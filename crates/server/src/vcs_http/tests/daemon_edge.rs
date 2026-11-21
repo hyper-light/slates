@@ -113,18 +113,28 @@ fn daemon_configured(
 /// A daemon of [`SHARDS`] shards as [`daemon_named`] starts one, holding a changeset store: a Subversion repository's
 /// history lands there (C2), and a daemon without one makes no Subversion repository.
 fn stored_daemon(identity: Option<EdgeIdentity>) -> crate::test_store::StoredDaemon {
+  stored_daemon_named(identity).0
+}
+
+/// [`stored_daemon`] and its instance name, as [`daemon_named`] gives a daemon's: a Mercurial or Subversion repository's
+/// history lands on the store (C1, C2), so a test making one starts its daemon here.
+fn stored_daemon_named(
+  identity: Option<EdgeIdentity>,
+) -> (crate::test_store::StoredDaemon, String) {
   let (profile, config, instance) = edge_config(identity, |_| {});
   let daemon = crate::test_store::StoredDaemon::start(
     "vcs-http",
     &profile,
     config,
-    SegmentSource::Create { name: instance },
+    SegmentSource::Create {
+      name: instance.clone(),
+    },
   )
   .expect("the daemon starts");
   daemon
     .bootstrap(true)
     .expect("the daemon creates its initial group");
-  daemon
+  (daemon, instance)
 }
 
 /// The profile, configuration and instance name of a daemon of [`SHARDS`] shards serving the edge on loopback presenting
@@ -157,13 +167,13 @@ fn name_on_the_repositorys_partition() -> String {
     .expect("a name routes there")
 }
 
-/// Creates the git repository `name` on its partition, owned by [`owner`].
+/// Creates the git repository `name` on its partition, owned by [`owner`] (on a daemon holding a store, landed then
+/// recorded in place: `crate::test_store::create`).
 fn create(daemon: &Daemon, name: &str) {
   let name = name.to_owned();
   let created = crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
-    crate::verbs::dispatch(
+    crate::test_store::create(
       state,
-      1,
       &owner(),
       RequestBody::CreateRepository {
         name: name.clone(),
@@ -1111,9 +1121,8 @@ fn hg_name_on_the_repositorys_partition() -> String {
 fn create_hg_from_states(daemon: &Daemon, name: &str) {
   let name = name.to_owned();
   crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
-    let created = crate::verbs::dispatch(
+    let created = crate::test_store::create(
       state,
-      1,
       &owner(),
       RequestBody::CreateRepository {
         name: name.clone(),
@@ -1179,7 +1188,7 @@ const STATES_SERVED_HEADS: &str = "b252f2a7c3d2e773bea91bf42aaa0acb39463176\n";
 #[test]
 fn a_mercurial_repositorys_store_is_served_over_the_daemons_edge() {
   let (identity, certificate) = identity();
-  let daemon = daemon(identity);
+  let daemon = stored_daemon(Some(identity));
   let port = daemon.vcs_http_port().expect("the edge started");
   let hg = hg_name_on_the_repositorys_partition();
   let git = name_on_the_repositorys_partition();
@@ -1249,9 +1258,8 @@ const HG_PUSH_FIELDS: &str = "Accept-Encoding: identity\r\nContent-Type: applica
 fn create_empty_hg(daemon: &Daemon, name: &str) {
   let name = name.to_owned();
   let created = crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
-    crate::verbs::dispatch(
+    crate::test_store::create(
       state,
-      1,
       &owner(),
       RequestBody::CreateRepository {
         name: name.clone(),
@@ -1334,7 +1342,7 @@ fn history_bundle(made: &[Made], revs: &[usize]) -> Vec<u8> {
 #[test]
 fn a_mercurial_push_larger_than_one_ring_region_lands_through_the_daemons_edge() {
   let (identity, certificate) = identity();
-  let (daemon, instance) = daemon_named(Some(identity));
+  let (daemon, instance) = stored_daemon_named(Some(identity));
   let room = super::bounds_of(&crate::DaemonConfig::derive(
     &crate::daemon::test_profile(),
     &instance,
@@ -1380,7 +1388,7 @@ fn a_mercurial_push_larger_than_one_ring_region_lands_through_the_daemons_edge()
 #[test]
 fn a_mercurial_clone_larger_than_one_ring_region_is_answered_through_the_daemons_edge() {
   let (identity, certificate) = identity();
-  let (daemon, instance) = daemon_named(Some(identity));
+  let (daemon, instance) = stored_daemon_named(Some(identity));
   let room = super::bounds_of(&crate::DaemonConfig::derive(
     &crate::daemon::test_profile(),
     &instance,
@@ -1444,7 +1452,7 @@ fn a_mercurial_clone_larger_than_one_ring_region_is_answered_through_the_daemons
 #[test]
 fn a_mercurial_stream_clone_larger_than_one_ring_region_is_answered_through_the_daemons_edge() {
   let (identity, certificate) = identity();
-  let (daemon, instance) = daemon_named(Some(identity));
+  let (daemon, instance) = stored_daemon_named(Some(identity));
   let room = super::bounds_of(&crate::DaemonConfig::derive(
     &crate::daemon::test_profile(),
     &instance,
@@ -1606,7 +1614,7 @@ fn challenges_in(head: &str) -> Vec<String> {
 #[test]
 fn a_stock_mercurial_push_over_the_daemons_edge_lands_on_its_repositorys_shard() {
   let (identity, certificate) = identity();
-  let daemon = daemon(identity);
+  let daemon = stored_daemon(Some(identity));
   let port = daemon.vcs_http_port().expect("the edge started");
   let name = hg_name_on_the_repositorys_partition();
   create_empty_hg(&daemon, &name);
