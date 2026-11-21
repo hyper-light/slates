@@ -251,6 +251,13 @@
 > a piece at a time through `StorePacks` rather than whole; the push's pack held twice in RAM until it lands (its own
 > buffer and the content store's windows); a node whose store lacks a record's changeset reading its names from their
 > region homes, held by a test of its own (the rebuild test now reads the node's store).
+> R2, the load-only edge tests, CLOSED (2026-11-21, w-git): a push's answer under side-band-64k wrote its first
+> keepalive two intervals after its body (`body_end` waited one interval unwritten, then the reply its own before
+> appending it), 10 s, the client's patience, so every push answer past 5 s failed (18 of 18 at load 24, the timing
+> diagnostic's reply gaps 6.7-7.0 s). Now the keepalive is written once due, the silence measured from the last write;
+> the homing and the store's landing are carried by a task the exchange awaits across its keepalives, and the report is
+> held until the push's records are held at f + 1 with the keepalive written meanwhile. Green 18 of 18 at load 29-33.
+> Owed: the SSH edge's receive carries its homing and landing inline (no keepalive between).
 > The store grant's durable record BUILT (2026-11-20): the `G` row, recorded at the store's first open and
 > checkpointed before it serves, found as first recorded after a crash; every landing's header names its id
 > (`StoreHandle::grant`). Owed: the row's audit position in the control partition's audit log (`AuditKind` has no
@@ -24094,7 +24101,7 @@ experiment/*, codex/*), none on origin: 1,387 commits not on main (cc29bfc4c), 6
 (VFS, DAX, FUSE, catalog, reclaim, runtime) are outside this goal and untouched. None duplicates A-255, A-257 or A-263-A-267
 in what lands. Branch tips as of 2026-11-10:
 
-- **LANDED as A-796 (2026-11-20): `CheckMerge`, `ReadMergeCheck`, `ResolveMerge` over main's rebase, A-267's kept verdict reused; `tests/merge_check.rs`.** Not ported: the Codex `rebase_with` refinement (a kept operation conflicting only on a path the replacement re-establishes answers the windows instead), which the agent meets by retiring those operations too. Its CLI and MCP surface landed with it: `slates check`/`slates resolve` and `slates.merge.check`/`read_check`/`resolve`, one JSON shape (`crates/mcp/tests/mcp.rs`).
+- **LANDED as A-796 (2026-11-20): `CheckMerge`, `ReadMergeCheck`, `ResolveMerge` over main's rebase, A-267's kept verdict reused; `tests/merge_check.rs`.** The Codex `rebase_with` rule landed too (`Green::rebase_establishing`, AC-6.13), and conflict-mutants' restart finding (a work's revision seeded from its log position; `merge_check.rs`). Its CLI and MCP surface landed with it: `slates check`/`slates resolve` and `slates.merge.check`/`read_check`/`resolve`, one JSON shape (`crates/mcp/tests/mcp.rs`).
   `work/slates-atomic-conflicts` 6420b7ee7, `work/slates-conflict-cli` 0d5ab5141, `work/slates-conflict-mutants` 65472f43a.
 - **superseded: A-257 (a green's chain records its verdict; recovery applies it), A-782 (one typed outcome).** Evidence: `green_checkpoint.rs` (0782fdb0c), `recovery.rs`.
   `work/slates-owned-merge-verdict` fd456c059, `work/slates-runtime-step-verdict` f5f26fe41, `work/slates-server-root-publication` 246b88842, `work/slates-verdict-counter-mutant` 246b88842, `work/slates-verdict-force-inline` f065ee4ad, `work/slates-verdict-inline-commit` 2bf699369, `work/slates-verdict-ordinary-path` 2bf699369.
