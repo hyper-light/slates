@@ -367,7 +367,7 @@ proptest::proptest! {
           let layered = twins[0].green.content_ref_at(path, version).map(|bytes| bytes.into_owned());
           let full = twins[1].green.content_ref_at(path, version).map(|bytes| bytes.into_owned());
           proptest::prop_assert_eq!(&layered, &full, "{} at {}", path, version);
-          let want = (!expected[which].is_empty() || version >= u64::try_from(which).unwrap() + 1)
+          let want = (!expected[which].is_empty() || version > u64::try_from(which).unwrap())
             .then(|| expected[which].clone());
           proptest::prop_assert_eq!(&layered, &want, "{} at {} against the model", path, version);
         }

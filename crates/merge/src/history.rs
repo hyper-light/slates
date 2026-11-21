@@ -1231,6 +1231,20 @@ fn layered_allowed() -> bool {
   true
 }
 
+/// Whether `before` and `after` (of one length) hold the same bytes everywhere outside `ranges` (sorted, disjoint):
+/// `Some` when they do.
+fn unchanged_outside(before: &[u8], after: &[u8], ranges: &[(usize, usize)]) -> Option<()> {
+  let len = before.len();
+  let mut cursor = 0usize;
+  for (start, end) in ranges.iter().copied().chain(std::iter::once((len, len))) {
+    if before.get(cursor..start)? != after.get(cursor..start)? {
+      return None;
+    }
+    cursor = end;
+  }
+  Some(())
+}
+
 /// A length-preserving change taken by its path's anchor (module docs, "A layered anchor"; A-803): where the latest
 /// value is its anchor whole and `ops` only overwrite bytes inside it, which the new block holds where they did not
 /// write, the bytes they overwrote are copied into one owned chunk as the anchor's next layer, the superseded latest
@@ -1270,13 +1284,7 @@ fn overlay(
   if before == after {
     return None;
   }
-  let mut cursor = 0usize;
-  for (start, end) in ranges.iter().copied().chain(std::iter::once((len, len))) {
-    if before.get(cursor..start)? != after.get(cursor..start)? {
-      return None;
-    }
-    cursor = end;
-  }
+  unchanged_outside(before, after, &ranges)?;
   let number = chunks.layers.get(&anchor).map_or(0, |layers| layers.next);
   if number >= CURRENT.saturating_sub(1) {
     return None;
