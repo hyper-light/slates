@@ -1608,3 +1608,544 @@ fn an_svnsync_measured() {
     );
   }
 }
+
+/// Format: the verbs [`a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve`] runs where
+/// `SLATES_SVN_USE_VERBS` names none: every stock client verb it compares (goal 93's correctness by use, main's lane of
+/// 2026-11-21).
+const USE_VERBS: &[&str] = &[
+  "log", "info", "checkout", "update", "switch", "blame", "diff", "revprops", "dump", "svnsync",
+  "commit", "copy", "merge", "propset",
+];
+
+/// Shape: the revisions a verb that reads one revision at a time is run at, where `SLATES_SVN_USE_SAMPLES` names no
+/// count: spread evenly over the history, its first and last among them, so a long history is read at its start,
+/// middle and end without reading every revision.
+const USE_SAMPLES: u64 = 16;
+
+/// Shape: how long one stock tool's run of the whole history may take (an `svnsync` or an `svnrdump dump` of a large
+/// dump): a guard against a server that never answers, far above what stock `svnserve` takes for git-2000.dump, never a
+/// measure of either.
+const USE_PATIENCE: Duration = Duration::from_secs(3600);
+
+/// Format: what stands for each server's URL in the outputs compared, so the two servers' answers are compared, not
+/// their addresses.
+const USE_URL: &str = "<repository>";
+
+/// Runs stock `program` with `args` in `dir`, killed past [`USE_PATIENCE`]: its exit code and both outputs.
+fn tool(program: &str, dir: &str, args: &[&str]) -> (i32, String, String) {
+  let mut child = Command::new(program)
+    .args(args)
+    .current_dir(dir)
+    .env("LC_ALL", "C")
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let out = read_on_a_thread(child.stdout.take().unwrap());
+  let err = read_on_a_thread(child.stderr.take().unwrap());
+  let started = Instant::now();
+  let code = loop {
+    if let Some(status) = child.try_wait().unwrap() {
+      break status.code().unwrap_or(-1);
+    }
+    if started.elapsed() > USE_PATIENCE {
+      let _ = child.kill();
+      let _ = child.wait();
+      panic!("{program} {args:?} in {dir} ran past {USE_PATIENCE:?}");
+    }
+    pause();
+  };
+  (code, out.join().unwrap(), err.join().unwrap())
+}
+
+/// One server of the comparison: its client (options and credentials) and its repository's URL.
+struct UseLeg {
+  name: &'static str,
+  svn: Svn,
+  url: String,
+}
+
+impl UseLeg {
+  /// `text` with this leg's URL replaced by [`USE_URL`].
+  fn plain(&self, text: &str) -> String {
+    text.replace(&self.url, USE_URL)
+  }
+
+  /// `svn args` against this leg (each `{url}` in `args` its URL), in `dir`: its standard output with the URL made
+  /// plain, or its failure's words, so a verb one server refuses and the other serves shows as a difference.
+  fn answer(&self, dir: &str, args: &[&str]) -> String {
+    let args: Vec<String> = args
+      .iter()
+      .map(|arg| arg.replace("{url}", &self.url))
+      .collect();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (code, out, err) = self.svn.run(dir, &args);
+    if code == 0 {
+      self.plain(&out)
+    } else {
+      format!("exit {code}: {}", self.plain(&err))
+    }
+  }
+}
+
+/// Every file of working copy `copy`, by its path beneath it, and its bytes; `.svn` left out.
+#[allow(clippy::disallowed_methods)] // test code: reads the working copies stock `svn` wrote
+fn tree_of(copy: &str) -> std::collections::BTreeMap<String, Vec<u8>> {
+  let mut files = std::collections::BTreeMap::new();
+  let mut stack = vec![std::path::PathBuf::from(copy)];
+  while let Some(dir) = stack.pop() {
+    for entry in std::fs::read_dir(&dir).unwrap() {
+      let entry = entry.unwrap();
+      let path = entry.path();
+      if entry.file_name() == ".svn" {
+        continue;
+      }
+      if entry.file_type().unwrap().is_dir() {
+        stack.push(path);
+      } else {
+        let relative = path
+          .strip_prefix(copy)
+          .unwrap()
+          .to_string_lossy()
+          .into_owned();
+        files.insert(relative, std::fs::read(&path).unwrap());
+      }
+    }
+  }
+  files
+}
+
+/// What `copy`, a working copy of `leg`, holds: every file's bytes and every path's properties (`svn proplist -v -R`).
+fn held(leg: &UseLeg, copy: &str) -> String {
+  let mut text = String::new();
+  for (path, bytes) in tree_of(copy) {
+    text.push_str(&format!("{path} {} {}\n", bytes.len(), fingerprint(&bytes)));
+  }
+  text.push_str(&leg.answer(copy, &["proplist", "-v", "-R", "--xml", "."]));
+  text
+}
+
+/// A short fingerprint of `bytes`, so a tree's listing names each file's content without holding it.
+fn fingerprint(bytes: &[u8]) -> String {
+  use std::hash::{Hash, Hasher};
+  let mut hasher = std::collections::hash_map::DefaultHasher::new();
+  bytes.hash(&mut hasher);
+  format!("{:016x}", hasher.finish())
+}
+
+/// Format: the lines of each side a difference is shown with, before and after its first differing line.
+const USE_CONTEXT: usize = 3;
+
+/// The first line where `control` and `slates` differ, with its number and [`USE_CONTEXT`] lines of each side around
+/// it, for a failure's words and the red test it becomes.
+fn first_difference(control: &str, slates: &str) -> String {
+  let (a, b): (Vec<&str>, Vec<&str>) = (control.lines().collect(), slates.lines().collect());
+  let Some(at) = (0..a.len().max(b.len())).find(|line| a.get(*line) != b.get(*line)) else {
+    return "none".to_owned();
+  };
+  let from = at.saturating_sub(USE_CONTEXT);
+  let window = |side: &[&str]| {
+    side
+      .iter()
+      .skip(from)
+      .take(2 * USE_CONTEXT + 1)
+      .copied()
+      .collect::<Vec<_>>()
+      .join("\n      ")
+  };
+  format!(
+    "line {}:\n    stock:\n      {}\n    slates:\n      {}",
+    at + 1,
+    window(&a),
+    window(&b)
+  )
+}
+
+/// Collects `verb`'s difference between the two legs' answers `control` and `slates`, at `at`, into `failed`.
+fn compare(failed: &mut Vec<String>, verb: &str, at: &str, control: &str, slates: &str) {
+  if control != slates {
+    failed.push(format!(
+      "{verb} {at}: {}",
+      first_difference(control, slates)
+    ));
+  }
+}
+
+/// Goal 93's Subversion correctness by use (main's lane of 2026-11-21; ignored: main runs its rounds, CLAUDE.md §8).
+/// Do: load the dump `SLATES_SVN_USE_DUMP` names into a stock FSFS repository (`svnadmin load`) served by stock
+/// `svnserve -t`, cut to its first `SLATES_SVN_USE_REVISIONS` revisions where that is set (`svnadmin dump -r`), and
+/// import the same revisions into a slates repository (`slates repository import`) served by the daemon's svn://
+/// listener; then run each verb `SLATES_SVN_USE_VERBS` names (default [`USE_VERBS`]) as stock `svn` 1.15 against both,
+/// reading verbs at [`USE_SAMPLES`] revisions spread over the history (`SLATES_SVN_USE_SAMPLES`), and the writing verbs
+/// (commit, copy, merge, propset of a revision property) as the same edits on both, then their logs. Expect every
+/// answer byte for byte alike once each server's URL is made plain ([`USE_URL`]; a written revision's author and date,
+/// which the servers stamp, left out): log -v, info, a checkout's files and properties, `update -r`, `switch`, blame,
+/// `diff -c`, revision properties, `svnrdump dump`, and an `svnsync` mirror's `svnadmin dump`. A failure names each verb,
+/// its revision and its first differing line. Skips loudly without stock Subversion 1.15 (`svn`, `svnadmin`,
+/// `svnserve`, `svnrdump`, `svnsync`), the dump, or an issuer surface.
+#[test]
+#[ignore = "correctness by use, main's rounds: SLATES_SVN_USE_DUMP=git-2000.dump [SLATES_SVN_USE_REVISIONS=N] [SLATES_SVN_USE_VERBS=log,diff] cargo test --release -p slates-cli --test svn_interop -- --ignored a_dump_reads_and_writes_alike --nocapture"]
+#[allow(clippy::disallowed_methods)] // test code: the control's repository, hook and the cut dump, in the scratch
+fn a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve() {
+  let Ok(dump) = std::env::var("SLATES_SVN_USE_DUMP") else {
+    eprintln!("skipping svn correctness by use: SLATES_SVN_USE_DUMP names no dump");
+    return;
+  };
+  let tools_here = stock_svn()
+    && stock_svnserve()
+    && ["svnrdump", "svnsync"].iter().all(|tool| {
+      Command::new(tool)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    });
+  if !tools_here {
+    eprintln!(
+      "skipping svn correctness by use: no stock Subversion 1.15 here (svn, svnadmin, svnserve, svnrdump, svnsync)"
+    );
+    return;
+  }
+  let verbs: Vec<String> = std::env::var("SLATES_SVN_USE_VERBS").map_or_else(
+    |_| USE_VERBS.iter().map(|verb| (*verb).to_owned()).collect(),
+    |named| named.split(',').map(str::to_owned).collect(),
+  );
+  let samples: u64 = std::env::var("SLATES_SVN_USE_SAMPLES")
+    .ok()
+    .and_then(|count| count.parse().ok())
+    .unwrap_or(USE_SAMPLES)
+    .max(1);
+  let scratch = Scratch::new("svn-use");
+  // The control: a stock FSFS repository loaded with the dump, its revision property changes allowed by a hook.
+  let root = format!("{}/repositories", scratch.path);
+  made_directory(&root);
+  let control_repository = format!("{root}/control");
+  let made = tool("svnadmin", &scratch.path, &["create", &control_repository]);
+  assert_eq!(made.0, 0, "svnadmin create: {made:?}");
+  let loaded = Command::new("svnadmin")
+    .args(["load", "-q", &control_repository])
+    .stdin(std::fs::File::open(&dump).unwrap())
+    .output()
+    .unwrap();
+  assert!(loaded.status.success(), "svnadmin load: {loaded:?}");
+  let cut = format!("{}/cut.dump", scratch.path);
+  let mut range = vec!["dump", "-q", control_repository.as_str()];
+  let revisions = std::env::var("SLATES_SVN_USE_REVISIONS").ok();
+  let upper = revisions.as_ref().map(|n| format!("0:{n}"));
+  if let Some(upper) = upper.as_deref() {
+    range.extend(["-r", upper]);
+  }
+  let dumped = Command::new("svnadmin").args(&range).output().unwrap();
+  assert!(dumped.status.success(), "svnadmin dump: {dumped:?}");
+  std::fs::write(&cut, &dumped.stdout).unwrap();
+  if revisions.is_some() {
+    let again = format!("{root}/control-cut");
+    let made = tool("svnadmin", &scratch.path, &["create", &again]);
+    assert_eq!(made.0, 0, "svnadmin create: {made:?}");
+    let loaded = Command::new("svnadmin")
+      .args(["load", "-q", &again])
+      .stdin(std::fs::File::open(&cut).unwrap())
+      .output()
+      .unwrap();
+    assert!(
+      loaded.status.success(),
+      "svnadmin load of the cut: {loaded:?}"
+    );
+    std::fs::remove_dir_all(&control_repository).unwrap();
+    std::fs::rename(&again, &control_repository).unwrap();
+  }
+  let hook = format!("{control_repository}/hooks/pre-revprop-change");
+  std::fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+  }
+  let control = UseLeg {
+    name: "stock svnserve",
+    svn: Svn::new(
+      &scratch,
+      "control",
+      vec![
+        "--config-option".to_owned(),
+        format!(
+          "config:tunnels:{CONTROL_TUNNEL}=sh -c 'exec svnserve -t -r {root} --tunnel-user={TUNNEL_USER}'"
+        ),
+      ],
+    ),
+    url: format!("svn+{CONTROL_TUNNEL}://localhost/control"),
+  };
+  // Slates: the same revisions imported, served by the svn:// listener.
+  let instance = format!("svn-use-{}", std::process::id());
+  let (_anchor, lines, issuer) = start_anchor(&instance, &["--vcs-svn", "127.0.0.1:0"]);
+  let port = svn_listener_port(&lines);
+  let Some(issuer) = issuer_or_skip(issuer, "svn correctness by use") else {
+    return;
+  };
+  create_repository(&instance);
+  let imported = slates(&instance, &["repository", "import", REPOSITORY, &cut]);
+  assert_eq!(imported.0, 0, "import: {imported:?}");
+  let (id, token) = minted_token(&instance, &issuer);
+  let allowing = format!("{}/allow-revprop-change", scratch.path);
+  std::fs::write(&allowing, "#!/bin/sh\nexit 0\n").unwrap();
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&allowing, std::fs::Permissions::from_mode(0o755)).unwrap();
+  }
+  let given = format!("pre-revprop-change={allowing}");
+  let policy = slates(
+    &instance,
+    &["repository", "policy", REPOSITORY, "--hook", &given],
+  );
+  assert_eq!(policy.0, 0, "policy: {policy:?}");
+  let slates_leg = UseLeg {
+    name: "slates",
+    svn: Svn::new(&scratch, "slates", credentials(id, token)),
+    url: format!("svn://127.0.0.1:{port}/{REPOSITORY}"),
+  };
+  let legs = [&control, &slates_leg];
+  let youngest: u64 = control
+    .answer(&scratch.path, &["info", "--show-item", "revision", "{url}"])
+    .trim()
+    .parse()
+    .unwrap();
+  let stride = youngest.div_ceil(samples).max(1);
+  let mut sampled: Vec<u64> = (1..=youngest)
+    .step_by(usize::try_from(stride).unwrap())
+    .collect();
+  if sampled.last() != Some(&youngest) && youngest > 0 {
+    sampled.push(youngest);
+  }
+  let mut failed = Vec::new();
+  let mut ran = Vec::new();
+  for verb in &verbs {
+    ran.push(verb.clone());
+    match verb.as_str() {
+      "log" => {
+        let args = ["log", "-v", "--xml", "-r", "0:HEAD", "{url}"];
+        let [a, b] = legs.map(|leg| leg.answer(&scratch.path, &args));
+        compare(&mut failed, verb, "0:HEAD", &a, &b);
+      }
+      "info" => {
+        for at in &sampled {
+          let target = format!("{{url}}@{at}");
+          let args = ["info", "-R", "--xml", target.as_str()];
+          let [a, b] = legs.map(|leg| leg.answer(&scratch.path, &args));
+          compare(&mut failed, verb, &format!("r{at}"), &a, &b);
+        }
+      }
+      "checkout" | "update" | "switch" | "blame" => {
+        for at in &sampled {
+          let rev = at.to_string();
+          let mut held_by = Vec::new();
+          for leg in legs {
+            let copy = leg.svn.copy(&format!("{verb}-{at}"));
+            match verb.as_str() {
+              "checkout" | "blame" => {
+                leg.answer(
+                  &scratch.path,
+                  &["checkout", "-q", "-r", &rev, "{url}", &copy],
+                );
+              }
+              "update" => {
+                leg.answer(&scratch.path, &["checkout", "-q", "{url}", &copy]);
+                leg.answer(&copy, &["update", "-q", "-r", &rev]);
+              }
+              _ => {
+                // A switch from the youngest root to revision `at`'s root, as a working copy moved between URLs.
+                leg.answer(
+                  &scratch.path,
+                  &["checkout", "-q", "--depth", "empty", "{url}", &copy],
+                );
+                leg.answer(
+                  &copy,
+                  &["switch", "-q", "--ignore-ancestry", "-r", &rev, "{url}"],
+                );
+                leg.answer(
+                  &copy,
+                  &["update", "-q", "--set-depth", "infinity", "-r", &rev],
+                );
+              }
+            }
+            held_by.push(if verb == "blame" {
+              let files: Vec<String> = tree_of(&copy).into_keys().collect();
+              files
+                .iter()
+                .map(|file| leg.answer(&copy, &["blame", "-v", "-r", &rev, file]))
+                .collect::<Vec<_>>()
+                .join("\n")
+            } else {
+              held(leg, &copy)
+            });
+            let _ = std::fs::remove_dir_all(&copy);
+          }
+          compare(
+            &mut failed,
+            verb,
+            &format!("r{at}"),
+            &held_by[0],
+            &held_by[1],
+          );
+        }
+      }
+      "diff" => {
+        for at in &sampled {
+          let change = at.to_string();
+          let args = ["diff", "-c", change.as_str(), "{url}"];
+          let [a, b] = legs.map(|leg| leg.answer(&scratch.path, &args));
+          compare(&mut failed, verb, &format!("r{at}"), &a, &b);
+        }
+      }
+      "revprops" => {
+        for at in &sampled {
+          let rev = at.to_string();
+          let args = [
+            "proplist",
+            "--revprop",
+            "-v",
+            "--xml",
+            "-r",
+            rev.as_str(),
+            "{url}",
+          ];
+          let [a, b] = legs.map(|leg| leg.answer(&scratch.path, &args));
+          compare(&mut failed, verb, &format!("r{at}"), &a, &b);
+        }
+      }
+      "dump" => {
+        let [a, b] = legs.map(|leg| {
+          let mut args = leg.svn.options.clone();
+          args.extend(["dump".to_owned(), "-q".to_owned(), leg.url.clone()]);
+          let args: Vec<&str> = args.iter().map(String::as_str).collect();
+          let (code, out, err) = tool("svnrdump", &scratch.path, &args);
+          if code == 0 {
+            out
+          } else {
+            format!("exit {code}: {}", leg.plain(&err))
+          }
+        });
+        compare(&mut failed, "svnrdump dump", "0:HEAD", &a, &b);
+      }
+      "svnsync" => {
+        let [a, b] = legs.map(|leg| {
+          let mirror = format!("{root}/mirror-of-{}", leg.svn.session);
+          tool("svnadmin", &scratch.path, &["create", &mirror]);
+          let hook = format!("{mirror}/hooks/pre-revprop-change");
+          std::fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
+          #[cfg(unix)]
+          {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+          }
+          let mirror_url = format!("file://{mirror}");
+          let mut options = leg.svn.options.clone();
+          options.push("--allow-non-empty".to_owned());
+          let init: Vec<String> = ["init".to_owned(), mirror_url.clone(), leg.url.clone()]
+            .into_iter()
+            .chain(leg.svn.options.iter().cloned())
+            .collect();
+          let init: Vec<&str> = init.iter().map(String::as_str).collect();
+          let (code, out, err) = tool("svnsync", &scratch.path, &init);
+          if code != 0 {
+            return format!("init exit {code}: {}{}", out, leg.plain(&err));
+          }
+          let sync: Vec<String> = ["sync".to_owned(), mirror_url]
+            .into_iter()
+            .chain(leg.svn.options.iter().cloned())
+            .collect();
+          let sync: Vec<&str> = sync.iter().map(String::as_str).collect();
+          let (code, _, err) = tool("svnsync", &scratch.path, &sync);
+          if code != 0 {
+            return format!("sync exit {code}: {}", leg.plain(&err));
+          }
+          // The mirror's own sync properties name its source: left out, as each names its own server.
+          let (_, out, _) = tool("svnadmin", &scratch.path, &["dump", "-q", &mirror]);
+          out
+            .lines()
+            .filter(|line| !line.contains("svn:sync-"))
+            .collect::<Vec<_>>()
+            .join("\n")
+        });
+        compare(&mut failed, "svnsync", "0:HEAD", &a, &b);
+      }
+      "commit" | "copy" | "merge" | "propset" => {}
+      other => failed.push(format!("{other}: no such verb in the comparison")),
+    }
+  }
+  // The writing verbs, as one session of edits on each server, then each written revision's log, the servers' own
+  // stamps (author, date) left out.
+  let writes: Vec<&str> = ["commit", "copy", "merge", "propset"]
+    .into_iter()
+    .filter(|verb| verbs.iter().any(|named| named == verb))
+    .collect();
+  if !writes.is_empty() {
+    let logs = legs.map(|leg| {
+      let copy = leg.svn.copy("writes");
+      leg.answer(
+        &scratch.path,
+        &["checkout", "-q", "--depth", "immediates", "{url}", &copy],
+      );
+      let mut said = String::new();
+      if writes.contains(&"commit") {
+        std::fs::write(format!("{copy}/use-written"), "written by use\n").unwrap();
+        said.push_str(&leg.answer(&copy, &["add", "-q", "use-written"]));
+        said.push_str(&leg.answer(&copy, &["commit", "-q", "-m", "by use: a commit"]));
+      }
+      if writes.contains(&"copy") {
+        said.push_str(&leg.answer(
+          &copy,
+          &[
+            "copy",
+            "-q",
+            "-m",
+            "by use: a copy",
+            "{url}",
+            "{url}/use-branch",
+          ],
+        ));
+      }
+      if writes.contains(&"merge") {
+        said.push_str(&leg.answer(&copy, &["update", "-q"]));
+        std::fs::write(format!("{copy}/use-merged"), "merged by use\n").unwrap();
+        said.push_str(&leg.answer(&copy, &["add", "-q", "use-merged"]));
+        said.push_str(&leg.answer(&copy, &["commit", "-q", "-m", "by use: to merge"]));
+        said.push_str(&leg.answer(&copy, &["update", "-q"]));
+        said.push_str(&leg.answer(&copy, &["merge", "-q", "-c", "HEAD", "{url}", "."]));
+        said.push_str(&leg.answer(&copy, &["status"]));
+        said.push_str(&leg.answer(&copy, &["revert", "-q", "-R", "."]));
+      }
+      if writes.contains(&"propset") {
+        said.push_str(&leg.answer(
+          &scratch.path,
+          &[
+            "propset",
+            "--revprop",
+            "-r",
+            "HEAD",
+            "svn:log",
+            "by use: a changed log",
+            "{url}",
+          ],
+        ));
+      }
+      let log = leg.answer(&scratch.path, &["log", "-v", "--xml", "-l", "4", "{url}"]);
+      let unstamped: String = log
+        .lines()
+        .filter(|line| !line.contains("<author>") && !line.contains("<date>"))
+        .collect::<Vec<_>>()
+        .join("\n");
+      format!("{said}\n{unstamped}")
+    });
+    compare(&mut failed, &writes.join("+"), "HEAD", &logs[0], &logs[1]);
+  }
+  println!(
+    "svn correctness by use: {} revisions, sampled {:?}; verbs {ran:?}; {} differences between {} and {}",
+    youngest,
+    sampled,
+    failed.len(),
+    control.name,
+    slates_leg.name
+  );
+  assert!(failed.is_empty(), "differences:\n{}", failed.join("\n"));
+}
