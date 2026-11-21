@@ -1546,6 +1546,15 @@ fn computed_request(
   };
   state.count(COMPUTED_ON_HOLDER, 1);
   let form = computed.encode(&inc);
+  // Encoded once: the bytes this node holds as the version's inputs, then forwarded (A-697 (1)): held here, they are
+  // never shipped back to this node, which composed them.
+  let increment = inc.encode();
+  let next = state
+    .merge
+    .replicas
+    .get(&slates_db::register::ObjectId(green.bytes))
+    .map_or(0, |replica| replica.head().saturating_add(1));
+  crate::merge_service::hold_composed_inputs(state, green, &increment, next);
   Ok(crate::verbs::forwarded_request(
     state,
     id.word(),
@@ -1553,7 +1562,7 @@ fn computed_request(
     RequestBody::SubmitComputed {
       work: crate::verbs::to_wire_volume(work),
       green: crate::verbs::to_wire_volume(green),
-      increment: inc.encode(),
+      increment,
       computed: form,
       carried,
     },

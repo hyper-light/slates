@@ -1119,6 +1119,11 @@ impl Index {
       .collect()
   }
 
+  /// The tail and runs the lookups since the merge rule's last report visited ([`Index::lookups_took`] takes them).
+  pub fn visits(&self) -> u64 {
+    self.visits.get()
+  }
+
   /// What the index has done.
   pub fn counters(&self) -> IndexCounters {
     self.counters
