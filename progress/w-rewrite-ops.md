@@ -1,5 +1,10 @@
 # w-rewrite-ops progress (D-O17: a whole-file rewrite becomes the precise edit it was)
 
+## 2026-11-21 ~04:35 PST — main 04:11: leftovers measured, A-811 LANDED (main 55288d05b); stage C split proposed
+- (a) read through layers: 191 to 5.9 µs at m = 10^4. (b') SDK replace: 12.6 ms to 10.4 µs at history 5,000.
+- (b) insert re-anchor: measured open (17.5 ms at history 5,000); its design asked of main.
+- Stage C: split proposed to w-svn (inbox/w-svn-from-w-rewrite-ops-stage-c-split.md); waiting for the answer.
+
 ## 2026-11-21 ~04:30 PST — main 04:02: the checkpoint failure FIXED (A-810, main d9bc5f00c)
 - The index's model asked specialness timelessly; the index was right; it was not the restore. Seeded red, named test,
   0 failures in 25 runs. Bug record in docs/bugs.
