@@ -2253,10 +2253,17 @@
 > headers):** part 1 BUILT, the read side as `mod_dav_svn` 1.14.x answers it: `!svn/vcc/default` (its `checked-in` the
 > youngest baseline; the v1 update-report's target, its hrefs version resources), `!svn/bln/REV` (`D:baseline`, its
 > collection `!svn/bc/REV/`, `version-name`, its revision's properties as dead properties), `!svn/ver/REV/PATH` (the
-> node in REV, no `checked-in`). Owed: part 2 the commit verbs (MKACTIVITY, CHECKOUT, the working baseline's PROPPATCH,
-> `wrk`, MERGE and DELETE of the activity) over DavCommit, part 3 the server site, part 4 by-use; the PROPFIND
-> writer's per-property strings rewritten into the connection's buffer (MEMORY SIZING; its subjects now lend their
-> properties).
+> node in REV, no `checked-in`). Part 2 BUILT (with part 3, the server site): MKACTIVITY begins a transaction with
+> the author alone and runs start-commit, as `dav_svn__create_txn` does, naming it the activity; CHECKOUT of the VCC (or
+> the youngest baseline) answers the working baseline `!svn/wbl/ID/REV`, of `!svn/ver/REV/PATH` the working resource
+> `!svn/wrk/ID/PATH`, its revision kept as the base later requests are judged against (`DavCommit::check_out`); the
+> working baseline's PROPPATCH sets the revision properties (`DavCommit::proppatch_revision_properties`); PUT, MKCOL,
+> DELETE, COPY and PROPPATCH on working resources run as on `!svn/txr/`; MERGE of the activity commits; DELETE of it
+> aborts or answers `204`; `201`s as `mod_dav`'s `dav_created` writes them (`dav::response::created`). Held by
+> `a_deltav_v1_commit_lands_as_mod_dav_svn_lands_it` (the daemon's edge, ra_serf 1.14's requests) and
+> `dav::activity` tests. Departures, each stated: a MERGE answers HTTPv2's short form (no per-path `D:response`s a
+> working copy's wc-props take), `Location` is the path alone, a CHECKOUT's out-of-date check is the drive's at the
+> next request. Owed: part 4 by-use (stock svn 1.15 against an OPTIONS with no v2 headers, on a host with svn).
 > request sent again refuses a stream that starts before the revision after the youngest); the CLI's and the SDKs'
 > words for both verbs; main's: clippy and `xtask` over the modules. Found by it and fixed by
 > A-652 (2026-11-19, g264): the
