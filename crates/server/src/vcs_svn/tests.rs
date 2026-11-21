@@ -19,6 +19,12 @@ use crate::daemon::{Daemon, SegmentSource};
 const SHARDS: u16 = 2;
 /// Shape: how long the client waits for each read: the daemon's liveness budget.
 const PATIENCE_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS;
+/// Shape: how long a client waits for an answer that runs hooks: a hang's bound, not a hook's. The daemon holds a hook
+/// only to the bound its runs taught it, so a first run lasts as long as the machine makes it: on a loaded Mac (load
+/// ~60, w-perf 2026-11-20) a hook's process took past the ten windows these tests once waited, 1 run in 3, and the read
+/// that timed out returned the answer part-way, read as a wrong answer (R3, the hook test flake). Sixty windows hold
+/// three times the longest seen (22 s a test against 2.3 s).
+const HOOK_PATIENCE_NS: u64 = 60 * PATIENCE_NS;
 /// Format: what stock `svnserve` 1.15.0 wrote to stock `svn` 1.15.0 asking for [`RECORDED_URL`] under a root holding no
 /// repository: its greeting, then its refusal (recorded on the Mac Studio, 2026-11-19).
 const SERVER_BYTES: &[u8] =
@@ -633,10 +639,10 @@ fn commit_under_hooks(
   set_svn_hooks(&daemon, OTHER, &name, hooks(&name));
   let root = format!("svn://127.0.0.1:{port}/{name}");
   let mut signed = sign_in(port, &greeting, &root);
-  // A hook's process is started and reaped within the answer: the client waits ten windows for it.
+  // A hook's process is started and reaped within the answer: the client waits a hang's bound for it.
   signed
     .stream
-    .set_read_timeout(Some(Duration::from_nanos(10 * PATIENCE_NS)))
+    .set_read_timeout(Some(Duration::from_nanos(HOOK_PATIENCE_NS)))
     .expect("the client's wait");
   let commit_at = MKDIR_COMMIT
     .windows(COMMIT_START.len())
@@ -829,7 +835,7 @@ fn under_policy(
   let mut signed = sign_in(port, &greeting, &root);
   signed
     .stream
-    .set_read_timeout(Some(Duration::from_nanos(10 * PATIENCE_NS)))
+    .set_read_timeout(Some(Duration::from_nanos(HOOK_PATIENCE_NS)))
     .expect("the client's wait");
   let committed = asked(&mut signed.stream, &new_file_commit(), 5);
   assert!(committed.ends_with(" ) ( ) ) "), "{committed}");
@@ -1176,6 +1182,12 @@ fn an_unlock_runs_pre_unlock_and_post_unlock_as_svnserve_does() {
     ],
   );
   let unlocked = answers.get(1).expect("the unlock's answer");
+  // The whole answer first: post-unlock runs before `done`, so a part-way answer (a read that timed out) is the cause
+  // of whatever the hooks' files lack, and is told as such.
+  assert!(
+    unlocked.contains("( success ( 7:new.txt ) )") && unlocked.ends_with("done ( success ( ) ) "),
+    "the unlock's answer, whole: {unlocked}"
+  );
   let pre_args = recorded_lines(&dir.path, "pre.args");
   assert_eq!(
     (

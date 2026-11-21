@@ -2308,6 +2308,11 @@
 > a stored text a store window a step, a green's held text a window's room a step; a call whose texts are not whole
 > writes nothing. Held by `an_export_rebuilds_a_long_delta_chain_a_window_a_call` (no call a quarter of the whole read)
 > and `a_stored_text_is_read_a_store_window_a_step`. Owed: format 3's window made in units (w-bugs' `WindowMaking`). Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
+> **R3, the svn hook tests' flake (2026-11-20, w-svn; Ada's close list):** `vcs_svn::tests` waited ten liveness windows
+> for an answer that runs hooks, and its reader returns part-way at a timeout; on a loaded Mac a hook's first run
+> outlasted that (1 in 3, w-perf; 22 s against 2.3 s), read as a wrong answer. The wait is now a hang's bound
+> (`HOOK_PATIENCE_NS`, sixty windows), and the unlock test holds its answer whole before its hooks' files. 8 of 8 runs
+> green after (load 11-17). Closed.
 > **A-780, the svn DAV site's PROPFIND written in place (2026-11-20, w-svn; Ada's MEMORY SIZING rule):** every
 > property's value and element is written into one reused buffer (`dav::site` `write_live`, `push_dead`, the value
 > writers), responses streamed into the body as described; allprop of a 32-file directory at depth 1 makes 445
@@ -10848,7 +10853,19 @@ per-thread switch count, which is why it stayed unseen. Linux's `epoll_wait(0)` 
 1.04/0.49/0.91 -> 0.43/0.54/0.73 ms, but p999 2.7/2.3/7.8 -> 12.1/10.6/12.0 ms, because A-387 then keeps holds (turns
 cost 0.5 µs) and a held shard true-spins for ms. With no hold as well: p99 0.17/0.38/0.27 ms and p999 0.30/11.3/6.6 ms,
 1.2-3.5 cores against 0.7-1.2. A sched_yield per idle turn: p99 10.1 ms (a whole macOS quantum given away), rejected.
-**Next (in flight):** A-387's turn estimate forgets by a count of turns, so with cheap turns a preemption is forgotten after
+**The bound, made robust (2026-11-20, C1).** The bound first added the load's addition to the parked p99 (loaded minus
+quiet). On a host busy of its own the "quiet" parked p99 (1.0-2.3 ms) passed the loaded one, so the bound fell to the
+quiet spinning p99 and failed every arm alike. It is now one loaded window's comparison: the loaded spinning p99 may be
+no slower than the loaded parked p99, nor than its own quiet p99. Over ab6's 9 runs that reads red 3 of 3 on main and
+green 6 of 6 on both candidate arms.
+
+**P2's A/B, round two (2026-11-20 evening, host load 10-26, BENCHMARKS "R9's loaded p99 on macOS, the candidates"):**
+the immediate poll with a time-horizon turn estimate, and the immediate poll with an explicit macOS nap in the idle
+spin's turn. Both meet R9's 50 µs floor quiet for the first time at nine shards (p99 28-43 and 38-40 µs against main's
+99-111) and cut the loaded p99 3-5x (0.25-0.46 ms against 1.06-1.34). Both make the loaded p999 worse (5.6-23.4 ms against
+2.1-2.5) and spend 2-6x main's quiet CPU (3.3-10 cores against 1.7). Neither lands under the data rule: P2 stays open.
+**Next:** the loaded p999's own hop (g222's ~1 ms timer band and the shards' priority under a true spin), with g222.
+Earlier next step, now measured: A-387's turn estimate forgets by a count of turns, so with cheap turns a preemption is forgotten after
 2^shift turns, microseconds of spinning; the fix weighs turns by time, then lands with the immediate poll and its red test
 (`a_zero_timeout_wait_delivers_what_is_ready_and_never_sleeps`, macOS judged by time). Found on the way, not chased:
 `IMMEDIATE` and zero-timespec `kevent64` polls on one queue lose a kick (3 of 3 runs hung, every shard parked).
