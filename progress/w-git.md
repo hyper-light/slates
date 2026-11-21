@@ -378,3 +378,4 @@
   submit's step. Then commits::made's objects from Head::trees -> GitPush sealed -> task: carry Home, carry Land ->
   made_commit::commit(tool = guard + store commit + append v5 entry). The owed path (staged/make_owed) folds into
   this; record_of/v2 removed after.
+- 08:50 piece 3 RED committed locally (w-git-c5b, not pushed): vcs_store::commits::tests::t_c5b_p3_a_git_made_commit_is_answered_only_once_its_changeset_landed_and_committed: in the verb's step (true, 1, 0) answered+durable. Next: Tool::Git in made_commit, commits::make_deferred from a preview (paths::stepped over with_preview), the landing task, then the kill test, then removing record_of/v2.
