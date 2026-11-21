@@ -340,6 +340,8 @@ slates edit WORK PATH AT DELETE TEXT [--json]
 slates copy WORK FROM TO [--version N] [--replace] [--json]
 slates submit WORK [--evidence HEX] [--json]     accepted: N, identical: N (nothing changed), or the conflicts
 slates rebase WORK [--json]
+slates check WORK [--json]                       the verdict a submit would get now, publishing nothing (A-796)
+slates resolve JSON [--json]                     resolve a checked conflict: {"stamp", "discard", "replacement"}
 slates advance ATTACHMENT [VERSION] [--json]
 slates read VOLUME PATH [--version N | --attachment A]
 slates mount ID PATH [--read-only] [--subtree DIR]

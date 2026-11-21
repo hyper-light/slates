@@ -495,6 +495,9 @@ fn stock_svn_sessions_hold_against_stock_svnserve() {
 struct Anchor {
   child: Child,
   drain: Option<std::thread::JoinHandle<()>>,
+  /// The directory its daemon's changeset store lives in (`--vcs-store`; C2: a daemon without one makes no Subversion
+  /// repository), removed after the anchor is killed; none where the caller named its own.
+  _store: Option<Scratch>,
 }
 
 impl Drop for Anchor {
@@ -552,6 +555,9 @@ type IssuerSurface = Option<Vec<(String, String)>>;
 /// consensus group as a first start does (`slates bootstrap root`): the anchor, the lines read, which name the edges'
 /// ports, and the issuer surface.
 fn start_anchor(instance: &str, edges: &[&str]) -> (Anchor, Vec<String>, IssuerSurface) {
+  // A Subversion repository's history lands on the daemon's changeset store (C2): a store directory in a scratch of
+  // its own, unless the caller named one.
+  let store = (!edges.contains(&"--vcs-store")).then(|| Scratch::new("vcs-store"));
   let mut child = Command::new(env!("CARGO_BIN_EXE_slates"))
     .args([
       "--instance",
@@ -562,12 +568,21 @@ fn start_anchor(instance: &str, edges: &[&str]) -> (Anchor, Vec<String>, IssuerS
       SHARDS,
     ])
     .args(edges)
+    .args(
+      store
+        .iter()
+        .flat_map(|store| ["--vcs-store", store.path.as_str()]),
+    )
     .stdout(Stdio::null())
     .stderr(Stdio::piped())
     .spawn()
     .unwrap();
   let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
-  let mut anchor = Anchor { child, drain: None };
+  let mut anchor = Anchor {
+    child,
+    drain: None,
+    _store: store,
+  };
   let (lines, issuer) = lines_until_serving(&mut stderr, instance);
   anchor.drain = Some(std::thread::spawn(move || {
     let _ = std::io::copy(&mut stderr, &mut std::io::stderr());
@@ -956,6 +971,91 @@ fn a_repository_policys_hook_lets_stock_svn_change_a_revision_property() {
     ),
     ((0, true, true), 0, "changed", "1", 0),
     "policy: {out}{err}; changed: {changed:?}; unmount: {unmounted:?}"
+  );
+}
+
+/// Sends one HTTP/1.1 request to the edge at `port` and reads its whole answer: `method` at `path`, a bearer `token`,
+/// the request's other `headers` and `body`; the answer's text.
+fn edge_request(
+  port: u16,
+  (method, path): (&str, &str),
+  token: &str,
+  headers: &[&str],
+  body: &[u8],
+) -> String {
+  use std::io::{Read, Write};
+  let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let mut request = format!(
+    "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nConnection: close\r\nContent-Length: {}\r\n",
+    body.len()
+  )
+  .into_bytes();
+  for header in headers {
+    request.extend_from_slice(header.as_bytes());
+    request.extend_from_slice(b"\r\n");
+  }
+  request.extend_from_slice(b"\r\n");
+  request.extend_from_slice(body);
+  stream.write_all(&request).unwrap();
+  let mut answer = Vec::new();
+  let _ = stream.read_to_end(&mut answer);
+  String::from_utf8_lossy(&answer).into_owned()
+}
+
+/// A-645 (a), the view's mount by itself, on every Unix (Linux's FUSE mount, macOS's NFS mount), with no stock client:
+/// the DAV site runs start-commit at a commit's POST (A-733). Do: start an anchor with its HTTP edge and a store
+/// directory (`--vcs-store`); make a Subversion repository and a token; configure a start-commit hook that copies
+/// `$1/db/current` and `$1/format` (its `REPOS-PATH`'s FSFS files) to a file and refuses; POST `( create-txn )` to
+/// `!svn/me`; then unmount the view. Expect the hook to have read `0` and `5` (revision 0 the youngest, repository
+/// format 5) through the view mounted at `<store>/project.svn`, the commit refused by the hook, and the unmount to
+/// succeed. Red before A-645 (a): the hook was refused unrun, the file never written.
+#[cfg(unix)]
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn a_hooks_repos_path_is_the_repositorys_view_mounted_in_the_store_directory() {
+  use std::os::unix::fs::PermissionsExt;
+  let instance = format!("svn-view-{}", std::process::id());
+  let scratch = Scratch::new("svn-view");
+  let store = format!("{}/{STORE}", scratch.path);
+  made_directory(&store);
+  let (_anchor, lines, issuer) = start_anchor(
+    &instance,
+    &["--vcs-http", "127.0.0.1:0", "--vcs-store", &store],
+  );
+  let port = http_edge_port(&lines);
+  let Some(issuer) = issuer_or_skip(issuer, "the view's mount") else {
+    return;
+  };
+  create_repository(&instance);
+  let (_, token) = minted_token(&instance, &issuer);
+  let read = format!("{}/view-read", scratch.path);
+  let hook = format!("{}/start-commit", scratch.path);
+  std::fs::write(
+    &hook,
+    format!("#!/bin/sh\ncat \"$1/db/current\" \"$1/format\" > \"{read}\"\nexit 1\n"),
+  )
+  .unwrap();
+  std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+  let given = format!("start-commit={hook}");
+  let (code, out, err) = slates(
+    &instance,
+    &["repository", "policy", REPOSITORY, "--hook", &given],
+  );
+  assert_eq!(code, 0, "policy: {out}{err}");
+  let answer = edge_request(
+    port,
+    ("POST", &format!("/{REPOSITORY}/!svn/me")),
+    &token,
+    &["Content-Type: application/vnd.svn-skel"],
+    b"( create-txn )",
+  );
+  let seen = std::fs::read_to_string(&read).unwrap_or_default();
+  let view = format!("{store}/{REPOSITORY}.svn");
+  let unmounted = slates(&instance, &["unmount", &view]);
+  assert_eq!(
+    (seen.as_str(), unmounted.0),
+    ("0\n5\n", 0),
+    "answer: {answer}; unmount: {unmounted:?}"
   );
 }
 

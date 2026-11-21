@@ -96,9 +96,9 @@ impl BasePlane {
         Ok(Directory {
           inode: inode.0,
           source: listing.source.clone(),
-          // Its identity alone, what a recovery holds the directory to (`same_object`): an S3 base's needs no fetch.
+          // What a recovery holds the directory to (`same_object`).
           fingerprint: host
-            .identify_dir(listing.dir)
+            .fingerprint_dir(listing.dir)
             .map_err(super::host_refusal)?,
         })
       })

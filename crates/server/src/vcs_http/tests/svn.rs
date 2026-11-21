@@ -542,28 +542,28 @@ fn added_row(path: &str, kind: NodeKind, text: Option<&[u8]>) -> ChangedPath {
   }
 }
 
-/// Makes Subversion repository [`COMMITTED`] on a daemon's shard and commits its revision 1 through the owner's step
-/// (A-655 part 2b): `/trunk`, `/trunk/a.txt`, `/trunk/sub` and `/trunk/sub/b.txt`, by alice. Its id.
-fn committed_repository(state: &mut crate::state::ShardState) -> RepositoryId {
-  let create = slates_ipc::protocol::RequestBody::CreateRepository {
-    name: COMMITTED.to_owned(),
-    tool: slates_ipc::protocol::VcsTool::Subversion,
-    format: slates_ipc::protocol::ObjectFormat::Revisions,
-    default_branch: "main".to_owned(),
-    green: None,
-  };
-  let reply = crate::verbs::dispatch(state, 1, &daemon_owner(), create);
-  assert!(
-    matches!(reply, slates_ipc::protocol::ReplyBody::GreenCreated { .. }),
-    "{reply:?}"
+/// Makes Subversion repository [`COMMITTED`] on a store-backed daemon's shard and lands its revision 1 through the
+/// owner's step (A-655 part 2b; C2), from a history running as a task there: `/trunk`, `/trunk/a.txt`, `/trunk/sub` and
+/// `/trunk/sub/b.txt`, by alice. Its id.
+async fn committed_repository() -> RepositoryId {
+  let asked = (
+    COMMITTED,
+    slates_ipc::protocol::VcsTool::Subversion,
+    slates_ipc::protocol::ObjectFormat::Revisions,
+    "main",
   );
-  let repositories = state.db.partition().repositories();
-  let id = repositories
-    .repository_named(COMMITTED)
-    .expect("the record")
-    .id;
+  let (id, _) = crate::test_store::created(&daemon_owner(), asked).await;
+  let committed =
+    crate::repository::svn_commit::tests::commit((&daemon_owner(), id), first_revision(), None)
+      .await;
+  assert!(committed.is_ok(), "{committed:?}");
+  id
+}
+
+/// [`committed_repository`]'s revision 1.
+fn first_revision() -> slates_svn::commit::revision::Revision {
   let (a, b): (&[u8], &[u8]) = (b"alpha\n", b"beta\n");
-  let revision = slates_svn::commit::revision::Revision {
+  slates_svn::commit::revision::Revision {
     head: 0,
     record: RevisionRecord {
       transaction: "0-1".to_owned(),
@@ -585,11 +585,7 @@ fn committed_repository(state: &mut crate::state::ShardState) -> RepositoryId {
       .collect(),
     stored: BTreeMap::new(),
     lock_entries: Vec::new(),
-  };
-  let committed =
-    crate::repository::svn_commit::commit(state, (&daemon_owner(), id), revision, None);
-  assert!(committed.is_ok(), "{committed:?}");
-  id
+  }
 }
 
 /// What the site reads of [`COMMITTED`] through the daemon's lender, from a task on its shard: whether the lender holds
@@ -658,8 +654,12 @@ fn read_through_the_lender(id: RepositoryId) -> (bool, bool, Vec<u8>, Vec<u8>, V
 /// alice with its message and its four added paths, then revision 0.
 #[test]
 fn the_daemons_lender_serves_a_repositorys_committed_records() {
-  let daemon = crate::daemon::audit_daemon();
-  let id = crate::daemon::observe_first(&daemon, committed_repository);
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let id = crate::test_store::run_on_first(
+    &daemon,
+    committed_repository,
+    std::time::Duration::from_secs(60),
+  );
   let (sent, outcome) = std::sync::mpsc::sync_channel(1);
   crate::daemon::observe_first(&daemon, move |_state| {
     let task = slates_rt::futures::spawn(async move {

@@ -54,11 +54,15 @@
 //! durable as the entry is. A recovery replays the record into the index through the same check ([`replay_lfs`]), told
 //! from a push's record by its first word.
 //!
-//! **Subversion** (A-655 part 2b). A Subversion repository's entries hold its records (`slates_svn::commit::record`):
-//! the entry that joins its root holds its creation (its UUID and revision 0's date), and each entry that moves its
-//! green holds the revision the commit step committed. A recovery replays them through the step's own check and apply
-//! (`replay_svn`), so the records after it equal the records before; the creation's own entry is replayed the same way
-//! when the repository is made ([`make_from_log`]). The records are charged to the shard's budget by the bytes they hold
+//! **Subversion** (A-655 part 2b; C2 of Ada's close list, A-767 item 1). A Subversion repository's history is the
+//! node's changeset store: each record (`slates_svn::commit::record`: its creation, a revision, a lock verb's entries, a
+//! revision's properties, the UUID, a deltified text) lands there as one changeset, and the register's entry names it
+//! by its sequence alone (`repository::svn_commit::landing`), with the green's version where the record moves one. A
+//! recovery or a rebuild reads each changeset the register names back from the store, in sequence order, before its
+//! replay ([`svn_to_fetch`], [`fetch_svn`]), and replays it through the step's own check and apply (`replay_svn`, a
+//! revision a row at a time), so the records after it equal the records before; a changeset landed past the last the
+//! register names was never committed and is dropped. A new repository's store is made from its creation record in
+//! hand ([`make_created`]), which lands on the store as `CreateRepository` is answered. The records are charged to the shard's budget by the bytes they hold
 //! (their texts, property lists and revision properties) as retention: a step is lent the room the shard could admit
 //! ([`lend_svn`]), the growth it checked is charged before its append ([`reserve_svn`]), and the charge is trued up after
 //! it ([`settle_svn`]); their index's entries are bounded by the room's bytes over the fewest an entry takes
@@ -213,6 +217,17 @@ pub(crate) struct VcsStores {
   /// `slates_svn::migration::RevisionReplay`): at most one a repository, the record its rebuild or recovery replays
   /// now; bounded by the partition's repositories.
   svn_replays: BTreeMap<RepositoryId, slates_svn::migration::RevisionReplay>,
+  /// Each Subversion repository's landing turn (C2 of Ada's close list, `svn_commit::landing`): one changeset landing
+  /// a repository at a time, from its check to its register's commit.
+  pub(crate) svn_landings: crate::repository::svn_commit::landing::Gates,
+  /// The Subversion record read back from the node's store for the record a rebuild or recovery replays next (C2),
+  /// by repository, with the register's index it is for: at most one a repository.
+  svn_fetched: BTreeMap<RepositoryId, (usize, Vec<u8>)>,
+  /// The stored texts a recovery read back from the node's store into the content store (C2 stage B,
+  /// [`fetch_stored_texts`]), by repository: each written with the hold its replay's end would take, so that end takes
+  /// none more for them ([`hold_svn_stored`]). Bounded by the records' stored texts.
+  svn_fetched_texts:
+    BTreeMap<RepositoryId, std::collections::BTreeSet<slates_svn::index::ContentIdentity>>,
   /// The generations git fetches hold, by repository (A-745 rule 4, [`upload::GitGeneration`]): one fork a stamp the
   /// repository stood at when a fetch began, shared by every fetch that began there, given back with its last holder;
   /// bounded by the fetches the shard's edges seat.
@@ -441,6 +456,9 @@ pub(crate) enum ReplayRefused {
   /// A Mercurial record naming a changeset on the changeset log (record v7, A-767 C4) the node cannot read back: no log
   /// held, its owner busy or gone, or its payload not whole at its identity and length.
   Unlanded,
+  /// A Subversion register record that is not a changeset's reference, or names another sequence than its place
+  /// (C2: the register names each changeset in sequence order).
+  SvnReference,
 }
 
 /// The repository's objects as the bases a replayed pack's reference deltas may name (A-723), read through the index view
@@ -853,6 +871,8 @@ pub(crate) fn free(state: &mut ShardState, id: RepositoryId) {
   }
   abandon_git_replay(state, id);
   state.vcs_stores.svn_replays.remove(&id);
+  state.vcs_stores.svn_fetched.remove(&id);
+  state.vcs_stores.svn_fetched_texts.remove(&id);
   paths::whole_build::abandon(state, id);
   hg_import::abandon(state, id);
   git_encode::abandon(state, id);
@@ -2375,6 +2395,14 @@ fn replay_record(
   id: RepositoryId,
   index: usize,
 ) -> Option<Result<(), ReplayRefused>> {
+  if matches!(
+    state.vcs_stores.entries.get(&id),
+    Some(RepositoryStore::Subversion(_))
+  ) {
+    return Some(
+      svn_fetched_record(state, id, index)?.and_then(|bytes| replay_bytes(state, id, &bytes)),
+    );
+  }
   let ShardState {
     db,
     store,
@@ -2403,6 +2431,113 @@ fn replay_record(
     state.count(CHARGE_SHORT, 1);
   }
   Some(replayed.map(|unkept| state.count(VALUE_UNKEPT, unkept)))
+}
+
+/// Replays `bytes`, a record read back from the node's store, into repository `id`'s store, as [`replay_record`]
+/// replays one the register holds.
+fn replay_bytes(
+  state: &mut ShardState,
+  id: RepositoryId,
+  bytes: &[u8],
+) -> Result<(), ReplayRefused> {
+  let ShardState {
+    store, vcs_stores, ..
+  } = &mut *state;
+  let brought = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+  lend(store, vcs_stores, brought);
+  let room = vcs_stores.svn_unlent(id).map(|svn| {
+    let entries = svn
+      .records
+      .as_ref()
+      .map_or(0, |records| records.index().entries());
+    svn_room(store, svn.charged, entries)
+  });
+  let replayed = {
+    let lent = Lent::new(&mut *store, vcs_stores);
+    replay_into(lent.stores, id, bytes, room)
+  };
+  let mut whole = settle_in(store, vcs_stores);
+  if let Some(svn) = vcs_stores.svn_unlent(id) {
+    whole &= settle_records(store, svn);
+  }
+  if !whole {
+    state.count(CHARGE_SHORT, 1);
+  }
+  replayed.map(|unkept| state.count(VALUE_UNKEPT, unkept))
+}
+
+/// Repository `id`'s Subversion record at register `index`, as read back from the node's store before its replay
+/// (C2, [`fetch_svn`]): none past the register's last; refused `SvnReference` where the register's record is not the
+/// reference to changeset `index`, and `Unlanded` where it was not read back.
+fn svn_fetched_record(
+  state: &mut ShardState,
+  id: RepositoryId,
+  index: usize,
+) -> Option<Result<Vec<u8>, ReplayRefused>> {
+  let named = state
+    .db
+    .partition()
+    .repositories()
+    .object_record(id, index)?;
+  let sequence = crate::repository::svn_commit::landing::sequence_of(named);
+  if sequence != u64::try_from(index).ok() {
+    return Some(Err(ReplayRefused::SvnReference));
+  }
+  Some(match state.vcs_stores.svn_fetched.remove(&id) {
+    Some((at, bytes)) if at == index => Ok(bytes),
+    _ => Err(ReplayRefused::Unlanded),
+  })
+}
+
+/// What repository `id`'s rebuild or recovery must read back from the node's store before its record at register
+/// `index` replays (C2): the store, where the daemon holds one, and the changeset's sequence; none for another tool's
+/// repository, a revision's replay under way, a record read back already, or past the register's last.
+fn svn_to_fetch(
+  state: &ShardState,
+  id: RepositoryId,
+  index: usize,
+) -> Option<(Option<slates_store::owner::StoreHandle>, u64)> {
+  if !matches!(
+    state.vcs_stores.entries.get(&id),
+    Some(RepositoryStore::Subversion(_))
+  ) || state.vcs_stores.svn_replays.contains_key(&id)
+    || state
+      .vcs_stores
+      .svn_fetched
+      .get(&id)
+      .is_some_and(|(at, _)| *at == index)
+  {
+    return None;
+  }
+  let named = state
+    .db
+    .partition()
+    .repositories()
+    .object_record(id, index)?;
+  let sequence = crate::repository::svn_commit::landing::sequence_of(named)?;
+  Some((state.vcs_disk.clone(), sequence))
+}
+
+/// Reads repository `id`'s changeset `sequence`'s record back from the node's store `disk` for its record at register
+/// `index` (C2); nothing kept where it could not be read, and the replay then refuses it `Unlanded`, counted.
+async fn fetch_svn(
+  id: RepositoryId,
+  index: usize,
+  (disk, sequence): (Option<slates_store::owner::StoreHandle>, u64),
+) -> Option<(usize, Vec<u8>)> {
+  let disk = disk?;
+  match crate::repository::svn_commit::landing::changeset_record(&disk, id, sequence).await {
+    Ok(bytes) => Some((index, bytes)),
+    Err(why) => {
+      let _ = crate::state::with_state(|state| {
+        slates_machine::log_line!(
+          "slates-server: partition {}: a Subversion changeset {sequence} was not read back from the store: {why:?}",
+          state.partition
+        );
+      });
+      None
+    }
+  }
 }
 
 /// Counter: the units a Mercurial record's sliced replay ran (A-732 part 5), each under one lend of the stores and one
@@ -2832,10 +2967,17 @@ fn replay_svn(store: &mut SvnStore, bytes: &[u8], room: SvnRoom) -> Result<(), R
 /// hands the deltify job the stored texts it may take, so a job a restart cut off goes on. A text the store lacks is
 /// refused `SvnStored`. Nothing for a repository of another tool.
 fn hold_svn_stored(state: &mut ShardState, id: RepositoryId) -> Result<(), ReplayRefused> {
+  // A text read back from the node's store holds the hold its writing took already (`fetch_stored_texts`).
+  let fetched = state
+    .vcs_stores
+    .svn_fetched_texts
+    .remove(&id)
+    .unwrap_or_default();
   let Some(stored) = state.vcs_stores.subversion_records(id).map(|records| {
     records
       .stored_texts()
       .map(|(identity, _)| *identity)
+      .filter(|identity| !fetched.contains(identity))
       .collect::<Vec<_>>()
   }) else {
     return Ok(());
@@ -2853,6 +2995,108 @@ fn hold_svn_stored(state: &mut ShardState, id: RepositoryId) -> Result<(), Repla
     svn_deltify::resume(state, id);
   }
   held
+}
+
+/// Counter: a stored Subversion text a recovery read back from the node's store into the content store (C2 stage B):
+/// the shard's image had not kept it. Format: a counter name in the status report.
+pub(crate) const SVN_TEXT_FETCHED: &str = "vcs_store.svn_text_fetched";
+/// Counter: a stored Subversion text the content store lacked and the node's store could not give back whole; the
+/// replay's end then refuses it `SvnStored`. Format: a counter name.
+pub(crate) const SVN_TEXT_UNFETCHED: &str = "vcs_store.svn_text_unfetched";
+
+/// Reads back from the node's store every text repository `id`'s records keep stored that the content store lacks (C2
+/// stage B: a commit's changeset carries the texts it put, so the store holds each, while the content store holds only
+/// what the shard's last image kept), a piece at a time into the content store, each checked against its identity;
+/// counted. One not whole there is left out, and the replay's end refuses it `SvnStored`.
+async fn fetch_stored_texts(state: &mut ShardState, id: RepositoryId) {
+  let Some(disk) = state.vcs_disk.clone() else {
+    return;
+  };
+  let missing: Vec<(slates_svn::index::ContentIdentity, u64)> = {
+    let content = state.vcs_stores.content.as_ref();
+    state
+      .vcs_stores
+      .subversion_records(id)
+      .map(|records| {
+        records
+          .stored_texts()
+          .filter(|(identity, _)| {
+            !content.is_some_and(|content| content.contains(&slates_vcs::ContentId(**identity)))
+          })
+          .map(|(identity, len)| (*identity, len))
+          .collect()
+      })
+      .unwrap_or_default()
+  };
+  let repository = u128::from_be_bytes(id.bytes);
+  for (identity, len) in missing {
+    let fetched = fetch_text(state, &disk, (repository, identity, len)).await;
+    if fetched {
+      state
+        .vcs_stores
+        .svn_fetched_texts
+        .entry(id)
+        .or_default()
+        .insert(identity);
+    }
+    state.count(
+      if fetched {
+        SVN_TEXT_FETCHED
+      } else {
+        SVN_TEXT_UNFETCHED
+      },
+      1,
+    );
+  }
+}
+
+/// Text `identity` of `len` bytes of repository `repository`, read back from the node's store `disk` a piece at a time
+/// into the content store and made whole there (one hold); whether it was, its bytes its identity's. A busy owner is
+/// asked again after a yield.
+async fn fetch_text(
+  state: &mut ShardState,
+  disk: &slates_store::owner::StoreHandle,
+  (repository, identity, len): (u128, slates_svn::index::ContentIdentity, u64),
+) -> bool {
+  let mut writing = slates_vcs::Writing::default();
+  let mut offset = 0u64;
+  while offset < len {
+    let piece = match disk.text(repository, identity, offset).await {
+      Ok(Some(piece)) if !piece.is_empty() => piece,
+      Err(slates_store::owner::OwnerError::Busy) => {
+        slates_rt::futures::yield_now().await;
+        continue;
+      }
+      _ => break,
+    };
+    let brought = u64::try_from(piece.len()).unwrap_or(u64::MAX);
+    let put = within_budget(state, brought, |stores| {
+      stores
+        .content_mut()
+        .map(|content| content.put_window(&mut writing, &piece).is_ok())
+    });
+    if put != Some(true) {
+      break;
+    }
+    offset = offset.saturating_add(brought);
+  }
+  within_budget(state, 0, |stores| {
+    let Some(content) = stores.content_mut() else {
+      return false;
+    };
+    if offset != len {
+      content.abandon_object(writing);
+      return false;
+    }
+    match content.finish_object(&mut writing) {
+      Ok(made) if made == slates_vcs::ContentId(identity) => true,
+      Ok(made) => {
+        let _ = content.release(&made);
+        false
+      }
+      Err(_) => false,
+    }
+  })
 }
 
 /// Replay's end for repository `id`: its stored Subversion texts held again ([`hold_svn_stored`]), counted as a record's
@@ -2895,6 +3139,17 @@ fn replayed(state: &mut ShardState, id: RepositoryId, outcome: Result<(), Replay
 pub(crate) fn make_from_log(state: &mut ShardState, record: &RepositoryRecord) {
   make(state, record);
   replay_all(state, record.id);
+}
+
+/// Makes a new Subversion repository's store from its creation record `created`, in hand (C2): what
+/// `CreateRepository` does on its owner shard, where the creation lands on the node's store as the verb is answered,
+/// and a recovery reads it back from there.
+pub(crate) fn make_created(state: &mut ShardState, record: &RepositoryRecord, created: &[u8]) {
+  make(state, record);
+  let outcome = replay_bytes(state, record.id, created);
+  if replayed(state, record.id, outcome) {
+    replay_ended(state, record.id);
+  }
 }
 
 /// Replays every record repository `id`'s register holds into its store, in log order, stopping at a refused one.
@@ -3025,6 +3280,12 @@ async fn recover_repository(
         None => replay_hg_sliced(state, record.id, index, slices).await,
       }
     } else {
+      // A Subversion record is read back from the node's store first (C2): the register names it alone.
+      if let Some(place) = svn_to_fetch(state, record.id, index)
+        && let Some(fetched) = fetch_svn(record.id, index, place).await
+      {
+        state.vcs_stores.svn_fetched.insert(record.id, fetched);
+      }
       // A git record carrying a pack is replayed a turn's units a unit of the recovery (A-722 part 4).
       let ns = state.config.step_quantum_ns();
       match record_turn(state, (record.id, index), ns) {
@@ -3037,6 +3298,9 @@ async fn recover_repository(
       }
     };
     let Some(outcome) = outcome else {
+      // A Subversion text a commit stored, which the shard's image did not keep, is read back from the node's store
+      // first (C2 stage B): its changeset carried it.
+      fetch_stored_texts(state, record.id).await;
       replay_ended(state, record.id);
       break;
     };
@@ -3157,6 +3421,19 @@ async fn rebuild_turns(id: RepositoryId, generation: u64) {
       if put != Some(true) {
         break;
       }
+    }
+    // A Subversion record is read back from the node's store before its replay (C2): the register names it alone.
+    let place = crate::state::with_state(|state| {
+      let (current, index) = state.vcs_stores.rebuild_turns.get(&id).copied()?;
+      (current == generation)
+        .then(|| svn_to_fetch(state, id, index).map(|place| (index, place)))
+        .flatten()
+    })
+    .flatten();
+    if let Some((index, place)) = place
+      && let Some(fetched) = fetch_svn(id, index, place).await
+    {
+      crate::state::with_state(|state| state.vcs_stores.svn_fetched.insert(id, fetched));
     }
     if crate::state::with_state(|state| rebuild_turn(state, id, generation)) != Some(true) {
       return;
@@ -3347,15 +3624,14 @@ fn svn_record_turn(
   let (pending, brought) = match state.vcs_stores.svn_replays.remove(&id) {
     Some(replay) => (SvnPending::UnderWay(replay), 0),
     None => {
-      let bytes = state
-        .db
-        .partition()
-        .repositories()
-        .object_record(id, index)?;
+      let bytes = match svn_fetched_record(state, id, index)? {
+        Ok(bytes) => bytes,
+        Err(refused) => return Some(RecordTurn::Replayed(Err(refused))),
+      };
       let brought = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-      match SvnRecord::decode(bytes) {
+      match SvnRecord::decode(&bytes) {
         Ok(SvnRecord::Revision(revision)) => (SvnPending::Begin(revision), brought),
-        _ => return replay_record(state, id, index).map(RecordTurn::Replayed),
+        _ => return Some(RecordTurn::Replayed(replay_bytes(state, id, &bytes))),
       }
     }
   };
@@ -3480,6 +3756,19 @@ pub(crate) fn settle_rebuild(state: &mut ShardState, id: RepositoryId) {
     while rebuild_turn(state, id, generation) {}
   }
   paths::whole_build::settle(state);
+}
+
+/// Waits for repository `id`'s rebuild under way to end, its task reading each Subversion record back from the node's
+/// store (C2), then runs every map build: what a test's history running as a task on the shard awaits once it
+/// rebuilt a store.
+#[cfg(test)]
+pub(crate) async fn rebuilt(id: RepositoryId) {
+  while crate::state::with_state(|state| state.vcs_stores.rebuild_turns.contains_key(&id))
+    == Some(true)
+  {
+    slates_rt::futures::yield_now().await;
+  }
+  let _ = crate::state::with_state(paths::whole_build::settle);
 }
 
 /// One turn of repository `id`'s git or Subversion rebuild under way: whether more remain.

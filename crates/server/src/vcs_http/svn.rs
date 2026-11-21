@@ -33,7 +33,7 @@
 //! repository's records, named `REV-SEQ` and kept on the owner shard between its requests (`VcsStores`, one a
 //! repository and principal, a new POST replacing the older); PUT, MKCOL, DELETE and PROPPATCH under `!svn/txr/NAME/`,
 //! a COPY whose `Destination` is there, and a DELETE of `!svn/txn/NAME` each drive it a step; a MERGE naming it closes
-//! it, the accepted work landed through the owner's commit step (`repository::svn_commit::commit_work`) and answered
+//! it, the accepted work landed through the owner's commit step (`repository::svn_commit::land_work`) and answered
 //! with the new revision. A hook the repository configures at start-commit or pre-commit refuses the commit, as the
 //! svn+ssh tunnel refuses it, until hooks run. A commit presents its lock tokens as a stock client sends them: each
 //! request's `If` header, then the MERGE's `S:lock-token-list` with `X-SVN-Options: keep-locks` deciding whether the
@@ -224,7 +224,7 @@ pub(crate) trait SvnStores {
   /// (A-681; `Record::Locks`, durable as a revision is, A-693 part 2): `judge` has the records lent with a fresh token's
   /// draw, and gives the entries and the answer; a landing the step refuses is its refusal. None where this lender
   /// serves no locks.
-  fn lock_verb(
+  async fn lock_verb(
     &mut self,
     id: RepositoryId,
     principal: &Principal,
@@ -238,7 +238,7 @@ pub(crate) trait SvnStores {
   }
 
   /// Lands an accepted `work` on repository `id`'s logs by `principal` through the owner's commit step
-  /// (`crate::repository::svn_commit::commit_work`): none where this lender serves no commits.
+  /// (`crate::repository::svn_commit::land_work`): none where this lender serves no commits.
   async fn land(
     &mut self,
     id: RepositoryId,
@@ -1516,7 +1516,8 @@ impl<S: SvnStores> SvnExchange<S> {
             commit::unserved("A LOCK the table did not answer"),
           ),
         }
-      });
+      })
+      .await;
     let answered = landed(judged);
     if lock_planned && answered.status < HTTP_REDIRECTION {
       // post-lock once the lock stands; its failure is logged, never told: the lock is made and its answer stands
@@ -1632,7 +1633,8 @@ impl<S: SvnStores> SvnExchange<S> {
             }
           }
         }
-      });
+      })
+      .await;
     let answered = landed(judged);
     if planned.is_some() && answered.status < HTTP_REDIRECTION {
       // post-unlock once the lock is gone; its failure is logged, never told (`lock.c` `remove_lock`,
