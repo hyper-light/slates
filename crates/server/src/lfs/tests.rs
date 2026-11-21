@@ -15,7 +15,6 @@ use slates_ipc::protocol::{ObjectFormat, ReplyBody, RequestBody, VcsTool};
 
 use super::{LfsAccess, LfsCall, answer, id_of};
 use crate::state::ShardState;
-use crate::verbs::dispatch;
 
 /// Shape: room enough for every request and answer these tests make.
 const ROOM: u64 = 1 << 20;

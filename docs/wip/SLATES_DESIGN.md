@@ -11754,10 +11754,13 @@ blocks it. Rejects are non-blocking; the merge task never stalls on a conflict.
 > rebase restates it, one recorded step; refused `StaleMergeView` with nothing changed when the work moved (checked on
 > its shard) or the head did (checked on the green's half, before anything is mapped). Off the green's shard the ask
 > travels with the sealed work (A-247). No merge is inferred: every byte of a resolution is declared (D-27). Ported
-> from the Codex agent's early-conflict work (work/slates-atomic-conflicts, conflict-cli); its `rebase_with`
-> refinement (kept operations that conflict only on a path the replacement re-establishes) is not: such a
-> resolution answers the windows, and the agent retires those operations too. Test: `crates/server/tests/merge_check.rs`
-> (one history on one shard and on eight).
+> from the Codex agent's early-conflict work (work/slates-atomic-conflicts, conflict-cli). Its `rebase_with` rule
+> (AC-6.13) holds too: the work's kept mode and attribute changes on a path the replacement writes, makes or renames
+> onto are judged as on a path the work establishes (`Green::rebase_establishing`), so a mode kept on a file the head
+> removed and the replacement writes anew rebases. A work's revision is seeded from its partition's log position at
+> creation and at rebuild, so a stamp from before a restart never names the work once it changed (the Codex agent's
+> conflict-mutants finding: revisions counted from 0 at every rebuild let one). Test:
+> `crates/server/tests/merge_check.rs` (one history on one shard and on eight; the restart; the kept mode).
 > The same three are MCP tools (`slates.merge.check`, `slates.merge.read_check`, `slates.merge.resolve`) and CLI verbs
 > (`slates check WORK`, `slates resolve JSON`, the resolution as the tool's JSON object), one JSON shape for both
 > (`slates_mcp::merge_check_json`, `resolve_args`; §4.12 schema parity). Test: `crates/mcp/tests/mcp.rs`
@@ -57756,9 +57759,11 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > store is `crate::test_store` (main's ruling 1's helper). Part 2a (2026-11-21): a daemon without `--vcs-store`
 > refuses a git repository's creation, `Unsupported` naming the flag, as it refuses Mercurial's and Subversion's (one
 > rule for the three tools), and git's tests run on store-backed daemons through that helper; a rebuild on a node whose
-> store holds the changeset reads it from there, not from the region. Owed (part 2b): versions 2 and a sequence of 0
-> gone (a homing or landing that falls short refuses the push); the replay's pack read a piece at a time through
-> `StorePacks`.
+> store holds the changeset reads it from there, not from the region. Part 2b piece 1 (2026-11-21): a client's push
+> writes version 5 alone, any shortfall of its homing or landing (or names changed since the homing) refusing it
+> `Unlanded` for its client's retry; an append that brings no object names none. Owed: the tests' synchronous push
+> drivers and server-made commits (A-664) still write version 2 until they carry the homing (piece 2) and take the
+> deferred submit's landing order (piece 3); the replay's pack read a piece at a time through `StorePacks`.
 
 > **Status (2026-11-20, C2 stage A: Subversion's history on the store; w-svn, main's rulings of 20:30 and 21:05).** The
 > store is a Subversion repository's truth. Each record it takes (creation, revision, lock entries, revision
@@ -57852,6 +57857,27 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > `land_then_record` runs). Recovery applies only the sequences the register names (decision 2), as C4's replay already
 > did. Held by `repository::tests::a_daemon_without_a_store_refuses_mercurial_and_subversion_naming_the_flag` and every
 > hg test on the helper. Git's create follows as its C item lands.
+
+> **Status (2026-11-21, C1: a changeset replayed from its payload a piece at a time; R2's replay half).** A replay
+> holds no payload whole. `slates_hg::framing` is the one walk of a changegroup's chunks (7.2's `changegroup.py`
+> order), over a `Source` that answers a range or `Wanted`: a slice never wants (a push's bundle, a whole decoding,
+> which counts in one walk and builds in a second, charged exactly between), and a `Window` holds a forward run its
+> driver fills. A step reads only from where it began and changes nothing on a want, so the driver lets go of what is
+> before the want and steps again. The intake reads each delta through it (`Stepped::Wanted`; a file group opens in
+> a step of its own, its path kept), and `record::Replay::begin_sectioned` / `step_sectioned` frame a changeset's
+> payload, then take it. The server fills the window from `StoreHandle::piece` (`vcs_store::fill_window`) for both
+> recovery and rebuild. Held by `a_landed_push_replays_from_its_payload_a_piece_at_a_time`: a 789,956-byte payload, 14
+> fills, the window at most 193,859 bytes. The import as changesets is next (its shape asked of main and w-store).
+
+> **Status (2026-11-21, C1 step 3, first part: an import written as a push's changegroup).** `slates_hg::import::emit`:
+> as the import walks a repository's revlogs (changelog, manifest log, each file log: a changegroup's order), it
+> writes each revision as its revlog stores it, the chunk against its delta parent (7.2's `deltaparent`: none for a
+> full snapshot, the base under generaldelta, else the revision before), a full snapshot as its text against the null
+> base, so nothing is diffed or rebuilt to write it. The stream is cut into segments of at least a bound, only between
+> chunks, each naming its texts (identity, length, delta parent's identity, place) as a push's `Texts` section does.
+> The segments concatenated are a changegroup 03 that the push's intake takes into the import's index row for row
+> (all five of 7.2's store formats). The server's landing of the segments as a run of changesets, and the run's
+> replay, follow main's ruling on the record's shape (inbox/main-from-w-hg-c1-import-design.md).
 
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
@@ -58285,6 +58311,17 @@ Applied in the same change to: §4.16 "Commit" (the record's inputs shipment), G
     - This Mac, load 6 to 16: 69 to 79 µs at 2 MiB, 133 to 157 µs at 8 MiB. Before this, the whole refinement ran inside the submit's step: 14 ms for a 300 KiB file, about
     200 ms at 12 MiB. Turns past the whole quantum: 2 to 4%, past 16 quanta 0.03%. The quantum here is a few µs, the
     shard's measured wake.
+  - **Fixed 2026-11-21 (main's red: `green_post_state` exit 4 in a debug build).** The shard's watchdog ended the
+    daemon on a 3.5 s poll of the job's task. The refinement's own turns were short (34,571 for the 2 MiB test); the
+    long poll was the job's end running the parked submit again, whose re-anchor of the path's history
+    (`history::reanchor`) was O(pieces × runs) twice over:
+    - `Value::remapped` scanned every kept run for each piece; it now uses a sorted index (`KeptIndex`), or the scan
+      when runs overlap, so the result is the scan's either way (property test `the_indexed_remap_is_the_scans`);
+    - `cut_superseded_blocks` scanned the union for each piece; it now binary-searches it.
+    Measured, debug, one path refined whole: 10,000 / 20,000 / 40,000 / 80,000 ops submitted in 0.40 / 1.43 / 5.64 /
+    22.5 s before, 11 / 23 / 44 / 90 ms after. `green_post_state` passes 8 of 8 in 5.2 s.
+  - **A verb outside a recorded request** (a bare dispatch, which no route could answer after the job) composes
+    unrefined and is answered now (645937436, w-fed-faults), as a remote edit-and-submit does.
   - **The remaining tail** follows the largest single buffer freed. Deferring those frees to an idle moment waits on
     A-783's yield-when-someone-waits primitive (GAPS D-O17).
   - **Not refined:** an edit-and-submit of a work off its green's shard. The job reads the writer's bytes from the work,
@@ -58667,6 +58704,11 @@ work, `RebaseAnswer::Checked`), `crates/client/src/client.rs` (`check_merge`, `r
   stamp's revision and base and the green at its head; it retires canonical operations by index, rebases the rest
   onto that head, applies the agent's changes there, and restates the work (A-207's restatement, one recorded step).
   The windows reuse A-267's kept verdict; nothing pages them twice. None of A-255, A-257 or A-263-A-267 is changed.
+- **Metadata and restarts (2026-11-20, finishing the strand at main's routing).** `Green::rebase_establishing` takes
+  the paths a resolution's replacement brings into being; `Resolved::establishes` counts them, so kept metadata on them
+  is judged as on a path the work makes (red: a mode kept on a removed file written anew answered a conflict). A work's
+  revision starts at its partition's `next_seq()` when made or rebuilt (red: a stamp from before a restart named the
+  work after one more edit, `Ok(Rebased(0))`).
 - **Tests.** `crates/server/tests/merge_check.rs` on one shard and on eight (every work off its green's shard): a
   conflicting check names the head and base and changes neither the work's bytes nor the green; a clean check leaves
   the base where it was; the views read both sides; a resolution retiring the work's operations on the file and writing
