@@ -36,6 +36,8 @@
 // Our code adds none. A ClientError cannot cross into Python as a Rust type, so it crosses as a
 // message string on `SlatesError` — the one place a typed error becomes text, and the reason is here.
 
+mod session_log;
+
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -134,6 +136,8 @@ fn merge_outcome_dict(
   let dict = PyDict::new_bound(py);
   dict.set_item("ok", version.is_some())?;
   dict.set_item("version", version)?;
+  // A-782: `True` only for an accepted increment that changed nothing; set by `submitted_to_py`.
+  dict.set_item("identical", false)?;
   let mut conflicts: Vec<Py<PyDict>> = Vec::with_capacity(windows.len());
   for (path, at, len, class) in windows {
     let window = PyDict::new_bound(py);
@@ -273,6 +277,12 @@ fn work_dict(py: Python<'_>, id: VolumeId, base: u64) -> PyResult<Py<PyDict>> {
 fn submitted_to_py(py: Python<'_>, outcome: Submitted) -> PyResult<PyObject> {
   let dict = match outcome {
     Submitted::Accepted(version) => merge_outcome_dict(py, Some(version), Vec::new())?,
+    // Accepted, changing nothing (A-782): every operation was already at the head.
+    Submitted::Identical(version) => {
+      let dict = merge_outcome_dict(py, Some(version), Vec::new())?;
+      dict.bind(py).set_item("identical", true)?;
+      dict
+    }
     // A merge an ask write policy holds (A-285): the increment's identity the launcher's approval binds, and its paths.
     Submitted::ApprovalRequired { identity, paths } => {
       let dict = merge_outcome_dict(py, None, Vec::new())?;
@@ -392,6 +402,14 @@ impl Client {
     let id = parse_volume(volume)?;
     let report = self.inner.status(id).map_err(refusal)?;
     status_dict(py, report)
+  }
+
+  /// The session log (A-773) as a dict, the shape `slates log --json` prints: `needs_you` first (collided works, merges
+  /// held for approval, landings awaiting a grant, each with its `kind`), then `greens` (each `head` and its `works`:
+  /// `base`, `behind`, `mark`) and `awaiting_grant`. A read walked a page at a time: it approves and grants nothing.
+  fn session_log(&mut self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+    let log = self.inner.session_log().map_err(refusal)?;
+    session_log::session_log_dict(py, &log)
   }
 
   /// Reads an overlay's whole drift (§4.4 `status`, A-267) as a dict: `drifted`, a list of dicts each with its `path`

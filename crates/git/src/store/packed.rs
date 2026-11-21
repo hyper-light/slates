@@ -20,12 +20,19 @@
 //! once its scratch has grown to the largest object it read. Each entry's data is inflated from the windows it lies in,
 //! a window lent at a time, never copied whole.
 //!
+//! **Objects read lately** ([`Recent`]; git's delta base cache, `core.deltaBaseCacheLimit`). A chain read whole for
+//! each of its members costs its depth for each (git/git's v1.5.0 pack: 23,653 deltas, chains 12.6 deep on average,
+//! 297,700 deltas applied where 23,653 suffice). A read stops at the first entry of its chain the scratch keeps, and
+//! keeps each object it builds, the oldest given back past a budget its caller learns from the work (a push's: its
+//! pack's length, so what it keeps is held to what it was sent).
+//!
 //! **Bounds (§4.9).** Every size a header names is held to the caller's room before any buffer grows to it. An
 //! OFS_DELTA's base lies before its entry ([`entry::read`] refuses one that does not), so a chain within one pack ends; a
 //! REF_DELTA's base that leads back to an entry already on the chain is refused (`Cycle`), so no chain loops. A stream
 //! that inflates to other than its header's size, or bytes no inflater takes, are refused where they begin.
 
 use std::borrow::Cow;
+use std::collections::{BTreeMap, VecDeque};
 
 use flate2::{Decompress, FlushDecompress, Status};
 use slates_vcs::{ContentId, ContentStore};
@@ -151,9 +158,100 @@ pub struct Scratch {
   chain: Vec<Link>,
   /// An entry's header's bytes, gathered across windows.
   header: Vec<u8>,
+  /// The objects read lately (module docs, "Objects read lately").
+  recent: Recent,
+}
+
+/// Objects read lately, by where their entries begin (module docs, "Objects read lately"): none kept past `budget`
+/// bytes, the oldest given back first.
+#[derive(Debug, Default)]
+pub struct Recent {
+  /// Each object kept: its type and bytes. Kept because a delta read later starts from it rather than its chain's
+  /// base; held to `budget`.
+  objects: BTreeMap<(ContentId, u64), (Kind, Vec<u8>)>,
+  /// The objects kept, oldest first. Kept to give back the oldest; one entry an object kept.
+  order: VecDeque<(ContentId, u64)>,
+  /// The bytes kept.
+  bytes: usize,
+  /// The most bytes kept: zero keeps none.
+  budget: usize,
+}
+
+impl Recent {
+  /// The object kept for the entry at `place`.
+  fn get(&self, place: InPack) -> Option<(Kind, &[u8])> {
+    self
+      .objects
+      .get(&(place.pack, place.offset))
+      .map(|(kind, bytes)| (*kind, bytes.as_slice()))
+  }
+
+  /// Keeps `bytes`, the object of type `kind` whose entry begins at `place`, taken whole (no copy): none kept where it
+  /// alone passes the budget or the entry's object is kept already.
+  pub fn keep(&mut self, place: InPack, kind: Kind, bytes: Vec<u8>) {
+    if !self.takes(place, bytes.len()) {
+      return;
+    }
+    self.make_room(bytes.len());
+    self.insert(place, kind, bytes);
+  }
+
+  /// Keeps a copy of `bytes` (as [`Recent::keep`]), into the buffer of an object given back to make room where there
+  /// is one.
+  fn keep_copy(&mut self, place: InPack, kind: Kind, bytes: &[u8]) {
+    if !self.takes(place, bytes.len()) {
+      return;
+    }
+    let mut copy = self.make_room(bytes.len()).unwrap_or_default();
+    copy.clear();
+    copy.extend_from_slice(bytes);
+    self.insert(place, kind, copy);
+  }
+
+  /// Whether an object `len` bytes long whose entry begins at `place` is kept.
+  fn takes(&self, place: InPack, len: usize) -> bool {
+    len <= self.budget && !self.objects.contains_key(&(place.pack, place.offset))
+  }
+
+  /// Gives back the oldest objects until `len` bytes more fit the budget: the last one's buffer.
+  fn make_room(&mut self, len: usize) -> Option<Vec<u8>> {
+    let mut freed = None;
+    while self.bytes.saturating_add(len) > self.budget {
+      let oldest = self.order.pop_front()?;
+      if let Some((_, given)) = self.objects.remove(&oldest) {
+        self.bytes = self.bytes.saturating_sub(given.len());
+        freed = Some(given);
+      }
+    }
+    freed
+  }
+
+  /// Keeps `bytes` as the newest.
+  fn insert(&mut self, place: InPack, kind: Kind, bytes: Vec<u8>) {
+    let key = (place.pack, place.offset);
+    self.bytes = self.bytes.saturating_add(bytes.len());
+    self.order.push_back(key);
+    self.objects.insert(key, (kind, bytes));
+  }
+
+  /// The bytes kept.
+  pub fn bytes(&self) -> usize {
+    self.bytes
+  }
+
+  /// Holds what is kept to `budget` bytes from now on, the oldest given back to fit.
+  pub fn set_budget(&mut self, budget: usize) {
+    self.budget = budget;
+    self.make_room(0);
+  }
 }
 
 impl Scratch {
+  /// The objects read lately (module docs, "Objects read lately").
+  pub fn recent(&mut self) -> &mut Recent {
+    &mut self.recent
+  }
+
   /// Gives back every buffer's room past `keep` bytes: the work's working set, learned by its caller (MEMORY SIZING:
   /// nothing stays resident because a past object was large).
   pub fn shrink(&mut self, keep: usize) {
@@ -179,6 +277,11 @@ pub fn read(
   scratch.chain.clear();
   let mut at = place;
   let (kind, base) = loop {
+    if let Some((kind, kept)) = scratch.recent.get(at) {
+      scratch.built.clear();
+      scratch.built.extend_from_slice(kept);
+      break (kind, None);
+    }
     let (header, data) = header_at(store, at, format, (&mut scratch.header, room))?;
     match header.representation {
       Representation::Whole(kind) => {
@@ -221,12 +324,14 @@ pub fn read(
   // A base whole in a pack is inflated now; one held whole outside every pack is in `built` already.
   if let Some(link) = base {
     inflate_into(store, link, room, &mut scratch.built)?;
+    scratch.recent.keep_copy(link.entry, kind, &scratch.built);
   }
   let Scratch {
     built,
     next,
     delta: delta_bytes,
     chain,
+    recent,
     ..
   } = scratch;
   for link in chain.iter().rev() {
@@ -234,6 +339,7 @@ pub fn read(
     next.clear();
     delta::apply_to(built, delta_bytes, next).map_err(PackedRefused::Delta)?;
     core::mem::swap(built, next);
+    recent.keep_copy(link.entry, kind, built);
   }
   core::mem::swap(out, built);
   Ok(kind)

@@ -575,3 +575,137 @@ fn an_export_rebuilds_a_long_delta_chain_a_window_a_call() {
     counted.steps.get()
   );
 }
+
+/// main's order of 2026-11-20 after w-bugs' run 13 (svn:// update still twice run 8's time: each 1,024-byte read made its
+/// whole delta window again). Do: commit revision 1, then 12 edits of [`FILE`], a 300 KiB text changing one line in
+/// each; read each revision's text in 1,024-byte pieces through one reader's `WindowCache`, as a fetch reads; then read
+/// one text again with a fresh cache, and the same text with no cache. Expect: every piece the text's bytes; each reader
+/// making each delta window of its text once (the windows made equal to the windows read, not to the pieces); the cache
+/// the reader's own, so a second reader makes the windows again, and reads with no cache make one a piece.
+#[test]
+fn s4_c2_a_reader_makes_each_window_of_a_text_once_whatever_the_pieces() {
+  let mut repository = created();
+  repository.commit(first()).unwrap();
+  let line =
+    |at: usize, version: usize| format!("{at:06} a line of the long file, version {version:04}\n");
+  let version = |n: usize| -> Vec<u8> {
+    (0..7_000)
+      .map(|at| line(at, if at == n * 331 % 7_000 { n } else { 0 }))
+      .collect::<String>()
+      .into_bytes()
+  };
+  let mut texts = Vec::new();
+  for n in 1..=12usize {
+    let bytes = version(n);
+    repository
+      .commit(edit(u64::try_from(n).unwrap(), &bytes, Vec::new()))
+      .unwrap();
+    texts.push(bytes);
+  }
+  let window = usize::try_from(crate::svndiff::WINDOW_LIMIT).unwrap();
+  let read = |bytes: &[u8], cache: Option<&mut crate::reads::WindowCache>| {
+    let identity = *blake3::hash(bytes).as_bytes();
+    let mut cache = cache;
+    let mut at = 0usize;
+    while at < bytes.len() {
+      let offset = u64::try_from(at).unwrap();
+      let run = match cache.as_deref_mut() {
+        Some(cache) => crate::reads::Repository::text_in(&repository, &identity, offset, cache)
+          .unwrap()
+          .into_owned(),
+        None => crate::reads::Repository::text(&repository, &identity, offset)
+          .unwrap()
+          .into_owned(),
+      };
+      let piece = &run[..run.len().min(1_024)];
+      assert_eq!(piece, &bytes[at..at + piece.len()]);
+      at += piece.len();
+    }
+  };
+  let windows_of = |bytes: &[u8]| u64::try_from(bytes.len().div_ceil(window)).unwrap();
+  let before = repository.windows_made();
+  for bytes in &texts {
+    let mut cache = crate::reads::WindowCache::new();
+    read(bytes, Some(&mut cache));
+  }
+  let made: u64 = repository.windows_made() - before;
+  let windows: u64 = texts.iter().map(|bytes| windows_of(bytes)).sum();
+  assert_eq!(made, windows, "each window a reader reads made once");
+  let last = texts.last().unwrap();
+  let before = repository.windows_made();
+  let mut again = crate::reads::WindowCache::new();
+  read(last, Some(&mut again));
+  assert!(
+    repository.windows_made() - before >= windows_of(last),
+    "a second reader makes its own"
+  );
+  let before = repository.windows_made();
+  read(last, None);
+  let pieces = u64::try_from(last.len().div_ceil(1_024)).unwrap();
+  assert!(
+    repository.windows_made() - before >= pieces,
+    "no cache: a window a piece"
+  );
+}
+
+/// svnsync's replay over the records (main's order of 2026-11-20: git-2000.dump replayed at 0.54 s a revision; a
+/// sample of the replay found 60% of its time in LZ4 decompression, each delta window made again for every 1,024-byte
+/// piece a step read of it). Do: commit [`FILE`] with a 512 KiB text, edit a few bytes of it in each of 31 revisions so
+/// the youngest is kept as a chain of skip deltas, then replay the youngest revision with deltas as `svnsync` asks
+/// (`replay` low water mark 0, `send-deltas`), counting the delta windows the reads ask the records for
+/// ([`Repository::windows_made`]). Expect: the stream ends, and at most two windows for each of the two texts' drive
+/// windows were made (one, or two where a drive window straddles a delta window's end): each window a reader is in made
+/// once (A-772, held by w-perf's `WindowCache`, b51f908f2). Before it, each 1,024-byte piece made its window again.
+#[test]
+fn a_replay_makes_each_delta_window_a_bounded_number_of_times() {
+  use crate::report::drive::replay::{Replay, Stepped};
+  use crate::svndiff::WINDOW_LIMIT;
+  const LEN: usize = 512 * 1024;
+  let mut bytes: Vec<u8> = (0..LEN).map(|at| u8::try_from(at % 251).unwrap()).collect();
+  let mut repository = created();
+  let mut opening = first();
+  let (alpha, _) = content(b"alpha\n");
+  opening.contents.remove(&alpha);
+  let (identity, held) = content(&bytes);
+  opening.contents.insert(identity, held);
+  if let Some(file) = opening
+    .record
+    .changes
+    .iter_mut()
+    .find(|row| row.path == FILE)
+  {
+    file.text = Some(text_of(&bytes));
+  }
+  let checked = repository.check(opening).unwrap();
+  repository.apply(checked).unwrap();
+  for head in 1..32u64 {
+    let at = usize::try_from(head).unwrap() * 4_099 % LEN;
+    bytes[at] = bytes[at].wrapping_add(1);
+    let checked = repository.check(edit(head, &bytes, Vec::new())).unwrap();
+    repository.apply(checked).unwrap();
+  }
+  let identity = *blake3::hash(&bytes).as_bytes();
+  let chain = repository.text_chain(&identity).unwrap();
+  assert!(chain >= 5, "a chain of {chain}");
+  let youngest = repository.youngest();
+  let before = repository.windows_made();
+  let mut replay = Replay::new(youngest, "/", 0, true);
+  let mut steps = 0u64;
+  loop {
+    steps += 1;
+    assert!(steps < 1 << 24, "the replay never ended");
+    if let Stepped::Ended = replay
+      .next_within((repository.index(), &repository), None, 1)
+      .unwrap()
+    {
+      break;
+    }
+  }
+  let made = repository.windows_made() - before;
+  let drive_windows = u64::try_from(LEN).unwrap().div_ceil(WINDOW_LIMIT);
+  let bound = 2 * 2 * drive_windows;
+  assert!(
+    made <= bound,
+    "{made} delta windows made replaying a {LEN}-byte text with a chain of {chain}; bound {bound}"
+  );
+}

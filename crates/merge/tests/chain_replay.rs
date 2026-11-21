@@ -320,7 +320,9 @@ impl History {
       self.twin.submit(&increment),
       "the verdict on a further increment"
     );
-    if let (Outcome::Accepted { version }, Some(applied)) = (&outcome, applied) {
+    if let (Outcome::Accepted { version } | Outcome::Identical { version }, Some(applied)) =
+      (&outcome, applied)
+    {
       self.ran.kinds.extend(applied.iter().map(kind_of));
       self.identities.insert(*version, self.live.head_identity());
       let recorded = self
@@ -391,7 +393,10 @@ impl History {
         let mut build = common::Build::new();
         build.create(&name, &[0xF0; 32]);
         let base = self.base(*behind);
-        if matches!(self.submit(&build, base), Outcome::Accepted { .. }) {
+        if matches!(
+          self.submit(&build, base),
+          Outcome::Accepted { .. } | Outcome::Identical { .. }
+        ) {
           self.fresh.push(name);
         }
       }
@@ -444,18 +449,24 @@ impl History {
     let name = format!("over-{}", self.next_id);
     let (made, changed, late) = read.builds(&name);
     let base = self.base(0);
-    assert!(matches!(self.submit(&made, base), Outcome::Accepted { .. }));
+    assert!(matches!(
+      self.submit(&made, base),
+      Outcome::Accepted { .. } | Outcome::Identical { .. }
+    ));
     if !matches!(read, BaseRead::SpecialKind) {
       self.fresh.push(name);
     }
     let before = self.base(0);
     assert!(matches!(
       self.submit(&changed, before),
-      Outcome::Accepted { .. }
+      Outcome::Accepted { .. } | Outcome::Identical { .. }
     ));
     let outcome = self.submit(&late, before);
     assert!(
-      matches!(outcome, Outcome::Accepted { .. }),
+      matches!(
+        outcome,
+        Outcome::Accepted { .. } | Outcome::Identical { .. }
+      ),
       "{read:?} over a change is accepted live: {outcome:?}"
     );
     before
@@ -503,7 +514,13 @@ fn a_history_reaches_every_dimension_across_a_checkpoint() {
     build(&mut built);
     let base = history.base(0);
     let outcome = history.submit(&built, base);
-    assert!(matches!(outcome, Outcome::Accepted { .. }), "{outcome:?}");
+    assert!(
+      matches!(
+        outcome,
+        Outcome::Accepted { .. } | Outcome::Identical { .. }
+      ),
+      "{outcome:?}"
+    );
   };
   each(&|b| {
     b.create("file", b"0123456789");
@@ -550,14 +567,14 @@ fn a_history_reaches_every_dimension_across_a_checkpoint() {
   let base = history.base(0);
   assert!(matches!(
     history.submit(&special, base),
-    Outcome::Accepted { .. }
+    Outcome::Accepted { .. } | Outcome::Identical { .. }
   ));
   let mut gone = common::Build::new();
   gone.remove("pipe");
   let base = history.base(0);
   assert!(matches!(
     history.submit(&gone, base),
-    Outcome::Accepted { .. }
+    Outcome::Accepted { .. } | Outcome::Identical { .. }
   ));
   // Two works' identical edit of one file over one base, and an edit that outlives a checkpoint above its base.
   history.step(&Step::Fresh(0));
@@ -668,7 +685,7 @@ fn two_clients_taking_turns_keep_folding_and_stay_bounded() {
     build.create(&format!("client-{who}-{n}"), &[n]);
     let increment = build.with_id(id(usize::from(n)), bases[who]);
     let (outcome, applied) = live.submit_resolved(&increment);
-    let Outcome::Accepted { version } = outcome else {
+    let (Outcome::Accepted { version } | Outcome::Identical { version }) = outcome else {
       panic!("disjoint files are accepted: {outcome:?}");
     };
     bases[who] = version;

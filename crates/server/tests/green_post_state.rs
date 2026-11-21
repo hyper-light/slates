@@ -494,3 +494,74 @@ fn other_kind(
     _ => WorkOp::Mkdir { path: name },
   }
 }
+
+/// D-O17 (A-776). Do: on a one-shard daemon, make a green whose file `f` holds 200 short functions; from two works on
+/// that version, rewrite `f` whole, the first changing a line near the top through one edit of the whole file (a
+/// formatter's or a codemod's write), the second a line near the end the way an editor saves (write `.f.swp`, rename
+/// it over `f`); submit both; read the head. Expect: both accepted, the head holding both edits. Each work declared the
+/// whole file replaced, so until the seal recovered the edits each made, the second was an overlap conflict.
+#[test]
+fn two_whole_file_rewrites_of_different_lines_merge_as_their_edits() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-rewrites-{}", std::process::id());
+  let daemon = Daemon::start(
+    &profile,
+    DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS)),
+    slates_server::SegmentSource::Create {
+      name: common::fixture_object("slates-seg", "rewrites"),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let base: String = (0..200)
+    .map(|n| format!("fn f{n}(a: u32) -> u32 {{\n    a + {n}\n}}\n"))
+    .collect();
+  let first = base.replacen("a + 3\n", "a * 3\n", 1);
+  let second = base.replacen("a + 190\n", "a - 190\n", 1);
+  let mut client = connect(&instance);
+  let green = client.create_green("rewrites-green", false).unwrap();
+  let (seed, _) = client.create_work(green, "rewrites-seed").unwrap();
+  client.edit(seed, "f", 0, 0, base.as_bytes()).unwrap();
+  let seeded = client.submit(seed);
+  let (formatter, _) = client.create_work(green, "rewrites-formatter").unwrap();
+  let (editor, _) = client.create_work(green, "rewrites-editor").unwrap();
+  client
+    .edit(formatter, "f", 0, base.len() as u64, first.as_bytes())
+    .unwrap();
+  client
+    .edit(editor, ".f.swp", 0, 0, second.as_bytes())
+    .unwrap();
+  client
+    .declare(
+      editor,
+      slates_ipc::protocol::WorkOp::Rename {
+        from: ".f.swp".to_owned(),
+        to: "f".to_owned(),
+      },
+    )
+    .unwrap();
+  let formatted = client.submit(formatter);
+  let edited = client.submit(editor);
+  let head = client.read(green, "f", ReadAt::Head);
+  drop(client);
+  daemon.stop();
+  assert!(
+    matches!(seeded, Ok(Submitted::Accepted(1))),
+    "seeded: {seeded:?}"
+  );
+  assert!(
+    matches!(formatted, Ok(Submitted::Accepted(2))),
+    "formatter: {formatted:?}"
+  );
+  assert!(
+    matches!(edited, Ok(Submitted::Accepted(3))),
+    "editor: {edited:?}"
+  );
+  assert_eq!(
+    String::from_utf8(head.unwrap()).unwrap(),
+    first.replacen("a + 190\n", "a - 190\n", 1),
+    "the head holds both edits"
+  );
+}

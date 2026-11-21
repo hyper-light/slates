@@ -156,6 +156,13 @@ impl VolumeSet for ShardVolumeSet {
   fn entries(&self) -> Vec<(String, VolumeId)> {
     let capability = self.capability;
     state::with_state(|s| {
+      // A work mounts like any volume (A-774): its capability's volume gets its slot here, at the mount's first look.
+      if let Some((attachment, _)) = capability
+        && let Some(record) = s.db.partition().attachment(attachment)
+      {
+        let volume = record.volume;
+        crate::mounted_work::ensure_slot(s, volume);
+      }
       // List each volume under its provisioned mount name (its slot's `name`), so `ls /` shows friendly
       // names and `cd <name>` resolves by matching it (`MultiExport`) — but only the volume the presented
       // mount capability authorizes (§4.13; AUD-01). Without a capability nothing is listed: a volume
@@ -336,6 +343,8 @@ fn with_export<R>(
   capability: MountCapability,
   f: impl FnOnce(&mut Export<'_>) -> R,
 ) -> Option<R> {
+  // A mounted work's slot, made again after a restart (A-774).
+  crate::mounted_work::ensure_slot(s, volume);
   let handle = *s.by_id.get(&volume)?;
   crate::verbs::relieve_deferred(s);
   let write_verifier = s.write_verifier;
@@ -365,8 +374,16 @@ fn with_export<R>(
     nfs_v4_files,
     snapshot_views,
     nfs_pending_base,
+    greens,
+    merge,
     ..
   } = s;
+  // A mounted work's base is its green at its pin, lent with the slot's tree host (A-774).
+  let lent_green = crate::mounted_work::source(greens, &merge.mounted, volume);
+  let green_tree = lent_green
+    .as_ref()
+    .map(|(green, version)| crate::green_tree::GreenTree::at(green, *version));
+  let mut tree_lens = None;
   let mut handles = new_handle_store();
   // The slot's base host is lent through a lens that notes the fetch a host call of this request met pending (A-555):
   // the bridge answers the refusal on the wire, and the call then parks on that fetch (`serve_local_held`).
@@ -377,10 +394,13 @@ fn with_export<R>(
       Some(view) => VolumeBridge::attached(volume, &mut view.volume, store, &mut handles, None),
       None => {
         let slot = volumes.get_mut(handle).ok()?;
-        lens = slot
-          .host
-          .as_mut()
-          .map(|host| crate::base_wait::Lens::over(host));
+        lens = slot.host.as_mut().map(|host| {
+          crate::base_wait::Lens::over(crate::mounted_work::lend(
+            host,
+            green_tree.as_ref(),
+            &mut tree_lens,
+          ))
+        });
         VolumeBridge::attached(
           volume,
           &mut slot.volume,

@@ -76,10 +76,10 @@ pub struct Session<'s, H> {
   /// The first object of the pack git's checks refuse, found as each object was kept (A-719 part 3:
   /// its bytes in hand, so the checks after the pack read none of them again for this).
   refused: Option<(ObjectId, crate::objects::FsckId)>,
-  /// The pack's bytes as the client sent them, compressed and with its deltas, charged to the admission as they arrive
-  /// (A-723): what the push's record keeps durably in place of its objects inflated, taken once by the caller
-  /// ([`Session::take_pack`]).
-  pack: Vec<u8>,
+  /// How many of the client's bytes were the pack's, each charged to the admission as it arrived: what the caller keeps
+  /// of them is its own (a server's push holds the pack as its objects' one copy, A-723 and main's ruling B part 2), so
+  /// the session keeps none ([`Session::pack_len`]).
+  pack_len: u64,
 }
 
 impl<'s, H: HiddenRefs> Session<'s, H> {
@@ -91,7 +91,7 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
       state: State::Request(RequestReader::new(advertised)),
       held: Held::default(),
       refused: None,
-      pack: Vec::new(),
+      pack_len: 0,
     }
   }
 
@@ -168,7 +168,7 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
     admission
       .charge(crate::to_u64(rest.len()))
       .map_err(Refusal::PastAdmission)?;
-    self.pack.extend_from_slice(rest);
+    self.pack_len = self.pack_len.saturating_add(crate::to_u64(rest.len()));
     let mut fscking = Fscking {
       site: &mut *site,
       format: self.advertised.format,
@@ -308,10 +308,11 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
     decide(checked, contents, judge, admission).map(Some)
   }
 
-  /// The pack's bytes as the client sent them (A-723), taken once: the caller's record keeps them durably, compressed and
-  /// with their deltas, so a push's objects are never recorded inflated. Empty when no pack was sent, or once taken.
-  pub fn take_pack(&mut self) -> Vec<u8> {
-    core::mem::take(&mut self.pack)
+  /// How many of the client's bytes so far were the pack's: the pack is the last of each call's bytes, so a caller that
+  /// keeps it takes the bytes past what it kept from the end of the call's (A-723: its record keeps them durably,
+  /// compressed and with their deltas, so a push's objects are never recorded inflated).
+  pub fn pack_len(&self) -> u64 {
+    self.pack_len
   }
 
   /// Whether the push is answered, or was refused.

@@ -1314,7 +1314,9 @@ impl ReplicaSeed {
     };
     let increment = Increment::decode(&bytes).map_err(|_| INPUTS_UNDECODABLE)?;
     match step.replica.submit(&increment) {
-      Outcome::Accepted { version } if version == step.version => {}
+      // An identical increment is accepted too (A-782): its version commits nothing new.
+      Outcome::Accepted { version } | Outcome::Identical { version } if version == step.version => {
+      }
       // The owner accepted it, and this holder too before its restart; anything else has diverged.
       _ => return Err(RECOMPUTE_MISMATCH),
     }

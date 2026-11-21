@@ -628,6 +628,10 @@ pub(crate) struct WindowWork {
   write: usize,
   /// How far into it.
   at: usize,
+  /// The target's window its reads are in, made once and lent across its steps (main's order of 2026-11-20).
+  target_cache: crate::reads::WindowCache,
+  /// The source's window its reads are in, likewise.
+  source_cache: crate::reads::WindowCache,
 }
 
 /// The units a drive's step takes of a window's making: bytes read or sent, or the maker's units
@@ -1796,11 +1800,21 @@ pub(crate) fn window_unit<R: Repository + ?Sized>(
   };
   let units = if work.target.len() < work.target_len {
     let piece = (*delta.sent, work.target_len);
-    read_piece(repository, &delta.text, piece, &mut work.target)?
+    read_piece(
+      repository,
+      &delta.text,
+      piece,
+      (&mut work.target, &mut work.target_cache),
+    )?
   } else if work.source.len() < work.source_len {
     let source = delta.source.ok_or_else(DriveFailure::corrupt)?;
     let piece = (work.view, work.source_len);
-    read_piece(repository, &source, piece, &mut work.source)?
+    read_piece(
+      repository,
+      &source,
+      piece,
+      (&mut work.source, &mut work.source_cache),
+    )?
   } else if work.making.as_ref().and_then(WindowMaking::made).is_none() {
     make_window(&mut work, encoding)?
   } else {
@@ -1924,6 +1938,8 @@ fn begun_window(sent: u64, source: Option<Text>, text: &Text) -> Result<WindowWo
     header: None,
     write: 0,
     at: 0,
+    target_cache: crate::reads::WindowCache::new(),
+    source_cache: crate::reads::WindowCache::new(),
   })
 }
 
@@ -1932,14 +1948,14 @@ fn read_piece<R: Repository + ?Sized>(
   repository: &R,
   text: &Text,
   (offset, want): (u64, usize),
-  piece: &mut Vec<u8>,
+  (piece, cache): (&mut Vec<u8>, &mut crate::reads::WindowCache),
 ) -> Result<usize, DriveFailure> {
   let at = u64::try_from(piece.len())
     .ok()
     .and_then(|read| offset.checked_add(read))
     .ok_or_else(DriveFailure::corrupt)?;
   let run = repository
-    .text(&text.identity, at)
+    .text_in(&text.identity, at, cache)
     .filter(|run| !run.is_empty())
     .ok_or_else(DriveFailure::corrupt)?;
   let take = run

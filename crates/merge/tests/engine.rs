@@ -29,6 +29,7 @@ fn conflict_class(outcome: &Outcome) -> Option<MergeConflictClass> {
   match outcome {
     Outcome::Conflict { windows } => windows.first().map(|window| window.class),
     Outcome::Accepted { .. }
+    | Outcome::Identical { .. }
     | Outcome::BaseUnavailable { .. }
     | Outcome::CopyRefused { .. }
     | Outcome::ContentUnread { .. } => None,
@@ -100,7 +101,7 @@ fn an_identical_edit_accepts() {
   let same = green.submit(&Build::new().overwrite("f", 5, b"AAAA").at(3, 1));
   assert_eq!(
     same,
-    Outcome::Accepted { version: 3 },
+    Outcome::Identical { version: 3 },
     "identical edit accepts"
   );
 }
@@ -421,13 +422,19 @@ fn a_verdict_consults_only_the_deltas_that_changed_its_paths() {
         .overwrite("b", 0, &[u8::try_from(n % 251).unwrap()])
         .with_id(long_id(n), base)
     };
-    assert!(matches!(green.submit(&build), Outcome::Accepted { .. }));
+    assert!(matches!(
+      green.submit(&build),
+      Outcome::Accepted { .. } | Outcome::Identical { .. }
+    ));
   }
   let before = green.deltas_visited();
   let lagging = Build::new()
     .overwrite("a", 4, b"Y")
     .with_id(long_id(OTHER_VERSIONS), 1);
-  assert!(matches!(green.submit(&lagging), Outcome::Accepted { .. }));
+  assert!(matches!(
+    green.submit(&lagging),
+    Outcome::Accepted { .. } | Outcome::Identical { .. }
+  ));
   assert_eq!(green.content("a"), Some(b"XaaaYaaa".as_slice()));
   assert_eq!(
     green.deltas_visited() - before,
@@ -490,7 +497,7 @@ fn identical_create_accepts() {
   green.submit(&Build::new().create("seed", b"x").at(1, 0));
   green.submit(&Build::new().create("new", b"same").at(2, 1));
   let b = green.submit(&Build::new().create("new", b"same").at(3, 1));
-  assert_eq!(b, Outcome::Accepted { version: 3 });
+  assert_eq!(b, Outcome::Identical { version: 3 });
   assert_eq!(green.content("new"), Some(b"same".as_slice()));
 }
 
@@ -519,7 +526,7 @@ fn removes_accept() {
   let again = green.submit(&Build::new().remove("f").at(3, 1));
   assert_eq!(
     again,
-    Outcome::Accepted { version: 3 },
+    Outcome::Identical { version: 3 },
     "already gone is a no-op"
   );
 }
@@ -535,7 +542,7 @@ fn mkdir_and_type_conflicts() {
   assert!(green.is_dir("d"));
   assert_eq!(
     green.submit(&Build::new().mkdir("d").at(2, 1)),
-    Outcome::Accepted { version: 2 }
+    Outcome::Identical { version: 2 }
   );
   green.submit(&Build::new().create("a", b"file").at(3, 2));
   assert_eq!(
@@ -558,7 +565,7 @@ fn mode_merges() {
   );
   assert_eq!(
     green.submit(&Build::new().setmode("f", 0o600).at(4, 1)),
-    Outcome::Accepted { version: 3 }
+    Outcome::Identical { version: 3 }
   );
   // A content edit based on version 1 does not conflict with the intervening mode change.
   let edit = green.submit(&Build::new().overwrite("f", 0, b"AB").at(5, 1));
@@ -702,7 +709,7 @@ fn xattr_merges() {
   assert_eq!(green.xattr("f", "user.a"), Some(b"1".as_slice()));
   assert_eq!(
     green.submit(&Build::new().setxattr("f", "user.a", b"1").at(3, 1)),
-    Outcome::Accepted { version: 3 }
+    Outcome::Identical { version: 3 }
   );
   assert_eq!(
     conflict_class(&green.submit(&Build::new().setxattr("f", "user.a", b"2").at(4, 1))),
@@ -980,7 +987,11 @@ proptest! {
         "a block changed differently by both sides must conflict; got {outcome:?}"
       );
     } else {
-      prop_assert_eq!(&outcome, &Outcome::Accepted { version: if any_green { 3 } else { 2 } });
+      let version = if any_green { 3 } else { 2 };
+      // A-782: every block the agent touched the green set to the same tag, so the increment changes nothing.
+      let identical = (0..BLOCKS).all(|b| agent[b] == 0 || agent[b] == green[b]);
+      let answered = if identical { Outcome::Identical { version } } else { Outcome::Accepted { version } };
+      prop_assert_eq!(&outcome, &answered);
       let expected = reference_merge(&green, &agent);
       prop_assert_eq!(volume.content("f").unwrap(), expected.as_slice());
     }
@@ -1364,7 +1375,13 @@ fn a_conflicting_verdict_makes_no_file_and_an_accept_makes_each_once() {
     "a conflict makes no file"
   );
   let outcome = green.submit(&Build::new().overwrite("a", 1, b"A").at(5, 3));
-  assert!(matches!(outcome, Outcome::Accepted { .. }), "{outcome:?}");
+  assert!(
+    matches!(
+      outcome,
+      Outcome::Accepted { .. } | Outcome::Identical { .. }
+    ),
+    "{outcome:?}"
+  );
   assert_eq!(green.content("a"), Some(b"aAaa".as_slice()));
   assert_eq!(
     green.mapped_files_made(),

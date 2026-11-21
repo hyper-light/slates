@@ -55,7 +55,7 @@ test('the addon loads and exposes the Client surface', async (t) => {
     'create', 'snapshot', 'status', 'list', 'resize', 'destroy',
     'createGreen', 'createWork', 'versions', 'changedSince', 'edit', 'submit', 'rebase',
     'unlink', 'rename', 'mkdir', 'rmdir', 'chmod', 'symlink', 'link', 'setXattr', 'removeXattr', 'copy',
-    'clientId', 'reconnects', 'spinFor', 'parkRatio',
+    'clientId', 'reconnects', 'spinFor', 'parkRatio', 'sessionLog',
   ];
   for (const verb of expected) {
     assert.ok(methods.includes(verb), `Client.prototype has ${verb}`);
@@ -248,6 +248,26 @@ test('lifecycle round trip over a live daemon', async (t) => {
     const empty = client.createWork(green, 'w-copy-nothing-node');
     client.copy(empty.id, '/nothing', '/z');
     assert.throws(() => client.submit(empty.id), /CopyRefused.*source_empty/);
+
+    // the session log (A-773), `slates log --json`'s view in camelCase: two works over a fresh green edit one span
+    // differently; the second collides and is the one decision that needs a person.
+    const watched = client.createGreen('g-log-node');
+    const first = client.createWork(watched, 'w-log-first-node');
+    const second = client.createWork(watched, 'w-log-second-node');
+    client.edit(first.id, '/f.txt', 0, 0, Buffer.from('one'));
+    client.edit(second.id, '/f.txt', 0, 0, Buffer.from('two'));
+    assert.equal(client.submit(first.id).ok, true);
+    assert.equal(client.submit(second.id).ok, false);
+    const log = client.sessionLog();
+    const needs = log.needsYou.filter((n) => n.work === second.id);
+    assert.equal(needs.length, 1, JSON.stringify(log.needsYou));
+    assert.equal(needs[0].kind, 'collided');
+    assert.equal(needs[0].path, 'f.txt');
+    const shown = log.greens.find((g) => g.id === watched);
+    assert.equal(shown.head, 1);
+    const marks = Object.fromEntries(shown.works.map((w) => [w.id, w.mark.state]));
+    assert.equal(marks[first.id], 'accepted');
+    assert.equal(marks[second.id], 'collided');
   } finally {
     await endAnchor(anchor);
   }

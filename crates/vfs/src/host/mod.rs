@@ -9,6 +9,8 @@
 //! lint wall refuses write-capable syscalls (R1).
 
 pub mod sim;
+/// A base read from a tree the shard holds, lent per request (A-774 part 2).
+pub mod tree;
 /// A volume symlink as a Windows symbolic link (A-275): the reparse buffer the WinFsp drive shows and a Windows landing
 /// writes (A-438).
 pub mod windows_link;

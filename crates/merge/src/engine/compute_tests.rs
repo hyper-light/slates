@@ -563,7 +563,7 @@ fn a_verdict_computed_on_a_copy_of_the_chain_is_the_owners_over_every_history() 
 fn landed(green: &mut Green, edits: &[Edit], id: u64) -> u64 {
   let inc = work(green, green.head(), edits, id);
   match green.submit(&inc) {
-    Outcome::Accepted { version } => version,
+    Outcome::Accepted { version } | Outcome::Identical { version } => version,
     other => panic!("not accepted: {other:?}"),
   }
 }
@@ -915,7 +915,7 @@ impl Concurrent {
     let serial = self.serial.submit_resolved(&inc);
     let owner = self.owner.submit_resolved(&inc);
     prop_assert_eq!(&serial, &owner, "a submit answered otherwise");
-    if let (Outcome::Accepted { .. }, Some(applied)) = owner {
+    if let (Outcome::Accepted { .. } | Outcome::Identical { .. }, Some(applied)) = owner {
       self.chain.push((inc.clone(), applied));
     }
     self.made.push(inc);
@@ -1213,7 +1213,7 @@ fn link_removed(green: &mut Green, id: u64) -> u64 {
   let mut draft = Draft::default();
   draft.alone(OpKind::Unlink, LINK);
   match green.submit(&increment(draft, green.head(), id)) {
-    Outcome::Accepted { version } => version,
+    Outcome::Accepted { version } | Outcome::Identical { version } => version,
     other => panic!("not accepted: {other:?}"),
   }
 }

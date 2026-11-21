@@ -585,6 +585,7 @@ async fn ask(
     .into_iter()
     .map(|(peer, endpoint)| (peer, request.to_vec(), endpoint))
     .collect();
+  let began = slates_rt::futures::now_ns();
   let (replies, mut stragglers) = broadcast(requests, STREAM, Priority::Metadata, budget).await;
   fold_replies(answers, query, replies, &mut unanswered);
   loop {
@@ -593,10 +594,12 @@ async fn ask(
     if done {
       break;
     }
-    if slates_rt::futures::sleep(budget.poll_interval_ns)
-      .await
-      .is_err()
-    {
+    // Woken by the next straggler's report (its send wakes this task, the dispatch's collector), within the round's span;
+    // before 2026-11-20 it looked once a poll interval.
+    let left = budget
+      .max_deadline_ns()
+      .saturating_sub(slates_rt::futures::now_ns().saturating_sub(began));
+    if left == 0 || !stragglers.reported(left).await {
       break;
     }
   }
