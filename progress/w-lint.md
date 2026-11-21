@@ -312,3 +312,9 @@
   CommittedPush alias. server vcs_store:: 109 pass, examples and git lib tests build. Host, fmt, structural, unsafe, cross
   clean otherwise. Still with owners: w-git (receive wide_connectivity, which also blocks git's lib tests), w-hg (intake
   helper), w-store (3 literals). Windows requests held for main's word on jupiter.
+
+## 2026-11-21 round 17 at 7e110566d
+- merge push.rs (efe6d2763: deferred push records) on every target: decode split (DeferredReader::head), widths by
+  size_of; push tests GreenReads alias + owed_history split; server push test split, green_ready Copy clone. merge lib
+  258, server repository::push 7 pass. w-git's helper fixed upstream. Still with owners: w-hg (intake helper), w-store
+  (3 literals). Windows requests held for main's word on jupiter.
