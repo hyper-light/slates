@@ -12,7 +12,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: never
-  ARMS: "6e65db464c39d56e3fcd73bc55045bdb44e658be"
+  ARMS: "bc688cefcdd07a0a99e8f6068b69a783115e1ab0"
   ROUNDS: "3"
   G222_SPLIT: "1"
 
@@ -78,7 +78,7 @@ jobs:
             fi
             # Does the newer daemon run inside 256 MB? One short loaded accept under the cap decides; else CPUs only.
             if [ "$(cat "$W/constraint")" = systemd ] && timeout 300 systemd-run --user --scope -q -p MemoryMax=256M -p AllowedCPUs=0-1 \
-                 "$W/bin-6e65db464/edit_merge_bench" --loaded-only --spinners-per-core 2 --files 10 --form accept </dev/null > "$W/logs/probe.log" 2>&1; then
+                 "$W/bin-bc688cefc/edit_merge_bench" --loaded-only --spinners-per-core 2 --files 10 --form accept </dev/null > "$W/logs/probe.log" 2>&1; then
               echo "cap: AllowedCPUs=0-1 MemoryMax=256M" | tee "$W/capnote"
             else
               echo "cap: AllowedCPUs=0-1 only (the 256 MB probe failed: $(tail -2 "$W/logs/probe.log" | tr '\n' ' '))" | tee "$W/capnote"
@@ -105,13 +105,15 @@ jobs:
           set +e
           order() { case $1 in 1) echo $ARMS;; 2) echo $ARMS | awk '{for(i=NF;i>0;i--) printf "%s ", $i}';; *) echo $ARMS | awk '{h=int(NF/2); for(i=h+1;i<=NF;i++) printf "%s ", $i; for(i=1;i<=h;i++) printf "%s ", $i}';; esac; }
           for round in $(seq 1 "$ROUNDS"); do
-            for arm in $ARMS; do
-              s="${arm:0:9}"; B="$W/bin-$s/edit_merge_bench$EXE"; [ -x "$B" ] || continue; L="$W/logs/loaded-$s-r$round.log"
-              echo "== loaded round $round arm $s $(date -u +%FT%TZ) load: $(load) $(cat "$W/capnote")" | tee "$L"
+            if [ $((round % 2)) = 1 ]; then modes="spin park"; else modes="park spin"; fi
+            for mode in $modes; do
+              arm=$ARMS; s="${arm:0:9}"; B="$W/bin-$s/edit_merge_bench$EXE"; [ -x "$B" ] || continue; L="$W/logs/loaded-$s-$mode-r$round.log"
+              if [ $mode = park ]; then export G222_NO_SPIN=1; else unset G222_NO_SPIN; fi
+              echo "== loaded round $round arm $s $mode $(date -u +%FT%TZ) load: $(load) $(cat "$W/capnote")" | tee "$L"
               MEM="-p MemoryMax=256M"; [ -f "$W/nomem" ] && MEM=""
-              G222_DIAG="$W/logs/loaded-$s-r$round.tsv" timeout 1200 systemd-run --user --scope -q $MEM -p AllowedCPUs=0-1 "$W/loaded.sh" "$B" "$W" </dev/null >> "$L" 2>&1
+              G222_DIAG="$W/logs/loaded-$s-$mode-r$round.tsv" timeout 1200 systemd-run --user --scope -q $MEM -p AllowedCPUs=0-1 "$W/loaded.sh" "$B" "$W" </dev/null >> "$L" 2>&1
               echo "exit $?" >> "$L"; grep -E "ratchet-info.*f10_loaded_total_p(50|99|999)\b|exit" "$L" | cut -c1-200
-              python3 - "$W/logs/loaded-$s-r$round.tsv.ring" <<'PY' || true
+              python3 - "$W/logs/loaded-$s-$mode-r$round.tsv.ring" <<'PY' || true
           import sys
           q=[];s=[]
           for l in open(sys.argv[1]).read().splitlines()[1:]:
