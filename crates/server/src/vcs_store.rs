@@ -118,6 +118,7 @@ pub(crate) mod record;
 pub(crate) mod record_names;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod referenced;
+pub(crate) mod svn_deltify;
 pub(crate) mod svn_import;
 pub(crate) mod svn_made;
 pub(crate) mod svn_texts;
@@ -235,6 +236,9 @@ pub(crate) struct VcsStores {
   /// Each git green's whole map built in slices after a push, between its slices ([`paths::whole_build`], A-664's live
   /// whole builds): one a green, so bounded by the partition's greens.
   whole_builds: paths::whole_build::Builds,
+  /// Each Subversion repository's deltify job between its slices ([`svn_deltify`]): one a repository, so bounded by the
+  /// partition's repositories.
+  svn_deltifies: svn_deltify::Deltifies,
   /// Each HTTP commit under way (A-681 part C: a transaction a POST made, between its requests), by repository and
   /// transaction name, with the key of the principal that made it and the monotonic instant of its last step: at most
   /// one a repository and principal, a new POST replacing the older ([`VcsStores::begin_dav_commit`]), so bounded by the
@@ -2456,7 +2460,7 @@ fn replay_into(
     }
     Some(RepositoryStore::Git(store)) => replay_git(content, store, bytes),
     Some(RepositoryStore::Subversion(store)) => {
-      replay_svn((content, store), bytes, svn_room.ok_or(unheld)?).map(|()| 0)
+      replay_svn(store, bytes, svn_room.ok_or(unheld)?).map(|()| 0)
     }
     Some(RepositoryStore::Mercurial(store)) => replay_hg(content, store, bytes),
     None => Err(unheld),
@@ -2580,11 +2584,7 @@ pub(crate) fn lfs_bytes(stores: &VcsStores, id: RepositoryId, oid: &Oid) -> Opti
 /// (`commit_record`): a revision checked and applied, its lock entries as recorded; the UUID and a revision's properties
 /// an import set (A-652 part 3). A record out of its order is refused, and so is one the step refuses; either leaves
 /// the records as they were.
-fn replay_svn(
-  (content, store): (&mut ContentStore, &mut SvnStore),
-  bytes: &[u8],
-  room: SvnRoom,
-) -> Result<(), ReplayRefused> {
+fn replay_svn(store: &mut SvnStore, bytes: &[u8], room: SvnRoom) -> Result<(), ReplayRefused> {
   match SvnRecord::decode(bytes).map_err(ReplayRefused::SvnRecord)? {
     SvnRecord::Created { uuid, date } => {
       if store.records.is_some() {
@@ -2597,27 +2597,50 @@ fn replay_svn(
     record => {
       let records = store.records.as_mut().ok_or(ReplayRefused::SvnOrder)?;
       records.set_room(room);
-      // The texts the revision stored, which the records now reference: each held again in the content store, as the
-      // live landing held it, so a recovery's sweep of unheld content keeps it.
-      let stored: Vec<slates_svn::index::ContentIdentity> = match &record {
-        SvnRecord::Revision(revision) => revision
-          .stored
-          .keys()
-          .filter(|identity| !records.holds(identity))
-          .copied()
-          .collect(),
-        _ => Vec::new(),
-      };
+      // The texts a revision stored are held again once the whole log is replayed (`hold_svn_stored`), not here: a later
+      // entry may keep one as a delta, its whole bytes no longer in the store (the deltify job, `svn_deltify`).
       records
         .commit_record(record)
-        .map_err(ReplayRefused::SvnStep)?;
-      for identity in stored {
-        content
-          .hold(&slates_vcs::ContentId(identity))
-          .map_err(|_| ReplayRefused::SvnStored)?;
-      }
-      Ok(())
+        .map_err(ReplayRefused::SvnStep)
     }
+  }
+}
+
+/// Holds again, in the content store, every text repository `id`'s records keep stored, as the live landings held them,
+/// once its whole log is replayed (module docs; `svn_deltify`), so a recovery's sweep of unheld content keeps them; then
+/// hands the deltify job the stored texts it may take, so a job a restart cut off goes on. A text the store lacks is
+/// refused `SvnStored`. Nothing for a repository of another tool.
+fn hold_svn_stored(state: &mut ShardState, id: RepositoryId) -> Result<(), ReplayRefused> {
+  let Some(stored) = state.vcs_stores.subversion_records(id).map(|records| {
+    records
+      .stored_texts()
+      .map(|(identity, _)| *identity)
+      .collect::<Vec<_>>()
+  }) else {
+    return Ok(());
+  };
+  let held = within_budget(state, 0, |stores| {
+    let content = stores.content_mut().ok_or(ReplayRefused::SvnStored)?;
+    for identity in &stored {
+      content
+        .hold(&slates_vcs::ContentId(*identity))
+        .map_err(|_| ReplayRefused::SvnStored)?;
+    }
+    Ok(())
+  });
+  if held.is_ok() {
+    svn_deltify::resume(state, id);
+  }
+  held
+}
+
+/// Replay's end for repository `id`: its stored Subversion texts held again ([`hold_svn_stored`]), counted as a record's
+/// replay is; whether it was served.
+fn replay_ended(state: &mut ShardState, id: RepositoryId) -> bool {
+  let held = hold_svn_stored(state, id);
+  match held {
+    Ok(()) => true,
+    Err(_) => replayed(state, id, held),
   }
 }
 
@@ -2658,10 +2681,11 @@ fn replay_all(state: &mut ShardState, id: RepositoryId) {
   let mut index = 0usize;
   while let Some(outcome) = replay_record(state, id, index) {
     if !replayed(state, id, outcome) {
-      break;
+      return;
     }
     index = index.saturating_add(1);
   }
+  replay_ended(state, id);
 }
 
 /// Makes every repository's store of this shard's partition again, and replays each one's records in log order (module
@@ -2789,6 +2813,7 @@ async fn recover_repository(
       }
     };
     let Some(outcome) = outcome else {
+      replay_ended(state, record.id);
       break;
     };
     if !replayed(state, record.id, outcome) {

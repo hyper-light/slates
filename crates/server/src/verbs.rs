@@ -9272,8 +9272,8 @@ pub(crate) fn compose_increment(
     &mut doc,
     &mut plan,
     &mut slates_merge::refine::Refiner::new(),
-    &mut |path| {
-      let before = files_base.file(path).ok().flatten()?;
+    &mut |base_path, path| {
+      let before = files_base.file(base_path).ok().flatten()?;
       let after = files.get(files_base, path).ok().flatten()?;
       Some((before, after))
     },
