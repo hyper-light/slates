@@ -183,3 +183,19 @@ the client's spin switched (CI ubuntu-24.04-arm, A-224's lane, 3 interleaved rou
 yielding its CPU each turn (`std::thread::yield_now`), with the default and the harness's spin. Your provisioning
 client: if its sync waits spin first (SDK default), it pays the same; your harness parks, which is why your client part
 was small and your daemon part (the shard waiting for the CPU) large.
+
+## 2026-11-20 23:35 PST — finding 10: on Linux only a client that parks at once gets the loaded p99 under 1 ms
+
+CI ubuntu-24.04-arm, A-224's lane, one binary, 3 interleaved rounds (runs 44871159397, 44873199369), medians per round:
+
+| client wait | loaded accept p99 ms | loaded conflict p99 ms | quiet accept p50 / p99 µs |
+|---|---|---|---|
+| library default (wake estimate) | 1.7–5.1 | 2.2–2.5 | 77–92 / 132 |
+| yield each spin turn | 12.0–18.0 | 12.0–15.0 | — |
+| capped at 50 µs | 1.9–2.1 | 1.6–2.2 | 60–79 / 118–130 |
+| park at once | **0.32–0.39** | **0.30–0.91** | 90–96 / 130–136 |
+
+The yield is far worse (the yielder goes to the back of the queue each turn) and rejected. Parking at once costs the
+quiet median 15–30 µs and the quiet p99 ~5–15 µs. Loaded p999 is 0.9–4.0 ms in every arm (the lane's floor p999
+0.8–2.8 ms). This changes the client's sync wait (§4.7's 2-competitive spin) and touches R9's spinning provisioning
+form, so I've put it to main with a recommendation rather than land it.
