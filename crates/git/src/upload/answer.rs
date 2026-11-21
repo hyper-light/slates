@@ -671,7 +671,9 @@ impl<K> Answer<K> {
       return Written::More;
     }
     if self.choosing.is_some() {
+      let diag_began = std::time::Instant::now();
       self.choose(served, packs, admission, spent);
+      if diag_began.elapsed().as_millis() > 300 { eprintln!("DIAG choose {} ms, choosing after {}", diag_began.elapsed().as_millis(), self.choosing.is_some()); }
       return if self.head_written < self.head.len()
         || self.choosing.is_some()
         || self.pack.is_some()
@@ -686,7 +688,10 @@ impl<K> Answer<K> {
     };
     let left = streaming.put_framed(out, room.saturating_sub(put));
     if left > 0 && streaming.wants_data() {
-      if let Err(refusal) = streaming.frame_next(served, packs, admission) {
+      let diag_began = std::time::Instant::now();
+      let diag_framed = streaming.frame_next(served, packs, admission);
+      if diag_began.elapsed().as_millis() > 300 { eprintln!("DIAG frame_next {} ms", diag_began.elapsed().as_millis()); }
+      if let Err(refusal) = diag_framed {
         self.refusal = Some(refusal);
       }
       streaming.put_framed(out, left);

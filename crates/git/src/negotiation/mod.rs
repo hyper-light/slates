@@ -612,7 +612,11 @@ impl<G: Copy, N: Copy + Ord + Into<u64> + TryFrom<u64>> Negotiating<G, N> {
     spent: &mut dyn FnMut() -> bool,
   ) -> Result<Option<Outcome<G, N>>, Refusal> {
     loop {
-      if let Some(outcome) = self.unit(graph, admission, spent)? {
+      let diag_phase = match &self.phase { Phase::Ready(..) => "ready", Phase::Cut(..) => "cut", Phase::Selecting(..) => "selecting", Phase::Done => "done" };
+      let diag_began = std::time::Instant::now();
+      let diag_unit = self.unit(graph, admission, spent);
+      if diag_began.elapsed().as_millis() > 100 { eprintln!("DIAG negotiation unit {} ms in phase {diag_phase}", diag_began.elapsed().as_millis()); }
+      if let Some(outcome) = diag_unit? {
         return Ok(Some(outcome));
       }
       if spent() {

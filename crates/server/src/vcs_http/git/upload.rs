@@ -221,11 +221,13 @@ impl<L: StoreLender> Exchange for Upload<L> {
       let mut spent = packs.turn();
       made.write_within(served, packs, admission, out, MAX_LEN, &mut spent)
     };
+    let diag_began = std::time::Instant::now();
     let written = match generation.as_ref() {
       Some(held) => lender.lend_held(held, step),
       None => lender.lend_objects(*repository, step),
     }
     .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
+    if diag_began.elapsed().as_millis() > 300 { eprintln!("DIAG reply {} ms (held {})", diag_began.elapsed().as_millis(), generation.is_some()); }
     if written != Written::More {
       // The answer is written: its generation is given back.
       *generation = None;
