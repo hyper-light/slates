@@ -157,13 +157,19 @@ pub struct Reference {
   pub len: u64,
   /// The changeset's sequence in its repository.
   pub sequence: u64,
+  /// Where the changeset is one the server made (A-731): the green's key and the version it was made of.
+  pub made: Option<(u64, u64)>,
 }
 
 impl Reference {
   /// The record of the changeset this reference names, as the log's `Record` section holds it
-  /// ([`write_push_record`]): what [`Replay::begin_sectioned`] replays with the payload read back.
+  /// ([`write_push_record`], [`write_made_record`]): what [`Replay::begin_sectioned`] replays with the payload read
+  /// back.
   pub fn record(&self) -> Vec<u8> {
-    write_push_record(self.room, self.version)
+    match self.made {
+      Some(made) => write_made_record(self.room, self.version, made),
+      None => write_push_record(self.room, self.version),
+    }
   }
 }
 
@@ -174,11 +180,37 @@ pub fn write_push_reference(
   (version, changegroup): (Version, &[u8]),
   sequence: u64,
 ) -> Vec<u8> {
+  write_reference(Source::Push, room, (version, changegroup), sequence)
+}
+
+/// The register's record of a changeset the server made of `green`'s `version` (A-731), landed as changeset `sequence`
+/// whose changegroup is `changegroup`: [`write_push_reference`]'s form with the made source.
+pub fn write_made_reference(
+  room: u64,
+  (version, changegroup): (Version, &[u8]),
+  sequence: u64,
+  (green, made): (u64, u64),
+) -> Vec<u8> {
+  write_reference(
+    Source::Made {
+      green,
+      version: made,
+    },
+    room,
+    (version, changegroup),
+    sequence,
+  )
+}
+
+/// A changeset reference from `source` ([`REFERENCE_VERSION`]).
+fn write_reference(
+  source: Source,
+  room: u64,
+  (version, changegroup): (Version, &[u8]),
+  sequence: u64,
+) -> Vec<u8> {
   let mut out = Vec::new();
-  out.extend_from_slice(&MAGIC.to_le_bytes());
-  out.extend_from_slice(&REFERENCE_VERSION.to_le_bytes());
-  out.push(Source::Push.byte());
-  out.extend_from_slice(&room.to_le_bytes());
+  write_head_alone(&mut out, (REFERENCE_VERSION, source, room));
   out.extend_from_slice(version.name());
   out.extend_from_slice(blake3::hash(changegroup).as_bytes());
   out.extend_from_slice(&to_u64(changegroup.len()).to_le_bytes());
@@ -191,7 +223,12 @@ pub fn write_push_reference(
 pub fn reference_of(bytes: &[u8]) -> Option<Reference> {
   let mut reader = Reader { rest: bytes };
   let (version, source, room) = head(&mut reader).ok()?;
-  if version != REFERENCE_VERSION || source != Source::Push {
+  let made = match source {
+    Source::Push => None,
+    Source::Made { green, version } => Some((green, version)),
+    Source::Import => return None,
+  };
+  if version != REFERENCE_VERSION {
     return None;
   }
   let name = reader.take(CHANGEGROUP_NAME_BYTES).ok()?;
@@ -205,6 +242,7 @@ pub fn reference_of(bytes: &[u8]) -> Option<Reference> {
     payload,
     len,
     sequence,
+    made,
   })
 }
 /// Format: the form byte of a revision given whole.
@@ -968,6 +1006,41 @@ pub fn write_push_record(room: u64, version: Version) -> Vec<u8> {
   out
 }
 
+/// A made changeset's record as the changeset log's `Record` section holds it ([`SECTIONED_VERSION`], A-767 C1: a made
+/// changeset lands as a push's does, main's ruling of 2026-11-21 09:00): [`write_push_record`]'s head with the made
+/// source, the green's key and the version it was made of, and the changegroup's version name; the changegroup the
+/// server built of it is the changeset's `Payload` section. Its replay puts the made node back
+/// ([`Replayed::made`]).
+pub fn write_made_record(room: u64, version: Version, (green, made): (u64, u64)) -> Vec<u8> {
+  let mut out = Vec::new();
+  write_head_alone(
+    &mut out,
+    (
+      SECTIONED_VERSION,
+      Source::Made {
+        green,
+        version: made,
+      },
+      room,
+    ),
+  );
+  out.extend_from_slice(version.name());
+  out
+}
+
+/// A record's head with no group count after it: the magic, the version, the source (a made changeset's green and
+/// version after its byte) and the room.
+fn write_head_alone(out: &mut Vec<u8>, (version, source, room): (u32, Source, u64)) {
+  out.extend_from_slice(&MAGIC.to_le_bytes());
+  out.extend_from_slice(&version.to_le_bytes());
+  out.push(source.byte());
+  if let Source::Made { green, version } = source {
+    out.extend_from_slice(&green.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
+  }
+  out.extend_from_slice(&room.to_le_bytes());
+}
+
 /// A push's changegroup record written whole ([`ChangegroupWriter`]'s steps at once).
 pub fn write_changegroup(
   room: u64,
@@ -1376,6 +1449,8 @@ struct Framing {
   framed: crate::framing::Framed,
   /// The room the push's intake ran within, each revision placed charged to it.
   room: Admission,
+  /// Where the changeset is one the server made: the green's key and the version.
+  made: Option<(u64, u64)>,
 }
 
 /// Whether a changeset's replay has more to take ([`Replay::step_sectioned`]).
@@ -1402,6 +1477,9 @@ struct Retaken {
   first: (u32, u32),
   /// Whether every unit is taken.
   done: bool,
+  /// Where the changeset is one the server made: the green's key and the version, which the replay puts back with its
+  /// node ([`Replayed::made`]).
+  made: Option<(u64, u64)>,
 }
 
 impl Replay {
@@ -1439,7 +1517,12 @@ impl Replay {
   pub fn begin_sectioned(record: &[u8]) -> Result<Replay, Refused> {
     let mut reader = Reader { rest: record };
     let (version, source, room) = head(&mut reader)?;
-    if version != SECTIONED_VERSION || source != Source::Push {
+    let made = match source {
+      Source::Push => None,
+      Source::Made { green, version } => Some((green, version)),
+      Source::Import => return Err(Refused::Version { version }),
+    };
+    if version != SECTIONED_VERSION {
       return Err(Refused::Version { version });
     }
     let name = reader.take(CHANGEGROUP_NAME_BYTES)?;
@@ -1454,6 +1537,7 @@ impl Replay {
         walk: crate::framing::Framing::new(changegroup, false),
         framed: crate::framing::Framed::default(),
         room,
+        made,
       })),
     })
   }
@@ -1469,7 +1553,9 @@ impl Replay {
   ) -> Result<Progress, Refused> {
     match &mut self.kind {
       Kind::Framing(framing) => {
-        let Framing { walk, framed, room } = &mut **framing;
+        let Framing {
+          walk, framed, room, ..
+        } = &mut **framing;
         let mut sink = crate::framing::Collect {
           framed,
           admission: room,
@@ -1477,12 +1563,15 @@ impl Replay {
         match walk.step(payload, &mut sink) {
           Ok(true) => Ok(Progress::More),
           Ok(false) => {
-            let Framing { framed, room, .. } = *core::mem::replace(
+            let Framing {
+              framed, room, made, ..
+            } = *core::mem::replace(
               framing,
               Box::new(Framing {
                 walk: crate::framing::Framing::new(Version::V01, false),
                 framed: crate::framing::Framed::default(),
                 room: Admission::new(0),
+                made: None,
               }),
             );
             let first = (
@@ -1496,6 +1585,7 @@ impl Replay {
               room,
               first,
               done: false,
+              made,
             }));
             Ok(Progress::More)
           }
@@ -1577,6 +1667,7 @@ impl Retaken {
       room,
       first,
       done: false,
+      made: None,
     })
   }
 
@@ -1640,6 +1731,16 @@ impl Retaken {
       .kept
       .saturating_sub(u64::from(changesets))
       .saturating_sub(u64::from(manifests));
+    let made = match self.made {
+      Some((green, version)) => {
+        let node = fork
+          .changeset(store, self.first.0)
+          .map(|row| row.node)
+          .ok_or(Refused::Truncated)?;
+        Some((green, version, node))
+      }
+      None => None,
+    };
     let replaced = core::mem::replace(index, fork);
     Ok(Replayed {
       changesets,
@@ -1648,7 +1749,7 @@ impl Retaken {
       file_revisions,
       markers: 0,
       whole: replaced.release(store).is_ok(),
-      made: None,
+      made,
     })
   }
 }
@@ -2009,10 +2110,9 @@ fn head(reader: &mut Reader<'_>) -> Result<(u32, Source, Admission), Refused> {
     },
     tag => return Err(Refused::Tag { tag }),
   };
-  if (version == CHANGEGROUP_VERSION
-    || version == SECTIONED_VERSION
-    || version == REFERENCE_VERSION)
-    && source != Source::Push
+  let changeset_kind = matches!(source, Source::Push | Source::Made { .. });
+  if (version == CHANGEGROUP_VERSION && source != Source::Push)
+    || ((version == SECTIONED_VERSION || version == REFERENCE_VERSION) && !changeset_kind)
   {
     return Err(Refused::Tag { tag: source.byte() });
   }
