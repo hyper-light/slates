@@ -206,9 +206,10 @@ fn inheritable(socket: &std::net::UdpSocket) -> std::os::fd::OwnedFd {
   duplicate
 }
 
-/// Starts node `node` as an anchor of the fleet in `manifest` with its HTTP edge on loopback, and reads its lines
-/// until its daemon serves and its edge's port and issuer surface are named (echoing each to standard error).
-fn start_node(instance: &str, manifest: &str, node: &str, held: &HeldBlock) -> Node {
+/// Starts node `node` as an anchor of the fleet in `manifest` with its HTTP edge on loopback and its changeset store in
+/// `store` (`--vcs-store`; C5: a daemon without one makes no git repository), and reads its lines until its daemon
+/// serves and its edge's port and issuer surface are named (echoing each to standard error).
+fn start_node(instance: &str, manifest: &str, node: &str, (held, store): (&HeldBlock, &str)) -> Node {
   use std::os::fd::AsRawFd;
   let [probe, record] = held.sockets.as_slice() else {
     panic!("a node's block is its probe and record ports");
@@ -228,6 +229,8 @@ fn start_node(instance: &str, manifest: &str, node: &str, held: &HeldBlock) -> N
       node,
       "--vcs-http",
       "127.0.0.1:0",
+      "--vcs-store",
+      store,
     ])
     .env(
       slates_anchor::ENV_FLEET_SERVE,
@@ -558,7 +561,24 @@ fn a_repositorys_acknowledged_pushes_survive_its_owners_death_whole_and_in_order
   let mut nodes: Vec<Node> = FLEET_NODES
     .iter()
     .zip(&blocks)
-    .map(|(node, held)| start_node(&format!("v3-takeover-{node}-{pid}"), &manifest, node, held))
+    .map(|(node, held)| {
+      // Each node's changeset store, in the test's scratch (`--vcs-store`; C5).
+      let store = format!("{}/store-{node}", scratch.path);
+      assert!(
+        Command::new("mkdir")
+          .args(["-p", &store])
+          .output()
+          .unwrap()
+          .status
+          .success()
+      );
+      start_node(
+        &format!("v3-takeover-{node}-{pid}"),
+        &manifest,
+        node,
+        (held, &store),
+      )
+    })
     .collect();
   eprintln!("V3TAKEOVER: nodes started");
   let hosts = wait_formed(&nodes);
