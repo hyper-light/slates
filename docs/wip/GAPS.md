@@ -2428,6 +2428,13 @@
 > after which the edge judges a client gone) is released at the table's next use, counted
 > (`vcs_store.dav_commits_released`). Before the edge has learned that bound none is released early; the table stays
 > bounded by one a repository and principal.
+> **A-681 part C by use, against svnserve byte for byte (clients, 2026-11-21):**
+> `stock_svn_over_httpv2_answers_as_stock_svnserve_byte_for_byte` (`crates/cli/tests/svn_interop.rs`) runs one session
+> (commits, copies and moves in a working copy and by URL, a copy of an older revision, versioned and revision
+> properties set and deleted, an import, the log, list, cat, proplist, blame, diff and status) over HTTPv2 and against
+> stock svnserve over FSFS, comparing each command's output with timestamps left out. Not yet run (no svn on this Mac):
+> main's run on a Studio with svn 1.15 (run-requests.md). By reading, the edge serves no PROPPATCH on `!svn/rev/N`, so
+> `svn propset --revprop` over HTTP is expected red (w-svn's, if so).
 > **svn replay by stock clients (w-interop, 2026-11-20; A-703):** `svn-matrix.sh` gains `svnrdump dump` and
 > `svnsync initialize/synchronize` over svn://, each compared with the dump stock svnserve 1.15.0 made of the same history
 > (`crates/svn/fixtures/replay`, `EXPECT_RDUMP`, `EXPECT_SYNC`): over the reads fixtures' repository both are
