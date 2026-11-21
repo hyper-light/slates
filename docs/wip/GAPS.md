@@ -51,8 +51,9 @@
 > (served p99 61–104 µs), and 1.0–1.3% of requests wait exactly 1.00–1.02 ms (queued p99 1,006–1,169 µs).
 > - **macOS:** the busy path's zero-timeout `kevent` nap (w-provision-gate, A-786 part 2, `b01a0ef7b`). On the
 >   edit-and-merge path it empties the band (1,362–1,543 of 52,050 → 0–2) and takes queued p99 to 22–23 µs, conflict
->   p99 10.2–10.7 → 0.22–0.46 ms, accept p99 10.4–10.8 → 0.80–2.6 ms (M4 Max Studio, interleaved). Lands with
->   w-provision-gate's hold rule. Shard, doorbell-thread and client QoS (`USER_INTERACTIVE`) each moved nothing.
+>   p99 10.2–10.7 → 0.22–0.46 ms, accept p99 10.4–10.8 → 0.80–2.6 ms (M4 Max Studio, interleaved). It did not land:
+>   on the provisioning path it failed main's conditions (quiet CPU, loaded p999; a38630375), so the nap stays. Shard,
+>   doorbell-thread and client QoS (`USER_INTERACTIVE`) each moved nothing.
 > - **Linux** (CI ubuntu-24.04-arm, A-224's lane): the same band (queued p99 1,007–1,010 µs, p999 1,021–1,091) with no
 >   nap; parking at once instead of spinning halves the medians (accept 189–206 → 86–100 µs) and leaves the band and
 >   the ms tails. It is the kernel's 1 ms tick on a two-CPU lane at the shard's own weight; no unprivileged raise
@@ -84,8 +85,11 @@
 >   far worse on both Windows runners (conflict p999 20-42 against 0.3-12 ms); it helps only macOS's quiet latency. B
 >   stays. **Open (85a):** the loaded tails sit on whole milliseconds (3,998 / 4,000 / 4,996 / 5,998 µs): the scheduler's
 >   slices behind the lane's 8 spinners on 4 vCPU. The shard count does not move them (run 44884432328: loaded accept
->   p99 0.27-5.0 ms and p999 3.3-6.0 ms at 1, 2 and 4 shards). The macOS hop split (run 44888851325): the client's p99
->   tail is its own wake (written -> seen, median 97 µs).
+>   p99 0.27-5.0 ms and p999 3.3-6.0 ms at 1, 2 and 4 shards). The macOS hop split (run 44888851325; BENCHMARKS "arm C"):
+>   the client's loaded round-trip p99 is 6.8-8.1 ms. The tail requests are replies written after the step that took
+>   them (resumed or forwarded verbs), which the ring stamp does not cover yet. That hop is next. The busy path's
+>   zero-timeout kevent took at least 1 ms in 9-12% of its calls loaded (up to 4 ms; quiet 7-47 calls). The runner's
+>   kevent and ulock timeouts are late about 200 µs at the median, nanosleep 1.7-2.5 ms.
 > - Windows (CI, run 44857045148): no 1 ms band (queued p99 5–49 µs); accept p99 0.13–0.31 ms, conflict 0.11–0.29 ms;
 >   p999 0.2–62 ms. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–7).
 >
