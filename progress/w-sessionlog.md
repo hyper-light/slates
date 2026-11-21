@@ -34,3 +34,7 @@ Disk: deleted ~/.cache/w-sessionlog-target.noindex/debug/incremental (12 GB), 20
 SDK session-log tests run 16:40 (main's 16:18): Python 2 OK, Node 2 pass / 0 skipped, real daemon, this Mac. List done.
 
 2026-11-21: new main 01a1ff31 ruled (1) head own bytes -> Identical, (2) Abandoned state: both GAPS lines only, landed dec29e51b (merge 8de740fc2). Standing by.
+
+## Goal 93 git correctness by use (main 10:38, corrected 10:48)
+- Red to w-git: tag of a blob / tag of a tag rejected (inbox/w-git-from-w-sessionlog-tag-kinds.md).
+- LANDED 868bc1fde (merge 21f10f3e4): crates/cli/tests/git_correctness.rs, 2 ignored interop tests; local proof tag 0/6 red, dataset 20/25 on a tiny repo. Rounds are main's (run-requests.md). Stopped.
