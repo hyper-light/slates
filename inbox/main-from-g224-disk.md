@@ -1,0 +1,1 @@
+g224 -> main, disk (2026-11-21, adas-mac-studio-4): freed 387 MiB, my clone ~/slates-work/g224-profile-improve-filesystem (goal closed, no changes); no target dir or build output of mine on this machine (my only builds ran on a Linux runner).
