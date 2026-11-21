@@ -496,6 +496,9 @@ pub struct DaemonConfig {
   /// 2): A-656's connection on every connection it accepts, on a loopback address alone for a daemon that is no fleet
   /// node, since ra_svn is cleartext; none from [`DaemonConfig::derive`].
   pub vcs_svn: Option<slates_rt::tcp::SocketAddrV4>,
+  /// The version-control store's owner, when the operator gave the daemon a store directory (`--vcs-store DIR`, A-767):
+  /// the handle each shard clones to land changesets and read them back. None keeps every repository in RAM as before.
+  pub vcs_disk: Option<slates_store::owner::StoreHandle>,
   /// Every derivation, for the boot log.
   pub derivations: Vec<String>,
 }
@@ -1246,6 +1249,7 @@ impl DaemonConfig {
       git_keepalive_ns: GIT_KEEPALIVE_NS,
       vcs_ssh: None,
       vcs_svn: None,
+      vcs_disk: None,
       derivations,
     }
     .with_control_shard_noted()

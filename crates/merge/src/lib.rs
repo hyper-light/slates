@@ -54,6 +54,7 @@ pub mod splice;
 pub mod verdict;
 
 pub use derive::{ContentOp, compose_content, compose_content_sized};
+pub use engine::HeadUnder;
 pub use engine::{
   ComputeRefused, Computed, ConflictWindow, Green, HeadMoved, Increment, Judged, Judgment, Outcome,
   PositionRefused, ReanchorRefused, Reanchored,

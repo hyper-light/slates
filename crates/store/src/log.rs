@@ -2,7 +2,8 @@
 //!
 //! **A record** (all integers little-endian):
 //! - a header of [`HEADER_BYTES`]: magic `SLCS`, the format, the tool, a flags byte, then the repository, the
-//!   changeset's sequence in it, the sequence it was judged over, the grant, the work and the time (each a `u64`), the
+//!   changeset's sequence in it, the sequence it was judged over, the grant, the work and the time (the repository a
+//!   `u128`, the rest each a `u64`), the
 //!   section count (`u16`), two zero bytes, and the CRC-32C of everything before it;
 //! - its sections, each a head of [`SECTION_HEAD_BYTES`] (the kind, three zero bytes, the length as a `u64`, the CRC-32C
 //!   of the section's bytes) followed by the bytes;
@@ -35,16 +36,63 @@ const MAGIC: [u8; 4] = *b"SLCS";
 const COMMIT: [u8; 4] = *b"SLCC";
 /// Format: this layout's number.
 const FORMAT: u16 = 1;
-/// Format: the header's bytes: magic 4, format 2, tool 1, flags 1, six `u64`s 48, section count 2, zero 2, CRC 4.
-pub const HEADER_BYTES: usize = 64;
-/// Format: a section head's bytes: kind 1, zero 3, length 8, CRC 4.
-pub const SECTION_HEAD_BYTES: usize = 16;
-/// Format: the trailer's bytes: identity 32, commit magic 4, record length 8, CRC 4.
-pub const TRAILER_BYTES: usize = 48;
-/// Format: the bytes of a header that its CRC covers.
-const HEADER_COVERED: usize = HEADER_BYTES - 4;
-/// Format: the bytes of a trailer that its CRC covers.
-const TRAILER_COVERED: usize = TRAILER_BYTES - 4;
+/// Format: a `u16` field's width.
+const U16: usize = size_of::<u16>();
+/// Format: a `u32` field's width.
+const U32: usize = size_of::<u32>();
+/// Format: a `u64` field's width.
+const U64: usize = size_of::<u64>();
+/// Format: a `u128` field's width (a repository's id: its creator host, owner partition and counter, A-515).
+const U128: usize = size_of::<u128>();
+/// Format: an identity's width (BLAKE3).
+const IDENTITY: usize = blake3::OUT_LEN;
+
+/// Format: the header's format field, after its magic.
+const H_FORMAT: usize = MAGIC.len();
+/// Format: the header's tool byte, after the format.
+const H_TOOL: usize = H_FORMAT + U16;
+/// Format: the header's flags byte (zero), after the tool.
+const H_FLAGS: usize = H_TOOL + 1;
+/// Format: the header's repository, after the flags.
+const H_REPOSITORY: usize = H_FLAGS + 1;
+/// Format: the header's sequence, after the repository.
+const H_SEQUENCE: usize = H_REPOSITORY + U128;
+/// Format: the header's judged-over sequence, after the sequence.
+const H_JUDGED: usize = H_SEQUENCE + U64;
+/// Format: the header's grant, after the judged-over sequence.
+const H_GRANT: usize = H_JUDGED + U64;
+/// Format: the header's work, after the grant.
+const H_WORK: usize = H_GRANT + U64;
+/// Format: the header's time, after the work.
+const H_TIME: usize = H_WORK + U64;
+/// Format: the header's section count, after the time.
+const H_SECTIONS: usize = H_TIME + U64;
+/// Format: the header's CRC, after the section count and two zero bytes: the bytes its CRC covers.
+const HEADER_COVERED: usize = H_SECTIONS + U16 + U16;
+/// Format: the header's bytes, its CRC last.
+pub const HEADER_BYTES: usize = HEADER_COVERED + U32;
+
+/// Format: a section head's zero bytes, after its kind byte.
+const S_ZERO: usize = 1;
+/// Format: a section head's zero bytes' count (the head's length field is `u64`-aligned).
+const S_ZERO_LEN: usize = U32 - 1;
+/// Format: a section head's length, after its zero bytes.
+const S_LEN: usize = S_ZERO + S_ZERO_LEN;
+/// Format: a section head's CRC, after its length.
+const S_CRC: usize = S_LEN + U64;
+/// Format: a section head's bytes.
+pub const SECTION_HEAD_BYTES: usize = S_CRC + U32;
+
+/// Format: the trailer's commit magic, after the identity.
+const T_COMMIT: usize = IDENTITY;
+/// Format: the trailer's record length, after the commit magic.
+const T_LEN: usize = T_COMMIT + COMMIT.len();
+/// Format: the trailer's CRC, after the record length: the bytes its CRC covers.
+const TRAILER_COVERED: usize = T_LEN + U64;
+/// Format: the trailer's bytes, its CRC last.
+pub const TRAILER_BYTES: usize = TRAILER_COVERED + U32;
+/// Format: a section's label in its record's identity: its kind byte and its length.
+const LABEL_BYTES: usize = 1 + U64;
 /// Format: the bytes a recovery's verification reads at a time, a buffer it keeps across sections. The
 /// identity's hash and the CRC take pieces of any length; this is the read's size, not a tuning of either.
 const VERIFY_PIECE: usize = 1 << 16;
@@ -61,7 +109,8 @@ pub enum Tool {
 }
 
 impl Tool {
-  fn byte(self) -> u8 {
+  /// The tool's byte in a header and a row.
+  pub(crate) fn byte(self) -> u8 {
     // Format: the tool's byte in the log (the format agreed with w-hg, w-git, w-svn).
     match self {
       Tool::Git => 1,
@@ -129,8 +178,8 @@ impl SectionKind {
 pub struct Header {
   /// The tool.
   pub tool: Tool,
-  /// The repository.
-  pub repository: u64,
+  /// The repository (slates' 128-bit repository id, A-515).
+  pub repository: u128,
   /// The changeset's sequence in its repository.
   pub sequence: u64,
   /// The sequence of the changeset it was judged over.
@@ -153,7 +202,7 @@ pub struct Located {
   /// Its header.
   pub header: Header,
   /// Its identity (BLAKE3 of the header and each section's kind, length and bytes).
-  pub identity: [u8; 32],
+  pub identity: [u8; IDENTITY],
   /// Its whole length, trailer included.
   pub len: u64,
 }
@@ -383,7 +432,7 @@ impl<F: BlockFile> Appending<'_, F> {
     if self.written != self.header.sections {
       return Err(LogError::OutOfOrder("fewer sections than the header names"));
     }
-    let identity: [u8; 32] = *self.identity.finalize().as_bytes();
+    let identity: [u8; IDENTITY] = *self.identity.finalize().as_bytes();
     let past = offset_after(self.at, TRAILER_BYTES)?;
     let len = past.checked_sub(self.start).ok_or(LogError::TooLarge)?;
     let mut trailer = [0u8; TRAILER_BYTES];
@@ -424,21 +473,19 @@ pub fn identity_of_range<F: BlockFile>(
   offset: u64,
   len: u64,
   buffer: &mut Vec<u8>,
-) -> Result<[u8; 32], LogError> {
+) -> Result<[u8; IDENTITY], LogError> {
   let mut hasher = blake3::Hasher::new();
   hash_range(file, &mut hasher, offset, len, buffer)?;
   Ok(*hasher.finalize().as_bytes())
 }
 
 /// Format: what a section adds to its record's identity before its bytes: its kind and its length.
-fn section_label(kind: SectionKind, len: u64) -> [u8; 9] {
-  let mut label = [0u8; 9];
-  if let Some(byte) = label.get_mut(0) {
+fn section_label(kind: SectionKind, len: u64) -> [u8; LABEL_BYTES] {
+  let mut label = [0u8; LABEL_BYTES];
+  if let Some(byte) = label.first_mut() {
     *byte = kind.byte();
   }
-  if let Some(slot) = label.get_mut(1..) {
-    slot.copy_from_slice(&len.to_le_bytes());
-  }
+  put_u64(&mut label, 1, len);
   label
 }
 
@@ -552,125 +599,113 @@ fn verify_at<F: BlockFile>(
   }))
 }
 
-fn put_u16(out: &mut [u8], at: usize, value: u16) {
-  if let Some(slot) = out.get_mut(at..at.saturating_add(2)) {
-    slot.copy_from_slice(&value.to_le_bytes());
+fn put_bytes(out: &mut [u8], at: usize, value: &[u8]) {
+  if let Some(slot) = at
+    .checked_add(value.len())
+    .and_then(|end| out.get_mut(at..end))
+  {
+    slot.copy_from_slice(value);
   }
+}
+
+fn put_u16(out: &mut [u8], at: usize, value: u16) {
+  put_bytes(out, at, &value.to_le_bytes());
 }
 
 fn put_u32(out: &mut [u8], at: usize, value: u32) {
-  if let Some(slot) = out.get_mut(at..at.saturating_add(4)) {
-    slot.copy_from_slice(&value.to_le_bytes());
-  }
+  put_bytes(out, at, &value.to_le_bytes());
 }
 
 fn put_u64(out: &mut [u8], at: usize, value: u64) {
-  if let Some(slot) = out.get_mut(at..at.saturating_add(8)) {
-    slot.copy_from_slice(&value.to_le_bytes());
-  }
+  put_bytes(out, at, &value.to_le_bytes());
+}
+
+fn get_array<const N: usize>(bytes: &[u8], at: usize) -> Option<[u8; N]> {
+  bytes.get(at..at.checked_add(N)?)?.try_into().ok()
 }
 
 fn get_u16(bytes: &[u8], at: usize) -> Option<u16> {
-  bytes
-    .get(at..at.checked_add(2)?)?
-    .try_into()
-    .ok()
-    .map(u16::from_le_bytes)
+  get_array(bytes, at).map(u16::from_le_bytes)
 }
 
 fn get_u32(bytes: &[u8], at: usize) -> Option<u32> {
-  bytes
-    .get(at..at.checked_add(4)?)?
-    .try_into()
-    .ok()
-    .map(u32::from_le_bytes)
+  get_array(bytes, at).map(u32::from_le_bytes)
 }
 
 fn get_u64(bytes: &[u8], at: usize) -> Option<u64> {
-  bytes
-    .get(at..at.checked_add(8)?)?
-    .try_into()
-    .ok()
-    .map(u64::from_le_bytes)
+  get_array(bytes, at).map(u64::from_le_bytes)
 }
 
 fn encode_header(header: &Header, out: &mut [u8; HEADER_BYTES]) {
-  if let Some(magic) = out.get_mut(0..4) {
-    magic.copy_from_slice(&MAGIC);
-  }
-  put_u16(out, 4, FORMAT);
-  if let Some(tool) = out.get_mut(6) {
-    *tool = header.tool.byte();
-  }
-  put_u64(out, 8, header.repository);
-  put_u64(out, 16, header.sequence);
-  put_u64(out, 24, header.judged_over);
-  put_u64(out, 32, header.grant);
-  put_u64(out, 40, header.work);
-  put_u64(out, 48, header.time_ns);
-  put_u16(out, 56, header.sections);
+  put_bytes(out, 0, &MAGIC);
+  put_u16(out, H_FORMAT, FORMAT);
+  put_bytes(out, H_TOOL, &[header.tool.byte()]);
+  put_bytes(out, H_REPOSITORY, &header.repository.to_le_bytes());
+  put_u64(out, H_SEQUENCE, header.sequence);
+  put_u64(out, H_JUDGED, header.judged_over);
+  put_u64(out, H_GRANT, header.grant);
+  put_u64(out, H_WORK, header.work);
+  put_u64(out, H_TIME, header.time_ns);
+  put_u16(out, H_SECTIONS, header.sections);
   let crc = out.get(..HEADER_COVERED).map_or(0, mantle_crc::crc32c);
   put_u32(out, HEADER_COVERED, crc);
 }
 
 fn decode_header(bytes: &[u8; HEADER_BYTES]) -> Option<Header> {
-  if bytes.get(0..4)? != MAGIC || get_u16(bytes, 4)? != FORMAT || *bytes.get(7)? != 0 {
+  if get_array::<{ MAGIC.len() }>(bytes, 0)? != MAGIC
+    || get_u16(bytes, H_FORMAT)? != FORMAT
+    || *bytes.get(H_FLAGS)? != 0
+  {
     return None;
   }
   if get_u32(bytes, HEADER_COVERED)? != mantle_crc::crc32c(bytes.get(..HEADER_COVERED)?) {
     return None;
   }
   Some(Header {
-    tool: Tool::from_byte(*bytes.get(6)?)?,
-    repository: get_u64(bytes, 8)?,
-    sequence: get_u64(bytes, 16)?,
-    judged_over: get_u64(bytes, 24)?,
-    grant: get_u64(bytes, 32)?,
-    work: get_u64(bytes, 40)?,
-    time_ns: get_u64(bytes, 48)?,
-    sections: get_u16(bytes, 56)?,
+    tool: Tool::from_byte(*bytes.get(H_TOOL)?)?,
+    repository: get_array(bytes, H_REPOSITORY).map(u128::from_le_bytes)?,
+    sequence: get_u64(bytes, H_SEQUENCE)?,
+    judged_over: get_u64(bytes, H_JUDGED)?,
+    grant: get_u64(bytes, H_GRANT)?,
+    work: get_u64(bytes, H_WORK)?,
+    time_ns: get_u64(bytes, H_TIME)?,
+    sections: get_u16(bytes, H_SECTIONS)?,
   })
 }
 
 fn encode_section_head(kind: SectionKind, len: u64, crc: u32, out: &mut [u8; SECTION_HEAD_BYTES]) {
-  if let Some(byte) = out.get_mut(0) {
-    *byte = kind.byte();
-  }
-  put_u64(out, 4, len);
-  put_u32(out, 12, crc);
+  put_bytes(out, 0, &[kind.byte()]);
+  put_u64(out, S_LEN, len);
+  put_u32(out, S_CRC, crc);
 }
 
 fn decode_section_head(bytes: &[u8; SECTION_HEAD_BYTES]) -> Option<(SectionKind, u64, u32)> {
-  if bytes.get(1..4)? != [0, 0, 0] {
+  if bytes.get(S_ZERO..S_LEN)?.iter().any(|byte| *byte != 0) {
     return None;
   }
   Some((
     SectionKind::from_byte(*bytes.first()?)?,
-    get_u64(bytes, 4)?,
-    get_u32(bytes, 12)?,
+    get_u64(bytes, S_LEN)?,
+    get_u32(bytes, S_CRC)?,
   ))
 }
 
-fn encode_trailer(identity: &[u8; 32], len: u64, out: &mut [u8; TRAILER_BYTES]) {
-  if let Some(slot) = out.get_mut(0..32) {
-    slot.copy_from_slice(identity);
-  }
-  if let Some(slot) = out.get_mut(32..36) {
-    slot.copy_from_slice(&COMMIT);
-  }
-  put_u64(out, 36, len);
+fn encode_trailer(identity: &[u8; IDENTITY], len: u64, out: &mut [u8; TRAILER_BYTES]) {
+  put_bytes(out, 0, identity);
+  put_bytes(out, T_COMMIT, &COMMIT);
+  put_u64(out, T_LEN, len);
   let crc = out.get(..TRAILER_COVERED).map_or(0, mantle_crc::crc32c);
   put_u32(out, TRAILER_COVERED, crc);
 }
 
-fn decode_trailer(bytes: &[u8; TRAILER_BYTES]) -> Option<([u8; 32], u64)> {
-  if bytes.get(32..36)? != COMMIT {
+fn decode_trailer(bytes: &[u8; TRAILER_BYTES]) -> Option<([u8; IDENTITY], u64)> {
+  if get_array::<{ COMMIT.len() }>(bytes, T_COMMIT)? != COMMIT {
     return None;
   }
   if get_u32(bytes, TRAILER_COVERED)? != mantle_crc::crc32c(bytes.get(..TRAILER_COVERED)?) {
     return None;
   }
-  Some((bytes.get(0..32)?.try_into().ok()?, get_u64(bytes, 36)?))
+  Some((get_array(bytes, 0)?, get_u64(bytes, T_LEN)?))
 }
 
 #[cfg(test)]

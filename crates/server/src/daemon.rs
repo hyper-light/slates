@@ -4562,7 +4562,7 @@ async fn start_shard(
 }
 
 /// Format: nanoseconds in a microsecond, for the boot log's slice times.
-const NANOS_PER_MICRO: u64 = 1_000;
+pub(crate) const NANOS_PER_MICRO: u64 = 1_000;
 
 /// Holds a shard's start as a [`crate::config::BootFault`] says: on the CPU (a long recovery) or asleep (a stuck
 /// shard), for its duration. Only the boot tests set one.
@@ -4976,6 +4976,7 @@ async fn init_shard(
     lease_waiters: crate::lease_wait::LeaseWaiters::default(),
     base_waits: crate::base_wait::BaseWaits::default(),
     work_home: crate::work_home::WorkHome::default(),
+    refining: crate::refining::Refining::default(),
     forwarded_rings: std::collections::BTreeMap::new(),
     telemetry_quota: config.telemetry_spans_per_reply,
     last_drain_ns: now,
@@ -5113,6 +5114,7 @@ async fn init_shard(
     making_volumes: std::collections::BTreeMap::new(),
     pending_catalogs: std::collections::BTreeMap::new(),
     fenced_greens: std::collections::BTreeMap::new(),
+    vcs_disk: config.vcs_disk.clone(),
     vcs_stores: crate::vcs_store::VcsStores::with_windows(Box::new(
       crate::vcs_store::arena_windows::ChunkWindows::new(config.page),
     )),
@@ -7735,13 +7737,14 @@ mod tests {
     assert_eq!(read_back.map(|bytes| bytes == object), Ok(true));
   }
 
-  /// A-727 slice b (the content plane's durability barrier; main's order of 2026-11-20). Do: on a daemon over a retained
-  /// anchor segment, with version 3 on, push the fixtures' `create`: its record names its names by identity, appended only
-  /// once the names are durable (`vcs_store::content_durable`, through the homing); then stop the daemon without
-  /// publishing anything more, as a crash between the push and anything after it, and start a successor over the same
-  /// segment. Expect: the successor replays the record whole from the content its image holds: the repository recovered,
-  /// `main` at the pushed commit, no replay refused and no names missing, the record version 3. Without the barrier (the
-  /// entry appended right after the names were put) the names are in no image and the replay is refused `Names`.
+  /// A-727 slice b (the content plane's durability barrier; main's order of 2026-11-20) and A-722's record v4. Do: on a
+  /// daemon over a retained anchor segment, with version 4 on, push the fixtures' `create`: its record names its names
+  /// and its pack by identity, appended only once both are durable (`vcs_store::content_durable`, through the homing);
+  /// then stop the daemon without publishing anything more, as a crash between the push and anything after it, and start
+  /// a successor over the same segment. Expect: the successor replays the record whole from the content its image holds:
+  /// the repository recovered, `main` at the pushed commit, no replay refused and nothing missing, the record version 4.
+  /// Without the barrier (the entry appended right after the contents were put) they are in no image and the replay is
+  /// refused.
   #[test]
   fn t_a727b_a_crash_after_an_entry_naming_content_by_identity_loses_nothing_it_names() {
     use slates_anchor::AnchorSegment;
@@ -7768,7 +7771,7 @@ mod tests {
     let (sent, got) = std::sync::mpsc::channel();
     first
       .observe(shard, move |state| {
-        crate::vcs_store::write_version_3_for_test(true);
+        crate::vcs_store::write_version_4_for_test(true);
         let repository = crate::git_push::tests::git_repository(state, "barrier");
         let request = crate::git_push::tests::chain()
           .into_iter()
@@ -7844,7 +7847,7 @@ mod tests {
     let seen = got.recv().ok();
     second.stop();
     drop(segment);
-    assert_eq!(seen, Some((true, true, 0, 0, vec![3])));
+    assert_eq!(seen, Some((true, true, 0, 0, vec![4])));
   }
 
   /// A-727 slice a3b (an object past a window across a warm restart; the identity rule). Do: on a daemon over a retained

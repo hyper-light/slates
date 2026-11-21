@@ -33,9 +33,11 @@
 //! of work, a byte scanned or compared, a diagonal visited, a unit counted into the anchors' table, is charged to a
 //! meter that asks the owner's turn for the next unit ([`crate::pace::Ticks`]) every [`WORK_PER_TICK`] of it, so a
 //! refinement driven by a [`crate::pace::Pace`] spans turns and none of its units is longer than that much work. No
-//! single charge can exceed it: a token is cut at [`WORK_PER_TICK`] bytes, so one comparison is bounded too, and the
-//! sort and canonical order of a refined document are the paced ones. The sync entry points run the same code under no
-//! turn ([`crate::pace::finish`]).
+//! single charge can exceed [`UNIT_BYTES`]: a token is cut at that length, so one comparison is bounded too. No step
+//! grows with the file: no vector doubles (units counted then laid, ranges and output ops in chunks), no hash table
+//! rehashes (anchors by a paced radix sort), and a refined document is built in canonical order and its post-state
+//! relaid through a map, with no sort (A-787 part 2). The sync entry points run the same code under no turn
+//! ([`crate::pace::finish`]).
 
 use std::borrow::Cow;
 
@@ -55,11 +57,15 @@ pub const ANCHORED_STEPS_PER_UNIT: u64 = 16;
 pub const STEPS_BASE: u64 = 1 << 16;
 
 /// Shape: the work a unit of a paced refinement may do before it asks its turn for the next (a byte scanned, compared
-/// or hashed, a diagonal visited, a word hashed for the anchors as [`TABLE_WORK`]); also the longest a token is cut,
-/// so one comparison stays within a unit. Measured (`examples/rewrite_slices.rs`, Apple M4 Max, release, load 13,
-/// 2026-11-20): the longest unit is 10 to 46 µs on the crate's sources, 31 to 99 µs at 1 and 4 MiB, and typically 40 to
-/// 300 µs at 12 MiB, under the shard's quantum (its measured wake), and an ask's clock read is a hundredth of a unit.
-pub const WORK_PER_TICK: u64 = 1 << 12;
+/// or hashed, a diagonal visited, a word hashed for the anchors as [`TABLE_WORK`]). 256: about a microsecond of the
+/// refinement's work on an M-series core, so a turn runs past its deadline by at most about that and a unit's largest
+/// charge (one comparison of a [`UNIT_BYTES`] token). An ask reads the owner's clock, a few percent of a unit.
+/// Measured: at 4,096 a unit was 10 to 46 µs, and a job's turns ran past a shard's whole quantum 14% of the time on a
+/// loaded Studio (A-787 part 2, `crates/server/tests/green_post_state.rs`).
+pub const WORK_PER_TICK: u64 = 1 << 8;
+/// Shape: the longest a token is cut, so one comparison of two units is one bounded charge: 4,096 bytes, about a
+/// hundred nanoseconds of comparison, while a source file's tokens are far shorter.
+pub const UNIT_BYTES: u64 = 1 << 12;
 /// Shape: the work charged for counting one unit into the anchors' table (its bytes are charged as well): a hash-table
 /// insertion costs about what comparing 32 bytes does (measured with the figure above).
 const TABLE_WORK: u64 = 32;
@@ -159,7 +165,7 @@ pub struct Refined {
   pub asks: u64,
 }
 
-/// The ranges a refinement found, kept in chunks that double from [`FIRST_CHUNK`] ranges up to [`WORK_PER_TICK`], so a
+/// The ranges a refinement found, kept in chunks that double from [`FIRST_CHUNK`] ranges up to [`UNIT_BYTES`], so a
 /// push never moves the ones before it: a vector's doubling would copy every range in one step, which grows with the
 /// file (A-787), and a small file's ranges cost a small chunk.
 #[derive(Debug, Default)]
@@ -174,7 +180,7 @@ const FIRST_CHUNK: usize = 64;
 impl HunkList {
   /// The capacity of the next chunk: double the last, at most a unit's work of ranges.
   fn next_chunk(&self) -> usize {
-    let cap = usize::try_from(WORK_PER_TICK).unwrap_or(usize::MAX).max(1);
+    let cap = usize::try_from(UNIT_BYTES).unwrap_or(usize::MAX).max(1);
     self
       .chunks
       .last()
@@ -294,6 +300,13 @@ pub struct Refiner {
   gaps: Vec<Region>,
 }
 
+/// Frees `buffer`: whether it held anything.
+fn free<T>(buffer: &mut Vec<T>) -> bool {
+  let held = buffer.capacity() > 0;
+  *buffer = Vec::new();
+  held
+}
+
 /// FNV-1a over a unit's bytes: the anchors' sort key (deterministic, so the same files anchor the same way on every
 /// platform; a collision only costs an anchor, since a candidate's bytes are compared before it is used).
 fn fnv(bytes: &[u8]) -> u64 {
@@ -314,11 +327,35 @@ enum Class {
   Alone,
 }
 
-/// A byte's class ([`classify`]): four comparisons, which the compiler lowers to a lookup.
+/// Every byte's class ([`classify`]), by the byte's value, looked up rather than branched on in the cut's scan (a
+/// table read is 1.1 to 1.3 times faster a save than the comparisons, A-787's A/B). Kept equal to [`classify`] by
+/// `the_class_table_is_classify_for_every_byte`.
+/// Format: one class a byte value, 256 of them, sixteen a row: `W` a word's, `B` a blank's, `A` alone.
+const CLASSES: [Class; 256] = {
+  const W: Class = Class::Word;
+  const B: Class = Class::Blank;
+  const A: Class = Class::Alone;
+  [
+    A, A, A, A, A, A, A, A, A, B, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A,
+    B, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, W, W, W, W, W, W, W, W, W, W, A, A, A, A, A, A,
+    A, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, A, A, A, A, W,
+    A, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, A, A, A, A, A,
+    W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W,
+    W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W,
+    W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W,
+    W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W,
+  ]
+};
+
+/// A byte's class: [`CLASSES`] read at the byte's value, which the table's length always holds.
 fn class(byte: u8) -> Class {
-  classify(byte)
+  CLASSES
+    .get(usize::from(byte))
+    .copied()
+    .unwrap_or(Class::Alone)
 }
 
+#[cfg(test)]
 const fn classify(byte: u8) -> Class {
   // Format: UTF-8; a byte at or past 0x80 belongs to a character outside ASCII, a word's.
   if byte.is_ascii_alphanumeric() || byte == b'_' || byte >= 0x80 {
@@ -358,7 +395,7 @@ fn boundaries(
   last: &mut usize,
   mut found: impl FnMut(usize),
 ) {
-  let cap = usize::try_from(WORK_PER_TICK).unwrap_or(usize::MAX);
+  let cap = usize::try_from(UNIT_BYTES).unwrap_or(usize::MAX);
   let mut before = from.checked_sub(1).and_then(|at| text.get(at).copied());
   for (offset, byte) in text.get(from..to).unwrap_or_default().iter().enumerate() {
     let at = from.saturating_add(offset);
@@ -379,7 +416,7 @@ fn boundaries(
   }
 }
 
-/// Cuts `text` into units of `grain`: the start of each, then its end. A unit reaching [`WORK_PER_TICK`] bytes is cut
+/// Cuts `text` into units of `grain`: the start of each, then its end. A unit reaching [`UNIT_BYTES`] bytes is cut
 /// there, so one unit's comparison stays within a unit of work; its cuts fall at the same offsets from its start in
 /// both texts, so equal long tokens still match piece by piece.
 async fn cut(grain: Grain, text: &[u8], out: &mut Vec<u32>, meter: &mut Meter<'_>) {
@@ -687,6 +724,29 @@ impl Refiner {
   /// Gives back the scratch the largest refinement grew.
   pub fn release(&mut self) {
     *self = Refiner::default();
+  }
+
+  /// Gives back the next of the scratch's buffers whole: an owner that must stay within a step's work gives a large
+  /// refinement's scratch back over turns, a buffer a turn, rather than all of it in one step (A-787 part 2). Whether
+  /// everything is given back.
+  pub fn release_step(&mut self) -> bool {
+    if self.hunks.chunks.pop().is_some() {
+      return false;
+    }
+    self.hunks.len = 0;
+    !(free(&mut self.base_units)
+      || free(&mut self.post_units)
+      || free(&mut self.entries)
+      || free(&mut self.spare)
+      || free(&mut self.post_of)
+      || free(&mut self.forward)
+      || free(&mut self.backward)
+      || free(&mut self.anchors)
+      || free(&mut self.piles)
+      || free(&mut self.previous)
+      || free(&mut self.digits)
+      || free(&mut self.stack)
+      || free(&mut self.gaps))
   }
 
   /// The ranges in which `post` (the writer's file) differs from `base` (the file it was given), at the seal's grain.
@@ -1550,9 +1610,10 @@ pub fn ops_of<'h>(
       (skip, add) if skip == add => {
         out.push(op(OpKind::Overwrite, hunk.base_at, add, hunk.post_at))
       }
+      // The canonical order at one offset: an insert before a delete (their wire kinds, `OpsDoc::canonicalize`).
       (skip, add) => {
-        out.push(op(OpKind::Delete, hunk.base_at, skip, u64::MAX));
         out.push(op(OpKind::Insert, hunk.base_at, add, hunk.post_at));
+        out.push(op(OpKind::Delete, hunk.base_at, skip, u64::MAX));
       }
     }
   }
@@ -1701,10 +1762,10 @@ async fn replacements(
   found
 }
 
-/// The base paths whose bytes [`refine_rewrites`] reads to refine `doc`'s whole replacements (A-776): each replaced
-/// path's own, or, under a rename over it, its source's (C2). What a work's shard asks its green's owner for the base of,
-/// besides the files it does not hold (C1, A-247). One walk of the document's ops, as its composition's own walks are.
-pub fn whole_replaced_paths(doc: &OpsDoc) -> Vec<String> {
+/// The whole-file replacements of `doc` as `(base path, path)`: the path replaced, and the base file its content is
+/// relative to (its own, or, under a rename over it, its source's, C2). What a refinement reads the bytes of. One walk
+/// of the document's ops, as its composition's own walks are.
+pub fn whole_replaced(doc: &OpsDoc) -> Vec<(String, String)> {
   let mut found = Vec::new();
   let mut start = 0;
   while start < doc.ops.len() {
@@ -1714,27 +1775,40 @@ pub fn whole_replaced_paths(doc: &OpsDoc) -> Vec<String> {
       end = end.saturating_add(1);
     }
     if let Some(shape) = whole_replacement(doc.ops.get(start..end).unwrap_or_default())
-      && let Some(name) = doc.paths.path(shape.from.unwrap_or(path))
+      && let (Some(base), Some(name)) = (
+        doc.paths.path(shape.from.unwrap_or(path)),
+        doc.paths.path(path),
+      )
     {
-      found.push(name.to_owned());
+      found.push((base.to_owned(), name.to_owned()));
     }
     start = end;
   }
   found
 }
 
+/// The base paths whose bytes [`refine_rewrites`] reads to refine `doc`'s whole replacements ([`whole_replaced`]): what
+/// a work's shard asks its green's owner for the base of, besides the files it does not hold (C1, A-247).
+pub fn whole_replaced_paths(doc: &OpsDoc) -> Vec<String> {
+  whole_replaced(doc)
+    .into_iter()
+    .map(|(base, _)| base)
+    .collect()
+}
+
 /// An op and where its bytes sat in the old layout (`None` when not laid).
 type OpBefore = (Op, Option<u64>);
 
 /// A refined path's ops in place of its replacement's content ops, `[start, end)` of the document's ops.
-type RefinedRun = (usize, usize, Vec<OpBefore>);
+type RefinedRun = (usize, usize, Chunked<OpBefore>);
 
 /// The lender of the base bytes at a base path and the writer's bytes at a path: (base path, path).
 pub type FileLender<'l, 'f> = &'l mut dyn FnMut(&str, &str) -> Option<BaseAndPost<'f>>;
 
 /// [`refine_rewrites`] a unit at a time under `ticks` (module docs, "Sliced"): each replacement's refinement, the
-/// relaid post-state's sort and the document's canonical order are paced; the same document and plan whatever the
-/// pace. The document's operations are walked once to find the replacements before any is refined.
+/// splice of its ops in canonical order and the relaid post-state are paced, with no sort and no vector that doubles;
+/// the same document and plan whatever the pace. The document's operations are walked once to find the replacements
+/// before any is refined.
 pub async fn refine_rewrites_paced<'f>(
   doc: &mut OpsDoc,
   plan: &mut PostStatePlan,
@@ -1764,9 +1838,8 @@ pub async fn refine_rewrites_paced<'f>(
     return done;
   }
   let mut out = spliced(doc, refined_at, &mut meter).await;
-  *plan = relaid_plan(&mut out, plan, ticks, &mut meter).await;
+  *plan = relaid_plan(&mut out, plan, &mut meter).await;
   ops_laid_into(doc, out, &mut meter).await;
-  doc.canonicalize_paced(ticks).await;
   done.longest_unit_work = meter.longest();
   done
 }
@@ -1788,13 +1861,14 @@ fn lent_whole<'f>(
     .then_some((base, post))
 }
 
-/// `out`'s ops made `doc`'s, in order, laid at exactly their count.
-async fn ops_laid_into(doc: &mut OpsDoc, out: Vec<OpBefore>, meter: &mut Meter<'_>) {
-  doc.ops = Vec::with_capacity(out.len());
-  for (op, _) in out {
-    charge!(meter, 1);
-    doc.ops.push(op);
+/// `out`'s ops made `doc`'s, in order, laid at exactly their count, a chunk at a time, each chunk freed once laid.
+async fn ops_laid_into(doc: &mut OpsDoc, out: Chunked<OpBefore>, meter: &mut Meter<'_>) {
+  let mut ops = Vec::with_capacity(out.len());
+  for chunk in out.chunks {
+    charge!(meter, chunk.len() as u64);
+    ops.extend(chunk.into_iter().map(|(op, _)| op));
   }
+  doc.ops = ops;
 }
 
 /// One replacement of path `path` (laid at `laid_at`) refined from `base` to `post`: its ops, each with where its bytes
@@ -1804,7 +1878,7 @@ async fn refined_ops(
   (base, post): (&[u8], &[u8]),
   (path, laid_at): (u64, u64),
   (done, meter): (&mut Rewrites, &mut Meter<'_>),
-) -> Vec<OpBefore> {
+) -> Chunked<OpBefore> {
   let (base_len, post_len) = (base.len() as u64, post.len() as u64);
   let cost = refiner
     .refine_metered((base, post), (Grain::Token, None), meter)
@@ -1813,19 +1887,16 @@ async fn refined_ops(
   done.kept_whole = done.kept_whole.saturating_add(cost.kept_whole);
   done.paths = done.paths.saturating_add(1);
   done.declared_bytes = done.declared_bytes.saturating_add(base_len);
-  // A range composes into two ops at most, so this is laid once at its bound.
-  let mut with_old: Vec<OpBefore> = Vec::with_capacity(refiner.hunks().len().saturating_mul(2));
+  let mut with_old: Chunked<OpBefore> = Chunked::new();
   let mut ops = Vec::with_capacity(2);
   for chunk in refiner.hunks().chunks() {
     for hunk in chunk {
       done.refined_bytes = done.refined_bytes.saturating_add(hunk.base_len);
       ops.clear();
       ops_of([hunk], (base_len, post_len), path, &mut ops);
-      with_old.extend(
-        ops
-          .iter()
-          .map(|op| (*op, laid(op).then(|| laid_at.saturating_add(op.src)))),
-      );
+      for op in &ops {
+        with_old.push((*op, laid(op).then(|| laid_at.saturating_add(op.src))));
+      }
     }
     // A chunk holds a unit's work of ranges at most.
     charge!(meter, chunk.len() as u64);
@@ -1834,15 +1905,13 @@ async fn refined_ops(
 }
 
 /// `doc`'s ops, each with where its bytes sat in the old layout, the refined paths' ops in place of their replacements'
-/// content ops.
+/// content ops, in chunks (no push moves the ops before it).
 async fn spliced(
   doc: &OpsDoc,
   refined_at: Vec<RefinedRun>,
   meter: &mut Meter<'_>,
-) -> Vec<OpBefore> {
-  // At most every op kept and every refined op added: laid once at that bound.
-  let added: usize = refined_at.iter().map(|(_, _, ops)| ops.len()).sum();
-  let mut out: Vec<OpBefore> = Vec::with_capacity(doc.ops.len().saturating_add(added));
+) -> Chunked<OpBefore> {
+  let mut out: Chunked<OpBefore> = Chunked::new();
   let mut refined_at = refined_at.into_iter().peekable();
   let mut index = 0;
   while index < doc.ops.len() {
@@ -1851,10 +1920,11 @@ async fn spliced(
       && *start == index
     {
       let end = *end;
-      if let Some((_, _, ops)) = refined_at.next() {
-        out.extend(ops);
-      }
-      others_kept(doc, (index, end), &mut out, meter).await;
+      let refined = refined_at
+        .next()
+        .map(|(_, _, ops)| ops)
+        .unwrap_or_else(Chunked::new);
+      merged(doc, (index, end), refined, (&mut out, meter)).await;
       index = end;
       continue;
     }
@@ -1866,53 +1936,72 @@ async fn spliced(
   out
 }
 
-/// A refined path's other ops, `[start, end)` of `doc`'s, kept as they were into `out`: its rename, its mode, its
-/// attributes. Only its content was refined.
-async fn others_kept(
+/// A refined path's ops into `out`: its refined content and its other ops, `[start, end)` of `doc`'s, kept as they were
+/// (its rename, its mode, its attributes; only its content was refined). Both runs are in the canonical order, by
+/// offset then kind (the path's ops were, and the refined content's are as [`ops_of`] emits them), so they merge into
+/// it: the document stays canonical with no sort of its own. The refined ops are taken a chunk at a time, each chunk
+/// freed once taken.
+async fn merged(
   doc: &OpsDoc,
   (start, end): (usize, usize),
-  out: &mut Vec<OpBefore>,
-  meter: &mut Meter<'_>,
+  refined: Chunked<OpBefore>,
+  (out, meter): (&mut Chunked<OpBefore>, &mut Meter<'_>),
 ) {
-  for index in start..end {
+  let canonical = |op: &Op| (op.at, op.kind.to_wire());
+  let mut refined = refined.chunks.into_iter().flatten().peekable();
+  let mut index = start;
+  loop {
     charge!(meter, 1);
-    if let Some(op) = doc.ops.get(index)
-      && !is_content(op.kind)
-    {
-      out.push((*op, laid(op).then_some(op.src)));
+    while index < end && doc.ops.get(index).is_some_and(|op| is_content(op.kind)) {
+      index = index.saturating_add(1);
+    }
+    let kept = doc.ops.get(index).filter(|_| index < end).copied();
+    let take_kept = match (kept, refined.peek()) {
+      (Some(kept), Some((next, _))) => canonical(&kept) <= canonical(next),
+      (Some(_), None) => true,
+      (None, Some(_)) => false,
+      (None, None) => return,
+    };
+    if take_kept {
+      if let Some(op) = kept {
+        out.push((op, laid(&op).then_some(op.src)));
+      }
+      index = index.saturating_add(1);
+    } else if let Some(next) = refined.next() {
+      out.push(next);
     }
   }
 }
 
-/// The laid ops of `out`, as (where its bytes sat, its index), in the old layout's order.
+/// The laid ops of `out`, as (where its bytes sat, its index), in the old layout's order: by a map, each insert a
+/// bounded step (a vector sorted a run at a time grows by doubling, and one push of that growth copies every item
+/// before it).
 async fn laid_in_old_order(
-  out: &[OpBefore],
-  ticks: &crate::pace::Ticks,
+  out: &Chunked<OpBefore>,
   meter: &mut Meter<'_>,
-) -> Vec<(u64, usize)> {
-  let mut laid_ops: Vec<(u64, usize)> = Vec::with_capacity(out.len());
+) -> std::collections::BTreeMap<(u64, usize), ()> {
+  let mut by_old = std::collections::BTreeMap::new();
   for (index, (_, old)) in out.iter().enumerate() {
-    charge!(meter, 1);
+    charge!(meter, TABLE_WORK);
     if let Some(old) = old {
-      laid_ops.push((*old, index));
+      by_old.insert((*old, index), ());
     }
   }
-  crate::pace::sort_by(laid_ops, ticks, |a, b| a.0.cmp(&b.0)).await
+  by_old
 }
 
 /// The post-state relaid: the laid runs of `out` in their old order, each at the next offset (each op's `src` moved
 /// there); a content op's bytes still come from its offset in the writer's file (the old `plan`'s, or the refined op's
 /// own `src` there).
 async fn relaid_plan(
-  out: &mut [OpBefore],
+  out: &mut Chunked<OpBefore>,
   plan: &PostStatePlan,
-  ticks: &crate::pace::Ticks,
   meter: &mut Meter<'_>,
 ) -> PostStatePlan {
-  let order = laid_in_old_order(out, ticks, meter).await;
+  let order = laid_in_old_order(out, meter).await;
   let mut relaid = PostStatePlan::new();
   let mut cursor = 0u64;
-  for (old, index) in order {
+  for ((old, index), ()) in order {
     charge!(meter, 1);
     let Some((op, _)) = out.get_mut(index) else {
       continue;
@@ -1927,6 +2016,54 @@ async fn relaid_plan(
     cursor = cursor.saturating_add(op.len);
   }
   relaid
+}
+
+/// Items kept in chunks of [`UNIT_BYTES`] items: a push never moves the items before it (a vector's doubling copies all
+/// of them in one step), and the chunks go back to the allocator one at a time.
+struct Chunked<T> {
+  chunks: Vec<Vec<T>>,
+  len: usize,
+}
+
+impl<T> Chunked<T> {
+  /// Shape: the items a chunk holds.
+  const CHUNK: usize = 1 << UNIT_BYTES.trailing_zeros();
+
+  fn new() -> Self {
+    Chunked {
+      chunks: Vec::new(),
+      len: 0,
+    }
+  }
+
+  fn push(&mut self, item: T) {
+    if self
+      .chunks
+      .last()
+      .is_none_or(|chunk| chunk.len() >= Self::CHUNK)
+    {
+      self.chunks.push(Vec::with_capacity(Self::CHUNK));
+    }
+    if let Some(chunk) = self.chunks.last_mut() {
+      chunk.push(item);
+      self.len = self.len.saturating_add(1);
+    }
+  }
+
+  fn len(&self) -> usize {
+    self.len
+  }
+
+  fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+    self
+      .chunks
+      .get_mut(index / Self::CHUNK)?
+      .get_mut(index % Self::CHUNK)
+  }
+
+  fn iter(&self) -> impl Iterator<Item = &T> {
+    self.chunks.iter().flatten()
+  }
 }
 
 #[cfg(test)]
