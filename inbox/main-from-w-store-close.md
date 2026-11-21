@@ -61,3 +61,14 @@
   slates-store 20/20 and slates-api store_sizing 1/1. Told w-hg, w-perf and w-svn.
 - Next: C4 with w-hg, rerunning its store test on main; then C5 with w-git; then C6 with w-svn's import over the
   sliced landing.
+
+## 2026-11-20 ~22:30: C5's store side; the grant's G row
+- ad1d9e7a6: `StorePacks` (crates/server/src/vcs_store/store_packs.rs), git's sync `PackSource` over the store's
+  owner. An awaited `fill` puts the covering 64 KiB store pieces into an LRU bounded by the caller's derived `most`;
+  `piece` lends from that alone, and a miss is the cue to fill. There is no blocking read (R6). Test: a 300,000-byte
+  pack read forward through a three-piece bound, each piece fetched once and every miss one fill (server --lib 1/1).
+  Shape posted to w-git.
+- e5baf401c: the standing grant is durable as the store's `G` row: recorded at the first open, checkpointed before
+  anything lands, and found as first issued after a crash. Every landing's header names its id
+  (`StoreHandle::grant()`); the creation landing does now, and the tools were told. Tests: slates-store 21/21, server
+  store_tests 2/2. Still owed: a standing-grant `AuditKind` with its audit position, and revocation.

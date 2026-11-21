@@ -1,5 +1,15 @@
 # w-store progress (brief: briefs/w-store.md)
 
+## State (2026-11-20 ~22:30 PST)
+- LANDED ad1d9e7a6: C5 store side, crates/server/src/vcs_store/store_packs.rs (StorePacks: async fill into a bounded
+  LRU of store pieces, sync PackSource::piece lends; main's split, w-git builds git's side on it; shape posted
+  inbox/w-git-from-w-store-store-packs-2026-11-20.md). server --lib store_packs 1/1.
+- LANDED e5baf401c: the standing grant's G row (recorded at first open, checkpointed, found after a crash);
+  StoreHandle::grant() named by the creation's header; tools told. slates-store 21/21, server store_tests 2/2.
+- NEXT: pair on C4 (w-hg rerun), C5 (w-git on StorePacks), C6 (w-svn import on the sliced landing). Mine owed: holders
+  landing replicated changesets (A-767 item 5, f>=1), a standing-grant audit kind + revocation, group commit (perf),
+  Windows store_root (main's lane), unnamed changesets' log space (cleaner).
+
 ## State (2026-11-20 ~21:30 PST)
 - LANDED 71db6d157: memtable held at 8/128 GiB profiles (slates-api store_sizing test; red 128 GiB Gone on the old
   formula); owner's sliced landing (StoreHandle::begin -> SlicedLanding section/part/commit, drop abandons). slates-store
