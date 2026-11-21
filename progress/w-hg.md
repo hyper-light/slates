@@ -252,3 +252,17 @@
       the register entry (v7 made reference), the fork placed, and the made map set.
     - The recovery/rebuild replay of v7 already goes through the pieces; replayed_hg sets `made`.
     - Tests poll for the made changeset (async now).
+- ~10:10 LANDED ac25475c1: made changesets on the store (one hook, one path). The v3 made record, `unstored` and
+  `stored_logs` are removed. Close note written; main and w-perf told.
+- NEXT: C1 step 1a, the clone walk (by_links) in serve/getbundle.rs Walk::file through StoreWants.
+  - Walk fields: want, wanted logs, the ahead deque (path, position, node, link, row, chunk), and a sent map
+    (identity -> node) for the open group.
+  - A new `Store::file_entry(path, node) -> ([Node;2], flags)`, read from the index, no text.
+  - A stored delta is sent as it stands (put_delta against the sent node, or NULL for a stored whole).
+  - Producing::Bundle forwards wants to Answering, then the Walk.
+  - The edges already answer wants between turns (vcs_http/hg.rs:653, vcs_ssh/hg.rs:184).
+  - Whole callers (getbundle::changegroup, session::serve whole, the tests) need a want-answerer: render's StoredSource
+    / answer_want style.
+  - Red: a full clone makes no whole text and reads chunks = file revisions; stock 7.2's clone verifies clean.
+  - Then 1b (the pull path, named_changegroup) with main's condition: the base on the client or sent earlier, from the
+    common set; count whole sends; measure a one-changeset pull touching a big file against stock.
