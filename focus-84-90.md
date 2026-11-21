@@ -1573,3 +1573,8 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - LANDED: 379087733 (w-git push cut-off layer 1: a push refused after its body is answered in git's words, never a cut connection; red 2/2). Layer 2, the charge, is named and next.
   - The MacBook disk is 32 GB.
 - 2026-11-21 02:20 PST DISK: the MacBook fell to 20 GB free (w-git's r10 release build placed here: 3.5 -> 14 GB). Main ran clean-aggressive.sh per the under-30-GB rule. It deleted ~/.cache/kiln-send-route-target (26 GB, a kiln session's build output, last written 23:43, not in use; regenerable, the session rebuilds if it resumes) and w-k90-a520's finished reach copy. Free went 20 -> 60 GB. w-git puts release builds on a Studio from now on (needs disk=60g) and builds with CARGO_INCREMENTAL=0 (w-svn's target went 27 -> 6.4 GB that way). Studio-1's g221 and g223 show offline (network).
+- 2026-11-21 02:23 PST LANDED:
+  - b295ea7b3 and dc7c03c35 (w-git push layer 2, piece 1): receive's connectivity check charges its objects, never its edges; red asked 134,176 B with 2,254 left.
+  - b9ce328cb (w-svn B2 (a): export reads stored texts through the store).
+  - 24a8f7e5e (w-fed-move, A-803): the verdict's growth with history named as A-793's re-anchor: O(k) for a path's k-th change while a reader pins the floor. Judge 24 -> 71 us and values walked 7.9 -> 231 at 10^5 versions; not the 100k wall. Fix design to main first.
+  A-804 is claimed by w-rewrite-ops (the deferred-submit hook). The MacBook disk is 59 GB.
