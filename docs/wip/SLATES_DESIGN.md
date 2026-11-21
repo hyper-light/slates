@@ -57979,6 +57979,14 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > `a_stores_standing_grant_is_recorded_once_and_found_after_a_crash` (`tests/store.rs`) and the creation test's
 > provenance check (`repository/store_tests.rs`). Owed: the audit position (a standing-grant audit kind) and revocation.
 
+> **Status (2026-11-20, a creation in the one landing order).** `CreateRepository` on a node keeping a store now lands
+> first and records second, as every landing does: the repository's record judged (the guard alone), its ids and its
+> root's reserved past the partition's family counter (`ShardState::family_reserved_through`, never lowered, so an id
+> whose creation never recorded is a gap), changeset 0 landed, then in one transaction the repository, its root and
+> its completion recorded, then the answer (deferred, AUD-11). A kill between the two leaves a changeset no repository
+> names, which recovery passes over, and the client's retry creates the repository afresh. Without a store the record
+> is made at once, as before; with one, a request with no reply route is refused `Unsupported` (the fleet half, owed).
+
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
 seam; (4) the A/B of item 7; (5) Mercurial onto it (w-hg), (6) git (w-git's B1-B4), (7) Subversion (w-svn), each with

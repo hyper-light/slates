@@ -191,7 +191,9 @@ pub(crate) fn fresh_family_id_at(
   family: Option<u16>,
   offset: u64,
 ) -> Option<DbVolumeId> {
-  let number = state.db.family_number_at(offset)?;
+  // Past every number a creation in flight reserved (`ShardState::family_reserved_through`, A-767 item 7).
+  let base = u64::from(state.db.family_number_at(0)?).max(state.family_reserved_through);
+  let number = u32::try_from(base.checked_add(offset)?).ok()?;
   // Derived: a new family's tag is its number modulo the tags a family id holds, MAX_FAMILY_TAG + 1.
   let tags = u32::from(slates_db::register::MAX_FAMILY_TAG).checked_add(1)?;
   let tag = match family {
