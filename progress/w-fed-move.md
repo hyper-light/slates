@@ -1,5 +1,16 @@
 # w-fed-move — progress (relaunched on the Mac Studio 2026-11-19 ~21:35 PST; supervisor slates-7a via kiln)
 
+## 2026-11-21 ~11:50 PST: owner asks after A-817 -- both cuts measured and rejected (records on main: 99dc2e932, eef868f80)
+- Push route fixed: ~/.local/bin/kiln is EMPTY (0 bytes); I push through ~/.cache/w-fed-move-target/release/kiln via the
+  MacBook (~/.cache/w-fed-move-publish-state.sh for the state branch, ~/.cache/w-fed-move-publish-main.sh for main),
+  each confirming the commit on origin.
+- Resolution at the head as it is (main's ruling 10:33), A/B at 300/100/30/10 hot files, all N, oracle clean:
+  asks a client 11.2/13.0/19.3/31.8 (read+rebase) vs 11.9/13.3/17.9/26.8 (check+resolve); rebase-kind asks
+  2.1/3.6/8.7/20.1 vs 2.9/3.9/7.2/13.2. Bar 19.8 -> ~4.6 not met: rejected. Patch:
+  ~/slates-work/w-fed-move-resolve-at-head-rejected.patch.
+- Option 3 (shard-level length cache): ceiling 10% (300 hot) to 18% (10 hot) of length asks: rejected unbuilt.
+- Asked main (inbox/main-from-w-fed-move-asks-done.md) whether to close the asks thread; waiting on r26's rows.
+
 ## 2026-11-21 ~10:45 PST: main's rebase-drop ruling (03:46, resent 06:40 as a goal) -- SETTLED, not landed by main's 10:35 ruling
 - Main's 03:46 ruling (drop a journal op whose result became the head's) reached me only at 06:40; I had already built
   it, measured it and reported it (inbox/main-from-w-fed-move-drop.md). Main, 10:35: "Don't land the drop ... A ruling
