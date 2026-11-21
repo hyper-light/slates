@@ -289,3 +289,9 @@
   unbounded set (1,637 on the MacBook). Recorded in GAPS, 5ee55fde3. Red owed: SIGKILL a test daemon, assert its node
   gone once the harness ends; shapes: the harness removes its node at its end, or the route sweeps dead instances'
   nodes at bind (bounded, owner-only).
+- 2026-11-21 07:10 main: r16/r17 lost when kiln's server dropped; restarted unpinned: P1 r1, start_shard r2, hg r3.
+  4th item (found by use): t_a752's "more quanta than files" fails under load. It states the implementation's timing,
+  not A-752's rule: a quantum is the shard's live wake estimate (`step_budget_ns`), which load and few CPUs raise, so
+  quanta over files is the machine's speed. The rule is a unit a file at least; the pace report counts units. Change:
+  PushTurns counts units (status `push.build.units`), the test asserts units >= files. Red/green at 1 CPU, 2 CPUs and a
+  loaded host, main against the branch: kiln r4 (Linux).

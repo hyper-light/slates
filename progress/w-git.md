@@ -370,3 +370,24 @@
   Reds (w-rewrite-ops' list): answered only after both (the durable head 0 in the verb's step); a kill between the land
   and the commit recovers to before, and the retry lands once. Open question: the version's trees from a preview need
   vcs_store::paths' map/trees of the preview's post-state (A-664).
+  Piece 3 design refinement (08:30): paths::stepped(&engine, ...) takes an engine ref, so the version's map/trees can
+  be stepped from the preview (state.greens.with_preview(&preview, |engine| stepped(...)) as svn_made::revision_held
+  does). It KEEPS the map as the green's git head at the version before the version is durable: acceptable as git's
+  derived data, but an abandoned made commit must drop that kept head (restore the one before). A green needing a whole
+  build (needs_whole) gets it sliced in the made task before the landing (A-664's whole_build machinery), never in the
+  submit's step. Then commits::made's objects from Head::trees -> GitPush sealed -> task: carry Home, carry Land ->
+  made_commit::commit(tool = guard + store commit + append v5 entry). The owed path (staged/make_owed) folds into
+  this; record_of/v2 removed after.
+- 08:50 piece 3 RED committed locally (w-git-c5b, not pushed): vcs_store::commits::tests::t_c5b_p3_a_git_made_commit_is_answered_only_once_its_changeset_landed_and_committed: in the verb's step (true, 1, 0) answered+durable. Next: Tool::Git in made_commit, commits::make_deferred from a preview (paths::stepped over with_preview), the landing task, then the kill test, then removing record_of/v2.
+- 09:45 main ruling (b): piece 3 after P2's engine half. Piece 3's red kept on agents/w-git-piece3-red (cf289fb7d);
+  old worktree w-git-c5b removed (its only unpushed commits were the red and its revert). New worktree
+  ~/slates-work/w-git-p2 from main f52934d65.
+- P2 engine half LANDED by w-rewrite-ops (A-812, 7e110566d): BranchChange::CreateDeferred, DeferredPush, green_ready,
+  with_owed_push_objects hook. My git half in w-git-p2 (uncommitted, not compiling yet):
+  * works.rs: Entry::Create { name, from, push: DeferredPush } (push_of of the eager create); prepare builds nothing
+    for creates.
+  * vcs_store::with_owed_push_objects: git arm (PushedObjects over an empty Push).
+  * git_push::created: CreateDeferred; the unborn default -> BranchChange::UpdateDeferred { green, push } (ASKED of
+    w-rewrite-ops, inbox/w-rewrite-ops-from-w-git-update-deferred.md; not on main yet).
+  Left: git crate works tests (Entry::Create increment), server tests reading created greens' files directly (route via
+  the door / lend), the oracle (derived map = eager build, branches and tags, before/after replay), red = git/git push.

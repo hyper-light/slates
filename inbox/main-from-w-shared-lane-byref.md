@@ -111,3 +111,15 @@ landed (71e55b6c2), the 8 MiB liveness test holds, and at 32 MiB+ the owner's on
   8.2 s).
 - r16 (big Studio) running the branch's suites: merge 252 + integration all ok, cluster 248 ok so far.
 - Local target deleted per your 01:23 note (19 GB). Family three's Linux run (r22) can't start: adacachy refuses new runs.
+
+## 06:55 PST (by `date`; your 07:34 note): r16 and r21 were lost with kiln's restart; restarted on the merged tree
+- `output` answered "no run" for both. Piece 1 is now one commit, 6088ccb72 (A-815; A-802 was taken), merged with
+  origin/main f52934d65 as 9f735ab64 on agents/w-shared-byref. The merge took main's new paths: `AcceptedParts`
+  carries the held increment instead of its bytes (made_commit's deferral keeps it held), A-814's import holds each
+  revision's increment before its entry and publishes first, A-813's deferred-push record stays the version's inputs
+  as chain bytes (`VersionInputs::Record`, shipped lent from the chain as before), and slates-git's `entry_bound`.
+- kiln r1 (new numbering): the merged tree's focused suites (merge, cluster, git lib, server lib, 7 server suites,
+  the kill test) and server lib at f52934d65 as the baseline, log at ~/.cache/w-shared-byref-ci.log on the machine.
+  Queued: no macOS runner with room answered yet.
+- kiln r2: the 3a release bench on origin/main, 64/128/256/320/512 MiB x 10, log ~/.cache/w-shared-bench.log there.
+- I land piece 1 when r1 is green (fast landing rule, on the merged tree), one line to w-git, w-hg, w-svn first.
