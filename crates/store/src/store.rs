@@ -60,7 +60,7 @@ const CONTENT_KEY_BYTES: usize = AFTER_TAG + IDENTITY;
 const CONTENT_VALUE_BYTES: usize = U64 + U64;
 /// Format: the most bytes one [`Store::piece`] reads from the log: the read's unit (a caller walks pieces of any length
 /// until what it needs is whole), not a tuning of the reader.
-const PIECE_BYTES: usize = 1 << 16;
+pub(crate) const PIECE_BYTES: usize = 1 << 16;
 /// Format: a changeset row key's sequence, after the tag and the repository.
 const K_SEQUENCE: usize = AFTER_TAG + U128;
 /// Format: a changeset row's key: the tag, the repository, the sequence.

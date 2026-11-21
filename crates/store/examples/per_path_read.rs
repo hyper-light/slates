@@ -160,6 +160,8 @@ fn main() {
     Sizing {
       memory: ENGINE_MEMORY,
       disk: DISK,
+      extent_bytes: 128 << 10,
+      fanout: 8,
     },
   )
   .unwrap();

@@ -22,7 +22,8 @@ use slates_rt::sync::{self, ChannelReceiver, Sender, SyncError};
 
 use crate::log::{Header, Located, SectionKind};
 use crate::staging::{Identity, Staging};
-use crate::store::{Changeset, Contents, Sizing, Store, StoreError};
+use crate::store::{Changeset, Contents, PIECE_BYTES, Sizing, Store, StoreError};
+use crate::texts::{TextCache, TextRow};
 
 /// A section of a landing: its kind and its bytes, moved in.
 pub type Part = (SectionKind, Vec<u8>);
@@ -45,6 +46,24 @@ enum Request {
     from: u64,
     limit: usize,
     answer: Sender<Result<Vec<Changeset>, StoreError>>,
+  },
+  Text {
+    repository: u128,
+    identity: Identity,
+    offset: u64,
+    answer: Sender<Result<Option<Vec<u8>>, StoreError>>,
+  },
+  TextRow {
+    repository: u128,
+    identity: Identity,
+    answer: Sender<Result<Option<TextRow>, StoreError>>,
+  },
+  PathTexts {
+    repository: u128,
+    path: Vec<u8>,
+    from: u64,
+    limit: usize,
+    answer: Sender<Result<Vec<(u64, Identity)>, StoreError>>,
   },
 }
 
@@ -107,6 +126,24 @@ impl fmt::Debug for Request {
         .field("repository", repository)
         .field("from", from)
         .finish_non_exhaustive(),
+      Request::Text {
+        repository, offset, ..
+      } => f
+        .debug_struct("Text")
+        .field("repository", repository)
+        .field("offset", offset)
+        .finish_non_exhaustive(),
+      Request::TextRow { repository, .. } => f
+        .debug_struct("TextRow")
+        .field("repository", repository)
+        .finish_non_exhaustive(),
+      Request::PathTexts {
+        repository, from, ..
+      } => f
+        .debug_struct("PathTexts")
+        .field("repository", repository)
+        .field("from", from)
+        .finish_non_exhaustive(),
     }
   }
 }
@@ -152,6 +189,9 @@ fn serve(
   let mut store = Store::open(root, sizing)?;
   // The owner lands bytes the request carries; nothing is staged on its side.
   let staging = Staging::new(0);
+  // The texts the owner made from their chains (A-645's derived per-path read form), kept across requests, so a clone
+  // streaming a path's versions in order makes each from the one before; its bound learned from the chains it made.
+  let mut texts = TextCache::new(0);
   while let Ok(request) = incoming.blocking_recv() {
     match request {
       Request::Land {
@@ -183,6 +223,41 @@ fn serve(
         answer,
       } => {
         let _ = answer.try_send(store.changesets(repository, from, limit));
+      }
+      Request::Text {
+        repository,
+        identity,
+        offset,
+        answer,
+      } => {
+        // As far as one piece reaches from `offset`, as `piece` answers: a caller walks pieces of any length.
+        let read = store
+          .text_at(&staging, repository, &identity, offset, &mut texts)
+          .map(|text| {
+            text.map(|rest| {
+              rest
+                .get(..rest.len().min(PIECE_BYTES))
+                .unwrap_or(rest)
+                .to_vec()
+            })
+          });
+        let _ = answer.try_send(read);
+      }
+      Request::TextRow {
+        repository,
+        identity,
+        answer,
+      } => {
+        let _ = answer.try_send(store.text_row(repository, &identity));
+      }
+      Request::PathTexts {
+        repository,
+        path,
+        from,
+        limit,
+        answer,
+      } => {
+        let _ = answer.try_send(store.path_texts(repository, &path, from, limit));
       }
     }
   }
@@ -239,6 +314,72 @@ impl StoreHandle {
           identity,
           len,
           offset,
+          answer,
+        },
+        answers,
+      )
+      .await
+  }
+
+  /// The text `identity` of `repository` from `offset`, as far as one piece reaches, made from its chain on the owner
+  /// (A-645's derived per-path read form, [`Store::text_at`]): empty at its end, none past it or for a text no landed
+  /// changeset kept.
+  pub async fn text(
+    &self,
+    repository: u128,
+    identity: Identity,
+    offset: u64,
+  ) -> Result<Option<Vec<u8>>, OwnerError> {
+    let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
+    self
+      .ask(
+        Request::Text {
+          repository,
+          identity,
+          offset,
+          answer,
+        },
+        answers,
+      )
+      .await
+  }
+
+  /// How the text `identity` of `repository` is made ([`Store::text_row`]): its changeset, length, base and place, so a
+  /// clone sends an edit as it lies (read with [`StoreHandle::piece`]).
+  pub async fn text_row(
+    &self,
+    repository: u128,
+    identity: Identity,
+  ) -> Result<Option<TextRow>, OwnerError> {
+    let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
+    self
+      .ask(
+        Request::TextRow {
+          repository,
+          identity,
+          answer,
+        },
+        answers,
+      )
+      .await
+  }
+
+  /// A path's history in `repository` from sequence `from` on, at most `limit` ([`Store::path_texts`]).
+  pub async fn path_texts(
+    &self,
+    repository: u128,
+    path: Vec<u8>,
+    from: u64,
+    limit: usize,
+  ) -> Result<Vec<(u64, Identity)>, OwnerError> {
+    let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
+    self
+      .ask(
+        Request::PathTexts {
+          repository,
+          path,
+          from,
+          limit,
           answer,
         },
         answers,

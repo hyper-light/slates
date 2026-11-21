@@ -317,12 +317,14 @@ impl<'b> Reader<'b> {
 const TEXTS: u8 = b'T';
 /// Format: the path history table's tag: a repository's path (by BLAKE3 of its bytes) and a sequence to the text it kept.
 const HISTORY: u8 = b'H';
+/// Format: the bytes of a repository's id (A-515's 128 bits, big-endian in a key so a repository's rows are one range).
+const REPOSITORY: usize = 16;
 /// Format: a text row's key: the tag, the repository, the text's identity.
-const TEXT_KEY_BYTES: usize = 1 + LONG + IDENTITY;
+const TEXT_KEY_BYTES: usize = 1 + REPOSITORY + IDENTITY;
 /// Format: a text row's value: the sequence, the length, the base's mark and identity, the place.
 const TEXT_VALUE_BYTES: usize = LONG + LONG + 1 + IDENTITY + IDENTITY + LONG + LONG;
 /// Format: a history row's key: the tag, the repository, the path's BLAKE3, the sequence (big-endian, so in order).
-const HISTORY_KEY_BYTES: usize = 1 + LONG + IDENTITY + LONG;
+const HISTORY_KEY_BYTES: usize = 1 + REPOSITORY + IDENTITY + LONG;
 
 /// How a landed text is made ([`Store::text_row`]): the changeset that kept it, its length, its edit's base (none for a
 /// whole), and where the edit or the whole lies.
@@ -338,8 +340,10 @@ pub struct TextRow {
   pub place: Place,
 }
 
-/// Whole texts made from their chains, by identity, oldest out first, bounded in bytes by the caller (the shard's
-/// learned share, as `Sizing`'s memory is); and what the reads did, the red test's non-vacuity counters.
+/// Whole texts made from their chains, by identity, oldest out first, bounded in bytes: the bound a caller starts it
+/// with, grown to the bytes of the longest chain a read has had to make (a learned size, Ada's sizing rule: a read needs
+/// its chain's texts at once, so no smaller bound serves it); and what the reads did, the red test's non-vacuity
+/// counters.
 #[derive(Debug)]
 pub struct TextCache {
   /// The texts held.
@@ -447,26 +451,26 @@ pub(crate) fn put_rows<F: hyper_block::block::BlockFile>(
 }
 
 /// A text row's key.
-fn text_key(repository: u64, text: &Identity) -> [u8; TEXT_KEY_BYTES] {
+fn text_key(repository: u128, text: &Identity) -> [u8; TEXT_KEY_BYTES] {
   let mut key = [0u8; TEXT_KEY_BYTES];
   let (tag, rest) = key.split_at_mut(1);
   if let Some(tag) = tag.first_mut() {
     *tag = TEXTS;
   }
-  let (repo, identity) = rest.split_at_mut(LONG);
+  let (repo, identity) = rest.split_at_mut(REPOSITORY);
   repo.copy_from_slice(&repository.to_be_bytes());
   identity.copy_from_slice(text);
   key
 }
 
 /// A history row's key.
-fn history_key(repository: u64, path: &Identity, sequence: u64) -> [u8; HISTORY_KEY_BYTES] {
+fn history_key(repository: u128, path: &Identity, sequence: u64) -> [u8; HISTORY_KEY_BYTES] {
   let mut key = [0u8; HISTORY_KEY_BYTES];
   let (tag, rest) = key.split_at_mut(1);
   if let Some(tag) = tag.first_mut() {
     *tag = HISTORY;
   }
-  let (repo, rest) = rest.split_at_mut(LONG);
+  let (repo, rest) = rest.split_at_mut(REPOSITORY);
   repo.copy_from_slice(&repository.to_be_bytes());
   let (hash, seq) = rest.split_at_mut(IDENTITY);
   hash.copy_from_slice(path);
@@ -506,7 +510,7 @@ impl Store {
   /// [`StoreError::BadRow`] for a row that does not decode; the engine's refusals.
   pub fn text_row(
     &mut self,
-    repository: u64,
+    repository: u128,
     text: &Identity,
   ) -> Result<Option<TextRow>, StoreError> {
     let mut value = Vec::with_capacity(TEXT_VALUE_BYTES);
@@ -530,7 +534,7 @@ impl Store {
   pub fn text_at<'c>(
     &mut self,
     staging: &Staging,
-    repository: u64,
+    repository: u128,
     text: &Identity,
     offset: u64,
     cache: &'c mut TextCache,
@@ -538,10 +542,10 @@ impl Store {
     if cache.get(text).is_none() && !self.make(staging, repository, text, cache)? {
       return Ok(None);
     }
-    let whole = cache
-      .held
-      .get(text)
-      .ok_or(StoreError::Sizing("a text past its reader's cache"))?;
+    // The cache's bound grew to the chain, so the text made is held.
+    let Some(whole) = cache.held.get(text) else {
+      return Err(StoreError::BadRow);
+    };
     let start = usize::try_from(offset).map_err(|_| StoreError::BadRow)?;
     Ok(whole.get(start..))
   }
@@ -553,7 +557,7 @@ impl Store {
   /// The engine's refusals; [`StoreError::BadRow`] for a row that does not decode.
   pub fn path_texts(
     &mut self,
-    repository: u64,
+    repository: u128,
     path: &[u8],
     from: u64,
     limit: usize,
@@ -583,7 +587,7 @@ impl Store {
   fn make(
     &mut self,
     staging: &Staging,
-    repository: u64,
+    repository: u128,
     text: &Identity,
     cache: &mut TextCache,
   ) -> Result<bool, StoreError> {
@@ -611,6 +615,11 @@ impl Store {
         None => break,
       }
     }
+    // The chain's texts are held at once while it is made: the cache's bound grows to them where it is short.
+    let need = chain
+      .iter()
+      .fold(0u64, |need, (_, row)| need.saturating_add(row.len));
+    cache.bound = cache.bound.max(need);
     let mut made: Vec<u8> = Vec::new();
     while let Some((identity, row)) = chain.pop() {
       let bytes = self.read_place(staging, &row.place, cache)?;

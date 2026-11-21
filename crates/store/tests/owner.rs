@@ -136,3 +136,122 @@ fn a_shard_lands_and_reads_through_the_owner_across_a_restart() {
   assert_eq!(again.1, payload[..again.1.len()]);
   owner.stop().unwrap();
 }
+
+/// A hunk replacing `start..end` of the base with `data` (Mercurial's `mpatch` form, the store's one edit form).
+fn hunk(start: u32, end: u32, data: &[u8]) -> Vec<u8> {
+  [
+    start.to_be_bytes().as_slice(),
+    &end.to_be_bytes(),
+    &(data.len() as u32).to_be_bytes(),
+    data,
+  ]
+  .concat()
+}
+
+/// A-645 on A-767 through the node's store (main's order of 2026-11-20 19:50: red first on the real store). Do: land a
+/// path's whole and three edits as four changesets through a shard's handle, each with its payload and `Texts` section;
+/// read its first and second versions back through the handle a piece at a time, and its history; restart the owner
+/// (its rows recovered from the log) and read again. Expect: each version's bytes, the history in order, both times.
+#[test]
+fn a_shard_reads_an_old_file_revision_through_the_owner_across_a_restart() {
+  use slates_store::texts::{self, Place, TextEntry};
+  let dir = scratch("texts");
+  let mut versions: Vec<Vec<u8>> = vec![(0..150_000u32).map(|at| (at % 241) as u8).collect()];
+  let mut changesets: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+  for sequence in 1..=4u64 {
+    let (payload, base) = if sequence == 1 {
+      (versions[0].clone(), None)
+    } else {
+      let before = versions.last().unwrap().clone();
+      let at = ((sequence - 1) * 40_000 + 3) as u32;
+      let data = [sequence as u8; 16];
+      let mut text = before.clone();
+      text[at as usize..at as usize + 16].copy_from_slice(&data);
+      versions.push(text);
+      (
+        hunk(at, at + 16, &data),
+        Some(*blake3::hash(&before).as_bytes()),
+      )
+    };
+    let text = versions.last().unwrap();
+    let entry = TextEntry {
+      path: b"big.bin".to_vec(),
+      tool_id: Vec::new(),
+      text: *blake3::hash(text).as_bytes(),
+      len: text.len() as u64,
+      base,
+      place: Place {
+        payload: *blake3::hash(&payload).as_bytes(),
+        offset: 0,
+        len: payload.len() as u64,
+      },
+    };
+    changesets.push((payload, texts::encode(&[entry])));
+  }
+  let read_back = |handle: slates_store::owner::StoreHandle, wanted: Vec<Vec<u8>>| async move {
+    let mut read = Vec::new();
+    for text in &wanted {
+      let identity = *blake3::hash(text).as_bytes();
+      let mut bytes = Vec::new();
+      loop {
+        let piece = handle
+          .text(11, identity, bytes.len() as u64)
+          .await
+          .unwrap()
+          .expect("a landed text");
+        if piece.is_empty() {
+          break;
+        }
+        bytes.extend(piece);
+      }
+      read.push(bytes);
+    }
+    let history = handle
+      .path_texts(11, b"big.bin".to_vec(), 0, 10)
+      .await
+      .unwrap();
+    (
+      read,
+      history
+        .into_iter()
+        .map(|(sequence, _)| sequence)
+        .collect::<Vec<_>>(),
+    )
+  };
+  let owner = start(&dir);
+  let handle = owner.handle();
+  let runtime = runtime();
+  let wanted = vec![versions[0].clone(), versions[1].clone()];
+  let first = runtime
+    .block_on({
+      let wanted = wanted.clone();
+      async move {
+        for (sequence, (payload, section)) in (1u64..).zip(changesets) {
+          handle
+            .land(
+              header(sequence),
+              vec![
+                (SectionKind::Payload, payload),
+                (SectionKind::Texts, section),
+              ],
+            )
+            .await
+            .unwrap();
+        }
+        read_back(handle, wanted).await
+      }
+    })
+    .unwrap();
+  assert_eq!(first, (wanted.clone(), vec![1, 2, 3, 4]));
+  owner.stop().unwrap();
+  let owner = start(&dir);
+  let handle = owner.handle();
+  let again = runtime.block_on(read_back(handle, wanted.clone())).unwrap();
+  assert_eq!(
+    again,
+    (wanted, vec![1, 2, 3, 4]),
+    "the same after the owner's restart"
+  );
+  owner.stop().unwrap();
+  let _ = std::fs::remove_dir_all(&dir);
+}
