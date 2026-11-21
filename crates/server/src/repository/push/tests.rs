@@ -1375,3 +1375,205 @@ fn a_materialization_past_the_greens_retention_room_is_refused_before_it_commits
   );
   assert_eq!(made, (false, 1), "made once there was room");
 }
+
+/// A revision's work for an import's batch: `tree` pushed over `base`, built against the batch's green as its staged
+/// revisions leave it, numbered as the green numbers it (based at the batch's head).
+fn batch_work(
+  state: &mut ShardState,
+  batch: &crate::import_batch::ImportBatch,
+  (base, tree, head): (ObjectKey, ObjectKey, &[u8]),
+  (store, name): (&Store, u8),
+) -> Increment {
+  let mut built = batch
+    .with_engine(state, |engine| {
+      let push = Push {
+        name: [name; 32],
+        base_version: engine.head(),
+        base_tree: Some(base),
+        tree,
+        head: Some(head),
+      };
+      slates_merge::push::build(&push, engine, store, ROOM)
+        .expect("the work is built")
+        .increment
+    })
+    .expect("the batch's green");
+  built.base = batch.head();
+  built
+}
+
+/// Reads a green as a test compares it: head, files, head identity, durable head (its checkpoint and chain).
+fn green_reads(
+  state: &mut ShardState,
+  green: DbVolumeId,
+) -> (u64, Vec<(String, Vec<u8>)>, [u8; 32], u64) {
+  let durable = state.db.partition().green_head(green);
+  let mut engine = state.greens.get_mut(&green).expect("the green");
+  let files = engine
+    .files()
+    .map(|(path, bytes)| (path, bytes.to_vec()))
+    .collect();
+  (engine.head(), files, engine.head_identity(), durable)
+}
+
+/// C2 stage C, the green's side (A-814; main's order of 06:11). Do: on two git repositories, commit a first version,
+/// then three more revisions, on one green each as its own entry (each bringing a changeset's reference, as an svn
+/// revision does), on the other through one import batch (staged a revision at a time against the batch's green, then
+/// committed with one reference); read the batch's green while staged; replay it after. Expect:
+/// - while staged, the batch's green shows nothing (its head the first version's), and a replay of its durable chain,
+///   what a crash recovers, reaches the first version alone;
+/// - committed, the two greens read alike: head 4, the same files and head identity, durable at 4;
+/// - the batched repository's register took one entry for the three revisions where the other took three;
+/// - the batched green replayed from its chain reaches the same head.
+#[test]
+fn an_import_batch_commits_its_revisions_as_one_entry_and_reads_as_one_by_one() {
+  crate::test_store::audit_on_stored_shard("import-batch", |state| {
+    let (one_by_one, seq_main) = repository(state, "one-by-one");
+    let (batched, batch_main) = repository(state, "batched");
+    let mut store = Store::default();
+    let trees: Vec<ObjectKey> = [
+      &[("f", &b"zero"[..])][..],
+      &[("f", &b"one"[..]), ("g", &b"g1"[..])][..],
+      &[("f", &b"two"[..]), ("g", &b"g1"[..])][..],
+      &[("f", &b"two"[..]), ("g", &b"g3"[..]), ("h", &b"new"[..])][..],
+    ]
+    .iter()
+    .map(|files| store.put_tree(files))
+    .collect();
+    let reference = |n: u8| EntryParts {
+      objects: vec![b'r', n],
+      ..EntryParts::default()
+    };
+    for (repo, green) in [(one_by_one, seq_main), (batched, batch_main)] {
+      let first = work(state, green, (0, None), (trees[0], b"h0"), (&store, 1));
+      push(
+        state,
+        &owner(),
+        repo,
+        vec![BranchChange::Update { green, work: first }],
+        reference(0),
+      )
+      .expect("the first version");
+    }
+    for n in 1..4u8 {
+      let index = usize::from(n);
+      let next = work(
+        state,
+        seq_main,
+        (u64::from(n), Some(trees[index - 1])),
+        (trees[index], &[n]),
+        (&store, n + 1),
+      );
+      push(
+        state,
+        &owner(),
+        one_by_one,
+        vec![BranchChange::Update {
+          green: seq_main,
+          work: next,
+        }],
+        reference(n),
+      )
+      .expect("a revision, one entry");
+    }
+    let mut batch = crate::import_batch::ImportBatch::begin(state, batch_main).expect("a batch");
+    for n in 1..4u8 {
+      let index = usize::from(n);
+      let next = batch_work(
+        state,
+        &batch,
+        (trees[index - 1], trees[index], &[n]),
+        (&store, n + 1),
+      );
+      assert_eq!(batch.stage(state, next), Ok(u64::from(n) + 1));
+    }
+    assert_eq!(
+      green_reads(state, batch_main).0,
+      1,
+      "the green shows nothing of a staged batch"
+    );
+    // A crash now recovers to before the batch: what a replay of the durable chain reaches.
+    assert_eq!(
+      crate::verbs::replay_green_for_test(state, batch_main),
+      Some((1, None)),
+      "nothing of it durable"
+    );
+    let made = batch
+      .commit(state, (&owner(), batched), reference(9))
+      .expect("committed");
+    assert_eq!(made, vec![2, 3, 4]);
+    assert_eq!(
+      green_reads(state, batch_main),
+      green_reads(state, seq_main),
+      "the batch reads as one by one"
+    );
+    let entries = |repo| state.db.partition().repositories().object_count(repo);
+    assert_eq!(
+      (entries(one_by_one), entries(batched)),
+      (4, 2),
+      "three entries against one for the revisions"
+    );
+    assert_eq!(
+      crate::verbs::replay_green_for_test(state, batch_main),
+      Some((4, None)),
+      "the record replays whole"
+    );
+  });
+}
+
+/// C2 stage C's refusals (A-814). Do: stage two revisions into a batch over a green at version 1, then abandon it; stage
+/// two again and commit them as another principal; stage one based off the batch's head. Expect: abandoned, the green
+/// and its chain are as they were; the commit refused `Forbidden`, nothing applied or recorded; the off-head work refused
+/// `NotAtHead`, nothing kept.
+#[test]
+fn an_import_batch_refused_or_abandoned_leaves_its_green_as_it_was() {
+  crate::test_store::audit_on_stored_shard("import-batch-refused", |state| {
+    let (repo, main) = repository(state, "refused");
+    let mut store = Store::default();
+    let zero = store.put_tree(&[("f", b"zero")]);
+    let one = store.put_tree(&[("f", b"one")]);
+    let two = store.put_tree(&[("f", b"two")]);
+    let first = work(state, main, (0, None), (zero, b"h0"), (&store, 1));
+    push(
+      state,
+      &owner(),
+      repo,
+      vec![BranchChange::Update {
+        green: main,
+        work: first,
+      }],
+      EntryParts::default(),
+    )
+    .expect("the first version");
+    let before = green_reads(state, main);
+    let staged_two = |state: &mut ShardState| {
+      let mut batch = crate::import_batch::ImportBatch::begin(state, main).expect("a batch");
+      let w1 = batch_work(state, &batch, (zero, one, b"h1"), (&store, 2));
+      batch.stage(state, w1).expect("staged");
+      let w2 = batch_work(state, &batch, (one, two, b"h2"), (&store, 3));
+      batch.stage(state, w2).expect("staged");
+      batch
+    };
+    staged_two(state).abandon(state);
+    assert_eq!(green_reads(state, main), before, "abandoned: as it was");
+    let refused = staged_two(state).commit(state, (&stranger(), repo), EntryParts::default());
+    assert!(
+      matches!(
+        refused,
+        Err(AppendRefused::Repository(Refusal::Forbidden { .. }))
+      ),
+      "{refused:?}"
+    );
+    assert_eq!(green_reads(state, main), before, "refused: as it was");
+    let mut batch = crate::import_batch::ImportBatch::begin(state, main).expect("a batch");
+    let mut off = batch_work(state, &batch, (zero, one, b"h1"), (&store, 4));
+    off.base = 0;
+    assert_eq!(
+      batch.stage(state, off),
+      Err(crate::import_batch::StageRefused::NotAtHead { head: 1 })
+    );
+    assert_eq!(batch.staged(), 0);
+    batch.abandon(state);
+    assert_eq!(green_reads(state, main), before);
+  });
+}

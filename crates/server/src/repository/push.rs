@@ -308,6 +308,118 @@ pub(crate) fn push(
   push_holding(state, (principal, repository), changes, parts, None)
 }
 
+/// Counter: a version of an import's batch whose recorded apply did not reach its version, the green made again from
+/// its chain: zero in every correct use, as the scratch member judged it at that head. Format: a counter name.
+pub(crate) const BATCH_APPLY_REFUSED: &str = "repository.import_batch.apply_refused";
+
+/// Appends `staged`, a batch of `green`'s versions in order (C2 stage C, `crate::import_batch`), with `parts` as one entry
+/// of `repository`'s register by `principal`, its owner: every version's chain entry and the register's own parts in one
+/// log record, then each version applied to the green as its entry records it (`Green::apply_recorded`, what a recovery
+/// replays) and its merge record enqueued. The batch's retention is secured first and the entry judged by the register's
+/// guard; refused, nothing is applied or recorded. The versions it made, in order.
+pub(crate) fn append_versions(
+  state: &mut ShardState,
+  (principal, repository): (&Principal, RepositoryId),
+  green: DbVolumeId,
+  staged: Vec<crate::import_batch::Staged>,
+  parts: EntryParts,
+) -> Result<Vec<u64>, AppendRefused> {
+  let record = state
+    .db
+    .partition()
+    .repositories()
+    .repository(repository)
+    .cloned()
+    .ok_or(AppendRefused::Repository(Refusal::NotFound))?;
+  if &record.owner != principal {
+    return Err(AppendRefused::Repository(Refusal::Forbidden {
+      verb: "push".to_owned(),
+    }));
+  }
+  if !is_member(state, repository, green) {
+    return Err(AppendRefused::Repository(Refusal::NotFound));
+  }
+  let head = state
+    .greens
+    .get(&green)
+    .map(|engine| engine.head())
+    .ok_or(AppendRefused::Repository(Refusal::NotFound))?;
+  let at = |index: usize| {
+    head
+      .saturating_add(u64::try_from(index).unwrap_or(u64::MAX))
+      .saturating_add(1)
+  };
+  if staged
+    .iter()
+    .enumerate()
+    .any(|(index, step)| step.increment.base.saturating_add(1) != at(index))
+  {
+    return Err(AppendRefused::Entry(Refusal::ContentUnavailable));
+  }
+  let reserved: usize = staged
+    .iter()
+    .map(|step| step.reserved)
+    .fold(0, usize::saturating_add);
+  let secured = u64::try_from(reserved).unwrap_or(u64::MAX);
+  crate::verbs::secure_retention(state, green, secured)
+    .map_err(|available| AppendRefused::Entry(Refusal::BudgetExceeded { available }))?;
+  let mut entry = RepositoryEntry {
+    repository,
+    ..RepositoryEntry::default()
+  };
+  for (index, step) in staged.iter().enumerate() {
+    let bytes = slates_merge::chain_entry::encode(
+      &step.increment.encode(),
+      &step.increment,
+      &step.applied,
+      None,
+      step.identity,
+      None,
+    );
+    entry.versions.push(GreenVersion {
+      green,
+      version: at(index),
+      entry: bytes,
+    });
+  }
+  entry.checks.extend(parts.checks);
+  entry.names.extend(parts.names);
+  entry.state = parts.state;
+  entry.objects = parts.objects;
+  let admitted = admit(state, &[], &entry, &[])
+    .and_then(|()| record_all(state, vec![Op::RepositoryAdvanced { entry }]));
+  if let Err(refused) = admitted {
+    let _ = crate::merge_service::settle_green_retention(state, green);
+    return Err(refused);
+  }
+  let mut made = Vec::with_capacity(staged.len());
+  for (index, step) in staged.into_iter().enumerate() {
+    let version = at(index);
+    let applied = state
+      .greens
+      .get_mut(&green)
+      .map(|mut engine| engine.apply_recorded(&step.increment, &step.applied));
+    if applied != Some(version) {
+      // Recorded, and not applied as judged: the green is made again from its chain, which holds every version.
+      state.count(BATCH_APPLY_REFUSED, 1);
+      crate::verbs::reconcile_unpublished_effects(state);
+    }
+    crate::merge_service::enqueue_record(
+      state,
+      green,
+      version,
+      step.increment.id,
+      step.increment.base,
+      step.increment.evidence,
+      (None, None),
+    );
+    made.push(version);
+  }
+  let _ = crate::merge_service::settle_green_retention(state, green);
+  crate::merge_service::checkpoint_green(state, green);
+  Ok(made)
+}
+
 /// One move of a git push's store (A-662): the green it names, a new branch's by its name, and its new head, none to
 /// delete it.
 pub(crate) type StoreMove = (

@@ -513,6 +513,11 @@
 >   holder's replica is made. Before A-813 the owed version itself never placed. The fix: a holder makes its replica
 >   through the same door over its tool's objects, which needs the repository's store on holders (w-git, w-store).
 >   Owed besides: the end-to-end f = 1 fleet kill test through a git push, once w-git's create defers.
+>   Main's ruling (2026-11-21 06:11), citing §4.16 / A-767: a changeset commits at f+1 nodes, so its content must be on
+>   f+1 nodes, once per node (content once means one copy a node, not one in the fleet). A repository's git objects must
+>   therefore be on its greens' holders, since a holder that takes over must serve the repository. Where the git store is
+>   not replicated with its changesets, that is a fleet gap owned by the store's replication (w-store, stopped pending
+>   Ada) and w-git. It is A-813's open f > 0 limit, and it does not block the laptop case.
 > - (c) FIXED by A-813. A signature verdict on a version in an owing green's tail is kept and recorded once the green is
 >   made (`a_signature_recorded_on_a_version_in_the_owed_tail_is_kept`).
 > - (d) FIXED by A-813. A materialization secures its history and change index before it commits, as a submit's
@@ -2821,6 +2826,16 @@
 > and its replay); git's adopts the hook (w-git, removing its version-2 path); (d)
 > performance: the held verdict's mapped files are made twice (in the preview and at the commit). A creation lands its changeset 0 before the register
 > records it since w-store's e4cfbd38d; Subversion's creation record is that changeset's second `Record` section.
+> **C2 stage C, the green's side BUILT (A-814, 2026-11-21, w-rewrite-ops; main's orders of 04:11 and 06:11; the
+> split in inbox/w-svn-from-w-rewrite-ops-stage-c-split.md).** `crate::import_batch::ImportBatch` advances an import's
+> revisions in RAM and commits them as one entry, through a scratch member of the green's lineage, so the green shows
+> nothing until the commit; the design entry A-814 has the details. Held by
+> `an_import_batch_commits_its_revisions_as_one_entry_and_reads_as_one_by_one` (three revisions: one register entry where
+> one by one took three; the greens alike; a replay before the commit reaches the version before) and
+> `an_import_batch_refused_or_abandoned_leaves_its_green_as_it_was`. Owed: w-svn's side (the records in RAM, the one
+> changeset, its replay, the import driver adopting the batch, the daemon-level red of one landing an import, and the
+> crash oracle).
+>
 > **C2 stage C waits: a Subversion import's per-revision landing, a measured regression (2026-11-21, w-svn; main's
 > ruling of 01:02).** git-2000's import takes 24.5 s against 8.2 s before the store (the real daemon 26.2 s): ~8 ms a
 > revision, one F_FULLFSYNC of the store's owner per landing (BENCHMARKS "Subversion on the changeset store").

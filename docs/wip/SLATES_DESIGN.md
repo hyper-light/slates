@@ -59342,3 +59342,31 @@ What changed:
   - `a_materialization_past_the_greens_retention_room_is_refused_before_it_commits`.
   - `a_signature_recorded_on_a_version_in_the_owed_tail_is_kept` (red: the verdict was refused while owing).
 
+### A-814 — An import's revisions advance in RAM and commit as one entry: the green's side of C2 stage C (2026-11-21, w-rewrite-ops; main 04:11 and 06:11 PST; A-805's "computed pure, applied in one commit" over many revisions; A-767 C2)
+Applied in the same change to:
+- `crates/server/src/import_batch.rs` (new).
+- `crates/server/src/repository/push.rs`: `append_versions`.
+- `crates/server/src/greens.rs`: `preview_at_head`, `with_preview_mut`.
+- GAPS (C2 stage C; A-813's f > 0 limit with main's ruling).
+
+- **Why.** A Subversion import landed each revision as its own changeset: git-2000's 2,001 landings took 24.5 s
+  against 8.2 s before the store, one `F_FULLFSYNC` each. One landing an import needs the green, and the records, to
+  advance through the import in RAM without chain entries, then commit in one transaction.
+- **What.**
+  - `ImportBatch::begin` makes a scratch member of the green's lineage at its head, O(1) (`Lineage::branch`).
+  - Each revision's work is built against the scratch member (`with_engine`) and judged and committed into it
+    (`stage`). Each work is numbered as the green's (based at its head and each revision after), and the scratch member
+    reads its base in its own numbering, so the chain entries are the real ones a holder recomputes.
+  - `commit` makes one log record: every version's chain entry (with the head identity where the record goes to
+    holders), plus the register's parts, i.e. the import's one changeset's reference, which is w-svn's. It secures the
+    batch's summed retention first and judges the entry by the register's guard. Then it applies each version as its
+    entry records it (`Green::apply_recorded`), enqueues each merge record, and retires the scratch member.
+  - `abandon`, a refused commit, or a crash before the record leaves the green and its chain as they were: the green
+    was never touched.
+- **Evidence.** Three revisions over a first version:
+  - one register entry where one by one took three;
+  - the greens read alike (head, files, identity, durable head);
+  - a replay before the commit reaches the version before the batch, and after it the batch's last;
+  - abandoned or refused `Forbidden`, the green is as it was, and an off-head work is refused `NotAtHead`.
+- **Owed:** w-svn's records side and the import driver; the batch's caller bounds it (one changeset's revisions).
+
