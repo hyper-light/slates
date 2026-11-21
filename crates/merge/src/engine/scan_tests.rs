@@ -115,7 +115,7 @@ fn green_of(files: usize) -> Green {
 /// Submits `increment`, expecting it accepted.
 fn accept(green: &mut Green, increment: &Increment) -> Result<(), String> {
   match green.submit(increment) {
-    Outcome::Accepted { .. } => Ok(()),
+    Outcome::Accepted { .. } | Outcome::Identical { .. } => Ok(()),
     other => Err(format!("a setup work was answered {other:?}")),
   }
 }
@@ -135,7 +135,10 @@ fn an_ipc_nodes_removal_examines_one_entry_whatever_the_green_holds() -> Result<
   let answer = green.submit(&increment(remove_node(), Vec::new(), head, 2));
   let count = examined();
   let stands = green.special(NODE).is_some();
-  if !matches!(answer, Outcome::Accepted { .. }) || stands || count != LOOKUPS {
+  if !matches!(answer, Outcome::Accepted { .. } | Outcome::Identical { .. })
+    || stands
+    || count != LOOKUPS
+  {
     return Err(format!(
       "{answer:?}, the node stands: {stands}, {count} entries examined"
     ));

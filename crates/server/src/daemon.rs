@@ -3838,16 +3838,17 @@ impl Daemon {
     })
   }
 
-  /// Test support: leaves unanswered every live phase-one report and log fetch this node, as a holder, is asked by one of
-  /// `askers` (§4.10, A-240; counted `fleet.live.silenced_by_fault`), while it answers everything else: the holder of a
-  /// live log paused or cut off from its successor alone. Replaces any earlier set; an empty `askers` restores full
-  /// service. Installed on every shard; `Ok` once installed, else the first typed refusal.
-  pub fn inject_live_silence(&self, askers: &[slates_db::HostId]) -> Result<(), ObserveError> {
+  /// Test support: leaves unanswered every live phase-one report and log fetch (§4.10, A-240) and every content request
+  /// (§4.10, §4.16: a green successor's fetch of the inputs it lacks) this node, as a holder, is asked by one of `askers`
+  /// (counted `fleet.holder.silenced_by_fault`), while it answers everything else: a holder paused or cut off from its
+  /// successor alone. Replaces any earlier set; an empty `askers` restores full service. Installed on every shard; `Ok`
+  /// once installed, else the first typed refusal.
+  pub fn inject_holder_silence(&self, askers: &[slates_db::HostId]) -> Result<(), ObserveError> {
     // On every shard: a holder's copy is answered on the shard that keeps it.
     for shard in self.shards.iter().copied() {
       let askers: std::collections::BTreeSet<slates_db::HostId> = askers.iter().copied().collect();
       self.observe(Some(shard), move |s| {
-        s.injected_live_silence = askers;
+        s.injected_holder_silence = askers;
       })?;
     }
     Ok(())
@@ -5043,7 +5044,7 @@ async fn init_shard(
     injected_content_ack_delay_ns: None,
     injected_forward_silence: None,
     injected_takeover_silence: std::collections::BTreeSet::new(),
-    injected_live_silence: std::collections::BTreeSet::new(),
+    injected_holder_silence: std::collections::BTreeSet::new(),
     injected_confirmation_withheld: false,
     injected_deaf_session: None,
     injected_discovery_hold: None,
@@ -5118,7 +5119,7 @@ async fn init_shard(
     healer: crate::fleet::HealerCursor::default(),
     repairs: 0,
     pending_materializations: crate::state::PendingMaterializations::default(),
-    given_up_volumes: std::collections::BTreeMap::new(),
+    given_up_taken_over: std::collections::BTreeMap::new(),
     making_taken_over: std::collections::BTreeMap::new(),
     making_volumes: std::collections::BTreeMap::new(),
     pending_catalogs: std::collections::BTreeMap::new(),

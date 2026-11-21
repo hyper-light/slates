@@ -2273,6 +2273,11 @@ fn serve_content_request(
     s.count(crate::merge_service::CONTENT_PUT_REFUSED, 1);
     return Vec::new();
   }
+  // A test's holder away from this asker (`Daemon::inject_holder_silence`): nothing answered.
+  if s.injected_holder_silence.contains(&peer_host) {
+    s.count(crate::live_ship::HOLDER_SILENCED_BY_FAULT, 1);
+    return Vec::new();
+  }
   // Authority for the object the request names is decided before any lookup (AUD-29-45), from the committed
   // configuration and this holder's records — never from the content hash.
   crate::content_holder::serve(
@@ -5257,7 +5262,7 @@ async fn materialize_pending_greens(
         origin,
         local,
         (object, TakenOver::Green),
-        (waited.named(), false),
+        (waited.named(), waited.waits_on_members()),
         attempts,
       )
       .await;
@@ -5314,6 +5319,12 @@ impl GreenWait {
   /// catalog register ([`paging_round`]).
   const fn waits_on_the_round(self) -> bool {
     matches!(self, GreenWait::Catalog)
+  }
+
+  /// Whether it waits on members of its takeover, which a member heard again may clear: the inputs its sources hold, or
+  /// its catalog register ([`judge_given_up_afresh`]).
+  const fn waits_on_members(self) -> bool {
+    matches!(self, GreenWait::Inputs | GreenWait::Catalog)
   }
 
   /// Its name in a refusal's cause (`RecoveryCause::TakeoverIncomplete`).
@@ -5681,21 +5692,22 @@ enum TakenOver {
   Green,
 }
 
-/// Judges afresh each taken-over volume given up on while it waited on its takeover cohorts' members
-/// ([`ShardState::given_up_volumes`], A-775) once one of them is heard again: alive at a later incarnation than when it was
-/// given up, back from a pause or a partition the failover SLO's worth of attempts did not outlast. Its owner shard's
-/// unrecovered record goes, so the verbs on it wait for its materialization again (A-548), and it is pending again with
-/// its attempts from zero, counted [`MATERIALIZE_JUDGED_AFRESH`]. Bounded as the takeover round's own fresh judgement is
-/// (`takeover::HostTakeover::heard_since`): once per member's later incarnation, each with the failover SLO's worth of
+/// Judges afresh each taken-over volume or green given up on while it waited on members of its takeover
+/// ([`ShardState::given_up_taken_over`], A-775: a volume's cohorts, a green's sources) once one of them is heard again:
+/// alive at a later incarnation than when it was given up, back from a pause or a partition the failover SLO's worth of
+/// attempts did not outlast. Its owner shard's unrecovered record goes, so the verbs on it wait for its materialization
+/// again (A-548), and it is pending again with its catalog register and its attempts from zero, counted
+/// [`MATERIALIZE_JUDGED_AFRESH`] or [`GREEN_TAKEOVER_JUDGED_AFRESH`]. Bounded as the takeover round's own fresh judgement
+/// is (`takeover::HostTakeover::heard_since`): once per member's later incarnation, each with the failover SLO's worth of
 /// attempts. Before, a give-up was final until a new configuration: a live volume whose log's holder was stopped about
 /// the failover SLO (`live_chaos`'s fresh-member flow stops it 3 s, its successor's bound 30 periods) answered
 /// `NotRecovered` for good once the holder came back with every acknowledged write (w-forming's anchor log,
 /// `takeover-stall-pr15-run1.log`: `fleet.materialize.given_up` 1 after 22 catalog and 11 quorum waits, the holder left at
-/// fence 1).
+/// fence 1), and a green whose inputs' only other holder was away did the same.
 async fn judge_given_up_afresh(origin: u16) {
   let heard: Vec<ObjectId> = state::with_state(|s| {
     let membership = s.fleet.membership();
-    s.given_up_volumes
+    s.given_up_taken_over
       .iter()
       .filter(|(_, given_up)| {
         given_up.heard.iter().any(|(host, incarnation)| {
@@ -5737,22 +5749,34 @@ async fn judge_given_up_afresh(origin: u16) {
       continue;
     };
     state::with_state(|s| {
-      let given_up = s.given_up_volumes.remove(&object)?;
-      // Its record gone another way (the volume destroyed, or recorded unrecovered for another cause): not taken up.
-      if !still_given_up || s.pending_materializations.contains_key(&object) {
-        // Adopted again meanwhile (a new configuration's round): that record stands.
+      let given_up = s.given_up_taken_over.remove(&object)?;
+      // Its record gone another way (the object destroyed, or recorded unrecovered for another cause), or adopted again
+      // meanwhile by a new configuration's round, whose record stands: not taken up.
+      let adopted_again = s.pending_materializations.contains_key(&object)
+        || s.pending_green_materializations.contains_key(&object);
+      if !still_given_up || adopted_again {
         return None;
       }
       if let Some(catalog) = given_up.catalog {
         s.pending_catalogs.entry(object).or_insert(catalog);
       }
-      let mut pending = given_up.pending;
-      pending.attempts = 0;
-      pending.round_seen = None;
-      pending.turns_seen = None;
-      pending.live_adopted = None;
-      s.pending_materializations.insert(object, pending);
-      s.count(MATERIALIZE_JUDGED_AFRESH, 1);
+      match given_up.pending {
+        crate::state::GivenUpRecord::Volume(mut pending) => {
+          pending.attempts = 0;
+          pending.round_seen = None;
+          pending.turns_seen = None;
+          pending.live_adopted = None;
+          s.pending_materializations.insert(object, pending);
+          s.count(MATERIALIZE_JUDGED_AFRESH, 1);
+        }
+        crate::state::GivenUpRecord::Green(mut pending) => {
+          pending.attempts = 0;
+          pending.round_seen = None;
+          pending.fewest_unheld = None;
+          s.pending_green_materializations.insert(object, pending);
+          s.count(GREEN_TAKEOVER_JUDGED_AFRESH, 1);
+        }
+      }
       Some(())
     });
   }
@@ -5761,6 +5785,9 @@ async fn judge_given_up_afresh(origin: u16) {
 /// Counter: a taken-over volume given up on, judged afresh once a member of its cohorts was heard again
 /// ([`judge_given_up_afresh`]).
 const MATERIALIZE_JUDGED_AFRESH: &str = "fleet.materialize.judged_afresh";
+/// Counter: a taken-over green given up on, judged afresh once one of its sources was heard again
+/// ([`judge_given_up_afresh`]).
+const GREEN_TAKEOVER_JUDGED_AFRESH: &str = "merge.takeover_judged_afresh";
 
 /// Gives up on the taken-over `object` of its kind after `attempts` without progress, the last of which waited on
 /// `waited` ([`materialize_pending`], [`materialize_pending_greens`]): its owner shard records it unrecovered with that
@@ -5808,37 +5835,47 @@ async fn give_up_taken_over(
   };
   state::with_state(|s| {
     let catalog = s.pending_catalogs.remove(&object);
-    match kind {
-      TakenOver::Volume => {
-        let given_up = s.pending_materializations.remove(&object);
-        // A volume that waited on its cohorts' members is judged afresh once one is heard again
-        // ([`judge_given_up_afresh`]).
-        if let Some(pending) =
-          given_up.filter(|pending| on_members && !pending.cohort_hosts.is_empty())
-        {
-          let membership = s.fleet.membership();
-          let heard = pending
-            .cohort_hosts
-            .iter()
-            .map(|host| {
-              let incarnation = membership.state(*host).map_or(0, |held| held.incarnation);
-              (*host, incarnation)
-            })
-            .collect();
-          s.given_up_volumes.insert(
-            object,
-            crate::state::GivenUpVolume {
-              pending,
-              catalog,
-              heard,
-            },
-          );
-        }
-      }
+    // A record that waited on its takeover's members is judged afresh once one is heard again
+    // ([`judge_given_up_afresh`]); each kind's members are its own.
+    let kept = match kind {
+      TakenOver::Volume => s.pending_materializations.remove(&object).map(|pending| {
+        (
+          pending.cohort_hosts.clone(),
+          crate::state::GivenUpRecord::Volume(pending),
+        )
+      }),
       TakenOver::Green => {
-        s.pending_green_materializations.remove(&object);
         crate::green_adopt::forget_completions(s, object);
+        s.pending_green_materializations
+          .remove(&object)
+          .map(|pending| {
+            (
+              pending.sources.clone(),
+              crate::state::GivenUpRecord::Green(pending),
+            )
+          })
       }
+    };
+    if let Some((members, pending)) = kept.filter(|(members, _)| on_members && !members.is_empty())
+    {
+      let membership = s.fleet.membership();
+      let heard = members
+        .iter()
+        .map(|host| {
+          (
+            *host,
+            membership.state(*host).map_or(0, |held| held.incarnation),
+          )
+        })
+        .collect();
+      s.given_up_taken_over.insert(
+        object,
+        crate::state::GivenUpTakenOver {
+          pending,
+          catalog,
+          heard,
+        },
+      );
     }
     if target.is_some() {
       crate::takeover::track_owner_on_every_shard(s, object, local);

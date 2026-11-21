@@ -74,13 +74,13 @@ impl Keep for Intake<'_> {
 }
 
 /// A push's quarantine, read only: the objects admitted so far, their bytes from the store.
-pub(super) struct Quarantined<'s> {
+pub(crate) struct Quarantined<'s> {
   /// The quarantine.
-  pub(super) push: Option<&'s Push>,
+  pub(crate) push: Option<&'s Push>,
   /// The store its objects are in.
-  pub(super) store: &'s ContentStore,
+  pub(crate) store: &'s ContentStore,
   /// The repository, whose index holds the objects a pack resends that the quarantine passed over (A-753).
-  pub(super) repository: &'s GitRepository,
+  pub(crate) repository: &'s GitRepository,
 }
 
 impl Contents for Quarantined<'_> {

@@ -338,7 +338,7 @@ slates changed-since GREEN VERSION [--json]
 slates work GREEN NAME [--json]
 slates edit WORK PATH AT DELETE TEXT [--json]
 slates copy WORK FROM TO [--version N] [--replace] [--json]
-slates submit WORK [--evidence HEX] [--json]
+slates submit WORK [--evidence HEX] [--json]     accepted: N, identical: N (nothing changed), or the conflicts
 slates rebase WORK [--json]
 slates advance ATTACHMENT [VERSION] [--json]
 slates read VOLUME PATH [--version N | --attachment A]

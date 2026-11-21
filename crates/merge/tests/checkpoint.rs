@@ -35,7 +35,8 @@ fn chain_of(origin_rows: &[Raw], chain: &[Raw]) -> (Green, Vec<(Increment, u64)>
   let mut accepted = Vec::new();
   for (n, step) in chain.iter().enumerate() {
     let increment = increment_of(step).with_id(id(n, 0xA0), green.head());
-    if let Outcome::Accepted { version } = green.submit(&increment) {
+    if let Outcome::Accepted { version } | Outcome::Identical { version } = green.submit(&increment)
+    {
       accepted.push((increment, version));
     }
   }
@@ -115,7 +116,8 @@ proptest! {
       prop_assert_eq!(restored.signature(version), kept, "version {}'s verdict", version);
     }
     for (increment, version) in accepted.iter().filter(|(_, version)| *version > at) {
-      prop_assert_eq!(restored.submit(increment), Outcome::Accepted { version: *version });
+      let committed = matches!(restored.submit(increment), Outcome::Accepted { version: v } | Outcome::Identical { version: v } if v == *version);
+      prop_assert!(committed, "accepted as version {}, changing something or (A-782) nothing", version);
     }
     prop_assert_eq!(restored.head(), head);
     prop_assert_eq!(restored.head_identity(), green.head_identity());
@@ -131,7 +133,8 @@ proptest! {
       prop_assert_eq!(green.changes_recounted(), green.changes_bytes());
     }
     if let Some((increment, version)) = accepted.iter().find(|(_, version)| *version <= at) {
-      prop_assert_eq!(restored.submit(increment), Outcome::Accepted { version: *version });
+      let committed = matches!(restored.submit(increment), Outcome::Accepted { version: v } | Outcome::Identical { version: v } if v == *version);
+      prop_assert!(committed, "accepted as version {}, changing something or (A-782) nothing", version);
     }
     if at > 0 {
       let below = increment_of(&extra).with_id(id(0, 0xB0), at - 1);
@@ -174,8 +177,10 @@ proptest! {
     };
     let mut in_shares = seeded.with_checkpoint(&checkpoint);
     for (increment, version) in accepted.iter().filter(|(_, version)| *version > at) {
-      prop_assert_eq!(whole.submit(increment), Outcome::Accepted { version: *version });
-      prop_assert_eq!(in_shares.submit(increment), Outcome::Accepted { version: *version });
+      let committed = matches!(whole.submit(increment), Outcome::Accepted { version: v } | Outcome::Identical { version: v } if v == *version);
+      prop_assert!(committed, "accepted as version {}, changing something or (A-782) nothing", version);
+      let committed = matches!(in_shares.submit(increment), Outcome::Accepted { version: v } | Outcome::Identical { version: v } if v == *version);
+      prop_assert!(committed, "accepted as version {}, changing something or (A-782) nothing", version);
     }
     prop_assert_eq!(in_shares.head(), whole.head());
     prop_assert_eq!(in_shares.head_identity(), whole.head_identity());

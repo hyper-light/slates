@@ -374,8 +374,16 @@ fn with_export<R>(
     nfs_v4_files,
     snapshot_views,
     nfs_pending_base,
+    greens,
+    merge,
     ..
   } = s;
+  // A mounted work's base is its green at its pin, lent with the slot's tree host (A-774).
+  let lent_green = crate::mounted_work::source(greens, &merge.mounted, volume);
+  let green_tree = lent_green
+    .as_ref()
+    .map(|(green, version)| crate::green_tree::GreenTree::at(green, *version));
+  let mut tree_lens = None;
   let mut handles = new_handle_store();
   // The slot's base host is lent through a lens that notes the fetch a host call of this request met pending (A-555):
   // the bridge answers the refusal on the wire, and the call then parks on that fetch (`serve_local_held`).
@@ -386,10 +394,13 @@ fn with_export<R>(
       Some(view) => VolumeBridge::attached(volume, &mut view.volume, store, &mut handles, None),
       None => {
         let slot = volumes.get_mut(handle).ok()?;
-        lens = slot
-          .host
-          .as_mut()
-          .map(|host| crate::base_wait::Lens::over(host));
+        lens = slot.host.as_mut().map(|host| {
+          crate::base_wait::Lens::over(crate::mounted_work::lend(
+            host,
+            green_tree.as_ref(),
+            &mut tree_lens,
+          ))
+        });
         VolumeBridge::attached(
           volume,
           &mut slot.volume,
@@ -2759,7 +2770,7 @@ fn admit(stream: TcpStream, port: u16, bound: usize) -> Option<Connection> {
     (None, None)
   } else {
     let admitted = HELD_CONNECTIONS
-      .fetch_update(
+      .try_update(
         std::sync::atomic::Ordering::Relaxed,
         std::sync::atomic::Ordering::Relaxed,
         |held| (held < bound).then_some(held.saturating_add(1)),

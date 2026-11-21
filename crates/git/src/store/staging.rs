@@ -94,6 +94,8 @@ enum Step {
   Rows {
     /// The next position as the fork was made.
     base: u64,
+    /// The runs of positions given each type (`Staged::kinds`).
+    kinds: Vec<(u64, u64, Kind)>,
     /// The new objects.
     fresh: Vec<Fresh>,
     /// The next one to write.
@@ -107,6 +109,8 @@ enum Step {
   Sealing {
     /// The next position as the fork was made.
     base: u64,
+    /// The runs of positions given each type.
+    kinds: Vec<(u64, u64, Kind)>,
     /// The positions given.
     positions: BTreeMap<ObjectId, u64>,
     /// The fork sealed.
@@ -352,6 +356,7 @@ impl Repository {
       } => positions_unit(store, (fork, base), (fresh, at), (next_of, positions)),
       Step::Rows {
         base,
+        kinds,
         fresh,
         at,
         positions,
@@ -360,6 +365,7 @@ impl Repository {
         let Some(object) = fresh.get(at).copied() else {
           return Ok(Step::Sealing {
             base,
+            kinds,
             positions,
             fork,
           });
@@ -370,6 +376,7 @@ impl Repository {
         }
         Ok(Step::Rows {
           base,
+          kinds,
           fresh,
           at: at.saturating_add(1),
           positions,
@@ -378,11 +385,13 @@ impl Repository {
       }
       Step::Sealing {
         base,
+        kinds,
         positions,
         mut fork,
       } => match fork.seal_step(store) {
         Ok(false) => Ok(Step::Sealing {
           base,
+          kinds,
           positions,
           fork,
         }),
@@ -391,6 +400,7 @@ impl Repository {
             fork,
             positions,
             base,
+            kinds,
           });
           Ok(Step::Ended)
         }
@@ -479,8 +489,19 @@ fn positions_unit(
   (mut next_of, mut positions): (BTreeMap<Kind, u64>, BTreeMap<ObjectId, u64>),
 ) -> Result<Step, StoreRefused> {
   let Some((id, kind, ..)) = fresh.get(at).copied() else {
+    // Each type's positions run from where the types before it, in their order, end to its own next (A-639).
+    let mut start = base;
+    let kinds = next_of
+      .iter()
+      .filter_map(|(kind, end)| {
+        let run = (start < *end).then_some((start, *end, *kind));
+        start = *end;
+        run
+      })
+      .collect();
     return Ok(Step::Rows {
       base,
+      kinds,
       fresh,
       at: 0,
       positions,

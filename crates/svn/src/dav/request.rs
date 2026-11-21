@@ -369,6 +369,48 @@ pub fn merge(body: &[u8], bounds: &Bounds) -> Result<MergeRequest, DavRefusal> {
   })
 }
 
+/// A CHECKOUT body as `mod_dav` reads it (`mod_dav.c` `dav_method_checkout`; DeltaV v1, A-766 part 2): the activities its
+/// `DAV:activity-set` names by `DAV:href`, whether it asks for a new activity (`DAV:new`), and whether it carries
+/// `DAV:apply-to-version`, which resolves a VCC to its checked-in baseline.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CheckoutRequest {
+  /// The activities named, in order.
+  pub activities: Vec<String>,
+  /// `DAV:new` given in the activity set.
+  pub new_activity: bool,
+  /// `DAV:apply-to-version` given.
+  pub apply_to_version: bool,
+}
+
+/// Reads a CHECKOUT body; an empty body asks for nothing. Refused for a root other than `DAV:checkout`, and for an
+/// activity set with neither an href nor `DAV:new` (`mod_dav`'s `400`).
+pub fn checkout(body: &[u8], bounds: &Bounds) -> Result<CheckoutRequest, DavRefusal> {
+  let Some(root) = document(body, bounds)? else {
+    return Ok(CheckoutRequest::default());
+  };
+  rooted(&root, DAV, "checkout")?;
+  let mut request = CheckoutRequest {
+    apply_to_version: root
+      .elements()
+      .any(|child| child.is(DAV, "apply-to-version")),
+    ..CheckoutRequest::default()
+  };
+  if let Some(set) = root.elements().find(|child| child.is(DAV, "activity-set")) {
+    request.new_activity = set.elements().any(|child| child.is(DAV, "new"));
+    if !request.new_activity {
+      request.activities = set
+        .elements()
+        .filter(|child| child.is(DAV, "href"))
+        .map(Element::trimmed_text)
+        .collect();
+      if request.activities.is_empty() {
+        return Err(DavRefusal::Missing { element: "href" });
+      }
+    }
+  }
+  Ok(request)
+}
+
 /// Reads a REPORT body.
 pub fn report(body: &[u8], bounds: &Bounds) -> Result<Report, DavRefusal> {
   let root = document(body, bounds)?.ok_or(DavRefusal::Missing { element: "report" })?;

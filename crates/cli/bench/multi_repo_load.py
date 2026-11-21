@@ -45,6 +45,7 @@ import asyncio
 import json
 import math
 import os
+import platform
 import re
 import subprocess
 import sys
@@ -93,7 +94,12 @@ def pushes_by_zipf(repositories: int) -> list[int]:
 
 
 def free_mib() -> float:
-    """The machine's free and inactive memory now (`vm_stat`), in MiB: what a step may grow into."""
+    """The machine's free and inactive memory now (`vm_stat` on macOS, `MemAvailable` on Linux), in MiB: what a step
+    may grow into."""
+    if os.path.exists("/proc/meminfo"):
+        with open("/proc/meminfo") as meminfo:
+            fields = dict(line.split(":", 1) for line in meminfo if ":" in line)
+        return int(fields["MemAvailable"].split()[0]) / 1024
     out = subprocess.run(["vm_stat"], stdout=subprocess.PIPE, text=True).stdout
     page = int(re.search(r"page size of (\d+) bytes", out).group(1))
     pages = sum(int(re.search(rf"{kind}:\s+(\d+)", out).group(1)) for kind in ("Pages free", "Pages inactive"))
@@ -101,7 +107,13 @@ def free_mib() -> float:
 
 
 def pressed() -> bool:
-    """Whether macOS reports memory pressure above normal (level 1)."""
+    """Whether the machine reports memory pressure: macOS above normal (level 1); Linux's pressure stall information,
+    some task stalled on memory more than a tenth of the last ten seconds (`/proc/pressure/memory`)."""
+    if os.path.exists("/proc/pressure/memory"):
+        with open("/proc/pressure/memory") as pressure:
+            some = pressure.readline().split()
+        avg10 = dict(field.split("=") for field in some[1:]).get("avg10", "0")
+        return float(avg10) > 10.0
     level = subprocess.run(
         ["sysctl", "-n", "kern.memorystatus_vm_pressure_level"], stdout=subprocess.PIPE, text=True
     ).stdout.strip()
@@ -355,7 +367,7 @@ def main():
     if steps is None:
         steps = push_load.steps_up_to(room)
     packs = [pack_of(source, rev) for rev in revs]
-    print(f"machine: {subprocess.run(['sysctl', '-n', 'machdep.cpu.brand_string'], stdout=subprocess.PIPE, text=True).stdout.strip()}, "
+    print(f"machine: {platform.platform()} {platform.processor()}, "
           f"{os.cpu_count()} cores, load {os.getloadavg()}, free {free_mib():,.0f} MiB, open-file room {room}, "
           f"per-repository cap {cap}")
     for size, (pack, head, count) in enumerate(packs):

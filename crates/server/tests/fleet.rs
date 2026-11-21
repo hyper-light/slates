@@ -842,6 +842,21 @@ fn poll_for_periods(
   daemons: &[&Daemon],
   within: Duration,
   periods: u64,
+  condition: impl FnMut() -> Result<bool, ObserveError>,
+) -> bool {
+  poll_for_live_periods(daemons, within, || periods, condition)
+}
+
+/// [`poll_for_periods`] with its budget read again at each look (`periods`): for a wait on a bound a daemon derives from
+/// an estimate it keeps measuring, such as the failover delay (A-363), which load raises while the wait runs. Read once
+/// at the wait's start, the budget fell behind the bound it waited on: `a_retired_owner_whose_takeover_gave_up_...`
+/// failed once in a loaded run of the fleet tests with the successor not yet giving up, and a successor whose estimate
+/// rose tenfold during the wait failed it every time (w-forming, 2026-11-20).
+#[track_caller]
+fn poll_for_live_periods(
+  daemons: &[&Daemon],
+  within: Duration,
+  mut periods: impl FnMut() -> u64,
   mut condition: impl FnMut() -> Result<bool, ObserveError>,
 ) -> bool {
   let mut wait = WaitTrace::begin("poll", std::panic::Location::caller(), daemons);
@@ -885,7 +900,7 @@ fn poll_for_periods(
       last_advance = Instant::now();
     }
     wait.asked(took, daemons, &advances, last_advance.elapsed());
-    if charged >= periods {
+    if charged >= periods() {
       // Every observed daemon ran a whole budget of its own periods, condition never met: a genuine
       // non-convergence (judged in daemon-time, so CPU load cannot cause it — periods, not wall-clock).
       wait.end("poll", "period budget spent", daemons, &advances);
@@ -14481,16 +14496,16 @@ fn a_live_volume_given_up_while_its_holder_was_away_is_served_once_the_holder_is
   };
   // The holder leaves the successor's live asks unanswered from the start: nothing asks before the takeover.
   let silent = daemons[other + 1]
-    .inject_live_silence(&[hosts[at + 1]])
+    .inject_holder_silence(&[hosts[at + 1]])
     .is_ok();
   daemons.remove(0).stop();
   let observed: Vec<&Daemon> = daemons.iter().collect();
   // Unheard on the probe plane only once the successor adopted the registers, as the chaos flow stopped the holder.
   let adopted = silent
-    && poll_for_periods(
+    && poll_for_live_periods(
       &observed,
       RETIREMENT_DEADLINE,
-      readmission_periods(&observed),
+      || readmission_periods(&observed),
       || Ok(summed_count(&daemons[at], "fleet.takeover.adopted") > 0),
     );
   let away = adopted
@@ -14498,13 +14513,13 @@ fn a_live_volume_given_up_while_its_holder_was_away_is_served_once_the_holder_is
       .inject_probe_deafness(&[hosts[other + 1]])
       .is_ok();
   let given_up = away
-    && poll_for_periods(
+    && poll_for_live_periods(
       &observed,
       RETIREMENT_DEADLINE,
-      promise_wait_periods(&observed).saturating_mul(4),
+      || promise_wait_periods(&observed).saturating_mul(4),
       || Ok(summed_count(&daemons[at], "fleet.materialize.given_up") > 0),
     );
-  let back = daemons[other].inject_live_silence(&[]).is_ok()
+  let back = daemons[other].inject_holder_silence(&[]).is_ok()
     && daemons[at].inject_probe_deafness(&[]).is_ok();
   let instance = daemons[at].instance().to_owned();
   let served = back && poll_status_answers(&observed, &instance, id);
@@ -14516,7 +14531,7 @@ fn a_live_volume_given_up_while_its_holder_was_away_is_served_once_the_holder_is
     counted("fleet.materialize.judged_afresh"),
     count_of(
       &summed_counters(&daemons[other]),
-      "fleet.live.silenced_by_fault",
+      "fleet.holder.silenced_by_fault",
     ),
   );
   for daemon in daemons {
@@ -15486,10 +15501,10 @@ fn deaf_until_its_takeover_resolves(
   let at_retirement: Vec<String> = daemons.iter().map(configuration_view).collect();
   let before = takeover_outcomes(daemons);
   let resolved = retired
-    && poll_for_periods(
+    && poll_for_live_periods(
       &observed,
       RETIREMENT_DEADLINE,
-      promise_wait_periods(&observed).saturating_mul(2),
+      || promise_wait_periods(&observed).saturating_mul(2),
       || {
         Ok(
           takeover_outcomes(daemons)
@@ -15536,20 +15551,20 @@ fn a_fleet_settles_on_one_configuration_after_the_owner_a_takeover_made_is_retir
   let adopter = if successor == hosts[1] { 1 } else { 2 };
   let taken = taken_over_on_the_probe_plane(&daemons, &hosts, &daemons[adopter]);
   let readmitted = taken
-    && poll_for_periods(
+    && poll_for_live_periods(
       &observed,
       RETIREMENT_DEADLINE,
-      readmission_periods(&observed),
+      || readmission_periods(&observed),
       || settled_on_one_configuration(&daemons, &hosts),
     );
   let after_first: Vec<String> = daemons.iter().map(configuration_view).collect();
   let through_adopter = written_through(&daemons, adopter, id, "/through-the-adopter");
   let spell = deaf_until_its_takeover_resolves(&daemons, &hosts, adopter);
   let settled = spell.healed
-    && poll_for_periods(
+    && poll_for_live_periods(
       &observed,
       RETIREMENT_DEADLINE,
-      readmission_periods(&observed),
+      || readmission_periods(&observed),
       || settled_on_one_configuration(&daemons, &hosts),
     );
   let at_end: Vec<String> = daemons.iter().map(configuration_view).collect();
@@ -15754,19 +15769,19 @@ fn retaken_from_its_adopter(by_creator: bool) -> Retaken {
   let observed: Vec<&Daemon> = daemons.iter().collect();
   let taken = taken_over_on_the_probe_plane(&daemons, &hosts, &daemons[adopter]);
   let readmitted = taken
-    && poll_for_periods(
+    && poll_for_live_periods(
       &observed,
       RETIREMENT_DEADLINE,
-      readmission_periods(&observed),
+      || readmission_periods(&observed),
       || settled_on_one_configuration(&daemons, &hosts),
     );
   let through_adopter = written_through(&daemons, adopter, id, "/through-the-adopter");
   let spell = deaf_until_its_takeover_resolves(&daemons, &hosts, adopter);
   let settled = spell.healed
-    && poll_for_periods(
+    && poll_for_live_periods(
       &observed,
       RETIREMENT_DEADLINE,
-      readmission_periods(&observed),
+      || readmission_periods(&observed),
       || settled_on_one_configuration(&daemons, &hosts),
     );
   let owner = shipping_at_the_highest_fence(&daemons, id);
@@ -17338,11 +17353,13 @@ fn a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again()
   let silenced = daemons[other].inject_takeover_silence(&[hosts[at]]);
   let observed: Vec<&Daemon> = daemons.iter().collect();
   let cut = silenced.is_ok() && probe_plane_cut(&daemons, &hosts, true);
+  // The successor's bound is its own failover estimate's worth of periods, which load raises while it waits: the
+  // budget follows it.
   let given_up = cut
-    && poll_for_periods(
+    && poll_for_live_periods(
       &observed,
       RETIREMENT_DEADLINE,
-      promise_wait_periods(&observed).saturating_mul(3),
+      || promise_wait_periods(&observed).saturating_mul(3),
       || Ok(summed_count(&daemons[at], "fleet.takeover.given_up") > 0),
     );
   let at_give_up: Vec<String> = daemons.iter().map(configuration_view).collect();
@@ -17350,10 +17367,10 @@ fn a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again()
   let healed = probe_plane_cut(&daemons, &hosts, false);
   let settled = answering
     && healed
-    && poll_for_periods(
+    && poll_for_live_periods(
       &observed,
       RETIREMENT_DEADLINE,
-      readmission_periods(&observed),
+      || readmission_periods(&observed),
       || settled_on_one_configuration(&daemons, &hosts),
     );
   let judged_afresh = summed_count(&daemons[at], "fleet.takeover.judged_afresh");
@@ -19758,10 +19775,10 @@ fn a_superseded_owner_restarted_warm_ships_no_record_of_the_volume_it_lost() {
   drop(through_a);
   daemons.insert(0, fleet.start(0));
   let observed: Vec<&Daemon> = daemons.iter().collect();
-  let settled = poll_for_periods(
+  let settled = poll_for_live_periods(
     &observed,
     RETIREMENT_DEADLINE,
-    readmission_periods(&observed),
+    || readmission_periods(&observed),
     || settled_on_one_configuration(&daemons, &hosts),
   );
   let refused = |daemon: &Daemon| count_of(&summed_counters(daemon), RECORD_REFUSED_UNAUTHORIZED);
@@ -22531,6 +22548,90 @@ fn a_forward_waiting_for_its_lent_session_is_woken_by_its_return() {
   assert_eq!(after.1, before.1, "no wait elapsed unwoken");
 }
 
+/// A-697 (1) (a holder's increment crosses once: the inputs it composed are never shipped back to it; main's ruling of
+/// 2026-11-20 after A-697's release bench, which measured a holder version's inputs shipped back in three shipments).
+/// Do: in a two-node `f = 1` fleet, B serving works over greens A owns (the test hook), a work on B writes a file of 256
+/// KiB and submits; then a work on A does the same. Expect: both answered `Submitted`; B held its composed increment as
+/// the version's inputs and A was told so; no input chunk was shipped for B's version, while A's own version shipped
+/// its chunks to B (the control, so the count is not vacuous).
+#[test]
+fn a_holders_composed_inputs_are_never_shipped_back_to_it() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let mut owner = Client::connect(&instance_a);
+  let green = bench_green(&mut owner, &daemon_b, "inputs-green");
+  daemon_b.serve_works_on_holders(true).unwrap();
+  let mut holder = Client::connect(daemon_b.instance());
+  let bytes = 256 * 1024;
+  let count = |name: &str| {
+    bench_counters([&daemon_a, &daemon_b])
+      .get(name)
+      .copied()
+      .unwrap_or(0)
+  };
+  let holders_work = bench_work(&mut holder, green, "inputs-holder", bytes);
+  let before = count("merge.inputs.chunks_shipped");
+  let held_before = (
+    count("merge.inputs.held_at_compose"),
+    count("merge.inputs.held_by_composer"),
+  );
+  let holders = holder.call(&RequestBody::submit(holders_work, Vec::new()));
+  let both = [&daemon_a, &daemon_b];
+  let holders_placed = poll_until(&both, PLACEMENT_DEADLINE, || {
+    daemon_a.merge_record_placed(green, 2)
+  });
+  let after_holders = count("merge.inputs.chunks_shipped");
+  let held_after = (
+    count("merge.inputs.held_at_compose"),
+    count("merge.inputs.held_by_composer"),
+  );
+  let owners_work = bench_work(&mut owner, green, "inputs-owner", bytes);
+  let owners = owner.call(&RequestBody::submit(owners_work, Vec::new()));
+  let owners_placed = poll_until(&both, PLACEMENT_DEADLINE, || {
+    daemon_a.merge_record_placed(green, 3)
+  });
+  let after_owners = count("merge.inputs.chunks_shipped");
+  daemon_b.serve_works_on_holders(false).unwrap();
+  assert!(
+    matches!(
+      holders,
+      ReplyBody::Submitted {
+        version: Some(2),
+        ..
+      }
+    ),
+    "{holders:?}"
+  );
+  assert!(
+    matches!(
+      owners,
+      ReplyBody::Submitted {
+        version: Some(3),
+        ..
+      }
+    ),
+    "{owners:?}"
+  );
+  assert!(
+    holders_placed && owners_placed,
+    "both versions placed at the quorum"
+  );
+  assert_eq!(
+    after_holders - before,
+    0,
+    "no input chunk shipped back to B for its own version"
+  );
+  assert_eq!(
+    (held_after.0 - held_before.0, held_after.1 - held_before.1),
+    (1, 1),
+    "B held its composed inputs, and A was told so"
+  );
+  assert!(
+    after_owners > after_holders,
+    "A's own version shipped its chunks to B: {after_holders} then {after_owners}"
+  );
+}
+
 /// §4.9 "Exactly-once", §4.16 "Commit" (AUD-11), found by fixtures' 1,000-client `f = 1` rung on 2026-11-06 (447
 /// submits answered `DuplicateRequest`): in a two-node `f = 1` fleet whose holder B withholds every merge record, a
 /// client on B submits a work whose green A owns. The forwarded submit runs on A, and its acceptance waits for the
@@ -25211,6 +25312,7 @@ fn a_submit_to_a_green_on_a_non_control_shard_is_answered_once_its_record_commit
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     },
     "the submit is accepted once its record commits; the record placed {placed:?}; the owner's merge counters \
      {counters:?}"
@@ -25330,6 +25432,7 @@ fn a_work_catalog_with_no_session_to_ship_over_waits_for_the_period() {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     }),
     "once the sessions returned the catalog committed and the submit was answered"
   );
@@ -25453,6 +25556,7 @@ fn a_submit_made_while_the_council_forms_is_answered_once_its_record_commits() {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     }),
     "accepted as version 1"
   );
@@ -25512,6 +25616,7 @@ fn a_submit_at_f1_is_answered_without_waiting_for_the_coordinators_period() {
         conflicts: Vec::new(),
         conflicts_elided: 0,
         verdict: 0,
+        identical: false,
       },
       "submit {index} is accepted as the next version"
     );
@@ -25599,6 +25704,7 @@ fn a_merge_version_reaches_each_holder_with_its_inputs_in_one_exchange() {
         conflicts: Vec::new(),
         conflicts_elided: 0,
         verdict: 0,
+        identical: false,
       },
       "submit {index} is accepted as the next version"
     );
@@ -27484,6 +27590,7 @@ fn check_resent_after_restart(seen: ResentAfterRestart) {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     })),
     "the submit resent under its id after the restart is answered the version it was accepted as: {:?}",
     seen.counters
@@ -28515,6 +28622,137 @@ fn a_successor_one_version_behind_fetches_the_versions_inputs_and_serves_the_gre
   );
 }
 
+/// A-775 for greens (§4.16 "Green owner loss in a fleet"; main's piece, 2026-11-20): a taken-over green given up while
+/// the only other holder of the inputs it lacked was away is served once that holder is heard again. Do: three nodes at
+/// `f = 1`; on a, a green advanced to version 2 on both holders, then to 3 on a and the other holder alone (the
+/// successor refusing content puts, as in `a_successor_one_version_behind_fetches_the_versions_inputs_and_serves_the_green`);
+/// the other holder leaves the successor's content requests unanswered (`Daemon::inject_holder_silence`); a dies; once
+/// the successor first waits on the inputs, it no longer hears the other holder on the probe plane; once it has given
+/// the green up, the holder answers and is heard again. Expect the green given up, judged afresh, placed at version 3 and
+/// served with the owner's head bytes. Before, a given-up green was final until a new configuration.
+#[test]
+fn a_green_given_up_while_its_inputs_holder_was_away_is_served_once_the_holder_is_heard_again() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(n);
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut client = Client::connect(daemons[0].instance());
+  let (green, work) = green_with_work(&mut client, "green-heard-again", &daemons);
+  let object = ObjectId(green.bytes);
+  let successor_host =
+    rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over the green");
+  // Indices among the survivors, once a is gone; the whole fleet's are one more.
+  let successor_index = usize::from(successor_host != hosts[1]);
+  let other_index = 1 - successor_index;
+  let other_host = hosts[1 + other_index];
+  commit_version(&mut client, work, (0, "hello"), 1);
+  commit_version(&mut client, work, (5, " world"), 2);
+  let (both_at_two, unowned) = holders_before_owner_death_at(&daemons, green, 2);
+  daemons[1 + successor_index]
+    .inject_merge_fault(slates_server::merge_service::MergeFault {
+      refuse_content_puts: true,
+      corrupt_next_inputs: false,
+      refuse_records: false,
+      refuse_work_catalogs: false,
+    })
+    .expect("the successor's refusal of content puts installs");
+  commit_version(&mut client, work, (11, "!"), 3);
+  let other_at_three = poll_until(
+    &daemons.iter().collect::<Vec<_>>(),
+    PLACEMENT_DEADLINE,
+    || {
+      daemons[1 + other_index]
+        .merge_holder_state(green)
+        .map(|state| state.version == Some(3))
+    },
+  );
+  let successor_at_death = daemons[1 + successor_index].merge_holder_state(green);
+  let silent = daemons[1 + other_index]
+    .inject_holder_silence(&[successor_host])
+    .is_ok();
+  daemons.remove(0).stop();
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let counted = |daemon: &Daemon, name: &str| {
+    daemon
+      .refusals_on_every_shard()
+      .map(|counted| counted.get(name).copied().unwrap_or(0))
+  };
+  let waits_inputs = silent
+    && poll_for_live_periods(
+      &survivors,
+      RETIREMENT_DEADLINE,
+      || readmission_periods(&survivors),
+      || Ok(counted(&daemons[successor_index], "merge.takeover_waits_inputs")? > 0),
+    );
+  let away = waits_inputs
+    && daemons[successor_index]
+      .inject_probe_deafness(&[other_host])
+      .is_ok();
+  let given_up = away
+    && poll_for_live_periods(
+      &survivors,
+      RETIREMENT_DEADLINE,
+      || promise_wait_periods(&survivors).saturating_mul(4),
+      || Ok(counted(&daemons[successor_index], "merge.takeover_given_up")? > 0),
+    );
+  let back = daemons[other_index].inject_holder_silence(&[]).is_ok()
+    && daemons[successor_index].inject_probe_deafness(&[]).is_ok();
+  let placed = back
+    && poll_for_live_periods(
+      &survivors,
+      RETIREMENT_DEADLINE,
+      || readmission_periods(&survivors).saturating_mul(2),
+      || daemons[successor_index].merge_record_placed(green, 3),
+    );
+  let judged = counted(&daemons[successor_index], "merge.takeover_judged_afresh");
+  let silenced = counted(&daemons[other_index], "fleet.holder.silenced_by_fault");
+  let served = observe_taken_over_green(&daemons[successor_index], green);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "a green given up while its inputs' holder was away: waited on inputs {waits_inputs}, given up {given_up}, \
+     silenced {silenced:?}, back {back}, judged afresh {judged:?}, placed {placed}, served {served:?}"
+  );
+  expect_the_successor_one_version_behind(
+    (both_at_two, unowned),
+    other_at_three,
+    successor_at_death.map(|state| state.version),
+  );
+  assert!(
+    given_up && silenced.as_ref().is_ok_and(|silenced| *silenced > 0),
+    "the successor gave the green up while the holder of its inputs was away ({silenced:?} answers withheld)"
+  );
+  assert!(
+    placed,
+    "the successor placed the green at version 3 once the holder was heard again"
+  );
+  assert!(
+    judged.as_ref().is_ok_and(|judged| *judged >= 1),
+    "the successor judged the green afresh ({judged:?})"
+  );
+  assert_eq!(
+    served,
+    TakenOverGreenView {
+      head: Ok(3),
+      at_one: Ok(b"hello".to_vec()),
+      at_head: Ok(b"hello world!".to_vec()),
+    },
+    "the successor serves the head version, version 1 and the head's bytes"
+  );
+}
+
 /// Waits, within the placement deadline in the survivors' own periods, for `daemon`'s verdict on the taken-over
 /// `green`: placed at `version`, or given up at its bound. The verdict is read again by the caller.
 fn await_placed_or_given_up(survivors: &[&Daemon], daemon: &Daemon, green: VolumeId, version: u64) {
@@ -28992,6 +29230,7 @@ fn a_submit_resent_after_two_takeovers_in_sequence_is_answered_its_version() {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     }),
     "the submit committed at version 1"
   );
@@ -29018,6 +29257,7 @@ fn a_submit_resent_after_two_takeovers_in_sequence_is_answered_its_version() {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     },
     "the resend after two takeovers in sequence is answered the version it was accepted as"
   );
@@ -29100,6 +29340,7 @@ fn a_works_head_is_never_placed_so_a_takeover_cannot_bring_it_back_to_run_a_rese
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     },
     "the submit committed at version 1"
   );
@@ -29533,6 +29774,7 @@ fn a_submit_resent_after_its_owner_was_taken_over_is_answered_its_version() {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     }),
     "the submit committed at version 1"
   );
@@ -29556,6 +29798,7 @@ fn a_submit_resent_after_its_owner_was_taken_over_is_answered_its_version() {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     },
     "the resend through the takeover is answered the version it was accepted as"
   );
@@ -29706,6 +29949,7 @@ fn a_works_route_ends_once_the_greens_owner_holds_none_of_its_completions() {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     }),
     "the submit committed at version 1"
   );
@@ -29737,6 +29981,7 @@ fn a_works_route_ends_once_the_greens_owner_holds_none_of_its_completions() {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     },
     "the route answered the resend the version it was accepted as"
   );
@@ -33798,6 +34043,7 @@ fn a_submit_whose_answer_was_lost_with_its_owner_is_answered_its_version_by_the_
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     })),
     "the submit resent after its owner died is answered its version by the green's successor"
   );
@@ -33931,6 +34177,7 @@ fn a_versions_merge_record_waits_for_its_works_catalog_record() {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     })),
     "the submit was answered its version once its record committed"
   );
@@ -34063,6 +34310,7 @@ fn a_submit_off_its_greens_shard_waits_for_its_works_catalog_record_before_its_v
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     })),
     "the submit was answered its version once its route and its record committed"
   );
@@ -34264,6 +34512,7 @@ fn a_request_id_copied_into_another_session_reaches_no_completion_through_a_take
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     })),
     "the victim's own resend is answered its version"
   );
@@ -34445,6 +34694,7 @@ fn a_survivor_holding_no_copy_of_the_works_catalog_learns_its_green_from_a_locat
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     })),
     "d's resend is answered its version through the green the location round named"
   );
