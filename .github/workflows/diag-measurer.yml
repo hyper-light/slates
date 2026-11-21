@@ -32,7 +32,7 @@ jobs:
       - name: red, green, and slates-rt at green
         shell: bash
         run: |
-          uname -a; nproc
+          set +e +o pipefail; uname -a; nproc
           W="$RUNNER_TEMP/rg"; mkdir -p "$W"; export CARGO_TARGET_DIR="$W/target"
           for arm in $RED $GREEN; do
             mkdir -p "$W/src-$arm"; git archive --format=tar "$arm" | tar -xmf - -C "$W/src-$arm"
