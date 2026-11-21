@@ -6992,3 +6992,7 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
      TerminateProcess differing / refused (an extent's section not held across the restart).
   4. RED-FIRST CHECK: run 3 also at the commit before this piece (origin/main before it) -- the commit test must fail
      there (each extent a range of the content section; commit kept), the restart test must pass (guard).
+- w-shared, lane instrument (3a9e5bf21): on a quiet Mac (load < 4), release:
+  `REPLICATION_BENCH_BULK_MIB=4,64 target/release/examples/replication_bench 200`, with `netstat -s -p udp | grep
+  "full socket"` read before and after. What it would show: if the window stops come with a rise in full-socket-buffer
+  drops, the receive buffer is the lane's bound.
