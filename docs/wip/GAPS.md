@@ -155,8 +155,9 @@
 > budget unseen. **Open:** a fresh daemon's write log and journal cannot know their memories unwritten until their first
 > give-back, so the split (A-744's per-range rows) walks ~28 GiB a shard whole, 13.9 s on a debug audit daemon; the
 > anchor could tell its first daemon the content object is new. Also open: the runtime's look for work between two idle
-> slices (~17 us against ~1.6 us of sweep in each) sets the honest sweep's rate, about 280 K pages a second. Windows'
-> run is with w-lint (run-requests, 2026-11-21T01:10Z). > **A-778 FIXED (found by use):** a `SIGKILL`ed anchor's segment and content object stayed in the kernel on macOS
+> slices (~17 us against ~1.6 us of sweep in each) sets the honest sweep's rate, about 280 K pages a second. Landed on
+> macOS green under the goal-93 focus rule; the Linux run (kiln r8, adacachy) was in flight at landing and is recorded
+> in BENCHMARKS when it ends; Windows' run is with w-lint (run-requests, 2026-11-21T01:10Z). > **A-778 FIXED (found by use):** a `SIGKILL`ed anchor's segment and content object stayed in the kernel on macOS
 > (21 GB held on the big Studio by four with no process alive); its daemon now removes their names as it leaves
 > (`docs/bugs/2026-11-20-a-killed-anchor-left-its-segment-and-content-in-the-kernel.md`). Open: a daemon killed with its
 > anchor still leaves them; harnesses should stop anchors with `SIGTERM`. **Open, by size:**
