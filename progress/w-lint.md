@@ -269,3 +269,7 @@
 ## 2026-11-20 19:15: refine.rs table back (9f77462e4), main's order
 - Whole refinement back at pre-round-10 cost; sliced ~1.05x left (GAPS D-O17 (f) updated). Plus refine CHUNK cast,
   refine test split, server refining.rs literals. Close note appended to inbox/main-from-w-lint-close.md.
+- Windows after jupiter's return (19:37): r4 (queued by needs while it was away) started, then timed out at 90 min
+  with no output at all (not even the clone's line: a hung clone or no output streamed). Resubmitted by needs with the
+  warm CARGO_TARGET_DIR and a 600 s clone cap: r5 and r6 both refused "no room here now" on jupiter. Not resubmitting
+  again until the next round. Linux r60 still queued.
