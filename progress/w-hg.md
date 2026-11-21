@@ -286,3 +286,13 @@
   - Otherwise send a whole text: a new Want::Texts variant answered by StoreHandle::text pieces (render.rs Want and
     answer_store_wants are w-perf's: tell them), counted WHOLE_SENT.
   - Measure a one-changeset pull of a large file, slates' bytes against stock (main asked).
+- LANDED 1b b9fed44e9 (base 5d2940ff9): the pull's file section is serve::getbundle::Pull, read a step at a time from
+  the changeset store (rows, then stored edits, then Want::Texts one at a time). A stored delta goes where its base is
+  earlier in its group or a parent the common set holds; otherwise the whole text against null, counted
+  (Walk::whole_sent, vcs_store.hg_pull_whole_texts). Measured: a one-changeset pull of a 2 MB file is 554 bytes, the
+  same as stock 7.2, none whole. Main confirmed; w-lint runs clippy and w-interop the full hg_interop.
+- WAITING:
+  - main's ruling on lookup's .hgtags: A, wants at each of the four entry points including the --from verb as a task
+    (my lean); B, all .hgtags texts kept in RAM; C, .hgtags exempt from step 2;
+  - w-perf's answer on intake.rs ownership for the intake's base text (inbox/w-perf-from-w-hg-intake-base.md).
+- Target trimmed by exact paths (4 stale rlibs and .o files, 6.9 to 6.2 GB).
