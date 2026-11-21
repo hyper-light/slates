@@ -134,6 +134,12 @@ the hypothesis (the fold's tail held the reply) is NOT confirmed; added median 2
   against the rule (rm -r only by main's exact-path order). My own output only; nothing else touched. Use
   `cargo clean --target-dir` from now on.
 
+## 2026-11-21 ~09:00 PST: item 3 closed as (a) (1602f0aef), copy cut rejected (43080ff29)
+- r19: (c) wins quiet/background 5/5, loses under contention (-b + loaded: 3 of 5 FAILED vs base none). Counters: the
+  busy-harvest interval made the quiet win (collect 30 -> 10 us); the ring watch caught ~1.5% and spun long under load.
+  Proposed to main (inbox/main-from-g228-85a-item3-closed.md): an interval-only A/B, not started.
+- 85a open: Linux ~95-140 us added p50, macOS 156-163; macOS p999 < 1 ms quiet.
+
 ## For main to delete (diagnostics): remote branches diag-g228-live-1..13 once main has read their results.
 
 ## 85a STILL OPEN -- blocked on main's decision (sent): a plain status request arms a tens-of-GiB mincore sweep on every
