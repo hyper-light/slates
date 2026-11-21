@@ -1,10 +1,10 @@
 //! A git record's replay a turn at a time (A-722 part 4; main's ruling of 2026-11-20: a large pack record's replay ran
 //! in one turn, held its shard past the watchdog's window and crash-looped the daemon).
 //!
-//! **What.** A version-2 record's pack (A-723) is read a chunk at a time, each turn held to a deadline on the shard's
-//! clock and taking at least one unit, so a record of any size is replayed over as many turns as it needs. The record
-//! is decoded once, as its replay begins: its names and moves are kept, and its pack is read from the register's bytes
-//! at each turn by its place in them. Each object is admitted as the reader resolves it, where it lies in the push's own
+//! **What.** A record's pack (A-723; version 5 names it, A-767 C5) is read a chunk at a time, each turn held to a
+//! deadline on the shard's clock and taking at least one unit, so a record of any size is replayed over as many turns as
+//! it needs. The record is decoded once, as its replay begins: its names and moves are kept, and its pack is read from
+//! the content store a window at a time by its identity. Each object is admitted as the reader resolves it, where it lies in the push's own
 //! copy of the pack, as a live push admits it (B2): the replay holds the pack and what it read lately, never its objects
 //! inflated, until its staging puts what lands. A pack's waiting deltas resolve a delta a unit (`Reader::resolve_turn`,
 //! w-balance's resolution in turns). Once every object is in, the names the admission would record are compared with
@@ -58,8 +58,6 @@ pub(crate) struct GitReplay {
   named: Option<ContentId>,
   /// The record's moves.
   moves: Vec<RecordedMove>,
-  /// Where the record's pack begins in its bytes.
-  pack_at: usize,
   /// A version-4 record's pack: its identity and length in the content store, where it is read from.
   packed: Option<(ContentId, u64)>,
   /// What comes next.
@@ -180,12 +178,11 @@ pub(crate) struct Turn {
   pub(crate) chunk: usize,
 }
 
-/// Whether a replay of the record `bytes` is stepped (module docs): a version-2 record carrying a pack.
+/// Whether a replay of the record `bytes` is stepped (module docs): a version-5 record naming a pack.
 pub(crate) fn stepped(bytes: &[u8], format: ObjectFormat) -> bool {
   !super::owed::is_owed(bytes)
     && !super::lfs_record::is_lfs(bytes)
-    && Record::decode(bytes, format)
-      .is_ok_and(|record| !record.pack.is_empty() || record.packed.is_some())
+    && Record::decode(bytes, format).is_ok_and(|record| record.packed.is_some())
 }
 
 impl GitReplay {
@@ -203,13 +200,11 @@ impl GitReplay {
           .map_err(ReplayRefused::Names)?,
         Some(identity),
       ),
-      None => (record.names, None),
+      None => (Vec::new(), None),
     };
     let mut push = Push::new(format);
     push.carried(record.deepest);
-    // The pack is the record's last field (`Record::decode` refuses trailing bytes), so it ends where the bytes do; a
-    // version-4 record's is read from the store by its identity instead (A-722's record v4).
-    let pack_at = bytes.len().saturating_sub(record.pack.len());
+    // The pack is read from the content store by its identity, a window at a time (A-722's record v4, version 5).
     Ok(Box::new(Self {
       push,
       remade: RecordWriter::default(),
@@ -217,7 +212,6 @@ impl GitReplay {
       named,
       packed: record.packed,
       moves: record.moves,
-      pack_at,
       stage: Stage::Reading {
         reader: Box::new(Reader::new(format, &NO_INDEX)),
         admission: Admission::new(content.room()),
@@ -226,12 +220,11 @@ impl GitReplay {
     }))
   }
 
-  /// One turn of the replay over the record `bytes` (module docs): a unit at least, then units until `turn`'s deadline.
-  /// Refused, what the push held is given back.
+  /// One turn of the replay (module docs): a unit at least, then units until `turn`'s deadline. Refused, what the push
+  /// held is given back.
   pub(crate) fn step(
     mut self: Box<Self>,
     (content, store): (&mut ContentStore, &mut GitStore),
-    bytes: &[u8],
     (turn, now): (Turn, &mut dyn FnMut() -> u64),
   ) -> Result<Stepped, ReplayRefused> {
     let held = self
@@ -250,7 +243,7 @@ impl GitReplay {
       }
     }
     loop {
-      match self.unit((content, store), bytes, turn.chunk) {
+      match self.unit((content, store), turn.chunk) {
         Ok(None) => {}
         Ok(Some(moves)) => return self.finish(content, store, moves).map(Stepped::Done),
         Err(refused) => return Err(self.abandon(content).err().unwrap_or(refused)),
@@ -266,7 +259,6 @@ impl GitReplay {
   fn unit(
     &mut self,
     (content, store): (&mut ContentStore, &mut GitStore),
-    bytes: &[u8],
     chunk: usize,
   ) -> Result<Option<Vec<Move>>, ReplayRefused> {
     let stage = core::mem::replace(
@@ -299,11 +291,8 @@ impl GitReplay {
               }
             }
           }
-          None => {
-            let pack = bytes.get(self.pack_at..).unwrap_or_default();
-            let rest = pack.get(read..).unwrap_or_default();
-            rest.get(..chunk.max(1)).unwrap_or(rest)
-          }
+          // A record that names no pack brought no object: nothing to read.
+          None => &[],
         };
         let (took, queue) = {
           let mut site = self.site(content, store);

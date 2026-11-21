@@ -504,15 +504,6 @@ impl Store for Indexed<'_> {
     self.logged(Log::Manifest, node, room)
   }
 
-  fn file(
-    &self,
-    path: &[u8],
-    node: &Node,
-    room: &mut Admission,
-  ) -> Result<Option<Logged<'_>>, PastAdmission> {
-    self.logged(Log::File(path), node, room)
-  }
-
   fn stored_now(&self, want: &crate::render::Want) -> Option<super::getbundle::Given> {
     #[cfg(test)]
     if let Some(texts) = &self.from_texts {

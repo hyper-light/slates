@@ -119,6 +119,9 @@ pub(crate) fn version_saying(
   // A green's first submit owes its commit and builds its map in slices after it (A-664's live whole builds, part 2),
   // by a task a test's step never runs: driven to its end here, so the test reads the store as the build leaves it.
   super::whole_build::settle(state);
+  // The version's commit is made by a job of the shard's queue (C5 part 2b piece 3: landed on the node's store, then
+  // recorded), a task a test's step never runs: made here, so the test reads the store as the commit leaves it.
+  crate::vcs_store::commits::made_after_now(state);
   let ReplyBody::Submitted {
     version: Some(version),
     ..

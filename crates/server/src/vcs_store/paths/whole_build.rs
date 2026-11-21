@@ -590,6 +590,8 @@ pub(crate) fn settle(state: &mut ShardState) {
   for green in greens {
     while slice(state, green, 0) {}
   }
+  // A build's end makes the commit owed (`commits::make_owed`), a job of the shard's queue: made here too.
+  crate::vcs_store::commits::made_after_now(state);
 }
 
 /// One slice of each build of the shard, given no budget (one file): what a test interleaving pushes with a build runs

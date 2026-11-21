@@ -12809,6 +12809,14 @@ what was not landed. Importing an existing
 repository reads its directory as a base (§4.15, read-only); exporting one writes it to a disk only through a landing
 under a grant (§4.15, R10).
 
+> **Status (2026-11-21, A-824: a git push's record is version 5 alone).** Every git record, a client's push's and a
+> commit the server makes, names the changeset its names and pack landed in on the node's store, its names and pack by
+> their BLAKE3 identity (version 5, A-767 C5); none carries a push's objects. Versions 1 (each object inflated) and 2
+> (A-723, the objects named and the pack inline) are retired: no path writes them, and a replay meeting one is refused
+> typed, `RecordRefused::Retired { version }`, never skipped or a panic (w-svn's A-819 rule); 3 and 4 are refused as
+> unknown versions. A log written before the retirement is therefore not replayed (pre-release; no compatibility
+> shim, CLAUDE.md §2 item 7). The register-held paragraph of A-662 below is superseded for git.
+
 > **Status (2026-11-20, A-716 slice 1a: a text held once, by content identity).** A green holds texts by identity in a
 > table of its file blocks (`crates/merge/src/held.rs`; `Green::hold_path`, `hold_bytes`, `held`, `release_held`,
 > `set_held_room`): by path, the head file's own block with one more holder, so no byte is copied; or by bytes, a block
@@ -59817,9 +59825,29 @@ Applied in the same change to:
     task killed after its changeset landed and before its step (`commits::KILL_BEFORE_MADE_COMMIT`, as Subversion's);
     made again from what is durable, the state before (durable head 0, no store version, the records as before, the
     request unanswered); the retry lands once (one record more, version 5) and is answered.
-- **Owed** (GAPS, C5 part 2b): `record_of` and version 2 removed with
-  the paths that still write them (a submit outside a recorded request, `commits::after_submit`'s owed commit, a store
-  test sealing a push directly); the change step over the preview in one turn (bounded by the submit's admission).
+- **Part 2** (2026-11-21, main's order 15:40 and its condition of 16:10 PST; replace, don't layer):
+  - A git commit the server makes of a version already committed (a submit outside a recorded request,
+    `commits::make`; a commit owed past a whole build, `commits::make_owed`) is a job of the shard's bounded queue
+    (`commits::MadeAfter`, the client seats): its repository's landing turn taken where it is free when it comes, else
+    awaited, so made commits land in their versions' order; then sealed over the version's map, homed and landed through
+    the same steps as the hooked path's (`first_ask`, `next_ask`, driven by `git_push::carry`), and recorded version 5
+    in a transaction of its own. A test drives the queue synchronously (`made_after_now`, through
+    `git_push::tests::carried_blocking`).
+  - No path writes version 2: `record_of`, `RecordWriter::finish` and its whole-object pack are gone, and a sealed push
+    bringing objects nobody homed and landed is refused `Unlanded` at its record.
+  - Versions 1 and 2 are refused typed at replay (`RecordRefused::Retired`; the record format's status above), and the
+    replay's branches only they reached (inline objects, an inline pack read from the register's bytes) are gone.
+  - The queue's turns are forgotten, not handed back, when it drops with the shard's state (a hand-back then reached the
+    state being dropped and aborted the process: a test run found it).
+- **Evidence (part 2).**
+  - `t_a824_a_log_meeting_a_retired_record_version_is_refused_typed_and_a_version_5_log_replays_whole`: a version-5-only
+    log replays whole, the same store as the live one; a version-2 record in the log refused `Retired { version: 2 }`,
+    the store as the version-5 record left it; a version-1 record refused `Retired { version: 1 }`.
+  - The store's oracle (`vcs_store::tests`, `Live`) writes and replays version 5 only, a recovery fetching each record's
+    names and pack as a region fetch does; the hostile-input test runs over version-5 bytes; the A-664 commit tests make
+    their commits through the queue.
+- **Owed** (GAPS, C5 part 2b): the change step over the preview in one turn (bounded by the submit's admission), next
+  in this series.
 
 ### A-821 — A refined submit's increment, verdict and encoding are prepared by its refinement job a bounded slice a turn, and its step judges by position (2026-11-21, w-fed-faults; main's ruling of 09:25 on the refining.rs:166 kill; §4.3 step budget, §4.16, A-787 part 2, A-697, A-816)
 Applied in the same change to: GAPS (the refining.rs:166 entry narrowed to the commit's step); `crates/server/src/refining.rs`
