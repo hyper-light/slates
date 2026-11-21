@@ -1,3 +1,7 @@
+# 2026-11-20 20:00 (w-forming): P4 image measured in release (kiln r9, M4 Max, load 5.7): 311 inodes / 55,654 B record,
+# image 26-36 us + encode 10.5-17 us in one turn. Asked main: (a) build the CoW reader-epoch hold, or (b) close P4 with
+# this measurement. C3 (r7) and the takeover A/B (r2) still queued on kiln.
+
 # STATUS 2026-11-20 ~17:30 (w-forming), Goal 85b under Ada's close order. C1 CLOSED 95adf9632, R2 CLOSED c922a41d1
 # (inbox/main-from-w-forming-close.md). C3 the chaos run: kiln r3 (macos/arm64; .git/w-forming-ab/c3.sh: nemesis x3,
 # replicas offline x3, volume failure x3, client disconnect) QUEUED -- fleet saturated. P4: delta reads sliced
