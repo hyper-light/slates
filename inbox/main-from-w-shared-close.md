@@ -96,3 +96,18 @@ see inbox/main-from-w-shared-lane.md.
 (takeover_round.rs:259: the zero-budget round's slices [1, 1, ...] where it expects [2, 1, ...]) and
 a_kernel_that_cannot_bump_its_epoch_still_gets_every_inode_and_is_counted (:294: 41 slices, expects 40). The same on
 family three's branch, so not family three's. GAPS updated on main. Needs an owner; not on my list.
+
+## 14:15 PST CLOSED: the content-plane-vs-lane A/B (close-list "93 shared"), measured by A-826's interleaved A/B
+- The question was whether a holder's increment should cross the forward lane or the content plane. A-826 moved it to
+  the content plane; kiln r32 measured both on one machine, interleaved (65133486d lane vs 156007d content plane,
+  release, holder route, 2 full rounds before the runner restarted): wall 64 MiB 410-466 vs 319-408 ms, 128 MiB 810-863
+  vs 601-613 ms, 256 MiB 2.41-2.52 vs 1.25-1.29 s, 320 MiB 3.52-3.61 vs 1.51-1.53 s; 512 MiB refused Overloaded on the
+  lane, completed on the content plane (2.4 s). The content plane wins at every size; the lane no longer carries it.
+
+## 14:15 PST goal 93 "shared" status (every close-list item)
+- CLOSED: sleep-and-look families 1, 2, 3 (c5051eb51); exit 4 at 64 MiB; inputs held at B; A-697 f; content-plane A/B.
+- OPEN, mine, in order: the lane's proof (main's ruling: 320 and 512 MiB 10 of 10 on the release bench). The holder route
+  passes 320 and completes 512; the bench's LOCAL 512 MiB submit is killed by the watchdog (w-work-cow's slicing); the
+  holder route still nears the window (polls to 883 ms). Remaining steps from your 23:50 ruling: slicing what remains
+  (agents/w-shared-slice: first cut ec245f32e, kiln r1), then datagram batching, then the 10 x 5 proof.
+- BLOCKED: A-658 3c waits for the repository's store on the holders (A-767's "holders' changesets", owed by w-store).

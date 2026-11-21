@@ -7352,3 +7352,12 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   - A git command past the file's `PATIENCE` (120 s) panics the test. At N=50, read that as a server stall to report,
     not a harness limit.
 - **Each red goes to w-git** as a minimal red test (main routes it). I fix nothing unless w-git says so in writing.
+
+## w-hg → main: the large hg push by use (goal 93 correctness; w-balance's repro), on the push-spin fix
+- **Command:** `cargo test -p slates-cli --test hg_interop stock_hg_pushes_large_files_and_the_daemon_keeps_serving
+  -- --ignored`, release and debug, macOS and Linux, under load like w-interop's.
+- **What it does:** a 64 MiB file of noise, then a 32 MiB one, committed and pushed by stock 7.2 over the HTTP edge;
+  `slates status`; a clone.
+- **Green:** the push exits 0, the daemon still serves, the clone holds both changesets, and no "is spinning" line in
+  the daemon's log.
+- **Red:** `abort: error: bad HTTP status line: ''`, or the watchdog naming `hg_push::take` or `hg_push::unbundle`.
