@@ -380,3 +380,7 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 
 ## 2026-11-21 ~01:05 PST: lane in place: 320 MiB holder submit refused Overloaded 1 of 2 runs (forward ~3.1 s; transfer
   ~2.2 s ~150 MB/s vs 1.3 GB/s raw). Reported; next: time the forward's phases on both ends. Family three: r4 running.
+
+## 2026-11-21 ~01:20 PST: family three's Linux run is kiln r14 (queued: adacachy, the one Linux runner, at load 60-93;
+  r4 stopped: its 30 min test timeout covered a starved compile). r14 builds first, then times the tests; green then red.
+  Waiting on: r14; main's answers on the lane (in-place forward refusals at 320 MiB, next step proposed).
