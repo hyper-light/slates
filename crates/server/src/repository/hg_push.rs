@@ -158,6 +158,13 @@ const MOVED: &[u8] = b"the repository changed while this push was taken; push ag
 const UNREAD: &[u8] = b"the push's changesets could not be read back";
 /// Slates' words for a push whose record could not be written (A-680 part 2c).
 const UNRECORDED: &[u8] = b"the push's record could not be written";
+/// Format: slates' words for a push the node's changeset log refused (its owner busy or gone, or its write failed).
+const UNLANDED: &[u8] = b"the push could not be landed on the repository's changeset log";
+
+/// Counter: pushes landed as a changeset on the node's changeset log (A-767 C4).
+pub(crate) const PUSH_LANDED: &str = "hg_push.landed";
+/// Counter: pushes the changeset log refused, answered `UNLANDED`: nothing of them is in the register.
+pub(crate) const PUSH_UNLANDED: &str = "hg_push.unlanded";
 /// Slates' words for a push refused while a Mercurial hook is configured (module docs, "The hook gate"), before the
 /// hook's configured name and after it.
 const HOOK_NOT_RUN: &[u8] = b"the repository's ";
@@ -1335,6 +1342,11 @@ pub(crate) async fn unbundle(
   // Landed in one step against the index as it is then; a fork another push made stale meanwhile is re-based by node
   // (A-720 part 2b), a slice at a time, and the landing tried again.
   let mut forked = forked;
+  if let Some(taken) = forked.as_mut()
+    && let Err(outcome) = land_on_disk(repository, taken).await?
+  {
+    return Some(outcome);
+  }
   loop {
     if let Some(taken) = forked.as_mut()
       && let Err(outcome) = record_sliced(taken).await?
@@ -1360,6 +1372,59 @@ pub(crate) async fn unbundle(
       },
     }
   }
+}
+
+/// Lands a push's changegroup as one changeset on the node's changeset log, where the daemon holds one (A-767 C4; item
+/// 4: landed, durable, before the register's entry names it): its `Record` the push's head (record v6), its `Payload`
+/// the changegroup as it arrived, moved into the log's request, never copied. The register's entry then holds a
+/// reference (record v7: the payload's identity and length and the changeset's sequence), so the changegroup is held
+/// once, by the log. A crash after this and before the entry leaves a changeset no entry names, which a recovery
+/// replays nothing of. Without a log the record is written as before ([`record_sliced`]).
+async fn land_on_disk(
+  repository: RepositoryId,
+  forked: &mut Forked,
+) -> Option<Result<(), PushOutcome>> {
+  if forked.record.is_some() || forked.intaken.logs.is_empty() {
+    return Some(Ok(()));
+  }
+  let taken = crate::state::with_state(|state| {
+    let disk = state.vcs_disk.clone()?;
+    let sequence = state.vcs_stores.next_changeset(repository)?;
+    Some((disk, sequence))
+  })?;
+  let Some((disk, sequence)) = taken else {
+    return Some(Ok(()));
+  };
+  let (version, payload) = &mut forked.changegroup;
+  let reference = record::write_push_reference(forked.room, (*version, payload), sequence);
+  let header = slates_store::log::Header {
+    tool: slates_store::log::Tool::Mercurial,
+    repository: u128::from_be_bytes(repository.bytes),
+    sequence,
+    judged_over: sequence.saturating_sub(1),
+    grant: 0,
+    work: 0,
+    time_ns: slates_rt::futures::now_ns(),
+    sections: 0,
+  };
+  let parts = vec![
+    (
+      slates_store::log::SectionKind::Record,
+      record::write_push_record(forked.room, *version),
+    ),
+    (
+      slates_store::log::SectionKind::Payload,
+      core::mem::take(payload),
+    ),
+  ];
+  let landed = disk.land(header, parts).await;
+  let ok = landed.is_ok();
+  crate::state::with_state(|state| state.count(if ok { PUSH_LANDED } else { PUSH_UNLANDED }, 1))?;
+  if !ok {
+    return Some(Err(PushOutcome::refused(&abort(UNLANDED.to_vec()))));
+  }
+  forked.record = Some(reference);
+  Some(Ok(()))
 }
 
 /// Writes `forked`'s record a part at a time, a yield between slices (A-732's writer; written whole in the landing's one
