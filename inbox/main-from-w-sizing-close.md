@@ -46,3 +46,10 @@
   passed quiet (1,648 -> 123 MiB), kept 1,366 MiB on adas-macbook-pro-2 later and 335 MiB on the big Studio at 5,433
   free pages, at A-789's own commit too. Likely the idle release's keep (commitments + headroom + pressure hold) keeping
   the free extents. Next for me, before R3.
+
+## R2 -- CLOSED on every platform (2026-11-20 ~20:10)
+- macOS A-789 362bd8c39, Windows 20bef898c, Linux unchanged (g226's measurement), leak A-778 779840fba, reserve A-777.
+- The variance found at 19:45 is not R2's: with the test's pressure readings injected (none / a fall of two bursts)
+  the anchor's content object held 0-2 MiB after the destroyed burst, so the extents go back; the RAM that stayed (591
+  / 340 MiB on the big Studio) is the process's own heap and buffers. Recorded in GAPS (c131361d3); worked under R3.
+- Owed: the Windows by-use run in run-requests (w-lint, jupiter).

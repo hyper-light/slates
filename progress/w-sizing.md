@@ -123,7 +123,9 @@ Plan: a section per pool extent, closed when wholly free; the anchor holds each 
 - Red first, across processes: a cli/server test (Windows) that an extent's section survives a daemon SIGKILL (anchor
   holds it) and that a released extent's commit goes back. Builds/tests -> run-requests.md (w-lint, jupiter offline).
 - LANDED 20bef898c (merge b30a0ab6d): Windows arm. Branches/worktrees removed (only ~/slates-work/w-sizing-main left).
-- OPEN R2 macOS: give-back depends on machine state (see close note); investigating the idle release's keep next.
+- R2 macOS variance: NOT the pressure hold (injected readings, branch agents/w-sizing-r2hold ea004b541, both red:
+  591 / 340 MiB kept; content object 0-2 MiB). Residual = process heap/buffers -> R3. GAPS corrected c131361d3.
+  R2 CLOSED (close note). Branch agents/w-sizing-r2hold holds the two-test refactor (red; not landed).
 - Then R3 with w-hg + w-store.
 
 ## Queue
