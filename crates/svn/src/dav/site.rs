@@ -151,6 +151,11 @@ const VCC: &str = "vcc";
 /// Format: `repos.c` `special_subdirs`, `bln`.
 const BASELINE: &str = "bln";
 
+/// HTTPv2's revision resource, the same baselined version resource as [`BASELINE`]'s under the URL a client of HTTPv2
+/// reads and writes revision properties at.
+/// Format: `repos.c` `special_subdirs`, `rev`; `parse_revstub_uri`.
+const REVISION_STUB: &str = "rev";
+
 /// The special resource of a version resource (DeltaV v1): a node in a revision, as `!svn/ver/REV/PATH`.
 /// Format: `repos.c` `special_subdirs`, `ver`.
 const VERSION: &str = "ver";
@@ -366,8 +371,9 @@ enum Resource {
   /// DeltaV v1's version-controlled configuration (`!svn/vcc/default`): its `checked-in` names the youngest
   /// baseline, and a v1 client sends its update-report here.
   Vcc,
-  /// DeltaV v1's baseline of a revision (`!svn/bln/REV`): the revision's collection and properties.
-  Baseline(Revision),
+  /// A revision's baselined version resource: DeltaV v1's baseline (`!svn/bln/REV`) or HTTPv2's revision resource
+  /// (`!svn/rev/REV`), the URL form it was named by second: the revision's collection and properties.
+  Baseline(Revision, &'static str),
   /// A special resource this part does not serve.
   Unserved,
 }
@@ -420,7 +426,15 @@ fn resolve<R: ?Sized>(served: &Served<'_, R>, path: &str) -> Result<Resource, Ht
         false => Err(malformed_uri()),
       };
     }
-    Some((&first, [baseline, revision])) if first == SPECIAL && *baseline == BASELINE => {
+    // HTTPv2's revision resource is the same baselined version resource as DeltaV v1's baseline, named by its own URL.
+    Some((&first, [kind, revision]))
+      if first == SPECIAL && (*kind == BASELINE || *kind == REVISION_STUB) =>
+    {
+      let named = if *kind == BASELINE {
+        BASELINE
+      } else {
+        REVISION_STUB
+      };
       let revision = decimal(revision).ok_or_else(malformed_uri)?;
       if revision > served.index.youngest() {
         let message = format!("No such revision {revision}");
@@ -431,7 +445,7 @@ fn resolve<R: ?Sized>(served: &Served<'_, R>, path: &str) -> Result<Resource, Ht
           &message,
         ));
       }
-      return Ok(Resource::Baseline(revision));
+      return Ok(Resource::Baseline(revision, named));
     }
     Some((&first, rest)) if first == SPECIAL => special(rest)?,
     _ => Some(Place {
@@ -644,7 +658,7 @@ fn report<R: Repository + ?Sized>(
       // DeltaV v1's client sends its update-report to the VCC (`update.c`, `session->vcc_url`); its checked-in
       // hrefs name version resources.
       Resource::Node(_) | Resource::Vcc => false,
-      Resource::Baseline(_) | Resource::Unserved => {
+      Resource::Baseline(..) | Resource::Unserved => {
         return Answer::Whole(unserved_method("REPORT"));
       }
     };
@@ -951,7 +965,7 @@ fn propfind<R: Repository + ?Sized>(
   bounds: &Bounds,
   room: usize,
 ) -> HttpAnswer {
-  if let Resource::Vcc | Resource::Baseline(_) = resource {
+  if let Resource::Vcc | Resource::Baseline(..) = resource {
     return private_propfind(served, resource, request, bounds, room);
   }
   let Resource::Node(place) = resource else {
@@ -1006,8 +1020,8 @@ fn private_propfind<R: Repository + ?Sized>(
   };
   let root = served.root.trim_end_matches('/');
   let (url, revision, kind) = match resource {
-    Resource::Baseline(revision) => (
-      format!("{root}/{SPECIAL}/{BASELINE}/{revision}"),
+    Resource::Baseline(revision, named) => (
+      format!("{root}/{SPECIAL}/{named}/{revision}"),
       *revision,
       Kind::Baseline,
     ),
