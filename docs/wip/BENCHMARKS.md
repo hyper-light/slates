@@ -17007,3 +17007,46 @@ is the invocation's median of 3 runs. µs unless marked.
   it was (its form names its own spin): Linux 31.6–37.7 µs against A's 33.4–56.0; macOS's CI runner misses R9 in both.
 - So the client's spin was Linux arm64's band; Linux x86_64's and macOS's loaded tails have other holds (macOS: the
   busy path's kevent nap, whose fix w-provision-gate measured and rejected on the provisioning path, a38630375).
+
+## 85a's two named costs, counted and A/B'd: the exchange on the data shard, and the held reply's wake (g228; 2026-11-21)
+
+**Command (the contract):** the live-shipping measurement, release, five rounds a run; arms interleaved. Linux:
+GitHub CI on `ubuntu-latest` (4 cores, 15 GiB, load 1.1-1.9), `diag-g228-live-2` to `-9`, each arm built from its
+commit (the workflow on those branches only; results pushed to `diag-results/`). macOS: adas-mac-studio.local-2 (32
+cores, load 9-17), CARGO_BUILD_JOBS=4. The hop counters are sums over a run; the per-write figures below divide them by
+the writes, which a single long write skews (see the correction).
+
+### The exchange on the data shard: measured and rejected
+
+With one shard a daemon, the volume's owner shard is the control shard, so an entry is sent and answered on the data
+shard with no control-shard hop: the most per-shard sessions could gain, measured before building them (arm
+`72af2d1ed`, the test's `SHARDS` constant only). Added at the median, µs, rounds 1-5:
+
+| host | two shards | one shard |
+|---|---|---|
+| ubuntu-latest (63d19f184 against 72af2d1ed) | 205.1, 210.1, 222.7, 197.5, 210.3 | 194.5, 173.8, 213.5, 219.0, 178.5 |
+| Studio (d80175d3f against 72af2d1ed) | 190.8, 188.2, 183.8, 177.0, 180.7 | 200.5, 200.8, 194.4, 192.3, 194.5 |
+
+On Linux about 15 µs better at the median with the spreads overlapping; on macOS about 10 µs worse (the hop back to the
+owner nearly vanishes, 7 to 1 µs, but the dispatch competes with the write on the one shard, 23 to 31 µs out). Neither
+justifies per-shard transport sessions.
+
+### The held reply's wake: not a cost; a run's one long first write, averaged
+
+Counted on main (b72aff1f, Studio, load 13-17): the reply's wake read 62.7-65.0 µs a write every round, and 68.2-68.6
+on ubuntu-latest, holds kept or declined. Split by stamps (fold to its wake of the reply; the wake to the reply's poll;
+the wait's end): 0.5-1.4, 54.8-64.6 and 1.3-3.3 µs a write, the reply woken by the fold itself in 2,050 of 2,051 writes,
+one step and about two task polls between the fold and the reply, no driver wait, no long step. **Correction:** the
+first held reply of each run waited 100.45 ms (the record period: its volume's head placed), and a second one in about a
+round in five; spread over 2,051 writes that is 49 µs a write, which is the whole constant (112.8 ms of `reply_poll`
+in a round: 100.45 ms for one write, about 6 µs for each of the others; the first logged replies, 5.8-7.8 µs). A reply
+is answered about 6-8 µs after its fold.
+
+**Measured and rejected: a held reply polled without a park while its answer is due** (e9f66a253, ubuntu-latest):
+added 224.9, 217.5, 214.9, 204.7 µs against parked 209.1, 210.3, 203.8, 214.2, 202.4 (its fifth round printed nothing);
+there was no wake to remove.
+
+**Reading.** Neither named cost is where 85a's median goes. What remains a write, from these runs: the entry's build on
+the owner (about 45-90 µs), the hop to the control shard (10-35), the exchange with the holders (about 50-170, the holder's
+own serve 12-25 of it), and the hop back (1-14); those are means, which the same kind of skew may inflate, so the next
+count is per-write percentiles of each hop.

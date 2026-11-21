@@ -8699,7 +8699,10 @@
 > **Still open:** on 218256bab the median is 184.5-437.0 µs (3.7-8.7x the goal) and p999 under 1 ms in 3 of 5 rounds at
 > load 6-10 on the 32-core Studio; the round's exchange (about 100 µs, the transport and two control shards' wakes, macOS
 > holds declined by A-387) and the held reply's wake (65-116 µs) remain. Linux not measured: adacachy's runs froze in
-> their cgroup at load 68-89.
+> their cgroup at load 68-89. Since counted (BENCHMARKS "85a's two named costs", 2026-11-21): the exchange on the data
+> shard gains about 15 µs on Linux and loses about 10 on macOS (rejected); the reply's "wake" was a run's one 100 ms
+> first write averaged over 2,051 (about 6-8 µs a write), and polling it while due gained nothing (rejected). What
+> remains is the entry's build and the exchange itself; the next count is per-write percentiles of each hop.
 
 > **Replication latency (raft, 2026-11-04): a commit returns at its quorum; live shipping in the daemon: writes durable on a candidate before their reply, takeover serves them.** Every quorum
 > collector in `slates-cluster` slept its whole poll after its quorum had answered, so a cross-node record commit cost
