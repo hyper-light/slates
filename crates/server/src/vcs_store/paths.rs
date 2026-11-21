@@ -432,7 +432,7 @@ fn step(
       (store, vcs_stores),
       repository,
       (key, version, whole),
-      (source, 0),
+      source,
     )
   };
   if !charged_whole {
@@ -493,13 +493,15 @@ pub(crate) fn over_preview(
 
 /// How the map of a held verdict's version is had over its preview (C5 2b piece 3): [`advance`]'s rule, the green at the
 /// version being the preview rather than the green, whose head is the version before until the one step applies it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OverPreviewStep {
   /// The map is of the version already.
   Kept,
-  /// Stepped over the change from the map before: the change's cost.
-  Change,
-  /// Built from the preview's whole head: the version a root's first, so the whole is the version's own change.
+  /// Stepped over the change from the map before, of the paths the preview's change index names: the change's cost, a
+  /// slice a turn (`whole_build::PreviewChange`).
+  Change(Head, BTreeSet<String>),
+  /// Built from the preview's whole head, a slice a turn too: the version a root's first, so the whole is the version's
+  /// own change.
   Whole,
   /// The map of the head before is built first, in slices (`whole_build`), then the change stepped.
   HeadFirst,
@@ -527,33 +529,14 @@ pub(crate) fn over_preview_step(
       over.version.saturating_sub(offset),
     )
   };
-  if before.is_some_and(|before| named_over(before).is_some()) {
-    return Some(OverPreviewStep::Change);
+  if let Some((before, named)) = before.and_then(|before| Some((before, named_over(before)?))) {
+    return Some(OverPreviewStep::Change(before, named));
   }
   Some(if over.version <= 1 {
     OverPreviewStep::Whole
   } else {
     OverPreviewStep::HeadFirst
   })
-}
-
-/// Steps the map of `over`'s version over `engine`, the held verdict's preview (C5 2b piece 3), and keeps it as the
-/// green's head in the store before the version is durable: the made commit's objects are read from it. `whole` builds
-/// it from the preview's whole head. Whether it was kept, and whether the shard took every byte the step left held.
-pub(crate) fn step_over_preview(
-  engine: &Green,
-  (store, stores): (&mut Store, &mut VcsStores),
-  over: &OverPreview,
-  whole: bool,
-) -> (bool, bool) {
-  let (answer, charged_whole) = stepped(
-    engine,
-    (store, stores),
-    over.repository,
-    (over.key, over.version, whole),
-    (over.source, over.preview_offset()),
-  );
-  (answer.is_ok(), charged_whole)
 }
 
 /// Lets go of the map kept for `green` at `version` over a preview whose version never became durable (a made commit
@@ -609,15 +592,9 @@ fn stepped(
   (store, stores): (&mut Store, &mut VcsStores),
   repository: RepositoryId,
   (key, version, whole): (u64, u64, bool),
-  (source, offset): (Option<(u64, u64)>, u64),
+  source: Option<(u64, u64)>,
 ) -> (Result<Stepped, StepRefused>, bool) {
-  let plan = match plan(
-    engine,
-    stores,
-    repository,
-    (key, version, whole),
-    (source, offset),
-  ) {
+  let plan = match plan(engine, stores, repository, (key, version, whole), source) {
     Ok(plan) => plan,
     Err(refused) => return (Err(refused), true),
   };
@@ -638,7 +615,7 @@ fn plan<'g>(
   stores: &VcsStores,
   repository: RepositoryId,
   (key, version, whole): (u64, u64, bool),
-  (source, offset): (Option<(u64, u64)>, u64),
+  source: Option<(u64, u64)>,
 ) -> Result<Plan<'g>, StepRefused> {
   let (content, git) = stores.git_ref(repository).ok_or(StepRefused::NoMap)?;
   let paths = git.paths.as_ref().ok_or(StepRefused::NoMap)?;
@@ -655,15 +632,10 @@ fn plan<'g>(
   let Some(before) = before else {
     return Ok(Plan::Whole(whole_head(engine)));
   };
-  // The engine numbers its versions `offset` below the green's: none for the green itself, the version before for a
-  // held verdict's preview, whose version 0 is the green's head and its 1 the verdict (C5 2b piece 3).
   let changed = changed(
     engine,
     (content, paths, before.root),
-    (
-      before.version.saturating_sub(offset),
-      version.saturating_sub(offset),
-    ),
+    (before.version, version),
   )?;
   Ok(changed.map_or_else(
     || Plan::Whole(whole_head(engine)),

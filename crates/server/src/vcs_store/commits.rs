@@ -760,12 +760,21 @@ async fn made_landing(
 /// commit's objects made and sealed as a push with its move admitted, then homed and landed.
 async fn made_before_step(pending: &mut crate::made_commit::Pending) -> Before {
   let mut head_first = false;
+  let mut building = None;
   loop {
-    match crate::state::with_state(|state| map_turn(state, pending, &mut head_first)) {
+    match crate::state::with_state(|state| {
+      map_turn(state, pending, (&mut head_first, &mut building))
+    }) {
       None => return Before::Gone,
       Some(Ok(true)) => break,
       Some(Ok(false)) => slates_rt::futures::yield_now().await,
-      Some(Err(_)) => return Before::Unmade,
+      Some(Err(_)) => {
+        // A build begun and not finished gives back what its puts held.
+        if let Some(change) = building.take() {
+          let _ = crate::state::with_state(|state| change.abandon(state));
+        }
+        return Before::Unmade;
+      }
     }
   }
   let mut sealed = match crate::state::with_state(|state| sealed_made(state, pending)) {
@@ -783,47 +792,116 @@ async fn made_before_step(pending: &mut crate::made_commit::Pending) -> Before {
   Before::Unlanded
 }
 
-/// One turn of the version's map over the held verdict's preview (`super::paths::over_preview_step`): whether it is kept.
-/// A head before with no map has its map built first, in the whole build's slices, once (`head_first`); a second need of
-/// it, or a step refused, leaves the commit unmade.
+/// The status count of the turns git commits the server makes took to put their versions' maps over the preview
+/// ([`map_turn`], A-824): the slicing's non-vacuity count.
+pub(crate) const MAP_TURNS: &str = "vcs_commits.made_map_turns";
+
+#[cfg(test)]
+thread_local! {
+  /// A test's budget for a made commit's map turn, in place of the shard's step quantum: 0 puts one path a turn,
+  /// whatever the machine's load, as `whole_build::settle` gives each slice.
+  pub(crate) static TEST_MAP_BUDGET: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// The nanoseconds a made commit's map turn may spend putting paths: the shard's step quantum (a test's own where set).
+fn map_budget(state: &ShardState) -> u64 {
+  #[cfg(test)]
+  if let Some(budget) = TEST_MAP_BUDGET.with(std::cell::Cell::get) {
+    return budget;
+  }
+  state.config.step_quantum_ns()
+}
+
+/// What a turn of the version's map over the preview did ([`map_turn`]).
+enum MapTurned {
+  /// The map is of the version already.
+  Kept,
+  /// The head before holds no map: built first.
+  HeadFirst,
+  /// Paths put; more to put.
+  More,
+  /// Every path put: the map is made next.
+  Put,
+  /// A put refused.
+  Refused,
+}
+
+/// One turn of the version's map over the held verdict's preview (`super::paths::over_preview_step`, A-824): the change's
+/// paths put from the preview a slice a turn, within the shard's step quantum (`whole_build::PreviewChange`, `building`
+/// between turns), then the change applied to the map before and kept; a root's first version's whole put the same way.
+/// Whether the map is kept. A head before with no map has its map built first, in the whole build's slices, once
+/// (`head_first`); a second need of it, or a put refused, leaves the commit unmade.
 fn map_turn(
   state: &mut ShardState,
   pending: &mut crate::made_commit::Pending,
-  head_first: &mut bool,
+  (head_first, building): (
+    &mut bool,
+    &mut Option<super::paths::whole_build::PreviewChange>,
+  ),
 ) -> Result<bool, Unmade> {
+  use super::paths::OverPreviewStep;
   let (green, version) = pending.version();
   if super::paths::whole_build::building(state, green) {
     return Ok(false);
   }
   let over =
     super::paths::over_preview(state, green, version).ok_or(Unmade::Store(GitRefused::NoStore))?;
-  let stepped = crate::made_commit::with_held_preview_and_stores(state, pending, |engine, lent| {
-    use super::paths::OverPreviewStep;
-    let step = super::paths::over_preview_step(engine, lent.1, &over)?;
-    Some(match step {
-      OverPreviewStep::Kept => (step, true, true),
-      OverPreviewStep::Change | OverPreviewStep::Whole => {
-        let whole = step == OverPreviewStep::Whole;
-        let (kept, charged) = super::paths::step_over_preview(engine, lent, &over, whole);
-        (step, kept, charged)
-      }
-      OverPreviewStep::HeadFirst => (step, false, true),
+  let budget = map_budget(state);
+  let mut charged = true;
+  let turned = crate::made_commit::with_held_preview_and_stores(state, pending, |engine, lent| {
+    if building.is_none() {
+      let change = match super::paths::over_preview_step(engine, lent.1, &over)? {
+        OverPreviewStep::Kept => return Some(MapTurned::Kept),
+        OverPreviewStep::HeadFirst => return Some(MapTurned::HeadFirst),
+        OverPreviewStep::Change(before, named) => Some((before, named)),
+        OverPreviewStep::Whole => None,
+      };
+      *building = Some(super::paths::whole_build::preview_change(
+        engine,
+        (over.repository, version),
+        change,
+      ));
+    }
+    let (answer, whole) = building.as_mut()?.turn(engine, lent, budget);
+    charged = whole;
+    Some(match answer {
+      Some(true) => MapTurned::Put,
+      Some(false) => MapTurned::More,
+      None => MapTurned::Refused,
     })
   })
   .flatten()
   .ok_or(Unmade::NoTrees)?;
-  let (step, kept, charged) = stepped;
   if !charged {
     state.count(super::CHARGE_SHORT, 1);
   }
-  match step {
-    super::paths::OverPreviewStep::HeadFirst if !*head_first => {
+  match turned {
+    MapTurned::Kept => Ok(true),
+    MapTurned::HeadFirst if !*head_first => {
       *head_first = true;
       super::paths::whole_build::start(state, over.repository, green, version.saturating_sub(1));
       Ok(false)
     }
-    _ if kept => Ok(true),
-    _ => Err(Unmade::NoTrees),
+    MapTurned::More => {
+      state.count(MAP_TURNS, 1);
+      Ok(false)
+    }
+    MapTurned::Put => {
+      let kept = building
+        .take()
+        .is_some_and(|change| change.finish(state, green));
+      if !kept {
+        return Err(Unmade::NoTrees);
+      }
+      state.count(MAP_TURNS, 1);
+      Ok(true)
+    }
+    MapTurned::HeadFirst | MapTurned::Refused => {
+      if let Some(change) = building.take() {
+        change.abandon(state);
+      }
+      Err(Unmade::NoTrees)
+    }
   }
 }
 

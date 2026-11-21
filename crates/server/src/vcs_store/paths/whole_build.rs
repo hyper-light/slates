@@ -392,17 +392,35 @@ fn put_some(
   (green, budget): (DbVolumeId, u64),
   build: &mut Build,
 ) -> Result<(), StepRefused> {
+  let (answer, charged_whole) = {
+    let ShardState {
+      store,
+      vcs_stores,
+      greens,
+      ..
+    } = &mut *state;
+    let engine = greens.get(&green).ok_or(StepRefused::NoMap)?;
+    put_some_over(&engine, (store, vcs_stores), budget, build)
+  };
+  if !charged_whole {
+    state.count(super::super::CHARGE_SHORT, 1);
+  }
+  answer
+}
+
+/// [`put_some`]'s puts, the files read from `engine` (the green, or a held verdict's preview, [`PreviewChange`]):
+/// paths put until `budget` nanoseconds are spent, one at least. What it answered, and whether the shard took every
+/// byte the puts left held.
+fn put_some_over(
+  engine: &slates_merge::engine::Green,
+  (store, vcs_stores): (&mut slates_vfs::volume::Store, &mut super::super::VcsStores),
+  budget: u64,
+  build: &mut Build,
+) -> (Result<(), StepRefused>, bool) {
   let began = slates_rt::futures::now_ns();
-  let ShardState {
-    store,
-    vcs_stores,
-    greens,
-    ..
-  } = &mut *state;
-  let engine = greens.get(&green).ok_or(StepRefused::NoMap)?;
   let mut answer = Ok(());
   while let Some(path) = build.paths.get(build.at) {
-    let Some(file) = super::git_file(&engine, path) else {
+    let Some(file) = super::git_file(engine, path) else {
       // A change build notes a path its map before holds a file at as removed.
       if let Some(before) = build.before {
         let name = map_path(path);
@@ -448,11 +466,110 @@ fn put_some(
     }
   }
   let charged_whole = super::super::settle_in(store, vcs_stores);
-  drop(engine);
-  if !charged_whole {
-    state.count(super::super::CHARGE_SHORT, 1);
+  (answer, charged_whole)
+}
+
+/// A change build over a held verdict's preview (C5 part 2b piece 3, A-824: a git commit the server makes steps its
+/// version's map a slice a turn): the change's paths put from the preview a turn at a time, as a push's change build
+/// puts them from the green ([`start_change`]), then the change applied to the map before and kept as the green's head
+/// at the version. Owned by the made commit's task, which lends the preview each turn; nothing waits behind it.
+pub(crate) struct PreviewChange(Build);
+
+/// A [`PreviewChange`] of `repository`'s green to `version` over the map `before`, of the paths `named` (the change the
+/// preview's index names); with no map before, of every path `engine`, the preview, holds a file at (a root's first
+/// version, whose whole is its own change).
+pub(crate) fn preview_change(
+  engine: &slates_merge::engine::Green,
+  (repository, version): (RepositoryId, u64),
+  change: Option<(super::Head, std::collections::BTreeSet<String>)>,
+) -> PreviewChange {
+  let (before, paths) = match change {
+    Some((before, named)) => (
+      Some(before),
+      named
+        .into_iter()
+        .filter(|path| !map_path(path).is_empty())
+        .collect(),
+    ),
+    None => (None, head_paths(engine)),
+  };
+  PreviewChange(Build {
+    repository,
+    version,
+    paths,
+    at: 0,
+    entries: BTreeMap::new(),
+    held: Vec::new(),
+    parked: Vec::new(),
+    task: None,
+    kept: false,
+    remade: false,
+    before,
+    removed: std::collections::BTreeSet::new(),
+  })
+}
+
+impl PreviewChange {
+  /// One turn of its puts from `engine`, the preview, until `budget` nanoseconds are spent, one path at least: whether
+  /// every path is put (none where a put was refused, the caller giving the build up), and whether the shard took every
+  /// byte the puts left held.
+  pub(crate) fn turn(
+    &mut self,
+    engine: &slates_merge::engine::Green,
+    stores: (&mut slates_vfs::volume::Store, &mut super::super::VcsStores),
+    budget: u64,
+  ) -> (Option<bool>, bool) {
+    let (answer, charged) = put_some_over(engine, stores, budget, &mut self.0);
+    (
+      answer.ok().map(|()| self.0.at >= self.0.paths.len()),
+      charged,
+    )
   }
-  answer
+
+  /// Its end: the change applied to the map before (or, with none, the map built of what was put), kept as `green`'s
+  /// head at its version (counted as a build's end is). Whether the map is kept.
+  pub(crate) fn finish(self, state: &mut ShardState, green: DbVolumeId) -> bool {
+    let Build {
+      repository,
+      version,
+      entries,
+      held,
+      before,
+      removed,
+      ..
+    } = self.0;
+    let plan = match before {
+      Some(before) => Plan::PutChange(
+        before,
+        entries
+          .into_iter()
+          .map(|(name, entry)| (name, Some(entry)))
+          .chain(removed.into_iter().map(|name| (name, None)))
+          .collect(),
+      ),
+      None => Plan::Put(entries),
+    };
+    super::super::lend(&mut state.store, &mut state.vcs_stores, 0);
+    let answer = made_holding(
+      super::super::Lent::new(&mut state.store, &mut state.vcs_stores).stores,
+      repository,
+      (super::super::green_key(green), version),
+      plan,
+      held,
+    );
+    if !super::super::settle_in(&mut state.store, &mut state.vcs_stores) {
+      state.count(super::super::CHARGE_SHORT, 1);
+    }
+    let kept = answer.is_ok();
+    count(state, answer, BUILT);
+    kept
+  }
+
+  /// Gives back the holds its puts took, where it ends before its finish (the made commit given up).
+  pub(crate) fn abandon(self, state: &mut ShardState) {
+    give_back(&mut state.vcs_stores, self.0.repository, &self.0.held);
+    super::super::settle(state);
+  }
 }
 
 /// The build's end: the map and trees built of what was put and kept as the green's head, counted; then its parked
