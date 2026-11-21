@@ -246,7 +246,7 @@ impl<'a> Indexed<'a> {
             log.push(logged.map(|logged| {
               let text = logged.text.into_owned();
               let identity = *blake3::hash(&text).as_bytes();
-              let len = to_u64(crate::delta::HUNK_HEADER_LEN.saturating_add(text.len()));
+              let len = to_u64(text.len());
               texts.borrow_mut().insert(identity, text);
               StoredRevision {
                 text: identity,
@@ -267,17 +267,22 @@ impl<'a> Indexed<'a> {
         let held = texts.borrow();
         let mut chunks = Vec::new();
         for place in places {
-          let mut chunk = Vec::new();
-          crate::delta::encode_full_text(held.get(&place.payload)?, &mut chunk).ok()?;
-          chunks.push(chunk);
+          // A stored whole is its raw text (the store's contract, A-767 C1).
+          chunks.push(held.get(&place.payload)?.clone());
         }
         Some(super::getbundle::Given::Chunks(chunks))
       }
-      Want::Texts { texts: asked } => {
+      Want::Texts { texts: asked, most } => {
         let held = texts.borrow();
         let mut made = Vec::new();
+        let mut total = 0_u64;
         for identity in asked {
-          made.push(held.get(identity)?.clone());
+          let text = held.get(identity)?;
+          total = total.saturating_add(to_u64(text.len()));
+          if total > *most {
+            return Some(super::getbundle::Given::TextsPast);
+          }
+          made.push(text.clone());
         }
         Some(super::getbundle::Given::Texts(made))
       }
@@ -450,12 +455,6 @@ impl Repository for Indexed<'_> {
     }
     let manifest = self.text_of(Log::Manifest, &row.manifest, admission)?;
     Ok(crate::manifest::find(&manifest, TAGS_PATH).map(|entry| entry.node))
-  }
-
-  fn tags_text(&self, node: &Node, admission: &mut Admission) -> Result<Vec<u8>, Refusal> {
-    let text = self.text_of(Log::File(TAGS_PATH), node, admission)?;
-    let split = crate::filerev::split(&text).map_err(|_| Refusal::Store { what: "tags" })?;
-    Ok(split.bytes.to_vec())
   }
 }
 

@@ -242,6 +242,9 @@ pub struct Intake {
   taker: Taker,
 }
 
+/// A new manifest and the entries its delta wrote: each file's path and file revision.
+type ManifestWrites = (Node, Vec<(Vec<u8>, Node)>);
+
 /// What an intake has made so far: its fork, where it stands, and what it keeps across steps.
 struct Taker {
   /// The fork: the repository's revisions, and the push's as they are kept.
@@ -254,7 +257,7 @@ struct Taker {
   manifest_of: Vec<(Node, Node)>,
   /// Each new manifest and the entries its delta wrote (each file's path and file revision), which its files' check
   /// reads ([`Taker::files_present`]): what the push changed, never a whole manifest.
-  manifests: Vec<(Node, Vec<(Vec<u8>, Node)>)>,
+  manifests: Vec<ManifestWrites>,
   /// The text kept last, and its node: the next revision's base where its delta names it.
   last: Option<(Node, Vec<u8>)>,
   /// The identity of the text kept last, so the next revision's base is named without hashing it again.
@@ -526,6 +529,16 @@ impl Taker {
     };
     admission.charge(to_u64(path.len()))?;
     let identity = *blake3::hash(&arrived.text).as_bytes();
+    // A whole is kept as its raw text (the store's contract, A-767 C1): its place past the one hunk it arrived in.
+    let place = if base.is_none() {
+      let start = delta::whole_text_start(revision.data).ok_or_else(|| Unverified::NotWhole {
+        log: log_of(log),
+        node: revision.node,
+      })?;
+      place.start.saturating_add(to_u64(start))..place.end
+    } else {
+      place
+    };
     self.intaken.texts.push(KeptText {
       path: path.to_vec(),
       node: revision.node,

@@ -283,14 +283,6 @@ impl Repository for Probed {
   ) -> Result<Option<Node>, slates_hg::serve::Refusal> {
     Ok(None)
   }
-
-  fn tags_text(
-    &self,
-    _node: &Node,
-    _admission: &mut slates_hg::Admission,
-  ) -> Result<Vec<u8>, slates_hg::serve::Refusal> {
-    Err(slates_hg::serve::Refusal::Store { what: "tags" })
-  }
 }
 
 impl Store for Probed {
@@ -1488,19 +1480,11 @@ impl Repository for Grown {
   ) -> Result<Option<Node>, slates_hg::serve::Refusal> {
     Ok(None)
   }
-
-  fn tags_text(
-    &self,
-    _node: &Node,
-    _admission: &mut slates_hg::Admission,
-  ) -> Result<Vec<u8>, slates_hg::serve::Refusal> {
-    Err(slates_hg::serve::Refusal::Store { what: "tags" })
-  }
 }
 
 impl Store for Grown {
   /// The test's changeset store answered at once (A-767 C1): each file revision kept as its whole (every file holds
-  /// [`Grown::bytes`]), its identity the plain BLAKE3 of the bytes, its chunk the full-text hunk.
+  /// [`Grown::bytes`]), its identity the plain BLAKE3 of the bytes, its chunk the bytes (a whole kept raw).
   fn stored_now(
     &self,
     want: &slates_hg::render::Want,
@@ -1508,7 +1492,7 @@ impl Store for Grown {
     use slates_hg::render::{StoredPlace, StoredRevision, Want};
     use slates_hg::serve::getbundle::Given;
     let identity = *blake3::hash(&self.bytes).as_bytes();
-    let len = u64::try_from(slates_hg::delta::HUNK_HEADER_LEN + self.bytes.len()).ok()?;
+    let len = u64::try_from(self.bytes.len()).ok()?;
     Some(match want {
       Want::Rows { logs } => Given::Rows(
         logs
@@ -1535,12 +1519,16 @@ impl Store for Grown {
           })
           .collect(),
       ),
-      Want::Chunks { places } => {
-        let mut chunk = Vec::new();
-        slates_hg::delta::encode_full_text(&self.bytes, &mut chunk).ok()?;
-        Given::Chunks(places.iter().map(|_| chunk.clone()).collect())
+      // A stored whole is its raw text (the store's contract, A-767 C1).
+      Want::Chunks { places } => Given::Chunks(places.iter().map(|_| self.bytes.clone()).collect()),
+      Want::Texts { texts, most } => {
+        let total = (self.bytes.len() as u64).saturating_mul(texts.len() as u64);
+        if total > *most {
+          Given::TextsPast
+        } else {
+          Given::Texts(texts.iter().map(|_| self.bytes.clone()).collect())
+        }
       }
-      Want::Texts { texts } => Given::Texts(texts.iter().map(|_| self.bytes.clone()).collect()),
     })
   }
 

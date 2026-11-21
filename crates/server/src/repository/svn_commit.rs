@@ -1236,8 +1236,7 @@ fn land(
     .greens
     .get(&green)
     .map_or(0, |engine| engine.copy_entry_room(&work));
-  let bound =
-    slates_merge::chain_entry::entry_bound(work.encoded_len(), &work).saturating_add(room);
+  let bound = slates_merge::chain_entry::entry_bound(&work).saturating_add(room);
   if state.db.partition().green_chain_room() < bound {
     state.count(CHAIN_ROOM_CHECKPOINTED, 1);
     crate::merge_service::checkpoint_green_when(state, green, crate::merge_service::Doubling::Now);

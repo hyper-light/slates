@@ -3101,15 +3101,19 @@ impl Daemon {
         identities.sort_unstable();
         identities.extend(partition.green_chain(volume).iter().enumerate().filter_map(
           |(index, bytes)| {
-            slates_merge::chain_entry::decode(bytes).ok().map(|entry| {
-              (
-                u64::try_from(index)
-                  .unwrap_or(u64::MAX)
-                  .saturating_add(held)
-                  .saturating_add(1),
-                entry.increment.id,
-              )
-            })
+            let inputs = slates_merge::chain_entry::inputs(bytes).ok()?;
+            let increment = crate::merge_service::increment_of(s, volume, &inputs)?;
+            slates_merge::chain_entry::decode(bytes, &increment)
+              .ok()
+              .map(|entry| {
+                (
+                  u64::try_from(index)
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(held)
+                    .saturating_add(1),
+                  entry.increment.id,
+                )
+              })
           },
         ));
         // A green its takeover adopted from this node's holder ledger, with no checkpoint past the adoption, names the
@@ -4985,6 +4989,7 @@ async fn init_shard(
     refining: crate::refining::Refining::default(),
     made_commits: crate::made_commit::MadeCommits::default(),
     materializations: crate::green_ready::Materializations::default(),
+    hg_tags: crate::vcs_store::hg_tags::HgTags::default(),
     forwarded_rings: std::collections::BTreeMap::new(),
     telemetry_quota: config.telemetry_spans_per_reply,
     last_drain_ns: now,

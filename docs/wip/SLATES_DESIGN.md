@@ -1523,6 +1523,10 @@ zero-timeout `kevent` this driver makes sleeps about 15 µs a call (macOS 26.4.1
 spin is a nap of that length a turn. That is kept by measurement: a true spin (`KEVENT_FLAG_IMMEDIATE`, about 180 ns)
 cut the single-client p50 from 60–95 µs to 13–22 µs but lost every tail once the host had no idle core, and no policy
 measured kept both (A-218, measured and rejected; BENCHMARKS "The spin policy, measured and rejected").
+A shard that stays busy, and so never parks, harvests between steps no more often than the longer of its quantum and
+its measured empty harvest (its learned idle turn), counted from the harvest's end (A-829, `slates_rt::busy_harvest`):
+a macOS empty harvest is that ~13 µs sleep, and until A-829 the stamp was taken before it, so every busy step after
+the first slept. Where a harvest is cheap the quantum still governs.
 Cancellation: dropping a future releases nothing it did not own (resources live in arenas
 keyed by handle and are released by the owning operation's terminal step), so every operation is
 cancel-safe by construction; a cancellation request is a message that guarantees a terminal
@@ -57813,7 +57817,10 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > interface agreed with w-hg, inbox `*-per-path-read-2026-11-20`).** A changeset's `Texts` section is one format for
 > every tool (`slates_store::texts`: per touched path its bytes, the tool's id, the full text's identity and length,
 > its edit's base, and the edit's or whole's place in the payload; Mercurial's changelog and manifest as the paths
-> `\0changelog` and `\0manifest`), and the edit is one form, Mercurial's `mpatch` hunks. Landing (and a recovery's
+> `\0changelog` and `\0manifest`), and the edit is one form, Mercurial's `mpatch` hunks; a whole's place is its raw
+> text, never a hunk around it (A-767 C1, main's ruling of 2026-11-21: both Mercurial writers had kept a whole as the
+> trivial full-text hunk and its text, so `text` refused `BadRow` for every Mercurial text; a store written before is
+> not read past that refusal, re-imported or re-pushed instead). Landing (and a recovery's
 > replay) derives two tables from it: `T` (a repository's text by identity: its changeset, length, base, place) and
 > `H` (a path by BLAKE3 and a sequence: the text kept). `Store::text_at` makes an old version by walking its `T` rows
 > to a whole and applying each edit read from its own changeset's payload, so no changeset outside the chain is read;
@@ -59118,6 +59125,21 @@ Applied in the same change to: `crates/merge/src/engine/branch.rs` (`Lineage::pr
   commit (file, identity, changed paths) while its green shows nothing, and a preview of a moved green is refused.
 - **Cost.** The preview's branch is O(1) and its release is the version's own nodes; the mapped files are made twice
   (owed, GAPS C2 (d)).
+- **The preview's oracle, and a fix it found** (2026-11-21, w-engine, main's order). A held verdict's preview must read as
+  its commit does on every path a Subversion revision is made of (`vcs_store::svn_made`'s reads: the changed paths, each
+  path's bytes, property list, kind, link target, IPC node, hard link's primary, copied-after). Held over the copy
+  oracle's generated histories (copies, nested and replacing, moves inside a copy) in `engine::copy_tests` and the
+  identity oracle's (links, symlinks, specials, modes, attributes, renames, removals) in `tests/identity.rs`, and through
+  the server's `Greens::preview` over a repository's lineage (`greens::preview_tests`); each red with the copy and link
+  effects dropped from the preview. **The fix:** a commit names a home's links as changed with it when the home has a
+  special history (`Green::record_changes`'s `was_special`, which a rename seeds), and a preview, a fork whose histories
+  start empty, could not tell: it named `b` alone where the commit and the change index's model name `b` and `d` (the
+  identity oracle's shrunk case: a link to a renamed file, then the file's mode set;
+  `a_preview_records_a_renamed_homes_links_as_its_commit_does`, red without the fix). Now `Lineage::preview` asks the
+  source, before the fork, which of the verdict's paths and their links were special there, and the fork's
+  `was_special` answers from that too (`Green::special_seen_for`, `know_special`): O(the verdict's paths), the fork still
+  O(1). A Subversion green holds no hard links, so no revision was made wrong; a git or mounted work's green could have
+  been.
 
 ### A-806 — A rebase answers each changed file as parts over the head, and a work holds and logs those parts: a work's log is what it wrote (2026-11-21, w-fed-move, goal 86b; main's order 02:37 PST, the 300 MB work log; CLAUDE.md §2 item 8; A-207, A-790)
 - **Why.** At 100,000 clients over the Linux kernel one work's log reached 300,898,443 bytes and filled its
@@ -59807,3 +59829,63 @@ Applied in the same change to: GAPS (the refining.rs:166 entry narrowed to the c
 - **Owed.** The step's bound: the commit's re-anchor goes with A-818's engine switch (piece 2b), and the chain's durable
   append of a ~5 MB entry stays in the step. `merge.submit.steps_past_ceiling` reads 0 in release now and is the
   criterion in debug.
+### A-825 — A version's increment held once in its owner shard's content store, its chain entry naming it (chain entry format 6) (2026-11-21, w-shared, lane (A); main's rulings 00:52 and 00:58 PST, "(A), by reference"; §4.16 "Commit", §4.8, §2.7; A-257, A-621, A-697, A-714, A-767)
+- **Why.** The lane's liveness (A-697's holder route at 32 MiB and above): the owner's one durable step copied the
+  increment into its chain entry and the entry into the partition's log, 2.3 to 6.9 s of one shard's step in a debug
+  build at 32 to 64 MiB (the append 1.2 s, its commit and publication about 1.1 s), so the holder's lane gave up
+  silent. Main ruled (A): the content held by reference, never kept in the log, its durability proved first.
+- **Format 6.** `crates/merge/src/chain_entry.rs`: the entry names the increment by its inputs identity (the inputs
+  archive's manifest identity, the one the version's merge record names) and its length, in place of its bytes; the
+  effects, completion, head identity, signature and digest as before. `decode` takes the increment's bytes as the
+  reader resolved them, refusing bytes of another length `Truncated`; `inputs` reads the name. A version 5 entry is
+  refused `BadVersion` and never read by a second path: §2.7 refuses another format typed, a segment is read only by
+  the build that wrote it (its anchor restarts the daemon from its own image), and the last bump did the same (A-621).
+  Golden vector `a_format_six_entry_encodes_to_its_golden_bytes`.
+- **Where the bytes are.** The shard's one content store (`ContentHold`, the anchor-held arena beside the partition's
+  log), under the green's object, as the version's inputs archive (`merge_service::hold_increment`, through
+  `ContentHold::hold_lent`, which copies each chunk once from the bytes into its block and builds no owned chunk). A
+  submit holds it before its verdict (`verbs::submit`), so an accepted version is always recorded; a push holds each
+  held verdict's before any commits (`repository::push::hold_increments`; git's, Mercurial's and Subversion's pushes
+  pass the identity where they passed the encoding). The holder's composed increment (A-697 (1)) is held under the same
+  identity, which 3b will fetch by.
+- **Durability (condition 1).** The partition's append is durable in the segment when it returns; the store's hold only
+  once a publication commits its image. So the shard publishes before the entry is appended whenever the store changed
+  (`verbs::publish_held_increments`, from `record_accepted` and the push's record), and an entry never names content a
+  restarted store lacks. A kill between that publication and the append leaves held content no entry names, which the
+  recovery gives back (`rebuild_recovered`, `release_unnamed_increments`). A replay resolves each entry's increment in
+  the store (`merge_service::increment_of`: lent from its block when one chunk, gathered once from its chunks
+  otherwise) and fences the green `ContentMissing` when the store lacks it. Proved by a real kill: `slates-cli`'s
+  `an_owners_unfolded_version_is_read_from_its_content_store_after_a_kill` (an anchored daemon, a second work holding
+  version 0 so the chain cannot fold, a 64 KiB file landed, `kill -9`, the anchor's restart; red first, green after).
+- **Retention (condition 3, A-714's rule).** The increment is held while an entry names it: a fold gives back what no
+  later entry names (`checkpoint_green_when`), a refused verdict gives back what its hold stored, a destroyed green's go
+  with it, and the doubling rule counts the named increments with their entries. It is charged against the shard's
+  unpromised capacity, never the partition's merge budget, refused typed at the room (`BudgetExceeded`); the store's
+  one charge is `ShardBudget::charge_replicated`, the rule `charge_retention` keeps, under the held-content account.
+- **The record plane.** A version's merge record names the identity its entry names (no copy and no hash of the
+  increment per record), and its shipments cut the chunks lent from the store's blocks (`InputsSource::Lent`).
+- **One content store (condition 4).** A-767's changeset log holds a repository's landed history on disk; a green's
+  increment is a change in RAM until then, so it is held in the store RAM changes are, the shard's content store. A
+  repository green's increment and its changeset carry the same content twice until w-store's wiring lands it: recorded
+  in GAPS.
+- **Cost owed.** One more publication per accepted version (before its append); the release bench (A/B at 64, 128,
+  256, 320 and 512 MiB) measures it with the lane.
+
+### A-829 — A busy shard asks its driver no more often than an empty ask costs (accepted 2026-11-21, g228, 85a; amends A-218's busy-step nap, §4.3 "Loop")
+Applied in the same change to: §4.3 ("Loop"), `crates/rt/src/busy_harvest.rs` (new), `crates/rt/src/shard.rs` (`run`'s
+busy harvest, `Counters::harvests_deferred`), `crates/rt/tests/busy_harvest.rs`, `crates/server/src/verbs.rs` (the
+`rt.core.harvests_deferred` status row), `crates/cli/tests/live_fleet.rs` (the measurement prints it), BENCHMARKS,
+GAPS.
+- **What was measured.** A live write's exchange collect on macOS, 28.7-30.7 µs at the median against Linux's 6, was
+  two empty zero-timeout `kevent`s of 14.3-16.4 µs each (`fleet.live.hop.exchange.{spawn,wake}`, g228). `Shard::run`
+  harvested once a quantum (the wake estimate, a few µs) had passed since its last wait, stamped before the harvest's
+  own sleep, so on macOS every busy step after the first slept. A probe priced the asks: an empty zero-timeout `kevent`
+  12.3-13.1 µs with an involuntary switch, one with an event ready 206 ns.
+- **The rule.** The busy interval is the longer of the quantum and the shard's measured empty harvest, counted from the
+  harvest's end. It spins nothing; it only skips asks that would find nothing. An I/O task waits at most one interval
+  and one harvest. On Linux and Windows the harvest is well under a microsecond, so the quantum governs as before.
+- **Decided by** the A/B in BENCHMARKS ("A busy shard asks its driver no more often than an empty ask costs"): quiet
+  137.0-141.2 against 164.5-167.7 µs added at the median, 5 of 5; loaded, `taskpolicy -b` and both, no contended
+  condition lost on its medians or the owner's CPU. A-218's nap stays everywhere else: the idle spin's turns, and a
+  harvest once the interval has passed. Beside it, a user-space ring watch (main's ruling (c)) was measured and
+  rejected; its bound, the wake estimate, grew with the contention it was meant to avoid.

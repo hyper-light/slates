@@ -204,6 +204,25 @@ pub fn encode_hunk(hunk: &Hunk<'_>, out: &mut Vec<u8>) -> Result<(), Refusal> {
   Ok(())
 }
 
+/// Where the text a delta against the null base carries begins in it: past its one hunk, which must insert exactly the
+/// rest at 0 (`mdiff.trivialdiffheader`, what every 7.2 writer makes), or at 0 for an empty delta (an empty text's, as
+/// 7.2 sends one); none for any other delta. A Mercurial whole is kept as that text alone (A-767 C1: the store's
+/// contract, a whole's place its raw text).
+pub fn whole_text_start(delta: &[u8]) -> Option<usize> {
+  if delta.is_empty() {
+    return Some(0);
+  }
+  let (header, text) = delta.split_at_checked(HUNK_HEADER_LEN)?;
+  let words: Vec<u32> = header
+    .as_chunks::<{ size_of::<u32>() }>()
+    .0
+    .iter()
+    .map(|word| u32::from_be_bytes(*word))
+    .collect();
+  let length = u32::try_from(text.len()).ok()?;
+  (words == [0, 0, length]).then_some(HUNK_HEADER_LEN)
+}
+
 /// Appends the delta Mercurial sends for a full text against the null base: one hunk inserting the whole text
 /// (`mdiff.trivialdiffheader`, `changegroup._revisiondeltatochunks`).
 pub fn encode_full_text(text: &[u8], out: &mut Vec<u8>) -> Result<(), Refusal> {

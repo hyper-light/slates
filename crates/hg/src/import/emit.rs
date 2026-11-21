@@ -24,7 +24,7 @@ use crate::changegroup::{self, Revision, Version};
 use crate::index::Log;
 use crate::push::intake::{CHANGELOG_PATH, KeptText, MANIFEST_PATH};
 use crate::read::to_u64;
-use crate::{Admission, NULL_NODE, Node};
+use crate::{Admission, NULL_NODE, Node, delta};
 
 /// Format: the changegroup version an import is written as: 03, which carries each delta's base and revision flags.
 pub const VERSION: Version = Version::V03;
@@ -175,7 +175,16 @@ impl Emitter {
       sidedata: None,
     };
     let start = to_u64(self.segment.len());
-    let header = to_u64(changegroup::LENGTH_LEN.saturating_add(VERSION.header_len()));
+    // A whole is kept as its raw text (the store's contract, A-767 C1): its place past the hunk it is written in.
+    let hunk = match read.delta_parent {
+      None => delta::HUNK_HEADER_LEN,
+      Some(_) => 0,
+    };
+    let header = to_u64(
+      changegroup::LENGTH_LEN
+        .saturating_add(VERSION.header_len())
+        .saturating_add(hunk),
+    );
     match read.delta_parent {
       None => changegroup::put_revision_whole(&revision, VERSION, &mut self.segment),
       Some(_) => changegroup::put_revision(&revision, VERSION, &mut self.segment),

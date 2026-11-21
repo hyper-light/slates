@@ -1,5 +1,20 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Open (w-shared, 2026-11-21, found landing A-825): two A-338/A-349 superseded-owner fleet tests fail on main.**
+> `a_superseded_owners_clients_reach_its_successor` and `a_superseded_owner_ships_nothing_more_of_the_volume_it_lost`
+> (`crates/server/tests/fleet.rs`) fail alone at origin/main 37c7a1691 and identically with A-825 (macOS arm64,
+> Mac Studio, kiln r18, load 4-5): the successor takes the volume over, but every write through the superseded node a
+> is refused, `StaleEpoch { current: 2 }` once and then `Overloaded` until the wait gives up ("a write through a was
+> answered at durability"). Not looked into; A-825 touches neither live shipping nor a volume's takeover.
+
+> **Open (A-825, w-shared, 2026-11-21): a repository green's increment is held twice until w-store's wiring lands it.**
+> Chain entry format 6 holds every version's increment in its owner shard's content store until the version folds
+> (main's ruling 00:52 PST, condition 4: one content store). A git, Mercurial or Subversion green's increment is also
+> its changeset, which A-767's log holds on disk once landed (w-store's wiring): the two carry the same content until
+> the changeset store names it, so a repository's increments are charged in RAM until their versions fold. Owed with
+> A-767's wiring: the entry naming the changeset's content where the log holds it. Also owed: the extra publication
+> before an entry's append (A-825 "Cost owed"), measured by the lane's release bench.
+
 > **FIXED (w-fed-faults, 2026-11-21): a whole-file rewrite outside a recorded request was refused `Overloaded`**
 > (A-787 part 2's park, 2a498b90f). 10 server lib tests (repository, vcs_store paths and commits) failed from that
 > commit on, bisected against its parent 81d8baea5; such a verb now composes unrefined and is answered (6459374).
@@ -36,8 +51,9 @@
 > (served p99 61–104 µs), and 1.0–1.3% of requests wait exactly 1.00–1.02 ms (queued p99 1,006–1,169 µs).
 > - **macOS:** the busy path's zero-timeout `kevent` nap (w-provision-gate, A-786 part 2, `b01a0ef7b`). On the
 >   edit-and-merge path it empties the band (1,362–1,543 of 52,050 → 0–2) and takes queued p99 to 22–23 µs, conflict
->   p99 10.2–10.7 → 0.22–0.46 ms, accept p99 10.4–10.8 → 0.80–2.6 ms (M4 Max Studio, interleaved). Lands with
->   w-provision-gate's hold rule. Shard, doorbell-thread and client QoS (`USER_INTERACTIVE`) each moved nothing.
+>   p99 10.2–10.7 → 0.22–0.46 ms, accept p99 10.4–10.8 → 0.80–2.6 ms (M4 Max Studio, interleaved). It did not land:
+>   on the provisioning path it failed main's conditions (quiet CPU, loaded p999; a38630375), so the nap stays. Shard,
+>   doorbell-thread and client QoS (`USER_INTERACTIVE`) each moved nothing.
 > - **Linux** (CI ubuntu-24.04-arm, A-224's lane): the same band (queued p99 1,007–1,010 µs, p999 1,021–1,091) with no
 >   nap; parking at once instead of spinning halves the medians (accept 189–206 → 86–100 µs) and leaves the band and
 >   the ms tails. It is the kernel's 1 ms tick on a two-CPU lane at the shard's own weight; no unprivileged raise
@@ -69,8 +85,11 @@
 >   far worse on both Windows runners (conflict p999 20-42 against 0.3-12 ms); it helps only macOS's quiet latency. B
 >   stays. **Open (85a):** the loaded tails sit on whole milliseconds (3,998 / 4,000 / 4,996 / 5,998 µs): the scheduler's
 >   slices behind the lane's 8 spinners on 4 vCPU. The shard count does not move them (run 44884432328: loaded accept
->   p99 0.27-5.0 ms and p999 3.3-6.0 ms at 1, 2 and 4 shards). The macOS hop split (run 44888851325): the client's p99
->   tail is its own wake (written -> seen, median 97 µs).
+>   p99 0.27-5.0 ms and p999 3.3-6.0 ms at 1, 2 and 4 shards). The macOS hop split (run 44888851325; BENCHMARKS "arm C"):
+>   the client's loaded round-trip p99 is 6.8-8.1 ms. The tail requests are replies written after the step that took
+>   them (resumed or forwarded verbs), which the ring stamp does not cover yet. That hop is next. The busy path's
+>   zero-timeout kevent took at least 1 ms in 9-12% of its calls loaded (up to 4 ms; quiet 7-47 calls). The runner's
+>   kevent and ulock timeouts are late about 200 µs at the median, nanosleep 1.7-2.5 ms.
 > - Windows (CI, run 44857045148): no 1 ms band (queued p99 5–49 µs); accept p99 0.13–0.31 ms, conflict 0.11–0.29 ms;
 >   p999 0.2–62 ms. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–7).
 >
@@ -207,7 +226,9 @@
 > (`vcs_store.hg_stream_turns`); hg's first 2987 changesets stream in 16 turns where they took 24,956. r25 on
 > 5d7e05b81: 5.24/5.28/5.30 s against stock's 0.47/0.50/0.48 s, a later stream of the same daemon 10.69/10.71 s, its
 > store thread reading each chunk with its own lookup and `pread`; BUILT: a batch of places is read a run at a time
-> (`Store::places_bytes`: in order in one payload, the read within twice the bytes asked). OPEN: the bytes, 151.7 MB on the wire against stock's 77.9 MB (8452 files uncompressed
+> (`Store::places_bytes`: in order in one payload, the read within twice the bytes asked). r27 on e0b677380: 38 store
+> asks a stream, 1.35 s of its 3.7 s waiting on them, a lookup a revision's row by node; BUILT: a log's rows read in one
+> scan of its key prefix (`Store::texts_by_tools`, counted `Store::tool_reads`). OPEN: the bytes, 151.7 MB on the wire against stock's 77.9 MB (8452 files uncompressed
 > against stream v2's 4282 compressed); the view made each turn (`Indexed::new`). CLOSED by w-hg's C1 (imports since
 > step 3, made changesets since the made-on-store piece): a repository whose history the store did not keep (an
 > import's, a made changeset's) advertised no stream (`State::stored_logs`, from `HgStore::unstored`, both removed),
@@ -408,6 +429,15 @@
 > A-782 closed identical versus accepted (one typed
 > outcome, engine to every surface); A-785 names merges held for approval. A-779 closed the stale presentation: a newer one of the same volume into the same target
 > supersedes it (typed refusal, off the log), and the log lists only grantable presentations.
+>
+> **Recorded, not built (close rule; main 01a1ff31, 2026-11-21).** (1) A write of the head's own bytes with nothing
+> intervening answers `Accepted` (the engine applies a no-op effect; `crates/client/tests/merge_identity.rs`
+> `the_heads_own_bytes_accept_at_a_version_of_their_own`), though it changes nothing and so is `Identical` (main's
+> ruling). Proposed test: that case asserts `Submitted::Identical(4)` and `Green::changed_nothing_at(4) == Some(true)`;
+> red today with `Accepted(4)`. (2) A presentation whose client went away (AUD-29-07's abandon) leaves its record
+> `AwaitingGrant` until a newer presentation of the same volume and target supersedes it (A-779); proposed: an
+> `Abandoned` landing state written at the abandon, its grant refused by kind, with a test that drops the presenting
+> client and reads the record and a grant's refusal.
 
 > **§4.17 version-control servers: the shared mapping and the git server are designed; the repository record, greens
 > made at another green's version and the object store's core are built (2026-11-18, A-497, D-28, A-515; 2026-11-19,
@@ -2922,6 +2952,39 @@
 >     store and verifies clean (0 asks before);
 >   - hg_interop 15/15 against stock hg 7.2.
 > - 1b, BUILT below.
+> **A Mercurial whole's place is its raw text, the store's contract (A-767 C1, 2026-11-21, w-hg; main's ruling). BUILT.**
+> - Found reading lookup's `.hgtags` through the store: `StoreHandle::text` refused `BadRow` for every Mercurial text.
+>   Both writers (the push intake's `KeptText.place`, the import's `Emitter::revision`) kept a revision against the null
+>   base as the trivial full-text hunk and its text, while the store's `make` takes a whole as raw bytes of its length.
+>   The stream hid it by stripping the hunk (`text_after_trivial_hunk`), the clone and the pull by sending the hunk as
+>   a delta against null.
+> - Now one rule: a whole's place is its raw text (the payload's bytes unchanged, the place past the hunk; an empty
+>   text an empty place). The stream sends a whole as it lies (`text_after_trivial_hunk` removed); the clone walk and
+>   the pull write a stored whole as the one hunk 7.2 sends (`put_revision_whole`). A delta against null that is not
+>   that one hunk is refused typed (`Unverified::NotWhole`); every 7.2 writer sends it.
+> - Old stores: no shim. A whole kept before is still refused `BadRow` (typed) by `text` until the repository is
+>   re-imported or re-pushed.
+> - Held by `hg_view::tests::the_store_makes_a_pushed_mercurial_text_whole` (red before: no text made; and a read past
+>   its room refused), the two-encodings oracle `every_text_both_writers_keep_is_made_whole_by_the_store_in_every_format`
+>   (dotencode, hybrid, pre-share-safe, revlog v2, file index: every revision imported, then cloned through the store
+>   and pushed into a second repository, each text the store makes equal the view's, edits counted under both writers),
+>   and the stream, clone and pull oracles unchanged.
+> **Lookup's `.hgtags` through the changeset store (A-767 C1, 2026-11-21, w-hg; main's ruling (A)). BUILT.**
+> - A name that reaches the tags (`serve::lookup::needs_tags`) has the served heads' `.hgtags` read first
+>   (`lookup::TagsRead`): the rows of every head's `.hgtags` revision in one want, then their texts in one, bounded by
+>   the asking step's room (`Want::Texts`'s `most`: the store stops reading past it and the lookup is refused past its
+>   admission). `Repository::tags_text` is gone.
+> - Over the edges: a plain `lookup` is a `Producing::Lookup` answer (over HTTP `application/mercurial-0.1`,
+>   uncompressed, as 7.2 sends a string); a `batch` reads the tags once for all its lookups (`BatchStep::Store`,
+>   answered by the SSH session's stream turns and the HTTP edge's batch driver). Counted `vcs_store.hg_lookup_store_asks`.
+> - The owner's `CreateBranch --from <tag>` (A-575) parks at a door in `verbs::run_recorded` while a task reads the tags
+>   (`vcs_store::hg_tags`), then runs again over the read; a read whose heads changed meanwhile is made again.
+> - Held by `a_tag_only_a_hidden_head_carries_is_unknown_and_the_tags_are_read_in_one_round` (the new `hidden-tag`
+>   fixture, made by stock 7.2: one rows want naming the visible head's `.hgtags` alone), `a_batch_of_lookups_reads_the_tags_once`,
+>   `a_repository_without_hgtags_asks_the_store_nothing_for_a_lookup`, `a_hgtags_past_the_room_is_refused_past_its_admission`,
+>   and `a_branch_from_a_name_follows_mercurials_lookup_bookmark_tag_then_branch` (red at first: `default` and `v1`
+>   refused with no door; now one read each). OPEN: stock 7.2's `pull -r <tag>` over SSH and HTTP and a batched
+>   `pull -r a -r b` by use (hg_interop), and the `--from` verb by use, run by main or w-interop.
 > **C1 step 1b, a pull's file revisions through the changeset store (2026-11-21, w-hg; main's ruling of 08:45 with its
 > condition on pulls). BUILT.**
 > - A pull (any fetch the links do not walk) still makes its changelog and manifests whole when it begins
@@ -3907,7 +3970,11 @@
 > daemon and asserts its node is gone once the harness ends.
 
 > **On a loaded Linux host, stock hg against the release daemon spun shard 0 past its window five times; four kills,
-> and a restarted daemon's own start spun into a fifth (2026-11-20; OPEN, w-hg; found by w-interop's Linux counts).**
+> and a restarted daemon's own start spun into a fifth (2026-11-20; found by w-interop's Linux counts).** The
+> `hg_push::unbundle` spin: not reproduced on 481d7abef (w-interop's r8, load ~40, after e6c3f10cd removed the
+> register-held record path the spinning build 90e9b720c still ran); the chain rebuild it most likely came from was
+> removed in c5248394f (w-perf's `files_present`). The next Linux matrix on current main confirms or reopens it. The
+> HTTP edge's and `start_shard`'s spins are w-bugs'.
 > adacachy (Linux x86_64, 32 cores, load 31-55, shared with CI), release main 90e9b720c, `ci/interop/hg-matrix.sh` over
 > Mercurial's whole history (57,053 changesets): 22 of 24. The watchdog named `hg_push::unbundle` (1,091 ms of CPU
 > without a step), the HTTP edge's connection task (`vcs_http.rs:850`, `drive`, twice, each killed) and the restarted
@@ -9242,7 +9309,9 @@
 > runner (at most 65.5 against 60.6-83.0 µs at p50), so the daemon hides nothing there. A live entry's request taken whole (one copy a holder for four) is measured dead even and rejected (BENCHMARKS, same
 > section). The macOS collect (two empty zero-timeout `kevent`s between busy steps, about 30 µs) was attacked by main's
 > ruling (c) and the candidate measured and rejected, losing under contention (BENCHMARKS, same section): item 3
-> closed as (a), the cost recorded. Still open: 2.2x on Linux;
+> closed as (a), the cost recorded. The collect's two sleeps themselves are gone by A-829 (a busy shard asks its driver
+> no more often than an empty ask costs): macOS 137.0-141.2 against 164.5-167.7 µs added at the median, no contended
+> condition lost. Still open: 2.2x on Linux;
 > the entry's copies and allocations (134 a write more than a plain write's 34); macOS's parked control shards (one
 > spin primitive with g222's 84a arm C).
 
@@ -24597,3 +24666,18 @@ in what lands. Branch tips as of 2026-11-10:
 > hashes current bytes only, no history reads); slice the checkpoint's last step (~43 ms: build 5.7, encode 9.5, record
 > 24.4 of 49 MB) and single key folds of up to 13.4 ms.
 
+> **A-805's preview oracle (2026-11-21, w-engine; main's order):** a held verdict's preview reads as its commit over the
+> copy and identity oracles' generated histories and through `Greens::preview`, red with copy and link effects dropped.
+> It found a preview naming fewer changed paths than its commit (a home's links, once the home had a special history):
+> fixed, the source telling the fork what was special. Closed.
+
+### 2026-11-20: after a takeover in a lossy phase, the old owner's forwards were refused and the new owner got no write — open (owner of the forward path)
+Found by w-forming's Goal 85b C3 run (kiln, Adas-Mac-Studio.local, commit c9c9554d8): `cargo test -p slates-cli --test
+live_chaos a_seeded_nemesis_of_single_faults_keeps_every_register_invariant` with `SLATES_TEST_CLI=1
+SLATES_CHAOS_SEED=10263252121351842258`. The owner b lost the volume to a during `Severed(Candidates)` then
+`Lossy(5% loss, 20 ms delay)` (b was held Dead, then Alive at incarnation 3). The stream kept writing through b, and b's
+forwards to the new owner were refused: `fleet.owner_location.route_dropped.refused` 571, `no_session` 106, `not_owner` 110 on b;
+`declined.departed` 15, `declined.not_owner` 8 on a. a's live log stayed at head 906, durable 906, nothing owed: no write
+reached it, and the flow failed at `live_chaos.rs:2465` ("the stream made a's log durable at 946, now 906"). The live log
+itself was whole on every node. Not worked by w-forming (Ada's close order); whether it reproduces on main after
+8e4da57ae is r19's replay.

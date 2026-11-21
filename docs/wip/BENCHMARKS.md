@@ -17103,13 +17103,25 @@ and every round shown, as main extracted them from the run's log.
     B's 0.2-33).
 - **Quiet:** C helps only macOS (accept_f1000 p50 277-311 against 347-381 µs, p99 592-624 against 784-1,234). It is
   even elsewhere.
-- **The macOS hop split** (run 44888851325, `diag-measurer-g222-22`). Its log could not be read here (no `gh` on this
-  machine), so g222's note stands for it (progress/g222.md, its quiet smoke run on Studio-4):
-  - The client's p99 tail is its own wake: from the reply written to the client seeing it, median 97 µs, two parks a
-    reply.
-  - The nap's harvests take 8-16 µs.
-  - The runtime's waits (the shard's kevent, the client's ulock) are late only 54 µs at the median and 63-75 µs at p99
-    under launchd. Only nanosleep is late (1.60 ms at the median), and nothing on the request path sleeps.
+- **The macOS hop split** (run 44888851325, `diag-measurer-g222-22`, macos-latest, main with B, branch
+  `diag-g222-hops-mac` 2e30acc9a, never main; read by g222 2026-11-21). Three rounds, each loaded then quiet. The bench
+  itself measured loaded accept p99 8.2-13.8 ms and conflict 8.1-8.9 ms, the same as B's above. Per request (57,936 a
+  round):
+  - **The client's round trip, loaded:** p50 79-98 µs, p99 6.8-8.1 ms, p999 8.6-11.9 ms (quiet: 66-67 / 515-563 /
+    985-1,550 µs). Every request in the p99 tail parked, 3 parks at the median.
+  - **Which hop:** the ring's stamp covers only replies a shard writes in the step that took the request. That joined
+    3-4 of the 580 loaded tail requests, so the tail is replies written later (a resumed or forwarded verb), and the
+    split hasn't named their hop yet. Over the joined requests, loaded: queued (sent -> taken) p99 3.2-3.3 ms and p999
+    3.9 ms; served p99 136-190 µs; wake (written -> the client saw it) p99 256-335 µs and p999 2.8-2.9 ms. Quiet: all
+    three p99 86-102 µs.
+  - **The nap:** the busy path's zero-timeout kevent took at least 1 ms in 11,825-16,321 of 131,136-135,988 calls
+    loaded (9-12%), spread up to 4 ms (2-4 ms: 5,355-6,906). Quiet: 7-47. The queued p99 (3.2 ms) sits in that range.
+  - **Shard parks:** a timed park overran its timeout by p99 110-390 µs and p999 1.9-2.0 ms loaded, at least 1 ms in
+    59-75 of about 15,400. Quiet: never as much as 1 ms.
+  - **The runner's timers, 200 µs timeouts x 2,000** (the launchd finding): kevent and ulock are late 199-212 µs at the
+    median both idle and loaded, and loaded p999 0.7-2.2 ms (at most 18 of 2,000 at least 1 ms late). nanosleep is late
+    1.7-2.5 ms at the median (1,221-1,947 of 2,000 at least 1 ms late). On Studio-4 under kiln, kevent and ulock are
+    late 54 µs at the median, nanosleep 1.60 ms. Nothing on the request path sleeps.
 
 ## Where a Subversion import's memory is: git-2000 attributed by region (P7 of Ada's close list, A-772's daemon peak; 2026-11-21)
 
@@ -17340,6 +17352,47 @@ itself under contention: the ring watch's bound was the wake estimate, and under
 scheduler's queueing until one daemon spent 1.70 s of a round watching. "No core, no spin" did not hold, because the
 wake estimate rose before any free-core reading could fall. A spin's bound must come from something that shrinks under
 contention, or the spin must be absent; the busy interval, which spins nothing, is measured on its own next.
+
+**A busy shard asks its driver no more often than an empty ask costs: the interval alone, accepted (A-829)**
+(agents/g228-busy-interval bc64bc20c against main a8ee99bf7; kiln r21, adas-mac-studio.local-2, Apple silicon, 32 cores,
+17:06-17:20 UTC 2026-11-21; the contract command, release, CARGO_BUILD_JOBS=4, each arm built from its commit, five
+rounds a condition, arms interleaved, order alternating). Loaded: 32 busy loops, one a core, started 30 s before the
+condition's first round. Background: the test under `taskpolicy -b`. Cells: added p50; live p999 (µs); the owner's CPU
+over the stream (ms):
+
+| condition, round | base | interval |
+|---|---|---|
+| quiet 1 | 166.4; 303.1; 340 | 137.8; 297.0; 340 |
+| quiet 2 | 167.7; 290.8; 330 | 139.8; 294.3; 330 |
+| quiet 3 | 164.5; 287.3; 320 | 137.1; 289.3; 330 |
+| quiet 4 | 166.4; 316.3; 330 | 137.0; 285.5; 340 |
+| quiet 5 | 167.0; 312.2; 330 | 141.2; 239.5; 340 |
+| `-b` 1 | 383.5; 1,666.5; 1,250 | 343.9; 1,601.3; 1,060 |
+| `-b` 2 | 358.6; 1,555.1; 1,110 | 359.4; 1,806.0; 1,260 |
+| `-b` 3 | 385.6; 1,551.0; 1,250 | 461.6; 3,096.6; 1,260 |
+| `-b` 4 | 370.1; 1,603.5; 1,180 | 350.8; 1,581.8; 1,110 |
+| `-b` 5 | 381.8; 1,386.7; 1,120 | 345.1; 1,662.4; 1,100 |
+| loaded 1 | 468.3; 4,335.3; 760 | 236.0; 1,572.7; 450 |
+| loaded 2 | 537.7; 2,935.6; 680 | 140.9; 1,763.1; 400 |
+| loaded 3 | 541.7; 2,883.8; 860 | 447.5; 2,134.2; 670 |
+| loaded 4 | 800.2; 11,699.9; 930 | 250.8; 1,705.6; 440 |
+| loaded 5 | 639.8; 5,479.5; 980 | 341.8; 1,682.9; 540 |
+| `-b` loaded 1 | 10,226.0; 111,242.2; 1,180 | 10,883.7; 36,879.4; 1,030 |
+| `-b` loaded 2 | 11,237.2; 127,244.5; 1,160 | 10,994.8; 39,079.4; 1,040 |
+| `-b` loaded 3 | 11,620.6; 321,528.7; 1,210 | 10,491.5; 49,215.2; 1,050 |
+| `-b` loaded 4 | 10,736.0; 39,038.7; 1,030 | 9,481.1; 32,920.1; 1,040 |
+| `-b` loaded 5 | 10,583.5; 72,913.3; 1,060 | 9,876.6; 110,903.4; 1,050 |
+
+No test failed in either arm. Live writes over 50 ms, `-b` loaded: base 41 / 25 / 47 / 0 / 10, interval 1 / 1 / 2 / 0 /
+8. The collect at the median: quiet 28.7-30.7 against 10.2-11.3 µs; loaded 61.4-81.9 against 11.3-28.7.
+Busy harvests deferred, every round of the interval arm, 510-26,062 a daemon (`rt.core.harvests_deferred`).
+
+**Reading.** Accepted. It wins quiet in every round (137.0-141.2 against 164.5-167.7 µs, the owner's CPU equal) and
+loses no contended condition on its medians or the owner's CPU. Loaded, it wins every round with lower CPU (400-670
+against 680-980 ms) and a p999 of 1.6-2.1 ms against 2.9-11.7. Under `taskpolicy -b` with every core busy, its medians
+are ahead in 4 of 5 rounds and its slow writes far fewer. One soft spot stays on record: under `taskpolicy -b` alone
+it led 4 of 5 medians, but round 3 was 461.6 against 385.6, and that condition's p999 was higher in 3 of 5 rounds.
+macOS's median moves from about 165 to about 139 µs added, 2.8x 85a's goal.
 
 ## A Subversion import on the real daemon: the peak against the dump, by kind (P7, A-772's daemon peak; 2026-11-21)
 

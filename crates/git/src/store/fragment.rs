@@ -271,6 +271,7 @@ impl Putting {
 /// 10,385, 258-byte pieces 10,410), so every stream is cut here, and a step sized by its time (A-718) is a number of
 /// pieces: one input, one output, on every machine. Within 0.6% of one call's ratio at levels 1, 6 and 9 for any piece
 /// from 64 bytes; a piece took 0.28, 0.85 and 1.70 us at those levels on an M4 Max, inside the step budget's 2.2 us.
+/// Format: 258 + 3 + 1, zlib's `MIN_LOOKAHEAD` as above.
 pub(crate) const DEFLATE_PIECE: usize = 262;
 
 /// What a step of an object's encoding gave.
