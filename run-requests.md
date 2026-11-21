@@ -7274,3 +7274,21 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   w-work-mount (the Windows store). Who filed: w-realtools.
 - Already green on macOS: case 1, focused, Adas-Mac-Studio-2 (Apple Git 2.50.1), debug, base e0079c7: 1 passed in
   14.87 s, fmt clean.
+
+## 2026-11-21, w-reaper: svn correctness by use, the rounds (goal 93; test landed 007bbca86 + 33dc5f546, origin/main 41bdf1bbe)
+- Where: adas-mac-studio.local-2, the big Studio, which has stock svn, svnserve, svnadmin, svnsync and svnrdump at
+  1.15.0 (the only stock svn on the fleet). Release build.
+- Command: `SLATES_TEST_CLI=1 SLATES_SVN_USE_DUMP=<git-2000.dump> cargo test --release -p slates-cli --test svn_interop -- --ignored a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve --nocapture`.
+  The dump is on adas-macbook-pro-2 at ~/.cache/w-svn-gitgit/git-2000.dump (458 MB).
+- Knobs:
+  - `SLATES_SVN_USE_REVISIONS=N`: the first N revisions only.
+  - `SLATES_SVN_USE_VERBS=log,info,checkout,update,switch,blame,diff,revprops,dump,svnsync,commit,copy,merge,propset`
+    (the default is all of them).
+  - `SLATES_SVN_USE_SAMPLES=K`: how many revisions the per-revision verbs read (16 by default).
+- Routes: svn:// alone today, against stock `svnserve -t`. svn+ssh and HTTP v1/v2 legs are owed: the same verbs on
+  another `UseLeg`.
+- Focused proof (mine, the Studio, r37): crates/svn/fixtures/dump/full.dump, N=2, verb log, 0 differences, 7 s.
+- Red looks like: `differences:` followed by one entry per verb and revision, its first differing line and three
+  lines of each side (stock, slates). Each goes to w-svn as a red test.
+- Fixed in the test, not a slates difference: `svn --xml` writes a tag's attributes from a hash, so their order is
+  compared canonically (`canonical_tags`).
