@@ -9924,6 +9924,7 @@ fn take_sealed(state: &mut ShardState, work: DbVolumeId) -> Option<crate::work_h
     files: std::mem::take(&mut w.files),
     composed: None,
     computed: None,
+    held: None,
     merge: None,
   })
 }
@@ -10763,6 +10764,16 @@ fn increment_held(
   green_id: DbVolumeId,
   inc: &slates_merge::engine::Increment,
 ) -> Result<crate::merge_service::HeldIncrement, Refusal> {
+  // A holder's submit names an increment this shard already holds (lane (A) 3b): neither encoded nor hashed again.
+  if let Some(inputs) = sealed.held {
+    chain_room_admitted(state, green_id, inc)?;
+    retention_secured(state, green_id, inc)?;
+    return crate::merge_service::increment_already_held(state, green_id, inputs).inspect_err(
+      |_| {
+        let _ = crate::merge_service::settle_green_retention(state, green_id);
+      },
+    );
+  }
   let increment_bytes =
     crate::refining::take_encoded(state, sealed.work, inc.id).unwrap_or_else(|| inc.encode());
   chain_room_admitted(state, green_id, inc)?;
@@ -12182,6 +12193,7 @@ fn submit_computed(
     files: crate::work_files::WorkFiles::default(),
     composed: Some(inc),
     computed: Some(computed),
+    held: Some(named),
     merge: None,
   };
   // A Subversion repository's green: the repository's landing turn before the verdict (`crate::made_commit`), or
