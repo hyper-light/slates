@@ -1,6 +1,19 @@
 # w-store progress (brief: briefs/w-store.md)
 
-## State (2026-11-20 ~14:40 PST)
+## State (2026-11-20 ~19:30 PST) — CLOSE LIST (briefs/close-list.md): C2, C3, C4-C6
+- C2 landed in steps on origin/main: a9fd63be1 (slates_rt::sync, safe channel), 1b02c30b4 (retirement Reaper,
+  RtError::Capacity, race2), ee0661c06 (vendor/mantle engine/chunk/disk/crc/codec @ mantle 87ab09e1; hyper-block issuer
+  back on slates_rt; ranges left out; block_on, spawn_detached, Reaper::shutdown, cell set_limit). Unit tests on
+  slates_rt: engine 155/155, chunk 52/52, hyper-block 101/101, rt sync 11/11 + retirement 3/3 (macOS arm64,
+  Adas-Mac-Studio-2; TMPDIR=~/.cache/w-store-tmp; own target ~/.cache/w-store-local-target.noindex).
+- C2 remainder = the land write seam: vendored prod code opens no files except hyper-block's DeviceFile::open /
+  SegmentedFile create+add and mantle-disk calibrate's scratch -> seam: land opens the granted store root (dir handle),
+  files created relative to it (openat), hyper-block patched to take an open file / a dir handle. Doing it as C3's
+  first step with slates-store + R1 table (xtask HOST_PATH_ALLOWED/WRITE_ALLOWED + design table).
+- Gotchas: engine tests must keep the Reaper alive as long as upstream's runtime (drop order) else join hangs;
+  slates rings need >=2 slots; zsh doesn't word-split $files (use while read).
+
+## Earlier (14:40)
 - LANDED 9d74daf2a on main: A-767 design (one unit the changeset; Ada ~13:35) + research/vcs-store-prior-art.md,
   GAPS line, §4.17.1 and R1 status lines. Base origin/main 990c83e77.
 - Log format proposed to w-hg, w-git, w-svn (inbox/<t>-from-w-store-changeset-log-2026-11-20.md); awaiting replies.
