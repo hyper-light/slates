@@ -1397,6 +1397,68 @@ pub enum RequestBody {
     /// The last line of the previous page, or `None` for the first page.
     after: Option<LogCursor>,
   },
+  /// Create a volume laid over the objects of an S3 base (§4.15 "An S3 base"; A-555): an overlay as `Create` with a
+  /// host directory makes one, its base read from the store `base` names, signed with `credential`. The credential is
+  /// held in RAM by the volume's owner shard and never written anywhere (R1); the catalog records the base alone.
+  /// Answered `Created`, or refused as `Create` is, and `BaseUnavailable` naming the base's endpoint for a base the
+  /// daemon cannot reach (an endpoint name it would have to resolve, a host no plain loopback address, no authority
+  /// for TLS). Appended.
+  CreateOverS3 {
+    /// The name.
+    name: String,
+    /// The size class.
+    size: SizeClass,
+    /// The name policy.
+    names: NamePolicy,
+    /// Whether unlocked memory refuses.
+    require_locked: bool,
+    /// The base: its store, bucket and prefix.
+    base: S3BaseSpec,
+    /// What the store's requests are signed with.
+    credential: S3Credential,
+  },
+}
+
+/// An S3 base as the wire names it (A-555; the library's `S3Base`, which checks every part and is what a caller makes
+/// one from): the store's endpoint (`https://host[:port]`, or `http://` to a loopback address alone), the bucket's
+/// region, the bucket, the prefix its keys lie under (empty or ending in `/`), whether requests name the bucket in the
+/// path, and the authorities the store's certificate is verified against (DER), none for plain HTTP.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct S3BaseSpec {
+  /// The endpoint, `https://host[:port]` or `http://host[:port]`.
+  pub endpoint: String,
+  /// The bucket's region, the signature's scope.
+  pub region: String,
+  /// The bucket.
+  pub bucket: String,
+  /// The prefix: empty, or ending in `/`.
+  pub prefix: String,
+  /// Path-style addressing (`/bucket/key`), as an S3-compatible store on one host serves it; virtual-hosted otherwise.
+  pub path_style: bool,
+  /// The certificate authorities the store's certificate is verified against, each DER; empty for plain HTTP.
+  pub authorities: Vec<Vec<u8>>,
+}
+
+/// A credential for an S3 store (A-555): an access key and its secret, with a session token for a temporary one. Its
+/// `Debug` names the key alone: the secret and the token never reach a log.
+#[derive(Wire, Clone, PartialEq, Eq)]
+pub struct S3Credential {
+  /// The access key id.
+  pub access_key_id: String,
+  /// The secret access key.
+  pub secret_access_key: String,
+  /// The session token of a temporary credential.
+  pub session_token: Option<String>,
+}
+
+impl std::fmt::Debug for S3Credential {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("S3Credential")
+      .field("access_key_id", &self.access_key_id)
+      .field("secret_access_key", &"<withheld>")
+      .field("session_token", &self.session_token.as_ref().map(|_| "<withheld>"))
+      .finish()
+  }
 }
 
 /// What a policy rule's pattern names (§4.17.1 "Policy"; A-622), as `SetRepositoryPolicy` gives it: the names its
@@ -2474,6 +2536,7 @@ impl RequestBody {
       // A green over a base is born on the base volume's owner shard, where the snapshot is walked.
       RequestBody::CreateGreen { base, .. } => base.map(|b| b.volume),
       RequestBody::Create { .. }
+      | RequestBody::CreateOverS3 { .. }
       | RequestBody::Advance { .. }
       | RequestBody::Detach { .. }
       | RequestBody::BindMount { .. }
@@ -2526,6 +2589,7 @@ impl RequestBody {
     matches!(
       self,
       RequestBody::Create { .. }
+        | RequestBody::CreateOverS3 { .. }
         | RequestBody::CreateGreen { .. }
         | RequestBody::CreateRepository { .. }
         | RequestBody::CreateBranch { .. }

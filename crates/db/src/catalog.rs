@@ -422,6 +422,21 @@ pub enum BaseRecord {
     /// The snapshot imaged.
     snapshot: SnapshotId,
   },
+  /// The objects of an S3 base (§4.15 "An S3 base", A-555): its store's endpoint, the bucket's region, the bucket, the
+  /// prefix and how requests address the bucket. The credential its fetches are signed with is never recorded (R1): it
+  /// is held in RAM by the owner shard, and a recovery without it holds the volume unavailable. Appended.
+  S3 {
+    /// The endpoint, `https://host[:port]` or `http://host[:port]`.
+    endpoint: String,
+    /// The bucket's region.
+    region: String,
+    /// The bucket.
+    bucket: String,
+    /// The prefix: empty, or ending in `/`.
+    prefix: String,
+    /// Path-style addressing.
+    path_style: bool,
+  },
 }
 
 /// The volume state machine (§4.4).

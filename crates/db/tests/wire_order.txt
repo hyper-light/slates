@@ -20,6 +20,7 @@ AuditKind 7 GrantExpired
 BaseRecord 0 Scratch
 BaseRecord 1 Path
 BaseRecord 2 Image
+BaseRecord 3 S3
 Consumer 0 Sdk
 Consumer 1 Bridge
 Consumer 2 Launcher

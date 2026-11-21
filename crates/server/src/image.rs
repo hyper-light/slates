@@ -367,7 +367,7 @@ fn slot_of(state: &ShardState, id: DbVolumeId) -> Result<Handle<VolumeSlot>, Ref
 fn image_base(record: &VolumeRecord) -> Result<(DbVolumeId, DbSnapshotId), Refusal> {
   match &record.base {
     BaseRecord::Image { volume, snapshot } => Ok((*volume, *snapshot)),
-    BaseRecord::Scratch | BaseRecord::Path { .. } => Err(Refusal::ImageRefused {
+    BaseRecord::Scratch | BaseRecord::Path { .. } | BaseRecord::S3 { .. } => Err(Refusal::ImageRefused {
       reason: "not an image volume: it was not built from a snapshot".to_owned(),
     }),
   }

@@ -488,6 +488,7 @@ RequestBody 93 AdmitWork
 RequestBody 94 MoveWorkFloor
 RequestBody 95 SubmitComputed
 RequestBody 96 SessionLog
+RequestBody 97 CreateOverS3
 Residency 0 DaemonRam
 Residency 1 DaemonRamAndKernelCache
 Residency 2 DaemonRamKernelCacheAndRuntimeVm

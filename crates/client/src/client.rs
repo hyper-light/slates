@@ -3809,6 +3809,29 @@ impl Client {
     }
   }
 
+  /// Creates a volume laid over the objects of the S3 base `base` (A-555), its fetches signed with `credential`, which
+  /// the daemon holds in RAM and never records. `spec`'s `base` is not read: the S3 base is the volume's base.
+  pub fn create_over_s3(
+    &mut self,
+    spec: &CreateSpec,
+    base: &slates_ipc::protocol::S3BaseSpec,
+    credential: &slates_ipc::protocol::S3Credential,
+  ) -> Result<VolumeId, ClientError> {
+    match self.call(&RequestBody::CreateOverS3 {
+      name: spec.name.clone(),
+      size: spec.size,
+      names: spec.names,
+      require_locked: spec.require_locked,
+      base: base.clone(),
+      credential: credential.clone(),
+    })? {
+      ReplyBody::Created { id } => Ok(id),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "create over S3",
+      }),
+    }
+  }
+
   /// Takes a snapshot; its id.
   pub fn snapshot(&mut self, volume: VolumeId) -> Result<SnapshotId, ClientError> {
     self.snapshot_with_coverage(volume).map(|(id, _)| id)
