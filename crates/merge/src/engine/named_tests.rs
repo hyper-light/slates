@@ -249,3 +249,196 @@ fn a_run_two_files_make_is_copied_never_moved_twice() {
   assert_eq!(green.content("a"), Some(bytes.as_slice()));
   assert_eq!(green.content("b"), Some(bytes.as_slice()));
 }
+
+/// A-760 part 2's bug, found 2026-11-20 closing A-760 (C1). Do: a work whose file `a` is the whole of named run 0 (its
+/// buffer moved into the file at the commit) and whose file `b` is the first five bytes of run 1, addressed past run 0
+/// in the post-state's one address space; judge it with `judge_named` and commit. Expect: `a` run 0's bytes and `b` run
+/// 1's first five. Before the fix the commit moved run 0's buffer out before making `b`, so every later run's bytes moved
+/// down by run 0's length and `b` was read from the wrong place.
+#[test]
+fn a_run_moved_into_its_file_leaves_later_runs_where_they_were() {
+  let first = b"the first text, moved whole".to_vec();
+  let second = b"second text, of which five bytes".to_vec();
+  let mut plane = Plane::default();
+  let first_object = plane.put(first.clone());
+  let second_object = plane.put(second.clone());
+  let journal = vec![
+    VolumeOp::Create {
+      path: "a".to_owned(),
+    },
+    VolumeOp::Extend {
+      path: "a".to_owned(),
+      at: 0,
+      len: first_object.len,
+    },
+    VolumeOp::Create {
+      path: "b".to_owned(),
+    },
+    VolumeOp::Extend {
+      path: "b".to_owned(),
+      at: 0,
+      len: 5,
+    },
+  ];
+  let (doc, _) = compose_volume_planned(&Base::of_files(Vec::new()), &journal).unwrap();
+  let mut work = Increment {
+    id: [5; 32],
+    base: 0,
+    doc,
+    post_state: Vec::new(),
+    evidence: Vec::new(),
+    named: Default::default(),
+  };
+  assert_eq!(
+    work.push_named(NamedRun {
+      identity: first_object,
+      offset: 0,
+      len: first_object.len,
+    }),
+    Some(0)
+  );
+  assert_eq!(
+    work.push_named(NamedRun {
+      identity: second_object,
+      offset: 0,
+      len: second_object.len,
+    }),
+    Some(first_object.len)
+  );
+  while !work.read_step(&plane, 8).unwrap() {}
+  let mut green = Green::new();
+  let super::Judgment::Accepted(judged) = green.judge_named(&mut work) else {
+    panic!("not accepted");
+  };
+  green.commit_judged(judged).unwrap();
+  assert_eq!(green.content("a"), Some(first.as_slice()));
+  assert_eq!(green.content("b"), second.get(..5));
+}
+
+/// A-760's last piece (C1, 2026-11-20: "a partial splice of a run copies at the commit"). Do: a green holding a 1 MiB
+/// file; a work that overwrites 5 bytes in its middle from named run 0 and creates a file of the whole of named run 1;
+/// judge it with `judge_named`, make its files with `make_step` a 64 KiB slice a step, then commit. Expect: no step
+/// copies more than its slice, and the steps together copy the spliced file once (1 MiB); the commit makes no file
+/// (`mapped_files_made` unmoved, `files_made_in_steps` one more); the spliced file is the base with run 0's five bytes
+/// in its middle, the created one run 1's bytes in run 1's own buffer.
+#[test]
+fn a_splice_into_a_large_file_is_made_a_slice_a_step_before_its_commit() {
+  const FILE: usize = 1 << 20;
+  const SLICE: u64 = 64 << 10;
+  let base: Vec<u8> = (0..FILE)
+    .map(|at| u8::try_from(at % 251).unwrap())
+    .collect();
+  let mut green = Green::new();
+  let (doc, _) = compose_volume_planned(
+    &Base::of_files(Vec::new()),
+    &[
+      VolumeOp::Create {
+        path: "big".to_owned(),
+      },
+      VolumeOp::Extend {
+        path: "big".to_owned(),
+        at: 0,
+        len: FILE as u64,
+      },
+    ],
+  )
+  .unwrap();
+  let seed = Increment {
+    id: [1; 32],
+    base: 0,
+    doc,
+    post_state: base.clone(),
+    evidence: Vec::new(),
+    named: Default::default(),
+  };
+  let super::Judgment::Accepted(seeded) = green.judge_named(&mut seed.clone()) else {
+    panic!("the seed was not accepted");
+  };
+  green.commit_judged(seeded).unwrap();
+
+  let whole = b"a whole text, moved".to_vec();
+  let splice = b"FIVE!".to_vec();
+  let mut plane = Plane::default();
+  let whole_object = plane.put(whole.clone());
+  let splice_object = plane.put(splice.clone());
+  let middle = (FILE / 2) as u64;
+  let (doc, _) = compose_volume_planned(
+    &Base::of_files(vec![("big".to_owned(), FILE as u64)]),
+    &[
+      VolumeOp::Create {
+        path: "new".to_owned(),
+      },
+      VolumeOp::Extend {
+        path: "new".to_owned(),
+        at: 0,
+        len: whole_object.len,
+      },
+      VolumeOp::Overwrite {
+        path: "big".to_owned(),
+        at: middle,
+        len: 5,
+      },
+    ],
+  )
+  .unwrap();
+  let mut work = Increment {
+    id: [2; 32],
+    base: 1,
+    doc,
+    post_state: Vec::new(),
+    evidence: Vec::new(),
+    named: Default::default(),
+  };
+  // The composed post-state holds `big`'s five bytes first, then `new`'s (its ops' sources): the runs in that order.
+  assert_eq!(
+    work.push_named(NamedRun {
+      identity: splice_object,
+      offset: 0,
+      len: splice_object.len,
+    }),
+    Some(0)
+  );
+  assert_eq!(
+    work.push_named(NamedRun {
+      identity: whole_object,
+      offset: 0,
+      len: whole_object.len,
+    }),
+    Some(splice_object.len)
+  );
+  while !work.read_step(&plane, 8).unwrap() {}
+  let whole_buffer = work.post().runs[1].as_ptr();
+  let super::Judgment::Accepted(mut judged) = green.judge_named(&mut work) else {
+    panic!("not accepted");
+  };
+  let (made_before, stepped_before) = (green.mapped_files_made(), green.files_made_in_steps());
+  let mut copied = 0u64;
+  let mut steps = 0u64;
+  loop {
+    let made = green.make_step(&mut judged, SLICE).unwrap();
+    assert!(made.copied <= SLICE, "a step copied {} bytes", made.copied);
+    copied += made.copied;
+    steps += 1;
+    if made.done {
+      break;
+    }
+  }
+  assert_eq!(copied, FILE as u64, "the spliced file copied once");
+  assert!(steps >= FILE as u64 / SLICE, "{steps} steps");
+  assert_eq!(green.commit_judged(judged).map(|(v, _)| v), Ok(2));
+  assert_eq!(
+    green.mapped_files_made(),
+    made_before,
+    "the commit made a file"
+  );
+  assert_eq!(green.files_made_in_steps(), stepped_before + 1);
+  let mut expected = base;
+  expected[FILE / 2..FILE / 2 + 5].copy_from_slice(&splice);
+  assert!(
+    green.content("big") == Some(expected.as_slice()),
+    "the spliced file differs"
+  );
+  let created = green.content("new").unwrap();
+  assert_eq!(created, whole.as_slice());
+  assert_eq!(created.as_ptr(), whole_buffer, "the whole run was copied");
+}

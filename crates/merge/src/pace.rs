@@ -19,15 +19,14 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
-/// A deadline no clock reaches: an unbounded turn's.
-const UNBOUNDED: u64 = u64::MAX;
-
 /// A turn's figures: what [`Pace`] keeps, and lends a drive.
 #[derive(Clone, Copy, Debug)]
 struct Turn {
-  /// The deadline in the clock's nanoseconds; [`UNBOUNDED`] for none.
-  deadline: u64,
-  /// Whether the turn has not yet run a unit: its first always runs.
+  /// The turn's step (A-783, `slates_pace::Step`): none for an unbounded pace, which never ends a turn.
+  step: Option<slates_pace::Step>,
+  /// Each unit kind's measured cost ([`KINDS`]) and the probe's, kept across turns.
+  costs: slates_pace::Costs<KINDS>,
+  /// Whether the turn has not yet run a unit.
   fresh: bool,
   /// Whether the turn began at its owner's mark ([`Pace::turn_from`]): its first ask measures the opening.
   opened: bool,
@@ -43,6 +42,25 @@ struct Turn {
   opening: u64,
   /// The bytes a unit may copy or hash this turn ([`Slices`]).
   slices: Slices,
+}
+
+/// The engine's unit kinds, each with its own cost estimate (A-783): a build's walk entry, a base path, a unit of the
+/// deriver's composition, a unit of the post-state and one of the identity.
+pub const KINDS: usize = 5;
+/// A walk's entry ([`KINDS`]).
+pub const WALK: usize = 0;
+/// A named path's base entries.
+pub const BASE: usize = 1;
+/// A unit of the deriver's composition.
+pub const COMPOSE: usize = 2;
+/// A unit of the post-state.
+pub const POST: usize = 3;
+/// A unit of the identity's hash.
+pub const HASH: usize = 4;
+
+/// Whether anyone waits, for a pace with no probe of its own ([`Pace::turn`]): always, so it yields at its quantum.
+fn always() -> bool {
+  true
 }
 
 /// The bytes one unit may move this turn, its owner's derived slices (R3: the merge engine measures no machine, so its
@@ -72,7 +90,8 @@ fn never() -> u64 {
 impl Turn {
   /// A turn that never ends and reads no clock.
   const UNBOUNDED: Turn = Turn {
-    deadline: UNBOUNDED,
+    step: None,
+    costs: slates_pace::Costs::ZERO,
     fresh: true,
     opened: false,
     clock: never,
@@ -83,23 +102,24 @@ impl Turn {
     slices: Slices::WHOLE,
   };
 
-  /// Whether another unit runs this turn ([`Pace::more`]).
-  fn more(&mut self) -> bool {
+  /// Whether another unit of `kind` runs this turn ([`Pace::more`]).
+  fn more(&mut self, kind: usize) -> bool {
     let (fresh, opened) = (self.fresh, self.opened);
     self.fresh = false;
     self.opened = false;
-    let granted = if self.deadline == UNBOUNDED {
-      true
-    } else {
-      let now = (self.clock)();
-      let since = now.saturating_sub(self.asked_at);
-      if opened {
-        self.opening = since;
-      } else if !fresh {
-        self.longest_unit = self.longest_unit.max(since);
+    let granted = match self.step.as_mut() {
+      None => true,
+      Some(step) => {
+        let now = (self.clock)();
+        let since = now.saturating_sub(self.asked_at);
+        if opened {
+          self.opening = since;
+        } else if !fresh {
+          self.longest_unit = self.longest_unit.max(since);
+        }
+        self.asked_at = now;
+        step.more_at(now, kind, &mut self.costs)
       }
-      self.asked_at = now;
-      fresh || opened || now < self.deadline
     };
     if granted {
       self.units = self.units.saturating_add(1);
@@ -146,31 +166,59 @@ impl Pace {
     answer
   }
 
-  /// Begins a turn that ends once `clock` passes `deadline_ns`: its first unit runs whatever the clock says.
+  /// Begins a turn that yields at `deadline_ns` (as though someone always waits): its first unit runs whatever the
+  /// clock says, and a unit whose estimate would end past the deadline does not.
   pub fn turn(&self, deadline_ns: u64) {
     self.with(|turn| {
-      turn.deadline = deadline_ns;
+      let now = (turn.clock)();
+      let quantum_ns = deadline_ns.saturating_sub(now);
+      let env = slates_pace::Env {
+        clock: turn.clock,
+        waiting: always,
+        quantum_ns,
+        ceiling_ns: quantum_ns,
+        target_ppm: 1,
+      };
+      turn.step = Some(slates_pace::Step::begin(env, now));
       turn.fresh = true;
       turn.opened = false;
     });
   }
 
-  /// [`Pace::turn`] for a turn its owner began at `began_ns` on the clock: what the owner did before its first ask is the
-  /// turn's opening ([`Pace::opening_ns`]), the units between its asks ([`Pace::longest_unit_ns`]), and what follows
-  /// its last ask ([`Pace::asked_at_ns`]) its owner's again.
-  pub fn turn_from(&self, began_ns: u64, (deadline_ns, slices): (u64, Slices)) {
+  /// A turn its owner began at `began_ns` on `env`'s clock, paced by `env` (A-783: units while the quantum has room,
+  /// another quantum while no one waits, to the ceiling), each unit moving at most `slices`: what the owner did before
+  /// its first ask is the turn's opening ([`Pace::opening_ns`]), the units between its asks ([`Pace::longest_unit_ns`]),
+  /// and what follows its last ask ([`Pace::asked_at_ns`]) its owner's again.
+  pub fn turn_from(&self, began_ns: u64, (env, slices): (slates_pace::Env, Slices)) {
     self.with(|turn| {
+      turn.clock = env.clock;
+      turn.step = Some(slates_pace::Step::begin(env, began_ns));
       turn.slices = slices;
-      turn.deadline = deadline_ns;
       turn.fresh = false;
       turn.opened = true;
       turn.asked_at = began_ns;
     });
   }
 
-  /// Whether another unit runs this turn: the turn's first, or any before the deadline. A unit granted is counted.
-  pub fn more(&self) -> bool {
-    self.with(Turn::more)
+  /// What the turn's step did (A-783): its units, the quanta it took, its asks and how it stopped.
+  pub fn step_report(&self) -> Option<slates_pace::Report> {
+    self.turn.get().step.map(|step| step.report())
+  }
+
+  /// What decides `kind`'s cost estimate now, for its owner's log (A-783).
+  pub fn unit_inputs(&self, kind: usize, target_ppm: u64) -> Option<slates_pace::Inputs> {
+    self
+      .turn
+      .get()
+      .costs
+      .units
+      .get(kind)
+      .map(|cost| cost.inputs(target_ppm))
+  }
+
+  /// Whether another unit of `kind` runs this turn (A-783, [`slates_pace::Step::more`]). A unit granted is counted.
+  pub fn more(&self, kind: usize) -> bool {
+    self.with(|turn| turn.more(kind))
   }
 
   /// One turn of `work`, which ticks this pace's turn ([`Ticks::tick`]): its output once done, else pending until the
@@ -235,7 +283,7 @@ impl Future for Tick {
   fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
     let granted = LENT.with(|lent| match lent.get() {
       Some(mut turn) => {
-        let granted = turn.more();
+        let granted = turn.more(COMPOSE);
         lent.set(Some(turn));
         granted
       }
