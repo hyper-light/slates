@@ -153,3 +153,17 @@ Started 2026-11-19 ~21:40 PST. Reads: brief, common.md, relaunch notes, g088v, g
   sandbox::isolated` 20/20 at base 2f589baa6 and again on the merged tree (base 5bd0de7d8). Target trimmed.
 - w-k90-microvm is DONE: items 1 and 2 complete (UI to mark: main), D288 on Shards main, item 3's KVM proof with
   w-k90-kvm, WHP blocked. Nothing running, nothing unpushed.
+
+## 2026-11-20 evening: w-fed-move's three kiln bugs (main's 15:20 assignment) -- ALL LANDED, kiln main 65a603aed
+- 99f05c3d4 (findings 1 + 4, workspace/slates.rs): a busy mount is asked again once each holder `lsof` names has ended
+  (os::watch::exited, within BUSY_PATIENCE = 120 s by rt::timeout), past it refused busy by kind (MountStays);
+  a workspace's first mount waits on Slates' Error::Retry (LeaseUnconfirmed) as the moved volume's mount does (one
+  rule, `after_refusal`). Red: fed_move_a_mount_held_busy... FAILED ("busy, held by 88916 git"); fed_move_a_first_mount...
+  failed by mutation (left Refused, right Again(250ms)).
+- a6a65148c (finding 3, harness/session.rs): each move asked keeps its own notice (`move-pending-<n>`), each refusal
+  kept with its count ("(refused move k)"). Red by mutation (left 1 notice, right 3).
+- Tests, macOS arm64, this Mac, local: `--lib -- fed_move_ w3_ workspace::slates harness::session` 129 passed (base
+  c0f576eb3), 130 on the merged tree (base 648c57184); clippy -p kiln --lib --tests: none in these files.
+- Seen on main, not mine (reported): clippy's disallowed rt::sleep in workspace/container.rs (since allowed by main),
+  tests/slates_fleet_live_move.rs `last` + redundant closure (695), tests/slates_roles.rs `Made.shared` (fixed by main 4aa0ee778).
+- Worktree removed, target trimmed.
