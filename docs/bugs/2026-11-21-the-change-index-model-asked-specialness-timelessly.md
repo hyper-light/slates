@@ -41,8 +41,9 @@ the checkpoint suite intermittent on main.
 |---|---|---|
 | checkpoint | 25 | 0 |
 | engine | 10 | 0 |
-| changed_since_cost | 10 | 0 |
 | slates-merge lib | 5 | 0 |
+
+`changed_since_cost`, which reads the model too, holds only an ignored cost run, so it was not counted.
 
 ## Siblings, reported
 `Green::index_restored_changes` notes a restored link at its target's last change when `was_special(target)` holds at
