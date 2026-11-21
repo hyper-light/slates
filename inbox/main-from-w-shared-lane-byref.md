@@ -196,3 +196,9 @@ identity) and the slicing, re-measured at these five sizes x 10.
   its store; not had whole is Overloaded, nothing started. Red test: an 8 MiB holder submit's forwarded request under
   64 KiB and the owner fetching it once. Server crate type-checks; the A-number gets claimed in amendments.tsv before
   any doc names it. Then the release bench at 64-512 MiB x 10 on it.
+
+## 10:22 PST: r23: A-825 is an improvement, not the cause; 320 MiB and above fails before and after it, under load
+- Interleaved A/B, big Studio, load 12-24, 3 rounds, 895b80994 (before) vs 545cf46c5 (A-825), release holder route:
+  256 MiB: 3/3 both; owner step 667-681 ms before, 437-476 ms after; late beat 1.19-1.21 s every round before, 0.55 s
+  twice and none once after; wall 3.5-4.3 s before, 3.3-3.4 s after. 320 and 512 MiB: 0/3 both (before also one exit 4).
+- GAPS line on agents/w-shared-3b, commit a5402c4c8 (my kiln message said ffa3b5c by mistake). A-826 closes it.
