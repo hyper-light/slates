@@ -70,6 +70,20 @@ the hypothesis (the fold's tail held the reply) is NOT confirmed; added median 2
 - Run requests for main: the Linux smaps arm (resident::tests::a_mapping_read_whole_agrees_with_its_page_walk on
   Linux), the Windows build of resident.rs's fallback arm, xtask unsafe (slates-mem 87), clippy.
 
+## 2026-11-21: 85a's two named costs (main's order), counted and A/B'd -- docs landed f656820d3
+- w-lint's three reds on 7ac3900ee fixed and landed cdbcc722f (smaps via rustix; slates-mem budget 88; live_fleet's two
+  fixed-window sleeps removed).
+- Exchange on the data shard (one shard a daemon): REJECTED (Linux -15 us, Studio +10 us at the median).
+- The reply's "65 us wake" was each run's one 100.45 ms first reply (the record period) averaged over 2,051 writes; per
+  write 6-8 us. Poll-while-due: REJECTED (no gain).
+- Linux legs ran as GitHub CI diag runs: branches diag-g228-live-1..9 (workflow .github/workflows/diag-g228.yml on those
+  branches only), results pushed to diag-results/diag-g228-live-N-<run>; read with `git fetch`.
+- Experiment branches deleted (agents/g228-one-shard-probe, agents/g228-reply-split); their commits stay in my clone.
+- Next: per-write percentiles of each hop (the hop counters are sums, which one long write skews), then cut the largest
+  (the entry's build ~45-90 us mean, the exchange ~50-170 us mean).
+
+## For main to delete (diagnostics): remote branches diag-g228-live-1..9 once main has read their results.
+
 ## 85a STILL OPEN -- blocked on main's decision (sent): a plain status request arms a tens-of-GiB mincore sweep on every
 shard (about a core per daemon for >1 s after a status burst; up to half a quantum per idle slice on the next message).
 Proposed: arm the background sweep only for a request asking for the memory report (a DaemonStatus field: wire change),
