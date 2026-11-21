@@ -13,3 +13,11 @@
   long paths; clone, push, pull, tags, fsck, byte-compare). It's modeled on crates/cli/bench/hg_push_profile.sh:
   release `slates anchor --vcs-http 127.0.0.1:0 --vcs-store DIR`, a token from `slates credential token`, and stock
   git with a bearer header.
+
+## Round 1 (2026-11-21 ~11:45 PST): the test landed; the jupiter round is yours (§8)
+- LANDED c66f7160 (merge 8f44f7e2): crates/cli/tests/git_interop.rs `stock_git_carries_windows_paths_byte_identically`,
+  #[ignore]d next to the existing git/git session (stock_git_carries_a_whole_repository_over_each_edge).
+- Focused proof on macOS: Adas-Mac-Studio-2, Apple Git 2.50.1, debug, base e0079c7: 1 passed in 14.87 s, fmt clean.
+- run-requests.md (8f44f7e2 entry): the jupiter round, both tests, release build, after 5db34aab0 lands and C: has room.
+- Stopped per your 10:48 correction: r11 (never started) and r12 (git/git download on jupiter; its partial folder is
+  deleted). I'm stopping now. hg waits on Ada.

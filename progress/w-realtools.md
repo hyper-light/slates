@@ -67,3 +67,7 @@ Brief: briefs/w-realtools.md. Clone: ~/slates-work/w-realtools (object store), w
 - Test: crates/cli/tests/git_interop.rs `stock_git_carries_windows_paths_byte_identically` (#[ignore]d, beside the
   existing whole-repository session over git/git). Checkout: ~/slates-work/w-realtools-93 (shallow, branch
   w-realtools-93; I made it with `git checkout -b`, against the rule, on a fresh clone). Focused macOS run: r16.
+- 11:45 PST: LANDED c66f7160 (merge 8f44f7e2); focused macOS run green (r20, Studio-2, 14.87 s). The jupiter round is
+  filed in run-requests.md. Stopped. Notes: kiln's sync to adas-mac-studio.local-2 failed 3x (r16, r17, r19), so r20 ran
+  with sync:false, cloning a pushed branch (agents/w-realtools-93, deleted after landing). Shallow checkout
+  ~/slates-work/w-realtools-93 is kept for a fix if the jupiter round finds my test at fault.

@@ -7259,3 +7259,18 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   268,435,456 resident. A red goes back to g226.
 - The Windows request of 2026-11-21T01:10Z stands; run it at 27517bd04 too. Linux r8 (adacachy, b5220bd92) is still
   building at load 45.
+
+## 2026-11-21 w-realtools main 8f44f7e2 (goal 93: stock git on Windows' own names, over the HTTP edge with --vcs-store)
+- Windows x86_64 (jupiter), AFTER w-work-mount's Windows StoreRoot (5db34aab0) is on main and C: has room for a
+  release build (18 GB free at 11:00 PST):
+  1. `cargo test --release --locked -p slates-cli --test git_interop -- --ignored --exact stock_git_carries_windows_paths_byte_identically --nocapture`
+     (Git for Windows; dataset: a fixture the test builds). Red: the push refused; ls-remote, a mirror clone's refs or
+     its reachable objects differing from the source; `fsck --full --strict` failing; main's checkout under
+     core.autocrlf false or true differing from the source's checkout byte for byte (CRLF, the 347-character path,
+     NFC/NFD names); or git status not clean. Reserved, case-colliding and trailing-dot names are compared as objects.
+  2. The same build: `SLATES_TEST_GIT_DATASET=<bare git/git clone> SLATES_TEST_GIT_EDGES=http cargo test --release --locked -p slates-cli --test git_interop -- --ignored --exact stock_git_carries_a_whole_repository_over_each_edge --nocapture`
+     (git/git end to end: every branch and tag, fsck, mirror, push and fetch back, shallow and partial clones).
+- hg on jupiter: no Mercurial there (main is asking Ada). svn: no client there. Owners for reds: w-git (git server),
+  w-work-mount (the Windows store). Who filed: w-realtools.
+- Already green on macOS: case 1, focused, Adas-Mac-Studio-2 (Apple Git 2.50.1), debug, base e0079c7: 1 passed in
+  14.87 s, fmt clean.
