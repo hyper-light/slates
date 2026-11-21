@@ -13,8 +13,9 @@
 //! repository named by its stream's UUID record (`svn_fs_set_uuid`, `load-fs-vtable.c` `uuid_record`); and
 //! [`Record::RevisionProperties`], a revision's properties set whole (`svn_fs_change_rev_prop2` for each difference),
 //! as an import sets revision 0's to its stream's (`close_revision`); [`Record::Locks`], the lock entries a lock verb
-//! made (`lock`, `lock-many`, `unlock`, `unlock-many`; A-693 part 2); and [`Record::Deltified`], a stored text kept as a
-//! delta from then on, its whole bytes released (the deltify job).
+//! made (`lock`, `lock-many`, `unlock`, `unlock-many`; A-693 part 2). The deltify job's record, a stored text kept as a
+//! delta in RAM from then on, is retired (C2 stage B part 2 (b), 2026-11-21: history lives on the node's store, so no
+//! record moves a text into RAM); its kind byte is refused [`RecordRefused::Retired`].
 //!
 //! **The encoding**, little-endian as a green's chain entry and A-662's git record are: the magic, the version and a
 //! kind byte; a creation's UUID, its 36 bytes, and its date; a revision's head, its transaction, its rows, its
@@ -69,7 +70,8 @@ const UUID_SET: u8 = 2;
 const PROPERTIES_SET: u8 = 3;
 /// Format: the kind byte of lock entries made by a lock verb alone, no revision with them (A-693 part 2).
 const LOCKS_SET: u8 = 4;
-/// Format: the kind byte of a stored text kept as a delta from now on (the deltify job, main's ruling on A-761).
+/// Format: the kind byte the retired deltify record had (main's ruling on A-761; retired by C2 stage B part 2 (b)): never
+/// written, refused [`Retired::Deltified`] where a log written before holds one.
 const DELTIFIED: u8 = 5;
 
 /// Format: the byte that marks an optional part absent, and a mark unset.
@@ -150,17 +152,15 @@ pub enum Record {
   /// Lock entries a lock verb made, in the order they are applied, no revision with them (`svn_fs_lock_many`,
   /// `svn_fs_unlock_many` through `lock`, `lock-many`, `unlock`, `unlock-many`; A-693 part 2).
   Locks(Vec<LockEntry>),
-  /// A text a commit stored in the content store (A-761), kept by the records as a delta from now on, its whole bytes
-  /// released: the deltify job's entry (main's ruling on A-761; GAPS' A-727 (c)). The delta is an svndiff of version 2
-  /// that makes the text from its base, as the records keep every other text (S4 c2).
-  Deltified {
-    /// The text's identity.
-    text: ContentIdentity,
-    /// The text the delta is against: its node's skip-delta predecessor's, none for a first version.
-    base: Option<ContentIdentity>,
-    /// The delta's bytes.
-    delta: Vec<u8>,
-  },
+}
+
+/// A record kind this build no longer reads: what a log written before its retirement holds ([`RecordRefused::Retired`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Retired {
+  /// The deltify job's record (main's ruling on A-761): a stored text kept by the records as a delta in RAM from then
+  /// on. Retired by C2 stage B part 2 (b) (2026-11-21, main's ruling of 09:20): a text is its changeset's on the node's
+  /// store and nothing keeps it in RAM, so such a record names a form no repository keeps.
+  Deltified,
 }
 
 /// Why bytes were refused as a record. A refused record replays nothing.
@@ -194,6 +194,8 @@ pub enum RecordRefused {
   Identity,
   /// Bytes after the last item.
   Trailing,
+  /// A record of a kind this build retired ([`Retired`]): the log was written before it.
+  Retired(Retired),
 }
 
 impl Record {
@@ -227,19 +229,6 @@ impl Record {
         for entry in entries {
           put_lock_entry(&mut out, entry);
         }
-        out
-      }
-      Self::Deltified { text, base, delta } => {
-        let mut out = header(DELTIFIED);
-        out.extend_from_slice(text);
-        match base {
-          Some(base) => {
-            out.push(PRESENT);
-            out.extend_from_slice(base);
-          }
-          None => out.push(ABSENT),
-        }
-        put_bytes(&mut out, delta);
         out
       }
     }
@@ -278,19 +267,7 @@ impl Record {
         properties: properties(&mut reader)?,
       },
       LOCKS_SET => Self::Locks(lock_entries(&mut reader)?),
-      DELTIFIED => {
-        let text = reader.array()?;
-        let base = if reader.mark()? {
-          Some(reader.array()?)
-        } else {
-          None
-        };
-        Self::Deltified {
-          text,
-          base,
-          delta: reader.bytes()?,
-        }
-      }
+      DELTIFIED => return Err(RecordRefused::Retired(Retired::Deltified)),
       byte => return Err(RecordRefused::Tag { byte }),
     };
     if !reader.rest.is_empty() {

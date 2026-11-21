@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use super::{Record, RecordRefused};
+use super::{Record, RecordRefused, Retired};
 use crate::commit::revision::Revision;
 use crate::dump::Uuid;
 use crate::index::{Action, ChangedPath, CopySource, NodeKind, PropertyList, RevisionRecord, Text};
@@ -540,41 +540,19 @@ fn a_version_one_revision_reads_back_with_no_stored_texts() {
   assert_eq!(Record::decode(&older), Ok(Record::Revision(expected)));
 }
 
-/// The deltify job's entry (main's ruling on A-761; w-perf's C1). Do: write a deltified text's record with a base and one
-/// without; read each back; read every truncation of each; read one whose base mark is neither absent nor present.
-/// Expect: the bytes pinned (the header, the text's identity, the mark, the base, the delta's length and bytes), each
-/// read back as written, every truncation refused `Truncated`, and the bad mark refused as a tag.
+/// The deltify job's record, retired (C2 stage B part 2 (b), main's ruling of 2026-11-21 09:20). Do: read the bytes a
+/// log written before held for a deltified text, with a base and without, and with nothing after the kind byte.
+/// Expect: each refused [`Retired::Deltified`], typed by the kind it names, never read as another record or a bad tag.
 #[test]
-fn a_deltified_texts_record_is_pinned_read_back_and_refused_by_kind() {
+fn a_retired_deltified_record_is_refused_typed_by_its_kind() {
   let text = [7u8; 32];
   let base = [9u8; 32];
-  let with_base = Record::Deltified {
-    text,
-    base: Some(base),
-    delta: HELLO.to_vec(),
-  };
-  let without = Record::Deltified {
-    text,
-    base: None,
-    delta: Vec::new(),
-  };
-  let pinned = [head_of(5).as_slice(), &text, &[1], &base, &long(5), HELLO].concat();
-  assert_eq!(with_base.encode(), pinned);
-  assert_eq!(
-    without.encode(),
-    [head_of(5).as_slice(), &text, &[0], &long(0)].concat()
-  );
-  for record in [with_base, without] {
-    let bytes = record.encode();
-    assert_eq!(Record::decode(&bytes), Ok(record));
-    for end in 0..bytes.len() {
-      assert!(Record::decode(&bytes[..end]).is_err(), "cut at {end}");
-    }
+  let with_base = [head_of(5).as_slice(), &text, &[1], &base, &long(5), HELLO].concat();
+  let without = [head_of(5).as_slice(), &text, &[0], &long(0)].concat();
+  for bytes in [with_base, without, head_of(5)] {
+    assert_eq!(
+      Record::decode(&bytes),
+      Err(RecordRefused::Retired(Retired::Deltified))
+    );
   }
-  let mut bad_mark = pinned.clone();
-  bad_mark[9 + 32] = 2;
-  assert_eq!(
-    Record::decode(&bad_mark),
-    Err(RecordRefused::Tag { byte: 2 })
-  );
 }
