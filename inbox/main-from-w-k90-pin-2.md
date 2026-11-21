@@ -23,3 +23,9 @@
    windows-11-arm: build + lib Slates tests green, vendored/slates_roles red (exit 101; repro r145 queued on jupiter).
 8. Every clippy leg is red on crates/kiln/src/workspace/container.rs:301 `crate::rt::sleep` (disallowed_methods),
    w-k90-containers' A-520 piece 5. Not mine; for the lint keeper / w-k90-containers.
+
+## ~01:15 PST 11-21
+9. GREEN Linux x86-64: GitHub run 44851246181 job 136703754443 (kiln 4f5e58c1b). macOS arm64 green as before.
+10. LANDED 482bd01f8 (Linux arm64 links with the toolchain's lld: GNU ld failed kiln's link after a 90-min build) and
+    60c0b27c5 (vendored test reads Cargo.lock as LF: windows-11-arm failed 2/11 on a CRLF checkout; local 11/11 LF+CRLF).
+    Next started GitHub main run should give Linux arm64 + Windows arm64. Windows x86-64 waits on w-k90-win.
