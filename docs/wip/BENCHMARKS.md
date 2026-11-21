@@ -16916,3 +16916,30 @@ read too (`push.build.turns`, both sides).
 384 µs; 189.6 µs, 393 µs; 184.5 µs, 2,788 µs; 437.0 µs, 2,484 µs. **Not met:** the median is 3.7-8.7x the 50 µs goal,
 and p999 is under 1 ms in 3 of 5 rounds. Linux was not measured: adacachy's run froze in its cgroup at load 68-71
 (`do_freezer_trap`) and was stopped unbuilt.
+
+## A-697's release bench at 64 to 320 MiB: exit 4 found and fixed (2026-11-20, w-shared; main's close list)
+
+`SLATES_A697_BENCH_FRESH=1 SLATES_A697_BENCH_MIB=<n> SLATES_A697_BENCH_RUNS=1 cargo test --release -p slates-server --test
+fleet bench_a697 -- --ignored --nocapture --test-threads=1`, one run each.
+
+Before (main `90e9b72`, this MacBook at load 42 to 60; and main `6f29c8d`, Studio-1 at load 3.7, 128 MiB): exit 4 at
+128, 256 and 320 MiB (exit 101 at 64 MiB on the MacBook, with a 1,652 ms poll). The watchdog: shard 1 spinning 1,009 to
+1,201 ms of CPU in one poll of the session's first submit. `/usr/bin/sample`: 997 of the shard's busy samples at the top
+of the stack in `slates_merge::derive::split_at`, the deriver's walk of a flat piece list for every op.
+
+After (`ffb2a65`, the deriver's blocked piece list; Studio-1, load 2.9 to 4.2), every size passes:
+
+| MiB | kind | wall | compose | forward | judge | append | place | recompute |
+|---|---|---|---|---|---|---|---|---|
+| 64 | holder | 514 ms | 42.7 | 428.2 | 3.9 | 63.2 | 123.0 | 2.3 |
+| 64 | local | 330 ms | 36.4 | — | 3.9 | 63.7 | 165.3 | 4.0 |
+| 128 | holder | 1,025 ms | 87.6 | 848.9 | 8.9 | 126.2 | 242.0 | 4.7 |
+| 128 | local | 650 ms | 75.1 | — | 8.0 | 125.6 | 322.8 | 7.8 |
+| 256 | holder | 3,093 ms | 175.5 | 2,737.0 | 16.8 | 236.8 | 492.5 | 9.4 |
+| 256 | local | 1,319 ms | 148.1 | — | 16.1 | 256.7 | 657.1 | 16.2 |
+| 320 | holder | 3,497 ms | 237.6 | 3,046.5 | 21.5 | 296.8 | 593.3 | 11.2 |
+| 320 | local | 1,618 ms | 179.1 | — | 20.2 | 314.8 | 805.9 | 19.5 |
+
+(Phases in ms.) What remains: the holder's forward is most of its wall time, about 105 to 150 MB/s, against the
+transport's 1.3 GB/s on the bulk row; and the control shard's beat task ran 520 to 1,381 ms late during the larger
+forwards (near misses: the watchdog's own beat held).

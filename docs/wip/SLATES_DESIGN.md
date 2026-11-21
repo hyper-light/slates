@@ -58663,3 +58663,31 @@ declined).
   `vcs_store::commits::tests` fail alike on origin/main 17bb639aa without this change (a submit refused `Overloaded`),
   and `content_ranges`' sweep test passes alone on both. `cargo clippy` of the touched crates' libraries: nothing in a
   touched line.
+
+### §4.16 amended — A path's composition finds each op's offset in about √ops steps, new runs merged as made (2026-11-20, w-shared for UI goal 93; main's close list, exit 4 at 64 MiB)
+Applied in the same change to: §4.16 "Composition at seal" (the deriver's shape), GAPS (the sweep's exit 4 line),
+`crates/merge/src/derive.rs` (`PieceList`, `apply`, `compose_content_sized`, `compose_examined`),
+`crates/merge/tests/derive.rs`.
+- **What was measured.** A-697's release bench, one fresh submit of 128, 256 and 320 MiB: the watchdog ended the daemon
+  (exit 4), shard 1 spinning 1,009 to 1,201 ms of CPU in one poll of the session's first submit (`identities.rs:243`,
+  which runs the submit inline once the session's identities are read), on this MacBook at load 42 to 60 and on
+  Studio-1 at load 3.7. `/usr/bin/sample` on Studio-1: 1,001 of the shard's 1,011 busy samples in `work_home::need_of`,
+  997 at the top of the stack in `slates_merge::derive::split_at`.
+- **Why.** The deriver kept a path's file as a flat list of pieces and, for every declared op, walked the list from its
+  front to find the op's offset, then inserted into it. A file written a few KiB a write has as many ops as writes, so
+  its composition cost the square of its writes. The module's own note had named the replacement, a measured one owed.
+- **Change.** The list is kept in blocks of pieces, each knowing its length (`PieceList`), so an offset is found by
+  walking the blocks, then one block's pieces; a block splits at twice its size, which is about `√ops` pieces, derived
+  from the journal. An append at the end skips every block by its length. Adjacent new runs merge as they are made, since
+  a new run is a length alone, so a file written by appends is one run. The net ops are the same: the oracle holds
+  them to a byte-level replay of every generated journal.
+- **Tests** (macOS arm64, local). `slates-merge --test derive`, 10 of 10: the proptest oracle (the net ops reproduce
+  the post-state byte for byte, are ordered, are deterministic) and the new
+  `a_paths_composition_costs_about_root_ops_an_op_not_its_pieces`. It composes 100,000 1 KiB appends (at most 4 pieces
+  or blocks examined an op) and 10,000 scattered inserts and deletes (at most 12 √ops an op). Red with one unbounded
+  block and no merging: 55,109,413 examined for the scattered ops, against a bound of 12,000,000. `slates-merge`'s
+  every test.
+- **Measured after** (BENCHMARKS; Studio-1, load 2.9 to 4.2, `ffb2a65`): 64, 128, 256 and 320 MiB each pass, exit 0,
+  no watchdog end; each of 128 to 320 MiB had ended exit 4 there before. Found, not fixed (GAPS): a holder's forward of
+  the increment runs at about 105 to 150 MB/s (320 MiB in 3,047 ms), and the control shard's beat task ran 520 to
+  1,381 ms late during it (near misses, the watchdog's beat holding).
