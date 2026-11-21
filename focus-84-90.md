@@ -1638,3 +1638,8 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - b0405dcad (w-fed-move, goal 86b): an edit reads its file's base length from the work's kept entry, and a rebase gives the entries of every path the work touched. At 10 hot files, owner asks fell from 69.4 to 48.5 a client.
   - 4e32bd101 (w-lint round 14 at 89269ab1b: db, vcs, store, merge, ipc and hg back under the wall; literals derived). Round 14's pieces went to w-provision-gate (a disallowed std::thread::sleep in its A-798 spin_kick test; nudged through kiln), w-git and w-hg.
   - A-809 claimed by w-rewrite-ops (A-803's fix, the layered anchor). w-perf's pull A/B now runs off Studio-2; the push profile is next.
+- 2026-11-21 03:43 PST
+  - CONFIRMED: w-rewrite-ops' piece 1, the dirty read during a held landing, is on main as 31c0acd50 (A-805), before A-807; it is now on A-809 (A-803's layered anchor).
+  - LANDED: 5d555c7fa (w-lint round 14 part 2: repository creation's boxed refusal, the svn landing's payload, the store tests' scratch and splits).
+  - w-fed-move's asks table at 1,000 clients (hot files 300/100/30/10): asks per client 17.5 / 23.1 / 38.7 / 69.4 and rebases 2.3 / 3.9 / 9.7 / 22.2. Contention is the knob. A-808 fixed the length re-asks.
+  - RULING: a rebase drops a journal op whose result became identical to the head, as git rebase skips already-upstream commits (D-27's identical). Provenance stays: each is recorded identical, as in A-782. An oracle holds heads and per-op outcomes equal with and without the drop, apart from git's later-change case, stated in the design with an amendment entry. A/B expects ~13.8 fewer byte asks per client at 10 hot files.
