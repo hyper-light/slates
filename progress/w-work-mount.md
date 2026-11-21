@@ -98,3 +98,5 @@ then `cargo test -p slates-cli --test winfsp a_work_mounted_through_winfsp`; gre
 push HEAD:main, add to the close note; red -> red-first fix. The Linux FUSE run is mine too.
 
 - 2026-11-21 02:30 PST: kiln refused every run 08:07-10:30 UTC (10 retries, "did not answer in time"); GitHub back at ~09:00 UTC (state pushed). WinFsp test and the warning fix 0cbef8441 still wait on kiln; nothing else in my queue.
+
+- 2026-11-21 04:35 PST: C1 WinFsp GREEN (r4) after fix 87721dbeb (merge volume status reports its mounts; r3 red). Only the Linux FUSE run r2 remains for C1.

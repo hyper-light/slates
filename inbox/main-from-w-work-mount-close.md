@@ -34,13 +34,15 @@
 
 All five items (C1 C2 R3 R4 P5) are closed on origin/main.
 
-## C1 Windows runs (2026-11-21, w-work-mount's own, on jupiter)
-- Windows build of crates/server/src/winfsp.rs: GREEN. `kiln run --on jupiter --no-sync` (the --needs windows sync of
-  the 585 MB tree timed out twice: "did not answer the sync in 60s"), in a clone of origin/main e4cfbd38d:
-  `cargo build --locked -p slates-server` exit 0 in 31 min 47 s; runner f766f09294f2e17e3b8a631ffd4e6a4b (the kiln CLI
-  prints no run id). One warning from C1: `use slates_vfs::host::HostFs` unused in winfsp.rs; fix 0cbef8441 built clean on
-  jupiter (main's r1), but main had already removed the import in 7a9ace19f, so 0cbef8441 changed nothing and its branch
-  is deleted.
-- `cargo test -p slates-cli --test winfsp a_work_mounted_through_winfsp`: NOT YET RUN. The clone on jupiter vanished
-  between runs, a re-clone hit a GitHub disconnect, the detached retry (06:05 UTC) is unconfirmed: from 08:07 UTC the
-  kiln server answers no `kiln run`, and from ~08:30 UTC GitHub fetches from this Mac fail ("early EOF", SSH and HTTPS).
+## C1 Windows runs (2026-11-21, on jupiter by kiln; r1-r4 run by main from the MacBook)
+- r1: Windows build of slates-server from agents/w-work-mount-win (0cbef8441): no warnings from slates code (the unused
+  HostFs import was already removed on main by 7a9ace19f; 0cbef8441 dropped, branch deleted). The WinFsp test SKIPPED
+  there (needs SLATES_TEST_CLI=1 and WINFSP_TEST_MOUNT=1): not green.
+- r3: the WinFsp test for real (both variables, live WinFsp), main as of 02:47: RED at crates\cli\tests\winfsp.rs:2539,
+  `slates unmount E:` -> "no slates volume is mounted at E:", after the read, write and rename through E: had passed.
+  Cause: a merge volume's status reported no mounts, and Windows' unmount finds a drive among the volumes' mounts.
+- Fix: 87721dbeb on origin/main (a mounted work's status reports its host mounts, as any volume's). Red-then-green on
+  macOS: tests/mounted_work.rs a_mounted_works_status_reports_its_mount.
+- r4: the WinFsp test on the fix (705f4d7e5, the same change as 87721dbeb): GREEN,
+  a_work_mounted_through_winfsp_saves_and_its_submit_lands_the_save ok in 2.04 s, no skip line.
+- Linux FUSE (r2): queued for adacachy; command in inbox/main-from-w-work-mount-fuse.md.
