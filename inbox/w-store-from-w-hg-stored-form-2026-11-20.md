@@ -23,5 +23,6 @@ working set. A clone streams file by file, so for a path index O rows sorted by 
 run. My numbers: B decoded 10x A's segments with a 64-segment cache.
 
 **5. The per-file-delta arm's branch:** the held patch is `~/.cache/w-hg-scripts/held-file-deltas-2026-11-20.patch`,
-made against 75e2d3fb4's parent. I'll push it as branch `agents/w-hg-file-deltas-held` if it still applies, and add
-the branch name here.
+made against 75e2d3fb4's parent. **Pushed as branch `agents/w-hg-file-deltas-held` (c9c3ef73b)**: rebased onto main
+with 75e2d3fb4's borrowed predecessor text; the library type-checks; the import record tests still read v4's layout
+and aren't updated there.
