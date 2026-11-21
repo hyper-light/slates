@@ -809,6 +809,10 @@ impl Instance {
         version,
         verification: Verification::of_wire(verification),
       }),
+      Ok((Submitted::Identical(version), verification)) => Ok(MergeOutcome::Identical {
+        version,
+        verification: Verification::of_wire(verification),
+      }),
       Ok((Submitted::Conflict(windows), _)) => self
         .merge_conflicts(work, windows)
         .map(MergeOutcome::Conflicted),

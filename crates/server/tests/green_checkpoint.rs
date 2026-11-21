@@ -59,7 +59,7 @@ fn submit_versions(
       return (head, Some(format!("edit {n}: {e}")));
     }
     match client.submit(work) {
-      Ok(Submitted::Accepted(version)) => head = version,
+      Ok(Submitted::Accepted(version) | Submitted::Identical(version)) => head = version,
       Ok(Submitted::ApprovalRequired { .. }) => {
         return (
           head,
@@ -321,7 +321,7 @@ fn fill_until_refused(
     };
     client.declare(work, op).unwrap();
     match client.submit(work) {
-      Ok(Submitted::Accepted(version)) => head = version,
+      Ok(Submitted::Accepted(version) | Submitted::Identical(version)) => head = version,
       other => return (head, Some(other)),
     }
   }

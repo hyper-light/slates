@@ -2642,6 +2642,7 @@ mod tests {
         conflicts,
         conflicts_elided: 0,
         verdict: 0,
+        identical: false,
       },
       Kind::SubmitAccepted,
     )

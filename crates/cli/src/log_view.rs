@@ -32,6 +32,12 @@ fn mark_text(mark: &WorkMark) -> String {
   match mark {
     WorkMark::Open => "open".to_owned(),
     WorkMark::Accepted { version } => format!("accepted as v{version}"),
+    WorkMark::Identical { version } => format!("identical, as v{version} (nothing changed)"),
+    WorkMark::AwaitingApproval { identity, paths } => format!(
+      "HELD for approval: increment {} ({paths} path{})",
+      manifest_text(identity),
+      if *paths == 1 { "" } else { "s" }
+    ),
     WorkMark::Collided { windows, first, .. } => match first {
       Some(window) => format!(
         "COLLIDED at {} [{}+{}] ({windows} window{})",
@@ -66,6 +72,16 @@ pub(crate) fn text_lines(log: &SessionLog) -> Vec<String> {
           if *windows == 1 { "" } else { "s" },
           if *behind == 1 { "" } else { "s" }
         ),
+        NeedsYou::AwaitingApproval {
+          name,
+          identity,
+          paths,
+          ..
+        } => format!(
+          "  ! {name}: merge held for approval: increment {} ({paths} path{})",
+          manifest_text(identity),
+          if *paths == 1 { "" } else { "s" }
+        ),
         NeedsYou::AwaitingGrant {
           landing,
           volume,
@@ -87,7 +103,10 @@ pub(crate) fn text_lines(log: &SessionLog) -> Vec<String> {
     for work in log.works.iter().filter(|work| work.green == green) {
       lines.push(format!(
         "  {} {}  from v{}, {} behind  {}",
-        if matches!(work.mark, WorkMark::Collided { .. }) {
+        if matches!(
+          work.mark,
+          WorkMark::Collided { .. } | WorkMark::AwaitingApproval { .. }
+        ) {
           '!'
         } else {
           'o'
@@ -102,97 +121,10 @@ pub(crate) fn text_lines(log: &SessionLog) -> Vec<String> {
   lines
 }
 
-/// A work's mark as JSON: `{"state": "open" | "accepted" | "collided", ...}`.
-fn mark_json(mark: &WorkMark) -> serde_json::Value {
-  match mark {
-    WorkMark::Open => serde_json::json!({ "state": "open" }),
-    WorkMark::Accepted { version } => {
-      serde_json::json!({ "state": "accepted", "version": version })
-    }
-    WorkMark::Collided {
-      verdict,
-      windows,
-      first,
-    } => serde_json::json!({
-      "state": "collided",
-      "verdict": verdict,
-      "windows": windows,
-      "first": first.as_ref().map(|w| serde_json::json!({ "path": w.path, "at": w.at, "len": w.len, "class": w.class })),
-    }),
-  }
-}
-
-/// A work as JSON.
-fn work_json(log: &SessionLog, work: &LogWork) -> serde_json::Value {
-  serde_json::json!({
-    "id": volume_id_text(work.id),
-    "name": work.name,
-    "base": work.base,
-    "behind": log.behind(work),
-    "mark": mark_json(&work.mark),
-  })
-}
-
-/// The view as one JSON object: `needs_you` (each `{"kind": "collided" | "awaiting_grant", ...}`), `greens` (each with
-/// its head and works) and `awaiting_grant`.
+/// The view as one JSON object (`slates_mcp::session_log_json`): the MCP tool `slates.log` and the SDKs answer the same
+/// shape, one definition (§4.12 schema parity).
 pub(crate) fn json(log: &SessionLog) -> serde_json::Value {
-  let needs: Vec<serde_json::Value> = log
-    .needs_you()
-    .iter()
-    .map(|need| match need {
-      NeedsYou::Collided {
-        work,
-        name,
-        green,
-        path,
-        windows,
-        behind,
-      } => serde_json::json!({
-        "kind": "collided",
-        "work": volume_id_text(*work),
-        "name": name,
-        "green": volume_id_text(*green),
-        "path": path,
-        "windows": windows,
-        "behind": behind,
-      }),
-      NeedsYou::AwaitingGrant {
-        landing,
-        volume,
-        target,
-        manifest,
-      } => serde_json::json!({
-        "kind": "awaiting_grant",
-        "landing": landing,
-        "volume": volume_id_text(*volume),
-        "target": target,
-        "manifest": manifest_text(manifest),
-      }),
-    })
-    .collect();
-  let greens: Vec<serde_json::Value> = greens_of(log)
-    .into_iter()
-    .map(|green| {
-      serde_json::json!({
-        "id": volume_id_text(green),
-        "head": log.head_of(green),
-        "works": log.works.iter().filter(|w| w.green == green).map(|w| work_json(log, w)).collect::<Vec<_>>(),
-      })
-    })
-    .collect();
-  let waiting: Vec<serde_json::Value> = log
-    .landings
-    .iter()
-    .map(|landing| {
-      serde_json::json!({
-        "landing": landing.landing,
-        "volume": volume_id_text(landing.volume),
-        "target": landing.target,
-        "manifest": manifest_text(&landing.manifest),
-      })
-    })
-    .collect();
-  serde_json::json!({ "needs_you": needs, "greens": greens, "awaiting_grant": waiting })
+  slates_mcp::session_log_json(log)
 }
 
 #[cfg(test)]
@@ -314,5 +246,47 @@ mod tests {
       serde_json::json!({ "state": "accepted", "version": 2 })
     );
     assert_eq!(value["awaiting_grant"][0]["target"], "/srv/out");
+  }
+
+  /// A-785. Do: render a log whose only notable work's merge an ask policy holds. Expect: the needs-you block names it
+  /// with the increment's identity and paths, its line is marked, and the JSON's `needs_you` holds one
+  /// `awaiting_approval`.
+  #[test]
+  fn a_held_merge_is_named_as_needing_the_human() {
+    let log = SessionLog {
+      works: vec![LogWork {
+        id: id(1),
+        name: "asking-agent".to_owned(),
+        green: id(0),
+        base: 0,
+        mark: WorkMark::AwaitingApproval {
+          identity: [0xcd; 32],
+          paths: 2,
+        },
+      }],
+      landings: Vec::new(),
+      heads: [([0; 16], 0)].into_iter().collect(),
+    };
+    let lines = text_lines(&log);
+    assert_eq!(lines[0], "needs you (1):");
+    assert_eq!(
+      lines[1],
+      format!(
+        "  ! asking-agent: merge held for approval: increment {} (2 paths)",
+        "cd".repeat(32)
+      )
+    );
+    assert!(
+      lines[3].trim_start().starts_with("! asking-agent"),
+      "{}",
+      lines[3]
+    );
+    let value = json(&log);
+    assert_eq!(value["needs_you"][0]["kind"], "awaiting_approval");
+    assert_eq!(value["needs_you"][0]["paths"], 2);
+    assert_eq!(
+      value["greens"][0]["works"][0]["mark"]["state"],
+      "awaiting_approval"
+    );
   }
 }

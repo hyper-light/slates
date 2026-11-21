@@ -47,7 +47,7 @@ fn imported(dump: &[u8]) -> Repository {
   loop {
     while held.len() < needed && next < dump.len() {
       let end = dump.len().min(next + PIECE);
-      held.extend_from_slice(&dump[next..end]);
+      held.extend_from_slice(dump.get(next..end).unwrap());
       next = end;
     }
     match importer
@@ -105,8 +105,8 @@ fn main() {
     per_revision.push((began.elapsed(), revision, delta_bytes));
   }
   let total = replaying.elapsed();
-  let count = per_revision.len().max(1) as u32;
-  per_revision.sort_by(|a, b| b.0.cmp(&a.0));
+  let count = u32::try_from(per_revision.len().max(1)).unwrap_or(u32::MAX);
+  per_revision.sort_by_key(|a| std::cmp::Reverse(a.0));
   println!(
     "dump {path} youngest {youngest} import_s {:.1} replay r{first}..r{last} total_s {:.2} mean_ms {:.2} \
      longest_step_us {} steps {steps_total} texts_made_whole {} windows_made {}",

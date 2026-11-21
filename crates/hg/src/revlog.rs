@@ -768,18 +768,22 @@ impl Outline {
       );
     }
     let (chain, stopped) = self.chain(source, rev, cached.map(|(at, _)| at), admission)?;
-    let mut text: Option<Cow<'_, [u8]>> = cached
-      .filter(|_| stopped)
-      .map(|(_, text)| Cow::Borrowed(text));
+    // The text so far and a spare it is patched into, swapped at each link, so the chain's deltas apply within two
+    // buffers whatever its length (main's order of 2026-11-20: a copy a link charged the read a text a link).
+    let mut cached_base = cached.filter(|_| stopped).map(|(_, text)| text);
+    let mut text: Option<Vec<u8>> = None;
+    let mut spare = Vec::new();
     for link in chain {
       let link_entry = self.entry(source, link, admission)?;
       let piece = self.chunk_of(source, link, &link_entry, admission)?;
-      text = Some(Cow::Owned(match text {
-        None => piece,
-        Some(base) => apply(&base, &piece, link, admission)?,
-      }));
+      match (cached_base.take(), text.as_ref()) {
+        (Some(base), _) => apply_into(base, &piece, &mut spare, link, admission)?,
+        (None, Some(base)) => apply_into(base, &piece, &mut spare, link, admission)?,
+        (None, None) => spare = piece,
+      }
+      spare = text.replace(spare).unwrap_or_default();
     }
-    let text = text.map(Cow::into_owned).unwrap_or_default();
+    let text = text.unwrap_or_else(|| cached_base.map(<[u8]>::to_vec).unwrap_or_default());
     if u64::try_from(text.len()).ok() != Some(u64::from(entry.uncompressed)) {
       return Err(Refused::Length { rev }.into());
     }
@@ -803,14 +807,15 @@ impl Outline {
   }
 }
 
-/// A delta applied by slates-hg's applier, its refusal in the reader's terms.
-fn apply(
+/// A delta applied by slates-hg's applier over `out`, its refusal in the reader's terms.
+fn apply_into(
   base: &[u8],
   piece: &[u8],
+  out: &mut Vec<u8>,
   rev: u32,
   admission: &mut Admission,
-) -> Result<Vec<u8>, Refused> {
-  delta::apply(base, piece, admission).map_err(|refusal| match refusal {
+) -> Result<(), Refused> {
+  delta::apply_into(base, piece, out, admission).map_err(|refusal| match refusal {
     delta::Refusal::PastAdmission(past) => Refused::PastAdmission(past),
     refusal => Refused::Delta { rev, refusal },
   })

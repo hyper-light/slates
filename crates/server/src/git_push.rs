@@ -134,7 +134,7 @@ use crate::verbs::to_wire_volume;
 
 #[cfg(unix)]
 mod hooks;
-mod intake;
+pub(crate) mod intake;
 #[cfg(test)]
 pub(crate) mod tests;
 
