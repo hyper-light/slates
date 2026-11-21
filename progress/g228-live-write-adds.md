@@ -145,6 +145,11 @@ the hypothesis (the fold's tail held the reply) is NOT confirmed; added median 2
 - 85a not closable on ubuntu-latest by daemon work: the bare transport's round trip (42-83 us) is at the 50 us goal.
   Asked main (inbox/main-from-g228-85a-next.md): split the build next, and/or restate the goal as the daemon's share.
 
+## 2026-11-21 ~10:45 PST: main 01a1ff2e ruled (i): split the build. A-829 renumbered on main 8cb874d3f.
+- agents/g228-build-split 06f20620f: fleet.live.hop.build.{capture,seal,append,send} per-write histograms; fleet hop
+  test holds every step timed and the sum within the build (green, kiln, debug). Diag run 15 (ubuntu-latest, release,
+  5 rounds, transport bench beside each round) pending: report = daemon share + transport floor + base commit.
+
 ## For main to delete (diagnostics): remote branches diag-g228-live-1..13 once main has read their results.
 
 ## 85a STILL OPEN -- blocked on main's decision (sent): a plain status request arms a tens-of-GiB mincore sweep on every
