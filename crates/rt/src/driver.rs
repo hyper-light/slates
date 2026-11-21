@@ -533,6 +533,40 @@ mod tests {
     drop(registration);
   }
 
+  /// 84a (A-834): a Windows shard at the normal level stays one level above it once a wait of its has blocked, so a
+  /// runnable shard preempts normal-priority load instead of waiting out its 31.6 ms quantum. Do: on this thread at the
+  /// normal level, a timed wait through the real driver. Expect: the thread one level up after it. Before A-834 the
+  /// raise was put back before the shard ran (A-361), and loaded requests waited 30-100 ms queued or mid-service (GAPS
+  /// 84a's stamps, diag run 44945557697).
+  #[test]
+  #[cfg(windows)]
+  #[cfg_attr(miri, ignore)]
+  fn a_windows_shard_stays_one_level_up_after_a_blocking_wait() {
+    use windows_sys::Win32::System::Threading::{
+      GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+      THREAD_PRIORITY_NORMAL,
+    };
+    // SAFETY: the calling thread's own pseudo-handle and level.
+    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
+    let prepared = os_driver().unwrap();
+    let (registration, _control) =
+      crate::registry::register(2, 1, crate::runtime::register_kick(prepared.kick_fd)).unwrap();
+    let kick = crate::registry::with_entry(registration.shard(), |entry| entry.kick).unwrap();
+    let mut driver = (prepared.seed)(kick).unwrap();
+    let mut out = Vec::new();
+    driver.wait(Some(SUB_MILLISECOND_WAIT_NS), &mut out).unwrap();
+    // SAFETY: the calling thread's own pseudo-handle.
+    let level = unsafe { GetThreadPriority(GetCurrentThread()) };
+    // SAFETY: as above; the thread put back for whatever runs on it next.
+    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
+    assert_eq!(
+      level, THREAD_PRIORITY_ABOVE_NORMAL,
+      "a shard at the normal level ran its next work at level {level}, not one above normal, after a blocking wait"
+    );
+    drop(driver);
+    drop(registration);
+  }
+
   /// Shape: a wait well under a millisecond, well over a system call's cost.
   #[cfg(any(unix, windows))]
   const SUB_MILLISECOND_WAIT_NS: u64 = 200_000;
