@@ -10,9 +10,10 @@
 > `a_rebased_work_submits_as_it_would_have` passes. Same on origin/main 8cb10f986 (not caused by 6459374). The job's
 > turns do not count as the shard's steps, or a turn runs past its slice at debug speed.
 
-> **Open (w-fed-faults, 2026-11-21): five Mercurial tests of `vcs_http::daemon_edge` fail on macOS arm64**
+> **CLOSED (w-hg, 2026-11-21): five Mercurial tests of `vcs_http::daemon_edge` failed on macOS arm64**
 > (`a_mercurial_repositorys_store_is_served_...`, `a_stock_mercurial_push_...`, the clone, stream clone and push
-> larger than one ring region), on origin/main 8cb10f986 alike. Not looked into.
+> larger than one ring region) since 8cb10f986: they made a Mercurial repository on a daemon without a changeset store,
+> which C1 refuses. They start stored daemons (`stored_daemon_named`) and create through `crate::test_store::create`.
 
 > **Open (w-fed-faults, 2026-11-21): A-796's wire variants are appended but not published.** `CheckMerge`,
 > `ReadMergeCheck`, `ResolveMerge`, `MergeChecked`, `StaleMergeView` and the `MergeView` enum: `cargo test -p
