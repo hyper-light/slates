@@ -18,7 +18,7 @@
 
 use std::borrow::Cow;
 
-use slates_vcs::ContentStore;
+use slates_vcs::{ContentStore, IndexRefused};
 
 use crate::changegroup::Version;
 use crate::import::record::{self, Refused as RecordRefused, Replay, Replayed};
@@ -78,6 +78,28 @@ pub enum Refused {
     /// Why.
     refused: RecordRefused,
   },
+  /// The changeset under way refused, and its fork could not be given back whole: the content store's holds are off.
+  Unreleased {
+    /// Its sequence.
+    sequence: u64,
+    /// Why it refused.
+    cause: Box<Refused>,
+    /// Why the fork was not given back.
+    release: IndexRefused,
+  },
+}
+
+/// `cause`, the refusal of the changeset at `sequence` under way, once `replay` is given back: [`Refused::Unreleased`]
+/// where it could not be.
+fn given_back(sequence: u64, replay: Replay, store: &mut ContentStore, cause: Refused) -> Refused {
+  match replay.abandon(store) {
+    Ok(()) => cause,
+    Err(release) => Refused::Unreleased {
+      sequence,
+      cause: Box::new(cause),
+      release,
+    },
+  }
 }
 
 /// Whether a replay has more to take.
@@ -127,10 +149,7 @@ impl Replaying {
     };
     let payload = match section(log, sequence, Section::Payload) {
       Ok(payload) => payload,
-      Err(refused) => {
-        drop(replay.abandon(store));
-        return Err(refused);
-      }
+      Err(refused) => return Err(given_back(sequence, replay, store, refused)),
     };
     match replay.step(&payload, store) {
       Ok(true) => {
@@ -145,10 +164,12 @@ impl Replaying {
         self.done = Some(sequence);
         Ok(Stepped::More)
       }
-      Err(refused) => {
-        drop(replay.abandon(store));
-        Err(Refused::Record { sequence, refused })
-      }
+      Err(refused) => Err(given_back(
+        sequence,
+        replay,
+        store,
+        Refused::Record { sequence, refused },
+      )),
     }
   }
 
