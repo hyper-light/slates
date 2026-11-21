@@ -1453,3 +1453,10 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - DISK: the MacBook fell from 37 to 31 GB free in about 8 minutes. Main removed 17 unused slates-* Docker volumes, its own from earlier sessions: slates-arm64-target 11.5 GB, slates-bug-sweep-target 6.75 GB, slates-a187-* 4 GB, slates-nfs-write-* 3.6 GB, plus caches. Every one had 0 links, and docker volume rm refuses any volume in use. Free space went 31 -> 55 GB at once.
   - w-git C5 part 2a, landing after r21: git refused without a store (Unsupported, naming --vcs-store), and git's tests on the shared helper. Moving the HTTP edge suite onto stores also fixes the Mercurial daemon_edge tests. w-hg is told not to repeat that in step 0; w-git merges main first, since the Overloaded reds are fixed there.
   - w-interop: its red test for the hook view passed on main's code (2,000 revisions of one file lay out in under 1 s); it is making the repro bite.
+- 2026-11-21 00:39 PST LANDED (on main):
+  - ac5f6c48f, bdf99f92d and e14493d62 (w-interop, A-645 (a)): a hook's first FSFS view is driven as turns on its owner shard, and its wait is judged on their progress, not one liveness budget for the whole. Red first, then made to bite with a tree as wide as git/git's (4,872 files).
+  NOTED:
+  - w-shared: the owner's step for a 32 MiB submit runs 4.2-6.9 s as one step (decode, verdict, append, checksum of the whole increment). A stuck owner reads no acks, so the holder rightly gives the forward up. Bounded work (item 2) is therefore 3a's prerequisite. It slices the owner's step by part, with by-reference content where the two meet.
+  - w-perf: (c) confirmed from w-hg's code: the text identity is of the framed text, so a stream chunk is the stored bytes. It builds the stream fix now while the pull profile runs.
+  - w-fed-move claimed an A-number for counting and resending lost replies.
+  DISK: Studio-4 42 GB free (82 at 23:58). g226's worktree is 30 GB and is told to trim. ~/.cache/kiln-gate (44 GB) is kiln's own, not ours. Studio-1 73 GB, the big Studio 777 GB, the MacBook 56 GB. Studio-2 unreachable.
