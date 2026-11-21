@@ -110,9 +110,9 @@ fn cpu_ns(process: &FleetProcess) -> (Option<u64>, Option<u64>) {
     .and_then(|out| {
       let text = String::from_utf8(out.stdout).ok()?;
       let (clock, centis) = text.trim().rsplit_once('.')?;
-      let seconds = clock
-        .split(':')
-        .try_fold(0_u64, |sum, part| Some(sum * 60 + part.parse::<u64>().ok()?))?;
+      let seconds = clock.split(':').try_fold(0_u64, |sum, part| {
+        Some(sum * 60 + part.parse::<u64>().ok()?)
+      })?;
       Some(seconds * 1_000_000_000 + centis.parse::<u64>().ok()? * 10_000_000)
     });
   (whole, None)
