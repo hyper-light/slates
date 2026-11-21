@@ -1432,8 +1432,8 @@ pub(crate) fn changeset_of(
       base: kept.base,
       place: slates_store::texts::Place {
         payload: payload_identity,
-        offset: u64::try_from(kept.place.start).unwrap_or(u64::MAX),
-        len: u64::try_from(kept.place.len()).unwrap_or(u64::MAX),
+        offset: kept.place.start,
+        len: kept.place.end.saturating_sub(kept.place.start),
       },
     })
     .collect();
@@ -1666,6 +1666,10 @@ async fn rebase_sliced(
           .flatten()
           .map(Ok);
       }
+      // A re-base reads the fork's rows, never the changegroup's bytes.
+      Ok(Stepped::Wanted(_)) => {
+        return Some(Err(PushOutcome::refused(&abort(REBASE_WANTED.to_vec()))));
+      }
       Err(refused) => return Some(Err(PushOutcome::refused(&abort(unindexed_words(&refused))))),
     }
   }
@@ -1720,8 +1724,10 @@ impl Taking {
     vcs_store::within_budget(state, lend, |stores| {
       let content = stores.content_mut()?;
       Some(loop {
-        match intake.step(payload, content, room) {
+        match intake.step(payload.as_slice(), content, room) {
           Ok(Stepped::More) if slates_rt::futures::now_ns().saturating_sub(start) < quantum => {}
+          // A push's changegroup arrived whole: a want names bytes past its end, a truncation.
+          Ok(Stepped::Wanted(range)) => break Err(whole_wanted(payload, range)),
           other => break other,
         }
       })
@@ -1826,9 +1832,29 @@ async fn take_sliced(
     match sliced.flatten()? {
       Ok(Stepped::More) => slates_rt::futures::yield_now().await,
       Ok(Stepped::Done) => return taking.finish().map(Ok),
+      // The slice answers a whole changegroup's want as its truncation; none reaches here.
+      Ok(Stepped::Wanted(range)) => return Some(Err(intake_outcome(&whole_wanted(&[], range)))),
       Err(refused) => return Some(Err(intake_outcome(&refused))),
     }
   }
+}
+
+/// Format: slates' words for a re-base that asked for a changegroup's bytes, which none reads.
+const REBASE_WANTED: &[u8] = b"push refused: its re-base asked for bytes of its changegroup";
+
+/// The refusal of a whole changegroup's intake that wanted bytes `range` (`slates_hg::framing`): past its end, a
+/// truncation.
+fn whole_wanted(payload: &[u8], range: core::ops::Range<u64>) -> IntakeRefused {
+  IntakeRefused::Unverified(Unverified::Changegroup(
+    slates_hg::changegroup::Refusal::Truncated(slates_hg::Truncated {
+      what: "changegroup",
+      at: range.start,
+      needed: range.end.saturating_sub(range.start),
+      left: u64::try_from(payload.len())
+        .unwrap_or(u64::MAX)
+        .saturating_sub(range.start),
+    }),
+  ))
 }
 
 /// `changegroup` taken into its fork every slice at once: [`take_sliced`]'s steps for a caller that holds the shard's
@@ -1849,6 +1875,14 @@ pub(crate) fn take_whole(
     match taking.slice(state, lend, room) {
       Some(Ok(Stepped::More)) => {}
       Some(Ok(Stepped::Done)) => return taking.finish().map(Ok),
+      Some(Ok(Stepped::Wanted(range))) => {
+        let refused = match taking.changegroup.as_ref() {
+          Some((_, payload)) => whole_wanted(payload, range),
+          None => whole_wanted(&[], range),
+        };
+        taking.abandon_in(state);
+        return Some(Err(intake_refused(&refused)));
+      }
       Some(Err(refused)) => {
         taking.abandon_in(state);
         return Some(Err(intake_refused(&refused)));
@@ -1883,6 +1917,9 @@ pub(crate) fn land_in(
         match rebasing.slice(state)? {
           Ok(Stepped::More) => {}
           Ok(Stepped::Done) => break,
+          Ok(Stepped::Wanted(_)) => {
+            return Some(PushOutcome::refused(&abort(REBASE_WANTED.to_vec())));
+          }
           Err(refused) => return Some(PushOutcome::refused(&abort(unindexed_words(&refused)))),
         }
       }
