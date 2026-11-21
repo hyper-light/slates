@@ -344,6 +344,9 @@ pub struct TimedReply {
   pub bytes: Vec<u8>,
   /// The exchange's round trip in nanoseconds when the peer answered inside the deadline.
   pub round_trip_ns: Option<u64>,
+  /// When the request was sent, on the shard's clock (`slates_rt::futures::now_ns`): with the round trip, when its
+  /// reply was read, so a collector on the same shard can tell its own lags from the exchange (g228, 85a).
+  pub sent_ns: u64,
 }
 
 /// What a dispatch task reports back to the owner's collection loop: a holder's timed reply (empty bytes
@@ -573,6 +576,7 @@ pub async fn request_within(
     TimedReply {
       bytes: reply.unwrap_or_default(),
       round_trip_ns,
+      sent_ns,
     },
     endpoint,
   )

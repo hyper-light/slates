@@ -4981,6 +4981,10 @@ async fn ship_lane(
     ready_ns = answered_ns;
     let entry = send.stream == slates_cluster::live::LIVE_ENTRY_STREAM;
     let round_trip = exchanged.round_trips.first().map(|(_, ns)| *ns);
+    let lags = exchanged
+      .lags
+      .first()
+      .map(|(_, spawn, wake)| (*spawn, *wake));
     let (replies, stragglers) = settle_sessions(exchanged);
     if entry {
       // The exchange split (85a, g228): the session's borrow, the transport's round trip as the session timed it, this
@@ -5001,6 +5005,10 @@ async fn ship_lane(
               .saturating_sub(sent_ns)
               .saturating_sub(round_trip),
           );
+        }
+        if let Some((spawn, wake)) = lags {
+          count_hop(s, HOP_EXCHANGE_SPAWN, spawn);
+          count_hop(s, HOP_EXCHANGE_WAKE, wake);
         }
         count_hop(
           s,
@@ -5362,6 +5370,17 @@ const HOP_EXCHANGE_ROUND_TRIP: (&str, &str) = (
 const HOP_EXCHANGE_COLLECT: (&str, &str) = (
   "fleet.live.hop.exchange.collect",
   "fleet.live.hop.exchange.collect_ns",
+);
+/// Of the collect: from the exchange's start to the request's task sending it (its spawn and first turn on the control
+/// shard), the first holder's (`slates_cluster::live::Exchanged::lags`).
+const HOP_EXCHANGE_SPAWN: (&str, &str) = (
+  "fleet.live.hop.exchange.spawn",
+  "fleet.live.hop.exchange.spawn_ns",
+);
+/// Of the collect: from the reply read by its task to the exchange seeing it (the collector's wake on the control shard).
+const HOP_EXCHANGE_WAKE: (&str, &str) = (
+  "fleet.live.hop.exchange.wake",
+  "fleet.live.hop.exchange.wake_ns",
 );
 /// The answered sessions returned to their links and the unanswered ones dropped ([`settle_sessions`]).
 const HOP_EXCHANGE_SETTLE: (&str, &str) = (

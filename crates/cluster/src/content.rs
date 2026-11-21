@@ -2744,6 +2744,7 @@ async fn transfer_chunks(
     TimedReply {
       bytes: acknowledgement.unwrap_or_default(),
       round_trip_ns,
+      sent_ns,
     },
     endpoint,
   )

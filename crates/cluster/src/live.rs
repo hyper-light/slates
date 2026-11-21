@@ -98,6 +98,10 @@ pub struct Exchanged {
   /// Each answering holder's round trip as its session timed it (the request sent to its reply read), nanoseconds: what
   /// of the exchange was the transport and the holder, the rest being this side's tasks (g228, 85a).
   pub round_trips: Vec<(HostId, u64)>,
+  /// Each answering holder's two lags on this shard, nanoseconds: from the exchange's start to its task sending the
+  /// request (the task's spawn and first turn), and from its reply read to this collector seeing it (the collector's
+  /// wake): what of the exchange beyond the round trip is this shard's own scheduling (g228, 85a).
+  pub lags: Vec<(HostId, u64, u64)>,
 }
 
 /// Sends `message` to every holder over its session and gathers the replies until `enough` (shown each reply as it
@@ -118,8 +122,10 @@ pub async fn exchange(
       stragglers: Stragglers::none(),
       timed_out: false,
       round_trips: Vec::new(),
+      lags: Vec::new(),
     };
   }
+  let started_ns = now_ns();
   let priority = if stream == LIVE_STATE_STREAM {
     Priority::Bulk
   } else {
@@ -162,6 +168,7 @@ pub async fn exchange(
     stragglers: Stragglers::none(),
     timed_out: false,
     round_trips: Vec::new(),
+    lags: Vec::new(),
   };
   loop {
     match rx.try_recv() {
@@ -171,6 +178,12 @@ pub async fn exchange(
           continue;
         };
         exchanged.round_trips.push((host, round_trip));
+        let replied_ns = reply.sent_ns.saturating_add(round_trip);
+        exchanged.lags.push((
+          host,
+          reply.sent_ns.saturating_sub(started_ns),
+          now_ns().saturating_sub(replied_ns),
+        ));
         exchanged.reusable.push((host, *endpoint));
         let done = enough(host, &reply.bytes);
         exchanged.replies.push((host, reply.bytes));
