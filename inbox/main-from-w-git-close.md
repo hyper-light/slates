@@ -94,3 +94,29 @@
   - server-made commits (A-664), until they take w-svn's deferred-submit landing order (piece 3);
   - pushes whose driver never takes its homing ask: the tests' synchronous drivers `git_push::tests::answered` and
     `pushed` (piece 2).
+
+## C5 part 2b, piece 2: a homing ask no edge takes refuses the push; and a hold lost at a home's restart: LANDED (2026-11-21 ~01:55 PST)
+- **Commit:** origin/main f5a14f6a8 (branch agents/w-git-c5b2, deleted). Version 2 now remains only where nothing homes
+  the record: server-made commits (piece 3) and a store test that seals a push straight into the store.
+- **The untaken ask:** an ask no edge took by the turn after now refuses the push `Unlanded`, counted
+  `HOMING_UNTAKEN`.
+  - Red, then green: `t_a767_c5b_a_push_whose_homing_no_edge_takes_is_refused`. Red on main 3ce898533 (r36: the push
+    answered, `None`); green on the branch.
+  - The tests' synchronous drivers carry the ask through a stand-in edge (`git_push::tests::carry_blocking`): the
+    home's own `keep_for_region`, and a real landing from a thread of its own. Their async drivers use the edge's
+    `carry`.
+- **Two real bugs the suite found on the way:**
+  1. **The HTTP edge returned for a keepalive before taking a homing ask** made in the same step, which leaves it
+     untaken. That is harmless before this piece and would have refused pushes after it. The ask is now taken first.
+     The test was `a_long_pushs_answer_is_kept_alive...`, which closed the connection with `UnexpectedEof`.
+  2. **A replay never took back its record's hold on a homed pack or names when this node is their region home.** The
+     region's hold, restored first, made the content look held. Every restart of a home left that content one hold
+     short. The replay now counts the region's hold apart, in both the whole and the stepped replay. Red was
+     `t_a727_repository_windows_survive_a_warm_restart_in_the_shard_image`: 5 holders before the restart, 4 after.
+- **Runs:**
+  - full slates-server lib on the branch (r45): 1060 passed, 1 failed. The failure is
+    `content_ranges::tests::a_status_requests_sweep_...`, which also fails on main.
+  - merged tree f5a14f6a8 (r53): focused 290 passed, format clean.
+- **Now:** the priority push cut-off. A release build is done, and the repro samples the daemon's git counters during a
+  stock git push. One finding already: w-interop's incremental push (one commit) is cut at 56-60 s too, so it isn't
+  the pack's size.
