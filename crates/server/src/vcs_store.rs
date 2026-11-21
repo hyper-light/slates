@@ -223,6 +223,11 @@ pub(crate) struct VcsStores {
   /// The Subversion record read back from the node's store for the record a rebuild or recovery replays next (C2),
   /// by repository, with the register's index it is for: at most one a repository.
   svn_fetched: BTreeMap<RepositoryId, (usize, Vec<u8>)>,
+  /// The stored texts a recovery read back from the node's store into the content store (C2 stage B,
+  /// [`fetch_stored_texts`]), by repository: each written with the hold its replay's end would take, so that end takes
+  /// none more for them ([`hold_svn_stored`]). Bounded by the records' stored texts.
+  svn_fetched_texts:
+    BTreeMap<RepositoryId, std::collections::BTreeSet<slates_svn::index::ContentIdentity>>,
   /// The generations git fetches hold, by repository (A-745 rule 4, [`upload::GitGeneration`]): one fork a stamp the
   /// repository stood at when a fetch began, shared by every fetch that began there, given back with its last holder;
   /// bounded by the fetches the shard's edges seat.
@@ -321,6 +326,10 @@ pub(crate) struct GitStore {
   /// The commits owed by submits whose maps are built whole after them (A-664's live whole builds, part 2, [`owed`]),
   /// by the green's key: one a green, each settled as the made commit's move of its green to its version commits.
   pub(crate) owed: BTreeMap<u64, owed::Owed>,
+  /// The sequence of the changeset this repository landed last on the node's changeset log (A-767 C5): 0 its creation's
+  /// (046628f88), then each push's, taken in turn on this shard ([`VcsStores::next_changeset`]) and read back from the
+  /// register's records at recovery, so the next push after a crash lands at the last one named + 1.
+  pub(crate) landed: u64,
 }
 
 impl GitStore {
@@ -338,6 +347,7 @@ impl GitStore {
       charged: 0,
       lfs: LfsObjects::new(),
       owed: BTreeMap::new(),
+      landed: 0,
     }
   }
 
@@ -448,8 +458,9 @@ pub(crate) enum ReplayRefused {
   /// A version-3 git record's names (A-724 piece 8c) not read: the store holds no content of their identity whole (not
   /// yet fetched from their region homes), or its rows are refused.
   Names(record_names::NamesRefused),
-  /// A Mercurial record naming a changeset on the changeset log (record v7, A-767 C4) the node cannot read back: no log
-  /// held, its owner busy or gone, or its payload not whole at its identity and length.
+  /// A Mercurial record naming a changeset on the changeset log (record v7, A-767 C4), or a git record version 5 (C5),
+  /// the node cannot read back: no log held, its owner busy or gone, the changeset missing, or its names or payload not
+  /// the identities and lengths the record names.
   Unlanded,
   /// A Subversion register record that is not a changeset's reference, or names another sequence than its place
   /// (C2: the register names each changeset in sequence order).
@@ -631,22 +642,24 @@ impl VcsStores {
     }
   }
 
-  /// The sequence repository `id`'s next changeset lands at on the changeset log (A-767 C4), taken now so two pushes
-  /// landing side by side never share one; none where the repository has no Mercurial store here.
+  /// The sequence repository `id`'s next changeset lands at on the changeset log (A-767 C4, C5), taken now so two pushes
+  /// landing side by side never share one; none where the repository has no Mercurial or git store here.
   pub(crate) fn next_changeset(&mut self, id: RepositoryId) -> Option<u64> {
-    match self.entries.get_mut(&id)? {
-      RepositoryStore::Mercurial(store) => {
-        store.landed = store.landed.checked_add(1)?;
-        Some(store.landed)
-      }
-      _ => None,
-    }
+    let landed = match self.entries.get_mut(&id)? {
+      RepositoryStore::Mercurial(store) => &mut store.landed,
+      RepositoryStore::Git(store) => &mut store.landed,
+      _ => return None,
+    };
+    *landed = landed.checked_add(1)?;
+    Some(*landed)
   }
 
-  /// Notes that repository `id` landed changeset `sequence` (a recovery reading the register's references).
+  /// Notes that repository `id` landed changeset `sequence` (a recovery reading the register's records).
   pub(crate) fn landed_changeset(&mut self, id: RepositoryId, sequence: u64) {
-    if let Some(RepositoryStore::Mercurial(store)) = self.entries.get_mut(&id) {
-      store.landed = store.landed.max(sequence);
+    match self.entries.get_mut(&id) {
+      Some(RepositoryStore::Mercurial(store)) => store.landed = store.landed.max(sequence),
+      Some(RepositoryStore::Git(store)) => store.landed = store.landed.max(sequence),
+      _ => {}
     }
   }
 
@@ -867,6 +880,7 @@ pub(crate) fn free(state: &mut ShardState, id: RepositoryId) {
   abandon_git_replay(state, id);
   state.vcs_stores.svn_replays.remove(&id);
   state.vcs_stores.svn_fetched.remove(&id);
+  state.vcs_stores.svn_fetched_texts.remove(&id);
   paths::whole_build::abandon(state, id);
   hg_import::abandon(state, id);
   git_encode::abandon(state, id);
@@ -1421,6 +1435,9 @@ pub(crate) struct SealedPush {
   /// The push's pack homed in the region at `f + 1` before the record (A-722's record v4): the identity and length of
   /// the content its staging put it in, held for the record; none for version 2.
   packed: Option<(slates_vcs::ContentId, u64)>,
+  /// The sequence of the changeset the node's store landed the names and the pack as, before the record names it
+  /// (A-767 C5); 0 for none.
+  landed: u64,
 }
 
 /// Whether a git push's record is written as version 4, its names and its pack homed in the region first (A-724 piece
@@ -1519,10 +1536,27 @@ impl SealedPush {
     Some((self.push.pack().to_vec(), stored))
   }
 
-  /// Keeps `packed`, the push's pack homed in the region under its identity and length: the record is version 4 while
+  /// Keeps `packed`, the push's pack homed in the region under its identity and length: the record is version 5 while
   /// it is still the push's stored pack and the names homed are still its names.
   pub(crate) fn pack_homed_as(&mut self, packed: (slates_vcs::ContentId, u64)) {
     self.packed = Some(packed);
+  }
+
+  /// Keeps `sequence`, the changeset the node's store landed the homed names and pack as (A-767 C5): the version 5 record
+  /// names it.
+  pub(crate) fn landed_as(&mut self, sequence: u64) {
+    self.landed = sequence;
+  }
+
+  /// Gives back the holds the homed names and pack took for a record that will never name them (a push refused after
+  /// its homing: its changeset unlanded).
+  pub(crate) fn release_homed(&mut self, state: &mut ShardState) {
+    for (identity, _) in [self.named.take(), self.packed.take()]
+      .into_iter()
+      .flatten()
+    {
+      release_names(state, &identity);
+    }
   }
 
   /// The repository it is a push to.
@@ -1557,6 +1591,7 @@ impl SealedPush {
         (self.push.deepest(), &self.keyed),
         (identity, count),
         packed,
+        self.landed,
       )
       .map_err(unwritten);
     }
@@ -1918,6 +1953,7 @@ impl SealingPush {
         prepared: Vec::new(),
         named: None,
         packed: None,
+        landed: 0,
       }))),
       Err(refused) => {
         self.abandon(state);
@@ -2679,6 +2715,192 @@ async fn payload_of(
   (payload.len() == len).then_some(payload)
 }
 
+/// What a git record version 5 names on the node's changeset store (A-767 C5), read before its replay: the changeset,
+/// its names' and pack's identities and sizes, and which of them this node's content store already holds.
+#[derive(Clone, Copy, Debug)]
+struct ChangesetWanted {
+  /// The repository's 128-bit id, as the store keys it.
+  repository: u128,
+  /// The changeset's sequence.
+  sequence: u64,
+  /// The names' content: identity and count.
+  named: (slates_vcs::ContentId, u64),
+  /// The pack's content: identity and length.
+  packed: (slates_vcs::ContentId, u64),
+  /// Whether the content store holds the names already.
+  names_held: bool,
+  /// Whether the content store holds the pack already.
+  pack_held: bool,
+}
+
+/// Repository `id`'s record at `index` where it is version 5 naming a changeset (A-767 C5): always for a recovery
+/// (`always`, so the changeset the register names is found on the store whatever the shard image restored), else only
+/// where the content store lacks its names or its pack (a rebuild).
+fn changeset_wanted(
+  state: &ShardState,
+  id: RepositoryId,
+  index: usize,
+  always: bool,
+) -> Option<ChangesetWanted> {
+  let Some(RepositoryStore::Git(git)) = state.vcs_stores.entries.get(&id) else {
+    return None;
+  };
+  let bytes = state
+    .db
+    .partition()
+    .repositories()
+    .object_record(id, index)?;
+  let record = Record::decode(bytes, git.repository.format()).ok()?;
+  if record.sequence == 0 {
+    return None;
+  }
+  let (named, packed) = (record.named?, record.packed?);
+  let content = state.vcs_stores.content.as_ref();
+  let holds =
+    |identity: &slates_vcs::ContentId| content.is_some_and(|content| content.contains(identity));
+  let wanted = ChangesetWanted {
+    repository: u128::from_be_bytes(id.bytes),
+    sequence: record.sequence,
+    named,
+    packed,
+    names_held: holds(&named.0),
+    pack_held: holds(&packed.0),
+  };
+  (always || !wanted.names_held || !wanted.pack_held).then_some(wanted)
+}
+
+/// What [`read_changeset`] read: the names' rows and the pack's bytes, each only where the content store lacks it.
+#[derive(Debug, Default)]
+struct ChangesetRead {
+  /// The names' rows.
+  names: Option<Vec<u8>>,
+  /// The pack.
+  pack: Option<Vec<u8>>,
+}
+
+/// Reads `wanted`'s changeset from the node's store (A-767 C5): its row and sections, its `Names` section checked
+/// against the record's identity, its `Payload` found under the pack's identity and length (the store keys a payload by
+/// the plain BLAKE3 of its bytes, which the record's pack identity is); the names and the pack read only where the
+/// content store lacks them, the pack a piece at a time. Refused `Unlanded` where any of it is missing or differs.
+async fn read_changeset(
+  disk: &slates_store::owner::StoreHandle,
+  wanted: &ChangesetWanted,
+) -> Result<ChangesetRead, ReplayRefused> {
+  let unlanded = || ReplayRefused::Unlanded;
+  let row = disk
+    .changesets(wanted.repository, wanted.sequence, 1)
+    .await
+    .map_err(|_| unlanded())?
+    .into_iter()
+    .find(|row| row.sequence == wanted.sequence)
+    .ok_or_else(unlanded)?;
+  let sections = disk.sections(row).await.map_err(|_| unlanded())?;
+  let of = |kind| sections.iter().find(|section| section.section.kind == kind);
+  let names_at = of(slates_store::log::SectionKind::Names).ok_or_else(unlanded)?;
+  let payload_at = of(slates_store::log::SectionKind::Payload).ok_or_else(unlanded)?;
+  if payload_at.section.len != wanted.packed.1 {
+    return Err(unlanded());
+  }
+  let names = match &names_at.inline {
+    Some(inline) => inline.clone(),
+    None => section_bytes(disk, &names_at.section)
+      .await
+      .ok_or_else(unlanded)?,
+  };
+  if slates_vcs::ContentId::of(&names) != wanted.named.0 {
+    return Err(unlanded());
+  }
+  let pack = if wanted.pack_held {
+    // Held already: the store's payload row under the record's identity is the check.
+    disk
+      .piece(wanted.packed.0.0, wanted.packed.1, 0)
+      .await
+      .map_err(|_| unlanded())?
+      .ok_or_else(unlanded)?;
+    None
+  } else {
+    Some(
+      payload_bytes(disk, wanted.packed)
+        .await
+        .ok_or_else(unlanded)?,
+    )
+  };
+  Ok(ChangesetRead {
+    names: (!wanted.names_held).then_some(names),
+    pack,
+  })
+}
+
+/// A section's bytes read by its place a piece at a time ([`slates_store::owner::StoreHandle::read`]).
+async fn section_bytes(
+  disk: &slates_store::owner::StoreHandle,
+  section: &slates_store::log::Section,
+) -> Option<Vec<u8>> {
+  let len = usize::try_from(section.len).ok()?;
+  let mut bytes = Vec::new();
+  bytes.try_reserve_exact(len).ok()?;
+  while bytes.len() < len {
+    let at = u64::try_from(bytes.len()).ok()?;
+    let piece = disk
+      .read(
+        section.offset.checked_add(at)?,
+        section.len.checked_sub(at)?,
+      )
+      .await
+      .ok()?;
+    if piece.is_empty() {
+      return None;
+    }
+    bytes.extend_from_slice(&piece);
+  }
+  (bytes.len() == len).then_some(bytes)
+}
+
+/// A landed payload's bytes read by its identity a piece at a time ([`slates_store::owner::StoreHandle::piece`]).
+async fn payload_bytes(
+  disk: &slates_store::owner::StoreHandle,
+  (identity, len): (slates_vcs::ContentId, u64),
+) -> Option<Vec<u8>> {
+  let whole = usize::try_from(len).ok()?;
+  let mut bytes = Vec::new();
+  bytes.try_reserve_exact(whole).ok()?;
+  while bytes.len() < whole {
+    let at = u64::try_from(bytes.len()).ok()?;
+    let piece = disk.piece(identity.0, len, at).await.ok()??;
+    if piece.is_empty() {
+      return None;
+    }
+    bytes.extend_from_slice(&piece);
+  }
+  (bytes.len() == whole).then_some(bytes)
+}
+
+/// Puts what [`read_changeset`] read into the shard's content store, each checked against the record's identity and
+/// held by its put as one fetched from the region is, and notes the changeset's sequence as landed, so the next push
+/// lands at the last one named + 1 (main's ruling of 2026-11-20: a changeset landed past the register's head is
+/// dropped, and the next landing takes its sequence). Counted.
+fn put_changeset(
+  state: &mut ShardState,
+  id: RepositoryId,
+  wanted: &ChangesetWanted,
+  read: ChangesetRead,
+) -> Result<(), ReplayRefused> {
+  for (bytes, identity) in [(read.names, wanted.named.0), (read.pack, wanted.packed.0)] {
+    if let Some(bytes) = bytes
+      && put_names(state, &bytes) != Some(identity)
+    {
+      return Err(ReplayRefused::Unlanded);
+    }
+  }
+  state.vcs_stores.landed_changeset(id, wanted.sequence);
+  state.count(CHANGESET_READ, 1);
+  Ok(())
+}
+
+/// Counter: git changesets a recovery or rebuild read from the node's store before replaying the record naming them
+/// (A-767 C5). Format: a counter name.
+pub(crate) const CHANGESET_READ: &str = "vcs_store.git_changeset_read";
+
 /// Repository `id`'s record at `index` where it names a changeset on the changeset log (record v7, A-767 C4).
 fn hg_reference(
   state: &ShardState,
@@ -2961,10 +3183,17 @@ fn replay_svn(store: &mut SvnStore, bytes: &[u8], room: SvnRoom) -> Result<(), R
 /// hands the deltify job the stored texts it may take, so a job a restart cut off goes on. A text the store lacks is
 /// refused `SvnStored`. Nothing for a repository of another tool.
 fn hold_svn_stored(state: &mut ShardState, id: RepositoryId) -> Result<(), ReplayRefused> {
+  // A text read back from the node's store holds the hold its writing took already (`fetch_stored_texts`).
+  let fetched = state
+    .vcs_stores
+    .svn_fetched_texts
+    .remove(&id)
+    .unwrap_or_default();
   let Some(stored) = state.vcs_stores.subversion_records(id).map(|records| {
     records
       .stored_texts()
       .map(|(identity, _)| *identity)
+      .filter(|identity| !fetched.contains(identity))
       .collect::<Vec<_>>()
   }) else {
     return Ok(());
@@ -2982,6 +3211,108 @@ fn hold_svn_stored(state: &mut ShardState, id: RepositoryId) -> Result<(), Repla
     svn_deltify::resume(state, id);
   }
   held
+}
+
+/// Counter: a stored Subversion text a recovery read back from the node's store into the content store (C2 stage B):
+/// the shard's image had not kept it. Format: a counter name in the status report.
+pub(crate) const SVN_TEXT_FETCHED: &str = "vcs_store.svn_text_fetched";
+/// Counter: a stored Subversion text the content store lacked and the node's store could not give back whole; the
+/// replay's end then refuses it `SvnStored`. Format: a counter name.
+pub(crate) const SVN_TEXT_UNFETCHED: &str = "vcs_store.svn_text_unfetched";
+
+/// Reads back from the node's store every text repository `id`'s records keep stored that the content store lacks (C2
+/// stage B: a commit's changeset carries the texts it put, so the store holds each, while the content store holds only
+/// what the shard's last image kept), a piece at a time into the content store, each checked against its identity;
+/// counted. One not whole there is left out, and the replay's end refuses it `SvnStored`.
+async fn fetch_stored_texts(state: &mut ShardState, id: RepositoryId) {
+  let Some(disk) = state.vcs_disk.clone() else {
+    return;
+  };
+  let missing: Vec<(slates_svn::index::ContentIdentity, u64)> = {
+    let content = state.vcs_stores.content.as_ref();
+    state
+      .vcs_stores
+      .subversion_records(id)
+      .map(|records| {
+        records
+          .stored_texts()
+          .filter(|(identity, _)| {
+            !content.is_some_and(|content| content.contains(&slates_vcs::ContentId(**identity)))
+          })
+          .map(|(identity, len)| (*identity, len))
+          .collect()
+      })
+      .unwrap_or_default()
+  };
+  let repository = u128::from_be_bytes(id.bytes);
+  for (identity, len) in missing {
+    let fetched = fetch_text(state, &disk, (repository, identity, len)).await;
+    if fetched {
+      state
+        .vcs_stores
+        .svn_fetched_texts
+        .entry(id)
+        .or_default()
+        .insert(identity);
+    }
+    state.count(
+      if fetched {
+        SVN_TEXT_FETCHED
+      } else {
+        SVN_TEXT_UNFETCHED
+      },
+      1,
+    );
+  }
+}
+
+/// Text `identity` of `len` bytes of repository `repository`, read back from the node's store `disk` a piece at a time
+/// into the content store and made whole there (one hold); whether it was, its bytes its identity's. A busy owner is
+/// asked again after a yield.
+async fn fetch_text(
+  state: &mut ShardState,
+  disk: &slates_store::owner::StoreHandle,
+  (repository, identity, len): (u128, slates_svn::index::ContentIdentity, u64),
+) -> bool {
+  let mut writing = slates_vcs::Writing::default();
+  let mut offset = 0u64;
+  while offset < len {
+    let piece = match disk.text(repository, identity, offset).await {
+      Ok(Some(piece)) if !piece.is_empty() => piece,
+      Err(slates_store::owner::OwnerError::Busy) => {
+        slates_rt::futures::yield_now().await;
+        continue;
+      }
+      _ => break,
+    };
+    let brought = u64::try_from(piece.len()).unwrap_or(u64::MAX);
+    let put = within_budget(state, brought, |stores| {
+      stores
+        .content_mut()
+        .map(|content| content.put_window(&mut writing, &piece).is_ok())
+    });
+    if put != Some(true) {
+      break;
+    }
+    offset = offset.saturating_add(brought);
+  }
+  within_budget(state, 0, |stores| {
+    let Some(content) = stores.content_mut() else {
+      return false;
+    };
+    if offset != len {
+      content.abandon_object(writing);
+      return false;
+    }
+    match content.finish_object(&mut writing) {
+      Ok(made) if made == slates_vcs::ContentId(identity) => true,
+      Ok(made) => {
+        let _ = content.release(&made);
+        false
+      }
+      Err(_) => false,
+    }
+  })
 }
 
 /// Replay's end for repository `id`: its stored Subversion texts held again ([`hold_svn_stored`]), counted as a record's
@@ -3156,6 +3487,8 @@ async fn recover_repository(
 ) {
   make(state, record);
   let mut index = 0usize;
+  // The git record whose changeset was read from the node's store (A-767 C5), so it is read once, before its first turn.
+  let mut read_index = None;
   loop {
     // A Mercurial record is replayed a revision a unit (A-732): whole in one unit, a large repository's held its
     // shard past the watchdog's window at every restart.
@@ -3171,6 +3504,22 @@ async fn recover_repository(
       {
         state.vcs_stores.svn_fetched.insert(record.id, fetched);
       }
+      // A version-5 record's changeset read from the node's store before its first turn (A-767 C5): the register
+      // names it, so it is there, or the replay is refused.
+      if read_index != Some(index) {
+        read_index = Some(index);
+        if let Some(wanted) = changeset_wanted(state, record.id, index, true) {
+          let read = match state.vcs_disk.clone() {
+            Some(disk) => read_changeset(&disk, &wanted).await,
+            None => Err(ReplayRefused::Unlanded),
+          };
+          if let Err(refused) = read.and_then(|read| put_changeset(state, record.id, &wanted, read))
+          {
+            let _ = replayed(state, record.id, Err(refused));
+            break;
+          }
+        }
+      }
       // A git record carrying a pack is replayed a turn's units a unit of the recovery (A-722 part 4).
       let ns = state.config.step_quantum_ns();
       match record_turn(state, (record.id, index), ns) {
@@ -3183,6 +3532,9 @@ async fn recover_repository(
       }
     };
     let Some(outcome) = outcome else {
+      // A Subversion text a commit stored, which the shard's image did not keep, is read back from the node's store
+      // first (C2 stage B): its changeset carried it.
+      fetch_stored_texts(state, record.id).await;
       replay_ended(state, record.id);
       break;
     };
@@ -3285,6 +3637,20 @@ fn rebuild_sliced(state: &mut ShardState, id: RepositoryId) {
 /// finds them held. One that no home answers is left missing, and the replay refuses it typed.
 async fn rebuild_turns(id: RepositoryId, generation: u64) {
   loop {
+    // A version-5 record's names and pack read from the node's store where this node lacks them (A-767 C5).
+    if let Some(Some((wanted, disk))) = crate::state::with_state(|state| {
+      let under_way = state.vcs_stores.rebuild_turns.get(&id).copied()?;
+      if under_way.0 != generation || state.vcs_stores.git_replays.contains_key(&id) {
+        return None;
+      }
+      let wanted = changeset_wanted(state, id, under_way.1, false)?;
+      Some((wanted, state.vcs_disk.clone()?))
+    }) {
+      let read = read_changeset(&disk, &wanted).await;
+      let _ = crate::state::with_state(|state| {
+        read.and_then(|read| put_changeset(state, id, &wanted, read))
+      });
+    }
     while let Some(Some((origin, shards, identity))) =
       crate::state::with_state(|state| names_to_fetch(state, id, generation))
     {

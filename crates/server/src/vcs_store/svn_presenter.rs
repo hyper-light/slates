@@ -39,11 +39,12 @@ use slates_vfs::volume::{Store, Volume};
 
 use super::svn_texts::{HeadTexts, SvnView};
 
-/// Format: the mode of every directory of the view: read and search for its user, nothing for others.
-const DIRECTORY_MODE: u32 = 0o700;
+/// Format: the mode of every directory of the view: read and search for all, written by none (the view is read-only;
+/// `svnadmin create`'s directories are `0755`).
+const DIRECTORY_MODE: u32 = 0o755;
 
-/// Format: the mode of every file of the view: read-only for its user, as FSFS keeps its revision files.
-const FILE_MODE: u32 = 0o400;
+/// Format: the mode of every file of the view: read-only for all, as FSFS keeps its revision files (`0444`).
+const FILE_MODE: u32 = 0o444;
 
 /// Format: why a configured hook is refused where no view can be shown (A-645 (a)): a hook is shown its repository as a
 /// view slates mounts in its store's granted directory, and this daemon was given none (`--vcs-store`). Answered with
@@ -128,6 +129,9 @@ impl Laid {
 pub(crate) struct Presented {
   view: View,
   written: Revision,
+  /// The bytes of the revision files written so far, the texts they name counted in them: the view's content, which
+  /// its volume's ceiling is derived from ([`Presented::size_for`]).
+  bytes: u64,
 }
 
 impl Presented {
@@ -221,18 +225,59 @@ impl Presented {
     let Some(youngest) = laid.shown.checked_sub(1) else {
       return Ok(laid.advance);
     };
-    for directory in fsfs::directories(youngest) {
+    let directories = fsfs::directories(youngest);
+    self.size_for(volume, &laid, &directories)?;
+    for directory in directories {
       directory_at(volume, store, root, &directory)?;
     }
     for (path, pieces) in laid.files {
       let (parent, name) = parent_of(volume, store, root, &path)?;
-      volume.create_referenced(store, parent, name, FILE_MODE, pieces, holds)?;
+      let made = volume.create_referenced(store, parent, name, FILE_MODE, pieces, holds)?;
+      owned_as_root(volume, store, root, made)?;
     }
     for (path, bytes) in &laid.small {
       put_file(volume, store, root, path, bytes)?;
     }
     self.written = laid.shown;
     Ok(laid.advance)
+  }
+
+  /// Sizes the view's volume to its own content before `laid` is written (main's ruling of 2026-11-20: never a ceiling of
+  /// its own, R3): its bytes the files it shows (every revision file's length, the texts it names counted in them, and
+  /// the small files'), at least what it holds; its inodes and entries those it holds and, at most, one more for each
+  /// directory and file `laid` makes. Until then the view was made with a ceiling of nothing and could hold no file
+  /// (`Volume(NoSpace)`, w-interop's matrix).
+  fn size_for(
+    &mut self,
+    volume: &mut Volume,
+    laid: &Laid,
+    directories: &[String],
+  ) -> Result<(), PresentRefusal> {
+    let files: u64 = laid
+      .files
+      .iter()
+      .map(|(_, pieces)| pieces.iter().map(Piece::len).sum::<u64>())
+      .sum();
+    let small = laid
+      .small
+      .iter()
+      .map(|(_, bytes)| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+      .fold(0u64, u64::saturating_add);
+    self.bytes = self.bytes.saturating_add(files);
+    let held = volume.accounting().referenced_bytes;
+    volume.resize(self.bytes.saturating_add(small).max(held))?;
+    let made = u64::try_from(
+      directories
+        .len()
+        .saturating_add(laid.files.len())
+        .saturating_add(laid.small.len()),
+    )
+    .unwrap_or(u64::MAX);
+    let (inodes, _) = volume.inode_usage();
+    volume.set_inode_allowance(inodes.saturating_add(made))?;
+    let (entries, _) = volume.entry_usage();
+    volume.set_entry_allowance(entries.saturating_add(made))?;
+    Ok(())
   }
 
   /// Rewrites revision `revision`'s properties file from the records, after a revision property change; nothing for a
@@ -269,7 +314,11 @@ fn directory_at(
   for name in path.split('/').filter(|name| !name.is_empty()) {
     at = match volume.lookup_no(store, at, name) {
       Ok(found) => found.inode,
-      Err(VfsError::NotFound) => volume.mkdir_no(store, at, name, DIRECTORY_MODE)?,
+      Err(VfsError::NotFound) => {
+        let made = volume.mkdir_no(store, at, name, DIRECTORY_MODE)?;
+        owned_as_root(volume, store, root, made)?;
+        made
+      }
       Err(refusal) => return Err(refusal.into()),
     };
   }
@@ -314,7 +363,21 @@ fn put_file(
   } else {
     vec![Piece::Made(bytes.into())]
   };
-  volume.create_referenced(store, parent, name, FILE_MODE, pieces, &mut NoHolds)?;
+  let made = volume.create_referenced(store, parent, name, FILE_MODE, pieces, &mut NoHolds)?;
+  owned_as_root(volume, store, root, made)
+}
+
+/// Gives `made` the owner of the view's root, `root`, the user its mount serves: the volume core makes every inode owned
+/// by uid 0, so a view's entries were unreadable to the hook it is mounted for (found by use: the macOS mount's `cat`
+/// of `db/current` waited, owner 0 and mode `0400`).
+fn owned_as_root(
+  volume: &mut Volume,
+  store: &mut Store,
+  root: InodeNo,
+  made: InodeNo,
+) -> Result<(), PresentRefusal> {
+  let owner = volume.stat(store, root)?;
+  volume.chown(store, made, owner.uid, owner.gid)?;
   Ok(())
 }
 
@@ -604,6 +667,8 @@ fn slot_for(
         && state.db.partition().volume_by_name(name).is_none()
     })
     .ok_or("no view volume name routes to the repository's shard")?;
+  // Dynamic, its ceiling nothing yet: each slice of the view sizes it to the view's own content before it writes
+  // (`Presented::write`), so its ceiling is never a number of its own (R3).
   let reply = crate::verbs::create(
     state,
     &owner,

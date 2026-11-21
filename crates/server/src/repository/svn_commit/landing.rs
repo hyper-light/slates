@@ -20,6 +20,13 @@
 //! **The read back** ([`changeset_record`]): a recovery or a rebuild reads each named changeset's record from the store,
 //! a piece at a time past one piece, before its replay; the replay is then the live path's own (`commit_record`, a
 //! revision's `RevisionReplay`).
+//!
+//! **A commit's texts** (C2 stage B): a client's commit lands the texts it brings in its changeset, so the store holds
+//! every text its history names ([`land_changeset`]): a `Payload` section of the texts' bytes, each whole, streamed from
+//! the content store a piece at a time (never one copy of them all); a `Texts` section naming each by its path, identity
+//! and length and its place in that payload (`slates_store::texts`, the format every tool shares), which the store
+//! indexes so it makes any of them again (`StoreHandle::text`); then the `Record`. One flush commits the three. A
+//! recovery reads a stored text the content store lacks back from there (`vcs_store::fetch_stored_texts`).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
@@ -104,6 +111,135 @@ pub(crate) async fn land(
     }
   });
   landed.map(drop).map_err(|_| Uncommitted::Unstored)
+}
+
+/// A text a commit brings, as its changeset names it: the path its row sets it at, its identity and its length. Its
+/// bytes are the content store's, held by the commit until its landing ends.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LandedText {
+  /// The repository path.
+  pub(crate) path: Vec<u8>,
+  /// Its identity (BLAKE3 of its bytes).
+  pub(crate) identity: [u8; 32],
+  /// Its length.
+  pub(crate) len: u64,
+}
+
+/// Lands repository `repository`'s changeset `sequence` on the store `disk` (module docs): `record` alone where the
+/// changeset brings no text ([`land`]); else, in one sliced landing, the texts' `Payload`, read from the content store a
+/// piece at a time, their `Texts` and the `Record`, durable once answered. Refused `Unstored` where the store refused
+/// it, `NotHeld` where a text is not whole in the content store; nothing of a refused one is visible. Counted.
+pub(crate) async fn land_changeset(
+  disk: &StoreHandle,
+  (repository, sequence): (RepositoryId, u64),
+  record: Vec<u8>,
+  texts: &[LandedText],
+) -> Result<(), Uncommitted> {
+  if texts.is_empty() {
+    return land(
+      disk,
+      (repository, sequence),
+      vec![(SectionKind::Record, record)],
+    )
+    .await;
+  }
+  let landed = land_sliced(disk, (repository, sequence), record, texts).await;
+  let _ = crate::state::with_state(|state| match &landed {
+    Ok(()) => state.count(LANDED, 1),
+    Err(refused) => {
+      slates_machine::log_line!(
+        "slates-server: partition {}: the store refused a Subversion changeset {sequence} with its texts: \
+         {refused:?}",
+        state.partition
+      );
+      state.count(UNLANDED, 1);
+    }
+  });
+  landed
+}
+
+/// Shape: the sections of a changeset that brings texts: its `Payload`, its `Texts` and its `Record`.
+const SECTIONS_WITH_TEXTS: u16 = 3;
+
+/// [`land_changeset`]'s sliced landing.
+async fn land_sliced(
+  disk: &StoreHandle,
+  (repository, sequence): (RepositoryId, u64),
+  record: Vec<u8>,
+  texts: &[LandedText],
+) -> Result<(), Uncommitted> {
+  let unstored = |_| Uncommitted::Unstored;
+  let mut header = header(repository, sequence, disk.grant());
+  header.sections = SECTIONS_WITH_TEXTS;
+  let mut landing = disk.begin(header).await.map_err(unstored)?;
+  let payload_len = texts
+    .iter()
+    .fold(0u64, |total, text| total.saturating_add(text.len));
+  landing
+    .section(SectionKind::Payload, payload_len)
+    .await
+    .map_err(unstored)?;
+  let mut hasher = blake3::Hasher::new();
+  let mut places = Vec::with_capacity(texts.len());
+  let mut at = 0u64;
+  for text in texts {
+    places.push((at, text.len));
+    let mut sent = 0u64;
+    while sent < text.len {
+      let piece = content_piece(text, sent).ok_or(Uncommitted::NotHeld)?;
+      if piece.is_empty() {
+        return Err(Uncommitted::NotHeld);
+      }
+      hasher.update(&piece);
+      sent = sent.saturating_add(u64::try_from(piece.len()).unwrap_or(u64::MAX));
+      landing.part(piece).await.map_err(unstored)?;
+    }
+    at = at.saturating_add(text.len);
+  }
+  let payload = *hasher.finalize().as_bytes();
+  let entries: Vec<slates_store::texts::TextEntry> = texts
+    .iter()
+    .zip(places)
+    .map(|(text, (offset, len))| slates_store::texts::TextEntry {
+      path: text.path.clone(),
+      tool_id: Vec::new(),
+      text: text.identity,
+      len: text.len,
+      base: None,
+      place: slates_store::texts::Place {
+        payload,
+        offset,
+        len,
+      },
+    })
+    .collect();
+  for (kind, bytes) in [
+    (SectionKind::Texts, slates_store::texts::encode(&entries)),
+    (SectionKind::Record, record),
+  ] {
+    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    landing.section(kind, len).await.map_err(unstored)?;
+    for piece in bytes.chunks(slates_store::store::PIECE_BYTES) {
+      landing.part(piece.to_vec()).await.map_err(unstored)?;
+    }
+  }
+  landing.commit().await.map(drop).map_err(unstored)
+}
+
+/// The next piece of `text` from `offset` as the content store holds it, at most one of the store's pieces; none where
+/// the content store does not hold it whole or the shard's state is gone.
+fn content_piece(text: &LandedText, offset: u64) -> Option<Vec<u8>> {
+  crate::state::with_state(|state| {
+    crate::vcs_store::within_budget(state, 0, |stores| {
+      let run =
+        stores
+          .content()?
+          .run_at(&slates_vcs::ContentId(text.identity), text.len, offset)?;
+      let take = run.len().min(slates_store::store::PIECE_BYTES);
+      run.get(..take).map(<[u8]>::to_vec)
+    })
+  })
+  .flatten()
 }
 
 /// The node's store and the sequence repository `repository`'s next changeset lands at; refused `Unstored` where the

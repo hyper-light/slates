@@ -4480,6 +4480,7 @@ pub fn shard_report(state: &mut ShardState, memory: bool) -> ShardReport {
       )
       .chain(large_counts(state))
       .chain(content_ranges)
+      .chain(crate::live_ship::hop_rows(state))
       .collect(),
     replayed_records: state.recovered.replayed_records,
     replay_ns: state.recovered.replay_ns,
@@ -9003,8 +9004,12 @@ fn report_first_work_log_refusal(state: &ShardState) {
     return;
   }
   let held = state.db.partition().merge_budget_held();
+  let largest = held
+    .largest_work
+    .map(|work| crate::work_log::describe_log(state.db.partition().work_log(work)))
+    .unwrap_or_default();
   slates_machine::log_line!(
-    "slates-server: work log refused at the merge budget (first occurrence): shard={} {held:?}",
+    "slates-server: work log refused at the merge budget (first occurrence): shard={} {held:?} largest log: {largest}",
     state.shard
   );
 }

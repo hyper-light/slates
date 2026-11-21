@@ -477,10 +477,9 @@ fn of_step(room: u64, refusal: Uncommitted, revision: u64) -> Refusal {
     Uncommitted::Unsupported { .. } => import_refused(ImportFault::Format),
     Uncommitted::Budget { available } => Refusal::BudgetExceeded { available },
     Uncommitted::Append(refused) => of_append(refused),
-    Uncommitted::NotHeld
-    | Uncommitted::Diverged
-    | Uncommitted::NotDurable(_)
-    | Uncommitted::Unstored => Refusal::ContentUnavailable,
+    Uncommitted::NotHeld | Uncommitted::Diverged | Uncommitted::Unstored => {
+      Refusal::ContentUnavailable
+    }
   }
 }
 

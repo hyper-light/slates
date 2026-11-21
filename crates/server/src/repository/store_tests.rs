@@ -611,7 +611,8 @@ fn read_back(
 /// owner; start both again over the same segment and store. Expect: the recovered repository equal to the one before
 /// the stop (records whole, youngest 2, the green at version 2), with nothing refused; its register five references
 /// naming sequences 0 to 4 (the creation, the two revisions, the properties and the deltified text), no record's bytes;
-/// the store's log holding those five changesets; and the file read back at revision 2.
+/// the store's log holding those five changesets, revision 1's carrying its text (C2 stage B: its payload, the `Texts`
+/// entry naming it there, then its record); and the file read back at revision 2.
 #[test]
 fn a_restarted_daemon_recovers_subversion_from_the_store_as_it_stood() {
   let instance = format!("vcs-store-svn-arbiter-{}", std::process::id());
@@ -685,13 +686,52 @@ fn a_restarted_daemon_recovers_subversion_from_the_store_as_it_stood() {
   )
   .unwrap();
   let mut found = Vec::new();
-  let _log = ChangesetLog::recover(log_file, 0, |_, located| found.push(*located)).unwrap();
-  let sequences: Vec<u64> = found
+  let log = ChangesetLog::recover(log_file, 0, |_, located| found.push(*located)).unwrap();
+  let ours: Vec<_> = found
     .iter()
     .filter(|located| located.header.repository == u128::from_be_bytes(repository.bytes))
-    .map(|located| located.header.sequence)
+    .copied()
     .collect();
+  let sequences: Vec<u64> = ours.iter().map(|located| located.header.sequence).collect();
   assert_eq!(sequences, vec![0, 1, 2, 3, 4]);
+  // Revision 1's changeset carries the text it put (C2 stage B): its payload, the `Texts` entry naming it there, then
+  // its record.
+  let sections = log.sections(&ours[1]).unwrap();
+  let kinds: Vec<SectionKind> = sections.iter().map(|section| section.kind).collect();
+  assert_eq!(
+    kinds,
+    vec![
+      SectionKind::Payload,
+      SectionKind::Texts,
+      SectionKind::Record
+    ]
+  );
+  let read = |section: &slates_store::log::Section| {
+    let mut bytes = vec![0u8; usize::try_from(section.len).unwrap()];
+    log.read_at(&mut bytes, section.offset).unwrap();
+    bytes
+  };
+  let payload = read(&sections[0]);
+  let entries = slates_store::texts::decode(&read(&sections[1])).unwrap();
+  assert_eq!(payload, b"alpha\n");
+  let entry = &entries[0];
+  assert_eq!(
+    (
+      entries.len(),
+      entry.path.as_slice(),
+      entry.text,
+      entry.len,
+      entry.base
+    ),
+    (
+      1,
+      b"/trunk/a.txt".as_slice(),
+      *blake3::hash(b"alpha\n").as_bytes(),
+      6,
+      None
+    )
+  );
+  assert_eq!(entry.place.payload, *blake3::hash(&payload).as_bytes());
 }
 
 /// C2's crash between the store's landing and the register's commit (main's rulings of 2026-11-20 20:30 item 5 and
