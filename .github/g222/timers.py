@@ -8,3 +8,8 @@ def run(label, f, n=2000):
 kq=select.kqueue()
 run(sys.argv[1]+' nanosleep', lambda: time.sleep(200e-6))
 run(sys.argv[1]+' kevent', lambda: kq.control(None, 1, 200e-6))
+import ctypes
+libc=ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True)
+word=ctypes.c_uint32(0)
+# __ulock_wait(UL_COMPARE_AND_WAIT=1, addr, value, timeout_us): the client's park between its looks.
+run(sys.argv[1]+' ulock', lambda: libc.__ulock_wait(1, ctypes.byref(word), 0, 200))
