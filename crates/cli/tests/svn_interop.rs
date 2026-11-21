@@ -867,6 +867,328 @@ fn stock_svn_locks_and_unlocks_over_the_vcs_http_edge() {
   locking(&leg.svn, &leg.url);
 }
 
+/// Writes `text` as `path` inside working copy `copy`, making its directory: the test writes the files stock `svn`
+/// commits, inside the scratch directory it removes (R1's wall is shipped code's).
+#[allow(clippy::disallowed_methods)]
+fn put_at(copy: &str, path: &str, text: &str) {
+  let file = std::path::Path::new(copy).join(path);
+  if let Some(parent) = file.parent() {
+    std::fs::create_dir_all(parent).unwrap();
+  }
+  std::fs::write(file, text).unwrap();
+}
+
+/// Whether `line` holds a Subversion timestamp (`2026-11-21T19:12:03.123456Z`, `svn_time_to_cstring`'s shape), which
+/// two servers' runs never share.
+fn holds_a_timestamp(line: &str) -> bool {
+  let bytes = line.as_bytes();
+  bytes.windows(27).any(|window| {
+    window.iter().enumerate().all(|(at, byte)| match at {
+      4 | 7 => *byte == b'-',
+      10 => *byte == b'T',
+      13 | 16 => *byte == b':',
+      19 => *byte == b'.',
+      26 => *byte == b'Z',
+      _ => byte.is_ascii_digit(),
+    })
+  })
+}
+
+/// `output` as two servers' runs of one session can be compared byte for byte: each line holding a timestamp, or a
+/// `<date>` element whose value is on it, left out; `author` (the leg's one committer) written `AUTHOR`; `url` (the
+/// leg's repository URL) written `URL`. Nothing else is changed.
+fn comparable(output: &str, author: &str, url: &str) -> String {
+  output
+    .lines()
+    .filter(|line| !holds_a_timestamp(line))
+    .map(|line| line.replace(url, "URL").replace(author, "AUTHOR"))
+    .fold(String::new(), |mut text, line| {
+      text.push_str(&line);
+      text.push('\n');
+      text
+    })
+}
+
+/// The HTTPv2 session (A-681 part C, by use), run as `svn` against `url`, a fresh repository whose `pre-revprop-change`
+/// hook allows every change: what a user does over a repository's life, each command's standard output kept under a
+/// label, in order. Commits from a working copy (adds, a nested directory, versioned properties on a file and a
+/// directory, an edit, a copy within the copy, a move, a property deleted and a file deleted), server-side copies,
+/// moves, deletes and a `mkdir` by URL (a copy of an older revision among them), an `import`, revision properties
+/// changed and read back, an update, and the reads of what that made: the log (`--xml --verbose`, the whole and a
+/// branch's `--stop-on-copy`), `list -R`, `cat` at the head and at an older revision, `proplist -v -R` over a URL and
+/// over the working copy, `blame --xml`, `diff -c` and `status -u --xml`. Fails the test where a command fails, naming
+/// it; what it answered is the caller's to compare.
+fn httpv2_session(svn: &Svn, url: &str) -> Vec<(&'static str, String)> {
+  let copy = svn.copy("work");
+  let mut kept = Vec::new();
+  let mut run = |label: &'static str, dir: &str, args: &[&str]| {
+    kept.push((label, svn.ok(dir, args)));
+  };
+  run("checkout", &svn.scratch, &["checkout", url, &copy]);
+  run("mkdir", &copy, &["mkdir", "trunk", "branches", "tags"]);
+  put_at(&copy, "trunk/file", "one\n");
+  put_at(&copy, "trunk/sub/inner", "inner\n");
+  run("add", &copy, &["add", "trunk/file", "trunk/sub"]);
+  run("commit 1", &copy, &["commit", "--message", "the layout"]);
+  run(
+    "propset file",
+    &copy,
+    &["propset", "color", "blue", "trunk/file"],
+  );
+  run(
+    "propset dir",
+    &copy,
+    &["propset", "svn:ignore", "*.o\n", "trunk"],
+  );
+  run("commit 2", &copy, &["commit", "--message", "properties"]);
+  put_at(&copy, "trunk/file", "one\ntwo\n");
+  run("commit 3", &copy, &["commit", "--message", "an edit"]);
+  run(
+    "copy in the copy",
+    &copy,
+    &["copy", "trunk/file", "trunk/file-copy"],
+  );
+  run("commit 4", &copy, &["commit", "--message", "a copy"]);
+  let trunk = format!("{url}/trunk");
+  let first_branch = format!("{url}/branches/first");
+  let second_branch = format!("{url}/branches/second");
+  run(
+    "copy an older revision by URL",
+    &svn.scratch,
+    &[
+      "copy",
+      "--revision",
+      "1",
+      &trunk,
+      &first_branch,
+      "--message",
+      "a branch from 1",
+    ],
+  );
+  run(
+    "move by URL",
+    &svn.scratch,
+    &[
+      "move",
+      &first_branch,
+      &second_branch,
+      "--message",
+      "a branch renamed",
+    ],
+  );
+  run(
+    "mkdir by URL",
+    &svn.scratch,
+    &[
+      "mkdir",
+      &format!("{url}/tags/empty"),
+      "--message",
+      "a tag's directory",
+    ],
+  );
+  run(
+    "delete by URL",
+    &svn.scratch,
+    &[
+      "delete",
+      &format!("{url}/tags/empty"),
+      "--message",
+      "gone again",
+    ],
+  );
+  run("update", &copy, &["update"]);
+  run(
+    "move in the copy",
+    &copy,
+    &["move", "trunk/sub", "trunk/moved"],
+  );
+  run("propdel", &copy, &["propdel", "color", "trunk/file"]);
+  run("delete in the copy", &copy, &["delete", "trunk/file-copy"]);
+  run(
+    "commit 9",
+    &copy,
+    &["commit", "--message", "a move, a property and a file gone"],
+  );
+  let imported = format!("{}/imported", svn.scratch);
+  put_at(&imported, "a", "a\n");
+  put_at(&imported, "deeper/b", "b\n");
+  run(
+    "import",
+    &svn.scratch,
+    &[
+      "import",
+      &imported,
+      &format!("{url}/imported"),
+      "--message",
+      "an import",
+    ],
+  );
+  run(
+    "revprop set log",
+    &svn.scratch,
+    &[
+      "propset",
+      "--revprop",
+      "--revision",
+      "3",
+      "svn:log",
+      "an edit, renamed",
+      url,
+    ],
+  );
+  run(
+    "revprop set custom",
+    &svn.scratch,
+    &[
+      "propset",
+      "--revprop",
+      "--revision",
+      "3",
+      "custom",
+      "value",
+      url,
+    ],
+  );
+  run(
+    "revprop get",
+    &svn.scratch,
+    &["propget", "--revprop", "--revision", "3", "custom", url],
+  );
+  run(
+    "revprop list",
+    &svn.scratch,
+    &["proplist", "--revprop", "--verbose", "--revision", "3", url],
+  );
+  run(
+    "revprop delete",
+    &svn.scratch,
+    &["propdel", "--revprop", "--revision", "3", "custom", url],
+  );
+  run("update again", &copy, &["update"]);
+  run("log", &svn.scratch, &["log", "--xml", "--verbose", url]);
+  run(
+    "log of a branch",
+    &svn.scratch,
+    &[
+      "log",
+      "--xml",
+      "--verbose",
+      "--stop-on-copy",
+      &second_branch,
+    ],
+  );
+  run("list", &svn.scratch, &["list", "--recursive", url]);
+  run("cat", &svn.scratch, &["cat", &format!("{trunk}/file")]);
+  run(
+    "cat of an older revision",
+    &svn.scratch,
+    &["cat", "--revision", "1", &format!("{trunk}/file")],
+  );
+  run(
+    "cat of a copy",
+    &svn.scratch,
+    &["cat", &format!("{second_branch}/file")],
+  );
+  run(
+    "proplist of a URL",
+    &svn.scratch,
+    &["proplist", "--verbose", "--recursive", &trunk],
+  );
+  run(
+    "proplist of the copy",
+    &copy,
+    &["proplist", "--verbose", "--recursive"],
+  );
+  run(
+    "blame",
+    &svn.scratch,
+    &["blame", "--xml", &format!("{trunk}/file")],
+  );
+  run("diff", &svn.scratch, &["diff", "--change", "3", url]);
+  run(
+    "status",
+    &copy,
+    &["status", "--show-updates", "--verbose", "--xml"],
+  );
+  kept
+}
+
+/// A-681 part C, by use: stock `svn` 1.15 speaks HTTPv2 to a server whose OPTIONS sends `SVN-Me-Resource` (ra_serf
+/// `options.c`), which slates' edge sends to every client. Do: make an FSFS repository with stock `svnadmin create`,
+/// its `pre-revprop-change` hook allowing every change, and run [`httpv2_session`] against it through stock `svnserve
+/// -t` (the control, as [`stock_svn_sessions_hold_against_stock_svnserve`] runs it); start an anchor with its HTTP edge
+/// on loopback, make the repository, give it the same hook (`slates repository policy --hook`), and run the same
+/// session as stock `svn` at `http://127.0.0.1:PORT/project`, a token as Basic's password. Expect: every command of
+/// both runs succeeds, and each answers the same bytes over slates as over `svnserve`, once each line holding a
+/// timestamp is left out and each leg's committer and URL are written alike ([`comparable`]). Skips loudly without
+/// stock Subversion 1.15 (`svn`, `svnadmin` and `svnserve`).
+#[test]
+fn stock_svn_over_httpv2_answers_as_stock_svnserve_byte_for_byte() {
+  if !stock_svn() || !stock_svnserve() {
+    eprintln!(
+      "skipping stock svn over HTTPv2 against svnserve: no stock Subversion 1.15 here (svn, svnadmin and svnserve on \
+       the PATH)"
+    );
+    return;
+  }
+  let control_scratch = Scratch::new("svn-v2-control");
+  let root = format!("{}/repositories", control_scratch.path);
+  made_directory(&root);
+  let made = Command::new("svnadmin")
+    .args(["create", &format!("{root}/{REPOSITORY}")])
+    .output()
+    .unwrap();
+  assert!(made.status.success(), "svnadmin create: {made:?}");
+  let allow = format!("{}/allow-revprop-change", control_scratch.path);
+  allowing_hook(&allow);
+  allowing_hook(&format!("{root}/{REPOSITORY}/hooks/pre-revprop-change"));
+  let tunnel = vec![
+    "--config-option".to_owned(),
+    format!(
+      "config:tunnels:{CONTROL_TUNNEL}=sh -c 'exec svnserve -t -r {root} --tunnel-user={TUNNEL_USER}'"
+    ),
+  ];
+  let control_url = format!("svn+{CONTROL_TUNNEL}://localhost/{REPOSITORY}");
+  let control_svn = Svn::new(&control_scratch, "v2", tunnel);
+  let control = httpv2_session(&control_svn, &control_url);
+  let Some(leg) = http_leg("v2") else {
+    return;
+  };
+  let instance = format!("svn-http-v2-{}", std::process::id());
+  let (code, out, err) = slates(
+    &instance,
+    &[
+      "repository",
+      "policy",
+      REPOSITORY,
+      "--hook",
+      &format!("pre-revprop-change={allow}"),
+    ],
+  );
+  assert_eq!(code, 0, "repository policy: {out}{err}");
+  let served = httpv2_session(&leg.svn, &leg.url);
+  let control_author = author_of_head(&control_svn, &control_url);
+  let served_author = author_of_head(&leg.svn, &leg.url);
+  for ((label, expected), (_, answered)) in control.iter().zip(&served) {
+    assert_eq!(
+      comparable(answered, &served_author, &leg.url),
+      comparable(expected, &control_author, &control_url),
+      "svn's {label} over HTTPv2 (left) and against svnserve (right)"
+    );
+  }
+}
+
+/// Writes an executable `pre-revprop-change` hook at `path` that allows every change, as `svnsync`'s mirrors carry.
+#[allow(clippy::disallowed_methods)]
+fn allowing_hook(path: &str) {
+  std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+  }
+}
+
 /// A fresh Ed25519 key `ssh-keygen` makes in `scratch`, with no passphrase: its private half's path and its public
 /// line, or `None` where this host has no `ssh-keygen`.
 fn ssh_key(scratch: &Scratch) -> Option<(String, String)> {

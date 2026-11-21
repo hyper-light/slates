@@ -29,7 +29,7 @@
 
 use core::ops::Range;
 use std::borrow::Cow;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use slates_vcs::{ContentStore, IndexRefused};
 
@@ -94,6 +94,12 @@ pub struct Intaken {
   /// and memory are to grow with what it brings, not with the history under it): a delta base it did not hold as the
   /// text kept last. A new manifest's files are checked from the lines its delta wrote, rebuilding nothing.
   pub rebuilt: u64,
+  /// The file delta bases found in the push's cache of its own texts ([`BaseCache`]; A-767 C1, main's ruling (b2)).
+  pub base_hits: u64,
+  /// The file revisions rebuilt from the push's own deltas to make a base the cache did not hold ((b1), counted).
+  pub base_rebuilds: u64,
+  /// The file delta bases read from the node's changeset store between steps: a revision landed before the push.
+  pub base_store_reads: u64,
 }
 
 /// Format: the path a `Texts` entry gives the changelog's revisions: no tracked path holds a NUL (7.2's
@@ -142,6 +148,9 @@ pub enum Stepped {
   /// The step needs these bytes of the changegroup, which its source does not hold (`crate::framing`): nothing was
   /// taken; put them in and step again. A whole changegroup in memory never wants.
   Wanted(Range<u64>),
+  /// The step needs a file delta's base from the node's changeset store, a revision landed before the push (A-767 C1):
+  /// nothing was taken; answer the intake's `crate::render::StoreWants` and step again.
+  Store,
 }
 
 /// The unit a step takes next.
@@ -269,6 +278,196 @@ struct Taker {
   path: Option<Vec<u8>>,
   /// What was brought.
   intaken: Intaken,
+  /// Each file revision the push brought in the group being taken, by node: its place in the group, from which its
+  /// text is rebuilt where a later delta names it as its base ((b1)).
+  positions: BTreeMap<Node, usize>,
+  /// The push's own file texts kept for later deltas' bases ((b2)), let go as each file group ends.
+  cache: BaseCache,
+  /// A file delta's base asked of the store, and its answer.
+  asked: Option<StoreAsk>,
+}
+
+/// The push's own file texts a later delta may name as its base (A-767 C1, main's ruling (b2)): the texts kept before
+/// the one kept last, oldest out first, at most the room the push was admitted (derived: what one step of the push may
+/// hold, so the intake's working set is at most twice its room), let go as each file group ends and with the push. A
+/// miss is rebuilt from the push's own deltas ((b1)), the one source; the cache only saves the rebuild.
+#[derive(Debug, Default)]
+struct BaseCache {
+  /// The texts, by node.
+  held: BTreeMap<Node, Vec<u8>>,
+  /// Their order of arrival, oldest first.
+  order: VecDeque<Node>,
+  /// The bytes they hold.
+  bytes: u64,
+  /// The most bytes they may hold.
+  bound: u64,
+}
+
+impl BaseCache {
+  /// The cache of a push admitted `room` bytes.
+  fn within(room: u64) -> BaseCache {
+    BaseCache {
+      bound: room,
+      ..BaseCache::default()
+    }
+  }
+
+  /// Keeps `text` as `node`'s, letting the oldest go until it fits; a text past the bound alone is not kept.
+  fn put(&mut self, node: Node, text: Vec<u8>) {
+    let len = to_u64(text.len());
+    if len > self.bound || self.held.contains_key(&node) {
+      return;
+    }
+    while self.bytes.saturating_add(len) > self.bound {
+      let Some(oldest) = self.order.pop_front() else {
+        break;
+      };
+      if let Some(gone) = self.held.remove(&oldest) {
+        self.bytes = self.bytes.saturating_sub(to_u64(gone.len()));
+      }
+    }
+    self.bytes = self.bytes.saturating_add(len);
+    self.order.push_back(node);
+    self.held.insert(node, text);
+  }
+
+  /// Lets every text go.
+  fn clear(&mut self) {
+    self.held.clear();
+    self.order.clear();
+    self.bytes = 0;
+  }
+}
+
+/// A file delta's base asked of the node's changeset store: its log's rows by node, then its text by identity, within
+/// the room it was asked in.
+#[derive(Debug)]
+struct StoreAsk {
+  /// The file's path.
+  path: Vec<u8>,
+  /// The base's node.
+  node: Node,
+  /// What is asked next.
+  want: Option<crate::render::Want>,
+  /// The most bytes its text may hold.
+  most: u64,
+  /// The text, once given.
+  text: Option<Vec<u8>>,
+  /// Why it could not be read, if it could not.
+  refused: Option<Refused>,
+}
+
+/// What a file delta's base came to ([`Taker::file_base`]).
+enum Based {
+  /// Its text.
+  Text(Vec<u8>),
+  /// The changegroup's bytes the rebuild needs: put them in and step again.
+  Wanted(Range<u64>),
+  /// The store is asked: answer it and step again.
+  Store,
+}
+
+impl crate::render::StoreWants for Intake {
+  fn wants(&self) -> Option<&crate::render::Want> {
+    self
+      .taker
+      .asked
+      .as_ref()
+      .and_then(|asked| asked.want.as_ref())
+  }
+
+  fn give_rows(&mut self, rows: Vec<Vec<Option<crate::render::StoredRevision>>>) {
+    let Some(asked) = self.taker.asked.as_mut() else {
+      return;
+    };
+    match rows
+      .into_iter()
+      .next()
+      .and_then(|log| log.into_iter().next())
+      .flatten()
+    {
+      Some(row) => {
+        asked.want = Some(crate::render::Want::Texts {
+          texts: vec![row.text],
+          most: asked.most,
+        });
+      }
+      None => {
+        asked.want = None;
+        asked.refused = Some(Refused::Unverified(Unverified::UnknownDeltaBase {
+          log: LogOf::File(asked.path.clone()),
+          node: asked.node,
+          base: asked.node,
+        }));
+      }
+    }
+  }
+
+  fn give_chunks(&mut self, _chunks: Vec<Vec<u8>>) {
+    if let Some(asked) = self.taker.asked.as_mut() {
+      asked.want = None;
+    }
+  }
+
+  fn give_texts(&mut self, texts: Vec<Vec<u8>>) {
+    let Some(asked) = self.taker.asked.as_mut() else {
+      return;
+    };
+    asked.want = None;
+    asked.text = texts.into_iter().next();
+    if asked.text.is_none() {
+      asked.refused = Some(Refused::Unverified(Unverified::UnknownDeltaBase {
+        log: LogOf::File(asked.path.clone()),
+        node: asked.node,
+        base: asked.node,
+      }));
+    }
+  }
+
+  fn reads_bases(&self) -> bool {
+    true
+  }
+
+  fn texts_past(&mut self) {
+    if let Some(asked) = self.taker.asked.as_mut() {
+      asked.want = None;
+      asked.refused = Some(Refused::from(crate::PastAdmission {
+        asked: asked.most.saturating_add(1),
+        left: asked.most,
+      }));
+    }
+  }
+}
+
+impl Intake {
+  /// The intake with its cache of the push's own texts bounded at `bound` bytes ((b2)): zero leaves (b1) alone, the
+  /// A/B's other arm and a test's rebuilds.
+  #[cfg(test)]
+  pub(crate) fn with_base_cache(mut self, bound: u64) -> Self {
+    self.taker.cache = BaseCache::within(bound);
+    self
+  }
+
+  /// Answers the store's want from the fork's own texts, as a test's stand-in for the node's changeset store (the tests
+  /// keep no store): the base the step asked for, read back from the fork's content store.
+  #[cfg(test)]
+  pub(crate) fn answer_from_fork(&mut self, store: &ContentStore) {
+    let Some(asked) = self.taker.asked.as_mut() else {
+      return;
+    };
+    let held = IndexHeld::new(&self.taker.fork, store);
+    asked.want = None;
+    match held.file_text(&asked.path, &asked.node) {
+      Some(text) => asked.text = Some(text.into_owned()),
+      None => {
+        asked.refused = Some(Refused::Unverified(Unverified::UnknownDeltaBase {
+          log: LogOf::File(asked.path.clone()),
+          node: asked.node,
+          base: asked.node,
+        }));
+      }
+    }
+  }
 }
 
 impl Intake {
@@ -281,7 +480,7 @@ impl Intake {
     admission: &mut Admission,
   ) -> Result<Self, Refused> {
     let frame = Frame::of(payload, version, admission)?;
-    Intake::with_frame(frame, index, store)
+    Intake::with_frame(frame, index, store, admission.left())
   }
 
   /// Starts taking a changegroup its caller framed (`crate::framing::Framing`, over a source read a piece at a time,
@@ -291,8 +490,9 @@ impl Intake {
     framed: Framed,
     index: &mut HgIndex,
     store: &mut ContentStore,
+    room: u64,
   ) -> Result<Self, Refused> {
-    Intake::with_frame(Frame::framed(framed)?, index, store)
+    Intake::with_frame(Frame::framed(framed)?, index, store, room)
   }
 
   /// [`Intake::begin`]'s fork made over `frame`.
@@ -300,6 +500,7 @@ impl Intake {
     frame: Frame,
     index: &mut HgIndex,
     store: &mut ContentStore,
+    room: u64,
   ) -> Result<Self, Refused> {
     let fork = index.fork(store).map_err(Unindexed::Fork)?;
     Ok(Intake {
@@ -315,6 +516,9 @@ impl Intake {
         logged: false,
         path: None,
         intaken: Intaken::default(),
+        positions: BTreeMap::new(),
+        cache: BaseCache::within(room),
+        asked: None,
       },
     })
   }
@@ -385,7 +589,7 @@ impl Taker {
       self.enter(after);
       return Ok(Stepped::More);
     };
-    self.take(log, (&revision, place), store, admission)?;
+    self.take(log, (&revision, place), None, (store, admission))?;
     self.stage = match self.stage {
       Stage::Changelog(at) => Stage::Changelog(at.saturating_add(1)),
       Stage::Manifests(at) => Stage::Manifests(at.saturating_add(1)),
@@ -431,7 +635,51 @@ impl Taker {
       });
       return Ok(Stepped::More);
     };
-    let taken = self.take(Log::File(&path), (&revision, place), store, admission);
+    // A file delta's base other than the text kept last: rebuilt from the push's own deltas, read from its cache, or
+    // read from the store between steps for a revision landed before the push (A-767 C1).
+    let kept_before = self.brought.contains(&revision.node)
+      || self
+        .fork
+        .rev(store, Log::File(&path), &revision.node)
+        .is_some();
+    let names_last = self
+      .last
+      .as_ref()
+      .is_some_and(|(node, _)| *node == revision.base);
+    let given = if kept_before || revision.base == NULL_NODE || names_last {
+      None
+    } else {
+      let mut room = *admission;
+      match self.file_base(
+        (frame, payload),
+        (&path, &revisions),
+        revision.base,
+        (store, &mut room),
+      ) {
+        Ok(Based::Text(text)) => Some(text),
+        Ok(Based::Wanted(range)) => {
+          self.path = Some(path);
+          return Ok(Stepped::Wanted(range));
+        }
+        Ok(Based::Store) => {
+          self.path = Some(path);
+          return Ok(Stepped::Store);
+        }
+        Err(refused) => {
+          self.path = Some(path);
+          return Err(refused);
+        }
+      }
+    };
+    let taken = self.take(
+      Log::File(&path),
+      (&revision, place),
+      given,
+      (store, admission),
+    );
+    if taken.is_ok() && !kept_before {
+      self.positions.insert(revision.node, at);
+    }
     self.path = Some(path);
     taken?;
     self.stage = Stage::Files {
@@ -444,6 +692,9 @@ impl Taker {
   /// Moves to `stage`, a new log's: what the last one brought is let go.
   fn enter(&mut self, stage: Stage) {
     self.path = None;
+    self.positions.clear();
+    self.cache.clear();
+    self.asked = None;
     self.brought.clear();
     self.last = None;
     self.last_identity = None;
@@ -476,8 +727,8 @@ impl Taker {
     &mut self,
     log: Log<'_>,
     (revision, place): (&Revision<'_>, Range<u64>),
-    store: &mut ContentStore,
-    admission: &mut Admission,
+    given: Option<Vec<u8>>,
+    (store, admission): (&mut ContentStore, &mut Admission),
   ) -> Result<(), Refused> {
     if self.brought.contains(&revision.node) {
       self.intaken.passed_over = self.intaken.passed_over.saturating_add(1);
@@ -493,8 +744,12 @@ impl Taker {
     }
     self.check_known(log, revision, store)?;
     let mut room = *admission;
-    let base_text = self.base_text(log, revision, store);
-    let base_rebuilt = matches!(base_text, Some(Cow::Owned(_)));
+    let base_rebuilt = given.is_none() && revision.base != NULL_NODE;
+    let base_text = match given {
+      Some(text) => Some(Cow::Owned(text)),
+      None => self.base_text(log, revision, store),
+    };
+    let base_rebuilt = base_rebuilt && matches!(base_text, Some(Cow::Owned(_)));
     let base = match (&base_text, &self.last_identity) {
       _ if revision.base == NULL_NODE => None,
       (_, Some((node, identity))) if *node == revision.base => Some(*identity),
@@ -560,6 +815,10 @@ impl Taker {
       place,
     });
     self.last_identity = Some((revision.node, identity));
+    // The text kept before this one may be a later delta's base: the push's cache keeps it ((b2)).
+    if let (Log::File(_), Some((node, text))) = (log, self.last.take()) {
+      self.cache.put(node, text);
+    }
     self.last = Some((revision.node, arrived.text));
     Ok(())
   }
@@ -589,6 +848,105 @@ impl Taker {
       }),
       None => Ok(()),
     }
+  }
+
+  /// The text of file delta base `base` (A-767 C1, main's ruling (b2) over (b1)): from the push's cache where it holds
+  /// it; else rebuilt from the push's own deltas, walked back from `base` through the revisions the group brought to a
+  /// text in hand (the null base, the text kept last, the cache's, or a revision landed before the push, read from the
+  /// store between steps), each rebuilt text kept in the cache; refused where the base is none of those.
+  fn file_base<S: Source + ?Sized>(
+    &mut self,
+    (frame, payload): (&Frame, &S),
+    (path, revisions): (&[u8], &Range<usize>),
+    base: Node,
+    (store, room): (&ContentStore, &mut Admission),
+  ) -> Result<Based, Refused> {
+    let unknown = |node: Node| {
+      Refused::Unverified(Unverified::UnknownDeltaBase {
+        log: LogOf::File(path.to_vec()),
+        node,
+        base,
+      })
+    };
+    let mut chain: Vec<usize> = Vec::new();
+    let mut at = base;
+    let start = loop {
+      if at == NULL_NODE {
+        break Vec::new();
+      }
+      if let Some((node, text)) = &self.last
+        && *node == at
+      {
+        break text.clone();
+      }
+      if let Some(text) = self.cache.held.get(&at) {
+        self.intaken.base_hits = self.intaken.base_hits.saturating_add(1);
+        break text.clone();
+      }
+      if let Some(index) = self.positions.get(&at).copied() {
+        let revision = match frame.placed(payload, revisions, index) {
+          Ok(Some((revision, _))) => revision,
+          Ok(None) => return Err(unknown(at)),
+          Err(wanted) => return Ok(Based::Wanted(wanted.range)),
+        };
+        room.charge_items::<usize>(1)?;
+        chain.push(index);
+        at = revision.base;
+        continue;
+      }
+      if self.fork.rev(store, Log::File(path), &at).is_none() {
+        return Err(unknown(at));
+      }
+      // Landed before the push: its text read from the store between steps.
+      match self.asked.take() {
+        Some(asked) if asked.node == at && asked.path == path => {
+          if let Some(refused) = asked.refused {
+            return Err(refused);
+          }
+          match asked.text {
+            Some(text) => {
+              self.intaken.base_store_reads = self.intaken.base_store_reads.saturating_add(1);
+              room.charge(to_u64(text.len()))?;
+              break text;
+            }
+            None => {
+              self.asked = Some(asked);
+              return Ok(Based::Store);
+            }
+          }
+        }
+        _ => {
+          self.asked = Some(StoreAsk {
+            path: path.to_vec(),
+            node: at,
+            want: Some(crate::render::Want::Rows {
+              logs: vec![(path.to_vec(), vec![at])],
+            }),
+            most: room.left(),
+            text: None,
+            refused: None,
+          });
+          return Ok(Based::Store);
+        }
+      }
+    };
+    let mut text = start;
+    while let Some(index) = chain.pop() {
+      let revision = match frame.placed(payload, revisions, index) {
+        Ok(Some((revision, _))) => revision,
+        Ok(None) => return Err(unknown(at)),
+        Err(wanted) => return Ok(Based::Wanted(wanted.range)),
+      };
+      room.charge(to_u64(text.len()))?;
+      text = delta::apply(&text, revision.data, room).map_err(|fault| Unverified::Delta {
+        log: LogOf::File(path.to_vec()),
+        node: revision.node,
+        fault,
+      })?;
+      self.intaken.base_rebuilds = self.intaken.base_rebuilds.saturating_add(1);
+      self.cache.put(revision.node, text.clone());
+    }
+    Ok(Based::Text(text))
   }
 
   /// The text of `revision`'s delta base: empty for the null node, the text kept last where it is that one, else the

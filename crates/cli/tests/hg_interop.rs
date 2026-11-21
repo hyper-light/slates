@@ -1996,3 +1996,96 @@ fn stock_hg_pulls_by_a_tag_over_ssh() {
   let url = format!("ssh://{HG_USER}@127.0.0.1:{port}/r");
   tag_pulls(&hg, &scratch.path, &url, &config, &instance);
 }
+
+/// Format: the environment variable naming the repositories the correctness lane compares on (paths of local Mercurial
+/// repositories, separated by `:`), such as hg's own history (`hg clone -U https://www.mercurial-scm.org/repo/hg`).
+/// Unset, the lane makes and uses `bench/hg_correctness_fixture.sh`'s repository.
+const LANE_SOURCES: &str = "SLATES_TEST_HG_SOURCES";
+
+/// Format: the environment variable bounding each of the lane's steps in seconds (the script's `BOUND`); unset, the
+/// script's own.
+const LANE_BOUND: &str = "SLATES_TEST_HG_BOUND";
+
+/// Whether `program` is here: it starts at all, whatever it answers.
+fn present(program: &str) -> bool {
+  Command::new(program)
+    .arg("--version")
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .status()
+    .is_ok()
+}
+
+/// UI goal 93, correctness by use (main's order of 2026-11-21: stock clients on real repositories get byte-identical
+/// results; a measurement of the server, run by main). Do: run `bench/hg_correctness.sh` with stock hg 7.2 and this
+/// build's `slates` over the repositories [`LANE_SOURCES`] names, or over the fixture `bench/hg_correctness_fixture.sh`
+/// makes (named branches, one closed; merges, one with a conflict resolved by hand; tags, one moved and one removed;
+/// bookmarks; draft and secret changesets; binaries of 1, 16 and 64 MiB). The script fills stock `hg serve`, slates over
+/// its HTTP edge and slates over its SSH edge alike, then compares their answers: push, clone (`-U`, `-r`, a named
+/// branch), `hg verify`, every changeset's node, parents, branch and phase, tags, bookmarks, branches, heads, incoming
+/// and outgoing byte for byte, pull, a new head refused without `-f` in stock's words, `-f`, `-B`, a draft made public
+/// by a publishing server, a tag, `pull -r` and `pull -B`. Expect every check PASS (the script exits 0); each FAIL line
+/// names the server, the verb and the difference. Ignored: main runs it (CLAUDE.md §8). Skips loudly without stock hg
+/// 7.2 ([`STOCK_HG`]), bash, perl, python3 or OpenSSH's `ssh-keygen` and `ssh-keyscan`.
+#[test]
+#[ignore = "a measurement of the server against stock hg serve, run by main (CLAUDE.md §8)"]
+fn stock_hg_gets_what_stock_hg_serve_gives_on_every_verb_over_http_and_ssh() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping the hg correctness lane: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)"
+    );
+    return;
+  };
+  for tool in ["bash", "perl", "python3", "ssh-keygen", "ssh-keyscan"] {
+    if !present(tool) {
+      eprintln!("skipping the hg correctness lane: no {tool} here");
+      return;
+    }
+  }
+  let bench = concat!(env!("CARGO_MANIFEST_DIR"), "/bench");
+  let scratch = Scratch::new("hg-lane");
+  let hg_words = hg.join(" ");
+  let sources: Vec<String> = match std::env::var(LANE_SOURCES) {
+    Ok(listed) => listed
+      .split(':')
+      .filter(|path| !path.is_empty())
+      .map(str::to_owned)
+      .collect(),
+    Err(_) => {
+      let fixture = format!("{}/fixture", scratch.path);
+      let made = Command::new("bash")
+        .arg(format!("{bench}/hg_correctness_fixture.sh"))
+        .args([&hg_words, &fixture])
+        .output()
+        .unwrap();
+      assert!(made.status.success(), "the fixture: {made:?}");
+      eprintln!("{}", String::from_utf8_lossy(&made.stdout).trim());
+      vec![fixture]
+    }
+  };
+  let mut lane = Command::new("bash");
+  lane
+    .arg(format!("{bench}/hg_correctness.sh"))
+    .arg(&hg_words)
+    .arg(format!("{}/work", scratch.path))
+    .args(&sources)
+    .env("SLATES", env!("CARGO_BIN_EXE_slates"));
+  if let Ok(bound) = std::env::var(LANE_BOUND) {
+    lane.env("BOUND", bound);
+  }
+  let ran = lane.output().unwrap();
+  let out = String::from_utf8_lossy(&ran.stdout);
+  eprintln!("{out}");
+  let failed: Vec<&str> = out
+    .lines()
+    .filter(|line| line.starts_with("FAIL "))
+    .collect();
+  assert!(
+    ran.status.success() && failed.is_empty(),
+    "the hg correctness lane over {sources:?}: {} failed:\n{}\n{}",
+    failed.len(),
+    failed.join("\n"),
+    String::from_utf8_lossy(&ran.stderr)
+  );
+}
