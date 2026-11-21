@@ -17047,6 +17047,64 @@ is the invocation's median of 3 runs. µs unless marked.
 - So the client's spin was Linux arm64's band; Linux x86_64's and macOS's loaded tails have other holds (macOS: the
   busy path's kevent nap, whose fix w-provision-gate measured and rejected on the provisioning path, a38630375).
 
+## 84a on macOS: Mach's time-constraint policy for the shards and the client's reply wait (A-831; w-provision-gate; 2026-11-21)
+
+**What, and why.** g222's hop split put macOS's loaded tail on two things:
+- the forward to the owner shard and back, the taken-to-written hop;
+- the busy path's zero-timeout kevent, which took at least 1 ms in 9-12% of its loaded calls.
+
+A woken time-share thread behind busy neighbours runs only when their quanta end. A thread under Mach's
+`THREAD_TIME_CONSTRAINT_POLICY` is in the real-time band, needs no privilege, and runs ahead of them. The kernel refuses a
+computation below its minimum real-time quantum (50 µs on Apple silicon; `slates_machine::time_constraint`'s test), so
+the policy's terms are aperiodic, with computation = constraint = the thread's measured window doubled until the kernel
+takes it.
+
+**The runs.** CI macos-latest (3 CPUs, 2 shards), `edit_merge_bench` with two spinners a CPU, then the quiet forms and
+`provision_bench`. Three interleaved rounds per run; each cell is a round's median of three runs, every round shown.
+- Run 44934544995 (branch `diag-measurer-w-provision-gate-tc`). B = main a9a2393b8 plus a line printing the load's
+  throughput; TC = plus the client's synchronous reply wait under the policy; TB = plus the shard threads.
+- Run 44934809949 (`diag-measurer-w-provision-gate-tck`). The same arms, also counting the busy path's zero-timeout
+  harvests that took 1 ms or more.
+
+Take 1, loaded:
+
+| arm | accept p99 ms | accept p999 ms | conflict p99 ms | conflict p999 ms | load, M spinner turns/s |
+|---|---|---|---|---|---|
+| B | 16.76 · 16.02 · 14.31 | 20.40 · 17.45 · 17.31 | 16.39 · 15.88 · 14.43 | 19.59 · 18.94 · 18.19 | 225 · 221 · 242 |
+| TC | 1.32 · 1.47 · 0.68 | 4.69 · 5.05 · 1.12 | 1.06 · 3.55 · 1.08 | 4.94 · 17.07 · 3.07 | 161 · 141 · 158 |
+| TB | 0.69 · 0.87 · 0.41 | 0.95 · 2.16 · 0.77 | 0.67 · 0.75 · 0.55 | 1.69 · 1.70 · 1.06 | 121 · 133 · 129 |
+
+Take 2, loaded:
+
+| arm | accept p99 ms | accept p999 ms | conflict p99 ms | conflict p999 ms | load, M spinner turns/s | busy harvests ≥ 1 ms |
+|---|---|---|---|---|---|---|
+| B | 15.72 · 14.00 · 17.42 | 16.60 · 16.59 · 20.76 | 15.92 · 14.70 · 15.63 | 20.23 · 18.93 · 17.68 | 221 · 224 · 213 | 16,293 of 172,191 · 14,172 of 162,157 · 21,273 of 174,757 |
+| TC | 2.25 · 1.06 · 5.33 | 4.38 · 2.72 · 29.92 | 2.47 · 2.66 · 4.39 | 15.17 · 6.94 · 28.44 | 147 · 153 · 140 | 184 of 139,685 · 137 of 159,691 · 472 of 134,252 |
+| TB | 0.89 · 0.42 · 2.11 | 3.01 · 0.70 · 4.52 | 0.65 · 0.70 · 1.85 | 0.80 · 1.32 · 4.56 | 137 · 114 · 98 | 5 of 200,410 · 2 of 184,609 · 62 of 198,370 |
+
+**Quiet (every round, both runs, accept_f10 p50 µs).** The medians are unchanged.
+- Take 1: B 451 · 506 · 549; TC 831 · 516 · 642; TB 438 · 377 · 435.
+- Take 2: B 454 · 522 · 470; TC 422 · 438 · 409; TB 479 · 468 · 478.
+
+**R9's uncontended spinning p99** (`provision_bench`) is unchanged, and misses 50 µs on this 3-CPU runner in every arm,
+main included:
+- B 335 · 344 · 326 and 333 · 196 · 303 µs;
+- TC 309 · 344 · 319 and 198 · 193 · 566;
+- TB 305 · 338 · 294 and 310 · 201 · 180.
+
+No refusal and no demotion was logged by any arm.
+
+**Verdict:**
+- **TB wins every round against main** on the loaded p99 and p999 of both forms, about 15-20 times on p99, with the
+  quiet medians and R9's p99 even. It lands as A-831: a latency-tracking runtime's shards (the daemon's) and a client's
+  synchronous reply wait run under the policy on macOS. Red first: `crates/rt/tests/time_constraint.rs`, a tracking
+  runtime's shard not under the policy on main, under it after.
+- **TC (the client alone) is measured and rejected:** p999 up to 29.9 ms, conflict p99 up to 4.4 ms.
+- **The cost:** the load's own spinners got 98-137 against 213-242 million turns a second. The daemon finishes its
+  work about ten times sooner, and while it works it runs ahead of them.
+- **84a's bar is still open on macOS.** The loaded p99 is under 1 ms in 11 of 12 round medians (worst 2.11 ms), the
+  p999 in 4 of 12 (0.70-4.56 ms).
+
 ## The client's reply wait, arm C: measured and rejected, B (A-799) stays (85a; g222's last step, recorded by w-provision-gate; 2026-11-21)
 
 **The run.** GitHub run 44884335146 (branch `diag-measurer-g222-20`, "g222 A/B/C of the client reply wait on every
@@ -17477,6 +17535,40 @@ are ahead in 4 of 5 rounds and its slow writes far fewer. One soft spot stays on
 it led 4 of 5 medians, but round 3 was 461.6 against 385.6, and that condition's p999 was higher in 3 of 5 rounds.
 macOS's median moves from about 165 to about 139 µs added, 2.8x 85a's goal.
 
+**A live write's build, split; and the volume's sealing keys kept between publications** (85a, g228, 2026-11-21; main
+01a1ff2e's ruling: split the 27 µs build, each run reported as the daemon's share and the transport floor). The build hop
+is split into its steps on the owner (`fleet.live.hop.build.{capture,keys,seal,append,send}`, per-write histograms,
+timed for an entry made in its publication's own turn). On ubuntu-latest, base 06f20620f (diag-g228-live-15, run
+44935392368, 4 cores, load 1.8-2.0), p50 / p99 µs, every round alike: capture 1.4-1.7 / 4.1-6.1, seal (keys included)
+15.4-18.4 / 36.9-49.2, append 5.1-5.6 / 6.7-18.4, send 0.9-1.0 / 28.7-36.9, of a build of 24.6-26.6. Run 17 (fbc6bc971,
+a runner about twice as slow: transport floor 112.8-138.1 µs) split the seal: keys 8.2 of a seal's 34.8 at the median.
+The keys were fetched afresh at every publication: the lineage key twice and the tenant key twice (`namer` asked the
+lineage again), the naming key once, five unwraps and three record clones. Now `seal_keys::BodyKeys` keeps each live
+volume's lineage key and namer while the tenant, lineage and naming records' key ids are the ones recorded (compared at
+every use), bounded by the volumes the shard ships live (`fleet.live.body_keys.{kept,fetched}`: 15 kept and 1 fetched in
+the fleet hop test's 16 writes).
+
+The A/B, diag-g228-live-18 (run on ubuntu-latest, 4 cores, load 2.0-2.3; the contract command, release, five rounds
+interleaved, order alternating, the transport bench's 4 KiB live ship beside each round). Each cell: added p50; the
+daemon's share (added less the transport floor); live p999 (µs):
+
+| round | transport floor | base fbc6bc971 | keys kept 8b67b484f |
+|---|---|---|---|
+| 1 | 49.8 | 113.3; 63.5; 553.2 | 108.0; 58.2; 2,045.8 |
+| 2 | 52.3 | 108.6; 56.3; 569.5 | 104.3; 52.0; 2,434.9 |
+| 3 | 51.7 | 122.0; 70.3; 2,953.2 | 103.1; 51.4; 1,196.5 |
+| 4 | 53.5 | 110.7; 57.2; 1,256.8 | 109.0; 55.5; 1,056.4 |
+| 5 | 52.7 | 112.5; 59.8; 622.7 | 126.1; 73.4; 1,012.0 |
+
+Per write, p50 / p99, every round: keys 3.8 / 4.6-5.1 against 0.4 / 0.6-0.8 µs; the build 22.5-24.6 against 20.5-22.5.
+
+**Reading.** Accepted: the keys step drops from 3.8 to 0.4 µs in every round, and the median added with it in 4 of 5.
+The live p999 swings between 0.55 and 3 ms in both arms on this 4-core runner (worse for the cache in 3 rounds,
+better in 2), and taking work out of the build cannot lengthen a tail, so it is recorded, not read. The daemon's share
+on this runner is now about 51-58 µs at the median (one round 73), against a transport floor of 50-54. What remains of
+the build is the seal itself, about 12-13 µs: each piece copied into a raw chunk and hashed for its identity, encoded and
+hashed again for its key, its key derived, sealed, and named.
+
 ## A Subversion import on the real daemon: the peak against the dump, by kind (P7, A-772's daemon peak; 2026-11-21)
 
 - **Machine, tree, command.** adas-macbook-pro-2.local (18 cores, 128 GB), load 17 to 35. Main 73cd23c63 with this
@@ -17749,3 +17841,41 @@ know that a file is unchanged since a cached answer without asking. Not built. W
 rejected the same day, what remains of the owner asks after A-817 is one ask a verb that needs the green: each rebase,
 each verdict, each work's first edit of a file, and a creation's admission and name.
 
+
+## The status memory report's residency: sweep what can hold pages, the report's kinds first (g226, 2026-11-21)
+
+w-sizing's option (a), main's order of 2026-11-20 23:50 (landed 27517bd04). A status asking for the memory report read
+the arenas 0 MiB resident after a 256 MiB burst on macOS (w-sizing's report on 599603559), since the residency sweep
+walked each shard's whole slice. Debug test binaries (the test is the measurement; no release run), 2 shards, RAM only.
+
+Command: `cargo test -p slates-server --test daemon a_memory_status_right_after_a_burst_reports_the_burst_resident_in_the_arenas -- --nocapture`
+(256 files of 1 MiB through the SDK, then a memory status every hundredth of a liveness budget until the arenas read
+measured, bound ten liveness budgets).
+
+| Machine | Tree | Arenas after the burst | Looks | Time to measured |
+|---|---|---|---|---|
+| Mac Studio (Studio-4), macOS arm64 | origin/main 40c3f8d1e, one status | resident 0, measured false | 1 | never in that status |
+| Mac Studio (Studio-4), macOS arm64 | 40c3f8d1e, looking again | 286,785,536 (the regions whole, freed pages too) | 20 | 1.15 s |
+| Mac Studio (Studio-4), macOS arm64 | the fix, 3 runs | 268,435,456 of 268,435,456 | 2, 2, 2 | 86, 86, 76 ms |
+| adacachy, Linux x86_64 (load 45, kiln r8) | b5220bd92 | 268,435,456 of 268,435,456 (region 16 GiB) | 2 | 35 ms |
+| jupiter, Windows x86_64 | the fix | with w-lint (run-requests 2026-11-21T01:10Z) | | |
+
+What the sweep walks a shard on the test daemon (`content_range.<range>.bytes`): write log 1,276,423,222, image slots
+12,884,901,888, delta log 6,442,450,944, DAX table 98,320, segment log 1,610,612,736, segment snapshots 6,442,450,944,
+rings 278,528; and of the arena only its held runs (268,435,456 on the burst's shard, where the region is 4 GiB). The
+write log and journal are whole because a fresh daemon cannot know them unwritten until its first give-back (GAPS).
+
+Step clock, measured-and-rejected: the shard's clock (`slates_machine::clock::monotonic_ns`, whole microseconds on
+macOS) for timing the sweep's steps. `cargo test -p slates-server --lib content_ranges::tests::a_status_requests_sweep_runs_on_the_shards_idle_time_and_is_spaced_by_its_length`
+on Studio-4, debug audit daemon:
+
+| Steps timed by | Whole sweep | Steps | Pages a step | Stepped | Longest true step | Steps over 100 us |
+|---|---|---|---|---|---|---|
+| the shard's clock | about 2 s | 70,909 | — | 1.24 s (fine clock) | 15.5 ms | 3,290 |
+| the step clock (`Instant`) | 13.9 s | 604,981 | 5.8 | 2.71 s | within budget (`past_budget` 0) | — |
+
+Budget a step about 1.6 us (half the debug daemon's live step quantum). The shard's clock read most steps as 0 ns, so
+each next step grew to a vector page's batch and ran milliseconds unseen; it is rejected for the step clock. The
+measured step: fixed 709-792 ns, 600-1,600 ns a page at a few pages (noise-dominated), so the floor buys about a page;
+the honest sweep's rate, about 280 K pages a second, is set by the runtime's look for work between idle slices (GAPS).
+The memory report's kinds pass 67 ms after arming in the same run.
