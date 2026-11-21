@@ -74,9 +74,6 @@ pub(crate) enum HomeRefused {
   Misnamed,
   /// The home holds no such content.
   NotHeld,
-  /// The queue of homings to a member is at its bound ([`Coalescing`]): more than the region carries within one exchange's
-  /// budget at its measured rate is queued already, so this homing is refused at once, typed (the record stays version 2).
-  Backlog,
 }
 
 /// Where and when a homed window is durable (module docs, "Durable before named"): its home shard, and the generation of
@@ -697,7 +694,6 @@ async fn keep_put(
     }
     Err(HomeRefused::Content(_)) => HomeOutcome::Refused(HomeRefusal::Room),
     Err(HomeRefused::NotHeld) => HomeOutcome::Refused(HomeRefusal::NotHeld),
-    Err(HomeRefused::Backlog) => HomeOutcome::Refused(HomeRefusal::Unanswered),
   }
 }
 
@@ -904,59 +900,9 @@ pub(crate) async fn serve_remote(origin: u16, request: &[u8], budget_ns: u64) ->
         };
       (identity, outcome)
     }
-    HomeMessage::PutMany { items } => {
-      return HomeMessage::AnswerMany {
-        answers: keep_many(origin, &shards, (local, &members, f), items, budget_ns).await,
-      }
-      .encode();
-    }
-    HomeMessage::Answer { .. } | HomeMessage::AnswerMany { .. } => return Vec::new(),
+    HomeMessage::Answer { .. } => return Vec::new(),
   };
   HomeMessage::Answer { identity, outcome }.encode()
-}
-
-/// The items of a [`slates_cluster::homes::HomeMessage::PutMany`] kept at their homes (A-724 piece 8c: concurrent homings
-/// coalesced): each kept as a whole put is ([`keep_put`]'s rule), all of them before any wait, then each answered kept
-/// once its home's image holding it is published, so the first wait publishes the home and the rest find it published:
-/// one publication for the many (group commit). Each item's answer, in order.
-async fn keep_many(
-  origin: u16,
-  shards: &[u16],
-  (local, members, f): (slates_db::HostId, &[slates_db::HostId], usize),
-  items: Vec<([u8; 32], Vec<u8>)>,
-  budget_ns: u64,
-) -> Vec<([u8; 32], slates_cluster::homes::HomeOutcome)> {
-  use slates_cluster::homes::{HomeOutcome, HomeRefusal, admits};
-  let mut kept = Vec::with_capacity(items.len());
-  for (identity, bytes) in items {
-    let outcome = match admits(&identity, &bytes, (local, members, f)) {
-      Err(refusal) => Err(HomeOutcome::Refused(refusal)),
-      Ok(()) => match keep_region_at_home(origin, shards, bytes, budget_ns).await {
-        Ok((_, ticket)) => Ok(ticket),
-        Err(HomeRefused::Content(_)) => Err(HomeOutcome::Refused(HomeRefusal::Room)),
-        Err(HomeRefused::NotHeld) => Err(HomeOutcome::Refused(HomeRefusal::NotHeld)),
-        Err(HomeRefused::Misnamed | HomeRefused::PastWindow) => {
-          Err(HomeOutcome::Refused(HomeRefusal::Misnamed))
-        }
-        Err(HomeRefused::Unanswered | HomeRefused::Backlog) => {
-          Err(HomeOutcome::Refused(HomeRefusal::Unanswered))
-        }
-      },
-    };
-    kept.push((identity, outcome));
-  }
-  let mut answers = Vec::with_capacity(kept.len());
-  for (identity, outcome) in kept {
-    let answer = match outcome {
-      Ok(ticket) if published(origin, ticket, budget_ns).await => HomeOutcome::Kept {
-        generation: ticket.generation,
-      },
-      Ok(_) => HomeOutcome::Refused(HomeRefusal::Unanswered),
-      Err(refused) => refused,
-    };
-    answers.push((identity, answer));
-  }
-  answers
 }
 
 /// [`keep_for_region`] on the home shard among `shards` of the window `bytes`, asked from shard `origin`.
@@ -1191,261 +1137,25 @@ async fn put_remote(
   bytes: Vec<u8>,
   budget: slates_cluster::CommitBudget,
 ) -> usize {
-  use slates_cluster::homes::PART_BYTES;
+  use slates_cluster::homes::{HomeMessage, HomeOutcome, PART_BYTES};
   if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > PART_BYTES {
     return put_in_parts(&homes, identity, &bytes, budget).await.len();
   }
-  let mut kept = 0usize;
-  for home in homes {
-    if coalesced(home, identity, bytes.clone(), budget).await == Ok(true) {
-      kept = kept.saturating_add(1);
-    }
+  let request = HomeMessage::Put {
+    identity: identity.0,
+    bytes,
   }
-  kept
-}
-
-/// Counter: nanoseconds homings spent on their local home (the keep and its shard's publication), summed. Format: a
-/// counter name.
-pub(crate) const HOMING_LOCAL_NS: &str = "vcs_store.homes.homing_local_ns";
-/// Counter: nanoseconds homings spent on their other homes (the exchange, their keep and publication), summed. Format: a
-/// counter name.
-pub(crate) const HOMING_REGION_NS: &str = "vcs_store.homes.homing_region_ns";
-
-/// Counter: coalesced exchanges sent ([`coalesced`], each one `PutMany` to one member). Format: a counter name.
-pub(crate) const COALESCED_EXCHANGES: &str = "vcs_store.homes.coalesced_exchanges";
-/// Counter: the homings those exchanges carried. Format: a counter name.
-pub(crate) const COALESCED_ITEMS: &str = "vcs_store.homes.coalesced_items";
-/// Counter: homings refused at the queue's bound ([`HomeRefused::Backlog`]). Format: a counter name.
-pub(crate) const HOMING_BACKLOG: &str = "vcs_store.homes.homing_backlog";
-
-/// The homings queued to each member on the control shard (A-724 piece 8c: concurrent homings to one member coalesced
-/// into one `PutMany`, the member publishing once for all of them; main's ruling of 2026-11-20):
-/// - **A queue a member**, its items in order, each a ticket, an identity and its bytes, and whether a sender drains it.
-/// - **The batch** a `PutMany` carries: at most one message's bytes (`slates_cluster::homes::PART_BYTES`, the format's
-///   cap), at least one item.
-/// - **The bound** on a queue's bytes: what the region carries within one exchange's budget at the rate measured over
-///   the exchanges sent (bytes over nanoseconds, kept as the latest exchange's), the batch's cap until one is measured:
-///   past it a homing is refused at once ([`HomeRefused::Backlog`]), typed, and its record stays version 2.
-/// Bounded by that bound and by the outcomes awaited (one a homing waiting).
-#[derive(Debug, Default)]
-pub(crate) struct Coalescing {
-  queues: std::collections::BTreeMap<slates_db::HostId, PeerQueue>,
-  /// Each finished ticket's outcome until its homing reads it, and the wakers of those still waiting.
-  outcomes: std::collections::BTreeMap<u64, bool>,
-  wakers: std::collections::BTreeMap<u64, std::task::Waker>,
-  next: u64,
-  /// The bytes over nanoseconds the latest exchange carried: the rate the bound is drawn from.
-  rate: Option<(u64, u64)>,
-}
-
-/// One member's queue ([`Coalescing`]).
-#[derive(Debug, Default)]
-struct PeerQueue {
-  items: std::collections::VecDeque<(u64, [u8; 32], Vec<u8>)>,
-  bytes: u64,
-  sending: bool,
-}
-
-impl Coalescing {
-  /// The bound on a queue's bytes ([`Coalescing`], "The bound") for an exchange budget of `budget_ns`.
-  pub(crate) fn bound(&self, budget_ns: u64) -> u64 {
-    let cap = slates_cluster::homes::PART_BYTES;
-    self.rate.map_or(cap, |(bytes, ns)| {
-      u128::from(bytes)
-        .saturating_mul(u128::from(budget_ns))
-        .checked_div(u128::from(ns.max(1)))
-        .map_or(cap, |carried| u64::try_from(carried).unwrap_or(u64::MAX))
-        .max(cap)
+  .encode();
+  exchange(&homes, &request, budget)
+    .await
+    .into_iter()
+    .filter(|(_, reply)| {
+      matches!(
+        HomeMessage::decode(reply),
+        Ok(HomeMessage::Answer { identity: answered, outcome: HomeOutcome::Kept { .. } }) if answered == identity.0
+      )
     })
-  }
-
-  /// Queues `bytes` named `identity` to `member`: its ticket, and whether the caller must drain the queue (none drains
-  /// it now); refused [`HomeRefused::Backlog`] past the bound.
-  pub(crate) fn enqueue(
-    &mut self,
-    member: slates_db::HostId,
-    (identity, bytes): ([u8; 32], Vec<u8>),
-    budget_ns: u64,
-  ) -> Result<(u64, bool), HomeRefused> {
-    let bound = self.bound(budget_ns);
-    let ticket = self.next;
-    let queue = self.queues.entry(member).or_default();
-    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    if queue.bytes.saturating_add(len) > bound && !queue.items.is_empty() {
-      return Err(HomeRefused::Backlog);
-    }
-    self.next = self.next.wrapping_add(1);
-    queue.bytes = queue.bytes.saturating_add(len);
-    queue.items.push_back((ticket, identity, bytes));
-    let drain = !queue.sending;
-    queue.sending = true;
-    Ok((ticket, drain))
-  }
-
-  /// The next batch of `member`'s queue ([`Coalescing`], "The batch"): its items up to one message's bytes, at least one;
-  /// none when the queue is empty, which ends its sender.
-  pub(crate) fn take_batch(&mut self, member: slates_db::HostId) -> Vec<(u64, [u8; 32], Vec<u8>)> {
-    let cap = slates_cluster::homes::PART_BYTES;
-    let Some(queue) = self.queues.get_mut(&member) else {
-      return Vec::new();
-    };
-    let mut batch = Vec::new();
-    let mut bytes = 0u64;
-    while let Some((_, _, item)) = queue.items.front() {
-      let len = u64::try_from(item.len()).unwrap_or(u64::MAX);
-      if !batch.is_empty() && bytes.saturating_add(len) > cap {
-        break;
-      }
-      bytes = bytes.saturating_add(len);
-      if let Some(taken) = queue.items.pop_front() {
-        batch.push(taken);
-      }
-    }
-    queue.bytes = queue.bytes.saturating_sub(bytes);
-    if batch.is_empty() {
-      queue.sending = false;
-      self.queues.remove(&member);
-    }
-    batch
-  }
-
-  /// `ticket`'s homing answered (kept or not), its waiter woken.
-  fn finish(&mut self, ticket: u64, kept: bool) -> Option<std::task::Waker> {
-    self.outcomes.insert(ticket, kept);
-    self.wakers.remove(&ticket)
-  }
-}
-
-std::thread_local! {
-  /// This shard's queues of homings ([`Coalescing`]); only the control shard's are used.
-  static COALESCING: std::cell::RefCell<Coalescing> = std::cell::RefCell::new(Coalescing::default());
-}
-
-/// Homes `bytes` named `identity` at `member` through its queue ([`Coalescing`]): whether it was kept. The homing that
-/// finds no sender drains the queue: it yields a turn first, so the homings started in the same turn join its batch, then
-/// sends batch after batch (one `PutMany` an exchange) until the queue is empty. Run on the control shard.
-async fn coalesced(
-  member: slates_db::HostId,
-  identity: ContentId,
-  bytes: Vec<u8>,
-  budget: slates_cluster::CommitBudget,
-) -> Result<bool, HomeRefused> {
-  let budget_ns = budget.max_deadline_ns();
-  let queued = COALESCING.with(|coalescing| {
-    coalescing
-      .try_borrow_mut()
-      .map_err(|_| HomeRefused::Unanswered)
-      .and_then(|mut coalescing| coalescing.enqueue(member, (identity.0, bytes), budget_ns))
-  });
-  let (ticket, drain) = match queued {
-    Ok(queued) => queued,
-    Err(refused) => {
-      crate::state::with_state(|state| state.count(HOMING_BACKLOG, 1));
-      return Err(refused);
-    }
-  };
-  if drain {
-    slates_rt::futures::yield_now().await;
-    send_batches(member, budget).await;
-  }
-  Ok(Outcome { ticket }.await)
-}
-
-/// Drains `member`'s queue a batch at a time ([`coalesced`]), each batch's homings answered as the member answered them.
-async fn send_batches(member: slates_db::HostId, budget: slates_cluster::CommitBudget) {
-  use slates_cluster::homes::{HomeMessage, HomeOutcome};
-  loop {
-    let batch = COALESCING.with(|coalescing| {
-      coalescing
-        .try_borrow_mut()
-        .map(|mut coalescing| coalescing.take_batch(member))
-        .unwrap_or_default()
-    });
-    if batch.is_empty() {
-      return;
-    }
-    let sent = batch
-      .iter()
-      .map(|(_, _, bytes)| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
-      .sum::<u64>();
-    let tickets: Vec<(u64, [u8; 32])> = batch
-      .iter()
-      .map(|(ticket, identity, _)| (*ticket, *identity))
-      .collect();
-    let request = HomeMessage::PutMany {
-      items: batch
-        .into_iter()
-        .map(|(_, identity, bytes)| (identity, bytes))
-        .collect(),
-    }
-    .encode();
-    let began = slates_rt::futures::now_ns();
-    let replies = exchange(&[member], &request, budget).await;
-    let took = slates_rt::futures::now_ns().saturating_sub(began);
-    let answers: Vec<([u8; 32], HomeOutcome)> = replies
-      .into_iter()
-      .find_map(|(_, reply)| match HomeMessage::decode(&reply) {
-        Ok(HomeMessage::AnswerMany { answers }) => Some(answers),
-        _ => None,
-      })
-      .unwrap_or_default();
-    crate::state::with_state(|state| {
-      state.count(COALESCED_EXCHANGES, 1);
-      state.count(
-        COALESCED_ITEMS,
-        u64::try_from(tickets.len()).unwrap_or(u64::MAX),
-      );
-    });
-    let woken: Vec<std::task::Waker> = COALESCING.with(|coalescing| {
-      let Ok(mut coalescing) = coalescing.try_borrow_mut() else {
-        return Vec::new();
-      };
-      if !answers.is_empty() {
-        coalescing.rate = Some((sent, took.max(1)));
-      }
-      tickets
-        .iter()
-        .filter_map(|(ticket, identity)| {
-          let kept = answers.iter().any(|(answered, outcome)| {
-            answered == identity && matches!(outcome, HomeOutcome::Kept { .. })
-          });
-          coalescing.finish(*ticket, kept)
-        })
-        .collect()
-    });
-    for waker in woken {
-      waker.wake();
-    }
-  }
-}
-
-/// The wait for a queued homing's outcome ([`coalesced`]): ready once its batch was answered.
-struct Outcome {
-  ticket: u64,
-}
-
-impl core::future::Future for Outcome {
-  type Output = bool;
-
-  fn poll(
-    self: core::pin::Pin<&mut Self>,
-    context: &mut core::task::Context<'_>,
-  ) -> core::task::Poll<bool> {
-    let ticket = self.ticket;
-    COALESCING.with(|coalescing| match coalescing.try_borrow_mut() {
-      Ok(mut coalescing) => match coalescing.outcomes.remove(&ticket) {
-        Some(kept) => core::task::Poll::Ready(kept),
-        None => {
-          coalescing.wakers.insert(ticket, context.waker().clone());
-          core::task::Poll::Pending
-        }
-      },
-      Err(_) => {
-        context.waker().wake_by_ref();
-        core::task::Poll::Pending
-      }
-    })
-  }
+    .count()
 }
 
 /// The object named `identity` read from one of the other homes `homes`, a part at a time from each in turn
@@ -1545,6 +1255,14 @@ async fn read_in_parts(
     }
   }
 }
+
+/// Counter: nanoseconds homings spent on their local home (the keep and its shard's publication), summed: with
+/// [`HOMING_REGION_NS`], where a homing's time goes (the three-node A/B, 2026-11-20: about 10 to 16 ms a homing). Format:
+/// a counter name.
+pub(crate) const HOMING_LOCAL_NS: &str = "vcs_store.homes.homing_local_ns";
+/// Counter: nanoseconds homings spent on their other homes (the exchange, their keep and publication), summed. Format: a
+/// counter name.
+pub(crate) const HOMING_REGION_NS: &str = "vcs_store.homes.homing_region_ns";
 
 /// Counter: identities the healer offered to their region homes. Format: a counter name.
 pub(crate) const HEAL_OFFERED: &str = "vcs_store.homes.heal_offered";

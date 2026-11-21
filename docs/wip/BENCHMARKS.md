@@ -15748,3 +15748,57 @@ Measured and rejected: the owned-run change (dead even with the cache, the same 
 Peak RSS of the bench (import + replay): 591-597 MB against the 447 MiB dump. The remaining gap to the matrix's
 0.54 s a revision is the server's per turn: ~960 steps a revision at one step a turn (the quantum, ~3.7 us, is under
 one step), measured next through the daemon's SSH site (`measure_svnsync_replay_range_over_the_tunnel`).
+
+## Three nodes: a version-3 push's homing at f + 1, and coalescing homings measured and rejected (A-724 piece 8c; main's order of 2026-11-20; 2026-11-20)
+
+- **The bench:** `crates/cli/bench/three_node_push.py SOURCE 'v1.0.0^{commit}' ROUNDS BUILD...`: for each build each round,
+  three `slates anchor --fleet` processes at f = 1 over loopback UDP with their HTTPS version-control edges, formed and
+  bootstrapped; on a node not the bootstrap's, one push of git/git cut at v1.0.0 (3,434,551 bytes, 12,232 objects, about
+  500 KB of names), then ten at once, each to its own repository, over TLS, each timed from its connection to its whole
+  answer; then that node's homing counters. Studio-2 (14 cores), shared with other agents: load 10 to 16, so a build's
+  own rounds spread by up to 15 s; read the medians and the counters, never one round.
+- **Found first:** six of eleven version-3 homings fell short (`homes.homed_short`), their records version 2: the region
+  half of a homing took the record sessions on the repository's owner shard, where none is. Fixed in 3406df928 (the
+  region half runs on the control shard and waits for a lent session); after it, eleven of eleven `homed_in_region` in
+  every round below.
+- **v2 against v3** (v2 = f95edf68e, v3 = the switch on with 3406df928's fix), ten rounds:
+
+| round | v2 1 push | v3 1 push | v2 10, p50 | v3 10, p50 | v2 10, p99 | v3 10, p99 |
+|---|---|---|---|---|---|---|
+| 1 | 2.847 | 2.376 | 5.523 | 6.787 | 8.345 | 7.902 |
+| 2 | 1.733 | 2.036 | 4.582 | 6.119 | 7.445 | 7.216 |
+| 3 | 1.719 | 2.044 | 4.910 | 5.849 | 6.862 | 6.554 |
+| 4 | 1.672 | 2.314 | 4.894 | 6.084 | 7.040 | 6.637 |
+| 5 | 1.732 | 2.082 | 4.829 | 8.733 | 6.483 | 9.971 |
+| 6 | 3.615 | 2.500 | 6.296 | 5.869 | 8.188 | 6.871 |
+| 7 | 1.952 | 2.426 | 4.312 | 7.409 | 6.631 | 8.573 |
+| 8 | 1.737 | 3.828 | 6.709 | 6.761 | 9.421 | 8.564 |
+| 9 | 4.217 | 2.278 | 10.972 | 5.646 | 15.167 | 6.045 |
+| 10 | 5.281 | 2.195 | 11.364 | 8.447 | 12.430 | 10.010 |
+
+- **Coalescing homings** (a per-member queue on the control shard, one `PutMany` a batch, the member publishing once
+  for the batch: branch `agents/w-balance-coalesce`, 962c37a07, never on main), a second ten rounds with each homing
+  timed inside (`homes.homing_local_ns`, `homes.homing_region_ns`, landed):
+
+| round | v2 10, p50 | v3 10, p50 | v3 coalesced 10, p50 | v2 1 push | v3 1 push | v3 coalesced 1 push |
+|---|---|---|---|---|---|---|
+| 1 | 9.193 | 12.633 | 13.815 | 4.588 | 4.161 | 5.935 |
+| 2 | 5.563 | 7.306 | 26.068 | 2.314 | 3.078 | 5.259 |
+| 3 | 6.670 | 15.004 | 18.836 | 2.946 | 5.626 | 4.031 |
+| 4 | 5.531 | 11.372 | 11.631 | 1.869 | 3.523 | 4.637 |
+| 5 | 20.257 | 7.777 | 11.360 | 2.431 | 4.363 | 2.886 |
+| 6 | 6.321 | 10.022 | 10.994 | 2.938 | 2.691 | 3.313 |
+| 7 | 5.054 | 5.329 | 6.109 | 2.319 | 2.052 | 2.327 |
+| 8 | 5.041 | 5.810 | 7.321 | 1.960 | 1.996 | 2.653 |
+| 9 | 4.363 | 6.453 | 5.774 | 1.738 | 2.321 | 2.168 |
+| 10 | 5.758 | 8.333 | 7.084 | 4.436 | 2.666 | 2.647 |
+
+- **What it says.** Medians, ten at once p50: 5.66 s (v2), 8.06 s (v3), 11.18 s (v3 coalesced), at load 10.5 to 11 with
+  v2's own rounds from 4.4 to 20.3 s. Each homing measured inside takes about 10 to 16 ms (11 a round: the local halves
+  16 to 66 ms, the region halves 71 to 174 ms a round), so the homing is not where a version-3 push's added time, if it
+  is real under this noise, goes; and the coalescer carried one item an exchange (14 exchanges for 14 items in most
+  rounds): the homings of concurrent pushes arrive spread over their checks and seldom overlap, so there is nothing to
+  coalesce. Coalescing is rejected: its queue, its bound and its wire variants add complexity for no measured gain. Owed
+  next: where a version-3 push's added time goes at ten at once (its decision's homing turn and the edge's hand-off are
+  the candidates), measured on a quiet host before anything is changed.
+
