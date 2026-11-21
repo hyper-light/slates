@@ -7,6 +7,13 @@
 //! answer resumes the verb under its own completion key (the `lease_wait` pattern), so no verb awaits and no await
 //! holds a partition's state.
 //!
+//! **A forwarded creation is placed by its name (A-794).** A work made through another node (one that does not hold
+//! the green's replica, so its creation is forwarded to the owner) is made on the partition its name hashes to, as a
+//! create is placed, and its verbs then park here for the green's shard like any client's; the forward's exchange
+//! waits for its parked verb and is answered when the verb resumes ([`attach_forwarded`]). Before, it was made on the
+//! green's own shard: at 100,000 clients over the Linux kernel 76,955 works were made on the primary's one partition,
+//! whose merge budget, the green's chain's too, then refused 60,349 edits, 3,883 rebases and 7,544 accepted submits.
+//!
 //! **Order.** While one verb of a work is parked, every later verb of that work parks behind it, and they resume in
 //! arrival order. So an edit never overtakes a submit pipelined after it, and no edit lands during a submit's verdict.
 //!
@@ -135,6 +142,20 @@ pub(crate) struct SealedWork {
   /// The verdict of `composed` a holder computed on its replica, in its wire form (A-658 part 3a), when the work lives
   /// on a node that holds a replica of a green another node owns (A-697 part c): the owner takes it by position.
   pub(crate) computed: Option<Vec<u8>>,
+  /// A merge check's or resolution's ask (A-796), when the rebase is one: what the green's half does beyond a rebase.
+  pub(crate) merge: Option<MergeAsk>,
+}
+
+/// What a merge check or a resolution asks of the green's half beyond a rebase (A-796).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MergeAsk {
+  /// The head a resolution's check judged: the green's half refuses `StaleMergeView` when its head is another. `None`
+  /// for a check, which judges the head as it is.
+  pub(crate) head: Option<u64>,
+  /// The canonical operations to retire, strictly increasing.
+  pub(crate) discard: Vec<u64>,
+  /// The agent's changes, applied at the head after the kept operations.
+  pub(crate) replacement: Vec<slates_ipc::protocol::WorkChange>,
 }
 
 /// What a clean rebase leaves a work, or the answer when it was not clean.
@@ -153,6 +174,16 @@ pub(crate) enum RebaseAnswer {
   },
   /// A conflict or a refusal: the reply, with the work unchanged.
   Reply(ReplyBody),
+  /// A merge check's answer (A-796): the head it judged, the canonical declaration, and the conflicting reply when a
+  /// submit now would conflict (`None` when it would be accepted). Nothing moves.
+  Checked {
+    /// The green's head the check judged.
+    head: u64,
+    /// The work's canonical declaration, by index.
+    declaration: Vec<slates_ipc::protocol::MergeOp>,
+    /// The conflict, as a rebase answers one.
+    conflict: Option<ReplyBody>,
+  },
 }
 
 /// The owner's answer to a work's creation: the work's id, minted before the ask, and its base.
@@ -206,6 +237,10 @@ pub(crate) struct Unbuilt {
 pub(crate) struct WorkHome {
   queues: BTreeMap<DbVolumeId, Queue>,
   by_request: BTreeMap<(u64, u32, u32), DbVolumeId>,
+  /// The exchanges of verbs forwarded from another node that wait for their parked verb here, each as its control shard
+  /// and awaited call (A-794, [`attach_forwarded`]): answered from the verb's completion when its queue resumes it. A
+  /// subset of `by_request`'s keys, each leaving with its verb, so bounded as the parked verbs are.
+  forwarded: BTreeMap<(u64, u32, u32), (u16, u64)>,
   parked: usize,
   /// The work whose parked verb is being resumed now: it may park again at the front of its own queue.
   resuming: Option<DbVolumeId>,
@@ -387,7 +422,12 @@ fn may_ask(state: &ShardState, principal: &Principal, body: &RequestBody) -> boo
     RequestBody::Submit { .. }
     | RequestBody::SubmitSigned { .. }
     | RequestBody::SubmitHeld { .. }
-    | RequestBody::Rebase { .. } => require_work(state, principal, volume, false, "ask").is_ok(),
+    | RequestBody::Rebase { .. }
+    | RequestBody::CheckMerge { .. }
+    | RequestBody::ReadMergeCheck { .. } => {
+      require_work(state, principal, volume, false, "ask").is_ok()
+    }
+    RequestBody::ResolveMerge { .. } => require_work(state, principal, volume, true, "ask").is_ok(),
     // An approval reaches the verdict only once it verifies (A-285): the owner trusts what it is sent, so a consumer's
     // or a forged approval runs here, where `verbs::submit_approved` refuses it, and nothing reaches the green.
     RequestBody::SubmitApproved {
@@ -460,6 +500,37 @@ fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<N
         seal(state, work),
         (evidence, approval, signature, authorship),
       ))
+    }
+    RequestBody::CheckMerge { .. } => merge_need(state, work, MergeAsk::default()),
+    RequestBody::ResolveMerge {
+      stamp,
+      discard,
+      replacement,
+    } => {
+      // A stale stamp asks nothing: the verb refuses it on this shard.
+      if !crate::verbs::stamp_holds(state, work, stamp) {
+        return None;
+      }
+      merge_need(
+        state,
+        work,
+        MergeAsk {
+          head: Some(stamp.head),
+          discard: discard.clone(),
+          replacement: replacement.clone(),
+        },
+      )
+    }
+    RequestBody::ReadMergeCheck {
+      stamp,
+      path,
+      offset,
+      max,
+    } => {
+      if !crate::verbs::stamp_holds(state, work, stamp) {
+        return None;
+      }
+      page_if_unheld(w, fetched, path, *offset, (*max).min(page_room()))
     }
     RequestBody::Rebase { .. } => {
       if home.rebased.is_some() {
@@ -568,6 +639,25 @@ fn verdict_need(
     evidence: evidence.to_vec(),
     sealed: Box::new(composed(state, sealed, evidence.to_vec())),
     policy: crate::verbs::SubmitPolicy::of_work(state, work, (approval, signature, authorship)),
+  })
+}
+
+/// What a merge check or a resolution needs of the green's owner (A-796): a rebase's base and refinement first, then the
+/// rebase itself carrying `ask`.
+fn merge_need(state: &ShardState, work: DbVolumeId, ask: MergeAsk) -> Option<Need> {
+  if state.work_home.rebased.is_some() {
+    return None;
+  }
+  let mut sealed = seal(state, work);
+  if let Some(need) = base_missing(state, &sealed) {
+    return Some(need);
+  }
+  if let Some(owed) = refine_owed(state, &sealed) {
+    return Some(Need::Refine(Box::new(owed)));
+  }
+  sealed.merge = Some(ask);
+  Some(Need::Rebase {
+    sealed: Box::new(composed(state, sealed, Vec::new())),
   })
 }
 
@@ -767,6 +857,7 @@ fn seal(state: &ShardState, work: DbVolumeId) -> SealedWork {
     files: w.map(|w| w.files.clone()).unwrap_or_default(),
     composed: None,
     computed: None,
+    merge: None,
   }
 }
 
@@ -2427,6 +2518,10 @@ fn resume_pass(state: &mut ShardState, work: DbVolumeId) {
     } = head;
     let home = &mut state.work_home;
     home.by_request.remove(&key(verb.origin, verb.id));
+    let forwarded = home
+      .forwarded
+      .remove(&key(verb.origin, verb.id))
+      .map(|waiter| (verb.origin, verb.id, waiter));
     home.parked = home.parked.saturating_sub(1);
     let verb_key = (verb.origin, verb.id.client, verb.id.sequence);
     if state
@@ -2446,6 +2541,9 @@ fn resume_pass(state: &mut ShardState, work: DbVolumeId) {
     home.named = named;
     home.resuming = Some(work);
     crate::lease_wait::run_resumed(state, verb, refused, None);
+    if let Some((origin, id, waiter)) = forwarded {
+      answer_forwarded(state, (origin, id), waiter);
+    }
     let home = &mut state.work_home;
     home.resuming = None;
     home.fetched = None;
@@ -2455,6 +2553,47 @@ fn resume_pass(state: &mut ShardState, work: DbVolumeId) {
     home.named = None;
   }
 }
+
+/// Attaches the exchange of a verb forwarded from another node, waiting as `waiter` (its control shard and awaited
+/// call), to the verb `(origin, id)` parked here (A-794): answered when its queue resumes it ([`answer_forwarded`]).
+/// False when no such verb is parked here. Before, such an exchange answered `Overloaded` at once and only the origin's
+/// resend under the id met the completion, so every forwarded verb of a work whose green lives on another shard of this
+/// node cost its client a retry pause.
+pub(crate) fn attach_forwarded(
+  state: &mut ShardState,
+  (origin, id): (u64, RequestId),
+  waiter: (u16, u64),
+) -> bool {
+  let home = &mut state.work_home;
+  if !home.by_request.contains_key(&key(origin, id)) {
+    return false;
+  }
+  home.forwarded.insert(key(origin, id), waiter);
+  state.count(FORWARDED_ATTACHED, 1);
+  true
+}
+
+/// Answers a forwarded verb's waiting exchange once its parked verb ran (A-794): with the completion it recorded; else,
+/// parked again here, the exchange waits for that; else, its acceptance deferred to a fleet commit, the exchange waits
+/// for the commit (`merge_service::await_forwarded`); else `Overloaded`, unrecorded, which its origin's resend runs again.
+fn answer_forwarded(state: &mut ShardState, (origin, id): (u64, RequestId), waiter: (u16, u64)) {
+  use crate::merge_service::ForwardedAcceptance;
+  let answer = match crate::merge_service::await_forwarded(state, (origin, id), waiter) {
+    ForwardedAcceptance::Completed(bytes) => <ReplyBody as slates_wire::Wire>::from_bytes(&bytes)
+      .unwrap_or_else(|_| crate::verbs::refused(Refusal::DuplicateRequest)),
+    ForwardedAcceptance::Waiting => return,
+    ForwardedAcceptance::Gone if attach_forwarded(state, (origin, id), waiter) => return,
+    ForwardedAcceptance::Gone => crate::verbs::refused(Refusal::Overloaded { shard: state.shard }),
+  };
+  crate::xshard::answer_awaited(waiter.0, waiter.1, answer);
+  state.count(FORWARDED_ANSWERED, 1);
+}
+
+/// Format: a forwarded verb's exchange attached to its verb parked here ([`attach_forwarded`]), the non-vacuity count
+/// of A-794's event-driven answer.
+pub(crate) const FORWARDED_ATTACHED: &str = "merge.work.forwarded_attached";
+/// Format: a forwarded verb's exchange answered when its parked verb resumed ([`answer_forwarded`]).
+pub(crate) const FORWARDED_ANSWERED: &str = "merge.work.forwarded_answered";
 
 /// Keeps the base entries a verb fetched with the work (A-247), charged as the work's: the refusal its verb answers when
 /// the budget cannot hold them.
@@ -2714,6 +2853,7 @@ mod tests {
       files: super::WorkFiles::default(),
       composed: None,
       computed: None,
+      merge: None,
     }
   }
 
@@ -2722,6 +2862,7 @@ mod tests {
     match answer {
       super::RebaseAnswer::Rebased { journal, .. } => format!("rebased to {journal:?}"),
       super::RebaseAnswer::Reply(reply) => format!("answered {reply:?}"),
+      super::RebaseAnswer::Checked { head, .. } => format!("checked at {head}"),
     }
   }
 

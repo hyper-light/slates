@@ -191,7 +191,9 @@ pub(crate) fn fresh_family_id_at(
   family: Option<u16>,
   offset: u64,
 ) -> Option<DbVolumeId> {
-  let number = state.db.family_number_at(offset)?;
+  // Past every number a creation in flight reserved (`ShardState::family_reserved_through`, A-767 item 7).
+  let base = u64::from(state.db.family_number_at(0)?).max(state.family_reserved_through);
+  let number = u32::try_from(base.checked_add(offset)?).ok()?;
   // Derived: a new family's tag is its number modulo the tags a family id holds, MAX_FAMILY_TAG + 1.
   let tags = u32::from(slates_db::register::MAX_FAMILY_TAG).checked_add(1)?;
   let tag = match family {
@@ -1020,6 +1022,15 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     Ok(shard) => shard,
     Err(refusal) => return encode_body(&refusal),
   };
+  // A work over a green is made on the partition its name hashes to (A-794), as a create is placed by its name: the
+  // green's own shard asks only its verdict and its base (A-247), and its partition's merge budget holds the green's
+  // chain, not every forwarded work's log. Run on the green's shard, 76,955 of 100,000 works over the Linux kernel were
+  // made on the primary's one partition, whose budget then refused their edits and the green's own versions.
+  // Whether the green is made yet is still asked of the green's shard, which holds it, before the work is made.
+  let (shard, made_on) = match forward_placement(&body, (control, shard), volume).await {
+    Ok(placed) => placed,
+    Err(refusal) => return encode_body(&*refusal),
+  };
   let origin_host = origin.0;
   let id = RequestId::from_word(request);
   let reply = if is_forwardable_read(&body) {
@@ -1035,7 +1046,7 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     forwarded_write(
       (control, shard),
       (origin_host, id),
-      (principal, body, volume),
+      (principal, body, made_on),
       (ack_up_to, ack_owed),
     )
     .await
@@ -1044,6 +1055,30 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     crate::remote_attach::serve_unforwardable(control, shard, origin_host, body).await
   };
   encode_body(&named_if_unshared(reply, (control, shard), volume, requester).await)
+}
+
+/// Where a forwarded verb runs, and the volume it is made on (none for a work being made): a work over a green on the
+/// partition its name hashes to (A-794), once the green's own shard has said the green is made (A-247); any other
+/// verb on `shard`, about `volume`. Refused, the answer.
+async fn forward_placement(
+  body: &RequestBody,
+  (control, shard): (u16, u16),
+  volume: VolumeId,
+) -> Result<(u16, Option<VolumeId>), Box<ReplyBody>> {
+  let RequestBody::CreateWork { name, .. } = body else {
+    return Ok((shard, Some(volume)));
+  };
+  let named = match crate::state::try_with_state(|s| {
+    shard_of_partition(s, owner_of_name(name, s.shards.len()))
+  }) {
+    Ok(named) => named.unwrap_or(shard),
+    Err(access) => return Err(Box::new(refusal_of_access(&access, control))),
+  };
+  match call_owner(control, shard, move |s| forwarded_before_made(s, volume)).await {
+    Ok(None) => Ok((named, None)),
+    Ok(Some(refusal)) => Err(Box::new(refusal)),
+    Err(refusal) => Err(refusal),
+  }
 }
 
 /// The work a node's verb is about (A-697: `AdmitWork`, `MoveWorkFloor`, `SubmitComputed`), whose creator alone may send
@@ -1133,17 +1168,18 @@ fn forwarded_before_made(state: &mut ShardState, volume: VolumeId) -> Option<Rep
 }
 
 /// A forwarded write run on its owner `shard` under the origin's request id (§4.8 "Lookup"): refused before any
-/// completion is recorded while the volume is not made here yet; the origin's acknowledged completions pruned first;
-/// answered as [`answer_forwarded_write`] answers it.
+/// completion is recorded while `made_on`, the volume the verb names, is not made here yet (`None` for a work's creation,
+/// whose green its own shard was asked of first, A-794); the origin's acknowledged completions pruned first; answered as
+/// [`answer_forwarded_write`] answers it.
 async fn forwarded_write(
   (control, shard): (u16, u16),
   (origin_host, id): (u64, RequestId),
-  (principal, body, volume): (Principal, RequestBody, VolumeId),
+  (principal, body, made_on): (Principal, RequestBody, Option<VolumeId>),
   (ack_up_to, ack_owed): (Option<u32>, Vec<u32>),
 ) -> ReplyBody {
   let forwarded = call_owner(control, shard, move |s| {
     // Not made here yet: refused before any completion is recorded, so the resend under its id runs it once made.
-    if let Some(refusal) = forwarded_before_made(s, volume) {
+    if let Some(refusal) = made_on.and_then(|volume| forwarded_before_made(s, volume)) {
       return (Some(refusal), None);
     }
     if let Some(up_to) = ack_up_to {
@@ -1291,7 +1327,15 @@ async fn await_deferred_completion(
 ) -> ReplyBody {
   let (call, waiter) = crate::xshard::awaited::<ReplyBody>(shard);
   let attached = call_owner(control, shard, move |s| {
-    crate::merge_service::await_forwarded(s, (origin_host, id), (control, waiter))
+    match crate::merge_service::await_forwarded(s, (origin_host, id), (control, waiter)) {
+      // A verb parked at its work's gate (A-794) answers this exchange when its queue resumes it.
+      crate::merge_service::ForwardedAcceptance::Gone
+        if crate::work_home::attach_forwarded(s, (origin_host, id), (control, waiter)) =>
+      {
+        crate::merge_service::ForwardedAcceptance::Waiting
+      }
+      other => other,
+    }
   })
   .await;
   match attached {
@@ -2753,9 +2797,7 @@ pub(crate) fn route_gated(
     ));
   }
   let owner = match &body {
-    RequestBody::Create { name, .. } | RequestBody::CreateOverS3 { name, .. } => {
-      Some(owner_of_name(name, state.shards.len()))
-    }
+    RequestBody::Create { name, .. } => Some(owner_of_name(name, state.shards.len())),
     // A repository and every green of its lineage live on the partition its name hashes to (§4.17.1, A-575).
     RequestBody::CreateRepository { name, .. } => Some(owner_of_name(name, state.shards.len())),
     RequestBody::CreateBranch { repository, .. }
@@ -4989,6 +5031,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::CopyRefused { .. } => "copy_refused",
     Refusal::CredentialUnreplicated { .. } => "credential_unreplicated",
     Refusal::LandingSuperseded { .. } => "landing_superseded",
+    Refusal::StaleMergeView => "stale_merge_view",
   }
 }
 
@@ -5002,7 +5045,6 @@ fn claims_placed_durability(body: &RequestBody) -> bool {
   matches!(
     body,
     RequestBody::Create { .. }
-      | RequestBody::CreateOverS3 { .. }
       | RequestBody::CreateGreen { .. }
       | RequestBody::CreateRepository { .. }
       | RequestBody::CreateBranch { .. }
@@ -5227,23 +5269,10 @@ fn dispatch_inner(
       require_locked,
       base.as_deref(),
     ),
-    RequestBody::CreateOverS3 {
-      name,
-      size,
-      names,
-      require_locked,
-      base,
-      credential,
-    } => create_over_s3(
-      state,
-      principal,
-      &name,
-      size,
-      names,
-      require_locked,
-      &base,
-      credential,
-    ),
+    // Tag 97, `CreateOverS3` until the S3 base was removed (2026-11-20): reserved, and refused by kind.
+    RequestBody::RemovedCreateOverS3 => refused(Refusal::Unsupported {
+      feature: "a volume over an S3 base (removed 2026-11-20)".to_owned(),
+    }),
     RequestBody::Snapshot { volume } => snapshot(state, principal, volume),
     RequestBody::Move { volume, to } => crate::moves::move_verb(state, principal, volume, to),
     RequestBody::CaptureBase { volume } => capture_base(state, principal, volume),
@@ -5380,6 +5409,18 @@ fn dispatch_inner(
       crate::merge_service::merge_record_verb(state, principal, green, version)
     }
     RequestBody::Rebase { work } => rebase(state, principal, work),
+    RequestBody::CheckMerge { work } => check_merge(state, principal, work),
+    RequestBody::ReadMergeCheck {
+      stamp,
+      path,
+      offset,
+      max,
+    } => read_merge_check(state, principal, stamp, &path, (offset, max)),
+    RequestBody::ResolveMerge {
+      stamp,
+      discard,
+      replacement,
+    } => resolve_merge(state, principal, stamp, discard, replacement),
     RequestBody::Advance {
       attachment,
       version,
@@ -6871,201 +6912,6 @@ pub(crate) fn create(
   )
 }
 
-/// The S3 base a `CreateOverS3` names (A-555), checked as the library checks it (`S3Base::new`): refused `BadRequest`
-/// naming what was wrong.
-fn s3_base_of(
-  spec: &slates_ipc::protocol::S3BaseSpec,
-) -> Result<slates_base::s3::name::S3Base, Refusal> {
-  let style = if spec.path_style {
-    slates_base::s3::client::Style::Path
-  } else {
-    slates_base::s3::client::Style::VirtualHosted
-  };
-  slates_base::s3::name::S3Base::new(
-    &spec.endpoint,
-    &spec.region,
-    &spec.bucket,
-    &spec.prefix,
-    style,
-  )
-  .map_err(|refused| Refusal::BadRequest {
-    reason: format!("an S3 base refused: {refused:?}"),
-  })
-}
-
-/// The store client of `base`, signed with `credential` (A-555): its endpoint at the address its host names, verified
-/// against `authorities` over HTTPS. The daemon resolves no names (GAPS A-464: name resolution is owed), so a host that
-/// is not an IPv4 address is refused `BaseUnavailable` naming the base, as is plain HTTP off loopback, HTTPS with no
-/// authority, and an authority the TLS configuration refuses. Its requests are dated by the host's wall clock, may be
-/// as late as this daemon's liveness window, and never take longer in all than the shard's failover delay, the longest
-/// a request parked on a fetch waits; its retry pauses are jittered from the volume's id.
-fn s3_client_of(
-  state: &ShardState,
-  base: &slates_base::s3::name::S3Base,
-  (authorities, credential): (&[Vec<u8>], slates_ipc::protocol::S3Credential),
-  seed: u64,
-) -> Result<slates_base::s3::client::Client, Refusal> {
-  use slates_base::s3::client::{Client, Limits, host_wall_ns};
-  let unreachable = || Refusal::BaseUnavailable {
-    path: base.to_string(),
-    errno: 0,
-  };
-  let addr: slates_rt::tcp::Ipv4Addr = base.host().parse().map_err(|_| unreachable())?;
-  if base.scheme() == slates_base::s3::name::Scheme::Https && authorities.is_empty() {
-    return Err(unreachable());
-  }
-  let authorities = authorities
-    .iter()
-    .map(|der| rustls::pki_types::CertificateDer::from(der.clone()))
-    .collect();
-  let endpoint = base.endpoint(
-    slates_rt::tcp::SocketAddrV4::new(addr, base.port()),
-    authorities,
-  );
-  let credentials = slates_base::s3::sigv4::Credentials::new(
-    &credential.access_key_id,
-    &credential.secret_access_key,
-    credential.session_token.as_deref(),
-  );
-  let limits = Limits {
-    liveness_ns: crate::daemon::LIVENESS_BUDGET_NS,
-    ceiling_ns: state.failover_ns,
-  };
-  Client::new(endpoint, credentials, limits, host_wall_ns, seed).map_err(|_| unreachable())
-}
-
-/// `CreateOverS3` (A-555): makes an overlay over the objects of an S3 base as [`create`] makes one over a host
-/// directory, its slot's host the base's, and starts the base's fetch driver on this shard, the volume's owner, with
-/// the store client the credential signs for. The driver is started before the volume is published, so a shard whose
-/// task arena is full refuses the create `Overloaded` having made nothing; it first looks for its host once this verb
-/// has run, and ends at once if the publish was refused. The credential is never recorded (R1): the catalog keeps the
-/// base alone.
-#[allow(clippy::too_many_arguments)]
-fn create_over_s3(
-  state: &mut ShardState,
-  principal: &Principal,
-  name: &str,
-  size: SizeClass,
-  names: NamePolicy,
-  require_locked: bool,
-  spec: &slates_ipc::protocol::S3BaseSpec,
-  credential: slates_ipc::protocol::S3Credential,
-) -> ReplyBody {
-  if state.db.partition().volume_by_name(name).is_some() {
-    let existing = state
-      .db
-      .partition()
-      .volume_by_name(name)
-      .map(|v| to_wire_volume(v.id))
-      .unwrap_or_default();
-    return refused(Refusal::AlreadyExists { existing });
-  }
-  let base = match s3_base_of(spec) {
-    Ok(base) => base,
-    Err(refusal) => return refused(refusal),
-  };
-  if base.to_string().len() > longest_recordable_base() {
-    return refused(crate::error::base_unavailable(
-      base.to_string(),
-      Some(PATH_TOO_LONG),
-    ));
-  }
-  let Admitted {
-    volume,
-    host,
-    credits,
-  } = match admit_over(
-    state,
-    principal,
-    (size, names, require_locked),
-    AdmitBase::S3(&base),
-  ) {
-    Ok(admitted) => admitted,
-    Err(reply) => return *reply,
-  };
-  let Credits {
-    reservation,
-    version: version_credit,
-    metadata: metadata_credit,
-    lock: lock_credit,
-  } = credits;
-  let discard = |state: &mut ShardState, volume: Volume| {
-    let hold = volume.version_hold();
-    let discarded = volume.discard_partial(&mut state.store);
-    count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
-    release_version_hold(&mut state.store, hold);
-  };
-  let Some(id) = fresh_volume_id(state) else {
-    discard(state, volume);
-    return give_back(
-      state,
-      reservation,
-      version_credit,
-      metadata_credit,
-      ids_exhausted(),
-    );
-  };
-  // Derived: the jitter's seed is the volume's own id, so two volumes' retries never pause in step.
-  let seed = id
-    .bytes
-    .first_chunk::<8>()
-    .map_or(0, |word| u64::from_le_bytes(*word));
-  let started =
-    s3_client_of(state, &base, (&spec.authorities, credential), seed).and_then(|client| {
-      crate::base_wait::spawn_driver(id, client)
-        .map_err(|_| Refusal::Overloaded { shard: state.shard })
-    });
-  if let Err(refusal) = started {
-    discard(state, volume);
-    return give_back(state, reservation, version_credit, metadata_credit, refusal);
-  }
-  let record = VolumeRecord {
-    id,
-    name: name.to_owned(),
-    owner_shard: state.partition,
-    policy: PolicyRecord {
-      size: db_size(size),
-      names: match names {
-        NamePolicy::Exact => DbNamePolicy::Exact,
-        NamePolicy::Fold => DbNamePolicy::Fold,
-      },
-      require_locked,
-      role: Role::Plain,
-      live_shipped: false,
-      live_holders: None,
-      write: None,
-      write_version: 0,
-      signers: Vec::new(),
-    },
-    base: BaseRecord::S3 {
-      endpoint: spec.endpoint.clone(),
-      region: spec.region.clone(),
-      bucket: spec.bucket.clone(),
-      prefix: spec.prefix.clone(),
-      path_style: spec.path_style,
-    },
-    head: DbSnapshotId::default(),
-    epoch: 0,
-    referenced_bytes: 0,
-    unique_bytes: 0,
-    state: VolumeState::Live,
-    lease: None,
-    owner: principal.clone(),
-    access: Vec::new(),
-    created_ns: state.clock.monotonic_ns(),
-    catalog_version: 0,
-    taken_over: None,
-  };
-  publish_created_volume(
-    state,
-    id,
-    volume,
-    host,
-    (reservation, version_credit, metadata_credit, lock_credit),
-    record,
-  )
-}
-
 /// What a volume holds against the shard's ledgers from its admission to its teardown (§4.2): a bounded volume's byte
 /// reservation, its inode allowance against the version slab, its records against the metadata ledger, and a strict
 /// volume's locked entitlement.
@@ -7116,8 +6962,6 @@ pub(crate) enum AdmitBase<'a> {
     /// The tree's identity: its fingerprints' device.
     identity: u64,
   },
-  /// An overlay over the objects of an S3 base, read through the shard's fetches (§4.15, A-791).
-  S3(&'a slates_base::s3::name::S3Base),
 }
 
 /// [`admit`] over any [`AdmitBase`].
@@ -7256,18 +7100,6 @@ pub(crate) fn admit_over(
       }
     },
     AdmitBase::Path(path) => match open_base(state, path, config) {
-      Ok(pair) => pair,
-      Err(reply) => {
-        return Err(Box::new(give_back(
-          state,
-          reservation,
-          version_credit,
-          metadata_credit,
-          reply_refusal(*reply),
-        )));
-      }
-    },
-    AdmitBase::S3(base) => match open_s3_base(state, base, config, size) {
       Ok(pair) => pair,
       Err(reply) => {
         return Err(Box::new(give_back(
@@ -7805,17 +7637,11 @@ fn clone_base_host(
 ) -> Result<Option<BaseHost>, Refusal> {
   let path = match &record.base {
     BaseRecord::Path { path } => path,
-    // An S3 base's host is one fetch state and its credential, which a clone cannot duplicate yet (A-555): refused,
-    // never a clone with no base under it.
-    BaseRecord::S3 {
-      endpoint,
-      bucket,
-      prefix,
-      ..
-    } => {
-      return Err(Refusal::BaseUnavailable {
-        path: format!("s3://{bucket}/{prefix} at {endpoint}"),
-        errno: 0,
+    // Tag 3, an S3 base's record until the S3 base was removed (2026-11-20): no daemon of this build records it, and
+    // one met is refused by kind, never a clone with no base under it.
+    BaseRecord::RemovedS3 => {
+      return Err(Refusal::Unsupported {
+        feature: "a volume over an S3 base (removed 2026-11-20)".to_owned(),
       });
     }
     BaseRecord::Scratch | BaseRecord::Image { .. } => return Ok(None),
@@ -7832,74 +7658,6 @@ fn clone_base_host(
     .try_clone_dirs()
     .map(|host| Some(BaseHost::Disk(host)))
     .map_err(|error| base_open_refusal(path, error))
-}
-
-/// Makes the host of the S3 base `base` (A-555) and creates the overlay over its root, a volume of `size`. The host is
-/// built empty: nothing is fetched until a request asks, and the root's facts need no fetch. Its cache is the volume's
-/// own byte bound, no more than the shard could admit now; a cache that cannot hold one chunk is refused
-/// `BudgetExceeded`, since no read of the base could ever be answered.
-fn open_s3_base(
-  state: &mut ShardState,
-  base: &slates_base::s3::name::S3Base,
-  config: VolumeConfig,
-  size: SizeClass,
-) -> Result<(Volume, Option<BaseHost>), Box<ReplyBody>> {
-  use slates_base::s3::host::{HostConfig, HostRefused, S3Host};
-  let admittable = state.store.admittable();
-  let bound = match size {
-    SizeClass::Bounded { limit } => limit,
-    SizeClass::Dynamic { max } => max,
-  };
-  let host_config = HostConfig {
-    chunk_bytes: u64::try_from(state.store.content.chunk_bytes()).unwrap_or(u64::MAX),
-    // Derived: the volume's byte bound, within what the shard could admit now: what fetched ranges and listings may
-    // take of the shard is no more than the volume itself may.
-    cache_bytes: bound.min(admittable),
-    owner: s3_owner(),
-    wall_ns: slates_base::s3::client::host_wall_ns,
-  };
-  let mut host = S3Host::new(base, host_config).map_err(|refusal| {
-    Box::new(refused(match refusal {
-      HostRefused::CacheBelowChunk => Refusal::BudgetExceeded {
-        available: admittable,
-      },
-      HostRefused::ZeroChunk => Refusal::BaseUnavailable {
-        path: base.to_string(),
-        errno: 0,
-      },
-    }))
-  })?;
-  let root = host.root();
-  let facts = host.facts(root).map_err(|e| {
-    Box::new(refused(crate::error::base_unavailable(
-      base.to_string(),
-      e.code(),
-    )))
-  })?;
-  let volume = Volume::create_overlay(
-    &mut state.store,
-    config,
-    BaseConfig {
-      root,
-      facts,
-      large_class_bytes: state.config.large_class_bytes,
-    },
-  )
-  .map_err(|e| Box::new(refused(refusal_of_vfs(&e))))?;
-  Ok((volume, Some(BaseHost::S3(Box::new(host)))))
-}
-
-/// The owner an S3 base's entries report (`st_uid`, `st_gid`): this daemon's own user and group, the one user the
-/// rendezvous admits ([`creator_gid`]).
-#[cfg(unix)]
-fn s3_owner() -> (u32, u32) {
-  (rustix::process::geteuid().as_raw(), creator_gid())
-}
-
-/// Windows: ownership is a security descriptor; the WinFsp bridge reports no POSIX ids.
-#[cfg(not(unix))]
-fn s3_owner() -> (u32, u32) {
-  (0, creator_gid())
 }
 
 /// Opens a base directory (read-only, `O_NOFOLLOW`) and creates the overlay over it.
@@ -9275,28 +9033,14 @@ fn accepted_restatement(version: u64) -> crate::work_log::WorkLogEntry {
 /// or rename also keeps the work's content map consistent, so a later edit and the post-state seal
 /// see the right files; a symlink's target travels in the ops document's path table and an xattr's
 /// value in the journal, so neither needs a work-side store.
-fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: WorkOp) -> ReplyBody {
-  let work_id = match crate::merge_service::require_work(state, principal, work, true, "declare") {
-    Ok((record, _)) => record.id,
-    Err(refusal) => return refused(refusal),
-  };
-  // A guest's own attribute namespaces (`trusted.`, `security.`) are its kernel's to set (A-290): a guest's kernel
-  // acts on them (a binary's capability, an overlay's opaque directory), and inside the guest only its privileged
-  // processes may set them. A declaration is a host's channel, so it sets and removes none, as no host's mount does.
-  if let WorkOp::SetXattr { name, .. } | WorkOp::RemoveXattr { name, .. } = &op
-    && slates_bridge_core::guest_only(name.as_bytes())
-  {
-    return refused(Refusal::Unsupported {
-      feature: format!("a guest's own attribute ({name}) from a host's channel"),
-    });
-  }
-  let Some(w) = state.works.get(&work_id) else {
-    return refused(Refusal::NotFound);
-  };
+/// A work's namespace or metadata declaration as the journal operation it records (§4.16): every path keyed canonically,
+/// a copy of the work's base `base_version` unless it names a version. One conversion for `declare` and a resolution's
+/// replacement (A-796).
+fn volume_op_of(op: WorkOp, base_version: u64) -> VolumeOp {
   // Every path the operation names is keyed canonically (no leading slash), as `edit` keys its
   // path and the origin walk its entries; a symlink's target is a link string, kept as given.
   let key = |path: String| crate::merge_service::canonical_path(&path).to_owned();
-  let volume_op = match op {
+  match op {
     WorkOp::Mknod { path, node } => {
       use slates_ipc::protocol::IpcNodeKind;
       use slates_merge::special::{SpecialKind, SpecialNode};
@@ -9359,10 +9103,31 @@ fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: Wo
     } => VolumeOp::Copy {
       from: key(from),
       to: key(to),
-      version: version.unwrap_or(w.base_version),
+      version: version.unwrap_or(base_version),
       replace,
     },
+  }
+}
+
+fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: WorkOp) -> ReplyBody {
+  let work_id = match crate::merge_service::require_work(state, principal, work, true, "declare") {
+    Ok((record, _)) => record.id,
+    Err(refusal) => return refused(refusal),
   };
+  // A guest's own attribute namespaces (`trusted.`, `security.`) are its kernel's to set (A-290): a guest's kernel
+  // acts on them (a binary's capability, an overlay's opaque directory), and inside the guest only its privileged
+  // processes may set them. A declaration is a host's channel, so it sets and removes none, as no host's mount does.
+  if let WorkOp::SetXattr { name, .. } | WorkOp::RemoveXattr { name, .. } = &op
+    && slates_bridge_core::guest_only(name.as_bytes())
+  {
+    return refused(Refusal::Unsupported {
+      feature: format!("a guest's own attribute ({name}) from a host's channel"),
+    });
+  }
+  let Some(w) = state.works.get(&work_id) else {
+    return refused(Refusal::NotFound);
+  };
+  let volume_op = volume_op_of(op, w.base_version);
   // The work is charged for what the declaration adds before it changes anything (`crate::work_charge`): a moved
   // file it now holds, a removal it records, the operation itself. The base is read while its green is lent.
   let delta =
@@ -9805,6 +9570,7 @@ fn take_sealed(state: &mut ShardState, work: DbVolumeId) -> Option<crate::work_h
     files: std::mem::take(&mut w.files),
     composed: None,
     computed: None,
+    merge: None,
   })
 }
 
@@ -10396,8 +10162,45 @@ type Judged = (
 fn secure_retention(state: &mut ShardState, green_id: DbVolumeId, secured: u64) -> Result<(), u64> {
   let room = usize::try_from(secured).unwrap_or(usize::MAX);
   crate::merge_service::settle_green_retention_leaving(state, green_id, room)?;
-  crate::merge_service::secure_green_retention(state, green_id, secured)
-    .inspect_err(|available| report_first_budget_refusal(state, "retention", secured, *available))
+  crate::merge_service::secure_green_retention(state, green_id, secured).inspect_err(|available| {
+    report_first_budget_refusal(state, "retention", secured, *available);
+    report_first_retention_cap_refusal(state, green_id, (secured, *available));
+  })
+}
+
+/// Logs, once a process, what a green's retention holds when a submit's reservation is first refused at the green's
+/// own cap with room left (A-794 part 2's diagnosis; the debugging protocol's logging first): at 100,000 clients over
+/// the Linux kernel, with A-793's re-anchored history, 64,072 accepted submits were refused `BudgetExceeded` where
+/// [`report_first_budget_refusal`], which logs only a budget with no room at all, wrote nothing. The history's bytes
+/// owned and named as files' blocks tell a block kept whole (another holder keeps it, never cut) from what the changes
+/// overwrote.
+fn report_first_retention_cap_refusal(
+  state: &ShardState,
+  green: DbVolumeId,
+  (secured, available): (u64, u64),
+) {
+  static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+  if available == 0 || LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    return;
+  }
+  let Some(engine) = state.greens.get(&green) else {
+    return;
+  };
+  let retained = engine.retained_bytes();
+  slates_machine::log_line!(
+    "slates-server: retention refused at the green's cap (first occurrence): shard={} secured={secured} \
+     available={available} charged={} cap={} head={} folded_below={} floor={} {retained:?} owned={} named={:?} \
+     reanchored={:?}",
+    state.shard,
+    state.green_retention.get(&green).copied().unwrap_or(0),
+    crate::merge_service::rejected_cache_budget(state),
+    engine.head(),
+    engine.folded_below(),
+    crate::merge_service::reachable_floor(state, green),
+    engine.history_owned_bytes(),
+    engine.history_blocks_named(),
+    engine.history_reanchored(),
+  );
 }
 
 /// What answers a submit once its increment and signature are judged, before it merges: an asked merge's verdict for
@@ -10843,6 +10646,181 @@ fn rebase(state: &mut ShardState, principal: &Principal, work: VolumeId) -> Repl
   settle_rebase(state, work_id, green_id, answer)
 }
 
+/// Whether a merge check's stamp still holds for `work` on this shard (A-796): the work is the stamp's, over the stamp's
+/// green and base, at the stamp's revision (every change to a work moves its revision). The green's head is the green
+/// half's to judge, where the green is.
+pub(crate) fn stamp_holds(
+  state: &ShardState,
+  work: DbVolumeId,
+  stamp: &slates_ipc::protocol::MergeStamp,
+) -> bool {
+  to_db_volume(stamp.work) == work
+    && state.works.get(&work).is_some_and(|w| {
+      to_wire_volume(w.green) == stamp.green
+        && w.base_version == stamp.base
+        && w.revision == stamp.revision
+    })
+}
+
+/// The green's half of a merge check or a resolution on a work whose green lives on this shard (A-796), as
+/// [`rebase`] asks it locally: the work sealed with `ask`, mapped, and put back unchanged. A work whose refinement
+/// is still owed is answered retryable rather than judged unrefined.
+fn local_merge(
+  state: &mut ShardState,
+  (work_id, green_id): (DbVolumeId, DbVolumeId),
+  ask: crate::work_home::MergeAsk,
+) -> crate::work_home::RebaseAnswer {
+  use crate::work_home::RebaseAnswer;
+  if refinement_owed(state, (work_id, green_id)).is_some() {
+    return RebaseAnswer::Reply(refused(Refusal::Overloaded { shard: state.shard }));
+  }
+  let Some(mut sealed) = take_sealed(state, work_id) else {
+    return RebaseAnswer::Reply(refused(Refusal::NotFound));
+  };
+  sealed.merge = Some(ask);
+  let answer = map_rebase(state, &sealed);
+  put_back_sealed(state, sealed);
+  answer
+}
+
+/// `CheckMerge` (§4.16, A-796): the verdict a submit would get now, judged by the green's half as a rebase is and
+/// settled by nothing. The windows are kept with the work for `Conflicts` (A-267), as a conflicting rebase keeps them;
+/// the work's base, journal, files and charge and the green are unchanged.
+fn check_merge(state: &mut ShardState, principal: &Principal, work: VolumeId) -> ReplyBody {
+  let (work_id, green_id) =
+    match crate::merge_service::require_work(state, principal, work, false, "check") {
+      Ok((record, green)) => (record.id, green),
+      Err(refusal) => return refused(refusal),
+    };
+  let answer = match state.work_home.rebased.take() {
+    Some(answer) => answer,
+    None => local_merge(
+      state,
+      (work_id, green_id),
+      crate::work_home::MergeAsk::default(),
+    ),
+  };
+  let (head, declaration, conflict) = match answer {
+    crate::work_home::RebaseAnswer::Checked {
+      head,
+      declaration,
+      conflict,
+    } => (head, declaration, conflict),
+    crate::work_home::RebaseAnswer::Reply(reply) => return reply,
+    crate::work_home::RebaseAnswer::Rebased { .. } => {
+      return refused(Refusal::BadRequest {
+        reason: "a merge check was answered as a rebase".to_owned(),
+      });
+    }
+  };
+  let Some(w) = state.works.get(&work_id) else {
+    return refused(Refusal::NotFound);
+  };
+  let stamp = slates_ipc::protocol::MergeStamp {
+    work,
+    green: to_wire_volume(green_id),
+    base: w.base_version,
+    head,
+    revision: w.revision,
+  };
+  let windows = match conflict {
+    Some(ReplyBody::Rebased { conflicts, .. }) => conflicts,
+    _ => Vec::new(),
+  };
+  let empty = |declaration: Vec<slates_ipc::protocol::MergeOp>| ReplyBody::MergeChecked {
+    stamp,
+    conflicts: Vec::new(),
+    conflicts_elided: 0,
+    verdict: u64::MAX,
+    declaration,
+    declaration_elided: 0,
+  };
+  let (conflicts, conflicts_elided, verdict) = if windows.is_empty() {
+    (Vec::new(), 0, 0)
+  } else {
+    let room = reply_room(&empty(Vec::new()));
+    keep_verdict(state, work_id, windows, room)
+  };
+  let room = reply_room(&ReplyBody::MergeChecked {
+    stamp,
+    conflicts: conflicts.clone(),
+    conflicts_elided,
+    verdict: u64::MAX,
+    declaration: Vec::new(),
+    declaration_elided: 0,
+  });
+  let (declaration, declaration_elided) = carried(declaration, room);
+  ReplyBody::MergeChecked {
+    stamp,
+    conflicts,
+    conflicts_elided,
+    verdict,
+    declaration,
+    declaration_elided,
+  }
+}
+
+/// `ReadMergeCheck` (A-796): a page of the work as its check saw it, refused `StaleMergeView` once it changed.
+fn read_merge_check(
+  state: &mut ShardState,
+  principal: &Principal,
+  stamp: slates_ipc::protocol::MergeStamp,
+  path: &str,
+  (offset, max): (u64, u64),
+) -> ReplyBody {
+  if let Err(refusal) =
+    crate::merge_service::require_work(state, principal, stamp.work, false, "read")
+  {
+    return refused(refusal);
+  }
+  if !stamp_holds(state, to_db_volume(stamp.work), &stamp) {
+    return refused(Refusal::StaleMergeView);
+  }
+  crate::merge_service::read_range(
+    state,
+    principal,
+    (stamp.work, path, ReadAt::Head),
+    offset,
+    max,
+  )
+}
+
+/// `ResolveMerge` (§4.16, A-796): refused `StaleMergeView` with nothing changed once the work moved since its check, or
+/// (the green's half) the head did; otherwise the green's half retires the operations `discard` names, rebases the rest
+/// onto the head and applies the agent's replacement there, and the work is restated at the head as a rebase restates
+/// it ([`settle_rebase`]): one recorded step. What is kept still conflicting answers the windows, nothing changed.
+fn resolve_merge(
+  state: &mut ShardState,
+  principal: &Principal,
+  stamp: slates_ipc::protocol::MergeStamp,
+  discard: Vec<u64>,
+  replacement: Vec<slates_ipc::protocol::WorkChange>,
+) -> ReplyBody {
+  let (work_id, green_id) =
+    match crate::merge_service::require_work(state, principal, stamp.work, true, "resolve") {
+      Ok((record, green)) => (record.id, green),
+      Err(refusal) => return refused(refusal),
+    };
+  if !stamp_holds(state, work_id, &stamp) {
+    // An answer the owner gave for this verb is dropped with it: nothing of it is applied.
+    state.work_home.rebased = None;
+    return refused(Refusal::StaleMergeView);
+  }
+  let answer = match state.work_home.rebased.take() {
+    Some(answer) => answer,
+    None => local_merge(
+      state,
+      (work_id, green_id),
+      crate::work_home::MergeAsk {
+        head: Some(stamp.head),
+        discard,
+        replacement,
+      },
+    ),
+  };
+  settle_rebase(state, work_id, green_id, answer)
+}
+
 /// The owner's half of a rebase (A-247): maps a work's sealed increment through the green's deltas. The green is never
 /// changed by a rebase.
 fn map_rebase(
@@ -10861,7 +10839,12 @@ fn map_rebase(
   let Some(engine) = state.greens.get(&green_id) else {
     return RebaseAnswer::Reply(refused(Refusal::NotFound));
   };
-  rebase_answer(&engine, green_id, &inc, sealed.composed.is_some())
+  merge_answer(
+    &engine,
+    (green_id, inc),
+    sealed.composed.is_some(),
+    sealed.merge.as_ref(),
+  )
 }
 
 /// Format: a rebase of a work on a holder node mapped over the node's replica of its green (A-697), the non-vacuity
@@ -10893,7 +10876,7 @@ pub(crate) fn replica_rebase(
     state.count(crate::work_home::REPLICA_BEHIND, 1);
     return RebaseAnswer::Reply(refused(Refusal::Overloaded { shard: state.shard }));
   }
-  let answer = rebase_answer(replica, sealed.green, &inc, true);
+  let answer = merge_answer(replica, (sealed.green, inc), true, sealed.merge.as_ref());
   state.count(REBASED_ON_REPLICA, 1);
   answer
 }
@@ -10941,6 +10924,195 @@ pub(crate) fn compose_on_replica(
   )?;
   state.count(COMPOSED_ON_REPLICA, 1);
   Ok(inc)
+}
+
+/// A rebase as a merge check or a resolution asks it (A-796), on the green's half: a resolution's stamped head must be
+/// the green's (else `StaleMergeView`, nothing computed); the canonical operations it retires are dropped from the
+/// increment before it is mapped (their post-state bytes stay, unread, so every kept operation's source holds); a check
+/// answers the head it judged and the canonical declaration, with the conflict when there is one, and moves nothing; a
+/// clean resolution has the agent's changes applied over the rebased work at the head. No ask is a plain rebase.
+fn merge_answer(
+  engine: &slates_merge::engine::Green,
+  (green_id, mut inc): (DbVolumeId, slates_merge::engine::Increment),
+  composes: bool,
+  ask: Option<&crate::work_home::MergeAsk>,
+) -> crate::work_home::RebaseAnswer {
+  use crate::work_home::RebaseAnswer;
+  let Some(ask) = ask else {
+    return rebase_answer(engine, green_id, &inc, composes);
+  };
+  if ask.head.is_some_and(|head| head != engine.head()) {
+    return RebaseAnswer::Reply(refused(Refusal::StaleMergeView));
+  }
+  let ops = u64::try_from(inc.doc.ops.len()).unwrap_or(u64::MAX);
+  if ask
+    .discard
+    .windows(2)
+    .any(|pair| pair.first() >= pair.get(1))
+    || ask.discard.last().is_some_and(|index| *index >= ops)
+  {
+    return RebaseAnswer::Reply(refused(Refusal::BadRequest {
+      reason: "a resolution retires distinct operations of the checked declaration, in order"
+        .to_owned(),
+    }));
+  }
+  if !ask.discard.is_empty() {
+    let mut retired = ask.discard.iter().copied().peekable();
+    let mut index = 0u64;
+    inc.doc.ops.retain(|_| {
+      let keep = retired.peek() != Some(&index);
+      if !keep {
+        retired.next();
+      }
+      index = index.saturating_add(1);
+      keep
+    });
+  }
+  let Some(head) = ask.head else {
+    let declaration = canonical_declaration(&inc.doc);
+    let head = engine.head();
+    return match rebase_answer(engine, green_id, &inc, composes) {
+      RebaseAnswer::Rebased { .. } => RebaseAnswer::Checked {
+        head,
+        declaration,
+        conflict: None,
+      },
+      RebaseAnswer::Reply(reply @ ReplyBody::Rebased { version: None, .. }) => {
+        RebaseAnswer::Checked {
+          head,
+          declaration,
+          conflict: Some(reply),
+        }
+      }
+      other => other,
+    };
+  };
+  match rebase_answer(engine, green_id, &inc, composes) {
+    RebaseAnswer::Rebased {
+      version,
+      changed,
+      journal,
+      entries,
+    } if ask.replacement.is_empty() => RebaseAnswer::Rebased {
+      version,
+      changed,
+      journal,
+      entries,
+    },
+    RebaseAnswer::Rebased {
+      changed, journal, ..
+    } => match apply_replacement(engine, head, (changed, journal), &ask.replacement) {
+      Ok((changed, journal)) => {
+        let entries = if composes {
+          journal
+            .iter()
+            .flat_map(VolumeOp::names)
+            .flatten()
+            .map(|path| (path.to_owned(), engine.path_base(head, path)))
+            .collect()
+        } else {
+          std::collections::BTreeMap::new()
+        };
+        RebaseAnswer::Rebased {
+          version: head,
+          changed,
+          journal,
+          entries,
+        }
+      }
+      Err(refusal) => RebaseAnswer::Reply(refused(refusal)),
+    },
+    other => other,
+  }
+}
+
+/// A work's canonical declaration (A-796): its composed operations by index, the indices a resolution retires.
+fn canonical_declaration(
+  doc: &slates_merge::ops_doc::OpsDoc,
+) -> Vec<slates_ipc::protocol::MergeOp> {
+  doc
+    .ops
+    .iter()
+    .map(|op| slates_ipc::protocol::MergeOp {
+      path: doc.paths.path(op.path).unwrap_or_default().to_owned(),
+      kind: op.kind as u8,
+      at: op.at,
+      len: op.len,
+    })
+    .collect()
+}
+
+/// A resolution's changes applied over a work rebased onto `head` (A-796), as the work's own edits and declarations
+/// would be: each edit's operations from the file's length alone and its bytes as pieces over the head
+/// (`crate::work_files`), each declaration converted as `declare` converts it. The work's changed files then, whole,
+/// as a rebase restates them, and its journal.
+fn apply_replacement(
+  engine: &slates_merge::engine::Green,
+  head: u64,
+  (changed, mut journal): (
+    std::collections::BTreeMap<String, Option<Vec<u8>>>,
+    Vec<VolumeOp>,
+  ),
+  replacement: &[slates_ipc::protocol::WorkChange],
+) -> Result<
+  (
+    std::collections::BTreeMap<String, Option<Vec<u8>>>,
+    Vec<VolumeOp>,
+  ),
+  Refusal,
+> {
+  use slates_ipc::protocol::WorkChange;
+  let mut files = crate::work_files::WorkFiles::from_changed(changed);
+  let base = crate::work_files::Base {
+    green: Some(engine),
+    fetched: None,
+    version: head,
+  };
+  let unknown = || Refusal::UnknownBase {
+    green: VolumeId::default(),
+    version: head,
+  };
+  for change in replacement {
+    match change {
+      WorkChange::Edit {
+        path,
+        at,
+        delete_len,
+        bytes,
+      } => {
+        let path = crate::merge_service::canonical_path(path);
+        let old_len = files.len(base, path).map_err(|_| unknown())?;
+        let inserted = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        journal.extend(crate::work_log::edit_ops(
+          path,
+          old_len,
+          (*at, *delete_len, inserted),
+        ));
+        files
+          .splice(base, path, (*at, *delete_len), bytes)
+          .map_err(|_| unknown())?;
+      }
+      WorkChange::Declare { op } => {
+        if let WorkOp::SetXattr { name, .. } | WorkOp::RemoveXattr { name, .. } = op
+          && slates_bridge_core::guest_only(name.as_bytes())
+        {
+          return Err(Refusal::Unsupported {
+            feature: format!("a guest's own attribute ({name}) from a host's channel"),
+          });
+        }
+        let operation = volume_op_of(op.clone(), head);
+        files.declare(base, &operation).map_err(|_| unknown())?;
+        journal.push(operation);
+      }
+    }
+  }
+  let restated = files
+    .changed_entries(base)
+    .map_err(|_| unknown())?
+    .into_iter()
+    .map(|(path, bytes)| (path.to_owned(), bytes.map(std::borrow::Cow::into_owned)))
+    .collect();
+  Ok((restated, journal))
 }
 
 /// What `engine`'s rebase of `inc` gives a work over `green_id` (A-247, A-658): the work's new delta and journal over the
@@ -11022,6 +11194,11 @@ fn settle_rebase(
       journal,
       entries,
     } => (version, changed, journal, entries),
+    crate::work_home::RebaseAnswer::Checked { .. } => {
+      return refused(Refusal::BadRequest {
+        reason: "a merge check is not a rebase".to_owned(),
+      });
+    }
     crate::work_home::RebaseAnswer::Reply(reply) => return kept_conflict(state, work_id, reply),
   };
   let restated = crate::work_log::WorkLogEntry::restated(version, &changed, &journal);
@@ -11226,6 +11403,7 @@ fn submit_computed(
     files: crate::work_files::WorkFiles::default(),
     composed: Some(inc),
     computed: Some(computed),
+    merge: None,
   };
   judge_submission(state, &sealed, evidence, policy)
 }
@@ -16525,7 +16703,6 @@ pub(crate) fn recorded_reason(mut reason: String) -> String {
 fn new_volume_name(body: &RequestBody) -> Option<&str> {
   match body {
     RequestBody::Create { name, .. }
-    | RequestBody::CreateOverS3 { name, .. }
     | RequestBody::CreateGreen { name, .. }
     | RequestBody::CreateWork { name, .. }
     | RequestBody::Clone { name, .. }
@@ -20609,19 +20786,12 @@ fn build_recovered_volume(
   let mut opened = match &record.base {
     // An image volume holds its content itself, as a scratch one does; its base names only the snapshot it pins.
     BaseRecord::Scratch | BaseRecord::Image { .. } => None,
-    // An S3 base's credential is held in RAM alone and never recorded (R1), so a recovery has none to fetch with until
-    // the credential is handed again: the volume is held unavailable, naming its base (A-555; GAPS A-464).
-    BaseRecord::S3 {
-      endpoint,
-      bucket,
-      prefix,
-      ..
-    } => {
+    // Tag 3, an S3 base's record until the S3 base was removed (2026-11-20): no daemon of this build records it, so a
+    // recovery that meets one holds its volume unavailable, saying why.
+    BaseRecord::RemovedS3 => {
       return Err(RecoveryCause::BaseUnavailable {
-        path: format!("s3://{bucket}/{prefix} at {endpoint}"),
-        reason: recorded_reason(
-          "an S3 base's credential is held in RAM alone and has not been handed again since the restart".to_owned(),
-        ),
+        path: "an S3 base".to_owned(),
+        reason: recorded_reason("the S3 base was removed (2026-11-20)".to_owned()),
       });
     }
     BaseRecord::Path { path } => {

@@ -23,6 +23,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::session::{AckRange, Frame};
+use crate::stream::StreamSpan;
 
 /// Format: RFC 9002 §6.1.1 `kPacketThreshold` — three packets of reordering are tolerated before a
 /// gap below the largest acknowledged packet declares the missing packets lost. A protocol constant,
@@ -159,7 +160,7 @@ impl AckGenerator {
 /// it was sent, and the bytes it counts in flight.
 #[derive(Debug, Clone)]
 struct InFlight {
-  frames: Vec<Frame>,
+  frames: Vec<Carried>,
   sent_at: u64,
   bytes: u64,
   size: u64,
@@ -193,7 +194,7 @@ pub struct Acked {
   /// The freed packets, in packet-number order.
   pub packets: Vec<SentPacket>,
   /// The frames the freed packets carried (the connection marks their stream ranges acknowledged).
-  pub frames: Vec<Frame>,
+  pub frames: Vec<Carried>,
 }
 
 /// What a loss-detection pass declared lost: the frames to retransmit, the largest packet number among
@@ -202,7 +203,7 @@ pub struct Acked {
 #[derive(Debug, Default)]
 pub struct Lost {
   /// The frames of the lost packets, to retransmit.
-  pub frames: Vec<Frame>,
+  pub frames: Vec<Carried>,
   /// The packet numbers declared lost (for the connection to drop their ACK-of-ACK bookkeeping — a lost
   /// packet is never acknowledged, so its entry would otherwise linger).
   pub pns: Vec<u64>,
@@ -212,12 +213,48 @@ pub struct Lost {
   pub packets: Vec<SentPacket>,
 }
 
-/// The stream-data bytes a frame counts toward the in-flight congestion window: a `Stream` frame's
-/// payload length, and zero for the acknowledgement and credit frames (which are never loss-tracked).
-pub fn tracked_bytes(frame: &Frame) -> u64 {
-  match frame {
-    Frame::Stream { data, .. } => u64::try_from(data.len()).unwrap_or(u64::MAX),
-    _ => 0,
+/// One reliable item a packet carries, as its sender keeps it until it is acknowledged: a frame held whole (a control
+/// frame, a reset, a blocked report), or a span of a send stream's bytes named by stream, offset and length
+/// ([`StreamSpan`]), its bytes left in the stream's sender and encoded from there each time the packet carrying it is
+/// built (MEMORY SIZING; main's ruling on the lane, 2026-11-20: before, every stream frame held a copy of its bytes from
+/// framing until its acknowledgement).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Carried {
+  /// A frame held whole.
+  Frame(Frame),
+  /// A span of a send stream's bytes.
+  Span(StreamSpan),
+}
+
+impl Carried {
+  /// The bytes it encodes to: a frame's own length, or a stream frame's header and the span's bytes.
+  pub fn encoded_len(&self) -> usize {
+    match self {
+      Carried::Frame(frame) => frame.encoded_len(),
+      Carried::Span(span) => crate::session::STREAM_FRAME_HEADER_BYTES
+        .saturating_add(usize::try_from(span.len).unwrap_or(usize::MAX)),
+    }
+  }
+
+  /// The stream data it carries, as `(stream, offset)`: a span's or a held stream frame's; `None` for any other frame.
+  pub fn stream_offset(&self) -> Option<(u64, u64)> {
+    match self {
+      Carried::Span(span) => Some((span.stream_id, span.offset)),
+      Carried::Frame(Frame::Stream {
+        stream_id, offset, ..
+      }) => Some((*stream_id, *offset)),
+      Carried::Frame(_) => None,
+    }
+  }
+}
+
+/// The stream-data bytes an item counts toward the in-flight congestion window: a span's length or a held `Stream`
+/// frame's payload length, and zero for every other frame (which are never loss-tracked).
+pub fn tracked_bytes(carried: &Carried) -> u64 {
+  match carried {
+    Carried::Span(span) => span.len,
+    Carried::Frame(Frame::Stream { data, .. }) => u64::try_from(data.len()).unwrap_or(u64::MAX),
+    Carried::Frame(_) => 0,
   }
 }
 
@@ -292,7 +329,7 @@ impl SentTracker {
 
   /// Records that packet `pn`, a `size`-byte datagram sent at `sent_at`, carried `frames` (kept for
   /// possible retransmission) counting their stream bytes in flight.
-  pub fn on_sent(&mut self, pn: u64, frames: Vec<Frame>, sent_at: u64, size: u64) {
+  pub fn on_sent(&mut self, pn: u64, frames: Vec<Carried>, sent_at: u64, size: u64) {
     let bytes = frames.iter().map(tracked_bytes).sum();
     self.in_flight.insert(
       pn,
@@ -475,17 +512,15 @@ impl SentTracker {
     let mut dropped = 0u64;
     self.in_flight.retain(|_, packet| {
       let mut from_packet = 0u64;
-      packet.frames.retain(|frame| match frame {
-        Frame::Stream {
-          stream_id: id,
-          data,
-          ..
-        } if *id == stream_id => {
-          from_packet = from_packet.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
-          false
-        }
-        _ => true,
-      });
+      packet
+        .frames
+        .retain(|carried| match carried.stream_offset() {
+          Some((id, _)) if id == stream_id => {
+            from_packet = from_packet.saturating_add(tracked_bytes(carried));
+            false
+          }
+          _ => true,
+        });
       packet.bytes = packet.bytes.saturating_sub(from_packet);
       dropped = dropped.saturating_add(from_packet);
       !packet.frames.is_empty()
@@ -497,7 +532,7 @@ impl SentTracker {
   /// in a newer probe, so this older copy is redundant — and forgets the packet if nothing else remains in
   /// it; its other frames stay tracked. Returns the stream bytes dropped, for the caller's in-flight count.
   /// Nothing happens for a packet no longer in flight.
-  pub fn drop_copied(&mut self, pn: u64, copied: &[Frame]) -> u64 {
+  pub fn drop_copied(&mut self, pn: u64, copied: &[Carried]) -> u64 {
     let Some(packet) = self.in_flight.get_mut(&pn) else {
       return 0;
     };
@@ -528,7 +563,7 @@ impl SentTracker {
   /// is still reported as a loss to the congestion controller and to the persistent-congestion test.
   /// A packet that carries only a `Ping` (a path-MTU probe, `crate::pmtud`) has nothing to recover and is
   /// skipped. Empty when nothing recoverable is in flight.
-  pub fn copy_oldest(&self) -> Vec<Frame> {
+  pub fn copy_oldest(&self) -> Vec<Carried> {
     self
       .in_flight
       .values()
@@ -536,7 +571,7 @@ impl SentTracker {
         flight
           .frames
           .iter()
-          .any(|frame| !matches!(frame, Frame::Ping))
+          .any(|frame| !matches!(frame, Carried::Frame(Frame::Ping)))
       })
       .map(|flight| flight.frames.clone())
       .unwrap_or_default()
@@ -759,12 +794,12 @@ mod tests {
       assert_eq!(sent.next_pn(), Some(pn));
       sent.on_sent(
         pn,
-        vec![Frame::Stream {
+        vec![Carried::Frame(Frame::Stream {
           stream_id: 1,
           offset: pn,
           fin: false,
           data: vec![0u8],
-        }],
+        })],
         0,
         0,
       );
@@ -802,7 +837,7 @@ mod tests {
     for pn in 0..6 {
       let got = sent.next_pn();
       assert_eq!(got, Some(pn));
-      sent.on_sent(pn, vec![Frame::MaxData { max: pn }], 0, 0);
+      sent.on_sent(pn, vec![Carried::Frame(Frame::MaxData { max: pn })], 0, 0);
     }
     // Acknowledge [2,5]; 0 and 1 remain in flight, both >= REORDER_THRESHOLD below largest (5).
     sent.on_ack(5, 3);
@@ -826,11 +861,14 @@ mod tests {
   #[test]
   fn a_probe_copies_the_oldest_in_flight_packet() {
     let mut sent = SentTracker::new();
-    sent.on_sent(0, vec![Frame::MaxData { max: 7 }], 0, 0);
-    sent.on_sent(1, vec![Frame::MaxData { max: 8 }], 0, 0);
+    sent.on_sent(0, vec![Carried::Frame(Frame::MaxData { max: 7 })], 0, 0);
+    sent.on_sent(1, vec![Carried::Frame(Frame::MaxData { max: 8 })], 0, 0);
     // No ACK ever arrives (a tail loss), so `take_lost` finds nothing.
     assert!(sent.take_lost(0, 1, REORDER_THRESHOLD).0.frames.is_empty());
-    assert_eq!(sent.copy_oldest(), vec![Frame::MaxData { max: 7 }]);
+    assert_eq!(
+      sent.copy_oldest(),
+      vec![Carried::Frame(Frame::MaxData { max: 7 })]
+    );
     assert_eq!(sent.in_flight_count(), 2, "the original stays in flight");
     assert!(
       SentTracker::new().copy_oldest().is_empty(),
@@ -839,11 +877,11 @@ mod tests {
   }
 
   /// Builds one packet's frames: the lost frames to retransmit first, then up to two fresh ones.
-  fn build_packet(source: &mut StreamSender, sent: &mut SentTracker) -> Vec<Frame> {
+  fn build_packet(source: &mut StreamSender, sent: &mut SentTracker) -> Vec<Carried> {
     let mut frames = sent.take_lost(0, 1, REORDER_THRESHOLD).0.frames;
     for _ in 0..2 {
       match source.next_frame(1, 8) {
-        Some(frame) => frames.push(frame),
+        Some(frame) => frames.push(Carried::Frame(frame)),
         None => break,
       }
     }
@@ -854,7 +892,7 @@ mod tests {
   /// contiguous bytes into `received`, and processes the ACK it sends back.
   fn deliver(
     pn: u64,
-    frames: &[Frame],
+    frames: &[Carried],
     acks: &mut AckGenerator,
     assembler: &mut StreamAssembler,
     sent: &mut SentTracker,
@@ -862,9 +900,9 @@ mod tests {
   ) {
     acks.record(pn);
     for frame in frames {
-      if let Frame::Stream {
+      if let Carried::Frame(Frame::Stream {
         offset, fin, data, ..
-      } = frame
+      }) = frame
       {
         assembler.offer(*offset, data, *fin).unwrap();
       }

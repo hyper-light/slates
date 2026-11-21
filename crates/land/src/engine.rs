@@ -1711,12 +1711,6 @@ impl<H: LandFs> Landing<'_, '_, H> {
         outcome: Outcome::Conflict(ConflictClass::TypeChanged),
         window_ns: None,
       },
-      // A landing's target is a directory host, which never answers a pending fetch (an S3 base's, A-524); were one to,
-      // that entry fails alone, with no code to name.
-      Err(WriteFailure::Host(HostError::Pending(_))) => Written {
-        outcome: Outcome::Failed { code: None },
-        window_ns: None,
-      },
       Err(WriteFailure::Volume(e)) => Written {
         outcome: Outcome::Volume(e),
         window_ns: None,
@@ -3349,8 +3343,7 @@ fn named_code(error: HostError) -> Option<OsCode> {
     | HostError::NotDirectory
     | HostError::NotFile
     | HostError::StaleHandle
-    | HostError::OwnMount(_)
-    | HostError::Pending(_) => None,
+    | HostError::OwnMount(_) => None,
   }
 }
 

@@ -74,6 +74,7 @@ const LOAD_VARIABLE: &str = "PROVISION_BENCH_LOAD";
 const SPIN_ARGUMENT: &str = "--spin";
 
 /// Shape: the busy loop's iterations between its looks at whether the bench that started it is still there.
+#[cfg(unix)]
 const SPIN_LOOK_EVERY: u64 = 1 << 22;
 
 /// A spinner of the load: a busy loop until the bench that started it ends (Unix: its parent changes) or kills it.

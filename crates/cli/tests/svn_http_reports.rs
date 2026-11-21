@@ -257,6 +257,9 @@ fn between<'t>(text: &'t str, start: &str, end: &str) -> Option<&'t str> {
 struct Anchor {
   child: Child,
   drain: Option<std::thread::JoinHandle<()>>,
+  /// The directory its daemon's changeset store lives in (`--vcs-store`; C2: a daemon without one makes no Subversion
+  /// repository), removed after the anchor is killed; none where the caller named its own.
+  _store: Option<Scratch>,
 }
 
 impl Drop for Anchor {
@@ -314,6 +317,9 @@ type IssuerSurface = Option<Vec<(String, String)>>;
 /// consensus group as a first start does (`slates bootstrap root`): the anchor, the lines read, which name the edges'
 /// ports, and the issuer surface.
 fn start_anchor(instance: &str, edges: &[&str]) -> (Anchor, Vec<String>, IssuerSurface) {
+  // A Subversion repository's history lands on the daemon's changeset store (C2): a store directory in a scratch of
+  // its own, unless the caller named one.
+  let store = (!edges.contains(&"--vcs-store")).then(|| Scratch::new("vcs-store"));
   let mut child = Command::new(env!("CARGO_BIN_EXE_slates"))
     .args([
       "--instance",
@@ -324,12 +330,21 @@ fn start_anchor(instance: &str, edges: &[&str]) -> (Anchor, Vec<String>, IssuerS
       SHARDS,
     ])
     .args(edges)
+    .args(
+      store
+        .iter()
+        .flat_map(|store| ["--vcs-store", store.path.as_str()]),
+    )
     .stdout(Stdio::null())
     .stderr(Stdio::piped())
     .spawn()
     .unwrap();
   let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
-  let mut anchor = Anchor { child, drain: None };
+  let mut anchor = Anchor {
+    child,
+    drain: None,
+    _store: store,
+  };
   let (lines, issuer) = lines_until_serving(&mut stderr, instance);
   anchor.drain = Some(std::thread::spawn(move || {
     let _ = std::io::copy(&mut stderr, &mut std::io::stderr());

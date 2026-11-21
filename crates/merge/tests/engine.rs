@@ -1146,29 +1146,24 @@ const PIECE_LIST_BYTES: usize = 3 * size_of::<usize>();
 #[test]
 fn small_edits_to_many_files_retain_what_they_wrote_not_the_files() {
   let mut green = Green::new();
-  let file = |n: u8| vec![b'a'.wrapping_add(n % 26); EDITED_FILE_BYTES];
-  let path = |n: u8| format!("f{n:02}");
   let mut create = Build::new();
   for n in 0..EDITED_FILES {
-    create.create(&path(n), &file(n));
+    create.create(&edited_path(n), &edited_file(n));
   }
   assert_eq!(
     green.submit(&create.at(1, 0)),
     Outcome::Accepted { version: 1 }
   );
-  let slot = |n: u8, pass: u8| -> (u64, Vec<u8>) {
-    let at = (usize::from(n) * 3 + usize::from(pass) * 7) % (EDITED_FILE_BYTES / EDIT_SLOT_BYTES);
-    (
-      u64::try_from(at * EDIT_SLOT_BYTES).unwrap(),
-      vec![b'0' + pass; EDIT_SLOT_BYTES],
-    )
-  };
   let mut id = 2u8;
   for pass in 0..2u8 {
     for n in 0..EDITED_FILES {
       let base = green.head();
-      let (at, bytes) = slot(n, pass);
-      let outcome = green.submit(&Build::new().overwrite(&path(n), at, &bytes).at(id, base));
+      let (at, bytes) = edit_slot(n, pass);
+      let outcome = green.submit(
+        &Build::new()
+          .overwrite(&edited_path(n), at, &bytes)
+          .at(id, base),
+      );
       assert_eq!(
         outcome,
         Outcome::Accepted { version: base + 1 },
@@ -1198,48 +1193,75 @@ fn small_edits_to_many_files_retain_what_they_wrote_not_the_files() {
     "balanced"
   );
   for n in 0..EDITED_FILES {
-    let mut expected = file(n);
-    let mut version_of_pass = Vec::new();
-    for pass in 0..2u8 {
-      let version = 2 + u64::from(pass) * u64::from(EDITED_FILES) + u64::from(n);
-      let (at, bytes) = slot(n, pass);
-      let at = usize::try_from(at).unwrap();
-      version_of_pass.push((version, expected.clone()));
-      expected[at..at + EDIT_SLOT_BYTES].copy_from_slice(&bytes);
-      version_of_pass.push((version, expected.clone()));
-    }
-    let [
-      (before_first, original),
-      (first, once),
-      (before_second, _),
-      (second, twice),
-    ] = version_of_pass.try_into().unwrap();
-    assert_eq!(
-      green.content_at(&path(n), before_first - 1).unwrap(),
-      original,
-      "file {n} before its edits"
-    );
-    assert_eq!(
-      green.content_at(&path(n), first).unwrap(),
-      once,
-      "file {n} after its first edit"
-    );
-    assert_eq!(
-      green.content_at(&path(n), before_second - 1).unwrap(),
-      once,
-      "file {n} between its edits"
-    );
-    assert_eq!(
-      green.content_at(&path(n), second).unwrap(),
-      twice,
-      "file {n} after its second edit"
-    );
-    assert_eq!(
-      green.content(&path(n)).unwrap(),
-      twice.as_slice(),
-      "file {n} at the head"
-    );
+    each_version_reads_back(&green, n);
   }
+}
+
+/// Edited file `n`'s bytes before any edit.
+fn edited_file(n: u8) -> Vec<u8> {
+  vec![b'a'.wrapping_add(n % 26); EDITED_FILE_BYTES]
+}
+
+/// Edited file `n`'s path.
+fn edited_path(n: u8) -> String {
+  format!("f{n:02}")
+}
+
+/// The slot file `n`'s edit of pass `pass` overwrites, and its bytes.
+fn edit_slot(n: u8, pass: u8) -> (u64, Vec<u8>) {
+  let at = (usize::from(n) * 3 + usize::from(pass) * 7) % (EDITED_FILE_BYTES / EDIT_SLOT_BYTES);
+  (
+    u64::try_from(at * EDIT_SLOT_BYTES).unwrap(),
+    vec![b'0' + pass; EDIT_SLOT_BYTES],
+  )
+}
+
+/// Edited file `n` read back at every version: before its edits, after its first, between them, after its second,
+/// and at the head.
+fn each_version_reads_back(green: &Green, n: u8) {
+  let mut expected = edited_file(n);
+  let mut version_of_pass = Vec::new();
+  for pass in 0..2u8 {
+    let version = 2 + u64::from(pass) * u64::from(EDITED_FILES) + u64::from(n);
+    let (at, bytes) = edit_slot(n, pass);
+    let at = usize::try_from(at).unwrap();
+    version_of_pass.push((version, expected.clone()));
+    expected[at..at + EDIT_SLOT_BYTES].copy_from_slice(&bytes);
+    version_of_pass.push((version, expected.clone()));
+  }
+  let [
+    (before_first, original),
+    (first, once),
+    (before_second, _),
+    (second, twice),
+  ] = version_of_pass.try_into().unwrap();
+  assert_eq!(
+    green.content_at(&edited_path(n), before_first - 1).unwrap(),
+    original,
+    "file {n} before its edits"
+  );
+  assert_eq!(
+    green.content_at(&edited_path(n), first).unwrap(),
+    once,
+    "file {n} after its first edit"
+  );
+  assert_eq!(
+    green
+      .content_at(&edited_path(n), before_second - 1)
+      .unwrap(),
+    once,
+    "file {n} between its edits"
+  );
+  assert_eq!(
+    green.content_at(&edited_path(n), second).unwrap(),
+    twice,
+    "file {n} after its second edit"
+  );
+  assert_eq!(
+    green.content(&edited_path(n)).unwrap(),
+    twice.as_slice(),
+    "file {n} at the head"
+  );
 }
 
 /// Folding is floor-bounded: with a live reader at version 3 and no budget at all, the fold stops at 3, balanced, and

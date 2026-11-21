@@ -29,7 +29,11 @@ impl ChangesetLog for Held {
         .map(|(section, bytes)| (*section, bytes.to_vec()))
         .collect(),
     );
-    Ok(u64::try_from(self.changesets.len() - 1).unwrap())
+    Ok(
+      u64::try_from(self.changesets.len())
+        .unwrap_or(u64::MAX)
+        .saturating_sub(1),
+    )
   }
 
   fn section(&self, sequence: u64, section: Section) -> Option<Cow<'_, [u8]>> {

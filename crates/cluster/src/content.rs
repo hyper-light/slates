@@ -2587,6 +2587,39 @@ pub fn chunk_requests(
     .collect()
 }
 
+/// The chunk request for one raw chunk lent as `raw`, whose identity is `identity`, of the content `manifest` names: the
+/// bytes [`chunk_requests`] makes of a held raw chunk, encoded straight from the lent slice into the request, with no
+/// chunk copied first. What an owner ships a version's inputs with from the bytes its chain already holds, never a
+/// rebuilt archive (family three's sibling in the record plane, 2026-11-20).
+pub fn raw_chunk_request(
+  (object, sequence): (ObjectId, u64),
+  manifest: &[u8; 32],
+  identity: &[u8; 32],
+  raw: &[u8],
+) -> Vec<u8> {
+  let len = u64::try_from(raw.len()).unwrap_or(u64::MAX);
+  let mut out = Vec::with_capacity(
+    raw
+      .len()
+      .saturating_add(CHUNK_RECORD_FIELDS)
+      .saturating_add(CHUNK_PLACEMENT_BYTES),
+  );
+  out.push(KIND_CHUNK);
+  put_placement(&mut out, &object, sequence, manifest);
+  out.extend_from_slice(identity);
+  out.extend_from_slice(&len.to_le_bytes());
+  out.extend_from_slice(&len.to_le_bytes());
+  out.push(Encoding::Raw.to_wire());
+  out.push(0);
+  out.extend_from_slice(&[0u8; 32]);
+  put_blob(&mut out, raw);
+  out
+}
+
+/// Format: a chunk request's bytes before its chunk record: the kind (1), the object (16), the sequence (8) and the
+/// manifest identity (32).
+const CHUNK_PLACEMENT_BYTES: usize = 1 + 16 + 8 + 32;
+
 /// What a holder's reply to an offer says, for this placement.
 enum Answer {
   /// The holder already holds the content whole: a bound acknowledgement.
@@ -3761,6 +3794,26 @@ mod tests {
         node: Node::File(extents),
       }]),
       chunks: vec![first, second],
+    }
+  }
+
+  /// A raw chunk's request made from a lent slice is byte for byte the one [`chunk_requests`] makes of the held chunk.
+  /// Do: encode each chunk of a two-chunk archive both ways. Expect: identical bytes.
+  #[test]
+  fn a_lent_raw_chunks_request_is_the_held_chunks_byte_for_byte() {
+    let archive = two_chunk_archive();
+    let manifest = archive.manifest_identity();
+    for chunk in &archive.chunks {
+      let [held] = chunk_requests(&archive, OBJECT, SEQUENCE, &[chunk.identity])
+        .try_into()
+        .unwrap();
+      let lent = raw_chunk_request(
+        (OBJECT, SEQUENCE),
+        &manifest,
+        &chunk.identity,
+        &chunk.payload,
+      );
+      assert_eq!(lent, held);
     }
   }
 
