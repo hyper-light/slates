@@ -33,3 +33,21 @@ Options:
 
 Unless you rule otherwise, I'll build (B) next: red = git/git's push unanswered at 1,200 s, green = it lands. Then the
 A/B against stock git, the checks' 16 s being the next thing to cut.
+
+## Correction (04:05 PST): (B) as written helps branches only
+
+I read the base search before building. `Repository::green_at` maps a head object's position to its green, and an
+annotated tag's green has the tag object as its head, not the commit it peels to. So the base search from a newer
+tag's commit never meets an older tag's green. git/git's refs are mostly annotated tags, so sorting by generation
+alone would not end the walls.
+
+(B') would also need:
+- an index map from each green head's peeled commit to its green, kept and replayed like `heads` (new derived index
+  state, with recovery consequences);
+- the new reached set taken as the base's minus the base's own tag chain (the old tag objects), since the new ref
+  does not reach those.
+
+That puts (B') close in size to (A): reached sets derived on first read, with the admission walking only what is new to
+the repository once per push. I'll hold on both until you rule (or Ada does, if it's A-614's call). Meanwhile I'm landing
+piece 2 once its merged-tree tests pass. Then, unless you say otherwise, I'll take the checks' 16 s, which is on my side
+of the line either way.
