@@ -12,13 +12,23 @@
 - Side effect: publishing wire tags also published VolumeRefusal 21 ReferenceUnresolved / 22 ReferencesHeld, which
   origin/main had left unpublished (wire_order was red on main for them).
 
-## Next (queue)
-1. "identical" as a submission outcome: the engine commits an identical increment as a new version; telling it apart
-   needs a field on ReplyBody::Submitted (~100 construct/match sites) or the green recording empty-effect versions.
-2. MCP tool `slates.log` (read-only, no grant verb) and the SDKs' read (sdk-node, sdk-python).
-3. A presentation never granted stays listed forever (presentations don't expire): decide supersede/expire with main.
-4. Ask-mode merges held for approval (Submitted::ApprovalRequired) are another "needs you" item not yet shown.
+## Piece 2: A-779 supersede (main's ruling 15:20): LANDED bbc605ac9 (merge f20719312)
+- See inbox/main-from-w-sessionlog-a779.md.
 
-## Run requests (main's)
-- clippy -p slates-server -p slates-client -p slates-cli -p slates-db -p slates-ipc --all-targets (macOS + Linux);
-  red = any lint in session_log.rs / log_view.rs / partition.rs index.
+## Piece 3: A-782 identical vs accepted: LANDED ea730edb8 (merge c9be876f1)
+- See inbox/main-from-w-sessionlog-a782.md.
+
+## Piece 4: A-785 held merges in the log: LANDED fee55900f (merge 00be8fae1)
+
+## Piece 5: A-788 MCP `slates.log` + SDKs: LANDED f5f127497 (merge 1de9e5e6f)
+- See inbox/main-from-w-sessionlog-a788.md.
+
+## Queue state (2026-11-20 ~17:45 PST)
+main's 15:20 order done: A-779, A-782, A-785, A-788 all on origin/main. Stopped; waiting for main's next piece.
+Owed (not started): async SDK forms of the log; whether a write of the head's own bytes with nothing intervening should
+answer Identical (main's call); an Abandoned landing state for presentations whose client went away (main's call).
+
+## Close list (Ada 16:05-16:15; main 16:20): C1 = A-782, C2 = A-785, C3 = A-788, all on origin/main.
+inbox/main-from-w-sessionlog-close.md written. Findings recorded, not worked: async SDK log forms (GAPS A-773 entry).
+Disk: deleted ~/.cache/w-sessionlog-target.noindex/debug/incremental (12 GB), 2026-11-20 16:30.
+SDK session-log tests run 16:40 (main's 16:18): Python 2 OK, Node 2 pass / 0 skipped, real daemon, this Mac. List done.

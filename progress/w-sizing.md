@@ -45,6 +45,41 @@
   recovery deleted-file 1/1. To land: fresh worktree from origin/main, squash, docs (A-214 status, GAPS, BENCHMARKS).
 - A/B now branch-based (A = branch~2, B = branch tip), no sync: r6 macOS, r7 Linux (both queued). r5 was stopped by me
   just as it started on d1323898 (mistake).
+- A/B DONE (r6, big Studio, release, interleaved x3): provisioning 1-client p99 A 226.7/197.4/203.5 vs B
+  232.5/200.6/182.3 us (both fail 50 us at load 9-31 alike); NFS best equal; kept rounds ~5% to A; NFS peak RSS A
+  1,137-1,139 vs B 625-627 MiB. => removal.
+- A-777 LANDED main 21a306a04 (reserve removed, -907 lines; BENCHMARKS entry with all N; design A-214 status + A-777
+  section; GAPS). Worktree ~/slates-work/w-sizing-land. Branch agents/w-sizing-noprefault kept until r7 (Linux A/B) runs.
+- r12 (kiln, d1323898, its hg source ~/.cache/w-hg-mem/hg 84 MB): hg history push before (47dc24b72) vs after
+  (21a306a04), interleaved BAAB: rss, top MEM, system free/reusable, status content ranges after push and after 20 s.
+- Proposal to main: inbox/main-from-w-sizing-content-extents.md (content as extents made on demand; needs ruling).
+- r12 (big Studio, release, BAAB, hg history 84 MB): daemon RSS after push 6,192-6,197 MiB in BOTH arms (before
+  47dc24b72 / after A-777 21a306a04); +1-3 MiB after 20 s idle in both. A-777 does not move this workload (A-765 had
+  already ended the idle refill); the 6.2 GB is held data (w-hg's content).
+- FOUND BY USE: system free fell 44,904 -> 58 MiB across r12's four runs: SIGKILLed anchors leave their shm segment +
+  content in the kernel on macOS. Unlinked my 8 names: free 2.8 -> 23.7 GiB. inbox/main-from-w-sizing-shm-leak.md.
+- Build break from A-777 (cli.rs imported CONTENT_PREFAULTED; my grep misread): fixed, LANDED main 42267c087.
+- A-778 LANDED main 779840fba: daemon removes the anchor's segment/content names when the anchor is gone
+  (slates_mem::unlink_handoff); red->green cli test on the big Studio; bug record docs/bugs/2026-11-20-a-killed-anchor-...
+- Worktree now ~/slates-work/w-sizing-a778 (landed, removable). Branch agents/w-sizing-noprefault kept for r7 (Linux A/B).
+- 15:20 ruling (main): content as extents made on demand, YES; macOS first behind the pool API; conditions (a)
+  provisioning untouched (made ahead), (b) Linux/Windows measured first (g226 takes it), (c) bounded counts, (d)
+  recovery across processes. Branch agents/w-sizing-noprefault deleted (landed as A-777; its A/B was r6). Local target
+  deleted (2.5 GB). g226's status residency read 0 MiB with a 256 MiB burst on macOS (sweep defect; mincore on a fresh
+  view does report the object, probed) -- tell g226.
+- Extents piece 1 (macOS), branch agents/w-sizing-extents, worktree ~/slates-work/w-sizing-a778:
+  red 961112d0e (recovery a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone; measure = anchor's content
+  object residency + process RSS). RED on adas-macbook-pro-2 (quiet): before 63 MiB, with burst 1,621, after destroy
+  1,622 (content object 259 MiB kept, RSS 1,362 kept). Fix d0f3199f9: slates_mem::extent_handoff/make_extent; pool
+  makes own slice's extents at start, maps by name, release unlinks + remakes empty; daemon unlinks every extent name
+  when the anchor is gone. mem shared:: 6/6 local. Green run r22 queued.
+- GREEN r22 (adas-macbook-pro-2, quiet): 256 MiB burst: pool 420 -> 1,648 -> 123 MiB after destroy (content object
+  2 -> 0 MiB). (d) r24 (big Studio): cli killed-anchor (incl. extents), locked-volume SIGKILL-daemon restart byte for
+  byte, anchor-supervises, recovery acknowledged-content restart: all ok; fmt clean. (a) provision A/B r25 (A=1b63ab896
+  base, B=3f24e4fea) queued -- the last gate before landing A-789 (claimed). Docs drafted in the worktree.
+- g226's Linux/Windows give-back numbers: inbox/w-sizing-from-g226-giveback.md. Linux: one memfd + punch (keep);
+  Windows: section per extent (decommit refused, discard per process, commit only back at close). Asked g226 to land
+  them in BENCHMARKS as "Content give-back per platform"; told g226 its status residency reads 0 on macOS.
 - Then item 2 (if prefault pays: EWMA of pages turns touch) or remove; item 3 reserve_per_shard work-derived + pressure.
 - Disk here 14 GiB free (others' caches; mine 2.5 GB).
 

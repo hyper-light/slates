@@ -204,3 +204,11 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
    Worktree ~/kiln-work/w-k90-containers-a520 NOT removed (holds my superseded local patch; no --force).
 ## For main to delete (add): worktree ~/kiln-work/w-k90-containers-a520 (`git -C ~/kiln-work/w-k90-containers-kiln worktree
    remove --force /Users/adalundhe/kiln-work/w-k90-containers-a520`; its only change, the slates_e2e.rs:1824 fix, is on main).
+## 2026-11-20 ~15:15: Mac leg r49 on kiln main 2f589baa6 (MacBook-Pro-2, Docker Desktop 29.3.1, after KILLing a stuck com.docker.backend)
+   1 passed, 1 failed, 153 s. Drift drive PASSED (Ask and Bypass: drift shown, landing conflicted under a grant, person's bytes kept).
+   Review/landing drive (Ask): steps 1-3 PROVEN (NFS engine volume of Slates' export; change request exact; approval-gated
+   landing exact; HEAD/index unchanged). Step 4 FAILED: after the end, `docker ps` still listed the container, but its
+   volume was already gone (`docker volume inspect` said no such volume), an end race. Reported to w-k90-a520 (owner) and main.
+   Jupiter is still waiting on the kiln re-vendor of Slates ae8319811 (export_engine).
+## For main to delete (add): this Studio ~/.cache/w-k90-containers-ship-1795208540; MacBook ~/.cache/w-k90-containers-e2e-2f589ba,
+   ~/.cache/w-k90-containers-dockercfg.

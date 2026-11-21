@@ -202,13 +202,16 @@ main()
 EOF_AB
 export HGPLAIN=1 HGRCPATH= AB_SCRATCH=$D
 HG="uvx --quiet --python 3.12 --from mercurial==7.2 hg"
-if [ ! -d $D/hg-as-git.git ]; then
-  git init -q --bare $D/hg-as-git.git
-  $HG -R ~/.cache/w-interop/hg-src fastexport | git -C $D/hg-as-git.git fast-import --quiet
+R=$D/hg-as-git-$(date +%s).git
+for c in $D/hg-as-git-*.git; do [ -f "$c/AB_DONE" ] && R=$c; done
+if [ ! -f $R/AB_DONE ]; then
+  git init -q --bare $R
+  $HG -R ~/.cache/w-interop/hg-src fastexport | git -C $R fast-import --quiet
+  touch $R/AB_DONE
 fi
-REF=$(for r in $(git -C $D/hg-as-git.git for-each-ref --format='%(refname)' refs/heads); do echo "$(git -C $D/hg-as-git.git rev-list --count $r) $r"; done | sort -rn | head -1 | cut -d' ' -f2)
-echo "hg-as-git ref $REF, commits $(git -C $D/hg-as-git.git rev-list --count $REF)"
+REF=$(for r in $(git -C $R for-each-ref --format='%(refname)' refs/heads); do echo "$(git -C $R rev-list --count $r) $r"; done | sort -rn | head -1 | cut -d' ' -f2)
+echo "hg-as-git ref $REF, commits $(git -C $R rev-list --count $REF)"
 mkdir -p $D/bin; printf '#!/bin/sh\nexec uvx --quiet --python 3.12 --from mercurial==7.2 hg "$@"\n' > $D/bin/hg; chmod +x $D/bin/hg
 export PATH=$D/bin:$PATH
 /usr/bin/time -l uv run --quiet --python 3.12 --with mercurial==7.2 python -I $D/scripts/changeset_ab.py $D/ab-phase1.json \
-  hg:$HOME/.cache/w-interop/hg-src "git:$D/hg-as-git.git@$REF" git:$HOME/.cache/w-interop/git-src@v2.0.0 git:$HOME/.cache/w-interop/git-src@v2.1.0 2>&1 | tail -30
+  hg:$HOME/.cache/w-interop/hg-src "git:$R@$REF" git:$HOME/.cache/w-interop/git-src@v2.0.0 git:$HOME/.cache/w-interop/git-src@v2.1.0 2>&1 | tee $D/ab-phase1.log | tail -30

@@ -4,7 +4,7 @@ set -e
 #      (b) pack-objects recomputing every object and delta = serving from normalized content with no cached pack.
 # Best of 3, all 3 shown, wall and max RSS (macOS /usr/bin/time -l).
 D=~/.cache/w-store-ab; cd $D
-G=~/.cache/w-interop/git-src
+G=~/.cache/w-store-ab/data-git/git-git.git
 t() { /usr/bin/time -l "$@" 2>$D/t.err >/dev/null; awk '/real/{r=$1} /maximum resident/{m=$1} END{printf "%ss %dMiB\n", r, m/1048576}' $D/t.err; }
 for rev in v2.0.0; do
   for i in 1 2 3; do echo "git a reuse $rev #$i: $(echo $rev | t git -C $G pack-objects --revs --stdout -q)"; done
@@ -17,7 +17,7 @@ for frac in 1 5 9; do
   for i in 1 2 3; do echo "git read tree+all blobs @${frac}/10 #$i: $(t sh -c "git -C $G ls-tree -r $c | awk '{print \$3}' | git -C $G cat-file --batch >/dev/null")"; done
 done
 export HGPLAIN=1 HGRCPATH=
-H=~/.cache/w-interop/hg-src; export PATH=$D/bin:$PATH
+H=~/.cache/w-store-ab/data-hg/hg-src; export PATH=$D/bin:$PATH
 for i in 1 2 3; do echo "hg bundle (revlog deltas) #$i: $(t hg -R $H bundle -q -a -t none-v2 $D/b.hg)"; done
 NH=$(hg -R $H log -r tip -T '{rev}')
 for frac in 1 5 9; do

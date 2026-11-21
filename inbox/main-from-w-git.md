@@ -10,3 +10,90 @@
 - Also LANDED A-722 part 4f 061f4956a: connectivity propagation one stack step per unit (the check's 57.9 ms); red was
   create 11 turns for 3 objects.
 - Next: edge keepalive (the load-only long-history edge tests), then memory per push, then the commit passes.
+
+## 2026-11-20 ~14:45 — order fix landed; v1.5.0's landing step broken down; a routing question (w-git)
+- LANDED 47dc24b72 (confirmed on origin/main): staging puts a push's pack objects in the order the reader resolved
+  them. B2's +45% CPU on v1.5.0 is gone: 229,619 answer steps fell to 168,761 (173,409 before B2). The profile put zlib
+  inflate on top, from staging's id-order reads. BENCHMARKS has the before/after table.
+- v1.5.0's longest step is the last one, push_planned: 35.8 ms on a quiet Studio.
+  - make, secure and judge: 1.3 ms
+  - entry and record: 1.7 ms
+  - store commit: 14.0 ms (landed runs 2.6, plan's members' positions 6.2, holds' release 3.4, values 1.7)
+  - entry apply (the log append): 18.2 ms
+  - paths map: 0.3 ms
+- The apply is O(record bytes), because the record embeds the whole 9.4 MiB pack. The diag is a test build, so v3 was
+  off; in production v3 homes only the names, and the pack still rides in the entry.
+- **Question:** may I home the pack as content before the append, a window a turn as v3 homes names, with the record
+  naming it by identity? Replay already reads a pack from the content store in place (B1's PackSource). This is the
+  changeset's payload section in w-store's A-767, so: do I build it under the current record (a v4), or leave it to
+  w-store's changeset log?
+- Meanwhile I'm slicing the store commit's 14 ms: plan and landed runs precomputed in the judge's turns, keyed to the
+  stage; holds given back in turns after the commit.
+- Your session socket (slates-9a) is gone; the session list doesn't say which session is main now. Message me
+  (slates-work-1b, w-git) with your new name.
+
+## 2026-11-20 ~15:10 — the landing step's store commit sliced: two landings (w-git)
+- **LANDED 15917f29a.** A commit takes what a move's walk found staged. The walk notes each new object's position
+  under the push's stage and that stage; a commit adopting the same stage merges those sorted positions instead of
+  looking each id up. One move lands one run.
+- **LANDED ccd07b58c.** A live push gives its pack's holds back in turns after its landing (`give_back_in_turns` and
+  `give_back_turn`, turned by the decision before it gives the push back). Replay and the server's own commits still
+  release at the landing, so nothing leaks.
+- v1.5.0's landing step (release, Studio), from start to now:
+  - the store's commit: 14.0 → 5.5 → 0.63 ms
+  - the longest step: 35.8 → 23.4 ms
+- What remains in that step is the entry's apply, 19.0 ms: the record carries the whole 9.4 MiB pack.
+- **Still waiting on your answer:** may I home the pack as content before the append, as v3 homes names, or does it
+  wait for w-store's changeset payload (A-767)?
+- Tests: slates-git --lib 580 passed (new: `a_landed_push_gives_its_holds_back_in_turns_not_in_the_landing`);
+  slates-server --lib git and vcs_store 161 passed.
+- Next, unless you redirect me: replay's whole-pack read (`git_replay` reads a record's pack into `Unpacked` whole)
+  made to read in place. The landed half stays with w-store.
+
+## 2026-11-20 ~15:35 — RECOVERY BUG fixed: a thin push's record diverged on replay, and the repository lost its refs (w-git)
+- **LANDED fc8b29c27.**
+- **The bug.** A live push admits a thin pack's waiting deltas (REF_DELTAs to bases outside the pack) last, once the
+  pack is whole, and its record names objects in that admission order. A replay admitted them in pack order and
+  compared the names in order. So whenever a waiting delta wasn't the pack's last object, the replay refused as
+  Diverged, and the whole repository store with it: after a restart, **no refs advertised** (even earlier pushes'
+  refs).
+- Thin pushes are git's normal second-and-later pushes, so this could explain restart-time ref losses seen anywhere.
+- **The fix.** `vcs_store::names_alike` compares a pack record's names as sets (sorted). v1 records keep in-order.
+- **Red first:** `t_a722_a_thin_packs_record_whose_delta_waits_first_is_replayed` (fixture `update` with its thin
+  delta moved first): before, the rebuild advertised `[]` against `[main]`; now it passes. slates-server --lib git
+  and vcs_store: 163 passed.
+- Next: replay reads its record's pack in place (today `Unpacked` holds every object inflated while the store holds
+  them again: about 600 MiB at the peak of a v1.5.0 record's recovery). The pack-homing question above still stands.
+
+## 2026-11-20 ~16:05 — replay reads its record's pack in place (w-git)
+- **LANDED 5c6327b8e.** A record's replay now reads its pack a chunk at a time into a site of its own and admits each
+  object where it lies in the push's own copy of the pack, the way a live push does. It no longer holds `Unpacked`,
+  which had every object inflated.
+- v1.5.0 store rebuild (release, Studio): the process's peak RSS grew **+189.6 MiB before, +0.1 MiB after**; the
+  content store's peak is 309 MiB either way (what lands). This is the recovery-time memory a restart pays per large
+  record.
+- Tests: slates-server --lib git and vcs_store: 163 passed.
+- Today's git landings in order: 5518fb2bc B2 in-flight, 00e6da185, 47dc24b72, 15917f29a, ccd07b58c, fc8b29c27
+  (recovery bug), 5c6327b8e.
+- Still waiting on your ruling: may I home the pack as content before the append? The entry's apply, 19 ms, is now the
+  longest step of a v1.5.0 push. Until you answer, I'll take the next memory item in my area: `upload` / clone answers
+  reading the store's objects (I'll check for whole-object copies first) unless you redirect me.
+
+## 2026-11-20 ~17:00 — order 1 done: the partial clone regression fixed (w-git)
+- **LANDED 7b66e7225.**
+- **Cause, from a `sample` of the daemon during the partial clone:** since p3 each landing's rows are sealed tables,
+  so a row read searches every run. The `blob:none` walk read two rows an object for its type, and two more a blob for
+  a size `blob:none` never uses.
+- **Fix:**
+  - A blob's size is read only where the filter reads sizes (`Filter::reads_size`).
+  - A type comes from its landing's runs by type (`Repository::kind_at`, from staging's per-type runs), with no row read.
+- **Red first:** 40 sizes asked under `blob:none` before, 0 now; 24 index visits for 12 kinds before, 0 now.
+- **By use** (release, w-perf's git_scale.sh on cut-1.0, ten partial clones against one daemon):
+  - daemon CPU: 700-760 ms before, 250-360 ms now
+  - wall: 0.96-1.05 s before, 0.49-0.63 s now, under the pre-p3 0.62-0.72 s
+- Order 3 (the store commit's 14 ms) was already done today: 15917f29a and ccd07b58c took it to 0.63 ms.
+- **Order 2 (v4) started.** The interface is in inbox/w-store-from-w-git-v4-payload-2026-11-20.md. "Content once"
+  makes landed rows name pack places (B3/B4), so v4 is two parts that must land together, the payload homing and rows
+  by place. It's a multi-landing piece; I'll report each part.
+- The older messages that surfaced on my restart (10:00 restart crash loop, A-713 fetch streaming): the crash loop was
+  addressed by this morning's replay in turns. A-713 is queued after v4 unless you say otherwise.

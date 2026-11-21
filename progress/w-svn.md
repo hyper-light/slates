@@ -263,3 +263,17 @@
   Owed: PROPFIND writer's per-property strings into the connection's buffer (MEMORY SIZING); 500 MB commit re-measured
   after A-760. Flake seen once under load: vcs_svn::tests::an_unlock_runs_pre_unlock_and_post_unlock_as_svnserve_does
   (passes alone 3/3).
+- 2026-11-20 afternoon. LANDED: A-766 part 1 84c74cc52; A-772 drive share 64655a32c (replay_bench + bounded-windows
+  test; 328 s -> 1.82 s with w-perf's WindowCache; my owned-run fix dead even, dropped); A-780 5586b9194 (PROPFIND
+  writer in place: allprop 5,691 -> 445 allocations over 33 responses).
+- A-772 OPEN: server per-turn cost + 2,511 MiB peak. Measuring with vcs_ssh::svn::tests::
+  measure_svnsync_replay_range_over_the_tunnel (ignored; SLATES_SVN_REPLAY_DUMP=~/.cache/w-svn-gitgit/git-2000.dump,
+  SLATES_SVN_REPLAY_LAST=300), release, in ~/slates-work/w-svn-a703 (target ~/.cache/w-svn-local-target). The test's
+  import runs a turn per observe_first (one closure spun the watchdog). Plan: sample the process during the replay.
+  Per-turn suspects (read): authenticated_access + with_view + rules clone + 1 KB socket write + yield per one-step turn.
+- NEXT after A-772: A-766 part 2 (DeltaV v1 commit verbs). Plan: server keeps a pending activity (id, revprops) from
+  MKACTIVITY; CHECKOUT vcc -> 201 wbl/ID/YOUNGEST; PROPPATCH wbl begins the DavCommit with its revprops (start-commit
+  hook as POST); CHECKOUT ver/REV/path records path->REV, 201 wrk/ID/path; wrk requests = txr with that base rev;
+  MERGE of act/ID commits, full merge response unless X-SVN-Options no-merge-response (merge.c send_response per
+  changed path); DELETE act aborts. mod_dav's 201 body: DAV_RESPONSE_BODY_1..5 (httpd mod_dav.h) + "WHAT URI has been
+  created.", Cache-Control no-cache. Worktrees: w-svn-a703 (measurement), w-svn-next (branch agents/w-svn-a772, on main).

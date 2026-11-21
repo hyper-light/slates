@@ -138,3 +138,12 @@
   12,143 MiB, held after; ssh and stream clones add nothing. r23 (vmmap + heap per phase, second HTTP clone) running.
 - Local target deleted (main, disk low): every cargo run now through kiln, no `on`.
 - NEXT: item 2 bound (red first), item 6 (forced new-head push over a moved line), item 4 S5 head texts.
+- 2026-11-20 afternoon, LANDED (each red first or held by a stock oracle; focused tests local):
+  - 46951a489: lookup and every whole answer get the fetch's room (clone-rev's PastAdmission).
+  - 648a46d1a: the changeset A/B example plus its BENCHMARKS section (counts and release timings).
+  - 75e2d3fb4: A-732 part 4, the intake hands each manifest append its predecessor's text (no chain rebuilds).
+  - dc59ef2a1: revision_text applies a chain into two swapped buffers.
+  - 6935d8e86: A-732 part 5, a replay unit takes steps until its slice is spent (vcs_store.hg_replay_turns).
+  - 13523dbe3: item 6(a) proven, a forced new head on a moved line held to stock 7.2's push -f.
+- OWED: the restart of hg's history measured again, release (r42 queued on adacachy; the Studios are unreachable
+  for sync). Item 6(b) (the lock-free rebase) waits on main's ruling. The changeset shape waits on w-store's arm.

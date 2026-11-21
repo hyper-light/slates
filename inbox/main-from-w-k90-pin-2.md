@@ -7,3 +7,11 @@
    silently on Studio-2 (0 idle cores) -> retried, queued; linux-x86_64 waits capacity on adacachy; linux-arm64 queued.
 3. For you: adalundhe-MacBook-Pro has 80 MB disk free; macos/ubuntu-arm clippy red on vendor/slates' deprecated
    fetch_update under -D warnings (lint keeper); w-k90-win's windows-slates red (inbox note sent).
+
+## ~16:10 PST
+4. LANDED kiln 5264caaa3: build job's Report shows error blocks first (Windows (clippy, build) went red on 63da2c592 with
+   exit 101; the annotation held only vendor/slates warnings, so the real error is unknown until the next run).
+5. kiln's own CI legs for 08f1a434 are wedged ~4 h: legs 01a1fa8f0de8 (linux-x86_64, 'running' on 451397) and
+   01a1fae6520e (macos-arm64, 'running' on d13238, routing 'held' cec37f with room) have every step pending, no
+   checkout. Scheduler state looks stuck; a person may need to look. I'm leaving them queued per kiln's rules and
+   watching GitHub's run on 5264caaa3 for evidence meanwhile.
