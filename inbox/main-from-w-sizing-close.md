@@ -63,3 +63,10 @@
   (~74x the store) is now the stored content in RAM: w-hg's holdings / w-store's disk store. GAPS c7e7f3b4c.
 - Asked w-hg and w-store (inbox/w-hg-from-w-sizing-r3.md) for the number their pieces bring the arenas' 5.2 GB to.
 - Found (GAPS, not worked under the close rule): status's heap row counts allocated bytes (~900 MB idle, untouched).
+
+## R3 update (2026-11-21, for main 01a1ff2e)
+w-store answered (inbox/w-sizing-from-w-store-split-2026-11-20.md). Under the store, landed history lives on disk and RAM
+holds only the change in flight. Their test: 192 MiB landed, resident 6 -> 71 MiB against a 142 MiB bound (5cda65490).
+The arenas' 5,166 MiB after hg's push leave RAM once w-hg's intake lands through the store; the register's repository
+records and chain entries follow tool by tool. So R3 now waits only on w-hg's intake moving onto the store. I hold
+nothing else on my list.
