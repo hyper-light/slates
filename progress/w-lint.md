@@ -367,3 +367,18 @@
 - Windows-only (xwin, slates-cli's build): server verbs.rs:3020 run_recorded 11/10 -> w-hg; vcs_store/svn_import.rs:506
   14/10 -> w-svn. Owners told in their inbox files; not edited (goal-93 files under active edits; not on the CI cross set).
 - Per the goal-93 focus I started no new Windows run. r29 still queued. I'm free for a goal-93 piece (inbox/main-from-w-lint-free.md).
+
+## 2026-11-21 round at 156007dff (landed 869791f94 and 754d530e6; main 754d530e6)
+- A lib error in slates-machine (A-831's division) stopped slates-server, so its own reds and every slates-cli test were
+  hidden. Last round's "Windows-only" server reds were host reds too; I corrected the w-hg/w-svn notes.
+- 869791f94: machine checked_div; unsafe-budget.toml slates-machine 97 -> 101 naming A-831's four macOS sites; rt test
+  .first(); db derive_partition returns its Partition (dead fields after 96df5abcd); hg sha1_ab Way alias; literals in
+  land os_windows (size_of::<u64>()) and server content_ranges (DAX_RANGES); server verbs serve_forward/run_recorded and
+  svn_import land_owed split; content_ranges/live_ship test helpers.
+- 754d530e6: svn_interop use test (22/10) in named steps; vcs_crash sweeps judge through Faults::add_each; vcs_concurrency
+  hg scenarios split; git_interop/hg_interop small ones; fleet build-steps assert helper; hg take's pass-over helper;
+  intake_tests PushedLine. Harness allows gained unwrap_in_result (the sanctioned crate-level form).
+- Focused local: db --lib 183; machine time_constraint 1; rt time_constraint 1; server lib 81 + import 31; fleet hop
+  test 1/1; hg push:: 61; cli five test targets build (61 listed).
+- After the merge, the whole wall is clean: host clippy, fmt, structural, literals, unsafe, and the six cross targets.
+- No new Windows run (goal-93 rule). r29 still queued.
