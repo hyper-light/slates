@@ -304,6 +304,45 @@ fn t_a732_a_recovery_replays_an_import_record_a_revision_a_unit() {
   });
 }
 
+/// A-732 part 5 (found by use, w-hg's r2: a restart of hg's own history ran 259,321 recovery units of one revision each,
+/// each lending the stores and settling the shard's charge). Do: import and land the `states` repository, then make its
+/// store again as a recovery does, its slices a generous 10 s, its content held as a warm restart's image holds it.
+/// Expect fewer recovery units than the record's revisions (a unit takes the record's steps until its slice's time is
+/// spent), the replay's units counted, and the rows the landing left.
+#[test]
+fn a_recovery_unit_replays_as_many_revisions_as_its_slice_allows() {
+  crate::daemon::audit_on_shard(|state| {
+    let id = created(state, "hg", VcsTool::Mercurial);
+    assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
+    let (_, ended) = to_its_end(state, id);
+    let finished = ended.expect("imported");
+    let revisions =
+      u64::from(finished.changesets) + u64::from(finished.manifests) + finished.file_revisions;
+    assert_eq!(land(state, id), Ok(()));
+    let landed = rows_of(state, id);
+    let image = crate::vcs_store::set_aside(state, id);
+    crate::vcs_store::free(state, id);
+    let turns = |state: &ShardState| count(state, crate::vcs_store::HG_REPLAY_TURNS);
+    let before = turns(state);
+    let mut slices = crate::recovery_slices::RecoverySlices::begin(10_000_000_000);
+    {
+      let recovery = crate::vcs_store::recover(state, &mut slices);
+      let mut recovery = std::pin::pin!(recovery);
+      let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+      while recovery.as_mut().poll(&mut context).is_pending() {}
+    }
+    let units = slices.finish().units;
+    let replay_turns = turns(state).saturating_sub(before);
+    assert!(units < revisions, "{units} units for {revisions} revisions");
+    assert!(
+      replay_turns > 0 && replay_turns < revisions,
+      "{replay_turns} replay turns for {revisions} revisions"
+    );
+    assert_eq!(rows_of(state, id), landed);
+    crate::vcs_store::release_aside(state, image);
+  });
+}
+
 /// A-675 (refused midway): do import the `states` repository with its manifest log cut in half, a unit a turn. Expect
 /// the import refused after more than one turn, by the import's own refusal; the store's index still empty, the content
 /// store holding what it held before, the shard's retention charge what it was before (the room and the kept texts

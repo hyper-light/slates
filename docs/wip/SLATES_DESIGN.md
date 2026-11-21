@@ -57567,6 +57567,11 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > and a plain thread blocks inside the standard channel. Tests 11 of 11 (`cargo test -p slates-rt --lib sync::`, macOS
 > arm64, Adas-Mac-Studio-2): thread to thread, task from thread, task waiting for room, closes, cells given back.
 > Next: the issuer, crc, codec, disk, chunk and engine on it (vendor patches), then the land seam for their files.
+> Step 2 (2026-11-20): `slates_rt::retirement` (upstream's cold-owned native thread retirement, `RetirementLease`,
+> `OriginalAdoption`, `OriginalLease`, `OriginalFence`; its owners held by a `Reaper` rather than the runtime), with
+> `RtError::Capacity`, and `futures::race2`/`Either` (pinned on its own frame, no pin-projection crate). The engine's
+> machine facts are already `slates_machine::facts` by the same names (hyper-rt took them from slates). Tests:
+> retirement 2/2, race 1/1, sync 11/11.
 
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
