@@ -1520,9 +1520,15 @@ fn an_import_batch_commits_its_revisions_as_one_entry_and_reads_as_one_by_one() 
       .expect("a revision, one entry");
     }
     let batch = staged_batch(state, batch_main, (&trees, &store));
-    let made = batch
+    let mut recorded = batch
       .commit(state, (&owner(), batched), reference(9))
       .expect("committed");
+    // Applied a slice at a time after its record (`RecordedBatch::apply_slice`).
+    let made = loop {
+      if let Some(made) = recorded.apply_slice(state) {
+        break made;
+      }
+    };
     assert_eq!(made, vec![2, 3, 4]);
     assert_eq!(
       green_reads(state, batch_main),
@@ -1578,11 +1584,13 @@ fn an_import_batch_refused_or_abandoned_leaves_its_green_as_it_was() {
     };
     staged_two(state).abandon(state);
     assert_eq!(green_reads(state, main), before, "abandoned: as it was");
-    let refused = staged_two(state).commit(state, (&stranger(), repo), EntryParts::default());
+    let refused = staged_two(state)
+      .commit(state, (&stranger(), repo), EntryParts::default())
+      .err();
     assert!(
       matches!(
         refused,
-        Err(AppendRefused::Repository(Refusal::Forbidden { .. }))
+        Some(AppendRefused::Repository(Refusal::Forbidden { .. }))
       ),
       "{refused:?}"
     );

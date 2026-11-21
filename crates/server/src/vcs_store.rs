@@ -3791,9 +3791,12 @@ async fn remake_greens(
     .collect();
   for green in greens {
     paths::remake_green_sliced(state, green, slices).await;
-    // A Subversion green made again holds none of its head's texts (S4 c1): every one held again, in byte order.
+    // A Subversion green made again holds none of its head's texts (S4 c1): every one held again, in byte order. And it
+    // keeps no version its readers do not name (A-820): a replay past its checkpoint made each one again (P7's finding
+    // (2): 434 MB of git-2000's versions kept after a recovery).
     if record.tool == VcsTool::Subversion {
       svn_texts::rehold_head(state, record.id, green);
+      crate::repository::svn_commit::fold_to_readers(state, green);
     }
     slices.unit_done().await;
   }

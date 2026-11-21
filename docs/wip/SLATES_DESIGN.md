@@ -15489,6 +15489,11 @@ and export by landing).
 > `OutOfSequence`). A Subversion repository serves no session while it imports, as a Mercurial one is not lent, so no
 > session reads a revision the register has not committed.
 >
+> **Status (2026-11-21, A-835).** A recorded batch is applied to its green a slice a turn under the shard's quantum
+> (`push::RecordedBatch`, `repository.import_batch.apply_slices`), the landing turn and the import's read gate held to
+> the last slice; a kill between slices recovers from the batch's record. A recovered Subversion green folds to its
+> readers' floor, as a landing does.
+>
 > **Status (2026-11-20, A-652, part 3 continued: the export verb).** Built: a range of a Subversion repository's
 > revisions written by the daemon as the dump `svnadmin dump` writes for it (`slates-server`'s
 > `repository::svn_export`; A-628's exporter). `ExportDump { repository, first, last, deltas, name }`, for the
@@ -59984,3 +59989,37 @@ Applied in the same change to: §4.6 "Linux (own /dev/fuse driver)" establishmen
   request under 64 KiB, fetched once); the release bench at 64-512 MiB follows.
 - Owed: the fetch staged on the owner shard itself (the bytes cross once from the control shard today); a fetched
   increment a refused verdict leaves is released at the next fold or restart.
+
+### A-835 — A recorded import batch is applied to its green a slice a turn; a recovered Subversion green folds to its readers (2026-11-21, w-svn; main's ruling of 12:43 PST on the A-822 watchdog kills, (b) and (c); A-814, A-822, A-820, §4.3 step budget)
+Applied in the same change to:
+- `crates/server/src/repository/push.rs`: `append_versions` records the batch and returns a `RecordedBatch`;
+  `RecordedBatch::apply_slice` applies its versions until the shard's step budget is spent, at least one, counted
+  `repository.import_batch.apply_slices`, and settles the green's retention and checkpoints its chain after the last.
+- `crates/server/src/import_batch.rs`: `ImportBatch::commit` returns the `RecordedBatch` (A-814's module, w-rewrite-ops';
+  `inbox/w-rewrite-ops-from-w-svn-a814-sliced-commit.md` says what moved).
+- `crates/server/src/repository/svn_commit/staging.rs`: `Staging::land` applies the recorded batch a slice a turn, a
+  yield between, holding the landing turn; then counts the flush, folds and lets go of the batch's holds.
+- `crates/server/src/vcs_store.rs`: `remake_greens` folds a recovered Subversion green to its live readers' floor
+  (`svn_commit::fold_to_readers`), as a landing does.
+
+- **Why.** Main's git-2000 run over A-822 (base 67fa7f75a) had the watchdog kill the anchor twice, "stuck in task
+  spawned at `repository/import.rs:235`": the batch's commit applied every version of the batch in one step, 2,000 for
+  git-2000, past the shard's 1 s liveness window (§4.3: a user-scaled loop is sliced). Its heap held 434 MB under
+  `GreenReplay::step -> Green::apply_recorded`: the recovery replayed the green's whole history and nothing folded it,
+  where a landing folds to the readers after each batch (A-820).
+- **What.** The batch's record holds every version, so the apply after it is a recovery's replay done early: a kill
+  between slices recovers from the record to the batch's last version. The apply runs in slices under the shard's
+  quantum. Nothing reads the green before the last slice: a Subversion repository serves no session while it imports
+  (A-822), and the import holds the repository's landing turn through the last slice. After a recovery's replay the
+  green folds to its readers' floor.
+- **Evidence.** `t_c2c_a_large_batch_is_applied_a_slice_at_a_time`: 400 revisions in one batch, the shard's own
+  quantum; the apply takes more than one slice. With the slice's deadline taken out (the apply one loop, as before) it
+  fails: "the batch's apply took 1 slice(s)".
+  `a_batch_killed_between_its_commits_slices_recovers_and_resumes_to_the_same_history`: a 13-revision batch, 3 versions
+  a slice, killed at every slice boundary (0 to 4), the daemon restarted over the same store; the recovered green
+  folded to its head, the same dump resumed after the batch (`Ok((0, 13))`) and the export byte-identical to the dump.
+  Without the fold at recovery it fails: "killed at 0: recovered and folded", `Some((0, 13))` against
+  `Some((13, 13))`.
+- **Not sliced yet.** `append_versions`' loop before the record (each version's increment held and its entry encoded)
+  is still one step a batch: w-rewrite-ops', said in their inbox. The steps after the last slice (`follow`, the fold, the
+  release of the batch's texts) are one step each, scaled by the batch's paths.

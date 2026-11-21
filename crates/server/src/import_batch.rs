@@ -189,14 +189,16 @@ impl ImportBatch {
   }
 
   /// Commits the staged revisions with `parts` (the import's changeset reference, w-svn's) as one entry of
-  /// `repository`'s register by `principal`, its owner (module docs): the versions it made, in order. The scratch member
-  /// is retired either way; refused, the green and its chain are as they were.
+  /// `repository`'s register by `principal`, its owner (module docs): recorded, then applied to the green a slice at a
+  /// time by what it answers (`RecordedBatch::apply_slice`; w-svn for main's ruling of 2026-11-21 12:43, the apply of a
+  /// whole import in one step having held the shard past its watchdog). The scratch member is retired either way;
+  /// refused, the green and its chain are as they were.
   pub(crate) fn commit(
     mut self,
     state: &mut ShardState,
     (principal, repository): (&Principal, RepositoryId),
     parts: EntryParts,
-  ) -> Result<Vec<u64>, AppendRefused> {
+  ) -> Result<crate::repository::push::RecordedBatch, AppendRefused> {
     let staged = std::mem::take(&mut self.staged);
     let green = self.green;
     self.retire(state);
