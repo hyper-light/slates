@@ -235,8 +235,8 @@ fn peeled(
     if row.kind != Kind::Tag {
       return Ok((depth > 0).then_some(target));
     }
-    let bytes = store
-      .object_bytes(&content, row.len)
+    let bytes = repository
+      .row_bytes(store, &row, content)
       .ok_or(ViewRefused::Store(StoreRefused::Unreadable { id: target }))?;
     let mut room = Admission::new(store.room());
     target = Tag::parse(&bytes, &mut room)

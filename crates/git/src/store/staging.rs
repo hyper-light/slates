@@ -18,18 +18,19 @@
 
 use std::collections::BTreeMap;
 
-use slates_vcs::{ContentId, ContentStore, Index, NewRow};
+use slates_vcs::{ContentId, ContentStore, Index, NewRow, Writing};
 
 use super::super::hook_view::Quantum;
 use super::super::learn::Clock;
 use super::super::naming::kind_of;
-use super::super::push::{Push, Staged};
+use super::super::push::{Push, Staged, StoredAt};
 use super::super::rows::{self, ObjectRow};
-use super::{IndexBases, Repository, StoreRefused};
+use super::{Repository, StoreRefused};
 use crate::object_name::{Kind, ObjectId};
 
-/// A new object as staging meets it: its id, type, root content and length.
-type Fresh = (ObjectId, Kind, ContentId, u64);
+/// A new object as staging meets it: its id, type, the content its row names (its own, or the pack it lies in), its
+/// length, and where its entry begins in that pack for one read from a pack.
+type Fresh = (ObjectId, Kind, ContentId, u64, Option<u64>);
 
 /// A push's seal and stage under way (module docs).
 #[derive(Debug)]
@@ -50,12 +51,14 @@ enum Step {
     /// The numbers so far.
     done: BTreeMap<ObjectId, u64>,
   },
-  /// Each object of the push's pack that the repository does not index put in the content store, an object a unit, in
-  /// the order the pack's reader resolved them (`Push::placed_in_order`): each read just after its base, so the objects
-  /// read lately hold its chain. The census after it finds each put.
-  Putting {
-    /// The next, in that order.
-    next: usize,
+  /// The push's pack put in the content store as one content, a window a unit (A-722's record v4: each object's row
+  /// names where it lies there, never a second copy inflated); none put for a push whose pack brought no object, or
+  /// whose pack is put already (a stage made again).
+  Packing {
+    /// The put under way, boxed (its hasher is most of a step's size); none before its first window.
+    writing: Option<Box<Writing>>,
+    /// The pack's bytes put so far.
+    at: usize,
   },
   /// The fork the rows are written into made, and the next position read: what the staging is current against. A
   /// landing after it moves the index's rows or its next position, so the commit stages the push again (A-722 part
@@ -133,6 +136,13 @@ impl Staging {
   /// Gives back what a staging ended before its end holds: its fork.
   pub fn abandon(self, store: &mut ContentStore) -> Result<(), StoreRefused> {
     match self.step {
+      Step::Packing {
+        writing: Some(writing),
+        ..
+      } => {
+        store.abandon_object(*writing);
+        Ok(())
+      }
       Step::Fresh { fork, .. }
       | Step::Positions { fork, .. }
       | Step::Rows { fork, .. }
@@ -183,7 +193,10 @@ impl Repository {
       old.fork.release(store)?;
     }
     Ok(Staging {
-      step: Step::Putting { next: 0 },
+      step: Step::Packing {
+        writing: None,
+        at: 0,
+      },
     })
   }
 
@@ -230,32 +243,14 @@ impl Repository {
     Ok(())
   }
 
-  /// The content-store root of the push's object `id`, its row's content: where the push holds it in the store, or put
-  /// there now from where it lies in the push's pack (`Push::put_placed`).
-  fn stored_for_row(
-    &self,
-    store: &mut ContentStore,
-    push: &mut Push,
-    id: &ObjectId,
-  ) -> Result<ContentId, StoreRefused> {
-    if let Some(content) = push.stored(id) {
-      return Ok(content);
+  /// The content the row of the push's object `id` names and where its entry begins there: its own content, held
+  /// whole; or the push's pack its staging put in the store ([`Step::Packing`]) and the entry's offset.
+  fn stored_for_row(push: &Push, id: &ObjectId) -> Result<(ContentId, Option<u64>), StoreRefused> {
+    match push.stored(id) {
+      Some(StoredAt::Whole(content)) => Ok((content, None)),
+      Some(StoredAt::InPack(place)) => Ok((place.pack, Some(place.offset))),
+      None => Err(StoreRefused::Unreadable { id: *id }),
     }
-    let unreadable = StoreRefused::Unreadable { id: *id };
-    let bytes = {
-      let outside = IndexBases {
-        repository: self,
-        store,
-      };
-      match push.bytes(store, &outside, id) {
-        Some(Ok(bytes)) => bytes.into_owned(),
-        _ => return Err(unreadable),
-      }
-    };
-    push
-      .put_placed(store, id, &bytes)
-      .map_err(StoreRefused::Content)?
-      .ok_or(unreadable)
   }
 
   /// One unit of the fresh objects' census: the next object the push holds after `after`, kept with its kind when the
@@ -275,16 +270,16 @@ impl Repository {
         fork.release(store)?;
         return Err(StoreRefused::Malformed { id });
       };
-      // An object read where it lies in the push's pack is put in the store now, its row's content (the module docs of
-      // `push`, "Read in place while judged"): what lands is held there.
-      let content = match self.stored_for_row(store, push, &id) {
-        Ok(content) => content,
+      // An object of the push's pack is named by where it lies in the pack its staging put in the store (A-722's
+      // record v4); one held whole, by its own content.
+      let (content, offset) = match Self::stored_for_row(push, &id) {
+        Ok(stored) => stored,
         Err(refused) => {
           fork.release(store)?;
           return Err(refused);
         }
       };
-      fresh.push((id, kind, content, held.len));
+      fresh.push((id, kind, content, held.len, offset));
       let count = kinds.entry(kind).or_insert(0);
       *count = count.saturating_add(1);
     }
@@ -312,7 +307,10 @@ impl Repository {
       } => {
         let Some(id) = ids.get(next).copied() else {
           push.seal_with(&done);
-          return Ok(Step::Putting { next: 0 });
+          return Ok(Step::Packing {
+            writing: None,
+            at: 0,
+          });
         };
         self.generations_from(store, push, id, &mut done)?;
         Ok(Step::Generations {
@@ -321,17 +319,7 @@ impl Repository {
           done,
         })
       }
-      Step::Putting { next } => {
-        let Some(id) = push.placed_in_order(next) else {
-          return Ok(Step::Forking);
-        };
-        if self.indexed(store, &id).is_none() {
-          self.stored_for_row(store, push, &id)?;
-        }
-        Ok(Step::Putting {
-          next: next.saturating_add(1),
-        })
-      }
+      Step::Packing { writing, at } => packing_unit(store, push, (writing, at)),
       Step::Forking => Ok(Step::Fresh {
         fork: self.index.fork(store)?,
         base: self.next_position,
@@ -446,7 +434,7 @@ impl Repository {
     store: &mut ContentStore,
     push: &Push,
     positions: &BTreeMap<ObjectId, u64>,
-    (id, kind, content, len): Fresh,
+    (id, kind, content, len, offset): Fresh,
     fork: &mut Index,
   ) -> Result<(), StoreRefused> {
     let position = self.position_of(store, positions, &id)?;
@@ -454,6 +442,7 @@ impl Repository {
       kind,
       len,
       position,
+      offset,
       commit: self.commit_row(store, push, positions, &id, kind)?,
     };
     let key = rows::object_key(&id);
@@ -478,6 +467,41 @@ impl Repository {
     )?;
     Ok(())
   }
+}
+
+/// One unit of [`Step::Packing`]: the next window of the push's pack put in the content store, or, past the last, the
+/// put finished and kept as the push's stored pack ([`Push::set_stored_pack`]) and the fork made next. A push whose
+/// pack brought no object, or whose pack is put already, puts none. Refused, what the put kept is given back.
+fn packing_unit(
+  store: &mut ContentStore,
+  push: &mut Push,
+  (writing, at): (Option<Box<Writing>>, usize),
+) -> Result<Step, StoreRefused> {
+  if push.stored_pack().is_some() || !push.has_placed() {
+    return Ok(Step::Forking);
+  }
+  let mut writing = writing.unwrap_or_else(|| Box::new(store.begin_object()));
+  let end = at.saturating_add(store.window()).min(push.pack().len());
+  if let Some(piece) = push.pack().get(at..end).filter(|piece| !piece.is_empty()) {
+    if let Err(refused) = store.put_window(&mut writing, piece) {
+      store.abandon_object(*writing);
+      return Err(refused.into());
+    }
+    return Ok(Step::Packing {
+      writing: Some(writing),
+      at: end,
+    });
+  }
+  let identity = match store.finish_object(&mut writing) {
+    Ok(identity) => identity,
+    Err(refused) => {
+      store.abandon_object(*writing);
+      return Err(refused.into());
+    }
+  };
+  let len = u64::try_from(push.pack().len()).unwrap_or(u64::MAX);
+  push.set_stored_pack(identity, len);
+  Ok(Step::Forking)
 }
 
 /// One unit of [`Step::Positions`]: the fresh object at `at` given its kind's next position, or, past the last, the
