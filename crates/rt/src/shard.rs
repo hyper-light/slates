@@ -1398,6 +1398,7 @@ impl ShardContext {
         let now = self.now_ns();
         if now.saturating_sub(last_wait_ns) >= self.quantum_ns() {
           let _ = self.harvest_io();
+          slates_machine::diag_harvest::count(true, self.now_ns().saturating_sub(now));
           last_wait_ns = now;
         }
         continue;
@@ -1494,7 +1495,9 @@ impl ShardContext {
       // message whose kick this harvest took is visible to the looks after it. Looked at before the harvest, a message
       // published between the look and the harvest lost its kick to the harvest, and a spin ending on that turn parked
       // with the message unseen and no kick left to wake it.
+      let harvest_began = self.now_ns();
       let harvested = self.harvest_io();
+      slates_machine::diag_harvest::count(false, self.now_ns().saturating_sub(harvest_began));
       if harvested
         || self.has_inbound()
         || self

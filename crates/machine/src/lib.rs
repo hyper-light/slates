@@ -57,6 +57,7 @@ pub mod budgets;
 pub mod build_cost;
 pub mod clock;
 pub mod derived;
+pub mod diag_harvest;
 pub mod error;
 pub mod facts;
 pub mod log;

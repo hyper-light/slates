@@ -995,6 +995,7 @@ fn main() {
     // daemon ahead of the load shows what it took from it.
     let turns = std::sync::atomic::AtomicU64::new(0);
     let started = std::time::Instant::now();
+    let _ = slates_machine::diag_harvest::take();
     std::thread::scope(|scope| {
       for _ in 0..spinners {
         scope.spawn(|| {
@@ -1014,6 +1015,10 @@ fn main() {
     let rate = turns.load(Ordering::Relaxed) as f64 / seconds / 1e6;
     println!(
       "load throughput: {rate:.1} million spinner turns a second over {seconds:.1} s ({spinners} spinners)"
+    );
+    let (busy, busy_slow, spin, spin_slow) = slates_machine::diag_harvest::take();
+    println!(
+      "diag harvests loaded: busy {busy} ({busy_slow} at or past 1 ms), spin {spin} ({spin_slow} at or past 1 ms)"
     );
   }
   // Each shard's pulse as the runtime holds it (§4.14): its longest step tells a request held behind a long task from
