@@ -341,3 +341,5 @@
 ## 2026-11-21 08:20 (main's word): the wall green
 - 13ded84f0 (main d612e3963): store texts.rs hunk widths derived (w-store's), hg intake helper split lint-only (w-hg's,
   told in its inbox). Host clippy and literals clean on the merged tree. Windows anchor tests (r23) running on jupiter.
+- Windows A-789: anchor lib 26/26 (r23), handles_windows 9 + 10 ignored (r24) green; CLI extent tests refused for room
+  twice (r25, r26), reported in run-requests.md. Stale r10/r13 stopped (not on jupiter).
