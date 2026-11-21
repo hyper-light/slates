@@ -1126,7 +1126,6 @@ async fn fetch_named_increment(
 ) -> Result<(), Box<ReplyBody>> {
   let id = to_db_volume(green);
   let object = ObjectId(green.bytes);
-  let named = slates_merge::chain_entry::Inputs { identity, len };
   if call_owner(control, shard, move |s| {
     s.held_content.holds_manifest(object, &identity)
   })
@@ -1147,23 +1146,40 @@ async fn fetch_named_increment(
       break false;
     }
   };
-  let bytes = whole
+  // The manifest the fetch staged here, then the increment moved to the owner shard a chunk a call (each its own step,
+  // never the whole increment in one): opened as a stage placed for the version it would make, a chunk at a time, and
+  // completed. On the owner's own shard the fetch staged it in place, and only its placement moves to the version.
+  let manifest = whole
     .then(|| {
       crate::state::with_state(|s| {
-        crate::merge_service::increment_of(s, id, &named).map(std::borrow::Cow::into_owned)
+        s.held_content
+          .held_manifest(s.store.content.arena(), object, &identity)
       })
       .flatten()
     })
     .flatten();
-  let Some(bytes) = bytes else {
+  let Some(manifest) = manifest else {
     let _ = crate::state::with_state(|s| s.count(INPUTS_FETCH_SHORT, 1));
     return Err(Box::new(refused(Refusal::Overloaded { shard: control })));
   };
-  let held = call_owner(control, shard, move |s| {
-    let next = s.db.partition().green_head(id).saturating_add(1);
-    crate::merge_service::hold_increment(s, id, next, &bytes).map(|_| ())
-  })
-  .await?;
+  let held = if shard == control {
+    crate::state::with_state(move |s| {
+      let next = s.db.partition().green_head(id).saturating_add(1);
+      s.held_content
+        .hold_lent(
+          &mut crate::content_holder::hold_space(&mut s.store),
+          object,
+          slates_cluster::content::Placed { sequence: next },
+          &manifest,
+          std::iter::empty(),
+        )
+        .map(|_| ())
+        .map_err(|refusal| held_refusal(refusal, control))
+    })
+    .unwrap_or(Err(Refusal::Overloaded { shard: control }))
+  } else {
+    move_increment((control, shard), (id, object, identity), manifest).await?
+  };
   let _ = crate::state::with_state(|s| {
     // Staged here for the move: released once the owner shard holds it, unless this shard is the owner's, whose hold it is.
     if shard != control {
@@ -1179,6 +1195,76 @@ async fn fetch_named_increment(
     }
   });
   held.map_err(|refusal| Box::new(refused(refusal)))
+}
+
+/// The typed refusal a content hold's refusal is for a holder's submit: no room is the shard's `BudgetExceeded`, any
+/// other `Overloaded` (nothing started; the retry fetches again).
+fn held_refusal(refusal: slates_cluster::content::ContentRefusal, shard: u16) -> Refusal {
+  match refusal {
+    slates_cluster::content::ContentRefusal::NoCapacity { available, .. } => {
+      Refusal::BudgetExceeded { available }
+    }
+    _ => Refusal::Overloaded { shard },
+  }
+}
+
+/// Moves an increment this control shard holds whole under `identity` to the owner `shard`'s content store, placed for
+/// the green's next version (lane (A) 3b): a stage opened there for `manifest`, then each chunk the stage lacks lent
+/// here, copied out once and staged there, a call each, then the stage completed. Every call one chunk's work, so the
+/// owner shard never spends a whole increment's copy and hash in one step. A stage the owner shard already held whole
+/// (an earlier move) is nothing to move.
+async fn move_increment(
+  (control, shard): (u16, u16),
+  (id, object, identity): (DbVolumeId, ObjectId, [u8; 32]),
+  manifest: slates_archive::Archive,
+) -> Result<Result<(), Refusal>, Box<ReplyBody>> {
+  let opened = call_owner(control, shard, move |s| {
+    let next = s.db.partition().green_head(id).saturating_add(1);
+    s.held_content.stage_fetched(
+      &mut crate::content_holder::hold_space(&mut s.store),
+      object,
+      slates_cluster::content::Placed { sequence: next },
+      &manifest,
+    )
+  })
+  .await?;
+  let wanted = match opened {
+    Ok(None) => return Ok(Ok(())),
+    Ok(Some(wanted)) => wanted,
+    Err(refusal) => return Ok(Err(held_refusal(refusal, shard))),
+  };
+  for chunk_id in wanted {
+    let chunk = crate::state::with_state(|s| {
+      s.held_content
+        .held_chunk(s.store.content.arena(), object, &identity, &chunk_id)
+    })
+    .flatten();
+    let Some(chunk) = chunk else {
+      return Ok(Err(Refusal::Overloaded { shard: control }));
+    };
+    let staged = call_owner(control, shard, move |s| {
+      s.held_content.stage_piece(
+        &mut crate::content_holder::hold_space(&mut s.store),
+        object,
+        &identity,
+        chunk,
+      )
+    })
+    .await?;
+    if let Err(refusal) = staged {
+      return Ok(Err(held_refusal(refusal, shard)));
+    }
+  }
+  let completed = call_owner(control, shard, move |s| {
+    s.held_content
+      .complete_stage(&mut crate::content_holder::hold_space(&mut s.store), object)
+  })
+  .await?;
+  Ok(
+    completed
+      .map(|_| ())
+      .map_err(|refusal| held_refusal(refusal, shard)),
+  )
 }
 
 /// Where a forwarded verb runs, and the volume it is made on (none for a work being made): a work over a green on the
