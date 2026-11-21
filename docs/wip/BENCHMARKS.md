@@ -15578,6 +15578,44 @@ What it says:
 Owed: the full clone over the wire (changesets, manifests derived, files) and an import's RSS in the daemon, once
 the shape is built there. And N=3 an arm on a quiet machine.
 
+## Mercurial's history as changesets with a derived per-file form: arm C of the changeset A/B (A-767 C3; main's order of 2026-11-20: "changesets plus a derived per-path form ... must meet the per-file arm's 91 µs and 0.27 s, or beat them, before A-767 is built"; 2026-11-20)
+
+**What it is.** w-hg's `changeset_ab` (the section above) with a third arm. **C**: B's log, in changeset order, is the
+truth; from it a per-file log is derived (each file's revisions in revision order, read out of B's compressed segments
+through the same 64-segment decoded cache, then cut into 64 KiB segments and compressed again) and kept as derived data
+by identity (A-645), and every read runs on the derived form. All three arms hold Mercurial's own deltas (no diff at the
+server) and check every rebuilt text against its BLAKE3 identity.
+
+**Command.** `cargo build --release -p slates-hg --example changeset_ab` at the worktree of this entry's commit, then
+`/usr/bin/time -l changeset_ab <hg-src> <A|B|C> 2000`, rounds of A B C interleaved, N=3. Machine: Adas-Mac-Studio-2.local
+(Apple silicon, 14 cores, 36 GiB, macOS), 2026-11-20 18:42 to 19:09 PST, load average 1.9 to 3.5. Data: Mercurial's
+repository cloned from mercurial-scm.org (57,054 changesets, 4,243 paths, 114,732 file revisions, 94.0 MiB of
+deltas). adacachy, which main named for timing while the Studios' network is bad, could not clone the history from
+mercurial-scm.org (three "incomplete response" aborts), so these rows are this Mac's.
+
+| zstd 1, rounds 1 / 2 / 3 | Held | Old read µs p50 | p99 | Clone file section | Segment decodes |
+|---|---|---|---|---|---|
+| A per-file | 26.6 MiB | 77 / 77 / 79 | 2,646 / 2,617 / 2,681 | 0.19 / 0.19 / 0.20 s | 5,258 |
+| B changesets | 28.5 MiB | 833 / 814 / 829 | 12,345 / 12,184 / 12,323 | 2.02 / 2.02 / 2.02 s | 52,498 |
+| C changesets + derived per-file | 28.5 MiB truth + 25.7 MiB derived | 73 / 73 / 74 | 2,677 / 2,638 / 2,660 | 0.06 / 0.06 / 0.06 s | 1,505 |
+
+Deriving C's per-file form from B's log: 2.17 / 2.17 / 2.19 s for the whole history (2.03 to 2.05 s of it regrouping
+through 52,498 decodes of B's segments, the rest compressing). Other codecs, round 1: raw 0.09 s and 94.0 MiB derived,
+reads p50 15 µs, clone 0.01 s; LZ4 1.02 s and 35.2 MiB, 40 µs, 0.03 s; zstd 3 2.27 s and 24.3 MiB, 72 µs, 0.06 s; zstd 9
+2.92 s and 22.2 MiB, 71 µs, 0.06 s. Peak RSS (the example holds every arm's raw log at once, so it is the harness's, not
+a store's): A 593 to 615 MB, B 618 to 624 MB, C 966 to 1,017 MB.
+
+What it says:
+- **C meets the bar and beats it**: old reads p50 73 µs against the per-file arm's 77 here (91 in w-hg's run), a clone's
+  file section 0.06 s against 0.19 (0.27). Its clone decodes fewer segments than A because its derived log is laid out in
+  the clone's own order (sorted paths), where A's follows the fncache; C is no faster than A's layout would be in that
+  order, and needs no faster.
+- **The cost is a derivation and its bytes**: 2.2 s once for the whole history, and for each later changeset only its
+  own files' runs; 25.7 MiB of derived form beside the 28.5 MiB of changesets (54.2 MiB in all, against stock hg's 77.6
+  MiB store), evictable and recomputable since it is derived.
+- Decision for A-767: the changeset log is the truth; a per-file form derived from it, cached by identity, serves reads
+  and clones.
+
 ## Subversion's history held as changesets or as per-file deltas, counted: svn's arm of the changeset A/B (Ada's ruling of 2026-11-20 ~13:35; main's A/B order; UI goal 93; 2026-11-20)
 
 **What it is.** The same A/B as Mercurial's (the section above, w-hg's `changeset_ab`). Both arms hold exactly the

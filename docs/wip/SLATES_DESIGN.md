@@ -57737,6 +57737,17 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > 64 KiB piece) once landed; `Store::changesets(repository, from)` reads the `C` rows. Tests: `slates-store` 7/7 unit
 > and 4/4 integration, the seam's own: a 300,001-byte pack read the same staged (borrowed), landed (RAM 0 after its
 > release) and recovered with and without a checkpoint.
+>
+> **Status (2026-11-20, piece C3 step 4: the A/B's derived per-path arm, decided).** Main's bar: changesets plus a derived
+> per-path form must meet the per-file arm's old read (91 µs p50) and clone file section (0.27 s). Arm C of
+> `crates/hg/examples/changeset_ab.rs` (BENCHMARKS, "Mercurial's history as changesets with a derived per-file form"):
+> over Mercurial's history at zstd 1, N=3 on Adas-Mac-Studio-2, old reads p50 73 to 74 µs and the clone's file section
+> 0.06 s, against the per-file arm's 77 to 79 µs and 0.19 to 0.20 s and the changesets alone's 814 to 833 µs and 2.02 s;
+> the derived form costs 2.2 s once for the whole history and 25.7 MiB beside the changesets' 28.5 MiB (stock: 77.6
+> MiB). **Decided:** the changeset log is the truth (item 1); a per-file form derived from it serves reads and clones,
+> kept by identity as A-645's derived data, evictable and recomputed from the log; a landing extends it with only its
+> own files' runs. Agreed in substance by w-hg (an edit against a named base; a `Texts` section) and w-git (v4's payload
+> homed by identity; normalization behind the same names); w-svn's reply not yet in.
 
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
