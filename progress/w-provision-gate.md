@@ -85,3 +85,5 @@
   refuses < its min RT quantum, 50 us here; unit test). Note: b01a0ef7b (named by main) is not on main and its branch is
   gone, so the arms sit on main's nap. Local smoke (Studio-4, load 7, TB): loaded accept p99 225 us / p999 361 us, no
   refusal. Worktrees: ~/slates-work/w-provision-gate-diag(2); clone ~/slates-work/w-provision-gate.
+- 2026-11-21 ~12:45 PST: 84a macOS CLOSED on data. TB landed as A-831 (6865fe121); close note
+  inbox/main-from-w-provision-gate-84a-macos.md. Goal 93 git interop test landed earlier (e1754f418); red sent to w-git.
