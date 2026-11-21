@@ -1,6 +1,6 @@
 name: diag-measurer
 
-# g222's Linux split: the diagnostic arm (2c8f89de6 + g222's ring stamps, diag-g222-hops-base) loaded under A-224's lane, landing->taken vs taken->reply per request. Was: g222's bisect of ~10 us on a quiet lone submit since A-400 (f2081a3c8..a5233e228), quiet only. Was: g222's lone-client A/B (the supervisor's condition 3, 2026-11-20): does A-400 (a work on its client's shard) undo W1's
+# g222's Windows split (windows-latest, windows-11-arm), the harness's own spinners. Was: g222's Linux split: the diagnostic arm (2c8f89de6 + g222's ring stamps, diag-g222-hops-base) loaded under A-224's lane, landing->taken vs taken->reply per request. Was: g222's bisect of ~10 us on a quiet lone submit since A-400 (f2081a3c8..a5233e228), quiet only. Was: g222's lone-client A/B (the supervisor's condition 3, 2026-11-20): does A-400 (a work on its client's shard) undo W1's
 # single-client regression at three shards? Four arms, each built from its own source extract, rotated each round,
 # loaded then quiet: 8dff8fcad (before W1), 379dfe750 (W1 and A-296, just before A-400), f2081a3c8 (A-400 landed),
 # a5233e228 (main now). Loaded on Linux = the supervisor's controlled load (A-224's lane). A diagnostics lane run only
@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04-arm]
+        os: [windows-latest, windows-11-arm]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 330
     defaults:
@@ -104,6 +104,7 @@ jobs:
           chmod +x "$W/loaded.sh"
           set +e
           order() { case $1 in 1) echo $ARMS;; 2) echo $ARMS | awk '{for(i=NF;i>0;i--) printf "%s ", $i}';; *) echo $ARMS | awk '{h=int(NF/2); for(i=h+1;i<=NF;i++) printf "%s ", $i; for(i=1;i<=h;i++) printf "%s ", $i}';; esac; }
+          native() { if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else echo "$1"; fi; }
           for round in $(seq 1 "$ROUNDS"); do
             if [ $((round % 2)) = 1 ]; then modes="spin park"; else modes="park spin"; fi
             for mode in $modes; do
@@ -111,9 +112,11 @@ jobs:
               if [ $mode = park ]; then export G222_NO_SPIN=1; else unset G222_NO_SPIN; fi
               echo "== loaded round $round arm $s $mode $(date -u +%FT%TZ) load: $(load) $(cat "$W/capnote")" | tee "$L"
               MEM="-p MemoryMax=256M"; [ -f "$W/nomem" ] && MEM=""
-              G222_DIAG="$W/logs/loaded-$s-$mode-r$round.tsv" timeout 1200 systemd-run --user --scope -q $MEM -p AllowedCPUs=0-1 "$W/loaded.sh" "$B" "$W" </dev/null >> "$L" 2>&1
+              export G222_DIAG="$(native "$W/logs/loaded-$s-$mode-r$round.tsv")"
+              if [ "${RUNNER_OS}" != Linux ]; then perl -e 'alarm shift; exec @ARGV' 1200 "$B" --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict </dev/null >> "$L" 2>&1; else
+              G222_DIAG="$W/logs/loaded-$s-$mode-r$round.tsv" timeout 1200 systemd-run --user --scope -q $MEM -p AllowedCPUs=0-1 "$W/loaded.sh" "$B" "$W" </dev/null >> "$L" 2>&1; fi
               echo "exit $?" >> "$L"; grep -E "ratchet-info.*f10_loaded_total_p(50|99|999)\b|exit" "$L" | cut -c1-200
-              python3 - "$W/logs/loaded-$s-$mode-r$round.tsv.ring" <<'PY' || true
+              "$(command -v python3 || command -v python)" - "$(native "$W/logs/loaded-$s-$mode-r$round.tsv.ring")" <<'PY' || true
           import sys
           q=[];s=[]
           for l in open(sys.argv[1]).read().splitlines()[1:]:
