@@ -1,0 +1,40 @@
+   Compiling slates-ssh v0.1.0 (/home/runner/work/slates/b/crates/ssh)
+   Compiling slates-hg v0.1.0 (/home/runner/work/slates/b/crates/hg)
+   Compiling slates-mcp v0.1.0 (/home/runner/work/slates/b/crates/mcp)
+   Compiling slates-server v0.1.0 (/home/runner/work/slates/b/crates/server)
+   Compiling rcgen v0.13.2
+   Compiling slates-api v0.1.0 (/home/runner/work/slates/b/crates/api)
+   Compiling slates-cli v0.1.0 (/home/runner/work/slates/b/crates/cli)
+warning: unused import: `process_wait::await_exit_of`
+  --> crates/cli/tests/vm/mod.rs:14:16
+   |
+14 | pub(crate) use process_wait::await_exit_of;
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `InstanceWait`, `Judged`, and `Verdict`
+  --> crates/cli/tests/vm/mod.rs:16:31
+   |
+16 | pub(crate) use process_wait::{InstanceWait, Judged, Verdict};
+   |                               ^^^^^^^^^^^^  ^^^^^^  ^^^^^^^
+
+warning: `slates-cli` (test "guest_vhost") generated 2 warnings (run `cargo fix --test "guest_vhost" -p slates-cli` to apply 2 suggestions)
+warning: unused import: `InstanceWait`
+  --> crates/cli/tests/vm/mod.rs:16:31
+   |
+16 | pub(crate) use process_wait::{InstanceWait, Judged, Verdict};
+   |                               ^^^^^^^^^^^^
+
+warning: `slates-cli` (test "guest_image") generated 2 warnings (1 duplicate) (run `cargo fix --test "guest_image" -p slates-cli` to apply 1 suggestion)
+warning: `slates-cli` (test "vm_harness") generated 2 warnings (2 duplicates)
+warning: `slates-cli` (test "guest_dax") generated 2 warnings (2 duplicates)
+error[E0425]: cannot find value `held` in this scope
+    --> crates/cli/tests/cli.rs:7020:17
+     |
+7020 |       wait_for(&held.instance, || attachments_of(&self.instance, &self.id)
+     |                 ^^^^ not found in this scope
+
+For more information about this error, try `rustc --explain E0425`.
+error: could not compile `slates-cli` (test "cli") due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
