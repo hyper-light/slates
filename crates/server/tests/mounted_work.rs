@@ -448,3 +448,38 @@ fn a_mount_shows_its_works_new_base_once_the_base_moves() {
   drop(client);
   daemon.stop();
 }
+
+/// A-774 C1 (a mounted work is unmounted like any volume; jupiter r3, 2026-11-21: `slates unmount E:` answered "no
+/// slates volume is mounted at E:" for a mounted work). Windows' unmount finds a drive among the volumes' reported
+/// mounts (`slates_api::mount`'s `unmount_platform`), and a merge volume's status reported none. Do: attach a work for a
+/// host mount and bind it at a path, then ask the work's status. Expect: the status reports that mount, its attachment
+/// at its path, as a plain volume's does.
+#[test]
+fn a_mounted_works_status_reports_its_mount() {
+  let (daemon, mut client, _) = start("status");
+  let green = seeded_green(&mut client);
+  let (work, _) = client.create_work(green, "mounted-status").unwrap();
+  let attached = client
+    .attach_mount(work, slates_ipc::protocol::Intent::Write)
+    .unwrap();
+  let path = "/mounted-status-drive".to_owned();
+  let bound = client.call(&slates_ipc::protocol::RequestBody::BindMount {
+    attachment: attached.attachment,
+    path: path.clone(),
+  });
+  assert!(
+    matches!(bound, Ok(slates_ipc::protocol::ReplyBody::MountBound)),
+    "{bound:?}"
+  );
+  let report = client.status(work).unwrap();
+  assert!(
+    report
+      .mounts
+      .iter()
+      .any(|mount| mount.attachment == attached.attachment && mount.path == path),
+    "the work's status reports its bound mount: {:?}",
+    report.mounts
+  );
+  drop(client);
+  daemon.stop();
+}
