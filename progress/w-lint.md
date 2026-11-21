@@ -417,3 +417,9 @@
   Windows: r31 dropped, resubmitted as r33, queued. No platform has a pass/fail count yet.
 - VCS lane, Windows: r31 dropped and its resubmit r33 died when jupiter's runner restarted (in run-requests.md).
   No platform has a pass/fail count this round.
+
+## 2026-11-21 round at ed4661d40
+- Red: server git_push t_a836 at 11/10, split into tags_listed_peeled and fetched_ids; git_push 30/30. The rest of the
+  wall was clean.
+- VCS lane: Linux r36 dropped (adacachy didn't answer in 15 s), so I resubmitted it once as r38 (shallow clone).
+  Windows r37 is queued for jupiter.
