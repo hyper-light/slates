@@ -112,6 +112,28 @@ fn a_shard_lands_and_reads_through_the_owner_across_a_restart() {
             .unwrap(),
         );
       }
+      // A replay's reading: the first changeset's sections, its record inline, its payload by place a piece at a time.
+      let sections = handle.sections(listed[0]).await.unwrap();
+      assert_eq!(sections.len(), 2);
+      assert_eq!(sections[0].section.kind, SectionKind::Record);
+      assert_eq!(sections[0].inline.as_deref(), Some(&b"heads"[..]));
+      assert_eq!(sections[1].section.kind, SectionKind::Payload);
+      assert!(
+        sections[1].inline.is_none(),
+        "a payload past one piece is read by its place"
+      );
+      let mut by_place = Vec::new();
+      let payload = sections[1].section;
+      while (by_place.len() as u64) < payload.len {
+        let at = payload.offset + by_place.len() as u64;
+        by_place.extend(
+          handle
+            .read(at, payload.len - by_place.len() as u64)
+            .await
+            .unwrap(),
+        );
+      }
+      assert_eq!(by_place, read, "the same bytes by place as by identity");
       (first, listed, read)
     })
     .unwrap();
