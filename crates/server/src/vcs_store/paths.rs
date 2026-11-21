@@ -271,22 +271,7 @@ pub(crate) fn needs_whole(
   before.is_none_or(|before| named(&engine, before.version, version).is_none())
 }
 
-/// Builds the map of each member green of `repository` that committed a version, from its head (module docs): what a
-/// store made again from the log holds again.
-pub(crate) fn remake(state: &mut ShardState, repository: RepositoryId) {
-  let greens: Vec<DbVolumeId> = state
-    .db
-    .partition()
-    .repositories()
-    .members_of(repository)
-    .map(|member| member.green)
-    .collect();
-  for green in greens {
-    remake_green(state, green);
-  }
-}
-
-/// [`remake`]'s unit: `green`'s map built from its head, where it committed a version.
+/// `green`'s map built from its head, where it committed a version: what a store made again from the log holds again.
 pub(crate) fn remake_green(state: &mut ShardState, green: DbVolumeId) {
   let Some(version) = state.greens.get(&green).map(|engine| engine.head()) else {
     return;

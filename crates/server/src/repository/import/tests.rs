@@ -446,7 +446,8 @@ fn served(state: &mut ShardState, id: RepositoryId) -> Served {
 }
 
 /// A recovery's own steps over this shard (A-575, A-662): every green rebuilt from its records in recovery's order
-/// into empty engines, then repository `id`'s store made again from the partition's log.
+/// into empty engines, then repository `id`'s store made again from the partition's log by the shard's task (its
+/// import's segments read back from the changeset store, A-767 C1 step 3), which the caller waits out.
 fn recovered(state: &mut ShardState, id: RepositoryId) {
   drop(std::mem::take(&mut state.greens));
   let mut greens: Vec<VolumeRecord> = state
@@ -461,7 +462,7 @@ fn recovered(state: &mut ShardState, id: RepositoryId) {
   for record in &greens {
     drop(crate::verbs::rebuild_member(state, record));
   }
-  crate::vcs_store::rebuild_whole(state, id);
+  crate::vcs_store::rebuild(state, id);
 }
 
 /// The `states` repository imported in one call through the same adapter: what it found.
@@ -529,14 +530,24 @@ fn t_a687_an_import_and_a_recovery_serve_the_same_repository() {
       "still importing after {TASK_WAIT:?}"
     );
   }
-  let (answered, before, after, replayed) = crate::daemon::observe_first(&daemon, move |state| {
+  let (answered, before, replayed_before) = crate::daemon::observe_first(&daemon, move |state| {
     let answered = count(state, ANSWERED);
     let before = served(state, id);
     let replayed = count(state, crate::vcs_store::REPLAYED);
     recovered(state, id);
+    (answered, before, replayed)
+  });
+  let began = Instant::now();
+  while crate::daemon::observe_first(&daemon, move |state| state.vcs_stores.rebuilding(id)) {
+    assert!(
+      began.elapsed() < TASK_WAIT,
+      "still rebuilding after {TASK_WAIT:?}"
+    );
+  }
+  let (after, replayed) = crate::daemon::observe_first(&daemon, move |state| {
     let after = served(state, id);
-    let replayed = count(state, crate::vcs_store::REPLAYED).saturating_sub(replayed);
-    (answered, before, after, replayed)
+    let replayed = count(state, crate::vcs_store::REPLAYED).saturating_sub(replayed_before);
+    (after, replayed)
   });
   daemon.stop();
   assert_eq!(answered, 1);
