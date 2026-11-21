@@ -23,6 +23,8 @@ slates-rt = { workspace = true }
 [dev-dependencies]
 # The simulated file with power-loss semantics the log's crash tests run on.
 hyper-block = { path = "../../vendor/hyper-raft/hyper-block", features = ["sim"] }
+# The process's resident memory the memory test bounds (`tests/memory.rs`).
+slates-machine = { workspace = true }
 
 [lints]
 workspace = true

@@ -57769,6 +57769,14 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > Without the flag nothing changes. Windows: `store_root` refuses `Unsupported` there until its handle-relative
 > counterpart is written (GAPS), so the crates build on every target. Test: `slates-api role` the flag parsed and
 > passed on (1/1, with the role's 38/38).
+>
+> **Status (2026-11-20, the store's RSS red test, C4-C6's store side).** `crates/store/tests/memory.rs`, a process of
+> its own: three 64 MiB payloads landed through the owner from a shard's task and one read back whole a piece at a
+> time; resident memory after is held to the baseline plus two of the change in flight (its bytes and one decode
+> window, item 8's k = 2) plus the engine's budget. Measured (macOS arm64, Adas-Mac-Studio-2): baseline 6 to 7 MiB,
+> after 71 to 73 MiB, bound 142 to 143 MiB, 192 MiB landed (release and debug). History held in RAM, as before A-767,
+> passes the bound by the landings alone. Each tool's own red test (its intake's memory) is owed with w-hg, w-git,
+> w-svn.
 
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
