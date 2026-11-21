@@ -318,8 +318,13 @@
 > text), the replay's and the live push's alike. The intake now hands each append the text it kept last
 > (`HgIndex::append_revisions_after`, borrowed, no copy); a predecessor is rebuilt only where the caller holds none.
 > Red first: `push::intake::tests::the_intake_hands_each_manifest_its_predecessors_text_never_rebuilding_it` (6
-> rebuilds of stock 7.2's bundle before, 0 after). Owed: the restart's replay of hg's history measured again, its
-> longest step against the quantum and the per-step lend and settle (0.5 ms a slice).
+> rebuilds of stock 7.2's bundle before, 0 after). Part 5 FIXED: a recovery unit, and a rebuild's turn, takes the
+> record's steps under one lend of the stores and one settle of the charge until its slice's budget (the step quantum)
+> is spent, where every revision was a unit of its own (259,321 for hg's history). Counted as
+> `vcs_store.hg_replay_turns`. Red first: `vcs_store::hg_import::tests::a_recovery_unit_replays_as_many_revisions_as_
+> its_slice_allows` (31 units for 15 revisions before; fewer units than revisions after, the 1 ns slices' test still a
+> revision a unit). `revision_text` applies a chain into two swapped buffers (dc59ef2a1). Owed: the restart of hg's
+> history measured again, release, its slices and longest step (the Studios' network and adacachy's room permitting).
 > **A-745 (2026-11-20, w-hg; main's ruling, found by use by w-interop: no clone of Mercurial's own 57,035-revision
 > history was admitted, HTTP, SSH and stream).** RED: §4.17.1 "A fetch's answer" written; the by-use test (a clone of
 > one changeset whose file is twice a request's room, `ERROR:ABORT PastAdmission { asked: 557056, left: 277336 }`)
