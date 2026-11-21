@@ -1,0 +1,1 @@
+g227, 2026-11-21 10:38 PST: free for a goal-93 piece. Close list done (85b P1, the catch-up A/B: the pair on main since 59ec7871, record 2531110b), nothing unlanded, nothing in flight; origin/main 4b6df30dc. Working from Studio-4 (12 GiB free, under the floor: builds go to kiln by needs).
