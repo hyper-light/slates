@@ -560,9 +560,7 @@ pub(crate) const GONE_DIRECTORY: crate::host::OsCode = crate::host::OsCode::Errn
 pub(crate) const GONE_DIRECTORY: crate::host::OsCode = crate::host::OsCode::Win32(2);
 
 /// The code a base directory recovery could not reopen is refused with, typed by its numbering (A-539): the host's own;
-/// [`GONE_DIRECTORY`] when the host says only that it is not there as a directory; none for a fetch under way, which no
-/// code names, as a base unavailable with no host at all names none (recovery over an S3 base is A-524's owed
-/// integration).
+/// [`GONE_DIRECTORY`] when the host says only that it is not there as a directory.
 pub(crate) fn unavailable_code(error: HostError) -> Option<crate::host::OsCode> {
   match error {
     HostError::Exists(code)
@@ -574,7 +572,6 @@ pub(crate) fn unavailable_code(error: HostError) -> Option<crate::host::OsCode> 
     HostError::NotFound | HostError::NotDirectory | HostError::NotFile | HostError::StaleHandle => {
       Some(GONE_DIRECTORY)
     }
-    HostError::Pending(_) => None,
   }
 }
 
@@ -895,7 +892,6 @@ fn host_refusal(e: HostError) -> VfsError {
     | HostError::Unavailable(code)
     | HostError::Unprivileged(code)
     | HostError::OwnMount(code) => VfsError::BaseUnavailable(Some(code)),
-    HostError::Pending(fetch) => VfsError::BasePending(fetch),
   }
 }
 

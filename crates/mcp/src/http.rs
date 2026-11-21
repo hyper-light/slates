@@ -35,7 +35,7 @@
 //! `SRTT + max(G, 4·RTTVAR)` (§2.3), `G` being this shard's granularity: its timer's tick or, when longer, the lateness
 //! its scheduler has shown. Only a bearer holder's arrival is a sample, so no other local user can move the bound either
 //! way, and a connection cut off is none (Karn's rule: its true arrival is unknown). Before the first arrival the bound
-//! is the estimator's own prior, RFC 9002 §6.2.2's initial probe timeout ([`PRIOR_NS`], A-471's), and each arrival
+//! is the estimator's own prior, RFC 9002 §6.2.2's initial probe timeout ([`PRIOR_NS`]), and each arrival
 //! shrinks the prior's part: after `n` of them the next outlasts every one with chance `1/(n+1)` whatever their
 //! distribution (Rényi's record indicator, the share A-363's detector prices a lateness past every one seen at), so the
 //! bound keeps that share of the prior's excess over the learned tail. A connection that has shown the bearer is the
@@ -107,8 +107,7 @@ const MAX_HEAD_BYTES: usize = MAX_LINE_BYTES * (MAX_FIELDS + 1);
 const VARIATION_MULTIPLIER: u64 = 4;
 
 /// Format: how long a connection may take to show the edge's bearer before any honest arrival was measured: the
-/// estimator's own prior, RFC 9002 §6.2.2's initial probe timeout (twice its initial round trip, 666 ms), the prior the
-/// S3 base's learned waits start from (A-471). Each honest arrival shrinks its part ([`Arrivals::bound_ns`]).
+/// estimator's own prior, RFC 9002 §6.2.2's initial probe timeout (twice its initial round trip, 666 ms). Each honest arrival shrinks its part ([`Arrivals::bound_ns`]).
 pub const PRIOR_NS: u64 = slates_transport::rtt::INITIAL_PTO_NS;
 
 /// What the edge enforces, fixed when it starts.
@@ -1335,7 +1334,7 @@ mod tests {
     );
   }
 
-  /// Shape: the timer tick of a test's runtime and edge, 100 µs (the S3 client's tests run theirs at it): the
+  /// Shape: the timer tick of a test's runtime and edge, 100 µs: the
   /// granularity `G`.
   const TICK_NS: u64 = 100_000;
   /// Shape: a quick honest arrival, 50 µs: a loopback client that writes its request as soon as it has connected.
