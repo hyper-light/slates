@@ -132,3 +132,10 @@ landed (71e55b6c2), the 8 MiB liveness test holds, and at 32 MiB+ the owner's on
   which kiln placed r3/r4 on at disk 40g; I stopped those before they started). r6: the 3a release bench, same needs.
   Both tentatively placed on runner b24c5c95, which lost r18 and r19 earlier ("did not answer in 15s").
 - Land piece 1 the moment r5 is green, one line each to w-git, w-hg, w-svn first.
+
+## 07:35 PST: piece 1's focused suites running locally (your 07:35 note)
+- r5 and r6 stopped. Local debug run of ddf708e56 started 07:34 in ~/.cache/w-shared-local-target.noindex (MacBook
+  49 GB free, load 14): build, then merge, cluster, git lib, server lib, 7 server suites, the kill test. Log
+  ~/slates-work/w-shared-scratch/focused.log. Land at once when green.
+- The 3a bench: re-sized to disk=20g with cpus>=16 (keeps it off this MacBook without pinning), but kiln answers "not
+  connected to the kiln server" since ~07:36, so it isn't queued yet; I'll retry until it takes.
