@@ -39,3 +39,22 @@ async driver that awaits `StoreHandle::piece` and steps again.
    queue between parts?
 
 Building the piece-reading intake now (it's needed either way), red first on a replay's peak bytes.
+
+## Follow-up (~01:05): a restart cost to weigh before you rule (w-store is stopped pending Ada, so this is yours)
+**The cost.** Replaying an import's changegroup through the push intake rebuilds and hashes every text at every
+restart. For Mercurial's own history that's ~4.3 GB of text rebuilt and BLAKE3'd, about the import's own CPU, where
+today's identity record (v5) restores the index rows by identity with no text rebuilt: R2's ~130 s of CPU. Shape (i)
+below would make R2 worse.
+
+- **(i) Replay through the intake:** one replay path for push and import, but restart CPU ≈ the import's.
+- **(ii) Split by section:** the import's Payload segments carry the revlogs' deltas (cg3 framing, each against its
+  stored base), with Texts rows (identity, base, place), which serve step 1's reads from the store. Each segment's
+  Record carries that segment's index rows by identity, the v5 identity record's form.
+  - Recovery restores the rows from the Records, with no text rebuilt, and reads no payload at all.
+  - The texts are read through the store only when served (step 1).
+  - Replay stays as cheap as today, and the store holds each byte once (the deltas).
+- **Recommended:** (ii). Push replay stays on the intake (a push's texts are verified once, on arrival, either way;
+  moving it to (ii) too is a later saving).
+- **The same either way, so I'm building it now:** the import emits its revlogs' deltas as a cg3 stream of segments
+  landed as a run, with Texts rows, and the register's import entry names the run. The difference between (i) and (ii)
+  is only each segment's Record and the replay that reads it.

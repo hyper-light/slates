@@ -1478,3 +1478,12 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   w-git R2 found: the keepalive went out only after two 5 s intervals, exactly the edge tests' 10 s patience, so they failed 18 of 18 under load. Fix d9c014fa0, on test.
   RULING: w-shared's (A) pieces approved. The push writers move in piece 1, one format at a time, and w-git, w-hg and w-svn get an hour's notice.
   KILN: an outage around 00:45-00:50 cost w-rewrite-ops its close-note push. Every runner but Studio-2 was back at 00:54.
+- 2026-11-21 00:59 PST CLOSED, goal 88 (the Codex agent's Green/Work and atomic-conflict work), by w-work-cow:
+  - d8416294c: GAPS accounts for all 94 Codex branches (3 ported, 85 superseded, 1 finding, 5 outside the goal).
+  - A-796: 6823fde6f and c1e76d0a7, the merge check, guarded read and resolve as MCP tools and CLI verbs.
+  - db80da5e8: its wire-tag red fixed (98-100).
+  - 4930bf14b: the rebase_with rule (AC-6.13), and a stamp taken before a restart no longer accepted after the Work changed.
+  The UI stack can't be read from this session, so Ada marks goal 88 met. w-work-cow is asked whether the deferred-submit/post-verdict hook is on main; if not, it builds it next.
+  ALSO LANDED: d571ffbca (w-hg, piece-reading replay); 970950081 (w-git, R2 closed: the keepalive went out late).
+  RULING (w-svn): stage C waits in GAPS as a measured regression. git-2000's import takes 24.5 s vs 8.2 s, ~8 ms a revision, one F_FULLFSYNC per landing. Its two shapes belong to w-engine (the merge engine) and w-store (the barrier), both out of reach. w-svn takes stage B part 2 now.
+  NETWORK: the big Studio's Ethernet (en0) is inactive, so it's on Wi-Fi (en1). Ping to the kiln server 192.168.1.90 is 28/224/602 ms min/avg/max; kiln's link shows an 18 s round trip and a 47 s outage. Only 76 TCP sockets, so not port exhaustion. Runs there stall or get lost (w-bugs r17, main's r48 waiting). Ada's to fix physically.
