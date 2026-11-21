@@ -4549,7 +4549,7 @@ mod tests {
         "another attempt"
       );
       take_target_lease(state, target(3), 11, LONG_TERM_NS, deadline).unwrap();
-      assert_eq!(crate::verbs::shard_report(state).target_leases, 2);
+      assert_eq!(crate::verbs::shard_report(state, false).target_leases, 2);
       release_target_lease(state, &target(2), 11).unwrap();
       assert_eq!(
         take_target_lease(state, target(2), 12, LONG_TERM_NS, deadline),
@@ -4561,7 +4561,7 @@ mod tests {
       assert!(c.generation > a.generation, "{c:?} after {a:?}");
       release_target_lease(state, &target(2), 12).unwrap();
       release_target_lease(state, &target(3), 11).unwrap();
-      assert_eq!(crate::verbs::shard_report(state).target_leases, 0);
+      assert_eq!(crate::verbs::shard_report(state, false).target_leases, 0);
     });
   }
 
@@ -4761,10 +4761,10 @@ mod tests {
       if stalled {
         assert!(held < TARGETS, "the stall outlasted no term: {held} held");
       }
-      assert_eq!(crate::verbs::shard_report(state).target_leases, held);
+      assert_eq!(crate::verbs::shard_report(state, false).target_leases, held);
       pause_past_a_short_term();
       take_target_lease(state, target(TARGETS), TARGETS, LONG_TERM_NS, deadline).unwrap();
-      assert_eq!(crate::verbs::shard_report(state).target_leases, 1);
+      assert_eq!(crate::verbs::shard_report(state, false).target_leases, 1);
     });
   }
 
