@@ -1497,3 +1497,9 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - The MacBook (4.7 ms to kiln's server, 46 ms to github.com, 0% loss), jupiter (4 ms) and adacachy (0 ms) are fine. Looks like the Studios' wired path (a switch?): Ada's to check.
   - Effects: Studio-2's seven agents show offline, kiln runs there stall or are lost, and main's 100k rerun r48 waits on the big Studio.
   - kiln's server was unreachable from the MacBook at about 01:03 and back by 01:07.
+- 2026-11-21 01:08 PST LANDED (on main):
+  - d7acd097e plus fixes (w-git C5 2b piece 1): a client's push writes version 5 only, a shortfall is refused Unlanded, and the v4 switch is gone.
+  - b73c0a570 (w-hg, A-767 C1 step 3, first part): the hg import is written as the changegroup a push would bring, a segment at a time.
+  RULINGS (to inboxes; kiln unreachable again at 01:08):
+  - w-perf: merge first, then the stream's bytes. 155 runs: 11.8 us per lookup, 0.6 us after one compact.
+  - R3's Windows restart-spin matrix on jupiter goes to w-interop (w-lint is offline with Studio-2).
