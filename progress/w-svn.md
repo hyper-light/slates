@@ -337,3 +337,7 @@
   content store lets go a commit's texts once landed, recovery reads none back, deltify job retired) on main, each with
   a store test red first. svn_made was done by A-804 (90e2a7666, not mine). Next: P4 (imports land texts as Payload,
   records keep none in RAM). Target trim of leftovers was declined at the prompt; disk 26 GB free.
+- 2026-11-21 ~10:00 PST: B2 (b) P4a 8d7dec8df, P4b f50841803 on main (every new svn text on the store, none in RAM);
+  A-818 72a1bbb24 (main's 09:20 "RETIRE"): Record::Deltified and the deltify APIs gone, a pre-P4a log refused typed
+  (Retired::Deltified at decode, SvnTextsInline at replay). KeptText stays for records standing alone (told main; a
+  fixture move if main wants it gone). C2 stage B complete. Next: P7's findings, re-measured on this tree first.
