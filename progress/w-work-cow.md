@@ -22,3 +22,38 @@ Grid (1/10/100k files, 1 MB-1 GB, 1/10/100 works) queued in run-requests.md (env
 Next: none in queue. One finding for w-work-mount: a first edit copies the whole file into the work (file-granular CoW,
 WorkFiles::splice), so editing a 1 GB file costs 1 GB; chunk-granular divergence would bound that.
 For main to delete: ~/slates-work/w-work-cow, ~/.cache/w-work-cow-target.noindex once main is done with the grid.
+
+## Piece 2: chunk-grain first edit (A-790) -- LANDED 0c5dd0cb5 (main af045255b), 2026-11-20 ~18:40 PST
+main 15:20: "a one-byte edit to a 1 GB file costs 1 GB; fix at chunk grain; red first; A/B release interleaved best-of-N".
+- Design: a changed file = piece table (work_files.rs `Held`): base ranges of its origin path at the pinned base version +
+  ranges of an append-only written buffer, compacted when dead > live. Edit/rename/unlink read only the base LENGTH
+  (off-owner `Need::Lengths` + `owner_lengths`); off-owner reads of a changed file ask the base span its pieces name;
+  post-state copies each op's range (`copy_range`); restatement written from the rebase's map. mounted_work.rs:91 ->
+  `!work.files.is_empty()` (told w-work-mount, inbox -3).
+- Red (tests/work_edit_cow.rs, release, this Studio): 8 one-byte edits of 64 MiB: +201,490,432 B resident, 2.38 ms.
+  Green: +18,752 B live heap, 0.14 ms.
+- A/B (BENCHMARKS, all N): live heap/work A 1.05 MB / 16.8 MB / 268 MB for 1/16/256 MiB vs B 2.6-2.9 KB; best mean
+  261 us / 455 us / 5.15 ms vs 113 / 132 / 173 us. Note: RSS hides A's copies (allocator reuses freed seed blocks);
+  live heap (slates_mem::heap::stats().in_use) is the meter.
+- Ledger: A-790 (A-788 went to w-sessionlog). Branch agents/w-work-cow local (wip commit under a merge; land as ONE
+  fresh commit from origin/main). Baseline worktree ~/slates-work/w-work-cow-ab (delete after landing).
+- Landing notes: a shared target let the baseline worktree's slates-server look fresh to mine (one run tested A's
+  library); fixed by removing the baseline worktree and touching sources, every result after shows `Compiling
+  slates-server (.../w-work-cow-a790)`. main's b8c16aad7 (A-776 C1) re-asks the owner with `fetched.files` keys; it now
+  carries `fetched.lengths` keys too (the generated oracle caught it: UnknownBase on 8 shards). work_home merge with
+  A-697 f: `Need::Lengths` joins the holder-replica base reads.
+- Final focused run (main da2b52d3e + A-790, release, this Studio): lib work_files 3, work_charge 1, work_log 2,
+  work_home 2; tests work_edit_cow (+18,304 B live heap, 2,288 B/work), works_off_owner 16/16, mounted_work 4,
+  mounted_work_cow 1. Merged 60586cdd3 after (docs + engine additions only, none of my surfaces): not re-run.
+- Cleaned: worktrees w-work-cow, w-work-cow-a790, w-work-cow-ab; ~/.cache/w-work-cow-{ab-run,serve,logs}. Kept:
+  ~/.cache/w-work-cow-clone, ~/.cache/w-work-cow-target.noindex (1.3 GB), ~/.cache/w-work-cow-push (push scripts).
+- Next (not started): a rebase restates changed files whole (Rebased::changed full bytes; WorkFiles::from_changed) --
+  a work rebased after a one-byte edit of a 1 GB file holds 1 GB again. Pieces through the rebase would bound it.
+  mounted_work.rs ~389 `changed_span` materializes a changed file via `get` (w-work-mount's; told them len+page).
+
+## Close list (Ada's order 2026-11-20 16:20): C1 + P2 -- BOTH CLOSED
+- C1 = A-790 (0c5dd0cb5, main af045255b); close note pushed (bff98c3f9).
+- P2 = the grid (5aef5f02f, main f9c113ae9): 135 runs in BENCHMARKS; after 1.6-5.6 KB a work flat, before 1.5 MB-1.25 GB.
+- New finding -> GAPS only: a 1 GiB / 100k-file single submit stalls its shard past the liveness window (watchdog exit 4).
+- Cleaned: grid worktree, ~/.cache/w-work-cow-{grid-run,serve}. Kept: clone, target, push scripts.
+- Queue empty.

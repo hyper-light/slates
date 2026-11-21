@@ -42,3 +42,13 @@ Brief: briefs/w-realtools.md. Clone: ~/slates-work/w-realtools (object store), w
   Compiles locally (`--list` shows it). Run: kiln r7 (needs macos), queued -- Studio-4's NFS client is stalled; the
   balancer's macbook-pro-2 failed the repo sync 3x; adas-mac-studio.local and adas-macbook-pro.local went offline.
   Land it once its red/green is read; if green on APFS (birth times), the red case is a no-birth-time base (A-781 shape).
+- 17:05 PST: C1 CLOSED (316a046f3). C2-C4 CLOSED on macOS: 617c88102, 249f5177d, 7f53665a1; 4/4 green on
+  adas-macbook-pro-2 in 30.97 s. Linux FUSE and WinFsp runs are filed in run-requests.md. Runs go through my clone
+  ~/.cache/w-realtools-clone on adas-macbook-pro-2 (sync:false; kiln's sync to that runner failed 3 times).
+  Open in GAPS: the WinFsp port of the flows; memory pressure from a host actually short of memory.
+- 17:40 PST: WinFsp port LANDED 9793d9218 (+ GAPS 3620554c6); macOS 4/4 in 44.71 s. Windows and Linux runs filed.
+  Close list C1-C4 done. Branch agents/w-realtools deleted once landed.
+- 21:05 PST: close list done; nothing new is addressed to me. My Linux FUSE and Windows WinFsp run requests
+  (run-requests.md) haven't been run yet. Landed worktree removed. Kept: the clone ~/slates-work/w-realtools (to make a
+  worktree again if the first Windows build needs a fix), ~/.cache/w-realtools-target.noindex (4.7 GB), and
+  ~/.cache/w-realtools-clone on adas-macbook-pro-2. Studio-4's root-owned dead mount kiln-01a1f9e974cb... is still Ada's.

@@ -1,0 +1,95 @@
+# g228 -- progress (close-list item 85a: a live write adds < 50 us at the median and < 1 ms at p999 under load)
+
+## State (2026-11-20 ~17:20 PST)
+- My first piece (each shard on a live write's path opens its idle window) was already on main as A-396 ("the live
+  holds", landed 2026-11-18, before its A/B). Dropped: local branch agents/g228-live-write-adds-idle-window, never
+  pushed (for main to delete: nothing remote).
+- Working branch agents/g228-live-write-adds-holds-ab in ~/slates-work/g228-live-write-adds, base origin/main
+  b402afc7c. Only change: crates/cli/tests/live_fleet.rs, `measure_what_live_shipping_adds_to_a_stable_nfs_write`
+  now reads each daemon's CPU (process; Linux also the control shard's thread) over the stream, the 500 ms after it
+  and the second after that.
+- Running: A-396's owed A/B, holds (main) vs no holds (live_hold::hold asks nothing), release, 5 interleaved rounds,
+  alternating order. Linux: kiln r17 on adacachy. macOS: kiln r24 on adas-mac-studio.local-2 (CARGO_BUILD_JOBS=4).
+  Script: ~/.cache/g228/ab.sh (passed inline; refuses outside a slates checkout and under 60 GiB free).
+
+## A-396 A/B, macOS (adas-mac-studio.local-2, 32 cores, load 32-34, base b402afc7c, release, 5 rounds interleaved)
+Added at p50 / live p999, us:
+- holds (main):  511.9/4645.0, 516.1/1045.0, 596.0/1859.8, 477.9/1171.2, 454.0/859.8
+- no holds:      548.1/1615.1, 466.0/1408.9, 551.0/1721.2, 467.7/886.5, 455.1/956.8
+Every hold declined on macOS (hold.declined ~7,900 a run, A-387's predicate), so the arms are the same; idle CPU after
+the stream the same (10-60 ms a second a daemon, ps's 10 ms grain). The goal is ~10x off on this Mac: owner's round
+~433 us = exchange 297 + to_control 65 + build 38 + to_owner 28 + lane 4; the reply's wake 68 on top.
+Next A/B running (kiln r31): holds vs no holds vs forced (A-387's decline bypassed), each candidate's counters printed
+(hop.holder). Linux (r17, adacachy) is frozen by its cgroup freezer at load 80-89 (wchan do_freezer_trap).
+
+## Three-arm A/B, macOS (same Studio, load 31->16, b402afc7c + c1aabba): added p50 / live p999, us
+- holds:   234.2/707.7, 177.3/393.5, 179.9/402.0, 182.8/453.5, 167.7/400.3
+- noholds: 169.2/434.4, 184.4/416.4, 169.8/447.7, 187.3/491.9, 205.0/423.0
+- forced (A-387's decline bypassed): 297.7/534.1, 223.9/447.2, 236.6/502.3, 224.4/514.3, 294.2/585.5 -- rejected:
+  ~50 us worse, owner CPU in the stream 620 vs 380 ms. A-387's decline is right on macOS. p999 < 1 ms holds here.
+- Holder's serve ~10 us an entry (hop.holder): the 100 us exchange is transport and the two control shards' wakes.
+- hop.reply (the held NFS reply's wake after the fold, same shard) 65-116 us.
+
+## Reply-first fold (2fbc20496 on agents/g228-live-write-adds-holds-ab): the fold's follow-on work queued behind
+the replies it woke. Focused tests green locally (debug, base 56f33c6f6): a_fold_answers_... (16 deferred, 0 inline),
+a_live_writes_round_is_counted_hop_by_hop... A/B on 56f33c6f6 (Studio, load 9-11): hop.reply 88 vs 92 us a write --
+the hypothesis (the fold's tail held the reply) is NOT confirmed; added median 2,368-2,676 vs 1,312-2,967. Not landed.
+
+## NEW FINDING (blocks 85a): main regressed 13-16x between b402afc7c and 56f33c6f6 on the same Studio
+- Added at p50 2,305-2,967 us (one round 1,312) against 168-205 us; every daemon burns ~5.5 s CPU over the stream
+  (was 0.1-0.5 s); in rounds 3-5 the daemons spun 220-600 ms in the 500 ms after the stream and 760-900 ms in the
+  second after that (round 4): holds now KEPT on macOS at load 9-11 (asked ~8,000, declined 1,800-4,100; at load 15-33
+  all declined). Hold code unchanged in the range; live_ship.rs +2,072 lines (A-768 capture turns, A-763, the holder's
+  task 2d4bb1285, ...). Running (kiln r36): main56 vs noholds56 vs old (b402afc7c) to split holds from the rest.
+
+## LANDED 2026-11-20 ~20:40 PST: origin/main 5e3bc853a (branch agents/g228-live-write-adds-sweep)
+- 97fc6ed5a, 8a5aac20f: the live-shipping measurement reads each daemon's CPU (stream, 500 ms after, 1 s after; Linux the
+  control shard's thread) and prints each candidate's live counters.
+- 68b597dd8: A-744's sweep a status request arms runs on the shard's idle time (set_idle_work), spaced by its own length
+  (content_range.sweep.idle_slices, .spaced); test content_ranges::tests::a_status_requests_sweep_runs_on_the_shards_
+  idle_time_and_is_spaced_by_its_length. (The sweep's design status line rode in 343b741e8 by `git add -A`; the branch
+  was pushed, so it was not amended.)
+- 343b741e8: rt harvests its driver between idle slices; tests/idle_work_io.rs red before (accept never served in 5 s),
+  green after; idle_work.rs still green.
+- cdb0e80ab: BENCHMARKS (all rounds), GAPS 85a line.
+- Focused tests on the merged tree (macOS arm64, this Mac, local, own target): content_ranges 2/2, rt idle_work_io 1/1,
+  idle_work 1/1; fmt clean.
+- A/B (Studio, load 11-15): added 1,217-1,939 vs main 2,614-3,096 us; p999 2.2-3.7 vs 4.9-9.7 ms; 0 writes > 50 ms.
+
+## LANDED 2026-11-20 ~21:55 PST: origin/main 218256bab (main's ruling on the status-armed sweep, yes to both)
+- 7ac3900ee: DaemonStatus { memory } (wire change, no compat path; frames' schema hash refuses a mismatched build);
+  `slates status --memory`, Client::daemon_memory_status; a plain status does no residency work (red: 50 plain statuses
+  armed one sweep a shard, 398 and 177 steps; green: 0 and 0); the segment and content object whole from per-mapping
+  kernel figures (resident::of_mapping: macOS mach_vm_region top info 0.11 ms vs mincore 30-32 ms on a 32 GiB mapping
+  with 2 GiB written; Linux /proc/self/smaps; Windows the bounded walk only the asking request pays); slates-mem unsafe
+  budget 86 -> 87; the live-shipping measurement's status-burst sibling.
+- 8f1c22d70: BENCHMARKS. A/B (Studio, load 9-11): added 172-205 vs main 1,353-2,220 us; p999 342-445 us vs 2.7-7.1 ms;
+  under a status burst 178-293 vs 1,099-2,815 us; idle daemons 10-30 ms CPU a second vs about a core.
+- Focused tests on the merged tree: server --test daemon a_burst_of_plain_statuses 1/1; content_ranges 2/2; mem
+  resident 3/3; ipc --test status 3/3; cli args 41/41; fmt clean.
+- Run requests for main: the Linux smaps arm (resident::tests::a_mapping_read_whole_agrees_with_its_page_walk on
+  Linux), the Windows build of resident.rs's fallback arm, xtask unsafe (slates-mem 87), clippy.
+
+## 85a STILL OPEN -- blocked on main's decision (sent): a plain status request arms a tens-of-GiB mincore sweep on every
+shard (about a core per daemon for >1 s after a status burst; up to half a quantum per idle slice on the next message).
+Proposed: arm the background sweep only for a request asking for the memory report (a DaemonStatus field: wire change),
+and read the content object whole from per-mapping kernel figures (macOS vm_region extended info, Linux smaps) rather
+than a page walk. Rejected on record: holds forced on macOS (+50 us); reply-first fold (hop.reply 88 vs 92 us).
+
+## For main to delete (mine, landed or rejected)
+- remote branches agents/g228-live-write-adds-holds-ab (rejected fold 2fbc20496 + landed test commits),
+  agents/g228-live-write-adds-sweep (landed); local branch agents/g228-live-write-adds-idle-window (never pushed).
+- this Mac: ~/.cache/g228-local-target, ~/.cache/g228; worktree ~/slates-work/g228-land after this piece.
+- Studio d1323898: ~/.cache/g228-clone (kept for the next 85a run), ~/.cache/g228-*.sh, ~/.cache/g228-*-out.log.
+
+## Incidents (recorded honestly)
+- 2026-11-20 ~09:57-10:40 PST: two A/B runs started without `cwd` ran in the runners' home folders; the script's
+  `rsync -a ./` copied adacachy's home (73 GB) into ~/.cache/g228-ab-noholds-src before it was stopped; removed by exact
+  path on both machines. Fixed: runs pass cwd=<clone>; the script refuses outside a slates checkout.
+- r7's orphaned build on adacachy (after a runner restart) wedged with its output pipe unread; stopped by PID, its
+  leftovers deleted. Builds now log to a file only.
+
+## Next
+1. Read both A/Bs: added median, live p999, idle CPU after the stream (holds vs none).
+2. If the holds cost idle CPU or latency: fix in this piece (Ada: performance gaps fixed up front).
+3. Land the measurement change; BENCHMARKS table; GAPS line under A-396; inbox/main-from-g228-close.md when 85a holds.

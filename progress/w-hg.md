@@ -138,3 +138,36 @@
   12,143 MiB, held after; ssh and stream clones add nothing. r23 (vmmap + heap per phase, second HTTP clone) running.
 - Local target deleted (main, disk low): every cargo run now through kiln, no `on`.
 - NEXT: item 2 bound (red first), item 6 (forced new-head push over a moved line), item 4 S5 head texts.
+- 2026-11-20 afternoon, LANDED (each red first or held by a stock oracle; focused tests local):
+  - 46951a489: lookup and every whole answer get the fetch's room (clone-rev's PastAdmission).
+  - 648a46d1a: the changeset A/B example plus its BENCHMARKS section (counts and release timings).
+  - 75e2d3fb4: A-732 part 4, the intake hands each manifest append its predecessor's text (no chain rebuilds).
+  - dc59ef2a1: revision_text applies a chain into two swapped buffers.
+  - 6935d8e86: A-732 part 5, a replay unit takes steps until its slice is spent (vcs_store.hg_replay_turns).
+  - 13523dbe3: item 6(a) proven, a forced new head on a moved line held to stock 7.2's push -f.
+- OWED: the restart of hg's history measured again, release (r42 queued on adacachy; the Studios are unreachable
+  for sync). Item 6(b) (the lock-free rebase) waits on main's ruling. The changeset shape waits on w-store's arm.
+- 2026-11-20 evening, LANDED:
+  - f98d99685: a clone sends manifests as their stored deltas.
+  - bab805323: whole texts written into the answer once.
+  - Branch agents/w-hg-file-deltas-held (c9c3ef73b): the per-file arm, for w-store's A/B.
+  - Inbox notes answered: w-store's stored form, w-sizing's numbers.
+- WAITING: r42 (the restart and clone measurement, queued on adacachy; also in run-requests.md); main's ruling on
+  item 6(b); w-store's piece 3, before hg moves onto the changeset store (the C item, with R2's red test: an import's
+  committed content against the .hg's bytes).
+- 2026-11-20 ~19:00, C1 (main's 18:30 ruling: hg's side against the seam, the store behind a double; land on main
+  once w-store's wiring is there). Branch agents/w-hg-c1 (worktree ~/slates-work/w-hg-c1), each red/oracle-tested,
+  slates-hg lib 376/376:
+  - 446207514: the intake names each kept revision for the Texts section (path, node, text BLAKE3 and length, base
+    identity, place in the payload).
+  - 1420ec376: record v6, a push's record is its head alone, the changegroup the Payload section, replayed in place
+    (Replay::begin_sectioned).
+  - 2d6d17db0 + 287fc769a: crate::landed, the ChangesetLog seam, land_push (Record + Payload), Replaying a unit a
+    step; refusals by kind (Missing, Record, Unreleased).
+  - Next on C1: the server adapter (slates_store::Store as ChangesetLog) and hg_push::land / recovery onto it, once
+    w-store's wiring lands; the Texts section once w-perf's encoder lands.
+- R2: r43 placed itself on this MacBook (load 116) and was stopped (no measurement here). r42 is still queued on
+  adacachy.
+- ~20:50 C1 on branch agents/w-hg-c1: 3ffb95c4b (land first, v7 reference in the entry, replay from the store by
+  piece), a9620fbb1 (Texts section). By-use test blocked: the store refuses every landing on this Mac (memtable past
+  4 GiB; reported to w-store). Lands on main when it passes.

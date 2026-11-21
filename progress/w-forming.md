@@ -1,3 +1,27 @@
+# 2026-11-20 ~21:00 (w-forming), 85b C3: chaos run r7 (Adas-Mac-Studio.local, c9c9554d8): 7 targeted flows PASS with
+# every invariant held (replicas offline x3, volume failure x3, client disconnect); nemesis 0/3 on progress checks, no
+# safety violation. Seeds 1256052866610850298 + 5939796479076166087: install images dropped stale 1055/1055 under the
+# stream (my A-757 p5) -> FIXED bbdea3259 (db live red test). Seed 10263252121351842258: after a takeover in a lossy
+# phase the old owner's forwards were refused 571x (owner_location.route_dropped.refused), the new owner a never got
+# a write (durable stuck 906) -- forwarding, blocks C3; replay r16 queued (3 seeds + 2 fresh).
+
+# 2026-11-20 20:00 (w-forming): P4 image measured in release (kiln r9, M4 Max, load 5.7): 311 inodes / 55,654 B record,
+# image 26-36 us + encode 10.5-17 us in one turn. Asked main: (a) build the CoW reader-epoch hold, or (b) close P4 with
+# this measurement. C3 (r7) and the takeover A/B (r2) still queued on kiln.
+
+# STATUS 2026-11-20 ~17:30 (w-forming), Goal 85b under Ada's close order. C1 CLOSED 95adf9632, R2 CLOSED c922a41d1
+# (inbox/main-from-w-forming-close.md). C3 the chaos run: kiln r3 (macos/arm64; .git/w-forming-ab/c3.sh: nemesis x3,
+# replicas offline x3, volume failure x3, client disconnect) QUEUED -- fleet saturated. P4: delta reads sliced
+# (c9e00c01b); image: debug unit split 0.31 ms image + 0.28 ms encode for 311 inodes / 55 KB; release probe kiln r5
+# QUEUED; the hold across turns needs a CoW reader-epoch amendment (asked main, no ruling yet). Piece-4 A/B kiln r2 QUEUED.
+# Finding to GAPS (c9c9554d8): fleet a_live_whole_entry_is_sealed_in_turns... fails on main under load.
+
+# STATUS 2026-11-20 evening (w-forming), main's 15:20 list: (1) flake LANDED c922a41d1 (poll_for_live_periods; the
+# test is A-351's, not mine); (2) greens LANDED 95adf9632; (3a) delta capture in turns LANDED c9e00c01b; (3b) image
+# slicing needs a CoW reader-epoch amendment -- asked main; (4) release A/B running on kiln (run r1, linux/amd64,
+# .git/w-forming-ab/ab.sh: before 51a061d36, after 9a0b9e877, N=5 interleaved). Finding sent: fleet
+# a_live_whole_entry_is_sealed_in_turns... fails on main at Studio-4 load (2/2). Deleted probe target + old land target.
+
 # STATUS 2026-11-20 end (w-forming): main's three items DONE. A-768 586cf5035 (sliced capture, pins), A-771 cb1b698f0
 # (rebuild payload + archive hashing in steps), A-775 035df1690 via 419557ac6 (base b831a2877): a taken-over volume
 # given up while its cohort members were away is judged afresh once one is heard at a later incarnation (anchor:

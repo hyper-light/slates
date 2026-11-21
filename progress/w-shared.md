@@ -306,3 +306,49 @@ Queue (briefs/w-shared.md): 1. A-664 part 3's commit (g308) + follow-ons; 2. A-6
   local output ~/slates-work/g308-scratch/run-p3k.out.
 - NEXT on green: fresh worktree off origin/main, `git merge --squash agents/g308-a664p3c`, runs bullet, one commit, push.
   Then piece: mode fix (test ~/slates-work/g308-scratch/mode-test-for-next-piece.rs).
+
+## 2026-11-20 ~16:55 PST: CLOSE LIST order (Ada). Closed: inputs at B (f26544b65), sleep-and-look 1 (c03a8953b), 2 (54b9d8b2b);
+  inbox/main-from-w-shared-close.md. Working now: A-697 f (completion), in ~/slates-work/w-shared-a697f.
+  Lane note for item 4 (local, load 74, NOT a reported number; base 5d29b9572, agents/w-shared-lane 3421049f1): path MTU
+  reached 9209 (the 1.1 KB-datagram hypothesis is refuted); 64 MiB stops: window ~6800, pacer ~600, budget ~7340, credit 0,
+  goodput 34-60 MB/s; 4 MiB 18-476 MB/s. The congestion window bounds the lane on loopback: look at loss and cwnd
+  collapse next, on a quiet machine.
+
+## LANDED 2026-11-20 ~18:05 PST: A-697 part f = a9e789e54 (main 56f33c6f6): the hook deleted, the rule "replicated here",
+  the holding list fanned, and the takeover test. A-697 complete. Close report appended. NEXT (completion): A-658 3c, with
+  its scope question to main (inbox/main-from-w-shared-a658-3c-scope.md; building reading (A) unless told otherwise).
+  Then robustness: family three (kiln r6 queued), exit 4 (kiln r9 queued). Then performance: lane (congestion window),
+  A/B.
+
+## 2026-11-20 ~18:45 PST: leads recorded (no code yet; order is completion -> robustness -> performance)
+- A-658 3c: reading (A) moves no work out of git's decision step (judge and append share one step), so it would land
+  code with no effect. Asked main to choose: record it as blocked on the repository store's replication to holders,
+  or build (B). inbox/main-from-w-shared-a658-3c-scope.md. Worktree ~/slates-work/w-shared-a658-3c is clean
+  (no changes).
+- Exit 4 / record plane: cut_shipments rebuilds the version's inputs bytes (inputs_of) and the whole inputs archive
+  (chunk + BLAKE3) on every shipment pass, and each pass carries one archive slice, so the cost is size squared, all on
+  the owner shard. Suspect for exit 4 at 64 MiB; kiln r9 (macOS, 64/128/256/320 MiB) will name the spinning shard.
+- Lane (perf): UDP sockets keep the OS default SO_RCVBUF. macOS net.inet.udp.recvspace = 786,896 B (~85 datagrams at
+  the 9,209 B path MTU; net.inet.udp.maxdgram 9216); this Mac shows 11,411,409 datagrams "dropped due to full socket
+  buffers" since boot (all processes). Hypothesis: a congestion window up to 560 KB overruns the receive buffer, the
+  drops read as loss, and the window collapses (64 MiB stops: window ~6800). Test it with netstat -s -p udp deltas
+  around the bulk row, then size the buffer from the work (the path's bandwidth-delay product, up to
+  kern.ipc.maxsockbuf), on a quiet machine.
+
+## 2026-11-20 ~18:55 PST: main's ruling on A-658 3c: (A) not built; (B) stays on my list, sequenced after w-store's
+  A-767 server wiring lands. GAPS line landed (main 548e99440). NOW: robustness, family three (kiln r6) and exit 4
+  (kiln r9). Then 3c (B) once the store wiring is on main, then the lane and the A/B.
+
+## 2026-11-20 ~19:20 PST: family three widened and hardened before landing (agents/w-shared-sweep-3 731331eef, merged
+  with main): the unmount helper's exit (`reap`) is watched too; a refused watch is a typed refusal
+  (MountError::ExitUnwatched; unmount counted refused), with no tick fallback (banned second path). bridge-fuse suites
+  green locally except a pre-existing flaky handshake count (1 of 4 on a loaded Mac; GAPS line added). Linux green+red =
+  kiln r11. Exit 4 = kiln r9 (queued).
+
+## 2026-11-20 ~21:35 PST: kiln runs held, both still queued (not started)
+- r11: family three, Linux green + red (agents/w-shared-sweep-3 731331eef); needs linux/amd64, tool:cargo, cpus=8,
+  mem=16g, disk=40g. kiln: "queued; not linux 8 runners, machine under strain 1 (adacachy 451397fc...), no cargo 1".
+- r9: exit 4 reproduction (64/128/256/320 MiB holder submits, release); needs macos/arm64, cpus=8, mem=32g,
+  disk=60g. kiln: "queued; link down 3, haven't answered 3, not macos 3, under strain 1 (the big Studio d1323898...)".
+NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and their whole archive on every shipment
+  pass (size squared, one owner step each); building the fix with an RSS-bound test.

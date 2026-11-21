@@ -6873,6 +6873,12 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - What the logs show (C:\Users\corph\.cache\w-interop\matrix-git\anchor.log): the daemon was killed (exit 143) at
   12:42:43.98 and restarted as pid 470456. That is after the last row's log (ssh-fetch, 12:42:42), and the successor
   logged nothing before the run ended. No row log in logs\ holds the "Failed to connect" text.
+- Status (later 2026-11-20): kiln can't sync my worktree to jupiter (it times out at 60 s), so the test builds in a
+  clone of main 0916cf5b4 at C:\Users\corph\w-reaper-win, with target C:\Users\corph\.cache\w-reaper-target and log
+  C:\Users\corph\.cache\w-reaper-r60.log. The debug build had reached slates-cli when jupiter's runner restarted, and
+  jupiter has been offline in kiln since. To finish: `cd /c/Users/corph/w-reaper-win && CARGO_TARGET_DIR=/c/Users/corph/.cache/w-reaper-target
+  cargo test -p slates-cli --test vcs_edge_restart -- --nocapture`. The likely cause of the report is w-interop's own
+  teardown (4b335a696: Git Bash's kill ends the daemon, then the anchor with its held listeners), not a lost port.
 
 ## 2026-11-20, w-forming: A-771 rebuild in steps (main b831a2877; commit cb1b698f0, base a7df9ccf0)
 - clippy + xtask over `crates/cluster/src/sealed.rs` (RawOpening) and `crates/server/src/live_ship.rs` (Rebuilding steps, Laying, hashed_chunk).
@@ -6880,7 +6886,7 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - `cargo test -p slates-server --test fleet a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again` under full-suite load: failed once at fleet.rs:17261 (setup: cut && given_up) in a 32-test run, 3/3 alone.
 
 ## 2026-11-20, w-work-cow: a work costs its divergence, the grid (main baa470b90; commit 819341ab4)
-- Grid, release, macOS arm64 Mac Studio (and Linux): `for f in 1000 10000 100000; do for b in 1024 65536 10240; do for w in 1 10 100; do SLATES_WORK_COW_FILES=$f SLATES_WORK_COW_FILE_BYTES=$b SLATES_WORK_COW_WORKS=$w cargo test --locked --release -p slates-server --test work_cow -- --nocapture | grep work_cow:; done; done; done` (pick f x b for 1 MB to 1 GB greens). Red = the assert fails, or per-work resident or time grows with the green's size.
+- Grid: DONE by w-work-cow on the Mac Studio (P2, 5aef5f02f, BENCHMARKS); Linux run of the same grid still welcome, not owed.
 - clippy + xtask over `crates/server/tests/work_cow.rs`.
 
 ## 2026-11-20, w-work-mount: mounted works end to end (A-774; main 089bc78a0, commit a2415c930)
@@ -6897,3 +6903,107 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 
 ## 2026-11-20T23:45Z w-realtools main d5a465908 (A-781: without a birth time, an unchanged base file keeps its number across a takeover)
 - Command: `cargo test --locked -p slates-vfs --test base_identity --test base`. Platforms: Linux x86_64/arm64 and Windows x86_64 (the base plane's host differs; the sim tests are portable). Red: a without_birth_times test failing, or A-151's guards (a reused number passing for the old file). Who: w-realtools.
+
+## 2026-11-20, w-work-mount A-774 part 2 (f6660f0ab, main 7f8eb5cbb)
+- clippy + xtask over crates/vfs/src/host/tree.rs, crates/base/src/base_host.rs (new Tree variant), crates/server/src/{green_tree,mounted_work}.rs, nfs.rs/fuse.rs lend sites; Linux FUSE: `cargo test -p slates-server --test fuse_mount` (red: a mounted work's FUSE read refused).
+- Finding by observation, not chased: debug `--test mounted_work_cow` was killed once of 4 by the daemon watchdog (shard 0 spun 3.6 s CPU without a step against 3.57 s; load 11.7 on this MacBook) while seeding a 64 MiB green in one submit; work_cow.rs seeds the same. Release runs never tripped it.
+
+## w-sessionlog (2026-11-20 ~17:45 PST), A-788 / A-782
+- [DONE by w-sessionlog 16:40, see inbox close note] Python SDK: maturin build crates/sdk-python, then `SLATES_DAEMON=<slates binary> python -m unittest crates/sdk-python/tests/test_sdk.py`
+  (macOS + Linux). Red: test_lifecycle_round_trip_over_a_live_daemon fails at the `session_log` block or
+  test_module_exposes_the_client_surface lacks `session_log`.
+- [DONE by w-sessionlog 16:40] Node SDK: build the napi addon, `node --test crates/sdk-node/tests/sdk.test.mjs` (macOS + Linux). Red: `sessionLog` missing
+  from Client.prototype or the collided-work assertions fail.
+- Cross-platform compile of A-782's touched crates (server, client, api, mcp, sdk-node, sdk-python) on Linux and Windows:
+  red = a cfg arm still matching `Submitted`/`Outcome` without `Identical`. Plus clippy on the same crates.
+
+## w-provision-gate, A-786 (landed 2c8f89de6, 2026-11-20): R9's provisioning gate into CI (for w-lint and main)
+- CI wiring (.github/workflows/ci.yml): a job on a reference runner the lane can own (nothing else scheduled beside it):
+  `cargo xtask ratchet --provision` (first time on that machine: `--record`), then `PROVISION_BENCH_LOAD=2 cargo run
+  --release -p slates-client --example provision_bench`; upload target/provision-histogram.tsv as an artifact every run.
+  Red = a `REGRESSION` row, an `ac-2.1 ... FAIL` line (floor or loaded bound). The loaded bound is RED on main until
+  A-786 part 2 lands (macOS 1.62 ms vs 0.87 ms) -- wire it as allowed-to-fail until then, or hold the loaded step.
+- clippy on slates-client (examples) and xtask for 2c8f89de6 (macOS, Linux, Windows); provision_bench builds on Windows
+  (`spin()`'s parent check is cfg(unix)).
+- Linux x86_64 and arm64 measurement: `PROVISION_BENCH_LOAD=2` provision_bench on a many-core Linux box (the 2026-10-20
+  x86 host if it exists): the `tail:` lines name daemon vs client part; Linux's epoll_wait(0) does not nap, so its
+  1.6 ms is another hop -- report the tail split per run.
+
+## 2026-11-21T01:00Z w-realtools main 7f53665a1 (C2-C4: real tools across a snapshot, a takeover and memory pressure)
+- Linux x86_64 and arm64 (FUSE): `SLATES_TEST_CLI=1 cargo test --locked -p slates-cli --test real_tools -- --test-threads=1 --nocapture` (needs fusermount3, cc, make, cargo, git, mkfifo; mount under $HOME on Ubuntu 26.04's AppArmor). Red: the #pragma once compile failing ("redefinition of 'struct once'"), an untouched file's inode number or times moving, make -q out of date, cargo printing "Compiling", or git status non-empty after a snapshot, the SIGKILL takeover or the injected pressure. Also run once with the base on tmpfs (no birth time on older kernels): A-781's case.
+- Windows x86_64 and arm64 (WinFsp), main 3620554c6: `SLATES_TEST_CLI=1 WINFSP_TEST_MOUNT=1 cargo test --locked -p slates-cli --test real_tools -- --test-threads=1 --nocapture` (needs WinFsp, cargo, git on PATH). First Windows build of this file (I compile macOS only, §8): a compile error is mine to fix. Red: an untouched file's file index, LastWriteTime or ChangeTime moving, cargo printing "Compiling", or git status non-empty after the snapshot, the TerminateProcess takeover (waits for winfsp.adopted to rise) or the injected pressure. Who: w-realtools.
+- 2026-11-20 w-shared A-697 (1) holder inputs never shipped back (main fb692bdd5): clippy + xtask (server merge_service hold_composed_inputs/inputs_held_by/INPUTS_CHUNKS_SHIPPED, work_home computed_request, verbs judge_submission); Linux run of `cargo test -p slates-server --test fleet a_holders_composed_inputs_are_never_shipped_back_to_it` (red: chunks shipped for B's version > 0).
+
+## 2026-11-20, w-work-mount A-774 part 3 (f401f798c, main 5d29b9572)
+- clippy + xtask over crates/land/src/{engine,manifest}.rs (Landing<'a,'b,H>, Beginning::unit_over/materializing, LandingRun::step_over, PlanWalk basis), crates/vfs/src/base.rs (DivergedWalk.whole), crates/server/src/landing.rs (base_is_target/over_tree), crates/server/tests/green_landing_cow.rs.
+- Suites touched: `cargo test -p slates-land` (whole), `cargo test -p slates-server --test snapshot_landing --test presentations --test write_policy --test signed_work` (landing paths now branch on a tree overlay). Red: any landing refusal or mismatch.
+
+- w-sizing, A-789 (362bd8c39), 2026-11-20: provisioning A/B on a QUIET macOS machine (r26 ran at load 44-79). Release
+  `provision_bench`, A = 1b63ab896 (extents as ranges), B = 3f24e4fea (extents of their own), interleaved, 3 rounds,
+  all N. Red: B's 1-client spinning p99 above A's beyond the rounds' spread.
+- w-shared, A-697 part f (a9e789e54, main 56f33c6f6): the whole `slates-server --test fleet` suite on macOS and Linux,
+  plus loadtest-scale's three-node rungs. Production routing now serves a green's works on every node that replicates
+  it, so any test whose client on B created a work over A's green and expected the work on A may change. Red: a test
+  asserting a work id names the green's owner while its client was on another node.
+
+## 2026-11-20, w-work-mount A-774 parts 4-5 (9d73a77c6, 1b0f5679c; main 64bbc241f)
+- clippy + xtask over crates/server/src/{mounted_work,verbs}.rs (rebuild_volume's tree pin, rebuild_mounted, tree_owner).
+- Suites touched: `cargo test -p slates-server --test recovery --test daemon` (recovery now rebuilds a mounted work's slot); `--lib recover` passed 25/25 here. Red: a recovery refusal or a work NotRecovered.
+- Main's order 4, owed to main: real editors on kernel mounts of works. macOS (root): `slates attach <work>` then `mount_nfs` the capability path; ten works over one green; per mount run `vim -es -c '3s/.*/editor N/' -c wq f3` (temp+rename save), `sed -i ''`, and `python3 -c` write-then-os.replace; then `slates submit` each, grant via the CLI, land; red = any verdict other than the in-process test's (tests/mounted_work.rs) or landed bytes != oracle. Linux the same with `mount -t nfs -o vers=3` and FUSE (`slates mount --fuse`). Gate it as `mounted_work_kernel` on SLATES_TEST_MOUNTED_WORK_KERNEL=1 when main schedules it.
+
+## 2026-11-20, w-work-mount C1/R4 (77fcae73a, 60a71db8a; main 56e44c7f8)
+- Linux (FUSE): `cargo test --locked -p slates-server --test fuse_mount a_work_mounted_through_fuse` on a host with
+  fusermount3 and /dev/fuse. Red: a read of `f` refused (the tree host not lent) or the submit not Accepted with TWO in
+  the green's head.
+- Windows: build `cargo test --locked -p slates-server --no-run` (winfsp.rs's tree lend, cfg(windows), never compiled on
+  macOS), then `cargo test --locked -p slates-cli --test winfsp a_work_mounted_through_winfsp` with WinFsp live. Red: a
+  compile error in crates/server/src/winfsp.rs, a refused read through the drive, or the save missing from the head.
+- Suites (main's): `cargo test -p slates-server` integration targets nfs_mount, snapshot_landing, presentations,
+  recovery, daemon, fuse_mount (Linux); `-p slates-land` whole; clippy + xtask over the A-774 files.
+- Note: at 15:30 my `cargo build -p slates-server --tests` built every server test binary into my target on Studio-2
+  (25 GB); deleted whole by exact path; since then only focused --test targets, CARGO_PROFILE_TEST_DEBUG=0 (3.2 GB).
+
+## w-hg, 2026-11-20 ~18:00 PST: restart replay and clone of hg's history, release (after 6935d8e86, f98d99685, bab805323)
+- **What:** prove A-732 parts 4 and 5 and the clone's manifest deltas by use.
+- **Platform:** any runner with 8 CPUs and 24 GB and Mercurial's repository at hand. On adacachy, pull it in pieces:
+  `hg pull -r N` in steps of 2,000. Whole clones from mercurial-scm.org aborted "incomplete response" there 3 times.
+  The big Studio has it at ~/.cache/w-hg-mem/hg.
+- **Command:** kiln r42's script (queued by needs linux/amd64; in w-hg's session). Release `slates`; push hg's whole
+  history over HTTP; `kill -9` the daemon; read the anchor log's "shard 0 initialized in ... longest slice" and
+  `vcs_store.hg_replay_turns`; then a plain clone, timed.
+- **Red would look like:**
+  - a recovery slice past the step quantum (r2 had 265-277 ms), or recovery CPU near r2's 130 s;
+  - "killing it" in the anchor log;
+  - the clone no faster than r14's 42 s quiet (the manifests are now deltas).
+
+## 2026-11-20, w-work-cow: A-790 a work's changed file is pieces over its base (main af045255b; commit 0c5dd0cb5)
+- clippy + xtask over crates/server/src/work_files.rs (new Held/Piece, indexing-free), work_home.rs, work_log.rs, work_charge.rs, verbs.rs (owner_lengths, post-state copy), tests/work_edit_cow.rs.
+- Linux/Windows: `cargo test --locked --release -p slates-server --test work_edit_cow -- --nocapture` and `--test works_off_owner`; red = live heap past the bound (a copy per work) or the generated history differing on 8 shards.
+
+- w-sizing, R2 Windows (A-789's Windows shape; main 18:40; for w-lint when jupiter is back), branch/commit on main once
+  landed (see progress/w-sizing.md). On Windows x86_64 (jupiter), from the landed commit:
+  1. Build + lint: `cargo clippy --workspace --all-targets -- -D warnings` (new Windows-only code: crates/mem/src/shared.rs
+     make_section/from_section, crates/server/src/content_extents_windows.rs, anchor_hold_windows.rs hold_extent/
+     release_extent + adopt, content_pool.rs cfg(windows) arms, cli tests); `cargo xtask unsafe` (mem 86, server 9).
+  2. `cargo test --locked -p slates-anchor --lib handles:: held_windows::` and `--test handles_windows`.
+  3. `SLATES_TEST_CLI=1 cargo test --locked -p slates-cli --test cli -- a_freed_content_extent_gives_its_commit_back_on_windows
+     a_content_extent_outlives_a_killed_daemon_on_windows --nocapture --test-threads=1`.
+     Red would look like: commit after the destroy within N/4 of with-burst (extents kept their commit), or the read after
+     TerminateProcess differing / refused (an extent's section not held across the restart).
+  4. RED-FIRST CHECK: run 3 also at the commit before this piece (origin/main before it) -- the commit test must fail
+     there (each extent a range of the content section; commit kept), the restart test must pass (guard).
+- w-shared, lane instrument (3a9e5bf21): on a quiet Mac (load < 4), release:
+  `REPLICATION_BENCH_BULK_MIB=4,64 target/release/examples/replication_bench 200`, with `netstat -s -p udp | grep
+  "full socket"` read before and after. What it would show: if the window stops come with a rise in full-socket-buffer
+  drops, the receive buffer is the lane's bound.
+
+## 2026-11-20, w-reaper: A-645 (a), svn's revprop rows by use (lands as the commit after b7cfb02fc; see the A-738 design entry, "fifth piece")
+- macOS with stock Subversion 1.15 and room to build (Studio-1 has svn 1.15.0 but 693 MB free):
+  `SLATES_TEST_CLI=1 cargo test -p slates-cli --test svn_interop -- a_repository_policys_hook_lets_stock_svn_change_a_revision_property a_revision_property_change_without_a_hook --nocapture`.
+  Then w-interop's matrix revprop-svn and revprop-ssh rows (an anchor given `--vcs-store DIR`).
+- Linux the same: the view mounts through FUSE (`fusermount3`), and `crates/server/src/fuse.rs`'s turn change is
+  compiled only there. Clippy for Linux, please (`fuse.rs` `turn_with`'s `lent_if` closure).
+- Red would look like: E200007 with `UNGRANTED_WORDS` (no --vcs-store given), or "could not show this repository's hook
+  its repository: ..." naming the step (the view volume refused, the mount helper refused or past its bound); the hook's
+  `svnlook youngest` writing nothing or not `1`; `slates unmount <store>/project.svn` failing.
+- 2026-11-20 w-fed-faults goal 91 (kiln main 73712cc): owed (main's Linux lane): Linux x86_64 `SLATES_FLEET_FAULTS=1` runs of slates_fleet_faults' w7_a708_a_runner_cut_off_..., w7_a708_a_slow_lossy_link_... and w7_a_move_whose_target_is_cut_off_midway_... (macOS PASSED; killed, restarted, partitioned PASSED on adacachy). Build once, run the test binary directly per flow: a second cargo test there rebuilt kiln for an hour.

@@ -266,3 +266,35 @@
   sets). 16:05 LANDED 5c6327b8e (replay reads its pack in place: v1.5.0 rebuild RSS +189.6 MiB -> +0.1 MiB).
 - Waiting on main: pack homing as content before the append (19 ms apply). Studio release target
   ~/.cache/w-git-target-rel.noindex still there for diags; delete when the memory work ends.
+- 16:20 landing step split further: apply = greens commit 1.7 + recorded_entry (work encode) 3.3 + record_all (db
+  write of the 11 MiB entry) 18.3 ms. Took main's 14:20 note (landed half stays with w-store) as the answer to the
+  pack-homing question; sent w-store the numbers (inbox/w-store-from-w-git-entry-apply-2026-11-20.md).
+- 16:40 MAIN'S ORDERS (inbox w-git-from-main-priority, 15:55): 1 partial clone regression -> LANDED 7b66e7225
+  (kind_at from landing kind runs; size only when filter reads it; daemon CPU/partial 740 -> 300 ms). 2 v4 pack
+  homing (inbox w-git-from-main-pack-homing): IN PROGRESS. 3 commit 14 ms: done earlier (ccd07b58c).
+- v4 PLAN (interface sent: inbox/w-store-from-w-git-v4-payload-2026-11-20.md):
+  B. rows by pack place first: staging puts the push's pack as one content (a window a unit, before census);
+     object rows: contents [pack identity] + payload offset (ObjectRow.offset); Repository::read_object(store,row,
+     content) via packed::read (Repository-owned Scratch/Recent, budget learned); readers: views IndexedObjects,
+     graph bytes_of, store/upload whole objects + hook_view Object{content}, encoding.rs, derived tree/commit;
+     Push::put_placed/Step::Putting go away. Store per v1.5.0 push 309 MiB -> ~10 MiB + rows. Record unchanged.
+  A. then record v4: record names pack (identity,len) + names (identity,count) homed via vcs_store::homes; replay
+     reads pack via content store PackSource; v3 removed (no second path).
+- 17:40 v4 part B LANDED 92f7a756b (rows by pack place; v1.5.0 store 309 -> 14.1 MiB). Reported to main inbox.
+- v4 PART A PLAN (in progress, worktree ~/slates-work/w-git-land9):
+  A1 record.rs VERSION 4: head, moves, names (identity,count), payload (identity,len); no inline pack. v3 writer AND
+     reader removed (main: no second path); v3 tests -> v4.
+  A2 SealedPush: packed: Option<(ContentId,u64)>; record() writes v4 when names and pack both homed, else v2.
+  A3 git_push Homing: Due -> names Asked -> homed -> PackDue -> pack Asked (push.pack() bytes) -> homed -> Done;
+     edges (vcs_http git receive, vcs_ssh receive, git_push tests driver) call take_homing/homed in a loop.
+  A4 replay v4: names from content; pack read from the content store by identity (GitReplay chunks from windows;
+     replay_pack whole via object_bytes); record holds the pack content as v3 held names.
+  Measure: v1.5.0 landing step (entry apply 18 ms -> ~0) and record bytes; red: no step past the quantum landing v1.5.0.
+- 18:35 v4 PART A LANDED 7a52ef882 (merge 33f17ba0d), tested at c20861789 over ed021dc42 (git 582, server 166 ok).
+  Close note: inbox/main-from-w-git-close.md (P4 7b66e7225, P5 ccd07b58c+15917f29a closed; C1 part done, C5 with
+  w-store left). Worktrees land9/land10 removed; branches v4a, v4a-land, memdiag, decodediag, a665p4 deleted; Studio
+  release target and diag worktrees deleted. Mac worktree now: ~/slates-work/w-git-state (state branch) only.
+- R2 (edge tests under load) IN PROGRESS: repro r139 at load 78-83, 8x the three tests: 19/24 fail, all in the PUSH's
+  chunked body (daemon_edge.rs:571 -> chunked_body), not the fetch. Suspects: Receive::answer_until awaits that skip the
+  keepalive deadline: turns::take, home_in_region (names + pack), names_committed_within. Diag r140
+  (~/.cache/w-git-diag/r2_patch.py, never for main) times each.

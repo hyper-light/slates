@@ -34,3 +34,39 @@ Pin + no-CLI clauses hold (w-k90-pin's audit). Left: CI evidence per platform at
 - kiln lanes: linux-x86_64 leg 01a1fa8f0de8 'running' but waits 'capacity' on 451397 (steps pending ~2.5 h);
   macos-arm64 attempt 2 running on d13238; linux-arm64 + win-arm64-cross queued 'headroom'.
 - Worktree ~/kiln-work/w-k90-pin-2-land (landed; remove when done).
+
+## ~16:10 PST
+- LANDED kiln 5264caaa3 (merge-base confirmed; base 5264caaa3): build job's Report annotates `error` blocks first
+  (run 44825381107, 63da2c592: windows-latest + windows-11-arm (clippy, build) red exit 101, annotation full of
+  vendor/slates fetch_update warnings, error unseen). Validated 0 diagnostics.
+- GitHub: run on c0f576eb3 (44830441910) pending behind 44825381107 (63da2c592, old 120-min slates timeout); the next
+  started main run carries both fixes.
+- kiln lanes WEDGED ~4 h: linux-x86_64 leg 01a1fa8f0de8 and macos-arm64 attempt-2 leg 01a1fae6520e both 'running' with
+  every step pending (no checkout); mac leg's routing says held for cec37f (room=true, room_at long past) yet never
+  starts. linux-arm64 + win-arm64-cross queued 'headroom'. Told main (scheduler, needs a person's look).
+
+## ~16:20 PST
+- 44825381107 (63da2c592) done: Windows (clippy, build) red in the Clippy step only (Build ran); windows-11-arm slates
+  cancelled at 120 in the integration step again; macos-latest slates cancelled in lib tests. Old timeout.
+- Watching GitHub run 44841298533 (4aa0ee778, contains 5264caaa3 + c0f576eb3 + 08f1a434): poller
+  ~/kiln-work/w-k90-pin-2-logs/poll.sh 44841298533 (background).
+- kiln legs still wedged (no change in another 25 min).
+
+## ~16:55 PST
+- 44841298533 (4aa0ee778): ubuntu-24.04-arm slates build ended exit 143 at ~22 min even with the disk step -> memory
+  (systemd-oomd on a 16 GB runner). LANDED kiln e763e394f (merge-base confirmed, base e763e394f): Linux lanes stop
+  oomd, 16 GiB swap, CARGO_BUILD_JOBS=2. Validated 0 diagnostics.
+- Still watching 44841298533's macos-latest / windows-11-arm / ubuntu-latest slates and w-k90-win's windows-slates.
+
+## ~19:00 PST (03:00Z)
+- GREEN macOS arm64: GitHub run 44841298533 (kiln 4aa0ee778, contains 08f1a434's vendor/slates pin), job 136653837819
+  `macos-latest (Slates build and tests)`: build 39 min, `--lib workspace::slates` 73 min, `--test vendored --test
+  slates_roles` 24 min, all success.
+- windows-11-arm job 136653837913: build OK, lib Slates tests OK, `vendored`/`slates_roles` FAILED exit 101 (no readable
+  detail). LANDED kiln eb7194f00 (merge-base confirmed, base eb7194f00): slates job Report step annotates failed tests.
+  Repro started: kiln run r145 (needs windows: jupiter, own target ~/.cache/w-k90-pin-2-target) `--test vendored --test
+  slates_roles`; queued (jupiter link down).
+- ubuntu-latest/ubuntu-24.04-arm on 4aa0ee778 red (before e763e394f's memory fix).
+- Clippy red on Windows/Linux (all clippy legs): crates/kiln/src/workspace/container.rs:301 `crate::rt::sleep` is a
+  disallowed method (A-520 piece 5, w-k90-containers'). For main / lint keeper.
+- Poller bebez30pl stopped at its 2 h limit.

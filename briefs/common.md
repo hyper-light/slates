@@ -81,8 +81,11 @@ Never put a number in a commit for main that you haven't pushed to the ledger.
   - adas-mac-studio-2.local and adas-mac-studio-3.local push to GitHub over SSH. Use
     `git remote set-url --push origin git@github.com:hyper-light/<repo>.git`.
   - adas-mac-studio.local-2 (the 32-core Studio) has no GitHub credentials (SSH publickey denied, no HTTPS
-    credential). Land from it through kiln `run` on adas-mac-studio-2.local, as w-fed-faults does: sync your worktree
-    there, then `git push origin HEAD:main` and check `git merge-base --is-ancestor`, retrying if the push is rejected.
+    credential). Since 2026-11-20 ~18:00, kiln refuses runs on adas-mac-studio-2.local (draining), so land from the
+    32-core Studio through adas-mac-studio-3.local, with a bundle over stdin and no sync (main 20:55):
+    `git fetch origin && git merge origin/main`, rerun your focused tests, then
+    `git bundle create - origin/main..HEAD | ~/.local/bin/kiln run --on adas-mac-studio-3.local --no-sync -i --timeout 300 -- 'set -e; d=$HOME/.cache/<you>-push; [ -d "$d" ] || git clone -q --filter=blob:none --no-checkout git@github.com:hyper-light/slates.git "$d"; cd "$d"; cat > .git/in.bundle; git fetch -q origin main; git fetch -q .git/in.bundle HEAD:refs/<you>/tip; git push origin refs/<you>/tip:refs/heads/main; git update-ref -d refs/<you>/tip; rm -f .git/in.bundle'`.
+    A push refused because main moved: merge again, retest, resend. Then check `git merge-base --is-ancestor`.
 
 ## NAMING A BRANCH WITHOUT CHECKOUT (main 2026-11-20 ~01:20 PST: two agents ran `git checkout -b` tonight)
 `git checkout` and `git switch` stay banned, including `-b`. To name your work as a branch, use `git branch <name>` (the
@@ -217,3 +220,19 @@ slates' CLAUDE.md §8 (Ada, 2026-11-18, "binding on every agent and subagent, fo
 - **The one addition, from Ada 2026-11-20 ("make your agents do A|B testing and back their decisions with data"):** a
   design decision between competing shapes is settled by the agent's own A/B: release builds, interleaved, all N
   shown, built as a measured example where possible (w-hg's changeset_ab.rs).
+
+## CLOSE THE OPEN ITEMS (ADA 2026-11-20 ~16:05-16:15 PST; binding)
+Ada: "stop FUCKING doing that and ensure they close the existing fucking items"; "anything you have currently added
+up until now gets closed, but no more new"; "the large message I sent you (the Codex/ChatGPT analysis) also needs to
+be closed"; "as well as the changeset work and integration in full"; "prioritize implementation/completion first,
+then robustness, then performance". Main had let UI parts gain new open items as fast as old ones closed; only one UI
+part closed between 07:20 and 16:00.
+- **Your queue is fixed: what you have been given up to now, and nothing more** (briefs/close-list.md names each
+  agent's items). Everything on it gets closed; nothing is dropped and nothing is added.
+- **Order: completion first, then robustness, then performance.** Build what's missing before hardening it, and
+  harden it before speeding it up.
+- **A new finding** (a bug, a gap, a faster shape) goes to docs/wip/GAPS.md and your progress file. It isn't worked
+  and isn't added to your queue or any UI part, unless it blocks an item already on your list.
+- **When an item closes**, write inbox/main-from-<you>-close.md: the item, the commit on origin/main, the test or the
+  measurement. Main marks the UI part met the same check.
+- Main adds no new open items to UI parts and gives no new pieces beyond the close list.

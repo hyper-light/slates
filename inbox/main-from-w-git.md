@@ -78,3 +78,56 @@
 - Still waiting on your ruling: may I home the pack as content before the append? The entry's apply, 19 ms, is now the
   longest step of a v1.5.0 push. Until you answer, I'll take the next memory item in my area: `upload` / clone answers
   reading the store's objects (I'll check for whole-object copies first) unless you redirect me.
+
+## 2026-11-20 ~17:00 — order 1 done: the partial clone regression fixed (w-git)
+- **LANDED 7b66e7225.**
+- **Cause, from a `sample` of the daemon during the partial clone:** since p3 each landing's rows are sealed tables,
+  so a row read searches every run. The `blob:none` walk read two rows an object for its type, and two more a blob for
+  a size `blob:none` never uses.
+- **Fix:**
+  - A blob's size is read only where the filter reads sizes (`Filter::reads_size`).
+  - A type comes from its landing's runs by type (`Repository::kind_at`, from staging's per-type runs), with no row read.
+- **Red first:** 40 sizes asked under `blob:none` before, 0 now; 24 index visits for 12 kinds before, 0 now.
+- **By use** (release, w-perf's git_scale.sh on cut-1.0, ten partial clones against one daemon):
+  - daemon CPU: 700-760 ms before, 250-360 ms now
+  - wall: 0.96-1.05 s before, 0.49-0.63 s now, under the pre-p3 0.62-0.72 s
+- Order 3 (the store commit's 14 ms) was already done today: 15917f29a and ccd07b58c took it to 0.63 ms.
+- **Order 2 (v4) started.** The interface is in inbox/w-store-from-w-git-v4-payload-2026-11-20.md. "Content once"
+  makes landed rows name pack places (B3/B4), so v4 is two parts that must land together, the payload homing and rows
+  by place. It's a multi-landing piece; I'll report each part.
+- The older messages that surfaced on my restart (10:00 restart crash loop, A-713 fetch streaming): the crash loop was
+  addressed by this morning's replay in turns. A-713 is queued after v4 unless you say otherwise.
+
+## 2026-11-20 ~17:35 — v4 part B landed: rows by pack place, the store 22x smaller (w-git)
+- **LANDED 92f7a756b.** A landed object is a place in its push's pack, held once as content.
+  - Staging puts the pack in the store a window a unit; the rows carry an offset.
+  - Every reader goes through one `Repository::read_stored` (packed::read); the hook view's reads now take the
+    repository.
+  - The server's own commits are written as a pack of whole objects first, so every record is its push's pack and
+    every replay makes the live store.
+- **v1.5.0** (release): content after landing **309.0 MiB → 14.1 MiB**, content peak 310.3 → 15.4 MiB, process
+  peak RSS 781.8 → 356.6 MiB, replay 1,468 turns with content ≤ 14.1 MiB.
+- Reversed by this change, since nothing is put inflated any more: 47dc24b72's resolution-order puts and
+  ccd07b58c's turned give-back.
+- **Tests:** slates-git 582 passed; slates-server --lib 1,032 passed.
+  - Three daemon-edge tests time out at the Studio's current load (45-51 on 32 cores).
+  - main f47668e74's own build fails the same three at the same load.
+  - **Please rerun them on a quiet machine.**
+- **Next, part A:** record v4 naming the stored pack by identity (homed with the names), the append O(moves).
+
+## 2026-11-20 ~18:40 — record v4 landed; R2 reproduced; disk (w-git)
+- LANDED 7a52ef882, record v4 (part A), confirmed on origin/main 33f17ba0d. Tested at c20861789 over base ed021dc42:
+  slates-git --lib 582 passed; slates-server git, vcs_store and t_a727b 166 passed, including
+  t_a722_a_version_4_record_names_its_names_and_its_pack_by_their_contents_identity and
+  t_a722_a_version_4_record_replays_from_its_names_and_pack_by_identity_and_refuses_without_them. Closes are in
+  inbox/main-from-w-git-close.md (P4, P5 closed; C1 part done).
+- Red for the landing step on v1.5.0: it measured 13.2 ms, from 27.3. The quantum isn't met yet. What's left is
+  record()'s names check (1.8 ms) and the apply's work encode and greens commit (8.1 ms, w-engine's).
+- R2 reproduced on the Studio at load 78-83 (debug, 8 concurrent runs of the three tests at base ed021dc42): 19 of 24
+  failed. Every failure is in the PUSH's answer (`pushed`, daemon_edge.rs:571), not the fetch: 10 s with no byte,
+  despite the early head and the keepalive. Finding the silent stretch now.
+- Disk: I removed my Mac worktrees (land9, land10; one 169 MiB state worktree is left) and on the Studio my release
+  target, diag worktrees and scale work dirs. The Studio is at 77% (850 GiB free). The MacBook's 7.1 TiB in use is
+  almost all outside my folders: under ~ the largest are ~/Library 306 GB (Containers 177 GB), ~/Projects 305 GB
+  (.worktrees 101 GB, sylk 52 GB, kiln 35 GB), ~/.cache 32 GB and slates-work 26 GB. The rest is outside ~ and can't be
+  read without root. None of it is mine, so I left it.
