@@ -109,3 +109,10 @@
 - GitHub run 44851246181 job 136703754349 (4f5e58c1b): slates_e2e 25/25 incl. both bare_metal drives.
 - mod bare_metal is cfg(any(unix, windows)).
 - Follow-up in flight: workspace::tests w2/w7 '/'-joined expectations fail on Windows (98/100) -> fb3460e9e, jupiter r4.
+
+## 2026-11-20 ~21:45 PST: C1 met in kiln (goals_done 01a1fa369a1c76f99a79a44a1fcf1f98); follow-up state
+- Finding (not C1): kiln workspace::tests w2_/w7_ hard-code Unix paths, fail on Windows (CI job 136703754349 98/100).
+  Fix on branch agents/w-k90-win-wst2 9ebc11e5d (host-spelled paths). jupiter r5 (first version): w2 passes on Windows,
+  w7 failed because '/Users/..' isn't absolute on Windows (rehomed correctly skips it) -> 9ebc11e5d gives w7 drive-letter
+  paths there. Its jupiter run (r7) was lost to the kiln server dropping; not yet green on Windows, not landed.
+  Next: re-run `cargo test -p kiln --lib -- workspace::tests::` on jupiter at wst2, then land as its own commit.
