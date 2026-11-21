@@ -17,6 +17,8 @@ mantle-crc = { path = "../../vendor/mantle/crc" }
 # The engine the store's rows live in (vendor/mantle; A-767 item 3).
 mantle-engine = { path = "../../vendor/mantle/engine" }
 slates-land = { workspace = true }
+# The bounded channel shards reach the store's owner thread by, and the thread's spawn (`owner.rs`).
+slates-rt = { workspace = true }
 
 [dev-dependencies]
 # The simulated file with power-loss semantics the log's crash tests run on.

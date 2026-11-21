@@ -6,6 +6,10 @@
 //! - **A, per-file**: each file's revisions in its own log, in revision order (a revlog's shape).
 //! - **B, changesets**: one log in changeset order, each changeset's file revisions together (grouped by the changeset
 //!   that introduced them, their link), a file's revisions found through its path history (the changesets touching it).
+//! - **C, changesets and a derived per-file form** (main's order of 2026-11-20, A-767 C3): B's log is the truth, and
+//!   from it a per-file log is derived (each file's revisions in revision order, read out of B's segments through a
+//!   decoded-segment cache, then segmented and compressed again) and cached by identity (A-645's derived data). Reads
+//!   run on the derived form; the arm reports what deriving it cost, in time and in bytes beside B's.
 //!
 //! Every version's full text is rebuilt once and its identity (plain BLAKE3, its length) recorded, as both arms keep
 //! it in metadata. The log is held raw and, as it would land, in segments compressed with LZ4 and with zstd at levels
@@ -14,7 +18,7 @@
 //! cache, its text checked against the identity), and a clone's file section streamed (every file revision in
 //! changegroup order, file by file, through the same cache).
 //!
-//! Command: `cargo run --release -p slates-hg --example changeset_ab -- <repository> <arm A|B> <samples>`. One arm a
+//! Command: `cargo run --release -p slates-hg --example changeset_ab -- <repository> <arm A|B|C> <samples>`. One arm a
 //! process, so its peak RSS is its own. Prints every number; the load is the caller's to record.
 
 #![allow(
@@ -291,7 +295,7 @@ fn main() {
   // The arm's order: A file by file (as read), B by link (changeset) then file.
   let started = Instant::now();
   let mut order: Vec<usize> = (0..read.len()).collect();
-  if arm_name == "B" {
+  if arm_name == "B" || arm_name == "C" {
     order.sort_by_key(|at| (read[*at].link, read[*at].path, read[*at].rev));
   }
   let mut arm = Arm {
@@ -363,50 +367,117 @@ fn main() {
     Codec::Zstd(9),
   ] {
     let started = Instant::now();
-    let segments = Segments::of(&arm.log, codec);
+    let truth = Segments::of(&arm.log, codec);
     let encode_s = started.elapsed().as_secs_f64();
-    // Old reads: each sampled revision rebuilt through its base chain, a fresh cache each read (a cold read).
-    let mut micros = Vec::with_capacity(samples);
-    let mut decodes = Vec::with_capacity(samples);
-    let mut bytes = Vec::new();
-    for at in &sample {
-      let started = Instant::now();
-      let mut cache = Cache::new(&segments);
-      let text = rebuilt(&arm, &mut cache, *at, &mut bytes);
-      micros.push(started.elapsed().as_secs_f64() * 1e6);
-      decodes.push(cache.decodes as f64);
-      let wanted = arm.revisions[*at];
-      assert_eq!(
-        (*blake3::hash(&text).as_bytes(), text.len()),
-        (wanted.text, wanted.text_len),
-        "{:?}",
-        reads[*at]
+    if arm_name != "C" {
+      measure(
+        &arm_name,
+        codec,
+        &arm.revisions,
+        &arm.files,
+        &truth,
+        encode_s,
+        &sample,
+        &reads,
       );
+      continue;
     }
-    // A clone's file section: every revision file by file, in revision order, through one bounded cache.
+    // C: derive the per-file form from B's segments, a file at a time in revision order, through one bounded cache.
     let started = Instant::now();
-    let mut cache = Cache::new(&segments);
-    let mut sent = 0usize;
+    let mut cache = Cache::new(&truth);
+    let mut derived_log: Vec<u8> = Vec::with_capacity(arm.log.len());
+    let mut derived = arm.revisions.clone();
+    let mut bytes = Vec::new();
     for file in arm.files.values() {
       for at in &file.revisions {
         let stored = arm.revisions[*at];
         cache.read(stored.at, stored.len, &mut bytes);
-        sent += bytes.len();
+        derived[*at].at = derived_log.len();
+        derived_log.extend_from_slice(&bytes);
       }
     }
-    let stream_s = started.elapsed().as_secs_f64();
+    let regroup_s = started.elapsed().as_secs_f64();
+    let started = Instant::now();
+    let derived_segments = Segments::of(&derived_log, codec);
+    let derive_s = regroup_s + started.elapsed().as_secs_f64();
     println!(
-      "arm {arm_name} {codec:?}: held {:.1} MiB (encoded in {encode_s:.2} s); old read µs p50 {:.0} p99 {:.0} max {:.0}, \
-       segments decoded p50 {:.0} p99 {:.0}; clone file section {:.1} MiB in {stream_s:.2} s, {} segment decodes; rss {:.0} MiB",
-      segments.bytes() as f64 / 1048576.0,
-      percentile(&mut micros.clone(), 500),
-      percentile(&mut micros.clone(), 990),
-      percentile(&mut micros, 1000),
-      percentile(&mut decodes.clone(), 500),
-      percentile(&mut decodes, 990),
-      sent as f64 / 1048576.0,
-      cache.decodes,
-      peak_rss_mib()
+      "arm C {codec:?}: truth (B's log) held {:.1} MiB; derived per-file form {:.1} MiB more, derived in {derive_s:.2} s \
+       ({regroup_s:.2} s regrouping through {} decodes of B's segments)",
+      truth.bytes() as f64 / 1048576.0,
+      derived_segments.bytes() as f64 / 1048576.0,
+      cache.decodes
+    );
+    drop(derived_log);
+    measure(
+      &arm_name,
+      codec,
+      &derived,
+      &arm.files,
+      &derived_segments,
+      encode_s,
+      &sample,
+      &reads,
     );
   }
+}
+
+/// Old reads (each sampled revision rebuilt cold through its chain, checked against its identity) and a clone's file
+/// section (every revision file by file through one bounded cache) over `segments`, printed.
+#[allow(clippy::too_many_arguments)]
+fn measure(
+  arm_name: &str,
+  codec: Codec,
+  revisions: &[Stored],
+  files: &BTreeMap<Vec<u8>, File>,
+  segments: &Segments,
+  encode_s: f64,
+  sample: &[usize],
+  reads: &[(usize, u32)],
+) {
+  let view = Arm {
+    log: Vec::new(),
+    revisions: revisions.to_vec(),
+    files: BTreeMap::new(),
+  };
+  let mut micros = Vec::with_capacity(sample.len());
+  let mut decodes = Vec::with_capacity(sample.len());
+  let mut bytes = Vec::new();
+  for at in sample {
+    let started = Instant::now();
+    let mut cache = Cache::new(segments);
+    let text = rebuilt(&view, &mut cache, *at, &mut bytes);
+    micros.push(started.elapsed().as_secs_f64() * 1e6);
+    decodes.push(cache.decodes as f64);
+    let wanted = revisions[*at];
+    assert_eq!(
+      (*blake3::hash(&text).as_bytes(), text.len()),
+      (wanted.text, wanted.text_len),
+      "{:?}",
+      reads[*at]
+    );
+  }
+  let started = Instant::now();
+  let mut cache = Cache::new(segments);
+  let mut sent = 0usize;
+  for file in files.values() {
+    for at in &file.revisions {
+      let stored = revisions[*at];
+      cache.read(stored.at, stored.len, &mut bytes);
+      sent += bytes.len();
+    }
+  }
+  let stream_s = started.elapsed().as_secs_f64();
+  println!(
+    "arm {arm_name} {codec:?}: held {:.1} MiB (encoded in {encode_s:.2} s); old read µs p50 {:.0} p99 {:.0} max {:.0}, \
+     segments decoded p50 {:.0} p99 {:.0}; clone file section {:.1} MiB in {stream_s:.2} s, {} segment decodes; rss {:.0} MiB",
+    segments.bytes() as f64 / 1048576.0,
+    percentile(&mut micros.clone(), 500),
+    percentile(&mut micros.clone(), 990),
+    percentile(&mut micros, 1000),
+    percentile(&mut decodes.clone(), 500),
+    percentile(&mut decodes, 990),
+    sent as f64 / 1048576.0,
+    cache.decodes,
+    peak_rss_mib()
+  );
 }

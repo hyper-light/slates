@@ -319,6 +319,9 @@ enum Need {
   /// work's own shard, which holds the register, before the owner is asked for a verdict, so the merge record that
   /// carries the submit's completion never exists before its route does.
   Route,
+  /// The refinement the work's composition owes (A-787 part 2, R3; `crate::refining`): met on the work's own shard by a
+  /// job of its own, a slice a turn, before the owner is asked for the verdict or the rebase it composes.
+  Refine(Box<crate::refining::Owed>),
 }
 
 fn key(origin: u64, id: RequestId) -> (u64, u32, u32) {
@@ -463,11 +466,15 @@ fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<N
         return None;
       }
       let sealed = seal(state, work);
-      Some(
-        base_missing(state, &sealed).unwrap_or_else(|| Need::Rebase {
-          sealed: Box::new(composed(state, sealed, Vec::new())),
-        }),
-      )
+      if let Some(need) = base_missing(state, &sealed) {
+        return Some(need);
+      }
+      if let Some(owed) = refine_owed(state, &sealed) {
+        return Some(Need::Refine(Box::new(owed)));
+      }
+      Some(Need::Rebase {
+        sealed: Box::new(composed(state, sealed, Vec::new())),
+      })
     }
     RequestBody::EditSubmit {
       path,
@@ -551,6 +558,12 @@ fn verdict_need(
   if !route_committed(state, work) {
     return Need::Route;
   }
+  if let Some(need) = base_missing(state, &sealed) {
+    return need;
+  }
+  if let Some(owed) = refine_owed(state, &sealed) {
+    return Need::Refine(Box::new(owed));
+  }
   base_missing(state, &sealed).unwrap_or_else(|| Need::Verdict {
     evidence: evidence.to_vec(),
     sealed: Box::new(composed(state, sealed, evidence.to_vec())),
@@ -598,6 +611,51 @@ fn declare_need(fetched: bool, op: &WorkOp) -> Option<Need> {
     }
     _ => None,
   }
+}
+
+/// The refinement `sealed`'s composition on this shard owes (A-787 part 2): none for a journal its owner composes (a
+/// copy's), a sealed copy holding more than the work, or one that replaces nothing whole or whose refinement is kept.
+fn refine_owed(state: &ShardState, sealed: &SealedWork) -> Option<crate::refining::Owed> {
+  // The job reads the writer's bytes from the work: a sealed copy holding more than the work (an edit-and-submit's
+  // edit, applied to the copy alone) composes unrefined.
+  let own = state
+    .works
+    .get(&sealed.work)
+    .is_some_and(|w| w.journal.len() == sealed.journal.len());
+  if !own || holds_copy(&sealed.journal) {
+    return None;
+  }
+  crate::refining::owed(
+    state,
+    (sealed.work, sealed.green, sealed.base_version),
+    &sealed.journal,
+  )
+}
+
+/// What the owner sent `work`'s parked verb (A-247), for its refinement's copy (`crate::refining`): `None` when no verb
+/// of the work is parked or it fetched nothing.
+pub(crate) fn parked_fetched(state: &ShardState, work: DbVolumeId) -> Option<&FetchedBase> {
+  state
+    .work_home
+    .queues
+    .get(&work)?
+    .waiting
+    .front()?
+    .fetched
+    .as_ref()
+}
+
+/// The base bytes of `path` the owner sent `work`'s parked verb (A-247): `None` when none was sent.
+pub(crate) fn parked_fetch<'s>(
+  state: &'s ShardState,
+  work: DbVolumeId,
+  path: &str,
+) -> Option<&'s [u8]> {
+  parked_fetched(state, work)?.files.get(path)?.as_deref()
+}
+/// The work's refinement job ended (`crate::refining`): the verb parked on it runs again.
+pub(crate) fn refined(state: &mut ShardState, work: DbVolumeId) {
+  resolve(state, work, Some(Answered::Refined));
 }
 
 /// The paths a sealed work's journal names whose base the work does not hold, to fetch before it composes (A-247): a
@@ -676,9 +734,14 @@ fn composed(state: &ShardState, mut sealed: SealedWork, evidence: Vec<[u8; 32]>)
     fetched: state.work_home.fetched.as_ref(),
     version: sealed.base_version,
   };
+  let kept = crate::refining::kept(
+    state,
+    sealed.work,
+    (sealed.base_version, sealed.journal.len()),
+  );
   let Ok(inc) = crate::verbs::compose_increment(
     (sealed.work, sealed.base_version),
-    &base,
+    (&base, kept),
     (&sealed.files, files_base),
     &sealed.journal,
     evidence,
@@ -1137,6 +1200,8 @@ enum Answered {
   Named(Result<(), Refusal>),
   /// The work's route is committed (A-298): nothing to hand the verb, which runs its gate again.
   Route,
+  /// The work's refinement ended (`crate::refining`): kept on this shard for the verb's composition.
+  Refined,
 }
 
 /// One ask waiting in a shard's outbox to its green's owner.
@@ -1208,6 +1273,13 @@ fn start_ask(
   let Some(need) = need else {
     return true;
   };
+  // A refinement is the work's own: a job of this shard, never an ask of the owner (A-787 part 2).
+  if let Need::Refine(owed) = need {
+    let Some(green) = state.works.get(&queue).map(|w| w.green) else {
+      return false;
+    };
+    return crate::refining::start(state, (queue, green), *owed);
+  }
   count_composed(state, &need);
   // A green another node owns admits its work there, by a forward (A-697 part a).
   if let Need::Admit {
@@ -1250,8 +1322,8 @@ fn start_ask(
         None => return false,
       }
     }
-    // The owner holds nothing of a work's route (A-298): `park` meets it on this shard.
-    Need::Route => return false,
+    // The owner holds nothing of a work's route (A-298): `park` meets it on this shard. A refinement was started above.
+    Need::Route | Need::Refine(_) => return false,
   };
   let version = state.works.get(&queue).map_or(0, |w| w.base_version);
   let owner_partition =
@@ -2111,6 +2183,8 @@ fn answer_on_owner(state: &mut ShardState, item: AskItem) -> Outcome {
     }
     // Never asked (`start_ask` refuses it); answered, it only runs the work's gate again, which checks the route there.
     Need::Route => Outcome::Answered(Answered::Route),
+    // Never sent to an owner (the work's own job meets it): answered as met.
+    Need::Refine(_) => Outcome::Answered(Answered::Refined),
   }
 }
 
@@ -2295,7 +2369,7 @@ fn resolve(state: &mut ShardState, work: DbVolumeId, answer: Option<Answered>) {
           Answered::Rebased(rebased) => head.rebased = Some(rebased),
           Answered::Admitted(admitted) => head.admitted = Some(admitted),
           Answered::Named(named) => head.named = Some(named),
-          Answered::Route => {}
+          Answered::Route | Answered::Refined => {}
         }
       }
     }

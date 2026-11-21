@@ -1477,11 +1477,13 @@ dependencies = [
  "slates-client",
  "slates-db",
  "slates-ipc",
+ "slates-land",
  "slates-machine",
  "slates-mem",
  "slates-merge",
  "slates-rt",
  "slates-server",
+ "slates-store",
  "slates-transport",
  "slates-vfs",
  "slates-wire",
@@ -1953,6 +1955,7 @@ dependencies = [
  "slates-rt",
  "slates-seal",
  "slates-ssh",
+ "slates-store",
  "slates-svn",
  "slates-test-seeds",
  "slates-transport",
@@ -1980,6 +1983,7 @@ dependencies = [
  "mantle-crc",
  "mantle-engine",
  "slates-land",
+ "slates-rt",
 ]
 
 [[package]]

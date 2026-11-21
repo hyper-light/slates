@@ -783,6 +783,9 @@ pub struct ShardState {
   /// repository's tool store with its derived values, made with its record and made again by a recovery from its
   /// entries' objects. Bounded by the shard's memory budget, which every byte of it is charged to.
   pub(crate) vcs_stores: crate::vcs_store::VcsStores,
+  /// The node's version-control store on disk, when the daemon has one (A-767; `DaemonConfig::vcs_disk`): this shard's
+  /// handle to its owner thread, through which a repository's landings reach the changeset log.
+  pub vcs_disk: Option<slates_store::owner::StoreHandle>,
   /// Each of this shard's repositories' usage (A-724 piece 1, `slates_vcs::usage`): its intakes and fetches begun,
   /// answered, stepped and timed, and its principals in a Space-Saving summary of `clients_per_shard` slots. One row a
   /// repository with an event, dropped with the repository ([`crate::vcs_store::free`]), so bounded by the partition's
@@ -885,6 +888,8 @@ pub struct ShardState {
   pub(crate) base_waits: crate::base_wait::BaseWaits,
   /// A shard's parked work verbs and the answer for the one now running (A-247; `crate::work_home`).
   pub(crate) work_home: crate::work_home::WorkHome,
+  /// The shard's refinements of works' whole-file rewrites, a slice a turn (A-787 part 2, `crate::refining`).
+  pub(crate) refining: crate::refining::Refining,
   /// The `ring.request` spans of requests this shard forwarded to another shard, or scattered, by request
   /// word (§4.14): opened at the slot read, ended when the reply comes back through `deliver` and is
   /// written, so a forwarded reply's ring span is timed from read to reply like a local one. Bounded by

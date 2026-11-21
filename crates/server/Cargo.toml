@@ -31,6 +31,8 @@ slates-archive = { workspace = true }
 slates-transport = { workspace = true }
 slates-ipc = { workspace = true }
 slates-land = { workspace = true }
+# The version-control store's owner handle each shard holds (A-767).
+slates-store = { workspace = true }
 slates-merge = { workspace = true }
 slates-bridge-core = { workspace = true }
 # The version-control servers' HTTP edge (§4.17.2 "Transports" item 1, A-625 part 2; `crate::vcs_http`): HTTP/1.1's

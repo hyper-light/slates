@@ -9089,6 +9089,24 @@ fn declared_xattr<'a>(journal: &'a [VolumeOp], path: &str, name: &str) -> Option
   })
 }
 
+/// The post-state's length: past the last laid byte of a content, xattr or node op.
+fn post_state_size(doc: &slates_merge::ops_doc::OpsDoc) -> u64 {
+  use slates_merge::ops_doc::OpKind;
+  doc
+    .ops
+    .iter()
+    .filter(|op| {
+      op.src != u64::MAX
+        && matches!(
+          op.kind,
+          OpKind::Overwrite | OpKind::Insert | OpKind::Extend | OpKind::SetXattr | OpKind::Mknod
+        )
+    })
+    .map(|op| op.src.saturating_add(op.len))
+    .max()
+    .unwrap_or(0)
+}
+
 /// Assembles an increment's post-state from a work's content and journal (§4.16): the deriver lays the runs its
 /// content ops add out compactly, then the extended-attribute values and the special nodes, and each such op names
 /// its slice (`slates_merge::increment::compose_volume_planned`). A content op copies `len` bytes of its file from
@@ -9110,15 +9128,7 @@ fn assemble_post_state(
   use slates_merge::ops_doc::OpKind;
   let is_file_content =
     |kind: OpKind| matches!(kind, OpKind::Overwrite | OpKind::Insert | OpKind::Extend);
-  let mut size = 0u64;
-  for op in &doc.ops {
-    if op.src != u64::MAX
-      && (is_file_content(op.kind) || matches!(op.kind, OpKind::SetXattr | OpKind::Mknod))
-    {
-      size = size.max(op.src.saturating_add(op.len));
-    }
-  }
-  let mut post = vec![0u8; usize::try_from(size).unwrap_or(0)];
+  let mut post = vec![0u8; usize::try_from(post_state_size(doc)).unwrap_or(0)];
   for op in &doc.ops {
     if op.src == u64::MAX {
       continue;
@@ -9225,9 +9235,10 @@ fn build_increment(
     fetched: None,
     version: base_version,
   };
+  let kept = crate::refining::kept(state, sealed.work, (base_version, sealed.journal.len()));
   let inc = compose_increment(
     (sealed.work, base_version),
-    &base,
+    (&base, kept),
     (&sealed.files, files_base),
     &sealed.journal,
     evidence,
@@ -9241,34 +9252,33 @@ fn build_increment(
 /// increment is the same byte for byte wherever it is composed.
 pub(crate) fn compose_increment(
   (work_id, base_version): (DbVolumeId, u64),
-  base: &slates_merge::increment::Base,
+  (base, kept): (
+    &slates_merge::increment::Base,
+    Option<(
+      slates_merge::ops_doc::OpsDoc,
+      slates_merge::increment::PostStatePlan,
+    )>,
+  ),
   (files, files_base): (&crate::work_files::WorkFiles, crate::work_files::Base<'_>),
   journal: &[VolumeOp],
   evidence: Vec<[u8; 32]>,
 ) -> Result<slates_merge::engine::Increment, Refusal> {
-  let (mut doc, mut plan) = match slates_merge::increment::compose_volume_planned(base, journal) {
-    Ok(planned) => planned,
-    Err(e) => {
-      return Err(Refusal::BadRequest {
-        reason: format!("increment does not compose: {e:?}"),
-      });
-    }
-  };
   // A file the work replaced whole (an editor's write-and-rename, a formatter's or a codemod's rewrite) is judged as
-  // the edit it was, not a replacement of the file (D-O17, A-776; `slates_merge::refine`): the base bytes it was given
-  // and the bytes it wrote, both already held here, give the ranges it changed. A base this shard cannot read (a work
-  // off the green's shard whose base the owner did not send, A-247) keeps the replacement. The refiner's scratch is
-  // sized by the files it compares and dropped with this submit, so nothing stays resident between submits.
-  slates_merge::refine::refine_rewrites(
-    &mut doc,
-    &mut plan,
-    &mut slates_merge::refine::Refiner::new(),
-    &mut |base_path, path| {
-      let before = files_base.file(base_path).ok().flatten()?;
-      let after = files.get(files_base, path).ok().flatten()?;
-      Some((before, after))
+  // the edit it was, not a replacement of the file (D-O17, A-776; `slates_merge::refine`). Its refinement ran before
+  // this, a slice a turn, as a job of this shard (A-787 part 2, `crate::refining`): `kept` is its refined document and
+  // plan, the composition of this journal over this base. None: the journal replaces nothing whole, or the job gave up,
+  // and the composition stands as it is.
+  let (doc, plan) = match kept {
+    Some(refined) => refined,
+    None => match slates_merge::increment::compose_volume_planned(base, journal) {
+      Ok(planned) => planned,
+      Err(e) => {
+        return Err(Refusal::BadRequest {
+          reason: format!("increment does not compose: {e:?}"),
+        });
+      }
     },
-  );
+  };
   let post_state = assemble_post_state((&doc, &plan), (files, files_base), journal);
   // The identity names the work and its base before the post-state and the document (§4.16 data model:
   // `blake3(work_volume, base, post_state, ops_doc, filter)`), so the engine's retry cache answers only a
@@ -9925,6 +9935,18 @@ fn submit(
       if let Err(refusal) = reset_would_fit(state, work_id, now) {
         return refused(refusal);
       }
+      // A whole-file rewrite is refined first, a slice a turn, by a job of this shard (A-787 part 2): the submit waits.
+      if let Some(owed) = refinement_owed(state, (work_id, green_id)) {
+        let kind = ParkedKind::Local {
+          principal: principal.clone(),
+          work,
+          evidence,
+          signature,
+          authorship,
+          approval,
+        };
+        return park_on_refinement(state, (work_id, green_id), owed, kind);
+      }
       let Some(sealed) = take_sealed(state, work_id) else {
         return refused(Refusal::NotFound);
       };
@@ -10472,6 +10494,15 @@ fn rebase(state: &mut ShardState, principal: &Principal, work: VolumeId) -> Repl
   let answer = match state.work_home.rebased.take() {
     Some(answer) => answer,
     None => {
+      if state.greens.contains_key(&green_id)
+        && let Some(owed) = refinement_owed(state, (work_id, green_id))
+      {
+        let kind = ParkedKind::LocalRebase {
+          principal: principal.clone(),
+          work,
+        };
+        return park_on_refinement(state, (work_id, green_id), owed, kind);
+      }
       let Some(sealed) = take_sealed(state, work_id) else {
         return refused(Refusal::NotFound);
       };
@@ -10567,9 +10598,14 @@ pub(crate) fn compose_on_replica(
     fetched: None,
     version: sealed.base_version,
   };
+  let kept = crate::refining::kept(
+    state,
+    sealed.work,
+    (sealed.base_version, sealed.journal.len()),
+  );
   let inc = compose_increment(
     (sealed.work, sealed.base_version),
-    &base,
+    (&base, kept),
     (&sealed.files, files_base),
     &sealed.journal,
     evidence,
@@ -11139,6 +11175,13 @@ enum ParkedKind {
     /// Its approval.
     approval: Approval,
   },
+  /// A rebase asked on the green's shard, parked behind its work's refinement (A-787 part 2).
+  LocalRebase {
+    /// Who asked.
+    principal: Principal,
+    /// The work.
+    work: VolumeId,
+  },
 }
 
 /// Parks the running submit behind `green`'s build: its request deferred as an acceptance that waits is (no completion,
@@ -11162,6 +11205,52 @@ fn park_submit(state: &mut ShardState, green: DbVolumeId, kind: ParkedKind) -> R
     }
     Err(refusal) => refused(refusal),
   }
+}
+
+/// Parks the running local verb of `work` behind its refinement (A-787 part 2, `crate::refining`), starting the job: no
+/// reply now, the verb run again and answered on its route when the job ends; `Overloaded` at the bound or when the job
+/// cannot start.
+fn park_on_refinement(
+  state: &mut ShardState,
+  (work, green): (DbVolumeId, DbVolumeId),
+  owed: crate::refining::Owed,
+  kind: ParkedKind,
+) -> ReplyBody {
+  let Some((origin, id)) = state.current_request else {
+    return refused(Refusal::Overloaded { shard: state.shard });
+  };
+  if !crate::refining::start(state, (work, green), owed) {
+    return refused(Refusal::Overloaded { shard: state.shard });
+  }
+  let parked = ParkedSubmit {
+    origin,
+    id,
+    route: state.reply_route,
+    kind,
+    parked_ns: state.clock.monotonic_ns(),
+  };
+  match crate::refining::park(state, work, parked) {
+    // No reply now: the deferred verb's is not sent (only a refusal would be), and the verb run again answers on its
+    // route once the job ends, as a verb parked on its green's owner is (A-247).
+    Ok(()) => {
+      state.reply_route = None;
+      state.acceptance_deferred = true;
+      crate::lease_wait::parked_reply()
+    }
+    Err(refusal) => refused(refusal),
+  }
+}
+
+/// The refinement `work`'s journal owes on this shard (A-787 part 2), read where the work holds it.
+fn refinement_owed(
+  state: &ShardState,
+  (work, green): (DbVolumeId, DbVolumeId),
+) -> Option<crate::refining::Owed> {
+  let w = state.works.get(&work)?;
+  if crate::work_home::holds_copy(&w.journal) {
+    return None;
+  }
+  crate::refining::owed(state, (work, green, w.base_version), &w.journal)
 }
 
 /// Runs each parked submit again in its own transaction, in the order they came, and answers it on its route.
@@ -11193,6 +11282,9 @@ pub(crate) fn resume_all(state: &mut ShardState, parked: Vec<ParkedSubmit>) {
         let verb = (work, (evidence, signature, authorship), approval);
         resumed_local(state, (origin, id), route, &principal, verb)
       }
+      ParkedKind::LocalRebase { principal, work } => {
+        resumed_rebase(state, (origin, id), route, &principal, work)
+      }
     };
     if let (Some(reply), Some(route)) = (reply, route)
       && !answered_on(route, (origin, id), reply)
@@ -11204,6 +11296,35 @@ pub(crate) fn resume_all(state: &mut ShardState, parked: Vec<ParkedSubmit>) {
 
 /// A parked local submit run again in its own transaction, as `run_recorded` runs a verb: its reply, recorded as its
 /// completion, or none where it waits again (an acceptance deferred, or parked behind a later build).
+/// [`resumed_local`] for a parked rebase: the verb run again in its own transaction, its completion recorded.
+fn resumed_rebase(
+  state: &mut ShardState,
+  (origin, id): (u64, RequestId),
+  route: Option<crate::merge_service::ReplyRoute>,
+  principal: &Principal,
+  work: VolumeId,
+) -> Option<ReplyBody> {
+  state.db.begin();
+  state.current_request = Some((origin, id));
+  state.reply_route = route;
+  let reply = rebase(state, principal, work);
+  state.current_request = None;
+  state.reply_route = None;
+  let deferred = std::mem::take(&mut state.acceptance_deferred);
+  let reply = if deferred {
+    reply
+  } else {
+    record_completion(state, origin, id, reply)
+  };
+  match state.db.commit(&mut state.segment) {
+    Ok(_) => (!deferred).then_some(reply),
+    Err(error) => {
+      reconcile_unpublished_effects(state);
+      Some(refused(refusal_of_db(&error)))
+    }
+  }
+}
+
 fn resumed_local(
   state: &mut ShardState,
   (origin, id): (u64, RequestId),

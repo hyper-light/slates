@@ -34,6 +34,8 @@ fn open(dir: &Path) -> Store {
     Sizing {
       memory: 8 << 20,
       disk: 1 << 30,
+      extent_bytes: 128 << 10,
+      fanout: 8,
     },
   )
   .unwrap()

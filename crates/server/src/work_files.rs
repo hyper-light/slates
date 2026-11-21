@@ -505,6 +505,9 @@ fn held(path: &str, entry: Option<&Option<Held>>) -> u64 {
   }
 }
 
+/// A path the work holds of its own, and its bytes put together from its pieces (none: removed).
+pub type ChangedEntry<'a> = (&'a str, Option<Cow<'a, [u8]>>);
+
 impl WorkFiles {
   /// The file at `path` as the work sees it: its own bytes, nothing where it removed one, else the base's. A file the
   /// work changed is lent where it wrote it all, else put together from its pieces (the base's ranges and its own).
@@ -828,10 +831,7 @@ impl WorkFiles {
 
   /// What the work holds of its own, in path order, each file's bytes put together from its pieces (A-207: what a
   /// restatement in its log carries; a restatement follows a rebase, whose files are held whole, so they are lent).
-  pub fn changed_entries<'a>(
-    &'a self,
-    base: Base<'a>,
-  ) -> Result<Vec<(&'a str, Option<Cow<'a, [u8]>>)>, BaseGone> {
+  pub fn changed_entries<'a>(&'a self, base: Base<'a>) -> Result<Vec<ChangedEntry<'a>>, BaseGone> {
     self
       .changed
       .keys()
@@ -865,9 +865,10 @@ mod tests {
   const BIG: usize = 1 << 20;
 
   fn green_with(path: &str, bytes: Vec<u8>) -> Green {
-    let mut origin = Origin::default();
-    origin.files = [(path.to_owned(), bytes)].into_iter().collect();
-    Green::with_origin(origin)
+    Green::with_origin(Origin {
+      files: [(path.to_owned(), bytes)].into_iter().collect(),
+      ..Origin::default()
+    })
   }
 
   fn pattern(len: usize) -> Vec<u8> {

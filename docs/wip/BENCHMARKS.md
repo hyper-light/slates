@@ -15578,6 +15578,44 @@ What it says:
 Owed: the full clone over the wire (changesets, manifests derived, files) and an import's RSS in the daemon, once
 the shape is built there. And N=3 an arm on a quiet machine.
 
+## Mercurial's history as changesets with a derived per-file form: arm C of the changeset A/B (A-767 C3; main's order of 2026-11-20: "changesets plus a derived per-path form ... must meet the per-file arm's 91 µs and 0.27 s, or beat them, before A-767 is built"; 2026-11-20)
+
+**What it is.** w-hg's `changeset_ab` (the section above) with a third arm. **C**: B's log, in changeset order, is the
+truth; from it a per-file log is derived (each file's revisions in revision order, read out of B's compressed segments
+through the same 64-segment decoded cache, then cut into 64 KiB segments and compressed again) and kept as derived data
+by identity (A-645), and every read runs on the derived form. All three arms hold Mercurial's own deltas (no diff at the
+server) and check every rebuilt text against its BLAKE3 identity.
+
+**Command.** `cargo build --release -p slates-hg --example changeset_ab` at the worktree of this entry's commit, then
+`/usr/bin/time -l changeset_ab <hg-src> <A|B|C> 2000`, rounds of A B C interleaved, N=3. Machine: Adas-Mac-Studio-2.local
+(Apple silicon, 14 cores, 36 GiB, macOS), 2026-11-20 18:42 to 19:09 PST, load average 1.9 to 3.5. Data: Mercurial's
+repository cloned from mercurial-scm.org (57,054 changesets, 4,243 paths, 114,732 file revisions, 94.0 MiB of
+deltas). adacachy, which main named for timing while the Studios' network is bad, could not clone the history from
+mercurial-scm.org (three "incomplete response" aborts), so these rows are this Mac's.
+
+| zstd 1, rounds 1 / 2 / 3 | Held | Old read µs p50 | p99 | Clone file section | Segment decodes |
+|---|---|---|---|---|---|
+| A per-file | 26.6 MiB | 77 / 77 / 79 | 2,646 / 2,617 / 2,681 | 0.19 / 0.19 / 0.20 s | 5,258 |
+| B changesets | 28.5 MiB | 833 / 814 / 829 | 12,345 / 12,184 / 12,323 | 2.02 / 2.02 / 2.02 s | 52,498 |
+| C changesets + derived per-file | 28.5 MiB truth + 25.7 MiB derived | 73 / 73 / 74 | 2,677 / 2,638 / 2,660 | 0.06 / 0.06 / 0.06 s | 1,505 |
+
+Deriving C's per-file form from B's log: 2.17 / 2.17 / 2.19 s for the whole history (2.03 to 2.05 s of it regrouping
+through 52,498 decodes of B's segments, the rest compressing). Other codecs, round 1: raw 0.09 s and 94.0 MiB derived,
+reads p50 15 µs, clone 0.01 s; LZ4 1.02 s and 35.2 MiB, 40 µs, 0.03 s; zstd 3 2.27 s and 24.3 MiB, 72 µs, 0.06 s; zstd 9
+2.92 s and 22.2 MiB, 71 µs, 0.06 s. Peak RSS (the example holds every arm's raw log at once, so it is the harness's, not
+a store's): A 593 to 615 MB, B 618 to 624 MB, C 966 to 1,017 MB.
+
+What it says:
+- **C meets the bar and beats it**: old reads p50 73 µs against the per-file arm's 77 here (91 in w-hg's run), a clone's
+  file section 0.06 s against 0.19 (0.27). Its clone decodes fewer segments than A because its derived log is laid out in
+  the clone's own order (sorted paths), where A's follows the fncache; C is no faster than A's layout would be in that
+  order, and needs no faster.
+- **The cost is a derivation and its bytes**: 2.2 s once for the whole history, and for each later changeset only its
+  own files' runs; 25.7 MiB of derived form beside the 28.5 MiB of changesets (54.2 MiB in all, against stock hg's 77.6
+  MiB store), evictable and recomputable since it is derived.
+- Decision for A-767: the changeset log is the truth; a per-file form derived from it, cached by identity, serves reads
+  and clones.
+
 ## Subversion's history held as changesets or as per-file deltas, counted: svn's arm of the changeset A/B (Ada's ruling of 2026-11-20 ~13:35; main's A/B order; UI goal 93; 2026-11-20)
 
 **What it is.** The same A/B as Mercurial's (the section above, w-hg's `changeset_ab`). Both arms hold exactly the
@@ -16036,7 +16074,35 @@ p999 13.0 -> 37.3 ms.
 
 **Measured, not landed.** Both arms meet R9's floor quiet at nine shards, which main never has, and cut the loaded p99
 3-5x. Both lose the loaded p999 and spend 2-6x the quiet CPU. Under the data rule neither lands. The loaded p999 is the
-open item; its hop is still to be named.
+open item; its hop is named below.
+
+### Where the loaded p999 goes, per hop, and the shards' QoS (A-786; 2026-11-20 night, w-provision-gate)
+
+Same MacBook. The host was quiet for once (load 4 to 18). `PROVISION_BENCH_LOAD=2`. Diagnostic hop stamps (never on main)
+split each create in the loaded p999 tail, three per run. Two rounds, interleaved.
+
+- **main:** the tail is the client's own wake after it parked (from the reply landing to its taking, 15 to 33 ms) and the
+  nap hop (from the reply's task to the serve task, 0.6 to 2.9 ms). Loaded p99 0.88 to 1.44 ms, p999 2.2 to 2.7 ms.
+- **immediate poll + time-horizon estimate:** the tail is almost all cross-shard hops. The forward to the owner's task
+  took 7 to 19 ms, and the owner's reply to its task on the client's shard 13 to 29 ms. The client wakes fast. A shard
+  that spins without ever sleeping looks CPU-bound to macOS, which demotes it; preempted beside the spinners, it waits
+  quanta for a core, and a kick cannot help because it is not parked. Loaded p99 0.26 to 0.55 ms, p999 10.6 to 12.2 ms.
+  Quiet: p99 41 to 89 µs, at 6.1 to 10.0 cores (holds keep all nine shards spinning for one client).
+- **The same, with shard threads at `QOS_CLASS_USER_INTERACTIVE`:** loaded p99 0.26 to 0.45 ms, p999 6.5 / 9.8 ms. The
+  tail is still the cross-shard hops (6 to 22 ms). **Measured and rejected,** the third time for a shard QoS class
+  (2026-10-07 twice, and g222's G222_QOS before the kqueue fix).
+
+| arm | quiet p99 µs | loaded p99 ms | loaded p999 ms | quiet CPU, cores |
+|---|---|---|---|---|
+| main | 96.7 / 89.3 | 0.88 / 1.06 | 2.42 / 2.24 | 1.66-1.70 |
+| immediate + time estimate | 89.2 / 48.1 | 0.43 / 0.26 | 11.2 / 10.6 | 6.1-10.0 |
+| the same, QoS user-interactive | 39.6 / 34.8 | 0.45 / 0.26 | 6.45 / 9.83 | 6.2-10.0 |
+
+**Reading.** On macOS beside two spinners a logical CPU, the nap is both the cause of the loaded p99 (it hands the core
+away between two tasks of a request) and what keeps a spinning shard at its priority. Removing it cuts the loaded p99 3 to
+5 times and loses the p999 4 to 5 times. No priority lever moved it. On g222's edit-and-merge path the immediate poll
+improved the p999 too (15 -> 7-9 ms, the client's spin there); on provisioning it does not. That makes it a trade-off for
+main and Ada, not a fix.
 
 ## Three nodes: a version-3 push's homing at f + 1, and coalescing homings measured and rejected (A-724 piece 8c; main's order of 2026-11-20; 2026-11-20)
 
@@ -16194,6 +16260,18 @@ Kept: A-787.
   about 1.5 times its pack (33 times before). The longest step is the landing's entry apply, the record still
   carrying the pack (part A).
 
+## A push's record names its homed pack: 141 bytes, the landing step halved (A-722's record v4, part A; 2026-11-20)
+- **The command and machine:** adas-mac-studio.local-2, release; B1's diagnostic with record version 4 on and the
+  homing driven as the edge drives it, over git/git's v1.5.0 push; the landing step's phases timed (`push_planned`).
+
+| | record bytes | landing step | entry and record | store commit | apply |
+|---|---|---|---|---|---|
+| part B (92f7a756b) | about 11 MiB | 27.3 ms | 1.7 ms | 0.6 ms | 18.6 ms |
+| part A | 141 | 13.2 ms | 1.8 ms | 1.2 ms | 8.1 ms |
+
+- **What it says.** The entry's write is no longer O(the pack). The apply's 8.1 ms is the greens' commit and the work's
+  encode (w-engine's), and the entry-and-record's 1.8 ms the names checked against the homed ones; each is the next cut.
+
 
 ## The quiet-Mac paced run: no 17–31 ms late wake of a kicked, parked shard (goal 84b; g222; 2026-11-20)
 
@@ -16266,6 +16344,25 @@ the one-minute load fell below 3. Machine: adas-mac-studio.local (Apple M4 Max, 
 | 256 MiB | B | 4 | 2,856 B | 65,536 B | 234.458 µs | 436.792 µs |
 | 256 MiB | A | 5 | 268,445,792 B | 32,768 B | 13.308385 ms | 23.680417 ms |
 | 256 MiB | B | 5 | 2,832 B | 98,304 B | 347.718 µs | 755.375 µs |
+
+## The forward lane's bulk throughput: the instrument (2026-11-20, w-shared; A-697 item 4, main's sweep)
+
+`replication_bench`'s bulk row sends one request of N MiB on a warm session. The holder takes the request whole and
+answers nothing, so the row times one direction. For each sample it prints the goodput, the session's path MTU and
+congestion window, and why its sending stopped (`Endpoint::send_stops`: the packet budget, the window, the pacer,
+the credit, nothing to send). The command, release, best of the five timed samples after one warm-up:
+
+    cargo build --release -p slates-cluster --example replication_bench
+    REPLICATION_BENCH_BULK_MIB=4,64 target/release/examples/replication_bench 200
+
+No numbers are recorded yet. The first run (macOS arm64, this MacBook, load average 74, base 5d29b9572) was too
+loaded to count. It showed two things to measure on a quiet machine:
+- The path MTU reached 9,209 bytes, at macOS's `net.inet.udp.maxdgram` of 9,216. So the lane is not bound by
+  small datagrams.
+- At 64 MiB the sends stopped at the congestion window about 6,800 times. The window, not per-packet cost, bounds the
+  lane on loopback.
+The suspect is the UDP receive buffer, left at the OS default (`net.inet.udp.recvspace` 786,896 bytes, about 85
+datagrams). Its drops would read as loss. The before and after, with `netstat -s -p udp` drop counts, belong here.
 
 ## A work over a green costs its divergence: the brief's grid, before and after (w-work-cow P2; Ada's close order; 2026-11-20)
 - **Machine.** Adas-Mac-Studio.local (runner d1323898), macOS arm64, 32 cores, 96 GB, shared with other agents (not
