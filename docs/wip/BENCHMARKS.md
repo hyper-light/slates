@@ -15619,6 +15619,106 @@ What it says:
   also carry node-revisions and changed-path lists.
 - Owed: N=3 on a quiet machine.
 
+## A changeset's stored form: the raw payload against normalized per-path edits or wholes by identity, across tools and forks (A-767 item 7, phase 1; main's order of 2026-11-20; w-store; 2026-11-20)
+
+**What it is.** Main's A/B for A-767: (a) the bytes a client sent, kept unchanged, plus a work index; (b) each touched
+path's new text held once by identity (plain hash of the text), as the smaller of its zstd-3 whole and its zstd-3 line
+delta against p1's text (Mercurial's `mdiff.textdiff`), a whole wherever its chain would pass the bound K (a
+checkpoint), plus each changeset's own record (message, author, date). Every corpus feeds one shared identity store,
+so a second tool's or a fork's push adds only what the store does not yet hold. Phase 1 counts bytes and chains;
+release timings of the same layouts are w-hg's and w-svn's sections above.
+
+**Command.** `scratch-w-store/ab/run-phase1-local.sh` on the state branch (`changeset_ab.py` under
+`uv run --python 3.12 --with mercurial==7.2 --with zstandard python -I`; `run-phase1b.sh` for the stock rows).
+Machine: Adas-Mac-Studio-2.local (Apple M-series, 14 cores, 36 GiB, macOS), 2026-11-20 14:40 to 16:30 PST, kiln's
+runners unreachable from it, so run here; load 2 to 4. Data: Mercurial's repository cloned from mercurial-scm.org
+(57,053 revisions, `.hg/store` 77.6 MB); the same history as git through `hg fastexport` and `git fast-import` (authors
+rewritten, every file byte kept; 57,048 commits on `default`), repacked with `git repack -a -d -f`; git/git from GitHub,
+v2.0.0 (36,430 commits) then v2.1.0 (37,387) as two repositories of one project.
+
+| Corpus, in this order into one store | (a) payload as received | (b) texts K=16 / 64 / 256 / unbounded | (b) changeset records, each / as one stream | work index (raw) |
+|---|---|---|---|---|
+| hg's history, by hg | 162.1 MB changegroup (44.6 MB as hg's zstd bundle) | 103.7 / 51.6 / 38.5 / 35.7 MB | 15.1 / 5.9 MB | 6.7 MB |
+| the same history again, by git | +85.2 MB pack (1,038 MB from fast-import's own pack, unrepacked) | **+0 / 0 / 0 / 0** (alone: 103.7 / 51.6 / 38.5 / 35.7) | 12.4 / 5.1 MB | 9.0 MB |
+| git v2.0.0 | 55.9 MB pack | 45.3 / 26.3 / 21.2 / 20.4 MB | 11.1 / 4.6 MB | 6.0 MB |
+| git v2.1.0, a second repository of the same project | +57.9 MB pack | **+1.27 / 0.63 / 0.49 / 0.38 MB** (alone: 46.6 / 26.9 / 21.7 / 20.8) | 11.4 / 4.7 MB (shared commits again; held once by identity in a store) | 6.1 MB |
+
+Chain depth a read applies, p50 / p99 / max: hg K=256 37 / 247 / 256, unbounded 45 / 2,383 / 3,499; git v2.0.0 K=256
+19 / 233 / 256, unbounded 19 / 591 / 1,004. The bound K=256 costs 7.7 % (hg) and 3.7 % (git) over unbounded; K=64
+costs 44 % and 29 %. Normalizing in Python (hashing, diffing, compressing every touched path for four bounds): hg
+164.8 s CPU for 57,054 changesets; git v2.0.0 104.4 s for 36,430 (an upper bound: the Rust landing is w-git's and
+w-hg's to time). Peak RSS of the run over both git repositories 409 MB (Python, every identity of both held).
+
+**Stock rows, best of 3 (all 3 shown).** git v2.0.0's full pack reusing stored deltas (serving a landed pack as
+received): 1.59, 0.94, 0.94 s, 364 to 380 MiB; recomputing every object and delta (serving from normalized content with
+no cached pack): 6.33, 9.70, 6.60 s, 489 to 548 MiB. hg's whole bundle from its revlogs: 5.95, 5.83, 8.48 s, 107 MiB.
+An old version read whole (git: every blob of the tree; hg: `archive`) at the history's first, middle and last tenth:
+git 0.02, 0.04, 0.07 s; hg 0.47, 1.00, 1.87 s.
+
+What it says:
+- **For one tool, the bytes do not decide it** (w-hg's and w-svn's sections agree): (b) at K=256 with its records is
+  about 46 MB for hg's history against 44.6 MB for hg's own zstd bundle and 77.6 MB for hg's store.
+- **Across tools and forks they do.** The same history arriving by a second tool adds 85.2 MB under (a) and no text
+  bytes under (b); a second repository of one project adds 57.9 MB under (a) and 0.49 MB under (b). Content once on
+  arrival (A-64, A-727) holds only under (b).
+- **(b)'s cost is serving.** A pack computed from normalized content is 6.3 s against 0.94 s reused for git v2.0.0, so
+  derived packs are cached by identity, and the received pack seeds that cache.
+- **Chains need checkpoints**, which K=256 (or w-hg's rule, a whole once a path's chain passes its length) gives for
+  under 8 % more bytes.
+- Owed: the Rust landing cost of git's normalization (w-git: the names are already computed on arrival since B2, so the
+  added work is the line delta against p1); a cross-tool clone served from the other tool's landing; N=3 on a quiet
+  machine.
+
+## A-722 part 3 against the main before it: a push's rows staged at its seal, by use (w-git's run request; main's go of 2026-11-20 15:35; UI goal 93; 2026-11-20)
+
+- **The builds:** before = 5ad8dea09 (main just before the part landed); p3 = 7b93d68c3 (the merge landing w-git's
+  82ff3bc79, "a push's rows are written at its seal and its landing adopts them"). Release, each from a `git archive` of
+  its commit into its own target directory (`cargo build --locked --release -p slates-cli`, 7 min 23 s and 24 s side by
+  side); the binaries differ. Script: `~/.cache/w-perf/bench/a722p3.sh` on the Studio, kiln r12.
+- **The commands**, each round on a fresh daemon an arm, the arms' order flipped each round (before, p3; p3, before;
+  before, p3): `crates/cli/bench/push_load.py SLATES ~/.cache/w-perf/data/cut-1.0.git 'v1.0.0^{commit}' --max 10` (1
+  push, then 10 at once, each to its own repository; a 3,434,551-byte pack of 12,232 objects), then `SERVERS=slates
+  crates/cli/bench/git_scale.sh SLATES cut-1.0.git WORK 1 900` (git/git cut at v1.0.0). The scripts as on main
+  (unchanged since before).
+- **The machine:** adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores, 96 GiB), 2026-11-20 15:29 to 15:42 PST, shared
+  with other agents' builds: load average 38 to 54 throughout, so every figure here is slower than the quiet records
+  above (one push 0.79 s at load 5 on 7b46fbdcd). Every clone: `fsck` clean, refs (2) and object ids (12,233) identical.
+  Every push answered `ok`, the daemon alive throughout.
+
+push_load, seconds and MiB, every round (r1, r2, r3):
+
+| | before | p3 |
+|---|---|---|
+| 1 push, wall | 2.882, 1.936, 2.455 | 1.820, 1.352, 1.404 |
+| 10 at once, p50 | 2.116, 2.119, 2.071 | 1.849, 1.311, 1.395 |
+| 10 at once, p99 | 2.134, 2.163, 2.082 | 1.874, 1.338, 1.431 |
+| daemon peak at 10 (MiB) | 1,777, 1,752, 1,726 | 1,768, 1,759, 1,762 |
+| held a push at 10 (MiB) | 152.5, 150.0, 147.2 | 151.6, 150.0, 150.9 |
+
+git_scale, seconds, every round:
+
+| | before | p3 |
+|---|---|---|
+| push, both refs | 2.012, 2.500, 3.454 | 2.134, 1.611, 1.791 |
+| first clone `--mirror` | 11.488, 11.852, 12.624 | 7.446, 7.299, 8.445 |
+| second clone `--mirror` | 1.162, 1.007, 0.958 | 1.082, 0.998, 1.043 |
+| one-commit push | 0.100, 0.106, 0.142 | 0.081, 0.084, 0.098 |
+| fetch of it | 0.111, 0.122, 0.119 | 0.086, 0.081, 0.098 |
+| clone `--depth 1` | 0.130, 0.211, 0.140 | 0.149, 0.108, 0.160 |
+| clone `--filter=blob:none` | 0.720, 0.637, 0.623 | 0.933, 0.925, 1.036 |
+| daemon RSS at the end (MiB) | 242, 241, 245 | 247, 244, 259 |
+
+What it says:
+- **Kept, by use.** Best of three: one push 1.936 → 1.352 s (1.4 times), ten at once p99 2.082 → 1.338 s (1.6 times),
+  git's push of both refs 2.012 → 1.611 s, and the first clone after a push 11.488 → 7.299 s (1.6 times). The one-commit
+  push and its fetch are 15 to 30 % faster; the second clone and the shallow clone are even.
+- **Not moved: memory.** A push still holds about 150 MiB at ten at once (44 times its 3.4 MB pack), the same in both
+  arms; p3 moves when rows are written, not what a push keeps. That is A-722 memory B1/B2's (w-git), not this part's.
+- **Regressed: the partial clone**, 0.623 to 0.720 s before against 0.925 to 1.036 s after (1.4 to 1.5 times slower in
+  every round). Reported to w-git with the logs.
+- Logs: `~/.cache/w-perf/ab/a722p3-20261120T232946/` on the Studio (`push-<arm>-<round>.log`,
+  `scale-<arm>-<round>.log`).
+
 ## Record version 3 against version 2: a push's latency with its names homed first (A-724 piece 8c; main's order of 2026-11-20; 2026-11-20)
 
 - **The builds:** v2 = f95edf68e (the switch off), v3 = 5ca050628 (the switch on, landed as 08fba4007), release, each built
@@ -15748,3 +15848,64 @@ Measured and rejected: the owned-run change (dead even with the cache, the same 
 Peak RSS of the bench (import + replay): 591-597 MB against the 447 MiB dump. The remaining gap to the matrix's
 0.54 s a revision is the server's per turn: ~960 steps a revision at one step a turn (the quantum, ~3.7 us, is under
 one step), measured next through the daemon's SSH site (`measure_svnsync_replay_range_over_the_tunnel`).
+
+## Content give-back per platform (g226, 2026-11-20)
+
+What frees a content extent's memory when two processes map it live (the anchor and its daemon), measured for w-sizing's
+on-demand content-pool extents (main's order of 2026-11-20 15:35; its macOS half is w-sizing's: `MADV_FREE_REUSABLE`
+kept the footprint, a purgeable Mach entry dropped it at once). Each run filled 1 GiB (16 extents of 64 MiB), mapped
+and written by both processes, gave back 512 MiB and read one second later. Python 3 standard-library probes, 120 s and
+1 GiB bounded, RAM only; the commands and the probes are in the fanout inbox note
+`inbox/w-sizing-from-g226-giveback.md` (`inbox/g226-giveback/`), run through kiln on the named machines.
+
+**Linux: adacachy** (CachyOS, kernel 7.2.9-2-cachyos, 32 CPUs, 125.9 GB; load average 55–70 throughout, 5–7 CI jobs).
+System `Shmem` from `/proc/meminfo`, each process's `RssShmem`, and under pressure the cgroup's `memory.current` in a
+`systemd-run --user --scope -p MemoryHigh=768M`:
+
+| Shape | Give-back | System Shmem | RssShmem anchor / second | Call | Under MemoryHigh=768M |
+|---|---|---|---|---|---|
+| A memfd per extent | the anchor unmaps and closes 8 | 1138 → 1138 MiB | 1018 → 506 / 1024 → 1024 | 11.1 ms | 767 → 767 MiB |
+| A memfd per extent | then the second process unmaps and closes them | 1138 → 626 MiB | 506 / 1024 → 512 | 2,716 ms (8 pipe round trips at load 56) | 767 → 518 MiB |
+| One memfd | `fallocate(PUNCH_HOLE \| KEEP_SIZE)` by the anchor, second map live | 1141 → 680 MiB | 1024 → 512 / 115 → 51 (second still filling) | 411.5 ms | 768 → 317 MiB (801.1 ms) |
+| One memfd | `madvise(MADV_REMOVE)` on the anchor's map, second map live | 1141 → 629 MiB | 1024 → 512 / 1024 → 512 | 705.9 ms | 767 → 432 MiB (233.0 ms) |
+
+One object's hole frees the pages in every mapping at once, from one process; a memfd per extent frees only when its
+last holder lets go. Descriptors at 1 TiB of address space, both processes holding each memfd: 2 MiB extents
+1,048,576 (adacachy's `RLIMIT_NOFILE`, soft and hard), 64 MiB 32,768, 1 GiB 2,048; one object, 1. Two runs reached the
+120 s bound on the loaded box and are left out; the per-extent rows are from a rerun whose second process
+acknowledges each command (the first run read before it had acted).
+
+**Windows: jupiter** (Windows 10.0.26200.9974, 32 CPUs, 128 GB). A 1 GiB pagefile-backed `SEC_RESERVE` section committed
+by `VirtualAlloc` on the anchor's view, opened by name and mapped by a second process; working sets from
+`GetProcessMemoryInfo`, available memory and commit from `GetPerformanceInfo` (a quiet second run):
+
+| Method | Call | Anchor's working set | Second's working set | Available | Commit |
+|---|---|---|---|---|---|
+| `VirtualFree(MEM_DECOMMIT)` on the view | refused, error 87 | 1041, unchanged | 1041, unchanged | — | — |
+| `DiscardVirtualMemory`, the anchor alone | 0, 115.7 ms | 1041 → 529 MiB | 1041, unchanged | 76,699 → 76,697 MiB | unchanged |
+| … then the second process too | 0, 242.5 ms | 529 | 1041 → 529 MiB | 76,697 → 77,205 (+508) | unchanged |
+| `OfferVirtualMemory(VeryLow)`, the anchor alone | 0, 106.3 ms | 1040 → 524 MiB | 1041, unchanged | 76,713 → 76,705 MiB | unchanged |
+| … then the second process too | 0, 143.4 ms | 523 | 1041 → 529 MiB | 76,705 → 77,219 (+514) | unchanged |
+| Both views unmapped, the section closed | — | — | — | +1,004 | 62,995 → 62,065 (−992) |
+
+A section view cannot be decommitted; discard and offer return physical memory only once every mapping process makes
+the call, and never the commit charge, which only closing the section returns. An offered range must be reclaimed
+(`ReclaimVirtualMemory`) before it is touched: a rewrite without it died of an access violation (after both offered,
+the anchor's reclaim answered 0 and the second's 170, `ERROR_BUSY`).
+
+Decided by them (w-sizing, 2026-11-20): Linux keeps one memfd with its free extents removed through the shard's view
+(`MADV_REMOVE`, today's design); Windows needs a section per extent, the commit returned only by closing it; macOS an
+object per extent (w-sizing's `agents/w-sizing-extents`).
+## A mounted work reads its green where it lies: a mount costs its divergence (A-774 part 2; main's order 1; 2026-11-20)
+
+`crates/server/tests/mounted_work_cow.rs`, release, macOS arm64 (this MacBook, local), interleaved, 5 runs a side, all
+shown. A 64 MiB green of 1,024 files of 64 KiB; 8 works each requested, mounted over the daemon's NFS, one file read
+through the mount and saved by temp file and rename. Before: main 3406df928 (each mount's slot seeded with a copy of the
+work's files, a2415c930). After: the slot an overlay over the green's pinned version (`slates_vfs::host::tree`).
+
+| side | resident added by 8 mounts (MB) | mount made, median, 64 MiB green (ms) | over a 16-file green (ms) |
+|---|---|---|---|
+| before | 547.0, 547.1, 547.0, 547.1, 547.1 | 11.14, 9.45, 12.94, 9.38, 10.41 | 0.54, 0.65, 0.58, 0.67, 0.68 |
+| after | 0.75, 0.75, 0.72, 0.82, 0.79 | 0.53, 0.78, 0.69, 0.60, 0.71 | 0.32, 0.56, 0.46, 0.42, 6.91 |
+
+Bound the test holds: 8 x (256 KiB + one 64 KiB file) + 8 MiB = 11.0 MB. A mount's own bytes: 90-102 KB.

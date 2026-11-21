@@ -661,7 +661,7 @@ fn a_replay_makes_each_delta_window_a_bounded_number_of_times() {
   use crate::report::drive::replay::{Replay, Stepped};
   use crate::svndiff::WINDOW_LIMIT;
   const LEN: usize = 512 * 1024;
-  let mut bytes: Vec<u8> = (0..LEN).map(|at| (at % 251) as u8).collect();
+  let mut bytes: Vec<u8> = (0..LEN).map(|at| u8::try_from(at % 251).unwrap()).collect();
   let mut repository = created();
   let mut opening = first();
   let (alpha, _) = content(b"alpha\n");
@@ -694,12 +694,11 @@ fn a_replay_makes_each_delta_window_a_bounded_number_of_times() {
   loop {
     steps += 1;
     assert!(steps < 1 << 24, "the replay never ended");
-    match replay
+    if let Stepped::Ended = replay
       .next_within((repository.index(), &repository), None, 1)
       .unwrap()
     {
-      Stepped::Ended => break,
-      _ => {}
+      break;
     }
   }
   let made = repository.windows_made() - before;

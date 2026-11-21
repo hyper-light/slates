@@ -134,30 +134,30 @@ fn a_presentation_past_the_bound_is_refused_and_changes_nothing() {
     1,
     "the re-presentation replaced the first"
   );
+  superseded_refused(&daemon, &mut client, (first, first_manifest), again);
+  drop(client);
+  daemon.stop();
+}
+
+/// A grant of landing `first` (of `manifest`), replaced by `newer`, under the issuer's proof: refused as superseded by
+/// kind, naming the newer (A-779).
+fn superseded_refused(
+  daemon: &Daemon,
+  client: &mut Client,
+  (first, manifest): (u64, [u8; 32]),
+  newer: u64,
+) {
   let secret = daemon.segment().issuer_secret().unwrap();
-  let proof = slates_server::landing::grant_proof(
-    &secret,
-    first,
-    &first_manifest,
-    GrantScope::Once,
-    GRANT_TERM_NS,
-  );
-  let replaced = client.grant(
-    first,
-    first_manifest,
-    GrantScope::Once,
-    GRANT_TERM_NS,
-    proof,
-  );
+  let proof =
+    slates_server::landing::grant_proof(&secret, first, &manifest, GrantScope::Once, GRANT_TERM_NS);
+  let replaced = client.grant(first, manifest, GrantScope::Once, GRANT_TERM_NS, proof);
   assert!(
     matches!(
       replaced,
-      Err(ClientError::Refused(Refusal::LandingSuperseded { newer })) if newer == again
+      Err(ClientError::Refused(Refusal::LandingSuperseded { newer: named })) if named == newer
     ),
     "the replaced presentation is no longer grantable, refused by kind naming the newer (A-779): {replaced:?}"
   );
-  drop(client);
-  daemon.stop();
 }
 
 /// §4.15 (AUD-29-02, A-49): a landing of a named snapshot presents that snapshot's state, whatever the head has become

@@ -304,7 +304,7 @@ fn judged_as(
   match expected {
     Ok(now) => {
       assert!(
-        matches!(answer, Outcome::Accepted { .. }),
+        matches!(answer, Outcome::Accepted { .. } | Outcome::Identical { .. }),
         "{what}: {answer:?}"
       );
       assert_eq!(text(green, "f").as_deref(), Some(now), "{what}");
