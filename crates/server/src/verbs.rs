@@ -1034,6 +1034,7 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
   // A holder's submit names its increment (lane (A) 3b): the owner shard holds it, fetched from the asking node by
   // identity, before the verb runs. Not had is answered retryable, nothing started; a retry asks only for what is lacking.
   if let RequestBody::SubmitComputed {
+    work,
     green,
     increment,
     increment_len,
@@ -1041,7 +1042,7 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
   } = &body
     && let Err(refusal) = fetch_named_increment(
       (control, shard),
-      origin,
+      ObjectId(work.bytes).creator(),
       (*green, *increment, *increment_len),
     )
     .await
@@ -1084,7 +1085,9 @@ pub(crate) const INPUTS_FETCHED_FROM_HOLDER_BYTES: &str = "merge.inputs.fetched_
 pub(crate) const INPUTS_FETCH_SHORT: &str = "merge.inputs.fetch_short";
 
 /// Gives the owner `shard` the increment a holder's `SubmitComputed` names (lane (A) 3b): nothing when the shard holds it
-/// already (a retry, or a version committed before); else fetched from `from`, the node that composed it and holds it
+/// already (a retry, or a version committed before); else fetched from `from`, the member that made the work (its id's
+/// creator, the key of this node's record session to it, where the forward's session names the peer's anchor), which
+/// composed it and holds it
 /// under that identity (`merge_service::hold_composed_inputs`), on the content plane into this control shard's hold
 /// (`fleet::fetch_manifest_into_hold`: hedged, every chunk verified, a cut fetch's chunks kept for the next ask), then held
 /// once on the owner shard for the version it would make (`merge_service::hold_increment`) and released here. Owed: the
@@ -1106,14 +1109,19 @@ async fn fetch_named_increment(
   {
     return Ok(());
   }
-  let whole = crate::fleet::fetch_manifest_into_hold(
-    object,
-    &[from],
-    |_| 0,
-    identity,
-    crate::fleet::live_budget(),
-  )
-  .await;
+  // The record session to the asking node may be out on a loan (a shipment, a link's probe): the fetch waits for its
+  // return and asks again, each ask for what the stage still lacks, within one deadline the fleet's live budget derives.
+  let budget = crate::fleet::live_budget();
+  let deadline = slates_machine::clock::monotonic_ns().saturating_add(budget.max_deadline_ns());
+  let whole = loop {
+    if crate::fleet::fetch_manifest_into_hold(object, &[from], |_| 0, identity, budget).await {
+      break true;
+    }
+    let left = deadline.saturating_sub(slates_machine::clock::monotonic_ns());
+    if left == 0 || crate::fleet::session_returned(&[from], left).await != Some(true) {
+      break false;
+    }
+  };
   let bytes = whole
     .then(|| {
       crate::state::with_state(|s| {
