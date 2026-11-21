@@ -1,5 +1,14 @@
 # w-rewrite-ops progress (D-O17: a whole-file rewrite becomes the precise edit it was)
 
+## NEXT, in order (main 04:36 PST, 2026-11-21)
+1. **Stage C, the green's side.** It waits for w-svn's answer on the split (inbox/w-svn-from-w-rewrite-ops-stage-c-split.md).
+   If w-svn hasn't answered within its next turn, I build my half against the proposed split: `ImportBatch` on a lineage
+   preview, one `apply_recorded` commit, and push taking N updates of one green.
+2. **A-809 leftover (b).** Layers that carry an offset shift, composing with overwrite layers, so an insert or delete
+   walks no earlier value. The oracle must cover them. Red: values walked per insert (2,551 at history 5,000 today).
+3. **The drift.** A one-value change still goes 2.6 to 9–10 µs over history 100 to 5,000 (A-811's bench). Chase it after
+   (b).
+
 ## 2026-11-21 ~04:35 PST — main 04:11: leftovers measured, A-811 LANDED (main 55288d05b); stage C split proposed
 - (a) read through layers: 191 to 5.9 µs at m = 10^4. (b') SDK replace: 12.6 ms to 10.4 µs at history 5,000.
 - (b) insert re-anchor: measured open (17.5 ms at history 5,000); its design asked of main.
