@@ -9013,6 +9013,7 @@ fn edit(
       green: lent.as_deref(),
       fetched: home.fetched.as_ref(),
       version: w.base_version,
+      entries: Some(&w.entries),
     };
     crate::work_log::apply_edit(
       (&mut w.files, &mut w.journal),
@@ -9249,6 +9250,7 @@ fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: Wo
       green: lent.as_deref(),
       fetched: home.fetched.as_ref(),
       version: w.base_version,
+      entries: Some(&w.entries),
     };
     crate::work_log::apply_declare((&mut w.files, &mut w.journal), base, volume_op)
   };
@@ -9422,6 +9424,7 @@ fn build_increment(
     green: Some(&*engine),
     fetched: None,
     version: base_version,
+    entries: None,
   };
   let kept = crate::refining::kept(state, sealed.work, (base_version, sealed.journal.len()));
   let inc = compose_increment(
@@ -10594,7 +10597,7 @@ fn judge_submission(
         increment_bytes,
         increment: inc,
         applied,
-        verification: signed.verification.clone(),
+        verification: signed.verification,
         computed: sealed.computed.is_some(),
         authorship: policy.authorship.clone(),
       };
@@ -11178,6 +11181,7 @@ pub(crate) fn compose_on_replica(
     green: Some(replica),
     fetched: None,
     version: sealed.base_version,
+    entries: None,
   };
   let kept = crate::refining::kept(
     state,
@@ -11348,6 +11352,12 @@ fn canonical_declaration(
     .collect()
 }
 
+/// A work's changed files (each its held parts, none: removed) and its journal of ops.
+type ChangedWork = (
+  std::collections::BTreeMap<String, Option<crate::work_files::HeldParts>>,
+  Vec<VolumeOp>,
+);
+
 /// A resolution's changes applied over a work rebased onto `head` (A-796), as the work's own edits and declarations
 /// would be: each edit's operations from the file's length alone and its bytes as pieces over the head
 /// (`crate::work_files`), each declaration converted as `declare` converts it. The work's changed files then, as parts
@@ -11355,24 +11365,16 @@ fn canonical_declaration(
 fn apply_replacement(
   engine: &slates_merge::engine::Green,
   head: u64,
-  (changed, mut journal): (
-    std::collections::BTreeMap<String, Option<crate::work_files::HeldParts>>,
-    Vec<VolumeOp>,
-  ),
+  (changed, mut journal): ChangedWork,
   replacement: &[slates_ipc::protocol::WorkChange],
-) -> Result<
-  (
-    std::collections::BTreeMap<String, Option<crate::work_files::HeldParts>>,
-    Vec<VolumeOp>,
-  ),
-  Refusal,
-> {
+) -> Result<ChangedWork, Refusal> {
   use slates_ipc::protocol::WorkChange;
   let mut files = crate::work_files::WorkFiles::from_parts(changed);
   let base = crate::work_files::Base {
     green: Some(engine),
     fetched: None,
     version: head,
+    entries: None,
   };
   let unknown = || Refusal::UnknownBase {
     green: VolumeId::default(),
@@ -11435,12 +11437,21 @@ fn rebase_answer(
       changed,
       journal,
     } => {
-      // A work that composed its own increment composes its next one too: it is given the entries it will need.
+      // A work that composed its own increment composes its next one too: it is given the entries it will need, of the
+      // paths its restated journal names and of every path its increment touched, so an edit of a path whose change
+      // became the head's reads its length from the entry, not the owner (A-808).
       let entries = if composes {
         journal
           .iter()
           .flat_map(VolumeOp::names)
           .flatten()
+          .chain(
+            inc
+              .doc
+              .ops
+              .iter()
+              .filter_map(|op| inc.doc.paths.path(op.path)),
+          )
           .map(|path| (path.to_owned(), engine.path_base(version, path)))
           .collect()
       } else {
@@ -14127,7 +14138,7 @@ fn bind_mount(
 /// prefix and its path), not its path alone, and the mounts take no more than the room the rest of the report leaves
 /// (A-267, 2026-11-18): a long name can leave less than this.
 /// Derived: `BULK_CHUNK_BYTES` (4096) / 4.
-const MOUNTS_REPORT_BYTES: usize = 1024;
+pub(crate) const MOUNTS_REPORT_BYTES: usize = 1024;
 
 /// Format: what the retired whole-file `Read` is refused as (A-267): the verb, and the paged read that replaced it.
 const RETIRED_WHOLE_READ: &str =
@@ -14143,7 +14154,7 @@ pub(crate) const WATCHER_MERGE: &str = "merge";
 /// The volume's bound host mounts for its status (§4.4 `Bound`; GAP-A9-4): each `Consumer::Bridge`
 /// attachment whose form is a chosen path, as many as `budget` bytes carry (in id order), and the
 /// count of those it did not.
-fn mounts_of(
+pub(crate) fn mounts_of(
   state: &ShardState,
   volume: DbVolumeId,
   budget: usize,

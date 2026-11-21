@@ -14,6 +14,7 @@
 //!   a merge the rule says is due (`Index::compaction_due`) begins: the rule's rent-or-buy over the deployment's own
 //!   timings decides which newest runs, and when. An index never merged has no price (a merge's measured time) for the
 //!   rule to weigh, so its first reported lookups merge it once, which times one (a repository filled by pushes alone).
+//!
 //! A fetch reads a fork of the index (A-745's generation), whose runs are shared, so it neither reports nor merges: runs a
 //! fork shares are never merged, and a merge whose runs a fork comes to share is given up (`MergeStep::GivenUp`).
 //!
@@ -231,22 +232,28 @@ mod tests {
         slices = slices.saturating_add(1);
         assert!(slices < 10_000, "the merge ended");
       }
-      let counted =
-        |state: &ShardState, name: &'static str| state.refusals.get(name).copied().unwrap_or(0);
-      assert_eq!((counted(state, MERGED), counted(state, GIVEN_UP)), (1, 0));
-      assert!(
-        counted(state, STEPS) > 1,
-        "sliced: {}",
-        counted(state, STEPS)
-      );
-      let (content, index) = index_of(&mut state.vcs_stores, id).unwrap();
-      assert_eq!(index.run_tables().len(), 1);
-      for key in &keys {
-        let before = index.visits();
-        assert!(index.get(content, key).is_some(), "{key:?}");
-        assert!(index.visits().saturating_sub(before) <= 2);
-      }
+      merged_into_one_run(state, id, &keys);
     });
+  }
+
+  /// One merge counted, made in more steps than one; `id`'s index one run, every one of `keys` read back, each lookup
+  /// visiting at most the tail and that run.
+  fn merged_into_one_run(state: &mut ShardState, id: RepositoryId, keys: &[Vec<u8>]) {
+    let counted =
+      |state: &ShardState, name: &'static str| state.refusals.get(name).copied().unwrap_or(0);
+    assert_eq!((counted(state, MERGED), counted(state, GIVEN_UP)), (1, 0));
+    assert!(
+      counted(state, STEPS) > 1,
+      "sliced: {}",
+      counted(state, STEPS)
+    );
+    let (content, index) = index_of(&mut state.vcs_stores, id).unwrap();
+    assert_eq!(index.run_tables().len(), 1);
+    for key in keys {
+      let before = index.visits();
+      assert!(index.get(content, key).is_some(), "{key:?}");
+      assert!(index.visits().saturating_sub(before) <= 2);
+    }
   }
 
   /// An index never merged (a repository filled by pushes alone) is merged once its lookups are reported, which gives

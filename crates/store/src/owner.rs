@@ -51,6 +51,9 @@ pub struct SectionAt {
 /// A section of a landing: its kind and its bytes, moved in.
 pub type Part = (SectionKind, Vec<u8>);
 
+/// The rows a texts-by-tool ask answers: each tool id's text identity and row, none where it has none.
+type TextsAnswer = Result<Vec<Option<(Identity, TextRow)>>, StoreError>;
+
 /// A request to the owner, with the channel its answer goes back on.
 enum Request {
   Begin {
@@ -123,7 +126,7 @@ enum Request {
     repository: u128,
     path: Vec<u8>,
     tool_ids: Vec<Vec<u8>>,
-    answer: Sender<Result<Vec<Option<(Identity, TextRow)>>, StoreError>>,
+    answer: Sender<TextsAnswer>,
   },
   Places {
     places: Vec<Place>,

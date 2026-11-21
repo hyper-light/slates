@@ -2556,20 +2556,73 @@ impl Green {
         })
         .map(|(dst, _)| dst.clone()),
     );
-    // Every link at either end: by the one history rule a link unchanged since version 0 has no history (A-534).
+    // Every link at either end: by the one history rule a link unchanged since version 0 has no history (A-534). A link
+    // changes with its target where the target was a special node by the target's change, as the index records it
+    // (`record_changes` asks `was_special` as the version commits): a target that becomes special only after the span
+    // read through the link as before within it, since a link resolves one level.
     let aliases: Vec<String> =
       union_keys(self.hardlinks.keys(), self.hardlink_history.keys().cloned()).collect();
     for alias in aliases {
       let targets = [self.hardlink_at(&alias, from), self.hardlink_at(&alias, to)];
-      if targets
-        .iter()
-        .flatten()
-        .any(|target| self.was_special(target) && changed.contains(target))
-      {
+      if targets.iter().flatten().any(|target| {
+        changed.contains(target)
+          && self
+            .last_change_in(target, from, to)
+            .is_some_and(|version| self.special_by(target, version))
+      }) {
         changed.insert(alias);
       }
     }
     changed.into_iter().collect()
+  }
+
+  /// The model's: the last version in `(from, to]` at which any dimension of `path` changed, read off its histories.
+  #[cfg(feature = "test-model")]
+  fn last_change_in(&self, path: &str, from: u64, to: u64) -> Option<u64> {
+    fn last<T>(history: Option<&Vec<(u64, T)>>, from: u64, to: u64) -> Option<u64> {
+      history?
+        .iter()
+        .map(|(version, _)| *version)
+        .filter(|version| *version > from && *version <= to)
+        .max()
+    }
+    let xattrs = self
+      .xattr_history
+      .iter()
+      .filter(|((at, _), _)| at == path)
+      .filter_map(|(_, history)| last(Some(history), from, to))
+      .max();
+    let copies = self.copies.get(path).and_then(|records| {
+      records
+        .iter()
+        .map(|record| record.version)
+        .filter(|version| *version > from && *version <= to)
+        .max()
+    });
+    [
+      last(self.content_history.get(path), from, to),
+      last(self.special_history.get(path), from, to),
+      last(self.dir_history.get(path), from, to),
+      last(self.mode_history.get(path), from, to),
+      last(self.symlink_history.get(path), from, to),
+      last(self.hardlink_history.get(path), from, to),
+      xattrs,
+      copies,
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+  }
+
+  /// The model's: whether `path` was a special node by `version`, as [`Green::was_special`] answered when `version`
+  /// committed: its special history holds an entry at or before it, or, with none, it holds a special node since the
+  /// origin.
+  #[cfg(feature = "test-model")]
+  fn special_by(&self, path: &str, version: u64) -> bool {
+    match self.special_history.get(path) {
+      Some(history) => history.iter().any(|(at, _)| *at <= version),
+      None => self.specials.contains_key(path),
+    }
   }
 
   /// What the green holds at its head under `dir` (A-792): every file, directory, symlink and special node whose
@@ -3404,6 +3457,11 @@ impl Green {
   /// copied out of them (A-793's non-vacuity counters, `crate::history::reanchor`).
   pub fn history_reanchored(&self) -> (u64, u64, u64) {
     self.history_reanchored
+  }
+
+  /// The anchor layers reads of earlier values have examined, in all (A-809): what a read through layers costs.
+  pub fn history_layers_examined(&self) -> u64 {
+    self.chunks.layers_examined()
   }
 
   /// The history values re-anchors walked in all (A-803): divided by the re-anchored changes, the values a change walks.

@@ -356,6 +356,7 @@ pub(crate) fn with_work_base<R>(
     green: lent.as_deref(),
     fetched: state.work_home.fetched.as_ref(),
     version: work.base_version,
+    entries: Some(&work.entries),
   })
 }
 
@@ -1451,7 +1452,7 @@ pub(crate) fn status_merge_volume(
     state,
     &rights_of(&record, principal),
   )));
-  Some(ReplyBody::Status {
+  let mut reply = ReplyBody::Status {
     report: Box::new(slates_ipc::protocol::StatusReport {
       transports,
       id: volume,
@@ -1468,8 +1469,7 @@ pub(crate) fn status_merge_volume(
       nfs_port: u16::try_from(crate::daemon::NFS_PORT.load(std::sync::atomic::Ordering::Acquire))
         .ok()
         .filter(|port| *port != 0),
-      // A green has no host mount of its own to bind (§4.16: a green is served through pinned
-      // attachments, the record form).
+      // Filled below, in the room the report leaves, as a plain volume's are.
       mounts: Vec::new(),
       mounts_elided: 0,
       drifted_elided: 0,
@@ -1484,7 +1484,15 @@ pub(crate) fn status_merge_volume(
       // reported rather than a zero it was not measured to be.
       loss: slates_ipc::protocol::LossReport::default(),
     }),
-  })
+  };
+  // A mounted work's host mounts, as any volume's (A-774 C1): Windows' unmount finds its drive among the volumes'
+  // reported mounts, so a work that reported none could not be unmounted (jupiter r3, 2026-11-21).
+  let room = crate::verbs::reply_room(&reply);
+  if let ReplyBody::Status { report } = &mut reply {
+    (report.mounts, report.mounts_elided) =
+      crate::verbs::mounts_of(state, id, room.min(crate::verbs::MOUNTS_REPORT_BYTES));
+  }
+  Some(reply)
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -424,12 +424,15 @@ fn cut<'a>(
   Ok(cuts)
 }
 
+/// A table cut from rows: its cut, and its first key (none: no row was left).
+type OneTable = (Option<Cut>, Option<Box<[u8]>>);
+
 /// The first table of `rows` (in key order) cut as [`cut`] cuts each, at most `window` bytes, and its last key; none when
 /// no row is left.
 fn one_table<'a>(
   rows: impl Iterator<Item = RowRef<'a>>,
   window: usize,
-) -> Result<(Option<Cut>, Option<Box<[u8]>>), IndexRefused> {
+) -> Result<OneTable, IndexRefused> {
   let mut builder = TableBuilder::new();
   let mut first: Option<Box<[u8]>> = None;
   let mut last: Option<Box<[u8]>> = None;
