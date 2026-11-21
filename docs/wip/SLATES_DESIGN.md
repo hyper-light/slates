@@ -56504,8 +56504,22 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   API did not exist. macOS arm64, merged main 051bf8f4: `slates-vfs --test referenced` 6 of 6, `--lib`, `--test recover`,
   `--test image`, `--test special` 167 of 167; `slates-server --lib vcs_store::referenced` 2 of 2; `slates-api --lib
   volume_core` 3 of 3.
-- **Owed.** P3's presenter (the view a hook runs in, under the root mount, made of referenced files), P4, the root mount's
-  publication (A-645 (a)), and the presenter's call of `hold_owed_references` after a recovery.
+- **Part 3, its fourth piece (2026-11-20, A-645 (a) part 1, main's ruling of 20:00): the view as a volume.**
+  `vcs_store::svn_presenter::Presented` lays a repository's view into a volume of its own, a budget of node-revisions a
+  call: the directories and fixed files, each revision's properties file, and each revision file as a referenced file
+  (`fsfs::RevisionFile::pieces`: its made bytes kept in the volume, each text a piece by identity and length). `db/current`
+  is rewritten after the files it names exist. A revision property change rewrites that revision's file
+  (`revision_properties_changed`). A text is read through `ViewTexts`, the repository's own text source (the green's held
+  head text, else the content store's window, else the records' delta window), and held through `ViewHolds` where the
+  content store keeps it. Every text is `PLAIN`: `WithTexts` answers no stored delta (`fsfs::TextDeltas`), since the
+  records' svndiffs are no content a piece can name and per-file deltas become derived forms of the changeset log (Ada's
+  ruling of ~13:35). Held by `the_presented_volume_holds_the_fsfs_view_byte_for_byte` (the golden repository laid out a
+  node-revision a call; every revision file, properties file and fixed file the bytes `fsfs` makes, each revision file
+  refused `EROFS`) and `a_revision_property_change_rewrites_that_revisions_properties_file`.
+- **Owed.** A-645 (a) parts 2 and 3: the view's volume made and kept current by the daemon, mounted read-only under the
+  store's standing grant (`<--vcs-store>/<repository>.svn`) through each platform's mount, its path the hook's
+  REPOS-PATH (the "root mount not yet published" refusal goes), and the by-use red (stock svn's revprop change through
+  a real anchor). Then P4, and the presenter's call of `hold_owed_references` after a recovery.
 - **Applied in the same change to** GAPS (A-661's hook entry), amendments.tsv.
 
 ### A-664 live whole builds, a parked submit's wait bounded — Answered `Overloaded` once it waits past the node's failover delay (2026-11-20, w-shared for UI goal 93; main's ruling)
@@ -57807,6 +57821,22 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > repository's landings on the device share one flush (item 2). Red test: `repository::store_tests` 1/1 (a git
 > repository created through the verb, its creation landed, the daemon and the owner stopped, the store reopened from its
 > files: one changeset, sequence 0, its record and its row read back).
+>
+> **Status (2026-11-20, A-645's derived per-path read form on the store; w-perf, main's orders of 18:30 and 19:50; the
+> interface agreed with w-hg, inbox `*-per-path-read-2026-11-20`).** A changeset's `Texts` section is one format for
+> every tool (`slates_store::texts`: per touched path its bytes, the tool's id, the full text's identity and length,
+> its edit's base, and the edit's or whole's place in the payload; Mercurial's changelog and manifest as the paths
+> `\0changelog` and `\0manifest`), and the edit is one form, Mercurial's `mpatch` hunks. Landing (and a recovery's
+> replay) derives two tables from it: `T` (a repository's text by identity: its changeset, length, base, place) and
+> `H` (a path by BLAKE3 and a sequence: the text kept). `Store::text_at` makes an old version by walking its `T` rows
+> to a whole and applying each edit read from its own changeset's payload, so no changeset outside the chain is read;
+> `path_texts` lists a path's history; the owner answers `text`, `text_row` and `path_texts` for shards, holding the
+> texts it made in a cache whose bound is learned (the longest chain it had to make). Held by
+> `an_old_file_revision_is_read_from_its_own_chain_alone` (39 changesets over three paths; the changesets read equal
+> the version's chain; again after a reopen) and `a_shard_reads_an_old_file_revision_through_the_owner_across_a_restart`
+> (red with the rows not written: no landed text). Owed: a changeset landed through `begin`/`applied` writes neither
+> `P` nor `T`/`H` rows (only `Store::land` does); the release timing against the per-file arm's 91 µs
+> (`examples/per_path_read.rs`, Mercurial's own history).
 
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
