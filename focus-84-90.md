@@ -1541,3 +1541,8 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - REASSIGNED: the deferred-submit hook (svn_made's acceptance and git's made commits wait for the store's landing; one hook) moves from w-work-cow, deaf after agents_restart, to w-rewrite-ops, whose A-787 park is the nearest mechanism. Red first; svn_made adopts it; git drops version 2 in the same series. Not on main yet (searched).
   - w-git's push cut-off: small pushes are fine on main (cut-1.0 in 5.1 s); r56 with every counter is running.
   - The MacBook disk is 34 GB.
+- 2026-11-21 01:53 PST
+  - LANDED: 08d65411e (w-perf, hg serve's first landing): the index merge is made a table at a time and kept up on its owner shard, lends report to the learned rule, and a pull is made from what it sends. A/B against hg serve running.
+  - THE PUSH CUT-OFF, NAMED (w-git): about 65 s in, an answer step refuses the 611 MB push PastAdmission (its working set outgrew the room its shard admitted). The reply's head was already out, so the 413 can't be sent and the edge aborts: curl 18.
+  - RULING: layer 1 now: every refusal after the head in git's own words, never an aborted connection. Layer 2 before C5 2b piece 3: the answer phases slice over the pack held once and charge only the slice (A-719, Ada's tens-of-thousands-of-large-pushes rule). Red: the 611 MB push lands within its room; A/B against stock git's 10.77 s.
+  - DISK: the MacBook at 26 GB; w-svn's target regrew to 27 GB. It deletes incremental and builds with CARGO_INCREMENTAL=0.
