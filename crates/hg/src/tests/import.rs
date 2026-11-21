@@ -1392,7 +1392,7 @@ fn a_rendered_repository_imports_back_to_the_same_index() {
 /// Goal 93 perf (main's order of 2026-11-21 00:22: a one-changeset pull that scales with the history). An index built
 /// whole (an import, a replay) ends with its runs merged, so a lookup reads one run, not every seal's. Do: import a
 /// repository into a store whose small window seals many runs; count the runs a lookup of each changeset visits; then
-/// mark the index built (`HgIndex::built`) and count again. Expect: more than two runs visited before; at most two (the
+/// merge it as the server's upkeep merges an index built whole, a table at a time, and count again. Expect: more than two runs visited before; at most two (the
 /// tail and the merged run) after, one merge counted, and every changeset read back alike.
 #[test]
 fn an_index_built_whole_is_read_from_one_merged_run() {
@@ -1419,7 +1419,10 @@ fn an_index_built_whole_is_read_from_one_merged_run() {
   let seals = imported.index.rows().counters().seals;
   assert!(seals > 2, "the small window seals many runs: {seals}");
   assert!(before > 2, "a lookup visits every run first: {before}");
-  imported.index.built(&mut store, &mut Ticking(0)).unwrap();
+  // The server's upkeep merges an index built whole a table at a time (`vcs_store::index_upkeep`): the same steps here.
+  let rows = imported.index.rows();
+  let mut merge = rows.merge_begin(&store, usize::MAX).unwrap();
+  while rows.merge_step(&mut store, &mut merge).unwrap() == slates_vcs::MergeStep::More {}
   let (after, rows_after) = visited(&mut imported, &store);
   assert_eq!(
     (

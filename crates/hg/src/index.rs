@@ -373,30 +373,6 @@ impl HgIndex {
     &mut self.rows
   }
 
-  /// Marks the index built whole (an import placed, a replay or rebuild ended): every run it alone holds merged into
-  /// one, the merge timed on `clock` and reported to the index's learned rule (`Index::compaction_took`). An index built
-  /// whole was written by its seals and read by no one yet: every later lookup visits each run it leaves unmerged (the
-  /// tail, then the runs from the newest), so the rent of merging them is certain, and one merge reads each row once.
-  /// Measured on Mercurial's own history (`examples/index_runs.rs`): 155 runs, a lookup visiting 123 at p50 (11.8 µs)
-  /// before, 2 (0.6 µs) after a 0.28 s merge. Runs a fork shares are never merged (`Index::compact`). The rows merged.
-  ///
-  /// # Errors
-  /// The store's refusal of the merged run's tables (past its room); the index is then as it was.
-  pub fn built(
-    &mut self,
-    store: &mut ContentStore,
-    clock: &mut impl crate::import::Clock,
-  ) -> Result<u64, IndexRefused> {
-    let started = clock.now_ns();
-    let merged = self.rows.compact(store, usize::MAX)?;
-    if merged > 0 {
-      self
-        .rows
-        .compaction_took(clock.now_ns().saturating_sub(started));
-    }
-    Ok(merged)
-  }
-
   /// A fork: the same rows, held once more, to which it adds only its own (A-581's `Index::fork`).
   pub fn fork(&mut self, store: &mut ContentStore) -> Result<HgIndex, IndexRefused> {
     Ok(HgIndex {
