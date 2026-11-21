@@ -1342,9 +1342,18 @@ fn wide_trees(absent: bool) -> Vec<u8> {
   request(&[], &command, b" report-status", &[], &pack_of(&listed))
 }
 
+/// What [`wide_connectivity`] answers: each command's state, or the check's refusal.
+#[derive(Debug, PartialEq)]
+enum WideAnswer {
+  /// Each command's state.
+  Connected(Vec<Connected>),
+  /// The check's refusal.
+  Refused(Refusal),
+}
+
 /// [`wide_trees`]'s push read and checked against an empty repository, then its connectivity checked again within
 /// `room` bytes an object of the pack: each command's state, or the refusal.
-fn wide_connectivity(absent: bool, room: u64) -> Result<Vec<Connected>, Refusal> {
+fn wide_connectivity(absent: bool, room: u64) -> WideAnswer {
   let bytes = wide_trees(absent);
   let repository = Repo::default();
   let mut session = super::Session::new(&ADVERTISED, &HIDDEN);
@@ -1357,7 +1366,10 @@ fn wide_connectivity(absent: bool, room: u64) -> Result<Vec<Connected>, Refusal>
   let objects = checked.objects();
   let pushed = Pushed::new(objects, Some(session.kept()), &mut unbounded()).unwrap();
   let mut admission = Admission::new(room.saturating_mul(wide(objects.len())));
-  connectivity(&checked.request, &pushed, &repository, &mut admission)
+  match connectivity(&checked.request, &pushed, &repository, &mut admission) {
+    Ok(connected) => WideAnswer::Connected(connected),
+    Err(refused) => WideAnswer::Refused(refused),
+  }
 }
 
 /// A-719 (main's order 01:56 PST, 2026-11-21: a push's working set is bounded by the slice in flight, never by its
@@ -1368,6 +1380,12 @@ fn wide_connectivity(absent: bool, room: u64) -> Result<Vec<Connected>, Refusal>
 /// room: the check charges a few bytes an object, never a word an edge.
 #[test]
 fn the_connectivity_check_charges_its_objects_never_its_edges() {
-  assert_eq!(wide_connectivity(false, 8), Ok(vec![Connected::Complete]));
-  assert_eq!(wide_connectivity(true, 64), Ok(vec![Connected::Missing]));
+  assert_eq!(
+    wide_connectivity(false, 8),
+    WideAnswer::Connected(vec![Connected::Complete])
+  );
+  assert_eq!(
+    wide_connectivity(true, 64),
+    WideAnswer::Connected(vec![Connected::Missing])
+  );
 }
