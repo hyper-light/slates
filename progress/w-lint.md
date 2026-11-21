@@ -298,3 +298,5 @@
   merge_check, fleet). Tests run for each (listed in the commits).
 - Sent: w-provision-gate (rt spin_kick time-wait; since fixed upstream), w-git (receive tests wide_connectivity),
   w-hg (push intake_tests intake): both still red on the host. w-store: 3 store literals.
+- Windows run requests: r12 (the once-only resubmission, by needs "windows", each step capped) never started: jupiter's
+  runner restarted while it was "starting". Not resubmitted again; main to say when jupiter is steady.
