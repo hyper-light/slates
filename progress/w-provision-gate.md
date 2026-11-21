@@ -49,6 +49,11 @@
 - ~19:20: C1 CLOSED: baseline landed b45a114e3 (kiln r9, sync:false clone on the big Studio, per main 18:35); close
   note inbox/main-from-w-provision-gate-close.md. Remote clone/target removed. Next: P2 (loaded p999 hop, with g222).
 
+- ~20:30: P2 p999 hop named and docs landed 8edfb763e. Candidates' loaded p999 = cross-shard hops to a demoted
+  true-spinning shard (7-29 ms); QoS rejected. P2 is a trade-off -> DECISION asked of main/Ada (land immediate poll or
+  keep the nap). Land worktree holds uncommitted DIAG (diag_stages, verbs marks, bench stamps, runtime DIAG_QOS) on top
+  of the time-estimator arm: strip before any commit. Arms/logs: ~/.cache/w-provision-gate-arms/ab7*, ab8*.
+
 ## Queue
 1. DONE measure; DONE gate (2c8f89de6); DONE red (bench loaded bound).
 2. NEXT: A-387's held-turn estimate forgets by turn count (cheap turns forget a ms preemption in microseconds); weigh
