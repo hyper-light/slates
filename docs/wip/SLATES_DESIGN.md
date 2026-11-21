@@ -7985,7 +7985,10 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > the session's own, `slates_cluster::live::Exchanged::round_trips`). A shard answers `Configuration::place` from a
 > cache keyed by everything `place` reads (`crate::placement_cache`, `ShardState::with_placement`), bounded by its
 > placed heads and refilled whole when the configuration moves, so a live write's durability polls allocate no
-> placement (g228, 2026-11-21).
+> placement (g228, 2026-11-21). The build hop is split into its steps (`fleet.live.hop.build.{capture,keys,seal,append,
+> send}`), and the owner keeps each live volume's lineage key and namer between publications (`seal_keys::BodyKeys`),
+> served only while the tenant, lineage and naming records it unwrapped them from are the ones recorded, compared by key
+> id at every use, and bounded by the volumes it ships live: a publication had unwrapped five keys afresh.
 >
 > **A live write parks no shard on its path where a held shard polls (2026-11-18, A-396, g076b).** The round's cost was
 > parked threads, not the cross-shard hop: each shard on a write's path (the owner awaiting the fold, its control shard

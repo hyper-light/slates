@@ -16561,14 +16561,39 @@ fn a_live_writes_round_is_counted_hop_by_hop_and_the_hops_add_up_to_it() {
     count(&daemons[0], LIVE_ROUND.1),
   );
   let percentiles = hop_percentiles(&mut client);
+  // The build split into its steps (capture, seal, append, send; g228, 85a): timed for entries made in their
+  // publication's own turn, each step's nanoseconds within the build's.
+  let build_steps: Vec<(u64, u64)> = [
+    "fleet.live.hop.build.capture",
+    "fleet.live.hop.build.keys",
+    "fleet.live.hop.build.seal",
+    "fleet.live.hop.build.append",
+    "fleet.live.hop.build.send",
+  ]
+  .iter()
+  .map(|step| {
+    (
+      count(&daemons[0], step),
+      count(&daemons[0], &format!("{step}_ns")),
+    )
+  })
+  .collect();
   let holders: Vec<u64> = [&daemons[1], &daemons[2]]
     .iter()
     .map(|holder| count(holder, LIVE_HOLDER_HOP.0))
     .collect();
+  // A sealed volume's keys are unwrapped once and kept for its later publications (`seal_keys::BodyKeys`).
+  let body_keys = (
+    count(&daemons[0], "fleet.live.body_keys.kept"),
+    count(&daemons[0], "fleet.live.body_keys.fetched"),
+  );
   for daemon in daemons {
     daemon.stop();
   }
-  eprintln!("hops: (timed, ns) {hops:?}; round {round:?}; holders' serves {holders:?}");
+  eprintln!(
+    "hops: (timed, ns) {hops:?}; round {round:?}; build steps {build_steps:?}; body keys (kept, fetched) {body_keys:?}; \
+     holders' serves {holders:?}"
+  );
   assert!(
     replies
       .iter()
@@ -16584,6 +16609,21 @@ fn a_live_writes_round_is_counted_hop_by_hop_and_the_hops_add_up_to_it() {
   assert!(
     holders.iter().any(|served| *served > 0),
     "a holder's serves were timed: {holders:?}"
+  );
+  let build_ns = hops.first().map_or(0, |(_, ns)| *ns);
+  let steps_timed = build_steps.first().map_or(0, |(timed, _)| *timed);
+  assert!(
+    steps_timed > 0 && build_steps.iter().all(|(timed, _)| *timed == steps_timed),
+    "every build step was timed, as often as each other: {build_steps:?}"
+  );
+  assert!(
+    body_keys.1 >= 1 && body_keys.0 > body_keys.1,
+    "the volume's keys were fetched and then kept for most publications: (kept, fetched) {body_keys:?}"
+  );
+  let steps_ns: u64 = build_steps.iter().map(|(_, ns)| ns).sum();
+  assert!(
+    steps_ns <= build_ns,
+    "the build's steps add up to no more than the build: {steps_ns} ns against {build_ns} ns ({build_steps:?})"
   );
 }
 

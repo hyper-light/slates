@@ -17535,6 +17535,40 @@ are ahead in 4 of 5 rounds and its slow writes far fewer. One soft spot stays on
 it led 4 of 5 medians, but round 3 was 461.6 against 385.6, and that condition's p999 was higher in 3 of 5 rounds.
 macOS's median moves from about 165 to about 139 µs added, 2.8x 85a's goal.
 
+**A live write's build, split; and the volume's sealing keys kept between publications** (85a, g228, 2026-11-21; main
+01a1ff2e's ruling: split the 27 µs build, each run reported as the daemon's share and the transport floor). The build hop
+is split into its steps on the owner (`fleet.live.hop.build.{capture,keys,seal,append,send}`, per-write histograms,
+timed for an entry made in its publication's own turn). On ubuntu-latest, base 06f20620f (diag-g228-live-15, run
+44935392368, 4 cores, load 1.8-2.0), p50 / p99 µs, every round alike: capture 1.4-1.7 / 4.1-6.1, seal (keys included)
+15.4-18.4 / 36.9-49.2, append 5.1-5.6 / 6.7-18.4, send 0.9-1.0 / 28.7-36.9, of a build of 24.6-26.6. Run 17 (fbc6bc971,
+a runner about twice as slow: transport floor 112.8-138.1 µs) split the seal: keys 8.2 of a seal's 34.8 at the median.
+The keys were fetched afresh at every publication: the lineage key twice and the tenant key twice (`namer` asked the
+lineage again), the naming key once, five unwraps and three record clones. Now `seal_keys::BodyKeys` keeps each live
+volume's lineage key and namer while the tenant, lineage and naming records' key ids are the ones recorded (compared at
+every use), bounded by the volumes the shard ships live (`fleet.live.body_keys.{kept,fetched}`: 15 kept and 1 fetched in
+the fleet hop test's 16 writes).
+
+The A/B, diag-g228-live-18 (run on ubuntu-latest, 4 cores, load 2.0-2.3; the contract command, release, five rounds
+interleaved, order alternating, the transport bench's 4 KiB live ship beside each round). Each cell: added p50; the
+daemon's share (added less the transport floor); live p999 (µs):
+
+| round | transport floor | base fbc6bc971 | keys kept 8b67b484f |
+|---|---|---|---|
+| 1 | 49.8 | 113.3; 63.5; 553.2 | 108.0; 58.2; 2,045.8 |
+| 2 | 52.3 | 108.6; 56.3; 569.5 | 104.3; 52.0; 2,434.9 |
+| 3 | 51.7 | 122.0; 70.3; 2,953.2 | 103.1; 51.4; 1,196.5 |
+| 4 | 53.5 | 110.7; 57.2; 1,256.8 | 109.0; 55.5; 1,056.4 |
+| 5 | 52.7 | 112.5; 59.8; 622.7 | 126.1; 73.4; 1,012.0 |
+
+Per write, p50 / p99, every round: keys 3.8 / 4.6-5.1 against 0.4 / 0.6-0.8 µs; the build 22.5-24.6 against 20.5-22.5.
+
+**Reading.** Accepted: the keys step drops from 3.8 to 0.4 µs in every round, and the median added with it in 4 of 5.
+The live p999 swings between 0.55 and 3 ms in both arms on this 4-core runner (worse for the cache in 3 rounds,
+better in 2), and taking work out of the build cannot lengthen a tail, so it is recorded, not read. The daemon's share
+on this runner is now about 51-58 µs at the median (one round 73), against a transport floor of 50-54. What remains of
+the build is the seal itself, about 12-13 µs: each piece copied into a raw chunk and hashed for its identity, encoded and
+hashed again for its key, its key derived, sealed, and named.
+
 ## A Subversion import on the real daemon: the peak against the dump, by kind (P7, A-772's daemon peak; 2026-11-21)
 
 - **Machine, tree, command.** adas-macbook-pro-2.local (18 cores, 128 GB), load 17 to 35. Main 73cd23c63 with this

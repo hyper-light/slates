@@ -9407,7 +9407,10 @@
 > ruling (c) and the candidate measured and rejected, losing under contention (BENCHMARKS, same section): item 3
 > closed as (a), the cost recorded. The collect's two sleeps themselves are gone by A-829 (a busy shard asks its driver
 > no more often than an empty ask costs): macOS 137.0-141.2 against 164.5-167.7 µs added at the median, no contended
-> condition lost. Still open: 2.2x on Linux;
+> condition lost. A live write's build is split (capture, keys, seal, append, send) and the volume's sealing keys are
+> kept between publications (`seal_keys::BodyKeys`): keys 3.8 to 0.4 µs a write; the daemon's share on ubuntu-latest
+> about 51-58 µs at the median against a transport floor of 50-54 (BENCHMARKS, same section). Next: the seal itself,
+> about 12-13 µs. Still open: 2.2x on Linux;
 > the entry's copies and allocations (134 a write more than a plain write's 34); macOS's parked control shards (one
 > spin primitive with g222's 84a arm C).
 
