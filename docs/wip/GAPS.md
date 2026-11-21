@@ -15,7 +15,16 @@
 > - **The client's share:** `edit_merge_bench`'s client spins for its reply at default priority beside the load, so
 >   accept's p99/p999 beyond the daemon's part (macOS 0.8–2.6 / 7–9 ms with the nap fixed) is the harness's own
 >   thread waiting for a CPU.
-> - Windows: not measured since A-400. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–6).
+> - **Fixed on the way (2026-11-20): a Linux timed wait shorter than a millisecond lasted a millisecond.** rustix
+>   (no `linux_5_11`) rounds `epoll_wait`'s timeout up to whole milliseconds; the epoll driver now arms a timerfd with the
+>   deadline's nanoseconds and waits untimed (`crates/rt/src/epoll.rs`). Red then green on ubuntu-latest and
+>   ubuntu-24.04-arm (`driver::tests::a_sub_millisecond_timed_wait_ends_by_its_deadline`: the shortest 200 µs wait
+>   1,018–1,059 µs, 3 of 3 on each; green 3 of 3, CI run 44860111648). It is not the band above: with it the queued p99
+>   stays 1,009–1,011 µs (run 44860060964), and the band survives no idle spin and no hold (run 44861831509): a kicked
+>   shard waits a millisecond for a CPU. The lane's own ping-pong floor beside the bench: p99 4.7–5.1 µs, p999 0.8–2.7 ms.
+>   New finding, not worked: Windows' completion-port wait rounds up to whole milliseconds too (`crates/rt/src/iocp.rs`).
+> - Windows (CI, run 44857045148): no 1 ms band (queued p99 5–49 µs); accept p99 0.13–0.31 ms, conflict 0.11–0.29 ms;
+>   p999 0.2–62 ms. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–7).
 >
 > **KILN ON A LOADED KVM HOST (w-k90-kvm, 2026-11-20; kiln goal 90d/90f, closed at kiln c0f576eb3; findings recorded,
 > not worked, per the close order).** Seen on adacachy (load 60-85, io some avg10 ~10%) in kiln's `slates_e2e microvm::`
