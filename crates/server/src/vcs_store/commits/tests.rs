@@ -272,13 +272,25 @@ fn tree_counters(state: &ShardState, repository: RepositoryId) -> TreeCounters {
 }
 
 /// Each record of `repository`'s register past the first `skip`: its moves, and its objects' types in order.
-fn recorded(state: &ShardState, repository: RepositoryId, skip: usize) -> Vec<RecordFacts> {
+fn recorded(state: &mut ShardState, repository: RepositoryId, skip: usize) -> Vec<RecordFacts> {
   records(state, repository)
     .iter()
     .skip(skip)
     .map(|bytes| {
       let record = Record::decode(bytes, FORMAT).expect("a record");
-      let kinds = record.names.iter().map(|name| name.0).collect();
+      // Version 5 keeps its names as a content (C5): read from the shard's content store.
+      let kinds = record
+        .named
+        .and_then(|(identity, count)| {
+          // Read with the shard's chunk store lent, where the names' windows are kept.
+          let lent = crate::vcs_store::Lent::new(&mut state.store, &mut state.vcs_stores);
+          let content = lent.stores.content()?;
+          crate::vcs_store::record_names::names_from_content(content, &identity, count).ok()
+        })
+        .unwrap_or_default()
+        .iter()
+        .map(|name| name.0)
+        .collect();
       (record.moves, kinds)
     })
     .collect()

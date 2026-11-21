@@ -210,13 +210,12 @@ impl Store for Empty {
     Ok(None)
   }
 
-  fn file(
+  fn file_entry(
     &self,
     _path: &[u8],
     _node: &Node,
-    _room: &mut slates_hg::Admission,
-  ) -> Result<Option<Logged<'_>>, slates_hg::PastAdmission> {
-    Ok(None)
+  ) -> Option<slates_hg::serve::getbundle::FileEntry> {
+    None
   }
 
   fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
@@ -895,13 +894,12 @@ impl Store for Charging {
     Ok(None)
   }
 
-  fn file(
+  fn file_entry(
     &self,
     _path: &[u8],
     _node: &Node,
-    _room: &mut slates_hg::Admission,
-  ) -> Result<Option<Logged<'_>>, slates_hg::PastAdmission> {
-    Ok(None)
+  ) -> Option<slates_hg::serve::getbundle::FileEntry> {
+    None
   }
 
   fn markers(&self) -> impl Iterator<Item = Marker<'_>> {

@@ -607,6 +607,13 @@ impl WriteLog {
   /// rule), and at most `budget` bytes a call, from the top down, so an idle shard walks a slice a step, never the log's
   /// whole capacity (gigabytes on a large machine). The bytes the OS took, the bytes walked, and whether any is left.
   /// A range the object refuses stays owed.
+  /// The bytes of the log's range, from its start, whose pages may be resident: its header and the record area as far
+  /// as any record reached since it was last given back ([`WriteLog::purge`]), the whole area for a log opened over a
+  /// predecessor's memory. What a residency sweep need read of it (A-744, main's ruling on w-sizing's option (a)).
+  pub(crate) fn written_bytes(&self) -> usize {
+    HEADER_BYTES.saturating_add(self.written)
+  }
+
   pub(crate) fn purge(&mut self, object: &mut SparseObject, budget: usize) -> Purged {
     if self.used > 0 || self.written == 0 {
       return Purged::default();

@@ -7985,7 +7985,10 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > the session's own, `slates_cluster::live::Exchanged::round_trips`). A shard answers `Configuration::place` from a
 > cache keyed by everything `place` reads (`crate::placement_cache`, `ShardState::with_placement`), bounded by its
 > placed heads and refilled whole when the configuration moves, so a live write's durability polls allocate no
-> placement (g228, 2026-11-21).
+> placement (g228, 2026-11-21). The build hop is split into its steps (`fleet.live.hop.build.{capture,keys,seal,append,
+> send}`), and the owner keeps each live volume's lineage key and namer between publications (`seal_keys::BodyKeys`),
+> served only while the tenant, lineage and naming records it unwrapped them from are the ones recorded, compared by key
+> id at every use, and bounded by the volumes it ships live: a publication had unwrapped five keys afresh.
 >
 > **A live write parks no shard on its path where a held shard polls (2026-11-18, A-396, g076b).** The round's cost was
 > parked threads, not the cross-shard hop: each shard on a write's path (the owner awaiting the fold, its control shard
@@ -12806,6 +12809,14 @@ what was not landed. Importing an existing
 repository reads its directory as a base (§4.15, read-only); exporting one writes it to a disk only through a landing
 under a grant (§4.15, R10).
 
+> **Status (2026-11-21, A-824: a git push's record is version 5 alone).** Every git record, a client's push's and a
+> commit the server makes, names the changeset its names and pack landed in on the node's store, its names and pack by
+> their BLAKE3 identity (version 5, A-767 C5); none carries a push's objects. Versions 1 (each object inflated) and 2
+> (A-723, the objects named and the pack inline) are retired: no path writes them, and a replay meeting one is refused
+> typed, `RecordRefused::Retired { version }`, never skipped or a panic (w-svn's A-819 rule); 3 and 4 are refused as
+> unknown versions. A log written before the retirement is therefore not replayed (pre-release; no compatibility
+> shim, CLAUDE.md §2 item 7). The register-held paragraph of A-662 below is superseded for git.
+
 > **Status (2026-11-20, A-716 slice 1a: a text held once, by content identity).** A green holds texts by identity in a
 > table of its file blocks (`crates/merge/src/held.rs`; `Green::hold_path`, `hold_bytes`, `held`, `release_held`,
 > `set_held_room`): by path, the head file's own block with one more holder, so no byte is copied; or by bytes, a block
@@ -15485,6 +15496,11 @@ and export by landing).
 > already are read through, each held to the repository's revision properties (a stream that differs is refused
 > `OutOfSequence`). A Subversion repository serves no session while it imports, as a Mercurial one is not lent, so no
 > session reads a revision the register has not committed.
+>
+> **Status (2026-11-21, A-835).** A recorded batch is applied to its green a slice a turn under the shard's quantum
+> (`push::RecordedBatch`, `repository.import_batch.apply_slices`), the landing turn and the import's read gate held to
+> the last slice; a kill between slices recovers from the batch's record. A recovered Subversion green folds to its
+> readers' floor, as a landing does.
 >
 > **Status (2026-11-20, A-652, part 3 continued: the export verb).** Built: a range of a Subversion repository's
 > revisions written by the daemon as the dump `svnadmin dump` writes for it (`slates-server`'s
@@ -55894,6 +55910,25 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   vcs_ssh::` 162 passed; fmt clean (kiln, adas-mac-studio.local-2). The debug-load rerun is in run-requests.md. Owed:
   the read itself measured per byte and per object (main's push-back: 820 KB should be milliseconds).
 
+### A-722's keepalive on the fetch (2026-11-21, w-perf for UI goal 93; main's piece of 10:39 PST)
+- **Found** (red on main 70dd82623, deterministic at a keepalive interval of none, MacBook idle): a fetch's answer wrote
+  nothing from its `packfile` section's head until its pack's first packet while the pack's objects were chosen over
+  the answer's turns (A-745), and nothing while its source framed nothing new; the push's half was closed by R2
+  (970950081). git's upload-pack writes `0005\1` while `pack-objects` is silent (git 2.50.1's `create_pack_file`,
+  `uploadpack.keepAlive`, five seconds).
+- **Change.** `slates_git::upload::Answer::write_keepalive` writes the empty band-1 packet only where the answer may
+  carry one: inside a banded pack's section, everything before the pack written, its objects still chosen or its source
+  between packets with the pack open (before the section git's client reads it as an empty line where a section's name
+  must stand; v0's bare pack has no band). The HTTP edge's upload exchange (`vcs_http::git::upload`) writes it when a
+  step wrote nothing and the answer has been silent for `git_keepalive_ns` since it last wrote, its head counted as
+  written at once (AtHead).
+- **Tests.** `vcs_http::daemon_edge::tests::a_long_fetchs_answer_is_kept_alive_with_gits_keepalive_while_its_pack_is_chosen`
+  (a 300-commit history fetched at keepalive none: the section's second packet was the pack's first, now git's
+  keepalive, the pack whole after it).
+- **Owed.** The SSH edge's upload (`vcs_ssh::git`) writes no keepalive while its answer is silent; and a fetch's wait
+  before its sections (the A-718 encode and A-614's derivations in `body_end`) has no packet git allows there under
+  side-band-64k alone (a band-2 progress packet needs `sideband-all`), so it stays silent.
+
 ### A-722's memory per push, B1 — An object read in place from its held pack (2026-11-20, w-git for UI goal 93; main's ruling B, Ada's MEMORY SIZING and storage rulings)
 - **Measured first** (adas-mac-studio.local-2, release, 2026-11-20; diagnostic test on branch agents/w-git-memdiag,
   never main): a push of git/git's v1.5.0 (9.4 MiB, 34,296 objects) holds a transient working set of 16.9 MiB after its
@@ -59585,9 +59620,18 @@ Applied in the same change to:
   5 of 5 rounds (main at most 2), SubmitAccepted p999 64.7-89.5 → 1.4-9.2 ms; at Z = 20 ms p999 and max better, p50
   equal, **p99 worse** (SubmitAccepted 2.48-4.47 → 5.43-9.73 ms): the owner is saturated there, so the fold's work costs
   wherever it lands. Recorded in GAPS as a measured gap; landed for robustness by main's order.
-- **Owed:** (b) a key's old entry subtracted at its first change, so the fold hashes only current bytes and reads no
-  history; the checkpoint's remaining one step (~43 ms: build, encode, a 49 MB record) and single keys of up to 13.4 ms
-  sliced; w-git's member loop in turns on `fold_identity_step`.
+- **(b), built after (main's 05:00 order):** `Green::mark_dirty` takes a file key's entry out of the sum when a commit
+  first changes it, on a green with no copy record (a copy's entry may stand for the entries it brought, A-586; such a
+  green keeps the whole move); the fold then adds the head's entry and gives back what a copy since gave it
+  (`identity_out`), so it hashes current bytes once and reads no history. Counted `identities_taken_at_change`; the
+  identity oracle (partial folds) asserts it moved, and fails with an entry marked out but not taken out.
+- **A bug in the part above, fixed with (b):** `copy_checkpoint::sum_at` moved every dirty key from `identity_version`, so
+  a key folded alone and changed again was moved from the wrong version, and a checkpoint carrying a copy's sum taken
+  mid-fold (`Doubling::Now` at the cap) carried a wrong sum (`a_checkpoints_sum_taken_mid_fold_is_the_whole_folds`, red
+  first). Each key now moves from `identity_since`, its own folded-at version.
+- **Owed:** (b)'s A/B at Z = 20 and 50 ms (a run was cut at 16 of 20 by kiln's restart); the checkpoint's remaining one
+  step (~43 ms: build, encode, a 49 MB record) and single keys of up to 13.4 ms sliced; w-git's member loop in turns on
+  `fold_identity_step`.
 - **Applied in the same change to** `crates/merge` (`engine`: `fold_identity_step`, `identity_backlog`,
   `identity_folded`; `tests/identity.rs`), `crates/server` (`merge_service`, `git_push`: `shard_pace_env`;
   `repository` tests), §4.16, GAPS, BENCHMARKS.md.
@@ -59790,9 +59834,29 @@ Applied in the same change to:
     task killed after its changeset landed and before its step (`commits::KILL_BEFORE_MADE_COMMIT`, as Subversion's);
     made again from what is durable, the state before (durable head 0, no store version, the records as before, the
     request unanswered); the retry lands once (one record more, version 5) and is answered.
-- **Owed** (GAPS, C5 part 2b): `record_of` and version 2 removed with
-  the paths that still write them (a submit outside a recorded request, `commits::after_submit`'s owed commit, a store
-  test sealing a push directly); the change step over the preview in one turn (bounded by the submit's admission).
+- **Part 2** (2026-11-21, main's order 15:40 and its condition of 16:10 PST; replace, don't layer):
+  - A git commit the server makes of a version already committed (a submit outside a recorded request,
+    `commits::make`; a commit owed past a whole build, `commits::make_owed`) is a job of the shard's bounded queue
+    (`commits::MadeAfter`, the client seats): its repository's landing turn taken where it is free when it comes, else
+    awaited, so made commits land in their versions' order; then sealed over the version's map, homed and landed through
+    the same steps as the hooked path's (`first_ask`, `next_ask`, driven by `git_push::carry`), and recorded version 5
+    in a transaction of its own. A test drives the queue synchronously (`made_after_now`, through
+    `git_push::tests::carried_blocking`).
+  - No path writes version 2: `record_of`, `RecordWriter::finish` and its whole-object pack are gone, and a sealed push
+    bringing objects nobody homed and landed is refused `Unlanded` at its record.
+  - Versions 1 and 2 are refused typed at replay (`RecordRefused::Retired`; the record format's status above), and the
+    replay's branches only they reached (inline objects, an inline pack read from the register's bytes) are gone.
+  - The queue's turns are forgotten, not handed back, when it drops with the shard's state (a hand-back then reached the
+    state being dropped and aborted the process: a test run found it).
+- **Evidence (part 2).**
+  - `t_a824_a_log_meeting_a_retired_record_version_is_refused_typed_and_a_version_5_log_replays_whole`: a version-5-only
+    log replays whole, the same store as the live one; a version-2 record in the log refused `Retired { version: 2 }`,
+    the store as the version-5 record left it; a version-1 record refused `Retired { version: 1 }`.
+  - The store's oracle (`vcs_store::tests`, `Live`) writes and replays version 5 only, a recovery fetching each record's
+    names and pack as a region fetch does; the hostile-input test runs over version-5 bytes; the A-664 commit tests make
+    their commits through the queue.
+- **Owed** (GAPS, C5 part 2b): the change step over the preview in one turn (bounded by the submit's admission), next
+  in this series.
 
 ### A-821 — A refined submit's increment, verdict and encoding are prepared by its refinement job a bounded slice a turn, and its step judges by position (2026-11-21, w-fed-faults; main's ruling of 09:25 on the refining.rs:166 kill; §4.3 step budget, §4.16, A-787 part 2, A-697, A-816)
 Applied in the same change to: GAPS (the refining.rs:166 entry narrowed to the commit's step); `crates/server/src/refining.rs`
@@ -59927,3 +59991,72 @@ expected}`; `release_capture` lets a hold go), `crates/vfs/tests/held_head.rs`.
 - **Measured.** `cargo test -p slates-server --lib bench_a_whole_publications_longest_turn -- --ignored --nocapture`
   (311 inodes, 9 interleaved rounds): debug, Studio-4, the one-turn image and encoding 598 to 849 us against the held
   capture's longest turn 36 to 66 us and its first 6 to 10 us. The release rounds are recorded in BENCHMARKS.
+### §4.6 amended — A FUSE helper's exit, mount and unmount alike, is awaited by its exit watch, never polled a tick at a time (2026-11-20, w-shared for UI goal 93; main's sweep after A-697's release bench, family three of three)
+Applied in the same change to: §4.6 "Linux (own /dev/fuse driver)" establishment, GAPS (the sweep's line),
+`crates/bridge-fuse/src/mount.rs` (`PendingMount::helper_pid`, `abort_unwatched`, `PendingExit::helper_pid`,
+`MountError::ExitUnwatched`), `crates/server/src/fuse.rs` (`mount_without_blocking`, `reap`, `mount_errno`),
+`crates/server/tests/fuse_mount.rs`.
+- **What was there.** A mount's helper is awaited on its socket's readiness until it hands the device back, then until
+  it exits (`Awaiting::Exit`). That exit, and the unmount helper's (`reap`, `fusermount3 -u -z`), were polled a heartbeat
+  tick at a time (a tenth of a period), so an exit just after a look waited out the rest of the tick.
+- **Change.** Each helper's exit is awaited by an exit watch on its process (`slates_ipc::exit_watch::ExitWatch`: a
+  pidfd on Linux, readable when the process exits), taken once per helper, within the helper's bound (A-525). A watch
+  the kernel refuses (a descriptor limit) is a typed refusal, never a return to the tick. A mount is refused
+  `MountError::ExitUnwatched` with the kernel's code, its helper killed and reaped. An unmount helper is given up at
+  once, killed and reaped by its guard, and the unmount counted refused. One path, no poll.
+- **Counters.** `fuse.helper_exit.watched`, `fuse.helper_exit.unwatched`, `fuse.unmount_exit.watched`,
+  `fuse.unmount_exit.unwatched`.
+- **Tests** (Linux, kiln run on adacachy, 2026-11-20). `slates-server --test fuse_mount
+  a_volume_mounted_through_fuse_serves_the_kernel_and_ends_with_its_mount` now also holds every helper's exit watched,
+  mount and unmount (`watched` >= 1, `unwatched` none). Red with the mount's watch never taken: refused. `slates-bridge-fuse`
+  suites (macOS arm64, local).
+- **Found while testing, not fixed (GAPS):** `slates-bridge-fuse --test handshake
+  a_non_blocking_handshake_reports_what_the_blocking_one_does` failed 1 of 4 runs on a loaded Mac at its
+  `waits >= 1` (handshake.rs:252): the helper answered before the owner's first poll. It predates this change.
+
+### A-826 — A holder's submit names its increment; the owner fetches it by identity (2026-11-21, w-shared, lane (A) 3b; main's rulings 2026-11-20 23:50 and 2026-11-21 00:52; §4.16 "Commit"; A-697, A-825)
+- `SubmitComputed` carries the increment's inputs identity and length (`increment`, `increment_len`), not its bytes:
+  the holder holds its composed increment under that identity (`merge_service::hold_composed_inputs`, lent, refused
+  typed at its room), and the owner's control shard, before the verb runs (`verbs::fetch_named_increment`), fetches
+  what its owner shard lacks from the work's member on the content plane (`fleet::fetch_manifest_into_hold`: hedged,
+  verified, a cut fetch kept for the retry, waiting for a lent session within the live budget), and the owner shard
+  holds it once (`hold_increment`); the verb reads it from its store. Not had whole: `Overloaded`, nothing started.
+- Why: a 320 MiB and larger holder submit crossed the forward lane whole and the lane gave up on silence under load
+  (GAPS). Measured in `fleet` `a_holders_submit_names_its_increment_and_the_owner_fetches_it_by_identity` (8 MiB: the
+  request under 64 KiB, fetched once); the release bench at 64-512 MiB follows.
+- Owed: the fetch staged on the owner shard itself (the bytes cross once from the control shard today); a fetched
+  increment a refused verdict leaves is released at the next fold or restart.
+
+### A-835 — A recorded import batch is applied to its green a slice a turn; a recovered Subversion green folds to its readers (2026-11-21, w-svn; main's ruling of 12:43 PST on the A-822 watchdog kills, (b) and (c); A-814, A-822, A-820, §4.3 step budget)
+Applied in the same change to:
+- `crates/server/src/repository/push.rs`: `append_versions` records the batch and returns a `RecordedBatch`;
+  `RecordedBatch::apply_slice` applies its versions until the shard's step budget is spent, at least one, counted
+  `repository.import_batch.apply_slices`, and settles the green's retention and checkpoints its chain after the last.
+- `crates/server/src/import_batch.rs`: `ImportBatch::commit` returns the `RecordedBatch` (A-814's module, w-rewrite-ops';
+  `inbox/w-rewrite-ops-from-w-svn-a814-sliced-commit.md` says what moved).
+- `crates/server/src/repository/svn_commit/staging.rs`: `Staging::land` applies the recorded batch a slice a turn, a
+  yield between, holding the landing turn; then counts the flush, folds and lets go of the batch's holds.
+- `crates/server/src/vcs_store.rs`: `remake_greens` folds a recovered Subversion green to its live readers' floor
+  (`svn_commit::fold_to_readers`), as a landing does.
+
+- **Why.** Main's git-2000 run over A-822 (base 67fa7f75a) had the watchdog kill the anchor twice, "stuck in task
+  spawned at `repository/import.rs:235`": the batch's commit applied every version of the batch in one step, 2,000 for
+  git-2000, past the shard's 1 s liveness window (§4.3: a user-scaled loop is sliced). Its heap held 434 MB under
+  `GreenReplay::step -> Green::apply_recorded`: the recovery replayed the green's whole history and nothing folded it,
+  where a landing folds to the readers after each batch (A-820).
+- **What.** The batch's record holds every version, so the apply after it is a recovery's replay done early: a kill
+  between slices recovers from the record to the batch's last version. The apply runs in slices under the shard's
+  quantum. Nothing reads the green before the last slice: a Subversion repository serves no session while it imports
+  (A-822), and the import holds the repository's landing turn through the last slice. After a recovery's replay the
+  green folds to its readers' floor.
+- **Evidence.** `t_c2c_a_large_batch_is_applied_a_slice_at_a_time`: 400 revisions in one batch, the shard's own
+  quantum; the apply takes more than one slice. With the slice's deadline taken out (the apply one loop, as before) it
+  fails: "the batch's apply took 1 slice(s)".
+  `a_batch_killed_between_its_commits_slices_recovers_and_resumes_to_the_same_history`: a 13-revision batch, 3 versions
+  a slice, killed at every slice boundary (0 to 4), the daemon restarted over the same store; the recovered green
+  folded to its head, the same dump resumed after the batch (`Ok((0, 13))`) and the export byte-identical to the dump.
+  Without the fold at recovery it fails: "killed at 0: recovered and folded", `Some((0, 13))` against
+  `Some((13, 13))`.
+- **Not sliced yet.** `append_versions`' loop before the record (each version's increment held and its entry encoded)
+  is still one step a batch: w-rewrite-ops', said in their inbox. The steps after the last slice (`follow`, the fold, the
+  release of the batch's texts) are one step each, scaled by the batch's paths.

@@ -101,6 +101,58 @@ fn a_created_repository_is_landed_into_the_store_and_recovered() {
   creation_recovered(&dir);
 }
 
+/// The store's Windows lane (main's order of 2026-11-21: every git, hg and svn repository was unusable on Windows, its
+/// daemon refusing `--vcs-store` at its start). Do: start a daemon holding a store, and create one repository of each
+/// tool through the verb, each with request numbers of its own. Expect: each create answered once landed and recorded,
+/// each creation landed on its name's partition, none refused by the store. On Unix and Windows alike.
+#[test]
+fn each_tool_creates_a_repository_into_the_store() {
+  let store = TestStore::start("each-tool");
+  let profile = crate::daemon::test_profile();
+  let instance = format!("vcs-store-each-{}", std::process::id());
+  let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(SHARDS));
+  config.vcs_disk = Some(store.handle());
+  let daemon = Daemon::start(&profile, config, SegmentSource::Create { name: instance }).unwrap();
+  daemon.bootstrap(true).unwrap();
+  let mut landed_on = std::collections::BTreeMap::<usize, u64>::new();
+  for (request, (name, tool)) in [
+    ("each-git", VcsTool::Git),
+    ("each-hg", VcsTool::Mercurial),
+    ("each-svn", VcsTool::Subversion),
+  ]
+  .into_iter()
+  .enumerate()
+  {
+    let partition = usize::from(crate::verbs::owner_of_name(name, usize::from(SHARDS)));
+    let asked = (name, tool, ObjectFormat::Sha1, "main");
+    let request = u64::try_from(request).unwrap() + 1;
+    let created = crate::daemon::observe_at(&daemon, partition, move |state| {
+      routed_create(state, (&owner(), request), asked)
+    });
+    assert!(
+      matches!(created, ReplyBody::Acknowledged),
+      "{tool:?}: answered once landed and recorded: {created:?}"
+    );
+    let landed = landed_on.entry(partition).or_insert(0);
+    *landed += 1;
+    wait_for(&daemon, partition, super::CREATION_LANDED, *landed);
+  }
+  for &partition in landed_on.keys() {
+    let unlanded = crate::daemon::observe_at(&daemon, partition, |state| {
+      state
+        .refusals
+        .get(super::CREATION_UNLANDED)
+        .copied()
+        .unwrap_or(0)
+    });
+    assert_eq!(
+      unlanded, 0,
+      "the store refused a creation on partition {partition}"
+    );
+  }
+  daemon.stop();
+}
+
 /// A-767 C6 (svn onto the changeset store; main's order of 2026-11-20 19:50: "a push's landing as a changeset append,
 /// and its replay", red first on the real store). Do: start a daemon holding a store, create a Subversion repository,
 /// land a client's accepted work adding `/trunk` through the commit's landing (`svn_commit::land_work`), wait for its
@@ -794,4 +846,129 @@ fn a_changeset_landed_and_never_named_is_dropped_at_recovery_and_its_retry_lands
     (Some(two.clone()), Some(two))
   );
   daemon.stop();
+}
+
+/// The folded history of `repository`'s green: the version below which it keeps none, and its head.
+fn green_folded(daemon: &Daemon, repository: RepositoryId) -> Option<(u64, u64)> {
+  crate::daemon::observe_first(daemon, move |state| {
+    let green = super::svn_commit::green_of(state, repository).ok()?;
+    let engine = state.greens.get(&green)?;
+    Some((engine.folded_below(), engine.head()))
+  })
+}
+
+/// P7's finding (2) from main's attribution of 2026-11-21 (the restarted daemon's green kept every version its chain
+/// replay made: 434 MB under `GreenReplay` for git-2000). Do: on a daemon holding a store, land revision 1 adding
+/// `/trunk/a.txt` and revisions 2 and 3 changing it; stop the daemon and the store's owner; start both again over the
+/// same segment and store. Expect: the green folded to its head after each landing (A-820), and folded to its head again
+/// once the recovery replayed its chain: it keeps no version no reader names. (A chain checkpointed at each landing
+/// restores folded already; a replay past the checkpoint, the batch a kill cut short, is held by the sliced commit's
+/// crash test.)
+#[test]
+fn a_recovered_subversion_green_keeps_no_version_its_readers_do_not_name() {
+  let instance = format!("vcs-store-svn-folded-{}", std::process::id());
+  let mut store = TestStore::start("svn-folded");
+  let anchor = anchor_of(&instance);
+  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  daemon.bootstrap(true).unwrap();
+  let repository = created_subversion(&daemon, "folded");
+  let texts = [&b"one\n"[..], b"one two\n", b"one two three\n"];
+  for (head, bytes) in texts.iter().enumerate() {
+    let head = u64::try_from(head).unwrap();
+    let action = if head == 0 {
+      slates_svn::index::Action::Add
+    } else {
+      slates_svn::index::Action::Modify
+    };
+    assert_eq!(
+      landed_work(&daemon, repository, head, (action, bytes.to_vec())),
+      Ok(head + 1)
+    );
+  }
+  let before = green_folded(&daemon, repository);
+  daemon.stop();
+  store.restart_owner();
+  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  let after = green_folded(&daemon, repository);
+  daemon.stop();
+  assert_eq!(before, Some((3, 3)), "folded after each landing");
+  assert_eq!(
+    after,
+    Some((3, 3)),
+    "folded once the recovery replayed the chain"
+  );
+}
+
+/// C2 stage C's sliced commit, main's ruling of 2026-11-21 12:43 (a batch's versions applied a slice a turn after its
+/// durable record; a kill between slices recovers from the record). Do: for each slice boundary of `full.dump`'s
+/// import (13 revisions in one batch, its apply three versions a slice: five slices), on a fresh daemon holding a store,
+/// kill the batch's landing there (`staging::KILL_AT_COMMIT_SLICE`); stop the daemon and the store's owner, start both
+/// again, import `full.dump` again. Expect, at every boundary: the recovered green at revision 13 and folded to it (the
+/// replay past its checkpoint keeps no version, P7's finding (2)); the import resuming with nothing to land; the history
+/// `full.dump` byte for byte. Before the fold at recovery, the recovered green kept every version the replay made.
+#[test]
+fn a_batch_killed_between_its_commits_slices_recovers_and_resumes_to_the_same_history() {
+  use crate::vcs_store::svn_import::tests::{FULL, FULL_LAST, history, imported};
+  /// Shape: the versions a slice of the recorded apply takes here, so `full.dump`'s 13 make five slices.
+  const SLICE_VERSIONS: usize = 3;
+  let slices = FULL_LAST.div_ceil(u64::try_from(SLICE_VERSIONS).unwrap());
+  for kill_at in 0..usize::try_from(slices).unwrap() {
+    let instance = format!("vcs-store-svn-killed-{}-{kill_at}", std::process::id());
+    let mut store = TestStore::start(&format!("svn-killed-{kill_at}"));
+    let anchor = anchor_of(&instance);
+    let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+    daemon.bootstrap(true).unwrap();
+    let repository = created_subversion(&daemon, "killed");
+    crate::daemon::observe_first(&daemon, move |_state| {
+      crate::repository::push::SLICE_VERSIONS.with(|most| most.set(Some(SLICE_VERSIONS)));
+      super::svn_commit::staging::KILL_AT_COMMIT_SLICE.with(|kill| kill.set(Some(kill_at)));
+      let task = slates_rt::futures::spawn(async move {
+        let _ = imported(repository, FULL).await;
+      })
+      .expect("the import's task");
+      slates_rt::futures::detach(task).expect("detached");
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while crate::daemon::observe_first(&daemon, |_state| {
+      super::svn_commit::staging::KILL_AT_COMMIT_SLICE
+        .with(std::cell::Cell::get)
+        .is_some()
+    }) {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the kill at {kill_at} never fired"
+      );
+      std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    daemon.stop();
+    store.restart_owner();
+    let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+    let folded = green_folded(&daemon, repository);
+    let resumed = crate::test_store::run_on_first(
+      &daemon,
+      move || async move {
+        imported(repository, FULL)
+          .await
+          .0
+          .map(|loaded| (loaded.revisions, loaded.youngest))
+      },
+      std::time::Duration::from_secs(60),
+    );
+    let exported = crate::test_store::run_on_first(
+      &daemon,
+      move || history(repository),
+      std::time::Duration::from_secs(60),
+    );
+    daemon.stop();
+    assert_eq!(
+      folded,
+      Some((FULL_LAST, FULL_LAST)),
+      "killed at {kill_at}: recovered and folded"
+    );
+    assert_eq!(resumed, Ok((0, FULL_LAST)), "killed at {kill_at}: resumed");
+    assert!(
+      exported == Some((FULL_LAST, FULL.to_vec())),
+      "killed at {kill_at}: full.dump"
+    );
+  }
 }

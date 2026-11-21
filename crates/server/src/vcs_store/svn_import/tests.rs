@@ -119,7 +119,7 @@ pub(crate) async fn imported(
 /// What the shard holds of repository `id`'s history: its records' youngest revision, and the whole of it exported in
 /// format 2 (A-628's export) through the repository's view, each stored text's piece it waits for fetched through the
 /// node's store and let go after the next call, as the export's task fetches them (C2 stage B part 2 (b)).
-async fn history(id: RepositoryId) -> Option<(u64, Vec<u8>)> {
+pub(crate) async fn history(id: RepositoryId) -> Option<(u64, Vec<u8>)> {
   let youngest = on(|state| {
     state
       .vcs_stores
@@ -642,5 +642,84 @@ fn t_c2c_a_repository_serves_no_session_while_it_imports() {
     let during = lent();
     on(|state| super::abandon(state, svn));
     assert_eq!((before, during, lent()), (true, false, true));
+  });
+}
+
+/// A format-2 dump of `revisions` revisions after revision 0, each adding one file `f<n>` of a line of text: a batch
+/// large in versions and small in bytes.
+fn many_revisions(revisions: usize) -> Vec<u8> {
+  let props = |entries: &[(&str, &str)]| {
+    let mut section = String::new();
+    for (name, value) in entries {
+      section.push_str(&format!(
+        "K {}\n{name}\nV {}\n{value}\n",
+        name.len(),
+        value.len()
+      ));
+    }
+    section.push_str("PROPS-END\n");
+    section
+  };
+  let mut dump =
+    String::from("SVN-fs-dump-format-version: 2\n\nUUID: 00000000-0000-4000-8000-000000000628\n\n");
+  let zero = props(&[("svn:date", "2026-11-19T00:00:00.000000Z")]);
+  dump.push_str(&format!(
+    "Revision-number: 0\nProp-content-length: {0}\nContent-length: {0}\n\n{zero}\n",
+    zero.len()
+  ));
+  for number in 1..=revisions {
+    let date = format!("2026-11-19T00:00:00.{number:06}Z");
+    let log = format!("r{number}");
+    let section = props(&[
+      ("svn:author", "alice"),
+      ("svn:date", &date),
+      ("svn:log", &log),
+    ]);
+    let text = format!("line {number}\n");
+    let empty = "PROPS-END\n";
+    dump.push_str(&format!(
+      "Revision-number: {number}\nProp-content-length: {0}\nContent-length: {0}\n\n{section}\n",
+      section.len()
+    ));
+    dump.push_str(&format!(
+      "Node-path: f{number}\nNode-kind: file\nNode-action: add\nProp-content-length: {}\nText-content-length: {}\n\
+       Content-length: {}\n\n{empty}{text}\n\n",
+      empty.len(),
+      text.len(),
+      empty.len() + text.len()
+    ));
+  }
+  dump.into_bytes()
+}
+
+/// Shape: the revisions of the batch whose apply the sliced commit test holds to the shard's quantum: past what one
+/// quantum applies on any build (a version's apply is tens of microseconds in debug, the quantum a few).
+const MANY_REVISIONS: usize = 400;
+
+/// C2 stage C's sliced commit, main's ruling of 2026-11-21 12:43 (the red: an import batch's apply in one step held the
+/// shard past its watchdog, git-2000's 2,000 versions). Do: import [`many_revisions`]'s [`MANY_REVISIONS`] revisions,
+/// one batch, with the shard's own quantum. Expect: the import whole (every file at the head), its batch landed once,
+/// and its apply taken in more than one slice (`repository.import_batch.apply_slices`): no step applies the batch whole.
+/// Before, the apply was one loop in the commit's one step.
+#[test]
+fn t_c2c_a_large_batch_is_applied_a_slice_at_a_time() {
+  stored(|| async move {
+    let (svn, green) = subversion("sliced").await;
+    let before = on(|state| count(state, crate::repository::push::BATCH_APPLY_SLICES));
+    let loaded = imported(svn, many_revisions(MANY_REVISIONS))
+      .await
+      .0
+      .map(|loaded| loaded.youngest);
+    let last = u64::try_from(MANY_REVISIONS).unwrap();
+    assert_eq!(loaded, Ok(last));
+    let (slices, flushes, head) = on(|state| {
+      (
+        count(state, crate::repository::push::BATCH_APPLY_SLICES) - before,
+        count(state, crate::repository::svn_commit::staging::FLUSHED_END),
+        state.greens.get(&green).map(|engine| engine.head()),
+      )
+    });
+    assert_eq!((flushes, head), (1, Some(last)));
+    assert!(slices >= 2, "the batch's apply took {slices} slice(s)");
   });
 }

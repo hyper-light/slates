@@ -134,7 +134,12 @@ fn listed_entry<'e>(
 /// and the entries in the volume's canonical order.
 #[derive(Debug)]
 pub(crate) struct Listing {
-  pub(crate) dir: HostDir,
+  /// The open directory; `None` for one a recovery recorded and nothing has used since: it is reacquired at its first
+  /// use ([`Overlay::reacquire`]), so a recovery opens no directory but the root (A-833).
+  pub(crate) dir: Option<HostDir>,
+  /// The directory a recovery holds an unreacquired listing to ([`Fingerprint::same_object`]): the image's record, kept
+  /// until the first use reacquires it, and written into the next image unchanged. `None` once reacquired.
+  recorded: Option<Fingerprint>,
   /// The immutable source path below the base root, independent of overlay renames.
   source: Vec<String>,
   fingerprint: Option<Fingerprint>,
@@ -507,8 +512,20 @@ pub struct BasePlane {
   /// ([`Self::durable_change_token`]) counts it beside the versioned tables' writes, so an overlay publication
   /// takes a delta — which carries no base-plane state — only while the whole durable base plane is unchanged.
   drift_writes: u64,
-  /// Open file descriptors by inode number (large-class copies and read-through).
+  /// Open file descriptors by inode number (large-class copies and read-through). An untouched inode's is held only
+  /// while a handle holds the inode open ([`Volume::is_open`]): one opened for a verb that holds no open is closed when
+  /// that verb's overlay borrow ends ([`Self::transient`]), and an open's is closed at its last close
+  /// ([`Self::release_unopened`]). A witnessed inode's (a large-class copy-up) is kept, since the witness's bytes are
+  /// read through it. Until 2026-11-21 every base file ever read kept one: kiln's daemon on adacachy reached
+  /// 1,048,575 of its 1,048,576 descriptors and this MacBook's held 3,995, so every later open failed `EMFILE`.
   descriptors: BTreeMap<InodeNo, HostFile>,
+  /// Untouched inodes whose descriptor was opened during the current overlay borrow while no handle held them open:
+  /// at the borrow's end each one still unopened is closed. Bounded by the descriptors one borrow opens.
+  transient: Vec<InodeNo>,
+  /// Untouched inodes whose descriptor [`Overlay::open_base`] opened for the open that follows it (the bridge counts
+  /// the open after the borrow, [`Volume::open_for`]): judged at the end of the next borrow, as [`Self::transient`]
+  /// is, so an open that never came closes its descriptor. Bounded by the opens one borrow makes.
+  deferred: Vec<InodeNo>,
   /// Descriptors taken out of `descriptors` by a reclaim that had no host to close them with (the volume reclaims an
   /// inode on its own): closed when the next [`Overlay`] borrow ends. Bounded by `descriptors`, which each left.
   closing: Vec<HostFile>,
@@ -581,12 +598,25 @@ impl BasePlane {
     self.closing.push(file);
   }
 
+  /// Queues the descriptor of an untouched inode whose last open handle closed, to be closed when the next overlay
+  /// borrow ends: nothing reads through it now, and a later read reopens the file through its home and proves it is
+  /// the file the inode was made from ([`Overlay::descriptor`], A-151). A witnessed inode keeps its descriptor.
+  pub(crate) fn release_unopened(&mut self, no: InodeNo) {
+    if self.is_witnessed(no) {
+      return;
+    }
+    if let Some(file) = self.descriptors.remove(&no) {
+      self.closing.push(file);
+    }
+  }
+
   fn new(config: BaseConfig, root_no: InodeNo) -> Self {
     let mut listings = BTreeMap::new();
     listings.insert(
       root_no,
       Listing {
-        dir: config.root,
+        dir: Some(config.root),
+        recorded: None,
         source: Vec::new(),
         fingerprint: None,
         entries: None,
@@ -607,6 +637,8 @@ impl BasePlane {
       drift_writes: 0,
       descriptors: BTreeMap::new(),
       closing: Vec::new(),
+      transient: Vec::new(),
+      deferred: Vec::new(),
       whiteouts: Versioned::default(),
       redirects: Versioned::default(),
       watch: WatchState::Unavailable,
@@ -667,6 +699,7 @@ impl BasePlane {
           no,
           Listing {
             dir: listing.dir,
+            recorded: listing.recorded,
             source: listing.source.clone(),
             fingerprint: None,
             entries: None,
@@ -1299,6 +1332,20 @@ impl Drop for Overlay<'_> {
     let Some(plane) = self.vol.base.as_mut() else {
       return;
     };
+    let judged = std::mem::take(&mut plane.transient);
+    let next = std::mem::take(&mut plane.deferred);
+    plane.transient = next;
+    for no in judged {
+      if self.vol.is_open(no) {
+        continue;
+      }
+      if let Some(plane) = self.vol.base.as_mut() {
+        plane.release_unopened(no);
+      }
+    }
+    let Some(plane) = self.vol.base.as_mut() else {
+      return;
+    };
     for file in std::mem::take(&mut plane.closing) {
       self.host.close_file(file);
     }
@@ -1333,7 +1380,34 @@ impl Overlay<'_> {
       let Some(listing) = plane.listings.get(&no) else {
         return Ok(None);
       };
-      let entries = host.list(listing.dir).map_err(host_refusal)?;
+      // A directory a recovery recorded and nothing has reacquired is read through its source path, uncached and closed
+      // again: this borrow lends the volume, so it cannot reacquire it (A-833).
+      let entries = match listing.dir {
+        Some(open) => host.list(open).map_err(host_refusal)?,
+        None => {
+          let opened = match recovery::open_source(host, plane.root, &listing.source)? {
+            Ok(opened) => opened,
+            Err(refused) => return Err(VfsError::BaseUnavailable(unavailable_code(refused))),
+          };
+          let same = listing.recorded.is_some_and(|recorded| {
+            host
+              .fingerprint_dir(opened)
+              .is_ok_and(|now| now.same_object(&recorded))
+          });
+          let listed = same.then(|| host.list(opened));
+          if opened != plane.root {
+            host.close_dir(opened);
+          }
+          match listed {
+            Some(listed) => listed.map_err(host_refusal)?,
+            None => {
+              return Err(VfsError::BaseUnavailable(unavailable_code(
+                HostError::NotFound,
+              )));
+            }
+          }
+        }
+      };
       Ok(Some(entries.into_iter().map(|entry| entry.name).collect()))
     })
   }
@@ -1364,24 +1438,19 @@ impl Overlay<'_> {
     let now = self.host.now_ns();
     let policy = self.vol.policy;
     let granularity = i64::try_from(self.granularity()).unwrap_or(i64::MAX);
+    let host_dir = self.reacquire(dir_no)?;
     let plane = self.vol.base.as_mut().ok_or(VfsError::NotOverlay)?;
-    if let Some(gone) = plane.unavailable.get(&dir_no) {
-      return Err(VfsError::BaseUnavailable(gone.code));
-    }
     let listing = plane
       .listings
       .get_mut(&dir_no)
       .ok_or(VfsError::NotOverlay)?;
     if listing.watch == WatchState::Unavailable {
-      listing.watch = self.host.watch(listing.dir);
+      listing.watch = self.host.watch(host_dir);
       if listing.watch == WatchState::Live && plane.watch == WatchState::Unavailable {
         plane.watch = WatchState::Live;
       }
     }
-    let fingerprint = self
-      .host
-      .fingerprint_dir(listing.dir)
-      .map_err(host_refusal)?;
+    let fingerprint = self.host.fingerprint_dir(host_dir).map_err(host_refusal)?;
     // The racy rule for listings (§4.5, as for a file's witness): an unchanged fingerprint proves the
     // listing current only when it was read more than one timestamp granularity after the directory last
     // changed; within that window a child added in the same tick leaves the fingerprint as it was, so the
@@ -1392,7 +1461,7 @@ impl Overlay<'_> {
     if listing.entries.is_some() && listing.fingerprint == Some(fingerprint) && !racy {
       return Ok(());
     }
-    let mut entries = self.host.list(listing.dir).map_err(host_refusal)?;
+    let mut entries = self.host.list(host_dir).map_err(host_refusal)?;
     entries.sort_by(|a, b| {
       (policy.hash(&a.name), policy.fold(&a.name))
         .cmp(&(policy.hash(&b.name), policy.fold(&b.name)))
@@ -1706,8 +1775,9 @@ impl Overlay<'_> {
         self.vol.drop_link(store, located.inode)?;
         if let Some(plane) = self.vol.base.as_mut()
           && let Some(l) = plane.listings.remove(&located.inode)
+          && let Some(open) = l.dir
         {
-          self.host.close_dir(l.dir);
+          self.host.close_dir(open);
         }
       }
       _ => self.vol.drop_link(store, located.inode)?,
@@ -1941,7 +2011,8 @@ impl Overlay<'_> {
         plane.listings.insert(
           no,
           Listing {
-            dir: opened,
+            dir: Some(opened),
+            recorded: None,
             source,
             fingerprint: None,
             entries: None,
@@ -1959,15 +2030,63 @@ impl Overlay<'_> {
   }
 
   fn listing_dir(&mut self, dir_no: InodeNo) -> Result<HostDir, VfsError> {
+    self.reacquire(dir_no)
+  }
+
+  /// The open directory of a merged directory's listing, reacquired now if a recovery recorded it and nothing has used it
+  /// since (A-833): reopened through its source path below the root without following links, and held to the directory
+  /// the image recorded ([`Fingerprint::same_object`]). A directory that is gone, unreadable or another at the path is
+  /// refused `BaseUnavailable` from here on, its untouched entries with it, while the volume's own entries in it serve
+  /// (§4.8's failure matrix, A-153), as a recovery that reopened it eagerly refused it. Until 2026-11-21 a recovery
+  /// reopened every directory the image recorded in one step: kiln's daemon on adacachy recorded about 192,000 and was
+  /// killed by the liveness watchdog a second into every restart.
+  fn reacquire(&mut self, dir_no: InodeNo) -> Result<HostDir, VfsError> {
     let plane = self.vol.base.as_ref().ok_or(VfsError::NotOverlay)?;
     if let Some(gone) = plane.unavailable.get(&dir_no) {
       return Err(VfsError::BaseUnavailable(gone.code));
     }
-    plane
-      .listings
-      .get(&dir_no)
-      .map(|l| l.dir)
-      .ok_or(VfsError::NotOverlay)
+    let listing = plane.listings.get(&dir_no).ok_or(VfsError::NotOverlay)?;
+    if let Some(open) = listing.dir {
+      return Ok(open);
+    }
+    let recorded = listing.recorded.ok_or(VfsError::RecoveryIncomplete)?;
+    let source = listing.source.clone();
+    let root = plane.root;
+    let refused = match recovery::open_source(self.host, root, &source)? {
+      Err(refused) => Some((None, refused)),
+      Ok(opened) => match self.host.fingerprint_dir(opened) {
+        Ok(now) if now.same_object(&recorded) => {
+          let plane = self.plane()?;
+          if let Some(listing) = plane.listings.get_mut(&dir_no) {
+            listing.dir = Some(opened);
+            listing.recorded = None;
+          }
+          return Ok(opened);
+        }
+        Ok(_) => Some((Some(opened), HostError::NotFound)),
+        Err(refused) => Some((Some(opened), refused)),
+      },
+    };
+    let Some((opened, refused)) = refused else {
+      return Err(VfsError::RecoveryIncomplete);
+    };
+    if let Some(opened) = opened
+      && opened != root
+    {
+      self.host.close_dir(opened);
+    }
+    let code = unavailable_code(refused);
+    let plane = self.plane()?;
+    plane.listings.remove(&dir_no);
+    plane.unavailable.insert(
+      dir_no,
+      UnavailableDir {
+        source,
+        fingerprint: recorded,
+        code,
+      },
+    );
+    Err(VfsError::BaseUnavailable(code))
   }
 
   // ---------------------------------------------------------------- namespace
@@ -2264,8 +2383,8 @@ impl Overlay<'_> {
     let at = self.vol.witness_clock();
     if let Some(plane) = self.vol.base.as_mut() {
       plane.forget_redirect(removed_no, at);
-      if let Some(l) = plane.listings.remove(&removed_no) {
-        self.host.close_dir(l.dir);
+      if let Some(open) = plane.listings.remove(&removed_no).and_then(|l| l.dir) {
+        self.host.close_dir(open);
       }
     }
     Ok(())
@@ -2665,8 +2784,20 @@ impl Overlay<'_> {
         }
       }
     }
-    self.plane()?.descriptors.insert(no, file);
+    self.hold_descriptor(no, file)?;
     Ok(file)
+  }
+
+  /// Holds `file` as untouched inode `no`'s descriptor; one no handle holds open is closed when this borrow ends
+  /// ([`BasePlane::transient`]).
+  fn hold_descriptor(&mut self, no: InodeNo, file: HostFile) -> Result<(), VfsError> {
+    let open = self.vol.is_open(no);
+    let plane = self.plane()?;
+    plane.descriptors.insert(no, file);
+    if !open && !plane.is_witnessed(no) {
+      plane.transient.push(no);
+    }
+    Ok(())
   }
 
   /// The host directory and entry name of a file inode on the disk: where its witness was
@@ -3248,7 +3379,7 @@ impl Overlay<'_> {
       .as_ref()
       .and_then(|b| b.descriptors.get(&no).copied());
     let Some(held) = held else {
-      self.plane()?.descriptors.insert(no, fresh);
+      self.hold_descriptor(no, fresh)?;
       return Ok(Current::Verified(fresh, at_path));
     };
     let served = match self.host.fstat(held) {
@@ -3796,7 +3927,7 @@ impl Overlay<'_> {
       let hit = plane
         .listings
         .iter()
-        .find(|(_, l)| l.dir == dir)
+        .find(|(_, l)| l.dir == Some(dir))
         .map(|(no, _)| *no);
       if let Some(no) = hit {
         if let Some(l) = plane.listings.get_mut(&no) {
@@ -4148,7 +4279,7 @@ impl Overlay<'_> {
           plane.forget_witness(no, at);
           // The directory is on the disk now: its listing is read from there.
           if !plane.listings.contains_key(&no)
-            && let Some(parent) = plane.listings.get(&dir_no).map(|l| l.dir)
+            && let Some(parent) = plane.listings.get(&dir_no).and_then(|l| l.dir)
             && let Ok(opened) = self.host.open_dir(parent, name)
           {
             let mut source = plane
@@ -4161,7 +4292,8 @@ impl Overlay<'_> {
             plane.listings.insert(
               no,
               Listing {
-                dir: opened,
+                dir: Some(opened),
+                recorded: None,
                 source,
                 fingerprint: None,
                 entries: None,
@@ -4502,7 +4634,14 @@ impl Overlay<'_> {
     if !untouched {
       return Ok(());
     }
-    self.descriptor(store, no).map(|_| ())
+    self.descriptor(store, no)?;
+    // The open this serves is counted after this borrow ends: judge the descriptor at the next borrow's end instead.
+    let plane = self.plane()?;
+    if let Some(at) = plane.transient.iter().rposition(|held| *held == no) {
+      plane.transient.swap_remove(at);
+      plane.deferred.push(no);
+    }
+    Ok(())
   }
 
   /// `chown` with a metadata-only copy-up: the witness is recorded and nothing is pinned (§4.5

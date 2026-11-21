@@ -1,7 +1,6 @@
 //! Correctness by use for slates' git server (goal 93's CORRECT step; main's piece for w-sessionlog, 2026-11-21): stock
-//! git does the same thing to two servers, stock git's own (a bare repository over git's local transport, which runs the
-//! same `git-upload-pack` and `git-receive-pack` `git http-backend` runs) and slates' (its HTTP edge, `--vcs-http`, and
-//! its SSH edge, `--vcs-ssh`), and every result a user can see is compared: each command's success, every ref and the
+//! git does the same thing to two servers, stock git's own (`git http-backend` over HTTP, hosted by the test's minimal CGI
+//! host on loopback) and slates' (its HTTP edge, `--vcs-http`, and its SSH edge, `--vcs-ssh`), and every result a user can see is compared: each command's success, every ref and the
 //! object it names (`git ls-remote`), every object a copy holds (`git cat-file --batch-all-objects --batch-check`: git
 //! names objects by their bytes, so equal sets are byte-identical content) and `git fsck --strict` on each copy.
 //!
@@ -727,23 +726,222 @@ fn same_clones(
   rows.record(row, failure);
 }
 
-/// A bare repository stock git serves over its local transport, made empty.
-fn stock_server(git: &Git, scratch: &Scratch, default_branch: &str) -> Server {
+/// Stock git's own HTTP server for one test: `git http-backend`, the CGI program stock git ships for smart HTTP, run by
+/// a minimal CGI host on a loopback port (`serve_cgi`), one connection a thread, each request one run of the program.
+/// Dropped, it stops taking connections.
+struct HttpBackend {
+  port: u16,
+  stop: &'static std::sync::atomic::AtomicBool,
+}
+
+impl Drop for HttpBackend {
+  fn drop(&mut self) {
+    self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    // Wakes the accept loop so it sees the stop.
+    let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+  }
+}
+
+/// One request the CGI host read: its method, path, query and the headers it passes on, and its body with any chunked
+/// framing removed.
+struct CgiRequest {
+  method: String,
+  path: String,
+  query: String,
+  headers: Vec<(String, String)>,
+  body: Vec<u8>,
+}
+
+impl CgiRequest {
+  fn header(&self, name: &str) -> Option<&str> {
+    self
+      .headers
+      .iter()
+      .find(|(key, _)| key.eq_ignore_ascii_case(name))
+      .map(|(_, value)| value.as_str())
+  }
+}
+
+/// Reads one HTTP/1.1 request from `reader`: its line, its headers, and its body by `Content-Length` or chunked.
+fn read_request(reader: &mut impl BufRead) -> Option<CgiRequest> {
+  let mut line = String::new();
+  reader.read_line(&mut line).ok()?;
+  let mut words = line.split_whitespace();
+  let (method, target) = (words.next()?.to_owned(), words.next()?.to_owned());
+  let (path, query) = target
+    .split_once('?')
+    .map_or((target.clone(), String::new()), |(path, query)| {
+      (path.to_owned(), query.to_owned())
+    });
+  let mut headers = Vec::new();
+  loop {
+    let mut header = String::new();
+    reader.read_line(&mut header).ok()?;
+    let header = header.trim_end();
+    if header.is_empty() {
+      break;
+    }
+    let (name, value) = header.split_once(':')?;
+    headers.push((name.trim().to_owned(), value.trim().to_owned()));
+  }
+  let mut request = CgiRequest {
+    method,
+    path,
+    query,
+    headers,
+    body: Vec::new(),
+  };
+  let chunked = request
+    .header("Transfer-Encoding")
+    .is_some_and(|value| value.eq_ignore_ascii_case("chunked"));
+  if chunked {
+    loop {
+      let mut size = String::new();
+      reader.read_line(&mut size).ok()?;
+      let size = usize::from_str_radix(size.trim().split(';').next()?, 16).ok()?;
+      if size == 0 {
+        let mut end = String::new();
+        reader.read_line(&mut end).ok()?;
+        break;
+      }
+      let mut chunk = vec![0; size];
+      reader.read_exact(&mut chunk).ok()?;
+      request.body.extend_from_slice(&chunk);
+      let mut end = [0; 2];
+      reader.read_exact(&mut end).ok()?;
+    }
+  } else if let Some(length) = request.header("Content-Length") {
+    let mut body = vec![0; length.parse().ok()?];
+    reader.read_exact(&mut body).ok()?;
+    request.body = body;
+  }
+  Some(request)
+}
+
+/// Serves one connection: reads its request, runs `git http-backend` on it as a CGI host does (RFC 3875's variables;
+/// `REMOTE_USER` set, so receive-pack is enabled as an authenticated user's would be), and answers what the program
+/// printed, its `Status` header the status line, then closes.
+fn serve_cgi(stream: std::net::TcpStream, program: &[String], root: &str, home: &str) {
+  let Ok(read_half) = stream.try_clone() else {
+    return;
+  };
+  let mut reader = std::io::BufReader::new(read_half);
+  let Some(request) = read_request(&mut reader) else {
+    return;
+  };
+  let (git, leading) = program.split_first().expect("a command");
+  let mut command = Command::new(git);
+  command
+    .args(leading)
+    .arg("http-backend")
+    .env("GIT_PROJECT_ROOT", root)
+    .env("GIT_HTTP_EXPORT_ALL", "1")
+    .env("GATEWAY_INTERFACE", "CGI/1.1")
+    .env("REQUEST_METHOD", &request.method)
+    .env("PATH_INFO", &request.path)
+    .env("QUERY_STRING", &request.query)
+    .env("CONTENT_LENGTH", request.body.len().to_string())
+    .env("REMOTE_USER", USER)
+    .env("REMOTE_ADDR", "127.0.0.1")
+    .env("HOME", home)
+    .env("GIT_CONFIG_NOSYSTEM", "1")
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
+  for (variable, header) in [
+    ("CONTENT_TYPE", "Content-Type"),
+    ("GIT_PROTOCOL", "Git-Protocol"),
+    ("HTTP_CONTENT_ENCODING", "Content-Encoding"),
+  ] {
+    if let Some(value) = request.header(header) {
+      command.env(variable, value);
+    }
+  }
+  let Ok(mut child) = command.spawn() else {
+    return;
+  };
+  let mut stdin = child.stdin.take().unwrap();
+  let body = request.body;
+  let feeder = std::thread::spawn(move || {
+    let _ = stdin.write_all(&body);
+  });
+  let printed = read_on_a_thread(child.stdout.take().unwrap())
+    .join()
+    .unwrap();
+  let _ = feeder.join();
+  let _ = child.wait();
+  let split = printed
+    .windows(4)
+    .position(|window| window == b"\r\n\r\n")
+    .map(|at| (at, 4))
+    .or_else(|| {
+      printed
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|at| (at, 2))
+    });
+  let (head, content) = match split {
+    Some((at, gap)) => (&printed[..at], &printed[at + gap..]),
+    None => (&printed[..0], &printed[..]),
+  };
+  let mut status = "200 OK".to_owned();
+  let mut response = Vec::new();
+  for line in String::from_utf8_lossy(head).lines() {
+    match line.split_once(':') {
+      Some((name, value)) if name.eq_ignore_ascii_case("Status") => {
+        status = value.trim().to_owned()
+      }
+      Some(_) => response.extend_from_slice(format!("{}\r\n", line.trim_end()).as_bytes()),
+      None => {}
+    }
+  }
+  let mut out = stream;
+  let _ = out.write_all(format!("HTTP/1.1 {status}\r\n").as_bytes());
+  let _ = out.write_all(&response);
+  let _ = out.write_all(
+    format!(
+      "Content-Length: {}\r\nConnection: close\r\n\r\n",
+      content.len()
+    )
+    .as_bytes(),
+  );
+  let _ = out.write_all(content);
+}
+
+/// A bare repository stock git serves over HTTP through `git http-backend` ([`HttpBackend`]), made empty: the server
+/// and the host, which the caller keeps for the test.
+fn stock_server(git: &Git, scratch: &Scratch, default_branch: &str) -> (Server, HttpBackend) {
   let bare = format!("{}/stock.git", scratch.path);
   git.ok(
     &scratch.path,
     &["init", "-q", "--bare", "-b", default_branch, &bare],
   );
-  let url = if bare.starts_with('/') {
-    format!("file://{bare}")
-  } else {
-    format!("file:///{bare}")
-  };
-  Server {
-    name: "stock",
-    url,
-    config: Vec::new(),
-  }
+  let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+  let port = listener.local_addr().unwrap().port();
+  let stop: &'static std::sync::atomic::AtomicBool =
+    Box::leak(Box::new(std::sync::atomic::AtomicBool::new(false)));
+  let (program, root, home) = (git.program.clone(), scratch.path.clone(), git.home.clone());
+  std::thread::spawn(move || {
+    for stream in listener.incoming() {
+      if stop.load(std::sync::atomic::Ordering::SeqCst) {
+        break;
+      }
+      let Ok(stream) = stream else {
+        continue;
+      };
+      let (program, root, home) = (program.clone(), root.clone(), home.clone());
+      std::thread::spawn(move || serve_cgi(stream, &program, &root, &home));
+    }
+  });
+  (
+    Server {
+      name: "stock",
+      url: format!("http://127.0.0.1:{port}/stock.git"),
+      config: Vec::new(),
+    },
+    HttpBackend { port, stop },
+  )
 }
 
 /// The servers a run compares stock against: slates' HTTP route, and its SSH route where OpenSSH is here.
@@ -828,7 +1026,7 @@ fn every_kind_of_tag_is_pushed_cloned_and_served_as_stock_git_serves_it() {
   let scratch = Scratch::new("git-tag-kinds");
   let git = Git::new(&program, &scratch);
   let source = tag_kind_source(&git, &scratch);
-  let stock = stock_server(&git, &scratch, BRANCH);
+  let (stock, _backend) = stock_server(&git, &scratch, BRANCH);
   let slates = start_slates(&scratch, BRANCH);
   let mut rows = Rows::default();
   for server in slates_servers(&slates) {
@@ -890,7 +1088,7 @@ fn stock_git_verbs_on_a_real_repository_match_stock_git() {
   let git = Git::new(&program, &scratch);
   let head = git.ok(&dataset, &["symbolic-ref", "--short", "HEAD"]);
   let branch = head.trim().to_owned();
-  let stock = stock_server(&git, &scratch, &branch);
+  let (stock, _backend) = stock_server(&git, &scratch, &branch);
   let slates = start_slates(&scratch, &branch);
   let servers = slates_servers(&slates);
   let mut rows = Rows::default();
@@ -1181,7 +1379,7 @@ fn verbs_on_copies(
 }
 
 /// Where `git-lfs` is here: a file tracked by LFS pushed to slates over HTTP and cloned back, its bytes the same. Stock
-/// git's local transport serves no LFS, so this row compares slates with the bytes pushed.
+/// git's http-backend serves no LFS, so this row compares slates with the bytes pushed.
 fn lfs_row(rows: &mut Rows, git: &Git, scratch: &Scratch, http: &Server) {
   let has_lfs = git.run(&scratch.path, &[], &["lfs", "version"]).ok();
   if !has_lfs {
