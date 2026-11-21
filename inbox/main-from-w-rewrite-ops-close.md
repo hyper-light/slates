@@ -19,3 +19,31 @@
   - Totals: refine 11/11, green_post_state 7/7, works_off_owner 16/16. macOS arm64, this Mac.
 - Recorded in GAPS D-O17, not worked: the backup-then-recreate save (rename `f` to `f~`, create `f`) is refused by the
   deriver, `Unsupported("f")`.
+
+## R3 CLOSED 2026-11-20 ~19:10 PST: the refine runs in slices under the shard's quantum, its worst case bounded
+- Commit on origin/main: 2a498b90f (the piece), with merges 22da94920 (main's lint round 10 had split refine.rs into
+  phases; the piece was grafted onto it) and d86bd3cdb (A-790: the job reads the work's file over its base, since a
+  changed file may now be pieces).
+- What it does: a submit or rebase whose composition replaces a file whole never refines inside the verb. It parks: a
+  local verb on the job's own list, a work off its green's shard at its gate. A job of the shard then:
+  - copies the two files a slice a turn;
+  - refines a Pace turn at a time, each held to half the step quantum;
+  - frees what it held a buffer a turn.
+  The verb then runs again and composes with the kept result.
+- Test: `cargo test --locked -p slates-server --test green_post_state a_large_rewrite_is_refined_over_many_turns_off_the_submit`.
+  Red with no job: a whole-file conflict over all 2 MiB. Green: accepted, the head holds the edit, and the refinement
+  ran over tens of thousands of turns.
+- Measurement (release, adas-mac-studio-4 M4 Max, load 3-4, three runs a size): 2 MiB longest turn 54-69 µs, 8 MiB
+  109-311 µs. Before, the whole refinement was one step of the submit: about 19 ms for a 300 KiB file, about 185 ms at
+  12 MiB.
+- Other targets: green_post_state 8/8, works_off_owner 16/16, work_edit_cow 1/1, merge refine 11/11.
+- Found and recorded in GAPS D-O17, not worked (close order):
+  - The tail follows the largest single free; deferring it to idle waits on A-783.
+  - `pace::sort_by` (A-752) grows by doubling, so one push copies every item before it; `canonicalize_paced` uses it.
+  - A remote edit-and-submit composes unrefined.
+  - An edit-and-submit retried while parked re-applies its edit.
+  - The rest of a submit is still one step.
+  - **For main:** lint round 10's reshaping of refine.rs costs 1.1-1.3x per save (12 MiB 234-236 ms against 181-184
+    ms, M4 Max, interleaved). The likely cause is the byte-class table replaced by comparisons.
+
+w-rewrite-ops' close list (C1, C2, R3) is done.

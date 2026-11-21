@@ -57,3 +57,39 @@ Pin + no-CLI clauses hold (w-k90-pin's audit). Left: CI evidence per platform at
   (systemd-oomd on a 16 GB runner). LANDED kiln e763e394f (merge-base confirmed, base e763e394f): Linux lanes stop
   oomd, 16 GiB swap, CARGO_BUILD_JOBS=2. Validated 0 diagnostics.
 - Still watching 44841298533's macos-latest / windows-11-arm / ubuntu-latest slates and w-k90-win's windows-slates.
+
+## ~19:00 PST (03:00Z)
+- GREEN macOS arm64: GitHub run 44841298533 (kiln 4aa0ee778, contains 08f1a434's vendor/slates pin), job 136653837819
+  `macos-latest (Slates build and tests)`: build 39 min, `--lib workspace::slates` 73 min, `--test vendored --test
+  slates_roles` 24 min, all success.
+- windows-11-arm job 136653837913: build OK, lib Slates tests OK, `vendored`/`slates_roles` FAILED exit 101 (no readable
+  detail). LANDED kiln eb7194f00 (merge-base confirmed, base eb7194f00): slates job Report step annotates failed tests.
+  Repro started: kiln run r145 (needs windows: jupiter, own target ~/.cache/w-k90-pin-2-target) `--test vendored --test
+  slates_roles`; queued (jupiter link down).
+- ubuntu-latest/ubuntu-24.04-arm on 4aa0ee778 red (before e763e394f's memory fix).
+- Clippy red on Windows/Linux (all clippy legs): crates/kiln/src/workspace/container.rs:301 `crate::rt::sleep` is a
+  disallowed method (A-520 piece 5, w-k90-containers'). For main / lint keeper.
+- Poller bebez30pl stopped at its 2 h limit.
+
+## ~21:45 PST (05:45Z)
+- GREEN Linux x86-64: GitHub run 44851246181 (kiln 4f5e58c1b, contains e763e394f + the 08f1a434 pin), job 136703754443
+  `ubuntu-latest (Slates build and tests)`: every step success. macOS arm64 green again there (136703754428).
+- ubuntu-24.04-arm 136703754445: build ran 90 min (oomd off, swap, -j2), exit 101, no detail; its (clippy, build) leg
+  lost the runner (143). LANDED kiln f500759d2 (base f500759d2): slates Report covers the build step.
+- windows-11-arm 136703754464: build OK, lib Slates tests OK (51 min), `--test vendored --test slates_roles` exit 101
+  again (slates_roles is #![cfg(unix)] -> the `vendored` test or the test build fails on Windows arm64). Report step
+  (eb7194f00) not in that run; next run 44867288588 (af73099bd) carries it.
+- windows-slates (w-k90-win) on 4f5e58c1b: slates_e2e GREEN; lib: 2 tests with hard-coded Unix paths (mod.rs:747/764)
+  -> told w-k90-win (agents_send + inbox).
+- clippy container.rs:301 -> w-k90-containers says it's w-k90-a520's, forwarded.
+- r145 (jupiter repro) still queued: jupiter not answering. kiln's own lanes for 08f1a434 still wedged.
+
+## ~00:30 PST 11-21 (08:30Z)
+- Run 44867288588 (af73099bd): ubuntu-latest GREEN again (136745995680). ubuntu-24.04-arm build failed at kiln's final
+  link ("linking with `cc` failed: exit status: 1", reason cut by the 4 KiB cap). LANDED kiln 482bd01f8 (base 482bd01f8):
+  Linux arm64 links with the toolchain's gcc-ld/ld.lld when present; Report shortens >300-char lines.
+- windows-11-arm 136745995679: build + lib Slates tests green; `vendored` 2 of 11 red: a_vendored_crate_taken_from_git
+  ("the planted source isn't in the lock") and an_unrelated_crates_io_crate ("quiver isn't in the lock as kiln's"):
+  CRLF Cargo.lock on Windows checkouts vs "\n" patterns. Fix in worktree: kiln_lock() normalizes \r\n. Testing:
+  kiln run r2 (d13238) `cargo test -p kiln --test vendored`, own target ~/.cache/w-k90-pin-2-target.noindex.
+- Note: my code_run sleep loop spun 2000 calls when machines.run failed fast during kiln's restart (now shell waits).

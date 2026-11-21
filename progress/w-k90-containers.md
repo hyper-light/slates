@@ -212,3 +212,35 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
    Jupiter is still waiting on the kiln re-vendor of Slates ae8319811 (export_engine).
 ## For main to delete (add): this Studio ~/.cache/w-k90-containers-ship-1795208540; MacBook ~/.cache/w-k90-containers-e2e-2f589ba,
    ~/.cache/w-k90-containers-dockercfg.
+## 2026-11-20 ~22:30: CLOSED (main's order after Ada's ~21:00 correction; the container part was rewritten and marked met by main)
+- Stopped by run id: r74 (MacBook, the rerun of r71) and r70 (jupiter, still building).
+- LANDED kiln 9437e6430 (fast-forward from b928a782a; is-ancestor confirmed): workspace/container.rs:301 rt::sleep -> rt::sleep_until(deadline), with no allow;
+  plus container_ab_tests.rs:253 (indexing_slicing) and tests/slates_fleet_live_move.rs:695 (.last() on a DoubleEndedIterator, redundant
+  closure), which also kept `cargo clippy -p kiln --all-targets --locked -- -D warnings` red. Red, then green under that exact command (big Studio,
+  macOS aarch64); 65 container unit tests pass. Told w-k90-pin-2.
+- Results on record: r49 (2f589baa6), r56 (cc80a38f8: Ask all 4 steps PROVEN, end included), r71 (f500759d2: drift passed). No adacachy pass (per w-k90-a520).
+- New findings (GAPS): the bind-vs-export A/B (r61) needs fresh folders per round and an exec tmpfs, and its take-down hangs on Docker Desktop's VM
+  holding the mount; fixes are only on agents/w-k90-a520-unlanded (fedd354ba), unverified. kiln's tree isn't `cargo fmt` clean under rustc 1.100
+  (1146 files reformat).
+## DELETED by exact path: big Studio: every ~/.cache/w-k90-containers-* (targets 128G+25G+18G, ship folders, logs), ~/kiln-work/w-k90-containers-kiln,
+   worktree ~/kiln-work/w-k90-containers-a520. MacBook-Pro-2: ~/.cache/w-k90-containers-{ab-cc80,dockercfg,e2e,e2e-2f589ba,e2e-cc80,e2e-f500,
+   live-r70.log,target}, ~/.cache/wkc-clippy.bundle, ~/.cache/kiln-container-ab, ~/kiln-work/w-k90-containers-{a520,kiln}. jupiter:
+   ~/.cache/w-k90-containers-{target,target.del-main,win-e2e.log,wincheck.log,win-leg2.log}, ~/kiln-work/w-k90-containers-win.
+## For main to delete (I couldn't reach these): b24c (did not answer): ~/.cache/w-k90-containers-statepush, ~/.cache/wkc-state.bundle,
+   ~/.cache/wkc-clippy.bundle (if there). adacachy (no room): any ~/.cache/w-k90-containers-*. This Studio: this state clone
+   ~/fanout-state-w-k90-containers (in use until this push). MacBook images pulled for the A/B: rust:1.99.1-bookworm, node:24-bookworm.
+## 2026-11-21 ~00:15: goal re-set by the person at ~22:40; stopped again by main at 00:03 (Ada's 21:00 ruling)
+- Results: Linux adacachy PASSED (w-k90-a520's r3, kiln 209e19dc6 = main f5056c0bb's container code: container:: 2/2, 240.9 s).
+  macOS PASSED on MacBook-Pro-2, Docker Desktop 29.3.1 (my r4, kiln 02f311ec3: 2/2, 293 s; drift held Ask+Bypass; review,
+  person's landing by manifest (folder = agent's changes exactly, HEAD/index unchanged), end clean; 0 mounts/volumes/containers left).
+  No Studio could run it (Studio-3, the only Studio with Docker Desktop, wedged/unreachable; Studio-2 offline; this Studio colima only).
+  Windows NOT run: jupiter r3 cancelled by main's order while building.
+- OWED to the kiln engine rework task (NOT landed, per main): kiln branch agents/w-k90-containers-export @ 02f311ec3 -- the
+  Windows container route (seen_at: the container mounts/works at guest_path's /mnt/<drive>/...; uid 1000 on Windows, held::owner
+  bailing there; slates_e2e `mod container` cfg(any(unix, windows))). Unverified on Windows. Also owed: the bind-vs-export A/B on a
+  Mac (f5056c0bb's fixed harness); its release build reached 23 GB and stalled the big Studio (main stopped it). kiln has no GAPS file.
+## DELETED by exact path (00:15): big Studio ~/.cache/w-k90-containers-{target,target-ab,target-win,ship-exp,*.log}, ~/kiln-work/
+   w-k90-containers-kiln, /tmp/wkc-exp.*; MacBook ~/.cache/w-k90-containers-{e2e-exp,target}, ~/kiln-work/{w-k90-containers-kiln,
+   wkc-push}; jupiter ~/.cache/w-k90-containers-{target,win.log}, ~/kiln-work/w-k90-containers-win; adacachy ~/kiln-work/
+   w-k90-containers-lin, ~/.cache/w-k90-containers-{target,tmp,lin.log,live-build.log,live-test.log}. cargo 82510 had exited.
+## 2026-11-21 ~00:25: a re-sent goal (kiln's reminder, not Ada) restarted the Windows leg; main stopped it (00:23). jupiter r17 stopped while cloning; its clone and target deleted; Studio-3 only read (no runs, no scratch). Owed items unchanged: agents/w-k90-containers-export 02f311ec3 + the Mac A/B, to the kiln engine rework. Closed.

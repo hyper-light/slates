@@ -1,5 +1,29 @@
 # w-rewrite-ops progress (D-O17: a whole-file rewrite becomes the precise edit it was)
 
+## 2026-11-20 ~19:10 PST — close list (Ada's CLOSE THE OPEN ITEMS order): C1, C2, R3 all CLOSED
+
+- C1 CLOSED: b8c16aad7 (main d4a5f9f43). A work off its green's shard fetches the base of files it replaced whole.
+- C2 CLOSED: 95e88882f (main 7998a7356). A rewrite renamed over another file is refined against its source. Also
+  fixed there: a refined path lost its rename, mode and attributes.
+- R3 CLOSED: 2a498b90f, with merges 22da94920 and d86bd3cdb on origin/main. Quiet Studio-4: longest turn 54-69 µs at
+  2 MiB, 109-311 µs at 8 MiB. Close notes: inbox/main-from-w-rewrite-ops-close.md. Queue empty.
+- (Earlier notes on R3, kept:)
+  - What it does: the refinement runs off the verb in a shard job (crates/server/src/refining.rs). It copies a slice a
+    turn, refines a pace turn at a time and frees a buffer a turn. Local verbs park on the job's own list; works off
+    their green's shard park on Need::Refine.
+  - Measured, release, this Mac before main's merge: longest turn 69-79 µs at 2 MiB, 133-157 µs at 8 MiB.
+  - The merge with main's lint round 10 (which split refine.rs into phases) needed a graft. Its 2 and 8 MiB figures are
+    being re-measured on a quiet machine (r25): this Mac reads load 35-80 now.
+  - Not yet: push, close note.
+- Findings recorded in GAPS D-O17, not worked:
+  - the backup-then-recreate save is refused Unsupported by the deriver;
+  - the R3 tail follows the largest free (deferring it waits on A-783);
+  - pace::sort_by's doubling copies;
+  - a remote edit-and-submit composes unrefined;
+  - an edit-and-submit retried while parked re-applies its edit;
+  - the rest of a submit is still one step.
+
+
 ## 2026-11-20 ~16:40 PST — LANDED: A-787 part 1 on origin/main (piece 5df1db1f4, main cafb424e3)
 
 Main's 15:20 pushback, item 1: slice the refinement under the quantum.

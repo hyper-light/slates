@@ -290,3 +290,25 @@
   A4 replay v4: names from content; pack read from the content store by identity (GitReplay chunks from windows;
      replay_pack whole via object_bytes); record holds the pack content as v3 held names.
   Measure: v1.5.0 landing step (entry apply 18 ms -> ~0) and record bytes; red: no step past the quantum landing v1.5.0.
+- 18:35 v4 PART A LANDED 7a52ef882 (merge 33f17ba0d), tested at c20861789 over ed021dc42 (git 582, server 166 ok).
+  Close note: inbox/main-from-w-git-close.md (P4 7b66e7225, P5 ccd07b58c+15917f29a closed; C1 part done, C5 with
+  w-store left). Worktrees land9/land10 removed; branches v4a, v4a-land, memdiag, decodediag, a665p4 deleted; Studio
+  release target and diag worktrees deleted. Mac worktree now: ~/slates-work/w-git-state (state branch) only.
+- R2 (edge tests under load) IN PROGRESS: repro r139 at load 78-83, 8x the three tests: 19/24 fail, all in the PUSH's
+  chunked body (daemon_edge.rs:571 -> chunked_body), not the fetch. Suspects: Receive::answer_until awaits that skip the
+  keepalive deadline: turns::take, home_in_region (names + pack), names_committed_within. Diag r140
+  (~/.cache/w-git-diag/r2_patch.py, never for main) times each.
+- 2026-11-21 00:45 C5 part 1 LANDED origin/main 0e7120bdd (record v5 + changeset landing + store recovery; red test
+  t_a767_c5_a_git_push_lands_as_one_changeset_and_a_restart_replays_it_from_the_store; r13 green 211 passed, 6 A-664
+  failures that also fail on main). Close note in inbox/main-from-w-git-close.md. Next: C5 part 2 (store-less git
+  creation refused + git leg of w-hg's test; v2 and sequence 0 removed; git tests onto test_store; StorePacks replay),
+  then R2 (edge tests under load: push answer_until awaits skip the keepalive deadline; r139 repro 19/24).
+  Studio-4: my old target, clone and worktree deleted (58 GiB free there after).
+- 2026-11-21 01:05 C5 part 2a LANDED cf6b3c98a: git refused without --vcs-store; 76 tests onto test_store; edge suite
+  StoredDaemon; v3_takeover/git_interop anchors with --vcs-store. Next: C5 part 2b (v2 + seq 0 removed, homing/landing
+  mandatory, StorePacks replay), then R2 (keepalive across answer_until's awaits: carry homing/landing,
+  names_committed_within; the edge tests fail under load; landing's flush makes it longer).
+- 2026-11-21 01:00 R2 CLOSED 970950081 (first keepalive after the body was 2 intervals = 10 s; r28 red 18/18 -> r29
+  green 18/18 at load 29-33). Next: C5 part 2b piece 1 (pushes v5 only; carried shortfalls refuse; names race
+  refuses; moves-only v5; the v4 test switch removed; v2 left for made commits and sync test drivers' untaken asks),
+  then 2b-2 (sync drivers async), then made commits onto w-svn's deferred-submit hook.

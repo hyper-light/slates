@@ -237,3 +237,53 @@
   48, presentations 10 pass here.
 - Host, six cross targets, structural, literals, unsafe, fmt: clean.
 - Windows r54 (on ebd9014c3) still running on jupiter; Linux resubmitted (r56 had no room).
+
+## 2026-11-20 round 10 at d4a5f9f43 (landed 35e4fd7de, merge follow-ups 3b2f12c1d, c968c7e2e; main 5313ab3cb)
+- merge refine.rs (A-787 part 1: 34/30/24/15/13 of 10) split by phase into paced helpers, every charge! kept in place;
+  the const byte-class table gone (class() calls classify()). Conflicted with w-rewrite-ops' 95e88882f (C2 renames):
+  took their tail, re-split refine_rewrites_paced on it (lent_whole, refined_ops, spliced + others_kept, relaid_plan,
+  ops_laid_into). merge lib 244 pass.
+- rt (A-767): sync test's sleep -> yield, room test split, retirement Format/Derived lines, a stale From<SyncRefusal>
+  the merge kept dropped. git encode_bench: Result + ? (no new allow). server: landing drop()s, svn DeltaV v1 arms,
+  rebuild_mounted_slot, fleet holder-takeover split, svn_deltify + recovery waits yield. mem, svn, land, store clippy.
+- recovery a_bursts_extents_go_back (A-789) fails on Studio-2 on main's own code (1,341 MiB after vs a 64 MiB bound),
+  same with the original sleep: GAPS.md, not worked (Ada's order).
+- store literals (56 sites, layout offsets + two Cited: consts) sent to w-store: inbox/w-store-from-w-lint.md.
+- Windows r58 / Linux r60 (A-782, g226, A-786) still running/queued on kiln.
+
+## 2026-11-20 round 11 at 5313ab3cb (landed 833144bd7)
+- Host clippy, fmt, structural, six cross targets: clean.
+- unsafe: slates-store had no budget entry -> `slates-store = 0` (833144bd7). slates-server 8 against 6: A-789's
+  (362bd8c39) two content_pool.rs open_range sites, budget not raised -> w-sizing (inbox/w-sizing-from-w-lint-unsafe.md).
+- literals: 56 sites in slates-store, w-store's (inbox/w-store-from-w-lint.md); none elsewhere.
+- r58/r60 were collected by kiln's restart without results; relaunched on 833144bd7 as r1 (jupiter) and r2 (Linux).
+
+## 2026-11-20 round 12 at 283d646b7 (landed e51d9adeb, main e79614bdf)
+- merge head_under test (A-792) no longer a Result test that asserts; server work_files ChangedEntry alias + test
+  initializer; verbs assemble_post_state's size is post_state_size. Tests: head_under 1, work_files 3,
+  green_post_state 7.
+- Host, fmt, structural, six cross targets clean. Still with owners: slates-store's 56 literals (w-store),
+  slates-server's unsafe 8 > 6 (w-sizing, A-789).
+- Windows: jupiter is offline; r4 asks kiln for any Windows runner. Linux r60 still queued.
+
+## 2026-11-20 19:15: refine.rs table back (9f77462e4), main's order
+- Whole refinement back at pre-round-10 cost; sliced ~1.05x left (GAPS D-O17 (f) updated). Plus refine CHUNK cast,
+  refine test split, server refining.rs literals. Close note appended to inbox/main-from-w-lint-close.md.
+- Windows after jupiter's return (19:37): r4 (queued by needs while it was away) started, then timed out at 90 min
+  with no output at all (not even the clone's line: a hung clone or no output streamed). Resubmitted by needs with the
+  warm CARGO_TARGET_DIR and a 600 s clone cap: r5 and r6 both refused "no room here now" on jupiter. Not resubmitting
+  again until the next round. Linux r60 still queued.
+
+## 2026-11-20 round 13 at e4cfbd38d (landed 7a9ace19f, 785e0a94f, 55038e039, part 3)
+- main's five Windows reds: two fixed (winfsp HostFs, vcs_svn HOOK_PATIENCE_NS cfg(unix)), three already in e51d9adeb;
+  `cargo xwin clippy` works on this Mac and ran the server and cli Windows check.
+- Host: hg, mem, merge, rt (Rc -> mpsc), db, land, server (push boxed verdict, hg_push, content_ranges, verbs
+  forward_placement, scratch-dir allows, svn_presenter), store tests and example, cli dead helper. slates-pace: no-panic
+  attribute (+4 checked divisions), budget 0; literals derived/named.
+- Correction to 785e0a94f's message: the rt pacing failure happened once, on my version only, under load; both versions
+  then passed 3 of 3. content_ranges failed once at load 7, then passed 2 of 2 on both versions.
+- To g228 (inbox/g228-from-w-lint.md): live_fleet's two time-waits, resident.rs's /proc read (structural), mem unsafe
+  88 > 87. Still with w-store: 3 store literals; w-sizing: server unsafe (now ok? see next round).
+- Windows run requests (main 20:05: w-sizing R2 at 20bef898c with its red-first at 20bef898c^, w-work-mount's WinFsp
+  mounted-work test, w-realtools' real_tools over WinFsp): one combined run by needs "windows". r7 and r8 both ended
+  "the kiln server did not answer in time" before any output came back; whether r8 runs on jupiter is unknown.

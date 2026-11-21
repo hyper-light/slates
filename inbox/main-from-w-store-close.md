@@ -20,3 +20,100 @@
   crates/rt and crates/land; the vendored crates' unit suites on Linux/Windows
   (`TMPDIR=<own dir> cargo test --manifest-path vendor/mantle/engine/Cargo.toml --lib`, same for chunk, hyper-block).
 - GAPS (performance, not blocking): segmented store files over the granted root.
+
+## C3 CLOSED (2026-11-20): slates-store — the seam, landing, and the content-form A/B with the derived per-path arm
+- Commits on origin/main (each confirmed with merge-base):
+  - 6ce6bd170 the changeset log (crates/store/src/log.rs): CRC'd header, sections (kind, len, CRC-32C), trailer (BLAKE3
+    identity, commit magic, len, CRC); appended in pieces, committed by trailer + one sync_data before the end moves;
+    recovered to the first record that does not verify. On hyper-block directly (hyper-log's groups keep a truncated
+    suffix; the history is never truncated) — recorded in A-767.
+  - 6ada9dc42 the store: granted dir (land store_root) holding `changesets` + mantle's engine `rows`; landing = commit
+    then C rows; engine checkpoints at the log's end; open replays the log from the checkpoint.
+  - 67ba19d3a the seam: Staging (in flight by BLAKE3, moved not copied, bounded, Full past budget), Store::land from
+    bytes or staged contents, P rows (payload identity -> place in the log, rebuilt on replay), Store::piece
+    (borrowed in flight, read from the log once landed), Store::changesets/sections.
+  - 6370667fc the A/B's arm C (crates/hg/examples/changeset_ab.rs): changesets + derived per-file form. Over hg's
+    history at zstd 1, N=3, Adas-Mac-Studio-2: old read p50 73-74 µs, clone file section 0.06 s (bar: 91 µs, 0.27 s;
+    A 77-79 µs / 0.19 s; B 814-833 µs / 2.02 s); derivation 2.2 s once, +25.7 MiB. Decided in A-767: changeset log =
+    truth, derived per-file form serves reads. BENCHMARKS has every round.
+- Tests: slates-store unit 7/7 (log over hyper-block's power-loss SimFile: round trip, every crash mode, interrupted
+  record, cut at every byte, bit flips, out-of-order; staging), integration 4/4 on real dirs (rows by repository,
+  recovery without/with checkpoint, a 300,001-byte pack read the same staged/landed/recovered), land store_root 3/3.
+- Not met as asked: adacachy could not clone hg's history (mercurial-scm.org "incomplete response" x3), so the A/B rows
+  are this Mac's (load 2-3.5). A Linux row needs the dataset carried there another way.
+- Agreement on the stored form: w-hg agreed (named-base edits, Texts section — both in the format), w-git agreed
+  (v4 payload by identity, normalization behind the same names); w-svn has not replied.
+- Next: C4-C6 — the store into the server (StoreGrant at repository creation, the store on the owner shard), each
+  tool's intake landing through Store::land, replay from Store::changesets, an RSS red test per tool; the derived
+  per-file form built in the store with hg (C4).
+
+## 2026-11-20 ~21:30: memtable at both extremes, the sliced landing (71db6d157)
+- Your memtable order: the derivation fix was already on main as bc0677af9. The memtable is one trunk node of extents,
+  fanout × chunk = 512 KiB, with no machine input and no clamp. 71db6d157 adds the red/green test at both extremes:
+  `slates-api` `store_sizing_tests::the_store_lands_on_a_small_and_a_large_machine_alike`. It injects 8 GiB and
+  128 GiB into `facts.memory`, then runs `DaemonConfig::derive` → `start_store` → land → stop. Red at 128 GiB under
+  the old formula (landing `Gone`), green at both. Ran on this Mac (Adas-Mac-Studio-2), debug, 0.75 s.
+- On point 2 (the device's flush rate): the memtable holds rows only. A landing's bytes go to the log, the engine's
+  write-ahead log, so the landing batch never sits in the memtable. The flush rate over the group-commit window is the
+  input for the log's group commit, which is owed (GAPS A-767), not for the memtable. I didn't add a device input there.
+- The section read for w-svn has been on main since ba760f0ef (`StoreHandle::sections` plus `read`), and w-svn was told.
+- New in 71db6d157: the owner's sliced landing (`begin`/`section`/`part`/`commit`, abandoned on drop). Tests:
+  slates-store 20/20 and slates-api store_sizing 1/1. Told w-hg, w-perf and w-svn.
+- Next: C4 with w-hg, rerunning its store test on main; then C5 with w-git; then C6 with w-svn's import over the
+  sliced landing.
+
+## 2026-11-20 ~22:30: C5's store side; the grant's G row
+- ad1d9e7a6: `StorePacks` (crates/server/src/vcs_store/store_packs.rs), git's sync `PackSource` over the store's
+  owner. An awaited `fill` puts the covering 64 KiB store pieces into an LRU bounded by the caller's derived `most`;
+  `piece` lends from that alone, and a miss is the cue to fill. There is no blocking read (R6). Test: a 300,000-byte
+  pack read forward through a three-piece bound, each piece fetched once and every miss one fill (server --lib 1/1).
+  Shape posted to w-git.
+- e5baf401c: the standing grant is durable as the store's `G` row: recorded at the first open, checkpointed before
+  anything lands, and found as first issued after a crash. Every landing's header names its id
+  (`StoreHandle::grant()`); the creation landing does now, and the tools were told. Tests: slates-store 21/21, server
+  store_tests 2/2. Still owed: a standing-grant `AuditKind` with its audit position, and revocation.
+
+## 2026-11-20 ~23:30: a creation in the one landing order (e4cfbd38d)
+- Red first: `a_kill_between_a_creations_landing_and_its_record_leaves_no_repository_and_its_retry_creates_it_once`
+  (server --lib, `repository/store_tests.rs`). A test-only fault ends the landing task between its two steps. Before
+  the fix, the repository was left in the register with no creation in the store.
+- Fix: `land_then_record`. It judges the `RepositoryCreated` guard (no apply) and reserves the repository's and root's
+  ids, then lands changeset 0. Only after that does one transaction record the repository, its root and the
+  completion, and the client is answered (the verb's acceptance is deferred until then). A kill in between leaves a
+  changeset no repository names, and the retry creates the repository once. Tests: `store_tests` 3/3.
+- **Your call:** id reservation was needed because ids were only peeked from the partition's family counter when the
+  verb ran. `ShardState::family_reserved_through` is a high-water mark; `fresh_family_id_at` now mints past it, so an
+  id that never got recorded becomes a gap and is never reused.
+- **Your call:** with a store, a create with no reply route (forwarded from another node) is refused `Unsupported`,
+  since it has nowhere to be answered after the landing. This is in GAPS as owed with the fleet half. Overrule if you
+  want something else.
+- There was no GAPS line for this finding, so I recorded it as CLOSED in the A-767 entry, with a design status line.
+- `repository::tests`: 58 pass and 4 fail. The 4 failures are the same ones (submit refused `Overloaded`) I reported on
+  clean main f9c113ae9, not from this change.
+- Sibling: svn_made's order is with w-svn (your note). w-hg's push already lands first on its branch.
+
+## 2026-11-20 ~23:59: e4cfbd38d's two choices (174459b36, merged as 9bfcbb9be)
+1. **The restart.** Test: `a_creation_after_a_restart_never_meets_a_killed_creations_orphaned_changeset`. A create is
+   killed between the steps; the daemon and the store's owner stop; a successor starts over the same anchor segment
+   and store; the same partition creates again. The log does hold two changesets 0 under one id (asserted, so the
+   successor really minted the orphan's id again).
+   **It was green with no code change, so there was no red to show.** The store's `C` row for `(repository,
+   sequence)` is the newest landing at that key, and that is the only one the register can ever name: a record
+   follows its landing, and once an id is recorded the counter passes it. So the new repository's rows give exactly
+   its own creation. This is your "applies only what the register named" rule, enforced by the store's key, so I added
+   no second mechanism. The orphan's log bytes stay until the cleaner of unnamed log space (in GAPS). If you want
+   recovery to drop unnamed changesets explicitly anyway, say so and I'll build it on that cleaner.
+2. **Forwarded creates.** No create is ever forwarded to another node. Every repository verb names no volume
+   (`RequestBody::volume` in `crates/ipc/src/protocol.rs`: "served on the partition its name hashes to", A-575), and
+   `verbs::serve_forward` refuses any volume-less verb (`Unsupported { "forwarded verb" }`) before it runs. A create
+   always runs on the node the client reached, and a forward between shards of one node carries its reply route. So
+   the refusal I had was unreachable by any client, laptop or fleet, and R8 already holds.
+   - I built the parked-answer path on dc4f6eb06's mechanism (an attach in `await_deferred_completion`), then took it
+     out: it could never run, and the rules ban a "just in case" second path.
+   - What remains is one typed refusal, for a dispatch with no client request or route (a shard's own call), and it is
+     the same on every node.
+   - The GAPS "owed" line is gone, replaced by these facts.
+   - If repository verbs are ever forwarded, the attach is three small pieces: a map of creations by request, a guard
+     arm in `await_deferred_completion`, and `answer_awaited` at the record.
+- Tests: `store_tests` 4/4 and `slates-store` 21/21, run on the merged tree (it includes main's lint round 13).
+- Next: the standing grant's AuditKind and revocation.

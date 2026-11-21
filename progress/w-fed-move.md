@@ -1,5 +1,61 @@
 # w-fed-move — progress (relaunched on the Mac Studio 2026-11-19 ~21:35 PST; supervisor slates-7a via kiln)
 
+## 2026-11-21 ~01:30 PST: A-800 LANDED slates main 9918e6c0 (main's order: the lost replies first)
+- Drop sites on the reply-home hop listed, each counted apart; the silent ones (a reply dropped while its shard's
+  state is borrowed, finish_owner_forward's and deliver's refused borrows) now resend or count. Three red/green tests.
+- Told main: inbox/main-from-w-fed-move-counters.md (main reruns 100k from run-requests.md).
+- Leading candidate: a reply admitted and never run; A-798 (931e52ed) fixed such a lost kick since.
+- Next (main's order 3): the throughput walls (153 verdicts/s; 10.1 M owner asks), each with a counter-named mechanism
+  and an A/B; measured only at small scale here, the heavy runs filed to main.
+
+## 2026-11-21 ~00:20 PST: A-797 LANDED slates main 086089ba; main STOPPED my 100k run (swap); load runs are main's now
+- A-797: the green's owner answers a batch of asks within its step budget, the rest handed back (the primary had been
+  killed by its watchdog: shard 0 spun 1,055 ms in one batch). Unit test red->green; 42 fleet tests pass.
+- Partial evidence, not proof (run on main 8a18edcc + A-797, ~22:49-00:03, stopped by main: the Studio was at 96 of 97
+  GB swap; the run held ~30 GB): no `is spinning` and no kill in 3,110 s (the run before: six reports, one kill);
+  1,570,311 batches handed back. Latencies confounded by swap. Open walls it showed (GAPS A-797): ~2,700 submits never
+  answered (client node: forwards resolved 9,116,579, delivered home 9,113,196, 3,383 lost); one 300 MB work log;
+  10.1 M owner asks.
+- Log summary recorded here; the 100k rung is filed in run-requests.md (mem=40g). I do not run it again.
+- Next: my close list has C1 (this) and R2 (closed). Next piece on C1 that needs no load run: the lost forwarded reply
+  (3,383 between resolved and delivered_home), found with unit/integration tests only.
+
+## 2026-11-20 ~23:00 PST: C1 continued
+- A-794 LANDED slates main 8a18edcc (dc4f6eb0): forwarded CreateWork placed by its name's partition, not the green's
+  (76,955 works had filled the primary's one partition: TableAtCapacity 71,776 -> 0); a forwarded verb parked at its
+  work's gate answers its exchange at resume. CreateWork p50 18.3 -> 10.0 s. Next: 64,072 accepted submits refused
+  BudgetExceeded (a retention-cap first-occurrence log line is in A-794).
+- A-797 (claimed; in progress, uncommitted in ~/slates-work/w-fed-move-slates): the primary was KILLED by its watchdog
+  -- shard 0 spun 1,055 ms in one poll answering a batch of work asks (xshard.rs:926) -> answer_within: a batch answered
+  within the owner's step budget, the rest handed back. Unit test red->green; 42 fleet work/forward tests pass. Running:
+  100k (~/slates-work/w-fed-move-c1-100k-a797.log).
+- MISTAKE, fixed: my state push 339b8fd0 carried amendments.tsv conflict markers (~10 min); fixed in 02895150. Now
+  pushing state only via ~/.cache/w-fed-move-state-push.sh (stops on any conflict or marker).
+
+## 2026-11-20 ~22:30 PST: C1 (goal 86b) in progress -- two walls fixed and LANDED, the third diagnosed next
+- A-792 LANDED slates main 60586cdd (3b3e0f4f): a green's listing at its head reads the directory's subtree
+  (Green::head_under). 10k clients: wall 201 -> 75 s, primary CPU 175 -> 53 s, oracle clean.
+- First 100k rung (base 60586cdd, log ~/slates-work/w-fed-move-c1-100k-a792.log): 94,877 of 100,000 submits refused
+  BudgetExceeded after 5,123 accepts (the green's retention cap, 373 MB; ~73 KB a version: every touched file's earlier
+  block kept whole by A-728 part 2's forward chain while 100k works hold the floor).
+- A-793 LANDED slates main e4c2ad76 (23e9ed81): history::reanchor -- a change re-anchors its path's history on the new
+  block, the earlier block cut to what the change overwrote. 100k (log ...-c1-100k-a793.log): BudgetExceeded 0,
+  accepted 29,795, conflicts 70,205, verdicts 13 -> 131/s, CreateWork p50 84.5 -> 25.1 s, oracle clean, wall 944 s.
+- Next wall: the 70,205 conflicted clients refused TableAtCapacity resolving (63,145 Edit, 7,060 Rebase): the client
+  node's merge budget (green_chain_bytes 373 MB a partition, shared by work logs). A-793 added a first-occurrence log
+  line (Partition::merge_budget_held). Running: 100k on e4c2ad76 with it (~/slates-work/w-fed-move-c1-100k-diag.log).
+- Then: CreateWork 25 s and every p99 (seconds to minutes) toward < 1 ms at >= 1,000 verdicts/s.
+
+## 2026-11-20 ~19:00 PST: CLOSE LIST (Ada's order). My items: C1 goal 86b; R2 unplaced (CLOSED, inbox/main-from-w-fed-move-close.md)
+- C1: 100,000 clients, 1 primary + 2 replicas, the Linux kernel tree, every p99 < 1 ms, conflicts judged right (oracle).
+  State found (GAPS ~6224+, BENCHMARKS 13870/14213): single in-process node reaches 10,000 clients (p99 200-440 ms);
+  1,000 clients <1 ms in 1 run of 15 on the shared Studio; the 3-node topology (crates/cli/tests/load_scale.rs) over the
+  whole kernel never run at 100k; f=1 version-0 over the kernel "measurement owed".
+- Kernel: ~/.cache/w-fed-move-linux (torvalds v7.4-rc4 5f22fb204, 97,371 files, shallow).
+- Harness: ~/.cache/w-fed-move-target/release/examples/load_bench (slates main 1527ecfe).
+- Rung 1,000 on the topology: ~/slates-work/w-fed-move-c1-rung1k.log (SLATES_LOADTEST_* env; cargo test --release -p
+  slates-cli --test load_scale).
+
 ## 2026-11-20 ~18:10 PST: main's piece "moves refused unplaced" DONE -- A-784 LANDED slates main 5f9e4287 (fix 3f4fadda), kiln carries it at main 4f5e58c1b (vendor 0002)
 - Report: inbox/main-from-w-fed-move-move-unplaced.md. kiln carry = vendor/patches/slates/0002 in worktree
   ~/slates-work/w-fed-move-kv (kiln main 648c57184; kiln now pins Slates 8ce3d615 which has A-756), docs W7 updated;

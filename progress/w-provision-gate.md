@@ -26,6 +26,48 @@
   stopped); kiln r3 (`macos exclusive`, `--record`) queued — when it ends, commit its ratchets.toml diff to main, then
   write inbox/main-from-w-provision-gate-close.md for C1. Worktree ~/slates-work/w-provision-gate-ci.
 
+- ~18:30: P2 in ~/slates-work/w-provision-gate-land (branch has b01a0ef7b kqueue; uncommitted: shard.rs idle_turn_rest =
+  macOS explicit sleep(1ns) per idle-spin turn). Saved variants in ~/.cache/w-provision-gate-fix/p2/ (held_turn.timew.rs +
+  shard.timew.rs = time-horizon estimator, unit tests 7/7, red vs old 400 ns). ab5 r1 (kqueue+timew): loaded p99 2.00 ->
+  0.46 ms but p999 13.0 -> 37.3 ms. ab6 running: p2main / p2fix(timew) / p2nap (kqueue + explicit macOS nap, old
+  estimator), 3 rounds, ~/.cache/w-provision-gate-arms/ab6.txt. r3 (macOS exclusive --record baseline) lost its runner,
+  requeued.
+
+- ~21:00: C1 robustness LANDED 99c599ce5 (bound = max(quiet spinning p99, loaded parked p99); main red 3/3, candidates
+  green 6/6). P2 A/B ab6 done (BENCHMARKS "the candidates"): time + nap arms meet R9 quiet (28-43 us), loaded p99 3-5x
+  better, but loaded p999 5.6-23.4 vs main 2.1-2.5 ms and 2-6x quiet CPU -> NOT landed; P2 open (loaded p999 hop next,
+  with g222). Land worktree's uncommitted shard.rs = nap arm; time arm saved in ~/.cache/w-provision-gate-fix/p2/.
+  C1 remaining: kiln r4 (`macos exclusive`, ratchet --provision --record from the ci worktree) queued. When it ends:
+  commit its ratchets.toml diff to main (area `ratchet:`), then write inbox/main-from-w-provision-gate-close.md for C1.
+
+- ~18:50: C1 baseline still unrecorded. Per main 18:36 resubmitted by needs ("macos,cpus=16,disk=60g exclusive"):
+  r7 and r8 both placed on d1323898 (big Studio) and both failed "did not answer the sync in 60s"; earlier r3/r4/r5
+  failed the same way on b24c5c95 (draining). r6 (named cec37f60, adas-mac-studio.local) was stopped per main's no-naming
+  rule. BLOCKER for main: the Studios' sync. To resume: rerun the same command by needs from
+  ~/slates-work/w-provision-gate-ci, commit the ratchets.toml diff, write the C1 close note.
+
+- ~19:20: C1 CLOSED: baseline landed b45a114e3 (kiln r9, sync:false clone on the big Studio, per main 18:35); close
+  note inbox/main-from-w-provision-gate-close.md. Remote clone/target removed. Next: P2 (loaded p999 hop, with g222).
+
+- ~20:30: P2 p999 hop named and docs landed 8edfb763e. Candidates' loaded p999 = cross-shard hops to a demoted
+  true-spinning shard (7-29 ms); QoS rejected. P2 is a trade-off -> DECISION asked of main/Ada (land immediate poll or
+  keep the nap). Land worktree holds uncommitted DIAG (diag_stages, verbs marks, bench stamps, runtime DIAG_QOS) on top
+  of the time-estimator arm: strip before any commit. Arms/logs: ~/.cache/w-provision-gate-arms/ab7*, ab8*.
+
+- ~21:30: P2 CLOSED on data (a38630375): option 3 failed all 4 of main's conditions; main's nap kept; branch
+  agents/w-provision-gate-kqueue deleted; close note appended; g222 told. QUEUE DONE (C1 b45a114e3, P2 a38630375).
+  For main to delete: worktrees ~/slates-work/w-provision-gate-land (local merge commits + option-3 commit, nothing to
+  land) and ~/slates-work/w-provision-gate-ci, the clone ~/slates-work/w-provision-gate, ~/.cache/w-provision-gate-*
+  (arms, fix, targets).
+
+- ~22:00: per main, deleted my scratch on Studio-4 by exact path: ~/.cache/w-provision-gate-target.noindex (4.8 GiB),
+  -arms, -fix, the kqueue .rs copies, and the clone ~/slates-work/w-provision-gate. Nothing of mine left to delete there.
+
+- ~22:45: main's new item (bench end-of-run lost wake) FIXED and LANDED 931e52ed6 (A-798): the idle spin's harvest
+  swallowed a client's kick; harvest-then-look. Red deterministic 3/3 (crates/rt/tests/spin_kick.rs), green 3/3. Close
+  note appended; w-engine told. Clone ~/slates-work/w-provision-gate (clean, at main) and
+  ~/.cache/w-provision-gate-target.noindex + ~/.cache/w-provision-gate-wake are mine: delete when main says.
+
 ## Queue
 1. DONE measure; DONE gate (2c8f89de6); DONE red (bench loaded bound).
 2. NEXT: A-387's held-turn estimate forgets by turn count (cheap turns forget a ms preemption in microseconds); weigh

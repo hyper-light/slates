@@ -147,3 +147,61 @@
   - 13523dbe3: item 6(a) proven, a forced new head on a moved line held to stock 7.2's push -f.
 - OWED: the restart of hg's history measured again, release (r42 queued on adacachy; the Studios are unreachable
   for sync). Item 6(b) (the lock-free rebase) waits on main's ruling. The changeset shape waits on w-store's arm.
+- 2026-11-20 evening, LANDED:
+  - f98d99685: a clone sends manifests as their stored deltas.
+  - bab805323: whole texts written into the answer once.
+  - Branch agents/w-hg-file-deltas-held (c9c3ef73b): the per-file arm, for w-store's A/B.
+  - Inbox notes answered: w-store's stored form, w-sizing's numbers.
+- WAITING: r42 (the restart and clone measurement, queued on adacachy; also in run-requests.md); main's ruling on
+  item 6(b); w-store's piece 3, before hg moves onto the changeset store (the C item, with R2's red test: an import's
+  committed content against the .hg's bytes).
+- 2026-11-20 ~19:00, C1 (main's 18:30 ruling: hg's side against the seam, the store behind a double; land on main
+  once w-store's wiring is there). Branch agents/w-hg-c1 (worktree ~/slates-work/w-hg-c1), each red/oracle-tested,
+  slates-hg lib 376/376:
+  - 446207514: the intake names each kept revision for the Texts section (path, node, text BLAKE3 and length, base
+    identity, place in the payload).
+  - 1420ec376: record v6, a push's record is its head alone, the changegroup the Payload section, replayed in place
+    (Replay::begin_sectioned).
+  - 2d6d17db0 + 287fc769a: crate::landed, the ChangesetLog seam, land_push (Record + Payload), Replaying a unit a
+    step; refusals by kind (Missing, Record, Unreleased).
+  - Next on C1: the server adapter (slates_store::Store as ChangesetLog) and hg_push::land / recovery onto it, once
+    w-store's wiring lands; the Texts section once w-perf's encoder lands.
+- R2: r43 placed itself on this MacBook (load 116) and was stopped (no measurement here). r42 is still queued on
+  adacachy.
+- ~20:50 C1 on branch agents/w-hg-c1: 3ffb95c4b (land first, v7 reference in the entry, replay from the store by
+  piece), a9620fbb1 (Texts section). By-use test blocked: the store refuses every landing on this Mac (memtable past
+  4 GiB; reported to w-store). Lands on main when it passes.
+- ~21:20 LANDED 242f4a173: C1's push onto the changeset store (by-use test with stock hg 7.2 passes; suites green).
+  NEXT: the import onto the store (rest of C1; R2's peak).
+- ~21:45 main's ruling (inbox/w-svn-from-main-c2-rulings.md, decision 1) applies to C1: no repository without
+  --vcs-store (a typed refusal naming it), no register-held history path for hg, and tests on store-backed daemons
+  through ONE shared helper (repository::store_tests' directory, made shared with a removal guard). Not small for hg:
+  every hg server test runs on a store-less shard through the sync push path (unbundle_in). Plan: the very next
+  commit after C1 lands. Recovery rule already matches decision 2 (next sequence = named + 1; unnamed changesets
+  dropped).
+- C1 remaining order:
+  1. file texts read through the store (T rows) instead of the content store;
+  2. the intake keeps no whole text with a store;
+  3. the import as changesets (R2).
+  Then the no-store path dropped.
+- 2026-11-21 ~00:20 LANDED 8cb10f986: C1 step 0, the no-store commit. One `repository::no_store_for` refuses hg and svn
+  without --vcs-store. The v2 path is gone. hg tests are on store-backed daemons through the one shared helper
+  (w-svn's test_store.rs plus mine: audit_on_stored_shard, land_blocking, create → repository::create_blocking).
+  Close note written, with the siblings: 10 failures already on main 68ce3d585 (whole_build's park bound) and the
+  load-bound git_push t_a752.
+- ~00:30 asked main (inbox/main-from-w-hg-c1-order.md) to order C1 as 3, then 1, then 2: step 1 alone can't serve an
+  imported repo, whose texts aren't on the store until 3.
+- ~00:45 step 3 design sent to main and w-store (inbox/main-from-w-hg-c1-import-design.md): the import lands as a run
+  of bounded changesets whose payloads, concatenated, are one cg3 changegroup; the register's one import entry names
+  the run; replay goes through the push intake reading pieces.
+- NOW: the piece-reading intake (needed by both 1 and 3).
+  - slates_hg: a `Source` (bytes by range, or Wanted{range}) and a forward `Window`.
+  - The changegroup framing decoded in steps from a cursor over a Source.
+  - Intake::step reads its delta through a Source; a step asks for its bytes before changing any state.
+  - Server replay (vcs_store replay_hg_referenced / replay_sliced, payload_of): a window filled by
+    `StoreHandle::piece` on Wanted. No whole payload is held.
+  - Red test: a replay's peak bytes against the payload's length.
+- 2026-11-21 ~00:55 LANDED d571ffbca: the piece-reading replay (framing over a Source, intake Wanted, Replay piece
+  mode, server fill_window; red test 789,956 B payload in 14 fills, window at most 193,859 B), and the daemon_edge hg
+  tests green via w-git's C5 part 2a. Close note written. Waiting on main's ruling for C1's order (3, 1, 2) and the
+  import's shape; next by default: step 3, the import as a run of changesets.

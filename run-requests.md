@@ -6873,6 +6873,12 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - What the logs show (C:\Users\corph\.cache\w-interop\matrix-git\anchor.log): the daemon was killed (exit 143) at
   12:42:43.98 and restarted as pid 470456. That is after the last row's log (ssh-fetch, 12:42:42), and the successor
   logged nothing before the run ended. No row log in logs\ holds the "Failed to connect" text.
+- Status (later 2026-11-20): kiln can't sync my worktree to jupiter (it times out at 60 s), so the test builds in a
+  clone of main 0916cf5b4 at C:\Users\corph\w-reaper-win, with target C:\Users\corph\.cache\w-reaper-target and log
+  C:\Users\corph\.cache\w-reaper-r60.log. The debug build had reached slates-cli when jupiter's runner restarted, and
+  jupiter has been offline in kiln since. To finish: `cd /c/Users/corph/w-reaper-win && CARGO_TARGET_DIR=/c/Users/corph/.cache/w-reaper-target
+  cargo test -p slates-cli --test vcs_edge_restart -- --nocapture`. The likely cause of the report is w-interop's own
+  teardown (4b335a696: Git Bash's kill ends the daemon, then the anchor with its held listeners), not a lost port.
 
 ## 2026-11-20, w-forming: A-771 rebuild in steps (main b831a2877; commit cb1b698f0, base a7df9ccf0)
 - clippy + xtask over `crates/cluster/src/sealed.rs` (RawOpening) and `crates/server/src/live_ship.rs` (Rebuilding steps, Laying, hashed_chunk).
@@ -6880,7 +6886,7 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - `cargo test -p slates-server --test fleet a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again` under full-suite load: failed once at fleet.rs:17261 (setup: cut && given_up) in a 32-test run, 3/3 alone.
 
 ## 2026-11-20, w-work-cow: a work costs its divergence, the grid (main baa470b90; commit 819341ab4)
-- Grid, release, macOS arm64 Mac Studio (and Linux): `for f in 1000 10000 100000; do for b in 1024 65536 10240; do for w in 1 10 100; do SLATES_WORK_COW_FILES=$f SLATES_WORK_COW_FILE_BYTES=$b SLATES_WORK_COW_WORKS=$w cargo test --locked --release -p slates-server --test work_cow -- --nocapture | grep work_cow:; done; done; done` (pick f x b for 1 MB to 1 GB greens). Red = the assert fails, or per-work resident or time grows with the green's size.
+- Grid: DONE by w-work-cow on the Mac Studio (P2, 5aef5f02f, BENCHMARKS); Linux run of the same grid still welcome, not owed.
 - clippy + xtask over `crates/server/tests/work_cow.rs`.
 
 ## 2026-11-20, w-work-mount: mounted works end to end (A-774; main 089bc78a0, commit a2415c930)
@@ -6953,3 +6959,100 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   recovery, daemon, fuse_mount (Linux); `-p slates-land` whole; clippy + xtask over the A-774 files.
 - Note: at 15:30 my `cargo build -p slates-server --tests` built every server test binary into my target on Studio-2
   (25 GB); deleted whole by exact path; since then only focused --test targets, CARGO_PROFILE_TEST_DEBUG=0 (3.2 GB).
+
+## w-hg, 2026-11-20 ~18:00 PST: restart replay and clone of hg's history, release (after 6935d8e86, f98d99685, bab805323)
+- **What:** prove A-732 parts 4 and 5 and the clone's manifest deltas by use.
+- **Platform:** any runner with 8 CPUs and 24 GB and Mercurial's repository at hand. On adacachy, pull it in pieces:
+  `hg pull -r N` in steps of 2,000. Whole clones from mercurial-scm.org aborted "incomplete response" there 3 times.
+  The big Studio has it at ~/.cache/w-hg-mem/hg.
+- **Command:** kiln r42's script (queued by needs linux/amd64; in w-hg's session). Release `slates`; push hg's whole
+  history over HTTP; `kill -9` the daemon; read the anchor log's "shard 0 initialized in ... longest slice" and
+  `vcs_store.hg_replay_turns`; then a plain clone, timed.
+- **Red would look like:**
+  - a recovery slice past the step quantum (r2 had 265-277 ms), or recovery CPU near r2's 130 s;
+  - "killing it" in the anchor log;
+  - the clone no faster than r14's 42 s quiet (the manifests are now deltas).
+
+## 2026-11-20, w-work-cow: A-790 a work's changed file is pieces over its base (main af045255b; commit 0c5dd0cb5)
+- clippy + xtask over crates/server/src/work_files.rs (new Held/Piece, indexing-free), work_home.rs, work_log.rs, work_charge.rs, verbs.rs (owner_lengths, post-state copy), tests/work_edit_cow.rs.
+- Linux/Windows: `cargo test --locked --release -p slates-server --test work_edit_cow -- --nocapture` and `--test works_off_owner`; red = live heap past the bound (a copy per work) or the generated history differing on 8 shards.
+
+- w-sizing, R2 Windows (A-789's Windows shape; main 18:40; for w-lint when jupiter is back), branch/commit on main once
+  landed (see progress/w-sizing.md). On Windows x86_64 (jupiter), from the landed commit:
+  1. Build + lint: `cargo clippy --workspace --all-targets -- -D warnings` (new Windows-only code: crates/mem/src/shared.rs
+     make_section/from_section, crates/server/src/content_extents_windows.rs, anchor_hold_windows.rs hold_extent/
+     release_extent + adopt, content_pool.rs cfg(windows) arms, cli tests); `cargo xtask unsafe` (mem 86, server 9).
+  2. `cargo test --locked -p slates-anchor --lib handles:: held_windows::` and `--test handles_windows`.
+  3. `SLATES_TEST_CLI=1 cargo test --locked -p slates-cli --test cli -- a_freed_content_extent_gives_its_commit_back_on_windows
+     a_content_extent_outlives_a_killed_daemon_on_windows --nocapture --test-threads=1`.
+     Red would look like: commit after the destroy within N/4 of with-burst (extents kept their commit), or the read after
+     TerminateProcess differing / refused (an extent's section not held across the restart).
+  4. RED-FIRST CHECK: run 3 also at the commit before this piece (origin/main before it) -- the commit test must fail
+     there (each extent a range of the content section; commit kept), the restart test must pass (guard).
+- w-shared, lane instrument (3a9e5bf21): on a quiet Mac (load < 4), release:
+  `REPLICATION_BENCH_BULK_MIB=4,64 target/release/examples/replication_bench 200`, with `netstat -s -p udp | grep
+  "full socket"` read before and after. What it would show: if the window stops come with a rise in full-socket-buffer
+  drops, the receive buffer is the lane's bound.
+
+## 2026-11-20, w-reaper: A-645 (a), svn's revprop rows by use (lands as the commit after b7cfb02fc; see the A-738 design entry, "fifth piece")
+- macOS with stock Subversion 1.15 and room to build (Studio-1 has svn 1.15.0 but 693 MB free):
+  `SLATES_TEST_CLI=1 cargo test -p slates-cli --test svn_interop -- a_repository_policys_hook_lets_stock_svn_change_a_revision_property a_revision_property_change_without_a_hook --nocapture`.
+  Then w-interop's matrix revprop-svn and revprop-ssh rows (an anchor given `--vcs-store DIR`).
+- Linux the same: the view mounts through FUSE (`fusermount3`), and `crates/server/src/fuse.rs`'s turn change is
+  compiled only there. Clippy for Linux, please (`fuse.rs` `turn_with`'s `lent_if` closure).
+- Red would look like: E200007 with `UNGRANTED_WORDS` (no --vcs-store given), or "could not show this repository's hook
+  its repository: ..." naming the step (the view volume refused, the mount helper refused or past its bound); the hook's
+  `svnlook youngest` writing nothing or not `1`; `slates unmount <store>/project.svn` failing.
+- 2026-11-20 w-fed-faults goal 91 (kiln main 73712cc): owed (main's Linux lane): Linux x86_64 `SLATES_FLEET_FAULTS=1` runs of slates_fleet_faults' w7_a708_a_runner_cut_off_..., w7_a708_a_slow_lossy_link_... and w7_a_move_whose_target_is_cut_off_midway_... (macOS PASSED; killed, restarted, partitioned PASSED on adacachy). Build once, run the test binary directly per flow: a second cargo test there rebuilt kiln for an hour.
+- w-shared, record plane (8f04c9130): RSS and time of one 64, 128, 256 and 320 MiB holder submit's placement, before
+  (c990989f7^) and after, release, on the big Studio (`SLATES_A697_BENCH_FRESH=1 SLATES_A697_BENCH_MIB=<n>
+  SLATES_A697_BENCH_RUNS=1 cargo test --release -p slates-server --test fleet bench_a697 -- --ignored --nocapture`).
+  Red would be the after's peak RSS or placement time growing with size squared, or a watchdog end (exit 4).
+- w-shared, lane (main's item 4): CPU profile, sender and holder, of
+  `REPLICATION_BENCH_BULK_MIB=64 target/release/examples/replication_bench 20` on a quiet Mac. 45-75 µs per 9.2 KB
+  packet measured at load 22; the UDP receive buffer was ruled out (no drops). Asked for: the top frames per side.
+- w-shared, transport send path (b72aff1fc): every packet's encoding and sealing changed (one reused buffer, frames
+  encoded in place). The fleet suites (`slates-server --test fleet`, `slates-cluster --test live`) and the Linux and
+  Windows lanes. Red would be a decrypt failure, a malformed frame refusal, or a session that stalls.
+- w-shared, transport step two (35c740150): stream data in flight as spans of the sender's bytes (loss recovery, probes
+  and MTU splits now encode from the sender's buffer). The fleet suites and the chaos/loss lanes on Linux and Windows.
+  Red would be a resend carrying wrong bytes (a decode or reassembly refusal on the peer) or a stream that never completes
+  after a loss.
+- w-shared, transport receive path (c3db76bcd): packets opened in place, messages taken whole at completion. The fleet
+  suites and the loss/chaos lanes on Linux and Windows. Red would be a stateless reset no longer recognised, a reply
+  taken partial, or a stalled exchange (its progress now counted on delivery).
+
+## 2026-11-20, w-work-cow: A-796 merge check and resolution (main d2ad10da4; commits 6823fde6f, c1e76d0a7)
+- clippy + xtask over crates/server/src/verbs.rs (merge_answer, apply_replacement, check_merge, resolve_merge, volume_op_of), work_home.rs (MergeAsk, Checked), ipc protocol, client, mcp lib, cli args/verbs.
+- Linux/Windows: `cargo test --locked -p slates-server --test merge_check`, `-p slates-mcp --test mcp the_mcp_surface_serves_the_tools`; red = the histories differ between 1 and 8 shards, or a stale stamp is not refused.
+- w-fed-faults for w-lint, A-795 (6f29c8d, the S3 base removed): the Linux-only code it changed was never compiled.
+  crates/server/src/fuse.rs (the kept-request path removed; the turn lends the host straight to the bridge; the A-509
+  test's FuseMount without `kept`/`kept_waker`) and crates/bridge-fuse/src/channel.rs (`dispatch_kept`,
+  `allocation_running` and `Dispatched::request` removed). The Mac Studio has both Linux Rust targets but no Linux C
+  cross-compiler or sysroot (zstd-sys, blake3 and aws-lc-sys stop), and adacachy refused every start. On Linux x86_64
+  (and aarch64): `cargo clippy --locked -p slates-server -p slates-bridge-fuse --lib --tests`, then
+  `cargo test --locked -p slates-bridge-fuse --lib` and `cargo test --locked -p slates-server --lib -- fuse:: nfs::`.
+  Red would be a compile error or an unused item in fuse.rs or channel.rs, or a FUSE test failing (A-509's EIO test,
+  held replies).
+
+## 2026-11-21T08:20Z w-fed-move main 086089ba (goal 86b C1 rung: A-792, A-793, A-794, A-797 by use)
+- Command (repository root, release; a load run, so main's under CLAUDE.md §8):
+  `SLATES_LOADTEST_TREE=<a Linux kernel checkout, v7.4-rc4 5f22fb204, 97,371 files>
+  SLATES_LOADTEST_BENCH=<target>/release/examples/load_bench SLATES_LOADTEST_CLIENTS=100000
+  SLATES_LOADTEST_ARGS="--rounds 1 --per-connection 32 --hot-files 42000 --reply-patience 3600"
+  cargo test --release --locked -p slates-cli --test load_scale -- --nocapture`, after
+  `cargo build --release --locked -p slates-client --example load_bench` and `-p slates-cli`.
+- Needs: mem=40g (measured about 30 GB: primary 13 GB, replicas 5.8 GB each, client daemon 1.8 GB, bench 3.3 GB) and
+  disk for the 2.1 GB tree; in kiln declare it in `needs` (`cpus=16,mem=40g` or more), never pin with `on`.
+  Runs 15 to 65 minutes.
+- Platform: macOS arm64 or Linux (the test reads `ps`; on Linux raise `ulimit -n`, per the test's module docs).
+- What to read: the `bound`, `oracle`, `refusal`, `node` and `rung` rows, and any `slates-server: ... (first
+  occurrence)` lines (the merge-budget and retention-cap diagnoses), `is spinning`, `killing it`.
+- Red: any `oracle_failures` above 0 (a wrong verdict); a watchdog kill (`killing it`, A-797's wall); `refusal` rows
+  (TableAtCapacity: A-794's wall; BudgetExceeded: open); `bench_exit -1` with `pending ... inflight Some((SubmitAccepted`
+  rows that stop moving (the open lost-reply wall: compare the client node's `fleet.forward.client.resolved` with
+  `delivered_home` in its `slates status --json`).
+- Known so far: on main 8a18edcc + A-797 (stopped at 96 of 97 GB swap) no kill in 3,110 s; about 2,700 submits never
+  answered; one 300 MB work log.
+- Who to send results to: w-fed-move
+

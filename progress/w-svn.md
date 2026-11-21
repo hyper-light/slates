@@ -277,3 +277,43 @@
   MERGE of act/ID commits, full merge response unless X-SVN-Options no-merge-response (merge.c send_response per
   changed path); DELETE act aborts. mod_dav's 201 body: DAV_RESPONSE_BODY_1..5 (httpd mod_dav.h) + "WHAT URI has been
   created.", Cache-Control no-cache. Worktrees: w-svn-a703 (measurement), w-svn-next (branch agents/w-svn-a772, on main).
+- CLOSE LIST (Ada 16:20): C1 DeltaV v1 CLOSED 3e63bee8d (by use, kiln r15). Next C2 (svn onto the changeset store
+  with w-store), then R3 hook flake, R4 recovery replay sliced, R5 exporter rebuild + svnserve-over-SSH red test
+  (both landed: 507d722b3, b1206d96c -- write close notes), P6 svn:// update 5.6 vs 2.7 s, P7 svnsync 524/1,068 s
+  (A-772: drive 328->1.82 s, tunnel 7.4 ms/rev; daemon peak owed; uncommitted RSS checkpoints in w-svn-next
+  vcs_ssh/tests/svn.rs), P8 500 MB commit.
+- CLOSED: C1 3e63bee8d, R3 74beb5600, R4 25035f50c, R5 (507d722b3/2cf1b1d35 + b1206d96c). C2 waits on w-store's
+  server wiring answer. NEXT: P6 svn:// update 5.6 vs 2.7 s, P7 svnsync (A-772 daemon peak; uncommitted RSS
+  checkpoints in w-svn-next vcs_ssh/tests/svn.rs), P8 500 MB commit.
+- C2 (main 20:30 ruling: the store is the truth; replacement, no second path; register keeps green head only; crash
+  test between store land and register commit; recovery test is the arbiter). w-store has on main: sections/read/text
+  (ba760f0ef), sliced landing begin/section/part/commit (71db6d157). Part 1 LANDED 00ff3b25c (land_work lands
+  changeset seq=revision -- seq rule changes in stage A to changeset count). Staging sent (inbox main-from-w-svn-c2-plan):
+  A history (all records as changesets, register head only, recovery from store, arbiter + crash tests; texts stay in
+  content store), B texts async via owner (svn drives yield), C import as one sliced changeset. Asked main the
+  no-store decision (inbox main-from-w-svn-c2-no-store). Worktree ~/slates-work/w-svn-c2 (agents/w-svn-c2), target
+  ~/.cache/w-svn-c2-target. Register write sites: svn_commit land_record (locks/revprops; callers vcs_svn.rs:1219,1278),
+  land (revision + green head entry, svn_commit.rs:623), append_made (svn_made, in a submit tx), svn_created
+  (repository.rs:555). Recovery: vcs_store record_turn/recover_repository over register indices.
+- P6: measurement test (w-svn-next, uncommitted vcs_ssh/tests/svn.rs: RSS checkpoints + update/checkout) got
+  "not whole" 524-byte answers for update; release run printing the answer in progress (bq3pv7luh). git-200.dump made
+  (~/.cache/w-svn-gitgit) for faster runs; debug builds die to the watchdog in import.
+- C2 stage A built in ~/slates-work/w-svn-c2 (uncommitted at 22:40, testing): every svn record store-first
+  (svn_commit::landing: gate/turn, sequence = register object count, reference-only register entries), recovery and
+  rebuild read changesets back from the store (vcs_store svn_to_fetch/fetch_svn), svn creation refused without
+  --vcs-store, crate::test_store shared helper (TestStore guard, StoredDaemon, run_on_first), svn_commit/import/export
+  tests async on stored daemons, arbiter + crash tests in repository::store_tests. slates-server svn+store_tests
+  96/96, identities+vcs_store 37/37, barrier/deltify/svn_texts 3/3, cli --test cli a_repository_the_cli_creates 1/1.
+  svn_made: landed by a task holding the turn the submit took (main asked: inbox main-from-w-svn-c2-made).
+- P6 finding: the measurement's scripted update was wrong, not the server: abort-edit then E210004 "Successful edit
+  status returned too soon" (the script's report). Fix the script after C2.
+- C2 stage A LANDED 72576cb1f (0703e62d2 + 65f69e1da). Tests: server 136/136 affected; cli svn_interop 4/4,
+  svn_http_reports 9/9, cli create 1/1. Main's ruling on svn_made (inbox w-svn-from-main-c2-made): submit acceptance
+  deferred until the made revision lands, no recovery remake -> next piece. Then stage B, stage C.
+- C2 stage B part 1 LANDED 40c3f8d1e (e69375553): texts in the changeset, recovery fetch, barrier gone for svn. P6/P7
+  measured (BENCHMARKS). Next: B part 2 (texts read through the owner). Stock legs kiln r2 on mac-studio.local-2; P8 next.
+- 2026-11-21 ~00:50: P6 CLOSED (close note), P8 CLOSED (002a7944f), P7: real-daemon peak measured (8508a8d52: 1,570
+  MiB for a 437 MiB dump, half the segment: green chain carries texts), green-fold rejected (c9f79f925), svnsync
+  measurement landed (1bfe51f88) and running on the big Studio (kiln r10). Stock legs pass on the Studio (r8).
+  Open: C2 B2 (main to decide, inbox stage-b2-value), svn_made (w-work-cow's view), C. B2a wait-path patch kept at
+  ~/.cache/w-svn-b2a-wait.patch.
