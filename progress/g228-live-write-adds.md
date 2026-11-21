@@ -82,6 +82,11 @@ the hypothesis (the fold's tail held the reply) is NOT confirmed; added median 2
 - Next: per-write percentiles of each hop (the hop counters are sums, which one long write skews), then cut the largest
   (the entry's build ~45-90 us mean, the exchange ~50-170 us mean).
 
+## 2026-11-21 later: per-hop percentiles landed e1f246ca8; medians in BENCHMARKS 41167afaa
+- Added p50: ubuntu-latest 106.7-113.4 us (holds kept); Studio 168.5-205.4 us (holds declined).
+- Exchange p50 57-61 (Linux) / 107-115 (macOS), holder's serve 8-12; build ~25; to control 8-9 / 25-31; reply 7-8 / 8-21.
+- Next: split the exchange's ~30 us of daemon overhead (Linux) against the transport bench's 23-27 us; then the build.
+
 ## For main to delete (diagnostics): remote branches diag-g228-live-1..9 once main has read their results.
 
 ## 85a STILL OPEN -- blocked on main's decision (sent): a plain status request arms a tens-of-GiB mincore sweep on every
