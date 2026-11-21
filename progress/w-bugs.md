@@ -270,3 +270,9 @@
     1 s of CPU at about its 100,000th poll, base and candidate alike (5 of 5 rounds each; 3 on the quiet run); the
     watchdog killed the candidate's daemon in round 5 (client: curl 18, bad pack header). Being located with a scratch
     diag build on the big Studio (kiln r3); builds moved off Studio-4 by main's order, caches deleted.
+- 2026-11-21 P1 spin fixed, landed f660401d4 (merged fb1077161): a part's wanted entries marked by a galloping cursor,
+  a window of the order read a unit (red: 1,536 reads a unit, window 128); the answer's plan read a window of its own
+  units a turn (red: 512 runs a unit). Found by a scratch build timing each unit: ~5 units a deepen of 365 ms and 1.1 s,
+  all marking. Big Studio, 5 rounds: main 1 spin (longest poll 1,107 ms), this 0 (longest 947 ms). Time unchanged:
+  stock 5.40 s, main 25.88 s, this 25.09 s. P1 stays open: a near-second unit remains (diag 10, kiln r5). My typed tree
+  entries dropped: main's 7b66e7225 did the same (kinds from the landing's type runs).
