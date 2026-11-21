@@ -41,3 +41,12 @@ store. Nothing for me to build.
 - r52 is still running.
 
 Free for the next goal-93 C/R piece.
+
+## 5. r52 (stream scan A/B b9fab5b21 vs 5c23f4499): VOID, not resubmitted (2026-11-21 ~12:20 PST)
+- It ran on this MacBook (M5 Max, load 30 to 48) for 2 h 8 min. The before side never ran: its release binary was
+  missing after its build. Only the after side has numbers.
+- **After side:** streams 38.1, 28.5, 37.6, 36.9 and 63.7 s, with the store's wait 14.6 s of round 1's 38 s.
+  Against 3.46 s warm on a quiet Studio, these measure the host, not the change.
+- No number from it goes on record. Per "no new performance runs" I haven't resubmitted it. The store scan
+  (6a6e35215) is already on main under the fast rule.
+- Logs: MacBook ~/.cache/w-perf/prof/hg-stream-scan-ab-20261121T181133/.
