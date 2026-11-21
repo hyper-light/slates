@@ -700,7 +700,7 @@ fn a_revoked_consumers_open_descriptor_reads_nothing_it_had_not_read() {
 /// attachment (`slates:<attachment>`); the detach and the kernel's unmount each leave no mount and the volume
 /// with no attachment; the file is refused typed with nothing mounted or recorded; the daemon's stop ends the mount
 /// but leaves it in place, refusing writes, until its user unmounts it (A-102); no barrier was refused; and every mount
-/// helper's exit was awaited by its exit watch (a pidfd), never a tick at a time.
+/// helper's exit, mount and unmount alike, was awaited by its exit watch (a pidfd), never a tick at a time.
 #[test]
 fn a_volume_mounted_through_fuse_serves_the_kernel_and_ends_with_its_mount() {
   if !command_available("fusermount3") || !std::path::Path::new("/dev/fuse").exists() {
@@ -748,6 +748,18 @@ fn a_volume_mounted_through_fuse_serves_the_kernel_and_ends_with_its_mount() {
   );
   assert_eq!(
     refusals.get("fuse.helper_exit.unwatched"),
+    None,
+    "{refusals:?}"
+  );
+  // So was every unmount helper's (the detach's and the refused mount's): awaited by its watch.
+  assert!(
+    refusals
+      .get("fuse.unmount_exit.watched")
+      .is_some_and(|count| *count >= 1),
+    "the unmount helpers' exits were watched: {refusals:?}"
+  );
+  assert_eq!(
+    refusals.get("fuse.unmount_exit.unwatched"),
     None,
     "{refusals:?}"
   );

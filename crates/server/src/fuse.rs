@@ -5,8 +5,8 @@
 //!
 //! **Establishment.** `attach` with the FUSE form allocates the attachment, then defers its reply to a task
 //! (the granted landing's discipline, `crate::landing`): the task spawns the helper and awaits its answer
-//! through the runtime (`slates_bridge_fuse::mount::begin_mount`, polled on the socket's readiness and the
-//! heartbeat's tick; the helper killed and reaped at the failover bound or if the task is dropped), so the
+//! through the runtime (`slates_bridge_fuse::mount::begin_mount`, awaited on the socket's readiness and on the
+//! helper's exit watch, a pidfd; the helper killed and reaped at the failover bound or if the task is dropped), so the
 //! shard never blocks on it. The mount's `fsname` is `slates:<attachment>` — the volume-specific, live
 //! authority the kernel's mount table carries for the OCI handoff to check (`crate::oci`). Only once the
 //! device is held is the attachment recorded, in the same database transaction as the request's completion,
@@ -339,9 +339,10 @@ pub(crate) struct PendingAttach {
 /// to the daemon's log (A-299).
 fn mount_errno(error: &MountError) -> Option<i32> {
   match error {
-    MountError::Socketpair { code } | MountError::Spawn { code } | MountError::Recv { code } => {
-      *code
-    }
+    MountError::Socketpair { code }
+    | MountError::Spawn { code }
+    | MountError::Recv { code }
+    | MountError::ExitUnwatched { code, .. } => *code,
     MountError::Helper { .. }
     | MountError::NoDevice { .. }
     | MountError::Timeout { .. }
@@ -520,7 +521,7 @@ fn deliver(s: &mut ShardState, reply: ReplyBody, route: Option<crate::merge_serv
 /// Format: a mount helper's exit awaited by its exit watch (family three of main's sweep, 2026-11-20), the non-vacuity
 /// count of [`mount_without_blocking`]'s woken wait.
 const HELPER_EXIT_WATCHED: &str = "fuse.helper_exit.watched";
-/// Format: a mount helper whose exit the kernel would not watch (no pidfd), its exit polled a tick at a time instead.
+/// Format: a mount refused because the kernel would not watch its helper's exit (`MountError::ExitUnwatched`).
 const HELPER_EXIT_UNWATCHED: &str = "fuse.helper_exit.unwatched";
 
 /// Mounts at `mount_point` through the OS helper without blocking the shard: the helper's answer awaited on
@@ -541,8 +542,7 @@ async fn mount_without_blocking(
     .collect();
   let mut pending = begin_mount(mount_point, fsname, &extra)?;
   let began = futures::now_ns();
-  let tick = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
-  let (mut exit_watch, mut exit_watch_refused) = (None, false);
+  let mut exit_watch: Option<slates_ipc::exit_watch::ExitWatch> = None;
   loop {
     let left = deadline_ns.saturating_sub(futures::now_ns().saturating_sub(began));
     if left == 0 {
@@ -563,32 +563,34 @@ async fn mount_without_blocking(
       }
       Progress::Waiting(Awaiting::Exit) => {
         // The helper's exit, awaited by an exit watch on its process (a pidfd, readable at the exit), taken once; before
-        // 2026-11-20 it was polled a tick at a time (main's sweep after A-697's release bench, family three). A watch
-        // the kernel refuses (no pidfd) leaves the tick, counted.
-        if exit_watch.is_none() && !exit_watch_refused {
-          exit_watch = pending
+        // 2026-11-20 it was polled a tick at a time (main's sweep after A-697's release bench, family three). A watch the
+        // kernel refuses refuses the mount, typed: an exit is never polled.
+        if exit_watch.is_none() {
+          let watched = pending
             .helper_pid()
-            .and_then(|pid| slates_ipc::exit_watch::ExitWatch::on(pid).ok());
-          exit_watch_refused = exit_watch.is_none();
-          if exit_watch_refused {
+            .map(slates_ipc::exit_watch::ExitWatch::on);
+          // A helper that names no process while its exit is awaited cannot be watched either: refused alike.
+          let code = match watched {
+            Some(Ok(watch)) => {
+              exit_watch = Some(watch);
+              None
+            }
+            Some(Err(slates_ipc::IpcError::OsRefused { code, .. })) => Some(code),
+            Some(Err(_)) | None => Some(None),
+          };
+          if let Some(code) = code {
             let _ = state::with_state_counted(|s| s.count(HELPER_EXIT_UNWATCHED, 1));
+            return Err(pending.abort_unwatched(code));
           }
         }
-        let readiness = exit_watch.as_ref().and_then(|watch| {
+        // A watch on a process already gone has no descriptor: its exit is there for the next poll to reap.
+        if let Some(fd) = exit_watch.as_ref().and_then(|watch| {
           watch
             .readiness()
             .map(|fd| std::os::fd::AsRawFd::as_raw_fd(&fd))
-        });
-        match readiness {
-          Some(fd) => {
-            let _ = futures::within(left, slates_rt::readiness::readable(fd)).await;
-            let _ = state::with_state_counted(|s| s.count(HELPER_EXIT_WATCHED, 1));
-          }
-          None => {
-            if futures::sleep(tick.min(left)).await.is_err() {
-              return Err(pending.abort(std::time::Duration::from_nanos(deadline_ns)));
-            }
-          }
+        }) {
+          let _ = futures::within(left, slates_rt::readiness::readable(fd)).await;
+          let _ = state::with_state_counted(|s| s.count(HELPER_EXIT_WATCHED, 1));
         }
       }
     }
@@ -1881,9 +1883,8 @@ const DEAD_MOUNT_LEFT: &str = "fuse.dead_mount_left";
 /// Format: the filesystem type the kernel lists for a slates FUSE mount (the `slates` subtype).
 const FUSE_TYPE: &str = "fuse.slates";
 
-/// Starts `fusermount3 -u -z` at `mount_point` and owns the helper until it is reaped, on a detached task
-/// polling at the heartbeat's tick (bounded by the bound its shard learned of its helpers, A-525; the helper is killed
-/// and reaped past it).
+/// Starts `fusermount3 -u -z` at `mount_point` and owns the helper until it is reaped, on a detached task awaiting its
+/// exit watch (bounded by the bound its shard learned of its helpers, A-525; the helper is killed and reaped past it).
 fn unmount_owned(mount_point: &str) {
   let Ok(pending) = begin_unmount(mount_point) else {
     let _ = state::with_state_counted(|s| s.count(UNMOUNT_REFUSED, 1));
@@ -1897,16 +1898,25 @@ fn unmount_owned(mount_point: &str) {
   }
 }
 
-/// Polls an unmount helper until it is reaped; dropped at the bound, which kills and reaps it. The bound is the one its
-/// shard learned of its helpers (A-525, `crate::helper_runs`): a run that finishes is a sample, one given up backs the
-/// next bound off. Off a shard nothing is learned and no wait can be timed, so the helper is given up at once.
+/// Format: an unmount helper's exit awaited by its exit watch (family three of main's sweep, 2026-11-20), the
+/// non-vacuity count of [`reap`].
+const UNMOUNT_EXIT_WATCHED: &str = "fuse.unmount_exit.watched";
+/// Format: an unmount helper whose exit the kernel would not watch: killed and reaped at once, the unmount refused.
+const UNMOUNT_EXIT_UNWATCHED: &str = "fuse.unmount_exit.unwatched";
+
+/// Awaits an unmount helper's exit by its exit watch (a pidfd, readable at the exit; before 2026-11-20 it was polled a
+/// heartbeat tick at a time, family three of main's sweep) until it is reaped; dropped at the bound, which kills and
+/// reaps it. The bound is the one its shard learned of its helpers (A-525, `crate::helper_runs`): a run that finishes is
+/// a sample, one given up backs the next bound off. Off a shard nothing is learned and no wait can be timed, so the
+/// helper is given up at once. A watch the kernel refuses gives the helper up at once too, counted: an exit is never
+/// polled.
 async fn reap(mut pending: PendingExit) {
-  let tick = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
   let Some(bound) = state::with_state(|s| s.fuse_helpers.bound_ns(s.failover_ns)) else {
     let _ = state::with_state_counted(|s| s.count(UNMOUNT_REFUSED, 1));
     return;
   };
   let began = futures::now_ns();
+  let mut exit_watch: Option<slates_ipc::exit_watch::ExitWatch> = None;
   loop {
     if let Some(done) = pending.poll() {
       let (ran, failed) = (futures::now_ns().saturating_sub(began), done.is_err());
@@ -1918,16 +1928,39 @@ async fn reap(mut pending: PendingExit) {
       });
       return;
     }
-    if futures::now_ns().saturating_sub(began) >= bound {
+    let left = bound.saturating_sub(futures::now_ns().saturating_sub(began));
+    if left == 0 {
       let _ = state::with_state_counted(|s| {
         s.fuse_helpers.given_up();
         s.count(UNMOUNT_REFUSED, 1);
       });
       return;
     }
-    if futures::sleep(tick).await.is_err() {
-      let _ = state::with_state_counted(|s| s.count(UNMOUNT_REFUSED, 1));
-      return;
+    if exit_watch.is_none() {
+      match pending
+        .helper_pid()
+        .map(slates_ipc::exit_watch::ExitWatch::on)
+      {
+        Some(Ok(watch)) => {
+          exit_watch = Some(watch);
+          let _ = state::with_state_counted(|s| s.count(UNMOUNT_EXIT_WATCHED, 1));
+        }
+        Some(Err(_)) | None => {
+          let _ = state::with_state_counted(|s| {
+            s.count(UNMOUNT_EXIT_UNWATCHED, 1);
+            s.count(UNMOUNT_REFUSED, 1);
+          });
+          return;
+        }
+      }
+    }
+    // A watch on a process already gone has no descriptor: its exit is there for the next poll to reap.
+    if let Some(fd) = exit_watch.as_ref().and_then(|watch| {
+      watch
+        .readiness()
+        .map(|fd| std::os::fd::AsRawFd::as_raw_fd(&fd))
+    }) {
+      let _ = futures::within(left, slates_rt::readiness::readable(fd)).await;
     }
   }
 }
