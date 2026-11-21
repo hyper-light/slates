@@ -97,9 +97,61 @@ pub(crate) struct Sweep {
   /// The anchor segment and content object whole, from the kernel's per-mapping figures (on the control shard), as the
   /// last memory request read them ([`read_whole`]); by their place in [`RANGES`].
   whole: [Option<Residency>; RANGES.len()],
+  /// Pages walked and time spent in steps over the sweep's life, by the step clock ([`step_clock_ns`]): with `steps`,
+  /// the rate a reader judges a slow sweep by.
+  pages: u64,
+  stepped_ns: u64,
+  /// Ranges walked to their end ([`advance`]): the non-vacuity count of the sweep's plan, each a held run of the arena,
+  /// a written range of the content object or segment, or a client's ring (main's ruling on w-sizing's option (a)).
+  ranges: u64,
+  /// What the sweep under way walks, fixed when it starts ([`targets`]): the ranges that can hold pages.
+  plan: Plan,
+  /// The memory report's swept kinds (the arena's held runs, the clients' rings), as the last sweep to pass them found
+  /// them, and when, shard clock nanoseconds ([`advance`]): a sweep walks them first, so the report's figures for what
+  /// clients wrote wait for those ranges only, not for the split's whole walk.
+  kinds: Option<([Residency; RANGES.len()], u64)>,
+  /// Sweeps that passed the memory report's kinds: the kinds' non-vacuity count.
+  kinds_swept: u64,
 }
 
-/// One mapped range the sweep walks: a range of the content object, or a region of the arena.
+/// A sweep's ranges, fixed at its start ([`targets`]), and how many of them, from the first, are the memory report's
+/// kinds ([`Sweep::kinds`]).
+#[derive(Default)]
+struct Plan(Vec<Target>, usize);
+
+impl std::fmt::Debug for Plan {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(f, "Plan({} ranges, {} of kinds)", self.0.len(), self.1)
+  }
+}
+
+impl Sweep {
+  /// Records one step of `walked` pages that took `took_ns` by the step clock ([`step_clock_ns`]), for the next step's
+  /// size: the step's fixed part is the cheapest step seen, and its cost a page what the step took past that.
+  fn record_step(&mut self, took_ns: u64, walked: u64) {
+    self.steps = self.steps.saturating_add(1);
+    self.pages = self.pages.saturating_add(walked);
+    self.stepped_ns = self.stepped_ns.saturating_add(took_ns);
+    self.longest_step_ns = self.longest_step_ns.max(took_ns);
+    self.ns_fixed = match self.ns_fixed {
+      0 => took_ns,
+      seen => seen.min(took_ns),
+    };
+    self.ns_per_page = took_ns
+      .saturating_sub(self.ns_fixed)
+      .checked_div(walked)
+      .unwrap_or(0)
+      .max(1);
+  }
+
+  /// The pages the next step walks with `left_ns` of its budget left, at most `most` ([`step_pages`]).
+  fn next_pages(&self, left_ns: u64, most: usize) -> usize {
+    step_pages(left_ns, (self.ns_fixed, self.ns_per_page), most)
+  }
+}
+
+/// One mapped range the sweep walks: a written range of the content object, a held run of the arena, a written region
+/// of the anchor segment, or a client's ring.
 enum Target {
   /// `len` bytes of the content object at `start`, for range `range`.
   Object {
@@ -107,8 +159,8 @@ enum Target {
     start: usize,
     len: usize,
   },
-  /// Arena region `id`, `len` bytes.
-  Region { id: u16, len: usize },
+  /// `len` bytes at `offset` of arena region `id` that allocations hold (`ChunkArena::held_runs`).
+  Held { id: u16, offset: usize, len: usize },
   /// A region of the anchor segment, `len` bytes, for range `range`.
   Segment {
     range: usize,
@@ -127,7 +179,7 @@ impl Target {
   fn len(&self) -> usize {
     match self {
       Target::Object { len, .. }
-      | Target::Region { len, .. }
+      | Target::Held { len, .. }
       | Target::Segment { len, .. }
       | Target::Client { len, .. } => *len,
     }
@@ -137,42 +189,76 @@ impl Target {
   fn range(&self) -> usize {
     match self {
       Target::Object { range, .. } | Target::Segment { range, .. } => *range,
-      Target::Region { .. } => ARENA,
+      Target::Held { .. } => ARENA,
       Target::Client { .. } => CLIENT_REGIONS,
     }
   }
 }
 
-/// The mapped ranges of the shard's slice, in order: the object's four, then the arena's regions.
-fn targets(state: &ShardState) -> Vec<Target> {
+/// The ranges a sweep walks (main's ruling of 2026-11-21 on w-sizing's option (a)): only those that can hold pages.
+/// Of the content object, the write log as far as a record reached, each image slot and the delta log as far as the
+/// journal wrote them since they were last given back (`Journal::written_ranges`), and the DAX range table; never the
+/// object's arena range, which holds no pages where extents are objects of their own (macOS since A-789, Linux's views
+/// of their own) and is the arena's regions where they are not. Of the arena, the runs allocations hold
+/// (`ChunkArena::held_runs`), not its regions whole. And the anchor segment's partition regions and the clients' rings.
+/// The memory report's kinds come first, the held runs and the rings ([`Sweep::kinds`]): where the object's and the
+/// segment's written ranges are not known they are whole (a write log or journal opened over memory a predecessor may
+/// have written reads it whole until its first give-back), 28 GiB a shard on the test daemon, and the report's figures
+/// for what clients wrote do not wait on them.
+/// Before, the sweep walked every range whole: 4 GiB of arena and 13 GiB of object a shard on the test daemon of
+/// `a_memory_status_right_after_a_burst_reports_the_burst_resident_in_the_arenas`, a sweep that never completed on a
+/// debug daemon on macOS, so a 256 MiB burst read 0 resident (w-sizing's report, 2026-11-20). Zero-length ranges are
+/// left out.
+fn targets(state: &ShardState) -> Plan {
   let mut targets = Vec::new();
-  if state.content.is_some() {
+  for (id, offset, len) in state.store.content.arena().held_runs() {
+    targets.push(Target::Held { id, offset, len });
+  }
+  // The daemon's own memory report (§4.14): each shard's clients' ring regions on their shard. The two anchor objects
+  // whole are read from the kernel's per-mapping figures, never walked ([`read_whole`]).
+  for (client, slot) in state.clients.iter() {
+    targets.push(Target::Client {
+      client,
+      len: slot.end.region().object().len(),
+    });
+  }
+  targets.retain(|target| target.len() > 0);
+  let kinds = targets.len();
+  if let Some(content) = state.content.as_ref() {
     let layout = state.config.shard_content_layout();
     let start = crate::daemon::slice_start(&state.config, state.partition);
-    for (range, (from, to)) in [
-      layout.write_log,
-      layout.images,
-      layout.delta_log,
-      layout.dax_ranges,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-      targets.push(Target::Object {
-        range,
-        start: start.saturating_add(from),
-        len: to.saturating_sub(from),
-      });
+    let object = |range: usize, (from, len): (usize, usize)| Target::Object {
+      range,
+      start: from,
+      len: len.min(content.len().saturating_sub(from)),
+    };
+    let (log_from, log_to) = layout.write_log;
+    let log_len = log_to.saturating_sub(log_from);
+    let log_written = state
+      .write_log
+      .as_ref()
+      .map_or(log_len, crate::write_log::WriteLog::written_bytes);
+    targets.push(object(
+      0,
+      (start.saturating_add(log_from), log_written.min(log_len)),
+    ));
+    let (images, deltas) = (state.content_range, state.delta_range);
+    let [committed, stale, logged] = state.journal.written_ranges(
+      images.1.saturating_sub(images.0),
+      deltas.1.saturating_sub(deltas.0),
+    );
+    for (offset, len) in [committed, stale] {
+      targets.push(object(1, (images.0.saturating_add(offset), len)));
     }
-  }
-  let arena = state.store.content.arena();
-  for id in arena.region_ids() {
-    if let Some(region) = arena.region(*id) {
-      targets.push(Target::Region {
-        id: *id,
-        len: region.len(),
-      });
-    }
+    targets.push(object(2, (deltas.0.saturating_add(logged.0), logged.1)));
+    let (dax_from, dax_to) = layout.dax_ranges;
+    targets.push(object(
+      3,
+      (
+        start.saturating_add(dax_from),
+        dax_to.saturating_sub(dax_from),
+      ),
+    ));
   }
   let partition = state.partition;
   for (range, kind) in [
@@ -193,15 +279,8 @@ fn targets(state: &ShardState) -> Vec<Target> {
       targets.push(Target::Segment { range, kind, len });
     }
   }
-  // The daemon's own memory report (§4.14): each shard's clients' ring regions on their shard. The two anchor objects
-  // whole are read from the kernel's per-mapping figures, never walked ([`read_whole`]).
-  for (client, slot) in state.clients.iter() {
-    targets.push(Target::Client {
-      client,
-      len: slot.end.region().object().len(),
-    });
-  }
-  targets
+  targets.retain(|target| target.len() > 0);
+  Plan(targets, kinds)
 }
 
 /// What `len` bytes at `offset` within `target` hold in RAM; `None` where the OS refuses to say.
@@ -216,12 +295,14 @@ fn residency(
       .as_ref()?
       .residency(start.saturating_add(offset), len)
       .ok(),
-    Target::Region { id, .. } => state
+    Target::Held {
+      id, offset: from, ..
+    } => state
       .store
       .content
       .arena()
       .region(*id)?
-      .residency_of(offset, len)
+      .residency_of(from.saturating_add(offset), len)
       .ok(),
     Target::Segment { kind, .. } => state.segment.region_residency_of(*kind, offset, len).ok(),
     Target::Client { client, .. } => state
@@ -234,6 +315,46 @@ fn residency(
       .residency(offset, len, state.config.page)
       .ok(),
   }
+}
+
+/// Records the memory report's kinds as the sweep under way found them, now that it has walked their ranges.
+fn kinds_passed(state: &mut ShardState) {
+  let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+  let sweep = &mut state.content_sweep;
+  sweep.kinds = Some((sweep.partial, now));
+  sweep.kinds_swept = sweep.kinds_swept.saturating_add(1);
+}
+
+/// Derived: how many pages a step walks, from the budget left `left_ns`, the step's measured fixed cost and its cost a page
+/// (`fixed_ns`, `per_page_ns`), at most `most` (a kernel batch): as many as the budget left buys past the fixed part, and
+/// never fewer than the fixed part itself buys (`fixed_ns ÷ per_page_ns`), so a step's overhead is at most half its cost.
+/// Without that floor a shard whose step quantum is shorter than one kernel call walked one page a step: on a 1-shard
+/// debug daemon on macOS (a step quantum of about a microsecond) no sweep of the 63 GiB the control shard sweeps completed
+/// in 68 s, and every resident figure read 0 (w-sizing's report, 2026-11-20). One page while nothing is measured yet.
+fn step_pages(left_ns: u64, (fixed_ns, per_page_ns): (u64, u64), most: usize) -> usize {
+  match per_page_ns {
+    0 => 1,
+    cost => {
+      let pages =
+        |ns: u64| usize::try_from(ns.checked_div(cost).unwrap_or(0)).unwrap_or(usize::MAX);
+      pages(left_ns.saturating_sub(fixed_ns))
+        .max(pages(fixed_ns))
+        .clamp(1, most)
+    }
+  }
+}
+
+/// Nanoseconds by the clock a sweep's steps are timed with: `std::time::Instant` from the first reading in this process
+/// (`mach_absolute_time` on macOS, `CLOCK_MONOTONIC` on Linux, `QueryPerformanceCounter` on Windows), which resolves far
+/// below a step. Not the shard's clock (`slates_machine::clock::monotonic_ns`): on macOS that is `CLOCK_MONOTONIC`
+/// through `clock_gettime`, which reads whole microseconds, and a step of a few pages read as a tick judged a page
+/// hundreds of times dearer than it is, so every next step shrank to a page or two (w-sizing's report, 2026-11-20: about
+/// 20 pages a step, a 6.7-million-page sweep in 24 s on a 1-shard debug daemon, every resident figure 0 until then).
+/// Measurement only: no deadline or record is taken from it.
+fn step_clock_ns() -> u64 {
+  static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+  let origin = ORIGIN.get_or_init(std::time::Instant::now);
+  u64::try_from(origin.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// Arms one sweep to completion in the background (§4.14, the daemon's memory report): a request's own advance walks
@@ -316,9 +437,19 @@ fn advance(state: &mut ShardState) {
   // costs a fixed part (the cheapest step seen: a kernel call and two clock reads) and a part a page, so it walks as many
   // pages as the budget left holds past the fixed part (one while nothing is measured).
   let most = page;
-  // The targets first: a handful, built in constant time; the budget's clock starts at the first step.
-  let targets = targets(state);
-  let began = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+  // A sweep's ranges are fixed when it starts ([`targets`]): a walk of the arena's block heads, once a sweep, not once an
+  // advance. A range gone since (a client left, a region given back) is passed over; a held run freed since reads what
+  // its pages hold. The budget's clock starts at the first step.
+  if state.content_sweep.at == (0, 0) {
+    state.content_sweep.plan = targets(state);
+    if state.content_sweep.plan.1 == 0 {
+      // No held run and no client: the kinds hold nothing, measured as such.
+      kinds_passed(state);
+    }
+  }
+  let plan = std::mem::take(&mut state.content_sweep.plan);
+  let (targets, kinds) = (&plan.0, plan.1);
+  let began = step_clock_ns();
   // Each step is timed from where the last ended (the first from `began`), so the steps cover the advance whole: time
   // the thread spent preempted between two steps is the later step's, and the advance passes its budget by at most the
   // step that crossed it.
@@ -330,38 +461,21 @@ fn advance(state: &mut ShardState) {
       sweep.done = Some(std::mem::take(&mut sweep.partial));
       sweep.sweeps = sweep.sweeps.saturating_add(1);
       sweep.at = (0, 0);
-      return;
+      break;
     };
     let now = mark;
     let left = budget.saturating_sub(now.saturating_sub(began));
-    let fixed = state.content_sweep.ns_fixed;
-    let pages = match state.content_sweep.ns_per_page {
-      0 => 1,
-      cost => usize::try_from(left.saturating_sub(fixed).checked_div(cost).unwrap_or(0))
-        .unwrap_or(usize::MAX)
-        .clamp(1, most),
-    };
+    let pages = state.content_sweep.next_pages(left, most);
     let len = target
       .len()
       .saturating_sub(offset)
       .min(pages.saturating_mul(page));
     let found = residency(state, target, (offset, len));
-    state.content_sweep.steps = state.content_sweep.steps.saturating_add(1);
-    let after = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+    let after = step_clock_ns();
     mark = after;
     let sweep = &mut state.content_sweep;
     let walked = u64::try_from(len.div_ceil(page).max(1)).unwrap_or(u64::MAX);
-    let took = after.saturating_sub(now);
-    sweep.longest_step_ns = sweep.longest_step_ns.max(took);
-    sweep.ns_fixed = match sweep.ns_fixed {
-      0 => took,
-      seen => seen.min(took),
-    };
-    sweep.ns_per_page = took
-      .saturating_sub(sweep.ns_fixed)
-      .checked_div(walked)
-      .unwrap_or(0)
-      .max(1);
+    sweep.record_step(after.saturating_sub(now), walked);
     if let (Some(found), Some(sum)) = (found, sweep.partial.get_mut(target.range())) {
       *sum = if sum.bytes == 0 && sum.modified.is_none() {
         found
@@ -371,10 +485,15 @@ fn advance(state: &mut ShardState) {
     }
     let next = offset.saturating_add(len);
     sweep.at = if next >= target.len() {
+      sweep.ranges = sweep.ranges.saturating_add(1);
       (index.saturating_add(1), 0)
     } else {
       (index, next)
     };
+    if sweep.at == (kinds, 0) && index < kinds {
+      kinds_passed(state);
+    }
+    let sweep = &mut state.content_sweep;
     let elapsed = after.saturating_sub(began);
     sweep.longest_ns = sweep.longest_ns.max(elapsed);
     if elapsed >= budget {
@@ -393,8 +512,12 @@ fn advance(state: &mut ShardState) {
       if elapsed.saturating_sub(budget) > batch.max(sweep.longest_step_ns).saturating_add(noise) {
         sweep.past_budget = sweep.past_budget.saturating_add(1);
       }
-      return;
+      break;
     }
+  }
+  // The plan stays for the sweep's next advance; a sweep that completed starts its next with a new one.
+  if state.content_sweep.at != (0, 0) {
+    state.content_sweep.plan = plan;
   }
 }
 
@@ -446,6 +569,33 @@ pub(crate) fn report(state: &mut ShardState, memory: bool) -> Vec<RefusalCount> 
     state.content_sweep.armed_count,
   ));
   rows.push((format!("{PREFIX}sweep.steps"), state.content_sweep.steps));
+  rows.push((format!("{PREFIX}sweep.pages"), state.content_sweep.pages));
+  rows.push((
+    format!("{PREFIX}sweep.stepped_ns"),
+    state.content_sweep.stepped_ns,
+  ));
+  rows.push((
+    format!("{PREFIX}sweep.ns_per_page"),
+    state.content_sweep.ns_per_page,
+  ));
+  rows.push((
+    format!("{PREFIX}sweep.ns_fixed"),
+    state.content_sweep.ns_fixed,
+  ));
+  rows.push((format!("{PREFIX}sweep.ranges"), state.content_sweep.ranges));
+  // When the figures were read (w-sizing: right, not fresh, so long as the report says when): the kinds' last pass and
+  // the last armed sweep's completion, shard clock nanoseconds (zero before either), and the sweep's length then.
+  rows.push((
+    format!("{PREFIX}sweep.kinds_swept"),
+    state.content_sweep.kinds_swept,
+  ));
+  rows.push((
+    format!("{PREFIX}sweep.kinds_at_ns"),
+    state.content_sweep.kinds.map_or(0, |(_, at)| at),
+  ));
+  let (completed_ns, took_ns) = state.content_sweep.last.unwrap_or((0, 0));
+  rows.push((format!("{PREFIX}sweep.completed_at_ns"), completed_ns));
+  rows.push((format!("{PREFIX}sweep.took_ns"), took_ns));
   rows.push((
     format!("{PREFIX}sweep.past_budget"),
     state.content_sweep.past_budget,
@@ -540,11 +690,21 @@ fn read_whole(state: &mut ShardState) {
 
 /// This shard's part of the daemon's memory by kind (§4.14; A-232's gotcha): on the control shard the anchor segment and
 /// content object whole, on every shard its arena's extents and its clients' ring regions. Each kind's reserved bytes
-/// and mappings are its live lengths now; its resident and written bytes are the last completed sweep's ([`advance`],
-/// which each status request moves), `measured` once one has completed. Called after [`report`], which advances it.
+/// and mappings are its live lengths now; its resident and written bytes are, for the anchor's objects, their mappings
+/// whole read at the request ([`read_whole`]), and for the arenas and the rings the last sweep to pass their ranges
+/// ([`Sweep::kinds`]; a sweep walks them first), `measured` once one has. Called after [`report`], which advances it.
 pub(crate) fn memory(state: &ShardState) -> Vec<slates_ipc::protocol::MemoryKindReport> {
   let kind = |name: &str, range: usize, (mappings, reserved): (u64, u64)| {
-    let found = figure(&state.content_sweep, range);
+    let found = if range == ARENA || range == CLIENT_REGIONS {
+      state
+        .content_sweep
+        .kinds
+        .as_ref()
+        .and_then(|(kinds, _)| kinds.get(range))
+        .copied()
+    } else {
+      figure(&state.content_sweep, range)
+    };
     slates_ipc::protocol::MemoryKindReport {
       kind: name.to_owned(),
       mappings,
@@ -598,9 +758,87 @@ mod tests {
 
   use super::*;
 
+  /// The step clock's tick, measured: the least nonzero step between two of its readings over many.
+  fn step_clock_tick_ns() -> u64 {
+    let mut least = u64::MAX;
+    for _ in 0..10_000 {
+      let first = step_clock_ns();
+      let mut next = step_clock_ns();
+      while next == first {
+        next = step_clock_ns();
+      }
+      least = least.min(next - first);
+    }
+    least
+  }
+
+  /// The sweep's steps on the clock they are timed by (w-sizing's report: on the shard's clock, which reads whole
+  /// microseconds on macOS, about 20 pages a step, 280,000 pages a second, a sweep of 6.7 million pages in 24 s on a
+  /// 1-shard debug daemon). Do: measure the step clock's tick ([`step_clock_ns`]); run the sizing over 20,000 steps of a
+  /// modelled step that truly costs 1.5 µs and 3 ns a page, each read on a clock rounded down to that tick at both ends,
+  /// with half a microsecond of budget left a step and a vector page of 16,384 pages the most. Expect the steps to average
+  /// at least nine tenths of the pages their fixed cost buys (1.5 µs ÷ 3 ns = 500). Red on the shard's clock, whose 1,000 ns tick gave
+  /// 333; a tick of a few tens of nanoseconds judges a page truly.
+  #[test]
+  fn a_sweep_on_its_step_clock_settles_at_steps_its_fixed_cost_amortizes() {
+    const MOST: usize = 16_384;
+    const STEPS: u64 = 20_000;
+    let (fixed_ns, per_page_ns, tick_ns) = (1_500u64, 3u64, step_clock_tick_ns());
+    let mut sweep = Sweep::default();
+    let mut now_ns = 0u64;
+    for _ in 0..STEPS {
+      let pages = sweep.next_pages(500, MOST);
+      let read_before = now_ns / tick_ns * tick_ns;
+      now_ns += fixed_ns + per_page_ns * u64::try_from(pages).unwrap();
+      let read_after = now_ns / tick_ns * tick_ns;
+      sweep.record_step(read_after - read_before, u64::try_from(pages).unwrap());
+    }
+    let average = sweep.pages / STEPS;
+    // Nine tenths: a reading on the tick rounds the fixed part down by up to a tick (492 of 500 on a 41 ns tick); the
+    // microsecond tick's 333 stays below.
+    assert!(
+      average >= fixed_ns / per_page_ns * 9 / 10,
+      "{average} pages a step on average on a {tick_ns} ns tick; the fixed cost buys {}",
+      fixed_ns / per_page_ns
+    );
+  }
+
+  /// The step's size where the shard's step quantum is shorter than one kernel call (w-sizing's report, 2026-11-20: on a
+  /// 1-shard debug daemon on macOS, whose step quantum is about a microsecond, no sweep completed in 68 s and every
+  /// resident figure read 0, since each turn walked one page). Do: size a step with half a microsecond left, a fixed cost
+  /// of 5 µs a step and 3 ns a page, a vector page of 16,384 pages the most; then with a quantum's worth left that
+  /// covers many pages. Expect the first step to walk at least the pages its fixed cost buys (5 µs ÷ 3 ns = 1,666), so
+  /// its overhead is at most half its cost, never one page; the second to walk what the budget left buys; and neither
+  /// past the most.
+  #[test]
+  fn a_step_walks_at_least_the_pages_its_fixed_cost_buys() {
+    const MOST: usize = 16_384;
+    let short = step_pages(500, (5_000, 3), MOST);
+    assert!(
+      short >= 5_000 / 3,
+      "a step amortizes its fixed cost: {short} pages"
+    );
+    assert!(short <= MOST);
+    let long = step_pages(50_000, (5_000, 3), MOST);
+    assert_eq!(
+      long, 15_000,
+      "the budget left buys (50 µs − 5 µs) ÷ 3 ns pages"
+    );
+    assert_eq!(
+      step_pages(10_000_000, (5_000, 3), MOST),
+      MOST,
+      "never past one kernel batch"
+    );
+    assert_eq!(
+      step_pages(500, (5_000, 0), MOST),
+      1,
+      "nothing measured yet: one page"
+    );
+  }
+
   /// A-744 (main's ruling: bounded a step at a time). Do: on a running daemon, ask the shard's report once a poll, as
   /// status requests do, until a sweep completes (at most one request a page of the slice, plus one per target).
-  /// Expect: a sweep completes within that bound; the arena's measured bytes are its regions' lengths; every range's
+  /// Expect: a sweep completes within that bound; the arena's measured bytes are its held runs' lengths (main's ruling on w-sizing's option (a)); every planned range walked (`ranges`) and the memory report's kinds passed (`kinds_swept`), the non-vacuity counts; every range's
   /// resident and written bytes are within its own bytes; no advance crossed its budget on a step larger than one page
   /// (the sweep's `past_budget` at 0: each step sized to the budget left); and the longest advance far inside the
   /// watchdog's window. Before, the test asked every report inside one poll, a step was a fixed batch of 16,384 pages and
@@ -612,14 +850,23 @@ mod tests {
   /// report nothing, until a sweep completes; then ask the report again at once. Expect: the sweep completes with no
   /// further request, by slices of the shard's idle time (`idle_slices` moved, the background path's non-vacuity count),
   /// and then stops (nothing left armed); and the request right after it arms no new sweep (`spaced` moved), since the
-  /// last completed less than its own length ago.
+  /// last completed less than its own length ago. With w-sizing's option (a) (main's ruling, 2026-11-21): the memory
+  /// report's kinds (the held runs, the rings) pass within ten liveness budgets, the bound the whole sweep had; the whole
+  /// sweep within sixty, and its rows say when it completed and how long it took. A fresh daemon's write log and journal
+  /// cannot know their memories unwritten, so its split walks them whole, and steps sized on the step clock keep to their
+  /// budget: 13.9 s for the 3.5 million pages of a debug audit daemon on the Mac Studio (2026-11-21), where steps timed
+  /// on the shard's microsecond clock finished in about 2 s by running past their budget unseen (3,290 steps over 100 us,
+  /// the longest 15.5 ms, against a budget of about 1.6 us, `past_budget` at 0).
   #[test]
   // The watch leaves the shard idle between its looks, which is the condition under test: a look is a task on the shard.
   #[allow(clippy::disallowed_methods)]
   fn a_status_requests_sweep_runs_on_the_shards_idle_time_and_is_spaced_by_its_length() {
-    /// Shape: the watch's bound: a debug audit daemon's whole slice, swept on idle time, within ten liveness budgets.
-    const WATCH: std::time::Duration =
+    /// Shape: the memory report's kinds' bound: swept on idle time within ten liveness budgets.
+    const KINDS: std::time::Duration =
       std::time::Duration::from_nanos(10 * crate::daemon::LIVENESS_BUDGET_NS);
+    /// Shape: the watch's bound: a fresh debug audit daemon's whole split, swept on idle time, within sixty.
+    const WATCH: std::time::Duration =
+      std::time::Duration::from_nanos(60 * crate::daemon::LIVENESS_BUDGET_NS);
     /// Shape: the pause between two looks: a hundredth of a liveness budget, long against a shard's idle spin, so the
     /// shard reaches its idle work between looks, as a daemon nobody asks does.
     const LOOK: std::time::Duration =
@@ -630,16 +877,27 @@ mod tests {
     });
     let started = std::time::Instant::now();
     let mut seen = (0, 0, true);
+    let mut kinds_seen = None;
     while started.elapsed() < WATCH {
-      seen = crate::daemon::observe_first(&daemon, |state| {
+      let kinds_swept;
+      (seen, kinds_swept) = crate::daemon::observe_first(&daemon, |state| {
         let sweep = &state.content_sweep;
-        (sweep.sweeps, sweep.idle_slices, sweep.running)
+        (
+          (sweep.sweeps, sweep.idle_slices, sweep.running),
+          sweep.kinds_swept,
+        )
       });
+      if kinds_swept > 0 && kinds_seen.is_none() {
+        kinds_seen = Some(started.elapsed());
+      }
       if seen.0 > 0 && !seen.2 {
         break;
       }
       std::thread::sleep(LOOK);
     }
+    let took_ns = crate::daemon::observe_first(&daemon, |state| {
+      state.content_sweep.last.map_or(0, |(_, took)| took)
+    });
     let spaced = crate::daemon::observe_first(&daemon, |state| {
       report(state, true);
       (state.content_sweep.spaced, state.content_sweep.running)
@@ -655,6 +913,11 @@ mod tests {
       "the sweep advanced in idle slices: {seen:?}"
     );
     assert!(!running, "the completed sweep left nothing armed: {seen:?}");
+    assert!(
+      kinds_seen.is_some_and(|at| at < KINDS),
+      "the memory report's kinds passed within {KINDS:?}: {kinds_seen:?}"
+    );
+    assert!(took_ns > 0, "the completed sweep says how long it took");
     assert_eq!(
       spaced,
       (1, false),
@@ -665,9 +928,9 @@ mod tests {
   #[test]
   fn a_sweep_completes_within_its_bound_and_holds_every_range_to_its_bytes() {
     let daemon = crate::daemon::audit_daemon();
-    let (bound, arena_len) = crate::daemon::observe_first(&daemon, |state| {
+    let (bound, arena_len, planned) = crate::daemon::observe_first(&daemon, |state| {
       let page = state.config.page.max(1);
-      let targets = targets(state);
+      let targets = targets(state).0;
       // The worst case: a step of one page a request (each step is sized to the budget left).
       let total: usize = targets
         .iter()
@@ -678,7 +941,7 @@ mod tests {
         .filter(|target| target.range() == ARENA)
         .map(Target::len)
         .sum();
-      (total + targets.len() + 1, arena_len)
+      (total + targets.len() + 1, arena_len, targets.len())
     });
     let mut asked = 0;
     let mut sweeps = 0;
@@ -689,14 +952,29 @@ mod tests {
       });
       asked += 1;
     }
-    let (done, past_budget, longest_ns) = crate::daemon::observe_first(&daemon, |state| {
-      let sweep = &state.content_sweep;
-      (sweep.done, sweep.past_budget, sweep.longest_ns)
-    });
+    let (done, past_budget, longest_ns, ranges, kinds) =
+      crate::daemon::observe_first(&daemon, |state| {
+        let sweep = &state.content_sweep;
+        (
+          sweep.done,
+          sweep.past_budget,
+          sweep.longest_ns,
+          sweep.ranges,
+          sweep.kinds_swept,
+        )
+      });
     daemon.stop();
     assert!(sweeps > 0, "no sweep completed within {bound} requests");
     let done = done.unwrap();
     assert_eq!(done[ARENA].bytes, u64::try_from(arena_len).unwrap());
+    assert!(
+      ranges >= u64::try_from(planned).unwrap() && planned > 0,
+      "the sweep walked its plan's {planned} ranges: {ranges}"
+    );
+    assert!(
+      kinds >= sweeps,
+      "every sweep passed the memory report's kinds: {kinds} of {sweeps}"
+    );
     for found in done {
       assert!(found.resident <= found.bytes, "{found:?}");
       assert!(

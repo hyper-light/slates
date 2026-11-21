@@ -1789,6 +1789,9 @@ pub(crate) struct PushTurns {
   pub(crate) longest_opening_ns: u64,
   /// The quanta turns took past their first because no one waited (A-783): the non-vacuity count of the extension.
   pub(crate) more_quanta: u64,
+  /// The units the turns ran (A-752: a build works a unit at a time, at least one a file it changes, whatever the
+  /// quantum the shard keeps).
+  pub(crate) units: u64,
   /// The turns that yielded to someone waiting at a quantum's end (A-783).
   pub(crate) yielded: u64,
 }
@@ -1846,14 +1849,16 @@ impl PushTurns {
     self.more_quanta = self
       .more_quanta
       .saturating_add(report.quanta.saturating_sub(1));
+    self.units = self.units.saturating_add(report.units);
     if report.stop == Some(slates_pace::Stop::Waiting) {
       self.yielded = self.yielded.saturating_add(1);
     }
   }
 
   /// Its status rows.
-  pub(crate) fn rows(&self) -> [(&'static str, u64); 7] {
+  pub(crate) fn rows(&self) -> [(&'static str, u64); 8] {
     [
+      ("push.build.units", self.units),
       ("push.build.more_quanta", self.more_quanta),
       ("push.build.yielded", self.yielded),
       ("push.build.turns", self.turns),

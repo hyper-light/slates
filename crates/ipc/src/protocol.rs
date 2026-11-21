@@ -1388,8 +1388,12 @@ pub enum RequestBody {
     work: VolumeId,
     /// Its green.
     green: VolumeId,
-    /// The increment, as `Increment::encode` writes it.
-    increment: Vec<u8>,
+    /// The increment, by the identity its inputs archive is held under on the asking node (its manifest identity, the
+    /// one the version's merge record and chain entry name; lane (A) 3b): the owner fetches what it lacks from that node
+    /// by identity on the content plane and stores it once, so the forward carries no increment.
+    increment: [u8; 32],
+    /// The increment's encoding's length in bytes.
+    increment_len: u64,
     /// Its verdict, as `Computed::encode` writes it (A-658 part 3a).
     computed: Vec<u8>,
     /// What the owner judges the write policy, the signature and the commit by.
@@ -2172,13 +2176,19 @@ pub struct MemoryKindReport {
   pub mappings: u64,
   /// The address space it reserves: the mappings' lengths, or for the heap what the allocators hold from the OS.
   pub reserved_bytes: u64,
-  /// Its bytes in RAM, from the kernel's page table at the last completed sweep of the shard that maps it (or for the
-  /// heap the bytes live allocations hold, now); 0 until a sweep completes ([`MemoryKindReport::measured`]).
+  /// Its bytes in RAM, from the kernel's page table (or for the heap the bytes live allocations hold, now); 0 until
+  /// measured ([`MemoryKindReport::measured`]). For `arenas` and `regions`, the arenas' held runs and the clients' rings
+  /// as the last sweep to pass them found them: a sweep walks them first, so they are read within one pass over what is
+  /// held, not over the address space reserved (main's ruling of 2026-11-21 on w-sizing's option (a)); for `segment` and
+  /// `content`, the mappings whole, read at the request. Tolerance: a page the host has compressed or paged out since it
+  /// was written is not resident and is not counted, so a figure may fall short of what was written by what the host
+  /// took away; it never counts a page not in RAM, nor a freed arena block's page (resident until the idle purge).
   pub resident_bytes: u64,
   /// Its bytes written, where the OS says (macOS); `None` where it does not, and for the heap.
   pub modified_bytes: Option<u64>,
-  /// Whether `resident_bytes` is a reading: each sweep that maps the kind has completed at least once (each status
-  /// request advances a shard's sweep, A-744's bound).
+  /// Whether `resident_bytes` is a reading: on every shard that maps the kind, a sweep has passed its ranges at least once
+  /// (a status asking for the memory report arms one on the shard's idle time, A-744; asked again, the report reads it,
+  /// and the shard's `content_range.sweep.kinds_at_ns` says when).
   pub measured: bool,
 }
 

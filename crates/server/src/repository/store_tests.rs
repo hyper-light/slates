@@ -101,6 +101,58 @@ fn a_created_repository_is_landed_into_the_store_and_recovered() {
   creation_recovered(&dir);
 }
 
+/// The store's Windows lane (main's order of 2026-11-21: every git, hg and svn repository was unusable on Windows, its
+/// daemon refusing `--vcs-store` at its start). Do: start a daemon holding a store, and create one repository of each
+/// tool through the verb, each with request numbers of its own. Expect: each create answered once landed and recorded,
+/// each creation landed on its name's partition, none refused by the store. On Unix and Windows alike.
+#[test]
+fn each_tool_creates_a_repository_into_the_store() {
+  let store = TestStore::start("each-tool");
+  let profile = crate::daemon::test_profile();
+  let instance = format!("vcs-store-each-{}", std::process::id());
+  let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(SHARDS));
+  config.vcs_disk = Some(store.handle());
+  let daemon = Daemon::start(&profile, config, SegmentSource::Create { name: instance }).unwrap();
+  daemon.bootstrap(true).unwrap();
+  let mut landed_on = std::collections::BTreeMap::<usize, u64>::new();
+  for (request, (name, tool)) in [
+    ("each-git", VcsTool::Git),
+    ("each-hg", VcsTool::Mercurial),
+    ("each-svn", VcsTool::Subversion),
+  ]
+  .into_iter()
+  .enumerate()
+  {
+    let partition = usize::from(crate::verbs::owner_of_name(name, usize::from(SHARDS)));
+    let asked = (name, tool, ObjectFormat::Sha1, "main");
+    let request = u64::try_from(request).unwrap() + 1;
+    let created = crate::daemon::observe_at(&daemon, partition, move |state| {
+      routed_create(state, (&owner(), request), asked)
+    });
+    assert!(
+      matches!(created, ReplyBody::Acknowledged),
+      "{tool:?}: answered once landed and recorded: {created:?}"
+    );
+    let landed = landed_on.entry(partition).or_insert(0);
+    *landed += 1;
+    wait_for(&daemon, partition, super::CREATION_LANDED, *landed);
+  }
+  for &partition in landed_on.keys() {
+    let unlanded = crate::daemon::observe_at(&daemon, partition, |state| {
+      state
+        .refusals
+        .get(super::CREATION_UNLANDED)
+        .copied()
+        .unwrap_or(0)
+    });
+    assert_eq!(
+      unlanded, 0,
+      "the store refused a creation on partition {partition}"
+    );
+  }
+  daemon.stop();
+}
+
 /// A-767 C6 (svn onto the changeset store; main's order of 2026-11-20 19:50: "a push's landing as a changeset append,
 /// and its replay", red first on the real store). Do: start a daemon holding a store, create a Subversion repository,
 /// land a client's accepted work adding `/trunk` through the commit's landing (`svn_commit::land_work`), wait for its

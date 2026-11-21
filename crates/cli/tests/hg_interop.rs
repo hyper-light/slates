@@ -634,6 +634,13 @@ fn counter(instance: &str, name: &str) -> u64 {
     .sum()
 }
 
+/// Format: the daemon's counter of the slices a push's intake took (`repository::hg_push::INTAKE_SLICES`).
+const INTAKE_SLICES: &str = "hg_push.intake_slices";
+
+/// Shape: the most slices the test's one push of two changesets may take paced: the intake's steps run on while no one
+/// waits on the shard, so its few units take a slice or two, where a slice a step took one each.
+const INTAKE_SLICES_AT_MOST: u64 = 3;
+
 /// Format: the daemon's counter of the turns a fetch's streamed answer took (`vcs_store::hg_view::STREAM_TURNS`).
 const STREAM_TURNS: &str = "vcs_store.hg_stream_turns";
 
@@ -735,6 +742,12 @@ fn stock_hg_clone_stream_streams_a_pushed_repository_and_an_imported_one() {
         .ok_or(verify_said),
     )
   };
+  // The push's intake was paced (A-783): a few slices, where a slice a step took one each of its units.
+  let slices = counter(&instance, INTAKE_SLICES);
+  assert!(
+    (1..=INTAKE_SLICES_AT_MOST).contains(&slices),
+    "the push's intake took {slices} slices"
+  );
   let imported = clone_stream("imported");
   let turns_before = counter(&instance, STREAM_TURNS);
   let pushed = clone_stream("pushed");

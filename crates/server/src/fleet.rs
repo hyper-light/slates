@@ -4884,7 +4884,7 @@ async fn fetch_into_hold(
 /// `placed_for` reads when the manifest arrives: a taken-over volume's adopted head (its head's own holders), or a
 /// taken-over green's version, whose inputs the retention rule keeps by that version's ledger position
 /// ([`fetch_green_inputs`]).
-async fn fetch_manifest_into_hold(
+pub(crate) async fn fetch_manifest_into_hold(
   object: ObjectId,
   holders: &[HostId],
   placed_for: impl Fn(&ShardState) -> u64,
