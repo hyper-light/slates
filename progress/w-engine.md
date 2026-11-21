@@ -277,3 +277,7 @@ Red: a focused server test landing a large named text: no step past the quantum,
   its oracle (copy + identity histories, red-checked) offered to main as a patch.
 - NEXT: (b) subtract a key's old entry at first change; slice the checkpoint's last step (~43 ms) and big single keys;
   A/B.
+- 2026-11-21 ~14:30: A-805 preview oracle landed 8f73b6928 (A-815 row; report sent to main by `kiln agents send`).
+  A-579 (b) + the mid-fold sum_at fix landed 596500613 (fast rule: fmt check, focused tests by name, local target;
+  merged with main 1a35ab091 fetched through the MacBook, this Mac's DNS can't reach github.com). NEXT (05:00 order):
+  slice the checkpoint's ~43 ms last step and the 13.4 ms single-key folds; (b)'s A/B owed.
