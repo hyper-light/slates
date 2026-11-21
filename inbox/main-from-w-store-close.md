@@ -91,3 +91,29 @@
 - `repository::tests`: 58 pass and 4 fail. The 4 failures are the same ones (submit refused `Overloaded`) I reported on
   clean main f9c113ae9, not from this change.
 - Sibling: svn_made's order is with w-svn (your note). w-hg's push already lands first on its branch.
+
+## 2026-11-20 ~23:59: e4cfbd38d's two choices (174459b36, merged as 9bfcbb9be)
+1. **The restart.** Test: `a_creation_after_a_restart_never_meets_a_killed_creations_orphaned_changeset`. A create is
+   killed between the steps; the daemon and the store's owner stop; a successor starts over the same anchor segment
+   and store; the same partition creates again. The log does hold two changesets 0 under one id (asserted, so the
+   successor really minted the orphan's id again).
+   **It was green with no code change, so there was no red to show.** The store's `C` row for `(repository,
+   sequence)` is the newest landing at that key, and that is the only one the register can ever name: a record
+   follows its landing, and once an id is recorded the counter passes it. So the new repository's rows give exactly
+   its own creation. This is your "applies only what the register named" rule, enforced by the store's key, so I added
+   no second mechanism. The orphan's log bytes stay until the cleaner of unnamed log space (in GAPS). If you want
+   recovery to drop unnamed changesets explicitly anyway, say so and I'll build it on that cleaner.
+2. **Forwarded creates.** No create is ever forwarded to another node. Every repository verb names no volume
+   (`RequestBody::volume` in `crates/ipc/src/protocol.rs`: "served on the partition its name hashes to", A-575), and
+   `verbs::serve_forward` refuses any volume-less verb (`Unsupported { "forwarded verb" }`) before it runs. A create
+   always runs on the node the client reached, and a forward between shards of one node carries its reply route. So
+   the refusal I had was unreachable by any client, laptop or fleet, and R8 already holds.
+   - I built the parked-answer path on dc4f6eb06's mechanism (an attach in `await_deferred_completion`), then took it
+     out: it could never run, and the rules ban a "just in case" second path.
+   - What remains is one typed refusal, for a dispatch with no client request or route (a shard's own call), and it is
+     the same on every node.
+   - The GAPS "owed" line is gone, replaced by these facts.
+   - If repository verbs are ever forwarded, the attach is three small pieces: a map of creations by request, a guard
+     arm in `await_deferred_completion`, and `answer_awaited` at the record.
+- Tests: `store_tests` 4/4 and `slates-store` 21/21, run on the merged tree (it includes main's lint round 13).
+- Next: the standing grant's AuditKind and revocation.

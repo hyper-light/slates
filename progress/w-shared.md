@@ -355,3 +355,12 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 
 ## LANDED 2026-11-20 ~22:50 PST: record plane, inputs archived once = 8f04c9130 (main c990989f7). Exit 4 open until kiln r9
   (queued) reports. Family three: kiln r11 started on adacachy (green running). Next: land sweep-3 on r11 green; read r9.
+
+## LANDED 2026-11-20 ~23:55 PST: lane step one = b72aff1fc (frames encoded in place, packets sealed in one reused
+  buffer; Studio-1 profile before/after in BENCHMARKS: memmove 604->491, median 1,066.5->1,103 MB/s). Lane is ~1.1 GB/s
+  quiet. NEXT: step two (frames by reference into the send stream until acked; receiver copies). Family three: kiln r15
+  (Linux, queued, r11 lost to a runner restart). Exit 4: kiln r9 (queued).
+
+## LANDED 2026-11-21 ~00:40 PST: lane step two = 35c740150 (main 585b89299): spans of the sender's bytes, no copy
+  into frames. memmove 604 -> 491 -> 433 over the two steps; goodput ~1.1 GB/s quiet, level. NEXT in lane: receiver
+  copies (decode, reassembly), then datagram batching per syscall. Family three: kiln r15 (Linux, queued). Exit 4: r9.

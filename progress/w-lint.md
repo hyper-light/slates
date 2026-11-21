@@ -284,3 +284,6 @@
   then passed 3 of 3. content_ranges failed once at load 7, then passed 2 of 2 on both versions.
 - To g228 (inbox/g228-from-w-lint.md): live_fleet's two time-waits, resident.rs's /proc read (structural), mem unsafe
   88 > 87. Still with w-store: 3 store literals; w-sizing: server unsafe (now ok? see next round).
+- Windows run requests (main 20:05: w-sizing R2 at 20bef898c with its red-first at 20bef898c^, w-work-mount's WinFsp
+  mounted-work test, w-realtools' real_tools over WinFsp): one combined run by needs "windows". r7 and r8 both ended
+  "the kiln server did not answer in time" before any output came back; whether r8 runs on jupiter is unknown.

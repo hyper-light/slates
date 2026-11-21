@@ -7014,3 +7014,10 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - w-shared, lane (main's item 4): CPU profile, sender and holder, of
   `REPLICATION_BENCH_BULK_MIB=64 target/release/examples/replication_bench 20` on a quiet Mac. 45-75 µs per 9.2 KB
   packet measured at load 22; the UDP receive buffer was ruled out (no drops). Asked for: the top frames per side.
+- w-shared, transport send path (b72aff1fc): every packet's encoding and sealing changed (one reused buffer, frames
+  encoded in place). The fleet suites (`slates-server --test fleet`, `slates-cluster --test live`) and the Linux and
+  Windows lanes. Red would be a decrypt failure, a malformed frame refusal, or a session that stalls.
+- w-shared, transport step two (35c740150): stream data in flight as spans of the sender's bytes (loss recovery, probes
+  and MTU splits now encode from the sender's buffer). The fleet suites and the chaos/loss lanes on Linux and Windows.
+  Red would be a resend carrying wrong bytes (a decode or reassembly refusal on the peer) or a stream that never completes
+  after a loss.

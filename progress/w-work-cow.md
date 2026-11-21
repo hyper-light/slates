@@ -57,3 +57,13 @@ main 15:20: "a one-byte edit to a 1 GB file costs 1 GB; fix at chunk grain; red 
 - New finding -> GAPS only: a 1 GiB / 100k-file single submit stalls its shard past the liveness window (watchdog exit 4).
 - Cleaned: grid worktree, ~/.cache/w-work-cow-{grid-run,serve}. Kept: clone, target, push scripts.
 - Queue empty.
+
+## Codex goal (main 2026-11-20 ~20:00): land the Codex agent's Green/Work + atomic-conflict work, or record it superseded
+- Inventory (adacachy, read-only on ~/Projects/slates): 476 branches (work/slates-*, experiment/*, codex/*), 1,387
+  distinct commits not on main (cc29bfc4c), ~6,394 behind; 204 commits touch merge/green/work/conflict.
+- My analysis copy: adacachy ~/.cache/w-work-cow-codex.git (bare, --shared on the checkout, gh/main fetched), lists
+  ~/.cache/w-work-cow-{uniq,gw}.txt there. Strands seen: green_preparation (Green publication/physical fill),
+  green namespace fill + directory recreation (merge engine), owned merge verdict (crates/merge/tests/prepared.rs),
+  mounted early conflict, Work NFS lease stale writes, work/slates-atomic-conflicts, work/slates-conflict-cli.
+- Main lacks the Codex files (green_preparation.rs etc.); verdicts by behaviour pending. Next: bundle the Codex refs
+  to this Studio and read each strand against main. Kiln server disconnected ~20:40; retrying.
