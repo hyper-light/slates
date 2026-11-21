@@ -15,7 +15,16 @@
 > - **The client's share:** `edit_merge_bench`'s client spins for its reply at default priority beside the load, so
 >   accept's p99/p999 beyond the daemon's part (macOS 0.8–2.6 / 7–9 ms with the nap fixed) is the harness's own
 >   thread waiting for a CPU.
-> - Windows: not measured since A-400. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–6).
+> - **Fixed on the way (2026-11-20): a Linux timed wait shorter than a millisecond lasted a millisecond.** rustix
+>   (no `linux_5_11`) rounds `epoll_wait`'s timeout up to whole milliseconds; the epoll driver now arms a timerfd with the
+>   deadline's nanoseconds and waits untimed (`crates/rt/src/epoll.rs`). Red then green on ubuntu-latest and
+>   ubuntu-24.04-arm (`driver::tests::a_sub_millisecond_timed_wait_ends_by_its_deadline`: the shortest 200 µs wait
+>   1,018–1,059 µs, 3 of 3 on each; green 3 of 3, CI run 44860111648). It is not the band above: with it the queued p99
+>   stays 1,009–1,011 µs (run 44860060964), and the band survives no idle spin and no hold (run 44861831509): a kicked
+>   shard waits a millisecond for a CPU. The lane's own ping-pong floor beside the bench: p99 4.7–5.1 µs, p999 0.8–2.7 ms.
+>   New finding, not worked: Windows' completion-port wait rounds up to whole milliseconds too (`crates/rt/src/iocp.rs`).
+> - Windows (CI, run 44857045148): no 1 ms band (queued p99 5–49 µs); accept p99 0.13–0.31 ms, conflict 0.11–0.29 ms;
+>   p999 0.2–62 ms. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–7).
 >
 > **KILN ON A LOADED KVM HOST (w-k90-kvm, 2026-11-20; kiln goal 90d/90f, closed at kiln c0f576eb3; findings recorded,
 > not worked, per the close order).** Seen on adacachy (load 60-85, io some avg10 ~10%) in kiln's `slates_e2e microvm::`
@@ -25,7 +34,7 @@
 > resume; (3) a runner's sqlite stores took 48-96 s to open under that I/O pressure. The link itself drops when a
 > starved process misses the transport's 10 s idle timeout (`net::limits`): run such drives at the default CPU weight.
 
-> **R9'S PROVISIONING GATE AND ITS LOADED P99 (w-provision-gate, 2026-11-20; A-786; 8a-r9-gate below).** BUILT: the
+> **R9'S PROVISIONING GATE AND ITS LOADED P99 (w-provision-gate, 2026-11-20; A-786; 8a-r9-gate below; C1 and P2 CLOSED).** BUILT: the
 > gate's lane (`cargo xtask ratchet --provision`) and its assertions, the loaded form's bound included; WIRED into kiln CI
 > and nightly (exclusive bare-metal Linux and macOS legs) and GitHub's CI (informational, the histogram kept). **Open, fix in flight:** the loaded 1-client p99 misses its bound on main (1.62 ms against 0.87 ms, macOS
 > arm64, M4 Max, 2 spinners a logical CPU), measured to the shard's busy-loop harvest (a zero-timeout `kevent` sleeps and
@@ -53,7 +62,15 @@
 > **A-789 BUILT (macOS; content as extents made on demand, piece 1):** each pool extent is an object of its own,
 > made ahead of need and given back whole at release: a 256 MiB burst's destroyed volume left 259 MiB in the content
 > object and 1,362 MiB resident before, 0 and 123 MiB after. Open: the arena's address-space range in the content
-> object, Windows' section per extent, a held extent's free pages. > **A-778 FIXED (found by use):** a `SIGKILL`ed anchor's segment and content object stayed in the kernel on macOS
+> object, a held extent's free pages. **Windows' section per extent written (A-789, main 18:40):** the anchor holds
+> each extent's section across a restart (`WHAT_CONTENT_EXTENT`); its build and tests are owed to w-lint on jupiter
+> (run-requests; red: commit kept after a destroyed volume's burst). **Open (R2, found 2026-11-20 19:45):** the macOS give-back
+> depends on the machine: recovery's `a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone` passed on a quiet
+> adas-macbook-pro-2 (1,648 -> 123 MiB) but kept 1,366 MiB there later and 335-336 MiB on the big Studio at 5,433 free
+> pages, at A-789's own commit too. Not the pressure hold: with the test's own pressure readings injected (none, and a
+> fall of two bursts) both kept RAM, 591 and 340 MiB after the destroy (big Studio, branch agents/w-sizing-r2hold,
+> ea004b541). The anchor's content object held 0-2 MiB throughout, so the extents go back; what stays is the process's
+> own resident memory (heap and buffers of the write path), worked under R3 with w-hg and w-store. > **A-778 FIXED (found by use):** a `SIGKILL`ed anchor's segment and content object stayed in the kernel on macOS
 > (21 GB held on the big Studio by four with no process alive); its daemon now removes their names as it leaves
 > (`docs/bugs/2026-11-20-a-killed-anchor-left-its-segment-and-content-in-the-kernel.md`). Open: a daemon killed with its
 > anchor still leaves them; harnesses should stop anchors with `SIGTERM`. **Open, by size:**
@@ -106,6 +123,11 @@
 > to hold it); (b) the shared Mac loaded, where main is
 > still slower than before W1 (accept p50 148–398 against 95–110 µs, p99 9.9–20.2 against 7.8–10.3 ms): the submit's
 > ask to the green's owner; (c) the goal's 1 ms loaded p99, met by no arm on either platform.
+>
+> **A-767, the derived per-path read form (2026-11-20, w-perf; A-645).** BUILT: the `Texts` section's one format and
+> edit form, the `T`/`H` rows at landing and replay, `Store::text_at`/`text_row`/`path_texts` and the owner's requests
+> (SLATES_DESIGN A-767's status). Owed: rows for a changeset landed through `begin`/`applied` (w-store's path writes
+> neither `P` nor `T`/`H`); the release timing on Mercurial's history against the per-file arm's 91 µs.
 >
 > **A-767 (2026-11-20, w-store; Ada's storage and changeset rulings).** DESIGNED: one unit, the changeset; RAM holds
 > the change in flight and a learned cache; history an append-only changeset log on each holder's disk under the
@@ -233,6 +255,15 @@
 > **A-722 part 4a (2026-11-20, w-git).** BUILT: a git record's pack replayed a turn at a time (read in chunks, objects
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
+>
+> **A-793 (2026-11-20, w-fed-move; goal 86b, found by use: 100,000 clients over the Linux kernel).** FIXED: a change
+> re-anchors its path's content history on the new block (`history::reanchor`), so the history keeps what a change
+> overwrote, not the earlier file; A-728 part 2's splice and seal are replaced. At 100,000 clients: `BudgetExceeded`
+> 94,877 to 0, accepted 5,123 to 29,795, verdicts 13 to 131 a second, oracle clean. Open (goal 86b's next bound): the
+> 70,205 clients that met a conflict were refused `TableAtCapacity` resolving it (63,145 edits, 7,060 rebases): the
+> client node's merge budget (`green_chain_bytes`, 373 MB a partition, which work logs share) filled; a first-occurrence
+> log line (`Partition::merge_budget_held`) names what holds it at the next run. Still open from A-792: every p99 is
+> seconds to minutes (the cycle's 677 s), CreateWork p50 25 s.
 >
 > **A-792 (2026-11-20, w-fed-move; goal 86b, found by use: the many-client rung on one primary and two replicas over
 > the Linux kernel).** FIXED: a green listed at its head reads the directory's subtree (`Green::head_under`, one descent
@@ -10916,8 +10947,13 @@ spin's turn. Both meet R9's 50 µs floor quiet for the first time at nine shards
 empties it on their path (queued p99 1.05-1.17 ms -> 22-23 µs), and on Linux the same band is the kernel tick. On
 provisioning the candidates' p999 sits in cross-shard hops to a shard that spins without sleeping, which macOS demotes
 and which then waits quanta for a core: 7-29 ms. QoS user-interactive does not move it (rejected; BENCHMARKS "Where the
-loaded p999 goes, per hop"). **Decision needed (main/Ada):** land the immediate poll for p99 3-5x better and R9's quiet
-floor (with the p999 4-5x worse and 4-6x the quiet CPU with holds), or keep main's nap.
+loaded p999 goes, per hop"). **Decided and CLOSED (P2, 2026-11-20 night):** main's option 3 (the
+immediate poll only where a shard keeps its core, holds declined where it can't) was A/B'd against main on four
+conditions. It failed all four: quiet CPU 5.7-10.0 against 1.6-1.7 cores, loaded p999 10.1-12.7 against 2.1-3.4 ms,
+loaded p99 better in two rounds of three, quiet p99 82 µs in one round. Option 2 failed the same way. Both are recorded
+as measured and rejected (BENCHMARKS "options 2 and 3 measured and rejected"), and **main's nap stays**. The loaded
+bound in the gate stays red on macOS: that is R9 unmet under load on this platform, recorded, with no daemon lever
+found.
 Earlier next step, now measured: A-387's turn estimate forgets by a count of turns, so with cheap turns a preemption is forgotten after
 2^shift turns, microseconds of spinning; the fix weighs turns by time, then lands with the immediate poll and its red test
 (`a_zero_timeout_wait_delivers_what_is_ready_and_never_sleeps`, macOS judged by time). Found on the way, not chased:
