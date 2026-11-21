@@ -262,6 +262,9 @@ pub struct DivergedWalk {
   snapshot: Option<SnapshotId>,
   stack: Vec<(String, Handle<DirNode>)>,
   out: Vec<Diverged>,
+  /// A walk of the whole loaded tree (A-774 part 3): every entry the tree holds is reported `Created`, untouched base
+  /// entries too, a whiteout as one; what a landing of a volume over a tree base into another directory lands.
+  whole: bool,
 }
 
 impl DivergedWalk {
@@ -270,6 +273,7 @@ impl DivergedWalk {
       snapshot,
       stack: vec![(String::new(), root)],
       out: Vec::new(),
+      whole: false,
     }
   }
 }
@@ -979,6 +983,21 @@ impl Volume {
     Ok(DivergedWalk::new(Some(id), root))
   }
 
+  /// A walk of snapshot `id`'s whole loaded tree, every entry reported `Created` (A-774 part 3; [`DivergedWalk`]'s
+  /// `whole`): the base's untouched entries land as created ones where the base is not the landing's target.
+  pub fn whole_walk_in(&self, id: SnapshotId) -> Result<DivergedWalk, VfsError> {
+    let mut walk = self.diverged_walk_in(id)?;
+    walk.whole = true;
+    Ok(walk)
+  }
+
+  /// [`Volume::whole_walk_in`] over the head.
+  pub fn whole_walk(&self) -> DivergedWalk {
+    let mut walk = self.diverged_walk();
+    walk.whole = true;
+    walk
+  }
+
   /// One unit of `walk`: one directory's entries judged; the whole diverged set, sorted by path, once the last
   /// directory is done. A directory gone meanwhile (a stale handle of a walk over the head) is passed over, as the
   /// one-call walk passed it.
@@ -1019,7 +1038,12 @@ impl Volume {
         }),
         Child::Dir(h) => {
           if let Ok(child) = store.dirs.get(h) {
-            if let Some(kind) = directory_divergence(child) {
+            if walk.whole {
+              found.push(Diverged {
+                path: path.clone(),
+                kind: Divergence::Created,
+              });
+            } else if let Some(kind) = directory_divergence(child) {
               found.push(Diverged {
                 path: path.clone(),
                 kind,
@@ -1040,7 +1064,12 @@ impl Volume {
         | Child::Socket(no)
         | Child::BlockDevice(no)
         | Child::CharDevice(no) => {
-          if witnessed(no) {
+          if walk.whole {
+            found.push(Diverged {
+              path,
+              kind: Divergence::Created,
+            });
+          } else if witnessed(no) {
             found.push(Diverged {
               path,
               kind: Divergence::Witnessed,

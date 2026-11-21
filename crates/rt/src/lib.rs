@@ -57,6 +57,7 @@ pub mod pipe_state;
 pub mod queue;
 pub mod readiness;
 pub mod registry;
+pub mod retirement;
 pub mod room;
 pub mod runtime;
 pub mod shard;
