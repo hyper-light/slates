@@ -55990,6 +55990,30 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (six captured pushes, their packs held in 64-byte windows, thin bases among them) and
   `an_entry_whose_base_is_held_nowhere_or_past_the_room_is_refused_typed`; 2 passed; fmt clean (kiln, macOS arm64).
 
+### A-722's record v4, part A — the record names its homed pack; the append is O(moves) (2026-11-20, w-git for UI goal 93; main's pack-homing ruling)
+- **Why.** After part B the longest step of git/git's v1.5.0 push was its landing (27 ms), most of it the entry's
+  apply: the record carried the whole 9.4 MiB pack, so the state log's write was O(its bytes) in one step.
+- **Change.**
+  - Record version 4 (`record::VERSION_PACKED`) replaces version 3 with no second path: the head, the moves, the
+    names' identity and count, and the pack's identity and length, and nothing else. Version 3 is no longer read.
+  - The push's pack is the content its staging put in the store (part B). The decision homes it in the region after
+    the names, a second homing round through the same edge path (`Homing::PackDue`, `PackAsked`, `PackWaiting`;
+    `SealedPush::pack_to_home`, `pack_homed_as`), with a hold taken for the record (`vcs_store::hold_for_record`).
+  - The record is version 4 when both are homed and still the push's (`SealedPush::record`), else version 2 inline.
+  - A replay reads a version-4 record's pack from the store by its identity: the stepped replay a window a unit
+    (`git_replay`), the whole one at once. Both contents are held for the record when nothing holds them, and a
+    rebuild fetches either from its region homes before the record's replay begins (`names_to_fetch`).
+- **Measured** (adas-mac-studio.local-2, release; B1's diagnostic with version 4 on, homing driven as the edge drives
+  it, over v1.5.0's push): the record 141 bytes (about 11 MiB before); the landing step 13.2 ms (27 ms), of which
+  the entry and record 1.8 ms, the store's commit 1.2 ms, the apply 8.1 ms (the greens' commit and the work's encode,
+  w-engine's; the log's write of the entry no longer O(the pack)).
+- **Tests.** `slates-server` `vcs_store::tests::t_a722_a_version_4_record_names_its_names_and_its_pack_by_their_contents_identity`
+  (the encoding; version 3 refused), `t_a722_a_version_4_record_replays_from_its_names_and_pack_by_identity_and_refuses_without_them`,
+  `git_push::tests::t_a724_a_pushs_record_names_its_names_once_they_are_homed_in_the_region` (every record version
+  4), `daemon::tests::t_a727b_a_crash_after_an_entry_naming_content_by_identity_loses_nothing_it_names` (a crash
+  after the entry, the successor replaying the version-4 record from its image); `slates-server --lib` 1,037 passed
+  (one dialer test failed once under the suite and passed twice alone).
+
 ### A-722's record v4, part B — rows by pack place: a landed object is where it lies in its push's pack (2026-11-20, w-git for UI goal 93; main's pack-homing ruling: content once, the store's bytes a push must not grow)
 - **Why.** A push's staging put every object new to the repository in the content store inflated (git/git's v1.5.0:
   309 MiB for a 9.4 MiB pack), its row naming that copy. Main's ruling for record v4: the landed objects are places
