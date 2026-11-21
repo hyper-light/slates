@@ -232,10 +232,15 @@
 > before its replay (its row; its `Names` checked against the record's identity; its `Payload` found under the record's
 > pack identity), puts what the content store lacks, and notes the sequence, so the next landing takes the last one
 > named + 1 and a changeset landed past the register's head is overwritten (main's ruling). The one shared test store:
-> `crate::test_store`. Owed (w-git, C5 part 2): a daemon without `--vcs-store` refusing git's creation, typed; versions
-> 2 and 5's sequence 0 removed (no register-held history); git's tests onto the shared store; the replay reading the
-> pack a piece at a time through `StorePacks` rather than whole; the push's pack held twice in RAM until it lands (its
-> own buffer and the content store's windows).
+> `crate::test_store`. C5 part 2a BUILT (2026-11-21, w-git): a daemon without `--vcs-store` refuses git's creation,
+> `Unsupported` naming `--vcs-store` (one rule for the three tools; `repository::tests::a_daemon_without_a_store_refuses_
+> mercurial_and_subversion_naming_the_flag` holds all three), and git's tests run on store-backed daemons through the
+> one helper (`test_store::audit_on_stored_shard[_configured]`, `audit_daemon_stored`, `audit_daemon_of_stored`,
+> `create`; the HTTP edge's every daemon a `StoredDaemon`). Owed (w-git, C5 part 2b): versions 2 and 5's sequence 0
+> removed (no register-held history: a homing or landing that falls short refuses the push); the replay reading the pack
+> a piece at a time through `StorePacks` rather than whole; the push's pack held twice in RAM until it lands (its own
+> buffer and the content store's windows); a node whose store lacks a record's changeset reading its names from their
+> region homes, held by a test of its own (the rebuild test now reads the node's store).
 > The store grant's durable record BUILT (2026-11-20): the `G` row, recorded at the store's first open and
 > checkpointed before it serves, found as first recorded after a crash; every landing's header names its id
 > (`StoreHandle::grant`). Owed: the row's audit position in the control partition's audit log (`AuditKind` has no
@@ -365,6 +370,13 @@
 > **A-722 part 4a (2026-11-20, w-git).** BUILT: a git record's pack replayed a turn at a time (read in chunks, objects
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
+>
+> **A-800 (2026-11-21, w-fed-move; goal 86b's lost replies).** BUILT: every place a reply carried home can be lost is
+> counted apart, and the silent ones now resend: a reply task dropped while its shard's state is borrowed, a forwarded
+> reply whose run meets a borrowed state (and one a retention refusal dropped after it was taken, now delivered), a
+> `deliver` that cannot borrow; handed and run are counted at each end of the hop. Open: which site lost the 3,383 at
+> 100k is for main's rerun to name (the counters print from the client node). Leading candidate, fixed since by A-798
+> (`931e52ed`): a lost kick left a reply's control message unseen on a parked shard; handed equal to run confirms it.
 >
 > **A-797 (2026-11-21, w-fed-move; goal 86b, found by use: 100,000 clients over the Linux kernel).** FIXED: the green's
 > owner answers a batch of work asks within its step budget and hands the rest back (one batch had held its shard 1,055
