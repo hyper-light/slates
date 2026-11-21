@@ -31,3 +31,18 @@
   section per extent needs the anchor to hold each extent's handle across a daemon restart (a new anchor<->daemon
   handle hand-off) and Windows builds/tests, which are main's. QUESTION: is Windows inside R2 (then I build it and
   put the Windows runs in run-requests), or a separate item?
+
+## R2 Windows arm -- LANDED 2026-11-20 (main's ruling 18:40; fast landing 19:25)
+- Commit on origin/main: 20bef898c (merge b30a0ab6d). Each content pool extent a section of its own on Windows, held by
+  the anchor across a restart (new hold kind WHAT_CONTENT_EXTENT, bound class HoldBounds::extents = partitions x 64),
+  made before any claim, closed when wholly free (commit back, g226's measurement).
+- Mac focused tests on the landing commit (big Studio): anchor handles:: 18/18 (incl. new class test), mem shared:: 6/6,
+  server content_pool config:: 11/11, api 3/3, fmt clean. Windows cross-check `cargo xwin clippy --target
+  x86_64-pc-windows-msvc -- -D warnings`: clean in this piece's files; main's own 5 remain (winfsp.rs unused HostFs
+  import; work_files.rs type_complexity + field assignment; verbs.rs assemble_post_state complexity; vcs_svn/tests.rs
+  unused HOOK_PATIENCE_NS), which stop the cli crate's Windows check.
+- Windows by-use (red at the base, green here, across processes): run-requests.md, for w-lint on jupiter.
+- OPEN in R2 (found 19:45, in GAPS): the macOS give-back of a destroyed volume's burst depends on the machine --
+  passed quiet (1,648 -> 123 MiB), kept 1,366 MiB on adas-macbook-pro-2 later and 335 MiB on the big Studio at 5,433
+  free pages, at A-789's own commit too. Likely the idle release's keep (commitments + headroom + pressure hold) keeping
+  the free extents. Next for me, before R3.

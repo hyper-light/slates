@@ -122,6 +122,8 @@ Plan: a section per pool extent, closed when wholly free; the anchor holds each 
   close own handle, release the anchor's hold (section closes -> commit returned, g226), make again in background.
 - Red first, across processes: a cli/server test (Windows) that an extent's section survives a daemon SIGKILL (anchor
   holds it) and that a released extent's commit goes back. Builds/tests -> run-requests.md (w-lint, jupiter offline).
+- LANDED 20bef898c (merge b30a0ab6d): Windows arm. Branches/worktrees removed (only ~/slates-work/w-sizing-main left).
+- OPEN R2 macOS: give-back depends on machine state (see close note); investigating the idle release's keep next.
 - Then R3 with w-hg + w-store.
 
 ## Queue
