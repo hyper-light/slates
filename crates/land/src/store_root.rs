@@ -13,12 +13,15 @@
 //! The store's crates (`slates-store`, and the vendored engine and block layer under it) never open a path: they are
 //! handed the files this module opens, and write into them in place. R1 still holds: disk is written only under a
 //! grant, here a standing one, and the hermeticity tracer counts writes under a granted store root as granted.
-//! Windows' counterpart (an `NtCreateFile` relative to the root's handle) is owed with the store's Windows lane.
+//! Windows' counterpart (an `NtCreateFile` relative to the root's handle) is owed with the store's Windows lane; until
+//! it is written every call there refuses `Unsupported`.
 
 use std::fs::File;
+#[cfg(unix)]
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
 use rustix::fs::{Mode, OFlags};
 
 use crate::grant::TargetIdentity;
@@ -49,9 +52,11 @@ pub enum StoreRootRefusal {
   Io {
     /// The call.
     op: &'static str,
-    /// The OS error.
-    errno: rustix::io::Errno,
+    /// The OS's error code.
+    code: i32,
   },
+  /// This platform has no store directory yet (Windows' handle-relative counterpart is owed, GAPS).
+  Unsupported,
 }
 
 impl std::fmt::Display for StoreRootRefusal {
@@ -62,7 +67,10 @@ impl std::fmt::Display for StoreRootRefusal {
         f.write_str("the directory is not the one the store's grant names")
       }
       Self::BadName => f.write_str("a store file's name must be one plain name"),
-      Self::Io { op, errno } => write!(f, "{op}: {errno}"),
+      Self::Io { op, code } => write!(f, "{op}: OS error {code}"),
+      Self::Unsupported => {
+        f.write_str("a version-control store directory is not supported on this platform yet")
+      }
     }
   }
 }
@@ -72,11 +80,58 @@ impl std::error::Error for StoreRootRefusal {}
 /// The granted directory of a repository's store, open: every file of the store is opened relative to it.
 #[derive(Debug)]
 pub struct StoreRoot {
+  #[cfg(unix)]
   dir: OwnedFd,
   path: PathBuf,
   target: TargetIdentity,
 }
 
+/// Windows has no store directory yet: every call refuses [`StoreRootRefusal::Unsupported`] (its handle-relative
+/// counterpart is owed, GAPS), so the store's crates build there and a daemon given `--vcs-store` refuses at its start.
+#[cfg(windows)]
+impl StoreRoot {
+  /// Refused: no store directory on this platform yet.
+  pub fn open(_path: &Path, _grant: &StoreGrant) -> Result<Self, StoreRootRefusal> {
+    Err(StoreRootRefusal::Unsupported)
+  }
+
+  /// Refused: no store directory on this platform yet.
+  pub fn identify(_path: &Path) -> Result<TargetIdentity, StoreRootRefusal> {
+    Err(StoreRootRefusal::Unsupported)
+  }
+
+  /// The directory's identity.
+  pub fn target(&self) -> &TargetIdentity {
+    &self.target
+  }
+
+  /// The path a store file is named under in messages.
+  pub fn path_of(&self, name: &str) -> PathBuf {
+    self.path.join(name)
+  }
+
+  /// Refused: no store directory on this platform yet.
+  pub fn create(&self, _name: &str) -> Result<File, StoreRootRefusal> {
+    Err(StoreRootRefusal::Unsupported)
+  }
+
+  /// Refused: no store directory on this platform yet.
+  pub fn open_file(&self, _name: &str) -> Result<File, StoreRootRefusal> {
+    Err(StoreRootRefusal::Unsupported)
+  }
+
+  /// Refused: no store directory on this platform yet.
+  pub fn free_bytes(&self) -> Result<u64, StoreRootRefusal> {
+    Err(StoreRootRefusal::Unsupported)
+  }
+
+  /// Refused: no store directory on this platform yet.
+  pub fn exists(&self, _name: &str) -> Result<bool, StoreRootRefusal> {
+    Err(StoreRootRefusal::Unsupported)
+  }
+}
+
+#[cfg(unix)]
 impl StoreRoot {
   /// Opens the directory `path` that `grant` names. Refused when the walk is (as a landing target's), and when the
   /// directory found is not the grant's.
@@ -117,7 +172,7 @@ impl StoreRoot {
     let file = self.open_at(name, OFlags::CREATE | OFlags::EXCL)?;
     rustix::fs::fsync(&self.dir).map_err(|errno| StoreRootRefusal::Io {
       op: "flush the store's directory after a create",
-      errno,
+      code: errno.raw_os_error(),
     })?;
     Ok(file)
   }
@@ -125,6 +180,16 @@ impl StoreRoot {
   /// Opens the existing file `name` in the directory for reading and writing.
   pub fn open_file(&self, name: &str) -> Result<File, StoreRootRefusal> {
     self.open_at(name, OFlags::empty())
+  }
+
+  /// The bytes free to this process on the directory's file system now (`fstatvfs` of its handle: the blocks available
+  /// to an unprivileged user times the fragment size): the disk a store's grant can grow into.
+  pub fn free_bytes(&self) -> Result<u64, StoreRootRefusal> {
+    let stat = rustix::fs::fstatvfs(&self.dir).map_err(|errno| StoreRootRefusal::Io {
+      op: "read the store's file system's free space",
+      code: errno.raw_os_error(),
+    })?;
+    Ok(u64::from(stat.f_bavail).saturating_mul(u64::from(stat.f_frsize)))
   }
 
   /// Whether the file `name` exists in the directory (without following a symlink).
@@ -135,7 +200,7 @@ impl StoreRoot {
       Err(rustix::io::Errno::NOENT) => Ok(false),
       Err(errno) => Err(StoreRootRefusal::Io {
         op: "look up a store file",
-        errno,
+        code: errno.raw_os_error(),
       }),
     }
   }
@@ -147,7 +212,7 @@ impl StoreRoot {
       rustix::fs::openat(&self.dir, name, flags, Mode::RUSR | Mode::WUSR).map_err(|errno| {
         StoreRootRefusal::Io {
           op: "open a store file",
-          errno,
+          code: errno.raw_os_error(),
         }
       })?;
     Ok(File::from(fd))
@@ -155,6 +220,7 @@ impl StoreRoot {
 }
 
 /// Refuses a name that is not one plain name.
+#[cfg(unix)]
 fn plain(name: &str) -> Result<(), StoreRootRefusal> {
   if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
     return Err(StoreRootRefusal::BadName);
@@ -163,10 +229,11 @@ fn plain(name: &str) -> Result<(), StoreRootRefusal> {
 }
 
 /// The walked directory's identity under `key`.
+#[cfg(unix)]
 fn identity_of(dir: &OwnedFd, key: String) -> Result<TargetIdentity, StoreRootRefusal> {
   let stat = rustix::fs::fstat(dir.as_fd()).map_err(|errno| StoreRootRefusal::Io {
     op: "stat the store's directory",
-    errno,
+    code: errno.raw_os_error(),
   })?;
   Ok(TargetIdentity {
     key: key.into_boxed_str(),

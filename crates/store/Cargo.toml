@@ -17,12 +17,16 @@ mantle-crc = { path = "../../vendor/mantle/crc" }
 # The engine the store's rows live in (vendor/mantle; A-767 item 3).
 mantle-engine = { path = "../../vendor/mantle/engine" }
 slates-land = { workspace = true }
+# The bounded channel shards reach the store's owner thread by, and the thread's spawn (`owner.rs`).
+slates-rt = { workspace = true }
 
 [dev-dependencies]
 # The per-path read form's example reads Mercurial's own history through slates-hg's revlog reader.
 slates-hg = { workspace = true }
 # The simulated file with power-loss semantics the log's crash tests run on.
 hyper-block = { path = "../../vendor/hyper-raft/hyper-block", features = ["sim"] }
+# The process's resident memory the memory test bounds (`tests/memory.rs`).
+slates-machine = { workspace = true }
 
 [lints]
 workspace = true

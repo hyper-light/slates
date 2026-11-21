@@ -1477,11 +1477,13 @@ dependencies = [
  "slates-client",
  "slates-db",
  "slates-ipc",
+ "slates-land",
  "slates-machine",
  "slates-mem",
  "slates-merge",
  "slates-rt",
  "slates-server",
+ "slates-store",
  "slates-transport",
  "slates-vfs",
  "slates-wire",
@@ -1920,6 +1922,7 @@ version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "blake3",
+ "hyper-block",
  "hyper-datagram",
  "hyper-seal",
  "libc",
@@ -1953,6 +1956,7 @@ dependencies = [
  "slates-rt",
  "slates-seal",
  "slates-ssh",
+ "slates-store",
  "slates-svn",
  "slates-test-seeds",
  "slates-transport",
@@ -1981,6 +1985,8 @@ dependencies = [
  "mantle-engine",
  "slates-hg",
  "slates-land",
+ "slates-machine",
+ "slates-rt",
 ]
 
 [[package]]
