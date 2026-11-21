@@ -275,6 +275,84 @@ struct Kept {
   out: usize,
 }
 
+/// The kept runs of a re-anchor, looked up by chunk and offset ([`Value::remapped`]). Sorted once by (chunk, offset) and
+/// binary-searched when no two runs of one chunk overlap (the common case), so remapping a value of n pieces against k
+/// runs costs O((n + k) log k). Until 2026-11-21 every piece scanned every run, O(n k): a refined re-indent of a 2 MiB
+/// file (92,354 ops) re-anchored in over 3.5 s of one step in a debug build, and the shard's watchdog ended the daemon
+/// (A-787 part 2's red; 10,000 ops 0.4 s, 40,000 ops 22.5 s). Runs that overlap are looked up by the scan, which picks
+/// the first in order, so the result is the scan's either way.
+struct KeptIndex<'k> {
+  kept: &'k [Kept],
+  /// `kept`'s indices sorted by (chunk, offset); empty when runs overlap (then the scan).
+  order: Vec<usize>,
+}
+
+impl<'k> KeptIndex<'k> {
+  fn new(kept: &'k [Kept]) -> KeptIndex<'k> {
+    let mut order: Vec<usize> = (0..kept.len()).collect();
+    order.sort_by_key(|index| kept.get(*index).map(|run| (run.chunk, run.at)));
+    let disjoint = order.windows(2).all(|pair| {
+      match (
+        pair.first().and_then(|a| kept.get(*a)),
+        pair.get(1).and_then(|b| kept.get(*b)),
+      ) {
+        (Some(a), Some(b)) => a.chunk != b.chunk || a.at.saturating_add(a.len) <= b.at,
+        _ => true,
+      }
+    });
+    if !disjoint {
+      order.clear();
+    }
+    KeptIndex { kept, order }
+  }
+
+  fn run(&self, position: usize) -> Option<&'k Kept> {
+    self
+      .order
+      .get(position)
+      .and_then(|index| self.kept.get(*index))
+  }
+
+  /// The position in `order` of the first run after (chunk, cursor).
+  fn after(&self, chunk: usize, cursor: usize) -> usize {
+    self.order.partition_point(|index| {
+      self
+        .kept
+        .get(*index)
+        .is_some_and(|run| (run.chunk, run.at) <= (chunk, cursor))
+    })
+  }
+
+  /// The run of `chunk` covering offset `cursor`, the first in `kept`'s order.
+  fn covering(&self, chunk: usize, cursor: usize) -> Option<&'k Kept> {
+    if self.order.is_empty() {
+      return self.kept.iter().find(|run| {
+        run.chunk == chunk && run.at <= cursor && cursor < run.at.saturating_add(run.len)
+      });
+    }
+    let before = self.after(chunk, cursor).checked_sub(1)?;
+    self
+      .run(before)
+      .filter(|run| run.chunk == chunk && cursor < run.at.saturating_add(run.len))
+  }
+
+  /// The least offset of a run of `chunk` past `cursor`.
+  fn next_start(&self, chunk: usize, cursor: usize) -> Option<usize> {
+    if self.order.is_empty() {
+      return self
+        .kept
+        .iter()
+        .filter(|run| run.chunk == chunk && run.at > cursor)
+        .map(|run| run.at)
+        .min();
+    }
+    self
+      .run(self.after(chunk, cursor))
+      .filter(|run| run.chunk == chunk)
+      .map(|run| run.at)
+  }
+}
+
 /// What a re-anchor did ([`reanchor`]): the path's new latest value, the earlier values' piece lists before and after
 /// (the engine's running totals move by the difference), the superseded latest value's list before and after (counted
 /// as current until the new value replaces it), and the blocks it let go with the bytes it copied out of them.
@@ -289,6 +367,8 @@ pub(crate) struct Reanchored {
   pub(crate) blocks_cut: u64,
   /// The bytes copied out of those blocks: the runs the change overwrote or removed, which earlier versions still read.
   pub(crate) bytes_cut: usize,
+  /// The values the re-anchor walked: the path's history (A-803's measure of what a change costs as history grows).
+  pub(crate) values: usize,
 }
 
 /// A run of the bytes the engine's `apply` writes ([`Value::applied_runs`]): a run of the value it keeps, or bytes of the
@@ -637,16 +717,13 @@ impl Value {
   /// This value's pieces with every run a kept run covers moved to the same bytes in `anchor` (the new block's chunk)
   /// and the rest left where they are, in order, unmerged and unreferenced (the caller builds the value with
   /// [`Value::push`]).
-  fn remapped(&self, kept: &[Kept], anchor: usize) -> Vec<Piece> {
+  fn remapped(&self, kept: &KeptIndex<'_>, anchor: usize) -> Vec<Piece> {
     let mut out = Vec::with_capacity(self.pieces.len());
     for piece in &self.pieces {
       let end = piece.at.saturating_add(piece.len);
       let mut cursor = piece.at;
       while cursor < end {
-        let covering = kept.iter().find(|run| {
-          run.chunk == piece.chunk && run.at <= cursor && cursor < run.at.saturating_add(run.len)
-        });
-        if let Some(run) = covering {
+        if let Some(run) = kept.covering(piece.chunk, cursor) {
           let stop = end.min(run.at.saturating_add(run.len));
           out.push(Piece {
             chunk: anchor,
@@ -655,13 +732,7 @@ impl Value {
           });
           cursor = stop;
         } else {
-          let stop = kept
-            .iter()
-            .filter(|run| run.chunk == piece.chunk && run.at > cursor)
-            .map(|run| run.at)
-            .min()
-            .unwrap_or(end)
-            .min(end);
+          let stop = kept.next_start(piece.chunk, cursor).unwrap_or(end).min(end);
           out.push(Piece {
             chunk: piece.chunk,
             at: cursor,
@@ -806,8 +877,9 @@ pub(crate) fn reanchor(
     },
   );
   // Every new piece referenced before any old one is released, so no chunk a value still names is freed between.
+  let index = KeptIndex::new(&kept);
   for value in &mut values {
-    let pieces = value.remapped(&kept, anchor);
+    let pieces = value.remapped(&index, anchor);
     let rebuilt = Value::rebuilt(chunks, pieces);
     let old = std::mem::replace(&mut **value, rebuilt);
     old.release(chunks, blocks);
@@ -826,7 +898,9 @@ pub(crate) fn reanchor(
     .map(|value| value.list_bytes())
     .fold(0usize, usize::saturating_add);
   let latest_after = values.last().map_or(0, |value| value.list_bytes());
+  let walked = values.len();
   Some(Reanchored {
+    values: walked,
     value: latest_value,
     lists: (lists_before, lists_after),
     latest_list: (latest_before, latest_after),
@@ -905,9 +979,13 @@ fn cut_superseded_blocks(
     let cut = chunks.add(owned);
     for value in values.iter_mut() {
       for piece in value.pieces.iter_mut().filter(|piece| piece.chunk == chunk) {
+        // The union is sorted by start and disjoint: the run covering the piece is the last starting at or before it,
+        // found by a binary search (a scan per piece was O(pieces x runs), A-787 part 2's red).
         let Some((start, _, place)) = union
-          .iter()
-          .find(|(start, end, _)| *start <= piece.at && piece.at < *end)
+          .partition_point(|(start, _, _)| *start <= piece.at)
+          .checked_sub(1)
+          .and_then(|last| union.get(last))
+          .filter(|(_, end, _)| piece.at < *end)
         else {
           continue;
         };
@@ -939,6 +1017,68 @@ mod tests {
   use super::*;
   use crate::dims::Files;
   use proptest::prelude::*;
+
+  /// The remap as it was before [`KeptIndex`]: each piece's cursor looked up by a scan of every kept run, the first in
+  /// order covering it. The oracle the index must equal.
+  fn remapped_by_scan(value: &Value, kept: &[Kept], anchor: usize) -> Vec<Piece> {
+    let mut out = Vec::new();
+    for piece in &value.pieces {
+      let end = piece.at + piece.len;
+      let mut cursor = piece.at;
+      while cursor < end {
+        let covering = kept
+          .iter()
+          .find(|run| run.chunk == piece.chunk && run.at <= cursor && cursor < run.at + run.len);
+        if let Some(run) = covering {
+          let stop = end.min(run.at + run.len);
+          out.push(Piece {
+            chunk: anchor,
+            at: run.out + (cursor - run.at),
+            len: stop - cursor,
+          });
+          cursor = stop;
+        } else {
+          let stop = kept
+            .iter()
+            .filter(|run| run.chunk == piece.chunk && run.at > cursor)
+            .map(|run| run.at)
+            .min()
+            .unwrap_or(end)
+            .min(end);
+          out.push(Piece {
+            chunk: piece.chunk,
+            at: cursor,
+            len: stop - cursor,
+          });
+          cursor = stop;
+        }
+      }
+    }
+    out
+  }
+
+  proptest! {
+    #![proptest_config(slates_test_seeds::unseeded(ProptestConfig::default()))]
+
+    /// A-787 part 2's red (a re-anchor O(pieces x runs)): do remap generated pieces against generated kept runs over a
+    /// few chunks, disjoint or overlapping, by the index; expect exactly what the scan makes.
+    #[test]
+    fn the_indexed_remap_is_the_scans(
+      pieces in prop::collection::vec((0usize..3, 0usize..200, 1usize..40), 0..40),
+      runs in prop::collection::vec((0usize..3, 0usize..200, 0usize..40, 0usize..500), 0..40),
+    ) {
+      let value = Value {
+        pieces: pieces.iter().map(|&(chunk, at, len)| Piece { chunk, at, len }).collect(),
+        len: 0,
+        own: None,
+      };
+      let kept: Vec<Kept> = runs.iter().map(|&(chunk, at, len, out)| Kept { chunk, at, len, out }).collect();
+      let index = KeptIndex::new(&kept);
+      let indexed = value.remapped(&index, 9);
+      let scanned = remapped_by_scan(&value, &kept, 9);
+      prop_assert_eq!(indexed, scanned);
+    }
+  }
 
   /// A generated op over a file of `len` bytes: kind, offset share, length, and the post-state offset.
   fn op_of(kind: u8, at: u64, len: u64, src: u64) -> Op {

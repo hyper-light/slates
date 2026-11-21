@@ -349,6 +349,9 @@ fn a_large_delta_is_measured_and_written_a_window_a_call() {
       Exporting::Wrote(2) => calls += 1,
       Exporting::Wrote(_) => {}
       Exporting::Done => break,
+      Exporting::Waiting(wanted) => {
+        panic!("the records hold every text, yet the export waited for {wanted:?}")
+      }
     }
     largest = largest.max(out.len() - before);
   }

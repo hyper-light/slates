@@ -2081,8 +2081,8 @@ fn take_for_slice(slot: &mut crate::state::VolumeSlot, granted: &mut GrantedRun)
 }
 
 /// Takes an overlay's directory host from its volume's slot for the landing's writer, which is built inside it (one host
-/// per volume): `None` when the slot holds none, or holds an S3 base's host, which stays in the slot, since a landing
-/// writes a host directory and never an S3 base (§4.15 "An S3 base", A-555).
+/// per volume): `None` when the slot holds none, or holds a tree host (A-774), which stays in the slot, since a landing
+/// writes a host directory.
 fn take_disk_host(slot: &mut crate::state::VolumeSlot) -> Option<OsHost> {
   match slot.host.take()?.into_disk() {
     Ok(host) => Some(host),
@@ -3291,9 +3291,6 @@ fn answer_of(error: HostError) -> HostAnswer {
       slates_vfs::host::OsCode::Win32(code) => HostAnswer::Win32 { code },
       slates_vfs::host::OsCode::Errno(errno) => HostAnswer::Errno { errno },
     },
-    // A landing writes a directory host, which never answers a pending fetch (an S3 base's, A-524); were one to, it is
-    // a refusal no errno names.
-    HostError::Pending(_) => HostAnswer::Errno { errno: 0 },
   }
 }
 

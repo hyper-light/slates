@@ -1489,11 +1489,17 @@ impl ShardContext {
       // A poller's question may consume its signal (the daemon's doorbell flag is swapped to false
       // when asked), so the spin wakes the pollers it finds ready rather than only reporting them:
       // asked here and dropped, a ring would be lost until the next one (`tests/pollers.rs`).
-      if self.has_inbound()
+      // The driver first, then the rings and the pollers (A-798's lost wake): a harvest takes the kicks pending with
+      // the completions and reports only the completions, and a kick is sent after its message is published, so a
+      // message whose kick this harvest took is visible to the looks after it. Looked at before the harvest, a message
+      // published between the look and the harvest lost its kick to the harvest, and a spin ending on that turn parked
+      // with the message unseen and no kick left to wake it.
+      let harvested = self.harvest_io();
+      if harvested
+        || self.has_inbound()
         || self
           .with_inner(|inner| inner.driver.has_pending() || self.wake_ready_pollers(inner))
           .unwrap_or(false)
-        || self.harvest_io()
       {
         self.with_inner(|inner| {
           inner.counters.spin_hits = inner.counters.spin_hits.saturating_add(1)

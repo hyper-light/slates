@@ -55,7 +55,7 @@
 //! policy lets it reach the repository at all, nothing where not (`vcs_policy::reaches`). A commit's drive runs over
 //! those sources; a hook it waits for passes where the repository configures none at its point and is refused where one
 //! is (none runs yet); its accepted work lands through the owner's commit step (A-698's
-//! `repository::svn_commit::commit_work`, which the `svn+ssh://` tunnel calls too), and `close-edit` is answered with
+//! `repository::svn_commit::land_work`, which the `svn+ssh://` tunnel calls too), and `close-edit` is answered with
 //! `commit-info` or the step's refusal.
 
 use std::cell::{Cell, RefCell};
@@ -691,6 +691,9 @@ enum Next {
     /// The bytes taken.
     consumed: usize,
   },
+  /// A drive waits for a text's piece read through the node's changeset store (C2 stage B part 2): fetch it, then
+  /// call again with the same input.
+  Fetch(slates_svn::reads::Wanted),
   /// End the connection.
   End,
 }
@@ -715,6 +718,9 @@ struct Conversation {
   /// ([`Connection::fetching`]; A-749, §4.17.1 "A fetch's answer" rule 4): given back as it ends, and before the
   /// conversation moves to another shard.
   held: Option<SvnHold>,
+  /// The text piece a drive waited for and the conversation fetched (C2 stage B part 2), held until the next call has
+  /// read it.
+  fetched: Option<slates_svn::reads::Wanted>,
 }
 
 /// The repository a conversation opened: its id and name on the owner shard.
@@ -758,6 +764,7 @@ async fn converse(stream: TcpStream, seat: Seat, limits: Limits, bound_ns: u64) 
     principal: None,
     commits: 0,
     held: None,
+    fetched: None,
   };
   go_on(stream, conversation, seat).await;
 }
@@ -786,8 +793,12 @@ async fn go_on(stream: TcpStream, mut conversation: Conversation, seat: Seat) {
       Stepped::Go => {}
       Stepped::End => return,
       Stepped::Elsewhere(found, located) => {
-        // A hold is given back on the shard that holds its records.
+        // A hold is given back on the shard that holds its records, and so is a fetched piece.
         conversation.held = None;
+        if let Some(wanted) = conversation.fetched.take() {
+          let _ =
+            crate::state::with_state(|state| crate::vcs_store::svn_texts::let_go(state, wanted));
+        }
         migrate(Moving {
           stream: stream.into_owned(),
           conversation,
@@ -814,6 +825,10 @@ async fn step(
     let _doing = slates_rt::futures::doing("vcs_svn::answer");
     answer(conversation, out)
   };
+  // The piece the last wait fetched was read by this call (C2 stage B part 2).
+  if let Some(wanted) = conversation.fetched.take() {
+    let _ = crate::state::with_state(|state| crate::vcs_store::svn_texts::let_go(state, wanted));
+  }
   if !out.is_empty() && stream.write_all(out).await.is_err() {
     return Stepped::End;
   }
@@ -840,6 +855,17 @@ async fn follow(
       return Stepped::Go;
     }
     Next::Again => return Stepped::Go,
+    Next::Fetch(wanted) => {
+      let Some(repository) = conversation.opened.as_ref().map(|opened| opened.id) else {
+        return Stepped::End;
+      };
+      // A piece the node's store cannot give ends the conversation: the drive would wait for it again.
+      if !crate::vcs_store::svn_texts::fetch_piece(repository, wanted).await {
+        return Stepped::End;
+      }
+      conversation.fetched = Some(wanted);
+      return Stepped::Go;
+    }
     Next::End => return Stepped::End,
     Next::Challenge(consumed) => {
       consume(conversation, consumed);
@@ -1054,6 +1080,7 @@ fn next_of(
       | Turn::Unserved { consumed, .. },
     ) => Next::Consume(consumed),
     Ok(Turn::Wrote) => Next::Again,
+    Ok(Turn::Waiting(wanted)) => Next::Fetch(wanted),
     Ok(Turn::Opened { open, consumed }) => match find_repository(open.url) {
       Ok(found) => Next::Locate { found, consumed },
       Err(unserved) => {
@@ -1112,7 +1139,7 @@ fn begin_commit(conversation: &mut Conversation, out: &mut Vec<u8>) -> bool {
 }
 
 /// Judges the lock verb the client asked for over the repository's sources on its owner, lands the lock entries it
-/// makes through the owner's step (a `Record::Locks`, durable as a revision is; `repository::svn_commit::record`), and
+/// makes through the owner's step (a `Record::Locks`, durable as a revision is; `repository::svn_commit::land_record_with`), and
 /// answers it (A-693 part 2; `slates_svn::serve` `locks`), running the repository's hooks where `svnserve` runs them
 /// (A-730, `fs-wrap.c`): pre-lock or pre-unlock for each path the session may write, before it is judged (a refusal is
 /// that path's answer; pre-lock's token is the lock's), then post-lock or post-unlock once over the paths changed, its
@@ -1147,6 +1174,14 @@ async fn lock(stream: &TcpStream, conversation: &mut Conversation, out: &mut Vec
   else {
     return false;
   };
+  // The repository's landing turn, held from the judgment to the entries' landing, so no other landing moves the lock
+  // table between them (C2, `svn_commit::landing`).
+  let Some(id) = conversation.opened.as_ref().map(|opened| opened.id) else {
+    return false;
+  };
+  let Some(turn) = svn_commit::landing::turn(id).await else {
+    return false;
+  };
   let undrawn = Cell::new(false);
   let mut draw = || {
     let mut token = [0u8; slates_svn::lock::UUID_BYTES];
@@ -1173,7 +1208,7 @@ async fn lock(stream: &TcpStream, conversation: &mut Conversation, out: &mut Vec
     Some(Ok(entries)) => entries,
     Some(Err(_)) | None => return false,
   };
-  let landed = land_locks(conversation, entries, undrawn.get());
+  let landed = land_locks(conversation, (turn, entries), undrawn.get()).await;
   let post = match conversation.connection.locks_landed(landed, out) {
     Ok(post) => post,
     Err(_) => return false,
@@ -1195,9 +1230,9 @@ async fn lock(stream: &TcpStream, conversation: &mut Conversation, out: &mut Vec
 
 /// Lands a lock verb's `entries` through the owner's step (a `Record::Locks`): `Ok` for none, or the step's refusal;
 /// refused where a new token could not be drawn (`undrawn`).
-fn land_locks(
+async fn land_locks(
   conversation: &Conversation,
-  entries: Vec<slates_svn::lock::LockEntry>,
+  (turn, entries): (svn_commit::landing::Turn, Vec<slates_svn::lock::LockEntry>),
   undrawn: bool,
 ) -> Result<(), (u32, String)> {
   let (Some(opened), Some(principal)) = (
@@ -1217,21 +1252,25 @@ fn land_locks(
     return Ok(());
   }
   land_record(
+    turn,
     (principal, opened.id),
     slates_svn::commit::record::Record::Locks(entries),
   )
+  .await
   .inspect_err(|_| {
     crate::fleet::count_refusal(LOCKS_REFUSED);
   })
 }
 
-/// Lands `record` on `repository`'s logs by `principal` through the owner's step (`svn_commit::record`): `Ok`, or the
-/// step's refusal as the connection answers it.
-fn land_record(
+/// Lands `record` on `repository`'s store and register by `principal` holding its landing `turn`
+/// (`svn_commit::land_record_with`): `Ok`, or the step's refusal as the connection answers it.
+async fn land_record(
+  turn: svn_commit::landing::Turn,
   (principal, repository): (&Principal, RepositoryId),
   record: slates_svn::commit::record::Record,
 ) -> Result<(), (u32, String)> {
-  crate::state::with_state(|state| svn_commit::record(state, (principal, repository), record))
+  svn_commit::land_record_with(turn, (principal, repository), record)
+    .await
     .unwrap_or(Err(svn_commit::Uncommitted::NotHeld))
     .map_err(|refused| refused.failure())
 }
@@ -1258,6 +1297,13 @@ async fn revision_property(
   else {
     return false;
   };
+  // The landing turn, held from the judgment to the record's landing (C2): no other change lands in between.
+  let Some(id) = conversation.opened.as_ref().map(|opened| opened.id) else {
+    return false;
+  };
+  let Some(turn) = svn_commit::landing::turn(id).await else {
+    return false;
+  };
   let Conversation {
     connection,
     opened,
@@ -1275,7 +1321,7 @@ async fn revision_property(
     Some(Ok(None)) => return true,
     Some(Err(_)) | None => return false,
   };
-  let landed = land_record((principal, opened.id), record);
+  let landed = land_record(turn, (principal, opened.id), record).await;
   let post = match connection.revision_property_landed(landed, out) {
     Ok(Some(post)) => post,
     Ok(None) => return true,
@@ -1721,7 +1767,7 @@ async fn run_svn_hook(
   }
 }
 
-/// Lands the accepted `work` through the owner's commit step (A-698's `repository::svn_commit::commit_work`, which the
+/// Lands the accepted `work` through the owner's commit step (A-698's `repository::svn_commit::land_work`, which the
 /// `svn+ssh://` tunnel calls too, at the owner's instant) and answers `close-edit` with `commit-info` or with the
 /// step's refusal as its failure: whether the conversation goes on, the answer in `out`.
 async fn land(

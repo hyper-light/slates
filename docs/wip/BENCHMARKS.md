@@ -15865,6 +15865,43 @@ the same draws in one process.
 - Found on this history and fixed first (c5d746f8b): a text that comes back (A, B, A) made a chain loop when its row
   was replaced; a `T` row is now its first landing's.
 
+## Mercurial's one-changeset pull against `hg serve`: 4.2 s to 0.24 s (the index's runs merged, a pull made from what it sends) (goal 93 perf; main's order of 2026-11-21 00:22; 2026-11-21)
+
+**What changed.** A profile of a one-changeset pull of Mercurial's whole history (24.95 s at load 15 to 31, release main
+948711996) found two steps that scale with the history: every index lookup walked every run, since the learned merge
+had no caller (155 runs after the import, a lookup visiting 123 at p50, 11.8 µs; 2 runs, 0.6 µs after one merge;
+`crates/hg/examples/index_runs.rs`), and a pull whose client holds the history walked every manifest and file row for
+their links (7.2's `fastpathlinkrev`). Fixed in 94ff89fe5 (the merge made a table at a time and kept up on the owner
+shard, `vcs_store::index_upkeep`; the link walk only for a clone of every head) and f0ca841c7 (git's index on the same
+upkeep).
+
+**Command.** `KEEP_LOGS=DIR SERVERS="stock slates" SLATES=BIN SLATES_FILL=import crates/cli/bench/hg_scale.sh
+~/.cache/w-interop/bin/hg ~/.cache/w-perf/hg-src WORK 3 1800`, the harness starting slates with `--vcs-store` (7189ce280;
+release build of 7189ce280: 94ff89fe5 and that harness line), stock Mercurial 7.2, interleaved stock then slates each
+run, Mercurial's own repository (57,036 changesets, 307 tags). adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores),
+2026-11-21 02:00 to 02:43 PST, load 14 at the start, 5.6 to 7.8 at the end (shared). Studio-1, which main named for
+timing, was offline in kiln; the big Studio's slow link carries no part of a loopback run. Logs:
+`~/.cache/w-perf/prof/hg-ab-20261121T100112/` on the Studio. Every slates clone verified (`hg verify`) and its changesets
+and tags identical to the source.
+
+| Step (seconds) | `hg serve` runs 1 / 2 / 3 | best | slates runs 1 / 2 / 3 | best |
+|---|---|---|---|---|
+| one-changeset pull | 0.189 / 0.192 / 0.271 | 0.189 | 0.303 / 0.301 / 0.243 | **0.243** |
+| one-changeset push | 0.200 / 0.221 / 0.177 | 0.177 | 0.672 / 0.872 / 0.651 | 0.651 |
+| `clone -U` | 9.244 / 12.222 / 7.729 | 7.729 | 53.445 / 56.637 / 53.928 | 53.445 |
+| `clone -U --stream` (this build's stream: every text whole) | 0.495 / 0.570 / 0.840 | 0.495 | 335.3 / 352.2 / 337.6 | 335.3 |
+| filled (stock: push; slates: import) | 13.0 / 15.9 / 12.4 | 12.4 | 142.4 / 141.6 / 144.8 | 141.6 |
+
+What it says:
+- **The pull: 4.2 s (w-interop, 907c246ac) and 24.95 s (948711996, loaded) to 0.243 s best**, 1.3 times `hg serve`'s
+  0.189 s. Ten times faster than `hg serve` in wall time is not reachable for a one-changeset pull: stock hg's own client
+  (its Python start, discovery's round trips, writing the changeset) is most of `hg serve`'s 0.19 s, so the bar is the
+  server's own share, measured next by the daemon's time a request.
+- **The stream** in this build still sends every text whole (335 s, worse than the 46.8 s measured an hour before at
+  load 4; owed an explanation with the fixed stream's A/B). Its fix (c870c8f80: each revision its stored delta, read in
+  place) serves a repository whose revisions the store keeps, so its A/B fills slates by a push, next.
+- **`clone -U` is 6.9 times slower** (53 against 7.7 s; 24 against 16.4 s in w-interop's run): w-hg's clone item, sent.
+
 ## Record version 3 against version 2: a push's latency with its names homed first (A-724 piece 8c; main's order of 2026-11-20; 2026-11-20)
 
 - **The builds:** v2 = f95edf68e (the switch off), v3 = 5ca050628 (the switch on, landed as 08fba4007), release, each built
@@ -16459,6 +16496,7 @@ timed 64 MiB requests after a warm-up, 40 in all; a 6 s `/usr/bin/sample` of the
 | main `55038e0` (before) | 3.70 | 874 / 1,066.5 / 1,131 | 61.9–65.5 ms | 604 | 798 | 344 | 189 / 197 |
 | `e39f4ae` (after: frames encoded in place, packets sealed in one reused buffer) | 3.05 to 2.96 | 961 / 1,103 / 1,217 | 58.9–62.5 ms | 491 | 852 | 356 | 224 / 237 |
 | `6f9261a` (then: stream data carried as spans of the sender's bytes until acknowledged) | 3.33 to 3.14 | 927 / 1,092 / 1,206 | 59.3–63.2 ms | 433 | 811 | 382 | 247 / 233 |
+| `cc5a1ad` (then: received packets opened in place, stream bytes delivered once and taken by move) | 2.34 to 2.55 | 966 / 1,308 / 1,382 | 49.4–53.3 ms | 220 | 609 | 212 | 187 / 145 |
 
 What it means:
 - The lane does about 1.1 GB/s on loopback, one direction, one session, on a quiet Mac.
@@ -16470,8 +16508,14 @@ What it means:
   stream data as a span (stream, offset, length), encoded from the sender's buffer when the packet is built and again
   if it is resent. `memmove` fell 12% more (491 to 433, 28% from 604). Goodput is level with the first step (median
   1,103 to 1,092 MB/s, inside run-to-run noise): the copy was banned, not slow.
-- What the profile names now, in order: `sendto` (one syscall a datagram), `recvfrom` (likewise), AES-GCM, and the
-  receiver's copies (the frame decode's and the reassembly's) inside `memmove`.
+- The third step removed the receiver's copies. Each packet is opened where it arrived (it was copied whole, then its
+  payload again), its frames are applied from there (each stream frame's bytes were copied into a frame), its stream
+  bytes are delivered once into their stream's delivered bytes (they were copied into a segment and again into each
+  read), and a message is taken whole by move when it completes (each read chunk was copied onto it). The median rose
+  20% (1,092 to 1,308 MB/s) and a 64 MiB transfer's p50 fell from about 61 to 51 ms. The sample took fewer samples in
+  all, so compare `memmove` with `sendto`: 0.53 of it before, 0.36 now.
+- What the profile names now: `sendto` and `recvfrom`, one syscall a datagram, then AES-GCM. On the receive side the
+  one copy left besides the delivery is the socket buffer's into each datagram's own allocation (`crate::receive`).
 
 ## A work over a green costs its divergence: the brief's grid, before and after (w-work-cow P2; Ada's close order; 2026-11-20)
 - **Machine.** Adas-Mac-Studio.local (runner d1323898), macOS arm64, 32 cores, 96 GB, shared with other agents (not
@@ -16909,3 +16953,272 @@ read too (`push.build.turns`, both sides).
 384 µs; 189.6 µs, 393 µs; 184.5 µs, 2,788 µs; 437.0 µs, 2,484 µs. **Not met:** the median is 3.7-8.7x the 50 µs goal,
 and p999 is under 1 ms in 3 of 5 rounds. Linux was not measured: adacachy's run froze in its cgroup at load 68-71
 (`do_freezer_trap`) and was stopped unbuilt.
+
+## Subversion on the changeset store (C2 stage A): an import's cost a landing, svnsync's replay, an update and a checkout, and the import's memory (P6, P7 of Ada's close list; 2026-11-20)
+
+- **Machine, tree, load.** adas-macbook-pro-2.local (M-series, 18 cores, 128 GB), load 20 to 30 with other agents'
+  builds. Main 72576cb1f (C2 stage A: every record lands on the node's store before the register names it) with the
+  measurement's own additions (this change). Release, one run.
+- **Command.** `CARGO_INCREMENTAL=0 cargo test --release -p slates-server --lib --no-run`, then
+  `SLATES_SVN_REPLAY_DUMP=~/.cache/w-svn-gitgit/git-2000.dump SLATES_SVN_REPLAY_LAST=300 SLATES_SVN_UPDATE=1000:1500
+  /usr/bin/time -l <binary> measure_svnsync_replay_range_over_the_tunnel --ignored --nocapture --test-threads 1`
+  (git-2000.dump: git/git's first 2,000 commits as a format-3 dump, 458,114,318 bytes).
+
+| What | Measured | Before C2 (same test, earlier today) |
+|---|---|---|
+| import of 2,000 revisions | 24.5 s, 2,001 changesets landed | 8.2 s at load ~40, 46.5 s at load ~43 (no store) |
+| svnsync `replay-range 1 300` over the tunnel | 0.73 s, 2.4 ms a revision, 27.3 MB | 3.41 s (11.4 ms) and 0.51 s for 10 |
+| `update` r1000 to r1500 over the tunnel | 0.14 s, 2.3 MB, the edit whole | refused: the script's fault (below) |
+| checkout at r1500 over the tunnel | 0.46 s, 24.6 MB, the edit whole | refused: the script's fault |
+| resident: start, after the import, after the replay | 480 MiB, 4,065 MiB, 4,076 MiB | 478 MiB, 5,582 MiB, 5,566 MiB |
+| the records' texts | 34.8 MB | 34.8 MB |
+
+- **What it says.** (1) Each imported revision now lands as a changeset of its own, one flush each: about 8 ms a
+  revision of the import's 24.5 s against the 8.2 s before the store (load differs; the 2,001 landings are counted).
+  C2 stage C, an import as one sliced changeset, is what takes that back. (2) The server's side of P6's update (stock
+  svn's 2.7 s at w-bugs' run 8, 5.6 s at run 13) is 0.14 s for 500 revisions: the gap is outside the server's drive.
+  The stock-client leg runs on the big Studio. (3) The import holds about 3.6 GiB above the process's start for a 458 MB
+  dump whose records keep 34.8 MB of texts: P7's daemon peak is not the records; still to attribute.
+- **The earlier refusal was the measurement's.** The scripted update sent the client's closing `( success ( ) )` with
+  its report, so it arrived during the server's drive, which svnserve answers E210004 "Successful edit status returned
+  too soon" and aborts (slates as svnserve). The test now hands it over as a run of its own once the server waits.
+
+## A-697's release bench at 64 to 320 MiB: exit 4 found and fixed (2026-11-20, w-shared; main's close list)
+
+`SLATES_A697_BENCH_FRESH=1 SLATES_A697_BENCH_MIB=<n> SLATES_A697_BENCH_RUNS=1 cargo test --release -p slates-server --test
+fleet bench_a697 -- --ignored --nocapture --test-threads=1`, one run each.
+
+Before (main `90e9b72`, this MacBook at load 42 to 60; and main `6f29c8d`, Studio-1 at load 3.7, 128 MiB): exit 4 at
+128, 256 and 320 MiB (exit 101 at 64 MiB on the MacBook, with a 1,652 ms poll). The watchdog: shard 1 spinning 1,009 to
+1,201 ms of CPU in one poll of the session's first submit. `/usr/bin/sample`: 997 of the shard's busy samples at the top
+of the stack in `slates_merge::derive::split_at`, the deriver's walk of a flat piece list for every op.
+
+After (`ffb2a65`, the deriver's blocked piece list; Studio-1, load 2.9 to 4.2), every size passes:
+
+| MiB | kind | wall | compose | forward | judge | append | place | recompute |
+|---|---|---|---|---|---|---|---|---|
+| 64 | holder | 514 ms | 42.7 | 428.2 | 3.9 | 63.2 | 123.0 | 2.3 |
+| 64 | local | 330 ms | 36.4 | — | 3.9 | 63.7 | 165.3 | 4.0 |
+| 128 | holder | 1,025 ms | 87.6 | 848.9 | 8.9 | 126.2 | 242.0 | 4.7 |
+| 128 | local | 650 ms | 75.1 | — | 8.0 | 125.6 | 322.8 | 7.8 |
+| 256 | holder | 3,093 ms | 175.5 | 2,737.0 | 16.8 | 236.8 | 492.5 | 9.4 |
+| 256 | local | 1,319 ms | 148.1 | — | 16.1 | 256.7 | 657.1 | 16.2 |
+| 320 | holder | 3,497 ms | 237.6 | 3,046.5 | 21.5 | 296.8 | 593.3 | 11.2 |
+| 320 | local | 1,618 ms | 179.1 | — | 20.2 | 314.8 | 805.9 | 19.5 |
+
+(Phases in ms.) What remains: the holder's forward is most of its wall time, about 105 to 150 MB/s, against the
+transport's 1.3 GB/s on the bulk row; and the control shard's beat task ran 520 to 1,381 ms late during the larger
+forwards (near misses: the watchdog's own beat held).
+
+## The client's reply wait, A/B on every platform: parking at once wins Linux arm64's loaded p99, not x86_64's or macOS's (84a; g222; 2026-11-21)
+
+**What it is.** Main's ruling of 2026-11-20 on Linux's 1 ms band (the client's own reply spin holding the CPU its woken
+shard needs, GAPS 84a): A, the library's wait (spin for the wake estimate, then park; `d799eff4b`, which also makes
+`edit_merge_bench` wait as the library does and fails a loaded p99 over 1 ms on Linux), against B, the sync wait parking
+at once unless its caller names a spin (`7ffa0d8ac`). C (spin only while a core is free) was not built: B is the simpler
+arm and the A/B decides whether C is needed.
+
+**Command.** CI run 44876741078 (branch `diag-measurer-g222-18`), each arm built release from its `git archive`, rotated
+each round, 3 rounds: `edit_merge_bench --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict`
+(Linux inside A-224's `systemd-run` lane with its fsync writer; elsewhere the harness's spinners), then `--quiet-only
+--files 10 --files 1000 --form accept --form conflict` and `provision_bench` (R9's uncontended spinning p99). Each figure
+is the invocation's median of 3 runs. µs unless marked.
+
+| platform | arm | loaded accept p99 | loaded conflict p99 | loaded accept p999 | quiet accept p50 / p99 | R9 spinning p99 |
+|---|---|---|---|---|---|---|
+| Linux arm64 | A | 3,162 / 2,160 / 2,099 | 2,843 / 2,205 / 2,759 | 5,000 / 3,994 / 3,805 | 86–92 / 129–142 | 36.8 / 56.0 / 33.4 |
+| Linux arm64 | B | **360 / 414 / 426** | 1,815 / 713 / 747 | 1,030 / 1,015 / 4,039 | 100–101 / 139–149 | 32.6 / 33.0 / 37.7 |
+| Linux x86_64 | A | 5,639 / 5,869 / 5,243 | 6,199 / 6,116 / 5,900 | 6,199 / 7,363 / 6,141 | 93–100 / 133–162 | 46.0 / 35.3 / 47.8 |
+| Linux x86_64 | B | 3,225 / 3,276 / 3,209 | 4,001 / 5,944 / 5,462 | 5,886 / 5,421 / 5,923 | 109–121 / 168–176 | 31.6 / 34.5 / 37.7 |
+| macOS (CI, 3 CPUs) | A | 8,049 / 8,262 / 7,724 | 8,038 / 8,076 / 7,805 | 8,507 / 11,792 / 8,177 | 274–374 / 521–1,030 | 190 / 486 / 293 |
+| macOS (CI, 3 CPUs) | B | 8,077 / 8,021 / 8,025 | 8,294 / 8,936 / 8,080 | 10,088 / 8,248 / 8,673 | 229–338 / 551–644 | 350 / 267 / 170 |
+| Windows x86_64 | A | 223 / 318 / 202 | 296 / 289 / 179 | 42,922 / 37,813 / 40,732 | 116 / 187–191 | — |
+| Windows x86_64 | B | 246 / 234 / 269 | 192 / 195 / 180 | 32,408 / 39,245 / 33,171 | 133–134 / 201–218 | — |
+| Windows arm64 | A | 336 / 347 / 290 | 320 / 322 / 322 | 18,160 / 42,367 / 436 | 116–120 / 160–168 | — |
+| Windows arm64 | B | 174 / 172 / 171 | 123 / 125 / 128 | 30,195 / 247 / 19,937 | 120–123 / 172–176 | — |
+
+- B wins Linux arm64's loaded accept p99 (2.1–3.2 ms → 0.36–0.43 ms) and its gate passes 2 of 3 rounds (A 0 of 3); it
+  halves Windows arm64's p99 and leaves Windows x86_64's even. It does not bring Linux x86_64 (3.2 ms) or macOS (8 ms)
+  under 1 ms, and no arm's p999 is under 1 ms anywhere (Linux 1.0–7.4 ms, macOS 8–12 ms, Windows 0.2–59 ms).
+- B costs the quiet median 10–30 µs on Linux and Windows (not on macOS) and leaves R9's uncontended spinning p99 where
+  it was (its form names its own spin): Linux 31.6–37.7 µs against A's 33.4–56.0; macOS's CI runner misses R9 in both.
+- **B landed as A-799 (2026-11-21), its measured cost the quiet median: +10–30 µs** (Linux arm64 86–92 → 100–101 µs,
+  x86_64 93–100 → 109–121, Windows x86_64 116 → 133–134; macOS not slower).
+- So the client's spin was Linux arm64's band; Linux x86_64's and macOS's loaded tails have other holds (macOS: the
+  busy path's kevent nap, whose fix w-provision-gate measured and rejected on the provisioning path, a38630375).
+
+## Where a Subversion import's memory is: git-2000 attributed by region (P7 of Ada's close list, A-772's daemon peak; 2026-11-21)
+
+- **Machine, tree, command.** As "Subversion on the changeset store" above (adas-macbook-pro-2.local, release, load 15
+  to 25), on main 40c3f8d1e with the measurement's attribution (this change): after the import, the shard's own figures
+  (`slates_mem::heap::stats`, the shard budget, its arena's extents, the stores' charges, the records' bytes) and
+  `vmmap -summary` of the test process. The dump is read once inside the history and dropped once the simulated host
+  holds it (a first run held it three more times through the history's clones: 4.0 GB footprint, 2.5 GB of it freed
+  large blocks).
+
+| Region after the import of 2,000 revisions (458 MB dump) | Resident |
+|---|---|
+| process footprint (vmmap) | 3.0 GB; 2.5 GB after the replay |
+| freed large blocks the allocator keeps (`MALLOC_LARGE (empty)`) | 1.5 GB: the simulated host's 458 MB dump, freed at the import's end, and ~1 GB of the import's own large transients |
+| live small allocations (`MALLOC_SMALL`) | 593 MB |
+| the shard's arena (`shared memory`) | 840 MB; the shard budget charges 440 MB of it, all as retention |
+| live large allocations | 57 MB |
+| the records' own bytes (texts, properties, index) | 35.5 MB |
+| the register's references | 62 KB |
+
+- **What it says.** A 458 MB dump whose history the records keep in 35.5 MB leaves the shard holding ~1.4 GB live: 440
+  MB charged as retention (the green's kept versions) inside an 840 MB-resident arena, and 593 MB of small allocations
+  not yet attributed by owner; plus ~1 GB of transient large buffers the allocator keeps. None of it is texts the store
+  could hold instead (C2 stage B part 2 would not move it). Next: the green's retained versions for a Subversion green,
+  the small heap by owner, and the import's large transients (a revision's whole texts, its record's encoding, the
+  reader's buffer) held once (Ada's MEMORY SIZING rule).
+- **Measured and rejected (2026-11-21): folding a Subversion green's history to its readers at each landing.** Sixteen
+  revisions rewriting a 16 KiB file left 246,150 bytes of green history, and the fold
+  (`merge_service::settle_green_retention_leaving` with room for all of it, after each landing) took it under one
+  text; but a copy from an older revision is the green's `Copy` of that version (A-586), so the import of
+  `part2.dump` refused `CopyRefused { case: VersionFolded }` at revision 12 (`svn_export` tests). The green's retained
+  versions are what serve such copies. Freeing them needs a copy's source tree built from the records when the green
+  has folded past it; until then the retention stays.
+
+## 85a's two named costs, counted and A/B'd: the exchange on the data shard, and the held reply's wake (g228; 2026-11-21)
+
+**Command (the contract):** the live-shipping measurement, release, five rounds a run; arms interleaved. Linux:
+GitHub CI on `ubuntu-latest` (4 cores, 15 GiB, load 1.1-1.9), `diag-g228-live-2` to `-9`, each arm built from its
+commit (the workflow on those branches only; results pushed to `diag-results/`). macOS: adas-mac-studio.local-2 (32
+cores, load 9-17), CARGO_BUILD_JOBS=4. The hop counters are sums over a run; the per-write figures below divide them by
+the writes, which a single long write skews (see the correction).
+
+### The exchange on the data shard: measured and rejected
+
+With one shard a daemon, the volume's owner shard is the control shard, so an entry is sent and answered on the data
+shard with no control-shard hop: the most per-shard sessions could gain, measured before building them (arm
+`72af2d1ed`, the test's `SHARDS` constant only). Added at the median, µs, rounds 1-5:
+
+| host | two shards | one shard |
+|---|---|---|
+| ubuntu-latest (63d19f184 against 72af2d1ed) | 205.1, 210.1, 222.7, 197.5, 210.3 | 194.5, 173.8, 213.5, 219.0, 178.5 |
+| Studio (d80175d3f against 72af2d1ed) | 190.8, 188.2, 183.8, 177.0, 180.7 | 200.5, 200.8, 194.4, 192.3, 194.5 |
+
+On Linux about 15 µs better at the median with the spreads overlapping; on macOS about 10 µs worse (the hop back to the
+owner nearly vanishes, 7 to 1 µs, but the dispatch competes with the write on the one shard, 23 to 31 µs out). Neither
+justifies per-shard transport sessions.
+
+### The held reply's wake: not a cost; a run's one long first write, averaged
+
+Counted on main (b72aff1f, Studio, load 13-17): the reply's wake read 62.7-65.0 µs a write every round, and 68.2-68.6
+on ubuntu-latest, holds kept or declined. Split by stamps (fold to its wake of the reply; the wake to the reply's poll;
+the wait's end): 0.5-1.4, 54.8-64.6 and 1.3-3.3 µs a write, the reply woken by the fold itself in 2,050 of 2,051 writes,
+one step and about two task polls between the fold and the reply, no driver wait, no long step. **Correction:** the
+first held reply of each run waited 100.45 ms (the record period: its volume's head placed), and a second one in about a
+round in five; spread over 2,051 writes that is 49 µs a write, which is the whole constant (112.8 ms of `reply_poll`
+in a round: 100.45 ms for one write, about 6 µs for each of the others; the first logged replies, 5.8-7.8 µs). A reply
+is answered about 6-8 µs after its fold.
+
+**Measured and rejected: a held reply polled without a park while its answer is due** (e9f66a253, ubuntu-latest):
+added 224.9, 217.5, 214.9, 204.7 µs against parked 209.1, 210.3, 203.8, 214.2, 202.4 (its fifth round printed nothing);
+there was no wake to remove.
+
+**Reading.** Neither named cost is where 85a's median goes. What remains a write, from these runs: the entry's build on
+the owner (about 45-90 µs), the hop to the control shard (10-35), the exchange with the holders (about 50-170, the holder's
+own serve 12-25 of it), and the hop back (1-14); those are means, which the same kind of skew may inflate, so the next
+count is per-write percentiles of each hop.
+
+**Per-write medians of each hop on main e1f246ca8** (the hops' histograms, landed the same day; the contract command,
+release, five rounds). Microseconds, p50 (bucket upper bounds, within an eighth above the exact value):
+
+| host | added p50 | build | to control | exchange (holder's serve) | to owner | reply |
+|---|---|---|---|---|---|---|
+| ubuntu-latest, 4 cores, load 1.4-1.6, holds kept (diag-g228-live-10) | 112.2, 113.4, 107.5, 106.7, 112.8 | 24.6 | 8.2-9.2 | 57.3-61.4 (7.7-9.2) | 3.3-3.6 | 7.2-8.2 |
+| Studio, 32 cores, load 13-17, holds declined | 168.5, 195.0, 186.0, 189.2, 205.4 | 22.5-26.6 | 24.6-30.7 | 106.5-114.7 (9.2-12.3) | 6.1-8.2 | 8.2-20.5 |
+
+**Reading.** The exchange is half the median added cost and more: about 59 µs on Linux and 107 on macOS, of which the
+holder's own serve is 8-12. The transport bench makes a 4 KiB write durable on two hosts in 22.6-27.2 µs (above), so
+about 30 µs of the Linux exchange is the daemon's own (the lane, the session's borrow and return, the control shards'
+receive), and on macOS the two control shards' parked wakes add about 50 more. The entry's build is next, about 25 µs on
+both. 85a's 50 µs median is 2.2x away on Linux and 3.7x on macOS.
+
+## A Subversion import on the real daemon: the peak against the dump, by kind (P7, A-772's daemon peak; 2026-11-21)
+
+- **Machine, tree, command.** adas-macbook-pro-2.local (18 cores, 128 GB), load 17 to 35. Main 73cd23c63 with this
+  change's measurement. `SLATES_SVN_IMPORT_DUMP=~/.cache/w-svn-gitgit/git-2000.dump cargo test --release -p slates-cli
+  --test svn_interop -- --ignored an_import_measured --nocapture` (`an_import_measured`: an anchor and a two-shard
+  release daemon holding a changeset store, `slates repository create --tool svn`, `slates repository import` of the
+  dump, the daemon's resident bytes sampled by `ps` every pause, then `slates status --memory`). One run read whole (a
+  first run's memory report agreed; its headline line was cut by the command's own `tail`).
+
+| What | Measured |
+|---|---|
+| import of git-2000 (2,000 revisions, 437 MiB dump) | exit 0, 26.2 s |
+| daemon RSS before, at its peak, after | 57 MiB, 1,570 MiB, 1,563 MiB (3.6 times the dump) |
+| segment (the register's log and snapshot), resident | 782 MiB; the log appended 838 MiB during the import, the snapshot's chain entries 39 MiB and checkpoints 44 MiB |
+| content object, resident | 0.8 MiB |
+| the records' texts (in-process run above) | 34.8 MB |
+
+- **What it says.** The daemon's own allocator gives large blocks back, so the test binary's 1.5 GB of freed blocks is
+  not the daemon's. Half the peak is the segment: the green's chain entries carry each revision's file bytes into the
+  register's log, so a Subversion repository's history is held three ways: the records' deltas (35 MB, RAM), the
+  store's changesets (disk, C2), and the green's chain in the register (782 MiB resident). The rest is the heap
+  (~790 MiB). The chain's copy of the texts is the largest; naming texts by identity in a Subversion green's chain,
+  their bytes the store's, is the change that moves it (not svn's alone: the green's chain is the register's).
+
+## A 500 MB Subversion commit, re-measured on the changeset store (P8 of Ada's close list; 2026-11-21)
+
+- **Machine, tree, command.** The big Mac Studio (adas-mac-studio.local-2, 32 cores, 96 GB), stock svn 1.15.0; main
+  73cd23c63 (C2 stage A and B part 1) from an HTTPS clone, kiln r8 (load 8 to 14) and r9 (load 5 to 9). Command as in
+  "A 500 MB Subversion commit over svn:// and DAV" above (`a_large_commit_measured`, release).
+
+| Run | Scheme | Answer | Seconds | Daemon RSS peak | Longest shard step |
+|---|---|---|---|---|---|
+| r9 | `svn://` | Committed revision 1 | 11.2 | 4,067 MiB | 1.91 s |
+| r9 | `http://` (DAV) | Committed revision 1 | 13.9 | 4,066 MiB | 1.91 s |
+| r8 | `http://` (DAV) | E160007 "No such transaction '0-1'": the daemon restarted during the commit | 12.0 | 4,068 MiB | 0.87 s at the recovery's replay |
+
+- **What it says.** Both schemes take the 500 MB text where load leaves the landing's one step room (8 times the text at
+  the peak, 12 times before the intake work and C2). The text is held three times after the commit: the content store's
+  arena (524 MB), and twice in the register's log, the green's chain entry (524 MB) and its checkpoint (524 MB), a 1 GB
+  log tail the recovery replays in one step. The landing's longest step is 1.91 s, the green's apply of the increment
+  in one step: at load 8 to 14 (r8) the daemon restarted within it and the client's transaction was gone. Owed (GAPS):
+  the green's apply a slice at a time (w-engine's 1b) and the chain naming the text by identity rather than carrying
+  it (P7's finding, the register's), each of them outside the Subversion path.
+
+## svnsync from slates over svn://, git-2000 (P7 of Ada's close list, A-772; 2026-11-21)
+
+- **Machine, tree, command.** The big Mac Studio (adas-mac-studio.local-2, 32 cores, 96 GB), load 3 to 7, stock svn
+  1.15.0; main 1bfe51f88 from an HTTPS clone (kiln r11). `SLATES_SVN_SYNC_DUMP=~/.cache/w-svn-replay/git-2000.dump
+  cargo test --release -p slates-cli --test svn_interop -- --ignored an_svnsync_measured --nocapture`
+  (`an_svnsync_measured`: a release anchor and daemon holding a store, the dump imported through the CLI, then stock
+  `svnsync init` and `svnsync sync` into a local FSFS mirror, timed, the daemon's RSS sampled). One run.
+
+| Scheme | Import | svnsync | A revision | Mirror | Daemon RSS before, peak |
+|---|---|---|---|---|---|
+| `svn://` | 13.5 s | 270.7 s, exit 0 | 135.4 ms | r2000 | 1,637 MiB, 1,686 MiB |
+| `http://` | 13.5 s | `svnsync init` refused E200007 (fixed since, 2dafcad02); `sync` needs the DAV `replay-report` (GAPS) | | | |
+
+- **What it says.** w-interop's matrix took 1,068 s over svn:// for the same history (0.54 s a revision); stock
+  svnsync now mirrors it in 270.7 s, a quarter. The server's replay of a revision is 2.4 to 2.8 ms of it (in-process,
+  above), so most of the 135 ms a revision is outside the server's drive (the client's commit into FSFS, the round
+  trips). Over HTTP the mirror cannot run until the DAV site serves `replay-report` (recorded in GAPS, not built).
+
+## A path's history re-anchored in O((n + k) log k): 80,000 ops judged in 90 ms, was 22.5 s (A-787 part 2's red; 2026-11-21)
+
+A refined re-indent puts tens of thousands of content ops on one path. The engine's judge re-anchors that path's history
+(`history::reanchor`), and two of its steps scanned a list per piece:
+- `Value::remapped` scanned every kept run;
+- `cut_superseded_blocks` scanned the union of runs.
+Both are now binary searches, and `remapped` falls back to the scan when runs overlap, so its result is the scan's
+(property test `the_indexed_remap_is_the_scans`). `green_post_state`, which had ended with exit 4 when the shard's
+watchdog saw a 3.5 s step in a debug build, passes 8 of 8 in 5.2 s.
+
+Measure: `Green::submit` of one increment re-indenting every line of one file (`lines` lines, two ops a line after
+refinement), timed once each, debug build, this Mac (macOS arm64), 2026-11-21 ~00:35 PST, by a scratch test in
+`crates/merge/src/refine/tests.rs` (not committed).
+
+| ops | before (main 73cd23c63) | after (2c32af2b5) |
+|---|---|---|
+| 10,000 | 0.40 s | 11 ms |
+| 20,000 | 1.43 s | 23 ms |
+| 40,000 | 5.64 s | 44 ms |
+| 80,000 | 22.5 s | 90 ms |
+
+Before, each doubling of ops quadrupled the time; after, it doubles. The first step alone (the remap index) gave 50 ms /
+195 ms / 775 ms / 3.22 s, still quadratic, until the union's binary search removed the second scan.

@@ -175,6 +175,10 @@ impl Drop for Anchor {
 /// ports), and its issuer surface's variables, where this platform names them ([`PRINTS_ISSUER_SURFACE`]).
 struct Started {
   _anchor: Anchor,
+  /// The daemon's changeset store (`--vcs-store`), which a Mercurial repository needs (main's ruling of 2026-11-20:
+  /// a daemon without one refuses to create one); declared after the anchor, so the daemon is gone before it is
+  /// removed.
+  _store: Scratch,
   lines: Vec<String>,
   issuer: Option<Vec<(String, String)>>,
 }
@@ -209,8 +213,10 @@ fn value_of(text: &str, key: &str) -> String {
 /// Starts `slates anchor` whose daemon is asked for `edges` (a flag and a loopback address whose port the system
 /// picks), reads what the anchor says until its daemon serves and, where this platform names one, the anchor has named
 /// its issuer surface ([`lines_until_served`]), waits until the daemon answers verbs steadily, and makes the root
-/// consensus group as a first start does (`slates bootstrap root`).
+/// consensus group as a first start does (`slates bootstrap root`). The daemon holds a changeset store in a fresh
+/// scratch directory (`--vcs-store`), as every daemon serving Mercurial must.
 fn start_anchor(instance: &str, edges: &[&str]) -> Started {
+  let store = Scratch::new("vcs-store");
   let mut child = Command::new(env!("CARGO_BIN_EXE_slates"))
     .args([
       "--instance",
@@ -221,6 +227,7 @@ fn start_anchor(instance: &str, edges: &[&str]) -> Started {
       SHARDS,
     ])
     .args(edges)
+    .args(["--vcs-store", &store.path])
     .stdout(Stdio::null())
     .stderr(Stdio::piped())
     .spawn()
@@ -236,6 +243,7 @@ fn start_anchor(instance: &str, edges: &[&str]) -> Started {
   assert_eq!(code, 0, "bootstrap root: {out}{err}");
   Started {
     _anchor: anchor,
+    _store: store,
     lines,
     issuer,
   }

@@ -2079,6 +2079,9 @@ pub struct PendingMergeRecord {
 pub(crate) const SUBMIT_JUDGE: (&str, &str) = ("merge.submit.judge", "merge.submit.judge_ns");
 /// See [`SUBMIT_JUDGE`]: the version's increment and verdict appended to the green's chain.
 pub(crate) const SUBMIT_APPEND: (&str, &str) = ("merge.submit.append", "merge.submit.append_ns");
+/// See [`SUBMIT_JUDGE`]: the retention a submit secures before its verdict, the settle's fold and the reservation's
+/// charge (A-803's measure).
+pub(crate) const SUBMIT_SECURE: (&str, &str) = ("merge.submit.secure", "merge.submit.secure_ns");
 /// See [`SUBMIT_JUDGE`]: from the version's enqueue to its record placed at the quorum, its inputs shipped first.
 pub(crate) const SUBMIT_PLACE: (&str, &str) = ("merge.submit.place", "merge.submit.place_ns");
 /// See [`SUBMIT_JUDGE`]: the versions placed, and the input shipments they took in all.

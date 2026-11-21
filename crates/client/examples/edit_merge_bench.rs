@@ -76,9 +76,8 @@ const GOAL_REQUIRED_NS: u64 = 1_000_000;
 /// thinking (the paced form of 2026-11-06, A-226; goal 84b's quiet-Mac run).
 static PAUSE: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
 
-/// Shape: how long the client spins for a reply before it parks: past the goal, so a reply inside
-/// the goal is taken without a wake (the provisioning bench's spinning form, AC-2.1).
-const SPIN_NS: u64 = GOAL_REQUIRED_NS;
+/// Whether a loaded form's p99 passed the required bound on a platform that gates it (84a): the run then exits 1.
+static LOADED_OVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Format: the percentiles reported, in parts per thousand.
 const PERCENTILES: &[(&str, u64)] = &[("p50", 500), ("p99", 990), ("p999", 999)];
 /// Format: parts per thousand.
@@ -216,7 +215,9 @@ impl Fixture {
   /// chain or the shard's budget cannot hold the seed): a measured answer, printed in the shape's place.
   fn new(instance: &str, tag: &str, files: usize) -> Result<Fixture, String> {
     let mut client = connect(instance);
-    client.spin_for(Some(SPIN_NS));
+    // The client waits as an agent's does: the library's own reply wait (84a: a spin that held the shard's CPU was the
+    // harness's, 1 ms, and the loaded band followed it).
+    client.spin_for(None);
     let green = client.create_green(&format!("{tag}-green"), false).unwrap();
     let (seed, _) = client.create_work(green, &format!("{tag}-seed")).unwrap();
     let mut model = BTreeMap::new();
@@ -790,7 +791,7 @@ fn print_growth(run: usize, key: &str, samples: &[u64]) {
 /// Every selected growth form, its runs, its rows and its goal lines.
 fn growth_sweep(instance: &str, selection: &Selection) {
   let mut client = connect(instance);
-  client.spin_for(Some(SPIN_NS));
+  client.spin_for(None);
   for form in selection.growth.iter().copied() {
     let mut rows: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     for index in 0..RUNS {
@@ -935,6 +936,11 @@ fn sweep(instance: &str, load: &str, selection: &Selection) {
       print_rows(&key, &rows);
       let p99 = median_of(&rows, "total_p99");
       let verdict = against_goal(p99);
+      // 84a's gate: a loaded full edit and merge under the required bound at its p99, on Linux, where the runner's
+      // lane is the controlled load (A-224); the other platforms record it until their lanes gate.
+      if load == "loaded" && cfg!(target_os = "linux") && p99 > GOAL_REQUIRED_NS {
+        LOADED_OVER.store(true, std::sync::atomic::Ordering::Relaxed);
+      }
       println!(
         "goal\tmerge.{key}: {:?} samples, total p50 {} ns, p99 {p99} ns, p999 {} ns, max {} ns: {verdict}",
         rows["samples"],
@@ -969,7 +975,7 @@ fn main() {
     .expect("the fixture explicitly creates its local consensus group");
   let cores = profile.facts.cpus_at_once();
   println!(
-    "edit and merge latency: {} {}, {shards} shards, {cores} cores, client spin {SPIN_NS} ns, {SAMPLES} samples x {RUNS} runs, edits of {EDIT_BYTES} B in files of {FILE_BYTES} B",
+    "edit and merge latency: {} {}, {shards} shards, {cores} cores, client wait the library's, {SAMPLES} samples x {RUNS} runs, edits of {EDIT_BYTES} B in files of {FILE_BYTES} B",
     std::env::consts::OS,
     std::env::consts::ARCH
   );
@@ -1012,4 +1018,10 @@ fn main() {
     );
   }
   daemon.stop();
+  if LOADED_OVER.load(std::sync::atomic::Ordering::Relaxed) {
+    eprintln!(
+      "edit_merge_bench: a loaded full edit and merge passed the required 1 ms at its p99 (84a)"
+    );
+    std::process::exit(1);
+  }
 }

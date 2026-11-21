@@ -26,7 +26,7 @@
 //! own socket or such a shared one (`Link`). Remaining connection work: an MTU budget (several frames
 //! per packet). The `Arc` here is rustls's config (D-8 exception 2), in `crate::handshake`.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::task::Poll;
 
 use rustix::net::SocketAddrV4;
@@ -41,7 +41,9 @@ use crate::handshake::{HandshakeError, Identity, client_connection, server_conne
 use crate::packet_number::{MAX_PACKET_NUMBER_BYTES, decode_packet_number, encode_packet_number};
 use crate::params::{ParamsError, TransportParameters};
 use crate::rtt::GRANULARITY_NS;
-use crate::session::{Frame, decode_frames};
+#[cfg(test)]
+use crate::session::decode_frames;
+use crate::session::{Frame, frame_refs, validate_frames};
 
 /// Format: RFC 9000 §14.1 — the smallest datagram every QUIC path must carry (1200 bytes); the fleet's
 /// frame cap and a receive queue's sizing derive from it.
@@ -244,11 +246,12 @@ fn checked_budget(shape: &ConnectionShape) -> Result<usize, EndpointError> {
     })
 }
 
-/// One of this end's exchanges: its stream once bound, and the reply bytes read so far.
+/// One of this end's exchanges: its stream once bound, and how many of its reply's bytes have arrived (the bytes
+/// themselves stay in the stream's reassembler until the reply is whole and taken, by move).
 #[derive(Debug)]
 struct Exchange {
   stream: Option<u64>,
-  reply: Vec<u8>,
+  received: usize,
 }
 
 /// An exchange begun but not yet bound to a stream ([`Endpoint::begin`]).
@@ -545,9 +548,9 @@ pub struct Endpoint {
   queued: VecDeque<Queued>,
   /// The id the next exchange takes.
   next_exchange: u64,
-  /// The peer's requests still arriving, by stream id, with the bytes read so far — bounded by the stream
-  /// credit this end extends and the flow-control window.
-  arriving: BTreeMap<u64, Vec<u8>>,
+  /// The peer's requests still arriving, by stream id (their bytes stay in their streams' reassemblers until each is
+  /// whole and taken, by move) — bounded by the stream credit this end extends.
+  arriving: BTreeSet<u64>,
   /// The peer's complete requests not yet handed to the caller, by stream id (each still holds its credit
   /// until replied to, so the peer cannot outrun the caller).
   ready: BTreeMap<u64, Vec<u8>>,
@@ -625,7 +628,7 @@ impl Endpoint {
       by_stream: BTreeMap::new(),
       queued: VecDeque::new(),
       next_exchange: 0,
-      arriving: BTreeMap::new(),
+      arriving: BTreeSet::new(),
       ready: BTreeMap::new(),
       completed: std::collections::BTreeSet::new(),
       progressed: std::collections::BTreeSet::new(),
@@ -682,7 +685,7 @@ impl Endpoint {
       by_stream: BTreeMap::new(),
       queued: VecDeque::new(),
       next_exchange: 0,
-      arriving: BTreeMap::new(),
+      arriving: BTreeSet::new(),
       ready: BTreeMap::new(),
       completed: std::collections::BTreeSet::new(),
       progressed: std::collections::BTreeSet::new(),
@@ -741,7 +744,7 @@ impl Endpoint {
       by_stream: BTreeMap::new(),
       queued: VecDeque::new(),
       next_exchange: 0,
-      arriving: BTreeMap::new(),
+      arriving: BTreeSet::new(),
       ready: BTreeMap::new(),
       completed: std::collections::BTreeSet::new(),
       progressed: std::collections::BTreeSet::new(),
@@ -1280,10 +1283,10 @@ impl Endpoint {
         Some((datagram, from)) if self.is_peer_close(&datagram, from) => {
           return Err(EndpointError::PeerClosed);
         }
-        Some((datagram, from)) => {
+        Some((mut datagram, from)) => {
           // A packet that unprotects under the 1-RTT keys is the server's confirmation: it has its keys,
           // so it received our final flight, and the handshake is complete both ways.
-          if from == self.peer && self.ingest(&datagram).is_ok() {
+          if from == self.peer && self.ingest(&mut datagram).is_ok() {
             return Ok(());
           }
           invalid = invalid.saturating_add(1);
@@ -1341,12 +1344,12 @@ impl Endpoint {
       }
       let period = backoff.min(self.handshake_probe_ceiling()).min(remaining);
       match self.recv_within(period).await? {
-        Some((datagram, from)) => {
+        Some((mut datagram, from)) => {
           // A datagram that unprotects under the 1-RTT keys is the client's own application traffic — it
           // has our confirmation and moved on, so the handshake is done. Ingest it, so the receive the
           // caller runs next finds it already in the connection rather than waiting a probe timeout for
           // the client's retransmit of it.
-          if from == self.peer && self.ingest(&datagram).is_ok() {
+          if from == self.peer && self.ingest(&mut datagram).is_ok() {
             return Ok(());
           }
           invalid = invalid.saturating_add(1);
@@ -1716,11 +1719,11 @@ impl Endpoint {
       return Err(EndpointError::PeerReset);
     }
     match self.recv_within(timeout_ns).await? {
-      Some((datagram, from)) => {
+      Some((mut datagram, from)) => {
         if !self.deaf {
           self.datagrams_received = self.datagrams_received.saturating_add(1);
         }
-        self.fold_or_discard(&datagram, from)?;
+        self.fold_or_discard(&mut datagram, from)?;
         Ok(true)
       }
       None => Ok(false),
@@ -1734,7 +1737,11 @@ impl Endpoint {
   /// does not open under the keys, is dropped as RFC 9000 §12.2 has it, never fatal to the session. Only
   /// a decoded packet whose frames are malformed (the peer broke the protocol), a closed session, or a
   /// socket refusal end the exchange.
-  fn fold_or_discard(&mut self, datagram: &[u8], from: SocketAddrV4) -> Result<(), EndpointError> {
+  fn fold_or_discard(
+    &mut self,
+    datagram: &mut [u8],
+    from: SocketAddrV4,
+  ) -> Result<(), EndpointError> {
     if !is_short_header(datagram) {
       self.discarded = self.discarded.saturating_add(1);
       // At most one answer per probe timeout: repeated raw traffic — a peer's retransmits, or a flood from
@@ -1757,6 +1764,9 @@ impl Endpoint {
       }
       return Ok(());
     }
+    // A packet is opened in place (`ingest`), and a failed open may leave its bytes rewritten, so the bytes a stateless
+    // reset is told by (its length and its last token's worth) are kept first: a few on the stack, nothing allocated.
+    let (length, tail) = (datagram.len(), crate::reset::tail_of(datagram));
     match self.ingest(datagram) {
       Ok(()) => Ok(()),
       Err(EndpointError::Header | EndpointError::Tls(_) | EndpointError::NotReady) => {
@@ -1766,7 +1776,7 @@ impl Endpoint {
         if self
           .conn
           .peer_reset_token()
-          .is_some_and(|token| crate::reset::is_reset(datagram, &token))
+          .is_some_and(|token| crate::reset::is_reset_tail(length, tail.as_ref(), &token))
         {
           self.reset_heard = true;
           return Err(EndpointError::PeerReset);
@@ -1821,16 +1831,23 @@ impl Endpoint {
   /// decode cursor (advancing it), feeds its frames to the connection, and folds an RTT sample in when the
   /// acknowledgement newly frees a packet (RFC 9002 §5.1: the round trip is now minus that packet's send
   /// time).
-  fn ingest(&mut self, datagram: &[u8]) -> Result<(), EndpointError> {
+  fn ingest(&mut self, datagram: &mut [u8]) -> Result<(), EndpointError> {
     if self.deaf {
       return Ok(());
     }
     let now = now_ns();
     let cid = self.connection_id()?;
     let keys = self.keys.as_mut().ok_or(EndpointError::NotReady)?;
-    let (pn, frames) = unprotect_packet(keys, &cid, self.rx_largest, datagram)?;
+    // Opened where it arrived, and its frames applied from there: a stream frame's bytes are offered to their stream
+    // straight from the opened packet, their one copy (MEMORY SIZING; main's ruling on the lane, 2026-11-20: before,
+    // the datagram was copied whole, its payload again, and each stream frame's bytes a third time, before reassembly).
+    let (pn, opened) = unprotect_in_place(keys, &cid, self.rx_largest, datagram)?;
+    let plaintext = datagram.get(opened).ok_or(EndpointError::Header)?;
+    validate_frames(plaintext).map_err(EndpointError::Frames)?;
     self.rx_largest = self.rx_largest.max(pn);
-    self.conn.handle_incoming(now, pn, &frames);
+    self
+      .conn
+      .handle_frames(now, pn, frame_refs(plaintext).map_while(Result::ok));
     // An acknowledgement of a packet sealed under the current keys confirms them, which lets the next key
     // update start (RFC 9001 §6.1).
     if let (Some(keys), Some(largest)) = (self.keys.as_mut(), self.conn.tx_largest_acked()) {
@@ -1908,7 +1925,7 @@ impl Endpoint {
       exchange,
       Exchange {
         stream: None,
-        reply: Vec::new(),
+        received: 0,
       },
     );
     self.queued.push_back(Queued {
@@ -1960,12 +1977,19 @@ impl Endpoint {
       .collect()
   }
 
-  /// The exchanges whose replies read more bytes since the last call and are still open: what a caller judging each
-  /// open exchange's progress reads instead of asking every one ([`Endpoint::reply_bytes_read`]). The forward lane
-  /// asked every one, each ask a drain of the session, and with about 20,000 forwards open a turn held its shard
-  /// 1.09 s (the f = 1 primary-kill rung, 2026-11-08).
+  /// The exchanges whose replies read more bytes, or whose requests had more bytes acknowledged, since the last call,
+  /// and are still open: what a caller judging each open exchange's progress reads instead of asking every one
+  /// ([`Endpoint::reply_bytes_read`]). The forward lane asked every one, each ask a drain of the session, and with about
+  /// 20,000 forwards open a turn held its shard 1.09 s (the f = 1 primary-kill rung, 2026-11-08). A request's bytes
+  /// acknowledged count since 2026-11-21: a forward carrying a large request made no progress before its reply began,
+  /// and its lane gave it up while its bytes still moved (main's ruling on the lane).
   pub fn take_progressed(&mut self) -> Vec<u64> {
     self.drain();
+    for stream_id in self.conn.take_send_progressed() {
+      if let Some(exchange) = self.by_stream.get(&stream_id).copied() {
+        self.progressed.insert(exchange);
+      }
+    }
     let progressed = std::mem::take(&mut self.progressed);
     progressed
       .into_iter()
@@ -1983,12 +2007,13 @@ impl Endpoint {
     if !self.conn.recv_stream_complete(stream) {
       return None;
     }
-    let exchange = self.exchanges.remove(&id)?;
+    self.exchanges.remove(&id)?;
     self.by_stream.remove(&stream);
     self.completed.remove(&id);
     self.progressed.remove(&id);
+    let reply = self.conn.take_stream(stream);
     self.conn.close_recv(stream);
-    Some(exchange.reply)
+    Some(reply)
   }
 
   /// The bytes of exchange `id`'s reply read so far (`None` for an unknown exchange): how far that one reply has
@@ -1996,7 +2021,7 @@ impl Endpoint {
   /// other exchanges' bytes (the forward lane's stall budget, 2026-11-07).
   pub fn reply_bytes_read(&mut self, id: u64) -> Option<usize> {
     self.drain();
-    self.exchanges.get(&id).map(|exchange| exchange.reply.len())
+    self.exchanges.get(&id).map(|exchange| exchange.received)
   }
 
   /// Abandons exchange `id`: a bound one's request stops sending (`ResetStream`) and its reply is refused
@@ -2218,19 +2243,22 @@ impl Endpoint {
     let now = if readable.is_empty() { 0 } else { now_ns() };
     let role = self.conn.role();
     for id in readable {
-      let chunk = self.conn.read_stream(now, id);
+      // How far the stream came: its window slides now, and its bytes wait in its reassembler until the message is
+      // whole, then are taken by move, never copied a chunk at a time.
+      let newly = usize::try_from(self.conn.advance_stream(now, id)).unwrap_or(usize::MAX);
+      let complete = self.conn.recv_stream_complete(id);
       if crate::streams::initiator(id) == role {
         // A reply to this end's exchange. One no longer open (taken or abandoned) is already closed at the
         // connection, so its frames never reach here; should one, it is refused, never read as a request.
         let exchange_id = self.by_stream.get(&id).copied();
         match exchange_id.and_then(|exchange| self.exchanges.get_mut(&exchange)) {
           Some(exchange) => {
-            exchange.reply.extend_from_slice(&chunk);
+            exchange.received = exchange.received.saturating_add(newly);
             if let Some(exchange_id) = exchange_id {
-              if !chunk.is_empty() {
+              if newly > 0 {
                 self.progressed.insert(exchange_id);
               }
-              if self.conn.recv_stream_complete(id) {
+              if complete {
                 self.completed.insert(exchange_id);
               }
             }
@@ -2239,19 +2267,20 @@ impl Endpoint {
         }
         continue;
       }
-      let request = self.arriving.entry(id).or_default();
-      request.extend_from_slice(&chunk);
-      if self.conn.recv_stream_complete(id) {
-        let whole = self.arriving.remove(&id).unwrap_or_default();
+      if complete {
+        self.arriving.remove(&id);
+        let whole = self.conn.take_stream(id);
         self.ready.insert(id, whole);
         self.conn.close_recv(id);
+      } else {
+        self.arriving.insert(id);
       }
     }
     // A request the peer reset (or abandoned) mid-arrival has its receiving half closed at the connection;
     // its partial bytes go too, so an abandoned exchange never leaves a request behind here (found by
     // `an_abandoned_exchange_frees_everything_on_both_ends`: one leaked entry per abandoned exchange).
     let conn = &self.conn;
-    self.arriving.retain(|&id, _| conn.receiving(id));
+    self.arriving.retain(|&id| conn.receiving(id));
   }
 
   /// The ready request to serve next: the most urgent class, then the oldest (lowest sequence).
@@ -2364,22 +2393,25 @@ fn seal_in_place(
   Ok(start)
 }
 
-fn unprotect_packet(
+/// Opens 1-RTT packet `packet` in place under `keys`: removes header protection, checks the short header and the
+/// connection id, decodes the packet number against `rx_largest`, and AEAD-opens the payload where it lies. Returns the
+/// packet number and where the plaintext frames lie in `packet`. A packet that does not open is refused, typed, and its
+/// bytes may be left rewritten (the caller keeps what it needs of them first).
+fn unprotect_in_place(
   keys: &mut crate::keys::OneRtt,
   cid: &ConnectionId,
   rx_largest: u64,
-  datagram: &[u8],
-) -> Result<(u64, Vec<Frame>), EndpointError> {
+  packet: &mut [u8],
+) -> Result<(u64, std::ops::Range<usize>), EndpointError> {
   let sample_len = keys.remote_header().sample_len();
-  if datagram.len() < HEADER_PROTECTION_SAMPLE_OFFSET.saturating_add(sample_len) {
+  if packet.len() < HEADER_PROTECTION_SAMPLE_OFFSET.saturating_add(sample_len) {
     return Err(EndpointError::NotReady);
   }
   // The connection id is not header-protected (RFC 9001 §5.4.1 masks only the first byte and the
   // packet number): a packet naming another session is refused before any crypto.
-  if connection_id_of(datagram).as_ref() != Some(cid) {
+  if connection_id_of(packet).as_ref() != Some(cid) {
     return Err(EndpointError::Header);
   }
-  let mut packet = datagram.to_vec();
 
   // Remove header protection: the packet-number field is unknown length, so hand the masker the full
   // maximum-width span; it unmasks the first byte, reads the length, and unmasks exactly that many.
@@ -2409,20 +2441,35 @@ fn unprotect_packet(
 
   // AEAD-open the payload with the unmasked header as associated data.
   let (aad, body) = packet
-    .split_at_checked(header_len)
+    .split_at_mut_checked(header_len)
     .ok_or(EndpointError::Header)?;
-  let aad = aad.to_vec();
-  let mut buf = body.to_vec();
   // Opened under the generation its key-phase bit and number name (`crate::keys`); a packet that does not
   // authenticate is discarded, and at the integrity limit the session ends (RFC 9001 §6.6).
   let phase = first_byte & KEY_PHASE_BIT != 0;
   let opened = keys
-    .open(pn, phase, &aad, &mut buf)
+    .open(pn, phase, aad, body)
     .map_err(|refusal| match refusal {
       crate::keys::OpenRefusal::Unauthenticated => EndpointError::Tls(rustls::Error::DecryptError),
       crate::keys::OpenRefusal::Exhausted(exhausted) => EndpointError::KeysExhausted(exhausted),
     })?;
-  let plaintext = buf.get(..opened).ok_or(EndpointError::Header)?;
+  let end = header_len
+    .checked_add(opened)
+    .filter(|end| *end <= packet.len())
+    .ok_or(EndpointError::Header)?;
+  Ok((pn, header_len..end))
+}
+
+/// [`unprotect_in_place`] of a copy of `datagram`, its frames decoded and held whole: how the tests read a packet.
+#[cfg(test)]
+fn unprotect_packet(
+  keys: &mut crate::keys::OneRtt,
+  cid: &ConnectionId,
+  rx_largest: u64,
+  datagram: &[u8],
+) -> Result<(u64, Vec<Frame>), EndpointError> {
+  let mut packet = datagram.to_vec();
+  let (pn, opened) = unprotect_in_place(keys, cid, rx_largest, &mut packet)?;
+  let plaintext = packet.get(opened).ok_or(EndpointError::Header)?;
   let frames = decode_frames(plaintext).map_err(EndpointError::Frames)?;
   Ok((pn, frames))
 }
@@ -2643,13 +2690,17 @@ mod tests {
         };
         let raw = crate::flight::fragment(&[2; 10], 0).unwrap().remove(0);
         for _ in 0..50 {
-          client.fold_or_discard(&raw, client.peer).unwrap();
+          client
+            .fold_or_discard(&mut raw.clone(), client.peer)
+            .unwrap();
         }
         let burst = client.fragments_sent();
         slates_rt::futures::sleep(client.handshake_probe_ceiling())
           .await
           .unwrap();
-        client.fold_or_discard(&raw, client.peer).unwrap();
+        client
+          .fold_or_discard(&mut raw.clone(), client.peer)
+          .unwrap();
         let _ = sent.send((burst, client.fragments_sent()));
       })
       .unwrap();

@@ -51,6 +51,9 @@ fn run(drive: &mut Drive, index: &Index, green: &Green, locks: &LockTable) -> Ve
     let call = match drive.next(&sources, STEPS) {
       Next::Call(call) => call,
       Next::Paused => panic!("a call needed more steps than {STEPS}"),
+      Next::Waiting(wanted) => {
+        panic!("the fixture holds every text, yet the drive waited for {wanted:?}")
+      }
       Next::Ended => return calls,
     };
     match call {
@@ -359,6 +362,9 @@ fn run_paused(
   loop {
     match drive.next(&sources, steps) {
       Next::Paused => pauses += 1,
+      Next::Waiting(wanted) => {
+        panic!("the fixture holds every text, yet the drive waited for {wanted:?}")
+      }
       Next::Ended => return (calls, pauses),
       Next::Call(Call::ApplyTextDelta { base_md5 }) => delta = Some((base_md5, Vec::new())),
       Next::Call(Call::DeltaPiece { bytes, .. }) => {
@@ -831,4 +837,103 @@ fn a_very_large_directory_is_listed_a_few_entries_a_step() {
       assert_eq!(sorted, gone, "an update's deletions");
     }
   }
+}
+
+/// The test repository with every text piece withheld until a drive has waited for it (C2 stage B part 2): a piece it
+/// has not been given reads as none and is `fetchable`, as a text read through the node's changeset store is.
+struct Withholding<'g> {
+  /// The repository.
+  green: &'g Green,
+  /// The pieces given, by text and offset.
+  given: std::cell::RefCell<std::collections::BTreeSet<(ContentIdentity, u64)>>,
+}
+
+impl crate::mergeinfo::Contents for Withholding<'_> {
+  fn entries(&self, directory: &str, revision: Revision) -> Option<Vec<String>> {
+    self.green.entries(directory, revision)
+  }
+
+  fn mergeinfo_value(&self, properties: &ContentIdentity) -> Option<&[u8]> {
+    self.green.mergeinfo_value(properties)
+  }
+}
+
+impl Repository for Withholding<'_> {
+  fn revision_properties(&self, revision: Revision) -> Option<Vec<(&[u8], &[u8])>> {
+    self.green.revision_properties(revision)
+  }
+
+  fn properties(&self, identity: &ContentIdentity) -> Option<Vec<(&[u8], &[u8])>> {
+    self.green.properties(identity)
+  }
+
+  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<std::borrow::Cow<'_, [u8]>> {
+    if !self.given.borrow().contains(&(*identity, offset)) {
+      return None;
+    }
+    self.green.text(identity, offset)
+  }
+
+  fn fetchable(&self, identity: &ContentIdentity, offset: u64) -> bool {
+    self.green.text(identity, offset).is_some()
+  }
+}
+
+/// C2 stage B part 2 (a drive waits for a text's piece its repository reads asynchronously). Do: drive `/trunk` from r5
+/// to r6 (`big.txt` edited over several windows, a delta against its base) over a repository that withholds every
+/// text piece until the drive waits for it, giving each piece when it is waited for and calling again. Expect the
+/// drive to wait (at least once a piece of the target and of the source) and make exactly the calls the drive makes
+/// over the repository that holds every text: nothing it made is lost at a wait. Before, a piece the repository did
+/// not hold ended the drive "Filesystem is corrupt".
+#[test]
+fn a_drive_that_waits_for_its_texts_pieces_makes_the_same_calls() {
+  let (index, green) = repository();
+  let locks = LockTable::new();
+  let whole = run(
+    &mut Drive::new(trunk_report(5, 6, false), b"u"),
+    &index,
+    &green,
+    &locks,
+  );
+  let withholding = Withholding {
+    green: &green,
+    given: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+  };
+  let anonymous = rules_of(None);
+  let sources = Sources {
+    index: &index,
+    repository: &withholding,
+    locks: &locks,
+    now: NOW,
+    rules: Some(&anonymous),
+  };
+  let mut drive = Drive::new(trunk_report(5, 6, false), b"u");
+  let (mut calls, mut waits) = (Vec::new(), 0usize);
+  let mut delta: Option<(Option<[u8; 16]>, Vec<u8>)> = None;
+  loop {
+    let call = match drive.next(&sources, STEPS) {
+      Next::Call(call) => call,
+      Next::Waiting(wanted) => {
+        waits += 1;
+        withholding
+          .given
+          .borrow_mut()
+          .insert((wanted.text, wanted.offset));
+        continue;
+      }
+      Next::Paused => panic!("a call needed more steps than {STEPS}"),
+      Next::Ended => break,
+    };
+    match call {
+      Call::ApplyTextDelta { base_md5 } => delta = Some((base_md5, Vec::new())),
+      Call::DeltaPiece { bytes, .. } => delta.as_mut().unwrap().1.extend_from_slice(bytes),
+      Call::TextDeltaEnd => {
+        let (base, stream) = delta.take().unwrap();
+        calls.push(Written::Delta(base, 0, windows_of(&stream)));
+      }
+      other => calls.push(owned(other)),
+    }
+  }
+  assert!(waits >= 2, "the drive waited {waits} times");
+  assert_eq!(calls, whole);
 }

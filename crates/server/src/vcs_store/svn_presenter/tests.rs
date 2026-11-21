@@ -31,6 +31,9 @@ const ADMISSION: Admission = Admission {
   buffer_bytes: 1 << 20,
 };
 
+/// Shape: the owner of the view's root, a user other than root, whom every entry must be owned by.
+const OWNER: (u32, u32) = (501, 20);
+
 /// Shape: the bytes a read asks for at once: prime, so reads start and end inside pieces.
 const READ_BYTES: usize = 1021;
 
@@ -72,17 +75,23 @@ fn volume() -> (Store, Volume) {
     arena,
     0,
   );
-  let volume = Volume::create(
+  let mut volume = Volume::create(
     &mut store,
     VolumeConfig {
       prefix: 7,
       names: NameEquivalence::Exact,
-      quota: Quota::Bounded { limit: 1 << 28 },
+      quota: Quota::Bounded { limit: 0 },
       journal_bytes: 1 << 20,
       clock: Box::new(StepClock::new(0, 1_000)),
     },
   )
   .unwrap();
+  // As the daemon makes a view: a ceiling of nothing, its allowances only what the empty volume holds; the presenter
+  // sizes it to the view's content as it writes (w-interop's matrix met `Volume(NoSpace)` before it did).
+  let (inodes, _) = volume.inode_usage();
+  volume.set_inode_allowance(inodes).unwrap();
+  let (entries, _) = volume.entry_usage();
+  volume.set_entry_allowance(entries.max(1)).unwrap();
   (store, volume)
 }
 
@@ -144,8 +153,8 @@ fn fixed_files_read_back(
   }
 }
 
-/// Revision `revision`'s files read back through the view: its revision file the bytes `fsfs` makes for it and
-/// refused a write (`EROFS`), its properties file `fsfs`'s. The revision file's bytes read.
+/// Revision `revision`'s files read back through the view: its revision file the bytes `fsfs` makes for it, refused a
+/// write (`EROFS`) and owned by the view root's owner, readable by all (`0444`), its properties file `fsfs`'s. The revision file's bytes read.
 fn revision_reads_back(
   (volume, store, root): (&mut Volume, &mut Store, InodeNo),
   (view, source, texts): (&View, &SvnView<'_>, &ViewTexts<'_>),
@@ -159,6 +168,12 @@ fn revision_reads_back(
     at = volume.lookup_no(store, at, name).unwrap().inode;
   }
   assert_eq!(volume.write(store, at, 0, b"x"), Err(VfsError::ReadOnly));
+  let attrs = volume.stat(store, at).unwrap();
+  assert_eq!(
+    (attrs.uid, attrs.gid, attrs.mode & 0o777),
+    (OWNER.0, OWNER.1, 0o444),
+    "{path}"
+  );
   let path = fsfs::revision_properties_path(revision);
   assert_eq!(
     read_path(volume, store, root, &path, texts),
@@ -171,7 +186,8 @@ fn revision_reads_back(
 /// A-645 P3. Do: present the golden repository's view into a volume a node-revision a call (the smallest budget);
 /// then read every file through the view's text seam. Expect: every revision file, every revision properties file and
 /// every fixed file the bytes `slates_svn::fsfs` makes for them; `db/current` naming the youngest; each revision file
-/// a referenced file the volume refuses to change (`EROFS`); and the reads' counts covering every byte read.
+/// a referenced file the volume refuses to change (`EROFS`), owned by the root's owner and readable by all (`0444`);
+/// and the reads' counts covering every byte read.
 #[test]
 fn the_presented_volume_holds_the_fsfs_view_byte_for_byte() {
   let records = imported(FULL);
@@ -179,6 +195,7 @@ fn the_presented_volume_holds_the_fsfs_view_byte_for_byte() {
     green: None,
     store: None,
     records: &records,
+    pieces: None,
   };
   let source = WithTexts {
     records: &records,
@@ -186,6 +203,7 @@ fn the_presented_volume_holds_the_fsfs_view_byte_for_byte() {
   };
   let (mut store, mut volume) = volume();
   let root = volume.root_inode(&store).unwrap();
+  volume.chown(&mut store, root, OWNER.0, OWNER.1).unwrap();
   let mut presented = Presented::new();
   let mut holds = ViewHolds {
     store: None,
@@ -240,6 +258,7 @@ fn a_revision_property_change_rewrites_that_revisions_properties_file() {
       green: None,
       store: None,
       records: &records,
+      pieces: None,
     };
     let source = WithTexts {
       records: &records,
@@ -268,6 +287,7 @@ fn a_revision_property_change_rewrites_that_revisions_properties_file() {
     green: None,
     store: None,
     records: &records,
+    pieces: None,
   };
   let source = WithTexts {
     records: &records,
@@ -293,4 +313,66 @@ fn a_revision_property_change_rewrites_that_revisions_properties_file() {
       "{path}"
     );
   }
+}
+
+/// C2 stage B part 2 (b), P2 (a hook's view brings back a stored text the content store let go before it holds it). Do:
+/// on a daemon whose revision 1 adds `/trunk/a.bin`, every hold RAM has on its text let go
+/// (`crate::test_store::a_text_only_the_store_holds`), show the repository's view as a hook's `REPOS-PATH` is shown
+/// ([`show`]), then read revision 1's file through the view's text seam. Expect the view shown, the file carrying the
+/// text whole (`PLAIN`), the text read through the store (`vcs_store.svn_texts.piece_fetched` at least once), and the
+/// view holding nothing it brought beyond its file's own hold. Before, the layout's hold on the text was refused and the
+/// view was never shown.
+#[test]
+fn a_hook_view_brings_back_a_stored_text_the_content_store_let_go() {
+  let bytes = crate::test_store::noise(200 << 10);
+  let (_store, daemon, id) = crate::test_store::a_text_only_the_store_holds(
+    &crate::repository::svn_commit::tests::owner(),
+    "viewed",
+    &bytes,
+  );
+  let shown = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let shard = crate::state::with_state(|state| state.shard).unwrap();
+      show(shard, shard, id).await
+    },
+    std::time::Duration::from_secs(60),
+  );
+  assert_eq!(shown, Ok(()));
+  let (file, brought, fetched) = crate::daemon::observe_first(&daemon, move |state| {
+    let fetched = state
+      .refusals
+      .get(crate::vcs_store::svn_texts::PIECE_FETCHED)
+      .copied()
+      .unwrap_or(0);
+    let read = crate::vcs_store::lent_state(state, |state| {
+      let slot = state.svn_views.get(&id)?;
+      let handle = *state.by_id.get(&slot.volume)?;
+      let held = state.volumes.get(handle).ok()?;
+      let records = state.vcs_stores.subversion_records(id)?;
+      let texts = HeadTexts {
+        green: None,
+        store: state.vcs_stores.content(),
+        records,
+        pieces: None,
+      };
+      let root = held.volume.root_inode(&state.store).ok()?;
+      let path = fsfs::revision_file_path(1);
+      let file = read_path(&held.volume, &state.store, root, &path, &ViewTexts(&texts));
+      Some((file, slot.brought.len()))
+    });
+    let (file, brought) = read.unzip();
+    (file, brought, fetched)
+  });
+  daemon.stop();
+  let carried = file
+    .as_ref()
+    .is_some_and(|file| file.windows(bytes.len()).any(|window| window == bytes));
+  assert!(
+    carried,
+    "revision 1's file does not carry the text: {:?} bytes",
+    file.map(|file| file.len())
+  );
+  assert!(fetched >= 1, "no piece read through the store");
+  assert_eq!(brought, Some(0), "the view kept what it brought");
 }

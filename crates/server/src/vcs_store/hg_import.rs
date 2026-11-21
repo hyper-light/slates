@@ -163,8 +163,7 @@ pub(crate) enum ImportFailed {
     /// The bytes it could admit.
     available: u64,
   },
-  /// The import refused: the store, its requirements, a file, or the host's own refusal (a fetch still pending on an
-  /// S3 base among them).
+  /// The import refused: the store, its requirements, a file, or the host's own refusal.
   Refused(ImportRefused<BaseRefused>),
   /// Its landing was refused (A-687): the entry by the register's guard or the budget, a bookmark's green by the
   /// namespace's rules, or its record or a bookmark's work past what the landing may hold; the wire's refusal.
@@ -619,6 +618,8 @@ pub(crate) fn place_imported(
         state.count(RELEASE_REFUSED, 1);
       }
       settle(state);
+      // An imported index is built whole: its runs merged a slice at a time (goal 93's pull).
+      super::index_upkeep::built(state, id);
       Ok(())
     }
     Err(refused) => {

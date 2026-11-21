@@ -114,7 +114,6 @@ use slates_db::register::ObjectId;
 use slates_rt::tcp::{TcpListener, TcpStream};
 use slates_rt::{futures, registry};
 use slates_vfs::clock::Clock;
-use slates_vfs::host::HostFs;
 use slates_wire::observe::Chokepoint;
 use slates_wire::request::RequestId;
 
@@ -391,7 +390,6 @@ fn with_export_lent<R>(
     attachments,
     nfs_v4_files,
     snapshot_views,
-    nfs_pending_base,
     greens,
     merge,
     vcs_stores,
@@ -412,29 +410,17 @@ fn with_export_lent<R>(
     .map(|(green, version)| crate::green_tree::GreenTree::at(green, *version));
   let mut tree_lens = None;
   let mut handles = new_handle_store();
-  // The slot's base host is lent through a lens that notes the fetch a host call of this request met pending (A-555):
-  // the bridge answers the refusal on the wire, and the call then parks on that fetch (`serve_local_held`).
-  let mut lens = None;
   let served = {
     // A snapshot mount serves its attachment's read-only view; every other mount, the volume's head.
     let mut bridge = match snapshot_views.get_mut(&capability.0) {
       Some(view) => VolumeBridge::attached(volume, &mut view.volume, store, &mut handles, None),
       None => {
         let slot = volumes.get_mut(handle).ok()?;
-        lens = slot.host.as_mut().map(|host| {
-          crate::base_wait::Lens::over(crate::mounted_work::lend(
-            host,
-            green_tree.as_ref(),
-            &mut tree_lens,
-          ))
-        });
-        VolumeBridge::attached(
-          volume,
-          &mut slot.volume,
-          store,
-          &mut handles,
-          lens.as_mut().map(|lens| lens as &mut dyn HostFs),
-        )
+        let host = slot
+          .host
+          .as_mut()
+          .map(|host| crate::mounted_work::lend(host, green_tree.as_ref(), &mut tree_lens));
+        VolumeBridge::attached(volume, &mut slot.volume, store, &mut handles, host)
       }
     };
     if let Some(seam) = view_seam.as_ref() {
@@ -467,8 +453,6 @@ fn with_export_lent<R>(
     attachments.end(admitted);
     served
   };
-  let met = lens.as_ref().and_then(crate::base_wait::Lens::met);
-  *nfs_pending_base = met.map(|fetch| (volume, fetch)).or(*nfs_pending_base);
   Some(served)
 }
 
@@ -1103,7 +1087,6 @@ fn serve_local(
   let _ = state::with_state_counted(|s| {
     s.store.recall_gate.act_as(requester.client);
     s.nfs_call = call;
-    s.nfs_pending_base = None;
   });
   // Only NFSv3 reaches here: an NFSv4 call is served by the v4 front end before routing.
   let served = serve_call(
@@ -1324,8 +1307,7 @@ async fn serve_remote(
     origin,
     owner,
     move || async move {
-      let ((served, owed), _) =
-        serve_local_fetched(requester, xid, program, procedure, &args, port).await;
+      let ((served, owed), _) = serve_local_seen(requester, xid, program, procedure, &args, port);
       let served = stable_once_durable(procedure, served).await;
       if let Some(owed) = owed {
         let _ = crate::told::wait(owed).await;
@@ -1607,59 +1589,24 @@ async fn serve_v3(
   served
 }
 
-/// Serves one call locally ([`serve_local`]) on the volume's owner shard, waiting while what it reads is fetched from an
-/// S3 base (§4.15 "An S3 base", A-555): a call answered `NFS3ERR_JUKEBOX` after a host call of it met a pending fetch
-/// changed nothing, so it waits for that fetch (`crate::base_wait`) and is served again from its start once it lands,
-/// within the failover delay from its first wait, the most a reply is held. A call that cannot wait (the shard's waits
-/// at their bound, the delay passed) is answered the retry it was given. With the answer goes the recall gate's
+/// A call served locally: its reply, and what it owes the volume's FUSE mounts before the reply (AC-3.3).
+type Answered = ((AcceptStatus, Vec<u8>), Option<crate::told::Owed>);
+
+/// Serves one call locally ([`serve_local`]) on the volume's owner shard. With the answer goes the recall gate's
 /// refusals as they stood just before the run that answered, which a delegation's hold judges by (A-79).
-async fn serve_local_fetched(
+fn serve_local_seen(
   requester: Requester,
   xid: u32,
   program: u32,
   procedure: u32,
   args: &[u8],
   port: u16,
-) -> (
-  ((AcceptStatus, Vec<u8>), Option<crate::told::Owed>),
-  Option<u64>,
-) {
-  let mut until = None;
-  loop {
-    let seen = state::with_state(|s| s.store.recall_gate.refusals());
-    let answered = serve_local(requester.clone(), xid, program, procedure, args, port);
-    let Some(key) = met_pending_base(&answered.0) else {
-      return (answered, seen);
-    };
-    if !waited_for_base(key, &mut until).await {
-      return (answered, seen);
-    }
-  }
-}
-
-/// The fetch a call just served waits for (A-555): the one a host call of it met pending
-/// (`ShardState::nfs_pending_base`, taken here so it never outlives its call), when the call was answered the retry a
-/// pending base's refusal is on this wire (`NFS3ERR_JUKEBOX`). `None` for every other call.
-fn met_pending_base(served: &(AcceptStatus, Vec<u8>)) -> Option<crate::base_wait::Key> {
-  let met = state::with_state(|s| s.nfs_pending_base.take()).flatten()?;
-  (served.0 == AcceptStatus::Success && leading_status(&served.1) == Some(Nfsstat3::Jukebox as u32))
-    .then_some(met)
-}
-
-/// Waits for the fetch `key` names to land, until the call's deadline: `until`, the failover delay from its first wait,
-/// set then. Whether the call runs again.
-async fn waited_for_base(key: crate::base_wait::Key, until: &mut Option<u64>) -> bool {
-  let deadline = match *until {
-    Some(deadline) => deadline,
-    None => {
-      let failover =
-        state::with_state(|s| s.failover_ns).unwrap_or(crate::daemon::LIVENESS_BUDGET_NS);
-      let deadline = futures::now_ns().saturating_add(failover);
-      *until = Some(deadline);
-      deadline
-    }
-  };
-  crate::base_wait::wait(key, deadline).await == crate::base_wait::Waited::Landed
+) -> (Answered, Option<u64>) {
+  let seen = state::with_state(|s| s.store.recall_gate.refusals());
+  (
+    serve_local(requester, xid, program, procedure, args, port),
+    seen,
+  )
 }
 
 /// Counter: NFSv3 calls the recall gate refused that were held for the delegation's return rather than answered
@@ -1687,7 +1634,7 @@ async fn serve_local_held(
   let mut deadline: Option<u64> = None;
   loop {
     let ((served, owed), seen) =
-      serve_local_fetched(requester.clone(), xid, program, procedure, args, port).await;
+      serve_local_seen(requester.clone(), xid, program, procedure, args, port);
     let served = stable_once_durable(procedure, served).await;
     // A change the call recorded is told to every FUSE mount of its volume before the reply (AC-3.3). A call the
     // recall gate refused changed nothing, so it owes nothing and is not held here.

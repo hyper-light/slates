@@ -12,12 +12,18 @@
 //! `Missing` otherwise. An object that cannot be read is `Missing`, since what it names cannot be
 //! known.
 //!
-//! **Bounds.** Every object is read twice, once to count the edges among the pushed objects and
-//! once to keep them, so the tables are charged exactly before they are made. A read's own
-//! transient structures (A-590's header and entry lists) are a small multiple of the object's
-//! bytes, which the pack's admission already charged, and are freed before the next read, so they
-//! are not charged again. The worst state is carried back over the edges with an explicit stack,
-//! each object finished once.
+//! **Bounds** (A-719: a push's working set is the slice in flight, never its history). The first pass reads every
+//! pushed object once and judges its own edges out of the pack. When no object is incomplete, no tip can reach one, so
+//! every pushed tip is complete and the walk ends there, its one table a state an object: the common case, every push
+//! of a complete history. Otherwise the worst state is carried back from each pushed tip depth first: an object is read
+//! once more as it is opened, each child's state folded into the frame of the object that opened it, so no table of
+//! the pack's edges is made. The stack holds the open path's frames and the children they wait on, charged as it
+//! grows, so it is bounded by the history's depth times its widest object, never by its edges; a mark an object is
+//! charged once when that walk begins. The table of edges this replaced was a `usize` for every tree entry in the pack:
+//! git/git's whole history asked 485,230,824 bytes for it with 300,809,433 left, and its push was refused (w-interop,
+//! 2026-11-21). A read's own transient structures (A-590's header and entry lists) are a small multiple of the object's
+//! bytes, which the pack's admission already charged, and are freed before the next read, so they are not charged
+//! again.
 
 use super::{Pushed, Refusal, Repository, Request, reserve};
 use crate::Admission;
@@ -92,40 +98,54 @@ impl Clock for Stopped {
 /// Where a walk stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Pass {
-  /// Each object's own edges out of the pack judged, and the edges among the pushed objects counted.
+  /// Each object's own edges out of the pack judged.
   States,
-  /// The edges among the pushed objects kept, each object's run of targets.
-  Edges,
-  /// The worst state carried back over the edges.
+  /// The worst state carried back from each pushed tip, depth first.
   Propagate,
-  /// Every object's state is final.
+  /// Every tip's state is final.
   Done,
 }
 
-/// The connectivity check made a turn at a time (A-719; the module docs): every pushed object read
-/// once a pass in pack order, each turn for its quantum and at least one object, then the states
-/// carried back over the edges. Its tables are charged to the admission before they are made, as
-/// the whole check charges them.
+/// A frame of the propagation's stack.
+#[derive(Clone, Copy, Debug)]
+enum Frame {
+  /// An object reached from the frame at `parent` (none for a tip), to open, or to fold into it when already done.
+  Enter {
+    /// The object, by position.
+    node: usize,
+    /// Where its parent's exit frame is on the stack.
+    parent: Option<usize>,
+  },
+  /// An open object waiting for the children it reached: the worst state folded into it so far.
+  Exit {
+    /// The object, by position.
+    node: usize,
+    /// The worst of its own state and its finished children's.
+    worst: Connected,
+    /// Where its parent's exit frame is on the stack.
+    parent: Option<usize>,
+  },
+}
+
+/// The connectivity check made a turn at a time (A-719; the module docs): every pushed object read once in pack order,
+/// each turn for its quantum and at least one object; then, only when some object is incomplete, the worst state
+/// carried back from each pushed tip. Its tables are charged to the admission before they are made, the stack as it
+/// grows.
 #[derive(Debug)]
 pub(crate) struct Walk {
   /// The commits the client called shallow, sorted.
   shallow: Vec<ObjectId>,
-  /// Each pushed object's state, in pack order.
+  /// Each pushed object's state, in pack order: its own until the propagation, then final for every object it reached.
   states: Vec<Connected>,
-  /// The edges among the pushed objects, counted by the first pass.
-  inside: usize,
-  /// Each object's run of targets: its bounds, one more than the objects.
-  offsets: Vec<usize>,
-  /// The targets, by position.
-  targets: Vec<usize>,
+  /// Whether the first pass found an object incomplete of its own.
+  incomplete: bool,
   /// The pass under way.
   pass: Pass,
-  /// The next object of the pass.
+  /// The next object of the first pass, or the next command whose tip the propagation starts from.
   at: usize,
-  /// The propagation's stack (A-722 part 4, the check's longest step at 100 concurrent pushes: the propagation ran whole
-  /// in one unit): each open object and its next edge.
-  stack: Vec<(usize, usize)>,
-  /// Where each object's propagation stands; empty until the propagation begins.
+  /// The propagation's stack: the open path's exit frames and the children they wait on.
+  stack: Vec<Frame>,
+  /// Where each object's propagation stands; empty unless the propagation runs.
   marks: Vec<Mark>,
 }
 
@@ -147,9 +167,7 @@ impl Walk {
     Ok(Walk {
       shallow: sorted(&request.shallow, admission)?,
       states,
-      inside: 0,
-      offsets: Vec::new(),
-      targets: Vec::new(),
+      incomplete: false,
       pass: Pass::States,
       at: 0,
       stack: Vec::new(),
@@ -176,109 +194,23 @@ impl Walk {
     Ok(self.pass == Pass::Done)
   }
 
-  /// The edges of the object at the pass's position, as `pushed` lends its bytes, handed to `each`:
-  /// whether it could be read. A blob names nothing, so its bytes are not read; an object whose
-  /// bytes are not lent could not be read.
-  fn edges_of(
-    &self,
-    placed: &Placed,
-    (format, pushed): (ObjectFormat, &Pushed<'_>),
-    each: &mut impl FnMut(ObjectId, bool),
-  ) -> Result<bool, Refusal> {
-    if placed.kind == Kind::Blob {
-      return Ok(true);
-    }
-    match pushed.content(self.at) {
-      Some(content) => for_each_edge((placed.kind, &content), format, each),
-      None => Ok(false),
-    }
-  }
-
-  /// The propagation's tables charged and made: the stack and the marks, an object each.
-  fn propagation_begun(&mut self, admission: &mut Admission) -> Result<(), Refusal> {
-    let count = self.states.len();
-    admission
-      .charge_items::<(usize, usize)>(count)
-      .map_err(Refusal::PastAdmission)?;
-    admission
-      .charge_items::<Mark>(count)
-      .map_err(Refusal::PastAdmission)?;
-    reserve(&mut self.stack, count)?;
-    reserve(&mut self.marks, count)?;
-    self.marks.resize(count, Mark::New);
-    Ok(())
-  }
-
-  /// One unit of the propagation, carrying the worst state back over the edges with an explicit stack, each object
-  /// finished once: the open object's next edge followed, or the object finished once its edges are; with none open,
-  /// the next object not reached opened (`at` the next root); with none left, the propagation done and its tables
-  /// given back.
-  fn propagation_unit(&mut self) {
-    let Self {
-      states,
-      offsets,
-      targets,
-      stack,
-      marks,
-      ..
-    } = self;
-    if let Some(&(node, cursor)) = stack.last() {
-      let end = offsets
-        .get(node.saturating_add(1))
-        .copied()
-        .unwrap_or(cursor);
-      if cursor < end {
-        if let Some(top) = stack.last_mut() {
-          top.1 = cursor.saturating_add(1);
-        }
-        if let Some(&child) = targets.get(cursor)
-          && marks.get(child) == Some(&Mark::New)
-        {
-          open(child, offsets, marks, stack);
-        }
-        return;
-      }
-      stack.pop();
-      finish(node, states, offsets, targets, marks);
-      return;
-    }
-    let root = self.at;
-    if root >= self.states.len() {
-      self.stack = Vec::new();
-      self.marks = Vec::new();
-      self.pass = Pass::Done;
-      return;
-    }
-    if self.marks.get(root) == Some(&Mark::New) {
-      open(root, &self.offsets, &mut self.marks, &mut self.stack);
-    }
-    self.at = root.saturating_add(1);
-  }
-
-  /// One unit of the walk: one object of a pass, a pass's end, or a unit of the propagation.
+  /// One unit of the walk: one object of the first pass, its end, or a frame of the propagation.
   fn unit<R: Repository + ?Sized>(
     &mut self,
     (request, pushed, repository): (&Request, &Pushed<'_>, &R),
     admission: &mut Admission,
   ) -> Result<(), Refusal> {
-    let object = pushed.objects().get(self.at);
-    match (self.pass, object) {
-      (Pass::States, Some(object)) => self.judge(object, (request, pushed, repository))?,
-      (Pass::States, None) => self.begin_edges(pushed.objects().len(), admission)?,
-      (Pass::Edges, Some(object)) => self.keep_edges(object, request.format, pushed)?,
-      (Pass::Edges, None) => {
-        self.propagation_begun(admission)?;
-        self.pass = Pass::Propagate;
-        self.at = 0;
-      }
-      (Pass::Propagate, _) => self.propagation_unit(),
-      (Pass::Done, _) => {}
+    match self.pass {
+      Pass::States => match pushed.objects().get(self.at) {
+        Some(object) => self.judge(object, (request, pushed, repository)),
+        None => self.propagation_begun(admission),
+      },
+      Pass::Propagate => self.propagation_unit((request, pushed), admission),
+      Pass::Done => Ok(()),
     }
-    Ok(())
   }
 
-  /// The first pass's object: its own edges out of the pack judged, those among the pushed objects
-  /// counted.
+  /// The first pass's object: its own edges out of the pack judged.
   fn judge<R: Repository + ?Sized>(
     &mut self,
     object: &Placed,
@@ -286,60 +218,179 @@ impl Walk {
   ) -> Result<(), Refusal> {
     let shallow_commit = self.shallow.binary_search(&object.id).is_ok();
     let mut state = Connected::Complete;
-    let mut inside = self.inside;
-    let read = self.edges_of(object, (request.format, pushed), &mut |target, parent| {
-      if pushed.position(&target).is_some() {
-        inside = inside.saturating_add(1);
-      } else if !repository.holds(&target) {
-        state = state.max(if parent && shallow_commit {
-          Connected::Shallow
-        } else {
-          Connected::Missing
-        });
-      }
-    })?;
-    self.inside = inside;
+    let read = edges_of(
+      (self.at, object),
+      (request.format, pushed),
+      &mut |target, parent| {
+        if pushed.position(&target).is_none() && !repository.holds(&target) {
+          state = state.max(if parent && shallow_commit {
+            Connected::Shallow
+          } else {
+            Connected::Missing
+          });
+        }
+      },
+    )?;
+    let state = if read { state } else { Connected::Missing };
+    self.incomplete |= state != Connected::Complete;
     if let Some(slot) = self.states.get_mut(self.at) {
-      *slot = if read { state } else { Connected::Missing };
+      *slot = state;
     }
     self.at = self.at.saturating_add(1);
     Ok(())
   }
 
-  /// The second pass begun: its tables, for `count` objects and the edges the first counted,
-  /// charged before they are made.
-  fn begin_edges(&mut self, count: usize, admission: &mut Admission) -> Result<(), Refusal> {
-    let bounds = count.saturating_add(1);
-    admission
-      .charge_items::<usize>(bounds.saturating_add(self.inside))
-      .map_err(Refusal::PastAdmission)?;
-    reserve(&mut self.offsets, bounds)?;
-    reserve(&mut self.targets, self.inside)?;
-    self.offsets.push(0);
-    self.pass = Pass::Edges;
+  /// The first pass ended: done when no object is incomplete of its own (the module docs), else the propagation begun
+  /// from the first command's tip, its marks charged before they are made.
+  fn propagation_begun(&mut self, admission: &mut Admission) -> Result<(), Refusal> {
     self.at = 0;
+    if !self.incomplete {
+      self.pass = Pass::Done;
+      return Ok(());
+    }
+    let count = self.states.len();
+    admission
+      .charge_items::<Mark>(count)
+      .map_err(Refusal::PastAdmission)?;
+    reserve(&mut self.marks, count)?;
+    self.marks.resize(count, Mark::New);
+    self.pass = Pass::Propagate;
     Ok(())
   }
 
-  /// The second pass's object: its run of targets among the pushed objects kept.
-  fn keep_edges(
+  /// One unit of the propagation: the top frame handled; with none, the next command's pushed tip entered; with no
+  /// command left, the propagation done and its tables given back.
+  fn propagation_unit(
     &mut self,
-    object: &Placed,
-    format: ObjectFormat,
-    pushed: &Pushed<'_>,
+    (request, pushed): (&Request, &Pushed<'_>),
+    admission: &mut Admission,
   ) -> Result<(), Refusal> {
-    let mut targets = core::mem::take(&mut self.targets);
-    let read = self.edges_of(object, (format, pushed), &mut |target, _| {
-      if let Some(at) = pushed.position(&target)
-        && targets.len() < targets.capacity()
-      {
-        targets.push(at);
+    match self.stack.pop() {
+      Some(Frame::Enter { node, parent }) => {
+        self.enter(node, parent, (request.format, pushed), admission)
       }
-    });
-    self.targets = targets;
-    read?;
-    self.offsets.push(self.targets.len());
-    self.at = self.at.saturating_add(1);
+      Some(Frame::Exit {
+        node,
+        worst,
+        parent,
+      }) => {
+        let state = match self.states.get_mut(node) {
+          Some(state) => {
+            *state = (*state).max(worst);
+            *state
+          }
+          None => worst,
+        };
+        if let Some(mark) = self.marks.get_mut(node) {
+          *mark = Mark::Done;
+        }
+        self.fold(parent, state);
+        Ok(())
+      }
+      None => {
+        let Some(command) = request.commands.get(self.at) else {
+          self.stack = Vec::new();
+          self.marks = Vec::new();
+          self.pass = Pass::Done;
+          return Ok(());
+        };
+        self.at = self.at.saturating_add(1);
+        match pushed.position(&command.new) {
+          Some(tip) if !command.is_delete() => self.push(
+            Frame::Enter {
+              node: tip,
+              parent: None,
+            },
+            admission,
+          ),
+          _ => Ok(()),
+        }
+      }
+    }
+  }
+
+  /// `node`, reached from the exit frame at `parent`: folded into it when already done; else opened, its exit frame
+  /// pushed and each child not yet done entered after it, a done child folded at once.
+  fn enter(
+    &mut self,
+    node: usize,
+    parent: Option<usize>,
+    (format, pushed): (ObjectFormat, &Pushed<'_>),
+    admission: &mut Admission,
+  ) -> Result<(), Refusal> {
+    match self.marks.get(node) {
+      Some(Mark::New) => {}
+      Some(Mark::Done) => {
+        let state = self.states.get(node).copied().unwrap_or(Connected::Missing);
+        self.fold(parent, state);
+        return Ok(());
+      }
+      // An object open on the path below cannot be reached again, its names being its children's hashes; nothing
+      // to fold.
+      Some(Mark::Open) | None => return Ok(()),
+    }
+    if let Some(mark) = self.marks.get_mut(node) {
+      *mark = Mark::Open;
+    }
+    let own = self.states.get(node).copied().unwrap_or(Connected::Missing);
+    let exit = self.stack.len();
+    self.push(
+      Frame::Exit {
+        node,
+        worst: own,
+        parent,
+      },
+      admission,
+    )?;
+    let Some(object) = pushed.objects().get(node) else {
+      return Ok(());
+    };
+    let mut worst = own;
+    let mut refused = None;
+    let Self {
+      stack,
+      marks,
+      states,
+      ..
+    } = self;
+    edges_of((node, object), (format, pushed), &mut |target, _| {
+      let Some(child) = pushed.position(&target) else {
+        return;
+      };
+      match marks.get(child) {
+        Some(Mark::Done) => {
+          worst = worst.max(states.get(child).copied().unwrap_or(Connected::Missing));
+        }
+        Some(Mark::New) if refused.is_none() => {
+          if let Err(past) = grown(stack, admission) {
+            refused = Some(past);
+            return;
+          }
+          stack.push(Frame::Enter {
+            node: child,
+            parent: Some(exit),
+          });
+        }
+        _ => {}
+      }
+    })?;
+    if let Some(Frame::Exit { worst: folded, .. }) = self.stack.get_mut(exit) {
+      *folded = (*folded).max(worst);
+    }
+    refused.map_or(Ok(()), Err)
+  }
+
+  /// `state` folded into the exit frame at `parent`, if any.
+  fn fold(&mut self, parent: Option<usize>, state: Connected) {
+    if let Some(Frame::Exit { worst, .. }) = parent.and_then(|at| self.stack.get_mut(at)) {
+      *worst = (*worst).max(state);
+    }
+  }
+
+  /// `frame` pushed on the stack, its growth charged first.
+  fn push(&mut self, frame: Frame, admission: &mut Admission) -> Result<(), Refusal> {
+    grown(&mut self.stack, admission)?;
+    self.stack.push(frame);
     Ok(())
   }
 
@@ -363,6 +414,35 @@ impl Walk {
       connected.push(state);
     }
     Ok(connected)
+  }
+}
+
+/// Room for one more frame on `stack`: when it is full, its capacity doubled (one frame at least), the growth charged
+/// to `admission` before it is made.
+fn grown(stack: &mut Vec<Frame>, admission: &mut Admission) -> Result<(), Refusal> {
+  if stack.len() < stack.capacity() {
+    return Ok(());
+  }
+  let more = stack.capacity().max(1);
+  admission
+    .charge_items::<Frame>(more)
+    .map_err(Refusal::PastAdmission)?;
+  reserve(stack, more)
+}
+
+/// The edges of the object at position `at`, as `pushed` lends its bytes, handed to `each`: whether it could be read.
+/// A blob names nothing, so its bytes are not read; an object whose bytes are not lent could not be read.
+fn edges_of(
+  (at, placed): (usize, &Placed),
+  (format, pushed): (ObjectFormat, &Pushed<'_>),
+  each: &mut impl FnMut(ObjectId, bool),
+) -> Result<bool, Refusal> {
+  if placed.kind == Kind::Blob {
+    return Ok(true);
+  }
+  match pushed.content(at) {
+    Some(content) => for_each_edge((placed.kind, &content), format, each),
+    None => Ok(false),
   }
 }
 
@@ -437,43 +517,4 @@ fn tree_edges(
     }
   }
   whole
-}
-
-/// Puts `node` on the stack, its walk at its first edge.
-fn open(node: usize, offsets: &[usize], marks: &mut [Mark], stack: &mut Vec<(usize, usize)>) {
-  if let Some(mark) = marks.get_mut(node) {
-    *mark = Mark::Open;
-  }
-  let first = offsets.get(node).copied().unwrap_or(0);
-  if stack.len() < stack.capacity() {
-    stack.push((node, first));
-  }
-}
-
-/// Makes `node`'s state the worst of its own and its targets', and marks it done.
-fn finish(
-  node: usize,
-  states: &mut [Connected],
-  offsets: &[usize],
-  targets: &[usize],
-  marks: &mut [Mark],
-) {
-  let start = offsets.get(node).copied().unwrap_or(0);
-  let end = offsets
-    .get(node.saturating_add(1))
-    .copied()
-    .unwrap_or(start);
-  let worst = targets
-    .get(start..end)
-    .unwrap_or_default()
-    .iter()
-    .filter_map(|child| states.get(*child).copied())
-    .max()
-    .unwrap_or_default();
-  if let Some(state) = states.get_mut(node) {
-    *state = (*state).max(worst);
-  }
-  if let Some(mark) = marks.get_mut(node) {
-    *mark = Mark::Done;
-  }
 }

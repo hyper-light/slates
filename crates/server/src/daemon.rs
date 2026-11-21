@@ -4870,7 +4870,6 @@ async fn init_shard(
     nfs_v4_instance: None,
     nfs_calls: slates_bridge_nfs::v4::replay::CallRecords::new(config.nfs_v4.record_bytes),
     nfs_call: None,
-    nfs_pending_base: None,
     held_nfs_replies: std::collections::BTreeMap::new(),
     held_nfs_replies_changed: false,
     recovered_nfs_replies: std::collections::BTreeMap::new(),
@@ -4982,9 +4981,9 @@ async fn init_shard(
     volume_ids_minted: 0,
     acceptance_deferred: false,
     lease_waiters: crate::lease_wait::LeaseWaiters::default(),
-    base_waits: crate::base_wait::BaseWaits::default(),
     work_home: crate::work_home::WorkHome::default(),
     refining: crate::refining::Refining::default(),
+    made_commits: crate::made_commit::MadeCommits::default(),
     forwarded_rings: std::collections::BTreeMap::new(),
     telemetry_quota: config.telemetry_spans_per_reply,
     last_drain_ns: now,
@@ -6747,7 +6746,11 @@ async fn heartbeat_loop(segment: AnchorSegment, control_life: std::sync::mpsc::S
     let now = slates_vfs::clock::Clock::monotonic_ns(&mut clock);
     let counters = registry::with_current(|ctx| ctx.counters()).unwrap_or_default();
     if let Some((beat, before)) = last {
-      log_late_beat(now.saturating_sub(beat), &before, &counters);
+      let gap = now.saturating_sub(beat);
+      if log_late_beat(gap, &before, &counters) {
+        // Counted as well as logged (main's ruling on the lane, 2026-11-20): a late beat is a step past its budget.
+        state::with_state(|s| crate::merge_service::count_phase(s, BEAT_LATE, gap));
+      }
     }
     last = Some((now, counters));
     let (requested, lapse_bound_ns) = match segment.supervision() {
@@ -6803,9 +6806,9 @@ fn log_late_beat(
   gap: u64,
   before: &slates_rt::shard::Counters,
   after: &slates_rt::shard::Counters,
-) {
+) -> bool {
   if !beat_is_late(gap, after.scheduler_overrun_ns) {
-    return;
+    return false;
   }
   let delta =
     |field: fn(&slates_rt::shard::Counters) -> u64| field(after).saturating_sub(field(before));
@@ -6831,7 +6834,12 @@ fn log_late_beat(
     after.longest_step_ns / NS_PER_MS,
     after.scheduler_overrun_ns / NS_PER_MS
   );
+  true
 }
+
+/// Counter pair: the control shard's beats that came late ([`log_late_beat`]), and their gaps in all, nanoseconds: what
+/// a step past the shard's budget costs the beat, a counted bug signal (CLAUDE.md §3 "Bounded work").
+pub(crate) const BEAT_LATE: (&str, &str) = ("daemon.beat.late", "daemon.beat.late_ns");
 
 /// Shape: a beat that late — this share of the shard's window or more after the last — is logged as a near
 /// miss ([`log_late_beat`]): half the window, so the stalls that stop short of a kill are seen too. A scatter's part
@@ -7159,8 +7167,8 @@ mod limits {
 
 #[cfg(test)]
 pub(crate) use tests::{
-  audit_daemon, audit_daemon_configured, audit_daemon_of, audit_on_shard,
-  audit_on_shard_configured, hold_busy, observe_at, observe_first, test_profile,
+  audit_daemon, audit_daemon_configured, audit_daemon_of, audit_daemon_of_configured,
+  audit_on_shard, audit_on_shard_configured, hold_busy, observe_at, observe_first, test_profile,
 };
 
 #[cfg(test)]
@@ -7363,6 +7371,15 @@ mod tests {
   /// A running audit daemon of `shards` shards, bootstrapped, for a test of one shard's call to another (a wait judged
   /// in its target's own time, A-432); the test stops it.
   pub(crate) fn audit_daemon_of(shards: u16) -> super::Daemon {
+    audit_daemon_of_configured(shards, |_| {})
+  }
+
+  /// [`audit_daemon_of`] with its derived configuration changed by `configure` before it starts (a store's handle,
+  /// `crate::test_store::audit_daemon_of_stored`).
+  pub(crate) fn audit_daemon_of_configured(
+    shards: u16,
+    configure: impl FnOnce(&mut crate::DaemonConfig),
+  ) -> super::Daemon {
     let profile = test_profile();
     static NEXT_OF: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let instance = format!(
@@ -7370,7 +7387,8 @@ mod tests {
       std::process::id(),
       NEXT_OF.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
-    let config = crate::DaemonConfig::derive(&profile, &instance, Some(shards));
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(shards));
+    configure(&mut config);
     audit_daemon_with(&profile, config, instance)
   }
 
@@ -7598,7 +7616,9 @@ mod tests {
     use slates_cluster::homes::{HomeMessage, HomeOutcome, PART_BYTES};
     let profile = test_profile();
     let instance = format!("a724-parts-{}", std::process::id());
-    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    let store = crate::test_store::TestStore::start("a724-parts");
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    config.vcs_disk = Some(store.handle());
     let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
       .unwrap()
       .with_content(&super::content_name_of(&instance), config.content_bytes())
@@ -7763,7 +7783,9 @@ mod tests {
     use slates_anchor::AnchorSegment;
     let profile = test_profile();
     let instance = format!("a727b-barrier-{}", std::process::id());
-    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    let store = crate::test_store::TestStore::start("a727b-barrier");
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    config.vcs_disk = Some(store.handle());
     let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
       .unwrap()
       .with_content(&super::content_name_of(&instance), config.content_bytes())
@@ -7784,7 +7806,6 @@ mod tests {
     let (sent, got) = std::sync::mpsc::channel();
     first
       .observe(shard, move |state| {
-        crate::vcs_store::write_version_4_for_test(true);
         let repository = crate::git_push::tests::git_repository(state, "barrier");
         let request = crate::git_push::tests::chain()
           .into_iter()
@@ -7860,7 +7881,190 @@ mod tests {
     let seen = got.recv().ok();
     second.stop();
     drop(segment);
-    assert_eq!(seen, Some((true, true, 0, 0, vec![4])));
+    assert_eq!(seen, Some((true, true, 0, 0, vec![5])));
+  }
+
+  /// A-767 C5 (git onto the changeset store; main's order of 2026-11-20 ~21:20: "red first: a stock git push lands as
+  /// one changeset, and a daemon restarted with kill -9 replays it"). Do: on a daemon over a retained anchor segment
+  /// holding a store (the one shared test store), create a git repository and push the fixtures' `create` as stock git
+  /// sends it, homed and landed as the edge does; stop the daemon with nothing more published, as a kill -9 leaves it,
+  /// and start a successor over the same segment and store. Expect: the successor recovers the repository by reading the
+  /// changeset its record names from the store (one read, no replay refused), `main` at the pushed commit, its record
+  /// version 5 naming sequence 1, and its next landing at sequence 2; the store's log holds the push as one git
+  /// changeset of the repository at sequence 1, after the creation's 0, whose `Names` and `Payload` sections are the
+  /// record's names and pack, the payload the BLAKE3 the record names. Before C5 no push landed anything into the store.
+  #[test]
+  fn t_a767_c5_a_git_push_lands_as_one_changeset_and_a_restart_replays_it_from_the_store() {
+    use slates_anchor::AnchorSegment;
+    use slates_store::log::{ChangesetLog, SectionKind, Tool};
+    let mut store = crate::test_store::TestStore::start("c5-git-push");
+    let profile = test_profile();
+    let instance = format!("c5-git-push-{}", std::process::id());
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    config.vcs_disk = Some(store.handle());
+    let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
+      .unwrap()
+      .with_content(&super::content_name_of(&instance), config.content_bytes())
+      .unwrap();
+    let rendezvous = slates_ipc::HeldRendezvous::hold(&instance).unwrap();
+    let source = || {
+      let (handoff, len) = segment.handoff().unwrap();
+      super::SegmentSource::Handoff {
+        handoff,
+        len,
+        content: segment.content_handoff().unwrap(),
+        rendezvous: rendezvous.adoption(),
+      }
+    };
+    let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
+    first.bootstrap(true).unwrap();
+    let shard = first.shards.first().copied();
+    let (sent, got) = std::sync::mpsc::channel();
+    first
+      .observe(shard, move |state| {
+        let repository = crate::git_push::tests::git_repository(state, "landed");
+        let request = crate::git_push::tests::chain()
+          .into_iter()
+          .next()
+          .map(|(scenario, _)| scenario.request.to_vec())
+          .unwrap();
+        let task = slates_rt::futures::spawn(async move {
+          let answered = crate::git_push::tests::homed_drive(repository, &request).await;
+          let landed = crate::state::with_state(|state| {
+            state
+              .refusals
+              .get(crate::git_push::PUSH_LANDED)
+              .copied()
+              .unwrap_or(0)
+          });
+          let _ = sent.send((repository, answered.map(|_| ()), landed));
+        })
+        .unwrap();
+        slates_rt::futures::detach(task).unwrap();
+      })
+      .unwrap();
+    let (repository, answered, landed) = got.recv().expect("the push answered");
+    answered.expect("the push homed, landed and answered");
+    assert_eq!(landed, Some(1), "the push landed one changeset");
+    // The crash: nothing more published.
+    first.stop();
+    let second = super::Daemon::start(&profile, config, source()).unwrap();
+    let shard = second.shards.first().copied();
+    let (sent, got) = std::sync::mpsc::channel();
+    let watch = move |_: &mut crate::state::ShardState| {
+      let sent = sent.clone();
+      let task = slates_rt::futures::spawn(async move {
+        loop {
+          let seen = crate::state::with_state(|state| {
+            let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+            let recovered = state.vcs_stores.unrecovered(repository).is_none()
+              && !state.vcs_stores.rebuilding(repository)
+              && state.vcs_stores.holds(repository);
+            let main = state
+              .db
+              .partition()
+              .repositories()
+              .branch(repository, "main");
+            let records: Vec<(u32, u64, Option<slates_vcs::ContentId>)> =
+              crate::vcs_store::tests::records(state, repository)
+                .iter()
+                .map(|record| {
+                  let read = crate::vcs_store::record::Record::decode(
+                    record,
+                    slates_git::object_name::ObjectFormat::Sha1,
+                  )
+                  .unwrap();
+                  (
+                    u32::from_le_bytes(record[4..8].try_into().unwrap()),
+                    read.sequence,
+                    read.packed.map(|(identity, _)| identity),
+                  )
+                })
+                .collect();
+            let next = state
+              .vcs_stores
+              .git_ref(repository)
+              .map(|(_, git)| git.landed + 1);
+            (
+              recovered,
+              main.is_some(),
+              count(crate::vcs_store::REPLAY_REFUSED),
+              count(crate::vcs_store::CHANGESET_READ),
+              records,
+              next,
+            )
+          });
+          if let Some(seen) = seen
+            && (seen.0 || seen.2 > 0)
+          {
+            let _ = sent.send(seen);
+            break;
+          }
+          slates_rt::futures::yield_now().await;
+        }
+      });
+      if let Ok(task) = task {
+        let _ = slates_rt::futures::detach(task);
+      }
+    };
+    let started = std::time::Instant::now();
+    let bound = std::time::Duration::from_nanos(10 * crate::daemon::LIVENESS_BUDGET_NS);
+    while second.observe(shard, watch.clone()).is_err() {
+      assert!(
+        started.elapsed() < bound,
+        "the successor's shard never took the watch"
+      );
+      std::thread::park_timeout(std::time::Duration::from_millis(50));
+    }
+    let (recovered, main, refused, read, records, next) = got.recv().expect("recovered");
+    second.stop();
+    drop(segment);
+    assert_eq!(
+      (recovered, main, refused, read, next),
+      (true, true, 0, 1, Some(2)),
+      "recovered from the store's changeset, the next at 2"
+    );
+    let [(version, sequence, Some(pack))] = records[..] else {
+      panic!("one record naming a pack: {records:?}")
+    };
+    assert_eq!((version, sequence), (5, 1));
+    // The store's log, read back from its files: the creation, then the push as one changeset.
+    store.stop_owner();
+    let dir = store.dir().to_path_buf();
+    let log_file = hyper_block::file::DeviceFile::adopt(
+      crate::test_store::root(&dir)
+        .open_file(slates_store::store::LOG_FILE)
+        .unwrap(),
+      &dir.join(slates_store::store::LOG_FILE),
+      hyper_block::file::CachingRequest::Buffered,
+      hyper_block::buf::Alignment::BYTE,
+    )
+    .unwrap();
+    let mut found = Vec::new();
+    let log = ChangesetLog::recover(log_file, 0, |_, located| found.push(*located)).unwrap();
+    let ours: Vec<_> = found
+      .iter()
+      .filter(|located| located.header.repository == u128::from_be_bytes(repository.bytes))
+      .copied()
+      .collect();
+    assert_eq!(
+      ours
+        .iter()
+        .map(|located| (located.header.tool, located.header.sequence))
+        .collect::<Vec<_>>(),
+      vec![(Tool::Git, 0), (Tool::Git, 1)]
+    );
+    let sections = log.sections(&ours[1]).unwrap();
+    assert_eq!(
+      sections
+        .iter()
+        .map(|section| section.kind)
+        .collect::<Vec<_>>(),
+      vec![SectionKind::Names, SectionKind::Payload]
+    );
+    let mut payload = vec![0u8; usize::try_from(sections[1].len).unwrap()];
+    log.read_at(&mut payload, sections[1].offset).unwrap();
+    assert_eq!(slates_vcs::ContentId::of(&payload), pack);
   }
 
   /// A-727 slice a3b (an object past a window across a warm restart; the identity rule). Do: on a daemon over a retained
@@ -7874,7 +8078,9 @@ mod tests {
     const LARGE: usize = 1 << 20;
     let profile = test_profile();
     let instance = format!("a727-a3b-{}", std::process::id());
-    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    let store = crate::test_store::TestStore::start("a727-a3b");
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    config.vcs_disk = Some(store.handle());
     let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
       .unwrap()
       .with_content(&super::content_name_of(&instance), config.content_bytes())
@@ -7966,20 +8172,27 @@ mod tests {
     );
   }
 
-  /// §4.17.1 "A push's intake" part 2 (main's ruling (B), A-727 slice b's barrier). Do: on a daemon over a retained
-  /// anchor segment, land a Subversion work whose text spans several copy slices through `svn_commit::land_work`: its
-  /// text put into the content store a slice a turn, its revision appended naming the text by identity only once the
-  /// text is durable; then stop the daemon without publishing anything more, as a crash right after the entry, and
-  /// start a successor over the same segment. Expect: the successor replays the revision with its stored text held, no
-  /// replay refused, and the text read back whole from the store. Without the barrier (the entry appended right after
-  /// the puts) the text is in no image and the replay is refused `SvnStored`.
+  /// §4.17.1 "A push's intake" part 2 (main's ruling (B)); C2 stage B (the store carries a commit's texts). Do: on a
+  /// daemon over a retained anchor segment holding a changeset store, land a Subversion work whose text spans several
+  /// copy slices through `svn_commit::land_work`: its text put into the content store a slice a turn, then landed in
+  /// the revision's changeset with its record, then the register's entry naming it; then stop the daemon without
+  /// publishing anything more, as a crash right after the entry, and start a successor over the same segment and store.
+  /// Expect: the successor replays the revision, no replay refused, the content store holding nothing of the text (C2
+  /// stage B part 2 (b): a committed text is its changeset's on the node's store, and neither the commit nor the
+  /// recovery keeps it in RAM), and the text read back whole through the node's store. Before stage B the entry waited
+  /// for the shard's image to keep the text (A-727 slice b's barrier); before part 2 (b) the recovery read every stored
+  /// text back into the content store.
   #[test]
   fn a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry() {
     use slates_anchor::AnchorSegment;
     use slates_svn::commit::drive::TextSink;
     let profile = test_profile();
     let instance = format!("svn-intake-barrier-{}", std::process::id());
-    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    // A Subversion repository's history lands on the node's changeset store (C2): the daemons hold one, which the
+    // successor opens again.
+    let mut store = crate::test_store::TestStore::start("svn-intake-barrier");
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    config.vcs_disk = Some(store.handle());
     let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
       .unwrap()
       .with_content(&super::content_name_of(&instance), config.content_bytes())
@@ -8004,9 +8217,9 @@ mod tests {
     let (sent, got) = std::sync::mpsc::channel();
     let put = bytes.clone();
     first
-      .observe(shard, move |state| {
-        let (repository, _) = crate::repository::svn_commit::tests::subversion(state, "barrier");
+      .observe(shard, move |_state| {
         let task = slates_rt::futures::spawn(async move {
+          let (repository, _) = crate::repository::svn_commit::tests::subversion("barrier").await;
           let texts = slates_svn::commit::drive::HeldTexts::new();
           let staged = texts.stage().unwrap();
           texts.append(staged, &put).unwrap();
@@ -8046,6 +8259,10 @@ mod tests {
     assert_eq!(landed.map(|landed| landed.is_ok()), Some(true));
     // The crash: nothing more published.
     first.stop();
+    // Every handle let go first (the configuration's too), so the owner ends, then opens the store again.
+    config.vcs_disk = None;
+    store.restart_owner();
+    config.vcs_disk = Some(store.handle());
     let second = super::Daemon::start(&profile, config, source()).unwrap();
     let shard = second.shards.first().copied();
     let identity = text.identity;
@@ -8060,15 +8277,11 @@ mod tests {
           let recovered = state.vcs_stores.unrecovered(repository).is_none()
             && !state.vcs_stores.rebuilding(repository)
             && state.vcs_stores.holds(repository);
-          let whole = crate::vcs_store::lent_state(state, |state| {
-            let len = state
-              .vcs_stores
-              .subversion_records(repository)?
-              .stored_len(&identity)?;
-            let store = state.vcs_stores.content()?;
-            store.object_bytes(&store.root_of(&slates_vcs::ContentId(identity)), len)
-          });
-          (recovered, refused, whole)
+          let kept = state
+            .vcs_stores
+            .content()
+            .is_some_and(|content| content.contains(&slates_vcs::ContentId(identity)));
+          (recovered, refused, kept)
         })
         .ok()
     };
@@ -8076,18 +8289,43 @@ mod tests {
       std::time::Instant::now() + std::time::Duration::from_millis(50).saturating_mul(600);
     let mut seen = read();
     while std::time::Instant::now() < deadline
-      && !seen
-        .as_ref()
-        .is_some_and(|seen| (seen.0 && seen.2.is_some()) || seen.1 > 0)
+      && !seen.as_ref().is_some_and(|seen| seen.0 || seen.1 > 0)
     {
       std::thread::park_timeout(std::time::Duration::from_millis(50));
       seen = read();
     }
+    // The text read back whole through the node's store, as a reader that needs it whole does, then given back.
+    let (sent, got) = std::sync::mpsc::channel();
+    let len = text.size;
+    second
+      .observe(shard, move |_state| {
+        let task = slates_rt::futures::spawn(async move {
+          let brought = crate::vcs_store::svn_texts::bring_whole(repository, identity, len).await;
+          let whole = crate::state::with_state(|state| {
+            let whole = crate::vcs_store::lent_state(state, |state| {
+              let store = state.vcs_stores.content()?;
+              store.object_bytes(&store.root_of(&slates_vcs::ContentId(identity)), len)
+            });
+            crate::repository::svn_commit::release_texts(state, None, &[identity]);
+            whole
+          })
+          .flatten();
+          let _ = sent.send(whole.filter(|_| brought));
+        })
+        .unwrap();
+        slates_rt::futures::detach(task).unwrap();
+      })
+      .unwrap();
+    let whole = got
+      .recv_timeout(std::time::Duration::from_millis(50).saturating_mul(600))
+      .expect("the read answered");
     second.stop();
     drop(segment);
-    let seen =
-      seen.map(|(recovered, refused, whole)| (recovered, refused, whole == Some(bytes.clone())));
-    assert_eq!(seen, Some((true, 0, true)));
+    assert_eq!(seen, Some((true, 0, false)));
+    assert!(
+      whole == Some(bytes),
+      "the text did not read back whole through the store"
+    );
   }
 
   /// A-727 slice a3 (repository windows across a warm restart). Do: on a daemon over a retained anchor segment, make a
@@ -8119,7 +8357,9 @@ mod tests {
     }
     let profile = test_profile();
     let instance = format!("a727-windows-{}", std::process::id());
-    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    let store = crate::test_store::TestStore::start("a727-windows");
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    config.vcs_disk = Some(store.handle());
     // The content object holds the shard's arena, so the windows' chunks survive with it (§4.8).
     let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
       .unwrap()
@@ -8138,15 +8378,17 @@ mod tests {
     let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
     first.bootstrap(true).unwrap();
     let shard = first.shards.first().copied();
-    let before = first
+    first
       .observe(shard, |state| {
         let repository = crate::git_push::tests::git_repository(state, "kept");
         crate::git_push::tests::pushed_from_the_fixtures(state, repository, &["create", "update"]);
         crate::vcs_store::paths::whole_build::settle(state);
-        windows(state)
       })
       .unwrap();
     first.publish_every_shard().unwrap();
+    // Read once the shard has had its turns since the pushes: a landed push gives its pack's holds back in turns after
+    // its landing (ccd07b58c), which a synchronous history holding the shard never lets run.
+    let before = first.observe(shard, windows).unwrap();
     first.stop();
     let second = super::Daemon::start(&profile, config, source()).unwrap();
     // The successor's own shard: shard ids are the process's, and another test's daemon may take the first's.
@@ -8205,7 +8447,9 @@ mod tests {
     use slates_anchor::AnchorSegment;
     let profile = test_profile();
     let instance = format!("a729-identities-{}", std::process::id());
-    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    let store = crate::test_store::TestStore::start("a729");
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    config.vcs_disk = Some(store.handle());
     let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
       .unwrap()
       .with_content(&super::content_name_of(&instance), config.content_bytes())
