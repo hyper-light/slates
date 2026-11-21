@@ -1888,7 +1888,7 @@
 > **Built (A-649 part 4):** the server's adapter from §4.15's host seam to the import's (`slates-server`'s `hg_base`):
 > one name at a time under the repository's directory, an absent file `None`, the host's refusals carried through, a
 > name not UTF-8 refused by kind, a file read within its length when it was opened, a host's short answer read on and
-> an S3 base's pending fetch carried through (never read as the file's end), at most a directory and two files held
+> a later refusal carried through (never read as the file's end), at most a directory and two files held
 > whatever a path's depth, everything closed when the lend ends; proven on macOS arm64 (Mac Studio, 11 of 11) by two
 > stores imported through the simulated host equal to the same files read from memory, the guards each by a test; its
 > red run against a stub and each guard's mutation owed to main.
@@ -3862,9 +3862,8 @@
 > - **Mantle**'s agent, asked on 2026-11-18 whether it waits on slates, has not answered; its kiln track (plan T10)
 >   puts kiln's bytes on Mantle through kiln's `Blobs`, and two of its steps reach slates, neither started: CP-T10.4 keeps slates snapshots on Mantle, which needs a snapshot's
 >   archive taken out through `slates-api` and a volume made from one (the archive exists inside the daemon, for the
->   fleet's copies and a takeover, with no verb for a host); CP-T10.5 lays a slates overlay over Mantle's objects until
->   Mantle's file system ships, which needs a base read from an object store rather than a host folder (§4.15 knows
->   only a host folder). Both wait on T10.1 to T10.3.
+>   fleet's copies and a takeover, with no verb for a host); CP-T10.5, a slates overlay over Mantle's objects read
+>   from an S3-compatible store, is declined (A-795, 2026-11-20). CP-T10.4 waits on T10.1 to T10.3.
 
 > **Open (g267, 2026-11-18): a volume moves between fleet nodes, and kiln's runners form the fleet.** Kiln moves an
 > agent between runners only without a volume (`harness/relocate.rs` refuses one), so the work owed is §4.10's
@@ -15583,81 +15582,11 @@ Owed:
 Shards streams on macOS have the same shape and are covered: their writes are logged since `1fa154230`; on Windows
 since A-402, which also makes the log option 2 names available to the WinFsp drive.
 
-### 2026-11-18: an overlay's base read from S3 objects (Mantle's CP-T10.5; designed and its pure core built, A-464; its network client built, A-471; its host, oracle and naming built, A-524; a request parked on its pending fetch, A-555; the volume over it owed)
+### 2026-11-20: Mantle's CP-T10.5 S3 ask declined (A-795)
 
-> - **Designed.** §4.15 "An S3 base": a directory listed lazily by a delimited `ListObjectsV2`, a file read by ranged
->   `GetObject` bound to its object by `If-Match` (or its version id), a replaced object a new file (A-151) whose drift
->   reaches every mapped copy (A-163), a deleted object a missing entry, every request SigV4-signed, credentials in RAM
->   only, no external runtime, every bound derived, laptop ≡ fleet. From S3's API reference and guides, fetched
->   2026-11-18.
-> - **Built (part 1, the pure core in `crates/base/src/s3`).** `sigv4` (held to the S3 signing page's four worked
->   examples), `list` (a `ListObjectsV2` page, its cap checked before parsing, every hostile shape refused by kind) and
->   `keys` (the tree and one directory's listing, every key that names no path refused by kind). Proven (Mac Studio,
->   debug, kiln r389): `cargo test --locked -p slates-base --lib -- s3`, 14 of 14 (the four golden vectors, twenty
->   hostile pages, a page cut anywhere and arbitrary bytes, every unnamable key); red once each (`$` unreserved, `<!`
->   passed over, `..` a name).
-> - **Built (part 2, A-471).** The network client in `crates/base/src/s3` (`client`, `http`, `tls`, `wait`):
->   `HeadObject`, ranged `GetObject` bound by `If-Match` or a version id, and `ListObjectsV2` pages, signed, over the
->   runtime's TCP and rustls over aws-lc-rs, every length capped before it is held, every wait learned from the path's
->   round trips within the caller's liveness window and ceiling, every answer typed. Proven (Mac Studio, debug, kiln
->   r447): `cargo test --locked -p slates-base --lib -- s3`, 30 of 30 (the client's seven against an in-process fake
->   store on loopback, over TLS and in the clear; the framing's five, twenty-three hostile answers among them; the
->   waits' three); red once each (a `412` untyped, `If-Match` not sent, no back-off, a length past its cap let
->   through); `cargo xwin check -p slates-base` (Windows x86_64) clean.
-> - **Built (part 3, A-524).** `S3Host` (`crates/base/src/s3/host.rs`), the host seam over the base's objects, sans-io:
->   a miss answers `HostError::Pending` (`VfsError::BasePending`, `Unpublished` on the wire) and names its fetch, one
->   however many calls miss on it; a directory is its delimited listing, serving one learned round trip and listed again
->   after it while it answers; a file bound to its object by `If-Match` and its version (a versioned bucket's replaced
->   object still reads its own version; elsewhere `412` or `404` makes the handle stale); chunks and listings cached
->   within the caller's budget. `SimS3` (`sim.rs`) is its oracle; `S3Base` (`name.rs`) the library's naming, exported by
->   `slates-api` (contract 43). Proven (Mac Studio, debug, 2026-11-19): `cargo test --locked -p slates-base --lib -- s3`
->   49 of 49 (the host's eight, the oracle over 256 generated histories on versioned and unversioned buckets, `SimS3`'s
->   two, the naming's four); the api's naming and contract tests 2 of 2; red first four ways (a landed range unkept, a
->   `412` taken for an unavailable store, a version unbound, a stale listing never listed again).
-> - **Built (A-555): a request waits for the fetch it met.** A pending answer names its fetch
->   (`HostError::Pending(FetchId)`, `VfsError::BasePending(FetchId)`): one name a directory's listing, one a run of
->   chunks, and `S3Host::landed` says which fetch a landing settled. The shard parks a request on the fetch it met
->   (`crates/server/src/base_wait.rs`, the fetch noted by a lens where the slot's host is lent), wakes it when that fetch
->   lands and no other, and serves it again; at most the shard's client credit of waits (past it the retry at once,
->   `base.wait.full`) and at most the failover delay a request (`base.wait.overdue`). An NFS call parks so, local or
->   forwarded (`nfs::serve_local_fetched`); a request that could not wait is answered the retry, FUSE `EAGAIN` and NFS
->   `NFS3ERR_JUKEBOX`, no longer `EIO` or a server fault. What a fetch landed is held while requests are parked on it
->   (`S3Host::hold_for_waiters`, `release_held`), and a landing the unheld cache cannot keep is counted
->   (`HostCounts::unkept`). A slot's base host is a `BaseHost` (a host directory or an S3 base). Proven: see A-555's
->   evidence.
-> - **Owed.**
->   - A-555's second piece built (the fetch driver, `slates_base::s3::driver`): a volume's owner shard runs its host's
->     fetches one at a time, woken by the host when one is wanted and ended when the host is dropped, each answer handed
->     to `base_wait::land` (`spawn_driver`). Started where a volume over an S3 base is made (A-791); its start at a
->     recovery waits on the credential's hold across a restart (below).
->   - A-555's third piece written (Linux-only, not compiled by its author, filed for main's build): a FUSE request that
->     met a pending fetch is kept off the device by its mount, waits on a task of the shard for that fetch, and is
->     dispatched again before the device is read (`crate::fuse`'s `keep`, `slates_bridge_fuse::channel::dispatch_kept`).
->   - A-555's remainder: WinFsp's answer (its catch-all) and the waits of the Shards streams, slates'
->     virtio-fs device and the typed channel's verbs (`Unpublished`, retryable); and the end-to-end run: an NFS read of
->     a volume over an S3 base through a daemon, its fetch answered by `SimS3`, once a volume over an S3 base can be
->     made. A volume destroyed (or its host replaced) while requests wait on its fetches leaves them to their deadline,
->     the failover delay, then the retry: its slot's removal should wake them.
->   - Part 2's remainder: the platform's trust roots (a source of roots to choose: compiled-in or the operating
->     system's store), name resolution (the caller resolves the endpoint today), the read-ahead from the measured
->     bandwidth-delay product, and a live run against a real S3-compatible store, which also reads
->     `Counts::longest_token` against the caps' assumption that no continuation token is longer than an encoded key.
->   - The volume over an S3 base (A-524's status in §4.15): the wire's create naming a base and the credential's
->     hand-off are built (A-791: `CreateOverS3`, the owner shard's `S3Host` and driver, `BaseRecord::S3` without the
->     credential); owed: the credential held by the anchor across a restart and the recovery over an S3 base that uses
->     it (until then such a volume recovers unavailable, `BaseUnavailable`), a clone of such an overlay (refused
->     `BaseUnavailable` now), the library's `VolumeSpec` over an S3 base, name resolution of the endpoint's host (an
->     IPv4 address alone today); the base plane's host calls audited for
->     a pending answer (some take a host refusal for an absence: `fingerprint_at_path`'s `open_file(..).ok()?`); recovery
->     over an S3 base (a pending reacquisition marks its directory unavailable, errno 0); a landing of an overlay over an
->     S3 base into a host directory (its base's own landing is refused `BaseUnavailable`); and the N=1 differential
->     through `SimS3`.
->   - Closed (A-555): the fetches under way could shed each other's landed runs through a small cache before their
->     requests ran again; what a fetch landed is now held until the last request parked on it has run.
->   - The listing page and request caps assume a continuation token no longer than an encoded key (S3 states no
->     length): the client counts the longest a listing names (`Counts::longest_token`); the live run reads it.
->   - The cross-target lint of `slates-base` with its new `aws-lc-rs`, `rustls`, `slates-rt` and `slates-transport`
->     dependencies (Windows through `cargo xwin clippy`, the Linux targets): main's.
+> Mantle's CP-T10.5, a slates overlay laid over Mantle's objects through a base read from an S3-compatible store, is
+> declined: Ada never asked for an S3 base and said NFS, so the S3 base built for it (A-464, A-471, A-524, A-555,
+> A-791) is removed whole (A-795). An overlay's base is a host directory or a green's tree (A-774).
 
 ### 2026-11-18: a volume made from an archive through the library (Mantle's CP-T10.4 import half; built, A-453)
 

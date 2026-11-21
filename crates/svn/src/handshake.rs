@@ -85,7 +85,7 @@
 //! contexts are what a token's credential record keeps (§4.13), made when the token is enrolled, so
 //! each digest is finished from a kept MD5 state: MD5 is written here from RFC 1321 (`rfc1321`), since
 //! neither RustCrypto's `md-5` 0.10, which A-599 took with its `hmac`, nor the vendored aws-lc-rs
-//! (MD5 as `digest::MD5_FOR_LEGACY_USE_ONLY`, a local change for S3, and HMAC over the SHA family
+//! (MD5 as `digest::MD5_FOR_LEGACY_USE_ONLY`, a local change, and HMAC over the SHA family
 //! alone) lets a caller start from a kept state. Both libraries are its tests' oracles.
 //!
 //! **Bounds.** The client's items are read with the item codec ([`crate::ra_svn`]) within bounds
