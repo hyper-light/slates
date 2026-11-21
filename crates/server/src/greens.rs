@@ -38,6 +38,8 @@ pub struct Greens {
   lineages: BTreeMap<RepositoryId, RefCell<Lineage>>,
   /// Lends refused because the member's lineage was lent already, or had a member taken out (module docs).
   busy: Cell<u64>,
+  /// Lends refused because the green owes a push (P2, `crate::green_ready`): the reach around the choke point, counted.
+  owing_reached: Cell<u64>,
   /// Retired members' releases still owed, oldest first (module docs, "A retire is sliced").
   pending: VecDeque<(RepositoryId, Release)>,
   /// Whether this shard's release task is running.
@@ -113,8 +115,51 @@ impl DerefMut for GreenMut<'_> {
 }
 
 impl Greens {
-  /// `id`'s engine, lent: `None` when there is none, or when its lineage is lent already (counted).
+  /// `id`'s engine, lent: `None` when there is none, when its lineage is lent already (counted), or when it owes a push
+  /// and holds no content yet (P2; counted): every reader reaches a green's content through `crate::green_ready`, which
+  /// materializes it first, so nothing reads around it. [`Greens::lend`] lends one that owes, for the materializer.
   pub fn get(&self, id: &VolumeId) -> Option<GreenRef<'_>> {
+    let lent = self.lend(id)?;
+    if lent.is_materialized() {
+      return Some(lent);
+    }
+    self
+      .owing_reached
+      .set(self.owing_reached.get().saturating_add(1));
+    None
+  }
+
+  /// `id`'s engine, lent for a write: as [`Greens::get`], `None` for a green that owes a push (counted).
+  pub fn get_mut(&mut self, id: &VolumeId) -> Option<GreenMut<'_>> {
+    let owing = self.lend(id).is_some_and(|lent| !lent.is_materialized());
+    if owing {
+      self
+        .owing_reached
+        .set(self.owing_reached.get().saturating_add(1));
+      return None;
+    }
+    self.lend_mut(id)
+  }
+
+  /// Makes `id`'s green owe `push` (P2, `Green::defer`): the version it owes, or none (no such green, or one that cannot
+  /// owe it).
+  pub fn defer(&mut self, id: &VolumeId, push: slates_merge::push::DeferredPush) -> Option<u64> {
+    self.lend_mut(id)?.defer(push)
+  }
+
+  /// Whether `id`'s green owes a push (P2): held, and not materialized.
+  pub fn is_owing(&self, id: &VolumeId) -> bool {
+    self.lend(id).is_some_and(|lent| !lent.is_materialized())
+  }
+
+  /// Reaches refused because the green owed a push ([`Greens::get`]): zero in a build where every reader goes through
+  /// `crate::green_ready`.
+  pub fn owing_reached(&self) -> u64 {
+    self.owing_reached.get()
+  }
+
+  /// `id`'s engine, lent whether or not it owes a push: the materializer's, a replay's and a create's lend alone (P2).
+  pub fn lend(&self, id: &VolumeId) -> Option<GreenRef<'_>> {
     if let Some(green) = self.alone.get(id) {
       return Some(GreenRef::Alone(green));
     }
@@ -130,9 +175,9 @@ impl Greens {
     lent.map(|lent| GreenRef::Member(Box::new(lent)))
   }
 
-  /// `id`'s engine, lent for a write: `None` when there is none, or when a member of its lineage is taken out
-  /// (counted).
-  pub fn get_mut(&mut self, id: &VolumeId) -> Option<GreenMut<'_>> {
+  /// `id`'s engine, lent for a write whether or not it owes a push: the materializer's, a replay's and a create's (P2).
+  /// `None` when there is none, or when a member of its lineage is taken out (counted).
+  pub fn lend_mut(&mut self, id: &VolumeId) -> Option<GreenMut<'_>> {
     if let Some(green) = self.alone.get_mut(id) {
       return Some(GreenMut::Alone(green));
     }

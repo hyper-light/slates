@@ -4984,6 +4984,7 @@ async fn init_shard(
     work_home: crate::work_home::WorkHome::default(),
     refining: crate::refining::Refining::default(),
     made_commits: crate::made_commit::MadeCommits::default(),
+    materializations: crate::green_ready::Materializations::default(),
     forwarded_rings: std::collections::BTreeMap::new(),
     telemetry_quota: config.telemetry_spans_per_reply,
     last_drain_ns: now,

@@ -11,8 +11,10 @@
 //! reads D(k) too), the request drives [`turn`] until it answers [`Turned::Idle`]: each turn takes the repository's
 //! derivation under way, or begins one of every version not yet known (`Repository::deriving_due`, the oldest heads
 //! first, so each derivation's search back finds the one before as its base), and runs it for the shard's quantum on its
-//! clock, at least one unit, keeping each version's sets as it comes (`Repository::keep_derived`). The request yields
-//! between turns. Unlike an encoding, a derivation is never left behind a fetch: the fetch's answer is made from these
+//! clock, at least one unit, keeping each version's sets as it comes (`Repository::keep_derived`), and goes on so while
+//! nobody else waits on the shard, to the step's ceiling (A-783's pace, as a push's build runs): a clone of git/git's
+//! branches derived 8 versions in 3,024,021 turns, a few units each, each paying the shard's lend, its settle and a
+//! yield (r52, 465 s). The request yields between turns. Unlike an encoding, a derivation is never left behind a fetch: the fetch's answer is made from these
 //! sets, so it waits for them, a unit a turn, the shard free between.
 //!
 //! **Bounds.** One derivation a repository, kept between turns, so the derivations under way are bounded by the
@@ -95,34 +97,7 @@ fn turn_lent(state: &mut ShardState, id: RepositoryId, quantum_ns: u64) -> (Turn
     }
   };
   let mut deriving = deriving;
-  let mut clock = ShardClock;
-  let mut derived = 0u64;
-  let quantum = Quantum {
-    clock: &mut clock,
-    ns: quantum_ns,
-  };
-  let outcome = match repository.derive_turn(content, &mut deriving, quantum) {
-    Ok(Derived::More) => Ok(Turned::More),
-    Ok(Derived::Sets {
-      green,
-      version,
-      sets,
-    }) => match repository.keep_derived(content, (green, version), &sets) {
-      Err(refused) => Err(refused),
-      // A version kept ends the turn: its put was the turn's last unit.
-      Ok(_) => {
-        derived = derived.saturating_add(1);
-        Ok(Turned::More)
-      }
-    },
-    // Done with the versions it queued; a push meanwhile may have left more, which the next turn queues.
-    Ok(Derived::Done) => Ok(if repository.derivations_due() {
-      Turned::More
-    } else {
-      Turned::Idle
-    }),
-    Err(refused) => Err(refused),
-  };
+  let (outcome, derived) = paced(repository, content, &mut deriving, quantum_ns);
   let answer = match outcome {
     Ok(Turned::More) => {
       // Kept for the next turn unless it is done.
@@ -136,6 +111,55 @@ fn turn_lent(state: &mut ShardState, id: RepositoryId, quantum_ns: u64) -> (Turn
   };
   super::settle(state);
   answer
+}
+
+/// Turns of `deriving` while nobody else waits on the shard, to the step's ceiling (A-783's pace, the module doc), each
+/// version kept as it comes: what came of it, and the versions kept.
+fn paced(
+  repository: &slates_git::store::Repository,
+  content: &mut slates_vcs::ContentStore,
+  deriving: &mut Deriving,
+  quantum_ns: u64,
+) -> (Result<Turned, slates_git::store::StoreRefused>, u64) {
+  let began = slates_rt::futures::now_ns();
+  let ceiling = slates_rt::futures::step_ceiling_ns()
+    .unwrap_or(quantum_ns)
+    .max(quantum_ns);
+  let go_on = || {
+    !slates_rt::futures::others_waiting()
+      && slates_rt::futures::now_ns().saturating_sub(began) < ceiling.saturating_sub(quantum_ns)
+  };
+  let mut clock = ShardClock;
+  let mut derived = 0u64;
+  loop {
+    let quantum = Quantum {
+      clock: &mut clock,
+      ns: quantum_ns,
+    };
+    match repository.derive_turn(content, deriving, quantum) {
+      Ok(Derived::More) if go_on() => {}
+      Ok(Derived::More) => return (Ok(Turned::More), derived),
+      Ok(Derived::Sets {
+        green,
+        version,
+        sets,
+      }) => {
+        if let Err(refused) = repository.keep_derived(content, (green, version), &sets) {
+          return (Err(refused), derived);
+        }
+        derived = derived.saturating_add(1);
+        if !go_on() {
+          return (Ok(Turned::More), derived);
+        }
+      }
+      // Done with the versions it queued; a push meanwhile may have left more, which the next turn queues.
+      Ok(Derived::Done) => {
+        let due = repository.derivations_due();
+        return (Ok(if due { Turned::More } else { Turned::Idle }), derived);
+      }
+      Err(refused) => return (Err(refused), derived),
+    }
+  }
 }
 
 /// Drops repository `id`'s derivation under way, if any: its repository is freed.

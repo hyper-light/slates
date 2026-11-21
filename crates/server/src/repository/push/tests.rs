@@ -866,3 +866,512 @@ fn t_a694_an_append_makes_each_new_branch_its_own_green() {
     );
   });
 }
+
+thread_local! {
+  /// P2's test: the store an owed push reads its objects from, on the shard's thread.
+  static OWED_STORE: std::cell::RefCell<Store> = std::cell::RefCell::new(Store::default());
+}
+
+/// P2's test objects: [`OWED_STORE`], as `crate::green_ready` reads an owed push's objects.
+fn owed_objects() -> Box<dyn PushObjects> {
+  Box::new(OWED_STORE.with(|store| store.borrow().clone()))
+}
+
+/// A request's completion as its reply, if recorded.
+fn completed_reply(
+  state: &ShardState,
+  (origin, id): (u64, slates_wire::request::RequestId),
+) -> Option<ReplyBody> {
+  match state
+    .db
+    .partition()
+    .completion(origin, id.client, id.sequence)
+  {
+    slates_wire::request::Seen::Completed(bytes) => {
+      <ReplyBody as slates_wire::Wire>::from_bytes(&bytes).ok()
+    }
+    _ => None,
+  }
+}
+
+/// The owed green's version 1 durable, its chain entry the push's record (not a work) and shorter than the eager
+/// green's.
+fn owed_is_its_record(state: &ShardState, (owed, eager): (DbVolumeId, DbVolumeId)) {
+  let partition = state.db.partition();
+  assert_eq!(partition.green_head(owed), 1, "the owed version is durable");
+  let owed_entry = partition
+    .green_chain(owed)
+    .first()
+    .cloned()
+    .expect("the owed entry");
+  let eager_entry = partition
+    .green_chain(eager)
+    .first()
+    .cloned()
+    .expect("the eager entry");
+  assert!(
+    slates_merge::push::DeferredPush::is_record(&owed_entry),
+    "the push's record, not a work"
+  );
+  assert!(
+    owed_entry.len() < eager_entry.len(),
+    "{} against {}",
+    owed_entry.len(),
+    eager_entry.len()
+  );
+}
+
+/// P2 (main's ruling of 2026-11-21 05:12; w-git's request): a created ref's green owes its push and is made when first
+/// reached. Do: push one change creating branch `eager` with its built work and one creating `owed` deferring the same
+/// tree (`BranchChange::CreateDeferred`); read `owed` around the door; fold and checkpoint it; then create a work over it
+/// as a client's recorded request, and wait for the answer; then replay it from its durable chain. Expect:
+/// - `owed` owes its push: `Greens::get` lends nothing (counted), its durable head is 1, its version-1 entry is the
+///   push's record and far smaller than `eager`'s, and its fold and checkpoint do nothing;
+/// - the request parks (no answer, no completion), the green is materialized, then the request is answered, a work
+///   created over version 1;
+/// - `owed` then reads as `eager`: the same head, files and head identity;
+/// - its replay from the durable chain stands at its base and owes version 1 again, as a restart leaves it.
+#[test]
+fn a_deferred_create_is_made_when_first_reached_and_reads_as_the_eager_create() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let id = slates_wire::request::RequestId {
+    client: 7,
+    sequence: 1,
+  };
+  let (eager, owed) = crate::daemon::observe_first(&daemon, move |state| {
+    let (repo, main) = repository(state, "p2");
+    let mut store = Store::default();
+    let tree = store.put_tree(&[("f", b"one"), ("g", b"two")]);
+    let built = work(state, main, (0, None), (tree, b"h1"), (&store, 1));
+    let owed_push = slates_merge::push::Push {
+      name: [2; 32],
+      base_version: 0,
+      base_tree: None,
+      tree,
+      head: Some(b"h1"),
+    };
+    let changes = vec![
+      BranchChange::Create {
+        name: "eager".to_owned(),
+        from: main,
+        version: 0,
+        work: Some(built),
+      },
+      BranchChange::CreateDeferred {
+        name: "owed".to_owned(),
+        from: main,
+        version: 0,
+        push: slates_merge::push::DeferredPush::of(&owed_push, ROOM),
+      },
+    ];
+    let pushed = push(state, &owner(), repo, changes, EntryParts::default()).expect("pushed");
+    assert!(pushed.recorded);
+    let branch_of = |name: &str| {
+      state
+        .db
+        .partition()
+        .repositories()
+        .branch(repo, name)
+        .expect("the branch")
+    };
+    let (eager, owed) = (branch_of("eager"), branch_of("owed"));
+    assert!(
+      state.greens.is_owing(&owed),
+      "the deferred green owes its push"
+    );
+    let reached = state.greens.owing_reached();
+    assert!(state.greens.get(&owed).is_none(), "no lend around the door");
+    assert_eq!(
+      state.greens.owing_reached(),
+      reached + 1,
+      "the reach counted"
+    );
+    owed_is_its_record(state, (owed, eager));
+    crate::merge_service::checkpoint_green(state, owed);
+    assert!(
+      state.db.partition().green_checkpoint(owed).is_none(),
+      "an owing green's checkpoint is nothing"
+    );
+    OWED_STORE.with(|held| *held.borrow_mut() = store);
+    crate::green_ready::TEST_OBJECTS.with(|objects| objects.set(Some(owed_objects)));
+    let parked = crate::verbs::run_recorded_for_test(
+      state,
+      (7, id),
+      &owner(),
+      RequestBody::CreateWork {
+        green: crate::verbs::to_wire_volume(owed),
+        name: "over-owed".to_owned(),
+      },
+    );
+    assert!(parked.is_none(), "parked, not answered: {parked:?}");
+    assert!(
+      completed_reply(state, (7, id)).is_none(),
+      "nothing recorded while parked"
+    );
+    (eager, owed)
+  });
+  let began = std::time::Instant::now();
+  let answered = loop {
+    let answered =
+      crate::daemon::observe_first(&daemon, move |state| completed_reply(state, (7, id)));
+    if answered.is_some() || began.elapsed() > std::time::Duration::from_secs(60) {
+      break answered;
+    }
+  };
+  let (reads, replayed, made) = crate::daemon::observe_first(&daemon, move |state| {
+    let mut read = |green: DbVolumeId| {
+      let mut engine = state.greens.get_mut(&green).expect("materialized");
+      let files: Vec<(String, Vec<u8>)> = engine
+        .files()
+        .map(|(path, bytes)| (path, bytes.to_vec()))
+        .collect();
+      (engine.head(), files, engine.head_identity())
+    };
+    let reads = (read(owed), read(eager));
+    let made = state
+      .refusals
+      .get(crate::green_ready::MATERIALIZED)
+      .copied();
+    (
+      reads,
+      crate::verbs::replay_green_for_test(state, owed),
+      made,
+    )
+  });
+  daemon.stop();
+  assert!(
+    matches!(answered, Some(ReplyBody::WorkCreated { .. })),
+    "the parked request answered once the green was made: {answered:?}"
+  );
+  assert_eq!(made, Some(1), "materialized once");
+  assert_eq!(reads.0, reads.1, "the owed green reads as the eager one");
+  assert_eq!(
+    replayed,
+    Some((0, Some(1))),
+    "replayed, it stands at its base and owes version 1 again"
+  );
+}
+
+/// Waits on `daemon`'s first shard until request `id` of origin 7 is answered, within a minute: its reply.
+fn answered_on_shard(
+  daemon: &crate::daemon::Daemon,
+  id: slates_wire::request::RequestId,
+) -> Option<ReplyBody> {
+  let began = std::time::Instant::now();
+  loop {
+    let answered =
+      crate::daemon::observe_first(daemon, move |state| completed_reply(state, (7, id)));
+    if answered.is_some() || began.elapsed() > std::time::Duration::from_secs(60) {
+      return answered;
+    }
+  }
+}
+
+/// P2's memory-sizing rule (main's order of 05:16: derived content is never kept unbounded). Do: create two branches
+/// that each owe a push, keep at most one untouched green materialized, then read the first, the second, and the first
+/// again, each as a client's recorded request that writes nothing. Expect: each read answered; reading the second
+/// drops the first back to owing (counted), and reading the first again makes it again; three materializations and the
+/// drops counted, the second still materialized at the end.
+#[test]
+fn an_untouched_materialized_green_past_the_bound_is_dropped_back_and_made_again_when_read() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let ask = |sequence: u32| slates_wire::request::RequestId {
+    client: 7,
+    sequence,
+  };
+  let (first, second) = crate::daemon::observe_first(&daemon, move |state| {
+    let (repo, main) = repository(state, "p2-bound");
+    let mut store = Store::default();
+    let tree = store.put_tree(&[("f", b"one"), ("g", b"two")]);
+    let owed = |name: &str, tag: u8| BranchChange::CreateDeferred {
+      name: name.to_owned(),
+      from: main,
+      version: 0,
+      push: slates_merge::push::DeferredPush::of(
+        &slates_merge::push::Push {
+          name: [tag; 32],
+          base_version: 0,
+          base_tree: None,
+          tree,
+          head: Some(b"h1"),
+        },
+        ROOM,
+      ),
+    };
+    push(
+      state,
+      &owner(),
+      repo,
+      vec![owed("first", 1), owed("second", 2)],
+      EntryParts::default(),
+    )
+    .expect("pushed");
+    let branch_of = |name: &str| {
+      state
+        .db
+        .partition()
+        .repositories()
+        .branch(repo, name)
+        .expect("the branch")
+    };
+    OWED_STORE.with(|held| *held.borrow_mut() = store);
+    crate::green_ready::TEST_OBJECTS.with(|objects| objects.set(Some(owed_objects)));
+    crate::green_ready::TEST_KEEP_BOUND.with(|bound| bound.set(Some(1)));
+    (branch_of("first"), branch_of("second"))
+  });
+  let read = |sequence: u32, green: DbVolumeId| {
+    crate::daemon::observe_first(&daemon, move |state| {
+      crate::verbs::run_recorded_for_test(
+        state,
+        (7, ask(sequence)),
+        &owner(),
+        RequestBody::Versions {
+          green: crate::verbs::to_wire_volume(green),
+        },
+      )
+    })
+  };
+  assert!(read(1, first).is_none(), "the first read parks");
+  let one = answered_on_shard(&daemon, ask(1));
+  assert!(read(2, second).is_none(), "the second read parks");
+  let two = answered_on_shard(&daemon, ask(2));
+  let after_two = crate::daemon::observe_first(&daemon, move |state| {
+    (
+      state.greens.is_owing(&first),
+      state.greens.is_owing(&second),
+    )
+  });
+  assert!(read(3, first).is_none(), "the first, dropped, parks again");
+  let three = answered_on_shard(&daemon, ask(3));
+  let counted = crate::daemon::observe_first(&daemon, move |state| {
+    let count = |name| state.refusals.get(name).copied().unwrap_or(0);
+    (
+      count(crate::green_ready::MATERIALIZED),
+      count(crate::green_ready::DEMATERIALIZED),
+      state.greens.is_owing(&first),
+    )
+  });
+  daemon.stop();
+  for (n, answer) in [one, two, three].into_iter().enumerate() {
+    assert!(
+      matches!(answer, Some(ReplyBody::Versions { .. })),
+      "read {} answered: {answer:?}",
+      n + 1
+    );
+  }
+  assert_eq!(
+    after_two,
+    (true, false),
+    "the first dropped back to owing, the second kept"
+  );
+  assert_eq!(
+    counted,
+    (3, 2, false),
+    "three made, two dropped (first, then second), the first made at the end"
+  );
+}
+
+/// P2 at f > 0 (main's order of 05:51, R8: laptop and fleet one code path). Do: push an eager create and an owed create
+/// of the same tree; take the merge record the owner ships holders for the owed version 1 (`enqueue_record`'s inputs and
+/// identity); apply it to a holder's replica of the green at version 0 as a holder does (`apply_inputs`, the record's
+/// recomputation and the ledger rebuild alike); offer the replica a later increment; then adopt the replica as a
+/// takeover successor does and make it from the push's objects, as the successor's door would. Expect:
+/// - the shipped inputs are the push's record, not a work, and the identity the owing green's (its base's);
+/// - the replica owes version 1 (`reached`), its head identity the record's, so a takeover counting it finds it whole;
+/// - a later increment is refused `merge.replica.owes` while it owes, nothing applied;
+/// - made, the adopted replica reads as the eager green: head, files, head identity.
+#[test]
+fn a_holders_replica_owes_the_same_push_and_a_takeover_makes_it_the_eager_green() {
+  crate::test_store::audit_on_stored_shard("p2-holder", |state| {
+    let (repo, main) = repository(state, "p2-holder");
+    let mut store = Store::default();
+    let tree = store.put_tree(&[("f", b"one"), ("g", b"two")]);
+    let built = work(state, main, (0, None), (tree, b"h1"), (&store, 1));
+    let owed_push = slates_merge::push::Push {
+      name: [2; 32],
+      base_version: 0,
+      base_tree: None,
+      tree,
+      head: Some(b"h1"),
+    };
+    let changes = vec![
+      BranchChange::Create {
+        name: "eager".to_owned(),
+        from: main,
+        version: 0,
+        work: Some(built.clone()),
+      },
+      BranchChange::CreateDeferred {
+        name: "owed".to_owned(),
+        from: main,
+        version: 0,
+        push: slates_merge::push::DeferredPush::of(&owed_push, ROOM),
+      },
+    ];
+    push(state, &owner(), repo, changes, EntryParts::default()).expect("pushed");
+    let branch_of = |name: &str| {
+      state
+        .db
+        .partition()
+        .repositories()
+        .branch(repo, name)
+        .expect("the branch")
+    };
+    let (eager, owed) = (branch_of("eager"), branch_of("owed"));
+    let (inputs, identity) =
+      crate::merge_service::shipped_for_test(state, owed, 1).expect("the shipped record");
+    assert!(
+      slates_merge::push::DeferredPush::is_record(&inputs),
+      "the push's record is the inputs"
+    );
+    let mut replica = slates_merge::engine::Green::new();
+    assert_eq!(
+      identity,
+      replica.head_identity(),
+      "the owing green's identity is its base's"
+    );
+    assert_eq!(
+      crate::merge_service::apply_inputs(&mut replica, &inputs, 1),
+      Ok(())
+    );
+    assert!(!replica.is_materialized());
+    assert_eq!(replica.reached(), 1, "the replica stands for version 1");
+    assert_eq!(
+      replica.head_identity(),
+      identity,
+      "its identity is the record's"
+    );
+    let mut later = built.clone();
+    later.id = [9; 32];
+    later.base = 1;
+    assert_eq!(
+      crate::merge_service::apply_inputs(&mut replica, &later.encode(), 2),
+      Err(crate::merge_service::REPLICA_OWES)
+    );
+    assert_eq!(replica.reached(), 1, "nothing applied while it owes");
+    let mut building = replica
+      .materializing(slates_merge::pace::Pace::unbounded())
+      .expect("it owes a push");
+    let made = loop {
+      if let Some(made) = building.advance(&replica, &store) {
+        break made.expect("built");
+      }
+    };
+    assert_eq!(replica.materialize(&made.increment), Ok(1));
+    let mut engine = state.greens.get_mut(&eager).expect("the eager green");
+    let files = |green: &slates_merge::engine::Green| -> Vec<(String, Vec<u8>)> {
+      green
+        .files()
+        .map(|(path, bytes)| (path, bytes.to_vec()))
+        .collect()
+    };
+    assert_eq!(
+      (replica.head(), files(&replica), replica.head_identity()),
+      (engine.head(), files(&engine), engine.head_identity()),
+      "the adopted replica, made, reads as the eager green"
+    );
+  });
+}
+
+/// P2's retention (main's order of 05:51: secured before the build commits, as the admission rule charges, with a typed
+/// refusal at the room). Do: push a create that owes its push; hold the green's retention charge at its cap; read it as a
+/// client's recorded request; then free the room and read again. Expect: with no room the materialization is refused
+/// before it commits (counted `merge.green.materialize_over_room`), the green still owes, nothing recorded; with room the
+/// second read makes it and is answered. Settled after the commit, as before this change, it committed past the room.
+#[test]
+fn a_materialization_past_the_greens_retention_room_is_refused_before_it_commits() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let ask = |sequence: u32| slates_wire::request::RequestId {
+    client: 7,
+    sequence,
+  };
+  let owed = crate::daemon::observe_first(&daemon, move |state| {
+    let (repo, main) = repository(state, "p2-room");
+    let mut store = Store::default();
+    let tree = store.put_tree(&[("f", b"one"), ("g", b"two")]);
+    let change = BranchChange::CreateDeferred {
+      name: "owed".to_owned(),
+      from: main,
+      version: 0,
+      push: slates_merge::push::DeferredPush::of(
+        &slates_merge::push::Push {
+          name: [3; 32],
+          base_version: 0,
+          base_tree: None,
+          tree,
+          head: Some(b"h1"),
+        },
+        ROOM,
+      ),
+    };
+    push(state, &owner(), repo, vec![change], EntryParts::default()).expect("pushed");
+    let owed = state
+      .db
+      .partition()
+      .repositories()
+      .branch(repo, "owed")
+      .expect("the branch");
+    OWED_STORE.with(|held| *held.borrow_mut() = store);
+    crate::green_ready::TEST_OBJECTS.with(|objects| objects.set(Some(owed_objects)));
+    // The green's own retention cap, held: no room for any byte more.
+    let cap = u64::try_from(crate::merge_service::rejected_cache_budget(state)).unwrap_or(u64::MAX);
+    state.green_retention.insert(owed, cap);
+    owed
+  });
+  let read = |sequence: u32| {
+    crate::daemon::observe_first(&daemon, move |state| {
+      crate::verbs::run_recorded_for_test(
+        state,
+        (7, ask(sequence)),
+        &owner(),
+        RequestBody::Versions {
+          green: crate::verbs::to_wire_volume(owed),
+        },
+      )
+    })
+  };
+  assert!(read(1).is_none(), "the first read parks");
+  let began = std::time::Instant::now();
+  let refused = loop {
+    let seen = crate::daemon::observe_first(&daemon, move |state| {
+      (
+        state
+          .refusals
+          .get(crate::green_ready::MATERIALIZE_OVER_ROOM)
+          .copied()
+          .unwrap_or(0),
+        state.greens.is_owing(&owed),
+        completed_reply(state, (7, ask(1))).is_some(),
+      )
+    });
+    if seen.0 > 0 || began.elapsed() > std::time::Duration::from_secs(60) {
+      break seen;
+    }
+  };
+  crate::daemon::observe_first(&daemon, move |state| {
+    state.green_retention.insert(owed, 0);
+  });
+  assert!(read(2).is_none(), "the second read parks");
+  let answered = answered_on_shard(&daemon, ask(2));
+  let made = crate::daemon::observe_first(&daemon, move |state| {
+    (
+      state.greens.is_owing(&owed),
+      state
+        .refusals
+        .get(crate::green_ready::MATERIALIZED)
+        .copied()
+        .unwrap_or(0),
+    )
+  });
+  daemon.stop();
+  assert_eq!(
+    refused,
+    (1, true, false),
+    "refused before it committed: still owing, nothing recorded"
+  );
+  assert!(
+    matches!(answered, Some(ReplyBody::Versions { .. })),
+    "{answered:?}"
+  );
+  assert_eq!(made, (false, 1), "made once there was room");
+}

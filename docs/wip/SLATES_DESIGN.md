@@ -59221,6 +59221,12 @@ What changes where:
 - **Fresh objects of a create** are attributed to the push's first move in the landing map. Upload then offers that
   move's fragment and encodes the rest loose: correct, maybe slower (GAPS).
 
+**Paced** (r52: a clone of git/git's branches took 465 s, its 8 derivations 3,024,021 turns of a few units each, each
+paying the shard's lend, its settle and a yield). The server's derivation turn goes on while nobody else waits on the
+shard, to the step's ceiling, as A-783 paces a push's build (`vcs_store::git_derive`).
+`git_push::tests::t_a614a_a_long_historys_derivation_takes_turns_by_the_shards_pace_not_its_objects`: red 2,404 turns
+for one version of a 600-commit line; green at most 8.
+
 **Tests** (main's conditions):
 1. The map-model oracle (`store::tests::oracle`) has tags (annotated and lightweight, at old commits) and a replay. Every
    derived set equals the model's closures before and after the replay, and the replay walks nothing.
@@ -59255,4 +59261,84 @@ inside appends. Green: none inside an append, and the room made in the turns.
 
 Also applied to: `crates/server/src/git_push.rs`, `crates/server/src/git_push/hooks.rs`,
 `crates/server/src/repository/push.rs`, `crates/git/src/receive/works.rs`, `docs/wip/GAPS.md`.
+
+### A-812 — A created ref's green owes its push and is made when first reached, through one door (2026-11-21, w-rewrite-ops; main 05:16 PST, P2's engine half, w-git's request; A-647's derived data, A-618, A-664's whole build, A-752)
+Applied in the same change to:
+- `crates/merge/src/push.rs`: `DeferredPush` and its record ("GDEF"); `Building` over a `?Sized` `PushObjects`.
+- `crates/merge/src/engine.rs`: `Green::defer`, `is_materialized`, `deferred`, `materializing`, `materialize`, the
+  owed tail; a checkpoint and a fold of an owing green are nothing.
+- `crates/server/src/green_ready.rs` (new).
+- `crates/server/src/greens.rs`: `get` and `get_mut` lend no owing green; `lend`, `lend_mut`, `is_owing`, `defer`,
+  `owing_reached`.
+- `crates/server/src/repository/push.rs`: `BranchChange::CreateDeferred`.
+- `crates/server/src/verbs.rs`: the door in `run_recorded` and `owner_judge`, `ParkedKind::Request`, and a replay of a
+  GDEF record.
+- `crates/server/src/vcs_store.rs`: `with_owed_push_objects`, which w-git fills for git.
+
+- **Why.** A git create composed its ref's whole tree at the push. git/git's history push makes 1,027 greens of a
+  4,876-file tree each, and could not land.
+- **What.**
+  - A created green owes its push: a `DeferredPush` (name, base version, base tree, tree, head, room), recorded as its
+    version 1 by a record of its own kind, not the built work.
+  - It is made when first reached. Today's `push::Building` runs over the tool's `PushObjects`, a unit a turn under half
+    the shard's step quantum, and `Green::materialize` commits the work as the owed version. So the made green is the
+    eager create's by construction: one builder over one input.
+  - Every request reaches a green's content through one door, `crate::green_ready::green_ready`. A recorded request on
+    an owing green, or on a work over one, parks and runs again whole once the green is made; so does an owner's step of
+    a submit. A request with no route answers `Overloaded`, unrecorded.
+  - `Greens::get` and `get_mut` lend no owing green, counted by `owing_reached`, so nothing reads one around the door,
+    and a checkpoint or a fold of one does nothing.
+  - A replay meeting a GDEF record defers the green. Entries after it wait in the engine's tail and apply once it is
+    made, so a recovery builds nothing.
+  - Main's memory-sizing rule: a materialized green nobody has written to (its chain is the push's record alone, no
+    checkpoint, no work over it) is dropped back to owing when more than one per client seat are kept, least recently
+    read first. Counted: `merge.green.materialized`, `merge.green.dematerialized`.
+- **Evidence.**
+  - `push::tests::a_green_that_owes_a_push_materializes_to_the_eager_create`. Over generated push histories with folds,
+    a green deferred then materialized over turns, and one replayed from records, read as the eager green: head,
+    identity, files and changed paths at every version, retention, checkpoint.
+  - `a_version_recorded_after_an_owed_push_is_applied_once_it_is_materialized` (the tail).
+  - `a_deferred_push_record_refuses_every_damaged_form` (every cut, every flipped byte, a trailing byte).
+  - `repository::push::tests::a_deferred_create_is_made_when_first_reached_and_reads_as_the_eager_create`. The owing
+    green lends nothing, its durable head is 1 and its entry the push's record, smaller than the eager entry; its
+    checkpoint is nothing; a recorded request parks, then is answered once the green is made; it then reads as the
+    eager green; and its replay owes version 1 again.
+  - `an_untouched_materialized_green_past_the_bound_is_dropped_back_and_made_again_when_read`: three materializations
+    and two drops at a bound of one.
+- **Owed** (GAPS, P2):
+  - git's objects (w-git's half);
+  - a deferred version's merge record to holders at f > 0;
+  - the signature verdict of a version replayed into an owing green's tail;
+  - the materialized content's retention charge before the build (it is settled after).
+
+### A-813 — An owed version goes to holders, its materialization is secured before it commits, and its tail keeps its signatures (2026-11-21, w-rewrite-ops; main 05:51 PST: A-812's robustness gaps; R8, A-321, A-16)
+Applied in the same change to:
+- `crates/merge/src/engine.rs`: `Green::reached`, and the owed signatures.
+- `crates/server/src/merge_service.rs`: `apply_inputs`, `REPLICA_OWES`, an owed version's inputs and identity.
+- `crates/server/src/merge_origin.rs` and `crates/server/src/green_adopt.rs`: replica versions by `reached`.
+- `crates/server/src/repository/push.rs`: an owed version's record enqueued.
+- `crates/server/src/green_ready.rs`: retention secured before the commit.
+- `crates/server/src/verbs.rs`: a replayed owed version's identity is its base's.
+- GAPS (A-812).
+
+What changed:
+- **Holders at f > 0 (R8: one code path).** An owed version's merge record is enqueued as any version's.
+  - Its inputs are the push's record, and its identity is the owing green's, its base's.
+  - A holder applies inputs through one function, `apply_inputs`, used by both the record's recomputation and the ledger
+    rebuild. A push's record makes the replica owe the same push.
+  - Replica versions are counted by `Green::reached`: the owed version and its tail, or the head when nothing is owed.
+    So a takeover adopts at the version the replica stands for, and the successor's door makes the green.
+  - An increment after an owed version meets a replica that still owes and is refused `merge.replica.owes` (GAPS A-812
+    (b), open).
+- **Retention.** Once the build is done and before `materialize` commits, the work's history and change index are
+  secured through the submit's own `secure_retention`. Past the room, the parked requests are answered
+  `BudgetExceeded`, typed with the bytes available; the green keeps owing (`merge.green.materialize_over_room`).
+- **Tail signatures (A-321).** A verdict recorded for a version an owing green stands for (up to `reached`) is kept, and
+  recorded once materialization applies the version.
+- **Evidence.**
+  - `a_holders_replica_owes_the_same_push_and_a_takeover_makes_it_the_eager_green`: the shipped inputs are the push's
+    record; the replica owes version 1 at the record's identity; a later increment is refused while it owes; made, the
+    adopted replica reads as the eager green.
+  - `a_materialization_past_the_greens_retention_room_is_refused_before_it_commits`.
+  - `a_signature_recorded_on_a_version_in_the_owed_tail_is_kept` (red: the verdict was refused while owing).
 
