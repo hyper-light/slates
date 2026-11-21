@@ -2846,7 +2846,7 @@
 > a server-made revision (`land_made`, A-804's made commits) stages its texts the same way (`svn_commit::stage_texts`,
 > shared with `land_revision`); held by `a_server_made_commit_is_answered_only_once_its_revision_landed_and_committed`
 > (its text named stored, none in RAM; red before: kept in RAM). Every new Subversion text now lands on the store and
-> nothing keeps one in RAM but the green's head and a hook view's pins. CLOSED (A-818, main 09:20): the deltify record
+> nothing keeps one in RAM but the green's head and a hook view's pins. CLOSED (A-819, main 09:20): the deltify record
 > and APIs retired, a log holding one refused typed at decode and a revision with inline texts at replay
 > (`a_log_holding_a_retired_record_or_inline_texts_is_refused_typed_at_rebuild`); `KeptText` stays for records
 > standing alone, which a daemon's no longer reach. Stage C,
