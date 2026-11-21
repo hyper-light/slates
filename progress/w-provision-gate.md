@@ -33,6 +33,13 @@
   estimator), 3 rounds, ~/.cache/w-provision-gate-arms/ab6.txt. r3 (macOS exclusive --record baseline) lost its runner,
   requeued.
 
+- ~21:00: C1 robustness LANDED 99c599ce5 (bound = max(quiet spinning p99, loaded parked p99); main red 3/3, candidates
+  green 6/6). P2 A/B ab6 done (BENCHMARKS "the candidates"): time + nap arms meet R9 quiet (28-43 us), loaded p99 3-5x
+  better, but loaded p999 5.6-23.4 vs main 2.1-2.5 ms and 2-6x quiet CPU -> NOT landed; P2 open (loaded p999 hop next,
+  with g222). Land worktree's uncommitted shard.rs = nap arm; time arm saved in ~/.cache/w-provision-gate-fix/p2/.
+  C1 remaining: kiln r4 (`macos exclusive`, ratchet --provision --record from the ci worktree) queued. When it ends:
+  commit its ratchets.toml diff to main (area `ratchet:`), then write inbox/main-from-w-provision-gate-close.md for C1.
+
 ## Queue
 1. DONE measure; DONE gate (2c8f89de6); DONE red (bench loaded bound).
 2. NEXT: A-387's held-turn estimate forgets by turn count (cheap turns forget a ms preemption in microseconds); weigh

@@ -6873,6 +6873,12 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - What the logs show (C:\Users\corph\.cache\w-interop\matrix-git\anchor.log): the daemon was killed (exit 143) at
   12:42:43.98 and restarted as pid 470456. That is after the last row's log (ssh-fetch, 12:42:42), and the successor
   logged nothing before the run ended. No row log in logs\ holds the "Failed to connect" text.
+- Status (later 2026-11-20): kiln can't sync my worktree to jupiter (it times out at 60 s), so the test builds in a
+  clone of main 0916cf5b4 at C:\Users\corph\w-reaper-win, with target C:\Users\corph\.cache\w-reaper-target and log
+  C:\Users\corph\.cache\w-reaper-r60.log. The debug build had reached slates-cli when jupiter's runner restarted, and
+  jupiter has been offline in kiln since. To finish: `cd /c/Users/corph/w-reaper-win && CARGO_TARGET_DIR=/c/Users/corph/.cache/w-reaper-target
+  cargo test -p slates-cli --test vcs_edge_restart -- --nocapture`. The likely cause of the report is w-interop's own
+  teardown (4b335a696: Git Bash's kill ends the daemon, then the anchor with its held listeners), not a lost port.
 
 ## 2026-11-20, w-forming: A-771 rebuild in steps (main b831a2877; commit cb1b698f0, base a7df9ccf0)
 - clippy + xtask over `crates/cluster/src/sealed.rs` (RawOpening) and `crates/server/src/live_ship.rs` (Rebuilding steps, Laying, hashed_chunk).
