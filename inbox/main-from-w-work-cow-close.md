@@ -41,3 +41,18 @@ c1e76d0a7/d2ad10da4 (MCP slates.merge.check/read_check/resolve, CLI slates check
 through studio-3, never as agents/codex-* branches (nothing of the Codex trees was pushed: the port is new commits on
 main). Not ported, recorded in GAPS: the Codex rebase_with refinement (a kept op conflicting only on a path the
 replacement re-establishes answers the windows instead). A-255, A-257, A-263-A-267 untouched (A-267's kept verdict reused).
+
+### Codex strand finished (main's 22:54 routing: CLI/MCP adapters, rebase_with, conflict-mutants' tests) + the wire red
+- Wire red (A-796's tags unpublished, slates-ipc --test wire_order): FIXED db80da5e8 (CheckMerge 98, ReadMergeCheck 99,
+  ResolveMerge 100 after A-795's RemovedCreateOverS3 97; MergeChecked, StaleMergeView; MergeView and WorkChange held).
+  Test: slates-ipc --test wire_order 2/2.
+- CLI/MCP adapters: c1e76d0a7 (via d2ad10da4). Test: mcp the_mcp_surface_serves_the_tools; cli the_grammar_parses_the_merge_verbs.
+- rebase_with (AC-6.13): 4930bf14b (via 544020bd2), Green::rebase_establishing. Test: merge_check
+  a_kept_mode_on_a_file_the_resolution_writes_anew_is_not_a_conflict (red: Conflict(f, DeleteModify)).
+- conflict-mutants: its restart finding was a real hole (a stamp from before a restart named the work after one more edit,
+  red Ok(Rebased(0))); fixed in 4930bf14b by seeding a work's revision from its partition's next_seq(). Test: merge_check
+  a_stamp_from_before_a_restart_never_names_the_work_after_it_changed. Its racing-resolvers and stale-page cases are held
+  by merge_check's moved-head refusal and verdict_pages' replaced-verdict refusal (A-267).
+- Note: 544020bd2 is studio-3's merge of 4930bf14b over a main that had moved again (an auto-merged verbs.rs change I did
+  not re-test after). Focused on my tree after merging e14493d62: merge_check 3/3, works_off_owner 16/16.
+- Not mine: vcs_store::paths::tests::t_a664_* (submit refused Overloaded) fails at d8416294c, before A-796 (w-fed-faults' red).

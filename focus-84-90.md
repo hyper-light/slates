@@ -1466,3 +1466,15 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   RUN: main's 100k rerun is queued as kiln r48 (needs macos,cpus=16,mem=40g,disk=40g; 2 h bound; a fresh clone of main; kernel tree 5f22fb204). kiln refuses a pinned run when the pinned machine lacks room, so it goes unpinned and carries its own tree. kiln's estimate: the big Studio, by about 02:42. Results go to w-fed-move.
   RULING: w-git C5 2b approved. Pushes write version 5 only and are refused when short. Made commits adopt w-svn's deferred-submit hook (one hook); version 2 stays in GAPS until then. A new refusal variant publishes its wire tag in the same commit.
   MEMORY: Studio-4 had 0.3-14 GB free, with swap at 18.6 of 19.5 GB. Most of it is a Virtualization VM up since boot (18 GB resident plus 30 GB compressed), not an agent's. g226 trimmed its worktree: 42 -> 53 GB disk free.
+- 2026-11-21 00:48 PST LANDED (on main):
+  - 71e55b6c2 (w-shared lane 3a): a holder's forward is held to its own progress, and acknowledged bytes count as progress.
+  - 002a7944f (w-svn P8): a 500 MB svn commit on the changeset store took 11.2 s over svn:// and 13.9 s over DAV, peak 4,067 MiB (8x the text, 12x before).
+  - cc917a1bf and 8508a8d52 (w-svn P7): the git-2000 import takes 26.2 s, peak 1,570 MiB (3.6x the dump).
+  - 1bfe51f88: stock svnsync 1.15 measured against a store-backed daemon (A-772).
+  RULING (w-shared, the owner's durable step): (A), by reference, not (B). (B) is a layer that (A) deletes, and it keeps two copies. (A) removes the work and carries 3b. Durability is proven first, then chain entry format 6 as a durable format change, retention until checkpoint, one content store. Meanwhile 3a is measured in release at 64-512 MiB, 10 runs each.
+- 2026-11-21 00:53 PST LANDED (on main):
+  - 2c32af2b5 (w-rewrite-ops, A-787 part 2's red): the cause was the merge engine's reanchor at O(n k) twice over, not the refinement job's slicing. It now runs in O((n + k) log k): 80,000 ops take 90 ms, was 22.5 s, with a property test against the old scan. green_post_state passes 8 of 8 in debug.
+  - 73cbdfc42 (w-shared): a file's mode moves with its rename.
+  w-git R2 found: the keepalive went out only after two 5 s intervals, exactly the edge tests' 10 s patience, so they failed 18 of 18 under load. Fix d9c014fa0, on test.
+  RULING: w-shared's (A) pieces approved. The push writers move in piece 1, one format at a time, and w-git, w-hg and w-svn get an hour's notice.
+  KILN: an outage around 00:45-00:50 cost w-rewrite-ops its close-note push. Every runner but Studio-2 was back at 00:54.

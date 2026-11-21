@@ -61,3 +61,17 @@
   It reads the changeset back from the node's store; the region-home read is owed a test of its own (in GAPS).
 - **C5 part 2b, next:** remove versions 2 and sequence 0, so a homing or landing that falls short refuses the push; and
   read the replay's pack a piece at a time through `StorePacks`.
+
+## R2, the load-only edge tests: CLOSED (2026-11-21 ~01:00 PST)
+- **Commit:** origin/main 970950081 (fix d9c014fa0).
+- **Cause, found with a timing diagnostic (kiln r28, main cf6b3c98a, six concurrent copies of the three tests on the
+  MacBook at load 24):** 18 of 18 failed, each with one reply gap of 6.7 to 7.0 s, and no long step anywhere else. A
+  push's answer under side-band-64k wrote its first keepalive two intervals after its body: `body_end` waited one
+  interval and wrote nothing, then the reply waited its own interval before appending it. That made 10 s, the client's
+  patience, so any push answer past 5 s failed.
+- **Fix:** the keepalive is written as soon as it's due, the silence measured from the last write. The homing and the
+  store's landing run on a task the exchange awaits across its keepalives, and the report is held until the push's
+  records are held at f + 1, with the keepalive written meanwhile.
+- **Red, then green:** the same six-way run (kiln r29, d9c014fa0, load 29 to 33): 18 of 18 passed, against 18 of 18
+  failed before. `vcs_http::`, `git_push::` and `vcs_ssh::`: 168 passed. Format clean.
+- **Owed (GAPS):** the SSH edge's receive still carries its homing and landing inline, with no keepalive between.
