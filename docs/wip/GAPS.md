@@ -23,6 +23,14 @@
 >   stays 1,009–1,011 µs (run 44860060964), and the band survives no idle spin and no hold (run 44861831509): a kicked
 >   shard waits a millisecond for a CPU. The lane's own ping-pong floor beside the bench: p99 4.7–5.1 µs, p999 0.8–2.7 ms.
 >   New finding, not worked: Windows' completion-port wait rounds up to whole milliseconds too (`crates/rt/src/iocp.rs`).
+> - **Linux's band found (2026-11-20, g222): the client's own reply spin.** While a client spins for its reply, the
+>   shard it woke gets no CPU on the oversubscribed lane, so the shard runs when the spin ends: the queued wait clusters
+>   where the spin ends (1 ms spin: 1.0 ms; 200 µs: 0.2 ms; park at once: none; runs 44868692669, 44869944205), and the
+>   per-park stamps show a kicked shard running ~1 ms after it parked whatever the kick's time (run 44867818237).
+>   Loaded accept p99 by the client's wait: the library default (its wake estimate) 1.7–5.1 ms, capped at 50 µs 1.9–2.1,
+>   yielding each spin turn 12–18 (rejected), parked at once **0.32–0.39 ms** (conflict 0.30–0.91); parking at once
+>   costs the quiet median 15–30 µs (runs 44871159397, 44873199369). Loaded p999 0.9–4.0 ms in every arm (the floor's
+>   0.8–2.8). **Owed:** main's decision on the client's sync wait (§4.7's spin, R9's spinning provisioning form).
 > - Windows (CI, run 44857045148): no 1 ms band (queued p99 5–49 µs); accept p99 0.13–0.31 ms, conflict 0.11–0.29 ms;
 >   p999 0.2–62 ms. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–7).
 >
