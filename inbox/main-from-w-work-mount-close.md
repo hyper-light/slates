@@ -58,3 +58,5 @@ All five items (C1 C2 R3 R4 P5) are closed on origin/main.
   --all-targets -D warnings clean.
 - By-use (stock git and hg clone/push/pull against a Windows --vcs-store daemon): not yet run; jupiter's C: has 8.2 GB
   free, and a cold build of slates-cli's interop tests needs more (my old 35 GB target there is gone).
+
+- By-use run r1 ENDED WITHOUT RUNNING (2026-11-21 ~14:55 PST): "the kiln runner closed the connection" while queued (jupiter "haven't answered"); no rows. Not resubmitted: main gave the store's by-use round to w-k90-win (14:31). Commands handed to main.
