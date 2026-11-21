@@ -1468,7 +1468,6 @@ dependencies = [
  "serde_json",
  "slates-anchor",
  "slates-archive",
- "slates-base",
  "slates-bridge-fuse",
  "slates-bridge-nfs",
  "slates-bridge-oci",
@@ -1505,19 +1504,12 @@ dependencies = [
 name = "slates-base"
 version = "0.1.0"
 dependencies = [
- "aws-lc-rs",
  "blake3",
  "libc",
- "proptest",
- "rcgen",
  "rustix",
- "rustls",
  "slates-bridge-oci",
  "slates-machine",
  "slates-mem",
- "slates-rt",
- "slates-test-seeds",
- "slates-transport",
  "slates-vfs",
  "windows-sys 0.60.2",
 ]

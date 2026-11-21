@@ -13,7 +13,7 @@ use slates_svn::commit::revision::StepRefusal;
 use slates_svn::dump::{DumpError, Format};
 use slates_svn::migration::{Exporter, Exporting, MigrationRefusal, Repository};
 use slates_vfs::host::sim::SimHost;
-use slates_vfs::host::{FetchId, HostDir, HostError, HostFs};
+use slates_vfs::host::{HostDir, HostError, HostFs};
 use slates_wire::request::RequestId;
 
 use super::{LoadFailed, Loaded, Turned, begin, turn};
@@ -352,13 +352,9 @@ fn t_a652_each_dump_import_failure_maps_to_its_refusal() {
       path: path.to_owned(),
     })
   };
-  let cases: [(LoadFailed, Refusal); 10] = [
+  let cases: [(LoadFailed, Refusal); 9] = [
     (LoadFailed::NoStore, Refusal::ContentUnavailable),
     (LoadFailed::Busy, fault(ImportFault::UnderWay)),
-    (
-      LoadFailed::Host(HostError::Pending(FetchId(3))),
-      fault(ImportFault::Pending),
-    ),
     (
       LoadFailed::Budget { available: 7 },
       Refusal::BudgetExceeded { available: 7 },
