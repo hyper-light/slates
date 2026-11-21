@@ -1536,3 +1536,8 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - RULING (w-fed-move): its 1,000-client stand-in is clean at 6,040 verdicts/s, so the 100k wall grows with scale. Inject the three scale knobs one at a time (bases N behind, history length, M works pinning the floor) and measure per-kind answer times; the knob whose cost grows is the mechanism and the red. r48 confirms it.
   - DISK: the MacBook at 26 GB, every slates target active. Holding unless under 20 GB.
 - 2026-11-21 01:43 PST Quiet. No new landings on main since 01:36. w-shared's 3a release bench (r21) and w-git's r56 are running; w-shared committed its format-6 red. The MacBook disk recovered to 36 GB. w-work-cow is deaf like w-engine (an idle harness from the big Studio's 22:40 batch, pid 14504; my 01:02 message about the post-verdict hook admitted but never taken in), so main called agents_restart.
+- 2026-11-21 01:48 PST
+  - LANDED: 9061acd6c (w-svn, C2 B2 (a): get-file waits for a stored text's piece RAM lacks and reads it through the store).
+  - REASSIGNED: the deferred-submit hook (svn_made's acceptance and git's made commits wait for the store's landing; one hook) moves from w-work-cow, deaf after agents_restart, to w-rewrite-ops, whose A-787 park is the nearest mechanism. Red first; svn_made adopts it; git drops version 2 in the same series. Not on main yet (searched).
+  - w-git's push cut-off: small pushes are fine on main (cut-1.0 in 5.1 s); r56 with every counter is running.
+  - The MacBook disk is 34 GB.
