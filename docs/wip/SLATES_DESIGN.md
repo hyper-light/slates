@@ -70,6 +70,15 @@ the two cross-cutting sections keep their numbers.
 | R9 | Sub-50 µs provisioning. | The provisioning path is decomposed step by step with a cited cost per step and a per-step budget; the end-to-end histogram (p50, p99, p999, max) is a permanent CI gate. |
 | R10 | Disk is written only on a user permission grant, and the grant follows the mode the user gave the agent (A-285). | A grant is a database record bound to the exact manifest it is about to write; the launcher's write policy decides whether the daemon issues it at once (bypass), answers an approval request that the harness presents (ask) or refuses (a forbidding mode); an agent can never raise its own policy; every grant, manifest, and outcome is in the audit log (§4.15). |
 
+> **R9's gate, built (A-786, 2026-11-20).** The histogram is its own ratcheted lane, `cargo xtask ratchet --provision`:
+> `provision_bench` alone, every gated row (spinning and parked p50, p99, p999; max informational) held to its machine's
+> ceilings, which only tighten, every run's rows kept (`target/provision-histogram.tsv`); the bench itself fails past the
+> 50 µs floor and, run with `PROVISION_BENCH_LOAD=<n>`, past a loaded bound derived from the quiet run and the load (the
+> load may add to the spinning 1-client p99 at most what it adds to the parked p99). Wiring the lane into CI on a
+> reference machine is a run request (w-lint, main). **Open, in flight:** the loaded p99 misses its bound on main
+> (macOS arm64: 1.62 ms against 0.87 ms; GAPS 8a-r9-gate), measured to macOS's zero-timeout `kevent` in the shard's busy
+> harvest.
+
 > **R1's reading for repositories (A-767, 2026-11-20, Ada's storage ruling; designed, not built).** A version-control
 > repository's history is kept on disk: a node's store directory is a landing target granted once (R10's record) and
 > written only by landings of accepted changesets and by the derived store's fills under it, through `slates-store`
@@ -11123,7 +11132,10 @@ numbers conflict, and the same node made twice converges.
 > submission ended (open, accepted as a version, or collided where), and the landings awaiting a grant (§4.15), the
 > collided works and those landings named first. A read (`RequestBody::SessionLog`), a scatter over the shards like
 > `grants`, each shard reading its works and its partition's waiting-landing index, never the landing history; it
-> shows a pending grant and never makes one (R10). Owed: the MCP tool and the SDKs' read.
+> shows a pending grant and never makes one (R10). A-788: the same view over MCP (`slates.log`, read-only, the JSON
+> `slates log --json` prints, one definition: `slates_mcp::session_log_json`) and in the SDKs' sync clients (Python
+> `session_log()`, Node `sessionLog()`, the same keys in each one's case). Owed: the async SDK forms (the async clients
+> carry single requests; the log is a paged walk, as `drifted` is, sync alone too).
 
 > **Status (2026-11-20, A-785: held merges in the session log).** A submission an ask policy holds for approval
 > (A-285) needs the human as a collision and a waiting landing do: the work remembers the held increment's identity and
@@ -57547,6 +57559,15 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > `hyper-rt`'s cross-thread channel, whose ring is `unsafe impl Send`/`Sync` (CLAUDE.md §3 forbids it): a decision for
 > main between porting a safe channel into `slates-rt` and driving `ShardDb` inline with no worker pool.
 
+> **Status (2026-11-20, piece C2 step 1: `slates_rt::sync`).** Main's ruling on 2b: no `hyper-rt`, no `unsafe impl
+> Send`/`Sync`; the vendored seams are ported onto `slates_rt`. `crates/rt/src/sync` carries upstream's channel
+> surface (`channel`, `channel_with`, `Sender`, `ChannelReceiver`, `SyncError`) with no `unsafe`: values cross through
+> the standard library's bounded channel, a waiting task's word sits in upstream's generational cell table (ported,
+> safe), sender tasks waiting for room hold places granted in turn (upstream's room, its places cells of that table),
+> and a plain thread blocks inside the standard channel. Tests 11 of 11 (`cargo test -p slates-rt --lib sync::`, macOS
+> arm64, Adas-Mac-Studio-2): thread to thread, task from thread, task waiting for room, closes, cells given back.
+> Next: the issuer, crc, codec, disk, chunk and engine on it (vendor patches), then the land seam for their files.
+
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
 seam; (4) the A/B of item 7; (5) Mercurial onto it (w-hg), (6) git (w-git's B1-B4), (7) Subversion (w-svn), each with
@@ -57847,6 +57868,21 @@ Evidence: `cargo test --locked -p slates-server --test session_log a_merge_held_
 red with the note disabled (the log named nothing), green with it; `--test session_log` 4 passed; `-p slates-cli --bin
 slates log_view` 3; `-p slates-client --lib session_log` 1; `-p slates-ipc --test wire_order` 2 (macOS arm64, this
 Mac, local).
+
+### A-788 — The session log over MCP and in the SDKs (2026-11-20, w-sessionlog; main's order 15:20 PST, item 4; A-773, §4.12, R10)
+`slates.log` is an MCP tool answering the JSON `slates log --json` prints, from one definition moved into `slates-mcp`
+(`session_log_json`), which the CLI now calls. The Python and Node SDKs link the client alone, so each builds the same
+keys from the typed log (`session_log.rs` in each): Python `Client.session_log()` a dict, Node `Client.sessionLog()` a
+typed object (`index.d.ts`). No tool or verb approves or grants (R10); the tool list's no-grant check holds. The async
+clients carry single requests; the log is a paged walk and stays sync, as `drifted` is.
+Found by use in this change: A-782's `identical` key broke `crates/mcp/tests/mcp.rs`'s exact comparison of a submit's
+JSON; fixed here.
+Applied in the same change to: §4.16 (A-773's status line), GAPS, `crates/mcp` (the tool, `session_log_json`, its test),
+`crates/cli` (`log_view` calls it), `crates/sdk-python` (`session_log`, its test), `crates/sdk-node` (`sessionLog`,
+`index.d.ts`, its test).
+Evidence: `cargo test --locked -p slates-mcp --test mcp` red with the tool's dispatch removed, green with it; `-p
+slates-mcp --lib` 19; `-p slates-cli --bin slates log_view` 3; workspace `cargo check --tests --examples` clean (macOS
+arm64, this Mac, local). The SDK tests need a built wheel and addon with a daemon: run requested from main.
 
 ### A-697 (1) — A holder's composed increment crosses once: the inputs it composed are never shipped back to it (2026-11-20, w-shared for UI goal 93; main's ruling after A-697's release bench)
 Applied in the same change to: §4.16 "Commit" (the record's inputs shipment), GAPS (A-247's step two),
