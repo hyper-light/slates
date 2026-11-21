@@ -59643,3 +59643,48 @@ Applied in the same change to:
     their makes in one poll met the watchdog's 3.5 s window.
 - **Owed** (GAPS, A-812): a replayed owing green made over a restarted node's shares (the restart test); git/git's push
   landing (the red) and the A/B against stock git's 10.77 s.
+
+### A-822 — A git commit the server makes takes the deferred-submit hook: landed on the node's store before its version commits (2026-11-21, w-git; C5 part 2b piece 3; main 07:27, 09:10 PST; A-804, A-805, A-816, A-767 C5, A-664)
+Applied in the same change to:
+- `crate::made_commit`: `Tool::Git`; `with_held_preview_and_stores` (the preview with the shard's store and the
+  repositories' stores lent beside it); `committing` (a made commit's one step).
+- `crate::vcs_store::commits`: `make_deferred`, its task (`made_landing`, `made_before_step`, `map_turn`, `sealed_made`,
+  `home_and_land`), `record_and_commit` split from `recorded`; `after_submit` stands aside in a made commit's step;
+  counter `vcs_commits.made_landed`.
+- `crate::vcs_store::paths`: `OverPreview`, `over_preview_step`, `step_over_preview`, `forget_preview_head`; `stepped`
+  and `plan` take the engine's numbering offset.
+- `crate::git_push`: `landing_of` and `Landing::sequence` shared with the made commit.
+- GAPS (C5 part 2b).
+
+- **Why.** A git commit the server made of a submitted version was made, recorded inline (record version 2) and the
+  submit answered in the verb's own step: the one register-held path left once a client's push landed on the node's
+  store (C5 part 2b), and a reply before the commit stood. Main's landing order (A-804): check, the store lands, the
+  register commits naming the sequence, the answer.
+- **What.**
+  - A recorded submit to a git repository's green takes the repository's landing turn and holds its verdict (A-805); the
+    preview of it is kept across turns (A-816).
+  - A task holding the turn steps the version's map over the preview a turn at a time. A preview numbers its own
+    versions (its 0 the green's head, its 1 the verdict), so the step's change is read `version - 1` below the green's
+    numbers (`plan`'s offset). Where the head before holds a map, the change is stepped; a root's first version is built
+    whole, its whole being its own change; otherwise the head's map is built first in the whole build's slices, once.
+  - The commit is made over that map as before (its parent, the submit's message and identity, the owner's instant), its
+    objects admitted to a push of their own as a pack of whole objects (`GitPush::admit_all`), sealed, and its move
+    admitted. Its names and its pack are homed in the region and landed on the node's store as one changeset, through
+    the edges' own `git_push::carry`.
+  - Then one step (`made_commit::commit`): the verdict applied, the version committed, the record naming the changeset
+    (version 5) judged by the register's guard, the store committed and the entry appended, the request's completion,
+    one transaction; then the answer.
+  - Given up before its step (the region or the store refused, the green moved, the daemon stopping): nothing durable,
+    the homed holds and the push given back, the map kept for the version let go, so the retry builds again, and the
+    request answered `Overloaded`, unrecorded. A commit not made (its identity, its map) leaves the version standing
+    alone, counted `vcs_commits.unmade`, as before.
+- **Evidence.**
+  - `t_c5b_p3_a_git_made_commit_is_answered_only_once_its_changeset_landed_and_committed`: in the verb's step nothing
+    answered or durable (the durable head 0, no store version); then answered, the durable head 1, the green at its
+    first store version, the record version 5. Red on main: answered in the verb's step, recorded version 2.
+  - `t_a664_live_a_submit_waits_parked_for_its_greens_whole_build`: a submit parked behind a push's whole build runs
+    again, takes the hook, and a stock clone reads the pushed files with the edit made (red while the preview's
+    numbering was taken as the green's: the commit held the pushed tree).
+- **Owed** (GAPS, C5 part 2b): the kill test between the landing and the step; `record_of` and version 2 removed with
+  the paths that still write them (a submit outside a recorded request, `commits::after_submit`'s owed commit, a store
+  test sealing a push directly); the change step over the preview in one turn (bounded by the submit's admission).
