@@ -11236,7 +11236,10 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > green at its head, its tree loaded (inodes, no bytes) (A-774 part 3): the landing plans its whole tree as created,
 > judged by content (`slates_land::manifest::PlanWalk::materializing`), and copies each file from the green a window at
 > a time through the tree host lent beside the target's writer (`Beginning::unit_over`, `LandingRun::step_over`).
-> Owed: a green landed again into a directory holding an earlier landing plans every file again (identical ones are
+> A mount's unsaved-to-the-green writes survive a restart: recovery rebuilds a mounted work's slot from its
+> published image, its base reacquired through the green at the work's durable base
+> (`tests/mounted_work.rs` `a_save_through_a_mount_survives_a_daemon_restart`). Owed: a green landed again into a
+> directory holding an earlier landing plans every file again (identical ones are
 > skipped by content; a changed one conflicts, since the plan holds no witness of the earlier landing).
 
 > **Status (2026-11-20, A-774).** A work mounts like any volume and a green lands under a grant
