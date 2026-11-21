@@ -119,3 +119,29 @@ landing and its replay red first.
     It's now on a stored shard.
 - **Next, C1 step 1:** file texts read through the store (`StoreHandle::text`/`text_at`), the served view first, async
   lends with no sync path.
+
+## C1: a changeset replayed from its payload a piece at a time: LANDED on origin/main d571ffbca (~00:55, 2026-11-21)
+- **What it does:** a replay (recovery or rebuild) holds no payload whole. It reads the store's pieces into a forward
+  window as the replay wants them.
+  - `slates_hg::framing` is the one walk of a changegroup's chunks, over a `Source` that answers a range or `Wanted`.
+    A whole decoding counts, then builds, charged exactly as before.
+  - The intake reads deltas through the walk (`Stepped::Wanted`).
+  - `record::Replay::begin_sectioned` / `step_sectioned` frame and take a changeset.
+  - Server: `vcs_store::hg_piece_step` and `fill_window` (`StoreHandle::piece`); `payload_of` is gone.
+- **Red first:** `repository::hg_push::tests::a_landed_push_replays_from_its_payload_a_piece_at_a_time`. A
+  789,956-byte payload was read in 14 fills, the window at most 193,859 B (one 128 KiB delta, a 64 KiB piece and a
+  header). Before, the payload was read back whole. Counters: `vcs_store.hg_replay_wants`,
+  `vcs_store.hg_replay_window_most`.
+- **Also landed:** the five `vcs_http::daemon_edge` Mercurial tests red since 8cb10f986, through w-git's C5 part 2a
+  (every daemon there is stored); GAPS' entry closed.
+- **Tests, local macOS:**
+  - slates-hg lib: 382/382.
+  - slates-server `vcs_http::`, `vcs_ssh::`, `repository::`, the vcs_store hg/store/paths/upload sets, identities,
+    `lfs::`: 264 passed, 2 failed. Both are git tests of main's daemon_edge on stored daemons whose answers pass their
+    12 s client read at load 22 (`a_partial_clones_lazy_fetch_...`, `a_push_of_a_long_history_...`): w-git's C5, not
+    hg.
+  - slates-cli `hg_interop`: 14/14 against stock hg 7.2.
+- **Still open from me:**
+  - The order question (inbox/main-from-w-hg-c1-order.md): 3, then 1, then 2.
+  - The import-as-changesets shape (inbox/main-from-w-hg-c1-import-design.md), for main and w-store.
+  - Answered w-perf's stream-clone questions (inbox/w-perf-from-w-hg-serve.md).
