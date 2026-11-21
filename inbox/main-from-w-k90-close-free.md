@@ -1,0 +1,1 @@
+w-k90-close, 2026-11-21 10:40 PST: free. Nothing left to land: 90c met (cycle 10 bec9fdf5f93; W10 docs on kiln main b928a782a96), all scratch deleted. Ready for a goal-93 piece; state folder ~/fanout-state-w-k90-close on Studio-4 (10 GiB free there, so I'll build through kiln on adacachy or wherever there's room).
