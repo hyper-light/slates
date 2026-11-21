@@ -58865,3 +58865,45 @@ Applied in the same change to: `crates/server/src/work_home.rs` (`verdict_over_f
   build step (0.2 to 1.9 s) are each one control-shard step, so the beat is late; and a retry after a real stall
   still re-sends the content. Next: the content placed ahead and stored once by identity, the record naming it rather
   than holding it, so the owner's durable step is small.
+
+### A-802 — A version's increment held once in its owner shard's content store, its chain entry naming it (chain entry format 6) (2026-11-21, w-shared, lane (A); main's rulings 00:52 and 00:58 PST, "(A), by reference"; §4.16 "Commit", §4.8, §2.7; A-257, A-621, A-697, A-714, A-767)
+- **Why.** The lane's liveness (A-697's holder route at 32 MiB and above): the owner's one durable step copied the
+  increment into its chain entry and the entry into the partition's log, 2.3 to 6.9 s of one shard's step in a debug
+  build at 32 to 64 MiB (the append 1.2 s, its commit and publication about 1.1 s), so the holder's lane gave up
+  silent. Main ruled (A): the content held by reference, never kept in the log, its durability proved first.
+- **Format 6.** `crates/merge/src/chain_entry.rs`: the entry names the increment by its inputs identity (the inputs
+  archive's manifest identity, the one the version's merge record names) and its length, in place of its bytes; the
+  effects, completion, head identity, signature and digest as before. `decode` takes the increment's bytes as the
+  reader resolved them, refusing bytes of another length `Truncated`; `inputs` reads the name. A version 5 entry is
+  refused `BadVersion` and never read by a second path: §2.7 refuses another format typed, a segment is read only by
+  the build that wrote it (its anchor restarts the daemon from its own image), and the last bump did the same (A-621).
+  Golden vector `a_format_six_entry_encodes_to_its_golden_bytes`.
+- **Where the bytes are.** The shard's one content store (`ContentHold`, the anchor-held arena beside the partition's
+  log), under the green's object, as the version's inputs archive (`merge_service::hold_increment`, through
+  `ContentHold::hold_lent`, which copies each chunk once from the bytes into its block and builds no owned chunk). A
+  submit holds it before its verdict (`verbs::submit`), so an accepted version is always recorded; a push holds each
+  held verdict's before any commits (`repository::push::hold_increments`; git's, Mercurial's and Subversion's pushes
+  pass the identity where they passed the encoding). The holder's composed increment (A-697 (1)) is held under the same
+  identity, which 3b will fetch by.
+- **Durability (condition 1).** The partition's append is durable in the segment when it returns; the store's hold only
+  once a publication commits its image. So the shard publishes before the entry is appended whenever the store changed
+  (`verbs::publish_held_increments`, from `record_accepted` and the push's record), and an entry never names content a
+  restarted store lacks. A kill between that publication and the append leaves held content no entry names, which the
+  recovery gives back (`rebuild_recovered`, `release_unnamed_increments`). A replay resolves each entry's increment in
+  the store (`merge_service::increment_of`: lent from its block when one chunk, gathered once from its chunks
+  otherwise) and fences the green `ContentMissing` when the store lacks it. Proved by a real kill: `slates-cli`'s
+  `an_owners_unfolded_version_is_read_from_its_content_store_after_a_kill` (an anchored daemon, a second work holding
+  version 0 so the chain cannot fold, a 64 KiB file landed, `kill -9`, the anchor's restart; red first, green after).
+- **Retention (condition 3, A-714's rule).** The increment is held while an entry names it: a fold gives back what no
+  later entry names (`checkpoint_green_when`), a refused verdict gives back what its hold stored, a destroyed green's go
+  with it, and the doubling rule counts the named increments with their entries. It is charged against the shard's
+  unpromised capacity, never the partition's merge budget, refused typed at the room (`BudgetExceeded`); the store's
+  one charge is `ShardBudget::charge_replicated`, the rule `charge_retention` keeps, under the held-content account.
+- **The record plane.** A version's merge record names the identity its entry names (no copy and no hash of the
+  increment per record), and its shipments cut the chunks lent from the store's blocks (`InputsSource::Lent`).
+- **One content store (condition 4).** A-767's changeset log holds a repository's landed history on disk; a green's
+  increment is a change in RAM until then, so it is held in the store RAM changes are, the shard's content store. A
+  repository green's increment and its changeset carry the same content twice until w-store's wiring lands it: recorded
+  in GAPS.
+- **Cost owed.** One more publication per accepted version (before its append); the release bench (A/B at 64, 128,
+  256, 320 and 512 MiB) measures it with the lane.

@@ -10480,6 +10480,7 @@ fn judge_submission(
       let copies = crate::vcs_store::svn_made::copies_of(&inc);
       // The wait goes first, in this transaction, so a version is never durable without it (A-252).
       if let Err(e) = crate::merge_service::stage_awaiting(state, green_id, version) {
+        crate::merge_service::release_refused_increment(state, green_id, held);
         return refused(refusal_of_db(&e));
       }
       // The pre-check passed and the shard is single-threaded, so this append fits the budget; a
@@ -10494,6 +10495,7 @@ fn judge_submission(
         (held.inputs, &inc),
         (applied.as_deref(), &signed.verification),
       ) {
+        crate::merge_service::release_refused_increment(state, green_id, held);
         return refused(refusal);
       }
       let appended = state.clock.monotonic_ns().saturating_sub(append_start);
@@ -10662,7 +10664,8 @@ fn record_accepted(
 /// Publishes the shard when its content store changed since its last publication (chain entry format 6): what an entry
 /// about to be appended names must be in the committed image first, since the append is durable at once and a kill
 /// before the next publication would leave the entry naming content the restarted store lacks. A refused publication
-/// refuses the append (the verb's record is taken back as every refused publication's is, A-721).
+/// refuses the append, and a green whose engine committed the version it would have recorded is made again from its
+/// durable checkpoint and chain, as after any refused publication (A-721, [`remake_greens_ahead`]).
 pub(crate) fn publish_held_increments(state: &mut ShardState) -> Result<(), Refusal> {
   // A shard with no content object keeps no image (a degraded build): nothing it holds survives it, so there is no
   // order to keep.
@@ -10670,9 +10673,10 @@ pub(crate) fn publish_held_increments(state: &mut ShardState) -> Result<(), Refu
   if state.held_content.changed_pieces().is_empty() || state.content.is_none() || end <= start {
     return Ok(());
   }
-  publish_shard(state)
-    .map(|_| ())
-    .map_err(|e| refusal_of_vfs(&e))
+  publish_shard(state).map(|_| ()).map_err(|e| {
+    remake_greens_ahead(state);
+    refusal_of_vfs(&e)
+  })
 }
 
 fn chain_admits(

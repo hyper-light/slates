@@ -832,7 +832,10 @@ fn apply_planned(
     .map(|record| Op::VolumeCreated { record })
     .collect();
   ops.push(Op::RepositoryAdvanced { entry });
-  crate::verbs::publish_held_increments(state).map_err(AppendRefused::Entry)?;
+  if let Err(refusal) = crate::verbs::publish_held_increments(state) {
+    release_increments(state, steps, increments);
+    return Err(AppendRefused::Entry(refusal));
+  }
   record_all(state, ops)?;
   // Recorded: the new greens are the repository's now, and nothing is given back.
   held.made.clear();
