@@ -59624,9 +59624,17 @@ Applied in the same change to:
   a key folded alone and changed again was moved from the wrong version, and a checkpoint carrying a copy's sum taken
   mid-fold (`Doubling::Now` at the cap) carried a wrong sum (`a_checkpoints_sum_taken_mid_fold_is_the_whole_folds`, red
   first). Each key now moves from `identity_since`, its own folded-at version.
+- **A key sliced inside itself (main's 05:00 order):** the paced fold's unit is a slice of the shard's measured BLAKE3
+  rate within its quantum (`archive_slice_bytes_within`), not a key: `Green::fold_identity_slice(bytes)` folds keys whole
+  while each fits, and a file taken out at its change and larger than what is left is hashed a slice a call
+  (`Entry::open_field` / `piece`: the same entry), nothing of it in the sum until whole. A change to the file, or any
+  copy, while it is part hashed begins it again; a whole fold drops it. Counted `identity_slices_within_a_key`. Test:
+  `a_large_files_entry_is_hashed_a_slice_a_call_and_begun_again_if_it_changes` (1 MiB at 64 KiB, red when a change is
+  ignored); the identity oracle folds a few bytes at random steps too (its histories rarely change a file mid-hash, so
+  the named test holds that rule).
 - **Owed:** (b)'s A/B at Z = 20 and 50 ms (a run was cut at 16 of 20 by kiln's restart); the checkpoint's remaining one
-  step (~43 ms: build, encode, a 49 MB record) and single keys of up to 13.4 ms sliced; w-git's member loop in turns on
-  `fold_identity_step`.
+  step (~43 ms: build, encode, a 49 MB record) sliced; w-git's member loop in turns on `fold_identity_step` /
+  `fold_identity_slice`.
 - **Applied in the same change to** `crates/merge` (`engine`: `fold_identity_step`, `identity_backlog`,
   `identity_folded`; `tests/identity.rs`), `crates/server` (`merge_service`, `git_push`: `shard_pace_env`;
   `repository` tests), §4.16, GAPS, BENCHMARKS.md.

@@ -42,6 +42,7 @@ impl Default for SetHash {
 }
 
 /// One entry being encoded: fed field by field, then expanded.
+#[derive(Clone, Debug)]
 pub(crate) struct Entry {
   hasher: Hasher,
 }
@@ -57,6 +58,19 @@ impl Entry {
   /// A length-prefixed field.
   pub(crate) fn field(mut self, bytes: &[u8]) -> Entry {
     self.hasher.update(&(bytes.len() as u64).to_le_bytes());
+    self.hasher.update(bytes);
+    self
+  }
+
+  /// A length-prefixed field of `len` bytes opened, its bytes to come in pieces ([`Entry::piece`]): the same entry as
+  /// [`Entry::field`] once all `len` have come (A-579, a large file's entry hashed a slice a step).
+  pub(crate) fn open_field(mut self, len: usize) -> Entry {
+    self.hasher.update(&(len as u64).to_le_bytes());
+    self
+  }
+
+  /// The next piece of the field [`Entry::open_field`] opened.
+  pub(crate) fn piece(mut self, bytes: &[u8]) -> Entry {
     self.hasher.update(bytes);
     self
   }

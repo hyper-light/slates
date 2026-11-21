@@ -2691,3 +2691,42 @@ fn a_checkpoints_sum_taken_mid_fold_is_the_whole_folds() {
   green.fold_identity();
   assert_eq!(mid_fold.bytes(), green.sum_at(head).bytes());
 }
+
+/// A-579 (main's 05:00 order: the 13.4 ms single-key folds sliced inside a key). Do: on a green with a 1 MiB file, change
+/// it; fold the identity 64 KiB a call; change the file again half way; fold on. Expect: no call folds a key whole (each
+/// hashes about a slice: the count of slices within a key moves); the change half way begins the file again; and the
+/// identity, once whole, equals its recount.
+#[test]
+fn a_large_files_entry_is_hashed_a_slice_a_call_and_begun_again_if_it_changes() {
+  const FILE: usize = 1 << 20;
+  const SLICE: usize = 64 << 10;
+  let mut green = Green::new();
+  let mut work = Work::default();
+  work.create("big", &vec![1u8; FILE]);
+  accept(&mut green, &work, 1);
+  green.fold_identity();
+  accept(
+    &mut green,
+    Work::default().overwrite("big", 0, b"changed"),
+    2,
+  );
+  let before = green.identity_slices_within_a_key();
+  for _ in 0..4 {
+    assert!(!green.fold_identity_slice(SLICE));
+  }
+  assert!(
+    green.identity_slices_within_a_key() > before,
+    "no slice within the key"
+  );
+  accept(&mut green, Work::default().overwrite("big", 7, b"again"), 3);
+  let mut calls = 0;
+  while !green.fold_identity_slice(SLICE) {
+    calls += 1;
+    assert!(calls <= 2 * FILE / SLICE, "the fold never ended");
+  }
+  assert!(
+    calls >= FILE / SLICE - 1,
+    "{calls} calls: the file was not begun again"
+  );
+  assert_eq!(green.head_identity(), green.head_identity_from_scratch());
+}

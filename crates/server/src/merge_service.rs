@@ -301,11 +301,20 @@ fn identity_folded_in_a_step(state: &mut ShardState, green: DbVolumeId, budget_n
   // The step asks whether anyone waits at the end of its budget, not of the bare quantum ([`turn_budget_ns`]).
   env.quantum_ns = budget_ns.max(env.quantum_ns);
   let mut costs = state.merge.identity_costs;
+  // A unit is a slice of the shard's measured BLAKE3 rate within its quantum (R3): keys whole while they fit, a large
+  // file's entry hashed across units ([`slates_merge::engine::Green::fold_identity_slice`]), so no unit is a whole file.
+  let slice = usize::try_from(
+    state
+      .config
+      .archive_slice_bytes_within(state.config.step_quantum_ns())
+      .max(1),
+  )
+  .unwrap_or(usize::MAX);
   let folded = state.greens.get_mut(&green).is_none_or(|mut engine| {
     let mut step = slates_pace::Step::begin(env, (env.clock)());
     let mut done = engine.identity_backlog() == 0;
     while !done && step.more(IDENTITY_KEY, &mut costs) {
-      done = engine.fold_identity_step(1);
+      done = engine.fold_identity_slice(slice);
     }
     step.close((env.clock)(), &mut costs);
     done
@@ -315,7 +324,7 @@ fn identity_folded_in_a_step(state: &mut ShardState, green: DbVolumeId, budget_n
   folded
 }
 
-/// The pace kind of one identity key's fold ([`identity_folded_in_a_step`]).
+/// The pace kind of one slice of an identity fold ([`identity_folded_in_a_step`]).
 const IDENTITY_KEY: usize = 0;
 
 /// Takes `green`'s checkpoint in turns (A-579): its identity's backlog folded a paced step a turn, yielding between,
