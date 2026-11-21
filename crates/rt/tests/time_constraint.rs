@@ -52,7 +52,7 @@ fn shard_holds(config: &RuntimeConfig) -> u8 {
   static ANSWER: AtomicU8 = AtomicU8::new(PENDING);
   ANSWER.store(PENDING, Ordering::Release);
   let rt = Runtime::start(config).unwrap();
-  let shard = rt.shard_ids()[0];
+  let shard = *rt.shard_ids().first().unwrap();
   rt.spawn_on(shard, async {
     let answer = match slates_machine::time_constraint::holds() {
       Some(true) => HELD,

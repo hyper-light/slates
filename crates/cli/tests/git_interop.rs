@@ -786,6 +786,352 @@ fn a_status_during_a_push_reports_the_daemons_memory_by_kind_while_the_anchor_ke
   );
 }
 
+/// Shape: the variable naming a real repository whose cut the memory test pushes in place of its made history (a
+/// git/git mirror, say), with [`HISTORY_CUT_VARIABLE`]; unset, the made history of [`HISTORY_COMMITS`] commits.
+const HISTORY_SOURCE_VARIABLE: &str = "SLATES_TEST_GIT_SOURCE";
+
+/// Shape: the variable naming the revision of [`HISTORY_SOURCE_VARIABLE`]'s repository the memory test pushes
+/// (`v2.0.0`, the cut w-interop's 7,421 MiB was measured on); its commit is pushed as [`BRANCH`].
+const HISTORY_CUT_VARIABLE: &str = "SLATES_TEST_GIT_CUT";
+
+/// Shape: the files of the memory test's histories, in [`HISTORY_DIRECTORIES`] directories: a source tree's count
+/// (git/git v2.0.0 holds about 2,500), so each version's tree, and whatever a server keeps per path or per object,
+/// is large beside the change one commit brings.
+const HISTORY_FILES: usize = 2_000;
+
+/// Shape: the directories the memory test's files lie in, each its own tree, as a source tree nests its files.
+const HISTORY_DIRECTORIES: usize = 20;
+
+/// Shape: the lines of each of the memory test's files, [`HISTORY_LINE_BYTES`] each (half a KiB a file).
+const HISTORY_FILE_LINES: usize = 16;
+
+/// Shape: the bytes of each line of the memory test's files (`line NN of file NNNNN` written to this width).
+const HISTORY_LINE_BYTES: usize = 32;
+
+/// Shape: the commits of the memory test's measured history after its first, which adds every file: each rewrites one
+/// line of one file, as most commits of a source history do, so the pack stock git sends grows by a delta a commit
+/// while the history's versions, trees and objects grow by a whole tree's worth of paths each.
+const HISTORY_COMMITS: usize = 200;
+
+/// Shape: the commits of the memory test's warm-up history after its first, the same shape: what a push and a clone of
+/// the tree cost the daemon whatever the history brings (the edge's buffers, a repository's store, the shards' first
+/// pages, one version of the tree).
+const WARM_COMMITS: usize = 2;
+
+/// Makes repository `name` in the memory test's daemon (`slates repository create`, A-685).
+#[cfg(unix)]
+fn create_named(instance: &str, name: &str) {
+  let (code, out, err) = slates(
+    instance,
+    &[],
+    &["repository", "create", name, "--tool", "git"],
+  );
+  assert_eq!(code, 0, "repository create {name}: {out}{err}");
+}
+
+/// Line `line` of file `file` as commit `commit` (`None` for the first) left it, [`HISTORY_LINE_BYTES`] wide.
+#[cfg(unix)]
+fn history_line(file: usize, line: usize, commit: Option<usize>) -> String {
+  let words = match commit {
+    Some(commit) => format!("line {line:02} of file {file:05} in {commit:05}"),
+    None => format!("line {line:02} of file {file:05}"),
+  };
+  format!("{words:<width$}\n", width = HISTORY_LINE_BYTES - 1)
+}
+
+/// The path of file `file` in the memory test's tree: `dNN/fNNNNN`, spread over [`HISTORY_DIRECTORIES`].
+#[cfg(unix)]
+fn history_path(file: usize) -> String {
+  format!("d{:02}/f{file:05}", file % HISTORY_DIRECTORIES)
+}
+
+/// Makes a history on [`BRANCH`] in a fresh repository at `dir` with stock `git fast-import`: a first commit adding
+/// [`HISTORY_FILES`] files ([`history_path`], [`HISTORY_FILE_LINES`] lines each), then `commits` commits each
+/// rewriting one line of one file ([`history_line`]); then packs it with `git repack -a -d`: the bytes of the pack
+/// stock git made of the history, which a push sends near enough (both deltify each version against the one before).
+#[allow(clippy::disallowed_methods)]
+#[cfg(unix)]
+fn made_history(git: &Git, dir: &str, commits: usize) -> u64 {
+  git.ok(&git.scratch, &["init", "-q", "-b", BRANCH, dir]);
+  let (program, leading) = git.program.split_first().expect("a command");
+  let mut importer = Command::new(program)
+    .args(leading)
+    .args(["fast-import", "--quiet"])
+    .current_dir(dir)
+    .envs(Git::environment(&git.home))
+    .stdin(Stdio::piped())
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let mut stream = std::io::BufWriter::new(importer.stdin.take().unwrap());
+  let mut files: Vec<Vec<String>> = (0..HISTORY_FILES)
+    .map(|file| {
+      (0..HISTORY_FILE_LINES)
+        .map(|line| history_line(file, line, None))
+        .collect()
+    })
+    .collect();
+  for commit in 0..=commits {
+    let changed: Vec<usize> = if commit == 0 {
+      (0..HISTORY_FILES).collect()
+    } else {
+      let file = commit.wrapping_mul(7919) % HISTORY_FILES;
+      let line = commit % HISTORY_FILE_LINES;
+      files[file][line] = history_line(file, line, Some(commit));
+      vec![file]
+    };
+    let message = format!("commit {commit}\n");
+    write!(
+      stream,
+      "commit refs/heads/{BRANCH}\ncommitter Test <test@example.com> {} +0000\ndata {}\n{message}",
+      1_700_000_000 + commit,
+      message.len()
+    )
+    .unwrap();
+    for file in changed {
+      let content = files[file].concat();
+      write!(
+        stream,
+        "M 100644 inline {}\ndata {}\n{content}\n",
+        history_path(file),
+        content.len()
+      )
+      .unwrap();
+    }
+  }
+  drop(stream);
+  let err = read_on_a_thread(importer.stderr.take().unwrap());
+  let code = exit_within(&mut importer, "git fast-import");
+  assert_eq!(code, 0, "git fast-import: {}", err.join().unwrap());
+  git.ok(dir, &["repack", "-a", "-d", "-q"]);
+  let packs = format!("{dir}/.git/objects/pack");
+  std::fs::read_dir(&packs)
+    .unwrap()
+    .filter_map(Result::ok)
+    .filter(|entry| {
+      entry
+        .path()
+        .extension()
+        .is_some_and(|extension| extension == "pack")
+    })
+    .map(|entry| entry.metadata().unwrap().len())
+    .sum()
+}
+
+/// The daemon's pid, as `slates status --json` names it.
+#[cfg(unix)]
+fn daemon_pid(instance: &str) -> String {
+  let (code, out, err) = slates(instance, &[], &["status", "--json"]);
+  assert_eq!(code, 0, "status --json: {out}{err}");
+  let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+  report["pid"]
+    .as_u64()
+    .unwrap_or_else(|| panic!("status names the daemon's pid: {report}"))
+    .to_string()
+}
+
+/// The bytes of the pack stock git makes of everything `cut` reaches in the repository at `dir` (`git pack-objects
+/// --revs --stdout`), which a first push of `cut` sends near enough.
+#[cfg(unix)]
+fn pack_bytes(git: &Git, dir: &str, cut: &str) -> u64 {
+  let (program, leading) = git.program.split_first().expect("a command");
+  let mut packer = Command::new(program)
+    .args(leading)
+    .args(["pack-objects", "--revs", "--stdout", "-q"])
+    .current_dir(dir)
+    .envs(Git::environment(&git.home))
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .spawn()
+    .unwrap();
+  let mut asked = packer.stdin.take().unwrap();
+  writeln!(asked, "{cut}").unwrap();
+  drop(asked);
+  let mut pack = packer.stdout.take().unwrap();
+  let counted = std::thread::spawn(move || std::io::copy(&mut pack, &mut std::io::sink()).unwrap());
+  let code = exit_within(&mut packer, "git pack-objects");
+  assert_eq!(code, 0, "git pack-objects --revs of {cut} in {dir}");
+  counted.join().unwrap()
+}
+
+/// Process `pid`'s resident set, in bytes, as `ps` reports it.
+#[cfg(unix)]
+fn resident_of(pid: &str) -> u64 {
+  let output = Command::new("ps")
+    .args(["-o", "rss=", "-p", pid])
+    .output()
+    .unwrap();
+  let kib: u64 = String::from_utf8_lossy(&output.stdout)
+    .trim()
+    .parse()
+    .unwrap();
+  kib * 1024
+}
+
+/// The daemon `pid`'s resident set once it has settled: read until two reads in a row agree (the shards' idle
+/// give-back runs between them), within [`PATIENCE`].
+#[cfg(unix)]
+fn settled_resident(pid: &str) -> u64 {
+  let started = Instant::now();
+  let mut last = resident_of(pid);
+  loop {
+    pause();
+    let now = resident_of(pid);
+    if now == last || started.elapsed() > PATIENCE {
+      return now;
+    }
+    last = now;
+  }
+}
+
+/// Runs `work` while a thread reads the daemon `pid`'s resident set every [`POLL`]: what `work` returned, and the
+/// most resident read. A sampled peak can only read under the true one, so a peak past a bound is past it.
+#[cfg(unix)]
+fn peak_while<T>(pid: &str, work: impl FnOnce() -> T) -> (T, u64) {
+  let working = std::sync::atomic::AtomicBool::new(true);
+  std::thread::scope(|scope| {
+    let sampler = scope.spawn(|| {
+      let mut most = resident_of(pid);
+      while working.load(std::sync::atomic::Ordering::Acquire) {
+        most = most.max(resident_of(pid));
+        pause();
+      }
+      most.max(resident_of(pid))
+    });
+    let done = work();
+    working.store(false, std::sync::atomic::Ordering::Release);
+    (done, sampler.join().unwrap())
+  })
+}
+
+/// What one round of the memory test measured: the pack's bytes, the daemon's peak resident set while its push and its
+/// clone ran, and its settled resident set after each.
+#[cfg(unix)]
+struct Measured {
+  pack: u64,
+  peak: u64,
+  pushed: u64,
+  cloned: u64,
+}
+
+/// Ada's MEMORY SIZING ruling (2026-11-20; A-830, A-767 item 1: "changes in RAM, the repository's history on disk"):
+/// the git server's resident memory follows the change it is handed, never the history it keeps. w-interop's release
+/// run (r2, base 26c98c76d) held 7,421 MiB at its peak against git/git v2.0.0's 51.3 MiB pack. Do: start an anchor with
+/// its HTTP edge on loopback; make a warm-up repository and push and clone a history of [`WARM_COMMITS`] commits of the
+/// measured shape ([`made_history`]), reading the daemon's resident set at the start, while they run ([`peak_while`])
+/// and settled after ([`settled_resident`]): `W`, the range it moved over, from its least to its peak, is what a push
+/// and a clone cost and the noise of reading them, whatever they bring. Then make [`REPOSITORY`] and push to it a
+/// history of [`HISTORY_FILES`] files and [`HISTORY_COMMITS`] commits each rewriting one line of one file, or, where
+/// [`HISTORY_SOURCE_VARIABLE`] and [`HISTORY_CUT_VARIABLE`] name them, a real repository's cut (its pack `N` bytes),
+/// and clone it back. Expect: the push and the clone succeed, the clone at the pushed head; and the daemon's resident
+/// set at its peak while they ran, settled after the push and settled after the clone, each at most the warm-up's end
+/// plus `2N + W`: the pack held once as the change in flight and once more as derived data cached by identity (A-767
+/// item 1). Red where the daemon keeps the history expanded, or something per object or per path of every version. The
+/// made history is a focused run's size (passed on current main, this Mac, debug, 2026-11-21: N 258,770 bytes, the peak
+/// and the settled sets at most 68.2 MiB against a bound of 90.5 MiB); git/git's cut is main's measurement run
+/// (run-requests.md). Unix (`ps`); skips loudly without stock git.
+#[cfg(unix)]
+#[test]
+fn the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the_history() {
+  let Some(program) = stock_git() else {
+    eprintln!(
+      "skipping the git server's memory bound: no stock git here (set {STOCK_GIT} to the command that runs it)"
+    );
+    return;
+  };
+  let Some(leg) = http_leg("resident") else {
+    return;
+  };
+  let scratch = Scratch::new("git-http-resident");
+  let header = format!("http.extraHeader=Authorization: Bearer {}", leg.token);
+  let git = Git::new(
+    &program,
+    &scratch,
+    "resident",
+    vec!["-c".to_owned(), header],
+  );
+  let site = format!("http://127.0.0.1:{}", leg.port);
+  let pid = daemon_pid(&leg.instance);
+  let real = std::env::var(HISTORY_SOURCE_VARIABLE)
+    .ok()
+    .zip(std::env::var(HISTORY_CUT_VARIABLE).ok());
+  let round = |name: &str, commits: usize, real: Option<&(String, String)>| -> Measured {
+    if name != REPOSITORY {
+      create_named(&leg.instance, name);
+    }
+    let url = format!("{site}/{name}");
+    let (source, pack, refspec) = match real {
+      Some((source, cut)) => (
+        source.clone(),
+        pack_bytes(&git, source, cut),
+        format!("{cut}^{{commit}}:refs/heads/{BRANCH}"),
+      ),
+      None => {
+        let source = git.copy(&format!("{name}-source"));
+        let pack = made_history(&git, &source, commits);
+        (source, pack, BRANCH.to_owned())
+      }
+    };
+    let ((), push_peak) = peak_while(&pid, || {
+      git.ok(&source, &["push", "-q", &url, &refspec]);
+    });
+    let pushed = settled_resident(&pid);
+    let clone = git.copy(&format!("{name}-clone"));
+    let ((), clone_peak) = peak_while(&pid, || {
+      git.ok(&git.scratch, &["clone", "-q", &url, &clone]);
+    });
+    let pushed_head = match real {
+      Some((_, cut)) => git.commit_of(&source, &format!("{cut}^{{commit}}")),
+      None => git.commit_of(&source, "HEAD"),
+    };
+    assert_eq!(
+      git.commit_of(&clone, "HEAD"),
+      pushed_head,
+      "the clone of {name} stands at the pushed head"
+    );
+    Measured {
+      pack,
+      peak: push_peak.max(clone_peak),
+      pushed,
+      cloned: settled_resident(&pid),
+    }
+  };
+  let start = settled_resident(&pid);
+  let warm = round("warm", WARM_COMMITS, None);
+  // W: the range the warm-up's resident set moved over, from its least (the start or its settled end, whichever the
+  // idle give-back left lower) to its peak: what a push and a clone cost, and the noise of reading them, whatever
+  // they bring.
+  let warm_cost = warm.peak.saturating_sub(start.min(warm.cloned));
+  let measured = round(REPOSITORY, HISTORY_COMMITS, real.as_ref());
+  let bound = warm.cloned + 2 * measured.pack + warm_cost;
+  let mib = |bytes: u64| format!("{}.{}", bytes >> 20, ((bytes % (1 << 20)) * 10) >> 20);
+  eprintln!(
+    "resident MiB: start {}; the warm-up's pack {} bytes, peak {}, after {} (W {}); the pack N = {} bytes, peak {}, \
+     after the push {}, after the clone {}; the bound {}",
+    mib(start),
+    warm.pack,
+    mib(warm.peak),
+    mib(warm.cloned),
+    mib(warm_cost),
+    measured.pack,
+    mib(measured.peak),
+    mib(measured.pushed),
+    mib(measured.cloned),
+    mib(bound)
+  );
+  assert!(
+    measured.pushed <= bound && measured.cloned <= bound && measured.peak <= bound,
+    "the daemon held {} MiB after the push, {} MiB after the clone and {} MiB at its peak, past {} MiB (the \
+     warm-up's end plus 2N + W): it holds the history, not the change",
+    mib(measured.pushed),
+    mib(measured.cloned),
+    mib(measured.peak),
+    mib(bound)
+  );
+}
+
 /// §4.17.2 "Transports" item 1 and A-686 (Basic with the token as its password on the loopback edge, Basic's challenge
 /// first): the round trip as [`stock_git_clones_pushes_and_fetches_over_the_vcs_http_edge_with_a_bearer_token`] runs
 /// it, the token given as Basic's password in the URL (`http://git:TOKEN@127.0.0.1:PORT/project`), as a user gives a
@@ -1737,7 +2083,7 @@ fn whole_session(git: &Git, source: &str, url: &str) {
       "-q",
       "origin",
       &branch,
-      &format!("HEAD:refs/heads/slates-topic"),
+      "HEAD:refs/heads/slates-topic",
     ],
   );
   git.ok(&mirror, &["fetch", "-q", "--prune", "origin"]);

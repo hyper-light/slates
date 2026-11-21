@@ -384,6 +384,7 @@ fn taken_as_changegroup(
       Stepped::More => {}
       Stepped::Done => break,
       Stepped::Wanted(range) => panic!("a whole changegroup wanted {range:?}"),
+      Stepped::Store => intake.answer_from_fork(store),
     }
   }
   let (fork, _) = intake.finish().ok().unwrap();
@@ -510,6 +511,7 @@ fn a_made_changesets_record_replays_to_its_made_node() {
       Progress::More => {}
       Progress::Done => break,
       Progress::Wanted(range) => panic!("a whole payload wanted {range:?}"),
+      Progress::Store => replay.answer_from_fork(&store),
     }
   }
   let replayed = replay.finish(&mut index, &mut store).unwrap();
