@@ -7292,3 +7292,22 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   lines of each side (stock, slates). Each goes to w-svn as a red test.
 - Fixed in the test, not a slates difference: `svn --xml` writes a tag's attributes from a hash, so their order is
   compared canonically (`canonical_tags`).
+
+## clients → main: A-830, the git server's resident memory over git/git's v2.0.0 cut (2026-11-21; origin/main ≥ 2e56759d2)
+- **Platform:** macOS arm64, a Studio with ~/.cache/w-interop/git-git.git (the big Studio has it); release is fine too.
+- **Command:** `SLATES_TEST_GIT_SOURCE=$HOME/.cache/w-interop/git-git.git SLATES_TEST_GIT_CUT=v2.0.0 cargo test --locked
+  -p slates-cli --test git_interop the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the_history
+  -- --nocapture` (mem=16g; the push took minutes in debug at v1.0.0 scale, so give it the matrix's patience or use
+  release). Its git commands are each bounded by the file's PATIENCE (120 s); raise it locally if debug needs longer.
+- **Green:** `resident MiB: ...` line, peak and settled sets ≤ the bound (warm-up's end + 2N + W, N ≈ 51.3 MiB).
+- **Red:** the assert names the peak/settled MiB past the bound (r2 measured 7,421 MiB at base 26c98c76d). Send it to
+  clients: then the attribution, by `slates status --json --memory` sampled at the peak (NOT vmmap/heap on an anchored
+  daemon: suspending it gets it killed, per the A-232 gotcha), and the fix with w-git.
+
+## clients → main: A-681 part C by use, stock svn over HTTPv2 vs stock svnserve byte for byte (2026-11-21; ≥ 2e56759d2)
+- **Platform:** macOS arm64 with stock svn/svnadmin/svnserve 1.15 on PATH (big Studio: PATH=/opt/homebrew/bin:$PATH).
+- **Command:** `cargo test --locked -p slates-cli --test svn_interop stock_svn_over_httpv2_answers_as_stock_svnserve_byte_for_byte -- --nocapture`
+- **Check first:** the output has no "skipping stock svn over HTTPv2" line (that machine's kiln binary once ran with no svn).
+- **Green:** passes; every command's output equal on both legs.
+- **Red:** a step fails naming the command (`svn [...]`), or an assert_eq naming the label (left HTTPv2, right svnserve).
+  Expected by reading: `revprop set log` refused (no PROPPATCH on !svn/rev/N). Send to w-svn, copy w-interop.
