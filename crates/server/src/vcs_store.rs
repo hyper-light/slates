@@ -26,10 +26,11 @@
 //!
 //! **Durable as greens are.** A push's objects are its changeset; everything the store computes from them (positions,
 //! rows, D(k), reached sets, derived values, pack fragments) is derived. A git push's one entry (A-635's append) holds
-//! its record ([`record`]), written as the append commits: the objects of the push that the repository lacks then, by
-//! the predicate the store's commit gives positions by ([`record_of`]), by content identity in admission order with
-//! their bytes; the moves the store committed them with; and the deepest chain the push's pack carried, which every
-//! record of the push carries. The partition's register keeps each entry's objects for as long as the repository lives
+//! its record ([`record`]), written as the append commits: the names of the objects of the push that the repository
+//! lacks then, by the predicate the store's commit gives positions by ([`SealedPush::names_now`]), and the changeset
+//! on the node's store their pack landed in (version 5, A-767 C5; no record carries a push's objects since C5 part 2b
+//! piece 3); the moves the store committed them with; and the deepest chain the push's pack carried, which every record
+//! of the push carries. The partition's register keeps each entry's objects for as long as the repository lives
 //! and a snapshot carries them (`slates_db`, A-662). The store commits between the register's guard and the entry's
 //! apply ([`commit`], called by the append), so a push the guard or a verdict refuses never reaches the store. A
 //! recovery makes each store again and replays every record, in log order, through the live path's own steps:
@@ -261,6 +262,9 @@ pub(crate) struct VcsStores {
   /// Each git green's whole map built in slices after a push, between its slices ([`paths::whole_build`], A-664's live
   /// whole builds): one a green, so bounded by the partition's greens.
   whole_builds: paths::whole_build::Builds,
+  /// The git commits the server makes of versions already committed, landed and recorded a job at a time
+  /// ([`commits::MadeAfter`], C5 part 2b piece 3): bounded by the shard's client seats.
+  pub(crate) made_after: commits::MadeAfter,
   /// Each repository's index merge under way between its slices ([`index_upkeep`]): one a repository, so bounded by the
   /// partition's repositories.
   index_upkeep: index_upkeep::Upkeep,
@@ -1580,11 +1584,10 @@ impl SealedPush {
   /// written now, as the append commits (C5 part 2b). An append that brings no object the repository lacks names none,
   /// version 5. One whose names and pack its edge homed and landed names them and its changeset, version 5, while they
   /// are still the names it would write (another push may have committed one of its objects since: refused, for the
-  /// client's retry, never written inline). One nobody homed (a server-made commit, A-664, until it takes the deferred
-  /// submit's landing order; a push whose driver never carried its homing, a test's synchronous one) is written whole,
-  /// version 2 ([`record_of`]): the one register-held path left (GAPS, C5 part 2b).
+  /// client's retry, never written inline). One bringing objects nobody homed and landed is refused `Unlanded`: no record
+  /// carries a push's objects (C5 part 2b piece 3; a server-made commit lands as a client's push does,
+  /// `commits::make_deferred` and `commits::MadeAfter`).
   pub(crate) fn record(&self, stores: &VcsStores) -> Result<Vec<u8>, GitRefused> {
-    let (content, store) = stores.git_ref(self.repository).ok_or(GitRefused::NoStore)?;
     let (bytes, now) = self.names_now(stores)?;
     let moves = (self.push.deepest(), self.keyed.as_slice());
     if now == 0 {
@@ -1604,12 +1607,8 @@ impl SealedPush {
         _ => Err(GitRefused::Unlanded),
       };
     }
-    record_of(
-      content,
-      store,
-      (&self.objects, self.push.deepest(), self.push.pack()),
-      &self.keyed,
-    )
+    // Objects nobody homed and landed: no record carries a push's objects (C5 part 2b piece 3).
+    Err(GitRefused::Unlanded)
   }
 
   /// Admits `moves` (each a green's key, its version once the entry moves it, and its new head) in place of any
@@ -2006,7 +2005,7 @@ fn abandon_push(state: &mut ShardState, push: Push) {
 /// arriving under a claimed id the repository indexes already is passed over, since the store reads an indexed object
 /// from its index before any push (A-638's order). Every object new to the push is noted for the record by the root its
 /// quarantine holds it under, whether or not the repository holds it now: which of them the record holds is decided
-/// when an append commits ([`record_of`]), by the predicate that commit gives positions by, since another push can
+/// when an append commits ([`SealedPush::names_now`]), by the predicate that commit gives positions by, since another push can
 /// commit an object this one holds between its admission and its append, and a store made again from the log can lose
 /// one. So the record names exactly the objects its commit positions.
 fn admit_object(
@@ -2042,27 +2041,7 @@ fn admit_object(
   Ok(())
 }
 
-/// The record a commit of `moves` writes now (`record::RecordWriter::finish`): `deepest` and `moves`, then each object
-/// `writer` noted that the repository lacks now, named by type, content identity and length, and the push's pack as the
-/// client sent it (A-723). Lacking is the predicate the
-/// store's commit gives positions by (`Repository::object`, the index its `fresh` reads), so the record holds exactly
-/// the objects the commit that follows positions.
-pub(crate) fn record_of(
-  content: &ContentStore,
-  store: &GitStore,
-  (writer, deepest, pack): (&RecordWriter, u64, &[u8]),
-  moves: &[RecordedMove],
-) -> Result<Vec<u8>, GitRefused> {
-  writer
-    .finish(
-      (content, store.repository.format(), pack),
-      lacks(content, store),
-      (deepest, moves),
-    )
-    .map_err(unwritten)
-}
-
-/// Whether the repository lacks an object: the predicate a commit gives positions by ([`record_of`]).
+/// Whether the repository lacks an object: the predicate a commit gives positions by ([`SealedPush::names_now`]).
 fn lacks<'s>(content: &'s ContentStore, store: &'s GitStore) -> impl Fn(&ObjectId) -> bool + 's {
   move |id| store.repository.object(content, id).is_none()
 }
@@ -2300,7 +2279,7 @@ fn replay_push(
 }
 
 /// Whether the objects the replay's admission would record now, by the predicate the live append wrote its record by
-/// ([`record_of`]), are the record's, by type, content identity and length: in order for a version-1 record, whose
+/// ([`SealedPush::names_now`]), are the record's, by type, content identity and length: in order for a version-1 record, whose
 /// objects are admitted in its order; as sets for a pack's ([`names_alike`]). Each identity was checked
 /// against the record's bytes before the object was admitted, so this compares the record written again without
 /// copying its bytes: a recomputation that differs is refused (§4.16).

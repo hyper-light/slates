@@ -1857,7 +1857,15 @@ pub(crate) fn carry_blocking<P>(state: &mut ShardState, push: &mut ReceivePack<P
   let Some(asked) = push.take_homing() else {
     return;
   };
-  let carried = match asked {
+  let carried = carried_blocking(state, asked);
+  push.homed(state, carried);
+}
+
+/// `carry` carried as [`carry_blocking`] stands in for the edge: content kept for the region on this shard as its home
+/// keeps it, a changeset landed on the node's store from a thread of its own. What a git commit the server makes is
+/// carried by in a test's synchronous driver too (`crate::vcs_store::commits::made_after_now`).
+pub(crate) fn carried_blocking(state: &mut ShardState, carry: super::Carry) -> super::Carried {
+  match carry {
     super::Carry::Home(bytes) => {
       let outcome =
         crate::vcs_store::homes::keep_for_region(state, &bytes).map(|(identity, _)| identity);
@@ -1873,8 +1881,7 @@ pub(crate) fn carry_blocking<P>(state: &mut ShardState, push: &mut ReceivePack<P
         disk, header, parts,
       ))
     }
-  };
-  push.homed(state, carried);
+  }
 }
 
 /// The edge's carry as a test's async driver runs it ([`super::carry`]): the homing or the landing the push asked,

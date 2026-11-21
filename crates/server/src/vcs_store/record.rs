@@ -40,7 +40,7 @@
 use slates_git::object_name::{Kind, ObjectFormat, ObjectId};
 use slates_git::store::kind_of;
 use slates_vcs::content::IDENTITY_BYTES;
-use slates_vcs::{ContentId, ContentStore};
+use slates_vcs::ContentId;
 
 /// Format: the record's magic, "SGPR" (a slates git push's record) little-endian, so bytes of another kind are refused
 /// at the first word.
@@ -205,18 +205,6 @@ impl RecordWriter {
     self.noted.iter().filter(move |noted| lacks(&noted.id))
   }
 
-  /// The record whole (module docs): `deepest`, `moves`, then each object noted that `lacks` says the repository lacks,
-  /// its bytes read back from `content`. Refused when the content store does not hold an object's bytes whole, or the
-  /// record's room is refused.
-  pub(crate) fn finish(
-    &self,
-    (content, format, pack): (&ContentStore, ObjectFormat, &[u8]),
-    lacks: impl Fn(&ObjectId) -> bool,
-    (deepest, moves): (u64, &[RecordedMove]),
-  ) -> Result<Vec<u8>, WriteRefused> {
-    self.finish_as((content, format, pack), lacks, (deepest, moves))
-  }
-
   /// The names a version-3 record of the objects `lacks` says the repository lacks keeps as a content
   /// (`super::record_names::names_to_content`), in the order they were admitted.
   pub(crate) fn names_of(&self, lacks: impl Fn(&ObjectId) -> bool) -> Vec<(Kind, ContentId, u64)> {
@@ -252,71 +240,9 @@ impl RecordWriter {
     out.extend_from_slice(&sequence.to_le_bytes());
     Ok(out)
   }
-
-  /// [`RecordWriter::finish`] (version 2): each name inline, then the pack's bytes.
-  fn finish_as(
-    &self,
-    (content, format, sent): (&ContentStore, ObjectFormat, &[u8]),
-    lacks: impl Fn(&ObjectId) -> bool,
-    (deepest, moves): (u64, &[RecordedMove]),
-  ) -> Result<Vec<u8>, WriteRefused> {
-    let objects: Vec<&Noted> = self.lacked(lacks).collect();
-    // A record that brings no object (a later append of a push, a delete) carries no pack; objects no client sent as a
-    // pack (the server's own commits) are written as one, each whole, so every record is a pack.
-    let made;
-    let pack: &[u8] = if objects.is_empty() {
-      &[]
-    } else if sent.is_empty() {
-      made = whole_pack(content, format, &objects)?;
-      &made
-    } else {
-      sent
-    };
-    let len = record_len(moves, &objects, pack.len()).ok_or(WriteRefused::Allocation)?;
-    let mut out = Vec::new();
-    out
-      .try_reserve_exact(len)
-      .map_err(|_| WriteRefused::Allocation)?;
-    write_head(&mut out, VERSION, (deepest, moves));
-    let count = u64::try_from(objects.len()).unwrap_or(u64::MAX);
-    out.extend_from_slice(&count.to_le_bytes());
-    for noted in objects {
-      out.push(noted.kind.pack_number());
-      out.extend_from_slice(&noted.identity.0);
-      out.extend_from_slice(&noted.len.to_le_bytes());
-    }
-    let pack_len = u64::try_from(pack.len()).unwrap_or(u64::MAX);
-    out.extend_from_slice(&pack_len.to_le_bytes());
-    out.extend_from_slice(pack);
-    Ok(out)
-  }
 }
 
 /// The bytes a record of `moves` and `objects` takes; none past what an address can hold.
-/// `objects`' bytes read back from `content`, as a pack of whole objects in `format` (A-723: what a record holds for
-/// objects no client sent as a pack).
-fn whole_pack(
-  content: &ContentStore,
-  format: ObjectFormat,
-  objects: &[&Noted],
-) -> Result<Vec<u8>, WriteRefused> {
-  let mut read = Vec::with_capacity(objects.len());
-  for noted in objects {
-    let mut bytes = Vec::new();
-    for window in content.windows(&noted.identity) {
-      bytes.extend_from_slice(&window);
-    }
-    if u64::try_from(bytes.len()).ok() != Some(noted.len) {
-      return Err(WriteRefused::Unreadable { id: noted.id });
-    }
-    read.push((noted.kind, bytes));
-  }
-  slates_git::pack::of_whole(
-    format,
-    read.iter().map(|(kind, bytes)| (*kind, bytes.as_slice())),
-  )
-  .map_err(WriteRefused::Whole)
-}
 
 fn record_len(moves: &[RecordedMove], objects: &[&Noted], pack: usize) -> Option<usize> {
   let mut len = HEAD_BYTES.checked_add(LONG_BYTES)?;

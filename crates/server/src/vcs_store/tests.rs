@@ -155,77 +155,6 @@ fn holding(kind: Kind, bytes: &[u8]) -> (ContentStore, Noted) {
   )
 }
 
-/// A-662, A-723 (the record's format, pinned: objects named, then the pack as sent). Do: write a record of one delete,
-/// one move and one object, with a pack kept, then read it back; and read back a version-1 record (each object's bytes
-/// inflated) as a segment written before A-723 holds one. Expect: the bytes the module's encoding states, byte for
-/// byte: the object named by its type, identity and length, then the pack's length and bytes, never the object's bytes;
-/// the same moves, name and pack read back; and the version-1 record's object read back with its bytes.
-#[test]
-fn t_a662_a_record_reads_back_what_it_wrote_and_its_bytes_are_pinned() {
-  let head = ObjectId::from_bytes(FORMAT, &[0xab; 20]).expect("an id");
-  let (content, noted) = holding(Kind::Blob, b"hi");
-  let mut writer = RecordWriter::default();
-  writer.object(noted);
-  let moves: Vec<RecordedMove> = vec![(7, 4, None), (9, 5, Some(head))];
-  let bytes = writer
-    .finish((&content, FORMAT, b"PACK-bytes"), |_| true, (3, &moves))
-    .expect("written");
-  let mut head_bytes = Vec::new();
-  head_bytes.extend_from_slice(b"SGPR");
-  head_bytes.extend_from_slice(&2u32.to_le_bytes());
-  head_bytes.extend_from_slice(&3u64.to_le_bytes());
-  head_bytes.extend_from_slice(&2u64.to_le_bytes());
-  head_bytes.extend_from_slice(&7u64.to_le_bytes());
-  head_bytes.extend_from_slice(&4u64.to_le_bytes());
-  head_bytes.push(0);
-  head_bytes.extend_from_slice(&9u64.to_le_bytes());
-  head_bytes.extend_from_slice(&5u64.to_le_bytes());
-  head_bytes.push(1);
-  head_bytes.extend_from_slice(&[0xab; 20]);
-  let mut expected = head_bytes.clone();
-  expected.extend_from_slice(&1u64.to_le_bytes());
-  expected.push(3);
-  expected.extend_from_slice(&noted.identity.0);
-  expected.extend_from_slice(&2u64.to_le_bytes());
-  expected.extend_from_slice(&10u64.to_le_bytes());
-  expected.extend_from_slice(b"PACK-bytes");
-  assert_eq!(bytes, expected);
-  let read = Record {
-    names: vec![(Kind::Blob, noted.identity, 2)],
-    named: None,
-    packed: None,
-    sequence: 0,
-    pack: b"PACK-bytes",
-    deepest: 3,
-    moves: moves.clone(),
-    objects: Vec::new(),
-  };
-  assert_eq!(Record::decode(&bytes, FORMAT), Ok(read));
-  let mut inflated = head_bytes;
-  inflated.splice(4..8, 1u32.to_le_bytes());
-  inflated.extend_from_slice(&1u64.to_le_bytes());
-  inflated.push(3);
-  inflated.extend_from_slice(&noted.identity.0);
-  inflated.extend_from_slice(&2u64.to_le_bytes());
-  inflated.extend_from_slice(b"hi");
-  let object = RecordedObject {
-    kind: Kind::Blob,
-    identity: noted.identity,
-    content: b"hi",
-  };
-  let read = Record {
-    names: Vec::new(),
-    named: None,
-    packed: None,
-    sequence: 0,
-    pack: &[],
-    deepest: 3,
-    moves,
-    objects: vec![object],
-  };
-  assert_eq!(Record::decode(&inflated, FORMAT), Ok(read));
-}
-
 /// A-767 C5's record v5 (it replaces A-722's version 4, which replaced A-724 piece 8c's version 3). Do: write the
 /// record of one move and one object as version 5, its names put as one content first, its pack named by an identity and
 /// a length, and the changeset the store landed them as; then read it back. Expect: the bytes the module's encoding
@@ -288,78 +217,6 @@ fn t_a767_c5_a_version_5_record_names_its_names_its_pack_and_its_changeset() {
     Err(super::record::RecordRefused::Version { version: 3 }),
     "version 3 is no longer read"
   );
-}
-
-/// A-662, A-723 (the record written when an append commits). Do: note three objects; write the record with the second
-/// one held by the repository by then, a pack kept; write it again with every object held; write one naming an object
-/// the content store does not hold, with no pack kept; and one naming a held object with no pack kept. Expect: the first
-/// record names the first and the third in the order noted, not the second, and carries the kept pack; the second names
-/// none and carries no pack; the third refused `Unreadable`, never written short; the fourth carries a pack made of the
-/// object whole (`slates_git::pack::of_whole`), as the server's own commits are recorded.
-#[test]
-fn t_a662_a_record_holds_what_the_repository_lacks_when_written_and_refuses_bytes_not_held() {
-  let mut content = ContentStore::new(BUDGET, WINDOW).expect("a content store");
-  let long: Vec<u8> = (0..=u8::MAX).cycle().take(WINDOW * 3 + 5).collect();
-  let mut writer = RecordWriter::default();
-  let mut identities = Vec::new();
-  for bytes in [&b"one"[..], b"two", &long] {
-    let identity = content.put_object(bytes).expect("held");
-    identities.push(identity);
-    let (id, _) = blob(bytes);
-    let len = u64::try_from(bytes.len()).expect("a length");
-    writer.object(Noted {
-      kind: Kind::Blob,
-      id,
-      identity,
-      len,
-    });
-  }
-  let (held, _) = blob(b"two");
-  let bytes = writer
-    .finish((&content, FORMAT, b"the pack"), |id| *id != held, (0, &[]))
-    .expect("written");
-  let read = Record::decode(&bytes, FORMAT).expect("read back");
-  let long_len = u64::try_from(long.len()).expect("a length");
-  assert_eq!(
-    (read.names, read.pack),
-    (
-      vec![
-        (Kind::Blob, identities[0], 3),
-        (Kind::Blob, identities[2], long_len)
-      ],
-      &b"the pack"[..]
-    )
-  );
-  let none = writer
-    .finish((&content, FORMAT, b"the pack"), |_| false, (0, &[]))
-    .expect("written");
-  let read = Record::decode(&none, FORMAT).expect("read back");
-  assert_eq!((read.names.len(), read.pack), (0, &[][..]));
-  let (ghost, _) = blob(b"never packed");
-  let mut unpacked = RecordWriter::default();
-  unpacked.object(Noted {
-    kind: Kind::Blob,
-    id: ghost,
-    identity: ContentId([9; 32]),
-    len: 12,
-  });
-  assert_eq!(
-    unpacked.finish((&content, FORMAT, &[]), |_| true, (0, &[])),
-    Err(WriteRefused::Unreadable { id: ghost })
-  );
-  let (one, _) = blob(b"one");
-  let mut sent_none = RecordWriter::default();
-  sent_none.object(Noted {
-    kind: Kind::Blob,
-    id: one,
-    identity: identities[0],
-    len: 3,
-  });
-  let made = sent_none
-    .finish((&content, FORMAT, &[]), |_| true, (0, &[]))
-    .expect("written");
-  let read = Record::decode(&made, FORMAT).expect("read back");
-  assert!(read.pack.starts_with(b"PACK"), "{:?}", read.pack);
 }
 
 /// A-662 (hostile input on a parser of bytes the log holds). Do: read a record cut at every length, one whose counts are
@@ -1434,6 +1291,9 @@ pub(crate) fn appended(
   changes: Vec<BranchChange>,
   sealed: (&mut super::SealedPush, &[StoreMove]),
 ) -> Result<Appended, crate::repository::push::AppendRefused> {
+  // Its names and pack homed and landed first, as a client's edge carries them (C5 part 2b: no record carries a push's
+  // objects); nothing to carry where it brings none.
+  let _ = crate::vcs_store::commits::home_and_land_blocking(state, sealed.0);
   let appended = crate::repository::push::push_sealed(
     state,
     (&owner(), repository),
@@ -1461,6 +1321,8 @@ pub(crate) fn push_unsettled(
   let mut sealed = push.seal(state).expect("sealed");
   let changes = vec![BranchChange::Update { green, work: built }];
   let moves = [(Target::Green(green), Some(head))];
+  // Homed and landed first, as a client's edge carries a push (C5 part 2b: no record carries a push's objects).
+  let _ = crate::vcs_store::commits::home_and_land_blocking(state, &mut sealed);
   crate::repository::push::push_sealed(
     state,
     (&owner(), repository),
