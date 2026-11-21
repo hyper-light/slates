@@ -377,3 +377,6 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 ## LANDED 2026-11-21 ~00:35 PST: exit 4 = c592a81f0 (main 5ab1c23b5): deriver's piece list blocked (√ops), runs merged.
   Bench 64-320 MiB all pass on Studio-1. CLOSED (note in close file). Lane: in-place forward ~105-150 MB/s; asked main.
   Family three: kiln r4 still on adacachy.
+
+## 2026-11-21 ~01:05 PST: lane in place: 320 MiB holder submit refused Overloaded 1 of 2 runs (forward ~3.1 s; transfer
+  ~2.2 s ~150 MB/s vs 1.3 GB/s raw). Reported; next: time the forward's phases on both ends. Family three: r4 running.

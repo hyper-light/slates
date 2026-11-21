@@ -57,3 +57,22 @@ A-697's release bench on Studio-1 (main 5ab1c23b5's parent tree ffb2a65): a hold
 1.3 GB/s (bulk row). So the lane's in-place throughput is bounded above the transport: the forward lane's own steps
 (its chunking and its session borrow per turn, `forward_lane.rs`), and the control shard's beat runs 0.5-1.4 s late
 during the larger ones. I'd take this as the lane item's remainder, ahead of datagram batching. Your call.
+
+## ~01:05 PST: the lane in place refuses 320 MiB holder submits about half the time
+Studio-1, main 5ab1c23, load 2.2-2.9, two runs of the 320 MiB bench without a profiler: run 1 passed (holder forward
+3,114 ms), run 2 failed: `holder 335544320 run 0: Refused { refusal: Overloaded { shard: 0 } }` (fleet.rs:22692).
+A third run under `sample` failed the same way. The forward's ask outlives its parked verb's bound and is answered
+`Overloaded`, unrecorded, as designed, so a retry re-forwards the 320 MiB and meets the same bound. At 256 MiB and below
+it passed (r9: 2,737 ms at 256).
+
+Where the 3.1 s goes, so far: the owner's own steps are ~0.9 s (judge 20, append 300, place 600 ms, from the local
+run's phases), so the transfer is ~2.2 s, about 150 MB/s, against the transport's 1.3 GB/s on the bulk row. The
+`sample` (8 s, both nodes in one process): the holder's control shard in `resolve_and_forward -> forward_lane::
+drive_or_queued -> Endpoint::drive -> flush -> sendto` (~377 samples); the owner's control shard in `serve_peer_records
+-> serve_forward -> run_forwarded -> submit_computed -> judge_submission` (~500) and the record plane (~320); across all
+threads blake3 1,072 and memmove 824 at the top of the stack. The serving side waits on `next_request()`, not a tick,
+so I'm not claiming the poll-interval hypothesis without a measurement.
+
+Proposed next, under the lane item (P): time the forward's phases on both ends (request bytes sent, last byte
+received, owner's step, reply) to find the ~2 s, then fix the step that owns it. The bound that refuses at 320 MiB
+should stay a bound (CLAUDE.md §2 item 8); a faster lane is the fix. Unless you'd rather I stop at the profile.
