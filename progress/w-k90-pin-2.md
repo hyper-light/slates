@@ -132,3 +132,23 @@ Pin + no-CLI clauses hold (w-k90-pin's audit). Left: CI evidence per platform at
 - Operational fix = a person on adacachy (drop .77 or route src .90). kiln fix = IP_PKTINFO in vendored hyper-rt +
   hyper-transport (passes local_ip None at endpoint.rs:1037): asked main whether that's R2's fix.
 - Reported: inbox/main-from-w-k90-pin-2.md (~04:50).
+
+## ~06:30 PST 11-21: R2 fix (main approved IP_PKTINFO, 04:36)
+- Worktree ~/kiln-work/w-k90-pin-2-r2 (base origin/main a0d114abb), local commit (unpushed, to amend).
+- kiln-rt (kiln's own hyper-rt; vendor/hyper-raft/crates/hyper-rt stays upstream's, nothing kiln builds uses it):
+  linux.rs enable_local_addresses (IP_PKTINFO + IPV6_RECVPKTINFO), Received::to from cmsgs, write_controls (UDP_SEGMENT
+  + IP_PKTINFO/IPV6_PKTINFO src), CONTROL_WORDS 15; macos.rs same + sendmsg send_from; batched.rs Arrival::to,
+  send_segments_from. ORIGIN.md row.
+- vendor hyper-raft: hyper-transport Endpoint::handle_datagram_to (local_ip in place of None at endpoint.rs:1037);
+  hyper-rt-transport driver passes arrival.to and sends from transmit.src_ip. Recorded by hand as
+  vendor/patches/hyper-raft/0006-* (vendor.py needs Python 3.11; this Mac has 3.9) + UPSTREAM.md row.
+- Windows: only runs client endpoints (src_ip None) -> portable send, unchanged.
+- Test: crates/kiln/src/tunnel.rs r2_a_server_on_a_host_with_two_addresses_answers_from_the_one_it_was_reached_at
+  (server endpoint bound 0.0.0.0; udp_answers at 127.0.0.1 [Linux+macOS] and 127.0.0.2 [Linux]).
+- macOS: cargo check -p kiln --lib --tests OK (local). Runs queued: r17 Linux RED (fix reversed) then GREEN;
+  r18 macOS test. vendor.py check hyper-raft to run where Python >= 3.11.
+- R2 BEFORE (kiln machines.list topo, 2026-11-21T14:59:53Z): drops / rtt / spread ms:
+  Studio-4 2768 135/214/369; Studio-3 cec37f 485/225/21; Studio-2 b24c 166/692/3934; Studio d13238 109/113/437;
+  MBP-2 e30189 167/13/39; jupiter 55/8/86; adacachy 9/0/0. Second sample later -> drops/hour before the fix.
+- r17 stopped (its red half diffed the working tree, empty after the local commit); r19 = red/green on Linux by
+  HEAD~1..HEAD, + kiln-rt udp tests + vendor.py check hyper-raft.
