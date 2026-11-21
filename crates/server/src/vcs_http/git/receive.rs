@@ -116,6 +116,8 @@ impl<L: ShardLender + Clone> GitServices for ReceiveServices<L> {
       answering: false,
       keepalive_ns: self.keepalive_ns,
       last_written_ns: slates_rt::futures::now_ns(),
+      carrying: None,
+      held_report: None,
     })
   }
 }
@@ -141,6 +143,13 @@ pub(crate) struct Receive<L> {
   keepalive_ns: u64,
   /// When the exchange last wrote: its head, or an interim keepalive while its body was read.
   last_written_ns: u64,
+  /// The push's homing or its changeset's landing, carried off the shard's step by a task of its own
+  /// (`crate::git_push::carry`), its outcome awaited across the answer's turns, so the wait writes git's keepalive (R2:
+  /// a homing or a store's flush that outlasted the client's read window left the answer silent).
+  carrying: Option<slates_rt::sync::ChannelReceiver<crate::git_push::Carried>>,
+  /// The push's report, written and held back until its records are held at `f + 1` (A-724 piece 8c's commit rule), and
+  /// when that wait began: given then, git's keepalive written meanwhile (R2).
+  held_report: Option<(Vec<u8>, u64)>,
 }
 
 impl<L: ShardLender> Exchange for Receive<L> {
@@ -220,27 +229,80 @@ impl<L: ShardLender> Receive<L> {
     // The client's going ends a hook's run alone, and no hook runs off unix.
     #[cfg(not(unix))]
     let _ = gone;
+    let unavailable = || Failed(Status::SERVICE_UNAVAILABLE);
     let Self {
       lender,
       push,
       given,
       sent,
+      carrying,
+      held_report,
       ..
     } = self;
     let repository = push.repository();
     loop {
+      // A homing or a landing in flight (R2): awaited no longer than the answer may stay silent, then its keepalive is
+      // written and the wait goes on at the next turn.
+      if let Some(waiting) = carrying.as_mut() {
+        let carried = match silent_until {
+          Some(until) => {
+            let left = until.saturating_sub(slates_rt::futures::now_ns());
+            match slates_rt::futures::within(left, waiting.recv()).await {
+              Ok(Some(Ok(carried))) => carried,
+              Ok(None) => return Ok(false),
+              Ok(Some(Err(_))) | Err(_) => return Err(unavailable()),
+            }
+          }
+          None => waiting.recv().await.map_err(|_| unavailable())?,
+        };
+        *carrying = None;
+        lender
+          .lend(|state| push.homed(state, carried))
+          .ok_or_else(unavailable)?;
+      }
+      // The report held until the push's records are held at f + 1 (§4.8's commit rule; A-724 piece 8c): given once they
+      // are, refused when they are not within the commit's budget, git's keepalive written meanwhile (R2).
+      if let Some(began) = held_report.as_ref().map(|(_, began)| *began) {
+        let budget = crate::fleet::live_budget();
+        loop {
+          if lender
+            .lend(|state| crate::state_log::names_committed(state, repository))
+            .ok_or_else(unavailable)?
+          {
+            if let Some((report, _)) = held_report.take() {
+              given.extend_from_slice(&report);
+            }
+            return Ok(true);
+          }
+          if slates_rt::futures::now_ns().saturating_sub(began) >= budget.deadline_ns {
+            let _ = lender.lend(|state| state.count(crate::state_log::PUSH_UNCOMMITTED, 1));
+            return Err(unavailable());
+          }
+          if silent_until.is_some_and(|until| slates_rt::futures::now_ns() >= until) {
+            return Ok(false);
+          }
+          slates_rt::futures::sleep(budget.poll_interval_ns.max(1))
+            .await
+            .map_err(|_| unavailable())?;
+        }
+      }
       let turn = crate::vcs_share::turns::take(repository).await;
+      let before = given.len();
       let step = lender
         .lend(|state| push.answer_step(state, given))
-        .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?
+        .ok_or_else(unavailable)?
         .map_err(failed)?;
       match step {
         Answering::Answered(_) => {
           // Acknowledged only once its records are held at f + 1 (§4.8's commit rule; A-724 piece 8c): the report goes
           // out after, or the push is refused, never lost with its owner.
           drop(turn);
+          if silent_until.is_some() {
+            *held_report = Some((given.split_off(before), slates_rt::futures::now_ns()));
+            continue;
+          }
           if !crate::state_log::names_committed_within(repository).await {
-            return Err(Failed(Status::SERVICE_UNAVAILABLE));
+            return Err(unavailable());
           }
           return Ok(true);
         }
@@ -251,15 +313,18 @@ impl<L: ShardLender> Receive<L> {
           }
           turn.yield_holding().await;
           // The push's names and pack homed in the region, then landed on the node's store, before its record names
-          // them (A-724 piece 8c; A-767 C5), off the shard's step.
+          // them (A-724 piece 8c; A-767 C5), by a task of its own off the shard's step, awaited at the loop's top.
           if let Some(asked) = push.take_homing() {
             let (origin, shards) = lender
               .lend(|state| (state.shard, state.shards.clone()))
-              .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
-            let carried = crate::git_push::carry(origin, &shards, asked).await;
-            lender
-              .lend(|state| push.homed(state, carried))
-              .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
+              .ok_or_else(unavailable)?;
+            let (sent_back, outcome) = slates_rt::sync::channel(1).map_err(|_| unavailable())?;
+            slates_rt::futures::spawn_detached(async move {
+              let carried = crate::git_push::carry(origin, &shards, asked).await;
+              let _ = sent_back.try_send(carried);
+            })
+            .map_err(|_| unavailable())?;
+            *carrying = Some(outcome);
           }
         }
         #[cfg(unix)]
@@ -269,7 +334,7 @@ impl<L: ShardLender> Receive<L> {
           let answer = call.run(gone.gone()).await;
           lender
             .lend(|state| push.hook_ran(state, answer, given))
-            .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?
+            .ok_or_else(unavailable)?
             .map_err(failed)?;
         }
       }
