@@ -17106,8 +17106,8 @@ both. 85a's 50 µs median is 2.2x away on Linux and 3.7x on macOS.
   change's measurement. `SLATES_SVN_IMPORT_DUMP=~/.cache/w-svn-gitgit/git-2000.dump cargo test --release -p slates-cli
   --test svn_interop -- --ignored an_import_measured --nocapture` (`an_import_measured`: an anchor and a two-shard
   release daemon holding a changeset store, `slates repository create --tool svn`, `slates repository import` of the
-  dump, the daemon's resident bytes sampled by `ps` every pause, then `slates status --memory`). Two runs; the second's
-  figures, the first's within 1%.
+  dump, the daemon's resident bytes sampled by `ps` every pause, then `slates status --memory`). One run read whole (a
+  first run's memory report agreed; its headline line was cut by the command's own `tail`).
 
 | What | Measured |
 |---|---|
