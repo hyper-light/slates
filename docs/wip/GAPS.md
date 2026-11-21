@@ -23779,6 +23779,6 @@ owes a whole state, and each owed whole state is another 3 MiB build the writes 
 ### 2026-11-20: a destroyed burst's extents not given back on Adas-Mac-Studio-2 — open (w-lint's finding, not worked: Ada's close order)
 `cargo test -p slates-server --test recovery a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone` (A-789,
 362bd8c39, red -> green on adas-macbook-pro-2 quiet: 1,622 -> 123 MiB) fails on main's own code on Adas-Mac-Studio-2,
-three runs of three at a3f7e6c9b's base: 41-42 MiB before the burst, 1,341-1,342 MiB after its volume was destroyed, for a
+three runs of three on the merge 287055d5b: 41-42 MiB before the burst, 1,341-1,342 MiB after its volume was destroyed, for a
 256 MiB burst (bound: under a quarter of the burst). The same with the wait's original 250 ms sleep as with a yield, so
 the wait is not the cause. Not chased.
