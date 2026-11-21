@@ -83,3 +83,13 @@ Pin + no-CLI clauses hold (w-k90-pin's audit). Left: CI evidence per platform at
   -> told w-k90-win (agents_send + inbox).
 - clippy container.rs:301 -> w-k90-containers says it's w-k90-a520's, forwarded.
 - r145 (jupiter repro) still queued: jupiter not answering. kiln's own lanes for 08f1a434 still wedged.
+
+## ~00:30 PST 11-21 (08:30Z)
+- Run 44867288588 (af73099bd): ubuntu-latest GREEN again (136745995680). ubuntu-24.04-arm build failed at kiln's final
+  link ("linking with `cc` failed: exit status: 1", reason cut by the 4 KiB cap). LANDED kiln 482bd01f8 (base 482bd01f8):
+  Linux arm64 links with the toolchain's gcc-ld/ld.lld when present; Report shortens >300-char lines.
+- windows-11-arm 136745995679: build + lib Slates tests green; `vendored` 2 of 11 red: a_vendored_crate_taken_from_git
+  ("the planted source isn't in the lock") and an_unrelated_crates_io_crate ("quiver isn't in the lock as kiln's"):
+  CRLF Cargo.lock on Windows checkouts vs "\n" patterns. Fix in worktree: kiln_lock() normalizes \r\n. Testing:
+  kiln run r2 (d13238) `cargo test -p kiln --test vendored`, own target ~/.cache/w-k90-pin-2-target.noindex.
+- Note: my code_run sleep loop spun 2000 calls when machines.run failed fast during kiln's restart (now shell waits).
