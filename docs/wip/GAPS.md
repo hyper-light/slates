@@ -778,6 +778,11 @@
 > (`unpack::Reader::resolve_turn`); per-repository push counters by phase in `slates status`. Owed: the small
 > repositories' wait was per-push turns (fixed: `vcs_share::turns`, a repository's pushes one turn a round); owed:
 > its by-use proof at cap 3 and 10, and weights learned from usage in place of one turn a repository.
+> In flight, paused for goal 93 (2026-11-21): run 31 (cap 3, Studio-2, 9865bb832) found shard-mates took 4.5 s of the
+> busiest repository's 41.3 s span and its shard ran steps 23.2 s of it: its own three pushes of one agent shared one
+> turn. The fix (a turn an agent, spare turns taken; red first) is on branch agents/w-balance-turn-weights, 928df7d1b,
+> NOT on main: its A/B (run 31's shape, three rounds) never ran (adacachy at load 30+, fat-LTO builds timed out at 2-3 h;
+> thin-LTO builds planned). Cap 10 owed: needs about 13.4 GiB free.
 > Acknowledged pushes lost at a takeover: fixed (push records ride the names log; a push answered once held at
 > f + 1; `crates/cli/tests/v3_takeover.rs`). Record version 3 on (names homed at f + 1, read from the region on a
 > takeover).
@@ -7507,6 +7512,12 @@
 >     mean of about 200 ms gives about 10³ verdicts a second at 1,000 clients (a round of about six requests a client),
 >     and about 20 ms gives about 10⁴. The run's own verdicts a second are the figure. The goal is met when a level at
 >     1,000 clients reads `met yes` at 10³ verdicts a second or more.
+>
+>     **89a, paused for goal 93 (2026-11-21, w-balance):** main's ruling: load_bench at 1,000 clients, main against main
+>     before A-400 (57ff29e53), release, quiet box, interleaved, best of N; if edit and merge are not under 1 ms, build a
+>     work whose client sits on its green's owner shard placed elsewhere, and A/B it. Not run: adacachy's fat-LTO builds
+>     timed out (3 h, load 29-31); next, thin-LTO builds once, the same harness in both arms (perf's handoff,
+>     agents/perf-handoff-g257).
 >
 >   The 10,000-client rung (same Studio, load 9.8 to 10.9, 313 connections) did not finish within its 30-minute bound.
 >   After 1,775 s about 2,170 of 10,000 clients were done and about 11,600 submits counted, with daemon RSS 17.6 GB.
