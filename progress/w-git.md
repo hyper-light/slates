@@ -358,3 +358,15 @@
   (interface agreed: PushObjects as source, DeferredPush, green_ready, Applied::Deferred). My git half waits for it.
 - NEXT while blocked on the engine half: C5 2b piece 3 (made commits onto the deferred-submit hook, A-804 landed
   5a21c11dc; record_of/v2 removed in the same series), per w-rewrite-ops' made-hook note.
+- 08:15 C5 2b piece 3 STARTED (main 07:05: go now). Plan, from reading made_commit.rs (A-804) and svn_made.rs:
+  1. made_commit::Tool::Git; made_repository_of recognises a git repository's green (shares svn's landing Turn type).
+  2. vcs_store::commits gains make_deferred(state, (repository, turn), pending, judged): the version's trees built from
+     a preview of the held verdict (Greens::preview/with_preview, as svn_made::revision_held), the commit's objects into
+     a GitPush, sealed; a task carries Home (names, pack) then Land (changeset at the next sequence), then
+     made_commit::commit(state, pending, |state| guard entry; store commit of the sealed push; append the register
+     entry with a v5 record naming the sequence). Store refused -> made_commit::abandon.
+  3. Remove the in-step path (commits::make from verbs::judge_submission, record appended in the submit's transaction)
+     and git_push's record_of / v2 writer (and v2 replay) in the same series.
+  Reds (w-rewrite-ops' list): answered only after both (the durable head 0 in the verb's step); a kill between the land
+  and the commit recovers to before, and the retry lands once. Open question: the version's trees from a preview need
+  vcs_store::paths' map/trees of the preview's post-state (A-664).
