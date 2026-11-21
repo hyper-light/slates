@@ -1572,3 +1572,4 @@ Critical path (every agent on it; non-critical pieces recorded owed):
     - The UI part needs Ada's mark: main's goal stack still reads empty from this session.
   - LANDED: 379087733 (w-git push cut-off layer 1: a push refused after its body is answered in git's words, never a cut connection; red 2/2). Layer 2, the charge, is named and next.
   - The MacBook disk is 32 GB.
+- 2026-11-21 02:20 PST DISK: the MacBook fell to 20 GB free (w-git's r10 release build placed here: 3.5 -> 14 GB). Main ran clean-aggressive.sh per the under-30-GB rule. It deleted ~/.cache/kiln-send-route-target (26 GB, a kiln session's build output, last written 23:43, not in use; regenerable, the session rebuilds if it resumes) and w-k90-a520's finished reach copy. Free went 20 -> 60 GB. w-git puts release builds on a Studio from now on (needs disk=60g) and builds with CARGO_INCREMENTAL=0 (w-svn's target went 27 -> 6.4 GB that way). Studio-1's g221 and g223 show offline (network).
