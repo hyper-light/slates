@@ -16739,3 +16739,27 @@ against 2,614-3,096 µs, CPU over the stream a third lower. **Still open (GAPS):
 them during the stream, at the writes' expense): a status request still costs every shard a sweep of tens of GiB of
 address space, and an idle slice still delays the next message by up to half a step quantum. The live write's 50 µs goal
 needs no sweep armed by a plain status request at all.
+
+## A status does residency work only when asked: a live write under a burst of plain statuses (main's ruling on g228's finding; A-744; 2026-11-20)
+
+**Command (the contract):** the live-shipping measurement as above, release, CARGO_BUILD_JOBS=4, and its sibling
+`measure_what_live_shipping_adds_under_a_burst_of_plain_statuses` (the same stream while a thread asks the owner a
+plain `slates status` again and again). **Arms:** main (a664be6f2, with 7ac3900ee's measurement file only) and asked
+(7ac3900ee). **Hardware:** adas-mac-studio.local-2, Apple silicon, 32 cores, macOS, load 9-11; five rounds interleaved.
+Each cell: added at the median (µs); live p999; every daemon's CPU over the stream; in the 1.5 s after it.
+
+| round | main, contract | asked, contract | main, status burst (statuses) | asked, status burst (statuses) |
+|---|---|---|---|---|
+| 1 | 2,220.4; 4.8 ms; 5.0-5.4 s; 0.6-1.2 s | 204.9; 441 µs; 0.11-0.44 s; 20-30 ms | 2,815.1; 5.7 ms (755) | 292.6; 1,450 µs (161) |
+| 2 | 1,940.5; 7.1 ms; 4.6-5.0 s; 1.5 s | 182.3; 402 µs; 0.12-0.40 s; 20-30 ms | 1,902.8; 5.4 ms (571) | 196.2; 713 µs (104) |
+| 3 | 1,681.8; 3.0 ms; 4.0-4.4 s; 1.4 s | 172.2; 343 µs; 0.09-0.35 s; 20 ms | 1,523.8; 3.1 ms (519) | 177.6; 638 µs (100) |
+| 4 | 1,353.0; 2.7 ms; 3.5-3.8 s; 1.4 s | 177.9; 368 µs; 0.08-0.36 s; 20 ms | 1,407.3; 3.1 ms (488) | 193.4; 650 µs (102) |
+| 5 | 1,465.3; 2.7 ms; 3.7-3.9 s; 1.5 s | 177.0; 445 µs; 0.10-0.37 s; 20-30 ms | 1,099.3; 2.4 ms (404) | 184.0; 2,713 µs (101) |
+
+**Reading.** Main's status-armed sweeps cost every live write about 1.1-2.8 ms at the median and 2.4-7.1 ms at p999,
+burst or none (the measurement's own status polls before the stream arm them), and every daemon about a core for 1.5 s
+after the stream. With residency only for a memory request: 172-205 µs added (9.5x), p999 342-445 µs, the daemons back
+at 10-30 ms of CPU a second when idle; under a status burst 178-293 µs, p999 under 1 ms in 4 of 5 rounds. The added
+median is back where b402afc7c stood before a48bcdc52 (168-205 µs at load 16-31). 85a's 50 µs median is still 3.4-4x
+away on this Mac: the round's exchange (about 100 µs, the transport and two control shards' wakes, A-387 declining
+macOS holds) and the held reply's wake (65-116 µs) are what remain (the round counted hop by hop above).
