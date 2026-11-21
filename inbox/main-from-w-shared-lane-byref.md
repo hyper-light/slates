@@ -159,3 +159,5 @@ increment (124 ms at 64 MiB -> 700 ms at 320) and a beat is late at 128 MiB and 
 exit 4 once); at 512 MiB the owner refuses Overloaded every time. Your ruling's steps are what remain: piece 1 (format 6,
 the append no longer copies the increment) is in its final local run now; then 3b (content ahead, the owner fetching by
 identity) and the slicing, re-measured at these five sizes x 10.
+
+## 08:29 PST: target gone (~/.cache/w-shared-local-target.noindex deleted, MacBook 51 GB free). Fleet had shown 2 failures before the stop (a_successor_adopts_a_greens_ledger_past_its_merge_budget_and_keeps_it_across_its_restart, a_successor_restarted_warm_takes_a_write_to_the_volume_it_took_over); fleet + kill -9 go to a Studio now, those two with their output.
