@@ -185,6 +185,10 @@
 > The flows build for Linux FUSE and Windows WinFsp too (Windows: the file index, last-write and change times, cargo
 > and git status; the held compile and `make` are Unix's). Open: their Linux and Windows runs (run-requests.md), and
 > memory pressure from a host actually short of memory (the test injects it).
+> Open (found by use 2026-11-21, routed to g224): on Mac Studios (Studio-2 twice, Studio-4) a fresh slates NFS mount's
+> first `opendir` never returns. The client sends GETATTR, LOOKUP, ACCESS and FSSTAT (345 in 30 min) and never
+> READDIR or CREATE, while the daemon answers every call. The same flows pass on adas-macbook-pro-2. The real-tools
+> test now fails in 305 s naming the stall instead of hanging.
 
 > **MEMORY SIZING (Ada 2026-11-20: the daemon held 7.1 GB resident after an 84 MB Mercurial push; w-sizing).** Every
 > buffer, region, reserve and prefault is sized from the work, learned, decays and is given back; a machine total is
