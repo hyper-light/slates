@@ -87,3 +87,22 @@ commit alone. Medians per round, every run in brackets in `~/.cache/g222-kq-ab/l
 - Conflict's loaded p99 is under 1 ms with it. Accept's p99/p999 left (0.8–2.6 / 7–9 ms) is the client's own spin under
   load (finding 2), not the daemon.
 - So: you land the fix (with your hold rule) red first, per the close list; my A/B above is the second path's.
+
+## 2026-11-20 19:05 PST — finding 5: Linux has the same 1 ms band, and it is not a nap (epoll doesn't nap)
+
+CI ubuntu-24.04-arm (run 44853115607, branch diag-measurer-g222-5), A-224's lane (`systemd-run --user --scope
+-p AllowedCPUs=0-1 -p MemoryMax=256M`, two spinners a CPU, a `dd conv=fsync` writer), the ring-stamped arm (2c8f89de6
++ my diagnostic, `diag-g222-hops-base`), 3 rounds of 50,305 requests:
+
+| round | queued p50 / p99 / p999 / max µs | served p50 / p99 / p999 µs | accept p99 ms (3 runs) | conflict p99 ms |
+|---|---|---|---|---|
+| 1 | 4.8 / 1,010 / 1,030 / 6,342 | 14 / 81 / 252 | 5.2, 2.9, 8.0 | 3.5, 3.9, 4.0 |
+| 2 | 4.5 / 1,009 / 1,023 / 3,012 | 13 / 77 / 178 | 4.0, 4.2, 8.0 | 3.7, 1.2, 1.8 |
+| 3 | 4.6 / 1,009 / 1,023 / 3,844 | 13 / 64 / 190 | 5.1, 5.2, 5.1 | 3.4, 4.8, 1.3 |
+
+The daemon's queued p99 and p999 sit at 1.01–1.03 ms on Linux too. epoll_wait(0) does not nap, so here the 1 ms is the
+scheduler tick (HZ 1000): my reading is a shard preempted while runnable (spinning its idle window, a spinner on the
+CPU) gets the CPU back only when the tick ends the spinner's slice, where a parked shard woken by a kick gets wakeup
+preemption at once. Testing it now: one binary, `G222_NO_SPIN` (idle window 0, park at once) on and off, interleaved,
+same lane (diag-measurer-g222-6). If the band empties with the shard parked, Linux's fix is the window under
+oversubscription, not the poll.
