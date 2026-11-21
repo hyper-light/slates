@@ -4467,6 +4467,24 @@ pub fn shard_report(state: &mut ShardState, memory: bool) -> ShardReport {
             crate::xshard::run_refused(),
           ),
           (
+            "merge.work.base_missing.unentried",
+            crate::work_home::BASE_MISSING_WHY
+              .with(std::cell::Cell::get)
+              .0,
+          ),
+          (
+            "merge.work.base_missing.unheld",
+            crate::work_home::BASE_MISSING_WHY
+              .with(std::cell::Cell::get)
+              .1,
+          ),
+          (
+            "merge.work.base_missing.replaced_whole",
+            crate::work_home::BASE_MISSING_WHY
+              .with(std::cell::Cell::get)
+              .2,
+          ),
+          (
             WORK_LOG_PEAK_BYTES,
             u64::try_from(state.db.partition().work_log_peak().0).unwrap_or(u64::MAX),
           ),

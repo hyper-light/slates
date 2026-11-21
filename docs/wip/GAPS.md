@@ -483,6 +483,12 @@
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
 >
+> **A-817 (2026-11-21, w-fed-move; goal 86b's owner asks).** FIXED: a file's base bytes are asked only for a whole
+> replacement whose declared base length is the file's (an overwrite at offset 0 had asked them at every rebase and
+> submit): file asks 17.2 to 0 a client at 10 hot files, asks a client 49.2 to 30.0. The identical-op drop main ruled was
+> built and measured and rejected (fired 0.03 a client; the engine already omits such operations). What remains is one
+> ask a rebase.
+>
 > **A-808 (2026-11-21, w-fed-move; goal 86b's owner asks).** FIXED in part: contention is the knob (1k stand-in: 17.5
 > asks a client at 300 hot files, 69.4 at 10); an edit now reads its length from the work's kept entry and a rebase
 > keeps every touched path's entry: 69.4 to 48.5 at 10 hot files, lengths 18.1 to 4.7. Open: rebases' file asks
