@@ -15848,6 +15848,54 @@ Measured and rejected: the owned-run change (dead even with the cache, the same 
 Peak RSS of the bench (import + replay): 591-597 MB against the 447 MiB dump. The remaining gap to the matrix's
 0.54 s a revision is the server's per turn: ~960 steps a revision at one step a turn (the quantum, ~3.7 us, is under
 one step), measured next through the daemon's SSH site (`measure_svnsync_replay_range_over_the_tunnel`).
+
+## Content give-back per platform (g226, 2026-11-20)
+
+What frees a content extent's memory when two processes map it live (the anchor and its daemon), measured for w-sizing's
+on-demand content-pool extents (main's order of 2026-11-20 15:35; its macOS half is w-sizing's: `MADV_FREE_REUSABLE`
+kept the footprint, a purgeable Mach entry dropped it at once). Each run filled 1 GiB (16 extents of 64 MiB), mapped
+and written by both processes, gave back 512 MiB and read one second later. Python 3 standard-library probes, 120 s and
+1 GiB bounded, RAM only; the commands and the probes are in the fanout inbox note
+`inbox/w-sizing-from-g226-giveback.md` (`inbox/g226-giveback/`), run through kiln on the named machines.
+
+**Linux: adacachy** (CachyOS, kernel 7.2.9-2-cachyos, 32 CPUs, 125.9 GB; load average 55–70 throughout, 5–7 CI jobs).
+System `Shmem` from `/proc/meminfo`, each process's `RssShmem`, and under pressure the cgroup's `memory.current` in a
+`systemd-run --user --scope -p MemoryHigh=768M`:
+
+| Shape | Give-back | System Shmem | RssShmem anchor / second | Call | Under MemoryHigh=768M |
+|---|---|---|---|---|---|
+| A memfd per extent | the anchor unmaps and closes 8 | 1138 → 1138 MiB | 1018 → 506 / 1024 → 1024 | 11.1 ms | 767 → 767 MiB |
+| A memfd per extent | then the second process unmaps and closes them | 1138 → 626 MiB | 506 / 1024 → 512 | 2,716 ms (8 pipe round trips at load 56) | 767 → 518 MiB |
+| One memfd | `fallocate(PUNCH_HOLE \| KEEP_SIZE)` by the anchor, second map live | 1141 → 680 MiB | 1024 → 512 / 115 → 51 (second still filling) | 411.5 ms | 768 → 317 MiB (801.1 ms) |
+| One memfd | `madvise(MADV_REMOVE)` on the anchor's map, second map live | 1141 → 629 MiB | 1024 → 512 / 1024 → 512 | 705.9 ms | 767 → 432 MiB (233.0 ms) |
+
+One object's hole frees the pages in every mapping at once, from one process; a memfd per extent frees only when its
+last holder lets go. Descriptors at 1 TiB of address space, both processes holding each memfd: 2 MiB extents
+1,048,576 (adacachy's `RLIMIT_NOFILE`, soft and hard), 64 MiB 32,768, 1 GiB 2,048; one object, 1. Two runs reached the
+120 s bound on the loaded box and are left out; the per-extent rows are from a rerun whose second process
+acknowledges each command (the first run read before it had acted).
+
+**Windows: jupiter** (Windows 10.0.26200.9974, 32 CPUs, 128 GB). A 1 GiB pagefile-backed `SEC_RESERVE` section committed
+by `VirtualAlloc` on the anchor's view, opened by name and mapped by a second process; working sets from
+`GetProcessMemoryInfo`, available memory and commit from `GetPerformanceInfo` (a quiet second run):
+
+| Method | Call | Anchor's working set | Second's working set | Available | Commit |
+|---|---|---|---|---|---|
+| `VirtualFree(MEM_DECOMMIT)` on the view | refused, error 87 | 1041, unchanged | 1041, unchanged | — | — |
+| `DiscardVirtualMemory`, the anchor alone | 0, 115.7 ms | 1041 → 529 MiB | 1041, unchanged | 76,699 → 76,697 MiB | unchanged |
+| … then the second process too | 0, 242.5 ms | 529 | 1041 → 529 MiB | 76,697 → 77,205 (+508) | unchanged |
+| `OfferVirtualMemory(VeryLow)`, the anchor alone | 0, 106.3 ms | 1040 → 524 MiB | 1041, unchanged | 76,713 → 76,705 MiB | unchanged |
+| … then the second process too | 0, 143.4 ms | 523 | 1041 → 529 MiB | 76,705 → 77,219 (+514) | unchanged |
+| Both views unmapped, the section closed | — | — | — | +1,004 | 62,995 → 62,065 (−992) |
+
+A section view cannot be decommitted; discard and offer return physical memory only once every mapping process makes
+the call, and never the commit charge, which only closing the section returns. An offered range must be reclaimed
+(`ReclaimVirtualMemory`) before it is touched: a rewrite without it died of an access violation (after both offered,
+the anchor's reclaim answered 0 and the second's 170, `ERROR_BUSY`).
+
+Decided by them (w-sizing, 2026-11-20): Linux keeps one memfd with its free extents removed through the shard's view
+(`MADV_REMOVE`, today's design); Windows needs a section per extent, the commit returned only by closing it; macOS an
+object per extent (w-sizing's `agents/w-sizing-extents`).
 ## A mounted work reads its green where it lies: a mount costs its divergence (A-774 part 2; main's order 1; 2026-11-20)
 
 `crates/server/tests/mounted_work_cow.rs`, release, macOS arm64 (this MacBook, local), interleaved, 5 runs a side, all

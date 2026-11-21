@@ -8552,6 +8552,7 @@ fn create_work_here(
       entries: std::collections::BTreeMap::new(),
       verdict: None,
       accepted: None,
+      held: None,
     },
   );
   // Its catalog register, which names its green, is the route a resend of its submit takes after a takeover, and its
@@ -9794,6 +9795,24 @@ pub(crate) fn accepted_version(reply: &ReplyBody) -> Option<u64> {
   }
 }
 
+/// Notes on the work a submission an ask policy held for approval (A-785, the session log's mark), at the work's
+/// revision now; any other answer leaves the mark as it is, to stand or go stale with the revision.
+fn note_held(state: &mut ShardState, work_id: DbVolumeId, reply: &ReplyBody) {
+  let ReplyBody::MergeApprovalRequired {
+    identity, paths, ..
+  } = reply
+  else {
+    return;
+  };
+  if let Some(work) = state.works.get_mut(&work_id) {
+    work.held = Some(crate::state::HeldMerge {
+      identity: *identity,
+      paths: *paths,
+      revision: work.revision,
+    });
+  }
+}
+
 /// Whether a submit's reply says its accepted increment changed nothing (A-782).
 fn accepted_identical(reply: &ReplyBody) -> bool {
   matches!(
@@ -9970,6 +9989,7 @@ fn settle_submit(
   reply: ReplyBody,
 ) -> ReplyBody {
   let Some(version) = accepted_version(&reply) else {
+    note_held(state, work_id, &reply);
     return kept_conflict(state, work_id, reply);
   };
   // A retry's answer for a work already past that version has nothing left to settle. At that very version it resets
@@ -18735,6 +18755,7 @@ fn install_rebuilt_work(
       entries: std::collections::BTreeMap::new(),
       verdict: None,
       accepted: None,
+      held: None,
     },
   );
 }

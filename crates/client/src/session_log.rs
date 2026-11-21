@@ -76,6 +76,19 @@ pub enum NeedsYou {
     /// How many versions the green moved past the work's base (0 when its head is unknown).
     behind: u64,
   },
+  /// A work's merge is held for approval: an ask policy holds it (A-785). The launcher approves, never this view (R10).
+  AwaitingApproval {
+    /// The work.
+    work: VolumeId,
+    /// Its name.
+    name: String,
+    /// The green.
+    green: VolumeId,
+    /// The increment's identity, which the approval binds.
+    identity: [u8; 32],
+    /// The paths the increment changes.
+    paths: u64,
+  },
   /// A landing awaits its grant.
   AwaitingGrant {
     /// The landing.
@@ -103,7 +116,8 @@ impl SessionLog {
       .map_or(0, |head| head.saturating_sub(work.base))
   }
 
-  /// The decisions that need the human, collisions first, each once.
+  /// The decisions that need the human, each once: the works' (collisions and merges held for approval, in work order),
+  /// then the landings awaiting a grant.
   pub fn needs_you(&self) -> Vec<NeedsYou> {
     let collided = self.works.iter().filter_map(|work| match &work.mark {
       WorkMark::Collided { windows, first, .. } => Some(NeedsYou::Collided {
@@ -116,6 +130,13 @@ impl SessionLog {
           .unwrap_or_default(),
         windows: *windows,
         behind: self.behind(work),
+      }),
+      WorkMark::AwaitingApproval { identity, paths } => Some(NeedsYou::AwaitingApproval {
+        work: work.id,
+        name: work.name.clone(),
+        green: work.green,
+        identity: *identity,
+        paths: *paths,
       }),
       WorkMark::Open | WorkMark::Accepted { .. } | WorkMark::Identical { .. } => None,
     });

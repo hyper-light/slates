@@ -78,7 +78,7 @@
 >
 > **A-773 (2026-11-20, w-sessionlog).** BUILT: `slates log [--json]`, the session log naming collided works and landings
 > awaiting a grant first. Owed: the MCP tool and the SDKs' read. A-782 closed identical versus accepted (one typed
-> outcome, engine to every surface). A-779 closed the stale presentation: a newer one of the same volume into the same target
+> outcome, engine to every surface); A-785 names merges held for approval. A-779 closed the stale presentation: a newer one of the same volume into the same target
 > supersedes it (typed refusal, off the log), and the log lists only grantable presentations.
 
 > **§4.17 version-control servers: the shared mapping and the git server are designed; the repository record, greens
@@ -3218,7 +3218,8 @@
 >   3.0 ms is still one turn). **A-771 (2026-11-20):** a takeover's rebuild applies a payload, and hashes its archive's
 >   content, in steps of a page (before, debug: a whole entry's open 56 to 59 ms of one turn, the archive's hashing 93 to
 >   99 ms of another). **A-775 (2026-11-20):** a taken-over volume given up while its log's holder (or its catalog's or
->   content's cohort) was away is judged afresh once that member is heard alive at a later incarnation; before, the
+>   content's cohort) was away, or a green given up while the holder of its inputs was, is judged afresh once that member is
+>   heard alive at a later incarnation; before, the
 >   give-up was final until a new configuration (live_chaos fresh-member: `NotRecovered` for good after a 3 s pause));
 >   and, after A-347's open, the takeover's
 >   restore (`slates_archive::restore` in `verbs::materialize_taken_over`) lays the whole archive out in the one turn
