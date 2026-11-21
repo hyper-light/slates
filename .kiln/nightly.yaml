@@ -263,3 +263,33 @@ jobs:
           rustup toolchain install nightly --profile minimal -c rust-src
       - name: TSan (the race canary must be reported; then the suites, any report fails)
         run: cargo xtask tsan
+
+  # R9's provisioning gate (A-786): `provision_bench` alone on a bare-metal machine it has to itself, quiet and beside
+  # two spinners a logical CPU, every gated row (spinning and parked p50/p99/p999) held to the machine's ceilings in
+  # ratchets.toml, which only tighten, and the bench's floor (50 µs) and loaded bound failing the job. A machine with no
+  # baseline measures and keeps the histogram, informational. Every run's rows are kept as the artifact.
+  provision-gate-linux:
+    name: "R9 provisioning gate (bare metal, Linux)"
+    runs-on: [baremetal, linux]
+    requires: ["os == linux"]
+    exclusive: true
+    timeout-minutes: 60
+    artifacts: [target/provision-histogram.tsv]
+    steps:
+      - name: toolchain (rust-toolchain.toml)
+        run: (rustup toolchain install || rustup show) && rustc --version
+      - name: Provisioning histogram and ratchet
+        run: cargo xtask ratchet --provision
+
+  provision-gate-macos:
+    name: "R9 provisioning gate (bare metal, macOS)"
+    runs-on: [baremetal]
+    requires: ["os == macos"]
+    exclusive: true
+    timeout-minutes: 60
+    artifacts: [target/provision-histogram.tsv]
+    steps:
+      - name: toolchain (rust-toolchain.toml)
+        run: (rustup toolchain install || rustup show) && rustc --version
+      - name: Provisioning histogram and ratchet
+        run: cargo xtask ratchet --provision

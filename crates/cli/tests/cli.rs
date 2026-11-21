@@ -1270,6 +1270,7 @@ fn kill_anchor_and_wait_for_the_daemon_to_leave(instance: &str, anchor: AnchorPr
 /// MEMORY SIZING (w-sizing; found by use on the big Studio, 2026-11-20: four anchors killed with `SIGKILL` held 21 GB
 /// with no process alive). Do: start an anchor, read its issuer surface for the names of its segment and its content
 /// object, `SIGKILL` the anchor and wait for its daemon to leave. Expect both names gone (`shm_open` answers `ENOENT`),
+/// and every content pool extent's too (objects of their own on macOS since the extents piece),
 /// so the objects and every page written into them go back to the system with their last holder. Before, nothing
 /// removed them: macOS keeps a shared-memory object while its name exists, and only the creator, the killed anchor,
 /// removed the name. Any name the test finds left is removed at the end, so a red run leaks nothing.
@@ -1308,7 +1309,25 @@ fn a_killed_anchors_segment_and_content_go_with_its_daemon() {
     progress.check(&instance, "the daemon's process ended");
     pause();
   }
-  let left: Vec<&String> = names.iter().filter(|name| present(name)).collect();
+  // The content pool's extents, objects of their own on macOS, named from the content object's name and their id: every
+  // id a layout of up to 64 partitions can name.
+  let content = exports
+    .iter()
+    .find(|(name, _)| name == slates_anchor::segment::ENV_CONTENT)
+    .map(|(_, value)| slates_mem::Handoff::Name(value.clone()))
+    .expect("the content object's name");
+  let extents: Vec<String> = (0..64 * slates_anchor::layout::POOL_EXTENTS_PER_PARTITION)
+    .filter_map(|id| u16::try_from(id).ok())
+    .filter_map(|id| match slates_mem::extent_handoff(&content, id) {
+      Some(slates_mem::Handoff::Name(name)) => Some(name),
+      _ => None,
+    })
+    .collect();
+  let left: Vec<&String> = names
+    .iter()
+    .chain(extents.iter())
+    .filter(|name| present(name))
+    .collect();
   for name in &left {
     let _ = rustix::shm::unlink(name.as_str());
   }
@@ -7025,8 +7044,74 @@ impl HeldMount {
   }
 }
 
+/// Lane (A) by reference, condition 1 (main's ruling of 2026-11-21 00:52 PST; chain entry format 6): a version's
+/// increment is held in its owner shard's content store, in the anchor-held segment beside the partition's log, and the
+/// version's chain entry names it there by its inputs identity. Do: on an anchored daemon, keep a second work at the
+/// green's version 0 (so its chain cannot fold), land a 64 KiB file as version 1, then `kill -9` the daemon and let the
+/// anchor restart it. Expect: the submit held the increment in the content store
+/// (`merge.inputs.held_by_owner`), the restarted daemon's recovery replayed version 1 with its increment read from that
+/// store (`merge.chain.inputs_resolved`), and the head reads the file's bytes. Failing first: the entry carried the
+/// increment's bytes, and neither count existed.
+#[cfg(unix)]
+#[test]
+fn an_owners_unfolded_version_is_read_from_its_content_store_after_a_kill() {
+  let instance = format!("cli-byref-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let (green, work) = byref_green_and_work(&instance);
+  let body = "by-reference-".repeat(64 * 1024 / 13);
+  let (code, _, err) = run(&instance, &["edit", &work, "/f.txt", "0", "0", &body]);
+  assert_eq!(code, 0, "{err}");
+  let (code, out, err) = run(&instance, &["submit", &work, "--json"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(out.contains("\"accepted\":true"), "accepted: {out}");
+  status_shows(
+    &instance,
+    "merge.inputs.held_by_owner",
+    "the submit held its increment in the owner's content store",
+  );
+  let killed = kill_the_daemon(&instance);
+  let restarted = await_daemon(&instance, Some(killed), &[]);
+  assert_ne!(restarted, killed, "a new daemon serves");
+  status_shows(
+    &instance,
+    "merge.chain.inputs_resolved",
+    "the recovery read version 1's increment from the content store",
+  );
+  let (code, read, err) = run(&instance, &["read", &green, "/f.txt"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    read == body,
+    "the head reads the version's file after the kill ({} bytes read)",
+    read.len()
+  );
+}
+
+/// A green, a work kept at its version 0 so its chain cannot fold, and the work to land on it: the green and that work.
+#[cfg(unix)]
+fn byref_green_and_work(instance: &str) -> (String, String) {
+  let (code, out, err) = run(instance, &["green", "byref"]);
+  assert_eq!(code, 0, "{err}");
+  let green = value_of(&out, "id");
+  let (code, _, err) = run(instance, &["work", &green, "byrefheld"]);
+  assert_eq!(code, 0, "the work that keeps version 0 reachable: {err}");
+  let (code, out, err) = run(instance, &["work", &green, "byref1"]);
+  assert_eq!(code, 0, "{err}");
+  (green, value_of(&out, "id"))
+}
+
+/// The instance's status names `counter`, as `what` says it should.
+#[cfg(unix)]
+fn status_shows(instance: &str, counter: &str, what: &str) {
+  let (code, status, err) = run(instance, &["status", "--json"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    status.contains(&format!("\"{counter}\"")),
+    "{what}: {status}"
+  );
+}
+
 /// `SIGKILL`s the instance's daemon; its pid.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn kill_the_daemon(instance: &str) -> u32 {
   let killed = daemon_pid(instance).expect("the daemon answers");
   let killed_it = Command::new("kill")
@@ -14059,10 +14144,12 @@ fn port_on(lines: &[String], prefix: &str) -> Option<u16> {
 
 /// Starts an anchor whose daemon serves the version-control HTTP edge on loopback, on a port the system picks
 /// (`--vcs-http 127.0.0.1:0`), and waits for it as [`start_anchor_with_issuer_surface`] does, its consensus group
-/// bootstrapped: the anchor, the issuer surface's exports where this platform prints them ([`PRINTS_ISSUER_SURFACE`]),
-/// and the edge's port, which the daemon names before it says it serves.
+/// bootstrapped, its daemon's changeset store in `store` (`--vcs-store`): the anchor, the issuer surface's exports where
+/// this platform prints them ([`PRINTS_ISSUER_SURFACE`]), and the edge's port, which the daemon names before it says it
+/// serves.
 fn start_anchor_with_vcs_http(
   instance: &str,
+  store: &ScratchDir,
 ) -> (AnchorProcess, Option<Vec<(String, String)>>, u16) {
   use std::io::{BufRead, Write};
   let mut child = slates()
@@ -14075,6 +14162,8 @@ fn start_anchor_with_vcs_http(
       SHARDS,
       "--vcs-http",
       "127.0.0.1:0",
+      "--vcs-store",
+      &store.path,
     ])
     .stdout(Stdio::null())
     .stderr(Stdio::piped())
@@ -14124,7 +14213,12 @@ fn start_anchor_with_vcs_http(
 #[test]
 fn a_repository_the_cli_creates_is_found_by_name_on_the_vcs_http_edge() {
   let instance = format!("cli-repository-{}", std::process::id());
-  let (anchor, issuer, port) = start_anchor_with_vcs_http(&instance);
+  // A Subversion repository's history lands on the daemon's changeset store (C2): the anchor is given a directory for
+  // it, removed after the anchor (declared first, so dropped last).
+  let store = ScratchDir {
+    path: build_output_dir("vcs-store"),
+  };
+  let (anchor, issuer, port) = start_anchor_with_vcs_http(&instance, &store);
   let name = "made-by-the-cli";
   let (code, out, err) = run(&instance, &["repository", "create", name, "--tool", "git"]);
   assert_eq!(code, 0, "the create answers: {err}");

@@ -14,18 +14,26 @@
 //!
 //! **The declaration.** A submit of a mounted work first declares what the mount changed ([`declare_mount`]): the
 //! overlay's diverged set (created, copied-up, whiteouted entries, §4.5 AC-1.10), each declared through the work's own
-//! `edit` and `declare` verbs, so it is recorded in the work's log and charged as a declared change is. A file is
-//! declared as the one splice that turns the work's bytes into the mount's ([`changed_span`]), so an editor's save
-//! (written whole to a temporary and renamed over the original) is the span it changed. The declaration compares, so
-//! it is idempotent: a second submit declares only what differs from the work by then. A finer minimiser (several
-//! spans a file, D-O17) replaces [`changed_span`] at its one call site.
+//! `edit` and `declare` verbs, so it is recorded in the work's log and charged as a declared change is. A changed file
+//! is declared as the whole-file replacement it is, and the composition recovers the edits it was (D-O17, A-776's
+//! `slates_merge::refine`: token-grain, sliced), so an editor's save changing two lines is two edits, never one span
+//! over another editor's line between them. The declaration compares, so it is idempotent: a second submit declares
+//! only what differs from the work by then.
 //!
-//! **What is owed (GAPS, A-774).** The slot is not recorded: a restart rebuilds it from the work, and a mount's writes
-//! not yet submitted are lost with it. A mount is not refreshed when its work's base moves past its pin: it shows the
-//! pinned version under its own changes, and a later submit of a file it changed declares its bytes against the work's,
-//! undoing another work's change to that file. A work holding declared changes when first mounted is refused. A
-//! directory renamed through the mount is refused at the submit, as is a special file. Only the NFS and FUSE bridges
-//! lend the tree; the others refuse a mounted work's base reads typed. A green on another shard than its work's mounts
+//! **A restart (main's order 2, A-127).** A mount's writes are published at each barrier as any volume's are (the tree
+//! host fingerprints a directory without its tree), and recovery rebuilds a mounted work's slot from that image after
+//! its work ([`rebuild_mounted`]), the base plane reacquired through the tree host lent with its green at the work's
+//! durable base ([`recovered_pin`]): a save made before a restart is there to submit after it. A tree's identity is its
+//! green's alone, so a slot rebuilt at another version shows drift only where an entry's bytes differ.
+//!
+//! **A moving base (R4).** A mount follows its work's base ([`refresh`]): once an accepted submit or a rebase moves it,
+//! the mount re-pins and its tree host moves to the new version, so the base plane lists each directory it next touches
+//! again and untouched entries show the new base.
+//!
+//! **What is owed (GAPS, A-774).** A file the mount changed stays its own after a refresh, so a later save of it is
+//! declared against the work's new bytes, which undoes another work's change made to that file meanwhile. A work holding declared changes when first mounted is refused. A
+//! directory renamed through the mount is refused at the submit, as is a special file. Only the NFS, FUSE and WinFsp
+//! bridges lend the tree; virtio-fs and the file verbs refuse a mounted work's base reads typed. A green on another shard than its work's mounts
 //! nothing yet.
 
 use slates_db::catalog::{Role, VolumeId as DbVolumeId};
@@ -34,7 +42,7 @@ use slates_vfs::base::{Diverged, Divergence};
 use slates_vfs::dir::Child;
 use slates_vfs::error::VfsError;
 use slates_vfs::host::HostFs;
-use slates_vfs::volume::{Store, Volume};
+use slates_vfs::volume::Volume;
 
 use crate::error::refusal_of_vfs;
 use crate::state::{ShardState, VolumeSlot};
@@ -43,10 +51,6 @@ use crate::state::{ShardState, VolumeSlot};
 /// for each byte it grows by (`crate::verbs::admit`), as the work it mounts is charged for what it holds; that budget
 /// is the mount's bound, as it is the work's, so a quota of its own would only refuse a write the work could make.
 const MOUNT_QUOTA_NONE: u64 = u64::MAX;
-/// Format: the permission bits a seeded directory takes (the green records none for a directory).
-const SEEDED_DIR_MODE: u32 = 0o755;
-/// Format: the permission bits a seeded file takes when the green records none.
-const SEEDED_FILE_MODE: u32 = 0o644;
 
 /// A mounted work's base: its green and the version the mount reads, kept readable while the mount lives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,21 +64,96 @@ pub(crate) struct MountPin {
 /// Each mounted work's pin, by work: one entry a mounted work of this shard, dropped with its slot.
 pub(crate) type MountedPins = std::collections::BTreeMap<DbVolumeId, MountPin>;
 
-/// The tree identity of `pin`: its fingerprints' device, telling one mount's base from another's.
+/// The tree identity of `pin`: its fingerprints' device, the green's alone, so a mount rebuilt at another version of the
+/// same green (a restart re-pins at the work's durable base) finds drift only where an entry's bytes differ there.
 fn identity(pin: MountPin) -> u64 {
-  let mut word = [0u8; 8];
+  // Format: a `u64`'s little-endian bytes: the green's id folded into eight.
+  let mut word = [0u8; size_of::<u64>()];
+  let width = word.len();
   for (at, byte) in pin.green.bytes.iter().enumerate() {
-    if let Some(slot) = word.get_mut(at % 8) {
+    if let Some(slot) = word.get_mut(at.checked_rem(width).unwrap_or(0)) {
       *slot ^= *byte;
     }
   }
-  u64::from_le_bytes(word) ^ pin.version.rotate_left(32)
+  u64::from_le_bytes(word)
+}
+
+/// The size a mounted work's or a green view's slot is admitted and recovered with: no quota of its own
+/// ([`MOUNT_QUOTA_NONE`]).
+pub(crate) const MOUNT_SIZE: SizeClass = SizeClass::Dynamic {
+  max: MOUNT_QUOTA_NONE,
+};
+
+/// The pin a recovered mounted work's slot is rebuilt at (A-774; main's order 2): its green at the work's durable base
+/// version, read once `rebuild_work` has restored the work; `None` for a work whose green is not on this shard.
+pub(crate) fn recovered_pin(state: &ShardState, id: DbVolumeId) -> Option<MountPin> {
+  let work = state.works.get(&id)?;
+  state.greens.get(&work.green)?;
+  Some(MountPin {
+    green: work.green,
+    version: work.base_version,
+  })
+}
+
+/// A mounted work's slot rebuilt from its image (A-774; main's order 2: a mount's unsubmitted writes survive a restart as
+/// a volume's do, A-127): the overlay's base plane reacquired through the tree host lent with its green at `pin`. What
+/// the mount wrote is in the image, published at each barrier as any volume's is.
+pub(crate) fn rebuild_mounted(
+  state: &mut ShardState,
+  record: &slates_db::catalog::VolumeRecord,
+  image: Option<&slates_vfs::recover::VolumeImage>,
+  claims: Option<&slates_vfs::recover::Claims>,
+  (size, pin): (SizeClass, MountPin),
+) -> Result<(Volume, Option<slates_base::BaseHost>, u16), slates_ipc::protocol::RecoveryCause> {
+  use slates_ipc::protocol::RecoveryCause;
+  let image = image.ok_or(RecoveryCause::NoImage)?;
+  let claims = claims.ok_or(RecoveryCause::BlocksUnclaimed)?;
+  let journal = crate::verbs::journal_floor_bytes(state);
+  let quota = crate::verbs::quota_for(size);
+  let mut host =
+    slates_vfs::host::tree::TreeHost::new(identity(pin), crate::verbs::tree_owner(&record.owner));
+  let root = host.root();
+  let ShardState { store, greens, .. } = state;
+  let green = greens
+    .get(&pin.green)
+    .ok_or(RecoveryCause::OriginNotRecovered)?;
+  let tree = crate::green_tree::GreenTree::at(&green, pin.version);
+  let mut volume = {
+    let mut lens = host.lend(&tree);
+    Volume::from_image(
+      store,
+      image,
+      claims,
+      Box::new(slates_vfs::clock::HostClock::new()),
+      journal,
+      Some((&mut lens, root)),
+    )
+    .map_err(|error| RecoveryCause::ImageRefused {
+      reason: crate::verbs::recorded_reason(error.to_string()),
+    })?
+  };
+  let acknowledged = quota.limit();
+  if volume.capacity_bytes() != acknowledged
+    && let Err(error) = volume.resize(acknowledged)
+  {
+    let mut lens = host.lend(&tree);
+    let _discarded = volume.discard_partial_releasing(store, Some(&mut lens));
+    return Err(RecoveryCause::ImageRefused {
+      reason: crate::verbs::recorded_reason(format!("a mounted work's quota: {error}")),
+    });
+  }
+  Ok((
+    volume,
+    Some(slates_base::BaseHost::Tree(Box::new(host))),
+    image.prefix,
+  ))
 }
 
 /// The slot of mounted work `id`, made on its first mount (the module doc): `true` when the work has one now, `false`
 /// when `id` is no work of this shard's or its slot could not be made (counted). A plain volume's slot answers `true`.
 pub(crate) fn ensure_slot(state: &mut ShardState, id: DbVolumeId) -> bool {
   if state.by_id.contains_key(&id) {
+    refresh(state, id);
     return true;
   }
   let Some(record) = state.db.partition().volume(id).cloned() else {
@@ -88,7 +167,7 @@ pub(crate) fn ensure_slot(state: &mut ShardState, id: DbVolumeId) -> bool {
   };
   // A work with declared changes of its own would show its green's version without them (owed: write them into the
   // overlay); one whose green is elsewhere has no green here to read.
-  if work.files.changed_entries().next().is_some() || state.greens.get(&work.green).is_none() {
+  if !work.files.is_empty() || state.greens.get(&work.green).is_none() {
     state.count(MOUNT_SLOT_REFUSED, 1);
     return false;
   }
@@ -99,13 +178,7 @@ pub(crate) fn ensure_slot(state: &mut ShardState, id: DbVolumeId) -> bool {
   let Ok(admitted) = crate::verbs::admit_over(
     state,
     &record.owner,
-    (
-      SizeClass::Dynamic {
-        max: MOUNT_QUOTA_NONE,
-      },
-      NamePolicy::Exact,
-      false,
-    ),
+    (MOUNT_SIZE, NamePolicy::Exact, false),
     crate::verbs::AdmitBase::Tree {
       identity: identity(pin),
     },
@@ -118,12 +191,47 @@ pub(crate) fn ensure_slot(state: &mut ShardState, id: DbVolumeId) -> bool {
     host,
     credits,
   } = admitted;
+  let mut host = host;
+  if let Some(slates_base::BaseHost::Tree(tree)) = host.as_mut() {
+    tree.move_to(pin.version);
+  }
   if install(state, (id, record.name), volume, host, credits).is_err() {
     state.count(MOUNT_SLOT_REFUSED, 1);
     return false;
   }
   state.merge.mounted.insert(id, pin);
   true
+}
+
+/// Re-pins mounted work `id`'s base at its work's base once that has moved (A-774 R4: an accepted submit or a rebase
+/// moves it): the tree host moves to the new version, so the base plane lists each directory it next touches again and
+/// every untouched entry shows the work's new base. What the mount changed stays its own. Nothing for a work whose base
+/// has not moved, or for any other slot.
+pub(crate) fn refresh(state: &mut ShardState, id: DbVolumeId) {
+  let Some(pin) = state.merge.mounted.get(&id).copied() else {
+    return;
+  };
+  let Some(base) = state.works.get(&id).map(|work| work.base_version) else {
+    return;
+  };
+  if base == pin.version {
+    return;
+  }
+  let Some(&handle) = state.by_id.get(&id) else {
+    return;
+  };
+  if let Ok(slot) = state.volumes.get_mut(handle)
+    && let Some(slates_base::BaseHost::Tree(host)) = slot.host.as_mut()
+  {
+    host.move_to(base);
+    state.merge.mounted.insert(
+      id,
+      MountPin {
+        green: pin.green,
+        version: base,
+      },
+    );
+  }
 }
 
 /// Format: the status counter of a work's mount slot that could not be made (no budget, no room in the registry, a
@@ -153,76 +261,6 @@ pub(crate) fn source<'a>(
 ) -> Option<(crate::greens::GreenRef<'a>, u64)> {
   let pin = mounted.get(&volume)?;
   Some((greens.get(&pin.green)?, pin.version))
-}
-
-/// Creates `path` in `volume` with `bytes`, making its missing parent directories.
-fn seed_file(
-  volume: &mut Volume,
-  store: &mut Store,
-  path: &str,
-  bytes: &[u8],
-) -> Result<(), VfsError> {
-  let mut parts = path.split('/').filter(|part| !part.is_empty()).peekable();
-  let mut dir = directory(volume, store, "")?;
-  let mut walked = String::new();
-  while let Some(part) = parts.next() {
-    if parts.peek().is_none() {
-      let file = volume.create_file(store, dir, part, SEEDED_FILE_MODE)?;
-      volume.write(store, file, 0, bytes)?;
-      return Ok(());
-    }
-    if !walked.is_empty() {
-      walked.push('/');
-    }
-    walked.push_str(part);
-    dir = match directory(volume, store, &walked) {
-      Ok(found) => found,
-      Err(VfsError::NotFound) => volume.mkdir(store, dir, part, SEEDED_DIR_MODE)?,
-      Err(other) => return Err(other),
-    };
-  }
-  Err(VfsError::NotFound)
-}
-
-/// The directory at `path` in `volume`'s head.
-fn directory(
-  volume: &Volume,
-  store: &Store,
-  path: &str,
-) -> Result<slates_mem::Handle<slates_vfs::dir::DirNode>, VfsError> {
-  match volume.resolve(store, path)?.child {
-    Child::Dir(dir) => Ok(dir),
-    _ => Err(VfsError::NotDirectory),
-  }
-}
-
-/// The one splice that turns `old` into `new`: `(at, delete_len, insert)` with `insert` the range of `new` put at
-/// `at`, keeping the longest common prefix and then the longest common suffix of what is left; `None` when they are
-/// equal. Linear in the shorter of the two, and allocates nothing.
-pub(crate) fn changed_span(old: &[u8], new: &[u8]) -> Option<(u64, u64, std::ops::Range<usize>)> {
-  let prefix = old
-    .iter()
-    .zip(new.iter())
-    .take_while(|(a, b)| a == b)
-    .count();
-  if prefix == old.len() && prefix == new.len() {
-    return None;
-  }
-  let old_rest = old.get(prefix..).unwrap_or_default();
-  let new_rest = new.get(prefix..).unwrap_or_default();
-  let suffix = old_rest
-    .iter()
-    .rev()
-    .zip(new_rest.iter().rev())
-    .take_while(|(a, b)| a == b)
-    .count();
-  let deleted = old_rest.len().saturating_sub(suffix);
-  let inserted = new_rest.len().saturating_sub(suffix);
-  Some((
-    u64::try_from(prefix).ok()?,
-    u64::try_from(deleted).ok()?,
-    prefix..prefix.saturating_add(inserted),
-  ))
 }
 
 /// Declares into `work` what its mount changed (the module doc). Nothing to do for a work with no mount. A refusal of
@@ -386,8 +424,15 @@ fn declare_entry(
       let span = {
         let w = state.works.get(&id).ok_or(Refusal::NotFound)?;
         crate::merge_service::with_work_base(state, w, |base| {
+          // A changed file is declared as the whole-file replacement it is; the composition recovers the edits it
+          // was (D-O17, A-776's `slates_merge::refine`), so one save changing two lines is two edits.
           w.files.get(base, path).map(|old| match old {
-            Some(old) => changed_span(&old, &mounted),
+            Some(old) if *old == *mounted => None,
+            Some(old) => Some((
+              0,
+              u64::try_from(old.len()).unwrap_or(u64::MAX),
+              0..mounted.len(),
+            )),
             None => Some((0, 0, 0..mounted.len())),
           })
         })
@@ -457,11 +502,14 @@ fn declared(reply: ReplyBody) -> Result<(), Refusal> {
   }
 }
 
-/// The store-backed view of green `id`'s head, for a landing (§4.15 over §4.16, A-774 piece 3): a slot under the
-/// green's own id holding its head's files and symlinks, so the landing engine plans, presents and lands it as it
-/// does any volume's head, under the same grant (R10). Kept while the green's head stays where it was made, and made
-/// again once the head moves, so a presentation and the granted landing after it read one state. A named snapshot of a
-/// green is refused: a green's versions are its snapshots, and only its head lands.
+/// The store-backed view of green `id`'s head, for a landing (§4.15 over §4.16, A-774 parts 1 and 3): a slot under the
+/// green's own id, an overlay over the green at its head read where it lies (as a mount's, [`ensure_slot`]), its tree
+/// loaded (its directories listed, each entry an inode, no byte copied) so the landing's snapshot holds every entry. The
+/// landing plans its whole tree and reads each file from the green a window at a time
+/// (`slates_land::engine::Beginning::materializing`), under the grant any volume's landing takes (R10). Kept while the
+/// green's head stays where it was made, and made again once the head moves, so a presentation and the granted landing
+/// after it read one state. A named snapshot of a green is refused: only its head lands. Before part 3 the view was a
+/// scratch volume holding a copy of the head: presenting a 64 MiB green's landing added 72 MB resident.
 pub(crate) fn ensure_green_view(
   state: &mut ShardState,
   id: DbVolumeId,
@@ -487,66 +535,87 @@ pub(crate) fn ensure_green_view(
     return Ok(());
   }
   release(state, id);
-  let admitted = crate::verbs::admit(
+  let pin = MountPin {
+    green: id,
+    version: head,
+  };
+  let admitted = crate::verbs::admit_over(
     state,
     &record.owner,
-    SizeClass::Dynamic {
-      max: MOUNT_QUOTA_NONE,
+    (MOUNT_SIZE, NamePolicy::Exact, false),
+    crate::verbs::AdmitBase::Tree {
+      identity: identity(pin),
     },
-    NamePolicy::Exact,
-    false,
-    None,
   )
   .map_err(|reply| match *reply {
     ReplyBody::Refused { refusal } => refusal,
     _ => Refusal::NotFound,
   })?;
   let crate::verbs::Admitted {
-    mut volume,
+    volume,
     host,
     credits,
   } = admitted;
-  let seeded = {
-    let (greens, store) = (&state.greens, &mut state.store);
-    match greens.get(&id) {
-      Some(green) => seed_green(&green, store, &mut volume),
-      None => Err(VfsError::StaleHandle),
-    }
-  };
-  if let Err(e) = seeded {
-    crate::verbs::discard_admitted(
-      state,
-      crate::verbs::Admitted {
-        volume,
-        host,
-        credits,
-      },
-    );
-    return Err(refusal_of_vfs(&e));
-  }
   install(state, (id, record.name), volume, host, credits)?;
   state.merge.green_views.insert(id, head);
+  if let Err(e) = load_tree(state, id) {
+    release(state, id);
+    return Err(refusal_of_vfs(&e));
+  }
   Ok(())
 }
 
-/// Writes `green`'s head into `volume`: its files, then its symlinks.
-fn seed_green(
-  green: &slates_merge::engine::Green,
-  store: &mut Store,
-  volume: &mut Volume,
-) -> Result<(), VfsError> {
-  for (path, bytes) in green.files() {
-    seed_file(volume, store, &path, bytes)?;
-  }
-  for (path, target) in green.symlinks() {
-    let (parent, name) = match path.rsplit_once('/') {
-      Some((parent, name)) => (parent, name),
-      None => ("", path.as_str()),
-    };
-    let dir = directory(volume, store, parent)?;
-    volume.symlink(store, dir, name, target)?;
+/// Lists every directory of green view `id`'s tree through its base, so each entry is an inode of the view (no byte read).
+/// Proportional to the green's paths (owed: a unit at a time under the shard's slice).
+fn load_tree(state: &mut ShardState, id: DbVolumeId) -> Result<(), VfsError> {
+  let ShardState {
+    store,
+    volumes,
+    by_id,
+    greens,
+    merge,
+    ..
+  } = state;
+  let handle = *by_id.get(&id).ok_or(VfsError::StaleHandle)?;
+  let lent = view_source(greens, &merge.green_views, id);
+  let tree = lent
+    .as_ref()
+    .map(|(green, version)| crate::green_tree::GreenTree::at(green, *version));
+  let slot = volumes.get_mut(handle).map_err(|_| VfsError::StaleHandle)?;
+  let mut lens = None;
+  let Some(host) = slot.host.as_mut() else {
+    return Err(VfsError::StaleHandle);
+  };
+  let host = lend(host, tree.as_ref(), &mut lens);
+  let mut overlay = slot.volume.with_host(host);
+  let Child::Dir(root) = overlay.resolve(store, "")?.child else {
+    return Err(VfsError::NotDirectory);
+  };
+  let mut stack = vec![root];
+  while let Some(dir) = stack.pop() {
+    let names: Vec<String> = overlay
+      .readdir(store, dir)?
+      .into_iter()
+      .filter(|row| row.kind == slates_vfs::inode::Kind::Dir)
+      .map(|row| row.name.to_owned())
+      .collect();
+    for name in names {
+      if let Child::Dir(child) = overlay.lookup(store, dir, &name)?.child {
+        stack.push(child);
+      }
+    }
   }
   Ok(())
+}
+
+/// The green tree green view `id` reads: the green, lent from `greens`, at the head its view was made at.
+pub(crate) fn view_source<'a>(
+  greens: &'a crate::greens::Greens,
+  views: &GreenViews,
+  id: DbVolumeId,
+) -> Option<(crate::greens::GreenRef<'a>, u64)> {
+  let version = views.get(&id)?;
+  Some((greens.get(&id)?, *version))
 }
 
 /// Registers `volume` as the slot of merge volume `id` named `name`, or discards it with its credits.
@@ -608,39 +677,3 @@ pub(crate) fn release(state: &mut ShardState, id: DbVolumeId) {
 
 /// The head version each green's landing view holds, by green ([`ensure_green_view`]).
 pub(crate) type GreenViews = std::collections::BTreeMap<DbVolumeId, u64>;
-
-#[cfg(test)]
-mod tests {
-  use super::changed_span;
-
-  /// A-774. Do: compare an editor's save with the file it replaced. Expect: the splice spans exactly the changed
-  /// bytes, the common prefix and suffix kept; equal files give none; a pure insertion or deletion deletes or inserts
-  /// nothing on the other side; and applying the splice to the old bytes gives the new.
-  #[test]
-  fn a_save_is_declared_as_the_span_it_changed() {
-    let cases: [(&[u8], &[u8]); 6] = [
-      (b"a\nb\nc\n", b"a\nB\nc\n"),
-      (b"same", b"same"),
-      (b"abc", b"abXc"),
-      (b"abXc", b"abc"),
-      (b"", b"new"),
-      (b"aaaa", b"aa"),
-    ];
-    for (old, new) in cases {
-      match changed_span(old, new) {
-        None => assert_eq!(old, new),
-        Some((at, deleted, inserted)) => {
-          let at = usize::try_from(at).unwrap();
-          let deleted = usize::try_from(deleted).unwrap();
-          let mut spliced = old[..at].to_vec();
-          spliced.extend_from_slice(&new[inserted.clone()]);
-          spliced.extend_from_slice(&old[at + deleted..]);
-          assert_eq!(spliced, new, "{old:?} -> {new:?}");
-          assert!(deleted + inserted.len() <= old.len().max(new.len()));
-        }
-      }
-    }
-    assert_eq!(changed_span(b"a\nb\nc\n", b"a\nB\nc\n"), Some((2, 1, 2..3)));
-    assert_eq!(changed_span(b"abc", b"abXc"), Some((2, 0, 2..3)));
-  }
-}

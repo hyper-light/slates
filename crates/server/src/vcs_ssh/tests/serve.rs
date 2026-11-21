@@ -968,9 +968,8 @@ fn name_on(partition: usize) -> String {
 fn create(daemon: &Daemon, partition: usize, name: &str) {
   let name = name.to_owned();
   let created = crate::daemon::observe_at(daemon, partition, move |state| {
-    crate::verbs::dispatch(
+    crate::test_store::create(
       state,
-      1,
       &owner(),
       RequestBody::CreateRepository {
         name,
@@ -1050,7 +1049,7 @@ fn said_where(name: &str, shard: u16) -> Transcript {
 /// repository's partition lives.
 #[test]
 fn an_exec_moves_its_connection_to_the_shard_that_holds_its_repository() {
-  let daemon = crate::daemon::audit_daemon_of(SHARDS);
+  let (_store, daemon) = crate::test_store::audit_daemon_of_stored(SHARDS);
   let address = ssh_edge(&daemon);
   enroll_held_key(&daemon);
   let names = [name_on(LISTENER), name_on(AWAY)];

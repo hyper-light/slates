@@ -524,7 +524,13 @@ pub enum RequestBody {
   },
   /// The daemon's own status (§4.14 `slates.status`: every shard's counters and health
   /// signals, and the anchor's view of the daemon as the segment holds it).
-  DaemonStatus,
+  DaemonStatus {
+    /// Whether the memory report's residency is wanted: the anchor's objects whole from the kernel's per-mapping
+    /// figures, and the A-744 sweep of each shard's ranges advanced and armed to completion on idle time. A plain status
+    /// does no residency work at all (main's ruling on g228's finding, 2026-11-20): every plain request armed a sweep of
+    /// tens of GiB of address space on every shard.
+    memory: bool,
+  },
   /// Promote a lost region's declared mirror (§4.8, D-14 — region-loss promotion at operator cadence): the
   /// operator, having judged the region truly lost, proposes `PromoteRegion` on the root group so the lost
   /// region's volumes re-home to the mirror. Issued on the root leader; a follower refuses `NotRootLeader`,
@@ -1382,8 +1388,12 @@ pub enum RequestBody {
     work: VolumeId,
     /// Its green.
     green: VolumeId,
-    /// The increment, as `Increment::encode` writes it.
-    increment: Vec<u8>,
+    /// The increment, by the identity its inputs archive is held under on the asking node (its manifest identity, the
+    /// one the version's merge record and chain entry name; lane (A) 3b): the owner fetches what it lacks from that node
+    /// by identity on the content plane and stores it once, so the forward carries no increment.
+    increment: [u8; 32],
+    /// The increment's encoding's length in bytes.
+    increment_len: u64,
     /// Its verdict, as `Computed::encode` writes it (A-658 part 3a).
     computed: Vec<u8>,
     /// What the owner judges the write policy, the signature and the commit by.
@@ -1396,6 +1406,45 @@ pub enum RequestBody {
   SessionLog {
     /// The last line of the previous page, or `None` for the first page.
     after: Option<LogCursor>,
+  },
+  /// Removed (2026-11-20, Ada: the S3 base was never asked for). Tag 97 was `CreateOverS3`, a volume laid over an S3
+  /// base's objects; the tag stays reserved, never reused, and a peer that sends it is refused `Unsupported` by kind.
+  RemovedCreateOverS3,
+  /// Checks a work's pending declarations against its green's head and publishes nothing (§4.16; the Codex agent's
+  /// early-conflict check, A-796): the verdict a submit would get now, the head and base it judged and the work's
+  /// revision, with the canonical declaration (the composed operations, by index) and the conflict windows, each as
+  /// far as one reply holds. The work's base, journal, files and charge and the green are unchanged; the windows are
+  /// kept with the work for `Conflicts` (A-267), as a conflicting rebase keeps them. Answered `MergeChecked`. A read.
+  /// Appended.
+  CheckMerge {
+    /// The work volume.
+    work: VolumeId,
+  },
+  /// Reads a byte range of the work as a `CheckMerge` saw it (A-796): refused `StaleMergeView` once the work changed (its
+  /// revision moved, its base or its green is not the stamp's). The green's view is the green at the stamp's head, read
+  /// with `ReadRange` at that version, which no later publication changes. Answered as `ReadRange` is. A read. Appended.
+  ReadMergeCheck {
+    /// The check's stamp.
+    stamp: MergeStamp,
+    /// The file.
+    path: String,
+    /// The first byte.
+    offset: u64,
+    /// The most bytes wanted.
+    max: u64,
+  },
+  /// Resolves a conflict an agent checked (A-796): retires the canonical operations `discard` names, rebases the rest
+  /// onto the stamp's head, applies `replacement` there in head coordinates, and restates the work at the head, as one
+  /// recorded step. Refused `StaleMergeView`, with nothing changed, when the green's head is not the stamp's or the work
+  /// changed since the check; answered `Rebased` with the windows, nothing changed, when what is kept still conflicts.
+  /// No merge is inferred: every byte of a resolution is the agent's declaration (D-27). Appended.
+  ResolveMerge {
+    /// The check's stamp.
+    stamp: MergeStamp,
+    /// Indices into the check's canonical declaration to retire, strictly increasing.
+    discard: Vec<u64>,
+    /// The agent's own changes, in the head's coordinates, applied after the kept operations.
+    replacement: Vec<WorkChange>,
   },
 }
 
@@ -2127,13 +2176,19 @@ pub struct MemoryKindReport {
   pub mappings: u64,
   /// The address space it reserves: the mappings' lengths, or for the heap what the allocators hold from the OS.
   pub reserved_bytes: u64,
-  /// Its bytes in RAM, from the kernel's page table at the last completed sweep of the shard that maps it (or for the
-  /// heap the bytes live allocations hold, now); 0 until a sweep completes ([`MemoryKindReport::measured`]).
+  /// Its bytes in RAM, from the kernel's page table (or for the heap the bytes live allocations hold, now); 0 until
+  /// measured ([`MemoryKindReport::measured`]). For `arenas` and `regions`, the arenas' held runs and the clients' rings
+  /// as the last sweep to pass them found them: a sweep walks them first, so they are read within one pass over what is
+  /// held, not over the address space reserved (main's ruling of 2026-11-21 on w-sizing's option (a)); for `segment` and
+  /// `content`, the mappings whole, read at the request. Tolerance: a page the host has compressed or paged out since it
+  /// was written is not resident and is not counted, so a figure may fall short of what was written by what the host
+  /// took away; it never counts a page not in RAM, nor a freed arena block's page (resident until the idle purge).
   pub resident_bytes: u64,
   /// Its bytes written, where the OS says (macOS); `None` where it does not, and for the heap.
   pub modified_bytes: Option<u64>,
-  /// Whether `resident_bytes` is a reading: each sweep that maps the kind has completed at least once (each status
-  /// request advances a shard's sweep, A-744's bound).
+  /// Whether `resident_bytes` is a reading: on every shard that maps the kind, a sweep has passed its ranges at least once
+  /// (a status asking for the memory report arms one on the shard's idle time, A-744; asked again, the report reads it,
+  /// and the shard's `content_range.sweep.kinds_at_ns` says when).
   pub measured: bool,
 }
 
@@ -2427,6 +2482,15 @@ impl RequestBody {
       | RequestBody::Status { volume }
       | RequestBody::Drifted { volume, .. }
       | RequestBody::Conflicts { work: volume, .. }
+      | RequestBody::CheckMerge { work: volume }
+      | RequestBody::ReadMergeCheck {
+        stamp: MergeStamp { work: volume, .. },
+        ..
+      }
+      | RequestBody::ResolveMerge {
+        stamp: MergeStamp { work: volume, .. },
+        ..
+      }
       | RequestBody::ReadBase { volume, .. }
       | RequestBody::Digest { volume, .. }
       | RequestBody::Rewitness { volume, .. }
@@ -2474,11 +2538,12 @@ impl RequestBody {
       // A green over a base is born on the base volume's owner shard, where the snapshot is walked.
       RequestBody::CreateGreen { base, .. } => base.map(|b| b.volume),
       RequestBody::Create { .. }
+      | RequestBody::RemovedCreateOverS3
       | RequestBody::Advance { .. }
       | RequestBody::Detach { .. }
       | RequestBody::BindMount { .. }
       | RequestBody::List { .. }
-      | RequestBody::DaemonStatus
+      | RequestBody::DaemonStatus { .. }
       | RequestBody::DaemonStatusNext { .. }
       | RequestBody::Bootstrap { .. }
       | RequestBody::RecoveryPlan { .. }
@@ -2542,6 +2607,7 @@ impl RequestBody {
         | RequestBody::Submit { .. }
         | RequestBody::SubmitApproved { .. }
         | RequestBody::Rebase { .. }
+        | RequestBody::ResolveMerge { .. }
         | RequestBody::Clone { .. }
         | RequestBody::Resize { .. }
         | RequestBody::Destroy { .. }
@@ -2575,6 +2641,8 @@ impl RequestBody {
       RequestBody::Status { .. }
         | RequestBody::Drifted { .. }
         | RequestBody::Conflicts { .. }
+        | RequestBody::CheckMerge { .. }
+        | RequestBody::ReadMergeCheck { .. }
         | RequestBody::Versions { .. }
         | RequestBody::MergeRecord { .. }
         | RequestBody::ChangedSince { .. }
@@ -2960,6 +3028,67 @@ pub struct MergeWindow {
   pub len: u64,
   /// The conflict class, as its `MergeConflictClass` discriminant.
   pub class: u8,
+}
+
+/// Everything a merge check judged (A-796): the work, its green, the base and head the verdict mapped between, and the
+/// work's revision, which every change to the work moves. A read or a resolution naming it is refused `StaleMergeView`
+/// once any of them no longer holds.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MergeStamp {
+  /// The work.
+  pub work: VolumeId,
+  /// Its green.
+  pub green: VolumeId,
+  /// The work's base the check mapped from.
+  pub base: u64,
+  /// The green's head the check judged against.
+  pub head: u64,
+  /// The work's revision when it was checked.
+  pub revision: u64,
+}
+
+/// A byte view a merge check names (A-796): what a client reads it through.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergeView {
+  /// The work as it stood when checked (`ReadMergeCheck`, refused once the work changed).
+  Work,
+  /// The green at the check's head (`ReadRange` at that version).
+  Green,
+}
+
+/// One change of a resolution (A-796), with the ordinary edit's and declaration's meaning, in the head's coordinates.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum WorkChange {
+  /// A splice of a file, as `Edit`.
+  Edit {
+    /// The file.
+    path: String,
+    /// The offset.
+    at: u64,
+    /// The bytes removed there.
+    delete_len: u64,
+    /// The bytes inserted there.
+    bytes: Vec<u8>,
+  },
+  /// A namespace or metadata declaration, as `Declare`.
+  Declare {
+    /// The declaration.
+    op: WorkOp,
+  },
+}
+
+/// One operation of a work's canonical declaration (A-796): what its journal composes to against its base, by the
+/// index a resolution's `discard` names it with.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct MergeOp {
+  /// The path the operation acts on.
+  pub path: String,
+  /// The operation's kind, as the ops document's `OpKind` discriminant.
+  pub kind: u8,
+  /// Its offset (or its kind's first operand).
+  pub at: u64,
+  /// Its length (or its kind's second operand).
+  pub len: u64,
 }
 
 /// A namespace or metadata operation a work volume declares (§4.16), the counterpart to the content
@@ -4676,6 +4805,9 @@ pub enum Refusal {
     /// The newer presentation.
     newer: u64,
   },
+  /// A merge check's view no longer holds (A-796): the green's head moved past the stamp's, or the work changed since it
+  /// was checked. Nothing was read or changed; check again. Appended.
+  StaleMergeView,
 }
 
 /// Why a copy was refused before any verdict ([`Refusal::CopyRefused`]): `slates_merge::engine::CopyRefusal` on the
@@ -4745,13 +4877,15 @@ pub enum ImportFault {
     /// The bytes an import may hold at once.
     room: u64,
   },
-  /// A file is still being fetched from the base's store (an S3 base): ask again once it has landed.
-  Pending,
+  /// Removed (2026-11-20, Ada: the S3 base was never asked for): a file still being fetched from an S3 base. The tag
+  /// stays reserved, never reused; no daemon of this build sends it.
+  RemovedPending,
   /// The import was given back before its end: its repository was freed.
   Abandoned,
   /// A Subversion dump the import refused as `svnadmin load` refuses the same stream (A-652 part 3): Subversion's error
-  /// number, the revision being loaded, and the path the refusal names. The revisions committed before it stay, as
-  /// `svnadmin load` keeps them. Appended.
+  /// number, the revision being loaded, and the path the refusal names. No daemon of this build sends it: since C2
+  /// stage C an import lands its revisions in batches, and refuses as [`ImportFault::SubversionLanded`] does, naming
+  /// what landed. Appended.
   Subversion {
     /// Subversion's error number (`svn_error_codes.h`).
     code: u32,
@@ -4759,6 +4893,21 @@ pub enum ImportFault {
     revision: Option<u64>,
     /// The path the refusal names, empty where it names none.
     path: String,
+  },
+  /// A Subversion dump the import refused as `svnadmin load` refuses the same stream (A-652 part 3; C2 stage C):
+  /// Subversion's error number, the revision being loaded, the path the refusal names, and the last revision that
+  /// landed. An import lands its revisions a batch at a time, a batch one changeset and atomic, so the revisions of the
+  /// batch the refusal ended are given up, where `svnadmin load` keeps each as it goes; the repository stands at
+  /// `landed`, and the same dump imported again resumes after it. Appended.
+  SubversionLanded {
+    /// Subversion's error number (`svn_error_codes.h`).
+    code: u32,
+    /// The revision being loaded; none before the stream's first revision record.
+    revision: Option<u64>,
+    /// The path the refusal names, empty where it names none.
+    path: String,
+    /// The repository's youngest revision as the refusal left it: the last that landed.
+    landed: u64,
   },
 }
 
@@ -5755,6 +5904,22 @@ pub enum ReplyBody {
     lines: Vec<LogLine>,
     /// The cursor that continues the walk (this page's last line), or `None` when this page ends it.
     next: Option<LogCursor>,
+  },
+  /// A merge check (`CheckMerge`, A-796): what it judged, the conflict windows as far as one reply holds (the rest kept
+  /// under `verdict` for `Conflicts`, A-267), and the canonical declaration as far as the reply holds. Appended.
+  MergeChecked {
+    /// What the check judged.
+    stamp: MergeStamp,
+    /// The conflict windows; none when a submit now would be accepted.
+    conflicts: Vec<MergeWindow>,
+    /// Windows past what this reply holds, read with `Conflicts`.
+    conflicts_elided: u32,
+    /// The kept verdict the windows are of; 0 when there are none.
+    verdict: u64,
+    /// The canonical declaration, by index.
+    declaration: Vec<MergeOp>,
+    /// Operations of the declaration past what this reply holds.
+    declaration_elided: u32,
   },
 }
 

@@ -7,12 +7,12 @@
 //! repository's directory and each name under the one before it, never a path string, so a rename of the repository by
 //! its user changes nothing (§4.4), and the seam has no verb that writes (R1). The host itself refuses a name that is
 //! not one entry (empty, `.`, `..`, or holding a separator: `slates_base`'s `one_entry`), never follows a link
-//! (`O_NOFOLLOW`, `FILE_OPEN_REPARSE_POINT`), and names the fetch a read of an S3 base waits on (A-555).
+//! (`O_NOFOLLOW`, `FILE_OPEN_REPARSE_POINT`).
 //!
 //! **Absent is not refused.** A name the host does not find is a file that is not there (`None`), which the import
 //! reads as 7.2 reads one: `revlog._get_data` reads an absent file as empty, and a store before its first commit has no
 //! changelog. Every other refusal is carried through typed ([`BaseRefused::Host`]) where 7.2's `open` raises and it
-//! aborts: a directory where a file is named or the reverse, a link, a fetch still pending, the host unavailable. A
+//! aborts: a directory where a file is named or the reverse, a link, the host unavailable. A
 //! name that is not UTF-8, which the seam's names are, is refused by kind before the host is asked
 //! ([`BaseRefused::NotUtf8`]): only the plain encoding (7.2's `exp-very-fragile-and-unsafe-plain-store-encoding`) names
 //! a file by its path's own bytes, since 7.2's every other encoding writes a byte past ASCII as `~` and two hexadecimal
@@ -25,11 +25,9 @@
 //! ends, so a read past that returns fewer bytes and the revlog reader refuses the revlog as truncated.
 //!
 //! **A host's short answer is not the file's end.** A read asks the host again from where its answer stopped until the
-//! range is read or the host answers nothing, since a host may answer fewer bytes than asked before a file ends: an S3
-//! base answers from the chunks it has cached and refuses the next read with the fetch it waits on (A-555), and Linux
-//! transfers at most 0x7ffff000 bytes a `pread` (read(2), NOTES). The S3 base's refusal is carried through, never taken
-//! for the file's end, so the import's caller runs the import again once the fetch lands (`ImportRefused::Host`) rather
-//! than the revlog being refused as truncated.
+//! range is read or the host answers nothing, since a host may answer fewer bytes than asked before a file ends: Linux
+//! transfers at most 0x7ffff000 bytes a `pread` (read(2), NOTES). A refusal of a later read is carried through, never
+//! taken for the file's end (`ImportRefused::Host`), so the revlog is not refused as truncated.
 //!
 //! **Bounds.** A read is charged to the import's room before a byte is held, and charged at most what the file holds
 //! from its offset, so an index entry pointing a chunk past its data file's end costs nothing. The handles held at once
@@ -74,7 +72,7 @@ type Open = (HostFile, u64);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum BaseRefused {
   /// The host refused, for its own reason (§4.15's `HostError`): a directory where a file is named or the reverse, a
-  /// link, a fetch still pending on an S3 base, the host unavailable.
+  /// link, the host unavailable.
   Host(HostError),
   /// A name is not UTF-8, which the host seam's names are: only the plain encoding leaves one.
   NotUtf8 {
@@ -360,7 +358,7 @@ pub(crate) mod tests {
   use slates_vcs::ContentStore;
   use slates_vfs::host::sim::{Interference, SimHost, SimVerb};
   use slates_vfs::host::{
-    BaseEntry, FetchId, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, WatchState,
+    BaseEntry, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, WatchState,
   };
   use slates_vfs::inode::Fingerprint;
 
@@ -417,7 +415,7 @@ pub(crate) mod tests {
   /// Shape: the history 7.2 stored under its file index (`crates/hg/fixtures/import/make-import-fixtures.sh`): names
   /// under every rule of its encoding (a reserved name, a trailing space and period, `.i` and `.d` directories) and a
   /// hashed path eight directories deep.
-  const FILE_INDEX: Files = repository!(
+  pub(crate) const FILE_INDEX: Files = repository!(
     "import/fileindex",
     ["requires" => "import/fileindex-hg-requires.txt"],
     [
@@ -454,6 +452,219 @@ pub(crate) mod tests {
     ]
   );
 
+  /// Shape: the history 7.2 stored in a dotencode store (`crates/hg/fixtures/store/make-store-fixtures.sh`), share-safe.
+  pub(crate) const DOT: Files = repository!(
+    "store/dot",
+    ["requires" => "import/dot-hg-requires.txt"],
+    [
+      "00changelog.d",
+      "00changelog.i",
+      "00manifest.i",
+      "data/_capital___under.txt.i",
+      "data/_f_o_o.i",
+      "data/au~78.txt.i",
+      "data/colon~3aquest~3fstar~2a.txt.i",
+      "data/co~6d1.i",
+      "data/co~6e.i",
+      "data/foo.i",
+      "data/lp~749.x.i",
+      "data/plain.txt.i",
+      "data/pr~6e.d.i",
+      "data/quote~22lt~3cgt~3epipe~7cback~5cslash.txt.i",
+      "data/tilde~7e~c3~a9.txt.i",
+      "data/trailing .i",
+      "data/trailing..i",
+      "data/x.i.hg/inside.txt.i",
+      "data/y.d.hg/inside.txt.i",
+      "data/z.hg.hg/inside.txt.i",
+      "data/~20space.i",
+      "data/~2eleading.i",
+      "dh/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab1068971bbd8477250f462eb099cbb09d78312dc.i",
+      "dh/director/seventh_/third.di/fourth.d/fifth.di/sixth.di/eighth.d/deep-file-na8045308eb5772f8d366bd883527c27741dfa75db.i",
+      "dh/upper_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz.txt.i20053374f434dbfe7d9cbc451df115259a188c19.i",
+      "fncache",
+      "requires",
+    ]
+  );
+
+  /// Shape: the same history in a hybrid store (`make-store-fixtures.sh`), share-safe.
+  pub(crate) const HYBRID: Files = repository!(
+    "store/hybrid",
+    ["requires" => "import/hybrid-hg-requires.txt"],
+    [
+      "00changelog.d",
+      "00changelog.i",
+      "00manifest.i",
+      "data/ space.i",
+      "data/.leading.i",
+      "data/_capital___under.txt.i",
+      "data/_f_o_o.i",
+      "data/au~78.txt.i",
+      "data/colon~3aquest~3fstar~2a.txt.i",
+      "data/co~6d1.i",
+      "data/co~6e.i",
+      "data/foo.i",
+      "data/lp~749.x.i",
+      "data/plain.txt.i",
+      "data/pr~6e.d.i",
+      "data/quote~22lt~3cgt~3epipe~7cback~5cslash.txt.i",
+      "data/tilde~7e~c3~a9.txt.i",
+      "data/trailing .i",
+      "data/trailing..i",
+      "data/x.i.hg/inside.txt.i",
+      "data/y.d.hg/inside.txt.i",
+      "data/z.hg.hg/inside.txt.i",
+      "dh/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab1068971bbd8477250f462eb099cbb09d78312dc.i",
+      "dh/director/seventh_/third.di/fourth.d/fifth.di/sixth.di/eighth.d/deep-file-na8045308eb5772f8d366bd883527c27741dfa75db.i",
+      "dh/upper_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz.txt.i20053374f434dbfe7d9cbc451df115259a188c19.i",
+      "fncache",
+      "requires",
+    ]
+  );
+
+  /// Shape: the dotencode store before share-safe: its requirements in `.hg/requires` alone, the store's left out.
+  pub(crate) const LEGACY: Files = repository!(
+    "store/dot",
+    ["requires" => "import/legacy-hg-requires.txt"],
+    [
+      "00changelog.d",
+      "00changelog.i",
+      "00manifest.i",
+      "data/_capital___under.txt.i",
+      "data/_f_o_o.i",
+      "data/au~78.txt.i",
+      "data/colon~3aquest~3fstar~2a.txt.i",
+      "data/co~6d1.i",
+      "data/co~6e.i",
+      "data/foo.i",
+      "data/lp~749.x.i",
+      "data/plain.txt.i",
+      "data/pr~6e.d.i",
+      "data/quote~22lt~3cgt~3epipe~7cback~5cslash.txt.i",
+      "data/tilde~7e~c3~a9.txt.i",
+      "data/trailing .i",
+      "data/trailing..i",
+      "data/x.i.hg/inside.txt.i",
+      "data/y.d.hg/inside.txt.i",
+      "data/z.hg.hg/inside.txt.i",
+      "data/~20space.i",
+      "data/~2eleading.i",
+      "dh/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab1068971bbd8477250f462eb099cbb09d78312dc.i",
+      "dh/director/seventh_/third.di/fourth.d/fifth.di/sixth.di/eighth.d/deep-file-na8045308eb5772f8d366bd883527c27741dfa75db.i",
+      "dh/upper_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz.txt.i20053374f434dbfe7d9cbc451df115259a188c19.i",
+      "fncache",
+    ]
+  );
+
+  /// Shape: the history 7.2 stored as revlog v2 under its file index (`crates/hg/fixtures/import/make-import-fixtures.sh`).
+  pub(crate) const V2: Files = repository!(
+    "import/v2",
+    ["requires" => "import/v2-hg-requires.txt"],
+    [
+      "00changelog-150e1cfc.idx",
+      "00changelog-88698448.sda",
+      "00changelog-b870a51b.dat",
+      "00changelog.i",
+      "00manifest-1335303a.sda",
+      "00manifest-6b8ab34b.idx",
+      "00manifest-b875dfc5.dat",
+      "00manifest.i",
+      "data/_capital___under.txt-1f2c2f01.idx",
+      "data/_capital___under.txt-5de78e5c.dat",
+      "data/_capital___under.txt-92d73cd4.sda",
+      "data/_capital___under.txt.i",
+      "data/_f_o_o-05a21d65.idx",
+      "data/_f_o_o-43c37dde.dat",
+      "data/_f_o_o-e2c9362a.sda",
+      "data/_f_o_o.i",
+      "data/au~78.txt-2c10b55e.dat",
+      "data/au~78.txt-7b2d6d46.idx",
+      "data/au~78.txt-9dc8a096.sda",
+      "data/au~78.txt.i",
+      "data/colon~3aquest~3fstar~2a.txt-0641b566.dat",
+      "data/colon~3aquest~3fstar~2a.txt-32090367.idx",
+      "data/colon~3aquest~3fstar~2a.txt-fdde9d5b.sda",
+      "data/colon~3aquest~3fstar~2a.txt.i",
+      "data/com1-887782a2.dat",
+      "data/com1-91214c9d.sda",
+      "data/com1-9ea89e64.idx",
+      "data/con-59d7cefb.idx",
+      "data/con-675e7e32.sda",
+      "data/con-768bf46f.dat",
+      "data/co~6d1.i",
+      "data/co~6e.i",
+      "data/foo-6594c487.dat",
+      "data/foo-88163688.sda",
+      "data/foo-ea337809.idx",
+      "data/foo.i",
+      "data/lp~749.x-76ca3167.dat",
+      "data/lp~749.x-7abfface.idx",
+      "data/lp~749.x-958fa9e4.sda",
+      "data/lp~749.x.i",
+      "data/plain.txt-92beb6fd.dat",
+      "data/plain.txt-c09e3fe7.idx",
+      "data/plain.txt-ecdc8c03.sda",
+      "data/plain.txt.i",
+      "data/pr~6e.d-a4d11bc6.dat",
+      "data/pr~6e.d-ecbdc938.idx",
+      "data/pr~6e.d-fd586516.sda",
+      "data/pr~6e.d.i",
+      "data/quote~22lt~3cgt~3epipe~7cback~5cslash.txt-06e3883a.idx",
+      "data/quote~22lt~3cgt~3epipe~7cback~5cslash.txt-65f67223.dat",
+      "data/quote~22lt~3cgt~3epipe~7cback~5cslash.txt-d7473fc6.sda",
+      "data/quote~22lt~3cgt~3epipe~7cback~5cslash.txt.i",
+      "data/tilde~7e~c3~a9.txt-171e199e.idx",
+      "data/tilde~7e~c3~a9.txt-57ac65f3.dat",
+      "data/tilde~7e~c3~a9.txt-b3ea699d.sda",
+      "data/tilde~7e~c3~a9.txt.i",
+      "data/trailing -1a19ef85.sda",
+      "data/trailing -73b1936b.idx",
+      "data/trailing -e7d3236b.dat",
+      "data/trailing .i",
+      "data/trailing.-00d6d3be.sda",
+      "data/trailing.-3d4c58e4.idx",
+      "data/trailing.-b0f8e721.dat",
+      "data/trailing..i",
+      "data/x.i.hg/inside.txt-791274ee.dat",
+      "data/x.i.hg/inside.txt-f1188b0c.sda",
+      "data/x.i.hg/inside.txt-faa1131a.idx",
+      "data/x.i.hg/inside.txt.i",
+      "data/y.d.hg/inside.txt-3e9ac652.idx",
+      "data/y.d.hg/inside.txt-4046ec56.dat",
+      "data/y.d.hg/inside.txt-ba969dfa.sda",
+      "data/y.d.hg/inside.txt.i",
+      "data/z.hg.hg/inside.txt-b71e11b5.idx",
+      "data/z.hg.hg/inside.txt-d7a799ae.sda",
+      "data/z.hg.hg/inside.txt-f7e0c86f.dat",
+      "data/z.hg.hg/inside.txt.i",
+      "data/~20space-539ee172.sda",
+      "data/~20space-7f2eb713.dat",
+      "data/~20space-9b3fc813.idx",
+      "data/~20space.i",
+      "data/~2eleading-265d8f66.sda",
+      "data/~2eleading-a2b86225.idx",
+      "data/~2eleading-f73766e4.dat",
+      "data/~2eleading.i",
+      "dh/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa4e4b71aecd2d6306510b05e6cdbc9e0c6814bf03.idx",
+      "dh/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa12a8264b75c8465edae102ccb3b9c5b108c5a2b.dat",
+      "dh/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa78c585b2dae8e17cd25ee33209c1bc563533310.sda",
+      "dh/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab1068971bbd8477250f462eb099cbb09d78312dc.i",
+      "dh/director/seventh_/third.di/fourth.d/fifth.di/sixth.di/eighth.d/deep-file-e22e927cfb06485b2c677a81d45d5162c1c9005f.sda",
+      "dh/director/seventh_/third.di/fourth.d/fifth.di/sixth.di/eighth.d/deep-file-f9f36e4c3c685d07240b7a978a965925d0261b1b.idx",
+      "dh/director/seventh_/third.di/fourth.d/fifth.di/sixth.di/eighth.d/deep-file-fc0f121cf5080777c9e15f7c81df433fcf28c48c.dat",
+      "dh/director/seventh_/third.di/fourth.d/fifth.di/sixth.di/eighth.d/deep-file-na8045308eb5772f8d366bd883527c27741dfa75db.i",
+      "dh/upper_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz.txt-00cf578e.dateecb7397900171839840de7c29f521193a11026b.dat",
+      "dh/upper_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz.txt-18857273.idxbc885b83760df24ca8dd319d77fdf3ce269b7af4.idx",
+      "dh/upper_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz.txt-246a6c91.sda40cc1723fcb3b67d6649f9efcdde74aedb1a61b7.sda",
+      "dh/upper_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz.txt.i20053374f434dbfe7d9cbc451df115259a188c19.i",
+      "fileindex",
+      "fileindex-list.69d069c3",
+      "fileindex-meta.619c4819",
+      "fileindex-tree.5e69c5d1",
+      "requires",
+    ]
+  );
+
   /// Shape: one file of ten bytes under two directories of the store.
   const TEN_BYTES: Files = &[("store/data/a.i", b"0123456789")];
 
@@ -469,8 +680,8 @@ pub(crate) mod tests {
   /// Shape: a nesting deeper than every handle the base holds at once.
   const DEPTH: usize = 32;
 
-  /// Shape: the fetch an S3 base's read waits on, any number.
-  const PENDING: HostError = HostError::Pending(FetchId(7));
+  /// Shape: a host's refusal of a read, an I/O error (EIO).
+  const REFUSED: HostError = HostError::Unavailable(slates_vfs::host::OsCode::Errno(5));
 
   /// A new content store.
   fn store() -> ContentStore {
@@ -867,54 +1078,52 @@ pub(crate) mod tests {
     assert_eq!(host.open_handles(), open_before);
   }
 
-  /// A-649 part 4: do import the `states` repository with the manifest log's open answered a fetch still pending (an
-  /// S3 base's first read of it). Expect the import refused with the host's refusal as the host gave it, and nothing
+  /// A-649 part 4: do import the `states` repository with the manifest log's open refused by the host (EIO). Expect the import refused with the host's refusal as the host gave it, and nothing
   /// the lend opened left open.
   #[test]
   fn a_host_refusal_is_carried_through_and_nothing_is_left_open() {
     let (mut host, repository) = laid_out(STATES.iter().copied());
     let open_before = host.open_handles();
     let manifest = format!("/{REPOSITORY}/.hg/store/00manifest.i");
-    host.fail(SimVerb::OpenFile, &manifest, PENDING, 1);
+    host.fail(SimVerb::OpenFile, &manifest, REFUSED, 1);
     let mut store = store();
     let mut base = HgBase::new(&mut host, repository);
     let refused = import::import(&mut base, &mut store, Admission::new(ROOM)).err();
     drop(base);
-    let expected = ImportRefused::Host(BaseRefused::Host(PENDING));
+    let expected = ImportRefused::Host(BaseRefused::Host(REFUSED));
     assert_eq!(
       (refused, host.open_handles()),
       (Some(expected), open_before)
     );
   }
 
-  /// The simulated host answering as an S3 base does (`slates_base`'s S3 host, A-555): a read answers at most `piece`
-  /// bytes and none from `cached` on, where the chunks it has cached end, and a read from there is refused with the
-  /// fetch it waits on (`PENDING`); a length is refused with `fstat` while one is armed, once. Every other call is the
-  /// simulated host's.
-  struct Fetching<'s> {
+  /// The simulated host answering short: a read answers at most `piece` bytes and none from `readable` on, where what it
+  /// can read ends, and a read from there is refused (`REFUSED`); a length is refused with `fstat` while one is armed,
+  /// once. Every other call is the simulated host's.
+  struct Short<'s> {
     /// The simulated host.
     sim: &'s mut SimHost,
     /// The next length's refusal, once.
     fstat: Option<HostError>,
     /// The most bytes a read answers.
     piece: usize,
-    /// Where the cached bytes end.
-    cached: u64,
+    /// Where the readable bytes end.
+    readable: u64,
   }
 
-  impl<'s> Fetching<'s> {
+  impl<'s> Short<'s> {
     /// `sim` answering every read whole and refusing nothing, until a test arms it.
     fn over(sim: &'s mut SimHost) -> Self {
-      Fetching {
+      Short {
         sim,
         fstat: None,
         piece: usize::MAX,
-        cached: u64::MAX,
+        readable: u64::MAX,
       }
     }
   }
 
-  impl HostFs for Fetching<'_> {
+  impl HostFs for Short<'_> {
     fn facts(&mut self, dir: HostDir) -> Result<HostFacts, HostError> {
       self.sim.facts(dir)
     }
@@ -943,11 +1152,11 @@ pub(crate) mod tests {
     }
 
     fn read_at(&mut self, file: HostFile, off: u64, buf: &mut [u8]) -> Result<usize, HostError> {
-      if off >= self.cached {
-        return Err(PENDING);
+      if off >= self.readable {
+        return Err(REFUSED);
       }
-      let cached = usize::try_from(self.cached.saturating_sub(off)).unwrap_or(usize::MAX);
-      let answered = buf.len().min(self.piece).min(cached);
+      let readable = usize::try_from(self.readable.saturating_sub(off)).unwrap_or(usize::MAX);
+      let answered = buf.len().min(self.piece).min(readable);
       let Some(piece) = buf.get_mut(..answered) else {
         return Ok(0);
       };
@@ -979,42 +1188,41 @@ pub(crate) mod tests {
     }
   }
 
-  /// A-649 part 4: do take the length of a file whose length the host refuses (an S3 base's fetch still pending), then
+  /// A-649 part 4: do take the length of a file whose length the host refuses (EIO), then
   /// take it again. Expect the host's refusal carried through with the file it opened closed at once, then the file's
   /// length, and nothing left open when the lend ends.
   #[test]
   fn a_refused_length_closes_the_file_it_opened_and_is_carried_through() {
     let (mut sim, repository) = laid_out(TEN_BYTES.iter().copied());
     let open_before = sim.open_handles();
-    let mut host = Fetching::over(&mut sim);
-    host.fstat = Some(PENDING);
+    let mut host = Short::over(&mut sim);
+    host.fstat = Some(REFUSED);
     let mut base = HgBase::new(&mut host, repository);
     let path = names("store/data/a.i");
     let refused = base.len(&path);
     let held_after = base.host.sim.open_handles().saturating_sub(open_before);
     let again = base.len(&path);
     drop(base);
-    let directory_alone = (Err(by_host(PENDING)), 1, Ok(Some(10)));
+    let directory_alone = (Err(by_host(REFUSED)), 1, Ok(Some(10)));
     assert_eq!((refused, held_after, again), directory_alone);
     assert_eq!(sim.open_handles(), open_before);
   }
 
-  /// A-649 part 4: do read a file of ten bytes whole from a host that answers three bytes a read (an S3 base answers
-  /// from its cached chunks), first with every byte cached, then with only its first six cached and a fetch pending for
-  /// the rest. Expect the whole file read in pieces, then the read refused with the fetch, never answered with the six
-  /// bytes before it as though the file ended there.
+  /// A-649 part 4: do read a file of ten bytes whole from a host that answers three bytes a read, first with every byte
+  /// readable, then with its reads from the sixth refused. Expect the whole file read in pieces, then the read refused
+  /// with the host's refusal, never answered with the six bytes before it as though the file ended there.
   #[test]
-  fn a_read_answered_in_pieces_is_read_whole_and_a_pending_piece_refuses_it() {
+  fn a_read_answered_in_pieces_is_read_whole_and_a_refused_piece_refuses_it() {
     let (mut sim, repository) = laid_out(TEN_BYTES.iter().copied());
-    let mut host = Fetching::over(&mut sim);
+    let mut host = Short::over(&mut sim);
     host.piece = 3;
     let mut base = HgBase::new(&mut host, repository);
     let path = names("store/data/a.i");
     let mut room = Admission::new(ROOM);
     let whole = base.read(&path, 0, 10, &mut room);
-    base.host.cached = 6;
-    let pending = base.read(&path, 0, 10, &mut room);
-    let expected = (Ok(Some(b"0123456789".to_vec())), Err(by_host(PENDING)));
-    assert_eq!((whole, pending), expected);
+    base.host.readable = 6;
+    let refused = base.read(&path, 0, 10, &mut room);
+    let expected = (Ok(Some(b"0123456789".to_vec())), Err(by_host(REFUSED)));
+    assert_eq!((whole, refused), expected);
   }
 }

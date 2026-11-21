@@ -41,6 +41,13 @@ pub enum RtError {
   DriverLost,
   /// A call that needs the current shard was made from a thread that runs none.
   NotOnShardThread,
+  /// A bounded resource is at its bound (A-767: native retirement's groups and commands, the synchronization cells).
+  Capacity {
+    /// What was bounded.
+    what: &'static str,
+    /// The bound.
+    bound: usize,
+  },
   /// A configuration value the runtime cannot honour.
   BadConfig {
     /// Which value.
@@ -105,6 +112,7 @@ impl fmt::Display for RtError {
       Self::DriverLost => f.write_str("the driver was lost while waiting"),
       Self::NotOnShardThread => f.write_str("not on a shard thread"),
       Self::BadConfig { what } => write!(f, "bad configuration: {what}"),
+      Self::Capacity { what, bound } => write!(f, "{what}: at the bound of {bound}"),
       Self::ControlFull { shard } => write!(f, "shard {shard}'s control channel is full"),
       Self::ShardGone { shard } => write!(f, "shard {shard} is gone"),
       Self::Mem(e) => write!(f, "memory: {e}"),
@@ -177,6 +185,7 @@ impl RtError {
       | Self::StaleTask { .. }
       | Self::TooManyShards { .. }
       | Self::BadConfig { .. }
+      | Self::Capacity { .. }
       | Self::ControlFull { .. }
       | Self::KeptInUse { .. }
       | Self::RingClaimed { .. }

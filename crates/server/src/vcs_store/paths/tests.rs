@@ -16,7 +16,7 @@ use slates_vcs::{ContentId, ContentStore, Mode};
 
 use super::{BUILT, DERIVED, GreenPaths, REFUSED, REMADE};
 use crate::state::ShardState;
-use crate::verbs::{dispatch, to_db_volume};
+use crate::verbs::to_db_volume;
 
 /// Shape: the room the oracle's own store is made with: the fixed histories' few files and their maps, many times over.
 const SCRATCH_BUDGET: u64 = 1 << 24;
@@ -39,7 +39,7 @@ fn owner() -> Principal {
 
 /// `body` asked of `state` as the owner.
 pub(crate) fn ask(state: &mut ShardState, body: RequestBody) -> ReplyBody {
-  dispatch(state, 1, &owner(), body)
+  crate::test_store::create(state, &owner(), body)
 }
 
 /// A git repository named `name`: its id and its root green.
@@ -119,6 +119,9 @@ pub(crate) fn version_saying(
   // A green's first submit owes its commit and builds its map in slices after it (A-664's live whole builds, part 2),
   // by a task a test's step never runs: driven to its end here, so the test reads the store as the build leaves it.
   super::whole_build::settle(state);
+  // The version's commit is made by a job of the shard's queue (C5 part 2b piece 3: landed on the node's store, then
+  // recorded), a task a test's step never runs: made here, so the test reads the store as the commit leaves it.
+  crate::vcs_store::commits::made_after_now(state);
   let ReplyBody::Submitted {
     version: Some(version),
     ..
@@ -396,7 +399,7 @@ fn last_five(state: &mut ShardState, at: (RepositoryId, VolumeId), model: &mut M
 /// link, asks for a whole build), none refused.
 #[test]
 fn t_a664_p3_every_version_of_a_git_green_keeps_its_map_of_gits_files() {
-  let counts = crate::daemon::audit_on_shard(|state| {
+  let counts = crate::test_store::audit_on_stored_shard("vcs_store-paths", |state| {
     let at = git_repository(state, "tree");
     let mut model = Model::new();
     first_five(state, at, &mut model);
@@ -415,7 +418,7 @@ fn t_a664_p3_every_version_of_a_git_green_keeps_its_map_of_gits_files() {
 /// file to a plain green. Expect: accepted, and no map derived, built or refused.
 #[test]
 fn t_a664_p3_a_plain_greens_versions_keep_no_map() {
-  let counts = crate::daemon::audit_on_shard(|state| {
+  let counts = crate::test_store::audit_on_stored_shard("vcs_store-paths", |state| {
     let made = ask(
       state,
       RequestBody::CreateGreen {
@@ -443,7 +446,7 @@ fn t_a664_p3_a_plain_greens_versions_keep_no_map() {
 /// the third version's map derived from it; so one build as a version committed, one remade, two derived.
 #[test]
 fn t_a664_p3_a_store_made_again_holds_each_greens_map_again() {
-  let counts = crate::daemon::audit_on_shard(|state| {
+  let counts = crate::test_store::audit_on_stored_shard("vcs_store-paths", |state| {
     let at = git_repository(state, "again");
     let mut model = Model::new();
     version(state, at.1, 1, vec![create("/f", b"one")]);
@@ -471,7 +474,7 @@ fn t_a664_p3_a_store_made_again_holds_each_greens_map_again() {
 /// its head equal to its model, remade once; the third version's derived from it.
 #[test]
 fn t_a664_holders_a_successors_rebuilt_repository_holds_each_greens_map() {
-  let counts = crate::daemon::audit_on_shard(|state| {
+  let counts = crate::test_store::audit_on_stored_shard("vcs_store-paths", |state| {
     let at = git_repository(state, "taken");
     let mut model = Model::new();
     version(state, at.1, 1, vec![create("/f", b"one")]);
@@ -516,7 +519,7 @@ fn t_a664_holders_a_successors_rebuilt_repository_holds_each_greens_map() {
 /// files (polled more than once), one unit a file; the head's map equal to its model, remade once.
 #[test]
 fn t_a664_sliced_a_recoverys_whole_build_steps_a_file_a_unit() {
-  let seen = crate::daemon::audit_on_shard(|state| {
+  let seen = crate::test_store::audit_on_stored_shard("vcs_store-paths", |state| {
     let at = git_repository(state, "sliced");
     let mut model = Model::new();
     let names = ["/a", "/b", "/c", "/d", "/e", "/f"];
@@ -586,7 +589,7 @@ fn main_bound((repository, root): (RepositoryId, VolumeId)) -> slates_db::catalo
 /// to its model; the second branch's first version built whole, its source's head having moved past it.
 #[test]
 fn t_a664_p3_a_branchs_first_version_derives_from_its_sources_map() {
-  let counts = crate::daemon::audit_on_shard(|state| {
+  let counts = crate::test_store::audit_on_stored_shard("vcs_store-paths", |state| {
     let (repository, root) = git_repository(state, "branched");
     version(state, root, 1, vec![create("/f", b"root")]);
     let topic = branch(state, "branched", "topic");
@@ -618,7 +621,7 @@ fn t_a664_p3_a_branchs_first_version_derives_from_its_sources_map() {
 /// holders and the bytes it uses; the root's map still its model.
 #[test]
 fn t_a664_p3_a_destroyed_branch_takes_its_map_with_it() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("vcs_store-paths", |state| {
     let (repository, root) = git_repository(state, "pruned");
     let head = version(state, root, 1, vec![create("/f", b"root")]);
     let topic = branch(state, "pruned", "topic");
@@ -644,7 +647,7 @@ fn t_a664_p3_a_destroyed_branch_takes_its_map_with_it() {
 /// holding `e/a` with `a`'s bytes beside `d/a`, and the copy composed by the green's owner (counted).
 #[test]
 fn t_a626_p4_a_work_copies_a_tree_and_its_version_holds_it() {
-  let seen = crate::daemon::audit_on_shard(|state| {
+  let seen = crate::test_store::audit_on_stored_shard("vcs_store-paths", |state| {
     let at = git_repository(state, "copied");
     version(state, at.1, 1, vec![create("/d/a", b"alpha")]);
     let copy = Op::Declare(WorkOp::Copy {
@@ -685,7 +688,7 @@ fn t_a626_p4_a_work_copies_a_tree_and_its_version_holds_it() {
 /// reads its bytes; `d/hard.txt` still names `d/g.txt`.
 #[test]
 fn t_a626_p4_a_work_copies_a_tree_holding_a_hard_link() {
-  let seen = crate::daemon::audit_on_shard(|state| {
+  let seen = crate::test_store::audit_on_stored_shard("vcs_store-paths", |state| {
     let at = git_repository(state, "linked");
     let link = Op::Declare(WorkOp::Link {
       path: "/d/hard.txt".to_owned(),
@@ -728,7 +731,7 @@ fn t_a626_p4_a_work_copies_a_tree_holding_a_hard_link() {
 /// a work copying `/nothing` to `/z`. Expect: the submit refused `CopyRefused` naming `z` and `SourceEmpty`.
 #[test]
 fn t_a626_p4_a_copy_of_nothing_is_refused_by_its_case() {
-  let reply = crate::daemon::audit_on_shard(|state| {
+  let reply = crate::test_store::audit_on_stored_shard("vcs_store-paths", |state| {
     let at = git_repository(state, "nothing");
     version(state, at.1, 1, vec![create("/a", b"a")]);
     let made = ask(

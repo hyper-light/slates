@@ -80,6 +80,7 @@ fn attachments(count: usize) -> HoldBounds {
   HoldBounds {
     attachments: count,
     sections: 0,
+    extents: 0,
   }
 }
 

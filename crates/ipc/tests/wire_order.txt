@@ -130,9 +130,10 @@ ImportFault 3 Unawaited
 ImportFault 4 Format
 ImportFault 5 Damaged
 ImportFault 6 PastRoom
-ImportFault 7 Pending
+ImportFault 7 RemovedPending
 ImportFault 8 Abandoned
 ImportFault 9 Subversion
+ImportFault 10 SubversionLanded
 Intent 0 Read
 Intent 1 Write
 IpcNodeKind 0 Fifo
@@ -165,6 +166,8 @@ LandingStage 9 Aborted
 LandingStage 10 Superseded
 LogLine 0 Work
 LogLine 1 AwaitingGrant
+MergeView 0 Work
+MergeView 1 Green
 MoveRefusal 0 NotPlain
 MoveRefusal 1 Attached
 MoveRefusal 2 Lineage
@@ -307,6 +310,7 @@ Refusal 78 ImportRefused
 Refusal 79 CopyRefused
 Refusal 80 CredentialUnreplicated
 Refusal 81 LandingSuperseded
+Refusal 82 StaleMergeView
 ReplyBody 0 Created
 ReplyBody 1 Snapshotted
 ReplyBody 2 SnapshotDestroyed
@@ -391,6 +395,7 @@ ReplyBody 80 DumpExported
 ReplyBody 81 WorkAdmitted
 ReplyBody 82 WorkFloorMoved
 ReplyBody 83 SessionLog
+ReplyBody 84 MergeChecked
 RequestBody 0 Create
 RequestBody 1 Snapshot
 RequestBody 2 DestroySnapshot
@@ -488,6 +493,10 @@ RequestBody 93 AdmitWork
 RequestBody 94 MoveWorkFloor
 RequestBody 95 SubmitComputed
 RequestBody 96 SessionLog
+RequestBody 97 RemovedCreateOverS3
+RequestBody 98 CheckMerge
+RequestBody 99 ReadMergeCheck
+RequestBody 100 ResolveMerge
 Residency 0 DaemonRam
 Residency 1 DaemonRamAndKernelCache
 Residency 2 DaemonRamKernelCacheAndRuntimeVm
@@ -579,6 +588,8 @@ VolumeRefusal 22 ReferencesHeld
 WatcherState 0 Live
 WatcherState 1 Overflowed
 WatcherState 2 Unavailable
+WorkChange 0 Edit
+WorkChange 1 Declare
 WorkMark 0 Open
 WorkMark 1 Accepted
 WorkMark 2 Collided

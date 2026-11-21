@@ -2592,7 +2592,7 @@ mod asynchronous_form {
       i32::try_from(bound.as_nanos().div_ceil(NANOS_PER_MILLI)).unwrap_or(i32::MAX)
     });
     let mut interest = [WSAPOLLFD {
-      fd: SOCKET::try_from(completion).unwrap(),
+      fd: SOCKET::try_from(completion).map_err(std::io::Error::other)?,
       events: POLLRDNORM,
       revents: 0,
     }];

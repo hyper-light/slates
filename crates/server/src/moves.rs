@@ -106,6 +106,8 @@ const MOVE_BEGUN: &str = "fleet.move.begun";
 const MOVE_HANDOFF_BEGUN: &str = "fleet.move.handoff_begun";
 /// Counter: move reports this node sent to the council.
 const MOVE_REPORTED: &str = "fleet.move.reported";
+/// Counter: moves prepared again on a new head, the volume written to while they were prepared unfrozen (A-784).
+const MOVE_PREPARED_AGAIN: &str = "fleet.move.prepared_again";
 /// Counter: unreported moves refused and thawed (the neighbourhood rule, or records not placed in time).
 const MOVE_REFUSED: &str = "fleet.move.refused";
 /// Counter: moves whose target left the region before the switch, the volume thawed.
@@ -167,8 +169,18 @@ pub(crate) struct MoveOut {
   /// The volume's head epoch the move hands over: the head that must be placed before the report, advanced to the next
   /// sequence when the move's handoff republishes the head ([`ready_to_hand_over`]).
   pub(crate) epoch: u64,
-  /// The shard clock when the move began, for the bound on an unreported move (`MoveRefusal::Unplaced`).
+  /// The shard clock when the move was first asked, which its hops are timed from ([`MoveHops`]).
   pub(crate) begun_ns: u64,
+  /// The shard clock when the volume was frozen for the move, zero while it is prepared unfrozen ([`frozen`],
+  /// [`freeze`]): the failover bound on an unreported move (`MoveRefusal::Unplaced`) runs from here.
+  pub(crate) frozen_ns: u64,
+  /// The shard clock at the move's latest ask: a move prepared unfrozen lasts while its mover asks after it, and is
+  /// dropped (refused `Unplaced`) once no ask came for a failover delay ([`outgoing`]).
+  pub(crate) asked_ns: u64,
+  /// The head epoch the move took for itself (at its ask, or prepared again on a new head): a snapshot later than it,
+  /// other than the head, was taken while the move was prepared, which the move would lose, so it is refused
+  /// `Snapshots` at its freeze ([`freeze`]); the earlier ones are what the ask already judged, its own head among them.
+  pub(crate) own_since: u64,
   /// Whether the move has been reported to the council.
   pub(crate) reported: bool,
   /// Whether this node has seen the switch: the configuration naming another owner of the volume. From then on the
@@ -177,11 +189,51 @@ pub(crate) struct MoveOut {
   pub(crate) switched: bool,
   /// The refusal that ended the move before any report, answered to the next ask and then dropped.
   pub(crate) refused: Option<MoveRefusal>,
+  /// When each step toward the report was first seen, from [`MoveOut::begun_ns`] ([`MoveHops`]).
+  pub(crate) hops: MoveHops,
+}
+
+/// When an outgoing move first passed each step toward its report, nanoseconds after it began (zero: not yet), as
+/// [`ready_to_hand_over`] sees them a record period at a time; said in the log with the bound and the widest
+/// forward-lane floor when the move is reported or refused ([`log_hops`]), so a move refused `Unplaced` names the step
+/// that held it (kiln's live move across two Macs, 2026-11-20: most first asks refused, every ask for 5 minutes once).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MoveHops {
+  /// A captured clone's capture carried on its head (A-544); at once for any other volume.
+  pub(crate) carried_ns: u64,
+  /// The head at the move's epoch and the catalog placed at `f + 1` ([`ready_to_report`]).
+  pub(crate) placed_ns: u64,
+  /// The head held by `f + 1` members other than this node ([`held_off_owner`]).
+  pub(crate) held_ns: u64,
+  /// The handoff that places the head off this node first begun ([`crate::fleet::start_move_handoff`]).
+  pub(crate) handoff_ns: u64,
+  /// The volume frozen for the move, ready to hand over ([`freeze`]).
+  pub(crate) frozen_ns: u64,
+}
+
+impl MoveHops {
+  /// `field` set to `elapsed` the first time (never zero, so a step seen at the move's first instant still reads as seen).
+  fn first(field: &mut u64, elapsed: u64) {
+    if *field == 0 {
+      *field = elapsed.max(1);
+    }
+  }
 }
 
 /// The moves a shard holds its volumes frozen for, by volume id, for every verb's gate ([`frozen`]). Bounded by the
 /// shard's volumes.
 pub(crate) type MovesOut = BTreeMap<DbVolumeId, MoveOut>;
+
+/// Whether `volume` has a move under way on this shard, prepared or frozen (A-784): the move's to place, so the healer
+/// passes it by (`crate::fleet`), as it passes a frozen copy by; only a frozen one turns writes away ([`frozen`]).
+pub(crate) fn moving(state: &ShardState, volume: VolumeId) -> bool {
+  state
+    .moves_out
+    .get(&DbVolumeId {
+      bytes: volume.bytes,
+    })
+    .is_some_and(|out| out.refused.is_none())
+}
 
 /// Whether `volume` is frozen for a move on this shard: every verb but its status and the move itself is answered
 /// `Overloaded` (retryable) while it is, and forwarded to its new owner from the switch on.
@@ -191,7 +243,7 @@ pub(crate) fn frozen(state: &ShardState, volume: VolumeId) -> bool {
     .get(&DbVolumeId {
       bytes: volume.bytes,
     })
-    .is_some_and(|out| out.refused.is_none())
+    .is_some_and(|out| out.refused.is_none() && out.frozen_ns != 0)
 }
 
 /// `Move` (§4.10, A-291): moves `volume`, which this shard holds, to the member `to`. Answered `Moved` once this node's
@@ -228,6 +280,10 @@ pub(crate) fn move_verb(
     if out.to != to {
       return refused(MoveRefusal::Pending);
     }
+    let now = state.clock.monotonic_ns();
+    if let Some(moving) = state.moves_out.get_mut(&id) {
+      moving.asked_ns = now;
+    }
     return ReplyBody::Moving { to: to.0 };
   }
   if let Some(reason) = unmovable(state, &record, to) {
@@ -244,9 +300,13 @@ pub(crate) fn move_verb(
       to,
       epoch,
       begun_ns,
+      frozen_ns: 0,
+      asked_ns: begun_ns,
+      own_since: epoch,
       reported: false,
       switched: false,
       refused: None,
+      hops: MoveHops::default(),
     },
   );
   state.count(MOVE_BEGUN, 1);
@@ -265,6 +325,17 @@ fn unmovable(
   state: &ShardState,
   record: &slates_db::catalog::VolumeRecord,
   to: HostId,
+) -> Option<MoveRefusal> {
+  unmovable_after(state, record, to, None)
+}
+
+/// [`unmovable`], judging only the snapshots later than epoch `after` where it is given: at a move's freeze (A-784),
+/// those taken while it was prepared, since what was there at its ask, its own head among them, was judged then.
+fn unmovable_after(
+  state: &ShardState,
+  record: &slates_db::catalog::VolumeRecord,
+  to: HostId,
+  after: Option<u64>,
 ) -> Option<MoveRefusal> {
   let local = state.fleet.host();
   if to == local || !state.fleet.members().contains(&to) {
@@ -295,11 +366,11 @@ fn unmovable(
   }
   // A carried capture's mark is the volume's own (A-503): its move carries again from it and lets it go with the copy.
   let mark = partition.carried(record.id).and_then(|(_, mark)| mark);
-  if partition
-    .snapshots_of(record.id)
-    .iter()
-    .any(|snapshot| snapshot.id != record.head && Some(snapshot.id) != mark)
-  {
+  if partition.snapshots_of(record.id).iter().any(|snapshot| {
+    snapshot.id != record.head
+      && Some(snapshot.id) != mark
+      && after.is_none_or(|epoch| snapshot.epoch > epoch)
+  }) {
     return Some(MoveRefusal::Snapshots);
   }
   None
@@ -320,15 +391,23 @@ pub(crate) struct Outgoing {
   pub(crate) ready: bool,
   /// Whether it has waited unreported past the failover delay the shard reads live (A-525, [`outgoing`]).
   pub(crate) overdue: bool,
+  /// Whether the volume is frozen for it ([`MoveOut::frozen_ns`]): a move ready to hand over is frozen before it is
+  /// reported ([`Step::Freeze`]).
+  pub(crate) frozen: bool,
   /// The cohort its records are placed at `f + 1` of: this owner's current cohort for it, in id order.
   pub(crate) cohort: Vec<HostId>,
 }
 
-/// The moves this shard has begun and not ended, for the control shard's period ([`drive_outgoing`]). An unreported one
-/// is overdue past the failover delay (A-525): a frozen volume takes no write, so it is held to the bound the fleet holds
-/// a dead owner's volumes to, the delay the fleet measures (`F = D + E + R`, A-363: its detector's periods, the council's
-/// confirmation window and the recoveries it timed), fanned to every shard (`ShardState::failover_ns`). Until A-525 it
-/// was the operator's ten-second placeholder, five times a quiet fleet's delay.
+/// The moves this shard has begun and not ended, for the control shard's period ([`drive_outgoing`]). A frozen,
+/// unreported one is overdue past the failover delay from its freeze (A-525): a frozen volume takes no write, so it is
+/// held to the bound the fleet holds a dead owner's volumes to, the delay the fleet measures (`F = D + E + R`, A-363: its
+/// detector's periods, the council's confirmation window and the recoveries it timed), fanned to every shard
+/// (`ShardState::failover_ns`). Until A-525 it was the operator's ten-second placeholder, five times a quiet fleet's delay.
+/// A move is prepared unfrozen until it is ready to hand over (A-784): its head carried and placed off this node takes
+/// seconds of sliced seal work, which the bound from the ask refused (kiln's live move, 2026-11-20: the first ask
+/// refused at 3,293 ms of a 3,200 ms bound, the fourth reported 120 ms after it began, the refused asks' work done
+/// meanwhile). Preparing, it takes writes, so nothing waits on it but its mover: it is overdue once its mover has not
+/// asked for a failover delay, or at once when its capture's carry was refused, which nothing re-asks.
 fn outgoing(state: &mut ShardState) -> Vec<Outgoing> {
   let quorum = state.fleet.configuration().quorum;
   let now = state.clock.monotonic_ns();
@@ -346,13 +425,21 @@ fn outgoing(state: &mut ShardState) -> Vec<Outgoing> {
       let ready = out.reported || ready_to_hand_over(state, id, quorum);
       let mut cohort = state.fleet.configuration().place_content(object).candidates;
       cohort.sort_unstable_by_key(|host| host.0);
+      let frozen = out.frozen_ns != 0;
+      let overdue = !out.reported
+        && if frozen {
+          now.saturating_sub(out.frozen_ns) > bound
+        } else {
+          now.saturating_sub(out.asked_ns) > bound || crate::carry::refused_for_head(state, id)
+        };
       Outgoing {
         object,
         to: out.to,
         reported: out.reported,
         switched: out.switched,
         ready,
-        overdue: !out.reported && now.saturating_sub(out.begun_ns) > bound,
+        overdue,
+        frozen,
         cohort,
       }
     })
@@ -374,6 +461,9 @@ fn ready_to_hand_over(state: &mut ShardState, id: DbVolumeId, quorum: Quorum) ->
   if !crate::carry::carries_its_head(state, id) {
     return false;
   }
+  note_hop(state, id, |hops, elapsed| {
+    MoveHops::first(&mut hops.carried_ns, elapsed)
+  });
   // The head is the volume's: a frozen volume takes no write and no snapshot, and the healer passes it by, so only its
   // handoff advances it.
   let Some(epoch) = state.db.partition().volume(id).map(|record| record.epoch) else {
@@ -385,13 +475,58 @@ fn ready_to_hand_over(state: &mut ShardState, id: DbVolumeId, quorum: Quorum) ->
   if !ready_to_report(state, id, epoch, quorum) {
     return false;
   }
+  note_hop(state, id, |hops, elapsed| {
+    MoveHops::first(&mut hops.placed_ns, elapsed)
+  });
   if held_off_owner(state, id, quorum) {
+    note_hop(state, id, |hops, elapsed| {
+      MoveHops::first(&mut hops.held_ns, elapsed)
+    });
     return true;
   }
   if crate::fleet::start_move_handoff(state, id) {
     state.count(MOVE_HANDOFF_BEGUN, 1);
+    note_hop(state, id, |hops, elapsed| {
+      MoveHops::first(&mut hops.handoff_ns, elapsed)
+    });
   }
   false
+}
+
+/// One of `id`'s move hops noted, `elapsed` since the move began by this shard's clock.
+fn note_hop(state: &mut ShardState, id: DbVolumeId, note: impl FnOnce(&mut MoveHops, u64)) {
+  let now = state.clock.monotonic_ns();
+  if let Some(out) = state.moves_out.get_mut(&id) {
+    note(&mut out.hops, now.saturating_sub(out.begun_ns));
+  }
+}
+
+/// The log line of `object`'s move ending its unreported part, `ended` as it did: its hops in milliseconds after it began
+/// (`-` for one never reached), its whole time, the bound it was held to and the widest forward-lane floor.
+fn log_hops(state: &mut ShardState, object: ObjectId, out: &MoveOut, ended: &str) {
+  let now = state.clock.monotonic_ns();
+  let ms = |ns: u64| {
+    if ns == 0 {
+      "-".to_owned()
+    } else {
+      (ns / crate::live_ship::NS_PER_MS).to_string()
+    }
+  };
+  let hops = out.hops;
+  slates_machine::log_line!(
+    "slates daemon: move of {} to member {} {ended} after {} ms: carried {} ms, records placed {} ms, held off this \
+     node {} ms, handoff begun {} ms, frozen {} ms; bound {} ms, widest forward-lane floor {} ms",
+    crate::verbs::hex_of(&object.0),
+    out.to.0,
+    now.saturating_sub(out.begun_ns) / crate::live_ship::NS_PER_MS,
+    ms(hops.carried_ns),
+    ms(hops.placed_ns),
+    ms(hops.held_ns),
+    ms(hops.handoff_ns),
+    ms(hops.frozen_ns),
+    state.failover_ns / crate::live_ship::NS_PER_MS,
+    state.forward_lanes.widest_floor_ns() / crate::live_ship::NS_PER_MS
+  );
 }
 
 /// Whether volume `id`'s head snapshot is recorded placed on `f + 1` members other than this node ([`off_owner`]).
@@ -457,6 +592,8 @@ pub(crate) enum Step {
   Wait,
   /// Report it (again): the council has not switched it.
   Report,
+  /// Freeze it: it is ready to hand over and was prepared unfrozen ([`freeze`]); it is reported once frozen.
+  Freeze,
   /// Refuse it, unreported, for this reason: the volume thaws.
   Refuse(MoveRefusal),
   /// Thaw it: its target left the region before any switch could apply it.
@@ -514,7 +651,9 @@ pub(crate) fn step_for(regional: &RegionalConfiguration, local: HostId, out: &Ou
         .iter()
         .all(|host| neighbourhood.hosts.contains(host))
     });
-  if covered {
+  if covered && !out.frozen {
+    Step::Freeze
+  } else if covered {
     Step::Report
   } else {
     Step::Refuse(MoveRefusal::Neighbourhood)
@@ -564,6 +703,7 @@ pub(crate) async fn drive_outgoing(
         refuse_unreported(s, object, reason);
       }),
       Step::Thaw => crate::xshard::run_on_counted(origin, shard, move |s| thaw(s, object)),
+      Step::Freeze => crate::xshard::run_on_counted(origin, shard, move |s| freeze(s, object)),
       Step::Report => {
         let Some(records) = capture(owner_acceptor, object) else {
           let _ = state::with_state_counted(|s| s.count(MOVE_UNCAPTURED, 1));
@@ -630,6 +770,8 @@ pub(crate) async fn drive_outgoing(
 fn note_reported(state: &mut ShardState, object: ObjectId) {
   if let Some(out) = state.moves_out.get_mut(&DbVolumeId { bytes: object.0 }) {
     out.reported = true;
+    let out = *out;
+    log_hops(state, object, &out, "reported");
   }
 }
 
@@ -648,7 +790,54 @@ fn refuse_unreported(state: &mut ShardState, object: ObjectId, reason: MoveRefus
     && out.refused.is_none()
   {
     out.refused = Some(reason);
+    let out = *out;
     state.count(MOVE_REFUSED, 1);
+    log_hops(state, object, &out, &format!("refused {reason:?}"));
+  }
+}
+
+/// Freezes the volume of `object`'s move, ready to hand over, on its owner shard (A-784): from here it takes no write and
+/// the failover bound runs. Still movable (no attachment or lease taken while it was prepared) and its content still its
+/// head (nothing written since): frozen, and reported once the next period finds it ready again. A change written while it
+/// was prepared gives it a new head, which it is prepared on again, unfrozen; an attachment or lease taken meanwhile
+/// refuses it by kind, as at its ask.
+fn freeze(state: &mut ShardState, object: ObjectId) {
+  let id = DbVolumeId { bytes: object.0 };
+  let Some(out) = state.moves_out.get(&id).copied() else {
+    return;
+  };
+  if out.frozen_ns != 0 || out.reported || out.refused.is_some() {
+    return;
+  }
+  let volume = VolumeId { bytes: object.0 };
+  let Ok((_, record)) = crate::verbs::find(state, volume) else {
+    return;
+  };
+  if let Some(reason) = unmovable_after(state, &record, out.to, Some(out.own_since)) {
+    refuse_unreported(state, object, reason);
+    return;
+  }
+  let Ok(epoch) = crate::verbs::head_for_move(state, volume) else {
+    return;
+  };
+  let now = state.clock.monotonic_ns();
+  let mut again = false;
+  if let Some(moving) = state.moves_out.get_mut(&id) {
+    if epoch == moving.epoch {
+      moving.frozen_ns = now;
+      MoveHops::first(
+        &mut moving.hops.frozen_ns,
+        now.saturating_sub(moving.begun_ns),
+      );
+    } else {
+      // Written to while it was prepared: its new head is prepared again, and is the move's own.
+      moving.epoch = epoch;
+      moving.own_since = epoch;
+      again = true;
+    }
+  }
+  if again {
+    state.count(MOVE_PREPARED_AGAIN, 1);
   }
 }
 
@@ -1751,15 +1940,16 @@ mod tests {
       switched: false,
       ready: false,
       overdue: false,
+      frozen: false,
       cohort: vec![HostId(1), HostId(2), HostId(3)],
     }
   }
 
   /// A-291, the old owner's decision, by the configuration alone. Do: decide host 1's move of its object to host 2 as
-  /// it is unplaced, placed, overdue, and then reported; commit the move and decide again; report it adopted and decide
+  /// it is unplaced, placed (unfrozen, then frozen), overdue, and then reported; commit the move and decide again; report it adopted and decide
   /// again; drop the exception as its new owner's destroy does and decide again; then decide a second move whose target
   /// retired before any switch, and a move whose cohort the target's neighbourhood does not cover. Expect: wait while
-  /// unplaced; report once placed and again until the switch; refused `Unplaced` when overdue unreported; switched to
+  /// unplaced; frozen once placed (A-784), then reported, and again until the switch; refused `Unplaced` when overdue unreported; switched to
   /// host 2 (keeping the copy) once committed; released once adopted; released to itself (the copy let go, never
   /// thawed) once the switched move's exception is gone; thawed when the target left with no switch; refused
   /// `Neighbourhood` for an uncovered cohort.
@@ -1781,8 +1971,9 @@ mod tests {
     expect_a_thaw_only_without_a_switch_and_a_covered_cohort(from, to);
   }
 
-  /// The first part of the decision test. Do: decide `out` as it is unplaced, overdue, placed, then reported and
-  /// overdue. Expect wait, refused `Unplaced`, report, and report again (a reported move can still commit).
+  /// The first part of the decision test. Do: decide `out` as it is unplaced, overdue, placed unfrozen, placed frozen,
+  /// then reported and overdue. Expect wait, refused `Unplaced`, freeze (A-784: prepared unfrozen, frozen only once ready),
+  /// report, and report again (a reported move can still commit).
   fn expect_a_report_only_once_placed_and_never_refused_once_reported(
     regional: &RegionalConfiguration,
     from: HostId,
@@ -1796,6 +1987,12 @@ mod tests {
     );
     out.overdue = false;
     out.ready = true;
+    assert_eq!(
+      step_for(regional, from, out),
+      Step::Freeze,
+      "a move ready to hand over is frozen before it is reported"
+    );
+    out.frozen = true;
     assert_eq!(step_for(regional, from, out), Step::Report);
     out.reported = true;
     out.overdue = true;
@@ -1852,6 +2049,68 @@ mod tests {
     );
   }
 
+  /// A-784: a move prepared unfrozen is bounded by its mover, not by the failover delay. Do: on an audit shard whose
+  /// live failover delay is two liveness windows, keep three unreported moves begun three windows ago: one prepared
+  /// (not frozen) and asked a window ago, one prepared and last asked three windows ago, one frozen three windows ago;
+  /// take the shard's outgoing moves, and ask whether each one's volume is frozen. Expect the prepared move its mover still
+  /// asks after not overdue and its volume not frozen (it takes writes while its head is carried and placed off this
+  /// node); the prepared move no one asked after for longer than the delay overdue; the frozen move overdue, its bound
+  /// running from its freeze. Before A-784 every move froze at its ask, so the first was refused `Unplaced` while its
+  /// head was still being placed (kiln's live move: first asks refused at 3.2 s, the head reported 120 ms after a later ask).
+  #[test]
+  fn a_move_prepared_unfrozen_lasts_while_its_mover_asks_and_a_frozen_one_is_bound_from_its_freeze()
+  {
+    let (asked, left, frozen, writable) = crate::daemon::audit_on_shard(|s| {
+      let window = crate::daemon::LIVENESS_BUDGET_NS;
+      s.failover_ns = 2 * window;
+      let now = s.clock.monotonic_ns();
+      let at = |ago: u64| now.checked_sub(ago).unwrap();
+      let moving = |frozen_ns: u64, asked_ns: u64| MoveOut {
+        to: HostId(2),
+        epoch: 0,
+        begun_ns: at(3 * window),
+        frozen_ns,
+        asked_ns,
+        own_since: 0,
+        reported: false,
+        switched: false,
+        refused: None,
+        hops: MoveHops::default(),
+      };
+      let ids = [0x71_u8, 0x72, 0x73].map(|byte| DbVolumeId { bytes: [byte; 16] });
+      s.moves_out.insert(ids[0], moving(0, at(window)));
+      s.moves_out.insert(ids[1], moving(0, at(3 * window)));
+      s.moves_out
+        .insert(ids[2], moving(at(3 * window), at(window)));
+      let writable = !frozen(
+        s,
+        VolumeId {
+          bytes: ids[0].bytes,
+        },
+      );
+      let moves = outgoing(s);
+      let overdue = |id: DbVolumeId| {
+        moves
+          .iter()
+          .find(|out| out.object == ObjectId(id.bytes))
+          .map(|out| out.overdue)
+      };
+      (overdue(ids[0]), overdue(ids[1]), overdue(ids[2]), writable)
+    });
+    assert_eq!(
+      asked,
+      Some(false),
+      "a prepared move its mover asks after waits on its preparation"
+    );
+    assert!(writable, "a prepared move's volume takes writes");
+    assert_eq!(
+      left,
+      Some(true),
+      "a prepared move no one asked after for the delay is dropped"
+    );
+    assert_eq!(frozen, Some(true), "a frozen move is bound from its freeze");
+  }
+
   /// A-525 (A-291's bound on an unreported move; R3, A-414's owed list: the failover placeholder's readers). Do: on an
   /// audit shard whose live failover delay is two liveness windows, begin two unreported moves, one three windows ago
   /// and one a window ago, and take the shard's outgoing moves. Expect the first overdue and the second not: a frozen
@@ -1868,9 +2127,13 @@ mod tests {
         to: HostId(2),
         epoch: 0,
         begun_ns: now.checked_sub(ago).unwrap(),
+        frozen_ns: now.checked_sub(ago).unwrap(),
+        asked_ns: now.checked_sub(ago).unwrap(),
+        own_since: 0,
         reported: false,
         switched: false,
         refused: None,
+        hops: MoveHops::default(),
       };
       let (old, young) = (
         DbVolumeId { bytes: [0x61; 16] },

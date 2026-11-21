@@ -30,8 +30,8 @@
 //! the shard's budget unable to take the import's room (`BudgetExceeded`, with what it could admit); the repository's
 //! format (`Format`: a requirement the import does not know or take, a censored, ellipsis, externally stored or
 //! unknown-flagged revision); a file missing, not of its format or at odds with the rest (`Damaged`, with its path
-//! under `.hg` where the refusal names one); more than an import may hold at once (`PastRoom`, with its room); a fetch
-//! still pending on an S3 base (`Pending`: ask again once it lands); the host's own refusal (`BaseUnavailable` with the
+//! under `.hg` where the refusal names one); more than an import may hold at once (`PastRoom`, with its room); the
+//! host's own refusal (`BaseUnavailable` with the
 //! directory's path); an import given back before its end (`Abandoned`); and its landing's own refusal (the register's
 //! guard, the budget, a bookmark's name the namespace refuses, or `PastRoom` for a bookmark's work past the room). A
 //! Subversion dump refused as `svnadmin load` refuses it is `Subversion`, with Subversion's error number, the revision
@@ -377,10 +377,9 @@ fn of_import(path: &str, room: u64, refusal: ImportRefused<BaseRefused>) -> Refu
   }
 }
 
-/// The wire's refusal for the host's refusal of a read: a fetch still pending, a name not UTF-8, or the host's own.
+/// The wire's refusal for the host's refusal of a read: a name not UTF-8, or the host's own.
 fn of_host(path: &str, refusal: BaseRefused) -> Refusal {
   match refusal {
-    BaseRefused::Host(HostError::Pending(_)) => import_refused(ImportFault::Pending),
     BaseRefused::Host(error) => crate::verbs::base_open_refusal(path, error),
     BaseRefused::NotUtf8 { name } => damaged(&name),
   }
@@ -433,24 +432,36 @@ pub(crate) fn svn_refusal_of(path: &str, room: u64, failed: LoadFailed) -> Refus
     // The repository is Subversion's (the verb asked first), so its records were not made or not recovered here.
     LoadFailed::NoStore => Refusal::ContentUnavailable,
     LoadFailed::Busy => import_refused(ImportFault::UnderWay),
-    LoadFailed::Host(HostError::Pending(_)) => import_refused(ImportFault::Pending),
     LoadFailed::Host(error) => crate::verbs::base_open_refusal(path, error),
     LoadFailed::Budget { available } => Refusal::BudgetExceeded { available },
-    LoadFailed::Refused { refusal, revision } => of_dump(room, refusal, revision),
-    LoadFailed::Uncommitted { refusal, revision } => of_step(room, refusal, revision),
+    LoadFailed::Refused {
+      refusal,
+      revision,
+      landed,
+    } => of_dump(room, refusal, (revision, landed)),
+    LoadFailed::Uncommitted {
+      refusal,
+      revision,
+      landed,
+    } => of_step(room, refusal, (revision, landed)),
   }
 }
 
 /// The wire's refusal for the import's own refusal of the stream: past its reader's admission `PastRoom`, else
 /// Subversion's own, with its number, the revision being loaded and the path it names.
-fn of_dump(room: u64, refusal: MigrationRefusal, revision: Option<u64>) -> Refusal {
+fn of_dump(
+  room: u64,
+  refusal: MigrationRefusal,
+  (revision, landed): (Option<u64>, u64),
+) -> Refusal {
   if let MigrationRefusal::Stream(slates_svn::dump::DumpError::PastAdmission { .. }) = refusal {
     return import_refused(ImportFault::PastRoom { room });
   }
-  import_refused(ImportFault::Subversion {
+  import_refused(ImportFault::SubversionLanded {
     code: refusal.subversion_code(),
     revision,
     path: path_named(&refusal),
+    landed,
   })
 }
 
@@ -473,13 +484,15 @@ fn path_named(refusal: &MigrationRefusal) -> String {
 /// as the import's (Subversion's number), a revision whose green version this build cannot declare yet `Format`, the
 /// append's refusal as it is, and records not held here, a green that does not follow them or texts not made durable
 /// `ContentUnavailable`.
-fn of_step(room: u64, refusal: Uncommitted, revision: u64) -> Refusal {
+fn of_step(room: u64, refusal: Uncommitted, (revision, landed): (u64, u64)) -> Refusal {
   match refusal {
-    Uncommitted::Step(step) => of_dump(room, MigrationRefusal::from(step), Some(revision)),
+    Uncommitted::Step(step) => {
+      of_dump(room, MigrationRefusal::from(step), (Some(revision), landed))
+    }
     Uncommitted::Unsupported { .. } => import_refused(ImportFault::Format),
     Uncommitted::Budget { available } => Refusal::BudgetExceeded { available },
     Uncommitted::Append(refused) => of_append(refused),
-    Uncommitted::NotHeld | Uncommitted::Diverged | Uncommitted::NotDurable(_) => {
+    Uncommitted::NotHeld | Uncommitted::Diverged | Uncommitted::Unstored => {
       Refusal::ContentUnavailable
     }
   }

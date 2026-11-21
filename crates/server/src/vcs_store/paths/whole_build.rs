@@ -39,10 +39,10 @@
 //!
 //! **Bounds.** One build a green, so the builds are bounded by the partition's greens; each holds the head's paths and
 //! the entries put so far, a version's files at most. The parked submits of a green are bounded by the shard's client
-//! credit (`clients_per_shard × slots`, the bound `crate::base_wait` keeps), every request that can be in flight; a
+//! credit (`clients_per_shard × slots`, the bound `crate::lease_wait` keeps), every request that can be in flight; a
 //! submit past it is refused `Overloaded`, counted ([`PARK_REFUSED`]), and a retry of a parked request joins its entry.
-//! A parked submit waits at most the node's failover delay (`ShardState::failover_ns`, the most a reply is held, the
-//! bound `crate::base_wait` keeps): at each slice one that has waited longer is answered `Overloaded`, unrecorded, so its
+//! A parked submit waits at most the node's failover delay (`ShardState::failover_ns`, the most a reply is held):
+//! at each slice one that has waited longer is answered `Overloaded`, unrecorded, so its
 //! retry runs, counted ([`OVERDUE`]).
 //!
 //! **Cancellation.** The build lives in the store's map, keyed by its green, and its task holds the key alone: a task
@@ -590,6 +590,8 @@ pub(crate) fn settle(state: &mut ShardState) {
   for green in greens {
     while slice(state, green, 0) {}
   }
+  // A build's end makes the commit owed (`commits::make_owed`), a job of the shard's queue: made here too.
+  crate::vcs_store::commits::made_after_now(state);
 }
 
 /// One slice of each build of the shard, given no budget (one file): what a test interleaving pushes with a build runs

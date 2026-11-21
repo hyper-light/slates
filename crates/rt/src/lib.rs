@@ -39,6 +39,7 @@
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 mod attribution;
+pub mod busy_harvest;
 pub mod control;
 pub mod driver;
 pub mod error;
@@ -57,6 +58,7 @@ pub mod pipe_state;
 pub mod queue;
 pub mod readiness;
 pub mod registry;
+pub mod retirement;
 pub mod room;
 pub mod runtime;
 pub mod shard;

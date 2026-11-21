@@ -141,6 +141,15 @@ pub struct MergeShardState {
   /// The head version each green's landing view holds (A-774, `crate::mounted_work::ensure_green_view`): one entry a
   /// green landed, dropped with the green.
   pub(crate) green_views: crate::mounted_work::GreenViews,
+  /// The greens whose checkpoint is being taken in turns ([`checkpoint_green`], A-579): one task each, which folds the
+  /// identity's backlog a paced step at a time and takes the checkpoint at its end.
+  pub(crate) checkpointing: BTreeSet<DbVolumeId>,
+  /// What an identity key's fold costs on this shard, learned across checkpoints (`slates_pace::Costs`, A-579).
+  pub(crate) identity_costs: slates_pace::Costs<1>,
+  /// When each green's last checkpoint was taken here, or when it first asked for one (A-579): the start of the
+  /// interval its next checkpoint's identity fold is paced to finish within. One entry a green this shard holds,
+  /// pruned of greens gone whenever one is added.
+  pub(crate) checkpoint_since: BTreeMap<DbVolumeId, u64>,
 }
 
 /// A green attachment's pin: the green and the version its view is fixed at.
@@ -221,8 +230,147 @@ pub(crate) fn checkpoint_floor(state: &ShardState, green: DbVolumeId) -> u64 {
 /// Never refuses the verb that called it: a checkpoint the engine cannot take at the floor (its histories already
 /// folded past it) or the partition refuses is counted and skipped, and the chain stays whole and correct.
 pub(crate) fn checkpoint_green(state: &mut ShardState, green: DbVolumeId) {
-  checkpoint_green_when(state, green, Doubling::Wait);
+  if state.merge.checkpointing.contains(&green) {
+    return;
+  }
+  if !state.merge.checkpoint_since.contains_key(&green) {
+    let now = slates_rt::futures::now_ns();
+    let greens = &state.greens;
+    state
+      .merge
+      .checkpoint_since
+      .retain(|held, _| greens.get(held).is_some());
+    state.merge.checkpoint_since.insert(green, now);
+  }
+  if fold_inputs(state, green).is_none_or(FoldInputs::waits) {
+    return;
+  }
+  // The identity's backlog first, in a paced step (A-579): a checkpoint reads the head's identity, and a green whose
+  // identity was last read thousands of versions ago hashed every file changed since in this one step (73.7 ms of a
+  // 100 ms checkpoint at 1,000 clients on the Mac Studio, 2026-11-20; every request the owner serves waited behind it).
+  // When the step's quantum ends with someone waiting, the rest is folded in turns by a task of its own.
+  let quantum = state.config.step_quantum_ns();
+  if identity_folded_in_a_step(state, green, quantum) {
+    taken_now(state, green);
+    return;
+  }
+  match slates_rt::futures::spawn(checkpoint_in_turns(green)) {
+    Ok(task) => {
+      state.merge.checkpointing.insert(green);
+      state.count(CHECKPOINT_IN_TURNS, 1);
+      let _ = slates_rt::futures::detach(task);
+    }
+    // No room for the task: taken here as before, whole.
+    Err(_) => taken_now(state, green),
+  }
 }
+
+/// Takes `green`'s checkpoint now, by the doubling rule, and starts the interval its next one is paced within.
+fn taken_now(state: &mut ShardState, green: DbVolumeId) {
+  checkpoint_green_when(state, green, Doubling::Wait);
+  let now = slates_rt::futures::now_ns();
+  state.merge.checkpoint_since.insert(green, now);
+}
+
+/// One turn's share of a checkpoint's identity fold (A-579), nanoseconds: what is left of it at its measured cost a key
+/// (`left_ns`), spread over the turns left before its deadline, a turn every `gap_ns` (the time since the last turn, the
+/// shard's measured cycle through its ready tasks). The deadline is the doubling interval (`interval_ns`, the time the
+/// increments it folds took to come, from `began_ns`): the next checkpoint is due after as much again, so this one
+/// ends within it. Never under the quantum; past the deadline, what is left at once (a step stops at its ceiling).
+fn turn_budget_ns(
+  left_ns: u64,
+  (gap_ns, quantum_ns): (u64, u64),
+  (began_ns, interval_ns, now_ns): (u64, u64, u64),
+) -> u64 {
+  let deadline = began_ns.saturating_add(interval_ns);
+  let remaining = deadline.saturating_sub(now_ns);
+  if remaining <= gap_ns {
+    return left_ns.max(quantum_ns);
+  }
+  let share = u128::from(left_ns)
+    .saturating_mul(u128::from(gap_ns))
+    .checked_div(u128::from(remaining))
+    .unwrap_or(u128::from(left_ns));
+  u64::try_from(share).unwrap_or(u64::MAX).max(quantum_ns)
+}
+
+/// Folds `green`'s identity backlog a key a unit in one paced step (`slates_pace::Step`, A-579): whether it is all
+/// folded. A green gone is folded (its checkpoint then finds nothing to take).
+fn identity_folded_in_a_step(state: &mut ShardState, green: DbVolumeId, budget_ns: u64) -> bool {
+  let mut env = crate::git_push::shard_pace_env(state);
+  // The step asks whether anyone waits at the end of its budget, not of the bare quantum ([`turn_budget_ns`]).
+  env.quantum_ns = budget_ns.max(env.quantum_ns);
+  let mut costs = state.merge.identity_costs;
+  let folded = state.greens.get_mut(&green).is_none_or(|mut engine| {
+    let mut step = slates_pace::Step::begin(env, (env.clock)());
+    let mut done = engine.identity_backlog() == 0;
+    while !done && step.more(IDENTITY_KEY, &mut costs) {
+      done = engine.fold_identity_step(1);
+    }
+    step.close((env.clock)(), &mut costs);
+    done
+  });
+  state.merge.identity_costs = costs;
+  state.count(CHECKPOINT_IDENTITY_STEPS, 1);
+  folded
+}
+
+/// The pace kind of one identity key's fold ([`identity_folded_in_a_step`]).
+const IDENTITY_KEY: usize = 0;
+
+/// Takes `green`'s checkpoint in turns (A-579): its identity's backlog folded a paced step a turn, yielding between,
+/// then the checkpoint itself, its doubling rule judged again then. Ends when the green or the shard state is gone.
+async fn checkpoint_in_turns(green: DbVolumeId) {
+  let began = slates_rt::futures::now_ns();
+  let mut last_turn = began;
+  loop {
+    let folded = crate::state::with_state(|state| {
+      let now = slates_rt::futures::now_ns();
+      let quantum = state.config.step_quantum_ns();
+      let interval = state
+        .merge
+        .checkpoint_since
+        .get(&green)
+        .map_or(0, |since| began.saturating_sub(*since));
+      let per_key = state.merge.identity_costs.units[IDENTITY_KEY].estimate_ns();
+      let backlog = state
+        .greens
+        .get(&green)
+        .map_or(0, |engine| engine.identity_backlog());
+      let left = per_key.saturating_mul(u64::try_from(backlog).unwrap_or(u64::MAX));
+      let budget = turn_budget_ns(
+        left,
+        (now.saturating_sub(last_turn), quantum),
+        (began, interval, now),
+      );
+      last_turn = now;
+      if identity_folded_in_a_step(state, green, budget) {
+        state.merge.checkpointing.remove(&green);
+        taken_now(state, green);
+        let span = slates_rt::futures::now_ns().saturating_sub(began);
+        let longest = state
+          .refusals
+          .entry(CHECKPOINT_IN_TURNS_LONGEST_NS)
+          .or_insert(0);
+        *longest = (*longest).max(span);
+        return true;
+      }
+      false
+    });
+    if folded.unwrap_or(true) {
+      return;
+    }
+    slates_rt::futures::yield_now().await;
+  }
+}
+
+/// Counter: checkpoints whose identity backlog outlasted one paced step and were finished by a task in turns (A-579),
+/// the non-vacuity count of [`checkpoint_in_turns`].
+pub(crate) const CHECKPOINT_IN_TURNS: &str = "merge.checkpoint.in_turns";
+/// Counter: the longest a checkpoint in turns took from its first step to its record, nanoseconds (A-579).
+pub(crate) const CHECKPOINT_IN_TURNS_LONGEST_NS: &str = "merge.checkpoint.in_turns_longest_ns";
+/// Counter: the paced steps that folded a checkpoint's identity backlog (A-579).
+pub(crate) const CHECKPOINT_IDENTITY_STEPS: &str = "merge.checkpoint.identity_steps";
 
 /// Whether [`checkpoint_green_when`] waits for the increments to fold to reach the held checkpoint's size.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -253,9 +401,11 @@ pub(crate) fn record_goes_to_holders(state: &ShardState, green: DbVolumeId) -> b
 pub(crate) struct FoldInputs {
   /// The version a checkpoint would be taken at: the green's checkpoint floor ([`checkpoint_floor`]).
   pub(crate) floor: u64,
-  /// The bytes the checkpoint would fold: the chain's increments from the one after the version held (the
-  /// partition's `green_floor`) up to `floor`.
+  /// The bytes the checkpoint would fold: the chain's entries from the one after the version held (the partition's
+  /// `green_floor`) up to `floor`, each with the increment it names in the content store (chain entry format 6).
   pub(crate) to_fold: usize,
+  /// The version the chain begins after: the partition's `green_floor`.
+  pub(crate) held: u64,
   /// The size of the checkpoint the green holds; 0 while it holds none, so its first one is taken at once.
   pub(crate) held_bytes: usize,
 }
@@ -284,8 +434,15 @@ pub(crate) fn fold_inputs(state: &ShardState, green: DbVolumeId) -> Option<FoldI
       .green_chain(green)
       .iter()
       .take(folds)
-      .map(Vec::len)
+      .map(|entry| {
+        let named = slates_merge::chain_entry::inputs(entry)
+          .ok()
+          .and_then(|inputs| usize::try_from(inputs.len).ok())
+          .unwrap_or(0);
+        entry.len().saturating_add(named)
+      })
       .sum(),
+    held,
     held_bytes: partition
       .green_checkpoint(green)
       .map_or(0, |(_, bytes)| bytes.len()),
@@ -330,7 +487,12 @@ pub(crate) fn checkpoint_green_when(state: &mut ShardState, green: DbVolumeId, d
         .map(|_| ())
     });
   match recorded {
-    Ok(()) => state.count(CHECKPOINT_TAKEN, 1),
+    Ok(()) => {
+      state.count(CHECKPOINT_TAKEN, 1);
+      // The folded versions' increments go with their entries (A-714's retention), but for one a later entry names.
+      let head = state.db.partition().green_head(green);
+      release_unnamed_increments(state, green, inputs.held, Some(head));
+    }
     Err(_) => state.count(CHECKPOINT_REFUSED, 1),
   }
 }
@@ -356,6 +518,7 @@ pub(crate) fn with_work_base<R>(
     green: lent.as_deref(),
     fetched: state.work_home.fetched.as_ref(),
     version: work.base_version,
+    entries: Some(&work.entries),
   })
 }
 
@@ -1406,6 +1569,15 @@ pub(crate) fn destroy_merge_volume(
     state.merge.placed_holders.remove(&object);
     // Its version 0's inputs, made or being made (a job being made sees its entry gone and ends, A-286).
     state.merge.origin_inputs.remove(&object);
+    // Its versions' increments (chain entry format 6), with the chain that named them.
+    let released = state.held_content.forget_object(
+      &mut crate::content_holder::hold_space(&mut state.store),
+      object,
+    );
+    state.count(
+      CHAIN_INPUTS_RELEASED,
+      u64::try_from(released).unwrap_or(u64::MAX),
+    );
   }
   Some(ReplyBody::Destroyed)
 }
@@ -1451,7 +1623,7 @@ pub(crate) fn status_merge_volume(
     state,
     &rights_of(&record, principal),
   )));
-  Some(ReplyBody::Status {
+  let mut reply = ReplyBody::Status {
     report: Box::new(slates_ipc::protocol::StatusReport {
       transports,
       id: volume,
@@ -1468,8 +1640,7 @@ pub(crate) fn status_merge_volume(
       nfs_port: u16::try_from(crate::daemon::NFS_PORT.load(std::sync::atomic::Ordering::Acquire))
         .ok()
         .filter(|port| *port != 0),
-      // A green has no host mount of its own to bind (§4.16: a green is served through pinned
-      // attachments, the record form).
+      // Filled below, in the room the report leaves, as a plain volume's are.
       mounts: Vec::new(),
       mounts_elided: 0,
       drifted_elided: 0,
@@ -1484,7 +1655,15 @@ pub(crate) fn status_merge_volume(
       // reported rather than a zero it was not measured to be.
       loss: slates_ipc::protocol::LossReport::default(),
     }),
-  })
+  };
+  // A mounted work's host mounts, as any volume's (A-774 C1): Windows' unmount finds its drive among the volumes'
+  // reported mounts, so a work that reported none could not be unmounted (jupiter r3, 2026-11-21).
+  let room = crate::verbs::reply_room(&reply);
+  if let ReplyBody::Status { report } = &mut reply {
+    (report.mounts, report.mounts_elided) =
+      crate::verbs::mounts_of(state, id, room.min(crate::verbs::MOUNTS_REPORT_BYTES));
+  }
+  Some(reply)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1524,7 +1703,7 @@ pub(crate) fn status_merge_volume(
 use std::collections::BTreeSet;
 
 use slates_archive::Archive;
-use slates_cluster::content::{chunk_requests, offer_request};
+use slates_cluster::content::{chunk_requests, offer_request, raw_chunk_request};
 use slates_cluster::{ClusterError, CommitBudget, commit_record_sent_as};
 use slates_db::register::{
   Acceptor, Configuration, HostEpoch, HostId, ObjectId, Placement, Quorum, Record,
@@ -2059,6 +2238,14 @@ pub struct PendingMergeRecord {
   /// The shipments that carried its inputs so far ([`SUBMIT_SHIPMENTS`]): inputs larger than one shipment's bound
   /// cross in several, one a record-plane pass.
   pub shipments: u64,
+  /// A later version's inputs archive without its chunks (`merge_origin::inputs_manifest_archive`), made once at its
+  /// first shipment that carries inputs ([`INPUTS_MANIFEST_MADE`]): what every shipment offers and names its chunks by,
+  /// each chunk cut as a view of the bytes the green's chain holds. Before 2026-11-20 every pass copied the version's
+  /// increment out of the chain and rebuilt and hashed its whole archive, so inputs of N shipments cost N times their
+  /// bytes in one owner step each (a 64 MiB version: 64 passes of 128 MB copied and 64 MB hashed). Its extents are a
+  /// chunk's in 1 MiB of inputs; `None` for version 0, whose origin archive is kept whole while it ships, and until a
+  /// shipment needs it.
+  pub inputs_manifest: Option<Archive>,
 }
 
 /// Counter pairs (how many were timed, and their nanoseconds or their count) of a submit's phases (A-697's measured
@@ -2071,6 +2258,9 @@ pub struct PendingMergeRecord {
 pub(crate) const SUBMIT_JUDGE: (&str, &str) = ("merge.submit.judge", "merge.submit.judge_ns");
 /// See [`SUBMIT_JUDGE`]: the version's increment and verdict appended to the green's chain.
 pub(crate) const SUBMIT_APPEND: (&str, &str) = ("merge.submit.append", "merge.submit.append_ns");
+/// See [`SUBMIT_JUDGE`]: the retention a submit secures before its verdict, the settle's fold and the reservation's
+/// charge (A-803's measure).
+pub(crate) const SUBMIT_SECURE: (&str, &str) = ("merge.submit.secure", "merge.submit.secure_ns");
 /// See [`SUBMIT_JUDGE`]: from the version's enqueue to its record placed at the quorum, its inputs shipped first.
 pub(crate) const SUBMIT_PLACE: (&str, &str) = ("merge.submit.place", "merge.submit.place_ns");
 /// See [`SUBMIT_JUDGE`]: the versions placed, and the input shipments they took in all.
@@ -2139,15 +2329,112 @@ impl MergeShardState {
   /// finds the inputs when the record arrives. The tree's own identity is not it: a record naming that
   /// named an archive no holder ever held, and waited `INPUTS_UNHELD` for good
   /// (`docs/bugs/2026-09-16-merge-record-names-inputs-by-the-tree-only-identity.md`).
-  /// Format: the archive's 32-byte manifest identity (`Archive::manifest_identity`).
+  /// Format: the archive's 32-byte manifest identity (`Archive::manifest_identity`). The owner names it in the version's
+  /// chain entry as it holds the increment ([`hold_increment`], from the manifest it holds); a deferred push's record
+  /// (P2), the chain's own bytes, is named by it here.
   fn inputs_identity(bytes: &[u8], page: u32) -> [u8; 32] {
     Self::inputs_archive(bytes, 0, page).manifest_identity()
   }
 }
 
-/// The inputs a version references, as the chain holds them: the origin for version 0 (none for a
-/// scratch green), the increment's chain entry for version N.
-fn inputs_of(state: &ShardState, green: DbVolumeId, version: u64) -> Option<Vec<u8>> {
+/// Format: a holder node's composed increment held as its version's inputs before its owner commits it (A-697 (1)), the
+/// non-vacuity count of [`hold_composed_inputs`].
+pub(crate) const INPUTS_HELD_AT_COMPOSE: &str = "merge.inputs.held_at_compose";
+/// Format: such a hold the content plane refused (no room): the submit is refused typed, since its owner fetches the
+/// increment from this hold (lane (A) 3b).
+const INPUTS_HELD_AT_COMPOSE_REFUSED: &str = "merge.inputs.held_at_compose_refused";
+/// Format: a version's owner told that the node which composed its increment lacks none of its inputs (A-697 (1)).
+pub(crate) const INPUTS_HELD_BY_COMPOSER: &str = "merge.inputs.held_by_composer";
+/// Format: the input chunks a version's shipments carried, summed over their targets (A-697 (1)'s red: none to the node
+/// that composed the increment).
+pub(crate) const INPUTS_CHUNKS_SHIPPED: &str = "merge.inputs.chunks_shipped";
+
+/// Holds `increment`, which this holder node composed and names to its owner (A-697 part c; lane (A) 3b), as the inputs
+/// of `green`'s next version (`sequence`, the version this node's replica expects; the owner's offer refreshes the
+/// placement to the version it commits): the archive its owner names the version's inputs by
+/// ([`MergeShardState::inputs_identity`], whose identity is the bytes' alone), in this node's held content, each chunk
+/// copied once from `increment` into its block (`ContentHold::hold_lent`). The owner fetches what it lacks from here by
+/// that identity, and the owner's record reaches this node with no chunks (`inputs_held_by`). The identity held, or the
+/// refusal at this node's room (`BudgetExceeded`), counted: the submit cannot name content it does not hold.
+pub(crate) fn hold_composed_inputs(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  increment: &[u8],
+  sequence: u64,
+) -> Result<[u8; 32], Refusal> {
+  let manifest = crate::merge_origin::inputs_manifest_archive(increment, 0, archive_page(state));
+  let held = state.held_content.hold_lent(
+    &mut crate::content_holder::hold_space(&mut state.store),
+    ObjectId(green.bytes),
+    slates_cluster::content::Placed { sequence },
+    &manifest,
+    increment.chunks(crate::merge_origin::inputs_chunk_bytes().max(1)),
+  );
+  match held {
+    Ok(identity) => {
+      state.count(INPUTS_HELD_AT_COMPOSE, 1);
+      Ok(identity)
+    }
+    Err(refusal) => {
+      state.count(INPUTS_HELD_AT_COMPOSE_REFUSED, 1);
+      Err(match refusal {
+        slates_cluster::content::ContentRefusal::NoCapacity { available, .. } => {
+          Refusal::BudgetExceeded { available }
+        }
+        _ => Refusal::ContentUnavailable,
+      })
+    }
+  }
+}
+
+/// Tells `green`'s pending `version` that `host`, the node which composed its increment and held it as the version's
+/// inputs (`hold_composed_inputs`), lacks none of them: its shipment carries the offer and no chunk, which that node
+/// acknowledges from its hold. A node that could not hold them answers the offer with what it lacks, and the next
+/// shipment carries that (the content plane's ordinary path).
+pub(crate) fn inputs_held_by(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  version: u64,
+  host: HostId,
+) {
+  let Some(pending) = state
+    .merge
+    .pending
+    .get_mut(&ObjectId(green.bytes))
+    .and_then(|pending_green| pending_green.records.get_mut(&version))
+  else {
+    return;
+  };
+  if pending.inputs.candidates.contains(&host) && !pending.inputs.acked.contains(&host) {
+    pending.lacking.insert(host, Vec::new());
+    state.count(INPUTS_HELD_BY_COMPOSER, 1);
+  }
+}
+
+/// A version's merge record as its owner ships it to holders, for a test (P2): its inputs' bytes and the head identity
+/// it carries, read as `enqueue_record` reads them.
+#[cfg(test)]
+pub(crate) fn shipped_for_test(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  version: u64,
+) -> Option<(Vec<u8>, [u8; 32])> {
+  let inputs = match version_inputs(state, green, version)? {
+    InputsAt::Held(held) => increment_of(state, green, &held)?.into_owned(),
+    InputsAt::Record(bytes) => bytes.to_vec(),
+  };
+  let identity = state.greens.lend_mut(&green)?.head_identity();
+  Some((inputs, identity))
+}
+
+/// Where version `version` of `green` holds its inputs (chain entry format 6): the increment its chain entry names, which
+/// this shard's content store holds under the green's object ([`hold_increment`]). None for version 0 (its origin is
+/// made a share at a time, `crate::merge_origin`), a folded version or an adopted one.
+pub(crate) fn version_inputs(
+  state: &ShardState,
+  green: DbVolumeId,
+  version: u64,
+) -> Option<InputsAt<'_>> {
   if version == 0 {
     // Version 0's inputs, a green's origin, are made a share at a time and kept until placed (`crate::merge_origin`,
     // A-286); a scratch green's version 0 has none.
@@ -2160,10 +2447,187 @@ fn inputs_of(state: &ShardState, green: DbVolumeId, version: u64) -> Option<Vec<
   let held = state.db.partition().green_floor(green);
   let index = usize::try_from(version.checked_sub(held)?.checked_sub(1)?).ok()?;
   let entry = state.db.partition().green_chain(green).get(index)?;
+  // A deferred push's version (P2): its record is the inputs, which a holder defers its replica by.
+  if slates_merge::push::DeferredPush::is_record(entry) {
+    return Some(InputsAt::Record(entry));
+  }
   // The record's inputs are the increment a holder judges afresh (§4.16 "Apply on holders"), not what this node resolved.
-  slates_merge::chain_entry::increment_bytes(entry)
+  slates_merge::chain_entry::inputs(entry)
     .ok()
-    .map(<[u8]>::to_vec)
+    .map(InputsAt::Held)
+}
+
+/// Where a version's inputs are ([`version_inputs`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum InputsAt<'a> {
+  /// A chain entry's increment, which the content store holds (chain entry format 6).
+  Held(slates_merge::chain_entry::Inputs),
+  /// A deferred push's record (P2), the chain's own bytes.
+  Record(&'a [u8]),
+}
+
+impl InputsAt<'_> {
+  /// The identity the version's merge record names its inputs by.
+  fn identity(&self, page: u32) -> [u8; blake3::OUT_LEN] {
+    match self {
+      InputsAt::Held(inputs) => inputs.identity,
+      InputsAt::Record(bytes) => MergeShardState::inputs_identity(bytes, page),
+    }
+  }
+}
+
+/// Format: a version's increment held in its owner shard's content store as the version's inputs before its verdict
+/// (lane (A), chain entry format 6): the non-vacuity count of [`hold_increment`].
+pub(crate) const INPUTS_HELD_BY_OWNER: &str = "merge.inputs.held_by_owner";
+/// Format: a chain entry's increment read from the content store at a replay (a recovery's, a remake's, a re-adoption's):
+/// the count that a replay resolved what its entry names.
+pub(crate) const CHAIN_INPUTS_RESOLVED: &str = "merge.chain.inputs_resolved";
+/// Format: a held increment no chain entry names any more, given back (its version folded into a checkpoint, a refused
+/// verdict's, or one a crash left before its entry was appended).
+pub(crate) const CHAIN_INPUTS_RELEASED: &str = "merge.chain.inputs_released";
+
+/// What holding a version's increment did ([`hold_increment`]): where its chain entry names it, and whether this hold
+/// stored it, so a refused verdict gives back only what it took.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HeldIncrement {
+  /// The identity and length the entry names.
+  pub(crate) inputs: slates_merge::chain_entry::Inputs,
+  /// Whether the content store held it only from this hold.
+  pub(crate) fresh: bool,
+}
+
+/// Holds `increment`, the encoding of `green`'s next `version`, in this shard's content store under the green's object
+/// as the version's inputs archive (lane (A), chain entry format 6): stored once, its chunks copied from `increment` into
+/// their blocks, charged against the shard's unpromised capacity like all held content (A-714's rule: the shard's room,
+/// never the partition's merge budget), refused typed at the room (`BudgetExceeded`). Taken before the verdict, so an
+/// accepted version is always recorded; held until its version folds into a checkpoint ([`release_unnamed_increments`]).
+/// Its identity is the one the version's merge record names its inputs by ([`MergeShardState::inputs_identity`]), so the
+/// shipment to holders is cut from the same chunks.
+pub(crate) fn hold_increment(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  version: u64,
+  increment: &[u8],
+) -> Result<HeldIncrement, Refusal> {
+  let manifest = crate::merge_origin::inputs_manifest_archive(increment, 0, archive_page(state));
+  let identity = manifest.manifest_identity();
+  let object = ObjectId(green.bytes);
+  let fresh = !state.held_content.holds_manifest(object, &identity);
+  let held = state.held_content.hold_lent(
+    &mut crate::content_holder::hold_space(&mut state.store),
+    object,
+    slates_cluster::content::Placed { sequence: version },
+    &manifest,
+    increment.chunks(crate::merge_origin::inputs_chunk_bytes().max(1)),
+  );
+  match held {
+    Ok(_) => {
+      state.count(INPUTS_HELD_BY_OWNER, 1);
+      Ok(HeldIncrement {
+        inputs: slates_merge::chain_entry::Inputs {
+          identity,
+          len: u64::try_from(increment.len()).unwrap_or(u64::MAX),
+        },
+        fresh,
+      })
+    }
+    Err(slates_cluster::content::ContentRefusal::NoCapacity { available, .. }) => {
+      Err(Refusal::BudgetExceeded { available })
+    }
+    Err(_) => Err(Refusal::ContentUnavailable),
+  }
+}
+
+/// Gives back a refused verdict's increment ([`hold_increment`]) when its hold stored it and no chain entry names it.
+pub(crate) fn release_refused_increment(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  held: HeldIncrement,
+) {
+  if !held.fresh || chain_names(state, green).contains(&held.inputs.identity) {
+    return;
+  }
+  let released = state.held_content.forget_manifest(
+    &mut crate::content_holder::hold_space(&mut state.store),
+    ObjectId(green.bytes),
+    &held.inputs.identity,
+  );
+  if released {
+    state.count(CHAIN_INPUTS_RELEASED, 1);
+  }
+}
+
+/// The increments `green`'s chain names.
+fn chain_names(state: &ShardState, green: DbVolumeId) -> BTreeSet<[u8; 32]> {
+  state
+    .db
+    .partition()
+    .green_chain(green)
+    .iter()
+    .filter_map(|entry| slates_merge::chain_entry::inputs(entry).ok())
+    .map(|inputs| inputs.identity)
+    .collect()
+}
+
+/// Gives back what this shard's content store holds for `green` placed for a version past `floor` that no entry of its
+/// chain names (A-714's retention: an increment is held until its version folds into a checkpoint): after a fold, and at
+/// recovery, where a crash between an increment's hold and its entry's append left it unnamed. Content placed for a
+/// version past `ahead`, the green's head, is a submit's still to be appended and stays; a recovery passes none. What is
+/// placed at or below `floor` is not judged: an adopted green's versions there are its takeover's (A-333).
+pub(crate) fn release_unnamed_increments(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  floor: u64,
+  ahead: Option<u64>,
+) -> usize {
+  let named = chain_names(state, green);
+  let released = state.held_content.retain_placed_from(
+    &mut crate::content_holder::hold_space(&mut state.store),
+    ObjectId(green.bytes),
+    floor.saturating_add(1),
+    |identity, placed| named.contains(identity) || ahead.is_some_and(|head| placed.sequence > head),
+  );
+  if released > 0 {
+    state.count(
+      CHAIN_INPUTS_RELEASED,
+      u64::try_from(released).unwrap_or(u64::MAX),
+    );
+  }
+  released
+}
+
+/// The encoding of the increment `entry` names, from this shard's content store (chain entry format 6): lent from its one
+/// chunk's block where it is one chunk, else gathered once from its chunks in order. None when the store does not hold it
+/// whole for `green`.
+pub(crate) fn increment_of<'a>(
+  state: &'a ShardState,
+  green: DbVolumeId,
+  inputs: &slates_merge::chain_entry::Inputs,
+) -> Option<std::borrow::Cow<'a, [u8]>> {
+  let object = ObjectId(green.bytes);
+  let arena = state.store.content.arena();
+  let manifest = state
+    .held_content
+    .held_manifest(arena, object, &inputs.identity)?;
+  let extents = inputs_extents(&manifest);
+  let piece = |extent: &slates_archive::manifest::Extent| {
+    state
+      .held_content
+      .held_raw(arena, object, &inputs.identity, &extent.chunk)
+      .filter(|bytes| u64::try_from(bytes.len()).ok() == Some(extent.len))
+  };
+  let bytes = match extents {
+    [] => std::borrow::Cow::Borrowed(&[][..]),
+    [one] => std::borrow::Cow::Borrowed(piece(one)?),
+    several => {
+      let mut whole = Vec::with_capacity(usize::try_from(inputs.len).ok()?);
+      for extent in several {
+        whole.extend_from_slice(piece(extent)?);
+      }
+      std::borrow::Cow::Owned(whole)
+    }
+  };
+  (u64::try_from(bytes.len()).ok() == Some(inputs.len)).then_some(bytes)
 }
 
 /// The page the inputs archive is chunked at (informational in the header; the identity is the
@@ -2193,9 +2657,11 @@ pub(crate) fn enqueue_record(
     (increment, base, evidence, completion),
     work,
     |state| {
+      // Lent whether or not it owes a push (P2): an owed version's record carries the base's identity, which a holder's
+      // replica owing the same push holds.
       state
         .greens
-        .get_mut(&green)
+        .lend_mut(&green)
         .map(|mut engine| engine.head_identity())
         .unwrap_or_default()
     },
@@ -2323,8 +2789,8 @@ fn enqueue_record_with(
     crate::merge_origin::make_origin_inputs(state, green, value);
     return;
   }
-  value.inputs = inputs_of(state, green, version)
-    .map(|bytes| MergeShardState::inputs_identity(&bytes, archive_page(state)));
+  let page = archive_page(state);
+  value.inputs = version_inputs(state, green, version).map(|inputs| inputs.identity(page));
   insert_pending(state, object, value, work);
 }
 
@@ -2394,6 +2860,7 @@ pub(crate) fn insert_pending(
       lacking: BTreeMap::new(),
       enqueued_ns: slates_machine::clock::monotonic_ns(),
       shipments: 0,
+      inputs_manifest: None,
     },
   );
   nudge_record_plane(state);
@@ -2710,6 +3177,9 @@ fn ship_version(
     generation: config.version,
     value,
   };
+  if version > 0 && groups.keys().any(|carry| *carry != Carry::Record) {
+    make_inputs_manifest(state, object, version);
+  }
   let shipments = cut_shipments(state, (object, version), groups);
   let carrying = shipments
     .iter()
@@ -2728,6 +3198,9 @@ fn ship_version(
   for (targets, inputs) in shipments {
     if let Some(inputs) = &inputs {
       state.count(INPUTS_UNPLACED, 1);
+      let chunks =
+        u64::try_from(inputs.chunks.len().saturating_mul(targets.len())).unwrap_or(u64::MAX);
+      state.count(INPUTS_CHUNKS_SHIPPED, chunks);
       if !inputs.whole {
         state.count(INPUTS_PARTIAL, 1);
       }
@@ -2803,15 +3276,32 @@ fn cut_shipments(
   groups: BTreeMap<Carry, Vec<HostId>>,
 ) -> Vec<(Vec<HostId>, Option<ShipInputs>)> {
   let bound = shipment_bound(state);
-  let owned;
-  let archive = if !groups.keys().any(|carry| *carry != Carry::Record) {
+  let source = if !groups.keys().any(|carry| *carry != Carry::Record) {
     None
   } else if version == 0 {
-    crate::merge_origin::made_archive(state, object)
+    crate::merge_origin::made_archive(state, object).map(InputsSource::Whole)
   } else {
-    owned = inputs_of(state, DbVolumeId { bytes: object.0 }, version)
-      .map(|bytes| MergeShardState::inputs_archive(&bytes, 0, archive_page(state)));
-    owned.as_ref()
+    let manifest = state
+      .merge
+      .pending
+      .get(&object)
+      .and_then(|pending_green| pending_green.records.get(&version))
+      .and_then(|pending| pending.inputs_manifest.as_ref());
+    manifest
+      .zip(version_inputs(
+        state,
+        DbVolumeId { bytes: object.0 },
+        version,
+      ))
+      .map(|(manifest, inputs)| InputsSource::Lent {
+        manifest,
+        held: match inputs {
+          InputsAt::Held(inputs) => {
+            LentChunks::Held(HeldChunks::of(state, object, inputs.identity))
+          }
+          InputsAt::Record(bytes) => LentChunks::Bytes(bytes),
+        },
+      })
   };
   groups
     .into_iter()
@@ -2821,11 +3311,11 @@ fn cut_shipments(
         Carry::Inputs => None,
         Carry::Lacking(lacking) => Some(lacking),
       };
-      archive.map(|archive| {
+      source.as_ref().map(|source| {
         (
           targets,
           Some(ShipInputs::cut(
-            archive,
+            source,
             (object, version),
             lacking.as_deref(),
             bound,
@@ -2834,6 +3324,163 @@ fn cut_shipments(
       })
     })
     .collect()
+}
+
+/// Format: a later version's inputs archive made without its chunks for its shipments, once a version
+/// ([`PendingMergeRecord::inputs_manifest`]): the non-vacuity count that a version crossing in several shipments is
+/// archived once, not once a shipment.
+pub(crate) const INPUTS_MANIFEST_MADE: &str = "merge.inputs.manifest_made";
+
+/// Makes `version`'s inputs manifest on its pending record if it has none yet ([`PendingMergeRecord::inputs_manifest`]):
+/// the manifest the owner's content store holds the version's increment by (chain entry format 6), nothing copied but the
+/// manifest. A version whose inputs the chain no longer names gets none, and its shipments then carry no inputs, as before.
+fn make_inputs_manifest(state: &mut ShardState, object: ObjectId, version: u64) {
+  let made = state
+    .merge
+    .pending
+    .get(&object)
+    .and_then(|pending_green| pending_green.records.get(&version))
+    .is_some_and(|pending| pending.inputs_manifest.is_some());
+  if made {
+    return;
+  }
+  let page = archive_page(state);
+  let Some(manifest) = version_inputs(state, DbVolumeId { bytes: object.0 }, version).and_then(
+    |inputs| match inputs {
+      InputsAt::Held(inputs) => {
+        state
+          .held_content
+          .held_manifest(state.store.content.arena(), object, &inputs.identity)
+      }
+      InputsAt::Record(bytes) => Some(crate::merge_origin::inputs_manifest_archive(bytes, 0, page)),
+    },
+  ) else {
+    return;
+  };
+  if let Some(pending) = state
+    .merge
+    .pending
+    .get_mut(&object)
+    .and_then(|pending_green| pending_green.records.get_mut(&version))
+  {
+    pending.inputs_manifest = Some(manifest);
+    state.count(INPUTS_MANIFEST_MADE, 1);
+  }
+}
+
+/// Where a shipment's inputs come from: version 0's origin archive, kept whole while it ships (A-286); or a later
+/// version's manifest with its chunks lent from the blocks the owner's content store holds them in
+/// ([`InputsSource::Lent`]).
+enum InputsSource<'a> {
+  /// An archive holding its chunks.
+  Whole(&'a Archive),
+  /// An archive's manifest, its chunks lent.
+  Lent {
+    /// The archive without its chunks.
+    manifest: &'a Archive,
+    /// Where its chunks are.
+    held: LentChunks<'a>,
+  },
+}
+
+/// Where a lent source's chunks are: the content store's blocks (a chain entry's increment, format 6), or ranges of the
+/// chain's own bytes (a deferred push's record, P2).
+enum LentChunks<'a> {
+  Held(HeldChunks<'a>),
+  Bytes(&'a [u8]),
+}
+
+/// A version's inputs as the owner's content store holds them (chain entry format 6): each raw chunk lent from its block.
+struct HeldChunks<'a> {
+  hold: &'a slates_cluster::content::ContentHold,
+  arena: &'a slates_mem::arena::ChunkArena,
+  object: ObjectId,
+  identity: [u8; 32],
+}
+
+impl<'a> HeldChunks<'a> {
+  fn of(state: &'a ShardState, object: ObjectId, identity: [u8; 32]) -> HeldChunks<'a> {
+    HeldChunks {
+      hold: &state.held_content,
+      arena: state.store.content.arena(),
+      object,
+      identity,
+    }
+  }
+
+  /// The raw bytes of `chunk`, lent.
+  fn piece(&self, chunk: &[u8; 32]) -> Option<&'a [u8]> {
+    self
+      .hold
+      .held_raw(self.arena, self.object, &self.identity, chunk)
+  }
+}
+
+impl InputsSource<'_> {
+  /// The archive whose manifest the shipment offers.
+  fn archive(&self) -> &Archive {
+    match self {
+      InputsSource::Whole(archive)
+      | InputsSource::Lent {
+        manifest: archive, ..
+      } => archive,
+    }
+  }
+
+  /// Each chunk's raw length by its identity.
+  fn sizes(&self) -> BTreeMap<[u8; 32], u64> {
+    match self {
+      InputsSource::Whole(archive) => archive
+        .chunks
+        .iter()
+        .map(|chunk| (chunk.identity, chunk.raw_len))
+        .collect(),
+      InputsSource::Lent { manifest, .. } => inputs_extents(manifest)
+        .iter()
+        .map(|extent| (extent.chunk, extent.len))
+        .collect(),
+    }
+  }
+
+  /// The chunk requests of `batch`, in its order: a held archive's from its chunks; a lent one's encoded straight from
+  /// each chunk's block in the content store, nothing copied first.
+  fn requests(&self, (object, version): (ObjectId, u64), batch: &[[u8; 32]]) -> Vec<Vec<u8>> {
+    match self {
+      InputsSource::Whole(archive) => chunk_requests(archive, object, version, batch),
+      InputsSource::Lent { manifest, held } => {
+        let identity = manifest.manifest_identity();
+        let extents = inputs_extents(manifest);
+        batch
+          .iter()
+          .filter_map(|chunk| {
+            let raw = match held {
+              LentChunks::Held(held) => held.piece(chunk)?,
+              LentChunks::Bytes(bytes) => {
+                let extent = extents.iter().find(|extent| extent.chunk == *chunk)?;
+                let start = usize::try_from(extent.offset).ok()?;
+                let end = start.checked_add(usize::try_from(extent.len).ok()?)?;
+                bytes.get(start..end)?
+              }
+            };
+            Some(raw_chunk_request((object, version), &identity, chunk, raw))
+          })
+          .collect()
+      }
+    }
+  }
+}
+
+/// The extents an inputs archive's manifest names (its one file's, `merge_origin`'s shape), or none for another shape.
+fn inputs_extents(archive: &Archive) -> &[slates_archive::manifest::Extent] {
+  match &archive.manifest {
+    slates_archive::manifest::Node::Directory(entries) => {
+      match entries.first().map(|entry| &entry.node) {
+        Some(slates_archive::manifest::Node::File(extents)) => extents,
+        _ => &[],
+      }
+    }
+    _ => &[],
+  }
 }
 
 /// Derived: the most inputs bytes one merge shipment carries (A-286) — what a holder verifies against their identities
@@ -2861,18 +3508,15 @@ impl ShipInputs {
   /// when `None`): the offer, and in reference order the chunks they lack up to `bound` bytes — at least one, so a
   /// shipment always carries something they lack.
   fn cut(
-    archive: &Archive,
+    source: &InputsSource<'_>,
     (object, version): (ObjectId, u64),
     lacking: Option<&[[u8; 32]]>,
     bound: u64,
   ) -> ShipInputs {
+    let archive = source.archive();
     let wanted: Option<BTreeSet<[u8; 32]>> =
       lacking.map(|lacking| lacking.iter().copied().collect());
-    let sizes: BTreeMap<[u8; 32], u64> = archive
-      .chunks
-      .iter()
-      .map(|chunk| (chunk.identity, chunk.raw_len))
-      .collect();
+    let sizes = source.sizes();
     let mut batch = Vec::new();
     let mut carried = 0u64;
     let mut owed = 0usize;
@@ -2894,7 +3538,7 @@ impl ShipInputs {
     }
     ShipInputs {
       offer: offer_request(archive, object, version),
-      chunks: chunk_requests(archive, object, version, &batch),
+      chunks: source.requests((object, version), &batch),
       whole: batch.len() == owed,
     }
   }
@@ -3675,7 +4319,7 @@ fn record_standing(
   sender: HostId,
 ) -> Option<RecordStanding> {
   let next = match state.merge.replicas.get(&object) {
-    Some(replica) => Some(replica.head().saturating_add(1)),
+    Some(replica) => Some(replica.reached().saturating_add(1)),
     // No replica of a green whose records this holder accepted: a warm restart keeps the records and the inputs it held
     // (AUD-29-59), not the engine, which is rebuilt from them a slice at a time (A-313). Before, every later record was
     // refused out of order here, for good.
@@ -3957,21 +4601,18 @@ fn recompute(
     let Some(bytes) = inputs else {
       return Err(INPUTS_UNHELD);
     };
-    let increment = Increment::decode(bytes).map_err(|_| INPUTS_UNDECODABLE)?;
     let mut replica = state.merge.replicas.remove(&object).ok_or(OUT_OF_ORDER)?;
     let started = slates_machine::clock::monotonic_ns();
-    let outcome = replica.submit(&increment);
+    let applied = apply_inputs(&mut replica, bytes, value.version);
     count_phase(
       state,
       SUBMIT_RECOMPUTE,
       slates_machine::clock::monotonic_ns().saturating_sub(started),
     );
-    match outcome {
-      // An identical increment is accepted too (A-782): its version commits nothing new.
-      Outcome::Accepted { version } | Outcome::Identical { version }
-        if version == value.version => {}
-      // The owner accepted it; a holder that computes anything else has diverged.
-      _ => return Err(RECOMPUTE_MISMATCH),
+    if let Err(reason) = applied {
+      // Given back as it was: a later record or an adoption meets it again.
+      state.merge.replicas.insert(object, replica);
+      return Err(reason);
     }
     replica
   };
@@ -4004,6 +4645,42 @@ fn recompute(
   Ok(())
 }
 
+/// Counter: a record of a version after an owed one met a replica that still owes it (P2): refused, counted, the record
+/// left for a later attempt (GAPS A-812, a holder's replica is not made from its tool's objects yet).
+pub(crate) const REPLICA_OWES: &str = "merge.replica.owes";
+
+/// Applies a version's inputs to a holder's `replica` as exactly `version` (§4.16 "Apply on holders"): an increment
+/// judged afresh and accepted as that version; or a deferred push's record (P2, `DeferredPush`), the replica then owing
+/// it as its owner's green does, its head identity its base's, as the owner's record carries. A replica that owes a push
+/// cannot judge an increment after it: refused [`REPLICA_OWES`]. Anything else has diverged.
+pub(crate) fn apply_inputs(
+  replica: &mut Green,
+  bytes: &[u8],
+  version: u64,
+) -> Result<(), &'static str> {
+  if slates_merge::push::DeferredPush::is_record(bytes) {
+    let push = slates_merge::push::DeferredPush::decode(bytes).ok_or(INPUTS_UNDECODABLE)?;
+    return match replica.defer(push) {
+      Some(owed) if owed == version => Ok(()),
+      _ => Err(RECOMPUTE_MISMATCH),
+    };
+  }
+  if !replica.is_materialized() {
+    return Err(REPLICA_OWES);
+  }
+  let increment = Increment::decode(bytes).map_err(|_| INPUTS_UNDECODABLE)?;
+  match replica.submit(&increment) {
+    // An identical increment is accepted too (A-782): its version commits nothing new.
+    Outcome::Accepted { version: made } | Outcome::Identical { version: made }
+      if made == version =>
+    {
+      Ok(())
+    }
+    // The owner accepted it; a holder that computes anything else has diverged.
+    _ => Err(RECOMPUTE_MISMATCH),
+  }
+}
+
 /// Folds a holder's `replica` of a green below `floor`, the version below which its owner's engine had folded the
 /// green's histories when it made the record this holder now holds (§4.16 "delta retention before folding", A-385): the
 /// replica then keeps no more of the green's history than its owner does. A floor at or below the replica's own fold
@@ -4021,7 +4698,7 @@ pub(crate) fn fold_replica(state: &mut ShardState, replica: &mut Green, floor: u
 /// A holder's view of `object`'s replica, for a test.
 pub(crate) fn holder_state(state: &ShardState, object: ObjectId) -> HolderMergeState {
   HolderMergeState {
-    version: state.merge.replicas.get(&object).map(Green::head),
+    version: state.merge.replicas.get(&object).map(Green::reached),
     refused: state.merge.refused.contains(&object),
   }
 }
@@ -4038,6 +4715,35 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A-579 (a checkpoint's identity fold paced to end within its doubling interval). Do: ask a turn's budget for 80 ms
+  /// of fold left, a turn every 0.5 ms, at several points of a 1 s interval; and past its end; and for almost nothing
+  /// left. Expect: the fold spread evenly over the turns left (80 ms x 0.5 / 1000 = 40 us at the start, twice that half
+  /// way), all of it once the deadline has passed, and never less than the quantum.
+  #[test]
+  fn a_folds_turn_budget_spreads_what_is_left_over_the_turns_before_its_deadline() {
+    const MS: u64 = 1_000_000;
+    const QUANTUM: u64 = 5_000;
+    let left = 80 * MS;
+    let gap = MS / 2;
+    assert_eq!(
+      turn_budget_ns(left, (gap, QUANTUM), (0, 1_000 * MS, 0)),
+      40_000
+    );
+    assert_eq!(
+      turn_budget_ns(left, (gap, QUANTUM), (0, 1_000 * MS, 500 * MS)),
+      80_000
+    );
+    assert_eq!(
+      turn_budget_ns(left, (gap, QUANTUM), (0, 1_000 * MS, 1_000 * MS)),
+      left
+    );
+    assert_eq!(turn_budget_ns(left, (gap, QUANTUM), (0, 0, 7)), left);
+    assert_eq!(
+      turn_budget_ns(1_000, (gap, QUANTUM), (0, 1_000 * MS, 0)),
+      QUANTUM
+    );
+  }
 
   /// AC-6.8 / A-26, A-294: seed a green from a frozen namespace of FIFO and socket names and device nodes without
   /// reading a stream or opening a device; expect every kind, owner and device number in the green, each alias a link.
@@ -4173,6 +4879,7 @@ mod tests {
       lacking: BTreeMap::new(),
       enqueued_ns: 0,
       shipments: 0,
+      inputs_manifest: None,
     };
     assert!(carries_inputs(&pending, &[second, third]));
     assert!(!carries_inputs(&pending, &[second]));
@@ -4276,6 +4983,7 @@ mod tests {
             lacking: BTreeMap::new(),
             enqueued_ns: 0,
             shipments: 0,
+            inputs_manifest: None,
           },
         );
       }
@@ -4620,6 +5328,61 @@ mod tests {
     assert_eq!(before, after, "nothing is left charged");
   }
 
+  /// Lane (A), condition 3 (A-714's retention; chain entry format 6): a version's increment is held in the owner shard's
+  /// content store, charged against the shard's room, and refused typed there. Do: on a shard with a reduced reserve,
+  /// hold a 3 MiB increment through `hold_increment`, then one a chunk past what the shard can still admit, then give the
+  /// first back as a refused verdict's. Expect: the first held fresh, its bytes charged to the shard (at least its
+  /// length); the second refused `BudgetExceeded` naming no more than the shard could admit, with nothing more charged;
+  /// and the charge back to what it was once the first is given back.
+  #[test]
+  fn an_increment_is_held_charged_and_refused_typed_at_the_shards_room() {
+    let green = DbVolumeId { bytes: [44; 16] };
+    let (fresh, held_charge, refused, after_refusal, released) =
+      crate::daemon::audit_on_shard_configured(
+        move |state| {
+          let before = state.store.budget.replicated();
+          let first: Vec<u8> = (0..3u32 << 20)
+            .map(|at| u8::try_from(at % 251).unwrap())
+            .collect();
+          let held = hold_increment(state, green, 1, &first).expect("room for 3 MiB");
+          let held_charge = state.store.budget.replicated() - before;
+          let past = usize::try_from(state.store.admittable()).unwrap()
+            + crate::merge_origin::inputs_chunk_bytes();
+          let second: Vec<u8> = (0..past)
+            .map(|at| u8::try_from(at % 241).unwrap())
+            .collect();
+          let refused = hold_increment(state, green, 2, &second).err();
+          let after_refusal = state.store.budget.replicated() - before;
+          release_refused_increment(state, green, held);
+          (
+            held.fresh,
+            held_charge,
+            refused,
+            after_refusal,
+            state.store.budget.replicated() - before,
+          )
+        },
+        |config| config.reserve_per_shard = OVER_BUDGET_RESERVE,
+      );
+    assert!(fresh, "the hold stored the increment");
+    assert!(
+      held_charge >= 3 << 20,
+      "the increment is charged to the shard: {held_charge} bytes"
+    );
+    assert!(
+      matches!(refused, Some(Refusal::BudgetExceeded { .. })),
+      "an increment past the shard's room is refused typed: {refused:?}"
+    );
+    assert_eq!(
+      after_refusal, held_charge,
+      "the refusal left nothing charged"
+    );
+    assert_eq!(
+      released, 0,
+      "a refused verdict's increment gives its charge back whole"
+    );
+  }
+
   /// A version's inputs archive over two whole inputs chunks and half of a third (A-286).
   fn three_chunk_archive() -> Archive {
     let chunk = crate::merge_origin::inputs_chunk_bytes();
@@ -4655,7 +5418,7 @@ mod tests {
     let ids = archive.referenced_chunks();
     let chunk = u64::try_from(crate::merge_origin::inputs_chunk_bytes()).unwrap();
     let carried = |lacking: Option<&[[u8; 32]]>, bound: u64| {
-      let cut = ShipInputs::cut(&archive, (object, 4), lacking, bound);
+      let cut = ShipInputs::cut(&InputsSource::Whole(&archive), (object, 4), lacking, bound);
       assert!(
         matches!(
           slates_cluster::content::ContentMessage::decode(&cut.offer),
@@ -4675,6 +5438,66 @@ mod tests {
     );
     assert_eq!(carried(None, u64::MAX), (ids.clone(), true));
     assert_eq!(carried(Some(&ids[2..]), chunk), (ids[2..].to_vec(), true));
+  }
+
+  /// A later version's shipments cut as views of the owner's content store (chain entry format 6: its increment held as
+  /// the version's inputs archive, its manifest read once, its chunks lent from their blocks) are byte for byte the
+  /// shipments a whole archive of the same bytes makes: the same offer, the same chunk requests in the same order, the
+  /// same wholeness. Do: hold each input through `hold_increment` on a shard and cut both ways for targets lacking every
+  /// chunk and lacking only the last, under bounds of zero, one chunk, two and past the whole, over a three-chunk input
+  /// whose last chunk is short, and over one that repeats a chunk. Expect: equal shipments every time, and the held
+  /// increment read back whole (`increment_of`).
+  #[test]
+  fn a_shipment_cut_from_held_chunks_is_the_whole_archives_byte_for_byte() {
+    let chunk = crate::merge_origin::inputs_chunk_bytes();
+    let short: Vec<u8> = (0..chunk * 2 + chunk / 2)
+      .map(|at| u8::try_from(at % 253).unwrap())
+      .collect();
+    let mut repeating = vec![7u8; chunk * 2];
+    repeating.extend((0..chunk / 3).map(|at| u8::try_from(at % 251).unwrap()));
+    let green = DbVolumeId { bytes: [43; 16] };
+    let object = ObjectId(green.bytes);
+    let step = u64::try_from(chunk).unwrap();
+    for (version, bytes) in [(4, short), (5, repeating)] {
+      let mismatches = crate::daemon::audit_on_shard(move |state| {
+        let held = hold_increment(state, green, version, &bytes).expect("room for the input");
+        let whole = MergeShardState::inputs_archive(&bytes, 0, archive_page(state));
+        let manifest = state
+          .held_content
+          .held_manifest(state.store.content.arena(), object, &held.inputs.identity)
+          .expect("the manifest is held");
+        let ids = whole.referenced_chunks();
+        let last = ids.last().copied().into_iter().collect::<Vec<_>>();
+        let mut mismatches = Vec::new();
+        for lacking in [None, Some(last.as_slice())] {
+          for bound in [0, step, 2 * step, u64::MAX] {
+            let from_whole =
+              ShipInputs::cut(&InputsSource::Whole(&whole), (object, 4), lacking, bound);
+            let lent = ShipInputs::cut(
+              &InputsSource::Lent {
+                manifest: &manifest,
+                held: LentChunks::Held(HeldChunks::of(state, object, held.inputs.identity)),
+              },
+              (object, 4),
+              lacking,
+              bound,
+            );
+            if (lent.offer, lent.chunks, lent.whole)
+              != (from_whole.offer, from_whole.chunks, from_whole.whole)
+            {
+              mismatches.push((lacking.is_some(), bound));
+            }
+          }
+        }
+        let read = increment_of(state, green, &held.inputs).map(|read| read.into_owned());
+        assert!(
+          read.as_deref() == Some(&bytes[..]),
+          "the held increment reads back whole"
+        );
+        mismatches
+      });
+      assert_eq!(mismatches, Vec::new(), "every cut equal");
+    }
   }
 
   /// §4.16 "Commit" (A-286): the owner reads what each target answered about a version's inputs, and ships each what it
@@ -4720,6 +5543,7 @@ mod tests {
           lacking: BTreeMap::new(),
           enqueued_ns: 0,
           shipments: 0,
+          inputs_manifest: None,
         },
       );
       let ack = |holder, sequence, manifest| {

@@ -3807,3 +3807,89 @@ fn measure_the_holders_take_turn() {
     hashing[0], hashing[median], given[0], given[median], slices[0], slices[median]
   );
 }
+
+/// `holder`, installed at `captured`, is answered the entries after it, never a second install.
+fn answered_after_install(shipper: &mut Shipper, holder: HostId, captured: Head) {
+  let _ = shipper.on_reply(holder, Ok(Some(captured)));
+  match shipper.pending(holder) {
+    Next::Entries(entries) => assert_eq!(
+      entries.first().map(|entry| entry.position),
+      Some(captured.position + 1),
+      "the entries after the install"
+    ),
+    other => panic!("the installed holder is answered entries, not {other:?}"),
+  }
+}
+
+/// A-757 part 5 under a stream (w-forming, Goal 85b C3; the seeded nemesis, seeds 1256052866610850298 and
+/// 5939796479076166087): a whole state made at a position behind the head is the checkpoint while the tail still holds
+/// every entry after it. An install image is sealed over turns while writes go on, so the head always moved past the
+/// position it was captured at, and 1,055 of 1,055 images were dropped: a candidate behind the tail was never installed
+/// and stayed 608 entries behind through the fleet wait. Do: bound a shipper's tail to eight entries, append four, mark a
+/// whole state at the second while two more are appended; then append past the tail and mark one at a position it no
+/// longer reaches past; then mark an older one than the checkpoint. Expect the second's head the checkpoint, a holder
+/// installed there answered the entries after it, never a second install; the position the tail let go refused; the
+/// checkpoint never moved back.
+#[test]
+fn a_whole_state_behind_the_head_is_the_checkpoint_while_the_tail_holds_what_follows() {
+  const SMALL: usize = 16;
+  let hosts = [HostId(1), HostId(2), HostId(3)];
+  let mut shipper = Shipper::new(
+    (hosts[0], OBJECT, HostEpoch(1)),
+    Quorum { f: 1 },
+    &hosts,
+    None,
+    bounds_of(64, 8, SMALL),
+  );
+  let mut heads = Vec::new();
+  for value in 0..4u8 {
+    heads.push(shipper.append(vec![value; SMALL]).unwrap().head());
+  }
+  let captured = heads[1];
+  for value in 4..6u8 {
+    heads.push(shipper.append(vec![value; SMALL]).unwrap().head());
+  }
+  assert!(
+    shipper.retains_after(captured.position),
+    "the tail holds what follows the capture"
+  );
+  shipper.mark_checkpoint(captured);
+  assert_eq!(
+    shipper.checkpoint(),
+    Some(captured),
+    "a whole state behind the head is the checkpoint while the tail holds what follows it"
+  );
+  // Holder 3, installed at the captured head, is answered the entries after it.
+  answered_after_install(&mut shipper, hosts[2], captured);
+  // Past the tail: a position it no longer reaches past is refused, and the checkpoint never moves back.
+  for value in 6..20u8 {
+    let entry = shipper.append(vec![value; SMALL]).unwrap();
+    let _ = shipper.on_reply(hosts[1], Ok(Some(entry.head())));
+    let _ = shipper.on_reply(hosts[2], Ok(Some(entry.head())));
+    heads.push(entry.head());
+  }
+  let let_go = heads[3];
+  assert!(
+    !shipper.retains_after(let_go.position),
+    "the tail let it go"
+  );
+  shipper.mark_checkpoint(let_go);
+  assert_eq!(
+    shipper.checkpoint(),
+    Some(captured),
+    "a position past the tail is refused"
+  );
+  let newest = *heads.last().unwrap();
+  shipper.mark_checkpoint(newest);
+  assert_eq!(
+    shipper.checkpoint(),
+    Some(newest),
+    "the head is the checkpoint"
+  );
+  shipper.mark_checkpoint(captured);
+  assert_eq!(
+    shipper.checkpoint(),
+    Some(newest),
+    "the checkpoint never moves back"
+  );
+}

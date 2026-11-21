@@ -17,10 +17,11 @@
 //!   from, its work then empty ([`Greens::holding_head`], A-753); else at the version of a green its new
 //!   value's first parent heads, where one can still be branched from, else at the default branch's
 //!   head ([`Greens::base_of_create`]), and
-//!   its work states the whole difference against that version's tree, so the new green holds
+//!   its push states the whole difference against that version's tree, so the new green holds
 //!   exactly the client's tree; in a repository whose default branch is unborn, over an empty
-//!   green. A create of a ref that names a green is a ref that moved, as git's lock refuses a ref
-//!   that exists (A-654, main's ruling of 2026-11-19);
+//!   green. The push is not built here: the new green owes it, based at its own version 0, and is
+//!   made when first reached (P2, A-812, A-823). A create of a ref that names a green is a ref
+//!   that moved, as git's lock refuses a ref that exists (A-654, main's ruling of 2026-11-19);
 //! - a delete retires the green, its old value the green's head, or the ref moved.
 //!
 //! A ref's tree is its commit's, or the tree it names; a tag (a green too, §4.17.1 item 6) may name
@@ -40,7 +41,9 @@
 //! refusal, with a band-2 line naming the path.
 
 use slates_merge::pace::{Pace, Slices};
-use slates_merge::push::{Building, Built, ObjectKey, Push, PushObjects, PushRefused, build};
+use slates_merge::push::{
+  Building, Built, DeferredPush, ObjectKey, Push, PushObjects, PushRefused, build,
+};
 use slates_merge::{ConflictWindow, Green, Increment};
 use std::cell::Cell;
 
@@ -153,8 +156,11 @@ pub enum Entry {
     name: Vec<u8>,
     /// The green and version it is made at ([`Greens::base_of_create`]); none to make it empty.
     from: Option<(u64, u64)>,
-    /// Its first work, built against that version, or over an empty green.
-    increment: Increment,
+    /// The push it owes as its first version, against that version or over an empty green, its work not built (P2,
+    /// main's ruling of 2026-11-21: a created ref's content is derived on first read, A-647; the push the eager create
+    /// built, so the green made when first reached is the one it made): git/git's 1,019 tags built their whole trees at
+    /// the push, refs times tree.
+    push: DeferredPush,
   },
   /// The green retired (§4.17.1: a deleted branch's chain kept for its retention), only while it
   /// is at `position`.
@@ -242,9 +248,23 @@ pub struct Preparing {
 }
 
 impl Preparing {
+  /// The largest chain entry its work can take (`slates_merge::chain_entry::entry_bound`), once built; none before:
+  /// what its judge makes the chains room for before the append, a green a turn (A-238, off the append's step).
+  pub fn entry_bound(&self) -> Option<usize> {
+    match &self.done {
+      Some(Ok(built)) => Some(slates_merge::chain_entry::entry_bound(&built.increment)),
+      _ => None,
+    }
+  }
+
   /// Its build's longest unit so far, nanoseconds on its owner's clock (A-752).
   pub fn longest_unit_ns(&self) -> u64 {
     self.building.pace().longest_unit_ns()
+  }
+
+  /// What its last turn's step did (A-783): the quanta it took and how it stopped.
+  pub fn step_report(&self) -> Option<slates_pace::Report> {
+    self.building.pace().step_report()
   }
 
   /// Its last turn's opening, nanoseconds on its owner's clock: what the turn did before its first unit.
@@ -328,18 +348,25 @@ where
 
   /// One turn of `command`'s work, built against the green and base its verdict will read (A-752): whether it is
   /// ready, so this step judges it (a delete, a command whose verdict refuses before any work, or a work built); not
-  /// ready, the turn, begun at `began`, ended at `deadline` on `clock` (the owner's, nanoseconds) and `preparing` keeps
-  /// the build for the next, each unit moving at most the owner's derived `slices`. What the turn did before its first
+  /// ready, the turn, begun at `began` and paced by `env` (A-783: yielding at its quantum when someone waits, to its
+  /// ceiling when no one does), ended and `preparing` keeps the build for the next, each unit moving at most the owner's
+  /// derived `slices`. What the turn did before its first
   /// unit is its opening ([`Preparing::opening_ns`]). A build for another command or push is begun again.
   pub fn prepare(
     &self,
     command: &Command,
     pushed: &Pushed<'_>,
     preparing: &mut Option<Preparing>,
-    (clock, began, deadline): (fn() -> u64, u64, u64),
+    (began, env): (u64, slates_pace::Env),
     slices: Slices,
   ) -> bool {
+    // A delete builds nothing, nor does a create, whose push its green owes until first reached (P2). A create reaches
+    // the greens its verdict will read, so the owner can make any that owes its own push before the verdict reads it.
     if command.is_delete() {
+      return true;
+    }
+    if command.is_create() {
+      self.reach_create(command, pushed);
       return true;
     }
     let ours = preparing.as_ref().is_some_and(|prepared| {
@@ -368,7 +395,7 @@ where
         };
         *preparing = Some(Preparing {
           command: (command.name.clone(), command.new),
-          building: Building::new(&push, self.room, Pace::new(clock)),
+          building: Building::new(&push, self.room, Pace::new(env.clock)),
           done: None,
           parent,
         });
@@ -377,7 +404,7 @@ where
         return true;
       };
       let pace = prepared.building.pace();
-      pace.turn_from(began, (deadline, slices));
+      pace.turn_from(began, (env, slices));
       prepared.done = prepared.building.advance(green, self.objects);
       prepared.done.is_some()
     };
@@ -443,12 +470,32 @@ where
     })
   }
 
-  /// A create's work, against the version it is made at, or over an empty green (module docs).
+  /// Reaches the greens a create's verdict reads (`Verdicts::create`): the ref's own, then the one it would be made at.
+  fn reach_create(&self, command: &Command, pushed: &Pushed<'_>) {
+    if self.greens.read(&command.name, |_| ()).is_some() {
+      return;
+    }
+    if self.greens.holding_head(&command.new, |_, _| ()).is_none() {
+      let parent = self.first_parent(&command.new, pushed);
+      let _ = self.greens.base_of_create(parent.as_ref(), |_, _| ());
+    }
+  }
+
+  /// A create's push, against the version it is made at, or over an empty green (module docs), owed and not built (P2).
   fn create(&self, command: &Command, pushed: &Pushed<'_>) -> Result<Entry, Declined> {
+    // The new green holds the version it is made at as its own version 0, so its owed push is based there, as the
+    // eager create's work was (`repository::push`'s `plan_create`).
+    let owed = |green: &Green, base: Option<Version>| {
+      self.push_of(command, pushed, green, base).map(|push| {
+        let rebased = Push {
+          base_version: 0,
+          ..push
+        };
+        DeferredPush::of(&rebased, self.room)
+      })
+    };
     let at = |read: GreenRead<'_>, version: Version| {
-      self
-        .work(command, pushed, read.green, Some(version))
-        .map(|increment| (Some((read.id, version.number)), increment))
+      owed(read.green, Some(version)).map(|push| (Some((read.id, version.number)), push))
     };
     let made = match self.greens.holding_head(&command.new, at) {
       Some(made) => Some(made),
@@ -457,14 +504,14 @@ where
         self.greens.base_of_create(parent.as_ref(), at)
       }
     };
-    let (from, increment) = match made {
+    let (from, push) = match made {
       Some(made) => made?,
-      None => (None, self.work(command, pushed, &Green::new(), None)?),
+      None => (None, owed(&Green::new(), None)?),
     };
     Ok(Entry::Create {
       name: command.name.clone(),
       from,
-      increment,
+      push,
     })
   }
 

@@ -56,7 +56,7 @@ use std::borrow::Cow;
 
 use slates_vcs::{ContentId, ContentStore};
 
-use super::getbundle::{Linked, Logged, Store};
+use super::getbundle::{Linked, Logged, Store, StoredDelta};
 use super::{Refusal, Repository, Rev};
 use crate::filerev::MARKER;
 use crate::index::{ChangesetRow, HgIndex, Log, NONE};
@@ -170,6 +170,10 @@ pub struct Indexed<'a> {
   census: Census,
   /// How the texts were lent.
   lends: Cell<Lends>,
+  /// The tests' changeset store answered at once from the index's own texts ([`Indexed::answering_from_its_texts`]),
+  /// each text by its identity as the rows named it; none in the daemon, whose changeset store answers between steps.
+  #[cfg(test)]
+  from_texts: Option<core::cell::RefCell<std::collections::BTreeMap<[u8; 32], Vec<u8>>>>,
 }
 
 impl<'a> Indexed<'a> {
@@ -210,7 +214,79 @@ impl<'a> Indexed<'a> {
       markers,
       census,
       lends,
+      #[cfg(test)]
+      from_texts: None,
     })
+  }
+
+  /// The view, its changeset store answered at once from the index's own texts, each file revision as a stored whole
+  /// (the tests' stand-in for the node's changeset store, which the daemon asks between steps).
+  #[cfg(test)]
+  pub(crate) fn answering_from_its_texts(mut self) -> Self {
+    self.from_texts = Some(core::cell::RefCell::new(std::collections::BTreeMap::new()));
+    self
+  }
+
+  /// [`Store::stored_now`] from the index's own texts ([`Indexed::answering_from_its_texts`]).
+  #[cfg(test)]
+  fn given_from_texts(
+    &self,
+    texts: &core::cell::RefCell<std::collections::BTreeMap<[u8; 32], Vec<u8>>>,
+    want: &crate::render::Want,
+  ) -> Option<super::getbundle::Given> {
+    use crate::render::{StoredPlace, StoredRevision, Want};
+    match want {
+      Want::Rows { logs } => {
+        let mut rows = Vec::new();
+        for (path, nodes) in logs {
+          let mut log = Vec::new();
+          for node in nodes {
+            let mut room = Admission::new(u64::MAX);
+            let logged = self.logged(Log::File(path), node, &mut room).ok()?;
+            log.push(logged.map(|logged| {
+              let text = logged.text.into_owned();
+              let identity = *blake3::hash(&text).as_bytes();
+              let len = to_u64(text.len());
+              texts.borrow_mut().insert(identity, text);
+              StoredRevision {
+                text: identity,
+                base: None,
+                place: StoredPlace {
+                  payload: identity,
+                  offset: 0,
+                  len,
+                },
+              }
+            }));
+          }
+          rows.push(log);
+        }
+        Some(super::getbundle::Given::Rows(rows))
+      }
+      Want::Chunks { places } => {
+        let held = texts.borrow();
+        let mut chunks = Vec::new();
+        for place in places {
+          // A stored whole is its raw text (the store's contract, A-767 C1).
+          chunks.push(held.get(&place.payload)?.clone());
+        }
+        Some(super::getbundle::Given::Chunks(chunks))
+      }
+      Want::Texts { texts: asked, most } => {
+        let held = texts.borrow();
+        let mut made = Vec::new();
+        let mut total = 0_u64;
+        for identity in asked {
+          let text = held.get(identity)?;
+          total = total.saturating_add(to_u64(text.len()));
+          if total > *most {
+            return Some(super::getbundle::Given::TextsPast);
+          }
+          made.push(text.clone());
+        }
+        Some(super::getbundle::Given::Texts(made))
+      }
+    }
   }
 
   /// Why the changeset `node` is not served; `None` for one it serves, or one the changelog does not hold.
@@ -380,12 +456,6 @@ impl Repository for Indexed<'_> {
     let manifest = self.text_of(Log::Manifest, &row.manifest, admission)?;
     Ok(crate::manifest::find(&manifest, TAGS_PATH).map(|entry| entry.node))
   }
-
-  fn tags_text(&self, node: &Node, admission: &mut Admission) -> Result<Vec<u8>, Refusal> {
-    let text = self.text_of(Log::File(TAGS_PATH), node, admission)?;
-    let split = crate::filerev::split(&text).map_err(|_| Refusal::Store { what: "tags" })?;
-    Ok(split.bytes.to_vec())
-  }
 }
 
 /// Format: the path of the file Mercurial keeps its global tags in.
@@ -434,13 +504,29 @@ impl Store for Indexed<'_> {
     self.logged(Log::Manifest, node, room)
   }
 
-  fn file(
-    &self,
-    path: &[u8],
-    node: &Node,
-    room: &mut Admission,
-  ) -> Result<Option<Logged<'_>>, PastAdmission> {
-    self.logged(Log::File(path), node, room)
+  fn stored_now(&self, want: &crate::render::Want) -> Option<super::getbundle::Given> {
+    #[cfg(test)]
+    if let Some(texts) = &self.from_texts {
+      return self.given_from_texts(texts, want);
+    }
+    let _ = want;
+    None
+  }
+
+  /// A file revision as its log's row holds it, no text read (A-767 C1).
+  fn file_entry(&self, path: &[u8], node: &Node) -> Option<super::getbundle::FileEntry> {
+    let log = Log::File(path);
+    let rev = self.index.rev(self.store, log, node)?;
+    let row = self
+      .index
+      .revision(self.store, log, rev)
+      .filter(|row| row.node == *node)?;
+    Some(super::getbundle::FileEntry {
+      position: u64::from(rev),
+      parents: [self.log_node(log, row.p1)?, self.log_node(log, row.p2)?],
+      link: self.index.changeset(self.store, row.link)?.node,
+      flags: row.flags,
+    })
   }
 
   fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
@@ -450,6 +536,34 @@ impl Store for Indexed<'_> {
         .into_iter()
         .flat_map(|markers| markers.iter())
     })
+  }
+
+  /// A manifest kept as a delta (A-729) lent as it is kept: its base's number, its parents' nodes, its flags and its
+  /// delta's bytes, in place where the store holds them in one window.
+  fn manifest_delta(
+    &self,
+    position: u64,
+    room: &mut Admission,
+  ) -> Result<Option<StoredDelta<'_>>, PastAdmission> {
+    let Ok(rev) = u32::try_from(position) else {
+      return Ok(None);
+    };
+    let Some(row) = self.index.revision(self.store, Log::Manifest, rev) else {
+      return Ok(None);
+    };
+    if row.base == NONE || row.block.is_some() {
+      return Ok(None);
+    }
+    let (Some(p1), Some(p2)) = (
+      self.log_node(Log::Manifest, row.p1),
+      self.log_node(Log::Manifest, row.p2),
+    ) else {
+      return Ok(None);
+    };
+    let Some(delta) = lend(self.store, &row.bytes, row.stored, &self.lends, room)? else {
+      return Ok(None);
+    };
+    Ok(Some((u64::from(row.base), [p1, p2], row.flags, delta)))
   }
 
   fn manifest_linked(&self, position: u64) -> Option<Linked> {

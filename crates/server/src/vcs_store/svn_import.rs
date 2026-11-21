@@ -4,10 +4,11 @@
 //! **What it does.** A Subversion repository `CreateRepository` made holds revision 0 and its creation's record. An
 //! import gives it the history a stock `svnadmin dump` wrote (format 2 or 3): the dump's file is read from the host as a
 //! base is, read-only (§4.15), and `slates-svn`'s import (`Importer`, A-628) reads it as `svnadmin load` does, handing
-//! over each record it makes. Each revision is committed through the owner's commit step a client's commit takes
-//! (`repository::svn_commit::commit`: the green's next version and the revision's record one entry of the repository's
-//! logs, then applied); the UUID and revision 0's properties through the step for a record that moves no version
-//! (`svn_commit::record`). So every imported revision is durable as it lands and a recovery reaches it, and a refusal
+//! over each record it makes. Each revision is landed as a client's commit lands one (`repository::svn_commit::
+//! land_revision`: checked, landed whole on the node's changeset store, then the green's next version and a reference
+//! to the changeset one entry of the register, then applied; C2); the UUID and revision 0's properties through the
+//! landing for a record that moves no version (`svn_commit::land_record`). A record handed over ends its turn and lands
+//! before the import reads on ([`land_owed`]). So every imported revision is durable as it lands and a recovery reaches it, and a refusal
 //! keeps the revisions before it, as `svnadmin load` keeps them. The history keeps the stream's revision numbers: a dump
 //! continues the repository's history (revision 0 into one that holds no revision but 0, else the revision after its
 //! youngest), so a dump made in parts loads part after part.
@@ -39,6 +40,7 @@ use slates_svn::migration::{Importer, Importing as Imported, MigrationRefusal};
 use slates_vfs::host::{HostDir, HostError, HostFile, HostFs};
 
 use super::hg_import::room_of;
+use crate::repository::svn_commit::staging::{Flush, Staging};
 use crate::repository::svn_commit::{self, Uncommitted};
 use crate::state::ShardState;
 
@@ -85,6 +87,18 @@ pub(crate) struct Importing {
   revisions: u64,
   /// The turns taken.
   turns: u64,
+  /// The record the import handed over last, owed its landing before the import reads on ([`land_owed`]).
+  owed: Option<Record>,
+  /// The delta base the import asked for that RAM does not hold, owed through the node's store before it reads on
+  /// ([`supply_owed_base`]; C2 stage B part 2 (b)).
+  base_owed: Option<slates_svn::index::ContentIdentity>,
+  /// The revisions staged since the last landing, landed as one changeset and one register entry (C2 stage C,
+  /// `svn_commit::staging`).
+  staging: Option<Staging>,
+  /// The stream ended with revisions staged: they land before the import ends ([`land_owed`]).
+  flush_end: bool,
+  /// The import's holding was not admitted with revisions staged: they land before it reads on ([`land_owed`]).
+  flush_admission: bool,
 }
 
 impl std::fmt::Debug for Importing {
@@ -120,6 +134,8 @@ pub(crate) enum LoadFailed {
     refusal: MigrationRefusal,
     /// The revision being loaded.
     revision: Option<u64>,
+    /// The last revision that landed: the repository's youngest as the refusal left it (C2 stage C, a batch atomic).
+    landed: u64,
   },
   /// The owner's step refused a record the import made (A-655's), at the revision it names.
   Uncommitted {
@@ -127,7 +143,36 @@ pub(crate) enum LoadFailed {
     refusal: Uncommitted,
     /// The revision the record makes or changes.
     revision: u64,
+    /// The last revision that landed, as [`LoadFailed::Refused`]'s.
+    landed: u64,
   },
+}
+
+impl LoadFailed {
+  /// This refusal naming the last revision repository `id` landed (C2 stage C): its green's durable head, the
+  /// register's, which a batch given up never moved.
+  fn landed_in(self, state: &ShardState, id: RepositoryId) -> LoadFailed {
+    let landed = svn_commit::green_of(state, id)
+      .ok()
+      .map_or(0, |green| state.db.partition().green_head(green));
+    match self {
+      LoadFailed::Refused {
+        refusal, revision, ..
+      } => LoadFailed::Refused {
+        refusal,
+        revision,
+        landed,
+      },
+      LoadFailed::Uncommitted {
+        refusal, revision, ..
+      } => LoadFailed::Uncommitted {
+        refusal,
+        revision,
+        landed,
+      },
+      other => other,
+    }
+  }
 }
 
 /// What a finished import did.
@@ -154,6 +199,8 @@ pub(crate) enum Turned {
 enum Unit {
   /// Not at the stream's end.
   More,
+  /// A record handed over, owed its landing ([`land_owed`]).
+  Owed,
   /// At the stream's end, every record committed.
   Done,
 }
@@ -189,6 +236,11 @@ pub(crate) fn begin(
     charged: 0,
     revisions: 0,
     turns: 0,
+    owed: None,
+    base_owed: None,
+    staging: None,
+    flush_end: false,
+    flush_admission: false,
   };
   state.vcs_stores.svn_imports.insert(id, importing);
   state.count(STARTED, 1);
@@ -212,6 +264,15 @@ fn takes_import(state: &ShardState, id: RepositoryId) -> Result<(), LoadFailed> 
 /// way, what it held is given back and its file closed. `None` when no import of `id` is under way.
 pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Option<Result<Turned, LoadFailed>> {
   let mut importing = state.vcs_stores.svn_imports.remove(&id)?;
+  // A record owed its landing first, or a base owed: the import reads on only from the records it made.
+  if importing.owed.is_some()
+    || importing.base_owed.is_some()
+    || importing.flush_end
+    || importing.flush_admission
+  {
+    state.vcs_stores.svn_imports.insert(id, importing);
+    return Some(Ok(Turned::More));
+  }
   importing.turns = importing.turns.saturating_add(1);
   state.count(TURNS, 1);
   let began = slates_rt::futures::now_ns();
@@ -219,7 +280,17 @@ pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Option<Result<Tu
   let outcome = loop {
     match unit(state, id, &mut importing) {
       Ok(Unit::More) if slates_rt::futures::now_ns().saturating_sub(began) < spend => {}
-      Ok(Unit::More) => break charge_holding(state, &mut importing).map(|()| Turned::More),
+      // A record handed over ends the turn: it lands before the import reads on ([`land_owed`]).
+      Ok(Unit::More | Unit::Owed) => {
+        let charged = charge_holding(state, &mut importing);
+        // A holding the shard cannot admit while revisions are staged lands them first (C2 stage C, bounded by the
+        // import's admission): the batch's charge goes with it, and the turn after charges what is left.
+        if charged.is_err() && importing.staging.is_some() {
+          importing.flush_admission = true;
+          break Ok(Turned::More);
+        }
+        break charged.map(|()| Turned::More);
+      }
       Ok(Unit::Done) => break done(state, id, &importing).map(Turned::Done),
       Err(failed) => break Err(failed),
     }
@@ -237,7 +308,7 @@ pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Option<Result<Tu
       state.count(REFUSED, 1);
     }
   }
-  Some(outcome)
+  Some(outcome.map_err(|failed| failed.landed_in(state, id)))
 }
 
 /// One unit of the import: the file read on where the import needs more, then one call of the import over the records,
@@ -272,12 +343,108 @@ fn unit(
     Ok(Imported::Commit { consumed, record }) => {
       importing.consume(consumed);
       importing.needed = 0;
-      commit_one(state, id, importing, *record)?;
-      Ok(Unit::More)
+      importing.owed = Some(*record);
+      Ok(Unit::Owed)
+    }
+    Ok(Imported::Base { consumed, text }) => {
+      importing.consume(consumed);
+      importing.needed = 0;
+      // The base read whole from what RAM holds (the green's head text, the content store), else owed through the
+      // node's store before the import reads on.
+      match base_in_ram(state, id, &text) {
+        Some(bytes) => {
+          supply(state, id, importing, (&text, bytes))?;
+          Ok(Unit::More)
+        }
+        None => {
+          importing.base_owed = Some(text);
+          Ok(Unit::Owed)
+        }
+      }
+    }
+    // The revisions staged land before the import ends.
+    Ok(Imported::Done) if importing.staging.is_some() => {
+      importing.flush_end = true;
+      Ok(Unit::Owed)
     }
     Ok(Imported::Done) => Ok(Unit::Done),
     Err(refusal) => Err(refused(state, refusal, importing.importer.loading())),
   }
+}
+
+/// Text `text` of repository `id` whole, as its view reads it from RAM: the green's held head text, else the content
+/// store's; none where neither holds it.
+fn base_in_ram(
+  state: &mut ShardState,
+  id: RepositoryId,
+  text: &slates_svn::index::ContentIdentity,
+) -> Option<Vec<u8>> {
+  crate::vcs_store::svn_view::with_view(state, (id, None), |view| {
+    slates_svn::migration::TextSource::text(view.texts, text).map(std::borrow::Cow::into_owned)
+  })
+  .flatten()
+}
+
+/// Hands repository `id`'s import the delta base `text`'s `bytes` it asked for.
+fn supply(
+  state: &mut ShardState,
+  id: RepositoryId,
+  importing: &mut Importing,
+  (text, bytes): (&slates_svn::index::ContentIdentity, Vec<u8>),
+) -> Result<(), LoadFailed> {
+  // Charged within the room the shard lends the records, as an import's call is.
+  crate::vcs_store::lend_svn(state, id, 0);
+  let supplied = state
+    .vcs_stores
+    .subversion_records(id)
+    .map(|records| importing.importer.supply_base(records, text, bytes));
+  crate::vcs_store::settle_svn(state, id);
+  supplied
+    .ok_or(LoadFailed::NoStore)?
+    .map_err(|refusal| refused(state, refusal, importing.importer.loading()))
+}
+
+/// Brings the delta base repository `id`'s import owes whole through the node's store (C2 stage B part 2 (b)), hands it
+/// to the import and gives the content store's hold back. Refused, the import ends as a refused turn ends it. None
+/// where no import of `id` is under way or the shard's state is gone.
+pub(crate) async fn supply_owed_base(id: RepositoryId) -> Option<Result<(), LoadFailed>> {
+  let owed = crate::state::with_state(|state| {
+    let importing = state.vcs_stores.svn_imports.get_mut(&id)?;
+    let text = importing.base_owed?;
+    let len = state.vcs_stores.subversion_records(id)?.stored_len(&text)?;
+    Some((text, len))
+  })?;
+  let Some((text, len)) = owed else {
+    return Some(Ok(()));
+  };
+  let brought = super::svn_texts::bring_whole(id, text, len).await;
+  crate::state::with_state(|state| {
+    let mut importing = state.vcs_stores.svn_imports.remove(&id)?;
+    importing.base_owed = None;
+    let bytes = brought.then(|| base_in_ram(state, id, &text)).flatten();
+    if brought {
+      svn_commit::release_texts(state, None, &[text]);
+    }
+    let supplied = match bytes {
+      Some(bytes) => supply(state, id, &mut importing, (&text, bytes)),
+      None => Err(LoadFailed::Refused {
+        refusal: MigrationRefusal::Corrupt,
+        revision: importing.importer.loading(),
+        landed: 0,
+      }),
+    };
+    match supplied {
+      Ok(()) => {
+        state.vcs_stores.svn_imports.insert(id, importing);
+      }
+      Err(_) => {
+        end(state, importing);
+        state.count(REFUSED, 1);
+      }
+    }
+    Some(supplied.map_err(|failed| failed.landed_in(state, id)))
+  })
+  .flatten()
 }
 
 impl Importing {
@@ -327,40 +494,175 @@ impl Importing {
     u64::try_from(self.buffer.len())
       .unwrap_or(u64::MAX)
       .saturating_add(self.importer.holding())
+      .saturating_add(self.staging.as_ref().map_or(0, Staging::held))
   }
 }
 
-/// Commits `record`, which the import handed over, through the owner's step (the module doc): a revision as a client's
-/// commit is, counted; the UUID or a revision's properties as a record that moves no version.
-fn commit_one(
+/// Lands the record repository `id`'s import handed over last, if one is owed (the module doc): a revision as a
+/// client's commit lands one (`svn_commit::land_revision`: checked, landed on the node's store, then the green's next
+/// version), counted; the UUID or a revision's properties as a record that moves no version
+/// (`svn_commit::land_record`). Refused, the import ends as a refused turn ends it. None where no import of `id` is
+/// under way or the shard's state is gone.
+pub(crate) async fn land_owed(id: RepositoryId) -> Option<Result<(), LoadFailed>> {
+  let owed = crate::state::with_state(|state| {
+    let importing = state.vcs_stores.svn_imports.get_mut(&id)?;
+    let flush = if core::mem::take(&mut importing.flush_admission) {
+      Some(Flush::Admission)
+    } else {
+      core::mem::take(&mut importing.flush_end).then_some(Flush::End)
+    };
+    Some((
+      importing.owed.take(),
+      flush,
+      importing.principal.clone(),
+      importing.staging.take(),
+    ))
+  })??;
+  let (record, flush, principal, mut staging) = owed;
+  let landed = owed_landed((&principal, id), record, flush, &mut staging).await?;
+  crate::state::with_state(|state| owed_settled(state, id, staging, landed))
+}
+
+/// Lands `record`, the import's owed record, or flushes `staging` at the stream's end or a holding not admitted:
+/// whether a revision landed. None where the shard's state is gone.
+async fn owed_landed(
+  (principal, id): (&Principal, RepositoryId),
+  record: Option<Record>,
+  flush: Option<Flush>,
+  staging: &mut Option<Staging>,
+) -> Option<Result<bool, LoadFailed>> {
+  Some(match (record, flush) {
+    (Some(Record::Revision(revision)), _) => {
+      let number = revision.head.saturating_add(1);
+      stage_owed((principal, id), staging, revision)
+        .await?
+        .map(|()| true)
+        .map_err(|refusal| load_failed(refusal, number))
+    }
+    (Some(other), _) => unversioned_landed((principal, id), other, staging).await?,
+    // The stream's end, or a holding not admitted: the revisions staged land before the import answers or reads on.
+    (None, Some(cause)) => match staging.take() {
+      Some(batch) => batch
+        .land(principal, cause)
+        .await?
+        .map(|_| false)
+        .map_err(|refusal| load_failed(refusal, 0)),
+      None => Ok(false),
+    },
+    (None, None) => Ok(false),
+  })
+}
+
+/// Lands `record`, a record that moves no version, after the revisions staged before it.
+async fn unversioned_landed(
+  (principal, id): (&Principal, RepositoryId),
+  record: Record,
+  staging: &mut Option<Staging>,
+) -> Option<Result<bool, LoadFailed>> {
+  let revision = match &record {
+    Record::RevisionProperties { revision, .. } => *revision,
+    _ => 0,
+  };
+  let flushed = match staging.take() {
+    Some(batch) => batch.land(principal, Flush::End).await?.map(drop),
+    None => Ok(()),
+  };
+  Some(match flushed {
+    Ok(()) => svn_commit::land_record((principal, id), record)
+      .await?
+      .map(|()| false)
+      .map_err(|refusal| load_failed(refusal, revision)),
+    Err(refusal) => Err(load_failed(refusal, revision)),
+  })
+}
+
+/// The import's failure for a landing of `revision` refused.
+fn load_failed(refusal: Uncommitted, revision: u64) -> LoadFailed {
+  match refusal {
+    Uncommitted::Budget { available } => LoadFailed::Budget { available },
+    refusal => LoadFailed::Uncommitted {
+      refusal,
+      revision,
+      landed: 0,
+    },
+  }
+}
+
+/// Settles a landing of `id`'s owed record on the shard: landed, its staging kept on the import (or abandoned where the
+/// import is gone) and a revision counted; refused, the staging abandoned and the import ended as refused.
+fn owed_settled(
   state: &mut ShardState,
   id: RepositoryId,
-  importing: &mut Importing,
-  record: Record,
+  staging: Option<Staging>,
+  landed: Result<bool, LoadFailed>,
 ) -> Result<(), LoadFailed> {
-  let principal = importing.principal.clone();
-  let failed = |refusal: Uncommitted, revision: u64| match refusal {
-    Uncommitted::Budget { available } => LoadFailed::Budget { available },
-    refusal => LoadFailed::Uncommitted { refusal, revision },
-  };
-  match record {
-    Record::Revision(revision) => {
-      let number = revision.head.saturating_add(1);
-      svn_commit::commit(state, (&principal, id), revision, None)
-        .map_err(|refusal| failed(refusal, number))?;
-      importing.revisions = importing.revisions.saturating_add(1);
-      state.count(REVISIONS, 1);
+  match landed {
+    Ok(revision) => {
+      match state.vcs_stores.svn_imports.get_mut(&id) {
+        Some(importing) => {
+          importing.staging = staging;
+          if revision {
+            importing.revisions = importing.revisions.saturating_add(1);
+          }
+        }
+        None => {
+          if let Some(staging) = staging {
+            staging.abandon(state);
+          }
+        }
+      }
+      if revision {
+        state.count(REVISIONS, 1);
+      }
+      Ok(())
     }
-    other => {
-      let revision = match &other {
-        Record::RevisionProperties { revision, .. } => *revision,
-        _ => 0,
-      };
-      svn_commit::record(state, (&principal, id), other)
-        .map_err(|refusal| failed(refusal, revision))?;
+    Err(failed) => {
+      if let Some(staging) = staging {
+        staging.abandon(state);
+      }
+      if let Some(importing) = state.vcs_stores.svn_imports.remove(&id) {
+        end(state, importing);
+        state.count(REFUSED, 1);
+      }
+      Err(failed.landed_in(state, id))
     }
   }
-  Ok(())
+}
+
+/// Stages an imported `revision` in `staging`'s batch, landing the batch first where the revision's charge would not be
+/// admitted or the changeset is full (`Staging::due_before`), and beginning one where none is under way (C2 stage C).
+/// Refused, the batch is given up. None where the shard's state is gone.
+async fn stage_owed(
+  (principal, id): (&Principal, RepositoryId),
+  staging: &mut Option<Staging>,
+  revision: slates_svn::commit::revision::Revision,
+) -> Option<Result<(), Uncommitted>> {
+  let due = staging.as_ref().and_then(|batch| {
+    crate::state::with_state(|state| batch.due_before(state, &revision)).flatten()
+  });
+  if let Some(cause) = due
+    && let Some(batch) = staging.take()
+    && let Err(refused) = batch.land(principal, cause).await?
+  {
+    return Some(Err(refused));
+  }
+  let mut batch = match staging.take() {
+    Some(batch) => batch,
+    None => match Staging::begin(id).await? {
+      Ok(batch) => batch,
+      Err(refused) => return Some(Err(refused)),
+    },
+  };
+  match batch.stage(revision).await? {
+    Ok(()) => {
+      *staging = Some(batch);
+      Some(Ok(()))
+    }
+    Err(refused) => {
+      let _ = crate::state::with_state(|state| batch.abandon(state));
+      Some(Err(refused))
+    }
+  }
 }
 
 /// The import's refusal of the stream, at `revision`: past the records' room it is the shard's budget that could not
@@ -370,7 +672,11 @@ fn refused(state: &ShardState, refusal: MigrationRefusal, revision: Option<u64>)
     MigrationRefusal::Room { .. } => LoadFailed::Budget {
       available: state.store.admittable(),
     },
-    refusal => LoadFailed::Refused { refusal, revision },
+    refusal => LoadFailed::Refused {
+      refusal,
+      revision,
+      landed: 0,
+    },
   }
 }
 
@@ -410,6 +716,10 @@ fn done(state: &ShardState, id: RepositoryId, importing: &Importing) -> Result<L
 
 /// Ends an import: what it charged given back, its file and directory closed, its host let go.
 fn end(state: &mut ShardState, mut importing: Importing) {
+  // Revisions staged and never landed are given up: the records made again from what the register names.
+  if let Some(staging) = importing.staging.take() {
+    staging.abandon(state);
+  }
   state.store.budget.credit_retention(importing.charged);
   importing.host.close_file(importing.file);
   importing.host.close_dir(importing.directory);
@@ -430,6 +740,12 @@ pub(crate) fn abandon(state: &mut ShardState, id: RepositoryId) {
 pub(crate) async fn run(id: RepositoryId) -> Option<Result<Loaded, LoadFailed>> {
   loop {
     slates_rt::futures::yield_now().await;
+    if let Err(failed) = land_owed(id).await? {
+      return Some(Err(failed));
+    }
+    if let Err(failed) = supply_owed_base(id).await? {
+      return Some(Err(failed));
+    }
     let turned = crate::state::with_state(|state| turn(state, id))??;
     match turned {
       Ok(Turned::More) => {}

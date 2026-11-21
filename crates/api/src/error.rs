@@ -341,6 +341,9 @@ pub enum Stale {
     /// The newer presentation.
     newer: u64,
   },
+  /// A merge check whose work changed or whose green's head moved since (A-796): nothing was read or changed. Check
+  /// again.
+  MergeView,
   /// A grant missing, expired or revoked.
   Grant,
   /// The disk changed under these entries after the plan was made (§4.15 step 4): present again.
@@ -871,6 +874,7 @@ impl Error {
       Refusal::AttachmentExpired { attachment } => Error::Stale(Stale::Attachment { attachment }),
       Refusal::GrantMismatch => Error::Stale(Stale::Approval),
       Refusal::LandingSuperseded { newer } => Error::Stale(Stale::Superseded { newer }),
+      Refusal::StaleMergeView => Error::Stale(Stale::MergeView),
       Refusal::PolicyChanged { current } => Error::Stale(Stale::Policy { current }),
       Refusal::VerdictReplaced { work } => Error::Stale(Stale::Verdict { work }),
       Refusal::GrantInvalid => Error::Stale(Stale::Grant),

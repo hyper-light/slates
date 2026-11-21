@@ -33,10 +33,10 @@ use crate::read::{Cursor, to_u64};
 use crate::{Admission, Node, PastAdmission, Truncated};
 
 /// Format: a chunk's length counts its own four bytes (`chunkheader`: `length + 4`).
-const LENGTH_LEN: usize = 4;
+pub(crate) const LENGTH_LEN: usize = 4;
 
 /// Format: the length of an empty chunk, which ends a group or a list (`closechunk`).
-const EMPTY: i32 = 0;
+pub(crate) const EMPTY: i32 = 0;
 
 /// Format: version 01's delta header: node, p1, p2 and link node, 20 bytes each (`>20s20s20s20s`).
 const V01_HEADER: usize = 80;
@@ -275,107 +275,28 @@ pub enum EncodeRefusal {
   Range,
 }
 
-/// Which part of the changegroup a group belongs to.
-#[derive(Clone, Copy)]
-enum List {
-  /// The changelog's group.
-  Changelog,
-  /// The manifest's group.
-  Manifests,
-  /// A tree manifest's group.
-  Trees,
-  /// A file's group.
-  Files,
-}
-
-/// Where a walk puts what it finds: the counting pass and the building pass.
-trait Sink<'a> {
-  /// A revision.
-  fn revision(&mut self, revision: Revision<'a>);
-  /// The end of a group of `list`, named `name` (empty for the changelog's and the manifest's).
-  fn end(&mut self, list: List, name: &'a [u8]);
-}
-
-/// The counting pass.
-#[derive(Default)]
-struct Count {
-  /// Revisions.
-  revisions: usize,
-  /// Tree groups.
-  trees: usize,
-  /// File groups.
-  files: usize,
-}
-
-impl<'a> Sink<'a> for Count {
-  fn revision(&mut self, _revision: Revision<'a>) {
-    self.revisions = self.revisions.saturating_add(1);
-  }
-
-  fn end(&mut self, list: List, _name: &'a [u8]) {
-    match list {
-      List::Trees => self.trees = self.trees.saturating_add(1),
-      List::Files => self.files = self.files.saturating_add(1),
-      List::Changelog | List::Manifests => {}
-    }
-  }
-}
-
-/// The building pass, into vectors the counting pass sized.
-struct Build<'a> {
-  /// The revisions.
-  revisions: Vec<Revision<'a>>,
-  /// The tree groups.
-  trees: Vec<Group<'a>>,
-  /// The file groups.
-  files: Vec<Group<'a>>,
-  /// Where the current group's revisions begin.
-  start: usize,
-  /// The changelog's range, once ended.
-  changelog: Range<usize>,
-  /// The manifest's range, once ended.
-  manifests: Range<usize>,
-}
-
-impl<'a> Sink<'a> for Build<'a> {
-  fn revision(&mut self, revision: Revision<'a>) {
-    self.revisions.push(revision);
-  }
-
-  fn end(&mut self, list: List, name: &'a [u8]) {
-    let revisions = self.start..self.revisions.len();
-    self.start = self.revisions.len();
-    match list {
-      List::Changelog => self.changelog = revisions,
-      List::Manifests => self.manifests = revisions,
-      List::Trees => self.trees.push(Group { name, revisions }),
-      List::Files => self.files.push(Group { name, revisions }),
-    }
-  }
-}
-
 impl<'a> Changegroup<'a> {
-  /// Decodes a changegroup of `version`: walked once to check and count it, the exact total charged to `admission`,
-  /// and walked again to build.
+  /// Decodes a changegroup of `version`: framed once to check and count it (`crate::framing::Framing`, the one walk of
+  /// a changegroup's chunks, each plain delta checked), the exact total charged to `admission`, and framed again to
+  /// build over `input`.
   pub fn decode(
     input: &'a [u8],
     version: Version,
     admission: &mut Admission,
   ) -> Result<Self, Refusal> {
-    let cursor = Cursor::new(input);
     let mut count = Count::default();
-    walk(&mut cursor.clone(), version, &mut count)?;
+    frame_whole(input, version, true, &mut count)?;
     admission.charge_items::<Revision<'_>>(count.revisions)?;
-    admission.charge_items::<Group<'_>>(count.trees.saturating_add(count.files))?;
+    admission.charge_items::<Group<'_>>(count.groups)?;
     let mut build = Build {
+      input,
       revisions: Vec::with_capacity(count.revisions),
-      trees: Vec::with_capacity(count.trees),
-      files: Vec::with_capacity(count.files),
-      start: 0,
+      trees: Vec::new(),
+      files: Vec::with_capacity(count.groups),
       changelog: 0..0,
       manifests: 0..0,
     };
-    walk(&mut cursor.clone(), version, &mut build)?;
+    frame_whole(input, version, false, &mut build)?;
     Ok(Self {
       version,
       revisions: build.revisions,
@@ -434,85 +355,120 @@ impl<'a> Changegroup<'a> {
   }
 }
 
-/// Walks the changelog's group, the manifest's, the tree list from version 03, the file list, and requires the input
-/// to end where the changegroup does.
-fn walk<'a>(
-  cursor: &mut Cursor<'a>,
+/// Frames the whole changegroup `input` into `sink`, checking each plain delta where `check`.
+fn frame_whole(
+  input: &[u8],
   version: Version,
-  sink: &mut impl Sink<'a>,
+  check: bool,
+  sink: &mut impl crate::framing::Sink,
 ) -> Result<(), Refusal> {
-  group(cursor, version, sink)?;
-  sink.end(List::Changelog, &[]);
-  group(cursor, version, sink)?;
-  sink.end(List::Manifests, &[]);
-  if version.has_tree_list() {
-    list(cursor, version, List::Trees, sink)?;
-  }
-  list(cursor, version, List::Files, sink)?;
-  if cursor.is_done() {
-    Ok(())
-  } else {
-    Err(Refusal::TrailingBytes {
-      bytes: to_u64(cursor.left()),
-    })
-  }
-}
-
-/// Walks a list of named groups, to its empty chunk.
-fn list<'a>(
-  cursor: &mut Cursor<'a>,
-  version: Version,
-  kind: List,
-  sink: &mut impl Sink<'a>,
-) -> Result<(), Refusal> {
-  while let Some(name) = chunk(cursor, "group name")? {
-    group(cursor, version, sink)?;
-    sink.end(kind, name);
-  }
-  Ok(())
-}
-
-/// Walks one group's delta chunks, to its empty chunk, each with version 05's sidedata chunk where its flag says so.
-fn group<'a>(
-  cursor: &mut Cursor<'a>,
-  version: Version,
-  sink: &mut impl Sink<'a>,
-) -> Result<(), Refusal> {
-  let mut previous: Option<Node> = None;
-  while let Some(body) = chunk(cursor, "delta chunk")? {
-    let mut revision = parse(body, version, previous)?;
-    if version == Version::V05 && revision.protocol_flags & FLAG_SIDEDATA != 0 {
-      revision.sidedata = Some(chunk(cursor, "sidedata chunk")?.unwrap_or_default());
+  let mut framing = crate::framing::Framing::new(version, check);
+  loop {
+    match framing.step(input, sink) {
+      Ok(true) => {}
+      Ok(false) => return Ok(()),
+      Err(crate::framing::Halt::Refused(refusal)) => return Err(refusal),
+      // A slice holds every byte of itself: a want names bytes past its end.
+      Err(crate::framing::Halt::Wanted(wanted)) => return Err(past_end(input, &wanted)),
     }
-    previous = Some(revision.node);
-    sink.revision(revision);
   }
-  Ok(())
 }
 
-/// One chunk's data, or `None` for the empty chunk.
-fn chunk<'a>(cursor: &mut Cursor<'a>, what: &'static str) -> Result<Option<&'a [u8]>, Refusal> {
-  let value = cursor.i32(what)?;
-  if value == EMPTY {
-    return Ok(None);
-  }
-  let body = usize::try_from(value)
-    .ok()
-    .and_then(|len| len.checked_sub(LENGTH_LEN))
-    .filter(|body| *body > 0)
-    .ok_or(Refusal::ChunkLength { value })?;
-  Ok(Some(cursor.take(body, what)?))
+/// The counting walk: how many revisions and named groups.
+#[derive(Default)]
+struct Count {
+  /// Revisions.
+  revisions: usize,
+  /// Tree and file groups.
+  groups: usize,
 }
 
-/// One delta chunk: its version's header, then the delta (or full text), checked when it is plain hunks.
-fn parse(body: &[u8], version: Version, previous: Option<Node>) -> Result<Revision<'_>, Refusal> {
-  if body.len() < version.header_len() {
-    return Err(Refusal::ShortChunk {
-      len: to_u64(body.len()),
-      header: to_u64(version.header_len()),
-    });
+impl crate::framing::Sink for Count {
+  fn revision(&mut self, _placed: crate::framing::Placed) -> Result<(), Refusal> {
+    self.revisions = self.revisions.saturating_add(1);
+    Ok(())
   }
-  let mut cursor = Cursor::new(body);
+
+  fn group(
+    &mut self,
+    kind: crate::framing::GroupKind,
+    _name: Range<u64>,
+    _revisions: Range<usize>,
+  ) -> Result<(), Refusal> {
+    if matches!(
+      kind,
+      crate::framing::GroupKind::Tree | crate::framing::GroupKind::File
+    ) {
+      self.groups = self.groups.saturating_add(1);
+    }
+    Ok(())
+  }
+}
+
+/// The building walk, over the whole changegroup, into vectors the counting walk sized.
+struct Build<'a> {
+  /// The changegroup's bytes.
+  input: &'a [u8],
+  /// The revisions.
+  revisions: Vec<Revision<'a>>,
+  /// The tree groups.
+  trees: Vec<Group<'a>>,
+  /// The file groups.
+  files: Vec<Group<'a>>,
+  /// The changelog's range, once ended.
+  changelog: Range<usize>,
+  /// The manifest's range, once ended.
+  manifests: Range<usize>,
+}
+
+impl crate::framing::Sink for Build<'_> {
+  fn revision(&mut self, placed: crate::framing::Placed) -> Result<(), Refusal> {
+    let input = self.input;
+    let revision = placed
+      .revision(input)
+      .map_err(|wanted| past_end(input, &wanted))?;
+    self.revisions.push(revision);
+    Ok(())
+  }
+
+  fn group(
+    &mut self,
+    kind: crate::framing::GroupKind,
+    name: Range<u64>,
+    revisions: Range<usize>,
+  ) -> Result<(), Refusal> {
+    let input = self.input;
+    let name =
+      crate::framing::Source::bytes(input, name).map_err(|wanted| past_end(input, &wanted))?;
+    match kind {
+      crate::framing::GroupKind::Changelog => self.changelog = revisions,
+      crate::framing::GroupKind::Manifests => self.manifests = revisions,
+      crate::framing::GroupKind::Tree => self.trees.push(Group { name, revisions }),
+      crate::framing::GroupKind::File => self.files.push(Group { name, revisions }),
+    }
+    Ok(())
+  }
+}
+
+/// The refusal for bytes a whole changegroup's framing named past its end, which a slice cannot want: a truncation.
+fn past_end(input: &[u8], wanted: &crate::framing::Wanted) -> Refusal {
+  Refusal::Truncated(Truncated {
+    what: "changegroup",
+    at: wanted.range.start,
+    needed: wanted.range.end.saturating_sub(wanted.range.start),
+    left: to_u64(input.len()).saturating_sub(wanted.range.start),
+  })
+}
+
+/// A delta chunk's header, exactly its version's length (`header`), as a revision with no data yet: the one reading of
+/// a header, a whole changegroup's ([`Changegroup::decode`]) and a framing's a chunk at a time
+/// (`crate::framing::Framing`).
+pub(crate) fn parse_header(
+  header: &[u8],
+  version: Version,
+  previous: Option<Node>,
+) -> Result<Revision<'static>, Refusal> {
+  let mut cursor = Cursor::new(header);
   let leading_flags = if version == Version::V05 {
     cursor.u8("protocol flags")?
   } else {
@@ -538,7 +494,7 @@ fn parse(body: &[u8], version: Version, previous: Option<Node>) -> Result<Revisi
   } else {
     (None, leading_flags)
   };
-  let revision = Revision {
+  Ok(Revision {
     node,
     p1,
     p2,
@@ -547,11 +503,9 @@ fn parse(body: &[u8], version: Version, previous: Option<Node>) -> Result<Revisi
     flags,
     info,
     protocol_flags,
-    data: cursor.rest(),
+    data: &[],
     sidedata: None,
-  };
-  check_data(&revision)?;
-  Ok(revision)
+  })
 }
 
 /// Version 04's fields after the revision flags: the delta information and the protocol flags between them.
@@ -575,7 +529,7 @@ fn parse_info(cursor: &mut Cursor<'_>) -> Result<(DeltaInfo, u8), Truncated> {
 }
 
 /// Checks a revision's delta by mpatch's decoding rules when it travels as plain hunks.
-fn check_data(revision: &Revision<'_>) -> Result<(), Refusal> {
+pub(crate) fn check_data(revision: &Revision<'_>) -> Result<(), Refusal> {
   if revision.is_plain_delta() {
     delta::check(revision.data).map_err(|refusal| Refusal::Delta {
       node: revision.node,
@@ -625,6 +579,35 @@ pub(crate) fn put_revision(
   put_chunk_length(out, header.len().saturating_add(revision.data.len()))?;
   out.put(&header);
   out.put(revision.data);
+  if let Some(sidedata) = revision.sidedata {
+    put_sidedata(out, sidedata)?;
+  }
+  Ok(())
+}
+
+/// Appends one revision's chunk whose delta is its whole text against the null base, `revision.data` the text: the
+/// full-text hunk's header written straight before the text, so a whole text is copied once, into `out`, never first
+/// into a delta of its own (Ada's no-allocation rule; a clone sends every file revision so).
+pub(crate) fn put_revision_whole(
+  revision: &Revision<'_>,
+  version: Version,
+  out: &mut Vec<u8>,
+) -> Result<(), EncodeRefusal> {
+  if version == Version::V01 {
+    return Err(EncodeRefusal::Unencodable {
+      node: revision.node,
+      reason: "a changegroup written a revision at a time names each delta's base",
+    });
+  }
+  check_encodable(revision, version, None)?;
+  let header = header_bytes(revision, version);
+  let delta_len = crate::delta::HUNK_HEADER_LEN.saturating_add(revision.data.len());
+  put_chunk_length(out, header.len().saturating_add(delta_len))?;
+  out.put(&header);
+  crate::delta::encode_full_text(revision.data, out).map_err(|_| EncodeRefusal::Unencodable {
+    node: revision.node,
+    reason: "a whole text past a hunk's length",
+  })?;
   if let Some(sidedata) = revision.sidedata {
     put_sidedata(out, sidedata)?;
   }

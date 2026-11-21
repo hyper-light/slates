@@ -723,7 +723,10 @@ impl ClientEnd {
   /// The wait both forms share: the spin, then one park at a time until the reply, the end `ends` names, or a refusal.
   fn wait_ending(&mut self, ends: Ends) -> Result<Waited, IpcError> {
     let started = Instant::now();
-    let spin_ns = self.spin_override_ns.unwrap_or_else(|| self.wake.mean_ns());
+    // A caller that names a spin gets it; by default the wait parks at once (A-799): a client spinning for its reply holds
+    // the CPU the shard it just woke needs whenever the cores are all busy, so the shard ran only when the spin ended
+    // (the loaded edit-and-merge p99 followed the spin: 1.7-5.1 ms on the wake estimate's spin, 0.32-0.39 ms parked).
+    let spin_ns = self.spin_override_ns.unwrap_or(0);
     loop {
       if let Some(reply) = self.try_take()? {
         return Ok(Waited::Reply(reply));
@@ -768,6 +771,7 @@ impl ClientEnd {
       return Ok(Some(Waited::Reply(reply)));
     }
     self.parks = self.parks.saturating_add(1);
+    real_time_once(u64::from(self.region.spin_ns()));
     let switches_before = slates_machine::switches::switches_now();
     let waiting_ns = slates_machine::clock::monotonic_ns();
     let parked = match ends {
@@ -2270,4 +2274,24 @@ mod tests {
     drop(dup);
     drop(client);
   }
+}
+
+thread_local! {
+  /// Whether this thread has asked for the time-constraint policy ([`real_time_once`]).
+  static REAL_TIME_ASKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Puts the calling thread, which parks for its reply (A-799), in macOS's real-time band, once per thread (A-831,
+/// `slates_machine::time_constraint`): woken by its reply behind busy time-share neighbours, it ran only when their
+/// quanta ended. Its computation is the daemon's published window, doubled until the kernel takes it. A thread that
+/// later runs long is demoted by the kernel, not harmed. Off macOS nothing is asked.
+fn real_time_once(window_ns: u64) {
+  if !cfg!(target_os = "macos") {
+    return;
+  }
+  REAL_TIME_ASKED.with(|asked| {
+    if !asked.replace(true) {
+      let _ = slates_machine::time_constraint::set_current_from(window_ns);
+    }
+  });
 }

@@ -65,9 +65,10 @@
 //! one past a window, is deflated a window a unit, and so is a delta found for one); a window of an object past a
 //! window, or of a candidate base, read for its search, or a step of the search over the two, a window's bytes at most;
 //! one object at most a window long encoded, its delta trials within the learned window; a window's worth of the
-//! answer's handles read; one object of a run judged by its row; a window's worth of a part's wanted positions marked
-//! among its entries, each found by halving the part's entries in position order, so a part's reading costs what it
-//! sends and never the whole part; one wanted entry of a part judged; one object still wanted offered its version's
+//! answer's handles read; one object of a run judged by its row; a part's wanted positions marked among its entries
+//! until a window's bytes of the part's entries in position order are read (each read an entry of the order and the
+//! entry it names), each found by galloping ahead from where the
+//! last was (the positions come ascending), so a part's reading costs what it sends and never the whole part; one wanted entry of a part judged; one object still wanted offered its version's
 //! parts. So no unit outgrows a window and the learned window's trials, and nothing is held whole but what a search
 //! holds, an object past a window and a candidate, while the request's admission holds them (**What it sends** 3):
 //! between turns the stream holds no borrow of the store or the repository, names what it reads by green, version,
@@ -94,6 +95,7 @@ use super::deltas::{Search, SearchStep, delta_most};
 use super::fragment::{self, Encoder, FragmentRefused, Learning, Placed, Stored, ToEncode};
 use super::learn::{Clock, Exchange, Levels, Window};
 use super::positions::Positions;
+use super::push::StoredAt;
 use super::repository::{Kept, Repository, StoreRefused};
 use super::rows::ObjectRow;
 
@@ -173,11 +175,18 @@ pub struct UploadCounters {
   /// Objects past a window no part covered that had a candidate base, sent whole because the request's admission
   /// could not hold their search (module docs, **What it sends** 3); each is counted in `loose_whole` too.
   pub loose_unsearched: u64,
+  /// The most of the answer's kept units (runs, listed positions or table words) one unit of reading its objects read:
+  /// a window's worth at most, however many the answer holds (module docs, **Slices**).
+  pub objects_read_most: u64,
+  /// The most of a part's entries in position order one unit of marking its wanted entries read: a window's worth of
+  /// handles at most, however many entries the part holds (module docs, **Slices**).
+  pub marks_read_most: u64,
 }
 
 /// Where the stream is (module docs).
 enum Stage {
-  /// Reading the answer's objects into the wanted set, from the one at `next`.
+  /// Reading the answer's objects into the wanted set, from its kept unit `next` (a run, a listed position or a table
+  /// word, as its form keeps them).
   Objects { next: usize },
   /// Gathering run `run`'s version `version`'s objects the filter sends, from position `from` on.
   Gather { run: usize, version: u64, from: u64 },
@@ -259,10 +268,13 @@ enum Chosen {
   /// Every one: the whole part is wanted.
   Every,
   /// Those marked, a bit an entry by its index, marked from the wanted positions first, from `marking` on, a window's
-  /// worth of handles a unit; `marking` is `None` once every one is marked.
+  /// worth of the part's entries in position order read a unit; `marking` is `None` once every one is marked. Each is
+  /// found ahead of `cursor`, where the one before it was, in the part's position order: the positions come ascending,
+  /// so the search never goes back and all the marking costs what it marks.
   Marked {
     bits: Vec<u64>,
     marking: Option<u64>,
+    cursor: usize,
   },
 }
 
@@ -289,6 +301,8 @@ struct Deflating {
 enum Deflated {
   /// A kept content.
   Content(ContentId),
+  /// An object read whole where it lies in its pack (A-722's record v4): its bytes, kept for its deflate's windows.
+  Read(Vec<u8>),
   /// A delta the stream made, and the admission's hold on what its search kept, given back after its last window.
   Made { delta: Vec<u8>, hold: Hold },
 }
@@ -299,7 +313,7 @@ struct Large {
   id: ObjectId,
   kind: Kind,
   len: u64,
-  content: ContentId,
+  stored: StoredAt,
   /// Where its entry begins in the pack.
   at: u64,
   /// Its delta chain's depth.
@@ -310,7 +324,7 @@ struct Large {
 /// each candidate's, each searched a window's bytes a unit; the smallest delta shorter than the object wins.
 struct Searching {
   /// The object.
-  target: (ObjectId, ObjectRow, ContentId),
+  target: (ObjectId, ObjectRow, StoredAt),
   /// The admission's hold on everything the search keeps.
   hold: Hold,
   /// The object's bytes read so far.
@@ -509,19 +523,20 @@ impl<A: Answered> Upload<A> {
     }
   }
 
-  /// Reads a window's worth of the answer's runs of objects into the wanted set, a run `size_of::<(u64, u64)>()` bytes
-  /// (A-745: the answer carries its objects as runs, so a clone's few runs are read at once whatever it holds).
+  /// Reads a window's worth of the answer's objects into the wanted set: its kept units from unit `next` on (its runs,
+  /// listed positions or table words, whichever its form keeps), copied as they are kept, so a unit reads its window
+  /// and never the set again (A-745 item 4), and the wanted set ends equal to the answer's, in its form. A unit
+  /// `size_of::<u64>()` bytes at least, so a clone's few runs are read at once whatever it holds.
   fn read_objects(&mut self, cx: &Context<'_>, next: usize) -> Result<Stage, StoreRefused> {
     let handles = handles(cx.store);
-    let runs = self.answer.objects().run_pairs();
-    let end = next.saturating_add(handles).min(runs.len());
-    let window =
-      Positions::from_runs(runs.get(next..end).unwrap_or_default().to_vec()).unwrap_or_default();
-    self.wanted = self.wanted.union(&window);
-    if end < runs.len() {
-      return Ok(Stage::Objects { next: end });
+    let (after, read) = self
+      .wanted
+      .copy_window(self.answer.objects(), next, handles);
+    self.counters.objects_read_most = self.counters.objects_read_most.max(to_u64(read));
+    match after {
+      Some(next) => Ok(Stage::Objects { next }),
+      None => self.gather_from(0),
     }
-    self.gather_from(0)
   }
 
   /// Gathering run `run` from its first version; once every run is gathered, the wanted set made whole and counted.
@@ -688,6 +703,7 @@ impl<A: Answered> Upload<A> {
       Chosen::Marked {
         bits: vec![0; words],
         marking: Some(0),
+        cursor: 0,
       }
     };
     self.by_entry = Some(ByEntry {
@@ -719,10 +735,22 @@ impl<A: Answered> Upload<A> {
     out: &mut impl Out,
   ) -> Result<Option<ByEntry>, StoreRefused> {
     let kept = part_of(cx.repository, by_entry.source)?;
-    if let Chosen::Marked { bits, marking } = &mut by_entry.chosen
+    if let Chosen::Marked {
+      bits,
+      marking,
+      cursor,
+    } = &mut by_entry.chosen
       && let Some(from) = *marking
     {
-      *marking = mark(kept, &by_entry.keep, bits, from, handles(cx.store));
+      let mut read = 0;
+      *marking = mark(
+        kept,
+        &by_entry.keep,
+        bits,
+        (from, cursor),
+        (marking_reads(cx.store), &mut read),
+      );
+      self.counters.marks_read_most = self.counters.marks_read_most.max(to_u64(read));
       return Ok(Some(by_entry));
     }
     let Some(index) = by_entry.chosen.next_at(by_entry.next, kept.placed.len()) else {
@@ -847,7 +875,7 @@ impl<A: Answered> Upload<A> {
   fn send_whole(
     &mut self,
     cx: &mut Context<'_>,
-    (id, row, content): (ObjectId, ObjectRow, ContentId),
+    (id, row, stored): (ObjectId, ObjectRow, StoredAt),
     out: &mut impl Out,
   ) -> Result<Pending, StoreRefused> {
     let mut written = Vec::new();
@@ -856,10 +884,23 @@ impl<A: Answered> Upload<A> {
       size: row.len,
     };
     entry::write(header, self.at, &mut written).map_err(entry_refused)?;
-    let first = cx
-      .store
-      .window_at(&content, row.len, 0)
-      .ok_or(StoreRefused::Unreadable { id })?;
+    let (first, from) = match stored {
+      StoredAt::Whole(content) => (
+        cx.store
+          .window_at(&content, row.len, 0)
+          .ok_or(StoreRefused::Unreadable { id })?,
+        Deflated::Content(content),
+      ),
+      StoredAt::InPack(_) => {
+        let bytes = cx
+          .repository
+          .read_stored(cx.store, &stored, row.len)
+          .ok_or(StoreRefused::Unreadable { id })?
+          .into_owned();
+        let first = bytes.get(..cx.store.window()).unwrap_or(&bytes).to_vec();
+        (Cow::Owned(first), Deflated::Read(bytes))
+      }
+    };
     let mut learning = Learning {
       window: &mut self.window,
       levels: &mut self.levels,
@@ -869,7 +910,7 @@ impl<A: Answered> Upload<A> {
     let level = fragment::level(row.kind, &first, &mut learning).map_err(StoreRefused::Encoding)?;
     self.emit(&written, out);
     Ok(Pending::Deflate(Deflating {
-      from: Deflated::Content(content),
+      from,
       len: row.len,
       next: 0,
       compress: Compress::new(Compression::new(level), true),
@@ -949,7 +990,9 @@ impl<A: Answered> Upload<A> {
         .store
         .window_at(content, deflating.len, deflating.next)
         .ok_or(StoreRefused::FragmentUnreadable)?,
-      Deflated::Made { delta, .. } => Cow::Borrowed(made_window(delta, window, deflating.next)?),
+      Deflated::Made { delta, .. } | Deflated::Read(delta) => {
+        Cow::Borrowed(made_window(delta, window, deflating.next)?)
+      }
     };
     let last = deflating.next.saturating_add(1) >= windows;
     let given = fragment::deflate_more(&mut deflating.compress, &bytes, last)
@@ -1058,18 +1101,19 @@ impl<A: Answered> Upload<A> {
       return Ok(Stage::Trailer);
     };
     self.entries = self.entries.saturating_add(1);
-    let (id, row, content) = cx.repository.stored_at(cx.store, position)?;
+    let (id, row, stored) = cx.repository.stored_at(cx.store, position)?;
     let next = Stage::Loose {
       from: position.saturating_add(1),
     };
     if row.len > to_u64(cx.store.window()) {
-      self.pending = Some(self.loose_large(cx, (id, row, content), out)?);
+      self.pending = Some(self.loose_large(cx, (id, row, stored), out)?);
       return Ok(next);
     }
     let bytes = cx
-      .store
-      .object_bytes(&content, row.len)
-      .ok_or(StoreRefused::Unreadable { id })?;
+      .repository
+      .read_stored(cx.store, &stored, row.len)
+      .ok_or(StoreRefused::Unreadable { id })?
+      .into_owned();
     let object = ToEncode {
       id,
       position,
@@ -1102,7 +1146,7 @@ impl<A: Answered> Upload<A> {
   fn loose_large(
     &mut self,
     cx: &mut Context<'_>,
-    target: (ObjectId, ObjectRow, ContentId),
+    target: (ObjectId, ObjectRow, StoredAt),
     out: &mut impl Out,
   ) -> Result<Pending, StoreRefused> {
     let candidates = self.candidates(target.1.kind, cx.exchange);
@@ -1126,7 +1170,7 @@ impl<A: Answered> Upload<A> {
   fn large_whole(
     &mut self,
     cx: &mut Context<'_>,
-    target: (ObjectId, ObjectRow, ContentId),
+    target: (ObjectId, ObjectRow, StoredAt),
     out: &mut impl Out,
   ) -> Result<Pending, StoreRefused> {
     self.counters.loose_whole = self.counters.loose_whole.saturating_add(1);
@@ -1134,7 +1178,7 @@ impl<A: Answered> Upload<A> {
       id: target.0,
       kind: target.1.kind,
       len: target.1.len,
-      content: target.2,
+      stored: target.2,
       at: self.at,
       depth: 0,
     };
@@ -1175,16 +1219,16 @@ impl<A: Answered> Upload<A> {
     mut searching: Box<Searching>,
     out: &mut impl Out,
   ) -> Result<Option<Pending>, StoreRefused> {
-    let (id, row, content) = &searching.target;
-    let target = (*id, row.len, *content);
-    if read_window(cx.store, target, &mut searching.target_bytes)? {
+    let (id, row, stored) = &searching.target;
+    let target = (*id, row.len, *stored);
+    if read_window(cx, target, &mut searching.target_bytes)? {
       return Ok(Some(Pending::Search(searching)));
     }
     let Some(candidate) = searching.candidates.get(searching.trying).copied() else {
       return self.searched(cx, *searching, out).map(Some);
     };
-    let base = (candidate.id, candidate.len, candidate.content);
-    let step = if read_window(cx.store, base, &mut searching.base_bytes)? {
+    let base = (candidate.id, candidate.len, candidate.stored);
+    let step = if read_window(cx, base, &mut searching.base_bytes)? {
       SearchStep::More
     } else {
       let Searching {
@@ -1248,7 +1292,7 @@ impl<A: Answered> Upload<A> {
       cx.admission.release(hold);
       return self.large_whole(cx, target, out);
     };
-    let (id, row, content) = target;
+    let (id, row, stored) = target;
     let representation = if self.answer.ofs_delta() {
       Representation::OfsDelta { base: base.at }
     } else {
@@ -1272,7 +1316,7 @@ impl<A: Answered> Upload<A> {
       id,
       kind: row.kind,
       len: row.len,
-      content,
+      stored,
       at: self.at,
       depth: base.depth.saturating_add(1),
     };
@@ -1314,7 +1358,7 @@ impl<A: Answered> Upload<A> {
 
 /// A search of `target` against `candidates`, with the admission's `hold` on what it keeps, nothing yet read.
 fn searching(
-  target: (ObjectId, ObjectRow, ContentId),
+  target: (ObjectId, ObjectRow, StoredAt),
   candidates: Vec<Large>,
   hold: Hold,
 ) -> Searching {
@@ -1357,15 +1401,28 @@ fn search_charge(target_len: u64, candidates: &[Large]) -> u64 {
 /// Reads the next window of the object `(id, len, content)` names into `bytes`, made with room for the whole object
 /// when the first is read: whether one was read, none once the object is whole.
 fn read_window(
-  store: &ContentStore,
-  (id, len, content): (ObjectId, u64, ContentId),
+  cx: &Context<'_>,
+  (id, len, stored): (ObjectId, u64, StoredAt),
   bytes: &mut Vec<u8>,
 ) -> Result<bool, StoreRefused> {
+  let store = cx.store;
   let read = to_u64(bytes.len());
   if read >= len {
     return Ok(false);
   }
   let unreadable = StoreRefused::Unreadable { id };
+  // An object read where it lies in its pack (A-722's record v4) is read whole at once, its chain resolved.
+  let content = match stored {
+    StoredAt::Whole(content) => content,
+    StoredAt::InPack(_) => {
+      *bytes = cx
+        .repository
+        .read_stored(store, &stored, len)
+        .ok_or(unreadable)?
+        .into_owned();
+      return Ok(true);
+    }
+  };
   if bytes.is_empty() {
     *bytes = Vec::with_capacity(usize::try_from(len).map_err(|_| unreadable)?);
   }
@@ -1492,33 +1549,121 @@ fn set_bit(bits: &mut [u64], index: usize) {
   }
 }
 
-/// The index of `kept`'s entry whose object is at `position`, found by halving its entries in position order.
-fn entry_of(kept: &Kept, position: u64) -> Option<usize> {
-  let position_of = |index: &u32| {
-    usize::try_from(*index)
-      .ok()
-      .and_then(|index| kept.placed.get(index))
-      .map_or(u64::MAX, |entry| entry.position)
+/// The first index of `kept`'s position order at `cursor` or after it whose entry's position is `position` or past it,
+/// found by galloping from `cursor` and then halving the stretch it ends in (Bentley and Yao's unbounded search [A:
+/// "An almost optimal algorithm for unbounded searching", Information Processing Letters 5(3), 1976]): about twice the
+/// logarithm of how far it lies, never the whole order. It reads at most `budget` entries of the order, each counted in
+/// `read`; past them, `Err` with how far it got, every entry before which lies before `position`.
+fn seek(
+  kept: &Kept,
+  cursor: usize,
+  position: u64,
+  (budget, read): (usize, &mut usize),
+) -> Result<usize, usize> {
+  let mut left = budget;
+  let mut before = |at: usize| -> Option<bool> {
+    left = left.checked_sub(1)?;
+    *read = read.saturating_add(1);
+    Some(
+      kept
+        .order
+        .get(at)
+        .and_then(|index| usize::try_from(*index).ok())
+        .and_then(|index| kept.placed.get(index))
+        .is_some_and(|entry| entry.position < position),
+    )
   };
-  let at = kept
-    .order
-    .binary_search_by_key(&position, position_of)
-    .ok()?;
-  usize::try_from(*kept.order.get(at)?).ok()
+  let len = kept.order.len();
+  let (mut low, mut high, mut step) = (cursor, cursor, 1_usize);
+  while high < len {
+    match before(high) {
+      None => return Err(low),
+      Some(false) => break,
+      Some(true) => {
+        low = high.saturating_add(1);
+        high = cursor.saturating_add(step);
+        step = step.saturating_mul(2);
+      }
+    }
+  }
+  let mut high = high.min(len);
+  while low < high {
+    let middle = low.saturating_add(high.saturating_sub(low) / 2);
+    match before(middle) {
+      None => return Err(low),
+      Some(true) => low = middle.saturating_add(1),
+      Some(false) => high = middle,
+    }
+  }
+  Ok(low)
 }
 
-/// Marks, among `kept`'s entries, those of `handles` of `keep`'s positions from `from` on: the position to go on from,
-/// or `None` once every one is marked.
-fn mark(kept: &Kept, keep: &Positions, bits: &mut [u64], from: u64, handles: usize) -> Option<u64> {
+/// Marks, among `kept`'s entries, those of `keep`'s positions from `from` on, each found ahead of `cursor` in the
+/// part's position order ([`seek`]), reading `handles` entries of the order at most ([`marking_reads`]) (a unit's first search may read
+/// what one whole search reads): the position to go on from (the
+/// one a search stopped short of, when the reading ran out inside it), or `None` once every one is marked.
+fn mark(
+  kept: &Kept,
+  keep: &Positions,
+  bits: &mut [u64],
+  (from, cursor): (u64, &mut usize),
+  (handles, read): (usize, &mut usize),
+) -> Option<u64> {
   let mut at = from;
-  for _ in 0..handles {
+  loop {
     let position = keep.next_from(at)?;
-    if let Some(index) = entry_of(kept, position) {
+    // A unit's first search may read what a whole search can (twice the order's bits, and two): every unit marks one.
+    let whole = bits_of_len(kept.order.len())
+      .saturating_mul(2)
+      .saturating_add(2);
+    let budget = if *read == 0 {
+      handles.max(whole)
+    } else {
+      handles.saturating_sub(*read)
+    };
+    let found = match seek(kept, *cursor, position, (budget, read)) {
+      Ok(found) => found,
+      Err(reached) => {
+        *cursor = reached;
+        return Some(position);
+      }
+    };
+    *cursor = found;
+    let index = kept
+      .order
+      .get(found)
+      .and_then(|index| usize::try_from(*index).ok())
+      .filter(|index| {
+        kept
+          .placed
+          .get(*index)
+          .is_some_and(|entry| entry.position == position)
+      });
+    if let Some(index) = index {
       set_bit(bits, index);
+      *cursor = found.saturating_add(1);
     }
     at = position.checked_add(1)?;
+    if *read >= handles {
+      return Some(at);
+    }
   }
-  Some(at)
+}
+
+/// The bits `len` takes: the most halvings a search of `len` entries makes.
+fn bits_of_len(len: usize) -> usize {
+  usize::try_from(usize::BITS.saturating_sub(len.leading_zeros())).unwrap_or(usize::MAX)
+}
+
+/// The entries of a part's position order one unit of marking reads: a window's bytes, each read an entry of the order
+/// and the entry it names (found by use: counted in handles, eight bytes each, a unit read sixteen times its window and
+/// held its poll 928 ms in a deepen of git v2.0.0).
+pub(super) fn marking_reads(store: &ContentStore) -> usize {
+  store
+    .window()
+    .checked_div(size_of::<u32>().saturating_add(size_of::<Placed>()))
+    .unwrap_or(0)
+    .max(1)
 }
 
 /// The handles a window holds, `size_of::<u64>()` bytes each: what one unit reads of a list of positions.

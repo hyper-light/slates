@@ -35,12 +35,12 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use super::{
-  Call, Delta, DriveFailure, LIST_STEP, Owned, OwnedFacts, WindowWork, property_changes,
+  Call, Delta, DriveFailure, Halt, LIST_STEP, Owned, OwnedFacts, WindowWork, property_changes,
   property_list, window_unit,
 };
 use crate::authz::{PrincipalRules, may_read};
 use crate::index::{Action, ChangedPath, Index, NodeKind, Revision, Text};
-use crate::reads::Repository;
+use crate::reads::{Repository, Wanted};
 use crate::svndiff::{Compression, Version};
 
 /// A step of `add_subdir`'s listing (A-759): the source's next [`LIST_STEP`] entries in name order, read through the
@@ -143,6 +143,9 @@ pub enum Stepped<'a> {
   Call(Call<'a>),
   /// The steps given were taken and no call is ready yet: ask again.
   Paused,
+  /// A text's piece the repository reads asynchronously is waited for (C2 stage B part 2): fetched and made readable to
+  /// the repository, ask again, and the replay reads on from there.
+  Waiting(Wanted),
   /// The replay has made its last call.
   Ended,
 }
@@ -195,9 +198,17 @@ impl Replay {
         return Ok(Stepped::Paused);
       };
       left = rest;
-      if !self.step(index, repository, rules)? {
-        self.given = None;
-        return Ok(Stepped::Ended);
+      match self.step(index, repository, rules) {
+        Ok(true) => {}
+        Ok(false) => {
+          self.given = None;
+          return Ok(Stepped::Ended);
+        }
+        Err(Halt::Waiting(wanted)) => {
+          self.given = None;
+          return Ok(Stepped::Waiting(wanted));
+        }
+        Err(Halt::Failed(failure)) => return Err(failure),
       }
     }
     self.given = self.pending.pop_front();
@@ -209,7 +220,8 @@ impl Replay {
     )
   }
 
-  /// The replay's next call; none at its end.
+  /// The replay's next call; none at its end. For a caller that cannot wait: a text the repository reads
+  /// asynchronously ([`Stepped::Waiting`]) is refused as one it does not hold.
   ///
   /// # Errors
   /// [`DriveFailure`] for a revision the index does not hold ("No such revision"), and for an index and a green that
@@ -221,9 +233,14 @@ impl Replay {
     rules: Option<&PrincipalRules>,
   ) -> Result<Option<Call<'_>>, DriveFailure> {
     while self.pending.is_empty() {
-      if !self.step(index, repository, rules)? {
-        self.given = None;
-        return Ok(None);
+      match self.step(index, repository, rules) {
+        Ok(true) => {}
+        Ok(false) => {
+          self.given = None;
+          return Ok(None);
+        }
+        Err(Halt::Waiting(_)) => return Err(DriveFailure::corrupt()),
+        Err(Halt::Failed(failure)) => return Err(failure),
       }
     }
     self.given = self.pending.pop_front();
@@ -236,7 +253,7 @@ impl Replay {
     index: &Index,
     repository: &R,
     rules: Option<&PrincipalRules>,
-  ) -> Result<bool, DriveFailure> {
+  ) -> Result<bool, Halt> {
     if !self.started {
       self.start(index, rules)?;
       return Ok(true);
@@ -485,7 +502,7 @@ impl Replay {
 
   /// One step of the delta's next window, `txdelta_next_window`'s, made and sent a step at a time as the update drive's
   /// are (`super::window_unit`, A-751), or its end and the file's close.
-  fn window<R: Repository + ?Sized>(&mut self, repository: &R) -> Result<(), DriveFailure> {
+  fn window<R: Repository + ?Sized>(&mut self, repository: &R) -> Result<(), Halt> {
     let Some(mut sending) = self.sending.take() else {
       return Ok(());
     };
@@ -501,14 +518,17 @@ impl Replay {
       header_sent: &mut sending.header_sent,
     };
     let pending = &mut self.pending;
-    window_unit(
+    let stepped = window_unit(
       &mut sending.window,
       delta,
       (self.encoding, repository),
       &mut |write, at, piece| pending.push_back(Owned::DeltaPiece(write, at, piece)),
-    )?;
-    self.sending = Some(sending);
-    Ok(())
+    );
+    // A wait keeps the text being sent, its window's work back in it.
+    if matches!(stepped, Ok(()) | Err(Halt::Waiting(_))) {
+      self.sending = Some(sending);
+    }
+    stepped
   }
 
   /// `add_subdir`'s start: the directory added with no source, the target's properties set on it, its source's

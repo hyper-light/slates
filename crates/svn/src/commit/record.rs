@@ -12,14 +12,17 @@
 //! import sets that no revision carries (A-652 part 3), each in an entry that moves no green: [`Record::Uuid`], the
 //! repository named by its stream's UUID record (`svn_fs_set_uuid`, `load-fs-vtable.c` `uuid_record`); and
 //! [`Record::RevisionProperties`], a revision's properties set whole (`svn_fs_change_rev_prop2` for each difference),
-//! as an import sets revision 0's to its stream's (`close_revision`); and [`Record::Locks`], the lock entries a lock verb
-//! made (`lock`, `lock-many`, `unlock`, `unlock-many`; A-693 part 2).
+//! as an import sets revision 0's to its stream's (`close_revision`); [`Record::Locks`], the lock entries a lock verb
+//! made (`lock`, `lock-many`, `unlock`, `unlock-many`; A-693 part 2). The deltify job's record, a stored text kept as a
+//! delta in RAM from then on, is retired (C2 stage B part 2 (b), 2026-11-21: history lives on the node's store, so no
+//! record moves a text into RAM); its kind byte is refused [`RecordRefused::Retired`].
 //!
 //! **The encoding**, little-endian as a green's chain entry and A-662's git record are: the magic, the version and a
 //! kind byte; a creation's UUID, its 36 bytes, and its date; a revision's head, its transaction, its rows, its
 //! properties, its contents and its lock entries, each list as a count and its items, each string as a length and its
 //! bytes, each optional part after a byte that marks it present or absent; a UUID's 36 bytes; a revision's number and
-//! its properties, written as a revision's are; a lock verb's lock entries, a count and each (A-693 part 2). A row is its path, its action, its kind,
+//! its properties, written as a revision's are; a lock verb's lock entries, a count and each (A-693 part 2); a deltified text's identity, its base after a
+//! byte that marks it present or absent, and its delta's length and bytes. A row is its path, its action, its kind,
 //! its copy source, its text (identity, MD5, SHA-1, size), its property list (none, empty, or held by identity with its
 //! mergeinfo mark) and its mergeinfo mark. A lock entry is a tag, then a set lock whole (path, token, owner, comment,
 //! the DAV comment's mark, creation and expiry) or a removal (path, token).
@@ -67,6 +70,9 @@ const UUID_SET: u8 = 2;
 const PROPERTIES_SET: u8 = 3;
 /// Format: the kind byte of lock entries made by a lock verb alone, no revision with them (A-693 part 2).
 const LOCKS_SET: u8 = 4;
+/// Format: the kind byte the retired deltify record had (main's ruling on A-761; retired by C2 stage B part 2 (b)): never
+/// written, refused [`Retired::Deltified`] where a log written before holds one.
+const DELTIFIED: u8 = 5;
 
 /// Format: the byte that marks an optional part absent, and a mark unset.
 const ABSENT: u8 = 0;
@@ -148,6 +154,15 @@ pub enum Record {
   Locks(Vec<LockEntry>),
 }
 
+/// A record kind this build no longer reads: what a log written before its retirement holds ([`RecordRefused::Retired`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Retired {
+  /// The deltify job's record (main's ruling on A-761): a stored text kept by the records as a delta in RAM from then
+  /// on. Retired by C2 stage B part 2 (b) (2026-11-21, main's ruling of 09:20): a text is its changeset's on the node's
+  /// store and nothing keeps it in RAM, so such a record names a form no repository keeps.
+  Deltified,
+}
+
 /// Why bytes were refused as a record. A refused record replays nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecordRefused {
@@ -179,6 +194,8 @@ pub enum RecordRefused {
   Identity,
   /// Bytes after the last item.
   Trailing,
+  /// A record of a kind this build retired ([`Retired`]): the log was written before it.
+  Retired(Retired),
 }
 
 impl Record {
@@ -250,6 +267,7 @@ impl Record {
         properties: properties(&mut reader)?,
       },
       LOCKS_SET => Self::Locks(lock_entries(&mut reader)?),
+      DELTIFIED => return Err(RecordRefused::Retired(Retired::Deltified)),
       byte => return Err(RecordRefused::Tag { byte }),
     };
     if !reader.rest.is_empty() {

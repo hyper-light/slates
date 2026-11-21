@@ -283,7 +283,7 @@ struct Scene {
 
 /// [`Scene`], made on the owner shard.
 fn scene() -> Scene {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("vcs", |state| {
     let (repository, main) = repository(state, "hooked", VcsTool::Git);
     let readme = |text: &[u8]| [(b"README".to_vec(), text.to_vec())];
     let (first, old) = commit_of(&readme(b"first\n"), &[], FIRST_DATE);
@@ -681,7 +681,7 @@ fn a_git_hook_runs_in_its_view_at_each_of_receive_packs_points() {
 /// `NoStore`; and after each, the shard holding and charging what it did before.
 #[test]
 fn a_view_the_store_cannot_show_is_refused_by_kind_and_holds_nothing() {
-  let refused = crate::daemon::audit_on_shard(|state| {
+  let refused = crate::test_store::audit_on_stored_shard("vcs", |state| {
     let (hooked, main) = repository(state, "hooked", VcsTool::Git);
     let (other, _) = repository(state, "other", VcsTool::Git);
     let (mercurial, _) = repository(state, "hg", VcsTool::Mercurial);

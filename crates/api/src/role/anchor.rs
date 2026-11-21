@@ -64,18 +64,28 @@ impl DaemonWatch {
   }
 }
 
-/// Waits out `pause`, or less: when a daemon sends a hold (A-113), or when the daemon exits. Both descriptors are
-/// polled with the pause as the timeout, so a hold is taken as it arrives and a dead daemon is restarted the moment it
-/// dies — a kill cost up to a whole pause (100 ms) of detection before its restart could begin, time every kernel client
-/// of a held mount waited. A signal ends the wait early, as it ended the park.
+/// Waits out `pause`, or less: when a daemon sends a hold (A-113), when the daemon exits, or when a process claims the
+/// segment over the issuer route (Linux, A-754). Every descriptor is polled with the pause as the timeout, so a hold is
+/// taken as it arrives and a dead daemon is restarted the moment it dies — a kill cost up to a whole pause (100 ms) of
+/// detection before its restart could begin, time every kernel client of a held mount waited — and a claim is answered
+/// as it arrives: a running daemon's pause runs up to its lapse bound, as long as a claim's patience, and claims timed
+/// out on a loaded Linux host (w-interop, 2026-11-20). A signal ends the wait early, as it ended the park.
 #[cfg(unix)]
-fn await_observation(supervisor: &mut Supervisor, watch: &mut DaemonWatch, pause: Duration) {
+fn await_observation(
+  supervisor: &mut Supervisor,
+  (watch, issuer): (&mut DaemonWatch, &IssuerSurface),
+  pause: Duration,
+) {
   use std::os::fd::BorrowedFd;
   let exit = watch
     .on(supervisor.child_pid())
     .and_then(|watch| watch.readiness());
-  let descriptors: Vec<BorrowedFd<'_>> =
-    supervisor.hold_channel().into_iter().chain(exit).collect();
+  let descriptors: Vec<BorrowedFd<'_>> = supervisor
+    .hold_channel()
+    .into_iter()
+    .chain(exit)
+    .chain(issuer.readiness())
+    .collect();
   if descriptors.is_empty() {
     std::thread::park_timeout(pause);
     return;
@@ -102,7 +112,11 @@ struct DaemonWatch {}
 
 /// See the Unix arm: the Windows supervisor waits itself ([`Supervisor::await_work`]).
 #[cfg(windows)]
-fn await_observation(supervisor: &mut Supervisor, _watch: &mut DaemonWatch, pause: Duration) {
+fn await_observation(
+  supervisor: &mut Supervisor,
+  _waits: (&mut DaemonWatch, &IssuerSurface),
+  pause: Duration,
+) {
   supervisor.await_work(pause);
 }
 
@@ -402,13 +416,14 @@ pub(crate) fn supervise(options: &ProcessOptions, daemon_args: &[String]) -> Res
       config.held_copy_bound(),
     )
     .map_err(|e| failed("hold channel", e))?;
-  // Windows holds each class of entry to its own bound: the attachments' mounts and resync ends, and the Shards streams'
-  // DAX sections (A-448).
+  // Windows holds each class of entry to its own bound: the attachments' mounts and resync ends, the Shards streams'
+  // DAX sections (A-448), and the content pool's extents (A-789).
   #[cfg(windows)]
   supervisor
     .hold_handles(slates_anchor::handles::HoldBounds {
       attachments: config.held_device_bound(),
       sections: config.held_dax_bound(),
+      extents: config.held_extent_bound(),
     })
     .map_err(|error| failed("hold channel", error))?;
   // The anchor holds a duplicate of every device and connection it is sent, so it needs the descriptors its bounds
@@ -519,6 +534,18 @@ impl IssuerSurface {
   /// See the Linux arm: nothing waits elsewhere.
   #[cfg(not(target_os = "linux"))]
   fn answer(&self, _supervisor: &Supervisor) {}
+
+  /// The route's listener, readable while a claim waits (Linux): the anchor's wait wakes on it ([`await_observation`]).
+  #[cfg(target_os = "linux")]
+  fn readiness(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+    Some(self.route.readiness())
+  }
+
+  /// See the Linux arm: no claim wakes the anchor elsewhere.
+  #[cfg(all(unix, not(target_os = "linux")))]
+  fn readiness(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+    None
+  }
 }
 
 /// Stops the daemon through the graceful protocol (`slates_anchor::layout::SUP_STOP`): asks it to stop, then
@@ -1027,7 +1054,7 @@ fn observe(
         let pause = next_pause(pause, kill_sent || (!alive && starting_since.is_none()));
         let asked = u64::try_from(pause.as_nanos()).unwrap_or(u64::MAX);
         let waited_from = clock.monotonic_ns();
-        await_observation(supervisor, &mut daemon_watch, pause);
+        await_observation(supervisor, (&mut daemon_watch, issuer), pause);
         lateness.record(asked, clock.monotonic_ns().saturating_sub(waited_from));
       }
       slates_anchor::Step::Restarted {
@@ -1070,7 +1097,7 @@ fn observe(
         kill_sent = false;
       }
       slates_anchor::Step::BackingOff { .. } => {
-        await_observation(supervisor, &mut daemon_watch, observation_pause());
+        await_observation(supervisor, (&mut daemon_watch, issuer), observation_pause());
       }
       slates_anchor::Step::Stopped => return Ok(()),
     }

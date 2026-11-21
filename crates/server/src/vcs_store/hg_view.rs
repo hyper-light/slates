@@ -107,6 +107,14 @@ impl HgStores for ServedViews {
     crate::state::with_state(|state| crate::vcs_share::room(state, id).bytes)
   }
 
+  async fn answer_wants(
+    &mut self,
+    (_, id, _): (&Generation, RepositoryId, u64),
+    wants: &mut dyn slates_hg::render::StoreWants,
+  ) -> bool {
+    answer_store_wants(wants, id).await
+  }
+
   fn fetch_turn(&self, id: RepositoryId) -> Option<(u64, u64)> {
     crate::state::with_state(|state| {
       (
@@ -115,6 +123,213 @@ impl HgStores for ServedViews {
       )
     })
   }
+}
+
+/// Counter: the turns a fetch's streamed answer took over either edge (A-783's paced turn, [`super::paced_turn`]): a turn
+/// yielding at its first quantum took one step, so a stream of hg-src was about 460,000 of them. Format: a counter name
+/// in the status report.
+pub(crate) const STREAM_TURNS: &str = "vcs_store.hg_stream_turns";
+
+/// Counter: the asks a fetch's streamed answer made of the node's changeset store ([`answer_store_wants`]), each a
+/// batch of rows or of chunks. Format: a counter name in the status report.
+pub(crate) const STORE_ASKS: &str = "vcs_store.hg_stream_store_asks";
+
+/// Counter: the file revisions a pull sent whole against the null base, each a text the store made from its chain since
+/// its stored base was neither on the client nor sent earlier in the answer (A-767 C1 step 1b, main's ruling of
+/// 2026-11-21 08:45; `slates_hg::serve::getbundle::Pull`). Format: a counter name in the status report.
+pub(crate) const PULL_WHOLE_TEXTS: &str = "vcs_store.hg_pull_whole_texts";
+
+/// Counter: the asks a `lookup` or a `batch` made of the node's changeset store for the heads' `.hgtags` (A-767 C1,
+/// main's ruling (A) of 2026-11-21; `slates_hg::serve::lookup::TagsRead`), each a want of rows or of texts. Format: a
+/// counter name in the status report.
+pub(crate) const LOOKUP_STORE_ASKS: &str = "vcs_store.hg_lookup_store_asks";
+
+/// Counter: the nanoseconds a fetch's streamed answer waited on the changeset store's answers, summed over its asks
+/// ([`STORE_ASKS`]). Format: a counter name in the status report.
+pub(crate) const STORE_WAIT_NS: &str = "vcs_store.hg_stream_store_wait_ns";
+
+/// Counts one turn of a fetch's streamed answer ([`STREAM_TURNS`]) on the shard serving it; nothing off a shard.
+pub(crate) fn turn_taken() {
+  let _ = crate::state::with_state(|state| state.count(STREAM_TURNS, 1));
+}
+
+/// Answers what a stream's next step needs of the node's changeset store (goal 93 perf: each revision sent as the store
+/// keeps it), over the shard's handle, as a task: a log's rows by node (`StoreHandle::texts_by_tool`, the `I` rows) and
+/// a batch of chunks (`StoreHandle::places`, read in place). A daemon holding no store keeps no revision, so a rows'
+/// want is answered none and the stream is not served (`1\n`). Whether every want was answered; false where the store
+/// refused or was gone, which ends the answer.
+pub(crate) async fn answer_store_wants(
+  wants: &mut dyn slates_hg::render::StoreWants,
+  id: RepositoryId,
+) -> bool {
+  use slates_hg::render::Want;
+  let repository = u128::from_be_bytes(id.bytes);
+  while let Some(want) = wants.wants().cloned() {
+    let asked_at = slates_rt::futures::now_ns();
+    let disk = crate::state::with_state(|state| state.vcs_disk.clone()).flatten();
+    let Some(disk) = disk else {
+      // A daemon holding no store keeps no revision: a rows' want is answered none, any other refused.
+      let Want::Rows { logs } = want else {
+        return false;
+      };
+      wants.give_rows(
+        logs
+          .iter()
+          .map(|(_, nodes)| vec![None; nodes.len()])
+          .collect(),
+      );
+      continue;
+    };
+    let Some(whole) = answer_one(&disk, repository, want, wants).await else {
+      return false;
+    };
+    let waited = slates_rt::futures::now_ns().saturating_sub(asked_at);
+    let (tags, bases) = (wants.reads_tags(), wants.reads_bases());
+    let _ = crate::state::with_state(|state| {
+      state.count(STORE_ASKS, 1);
+      state.count(STORE_WAIT_NS, waited);
+      if tags {
+        state.count(LOOKUP_STORE_ASKS, 1);
+      } else if bases {
+        state.count(INTAKE_BASE_ASKS, 1);
+      } else {
+        state.count(PULL_WHOLE_TEXTS, whole);
+      }
+    });
+  }
+  true
+}
+
+/// Counter: the asks a push's intake (or its replay) made of the node's changeset store for a file delta's base landed
+/// before the push (A-767 C1, main's ruling (b2); `slates_hg::push::intake::Stepped::Store`), each a want of rows or of
+/// texts. Format: a counter name in the status report.
+pub(crate) const INTAKE_BASE_ASKS: &str = "vcs_store.hg_intake_base_asks";
+
+/// [`answer_store_wants`] over `disk` alone, touching no shard state (a recovery's replay holds the state across its
+/// waits): whether every want was answered.
+pub(crate) async fn answer_wants_over(
+  disk: &slates_store::owner::StoreHandle,
+  repository: u128,
+  wants: &mut dyn slates_hg::render::StoreWants,
+) -> bool {
+  while let Some(want) = wants.wants().cloned() {
+    if answer_one(disk, repository, want, wants).await.is_none() {
+      return false;
+    }
+  }
+  true
+}
+
+/// Answers one `want` of `repository` from `disk` into `wants`: the whole texts it gave (zero for any other want), or
+/// none where the store refused or was gone.
+async fn answer_one(
+  disk: &slates_store::owner::StoreHandle,
+  repository: u128,
+  want: slates_hg::render::Want,
+  wants: &mut dyn slates_hg::render::StoreWants,
+) -> Option<u64> {
+  use slates_hg::render::{StoredPlace, StoredRevision, Want};
+  match want {
+    Want::Rows { logs } => {
+      let asked = logs
+        .iter()
+        .map(|(log, nodes)| {
+          (
+            log.clone(),
+            nodes.iter().map(|node| node.to_vec()).collect(),
+          )
+        })
+        .collect();
+      let found = disk.texts_by_tool(repository, asked).await.ok()?;
+      wants.give_rows(
+        found
+          .into_iter()
+          .map(|log| {
+            log
+              .into_iter()
+              .map(|row| {
+                row.map(|(text, row)| StoredRevision {
+                  text,
+                  base: row.base,
+                  place: StoredPlace {
+                    payload: row.place.payload,
+                    offset: row.place.offset,
+                    len: row.place.len,
+                  },
+                })
+              })
+              .collect()
+          })
+          .collect(),
+      );
+      Some(0)
+    }
+    Want::Chunks { places } => {
+      let asked = places
+        .iter()
+        .map(|place| slates_store::texts::Place {
+          payload: place.payload,
+          offset: place.offset,
+          len: place.len,
+        })
+        .collect();
+      let chunks = disk.places(asked).await.ok()?;
+      wants.give_chunks(chunks);
+      Some(0)
+    }
+    Want::Texts { texts, most } => match texts_made(disk, repository, &texts, most).await? {
+      MadeTexts::Past => {
+        wants.texts_past();
+        Some(0)
+      }
+      MadeTexts::Made(made) => {
+        let whole = u64::try_from(made.len()).unwrap_or(u64::MAX);
+        wants.give_texts(made);
+        Some(whole)
+      }
+    },
+  }
+}
+
+/// The full texts of a [`texts_made`] read: each made, or past the bytes they could hold together.
+#[derive(Debug)]
+pub(crate) enum MadeTexts {
+  /// Each text, in the order asked.
+  Made(Vec<Vec<u8>>),
+  /// The texts held more than the bytes allowed: none read past them.
+  Past,
+}
+
+/// The full texts `texts` (each by its identity) of `repository`, made by the store's owner from their chains and read
+/// a piece at a time to their end (`StoreHandle::text`, empty at a text's end; A-767 C1: a pull's revision sent whole,
+/// a lookup's `.hgtags`), together at most `most` bytes: past them the reading stops, so a hostile or huge text is
+/// never held whole ([`MadeTexts::Past`]). None where the store keeps no such text.
+pub(crate) async fn texts_made(
+  disk: &slates_store::owner::StoreHandle,
+  repository: u128,
+  texts: &[[u8; 32]],
+  most: u64,
+) -> Option<MadeTexts> {
+  let mut made = Vec::new();
+  made.try_reserve_exact(texts.len()).ok()?;
+  let mut total = 0_u64;
+  for identity in texts {
+    let mut text = Vec::new();
+    loop {
+      let at = u64::try_from(text.len()).ok()?;
+      let piece = disk.text(repository, *identity, at).await.ok()??;
+      if piece.is_empty() {
+        break;
+      }
+      total = total.saturating_add(u64::try_from(piece.len()).ok()?);
+      if total > most {
+        return Some(MadeTexts::Past);
+      }
+      text.extend_from_slice(&piece);
+    }
+    made.push(text);
+  }
+  Some(MadeTexts::Made(made))
 }
 
 /// [`held`], for the tests.
@@ -225,7 +440,7 @@ fn held(state: &ShardState, id: RepositoryId) -> bool {
 
 /// Runs `step` over repository `id`'s view, made within `room` from what `state` holds now; none when it is not lent
 /// (module docs), an unmade view counted.
-fn lend_in<R>(
+pub(crate) fn lend_in<R>(
   state: &mut ShardState,
   id: RepositoryId,
   room: &mut Admission,
@@ -234,12 +449,19 @@ fn lend_in<R>(
   if !held(state, id) {
     return None;
   }
+  let started = slates_rt::futures::now_ns();
   let made = super::lent_state(state, |state| {
     with_view(state, id, room, |view, _, room| step(view, room))
   });
   if made.is_none() {
     crate::fleet::count_refusal_in(state, UNMADE);
   }
+  // The lend's lookups over the store's own index, reported to its merge rule (`super::index_upkeep`).
+  super::index_upkeep::looked_up(
+    state,
+    id,
+    slates_rt::futures::now_ns().saturating_sub(started),
+  );
   made
 }
 
@@ -252,8 +474,18 @@ pub(crate) fn resolved_in(
   name: &[u8],
   room: &mut Admission,
 ) -> Option<Result<Option<Node>, slates_hg::serve::Refusal>> {
+  let tags = match super::hg_tags::owed(state, id, name, room)? {
+    Ok(super::hg_tags::Owed::Ready(tags)) => tags,
+    // The verb's door reads the tags first (`super::hg_tags`); a dispatch that passed no door cannot wait for them.
+    Ok(super::hg_tags::Owed::Read(_)) => {
+      return Some(Err(slates_hg::serve::Refusal::Store {
+        what: "a .hgtags text not read from the changeset store",
+      }));
+    }
+    Err(refusal) => return Some(Err(refusal)),
+  };
   lend_in(state, id, room, |view, room| {
-    slates_hg::serve::lookup::resolve_name(view, name, room)
+    slates_hg::serve::lookup::resolve_name(view, tags.as_ref(), name, room)
   })
 }
 

@@ -3834,9 +3834,9 @@ fn a_file_deleted_after_its_burst_went_idle_takes_its_reserve_with_it() {
 /// after this call began, so the figures are of now.
 #[cfg(target_os = "linux")]
 fn arena_figures(client: &mut Client) -> (u64, u64) {
-  let completed = counter(client, "content_range.sweep.completed");
+  let completed = memory_counter(client, "content_range.sweep.completed");
   let started = Instant::now();
-  while counter(client, "content_range.sweep.completed") <= completed {
+  while memory_counter(client, "content_range.sweep.completed") <= completed {
     assert!(
       started.elapsed() < Duration::from_secs(10),
       "a sweep of the shard's slice completed"
@@ -3847,6 +3847,21 @@ fn arena_figures(client: &mut Client) -> (u64, u64) {
     counter(client, "content_range.arena.allocated"),
     counter(client, "content_range.arena.resident"),
   )
+}
+
+/// [`counter`] read from a status that asks for the memory report, which alone advances and arms the residency sweep
+/// (A-744; main's ruling on g228's finding).
+#[cfg(target_os = "linux")]
+fn memory_counter(client: &mut Client, kind: &str) -> u64 {
+  client
+    .daemon_memory_status()
+    .unwrap()
+    .shards
+    .iter()
+    .flat_map(|shard| shard.refusals.iter())
+    .filter(|refusal| refusal.kind == kind)
+    .map(|refusal| refusal.count)
+    .sum()
 }
 
 /// MEMORY SIZING (Ada 2026-11-20: the daemon held 7.1 GB resident after an 84 MB Mercurial push; w-sizing). Do: on a
@@ -3910,6 +3925,110 @@ fn a_burst_leaves_nothing_resident_behind_it_but_its_data() {
     resident.saturating_sub(allocated) * 4 <= file,
     "the idle arena keeps resident at most a quarter of N past its data: {resident} resident, {allocated} allocated, \
      N = {file}"
+  );
+}
+
+/// The RAM the content pool holds for the daemon's volumes, wherever it lies: the pages of the anchor's content object
+/// in RAM (read through the anchor's own view, `mincore`, which on macOS answers for the object, measured on Studio-4
+/// 2026-11-20: a fresh view reports another mapping's pages, and keeps reporting them after that mapping is gone), plus
+/// the process's resident memory, which counts the pages the daemon maps (its arena's extents) while it maps them.
+fn pool_resident(anchor: &Anchor) -> u64 {
+  let content = anchor
+    .segment
+    .content()
+    .expect("the anchor holds a content object");
+  let in_object = content
+    .residency(0, content.len())
+    .expect("the OS reports the object's residency")
+    .resident;
+  let rss = slates_machine::facts::Facts::resident_now().expect("the OS reports resident memory");
+  eprintln!(
+    "pool_resident: the content object {} MiB in RAM, the process {} MiB",
+    in_object >> 20,
+    rss >> 20
+  );
+  in_object + rss
+}
+
+/// MEMORY SIZING, content as extents made on demand (main's ruling of 2026-11-20 15:20; w-sizing). Do: on a one-shard
+/// daemon over a held anchor, read the RAM the content pool holds ([`pool_resident`]), write a burst of N bytes into a volume of
+/// its own, publish, destroy the volume, publish, and leave the shard idle. Expect the pool's resident pages to come
+/// back to within a quarter of N of where they began: the extents the burst claimed go back to the system. On macOS the
+/// pool's extents were ranges of the anchor's one shared object: a released extent was only unmapped, and its pages
+/// stayed in the object (a 512 MiB `shm_open` probe on Studio-4: still resident 10 s after `MADV_FREE_REUSABLE`, under
+/// pressure). The process's RSS fell all the same (it counts only mapped pages), so it alone cannot be the measure.
+/// Linux punches the object's hole, which already frees it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone() {
+  const MARKER: &[u8] = b"SLATES-EXTENTS-BACK-7d02";
+  /// Shape: the burst, in chunk-sized blocks, far above the pool's own metadata pages.
+  const CHUNKS: usize = 1024;
+  /// Shape: the bound on the shard's idle passes and give-back.
+  const IDLE_WAIT: Duration = Duration::from_secs(20);
+  let profile = common::machine_profile();
+  let instance = format!("srv-extents-back-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let chunk = slates_vfs::content::chunk_bytes(config.page).get();
+  let tag = format!("extents-back-{}", std::process::id());
+  let anchor = held_anchor(&tag, &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let file = u64::try_from(chunk * CHUNKS).unwrap();
+  let mut spec = scratch("extents-back");
+  spec.size = SizeClass::Bounded { limit: file * 2 };
+  daemon.publish_every_shard().unwrap();
+  let before = pool_resident(&anchor);
+  let volume = client.create(&spec).unwrap();
+  let attachment = client
+    .attach(volume, None, slates_ipc::protocol::Intent::Write)
+    .unwrap()
+    .attachment;
+  client
+    .fs_write(
+      (volume, attachment),
+      "burst",
+      &MARKER.repeat(usize::try_from(file).unwrap() / MARKER.len()),
+      0o644,
+    )
+    .unwrap();
+  daemon.publish_every_shard().unwrap();
+  let with_burst = pool_resident(&anchor);
+  client.detach_of(volume, attachment).unwrap();
+  client.destroy(volume).unwrap();
+  daemon.publish_every_shard().unwrap();
+  let started = Instant::now();
+  let mut after = pool_resident(&anchor);
+  while after.saturating_sub(before) * 4 >= file && started.elapsed() < IDLE_WAIT {
+    std::thread::yield_now();
+    let _ = daemon.publish_every_shard();
+    after = pool_resident(&anchor);
+  }
+  daemon.stop();
+  drop(anchor);
+  let mib = |bytes: u64| bytes >> 20;
+  eprintln!(
+    "a {} MiB burst: the pool held {} MiB in RAM before, {} MiB with it, {} MiB after its volume was destroyed",
+    mib(file),
+    mib(before),
+    mib(with_burst),
+    mib(after)
+  );
+  assert!(
+    with_burst.saturating_sub(before) >= file / 2,
+    "the burst was in the pool's pages: {} MiB before, {} MiB with it",
+    mib(before),
+    mib(with_burst)
+  );
+  assert!(
+    after.saturating_sub(before) * 4 < file,
+    "the burst's extents went back to the system: {} MiB before, {} MiB after, for a {} MiB burst",
+    mib(before),
+    mib(after),
+    mib(file)
   );
 }
 

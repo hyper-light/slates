@@ -20,14 +20,16 @@ use slates_ipc::protocol::{ObjectFormat, ReplyBody, RequestBody, VcsTool};
 use slates_merge::push::{HEAD_ATTRIBUTE, ROOT};
 
 use super::{
-  BOOKMARK_TAG, LINE_TAG, Landed, Prepared, bookmark_name, bookmark_of, branch_prefix, land,
-  line_name, line_of, transaction_id,
+  BOOKMARK_TAG, LINE_TAG, Landed, Prepared, bookmark_name, bookmark_of, branch_prefix, line_name,
+  line_of, transaction_id,
 };
 use crate::state::ShardState;
 use crate::verbs::{dispatch, to_db_volume};
 
 /// Shape: the room a test's work is built within, far past any of these trees.
 const ROOM: u64 = 1 << 20;
+/// Shape: how long a test waits for a shard's task (a rebuild) to end before it fails, as the import tests wait.
+const TASK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 /// Shape: the push's name every test work's identity begins with.
 const NAME: [u8; 32] = [7; 32];
 
@@ -178,14 +180,6 @@ impl Repository for View {
     _admission: &mut slates_hg::Admission,
   ) -> Result<Option<Node>, slates_hg::serve::Refusal> {
     Ok(None)
-  }
-
-  fn tags_text(
-    &self,
-    _node: &Node,
-    _admission: &mut slates_hg::Admission,
-  ) -> Result<Vec<u8>, slates_hg::serve::Refusal> {
-    Err(slates_hg::serve::Refusal::Store { what: "tags" })
   }
 }
 
@@ -371,9 +365,8 @@ struct Hg {
 impl Hg {
   /// A new Mercurial repository `name`, its first line `default`'s, empty.
   fn new(state: &mut ShardState, name: &str) -> Hg {
-    let reply = dispatch(
+    let reply = crate::test_store::create(
       state,
-      1,
       &owner(),
       RequestBody::CreateRepository {
         name: name.to_owned(),
@@ -416,7 +409,7 @@ impl Hg {
   }
 
   fn land(&mut self, state: &mut ShardState, prepared: Prepared) -> Landed {
-    let landed = land(state, (&owner(), self.repository), prepared);
+    let landed = super::land_stored(state, (&owner(), self.repository), prepared);
     assert_eq!(
       landed.released,
       Ok(()),
@@ -559,7 +552,7 @@ fn assert_rebuilt(state: &ShardState, hg: &Hg, made: &[Made]) {
 /// changeset, which is a draft root and held by the index; sent again it is answered alike and records nothing.
 #[test]
 fn a_stock_push_lands_on_the_rebuilt_repository_as_7_2_answered_it() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let mut hg = Hg::new(state, "plain");
     let made = rebuild(state, &mut hg, (&[1], 1));
     assert_rebuilt(state, &hg, &made);
@@ -601,12 +594,16 @@ fn a_stock_push_lands_on_the_rebuilt_repository_as_7_2_answered_it() {
   });
 }
 
-/// A-680 part 2c. Do: land stock `push-plain` on the rebuilt repository, then make the repository's store again from
-/// its log as a recovery does (`vcs_store::rebuild`). Expect the store's index to hold every changeset the pushes
-/// brought, the stock push's among them, as many as before: each push's entry holds its record, replayed in order.
+/// A-680 part 2c, A-767 C4. Do: on a running daemon holding a changeset store, land stock `push-plain` on the rebuilt
+/// repository, then make the repository's store again from its log as a recovery does (`vcs_store::rebuild`, the
+/// sliced task), and read the store once the task ends. Expect the store's index to hold every changeset the pushes
+/// brought, the stock push's among them, as many as before: each push's entry names its changeset on the store, whose
+/// payload the replay read back, in order; and its stream clone still advertised (goal 93 perf, main's ruling of
+/// 2026-11-21 02:31), since the store keeps every revision it replayed.
 #[test]
 fn a_landed_push_is_replayed_into_the_store_from_its_entry() {
-  crate::daemon::audit_on_shard(|state| {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (repository, made, before) = crate::daemon::observe_first(&daemon, |state| {
     let mut hg = Hg::new(state, "replayed");
     let made = rebuild(state, &mut hg, (&[1], 1));
     let view = View::of(
@@ -616,10 +613,126 @@ fn a_landed_push_is_replayed_into_the_store_from_its_entry() {
     let answer = hg.push(state, &stock(fixture!("push-plain.hg")), &view);
     assert!(answer.is_ok(), "{answer:?}");
     let before = hg.changesets(state);
-    crate::vcs_store::rebuild_whole(state, hg.repository);
-    assert_eq!(hg.changesets(state), before);
-    assert!([0, 1, 3].iter().all(|at| hg.holds(state, &made[*at].node)));
+    crate::vcs_store::rebuild(state, hg.repository);
+    (hg.repository, made, before)
   });
+  let began = std::time::Instant::now();
+  let rebuilding = loop {
+    let rebuilding = crate::daemon::observe_first(&daemon, move |state| {
+      state.vcs_stores.rebuilding(repository)
+    });
+    if !rebuilding || began.elapsed() > TASK_WAIT {
+      break rebuilding;
+    }
+  };
+  let nodes: Vec<Node> = [0, 1, 3].iter().map(|at| made[*at].node).collect();
+  let (after, held, streams) = crate::daemon::observe_first(&daemon, move |state| {
+    let (content, store) = state.vcs_stores.mercurial_ref(repository).unwrap();
+    let counted = (
+      store.index.len(content, Log::Changelog),
+      nodes
+        .iter()
+        .all(|node| store.index.rev(content, Log::Changelog, node).is_some()),
+    );
+    let streams =
+      crate::vcs_store::hg_view::with_view(state, repository, &mut room(), |view, _, _| {
+        slates_hg::serve::getbundle::Store::streams(view)
+      });
+    (counted.0, counted.1, streams)
+  });
+  daemon.stop();
+  assert!(!rebuilding, "still rebuilding after {TASK_WAIT:?}");
+  assert_eq!(after, before);
+  assert!(held);
+  assert_eq!(
+    streams,
+    Some(true),
+    "a push replayed from the changeset log keeps its revisions in the store, so its stream clone stays advertised"
+  );
+}
+
+/// Shape: each large file's length in [`LARGE`]: two of the store's 64 KiB pieces, so the payload spans many pieces
+/// while any one delta spans few.
+const LARGE_LEN: usize = 1 << 17;
+/// Six large files, each its own byte repeated.
+static LARGE: [[u8; LARGE_LEN]; 6] = [
+  [b'a'; LARGE_LEN],
+  [b'b'; LARGE_LEN],
+  [b'c'; LARGE_LEN],
+  [b'd'; LARGE_LEN],
+  [b'e'; LARGE_LEN],
+  [b'f'; LARGE_LEN],
+];
+
+/// A-767 C1 (the piece-reading intake; R2, a replay holding no payload whole). Do: on a running daemon holding a
+/// changeset store, push six changesets each adding a 128 KiB file (a payload of about 768 KiB, many store pieces);
+/// make the repository's store again from its log (the sliced `vcs_store::rebuild`) and read it once the task ends.
+/// Expect every changeset held again; the replay's window wanted the store's pieces more than once; and it never held
+/// the payload whole, at most one file's delta, a chunk's header and a piece. Red before: the payload was read back
+/// whole (`payload_of`), no want counted.
+#[test]
+fn a_landed_push_replays_from_its_payload_a_piece_at_a_time() {
+  let commits: Vec<Commit> = LARGE
+    .iter()
+    .zip(["one", "two", "three", "four", "five", "six"])
+    .enumerate()
+    .map(|(at, (bytes, name))| (name, name, bytes.as_slice(), at.checked_sub(1), "default"))
+    .collect();
+  let made = history_of(&commits);
+  let part = changegroup(&made, &[0, 1, 2, 3, 4, 5]);
+  let payload = u64::try_from(part.payload.len()).unwrap();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let repository = crate::daemon::observe_first(&daemon, move |state| {
+    let mut hg = Hg::new(state, "pieces");
+    let unbundle = Unbundle {
+      parts: vec![taken(0, Asks::Changegroup(part))],
+    };
+    let answer = hg.push(state, &unbundle, &View::default());
+    assert!(answer.is_ok(), "{answer:?}");
+    crate::vcs_store::rebuild(state, hg.repository);
+    hg.repository
+  });
+  let began = std::time::Instant::now();
+  let rebuilding = loop {
+    let rebuilding = crate::daemon::observe_first(&daemon, move |state| {
+      state.vcs_stores.rebuilding(repository)
+    });
+    if !rebuilding || began.elapsed() > TASK_WAIT {
+      break rebuilding;
+    }
+  };
+  let (changesets, wants, most) = crate::daemon::observe_first(&daemon, move |state| {
+    let (content, store) = state.vcs_stores.mercurial_ref(repository).unwrap();
+    (
+      store.index.len(content, Log::Changelog),
+      state
+        .refusals
+        .get(crate::vcs_store::HG_REPLAY_WANTS)
+        .copied()
+        .unwrap_or(0),
+      state
+        .refusals
+        .get(crate::vcs_store::HG_REPLAY_WINDOW_MOST)
+        .copied()
+        .unwrap_or(0),
+    )
+  });
+  daemon.stop();
+  println!(
+    "A-767 C1 replay: a {payload}-byte payload read in {wants} fills, the window at most {most} bytes"
+  );
+  assert!(!rebuilding, "still rebuilding after {TASK_WAIT:?}");
+  assert_eq!(changesets, 6);
+  assert!(
+    wants > 1,
+    "the replay wanted the store's pieces {wants} times"
+  );
+  let piece = u64::try_from(slates_store::store::PIECE_BYTES).unwrap();
+  let bound = u64::try_from(LARGE_LEN).unwrap() + piece + 256;
+  assert!(
+    most > 0 && most <= bound && most < payload,
+    "the window held {most} at once, of a {payload}-byte payload"
+  );
 }
 
 fn assert_plain_landed(state: &ShardState, hg: &Hg, made: &[Made]) {
@@ -638,7 +751,7 @@ fn assert_plain_landed(state: &ShardState, hg: &Hg, made: &[Made]) {
 /// and forty lower-case hexadecimal digits; the same name gives the same id, another name another.
 #[test]
 fn a_push_names_its_transaction_as_7_2_does() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let mut hg = Hg::new(state, "transaction");
     rebuild(state, &mut hg, (&[1], 1));
     let view = View::of(
@@ -688,7 +801,7 @@ fn reply_parts(bytes: &[u8]) -> Vec<ReplyPart> {
 /// reply to the changegroup part, right after `reply:changegroup`.
 #[test]
 fn a_hooks_words_follow_the_changegroup_reply_naming_its_part() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let mut hg = Hg::new(state, "words");
     let made = rebuild(state, &mut hg, (&[1], 1));
     let view = View::of(
@@ -726,7 +839,7 @@ fn a_hooks_words_follow_the_changegroup_reply_naming_its_part() {
 /// `push-race` reply, and nothing of it is applied: `default` at `other`, its changeset not held, no root of it.
 #[test]
 fn a_push_whose_line_moved_after_its_read_is_answered_as_7_2s_race() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let mut hg = Hg::new(state, "race");
     let made = rebuild(state, &mut hg, (&[1], 1));
     let view = View::of(
@@ -776,7 +889,7 @@ fn a_push_whose_line_moved_after_its_read_is_answered_as_7_2s_race() {
 /// repository's index after: the second re-based by node, nothing of the first lost.
 #[test]
 fn two_pushes_taken_side_by_side_both_land() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let mut hg = Hg::new(state, "side-by-side");
     let made = rebuild(state, &mut hg, (&[1], 1));
     let first = Unbundle {
@@ -841,7 +954,7 @@ fn view_with(made: &[Made], drafts: &[usize]) -> View {
 /// is applied.
 #[test]
 fn a_push_is_refused_when_a_green_it_only_checked_moved() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let mut hg = Hg::new(state, "heads");
     let made = rebuild(state, &mut hg, (&[1], 1));
     let first = Unbundle {
@@ -896,7 +1009,7 @@ fn a_push_is_refused_when_a_green_it_only_checked_moved() {
 /// phases log one position on.
 #[test]
 fn a_published_draft_leaves_the_roots_in_the_same_entry() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let mut hg = Hg::new(state, "phase");
     let made = rebuild(state, &mut hg, (&[0], 1));
     assert_eq!(hg.roots(state), BTreeSet::from([made[1].node]));
@@ -921,7 +1034,7 @@ fn a_published_draft_leaves_the_roots_in_the_same_entry() {
 /// moved to `second`, holding `b`; `default`'s line untouched.
 #[test]
 fn a_bookmark_moves_on_its_own_green() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let mut hg = Hg::new(state, "bookmark");
     let made = rebuild(state, &mut hg, (&[0], 0));
     let main = hg.bound(state, &bookmark_name(b"main")).unwrap();
@@ -1077,7 +1190,7 @@ fn set_hook(state: &mut ShardState, name: &str, hook: &str) {
 /// store's index holding it.
 #[test]
 fn a_push_through_the_driver_lands_in_the_repositorys_store_unless_a_hook_waits() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let mut driven = Hg::new(state, "driven");
     let made = rebuild(state, &mut driven, (&[1], 1));
     let mut hooked = Hg::new(state, "hooked");
@@ -1086,7 +1199,7 @@ fn a_push_through_the_driver_lands_in_the_repositorys_store_unless_a_hook_waits(
     let (principal, heads) = (owner(), HeadsArgument::Force);
     let pushing = (&principal, &heads, &fixture!("push-plain.hg")[..]);
     let version = state.db.partition().green_head(hooked.root);
-    let refused = super::unbundle_in(state, hooked.repository, pushing, &mut room());
+    let refused = drive(state, hooked.repository, pushing, &mut room());
     let message = b"the repository's pretxnchangegroup.check hook cannot run here yet: its view of the push is \
                     not served"
       .to_vec();
@@ -1099,7 +1212,7 @@ fn a_push_through_the_driver_lands_in_the_repositorys_store_unless_a_hook_waits(
     );
     assert_eq!(state.db.partition().green_head(hooked.root), version);
     assert!(!hooked.holds(state, &made[3].node));
-    let accepted = super::unbundle_in(state, driven.repository, pushing, &mut room());
+    let accepted = drive(state, driven.repository, pushing, &mut room());
     let Some(Outcome::Accepted(reply)) = accepted else {
       panic!("not accepted: {accepted:?}");
     };
@@ -1107,6 +1220,44 @@ fn a_push_through_the_driver_lands_in_the_repositorys_store_unless_a_hook_waits(
     assert_eq!(head(state, driven.root), Some(made[3].node));
     assert!(driven.holds(state, &made[3].node));
   });
+}
+
+/// The push driver's steps in one call, for a test on a shard (the daemon's driver, `super::unbundle`, takes them a
+/// slice at a time between yields): `heads` judged and the bundle read, the changegroup taken whole, the push landed on
+/// the shard's store first and then judged and landed (`super::land_stored`'s order, the one landing path).
+fn drive(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  (principal, heads, bundle): super::Pushing<'_>,
+  room: &mut Admission,
+) -> Option<Outcome> {
+  let fronted = crate::vcs_store::lent_state(state, |state| {
+    super::front(state, repository, (heads, bundle), room)
+  });
+  let mut unbundle = match fronted? {
+    Ok(unbundle) => unbundle,
+    Err(outcome) => return Some(outcome),
+  };
+  let mut forked = match unbundle.take_changegroup() {
+    None => None,
+    Some(changegroup) => match super::take_whole(state, repository, changegroup, room)? {
+      Ok(forked) => Some(forked),
+      Err(refused) => return Some(Outcome::refused(&refused)),
+    },
+  };
+  if let Some(taken) = forked.as_mut()
+    && let Err(outcome) = super::store_blocking(state, repository, taken)
+  {
+    return Some(outcome);
+  }
+  super::landing(
+    state,
+    repository,
+    (principal, bundle),
+    &unbundle,
+    forked,
+    room,
+  )
 }
 
 /// A rule over `names` matching `pattern`, deciding a submit with `effect` for `who`.
@@ -1137,7 +1288,7 @@ fn rule(
 #[test]
 fn the_policy_refuses_before_the_verdict_in_acls_words() {
   use slates_ipc::protocol::{PolicyEffect, PolicyEntry, PolicyNames, PolicyWho};
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let mut plain = Hg::new(state, "acl-plain");
     rebuild(state, &mut plain, (&[1], 1));
     set_policy(
@@ -1217,7 +1368,7 @@ fn the_policy_refuses_before_the_verdict_in_acls_words() {
 #[test]
 fn a_bookmark_deleted_is_refused_naming_the_empty_changeset_acl_names() {
   use slates_ipc::protocol::{PolicyEffect, PolicyNames, PolicyRight, PolicyRule, PolicyWho};
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let mut marks = Hg::new(state, "acl-delete");
     rebuild(state, &mut marks, (&[1], 1));
     set_policy(
@@ -1266,7 +1417,7 @@ fn a_bookmark_deleted_is_refused_naming_the_empty_changeset_acl_names() {
 #[test]
 fn the_policy_names_the_branch_acl_meets_first() {
   use slates_ipc::protocol::{PolicyEffect, PolicyNames, PolicyWho};
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let mut two = Hg::new(state, "acl-order");
     let made = rebuild(state, &mut two, (&[1], 1));
     set_policy(
@@ -1523,7 +1674,7 @@ mod hooks {
 /// different. Before, the second new green was minted the first's id and the push was answered `error:abort`.
 #[test]
 fn t_a694_a_push_making_two_bookmarks_makes_two_greens() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let mut hg = Hg::new(state, "marks");
     let made = rebuild(state, &mut hg, (&[1], 1));
     let view = View::of(

@@ -159,13 +159,91 @@ pub(crate) enum LoggedOp {
   },
 }
 
-/// A file a work holds of its own, in a restatement: its bytes, or `None` for a file it removed.
+/// A file a work holds of its own, in a restatement: its parts over the work's base, or `None` for a file it removed
+/// (A-806: before, the file's bytes whole, so a 64-byte edit of a 1 MiB file restated 1 MiB).
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OwnFile {
   /// The file.
   pub(crate) path: String,
-  /// Its bytes, or none for a removal.
-  pub(crate) bytes: Option<Vec<u8>>,
+  /// Its parts, or none for a removal.
+  pub(crate) content: Option<LoggedParts>,
+}
+
+/// A held file's parts as the log carries them ([`crate::work_files::HeldParts`]).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LoggedParts {
+  /// The base path its base pieces read.
+  pub(crate) origin: Option<String>,
+  /// Its pieces in order: whether a base piece, where, and how long.
+  pub(crate) pieces: Vec<LoggedPiece>,
+  /// The bytes it wrote.
+  pub(crate) written: Vec<u8>,
+  /// Its length.
+  pub(crate) len: u64,
+}
+
+/// One piece of [`LoggedParts`].
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LoggedPiece {
+  /// A range of the origin's base file, else of the written bytes.
+  pub(crate) base: bool,
+  /// Where.
+  pub(crate) at: u64,
+  /// How long.
+  pub(crate) len: u64,
+}
+
+impl LoggedParts {
+  fn of(parts: &crate::work_files::HeldParts) -> LoggedParts {
+    use crate::work_files::PiecePart;
+    LoggedParts {
+      origin: parts.origin.clone(),
+      pieces: parts
+        .pieces
+        .iter()
+        .map(|piece| match *piece {
+          PiecePart::Base { at, len } => LoggedPiece {
+            base: true,
+            at,
+            len,
+          },
+          PiecePart::Own { at, len } => LoggedPiece {
+            base: false,
+            at,
+            len,
+          },
+        })
+        .collect(),
+      written: parts.written.clone(),
+      len: parts.len,
+    }
+  }
+
+  fn parts(self) -> crate::work_files::HeldParts {
+    use crate::work_files::PiecePart;
+    crate::work_files::HeldParts {
+      origin: self.origin,
+      pieces: self
+        .pieces
+        .into_iter()
+        .map(|piece| {
+          if piece.base {
+            PiecePart::Base {
+              at: piece.at,
+              len: piece.len,
+            }
+          } else {
+            PiecePart::Own {
+              at: piece.at,
+              len: piece.len,
+            }
+          }
+        })
+        .collect(),
+      written: self.written,
+      len: self.len,
+    }
+  }
 }
 
 /// One entry of a work's log.
@@ -196,6 +274,45 @@ pub(crate) enum WorkLogEntry {
     /// Its journal.
     journal: Vec<LoggedOp>,
   },
+}
+
+/// What a work's log holds, for a diagnosis line (A-797's, at a refused log): each entry's kind and bytes, a
+/// restatement's own files with their count, total and largest, an edit's path and length. A cold path, at a refusal.
+pub(crate) fn describe_log(entries: &[Vec<u8>]) -> String {
+  let mut out = String::new();
+  for entry in entries {
+    let part = match <WorkLogEntry as Wire>::from_bytes(entry) {
+      Ok(WorkLogEntry::Edit { path, bytes, .. }) => format!("edit {path} {} bytes", bytes.len()),
+      Ok(WorkLogEntry::Declared { .. }) => "declared".to_owned(),
+      Ok(WorkLogEntry::Restated {
+        base,
+        files,
+        journal,
+      }) => {
+        let sizes = files.iter().map(|file| {
+          (
+            file.content.as_ref().map_or(0, |parts| parts.written.len()),
+            file.path.as_str(),
+          )
+        });
+        let total = sizes
+          .clone()
+          .map(|(len, _)| len)
+          .fold(0usize, usize::saturating_add);
+        let largest = sizes.max_by_key(|(len, _)| *len).unwrap_or((0, ""));
+        format!(
+          "restated at {base}: {} files, {total} bytes, the largest {} {} bytes; {} journal ops",
+          files.len(),
+          largest.1,
+          largest.0,
+          journal.len()
+        )
+      }
+      Err(_) => "undecodable".to_owned(),
+    };
+    out.push_str(&format!("[{} bytes: {part}] ", entry.len()));
+  }
+  out
 }
 
 /// Why a work's log could not be replayed: a refusal the recovery counts, leaving the work unbuilt.
@@ -292,15 +409,20 @@ impl LoggedOp {
 }
 
 impl WorkLogEntry {
-  /// The restatement of a work at `base` holding `files` of its own, with `journal`.
-  pub(crate) fn restated(base: u64, files: &WorkFiles, journal: &[VolumeOp]) -> WorkLogEntry {
+  /// The restatement of a work at `base` holding `files` of its own (a rebase's changed files, as parts over the base,
+  /// A-806), with `journal`.
+  pub(crate) fn restated(
+    base: u64,
+    files: &BTreeMap<String, Option<crate::work_files::HeldParts>>,
+    journal: &[VolumeOp],
+  ) -> WorkLogEntry {
     WorkLogEntry::Restated {
       base,
       files: files
-        .changed_entries()
-        .map(|(path, bytes)| OwnFile {
-          path: path.to_owned(),
-          bytes: bytes.map(<[u8]>::to_vec),
+        .iter()
+        .map(|(path, parts)| OwnFile {
+          path: path.clone(),
+          content: parts.as_ref().map(LoggedParts::of),
         })
         .collect(),
       journal: journal.iter().map(LoggedOp::of).collect(),
@@ -312,12 +434,11 @@ impl WorkLogEntry {
 /// range, and the inserted bytes as an extend past the file's end or an insert within it.
 pub(crate) fn edit_ops(
   path: &str,
-  old: Option<&[u8]>,
+  old_len: Option<u64>,
   (at, delete_len, inserted): (u64, u64, u64),
 ) -> Vec<VolumeOp> {
-  let old_len = old.map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX));
   let mut ops = Vec::new();
-  if old.is_none() {
+  if old_len.is_none() {
     ops.push(VolumeOp::Create {
       path: path.to_owned(),
     });
@@ -330,7 +451,7 @@ pub(crate) fn edit_ops(
     });
   }
   if inserted > 0 {
-    ops.push(if at >= old_len {
+    ops.push(if at >= old_len.unwrap_or(0) {
       VolumeOp::Extend {
         path: path.to_owned(),
         at,
@@ -390,10 +511,10 @@ pub(crate) fn replay(
         journal: logged,
       } => {
         version = restated;
-        files = WorkFiles::from_changed(
+        files = WorkFiles::from_parts(
           own
             .into_iter()
-            .map(|file| (file.path, file.bytes))
+            .map(|file| (file.path, file.content.map(LoggedParts::parts)))
             .collect::<BTreeMap<_, _>>(),
         );
         journal = logged
@@ -411,10 +532,11 @@ pub(crate) fn replay(
           green,
           fetched: None,
           version,
+          entries: None,
         };
-        let old = files.get(base, &path)?.map(std::borrow::Cow::into_owned);
+        let old_len = files.len(base, &path)?;
         let inserted = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        let ops = edit_ops(&path, old.as_deref(), (at, delete_len, inserted));
+        let ops = edit_ops(&path, old_len, (at, delete_len, inserted));
         apply_edit(
           (&mut files, &mut journal),
           base,
@@ -429,6 +551,7 @@ pub(crate) fn replay(
             green,
             fetched: None,
             version,
+            entries: None,
           },
           op.op()?,
         )?;
@@ -449,6 +572,16 @@ mod tests {
   use super::*;
 
   /// One of every journal operation, so a round trip covers each variant.
+  /// No base: a work whose green is gone, which reads only what it holds whole.
+  fn no_base() -> Base<'static> {
+    Base {
+      green: None,
+      fetched: None,
+      version: 0,
+      entries: None,
+    }
+  }
+
   fn every_op() -> Vec<VolumeOp> {
     let node = SpecialNode {
       kind: slates_merge::special::SpecialKind::Fifo,
@@ -545,23 +678,23 @@ mod tests {
   /// it; expect the same entry, and the replay of it alone to give back the base, the files and the journal.
   #[test]
   fn a_restatement_round_trips_every_journal_operation() {
-    let files = WorkFiles::from_changed(
-      [
-        ("kept".to_owned(), Some(b"own bytes".to_vec())),
-        ("gone".to_owned(), None),
-      ]
-      .into_iter()
-      .collect(),
-    );
+    let own: BTreeMap<String, Option<Vec<u8>>> = [
+      ("kept".to_owned(), Some(b"own bytes".to_vec())),
+      ("gone".to_owned(), None),
+    ]
+    .into_iter()
+    .collect();
+    let files = WorkFiles::from_changed(own.clone());
+    let parts = files.parts();
     let journal = every_op();
-    let entry = WorkLogEntry::restated(9, &files, &journal);
+    let entry = WorkLogEntry::restated(9, &parts, &journal);
     let bytes = entry.to_bytes();
     assert_eq!(WorkLogEntry::from_bytes(&bytes).unwrap(), entry);
     let (base, replayed_files, replayed_journal) = replay(None, 0, &[bytes]).unwrap();
     assert_eq!(base, 9);
     assert_eq!(
-      replayed_files.changed_entries().collect::<Vec<_>>(),
-      files.changed_entries().collect::<Vec<_>>()
+      replayed_files.changed_entries(no_base()).unwrap(),
+      files.changed_entries(no_base()).unwrap()
     );
     assert_eq!(replayed_journal, journal);
   }
@@ -570,12 +703,11 @@ mod tests {
   /// expect each refused `Undecodable` by the replay, never a panic or a partial work.
   #[test]
   fn a_truncated_or_overlong_entry_is_refused() {
-    let files = WorkFiles::from_changed(
-      [("kept".to_owned(), Some(b"own bytes".to_vec()))]
-        .into_iter()
-        .collect(),
-    );
-    let bytes = WorkLogEntry::restated(3, &files, &every_op()).to_bytes();
+    let own: BTreeMap<String, Option<Vec<u8>>> = [("kept".to_owned(), Some(b"own bytes".to_vec()))]
+      .into_iter()
+      .collect();
+    let parts = WorkFiles::from_changed(own).parts();
+    let bytes = WorkLogEntry::restated(3, &parts, &every_op()).to_bytes();
     for cut in 0..bytes.len() {
       assert_eq!(
         replay(None, 0, &[bytes[..cut].to_vec()]).err(),

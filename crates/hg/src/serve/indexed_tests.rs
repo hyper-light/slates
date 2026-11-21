@@ -320,7 +320,9 @@ fn texts_of(
 #[test]
 fn a_clone_over_the_view_carries_its_changesets_each_text_lent_once_in_place() {
   let (imported, store) = imported("states");
-  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
+    .unwrap()
+    .answering_from_its_texts();
   assert_eq!(
     view.lends(),
     Lends {
@@ -439,12 +441,13 @@ fn long_texts_indexed() -> (HgIndex, ContentStore, [Vec<u8>; 3]) {
 /// A-680 part 1: do lend, from a store whose window is 4,096 bytes, a changeset text of 10,000 bytes, a manifest text
 /// of 8,200, a file revision with a metadata block (its bytes 5,000 long) and a short one without, first the
 /// changeset's with a room a byte short. Expect the short room refused before anything is copied; then the long texts
-/// and the framed one copied exactly (the block between its markers, then the bytes) and the short one lent in place,
-/// each with its position, parents and link, and nothing for a node no log holds.
+/// copied exactly, each with its position, parents and link; the file revisions' rows read with no text (A-767 C1: the
+/// served view lends no file's whole text, which a fetch reads from the changeset store); and nothing for a node no
+/// log holds.
 #[test]
 fn texts_longer_than_a_window_are_copied_within_the_room() {
   let (node, manifest_node, f_node, g_node) = ([1; 20], [2; 20], [3; 20], [4; 20]);
-  let (index, store, [changeset, manifest, framed]) = long_texts_indexed();
+  let (index, store, [changeset, manifest, _]) = long_texts_indexed();
   let no_state = State {
     roots: &[],
     bookmarks: &[],
@@ -461,15 +464,15 @@ fn texts_longer_than_a_window_are_copied_within_the_room() {
   );
   assert_eq!(view.lends(), Lends::default());
   long_texts_are_copied(&view, [node, manifest_node], [changeset, manifest]);
-  file_texts_are_lent(&view, [f_node, g_node], &framed);
+  file_rows_are_read(&view, [f_node, g_node]);
   assert_eq!(
     view.lends(),
     Lends {
-      in_place: 1,
-      copied: 3
+      in_place: 0,
+      copied: 2
     }
   );
-  assert_eq!(view.file(b"g", &f_node, &mut room()), Ok(None));
+  assert_eq!(view.file_entry(b"g", &f_node), None);
   assert_eq!(view.manifest(&[9; 20], &mut room()), Ok(None));
 }
 
@@ -488,13 +491,12 @@ fn long_texts_are_copied(view: &Indexed<'_>, nodes: [Node; 2], texts: [Vec<u8>; 
   );
 }
 
-/// The file revisions of [`long_texts_indexed`] (`nodes` `f`'s and `g`'s) lent from `view`: `f`'s framed text
-/// (`framed`) copied exactly, `g`'s short one lent in place.
-fn file_texts_are_lent(view: &Indexed<'_>, [f_node, g_node]: [Node; 2], framed: &[u8]) {
-  let logged = view.file(b"f", &f_node, &mut room()).unwrap().unwrap();
-  assert!(matches!(&logged.text, Cow::Owned(text) if *text == framed));
-  let logged = view.file(b"g", &g_node, &mut room()).unwrap().unwrap();
-  assert!(matches!(logged.text, Cow::Borrowed(b"g\n")));
+/// The file revisions of [`long_texts_indexed`] (`nodes` `f`'s and `g`'s) as `view`'s rows hold them, no text lent.
+fn file_rows_are_read(view: &Indexed<'_>, [f_node, g_node]: [Node; 2]) {
+  for (path, node) in [(&b"f"[..], f_node), (b"g", g_node)] {
+    let entry = view.file_entry(path, &node).unwrap();
+    assert_eq!(entry.parents, [NULL_NODE; 2], "{path:?}");
+  }
 }
 
 /// What a generated changeset is: its parents (earlier revisions), the phase root at it, the marker naming it as a
@@ -1085,6 +1087,81 @@ fn streamed(answer: &[u8]) -> Streamed {
   (status, sent)
 }
 
+/// A changeset store as a stream asks it, over an imported index: every revision kept whole, its place its raw text
+/// under its text's own identity (the store's contract for a whole, A-767 C1), so the stream's bytes are the whole
+/// rendering's (`render::revlogs`).
+struct WholeTexts<'s> {
+  index: &'s crate::index::HgIndex,
+  store: &'s slates_vcs::ContentStore,
+  texts: BTreeMap<[u8; 32], Vec<u8>>,
+}
+
+impl crate::render::StoredSource for WholeTexts<'_> {
+  fn rows(
+    &mut self,
+    logs: &[(Vec<u8>, Vec<Node>)],
+  ) -> Option<Vec<Vec<Option<crate::render::StoredRevision>>>> {
+    logs
+      .iter()
+      .map(|(log, nodes)| self.log_rows(log, nodes))
+      .collect()
+  }
+
+  fn chunks(&mut self, places: &[crate::render::StoredPlace]) -> Option<Vec<Vec<u8>>> {
+    places
+      .iter()
+      .map(|place| self.texts.get(&place.payload).cloned())
+      .collect()
+  }
+}
+
+impl WholeTexts<'_> {
+  /// One log's rows ([`crate::render::StoredSource::rows`]).
+  fn log_rows(
+    &mut self,
+    log: &[u8],
+    nodes: &[Node],
+  ) -> Option<Vec<Option<crate::render::StoredRevision>>> {
+    let log = match log {
+      b"\0changelog" => crate::index::Log::Changelog,
+      b"\0manifest" => crate::index::Log::Manifest,
+      path => crate::index::Log::File(path),
+    };
+    let mut rows = Vec::with_capacity(nodes.len());
+    for node in nodes {
+      let rev = self.index.rev(self.store, log, node)?;
+      let kept = crate::import::record::kept(self.index, self.store, log, rev)?;
+      let mut text = Vec::new();
+      crate::import::record::write_text(&mut text, self.store, &kept);
+      let identity = *blake3::hash(&text).as_bytes();
+      let len = u64::try_from(text.len()).ok()?;
+      self.texts.insert(identity, text);
+      rows.push(Some(crate::render::StoredRevision {
+        text: identity,
+        base: None,
+        place: crate::render::StoredPlace {
+          payload: identity,
+          offset: 0,
+          len,
+        },
+      }));
+    }
+    Some(rows)
+  }
+}
+
+/// The whole-text store of `index`.
+fn whole_texts<'s>(
+  index: &'s crate::index::HgIndex,
+  store: &'s slates_vcs::ContentStore,
+) -> WholeTexts<'s> {
+  WholeTexts {
+    index,
+    store,
+    texts: BTreeMap::new(),
+  }
+}
+
 /// Stream clones part 2 (A-712; 7.2's `generatev1wireproto`): do ask `stream_out` of the `states` repository, which
 /// holds a secret changeset, and of the same repository with its secret root dropped. Expect the first answered `1\n`
 /// and listing no `streamreqs`; the second `0\n`, then every non-empty revlog of `render::revlogs` in its order, each
@@ -1096,7 +1173,13 @@ fn stream_out_sends_the_rendered_revlogs_unless_a_changeset_is_secret() {
   let (imported, store) = imported("states");
   let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
   let mut answer = Vec::new();
-  stream_out(&view, &mut room(), &mut answer).unwrap();
+  stream_out(
+    &view,
+    &mut whole_texts(&imported.index, &store),
+    &mut room(),
+    &mut answer,
+  )
+  .unwrap();
   assert_eq!(answer, b"1\n");
   assert!(!view.streams());
   let public: Vec<PhaseHead> = imported
@@ -1111,7 +1194,13 @@ fn stream_out_sends_the_rendered_revlogs_unless_a_changeset_is_secret() {
   };
   let view = Indexed::new(&imported.index, &store, state, &mut room()).unwrap();
   let mut answer = Vec::new();
-  stream_out(&view, &mut room(), &mut answer).unwrap();
+  stream_out(
+    &view,
+    &mut whole_texts(&imported.index, &store),
+    &mut room(),
+    &mut answer,
+  )
+  .unwrap();
   let (status, sent) = streamed(&answer);
   assert_eq!(status, b"0");
   let expected: Vec<(Vec<u8>, Vec<u8>)> =
@@ -1153,7 +1242,9 @@ fn a_full_clone_walked_by_its_links_carries_what_the_namers_name() {
   let mut walked = 0;
   for name in ["amended-root", "divergent", "states"] {
     let (imported, store) = imported(name);
-    let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+    let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
+      .unwrap()
+      .answering_from_its_texts();
     if !view.serves_every_changeset() {
       continue;
     }
@@ -1161,7 +1252,7 @@ fn a_full_clone_walked_by_its_links_carries_what_the_namers_name() {
     let outgoing = pull::outgoing(&view, b"", b"", &mut room()).unwrap();
     let by_links = changegroup(&view, &outgoing, Version::V03, &mut room()).unwrap();
     let named =
-      super::super::getbundle::named_changegroup(&view, &outgoing, Version::V03, &mut room())
+      super::super::getbundle::named_changegroup_whole(&view, &outgoing, Version::V03, &mut room())
         .unwrap();
     assert_eq!(carried(&by_links), carried(&named), "{name}");
     assert!(!carried(&by_links).is_empty(), "{name}");
@@ -1190,14 +1281,26 @@ fn a_stream_clone_is_sent_a_row_at_a_time_each_within_its_own_room() {
     };
     let view = Indexed::new(&imported.index, &store, state, &mut room()).unwrap();
     let mut whole = Vec::new();
-    stream_out(&view, &mut room(), &mut whole).unwrap();
+    stream_out(
+      &view,
+      &mut whole_texts(&imported.index, &store),
+      &mut room(),
+      &mut whole,
+    )
+    .unwrap();
     let stepped = |each: u64| -> Option<Vec<u8>> {
       let mut streaming = crate::render::Streaming::default();
+      let mut source = whole_texts(&imported.index, &store);
       let mut out = Vec::new();
-      while streaming
-        .step(&imported.index, &store, &mut Admission::new(each), &mut out)
-        .ok()?
-      {}
+      loop {
+        crate::render::answer_want(&mut streaming, &mut source).ok()?;
+        if !streaming
+          .step(&imported.index, &store, &mut Admission::new(each), &mut out)
+          .ok()?
+        {
+          break;
+        }
+      }
       Some(out)
     };
     let least = |takes: &dyn Fn(u64) -> bool| {
@@ -1212,8 +1315,15 @@ fn a_stream_clone_is_sent_a_row_at_a_time_each_within_its_own_room() {
       }
       high
     };
-    let whole_room =
-      least(&|each| stream_out(&view, &mut Admission::new(each), &mut Vec::new()).is_ok());
+    let whole_room = least(&|each| {
+      stream_out(
+        &view,
+        &mut whole_texts(&imported.index, &store),
+        &mut Admission::new(each),
+        &mut Vec::new(),
+      )
+      .is_ok()
+    });
     let step_room = least(&|each| stepped(each).is_some());
     assert!(
       step_room < whole_room,
@@ -1221,4 +1331,424 @@ fn a_stream_clone_is_sent_a_row_at_a_time_each_within_its_own_room() {
     );
     assert_eq!(stepped(step_room).unwrap(), whole, "{name}");
   }
+}
+
+/// Ada's no-allocation rule and goal 93's clone (found in the code, 2026-11-20: a clone sent every manifest as its whole
+/// text against the null base, about 57,000 texts of up to 179 KB for hg's own history, each rebuilt from its chain on
+/// the server and diffed again by the client). Do: import each of `fixtures/state`'s repositories, its manifests kept
+/// as deltas (A-729), and clone each view that serves every changeset by its links; rebuild every manifest the answer
+/// carries from its base as a client does, each checked against its node. Expect every text to rebuild to its node,
+/// and some manifest sent as its stored delta against the one sent before it rather than whole.
+#[test]
+fn a_clone_sends_a_manifest_kept_as_a_delta_as_that_delta() {
+  let mut deltas = 0usize;
+  for name in ["amended-root", "divergent", "states"] {
+    let (imported, store) = imported(name);
+    let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
+      .unwrap()
+      .answering_from_its_texts();
+    if !view.serves_every_changeset() {
+      continue;
+    }
+    let outgoing = pull::outgoing(&view, b"", b"", &mut room()).unwrap();
+    let packed = changegroup(&view, &outgoing, Version::V03, &mut room()).unwrap();
+    let packed = Changegroup::decode(&packed, Version::V03, &mut room()).unwrap();
+    let mut texts: BTreeMap<Node, Vec<u8>> = BTreeMap::new();
+    for revision in packed.group(&packed.manifests) {
+      let base: &[u8] = if revision.base == NULL_NODE {
+        &[]
+      } else {
+        deltas += 1;
+        texts
+          .get(&revision.base)
+          .map(Vec::as_slice)
+          .expect("a base sent before")
+      };
+      let text = delta::apply(base, revision.data, &mut room()).unwrap();
+      node::check(&revision.node, &revision.p1, &revision.p2, &text).unwrap();
+      texts.insert(revision.node, text);
+    }
+  }
+  assert!(deltas > 0, "every manifest was sent whole");
+}
+
+/// A changeset store keeping each revision after a log's first as a delta against the one before it: one hunk replacing
+/// the bytes the two texts do not share at their ends (an `mpatch` edit, the store's one form), the first whole.
+struct Deltas<'s> {
+  whole: WholeTexts<'s>,
+  edits: BTreeMap<[u8; 32], Vec<u8>>,
+  delta_bytes: u64,
+}
+
+impl crate::render::StoredSource for Deltas<'_> {
+  fn rows(
+    &mut self,
+    logs: &[(Vec<u8>, Vec<Node>)],
+  ) -> Option<Vec<Vec<Option<crate::render::StoredRevision>>>> {
+    logs
+      .iter()
+      .map(|(log, nodes)| self.log_rows(log, nodes))
+      .collect()
+  }
+
+  fn chunks(&mut self, places: &[crate::render::StoredPlace]) -> Option<Vec<Vec<u8>>> {
+    places
+      .iter()
+      .map(|place| {
+        self
+          .edits
+          .get(&place.payload)
+          .cloned()
+          .or_else(|| self.whole.texts.get(&place.payload).cloned())
+      })
+      .collect()
+  }
+}
+
+impl Deltas<'_> {
+  /// One log's rows ([`crate::render::StoredSource::rows`]): after its first, each revision kept as an edit against the
+  /// one before it.
+  fn log_rows(
+    &mut self,
+    log: &[u8],
+    nodes: &[Node],
+  ) -> Option<Vec<Option<crate::render::StoredRevision>>> {
+    let wholes = self.whole.log_rows(log, nodes)?;
+    let mut rows = Vec::with_capacity(wholes.len());
+    let mut before: Option<([u8; 32], Vec<u8>)> = None;
+    for row in wholes {
+      let row = row?;
+      let text = self.whole.texts.get(&row.text)?.clone();
+      let stored = match &before {
+        Some((base, base_text)) if *base != row.text => {
+          let start = base_text
+            .iter()
+            .zip(&text)
+            .take_while(|(a, b)| a == b)
+            .count();
+          let tail = base_text[start..]
+            .iter()
+            .rev()
+            .zip(text[start..].iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+          let (end, data) = (base_text.len() - tail, &text[start..text.len() - tail]);
+          let mut edit = Vec::new();
+          for field in [start, end, data.len()] {
+            edit.extend_from_slice(&u32::try_from(field).ok()?.to_be_bytes());
+          }
+          edit.extend_from_slice(data);
+          let place = *blake3::hash(&edit).as_bytes();
+          let len = u64::try_from(edit.len()).ok()?;
+          self.edits.insert(place, edit);
+          crate::render::StoredRevision {
+            text: row.text,
+            base: Some(*base),
+            place: crate::render::StoredPlace {
+              payload: place,
+              offset: 0,
+              len,
+            },
+          }
+        }
+        _ => row,
+      };
+      self.delta_bytes = self.delta_bytes.saturating_add(stored.place.len);
+      before = Some((row.text, text));
+      rows.push(Some(stored));
+    }
+    Some(rows)
+  }
+}
+
+/// Goal 93 perf (main's ruling of 2026-11-21 00:30: a stream sends each revision as its stored delta against its stored
+/// base, read in place, never a text made whole). Do: stream the `states` repository (its secret root dropped) from a
+/// store keeping each revision after a log's first as a delta, and from one keeping every revision whole; read every
+/// streamed revlog back with the revlog reader, each text held to its node. Expect: the delta stream's chunk bytes the
+/// store's delta bytes plus one marker a chunk (so its bytes within the deltas, the entries and the file lines), fewer
+/// bytes than the whole stream, and every revision read back.
+#[test]
+fn a_stream_sends_each_revision_as_the_store_keeps_it_within_its_delta_bytes() {
+  use super::super::stream::stream_out;
+  let (imported, store) = imported("states");
+  let public: Vec<PhaseHead> = imported
+    .phase_roots
+    .iter()
+    .filter(|root| root.phase != Phase::Secret)
+    .copied()
+    .collect();
+  let state = State {
+    roots: &public,
+    ..state_of(&imported)
+  };
+  let view = Indexed::new(&imported.index, &store, state, &mut room()).unwrap();
+  let mut whole = Vec::new();
+  stream_out(
+    &view,
+    &mut whole_texts(&imported.index, &store),
+    &mut room(),
+    &mut whole,
+  )
+  .unwrap();
+  let mut deltas = Deltas {
+    whole: whole_texts(&imported.index, &store),
+    edits: BTreeMap::new(),
+    delta_bytes: 0,
+  };
+  let mut answer = Vec::new();
+  stream_out(&view, &mut deltas, &mut room(), &mut answer).unwrap();
+  let (status, sent) = streamed(&answer);
+  assert_eq!(status, b"0");
+  let entries: usize = sent
+    .iter()
+    .filter(|(name, _)| name.ends_with(b".i"))
+    .map(|(_, bytes)| bytes.len())
+    .sum();
+  let chunks: usize = sent
+    .iter()
+    .filter(|(name, _)| name.ends_with(b".d"))
+    .map(|(_, bytes)| bytes.len())
+    .sum();
+  let revisions = entries / 64;
+  // Counted twice by the walk (the count, then the writing), the store's bytes are half its tally.
+  let delta_bytes = usize::try_from(deltas.delta_bytes / 2).unwrap();
+  assert!(
+    chunks <= delta_bytes + revisions,
+    "chunks {chunks}, deltas {delta_bytes}, revisions {revisions}"
+  );
+  assert!(
+    answer.len() < whole.len(),
+    "{} against the whole {}",
+    answer.len(),
+    whole.len()
+  );
+  // Every revlog read back: each text rebuilt through its chain and held to its node by the reader.
+  for (name, index_bytes) in sent.iter().filter(|(name, _)| name.ends_with(b".i")) {
+    let data_name = [&name[..name.len() - 2], b".d"].concat();
+    let data = sent
+      .iter()
+      .find(|(sent_name, _)| *sent_name == data_name)
+      .map_or(&[][..], |(_, bytes)| bytes.as_slice());
+    let log = crate::revlog::Revlog::open(index_bytes, data, &mut room()).unwrap();
+    for rev in 0..log.len() {
+      log.text(rev, &mut room()).unwrap_or_else(|refused| {
+        panic!("{:?} rev {rev}: {refused:?}", String::from_utf8_lossy(name))
+      });
+    }
+  }
+}
+
+/// A changeset store that counts what a stream asks of it, answering through `inner`.
+struct Counted<S> {
+  inner: S,
+  rows: usize,
+  chunks: usize,
+}
+
+impl<S: crate::render::StoredSource> crate::render::StoredSource for Counted<S> {
+  fn rows(
+    &mut self,
+    logs: &[(Vec<u8>, Vec<Node>)],
+  ) -> Option<Vec<Vec<Option<crate::render::StoredRevision>>>> {
+    self.rows += 1;
+    self.inner.rows(logs)
+  }
+
+  fn chunks(&mut self, places: &[crate::render::StoredPlace]) -> Option<Vec<Vec<u8>>> {
+    self.chunks += 1;
+    self.inner.chunks(places)
+  }
+}
+
+/// Shape: the file logs of [`a_stream_asks_the_store_by_the_room_not_by_the_log`]'s repository, many beside its three
+/// other logs, so an ask a log stands out.
+const MANY_LOGS: u64 = 64;
+
+/// Goal 93 perf (main's order of 2026-11-21 05:06: the stream clone ~37x slower than stock; r20 on 94c1696bb, hg-src:
+/// the serving shard idle half the stream, waiting on one store ask a log, both passes, about 12,000 of them, each a turn
+/// with its view made afresh). Do: build a repository of one changeset and [`MANY_LOGS`] file logs of one revision
+/// each; stream it whole, in a room that holds it, from a store that counts its asks. Expect the store asked for rows
+/// once a pass (the count, then the writing) and for chunks once, whatever the logs; and the same bytes as the stream
+/// made a step at a time in a room that holds one log's rows or one chunk (which asks more).
+#[test]
+fn a_stream_asks_the_store_by_the_room_not_by_the_log() {
+  use super::super::stream::stream_out;
+  let mut built = build(
+    &[Made {
+      parents: [None, None],
+      root: None,
+      marker: None,
+      bookmark: false,
+    }],
+    false,
+  );
+  for at in 0..MANY_LOGS {
+    let path = format!("file-{at:03}").into_bytes();
+    let text = format!("text of file {at}\n").into_bytes();
+    let revision = NewRevision {
+      node: node::compute(&NULL_NODE, &NULL_NODE, &text).unwrap(),
+      p1: NULL_NODE,
+      p2: NULL_NODE,
+      link: built.nodes[0],
+      flags: 0,
+      len: u64::try_from(text.len()).unwrap(),
+      bytes: built.store.put(&text).unwrap(),
+      block: None,
+    };
+    built
+      .index
+      .append_revisions(&mut built.store, Log::File(&path), &[revision])
+      .unwrap();
+  }
+  let view = view_of(&built, true);
+  let mut counted = Counted {
+    inner: whole_texts(&built.index, &built.store),
+    rows: 0,
+    chunks: 0,
+  };
+  let mut answer = Vec::new();
+  stream_out(&view, &mut counted, &mut room(), &mut answer).unwrap();
+  let (status, sent) = streamed(&answer);
+  assert_eq!(status, b"0");
+  // The same stream a step at a time in a small room, its batches a log or a chunk each: the same bytes.
+  let mut streaming = crate::render::Streaming::default();
+  let mut small = Counted {
+    inner: whole_texts(&built.index, &built.store),
+    rows: 0,
+    chunks: 0,
+  };
+  let mut stepped = Vec::new();
+  loop {
+    crate::render::answer_want(&mut streaming, &mut small).unwrap();
+    if !streaming
+      .step(
+        &built.index,
+        &built.store,
+        &mut Admission::new(SMALL_ROOM),
+        &mut stepped,
+      )
+      .unwrap()
+    {
+      break;
+    }
+  }
+  assert_eq!(stepped, answer, "the stream asked a log at a time");
+  assert!(
+    small.rows > counted.rows,
+    "a small room asked {} times",
+    small.rows
+  );
+  assert_eq!(
+    (
+      sent
+        .iter()
+        .filter(|(name, _)| name.ends_with(b".i"))
+        .count(),
+      counted.rows,
+      counted.chunks
+    ),
+    // The file logs and the changelog: `build`'s changesets name no manifest, so no manifest log is written.
+    (usize::try_from(MANY_LOGS).unwrap() + 1, 2, 1),
+    "(index files, row asks, chunk asks)"
+  );
+}
+
+/// Shape: a step's room small enough that a batch holds one log's rows or one chunk, large enough for an entry.
+const SMALL_ROOM: u64 = 1 << 8;
+
+/// A-767 C1 (main's ruling (A) of 2026-11-21: lookup's `.hgtags` through the changeset store). Do: over `hidden-tag`
+/// (`make-state-fixtures.sh`: a visible head whose `.hgtags` tags the root `seen`, and a pruned, hidden head whose
+/// `.hgtags` alone tags `hidden-only`), read the heads' `.hgtags` from the store and look up both names. Expect one want
+/// of rows naming only the visible head's `.hgtags` revision, then one of texts; `seen` the root, as stock 7.2's `hg log
+/// -r seen` resolved it; `hidden-only` unknown, its hidden head's `.hgtags` never read.
+#[test]
+fn a_tag_only_a_hidden_head_carries_is_unknown_and_the_tags_are_read_in_one_round() {
+  use super::super::lookup::{TagsRead, lookup};
+  use crate::render::Want;
+  let (imported, store) = imported("hidden-tag");
+  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
+    .unwrap()
+    .answering_from_its_texts();
+  let mut tags = TagsRead::begin(&view, &mut room()).unwrap();
+  let mut asks = Vec::new();
+  while let Some(want) = tags.wants().cloned() {
+    tags.give(view.stored_now(&want).unwrap());
+    asks.push(want);
+  }
+  assert_eq!(asks.len(), 2, "one want of rows, one of texts: {asks:?}");
+  match &asks[0] {
+    Want::Rows { logs } => {
+      assert_eq!(logs.len(), 1);
+      assert_eq!(logs[0].0, b".hgtags");
+      assert_eq!(logs[0].1.len(), 1, "the visible head's .hgtags alone");
+    }
+    other => panic!("rows first, not {other:?}"),
+  }
+  let answer = |key: &str| {
+    let mut out = Vec::new();
+    lookup(&view, Some(&tags), key.as_bytes(), &mut room(), &mut out).unwrap();
+    String::from_utf8(out).unwrap()
+  };
+  assert_eq!(
+    answer("seen"),
+    "1 c3daaa7ea5f5d20902f12c53611fefce7e15cefa\n"
+  );
+  assert_eq!(answer("hidden-only"), "0 unknown revision 'hidden-only'\n");
+}
+
+/// A-767 C1 (main's ruling (A)). Do: over `states`, whose heads hold no `.hgtags`, begin reading the tags over a view
+/// that answers the store only between steps, and look up a name nothing has, in a whole answer too. Expect nothing
+/// asked of the store and the name unknown in 7.2's words.
+#[test]
+fn a_repository_without_hgtags_asks_the_store_nothing_for_a_lookup() {
+  use super::super::lookup::{TagsRead, lookup};
+  let (imported, store) = imported("states");
+  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+  let tags = TagsRead::begin(&view, &mut room()).unwrap();
+  assert_eq!(tags.wants(), None);
+  let mut out = Vec::new();
+  lookup(&view, Some(&tags), b"nothing", &mut room(), &mut out).unwrap();
+  assert_eq!(out, b"0 unknown revision 'nothing'\n");
+  let whole = TagsRead::now(&view, &mut room()).unwrap();
+  assert_eq!(whole.wants(), None);
+}
+
+/// A-767 C1 (main's ruling (A): one round of wants for all the names a batch looks up). Do: over `hidden-tag`, answer
+/// a `batch` of two lookups that reach the tags, its view answering the store only between steps, its wants answered by
+/// the caller. Expect the batch to wait on the store once, two asks in all (rows, texts) for both lookups, and its
+/// answer `seen`'s node then `nope` unknown.
+#[test]
+fn a_batch_of_lookups_reads_the_tags_once() {
+  use super::super::session::{Batch, BatchStep, Transport};
+  use crate::render::StoreWants;
+  let (imported, store) = imported("hidden-tag");
+  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+  let answering = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
+    .unwrap()
+    .answering_from_its_texts();
+  let mut batch = Batch::begin(b"lookup key=seen;lookup key=nope", &mut room()).unwrap();
+  let mut waits = 0;
+  let mut asks = 0;
+  let answer = loop {
+    match batch.step(&view, Transport::Ssh, &mut room()).unwrap() {
+      BatchStep::Store => {
+        waits += 1;
+        while let Some(want) = batch.wants().cloned() {
+          asks += 1;
+          match answering.stored_now(&want).unwrap() {
+            super::super::getbundle::Given::Rows(rows) => batch.give_rows(rows),
+            super::super::getbundle::Given::Texts(texts) => batch.give_texts(texts),
+            other => panic!("a .hgtags read is given rows or texts, not {other:?}"),
+          }
+        }
+      }
+      BatchStep::Answered(answer) => break answer,
+      BatchStep::Push(_) => panic!("no pushkey call"),
+    }
+  };
+  assert_eq!((waits, asks), (1, 2));
+  assert_eq!(
+    String::from_utf8(answer).unwrap(),
+    "1 c3daaa7ea5f5d20902f12c53611fefce7e15cefa\n;0 unknown revision 'nope'\n"
+  );
 }

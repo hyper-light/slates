@@ -188,7 +188,7 @@ impl ChunkArena {
   pub fn new(granule: usize) -> Self {
     // Checked, never wrapped: 2^64 arenas cannot be made in practice, but a spent space refuses by type.
     let identity = ARENAS
-      .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |taken| {
+      .try_update(Ordering::Relaxed, Ordering::Relaxed, |taken| {
         taken.checked_add(1)
       })
       .ok()
@@ -1073,6 +1073,26 @@ impl ChunkArena {
       .get_mut(extent.offset()..extent.offset().checked_add(extent.len())?)
   }
 
+  /// The bytes the arena's allocations hold, region by region, as `(region id, offset, len)` runs in address order,
+  /// adjacent blocks joined into one run: the only bytes of a region whose pages an allocation keeps (A-744's split, the
+  /// memory report's arenas; main's ruling of 2026-11-20 on w-sizing's option (a)). A freed block's pages stay resident
+  /// until the idle purge gives them back ([`ChunkArena::resident_free_bytes`]); these runs leave them out. A cold path:
+  /// a walk of the block heads ([`Buddy::allocated`]), costing the blocks and free blocks, not the granules inside them.
+  pub fn held_runs(&self) -> Vec<(u16, usize, usize)> {
+    let mut runs: Vec<(u16, usize, usize)> = Vec::new();
+    for slot in self.held() {
+      for (offset, len) in slot.buddy.allocated() {
+        match runs.last_mut() {
+          Some((id, start, run)) if *id == slot.id && start.saturating_add(*run) == offset => {
+            *run = run.saturating_add(len);
+          }
+          _ => runs.push((slot.id, offset, len)),
+        }
+      }
+    }
+    runs
+  }
+
   /// A region, read-only.
   pub fn region(&self, index: u16) -> Option<&Region> {
     self.slot(index).map(|s| &s.region)
@@ -1132,6 +1152,55 @@ mod tests {
         return given;
       }
     }
+  }
+
+  /// A-744's split by held extents (main's ruling on w-sizing's option (a), 2026-11-21). Do: in two regions of four
+  /// pages, allocate three one-page blocks in the first and one in the second, then free the middle one of the first's.
+  /// Expect the held runs to be each allocation's bytes only, by region, adjacent blocks joined: the first region's
+  /// first block alone (its neighbour freed), its third, and the second region's one; no run for the free pages.
+  #[test]
+  fn the_held_runs_are_the_allocated_blocks_by_region_joined_where_adjacent() {
+    let p = page();
+    let mut arena = two_regions(p);
+    let first = arena.alloc(p).unwrap();
+    let middle = arena.alloc(p).unwrap();
+    let third = arena.alloc(p).unwrap();
+    let fourth = arena.alloc(p).unwrap();
+    let held = |extent: Extent| (extent.region, extent.offset(), extent.len());
+    let mut before = vec![held(first), held(middle), held(third), held(fourth)];
+    before.sort_unstable();
+    let joined = arena.held_runs();
+    assert_eq!(
+      joined.iter().map(|run| run.2).sum::<usize>(),
+      4 * p,
+      "every allocated byte held: {joined:?} from {before:?}"
+    );
+    assert!(
+      joined.len() < before.len(),
+      "adjacent blocks joined: {joined:?} from {before:?}"
+    );
+    arena.free(middle).unwrap();
+    let runs = arena.held_runs();
+    assert_eq!(
+      runs.iter().map(|run| run.2).sum::<usize>(),
+      3 * p,
+      "the freed block's bytes left out: {runs:?}"
+    );
+    for extent in [first, third, fourth] {
+      assert!(
+        runs.iter().any(|(id, offset, len)| *id == extent.region
+          && *offset <= extent.offset()
+          && extent.offset() + extent.len() <= offset + len),
+        "{:?} within a run: {runs:?}",
+        held(extent)
+      );
+    }
+    assert!(
+      !runs.iter().any(|(id, offset, len)| *id == middle.region
+        && *offset <= middle.offset()
+        && middle.offset() < offset + len),
+      "no run over the freed block: {runs:?}"
+    );
   }
 
   /// Whether every byte of the `len` bytes at `at` of `bytes` is `value`.

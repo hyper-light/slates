@@ -45,6 +45,23 @@ pub fn step_budget_ns() -> Option<u64> {
   registry::with_current(|ctx| ctx.quantum_ns())
 }
 
+/// Whether anyone else waits on the current shard now (A-783, [`crate::shard::ShardContext::others_waiting`]): what a
+/// paced step asks once a quantum. False off a shard thread (no one shares it).
+pub fn others_waiting() -> bool {
+  registry::with_current(|ctx| ctx.others_waiting()).unwrap_or(false)
+}
+
+/// The most a paced step runs on the current shard while no one waits (A-783,
+/// [`crate::shard::ShardContext::step_ceiling_ns`]). `None` off a shard thread.
+pub fn step_ceiling_ns() -> Option<u64> {
+  registry::with_current(|ctx| ctx.step_ceiling_ns())
+}
+
+/// Sets the current shard's paced-step ceiling ([`step_ceiling_ns`]); nothing off a shard thread.
+pub fn set_step_ceiling_ns(ceiling_ns: u64) {
+  let _ = registry::with_current(|ctx| ctx.set_step_ceiling_ns(ceiling_ns));
+}
+
 /// The current shard's idle window in nanoseconds (`ShardContext::idle_window_ns`): what the daemon's serve
 /// loop keeps polling for after its last work. `None` off a shard thread.
 pub fn idle_window_ns() -> Option<u64> {
@@ -333,5 +350,67 @@ impl Drop for Sleep {
     if let Some(id) = self.timer.take() {
       let _ = registry::with_current(|ctx| ctx.disarm_timer(id));
     }
+  }
+}
+
+/// Spawns `future` on the current shard and detaches it, so its slot is freed when it ends (hyper-rt's
+/// `spawn_detached`, A-767 piece C2). Refused as [`spawn`] is, or `NotOnShardThread` off a shard.
+pub fn spawn_detached<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtError> {
+  let id = spawn(future)?;
+  detach(id)?;
+  Ok(id)
+}
+
+/// Which of two futures finished first, with its output ([`race2`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Either<A, B> {
+  /// The first.
+  First(A),
+  /// The second.
+  Second(B),
+}
+
+/// The first of `a` and `b` to finish; the other is dropped. Polls `a` first. hyper-rt's `combine::race2` (A-767
+/// piece C2, for the vendored engine's wait on its pool or its store), pinned on this future's own frame with
+/// `std::pin::pin!`, so it needs neither a pin-projection crate nor an allocation.
+pub async fn race2<A: Future, B: Future>(a: A, b: B) -> Either<A::Output, B::Output> {
+  let mut a = std::pin::pin!(a);
+  let mut b = std::pin::pin!(b);
+  std::future::poll_fn(|cx| {
+    if let Poll::Ready(out) = a.as_mut().poll(cx) {
+      return Poll::Ready(Either::First(out));
+    }
+    if let Poll::Ready(out) = b.as_mut().poll(cx) {
+      return Poll::Ready(Either::Second(out));
+    }
+    Poll::Pending
+  })
+  .await
+}
+
+#[cfg(test)]
+mod race_tests {
+  use super::*;
+
+  /// Do: race a ready future against a pending one, both ways, and two ready ones. Expect: the ready one wins
+  /// whichever side it is on, and of two ready ones the first.
+  #[test]
+  fn the_first_ready_future_wins_and_the_first_breaks_a_tie() {
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    let mut first = std::pin::pin!(race2(std::future::ready(1), std::future::pending::<u8>()));
+    assert_eq!(first.as_mut().poll(&mut cx), Poll::Ready(Either::First(1)));
+    let mut second = std::pin::pin!(race2(std::future::pending::<u8>(), std::future::ready(2)));
+    assert_eq!(
+      second.as_mut().poll(&mut cx),
+      Poll::Ready(Either::Second(2))
+    );
+    let mut tie = std::pin::pin!(race2(std::future::ready(3), std::future::ready(4)));
+    assert_eq!(tie.as_mut().poll(&mut cx), Poll::Ready(Either::First(3)));
+    let mut neither = std::pin::pin!(race2(
+      std::future::pending::<u8>(),
+      std::future::pending::<u8>()
+    ));
+    assert_eq!(neither.as_mut().poll(&mut cx), Poll::Pending);
   }
 }

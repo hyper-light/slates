@@ -175,7 +175,7 @@ pub(crate) fn engine_for_adoption(
   if state.merge.seeding.contains(&object) {
     return Engine::Building;
   }
-  match state.merge.replicas.get(&object).map(Green::head) {
+  match state.merge.replicas.get(&object).map(Green::reached) {
     Some(head) if head == through => at_adopted(state, object, identity),
     Some(head) if head < through => advance(state, object, (head, through), identity),
     Some(_) => {
@@ -230,7 +230,7 @@ fn at_adopted(state: &mut ShardState, object: ObjectId, identity: [u8; 32]) -> E
     .merge
     .replicas
     .get_mut(&object)
-    .map(|replica| (replica.head(), replica.head_identity()));
+    .map(|replica| (replica.reached(), replica.head_identity()));
   match reached {
     Some((_, at)) if at == identity => Engine::Ready,
     Some((head, _)) => {
@@ -532,7 +532,7 @@ async fn rebuilt_engine(object: ObjectId, through: u64) -> Option<Green> {
     slates_rt::futures::yield_now().await;
   }
   crate::state::with_state(|s| {
-    let at = s.merge.replicas.get(&object).map(Green::head);
+    let at = s.merge.replicas.get(&object).map(Green::reached);
     (at == Some(through))
       .then(|| take_engine(s, object))
       .flatten()

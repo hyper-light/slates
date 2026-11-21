@@ -306,6 +306,8 @@ impl Graph for TestGraph {
 struct Counted<'g> {
   graph: &'g TestGraph,
   reads: std::cell::Cell<u64>,
+  /// Each object's size asked (a store reads its row for it).
+  sizes: std::cell::Cell<u64>,
 }
 
 impl Counted<'_> {
@@ -346,6 +348,7 @@ impl Graph for Counted<'_> {
     self.graph.named_entries(tree)
   }
   fn size(&self, blob: u32) -> u64 {
+    self.sizes.set(self.sizes.get() + 1);
     self.graph.size(blob)
   }
   fn target(&self, tag: u32) -> Option<u32> {
@@ -2312,6 +2315,7 @@ fn a745_begin_reads_what_the_request_names_and_each_step_one_unit_of_ready_the_c
     let counted = Counted {
       graph: &graph,
       reads: std::cell::Cell::new(0),
+      sizes: std::cell::Cell::new(0),
     };
     let mut admission = Admission::new(u64::MAX);
     let begun = super::begin(&counted, &request, &mut admission);
@@ -2384,4 +2388,42 @@ fn a745_a_deepening_through_a_merge_heavy_history_is_negotiated_within_a_few_kil
     panic!("not a pack")
   };
   assert!(pack.objects.len() > 6_000, "{} objects", pack.objects.len());
+}
+
+/// A-722 part 3's partial clone (w-perf's A/B: `--filter=blob:none` 1.4-1.5 times slower since its landings sealed
+/// into tables; the profile: each blob's kind and size read from its row, four index lookups, for a filter that sends
+/// no blob whatever its size). Do: clone a commit of a tree of 40 blobs under `blob:none`, then under `blob:limit=2`,
+/// counting the sizes the walk asks. Expect: none under `blob:none`; every blob's under `blob:limit` (the filter that
+/// reads it); the same objects sent as an uncounted graph sends. Red before the change: one size asked a blob under
+/// `blob:none`.
+#[test]
+fn a_filter_that_reads_no_size_asks_none() {
+  let mut graph = TestGraph::default();
+  let blobs: Vec<u32> = (0..40).map(|size| graph.new_blob(size)).collect();
+  let tree = graph.new_tree(&blobs);
+  let commit = graph.new_commit(&[], tree, 1);
+  let wants = [graph.id(commit)];
+  for (filter, sizes) in [(Filter::BlobNone, 0), (Filter::BlobLimit(2), 40)] {
+    let request = Request {
+      wants: &wants,
+      haves: &[],
+      done: true,
+      wait_for_done: false,
+      shallow: &[],
+      deepen: None,
+      filter: Some(&filter),
+      sparse: None,
+      include_tag: false,
+      thin: false,
+    };
+    let counted = Counted {
+      graph: &graph,
+      reads: std::cell::Cell::new(0),
+      sizes: std::cell::Cell::new(0),
+    };
+    let sent = negotiate(&counted, &request, &mut Admission::new(u64::MAX)).unwrap();
+    let whole = negotiate(&graph, &request, &mut Admission::new(u64::MAX)).unwrap();
+    assert_eq!(counted.sizes.get(), sizes, "{filter:?}");
+    assert_eq!(sent, whole, "{filter:?}");
+  }
 }

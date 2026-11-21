@@ -993,6 +993,13 @@ impl AnchorSegment {
     Ok(self.object.residency(at, len)?)
   }
 
+  /// What of the whole mapped segment is in RAM, from the kernel's per-mapping figures rather than a page walk
+  /// (`slates_mem::resident::of_mapping`; main's ruling on g228's finding): the daemon's memory report reads the segment
+  /// whole with it (§4.14), for the cost of reading its mapping.
+  pub fn mapped_residency(&self) -> Result<slates_mem::resident::Residency, AnchorError> {
+    Ok(self.object.mapped_residency()?)
+  }
+
   /// [`AnchorSegment::region_residency`] of `len` bytes at `at` within the region, a span past the region refused
   /// (`Geometry`): what a caller walking a large region a bounded step at a time asks (A-744). Words and payloads alike:
   /// the kernel's page table is read, no byte.

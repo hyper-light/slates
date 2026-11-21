@@ -76,7 +76,10 @@ pub mod works;
 pub use advertisement::{Advertised, write_advertisement};
 pub use checking::Checking;
 pub use connect::{Connected, connectivity};
-pub use report::{message, write_hook_words, write_report, write_report_end, write_report_held};
+pub use report::{
+  message, write_hook_words, write_refused_report, write_report, write_report_end,
+  write_report_held,
+};
 pub use request::{Command, Request, RequestReader, Requested};
 pub use session::Session;
 

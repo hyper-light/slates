@@ -29,6 +29,7 @@ slates-vcs = { path = "crates/vcs", version = "0.1.0" }
 slates-guest-probe = { path = "crates/guest-probe" }
 slates-base = { path = "crates/base", version = "0.1.0" }
 slates-land = { path = "crates/land", version = "0.1.0" }
+slates-store = { path = "crates/store", version = "0.1.0" }
 slates-anchor = { path = "crates/anchor", version = "0.1.0" }
 slates-db = { path = "crates/db", version = "0.1.0" }
 slates-ipc = { path = "crates/ipc", version = "0.1.0" }
@@ -41,6 +42,7 @@ slates-bridge-nfs = { path = "crates/bridge-nfs", version = "0.1.0" }
 slates-bridge-virtiofs = { path = "crates/bridge-virtiofs", version = "0.1.0" }
 slates-bridge-oci = { path = "crates/bridge-oci", version = "0.1.0" }
 slates-merge = { path = "crates/merge", version = "0.1.0" }
+slates-pace = { path = "crates/pace", version = "0.1.0" }
 slates-mcp = { path = "crates/mcp", version = "0.1.0" }
 slates-client = { path = "crates/client", version = "0.1.0" }
 slates-api = { path = "crates/api", version = "0.1.0" }

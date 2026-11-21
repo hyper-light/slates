@@ -81,9 +81,9 @@ pub struct BaseImage {
 impl BasePlane {
   /// Releases handles opened during a refused reconstruction; the root is still the caller's.
   pub(crate) fn release_sources(self, host: &mut dyn HostFs) {
-    for listing in self.listings.values() {
-      if listing.dir != self.root {
-        host.close_dir(listing.dir);
+    for open in self.listings.values().filter_map(|listing| listing.dir) {
+      if open != self.root {
+        host.close_dir(open);
       }
     }
   }
@@ -96,9 +96,12 @@ impl BasePlane {
         Ok(Directory {
           inode: inode.0,
           source: listing.source.clone(),
-          fingerprint: host
-            .fingerprint_dir(listing.dir)
-            .map_err(super::host_refusal)?,
+          // What a recovery holds the directory to (`same_object`): an unreacquired one's record, unchanged (A-833).
+          fingerprint: match (listing.recorded, listing.dir) {
+            (Some(recorded), _) => recorded,
+            (None, Some(open)) => host.fingerprint_dir(open).map_err(super::host_refusal)?,
+            (None, None) => return Err(VfsError::RecoveryIncomplete),
+          },
         })
       })
       .collect::<Result<Vec<_>, VfsError>>()?;
@@ -199,41 +202,30 @@ impl BasePlane {
         if plane.listings.contains_key(&inode) || plane.unavailable.contains_key(&inode) {
           return Err(VfsError::RecoveryIncomplete);
         }
-        // A directory recovery cannot reacquire as the recorded one, gone from the disk, unreadable, or another at the
-        // path, refuses its untouched entries `BaseUnavailable` while the volume's own entries in it serve (§4.8's
-        // failure matrix). Until 2026-11-07 such a directory refused the whole volume `RecoveryIncomplete`: a base
-        // directory removed after the last publication cost every file in the volume
-        // (`docs/bugs/2026-11-07-a-removed-base-directory-refused-the-whole-volume-at-recovery.md`).
-        let opened = match open_source(host, root, &directory.source)? {
-          Ok(opened) => opened,
-          Err(refused) => {
+        // Only the root is reopened now (it is the caller's, held to the record as before). Every other directory is
+        // recorded and reacquired at its first use (`Overlay::reacquire`, A-833): gone, unreadable or another at the
+        // path, it is refused `BaseUnavailable` then, with its untouched entries, while the volume's own entries in it
+        // serve (§4.8's failure matrix; until 2026-11-07 such a directory refused the whole volume, then until
+        // 2026-11-21 recovery reopened every recorded directory in one step: about 192,000 on kiln's adacachy daemon,
+        // which the liveness watchdog killed a second into every restart).
+        if directory.source.is_empty() {
+          let refused = match host.fingerprint_dir(root) {
+            Ok(now) if now.same_object(&directory.fingerprint) => None,
+            Ok(_) => Some(HostError::NotFound),
+            Err(refused) => Some(refused),
+          };
+          if let Some(refused) = refused {
             plane
               .unavailable
               .insert(inode, unavailable(directory, refused));
             continue;
           }
-        };
-        // The same source is the same directory, not the same entries (§4.8, A-153): a directory whose entries an
-        // outsider changed since the image is still the one recorded (its listing is read again on first use, and every
-        // entry beneath is checked then), while one another directory replaced is not, and is never substituted.
-        let refused = match host.fingerprint_dir(opened) {
-          Ok(now) if now.same_object(&directory.fingerprint) => None,
-          Ok(_) => Some(HostError::NotFound),
-          Err(refused) => Some(refused),
-        };
-        if let Some(refused) = refused {
-          if opened != root {
-            host.close_dir(opened);
-          }
-          plane
-            .unavailable
-            .insert(inode, unavailable(directory, refused));
-          continue;
         }
         plane.listings.insert(
-          InodeNo(directory.inode),
+          inode,
           Listing {
-            dir: opened,
+            dir: directory.source.is_empty().then_some(root),
+            recorded: (!directory.source.is_empty()).then_some(directory.fingerprint),
             source: directory.source.clone(),
             fingerprint: None,
             entries: None,
@@ -265,9 +257,9 @@ impl BasePlane {
       Ok(())
     })();
     if let Err(error) = result {
-      for listing in plane.listings.values() {
-        if listing.dir != root {
-          host.close_dir(listing.dir);
+      for open in plane.listings.values().filter_map(|listing| listing.dir) {
+        if open != root {
+          host.close_dir(open);
         }
       }
       return Err(error);
@@ -334,7 +326,7 @@ fn unavailable(directory: &Directory, refused: HostError) -> UnavailableDir {
 /// Reopens a recorded source directory below `root`, one component at a time without following links: the inner
 /// result is the host's refusal of a directory that is not there to open; the outer refuses a recorded path that is not
 /// one (`RecoveryIncomplete`).
-fn open_source(
+pub(super) fn open_source(
   host: &mut dyn HostFs,
   root: HostDir,
   path: &[String],

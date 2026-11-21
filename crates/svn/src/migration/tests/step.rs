@@ -436,6 +436,96 @@ fn a_stored_text_exports_through_the_store_beside_the_records_as_a_kept_one_does
   );
 }
 
+/// C2 stage B part 2 (the export reads a stored text a store reads asynchronously, waiting for each piece). Do: commit
+/// [`first`] with its text `alpha\n` stored beside the records, and export it whole in formats 2 and 3 through a source
+/// that holds none of its pieces until the export, having waited for one ([`Exporting::Waiting`]), has it fetched: two
+/// bytes a piece, kept once fetched. Expect: the dump byte for byte the one of the text kept in the records; each wait
+/// for the piece the reading had reached and appending nothing, three in all for the six bytes (any later reading of
+/// the text finds its pieces fetched).
+#[test]
+fn an_export_waits_for_each_piece_of_a_stored_text_and_writes_the_same_dump() {
+  use std::cell::RefCell;
+  use std::collections::BTreeSet;
+
+  use crate::dump::Format;
+  use crate::migration::{Exporter, Exporting, TextReading, TextSource};
+  /// Shape: the bytes a fetched piece holds.
+  const PIECE: u64 = 2;
+  /// The records, and one text stored beside them whose pieces are read only once fetched.
+  struct Withheld<'a> {
+    records: &'a Repository,
+    stored: (ContentIdentity, Vec<u8>),
+    fetched: RefCell<BTreeSet<u64>>,
+  }
+  impl TextSource for Withheld<'_> {
+    fn text(&self, identity: &ContentIdentity) -> Option<std::borrow::Cow<'_, [u8]>> {
+      if *identity == self.stored.0 {
+        return None;
+      }
+      TextSource::text(self.records, identity)
+    }
+
+    fn read_step(&self, identity: &ContentIdentity, reading: &mut TextReading) -> Option<bool> {
+      if *identity != self.stored.0 {
+        return TextSource::read_step(self.records, identity, reading);
+      }
+      let (read, len) = (reading.read(), u64::try_from(self.stored.1.len()).unwrap());
+      if read >= len {
+        return Some(true);
+      }
+      if !self.fetched.borrow().contains(&read) {
+        return None;
+      }
+      let end = (read + PIECE).min(len);
+      let piece = &self.stored.1[usize::try_from(read).unwrap()..usize::try_from(end).unwrap()];
+      Some(reading.append(piece, len))
+    }
+
+    fn fetchable(&self, identity: &ContentIdentity, offset: u64) -> bool {
+      *identity == self.stored.0 && !self.fetched.borrow().contains(&offset)
+    }
+  }
+  let mut kept = created();
+  let checked = kept.check(first()).unwrap();
+  kept.apply(checked).unwrap();
+  let (identity, bytes) = content(b"alpha\n");
+  let mut naming = first();
+  naming.contents.remove(&identity);
+  naming
+    .stored
+    .insert(identity, u64::try_from(bytes.len()).unwrap());
+  let mut stored = created();
+  let checked = stored.check(naming).unwrap();
+  stored.apply(checked).unwrap();
+  for format in [Format::Two, Format::Three] {
+    let mut whole = Exporter::new(&kept, 0, kept.youngest(), format).unwrap();
+    let mut expected = Vec::new();
+    while whole.export(&kept, &kept, &mut expected).unwrap() != Exporting::Done {}
+    let withheld = Withheld {
+      records: &stored,
+      stored: (identity, bytes.clone()),
+      fetched: RefCell::new(BTreeSet::new()),
+    };
+    let mut exporter = Exporter::new(&stored, 0, stored.youngest(), format).unwrap();
+    let (mut out, mut waits) = (Vec::new(), Vec::new());
+    loop {
+      let before = out.len();
+      match exporter.export(&stored, &withheld, &mut out).unwrap() {
+        Exporting::Waiting(wanted) => {
+          assert_eq!(out.len(), before, "a waiting call appended");
+          assert_eq!(wanted.text, identity);
+          waits.push(wanted.offset);
+          withheld.fetched.borrow_mut().insert(wanted.offset);
+        }
+        Exporting::Wrote(_) => {}
+        Exporting::Done => break,
+      }
+    }
+    assert_eq!(out, expected, "{format:?}");
+    assert_eq!(waits, vec![0, 2, 4], "{format:?}");
+  }
+}
+
 /// main's order of 2026-11-20 (w-bugs' runs 10/11: svn checkout and update 3 to 12 times as slow after c2, the fetch's
 /// 1,024-byte steps each making the whole text through its chain). Do: commit revision 1, then 20 edits of [`FILE`], a
 /// 300 KiB text changing one line in each; read every revision's text through the read source in 1,024-byte pieces,
@@ -707,5 +797,193 @@ fn a_replay_makes_each_delta_window_a_bounded_number_of_times() {
   assert!(
     made <= bound,
     "{made} delta windows made replaying a {LEN}-byte text with a chain of {chain}; bound {bound}"
+  );
+}
+
+/// R4 of Ada's close list (a recovery replayed a revision's record whole, its every text deltified in one step). Do:
+/// commit a revision adding `/trunk` and six files of distinct texts, once whole (`check` and `apply`) and once replayed
+/// a row's text a step (`replay_revision`, `replay_step` with one row a step), then a second revision changing every
+/// file the same two ways. Expect: the same records (their whole export byte for byte, every text's chain), and each
+/// replay taken in one step to apply its rows, one a row, none left: never a revision's texts in one step.
+#[test]
+fn a_replayed_revision_keeps_its_texts_a_row_a_step_as_a_whole_commit_does() {
+  use crate::migration::RevisionReplay;
+  let files: Vec<(String, Vec<u8>)> = (0..6)
+    .map(|at| {
+      (
+        format!("/trunk/f{at}.txt"),
+        format!("file {at}\n").repeat(200).into_bytes(),
+      )
+    })
+    .collect();
+  let made = |head: u64, edit: &dyn Fn(&[u8]) -> Vec<u8>| {
+    let mut rows = Vec::new();
+    let mut contents = BTreeMap::new();
+    if head == 0 {
+      rows.push(row("/trunk", Action::Add, NodeKind::Directory));
+    }
+    for (path, bytes) in &files {
+      let bytes = edit(bytes);
+      rows.push(ChangedPath {
+        text: Some(text_of(&bytes)),
+        ..row(
+          path,
+          if head == 0 {
+            Action::Add
+          } else {
+            Action::Modify
+          },
+          NodeKind::File,
+        )
+      });
+      let (identity, held) = content(&bytes);
+      contents.insert(identity, held);
+    }
+    RevisionToCommit {
+      head,
+      record: RevisionRecord {
+        transaction: format!("{head}-1"),
+        changes: rows,
+      },
+      properties: properties(&[
+        ("svn:author", "alice"),
+        ("svn:date", FIRST_DATE),
+        ("svn:log", "r"),
+      ]),
+      contents,
+      stored: BTreeMap::new(),
+      lock_entries: Vec::new(),
+    }
+  };
+  let same = |bytes: &[u8]| bytes.to_vec();
+  let changed = |bytes: &[u8]| {
+    let mut bytes = bytes.to_vec();
+    bytes.extend_from_slice(b"one more line\n");
+    bytes
+  };
+  let mut whole = created();
+  let mut replayed = created();
+  let mut steps = Vec::new();
+  for (head, edit) in [(0u64, &same as &dyn Fn(&[u8]) -> Vec<u8>), (1, &changed)] {
+    let checked = whole.check(made(head, edit)).unwrap();
+    whole.apply(checked).unwrap();
+    let mut replay: RevisionReplay = replayed.replay_revision(made(head, edit)).unwrap();
+    let mut taken = 1u64;
+    while replayed.replay_step(&mut replay, 1).unwrap().is_none() {
+      taken += 1;
+      assert!(taken < 100, "the replay never ended");
+    }
+    steps.push(taken);
+  }
+  let chains = |repository: &Repository| -> Vec<Option<usize>> {
+    files
+      .iter()
+      .map(|(_, bytes)| repository.text_chain(blake3::hash(&changed(bytes)).as_bytes()))
+      .collect()
+  };
+  assert_eq!(
+    (
+      super::support::export_all(&replayed).unwrap() == super::support::export_all(&whole).unwrap(),
+      chains(&replayed) == chains(&whole),
+      steps,
+    ),
+    (true, true, vec![1 + 7, 1 + 6])
+  );
+}
+
+/// C2 stage B part 2 (b), P4 (an import's delta whose base the records keep elsewhere asks its caller for the base).
+/// Do: commit [`first`] twice, once with its text `alpha\n` kept by the records and once stored beside them (the records
+/// naming it alone); into each import a format-3 stream whose revision 2 changes [`FILE`] by a delta against that text
+/// (a window copying it and adding `beta\n`), supplying the base whole when the import asks for it. Expect: the stored
+/// one asks once, for `alpha\n`'s identity, before any record is made, and takes it; the kept one never asks; each
+/// imports revision 2 with the text `alpha\nbeta\n`; and a base the import did not ask for, or bytes not its identity's,
+/// refused `Corrupt`.
+#[test]
+fn an_import_asks_its_caller_for_a_delta_base_the_records_keep_elsewhere() {
+  use super::support::{Dump, revision_properties};
+  use crate::dump::{DeltaBase, Format};
+  use crate::migration::{Importer, Importing, MigrationRefusal};
+  use crate::svndiff::{Instruction, Window};
+  let (alpha, alpha_bytes) = content(b"alpha\n");
+  let made = b"alpha\nbeta\n";
+  let window = Window {
+    source_offset: 0,
+    source_len: 6,
+    target_len: 11,
+    instructions: vec![
+      Instruction::Source {
+        offset: 0,
+        length: 6,
+      },
+      Instruction::New { length: 5 },
+    ],
+    new_data: b"beta\n".to_vec(),
+  };
+  let base = digests(b"alpha\n");
+  let mut dump = Dump::new(Format::Three, None);
+  dump.revision(2, &revision_properties(2)).delta(
+    FILE,
+    DeltaBase {
+      md5: Some(base.0),
+      sha1: Some(base.1),
+    },
+    &[window],
+    digests(made),
+  );
+  let stream = dump.bytes();
+  // Imports `stream` into `repository`, supplying the base when asked: the bases asked for, and revision 2's text.
+  let imported = |repository: &mut Repository| {
+    let mut importer = Importer::new(super::support::ADMISSION);
+    let mut rest = stream.as_slice();
+    let mut asked = Vec::new();
+    loop {
+      match importer.import(repository, rest, true).unwrap() {
+        Importing::Base { consumed, text } => {
+          asked.push(text);
+          assert_eq!(
+            importer.supply_base(repository, &text, b"not it".to_vec()),
+            Err(MigrationRefusal::Corrupt)
+          );
+          importer
+            .supply_base(repository, &text, alpha_bytes.clone())
+            .unwrap();
+          rest = &rest[consumed..];
+        }
+        Importing::Commit { consumed, record } => {
+          rest = &rest[consumed..];
+          repository.commit_record(*record).unwrap();
+        }
+        Importing::NeedMore { .. } => panic!("the whole stream was given"),
+        Importing::Done => break,
+      }
+    }
+    let identity = *blake3::hash(made).as_bytes();
+    let text = repository.text(&identity).map(std::borrow::Cow::into_owned);
+    (
+      asked,
+      repository.youngest(),
+      text,
+      repository.stored_len(&identity),
+    )
+  };
+  let mut kept = created();
+  let checked = kept.check(first()).unwrap();
+  kept.apply(checked).unwrap();
+  let mut naming = first();
+  naming.contents.remove(&alpha);
+  naming.stored.insert(alpha, 6);
+  let mut stored = created();
+  let checked = stored.check(naming).unwrap();
+  stored.apply(checked).unwrap();
+  let made_text = Some(made.to_vec());
+  assert_eq!(
+    imported(&mut kept),
+    (Vec::new(), 2, made_text.clone(), None)
+  );
+  assert_eq!(imported(&mut stored), (vec![alpha], 2, made_text, None));
+  let mut unasked = Importer::new(super::support::ADMISSION);
+  assert_eq!(
+    unasked.supply_base(&kept, &alpha, alpha_bytes),
+    Err(MigrationRefusal::Corrupt)
   );
 }

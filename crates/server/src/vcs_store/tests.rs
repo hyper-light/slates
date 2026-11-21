@@ -14,16 +14,14 @@ use slates_ipc::protocol::{ObjectFormat as WireFormat, Refusal, ReplyBody, Reque
 use slates_merge::push as work;
 use slates_vcs::{ContentId, ContentRefused, ContentStore};
 
-use super::record::{
-  Noted, Record, RecordRefused, RecordWriter, RecordedMove, RecordedObject, WriteRefused,
-};
+use super::record::{Noted, Record, RecordRefused, RecordWriter, RecordedMove};
 use super::{
   GitPush, GitRefused, GitStore, ReplayRefused, RepositoryStore, Target, admit_object,
-  commit_moves, green_key, record_of, replay_git, replay_into, seal_moves,
+  commit_moves, green_key, replay_git, replay_into, seal_moves,
 };
 use crate::repository::push::{Appended, BranchAppended, BranchChange, EntryParts, StoreMove};
 use crate::state::ShardState;
-use crate::verbs::{dispatch, to_db_volume};
+use crate::verbs::to_db_volume;
 
 /// Shape: the window the store-level tests' content store holds content in, as A-614's view tests hold theirs: past the
 /// longest row the store writes here with its table's frame (`slates_vcs::index` refuses one past it), and short, so a
@@ -155,79 +153,14 @@ fn holding(kind: Kind, bytes: &[u8]) -> (ContentStore, Noted) {
   )
 }
 
-/// A-662, A-723 (the record's format, pinned: objects named, then the pack as sent). Do: write a record of one delete,
-/// one move and one object, with a pack kept, then read it back; and read back a version-1 record (each object's bytes
-/// inflated) as a segment written before A-723 holds one. Expect: the bytes the module's encoding states, byte for
-/// byte: the object named by its type, identity and length, then the pack's length and bytes, never the object's bytes;
-/// the same moves, name and pack read back; and the version-1 record's object read back with its bytes.
+/// A-767 C5's record v5 (it replaces A-722's version 4, which replaced A-724 piece 8c's version 3). Do: write the
+/// record of one move and one object as version 5, its names put as one content first, its pack named by an identity and
+/// a length, and the changeset the store landed them as; then read it back. Expect: the bytes the module's encoding
+/// states: the head at version 5, the moves, the names' identity (the BLAKE3 of the names' rows) and their count, the
+/// pack's identity and its length, the changeset's sequence, and nothing after; read back with the same moves, the
+/// names, the pack and the sequence named, none inline and no pack bytes.
 #[test]
-fn t_a662_a_record_reads_back_what_it_wrote_and_its_bytes_are_pinned() {
-  let head = ObjectId::from_bytes(FORMAT, &[0xab; 20]).expect("an id");
-  let (content, noted) = holding(Kind::Blob, b"hi");
-  let mut writer = RecordWriter::default();
-  writer.object(noted);
-  let moves: Vec<RecordedMove> = vec![(7, 4, None), (9, 5, Some(head))];
-  let bytes = writer
-    .finish((&content, FORMAT, b"PACK-bytes"), |_| true, (3, &moves))
-    .expect("written");
-  let mut head_bytes = Vec::new();
-  head_bytes.extend_from_slice(b"SGPR");
-  head_bytes.extend_from_slice(&2u32.to_le_bytes());
-  head_bytes.extend_from_slice(&3u64.to_le_bytes());
-  head_bytes.extend_from_slice(&2u64.to_le_bytes());
-  head_bytes.extend_from_slice(&7u64.to_le_bytes());
-  head_bytes.extend_from_slice(&4u64.to_le_bytes());
-  head_bytes.push(0);
-  head_bytes.extend_from_slice(&9u64.to_le_bytes());
-  head_bytes.extend_from_slice(&5u64.to_le_bytes());
-  head_bytes.push(1);
-  head_bytes.extend_from_slice(&[0xab; 20]);
-  let mut expected = head_bytes.clone();
-  expected.extend_from_slice(&1u64.to_le_bytes());
-  expected.push(3);
-  expected.extend_from_slice(&noted.identity.0);
-  expected.extend_from_slice(&2u64.to_le_bytes());
-  expected.extend_from_slice(&10u64.to_le_bytes());
-  expected.extend_from_slice(b"PACK-bytes");
-  assert_eq!(bytes, expected);
-  let read = Record {
-    names: vec![(Kind::Blob, noted.identity, 2)],
-    named: None,
-    pack: b"PACK-bytes",
-    deepest: 3,
-    moves: moves.clone(),
-    objects: Vec::new(),
-  };
-  assert_eq!(Record::decode(&bytes, FORMAT), Ok(read));
-  let mut inflated = head_bytes;
-  inflated.splice(4..8, 1u32.to_le_bytes());
-  inflated.extend_from_slice(&1u64.to_le_bytes());
-  inflated.push(3);
-  inflated.extend_from_slice(&noted.identity.0);
-  inflated.extend_from_slice(&2u64.to_le_bytes());
-  inflated.extend_from_slice(b"hi");
-  let object = RecordedObject {
-    kind: Kind::Blob,
-    identity: noted.identity,
-    content: b"hi",
-  };
-  let read = Record {
-    names: Vec::new(),
-    named: None,
-    pack: &[],
-    deepest: 3,
-    moves,
-    objects: vec![object],
-  };
-  assert_eq!(Record::decode(&inflated, FORMAT), Ok(read));
-}
-
-/// A-724 piece 8c (record version 3, main's ruling of 2026-11-20 (ii)). Do: write the record of one move and one object
-/// as version 3, its names put as one content first, then read it back. Expect: the bytes the module's encoding states:
-/// the head at version 3, then the names' identity (the BLAKE3 of the names' rows) and their count in place of each
-/// name, then the pack; read back with the same moves and pack, the names named, none inline.
-#[test]
-fn t_a724_a_version_3_record_names_its_names_by_their_contents_identity() {
+fn t_a767_c5_a_version_5_record_names_its_names_its_pack_and_its_changeset() {
   let head = ObjectId::from_bytes(FORMAT, &[0xab; 20]).expect("an id");
   let (mut content, noted) = holding(Kind::Blob, b"hi");
   let mut writer = RecordWriter::default();
@@ -245,17 +178,13 @@ fn t_a724_a_version_3_record_names_its_names_by_their_contents_identity() {
     slates_vcs::ContentId::of(&rows),
     "the names' identity is the BLAKE3 of their rows"
   );
-  let bytes = writer
-    .finish_named(
-      (&content, FORMAT, b"PACK-bytes"),
-      |_| true,
-      (3, &moves),
-      (identity, count),
-    )
-    .expect("written");
+  let pack = slates_vcs::ContentId::of(b"PACK-bytes");
+  let bytes =
+    RecordWriter::finish_packed((3, &moves), Some((identity, count)), Some((pack, 10)), 7)
+      .expect("written");
   let mut expected = Vec::new();
   expected.extend_from_slice(b"SGPR");
-  expected.extend_from_slice(&3u32.to_le_bytes());
+  expected.extend_from_slice(&5u32.to_le_bytes());
   expected.extend_from_slice(&3u64.to_le_bytes());
   expected.extend_from_slice(&1u64.to_le_bytes());
   expected.extend_from_slice(&9u64.to_le_bytes());
@@ -264,108 +193,38 @@ fn t_a724_a_version_3_record_names_its_names_by_their_contents_identity() {
   expected.extend_from_slice(&[0xab; 20]);
   expected.extend_from_slice(&identity.0);
   expected.extend_from_slice(&1u64.to_le_bytes());
+  expected.extend_from_slice(&pack.0);
   expected.extend_from_slice(&10u64.to_le_bytes());
-  expected.extend_from_slice(b"PACK-bytes");
+  expected.extend_from_slice(&7u64.to_le_bytes());
   assert_eq!(bytes, expected);
   let read = Record {
-    names: Vec::new(),
     named: Some((identity, 1)),
-    pack: b"PACK-bytes",
+    packed: Some((pack, 10)),
+    sequence: 7,
     deepest: 3,
     moves,
-    objects: Vec::new(),
   };
   assert_eq!(Record::decode(&bytes, FORMAT), Ok(read));
+  let mut three = bytes.clone();
+  three.splice(4..8, 3u32.to_le_bytes());
+  assert_eq!(
+    Record::decode(&three, FORMAT),
+    Err(super::record::RecordRefused::Version { version: 3 }),
+    "version 3 is no longer read"
+  );
 }
 
-/// A-662, A-723 (the record written when an append commits). Do: note three objects; write the record with the second
-/// one held by the repository by then, a pack kept; write it again with every object held; write one naming an object
-/// the content store does not hold, with no pack kept; and one naming a held object with no pack kept. Expect: the first
-/// record names the first and the third in the order noted, not the second, and carries the kept pack; the second names
-/// none and carries no pack; the third refused `Unreadable`, never written short; the fourth carries a pack made of the
-/// object whole (`slates_git::pack::of_whole`), as the server's own commits are recorded.
-#[test]
-fn t_a662_a_record_holds_what_the_repository_lacks_when_written_and_refuses_bytes_not_held() {
-  let mut content = ContentStore::new(BUDGET, WINDOW).expect("a content store");
-  let long: Vec<u8> = (0..=u8::MAX).cycle().take(WINDOW * 3 + 5).collect();
-  let mut writer = RecordWriter::default();
-  let mut identities = Vec::new();
-  for bytes in [&b"one"[..], b"two", &long] {
-    let identity = content.put_object(bytes).expect("held");
-    identities.push(identity);
-    let (id, _) = blob(bytes);
-    let len = u64::try_from(bytes.len()).expect("a length");
-    writer.object(Noted {
-      kind: Kind::Blob,
-      id,
-      identity,
-      len,
-    });
-  }
-  let (held, _) = blob(b"two");
-  let bytes = writer
-    .finish((&content, FORMAT, b"the pack"), |id| *id != held, (0, &[]))
-    .expect("written");
-  let read = Record::decode(&bytes, FORMAT).expect("read back");
-  let long_len = u64::try_from(long.len()).expect("a length");
-  assert_eq!(
-    (read.names, read.pack),
-    (
-      vec![
-        (Kind::Blob, identities[0], 3),
-        (Kind::Blob, identities[2], long_len)
-      ],
-      &b"the pack"[..]
-    )
-  );
-  let none = writer
-    .finish((&content, FORMAT, b"the pack"), |_| false, (0, &[]))
-    .expect("written");
-  let read = Record::decode(&none, FORMAT).expect("read back");
-  assert_eq!((read.names.len(), read.pack), (0, &[][..]));
-  let (ghost, _) = blob(b"never packed");
-  let mut unpacked = RecordWriter::default();
-  unpacked.object(Noted {
-    kind: Kind::Blob,
-    id: ghost,
-    identity: ContentId([9; 32]),
-    len: 12,
-  });
-  assert_eq!(
-    unpacked.finish((&content, FORMAT, &[]), |_| true, (0, &[])),
-    Err(WriteRefused::Unreadable { id: ghost })
-  );
-  let (one, _) = blob(b"one");
-  let mut sent_none = RecordWriter::default();
-  sent_none.object(Noted {
-    kind: Kind::Blob,
-    id: one,
-    identity: identities[0],
-    len: 3,
-  });
-  let made = sent_none
-    .finish((&content, FORMAT, &[]), |_| true, (0, &[]))
-    .expect("written");
-  let read = Record::decode(&made, FORMAT).expect("read back");
-  assert!(read.pack.starts_with(b"PACK"), "{:?}", read.pack);
-}
-
-/// A-662 (hostile input on a parser of bytes the log holds). Do: read a record cut at every length, one whose counts are
-/// `u64::MAX`, one of another magic and another version, one with a marker of neither kind, one read in another format,
-/// one naming a delta's type number, and one with a byte after its last object. Expect: each refused by its kind, never
-/// a panic, and no count allocated past what the bytes could hold.
+/// A-662 (hostile input on a parser of bytes the log holds), over a version-5 record. Do: read a record cut at every
+/// length, one whose moves' count is `u64::MAX`, one of another magic, one of an unknown version and one of each retired
+/// version (1 and 2, which carried a push's objects), one with a marker of neither kind, one read in another format, and
+/// one with a byte after its sequence. Expect: each refused by its kind, never a panic, and no count allocated past what
+/// the bytes could hold.
 #[test]
 fn t_a662_hostile_records_are_refused_by_kind() {
   let head = ObjectId::from_bytes(FORMAT, &[0xcd; 20]).expect("an id");
-  let (content, noted) = holding(Kind::Commit, b"commit");
-  let mut writer = RecordWriter::default();
-  writer.object(noted);
-  let bytes = writer
-    .finish(
-      (&content, FORMAT, b"a pack"),
-      |_| true,
-      (0, &[(1, 1, Some(head))]),
-    )
+  let names = (ContentId([3; 32]), 1);
+  let pack = (ContentId([4; 32]), 9);
+  let bytes = RecordWriter::finish_packed((0, &[(1, 1, Some(head))]), Some(names), Some(pack), 2)
     .expect("written");
   for cut in 0..bytes.len() {
     let read = Record::decode(bytes.get(..cut).expect("a prefix"), FORMAT);
@@ -373,6 +232,76 @@ fn t_a662_hostile_records_are_refused_by_kind() {
   }
   assert_hostile_counts_and_words(&bytes);
   assert_hostile_marks(&bytes);
+}
+
+/// Main's ruling of 2026-11-21 on part 2 (w-svn's A-819 rule: a retired format is refused typed, never skipped or a
+/// panic; A-824). Do: build a log of two records, a version-5 one a live push wrote and, after it, a version-2 one as a
+/// segment written before C5 part 2b piece 3 holds it (its moves, its objects' names and an inline pack); replay the
+/// version-5 record alone into an empty store, then the log in order into another. Expect: the version-5-only log
+/// replayed whole, the same store as the live one; the log meeting the version-2 record refused `Retired { version: 2 }`
+/// (and a version-1 record `Retired { version: 1 }`), the store as the version-5 record left it.
+#[test]
+fn t_a824_a_log_meeting_a_retired_record_version_is_refused_typed_and_a_version_5_log_replays_whole()
+ {
+  let mut live = Live::new();
+  let (objects, head) = commit_of(&[(b"a".to_vec(), b"bytes".to_vec())], &[], FIRST_DATE);
+  live
+    .push(&objects, vec![(0, Some(head))], 0)
+    .expect("pushed");
+  let before = live.facts();
+  assert_eq!(
+    live.recovered().map(|store| store.facts()),
+    Ok(before.clone()),
+    "a version-5 log replays whole"
+  );
+  let mut old = Vec::new();
+  old.extend_from_slice(b"SGPR");
+  old.extend_from_slice(&2u32.to_le_bytes());
+  old.extend_from_slice(&0u64.to_le_bytes());
+  old.extend_from_slice(&1u64.to_le_bytes());
+  old.extend_from_slice(&1u64.to_le_bytes());
+  old.extend_from_slice(&2u64.to_le_bytes());
+  old.push(1);
+  old.extend_from_slice(head.as_bytes());
+  old.extend_from_slice(&0u64.to_le_bytes());
+  old.extend_from_slice(&4u64.to_le_bytes());
+  old.extend_from_slice(b"PACK");
+  let mut store = live.recovered().expect("recovered");
+  assert_eq!(
+    replay_git(&mut store.content, &mut store.store, &old),
+    Err(ReplayRefused::Record(RecordRefused::Retired { version: 2 })),
+    "a version-2 record refused typed, naming its version"
+  );
+  assert_eq!(
+    store.facts(),
+    before,
+    "the store as the version-5 record left it"
+  );
+  let mut first = old.clone();
+  first.splice(4..8, 1u32.to_le_bytes());
+  assert_eq!(
+    Record::decode(&first, FORMAT),
+    Err(RecordRefused::Retired { version: 1 })
+  );
+}
+
+/// Lets go of the region's holds this shard keeps that `kept` did not hold (the names and packs a test's pushes homed
+/// here, a one-node daemon being each one's region home), as the home's own collection lets go of content no record
+/// names: what a test comparing the repository's own bytes leaves out (C5 part 2b).
+fn let_go_region_holds_since(state: &mut ShardState, kept: &[ContentId]) {
+  for identity in super::homes::region_held_here() {
+    if !kept.contains(&identity) {
+      let _ = super::homes::let_go_for_region(state, &identity);
+    }
+  }
+  super::settle(state);
+}
+
+/// The count of names `record` names (version 5 keeps them as a content, with their count).
+fn named_count(record: &Record) -> usize {
+  record
+    .named
+    .map_or(0, |(_, count)| usize::try_from(count).unwrap_or(usize::MAX))
 }
 
 /// The counts and the leading words of `bytes` made hostile, each refused by its kind.
@@ -392,18 +321,19 @@ fn assert_hostile_counts_and_words(bytes: &[u8]) {
   );
   let magic = with(0..4, b"GCHN");
   assert_eq!(Record::decode(&magic, FORMAT), Err(RecordRefused::Magic));
-  let version = with(4..8, &4u32.to_le_bytes());
+  let version = with(4..8, &6u32.to_le_bytes());
   assert_eq!(
     Record::decode(&version, FORMAT),
-    Err(RecordRefused::Version { version: 4 })
+    Err(RecordRefused::Version { version: 6 })
   );
-  // Format: the objects' count follows the header (24 bytes), the move's key, version and marker (17) and its head (20).
-  let objects_at = 24 + 17 + 20;
-  let objects_huge = with(objects_at..objects_at + 8, &u64::MAX.to_le_bytes());
-  assert_eq!(
-    Record::decode(&objects_huge, FORMAT),
-    Err(RecordRefused::Count)
-  );
+  for retired in [1u32, 2] {
+    let old = with(4..8, &retired.to_le_bytes());
+    assert_eq!(
+      Record::decode(&old, FORMAT),
+      Err(RecordRefused::Retired { version: retired }),
+      "version {retired} is no longer read (C5 part 2b piece 3: no record carries a push's objects)"
+    );
+  }
 }
 
 /// The markers, the format, the type and the end of `bytes` made hostile, each refused by its kind.
@@ -415,15 +345,6 @@ fn assert_hostile_marks(bytes: &[u8]) {
   }
   assert_eq!(Record::decode(&marker, FORMAT), Err(RecordRefused::Marker));
   assert!(Record::decode(bytes, ObjectFormat::Sha256).is_err());
-  let mut delta = bytes.to_vec();
-  // Format: the object's type follows the move (24 + 17 + 20) and the objects' count (8).
-  if let Some(byte) = delta.get_mut(24 + 17 + 20 + 8) {
-    *byte = 6;
-  }
-  assert_eq!(
-    Record::decode(&delta, FORMAT),
-    Err(RecordRefused::Malformed)
-  );
   let mut trailing = bytes.to_vec();
   trailing.push(0);
   assert_eq!(
@@ -449,6 +370,52 @@ struct Live {
   greens: BTreeMap<u64, u64>,
   /// Every blob a push brought, to send one again.
   blobs: Vec<Brought>,
+}
+
+/// The record a commit of `moves` writes now as a client's push's append writes it once its edge homed and landed it
+/// (version 5, C5 part 2b): the names of the objects `writer` noted that the store lacks now, by the predicate the
+/// commit gives positions by, put as one content, and the push's pack held by its identity (a pack of whole objects
+/// where the push kept none), as their homing leaves them in the content store; no changeset (the model holds no node
+/// store). An append that brings no object names none.
+fn landed_record(
+  content: &mut ContentStore,
+  store: &GitStore,
+  (writer, deepest, pack): (&RecordWriter, u64, &[u8]),
+  moves: &[RecordedMove],
+) -> Result<Vec<u8>, GitRefused> {
+  let names = writer.names_of(|id| store.repository.object(content, id).is_none());
+  if names.is_empty() {
+    return RecordWriter::finish_packed((deepest, moves), None, None, 0).map_err(super::unwritten);
+  }
+  let named =
+    super::record_names::names_to_content(content, &names).map_err(|_| GitRefused::Allocation)?;
+  let whole;
+  let pack = if pack.is_empty() {
+    let mut objects = Vec::new();
+    for (kind, identity, len) in &names {
+      let bytes = content
+        .object_bytes(identity, *len)
+        .ok_or(GitRefused::Allocation)?;
+      objects.push((*kind, bytes));
+    }
+    whole = slates_git::pack::of_whole_placed(
+      store.repository.format(),
+      objects
+        .iter()
+        .map(|(kind, bytes)| (*kind, bytes.as_slice())),
+    )
+    .map_err(|_| GitRefused::Allocation)?
+    .0;
+    whole.as_slice()
+  } else {
+    pack
+  };
+  let identity = content
+    .put_object(pack)
+    .map_err(|refused| GitRefused::Object(PushRefused::Content(refused)))?;
+  let len = u64::try_from(pack.len()).unwrap_or(u64::MAX);
+  RecordWriter::finish_packed((deepest, moves), Some(named), Some((identity, len)), 0)
+    .map_err(super::unwritten)
 }
 
 /// A push admitted and not yet committed, as a sealed push waits for its appends: its quarantine and its record's
@@ -488,13 +455,24 @@ impl Live {
   ) -> Result<Pending, GitRefused> {
     let mut push = Push::new(FORMAT);
     let mut writer = RecordWriter::default();
-    for brought in objects {
-      let arriving = incoming(brought, depth);
+    let arriving: Vec<Incoming<'_>> = objects
+      .iter()
+      .map(|brought| incoming(brought, depth))
+      .collect();
+    let (pack, offsets) = slates_git::pack::of_whole_placed(
+      FORMAT,
+      arriving
+        .iter()
+        .map(|incoming| (incoming.kind, incoming.content)),
+    )
+    .map_err(|_| GitRefused::Allocation)?;
+    push.extend_pack(&pack);
+    for (arriving, offset) in arriving.into_iter().zip(offsets) {
       admit_object(
         &mut self.content,
         &self.store,
         (&mut push, &mut writer),
-        (arriving, None),
+        (arriving, Some(offset)),
       )?;
     }
     Ok(Pending {
@@ -544,10 +522,10 @@ impl Live {
   ) -> Result<(), GitRefused> {
     let admitted = seal_moves(&mut self.content, &mut self.store, &mut pending.push, moves)?;
     let deepest = pending.push.deepest();
-    let record = record_of(
-      &self.content,
+    let record = landed_record(
+      &mut self.content,
       &self.store,
-      (&pending.writer, deepest, &[]),
+      (&pending.writer, deepest, pending.push.pack()),
       moves,
     )?;
     commit_moves(
@@ -599,6 +577,7 @@ impl Live {
     let mut content = empty_content();
     let mut store = GitStore::new(FORMAT, WINDOW);
     for record in &self.records {
+      self.fetched_into(&mut content, record);
       replay_git(&mut content, &mut store, record)?;
     }
     Ok(Live {
@@ -609,6 +588,26 @@ impl Live {
       greens: self.greens.clone(),
       blobs: self.blobs.clone(),
     })
+  }
+}
+
+impl Live {
+  /// The names and the pack `record` names, put into `content` as a recovery's fetch from their region homes puts them
+  /// (C5: a record holds neither; its fetch's hold is the record's), from this store's content where it holds them.
+  fn fetched_into(&self, content: &mut ContentStore, record: &[u8]) {
+    let Ok(read) = Record::decode(record, FORMAT) else {
+      return;
+    };
+    if let Some((identity, count)) = read.named
+      && let Ok(names) = super::record_names::names_from_content(&self.content, &identity, count)
+    {
+      let _ = super::record_names::names_to_content(content, &names);
+    }
+    if let Some((identity, len)) = read.packed
+      && let Some(pack) = self.content.object_bytes(&identity, len)
+    {
+      let _ = content.put_object(&pack);
+    }
   }
 }
 
@@ -626,7 +625,7 @@ type RefFacts = (Vec<VersionFacts>, Option<Positions>, Vec<u64>);
 /// Everything a store holds that a reader can ask (the module docs' "the store after a recovery equals the store
 /// before"): every position's id and row, every ref's versions and reached set, every derived value, every content the
 /// content store holds with its holders, and the deepest chain the store learned from its pushes' packs.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Facts {
   rows: Vec<(ObjectId, Option<ObjectRow>)>,
   refs: Vec<RefFacts>,
@@ -1052,10 +1051,9 @@ fn t_a662_a_fixed_history_makes_every_kind_of_push_and_recovers() {
 }
 
 /// A-662 (guard then apply: a replay refuses what is not what its record names, and leaves nothing). Do: replay a
-/// record whose pack's last byte was changed, one whose objects the store holds already (a record the live admission
-/// would not have made), and one whose head names a commit nobody sent. Expect: refused by git's reader (`Pack`, A-723:
-/// the pack's trailer no longer its checksum), `Diverged` and the store's `Missing` in turn, and each refused replay
-/// leaves the store as it was.
+/// record whose names' identity was changed, one whose objects the store holds already (a record the live admission
+/// would not have made), and one whose head names a commit nobody sent. Expect: refused `Names` (no content of that
+/// identity), `Diverged` and the store's `Missing` in turn, and each refused replay leaves the store as it was.
 #[test]
 fn t_a662_a_record_not_what_it_names_is_refused_and_leaves_nothing() {
   let mut live = Live::new();
@@ -1066,14 +1064,14 @@ fn t_a662_a_record_not_what_it_names_is_refused_and_leaves_nothing() {
   let before = live.facts();
   let record = live.records.first().expect("a record").clone();
   let mut changed = record.clone();
-  if let Some(byte) = changed.last_mut() {
+  // Format: the names' identity follows the head (24 bytes) and the one move (17 and its head's 20).
+  if let Some(byte) = changed.get_mut(24 + 17 + 20) {
     *byte ^= 1;
   }
   let mut store = live.recovered().expect("recovered");
-  // A-723: the record's last bytes are its pack's trailer, so the changed record's pack is refused by git's reader.
   assert!(matches!(
     replay_git(&mut store.content, &mut store.store, &changed),
-    Err(ReplayRefused::Pack(_))
+    Err(ReplayRefused::Names(_))
   ));
   assert_eq!(store.facts(), before);
   assert!(matches!(
@@ -1084,65 +1082,52 @@ fn t_a662_a_record_not_what_it_names_is_refused_and_leaves_nothing() {
   assert_a_head_nobody_sent_is_refused_and_leaves_nothing(&mut store, &before);
 }
 
-/// `v2`, a version-2 record, written as version 3 (A-724 piece 8c): its names put into `content` as one content and
-/// named by its identity and count in their place. The identity, beside the bytes.
-fn as_version_3(v2: &[u8], content: &mut ContentStore) -> (Vec<u8>, slates_vcs::ContentId) {
-  let read = Record::decode(v2, FORMAT).expect("a version-2 record");
-  let (identity, count) =
-    super::record_names::names_to_content(content, &read.names).expect("names put");
-  // Format: after the moves come the names' count (8), each name (41), the pack's length (8) and the pack.
-  let tail = 8 + 41 * read.names.len() + 8 + read.pack.len();
-  let mut v3 = v2[..v2.len() - tail].to_vec();
-  v3.splice(4..8, 3u32.to_le_bytes());
-  v3.extend_from_slice(&identity.0);
-  v3.extend_from_slice(&count.to_le_bytes());
-  v3.extend_from_slice(&(read.pack.len() as u64).to_le_bytes());
-  v3.extend_from_slice(read.pack);
-  (v3, identity)
-}
-
-/// A-724 piece 8c (main's ruling of 2026-11-20 (ii): replay reads a version-3 record's names locally, else from their
-/// region homes, and holds them by identity). Do: push a commit, write its record as version 3, and replay it into an
-/// empty store twice: once holding its names (as a fetch from the region leaves them, or a restart's restored window
-/// held for no one), once without them. Expect: the first made again equal to the live store beside the names' content,
-/// held for the record; the second
+/// A-767 C5's record v5 (A-722's pack homing; A-724 piece 8c's names): a replay reads a version-5 record's names and
+/// pack by their identities, locally, else from their region homes, and holds them for the record. Do: push a commit,
+/// write its record as version 5, and replay it into an empty store twice: once holding its names and pack (as a fetch
+/// from the region leaves them, or a restart's restored windows held for no one), once without them. Expect: the first
+/// made again equal to the live store, which holds the names' content and the pack as its homing left them; the second
 /// refused `Names` (missing, to be fetched first), the store left as it was.
 #[test]
-fn t_a724_a_version_3_record_replays_from_its_names_by_identity_and_refuses_without_them() {
+fn t_a767_c5_a_version_5_record_replays_from_its_names_and_pack_by_identity_and_refuses_without_them()
+ {
   let mut live = Live::new();
   let (objects, head) = commit_of(&[(b"a".to_vec(), b"bytes".to_vec())], &[], FIRST_DATE);
   live
     .push(&objects, vec![(0, Some(head))], 0)
     .expect("pushed");
   let before = live.facts();
-  let v2 = live.records.first().expect("a record").clone();
+  let v5 = live.records.first().expect("a record").clone();
+  let read = Record::decode(&v5, FORMAT).expect("a version-5 record");
+  let ((identity, _), (pack, _)) = (
+    read.named.expect("names named"),
+    read.packed.expect("a pack named"),
+  );
   let mut content = empty_content();
-  let (v3, identity) = as_version_3(&v2, &mut content);
-  // What the names' content is charged in the store, measured as it was put into an empty one.
-  let names_charge = content.used();
+  live.fetched_into(&mut content, &v5);
   let mut store = GitStore::new(FORMAT, WINDOW);
-  replay_git(&mut content, &mut store, &v3).expect("replayed from its names");
+  replay_git(&mut content, &mut store, &v5).expect("replayed from its names and pack");
   assert!(
     content.holders(&identity) >= 1,
     "the names are held for the record"
   );
+  assert!(
+    content.holders(&pack) >= 2,
+    "the pack is held for the record and by its rows"
+  );
   let made = Live {
     content,
     store,
-    records: vec![v3.clone()],
+    records: vec![v5.clone()],
     heads: live.heads.clone(),
     greens: live.greens.clone(),
     blobs: live.blobs.clone(),
   };
-  // The same store as the live one, beside the names' content itself, which a version-3 store holds for its record.
-  let mut facts = made.facts();
-  facts.contents.retain(|(held, _)| *held != identity);
-  facts.used -= names_charge;
-  assert_eq!(facts, before);
+  assert_eq!(made.facts(), before, "the same store as the live one");
   let mut bare = empty_content();
   let mut store = GitStore::new(FORMAT, WINDOW);
   assert!(matches!(
-    replay_git(&mut bare, &mut store, &v3),
+    replay_git(&mut bare, &mut store, &v5),
     Err(ReplayRefused::Names(
       super::record_names::NamesRefused::Rows(slates_vcs::rows::RowsRefused::Missing)
     ))
@@ -1157,13 +1142,8 @@ fn t_a724_a_version_3_record_replays_from_its_names_by_identity_and_refuses_with
 /// commit nobody sent is refused by the store as `Missing`, and leaves `store`'s facts `before`.
 fn assert_a_head_nobody_sent_is_refused_and_leaves_nothing(store: &mut Live, before: &Facts) {
   let nobody = ObjectId::from_bytes(FORMAT, &[0x5a; 20]).expect("an id");
-  let missing = RecordWriter::default()
-    .finish(
-      (&store.content, FORMAT, &[]),
-      |_| true,
-      (0, &[(1, 1, Some(nobody))]),
-    )
-    .expect("written");
+  let missing =
+    RecordWriter::finish_packed((0, &[(1, 1, Some(nobody))]), None, None, 0).expect("written");
   assert!(matches!(
     replay_git(&mut store.content, &mut store.store, &missing),
     Err(ReplayRefused::Git(GitRefused::Store(_)))
@@ -1188,9 +1168,8 @@ pub(crate) fn repository(
   name: &str,
   tool: VcsTool,
 ) -> (RepositoryId, DbVolumeId) {
-  let reply = dispatch(
+  let reply = crate::test_store::create(
     state,
-    1,
     &owner(),
     RequestBody::CreateRepository {
       name: name.to_owned(),
@@ -1217,10 +1196,18 @@ pub(crate) fn repository(
 /// is held, none unrecovered, and nothing is charged.
 #[test]
 fn t_a662_each_tool_has_its_arm_made_with_its_record_and_freed_with_it() {
-  crate::daemon::audit_on_shard(|state| {
-    let (git, _) = repository(state, "git", VcsTool::Git);
-    let (hg, _) = repository(state, "hg", VcsTool::Mercurial);
-    let (svn, _) = repository(state, "svn", VcsTool::Subversion);
+  // Each made through a client's request on a store-backed daemon (A-767 item 7: a creation lands on the store before
+  // it is recorded, and a Subversion repository needs the store, C2).
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let [git, hg, svn] = [
+    ("git", VcsTool::Git),
+    ("hg", VcsTool::Mercurial),
+    ("svn", VcsTool::Subversion),
+  ]
+  .map(|(name, tool)| {
+    crate::test_store::create_on(&daemon, 0, &owner(), (name, tool, WireFormat::Sha1, "main")).0
+  });
+  crate::daemon::observe_first(&daemon, move |state| {
     assert_each_tool_has_its_arm(state, [git, hg, svn]);
     assert_bytes_that_are_no_record_are_refused(state, hg, svn);
     assert!(!super::replayed(state, hg, Err(ReplayRefused::Diverged)));
@@ -1236,6 +1223,7 @@ fn t_a662_each_tool_has_its_arm_made_with_its_record_and_freed_with_it() {
     }
     assert_eq!(state.vcs_stores.charged(), 0);
   });
+  daemon.stop();
 }
 
 /// The stores of [`t_a662_each_tool_has_its_arm_made_with_its_record_and_freed_with_it`]: each its tool's arm, git's
@@ -1297,7 +1285,7 @@ fn assert_bytes_that_are_no_record_are_refused(
 /// admit now, then `ContentUnavailable`, counted.
 #[test]
 fn t_a662_a_store_refusal_reads_as_the_budget_or_unavailable() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("vcs", |state| {
     let budget = GitRefused::Store(StoreRefused::Content(ContentRefused::OverBudget {
       need: 10,
       room: 3,
@@ -1321,52 +1309,6 @@ fn t_a662_a_store_refusal_reads_as_the_budget_or_unavailable() {
 }
 
 /// A push begun on the shard with `objects` admitted at `depth`.
-/// A zlib stream of `data` in stored (uncompressed) blocks, as a pack entry's data may be (RFC 1950, RFC 1951 §3.2.4):
-/// what git's reader inflates, made with no compressor.
-fn zlib_stored(data: &[u8]) -> Vec<u8> {
-  let mut out = vec![0x78, 0x01];
-  let mut blocks = data.chunks(usize::from(u16::MAX)).peekable();
-  if blocks.peek().is_none() {
-    out.extend_from_slice(&[1, 0, 0, 0xff, 0xff]);
-  }
-  while let Some(block) = blocks.next() {
-    out.push(u8::from(blocks.peek().is_none()));
-    let len = u16::try_from(block.len()).expect("a stored block's length");
-    out.extend_from_slice(&len.to_le_bytes());
-    out.extend_from_slice(&(!len).to_le_bytes());
-    out.extend_from_slice(block);
-  }
-  let (mut a, mut b) = (1u32, 0u32);
-  for byte in data {
-    a = (a + u32::from(*byte)) % 65_521;
-    b = (b + a) % 65_521;
-  }
-  out.extend_from_slice(&((b << 16) | a).to_be_bytes());
-  out
-}
-
-/// A pack of `objects`, each whole, as a client sends them (A-723: the pack the record keeps).
-pub(crate) fn pack_of(objects: &[Brought]) -> Vec<u8> {
-  let mut out = Vec::new();
-  let count = u32::try_from(objects.len()).expect("a count");
-  let mut writer = slates_git::pack::Writer::new(FORMAT, count, &mut out);
-  let mut at = slates_git::entry::PACK_HEADER_LEN;
-  for (kind, _, bytes) in objects {
-    let mut head = Vec::new();
-    let header = slates_git::entry::Header {
-      representation: slates_git::entry::Representation::Whole(*kind),
-      size: u64::try_from(bytes.len()).expect("a size"),
-    };
-    slates_git::entry::write(header, at, &mut head).expect("a header");
-    let data = zlib_stored(bytes);
-    slates_git::out::Out::put(&mut writer, &head);
-    slates_git::out::Out::put(&mut writer, &data);
-    at += u64::try_from(head.len() + data.len()).expect("an offset");
-  }
-  writer.finish().expect("a trailer");
-  out
-}
-
 fn begun_at(
   state: &mut ShardState,
   repository: RepositoryId,
@@ -1374,8 +1316,6 @@ fn begun_at(
   depth: u64,
 ) -> GitPush {
   let mut push = GitPush::begin(&state.vcs_stores, repository).expect("a git store");
-  let pack = pack_of(objects);
-  push.keep_pack_to(u64::try_from(pack.len()).expect("a length"), &pack);
   let arriving: Vec<Incoming<'_>> = objects
     .iter()
     .map(|brought| incoming(brought, depth))
@@ -1431,13 +1371,21 @@ pub(crate) fn appended(
   changes: Vec<BranchChange>,
   sealed: (&mut super::SealedPush, &[StoreMove]),
 ) -> Result<Appended, crate::repository::push::AppendRefused> {
+  // Its names and pack homed and landed first, as a client's edge carries them (C5 part 2b: no record carries a push's
+  // objects); nothing to carry where it brings none.
+  let _ = crate::vcs_store::commits::home_and_land_blocking(state, sealed.0);
+  let (pushing, moves) = sealed;
   let appended = crate::repository::push::push_sealed(
     state,
     (&owner(), repository),
     changes,
     EntryParts::default(),
-    sealed,
+    (&mut *pushing, moves),
   );
+  // Refused, its homing's holds are given back, as a refused push gives them back.
+  if appended.is_err() {
+    pushing.release_homed(state);
+  }
   // A push's whole map is built by a task of the shard (A-664's live whole builds), which a test's step never runs:
   // driven to its end here, so the test reads the store as the build leaves it.
   crate::vcs_store::paths::whole_build::settle(state);
@@ -1458,6 +1406,8 @@ pub(crate) fn push_unsettled(
   let mut sealed = push.seal(state).expect("sealed");
   let changes = vec![BranchChange::Update { green, work: built }];
   let moves = [(Target::Green(green), Some(head))];
+  // Homed and landed first, as a client's edge carries a push (C5 part 2b: no record carries a push's objects).
+  let _ = crate::vcs_store::commits::home_and_land_blocking(state, &mut sealed);
   crate::repository::push::push_sealed(
     state,
     (&owner(), repository),
@@ -1576,7 +1526,7 @@ pub(crate) fn assert_made_again_whole(
 /// made again equal whole, both records replayed and none refused.
 #[test]
 fn t_a662_a_push_appended_a_ref_at_a_time_is_made_again_from_its_records() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("vcs", |state| {
     let (repository, root) = repository(state, "split", VcsTool::Git);
     let files = [(b"README".to_vec(), b"one\n".to_vec())];
     let (objects, one) = commit_of(&files, &[], FIRST_DATE);
@@ -1595,7 +1545,7 @@ fn t_a662_a_push_appended_a_ref_at_a_time_is_made_again_from_its_records() {
     .expect("topic");
     sealed.abandon(state);
     let last = records(state, repository).pop().expect("a record");
-    let read = Record::decode(&last, FORMAT).map(|record| (record.deepest, record.names.len()));
+    let read = Record::decode(&last, FORMAT).map(|record| (record.deepest, named_count(&record)));
     assert_eq!(read, Ok((DEEP, 0)));
     let greens = [green_key(root), green_key(created_green(&made))];
     assert_made_again_whole(state, repository, &greens);
@@ -1609,7 +1559,7 @@ fn t_a662_a_push_appended_a_ref_at_a_time_is_made_again_from_its_records() {
 /// second's chain; the store made again equal whole, its learned depth the second's chain, both records replayed.
 #[test]
 fn t_a662_a_push_whose_objects_another_committed_first_records_none_of_them() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("vcs", |state| {
     let (repository, root) = repository(state, "twice", VcsTool::Git);
     let files = [(b"README".to_vec(), b"one\n".to_vec())];
     let (objects, one) = commit_of(&files, &[], FIRST_DATE);
@@ -1631,7 +1581,7 @@ fn t_a662_a_push_whose_objects_another_committed_first_records_none_of_them() {
     .expect("the second");
     second.abandon(state);
     let last = records(state, repository).pop().expect("a record");
-    let read = Record::decode(&last, FORMAT).map(|record| (record.deepest, record.names.len()));
+    let read = Record::decode(&last, FORMAT).map(|record| (record.deepest, named_count(&record)));
     assert_eq!(read, Ok((DEEP, 0)));
     let learned = state
       .vcs_stores
@@ -1650,7 +1600,7 @@ fn t_a662_a_push_whose_objects_another_committed_first_records_none_of_them() {
 /// as version 2, its record holding every object the push brought, and the store's ref at the new head.
 #[test]
 fn t_a662_a_refused_ref_leaves_the_push_whole_for_the_next() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("vcs", |state| {
     let (repository, root) = repository(state, "tree", VcsTool::Git);
     let files = [(b"README".to_vec(), b"one\n".to_vec())];
     let (first, one) = commit_of(&files, &[], FIRST_DATE);
@@ -1670,11 +1620,15 @@ fn t_a662_a_refused_ref_leaves_the_push_whole_for_the_next() {
     let mut sealed = push.seal(state).expect("sealed");
     let moves = [(Target::Green(root), Some(two))];
     let held = state.vcs_stores.content().map(ContentStore::used);
+    let kept = super::homes::region_held_here();
     let changes = vec![BranchChange::Update {
       green: root,
       work: stale,
     }];
     assert!(appended(state, repository, changes, (&mut sealed, &moves)).is_err());
+    // The refused push's homing left its names and pack with their region home (this shard): the home's, let go here
+    // as the home lets go of content no record names; the repository holds nothing more.
+    let_go_region_holds_since(state, &kept);
     assert_eq!(state.vcs_stores.content().map(ContentStore::used), held);
     assert_eq!(records(state, repository).len(), 1);
     let changes = vec![BranchChange::Update {
@@ -1689,7 +1643,7 @@ fn t_a662_a_refused_ref_leaves_the_push_whole_for_the_next() {
     sealed.abandon(state);
     let last = records(state, repository).pop().expect("a record");
     let read = Record::decode(&last, FORMAT).expect("a record");
-    assert_eq!(read.names.len(), second.len());
+    assert_eq!(named_count(&read), second.len());
     let (content, store) = state.vcs_stores.git_ref(repository).expect("the store");
     let key = green_key(root);
     let newest = store
@@ -1710,7 +1664,7 @@ fn t_a662_a_refused_ref_leaves_the_push_whole_for_the_next() {
 /// and replayed both records; freeing gives every byte back.
 #[test]
 fn t_a662_a_pushs_objects_ride_its_entry_and_the_log_makes_the_same_store() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("vcs", |state| {
     let (repository, root) = repository(state, "kernel", VcsTool::Git);
     let files = [(b"README".to_vec(), b"one\n".to_vec())];
     let (first, one) = commit_of(&files, &[], FIRST_DATE);
@@ -1742,7 +1696,13 @@ fn t_a662_a_pushs_objects_ride_its_entry_and_the_log_makes_the_same_store() {
     assert_eq!(store.version_of(content, key, &two), Some((2, second_tree)));
     assert_eq!(store.versions(key), &[1, 2]);
     assert_made_again_whole(state, repository, &[key]);
+    // The records' own holds of their names and packs, which a free leaves (a rebuild replays the same records), let go
+    // as a destroy of the repository lets them go with its records.
+    super::release_record_holds(state, repository);
     super::free(state, repository);
+    // The region's own holds of the pushes' names and packs (this shard their home) are the home's, not the
+    // repository's: let go as the home lets go of content no record names, then nothing is held or charged.
+    let_go_region_holds_since(state, &[]);
     assert_eq!(state.vcs_stores.charged(), 0);
     assert_eq!(state.vcs_stores.content().map(ContentStore::used), Some(0));
   });
@@ -1757,7 +1717,7 @@ fn assert_an_abandoned_push_leaves_nothing(
   let mut abandoned = GitPush::begin(&state.vcs_stores, repository).expect("a git store");
   let arriving: Vec<Incoming<'_>> = objects.iter().map(|brought| incoming(brought, 0)).collect();
   abandoned.admit_all(state, &arriving).expect("admitted");
-  assert!(state.vcs_stores.charged() > 0);
+  assert!(!abandoned.quarantine().is_empty());
   abandoned.abandon(state);
   assert_eq!(state.vcs_stores.content().map(ContentStore::used), Some(0));
   assert_eq!(state.vcs_stores.charged(), 0);
@@ -1772,11 +1732,11 @@ fn assert_recorded_and_charged(
   (first, second): (usize, usize),
 ) {
   let records = records(state, repository);
-  let read: Vec<Record<'_>> = records
+  let read: Vec<Record> = records
     .iter()
     .map(|bytes| Record::decode(bytes, FORMAT).expect("a record"))
     .collect();
-  let counts: Vec<usize> = read.iter().map(|record| record.names.len()).collect();
+  let counts: Vec<usize> = read.iter().map(named_count).collect();
   // The second push's README blob is the first's, already held, so only its new blob, tree and commit are recorded.
   assert_eq!(counts, vec![first, second - 1]);
   assert!(read.iter().all(|record| record.moves.len() == 1
@@ -1792,7 +1752,7 @@ fn assert_recorded_and_charged(
 /// version 1 with the new head; the record naming that key.
 #[test]
 fn t_a662_a_created_branch_is_keyed_by_the_green_its_append_makes() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("vcs", |state| {
     let (repository, root) = repository(state, "made", VcsTool::Git);
     let files = [(b"README".to_vec(), b"one\n".to_vec())];
     let (first, one) = commit_of(&files, &[], FIRST_DATE);
@@ -1852,7 +1812,7 @@ fn kept_files(
 /// first version) and none refused.
 #[test]
 fn t_a664_p3_a_pushs_version_keeps_its_map_of_gits_files() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("vcs", |state| {
     let (repository, green) = repository(state, "pushed", VcsTool::Git);
     let (a, a_bytes) = blob(b"alpha\n");
     let (b, b_bytes) = blob(b"beta\n");
@@ -1966,7 +1926,7 @@ fn pushed_many(state: &mut ShardState, name: &str, pushes: u64) -> (RepositoryId
 /// lent again and its green's map made again by its build. Red before the change: the store was made whole at once.
 #[test]
 fn t_a732_a_git_rebuild_lends_nothing_and_replays_a_record_a_turn() {
-  let seen = crate::daemon::audit_on_shard(|state| {
+  let seen = crate::test_store::audit_on_stored_shard("vcs", |state| {
     let (repository, root) = pushed_many(state, "sliced-rebuild", 5);
     let records = records(state, repository).len();
     super::rebuild(state, repository);
@@ -2001,7 +1961,7 @@ const MANY_FILES: usize = 64;
 /// Red before the change: the record was replayed whole in one turn.
 #[test]
 fn t_a722_p4_a_many_object_pack_record_is_replayed_over_many_turns() {
-  let seen = crate::daemon::audit_on_shard(|state| {
+  let seen = crate::test_store::audit_on_stored_shard("vcs", |state| {
     let (repository, root) = repository(state, "many-objects", VcsTool::Git);
     let files: Vec<(Vec<u8>, Vec<u8>)> = (0..MANY_FILES)
       .map(|n| {
@@ -2039,7 +1999,7 @@ fn t_a722_p4_a_many_object_pack_record_is_replayed_over_many_turns() {
 /// it. Expect: more turns than the push holds objects; the push landed, its green's head the commit.
 #[test]
 fn t_a722_p4_a_pushs_seal_takes_many_turns_and_lands() {
-  let seen = crate::daemon::audit_on_shard(|state| {
+  let seen = crate::test_store::audit_on_stored_shard("vcs", |state| {
     let (repository, root) = repository(state, "many-sealed", VcsTool::Git);
     let files: Vec<(Vec<u8>, Vec<u8>)> = (0..MANY_FILES)
       .map(|n| {
@@ -2089,7 +2049,7 @@ fn t_a722_p4_a_pushs_seal_takes_many_turns_and_lands() {
 /// admitted before it (none left kept) and landed it, the green's head the commit.
 #[test]
 fn t_a722_p4_a_move_admitted_over_many_turns_is_the_one_its_append_lands() {
-  let seen = crate::daemon::audit_on_shard(|state| {
+  let seen = crate::test_store::audit_on_stored_shard("vcs", |state| {
     let (repository, root) = repository(state, "many-admitted", VcsTool::Git);
     let files: Vec<(Vec<u8>, Vec<u8>)> = (0..MANY_FILES)
       .map(|n| {
@@ -2129,9 +2089,10 @@ fn t_a722_p4_a_move_admitted_over_many_turns_is_the_one_its_append_lands() {
         let newest = git.repository.versions(key).checked_sub(1)?;
         git.repository.head(content, key, newest)
       });
-    (turns > objects.len(), kept, left, head == Some(commit))
+    (turns, kept, left, head == Some(commit))
   });
-  assert_eq!(seen, (true, 1, 0, true));
+  // A create is admitted with no walk (A-614 amended), in one turn; its sets are its first reader's to derive.
+  assert_eq!(seen, (1, 1, 0, true));
 }
 
 /// A-752 part 3 (main's order of 2026-11-20: a push changing every file of a 1,500-file head stepped its map in its
@@ -2143,7 +2104,7 @@ fn t_a722_p4_a_move_admitted_over_many_turns_is_the_one_its_append_lands() {
 /// ones built from the whole head.
 #[test]
 fn t_a752_p3_a_pushs_map_step_runs_a_path_a_slice_and_equals_the_whole_build() {
-  let seen = crate::daemon::audit_on_shard(|state| {
+  let seen = crate::test_store::audit_on_stored_shard("vcs", |state| {
     let (repository, root) = repository(state, "change-build", VcsTool::Git);
     let files = |word: &str, count: usize| -> Vec<(Vec<u8>, Vec<u8>)> {
       (0..count)
@@ -2239,14 +2200,15 @@ fn walked(state: &ShardState, id: RepositoryId) -> u64 {
 }
 
 /// A-722 part 4g (main's report of 2026-11-20: after a restart, a daemon recovering a repository pushed git/git's v2.0.0
-/// spun past the watchdog's window and was killed again, a crash loop). Do: push one commit of [`MANY_FILES`] files;
-/// make the store again from the log, each turn held to no time at all, reading after each turn how many objects the
-/// store's walks visited. Expect: the record replayed; the move's admission walking every object the push brought, and
-/// no turn walking more than one of them. Red before the change: the replay's end admitted the move whole, its walk in
-/// one turn.
+/// spun past the watchdog's window and was killed again, a crash loop); A-614 amended (main's ruling (A) of 2026-11-21,
+/// its condition 3: a replay walks nothing, so a restart's cost stays flat in history). Do: push one commit of
+/// [`MANY_FILES`] files; make the store again from the log, each turn held to no time at all, reading after each turn
+/// how many objects the store's walks visited. Expect: the record replayed, and no object walked at all, by any turn:
+/// the create is admitted with no walk, its sets its first reader's to derive. Red before A-614's amendment: the move's
+/// admission walked every object the push brought, an object a turn (and before part 4g, the whole walk in one turn).
 #[test]
 fn t_a722_p4g_a_replayed_records_move_is_admitted_an_object_a_turn() {
-  let (most, total, objects) = crate::daemon::audit_on_shard(|state| {
+  let (most, total, objects) = crate::test_store::audit_on_stored_shard("vcs", |state| {
     let (repository, root) = repository(state, "admitted-in-turns", VcsTool::Git);
     let files: Vec<(Vec<u8>, Vec<u8>)> = (0..MANY_FILES)
       .map(|n| {
@@ -2269,46 +2231,86 @@ fn t_a722_p4g_a_replayed_records_move_is_admitted_an_object_a_turn() {
     }
     (most, before.saturating_sub(begun), objects.len())
   });
-  assert!(
-    total >= u64::try_from(objects).unwrap(),
-    "walked {total} of {objects}"
-  );
-  assert_eq!(most, 1, "the most objects one turn walked");
+  assert!(objects > 0);
+  assert_eq!((total, most), (0, 0), "a replay walks nothing");
 }
 
 /// main's ruling (b) on the identity rule's compatibility shim (banned item 7): a git record that names an object past
 /// one window by this node's root of it, as records did before the rule, is refused, never read as the object. Do:
-/// push a create of `main` whose one file is 1 MiB; take the push's record and name the file by its root in place of
-/// its BLAKE3; replay the record so altered into the repository's store made again empty. Expect: the record as written
+/// push a create of `main` whose one file is 512 KiB (its record version 5, naming its objects by its names' content);
+/// take its record and name the file in that content by its root in place of its BLAKE3, the content put again; replay
+/// the record so altered into the repository's store made again empty. Expect: the record as written
 /// replays; the altered one refused, typed (`ReplayRefused::Diverged`: the objects the replay admits are named by
 /// their BLAKE3, which the record does not name), never accepted.
 #[test]
 fn t_identity_rule_a_record_naming_an_object_by_its_old_root_is_refused_typed() {
-  crate::daemon::audit_on_shard(|state| {
-    const LARGE: usize = 1 << 20;
-    let repository = crate::git_push::tests::git_repository(state, "old-form");
-    let (request, _) = crate::git_push::tests::large_create(LARGE);
-    crate::git_push::tests::pushed(state, repository, &request);
+  crate::test_store::audit_on_stored_shard("vcs", |state| {
+    // Shape: a file past one window of the content store (its `assert_ne!` below holds it so), and within the room a
+    // wiring test's work is built in ([`ROOM`]).
+    const LARGE: usize = 1 << 19;
+    let (repository, green) = repository(state, "old-form", VcsTool::Git);
     let blob: Vec<u8> = (0..LARGE)
       .map(|at| u8::try_from(at % 251).unwrap_or(u8::MAX))
       .collect();
+    let (objects, head) = commit_of(&[(b"large".to_vec(), blob.clone())], &[], FIRST_DATE);
+    push_through(
+      state,
+      (repository, green),
+      &objects,
+      (None, head, tree_of(&objects)),
+    );
     let identity = ContentId::of(&blob);
-    let root = state
+    // The root a record before the rule named the file by: the one this store would cut its bytes into (the file is
+    // held where it lies in its push's pack now, A-722's record v4, so the store keeps no root of it).
+    let window = state
       .vcs_stores
       .content()
-      .map(|content| content.root_of(&identity))
+      .map(ContentStore::window)
       .unwrap();
+    let mut scratch = ContentStore::new(u64::try_from(4 * LARGE).unwrap(), window).unwrap();
+    let held = scratch.put_object(&blob).unwrap();
+    let root = scratch.root_of(&held);
     assert_ne!(root, identity, "the file is past one window");
+    // A record names its objects by its names' content (version 5): the file's name in it rewritten to its old root,
+    // the content put again, and the record written again naming that content.
+    let names_of = |state: &mut ShardState, record: &[u8]| {
+      let (named, count) = Record::decode(record, FORMAT).ok()?.named?;
+      // Read with the shard's chunk store lent, where the names' windows are kept.
+      let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
+      super::record_names::names_from_content(lent.stores.content()?, &named, count).ok()
+    };
     let written = records(state, repository)
       .into_iter()
-      .find(|record| record.windows(32).any(|at| at == identity.0))
+      .find(|record| {
+        names_of(state, record).is_some_and(|names| names.iter().any(|name| name.1 == identity))
+      })
       .expect("a record naming the file");
-    let at = written
-      .windows(32)
-      .position(|bytes| bytes == identity.0)
-      .unwrap();
-    let mut altered = written.clone();
-    altered[at..at + 32].copy_from_slice(&root.0);
+    let read = Record::decode(&written, FORMAT).expect("a record");
+    let mut names = names_of(state, &written).expect("its names");
+    for name in &mut names {
+      if name.1 == identity {
+        name.1 = root;
+      }
+    }
+    let renamed = {
+      // The room the names' content needs, lent as a push's homing lends it (`vcs_store::put_names`).
+      super::lend(
+        &mut state.store,
+        &mut state.vcs_stores,
+        u64::try_from(written.len()).unwrap(),
+      );
+      let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
+      let content = lent.stores.content.as_mut().expect("the content store");
+      super::record_names::names_to_content(content, &names).expect("names put")
+    };
+    super::settle(state);
+    let altered = RecordWriter::finish_packed(
+      (read.deepest, &read.moves),
+      Some(renamed),
+      read.packed,
+      read.sequence,
+    )
+    .expect("written");
     let record = state
       .db
       .partition()

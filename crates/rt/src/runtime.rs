@@ -568,9 +568,23 @@ impl Runtime {
       };
       let id = seed.id;
       let ready = ready.clone();
+      // A latency-tracking runtime's shard runs in macOS's real-time band (A-831, `slates_machine::time_constraint`):
+      // woken behind busy time-share neighbours it ran only when their quanta ended (84a: a loaded edit and merge's p99
+      // 14-17 ms, 0.4-2.1 ms under the policy). Its computation is its idle window, doubled until the kernel takes it.
+      let real_time_window_ns = config.wake_tracking.is_some().then_some(config.spin_ns);
       let spawned = std::thread::Builder::new()
         .name(format!("slates-shard-{id}"))
-        .spawn(move || run_worker(seed, core, ready));
+        .spawn(move || {
+          if let Some(window_ns) = real_time_window_ns
+            && cfg!(target_os = "macos")
+            && slates_machine::time_constraint::set_current_from(window_ns).is_none()
+          {
+            slates_machine::log_line!(
+              "slates-rt: shard {id} runs time-share: the kernel took no time-constraint policy from {window_ns} ns"
+            );
+          }
+          run_worker(seed, core, ready)
+        });
       match spawned {
         Ok(thread) => {
           workers.push(Worker { id, thread });
@@ -775,6 +789,37 @@ impl LocalRuntime {
     self
       .context()
       .spawn_local(crate::shard::boxed(future), None)
+  }
+
+  /// Runs `future` on this shard to its end and gives back its output (hyper-rt's `LocalRuntime::block_on`, for the
+  /// vendored engine's tests and a cold caller, A-767 piece C2): the future runs as a detached task, the shard steps
+  /// while it has work and parks in its driver while it waits, so a wake from another thread (a channel, a
+  /// completion) is what resumes it, never a spin. Refused `WorkerFailed` when the task ends without its output (it
+  /// was cancelled or its poll unwound).
+  pub fn block_on<T: 'static>(
+    &self,
+    future: impl Future<Output = T> + 'static,
+  ) -> Result<T, RtError> {
+    let (sent, output) = std::sync::mpsc::sync_channel(1);
+    let id = self.spawn(async move {
+      let _ = sent.send(future.await);
+    })?;
+    self.context().detach(id)?;
+    loop {
+      match output.try_recv() {
+        Ok(value) => return Ok(value),
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+          return Err(RtError::WorkerFailed {
+            shard: self.shard_id().0,
+          });
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+      }
+      let outcome = self.context().step();
+      if !outcome.did_work {
+        self.context().park(outcome.next_deadline_ns);
+      }
+    }
   }
 
   /// Runs until no task, timer or message is pending.

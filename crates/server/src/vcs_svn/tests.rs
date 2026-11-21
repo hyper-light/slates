@@ -19,6 +19,13 @@ use crate::daemon::{Daemon, SegmentSource};
 const SHARDS: u16 = 2;
 /// Shape: how long the client waits for each read: the daemon's liveness budget.
 const PATIENCE_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS;
+/// Shape: how long a client waits for an answer that runs hooks: a hang's bound, not a hook's. The daemon holds a hook
+/// only to the bound its runs taught it, so a first run lasts as long as the machine makes it: on a loaded Mac (load
+/// ~60, w-perf 2026-11-20) a hook's process took past the ten windows these tests once waited, 1 run in 3, and the read
+/// that timed out returned the answer part-way, read as a wrong answer (R3, the hook test flake). Sixty windows hold
+/// three times the longest seen (22 s a test against 2.3 s).
+#[cfg(unix)]
+const HOOK_PATIENCE_NS: u64 = 60 * PATIENCE_NS;
 /// Format: what stock `svnserve` 1.15.0 wrote to stock `svn` 1.15.0 asking for [`RECORDED_URL`] under a root holding no
 /// repository: its greeting, then its refusal (recorded on the Mac Studio, 2026-11-19).
 const SERVER_BYTES: &[u8] =
@@ -52,7 +59,7 @@ const OTHER: usize = 1;
 const OWNER: u32 = 1234;
 
 /// A daemon of [`SHARDS`] shards whose configuration asks for the svn:// listener at `address`.
-fn daemon(address: SocketAddrV4) -> Daemon {
+fn daemon(address: SocketAddrV4) -> crate::test_store::StoredDaemon {
   static NEXT: AtomicU32 = AtomicU32::new(0);
   let profile = crate::daemon::test_profile();
   let instance = format!(
@@ -62,8 +69,14 @@ fn daemon(address: SocketAddrV4) -> Daemon {
   );
   let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(SHARDS));
   config.vcs_svn = Some(address);
-  let daemon = Daemon::start(&profile, config, SegmentSource::Create { name: instance })
-    .expect("the daemon starts");
+  // A Subversion repository's history lands on the node's changeset store (C2): the daemon holds one.
+  let daemon = crate::test_store::StoredDaemon::start(
+    "vcs-svn",
+    &profile,
+    config,
+    SegmentSource::Create { name: instance },
+  )
+  .expect("the daemon starts");
   daemon
     .bootstrap(true)
     .expect("the daemon creates its initial group");
@@ -201,22 +214,9 @@ fn name_on(prefix: &str, partition: usize) -> String {
 /// Creates the Subversion repository `name` on partition `partition`, owned by [`owner`], with the defaults `slates
 /// repository create NAME --tool svn` sends (A-685).
 fn create_svn(daemon: &Daemon, partition: usize, name: &str) {
-  let name = name.to_owned();
-  let created = crate::daemon::observe_at(daemon, partition, move |state| {
-    crate::verbs::dispatch(
-      state,
-      1,
-      &owner(),
-      RequestBody::CreateRepository {
-        name: name.clone(),
-        tool: VcsTool::Subversion,
-        format: ObjectFormat::Sha1,
-        default_branch: "trunk".to_owned(),
-        green: None,
-      },
-    )
-  });
-  assert!(!matches!(created, ReplyBody::Refused { .. }), "{created:?}");
+  // Landed on the daemon's store, then recorded, then answered by the request's route (A-767 item 7).
+  let asked = (name, VcsTool::Subversion, ObjectFormat::Sha1, "trunk");
+  crate::test_store::create_on(daemon, partition, &owner(), asked);
 }
 
 /// The token the tests' owner enrolls, the password a stock client answers CRAM-MD5's challenge with.
@@ -633,10 +633,10 @@ fn commit_under_hooks(
   set_svn_hooks(&daemon, OTHER, &name, hooks(&name));
   let root = format!("svn://127.0.0.1:{port}/{name}");
   let mut signed = sign_in(port, &greeting, &root);
-  // A hook's process is started and reaped within the answer: the client waits ten windows for it.
+  // A hook's process is started and reaped within the answer: the client waits a hang's bound for it.
   signed
     .stream
-    .set_read_timeout(Some(Duration::from_nanos(10 * PATIENCE_NS)))
+    .set_read_timeout(Some(Duration::from_nanos(HOOK_PATIENCE_NS)))
     .expect("the client's wait");
   let commit_at = MKDIR_COMMIT
     .windows(COMMIT_START.len())
@@ -672,13 +672,13 @@ fn a_start_commit_hook_that_refuses_refuses_the_commit_in_svnserves_words() {
   assert_eq!(latest, "( success ( ( ) 0: ) ) ( success ( 0 ) ) ");
 }
 
-/// A-645 P3 (main's ruling 1). Do: configure a start-commit hook that records that it ran and accepts, publish no root
-/// mount, and send the recorded commit. Expect: the commit refused at `open-root`, typed, in words naming why (the
-/// daemon's root mount is not yet published, so it has nowhere to show the hook its repository); the hook never run;
-/// the youngest revision still 0. Before A-645 P3 the hook ran with REPOS `/<name>`, a path that holds nothing.
+/// A-645 P3 (main's ruling 1) and (a). Do: configure a start-commit hook that records that it ran and accepts, give the
+/// daemon no store directory (no standing grant to show a hook its repository under), and send the recorded commit.
+/// Expect: the commit refused at `open-root`, typed, in words naming why; the hook never run; the youngest revision
+/// still 0. Before A-645 P3 the hook ran with REPOS `/<name>`, a path that holds nothing.
 #[cfg(unix)]
 #[test]
-fn a_hook_before_the_root_mount_is_published_is_refused_typed() {
+fn a_hook_with_no_standing_grant_to_show_its_repository_is_refused_typed() {
   let dir = crate::git_hooks::tests::ScratchDir::new();
   let at = dir.path.display().to_string();
   let accepting = hook_script(&dir.path, "start-commit", &format!("echo ran > {at}/ran"));
@@ -692,7 +692,7 @@ fn a_hook_before_the_root_mount_is_published_is_refused_typed() {
   });
   assert!(
     committed.contains(&super::UNSUPPORTED_FEATURE.to_string())
-      && committed.contains(super::ROOT_UNPUBLISHED_WORDS),
+      && committed.contains(crate::vcs_store::svn_presenter::UNGRANTED_WORDS),
     "{committed}"
   );
   assert!(!dir.path.join("ran").exists(), "the hook ran");
@@ -829,7 +829,7 @@ fn under_policy(
   let mut signed = sign_in(port, &greeting, &root);
   signed
     .stream
-    .set_read_timeout(Some(Duration::from_nanos(10 * PATIENCE_NS)))
+    .set_read_timeout(Some(Duration::from_nanos(HOOK_PATIENCE_NS)))
     .expect("the client's wait");
   let committed = asked(&mut signed.stream, &new_file_commit(), 5);
   assert!(committed.ends_with(" ) ( ) ) "), "{committed}");
@@ -1176,6 +1176,12 @@ fn an_unlock_runs_pre_unlock_and_post_unlock_as_svnserve_does() {
     ],
   );
   let unlocked = answers.get(1).expect("the unlock's answer");
+  // The whole answer first: post-unlock runs before `done`, so a part-way answer (a read that timed out) is the cause
+  // of whatever the hooks' files lack, and is told as such.
+  assert!(
+    unlocked.contains("( success ( 7:new.txt ) )") && unlocked.ends_with("done ( success ( ) ) "),
+    "the unlock's answer, whole: {unlocked}"
+  );
   let pre_args = recorded_lines(&dir.path, "pre.args");
   assert_eq!(
     (

@@ -153,6 +153,7 @@ enum PutStage {
     crc: crc32fast::Hasher,
     next: usize,
     header: Vec<u8>,
+    level: u32,
   },
 }
 
@@ -215,9 +216,63 @@ impl Putting {
       crc: crc32fast::Hasher::new(),
       next: 0,
       header: written,
+      level,
     })
   }
+
+  /// The bytes its next step is given (A-718, main's ruling of 2026-11-21 07:30: a unit sized from its measured cost
+  /// within the step budget, never a fixed count): a search step or a deflate step the bytes the machine's measured
+  /// rate for that work does in `quantum_ns` ([`Rates`]), one at least and `window` at most (the most a step holds);
+  /// a level's sample its whole window, the bytes a level is chosen on. A search or deflate step a window's work at a
+  /// quantum of a few microseconds ran past it nearly every time: 844,380 of 992,574 turns on git/git (w-git's r52).
+  pub(crate) fn unit_bytes(
+    &self,
+    rates: &crate::store::learn::Rates,
+    quantum_ns: u64,
+    window: usize,
+  ) -> usize {
+    let per_kib = match self.stage {
+      PutStage::Trials => rates.search_ns_per_kib,
+      PutStage::Sample { .. } => return window.max(1),
+      PutStage::Deflate { level, .. } => usize::try_from(level)
+        .ok()
+        .and_then(|level| rates.deflate_ns_per_kib.get(level))
+        .copied()
+        .unwrap_or(0),
+    };
+    let bytes = if per_kib == 0 {
+      window.max(1)
+    } else {
+      let bought = u128::from(quantum_ns)
+        .saturating_mul(u128::from(crate::store::learn::KIB))
+        .checked_div(u128::from(per_kib))
+        .unwrap_or(0);
+      usize::try_from(bought)
+        .unwrap_or(usize::MAX)
+        .clamp(1, window.max(1))
+    };
+    // A deflate step is a whole number of pieces, one at least, so every step begins where a piece does.
+    match self.stage {
+      PutStage::Deflate { .. } => (bytes / DEFLATE_PIECE).max(1).saturating_mul(DEFLATE_PIECE),
+      _ => bytes,
+    }
+  }
+
+  /// Whether its next step samples a level ([`Putting::unit_bytes`]: its window's bytes, the bytes a level is chosen
+  /// on, at most ten steps a kind a repository).
+  pub(crate) fn sampling(&self) -> bool {
+    matches!(self.stage, PutStage::Sample { .. })
+  }
 }
+
+/// Format: the bytes a deflate stream is fed at a time, whoever feeds it and however long their step (zlib's
+/// `MIN_LOOKAHEAD`: the longest match, 258 bytes, the shortest, 3, and one, RFC 1951 §3.2.5 and zlib's `deflate.h`).
+/// zlib-rs's output depends on how its input is cut (measured 2026-11-21: one call 10,367 bytes, a byte at a time
+/// 10,385, 258-byte pieces 10,410), so every stream is cut here, and a step sized by its time (A-718) is a number of
+/// pieces: one input, one output, on every machine. Within 0.6% of one call's ratio at levels 1, 6 and 9 for any piece
+/// from 64 bytes; a piece took 0.28, 0.85 and 1.70 us at those levels on an M4 Max, inside the step budget's 2.2 us.
+/// Format: 258 + 3 + 1, zlib's `MIN_LOOKAHEAD` as above.
+pub(crate) const DEFLATE_PIECE: usize = 262;
 
 /// What a step of an object's encoding gave.
 pub(crate) enum Put {
@@ -447,6 +502,7 @@ impl Encoder {
       ref mut crc,
       ref mut next,
       ref mut header,
+      ..
     } = putting.stage
     else {
       return Ok(Put::More(Vec::new()));
@@ -601,6 +657,28 @@ pub(crate) fn deflate_more(
   data: &[u8],
   last: bool,
 ) -> Result<Vec<u8>, FragmentRefused> {
+  // Fed a piece at a time whatever the call's length, so a stream fed by steps of any size is fed as one call feeds it.
+  let mut out = Vec::with_capacity(data.len().saturating_add(1));
+  let mut pieces = data.chunks(DEFLATE_PIECE).peekable();
+  if pieces.peek().is_none() {
+    out.extend(deflate_piece(compress, &[], last)?);
+  }
+  while let Some(piece) = pieces.next() {
+    out.extend(deflate_piece(
+      compress,
+      piece,
+      last && pieces.peek().is_none(),
+    )?);
+  }
+  Ok(out)
+}
+
+/// One piece of a deflate stream ([`deflate_more`]): `data` fed whole, the stream finished after it where `last`.
+fn deflate_piece(
+  compress: &mut Compress,
+  data: &[u8],
+  last: bool,
+) -> Result<Vec<u8>, FragmentRefused> {
   let flush = if last {
     FlushCompress::Finish
   } else {
@@ -620,5 +698,55 @@ pub(crate) fn deflate_more(
       return Ok(out);
     }
     out.reserve(out.capacity().max(1));
+  }
+}
+
+#[cfg(test)]
+mod w_perf_probe {
+  #[test]
+  fn probe_deflate_feeding() {
+    use flate2::{Compress, Compression};
+    // A text-like corpus: lines of words, as a pushed source file.
+    let mut data = Vec::new();
+    for i in 0..4000u32 {
+      data.extend_from_slice(
+        format!(
+          "line {i}: the quick brown fox {} jumps over {} lazy dogs\n",
+          i % 37,
+          i % 11
+        )
+        .as_bytes(),
+      );
+    }
+    for level in [1u32, 6, 9] {
+      let feed = |piece: usize| {
+        let mut c = Compress::new(Compression::new(level), true);
+        let mut out = Vec::new();
+        let mut at = 0;
+        let start = std::time::Instant::now();
+        let mut pieces = 0u32;
+        while at < data.len() {
+          let to = (at + piece).min(data.len());
+          out.extend(super::deflate_more(&mut c, &data[at..to], to == data.len()).unwrap());
+          at = to;
+          pieces += 1;
+        }
+        (out.len(), start.elapsed().as_nanos() as f64 / pieces as f64)
+      };
+      let whole = feed(data.len());
+      let mut line = format!(
+        "W-PERF-PROBE level {level} input {} whole {}",
+        data.len(),
+        whole.0
+      );
+      for piece in [16usize, 32, 64, 128, 262, 1024, 32768] {
+        let (len, ns) = feed(piece);
+        line.push_str(&format!(
+          " | {piece}: {len} ({:+.2}%) {ns:.0} ns/piece",
+          (len as f64 / whole.0 as f64 - 1.0) * 100.0
+        ));
+      }
+      eprintln!("{line}");
+    }
   }
 }

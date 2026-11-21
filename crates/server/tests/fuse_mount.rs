@@ -699,7 +699,8 @@ fn a_revoked_consumers_open_descriptor_reads_nothing_it_had_not_read() {
 /// back, and a second mount sees the first's work; the table shows `fuse.slates` with the source naming this
 /// attachment (`slates:<attachment>`); the detach and the kernel's unmount each leave no mount and the volume
 /// with no attachment; the file is refused typed with nothing mounted or recorded; the daemon's stop ends the mount
-/// but leaves it in place, refusing writes, until its user unmounts it (A-102); and no barrier was refused.
+/// but leaves it in place, refusing writes, until its user unmounts it (A-102); no barrier was refused; and every mount
+/// helper's exit, mount and unmount alike, was awaited by its exit watch (a pidfd), never a tick at a time.
 #[test]
 fn a_volume_mounted_through_fuse_serves_the_kernel_and_ends_with_its_mount() {
   if !command_available("fusermount3") || !std::path::Path::new("/dev/fuse").exists() {
@@ -737,6 +738,30 @@ fn a_volume_mounted_through_fuse_serves_the_kernel_and_ends_with_its_mount() {
     refusals.get("publish.volume_skipped"),
     None,
     "every publish imaged the volume: {refusals:?}"
+  );
+  // Every mount's helper exit was awaited by its exit watch, never a tick at a time (main's sweep, 2026-11-20).
+  assert!(
+    refusals
+      .get("fuse.helper_exit.watched")
+      .is_some_and(|count| *count >= 1),
+    "the helpers' exits were watched: {refusals:?}"
+  );
+  assert_eq!(
+    refusals.get("fuse.helper_exit.unwatched"),
+    None,
+    "{refusals:?}"
+  );
+  // So was every unmount helper's (the detach's and the refused mount's): awaited by its watch.
+  assert!(
+    refusals
+      .get("fuse.unmount_exit.watched")
+      .is_some_and(|count| *count >= 1),
+    "the unmount helpers' exits were watched: {refusals:?}"
+  );
+  assert_eq!(
+    refusals.get("fuse.unmount_exit.unwatched"),
+    None,
+    "{refusals:?}"
   );
 }
 
@@ -875,4 +900,66 @@ fn a_scoped_fuse_mount_presents_one_directory_and_follows_it() {
   );
   daemon.stop();
   left_dead_until_its_user_unmounts(&point.path, "the daemon's stop");
+}
+
+/// A-774 C1 (a work mounts and works through FUSE). Do: seed a green with `f` = "one\ntwo\nthree\n"; make a work over it
+/// and attach it through FUSE; through the kernel read `f`, save it as an editor does (the whole new content written to
+/// a temporary beside it, renamed over it); detach; submit the work with no declaration. Expect: the mount reads the
+/// green's bytes, the submit is accepted, and the green's head holds the save.
+#[test]
+fn a_work_mounted_through_fuse_saves_and_its_submit_lands_the_save() {
+  if !command_available("fusermount3") || !std::path::Path::new("/dev/fuse").exists() {
+    eprintln!("SKIP: no fusermount3 or /dev/fuse on this host; the FUSE transport needs both");
+    return;
+  }
+  let profile = common::machine_profile();
+  let instance = format!("srv-fuse-work-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: common::fixture_object("slates-seg", "fuse-work"),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let green = client.create_green("fuse-green", false).unwrap();
+  let (seed, _) = client.create_work(green, "fuse-seed").unwrap();
+  client.edit(seed, "f", 0, 0, b"one\ntwo\nthree\n").unwrap();
+  assert!(matches!(
+    client.submit(seed).unwrap(),
+    slates_client::Submitted::Accepted(_)
+  ));
+  let (work, _) = client.create_work(green, "fuse-work").unwrap();
+  let point = target_dir();
+  let attached = client
+    .attach_fuse(work, Intent::Write, &point.path)
+    .unwrap();
+  #[allow(clippy::disallowed_methods)]
+  // through the kernel's FUSE mount, as an editor reads and saves
+  {
+    let file = format!("{}/f", point.path);
+    assert_eq!(std::fs::read(&file).unwrap(), b"one\ntwo\nthree\n");
+    let temp = format!("{}/.f.swp", point.path);
+    std::fs::write(&temp, b"one\nTWO\nthree\n").unwrap();
+    std::fs::rename(&temp, &file).unwrap();
+  }
+  client.detach(attached.attachment).unwrap();
+  let verdict = client.submit(work).unwrap();
+  assert!(
+    matches!(verdict, slates_client::Submitted::Accepted(_)),
+    "{verdict:?}"
+  );
+  assert_eq!(
+    client
+      .read(green, "f", slates_client::ReadAt::Head)
+      .unwrap(),
+    b"one\nTWO\nthree\n"
+  );
+  drop(client);
+  daemon.stop();
 }

@@ -342,7 +342,9 @@ fn handed_over(dump: &[u8], withheld: Option<u64>) -> (Vec<String>, Result<(), M
     let (consumed, record) = match importer.import(&mut repository, rest, true) {
       Ok(Importing::Commit { consumed, record }) => (consumed, *record),
       Ok(Importing::Done) => return (names, Ok(())),
-      Ok(Importing::NeedMore { .. }) => return (names, Err(MigrationRefusal::Corrupt)),
+      Ok(Importing::NeedMore { .. } | Importing::Base { .. }) => {
+        return (names, Err(MigrationRefusal::Corrupt));
+      }
       Err(refusal) => return (names, Err(refusal)),
     };
     rest = &rest[consumed..];

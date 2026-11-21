@@ -11,8 +11,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use proptest::prelude::*;
 
 use super::{
-  Building, Built, EntryKind, HEAD_ATTRIBUTE, ObjectKey, Push, PushObjects, PushRefused, ROOT,
-  Reads, TreeEntry, Unavailable, build, identity,
+  Building, Built, DeferredPush, EntryKind, HEAD_ATTRIBUTE, ObjectKey, Push, PushObjects,
+  PushRefused, ROOT, Reads, TreeEntry, Unavailable, build, identity,
 };
 use crate::engine::{Green, Increment, Outcome};
 use crate::increment::{DeriveError, PostStatePlan, VolumeOp, compose_volume_planned};
@@ -1503,6 +1503,11 @@ fn every_push_is_the_oracles_work_and_leaves_the_client_where_it_is() {
 /// A test clock: each read a nanosecond later.
 static NOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Whether anyone waits: always, in a build in turns.
+fn someone_waits() -> bool {
+  true
+}
+
 /// [`NOW`], read.
 fn now() -> u64 {
   NOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -1522,12 +1527,20 @@ fn built_in_turns(
     turns += 1;
     // The clock is read once a unit after the turn's first: a deadline `units` reads on.
     // Units of a few bytes too, so a unit's copy and hash slices are held to the one-call build.
-    let now = NOW.load(std::sync::atomic::Ordering::Relaxed);
+    let at = NOW.load(std::sync::atomic::Ordering::Relaxed);
     let slices = crate::pace::Slices {
       copy_bytes: 7,
       hash_bytes: 5,
     };
-    building.pace().turn_from(now, (now + units, slices));
+    // Someone always waits, so each turn yields at its quantum of `units` reads.
+    let env = slates_pace::Env {
+      clock: now,
+      waiting: someone_waits,
+      quantum_ns: units,
+      ceiling_ns: units,
+      target_ppm: 1,
+    };
+    building.pace().turn_from(at, (env, slices));
     if let Some(built) = building.advance(green, store) {
       return (built, turns);
     }
@@ -1567,4 +1580,298 @@ fn a_push_over_a_flat_tree_is_built_a_unit_at_a_time_over_many_turns() {
   let (built, turns) = built_in_turns(&push, &green, &store, 0);
   assert_eq!(built.unwrap(), whole);
   assert!(turns > FILES as u64, "{turns} turns for {FILES} files");
+}
+
+/// A green's reads, as [`reads_of`] takes them: its head, its head identity, its files at every version, the paths
+/// each version changed, the history it retains, and its checkpoint at the head.
+type GreenReads = (
+  u64,
+  [u8; 32],
+  Vec<Vec<(String, Vec<u8>)>>,
+  Vec<Vec<String>>,
+  usize,
+  Option<Vec<u8>>,
+);
+
+/// What a green reads as, for P2's oracle: its head, its head identity, its files at every version, the paths each
+/// version changed, the history it retains, and its checkpoint at the head.
+fn reads_of(green: &mut Green) -> GreenReads {
+  let head = green.head();
+  let files = (0..=head)
+    .map(|version| {
+      green
+        .files_at(version)
+        .into_iter()
+        .map(|(path, bytes)| (path, bytes.into_owned()))
+        .collect()
+    })
+    .collect();
+  let changed = (1..=head)
+    .map(|version| green.changed_between(version - 1, version))
+    .collect();
+  let checkpoint = green.checkpoint(head).map(|checkpoint| checkpoint.encode());
+  (
+    head,
+    green.head_identity(),
+    files,
+    changed,
+    green.retained_bytes().history,
+    checkpoint,
+  )
+}
+
+/// P2 (main's ruling of 2026-11-21 05:12; w-git's request, inbox/w-rewrite-ops-from-w-git-p2.md). Do: over generated
+/// histories of pushes, land each push eagerly on one green (built, then submitted) and deferred on its twin
+/// (`Green::defer` of the same push; read while owed; then `Green::materializing` built over turns of a few units and
+/// `Green::materialize`), every few pushes folding both; and replay the twin's pushes from their records into a third
+/// green. Expect:
+/// - while the push is owed, the twin reads as before it (its head and files its base's), is not materialized, and its
+///   checkpoint and fold are nothing;
+/// - once materialized, the twin reads as the eager green: head, identity, every version's files and changed paths,
+///   retained history, checkpoint at the head;
+/// - a fold leaves them equal;
+/// - every record decodes to its push, and the replayed green, deferred from records and materialized, reads the same.
+#[test]
+fn a_green_that_owes_a_push_materializes_to_the_eager_create() {
+  let mut runner = proptest::test_runner::TestRunner::new(slates_test_seeds::unseeded(
+    proptest::test_runner::Config::default(),
+  ));
+  let histories = proptest::collection::vec(
+    proptest::collection::vec(proptest::option::of((1u8..9, any::<bool>())), SLOTS.len()),
+    1..6,
+  );
+  runner
+    .run(&histories, |steps| {
+      owed_history(&steps);
+      Ok(())
+    })
+    .unwrap();
+}
+
+/// `push`'s record round-trips; `owing` defers it at `version`, reads its base meanwhile (no checkpoint, no fold), and
+/// materializes it, built in turns. The record.
+fn owing_took_the_record(
+  owing: &mut Green,
+  (push, version): (&Push<'_>, u64),
+  store: &Store,
+) -> Vec<u8> {
+  let record = DeferredPush::of(push, u64::MAX).encode();
+  let owed = DeferredPush::decode(&record).expect("the record decodes");
+  assert_eq!(
+    owed,
+    DeferredPush::of(push, u64::MAX),
+    "the record round-trips"
+  );
+  let before = reads_of(owing);
+  assert_eq!(owing.defer(owed.clone()), Some(version));
+  assert!(!owing.is_materialized());
+  assert!(
+    owing.checkpoint(owing.head()).is_none(),
+    "an owing green's checkpoint is nothing"
+  );
+  assert_eq!(
+    owing.fold_history_before(owing.head()),
+    0,
+    "an owing green's fold is nothing"
+  );
+  assert_eq!(owing.head(), before.0, "the owing green reads its base");
+  assert_eq!(
+    owing.files_at(before.0).len(),
+    before.2.last().unwrap().len()
+  );
+  let (made, _) = built_in_turns(&owing.deferred().unwrap().push(), owing, store, 3);
+  assert_eq!(owing.materialize(&made.unwrap().increment), Ok(version));
+  assert!(owing.is_materialized());
+  record
+}
+
+/// `replayed` defers the push its `record` holds at `version` and materializes it as a replay does, a pace's advances
+/// to the end; a second materialization owes nothing.
+fn replayed_from_record(replayed: &mut Green, record: &[u8], version: u64, store: &Store) {
+  assert_eq!(
+    replayed.defer(DeferredPush::decode(record).unwrap()),
+    Some(version)
+  );
+  let mut building = replayed
+    .materializing(crate::pace::Pace::unbounded())
+    .unwrap();
+  let made = loop {
+    if let Some(made) = building.advance(replayed, store) {
+      break made.unwrap();
+    }
+  };
+  assert_eq!(replayed.materialize(&made.increment), Ok(version));
+  assert_eq!(
+    replayed.materialize(&made.increment),
+    Err(crate::engine::Unmaterialized::NothingOwed)
+  );
+}
+
+/// One history of [`a_green_that_owes_a_push_materializes_to_the_eager_create`].
+fn owed_history(steps: &[Vec<Option<(u8, bool)>>]) {
+  let mut store = Store::default();
+  let (mut eager, mut owing, mut replayed) = (Green::new(), Green::new(), Green::new());
+  let mut landed = Files::new();
+  let mut landed_tree = None;
+  for (n, step) in steps.iter().enumerate() {
+    let files = apply(&landed, step);
+    let tree = put(&mut store, &files);
+    let head = head(n as u64 + 1);
+    let push = push(eager.head(), landed_tree, tree, &head);
+    let Ok(built) = build(&push, &eager, &store, u64::MAX) else {
+      // A push the build refuses (a kind change) is refused alike, owed or not: neither green takes it.
+      continue;
+    };
+    let version = eager.head() + 1;
+    assert_eq!(
+      eager.submit(&built.increment),
+      Outcome::Accepted { version }
+    );
+
+    let record = owing_took_the_record(&mut owing, (&push, version), &store);
+    replayed_from_record(&mut replayed, &record, version, &store);
+
+    if n % 3 == 2 {
+      let floor = eager.head();
+      eager.fold_history_before(floor);
+      owing.fold_history_before(floor);
+      replayed.fold_history_before(floor);
+    }
+    let expected = reads_of(&mut eager);
+    assert_eq!(
+      reads_of(&mut owing),
+      expected,
+      "materialized as the eager green at version {version}"
+    );
+    assert_eq!(
+      reads_of(&mut replayed),
+      expected,
+      "replayed from records at version {version}"
+    );
+    landed = files;
+    landed_tree = Some(tree);
+  }
+}
+
+/// P2's record (`DeferredPush::encode`). Do: decode a record cut at every length, with any byte flipped, with a byte
+/// past its end, and with another record kind's magic. Expect: every one refused (`None`), never a panic, and the whole
+/// record decoded to its push; `is_record` true for it and false for a chain entry's magic.
+#[test]
+fn a_deferred_push_record_refuses_every_damaged_form() {
+  let mut store = Store::default();
+  let tree = put(&mut store, &files_of(&[("a", file(b"x"))]));
+  let head = head(1);
+  let owed = DeferredPush::of(&push(0, None, tree, &head), 4096);
+  let record = owed.encode();
+  assert_eq!(DeferredPush::decode(&record), Some(owed));
+  assert!(DeferredPush::is_record(&record));
+  assert!(!DeferredPush::is_record(b"GCHN\x05\0\0\0"));
+  for cut in 0..record.len() {
+    assert_eq!(DeferredPush::decode(&record[..cut]), None, "cut at {cut}");
+  }
+  for at in 0..record.len() {
+    let mut flipped = record.clone();
+    flipped[at] ^= 0x40;
+    assert_eq!(DeferredPush::decode(&flipped), None, "flipped at {at}");
+  }
+  let mut longer = record.clone();
+  longer.push(0);
+  assert_eq!(DeferredPush::decode(&longer), None, "a byte past the end");
+}
+
+/// P2's replay tail. Do: land two pushes eagerly on one green; on its twin, defer the first from its record and apply
+/// the second's chain entry while the first is still owed (a chain that went on after a materialization, replayed after
+/// a restart), then materialize. Expect: the entry answers its version while owed, the twin owes until materialized, and
+/// once materialized it reads as the eager green.
+#[test]
+fn a_version_recorded_after_an_owed_push_is_applied_once_it_is_materialized() {
+  let mut store = Store::default();
+  let mut eager = Green::new();
+  let first = files_of(&[("a", file(b"one\n")), ("b/c", file(b"two\n"))]);
+  let (head1, head2) = (head(1), head(2));
+  let tree1 = put(&mut store, &first);
+  let push1 = push(0, None, tree1, &head1);
+  let built1 = build(&push1, &eager, &store, u64::MAX).unwrap();
+  assert_eq!(
+    eager.submit(&built1.increment),
+    Outcome::Accepted { version: 1 }
+  );
+  let second = files_of(&[
+    ("a", file(b"one, changed\n")),
+    ("b/c", file(b"two\n")),
+    ("d", file(b"new\n")),
+  ]);
+  let tree2 = put(&mut store, &second);
+  let push2 = push(1, Some(tree1), tree2, &head2);
+  let built2 = build(&push2, &eager, &store, u64::MAX).unwrap();
+  let (outcome, applied) = eager.submit_resolved(&built2.increment);
+  assert_eq!(outcome, Outcome::Accepted { version: 2 });
+  let mut twin = Green::new();
+  assert_eq!(
+    twin.defer(DeferredPush::decode(&DeferredPush::of(&push1, u64::MAX).encode()).unwrap()),
+    Some(1)
+  );
+  assert_eq!(
+    twin.apply_recorded(&built2.increment, &applied.unwrap()),
+    2,
+    "the later version answered while owed"
+  );
+  assert!(!twin.is_materialized());
+  assert_eq!(twin.head(), 0, "nothing applied while owed");
+  let made = build(&twin.deferred().unwrap().push(), &twin, &store, u64::MAX).unwrap();
+  assert_eq!(
+    twin.materialize(&made.increment),
+    Ok(2),
+    "the owed version, then the later one"
+  );
+  assert_eq!(reads_of(&mut twin), reads_of(&mut eager));
+}
+
+/// P2's tail signatures (main's order of 05:51: a lost signature is a lost audit fact). Do: on a green that owes its
+/// first push, apply the second push's chain entry into the tail as a replay does, record that version's signature
+/// verdict as the replay records it, then materialize. Expect: the verdict is taken while owed (its version is one the
+/// green stands for) and answered for that version once made, as the eager green answers it.
+#[test]
+fn a_signature_recorded_on_a_version_in_the_owed_tail_is_kept() {
+  let mut store = Store::default();
+  let mut eager = Green::new();
+  let (head1, head2) = (head(1), head(2));
+  let tree1 = put(&mut store, &files_of(&[("a", file(b"one\n"))]));
+  let push1 = push(0, None, tree1, &head1);
+  let built1 = build(&push1, &eager, &store, u64::MAX).unwrap();
+  assert_eq!(
+    eager.submit(&built1.increment),
+    Outcome::Accepted { version: 1 }
+  );
+  let tree2 = put(&mut store, &files_of(&[("a", file(b"two\n"))]));
+  let built2 = build(
+    &push(1, Some(tree1), tree2, &head2),
+    &eager,
+    &store,
+    u64::MAX,
+  )
+  .unwrap();
+  let (outcome, applied) = eager.submit_resolved(&built2.increment);
+  assert_eq!(outcome, Outcome::Accepted { version: 2 });
+  let verdict = crate::chain_entry::Signature {
+    kind: 1,
+    detail: 0,
+    fingerprint: [7; 32],
+  };
+  assert!(eager.record_signature(2, verdict));
+  let mut twin = Green::new();
+  assert_eq!(twin.defer(DeferredPush::of(&push1, u64::MAX)), Some(1));
+  assert_eq!(twin.apply_recorded(&built2.increment, &applied.unwrap()), 2);
+  assert!(
+    twin.record_signature(2, verdict),
+    "the verdict of a version the owing green stands for is taken"
+  );
+  let made = build(&twin.deferred().unwrap().push(), &twin, &store, u64::MAX).unwrap();
+  assert_eq!(twin.materialize(&made.increment), Ok(2));
+  assert_eq!(
+    twin.signature(2),
+    eager.signature(2),
+    "kept through the materialization"
+  );
+  assert_eq!(twin.signature(2), Some(verdict));
 }

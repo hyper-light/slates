@@ -11,9 +11,9 @@
 //!
 //! **Under load (A-786).** With `PROVISION_BENCH_LOAD=<n>` the 1-client forms run again, after the quiet ones, beside
 //! `n` busy processes per logical CPU, as `loaded<n>_` rows, and the spinning p99 is held to a bound derived from the
-//! quiet run and the load ([`loaded_bound_ns`]); the bench exits non-zero past it, as past the floor. Every 1-client
-//! run prints where its slowest creates' time went, split by A-559's stamps into the daemon's part (from the request's
-//! landing in its ring to the reply's) and the client's.
+//! quiet run and the load: no slower than parking under the load, nor than quiet ([`loaded_bound_ns`]). The bench exits
+//! non-zero past it, as past the floor. Every 1-client run prints where its slowest creates' time went, split by
+//! A-559's stamps into the daemon's part (from the request's landing in its ring to the reply's) and the client's.
 //!
 //! The CPU the process spends is reported beside the latencies, in thousandths of one core: each form's runs, and the
 //! daemon at rest with no client. The paced form is the case the idle window prices: one client every
@@ -74,6 +74,7 @@ const LOAD_VARIABLE: &str = "PROVISION_BENCH_LOAD";
 const SPIN_ARGUMENT: &str = "--spin";
 
 /// Shape: the busy loop's iterations between its looks at whether the bench that started it is still there.
+#[cfg(unix)]
 const SPIN_LOOK_EVERY: u64 = 1 << 22;
 
 /// A spinner of the load: a busy loop until the bench that started it ends (Unix: its parent changes) or kills it.
@@ -448,13 +449,15 @@ fn p99_median(rows: &[(&'static str, Vec<u64>)]) -> u64 {
   sorted[sorted.len() / 2]
 }
 
-/// The loaded bound on the 1-client spinning p99 (R9 under load; A-786), from the quiet run and the load: what the load
-/// adds to the spinning form's tail may be at most what it adds to the parked form's, whose every create pays its
-/// threads' wakes under that load. Spinning exists so a create never waits for a park, so under the same load it never
-/// does worse than parking. `quiet` and `loaded` are each form's `(spinning, parked)` p99, nanoseconds.
-fn loaded_bound_ns(quiet: (u64, u64), loaded_parked: u64) -> u64 {
-  let (spinning, parked) = quiet;
-  spinning.saturating_add(loaded_parked.saturating_sub(parked))
+/// The loaded bound on the 1-client spinning p99 (R9 under load; A-786), from the quiet run and the load: under the
+/// load, the spinning form may be no slower than the parked form under that same load, whose every create pays its
+/// threads' wakes, nor than its own quiet p99. Spinning exists so a create never waits for a park, so it never does
+/// worse than parking. Both sides are read in one loaded window: until 2026-11-20 the bound added the load's addition
+/// to the parked p99 (loaded minus quiet), and on a host busy of its own the "quiet" parked p99 (1.0-2.3 ms) passed
+/// the loaded one, the addition fell to 0 and the bound to the quiet spinning p99, failing every arm alike.
+/// `quiet_spinning` and `loaded_parked` are p99s, nanoseconds.
+fn loaded_bound_ns(quiet_spinning: u64, loaded_parked: u64) -> u64 {
+  quiet_spinning.max(loaded_parked)
 }
 
 /// The 1-client forms again beside `load_per_cpu` spinners per logical CPU, started after the quiet forms so those are
@@ -486,10 +489,10 @@ fn loaded_forms(daemon: &Daemon, instance: &str, load_per_cpu: usize, quiet: (u6
   print_rows_gated(&key, &parked, true);
   drop(load);
   let (spinning, parked) = (p99_median(&spinning), p99_median(&parked));
-  let bound = loaded_bound_ns(quiet, parked);
+  let bound = loaded_bound_ns(quiet.0, parked);
   let ok = spinning <= bound;
   println!(
-    "ac-2.1: 1 client spinning beside {load_per_cpu} spinners a logical CPU, provisioning p99 {spinning} ns vs the loaded bound {bound} ns (quiet spinning p99 {} ns + the load's addition to the parked p99, {parked} - {} ns): {}",
+    "ac-2.1: 1 client spinning beside {load_per_cpu} spinners a logical CPU, provisioning p99 {spinning} ns vs the loaded bound {bound} ns (the larger of the quiet spinning p99 {} ns and the parked p99 under the load {parked} ns; quiet parked {} ns): {}",
     quiet.0,
     quiet.1,
     if ok { "ok" } else { "FAIL" }

@@ -80,21 +80,45 @@ fn identity() -> (EdgeIdentity, CertificateDer<'static>) {
 }
 
 /// A daemon of [`SHARDS`] shards whose configuration asks for an edge on loopback presenting `identity`.
-fn daemon(identity: EdgeIdentity) -> Daemon {
+fn daemon(identity: EdgeIdentity) -> crate::test_store::StoredDaemon {
   daemon_named(Some(identity)).0
 }
 
 /// A daemon of [`SHARDS`] shards whose configuration asks for an edge on loopback presenting `identity`, or serving
 /// cleartext without one, and its instance's name, which its edge's realm names (`slates <instance>`).
-fn daemon_named(identity: Option<EdgeIdentity>) -> (Daemon, String) {
+fn daemon_named(identity: Option<EdgeIdentity>) -> (crate::test_store::StoredDaemon, String) {
   daemon_configured(identity, |_| {})
 }
 
-/// [`daemon_named`], its configuration changed by `configure` before it starts.
+/// [`daemon_named`], its configuration changed by `configure` before it starts. Every daemon here holds a changeset
+/// store (`crate::test_store`): a repository's history lands there, and a daemon without one makes no repository of any
+/// tool (C1, C2, C5).
 fn daemon_configured(
   identity: Option<EdgeIdentity>,
   configure: impl FnOnce(&mut crate::DaemonConfig),
-) -> (Daemon, String) {
+) -> (crate::test_store::StoredDaemon, String) {
+  let (profile, config, instance) = edge_config(identity, configure);
+  let daemon = crate::test_store::StoredDaemon::start(
+    "vcs-http",
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: instance.clone(),
+    },
+  )
+  .expect("the daemon starts");
+  daemon
+    .bootstrap(true)
+    .expect("the daemon creates its initial group");
+  (daemon, instance)
+}
+
+/// The profile, configuration and instance name of a daemon of [`SHARDS`] shards serving the edge on loopback presenting
+/// `identity`, or cleartext without one, its configuration changed by `configure`.
+fn edge_config(
+  identity: Option<EdgeIdentity>,
+  configure: impl FnOnce(&mut crate::DaemonConfig),
+) -> (slates_machine::MachineProfile, crate::DaemonConfig, String) {
   static NEXT: AtomicU32 = AtomicU32::new(0);
   let profile = crate::daemon::test_profile();
   let instance = format!(
@@ -108,18 +132,7 @@ fn daemon_configured(
     identity,
   });
   configure(&mut config);
-  let daemon = Daemon::start(
-    &profile,
-    config,
-    SegmentSource::Create {
-      name: instance.clone(),
-    },
-  )
-  .expect("the daemon starts");
-  daemon
-    .bootstrap(true)
-    .expect("the daemon creates its initial group");
-  (daemon, instance)
+  (profile, config, instance)
 }
 
 /// A git repository's name that routes to [`REPOSITORY`]'s partition, not the listener's.
@@ -134,9 +147,8 @@ fn name_on_the_repositorys_partition() -> String {
 fn create(daemon: &Daemon, name: &str) {
   let name = name.to_owned();
   let created = crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
-    crate::verbs::dispatch(
+    crate::test_store::create(
       state,
-      1,
       &owner(),
       RequestBody::CreateRepository {
         name: name.clone(),
@@ -908,6 +920,50 @@ fn a_long_pushs_answer_is_kept_alive_with_gits_keepalive_until_its_report() {
   );
 }
 
+/// A-722's keepalive on the fetch (main's goal-93 piece, 2026-11-21: a fetch's answer wrote nothing from its
+/// `packfile` section's head until its pack's first packet while the pack's objects were chosen over many turns; git's
+/// upload-pack writes `0005\1` while `pack-objects` is silent, git 2.50.1's `create_pack_file`). Do: start a daemon
+/// whose keepalive interval is none; push a history of [`KEPT_ALIVE_HISTORY`] commits; fetch its last commit at
+/// protocol v2 with `done`, as `git clone` asks. Expect: `200`; the `packfile` section's first packet git's keepalive
+/// (an empty band-1 packet), and the section's pack whole after the keepalives, every object pushed.
+/// Shape: how much of each of a fetch's first packets [`a_long_fetchs_answer_is_kept_alive_with_gits_keepalive_while_its_pack_is_chosen`]
+/// compares and shows: past a section's name and a keepalive, short of a pack's whole packet.
+const OPENING_SHOWN: usize = 16;
+
+#[test]
+fn a_long_fetchs_answer_is_kept_alive_with_gits_keepalive_while_its_pack_is_chosen() {
+  let (identity, certificate) = identity();
+  let (daemon, _) = daemon_configured(Some(identity), |config| config.git_keepalive_ns = 0);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, last) = long_history(KEPT_ALIVE_HISTORY);
+  let created = pushed(edge, &name, &request);
+  let fetched = uploaded(edge, &name, &fetch_of(last));
+  daemon.stop();
+  assert_eq!(created.0, 200, "{}", String::from_utf8_lossy(&created.1));
+  assert_eq!(fetched.0, 200);
+  let (lines, _) = packets_from(&fetched.1, 0);
+  let opening: Vec<&[u8]> = lines
+    .iter()
+    .take(2)
+    .map(|line| {
+      line
+        .get(..line.len().min(OPENING_SHOWN))
+        .unwrap_or_default()
+    })
+    .collect();
+  assert_eq!(opening, [b"packfile\n".as_slice(), [1].as_slice()]);
+  let (_, commands_end) = packets_from(&request, 0);
+  let pushed_pack = request.get(commands_end..).expect("the push's pack");
+  assert_eq!(
+    ids_in(&fetched_pack(&fetched.1)).len(),
+    ids_in(pushed_pack).len()
+  );
+}
+
 /// A-713 (found by use, 2026-11-20: with git/git cut at v1.0.0, 2,930 commits in a 3.4 MB pack, the push landed and every
 /// clone, over HTTP and SSH, was refused `upload-pack: the request needs more room than the server admits`). Do: start a
 /// two-shard daemon whose edge serves loopback TLS, each request admitted one ring region; push a line of
@@ -1084,9 +1140,8 @@ fn hg_name_on_the_repositorys_partition() -> String {
 fn create_hg_from_states(daemon: &Daemon, name: &str) {
   let name = name.to_owned();
   crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
-    let created = crate::verbs::dispatch(
+    let created = crate::test_store::create(
       state,
-      1,
       &owner(),
       RequestBody::CreateRepository {
         name: name.clone(),
@@ -1120,7 +1175,10 @@ fn create_hg_from_states(daemon: &Daemon, name: &str) {
       "the import did not end: {ended:?}"
     );
     // A done import waits to land (A-687); landed, its index is the store's and the store is lent again.
-    assert_eq!(crate::vcs_store::hg_import::land(state, id), Ok(()));
+    assert_eq!(
+      crate::vcs_store::hg_import::land_imported(state, id),
+      Ok(())
+    );
   });
 }
 
@@ -1222,9 +1280,8 @@ const HG_PUSH_FIELDS: &str = "Accept-Encoding: identity\r\nContent-Type: applica
 fn create_empty_hg(daemon: &Daemon, name: &str) {
   let name = name.to_owned();
   let created = crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
-    crate::verbs::dispatch(
+    crate::test_store::create(
       state,
-      1,
       &owner(),
       RequestBody::CreateRepository {
         name: name.clone(),
@@ -1770,7 +1827,7 @@ fn stock_hg_reads_a_repositorys_capabilities_on_a_daemons_loopback_edge_by_basic
     );
     return;
   };
-  let (daemon, _) = daemon_named(None);
+  let daemon = daemon_named(None).0;
   let port = daemon.vcs_http_port().expect("the edge started");
   let name = hg_name_on_the_repositorys_partition();
   create_hg_from_states(&daemon, &name);
@@ -1806,21 +1863,11 @@ fn create_svn_hooked(
   daemon
     .record_root_mount(std::path::Path::new(crate::vcs_svn::tests::TEST_ROOT))
     .expect("the root mount recorded");
+  let asked = (name, VcsTool::Subversion, ObjectFormat::Revisions, "trunk");
+  crate::test_store::create_on(daemon, REPOSITORY, &owner(), asked);
   let name = name.to_owned();
-  let replies = crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
-    let created = crate::verbs::dispatch(
-      state,
-      1,
-      &owner(),
-      RequestBody::CreateRepository {
-        name: name.clone(),
-        tool: VcsTool::Subversion,
-        format: ObjectFormat::Revisions,
-        default_branch: "trunk".to_owned(),
-        green: None,
-      },
-    );
-    let set = crate::verbs::dispatch(
+  let set = crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
+    crate::verbs::dispatch(
       state,
       2,
       &owner(),
@@ -1839,14 +1886,9 @@ fn create_svn_hooked(
         hooks_env: Vec::new(),
         signers: Vec::new(),
       },
-    );
-    (created, set)
+    )
   });
-  assert!(
-    !matches!(replies.0, ReplyBody::Refused { .. }),
-    "{replies:?}"
-  );
-  assert_eq!(replies.1, ReplyBody::Acknowledged);
+  assert_eq!(set, ReplyBody::Acknowledged);
 }
 
 /// The name Subversion gives a hook at `point`.
@@ -2284,5 +2326,236 @@ fn a_shallow_clone_of_a_merge_heavy_history_is_deepened_over_the_daemons_edge() 
   assert!(
     String::from_utf8_lossy(&deepened.1).contains("packfile"),
     "{answer}"
+  );
+}
+
+/// A-766 part 2 (DeltaV v1, ra_serf 1.14's `open_root` without HTTPv2; `mod_dav_svn` 1.14.x `activity.c`, `version.c`,
+/// `mod_dav.c`). Do: on a daemon's HTTP edge, commit a file as a client without HTTPv2 does: MKACTIVITY of an activity;
+/// CHECKOUT of the VCC into it (`apply-to-version`); PROPPATCH of the working baseline the CHECKOUT named, setting
+/// `svn:log`; CHECKOUT of the root's version resource; PUT of `f.txt` under the working root that CHECKOUT named; MERGE
+/// of the activity; DELETE of the activity. Expect: `201` "Activity ... has been created."; `201` naming
+/// `!svn/wbl/ID/0`; `207`; `201` naming `!svn/wrk/ID/`; `201`; `200` naming revision 1; `204`; and revision 1 carrying
+/// the log message and the file. Before, the site refused every one of them.
+#[cfg(unix)]
+#[test]
+fn a_deltav_v1_commit_lands_as_mod_dav_svn_lands_it() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge serves");
+  let edge = (port, &certificate);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let name = svn_name_on_the_repositorys_partition();
+  create_svn_hooked(&daemon, &name, Vec::new());
+  let activity = "4c1d2b8a-0f6e-4b52-9c7a-3d2e1f0a9b8c";
+  let made = dav(
+    edge,
+    ("MKACTIVITY", &format!("/{name}/!svn/act/{activity}")),
+    &[],
+    b"",
+  );
+  let checkout_body = format!(
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?><D:checkout xmlns:D=\"DAV:\"><D:activity-set><D:href>/{name}/!svn/act/\
+     {activity}</D:href></D:activity-set><D:apply-to-version/></D:checkout>"
+  );
+  let xml = ["Content-Type: text/xml"];
+  let baseline = dav(
+    edge,
+    ("CHECKOUT", &format!("/{name}/!svn/vcc/default")),
+    &xml,
+    checkout_body.as_bytes(),
+  );
+  let working_baseline = field(&baseline.1, "Location").unwrap_or_default();
+  let logged = dav(
+    edge,
+    ("PROPPATCH", &working_baseline),
+    &xml,
+    b"<?xml version=\"1.0\" encoding=\"utf-8\"?><D:propertyupdate xmlns:D=\"DAV:\" \
+      xmlns:S=\"http://subversion.tigris.org/xmlns/svn/\"><D:set><D:prop><S:log>a v1 commit</S:log></D:prop>\
+      </D:set></D:propertyupdate>",
+  );
+  let root = dav(
+    edge,
+    ("CHECKOUT", &format!("/{name}/!svn/ver/0/")),
+    &xml,
+    checkout_body.as_bytes(),
+  );
+  let working_root = field(&root.1, "Location").unwrap_or_default();
+  let put = dav(
+    edge,
+    ("PUT", &format!("{}f.txt", working_root)),
+    &["Content-Type: application/vnd.svn-svndiff"],
+    &fulltext_delta(b"hello\n"),
+  );
+  let merge = format!(
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?><D:merge xmlns:D=\"DAV:\"><D:source><D:href>/{name}/!svn/act/\
+     {activity}</D:href></D:source><D:no-auto-merge/><D:no-checkout/><D:prop><D:checked-in/><D:version-name/>\
+     </D:prop></D:merge>"
+  );
+  let merged = dav(edge, ("MERGE", &format!("/{name}")), &xml, merge.as_bytes());
+  let deleted = dav(
+    edge,
+    ("DELETE", &format!("/{name}/!svn/act/{activity}")),
+    &[],
+    b"",
+  );
+  let landed_name = name.clone();
+  let landed = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    let id = state
+      .db
+      .partition()
+      .repositories()
+      .repository_named(&landed_name)?
+      .id;
+    let records = state.vcs_stores.subversion_records(id)?;
+    let log = records
+      .revision_properties(1)?
+      .iter()
+      .find(|(name, _)| name.as_slice() == b"svn:log")
+      .map(|(_, value)| String::from_utf8_lossy(value).into_owned());
+    let file = records.index().node("/f.txt", 1).ok().flatten().is_some();
+    Some((records.youngest(), log, file))
+  });
+  daemon.stop();
+  assert_eq!(
+    (
+      (made.0, made.2.contains("has been created.")),
+      (
+        baseline.0,
+        working_baseline.ends_with(&format!("/!svn/wbl/{activity}/0"))
+      ),
+      logged.0,
+      (
+        root.0,
+        working_root.ends_with(&format!("/!svn/wrk/{activity}/"))
+      ),
+      put.0,
+      (
+        merged.0,
+        merged.2.contains("<D:version-name>1</D:version-name>")
+      ),
+      deleted.0,
+      landed,
+    ),
+    (
+      (201, true),
+      (201, true),
+      207,
+      (201, true),
+      201,
+      (200, true),
+      204,
+      Some((1, Some(String::from("a v1 commit")), true)),
+    ),
+    "MKACTIVITY {made:?}\nCHECKOUT {baseline:?}\nPROPPATCH {logged:?}\nCHECKOUT {root:?}\nPUT {put:?}\nMERGE {merged:?}"
+  );
+}
+
+/// Stock `svn` run with `arguments` in `directory`, as alice with the owner's token over Basic, its configuration in
+/// `config`: whether it succeeded, and what it printed.
+#[cfg(unix)]
+fn stock_svn(
+  config: &std::path::Path,
+  directory: &std::path::Path,
+  arguments: &[&str],
+) -> (bool, String) {
+  let config_dir = config.to_string_lossy().into_owned();
+  let output = std::process::Command::new("svn")
+    .current_dir(directory)
+    .args([
+      "--non-interactive",
+      "--no-auth-cache",
+      "--config-dir",
+      &config_dir,
+      "--config-option",
+      "servers:global:http-timeout=60",
+      "--username",
+      "alice",
+      "--password",
+      OWNER_TOKEN,
+    ])
+    .args(arguments)
+    .stdin(std::process::Stdio::null())
+    .output()
+    .expect("stock svn runs");
+  (
+    output.status.success(),
+    format!(
+      "{}{}",
+      String::from_utf8_lossy(&output.stdout),
+      String::from_utf8_lossy(&output.stderr)
+    ),
+  )
+}
+
+/// A-766 part 4 (DeltaV v1 by use): stock svn 1.7 and later speak v1 to a server whose OPTIONS has no HTTPv2 headers
+/// (ra_serf `options.c`: HTTPv2 only where `SVN-Me-Resource` is sent), as to `mod_dav_svn` with
+/// `SVNAdvertiseV2Protocol Off`. Do: start a daemon whose edge serves loopback cleartext; create a Subversion
+/// repository named with [`crate::vcs_http::svn::V1_ONLY_PREFIX`], whose OPTIONS withholds those headers in tests; run stock svn's
+/// `mkdir` of `/trunk`, `checkout` of it, `add` and `commit` of a file, and `log`. Expect: each succeeds, the log lists
+/// both commits' messages, and the edge made at least two DeltaV v1 activities (MKACTIVITY): the commits went over v1,
+/// not HTTPv2. Skips loudly without stock svn.
+#[cfg(unix)]
+#[test]
+fn stock_svn_commits_over_deltav_v1_on_a_daemons_loopback_edge() {
+  let present = std::process::Command::new("svn")
+    .args(["--version", "--quiet"])
+    .output()
+    .is_ok_and(|output| output.status.success());
+  if !present {
+    eprintln!(
+      "SKIPPED stock_svn_commits_over_deltav_v1_on_a_daemons_loopback_edge: no `svn` on this host"
+    );
+    return;
+  }
+  let daemon = daemon_named(None).0;
+  let port = daemon.vcs_http_port().expect("the edge started");
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let name = (0u32..)
+    .map(|serial| format!("{}{serial}", crate::vcs_http::svn::V1_ONLY_PREFIX))
+    .find(|name| usize::from(crate::verbs::owner_of_name(name, usize::from(SHARDS))) == REPOSITORY)
+    .expect("a name routes there");
+  create_svn_hooked(&daemon, &name, Vec::new());
+  let scratch = crate::git_hooks::tests::ScratchDir::new();
+  let config = scratch.path.join("config");
+  let url = format!("http://127.0.0.1:{port}/{name}");
+  let at = scratch.path.clone();
+  let mkdir = stock_svn(
+    &config,
+    &at,
+    &["mkdir", "-m", "the trunk over v1", &format!("{url}/trunk")],
+  );
+  let checkout = stock_svn(&config, &at, &["checkout", &format!("{url}/trunk"), "wc"]);
+  let wc = scratch.path.join("wc");
+  #[allow(clippy::disallowed_methods)]
+  // test code: a file in its own working copy, in its scratch directory
+  let written = std::fs::write(wc.join("a.txt"), b"hello over v1\n").is_ok();
+  let add = stock_svn(&config, &wc, &["add", "a.txt"]);
+  let commit = stock_svn(&config, &wc, &["commit", "-m", "a file over v1"]);
+  let log = stock_svn(&config, &at, &["log", &url]);
+  let activities = crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
+    state
+      .refusals
+      .get(crate::vcs_http::svn::V1_ACTIVITIES)
+      .copied()
+      .unwrap_or(0)
+  });
+  daemon.stop();
+  for (step, (ran, output)) in [
+    ("mkdir", &mkdir),
+    ("checkout", &checkout),
+    ("add", &add),
+    ("commit", &commit),
+    ("log", &log),
+  ] {
+    eprintln!("svn {step} (success {ran}):\n{output}");
+  }
+  assert_eq!(
+    (
+      (mkdir.0, checkout.0, written, add.0, commit.0, log.0),
+      log.1.contains("the trunk over v1") && log.1.contains("a file over v1"),
+      activities >= 2,
+    ),
+    ((true, true, true, true, true, true), true, true),
+    "the edge made {activities} v1 activities"
   );
 }

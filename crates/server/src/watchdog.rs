@@ -1813,7 +1813,7 @@ mod tests {
   #[test]
   fn a_shards_status_names_the_window_its_watchdog_judges_it_by() {
     let (signal, overrun_ns) = crate::daemon::audit_on_shard(|state| {
-      let signal = crate::verbs::shard_report(state)
+      let signal = crate::verbs::shard_report(state, false)
         .signals
         .into_iter()
         .find(|signal| signal.name == slates_ipc::protocol::HealthSignal::WatchWindowNs.name());

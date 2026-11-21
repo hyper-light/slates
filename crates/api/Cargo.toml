@@ -32,6 +32,10 @@ slates-machine = { workspace = true, features = ["codecs"] }
 # The proofs a grant, an enrollment, a revocation and a consensus recovery carry, the anchor's liveness budget the
 # client's deadlines derive from, and the daemon the daemon role runs (§2.6).
 slates-server = { workspace = true }
+# The version-control store the daemon role opens under the operator's `--vcs-store` grant (A-767): its directory's
+# root and grant (`slates-land`), its owner thread (`slates-store`).
+slates-land = { workspace = true }
+slates-store = { workspace = true }
 # The recovery budget the client's reconnect deadline and the anchor's restart policy derive from.
 slates-db = { workspace = true }
 # The anchor role's held NFS listener and fleet sockets, and its judgment of a starting daemon's runnable state.
@@ -40,9 +44,6 @@ slates-rt = { workspace = true }
 slates-vfs = { workspace = true }
 # The fleet manifest the roles read (`role::fleet`).
 serde_json = { workspace = true }
-# An S3 base as the library names it (A-524): the naming, its addressing and its credential's type. The server links it
-# already.
-slates-base = { workspace = true }
 # The merge engine's conflict classes, which a merge window names by discriminant on the wire (§4.16, D-27): the
 # contract reads them against the engine's own enum (A-299). The server links it already.
 slates-merge = { workspace = true }

@@ -483,4 +483,96 @@ mod tests {
     drop(driver);
     drop(registration);
   }
+
+  /// 84a (goal 01a1af51): a timed wait ends at its own deadline, never at the next whole millisecond. Do: through the
+  /// real driver with nothing to deliver, wait [`SUB_MILLISECOND_WAIT_NS`] many times and keep the shortest. Expect: the
+  /// shortest under one millisecond. epoll's `epoll_wait` takes whole milliseconds and rustix rounds a shorter timeout
+  /// up, so every such wait lasted a full millisecond: a shard parked to the end of its idle window slept to the next
+  /// millisecond with a client's request waiting (the 1.00-1.02 ms band of a loaded Linux edit and merge, GAPS 84a).
+  /// The completion port's `GetQueuedCompletionStatusEx` takes whole milliseconds too (and a short wait lasts a
+  /// timer tick, 15.6 ms by default): the IOCP driver's deadline timer is held to the same bar.
+  #[test]
+  #[cfg(any(unix, windows))]
+  #[cfg_attr(miri, ignore)]
+  fn a_sub_millisecond_timed_wait_ends_by_its_deadline() {
+    /// Shape: one millisecond, the granularity a whole-millisecond wait rounds up to.
+    const MILLISECOND_NS: u64 = 1_000_000;
+    let prepared = os_driver().unwrap();
+    let (registration, _control) =
+      crate::registry::register(2, 1, crate::runtime::register_kick(prepared.kick_fd)).unwrap();
+    let kick = crate::registry::with_entry(registration.shard(), |entry| entry.kick).unwrap();
+    let mut driver = (prepared.seed)(kick).unwrap();
+    let mut out = Vec::new();
+    let mut took: Vec<u64> = (0..SUB_MILLISECOND_WAITS)
+      .map(|_| {
+        let started = driver.now_ns();
+        driver
+          .wait(Some(SUB_MILLISECOND_WAIT_NS), &mut out)
+          .unwrap();
+        driver.now_ns() - started
+      })
+      .collect();
+    took.sort_unstable();
+    let shortest = took.first().copied().unwrap_or(u64::MAX);
+    assert!(
+      shortest < MILLISECOND_NS,
+      "{}: a {SUB_MILLISECOND_WAIT_NS} ns timed wait took at least {shortest} ns every time: it waited for a whole \
+       millisecond",
+      driver.kind().name()
+    );
+    // A Windows wait in whole milliseconds may also end before its timeout, on its timer's tick (iocp.rs's `wait`), so a
+    // lucky shortest proves nothing there (windows-11-arm, diag run 44934773181: the shortest under a millisecond with
+    // every wait a millisecond's): half the waits must end before one.
+    let median = took.get(took.len() / 2).copied().unwrap_or(u64::MAX);
+    assert!(
+      !cfg!(windows) || median < MILLISECOND_NS,
+      "{}: a {SUB_MILLISECOND_WAIT_NS} ns timed wait took {median} ns at the median: it waited for whole milliseconds",
+      driver.kind().name()
+    );
+    drop(driver);
+    drop(registration);
+  }
+
+  /// 84a (A-834): a Windows shard at the normal level stays one level above it once a wait of its has blocked, so a
+  /// runnable shard preempts normal-priority load instead of waiting out its 31.6 ms quantum. Do: on this thread at the
+  /// normal level, a timed wait through the real driver. Expect: the thread one level up after it. Before A-834 the
+  /// raise was put back before the shard ran (A-361), and loaded requests waited 30-100 ms queued or mid-service (GAPS
+  /// 84a's stamps, diag run 44945557697).
+  #[test]
+  #[cfg(windows)]
+  #[cfg_attr(miri, ignore)]
+  fn a_windows_shard_stays_one_level_up_after_a_blocking_wait() {
+    use windows_sys::Win32::System::Threading::{
+      GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+      THREAD_PRIORITY_NORMAL,
+    };
+    // SAFETY: the calling thread's own pseudo-handle and level.
+    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
+    let prepared = os_driver().unwrap();
+    let (registration, _control) =
+      crate::registry::register(2, 1, crate::runtime::register_kick(prepared.kick_fd)).unwrap();
+    let kick = crate::registry::with_entry(registration.shard(), |entry| entry.kick).unwrap();
+    let mut driver = (prepared.seed)(kick).unwrap();
+    let mut out = Vec::new();
+    driver
+      .wait(Some(SUB_MILLISECOND_WAIT_NS), &mut out)
+      .unwrap();
+    // SAFETY: the calling thread's own pseudo-handle.
+    let level = unsafe { GetThreadPriority(GetCurrentThread()) };
+    // SAFETY: as above; the thread put back for whatever runs on it next.
+    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
+    assert_eq!(
+      level, THREAD_PRIORITY_ABOVE_NORMAL,
+      "a shard at the normal level ran its next work at level {level}, not one above normal, after a blocking wait"
+    );
+    drop(driver);
+    drop(registration);
+  }
+
+  /// Shape: a wait well under a millisecond, well over a system call's cost.
+  #[cfg(any(unix, windows))]
+  const SUB_MILLISECOND_WAIT_NS: u64 = 200_000;
+  /// Shape: the waits whose shortest is judged, so one preemption of the test thread decides nothing.
+  #[cfg(any(unix, windows))]
+  const SUB_MILLISECOND_WAITS: usize = 50;
 }

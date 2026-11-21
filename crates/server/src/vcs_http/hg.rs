@@ -162,6 +162,32 @@ pub(crate) trait HgStores {
     room: &mut Admission,
     step: impl for<'s> FnOnce(&Self::Store<'s>, &mut Admission) -> R,
   ) -> Option<R>;
+
+  /// Answers what a streamed answer asks of the changeset store before its next step (`slates_hg::render::StoreWants`;
+  /// A-767 C1): by default from what `hold`'s view reads at once (a test's lender,
+  /// `slates_hg::serve::getbundle::Store::stored_now`), within `room`; the daemon's lender asks the node's changeset
+  /// store between steps (`crate::vcs_store::hg_view::answer_store_wants`). Whether every want was answered.
+  async fn answer_wants(
+    &mut self,
+    (hold, id, room): (&Self::Hold, RepositoryId, u64),
+    wants: &mut dyn slates_hg::render::StoreWants,
+  ) -> bool {
+    let _ = id;
+    while let Some(want) = wants.wants().cloned() {
+      let mut admission = Admission::new(room);
+      let given = self
+        .lend_held(hold, &mut admission, |store, _| store.stored_now(&want))
+        .flatten();
+      match given {
+        Some(slates_hg::serve::getbundle::Given::Rows(rows)) => wants.give_rows(rows),
+        Some(slates_hg::serve::getbundle::Given::Chunks(chunks)) => wants.give_chunks(chunks),
+        Some(slates_hg::serve::getbundle::Given::Texts(texts)) => wants.give_texts(texts),
+        Some(slates_hg::serve::getbundle::Given::TextsPast) => wants.texts_past(),
+        None => return false,
+      }
+    }
+    true
+  }
 }
 
 /// An exchange's answer once made: whole, or a `getbundle`'s, made a turn at a time (A-745).
@@ -496,6 +522,8 @@ pub(crate) struct HgExchange<S: HgStores> {
   /// Whether a push's body ran past its room: its bytes let go as they arrive, and the push refused in Mercurial's
   /// words once the body has ended (A-711).
   past_room: bool,
+  /// A streamed answer's measured step cost, across its turns (A-783's paced turn).
+  costs: crate::vcs_store::TurnCosts,
 }
 
 impl<S: HgStores> HgExchange<S> {
@@ -544,6 +572,7 @@ impl<S: HgStores> HgExchange<S> {
       generation: None,
       request_room: room,
       past_room: false,
+      costs: crate::vcs_store::TurnCosts::ZERO,
     })
   }
 }
@@ -645,6 +674,23 @@ impl<S: HgStores> Exchange for HgExchange<S> {
         Ok(false)
       }
       Some(Made::Streamed(mut streamed)) => {
+        // What the answer's next step asks of the node's changeset store, answered before its turn (a stream's rows and
+        // chunks, read where the store keeps them).
+        let answered = match self.generation.as_ref() {
+          Some(generation) => {
+            self
+              .stores
+              .answer_wants(
+                (generation, self.repository.id, self.request_room),
+                &mut *streamed,
+              )
+              .await
+          }
+          None => false,
+        };
+        if !answered {
+          return Err(Failed(Status::SERVICE_UNAVAILABLE));
+        }
         let more = self.turn(&mut streamed, out)?;
         if more {
           self.answered = Some(Made::Streamed(streamed));
@@ -660,8 +706,10 @@ impl<S: HgStores> Exchange for HgExchange<S> {
 
 impl<S: HgStores> HgExchange<S> {
   /// One turn of a streamed answer (A-745, §4.17.1 "A fetch's answer"): the repository's view lent for the turn alone,
-  /// steps taken within the room the lender names until its quantum is spent or the answer ends; a step past the turn's
-  /// room after others ends the turn, and is taken again by the next within a room of its own. Whether more follow.
+  /// steps taken within the room the lender names, paced (A-783, [`crate::vcs_store::paced_turn`]): to the
+  /// quantum while someone waits on the shard, on to its ceiling while no one does, or until the answer ends or asks the
+  /// changeset store; a step past the turn's room after others ends the turn, and is taken again by the next within a
+  /// room of its own. Whether more follow.
   fn turn(&mut self, streamed: &mut hg_http::Streamed, out: &mut Vec<u8>) -> Result<bool, Failed> {
     let id = self.repository.id;
     let (room, quantum) = self.stores.fetch_turn(id).unwrap_or((self.request_room, 0));
@@ -671,15 +719,22 @@ impl<S: HgStores> HgExchange<S> {
       .generation
       .as_ref()
       .ok_or(Failed(Status::INTERNAL_SERVER_ERROR))?;
+    let costs = &mut self.costs;
+    let mut paced = crate::vcs_store::paced_turn(quantum, start);
     let turned = self
       .stores
       .lend_held(generation, &mut admission, |store, room| {
         let mut taken = false;
         loop {
+          if !paced.more(crate::vcs_store::ANSWER_STEP, costs) {
+            break Ok(true);
+          }
           match streamed.step(store, room, out) {
-            Ok(true) if slates_rt::futures::now_ns().saturating_sub(start) < quantum => {
-              taken = true
+            // A step that asks the changeset store ends the turn: the store answers before the next one.
+            Ok(true) if slates_hg::render::StoreWants::wants(&*streamed).is_some() => {
+              break Ok(true);
             }
+            Ok(true) => taken = true,
             Ok(more) => break Ok(more),
             Err(slates_hg::serve::session::Refused::Serve(
               slates_hg::serve::Refusal::PastAdmission(_),
@@ -690,6 +745,8 @@ impl<S: HgStores> HgExchange<S> {
           }
         }
       });
+    paced.close(slates_rt::futures::now_ns(), costs);
+    crate::vcs_store::hg_view::turn_taken();
     match turned {
       Some(Ok(more)) => Ok(more),
       Some(Err(_)) => Err(Failed(Status::INTERNAL_SERVER_ERROR)),
@@ -745,6 +802,18 @@ async fn answered_batch<S: HgStores>(
       None => return Ok(None),
       Some(Ok(BatchStep::Push(bundle))) => bundle,
       Some(Ok(BatchStep::Answered(answer))) => return Ok(Some(hg_http::batched(Ok(answer)))),
+      Some(Ok(BatchStep::Store)) => {
+        // A lookup call reaches the tags: the heads' `.hgtags` read from the node's changeset store, once for the
+        // batch (A-767 C1, main's ruling (A)), under a generation held for the asks, then the batch stepped again.
+        let room = admission.left();
+        let Some(held) = stores.hold(id, &mut Admission::new(room)) else {
+          return Ok(None);
+        };
+        if !stores.answer_wants((&held, id, room), &mut batch).await {
+          return Ok(None);
+        }
+        continue;
+      }
       Some(Err(refused)) => return Ok(Some(hg_http::batched(Err(refused)))),
     };
     if !posted {
