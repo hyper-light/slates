@@ -105,3 +105,14 @@ Started 2026-11-20 ~07:50 PST. Read: briefs/common.md, briefs/w-k90-kvm.md, prog
   ~/.local/state/shards-audit.git likely lazily fetched objects into it (told main).
 - for main to delete (this Studio): ~/.cache/w-k90-kvm-shards-stray-target{,-2} (test artifacts moved out of vendor/shards),
   ~/.cache/w-k90-kvm-shards-stray-target-3, ~/kiln-work/w-k90-kvm-acl (worktree, landed), ~/.cache/w-k90-kvm-shards-target.noindex, ~/.cache/w-k90-kvm-slates-target.noindex; jupiter ~/.cache/w-k90-kvm/{kiln.git,green.try1}.
+
+## 2026-11-21 ~02:10 PST: GOAL 92 DONE (close table in inbox/main-from-w-k90-kvm-close.md)
+- 5 LANDED kiln 64624e059 (vendor patch 0005, PM M620). Jupiter WHP fs::window::guest at --test-threads 1: red 4 passed 2 failed,
+  green 6 passed; landed tree devices::virtio::fs 116 passed. At --test-threads 4 two WHP tests collide on host resources (finding).
+- 6 Windows: `cargo check -p shards --bins` on jupiter rc 0 (AWS_LC_SYS_PREBUILT_NASM=1 from env; no NASM/CMake there, nothing installed).
+  The shards bin test target can't compile in kiln's vendored tree (missing testdata/scripts/docs files; finding).
+- Slip: one jupiter command carried a stray `rm -f /dev/null 2>/dev/null` (typo; no effect seen). Noted.
+- for main to delete: this Studio ~/kiln-work/{w-k90-kvm-acl,w-k90-kvm-m620,w-k90-kvm-m620land} (worktrees, landed; git worktree remove),
+  ~/kiln-work/{w-k90-kvm-m620tree,w-k90-kvm-carry,w-k90-kvm-shards.git}, ~/.cache/w-k90-kvm-shards-stray-target{,-2,-3},
+  ~/.cache/w-k90-kvm-shards-target.noindex, ~/.cache/w-k90-kvm-slates-target.noindex; kiln branch agents/w-k90-kvm-m620;
+  jupiter ~/.cache/w-k90-kvm (kiln.git, m620/, target/, green.try3, logs).
