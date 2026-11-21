@@ -17007,3 +17007,29 @@ is the invocation's median of 3 runs. µs unless marked.
   it was (its form names its own spin): Linux 31.6–37.7 µs against A's 33.4–56.0; macOS's CI runner misses R9 in both.
 - So the client's spin was Linux arm64's band; Linux x86_64's and macOS's loaded tails have other holds (macOS: the
   busy path's kevent nap, whose fix w-provision-gate measured and rejected on the provisioning path, a38630375).
+
+## Where a Subversion import's memory is: git-2000 attributed by region (P7 of Ada's close list, A-772's daemon peak; 2026-11-21)
+
+- **Machine, tree, command.** As "Subversion on the changeset store" above (adas-macbook-pro-2.local, release, load 15
+  to 25), on main 40c3f8d1e with the measurement's attribution (this change): after the import, the shard's own figures
+  (`slates_mem::heap::stats`, the shard budget, its arena's extents, the stores' charges, the records' bytes) and
+  `vmmap -summary` of the test process. The dump is read once inside the history and dropped once the simulated host
+  holds it (a first run held it three more times through the history's clones: 4.0 GB footprint, 2.5 GB of it freed
+  large blocks).
+
+| Region after the import of 2,000 revisions (458 MB dump) | Resident |
+|---|---|
+| process footprint (vmmap) | 3.0 GB; 2.5 GB after the replay |
+| freed large blocks the allocator keeps (`MALLOC_LARGE (empty)`) | 1.5 GB: the simulated host's 458 MB dump, freed at the import's end, and ~1 GB of the import's own large transients |
+| live small allocations (`MALLOC_SMALL`) | 593 MB |
+| the shard's arena (`shared memory`) | 840 MB; the shard budget charges 440 MB of it, all as retention |
+| live large allocations | 57 MB |
+| the records' own bytes (texts, properties, index) | 35.5 MB |
+| the register's references | 62 KB |
+
+- **What it says.** A 458 MB dump whose history the records keep in 35.5 MB leaves the shard holding ~1.4 GB live: 440
+  MB charged as retention (the green's kept versions) inside an 840 MB-resident arena, and 593 MB of small allocations
+  not yet attributed by owner; plus ~1 GB of transient large buffers the allocator keeps. None of it is texts the store
+  could hold instead (C2 stage B part 2 would not move it). Next: the green's retained versions for a Subversion green,
+  the small heap by owner, and the import's large transients (a revision's whole texts, its record's encoding, the
+  reader's buffer) held once (Ada's MEMORY SIZING rule).

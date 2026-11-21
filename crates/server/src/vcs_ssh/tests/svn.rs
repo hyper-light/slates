@@ -1403,8 +1403,7 @@ fn measure_svnsync_replay_range_over_the_tunnel() {
     .ok()
     .and_then(|last| last.parse().ok())
     .unwrap_or(200);
-  let dump = std::fs::read(&path).expect("the dump");
-  let dump_bytes = dump.len();
+  let dump_bytes = std::fs::metadata(&path).expect("the dump").len();
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let started_kib = resident_kib();
   let importing = std::time::Instant::now();
@@ -1414,13 +1413,62 @@ fn measure_svnsync_replay_range_over_the_tunnel() {
     move || async move {
       use crate::vcs_store::svn_import::tests::{imported, subversion};
       let (id, _) = subversion(REPOSITORY).await;
-      (id, imported(id, &dump).await.0)
+      // Read here, once: the history's closure is cloned to run, and a dump captured by it would be held twice more.
+      let dump = std::fs::read(&path).expect("the dump");
+      (id, imported(id, dump).await.0)
     },
     std::time::Duration::from_secs(3600),
   );
   assert!(loaded.is_ok(), "{loaded:?}");
   let import = importing.elapsed();
   let imported_kib = resident_kib();
+  // Where the import's memory is (P7): the heap, the shard's budget, its arena's extents, the stores' charges and the
+  // records' own bytes, then the process's regions by type.
+  let attributed = crate::daemon::observe_first(&daemon, move |state| {
+    let heap = slates_mem::heap::stats();
+    let arena = state.store.content.arena();
+    let extents: u64 = arena
+      .region_ids()
+      .iter()
+      .filter_map(|region| arena.region(*region))
+      .map(|region| u64::try_from(region.len()).unwrap_or(0))
+      .sum();
+    format!(
+      "heap_in_use {} heap_reserved {} budget_committed {} budget_retained {} arena_extents {} vcs_charged {} \
+       objects_charged {} records_held {:?} register_objects_bytes {}",
+      heap.in_use,
+      heap.reserved,
+      state.store.budget.committed(),
+      state.store.budget.retained(),
+      extents,
+      state.vcs_stores.charged(),
+      state.vcs_stores.objects_charged(id),
+      state
+        .vcs_stores
+        .subversion_records(id)
+        .map(slates_svn::migration::Repository::held),
+      state.db.partition().repositories().objects_bytes(id),
+    )
+  });
+  println!("MEASURE attributed {attributed}");
+  if let Ok(out) = std::process::Command::new("vmmap")
+    .args(["-summary", &std::process::id().to_string()])
+    .output()
+  {
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines().filter(|line| {
+      line.contains("TOTAL")
+        || line.contains("MALLOC")
+        || line.contains("VM_ALLOCATE")
+        || line.contains("mapped file")
+        || line.contains("Stack")
+        || line.contains("__DATA")
+        || line.contains("shared memory")
+        || line.contains("Physical footprint")
+    }) {
+      println!("MEASURE vmmap {line}");
+    }
+  }
   let (text_bytes, landed) = crate::daemon::observe_first(&daemon, move |state| {
     (
       state
