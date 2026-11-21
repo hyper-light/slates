@@ -520,6 +520,9 @@
 > - (d) FIXED by A-813. A materialization secures its history and change index before it commits, as a submit's
 >   admission does, and is refused `BudgetExceeded` past the room, counted `merge.green.materialize_over_room`
 >   (`a_materialization_past_the_greens_retention_room_is_refused_before_it_commits`).
+> - A-815 (main's 07:30 ruling): a held verdict's preview lives across turns until the one step (`made_commit::
+>   hold_preview`, `with_held_preview`), for git's made commit's sliced map build; counted
+>   `vcs.made.preview_held_across_turns`. git's made commit over it is w-git's C5 2b piece 3.
 > - (e) Paths outside a recorded request or an owner's step are not routed through the door. A reach that skips it gets
 >   a typed miss from `Greens::get`, counted by `Greens::owing_reached`, never wrong content. That count is the detector
 >   for a missed path.

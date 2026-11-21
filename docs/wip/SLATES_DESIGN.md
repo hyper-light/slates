@@ -59370,3 +59370,27 @@ Applied in the same change to:
   - abandoned or refused `Forbidden`, the green is as it was, and an off-head work is refused `NotAtHead`.
 - **Owed:** w-svn's records side and the import driver; the batch's caller bounds it (one changeset's revisions).
 
+### A-815 — A held verdict's preview lives across turns until its one step (2026-11-21, w-rewrite-ops; main 07:30 PST, P2's interface, for w-git's C5 2b piece 3; A-804, A-805, A-664)
+Applied in the same change to:
+- `crates/server/src/made_commit.rs`: `HeldPreview`, `hold_preview`, `with_held_preview`, `give_up`,
+  `PREVIEW_HELD_ACROSS_TURNS`, and the retire in `commit`.
+- `crates/server/src/greens.rs`: `lineage_len`, a test's view.
+- `crates/server/src/verbs.rs`: `AcceptedParts::for_test`.
+
+- **Why.** A git made commit takes its trees from A-664's path map, stepped from the version's engine. A green whose map
+  is built whole (a first version, one past a copy) builds it a slice a turn on a task. Under the deferred-submit hook
+  the verdict is held, never applied, until the one step (A-805), and its preview was retired in the submit's step.
+- **What.** The preview is engine state kept with the pending accept:
+  - `hold_preview` makes it from the held verdict (`Greens::preview`).
+  - `with_held_preview` lends it on any later turn, so a sliced build steps against the version the verdict makes while
+    the green shows nothing of it.
+  - It is retired in the one step (`commit`, whatever the step does), or by `give_up` when the accept is abandoned. A
+    pending accept dropped otherwise gives its member back as it drops.
+  - The first lend after the submit's step counts `vcs.made.preview_held_across_turns`, the non-vacuity counter.
+- **Evidence.** `a_held_verdicts_preview_lives_across_turns_until_its_one_step`. In a later step of the shard the
+  preview reads as version 2 while the green shows version 1 and its lineage holds one member more, counted once.
+  Committed in a third step, the green is at version 2 and the preview is retired.
+  Main's red for the made commit itself (a first version past a copy answered (false, 0, 0) through a sliced build) is
+  w-git's `t_c5b_p3_a_git_made_commit_is_answered_only_once_its_changeset_landed_and_committed`, green with their
+  piece 3 over this interface.
+
