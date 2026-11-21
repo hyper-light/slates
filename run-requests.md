@@ -6944,3 +6944,16 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - clippy + xtask over crates/server/src/{mounted_work,verbs}.rs (rebuild_volume's tree pin, rebuild_mounted, tree_owner).
 - Suites touched: `cargo test -p slates-server --test recovery --test daemon` (recovery now rebuilds a mounted work's slot); `--lib recover` passed 25/25 here. Red: a recovery refusal or a work NotRecovered.
 - Main's order 4, owed to main: real editors on kernel mounts of works. macOS (root): `slates attach <work>` then `mount_nfs` the capability path; ten works over one green; per mount run `vim -es -c '3s/.*/editor N/' -c wq f3` (temp+rename save), `sed -i ''`, and `python3 -c` write-then-os.replace; then `slates submit` each, grant via the CLI, land; red = any verdict other than the in-process test's (tests/mounted_work.rs) or landed bytes != oracle. Linux the same with `mount -t nfs -o vers=3` and FUSE (`slates mount --fuse`). Gate it as `mounted_work_kernel` on SLATES_TEST_MOUNTED_WORK_KERNEL=1 when main schedules it.
+
+## w-hg, 2026-11-20 ~18:00 PST: restart replay and clone of hg's history, release (after 6935d8e86, f98d99685, bab805323)
+- **What:** prove A-732 parts 4 and 5 and the clone's manifest deltas by use.
+- **Platform:** any runner with 8 CPUs and 24 GB and Mercurial's repository at hand. On adacachy, pull it in pieces:
+  `hg pull -r N` in steps of 2,000. Whole clones from mercurial-scm.org aborted "incomplete response" there 3 times.
+  The big Studio has it at ~/.cache/w-hg-mem/hg.
+- **Command:** kiln r42's script (queued by needs linux/amd64; in w-hg's session). Release `slates`; push hg's whole
+  history over HTTP; `kill -9` the daemon; read the anchor log's "shard 0 initialized in ... longest slice" and
+  `vcs_store.hg_replay_turns`; then a plain clone, timed.
+- **Red would look like:**
+  - a recovery slice past the step quantum (r2 had 265-277 ms), or recovery CPU near r2's 130 s;
+  - "killing it" in the anchor log;
+  - the clone no faster than r14's 42 s quiet (the manifests are now deltas).

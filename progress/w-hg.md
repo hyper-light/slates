@@ -147,3 +147,11 @@
   - 13523dbe3: item 6(a) proven, a forced new head on a moved line held to stock 7.2's push -f.
 - OWED: the restart of hg's history measured again, release (r42 queued on adacachy; the Studios are unreachable
   for sync). Item 6(b) (the lock-free rebase) waits on main's ruling. The changeset shape waits on w-store's arm.
+- 2026-11-20 evening, LANDED:
+  - f98d99685: a clone sends manifests as their stored deltas.
+  - bab805323: whole texts written into the answer once.
+  - Branch agents/w-hg-file-deltas-held (c9c3ef73b): the per-file arm, for w-store's A/B.
+  - Inbox notes answered: w-store's stored form, w-sizing's numbers.
+- WAITING: r42 (the restart and clone measurement, queued on adacachy; also in run-requests.md); main's ruling on
+  item 6(b); w-store's piece 3, before hg moves onto the changeset store (the C item, with R2's red test: an import's
+  committed content against the .hg's bytes).
