@@ -9309,7 +9309,7 @@ fn declared_xattr<'a>(journal: &'a [VolumeOp], path: &str, name: &str) -> Option
 }
 
 /// The post-state's length: past the last laid byte of a content, xattr or node op.
-fn post_state_size(doc: &slates_merge::ops_doc::OpsDoc) -> u64 {
+pub(crate) fn post_state_size(doc: &slates_merge::ops_doc::OpsDoc) -> u64 {
   use slates_merge::ops_doc::OpKind;
   doc
     .ops
@@ -9344,79 +9344,117 @@ fn assemble_post_state(
   (files, base): (&crate::work_files::WorkFiles, crate::work_files::Base<'_>),
   journal: &[VolumeOp],
 ) -> Vec<u8> {
+  let mut post = vec![0u8; usize::try_from(post_state_size(doc)).unwrap_or(0)];
+  lay_ops(
+    &mut post,
+    (doc, plan),
+    (files, base),
+    journal,
+    0..doc.ops.len(),
+  );
+  post
+}
+
+/// Lays the bytes the ops of `doc` in `ops` contribute into `post` ([`assemble_post_state`]'s body, which a sliced
+/// build runs a range at a time, A-787 part 3). Returns the bytes copied, what a slice is budgeted by.
+pub(crate) fn lay_ops(
+  post: &mut [u8],
+  (doc, plan): (
+    &slates_merge::ops_doc::OpsDoc,
+    &slates_merge::increment::PostStatePlan,
+  ),
+  (files, base): (&crate::work_files::WorkFiles, crate::work_files::Base<'_>),
+  journal: &[VolumeOp],
+  ops: std::ops::Range<usize>,
+) -> usize {
+  let mut copied = 0usize;
+  for op in doc.ops.get(ops).unwrap_or_default() {
+    copied = copied.saturating_add(lay_op(post, op, (doc, plan), (files, base), journal));
+  }
+  copied
+}
+
+/// One op's bytes laid into `post` ([`lay_ops`]): the bytes it copied.
+fn lay_op(
+  post: &mut [u8],
+  op: &slates_merge::ops_doc::Op,
+  (doc, plan): (
+    &slates_merge::ops_doc::OpsDoc,
+    &slates_merge::increment::PostStatePlan,
+  ),
+  (files, base): (&crate::work_files::WorkFiles, crate::work_files::Base<'_>),
+  journal: &[VolumeOp],
+) -> usize {
   use slates_merge::ops_doc::OpKind;
   let is_file_content =
     |kind: OpKind| matches!(kind, OpKind::Overwrite | OpKind::Insert | OpKind::Extend);
-  let mut post = vec![0u8; usize::try_from(post_state_size(doc)).unwrap_or(0)];
-  for op in &doc.ops {
-    if op.src == u64::MAX {
-      continue;
-    }
-    let Some(path) = doc.paths.path(op.path) else {
-      continue;
-    };
-    let encoded_node;
-    if is_file_content(op.kind) {
-      // The file's bytes this op contributes, copied out of that range alone (a held file's pieces, never the whole
-      // file); a range the file does not wholly hold contributes nothing, as before. The submit read the base already
-      // (`build_increment` refuses a work whose green is gone).
-      let (Some(at), Ok(dst), Ok(len)) = (
-        plan.get(&op.src),
-        usize::try_from(op.src),
-        usize::try_from(op.len),
-      ) else {
-        continue;
-      };
-      if let Some(into) = post.get_mut(dst..dst.saturating_add(len))
-        && files.copy_range(base, path, *at, into).ok().flatten() != Some(len)
-      {
-        into.fill(0);
-      }
-      continue;
-    }
-    // The bytes this op contributes, and the offset into them: an xattr's value or a node.
-    let (source, source_at): (&[u8], u64) = if op.kind == OpKind::Mknod {
-      let Some(node) = journal.iter().rev().find_map(|entry| match entry {
-        VolumeOp::Mknod {
-          path: declared,
-          node,
-          ..
-        } if declared == path => Some(node),
-        _ => None,
-      }) else {
-        continue;
-      };
-      encoded_node = node.encode();
-      (&encoded_node, 0)
-    } else if op.kind == OpKind::SetXattr {
-      // The name's index is 64 bits (A-621): until then one past 16 bits was skipped here, so an attribute of a work
-      // naming more than 65,535 paths had no value laid in.
-      let Some(name) = doc.paths.path(op.at) else {
-        continue;
-      };
-      let Some(value) = declared_xattr(journal, path, name) else {
-        continue;
-      };
-      (value, 0)
-    } else {
-      continue;
-    };
-    let (Ok(from), Ok(dst), Ok(len)) = (
-      usize::try_from(source_at),
+  if op.src == u64::MAX {
+    return 0;
+  }
+  let Some(path) = doc.paths.path(op.path) else {
+    return 0;
+  };
+  let encoded_node;
+  if is_file_content(op.kind) {
+    // The file's bytes this op contributes, copied out of that range alone (a held file's pieces, never the whole
+    // file); a range the file does not wholly hold contributes nothing, as before. The submit read the base already
+    // (`build_increment` refuses a work whose green is gone).
+    let (Some(at), Ok(dst), Ok(len)) = (
+      plan.get(&op.src),
       usize::try_from(op.src),
       usize::try_from(op.len),
     ) else {
-      continue;
+      return 0;
     };
-    let span = (
-      post.get_mut(dst..dst.saturating_add(len)),
-      source.get(from..from.saturating_add(len)),
-    );
-    if let (Some(into), Some(from)) = span {
-      into.copy_from_slice(from);
+    if let Some(into) = post.get_mut(dst..dst.saturating_add(len))
+      && files.copy_range(base, path, *at, into).ok().flatten() != Some(len)
+    {
+      into.fill(0);
     }
+    return len;
   }
-  post
+  // The bytes this op contributes, and the offset into them: an xattr's value or a node.
+  let (source, source_at): (&[u8], u64) = if op.kind == OpKind::Mknod {
+    let Some(node) = journal.iter().rev().find_map(|entry| match entry {
+      VolumeOp::Mknod {
+        path: declared,
+        node,
+        ..
+      } if declared == path => Some(node),
+      _ => None,
+    }) else {
+      return 0;
+    };
+    encoded_node = node.encode();
+    (&encoded_node, 0)
+  } else if op.kind == OpKind::SetXattr {
+    // The name's index is 64 bits (A-621): until then one past 16 bits was skipped here, so an attribute of a work
+    // naming more than 65,535 paths had no value laid in.
+    let Some(name) = doc.paths.path(op.at) else {
+      return 0;
+    };
+    let Some(value) = declared_xattr(journal, path, name) else {
+      return 0;
+    };
+    (value, 0)
+  } else {
+    return 0;
+  };
+  let (Ok(from), Ok(dst), Ok(len)) = (
+    usize::try_from(source_at),
+    usize::try_from(op.src),
+    usize::try_from(op.len),
+  ) else {
+    return 0;
+  };
+  let span = (
+    post.get_mut(dst..dst.saturating_add(len)),
+    source.get(from..from.saturating_add(len)),
+  );
+  if let (Some(into), Some(from)) = span {
+    into.copy_from_slice(from);
+  }
+  len
 }
 
 /// Composes a work volume's declared operations into an increment against its green's base version
@@ -9507,9 +9545,7 @@ pub(crate) fn compose_increment(
   // reported as an accept (`docs/bugs/2026-11-04-the-same-edit-from-two-works-was-one-increment.md`).
   // Both are fixed widths, so the concatenation is unambiguous. Every work volume of a green is under one
   // exclusion filter today (none), so the filter adds nothing yet.
-  let mut hasher = blake3::Hasher::new();
-  hasher.update(&work_id.bytes);
-  hasher.update(&base_version.to_le_bytes());
+  let mut hasher = identity_hasher(work_id, base_version);
   hasher.update(&doc.encode());
   hasher.update(&post_state);
   let id = *hasher.finalize().as_bytes();
@@ -9521,6 +9557,46 @@ pub(crate) fn compose_increment(
     evidence,
     named: Default::default(),
   })
+}
+
+/// The increment [`compose_increment`] composes whole for `work`'s journal over `refined`, its refinement's document and
+/// plan, at `base_version` on the green `green` holds here: the oracle a refinement job's sliced build is held to in a
+/// debug build (A-821). `None` where the work, the green or the composition is not there.
+pub(crate) fn composed_whole(
+  state: &ShardState,
+  (work, green, base_version): (DbVolumeId, DbVolumeId, u64),
+  refined: (
+    slates_merge::ops_doc::OpsDoc,
+    slates_merge::increment::PostStatePlan,
+  ),
+  evidence: Vec<[u8; 32]>,
+) -> Option<slates_merge::engine::Increment> {
+  let w = state.works.get(&work)?;
+  let engine = state.greens.get(&green)?;
+  let base = engine.base_for(base_version, &w.journal);
+  let files_base = crate::work_files::Base {
+    green: Some(&*engine),
+    fetched: None,
+    version: base_version,
+    entries: None,
+  };
+  compose_increment(
+    (work, base_version),
+    (&base, Some(refined)),
+    (&w.files, files_base),
+    &w.journal,
+    evidence,
+  )
+  .ok()
+}
+
+/// The increment identity's hasher with the work and its base taken in ([`compose_increment`]'s comment): the encoded
+/// document and then the post-state follow, whole or a slice at a time (A-787 part 3), to the same identity.
+pub(crate) fn identity_hasher(work_id: DbVolumeId, base_version: u64) -> blake3::Hasher {
+  let mut hasher = blake3::Hasher::new();
+  hasher.update(&work_id.bytes);
+  hasher.update(&base_version.to_le_bytes());
+  hasher
 }
 
 /// Keeps a conflicting verdict with its work (§4.16, A-267): every window, under a fresh id, until the work's next
@@ -10286,7 +10362,26 @@ fn verdict_of(
   sealed: &crate::work_home::SealedWork,
   (inc, hold): (&slates_merge::engine::Increment, bool),
 ) -> Option<Result<(Judged, Option<slates_merge::engine::Judged>), String>> {
+  // The verdict the refinement job computed at the head it saw (A-787 part 3), taken by position: only what a later
+  // head changed is judged again, so the outcome is the one this head's own judgment reaches.
+  let local = if sealed.computed.is_none() {
+    crate::refining::take_computed(state, sealed.work, inc.id)
+  } else {
+    None
+  };
   let mut engine = state.greens.get_mut(&green_id)?;
+  if let Some(computed) = local {
+    let taken = if hold {
+      engine.judge_computed(inc, computed).map(held_outcome)
+    } else {
+      engine
+        .submit_computed(inc, computed)
+        .map(|judged| (judged, None))
+    };
+    return Some(
+      taken.map_err(|refusal| format!("the verdict is not taken by position: {refusal:?}")),
+    );
+  }
   if hold {
     let judgment = match &sealed.computed {
       None => Ok(engine.judge(inc)),
@@ -10460,6 +10555,13 @@ fn composed_here(
   if sealed.composed.is_none() && crate::work_home::holds_copy(&sealed.journal) {
     state.count(crate::work_home::COPY_COMPOSED_BY_OWNER, 1);
   }
+  // A refined submit's increment the refinement job prepared a slice a turn (A-787 part 3): composed off this step.
+  let key = (sealed.base_version, sealed.journal.len());
+  if sealed.composed.is_none()
+    && let Some(inc) = crate::refining::take_increment(state, sealed.work, key, &evidence)
+  {
+    return Ok((sealed.green, inc));
+  }
   let compose_start = state.clock.monotonic_ns();
   let built = build_increment(state, sealed, evidence)?;
   if sealed.composed.is_none() {
@@ -10473,6 +10575,34 @@ fn composed_here(
 /// the single serialized step of the green. Runs in the transaction of the verb that asked, whether on this shard or
 /// through [`owner_judge`]. The work's own reset is the caller's to settle.
 fn judge_submission(
+  state: &mut ShardState,
+  sealed: &crate::work_home::SealedWork,
+  evidence: Vec<[u8; 32]>,
+  policy: SubmitPolicy,
+) -> ReplyBody {
+  // The submit's judgment is one step today (its verdict, its commit with the history's re-anchor, its encode): its
+  // longest, and those past the shard's derived step bound (the ceiling a paced step runs to, A-783), counted.
+  let began = slates_rt::futures::now_ns();
+  let reply = judged_submission(state, sealed, evidence, policy);
+  let took = slates_rt::futures::now_ns().saturating_sub(began);
+  state.count_max(
+    SUBMIT_LONGEST_STEP_US,
+    took / crate::daemon::NANOS_PER_MICRO,
+  );
+  if slates_rt::futures::step_ceiling_ns().is_some_and(|ceiling| took > ceiling) {
+    state.count(SUBMIT_STEPS_PAST_CEILING, 1);
+  }
+  reply
+}
+
+/// Counter: the longest step a submit's judgment took on this shard, microseconds (a maximum, not a sum). Format: a
+/// counter name in the daemon's status report.
+pub(crate) const SUBMIT_LONGEST_STEP_US: &str = "merge.submit.longest_step_us";
+/// Counter: submit judgments whose one step ran past the shard's derived step bound (`step_ceiling_ns`, A-783).
+pub(crate) const SUBMIT_STEPS_PAST_CEILING: &str = "merge.submit.steps_past_ceiling";
+
+/// [`judge_submission`]'s judgment itself.
+fn judged_submission(
   state: &mut ShardState,
   sealed: &crate::work_home::SealedWork,
   evidence: Vec<[u8; 32]>,
@@ -10521,7 +10651,9 @@ fn judge_submission(
   // submit (it cannot advance regardless of the verdict).
   // What the chain will hold is the increment and what its verdict resolves it to (A-257), known only after the verdict,
   // so the admission charges the most an entry for this increment can be.
-  let increment_bytes = inc.encode();
+  // Encoded by the refinement job where it prepared the increment (A-787 part 3), else here.
+  let increment_bytes =
+    crate::refining::take_encoded(state, sealed.work, inc.id).unwrap_or_else(|| inc.encode());
   // A copy from a version its source changed after records the source's values then in its entry (A-626 part 2): the
   // green adds that room, derived from what its histories hold, never a fixed allowance.
   let Some(room) = state
@@ -12197,6 +12329,15 @@ pub(crate) fn answer_overdue(state: &ShardState, parked: ParkedSubmit) -> bool {
   let shard = state.shard;
   route
     .is_some_and(|route| answered_on(route, (origin, id), refused(Refusal::Overloaded { shard })))
+}
+
+/// The evidence of the first submit parked in `parked` that runs on the green's shard (A-787 part 3: the increment a
+/// refinement job prepares carries it); none when no such submit waits.
+pub(crate) fn parked_local_evidence(parked: &[ParkedSubmit]) -> Option<Vec<[u8; 32]>> {
+  parked.iter().find_map(|submit| match &submit.kind {
+    ParkedKind::Local { evidence, .. } => Some(evidence.clone()),
+    _ => None,
+  })
 }
 
 /// What a parked submit runs again: the owner's step of a submit asked from a work's shard ([`owner_judge`]), or the

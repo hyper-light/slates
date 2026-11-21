@@ -19,11 +19,15 @@
 > (A-787 part 2's park, 2a498b90f). 10 server lib tests (repository, vcs_store paths and commits) failed from that
 > commit on, bisected against its parent 81d8baea5; such a verb now composes unrefined and is answered (6459374).
 
-> **Open (w-fed-faults, 2026-11-21): A-787 part 2's refinement job spins a shard past the watchdog in a debug build.**
-> `cargo test -p slates-server --test green_post_state` on macOS arm64 ends exit 4: "shard N is spinning, 3,513 ms of
-> CPU without a step against its 3,488 ms window, in task spawned at crates/server/src/refining.rs:166", after
-> `a_rebased_work_submits_as_it_would_have` passes. Same on origin/main 8cb10f986 (not caused by 6459374). The job's
-> turns do not count as the shard's steps, or a turn runs past its slice at debug speed.
+> **Open, narrowed (w-fed-faults, A-821, 2026-11-21): the refined submit's one step still holds its commit.** The
+> watchdog's kill at refining.rs:166 (exit 4 in `green_post_state`, debug, a loaded Studio) was not the job's turns
+> (longest 608 µs) but the parked submit, run again in the job's last poll as one 415 ms step: composition 85 ms,
+> verdict 23 ms, encode 11 ms, the commit's history re-anchor 219 ms, the chain's append ~60 ms. A-821 prepares the
+> increment, its verdict and its encoding in the job a bounded slice a turn; the step judges by position and commits.
+> Measured (`merge.submit.longest_step_us`, the 2 MiB re-indent): debug 417.5 to 303.8 ms, release 34.5 to 24.6 ms,
+> against the derived bound of 100 ms (`HEARTBEAT_NS`, the paced ceiling). What stays in the step: the commit's
+> re-anchor (A-818's engine switch, piece 2b, replaces it) and the chain's durable append of a ~5 MB entry. Close once
+> `merge.submit.steps_past_ceiling` reads 0 in a debug build.
 
 > **CLOSED (w-hg, 2026-11-21): five Mercurial tests of `vcs_http::daemon_edge` failed on macOS arm64**
 > (`a_mercurial_repositorys_store_is_served_...`, `a_stock_mercurial_push_...`, the clone, stream clone and push
@@ -344,7 +348,7 @@
 > register-held path left, version 2 (`vcs_store::SealedPush::record`'s last arm, `record_of`): a record nobody homed,
 > which is a server-made commit (A-664, `vcs_store::commits`) until it takes w-svn's deferred-submit landing order, and
 > a store test sealing a push directly (`vcs_store::tests::push_through`, never through a driver). Piece 3 part 1 BUILT
-> (A-822, w-git, 2026-11-21): a recorded submit's git made commit takes the deferred-submit hook, its map stepped over
+> (A-824, w-git, 2026-11-21): a recorded submit's git made commit takes the deferred-submit hook, its map stepped over
 > the held verdict's preview, its changeset homed and landed, then recorded version 5 with its version in one step
 > (`t_c5b_p3_…`; counter `vcs_commits.made_landed`); a kill between the landing and the step recovers to before and the
 > retry lands once (`t_c5b_p3_a_kill_…`). Owed (w-git): `record_of` and version 2 removed with the paths that still write them (a submit outside a recorded request,
@@ -550,11 +554,11 @@
 > A-774 part 3), reported to main.
 >
 > **A-812, P2's engine half (2026-11-21, w-rewrite-ops; main's order of 05:16, w-git's request). BUILT, engine and
-> server; git's half BUILT (A-821, w-git).** A created ref's green may owe its push (`DeferredPush`, recorded as its version 1)
+> server; git's half BUILT (A-823, w-git).** A created ref's green may owe its push (`DeferredPush`, recorded as its version 1)
 > and is made when first reached, through one door (`crate::green_ready`). The made green is the eager create's by
 > construction, and requests park until it is made. The full description and tests are in the design entry A-812.
 > Owed:
-> - (a) FIXED by A-821 (w-git, 2026-11-21): git's creates owe their pushes, the unborn default's first push is a deferred
+> - (a) FIXED by A-823 (w-git, 2026-11-21): git's creates owe their pushes, the unborn default's first push is a deferred
 >   update, `with_owed_push_objects` answers git's objects, and a push reaches greens through the door (a command whose
 >   wait ends with the build refused is declined, not retried). Owed from it: a replayed owing green has not been made
 >   over a restarted node's shares in a test (`verbs::replay_green` alone holds no origin shares, and its build met
@@ -584,7 +588,7 @@
 >   compacts a fragmented value at write time.
 > - A-816 (main's 07:30 ruling): a held verdict's preview lives across turns until the one step (`made_commit::
 >   hold_preview`, `with_held_preview`), for git's made commit's sliced map build; counted
->   `vcs.made.preview_held_across_turns`. git's made commit over it is w-git's C5 2b piece 3, BUILT (A-822).
+>   `vcs.made.preview_held_across_turns`. git's made commit over it is w-git's C5 2b piece 3, BUILT (A-824).
 > - (e) Paths outside a recorded request or an owner's step are not routed through the door. A reach that skips it gets
 >   a typed miss from `Greens::get`, counted by `Greens::owing_reached`, never wrong content. That count is the detector
 >   for a missed path.
