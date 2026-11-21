@@ -3021,6 +3021,20 @@
 >     store and verifies clean (0 asks before);
 >   - hg_interop 15/15 against stock hg 7.2.
 > - 1b, BUILT below.
+> **Three more readers of whole file texts gone: made changesets, the presence check, the served view's `file` (A-767
+> C1, 2026-11-21, w-hg; main's order of 10:34). BUILT.**
+> - `push/made.rs`: whether a version's file keeps its parent's node (7.2's `filelog.cmp`) is told by the two texts'
+>   names, the metadata block's and the bytes' identities (`verify::FileNames`, `Held::file_names`), the parent's
+>   read from its index row unread (`IndexHeld::file_names`); no file text read.
+> - `push/verify.rs`: a new manifest's files are present by their rows (`file_names`), no text read. The whole
+>   `verify` has no production caller (the sliced intake replaced it); it stays as the intake's test oracle, its
+>   delta bases read from the content store there alone.
+> - `serve`: `getbundle::Store::file` is gone, and with it `Indexed::file`. `file_entry` (the row, no text) is the
+>   served view's one file read; a fetch's bytes come from the changeset store (C1 step 1).
+> - Held by the made tests (a version that changes nothing makes none; a same-text file keeps its node), the serve
+>   suites, and `texts_longer_than_a_window_are_copied_within_the_room` (file rows read with no text lent).
+> - Left before step 2: `push/tree.rs` (A-618's builder reads file bytes synchronously; main's ruling asked,
+>   inbox/main-from-w-hg-tree-through-store.md).
 > **The push intake's file delta bases through the store (A-767 C1, 2026-11-21, w-hg; main's ruling (b2) over (b1)).
 > BUILT.**
 > - A file delta whose base is not the text kept last no longer reads the fork's whole text from the content store

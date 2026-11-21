@@ -302,13 +302,12 @@ impl Store for Probed {
     Ok(None)
   }
 
-  fn file(
+  fn file_entry(
     &self,
     _path: &[u8],
     _node: &Node,
-    _room: &mut slates_hg::Admission,
-  ) -> Result<Option<Logged<'_>>, slates_hg::PastAdmission> {
-    Ok(None)
+  ) -> Option<slates_hg::serve::getbundle::FileEntry> {
+    None
   }
 
   fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
@@ -1566,23 +1565,17 @@ impl Store for Grown {
     }))
   }
 
-  fn file(
-    &self,
-    path: &[u8],
-    node: &Node,
-    _room: &mut slates_hg::Admission,
-  ) -> Result<Option<Logged<'_>>, slates_hg::PastAdmission> {
+  fn file_entry(&self, path: &[u8], node: &Node) -> Option<slates_hg::serve::getbundle::FileEntry> {
     let at = self
       .files
       .iter()
-      .position(|(held, file)| held == path && file == node);
-    Ok(at.map(|at| Logged {
+      .position(|(held, file)| held == path && file == node)?;
+    Some(slates_hg::serve::getbundle::FileEntry {
       position: 0,
       parents: [NULL_NODE, NULL_NODE],
       link: self.changesets[at],
       flags: 0,
-      text: Cow::Borrowed(self.bytes.as_slice()),
-    }))
+    })
   }
 
   fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
