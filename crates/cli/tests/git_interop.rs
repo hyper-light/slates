@@ -1329,6 +1329,514 @@ fn stock_git_sees_the_branches_the_cli_makes_retires_and_binds() {
   );
 }
 
+/// Format: the variable naming the client counts goal 93's concurrency tests run, comma-separated (`2,10,50`); unset,
+/// [`FOCUSED_CLIENTS`] alone.
+const CONCURRENCY: &str = "SLATES_GIT_CONCURRENCY";
+/// Shape: the client count a concurrency test runs when [`CONCURRENCY`] names none: two, the fewest that race.
+const FOCUSED_CLIENTS: usize = 2;
+/// Shape: the mirrors each concurrency test clones at its end to hold every clone's refs and objects identical: three,
+/// so one clone that differs shows against two that agree.
+const MIRRORS: usize = 3;
+/// Shape: one concurrent reader for this many pushing clients, and never fewer than [`LEAST_READERS`]: readers enough
+/// to meet the pushes mid-flight without outnumbering them.
+const CLIENTS_PER_READER: usize = 5;
+/// Shape: the fewest concurrent readers a distinct-branches test runs: two, so a clone and a fetch overlap each other
+/// as well as the pushes.
+const LEAST_READERS: usize = 2;
+/// Format: the words git puts on a ref a push could not move (`transport.c`, `print_ref_status`): its own `[rejected]`
+/// and the server's `[remote rejected]`.
+const REJECTED_WORDS: [&str; 2] = ["[rejected]", "[remote rejected]"];
+/// Format: why git says a ref was refused when another push moved it first. Lost before the advertisement, git judges
+/// it itself (`transport.c`; `push.c`'s advice): the tip behind (`fetch first`, `non-fast-forward`), a tag already
+/// there (`already exists`), or a lease that went stale. Lost after it, at the ref's compare-and-swap, the server
+/// refuses it `[remote rejected] … (failed to update ref)`, as stock git's own receive-pack does: two pushes at once to
+/// a bare repository over `file://`, 6 of 6 rounds one refused so, with `cannot lock ref 'refs/heads/main': is at …
+/// but expected …` (git 2.50.1, 2026-11-21).
+const LOST_RACE_WORDS: [&str; 5] = [
+  "fetch first",
+  "non-fast-forward",
+  "already exists",
+  "stale info",
+  "failed to update ref",
+];
+/// Format: words in a refused push's output that mean the server broke rather than refused cleanly: a dropped
+/// connection, a failed RPC over HTTP, a 5xx answer, or a pack the server could not unpack.
+const BROKEN_WORDS: [&str; 5] = [
+  "hung up",
+  "RPC failed",
+  "HTTP 5",
+  "unpack",
+  "internal server error",
+];
+
+/// The client counts [`CONCURRENCY`] names, or [`FOCUSED_CLIENTS`] alone.
+fn client_counts() -> Vec<usize> {
+  std::env::var(CONCURRENCY).map_or_else(
+    |_| vec![FOCUSED_CLIENTS],
+    |line| {
+      line
+        .split(',')
+        .map(|count| count.trim().parse().expect("a client count"))
+        .collect()
+    },
+  )
+}
+
+/// One concurrency session: its HTTP leg (an anchor, repository [`REPOSITORY`], a token for its owner), stock git
+/// carrying the token, the repository's URL, and the scratch directory, removed after the anchor stops.
+struct Racing {
+  _leg: HttpLeg,
+  git: Git,
+  url: String,
+  _scratch: Scratch,
+}
+
+/// The concurrency session `session`, or `None` (said loudly) where this host runs no stock git or names no issuer
+/// surface.
+fn racing(session: &str) -> Option<Racing> {
+  let Some(program) = stock_git() else {
+    eprintln!(
+      "skipping {session}: no stock git here (set {STOCK_GIT} to the command that runs it)"
+    );
+    return None;
+  };
+  let leg = http_leg(session)?;
+  let scratch = Scratch::new(&format!("git-race-{session}"));
+  let header = format!("http.extraHeader=Authorization: Bearer {}", leg.token);
+  let git = Git::new(&program, &scratch, session, vec!["-c".to_owned(), header]);
+  let url = format!("http://127.0.0.1:{}/{REPOSITORY}", leg.port);
+  Some(Racing {
+    _leg: leg,
+    git,
+    url,
+    _scratch: scratch,
+  })
+}
+
+/// Writes `text` as file `name` in copy `copy` (the test's own scratch directory, as [`put`] writes).
+#[allow(clippy::disallowed_methods)]
+fn put_named(copy: &str, name: &str, text: &str) {
+  std::fs::write(format!("{copy}/{name}"), text).unwrap();
+}
+
+/// `count` clones of `url`, copies `PREFIX-0` and on: their paths.
+fn clones(git: &Git, url: &str, prefix: &str, count: usize) -> Vec<String> {
+  (0..count)
+    .map(|index| {
+      let path = git.copy(&format!("{prefix}-{index}"));
+      git.ok(&git.scratch, &["clone", "-q", url, &path]);
+      path
+    })
+    .collect()
+}
+
+/// A commit in copy `copy` adding a file of its own, named for `what` and `index`: the commit.
+fn commit_own(git: &Git, copy: &str, what: &str, index: usize) -> String {
+  let name = format!("{what}-{index}");
+  put_named(copy, &name, &format!("{what} {index}\n"));
+  git.ok(copy, &["add", &name]);
+  git.ok(copy, &["commit", "-q", "-m", &name]);
+  git.commit_of(copy, "HEAD")
+}
+
+/// Runs each of `jobs` (a directory and git's words) on a thread of its own, all released at once by one barrier: each
+/// one's exit code and both outputs, in order.
+fn at_once(git: &Git, jobs: &[(String, Vec<String>)]) -> Vec<(i32, String, String)> {
+  let barrier = std::sync::Barrier::new(jobs.len());
+  let barrier = &barrier;
+  std::thread::scope(|scope| {
+    let running: Vec<_> = jobs
+      .iter()
+      .map(|(dir, words)| {
+        scope.spawn(move || {
+          let words: Vec<&str> = words.iter().map(String::as_str).collect();
+          barrier.wait();
+          git.run(dir, &words)
+        })
+      })
+      .collect();
+    running.into_iter().map(|job| job.join().unwrap()).collect()
+  })
+}
+
+/// `words` as owned strings, a job's words for [`at_once`].
+fn words(words: &[&str]) -> Vec<String> {
+  words.iter().map(|word| (*word).to_owned()).collect()
+}
+
+/// Whether a push refused with `err` was refused cleanly: git names the ref rejected ([`REJECTED_WORDS`]) because the
+/// race was lost ([`LOST_RACE_WORDS`]), and nothing says the server broke ([`BROKEN_WORDS`]).
+fn refused_cleanly(err: &str) -> bool {
+  REJECTED_WORDS.iter().any(|words| err.contains(words))
+    && LOST_RACE_WORDS.iter().any(|words| err.contains(words))
+    && !BROKEN_WORDS.iter().any(|words| err.contains(words))
+}
+
+/// The refs `url` serves, as `git ls-remote` lists them, without its `HEAD` or an annotated tag's peeled line
+/// (`refs/tags/NAME^{}`): each ref's name and object.
+fn served_refs(git: &Git, url: &str) -> std::collections::BTreeMap<String, String> {
+  git
+    .ok(&git.scratch, &["ls-remote", url])
+    .lines()
+    .filter_map(|line| line.split_once('\t'))
+    .filter(|(_, name)| *name != "HEAD" && !name.ends_with("^{}"))
+    .map(|(object, name)| (name.to_owned(), object.to_owned()))
+    .collect()
+}
+
+/// The refs of the repository at `dir` under `under`, each name with `under` replaced by `as_`, and their objects.
+fn refs_under(
+  git: &Git,
+  dir: &str,
+  under: &str,
+  as_: &str,
+) -> std::collections::BTreeMap<String, String> {
+  git
+    .ok(
+      dir,
+      &["for-each-ref", "--format=%(objectname) %(refname)", under],
+    )
+    .lines()
+    .filter_map(|line| line.split_once(' '))
+    .filter(|(_, name)| !name.ends_with("/HEAD"))
+    .map(|(object, name)| (name.replacen(under, as_, 1), object.to_owned()))
+    .collect()
+}
+
+/// The checks every concurrency test ends on, `label` naming the run: the refs `url` serves equal `expected`, the
+/// accepted pushes; then each of [`MIRRORS`] mirror clones passes `git fsck --full --strict`, holds exactly `expected`,
+/// and lists the same refs and the same objects as the others.
+fn ends_consistent(
+  git: &Git,
+  url: &str,
+  expected: &std::collections::BTreeMap<String, String>,
+  label: &str,
+) {
+  assert_eq!(
+    &served_refs(git, url),
+    expected,
+    "{label}: the refs served are the accepted pushes"
+  );
+  let mut held = Vec::new();
+  for mirror in 0..MIRRORS {
+    let path = git.copy(&format!("{label}-mirror-{mirror}"));
+    git.ok(&git.scratch, &["clone", "-q", "--mirror", url, &path]);
+    git.ok(&path, &["fsck", "--full", "--strict", "--no-dangling"]);
+    let refs = refs_under(git, &path, "refs/", "refs/");
+    assert_eq!(
+      &refs, expected,
+      "{label}: mirror {mirror} holds the accepted pushes"
+    );
+    let mut objects: Vec<String> = git
+      .ok(&path, &["cat-file", "--batch-all-objects", "--batch-check"])
+      .lines()
+      .map(str::to_owned)
+      .collect();
+    objects.sort();
+    held.push((refs, objects));
+  }
+  assert!(
+    held.windows(2).all(|pair| pair[0] == pair[1]),
+    "{label}: every mirror lists the same refs and objects"
+  );
+}
+
+/// Goal 93's concurrency, one branch (a correctness round main runs; Ada 2026-11-21, "complete the servers, ensure
+/// correctness"). Do: for each client count N [`CONCURRENCY`] names, start an anchor with its HTTP edge and repository
+/// [`REPOSITORY`]; push a first commit to [`BRANCH`]; clone it N times, commit a file of its own in each clone, and push
+/// all N to [`BRANCH`] at once, released by one barrier. Expect exactly one push to win; every other to be refused in
+/// git's own words for a lost race ([`LOST_RACE_WORDS`]: `fetch first` or `non-fast-forward` before the
+/// advertisement, `[remote rejected] … (failed to update ref)` after it, as stock git's receive-pack answers) and never
+/// a broken server ([`BROKEN_WORDS`]); and then the branch at the winner's commit, served and in every mirror, each
+/// mirror fsck clean and identical ([`ends_consistent`]).
+#[test]
+#[ignore = "goal 93's concurrency round, main's to run: SLATES_GIT_CONCURRENCY=2,10,50 cargo test --release -p slates-cli --test git_interop -- --ignored concurrent_pushes --nocapture"]
+fn concurrent_pushes_to_one_branch_land_one_and_refuse_the_rest_cleanly() {
+  for count in client_counts() {
+    let Some(race) = racing(&format!("one-branch-{count}")) else {
+      return;
+    };
+    first_push(&race.git, &race.url);
+    let copies = clones(&race.git, &race.url, "clone", count);
+    let heads: Vec<String> = copies
+      .iter()
+      .enumerate()
+      .map(|(index, copy)| commit_own(&race.git, copy, "same", index))
+      .collect();
+    let jobs: Vec<_> = copies
+      .iter()
+      .map(|copy| (copy.clone(), words(&["push", "-q", "origin", BRANCH])))
+      .collect();
+    let results = at_once(&race.git, &jobs);
+    let won: Vec<usize> = (0..count).filter(|&index| results[index].0 == 0).collect();
+    let unclean: Vec<&(i32, String, String)> = results
+      .iter()
+      .filter(|(code, _, err)| *code != 0 && !refused_cleanly(err))
+      .collect();
+    eprintln!(
+      "{count} pushes to one branch: won {won:?}; refused uncleanly {}",
+      unclean.len()
+    );
+    assert_eq!(
+      won.len(),
+      1,
+      "{count} pushes to one branch: exactly one wins: {results:?}"
+    );
+    assert!(
+      unclean.is_empty(),
+      "{count} pushes to one branch: every loser refused cleanly: {unclean:?}"
+    );
+    let expected =
+      std::collections::BTreeMap::from([(format!("refs/heads/{BRANCH}"), heads[won[0]].clone())]);
+    ends_consistent(
+      &race.git,
+      &race.url,
+      &expected,
+      &format!("one-branch-{count}"),
+    );
+  }
+}
+
+/// What one concurrent reader saw in one pass: whether its clone succeeded, the branches it cloned with their
+/// commits, whether that clone fscked clean, whether its fetch into a standing clone succeeded, and the outputs of
+/// whatever failed.
+struct ReaderPass {
+  cloned: bool,
+  branches: std::collections::BTreeMap<String, String>,
+  fsck_clean: bool,
+  fetched: bool,
+  said: String,
+}
+
+/// Reader `reader`'s passes until `stop`, at least one: a fresh clone of `url` (no checkout), its branches and its
+/// fsck, then a fetch of every branch into the reader's standing clone.
+fn read_until(
+  git: &Git,
+  url: &str,
+  reader: usize,
+  stop: &std::sync::atomic::AtomicBool,
+) -> Vec<ReaderPass> {
+  let standing = git.copy(&format!("reader-{reader}"));
+  git.ok(
+    &git.scratch,
+    &["clone", "-q", "--no-checkout", url, &standing],
+  );
+  let mut passes = Vec::new();
+  for pass in 0.. {
+    let path = git.copy(&format!("reader-{reader}-{pass}"));
+    let (code, _, err) = git.run(&git.scratch, &["clone", "-q", "--no-checkout", url, &path]);
+    let (branches, fsck) = if code == 0 {
+      let branches = refs_under(git, &path, "refs/remotes/origin/", "refs/heads/");
+      (
+        branches,
+        git.run(&path, &["fsck", "--full", "--no-dangling"]),
+      )
+    } else {
+      (
+        std::collections::BTreeMap::new(),
+        (code, String::new(), err.clone()),
+      )
+    };
+    let fetch = git.run(
+      &standing,
+      &[
+        "fetch",
+        "-q",
+        "origin",
+        "+refs/heads/*:refs/remotes/origin/*",
+      ],
+    );
+    passes.push(ReaderPass {
+      cloned: code == 0,
+      branches,
+      fsck_clean: fsck.0 == 0,
+      fetched: fetch.0 == 0,
+      said: format!(
+        "clone: {err}; fsck: {}{}; fetch: {}",
+        fsck.1, fsck.2, fetch.2
+      ),
+    });
+    if stop.load(std::sync::atomic::Ordering::Acquire) {
+      break;
+    }
+  }
+  passes
+}
+
+/// Goal 93's concurrency, distinct branches with readers (a correctness round main runs). Do: for each client count N
+/// [`CONCURRENCY`] names, start an anchor with its HTTP edge and repository [`REPOSITORY`]; push a first commit to
+/// [`BRANCH`]; clone it N times and commit on a branch of its own in each clone; then push all N branches at once while
+/// N / [`CLIENTS_PER_READER`] readers (at least [`LEAST_READERS`]) clone, fsck and fetch in a loop until the pushes
+/// end. Expect every push to land; every reader's clone and fetch to succeed, each clone fsck clean and holding each
+/// branch either not at all or at its pushed commit (never one half-applied); and then every branch served and in
+/// every mirror, each mirror fsck clean and identical ([`ends_consistent`]).
+#[test]
+#[ignore = "goal 93's concurrency round, main's to run: SLATES_GIT_CONCURRENCY=2,10,50 cargo test --release -p slates-cli --test git_interop -- --ignored concurrent_pushes --nocapture"]
+fn concurrent_pushes_to_distinct_branches_all_land_while_readers_see_consistent_refs() {
+  for count in client_counts() {
+    let Some(race) = racing(&format!("branches-{count}")) else {
+      return;
+    };
+    let base = first_push(&race.git, &race.url);
+    let copies = clones(&race.git, &race.url, "clone", count);
+    let mut expected = std::collections::BTreeMap::from([(format!("refs/heads/{BRANCH}"), base)]);
+    for (index, copy) in copies.iter().enumerate() {
+      let branch = format!("refs/heads/b{index}");
+      race.git.ok(copy, &["symbolic-ref", "HEAD", &branch]);
+      expected.insert(branch, commit_own(&race.git, copy, "branch", index));
+    }
+    let jobs: Vec<_> = copies
+      .iter()
+      .enumerate()
+      .map(|(index, copy)| {
+        (
+          copy.clone(),
+          words(&["push", "-q", "origin", &format!("b{index}")]),
+        )
+      })
+      .collect();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let (results, reads) = std::thread::scope(|scope| {
+      let readers: Vec<_> = (0..(count / CLIENTS_PER_READER).max(LEAST_READERS))
+        .map(|reader| {
+          let (git, url, stop) = (&race.git, &race.url, &stop);
+          scope.spawn(move || read_until(git, url, reader, stop))
+        })
+        .collect();
+      let results = at_once(&race.git, &jobs);
+      stop.store(true, std::sync::atomic::Ordering::Release);
+      let reads: Vec<ReaderPass> = readers
+        .into_iter()
+        .flat_map(|reader| reader.join().unwrap())
+        .collect();
+      (results, reads)
+    });
+    let failed: Vec<&(i32, String, String)> =
+      results.iter().filter(|(code, _, _)| *code != 0).collect();
+    eprintln!(
+      "{count} pushes to distinct branches: {} failed; {} reader passes",
+      failed.len(),
+      reads.len()
+    );
+    assert!(
+      failed.is_empty(),
+      "{count} pushes to distinct branches: all land: {failed:?}"
+    );
+    for read in &reads {
+      assert!(
+        read.cloned && read.fetched && read.fsck_clean,
+        "{count} distinct branches: a reader's clone, fsck and fetch succeed: {}",
+        read.said
+      );
+      let torn: Vec<_> = read
+        .branches
+        .iter()
+        .filter(|(name, object)| expected.get(*name) != Some(object))
+        .collect();
+      assert!(
+        torn.is_empty(),
+        "{count} distinct branches: a reader saw each branch absent or at its pushed commit: {torn:?}"
+      );
+    }
+    ends_consistent(
+      &race.git,
+      &race.url,
+      &expected,
+      &format!("branches-{count}"),
+    );
+  }
+}
+
+/// Goal 93's concurrency, tags (a correctness round main runs). Do: for each client count N [`CONCURRENCY`] names,
+/// start an anchor with its HTTP edge and repository [`REPOSITORY`]; push a first commit to [`BRANCH`]; clone it N
+/// times; in each clone make an annotated tag `vI` and a lightweight tag `lI` of its own and push all N clones' tags at
+/// once; then in each clone commit a file of its own, tag that commit `race` (annotated), and push all N `race` tags at
+/// once. Expect every distinct tag to land; exactly one `race` to win and every other to be refused in git's own words
+/// ([`LOST_RACE_WORDS`]: `already exists`, or `failed to update ref` past the advertisement), never a broken server;
+/// and then every tag served and in every mirror, each mirror fsck clean and identical ([`ends_consistent`]).
+#[test]
+#[ignore = "goal 93's concurrency round, main's to run: SLATES_GIT_CONCURRENCY=2,10,50 cargo test --release -p slates-cli --test git_interop -- --ignored concurrent_pushes --nocapture"]
+fn concurrent_pushes_of_tags_land_and_one_raced_tag_name_lands_once() {
+  for count in client_counts() {
+    let Some(race) = racing(&format!("tags-{count}")) else {
+      return;
+    };
+    let base = first_push(&race.git, &race.url);
+    let copies = clones(&race.git, &race.url, "clone", count);
+    let mut expected =
+      std::collections::BTreeMap::from([(format!("refs/heads/{BRANCH}"), base.clone())]);
+    for (index, copy) in copies.iter().enumerate() {
+      let (annotated, light) = (format!("v{index}"), format!("l{index}"));
+      race
+        .git
+        .ok(copy, &["tag", "-a", &annotated, "-m", &annotated]);
+      race.git.ok(copy, &["tag", &light]);
+      expected.insert(
+        format!("refs/tags/{annotated}"),
+        race.git.commit_of(copy, &format!("refs/tags/{annotated}")),
+      );
+      expected.insert(format!("refs/tags/{light}"), base.clone());
+    }
+    let jobs: Vec<_> = copies
+      .iter()
+      .enumerate()
+      .map(|(index, copy)| {
+        let tags = [format!("refs/tags/v{index}"), format!("refs/tags/l{index}")];
+        (
+          copy.clone(),
+          words(&["push", "-q", "origin", &tags[0], &tags[1]]),
+        )
+      })
+      .collect();
+    let results = at_once(&race.git, &jobs);
+    let failed: Vec<&(i32, String, String)> =
+      results.iter().filter(|(code, _, _)| *code != 0).collect();
+    assert!(
+      failed.is_empty(),
+      "{count} pushes of distinct tags: all land: {failed:?}"
+    );
+    let racers: Vec<String> = copies
+      .iter()
+      .enumerate()
+      .map(|(index, copy)| {
+        commit_own(&race.git, copy, "race", index);
+        race.git.ok(copy, &["tag", "-a", "race", "-m", "race"]);
+        race.git.commit_of(copy, "refs/tags/race")
+      })
+      .collect();
+    let jobs: Vec<_> = copies
+      .iter()
+      .map(|copy| {
+        (
+          copy.clone(),
+          words(&["push", "-q", "origin", "refs/tags/race"]),
+        )
+      })
+      .collect();
+    let results = at_once(&race.git, &jobs);
+    let won: Vec<usize> = (0..count).filter(|&index| results[index].0 == 0).collect();
+    let unclean: Vec<&(i32, String, String)> = results
+      .iter()
+      .filter(|(code, _, err)| *code != 0 && !refused_cleanly(err))
+      .collect();
+    eprintln!(
+      "{count} pushes of one tag name: won {won:?}; refused uncleanly {}",
+      unclean.len()
+    );
+    assert_eq!(
+      won.len(),
+      1,
+      "{count} pushes of one tag name: exactly one wins: {results:?}"
+    );
+    assert!(
+      unclean.is_empty(),
+      "{count} pushes of one tag name: every loser refused cleanly: {unclean:?}"
+    );
+    expected.insert("refs/tags/race".to_owned(), racers[won[0]].clone());
+    ends_consistent(&race.git, &race.url, &expected, &format!("tags-{count}"));
+  }
+}
+
 /// Format: the variable naming the repository the whole-repository session carries (a clone of git/git for main's
 /// rounds); unset, the session skips loudly.
 const DATASET: &str = "SLATES_TEST_GIT_DATASET";

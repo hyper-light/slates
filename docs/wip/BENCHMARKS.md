@@ -17879,3 +17879,44 @@ each next step grew to a vector page's batch and ran milliseconds unseen; it is 
 measured step: fixed 709-792 ns, 600-1,600 ns a page at a few pages (noise-dominated), so the floor buys about a page;
 the honest sweep's rate, about 280 K pages a second, is set by the runtime's look for work between idle slices (GAPS).
 The memory report's kinds pass 67 ms after arming in the same run.
+
+
+## Windows timed waits through a high-resolution timer's wait completion packet (84a, A-828; w-k90-win; 2026-11-21)
+
+- **Question.** The IOCP driver's timed wait asked `GetQueuedCompletionStatusEx` for whole milliseconds, so a shard
+  parked to the end of its idle window slept a millisecond or a 15.6 ms tick. Does a high-resolution waitable timer
+  (`CreateWaitableTimerExW`, `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`) whose wait completion packet
+  (`NtAssociateWaitCompletionPacket`) wakes the port, the port's wait untimed (Go's runtime since 1.23), end it at its
+  deadline, and does that move 84a's loaded tails?
+- **Test, red then green** (`driver::tests::a_sub_millisecond_timed_wait_ends_by_its_deadline`, 50 waits of 200 µs, on
+  Windows also judged at the median): without the timer the shortest took 1.53 ms (jupiter), 1.87 ms (windows-latest),
+  2.55 ms (jupiter, earlier); with it all 50 ran in 0.03 s on jupiter, windows-latest and windows-11-arm. On
+  windows-11-arm the old wait's shortest fell under a millisecond by an early tick (50 waits 0.79 s), hence the median.
+  `iocp::tests::a_deadline_armed_for_200_us_posts_its_packet_before_a_millisecond`: the packet in 403.5 µs (jupiter).
+- **Command** (diagnostic runs 44934773181 and 44941791157, branches `diag-measurer-w-k90-win-84a-*`, never main):
+  `edit_merge_bench --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict`, then `--quiet-only`,
+  release, BASE (main without it) and FIX interleaved, 3 rounds each. µs.
+
+| windows-latest, loaded | accept p50 / p99 / p999 | conflict p50 / p99 / p999 |
+|---|---|---|
+| base r1 | 87 / 188 / 32,430 | 109 / 207 / 33,544 |
+| fix r1 | 81 / 156 / 33,210 | 104 / 173 / 33,030 |
+| fix r2 | 81 / 184 / 33,343 | 102 / 178 / 31,858 |
+| base r2 | 81 / 154 / 31,623 | 103 / 173 / 333 |
+| base r3 | 82 / 192 / 29,132 | 102 / 172 / 33,030 |
+| fix r3 | 80 / 212 / 23,915 | 102 / 165 / 3,580 |
+
+| windows-11-arm, loaded | accept p50 / p99 / p999 | conflict p50 / p99 / p999 |
+|---|---|---|
+| base r1 | 152 / 290 / 728 | 149 / 246 / 15,430 |
+| fix r1 | 143 / 288 / 748 | 146 / 261 / 20,552 |
+| fix r2 | 143 / 266 / 866 | 148 / 247 / 33,526 |
+| base r2 | 133 / 305 / 32,026 | 146 / 224 / 24,295 |
+| base r3 | 137 / 282 / 32,962 | 147 / 245 / 23,004 |
+| fix r3 | 144 / 286 / 889 | 141 / 255 / 23,438 |
+
+  Quiet (both runners, both arms): p99 111-264 µs, p999 224-882 µs, unchanged within the rounds' spread.
+- **Verdict: landed** for the wait itself (a deadline is kept to its nanoseconds; p99 under 1 ms loaded and quiet,
+  unchanged). **84a not met on Windows:** the loaded p999 stays at 24-34 ms on windows-latest and in windows-11-arm's
+  conflicts (its accept p999 lost its 32 ms rounds: 3 of 3 under 0.9 ms against 1 of 3). That is the scheduler's 31.6 ms
+  quantum a woken thread waits behind the load's spinners (A-361), which no wait's timer moves; per-wake stamps next.
