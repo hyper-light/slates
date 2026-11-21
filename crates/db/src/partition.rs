@@ -303,6 +303,11 @@ pub struct Partition {
   caps: PartitionCaps,
   volumes: Slab<VolumeRecord>,
   by_id: Art<Handle<VolumeRecord>>,
+  /// How many volumes of each tenant the partition holds (A-802): what a destroy asks before it erases the tenant's
+  /// sealing key, kept with every volume record added and removed (`insert_volume`, `remove_volume`, the only two), so
+  /// derived again on a snapshot's restore. Bounded by the volumes. Before, a destroy collected every volume record to
+  /// ask, so its cost grew with the partition.
+  tenant_volumes: BTreeMap<u64, usize>,
   by_name: Art<Handle<VolumeRecord>>,
   snapshots: Slab<SnapshotRecord>,
   snapshot_index: Art<Handle<SnapshotRecord>>,
@@ -479,6 +484,7 @@ impl Partition {
       caps,
       volumes: Slab::new(caps.segment_slots, caps.volumes),
       by_id: Art::new(),
+      tenant_volumes: BTreeMap::new(),
       by_name: Art::new(),
       snapshots: Slab::new(caps.segment_slots, caps.snapshots),
       snapshot_index: Art::new(),
@@ -897,10 +903,7 @@ impl Partition {
     self.seal_keys.remove(&SealKeyOwner::Lineage { volume: id });
     self.seal_keys.remove(&SealKeyOwner::Naming { volume: id });
     if let Some(account) = tenant
-      && !self
-        .volumes()
-        .iter()
-        .any(|volume| volume.owner.tenant() == account)
+      && !self.tenant_volumes.contains_key(&account)
     {
       self.seal_keys.remove(&SealKeyOwner::Tenant { account });
     }
@@ -2871,8 +2874,11 @@ impl Partition {
     let id = record.id;
     let name = record.name.clone();
     let lease = record.lease.clone();
+    let tenant = record.owner.tenant();
     let h = self.volumes.insert(record)?;
     self.by_id.insert(&id.bytes, h);
+    let held = self.tenant_volumes.entry(tenant).or_insert(0);
+    *held = held.saturating_add(1);
     self.by_name.insert(name.as_bytes(), h);
     if let Some(lease) = lease {
       self.index_lease(id, &lease)?;
@@ -2894,6 +2900,13 @@ impl Partition {
     let h = self.by_id.remove(&id.bytes).ok_or(DbError::NotFound)?;
     let record = self.volumes.remove(h)?;
     self.by_name.remove(record.name.as_bytes());
+    let tenant = record.owner.tenant();
+    match self.tenant_volumes.get_mut(&tenant) {
+      Some(held) if *held > 1 => *held = held.saturating_sub(1),
+      _ => {
+        self.tenant_volumes.remove(&tenant);
+      }
+    }
     if let Some(lease) = &record.lease {
       self.leases_by_holder.remove(&lease.holder.key());
     }

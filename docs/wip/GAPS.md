@@ -432,6 +432,12 @@
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
 >
+> **A-802 (2026-11-21, w-fed-move; goal 86b's throughput, found by injection).** FIXED: a destroy no longer collects
+> every volume record to ask whether its tenant has one left (a per-tenant count, kept with the records). Of the three
+> injections into the 1,000-client stand-in (bases behind, long history, works pinning the floor) the last grew: 10^4
+> idle works cut verdicts to 2,506/s and slowed every answer two to three times. After: 5,956/s, flat in the idle works.
+> Open: a long history doubles the verdict (41 to 90 µs over 10^5 versions); main's r48 confirms on the topology.
+>
 > **A-801 (2026-11-21, w-fed-move; goal 86b's throughput).** BUILT: owner asks counted and answers timed by kind; the
 > load harness prints the server nodes' merge counters. At 1,000 clients in-process: 17.5 asks a client (lengths 44%,
 > files 18%, verdicts 14%, rebases 13%), the owner's answering 185 ms in all: not the wall at that scale. Open: the
@@ -2615,8 +2621,11 @@
 > checkout over the daemon's tunnel of a text neither the green nor the content store holds). ra_svn's `get-file`
 > BUILT the same way (`reads::Progress::Waiting`; the string gathered so far kept across the wait): held by
 > `a_get_file_reads_a_text_ram_does_not_hold_through_the_store` (red without it: "Filesystem is corrupt" after the
-> first response). Owed in (a): DAV GET, file-revs, the exporter, the deltify job; then (b), the records keep history
-> on the store. Stage C,
+> first response). A DAV GET BUILT too: its reply's read of a piece RAM does not hold fetches it and reads again,
+> held by `a_get_reads_a_text_ram_does_not_hold_through_the_store` (red without it: `503`). `get-file-revs` BUILT
+> too (svn:// and DAV): a delta's window that waits keeps its work with the revision's delta and the stream answers the
+> wait, held by `a_get_file_revs_reads_a_text_ram_does_not_hold_through_the_store` (red without it: "Filesystem is
+> corrupt"). Owed in (a): the exporter, the deltify job; then (b), the records keep history on the store. Stage C,
 > an import as one sliced changeset (today a changeset a record); and a submitted version's revision (`svn_made`), which
 > today lands from a task holding the landing turn the submit took, after the submit committed its version, so a crash
 > between leaves the version without its revision. Main's ruling (inbox w-svn-from-main-c2-made): the submit takes the one
