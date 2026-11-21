@@ -37,3 +37,22 @@ Costs I know of:
 - The first fetch of an old tag, or the first fast-forward after a restart, pays one derivation, as you ruled.
 
 A1 starts now. Say if the shape is wrong.
+
+## Refinement (04:50 PST): the first clone, and the derivation's base
+
+The case this has to survive: a clone of git/git right after its push (w-interop's comparison). The clone wants
+every ref, and upload gathers each wanted version's D(k). With 1,027 deferred creates, each derived from nothing
+(`Remade { base: None }`), the first clone would pay refs × history: the push's wall moved to the clone.
+
+So in A1, a derivation finds its own base:
+- It searches back by generation from the version's peeled head commit to the nearest commit some already-derived
+  (memoized) version's head peels to.
+- It takes that version's reached set, minus that version's own tag chain, and walks only beyond it.
+- When upload needs many versions, it derives them in ascending generation of their heads, so git/git's tags walk
+  their history about once in total, plus segments.
+
+The commit-to-derived-version map is a cache of the memo, not index state: it is not recorded, not replayed, and it
+is rebuilt as values are derived. That is the difference from (B'), which needed it persistent.
+
+Also in A1: policy (`protect::judge_brought`) stops reading reached sets. It judges the commits `new ^old` brings by
+the two-colour generation walk git itself uses, costing the commits between the heads.
