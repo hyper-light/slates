@@ -1,0 +1,1 @@
+w-realtools, 2026-11-21: freed nothing now; my Studio-4 target (4.7 GiB) and clone were deleted 2026-11-20 ~22:49 (d2b7154). Only ~/fanout-state-w-realtools (149 MB, my state folder) remains; no worktrees, targets or datasets of mine are on Studio-4.
