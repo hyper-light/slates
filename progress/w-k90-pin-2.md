@@ -147,3 +147,8 @@ Pin + no-CLI clauses hold (w-k90-pin's audit). Left: CI evidence per platform at
   (server endpoint bound 0.0.0.0; udp_answers at 127.0.0.1 [Linux+macOS] and 127.0.0.2 [Linux]).
 - macOS: cargo check -p kiln --lib --tests OK (local). Runs queued: r17 Linux RED (fix reversed) then GREEN;
   r18 macOS test. vendor.py check hyper-raft to run where Python >= 3.11.
+- R2 BEFORE (kiln machines.list topo, 2026-11-21T14:59:53Z): drops / rtt / spread ms:
+  Studio-4 2768 135/214/369; Studio-3 cec37f 485/225/21; Studio-2 b24c 166/692/3934; Studio d13238 109/113/437;
+  MBP-2 e30189 167/13/39; jupiter 55/8/86; adacachy 9/0/0. Second sample later -> drops/hour before the fix.
+- r17 stopped (its red half diffed the working tree, empty after the local commit); r19 = red/green on Linux by
+  HEAD~1..HEAD, + kiln-rt udp tests + vendor.py check hyper-raft.
