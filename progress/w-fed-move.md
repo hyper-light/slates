@@ -1,5 +1,11 @@
 # w-fed-move — progress (relaunched on the Mac Studio 2026-11-19 ~21:35 PST; supervisor slates-7a via kiln)
 
+## 2026-11-21 ~03:15 PST: A-806 LANDED slates main 4c404823 (the 300 MB work log: a work's log is what it wrote)
+- Peak counter merge.work.log_peak_bytes; rebases answer parts over the head; restatements log parts.
+- 1k over asic_reg: 35,249,811 -> 1,957 bytes. Report: inbox/main-from-w-fed-move-worklog.md.
+- (b)'s fix (anchor indirection) handed to w-rewrite-ops by main; my design note is its brief.
+- Sibling: daemon roles test stale since A-774 part 3 (reported, untouched).
+
 ## 2026-11-21 ~02:50 PST: A-803 LANDED slates main 081542c5 ((b) named: the re-anchor walks every value)
 - Counters: merge.reanchor.values_walked, merge.submit.secure. Values per verdict 7.9 -> 231 over 10^5 versions,
   judge 24 -> 71 µs, compose and secure flat. Not the 100k wall (a few values a path there).
