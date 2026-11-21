@@ -111,7 +111,7 @@ fn connect(instance: &str) -> Client {
         // Diagnostic only (g222): the client thread's own EEVDF slice.
         #[cfg(target_os = "linux")]
         if let Some(slice) = std::env::var("G222_CLIENT_SLICE_NS").ok().and_then(|v| v.parse::<u64>().ok()) {
-          slates_rt::g222_set_slice("client", slice);
+          slates_server::g222_diag::set_slice("client", slice);
         }
         return client;
       }
@@ -965,7 +965,7 @@ struct G222Dump;
 impl Drop for G222Dump {
   fn drop(&mut self) {
     #[cfg(target_os = "linux")]
-    eprintln!("g222 slice client at the end: held {:?}", slates_rt::g222_held_slice());
+    eprintln!("g222 slice client at the end: held {:?}", slates_server::g222_diag::held_slice());
     if let Ok(path) = std::env::var("G222_DIAG") {
       slates_server::g222_diag::dump(&path);
       slates_server::g222_diag::dump_ring(&format!("{path}.ring"));

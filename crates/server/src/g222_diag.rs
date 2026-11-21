@@ -146,3 +146,13 @@ pub fn dump_parks(path: &str) {
 pub fn raise_qos() {
   slates_rt::g222_raise_qos();
 }
+
+#[cfg(target_os = "linux")]
+pub fn set_slice(who: &str, slice: u64) {
+  slates_rt::g222_set_slice(who, slice);
+}
+
+#[cfg(target_os = "linux")]
+pub fn held_slice() -> Option<(u32, u64)> {
+  slates_rt::g222_held_slice()
+}
