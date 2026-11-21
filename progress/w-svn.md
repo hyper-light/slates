@@ -312,3 +312,8 @@
   deferred until the made revision lands, no recovery remake -> next piece. Then stage B, stage C.
 - C2 stage B part 1 LANDED 40c3f8d1e (e69375553): texts in the changeset, recovery fetch, barrier gone for svn. P6/P7
   measured (BENCHMARKS). Next: B part 2 (texts read through the owner). Stock legs kiln r2 on mac-studio.local-2; P8 next.
+- 2026-11-21 ~00:50: P6 CLOSED (close note), P8 CLOSED (002a7944f), P7: real-daemon peak measured (8508a8d52: 1,570
+  MiB for a 437 MiB dump, half the segment: green chain carries texts), green-fold rejected (c9f79f925), svnsync
+  measurement landed (1bfe51f88) and running on the big Studio (kiln r10). Stock legs pass on the Studio (r8).
+  Open: C2 B2 (main to decide, inbox stage-b2-value), svn_made (w-work-cow's view), C. B2a wait-path patch kept at
+  ~/.cache/w-svn-b2a-wait.patch.

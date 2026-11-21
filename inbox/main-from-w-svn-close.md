@@ -71,3 +71,11 @@
   yours if you want the stock-client wall.
 - My earlier "not whole" 524 bytes was my script's: the client's closing success sent during the drive (E210004, as
   svnserve answers it).
+
+## P8 CLOSED (2026-11-21 ~00:50 PST): the 500 MB commit, re-measured
+- Commit on origin/main: 002a7944f (BENCHMARKS "A 500 MB Subversion commit, re-measured on the changeset store").
+- Measurement: big Studio, stock svn 1.15, main 73cd23c (C2 stage A + B1), `a_large_commit_measured` release. kiln r9
+  (load 5-9): svn:// Committed revision 1 in 11.2 s, DAV in 13.9 s; daemon peak 4,067 MiB (8x the text; 12x before);
+  longest shard step 1.91 s. kiln r8 (load 8-14): DAV's daemon restarted within that step, E160007.
+- Left, outside svn and recorded in GAPS/BENCHMARKS: the green's apply of the landing in one step (w-engine's 1b),
+  and the text carried twice in the register's log (chain entry and checkpoint, 524 MB each; P7's finding).
