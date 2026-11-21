@@ -6931,3 +6931,7 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 ## 2026-11-20, w-work-mount A-774 part 3 (f401f798c, main 5d29b9572)
 - clippy + xtask over crates/land/src/{engine,manifest}.rs (Landing<'a,'b,H>, Beginning::unit_over/materializing, LandingRun::step_over, PlanWalk basis), crates/vfs/src/base.rs (DivergedWalk.whole), crates/server/src/landing.rs (base_is_target/over_tree), crates/server/tests/green_landing_cow.rs.
 - Suites touched: `cargo test -p slates-land` (whole), `cargo test -p slates-server --test snapshot_landing --test presentations --test write_policy --test signed_work` (landing paths now branch on a tree overlay). Red: any landing refusal or mismatch.
+
+- w-sizing, A-789 (362bd8c39), 2026-11-20: provisioning A/B on a QUIET macOS machine (r26 ran at load 44-79). Release
+  `provision_bench`, A = 1b63ab896 (extents as ranges), B = 3f24e4fea (extents of their own), interleaved, 3 rounds,
+  all N. Red: B's 1-client spinning p99 above A's beyond the rounds' spread.

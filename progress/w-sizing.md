@@ -80,6 +80,13 @@
 - g226's Linux/Windows give-back numbers: inbox/w-sizing-from-g226-giveback.md. Linux: one memfd + punch (keep);
   Windows: section per extent (decommit refused, discard per process, commit only back at close). Asked g226 to land
   them in BENCHMARKS as "Content give-back per platform"; told g226 its status residency reads 0 on macOS.
+- A-789 LANDED main 362bd8c39 (merge 4e461fd36): macOS extents as own objects. Provision A/B r26 (big Studio, load
+  44-79): p50 equal, p99 not worse; quiet rerun in run-requests.md. Branch agents/w-sizing-extents deleted; worktree
+  w-sizing-a778 removed; now ~/slates-work/w-sizing-a789 (landed, removable).
+- Flaky, not mine: mem arena::tests::a_purged_block_leaves_the_footprint_and_is_cleared_before_reuse failed once in a
+  parallel run on pressured Studio-4 (footprint 69,812,680 -> 69,632,408), passes alone.
+- NEXT (extents): Windows section per extent (g226: only a closed section returns commit); the content object's arena
+  address-space range (layout); the 5x process RSS over a burst (1,362 MiB for 256 MiB, r21) -- find what holds it.
 - Then item 2 (if prefault pays: EWMA of pages turns touch) or remove; item 3 reserve_per_shard work-derived + pressure.
 - Disk here 14 GiB free (others' caches; mine 2.5 GB).
 
