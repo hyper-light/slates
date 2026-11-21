@@ -31,6 +31,9 @@ const ADMISSION: Admission = Admission {
   buffer_bytes: 1 << 20,
 };
 
+/// Shape: the owner of the view's root, a user other than root, whom every entry must be owned by.
+const OWNER: (u32, u32) = (501, 20);
+
 /// Shape: the bytes a read asks for at once: prime, so reads start and end inside pieces.
 const READ_BYTES: usize = 1021;
 
@@ -72,17 +75,23 @@ fn volume() -> (Store, Volume) {
     arena,
     0,
   );
-  let volume = Volume::create(
+  let mut volume = Volume::create(
     &mut store,
     VolumeConfig {
       prefix: 7,
       names: NameEquivalence::Exact,
-      quota: Quota::Bounded { limit: 1 << 28 },
+      quota: Quota::Bounded { limit: 0 },
       journal_bytes: 1 << 20,
       clock: Box::new(StepClock::new(0, 1_000)),
     },
   )
   .unwrap();
+  // As the daemon makes a view: a ceiling of nothing, its allowances only what the empty volume holds; the presenter
+  // sizes it to the view's content as it writes (w-interop's matrix met `Volume(NoSpace)` before it did).
+  let (inodes, _) = volume.inode_usage();
+  volume.set_inode_allowance(inodes).unwrap();
+  let (entries, _) = volume.entry_usage();
+  volume.set_entry_allowance(entries.max(1)).unwrap();
   (store, volume)
 }
 
@@ -144,8 +153,8 @@ fn fixed_files_read_back(
   }
 }
 
-/// Revision `revision`'s files read back through the view: its revision file the bytes `fsfs` makes for it and
-/// refused a write (`EROFS`), its properties file `fsfs`'s. The revision file's bytes read.
+/// Revision `revision`'s files read back through the view: its revision file the bytes `fsfs` makes for it, refused a
+/// write (`EROFS`) and owned by the view root's owner, readable by all (`0444`), its properties file `fsfs`'s. The revision file's bytes read.
 fn revision_reads_back(
   (volume, store, root): (&mut Volume, &mut Store, InodeNo),
   (view, source, texts): (&View, &SvnView<'_>, &ViewTexts<'_>),
@@ -159,6 +168,12 @@ fn revision_reads_back(
     at = volume.lookup_no(store, at, name).unwrap().inode;
   }
   assert_eq!(volume.write(store, at, 0, b"x"), Err(VfsError::ReadOnly));
+  let attrs = volume.stat(store, at).unwrap();
+  assert_eq!(
+    (attrs.uid, attrs.gid, attrs.mode & 0o777),
+    (OWNER.0, OWNER.1, 0o444),
+    "{path}"
+  );
   let path = fsfs::revision_properties_path(revision);
   assert_eq!(
     read_path(volume, store, root, &path, texts),
@@ -171,7 +186,8 @@ fn revision_reads_back(
 /// A-645 P3. Do: present the golden repository's view into a volume a node-revision a call (the smallest budget);
 /// then read every file through the view's text seam. Expect: every revision file, every revision properties file and
 /// every fixed file the bytes `slates_svn::fsfs` makes for them; `db/current` naming the youngest; each revision file
-/// a referenced file the volume refuses to change (`EROFS`); and the reads' counts covering every byte read.
+/// a referenced file the volume refuses to change (`EROFS`), owned by the root's owner and readable by all (`0444`);
+/// and the reads' counts covering every byte read.
 #[test]
 fn the_presented_volume_holds_the_fsfs_view_byte_for_byte() {
   let records = imported(FULL);
@@ -186,6 +202,7 @@ fn the_presented_volume_holds_the_fsfs_view_byte_for_byte() {
   };
   let (mut store, mut volume) = volume();
   let root = volume.root_inode(&store).unwrap();
+  volume.chown(&mut store, root, OWNER.0, OWNER.1).unwrap();
   let mut presented = Presented::new();
   let mut holds = ViewHolds {
     store: None,
