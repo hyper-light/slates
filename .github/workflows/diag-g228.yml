@@ -39,6 +39,10 @@ jobs:
               if m.get("reason")=="compiler-artifact" and m.get("executable") and m["target"]["name"]=="live_fleet": print(m["executable"])' | tail -1)
             echo "$arm $b"; echo "$arm=$b" >> ../bins
           done
+          # The transport reference on the same runner: the bare live ship over real endpoints (no daemon), from the first arm.
+          first=$(echo $ARMS | cut -d' ' -f1); first=${first%%:*}
+          (cd "../arm-$first" && CARGO_TARGET_DIR="../t-$first" cargo build --release -p slates-cluster --example replication_bench 2>&1 | tail -1)
+          bench="../t-$first/release/examples/replication_bench"
           cat > ../counters.py <<'PY'
           import sys,re,json
           t=open(sys.argv[1]).read()
@@ -60,6 +64,8 @@ jobs:
           PY
           for r in $(seq 1 "$ROUNDS"); do
             order=$(cut -d= -f1 ../bins | tr '\n' ' '); [ $((r % 2)) -eq 0 ] && order=$(echo $order | tr ' ' '\n' | tac | tr '\n' ' ')
+            echo "== round $r transport reference load $(cut -d' ' -f1-3 /proc/loadavg)"
+            "$bench" 1000 0 2>&1 | grep -i "live ship" || echo "transport bench gave no live ship row"
             for arm in $order; do
               b=$(grep "^$arm=" ../bins | cut -d= -f2-)
               for t in $TESTS; do
