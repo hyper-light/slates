@@ -9528,7 +9528,7 @@ it builds against the contract and adds to it rather than around it.
 > **`CONTRACT` = 46 (A-524):** an S3 base is named by the library: `S3Base`, the endpoint (`https`, or plain `http`
 > to loopback alone), the region, the bucket by S3's naming rules, the prefix by the keys' rules, and the addressing,
 > each refused by its kind (§4.15's S3 base). A base whose fetch is outstanding answers `Pending` through the host
-> seam, and the wire's `Unpublished` until the server parks it (A-555).
+> seam, and the wire's `Unpublished` until the server parks it (A-555). Removed by `CONTRACT` = 58 (A-795).
 > **`CONTRACT` = 47 (A-520, second piece):** the container handoff's other two steps are library calls, which the
 > command line now makes: `container_engine::engine_profile(runtime)` asks the runtime's engine for its profile,
 > bounded as the command line asked it, and judges it, answering an `EngineProfile` or an `EngineFault` (the judge's
@@ -10385,248 +10385,12 @@ coverage, dependencies, bytes read/retained and elapsed cost.
 > exactly the head it hands over, so the rebuild is that head and is marked as a seal's is; a takeover after an
 > owner's loss still marks nothing it rebuilt from a log, which may have run past the seal its head names.
 
-**An S3 base (A-464, designed 2026-11-18; Mantle's CP-T10.5).** An overlay's base may be the objects under a prefix
-of an S3 bucket instead of a host directory: kiln keeps its bytes on Mantle, Mantle keeps them in S3-compatible object
-stores, and an agent's workspace over such a tree needs no copy of it on the runner's disk. The base is read-only,
-live, and judged as a host directory's base is; a landing never writes S3 (a landing's target is a host directory
-under a grant, as ever). Part 1, this design and its pure core, is built; the network client (part 2) and the base
-host with its simulated oracle (part 3) follow, each its own piece (GAPS A-464).
-
-*Sources* (primary, fetched 2026-11-18; tier B): S3's API reference for `ListObjectsV2`, `GetObject`, `HeadObject` and
-the `Object` type (`docs.aws.amazon.com/AmazonS3/latest/API/API_<Action>.html`); S3's user guide for object keys
-(`userguide/object-keys`) and its consistency model (`userguide/Welcome`, "Amazon S3 data consistency model"); S3's
-SigV4 page (`developerguide/sig-v4-header-based-auth`, with its four worked examples) and IAM's
-(`IAM/latest/UserGuide/reference_sigv-create-signed-request`). AWS's SDK behaviour is tier C and flagged where used.
-
-*What S3 promises, and what the base takes from it.*
-- **Listing.** `ListObjectsV2` (`GET /?list-type=2`) returns up to 1,000 entries a page (`max-keys`' ceiling and
-  default). With `delimiter=/` and a directory's prefix, a page's `Contents` are the files directly in that directory
-  and its `CommonPrefixes` its subdirectories, which is the host's `list(dir)` exactly, so a directory is listed when it
-  is first looked up, never the whole bucket at creation (§4.15 "Live source": a live overlay identifies its source
-  without walking it). A page with `IsTruncated` true names a `NextContinuationToken`, which the next request sends as
-  `continuation-token` until a page is not truncated. Keys are asked `encoding-type=url`, since XML 1.0 cannot carry
-  every character a key may hold (the API reference's own reason), and decoded as form values (`+` a space: AWS's SDKs
-  decode so, botocore's `unquote_plus`, tier C). Keys come in UTF-8 binary order.
-- **Reading.** `GetObject` with `Range: bytes=first-last` answers `206` with the bytes and `Content-Range`; S3 serves
-  one range a request. `If-Match: <ETag>` answers `412 Precondition Failed` when the object's ETag is another, and
-  `versionId` names one version of a versioned bucket. `HeadObject` answers the size, the ETag, `Last-Modified` and
-  `x-amz-version-id` without the bytes. A key that does not exist answers `404` (`NoSuchKey`).
-- **Identity.** "The ETag reflects changes only to the contents of an object, not its metadata", and may or may not be
-  an MD5 digest (the `Object` type), so the base treats it as opaque: equal ETags mean equal content, a changed ETag a
-  replaced object. `LastModified` is "the creation date of the object": an object is never changed in place, only
-  replaced whole ("updates to a single key are atomic", the consistency model).
-- **Consistency.** S3 gives "strong read-after-write consistency for PUT and DELETE requests", listings included: a
-  read or a listing after a successful write sees it.
-- **Keys.** A key is up to 1,024 bytes of UTF-8, case-sensitive, and may hold `.` and `..` segments, which S3 itself
-  warns are resolved differently by different tools (the object key guide).
-
-*The base plane's promise over S3.*
-- **Read-only.** The base host reads (list, head, get); nothing in it can put or delete an object.
-- **A key is a path or is refused.** The keys under the base's prefix are mapped to a POSIX tree by `/`
-  (`slates_base::s3::keys`): a key ending in `/` is a directory of its own and the prefix's own key the root's; a key
-  with an empty, `.` or `..` component, a NUL, a component past `NAME_MAX` or a length past S3's 1,024 bytes is refused
-  by its kind; a file whose path a directory takes (the key `a` beside `a/b`, which S3 allows and a tree cannot) is
-  refused `Shadowed`, the directory standing, whichever was listed first. A refused key is counted and named in the
-  base's report, never dropped in silence, never renamed into another path, so no key leaves the base or aliases
-  another.
-- **An outsider's change is seen as on a disk.** An untouched base file is bound to the object it was made from (A-151):
-  its fingerprint carries the base's identity (`dev`), the inode number the base plane gives the key, the size,
-  `Last-Modified` as its times, and the object's identity as its birth (its version id where the bucket is versioned,
-  else its ETag), so a replaced object is a new file, as a replaced disk file is, and its inode is never refreshed onto
-  the new bytes. Every ranged read of a base file carries `If-Match` with the ETag it was made from (or names its
-  version), so a replacement between reads answers `412` and never mixes two objects' bytes in one file: the 412 is the
-  base plane's drift, adopted as A-151 adopts a replaced file, and adopting it marks every copy a client maps stale
-  (A-163: every way the served bytes change without a write must reach the copy). A relist of a directory (on its next
-  lookup, as the host's fingerprint of a directory decides) finds new and deleted keys. A deleted object is a missing
-  base entry: absent from its listing, `404` on a read, as a deleted disk file is `ENOENT`.
-- **Pinning and capture.** `pin` and `capture_base` work as over a directory: a captured file's witness is the BLAKE3 of
-  the bytes read under one ETag, so a capture is consistent per object; across objects it is as a directory's, the
-  caller's quiescence (`capture_base`).
-
-*Signing.* Every request is signed with AWS Signature Version 4 (`slates_base::s3::sigv4`): the canonical request
-(the method; the key's path encoded once and never normalized, `/` kept; the query's names and values encoded and
-sorted; the headers lower-cased, trimmed, their runs of spaces made one, sorted; the names signed; the payload's
-SHA-256), the string to sign (the algorithm, the time, the scope `YYYYMMDD/region/s3/aws4_request`, the canonical
-request's SHA-256), the HMAC-SHA256 key chain and the signature, held to the S3 page's four worked examples as golden
-vectors. A temporary credential's session token rides `x-amz-security-token` and is signed with the rest. SHA-256 and
-HMAC are aws-lc-rs's, the workspace's one cryptographic library.
-
-*Credentials.* They come only from where Mantle hands them, through kiln and the library, at the volume's creation and
-again when they are rotated. They are held in RAM by the volume's owner shard and, across a daemon's restart, by the
-anchor as it holds the launcher's secret: never in a catalog or completion record, an audit record, a log line or a
-core dump (the roles exclude themselves from dumps), never on disk. A credential's `Debug` shows its access key id
-alone. An expired or refused credential (`403`) makes base reads refuse typed until a fresh one is handed; the
-overlay's own entries are served meanwhile.
-
-*Runtime and network (D-9, R6).* No external runtime: the S3 client is a task of the volume's owner shard on slates'
-runtime, over its TCP and TLS (rustls over aws-lc-rs, as the transport's handshake), the server's certificate verified
-against the platform's trust roots, an endpoint over plain HTTP allowed only on loopback for a test's store. HTTP/1.1
-is slates' own bounded codec, a response's head and body each checked against their caps before they are held. It
-lives in the base crate, which the lint wall lets read the network and links no write call. The `HostFs` seam is
-synchronous; the S3 host answers it from a RAM cache of listings and fetched ranges, and a miss is a typed pending
-answer on which the request is parked and run again when its fetch lands, by the deferred replies the image verbs and
-the direct map already use (part 3, with its oracle).
-
-*Bounds, each derived (R3).*
-- A listing page is refused past `page_cap(max_keys)` before it is parsed: each entry a key at its longest encoding
-  (1,024 bytes × 3) and an entry's markup, the page's own markup and its long fields (`slates_base::s3::list`), 4.9 MiB
-  for a thousand keys.
-- A range is the volume's chunk (the copy-on-write unit, §4.5), so a fetched range lands as one window; read-ahead is
-  the measured bandwidth-delay product, as the transport's windows are (part 2 measures it).
-- The cache of fetched ranges and listings is RAM the shard holds and is charged and shed as content is, under the
-  shard's admittable room.
-- A retry follows only S3's retryable answers (`500`, `503` `SlowDown`), with jittered exponential backoff, within the
-  liveness budget (`LIVENESS_BUDGET_NS`); past it the read is refused `BaseUnavailable`, and every other answer is typed
-  at once (`404` missing, `403` denied, `412` drift).
-- Connections are at most one per fetch in flight on the shard, and fetches at most the shard's parked requests.
-
-*Laptop ≡ fleet (R8).* One code path. The base's identity (endpoint, region, bucket, prefix, addressing style) is in
-the volume's catalog record and travels with it; a credential never does: each node holds the one its own hand-off
-gave it, kiln handing it to every runner that may own the volume. A node that holds none serves the overlay's own
-entries and refuses base reads typed. The N=1 differential covers the S3 host through its simulated store (part 3:
-`SimS3`, an in-RAM bucket with an outsider's put and delete and a controllable clock, as `SimHost` is a directory's).
-
-*Nothing is written to disk (R1).* No cache file, no temporary file, no credential file; TLS session state is RAM.
-
-> **Status (2026-11-18, A-464 part 1: the design and its pure core).** Built in `crates/base/src/s3` (cfg-free, no I/O):
-> `sigv4` (the signing, held to the S3 page's four worked examples, IAM's header rules, `UriEncode`'s classes, a session
-> token signed and never shown, a malformed time or region refused), `list` (a `ListObjectsV2` page: the API reference's
-> sample pages, an encoded truncated page, and every hostile shape refused by its kind: past its cap, not UTF-8, a
-> document type, a comment, CDATA, a stray processing instruction, nesting past the syntax, a foreign root, mismatched
-> tags, text outside the root, bad entities, bad numbers, a missing or doubled field, too many entries, a truncated page
-> without its token, a bad encoding; cut short anywhere it is refused; any bytes, never a panic) and `keys` (the tree
-> and one directory's delimited listing: escapes, aliases, a NUL, long names and keys, outsiders and shadowed files
-> refused by kind, whatever the order). Owed: part 2, the network client over the shard's runtime (TCP, TLS, HTTP/1.1,
-> the retry and the measured read-ahead) with its real-store run against a local S3-compatible store; part 3, the
-> `HostFs` implementation, its parked misses and `SimS3`, its oracle, and the library's way to name an S3 base and hand
-> its credential.
-
-> **Status (2026-11-18, A-471 part 2: the network client).** Built in `crates/base/src/s3` on the runtime's own TCP and
-> timers, rustls over aws-lc-rs, and slates' own HTTP/1.1:
-> - `client`: `HeadObject`, ranged `GetObject` bound by `If-Match` (or a version id) and `ListObjectsV2` pages, each
->   signed by `sigv4`, one request at a time on a kept-alive connection. Every answer is typed: `412` on a bound read
->   is `Changed`; `404` `Missing`; `403` `Denied` with S3's code; `400 ExpiredToken` `CredentialExpired`; `416`
->   `RangeNotSatisfiable`; a range or a head other than asked a `Mismatch`, never data; `503 SlowDown`, `503` and `500`
->   retried, then `SlowDown` or `Unavailable` past the ceiling.
-> - `http`: a request's head refused past its cap or with a line break in any field (an ETag decoded from a hostile
->   listing could carry one); a response read as its bytes arrive, its head past its cap refused, its body by length or
->   chunks refused past what the request asked or an error document may hold, before the excess is held; both framings
->   at once (the smuggling shape), another coding, no framing, interim statuses and the invalid ones below them (RFC
->   9110 §15), folded or malformed fields refused.
-> - `wait`: each request's bound is the path's measured round trips (RFC 9002's estimator, to the response's head)
->   plus the caller's liveness window, doubled per request that ran out (Karn's rule, RFC 6298 §5.5) to the caller's
->   ceiling; a retry S3 asks for pauses with full jitter up to the tail doubled per retry, within the ceiling (AWS's
->   advice for `SlowDown`).
-> - `tls`: the server's certificate verified against the authorities the endpoint names; plain HTTP refused off
->   loopback.
->
-> Owed: the platform's trust roots for an endpoint on the public internet (part 3 chooses their source: compiled-in
-> roots or the operating system's store); name resolution (the caller resolves the endpoint's address; the runtime has
-> no resolver); a live run against a real S3-compatible store, which also reads the longest continuation token a
-> listing names (`Counts::longest_token`) against the caps' assumption that none is longer than an encoded key.
-
-> **Status (2026-11-19, A-524 part 3: the base's host, its oracle and its name).** Built in `crates/base/src/s3`:
-> - `host`: `S3Host`, the read-only host seam answered from the base's objects, sans-io. A miss answers
->   `HostError::Pending` (new in the seam; `VfsError::BasePending` in the volume core; `Refusal::Unpublished`, retryable
->   under the same id, on the wire) and names its fetch (`next_fetch`); the driver hands the store's answer back
->   (`landed`) and the parked call, asked again, is answered from it; one fetch however many calls miss on it. A
->   directory is its delimited listing, every page of it; a listing serves for one round trip of the path from its
->   landing (RFC 9002's estimator over the fetches' own round trips), and a call after that is answered from it while
->   the directory is listed again, the next call seeing the change with the directory's fingerprint moved (its entries'
->   count as its size, its newest `LastModified` as its modification, when the host saw its entries change as its
->   change). A file is bound to its object by `If-Match` and, once the store names it, its version: on a versioned
->   bucket a replaced object's handle reads its own version, as a disk's open descriptor reads its inode; elsewhere a
->   `412` (or `404`) makes the handle stale and its directory listed again. Ranges are the volume's chunks, fetched as
->   a run from the first a read misses and cached with the listings within the caller's budget, the least recently
->   used shed first; a listing larger than the whole budget is refused `ENOMEM`. A refusal answers the calls of one
->   round trip (`EACCES` for a refused or expired credential, `NotFound` for a missing bucket, `EIO` for the rest).
-> - `sim`: `SimS3`, the oracle: versioned and unversioned buckets, an outsider's puts and deletes, delimited listings
->   paged with opaque tokens (a forged one refused `400`), reads bound by `If-Match` or a version answering `412`,
->   `404 NoSuchKey` or `NoSuchVersion`, `416`, and a refused or expired credential, each as S3's reference states it.
-> - `name`: `S3Base`, the library's naming of a base (exported by `slates-api`, contract 46): the endpoint
->   (`https`, or plain `http` to loopback alone), the region, the bucket by S3's naming rules, the prefix by the keys'
->   rules, and the addressing (a dotted bucket refused virtual-hosted over HTTPS), each refused by its kind; its
->   identity, a digest of the endpoint's host and port, the bucket and the prefix, is the device of every fingerprint.
-> - `fetch`: the host's requests and the store's answers, run through A-471's client; `time`: the calendar the
->   signing timestamp is written in and `LastModified` read in.
->
-> Owed (GAPS A-464): the volume over an S3 base. The wire's create naming a base and the credential's hand-off (held in
-> RAM by the owner shard and by the anchor across a restart); the shard's driver running the host's fetches on the
-> client; the server parking a request on `BasePending` and running it again when its fetch lands, for every bridge
-> (until then a bridge answers it by its catch-all, FUSE `EIO` and NFS `NFS3ERR_SERVERFAULT`, though no volume over an
-> S3 base can be made before the parking lands); the base plane's call sites audited for a pending answer, since some
-> take a host refusal for an absence; recovery over an S3 base; the read-ahead from the
-> measured bandwidth-delay product; the platform's trust roots and name resolution; and the N=1 differential through
-> `SimS3`.
-
-> **Status (2026-11-19, A-555: a request waits for the fetch it met).** Built:
-> - The pending answer names its fetch: `HostError::Pending(FetchId)` and `VfsError::BasePending(FetchId)`. `S3Host`
->   names one fetch for a directory's listing (every page of it) and one for each run of a file's chunks; a call that
->   misses on what is under way is answered under that fetch's name, and `S3Host::landed` says which fetch a landing
->   settled.
-> - The shard's base waits (`crates/server/src/base_wait.rs`): a request whose host call met a pending fetch, noted
->   where the slot's host is lent to it (`Lens`), parks on its volume and that fetch; the fetch's landing
->   (`base_wait::land`, the fetch driver's entry) wakes those requests alone, and each runs again from its start, since
->   a pending answer changed nothing. The waits are bounded by the shard's client credit (`clients_per_shard × slots`,
->   the bound the lease waiters and the told replies keep): a request past it is answered its pending refusal at once,
->   counted `base.wait.full`. A request waits at most the failover delay in all, the most a reply is held, then is
->   answered the same, counted `base.wait.overdue`; `base.wait.parked` and `base.wait.landed` are the non-vacuity counts.
-> - The hold: what a fetch lands is never shed while requests are parked on it (`S3Host::hold_for_waiters` at a
->   request's parking, `S3Host::release_held` at the last one's leaving), so a woken request finds what it waited for
->   whatever lands meanwhile; a landing the unheld cache cannot make room for is not kept (`HostCounts::unkept`), and
->   its own requests fetch it again once they run. This closes A-524's owed hold (GAPS A-464).
-> - NFS: a call answered `NFS3ERR_JUKEBOX` after it met a pending base waits on its volume's owner shard and is served
->   again (`nfs::serve_local_fetched`, for a local call and a forwarded one alike). The bridges answer a request that
->   could not wait with the retry: FUSE `EAGAIN`, NFS `NFS3ERR_JUKEBOX` (NFSv4 `NFS4ERR_DELAY`), never `EIO` or a server
->   fault.
-> - A slot's base host is one `BaseHost` (`crates/base/src/base_host.rs`): a host directory or an S3 base. A landing
->   writes a host directory only; an overlay over an S3 base keeps its host in its slot and a landing into its base is
->   refused `BaseUnavailable`.
->
-> Owed (GAPS A-464): parking a FUSE request (Linux: the request held off the device and dispatched again when its
-> fetch lands; it is answered `EAGAIN` until then); WinFsp's answer (its catch-all today), the Shards streams, slates'
-> own virtio-fs device and the typed channel's verbs (answered `Unpublished`, retryable); and the volume over an S3 base
-> (the wire's create, the credential's hand-off, the fetch driver), with the rest of A-524's owed list.
-
-> **Status (2026-11-19, A-555's second piece: the fetch driver).** Built: `slates_base::s3::driver::drive`, the task of
-> the volume's owner shard that runs its host's fetches against the store one at a time and hands each answer back,
-> timed, so the requests parked on a fetch are woken when it lands. An idle driver waits on the host itself
-> (`S3Host::next_fetch_or_wait`), which wakes it the moment a miss wants a fetch; a host dropped wakes its driver, which
-> ends, so the driver lives exactly as long as its host and needs no other owner. It is the same code over any store
-> (`s3::fetch::Store`: the network client, or `SimS3` in a test) and any home of the host (`HostCell`: the shard's
-> volume slot in the daemon, `crates/server/src/base_wait.rs`'s `spawn_driver`, whose answers go to `base_wait::land`).
-> Owed: its start where a volume over an S3 base is made or recovered (the wire's create, A-555's next piece), and
-> fetches side by side within the requests that wait on them, which a measurement decides.
-
-> **Status (2026-11-19, A-555's third piece: a FUSE request kept while its base fetches; Linux).** Written, not yet
-> compiled (Linux-only, filed for main's build): a FUSE request answered the retry because a base host call of it met a
-> fetch under way (`EAGAIN` with the fetch the mount's lens noted) is kept rather than answered (`crate::fuse`'s `keep`):
-> a task of the shard waits for that fetch (`base_wait::wait`, the failover delay from its first wait, the shard's base
-> waits' bound) and hands the request back to its mount, which dispatches it again before reading the device
-> (`slates_bridge_fuse::channel::dispatch_kept`), the kernel's other requests served meanwhile, since FUSE answers each by
-> its own `unique`. A request still pending past its deadline, or past the bound, is answered the retry, as are those
-> whose task cannot be spawned. The unit test (`a_kept_request_is_dispatched_again_before_the_device_is_read`) holds a
-> mount over a socket pair on an audit shard and expects a kept request answered before the device's.
-
-> **Status (2026-11-20, A-791: a volume over an S3 base made through the wire).** Built: `CreateOverS3` (appended to
-> the wire's requests) names the base (`S3BaseSpec`: the endpoint, region, bucket, prefix, addressing and the
-> authorities for TLS) and hands the credential its fetches are signed with (`S3Credential`, whose `Debug` names the
-> access key alone); the client's `create_over_s3` sends it. The volume's owner shard makes the overlay over an
-> `S3Host` of the base (`verbs::open_s3_base`: the root's facts need no fetch; the host's cache is the volume's byte
-> bound within what the shard could admit, refused `BudgetExceeded` below one chunk), puts the host in the slot
-> (`BaseHost::S3`), and starts the base's fetch driver over the store client (`verbs::s3_client_of`, `base_wait::
-> spawn_driver`) before the volume is published, so a full task arena refuses the create `Overloaded` with nothing
-> made. The client's requests may be as late as the daemon's liveness window and never take longer in all than the
-> shard's failover delay, the longest a parked request waits. The catalog records the base alone
-> (`BaseRecord::S3`, appended); the credential is held in RAM by the owner shard and never written (R1). A recovery
-> over an S3 base holds the volume unavailable (`BaseUnavailable`, naming the base) until the credential is handed
-> again, and a clone of such an overlay is refused `BaseUnavailable`: the host's fetch state and its credential are
-> not duplicated. An image of the volume records each listed directory by its identity (`HostFs::identify_dir`: the
-> device, number and birth a recovery holds it to), which an S3 base answers with no fetch; it recorded the whole
-> fingerprint, whose listing had not landed, so every create over an S3 base was skipped by the shard's publication
-> (`EAGAIN`) and answered `ContentUnavailable`. A host directory's identity is its fingerprint, as before. Owed: the anchor's hold of the credential across a daemon restart and the recovery that uses it;
-> name resolution (a host that is not an IPv4 address is refused `BaseUnavailable`) and the platform's trust roots
-> (the caller hands the authorities); the library's `VolumeSpec` over an S3 base.
+**An S3 base: removed (A-795, 2026-11-20).** An overlay's base could once be the objects under a prefix of an S3
+bucket (A-464, A-471, A-524, A-555, A-791; Mantle's CP-T10.5). Ada never asked for it ("she said NFS"), so it is
+removed whole, with no flag and nothing kept: an overlay's base is a host directory or a green's tree (A-774), and
+neither ever answers a read pending, so no request is parked on a base. The wire's tags it took stay published and
+are never reused: `RequestBody` 97 (`CreateOverS3`) is refused `Unsupported` by kind, no daemon sends `ImportFault` 7
+(`Pending`), and a catalog's `BaseRecord` 3 (`S3`) is refused at a clone and holds a recovery `BaseUnavailable`.
 
 A verified content digest xattr, if exported, names exactly the current immutable file bytes.
 It is invalidated before any mutation and absent while content is unsealed or unverified;
@@ -14634,11 +14398,10 @@ signature verification).
 > **Status (2026-11-19, A-649 part 4: the server's adapter from the base's host seam).** `slates-server`'s `hg_base`
 > answers the import's seam from §4.15's base plane (`HostFs`): `.hg` opened under the repository's directory and each
 > name under the one before it, never a path string; a name the host does not find is a file that is not there, every
-> other refusal carried through typed (an S3 base's pending fetch among them), and a name that is not UTF-8 refused by
+> other refusal carried through typed, and a name that is not UTF-8 refused by
 > kind before the host is asked. A file is opened once a lend and read within its length when it was opened, each read
 > charged what the file holds before a byte is held; a host's short answer is read on from where it stopped and its
-> refusal carried through, never taken for the file's end (an S3 base answers from the chunks it has cached, then
-> names the fetch it waits on); at most the last file's directory and a revlog's two files are held whatever a path's
+> refusal carried through, never taken for the file's end; at most the last file's directory and a revlog's two files are held whatever a path's
 > depth, and everything a lend opened is closed when the lend ends, so the host can be lent a turn at a time. Proven
 > by two stores 7.2 kept (`states`, with its phases, bookmarks and markers, and the file index store, eight
 > directories deep) imported through the simulated host equal to the same files read from memory, each file opened
@@ -16179,7 +15942,7 @@ for Subversion.)
   `X-SVN-VR-Base` answered as an svndiff; PROPFIND and PROPPATCH; the REPORTs; POST to open a transaction; PUT, MKCOL,
   COPY and DELETE against it with `X-SVN-Version-Name` for the out-of-date test; MERGE; LOCK and UNLOCK. DeltaV's
   version-1 resources for older clients follow it as their own piece. HTTP/1.1 with keep-alive and pipelining; XML
-  bodies parsed with every cap checked before anything is held, as A-464's listing parser does; TLS through rustls over
+  bodies parsed with every cap checked before anything is held; TLS through rustls over
   aws-lc-rs, the workspace's one cryptographic library. Responses use svndiff 2 for a client that lists it in
   `Accept-Encoding`, else 0; slates never advertises `svndiff1`, so no client sends it in a PUT (notes §3).
 - **svndiff** (built here, `slates-svn`): versions 0 and 2 (version 1 is refused, never having been offered).
@@ -16303,7 +16066,7 @@ commit's release runs are logged and never told, as `svnserve` drops them.
 `CRAM-MD5` and, through the tunnel, `EXTERNAL`; over `https://` a TLS client certificate or Basic credentials inside
 TLS; over `svn+ssh://` the SSH login. `CRAM-MD5` needs the server to hold the shared secret or its keyed-MD5
 "contexts", which "must both be protected" alike (RFC 2195 §2 and §4), so slates holds the contexts, never the
-cleartext, as §4.15's S3 credentials are held: in RAM on the owner and the anchor, never on disk. The exchange is
+cleartext: in RAM on the owner and the anchor, never on disk. The exchange is
 `svnserve`'s (`serve.c` `construct_server_baton`, `auth`; `cram.c`; built, A-599), stricter on three inputs no stock
 client sends: a CRAM-MD5 response holding a NUL is malformed, as `cram.c` finds every such response; an `EXTERNAL`
 token is compared whole, where `strcmp` stops at a NUL; and a list deeper than the handshake's prototypes is refused at
@@ -38049,6 +37812,9 @@ Applied in the same change to: §4.14 (a status block on `daemon.alive`), GAPS (
 `crates/api/src/role/anchor.rs`.
 
 ### A-464 — An overlay's base read from S3 objects: the design and its pure core (2026-11-18, goal g268; Mantle's CP-T10.5; §4.15 "An S3 base"; §4.9 hostile input; D-9, R1, R3, R6, R8; A-151, A-163)
+> **Removed (A-795, 2026-11-20).** The S3 base this entry built is removed whole (Ada: never asked for; she said
+> NFS); the entry stays as history, and its code, tests and wire use are gone (its tags reserved).
+
 Applied in the same change to: §4.15 (the subsection "An S3 base" and its status); `crates/base` (the module `s3`:
 `sigv4`, `list` and `keys`, each with its tests; `aws-lc-rs` a dependency, for SHA-256 and HMAC-SHA256); GAPS
 (2026-11-18).
@@ -39101,6 +38867,9 @@ counter `image.archive_import_stage_past_bound`, `BadLayout` classed `Malformed`
   are filed for main (run-requests.md, 2026-11-19).
 
 ### A-471 — The S3 base's network client: signed requests over the runtime's TCP and rustls, every length capped and every wait learned (2026-11-18, goal g268; Mantle's CP-T10.5 part 2; §4.15 "An S3 base"; §4.9 hostile input; D-9, R3, R6; RFC 9112, RFC 9002, RFC 6298; A-442, A-464)
+> **Removed (A-795, 2026-11-20).** The S3 base this entry built is removed whole (Ada: never asked for; she said
+> NFS); the entry stays as history, and its code, tests and wire use are gone (its tags reserved).
+
 Applied in the same change to: `crates/base/src/s3` (`client`, `http`, `tls` and `wait`, each with its tests;
 `sigv4::amz_timestamp` and `sigv4::canonical_query` made public; `ResponseReader::has_head`); `crates/base/Cargo.toml`
 (`rustls`, `slates-rt` and `slates-transport` dependencies, `rcgen` for the tests); §4.15's status; GAPS (A-464's
@@ -40596,6 +40365,9 @@ A-500 status block's last sentence restored to it, which A-531's edit had moved)
   main's (the run-request queue); no test there sets the flag, so their verdicts are the ones they were.
 
 ### A-524 — The S3 base's host: a miss parked as a pending answer, a directory its listing for one round trip, a file bound to its object; `SimS3`, its oracle; and the library's naming of a base (2026-11-19, goal g268; Mantle's CP-T10.5 part 3; §4.15 "An S3 base"; §4.5, §4.9; R3, R8; RFC 9002; A-151, A-163, A-464, A-471)
+> **Removed (A-795, 2026-11-20).** The S3 base this entry built is removed whole (Ada: never asked for; she said
+> NFS); the entry stays as history, and its code, tests and wire use are gone (its tags reserved).
+
 Applied in the same change to: `crates/base/src/s3` (`host`, `sim`, `name`, `fetch` and `time`, each with its tests;
 `sigv4::amz_timestamp` on `time`'s calendar; `keys::check_name` shared with the naming; a client test running a host's
 fetches); `crates/vfs` (`HostError::Pending`, `VfsError::BasePending` and its errno name, the base plane's mapping);
@@ -42143,6 +41915,9 @@ and `pending_changes` through them), and the bug record
   main's (Linux).
 
 ### A-555 — A request that meets a pending S3 base waits for the fetch it met, and is served again when that one lands (2026-11-19, goal g268, UI goal 90; Mantle's CP-T10.5; §4.15 "An S3 base"; §4.6; R3, R8; A-79, A-354, A-375, A-464, A-524)
+> **Removed (A-795, 2026-11-20).** The S3 base this entry built is removed whole (Ada: never asked for; she said
+> NFS); the entry stays as history, and its code, tests and wire use are gone (its tags reserved).
+
 Applied in the same change to: `crates/vfs` (`host::FetchId`; `HostError::Pending` and `VfsError::BasePending` name
 their fetch; the base plane's two mappings); `crates/base` (`s3::host`: a fetch's name per listing and per chunk run,
 `landed` reporting the fetch it settled, `hold_for_waiters` and `release_held`, the cache passing over held items and
@@ -42630,6 +42405,9 @@ Applied in the same change to: GAPS (g267's captured-clone status: the two tests
   helper, so no lib test came with them.
 
 ### A-555, second piece — The fetch driver: a volume's owner shard runs its S3 host's fetches, woken by the host when a fetch is wanted and ended with it (2026-11-19, goal g268, UI goal 90; §4.15 "An S3 base"; D-9, R6, R8; A-471, A-524, A-555)
+> **Removed (A-795, 2026-11-20).** The S3 base this entry built is removed whole (Ada: never asked for; she said
+> NFS); the entry stays as history, and its code, tests and wire use are gone (its tags reserved).
+
 Applied in the same change to: `crates/base` (`s3::driver`, new: `HostCell`, `drive` and their tests; `s3::fetch::Store`
 over the network client and `SimS3`; `s3::host`: `next_fetch_or_wait`, a wanted fetch waking the driver, and the host's
 drop waking it); `crates/server` (`base_wait`: `ShardCell` and `spawn_driver`); §4.15's status; GAPS (A-464's entry).
@@ -42888,6 +42666,9 @@ takes the target it expects).
   x86_64 lane is owed. Nothing new in the server's library needed a helper.
 
 ### A-555, third piece — A FUSE request that meets a pending base is kept off the device and dispatched again when its fetch lands (2026-11-19, goal g268, UI goal 90; §4.15 "An S3 base", §4.6 "Linux (own /dev/fuse driver)"; A-555; Linux-only, written and filed for main's build)
+> **Removed (A-795, 2026-11-20).** The S3 base this entry built is removed whole (Ada: never asked for; she said
+> NFS); the entry stays as history, and its code, tests and wire use are gone (its tags reserved).
+
 Applied in the same change to: `crates/bridge-fuse` (`channel`: `dispatch_kept` beside `dispatch_ready`, both through
 one admitted path, `Dispatched::request`, `ServeState::allocation_running`; `bridge`: `EAGAIN` public);
 `crates/server` (`fuse`: the mount's kept requests and its task's waker, `next_kept`, `answer`, `keep`, `settle_kept`,
@@ -58653,6 +58434,9 @@ C1's, keeps the paths the verb's fetch holds only lengths of), `verbs.rs` (`edit
   `crates/cli/bench/pacing_ab.py` (new), §4.3, GAPS, BENCHMARKS.md, amendments.tsv.
 
 ### A-791 — A volume over an S3 base is made through the wire, its credential handed with the create (2026-11-20, w-k90-whp; main's dispatch 15:52 PST, goal 92's A-555 parts 2 and 3; §4.15 "An S3 base", A-464, A-524, A-555; R1, R3)
+> **Removed (A-795, 2026-11-20).** The S3 base this entry built is removed whole (Ada: never asked for; she said
+> NFS); the entry stays as history, and its code, tests and wire use are gone (its tags reserved).
+
 - **What was missing.** A-555 built the parking of a request on its base's fetch and the fetch driver, but nothing
   made a volume over an S3 base: no request named one, `spawn_driver` had no caller, and `BaseHost::S3` was built only
   by tests.
@@ -58844,3 +58628,38 @@ work, `RebaseAnswer::Checked`), `crates/client/src/client.rs` (`check_merge`, `r
   read; a resolution keeping a conflicting operation answers the windows with nothing changed. Red: with the stamped
   head's check removed, the moved head's resolution was applied (the test failed there).
 
+
+### A-795 — The S3 base removed: Ada 2026-11-20, never asked; she said NFS (w-fed-faults, goal 91's close list; main's brief from Ada's word at about 21:27, "Don't just hold it. delete it."; §4.15, §4.5's host seam, the wire)
+Applied in the same change to: §4.15 (the subsection "An S3 base", now its removal); A-464, A-471, A-524, A-555 (its
+three pieces) and A-791, each marked removed; the `CONTRACT` = 46 note; the cross-references in §4.17's Mercurial
+status, the svn credential paragraph and the WebDAV paragraph; GAPS (the S3 entries removed, Mantle's CP-T10.5 ask
+declined).
+- **Why.** The S3 base was built for Mantle's CP-T10.5 ask, which Ada never made: an overlay's base she wants is a host
+  directory, served over NFS. Replace, don't layer: no flag, no dead code, nothing kept "just in case".
+- **Removed.** `crates/base`: the `s3` module (signing, keys, listing, the client, its TLS and waits, `S3Host` and
+  `SimS3`, the fetch driver) and `BaseHost::S3`, with the dependencies only it used (`aws-lc-rs`, `rustls`,
+  `slates-rt`, `slates-transport`; dev `proptest`, `slates-test-seeds`, `rcgen`). `crates/vfs`: `HostError::Pending`,
+  `FetchId`, `HostFs::identify_dir` and `VfsError::BasePending`. `crates/server`: `CreateOverS3`'s path
+  (`verbs::create_over_s3`, `open_s3_base`, `s3_client_of`, `AdmitBase::S3`, the driver's start) and the pending-base
+  parking whole: `base_wait.rs`, `ShardState::base_waits` and `nfs_pending_base`, the NFS lens and its JUKEBOX wait
+  (`serve_local_fetched`, now `serve_local_seen`, which only reads the recall gate), the FUSE kept requests
+  (`crates/bridge-fuse`: `dispatch_kept`, `allocation_running`, `Dispatched::request`), and the `Pending` arms in the
+  landing, the land engine, the imports and the NFS status map. `crates/client`: `create_over_s3`. `crates/api`: the
+  S3 naming (`CONTRACT` = 58). `crates/server/tests/s3_base.rs` and every S3 unit test.
+- **A local base never pends.** Only `S3Host` answered `HostError::Pending`; `OsHost` and the tree host (A-774) never
+  did, so every parking path was the S3 base's alone and nothing else waited on one.
+- **Kept, with a user that is not S3's.** `BaseHost::Tree` (A-774, a work's green lent as its base). The vendored
+  `aws-lc-rs` and its MD5 export: the server's config digests and `slates_svn`'s commit drive use them. `hg_base`'s
+  tests of a refusal carried through and a short read read whole, now over an EIO refusal (Linux's `pread` answers
+  short too).
+- **The wire.** Tags stay published and are never reused: `RequestBody` 97 is `RemovedCreateOverS3`, fieldless, and a
+  peer sending it is refused `Unsupported` by kind; `ImportFault` 7 is `RemovedPending`, sent by no daemon;
+  `BaseRecord` 3 is `RemovedS3`, refused at a clone (`Unsupported`) and holding a recovery `BaseUnavailable`. The
+  `wire_order` goldens of `slates-ipc` and `slates-db` name them so.
+- **Tests** (macOS arm64, Mac Studio, local; over origin/main 17bb639aa). `cargo test --offline --lib` of
+  `slates-base`, `-vfs`, `-ipc`, `-db`, `-api`, `-client`, `-bridge-nfs`, `-bridge-fuse`, `-land`, `-hg`, `-mcp` and
+  `-http-edge`, with the `wire_order` goldens of `slates-ipc` and `slates-db`: 14 runs, every one passed. `slates-server
+  --lib`: 1,038 passed, 11 failed; the 10 of `repository::tests`, `vcs_store::paths::tests` and
+  `vcs_store::commits::tests` fail alike on origin/main 17bb639aa without this change (a submit refused `Overloaded`),
+  and `content_ranges`' sweep test passes alone on both. `cargo clippy` of the touched crates' libraries: nothing in a
+  touched line.

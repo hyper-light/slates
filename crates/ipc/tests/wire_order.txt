@@ -130,7 +130,7 @@ ImportFault 3 Unawaited
 ImportFault 4 Format
 ImportFault 5 Damaged
 ImportFault 6 PastRoom
-ImportFault 7 Pending
+ImportFault 7 RemovedPending
 ImportFault 8 Abandoned
 ImportFault 9 Subversion
 Intent 0 Read
@@ -492,7 +492,7 @@ RequestBody 93 AdmitWork
 RequestBody 94 MoveWorkFloor
 RequestBody 95 SubmitComputed
 RequestBody 96 SessionLog
-RequestBody 97 CreateOverS3
+RequestBody 97 RemovedCreateOverS3
 RequestBody 98 CheckMerge
 RequestBody 99 ReadMergeCheck
 RequestBody 100 ResolveMerge
