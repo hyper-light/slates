@@ -771,6 +771,7 @@ impl ClientEnd {
       return Ok(Some(Waited::Reply(reply)));
     }
     self.parks = self.parks.saturating_add(1);
+    diag_time_constraint(u64::from(self.region.spin_ns()));
     let switches_before = slates_machine::switches::switches_now();
     let waiting_ns = slates_machine::clock::monotonic_ns();
     let parked = match ends {
@@ -2273,4 +2274,25 @@ mod tests {
     drop(dup);
     drop(client);
   }
+}
+
+thread_local! {
+  /// DIAG (84a macOS, T arms; never main): whether this thread has asked for the time-constraint policy.
+  static DIAG_TIME_CONSTRAINT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// DIAG (84a macOS, T arms; never main): puts the calling client thread, which parks for its reply (A-799), in the
+/// real-time band once, its computation and constraint the daemon's published idle window (R9's floor, the kernel's
+/// minimum real-time quantum).
+fn diag_time_constraint(window_ns: u64) {
+  DIAG_TIME_CONSTRAINT.with(|asked| {
+    if asked.replace(true) {
+      return;
+    }
+    if slates_machine::time_constraint::set_current_from(window_ns).is_none() {
+      slates_machine::log_line!(
+        "diag 84a: the client's time-constraint policy was refused (from {window_ns} ns)"
+      );
+    }
+  });
 }
