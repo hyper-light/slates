@@ -1402,15 +1402,15 @@ impl Daemon {
       .wait()
   }
 
-  /// Records `point` as the root mount this daemon published (§4.6, D-1; A-645 P3) on every shard: the point a hook is
-  /// handed its repository's view beneath (`ShardState::root_mount`). What the root mount's publication calls once the
-  /// mount is made (A-645 (a), owed); until a daemon has published one, a configured hook is refused, typed, for git
-  /// and Subversion alike. Refused where a shard does not answer.
+  /// Shows every hook its repository beneath `point`, a directory the caller made, on every shard
+  /// (`ShardState::hook_views`, `HookViews::Given`): the hook tests' stand-in for the view the daemon presents and
+  /// mounts under its store's grant (A-645 (a)), which needs a real mount the in-process tests do not make. Refused where
+  /// a shard does not answer.
   pub fn record_root_mount(&self, point: &std::path::Path) -> Result<(), ObserveError> {
     for shard in &self.shards {
       let point = point.to_path_buf();
       self.observe(Some(*shard), move |state| {
-        state.root_mount = Some(point.clone());
+        state.hook_views = crate::vcs_store::svn_presenter::HookViews::Given(point.clone());
       })?;
     }
     Ok(())
@@ -5129,7 +5129,8 @@ async fn init_shard(
     vcs_usage: slates_vcs::Ledger::new(config.clients_per_shard),
     #[cfg(unix)]
     hook_times: crate::vcs_hooks::HookTimesTable::default(),
-    root_mount: None,
+    hook_views: crate::vcs_store::svn_presenter::HookViews::of(config.vcs_view_root),
+    svn_views: std::collections::BTreeMap::new(),
     pending_green_materializations: std::collections::BTreeMap::new(),
     pending_repositories: std::collections::BTreeMap::new(),
   };

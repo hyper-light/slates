@@ -1413,6 +1413,17 @@ pressure, fragmentation, restart and open/close behavior, not assertions on quot
 > turn), and `heap` (the system allocator's own statistics and the large path's mappings, `slates_mem::heap`). A fresh
 > debug daemon on the Mac Studio read every kind within 8 status calls (2.5 s), its longest advance 0.67 ms, none past
 > its budget. It replaces suspending the daemon with `vmmap` or `heap`, which past the anchor's window kills it (A-232).
+>
+> **Status (2026-11-20, g228: the sweep on the shard's idle time, spaced by its length).** Armed as a task that advanced
+> a step a turn, a status request's sweep ran half a step quantum of `mincore` ahead of every turn's ready work for as
+> long as it lasted, seconds over tens of GiB of address space, on every shard the request reached. Live writes begun
+> after a status request paid it at every hop, and every daemon burned seconds of CPU (BENCHMARKS, "What live shipping
+> adds to a stable write, after A-396's holds"). The sweep is now the shard's idle work (`ShardContext::set_idle_work`,
+> `content_ranges::idle_slice`): it advances only when the shard has nothing ready and its idle spin has run out, and a
+> sweep is armed no sooner after the last completed than that one took, so sweeps take at most half a shard's time
+> however often status is asked and a report reads figures at most two sweeps old. Counted
+> `content_range.sweep.idle_slices` and `.spaced`; held by
+> `content_ranges::tests::a_status_requests_sweep_runs_on_the_shards_idle_time_and_is_spaced_by_its_length`.
 
 ### 4.3 Runtime: thread-per-core executor, drivers, rings, cancellation (D-7, D-9)
 
@@ -56522,10 +56533,34 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   makes the view's mount point inside the store's granted directory (`mkdirat` relative to its handle, for the user
   alone, made durable; a file or symlink at the name refused `ENOTDIR`), held by
   `a_mount_point_is_made_in_the_granted_directory_and_nowhere_else`.
-- **Owed.** A-645 (a) parts 2 and 3: the view's volume made and kept current by the daemon, mounted read-only under the
-  store's standing grant (`<--vcs-store>/<repository>.svn`) through each platform's mount, its path the hook's
-  REPOS-PATH (the "root mount not yet published" refusal goes), and the by-use red (stock svn's revprop change through
-  a real anchor). Then P4, and the presenter's call of `hold_owed_references` after a recovery.
+- **Part 3, its fifth piece (2026-11-20, A-645 (a) parts 2b and 2c, main's ruling of 20:00): a hook is handed its
+  repository's view, mounted under the store's standing grant.** Where the daemon is given a store directory
+  (`--vcs-store`, A-767's standing grant), the daemon role opens it once more for views (`DaemonConfig::vcs_view_root`),
+  and every shard's `ShardState::hook_views` is `HookViews::Granted`. A configured Subversion hook's `REPOS-PATH` is
+  then `svn_presenter::repos_for_hook`, run on the repository's owner shard (`xshard::task_in_shard_time`):
+  - the view volume made once, a scratch volume owned by the repository's owner, named `.svn-view.<repository>.<n>`
+    with `n` the first number whose name routes to the owner shard (`verbs::owner_of_name`), so the view's reads run where
+    the records are;
+  - laid out a revision a turn (`present_slice`, inside `vcs_store::lent_state`, so a text the content store keeps is
+    held), then each revision's properties file refreshed a revision a turn (`refresh_slice`), since a revision property
+    change may have changed them;
+  - mounted read-only, once, at `<store>/<repository>.svn` (`StoreRoot::mount_point`) by the daemon's own `slates
+    --instance I mount <view volume> <point> --read-only`, run as a helper of the shard (`hook_driver::run_helper`, its
+    exit awaited through `ExitWatch`, bounded by the failover delay, killed with its group past it), so each platform
+    mounts it as any client's mount does (§4.6: Linux FUSE through `fusermount3`, macOS NFS `mount(2)`).
+  The bridges read a view volume's texts through `VolumeBridge::reading_referenced` (bridge-core, new): the daemon's NFS
+  export (`nfs::with_export`) and FUSE turn (`fuse::turn_with`) serve a view volume's request inside `lent_state`, the
+  view's `ViewTexts` lent to the bridge. A daemon with no store directory refuses a configured hook typed
+  (`svn_presenter::UNGRANTED_WORDS`, `SVN_ERR_UNSUPPORTED_FEATURE`; git's push `no standing grant to show a hook its
+  view`); the unpublished root mount and `ShardState::root_mount` are gone, and `Daemon::record_root_mount` is the
+  in-process hook tests' stand-in (`HookViews::Given`). Held by `slates-server --lib` vcs_svn, git_push, vcs_ssh's svn,
+  vcs_http's svn and daemon edge, svn_hooks, hook_driver and the presenter (67 of 67, macOS arm64), and owed to a host
+  with stock Subversion 1.15 and room to build: `svn_interop::a_repository_policys_hook_lets_stock_svn_change_a_revision_property`
+  (the anchor given `--vcs-store`, the hook running `svnlook youngest $REPOS`; red on main before: E200007). Windows:
+  the store directory is `Unsupported` there and no hook runs, so a configured hook stays refused typed.
+- **Owed.** The by-use run above (in run-requests.md); a per-change signal for revision properties instead of the
+  refresh of every revision's file at each hook (GAPS); the view's mount ended with the repository; P4; and the
+  presenter's call of `hold_owed_references` after a recovery.
 - **Applied in the same change to** GAPS (A-661's hook entry), amendments.tsv.
 
 ### A-664 live whole builds, a parked submit's wait bounded — Answered `Overloaded` once it waits past the node's failover delay (2026-11-20, w-shared for UI goal 93; main's ruling)
@@ -57258,6 +57293,13 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
   `a_candidate_behind_the_tail_of_a_large_volume_is_installed_from_an_image_sealed_in_turns` (a 3 MiB file, a candidate
   stopped while it is overwritten, then resumed), red before (the image made in one turn), 65 turns after with one stale
   build dropped and made again.
+- **Part 5 under a stream (2026-11-20, Goal 85b C3).** "Only if the head is still the one it was captured at" never held
+  while writes went on: the seeded nemesis (seeds 1256052866610850298, 5939796479076166087) dropped 1,055 of 1,055
+  images, and a candidate behind the tail stayed 608 and 743 entries behind through the fleet wait. An image is now made
+  at the head it was captured at while the retained tail still reaches past that head (`Shipper::mark_checkpoint` takes a
+  head behind the owner's on its chain that `retains_after` reaches past, never one behind the checkpoint): a holder
+  installed there catches up by the entries after it (A-428). Test: `slates-db` live
+  `a_whole_state_behind_the_head_is_the_checkpoint_while_the_tail_holds_what_follows` (red: refused, checkpoint none).
 - **Applied in the same change to** GAPS (the one-turn walks entry), amendments.tsv. g226's branches touch neither
   `db::live` nor `live_ship` (checked 2026-11-20), so no order was needed.
 
@@ -57840,9 +57882,24 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > texts it made in a cache whose bound is learned (the longest chain it had to make). Held by
 > `an_old_file_revision_is_read_from_its_own_chain_alone` (39 changesets over three paths; the changesets read equal
 > the version's chain; again after a reopen) and `a_shard_reads_an_old_file_revision_through_the_owner_across_a_restart`
-> (red with the rows not written: no landed text). Owed: a changeset landed through `begin`/`applied` writes neither
-> `P` nor `T`/`H` rows (only `Store::land` does); the release timing against the per-file arm's 91 µs
-> (`examples/per_path_read.rs`, Mercurial's own history).
+> (red with the rows not written: no landed text). A changeset landed through `begin`/`applied` gets every row since
+> bc0677af9 (`applied` reads the committed record back, as a replay does). Owed: the release timing against the
+> per-file arm's 91 µs (`examples/per_path_read.rs`, Mercurial's own history).
+
+> **Status (2026-11-20, the store sized by its work at both extremes; the owner's sliced landing).** A 128 GiB Mac
+> refused every landing (w-hg: "a memtable past 4 GiB"): the store's memtable was the shard's reserve, which grows with
+> the machine. It is one trunk node of extents (fanout × the content plane's chunk), the engine's own unit of work;
+> the memtable holds rows, never a landing's bytes (those are in the log), so no machine input belongs in it and no
+> clamp is needed. Held by `store_sizing_tests::the_store_lands_on_a_small_and_a_large_machine_alike` in
+> `slates-api` (8 GiB and 128 GiB profiles injected into the machine facts the daemon derives from, the store started
+> as `--vcs-store` starts it, a landing and a clean stop at each; red at 128 GiB, the landing `Gone`, under the
+> machine-sized formula). A device's flush rate belongs to the log's group commit (owed), not the memtable. The
+> owner's sliced landing: `StoreHandle::begin` opens a record whose state lives in the log (`ChangesetLog::open_record`,
+> `open_section`, `open_piece`, `commit_open`, `abandon_open`), so the owner serves reads between its parts;
+> `SlicedLanding::section`, `part` (at most one piece, the read's unit, so a landing in flight holds a piece a request)
+> and `commit`; other landings wait in the owner's queue, bounded by the request channel's capacity and refused `Busy`
+> past it; a landing let go uncommitted is abandoned (its liveness channel's sender dropped, the owner woken), the log's
+> end never moved. Held by `a_changeset_lands_in_parts_alone_and_a_dropped_one_leaves_nothing` (`tests/owner.rs`).
 
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the

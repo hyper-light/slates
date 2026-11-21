@@ -237,3 +237,46 @@ fn a_staged_content_reads_the_same_in_flight_landed_and_recovered() {
     "an identity nothing holds"
   );
 }
+
+/// w-perf's finding. Do: land a payload through `begin` a slice at a time, then `applied`; read it by its identity.
+/// Expect: the bytes, as a changeset landed whole through `land` gives them (its `P` row put from the log).
+#[test]
+fn a_changeset_landed_in_slices_is_indexed_as_one_landed_whole() {
+  use slates_store::staging::Staging;
+  let dir = scratch("slices");
+  let mut store = open(&dir);
+  let payload: Vec<u8> = (0..150_000u32).map(|at| (at % 241) as u8).collect();
+  let identity = *blake3::hash(&payload).as_bytes();
+  let mut record = store
+    .begin(Header {
+      tool: Tool::Mercurial,
+      repository: 6,
+      sequence: 1,
+      judged_over: 0,
+      grant: 1,
+      work: 1,
+      time_ns: 1,
+      sections: 1,
+    })
+    .unwrap();
+  record
+    .section(SectionKind::Payload, payload.len() as u64)
+    .unwrap();
+  for slice in payload.chunks(40_000) {
+    record.piece(slice).unwrap();
+  }
+  let located = record.commit().unwrap();
+  store.applied(&located).unwrap();
+  let staging = Staging::new(0);
+  let first = store
+    .piece(&staging, &identity, payload.len() as u64, 0)
+    .unwrap();
+  assert!(
+    first.is_some(),
+    "the slices' payload is found by its identity"
+  );
+  assert_eq!(
+    read_whole(&mut store, &staging, &identity, payload.len() as u64),
+    payload
+  );
+}

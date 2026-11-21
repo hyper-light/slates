@@ -79,8 +79,17 @@ pub(crate) struct Sweep {
   longest_ns: u64,
   /// The longest single step, nanoseconds: what an advance may pass its budget by at most.
   longest_step_ns: u64,
-  /// Whether a status request's sweep task is advancing the sweep in the background ([`arm`]): one at a time.
+  /// Whether a status request armed a sweep the shard's idle time is advancing ([`arm`]): one at a time.
   running: bool,
+  /// Slices of the sweep run on the shard's idle time ([`idle_slice`]): the background path's non-vacuity count.
+  idle_slices: u64,
+  /// When the armed sweep was armed, shard clock nanoseconds, and the sweeps completed then ([`arm`]): the armed sweep
+  /// is done once one more has completed, by an idle slice or a request's own advance.
+  armed: (u64, u64),
+  /// When the last armed sweep completed, and how long it took from its arming: the spacing [`arm`] keeps.
+  last: Option<(u64, u64)>,
+  /// Status requests that found the last sweep too recent to arm another ([`arm`]).
+  spaced: u64,
 }
 
 /// One mapped range the sweep walks: a range of the content object, or a region of the arena.
@@ -241,39 +250,72 @@ fn residency(
 /// Arms one sweep to completion in the background (§4.14, the daemon's memory report): a request's own advance walks
 /// half a step quantum, and the anchor segment and content object whole are tens of GiB, millions of pages, which a
 /// status request alone would take hundreds of requests to sweep (84 GiB unswept after 400 requests, a debug daemon on the
-/// Mac Studio, 2026-11-20). So a status request also spawns, unless one runs, a task that advances the sweep a step a
-/// turn of this shard ([`advance`]'s bound), yielding between, until one sweep completes; the next request reads it. An
-/// idle shard is woken for nothing else: the task is armed by a request and ends with its sweep. With no task to spawn
-/// the request's own advance still moves the sweep.
+/// Mac Studio, 2026-11-20). So a status request also hands the rest to the shard's idle time, unless a sweep is already
+/// armed: the shard's idle work ([`idle_slice`], `ShardContext::set_idle_work`) advances it a bounded step whenever the
+/// shard has nothing ready and its idle spin has run out, until one sweep completes; the next request reads it.
+///
+/// Never as a task: one that advanced the sweep a step a turn, yielding between, ran half a step quantum of `mincore`
+/// ahead of every turn's ready work for as long as a sweep lasted, seconds over tens of GiB, on every shard a status
+/// request reached. A stream of live writes begun after a status request paid it at every hop: on the 32-core Studio
+/// (load 4-75, 2026-11-20, BENCHMARKS) what live shipping added went from 543-823 µs to 1,312-4,111 µs at the median, its
+/// p999 from 5.6-11.4 ms to 25-198 ms, and every daemon burned 1.5-9.3 s of CPU over a 2,000-write stream against
+/// 0.26-0.93 s, `mincore` the heaviest frame in each (g228). On idle time a sweep takes nothing from ready work, and a
+/// busy shard's sweep waits for its idle moments while each request still moves it (`report`'s own advance).
+///
+/// Spaced by its own length: a sweep is armed no sooner after the last one completed than that one took. So the sweeps
+/// take at most half of a shard's time over any span however often status is asked (a poller asking every few
+/// milliseconds kept every shard sweeping), and what a request reads is at most two sweeps old. A request that finds the
+/// last sweep too recent is counted (`content_range.sweep.spaced`) and reads it. The shard has one idle-work slot and
+/// this is the daemon's only use of it since A-777 removed the arena reserve's refill.
 fn arm(state: &mut ShardState) {
   if state.content_sweep.running {
     return;
   }
-  state.content_sweep.running = true;
-  let spawned =
-    slates_rt::futures::spawn(sweep_to_completion()).and_then(slates_rt::futures::detach);
-  if spawned.is_err() {
-    state.content_sweep.running = false;
+  let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+  if state
+    .content_sweep
+    .last
+    .is_some_and(|(completed_ns, took_ns)| now < completed_ns.saturating_add(took_ns))
+  {
+    state.content_sweep.spaced = state.content_sweep.spaced.saturating_add(1);
+    return;
+  }
+  let registered =
+    slates_rt::registry::with_current(|context| context.set_idle_work(Box::new(idle_slice)));
+  if matches!(registered, Some(Ok(()))) {
+    state.content_sweep.running = true;
+    state.content_sweep.armed = (now, state.content_sweep.sweeps);
   }
 }
 
-/// The task [`arm`] spawns: one [`advance`] a turn until a sweep completes, then the task ends.
-async fn sweep_to_completion() {
-  loop {
-    let completed = crate::state::with_state(|state| {
-      let before = state.content_sweep.sweeps;
-      advance(state);
-      let completed = state.content_sweep.sweeps != before;
-      if completed {
-        state.content_sweep.running = false;
-      }
-      completed
-    });
-    if completed != Some(false) {
-      return;
+/// One slice of an armed sweep on the shard's idle time ([`arm`]): one [`advance`], bounded by half the step quantum as
+/// the shard's idle work must be. Whether it did anything: `false` once the armed sweep has completed (or none is armed,
+/// or the state is out of reach), so the shard parks, and an idle shard pays one flag read before each park after that.
+fn idle_slice() -> bool {
+  crate::state::with_state(|state| {
+    if !state.content_sweep.running {
+      return false;
     }
-    slates_rt::futures::yield_now().await;
-  }
+    let advanced = !armed_sweep_done(state);
+    if advanced {
+      advance(state);
+      state.content_sweep.idle_slices = state.content_sweep.idle_slices.saturating_add(1);
+    }
+    if armed_sweep_done(state) {
+      let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+      let sweep = &mut state.content_sweep;
+      sweep.running = false;
+      sweep.last = Some((now, now.saturating_sub(sweep.armed.0)));
+    }
+    advanced
+  })
+  .unwrap_or(false)
+}
+
+/// Whether the armed sweep has completed: one more sweep since it was armed, by an idle slice or a request's own advance
+/// ([`report`]), so a request that finishes it leaves the idle work nothing to begin again.
+fn armed_sweep_done(state: &ShardState) -> bool {
+  state.content_sweep.sweeps > state.content_sweep.armed.1
 }
 
 /// Advances the sweep for at most half the shard's step quantum (module docs, "Bounded"); at most one sweep completes.
@@ -406,6 +448,11 @@ pub(crate) fn report(state: &mut ShardState) -> Vec<RefusalCount> {
     state.content_sweep.sweeps,
   ));
   rows.push((
+    format!("{PREFIX}sweep.idle_slices"),
+    state.content_sweep.idle_slices,
+  ));
+  rows.push((format!("{PREFIX}sweep.spaced"), state.content_sweep.spaced));
+  rows.push((
     format!("{PREFIX}sweep.past_budget"),
     state.content_sweep.past_budget,
   ));
@@ -493,6 +540,61 @@ mod tests {
   /// a segment region one step whole: a debug shard spun 3.2 s in one poll (w-perf); with one report a poll but a fixed
   /// batch, every advance ran past its budget. (The runtime's `long_steps` is no measure here: the debug audit daemon's
   /// live quantum is 3.2 us, which no status report's own rows fit; 200 no-op observes counted 6, 200 reports 200.)
+  /// A-744, with g228's finding (a status request's sweep ran ahead of every turn's ready work for seconds). Do: on a
+  /// running daemon, ask the shard's report once, as a status request does, then only watch, with observations that
+  /// report nothing, until a sweep completes; then ask the report again at once. Expect: the sweep completes with no
+  /// further request, by slices of the shard's idle time (`idle_slices` moved, the background path's non-vacuity count),
+  /// and then stops (nothing left armed); and the request right after it arms no new sweep (`spaced` moved), since the
+  /// last completed less than its own length ago.
+  #[test]
+  // The watch leaves the shard idle between its looks, which is the condition under test: a look is a task on the shard.
+  #[allow(clippy::disallowed_methods)]
+  fn a_status_requests_sweep_runs_on_the_shards_idle_time_and_is_spaced_by_its_length() {
+    /// Shape: the watch's bound: a debug audit daemon's whole slice, swept on idle time, within ten liveness budgets.
+    const WATCH: std::time::Duration =
+      std::time::Duration::from_nanos(10 * crate::daemon::LIVENESS_BUDGET_NS);
+    /// Shape: the pause between two looks: a hundredth of a liveness budget, long against a shard's idle spin, so the
+    /// shard reaches its idle work between looks, as a daemon nobody asks does.
+    const LOOK: std::time::Duration =
+      std::time::Duration::from_nanos(crate::daemon::LIVENESS_BUDGET_NS / 100);
+    let daemon = crate::daemon::audit_daemon();
+    crate::daemon::observe_first(&daemon, |state| {
+      report(state);
+    });
+    let started = std::time::Instant::now();
+    let mut seen = (0, 0, true);
+    while started.elapsed() < WATCH {
+      seen = crate::daemon::observe_first(&daemon, |state| {
+        let sweep = &state.content_sweep;
+        (sweep.sweeps, sweep.idle_slices, sweep.running)
+      });
+      if seen.0 > 0 && !seen.2 {
+        break;
+      }
+      std::thread::sleep(LOOK);
+    }
+    let spaced = crate::daemon::observe_first(&daemon, |state| {
+      report(state);
+      (state.content_sweep.spaced, state.content_sweep.running)
+    });
+    daemon.stop();
+    let (sweeps, idle_slices, running) = seen;
+    assert!(
+      sweeps > 0,
+      "a sweep completed on the shard's idle time within {WATCH:?}: (sweeps, idle slices, armed) {seen:?}"
+    );
+    assert!(
+      idle_slices > 0,
+      "the sweep advanced in idle slices: {seen:?}"
+    );
+    assert!(!running, "the completed sweep left nothing armed: {seen:?}");
+    assert_eq!(
+      spaced,
+      (1, false),
+      "a request right after a sweep completed armed none: (spaced, running) {spaced:?}"
+    );
+  }
+
   #[test]
   fn a_sweep_completes_within_its_bound_and_holds_every_range_to_its_bytes() {
     let daemon = crate::daemon::audit_daemon();
