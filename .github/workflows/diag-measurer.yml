@@ -1,0 +1,81 @@
+name: diag-measurer
+
+# w-provision-gate's A/B of Mach's time-constraint policy on macOS (84a): B 008f618ec (main + the load's throughput
+# line), TC 821457913 (the client's reply-wait thread under the policy), TB 27e7a0873 (the shard threads too).
+# edit_merge_bench loaded and quiet, provision_bench quiet (R9's uncontended spinning p99), interleaved. Diagnostics only
+# (never main).
+
+on:
+  push:
+    branches: ["diag-measurer-w-provision-gate-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+  ARMS: "008f618ecf3ef323924d72d248f13f7c779cec8a 82145791308fcd0e83ba7e848ab608bec1164cf8 27e7a0873bab7eb1ae1675b5ba7f6886ccec2779"
+  ROUNDS: "3"
+
+jobs:
+  edit-merge-ab:
+    name: time-constraint A/B (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 330
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: Build the arms (one target dir, each arm's sources extracted just before its build)
+        run: |
+          W="$RUNNER_TEMP/msr"; mkdir -p "$W/logs"
+          export CARGO_TARGET_DIR="$W/target"
+          for arm in $ARMS; do
+            s="${arm:0:9}"; mkdir -p "$W/src-$s" "$W/bin-$s"
+            git archive --format=tar "$arm" | tar -xmf - -C "$W/src-$s"
+            ( cd "$W/src-$s" && cargo build --release --locked -p slates-client --example edit_merge_bench --example provision_bench ) > "$W/logs/build-$s.log" 2>&1 \
+              || { tail -40 "$W/logs/build-$s.log"; exit 1; }
+            cp "$W/target/release/examples/edit_merge_bench" "$W/bin-$s/edit_merge_bench"
+            cp "$W/target/release/examples/provision_bench" "$W/bin-$s/provision_bench"
+            shasum -a 256 "$W/bin-$s/edit_merge_bench"
+          done
+      - name: The machine
+        run: uname -a; sysctl -n hw.ncpu machdep.cpu.brand_string; uptime
+      - name: Interleaved rounds, loaded then quiet
+        run: |
+          W="$RUNNER_TEMP/msr"
+          order() { case $1 in 1) echo $ARMS;; 2) echo $ARMS | awk '{for(i=NF;i>0;i--) printf "%s ", $i}';; *) echo $ARMS | awk '{print $2, $3, $1}';; esac; }
+          set +e
+          for round in $(seq 1 "$ROUNDS"); do
+            for arm in $(order $round); do
+              s="${arm:0:9}"; L="$W/logs/loaded-$s-r$round.log"
+              echo "== loaded round $round arm $s $(date -u +%FT%TZ) load: $(uptime)" | tee "$L"
+              perl -e 'alarm shift; exec @ARGV' 1200 "$W/bin-$s/edit_merge_bench" --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict </dev/null >> "$L" 2>&1
+              echo "exit $?" >> "$L"; grep -E "goal|WRONG|load throughput|diag 84a|_loaded_total_p(50|99|999)|exit" "$L" | cut -c1-220
+            done
+          done
+          for round in $(seq 1 "$ROUNDS"); do
+            for arm in $(order $round); do
+              s="${arm:0:9}"; L="$W/logs/quiet-$s-r$round.log"
+              echo "== quiet round $round arm $s $(date -u +%FT%TZ) load: $(uptime)" | tee "$L"
+              perl -e 'alarm shift; exec @ARGV' 1200 "$W/bin-$s/edit_merge_bench" --quiet-only --files 10 --files 1000 --form accept --form conflict </dev/null >> "$L" 2>&1
+              echo "exit $?" >> "$L"; grep -E "goal|WRONG|diag 84a|_quiet_total_p(50|99|999)|exit" "$L" | cut -c1-220
+              PL="$W/logs/provision-$s-r$round.log"
+              perl -e 'alarm shift; exec @ARGV' 1200 "$W/bin-$s/provision_bench" </dev/null > "$PL" 2>&1; echo "exit $?" >> "$PL"
+              grep -E "spinning_1_p(50|99|999):|ac-2.1: 1 client spinning \(|diag 84a|exit" "$PL" | cut -c1-200
+            done
+          done
+      - name: Keep the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: tc-logs-${{ matrix.os }}
+          path: ${{ runner.temp }}/msr/logs
+          if-no-files-found: warn
