@@ -60,3 +60,16 @@ are wedged and need a person's cancel; every clippy leg is red on container.rs:3
   Studios' Ethernet in would also end the Wi-Fi blips.
 - kiln fix (mine, next, red first): the QUIC listener answers from the address it was reached at (IP_PKTINFO), so a
   multi-homed server can't do this again.
+
+## ~09:30 PST 11-21: R2 IP_PKTINFO fix built, green so far; waiting on Linux for the kiln end-to-end red/green
+- Where: kiln-rt (kiln's own hyper-rt: vendor/hyper-raft/crates/hyper-rt stays upstream's and nothing kiln builds uses
+  it): Arrival::to (IP_PKTINFO/IPV6_RECVPKTINFO), Batched::send_segments_from (IP_PKTINFO src; Linux sendmmsg beside
+  UDP_SEGMENT, macOS sendmsg). Vendored hyper-raft: hyper-transport Endpoint::handle_datagram_to (local_ip in place of
+  None), driver passes arrival.to and sends from transmit.src_ip -- recorded as vendor/patches/hyper-raft/0006 + rows in
+  UPSTREAM.md and kiln-rt ORIGIN.md. Windows runs only client endpoints (src_ip None): unchanged.
+- Green: Linux (container on this Mac) kiln-rt reached_at_a_second_address_it_answers_from_that_address -- the kernel
+  answers a 127.0.0.2 datagram from 127.0.0.1 (the fault) and from 127.0.0.2 with the fix; udp_batched 23/23; clippy
+  -D warnings clean (Linux + macOS). macOS: new test 1/1, udp_batched 18/18 x10, kiln lib+tests compile.
+- Waiting: r19 on adacachy (the only Linux runner; "too few idle CPUs"): kiln tunnel test RED with the fix reversed,
+  GREEN with it, + vendor.py check (this Mac has Python 3.9). Then land, then measure the runners' drops.
+- Finding for GAPS: kiln's topo.drops did not count Studio-4's 15:34:40Z drop; I measure drops from runners' logs.
