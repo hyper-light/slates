@@ -56489,8 +56489,22 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   API did not exist. macOS arm64, merged main 051bf8f4: `slates-vfs --test referenced` 6 of 6, `--lib`, `--test recover`,
   `--test image`, `--test special` 167 of 167; `slates-server --lib vcs_store::referenced` 2 of 2; `slates-api --lib
   volume_core` 3 of 3.
-- **Owed.** P3's presenter (the view a hook runs in, under the root mount, made of referenced files), P4, the root mount's
-  publication (A-645 (a)), and the presenter's call of `hold_owed_references` after a recovery.
+- **Part 3, its fourth piece (2026-11-20, A-645 (a) part 1, main's ruling of 20:00): the view as a volume.**
+  `vcs_store::svn_presenter::Presented` lays a repository's view into a volume of its own, a budget of node-revisions a
+  call: the directories and fixed files, each revision's properties file, and each revision file as a referenced file
+  (`fsfs::RevisionFile::pieces`: its made bytes kept in the volume, each text a piece by identity and length). `db/current`
+  is rewritten after the files it names exist. A revision property change rewrites that revision's file
+  (`revision_properties_changed`). A text is read through `ViewTexts`, the repository's own text source (the green's held
+  head text, else the content store's window, else the records' delta window), and held through `ViewHolds` where the
+  content store keeps it. Every text is `PLAIN`: `WithTexts` answers no stored delta (`fsfs::TextDeltas`), since the
+  records' svndiffs are no content a piece can name and per-file deltas become derived forms of the changeset log (Ada's
+  ruling of ~13:35). Held by `the_presented_volume_holds_the_fsfs_view_byte_for_byte` (the golden repository laid out a
+  node-revision a call; every revision file, properties file and fixed file the bytes `fsfs` makes, each revision file
+  refused `EROFS`) and `a_revision_property_change_rewrites_that_revisions_properties_file`.
+- **Owed.** A-645 (a) parts 2 and 3: the view's volume made and kept current by the daemon, mounted read-only under the
+  store's standing grant (`<--vcs-store>/<repository>.svn`) through each platform's mount, its path the hook's
+  REPOS-PATH (the "root mount not yet published" refusal goes), and the by-use red (stock svn's revprop change through
+  a real anchor). Then P4, and the presenter's call of `hold_owed_references` after a recovery.
 - **Applied in the same change to** GAPS (A-661's hook entry), amendments.tsv.
 
 ### A-664 live whole builds, a parked submit's wait bounded — Answered `Overloaded` once it waits past the node's failover delay (2026-11-20, w-shared for UI goal 93; main's ruling)
