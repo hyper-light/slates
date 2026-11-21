@@ -1546,3 +1546,10 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - THE PUSH CUT-OFF, NAMED (w-git): about 65 s in, an answer step refuses the 611 MB push PastAdmission (its working set outgrew the room its shard admitted). The reply's head was already out, so the 413 can't be sent and the edge aborts: curl 18.
   - RULING: layer 1 now: every refusal after the head in git's own words, never an aborted connection. Layer 2 before C5 2b piece 3: the answer phases slice over the pack held once and charge only the slice (A-719, Ada's tens-of-thousands-of-large-pushes rule). Red: the 611 MB push lands within its room; A/B against stock git's 10.77 s.
   - DISK: the MacBook at 26 GB; w-svn's target regrew to 27 GB. It deletes incremental and builds with CARGO_INCREMENTAL=0.
+- 2026-11-21 02:03 PST
+  - w-engine is BACK (took the 89b ruling). Its fold now finishes in 0.9-1.6 s on a deadline-sized share. A/B against main:
+    - Z=50 ms: p99 under 1 ms for every kind, 5 of 5 rounds (main at most 2); SubmitAccepted p999 1.4-9.2 ms vs 64.7-89.5.
+    - Z=20 ms: SubmitAccepted p99 5.4-9.7 ms vs 2.5-4.5, WORSE; p999 better.
+  - RULING: (b): subtract a key's old entry at first change, half the hashing and no history reads, no format change. Measure again; (a) and (b) land together only if Z=20 p99 is no worse. (c), the format change, only if needed and inside w-shared's format 6 bump. Push through the MacBook (Studio-4 unreliable).
+  - LANDED: 302da8b45 (w-svn B2 (a): DAV GET reads a stored text's piece through the store). kiln CI: run 44887857088 on a0d114abb, carrying w-k90-win's w2/w7 fix, holds the lane; no dispatch needed.
+  - The MacBook disk back to 44 GB.
