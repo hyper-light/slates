@@ -19,7 +19,7 @@ own wake, written -> seen median 97 µs) is cited in its place.
 
 **For main:** g222's diag branches can go (diag-measurer-g222-20, -22; agents/g222-loaded-p99-p999-reply-wait-c).
 
-## 85a C/B/A: closed (g222, 2026-11-21 10:14 PST, origin/main 20c2bc961)
+## 85a C/B/A: closed (g222, 2026-11-21, by 10:18 PST per date, origin/main 20c2bc961)
 - **C measured and rejected.** w-provision-gate recorded it on main (b88f93326, BENCHMARKS "The client's reply wait,
   arm C"), every round of A/B/C on all five platforms shown. My own direct read of run 44884335146 matches. C gets A's
   quiet p50 back, but loaded it is worse than B on ubuntu-latest (accept p99 5.7-5.9 against 2.9-3.1 ms) and on both
