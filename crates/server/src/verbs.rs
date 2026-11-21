@@ -4456,6 +4456,14 @@ pub fn shard_report(state: &mut ShardState, memory: bool) -> ShardReport {
             crate::xshard::run_refused(),
           ),
           (
+            WORK_LOG_PEAK_BYTES,
+            u64::try_from(state.db.partition().work_log_peak().0).unwrap_or(u64::MAX),
+          ),
+          (
+            WORK_LOG_PEAK_ENTRIES,
+            u64::try_from(state.db.partition().work_log_peak().1).unwrap_or(u64::MAX),
+          ),
+          (
             crate::xshard::REPLY_HOME_HANDED,
             crate::xshard::reply_home_counts().handed,
           ),
@@ -10238,24 +10246,85 @@ pub(crate) fn settle_submit(
 
 /// The green's verdict on `inc`: a holder's computed verdict taken by position (A-697 part c), or one judged here; the
 /// reason where a computed verdict does not read back or is not taken. `None` for a green this shard does not hold.
+/// Where `hold` (a server-made commit's submit holding its landing turn, `crate::made_commit`), an accepted verdict is
+/// held, not applied (A-805): its outcome and what it records come with it, and the green shows nothing of it.
 fn verdict_of(
   state: &mut ShardState,
   green_id: DbVolumeId,
   sealed: &crate::work_home::SealedWork,
-  inc: &slates_merge::engine::Increment,
-) -> Option<Result<Judged, String>> {
+  (inc, hold): (&slates_merge::engine::Increment, bool),
+) -> Option<Result<(Judged, Option<slates_merge::engine::Judged>), String>> {
   let mut engine = state.greens.get_mut(&green_id)?;
-  Some(match &sealed.computed {
-    None => Ok(engine.submit_resolved(inc)),
-    Some(form) => engine
-      .computed_from(inc, form)
-      .map_err(|error| format!("the verdict's form does not read back: {error:?}"))
-      .and_then(|computed| {
-        engine
-          .submit_computed(inc, computed)
-          .map_err(|refusal| format!("the verdict is not taken by position: {refusal:?}"))
-      }),
-  })
+  if hold {
+    let judgment = match &sealed.computed {
+      None => Ok(engine.judge(inc)),
+      Some(form) => engine
+        .computed_from(inc, form)
+        .map_err(|error| format!("the verdict's form does not read back: {error:?}"))
+        .and_then(|computed| {
+          engine
+            .judge_computed(inc, computed)
+            .map_err(|refusal| format!("the verdict is not taken by position: {refusal:?}"))
+        }),
+    };
+    return Some(judgment.map(held_outcome));
+  }
+  Some(
+    match &sealed.computed {
+      None => Ok(engine.submit_resolved(inc)),
+      Some(form) => engine
+        .computed_from(inc, form)
+        .map_err(|error| format!("the verdict's form does not read back: {error:?}"))
+        .and_then(|computed| {
+          engine
+            .submit_computed(inc, computed)
+            .map_err(|refusal| format!("the verdict is not taken by position: {refusal:?}"))
+        }),
+    }
+    .map(|judged| (judged, None)),
+  )
+}
+
+/// A judgment as the outcome a submit answers, with the verdict held where it accepted (A-805): the version it will
+/// commit as is the one after the head it was judged at, identical where it changes nothing (as the engine's own
+/// commit tells it).
+fn held_outcome(
+  judgment: slates_merge::engine::Judgment,
+) -> (Judged, Option<slates_merge::engine::Judged>) {
+  use slates_merge::engine::{Judgment, Outcome};
+  match judgment {
+    Judgment::Accepted(held) => {
+      let version = held.at().saturating_add(1);
+      let outcome = if held.applied().is_empty() {
+        Outcome::Identical { version }
+      } else {
+        Outcome::Accepted { version }
+      };
+      let applied = held.applied().to_vec();
+      ((outcome, Some(applied)), Some(held))
+    }
+    Judgment::AcceptedBefore { version } => ((Outcome::Accepted { version }, None), None),
+    Judgment::Conflict { windows } => ((Outcome::Conflict { windows }, None), None),
+    Judgment::BaseUnavailable { base, floor } => {
+      ((Outcome::BaseUnavailable { base, floor }, None), None)
+    }
+    Judgment::CopyRefused { path, case } => ((Outcome::CopyRefused { path, case }, None), None),
+    Judgment::ContentUnread { identity } => ((Outcome::ContentUnread { identity }, None), None),
+  }
+}
+
+/// Applies the verdict `parts` holds to its green (A-805): at the head it was judged at, as its chain entry records it
+/// (`Green::apply_recorded`, the replay a recovery runs). Whether it committed as its version; false, nothing applied,
+/// where the green moved since or is not here.
+pub(crate) fn apply_accepted(state: &mut ShardState, parts: &AcceptedParts) -> bool {
+  let Some(mut engine) = state.greens.get_mut(&parts.green) else {
+    return false;
+  };
+  if engine.head().checked_add(1) != Some(parts.version) {
+    return false;
+  }
+  let applied = parts.applied.as_deref().unwrap_or_default();
+  engine.apply_recorded(&parts.increment, applied) == parts.version
 }
 
 /// A green's verdict on an increment and what it applied ([`slates_merge::engine`]'s `submit_resolved`).
@@ -10263,6 +10332,12 @@ type Judged = (
   slates_merge::engine::Outcome,
   Option<Vec<slates_merge::chain_entry::Applied>>,
 );
+
+/// Format: the largest work log a shard's partition has held, its bytes and its entries then (A-806's measure; a peak,
+/// read as the most over the shards, not their sum).
+const WORK_LOG_PEAK_BYTES: &str = "merge.work.log_peak_bytes";
+/// See [`WORK_LOG_PEAK_BYTES`].
+const WORK_LOG_PEAK_ENTRIES: &str = "merge.work.log_peak_entries";
 
 /// Format: the history values a submit's commit re-anchored (A-803's measure), summed: over `merge.submit.judge`, what a
 /// verdict walks of its paths' histories.
@@ -10458,10 +10533,11 @@ fn judge_submission(
     .map_or(0, |engine| engine.history_reanchored_values());
   let verdict_start = state.clock.monotonic_ns();
   // A verdict a holder computed (A-697 part c) is taken by position; any other is judged here.
-  let Some(judged) = verdict_of(state, green_id, sealed, &inc) else {
+  let hold = crate::made_commit::holds(state, green_id);
+  let Some(judged) = verdict_of(state, green_id, sealed, (&inc, hold)) else {
     return refused(Refusal::NotFound);
   };
-  let (outcome, applied) = match judged {
+  let ((outcome, applied), held_verdict) = match judged {
     Ok(judged) => judged,
     Err(reason) => {
       let _ = crate::merge_service::settle_green_retention(state, green_id);
@@ -10526,8 +10602,20 @@ fn judge_submission(
       // (`crate::made_commit`, main's landing order): the version, its revision's register entry and the answer are one
       // durable step after the revision's changeset lands on the node's store, by a task holding the turn. Nothing of
       // the accept is durable in this step, and the request is answered when that step commits.
-      if let Some(held) = crate::made_commit::take_held(state, green_id) {
-        return crate::made_commit::defer(state, held, parts, copies);
+      if let Some(judged) = held_verdict {
+        match crate::made_commit::take_held(state, green_id) {
+          Some(held) => return crate::made_commit::defer(state, held, parts, (copies, judged)),
+          // No turn to hold it with (not reached: `holds` said one was held): applied in this step as any accept is.
+          None => {
+            let committed = state
+              .greens
+              .get_mut(&green_id)
+              .map(|mut engine| engine.commit_judged(judged).is_ok());
+            if committed != Some(true) {
+              return refused(Refusal::Overloaded { shard: state.shard });
+            }
+          }
+        }
       }
       if let Err(refusal) = commit_accepted(state, parts) {
         return refused(refusal);
@@ -11262,25 +11350,25 @@ fn canonical_declaration(
 
 /// A resolution's changes applied over a work rebased onto `head` (A-796), as the work's own edits and declarations
 /// would be: each edit's operations from the file's length alone and its bytes as pieces over the head
-/// (`crate::work_files`), each declaration converted as `declare` converts it. The work's changed files then, whole,
-/// as a rebase restates them, and its journal.
+/// (`crate::work_files`), each declaration converted as `declare` converts it. The work's changed files then, as parts
+/// over the head as a rebase restates them (A-806), and its journal.
 fn apply_replacement(
   engine: &slates_merge::engine::Green,
   head: u64,
   (changed, mut journal): (
-    std::collections::BTreeMap<String, Option<Vec<u8>>>,
+    std::collections::BTreeMap<String, Option<crate::work_files::HeldParts>>,
     Vec<VolumeOp>,
   ),
   replacement: &[slates_ipc::protocol::WorkChange],
 ) -> Result<
   (
-    std::collections::BTreeMap<String, Option<Vec<u8>>>,
+    std::collections::BTreeMap<String, Option<crate::work_files::HeldParts>>,
     Vec<VolumeOp>,
   ),
   Refusal,
 > {
   use slates_ipc::protocol::WorkChange;
-  let mut files = crate::work_files::WorkFiles::from_changed(changed);
+  let mut files = crate::work_files::WorkFiles::from_parts(changed);
   let base = crate::work_files::Base {
     green: Some(engine),
     fetched: None,
@@ -11324,13 +11412,8 @@ fn apply_replacement(
       }
     }
   }
-  let restated = files
-    .changed_entries(base)
-    .map_err(|_| unknown())?
-    .into_iter()
-    .map(|(path, bytes)| (path.to_owned(), bytes.map(std::borrow::Cow::into_owned)))
-    .collect();
-  Ok((restated, journal))
+  // As parts over the head (A-806), as the rebase answered them: never a file materialized whole.
+  Ok((files.parts(), journal))
 }
 
 /// What `engine`'s rebase of `inc` gives a work over `green_id` (A-247, A-658): the work's new delta and journal over the
@@ -11363,6 +11446,16 @@ fn rebase_answer(
       } else {
         std::collections::BTreeMap::new()
       };
+      // Each changed file as its parts over the head's same path (A-806): what differs is written, the rest names the
+      // head, so neither the work nor its restatement holds the file.
+      let changed = changed
+        .into_iter()
+        .map(|(path, bytes)| {
+          let parts = bytes
+            .map(|bytes| crate::work_files::parts_over_base(&path, engine.content(&path), bytes));
+          (path, parts)
+        })
+        .collect();
       RebaseAnswer::Rebased {
         version,
         changed,
@@ -11423,7 +11516,7 @@ fn settle_rebase(
     crate::work_home::RebaseAnswer::Reply(reply) => return kept_conflict(state, work_id, reply),
   };
   let restated = crate::work_log::WorkLogEntry::restated(version, &changed, &journal);
-  let changed = crate::work_files::WorkFiles::from_changed(changed);
+  let changed = crate::work_files::WorkFiles::from_parts(changed);
   let wanted = crate::work_charge::footprint(&changed, &journal).saturating_add(
     entries
       .iter()
