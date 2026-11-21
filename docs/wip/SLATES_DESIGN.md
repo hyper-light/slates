@@ -58815,3 +58815,19 @@ Applied in the same change to: `crates/server/src/work_home.rs` (`SUBMIT_FORWARD
   take the kick of a control message published just before it looked, so the message stayed unseen while the shard
   parked, which matches the runs (every daemon idle, the replies never run; `343b741e`, in the range the stalls began).
   The rerun shows it gone if handed equals run.
+
+### A-801 — A green owner's asks counted by kind and its answers timed by kind; the load harness reports the server nodes' merge counters (2026-11-21, w-fed-move, goal 86b; main's order 00:48 PST, the throughput walls; A-247, A-797)
+- **Why.** At 100,000 clients on one primary and two replicas the green's owner was asked 10,141,852 times (about a
+  hundred asks a client) and verdicts held at 153 a second, but no counter named which asks or where the owner's time
+  went, and the load harness printed only the client node's counters, while the owner's work is on the primary.
+- **Change.** `crates/server/src/work_home.rs`: every ask is counted by its kind beside the total
+  (`merge.work.asked_owner.<files|lengths|page|sizes|verdict|rebase|admit|name>`), and the owner times each answer by
+  kind (`merge.work.answered.<kind>`, `..._ns`). `crates/client/examples/load_bench.rs`: `--report-instances` prints
+  each named node's merge counters (`server_counter` rows); `crates/cli/tests/load_scale.rs` passes its three servers.
+- **Measured** (release, in-process daemon, this Mac Studio, 2026-11-21 ~01:00, the kernel's `kernel/` directory, 754
+  files, 1,000 clients, one round, `--per-connection 32 --hot-files 300`, oracle clean, 6,040 verdicts a second):
+  17,545 asks, 17.5 a client. By kind: lengths 7,736 (2.6 µs each to answer), files 3,173 (5.1 µs), verdict 2,458
+  (41.2 µs), rebase 2,256 (17.9 µs), admit 968 (1.6 µs), name 954 (5.6 µs). The owner spends about 185 ms answering
+  in all, so at this scale it is not the wall; cutting the length asks (each work asks once per file it first edits,
+  and again after a rebase) would save little here. The 100,000-client wall grows with what scales (base lag, history,
+  works pinning the floor); main's rerun (r48) prints these counters from the primary to name it.
