@@ -179,9 +179,8 @@ pub(crate) trait SvnStores {
     principal: &Principal,
     record: Record,
   ) -> Option<Result<(), svn_commit::Uncommitted>>;
-  /// The root mount this daemon published (`ShardState::root_mount`, A-645 P3), beneath which a hook is shown its
-  /// repository; none before one is published, when a configured hook is refused.
-  fn root_mount(&self) -> Option<std::path::PathBuf>;
+  /// Where this shard shows a hook its repository (`ShardState::hook_views`, A-645 (a)).
+  fn hook_views(&self) -> crate::vcs_store::svn_presenter::HookViews;
   /// Runs `step` over repository `id`'s sources at the owner's instant; none when its store is not held here.
   fn lend<T>(
     &mut self,
@@ -620,7 +619,7 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     };
     let id = record.id;
     let policy = record.policy.clone();
-    let hooked = Hooked::new(id, &record.name, self.stores.root_mount());
+    let hooked = Hooked::new(id, &record.name, self.stores.hook_views());
     let room = self.bounds.limits.item_bytes;
     let called = {
       let Self {
@@ -711,7 +710,7 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     };
     let id = record.id;
     let policy = record.policy.clone();
-    let hooked = Hooked::new(id, &record.name, self.stores.root_mount());
+    let hooked = Hooked::new(id, &record.name, self.stores.hook_views());
     let room = self.bounds.limits.item_bytes;
     let site = HookSite::Tunnel(&policy, gone);
     // No verdict: the client left during a run (the module doc's hooks).
@@ -798,7 +797,7 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     };
     let id = record.id;
     let policy = record.policy.clone();
-    let hooked = Hooked::new(id, &record.name, self.stores.root_mount());
+    let hooked = Hooked::new(id, &record.name, self.stores.hook_views());
     let user = String::from_utf8_lossy(&self.user).into_owned();
     let mergeinfo = self
       .connection
@@ -879,7 +878,7 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     };
     let id = record.id;
     let policy = record.policy.clone();
-    let hooked = Hooked::new(id, &record.name, self.stores.root_mount());
+    let hooked = Hooked::new(id, &record.name, self.stores.hook_views());
     let transaction = work.record.transaction.clone();
     let landed = self
       .stores

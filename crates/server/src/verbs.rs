@@ -6759,7 +6759,7 @@ pub(crate) fn db_size(size: SizeClass) -> DbSizeClass {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn create(
+pub(crate) fn create(
   state: &mut ShardState,
   principal: &Principal,
   name: &str,
@@ -8817,12 +8817,12 @@ fn edit(
   // it now holds (copied from the base when it had not changed it), less what the splice deletes, and the journal's ops.
   // The base is read while its green is lent (`crate::greens`), and what comes out of it is owned.
   let read = crate::merge_service::with_work_base(state, w, |base| {
-    w.files.get(base, path).map(|old| {
+    w.files.len(base, path).map(|old_len| {
       let inserted = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-      let ops = crate::work_log::edit_ops(path, old.as_deref(), (at, delete_len, inserted));
-      let (spliced, removed) =
-        w.files
-          .splice_delta(path, old.as_deref(), (at, delete_len, bytes.len()));
+      let ops = crate::work_log::edit_ops(path, old_len, (at, delete_len, inserted));
+      let (spliced, removed) = w
+        .files
+        .splice_delta(path, old_len, (at, delete_len, bytes.len()));
       (ops, spliced, removed)
     })
   });
@@ -8908,11 +8908,12 @@ fn record_work_change(
     entry: slates_wire::Wire::to_bytes(&entry),
   };
   let now = state.clock.monotonic_ns();
-  state
-    .db
-    .partition()
-    .check(&op, now)
-    .map_err(|e| refusal_of_db(&e))?;
+  state.db.partition().check(&op, now).map_err(|e| {
+    if matches!(e, slates_db::DbError::Capacity { .. }) {
+      report_first_work_log_refusal(state);
+    }
+    refusal_of_db(&e)
+  })?;
   crate::work_charge::grow(state, work, added)
     .map_err(|available| Refusal::BudgetExceeded { available })?;
   if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {
@@ -8920,6 +8921,22 @@ fn record_work_change(
     return Err(refusal_of_db(&e));
   }
   Ok(())
+}
+
+/// Logs, once a process, what holds this partition's merge budget when a work's log is first refused at its cap
+/// (A-793 part 2; the debugging protocol's logging first): at 100,000 clients over the Linux kernel, 63,145 edits and
+/// 7,060 rebases were refused `TableAtCapacity` on the client node, whose work logs of about 130 bytes an edit could not
+/// have filled 373 MB a partition alone.
+fn report_first_work_log_refusal(state: &ShardState) {
+  static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+  if LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    return;
+  }
+  let held = state.db.partition().merge_budget_held();
+  slates_machine::log_line!(
+    "slates-server: work log refused at the merge budget (first occurrence): shard={} {held:?}",
+    state.shard
+  );
 }
 
 /// The `WorkRestated` record of `work` restated as `entry` (A-207): what an accepted submit or a rebase records.
@@ -9089,6 +9106,24 @@ fn declared_xattr<'a>(journal: &'a [VolumeOp], path: &str, name: &str) -> Option
   })
 }
 
+/// The post-state's length: past the last laid byte of a content, xattr or node op.
+fn post_state_size(doc: &slates_merge::ops_doc::OpsDoc) -> u64 {
+  use slates_merge::ops_doc::OpKind;
+  doc
+    .ops
+    .iter()
+    .filter(|op| {
+      op.src != u64::MAX
+        && matches!(
+          op.kind,
+          OpKind::Overwrite | OpKind::Insert | OpKind::Extend | OpKind::SetXattr | OpKind::Mknod
+        )
+    })
+    .map(|op| op.src.saturating_add(op.len))
+    .max()
+    .unwrap_or(0)
+}
+
 /// Assembles an increment's post-state from a work's content and journal (§4.16): the deriver lays the runs its
 /// content ops add out compactly, then the extended-attribute values and the special nodes, and each such op names
 /// its slice (`slates_merge::increment::compose_volume_planned`). A content op copies `len` bytes of its file from
@@ -9110,15 +9145,7 @@ fn assemble_post_state(
   use slates_merge::ops_doc::OpKind;
   let is_file_content =
     |kind: OpKind| matches!(kind, OpKind::Overwrite | OpKind::Insert | OpKind::Extend);
-  let mut size = 0u64;
-  for op in &doc.ops {
-    if op.src != u64::MAX
-      && (is_file_content(op.kind) || matches!(op.kind, OpKind::SetXattr | OpKind::Mknod))
-    {
-      size = size.max(op.src.saturating_add(op.len));
-    }
-  }
-  let mut post = vec![0u8; usize::try_from(size).unwrap_or(0)];
+  let mut post = vec![0u8; usize::try_from(post_state_size(doc)).unwrap_or(0)];
   for op in &doc.ops {
     if op.src == u64::MAX {
       continue;
@@ -9127,19 +9154,26 @@ fn assemble_post_state(
       continue;
     };
     let encoded_node;
-    let file_bytes;
-    // The bytes this op contributes, and the offset into them: a file's slice, or an xattr's value.
-    let (source, source_at): (&[u8], u64) = if is_file_content(op.kind) {
-      // The submit read the base already (`build_increment` refuses a work whose green is gone).
-      let Some(file) = files.get(base, path).ok().flatten() else {
+    if is_file_content(op.kind) {
+      // The file's bytes this op contributes, copied out of that range alone (a held file's pieces, never the whole
+      // file); a range the file does not wholly hold contributes nothing, as before. The submit read the base already
+      // (`build_increment` refuses a work whose green is gone).
+      let (Some(at), Ok(dst), Ok(len)) = (
+        plan.get(&op.src),
+        usize::try_from(op.src),
+        usize::try_from(op.len),
+      ) else {
         continue;
       };
-      let Some(at) = plan.get(&op.src) else {
-        continue;
-      };
-      file_bytes = file;
-      (&file_bytes, *at)
-    } else if op.kind == OpKind::Mknod {
+      if let Some(into) = post.get_mut(dst..dst.saturating_add(len))
+        && files.copy_range(base, path, *at, into).ok().flatten() != Some(len)
+      {
+        into.fill(0);
+      }
+      continue;
+    }
+    // The bytes this op contributes, and the offset into them: an xattr's value or a node.
+    let (source, source_at): (&[u8], u64) = if op.kind == OpKind::Mknod {
       let Some(node) = journal.iter().rev().find_map(|entry| match entry {
         VolumeOp::Mknod {
           path: declared,
@@ -9218,9 +9252,10 @@ fn build_increment(
     fetched: None,
     version: base_version,
   };
+  let kept = crate::refining::kept(state, sealed.work, (base_version, sealed.journal.len()));
   let inc = compose_increment(
     (sealed.work, base_version),
-    &base,
+    (&base, kept),
     (&sealed.files, files_base),
     &sealed.journal,
     evidence,
@@ -9234,34 +9269,33 @@ fn build_increment(
 /// increment is the same byte for byte wherever it is composed.
 pub(crate) fn compose_increment(
   (work_id, base_version): (DbVolumeId, u64),
-  base: &slates_merge::increment::Base,
+  (base, kept): (
+    &slates_merge::increment::Base,
+    Option<(
+      slates_merge::ops_doc::OpsDoc,
+      slates_merge::increment::PostStatePlan,
+    )>,
+  ),
   (files, files_base): (&crate::work_files::WorkFiles, crate::work_files::Base<'_>),
   journal: &[VolumeOp],
   evidence: Vec<[u8; 32]>,
 ) -> Result<slates_merge::engine::Increment, Refusal> {
-  let (mut doc, mut plan) = match slates_merge::increment::compose_volume_planned(base, journal) {
-    Ok(planned) => planned,
-    Err(e) => {
-      return Err(Refusal::BadRequest {
-        reason: format!("increment does not compose: {e:?}"),
-      });
-    }
-  };
   // A file the work replaced whole (an editor's write-and-rename, a formatter's or a codemod's rewrite) is judged as
-  // the edit it was, not a replacement of the file (D-O17, A-776; `slates_merge::refine`): the base bytes it was given
-  // and the bytes it wrote, both already held here, give the ranges it changed. A base this shard cannot read (a work
-  // off the green's shard whose base the owner did not send, A-247) keeps the replacement. The refiner's scratch is
-  // sized by the files it compares and dropped with this submit, so nothing stays resident between submits.
-  slates_merge::refine::refine_rewrites(
-    &mut doc,
-    &mut plan,
-    &mut slates_merge::refine::Refiner::new(),
-    &mut |base_path, path| {
-      let before = files_base.file(base_path).ok().flatten()?;
-      let after = files.get(files_base, path).ok().flatten()?;
-      Some((before, after))
+  // the edit it was, not a replacement of the file (D-O17, A-776; `slates_merge::refine`). Its refinement ran before
+  // this, a slice a turn, as a job of this shard (A-787 part 2, `crate::refining`): `kept` is its refined document and
+  // plan, the composition of this journal over this base. None: the journal replaces nothing whole, or the job gave up,
+  // and the composition stands as it is.
+  let (doc, plan) = match kept {
+    Some(refined) => refined,
+    None => match slates_merge::increment::compose_volume_planned(base, journal) {
+      Ok(planned) => planned,
+      Err(e) => {
+        return Err(Refusal::BadRequest {
+          reason: format!("increment does not compose: {e:?}"),
+        });
+      }
     },
-  );
+  };
   let post_state = assemble_post_state((&doc, &plan), (files, files_base), journal);
   // The identity names the work and its base before the post-state and the document (§4.16 data model:
   // `blake3(work_volume, base, post_state, ops_doc, filter)`), so the engine's retry cache answers only a
@@ -9918,6 +9952,18 @@ fn submit(
       if let Err(refusal) = reset_would_fit(state, work_id, now) {
         return refused(refusal);
       }
+      // A whole-file rewrite is refined first, a slice a turn, by a job of this shard (A-787 part 2): the submit waits.
+      if let Some(owed) = refinement_owed(state, (work_id, green_id)) {
+        let kind = ParkedKind::Local {
+          principal: principal.clone(),
+          work,
+          evidence,
+          signature,
+          authorship,
+          approval,
+        };
+        return park_on_refinement(state, (work_id, green_id), owed, kind);
+      }
       let Some(sealed) = take_sealed(state, work_id) else {
         return refused(Refusal::NotFound);
       };
@@ -10465,6 +10511,15 @@ fn rebase(state: &mut ShardState, principal: &Principal, work: VolumeId) -> Repl
   let answer = match state.work_home.rebased.take() {
     Some(answer) => answer,
     None => {
+      if state.greens.contains_key(&green_id)
+        && let Some(owed) = refinement_owed(state, (work_id, green_id))
+      {
+        let kind = ParkedKind::LocalRebase {
+          principal: principal.clone(),
+          work,
+        };
+        return park_on_refinement(state, (work_id, green_id), owed, kind);
+      }
       let Some(sealed) = take_sealed(state, work_id) else {
         return refused(Refusal::NotFound);
       };
@@ -10560,9 +10615,14 @@ pub(crate) fn compose_on_replica(
     fetched: None,
     version: sealed.base_version,
   };
+  let kept = crate::refining::kept(
+    state,
+    sealed.work,
+    (sealed.base_version, sealed.journal.len()),
+  );
   let inc = compose_increment(
     (sealed.work, sealed.base_version),
-    &base,
+    (&base, kept),
     (&sealed.files, files_base),
     &sealed.journal,
     evidence,
@@ -10652,6 +10712,7 @@ fn settle_rebase(
     } => (version, changed, journal, entries),
     crate::work_home::RebaseAnswer::Reply(reply) => return kept_conflict(state, work_id, reply),
   };
+  let restated = crate::work_log::WorkLogEntry::restated(version, &changed, &journal);
   let changed = crate::work_files::WorkFiles::from_changed(changed);
   let wanted = crate::work_charge::footprint(&changed, &journal).saturating_add(
     entries
@@ -10659,10 +10720,7 @@ fn settle_rebase(
       .map(|(path, base)| crate::work_charge::base_footprint(path, base))
       .fold(0, u64::saturating_add),
   );
-  let op = restatement(
-    work_id,
-    &crate::work_log::WorkLogEntry::restated(version, &changed, &journal),
-  );
+  let op = restatement(work_id, &restated);
   let now = state.clock.monotonic_ns();
   if let Err(e) = state.db.partition().check(&op, now) {
     return refused(refusal_of_db(&e));
@@ -10920,6 +10978,31 @@ pub(crate) fn owner_files(
   fetched
 }
 
+/// The base's lengths of `paths`, with their base entries, for an edit or a declaration on a work's shard (A-247):
+/// never their bytes, since a work's first edit of a file holds the base's ranges as pieces (`crate::work_files`).
+pub(crate) fn owner_lengths(
+  state: &ShardState,
+  green: DbVolumeId,
+  version: u64,
+  paths: &[String],
+) -> crate::work_files::FetchedBase {
+  let mut fetched = crate::work_files::FetchedBase::default();
+  let Some(engine) = base_engine(state, green) else {
+    fetched.gone = true;
+    return fetched;
+  };
+  for path in paths {
+    let len = engine
+      .content_len_at(path, version)
+      .map(|len| u64::try_from(len).unwrap_or(u64::MAX));
+    fetched.lengths.insert(path.clone(), len);
+    fetched
+      .entries
+      .insert(path.clone(), engine.path_base(version, path));
+  }
+  fetched
+}
+
 /// A page of the base's `path` for a paged read on a work's shard (A-247).
 pub(crate) fn owner_page(
   state: &ShardState,
@@ -11109,6 +11192,13 @@ enum ParkedKind {
     /// Its approval.
     approval: Approval,
   },
+  /// A rebase asked on the green's shard, parked behind its work's refinement (A-787 part 2).
+  LocalRebase {
+    /// Who asked.
+    principal: Principal,
+    /// The work.
+    work: VolumeId,
+  },
 }
 
 /// Parks the running submit behind `green`'s build: its request deferred as an acceptance that waits is (no completion,
@@ -11132,6 +11222,52 @@ fn park_submit(state: &mut ShardState, green: DbVolumeId, kind: ParkedKind) -> R
     }
     Err(refusal) => refused(refusal),
   }
+}
+
+/// Parks the running local verb of `work` behind its refinement (A-787 part 2, `crate::refining`), starting the job: no
+/// reply now, the verb run again and answered on its route when the job ends; `Overloaded` at the bound or when the job
+/// cannot start.
+fn park_on_refinement(
+  state: &mut ShardState,
+  (work, green): (DbVolumeId, DbVolumeId),
+  owed: crate::refining::Owed,
+  kind: ParkedKind,
+) -> ReplyBody {
+  let Some((origin, id)) = state.current_request else {
+    return refused(Refusal::Overloaded { shard: state.shard });
+  };
+  if !crate::refining::start(state, (work, green), owed) {
+    return refused(Refusal::Overloaded { shard: state.shard });
+  }
+  let parked = ParkedSubmit {
+    origin,
+    id,
+    route: state.reply_route,
+    kind,
+    parked_ns: state.clock.monotonic_ns(),
+  };
+  match crate::refining::park(state, work, parked) {
+    // No reply now: the deferred verb's is not sent (only a refusal would be), and the verb run again answers on its
+    // route once the job ends, as a verb parked on its green's owner is (A-247).
+    Ok(()) => {
+      state.reply_route = None;
+      state.acceptance_deferred = true;
+      crate::lease_wait::parked_reply()
+    }
+    Err(refusal) => refused(refusal),
+  }
+}
+
+/// The refinement `work`'s journal owes on this shard (A-787 part 2), read where the work holds it.
+fn refinement_owed(
+  state: &ShardState,
+  (work, green): (DbVolumeId, DbVolumeId),
+) -> Option<crate::refining::Owed> {
+  let w = state.works.get(&work)?;
+  if crate::work_home::holds_copy(&w.journal) {
+    return None;
+  }
+  crate::refining::owed(state, (work, green, w.base_version), &w.journal)
 }
 
 /// Runs each parked submit again in its own transaction, in the order they came, and answers it on its route.
@@ -11163,6 +11299,9 @@ pub(crate) fn resume_all(state: &mut ShardState, parked: Vec<ParkedSubmit>) {
         let verb = (work, (evidence, signature, authorship), approval);
         resumed_local(state, (origin, id), route, &principal, verb)
       }
+      ParkedKind::LocalRebase { principal, work } => {
+        resumed_rebase(state, (origin, id), route, &principal, work)
+      }
     };
     if let (Some(reply), Some(route)) = (reply, route)
       && !answered_on(route, (origin, id), reply)
@@ -11174,6 +11313,35 @@ pub(crate) fn resume_all(state: &mut ShardState, parked: Vec<ParkedSubmit>) {
 
 /// A parked local submit run again in its own transaction, as `run_recorded` runs a verb: its reply, recorded as its
 /// completion, or none where it waits again (an acceptance deferred, or parked behind a later build).
+/// [`resumed_local`] for a parked rebase: the verb run again in its own transaction, its completion recorded.
+fn resumed_rebase(
+  state: &mut ShardState,
+  (origin, id): (u64, RequestId),
+  route: Option<crate::merge_service::ReplyRoute>,
+  principal: &Principal,
+  work: VolumeId,
+) -> Option<ReplyBody> {
+  state.db.begin();
+  state.current_request = Some((origin, id));
+  state.reply_route = route;
+  let reply = rebase(state, principal, work);
+  state.current_request = None;
+  state.reply_route = None;
+  let deferred = std::mem::take(&mut state.acceptance_deferred);
+  let reply = if deferred {
+    reply
+  } else {
+    record_completion(state, origin, id, reply)
+  };
+  match state.db.commit(&mut state.segment) {
+    Ok(_) => (!deferred).then_some(reply),
+    Err(error) => {
+      reconcile_unpublished_effects(state);
+      Some(refused(refusal_of_db(&error)))
+    }
+  }
+}
+
 fn resumed_local(
   state: &mut ShardState,
   (origin, id): (u64, RequestId),
@@ -17559,6 +17727,45 @@ fn keep_unrecovered_mounts(state: &mut ShardState, record: &VolumeRecord) -> usi
   ended
 }
 
+/// A mounted work's slot, from its image, with what its mount wrote and has not submitted (A-774, A-127); refused and
+/// counted where it cannot be rebuilt.
+fn rebuild_mounted_slot(
+  state: &mut ShardState,
+  record: &VolumeRecord,
+  (images, claims): (
+    &std::collections::BTreeMap<[u8; 16], VolumeImage>,
+    Option<&slates_vfs::recover::Claims>,
+  ),
+  max_prefix: &mut u16,
+) {
+  let Some(pin) = crate::mounted_work::recovered_pin(state, record.id) else {
+    return;
+  };
+  if !images.contains_key(&record.id.bytes) {
+    return;
+  }
+  match rebuild_volume(
+    state,
+    record,
+    images.get(&record.id.bytes),
+    claims,
+    Some(pin),
+  ) {
+    Ok(prefix) => {
+      *max_prefix = (*max_prefix).max(prefix.wrapping_add(1).max(1));
+      state.merge.mounted.insert(record.id, pin);
+    }
+    Err(cause) => {
+      slates_machine::log_line!(
+        "slates-server: partition {}: mounted work {} not rebuilt: {cause:?}",
+        state.partition,
+        record.name
+      );
+      state.count(crate::mounted_work::MOUNT_SLOT_REFUSED, 1);
+    }
+  }
+}
+
 /// Rebuilds one recorded volume by its role; false when a plain volume could not be (refused and logged, never
 /// presented empty), which leaves it out of the reconciliation.
 async fn rebuild_record(
@@ -17602,31 +17809,7 @@ async fn rebuild_record(
     Role::Work { green, .. } => {
       rebuild_work(state, record, green);
       rebuilt.merge_volumes = rebuilt.merge_volumes.saturating_add(1);
-      // A mounted work's slot, from its image, with what its mount wrote and has not submitted (A-774, A-127).
-      if let Some(pin) = crate::mounted_work::recovered_pin(state, record.id)
-        && images.contains_key(&record.id.bytes)
-      {
-        match rebuild_volume(
-          state,
-          record,
-          images.get(&record.id.bytes),
-          claims,
-          Some(pin),
-        ) {
-          Ok(prefix) => {
-            *max_prefix = (*max_prefix).max(prefix.wrapping_add(1).max(1));
-            state.merge.mounted.insert(record.id, pin);
-          }
-          Err(cause) => {
-            slates_machine::log_line!(
-              "slates-server: partition {}: mounted work {} not rebuilt: {cause:?}",
-              state.partition,
-              record.name
-            );
-            state.count(crate::mounted_work::MOUNT_SLOT_REFUSED, 1);
-          }
-        }
-      }
+      rebuild_mounted_slot(state, record, (images, claims), max_prefix);
     }
     Role::Plain => {
       match rebuild_volume(state, record, images.get(&record.id.bytes), claims, None) {

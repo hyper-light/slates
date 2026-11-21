@@ -77,27 +77,35 @@ fn memcpy_rate() -> u64 {
     / ns
 }
 
-fn main() {
-  let head = std::env::args().nth(1).expect("the head commit's hex");
-  let head = ObjectId::from_hex(ObjectFormat::Sha1, head.as_bytes()).expect("a SHA-1 hex id");
+/// A step's failure, named by what it was to give.
+fn why<E: std::fmt::Debug>(what: &'static str) -> impl FnOnce(E) -> String {
+  move |error| format!("{what}: {error:?}")
+}
+
+fn main() -> Result<(), String> {
+  let head = std::env::args()
+    .nth(1)
+    .ok_or_else(|| "the head commit's hex".to_owned())?;
+  let head =
+    ObjectId::from_hex(ObjectFormat::Sha1, head.as_bytes()).map_err(why("a SHA-1 hex id"))?;
   let mut pack = Vec::new();
   std::io::stdin()
     .read_to_end(&mut pack)
-    .expect("the pack on standard input");
+    .map_err(why("the pack on standard input"))?;
   let unpacked = read_whole(
     &pack,
     ObjectFormat::Sha1,
     &NoIndex,
     &mut Admission::new(u64::MAX),
   )
-  .expect("a whole pack");
+  .map_err(why("a whole pack"))?;
   drop(pack);
   let input: u64 = unpacked
     .objects
     .iter()
     .map(|object| object.content.len() as u64)
     .sum();
-  let mut store = ContentStore::new(BUDGET, WINDOW).expect("a content store");
+  let mut store = ContentStore::new(BUDGET, WINDOW).map_err(why("a content store"))?;
   let mut repository = Repository::new(ObjectFormat::Sha1);
   let mut push = Push::new(ObjectFormat::Sha1);
   let naming = repository.naming();
@@ -110,15 +118,15 @@ fn main() {
         at: 0,
       },
     )
-    .expect("every object admitted");
+    .map_err(why("every object admitted"))?;
   drop(unpacked);
-  repository.seal(&store, &mut push).expect("sealed");
+  repository.seal(&store, &mut push).map_err(why("sealed"))?;
   let moved = repository
     .admit(&store, &push, 1, Some(head))
-    .expect("main admitted");
+    .map_err(why("main admitted"))?;
   repository
     .commit(&mut store, &mut push, &[moved])
-    .expect("committed");
+    .map_err(why("committed"))?;
   let exchange = Exchange {
     ns: NANOS_PER_SECOND,
     bytes: memcpy_rate(),
@@ -127,9 +135,12 @@ fn main() {
   let start = Instant::now();
   repository
     .encode_fragments(&mut store, (1, 0), &mut Wall(Instant::now()), exchange)
-    .expect("encoded");
+    .map_err(why("encoded"))?;
   let ns = start.elapsed().as_nanos();
-  let out = repository.fragments_len(1, 0).expect("the fragments kept");
+  let out = repository
+    .fragments_len(1, 0)
+    .ok_or_else(|| "the fragments kept".to_owned())?;
   let per_mib = ns.saturating_mul(MIB) / u128::from(input.max(1));
   println!("encode_ns={ns} input_bytes={input} fragments_bytes={out} ns_per_input_mib={per_mib}");
+  Ok(())
 }

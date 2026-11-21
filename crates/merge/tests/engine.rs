@@ -1099,9 +1099,10 @@ fn assert_retry_semantics(green: &mut Green, first: &Outcome) {
   );
 }
 
-/// §4.2 all-cost admission, §4.16 "delta retention before folding" (AUD-16) and "Splice" (W2): small edits to a large
-/// file retain what they changed, not the file. After `SMALL_EDITS` four-byte overwrites of a 64 KiB file the content
-/// history holds less than one copy of it (it held one whole copy per edit, eight here, before 2026-11-07), the
+/// §4.2 all-cost admission, §4.16 "delta retention before folding" (AUD-16) and "Splice" (W2, A-793): small edits to a
+/// large file retain what they changed, not the file. After `SMALL_EDITS` four-byte overwrites of a 64 KiB file the
+/// content history holds their bytes and pieces (it held one whole copy per edit, eight here, before 2026-11-07, and
+/// the file as it was before them until A-793), the
 /// engine's running total equals the recount, and every version still reconstructs. Folding to a reader's version
 /// stops there, balanced, keeping every version at or above it; folding to the head releases everything no reader can
 /// name, keeping the current file exactly.
@@ -1120,6 +1121,125 @@ fn small_edits_to_a_large_file_are_charged_as_retained_history_and_fold_below_th
   let head = green.head();
   assert_fold_bounded_by_the_reachable_floor(&mut green, head);
   assert_fold_to_head(&mut green, head);
+}
+
+/// Shape: the files the many-files retention test edits, each once and then again, every version kept readable.
+const EDITED_FILES: u8 = 32;
+/// Shape: each such file's length, large against the slot each edit writes, as a kernel source file is (the Linux tree's
+/// files average about 20 KB; goal 86b's edits write 64-byte slots).
+const EDITED_FILE_BYTES: usize = 16 * 1024;
+/// Shape: the slot each edit writes, goal 86b's harness's (`SLOT_BYTES` in `crates/client/examples/load_bench.rs`).
+const EDIT_SLOT_BYTES: usize = 64;
+/// Shape: the pieces one overwrite inside a file may leave an earlier value of it (the runs before, at and after the
+/// slot), the list cost the retention bound below allows each edit per version it is read at.
+const PIECES_PER_EDIT: usize = 3;
+/// Format: one piece's list entry, as `crate::history::PIECE_BYTES` measures it (a chunk index, an offset, a length).
+const PIECE_LIST_BYTES: usize = 3 * size_of::<usize>();
+
+/// A-793 (goal 86b; §4.16 "Splice", "delta retention before folding"): small edits to many files, with every version
+/// kept readable (no fold, as while a work holds the floor), retain what they wrote and their piece lists, never a
+/// copy of each file. At 100,000 clients over the Linux kernel every file's first change kept its whole earlier block:
+/// about 73 KB of retention a version for 256 bytes written, so the green's cap (373 MB) refused 94,877 of 100,000
+/// submits `BudgetExceeded` after 5,123 accepts. Here each of `EDITED_FILES` files is overwritten in one slot, then each
+/// again in another: what the history retains is bounded by the slots written and the pieces they split, the running
+/// total equals the recount, and every version reads back.
+#[test]
+fn small_edits_to_many_files_retain_what_they_wrote_not_the_files() {
+  let mut green = Green::new();
+  let file = |n: u8| vec![b'a'.wrapping_add(n % 26); EDITED_FILE_BYTES];
+  let path = |n: u8| format!("f{n:02}");
+  let mut create = Build::new();
+  for n in 0..EDITED_FILES {
+    create.create(&path(n), &file(n));
+  }
+  assert_eq!(
+    green.submit(&create.at(1, 0)),
+    Outcome::Accepted { version: 1 }
+  );
+  let slot = |n: u8, pass: u8| -> (u64, Vec<u8>) {
+    let at = (usize::from(n) * 3 + usize::from(pass) * 7) % (EDITED_FILE_BYTES / EDIT_SLOT_BYTES);
+    (
+      u64::try_from(at * EDIT_SLOT_BYTES).unwrap(),
+      vec![b'0' + pass; EDIT_SLOT_BYTES],
+    )
+  };
+  let mut id = 2u8;
+  for pass in 0..2u8 {
+    for n in 0..EDITED_FILES {
+      let base = green.head();
+      let (at, bytes) = slot(n, pass);
+      let outcome = green.submit(&Build::new().overwrite(&path(n), at, &bytes).at(id, base));
+      assert_eq!(
+        outcome,
+        Outcome::Accepted { version: base + 1 },
+        "file {n}, pass {pass}"
+      );
+      id = id.wrapping_add(1);
+    }
+  }
+  let retained = green.retained_bytes();
+  let edits = 2 * usize::from(EDITED_FILES);
+  // Each edit keeps the slot it overwrote, and each version a file was read at may hold its pieces.
+  let bound = edits * (EDIT_SLOT_BYTES + 2 * PIECES_PER_EDIT * PIECE_LIST_BYTES);
+  assert!(
+    retained.history <= bound,
+    "{edits} edits of {EDIT_SLOT_BYTES} bytes retained {} bytes of history, over {bound}; the files are \
+     {EDITED_FILE_BYTES} bytes each",
+    retained.history
+  );
+  assert_eq!(
+    retained.content,
+    usize::from(EDITED_FILES) * EDITED_FILE_BYTES,
+    "each current file once"
+  );
+  assert_eq!(
+    retained.history,
+    green.history_bytes_recounted(),
+    "balanced"
+  );
+  for n in 0..EDITED_FILES {
+    let mut expected = file(n);
+    let mut version_of_pass = Vec::new();
+    for pass in 0..2u8 {
+      let version = 2 + u64::from(pass) * u64::from(EDITED_FILES) + u64::from(n);
+      let (at, bytes) = slot(n, pass);
+      let at = usize::try_from(at).unwrap();
+      version_of_pass.push((version, expected.clone()));
+      expected[at..at + EDIT_SLOT_BYTES].copy_from_slice(&bytes);
+      version_of_pass.push((version, expected.clone()));
+    }
+    let [
+      (before_first, original),
+      (first, once),
+      (before_second, _),
+      (second, twice),
+    ] = version_of_pass.try_into().unwrap();
+    assert_eq!(
+      green.content_at(&path(n), before_first - 1).unwrap(),
+      original,
+      "file {n} before its edits"
+    );
+    assert_eq!(
+      green.content_at(&path(n), first).unwrap(),
+      once,
+      "file {n} after its first edit"
+    );
+    assert_eq!(
+      green.content_at(&path(n), before_second - 1).unwrap(),
+      once,
+      "file {n} between its edits"
+    );
+    assert_eq!(
+      green.content_at(&path(n), second).unwrap(),
+      twice,
+      "file {n} after its second edit"
+    );
+    assert_eq!(
+      green.content(&path(n)).unwrap(),
+      twice.as_slice(),
+      "file {n} at the head"
+    );
+  }
 }
 
 /// Folding is floor-bounded: with a live reader at version 3 and no budget at all, the fold stops at 3, balanced, and
@@ -1164,16 +1284,18 @@ fn apply_small_edits(green: &mut Green) {
   }
 }
 
-/// What the edits retained: the file as it was before them, once (its earlier block, which every version shares runs
-/// of), and what the edits wrote, never a copy per edit (one whole copy per edit before W2); the running total equal to
-/// the recount, the current file held once, and every version reconstructing. Since A-728 part 4 the earlier file is
-/// charged as the history's, which in memory it always was: before, the latest value's copy had stood in for the
-/// current file's bytes, and the earlier file went uncharged.
+/// What the edits retained: the bytes each overwrote, which the earlier versions read, and the pieces the earlier
+/// versions name of the current file's block; never the file as it was before them (A-728 part 2 kept that block
+/// whole, which A-793 cut), nor a copy per edit (one whole copy per edit before W2); the running total equal to the
+/// recount, the current file held once, and every version reconstructing.
 fn assert_shared(green: &Green) {
   let retained = green.retained_bytes();
+  let edits = usize::try_from(SMALL_EDITS).unwrap();
+  // Each edit's 4 overwritten bytes, and each version's pieces: at most the runs between the edits, two per edit more.
+  let bound = edits * 4 + (edits + 1) * (2 * edits + 1) * 3 * size_of::<usize>();
   assert!(
-    retained.history >= LARGE_FILE_BYTES && retained.history < 2 * LARGE_FILE_BYTES,
-    "{} small edits retained {} bytes; the earlier file is {LARGE_FILE_BYTES}, once",
+    retained.history <= bound,
+    "{} small edits retained {} bytes, over {bound}; the earlier file is {LARGE_FILE_BYTES}",
     SMALL_EDITS,
     retained.history
   );

@@ -59,6 +59,10 @@ mod anchor_hold;
 #[cfg(windows)]
 #[path = "anchor_hold_windows.rs"]
 mod anchor_hold;
+// The content pool's extents as sections of their own on Windows, held by the anchor across a restart (A-789).
+#[cfg(windows)]
+#[path = "content_extents_windows.rs"]
+mod content_extents;
 pub mod dns;
 pub mod doorbell;
 pub mod error;
@@ -107,6 +111,7 @@ mod mounted_work;
 mod moves;
 // A host admitted again under its own id yields the volumes it catalogued (A-334, §4.8 "Authority scope").
 mod readmission;
+mod refining;
 mod remote_attach;
 mod work_home;
 // The writes acknowledged since the last publication, kept in anchor RAM (A-63): a FUSE mount's (Linux) and a Shards

@@ -1408,6 +1408,11 @@ impl ShardContext {
       // Idle: one slice of the registered idle work, then the loop looks for work again; it parks once the idle
       // work has none left (§4.2, "the shard schedules a pre-fault task on its idle time").
       if self.idle_slice() {
+        // The driver is harvested between idle slices, as the idle spin harvests it each turn: a step queues only what
+        // is already woken, and only a park, the spin or a busy stretch's quantum ask the driver, so without this a
+        // socket's readiness waited for the idle work to run out (the daemon's memory sweep on idle time held live
+        // writes 50-120 ms, g228; `tests/idle_work_io.rs`).
+        let _ = self.harvest_io();
         continue;
       }
       self.park(outcome.next_deadline_ns);

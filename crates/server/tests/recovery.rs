@@ -3988,7 +3988,7 @@ fn a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone() {
   let started = Instant::now();
   let mut after = pool_resident(&anchor);
   while after.saturating_sub(before) * 4 >= file && started.elapsed() < IDLE_WAIT {
-    std::thread::sleep(Duration::from_millis(250));
+    std::thread::yield_now();
     let _ = daemon.publish_every_shard();
     after = pool_resident(&anchor);
   }

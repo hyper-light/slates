@@ -159,8 +159,8 @@ const REFS: &str = "refs/";
 pub(crate) const HOOK_NOT_RUN: &[u8] = b"hook not run";
 
 /// Slates' words: the reason every command of a push is given while a git hook is configured for its repository and
-/// this daemon has published no root mount to show the hook its view beneath (A-645 P3, main's ruling 1).
-pub(crate) const ROOT_UNPUBLISHED: &[u8] = b"root mount not yet published";
+/// this daemon holds no standing grant to show the hook its view under (A-645 (a): `--vcs-store`).
+pub(crate) const ROOT_UNPUBLISHED: &[u8] = b"no standing grant to show a hook its view";
 
 /// Slates' words: the reason every command of a push is given whose objects its repository's store did not admit (the
 /// shard's budget, or an object the store refused).
@@ -314,11 +314,12 @@ struct DecidingPush {
   then: Option<hooks::PushHooks>,
 }
 
-/// Where the homing of a push's names stands (A-724 piece 8c; main's ruling of 2026-11-20 (ii): content durable at
-/// `f + 1` in the region before the record that names it). While `crate::vcs_store::write_version_3`, the decision's
-/// first turn puts the names the record would carry as one content and asks the edge to home them
-/// ([`ReceivePack::take_homing`]); the decision waits, a turn at a time, until the edge hands back the outcome
-/// ([`ReceivePack::homed`]); homed, the record is written as version 3, else as version 2.
+/// Where the homing of a push's names and pack stands (A-724 piece 8c; A-722's record v4; main's ruling of 2026-11-20
+/// (ii): content durable at `f + 1` in the region before the record that names it). While
+/// `crate::vcs_store::write_version_4`, the decision's first turn puts the names the record would carry as one content
+/// and asks the edge to home them ([`ReceivePack::take_homing`]); the decision waits, a turn at a time, until the edge
+/// hands back the outcome ([`ReceivePack::homed`]); then it asks the same of the pack its staging put in the store.
+/// Both homed, the record is written as version 4, naming each; else as version 2.
 #[derive(Debug)]
 enum Homing {
   /// Not yet asked.
@@ -327,6 +328,12 @@ enum Homing {
   Asked(Vec<u8>, (slates_vcs::ContentId, u64)),
   /// Taken by the edge, its outcome awaited.
   Waiting((slates_vcs::ContentId, u64)),
+  /// The names homed: the pack is asked next.
+  PackDue,
+  /// Asked: the pack's bytes, for the edge to take, its identity and length (held for the record).
+  PackAsked(Vec<u8>, (slates_vcs::ContentId, u64)),
+  /// The pack taken by the edge, its outcome awaited.
+  PackWaiting((slates_vcs::ContentId, u64)),
   /// Done, or never asked: the decision goes on.
   Done,
 }
@@ -584,7 +591,7 @@ impl<P> ReceivePack<P> {
     let checked = self.session.checked().ok_or(PushFailed::Unchecked)?;
     if let Some(hook) = git_hook(&record).filter(|_| !can_present) {
       self.give_back(state);
-      let answering = self.declined(&mut Declining::hook(hook, state.root_mount.is_some()), out)?;
+      let answering = self.declined(&mut Declining::hook(hook, state.hook_views.shows()), out)?;
       return Ok(Begun::Answering(Box::new(answering)));
     }
     let quarantine = (self.quarantine.take(), self.unadmitted.take());
@@ -671,7 +678,7 @@ impl<P> ReceivePack<P> {
       admitting: None,
       restaging: None,
       preparing: None,
-      homing: if crate::vcs_store::write_version_3() {
+      homing: if crate::vcs_store::write_version_4() {
         Homing::Due
       } else {
         Homing::Done
@@ -760,14 +767,22 @@ impl<P> ReceivePack<P> {
           None => true,
         }
       }
-      // Asked and not taken by the turn after: no edge homes it (a driver that never asks), so the names are given back
+      // Asked and not taken by the turn after: no edge homes it (a driver that never asks), so the content is given back
       // and the record is version 2, never a decision waiting for a homing nobody runs.
-      Homing::Asked(_, (identity, _)) => {
+      Homing::Asked(_, (identity, _)) | Homing::PackAsked(_, (identity, _)) => {
         crate::vcs_store::release_names(state, &identity);
         crate::vcs_store::homes::count_untaken(state);
         true
       }
-      waiting @ Homing::Waiting(_) => {
+      // The pack the staging put in the store, held once more for the record (A-722's record v4), and asked of the edge.
+      Homing::PackDue => match decision.sealed.pack_to_home() {
+        Some((bytes, packed)) if crate::vcs_store::hold_for_record(state, &packed.0) => {
+          decision.homing = Homing::PackAsked(bytes, packed);
+          false
+        }
+        _ => true,
+      },
+      waiting @ (Homing::Waiting(_) | Homing::PackWaiting(_)) => {
         decision.homing = waiting;
         false
       }
@@ -785,6 +800,10 @@ impl<P> ReceivePack<P> {
         decision.homing = Homing::Waiting(named);
         Some(bytes)
       }
+      Homing::PackAsked(bytes, packed) => {
+        decision.homing = Homing::PackWaiting(packed);
+        Some(bytes)
+      }
       other => {
         decision.homing = other;
         None
@@ -792,8 +811,9 @@ impl<P> ReceivePack<P> {
     }
   }
 
-  /// What the region answered of the names [`Self::take_homing`] gave: homed under their identity, the record is written
-  /// as version 3; else their hold is given back and the record is version 2.
+  /// What the region answered of the names or the pack [`Self::take_homing`] gave: the names homed under their identity,
+  /// the pack is asked next; the pack homed too, the record is written as version 4 naming both; else the content's
+  /// hold is given back and the record is version 2.
   pub(crate) fn homed(
     &mut self,
     state: &mut ShardState,
@@ -802,15 +822,24 @@ impl<P> ReceivePack<P> {
     let AnswerState::Deciding(decision) = &mut self.answer else {
       return;
     };
-    let Homing::Waiting((identity, count)) = core::mem::replace(&mut decision.homing, Homing::Done)
-    else {
-      return;
-    };
-    if homed.as_ref().is_ok_and(|homed| *homed == identity) {
-      decision.sealed.homed_as((identity, count));
-      return;
+    match core::mem::replace(&mut decision.homing, Homing::Done) {
+      Homing::Waiting((identity, count)) => {
+        if homed.as_ref().is_ok_and(|homed| *homed == identity) {
+          decision.sealed.homed_as((identity, count));
+          decision.homing = Homing::PackDue;
+          return;
+        }
+        crate::vcs_store::release_names(state, &identity);
+      }
+      Homing::PackWaiting((identity, len)) => {
+        if homed.as_ref().is_ok_and(|homed| *homed == identity) {
+          decision.sealed.pack_homed_as((identity, len));
+          return;
+        }
+        crate::vcs_store::release_names(state, &identity);
+      }
+      other => decision.homing = other,
     }
-    crate::vcs_store::release_names(state, &identity);
   }
 }
 
@@ -1416,7 +1445,7 @@ impl Declining {
   fn hook(hook: &HookConfig, root_published: bool) -> Declining {
     if !root_published {
       let why = format!(
-        "the repository's {} hook cannot run here: this daemon's root mount is not yet published",
+        "the repository's {} hook cannot run here: this daemon holds no standing grant to show it its view (--vcs-store)",
         hook.name
       );
       return Declining {

@@ -402,13 +402,14 @@ pub(crate) fn supervise(options: &ProcessOptions, daemon_args: &[String]) -> Res
       config.held_copy_bound(),
     )
     .map_err(|e| failed("hold channel", e))?;
-  // Windows holds each class of entry to its own bound: the attachments' mounts and resync ends, and the Shards streams'
-  // DAX sections (A-448).
+  // Windows holds each class of entry to its own bound: the attachments' mounts and resync ends, the Shards streams'
+  // DAX sections (A-448), and the content pool's extents (A-789).
   #[cfg(windows)]
   supervisor
     .hold_handles(slates_anchor::handles::HoldBounds {
       attachments: config.held_device_bound(),
       sections: config.held_dax_bound(),
+      extents: config.held_extent_bound(),
     })
     .map_err(|error| failed("hold channel", error))?;
   // The anchor holds a duplicate of every device and connection it is sent, so it needs the descriptors its bounds

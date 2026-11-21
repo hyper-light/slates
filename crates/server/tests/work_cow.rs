@@ -79,19 +79,32 @@ fn path(index: usize) -> String {
   format!("dir-{:02}/file-{index:05}", index % 64)
 }
 
-/// A green of `sizes.files` files of `sizes.file_bytes` each, landed by one seed work.
+/// Shape: the most bytes and files one seed work lands: a submit of a whole 1 GiB or 100,000-file green holds its
+/// shard past its liveness window, and the watchdog ends the daemon (GAPS, 2026-11-20), so the green is seeded in parts.
+const SEED_BYTES: usize = 16 * 1024 * 1024;
+/// Shape: see [`SEED_BYTES`].
+const SEED_FILES: usize = 5000;
+
+/// A green of `sizes.files` files of `sizes.file_bytes` each, landed by seed works of at most [`SEED_FILES`] files and
+/// [`SEED_BYTES`] bytes each.
 fn populated_green(client: &mut Client, sizes: Sizes) -> VolumeId {
   let green = client.create_green("cow-green", false).unwrap();
-  let (seed, _) = client.create_work(green, "cow-seed").unwrap();
+  let per_seed = (SEED_BYTES / sizes.file_bytes.max(1)).clamp(1, SEED_FILES);
   let mut bytes = vec![0u8; sizes.file_bytes];
-  for index in 0..sizes.files {
-    bytes.fill(u8::try_from(index % 251).unwrap());
-    client.edit(seed, &path(index), 0, 0, &bytes).unwrap();
+  for (part, first) in (0..sizes.files).step_by(per_seed).enumerate() {
+    let (seed, _) = client
+      .create_work(green, &format!("cow-seed-{part}"))
+      .unwrap();
+    for index in first..(first + per_seed).min(sizes.files) {
+      bytes.fill(u8::try_from(index % 251).unwrap());
+      client.edit(seed, &path(index), 0, 0, &bytes).unwrap();
+    }
+    match client.submit(seed).unwrap() {
+      Submitted::Accepted(_) => {}
+      other => panic!("seed part {part}'s submit was not accepted: {other:?}"),
+    }
   }
-  match client.submit(seed).unwrap() {
-    Submitted::Accepted(_) => green,
-    other => panic!("the seed's submit was not accepted: {other:?}"),
-  }
+  green
 }
 
 /// One agent's first steps on a work: request it, read one existing file, change one byte of it. The time they took.
@@ -115,6 +128,12 @@ fn resident() -> usize {
   usize::try_from(Facts::resident_now().expect("this OS reports resident memory")).unwrap()
 }
 
+/// The bytes live allocations hold now, as the allocator counts them (`slates_mem::heap`): a freed block the allocator
+/// keeps for reuse is not counted, so a copy made into one shows where resident memory hides it.
+fn live_heap() -> usize {
+  usize::try_from(slates_mem::heap::stats().in_use).unwrap()
+}
+
 /// §4.16, A-247: N works over one G-byte green, each requested, reading one base file and editing it, add resident
 /// bytes bounded by N x (a work's metadata + the file it changed) plus a fixed term, below even one copy of the green.
 #[test]
@@ -126,26 +145,33 @@ fn works_over_a_green_cost_their_divergence_not_the_green() {
   let green = populated_green(&mut client, sizes);
   // One work first, so what a first work alone sets up (a map's first node, a reply buffer) is not charged to the N.
   let warm = first_edit(&mut client, green, sizes, sizes.works);
-  let before = resident();
+  let (before, heap_before) = (resident(), live_heap());
   let times: Vec<Duration> = (0..sizes.works)
     .map(|index| first_edit(&mut client, green, sizes, index))
     .collect();
   let added = resident().saturating_sub(before);
+  let heap_added = live_heap().saturating_sub(heap_before);
   let bound = sizes.works * (WORK_METADATA_BYTES + sizes.file_bytes) + FIXED_BYTES;
   let slowest = times.iter().max().unwrap();
   let total: Duration = times.iter().sum();
   println!(
-    "work_cow: green {green_bytes} B in {} files; {} works, each request -> read -> edit: resident +{added} B \
-     ({} B/work), bound {bound} B, one copy per work would be {} B; time warm {warm:?}, mean {:?}, slowest {slowest:?}",
+    "work_cow: green {green_bytes} B in {} files; {} works, each request -> read -> edit: live heap +{heap_added} B \
+     ({} B/work), resident +{added} B, bound {bound} B, one copy per work would be {} B; time warm {warm:?}, mean {:?}, slowest {slowest:?}",
     sizes.files,
     sizes.works,
-    added / sizes.works,
+    heap_added / sizes.works,
     sizes.works * green_bytes,
     total / u32::try_from(sizes.works).unwrap(),
   );
+  if sizes.works * green_bytes <= bound {
+    println!(
+      "work_cow: a copy of the green per work would fit the bound at these sizes; the bound decides nothing"
+    );
+  }
   assert!(
-    sizes.works * green_bytes > bound,
-    "the bound must rule out a copy of the green per work"
+    heap_added <= bound,
+    "{} works over a {green_bytes}-byte green added {heap_added} live heap bytes, past {bound}",
+    sizes.works
   );
   assert!(
     added <= bound,

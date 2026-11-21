@@ -1,7 +1,9 @@
 //! The epoll driver: Linux's driver (D-9, amended 2026-10-18 — io_uring was removed after its
 //! measured win proved confined to the parked path while it cost the kernel attack surface and a
 //! boot-time `ENOMEM` under `RLIMIT_MEMLOCK`; see `BENCHMARKS.md`).
-//! timeout for the wait [B: epoll(7); B: eventfd(2)], through rustix's safe wrappers. The one unsafe
+//! timeout for the wait [B: epoll(7); B: eventfd(2)], through rustix's safe wrappers. A timed wait's deadline is a
+//! timerfd in the interest list, armed with the deadline's nanoseconds, and `epoll_wait` itself waits untimed (84a,
+//! 2026-11-20): its timeout is whole milliseconds, so a shorter wait lasted a millisecond. The one unsafe
 //! idiom is borrowing a caller-owned socket fd by number for a single `epoll_ctl` readiness
 //! registration (a `UdpSocket` recv, a `TcpStream` read or write), each with a `// SAFETY:` note.
 
@@ -26,6 +28,9 @@ pub fn prepare_eventfd() -> Result<OwnedFd, RtError> {
 /// Format: the user word that marks the kick eventfd in epoll events.
 const KICK_TAG: u64 = u64::MAX;
 
+/// Format: the user word that marks the deadline timerfd in epoll events (a word no waker uses, as [`KICK_TAG`]).
+const DEADLINE_TAG: u64 = u64::MAX - 1;
+
 /// Shape: events drained per wait (see the kqueue driver for the reasoning).
 const EVENTS_PER_WAIT: usize = 64;
 
@@ -33,6 +38,11 @@ const EVENTS_PER_WAIT: usize = 64;
 pub struct EpollDriver {
   epfd: OwnedFd,
   efd: crate::driver::KickFd,
+  /// The timed wait's deadline, a timerfd in the interest list (84a): `epoll_wait` takes whole milliseconds and rustix
+  /// rounds a shorter timeout up, so a wait for 200 µs lasted a millisecond; the timerfd keeps the nanoseconds, and a
+  /// timed wait is an untimed `epoll_wait` this timer ends. `epoll_pwait2` would too, but it needs Linux 5.11 and the
+  /// design's Linux floor is 5.10; the timerfd is 2.6.25's.
+  deadline: OwnedFd,
   epoch: Instant,
   events: Vec<epoll::Event>,
   nops: Vec<u64>,
@@ -55,9 +65,22 @@ impl EpollDriver {
       .with(|fd| epoll::add(&epfd, fd, EventData::new_u64(KICK_TAG), EventFlags::IN))
       .ok_or(RtError::DriverLost)?
       .map_err(|e| refused("epoll_ctl(ADD eventfd)", e))?;
+    let deadline = rustix::time::timerfd_create(
+      rustix::time::TimerfdClockId::Monotonic,
+      rustix::time::TimerfdFlags::CLOEXEC | rustix::time::TimerfdFlags::NONBLOCK,
+    )
+    .map_err(|e| refused("timerfd_create", e))?;
+    epoll::add(
+      &epfd,
+      &deadline,
+      EventData::new_u64(DEADLINE_TAG),
+      EventFlags::IN,
+    )
+    .map_err(|e| refused("epoll_ctl(ADD timerfd)", e))?;
     Ok(EpollDriver {
       epfd,
       efd,
+      deadline,
       epoch: Instant::now(),
       events: Vec::with_capacity(EVENTS_PER_WAIT),
       nops: Vec::new(),
@@ -67,6 +90,52 @@ impl EpollDriver {
   fn drain_kick(&self) {
     let mut word = [0u8; size_of::<u64>()];
     let _ = self.efd.with(|efd| rustix::io::read(efd, &mut word));
+  }
+
+  /// Sets the deadline timer to fire `ns` from now, or disarms it for `None`: what a timed wait waits on in place of
+  /// `epoll_wait`'s millisecond timeout.
+  fn set_deadline(&self, ns: Option<u64>) -> Result<(), RtError> {
+    let zero = timespec(0);
+    let value = ns.map_or(zero, timespec);
+    rustix::time::timerfd_settime(
+      &self.deadline,
+      rustix::time::TimerfdTimerFlags::empty(),
+      &rustix::time::Itimerspec {
+        it_interval: zero,
+        it_value: value,
+      },
+    )
+    .map(|_| ())
+    .map_err(|e| refused("timerfd_settime", e))
+  }
+
+  /// Takes a fired deadline's count, so its readiness does not end the next wait.
+  fn drain_deadline(&self) {
+    let mut count = [0u8; size_of::<u64>()];
+    let _ = rustix::io::read(&self.deadline, &mut count);
+  }
+
+  /// Turns the events a wait returned into completions: the kick and the deadline drained, every other event a
+  /// completion keyed by its waker word.
+  fn harvest(&self, out: &mut Vec<Completion>) {
+    let mut kicked = false;
+    for ev in &self.events {
+      // The event record is packed: copy the fields out before touching them.
+      let (data, flags) = (ev.data, ev.flags);
+      if data.u64() == KICK_TAG {
+        kicked = true;
+      } else if data.u64() == DEADLINE_TAG {
+        self.drain_deadline();
+      } else {
+        out.push(Completion {
+          user_data: data.u64(),
+          result: i32::try_from(flags.bits()).unwrap_or(0),
+        });
+      }
+    }
+    if kicked {
+      self.drain_kick();
+    }
   }
 }
 
@@ -84,13 +153,22 @@ impl Driver for EpollDriver {
   }
 
   fn wait(&mut self, timeout_ns: Option<u64>, out: &mut Vec<Completion>) -> Result<(), RtError> {
-    let mut timeout = timeout_ns.map(timespec);
+    let mut timeout_ns = timeout_ns;
     if !self.nops.is_empty() {
       out.extend(self.nops.drain(..).map(|user_data| Completion {
         user_data,
         result: 0,
       }));
-      timeout = Some(timespec(0));
+      timeout_ns = Some(0);
+    }
+    // A zero timeout polls; a positive one waits untimed for the deadline timer, which keeps its nanoseconds (84a).
+    let timed = matches!(timeout_ns, Some(ns) if ns > 0);
+    let timeout = match timeout_ns {
+      Some(0) => Some(timespec(0)),
+      _ => None,
+    };
+    if timed {
+      self.set_deadline(timeout_ns)?;
     }
     self.events.clear();
     let outcome = epoll::wait(
@@ -98,30 +176,19 @@ impl Driver for EpollDriver {
       rustix::buffer::spare_capacity(&mut self.events),
       timeout.as_ref(),
     );
-    if let Err(e) = outcome {
-      return match e {
-        rustix::io::Errno::INTR => Ok(()),
-        rustix::io::Errno::BADF => Err(RtError::DriverLost),
-        other => Err(refused("epoll_wait", other)),
-      };
+    if timed {
+      // Disarmed whatever ended the wait, so a deadline left over never ends a later one.
+      self.set_deadline(None)?;
     }
-    let mut kicked = false;
-    for ev in &self.events {
-      // The event record is packed: copy the fields out before touching them.
-      let (data, flags) = (ev.data, ev.flags);
-      if data.u64() == KICK_TAG {
-        kicked = true;
-      } else {
-        out.push(Completion {
-          user_data: data.u64(),
-          result: i32::try_from(flags.bits()).unwrap_or(0),
-        });
+    match outcome {
+      Ok(_) => {
+        self.harvest(out);
+        Ok(())
       }
+      Err(rustix::io::Errno::INTR) => Ok(()),
+      Err(rustix::io::Errno::BADF) => Err(RtError::DriverLost),
+      Err(other) => Err(refused("epoll_wait", other)),
     }
-    if kicked {
-      self.drain_kick();
-    }
-    Ok(())
   }
 
   fn submit_nop(&mut self, user_data: u64) -> Result<(), RtError> {

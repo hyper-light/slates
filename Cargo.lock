@@ -241,6 +241,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc-fast"
+version = "1.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e75b2483e97a5a7da73ac68a05b629f9c53cff58d8ed1c77866079e18b00dba5"
+dependencies = [
+ "digest",
+ "spin",
+]
+
+[[package]]
 name = "crc32c"
 version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -346,7 +356,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -472,6 +482,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
+name = "hyper-block"
+version = "0.1.0"
+dependencies = [
+ "crc32c",
+ "getrandom 0.4.3",
+ "hyper-sim",
+ "libc",
+ "rustix",
+ "slates-rt",
+ "thiserror",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "hyper-datagram"
 version = "0.1.0"
 dependencies = [
@@ -489,6 +513,10 @@ dependencies = [
  "thiserror",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "hyper-sim"
+version = "0.1.0"
 
 [[package]]
 name = "hyper-swim"
@@ -651,6 +679,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "mantle-crc"
+version = "0.1.0"
+dependencies = [
+ "crc-fast",
+]
+
+[[package]]
+name = "mantle-engine"
+version = "0.1.0"
+dependencies = [
+ "hyper-block",
+ "mantle-crc",
+ "rustix",
+ "slates-machine",
+ "slates-rt",
+ "thiserror",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -772,7 +820,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1148,7 +1196,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1429,11 +1477,13 @@ dependencies = [
  "slates-client",
  "slates-db",
  "slates-ipc",
+ "slates-land",
  "slates-machine",
  "slates-mem",
  "slates-merge",
  "slates-rt",
  "slates-server",
+ "slates-store",
  "slates-transport",
  "slates-vfs",
  "slates-wire",
@@ -1878,6 +1928,7 @@ version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "blake3",
+ "hyper-block",
  "hyper-datagram",
  "hyper-seal",
  "libc",
@@ -1912,6 +1963,7 @@ dependencies = [
  "slates-rt",
  "slates-seal",
  "slates-ssh",
+ "slates-store",
  "slates-svn",
  "slates-test-seeds",
  "slates-transport",
@@ -1928,6 +1980,20 @@ dependencies = [
  "aws-lc-rs",
  "proptest",
  "slates-test-seeds",
+]
+
+[[package]]
+name = "slates-store"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "hyper-block",
+ "mantle-crc",
+ "mantle-engine",
+ "slates-hg",
+ "slates-land",
+ "slates-machine",
+ "slates-rt",
 ]
 
 [[package]]
@@ -2018,6 +2084,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9be42f50aa861c555654aa3a37f52f4b1074bacf4e48fe0ef7fa584e80f1f0f"
 
 [[package]]
+name = "spin"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
+
+[[package]]
 name = "strum"
 version = "0.27.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2094,7 +2166,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2412,7 +2484,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
