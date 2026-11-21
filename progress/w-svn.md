@@ -363,3 +363,14 @@
   reading held revisions through), no svn session while importing, ImportBatch::stage renumbers Copy ops. Owed: main's
   git-2000 re-measure (time, peak), the A/B for A-820, the heap attribution for (2). Then (2), then KeptText.
   Seen under load ~30: vcs_svn hook tests flake in the full suite, pass alone (15/15 in 4.7 s).
+
+## 2026-11-21 ~14:40 PST — A-835 landed (e15e87490, merged to origin/main as c5e157467; base 8fb2e33db)
+(b) and (c) of main's 12:43 ruling on the A-822 watchdog kills. A recorded import batch is applied to its green a
+slice a turn under the shard's quantum (push::RecordedBatch::apply_slice, counted repository.import_batch.apply_slices),
+the landing turn and the import's read gate held to the last slice; a recovered Subversion green folds to its readers'
+floor (vcs_store::remake_greens). Crash test: kill at every slice boundary (0..4 of a 13-version batch, 3 a slice),
+recover, resume Ok((0, 13)), byte-identical export, green folded to (13, 13). Red checks run: without the fold at
+recovery it fails (folded (0, 13)); with the slice deadline taken out the 400-revision batch applies in 1 slice and
+fails. Focused tests 99/99 on the merged tree 10760328f. Still one step a batch: append_versions' pre-record loop
+(w-rewrite-ops', inbox/w-rewrite-ops-from-w-svn-a814-sliced-commit.md) and follow/fold/release after the last slice.
+Next: finding (2) re-measured on the merged tree; main runs git-2000.
