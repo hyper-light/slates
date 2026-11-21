@@ -227,7 +227,7 @@ impl Finished {
 }
 
 /// The shard's clock (§4.3), which a turn's quantum is spent on.
-struct ShardClock;
+pub(crate) struct ShardClock;
 
 impl Clock for ShardClock {
   fn now_ns(&mut self) -> u64 {
@@ -618,6 +618,8 @@ pub(crate) fn place_imported(
         state.count(RELEASE_REFUSED, 1);
       }
       settle(state);
+      // An imported index is built whole: its runs merged before its first lookup (goal 93's pull).
+      super::merge_built_hg(state, id);
       Ok(())
     }
     Err(refused) => {

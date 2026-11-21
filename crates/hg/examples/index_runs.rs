@@ -127,9 +127,7 @@ fn main() {
       (changeset, (next() % u64::from(of.max(1))) as u32)
     })
     .collect();
-  let measure = |label: &str,
-                     imported: &mut slates_hg::import::Imported,
-                     store: &ContentStore| {
+  let measure = |label: &str, imported: &mut slates_hg::import::Imported, store: &ContentStore| {
     let counters = imported.index.rows().counters();
     let mut micros = Vec::with_capacity(samples);
     let mut visits = Vec::with_capacity(samples);

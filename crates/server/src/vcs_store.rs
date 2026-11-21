@@ -3315,9 +3315,34 @@ async fn fetch_text(
   })
 }
 
-/// Replay's end for repository `id`: its stored Subversion texts held again ([`hold_svn_stored`]), counted as a record's
-/// replay is; whether it was served.
+/// Counter: a Mercurial index built whole (an import placed, a replay or a rebuild ended) whose runs were merged into one
+/// ([`merge_built_hg`]). Format: a counter name in the status report.
+pub(crate) const HG_INDEX_MERGED: &str = "vcs_store.hg_index.merged";
+/// Counter: a Mercurial index built whole whose merge the store refused (past its room); it is served unmerged. Format: a
+/// counter name in the status report.
+pub(crate) const HG_INDEX_UNMERGED: &str = "vcs_store.hg_index.unmerged";
+
+/// Merges the runs of repository `id`'s Mercurial index, just built whole, into one (`HgIndex::built`; goal 93's pull,
+/// main's order of 2026-11-21 00:22): a lookup then reads one run, not every seal's. Lent every byte the shard could admit
+/// now, as an import's turn is, since the merged run's tables are written before the merged runs give theirs back;
+/// counted either way. Nothing for a repository of another tool, or one with fewer than two runs of its own.
+pub(crate) fn merge_built_hg(state: &mut ShardState, id: RepositoryId) {
+  let room = state.store.admittable();
+  let merged = within_budget(state, room, |stores| {
+    let (content, store) = stores.mercurial(id)?;
+    Some(store.index.built(content, &mut hg_import::ShardClock))
+  });
+  match merged {
+    Some(Ok(0)) | None => {}
+    Some(Ok(_)) => state.count(HG_INDEX_MERGED, 1),
+    Some(Err(_)) => state.count(HG_INDEX_UNMERGED, 1),
+  }
+}
+
+/// Replay's end for repository `id`: a Mercurial index's runs merged ([`merge_built_hg`]), and its stored Subversion
+/// texts held again ([`hold_svn_stored`]), counted as a record's replay is; whether it was served.
 fn replay_ended(state: &mut ShardState, id: RepositoryId) -> bool {
+  merge_built_hg(state, id);
   let held = hold_svn_stored(state, id);
   match held {
     Ok(()) => true,
@@ -4152,6 +4177,7 @@ async fn replay_sliced(id: RepositoryId, aside: Option<slates_hg::index::HgIndex
   }
   crate::state::with_state(|state| {
     state.vcs_stores.rebuilding.remove(&id);
+    merge_built_hg(state, id);
     state.vcs_stores.index_changed(id);
     release_aside(state, aside);
   })
