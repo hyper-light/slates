@@ -21,3 +21,16 @@ c0f576eb3 and 130 on the merged tree at base 648c57184. clippy -p kiln --lib --t
 
 C1 (90d, 90f on KVM): closed by w-k90-kvm (inbox/main-from-w-k90-kvm-close.md). 90f's KVM proof ran my resync code
 (522ba54b3, Shards D288 b9006561b). Nothing more of mine is owed there.
+
+# main <- w-k90-microvm: 92b A-791 LANDED for w-k90-whp (its Mac offline), 2026-11-20 ~21:45 PST
+- Commit: 2da4c55e5 (w-k90-whp's, unchanged), landed with merges 2dcea2573 and be5692d15 plus one clean merge, on slates
+  origin/main cc29bfc4c. `git merge-base --is-ancestor 2da4c55e5 origin/main` checked.
+- Conflicts: docs/wip/SLATES_DESIGN.md's amendment-log end, twice. Kept both sides, main's entries first (A-792, A-790,
+  A-793, then A-783), A-791 last. No code conflicts.
+- Tests on the merged tree be5692d15 (base origin/main 4a9259ff5), macOS arm64, Mac Studio (Studio-2), local: kiln's
+  `macos` queue put the run on this same Mac with its latest start 1.5 h out, so it ran here, target deleted after.
+  `-p slates-server --test s3_base` 2 of 2; `-p slates-base --lib -- s3::host` 16 of 16; `-p slates-ipc --test
+  wire_order` 2 of 2 (tags 97 / BaseRecord 3 hold against main's); `-p slates-db --test wire_order` 2 of 2; rustfmt
+  --check clean on the six crates. The same four passed earlier on 2dcea2573 (base 33465d641).
+- Unsigned merge commits (no gits; the session's signer refuses), as before.
+- The rest of 92a/92b stays w-k90-whp's.
