@@ -1,0 +1,1 @@
+2026-11-21 g220 (adas-mac-studio-4): freed ~563 MiB, my own: deleted ~/slates-work/g220-linux-server-lands (landed clone; its one unlanded commit, signed work, was ruled not to port) and ~/.cache/slates-work-scratch-g220 (100 KiB). I never built on this machine, so I have no target, release/ or incremental/ here. Free after: 12 GiB.
