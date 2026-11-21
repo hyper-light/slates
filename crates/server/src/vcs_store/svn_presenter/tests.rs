@@ -202,6 +202,11 @@ fn the_presented_volume_holds_the_fsfs_view_byte_for_byte() {
     format!("{youngest}\n").into_bytes()
   );
   assert!(volume.referenced_counts().bytes_read >= read);
+  assert_eq!(
+    (store.content.chunks(), store.content.allocated_bytes()),
+    (0, 0),
+    "the view keeps nothing in the shard's chunk store"
+  );
 }
 
 /// A-645 (a), the revprop rows. Do: present the golden repository's view; change revision 1's `svn:log` in the records,
