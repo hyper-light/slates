@@ -265,7 +265,6 @@ fn pushed(served: &mut Served, bytes: &[u8], logs: &mut Logs) -> Received {
   let mut answer = Vec::new();
   let received = session.answer(&mut works, &mut answer, &mut unbounded());
   drop(works);
-  drop(read);
   // A create's green owes its push (P2): built here as its first reader's materialization builds it, over the same
   // objects, against the green it is made at or an empty one.
   let empty = Green::new();

@@ -70,7 +70,7 @@ pub struct Rates {
 const LEVELS_USIZE: usize = 10;
 
 /// Format: the bytes in a KiB, the rates' unit of input.
-const KIB: u64 = 1024;
+pub(crate) const KIB: u64 = 1024;
 
 /// Format: deflate's window, 32 KiB (RFC 1951 §2.3: distances reach 32,768 bytes back). The rates' corpus is two windows,
 /// so every match distance the format allows is met.

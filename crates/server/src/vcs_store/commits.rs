@@ -685,7 +685,7 @@ pub(crate) fn make_deferred(
 /// Where a made commit stands before its one step ([`made_before_step`]).
 enum Before {
   /// Its changeset landed: the sealed push, its record version 5 once written.
-  Landed(SealedPush),
+  Landed(Box<SealedPush>),
   /// Its commit not made (counted [`UNMADE`]): the version stands alone, as a version no commit was made of does
   /// (module docs).
   Unmade,
@@ -764,7 +764,7 @@ async fn made_before_step(pending: &mut crate::made_commit::Pending) -> Before {
     Some(Ok(sealed)) => sealed,
   };
   if home_and_land(&mut sealed).await.is_some() {
-    return Before::Landed(sealed);
+    return Before::Landed(Box::new(sealed));
   }
   let _ = crate::state::with_state(move |state| {
     sealed.release_homed(state);
