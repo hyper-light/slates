@@ -16149,3 +16149,20 @@ Kept: A-787.
   fragments 34 times the pack git made of the same objects (1.92 GB against 55.9 MB): a first version has no earlier tree
   to name bases from and the learned window starts at one candidate in an order by size, so an import finds few deltas
   (GAPS, A-718's entry); an earlier debug run over v1.0.0 measured 40.7 MB against git's 3.4 MB.
+
+## A push's objects landed where they lie in its pack: the store 22 times smaller (A-722's record v4, part B; main's pack-homing ruling; 2026-11-20)
+- **The command and machine:** adas-mac-studio.local-2, release; B1's diagnostic (one push driven by phase on a
+  daemon's shard, then its repository's store made again from the log, each replay turn 1 ms) over git/git's v1.5.0
+  (9.4 MiB of pack, 34,296 objects). Before: main 5c6327b8e (its run in "A push read where it lies in its pack while
+  it is judged" and the replay section's); after: the change.
+
+| | content after input | content peak | content after the landing | process peak RSS | replay: turns, content peak |
+|---|---|---|---|---|---|
+| before | 0.0 MiB | 310.3 MiB | 309.0 MiB | 781.8 MiB | 1,921, 309.0 MiB |
+| after | 0.0 MiB | 15.4 MiB | 14.1 MiB | 356.6 MiB | 1,468, 14.1 MiB |
+
+- **What it says.** A landed object is a place in its push's pack, held once as content (9.4 MiB), and its row; the
+  rest of the 14.1 MiB is the index's tables, the reach values and the landing map. The store's bytes a push are now
+  about 1.5 times its pack (33 times before). The longest step is the landing's entry apply, the record still
+  carrying the pack (part A).
+
