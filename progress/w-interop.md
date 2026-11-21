@@ -381,3 +381,8 @@ Also: re-run git matrix for A-719 part 1 (81c36bd99) and hg matrix when w-hg's p
 - main: vcs_http.rs:850 spin is w-bugs' item -> inbox/w-bugs-from-w-interop-http-spin.md (scope kill: not cap, not kiln timeout, no oomd line; coincides with kiln disk headroom events). r14 queued: git A/B unpinned (macos, disk=60g) on main 43080ff29+ with P2 git half.
 - r14 (Studio-2, main 1602f0aef, build 218 s): git/git dataset clone failed (curl 92 HTTP/2 CANCEL). r16: same run, dataset clone over HTTP/1.1 with 3 attempts.
 - r16 (Studio-2, release a8ee99bf7, load 3-5): stock push 9.6/clone 9.4/shallow 0.90/partial 5.26; slates push 50 s refuses tags naming non-commit/non-tree (junio-gpg-pub, v1.0rc1-6), all whole clones fail "repository corruption"; inc-push even, shallow 4.2x slower. -> w-git + main.
+- 10:38 Ada (via main 01a1ff2e): FOCUS GOAL 93, order C then R then P; a failure found by use goes to its owner as a
+  red test. My list reordered: C (Windows matrices: w-work-mount; svn installs: Ada) blocked; R now: git tags of a
+  blob/tag refused + clones corrupt -> red test dfe24c8bb (agents/w-interop-gittags, git_interop
+  stock_git_pushes_and_clones_tags_of_a_blob_a_tree_and_a_tag), r18 running it unpinned; P (93 perf) waits on R.
+- Red test dfe24c8bb RED locally (MacBook, kiln placed it on 4 failing machines): 3 tags refused "names neither a commit nor a tree"; -> inbox/w-git-from-w-interop-red-tags.md.
