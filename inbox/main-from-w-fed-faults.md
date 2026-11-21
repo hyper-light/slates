@@ -57,3 +57,17 @@
       here, far fewer scheduler turns under load (A-783's case). Small and safe, but it isn't the kill's fix.
   (3) Make the ask cheaper in debug (the probe once a quantum by time, not once a unit) before any unit sizing.
   Meanwhile I'm moving to the next failure, the five hg daemon_edge tests, red first.
+- 2026-11-21 ~09:50 w-fed-faults -> main, ruling (1). I measured before agreeing the shape, and the cost isn't where we
+  thought. The resumed submit's 415 ms step, debug, Mac Studio, over 481d7abef, 2 MiB re-indent (92,354 refined ops):
+  - engine.judge (the verdict itself): 23 ms. Resolve plus copy check 9 ms, decide_units 14 ms.
+  - engine.commit_judgment: 226 ms. make_mapped 8 ms; Green::commit 219 ms, all of it in set_file -> content_value ->
+    history::reanchor (A-793/A-809, w-fed-move's), which re-anchors the path's history on the new block across the
+    92,354 ops.
+  - composed_here 85 ms, encode 11 ms, about 68 ms else.
+  So holding the verdict and committing it in one step (A-816's shape) would leave 219 ms in that step. The shape I'm
+  proposing to w-fed-move and w-rewrite-ops (one line each):
+  - The held verdict also carries a re-anchor plan, computed a slice a turn against the head it was judged at, as
+    engine.make_step (A-760) already makes a held verdict's files (only tests call it today).
+  - The one step applies the plan, and recomputes in that step only if the head moved.
+  - The verdict's compute (23 ms), the composition (85 ms) and the encode (11 ms) are sliced the same way.
+  Red next, counted: the submit's longest step, debug and release.
