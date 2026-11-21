@@ -11782,6 +11782,24 @@ blocks it. Rejects are non-blocking; the merge task never stalls on a conflict.
 > (`slates_mcp::merge_check_json`, `resolve_args`; §4.12 schema parity). Test: `crates/mcp/tests/mcp.rs`
 > (`assert_merge_check_resolves_over_mcp`).
 
+> **Status (2026-11-21, A-840: a conflict resolved in one ask).** `ResolveConflict { work, over, replacement }` gives
+> up the windows a conflict named and resolves at the head as it is: the green's half takes the work's writes out of
+> exactly those windows (an overwrite keeps its bytes outside them; an insertion, deletion, extension or truncation that
+> meets one goes whole; a zero-length window gives up every operation on its path), rebases the rest onto the head,
+> applies the agent's replacement there and restates the work, one recorded step, as `ResolveMerge` does. There is no
+> check and no stamp: nothing is judged at an older head, so nothing can be stale. What is kept and still conflicts
+> answers only its own windows, nothing changed, so the next resolution names those and the ones given up before. Every
+> window given up and every byte written is the agent's declaration (D-27). It is the client's corrective path in the
+> load harness: at 10 hot files in the 1,000-client stand-in, rebase-kind owner asks fell from 20.5-20.9 to 10.4-10.9 a
+> client and all owner asks from 32.7-33.2 to 26.3-27.0 (BENCHMARKS, 2026-11-21). A work's shard that cannot lay its
+> own increment's bytes (a rebased file held as parts over the head, A-806, names a run of the work's own write as the
+> head's, which a work off the green's shard does not hold) hands the owner its journal and files rather than laying
+> zeros, and the owner's answer still carries the work's base entries. Tests: `crates/server/tests/merge_check.rs`
+> (the one-ask history on one shard and on eight; a later write meets the resolved work in every file; a kept slot
+> beside a given-up one; a generated oracle of 24 histories under rival writes, every accepted version holding its
+> work's slots and the green ending as the replay) and `crates/server/tests/works_off_owner.rs`
+> (`a_resolution_the_owner_composed_leaves_the_work_its_entries`).
+
 > **Status (2026-11-19, A-663: a rebased work restates each hard link where the node it names still stands).** The
 > restated journal is the work's own operations over the head, and a volume with real inodes replays it in order, as
 > does the deriver composing the work's next submit. A hard link names the node at its target when it is made
@@ -58144,6 +58162,31 @@ Status: built 2026-11-21, macOS.
 - The layout's `arena` still names the arena's capacity, which the pool cuts into its parts. Linux keeps the range (its
   extents are ranges of one memfd, holes punched), and so does Windows, whose extents are ranges of the object when no
   anchor holds their sections.
+
+### A-840 — A conflict resolved in one ask (2026-11-21, w-fed-move; goal 86b's owner asks; main's 10:37 ruling, take-head as one verb; §4.16 "Rebase, the only corrective path", D-27, A-796)
+Applied in the same change to: §4.16 (its status), `crates/ipc/src/protocol.rs` (`ResolveConflict`),
+`crates/server/src/verbs.rs` (`resolve_conflict`, `give_up_windows`, `merge_answer`, `lay_ops`/`lay_op`/
+`assemble_post_state` refusing `BaseGone`, `compose_increment`), `crates/server/src/work_home.rs` (`MergeAsk::over`,
+`SealedWork::composes_here`), `crates/server/src/refining.rs` (a sliced build that meets it gives up),
+`crates/client/src/client.rs` (`resolve_conflict`), `crates/client/examples/load_bench.rs` (the resolution, with
+`--resolve rebase` kept for the comparison), GAPS, BENCHMARKS, `docs/bugs/2026-11-21-a-composition-laid-zeros-for-base-bytes-its-shard-did-not-hold.md`.
+- **Why.** After A-817 the work's owner asks were 30.0 a client at 10 hot files, 20.1 of them rebases: 77% of rebases
+  conflicted again. Two cuts that kept a gap between the conflict and the resolution were even (the head's window bytes
+  in the reply; BENCHMARKS): in a closed loop some 50 to 120 verdicts land in either gap. A-796's check and resolution
+  closed the gap (16,035 to 584 repeat conflicts) but cost two asks; the check's stamp is what made the second.
+- **Rule.** The agent names the windows it gives up, never operation indices, so it needs no check: the green's half
+  takes the work's writes out of exactly those windows and resolves at the head as it is. The windows a conflict names
+  are the work's operations' ranges, so a window may span adjacent writes of the work; the agent writes again what it
+  keeps inside one.
+- **Found on the way, by the generated oracle.** A rebased file is held as parts over the head (A-806), a run equal to
+  the head's named as the head's; a work off the green's shard does not hold the head's bytes, so composing its next
+  increment met `BaseGone` and `lay_op` laid zeros into the post-state, which the green took as the work's bytes. A
+  composition now refuses it, the work's shard hands the owner its journal and files, and the owner's answer carries the
+  base entries anyway (`SealedWork::composes_here`; without them every later submit asked the files, 3.9 a client).
+- **Measured.** BENCHMARKS 2026-11-21, three pairs at each of 300/100/30/10 hot files, oracle clean in all 24 runs:
+  rebase-kind asks a client 2.1-2.2/3.7/8.9-9.5/20.5-20.9 to 1.8-1.9/2.6-2.7/5.4-5.7/10.4-10.9; all owner asks
+  11.2-11.3/13.2-13.3/19.5-20.1/32.7-33.2 to 10.9-11.0/12.3-12.5/17.2-17.6/26.3-27.0. Verdict asks rose (5.5-5.7 to
+  9.2-9.5 at 10 hot files): a resolved work submits at once, into the same contention. That is now the largest kind.
 
 ### A-778 — A daemon whose anchor is gone removes the anchor's object names (2026-11-20, w-sizing; found by use; §4.7, A-178)
 Applied in the same change to: `crates/mem/src/shared.rs` (`unlink_handoff`), `crates/api/src/role/daemon.rs`

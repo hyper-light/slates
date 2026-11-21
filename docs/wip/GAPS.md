@@ -648,6 +648,15 @@
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
 >
+> **A-840 (2026-11-21, w-fed-move; goal 86b's owner asks).** FIXED: a conflict is resolved in one ask
+> (`ResolveConflict`: the windows given up, the rest resolved at the head as it is): rebase-kind asks 20.5-20.9 to
+> 10.4-10.9 a client at 10 hot files, all owner asks 32.7-33.2 to 26.3-27.0. Also FIXED, found by its oracle: a work off
+> its green's shard laid zeros for base bytes it did not hold when composing a rebased file (A-806's parts), and the
+> green took them; the composition now goes to the owner. Open: verdict asks are the largest kind (9.2-9.5 a client at
+> 10 hot files); the rebase arm (`--resolve rebase`) is kept only as the comparison's other leg. Main's queue:
+> `work_edit_cow`'s `a_one_byte_edit_of_a_large_file_costs_the_byte_not_the_file` is ended by the watchdog in a debug
+> build on a loaded box, on main before this change too (shard spinning 3.6 s in the submit's first poll).
+>
 > **A-817 (2026-11-21, w-fed-move; goal 86b's owner asks).** FIXED: a file's base bytes are asked only for a whole
 > replacement whose declared base length is the file's (an overwrite at offset 0 had asked them at every rebase and
 > submit): file asks 17.2 to 0 a client at 10 hot files, asks a client 49.2 to 30.0. The identical-op drop main ruled was
