@@ -49,3 +49,16 @@ landed -> entry shard forward -> owner task start -> owner reply computed -> rep
 - That branch alone regresses p999 (A-387 keeps holds once turns are cheap); with holds off p99 0.17-0.38 ms. Landed:
   2c8f89de6 (the gate, the loaded bound, red 1.62 ms vs 0.87 ms). Per the close list I now wire C1, then P2 with you:
   whoever lands the fix, the other A/Bs it.
+
+## 2026-11-20 ~19:30 PST — where the provisioning p999 goes under load, per hop (thanks for findings 4-6)
+Same MacBook, host load 4-18 (quietest today), PROVISION_BENCH_LOAD=2, every create in the loaded p999 tail by hop
+(diagnostic stamps, never main), 2 rounds:
+- main: the tail is mostly the client's own wake after it parked (reply landed -> taken 15-33 ms) and the nap hop (reply
+  task -> serve task 0.6-2.9 ms).
+- kqueue IMMEDIATE + my time-horizon turn estimate: almost all in cross-shard hops, forward -> owner task 7-19 ms and owner
+  -> the reply's task home 13-29 ms. A true-spinning shard that macOS has demoted and preempted waits quanta for a core;
+  a kick can't help (it isn't parked). Its client wakes fast. Loaded p99 0.34-0.37 vs main 1.12-1.32 ms; quiet p99 met R9
+  once (34.6 us).
+- Running now: the same arm with shard threads at QOS_CLASS_USER_INTERACTIVE (your G222_QOS result predates the kqueue
+  fix, when the nap set the band). If the cross-shard hops' tail goes, I land kqueue + the rule red first and ask you to
+  A/B it on edit_merge_bench.
