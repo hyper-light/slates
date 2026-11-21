@@ -1686,3 +1686,7 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - ROOT CAUSE of tonight's link drops (w-k90-pin-2's R2): adacachy's enp9s0 holds a stray static 192.168.1.77/24 as PRIMARY beside kiln's 192.168.1.90/24. UDP replies leave from .77, so the tunnel's from == to check never passes, and every LAN Mac stays on one TCP tunnel over 2.4 GHz Wi-Fi.
     - RULED: the fix is IP_PKTINFO, answering from the contacted address, in kiln's vendored hyper-rt and hyper-transport as a vendor patch. Red: a two-address host contacted on the secondary.
     - Ada's stopgap: on adacachy, sudo ip addr del 192.168.1.77/24 dev enp9s0, unless something needs .77, or route the LAN with src .90.
+- 2026-11-21 04:38 PST
+  - LANDED: 94c1696bb (w-perf's second stream fix: an empty text). w-perf's pull A/B and push profile run together as r16.
+  - w-git (A) BUILT (40d961807): reached sets deferred, sliced and memoized; tag oracle plus replay; 587/587 and 188/188. The 611 MB push meets a THIRD wall: each created ref's green builds a whole path map from its tree (refs x tree size; 9,700 of 11,642 decision samples in compose_unit / whole_build::slice). Also a unit over 1 s (1,142 ms) at vcs_http.rs:1454 gets the daemon killed mid-push.
+  - RULINGS: (1) land (A) now, with GAPS entries for the path-map wall and Repository::commit's stage leak. (2) Name and slice the >1 s unit (robustness first). (3) Path maps derived on first read under A-647, like (A): oracle, sliced, memoized, replay flat; w-engine told. Red: the 611 MB push lands.
