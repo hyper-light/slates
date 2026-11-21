@@ -121,6 +121,7 @@ enum Request {
   },
   TextsByTool {
     repository: u128,
+    path: Vec<u8>,
     tool_ids: Vec<Vec<u8>>,
     answer: Sender<Result<Vec<Option<(Identity, TextRow)>>, StoreError>>,
   },
@@ -435,12 +436,13 @@ fn serve(
       }
       Request::TextsByTool {
         repository,
+        path,
         tool_ids,
         answer,
       } => {
         let found: Result<Vec<_>, StoreError> = tool_ids
           .iter()
-          .map(|tool_id| store.text_by_tool(repository, tool_id))
+          .map(|tool_id| store.text_by_tool(repository, &path, tool_id))
           .collect();
         let _ = answer.try_send(found);
       }
@@ -726,12 +728,13 @@ impl StoreHandle {
       .await
   }
 
-  /// Each version of `repository` its tool names in `tool_ids` (Mercurial's nodes), in order: its text's identity and
-  /// how it is made ([`Store::text_by_tool`]), none for one no landed changeset named. A batch, so a stream asks once
-  /// for a log's rows (bounded by the log's length).
+  /// Each version of `path` in `repository` its tool names in `tool_ids` (Mercurial's nodes), in order, as it landed
+  /// ([`Store::text_by_tool`]), none for one no landed changeset named. A batch, so a stream asks once for a log's rows
+  /// (bounded by the log's length).
   pub async fn texts_by_tool(
     &self,
     repository: u128,
+    path: Vec<u8>,
     tool_ids: Vec<Vec<u8>>,
   ) -> Result<Vec<Option<(Identity, TextRow)>>, OwnerError> {
     let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
@@ -739,6 +742,7 @@ impl StoreHandle {
       .ask(
         Request::TextsByTool {
           repository,
+          path,
           tool_ids,
           answer,
         },

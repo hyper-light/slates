@@ -332,10 +332,11 @@ const ORDINAL: usize = 4;
 /// Format: a history row's key: the tag, the repository, the path's BLAKE3, the sequence and the entry's place in the
 /// changeset's section (each big-endian, so in order: a push's several versions of one path are each a row).
 const HISTORY_KEY_BYTES: usize = 1 + REPOSITORY + IDENTITY + LONG + ORDINAL;
-/// Format: the tool id table's tag: a repository's version by its tool's id (Mercurial's node) to its text's identity.
+/// Format: the tool id table's tag: a repository's version of a path by its tool's id (Mercurial's node), to the version
+/// as it landed: its text's identity and its own row (its base is a version of the same path, as a revlog's is).
 const TOOLS: u8 = b'I';
-/// Format: a tool id row's key: the tag, the repository, the tool id's bytes (a tool's ids are of one length).
-const TOOL_KEY_FIXED: usize = 1 + REPOSITORY;
+/// Format: a tool id row's key before the id: the tag, the repository, the path's BLAKE3 (the id's bytes follow).
+const TOOL_KEY_FIXED: usize = 1 + REPOSITORY + IDENTITY;
 
 /// How a landed text is made ([`Store::text_row`]): the changeset that kept it, its length, its edit's base (none for a
 /// whole), and where the edit or the whole lies.
@@ -442,11 +443,19 @@ pub(crate) fn put_rows<F: hyper_block::block::BlockFile>(
       ),
       &entry.text,
     )?;
-    // The version by its tool's id, the first landing's (a node lands once; a text shared by two nodes keeps both).
+    // The version of its path by its tool's id, as it landed (its own base and place, never another path's: a text
+    // two paths share keeps one `T` row, whose base may be a version of the other), the first landing's.
     if !entry.tool_id.is_empty() {
-      let key = tool_key(header.repository, &entry.tool_id);
+      let key = tool_key(
+        header.repository,
+        blake3::hash(&entry.path).as_bytes(),
+        &entry.tool_id,
+      );
       if !rows.get(&key, &mut held)? {
-        rows.put(&key, &entry.text)?;
+        value.clear();
+        value.extend_from_slice(&entry.text);
+        put_row_value(&mut value, header.sequence, &entry);
+        rows.put(&key, &value)?;
       }
     }
     // A text's row is the first changeset's that kept it, never replaced: a text that comes back (a file reverted, a
@@ -456,24 +465,30 @@ pub(crate) fn put_rows<F: hyper_block::block::BlockFile>(
       continue;
     }
     value.clear();
-    value.extend_from_slice(&header.sequence.to_le_bytes());
-    value.extend_from_slice(&entry.len.to_le_bytes());
-    match entry.base {
-      Some(base) => {
-        value.push(PRESENT);
-        value.extend_from_slice(&base);
-      }
-      None => {
-        value.push(ABSENT);
-        value.extend_from_slice(&[0; IDENTITY]);
-      }
-    }
-    value.extend_from_slice(&entry.place.payload);
-    value.extend_from_slice(&entry.place.offset.to_le_bytes());
-    value.extend_from_slice(&entry.place.len.to_le_bytes());
+    put_row_value(&mut value, header.sequence, &entry);
     rows.put(&text_key(header.repository, &entry.text), &value)?;
   }
   Ok(())
+}
+
+/// Appends a text row's value of `entry`, landed at `sequence`: the sequence, the length, the base's mark and identity,
+/// the place ([`TEXT_VALUE_BYTES`]).
+fn put_row_value(value: &mut Vec<u8>, sequence: u64, entry: &TextEntry) {
+  value.extend_from_slice(&sequence.to_le_bytes());
+  value.extend_from_slice(&entry.len.to_le_bytes());
+  match entry.base {
+    Some(base) => {
+      value.push(PRESENT);
+      value.extend_from_slice(&base);
+    }
+    None => {
+      value.push(ABSENT);
+      value.extend_from_slice(&[0; IDENTITY]);
+    }
+  }
+  value.extend_from_slice(&entry.place.payload);
+  value.extend_from_slice(&entry.place.offset.to_le_bytes());
+  value.extend_from_slice(&entry.place.len.to_le_bytes());
 }
 
 /// A text row's key.
@@ -510,11 +525,12 @@ fn history_key(
   key
 }
 
-/// A tool id row's key: the tag, the repository, the id's bytes.
-fn tool_key(repository: u128, tool_id: &[u8]) -> Vec<u8> {
+/// A tool id row's key: the tag, the repository, the path's BLAKE3, the id's bytes.
+fn tool_key(repository: u128, path: &Identity, tool_id: &[u8]) -> Vec<u8> {
   let mut key = Vec::with_capacity(TOOL_KEY_FIXED.saturating_add(tool_id.len()));
   key.push(TOOLS);
   key.extend_from_slice(&repository.to_be_bytes());
+  key.extend_from_slice(path);
   key.extend_from_slice(tool_id);
   key
 }
@@ -627,30 +643,26 @@ impl Store {
     Ok(found)
   }
 
-  /// The version of repository `repository` its tool names `tool_id` (Mercurial's node): its text's identity and how
-  /// that text is made; none where no landed changeset named it.
+  /// The version of `path` in repository `repository` its tool names `tool_id` (Mercurial's node), as it landed: its
+  /// text's identity and its own row (its base a version of the same path, its place its own edit's); none where no
+  /// landed changeset named it.
   ///
   /// # Errors
   /// [`StoreError::BadRow`] for a row that does not decode; the engine's refusals.
   pub fn text_by_tool(
     &mut self,
     repository: u128,
+    path: &[u8],
     tool_id: &[u8],
   ) -> Result<Option<(Identity, TextRow)>, StoreError> {
-    let mut value = Vec::with_capacity(IDENTITY);
-    if !self
-      .rows_mut()
-      .get(&tool_key(repository, tool_id), &mut value)?
-    {
+    let mut value = Vec::with_capacity(IDENTITY + TEXT_VALUE_BYTES);
+    let key = tool_key(repository, blake3::hash(path).as_bytes(), tool_id);
+    if !self.rows_mut().get(&key, &mut value)? {
       return Ok(None);
     }
-    let identity: Identity = value
-      .as_slice()
-      .try_into()
-      .map_err(|_| StoreError::BadRow)?;
-    let row = self
-      .text_row(repository, &identity)?
-      .ok_or(StoreError::BadRow)?;
+    let (identity, row) = value.split_at_checked(IDENTITY).ok_or(StoreError::BadRow)?;
+    let identity: Identity = identity.try_into().map_err(|_| StoreError::BadRow)?;
+    let row = decode_row(row).ok_or(StoreError::BadRow)?;
     Ok(Some((identity, row)))
   }
 

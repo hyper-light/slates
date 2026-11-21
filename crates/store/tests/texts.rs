@@ -341,10 +341,10 @@ fn a_changeset_holding_several_versions_of_a_path_lists_them_all() {
   let history = store.path_texts(1, b"f", 0, 10).unwrap();
   assert_eq!(history, vec![(1, ids[0]), (1, ids[1]), (1, ids[2])]);
   // Each version found by its tool's id (Mercurial's node), with its place: what a stream sends as its chunk.
-  let (by_tool, row) = store.text_by_tool(1, b"n2").unwrap().unwrap();
+  let (by_tool, row) = store.text_by_tool(1, b"f", b"n2").unwrap().unwrap();
   assert_eq!((by_tool, row.base), (ids[1], Some(ids[0])));
   assert_eq!(store.place_bytes(&staging, &row.place).unwrap(), edit_two);
-  assert_eq!(store.text_by_tool(1, b"n9").unwrap(), None);
+  assert_eq!(store.text_by_tool(1, b"f", b"n9").unwrap(), None);
   for (identity, text) in ids.iter().zip([&first, &second, &third]) {
     let mut cache = TextCache::new(0);
     let read = store
