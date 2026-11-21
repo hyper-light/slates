@@ -4589,6 +4589,7 @@ pub fn shard_report(state: &mut ShardState, memory: bool) -> ShardReport {
       .chain(large_counts(state))
       .chain(content_ranges)
       .chain(crate::live_ship::hop_rows(state))
+      .chain(held_core_rows())
       .collect(),
     replayed_records: state.recovered.replayed_records,
     replay_ns: state.recovered.replay_ns,
@@ -27429,4 +27430,27 @@ mod resize_admission_tests {
     );
     assert_eq!(refused, 0, "no allowance was refused");
   }
+}
+
+/// This shard's driver harvests and idle spins by whether they kept the core (`slates_rt::held_core`, 85a item 3), as
+/// `rt.core.*` rows: each a non-vacuity count of its path, and `rt.core.kept_spin_ns` the CPU the kept spins cost.
+/// Rows at zero are left out, as every count of the report is.
+fn held_core_rows() -> Vec<RefusalCount> {
+  let Some(counters) = slates_rt::registry::with_current(|ctx| ctx.counters()) else {
+    return Vec::new();
+  };
+  [
+    ("rt.core.harvests_kept", counters.harvests_kept),
+    ("rt.core.harvests_slept", counters.harvests_slept),
+    ("rt.core.kept_spins_caught", counters.kept_spins_caught),
+    ("rt.core.kept_spins_ran_out", counters.kept_spins_ran_out),
+    ("rt.core.kept_spin_ns", counters.kept_spin_ns),
+  ]
+  .into_iter()
+  .filter(|(_, count)| *count > 0)
+  .map(|(kind, count)| RefusalCount {
+    kind: kind.to_owned(),
+    count,
+  })
+  .collect()
 }

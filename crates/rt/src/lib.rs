@@ -43,6 +43,7 @@ pub mod control;
 pub mod driver;
 pub mod error;
 pub mod futures;
+pub mod held_core;
 pub mod held_turn;
 mod interest;
 pub mod label;

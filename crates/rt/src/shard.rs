@@ -29,6 +29,7 @@ use slates_mem::{Encoded, Handle, Slab, ring};
 
 use slates_machine::wake::WakeEstimate;
 
+use crate::held_core::{HeldCore, spin_keeps_core};
 use crate::held_turn::{HeldTurn, hold_pays};
 
 use crate::attribution::{self, Attribution, Tracker};
@@ -121,6 +122,18 @@ pub struct Counters {
   pub held_turn_ns: u64,
   /// Idle turns the shard has measured (a non-vacuity count of [`Counters::held_turn_ns`]).
   pub held_turns: u64,
+  /// Driver harvests that kept the core (`Driver::poll_now`: on macOS `KEVENT_FLAG_IMMEDIATE`), a core being free
+  /// ([`crate::held_core`], 85a item 3): the non-vacuity count of the kept path.
+  pub harvests_kept: u64,
+  /// Driver harvests that gave the core up (a zero-timeout wait, which sleeps on macOS, A-218): no core was free, or an
+  /// idle spin had spun past what blocking costs.
+  pub harvests_slept: u64,
+  /// Idle spins that found work while they kept the core.
+  pub kept_spins_caught: u64,
+  /// Idle spins that kept the core as long as blocking costs and found nothing in that time.
+  pub kept_spins_ran_out: u64,
+  /// Nanoseconds idle spins spent keeping the core: the CPU the kept spin costs.
+  pub kept_spin_ns: u64,
   /// Tasks admitted.
   pub spawns: u64,
   /// Tasks whose future returned.
@@ -346,6 +359,8 @@ pub struct ShardContext {
   /// ([`crate::held_turn`], A-387): the side of a hold's decision the wake estimate is weighed against. `None` while the
   /// shard tracks no wake estimate, which then has nothing to weigh it against and holds as asked.
   held_turn: Cell<Option<HeldTurn>>,
+  /// What the shard last learned of whether a core is free for it, and when ([`crate::held_core`]).
+  held_core: Cell<HeldCore>,
   pair_full_events: Cell<u64>,
   nested_borrows: Cell<u64>,
   /// The shard's readiness registrations, by descriptor and direction: which task waits on each, and whether
@@ -556,6 +571,7 @@ impl ShardContext {
           .wake_tracking
           .map(|tracking| HeldTurn::new(tracking.shift)),
       ),
+      held_core: Cell::new(HeldCore::default()),
       pair_full_events: Cell::new(0),
       nested_borrows: Cell::new(0),
       interests: RefCell::new(Interests::default()),
@@ -749,7 +765,7 @@ impl ShardContext {
       })
       .unwrap_or(false);
     waiting = waiting || inner;
-    waiting = self.harvest_io() || waiting;
+    waiting = self.harvest_io(self.core_free()) || waiting;
     // The rest of this step's batch waits too: taken from the queue with the task asking, it is in no queue now.
     waiting = waiting || !self.local.is_empty() || self.batch_left.get() > 0;
     if !waiting {
@@ -1397,7 +1413,7 @@ impl ShardContext {
       if outcome.did_work {
         let now = self.now_ns();
         if now.saturating_sub(last_wait_ns) >= self.quantum_ns() {
-          let _ = self.harvest_io();
+          let _ = self.harvest_io(self.core_free());
           last_wait_ns = now;
         }
         continue;
@@ -1412,7 +1428,7 @@ impl ShardContext {
         // is already woken, and only a park, the spin or a busy stretch's quantum ask the driver, so without this a
         // socket's readiness waited for the idle work to run out (the daemon's memory sweep on idle time held live
         // writes 50-120 ms, g228; `tests/idle_work_io.rs`).
-        let _ = self.harvest_io();
+        let _ = self.harvest_io(self.core_free());
         continue;
       }
       self.park(outcome.next_deadline_ns);
@@ -1428,12 +1444,20 @@ impl ShardContext {
   /// would otherwise wait out the window. True when a completion was queued. Unlike `park` it does not
   /// set the parked flag: the shard is not waiting, so a concurrent kick must not believe it is. A
   /// driver error other than loss is left for the next real wait to surface; loss is likewise deferred
-  /// (this is a best-effort poll, not the loop's liveness point).
-  fn harvest_io(&self) -> bool {
+  /// (this is a best-effort poll, not the loop's liveness point). `keep_core` asks the driver's poll that keeps the
+  /// thread on its core (`Driver::poll_now`) rather than the zero-timeout wait, which on macOS sleeps about 15 µs
+  /// ([`crate::held_core`]); both are counted.
+  fn harvest_io(&self, keep_core: bool) -> bool {
     self
       .with_inner(|inner| {
         let mut completions = std::mem::take(&mut inner.completions);
-        let result = inner.driver.wait(Some(0), &mut completions);
+        let result = if keep_core {
+          inner.counters.harvests_kept = inner.counters.harvests_kept.saturating_add(1);
+          inner.driver.poll_now(&mut completions)
+        } else {
+          inner.counters.harvests_slept = inner.counters.harvests_slept.saturating_add(1);
+          inner.driver.wait(Some(0), &mut completions)
+        };
         let harvested = !completions.is_empty();
         for c in completions.drain(..) {
           inner.counters.completions = inner.counters.completions.saturating_add(1);
@@ -1484,8 +1508,26 @@ impl ShardContext {
   /// message, and no driver can tell it without a (non-blocking) poll — without one a request arriving
   /// on a socket waited until the window ended and the shard parked (`tests/tcp.rs`).
   fn spin_for_work(&self, spin_end: u64, deadline_ns: Option<u64>) -> bool {
-    let mut turn_began = self.now_ns();
+    let spin_began = self.now_ns();
+    let mut turn_began = spin_began;
+    // Whether this spin has kept its core yet, and whether it still may: a spin keeps it while a core is free and for
+    // no longer than blocking costs (the competitive bound, [`crate::held_core`]), then sleeps its turns as before.
+    let mut kept_any = false;
+    let mut ran_out_counted = false;
     loop {
+      let keep = spin_keeps_core(
+        self.core_free(),
+        spin_began,
+        turn_began,
+        self.wake_cost_ns(),
+      );
+      kept_any |= keep;
+      if kept_any && !keep && !ran_out_counted {
+        ran_out_counted = true;
+        self.with_inner(|inner| {
+          inner.counters.kept_spins_ran_out = inner.counters.kept_spins_ran_out.saturating_add(1)
+        });
+      }
       // A poller's question may consume its signal (the daemon's doorbell flag is swapped to false
       // when asked), so the spin wakes the pollers it finds ready rather than only reporting them:
       // asked here and dropped, a ring would be lost until the next one (`tests/pollers.rs`).
@@ -1494,7 +1536,7 @@ impl ShardContext {
       // message whose kick this harvest took is visible to the looks after it. Looked at before the harvest, a message
       // published between the look and the harvest lost its kick to the harvest, and a spin ending on that turn parked
       // with the message unseen and no kick left to wake it.
-      let harvested = self.harvest_io();
+      let harvested = self.harvest_io(keep);
       if harvested
         || self.has_inbound()
         || self
@@ -1502,11 +1544,16 @@ impl ShardContext {
           .unwrap_or(false)
       {
         self.with_inner(|inner| {
-          inner.counters.spin_hits = inner.counters.spin_hits.saturating_add(1)
+          inner.counters.spin_hits = inner.counters.spin_hits.saturating_add(1);
+          if keep {
+            inner.counters.kept_spins_caught = inner.counters.kept_spins_caught.saturating_add(1);
+          }
         });
+        self.count_kept_turn(keep, turn_began);
         return true;
       }
       let now = self.now_ns();
+      self.count_kept_turn(keep, turn_began);
       // A turn that found nothing: what a request landing in it waited for (A-387).
       self.learn_turn(now.saturating_sub(turn_began));
       turn_began = now;
@@ -1541,6 +1588,30 @@ impl ShardContext {
       turns.record(turn_ns);
       self.held_turn.set(Some(turns));
     }
+  }
+
+  /// Whether a core is free for this shard to keep ([`crate::held_core`]): the kernel's count, asked at most once a
+  /// refresh interval. A simulated shard keeps it without asking: its driver's polls never sleep, and the host's load
+  /// must not reach a deterministic run.
+  fn core_free(&self) -> bool {
+    if !self.real_time {
+      return true;
+    }
+    let mut held = self.held_core.get();
+    let free = held.core_free(self.now_ns(), slates_machine::facts::free_processors);
+    self.held_core.set(held);
+    free
+  }
+
+  /// Adds an idle turn that kept the core, from `turn_began` to now, to [`Counters::kept_spin_ns`].
+  fn count_kept_turn(&self, kept: bool, turn_began: u64) {
+    if !kept {
+      return;
+    }
+    let spun = self.now_ns().saturating_sub(turn_began);
+    self.with_inner(|inner| {
+      inner.counters.kept_spin_ns = inner.counters.kept_spin_ns.saturating_add(spun)
+    });
   }
 
   /// Steps until no task, timer or message is pending, parking for timers as needed; returns
