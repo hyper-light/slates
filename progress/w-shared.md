@@ -1,5 +1,9 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## LANDED 2026-11-21 09:40 PST: lane (A) piece 1 = A-825 chain entry format 6, main 545cf46c5 (tested 000d0e442, kiln r19).
+  3a bench (r13): 320 MiB 9/10, 512 MiB 0/10, liveness open. NEXT: 3b content ahead by identity, then slicing, then
+  the bench. Family three (agents/w-shared-sweep-3) still waits for a Linux runner (adacachy refuses runs).
+
 ## ACTIVE 2026-11-21 00:57 PST: lane (A) by reference, piece 1 (chain entry format 6), approved by main 00:58. Worktree
   ~/slates-work/w-shared-byref, branch agents/w-shared-byref off origin/main 544020bd2. Design: the increment is held in
   the shard's one content hold under the green's object by its inputs identity, before the verdict (typed refusal at the

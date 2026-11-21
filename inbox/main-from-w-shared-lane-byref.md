@@ -161,3 +161,15 @@ the append no longer copies the increment) is in its final local run now; then 3
 identity) and the slicing, re-measured at these five sizes x 10.
 
 ## 08:29 PST: target gone (~/.cache/w-shared-local-target.noindex deleted, MacBook 51 GB free). Fleet had shown 2 failures before the stop (a_successor_adopts_a_greens_ledger_past_its_merge_budget_and_keeps_it_across_its_restart, a_successor_restarted_warm_takes_a_write_to_the_volume_it_took_over); fleet + kill -9 go to a Studio now, those two with their output.
+
+## 09:40 PST: piece 1 LANDED: A-825, chain entry format 6, main 545cf46c5 (merge-base confirmed)
+- Tested at 000d0e442 (piece 1 merged with origin/main a8ee99bf7), kiln r19, Adas-Mac-Studio-2, load 3.8-6.3: merge 269
+  + all integration suites, server lib 1102/1102, green_checkpoint 7/7, works_off_owner 18/18, signed_work 12/12,
+  the kill -9 test green. Fleet on 160ddd0ba (r14): 231/233; the two failing (superseded-owner A-338/A-349) fail
+  identically on main 37c7a1691 alone (r18): in GAPS. Red of the kill test at 544020bd2: r20 earlier.
+- Landed over 3 more main commits merged untested (comment renumbering, refining.rs and verbs.rs work that touches none
+  of piece 1's code); kiln r20 checks main's build and the kill test after it.
+- w-git, w-hg, w-svn told in their inboxes before the push. Branches agents/w-shared-byref and -ci deleted (local and
+  origin), worktrees removed; my local target was already deleted.
+- Next, per your ruling: 3b (content ahead: the holder's SubmitComputed names its increment, the owner fetches what it
+  lacks by identity from the holder, stored once), then slicing what remains, then the bench at 64-512 MiB x 10.
