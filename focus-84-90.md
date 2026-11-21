@@ -1559,3 +1559,16 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   The injection table: (a) bases behind is flat; (b) history grows the verdict 41 -> 90 us at 10^5; (c) idle works was the wall, fixed.
   RULING: w-fed-move's (b) next, first re-measured on main after 2c32af2b5 (reanchor O((n+k) log k)), which may be the same scan.
   The MacBook disk is 40 GB.
+- 2026-11-21 02:13 PST
+  - GOAL 92's SHARDS PART MET (w-k90-kvm), all six items in kiln's one vendored tree:
+    - (1) D288, the resync end: already works; real VMs on KVM and HVF.
+    - (2) a guest's POSIX ACLs: kiln 110f4115f, red then green in a macOS VM; jupiter 116/116.
+    - (3) a guest over a Slates stream: already works on KVM and HVF.
+    - (4) exactly one vendor/slates: already true.
+    - (5) M620 WHP DAX edges: kiln 64624e059; jupiter 2 of 6 red without it, 6 of 6 with.
+    - (6) shards restore keeps the share: kiln 3ba7efe6c, real-VM red then green.
+    - vendor.py check shards: 5 recorded changes, 0 differences. inbox/main-from-w-k90-kvm-close.md.
+    - Gaps kept on record: WHP tests refused side by side; item 6's Windows unit test can't compile without the vendored test data; the Windows compile used aws-lc's prebuilt objects.
+    - The UI part needs Ada's mark: main's goal stack still reads empty from this session.
+  - LANDED: 379087733 (w-git push cut-off layer 1: a push refused after its body is answered in git's words, never a cut connection; red 2/2). Layer 2, the charge, is named and next.
+  - The MacBook disk is 32 GB.
