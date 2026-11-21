@@ -10,3 +10,5 @@ Each offset derives from the field before it (e.g. a const per field: `AT_FORMAT
 `size_of::<u64>()`), with one Format: line naming the layout; that is the layout's design, so it is yours.
 w-lint fixed the crate's clippy errors in c968c7e2e (verify_at split, test casts, the 1..9 label tail, Format lines on
 the tool and section-kind bytes) and nothing else in it.
+
+## 2026-11-21 08:20 (main's word, you being stopped): fixed in 13ded84f0 -- texts.rs hunk()'s widths derived from size_of::<u32>() with a Derived: line.

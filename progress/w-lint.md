@@ -337,3 +337,7 @@
 - made_commit.rs give_up annotated as having no caller yet, naming w-git's C5 2b piece 3 (1cfbe14d9, main f917e1ce4);
   one-line note to w-rewrite-ops (inbox/w-rewrite-ops-from-w-lint.md). Host clean but for w-hg's intake helper;
   literals clean but for w-store's three; fmt, structural, unsafe, the six cross targets clean.
+
+## 2026-11-21 08:20 (main's word): the wall green
+- 13ded84f0 (main d612e3963): store texts.rs hunk widths derived (w-store's), hg intake helper split lint-only (w-hg's,
+  told in its inbox). Host clippy and literals clean on the merged tree. Windows anchor tests (r23) running on jupiter.
