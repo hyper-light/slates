@@ -75,3 +75,10 @@ main 15:20: "a one-byte edit to a 1 GB file costs 1 GB; fix at chunk grain; red 
   work_cow, lib work_*; mcp the_mcp_surface_serves_the_tools; cli the_grammar_parses_the_merge_verbs.
 - Cleanup: worktrees w-work-cow-codex, w-work-cow-review; adacachy ~/.cache/w-work-cow-codex.git (+ .bundle, lists, serve).
 - Queue empty.
+
+## Strand finish -- 2026-11-21 ~00:45 PST
+- db80da5e8 wire tags; 4930bf14b (main 544020bd2) rebase_establishing + revision seeded from next_seq.
+- Cleaned locally: worktrees wire/review/codex, ~/.cache/w-work-cow-{serve,recv-bin,codex}. Kept: clone, target, push.
+- OWED (kiln down at 00:40): delete on adacachy by exact path: ~/.cache/w-work-cow-codex.git, ~/.cache/w-work-cow-codex.bundle,
+  ~/.cache/w-work-cow-{uniq,gw,amend}.txt, ~/.cache/w-work-cow-serve. And push this state commit.
+- Queue empty.
