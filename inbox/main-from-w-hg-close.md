@@ -226,3 +226,33 @@ landing and its replay red first.
 - **Open, 1b:** the pull path (`named_changegroup`) still reads whole texts from the content store. It becomes the same
   walk, with your condition (the base on the client or sent earlier), a count of revisions sent whole, and the
   one-changeset-pull-of-a-large-file measurement against stock.
+
+## C1 step 1b: a pull's file revisions through the changeset store: LANDED on origin/main b9fed44e9 (2026-11-21; base 5d2940ff9)
+- **The pull:** any fetch the links don't walk still makes its changelog and manifests whole when it begins. Its file
+  section is now `serve::getbundle::Pull`, taken a step at a time through StoreWants:
+  - the rows of a batch of planned revisions and of their parents;
+  - then their stored edits;
+  - then any whole texts, one at a time (new `Want::Texts` / `StoreWants::give_texts`; the daemon reads
+    `StoreHandle::text` a piece at a time to its end).
+- **Your condition:**
+  - A stored delta is sent when its base is an earlier revision of its group (sent in this answer), or a parent whose
+    changeset the common set holds.
+  - Otherwise its whole text, made from its chain, is sent against null and counted: `Walk::whole_sent`, and the
+    daemon counter `vcs_store.hg_pull_whole_texts`.
+  - A short answer from the store, or a revision with no row, is refused typed.
+- **Measured (MacBook arm64, debug, stock 7.2):** a one-changeset pull changing one line of a 40,000-line (~2 MB) file.
+  - slates: 554 bytes of changegroup;
+  - stock 7.2 pulling the same changeset from its source: 554;
+  - none sent whole.
+  - Not materially more, so no A/B arm of a delta against p1.
+- **Tests:**
+  - new: a stored delta sent against a held p1; a sibling-based stored delta sent whole and counted 1; a pull with no
+    store row refused by kind; the one-changeset-pull step count is now "a step a unit sent";
+  - slates-hg serve 94/94, slates-server hg 69/69;
+  - hg_interop: the new `a_pull_of_one_changeset_sends_its_large_files_stored_delta_as_stock_does`, plus both stock
+    round trips (HTTP, SSH), pass.
+- **For you to run:** clippy on slates-hg and slates-server, and the full hg_interop suite. Red would be a `Want::Texts`
+  match left non-exhaustive in a lender I didn't see, or a pull refused "a file revision the changeset store gave
+  short".
+- **Next (your order):** the other synchronous readers (lookup's `.hgtags`, the push intake's base text), then step 2
+  after w-perf's intake change lands.
