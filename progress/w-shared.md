@@ -1,5 +1,14 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## ACTIVE 2026-11-21 00:57 PST: lane (A) by reference, piece 1 (chain entry format 6), approved by main 00:58. Worktree
+  ~/slates-work/w-shared-byref, branch agents/w-shared-byref off origin/main 544020bd2. Design: the increment is held in
+  the shard's one content hold under the green's object by its inputs identity, before the verdict (typed refusal at the
+  shard's room), the hold published before the entry appends (the db entry is durable at append, the hold only at a
+  publication), released when its entry folds into a checkpoint and no entry above names it, and at recovery any owned
+  green's held content no entry names goes. Push writers (w-git, w-hg, w-svn) move in this piece; told the hour before
+  landing. Red first: a real-process kill -9 of the owner with an unfolded version (crates/cli/tests/cli.rs). Kiln r15
+  (3a release bench) and r14 (family 3 Linux) still queued.
+
 ## LANDED 2026-11-20: sweep family 2 (stragglers woken by their reports) = 54b9d8b2b (main ab30bfb75). Reports to main now
   go as inbox/main-from-w-shared-<topic>.md on this branch (main moved to the Studio; SendMessage no longer reaches it).
   Family 3 (fuse helper exit via ExitWatch) on agents/w-shared-sweep-3 215556146, worktree ~/slates-work/w-shared-sweep-3;
