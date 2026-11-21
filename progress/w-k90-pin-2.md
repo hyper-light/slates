@@ -166,3 +166,11 @@ Pin + no-CLI clauses hold (w-k90-pin's audit). Left: CI evidence per platform at
 - Linux runs waiting on adacachy (load ~40/32, "machine under strain"; fedora offline): r19 = kiln e2e RED/GREEN
   (32g), r21 = kiln-rt tests + vendor.py check (6g). r18 = kiln e2e on macOS (queued for this Mac).
 - Local commit (unpushed) in ~/kiln-work/w-k90-pin-2-r2: 10 files (+685/-74).
+- ~11:00 PST 11-21: Linux kiln-rt green in a container on Studio-4 (rust:1.99.1-bookworm, aarch64): udp_local_address 2/2
+  (reached_at_a_second_address: kernel answers 127.0.0.2 from 127.0.0.1 = the fault; from 127.0.0.2 with the fix),
+  udp_batched 23/23, --lib udp:: 13/13, clippy -D warnings clean (Linux and macOS).
+- Waiting for the kiln e2e (tunnel.rs r2 test, never run yet): r19 (Linux RED/GREEN, adacachy strained for hours),
+  r23 (macOS, queued; fleet: several runners "link down"/not answering). r18 stopped, r22 lost (d13238 silent).
+- Studio-4 disk: my target deleted whole 09:20; r23 deletes its target after the run.
+- NEXT: on r19 or r23 green -> amend commit message with results, merge origin/main, push HEAD:main, is-ancestor;
+  then measure runners' drops after deploy (deploy is a person's).
