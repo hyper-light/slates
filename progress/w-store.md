@@ -6,6 +6,9 @@
   back on slates_rt; ranges left out; block_on, spawn_detached, Reaper::shutdown, cell set_limit). Unit tests on
   slates_rt: engine 155/155, chunk 52/52, hyper-block 101/101, rt sync 11/11 + retirement 3/3 (macOS arm64,
   Adas-Mac-Studio-2; TMPDIR=~/.cache/w-store-tmp; own target ~/.cache/w-store-local-target.noindex).
+- 046628f88 main's ruling: repository create lands changeset 0 into the store (deferred reply), RepositoryId u128 in
+  the store; red test repository::store_tests 1/1. Shape kept (one store a node, owner thread) — told main why.
+  Pre-existing on clean main f9c113ae9: repository::tests (4) fail, submit refused Overloaded (not mine; reported).
 - 5cda65490 store RSS red test (tests/memory.rs): 192 MiB landed, RSS 6->71 MiB vs bound 142 (release), 7->73/143
   (debug). C4-C6 now in the tools' hands: w-hg (agents/w-hg-c1, server adapter + hg_push::land onto vcs_disk), w-git
   (C5 left with w-store), w-svn (its C2 waits on the wiring, now landed). My part: pair on each landing + RSS test.
