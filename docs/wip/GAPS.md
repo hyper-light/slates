@@ -2808,9 +2808,14 @@
 > through the store between turns (`svn_import::supply_owed_base`). Held by
 > `an_import_asks_its_caller_for_a_delta_base_the_records_keep_elsewhere` (slates-svn) and
 > `t_a652_a_dump_imports_through_the_owners_step_and_exports_again_byte_for_byte` (every imported text stored, none in
-> RAM; red before: 0 stored), with `full.dump` and `deltas.dump` exported byte for byte through the store. Owed: P4b a
-> server-made revision's texts (`land_made`, A-804's made commits) land the same way; the records' `KeptText` and
-> `Record::Deltified` then serve only logs written before P4a, and go with them. Stage C,
+> RAM; red before: 0 stored), with `full.dump` and `deltas.dump` exported byte for byte through the store. P4b BUILT:
+> a server-made revision (`land_made`, A-804's made commits) stages its texts the same way (`svn_commit::stage_texts`,
+> shared with `land_revision`); held by `a_server_made_commit_is_answered_only_once_its_revision_landed_and_committed`
+> (its text named stored, none in RAM; red before: kept in RAM). Every new Subversion text now lands on the store and
+> nothing keeps one in RAM but the green's head and a hook view's pins. Left for main's call (w-svn, inbox b2b-p4):
+> the records' `KeptText`, `Record::Deltified` and the deltify APIs (`deltify_after`, `deltify_candidates`,
+> `kept_range`, `check_deltified`) now serve only logs written before P4a; retiring them makes such logs unreplayable.
+> Stage C,
 > an import as one sliced changeset (today a changeset a record). A submitted version's revision (`svn_made`) takes the
 > one landing order since A-804 (2026-11-21, w-rewrite-ops; main 01:52, the deferred-submit hook, `crate::made_commit`):
 > a recorded submit takes the repository's landing turn before its verdict (or parks for it), the verdict applies in
