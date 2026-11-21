@@ -238,6 +238,15 @@
 > - **A-839 BUILT (2026-11-21):** on macOS a shard's slice no longer reserves its arena's range (the extents are objects
 >   of their own since A-789): a one-shard daemon's content object 139,264 -> 106,496 MiB of address space. Linux and
 >   Windows keep it (their extents are ranges of the object). The image slots, delta log and write log are next.
+> - **PLANNED, deferred until after goal 93 (main 2026-11-21 14:55): the image slots, delta log and write log as growable
+>   objects (w-sizing).** Today, per shard, two image slots take 2R, the delta log R and the write log R/4 of the content
+>   object's address space: on the big Studio (96 GB, 23 shards, R = 1,425 MiB) that is 3.25R = 4,631 MiB a shard and
+>   106,496 MiB for a one-shard daemon, every byte reserved before anything is stored. macOS cannot resize an object it
+>   has sized once (EINVAL), so the ranges cannot grow in place. Plan: each slot and log becomes an object of its own,
+>   named per generation (as A-789's extents are), sized from the image it holds and grown by doubling when a
+>   publication outgrows it; the write log from the writes measured between barriers. This changes the recovery
+>   format (A-68), so it needs a design amendment first. Red first: after a restart a one-shard daemon's content
+>   object reserves less than one image slot's range, and recovery reads back an image grown past its first size.
 > - The content object's address space, per shard (`shard_content_layout`): write log R/4, two image slots 2R, delta
 >   log R, DAX table, arena R; about 4.25R a shard, 1.4 times memory in all (220 GB mapped on the 96 GB Studio, g226;
 >   16 GiB mapped on w-hg's run). -> Image slots and the delta log sized from the image a shard publishes (metadata),
@@ -254,6 +263,14 @@
 > - Device reads: `slates_machine::facts::resident_now` is RSS on macOS, which counts given-back shared pages (above);
 >   the pressure hold's own growth reads it. -> The footprint on macOS; Linux PSI and Windows commit already watched
 >   (A-570). The pressure seam is consulted by admission only; the sizes above don't read it yet.
+> - **PLANNED, deferred until after goal 93 (main 2026-11-21 14:55): the device-pressure seam that sizes consult
+>   (w-sizing).** Today the sampler (A-570) only sets the admission hold. A shard gives memory back only at its next
+>   idle pass: the release run, A-778 r2hold on the big Studio, kept 591 and 340 MiB resident after a destroy until the
+>   idle pass ran. Plan: one seam with the same code on a laptop and in a fleet. A pressure report makes every shard
+>   give back what it can at once (the free extents `release_idle` returns, the idle purge). Each sizing site reads the
+>   seam's ceiling before it grows. Past the hold, admission refuses with a typed error before the machine swaps. Red
+>   first: an injected pressure fall frees a deleted volume's extents with no idle pass, and a growth past the ceiling
+>   is refused with the typed error.
 > - Give-back on macOS: `MADV_FREE_REUSABLE` over the shared content object leaves RSS (probe: 513 MiB stays, not
 >   reclaimed in 10 s under pressure); a purgeable Mach memory entry set `VM_PURGABLE_EMPTY` frees at once (513 -> 1
 >   MiB with two mappings), a whole entry at a time. -> Arena extents as purgeable entries handed to the anchor by port.
