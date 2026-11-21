@@ -58757,3 +58757,25 @@ its split, `frame_of`, `record_sent`, `still_owed`, `mark_acknowledged`, `forget
   encoding is what they assert on. The tracker's own tests carry held frames (`Carried::Frame`), a case it keeps.
 - **Owed.** The receiver's copies (the frame decode's into each `Stream` frame, the reassembly's), and the profile's top:
   one `sendto` and one `recvfrom` a datagram.
+
+### A-797 — The green's owner answers a batch of work asks within its step budget and hands the rest back (2026-11-21, w-fed-move, goal 86b; found by use: 100,000 clients over the Linux kernel; CLAUDE.md "Bounded work everywhere"; A-247, A-388)
+- **Why.** A shard asks its works' green owner in batches of up to a client region's credit (A-388), and the owner
+  answered a whole batch in one synchronous call, whatever each ask cost (a verdict, a rebase, a whole green's sizes, a
+  file's bytes). At 100,000 clients on one primary and two replicas (main `8a18edcc`) the green's shard spent 1,055 ms
+  of CPU in one poll of such a call (`xshard.rs:926`), past its liveness window, and the anchor killed and restarted the
+  primary; the spinning report recurred five more times that run.
+- **Change.** `crates/server/src/work_home.rs`: `answer_within` answers a batch's asks in order while the owner's step
+  budget (`runtime.step_budget_ns`) is unspent, always the first, and hands back the rest, which the asker puts at the
+  front of its outbox and sends again. Counted: `merge.work.batch_handed_back`. Also a diagnosis line: a work log
+  refused at its partition's merge budget names its largest log's entries (`work_log::describe_log`).
+- **Tests** (macOS arm64, Mac Studio, local). Red first: `slates-server --lib
+  a_batch_is_answered_within_the_owners_step_budget_and_the_rest_handed_back` (ten asks of 3 ns under 10 ns: all ten
+  answered before, four after and six handed back; a first ask past the budget still answered). `--lib work_home`,
+  `--test merge_load`, and the fleet tests on works and forwards (42) pass.
+- **By use, partial evidence, not proof** (release, `load_scale`, 100,000 clients, main `8a18edcc` with this change,
+  2026-11-21 ~00:00): no `is spinning` report and no watchdog kill in 3,110 s, where the run before had six reports
+  and one kill; 1,570,311 batches handed back. The run was stopped by main at about 3,970 s: the machine was at 96 of
+  97 GB of swap on 96 GiB of RAM (the run held about 30 GB), so its latencies are confounded. It also showed two open
+  walls (GAPS, A-797): about 2,700 clients whose submits, first sent at 11 to 14 s, were never answered (the client
+  node's forwards: 9,116,579 resolved on its control shard, 9,113,196 delivered home, 3,383 lost between); and a work
+  whose log reached 300,898,443 bytes, filling its partition's merge budget.

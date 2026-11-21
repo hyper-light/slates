@@ -2050,6 +2050,31 @@ enum Outcome {
   Unanswered,
 }
 
+/// Answers `items` in order with `answer` while the clock (`now`, nanoseconds) has spent less than `budget_ns` since the
+/// first: always the first, so a batch always moves; the rest, unanswered and in order, for the asker to send again
+/// (A-797: an owner's step for a batch is bounded by its step budget, CLAUDE.md "Bounded work everywhere").
+fn answer_within<T, A>(
+  items: Vec<T>,
+  budget_ns: u64,
+  mut now: impl FnMut() -> u64,
+  mut answer: impl FnMut(T) -> A,
+) -> (Vec<A>, Vec<T>) {
+  let started = now();
+  let mut answers = Vec::with_capacity(items.len());
+  let mut items = items.into_iter();
+  for item in items.by_ref() {
+    answers.push(answer(item));
+    if now().saturating_sub(started) >= budget_ns {
+      break;
+    }
+  }
+  (answers, items.collect())
+}
+
+/// Format: a batch the green's owner answered in part within its step budget, handing the rest back to be asked again
+/// ([`answer_within`], A-797), the non-vacuity count of the bounded owner step.
+pub(crate) const BATCH_HANDED_BACK: &str = "merge.work.batch_handed_back";
+
 /// Sends `here`'s outbox to `owner` a batch at a time until it is empty: one of the at most [`BATCHES_OUT`] senders out
 /// to `owner`, each awaiting its own batch's answers (A-388).
 async fn send_batches(here: u16, owner: u16) {
@@ -2060,22 +2085,31 @@ async fn send_batches(here: u16, owner: u16) {
     }
     let keys: Vec<DbVolumeId> = batch.iter().map(|item| item.queue).collect();
     let budget = crate::lease::lease_bound_ns();
+    // The owner answers within its step budget and hands back the rest (A-797), which go out again first.
     let answers = crate::xshard::call_in_shard_time_given_room(
       here,
       owner,
       move |s| {
-        batch
-          .into_iter()
-          .map(|item| answer_on_owner(s, item))
-          .collect::<Vec<_>>()
+        let step = s.config.runtime.step_budget_ns;
+        answer_within(batch, step, slates_machine::clock::monotonic_ns, |item| {
+          answer_on_owner(s, item)
+        })
       },
       budget,
     )
     .await;
     let _ = state::with_state_counted(|s| match answers {
-      Some(answers) => {
+      Some((answers, rest)) => {
         for (queue, outcome) in keys.into_iter().zip(answers) {
           settle_outcome(s, queue, outcome);
+        }
+        if !rest.is_empty() {
+          s.count(BATCH_HANDED_BACK, 1);
+          if let Some(outbox) = s.work_home.outboxes.get_mut(&owner) {
+            for item in rest.into_iter().rev() {
+              outbox.waiting.push_front(item);
+            }
+          }
         }
       }
       None => {
@@ -2693,7 +2727,42 @@ fn tell_floor_over_fleet(
 
 #[cfg(test)]
 mod tests {
-  use super::{DbVolumeId, ParkedVerb, Queue, defer_oldest, release_expired_at};
+  use super::{DbVolumeId, ParkedVerb, Queue, answer_within, defer_oldest, release_expired_at};
+
+  /// A-797 (goal 86b; CLAUDE.md "Bounded work everywhere"). Do: answer a batch of ten asks, each costing 3 ns of a test
+  /// clock, under a 10 ns budget; then a batch whose first ask alone costs past the budget. Expect: the first batch
+  /// answers asks while under the budget (the first four: started at 0, 3, 6 and 9) and hands back the other six in order;
+  /// the second answers its first ask whatever it cost, so a batch always moves, and hands back the rest. At 100,000
+  /// clients over the Linux kernel one batch of asks held the green's owner shard 1,055 ms of CPU in one poll, past the
+  /// liveness window, and the anchor killed the daemon.
+  #[test]
+  fn a_batch_is_answered_within_the_owners_step_budget_and_the_rest_handed_back() {
+    let clock = std::cell::Cell::new(0u64);
+    let (answers, rest) = answer_within(
+      (0..10).collect::<Vec<u32>>(),
+      10,
+      || clock.get(),
+      |item| {
+        clock.set(clock.get() + 3);
+        item * 10
+      },
+    );
+    assert_eq!(
+      (answers, rest),
+      (vec![0, 10, 20, 30], vec![4, 5, 6, 7, 8, 9])
+    );
+    clock.set(0);
+    let (answers, rest) = answer_within(
+      vec![1u32, 2],
+      10,
+      || clock.get(),
+      |item| {
+        clock.set(clock.get() + 50);
+        item
+      },
+    );
+    assert_eq!((answers, rest), (vec![1], vec![2]));
+  }
 
   /// The verb a test parks: a status asked by a local client, with nowhere to reply (answered `Overloaded` at its release,
   /// nothing is sent).
