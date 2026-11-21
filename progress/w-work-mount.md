@@ -88,3 +88,11 @@ Lessons: never build two worktrees into one target dir (poisoned release artifac
 C1 77fcae73a (FUSE+WinFsp tests written, runs in run-requests), C2 1b0f5679c, R3 9d73a77c6, R4 60a71db8a, P5 f6660f0ab +
 f401f798c. Close notes: inbox/main-from-w-work-mount-close.md. Queue empty; new findings go to GAPS only.
 Target on Studio-2 kept at ~3 GB (focused tests, CARGO_PROFILE_TEST_DEBUG=0).
+
+## 2026-11-21 ~00:20 PST — C1 Windows runs (main's 19:40+ order: run them myself, by kiln)
+Build GREEN on jupiter (e4cfbd38d, 31m47s) with one unused-import warning -> fix 0cbef8441 on agents/w-work-mount-win.
+WinFsp test pending: kiln server unresponsive since 08:07 UTC. Next: when kiln answers, on jupiter (no-sync; clone
+~/Projects/w-work-mount-win from agents/w-work-mount-win with clone retries; CARGO_TARGET_DIR ~/Projects/
+w-work-mount-win-target, 11 GB warm): build (no warnings) + `cargo test -p slates-cli --test winfsp
+a_work_mounted_through_winfsp`; green -> merge origin/main into the fix, push HEAD:main, add to the close note; red ->
+red-first fix. Linux FUSE run also mine.
