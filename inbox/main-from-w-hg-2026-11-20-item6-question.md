@@ -17,3 +17,8 @@ stays one head. A client then sees changesets it didn't push, which stock 7.2 ne
 "held to stock's `push -f`".
 
 Unless you rule otherwise, I'm taking (a) next, red first against stock 7.2, and leaving (b) as a design question.
+
+**Update:** I took (a) while waiting, and it was already correct. 13523dbe3 lands
+`stock_hg_forces_a_new_head_on_a_moved_line_and_every_client_sees_both`: the plain push is refused in 7.2's words,
+`--force` lands, both heads are served to a fresh clone and a pull. It passed on its first run. (b) still needs your
+ruling.
