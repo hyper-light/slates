@@ -7182,3 +7182,21 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   own refs/tags/slates-blob and slates-nested: "names neither a commit nor a tree" (inbox/w-git-from-w-provision-gate-tag-kinds.md).
   Any other red names its step: the listing compare, fsck, fetch, shallow, partial archive bytes, or the advertisement
   byte compare against http-backend. Send each to w-git.
+
+## w-bugs (goal 93, hg robustness by use): time the HTTP edge's hg requests under load to find the poll-1 spin
+- **Command** (release, branch diag-w-bugs-hg-1, which adds DIAG lines timing each hg request's view and answer):
+  `HG="uvx --from mercurial==7.2 hg" STEP_LIMIT=1800 bash ci/interop/hg-matrix.sh <slates release> <hg's own history> <work>`,
+  then `grep DIAG <work>/anchor.log` and `grep "is spinning" <work>/anchor.log`.
+- **Platform:** Linux under load (adacachy, as w-interop's counts), hg 7.2 through uvx, hg's own history (57,053).
+- **Green:** no "is spinning" in `vcs_http.rs:850`. **Red:** a spin at a connection's first polls (w-interop's run:
+  polls 1 and 7, one after a restart); the DIAG lines around it name the query and whether the view or the answer
+  held the poll. Send the DIAG lines to w-bugs.
+
+## w-bugs (goal 93, git push suite under load): t_a752 at the extremes, main against agents/w-bugs-a752
+- **Command:** `cargo test -p slates-server --lib t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time`
+  three times each under `taskset -c 0`, `taskset -c 0,1`, and with 2 x nproc busy loops; on origin/main and on
+  agents/w-bugs-a752 (fc3da3a40: asserts units >= files, not quanta > files).
+- **Platform:** Linux (taskset).
+- **Green:** the branch passes every run. **Red:** main fails "the update's work took N quanta for M files" at the
+  extremes (w-git: 1 in 2 at load 12.8). A branch failure on "turns for quanta" means the second assertion is timing
+  too: send it to w-bugs.
