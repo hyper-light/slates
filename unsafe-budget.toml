@@ -563,7 +563,11 @@ slates-ipc = 147
 # 2026-11-20 (+1, A-748, `daemon.rs` `shared_listeners`, compiled only for Windows): the daemon takes unique ownership of
 #   the reading end of the anchor's shared-listener pipe, handed in its spawn's explicit handle list and named in its
 #   environment, read once; its inheritance flag is cleared at once (`slates_ipc::win_spawn::clear_inheritance`).
-slates-server = 9
+slates-server = 10
+# 2026-11-20 (+1, A-789's macOS shape, 362bd8c39, which landed it without raising the budget; w-lint's finding; a
+#   `// SAFETY:` line directly above): `content_pool.rs` `map`: `ExclusiveObject::open_range` of an extent's own object
+#   (unsafe fn: no other mapping reaches it while its owner word is held), one site, its retry after `make_extent` folded
+#   into the same loop.
 # 2026-11-20 (+3, A-789's Windows shape, main's ruling of 18:40; compiled only for Windows; a `// SAFETY:` line directly
 #   above each): the process's content extent table keeps each section's handle as a value in an atomic word, since a
 #   shard may claim another partition's extent and no lock may stand between them (D-7):

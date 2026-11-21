@@ -16657,3 +16657,85 @@ cores and loaded p999 5.6-12.2 ms (the tables above, "the candidates" and "per h
   µs).
 
 The candidates' code is deleted with its branch (`agents/w-provision-gate-kqueue`, b01a0ef7b).
+## What live shipping adds to a stable write, after A-396's holds: macOS, and main's regression since b402afc7c (85a; g228; 2026-11-20)
+
+**Command (the contract):** `SLATES_TEST_CLI=1 SLATES_TEST_MEASURE=1 <live_fleet release test binary>
+measure_what_live_shipping --nocapture --test-threads=1`, each arm built with `cargo test --release -p slates-cli --test
+live_fleet --no-run` (CARGO_BUILD_JOBS=4, the Studio's load rule). The test, since this change, also reads each daemon's
+CPU over the stream, the 500 ms after it and the second after that (the process; on Linux the control shard's thread
+too), and prints each candidate's live counters (`fleet.live.hop.holder`). Arms interleaved round by round, the order
+rotated; every round shown. **Hardware:** adas-mac-studio.local-2, Apple silicon, 32 cores, macOS. Linux (adacachy) was
+not measured: its kiln runs were frozen by their cgroup at load 80-89 (`do_freezer_trap`) and timed out unbuilt.
+
+### A-396's owed A/B: the holds against none, and against holds forced on (base b402afc7c, load 31 -> 16)
+
+Microseconds: what live shipping adds at the median; the live write's p999.
+
+| round | holds (main) | no holds | forced (A-387's decline bypassed) |
+|---|---|---|---|
+| 1 | 234.2; 707.7 | 169.2; 434.4 | 297.7; 534.1 |
+| 2 | 177.3; 393.5 | 184.4; 416.4 | 223.9; 447.2 |
+| 3 | 179.9; 402.0 | 169.8; 447.7 | 236.6; 502.3 |
+| 4 | 182.8; 453.5 | 187.3; 491.9 | 224.4; 514.3 |
+| 5 | 167.7; 400.3 | 205.0; 423.0 | 294.2; 585.5 |
+
+An earlier five-round A/B of holds against none on the same base (load 32-34): holds 454.0-596.0 µs added (p999
+859.8-4,645.0), none 455.1-551.0 (886.5-1,721.2).
+
+**Reading.** On macOS every hold is declined by A-387's predicate (`fleet.live.hold.declined` about 7,900 a run), so the
+holds change nothing there, and the CPU after the stream is the same either way (10-60 ms a second a daemon, `ps`'s 10 ms
+grain): no idle spin. Forcing the holds on is **measured and rejected**: about 50 µs worse at the median and the owner's
+CPU over the stream 620 against 380 ms. The live p999 is under 1 ms at this load; the median is 3.4-4x the 50 µs goal.
+The owner's round splits (holds, round 5): exchange 100 µs, build 28, to the control shard 23, back to the owner 5, the
+lane 1; the reply's own wake from the fold 65 µs on top. A holder's serve of an entry is about 10 µs
+(`fleet.live.hop.holder`), so the exchange is the transport and the two control shards' wakes.
+
+**Measured and rejected: a fold that answers before its follow-on work** (2fbc20496, branch
+agents/g228-live-write-adds-holds-ab, not landed). The fold's appends and sends queued behind the replies it woke, to cut
+the reply's 65-116 µs wake: on main 56f33c6f6 at load 9-11 the reply's wake was 88 against 92 µs a write, and the added
+median 2,368-2,676 against 1,312-2,967 µs. The reply's wake is not the fold's tail.
+
+### Main regressed 4x at the median and 15-20x at p999 between b402afc7c and 56f33c6f6, holds or none (load 33 -> 75)
+
+| round | old (b402afc7c) | main56 (56f33c6f6) | noholds56 |
+|---|---|---|---|
+| 1 | 543.1; 6.3 ms; 0 | 2,518.4; 126.3 ms; 30 | 1,797.5; 105.9 ms; 30 |
+| 2 | 624.1; 11.4 ms; 0 | 4,101.1; 106.8 ms; 61 | 2,948.2; 95.5 ms; 33 |
+| 3 | 822.5; 6.2 ms; 0 | 549.4; 42.7 ms; 1 | 2,425.7; 152.3 ms; 49 |
+| 4 | 604.1; 6.5 ms; 0 | 2,639.4; 108.1 ms; 39 | 631.7; 24.8 ms; 0 |
+| 5 | 700.9; 5.6 ms; 0 | 3,984.3; 150.8 ms; 56 | 4,110.9; 198.3 ms; 73 |
+
+Each cell: added at the median (µs); live p999; live writes over 50 ms. Every daemon's CPU over the stream: old
+0.26-0.93 s, the new arms 1.5-9.3 s; in several new rounds every daemon burned 300-880 ms a second after the stream,
+holds or none. Bisected on main's first-parent line (three rounds a probe, load 49-74): good through #17 (6337049f6:
+572/338/645 and 652/594/551 µs added, no write over 50 ms), bad from #25 (03a62ad15: 562/2,092/1,046 µs, 0/34/12 writes
+over 50 ms; #33 779840fba: 568/1,672/2,305, 0/25/37). A probe at load 4-6 could not classify #19-#24 (1,029-2,970 µs,
+no write over 50 ms, no reference in that run), so the burner was found by sampling instead: `sample <daemon pid> 3`
+during the stream of main56, three rounds, every daemon's heaviest non-waiting frame `mincore` (538-1,309 samples in
+3 s), under `slates_mem::resident::of_range` (A-744's sweep). #18 is a48bcdc52, "a status request arms the A-744 sweep
+to completion a step a turn": the test's own status polls before the stream (`wait_settled`, the sessions) armed a sweep
+of tens of GiB of address space on every shard, which ran half a step quantum ahead of every turn's ready work for
+seconds.
+
+### The fix, measured: the sweep on the shard's idle time, spaced by its length, and the driver harvested between idle slices
+
+Same command and Studio. Each cell: added at the median (µs); live p999; writes over 50 ms; every daemon's CPU over the
+stream.
+
+| round | main (f9c113ae9) | sweep on idle time (68b597dd8), load 15-21 | main (f9c113ae9) | sweep + harvest (343b741e8), load 11-15 |
+|---|---|---|---|---|
+| 1 | 3,485.5; 13.1 ms; 0; 6.3-7.0 s | 353.7; 64.6 ms; 18; 3.3-4.1 s | 3,087.4; 7.8 ms; 0; 5.6-6.2 s | 1,701.8; 3.6 ms; 0; 4.2-4.5 s |
+| 2 | 440.9; 17.5 ms; 1; 4.7-5.1 s | 424.5; 64.0 ms; 12; 2.7-3.4 s | 3,095.8; 6.4 ms; 0; 6.3-6.6 s | 1,397.9; 2.7 ms; 0; 3.6-4.0 s |
+| 3 | 2,415.4; 15.7 ms; 0; 5.1-5.7 s | 392.5; 61.6 ms; 8; 3.1-3.6 s | 2,614.2; 9.7 ms; 0; 5.4-6.5 s | 1,939.2; 3.4 ms; 0; 4.4-4.6 s |
+| 4 | 3,684.6; 14.0 ms; 0; 6.6-7.3 s | 406.5; 84.2 ms; 25; 3.5-3.9 s | 2,654.0; 4.9 ms; 0; 5.6-6.2 s | 1,630.0; 3.7 ms; 0; 4.3-4.5 s |
+| 5 | 3,283.7; 31.1 ms; 0; 5.8-6.6 s | 410.0; 79.7 ms; 17; 3.1-4.0 s | 2,796.5; 5.4 ms; 0; 6.1-6.6 s | 1,216.5; 2.2 ms; 0; 2.4-2.7 s |
+
+**Reading.** On idle time alone the sweep stopped running ahead of ready work (the median 8x better), but the idle loop
+never asked the driver between slices, so a socket's readiness waited for the sweep to end: 8-25 writes over 50 ms a run
+(`crates/rt/tests/idle_work_io.rs`, red before: a TCP accept never served in 5 s beside endless idle work). With the
+driver harvested between slices: no write over 50 ms, p999 2.2-3.7 ms against main's 4.9-9.7, the median 1,217-1,939
+against 2,614-3,096 µs, CPU over the stream a third lower. **Still open (GAPS):** every daemon burns 440-600 ms in the
+500 ms after the stream and 630-1,100 ms in the second after that, the armed sweeps finishing on idle time (main finished
+them during the stream, at the writes' expense): a status request still costs every shard a sweep of tens of GiB of
+address space, and an idle slice still delays the next message by up to half a step quantum. The live write's 50 µs goal
+needs no sweep armed by a plain status request at all.
