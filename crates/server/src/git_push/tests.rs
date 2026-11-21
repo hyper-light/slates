@@ -2078,6 +2078,132 @@ fn flat_commit(
   (commit_id, objects)
 }
 
+/// An annotated tag object named `name` of the object `target` of `kind`: its id and its bytes as git writes them.
+fn tag_object(name: &str, (target, kind): (ObjectId, &str)) -> (ObjectId, Vec<u8>) {
+  use slates_git::object_name::{Kind, name_of};
+  let bytes = format!(
+    "object {target}\ntype {kind}\ntag {name}\ntagger A <a@example.com> 1700000000 +0000\n\n{name}\n"
+  )
+  .into_bytes();
+  (
+    name_of(ObjectFormat::Sha1, Kind::Tag, &bytes).unwrap(),
+    bytes,
+  )
+}
+
+/// Main's order of 2026-11-21 (w-interop's A/B of record, r16: git/git's push refused every ref whose target is
+/// neither a commit nor a tree, `junio-gpg-pub`, a blob, and `v1.0rc1` to `v1.0rc6`, so its clones were short of
+/// them). Git lets a ref name any object, and stock `git daemon` takes them. Do: push `main` at a commit, then in one
+/// push `refs/tags/junio-gpg-pub` naming a blob, `refs/tags/signed-blob` naming an annotated tag of that blob, and
+/// `refs/tags/rc` naming an annotated tag of an annotated tag of the commit; then read the refs advertised, list the tags
+/// with `peel` and fetch the three. Expect: every command `ok`; each ref advertised at the object it names; `ls-refs`
+/// naming each tag peeled through every tag it names (the signed blob's to the blob, `rc` to the commit) and none for the
+/// bare blob; the fetch's pack holding the blob, both tags, the inner tag and the commit. Red before the change: each
+/// refused `ref names no tree` ("names neither a commit nor a tree").
+#[test]
+fn t_a836_refs_naming_a_blob_and_tags_of_tags_are_taken_and_advertised() {
+  use slates_git::object_name::{Kind, name_of};
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
+    let repository = git_repository(state, "targets");
+    let (first, objects) = flat_commit(1, "first", None);
+    let created = [("", first.to_string(), b"refs/heads/main".to_vec())];
+    let created: Vec<(&str, &str, &[u8])> = created
+      .iter()
+      .map(|(old, new, name)| (*old, new.as_str(), name.as_slice()))
+      .collect();
+    let received = pushed(
+      state,
+      repository,
+      &request(&created, CAPABILITIES, &pack_of_objects(&objects)),
+    );
+    assert_eq!(reasons(&received), [b"ok"]);
+    let key = b"-----BEGIN PGP PUBLIC KEY BLOCK-----\n".to_vec();
+    let blob = name_of(ObjectFormat::Sha1, Kind::Blob, &key).unwrap();
+    let (signed, signed_bytes) = tag_object("signed-blob", (blob, "blob"));
+    let (inner, inner_bytes) = tag_object("rc-inner", (first, "commit"));
+    let (rc, rc_bytes) = tag_object("rc", (inner, "tag"));
+    let objects = vec![
+      (Kind::Blob, key),
+      (Kind::Tag, signed_bytes),
+      (Kind::Tag, inner_bytes),
+      (Kind::Tag, rc_bytes),
+    ];
+    let named = [
+      (blob, b"refs/tags/junio-gpg-pub".to_vec()),
+      (signed, b"refs/tags/signed-blob".to_vec()),
+      (rc, b"refs/tags/rc".to_vec()),
+    ];
+    let ids: Vec<String> = named.iter().map(|(id, _)| id.to_string()).collect();
+    let commands: Vec<(&str, &str, &[u8])> = named
+      .iter()
+      .zip(&ids)
+      .map(|((_, name), id)| ("", id.as_str(), name.as_slice()))
+      .collect();
+    let received = pushed(
+      state,
+      repository,
+      &request(&commands, CAPABILITIES, &pack_of_objects(&objects)),
+    );
+    let advertised = super::advertised_refs(state, repository);
+    assert_eq!(
+      reasons(&received),
+      [b"ok", b"ok", b"ok"],
+      "{:?}",
+      received.outcomes
+    );
+    for (id, name) in &named {
+      assert!(
+        advertised.contains(&(*id, name.clone())),
+        "{} not advertised at {id}: {advertised:?}",
+        String::from_utf8_lossy(name)
+      );
+    }
+    // Served as git serves them: `ls-refs` with `peel` names each tag's object peeled through every tag it names, and a
+    // fetch wanting the three answers a pack holding them and everything they reach.
+    use crate::vcs_store::upload::tests::{
+      answered, fetch, lines_of, pack_of, request as upload_request,
+    };
+    let asking = ["peel".to_owned(), "ref-prefix refs/tags/".to_owned()];
+    let listed = answered(
+      state,
+      (repository, &owner()),
+      slates_git::upload::Asked::Request(&upload_request("ls-refs", &asking)),
+    );
+    assert_eq!(listed.1, None, "ls-refs refused");
+    let lines: Vec<String> = lines_of(&listed.0)
+      .iter()
+      .map(|line| String::from_utf8_lossy(line).trim_end().to_owned())
+      .collect();
+    for expected in [
+      format!("{blob} refs/tags/junio-gpg-pub"),
+      format!("{signed} refs/tags/signed-blob peeled:{blob}"),
+      format!("{rc} refs/tags/rc peeled:{first}"),
+    ] {
+      assert!(
+        lines.contains(&expected),
+        "{expected} not listed: {lines:?}"
+      );
+    }
+    let fetched = answered(
+      state,
+      (repository, &owner()),
+      slates_git::upload::Asked::Request(&fetch(&[blob, signed, rc], &[])),
+    );
+    assert_eq!(fetched.1, None, "fetch refused");
+    let unpacked = slates_git::unpack::read_whole(
+      &pack_of(&fetched.0),
+      ObjectFormat::Sha1,
+      &slates_git::unpack::NoIndex,
+      &mut slates_git::Admission::new(u64::MAX),
+    )
+    .expect("a whole pack");
+    let ids: Vec<ObjectId> = unpacked.objects.iter().map(|object| object.id).collect();
+    for id in [blob, signed, rc, inner, first] {
+      assert!(ids.contains(&id), "{id} not fetched: {ids:?}");
+    }
+  });
+}
+
 /// Shape: the files of a flat head in [`t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time`], as w-git
 /// measured (3,500); fewer in debug, where every unit is slower, to keep the test's time.
 const FLAT_FILES: usize = if cfg!(debug_assertions) { 1_500 } else { 3_500 };
