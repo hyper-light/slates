@@ -51,3 +51,9 @@ Pin + no-CLI clauses hold (w-k90-pin's audit). Left: CI evidence per platform at
 - Watching GitHub run 44841298533 (4aa0ee778, contains 5264caaa3 + c0f576eb3 + 08f1a434): poller
   ~/kiln-work/w-k90-pin-2-logs/poll.sh 44841298533 (background).
 - kiln legs still wedged (no change in another 25 min).
+
+## ~16:55 PST
+- 44841298533 (4aa0ee778): ubuntu-24.04-arm slates build ended exit 143 at ~22 min even with the disk step -> memory
+  (systemd-oomd on a 16 GB runner). LANDED kiln e763e394f (merge-base confirmed, base e763e394f): Linux lanes stop
+  oomd, 16 GiB swap, CARGO_BUILD_JOBS=2. Validated 0 diagnostics.
+- Still watching 44841298533's macos-latest / windows-11-arm / ubuntu-latest slates and w-k90-win's windows-slates.
