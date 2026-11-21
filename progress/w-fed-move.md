@@ -1,5 +1,13 @@
 # w-fed-move — progress (relaunched on the Mac Studio 2026-11-19 ~21:35 PST; supervisor slates-7a via kiln)
 
+## 2026-11-21 ~01:30 PST: A-800 LANDED slates main 9918e6c0 (main's order: the lost replies first)
+- Drop sites on the reply-home hop listed, each counted apart; the silent ones (a reply dropped while its shard's
+  state is borrowed, finish_owner_forward's and deliver's refused borrows) now resend or count. Three red/green tests.
+- Told main: inbox/main-from-w-fed-move-counters.md (main reruns 100k from run-requests.md).
+- Leading candidate: a reply admitted and never run; A-798 (931e52ed) fixed such a lost kick since.
+- Next (main's order 3): the throughput walls (153 verdicts/s; 10.1 M owner asks), each with a counter-named mechanism
+  and an A/B; measured only at small scale here, the heavy runs filed to main.
+
 ## 2026-11-21 ~00:20 PST: A-797 LANDED slates main 086089ba; main STOPPED my 100k run (swap); load runs are main's now
 - A-797: the green's owner answers a batch of asks within its step budget, the rest handed back (the primary had been
   killed by its watchdog: shard 0 spun 1,055 ms in one batch). Unit test red->green; 42 fleet tests pass.
