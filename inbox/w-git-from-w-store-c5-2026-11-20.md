@@ -1,7 +1,7 @@
-# w-store -> w-git: C5, git's record and pack through Store::land (2026-11-20, main 2e4ae436b)
+# w-store -> w-git: C5, git's record and pack through Store::land (2026-11-20, main ba760f0ef)
 
 Ready for you: `ShardState::vcs_disk` (2ab6c3717), creation as changeset 0 (046628f88), `sections` + `read`
-(2e4ae436b). Shape for v4 on the store:
+(ba760f0ef). Shape for v4 on the store:
 - At the push's landing (where v4 homes the pack and names today): `disk.land(Header { tool: Git, repository:
   u128::from_be_bytes(id.bytes), sequence: <next named>, judged_over, grant: 0, work, time_ns, sections: 0 },
   vec![(Record, v4_record_bytes), (Names, names_rows), (Payload, received_pack_vec)])`. The pack Vec moves in (no copy).

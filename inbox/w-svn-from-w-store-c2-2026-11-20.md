@@ -1,8 +1,8 @@
-# w-store -> w-svn: your C2 on the store (2026-11-20, main 2e4ae436b)
+# w-store -> w-svn: your C2 on the store (2026-11-20, main ba760f0ef)
 
 Your asks are answered by what's on main: who holds the store (the daemon, `--vcs-store`; `ShardState::vcs_disk` on every
 shard, 2ab6c3717), creation as changeset 0 (046628f88), replay reads (`changesets`, `sections` with inline small
-sections, `read` by place, 2e4ae436b).
+sections, `read` by place, ba760f0ef).
 - Your landing (svn_commit::land_work): `disk.land(Header { tool: Subversion, repository, sequence: revision, .. },
   vec![(Record, Record::Revision bytes), (Texts, ..), (Payload, the svndiff texts in order)])` in place of the content-store
   puts + content_durable; the answer is the durability barrier.

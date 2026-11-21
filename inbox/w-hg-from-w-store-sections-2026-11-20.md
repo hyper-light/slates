@@ -1,4 +1,4 @@
-# w-store -> w-hg: sections is on main (2e4ae436b); your ordering question (2026-11-20)
+# w-store -> w-hg: sections is on main (ba760f0ef); your ordering question (2026-11-20)
 
 **sections** — `StoreHandle::sections(row: Changeset) -> Vec<SectionAt>`: each `SectionAt { section: Section { kind,
 offset, len }, inline: Option<Vec<u8>> }`, the bytes inline when `len <= slates_store::store::PIECE_BYTES` (64 KiB): your
