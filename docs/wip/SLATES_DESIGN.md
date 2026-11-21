@@ -59104,6 +59104,21 @@ Applied in the same change to: `crates/merge/src/engine/branch.rs` (`Lineage::pr
   commit (file, identity, changed paths) while its green shows nothing, and a preview of a moved green is refused.
 - **Cost.** The preview's branch is O(1) and its release is the version's own nodes; the mapped files are made twice
   (owed, GAPS C2 (d)).
+- **The preview's oracle, and a fix it found** (2026-11-21, w-engine, main's order). A held verdict's preview must read as
+  its commit does on every path a Subversion revision is made of (`vcs_store::svn_made`'s reads: the changed paths, each
+  path's bytes, property list, kind, link target, IPC node, hard link's primary, copied-after). Held over the copy
+  oracle's generated histories (copies, nested and replacing, moves inside a copy) in `engine::copy_tests` and the
+  identity oracle's (links, symlinks, specials, modes, attributes, renames, removals) in `tests/identity.rs`, and through
+  the server's `Greens::preview` over a repository's lineage (`greens::preview_tests`); each red with the copy and link
+  effects dropped from the preview. **The fix:** a commit names a home's links as changed with it when the home has a
+  special history (`Green::record_changes`'s `was_special`, which a rename seeds), and a preview, a fork whose histories
+  start empty, could not tell: it named `b` alone where the commit and the change index's model name `b` and `d` (the
+  identity oracle's shrunk case: a link to a renamed file, then the file's mode set;
+  `a_preview_records_a_renamed_homes_links_as_its_commit_does`, red without the fix). Now `Lineage::preview` asks the
+  source, before the fork, which of the verdict's paths and their links were special there, and the fork's
+  `was_special` answers from that too (`Green::special_seen_for`, `know_special`): O(the verdict's paths), the fork still
+  O(1). A Subversion green holds no hard links, so no revision was made wrong; a git or mounted work's green could have
+  been.
 
 ### A-806 — A rebase answers each changed file as parts over the head, and a work holds and logs those parts: a work's log is what it wrote (2026-11-21, w-fed-move, goal 86b; main's order 02:37 PST, the 300 MB work log; CLAUDE.md §2 item 8; A-207, A-790)
 - **Why.** At 100,000 clients over the Linux kernel one work's log reached 300,898,443 bytes and filled its

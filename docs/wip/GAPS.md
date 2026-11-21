@@ -24617,3 +24617,8 @@ in what lands. Branch tips as of 2026-11-10:
 > hashes current bytes only, no history reads); slice the checkpoint's last step (~43 ms: build 5.7, encode 9.5, record
 > 24.4 of 49 MB) and single key folds of up to 13.4 ms.
 
+> **A-805's preview oracle (2026-11-21, w-engine; main's order):** a held verdict's preview reads as its commit over the
+> copy and identity oracles' generated histories and through `Greens::preview`, red with copy and link effects dropped.
+> It found a preview naming fewer changed paths than its commit (a home's links, once the home had a special history):
+> fixed, the source telling the fork what was special. Closed.
+

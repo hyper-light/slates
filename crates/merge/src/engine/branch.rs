@@ -679,9 +679,13 @@ impl Lineage {
         head,
       });
     }
+    // The fork's histories start empty, so it is told which of the verdict's paths and links were special here: the
+    // commit records a special's links as changed with it (`Green::record_changes`), as the source would.
+    let seen = self.with(from, |green| green.special_seen_for(&judged))?;
     let preview = self.branch(from, head)?;
     let mut judged = judged;
     self.with(preview, |green| {
+      green.know_special(seen);
       // The branch's head is its version 0: the verdict commits as the version after it.
       judged.at = green.head();
       green.commit_held(judged)
