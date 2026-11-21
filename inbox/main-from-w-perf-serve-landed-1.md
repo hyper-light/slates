@@ -74,3 +74,13 @@ Next: what's left of the pull after the A/B (the per-turn view rebuild), then th
 - Same run: **`clone -U` slates 53.4 s against stock 7.7 s** (6.9x slower; w-interop saw 24 vs 16.4). That's w-hg's
   clone item; told. **The stream in that build** (still every text whole) was 335 s; its fix (c870c8f80) serves only
   a repository whose revisions have rows, so its A/B fills slates by a push: running now on main 772395004.
+
+## Fourth landing: the rule's first price (e3a253e96)
+The learned rule weighs rent against a price, and the price is a merge's measured time (or reported inserts). An
+index never merged has neither, so no merge ever came due. A repository filled by pushes alone (each push's fork
+sealed into runs, adopted as the index) would never be merged until a restart replays it. Reporting inserts means
+editing the push intakes (w-hg's C1 files, w-git's staging), so instead an index never merged is merged once at its
+first reported lookups. That times the price, and the rule decides every merge after. Red:
+`an_index_never_merged_is_merged_once_its_lookups_are_reported` (four runs and no merge before). Server
+hg_view/upload/vcs_store 114/114. `inserts_took` stays owed (GAPS), for w-hg's and w-git's intakes if you want it.
+The stream's A/B (slates filled by one whole-history push) restarted on e3a253e96: kiln r3, big Studio.

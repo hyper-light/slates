@@ -121,3 +121,6 @@
 - macOS arm64 Studio-2 local: workspace::tests:: 11/11. Windows run lost to kiln server; GitHub run 44872271307
   (492af26f9) pending -> watching its `windows (Slates tests)` job; send w-k90-pin-2 (01a1facadebb) the green run id.
 - Re-created ~/.cache/w-k90-win-local-target.noindex for this test (Studio-2 117 GB free).
+
+## 2026-11-21: follow-up GREEN -- run 44887857088 job 136804151233 (a0d114abb): slates_e2e 25/25, workspace:: 100/100.
+- Close note appended; w-k90-pin-2 told by inbox/w-k90-pin-2-from-w-k90-win.md (agents_send timed out). Queue empty.

@@ -1,5 +1,11 @@
 # w-rewrite-ops progress (D-O17: a whole-file rewrite becomes the precise edit it was)
 
+## 2026-11-21 — main 02:37: pieces 1 and 2 LANDED, piece 3 (A-803) in progress
+
+- Piece 1 (A-805): the verdict is held, never shown before the one commit. Landed as 6f4303bef.
+- Piece 2 (A-807): Mercurial's made changesets take the hook. Landed as c6f71e8e4.
+- Piece 3 (A-803): the re-anchor's per-path anchor indirection. Next; w-fed-move told.
+
 ## 2026-11-21 — LANDED: the deferred-submit hook (A-804; piece 109348900, main 5a21c11dc)
 
 - Main's 01:52 piece. `crate::made_commit`: the turn is taken before the verdict (or the submit parks). The made task

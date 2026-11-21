@@ -1591,3 +1591,33 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - w-fed-move stays on the 100k walls. While r48 waits it takes the 300 MB work log, unbounded growth: a counter-named mechanism, red, fix.
   2c32af2b5 was already in w-fed-move's profiled build; the growth survives it.
 - 2026-11-21 02:38 PST LANDED: 2659cfe39 (w-perf: git's repository index is kept up as Mercurial's is, merged a table at a time once built whole, its lends reporting lookups; red: no merge without its arm). The compaction ruling now covers git as well as hg. No agent waiting on main. r48 still queued (no start notice). The MacBook disk is 46 GB.
+- 2026-11-21 02:43 PST
+  - LANDED:
+    - 772395004 (BENCHMARKS: hg's one-changeset pull 4.2 s -> 0.243 s best, hg serve 0.189 s, every run shown; still 1.29x stock).
+    - 5ddb0e3c3 (w-svn B2 (b) P1: a commit brings back a stored text the content store let go).
+  - RUN: w-work-mount's C1 WinFsp test can't reach jupiter from Studio-2 (10 kiln refusals), so main runs it from the MacBook as kiln r1 on jupiter: a fresh clone of agents/w-work-mount-win (0cbef8441), slates-server's build warnings counted, then a_work_mounted_through_winfsp_saves_and_its_submit_lands_the_save. The result goes to w-work-mount.
+- 2026-11-21 02:48 PST Quiet: no agent waiting on main; no new landings since 02:39. jupiter run r1 (w-work-mount's WinFsp test) is running; r48 is still queued. The MacBook disk is 39 GB; the owners were told earlier, and the cleanup runs again under 30.
+- 2026-11-21 02:53 PST LANDED: 34259b8eb (w-svn B2 (b) P2: a hook's view brings back a stored text the content store let go before it holds it). w-git waits on its own r14 (the push's decision phase sampled). No agent waiting on main. The MacBook disk is 35 GB.
+- 2026-11-21 02:59 PST DISK, the MacBook: 59 GB free at 02:22, 31 GB now, none of it slates' targets (only w-perf 4.6 GB and w-svn 5.4 GB are active). The growth:
+  - a Docker container elated_leakey (rust:1-bookworm, 33 min) building kiln and running w-k90-vendor's C1 Linux tests (workspace::slates, vendored, slates_roles) from a kiln work folder; its writable layer is 13.9 GB, freed when it exits;
+  - Docker images up 14 GB;
+  - ~/.local/share/kiln up 37 -> 53 GB (agent work folders);
+  - other sessions' new caches (kmf-local 6.4 GB, reliquary-rq03 2.3 GB, kiln-move-freeze 1.1 GB).
+  The clean-aggressive rule applies under 30 GB; kiln-opt-target (18 GB, unwritten since 23:09) qualifies then. No agent waiting on main.
+- 2026-11-21 03:03 PST
+  - LANDED: 6b555466b (w-perf: an index never merged, such as a repository filled by pushes alone, is merged once its lookups are reported, which times the rule's price; red: four runs, no merge). inserts_took stays owed in GAPS for w-hg's and w-git's intakes. The stream A/B restarted on the big Studio (r3).
+  - w-fed-move claimed an A-number for the work-log wall ("a work's log is what it wrote").
+  - DISK: the MacBook at 29 GB. clean-aggressive freed 0: kiln-opt-target has a file open, so it's in use and kept. The growth is Docker (the kiln-build container's 14 GB layer, freed on exit; images +14 GB) and kiln's agent folders. Ada's. Studio-1's g221 and g223 offline again.
+- 2026-11-21 03:08 PST
+  - LANDED: dc0adee77 (w-fed-move, the work-log wall: a rebase answers each changed file as parts over the head, and a work holds and logs those parts, so its log is what it wrote).
+  - Studio-2 is off kiln again (its 7 agents offline).
+  - DISK: the MacBook at 27 GB. The kiln-build container elated_leakey is still running at 42 min, its layer 14.2 GB, freed when it exits. Docker images are 60 GB (36.6 reclaimable, not ours). w-git's r18 is compiling on the MacBook, non-incremental.
+- 2026-11-21 03:13 PST
+  - LANDED:
+    - A-806 (w-fed-move, 4c404823 / dc0adee77): a work's log holds what it wrote. A rebase answers changed files as pieces over the head. Largest log 752,530 -> 2,036 bytes over kernel/, 35,249,811 -> 1,957 over asic_reg. Red first: a 64-byte write into 1 MiB logged 1,048,635 bytes before, under 1,088 after.
+    - 542e1242c (w-svn B2 (b) P3: the content store lets go a commit's texts once landed, recovery reads none back, the deltify job retired).
+    - w-git's r18 is green at 8baa1cf16 (layer 2's next piece), landing.
+  - STALE TEST on main: daemon's the_merge_service_enforces_roles_pins_versions_and_seals_behind_the_barrier still asserts a green's landing is refused, but A-774 part 3 (f401f798c) made greens landable. w-fed-move updates only that assertion to A-774's rule, or stops and reports a design conflict.
+  - NEXT for w-fed-move: owner asks per client grow ~6x with scale (17.5 at 1k, ~101 at 100k). Inject contention to find the kind that grows.
+  - DISK: the MacBook back to 42 GB. The kiln-build container is still running at 47 min, 14.3 GB.
+- 2026-11-21 03:18 PST LANDED: 564cc74af (w-fed-move: the stale role test judges a green's landing as any volume's, so it expects the missing target refused, not Unsupported: A-774 part 3's rule; stale since f401f798c). w-fed-faults acknowledged an old message late; its list stays closed. w-git's r22 (the git/git push on the 8baa1cf16 diagnostic) is running. The MacBook disk is 55 GB.
