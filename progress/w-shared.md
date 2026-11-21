@@ -1,5 +1,10 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## 14:00 PST: LANDED A-826 (3b) main 156007dff, family three c5051eb51. ACTIVE: owner-side slicing of the holder route
+  (performance; near misses 454-883 ms on the control shard at 512 MiB). First cut agents/w-shared-slice ec245f32e: a
+  holder's submit not re-encoded/re-hashed at the owner (SealedWork.held). kiln r1 (new numbering): holder tests + A/B
+  256/320/512 x5. The 512 MiB exit 4 is the LOCAL submit (w-work-cow's slicing; told). takeover_round: main's (GAPS).
+
 ## ACTIVE 2026-11-21 10:07 PST: lane 3b on agents/w-shared-3b (269f12e3f off 8f73b6928), worktree ~/slates-work/w-shared-3b.
   kiln r24 red+green; r23 A/B of A-825 (895b80994 vs 545cf46c5) queued. Map in ~/slates-work/w-shared-scratch/3b-map.md.
 
