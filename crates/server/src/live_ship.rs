@@ -326,6 +326,12 @@ pub(crate) struct LiveVolume {
   /// The newest entry appended, by position, with when its publication reached the shipper: the round its durability
   /// ends is timed hop by hop when the answer that makes it durable is folded ([`count_hops`]).
   newest: Option<(u64, u64)>,
+  /// The build of the publication being made, stamped at each step on the host's monotonic clock: its capture read, its
+  /// payload sealed, its entry appended ([`BuildMarks`]). Taken by the entry appended for it into [`LiveVolume::newest_marks`].
+  marking: BuildMarks,
+  /// The newest entry's build marks, timed with its round when the answer that makes it durable is folded: the build
+  /// split into capture, seal, append and send ([`count_hops`], g228, 85a).
+  newest_marks: BuildMarks,
   /// When the fold that made the newest entry durable ran, on the host's monotonic clock: a reply held for it times its
   /// own wake from there ([`wait_durable`], `fleet.live.hop.reply`).
   resolved_ns: Option<u64>,
@@ -2233,12 +2239,25 @@ fn publish_body(
     begin_whole_build(state, id, body, whole);
     return;
   }
+  mark_build(state, id, |marks, now| marks.captured_ns = Some(now));
   let Some((payload, anchors)) = sealed_payload(state, id, whole, body) else {
     refuse(state, id, "fleet.live.refused.no_payload");
     return;
   };
+  mark_build(state, id, |marks, now| marks.sealed_ns = Some(now));
   if append_payload(state, id, (whole, true), payload, anchors) {
     ship_appended(state, id);
+  }
+}
+
+/// Stamps a step of `id`'s publication build now ([`BuildMarks`]).
+fn mark_build(
+  state: &mut ShardState,
+  id: slates_db::catalog::VolumeId,
+  mark: impl FnOnce(&mut BuildMarks, u64),
+) {
+  if let Some(live) = state.live.shipping.get_mut(&id.bytes) {
+    mark(&mut live.marking, slates_machine::clock::monotonic_ns());
   }
 }
 
@@ -2341,6 +2360,8 @@ fn append_entry_with(
     .take()
     .unwrap_or_else(slates_machine::clock::monotonic_ns);
   live.newest = Some((head.position, published_ns));
+  live.marking.appended_ns = Some(slates_machine::clock::monotonic_ns());
+  live.newest_marks = std::mem::take(&mut live.marking);
   let shipped = u64::try_from(payload_len).unwrap_or(u64::MAX);
   if whole {
     live.owes_whole = false;
@@ -3588,6 +3609,8 @@ fn new_live_volume(shipper: Shipper) -> LiveVolume {
     building: None,
     image_build: None,
     publishing_ns: None,
+    marking: BuildMarks::default(),
+    newest_marks: BuildMarks::default(),
     newest: None,
     resolved_ns: None,
     answers: crate::live_hold::AnswerWindow::default(),
@@ -5370,6 +5393,34 @@ const HOP_EXCHANGE_SETTLE: (&str, &str) = (
 );
 /// The entry built on the owner shard: from its publication reaching the shipper to its message made.
 const HOP_BUILD: (&str, &str) = ("fleet.live.hop.build", "fleet.live.hop.build_ns");
+/// Of the build: from the publication reaching the shipper to its capture read, the delta's bytes taken from the volume
+/// ([`begin_capture`], [`publish_body`]).
+const HOP_BUILD_CAPTURE: (&str, &str) = (
+  "fleet.live.hop.build.capture",
+  "fleet.live.hop.build.capture_ns",
+);
+/// Of the build: the payload sealed under the volume's keys ([`sealed_payload`]).
+const HOP_BUILD_SEAL: (&str, &str) = ("fleet.live.hop.build.seal", "fleet.live.hop.build.seal_ns");
+/// Of the build: the entry appended to the shipper's log, its identity hashed ([`append_entry`]).
+const HOP_BUILD_APPEND: (&str, &str) = (
+  "fleet.live.hop.build.append",
+  "fleet.live.hop.build.append_ns",
+);
+/// Of the build: from the entry appended to its message made for the holder ([`ship_appended`], [`pending_sends`]).
+const HOP_BUILD_SEND: (&str, &str) = ("fleet.live.hop.build.send", "fleet.live.hop.build.send_ns");
+
+/// When each step of a publication's build ended, on the host's monotonic clock (g228, 85a): what the build hop
+/// ([`HOP_BUILD`]) is split by. Each is set as its step ends in the publication's own turn; a build made in turns leaves
+/// them unset, and its build is timed whole.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BuildMarks {
+  /// The capture read, its plain body in hand ([`publish_body`] entered).
+  captured_ns: Option<u64>,
+  /// The payload sealed.
+  sealed_ns: Option<u64>,
+  /// The entry appended.
+  appended_ns: Option<u64>,
+}
 /// From the message made on the owner shard to its lane on the control shard free to take it: the cross-shard hop and
 /// the wait behind a lane's earlier message.
 const HOP_TO_CONTROL: (&str, &str) = ("fleet.live.hop.to_control", "fleet.live.hop.to_control_ns");
@@ -5423,6 +5474,10 @@ pub(crate) fn hop_rows(state: &ShardState) -> Vec<slates_ipc::protocol::RefusalC
 /// stamps (a straggler's late answer) times no hop; the entry is let go either way, and its round, publication to
 /// durability, is what the volume's answer window learns (A-396, [`hold_for_answer`]). The fold's own time is kept for the
 /// reply's wake ([`HOP_REPLY`]).
+///
+/// The build is split too when its marks are whole and in order ([`BuildMarks`]): an entry made in the publication's own
+/// turn, the path a live write's small delta takes; one built in turns of the shard (a whole state, a large body) times
+/// the build alone.
 fn count_hops(state: &mut ShardState, volume: [u8; 16], stamps: Option<LaneStamps>) {
   let now = slates_machine::clock::monotonic_ns();
   let Some(live) = state.live.shipping.get_mut(&volume) else {
@@ -5439,6 +5494,7 @@ fn count_hops(state: &mut ShardState, volume: [u8; 16], stamps: Option<LaneStamp
     return;
   }
   live.newest = None;
+  let marks = std::mem::take(&mut live.newest_marks);
   live.resolved_ns = Some(now);
   // The newest entry's round, publication to durability, is what a reply held for the next one holds the owner's window
   // by (A-396, [`hold_for_answer`]).
@@ -5462,6 +5518,24 @@ fn count_hops(state: &mut ShardState, volume: [u8; 16], stamps: Option<LaneStamp
   ];
   for (hop, ns) in hops {
     count_hop(state, hop, ns);
+  }
+  if let (Some(captured), Some(sealed), Some(appended)) =
+    (marks.captured_ns, marks.sealed_ns, marks.appended_ns)
+  {
+    let ordered = published_ns <= captured
+      && captured <= sealed
+      && sealed <= appended
+      && appended <= stamps.made_ns;
+    if ordered {
+      for (hop, ns) in [
+        (HOP_BUILD_CAPTURE, captured.saturating_sub(published_ns)),
+        (HOP_BUILD_SEAL, sealed.saturating_sub(captured)),
+        (HOP_BUILD_APPEND, appended.saturating_sub(sealed)),
+        (HOP_BUILD_SEND, stamps.made_ns.saturating_sub(appended)),
+      ] {
+        count_hop(state, hop, ns);
+      }
+    }
   }
 }
 
