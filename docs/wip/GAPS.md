@@ -24699,3 +24699,14 @@ forwards to the new owner were refused: `fleet.owner_location.route_dropped.refu
 reached it, and the flow failed at `live_chaos.rs:2465` ("the stream made a's log durable at 946, now 906"). The live log
 itself was whole on every node. Not worked by w-forming (Ada's close order); whether it reproduces on main after
 8e4da57ae is r19's replay.
+
+### 2026-11-21: Goal 85b, w-forming's two in-flight measurements (parked for goal 93)
+- **P4, A-827's release A/B (4a0cbd7b7):** the debug bench (Studio-4, 311 inodes, 9 interleaved rounds) gave the one-turn
+  image and encoding 598-849 us against the held capture's longest turn 36-66 us (first turn 6-10 us). The release rounds
+  are kiln run r3: `bash .git/w-forming-ab/p4.sh` (`cargo test --release -p slates-server --lib
+  bench_a_whole_publications_longest_turn -- --ignored --nocapture`); P4 closes on its numbers.
+- **C3, the chaos run:** recorded on c9c9554d8 (7/7 targeted flows, every invariant held; seeded nemesis 0/3 on progress,
+  no safety violation). The two causes in w-forming's code are fixed (bbdea3259, 8e4da57ae); the replay of seeds
+  1256052866610850298, 5939796479076166087, 10263252121351842258, 17757241901296347647, 8389754676365715562 and two fresh
+  draws is kiln run r19 (`SEEDS=... NEMESIS_RUNS=2 NEMESIS_ONLY=1 bash .git/w-forming-ab/c3.sh`). Seed
+  10263252121351842258's forwarding stall is the separate entry above.
