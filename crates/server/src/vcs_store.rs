@@ -205,6 +205,10 @@ pub(crate) struct VcsStores {
   /// The git records whose replay is under way a turn at a time (A-722 part 4, [`git_replay`]): at most one a
   /// repository, the record its rebuild or recovery replays now; bounded by the partition's repositories.
   git_replays: BTreeMap<RepositoryId, Box<git_replay::GitReplay>>,
+  /// The Subversion revision records whose replay is under way a turn at a time (R4 of Ada's close list,
+  /// `slates_svn::migration::RevisionReplay`): at most one a repository, the record its rebuild or recovery replays
+  /// now; bounded by the partition's repositories.
+  svn_replays: BTreeMap<RepositoryId, slates_svn::migration::RevisionReplay>,
   /// The generations git fetches hold, by repository (A-745 rule 4, [`upload::GitGeneration`]): one fork a stamp the
   /// repository stood at when a fetch began, shared by every fetch that began there, given back with its last holder;
   /// bounded by the fetches the shard's edges seat.
@@ -818,6 +822,7 @@ pub(crate) fn free(state: &mut ShardState, id: RepositoryId) {
     state.vcs_stores.rebuilding.remove(&id);
   }
   abandon_git_replay(state, id);
+  state.vcs_stores.svn_replays.remove(&id);
   paths::whole_build::abandon(state, id);
   hg_import::abandon(state, id);
   git_encode::abandon(state, id);
@@ -3075,6 +3080,12 @@ fn record_turn(
   (id, index): (RepositoryId, usize),
   ns: u64,
 ) -> Option<RecordTurn> {
+  if matches!(
+    state.vcs_stores.entries.get(&id),
+    Some(RepositoryStore::Subversion(_))
+  ) {
+    return svn_record_turn(state, (id, index), ns);
+  }
   let chunk = usize::try_from(state.config.archive_slice_bytes_within(ns)).unwrap_or(usize::MAX);
   let deadline_ns = slates_rt::futures::now_ns().saturating_add(ns);
   let under_way = state.vcs_stores.git_replays.remove(&id);
@@ -3140,6 +3151,108 @@ fn git_turn_in(
   let turn = git_replay::Turn { deadline_ns, chunk };
   let mut now = slates_rt::futures::now_ns;
   replay.step((content, store), bytes, (turn, &mut now))
+}
+
+/// Counter: the turns a Subversion revision record's replay took (R4 of Ada's close list), each its rows' texts kept until
+/// the turn's time ran, one row at least. Format: a counter name in the status report.
+pub(crate) const SVN_REPLAY_TURNS: &str = "vcs_store.svn_replay_turns";
+
+/// One turn of repository `id`'s Subversion record at `index`, held to `ns` of the shard's clock (R4: a recovery
+/// replayed a revision's record whole, every text it brought deltified in one step): a revision's replay begun at its
+/// first turn (`RevisionReplay`, checked, the room its bytes take lent), kept between turns, its rows' texts kept
+/// until the turn's time runs, one row at least; any other record replayed whole ([`replay_record`]). None when it has no
+/// record there.
+fn svn_record_turn(
+  state: &mut ShardState,
+  (id, index): (RepositoryId, usize),
+  ns: u64,
+) -> Option<RecordTurn> {
+  let deadline_ns = slates_rt::futures::now_ns().saturating_add(ns);
+  let (pending, brought) = match state.vcs_stores.svn_replays.remove(&id) {
+    Some(replay) => (SvnPending::UnderWay(replay), 0),
+    None => {
+      let bytes = state
+        .db
+        .partition()
+        .repositories()
+        .object_record(id, index)?;
+      let brought = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+      match SvnRecord::decode(bytes) {
+        Ok(SvnRecord::Revision(revision)) => (SvnPending::Begin(revision), brought),
+        _ => return replay_record(state, id, index).map(RecordTurn::Replayed),
+      }
+    }
+  };
+  let ShardState {
+    store, vcs_stores, ..
+  } = &mut *state;
+  lend(store, vcs_stores, brought);
+  let room = vcs_stores.svn_unlent(id).map(|svn| {
+    let entries = svn
+      .records
+      .as_ref()
+      .map_or(0, |records| records.index().entries());
+    svn_room(store, svn.charged, entries)
+  });
+  let stepped = {
+    let lent = Lent::new(&mut *store, vcs_stores);
+    svn_step_in(lent.stores, id, (pending, room), deadline_ns)
+  };
+  let mut whole = settle_in(store, vcs_stores);
+  if let Some(svn) = vcs_stores.svn_unlent(id) {
+    whole &= settle_records(store, svn);
+  }
+  if !whole {
+    state.count(CHARGE_SHORT, 1);
+  }
+  state.count(SVN_REPLAY_TURNS, 1);
+  Some(match stepped {
+    Ok(None) => RecordTurn::Replayed(Ok(())),
+    Ok(Some(replay)) => {
+      state.vcs_stores.svn_replays.insert(id, replay);
+      RecordTurn::More
+    }
+    Err(refused) => RecordTurn::Replayed(Err(refused)),
+  })
+}
+
+/// A Subversion revision record's replay as a turn takes it up: to begin from its decoded revision, or under way.
+enum SvnPending {
+  /// The revision, to check and begin once the turn's room is set.
+  Begin(slates_svn::commit::revision::Revision),
+  /// Its replay under way.
+  UnderWay(slates_svn::migration::RevisionReplay),
+}
+
+/// [`svn_record_turn`]'s steps over the stores, within `room` (set first, as [`replay_svn`] sets it before a record's
+/// check): the replay while steps remain, none once the revision is whole.
+fn svn_step_in(
+  stores: &mut VcsStores,
+  id: RepositoryId,
+  (pending, room): (SvnPending, Option<SvnRoom>),
+  deadline_ns: u64,
+) -> Result<Option<slates_svn::migration::RevisionReplay>, ReplayRefused> {
+  let Some(RepositoryStore::Subversion(store)) = stores.entries.get_mut(&id) else {
+    return Err(ReplayRefused::Git(GitRefused::NoStore));
+  };
+  let records = store.records.as_mut().ok_or(ReplayRefused::SvnOrder)?;
+  if let Some(room) = room {
+    records.set_room(room);
+  }
+  let mut replay = match pending {
+    SvnPending::UnderWay(replay) => replay,
+    SvnPending::Begin(revision) => records
+      .replay_revision(revision)
+      .map_err(ReplayRefused::SvnStep)?,
+  };
+  loop {
+    match records.replay_step(&mut replay, 1) {
+      Ok(Some(_)) => return Ok(None),
+      Ok(None) if slates_rt::futures::now_ns() >= deadline_ns => return Ok(Some(replay)),
+      Ok(None) => {}
+      Err(refusal) => return Err(ReplayRefused::SvnStep(refusal)),
+    }
+  }
 }
 
 /// Gives back what repository `id`'s git record's replay under way holds, where one is: its rebuild ended or replaced.

@@ -11844,6 +11844,10 @@ the shard cannot admit waits, counted `merge.inputs_over_budget`, as one whose i
 > work: the 64 KiB file it changed plus about 10 KiB) in 0.58 ms mean per work. With a copy of the green per work put
 > back, the same run added 975 MB in 4.46 ms. Release, macOS arm64, Mac Studio. Held by
 > `crates/server/tests/work_cow.rs`: N x (64 KiB + file) + 8 MiB, below one copy of the green.
+> **A-790 (2026-11-20): a first edit costs what it wrote, never the file.** A changed file is pieces over its base
+> (the base's ranges and the bytes written), so 8 works each overwriting one byte of a 64 MiB file add 32 KiB, not
+> 201 MB (`crates/server/tests/work_edit_cow.rs`); off the green's shard an edit asks the owner for the file's length
+> alone. The A/B is in BENCHMARKS.
 
 > **Status (2026-11-18, A-513: a work replayed through its green's owner is found again after a lost answer).** At
 > recovery a work whose green lives on another partition is replayed through the green's owner, every ask in its
@@ -23397,9 +23401,11 @@ edit_merge_bench.rs` (its verdict forms), `crates/client/tests/merge_identity.rs
     O(1); a rebase keeps what differs from the head. A work is charged for what it holds (A-84's rule, unchanged):
     a new or recovered work holds nothing, so its creation and its rebuild after a restart are charged nothing and
     cannot be refused (the `merge.work_rebuild_refused` count is gone with the case); its first edit of a green's file
-    copies that file and is charged for it, and refused `BudgetExceeded` when the budget cannot hold it. A submit
+    holds the file as pieces over the base and is charged for what it wrote and the pieces, never the file (A-790),
+    and refused `BudgetExceeded` when the budget cannot hold that. A submit
     secures no bound for the reset (A-84 secured the green's files). A work whose green is gone cannot read its base:
-    a file it did not change answers `UnknownBase`, as its submit does, and the files it changed stay readable.
+    a file it did not change answers `UnknownBase`, as its submit does, and a file it changed reads only where the work
+    wrote all of it (A-790).
 - **Measured** (adas-macbook-pro-2, macOS arm64, 18 cores, shared, load 5 to 9; release harness `--quiet-only` (then `merge_bench`),
   1,000 samples a run, three runs a binary, binaries interleaved A B A B A B; total of edit and submit, p50; all
   runs in BENCHMARKS): accept at 1,000 files 14.0, 14.8, 13.9 ms → 0.97, 0.93, 0.99 ms with the identity deferred →
@@ -58196,3 +58202,49 @@ Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and i
     `f = 1` end-to-end test on production routing, with `merge.verdict.taken_by_position` as its counter.
   - Every holder test runs with no hook. Each waits until B replicates the green before B's creation, since B's
     creations are A's until then.
+
+### A-792 — A green listed at its head reads the directory's subtree, not the whole green (2026-11-20, w-fed-move, goal 86b; found by use: 1,000 and 10,000 clients over the Linux kernel on one primary and two replicas held the primary's one busy core; §4.16 "Greens", the listing verbs)
+- **Why.** A green's listing (`listing::green_entries`) built the green's whole base at the version asked
+  (`Green::base_at`, at the head `Green::current_base`: every file, directory, symlink, special node, mode, xattr and
+  hard link, each path copied into a new string) and then kept the directory's entries, for every page of a listing.
+  Sampled on the primary at 100,000 clients (release, `load_scale` over the kernel's 97,371 files): 5,866 of 7,284
+  samples of its busiest shard in `listing::read_dir`, 2,212 in `current_base`, most of them copying paths.
+- **Change.** `Green::head_under(dir)`: each dimension's paths that are `dir` or lie under it, one descent of its map
+  (`Dim::prefix`, `Files::prefix`), a file with its length. `green_entries` lists from it at the head; an older version
+  still reconstructs its base (`base_at`).
+- **Tests** (macOS arm64, Mac Studio, local). `slates-merge --lib head_under`:
+  `a_greens_head_under_a_directory_is_its_subtree_of_the_whole_base` (the whole base filtered to each directory as the
+  oracle, the prefix trap `a`/`ab`, a file and a missing path); `slates-server --lib listing` 3 passed. By use (release,
+  `crates/cli/tests/load_scale.rs`, one primary, two replicas, one client node, the kernel v7.4-rc4, one round, 10,000
+  clients, `--hot-files 8000 --per-connection 32`): wall 201 s to 75 s, the primary's CPU 175 s to 53 s, verdicts 192
+  to 228 a second, edits p50 1.04 s to 0.60 s, the cycle's p99 43.9 s to 23.6 s; oracle failures 0 in both.
+
+### A-790 — A work's changed file is pieces over its base: a first edit costs what it wrote (2026-11-20, w-work-cow; main's dispatch after the Slates-vs-Sapling comparison; §4.16 "Role", failure matrix; D-5; MEMORY SIZING)
+Applied in the same change to: §4.16 (the work as a delta; its A-247 status), `crates/server/src/work_files.rs`,
+`work_log.rs` (`edit_ops` takes the old length; a restatement is written from a rebase's files), `work_home.rs`
+(`Need::Lengths`; a read of a changed file asks for the base span its pieces name; `base_missing`'s second ask, A-776
+C1's, keeps the paths the verb's fetch holds only lengths of), `verbs.rs` (`edit`,
+`owner_lengths`, the post-state's per-operation copy), `work_charge.rs`, GAPS GAP-A9-14, BENCHMARKS.
+- **Why (measured).** A work's first edit of a base file copied the whole file into the work (`WorkFiles::splice`),
+  though the edit's operations need only the file's length: 8 works each overwriting one byte of a 64 MiB file added
+  201,490,432 B resident, 2.38 ms a work (`tests/work_edit_cow.rs`, red, release, Mac Studio 32 cores). Off the green's
+  shard the owner sent the whole file across shards for the same edit.
+- **Rule.** A changed file is a piece table: ranges of its origin's base bytes (the path, or the path it was renamed
+  from), pinned at the work's base version by its floor, and ranges of an append-only buffer of the bytes the work
+  wrote. The buffer is compacted to its live bytes once its dead bytes outnumber them, keeping the count of pieces, so
+  the charge foreseen before an edit is the charge after it, and a file rewritten again and again holds at most twice
+  what it shows of its own. A work is charged for the path, the origin's name, the written bytes and the pieces. An
+  edit, a rename and an unlink read only the base's length; off the green's shard they ask the owner for lengths and
+  entries (`Need::Lengths`), never bytes. A read of a changed file reads its pieces, and off the green's shard asks for
+  the span of base bytes the read's pieces name, in the base's offsets. A submit's post-state copies each operation's
+  range alone (`WorkFiles::copy_range`). A rebase's changed files are held whole, as before, and restated whole.
+- **Measured (A/B, BENCHMARKS).** Release, interleaved, five rounds, Mac Studio: live heap a work after a one-byte
+  first edit, A (whole-file copy) 1,050,496 / 16,787,328 / 268,445,760 B for 1 / 16 / 256 MiB files, B (pieces) 2.6 to
+  2.9 KB at every size; best mean time 261 us / 455 us / 5.15 ms against 113 us / 132 us / 173 us.
+- **Failure matrix.** With its green destroyed, a file the work changed reads only where the work wrote all of it:
+  its other pieces are the green's bytes. Its submit already answered `UnknownBase` then.
+- **Tests.** `work_files::tests` (a one-byte edit of a 1 MiB base file holds the byte and three pieces, charge foreseen
+  equals held; 100 whole rewrites stay within twice the file; a rename moves the pieces and a read names its base span
+  in the base's offsets); `work_charge`'s oracle (the charge equals a recount and the view a plain map after every
+  generated edit, unlink and rename, with distinct base and written bytes); `tests/work_edit_cow.rs` (red above; green:
+  +32,768 B, 0.15 ms mean); `tests/works_off_owner.rs` (one history on one shard and on eight, reply for reply).
