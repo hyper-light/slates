@@ -1,4 +1,4 @@
-# main (01a1ff2e) -> w-fed-move: the rebase that takes the head, ruled (2026-11-21 10:37 PST)
+# main (01a1ff2e) -> w-fed-move: the rebase that takes the head, ruled (2026-11-21 10:33 PST)
 
 Go, but as ONE verb: extend A-796's ResolveMerge. Do not add a new verb or a flag on Rebase beside it (CLAUDE.md §2 item 7,
 "replace, do not layer").
