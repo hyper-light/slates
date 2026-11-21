@@ -4660,6 +4660,36 @@ type ShardLearning = ();
 /// Runs on the shard: attaches the segment, recovers the partition, builds the store and
 /// installs the state, then spawns the server loop as a poller. Its recovery runs in slices
 /// (`crate::recovery_slices`), which it reports.
+/// Format: the catalog's records one unit of a shard's start replays ([`replay_catalog`]): one, as the start's other
+/// units rebuild one record each, so the slicer yields within a log of any length.
+const CATALOG_RECORDS_A_UNIT: usize = 1;
+
+/// Replays partition `partition`'s catalog for its shard's start (§2.6 boot step 2, A-228 continued): its snapshot one
+/// unit, then [`CATALOG_RECORDS_A_UNIT`] records a unit, the start's slicer yielding between them, then the torn tail
+/// cut. Found by use: the whole replay was the start's first unit, held only to the recovery budget of about a second,
+/// the watchdog's window itself; on a loaded host (w-interop's Linux counts) a restarted daemon's start ran 963 ms of
+/// CPU in it and was killed. The database, what was recovered, and the most records one unit replayed.
+async fn replay_catalog(
+  segment: &mut AnchorSegment,
+  (partition, caps, now): (u16, slates_db::partition::PartitionCaps, u64),
+  slices: &mut crate::recovery_slices::RecoverySlices,
+) -> Result<(slates_db::Db, slates_db::Recovered, u64), ServerError> {
+  let mut recovering = slates_db::replay::Recovering::begin(segment, partition, caps, now)?;
+  slices.unit_done().await;
+  let mut most = 0_u64;
+  loop {
+    let before = recovering.records();
+    let done = recovering.step(segment, CATALOG_RECORDS_A_UNIT)?;
+    most = most.max(recovering.records().saturating_sub(before));
+    slices.unit_done().await;
+    if done {
+      break;
+    }
+  }
+  let (db, recovered) = recovering.finish(segment)?;
+  Ok((db, recovered, most))
+}
+
 async fn init_shard(
   config: &DaemonConfig,
   env: &[(String, String)],
@@ -4692,8 +4722,8 @@ async fn init_shard(
   let mut segment = AnchorSegment::attach(&handoff, len, identity)?;
   let mut clock = HostClock::new();
   let now = slates_vfs::clock::Clock::monotonic_ns(&mut clock);
-  let (db, recovered) = slates_db::replay::recover(&mut segment, partition, config.caps, now)?;
-  slices.unit_done().await;
+  let (db, recovered, _catalog_most) =
+    replay_catalog(&mut segment, (partition, config.caps, now), &mut slices).await?;
   let (arena, slice_capacity) = shard_arena(config, partition, env, identity)?;
   // The anchor holds this slice's content extents (Windows, A-789): a task of the shard, so a claim finds them held.
   #[cfg(windows)]
@@ -7511,6 +7541,50 @@ mod tests {
       before_loss,
       after_loss,
     );
+  }
+
+  /// A-228 continued (found by use: w-interop's Linux counts, a restarted daemon's start ran 963 ms of CPU in its
+  /// first unit, the whole catalog replay, and the watchdog killed it). Do: write 256 records to a partition's log, then
+  /// replay it as a shard's start does ([`super::replay_catalog`]), polled to its end. Expect: every record replayed,
+  /// and no unit of the start replayed more than one, where the whole log had been one unit.
+  #[test]
+  fn a_shards_start_replays_its_catalog_a_record_a_unit() {
+    use slates_anchor::AnchorSegment;
+    use slates_db::Op;
+    const RECORDS: u32 = 256;
+    let profile = test_profile();
+    let instance = format!("catalog-units-{}", std::process::id());
+    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    let mut segment =
+      AnchorSegment::create(&instance, &profile.facts.identity, config.geometry).unwrap();
+    let (mut db, _) = slates_db::replay::recover(&mut segment, 0, config.caps, 0).unwrap();
+    db.set_policy(slates_db::SnapshotPolicy {
+      bytes_between_snapshots: u64::MAX,
+    });
+    for up_to in 0..RECORDS {
+      let acknowledged = Op::CompletionsAcknowledged {
+        origin: 1,
+        client: 1,
+        up_to,
+        owed: Vec::new(),
+      };
+      db.mutate(&mut segment, &acknowledged, 0).unwrap();
+    }
+    drop(db);
+    let mut slices = crate::recovery_slices::RecoverySlices::begin(1);
+    let replay = super::replay_catalog(&mut segment, (0, config.caps, 0), &mut slices);
+    let mut replay = core::pin::pin!(replay);
+    let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+    let (_, recovered, most) = loop {
+      if let core::task::Poll::Ready(done) = replay.as_mut().poll(&mut cx) {
+        break done.unwrap();
+      }
+    };
+    assert!(
+      recovered.replayed_records >= u64::from(RECORDS),
+      "{recovered:?}"
+    );
+    assert_eq!(most, 1, "the most records one unit of the start replayed");
   }
 
   /// AC-8.1 / T-2.14, §4.8: acknowledge a vote in both groups, restart over retained anchor

@@ -101,6 +101,14 @@
 >   first tick. arm64 with shard and client slices came close: p99 under 1 ms in 6 of 6 rounds and p999 in 5 of 6. On
 >   x86_64, p99 stays at 1.0-1.8 ms and the client slice costs the loaded p50 (conflict 99-172 against 49-90 µs).
 >   Preempting at a wake needs a privileged class (R10). Open: 84a Linux under this lane's oversubscription.
+> - **macOS, Mach's time-constraint policy (A-831, 2026-11-21, w-provision-gate; BENCHMARKS "84a on macOS"):** LANDED
+>   for a latency-tracking runtime's shards and a client's synchronous reply wait. On CI macos-latest (runs 44934544995
+>   and 44934809949, six rounds against main) the loaded accept p99 fell from 14.0-17.4 to 0.41-2.11 ms and the p999
+>   from 16.6-20.8 to 0.70-4.52 ms; conflict likewise. The busy path's kevent harvests of 1 ms or more fell from
+>   8.7-12.2% to 0.001-0.03%. The quiet medians and R9's uncontended p99 are unchanged. The load's own spinners got
+>   98-137 against 213-242 million turns a second: not starved, but the daemon now takes the CPU it needs ahead of them.
+>   No demotion was seen. **Open:** 84a's bar on macOS. The p99 is under 1 ms in 11 of 12 round medians, the p999 in
+>   4 of 12. The client-only arm (TC) was measured and rejected (p999 up to 29.9 ms).
 > - Windows (CI, run 44857045148): no 1 ms band (queued p99 5–49 µs); accept p99 0.13–0.31 ms, conflict 0.11–0.29 ms;
 >   p999 0.2–62 ms. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–7).
 >
@@ -349,8 +357,9 @@
 > `StoreGrant` (C2 closed). Owed (performance): segmented store files over the granted root, measured against one file; the
 > engine's extent bytes and fanout are the caller's `Sizing` (from its machine profile; the server's derivation is
 > owed with C4). C3 closed; C4 groundwork built: the owner thread and
-> `--vcs-store` (the daemon holds the store; shards hold its handle). Owed: Windows' store directory (`store_root`
-> refuses `Unsupported` there); each tool's landing onto it (C4-C6); the
+> `--vcs-store` (the daemon holds the store; shards hold its handle). Windows' store directory built (2026-11-21, w-work-mount: `NtCreateFile`
+> relative to the granted directory's handle, identity by volume serial and `FileIdInfo`; green on jupiter (5/5,
+> clippy clean), `crates/land/tests/store_root.rs`, `repository::store_tests::each_tool_creates_a_repository_into_the_store`). Owed: each tool's landing onto it (C4-C6); the
 > engine's memtable learned upward from its rows (it starts at one trunk node, fanout extents, since the machine-sized
 > start passed the engine's 4 GiB bound on a 128 GiB Mac; held at both extremes by
 > `store_sizing_tests::the_store_lands_on_a_small_and_a_large_machine_alike`: 8 GiB and 128 GiB profiles injected,
@@ -4030,6 +4039,9 @@
 > under it. The same matrix on the Mac Studio (release 907c246ac, load 13-30) was 24 of 24 with no spin. git v2.0.0 on
 > the same Linux run: 26 of 27, two spins in `git_encode.rs:359` (`settle_encodings`, w-k90-vendor's encode spin) and
 > no kill; deepen's bad pack is w-bugs'. Report: adacachy `~/.cache/w-interop/r-linuxc-2239.txt`, anchor logs beside it.
+> The restarted daemon's start spin (`daemon.rs:1186`, `start_shard`, "the most CPU in one [slice] 962,859 µs, ending
+> at unit 1") was the catalog's whole replay in one unit of the sliced start: it is replayed a record a unit since this
+> change (w-bugs; `a_shards_start_replays_its_catalog_a_record_a_unit`, 256 records in one unit before, 1 after).
 
 > **A daemon whose control shard was busy with recovered work stopped itself, and its anchor restarted it into the same
 > work (2026-11-20; CLOSED, g226; found by w-interop's git matrix).** On debug main 3e1983bc9, a 56 MB push of git/git
