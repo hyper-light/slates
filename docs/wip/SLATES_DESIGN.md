@@ -1524,8 +1524,8 @@ spin is a nap of that length a turn. That is kept by measurement: a true spin (`
 cut the single-client p50 from 60–95 µs to 13–22 µs but lost every tail once the host had no idle core, and no policy
 measured kept both (A-218, measured and rejected; BENCHMARKS "The spin policy, measured and rejected").
 A shard that stays busy, and so never parks, harvests between steps no more often than the longer of its quantum and
-its measured empty harvest (its learned idle turn), counted from the harvest's end (A-826, `slates_rt::busy_harvest`):
-a macOS empty harvest is that ~13 µs sleep, and until A-826 the stamp was taken before it, so every busy step after
+its measured empty harvest (its learned idle turn), counted from the harvest's end (A-829, `slates_rt::busy_harvest`):
+a macOS empty harvest is that ~13 µs sleep, and until A-829 the stamp was taken before it, so every busy step after
 the first slept. Where a harvest is cheap the quantum still governs.
 Cancellation: dropping a future releases nothing it did not own (resources live in arenas
 keyed by handle and are released by the owning operation's terminal step), so every operation is
@@ -59822,7 +59822,7 @@ Applied in the same change to: GAPS (the refining.rs:166 entry narrowed to the c
 - **Cost owed.** One more publication per accepted version (before its append); the release bench (A/B at 64, 128,
   256, 320 and 512 MiB) measures it with the lane.
 
-### A-826 — A busy shard asks its driver no more often than an empty ask costs (accepted 2026-11-21, g228, 85a; amends A-218's busy-step nap, §4.3 "Loop")
+### A-829 — A busy shard asks its driver no more often than an empty ask costs (accepted 2026-11-21, g228, 85a; amends A-218's busy-step nap, §4.3 "Loop")
 Applied in the same change to: §4.3 ("Loop"), `crates/rt/src/busy_harvest.rs` (new), `crates/rt/src/shard.rs` (`run`'s
 busy harvest, `Counters::harvests_deferred`), `crates/rt/tests/busy_harvest.rs`, `crates/server/src/verbs.rs` (the
 `rt.core.harvests_deferred` status row), `crates/cli/tests/live_fleet.rs` (the measurement prints it), BENCHMARKS,
