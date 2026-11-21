@@ -349,3 +349,9 @@
   then the server reds hg's had hidden: svn restore push_children, commits Before::Landed boxed, svn_commit tests
   GreenTree + get(). Tests: hg getbundle 20, git works 9, merge byte_places 2, server svn_commit 30, commits 12.
   Host, fmt, literals, structural, unsafe, the six cross targets clean. real_tools (r29) still queued for jupiter.
+
+## 2026-11-21 round at 6a6e35215 (landed dc5ab18f5, then the A-805 test fix; main a9a2393b8+)
+- server judged_submission split (increment_held, chain_room_admitted, retention_secured, verdict_span_emitted,
+  accepted_answer); hg ManifestWrites; merge chain_replay, server green_post_state, cli by-reference test splits; four
+  literals. Then A-805's merge tests (copy_tests view_of `?` with `failed`, identity.rs harness unwrap_used + get +
+  Viewed). Host, fmt, structural, literals, unsafe, the six cross targets clean. real_tools (r29) still queued.
