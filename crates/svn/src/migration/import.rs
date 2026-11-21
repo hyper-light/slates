@@ -113,6 +113,9 @@ pub struct Importer {
   /// The base of the delta text just opened, which the repository keeps elsewhere: asked of the caller before the import
   /// reads on ([`Importing::Base`]).
   wanted_base: Option<ContentIdentity>,
+  /// Whether the stream may still name revisions the repository holds: true until the first revision it makes, so a
+  /// stream resumes a cut-short import only from its start, never by revisions out of order.
+  resumable: bool,
 }
 
 /// A revision being read: its number, its properties and its transaction (none for revision 0).
@@ -124,6 +127,9 @@ struct OpenRevision {
   properties: Properties,
   /// Its transaction; revision 0 makes none (`new_revision_record`).
   transaction: Option<Transaction>,
+  /// Whether the repository holds it already: an import resumed after a refusal (C2 stage C) reads it through without
+  /// making anything, its revision properties held to the repository's.
+  skipped: bool,
 }
 
 /// A node record being read: the path its sections change.
@@ -196,6 +202,7 @@ impl Importer {
       loading: None,
       done: false,
       wanted_base: None,
+      resumable: true,
     }
   }
 
@@ -334,6 +341,17 @@ impl Importer {
     event: Event<'_>,
   ) -> Result<Option<Record>, MigrationRefusal> {
     let unmade = |done: Result<(), MigrationRefusal>| done.map(|()| None);
+    // A revision the repository holds already is read through: its nodes, their sections and texts make nothing.
+    let skipping = self.revision.as_ref().is_some_and(|open| open.skipped);
+    if skipping {
+      match event {
+        Event::Node(_) | Event::Text(_) | Event::Window(_) | Event::TextEnd | Event::Delta(_) => {
+          return Ok(None);
+        }
+        Event::Property(_) | Event::PropertiesEnd if self.properties.is_none() => return Ok(None),
+        _ => {}
+      }
+    }
     match event {
       Event::Format(_) | Event::Delta(_) => Ok(None),
       Event::Uuid(uuid) => uuid_record(repository, uuid),
@@ -379,13 +397,16 @@ impl Importer {
     let youngest = repository.youngest();
     let expected = youngest.checked_add(1).ok_or(MigrationRefusal::Corrupt)?;
     let continues = number == expected || (number == 0 && youngest == 0);
-    if !continues {
+    // A revision the repository holds already: the stream resumes an import a refusal cut short (C2 stage C, a batch
+    // is atomic), read through as long as each such revision's properties are the repository's.
+    let skipped = !continues && number <= youngest && self.resumable;
+    if !continues && !skipped {
       return Err(MigrationRefusal::OutOfSequence {
         expected,
         found: number,
       });
     }
-    let transaction = if number == 0 {
+    let transaction = if number == 0 || skipped {
       None
     } else {
       Some(repository.begin()?)
@@ -394,6 +415,7 @@ impl Importer {
       number,
       properties: Properties::new(),
       transaction,
+      skipped,
     });
     if properties {
       self.properties = Some(OpenProperties {
@@ -417,6 +439,18 @@ impl Importer {
       return Ok(None);
     };
     self.in_flight = 0;
+    if open.skipped {
+      // Held already: the same revision as the repository's, by its properties, or a stream that does not resume it.
+      if repository.revision_properties(open.number) != Some(&open.properties) {
+        return Err(MigrationRefusal::OutOfSequence {
+          expected: repository.youngest().saturating_add(1),
+          found: open.number,
+        });
+      }
+      self.resumable = open.number < repository.youngest();
+      return Ok(None);
+    }
+    self.resumable = false;
     match open.transaction {
       None => Ok(Some(Record::RevisionProperties {
         revision: open.number,

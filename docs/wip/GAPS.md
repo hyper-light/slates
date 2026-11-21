@@ -87,7 +87,11 @@
 >   slices behind the lane's 8 spinners on 4 vCPU. The shard count does not move them (run 44884432328: loaded accept
 >   p99 0.27-5.0 ms and p999 3.3-6.0 ms at 1, 2 and 4 shards). The macOS hop split (run 44888851325; BENCHMARKS "arm C"):
 >   the client's loaded round-trip p99 is 6.8-8.1 ms. The tail requests are replies written after the step that took
->   them (resumed or forwarded verbs), which the ring stamp does not cover yet. That hop is next. The busy path's
+>   them (resumed or forwarded verbs). **Take 2 (run 44934263888) named the hop:** with those replies stamped, every
+>   request joins, and 574-580 of each round's 580 loaded p99-tail requests are such deferred replies, almost all
+>   waiting in taken -> written (tail median 4.4-7.6 ms, against 0.9-2.7 ms queued and 3-15 µs for the client's own
+>   wake). Deferred taken -> written p99 is 5.8-8.1 ms loaded and 0.24-0.46 ms quiet; a sync reply's is 59-176 µs
+>   loaded. So the macOS loaded tail is the forward to the owner shard and back, not the client's wake. The busy path's
 >   zero-timeout kevent took at least 1 ms in 9-12% of its calls loaded (up to 4 ms; quiet 7-47 calls). The runner's
 >   kevent and ulock timeouts are late about 200 µs at the median, nanosleep 1.7-2.5 ms.
 > - Windows (CI, run 44857045148): no 1 ms band (queued p99 5–49 µs); accept p99 0.13–0.31 ms, conflict 0.11–0.29 ms;
@@ -774,6 +778,11 @@
 > (`unpack::Reader::resolve_turn`); per-repository push counters by phase in `slates status`. Owed: the small
 > repositories' wait was per-push turns (fixed: `vcs_share::turns`, a repository's pushes one turn a round); owed:
 > its by-use proof at cap 3 and 10, and weights learned from usage in place of one turn a repository.
+> In flight, paused for goal 93 (2026-11-21): run 31 (cap 3, Studio-2, 9865bb832) found shard-mates took 4.5 s of the
+> busiest repository's 41.3 s span and its shard ran steps 23.2 s of it: its own three pushes of one agent shared one
+> turn. The fix (a turn an agent, spare turns taken; red first) is on branch agents/w-balance-turn-weights, 928df7d1b,
+> NOT on main: its A/B (run 31's shape, three rounds) never ran (adacachy at load 30+, fat-LTO builds timed out at 2-3 h;
+> thin-LTO builds planned). Cap 10 owed: needs about 13.4 GiB free.
 > Acknowledged pushes lost at a takeover: fixed (push records ride the names log; a push answered once held at
 > f + 1; `crates/cli/tests/v3_takeover.rs`). Record version 3 on (names homed at f + 1, read from the region on a
 > takeover).
@@ -3044,6 +3053,12 @@
 > changeset, its replay, the import driver adopting the batch, the daemon-level red of one landing an import, and the
 > crash oracle).
 >
+> **C2 stage C BUILT (A-822, 2026-11-21, w-svn over A-814): an import lands a batch as one changeset and one register
+> entry, bounded by the import's admission; a batch is atomic, differing from `svnadmin load`, which keeps each revision
+> as it goes: a refusal names the last revision landed (`SubversionLanded`) and the same dump resumes after it.** A
+> refusal the wire answers without a Subversion number (`BudgetExceeded`, `ContentUnavailable`, `Format`) does not
+> name what landed; the same dump resumes all the same. Owed: the import's time and peak re-measured on git-2000
+> (main's run), which closes P7's finding (3) or not. The entry below is its history.
 > **C2 stage C waits: a Subversion import's per-revision landing, a measured regression (2026-11-21, w-svn; main's
 > ruling of 01:02).** git-2000's import takes 24.5 s against 8.2 s before the store (the real daemon 26.2 s): ~8 ms a
 > revision, one F_FULLFSYNC of the store's owner per landing (BENCHMARKS "Subversion on the changeset store").
@@ -4100,7 +4115,8 @@
 >   bytes it changed, not every window it touched (64 page writes on a 3 MiB file: 20,063,216 bytes shipped before,
 >   309,760 after). **A-768 (2026-11-20):** a whole publication's content is read in turns from pinned chunks, a quantum a
 >   turn, the publications made meanwhile queued behind it (before: 4.5 to 6 ms of its turn, debug), and a delta's the
->   same way (before: 3.3 ms for 1.25 MB); a whole state's image (2.0 to 3.0 ms, debug) is still one turn. **A-771 (2026-11-20):** a takeover's rebuild applies a payload, and hashes its archive's
+>   same way (before: 3.3 ms for 1.25 MB); and since A-827 (2026-11-21) a whole state's image too, built an inode a step from the volume's held head (before: 26
+>   to 36 us of image and 10.5 to 17 us of encoding in one turn for 311 inodes, release). **A-771 (2026-11-20):** a takeover's rebuild applies a payload, and hashes its archive's
 >   content, in steps of a page (before, debug: a whole entry's open 56 to 59 ms of one turn, the archive's hashing 93 to
 >   99 ms of another). **A-775 (2026-11-20):** a taken-over volume given up while its log's holder (or its catalog's or
 >   content's cohort) was away, or a green given up while the holder of its inputs was, is judged afresh once that member is
@@ -7496,6 +7512,12 @@
 >     mean of about 200 ms gives about 10³ verdicts a second at 1,000 clients (a round of about six requests a client),
 >     and about 20 ms gives about 10⁴. The run's own verdicts a second are the figure. The goal is met when a level at
 >     1,000 clients reads `met yes` at 10³ verdicts a second or more.
+>
+>     **89a, paused for goal 93 (2026-11-21, w-balance):** main's ruling: load_bench at 1,000 clients, main against main
+>     before A-400 (57ff29e53), release, quiet box, interleaved, best of N; if edit and merge are not under 1 ms, build a
+>     work whose client sits on its green's owner shard placed elsewhere, and A/B it. Not run: adacachy's fat-LTO builds
+>     timed out (3 h, load 29-31); next, thin-LTO builds once, the same harness in both arms (perf's handoff,
+>     agents/perf-handoff-g257).
 >
 >   The 10,000-client rung (same Studio, load 9.8 to 10.9, 313 connections) did not finish within its 30-minute bound.
 >   After 1,775 s about 2,170 of 10,000 clients were done and about 11,600 submits counted, with daemon RSS 17.6 GB.
@@ -24677,3 +24699,14 @@ forwards to the new owner were refused: `fleet.owner_location.route_dropped.refu
 reached it, and the flow failed at `live_chaos.rs:2465` ("the stream made a's log durable at 946, now 906"). The live log
 itself was whole on every node. Not worked by w-forming (Ada's close order); whether it reproduces on main after
 8e4da57ae is r19's replay.
+
+### 2026-11-21: Goal 85b, w-forming's two in-flight measurements (parked for goal 93)
+- **P4, A-827's release A/B (4a0cbd7b7):** the debug bench (Studio-4, 311 inodes, 9 interleaved rounds) gave the one-turn
+  image and encoding 598-849 us against the held capture's longest turn 36-66 us (first turn 6-10 us). The release rounds
+  are kiln run r3: `bash .git/w-forming-ab/p4.sh` (`cargo test --release -p slates-server --lib
+  bench_a_whole_publications_longest_turn -- --ignored --nocapture`); P4 closes on its numbers.
+- **C3, the chaos run:** recorded on c9c9554d8 (7/7 targeted flows, every invariant held; seeded nemesis 0/3 on progress,
+  no safety violation). The two causes in w-forming's code are fixed (bbdea3259, 8e4da57ae); the replay of seeds
+  1256052866610850298, 5939796479076166087, 10263252121351842258, 17757241901296347647, 8389754676365715562 and two fresh
+  draws is kiln run r19 (`SEEDS=... NEMESIS_RUNS=2 NEMESIS_ONLY=1 bash .git/w-forming-ab/c3.sh`). Seed
+  10263252121351842258's forwarding stall is the separate entry above.
