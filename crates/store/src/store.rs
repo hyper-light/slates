@@ -60,7 +60,7 @@ const CONTENT_KEY_BYTES: usize = AFTER_TAG + IDENTITY;
 const CONTENT_VALUE_BYTES: usize = U64 + U64;
 /// Format: the most bytes one [`Store::piece`] reads from the log: the read's unit (a caller walks pieces of any length
 /// until what it needs is whole), not a tuning of the reader.
-const PIECE_BYTES: usize = 1 << 16;
+pub const PIECE_BYTES: usize = 1 << 16;
 /// Format: a changeset row key's sequence, after the tag and the repository.
 const K_SEQUENCE: usize = AFTER_TAG + U128;
 /// Format: a changeset row's key: the tag, the repository, the sequence.
@@ -344,6 +344,17 @@ impl Store {
       len: row.len,
     };
     Ok(self.log.sections(&located)?)
+  }
+
+  /// At most [`PIECE_BYTES`] of the log from `offset` (a section's bytes, by the place [`Store::sections`] gave), as
+  /// far as `len` reaches.
+  pub fn read(&self, offset: u64, len: u64) -> Result<Vec<u8>, StoreError> {
+    let take =
+      usize::try_from(len.min(u64::try_from(PIECE_BYTES).map_err(|_| StoreError::BadRow)?))
+        .map_err(|_| StoreError::BadRow)?;
+    let mut bytes = vec![0u8; take];
+    self.log.read_at(&mut bytes, offset)?;
+    Ok(bytes)
   }
 
   /// The repository's landed changesets from sequence `from` on, at most `limit`, in order.
