@@ -2582,9 +2582,11 @@
 > through the store's owner (`svn_texts::fetch_piece`, a piece cache held by the waiting readers alone) and step it
 > again. Held by `a_drive_that_waits_for_its_texts_pieces_makes_the_same_calls` (slates-svn: the same calls as the
 > drive over a repository holding every text) and `a_checkout_reads_a_text_ram_does_not_hold_through_the_store` (a
-> checkout over the daemon's tunnel of a text neither the green nor the content store holds). Owed in (a): get-file
-> and DAV GET (`reads::file`), file-revs, the exporter, the deltify job; then (b), the records keep history on the
-> store. Stage C,
+> checkout over the daemon's tunnel of a text neither the green nor the content store holds). ra_svn's `get-file`
+> BUILT the same way (`reads::Progress::Waiting`; the string gathered so far kept across the wait): held by
+> `a_get_file_reads_a_text_ram_does_not_hold_through_the_store` (red without it: "Filesystem is corrupt" after the
+> first response). Owed in (a): DAV GET, file-revs, the exporter, the deltify job; then (b), the records keep history
+> on the store. Stage C,
 > an import as one sliced changeset (today a changeset a record); and a submitted version's revision (`svn_made`), which
 > today lands from a task holding the landing turn the submit took, after the submit committed its version, so a crash
 > between leaves the version without its revision. Main's ruling (inbox w-svn-from-main-c2-made): the submit takes the one
