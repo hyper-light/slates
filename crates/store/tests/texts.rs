@@ -65,10 +65,13 @@ struct History {
 
 /// Lands `changesets` changesets of repository 1, the `n`th editing path `n % 3` (a whole at its first version, then
 /// ten bytes replaced a version), each with a record, a payload of its edit or whole, and its `Texts` section.
+/// Each path's current text: its bytes, its identity, and the sequences of the changesets its chain spans.
+type CurrentTexts<'p> = BTreeMap<&'p str, (Vec<u8>, [u8; 32], BTreeSet<u64>)>;
+
 fn land_history(store: &mut Store, changesets: u64) -> History {
   let paths = ["a.txt", "b.txt", "c.txt"];
   let staging = Staging::new(1 << 20);
-  let mut current: BTreeMap<&str, (Vec<u8>, [u8; 32], BTreeSet<u64>)> = BTreeMap::new();
+  let mut current: CurrentTexts<'_> = BTreeMap::new();
   let mut history = History {
     texts: BTreeMap::new(),
     chains: BTreeMap::new(),
@@ -149,7 +152,7 @@ fn read(
   let bytes = store
     .text_at(&staging, 1, &identity, 0, &mut cache)
     .unwrap()
-    .expect("a landed text")
+    .unwrap()
     .to_vec();
   (bytes, cache.changesets)
 }

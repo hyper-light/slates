@@ -25,6 +25,7 @@ fn owner() -> Principal {
 }
 
 /// A fresh directory beside the test binary, in the build output.
+#[allow(clippy::disallowed_methods)] // test code: its own scratch directory
 fn store_directory(name: &str) -> PathBuf {
   let binary = std::env::current_exe().unwrap();
   let dir = binary
@@ -53,6 +54,45 @@ fn sizing() -> Sizing {
     extent_bytes: 128 << 10,
     fanout: 8,
   }
+}
+
+/// The store recovered from its files in `dir`: its log read whole names one changeset, a git creation of `stored`
+/// on `main` at sequence 0 under the store's standing grant, and the store's rows find it by its repository.
+fn creation_recovered(dir: &std::path::Path) {
+  // Recovered: the log read whole names one changeset, and the store's rows find it by its repository.
+  let log_file = hyper_block::file::DeviceFile::adopt(
+    root(dir).open_file(LOG_FILE).unwrap(),
+    &dir.join(LOG_FILE),
+    hyper_block::file::CachingRequest::Buffered,
+    hyper_block::buf::Alignment::BYTE,
+  )
+  .unwrap();
+  let mut found = Vec::new();
+  let log = ChangesetLog::recover(log_file, 0, |_, located| found.push(*located)).unwrap();
+  assert_eq!(found.len(), 1, "one creation landed");
+  let creation = found[0];
+  assert_eq!(
+    (creation.header.tool, creation.header.sequence),
+    (Tool::Git, 0)
+  );
+  let target = StoreRoot::identify(dir).unwrap();
+  assert_eq!(
+    creation.header.grant,
+    slates_store::store::grant_id(target.device, target.inode),
+    "landed under the store's standing grant (its G row, R10)"
+  );
+  let sections = log.sections(&creation).unwrap();
+  assert_eq!(sections.len(), 1);
+  assert_eq!(sections[0].kind, SectionKind::Record);
+  let mut record = vec![0u8; usize::try_from(sections[0].len).unwrap()];
+  log.read_at(&mut record, sections[0].offset).unwrap();
+  let record = String::from_utf8(record).unwrap();
+  assert!(record.contains("\nstored\nmain\nGit\n"), "{record}");
+  drop(log);
+  let mut store = Store::open(root(dir), sizing()).unwrap();
+  let rows = store.changesets(creation.header.repository, 0, 10).unwrap();
+  assert_eq!(rows.len(), 1);
+  assert_eq!(rows[0].identity, creation.identity);
 }
 
 /// A-767 item 7. Do: start a daemon holding a store, create a git repository through the verb, wait for its creation to
@@ -91,40 +131,7 @@ fn a_created_repository_is_landed_into_the_store_and_recovered() {
   daemon.stop();
   store_owner.stop().unwrap();
 
-  // Recovered: the log read whole names one changeset, and the store's rows find it by its repository.
-  let log_file = hyper_block::file::DeviceFile::adopt(
-    root(&dir).open_file(LOG_FILE).unwrap(),
-    &dir.join(LOG_FILE),
-    hyper_block::file::CachingRequest::Buffered,
-    hyper_block::buf::Alignment::BYTE,
-  )
-  .unwrap();
-  let mut found = Vec::new();
-  let log = ChangesetLog::recover(log_file, 0, |_, located| found.push(*located)).unwrap();
-  assert_eq!(found.len(), 1, "one creation landed");
-  let creation = found[0];
-  assert_eq!(
-    (creation.header.tool, creation.header.sequence),
-    (Tool::Git, 0)
-  );
-  let target = StoreRoot::identify(&dir).unwrap();
-  assert_eq!(
-    creation.header.grant,
-    slates_store::store::grant_id(target.device, target.inode),
-    "landed under the store's standing grant (its G row, R10)"
-  );
-  let sections = log.sections(&creation).unwrap();
-  assert_eq!(sections.len(), 1);
-  assert_eq!(sections[0].kind, SectionKind::Record);
-  let mut record = vec![0u8; usize::try_from(sections[0].len).unwrap()];
-  log.read_at(&mut record, sections[0].offset).unwrap();
-  let record = String::from_utf8(record).unwrap();
-  assert!(record.contains("\nstored\nmain\nGit\n"), "{record}");
-  drop(log);
-  let mut store = Store::open(root(&dir), sizing()).unwrap();
-  let rows = store.changesets(creation.header.repository, 0, 10).unwrap();
-  assert_eq!(rows.len(), 1);
-  assert_eq!(rows[0].identity, creation.identity);
+  creation_recovered(&dir);
 }
 
 /// A-767 C6 (svn onto the changeset store; main's order of 2026-11-20 19:50: "a push's landing as a changeset append,
@@ -297,7 +304,7 @@ fn wait_for(daemon: &Daemon, partition: usize, counter: &'static str, count: u64
       std::time::Instant::now() < deadline,
       "{counter} never reached {count}"
     );
-    std::thread::sleep(std::time::Duration::from_millis(5));
+    std::thread::yield_now();
   }
 }
 
