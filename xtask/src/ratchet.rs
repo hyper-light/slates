@@ -44,6 +44,18 @@ const BENCHES: &[(&str, &str)] = &[
   ("slates-ipc", "ipc_bench"),
 ];
 
+/// R9's provisioning histogram (`slates-client`'s `provision_bench`): p50/p99/p999/max of a create, spinning and
+/// parked, quiet and beside its own load, with its floor and its loaded bound asserted by the bench itself (it exits
+/// non-zero on either). It runs alone (`--provision`), never beside [`BENCHES`]: it starts a daemon whose shards spin,
+/// and measured back to back with the microbenches its tail measured them (BENCHMARKS, 2026-09-05). Its rows share
+/// `ratchets.toml`'s machine entries, so its ceilings only tighten as the others' do.
+const PROVISION: &[(&str, &str)] = &[("slates-client", "provision_bench")];
+
+/// Format: the file each `--provision` run's rows are appended to, under the target directory, one TSV line a row:
+/// the date, the machine id, the run, the row's key, its lower edge, median and upper edge in nanoseconds. The
+/// histogram of every run is kept, as R9 asks, for CI to keep as an artifact.
+const PROVISION_RECORD: &str = "target/provision-histogram.tsv";
+
 /// One row of one run.
 #[derive(Clone, Copy, Debug)]
 struct Row {
@@ -116,6 +128,8 @@ pub(crate) struct Flags {
   pub(crate) record: bool,
   pub(crate) tighten: bool,
   pub(crate) reset: bool,
+  /// R9's provisioning lane ([`PROVISION`]) in place of the microbenches.
+  pub(crate) provision: bool,
   pub(crate) runs: Option<usize>,
 }
 
@@ -152,7 +166,11 @@ pub(crate) fn run(root: &Path, flags: Flags) -> Result<(), Failure> {
   }
   let runs = flags.runs.unwrap_or(DEFAULT_RUNS).max(1);
 
-  let across = measure_all(root, runs)?;
+  let benches = if flags.provision { PROVISION } else { BENCHES };
+  let record = flags
+    .provision
+    .then(|| (root.join(PROVISION_RECORD), hash.clone()));
+  let across = measure_all(root, runs, benches, record.as_ref())?;
   let entry = file.machine.entry(hash.clone()).or_default();
   if !known {
     entry.identity = identity.clone();
@@ -243,10 +261,17 @@ pub(crate) fn run(root: &Path, flags: Flags) -> Result<(), Failure> {
   }
 }
 
-/// Runs every bench `runs` times and folds the runs per row, printing every run.
-fn measure_all(root: &Path, runs: usize) -> Result<BTreeMap<String, Across>, Failure> {
+/// Runs every bench of `benches` `runs` times and folds the runs per row, printing every run; with `record`, each
+/// run's rows are appended to its file under the machine's id ([`PROVISION_RECORD`]).
+fn measure_all(
+  root: &Path,
+  runs: usize,
+  benches: &[(&str, &str)],
+  record: Option<&(std::path::PathBuf, String)>,
+) -> Result<BTreeMap<String, Across>, Failure> {
   let mut across: BTreeMap<String, Across> = BTreeMap::new();
-  for (krate, example) in BENCHES {
+  let date = today();
+  for (krate, example) in benches {
     for run in 1..=runs {
       let output = Command::new(env!("CARGO"))
         .args([
@@ -275,6 +300,9 @@ fn measure_all(root: &Path, runs: usize) -> Result<BTreeMap<String, Across>, Fai
       }
       let rows = parse(&String::from_utf8_lossy(&output.stdout));
       println!("{krate} run {run}/{runs}: {} rows", rows.len());
+      if let Some((path, machine)) = record {
+        append_rows(path, &date, machine, run, &rows)?;
+      }
       for (key, row) in rows {
         println!(
           "  {key}: median {} [{}, {}]",
@@ -293,6 +321,39 @@ fn measure_all(root: &Path, runs: usize) -> Result<BTreeMap<String, Across>, Fai
     }
   }
   Ok(across)
+}
+
+/// Appends one run's rows to `path` ([`PROVISION_RECORD`]'s format), creating it and its directory if need be.
+fn append_rows(
+  path: &Path,
+  date: &str,
+  machine: &str,
+  run: usize,
+  rows: &BTreeMap<String, Row>,
+) -> Result<(), Failure> {
+  use std::io::Write;
+  let lines: String = rows
+    .iter()
+    .map(|(key, row)| {
+      format!(
+        "{date}\t{machine}\t{run}\t{key}\t{}\t{}\t{}\n",
+        row.lower, row.median, row.upper
+      )
+    })
+    .collect();
+  if let Some(parent) = path.parent() {
+    // xtask is a development tool writing under the target directory; shipped code never reaches this call.
+    #[allow(clippy::disallowed_methods)]
+    std::fs::create_dir_all(parent)?;
+  }
+  // As above: the development tool's own record, under the target directory.
+  #[allow(clippy::disallowed_methods)]
+  let mut file = std::fs::OpenOptions::new()
+    .create(true)
+    .append(true)
+    .open(path)?;
+  file.write_all(lines.as_bytes())?;
+  Ok(())
 }
 
 fn parse(stdout: &str) -> BTreeMap<String, Row> {
@@ -332,4 +393,37 @@ fn today() -> String {
     .filter(|o| o.status.success())
     .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
     .unwrap_or_else(|| "unknown".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// R9 (A-786): every `--provision` run's rows are kept. Do: append two runs' rows, the second's gated row and its
+  /// informational one, to a fresh file under the build output. Expect: one line a row, in run order, each the date, the
+  /// machine, the run, the key and the three edges, and the first run's lines still there after the second's.
+  #[test]
+  fn every_provision_runs_rows_are_kept_in_run_order() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+      .join("../target/xtask-test")
+      .join(format!("provision-{}.tsv", std::process::id()));
+    let rows = |median: u64| {
+      parse(&format!(
+        "ratchet\tprovision.spinning_1_p99\t1\t{median}\t3\nratchet-info\tprovision.spinning_1_max\t4\t5\t6\n"
+      ))
+    };
+    append_rows(&path, "2026-11-20", "abcd", 1, &rows(2)).unwrap();
+    append_rows(&path, "2026-11-20", "abcd", 2, &rows(7)).unwrap();
+    let kept = std::fs::read_to_string(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(
+      kept.lines().collect::<Vec<_>>(),
+      [
+        "2026-11-20\tabcd\t1\tprovision.spinning_1_max\t4\t5\t6",
+        "2026-11-20\tabcd\t1\tprovision.spinning_1_p99\t1\t2\t3",
+        "2026-11-20\tabcd\t2\tprovision.spinning_1_max\t4\t5\t6",
+        "2026-11-20\tabcd\t2\tprovision.spinning_1_p99\t1\t7\t3",
+      ]
+    );
+  }
 }

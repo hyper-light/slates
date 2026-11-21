@@ -1336,6 +1336,21 @@ pub struct Drive {
 }
 
 impl Drive {
+  /// Sets each of `set` among the revision properties the commit records and removes each of `removed`, but
+  /// `svn:author`, which is the principal's (`serve.c` 1526-1541; `svn_repos_fs_change_txn_prop` on a transaction's
+  /// properties, DeltaV v1's working-baseline PROPPATCH).
+  pub fn change_revision_properties(&mut self, set: &[(Vec<u8>, Vec<u8>)], removed: &[Vec<u8>]) {
+    let author = |name: &[u8]| name == b"svn:author";
+    let properties = &mut self.setup.revision_properties;
+    properties.retain(|(name, _)| author(name) || !removed.iter().any(|gone| gone == name));
+    for (name, value) in set.iter().filter(|(name, _)| !author(name)) {
+      match properties.iter_mut().find(|(held, _)| held == name) {
+        Some((_, held)) => held.clone_from(value),
+        None => properties.push((name.clone(), value.clone())),
+      }
+    }
+  }
+
   /// A drive about to read its first editor command.
   pub fn new(setup: Setup) -> Self {
     Self {

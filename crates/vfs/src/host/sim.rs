@@ -974,11 +974,10 @@ impl HostFs for SimHost {
           self
             .node(path)
             .filter(|n| n.ino == ino)
-            .cloned()
             .or_else(|| self.sibling_with_ino(path, ino))
         })
         .or_else(|| self.find_ino(ino))
-        .unwrap_or_else(|| node.clone());
+        .unwrap_or(node);
       return Ok(live.fingerprint_as(self.birth_times));
     }
     Ok(self.live_node(file)?.fingerprint_as(self.birth_times))
@@ -1037,7 +1036,7 @@ impl SimHost {
   /// What an open descriptor serves: the inode where it was opened if it still sits there,
   /// else wherever the inode moved to, else the retired copy the descriptor keeps alive, else
   /// the snapshot taken at the open.
-  fn live_node(&self, file: HostFile) -> Result<SimNode, HostError> {
+  fn live_node(&self, file: HostFile) -> Result<&SimNode, HostError> {
     let (ino, snapshot, path) = match self.opens.get(&file.0) {
       Some(Open::File {
         ino,
@@ -1050,32 +1049,26 @@ impl SimHost {
       self
         .node(path)
         .filter(|n| n.ino == ino)
-        .cloned()
         .or_else(|| self.sibling_with_ino(path, ino))
         .or_else(|| self.find_ino(ino))
-        .or_else(|| self.retired.get(&ino).cloned())
-        .unwrap_or_else(|| snapshot.clone()),
+        .or_else(|| self.retired.get(&ino))
+        .unwrap_or(snapshot),
     )
   }
 
   /// The inode under another name in the same directory (an exchange or a rename within the
   /// directory moved it there): the directory's entries, not the whole tree.
-  fn sibling_with_ino(&self, path: &[Box<str>], ino: u64) -> Option<SimNode> {
+  fn sibling_with_ino(&self, path: &[Box<str>], ino: u64) -> Option<&SimNode> {
     let parent = path.split_last().map(|(_, p)| p)?;
-    self
-      .node(parent)?
-      .children
-      .values()
-      .find(|n| n.ino == ino)
-      .cloned()
+    self.node(parent)?.children.values().find(|n| n.ino == ino)
   }
 
   /// The live node with inode `ino`, wherever it sits now (a rename keeps the inode).
-  fn find_ino(&self, ino: u64) -> Option<SimNode> {
+  fn find_ino(&self, ino: u64) -> Option<&SimNode> {
     let mut stack = vec![&self.root];
     while let Some(node) = stack.pop() {
       if node.ino == ino {
-        return Some(node.clone());
+        return Some(node);
       }
       for child in node.children.values() {
         stack.push(child);

@@ -103,7 +103,7 @@ fn race(instance: &str, green: VolumeId, client_index: usize) -> Vec<Told> {
       .edit(work.0, &path_of(file), at, BLOCK as u64, &bytes)
       .unwrap();
     match client.submit(work.0).unwrap() {
-      Submitted::Accepted(version) => {
+      Submitted::Accepted(version) | Submitted::Identical(version) => {
         told.push(Told {
           base: work.1,
           file,

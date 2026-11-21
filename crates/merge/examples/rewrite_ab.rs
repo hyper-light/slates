@@ -254,8 +254,15 @@ fn hunks_of(arm: Arm, base: &[u8], post: &[u8], refiner: &mut Refiner) -> Vec<Hu
     Arm::Trim => refiner
       .refine_bounded(base, post, Grain::Token, Some(0))
       .0
-      .to_vec(),
-    Arm::Myers(grain) => refiner.refine_grain(base, post, grain).0.to_vec(),
+      .iter()
+      .copied()
+      .collect(),
+    Arm::Myers(grain) => refiner
+      .refine_grain(base, post, grain)
+      .0
+      .iter()
+      .copied()
+      .collect(),
   }
 }
 
@@ -309,7 +316,7 @@ fn tally_of(arm: Arm, set: &[Pair]) -> Tally {
     });
     let one = green.submit(&increment(b, f, &h1, 1));
     assert!(
-      matches!(one, Outcome::Accepted { .. }),
+      matches!(one, Outcome::Accepted { .. } | Outcome::Identical { .. }),
       "{arm:?} first: {one:?}"
     );
     let two = green.submit(&increment(b, s, &h2, 2));
