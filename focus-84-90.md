@@ -1656,3 +1656,6 @@ Critical path (every agent on it; non-critical pieces recorded owed):
     - c22f468e3 (w-lint round 14 part 4).
   - BUG FOUND (w-rewrite-ops), assigned to it: checkpoint.rs a_green_restored_from_its_checkpoint_answers_as_the_green_it_was fails 1 in 5-10. The change index after a restore drops a path (["e/f"] vs the model's ["a", "e/f"]), reproduced on pure origin/main. Seed into the seed file, then fix.
   - RUNS: r4 on jupiter runs w-work-mount's C1 fix (agents/w-work-mount-c1, 705f4d7e5: a merge volume's status reports its mounts) under the live WinFsp test. r5 on Studio-4 runs slates-merge's clippy and full suite on main, w-rewrite-ops' request.
+- 2026-11-21 04:03 PST
+  - RUN r5 (Studio-4, main c8b77f817): slates-merge's full suite is green (lib 253/253, every target). Clippy had one error, the layered overlay's cognitive complexity at 11/10, which w-lint's round 15 had already fixed: 7db3bdba6 on main.
+  - r4 (jupiter, w-work-mount's C1 fix 705f4d7e5) is still running.
