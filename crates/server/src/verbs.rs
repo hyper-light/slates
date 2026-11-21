@@ -6760,7 +6760,7 @@ pub(crate) fn db_size(size: SizeClass) -> DbSizeClass {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn create(
+pub(crate) fn create(
   state: &mut ShardState,
   principal: &Principal,
   name: &str,

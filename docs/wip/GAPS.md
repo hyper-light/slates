@@ -126,8 +126,8 @@
 >
 > **A-767, the derived per-path read form (2026-11-20, w-perf; A-645).** BUILT: the `Texts` section's one format and
 > edit form, the `T`/`H` rows at landing and replay, `Store::text_at`/`text_row`/`path_texts` and the owner's requests
-> (SLATES_DESIGN A-767's status). Owed: rows for a changeset landed through `begin`/`applied` (w-store's path writes
-> neither `P` nor `T`/`H`); the release timing on Mercurial's history against the per-file arm's 91 µs.
+> (SLATES_DESIGN A-767's status). Rows for a changeset landed through `begin`/`applied`: CLOSED bc0677af9 (`applied`
+> reads the record back and puts every row, as replay does). Owed: the release timing on Mercurial's history against the per-file arm's 91 µs.
 >
 > **A-767 (2026-11-20, w-store; Ada's storage and changeset rulings).** DESIGNED: one unit, the changeset; RAM holds
 > the change in flight and a learned cache; history an append-only changeset log on each holder's disk under the
@@ -140,7 +140,16 @@
 > engine's extent bytes and fanout are the caller's `Sizing` (from its machine profile; the server's derivation is
 > owed with C4). C3 closed; C4 groundwork built: the owner thread and
 > `--vcs-store` (the daemon holds the store; shards hold its handle). Owed: Windows' store directory (`store_root`
-> refuses `Unsupported` there); the store grant's durable audit record (logged only); each tool's landing onto it (C4-C6).
+> refuses `Unsupported` there); the store grant's durable audit record (logged only); each tool's landing onto it (C4-C6); the
+> engine's memtable learned upward from its rows (it starts at one trunk node, fanout extents, since the machine-sized
+> start passed the engine's 4 GiB bound on a 128 GiB Mac; held at both extremes by
+> `store_sizing_tests::the_store_lands_on_a_small_and_a_large_machine_alike`: 8 GiB and 128 GiB profiles injected,
+> red 128 GiB `Gone` under the machine-sized formula, green both). The owner's sliced landing BUILT (2026-11-20):
+> `StoreHandle::begin`, then `SlicedLanding::section`/`part` (one piece a part)/`commit`, visible only at its commit,
+> other landings held in the owner's bounded queue meanwhile, a dropped one abandoned with nothing visible
+> (`tests/owner.rs` `a_changeset_lands_in_parts_alone_and_a_dropped_one_leaves_nothing`). Owed: the log's group commit
+> (concurrent landings sharing one flush, its window from the device's measured flush time), which is where a device
+> rate belongs; the memtable holds rows, never a landing's bytes, so its size is the engine's unit of work.
 >
 > **A-773 (2026-11-20, w-sessionlog).** BUILT: `slates log [--json]`, the session log naming collided works and landings
 > awaiting a grant first. A-788 serves it over MCP (`slates.log`) and the SDKs' sync clients; owed: their async forms.
@@ -1196,7 +1205,12 @@
 > prototype file from the index's trial, read by stock `svnlook -t` as `-r` reads the committed revision. P3's
 > referenced file BUILT (2026-11-20, main's ruling 2): `slates_vfs::referenced`, a read-only file of content-store
 > identities read through the store's seam (zero bytes copied over a view of 64 texts), held by its volume until
-> released, `EROFS` to every change; the server's seam over `ContentStore`. Owed: P3 (the presenter under
+> released, `EROFS` to every change; the server's seam over `ContentStore`. A-645 (a) BUILT (2026-11-20): a hook's
+> REPOS-PATH is its repository's view, presented on the owner shard and mounted read-only under the store's standing
+> grant (`<--vcs-store>/<repository>.svn`); a daemon with no store directory refuses a configured hook typed. Owed: the
+> by-use run with stock svn 1.15 (run-requests.md); a revision property change's own signal, since each hook refreshes
+> every revision's properties file now (linear in the history, a revision a turn); the view unmounted with its
+> repository. Owed before: P3 (the presenter under
 > SLATES_ROOT, after A-727 a2), P4, the root mount's publication; until P3, REPOS stays `/<name>`.
 > **A-671 (2026-11-19, g296; the matcher's home):** git's `wildmatch` (A-597) is `slates_vcs::wildmatch` now, moved
 > whole from `crates/server` with its tests, behaviour unchanged, so slates-git, which builds on slates-vcs and not on
