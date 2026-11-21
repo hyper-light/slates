@@ -15,6 +15,11 @@
 //! the view's volume holds the file, through the store's `hold` and `release`; a text the records keep lives as long as
 //! the repository's records do, which outlive its view.
 //!
+//! **Nothing in the chunk store.** Every file of the view is a referenced file, the small ones a single made piece, so
+//! the volume holds no content in the shard's chunk store: a read of it is served while that store is lent to the
+//! content store's windows (A-727 a2), the vfs reading only the volume's inodes and directories, and the texts read
+//! through [`ViewTexts`].
+//!
 //! **Growing.** [`Presented::advance`] lays out the revisions the records hold past those already shown, at most a
 //! budget of node-revisions a call, writes their files, and then rewrites `db/current`, so a reader never sees a
 //! youngest revision whose file is missing. [`Presented::revision_properties_changed`] rewrites one revision's
@@ -185,7 +190,10 @@ fn parent_of<'p>(
   Ok((directory_at(volume, store, root, directory)?, name))
 }
 
-/// Makes the file `path` beneath `root` hold exactly `bytes`: made where missing, else rewritten and cut to them.
+/// Makes the file `path` beneath `root` hold exactly `bytes`: a referenced file of one made piece, made where missing and
+/// made again where it held other bytes (a referenced file is never written in place). Every file of the view is a
+/// referenced file, so the volume keeps nothing in the shard's chunk store: a read of it runs while that store is lent
+/// to the content store's windows (A-727), the vfs store reading only inodes and directories (module docs).
 fn put_file(
   volume: &mut Volume,
   store: &mut Store,
@@ -194,23 +202,45 @@ fn put_file(
   bytes: &[u8],
 ) -> Result<(), PresentRefusal> {
   let (parent, name) = parent_of(volume, store, root, path)?;
-  let file = match volume.lookup_no(store, parent, name) {
-    Ok(found) => found.inode,
-    Err(VfsError::NotFound) => volume.create_file_no(store, parent, name, FILE_MODE)?,
-    Err(refusal) => return Err(refusal.into()),
-  };
-  let len = u64::try_from(bytes.len()).map_err(|_| VfsError::FileTooLarge)?;
-  volume.truncate(store, file, len)?;
-  let mut at = 0usize;
-  while at < bytes.len() {
-    let offset = u64::try_from(at).map_err(|_| VfsError::FileTooLarge)?;
-    let wrote = volume.write(store, file, offset, bytes.get(at..).unwrap_or_default())?;
-    if wrote == 0 {
-      return Err(VfsError::NoSpace.into());
+  match volume.lookup_no(store, parent, name) {
+    Ok(found) => {
+      if file_bytes(volume, store, found.inode)? == bytes {
+        return Ok(());
+      }
+      volume.unlink_no(store, parent, name)?;
     }
-    at = at.saturating_add(wrote);
+    Err(VfsError::NotFound) => {}
+    Err(refusal) => return Err(refusal.into()),
   }
+  let pieces = if bytes.is_empty() {
+    Vec::new()
+  } else {
+    vec![Piece::Made(bytes.into())]
+  };
+  volume.create_referenced(store, parent, name, FILE_MODE, pieces, &mut NoHolds)?;
   Ok(())
+}
+
+/// A made file's bytes, read through no store (it names no content).
+fn file_bytes(volume: &Volume, store: &Store, file: InodeNo) -> Result<Vec<u8>, PresentRefusal> {
+  let len = usize::try_from(volume.stat(store, file)?.size).map_err(|_| VfsError::FileTooLarge)?;
+  let mut bytes = vec![0u8; len];
+  let read = volume.read(store, file, 0, &mut bytes)?;
+  bytes.truncate(read);
+  Ok(bytes)
+}
+
+/// The holds of a file that names no content: none taken, none given back.
+struct NoHolds;
+
+impl ReferencedHolds for NoHolds {
+  fn hold(&mut self, _id: &Identity) -> Result<(), VfsError> {
+    Err(VfsError::ReferenceUnresolved)
+  }
+
+  fn release(&mut self, _id: &Identity) -> Result<(), VfsError> {
+    Err(VfsError::ReferenceUnresolved)
+  }
 }
 
 /// A view's referenced read (module docs, "Where a text is read"): a text's run from the repository's text source.

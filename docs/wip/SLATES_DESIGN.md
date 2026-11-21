@@ -56515,7 +56515,13 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   records' svndiffs are no content a piece can name and per-file deltas become derived forms of the changeset log (Ada's
   ruling of ~13:35). Held by `the_presented_volume_holds_the_fsfs_view_byte_for_byte` (the golden repository laid out a
   node-revision a call; every revision file, properties file and fixed file the bytes `fsfs` makes, each revision file
-  refused `EROFS`) and `a_revision_property_change_rewrites_that_revisions_properties_file`.
+  refused `EROFS`) and `a_revision_property_change_rewrites_that_revisions_properties_file`. Part 2a (same day): every
+  file of the view is a referenced file (the small ones one made piece, made again when its bytes change), so the view's
+  volume keeps nothing in the shard's chunk store and a read of it can run while that store is lent to the content
+  store's windows (A-727 a2), the test holding the chunk store empty; and `slates_land::store_root::StoreRoot::mount_point`
+  makes the view's mount point inside the store's granted directory (`mkdirat` relative to its handle, for the user
+  alone, made durable; a file or symlink at the name refused `ENOTDIR`), held by
+  `a_mount_point_is_made_in_the_granted_directory_and_nowhere_else`.
 - **Owed.** A-645 (a) parts 2 and 3: the view's volume made and kept current by the daemon, mounted read-only under the
   store's standing grant (`<--vcs-store>/<repository>.svn`) through each platform's mount, its path the hook's
   REPOS-PATH (the "root mount not yet published" refusal goes), and the by-use red (stock svn's revprop change through
