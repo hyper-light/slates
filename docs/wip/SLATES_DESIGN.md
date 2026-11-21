@@ -57649,6 +57649,12 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > `RtError::Capacity`, and `futures::race2`/`Either` (pinned on its own frame, no pin-projection crate). The engine's
 > machine facts are already `slates_machine::facts` by the same names (hyper-rt took them from slates). Tests:
 > retirement 2/2, race 1/1, sync 11/11.
+> Step 3 (2026-11-20): the crates vendored and ported. `vendor/mantle/` holds `mantle-engine`, `-chunk`, `-disk`,
+> `-crc`, `-codec` at mantle `87ab09e1`; `hyper-block`'s issuer is back, on `slates_rt`; every `hyper_rt::` path is
+> `slates_rt`'s or `slates_machine`'s (`vendor/mantle/README.md`, `vendor/hyper-raft/README.md`, "Local changes");
+> `ranges` stays upstream. No `hyper-rt` and no `unsafe impl Send`/`Sync` anywhere. Unit tests on slates' runtime:
+> engine 155/155, chunk 52/52, `hyper-block` 101/101 (issuer included), slates-rt sync 11/11 and retirement 3/3.
+> Owed in C2: the engine's and the chunk store's file creation behind `land`'s write seam, under the grant.
 
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
