@@ -635,3 +635,95 @@ fn a_rewrite_renamed_over_another_file_merges_with_an_edit_of_its_source() {
   );
   assert!(a.is_err(), "a was moved: {a:?}");
 }
+
+/// Close item R3 (A-787 part 2). Do: on a one-shard daemon, seed a green's `f` with 2 MiB of source lines; from one work,
+/// change one call in it by a declared edit; from another, re-indent every line of the file (a formatter's pass, saved
+/// whole); submit the edit, then the pass. Expect: both accepted, the head the re-indented file with the edit, and the
+/// refinement having run as a job of the shard over many turns (`merge.refine.turns`), never inside the verb. Until
+/// A-787 part 2 the submit refined the 2 MiB in its own step.
+#[test]
+fn a_large_rewrite_is_refined_over_many_turns_off_the_submit() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-refine-turns-{}", std::process::id());
+  let daemon = Daemon::start(
+    &profile,
+    DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS)),
+    slates_server::SegmentSource::Create {
+      name: common::fixture_object("slates-seg", "refine-turns"),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut base = String::new();
+  let mut n = 0usize;
+  while base.len() < 2 << 20 {
+    base.push_str(&format!(
+      "  let value_{n} = compute({n}, other_{});\n",
+      n % 97
+    ));
+    n += 1;
+  }
+  let reindent = |text: &str| -> String {
+    text
+      .split_inclusive('\n')
+      .map(|line| format!("  {line}"))
+      .collect()
+  };
+  let marker = "compute(1000, ";
+  let mut client = connect(&instance);
+  let green = client.create_green("refine-turns-green", false).unwrap();
+  let (seed, _) = client.create_work(green, "refine-turns-seed").unwrap();
+  client.edit(seed, "f", 0, 0, base.as_bytes()).unwrap();
+  let seeded = client.submit(seed);
+  let (editor, _) = client.create_work(green, "refine-turns-edit").unwrap();
+  let (formatter, _) = client.create_work(green, "refine-turns-format").unwrap();
+  let at = u64::try_from(base.find(marker).unwrap()).unwrap();
+  client.edit(editor, "f", at, 7, b"measure").unwrap();
+  let whole = u64::try_from(base.len()).unwrap();
+  let formatted = reindent(&base);
+  client
+    .edit(formatter, "f", 0, whole, formatted.as_bytes())
+    .unwrap();
+  let edited = client.submit(editor);
+  let format = client.submit(formatter);
+  let head = client.read(green, "f", ReadAt::Head);
+  let counts = daemon.refusals_on_every_shard().unwrap();
+  let turns = counts.get("merge.refine.turns").copied().unwrap_or(0);
+  let past: Vec<u64> = [
+    "merge.refine.past_quantum",
+    "merge.refine.past_2_quanta",
+    "merge.refine.past_4_quanta",
+    "merge.refine.past_16_quanta",
+  ]
+  .iter()
+  .map(|name| counts.get(*name).copied().unwrap_or(0))
+  .collect();
+  // The measured figures, for the record: the job's turns, and those past 1, 2, 4 and 16 step quanta.
+  let longest = counts
+    .get("merge.refine.longest_turn_us")
+    .copied()
+    .unwrap_or(0);
+  eprintln!("refinement: {turns} turns, past 1/2/4/16 quanta: {past:?}, longest {longest} us");
+  drop(client);
+  daemon.stop();
+  assert!(
+    matches!(seeded, Ok(Submitted::Accepted(1))),
+    "seeded: {seeded:?}"
+  );
+  assert!(
+    matches!(edited, Ok(Submitted::Accepted(2))),
+    "edit: {edited:?}"
+  );
+  assert!(
+    matches!(format, Ok(Submitted::Accepted(3))),
+    "format: {format:?}"
+  );
+  let expected = reindent(&base.replacen("compute(1000, ", "measure(1000, ", 1));
+  assert!(
+    head.as_deref().ok() == Some(expected.as_bytes()),
+    "the head is the re-indented file with the edit"
+  );
+  assert!(turns > 50, "the refinement ran over many turns: {turns}");
+}

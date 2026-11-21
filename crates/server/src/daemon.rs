@@ -4987,6 +4987,7 @@ async fn init_shard(
     lease_waiters: crate::lease_wait::LeaseWaiters::default(),
     base_waits: crate::base_wait::BaseWaits::default(),
     work_home: crate::work_home::WorkHome::default(),
+    refining: crate::refining::Refining::default(),
     forwarded_rings: std::collections::BTreeMap::new(),
     telemetry_quota: config.telemetry_spans_per_reply,
     last_drain_ns: now,
