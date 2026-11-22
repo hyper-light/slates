@@ -2888,8 +2888,10 @@
 > The session then went red on `svn status -u -v --xml`, the test's own: the same 15 entries, the same in every
 > field, in two orders, since stock `svn` reports a directory's children in its working copy's hash order, seeded afresh
 > each run. FIXED in the comparison (w-svn): a status's entries are compared in text order, every other output's as
-> answered (`entries_in_order`; `the_comparison_leaves_status_entry_order_out_and_nothing_else`). Owed: main's rerun
-> on macos-latest, and w-lint's Linux and Windows cross-target round. Windows spawns no hooks yet (A-622's Windows
+> answered (`entries_in_order`; `the_comparison_leaves_status_entry_order_out_and_nothing_else`). **CLOSED by use**
+> (main 01a20182's CI 45021179639, 2026-11-22, macos-latest, Homebrew svn 1.15.0, at 272513fe4 on 738b4e0af): the
+> session passes 1 of 1 in 33.54 s, byte for byte against `svnserve`, and the guard leaves 0 views mounted. Owed:
+> w-lint's Linux and Windows cross-target round. Windows spawns no hooks yet (A-622's Windows
 > part), so it has no seam to change.
 > **svn replay by stock clients (w-interop, 2026-11-20; A-703):** `svn-matrix.sh` gains `svnrdump dump` and
 > `svnsync initialize/synchronize` over svn://, each compared with the dump stock svnserve 1.15.0 made of the same history
