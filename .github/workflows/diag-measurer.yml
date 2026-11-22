@@ -1,0 +1,33 @@
+name: diag measurer
+# w-interop (2026-11-22): the focused Linux tests of a Linux-only change (fuse::serve split; hangup's close wait on
+# readiness), which no macOS run compiles and kiln reaches no Linux box for. Run only from `diag-measurer-*` branches,
+# never main.
+
+on:
+  push:
+    branches: ["diag-measurer-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  focused:
+    name: hangup and fuse tests (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: slates-server --lib hangup
+        run: cargo test --locked -p slates-server --lib hangup
+      - name: slates-server --lib fuse
+        run: cargo test --locked -p slates-server --lib fuse
