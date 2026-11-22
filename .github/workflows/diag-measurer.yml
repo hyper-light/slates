@@ -1,0 +1,52 @@
+name: diag measurer
+# main 01a20182 (2026-11-22 04:04 PST): ci.yml's own wall, workspace-wide, on both host platforms, because CI's main runs
+# have been cancelled one after another and the four-crate clippy round found Linux-only test code that no longer
+# compiles (crates/server/tests/virtiofs.rs:1210, since 5169ed2b1 on 11-20). The same three gates ci.yml's `gates` job
+# runs, each kept going so one red doesn't hide the next: fmt, clippy --workspace --all-targets -D warnings, and every
+# test target compiled. Run only from `diag-measurer-*` branches, never main.
+
+on:
+  push:
+    branches: ["diag-measurer-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  wall:
+    name: the wall, workspace-wide (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format, clippy and every test compiled
+        run: |
+          set +e; rc=0
+          cargo fmt --all --check > fmt.log 2>&1; f=$?; echo "fmt exit $f"; [ $f -eq 0 ] || { rc=1; grep -E '^Diff in' fmt.log | sed -E 's#^Diff in .*/slates/slates/##' | head -20; }
+          cargo clippy --workspace --all-targets --keep-going -- -D warnings > clippy.log 2>&1; c=$?; echo "clippy exit $c"
+          [ $c -eq 0 ] || { rc=1; awk '/^(error|warning)(\[|:)/{msg=$0} /^ *--> /{print msg " @@ " $2}' clippy.log | sort -u | head -60; }
+          cargo test --workspace --no-run --keep-going > build-tests.log 2>&1; t=$?; echo "test build exit $t"
+          [ $t -eq 0 ] || { rc=1; awk '/^error(\[|:)/{msg=$0} /^ *--> /{print msg " @@ " $2}' build-tests.log | sort -u | head -40; }
+          exit $rc
+      - name: Keep the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: wall-${{ matrix.os }}
+          path: |
+            fmt.log
+            clippy.log
+            build-tests.log
+          if-no-files-found: warn
