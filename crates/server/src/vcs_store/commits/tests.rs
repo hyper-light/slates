@@ -909,7 +909,16 @@ fn t_c5b_p3_a_git_made_commit_is_answered_only_once_its_changeset_landed_and_com
   );
   assert_eq!(
     seen.1,
-    (true, 1, 1, Some(6u32.to_le_bytes().to_vec())),
+    (
+      true,
+      1,
+      1,
+      Some(
+        crate::vcs_store::record::VERSION_LANDED
+          .to_le_bytes()
+          .to_vec()
+      )
+    ),
     "answered once its changeset landed and both committed, recorded v5"
   );
 }
@@ -1029,7 +1038,14 @@ fn t_c5b_p3_a_kill_between_a_made_commits_landing_and_its_step_recovers_to_befor
   );
   assert_eq!(
     (after_retry, newest),
-    ((1, 1, held + 1, true), Some(6u32.to_le_bytes().to_vec())),
+    (
+      (1, 1, held + 1, true),
+      Some(
+        crate::vcs_store::record::VERSION_LANDED
+          .to_le_bytes()
+          .to_vec()
+      )
+    ),
     "the retry landed once, recorded version 6, and answered"
   );
 }

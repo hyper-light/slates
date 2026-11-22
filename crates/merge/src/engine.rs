@@ -5639,10 +5639,11 @@ impl Green {
     self.owed.as_ref()
   }
 
-  /// The build of the push this green owes, each turn under `pace`: drive it with [`crate::push::Building::advance`]
+  /// The build of the push this green owes within `room` bytes (A-857: the room its repository has as it is built), each
+  /// turn under `pace`: drive it with [`crate::push::Building::advance`]
   /// over this green and the push's objects, then give its work to [`Green::materialize`]. None when nothing is owed.
-  pub fn materializing(&self, pace: crate::pace::Pace) -> Option<crate::push::Building> {
-    self.owed.as_ref().map(|owed| owed.building(pace))
+  pub fn materializing(&self, pace: crate::pace::Pace, room: u64) -> Option<crate::push::Building> {
+    self.owed.as_ref().map(|owed| owed.building(pace, room))
   }
 
   /// Commits `built`, the owed push's work, as the owed version, and clears the debt: the green is then the green the

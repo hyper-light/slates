@@ -646,6 +646,10 @@
 > what is held past the grant is given back (`t_a856_with_no_fetch_answered_nothing_is_encoded_ahead`). Owed: one deflate
 > state a shard (clients: 97 GB of fresh states over one git/git clone); fragments past the grant kept on disk under its
 > grant, not only left unmade; main's RSS round.
+> A-857 BUILT (2026-11-22, w-git; a regression): a deferred build ran within the room its push recorded (a small push's
+> learned demand) and was refused `PastRoom`, so branch, tag and master pushes failed on git/git. Now it runs within its
+> repository's room as it is built and waits for room past it (`vcs_share::wait`, shared with hg). Owed: A-855's fetch
+> wait moved onto it; main's matrix and git/git rerun (master's "cannot lock ref" judged there).
 > R2, the load-only edge tests, CLOSED (2026-11-21, w-git): a push's answer under side-band-64k wrote its first
 > keepalive two intervals after its body (`body_end` waited one interval unwritten, then the reply its own before
 > appending it), 10 s, the client's patience, so every push answer past 5 s failed (18 of 18 at load 24, the timing
