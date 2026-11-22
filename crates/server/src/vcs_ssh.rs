@@ -1111,7 +1111,7 @@ impl<S: SshSite> Link<S> {
       return Ok(Turn::Client);
     }
     if running.unsent() {
-      return Ok(self.offer());
+      return self.offer();
     }
     let next = running.next;
     match next {
@@ -1121,17 +1121,20 @@ impl<S: SshSite> Link<S> {
     }
   }
 
-  /// Offers what the command wrote to the channel: standard error first, then standard output.
-  fn offer(&mut self) -> Turn {
+  /// Offers what the command wrote to the channel: standard error first, then standard output. A send the session
+  /// refuses (its connection closed, its channel finished or never running) ends the connection refused: nothing the
+  /// command wrote can reach its client, and a send read as nothing taken would hold the connection for a
+  /// [`SessionEvent::Writable`] that never comes.
+  fn offer(&mut self) -> Result<Turn, Why> {
     let Some(running) = self.running.as_mut() else {
-      return Turn::Idle;
+      return Ok(Turn::Idle);
     };
     let taken = match running.command.as_mut() {
       Some(command) => {
         let (stderr, stdout) = command.output();
-        let taken_stderr = self.session.send_stderr(stderr).unwrap_or(0);
+        let taken_stderr = self.session.send_stderr(stderr).map_err(|_| Why::Refused)?;
         let taken_stdout = if taken_stderr == stderr.len() {
-          self.session.send_data(stdout).unwrap_or(0)
+          self.session.send_data(stdout).map_err(|_| Why::Refused)?
         } else {
           0
         };
@@ -1139,16 +1142,19 @@ impl<S: SshSite> Link<S> {
         taken_stderr.saturating_add(taken_stdout)
       }
       None => {
-        let taken = self.session.send_stderr(&running.refusal).unwrap_or(0);
+        let taken = self
+          .session
+          .send_stderr(&running.refusal)
+          .map_err(|_| Why::Refused)?;
         running.refusal.drain(..taken.min(running.refusal.len()));
         taken
       }
     };
     if taken == 0 {
       running.held = true;
-      return Turn::Client;
+      return Ok(Turn::Client);
     }
-    Turn::Moved
+    Ok(Turn::Moved)
   }
 
   /// Steps the command and gives the input it consumed back to the client's window, then yields: one step a turn. The

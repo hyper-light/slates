@@ -9,16 +9,19 @@
 //!
 //! **Claims.** An extent's owner word in the anchor segment is 0 while free, else its partition plus one, taken and
 //! given back by compare-and-swap (`AnchorSegment::pool_claim`), so the claim outlives a daemon restart as the content
-//! does. A shard claims at admission only (`Store::make_room`), never per write. It tries its own slice's parts first,
-//! largest first, then the following partitions' parts, so shards meet in the pool only when a volume outgrows its
-//! own slice.
+//! does. A shard claims at admission only (`Store::make_room`), never per write, and takes the smallest free part
+//! that covers what it lacks, else the largest (best fit, A-848), its own slice's before the following partitions'
+//! of the same length, so shards meet in the pool only when a volume outgrows its own slice. Before A-848 it took its
+//! slice's largest part first: a push seal's 18,564-byte turn grew a shard's arena by 8,589,934,592 bytes (g227,
+//! Studio-4, 2026-11-21).
 //!
 //! **Names.** An extent's id is `partition × POOL_EXTENTS_PER_PARTITION + part`, and the arena holds it under that id,
 //! so a block's (region, offset) name is the same in every daemon and an image needs no extent table.
 //!
 //! **Parts.** The unit is one chunk window rounded up to the mapping granule, so every part holds whole chunks and
 //! maps on its own; a part is a power-of-two number of units, since a buddy region uses only the largest
-//! power-of-two run of granules it holds. Cut as one region, a reserve of 170.7 MiB under a 1 GiB cap left 25%
+//! power-of-two run of granules it holds. A slice is cut into a run doubling from one unit (1, 1, 2, 4, ... units),
+//! then the rest's binary parts ([`arena_parts`]), so an arena grows from one unit by its work. Cut as one region, a reserve of 170.7 MiB under a 1 GiB cap left 25%
 //! unallocatable (2026-10-05, BENCHMARKS).
 //!
 //! **The pressure hold.** The memory-pressure hold (§4.2, admission.md §5.5) is the daemon's, not each shard's: what the
@@ -133,9 +136,6 @@ pub(crate) fn hold_toward(
   Ok(held)
 }
 
-/// The parts of an arena range of `len` bytes, `(offset, len)` relative to the range: its length cut on `unit` into
-/// power-of-two multiples of it, largest first, the remainder under one `unit` left unused. At most one part per bit
-/// of `len / unit`.
 /// The parts of one slice's arena range in `config`'s layout ([`arena_parts`]): what a Windows extent's length is read
 /// from (`crate::content_extents::extent_len`, A-789).
 #[cfg(windows)]
@@ -143,18 +143,36 @@ pub(crate) fn parts_of(config: &DaemonConfig) -> Vec<(usize, usize)> {
   arena_parts(config.shard_content_layout().arena.1, config.pool_unit())
 }
 
+/// The parts of an arena range of `len` bytes, `(offset, len)` relative to the range, each a power-of-two number of
+/// `unit`s (A-848): first a doubling run (1, 1, 2, 4, ... units, each as long as all before it), then what the run
+/// leaves cut into power-of-two parts, largest first; the remainder under one `unit` left unused. A claim takes the
+/// smallest free part that covers what it needs ([`ContentPool`]'s `claim`), so an arena grows by its need rounded up
+/// to a power of two of units, from one unit, and doubles when claims keep coming. Before A-848 the range was cut
+/// into its binary parts, largest first, and a first claim of 18,564 bytes took an 8,589,934,592-byte part (g227,
+/// Studio-4). At most about two parts per bit of `len / unit`, and never more than `POOL_EXTENTS_PER_PARTITION`.
 pub(crate) fn arena_parts(len: usize, unit: usize) -> Vec<(usize, usize)> {
   let unit = unit.max(1);
-  let mut units = len.checked_div(unit).unwrap_or(0);
-  let mut at = 0usize;
-  let mut parts = Vec::new();
-  while units > 0 {
-    // `units >= 1` in the loop, so it has a top bit.
-    let top = 1usize.checked_shl(units.ilog2()).unwrap_or(0);
-    let part = top.saturating_mul(unit);
-    parts.push((at, part));
-    at = at.saturating_add(part);
-    units = units.saturating_sub(top);
+  let units = len.checked_div(unit).unwrap_or(0);
+  let mut parts: Vec<(usize, usize)> = Vec::new();
+  // The doubling run: one unit, then each part as long as every part before it together (1, 1, 2, 4, ... units), so an
+  // arena that claims them in turn doubles at each claim, from one unit.
+  let mut taken = 0usize;
+  while taken < units && parts.len() < POOL_EXTENTS_PER_PARTITION {
+    let next = taken.max(1);
+    if units.saturating_sub(taken) < next {
+      break;
+    }
+    parts.push((taken.saturating_mul(unit), next.saturating_mul(unit)));
+    taken = taken.saturating_add(next);
+  }
+  // What the run leaves (fewer units than it holds) in power-of-two parts, largest first: one per bit of the rest.
+  let mut rest = units.saturating_sub(taken);
+  while rest > 0 && parts.len() < POOL_EXTENTS_PER_PARTITION {
+    // `rest >= 1` in the loop, so it has a top bit.
+    let top = 1usize.checked_shl(rest.ilog2()).unwrap_or(0);
+    parts.push((taken.saturating_mul(unit), top.saturating_mul(unit)));
+    taken = taken.saturating_add(top);
+    rest = rest.saturating_sub(top);
   }
   parts
 }
@@ -365,6 +383,41 @@ impl ContentPool {
 }
 
 impl ContentPool {
+  /// The free extents in the order a claim of `want` bytes tries them (A-848): those that cover `want`, smallest first,
+  /// then those that do not, largest first; equal lengths in [`ContentPool::candidates`]' order, so this partition's
+  /// own slice before the following ones. An arena so grows by its need rounded up to a power of two of units. Before
+  /// A-848 a claim took the first free part, its slice's largest: 8,589,934,592 bytes for an 18,564-byte lend (g227).
+  /// Claims come at admission only, never per write, so the list is made per claim.
+  fn best_fit(&self, want: usize) -> Vec<u16> {
+    let mut free: Vec<(bool, usize, usize, u16)> = Vec::new();
+    for (order, id) in self.candidates().enumerate() {
+      // An extent whose section is not made, or not yet held by the anchor, is passed over (A-789, Windows): data never
+      // lands where a daemon's death would lose it.
+      #[cfg(windows)]
+      if crate::content_extents::installed() && !crate::content_extents::ready(id) {
+        continue;
+      }
+      if !matches!(self.segment.pool_owner(usize::from(id)), Ok(None)) {
+        continue;
+      }
+      let Some((_, (_, len))) = self.part(id) else {
+        continue;
+      };
+      let covers = len >= want;
+      // Covering parts by length up, the rest by length down.
+      let key = if covers {
+        len
+      } else {
+        usize::MAX.saturating_sub(len)
+      };
+      free.push((!covers, key, order, id));
+    }
+    free.sort_unstable();
+    free.into_iter().map(|(_, _, _, id)| id).collect()
+  }
+}
+
+impl ContentPool {
   /// Maps extent `id`, which this partition has just claimed, for the arena: `None` when the OS would not map it, the
   /// word then given straight back (if even that is refused, the extent stays held by this partition and is released
   /// by the next daemon's `held`).
@@ -437,14 +490,8 @@ impl ContentPool {
 }
 
 impl ExtentSource for ContentPool {
-  fn claim(&mut self) -> Option<(u16, Region)> {
-    for id in self.candidates() {
-      // An extent whose section is not made, or not yet held by the anchor, is passed over (A-789, Windows): data never
-      // lands where a daemon's death would lose it.
-      #[cfg(windows)]
-      if crate::content_extents::installed() && !crate::content_extents::ready(id) {
-        continue;
-      }
+  fn claim(&mut self, want: usize) -> Option<(u16, Region)> {
+    for id in self.best_fit(want) {
       match self.segment.pool_claim(usize::from(id), self.partition) {
         Ok(true) => return self.hand_out(id),
         Ok(false) => {}
@@ -490,5 +537,107 @@ impl ExtentSource for ContentPool {
       })
       .filter_map(|id| self.part(id).map(|(_, (_, len))| len))
       .sum()
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use crate::state::ShardState;
+
+  /// Derived: the bytes g227's push seal lent a turn for 64 files (Studio-4, 2026-11-21; GAPS, g227's measurement),
+  /// the lend that grew a shard's arena by a whole 8 GiB extent.
+  const SEAL_TURN_BYTES: u64 = 18_564;
+
+  /// One ask for room on `state`'s shard: room for what its arena can already admit plus [`SEAL_TURN_BYTES`].
+  /// `(asked, lacked, grown, before, admittable)`: what was asked, what the budget lacked for it (the commitments, the
+  /// operation headroom and the pressure hold beside the ask, and the pressure debt a growth takes on), what the arena
+  /// grew by, its capacity before, and what the shard could admit after.
+  fn ask_one_turn(state: &mut ShardState) -> (u64, u64, u64, u64, u64) {
+    let before = state.store.budget.capacity();
+    let asked = state
+      .store
+      .budget
+      .admittable()
+      .saturating_add(SEAL_TURN_BYTES);
+    let lacked = state
+      .store
+      .budget
+      .deficit(asked)
+      .saturating_add(state.store.budget.debt());
+    state.store.make_room(asked);
+    let grown = state.store.budget.capacity().saturating_sub(before);
+    (
+      asked,
+      lacked,
+      grown,
+      before,
+      state.store.budget.admittable(),
+    )
+  }
+
+  /// The most a growth by `lacked` bytes may take (A-848): `lacked` rounded up to a power-of-two number of `unit`s,
+  /// the length of the smallest part covering it, or the arena's capacity `before` when the parts left are the doubling
+  /// run's next.
+  fn bound(lacked: u64, unit: usize, before: u64) -> u64 {
+    let unit = u64::try_from(unit).unwrap();
+    lacked
+      .div_ceil(unit)
+      .max(1)
+      .next_power_of_two()
+      .saturating_mul(unit)
+      .max(before)
+  }
+
+  /// A-848 (main 2026-11-21 17:20, goal 93; Ada's MEMORY SIZING rule: sized from the work). Do: on a shard, ask room for
+  /// what its arena can already admit plus one push seal's turn (18,564 bytes), so the arena must grow. Expect: it grows
+  /// (non-vacuity), by no more than what its budget lacked rounded up to a power of two of pool units, or its capacity
+  /// before. Before, the first claim took its slice's largest part (8,589,934,592 bytes on Studio-4, g227), however few
+  /// bytes the lend needed.
+  #[test]
+  fn a_small_lend_grows_its_shards_arena_by_its_need_not_an_extent() {
+    let ((asked, lacked, grown, before, admittable), unit, slice) =
+      crate::daemon::audit_on_shard(|state| {
+        let unit = state.config.pool_unit();
+        let slice = state.config.shard_content_layout().arena.1;
+        (ask_one_turn(state), unit, slice)
+      });
+    assert!(grown > 0, "the lend grew the arena (non-vacuity)");
+    assert!(
+      admittable >= asked,
+      "asked {asked}, admittable {admittable}"
+    );
+    assert!(
+      grown <= bound(lacked, unit, before),
+      "a {SEAL_TURN_BYTES}-byte lend grew the arena by {grown} bytes (lacked {lacked}, unit {unit}, capacity before \
+       {before}, slice arena {slice})"
+    );
+  }
+
+  /// Shape: the turns each shard lends in [`two_shards_lending_small_rooms_in_turn_are_both_admitted`]: enough that a
+  /// shard taking more than its turns need would reach the other's slice.
+  const TURNS: usize = 8;
+
+  /// A-848 (main 2026-11-21 17:20, case 2). Do: on a two-shard daemon, each shard in turn asks room for what its arena
+  /// can already admit plus one push seal's turn, [`TURNS`] times. Expect: every ask admitted (the shard's admittable
+  /// at least what it asked), and no turn growing a shard's arena past [`bound`].
+  #[test]
+  fn two_shards_lending_small_rooms_in_turn_are_both_admitted() {
+    let daemon = crate::daemon::audit_daemon_of(2);
+    for turn in 0..TURNS {
+      for partition in 0..2usize {
+        let ((asked, lacked, grown, before, admittable), unit) =
+          crate::daemon::observe_at(&daemon, partition, |state| {
+            (ask_one_turn(state), state.config.pool_unit())
+          });
+        assert!(
+          admittable >= asked,
+          "turn {turn}, shard {partition}: asked {asked}, admittable {admittable}"
+        );
+        assert!(
+          grown <= bound(lacked, unit, before),
+          "turn {turn}, shard {partition}: grew the arena by {grown} (lacked {lacked}, unit {unit}, before {before})"
+        );
+      }
+    }
   }
 }

@@ -2194,3 +2194,75 @@ fn stock_hg_pushes_large_files_and_the_daemon_keeps_serving() {
     "the clone holds both changesets"
   );
 }
+
+/// Shape: the file the SSH clone carries: 16 MiB of noise, the fixture lane's `big16.bin`, whose 16,777,334-byte
+/// revision chunk the lane's SSH clone was cut inside (main's red of 2026-11-21 17:16, de3fd468a, release).
+const SSH_CLONE_FILE: (u64, usize) = (3, 16 << 20);
+
+/// The SSH clone truncation main found by use (goal 93 correctness; the hg fixture lane at de3fd468a, release: 9 SSH
+/// cases failed, the clone cut at 4,103,588 of a 16,777,334-byte chunk, another run at 3,473,588; HTTP passed every
+/// case). Do: over the SSH edge, push one changeset carrying 16 MiB of noise with stock hg 7.2, then clone it over SSH
+/// and verify the clone. Expect the push and the clone to exit 0, the clone to hold the changeset and `hg verify` to
+/// pass. Ignored: a by-use test main runs (run-requests.md), a debug build's push of the file taking minutes.
+#[test]
+#[ignore = "by use, main's rounds"]
+#[allow(clippy::disallowed_methods)]
+fn stock_hg_clones_a_large_file_whole_over_the_ssh_edge() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping stock hg's large SSH clone: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)"
+    );
+    return;
+  };
+  let scratch = Scratch::new("hg-ssh-large");
+  let Some((key, public)) = fresh_key(&scratch) else {
+    eprintln!("skipping stock hg's large SSH clone: no ssh-keygen here");
+    return;
+  };
+  let instance = format!("hg-ssh-large-{}", std::process::id());
+  let started = start_anchor(&instance, &["--vcs-ssh", "127.0.0.1:0"]);
+  let (port, fingerprint) = started
+    .lines
+    .iter()
+    .find_map(|line| ssh_edge_of(line))
+    .expect("the daemon named its SSH edge's port and host key");
+  let Some(issuer) = issuer_of(&started, "stock hg's large SSH clone") else {
+    return;
+  };
+  let known_hosts = known_hosts(&scratch, port, &fingerprint);
+  create_hg_repository(&instance, "r");
+  let (code, out, err) = slates(&instance, &issuer, &["credential", "key", &public]);
+  assert_eq!(code, 0, "credential key: {out}{err}");
+  let config = vec!["--config".to_owned(), ssh_command(&key, &known_hosts)];
+  let url = format!("ssh://{HG_USER}@127.0.0.1:{port}/r");
+  let source = format!("{}/source", scratch.path);
+  hg_ok(&hg, &scratch.path, &["init", &source]);
+  let (seed, len) = SSH_CLONE_FILE;
+  std::fs::write(format!("{source}/large"), noise(seed, len)).unwrap();
+  hg_ok(
+    &hg,
+    &source,
+    &["commit", "--addremove", "--message", "large"],
+  );
+  let (code, out, err) = hg_in_within(
+    &hg,
+    &source,
+    &with_config(&["push", &url], &config),
+    LARGE_PUSH_PATIENCE,
+  );
+  assert_eq!(code, 0, "the large push over SSH: {out}{err}");
+  let copy = format!("{}/copy", scratch.path);
+  let (code, out, err) = hg_in_within(
+    &hg,
+    &scratch.path,
+    &with_config(&["clone", "-U", &url, &copy], &config),
+    LARGE_PUSH_PATIENCE,
+  );
+  assert_eq!(code, 0, "the large clone over SSH: {out}{err}");
+  assert_eq!(
+    hg_nodes(&hg, &copy),
+    hg_nodes(&hg, &source),
+    "the clone holds the changeset"
+  );
+  hg_ok(&hg, &copy, &["verify"]);
+}
