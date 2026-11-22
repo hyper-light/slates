@@ -1,0 +1,51 @@
+name: diag measurer
+# main 01a20182 (2026-11-22 02:23 PST): w-interop's revprop-http row (61f26030b, cherry-picked onto origin/main 059578d78)
+# proved by the whole svn matrix, over both main routes, on macos-latest with Homebrew's stock Subversion 1.15.0. Its own
+# proving run was on the big Studio, which kiln's hung API no longer reaches. The dump is the repository's fixture
+# (crates/svn/fixtures/dump/full.dump, 14 revisions under trunk/). Run only from `diag-measurer-*` branches, never main;
+# every log is an artifact.
+
+on:
+  push:
+    branches: ["diag-measurer-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  svn-matrix:
+    name: svn matrix (macos-latest)
+    runs-on: macos-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      # The same tool ci.yml's macOS suite lane installs.
+      - name: Stock Subversion
+        run: brew install subversion && svn --version --quiet
+      - name: Build
+        run: cargo build --release --locked -p slates-cli --bin slates
+      - name: The matrix over each main route
+        run: |
+          set +e; rc=0
+          for route in svn http; do
+            echo "== route $route $(date -u +%FT%TZ)"
+            ROUTE=$route STEP_LIMIT=600 ci/interop/svn-matrix.sh "$PWD/target/release/slates" \
+              crates/svn/fixtures/dump/full.dump "$RUNNER_TEMP/matrix-$route" 2>&1 | tee "$RUNNER_TEMP/matrix-$route.out"
+            r=${PIPESTATUS[0]}; echo "route $route exit $r"; [ $r -eq 0 ] || rc=1
+          done
+          exit $rc
+      - name: Keep the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: svn-matrix-logs
+          path: |
+            ${{ runner.temp }}/matrix-*.out
+            ${{ runner.temp }}/matrix-*/logs
+          if-no-files-found: warn
