@@ -1,5 +1,5 @@
-//! A repository's decayed rates of works and bytes, whose decay is learned from the repository's own inter-arrival
-//! times (A-724 piece 2; §4.17.5 "Learned demand"; §4.17.1 "Every tunable is learned online").
+//! A repository's learned demand: its decayed rates of works and bytes and the bytes a work brings, whose decay is
+//! learned from the repository's own works (A-724 piece 2; §4.17.5 "Learned demand"; §4.17.1 "Every tunable is learned online").
 //!
 //! **What it is.** §4.17.5's shares weigh each repository by what it actually does now: how many works arrive a second
 //! and how many bytes they bring. A count since the start weighs last month like the last minute, and a window or a
@@ -20,14 +20,23 @@
 //! rungs, whose intensity has fallen by then; on 3,000 Poisson arrivals at 10 a second it chose a horizon of 1.3 gaps
 //! and read 18.8 a second. With the integral it chose 84 gaps and read 9.9.
 //!
-//! **Bytes** are kept on every rung beside the works and read at the chosen horizon. So is the miss-ratio curve's
-//! aging: [`Rates::keep`] is `e^{-elapsed/τ}`, what `crate::mrc::Curve::decay` takes.
+//! **Bytes a work** (§4.17.5's demand: what the next work will claim; it replaces A-724 piece 2a's `Learned`, so a
+//! repository has one learned demand). Each rung keeps the decayed mean of its works' bytes beside their count, and the
+//! same ladder chooses a second horizon for it: the rung whose mean would have predicted each work's bytes best, by
+//! squared error (the proper score for a mean), its sums decayed as the gaps' are. The arrival horizon cannot serve:
+//! a steady rhythm makes the longest rung the most likely, and 100 small intakes then three 64 times larger at that
+//! rhythm would read about 2.8 small where the shard must expect the large. Among equal scores, which only an
+//! unchanging size gives, the shortest rung wins (equal evidence goes to the most recent past): so a new size is read
+//! from the first work that brings it, and a work after a silence outweighs what came before it. A mean is a convex
+//! combination of the bytes seen, so the estimate never leaves their range; a first work's bytes are the first value.
+//! Bytes a second are the arrival horizon's works a second times its mean. The miss-ratio curve's aging is the
+//! arrival horizon's too: [`Rates::keep`] is `e^{-elapsed/τ}`, what `crate::mrc::Curve::decay` takes.
 //!
 //! **A principal's rates** ([`Decayed`]) are one decayed count each, read at its repository's horizon: a repository
 //! keeps its principals in a Space-Saving summary of bounded slots (`crate::usage`), and a ladder a slot would cost each
 //! of them its rungs.
 //!
-//! **Before any gap** there is no rate to read: [`Rates::works_per_s`] answers `None` until a second arrival, and the
+//! **Before any gap** there is no rate to read: [`Rates::works_per_s`] answers `None` until a second work, and the
 //! caller takes its first value from the work in hand (§4.17.1: that work's size at the rate this machine was measured
 //! to do it), never a literal. Arithmetic is in `f64`, where nothing panics; times are the caller's clock in
 //! nanoseconds.
@@ -43,139 +52,140 @@ const MOST_RUNGS: usize = 64;
 struct Rung {
   /// Its time constant, in nanoseconds.
   tau_ns: f64,
-  /// Its decayed count of works, as of the last arrival.
+  /// Its decayed count of works, as of the last work.
   works: f64,
-  /// Its decayed count of bytes, as of the last bytes counted.
-  bytes: f64,
+  /// Its decayed mean bytes a work: the works' bytes weighted as their counts are, kept as a mean so a steady size is
+  /// held exactly.
+  mean: f64,
   /// Its summed log-likelihood of the gaps it predicted, decayed at the slowest rung's pace.
   score: f64,
+  /// Its summed squared error predicting each work's bytes by its mean, negated (higher is better), decayed alike.
+  size_score: f64,
 }
 
-/// A repository's rates (module docs).
+/// A repository's learned demand of one kind of work (module docs).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Rates {
   /// The clock grain the ladder starts at, in nanoseconds (at least one).
   base_ns: u64,
-  /// The first arrival's time.
+  /// The first work's time.
   first_ns: Option<u64>,
-  /// The last bytes' time: what the bytes are kept as of.
-  last_bytes_ns: u64,
-  /// The last arrival's time: what the works are kept as of, and where the next gap is measured from.
-  last_arrival_ns: u64,
+  /// The last work's time: what the counts are kept as of, and where the next gap is measured from.
+  last_ns: u64,
   /// The rungs, shortest first.
   rungs: Vec<Rung>,
-  /// The rung chosen as the horizon.
+  /// The rung chosen as the horizon of the rates.
   chosen: usize,
-  /// Whether a gap has been scored.
-  scored: bool,
+  /// The rung chosen as the horizon of the bytes a work.
+  sized: usize,
+  /// Works seen.
+  works: u64,
 }
 
 impl Rates {
-  /// Rates with no arrival yet, their ladder starting at `base_ns` (the caller's clock grain; at least one).
+  /// No work yet, the ladder starting at `base_ns` (the caller's clock grain; at least one).
   pub fn new(base_ns: u64) -> Rates {
     Rates {
       base_ns: base_ns.max(1),
       first_ns: None,
-      last_bytes_ns: 0,
-      last_arrival_ns: 0,
+      last_ns: 0,
       rungs: Vec::new(),
       chosen: 0,
-      scored: false,
+      sized: 0,
+      works: 0,
     }
   }
 
-  /// One work arrived at `now_ns`: each rung scores the gap since the last arrival, the horizon is chosen again, and
-  /// each rung counts it.
-  pub fn arrival(&mut self, now_ns: u64) {
+  /// One work answered at `now_ns`, having brought `bytes` (module docs): each rung scores the gap since the last work
+  /// and its prediction of these bytes, both horizons are chosen again, and each rung counts it.
+  pub fn answered(&mut self, now_ns: u64, bytes: u64) {
+    let sample = crate::share::amount_of(bytes);
+    self.works = self.works.saturating_add(1);
     let Some(first) = self.first_ns else {
       self.first_ns = Some(now_ns);
-      self.last_arrival_ns = now_ns;
+      self.last_ns = now_ns;
       self.grow(0);
       for rung in &mut self.rungs {
         rung.works = 1.0;
+        rung.mean = sample;
       }
       return;
     };
-    let gap = now_ns.saturating_sub(self.last_arrival_ns) as f64;
+    let gap = crate::share::amount_of(now_ns.saturating_sub(self.last_ns));
     self.grow(now_ns.saturating_sub(first).max(1));
     let slowest = self.rungs.last().map_or(0.0, |rung| rung.tau_ns);
     let fade = (-gap / slowest).exp();
     for rung in &mut self.rungs {
-      // The gap's log-likelihood under the intensity the arrivals before it predict, `c e^{-s/τ} / τ` from the last
-      // arrival, `c` the count then: the intensity at this arrival, less its integral over the gap, `c (1 - e^{-gap/τ})`.
+      // The gap's log-likelihood under the intensity the works before it predict, `c e^{-s/τ} / τ` from the last
+      // work, `c` the count then: the intensity at this work, less its integral over the gap, `c (1 - e^{-gap/τ})`.
       let decay = (-gap / rung.tau_ns).exp();
       let intensity = (rung.works * decay / rung.tau_ns).max(f64::MIN_POSITIVE);
       let compensator = rung.works * (1.0 - decay);
       rung.score = rung.score * fade + (intensity.ln() - compensator);
-      rung.works = rung.works * decay + 1.0;
+      let miss = sample - rung.mean;
+      rung.size_score = rung.size_score * fade - miss * miss;
+      let kept = rung.works * decay;
+      rung.works = kept + 1.0;
+      rung.mean += miss / rung.works;
     }
-    self.scored = true;
-    self.last_arrival_ns = self.last_arrival_ns.max(now_ns);
-    self.chosen = self
-      .rungs
-      .iter()
-      .enumerate()
-      .max_by(|(_, left), (_, right)| left.score.total_cmp(&right.score))
-      .map_or(0, |(at, _)| at);
+    self.last_ns = self.last_ns.max(now_ns);
+    self.chosen = best(self.rungs.iter().map(|rung| rung.score));
+    self.sized = best(self.rungs.iter().map(|rung| rung.size_score));
   }
 
-  /// `bytes` the repository's works brought at `now_ns`, counted on every rung.
-  pub fn bytes(&mut self, now_ns: u64, bytes: u64) {
-    let gap = now_ns.saturating_sub(self.last_bytes_ns) as f64;
-    for rung in &mut self.rungs {
-      let decay = (-gap / rung.tau_ns).exp();
-      rung.bytes = rung.bytes * decay + bytes as f64;
-    }
-    self.last_bytes_ns = self.last_bytes_ns.max(now_ns);
+  /// Works seen.
+  pub fn works(&self) -> u64 {
+    self.works
   }
 
-  /// The horizon chosen, in nanoseconds: the time constant the rates are read at. `None` before a gap was scored.
-  pub fn horizon_ns(&self) -> Option<f64> {
-    if !self.scored {
+  /// The bytes the next work is expected to bring (module docs, "Bytes a work"): `None` before any work, the first
+  /// work's own bytes until a second, then the mean at the size horizon. Always within the range of the bytes seen.
+  pub fn bytes_per_work(&self) -> Option<u64> {
+    if self.works == 0 {
       return None;
     }
-    self.rungs.get(self.chosen).map(|rung| rung.tau_ns)
+    self
+      .rungs
+      .get(self.sized)
+      .map(|rung| crate::share::whole_units(rung.mean.round()))
+  }
+
+  /// The horizon chosen for the rates, in nanoseconds. `None` before a gap was scored.
+  pub fn horizon_ns(&self) -> Option<f64> {
+    self.scored()?.get(self.chosen).map(|rung| rung.tau_ns)
   }
 
   /// Works a second at `now_ns`, at the horizon. `None` before a gap was scored (module docs, "Before any gap").
   pub fn works_per_s(&self, now_ns: u64) -> Option<f64> {
-    let rung = self.chosen_rung()?;
-    Some(Self::at(
-      rung.works,
-      rung.tau_ns,
-      now_ns.saturating_sub(self.last_arrival_ns),
-    ))
+    let rung = self.scored()?.get(self.chosen)?;
+    Some(self.at(rung.works, rung.tau_ns, now_ns))
   }
 
-  /// Bytes a second at `now_ns`, at the horizon. `None` before a gap was scored.
+  /// Bytes a second at `now_ns`, at the horizon: the works a second times their mean there. `None` before a gap.
   pub fn bytes_per_s(&self, now_ns: u64) -> Option<f64> {
-    let rung = self.chosen_rung()?;
-    Some(Self::at(
-      rung.bytes,
-      rung.tau_ns,
-      now_ns.saturating_sub(self.last_bytes_ns),
-    ))
+    let rung = self.scored()?.get(self.chosen)?;
+    Some(self.at(rung.works * rung.mean, rung.tau_ns, now_ns))
   }
 
   /// What a count kept since `elapsed_ns` ago keeps at the horizon, `e^{-elapsed/τ}` in `[0, 1]`: the miss-ratio
   /// curve's aging (`crate::mrc::Curve::decay`). One (keep everything) before a gap was scored.
   pub fn keep(&self, elapsed_ns: u64) -> f64 {
     self.horizon_ns().map_or(1.0, |tau| {
-      (-(elapsed_ns as f64) / tau).exp().clamp(0.0, 1.0)
+      (-crate::share::amount_of(elapsed_ns) / tau)
+        .exp()
+        .clamp(0.0, 1.0)
     })
   }
 
-  /// The chosen rung, once a gap was scored.
-  fn chosen_rung(&self) -> Option<&Rung> {
-    if !self.scored {
-      return None;
-    }
-    self.rungs.get(self.chosen)
+  /// The rungs, once a gap was scored.
+  fn scored(&self) -> Option<&[Rung]> {
+    (self.works > 1).then_some(self.rungs.as_slice())
   }
 
-  /// `count`, kept as of `since_ns` ago on a rung of time constant `tau_ns`, read as a rate a second now.
-  fn at(count: f64, tau_ns: f64, since_ns: u64) -> f64 {
-    count * (-(since_ns as f64) / tau_ns).exp() / tau_ns * NANOS_PER_SECOND
+  /// `count`, kept as of the last work on a rung of time constant `tau_ns`, read as a rate a second at `now_ns`.
+  fn at(&self, count: f64, tau_ns: f64, now_ns: u64) -> f64 {
+    let since = crate::share::amount_of(now_ns.saturating_sub(self.last_ns));
+    count * (-since / tau_ns).exp() / tau_ns * NANOS_PER_SECOND
   }
 
   /// Adds the rungs whose time constant the repository's `age_ns` has reached, and the one after them, each a copy of
@@ -190,22 +200,34 @@ impl Rates {
         return;
       };
       if let Some(last) = self.rungs.last()
-        && last.tau_ns > age_ns as f64
+        && last.tau_ns > crate::share::amount_of(age_ns)
       {
         return;
       }
       let template = self.rungs.last().copied().unwrap_or(Rung {
         tau_ns: 0.0,
         works: 0.0,
-        bytes: 0.0,
+        mean: 0.0,
         score: 0.0,
+        size_score: 0.0,
       });
       self.rungs.push(Rung {
-        tau_ns: tau as f64,
+        tau_ns: crate::share::amount_of(tau),
         ..template
       });
     }
   }
+}
+
+/// The index of the best score, the first (shortest rung) among equals: equal evidence goes to the most recent past.
+fn best(scores: impl Iterator<Item = f64>) -> usize {
+  let mut chosen: Option<(usize, f64)> = None;
+  for (at, score) in scores.enumerate() {
+    if chosen.is_none_or(|(_, held)| score > held) {
+      chosen = Some((at, score));
+    }
+  }
+  chosen.map_or(0, |(at, _)| at)
 }
 
 /// A principal's decayed counts of works and bytes, read at its repository's horizon (module docs).

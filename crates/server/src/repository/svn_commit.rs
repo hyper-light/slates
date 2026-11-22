@@ -232,7 +232,7 @@ impl Uncommitted {
 /// The commit is counted as its repository's intake (A-724 piece 3c, §4.17.5): live among the shard's intakes while it
 /// lands (`crate::vcs_share::Live`, so other repositories' rooms are divided meanwhile), begun on the repository's usage
 /// row with its principal, and answered there with its texts' bytes, learned as the repository's next intake
-/// (`slates_vcs::Learned`), once it comes to an answer.
+/// (`slates_vcs::Rates`), once it comes to an answer.
 pub(crate) async fn land_work(
   (principal, repository): (&Principal, RepositoryId),
   work: Work,

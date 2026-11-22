@@ -1372,7 +1372,7 @@ pub(crate) struct Forked {
 /// The push is counted as its repository's intake (A-724 piece 3c, §4.17.5): live among the shard's intakes from its
 /// start until it ends however it ends (`crate::vcs_share::Live`, so other repositories' rooms are divided while it
 /// runs), begun on the repository's usage row with its principal, and answered there with its bundle's bytes, learned
-/// as the repository's next intake (`slates_vcs::Learned`), once it comes to an answer.
+/// as the repository's next intake (`slates_vcs::Rates`), once it comes to an answer.
 pub(crate) async fn unbundle(
   repository: RepositoryId,
   pushing: Pushing<'_>,

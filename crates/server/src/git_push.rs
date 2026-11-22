@@ -234,7 +234,7 @@ pub(crate) struct ReceivePack<P = Unpresented> {
   /// What bound the push's room when it began (`crate::vcs_share::Bound`): a refusal past it is typed by it.
   room_bound: crate::vcs_share::Bound,
   /// The client's bytes this push read, in all: what it brought, learned as its repository's demand once it is answered
-  /// (A-724 piece 2, `slates_vcs::Learned`).
+  /// (A-724 piece 2, `slates_vcs::Rates`).
   read_bytes: u64,
   /// The push counted decoding on its shard until it drops (A-724, `crate::vcs_share::place`): the load the placement
   /// of A-722's intake off the owner shard reads.
