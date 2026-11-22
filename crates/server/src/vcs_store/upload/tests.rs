@@ -965,7 +965,7 @@ fn t_goal93_a_repositorys_let_go_pack_is_made_resident_before_it_is_read() {
       header,
       parts
     ));
-    let _ = crate::vcs_store::within_budget(state, 0, |stores| {
+    crate::vcs_store::within_budget(state, 0, |stores| {
       let content = stores.content_mut().unwrap();
       let ids: Vec<ContentId> = bytes.chunks(window).map(ContentId::of).collect();
       for id in &ids {

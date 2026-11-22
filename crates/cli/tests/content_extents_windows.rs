@@ -203,10 +203,8 @@ fn terminate(pid: u32) {
   // SAFETY: `process` stays owned for the call.
   assert_ne!(unsafe { TerminateProcess(process.as_raw_handle(), 1) }, 0);
   // SAFETY: `process` stays owned for the wait.
-  assert_eq!(
-    unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) },
-    WAIT_OBJECT_0
-  );
+  let waited = unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) };
+  assert_eq!(waited, WAIT_OBJECT_0);
 }
 
 /// A volume of `bounded` bytes made through the CLI and attached for writing: its id and the attachment.

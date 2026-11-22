@@ -3758,6 +3758,11 @@
 > back). Then the import's sink keeps one window buffer for all its texts (`ContentStore::begin_object_reusing`,
 > `objects_begun_in_turn_on_one_buffer_never_make_another`): 142.3 MB to 130.7 MB sampled. Next, largest first: the
 > engine's `push_slice` (two sites), `Increment::encode`, `judge_held`; the content store's `release_one` (w-shared's).
+> The engine's splice sizes its file once at what it makes (`engine::made_len`;
+> `a_splice_makes_its_bytes_in_one_buffer_of_their_length`, 6,000 bytes held for 4,000, now 4,000): dead even on the
+> import, which replaces files whole (130.7 to 130.8 MB sampled), and on 300 partial splices over 200 files of 64 KiB
+> 43,945,798 B allocated before, 21,594,432 B after (w-svn's local probe, main's ruling of 11:05). Next (main's ruling):
+> the svn landing names its stored texts as A-760 runs, in three pieces.
 > Still to measure: the A-742 floor's A/B only if the
 > footprint still stays (main's ruling). A local 64 KiB floor gave 47 MB of footprint at 2 s idle, against 363 MB, at
 > 19.4 s against 12.0 s (debug).
