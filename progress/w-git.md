@@ -449,3 +449,11 @@
   Main is now kiln agent 01a1ff311fc972a8a0f720e354891538 (agents_send). NEXT (main's order): (1) refs to blobs and tag
   objects refused (junio-gpg-pub, v1.0rc1..rc6), red first; (2) whole-clone "possible repository corruption"; (3) push
   50-52 s vs 9.6-10.2 s, shallow clone 3.82 vs 0.90 s, A/B all rounds. Then the sliced change step (A-824 owed).
+- 2026-11-21 late: A-836 LANDED b61cdf8d1 (refs to any object: tag chains peeled, blob refs at the empty tree; t_a836).
+  A-824's sliced change step LANDED 9b46d364f (PreviewChange a slice a turn; t_a824_a_made_commits_map_…; counter
+  vcs_commits.made_map_turns). Piece 3 series DONE.
+  (2) whole-clone abort: w-sessionlog's red by use (inbox/w-git-from-w-sessionlog-clone-corruption.md): master + many
+  annotated tags of master commits aborts; master alone / + one tag clones. Not the refused refs. My unit red
+  t_goal93_a_whole_clone_of_a_line_with_an_annotated_tag_of_every_commit_is_whole (uncommitted, w-git-p2): 40 tags of a
+  line, encode to idle, fetch all: PASSES with flat blobs (41 versions in 5,191 turns: each tag's first version encodes
+  everything it reaches, O(tags x history) -- a perf/RSS finding to report); now trying delta-heavy content.
