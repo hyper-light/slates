@@ -58,12 +58,14 @@ jobs:
           for i in $(seq $(( $(nproc) * 2 ))); do (while :; do :; done) & done
           sleep 20; echo "load with burners $(cat /proc/loadavg)"
           set +e
-          PUSH_CHUNK=500 HG="$RUNNER_TEMP/hgvenv/bin/hg" STEP_LIMIT=2400 ci/interop/hg-matrix.sh "$PWD/target/release/slates" "$RUNNER_TEMP/hg-src" "$RUNNER_TEMP/matrix-hg" 2>&1 | tee "$RUNNER_TEMP/matrix-hg.out"
+          HG="$RUNNER_TEMP/hgvenv/bin/hg" STEP_LIMIT=2400 ci/interop/hg-matrix.sh "$PWD/target/release/slates" "$RUNNER_TEMP/hg-src" "$RUNNER_TEMP/matrix-hg" 2>&1 | tee "$RUNNER_TEMP/matrix-hg.out"
           rc=${PIPESTATUS[0]}
           echo "load after $(cat /proc/loadavg)"
           A=$RUNNER_TEMP/matrix-hg/anchor.log
           echo "spins $(grep -cE 'is spinning' $A); kills $(grep -cE 'killing it' $A); restarts $(grep -cE 'daemon exited' $A)"
           grep -E 'is spinning|killing it' $A | cut -c1-300
+          echo "== held-ahead increments the content store refused (NoCapacity, StaleStage or Unstaged)"
+          grep "a push's increment held ahead was refused by the content store" $A | cut -c1-300 | sort | uniq -c | head -20 || true
           echo "== DIAG turns, by cpu"; grep 'DIAG hg-http turn' $A | sed 's/.*turn //' | sort -t= -k3 -n -r | head -20 || true
           echo "== DIAG begins over 10 ms cpu"; grep 'DIAG hg-http begin' $A | awk '{for(i=1;i<=NF;i++) if($i ~ /^cpu_us=/){split($i,a,"="); if (a[2] > 10000) print}}' | cut -c1-260 || true
           exit $rc
