@@ -444,3 +444,12 @@
 - VCS lane, Windows server (33e41f583, 4 threads): the process died with exit 4 after 4 tests. The watchdog wedged
   t_a767_c5's git push task; alone it passes in 0.81 s, so it's on w-bugs (concurrency in one process, not load).
   No server count on Windows.
+
+## 2026-11-21 round at 3a00d432d
+- Reds:
+  - server hg_push Landing::Unbuilt: boxed (large_enum_variant).
+  - grants.rs and partition/tests.rs: precedence.
+  - vcs content.rs and mrc.rs: two literals derived (size_of::<u64>(), 2^u64::BITS).
+- Focused local: vcs --lib 125, server hg_push|vcs_share 36. Fmt, structural, unsafe and the six cross targets were clean.
+- VCS lane: Linux r46 dropped (adacachy2 didn't answer the sync), so I resubmitted it once as r51. Windows: the counts
+  from the last round stand (crates green); the server's are blocked on w-bugs' watchdog exit.
