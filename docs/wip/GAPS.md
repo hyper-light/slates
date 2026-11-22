@@ -330,6 +330,23 @@
 > Owed: the sweeps at N=12 on each platform with each client (main's run request), each failure a red test to its
 > server's owner.
 >
+> **An index merge claimed the whole arena pool for its shard, and the other shard admitted nothing (goal 93
+> correctness; main's round of 2026-11-21 16:18: `vcs_concurrency::concurrent_stock_hg_pushes_hold` at N=10, the lone
+> seed push refused "unreadable request: PastAdmission { asked: 15, left: 0 }"). FIXED (w-hg).**
+> - Cause, logged: the N=10 repository lives on shard 1, whose `Store::admittable` was 0 (capacity 0, the pool's
+>   claimable 0), while shard 0 held all 45.8 GB. `vcs_store::index_upkeep::slice` lent each merge step
+>   `within_budget(state, state.store.admittable())`, and a lend grows the arena from the pool the shards share
+>   (`Store::make_room`) by what it is lent: one merge step grew shard 0's arena by 28.6 GB, every byte the pool had. No
+>   push leaked; the admission was right to refuse a shard with nothing.
+> - Fix: a merge step is lent what it can put, its tables cut so far (`Merge::cut_bytes`; only its last step puts them,
+>   the steps before cut a table into memory).
+> - Held by `index_upkeep::tests::a_{mercurial,git}_index_built_whole_is_merged_a_table_a_step_into_one_run` (red
+>   before: "a merge claimed the pool: grown 11453071360 of 11453071360"; non-vacuity, the pool had room to claim), and
+>   by use the concurrency round at N=2 then 10 (debug, MacBook).
+> - Siblings, git's (main routes): `git_hooks.rs` (`within_budget(state, room, ..)` for a push's seal) and
+>   `vcs_store.rs`'s `restage_turn` (`stage_room`) and `SealingPush::turn` (`self.room`) lend rooms that may be the
+>   whole admittable; each grows the arena by it. A lend should name its step's bytes.
+
 > **Goal 93 perf, hg serve (2026-11-21, w-perf; main's order 00:22 and ruling 01:05).** Found by a profile of a
 > one-changeset pull of Mercurial's history (24.95 s) and a stream clone (288 s): (1) every lookup in a
 > `slates_vcs::Index` walked every run, since the learned merge had no caller (155 runs after hg-src's import, 123 visited
