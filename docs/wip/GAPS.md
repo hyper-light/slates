@@ -2023,6 +2023,9 @@
 > **A-724 piece 2d part 3 (A-846): grants divided at the learning cadence, not yet read by admission**
 > (`vcs_share::grants`, `t_a724_the_grants_are_divided_at_the_learning_cadence_and_kept_between`). Open: `room` reading
 > them.
+> **A-724 piece 7 (A-849): the load proof's fetches** (`multi_repo_load.py --fetches`; harness daemons given a
+> `--vcs-store`, without which `repository create --tool git` failed since A-767 C5). Open: hg and svn in the mix; the
+> rounds (main's).
 > **A-724 piece 2c (A-846): memory by marginal utility built, not yet applied** (`slates_vcs::partition`, `cargo test
 > -p slates-vcs --lib partition::`, 4 of 4, macOS arm64, this Mac). Open: computed on the owner shard and published.
 >

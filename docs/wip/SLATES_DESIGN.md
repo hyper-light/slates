@@ -16552,6 +16552,13 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > room's admission reading it (a repository admitted against its grant, else the spare; agreed with A-724 piece 3's
 > side first), and pushes', Mercurial's and Subversion's reads feeding the curves.
 
+> **Status (2026-11-21, A-849: piece 7's proof gains fetches).** `crates/cli/bench/multi_repo_load.py --fetches`
+> seeds every repository with its class's pack, then sends Zipf-skewed protocol v2 fetches beside the pushes, each
+> class's fetch p50 and p99 against its fetch alone. The harnesses' daemons get their own `--vcs-store` (push_load's
+> `Daemon`), without which no git repository could be made since A-767 C5. Proved locally (debug, M-series Mac): a
+> push alone 2.3 s and a fetch alone 10.3 s of git/git v0.99 (4,507 objects), both whole; the steps are main's rounds.
+> Owed: Mercurial and Subversion repositories in the mix.
+
 > **Status (2026-11-21, A-846: piece 2's memory share by marginal utility).** `slates_vcs::partition`: a shard's room
 > divided among its repositories, each first guaranteed the lesser of A-188's floor (the room over the repositories
 > served now) and what its curve can use, the rest by Qureshi and Patt's lookahead (each next extension, ending at a
