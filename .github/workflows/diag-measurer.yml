@@ -1,7 +1,8 @@
 name: diag-measurer
 
-# w-k90-win, main's goal-93 Windows round 2 (never main): w-realtools' Windows-paths test and the git/git session over
-# the HTTP edge, release, at origin/main 40d816c29 (jupiter's store owner dies there, inbox/w-work-mount-from-w-k90-win-store-jupiter.md).
+# w-k90-win, main's goal-93 Windows rounds (never main): the git matrix at git/git v2.0.0 (w-perf's R3 restart-spin check:
+# the daemon's spins, kills and restarts counted from the anchor log) and the hg matrix over hg's own history, against
+# a Windows daemon with --vcs-store, release, origin/main 40d816c29. jupiter's store owner dies, so these run here.
 
 on:
   push:
@@ -11,10 +12,10 @@ env:
   CARGO_TERM_COLOR: never
 
 jobs:
-  round-2:
-    name: 93 round 2 (windows-latest)
+  matrices:
+    name: 93 matrices (windows-latest)
     runs-on: windows-latest
-    timeout-minutes: 240
+    timeout-minutes: 330
     defaults:
       run:
         shell: bash
@@ -24,27 +25,39 @@ jobs:
         with:
           toolchain: 1.98.1
       - uses: ilammy/setup-nasm@v1.5.2
-      - name: git/git, bare
-        run: git --version && git clone -q --bare https://github.com/git/git.git "$RUNNER_TEMP/git-git.git" && git -C "$RUNNER_TEMP/git-git.git" rev-list --all --count
-      - name: The two tests
+      - name: Sources and stock clients
+        run: |
+          python -m pip install --quiet uv
+          git clone -q https://github.com/git/git.git "$RUNNER_TEMP/git-src"
+          mkdir -p "$RUNNER_TEMP/bin"
+          printf '%s\n' '#!/bin/sh' 'exec uvx --quiet --from mercurial==7.2.4 hg "$@"' > "$RUNNER_TEMP/bin/hg"; chmod +x "$RUNNER_TEMP/bin/hg"
+          "$RUNNER_TEMP/bin/hg" --version | head -1
+          "$RUNNER_TEMP/bin/hg" clone -q https://repo.mercurial-scm.org/hg "$RUNNER_TEMP/hg-src" || echo "hg clone failed"
+      - name: Build (release)
         env:
           AWS_LC_SYS_PREBUILT_NASM: "0"
+        run: cargo build --release --locked -p slates-cli > build.log 2>&1 || { echo "::error title=build::$(grep -E '^error' build.log | head -5 | tr '\n' ' ')"; exit 1; }
+      - name: git matrix (v2.0.0) and hg matrix
         run: |
           set +e
-          cargo test --release --locked -p slates-cli --test git_interop -- --ignored --exact stock_git_carries_windows_paths_byte_identically --nocapture > paths.log 2>&1; p=$?
-          SLATES_TEST_GIT_DATASET="$(cygpath -w "$RUNNER_TEMP/git-git.git")" SLATES_TEST_GIT_EDGES=http timeout 9000 cargo test --release --locked -p slates-cli --test git_interop -- --ignored --exact stock_git_carries_a_whole_repository_over_each_edge --nocapture > gitgit.log 2>&1; g=$?
-          ps=$(grep -E "^test |test result|skipping|panicked" paths.log | tr '\n' ' ' | cut -c1-600)
-          gs=$(grep -E "^test |test result|skipping|panicked" gitgit.log | tr '\n' ' ' | cut -c1-600)
-          echo "::notice title=round 2::windows-paths exit=$p: $ps%0Agit/git exit=$g: $gs"
-          if [ $p -ne 0 ]; then echo "::error title=windows-paths failure::$(grep -E -A15 'panicked|^---- ' paths.log | head -40 | sed 's/%/%25/g' | awk 'BEGIN{ORS="%0A"}{print}')"; fi
-          if [ $g -ne 0 ]; then echo "::error title=git/git failure::$(grep -E -A15 'panicked|^---- ' gitgit.log | head -40 | sed 's/%/%25/g' | awk 'BEGIN{ORS="%0A"}{print}')"; fi
-          [ $p -eq 0 ] && [ $g -eq 0 ]
+          S="$(cygpath -w "$PWD/target/release/slates.exe")"
+          PUSH_REFS='v2.0.0^{commit}:refs/heads/master' timeout 7200 bash ci/interop/git-matrix.sh "$S" "$RUNNER_TEMP/git-src" "$RUNNER_TEMP/mx-git" > gitmx.txt 2>&1; g=$?
+          rows=$(grep -E "^(PASS|FAIL)" gitmx.txt | awk '{printf "%s %s %s; ", $1, $2, $3}')
+          restarts=$(grep -c "restarted as pid" "$RUNNER_TEMP/mx-git/anchor.log" 2>/dev/null); kills=$(grep -c -i "killed\|stuck" "$RUNNER_TEMP/mx-git/anchor.log" 2>/dev/null)
+          echo "::notice title=git matrix v2.0.0::exit=$g restarts=$restarts kills_or_stuck=$kills%0A$rows%0A$(tail -3 gitmx.txt | tr '\n' ' ')"
+          if [ -d "$RUNNER_TEMP/hg-src" ]; then
+            HG="$RUNNER_TEMP/bin/hg" timeout 7200 bash ci/interop/hg-matrix.sh "$S" "$RUNNER_TEMP/hg-src" "$RUNNER_TEMP/mx-hg" > hgmx.txt 2>&1; h=$?
+            rows=$(grep -E "^(PASS|FAIL)" hgmx.txt | awk '{printf "%s %s %s; ", $1, $2, $3}')
+            restarts=$(grep -c "restarted as pid" "$RUNNER_TEMP/mx-hg/anchor.log" 2>/dev/null)
+            echo "::notice title=hg matrix::exit=$h restarts=$restarts%0A$rows%0A$(tail -3 hgmx.txt | tr '\n' ' ')"
+          fi
+          for f in "$RUNNER_TEMP"/mx-git/*.log "$RUNNER_TEMP"/mx-hg/*.log; do :; done
+          mkdir -p logs; cp gitmx.txt hgmx.txt logs/ 2>/dev/null; cp -r "$RUNNER_TEMP/mx-git" logs/mx-git 2>/dev/null; cp -r "$RUNNER_TEMP/mx-hg" logs/mx-hg 2>/dev/null
+          for x in mx-git mx-hg; do for l in logs/$x/*.out logs/$x/*.log; do [ -f "$l" ] || continue; case "$l" in *anchor*) ;; *) if grep -q -i "fatal\|abort\|error" "$l"; then echo "::warning title=$x $(basename $l)::$(grep -i -m3 'fatal\|abort\|error' "$l" | tr '\n' ' ' | cut -c1-400)"; fi;; esac; done; done 2>/dev/null | head -20
       - name: Keep the logs
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
-          name: round-2-logs
-          path: |
-            paths.log
-            gitgit.log
+          name: matrices-logs
+          path: logs
           if-no-files-found: warn
