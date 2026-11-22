@@ -16509,6 +16509,22 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > marginal utility above A-188's floor, the CPU weights, and the owner shard reading content through it with the
 > shares published as a snapshot.
 
+> **Status (2026-11-21, A-845: piece 2's decayed rates).** `slates_vcs::rate::Rates`: works and bytes a second, the
+> decay learned from the repository's own gaps: a ladder of decayed counts at `base · 2^k` up to its age, each gap
+> scored by its Poisson log-likelihood (the intensity at the arrival less its integral over the gap), the best rung the
+> horizon; scale-free (doubled gaps double the horizon exactly); `keep` is the curve's aging; `Decayed`, a principal's,
+> read at its repository's horizon. Owed: feeding both on the owner shard (`slates_vcs::usage`, beside A-724 piece 2's
+> `Learned`, after main's split of A-724 between w-balance and w-multirepo).
+
+> **Status (2026-11-21, A-846: piece 2's memory share by marginal utility).** `slates_vcs::partition`: a shard's room
+> divided among its repositories, each first guaranteed the lesser of A-188's floor (the room over the repositories
+> served now) and what its curve can use, the rest by Qureshi and Patt's lookahead (each next extension, ending at a
+> curve's bin edge, to the repository saving the most misses a second per byte); room no curve would use returned as
+> spare to lend. Held to brute force on straight curves (within 1%), a scan's step won over a steadier neighbour, a flat
+> curve given nothing. The floor is a guarantee, not a grant: given whole, `room / n` each left nothing to divide.
+> Owed: the CPU weights (WFQ by learned demand capped at use), and the owner shard computing it at its learning cadence
+> and publishing the shares as an immutable snapshot.
+
 **Role.** One slates server serves many repositories at once, from toys to monorepos the size of Google's or Meta's,
 several of those at once, and divides its memory, its CPU, its admission and its placement among them by what their
 agents and clients actually do (Ada, 2026-11-20). No repository has a fixed share: every share is a stated formula
