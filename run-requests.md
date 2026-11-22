@@ -7469,3 +7469,9 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   beat_late 0. The same run's local submit (the bench's second half) still exits 4 at 512 MiB until w-work-cow's
   slicing lands: that is the local route's proof, a separate entry after it lands, not this one.
 - Last measured (kiln r2, Mac Studio-3, load 2-4, 5 rounds): holder 5/5 at 320 and 512, beat_late none.
+- 2026-11-21 (round at ed4661d40), Linux VCS lane failed again: r36 dropped (adacachy didn't answer in 15 s); its
+  resubmit r38 on adacachy2 ran 34 min and "the kiln runner closed the connection". ~/w-lint-vcs-shallow is broken (a
+  `git clone --depth 1` over https that never finished) and there's no log. Three tries this afternoon (sync, full clone,
+  shallow clone) have all died while the code was being brought to adacachy2. Owner: the runner path (adacachy2's
+  GitHub reach or kiln's link), not a slates test. What would unblock it: a working slates checkout on a Linux x86_64
+  runner that I may fetch into.

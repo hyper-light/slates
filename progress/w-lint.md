@@ -427,3 +427,4 @@
 - VCS lane, Windows (jupiter, 19ad3d506): git/hg/svn/vcs didn't build (aws-lc-sys needs NASM, missing there; next try
   AWS_LC_SYS_NO_ASM=1). Server vcs_/git_/hg_/svn_: the process died with exit 4 when the watchdog wedged a shard under
   parallel load. The hg_push test it hit passes alone (r41), so it went to w-bugs. Linux: r38 still running.
+- VCS lane, Linux: r38 (the resubmit of r36) died with its clone broken after 34 min; in run-requests.md. No Linux count yet.
