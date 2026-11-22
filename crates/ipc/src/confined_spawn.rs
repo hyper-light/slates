@@ -145,45 +145,73 @@ fn flags(own_group: bool) -> io::Result<libc::c_short> {
   libc::c_short::try_from(flags).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
 }
 
-/// The spawn's file actions and attributes, destroyed when it ends.
-struct Prepared {
-  actions: libc::posix_spawn_file_actions_t,
-  attributes: libc::posix_spawnattr_t,
-}
+/// A spawn's file actions, initialised in boxed storage that does not move (the record may hold its own address on some
+/// libcs), destroyed when dropped: a value exists only once its `init` succeeded, so a failed `init` leaves nothing.
+struct FileActions(Box<libc::posix_spawn_file_actions_t>);
 
-impl Drop for Prepared {
-  fn drop(&mut self) {
-    // SAFETY: both were initialised by `prepare` (it builds this value only once both `init` calls succeeded) and are
-    // destroyed once, here.
+impl FileActions {
+  /// Initialised file actions.
+  fn new() -> io::Result<Self> {
+    let mut storage = Box::new(std::mem::MaybeUninit::<libc::posix_spawn_file_actions_t>::uninit());
+    // SAFETY: `init` writes the record at the pointer, the box's own storage; only when it answered 0 is the storage
+    // read as initialised (`assume_init`), and a failed `init` leaves an uninitialised box, which drops as one.
     unsafe {
-      libc::posix_spawn_file_actions_destroy(&raw mut self.actions);
-      libc::posix_spawnattr_destroy(&raw mut self.attributes);
+      checked(libc::posix_spawn_file_actions_init(storage.as_mut_ptr()))?;
+      Ok(Self(storage.assume_init()))
     }
   }
+
+  /// The record, for the calls that take it.
+  fn raw(&mut self) -> *mut libc::posix_spawn_file_actions_t {
+    &raw mut *self.0
+  }
+}
+
+impl Drop for FileActions {
+  fn drop(&mut self) {
+    // SAFETY: the record was initialised (`new` makes no value otherwise) and is destroyed once, here.
+    unsafe { libc::posix_spawn_file_actions_destroy(&raw mut *self.0) };
+  }
+}
+
+/// A spawn's attributes, as [`FileActions`] are held.
+struct Attributes(Box<libc::posix_spawnattr_t>);
+
+impl Attributes {
+  /// Initialised attributes.
+  fn new() -> io::Result<Self> {
+    let mut storage = Box::new(std::mem::MaybeUninit::<libc::posix_spawnattr_t>::uninit());
+    // SAFETY: as for [`FileActions::new`], for the attributes' record.
+    unsafe {
+      checked(libc::posix_spawnattr_init(storage.as_mut_ptr()))?;
+      Ok(Self(storage.assume_init()))
+    }
+  }
+
+  /// The record, for the calls that take it.
+  fn raw(&mut self) -> *mut libc::posix_spawnattr_t {
+    &raw mut *self.0
+  }
+}
+
+impl Drop for Attributes {
+  fn drop(&mut self) {
+    // SAFETY: the record was initialised (`new` makes no value otherwise) and is destroyed once, here.
+    unsafe { libc::posix_spawnattr_destroy(&raw mut *self.0) };
+  }
+}
+
+/// The spawn's file actions and attributes, each its own owner.
+struct Prepared {
+  actions: FileActions,
+  attributes: Attributes,
 }
 
 /// The file actions and attributes of `spawn` (module docs), `directory` and the null device's path the C strings they
 /// copy.
 fn prepare(spawn: &Spawn<'_>, directory: &CString, null: &CString) -> io::Result<Prepared> {
-  // SAFETY: zeroed storage for the two opaque records, each initialised by its own `init` call below before any other
-  // use; on Apple both are pointers, on Linux plain structs, and either is valid zeroed until `init` writes it.
-  let mut prepared: Prepared = unsafe { std::mem::zeroed() };
-  // SAFETY: `init` writes the record it is given, this frame's own. Were it to fail, nothing would need destroying, so
-  // the value is forgotten rather than dropped.
-  let actions = unsafe { libc::posix_spawn_file_actions_init(&raw mut prepared.actions) };
-  if actions != 0 {
-    std::mem::forget(prepared);
-    return Err(io::Error::from_raw_os_error(actions));
-  }
-  // SAFETY: as above, for the attributes; on failure the actions, made just above, are destroyed and the value
-  // forgotten.
-  let attributes = unsafe { libc::posix_spawnattr_init(&raw mut prepared.attributes) };
-  if attributes != 0 {
-    // SAFETY: the actions were initialised above and are destroyed once.
-    unsafe { libc::posix_spawn_file_actions_destroy(&raw mut prepared.actions) };
-    std::mem::forget(prepared);
-    return Err(io::Error::from_raw_os_error(attributes));
-  }
+  let mut actions = FileActions::new()?;
+  let mut attributes = Attributes::new()?;
   let streams = [
     (libc::STDIN_FILENO, spawn.stdin, libc::O_RDONLY),
     (libc::STDOUT_FILENO, spawn.stdout, libc::O_WRONLY),
@@ -194,29 +222,20 @@ fn prepare(spawn: &Spawn<'_>, directory: &CString, null: &CString) -> io::Result
       // SAFETY: the actions are initialised; `fd` is the caller's open descriptor, borrowed for this call and the spawn
       // after it (the caller's `Spawn` outlives both), duplicated to `number` in the child.
       ChildStream::Fd(fd) => unsafe {
-        libc::posix_spawn_file_actions_adddup2(&raw mut prepared.actions, fd.as_raw_fd(), number)
+        libc::posix_spawn_file_actions_adddup2(actions.raw(), fd.as_raw_fd(), number)
       },
       // SAFETY: the actions are initialised; `null` is a NUL-terminated path the action copies.
       ChildStream::Null => unsafe {
-        libc::posix_spawn_file_actions_addopen(
-          &raw mut prepared.actions,
-          number,
-          null.as_ptr(),
-          mode,
-          0,
-        )
+        libc::posix_spawn_file_actions_addopen(actions.raw(), number, null.as_ptr(), mode, 0)
       },
     };
     checked(answer)?;
   }
   // SAFETY: the actions are initialised; `directory` is a NUL-terminated path the action copies.
-  checked(unsafe {
-    posix_spawn_file_actions_addchdir_np(&raw mut prepared.actions, directory.as_ptr())
-  })?;
-  // SAFETY: the attributes are initialised; the flags are `<spawn.h>`'s.
+  checked(unsafe { posix_spawn_file_actions_addchdir_np(actions.raw(), directory.as_ptr()) })?;
   let flags = flags(spawn.own_group)?;
   // SAFETY: the attributes are initialised; the flags are `<spawn.h>`'s.
-  checked(unsafe { libc::posix_spawnattr_setflags(&raw mut prepared.attributes, flags) })?;
+  checked(unsafe { libc::posix_spawnattr_setflags(attributes.raw(), flags) })?;
   // SAFETY: two signal sets in this frame, zeroed and then made valid by `sigemptyset` before any other use (`sigaddset`
   // adds `SIGPIPE` to one); the attribute calls take the initialised attributes and copy the sets. The calls' answers
   // are each checked after.
@@ -226,17 +245,20 @@ fn prepare(spawn: &Spawn<'_>, directory: &CString, null: &CString) -> io::Result
     libc::sigemptyset(&raw mut defaults);
     libc::sigaddset(&raw mut defaults, libc::SIGPIPE);
     (
-      libc::posix_spawnattr_setsigmask(&raw mut prepared.attributes, &raw const mask),
-      libc::posix_spawnattr_setsigdefault(&raw mut prepared.attributes, &raw const defaults),
+      libc::posix_spawnattr_setsigmask(attributes.raw(), &raw const mask),
+      libc::posix_spawnattr_setsigdefault(attributes.raw(), &raw const defaults),
     )
   };
   checked(masked)?;
   checked(defaulted)?;
   if spawn.own_group {
     // SAFETY: the attributes are initialised; group 0 makes the child the leader of a group of its own pid.
-    checked(unsafe { libc::posix_spawnattr_setpgroup(&raw mut prepared.attributes, 0) })?;
+    checked(unsafe { libc::posix_spawnattr_setpgroup(attributes.raw(), 0) })?;
   }
-  Ok(prepared)
+  Ok(Prepared {
+    actions,
+    attributes,
+  })
 }
 
 /// Starts `spawn`'s child (module docs).
@@ -267,7 +289,7 @@ pub fn spawn(spawn: &Spawn<'_>) -> io::Result<SpawnedChild> {
     .map(|entry| entry.as_ptr().cast_mut())
     .chain(std::iter::once(std::ptr::null_mut()))
     .collect();
-  let prepared = prepare(spawn, &directory, &null)?;
+  let mut prepared = prepare(spawn, &directory, &null)?;
   let mut pid: libc::pid_t = 0;
   // SAFETY: `program`, every word and entry are NUL-terminated strings this frame owns, `argv` and `envp` arrays of
   // pointers to them ending in a null pointer, alive across the call; the actions and attributes are initialised
@@ -277,8 +299,8 @@ pub fn spawn(spawn: &Spawn<'_>) -> io::Result<SpawnedChild> {
     libc::posix_spawn(
       &raw mut pid,
       program.as_ptr(),
-      &raw const prepared.actions,
-      &raw const prepared.attributes,
+      prepared.actions.raw().cast_const(),
+      prepared.attributes.raw().cast_const(),
       argv.as_ptr(),
       envp.as_ptr(),
     )
@@ -331,8 +353,7 @@ impl SpawnedChild {
       .and_then(rustix::process::Pid::from_raw)
       .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
     let waited = rustix::process::waitpid(Some(pid), options).map_err(io::Error::from)?;
-    let status = waited
-      .map(|(_, status)| ExitStatus::from_raw(i32::try_from(status.as_raw()).unwrap_or(i32::MAX)));
+    let status = waited.map(|(_, status)| ExitStatus::from_raw(status.as_raw()));
     if status.is_some() {
       self.status = status;
     }
