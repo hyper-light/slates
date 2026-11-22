@@ -1350,6 +1350,25 @@ fn a_pushs_segment_records_replay_in_order_to_its_forks_rows() {
 /// and sent whole against the null base (a full snapshot each), as a whole-history push of a revlog storing snapshots
 /// sends them; every revision whole.
 fn snapshots_push(n: usize) -> Vec<u8> {
+  let paths: Vec<String> = (0..n).map(|k| format!("f{k:03}")).collect();
+  adding_files(Line::default(), &paths).0
+}
+
+/// Where a line of changesets ends: its last changeset and manifest, and the manifest's lines.
+#[derive(Clone, Debug, Default)]
+struct Line {
+  /// The last changeset.
+  changeset: Node,
+  /// Its manifest.
+  manifest: Node,
+  /// The manifest's lines.
+  lines: Vec<Vec<u8>>,
+}
+
+/// A changegroup 03 of a changeset for each of `paths` after `after`, each adding its file (one whole revision, its
+/// text naming its path) to the manifest before it, the manifest sent whole against the null base; and where the line
+/// then ends.
+fn adding_files(after: Line, paths: &[String]) -> (Vec<u8>, Line) {
   use crate::changegroup::{self as cg, Revision, Version};
   use crate::{NULL_NODE, node};
   let hex = |node: &Node| {
@@ -1372,16 +1391,18 @@ fn snapshots_push(n: usize) -> Vec<u8> {
     };
     cg::put_revision_whole(&revision, Version::V03, out).unwrap();
   };
-  let (mut changeset, mut manifest) = (NULL_NODE, NULL_NODE);
+  let mut line = after;
   let (mut changesets, mut manifests, mut files) = (Vec::new(), Vec::new(), Vec::new());
-  let mut lines = Vec::new();
-  for k in 0..n {
-    let path = format!("f{k:03}").into_bytes();
-    let text = format!("file {k}\n").into_bytes();
+  for path in paths {
+    let path = path.as_bytes().to_vec();
+    let text = [b"file ", &path[..], b"\n"].concat();
     let file = node::compute(&NULL_NODE, &NULL_NODE, &text).unwrap();
-    lines.push([&path[..], b"\0", &hex(&file), b"\n"].concat());
-    let manifest_text = lines.concat();
-    let manifest_node = node::compute(&manifest, &NULL_NODE, &manifest_text).unwrap();
+    line
+      .lines
+      .push([&path[..], b"\0", &hex(&file), b"\n"].concat());
+    line.lines.sort();
+    let manifest_text = line.lines.concat();
+    let manifest_node = node::compute(&line.manifest, &NULL_NODE, &manifest_text).unwrap();
     let changeset_text = [
       &hex(&manifest_node)[..],
       b"\ntest\n0 0\n",
@@ -1389,11 +1410,11 @@ fn snapshots_push(n: usize) -> Vec<u8> {
       b"\n\nchange",
     ]
     .concat();
-    let changeset_node = node::compute(&changeset, &NULL_NODE, &changeset_text).unwrap();
-    changesets.push((changeset_node, changeset, changeset_text));
-    manifests.push((manifest_node, manifest, manifest_text, changeset_node));
+    let changeset_node = node::compute(&line.changeset, &NULL_NODE, &changeset_text).unwrap();
+    changesets.push((changeset_node, line.changeset, changeset_text));
+    manifests.push((manifest_node, line.manifest, manifest_text, changeset_node));
     files.push((path, file, text, changeset_node));
-    (changeset, manifest) = (changeset_node, manifest_node);
+    (line.changeset, line.manifest) = (changeset_node, manifest_node);
   }
   let mut out = Vec::new();
   for (node, p1, text) in &changesets {
@@ -1405,13 +1426,14 @@ fn snapshots_push(n: usize) -> Vec<u8> {
   }
   cg::put_end(&mut out);
   cg::put_end(&mut out);
+  files.sort_by(|left, right| left.0.cmp(&right.0));
   for (path, node, text, link) in &files {
     cg::put_name(path, &mut out).unwrap();
     whole((*node, NULL_NODE, *link), text, &mut out);
     cg::put_end(&mut out);
   }
   cg::put_end(&mut out);
-  out
+  (out, line)
 }
 
 /// What taking `payload` (a changegroup 03) whole into an empty index kept charged to its admission past its begin, and
@@ -1453,4 +1475,84 @@ fn a_push_of_many_whole_manifest_snapshots_keeps_one_copy_of_their_entries() {
     long_kept * 2 < short_kept * 5 && long_told * 2 < short_told * 5,
     "kept {short_kept} then {long_kept}, told {short_told} then {long_told}: past linear in the changesets"
   );
+}
+
+/// `payload`, a changegroup 03, taken into a fork of `index` cut at every kept text, each segment's record written as it
+/// is cut and the rest's once every unit is taken, each store want answered from the fork; the records, and the fork,
+/// which holds their contents (as a push's fork holds them to its entry).
+fn segment_records_over(
+  payload: &[u8],
+  index: &mut HgIndex,
+  store: &mut ContentStore,
+) -> (Vec<Vec<u8>>, HgIndex) {
+  let mut admission = room();
+  let mut taking = Intake::begin(
+    (crate::changegroup::Version::V03, payload),
+    index,
+    store,
+    &mut admission,
+  )
+  .unwrap()
+  .cutting(1);
+  let mut records = Vec::new();
+  let mut recorded = |taking: &mut Intake, store: &ContentStore| {
+    while let Some(segment) = taking.take_segment() {
+      records.push(taking.segment_record(&segment, 1 << 20, store).unwrap());
+    }
+  };
+  loop {
+    let stepped = taking.step(payload, store, &mut admission).unwrap();
+    recorded(&mut taking, store);
+    match stepped {
+      Stepped::More => {}
+      Stepped::Store => taking.answer_from_fork(store),
+      _ => break,
+    }
+  }
+  taking.cut_rest();
+  recorded(&mut taking, store);
+  let (fork, _) = finished(taking);
+  (records, fork)
+}
+
+/// Main 01a20182's ruling of 2026-11-22 06:57 (a push lands its segments apart from its repository's turn, which it
+/// takes only for its entry's commit, so another push may land between its segments and its entry). Do: land a line of
+/// four changesets, each adding a file; over it, cut a push of three more into segments and write their records; land
+/// another push of one changeset over the same line meanwhile; replay the first push's records onto the index as that
+/// left it. Expect every manifest the first push brought held and reading as its fork read it (some kept as a delta
+/// against the manifest before it, A-729), though the other push's manifest now stands before it. Red before: a record
+/// kept a manifest's stored delta by its base's number, the one before it, which the other push's manifest took.
+#[test]
+fn a_pushs_segments_replay_onto_an_index_another_push_moved_their_bases_by_node() {
+  let names =
+    |range: core::ops::Range<usize>| range.map(|k| format!("f{k:03}")).collect::<Vec<_>>();
+  let (first, line) = adding_files(Line::default(), &names(0..4));
+  let mut store = store();
+  let (mut index, _, _) = taken_counting(&first, &mut HgIndex::new(), &mut store, None);
+  let held = index.len(&store, Log::Manifest);
+  let (pushed, _) = adding_files(line.clone(), &names(4..7));
+  let (other, _) = adding_files(line, &names(9..10));
+  let (records, fork) = segment_records_over(&pushed, &mut index, &mut store);
+  assert!(records.len() > 1, "{} records", records.len());
+  let (moved, _, _) = taken_counting(&other, &mut index, &mut store, None);
+  core::mem::replace(&mut index, moved)
+    .release(&mut store)
+    .unwrap();
+  for bytes in &records {
+    crate::import::record::replay(bytes, &mut index, &mut store).unwrap();
+  }
+  let mut deltas = 0;
+  for rev in held..fork.len(&store, Log::Manifest) {
+    let row = fork.revision(&store, Log::Manifest, rev).expect("its row");
+    deltas += usize::from(row.base != crate::index::NONE);
+    let at = index.rev(&store, Log::Manifest, &row.node).expect("held");
+    assert_eq!(
+      index.revision_text(&store, Log::Manifest, at),
+      fork.revision_text(&store, Log::Manifest, rev),
+      "manifest {rev}, replayed at {at}"
+    );
+  }
+  assert!(deltas > 0, "the push kept a manifest as a delta");
+  index.release(&mut store).unwrap();
+  fork.release(&mut store).unwrap();
 }

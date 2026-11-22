@@ -96,6 +96,13 @@ const REFERENCE_VERSION: u32 = 7;
 /// repository's empty store, and the import checked every manifest before its entry named the run.
 /// Format: the segment record's version, the eighth.
 const SEGMENT_VERSION: u32 = 8;
+/// Format: the version of a push's segment record on the changeset log (main 01a20182's ruling of 2026-11-22 06:57: a
+/// push lands its segments apart from its repository's landing turn, so another push may land between a segment and the
+/// entry naming it): a [`SEGMENT_VERSION`] record whose each manifest's or file revision's stored delta names its base
+/// by node, never by number. Its replay appends each row over the index as it is then, one it holds passed over: a
+/// delta resting on the log's last revision is kept as stored, any other is read over its base by node and kept again
+/// against the revision before it, as the index keeps a manifest (A-729), the same row a stale fork's re-base keeps.
+const PUSH_SEGMENT_VERSION: u32 = 10;
 /// Format: the version of an import's or a push's record in the repository's register once its revisions are on the
 /// changeset log as a run of segments (A-767 C1 step 3; a push's, main 01a20182's ruling (b1) of 2026-11-22 04:44): the
 /// head, its source an import's or a push's, then the first and the last sequence of the run of segment changesets it
@@ -548,6 +555,8 @@ pub struct Writer {
   identities: bool,
   /// Whether the record holds the index's markers (an import's whole record, or its last segment's).
   markers: bool,
+  /// Whether a stored delta names its base by node ([`PUSH_SEGMENT_VERSION`]).
+  base_by_node: bool,
 }
 
 /// One log's revisions a record holds: its tag, a file log's path, the first revision and the one past the last
@@ -590,7 +599,11 @@ impl Writer {
       Log::Manifest => (MANIFEST_TAG, Vec::new(), *first, *end),
       Log::File(path) => (FILE_TAG, path.to_vec(), *first, *end),
     }));
-    Writer::of(logs, (source, room), (SEGMENT_VERSION, markers))
+    let version = match source {
+      Source::Push => PUSH_SEGMENT_VERSION,
+      Source::Import | Source::Made { .. } => SEGMENT_VERSION,
+    };
+    Writer::of(logs, (source, room), (version, markers))
   }
 
   /// Starts a push's record (A-680 part 2c, A-720) of the revisions it kept in `logs` (each a log and its first kept
@@ -632,6 +645,7 @@ impl Writer {
       done: false,
       identities: version != VERSION,
       markers,
+      base_by_node: version == PUSH_SEGMENT_VERSION,
     })
   }
 
@@ -673,7 +687,7 @@ impl Writer {
     }
     if rev < len {
       let written = if self.identities {
-        write_identity_revision(&mut part, (index, store), log, rev)
+        write_identity_revision(&mut part, (index, store), (log, rev), self.base_by_node)
       } else {
         kept(index, store, log, rev).and_then(|kept| write_kept_revision(&mut part, store, &kept))
       };
@@ -729,8 +743,8 @@ fn write_kept_revision(out: &mut Vec<u8>, store: &ContentStore, kept: &Kept) -> 
 fn write_identity_revision(
   out: &mut Vec<u8>,
   (index, store): (&HgIndex, &ContentStore),
-  log: Log<'_>,
-  rev: u32,
+  (log, rev): (Log<'_>, u32),
+  base_by_node: bool,
 ) -> Option<()> {
   let node_of = |number: u32| {
     if number == NONE {
@@ -758,7 +772,11 @@ fn write_identity_revision(
   out.extend_from_slice(&changeset_node(index, store, row.link)?);
   out.extend_from_slice(&row.flags.to_le_bytes());
   out.extend_from_slice(&row.len.to_le_bytes());
-  out.extend_from_slice(&row.base.to_le_bytes());
+  if base_by_node {
+    out.extend_from_slice(&node_of(row.base)?);
+  } else {
+    out.extend_from_slice(&row.base.to_le_bytes());
+  }
   out.extend_from_slice(&row.stored.to_le_bytes());
   out.extend_from_slice(&row.chain.to_le_bytes());
   out.extend_from_slice(&row.bytes.0);
@@ -1349,8 +1367,11 @@ struct Revisions {
   replayed: Replayed,
   /// Whether each revision is named by its content's identity ([`IDENTITY_VERSION`]).
   identities: bool,
-  /// Whether it is an import's segment ([`SEGMENT_VERSION`]): held to no empty index, no manifest checked.
+  /// Whether it is a segment ([`SEGMENT_VERSION`], [`PUSH_SEGMENT_VERSION`]): held to no empty index, no manifest
+  /// checked.
   segment: bool,
+  /// Whether a stored delta names its base by node ([`PUSH_SEGMENT_VERSION`]).
+  base_by_node: bool,
   /// The manifest replayed last and its text: the next one's base where its delta names it.
   last: Option<(Node, Vec<u8>)>,
 }
@@ -1730,7 +1751,8 @@ impl Revisions {
     index: &mut HgIndex,
     store: &mut ContentStore,
   ) -> Result<Revisions, Refused> {
-    let segment = version == SEGMENT_VERSION;
+    let base_by_node = version == PUSH_SEGMENT_VERSION;
+    let segment = version == SEGMENT_VERSION || base_by_node;
     if source == Source::Import && !segment && index.rows().rows() != 0 {
       return Err(Refused::NotEmpty);
     }
@@ -1752,6 +1774,7 @@ impl Revisions {
       replayed: Replayed::default(),
       identities: version == IDENTITY_VERSION || segment,
       segment,
+      base_by_node,
       last: None,
     })
   }
@@ -1907,10 +1930,15 @@ impl Revisions {
     let node = reader.node()?;
     let p1 = reader.node()?;
     let p2 = reader.node()?;
+    let held = self.base_by_node && self.fork.rev(store, log, &node).is_some();
     if log == Log::Changelog {
       let flags = flags_of(reader)?;
       let len = reader.long()?;
       let text_id = identity_of(reader)?;
+      // A changeset another push brought meanwhile is held already: passed over.
+      if held {
+        return Ok(());
+      }
       let text = store.object_bytes(&text_id, len).ok_or_else(unheld)?;
       let read = Read {
         node,
@@ -1925,13 +1953,21 @@ impl Revisions {
     let link = reader.node()?;
     let flags = flags_of(reader)?;
     let len = reader.long()?;
-    let stored = (reader.word()?, reader.long()?, reader.long()?);
+    let base = if self.base_by_node {
+      Base::Node(reader.node()?)
+    } else {
+      Base::Number(reader.word()?)
+    };
+    let (delta_len, chain) = (reader.long()?, reader.long()?);
     let bytes = identity_of(reader)?;
     let block = match reader.byte()? {
       0 => None,
       1 => Some(identity_of(reader)?),
       tag => return Err(Refused::Tag { tag }),
     };
+    if held {
+      return Ok(());
+    }
     if store.len_of(&bytes).is_none() || block.is_some_and(|block| store.len_of(&block).is_none()) {
       return Err(unheld());
     }
@@ -1945,12 +1981,66 @@ impl Revisions {
       bytes,
       block,
     };
-    let numbers = self
-      .fork
-      .append_stored(store, log, &[(row, stored)])
-      .map_err(ImportRefused::<Infallible>::Index)?;
+    let numbers = match self.stored_on(store, log, base)? {
+      Some(on) => self
+        .fork
+        .append_stored(store, log, &[(row, (on, delta_len, chain))]),
+      None => self.kept_again(store, log, (row, delta_len), base),
+    }
+    .map_err(ImportRefused::<Infallible>::Index)?;
     settle::<Infallible>(&mut self.fork, store, radix, rev, &numbers)?;
     Ok(())
+  }
+
+  /// The number a row's stored delta rests on as the fork is now: its number where the record named it
+  /// ([`SEGMENT_VERSION`]) or none ([`NONE`]), the log's last revision where the record names that one by node
+  /// ([`PUSH_SEGMENT_VERSION`]); none where it names another, whose row is kept again ([`Revisions::kept_again`]).
+  fn stored_on(
+    &self,
+    store: &ContentStore,
+    log: Log<'_>,
+    base: Base,
+  ) -> Result<Option<u32>, Refused> {
+    let node = match base {
+      Base::Number(number) => return Ok(Some(number)),
+      Base::Node(node) if node == NULL_NODE => return Ok(Some(NONE)),
+      Base::Node(node) => node,
+    };
+    let last = self.fork.len(store, log).checked_sub(1);
+    let last_node = last.and_then(|last| match log {
+      Log::Changelog => None,
+      _ => self.fork.revision(store, log, last).map(|row| row.node),
+    });
+    Ok((last_node == Some(node)).then_some(last).flatten())
+  }
+
+  /// A row whose stored delta rests on `base`, a revision before the log's last (another push landed after it): its
+  /// text read over its base by node and kept again, the index keeping it as its own against the revision before it.
+  fn kept_again(
+    &mut self,
+    store: &mut ContentStore,
+    log: Log<'_>,
+    (mut row, delta_len): (NewRevision, u64),
+    base: Base,
+  ) -> Result<Vec<u32>, crate::index::Refused> {
+    let unread = crate::index::Refused::Unread { rev: NONE };
+    let Base::Node(base) = base else {
+      return Err(unread);
+    };
+    let text = self
+      .fork
+      .rev(store, log, &base)
+      .and_then(|on| self.fork.revision_text(store, log, on))
+      .zip(store.object_bytes(&row.bytes, delta_len))
+      .and_then(|(on, delta)| crate::delta::apply(&on, &delta, &mut self.room).ok())
+      .ok_or(unread)?;
+    let content =
+      |refused| crate::index::Refused::Index(slates_vcs::IndexRefused::Content(refused));
+    let put = store.put_object(&text).map_err(content)?;
+    row.bytes = put;
+    let appended = self.fork.append_revisions(store, log, &[row]);
+    store.release(&put).map_err(content)?;
+    appended
   }
 
   /// A group read whole: counted, and the next group's head next.
@@ -1967,6 +2057,15 @@ impl Revisions {
       }
     }
   }
+}
+
+/// What a row's stored delta rests on, as its record names it.
+#[derive(Clone, Copy)]
+enum Base {
+  /// By number ([`SEGMENT_VERSION`] and before).
+  Number(u32),
+  /// By node ([`PUSH_SEGMENT_VERSION`]), the null node for a whole text.
+  Node(Node),
 }
 
 /// A revision's flags, read.
@@ -1997,6 +2096,7 @@ fn head(reader: &mut Reader<'_>) -> Result<(u32, Source, Admission), Refused> {
     REFERENCE_VERSION,
     SEGMENT_VERSION,
     RUN_VERSION,
+    PUSH_SEGMENT_VERSION,
   ]
   .contains(&version)
   {
