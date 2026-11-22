@@ -518,9 +518,20 @@
 >   every such refusal (a charge, the framing, a delta's text, the keeping's room). Held by
 >   `push::intake::tests::a_step_refused_past_its_admission_is_taken_again_whole_in_a_grown_room` (rooms of a quarter,
 >   a half and all but a byte of what the push holds; red with the charges after the keep: 20 kept for 21).
-> - Part 2, next: the push's driver (`hg_push::take_sliced`) waits for room under w-git's shared `vcs_share::RoomWait`
->   (main's ruling: one wait for git and hg) and takes the step again in the room it gives; a piece past the most the
->   repository could ever be lent is refused typed.
+> - Part 2 BUILT (2026-11-22, w-hg): the push's driver waits for room under w-git's shared `vcs_share::wait::RoomWait`
+>   (A-857; one wait for git and hg) and takes again what was refused in the room it gives. A begin past its admission
+>   begins again; a step past it is taken again, what the push holds charged to the grown room first, and the record
+>   names the room it was taken within, so a replay takes it alike (`hg_push::take_sliced`, `room_after_wait`; counted
+>   `vcs.hg.push_intake_room_waits`). A push whose increments the content store cannot hold for now waits past what the
+>   store could hold and holds them again (`landed_after_rebases`; counted `vcs.hg.push_held_ahead_room_waits`, main's
+>   order of 03:35). A need past the most the repository could ever be lent, or a wait past its patience, is refused as
+>   before. Held by `vcs_http::daemon_edge::tests::a_mercurial_push_past_its_first_admission_waits_for_room_and_lands_whole`
+>   (a first room of 64 bytes; red with no wait: `PastAdmission { asked: 127, left: 64 }`) and
+>   `a_mercurial_push_its_store_cannot_hold_for_now_waits_for_room_and_lands_whole` (red: `heads` empty).
+> - Not reproduced here, logged: w-interop's fresh repository's first 500-revision push refused at once on CI's x86 and
+>   arm runners (main's order of 03:49 and 03:50). `a_fresh_repositorys_first_push_of_hundreds_of_changesets_is_taken_at_once`
+>   (500 changesets pushed with no gap after the create) passes on this Mac. Every content-store refusal of a held-ahead
+>   increment is now named in the daemon's log, so the next run says which it was.
 > **A push's work counted a file revision's metadata markers as bytes (2026-11-22, w-hg; w-interop's find, ubuntu,
 > `hg push --new-branch -f -r 2000` of hg's own history refused `LengthDiffers { said: 10101, given: 10097 }` on
 > `hgext/hbisect.py`). FIXED.** 2a's `IndexHeld::file_bytes_len` (d93f98369) took a file revision's bytes as its text's
@@ -2872,9 +2883,14 @@
 > stream's write end (macOS has no `pipe2`, so std's pipe is made close-on-exec a call later), until the client's
 > 10 s read gives up. RULED (a) and BUILT, A-858: every child the daemon spawns is handed only its three streams
 > (`slates_ipc::confined_spawn`), and the driver reads an exit the watch posted before it was waitable, the second cause
-> the concurrent-spawn test found. Owed: the macos-latest proof of the HTTPv2 propset hang's end and the guard's order
-> (a diag-measurer branch; never on Ada's Macs, main's constraint of 2026-11-22 03:22), and w-lint's Linux and Windows
-> cross-target round. Windows spawns no hooks yet (A-622's Windows part), so it has no seam to change.
+> the concurrent-spawn test found. PROVEN on macos-latest (main 01a20182's CI 45018545878, 2026-11-22, at 00844de07):
+> the session ran 33.57 s, past the propset that hung at 120 s, and the guard's deliberate failure left 0 views mounted.
+> The session then went red on `svn status -u -v --xml`, the test's own: the same 15 entries, the same in every
+> field, in two orders, since stock `svn` reports a directory's children in its working copy's hash order, seeded afresh
+> each run. FIXED in the comparison (w-svn): a status's entries are compared in text order, every other output's as
+> answered (`entries_in_order`; `the_comparison_leaves_status_entry_order_out_and_nothing_else`). Owed: main's rerun
+> on macos-latest, and w-lint's Linux and Windows cross-target round. Windows spawns no hooks yet (A-622's Windows
+> part), so it has no seam to change.
 > **svn replay by stock clients (w-interop, 2026-11-20; A-703):** `svn-matrix.sh` gains `svnrdump dump` and
 > `svnsync initialize/synchronize` over svn://, each compared with the dump stock svnserve 1.15.0 made of the same history
 > (`crates/svn/fixtures/replay`, `EXPECT_RDUMP`, `EXPECT_SYNC`): over the reads fixtures' repository both are
@@ -3600,6 +3616,13 @@
 > refusal the wire answers without a Subversion number (`BudgetExceeded`, `ContentUnavailable`, `Format`) does not
 > name what landed; the same dump resumes all the same. Owed: the import's time and peak re-measured on git-2000
 > (main's run), which closes P7's finding (3) or not. The entry below is its history.
+> **FIXED (w-svn, 2026-11-22; main 01a20182 03:55 PST, a sibling of finding (2)'s `put_window` cut): a text refused
+> part-way through its put into the content store left its kept windows held for good.** `svn_commit::store_step_from`
+> took the text's writer out of the landing's `Storing` before it read and put the piece, so a refusal (a piece the
+> reader lacked, a window or the finish refused) dropped the writer, and the landing's release found nothing to abandon.
+> The writer now stays in `Storing` until its object is finished, so every refusal leaves it for the release. Red: a
+> 4 MiB text refused half-way left 8 entries, 2,097,152 bytes, after its release; green: the store as it was
+> (`a_text_refused_part_way_through_its_put_leaves_the_store_as_it_was`).
 > **P7's finding (2) OPEN, RED: an import's freed memory is not given back (2026-11-22, w-svn; main 01a20182's ruling of
 > 00:09, option 3).** Main's r11 (git-2000, release): physical footprint 43 MiB before, 527 MiB after 30 s of idle,
 > 484 MiB held. Only 155 MB of it is live (heap in use +104 MB, arena 51 MB); the rest is blocks under A-742's 1 MiB
@@ -3608,8 +3631,12 @@
 > churn for 25.6 MB of text. Red: `an_import_measured` now gates the idle footprint's growth at `HELD_FACTOR` (2) times
 > what the import still holds live. Cut so far (w-svn's sites): the importer's text buffer sized once from its header,
 > admitted first; a stored text streamed into the increment from the store's lent windows, not read back whole; the
-> landing's store pieces lent. Owed: the other owners' copies (the content store's `put_window` and `release_one`; the
-> engine's `judge_held`, two `push_slice`, `Increment::encode`, `chain_entry::encode_carrying`), then A-742's floor
+> landing's store pieces lent; a text put into the content store a copy slice at a time begun with its length
+> (`ContentStore::begin_object_of_length`, w-svn for A-851's absent owner, main's routing of 03:46): its window's buffer
+> reserved once rather than doubled from the first slice, 97.5 MB in 400 allocations to 26.2 MB in 100 for 26.2 MB of
+> text, the band's churn from 10.7 to 8.0 times the text
+> (`an_object_begun_with_its_length_reserves_its_windows_buffer_once`). Owed: the other owners' copies (the content
+> store's `release_one`; the engine's `judge_held`, two `push_slice`, `Increment::encode`), then A-742's floor
 > re-derived by a release A/B only if the footprint still stays (main's ruling). The changeset landing's piece copies
 > are cut too (w-svn, main's routing of 00:57): `slates_store::owner::SlicedLanding::part` answers its buffer emptied
 > once written, and the svn landing fills one buffer a landing (`a_sliced_landings_part_gives_its_buffer_back_to_be_filled_again`).
