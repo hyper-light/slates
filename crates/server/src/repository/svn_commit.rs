@@ -777,10 +777,10 @@ fn store_step_from(
   let slice = usize::try_from(state.config.copy_slice_bytes())
     .unwrap_or(usize::MAX)
     .max(1);
-  let (identity, len, mut writing, sent) = match storing.current.take() {
-    Some(current) => current,
+  let (identity, len, begun, sent) = match storing.current.take() {
+    Some((identity, len, writing, sent)) => (identity, len, Some(writing), sent),
     None => match storing.queue.pop_front() {
-      Some((identity, len)) => (identity, len, slates_vcs::Writing::default(), 0),
+      Some((identity, len)) => (identity, len, None, 0),
       None => return Ok(true),
     },
   };
@@ -788,6 +788,9 @@ fn store_step_from(
   let piece_len = u64::try_from(piece.len()).unwrap_or(u64::MAX);
   let kept = crate::vcs_store::within_budget(state, piece_len, |stores| {
     let store = stores.content_mut().ok_or(Uncommitted::NotHeld)?;
+    // Begun with its length, the text's window buffer is reserved once rather than doubled a copy slice at a time
+    // (goal 93, svn finding (2)).
+    let mut writing = begun.unwrap_or_else(|| store.begin_object_of_length(len));
     store
       .put_window(&mut writing, &piece)
       .map_err(|refused| store_refused(&refused))?;
