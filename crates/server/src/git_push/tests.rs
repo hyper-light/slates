@@ -2505,12 +2505,15 @@ fn line_commit(
 /// moved and within the history's commits; the encoding ends within its bound; the fetch's pack whole, every object
 /// pushed once. Red before: each tag's first version brought its commit's whole history, about tags times history; with
 /// the search but its commands decided as sent, 9,557 brought against 3,542 (2026-11-21, this Mac).
-/// r16's history (A-850): a line of [`R16_HISTORY`] commits as `main` and an annotated tag of every [`TAG_EVERY`]th
-/// commit, the refs sorted by name as git sends them: the objects pushed and each ref's object and name.
-fn r16_history() -> (
+/// A pushed history: its objects (each a type and its bytes) and each ref's object and name.
+type PushedHistory = (
   Vec<(slates_git::object_name::Kind, Vec<u8>)>,
   Vec<(ObjectId, Vec<u8>)>,
-) {
+);
+
+/// r16's history (A-850): a line of [`R16_HISTORY`] commits as `main` and an annotated tag of every [`TAG_EVERY`]th
+/// commit, the refs sorted by name as git sends them.
+fn r16_history() -> PushedHistory {
   use slates_git::object_name::Kind;
   let mut objects = Vec::new();
   let mut commits = Vec::new();
@@ -2889,7 +2892,9 @@ fn t_a724_a_pushs_record_names_its_names_once_they_are_homed_in_the_region() {
   let versions = sent.recv().expect("checked");
   assert!(!versions.is_empty(), "no record");
   assert!(
-    versions.iter().all(|version| *version == 6),
+    versions
+      .iter()
+      .all(|version| *version == crate::vcs_store::record::VERSION_LANDED),
     "versions {versions:?}"
   );
 }
