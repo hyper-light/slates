@@ -608,7 +608,43 @@ pub fn dump_polls(path: &str) {
     .lock()
     .map(|mut rows| std::mem::take(&mut *rows))
     .unwrap_or_default();
+  let replies = slates_ipc::endpoint::G222_REPLY_ROWS
+    .lock()
+    .map(|mut rows| std::mem::take(&mut *rows))
+    .unwrap_or_default();
   if let Ok(mut serves) = SERVES.lock() {
+    for [
+      shard,
+      from,
+      pack,
+      push,
+      wake_at,
+      wake,
+      wake_cpu,
+      nudge,
+      nudge_cpu,
+    ] in replies
+    {
+      let shard = u16::try_from(shard).unwrap_or(u16::MAX);
+      for (start, ns, name) in [
+        (from, pack, "ipc:pack".to_owned()),
+        (from.saturating_add(pack), push, "ipc:push".to_owned()),
+        (
+          wake_at,
+          wake,
+          format!("ipc:wake_one (on CPU {} us)", wake_cpu / 1000),
+        ),
+        (
+          wake_at.saturating_add(wake),
+          nudge,
+          format!("ipc:nudge (on CPU {} us)", nudge_cpu / 1000),
+        ),
+      ] {
+        if serve_is_long(ns) {
+          serves.push((shard, start, ns, name));
+        }
+      }
+    }
     for (shard, began, ns) in snapshots {
       if serve_is_long(ns) {
         serves.push((shard, began, ns, "db:snapshot".to_owned()));

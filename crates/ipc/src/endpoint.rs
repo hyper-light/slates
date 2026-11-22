@@ -1514,6 +1514,8 @@ impl DaemonEnd {
     if !self.region.cpl().can_push(self.region.object(), index)? {
       return Err(IpcError::RingFull);
     }
+    let g222_began = g222_now();
+    G222_PACK_BEGAN.with(|c| c.set(g222_began));
     let slot = crate::protocol::pack(
       &mut self.region,
       crate::protocol::Direction::Reply,
@@ -1526,6 +1528,8 @@ impl DaemonEnd {
 
   /// Writes a reply and wakes the client if it parked.
   pub fn reply(&mut self, slot: &Slot) -> Result<(), IpcError> {
+    let g222_pack_began = G222_PACK_BEGAN.with(|c| c.replace(0));
+    let g222_push = g222_now();
     let cpl = self.region.cpl();
     cpl.push(
       self.region.object_mut(),
@@ -1534,6 +1538,8 @@ impl DaemonEnd {
       crate::slot::stamp_now(),
     )?;
     self.next_reply = self.next_reply.wrapping_add(1);
+    let g222_pushed = g222_now();
+    let mut g222_wake = (0u64, 0u64, 0u64, 0u64, 0u64);
     let word = self.region.wake_word()?;
     word.fetch_add(1, Ordering::AcqRel);
     let parked = self.region.client_parked()?;
@@ -1564,8 +1570,14 @@ impl DaemonEnd {
       // confirmation then left a bare confirmed bit that refused the following park's stamp).
       #[cfg(windows)]
       self.region.wake_signal()?;
+      let g222_wake_began = (g222_now(), g222_cpu());
       #[cfg(not(windows))]
-      if wake::wake_one(word)? && stamped {
+      let g222_woke = wake::wake_one(word)?;
+      g222_wake.0 = g222_wake_began.0;
+      g222_wake.1 = g222_now().saturating_sub(g222_wake_began.0);
+      g222_wake.2 = g222_cpu().saturating_sub(g222_wake_began.1);
+      #[cfg(not(windows))]
+      if g222_woke && stamped {
         // A failed exchange is this slot armed again before the confirmation, which the ring's order
         // rules out but for a client that gave the reply up past its deadline: nothing left to confirm.
         let _ = stamp.compare_exchange(
@@ -1581,8 +1593,30 @@ impl DaemonEnd {
       // Nudge the completion fd too, so an async SDK event loop polling it (D-19) wakes alongside a
       // futex-parked sync client. Both are under the same parked check, so a spinning client pays for
       // neither.
+      let g222_nudge_began = (g222_now(), g222_cpu());
       #[cfg(unix)]
       self.nudge_completion();
+      g222_wake.3 = g222_now().saturating_sub(g222_nudge_began.0);
+      g222_wake.4 = g222_cpu().saturating_sub(g222_nudge_began.1);
+    }
+    let g222_end = g222_now();
+    let g222_from = if g222_pack_began != 0 {
+      g222_pack_began
+    } else {
+      g222_push
+    };
+    if g222_end.saturating_sub(g222_from) >= 200_000 {
+      g222_reply_row([
+        g222_shard(),
+        g222_from,
+        g222_push.saturating_sub(g222_from),
+        g222_pushed.saturating_sub(g222_push),
+        g222_wake.0,
+        g222_wake.1,
+        g222_wake.2,
+        g222_wake.3,
+        g222_wake.4,
+      ]);
     }
     Ok(())
   }
@@ -2539,4 +2573,40 @@ fn real_time_once(window_ns: u64) {
       let _ = slates_machine::time_constraint::set_current_from(window_ns);
     }
   });
+}
+
+// Diagnostic only (w-perf 84a, never main): a reply write that ran long, split: (shard, start, pack ns, push ns, wake
+// start, wake wall ns, wake thread-CPU ns, nudge wall ns, nudge thread-CPU ns).
+std::thread_local! {
+  static G222_PACK_BEGAN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+#[doc(hidden)]
+#[allow(clippy::disallowed_types)]
+pub static G222_REPLY_ROWS: std::sync::Mutex<Vec<[u64; 9]>> = std::sync::Mutex::new(Vec::new());
+fn g222_now() -> u64 {
+  slates_machine::clock::monotonic_ns()
+}
+#[allow(clippy::all, clippy::pedantic)]
+fn g222_cpu() -> u64 {
+  let reading = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
+  u64::try_from(reading.tv_sec)
+    .unwrap_or(0)
+    .saturating_mul(1_000_000_000)
+    .saturating_add(u64::try_from(reading.tv_nsec).unwrap_or(0))
+}
+#[allow(clippy::all, clippy::pedantic, clippy::disallowed_methods)]
+fn g222_shard() -> u64 {
+  std::thread::current()
+    .name()
+    .and_then(|name| name.strip_prefix("slates-shard-"))
+    .and_then(|id| id.parse::<u64>().ok())
+    .unwrap_or(u64::from(u16::MAX))
+}
+#[allow(clippy::all, clippy::pedantic)]
+fn g222_reply_row(row: [u64; 9]) {
+  if let Ok(mut rows) = G222_REPLY_ROWS.lock() {
+    if rows.len() < 100_000 {
+      rows.push(row);
+    }
+  }
 }
