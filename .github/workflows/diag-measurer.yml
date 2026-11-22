@@ -48,7 +48,7 @@ jobs:
             echo "config HZ: $(grep -E '^CONFIG_HZ=|^CONFIG_PREEMPT' /boot/config-$(uname -r) 2>/dev/null | tr '\n' ' ')"
             echo "rtprio limit: $(ulimit -r)"
           fi
- sysctl -n hw.ncpu hw.perflevel0.physicalcpu hw.perflevel1.physicalcpu 2>/dev/null || true; sw_vers 2>/dev/null || true; launchctl print system 2>/dev/null | grep -i -m3 timer || true
+          sysctl -n hw.ncpu hw.perflevel0.physicalcpu hw.perflevel1.physicalcpu 2>/dev/null || true; sw_vers 2>/dev/null || true; launchctl print system 2>/dev/null | grep -i -m3 timer || true
       - name: Rounds, loaded then quiet, split by hop
         run: |
           W="$RUNNER_TEMP/msr"; B="$W/bench"; set +e +o pipefail
