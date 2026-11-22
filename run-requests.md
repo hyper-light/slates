@@ -7529,3 +7529,15 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - 2026-11-21 (round at 40d816c29), Linux VCS lane: r53 (adacachy2) and its resubmit r55, which this time went to adacachy
   451397fc, both ended "did not answer the sync in 60s". Both Linux x86_64 runners now refuse a sync from Studio-2;
   no test ran. Same owner and same need as above.
+
+- w-multirepo (2026-11-21, A-724 piece 7 / A-849, 2beeb7502 on main; main 01a20182's 21:35 ruling (a)): many hg and svn
+  repositories under their stock clients:
+    SLATES_TEST_HG="uvx --quiet --python 3.12 --from mercurial==7.2 hg" \
+      python3 crates/cli/bench/multi_repo_stock.py $SLATES_RELEASE hg ~/.cache/g309-scale/src.git v0.99 v1.0.0 v1.5.0 --steps 1,10,100
+    python3 crates/cli/bench/multi_repo_stock.py $SLATES_RELEASE svn ~/.cache/g309-scale/src.git v0.99 v1.0.0 v1.5.0 --steps 1,10,100
+  Platform: the big Studio (adas-mac-studio.local-2; svn 1.15 is only there), release build of origin/main, mem=16g.
+  Read per step and class: pushes and fetches p50/p99 and "(Kx alone)", refusals in the client's words, daemon alive.
+  Green: every work ok; the smallest class's p99 within 2x alone at R=100. Red: refusals (hg's/svn's words name it),
+  a daemon gone, or a small class past 2x while a large one runs (starvation). The bounds stop a step early on disk or
+  memory and say so; scratch under ~/.cache/multi-repo-stock/<pid>, removed.
+  Proved locally (hg, debug, M-series Mac, R=1 and 2): all ok, 1.0x-1.2x alone.
