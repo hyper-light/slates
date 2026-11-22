@@ -584,10 +584,17 @@
 >   whole run, past the patience for a long enough one; the structural fix is a per-push staging log, the run landing
 >   apart from the repository's log and named in one step, so pushes to one repository need no turn between them.
 >   Owed, main's: the whole-history push on ubuntu and its peak RSS before and after (run-requests.md).
-> - Part 3, next (main's 05:13 order, straight after (b1)): a manifest's written entries kept once across the push. A
->   whole or null-base manifest revision's `written_entries` are its every line, kept for the files-present check once a
->   snapshot, the bulk of a whole-history push's 1.37 GB held (main's 04:59 measure); (b1)'s segments do not free them.
->   Red: a push of many whole manifest snapshots keeps one copy's worth.
+> - Part 3, a manifest's written entries kept once BUILT (2026-11-22, w-hg; main's 05:13 order): a whole or null-base
+>   manifest revision's written entries are its every line, and each was kept for the files' check once a snapshot,
+>   the bulk of a whole-history push's 1.37 GB held (main's 04:59 measure). Now a manifest's entries are a step's
+>   working set (charged to a copy); of them the intake keeps only the file revisions the fork lacks, each once across
+>   the push (`Taker::awaited`), refused at once as missing where they would outnumber the file revisions the push
+>   brings, and checked once every file is taken, a window of paths a step, each given back as checked. The bound
+>   (`Intake::bookkeeping`) counts each file revision once more for it, never a manifest's delta; it also counts a file
+>   group's path twice, as the steps charge it (the old manifest term's slack had hidden that). Held by
+>   `push::intake::tests::a_push_of_many_whole_manifest_snapshots_keeps_one_copy_of_their_entries`: a line of 60 then
+>   120 changesets, every manifest a full snapshot, kept 39,844 then 79,624 bytes, the bound the same (red: 134,764
+>   then 456,664, growing with the square).
 > - Not reproduced here, logged: w-interop's fresh repository's first 500-revision push refused at once on CI's x86 and
 >   arm runners (main's order of 03:49 and 03:50). `a_fresh_repositorys_first_push_of_hundreds_of_changesets_is_taken_at_once`
 >   (500 changesets pushed with no gap after the create) passes on this Mac. Every content-store refusal of a held-ahead
