@@ -535,3 +535,24 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
   (130.7 to 130.8 MB): an import replaces files whole.
 - Proposed to main: the svn landing names its stored texts as A-760 named runs, removing the post-state, make_mapped
   and encode copies, instead of shaving judge_held and encode one by one.
+
+## 2026-11-22 ~11:40 PST: A-760 named runs for the svn landing, (a)+(b) as one (main's rulings of 11:05 and ~11:35)
+- 91495a96a landed: the splice is sized once (`made_len`). Partial splices: 43,945,798 B to 21,594,432 B.
+- Ruling (i): a named svn run the content store lacks at replay is brought back from the node's changeset store
+  (A-863's Away wait, the owner's `svn_texts::bring_whole`). The bring-back stays on the cold path, counted, and is 0 in
+  a run with no crash.
+- Invariant to state in the module doc, with where it is enforced: an entry naming a text commits only once the
+  Payload holding that text is durable.
+- PLAN (consumers of a built svn increment):
+  1. `svn_commit::Building`: a stored text named as a `NamedRun` (`push_named`); op srcs patched after the inline bytes
+     are complete, before `doc.canonicalize()`. Red: a counter of stored-text bytes copied into the post-state reads 0.
+  2. Read the runs in the build step (`read_step` over `named_objects::PlaneObjects`), counted.
+  3. `ImportBatch::stage`: judge with `judge_named` (a new engine `submit_named`, `&mut`), so the buffers become files.
+  4. `RecordedBatch::apply_slice` (push.rs ~506): read the step's runs again before `apply_recorded`. The texts are
+     still held until the batch's release. Piece (c) would adopt the scratch member's files instead.
+  5. The client commit's `land` (svn_commit ~1286), via `version_of`, and `land_made`: read, then judge as they do.
+  6. `verbs.rs` ~20399, the replay: on ObjectMissing for a svn green's run, wait as Away; the owner brings the text back
+     with `bring_whole`, then reads on. Also check `verbs.rs` ~10715's `apply_recorded`.
+  7. Reds: the entry's size independent of its texts; crash oracle killed (1) between the texts' landing and the
+     entry's commit, and (2) between the entry's commit and its checkpoint; the bring-back count is 0 without a crash.
+  8. Sampled number on the tree dump, sent to main for the daemon A/B.
