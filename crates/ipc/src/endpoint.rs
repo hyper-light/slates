@@ -121,6 +121,9 @@ pub struct ClientEnd {
   parks: u64,
   /// Parks its region's wake semaphore ended (macOS, `crate::mach_semaphore`): the semaphore wake's non-vacuity count.
   semaphore_wakes: u64,
+  /// Its synchronous reply wait's parks in Linux's round-robin real-time class, and those it skipped by why
+  /// ([`RealTimeParks`], 84a's Linux half).
+  real_time_parks: RealTimeParks,
   /// Replies taken.
   replies: u64,
   /// Parks a wake ended with no reply in the ring — a spurious return from the OS wait, or a previous
@@ -217,6 +220,7 @@ impl ClientEnd {
       request_stamp: 0,
       parks: 0,
       semaphore_wakes: 0,
+      real_time_parks: RealTimeParks::default(),
       replies: 0,
       unanswered_wakes: 0,
       parks_ended_by_looks: 0,
@@ -587,6 +591,12 @@ impl ClientEnd {
     self.parks_ended_by_looks
   }
 
+  /// The synchronous reply wait's parks in Linux's round-robin real-time class, and those it skipped by why (see the
+  /// field).
+  pub fn real_time_parks(&self) -> RealTimeParks {
+    self.real_time_parks
+  }
+
   /// The ring index the next request takes (its bulk chunk is chosen by it).
   pub fn next_request_index(&self) -> u64 {
     self.next_request
@@ -796,16 +806,30 @@ impl ClientEnd {
     }
     self.parks = self.parks.saturating_add(1);
     real_time_once(u64::from(self.region.spin_ns()));
+    let raised = self.raise_for_park();
     let switches_before = slates_machine::switches::switches_now();
     let waiting_ns = slates_machine::clock::monotonic_ns();
     let parked = match ends {
       Ends::At(deadline_ns) => {
         let remaining = deadline_ns.map(|deadline| deadline.saturating_sub(elapsed_ns(started)));
-        self.park_until(expected, remaining)?
+        self.park_until(expected, remaining)
       }
-      Ends::Departure => self.park_until_departure(expected, look_timeout_ns)?,
+      Ends::Departure => self.park_until_departure(expected, look_timeout_ns),
     };
     let returned_ns = slates_machine::clock::monotonic_ns();
+    // The thread's own class back before anything else, whatever the park answered: the caller's code never runs at
+    // real-time priority.
+    if let Some(class) = raised
+      && let Err(code) = class.restore()
+    {
+      self.real_time_parks.restore_failed = self.real_time_parks.restore_failed.saturating_add(1);
+      self.region.client_parked()?.store(0, Ordering::Release);
+      return Err(IpcError::OsRefused {
+        call: "sched_setattr (a real-time park's restore)",
+        code: Some(code),
+      });
+    }
+    let parked = parked?;
     let teaches = wait_may_teach(
       parked.waker_confirms,
       switches_before,
@@ -2505,7 +2529,55 @@ impl Drop for RaisedForTheWait {
   }
 }
 
+/// A client's synchronous reply wait's parks in Linux's round-robin real-time class (84a's Linux half,
+/// `slates_machine::round_robin::raise_for_park`), and those it skipped by why. Elsewhere every park is skipped,
+/// `declined`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RealTimeParks {
+  /// Parks taken in the class, the thread's own class put back after each.
+  pub taken: u64,
+  /// Parks the account's limits (or the platform) denied the class.
+  pub declined: u64,
+  /// Parks of a thread already in a real-time class of its own, which it kept.
+  pub already_real_time: u64,
+  /// Parks whose thread's scheduling could not be read, so stayed as they were.
+  pub unreadable: u64,
+  /// Restores the kernel refused: each the call's typed refusal, the thread lowered to time-share. Expected none.
+  pub restore_failed: u64,
+}
+
+impl ClientEnd {
+  /// Raises this thread to Linux's round-robin real-time class for the coming park, where the account's limits grant
+  /// it (84a's Linux half: woken by its reply behind busy time-share neighbours, the client waited out their slices,
+  /// 2.5-3.0 ms in the p999 tail on CI's runners with the shards in the class, run 45020845000). Counted either way;
+  /// the first decline on a thread is logged, with its reason.
+  fn raise_for_park(&mut self) -> Option<slates_machine::round_robin::ParkClass> {
+    use slates_machine::round_robin::ParkSkipped;
+    let counts = &mut self.real_time_parks;
+    match slates_machine::round_robin::raise_for_park() {
+      Ok(class) => {
+        counts.taken = counts.taken.saturating_add(1);
+        Some(class)
+      }
+      Err(skipped) => {
+        let count = match skipped {
+          ParkSkipped::Declined(_) => &mut counts.declined,
+          ParkSkipped::AlreadyRealTime => &mut counts.already_real_time,
+          ParkSkipped::Unreadable { .. } => &mut counts.unreadable,
+        };
+        *count = count.saturating_add(1);
+        if cfg!(target_os = "linux") && !PARK_DECLINE_LOGGED.with(|logged| logged.replace(true)) {
+          slates_machine::log_line!("slates-ipc: a reply wait parks time-share: {skipped:?}");
+        }
+        None
+      }
+    }
+  }
+}
+
 thread_local! {
+  /// Whether this thread has logged its reply wait's first skipped real-time park ([`ClientEnd::raise_for_park`]).
+  static PARK_DECLINE_LOGGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
   /// Whether this thread has asked for the time-constraint policy ([`real_time_once`]).
   static REAL_TIME_ASKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
