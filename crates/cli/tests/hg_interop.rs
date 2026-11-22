@@ -134,15 +134,20 @@ fn read_on_a_thread(mut from: impl Read + Send + 'static) -> std::thread::JoinHa
 /// Waits for `child` to end within [`PATIENCE`], killing it and failing the test past that: its exit code, -1 where a
 /// signal ended it.
 fn exit_within(child: &mut Child, what: &str) -> i32 {
+  exit_within_for(child, what, PATIENCE)
+}
+
+/// [`exit_within`], killed past `patience`.
+fn exit_within_for(child: &mut Child, what: &str, patience: Duration) -> i32 {
   let started = Instant::now();
   loop {
     if let Some(status) = child.try_wait().unwrap() {
       return status.code().unwrap_or(-1);
     }
-    if started.elapsed() > PATIENCE {
+    if started.elapsed() > patience {
       let _ = child.kill();
       let _ = child.wait();
-      panic!("{what} ran past {PATIENCE:?} and was killed");
+      panic!("{what} ran past {patience:?} and was killed");
     }
     pause();
   }
@@ -438,6 +443,16 @@ fn stock_hg() -> Option<Vec<String>> {
 /// (`HGPLAIN`), committing as one test user, with no terminal to prompt on, killed past [`PATIENCE`]: its exit code and
 /// both outputs.
 fn hg_in(hg: &[String], dir: &str, args: &[&str]) -> (i32, String, String) {
+  hg_in_within(hg, dir, args, PATIENCE)
+}
+
+/// [`hg_in`], killed past `patience`.
+fn hg_in_within(
+  hg: &[String],
+  dir: &str,
+  args: &[&str],
+  patience: Duration,
+) -> (i32, String, String) {
   let (program, leading) = hg.split_first().expect("a command");
   let mut child = Command::new(program)
     .args(leading)
@@ -453,7 +468,7 @@ fn hg_in(hg: &[String], dir: &str, args: &[&str]) -> (i32, String, String) {
     .unwrap();
   let out = read_on_a_thread(child.stdout.take().unwrap());
   let err = read_on_a_thread(child.stderr.take().unwrap());
-  let code = exit_within(&mut child, &format!("hg {args:?} in {dir}"));
+  let code = exit_within_for(&mut child, &format!("hg {args:?} in {dir}"), patience);
   (code, out.join().unwrap(), err.join().unwrap())
 }
 
@@ -2088,5 +2103,94 @@ fn stock_hg_gets_what_stock_hg_serve_gives_on_every_verb_over_http_and_ssh() {
     failed.len(),
     failed.join("\n"),
     String::from_utf8_lossy(&ran.stderr)
+  );
+}
+
+/// Shape: the bytes of the large files [`stock_hg_pushes_large_files_and_the_daemon_keeps_serving`] commits, each from
+/// its own seed: w-balance's repro (inbox w-hg-from-w-balance-push-spin.md), 64 MiB then 32 MiB.
+const LARGE_PUSH_FILES: [(u64, usize); 2] = [(1, 64 << 20), (2, 32 << 20)];
+
+/// Shape: how long stock hg may take to push [`LARGE_PUSH_FILES`]: a debug build hashed 64 MiB with sha1dc in 50 s and
+/// kept it in 59 s (2026-11-21, MacBook arm64, the test profile), each revision hashed and kept once by the intake and
+/// its bytes again by the work, so 96 MiB costs about four minutes there; five times that, for a loaded machine.
+const LARGE_PUSH_PATIENCE: Duration = Duration::from_secs(20 * 60);
+
+/// `len` pseudo-random bytes from `seed` (xorshift64), so a file compresses as little as w-balance's random ones did.
+fn noise(seed: u64, len: usize) -> Vec<u8> {
+  let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+  (0..len)
+    .map(|_| {
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      state.to_le_bytes()[0]
+    })
+    .collect()
+}
+
+/// A-767 C1, the push spin w-balance found by use (goal 93 correctness; inbox w-hg-from-w-balance-push-spin.md: a
+/// 64+32 MiB push spun shard 8 past 3 s in one poll in `hg_push::take` and `hg_push::unbundle`, and the watchdog killed
+/// the daemon). Do: over the HTTP edge, commit a 64 MiB file of noise, then a 32 MiB one, push both with stock 7.2, then
+/// clone. Expect the push to exit 0, the daemon still serving (`slates status`), and the clone holding both changesets.
+/// Ignored: a by-use test main runs (run-requests.md); its red before the fix is the push's `bad HTTP status line`. Still
+/// red in a debug build: the merge engine applies the built 96 MiB increment in one step (GAPS, the sliced apply owed).
+#[test]
+#[ignore = "by use, main's rounds; open: the merge engine applies a large increment in one step (GAPS)"]
+#[allow(clippy::disallowed_methods)]
+fn stock_hg_pushes_large_files_and_the_daemon_keeps_serving() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping stock hg's large push: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)"
+    );
+    return;
+  };
+  let instance = format!("hg-large-push-{}", std::process::id());
+  let started = start_anchor(&instance, &["--vcs-http", "127.0.0.1:0"]);
+  let port = http_edge_port(&started.lines);
+  let Some(issuer) = issuer_of(&started, "stock hg's large push") else {
+    return;
+  };
+  create_hg_repository(&instance, "r");
+  let token = minted_token(&instance, &issuer);
+  let prefix = format!("http://127.0.0.1:{port}/");
+  let url = format!("{prefix}r");
+  let config: Vec<String> = [
+    format!("auth.slates.prefix={prefix}"),
+    format!("auth.slates.username={HG_USER}"),
+    format!("auth.slates.password={token}"),
+  ]
+  .into_iter()
+  .flat_map(|item| ["--config".to_owned(), item])
+  .collect();
+  let scratch = Scratch::new("hg-large-push");
+  let source = format!("{}/source", scratch.path);
+  hg_ok(&hg, &scratch.path, &["init", &source]);
+  for (at, (seed, len)) in LARGE_PUSH_FILES.into_iter().enumerate() {
+    std::fs::write(format!("{source}/large-{at}"), noise(seed, len)).unwrap();
+    hg_ok(
+      &hg,
+      &source,
+      &["commit", "--addremove", "--message", &format!("large {at}")],
+    );
+  }
+  let (code, out, err) = hg_in_within(
+    &hg,
+    &source,
+    &with_config(&["push", &url], &config),
+    LARGE_PUSH_PATIENCE,
+  );
+  assert_eq!(code, 0, "the large push: {out}{err}");
+  let (code, _, err) = slates(&instance, &[], &["status"]);
+  assert_eq!(code, 0, "the daemon still serving: {err}");
+  let copy = format!("{}/copy", scratch.path);
+  hg_ok(
+    &hg,
+    &scratch.path,
+    &with_config(&["clone", "-U", &url, &copy], &config),
+  );
+  assert_eq!(
+    hg_nodes(&hg, &copy),
+    hg_nodes(&hg, &source),
+    "the clone holds both changesets"
   );
 }

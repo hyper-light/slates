@@ -565,7 +565,11 @@ fn a_pushs_sectioned_record_and_payload_replay_as_its_whole_record_does() {
 fn a_pushs_reference_names_its_changeset_and_payload_by_identity() {
   use crate::import::record::{self, Reference, Replay};
   let part = stock();
-  let bytes = record::write_push_reference(1 << 20, (part.version, &part.payload), 5);
+  let bytes = record::write_push_reference(
+    1 << 20,
+    (part.version, record::PayloadName::of(&part.payload)),
+    5,
+  );
   let read = record::reference_of(&bytes).unwrap();
   assert_eq!(
     read,
@@ -986,4 +990,37 @@ fn a_file_delta_base_before_the_last_text_comes_from_the_cache_the_push_or_the_s
     (3, 1, 1),
     "the landed base read from the store, asked once"
   );
+}
+
+/// A-767 C1 (the push spin w-balance found: a 64 MiB file revision hashed and kept in one intake step spun its shard past
+/// the watchdog). Do: take a push of one file revision three and a half content windows long and a delta over it, once
+/// into a store whose window is the tests' (4 KiB) and once into one whose window holds the whole text. Expect the same
+/// rows either way; with the small window, both revisions taken over several steps and no step hashing or keeping more
+/// than one window; with the large one, none spread. Red before: one step took the whole text.
+#[test]
+fn a_revision_longer_than_a_window_is_taken_a_window_a_step() {
+  let window = 1 << 12;
+  let long: Vec<u8> = (0..window * 7 / 2)
+    .map(|at| u8::try_from(at % 251).unwrap())
+    .collect();
+  let mut edited = long.clone();
+  edited.extend_from_slice(b"\nand a line more\n");
+  let texts: [(&[u8], Option<usize>); 2] = [(&long, None), (&edited, Some(0))];
+  let (payload, _) = file_push(&texts, (crate::NULL_NODE, crate::NULL_NODE, &[]));
+  let take = |window: usize| {
+    let mut store = ContentStore::new(1 << 30, window).unwrap();
+    let (mut fork, intaken, _) = taken_counting(&payload, &mut HgIndex::new(), &mut store, None);
+    (rows(&mut fork, &store), intaken)
+  };
+  let (small_rows, small) = take(window);
+  let (large_rows, large) = take(window * 8);
+  assert_eq!(small_rows, large_rows, "the same rows either way");
+  assert_eq!(small.spread, 2, "both file revisions spread over steps");
+  assert!(
+    small.longest_step_bytes <= u64::try_from(window).unwrap(),
+    "no step past a window: {}",
+    small.longest_step_bytes
+  );
+  assert_eq!(large.spread, 0);
+  assert_eq!(small.kept, large.kept);
 }

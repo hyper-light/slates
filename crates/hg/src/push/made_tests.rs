@@ -516,8 +516,15 @@ fn a_made_changesets_record_replays_to_its_made_node() {
   }
   let replayed = replay.finish(&mut index, &mut store).unwrap();
   assert_eq!(replayed.made, Some((7, 3, node(STOCK[0].0))));
-  let reference =
-    record::write_made_reference(1 << 20, (super::CHANGEGROUP_VERSION, &payload), 4, (7, 3));
+  let reference = record::write_made_reference(
+    1 << 20,
+    (
+      super::CHANGEGROUP_VERSION,
+      record::PayloadName::of(&payload),
+    ),
+    4,
+    (7, 3),
+  );
   let read = record::reference_of(&reference).unwrap();
   assert_eq!((read.made, read.sequence), (Some((7, 3)), 4));
   assert_eq!(read.record(), written);
