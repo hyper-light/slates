@@ -158,3 +158,22 @@ main 15:20: "a one-byte edit to a 1 GB file costs 1 GB; fix at chunk grain; red 
 - Open, for main: (1) the checkpoint step (scope question above); (2) the park threshold. Slicing a 1.5 MB submit costs
   3 to 4 times its latency. Either park only above a step-ceiling's worth of work (the step then runs up to ~100 ms
   unsliced, HEARTBEAT_NS), or accept the latency.
+
+## Large single submit -- main's rulings 15:00 / 15:41 applied, 2026-11-21 ~16:25 PST; NOT landed, a question to main
+- Rulings: the checkpoint stays w-engine's (my 1 GiB bar is judged after it lands); (c) prepares run their slices back to
+  back until the shard's quantum is spent. Done: ae6aa4d2d (chained turns, prepare_turns and
+  prepare_longest_turn_us counters).
+- Found and fixed: the step's increment_held -> merge_service::hold_increment took 1,155 ms at 1 GiB (the manifest
+  hash plus hold_lent's copy). 6b6ebfdad: the job hashes the manifest and stages the chunks a slice a turn
+  (ContentHold::stage_fetched, stage_piece, complete_stage), and the step only refreshes the placement
+  (hold_increment_manifested). An untaken hold is given back as its job ends. Split proposed to w-shared:
+  inbox/w-shared-from-w-work-cow-slice-split.md.
+- Red test on the fix: both single submits accepted, 0/27 and 0/6 looks withheld; the submit's longest step 218 ms
+  (was 1,212 ms); the longest prepare turn 61 ms.
+- A/B 16:19 (release, interleaved, load 3.5-14.6; log ~/.cache/w-work-cow-ab/ab-20261121-161935.log):
+  - 1.5 MB: A 7.34, 3.39, 3.46, 4.12, 3.48 ms; B 9.87, 11.37, 15.79, 12.91, 15.24 ms (fails the 10% bar).
+  - 1 GiB: A exit 4 before answering x5; B answered 4.86, 5.21, 4.54, 6.45, 6.05 s, of which rounds 3 and 4 then
+    exited 4 after the answer (the checkpoint step, w-engine's).
+- Why 1.5 MB fails: the shard's quantum is its online wake estimate (tens of µs idle). The 1.5 MB prepare took 776
+  slices in 498 turns, longest 631 µs. a_small_submit_is_prepared_in_one_turn is red (498). Asked main: pace by the step
+  ceiling while nobody waits (A-783, yielding at once to any waiter), or don't park a submit that fits the quantum.
