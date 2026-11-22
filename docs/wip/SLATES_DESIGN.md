@@ -60783,7 +60783,9 @@ Applied in the same change to: `crates/git/src/store/packed.rs` (`Recent::let_go
 
 ### A-861 — Objects read lately lie in chunks given back whole, never on the system heap (2026-11-22, w-shared; main 01a20182's rulings of 04:24 and 04:56 PST, goal 93; A-742, A-860)
 Applied in the same change to: `crates/git/src/store/packed.rs` (`Recent`: chunks, a hash index, one order queue;
-`let_go` gives back every chunk), `crates/git/Cargo.toml` (`slates-mem`), `crates/mem/src/large.rs`
+`let_go` gives back every chunk; `true_up`, `release`), `crates/git/src/store/push.rs`, `repository.rs` and
+`encoding.rs` (the charge's owners), `crates/server/src/vcs_store.rs` and `git_encode.rs`, `crates/git/Cargo.toml`
+(`slates-mem`), `crates/mem/src/large.rs`
 (`Heap::system_allocated`), `crates/server/src/memory_gauges.rs` (`mem.gauge.process.system_allocated_bytes`),
 `crates/git/tests/recent_ring.rs`, GAPS.
 
@@ -60802,8 +60804,12 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's RSS round owed.
   refused, abandoned, or a dropped future), and `let_go` (A-860) gives back every one.
 - Index: a hash table, which allocates nothing once grown to the budget's objects (a B-tree split and gave back a node
   every few: 142 bytes an object), and one order queue.
-- Not charged to the push's room: the pack and its objects read lately were not charged before either; the ring is held
-  to the same bound, the pack's length. Open.
+- Charged (main 01a20182's ruling of 05:17: an uncharged holder makes the admission's numbers lie): `Recent::true_up`
+  charges the owner's content store for the chunks held, trued up where the owner holds the store mutably (a push after
+  each admission turn, a repository after each encoding unit, since a clone's reads fill it), and where the store's room
+  cannot take it the oldest chunks go until it can. `Recent::release` gives back the chunks and the charge: a push's
+  when it is committed or abandoned, a repository's when it goes idle (A-860's give-back). A read between two true-ups
+  only lays chunks the next one charges.
 - Evidence: `a_push_keeps_its_objects_read_lately_off_the_system_heap` (its own binary, `LargeMapped` global): red, the
   system path's live bytes grew 6,582,872 bytes keeping 8 MiB; green, under a tenth of the budget, and a third round's churn
   past the objects handed over under a hundredth. `recent_tests`: a gone chunk's object a miss, a large object a chunk
