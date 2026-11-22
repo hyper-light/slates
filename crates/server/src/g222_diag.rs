@@ -170,6 +170,30 @@ struct Fwd {
   delivered_at: u64,
   /// The resumed run's thread CPU time, ns, beside its wall time (`ran_at - resumed_at`).
   resume_cpu: u64,
+  /// The resumed run's verb's thread CPU (its commit's is the rest), and what ran inside it ([`mark`]'s bits).
+  verb_cpu: u64,
+  flags: u64,
+}
+
+/// What ran inside a resumed submit, a bit each ([`mark`]).
+pub const CHECKPOINT: u64 = 1;
+/// See [`CHECKPOINT`]: a shard publication.
+pub const PUBLISHED: u64 = 2;
+/// See [`CHECKPOINT`]: a prepared part taken (each part sets it).
+pub const PREPARED_TAKEN: u64 = 4;
+
+thread_local! {
+  static FLAGS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Marks `bit` as having run on this thread since the last [`take_flags`].
+pub fn mark(bit: u64) {
+  FLAGS.set(FLAGS.get() | bit);
+}
+
+/// The bits marked since the last take, cleared.
+pub fn take_flags() -> u64 {
+  FLAGS.replace(0)
 }
 
 thread_local! {
@@ -210,12 +234,29 @@ pub fn resumed(request: u64, waited: u64, at: &std::panic::Location<'_>) {
 }
 
 /// A resumed submit's verb ran and made its reply.
-pub fn resume_ran(request: u64, cpu_ns: u64) {
+pub fn resume_ran(request: u64, cpu_ns: u64, verb_cpu: u64, flags: u64) {
   let now = now_mono();
   fwd(request, |f| {
     f.ran_at = now;
     f.resume_cpu = cpu_ns;
+    f.verb_cpu = verb_cpu;
+    f.flags = flags;
   });
+}
+
+thread_local! {
+  /// The CPU the resumed verb took, set by `verbs::resumed_local` before its commit.
+  static VERB_CPU: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The resumed verb ran, taking `cpu` ns.
+pub fn verb_ran(cpu: u64) {
+  VERB_CPU.set(cpu);
+}
+
+/// The last resumed verb's CPU, cleared.
+pub fn take_verb_cpu() -> u64 {
+  VERB_CPU.replace(0)
 }
 
 /// The resumes of one `resume_all` are done.
@@ -237,7 +278,8 @@ const FWD_CAP: usize = 100_000;
 /// And for a parked submit run again: its park's wait, the resume's file and line, and the refining job's turns.
 /// And, before the reply's writing: how long before it the resume began, its verb ran, and `deliver` queued it.
 /// And the resumed run's thread CPU time.
-const FWD_COLS: usize = 27;
+/// And the resumed verb's own CPU and the flags of what ran inside it.
+const FWD_COLS: usize = 29;
 
 fn fwd(request: u64, change: impl FnOnce(&mut Fwd)) {
   if let Ok(mut guard) = FWD.lock() {
@@ -377,6 +419,8 @@ fn fwd_split(request: u64, written: u64) -> [u64; FWD_COLS] {
   out[24] = before(f.ran_at);
   out[25] = before(f.delivered_at);
   out[26] = f.resume_cpu;
+  out[27] = f.verb_cpu;
+  out[28] = f.flags;
   let accepted = f.replied == 0 && f.waiting != 0 && f.resolved != 0;
   if f.sent == 0 || f.started == 0 || f.home == 0 || (f.replied == 0 && !accepted) {
     return out;
@@ -454,7 +498,7 @@ pub fn dump_ring(path: &str) {
   let n = RING_TAKEN.load(Relaxed).min(RING_CAP);
   let mut out = files_header();
   out += &format!(
-    "# client sends {} rings {}\nqueued\tserved\tlanded\twritten\tdeferred\tcomplete\towner_met\towner_kick_after\towner_kick_run\towner_run_start\towner_work\torigin_met\torigin_kick_after\torigin_kick_run\torigin_run_home\thome_written\tplacement\tresolve_met\tresolve_kick_after\tresolve_kick_run\tresolve_run_at\tmask\tdeliver_file\tdeliver_line\tpark_wait\tresume_file\tresume_line\tjob_turns\tresumed_before\tran_before\tdelivered_before\tresume_cpu\n",
+    "# client sends {} rings {}\nqueued\tserved\tlanded\twritten\tdeferred\tcomplete\towner_met\towner_kick_after\towner_kick_run\towner_run_start\towner_work\torigin_met\torigin_kick_after\torigin_kick_run\torigin_run_home\thome_written\tplacement\tresolve_met\tresolve_kick_after\tresolve_kick_run\tresolve_run_at\tmask\tdeliver_file\tdeliver_line\tpark_wait\tresume_file\tresume_line\tjob_turns\tresumed_before\tran_before\tdelivered_before\tresume_cpu\tverb_cpu\tflags\n",
     slates_ipc::endpoint::G222_SENDS.swap(0, Relaxed),
     slates_ipc::endpoint::G222_RINGS.swap(0, Relaxed)
   );

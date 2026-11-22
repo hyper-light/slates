@@ -822,6 +822,7 @@ pub(crate) fn fold_inputs(state: &ShardState, green: DbVolumeId) -> Option<FoldI
 /// the chain's cap does first (`verbs::submit`, A-238), since the floor may have risen since the last accept (a work
 /// destroyed, rebased or reset), and a chain at its cap refuses every submit whose accept would take it.
 pub(crate) fn checkpoint_green_when(state: &mut ShardState, green: DbVolumeId, doubling: Doubling) {
+  crate::g222_diag::mark(crate::g222_diag::CHECKPOINT);
   let Some(mut hold) = CheckpointHold::begin(state, green, doubling) else {
     return;
   };

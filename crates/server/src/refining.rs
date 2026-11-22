@@ -656,6 +656,7 @@ fn take_prepared<T>(
     .and_then(take);
   if taken.is_some() {
     state.count(PREPARED_TAKEN, 1);
+    crate::g222_diag::mark(crate::g222_diag::PREPARED_TAKEN);
   }
   taken
 }

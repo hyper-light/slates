@@ -12972,6 +12972,8 @@ pub(crate) fn resume_all(state: &mut ShardState, parked: Vec<ParkedSubmit>) {
   crate::g222_diag::resumes_done();
   for submit in parked {
     let g222_cpu = slates_rt::g222_parks::thread_cpu_ns();
+    let _ = crate::g222_diag::take_flags();
+    let _ = crate::g222_diag::take_verb_cpu();
     let ParkedSubmit {
       origin,
       id,
@@ -13016,6 +13018,8 @@ pub(crate) fn resume_all(state: &mut ShardState, parked: Vec<ParkedSubmit>) {
       crate::g222_diag::resume_ran(
         route.request,
         slates_rt::g222_parks::thread_cpu_ns().saturating_sub(g222_cpu),
+        crate::g222_diag::take_verb_cpu(),
+        crate::g222_diag::take_flags(),
       );
     }
     if let (Some(reply), Some(route)) = (reply, route)
@@ -13067,7 +13071,9 @@ fn resumed_local(
   state.db.begin();
   state.current_request = Some((origin, id));
   state.reply_route = route;
+  let g222_cpu = slates_rt::g222_parks::thread_cpu_ns();
   let reply = submit(state, principal, work, carried, approval);
+  crate::g222_diag::verb_ran(slates_rt::g222_parks::thread_cpu_ns().saturating_sub(g222_cpu));
   state.current_request = None;
   state.reply_route = None;
   let deferred = std::mem::take(&mut state.acceptance_deferred);
@@ -21142,6 +21148,7 @@ impl Published {
 /// Efficiency gate: it re-images
 /// every volume on each call; an incremental publish is the owed refinement (docs/wip/recovery.md).
 pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::VfsError> {
+  crate::g222_diag::mark(crate::g222_diag::PUBLISHED);
   let (start, end) = state.content_range;
   if state.content.is_none() || end <= start {
     return Err(slates_vfs::VfsError::RecoveryIncomplete);

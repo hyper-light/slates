@@ -12,7 +12,8 @@ COLS = ["queued", "served", "landed", "written", "deferred", "complete", "owner_
         "owner_kick_run", "owner_run_start", "owner_work", "origin_met", "origin_kick_after", "origin_kick_run",
         "origin_run_home", "home_written", "placement", "resolve_met", "resolve_kick_after", "resolve_kick_run",
         "resolve_run_at", "mask", "deliver_file", "deliver_line", "park_wait", "resume_file", "resume_line", "job_turns", "resumed_before",
-        "ran_before", "delivered_before", "resume_cpu"]
+        "ran_before", "delivered_before", "resume_cpu", "verb_cpu",
+        "flags"]
 AT = {name: at for at, name in enumerate(COLS)}
 
 
@@ -102,8 +103,21 @@ for key, members in sorted(groups.items(), key=lambda item: -len(item[1])):
             "write (deliver -> written)": lambda r: r[AT["delivered_before"]],
             "resumed run's CPU": lambda r: r[AT["resume_cpu"]],
             "resumed run off its CPU (wall - CPU)": lambda r: max(0, r[AT["resumed_before"]] - r[AT["ran_before"]] - r[AT["resume_cpu"]]),
+            "resumed verb's CPU": lambda r: r[AT["verb_cpu"]],
+            "resumed commit's CPU (run - verb)": lambda r: max(0, r[AT["resume_cpu"]] - r[AT["verb_cpu"]]),
         }
         resumed.sort(key=lambda r: r[AT["served"]])
+        by_cpu = sorted(resumed, key=lambda r: r[AT["resume_cpu"]])
+        for label, low in (("all", 0), ("p99 by resumed CPU", .99), ("p999 by resumed CPU", .999)):
+            part = by_cpu[int(len(by_cpu) * low):]
+            flags = {}
+            for r in part:
+                names = [n for n, b in (("checkpoint", 1), ("published", 2), ("prepared", 4)) if r[AT["flags"]] & b] or ["none"]
+                key = "+".join(names)
+                flags[key] = flags.get(key, 0) + 1
+            print(f"     resumed {label} (n {len(part)}): CPU med {us(med([r[AT['resume_cpu']] for r in part]))} us, verb "
+                  f"{us(med([r[AT['verb_cpu']] for r in part]))}, commit "
+                  f"{us(med([max(0, r[AT['resume_cpu']] - r[AT['verb_cpu']]) for r in part]))}; ran inside {flags}")
         for label, low in (("all", 0), ("p99 tail", .99), ("p999 tail", .999)):
             part = resumed[int(len(resumed) * low):]
             if part:
