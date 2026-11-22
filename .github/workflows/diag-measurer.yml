@@ -1,0 +1,60 @@
+name: diag measurer
+# main 01a20182's confirming round for 84a on macOS (2026-11-21 ~23:50 PST): origin/main as it is, with A-831's TB (the
+# shards under THREAD_TIME_CONSTRAINT_POLICY), no stamps or diagnostic code. Five loaded rounds (the harness's spinners,
+# two a core) and three quiet ones inside one job on one runner, so runner variance is out of the comparison. 84a's bar:
+# loaded p99 and p999 of the f10 accept and conflict forms under 1 ms in every round. Run only from `diag-measurer-*`
+# branches, never main; every log is an artifact.
+
+on:
+  push:
+    branches: ["diag-measurer-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+  LOADED_ROUNDS: "5"
+  QUIET_ROUNDS: "3"
+
+jobs:
+  confirm:
+    name: 84a macOS confirm (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: Build
+        run: |
+          W="$RUNNER_TEMP/msr"; mkdir -p "$W/logs"
+          cargo build --release --locked -p slates-client --example edit_merge_bench > "$W/logs/build.log" 2>&1 || { tail -30 "$W/logs/build.log"; exit 1; }
+          cp target/release/examples/edit_merge_bench "$W/bench"; shasum -a 256 "$W/bench"
+          echo "base $(git rev-parse --short HEAD); runner cpus $(sysctl -n hw.ncpu) memory $(($(sysctl -n hw.memsize) / 1073741824)) GiB"
+          uname -a; sw_vers
+      - name: Rounds, loaded then quiet
+        run: |
+          W="$RUNNER_TEMP/msr"; B="$W/bench"; set +e +o pipefail
+          for round in $(seq 1 "$LOADED_ROUNDS"); do
+            L="$W/logs/loaded-r$round.log"; echo "== loaded round $round $(date -u +%FT%TZ) load: $(uptime)" | tee "$L"
+            perl -e 'alarm shift; exec @ARGV' 1500 "$B" --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict </dev/null >> "$L" 2>&1
+            echo "exit $?" >> "$L"; grep -E "f10_loaded_total_p(50|99|999)\b|exit" "$L" | cut -c1-200
+          done
+          for round in $(seq 1 "$QUIET_ROUNDS"); do
+            L="$W/logs/quiet-r$round.log"; echo "== quiet round $round $(date -u +%FT%TZ) load: $(uptime)" | tee "$L"
+            perl -e 'alarm shift; exec @ARGV' 1200 "$B" --quiet-only --files 10 --form accept --form conflict </dev/null >> "$L" 2>&1
+            echo "exit $?" >> "$L"; grep -E "f10_quiet_total_p(50|99|999)\b|exit" "$L" | cut -c1-200
+          done
+      - name: Keep the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: confirm-84a-macos-logs
+          path: ${{ runner.temp }}/msr/logs
+          if-no-files-found: warn
