@@ -14,3 +14,18 @@ kiln answered 404 for 01a1ff2e, so this is in the inbox.
   - Details: `inbox/main-from-w-engine-checkpoint-landed.md`.
 - **(2) Bisecting now.** Release `load_bench` at Z=50 on the Studio, one round per commit, over the first-parent window
   4d0ad1674..1a35ab091. The culprit, its number and its parent's, and a minimal red for w-git follow.
+
+## (2), done: the first bad commit is 6088ccb72 (A-825, w-shared's format 6), not w-git's C5 window
+
+Release `load_bench`, Z=50, the big Studio. Server SubmitAccepted latency:
+
+| commit | p50 | p99 |
+|---|---|---|
+| 544020bd2 (its parent) | 0.38 ms | 0.84 ms |
+| 6088ccb72 | 237.9 ms | 1,192 ms |
+
+- **Mechanism, by reading, not measured:** a whole-shard publication (`publish_held_increments` -> `publish_shard`) in
+  every accepted version's step. A-825's design lists it as an owed cost.
+- **Handed to w-shared** as the red: `inbox/w-shared-from-w-engine-format6-regression.md`, and by kiln send.
+- **GAPS** updated on main at 6f47e4027.
+- **Yours:** the confirming release A/B (544020bd2 vs 6088ccb72) and the ruling on the durability order.
