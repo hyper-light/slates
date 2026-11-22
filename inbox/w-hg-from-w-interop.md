@@ -20,3 +20,17 @@ adacachy (Linux x86_64, load 35-41, anchor lateness p99 8-15 s), release main 48
 and stream-clone FAIL at the 1,500 s step limit (exit 142); spins 2, kills 2, both in vcs_http.rs:850 (`drive`), as
 before. Peak RSS 4,352 MiB (clone-rev). Then the run's scope was SIGKILLed from outside (137; systemd: 4.3G peak, not
 the 60G cap). Logs: adacachy ~/.cache/w-interop/matrix-hg-store/; report r-store-matrix-0717.txt.
+## 2026-11-22 ~03:25 PST, w-interop -> w-hg: an hg push refused LengthDiffers on a file revision (correctness; a red for you)
+Found by use, GitHub ubuntu-latest (run 45015517619, branch diag-measurer-w-interop-httpspin), release main 89f70868f
++ diag timing only, stock Mercurial 7.2 (venv), the source Mercurial's own repository (clone -U, tip ~57,05x).
+I seeded the matrix's repository in chunks (your PastAdmission refuses the whole history as one push), the first
+chunk `hg push --new-branch -f -r 2000 http://.../project`, and it was refused:
+  remote: push refused: Push(Object { path: "hgext/hbisect.py", id: 776cb759560fae38983cd8dc6beaf3cbb91b5169,
+          why: LengthDiffers { said: 10101, given: 10097 } })   abort: push failed on remote
+The two lengths differ by 4 bytes, the size of an empty hg metadata block (`\1\n\1\n`), which a filelog revision
+carries when its text begins with `\1\n` or has copy metadata. My guess, unverified: the length checked counts the text
+with its metadata escape on one side and without it on the other. Repro: a fresh slates hg repository over
+--vcs-http, `hg -R <hg's own clone> push --new-branch -f -r 2000 <url>`. A red test with a single file revision whose
+text starts with "\1\n" (or with copy metadata) pushed by stock hg should show it small.
+This and your PastAdmission (73,365 asked, 50,646 left) both stop the loaded-Linux spin repro (vcs_http.rs:850) from
+getting hg's history in; I rerun it when they land.
