@@ -1,0 +1,38 @@
+name: diag measurer
+# w-interop (2026-11-22): slates-cli's Linux test targets compile again (cli.rs's HeldMount::unmount, vm/mod.rs's
+# imports and next_line), and the FUSE test whose mount it unmounts runs. Run only from `diag-measurer-*` branches,
+# never main.
+
+on:
+  push:
+    branches: ["diag-measurer-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  focused:
+    name: slates-cli Linux targets (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: FUSE and the operator's grant, as ci.yml's Linux lanes have
+        run: |
+          command -v fusermount3 >/dev/null || { sudo apt-get update && sudo apt-get install -y fuse3; }
+          grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+      - name: fmt
+        run: rustfmt --edition 2024 --check crates/cli/tests/cli.rs crates/cli/tests/vm/mod.rs crates/cli/tests/pmem.rs crates/cli/tests/guest_image.rs
+      - name: every slates-cli test target compiles
+        run: cargo test --locked -p slates-cli --no-run
+      - name: the FUSE test whose mount HeldMount::unmount unmounts
+        timeout-minutes: 30
+        run: cargo test --locked -p slates-cli --test cli -- --exact a_closed_files_writes_survive_a_kill_from_the_write_log_alone --nocapture 2>&1 | grep -E '^test |test result|skipping|panicked' ; exit ${PIPESTATUS[0]}
