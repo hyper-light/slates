@@ -8942,6 +8942,25 @@ rest restores. Insufficient memory to hold a compressed copy: Refused before wor
 **Derived constants.** All from the profile and per-volume observations; the only fixed rule is
 the format floor.
 
+**A fetched git byte** (A-859 part A). A git fetch's pack crosses a link, so the value of a byte it
+saves is the link's price, never local memcpy's: the nanoseconds the HTTP edge's writes of fetch
+answers waited for the peer to take their bytes, over those bytes, learned per shard
+(`vcs_store::upload::LinkPrice`). An answer teaches it only from its first write that found the
+socket full on (a write into a buffer with room takes no time whatever the link), and the time
+slates spends making an answer is never in it, so a clone slow for its own encoding does not price
+its link dearer. Until a MiB past a first wait is learned, a byte is priced cold: at the break-even
+where deflating at git's default level (zlib's 6) just pays on this machine, `p₀ = d₆ / s₆`, `d₆`
+the measured nanoseconds a byte of that level on the profile's seeded text corpus and `s₆` the
+fraction of the corpus it saved (`learn::Rates`, `Exchange::cold`), so a pack is deflated as stock
+git deflates one until the link says otherwise. The price governs what has no stored form: a pushed
+entry is sent on as it lies (A-859 part B).
+
+> **Status (2026-11-22, A-859 part A).** A git fetch priced a byte at memcpy's 0.14 ns, so nothing
+> it encoded deflated or deltified: git/git's clone went 3-4 GiB where stock's pack is ~300 MB. Now a
+> fetched byte is priced at its link as above, cold at deflate's measured break-even. Owed (GAPS):
+> the SSH edge's link (its writes are not yet heard, so SSH fetches price cold), a price per client
+> rather than per shard, and the archive's own question below.
+
 > **Status (2026-10-20).** The cost model above ran with no inputs in some builds and not
 > others until this date. The boot profile's codec probe was compiled out wherever
 > `slates-machine` was reached as a dependency — it was declared `default-features = false` on
@@ -60761,8 +60780,16 @@ Applied in the same change to:
   whenever it has one (main 01a20182's ruling of 2026-11-22 05:38, superseding "only where the encoder would try no
   delta": git/git's clone spent its time in `Search::step` on objects that had a stored form), the reused object kept
   as a later one's candidate base. Counted where reuse is not taken: `reuse_refused` (its check failed),
-  `reuse_no_entry` (kept as content, in no pack) and `reuse_unread` (its entry or base unread). Part A (owed next): a fetched byte
-  priced at the network, so what no pushed entry holds deflates and deltas within the learned budget.
+  `reuse_no_entry` (kept as content, in no pack) and `reuse_unread` (its entry or base unread). Part A (built after B,
+  main 01a20182's rulings of 2026-11-22 04:30 and 06:32): a fetched byte priced at its link, the nanoseconds the HTTP
+  edge's writes waited for the peer over their bytes, learned per shard from each answer's first wait on (never the
+  answer's wall time, which a CPU-bound clone would read as a slow link and ratchet into harder compression); cold,
+  deflate's measured break-even at git's default level, `p₀ = d₆ / s₆` (§4.11, "A fetched git byte"). Tests:
+  `slates-git` `a859_a_fetched_byte_is_priced_at_its_link_cold_at_deflates_break_even` (626 bytes of objects: 287 cold,
+  697 at a fast link's price, 285 at a slow one's); `slates-server`
+  `t_a859_a_shard_prices_a_fetched_byte_cold_until_its_link_is_learned`,
+  `t_a859_an_answer_slow_for_its_own_making_teaches_its_link_price_nothing`, and
+  `vcs_http::tests::a859_a_reply_to_a_client_that_reads_late_waits_for_it_and_the_edge_hears_each_write`.
 - **Tests.** `slates-server` `git_push::tests::t_a859_a_clone_of_a_deltified_push_sends_its_entries_as_they_lie` (the
   line above pushed as stock git sends it, 17,299 bytes: cloned before encoding in 20,916 (121 whole, 20 deltas reused,
   none refused) and from kept fragments in 20,858 (121 whole, 39 deltas), each within the pushed pack plus 40 bytes an

@@ -105,6 +105,11 @@ pub(crate) trait StoreLender {
   /// lender that learns nothing does nothing.
   fn wrote(&mut self, _hold: &Self::Hold, _bytes: u64) {}
 
+  /// A fetch's answer wrote `bytes` past its first write that waited for the peer, taken in `ns` (A-859 part A,
+  /// `crate::vcs_store::upload::Pacing`): what the shard's link price is learned from. A lender that learns nothing does
+  /// nothing.
+  fn paced(&mut self, _taught: (u64, u64)) {}
+
   /// Makes repository `id`'s store ready for a fetch's answer before it is made (A-718): the shard's lender encodes every
   /// version not yet encoded as its fragments, a turn at a time, yielding between turns, so the answer copies them. A
   /// lender whose store needs nothing made does nothing.
@@ -172,6 +177,7 @@ impl<L: StoreLender + Clone> GitServices for UploadServices<L> {
       admitted: shard,
       held_since: None,
       room_patience_ns: self.room_patience_ns,
+      pacing: crate::vcs_store::upload::Pacing::default(),
     })
   }
 }
@@ -213,9 +219,22 @@ pub(crate) struct Upload<L: StoreLender> {
   held_since: Option<u64>,
   /// How long it waits held for more room ([`ROOM_PATIENCE_NS`]).
   room_patience_ns: u64,
+  /// What its answer's writes have taught of its link (A-859 part A).
+  pacing: crate::vcs_store::upload::Pacing,
 }
 
 impl<L: StoreLender> Exchange for Upload<L> {
+  /// A write of the answer (A-859 part A): learned into the shard's link price once a write of it has waited for the
+  /// peer; an advertisement's teaches nothing, its bytes too few to fill a socket.
+  fn sent(&mut self, sent: crate::vcs_store::upload::Sent) {
+    if self.advertise || self.answer.is_none() {
+      return;
+    }
+    if let Some(taught) = self.pacing.sent(sent) {
+      self.lender.paced(taught);
+    }
+  }
+
   async fn body(&mut self, run: &[u8]) -> Result<(), Failed> {
     self
       .request_room

@@ -303,6 +303,12 @@ impl<U: Exchange, R: Exchange> Exchange for HalfExchange<U, R> {
       HalfExchange::Receive(receive) => receive.reply(out, gone).await,
     }
   }
+
+  fn sent(&mut self, sent: crate::vcs_store::upload::Sent) {
+    if let HalfExchange::Upload(upload) = self {
+      upload.sent(sent);
+    }
+  }
 }
 
 impl<U: GitServices, R: GitServices> GitServices for Halves<U, R> {
@@ -346,6 +352,10 @@ impl<E: Exchange> Exchange for GitExchange<E> {
       return Ok(true);
     }
     self.service.reply(out, gone).await
+  }
+
+  fn sent(&mut self, sent: crate::vcs_store::upload::Sent) {
+    self.service.sent(sent);
   }
 }
 
@@ -505,6 +515,12 @@ impl<E: Exchange, L: LfsService> Exchange for SiteExchange<E, L> {
     match self {
       SiteExchange::Git(git) => git.reply(out, gone).await,
       SiteExchange::Lfs(lfs) => lfs.reply(out, gone).await,
+    }
+  }
+
+  fn sent(&mut self, sent: crate::vcs_store::upload::Sent) {
+    if let SiteExchange::Git(git) = self {
+      git.sent(sent);
     }
   }
 }

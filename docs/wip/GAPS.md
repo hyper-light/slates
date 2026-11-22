@@ -695,8 +695,11 @@
 > A-859 BUILT, part B (2026-11-22, w-git; main 03:38): a git/git clone moved 4-5 GiB, every object whole and
 > uncompressed (the encoder priced a byte at memcpy's 0.14 ns). Now an object pushed in a pack is sent on as its entry
 > lies there, checked against its name first, its delta reused where its base precedes it (`t_a859_…`: 20,916 bytes
-> against the pushed 17,299, where 89,439 went before). Owed: part A, a fetched byte priced at the network (§4.11);
-> main's git/git whole round and `fsck --strict`.
+> against the pushed 17,299, where 89,439 went before); a stored entry reused whenever one exists, a delta's wanted
+> base placed first (3fa634049). Part A BUILT: a fetched byte priced at its link, learned per shard from the HTTP
+> edge's writes that waited for the peer, cold at deflate's measured break-even at git's level 6 (§4.11). Owed: the
+> SSH edge's writes heard (SSH fetches price cold), a price per client, not per shard; main's git/git whole round and
+> `fsck --strict`.
 > A-860 BUILT (2026-11-22, w-git): a repository gone idle lets go of the objects its reads keep (git.recent_bytes held
 > 53.9 MB after a git/git clone). Owed: the push side's held windows and pack, w-shared's.
 > R2, the load-only edge tests, CLOSED (2026-11-21, w-git): a push's answer under side-band-64k wrote its first

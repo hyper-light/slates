@@ -236,6 +236,9 @@ pub(crate) struct VcsStores {
   /// repository stood at when a fetch began, shared by every fetch that began there, given back with its last holder;
   /// bounded by the fetches the shard's edges seat.
   git_forks: BTreeMap<RepositoryId, Vec<upload::GitFork>>,
+  /// The price of a byte git's fetches send over this shard's links, learned from the time their writes waited for the
+  /// peer (A-859 part A, [`upload::LinkPrice`]).
+  pub(crate) git_link: upload::LinkPrice,
   /// What each repository's entries' objects, which the partition's register keeps (A-662), hold of the shard's budget,
   /// charged as retention ([`settle_objects`]): bounded by the partition's repositories.
   objects_charged: BTreeMap<RepositoryId, u64>,
