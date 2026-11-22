@@ -549,3 +549,8 @@
   let-go window stops cleanly, its window brought back alone; no whole-pack residency remains. git_interop reports each
   heavy step (main's r28: the plain clone killed past 120 s said nothing). Freed 2.8 GB of leftover .rcgu.o. NEXT:
   main's run of the per-step print (plain clone's counters); piece 3 on w-shared's let_go_read; deflate reuse.
+- 2026-11-22 ~15:10 PST: A-864 piece 2 stall fix LANDED 06aa0e2ce and the LFS `.git` endpoint fix 985e378b5 (merge
+  8e2497cbf): stops are failure-driven and once a window (main's r29: git/git's clone stalled at 183 KB); git-lfs's
+  `<remote>.git/info/lfs` reaches the repository named without `.git` (main's r28 lfs row). The many-ref push red
+  (daemon_edge) is 2b(a)'s, settled by main (green at 7240125cf), w-shared fixing. NEXT: piece 3 on let_go_read
+  (646de255c), peak gauge; deflate reuse.
