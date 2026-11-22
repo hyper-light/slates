@@ -44,11 +44,31 @@ impl DoorbellThread {
     waker: DoorbellWaiter,
     kicks: Vec<(u16, Kick)>,
     rang: &'static AtomicBool,
+    real_time_window_ns: Option<u64>,
   ) -> Result<DoorbellThread, slates_ipc::IpcError> {
     let (stop, stop_signal) = channel();
     let handle = std::thread::Builder::new()
       .name("slates-doorbell".to_owned())
-      .spawn(move || run(&waiter, &kicks, &stop_signal, rang))
+      .spawn(move || {
+        // w-perf 84a arm (diag, never main as is): the doorbell thread in macOS's real-time band with the shards' window,
+        // as the shards and the client's reply park are (A-831), when G222_BELL_TB is set; base leaves it time-share.
+        #[allow(clippy::disallowed_methods)]
+        let arm = std::env::var_os("G222_BELL_TB").is_some();
+        if let Some(window_ns) = real_time_window_ns
+          && arm
+          && cfg!(target_os = "macos")
+        {
+          match slates_machine::time_constraint::set_current_from(window_ns) {
+            Some(computation_ns) => slates_machine::log_line!(
+              "slates-server: the doorbell thread runs real-time: computation {computation_ns} ns"
+            ),
+            None => slates_machine::log_line!(
+              "slates-server: the doorbell thread runs time-share: the kernel took no policy from {window_ns} ns"
+            ),
+          }
+        }
+        run(&waiter, &kicks, &stop_signal, rang)
+      })
       .map_err(|error| slates_ipc::IpcError::OsRefused {
         call: "spawn the doorbell thread",
         code: error.raw_os_error(),
