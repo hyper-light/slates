@@ -2853,8 +2853,11 @@
 > its chain's best message. Still seen (2 of 12 runs): a hook's first run, which has no learned bound, waits on its
 > words stream past its exit when a process spawned at the same instant elsewhere in the process inherited the
 > stream's write end (macOS has no `pipe2`, so std's pipe is made close-on-exec a call later), until the client's
-> 10 s read gives up. Owed: a ruling on spawning hooks with no inherited descriptors, or ending a drain once the
-> hook's process group is empty.
+> 10 s read gives up. RULED (a) and BUILT, A-858: every child the daemon spawns is handed only its three streams
+> (`slates_ipc::confined_spawn`), and the driver reads an exit the watch posted before it was waitable, the second cause
+> the concurrent-spawn test found. Owed: the macos-latest proof of the HTTPv2 propset hang's end and the guard's order
+> (a diag-measurer branch; never on Ada's Macs, main's constraint of 2026-11-22 03:22), and w-lint's Linux and Windows
+> cross-target round. Windows spawns no hooks yet (A-622's Windows part), so it has no seam to change.
 > **svn replay by stock clients (w-interop, 2026-11-20; A-703):** `svn-matrix.sh` gains `svnrdump dump` and
 > `svnsync initialize/synchronize` over svn://, each compared with the dump stock svnserve 1.15.0 made of the same history
 > (`crates/svn/fixtures/replay`, `EXPECT_RDUMP`, `EXPECT_SYNC`): over the reads fixtures' repository both are
