@@ -55,18 +55,6 @@ pub(super) fn created_within(room: Room) -> Standalone {
   Standalone::new(Repository::new(uuid, CREATED_DATE, room).expect("a repository within its room"))
 }
 
-/// Records as `CreateRepository` leaves them, keeping their texts themselves (`KeptText`): for the tests of that
-/// keeping alone, which go with it (the KeptText move's third piece).
-pub(super) fn created_records() -> Repository {
-  created_records_within(ROOMY)
-}
-
-/// [`created_records`] within `room`.
-pub(super) fn created_records_within(room: Room) -> Repository {
-  let uuid = Uuid::parse(CREATED_UUID).expect("a UUID");
-  Repository::new(uuid, CREATED_DATE, room).expect("a repository within its room")
-}
-
 /// Imports `dump` into `repository`, its bytes arriving `piece` at a time.
 pub(super) fn import(
   repository: &mut Standalone,

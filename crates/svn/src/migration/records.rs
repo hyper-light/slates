@@ -17,17 +17,14 @@
 //! text and property list its rows name is held by the records or brought by the revision; its properties and new
 //! contents fit the room; the index takes its rows ([`Index::plan`]). A refused revision changes nothing.
 //!
-//! **Texts** (S4 slice 2 c2, A-727 (c); rule (B): the repository's history compressed, never its texts whole). Each
-//! text is kept once, when the revision that brings it is applied, as an svndiff of version 2 (LZ4 sections, FSFS
-//! 1.10's form) against the text of its node's skip-delta predecessor (FSFS's `choose_delta_base`: the predecessor
-//! whose count is the node's with its lowest set bit cleared), a node's first version against nothing. A read makes the
-//! text from its chain of bases, at most `log2` of the node's predecessors deltas applied ([`Repository::text`]); nothing
-//! is deltified again later. Property lists are kept whole and read in place ([`Repository::content`]). Records a
-//! daemon keeps hold no text: since C2 stage B part 2 (b) every text there is named stored, its bytes its changeset's on
-//! the node's store, and the daemon refuses a log that carries texts inline. Records standing alone hold theirs apart
-//! the same way ([`super::Standalone`], the KeptText move; the crate's tests, integration tests and benches, and the
-//! server's tests); only the tests of this keeping and the changeset A/B example still commit into bare records, and
-//! the move's third piece removes this keeping.
+//! **Texts** (C2 stage B part 2 (b); the KeptText move, main's 10:35 item 3 of 2026-11-21). The records keep no text.
+//! A row's text is named stored, by its length ([`Repository::stored_len`]); its bytes are where the records' caller
+//! holds them: a daemon's on the node's changeset store and its shard's content store, records standing alone in
+//! [`super::Standalone`]. A caller takes a revision's texts out before its step ([`Repository::take_texts`]), and the
+//! step refuses a text that arrives inline (`Corrupt`). Property lists are kept whole and read in place
+//! ([`Repository::content`]); a text whose bytes a property list holds too is read as that list's bytes. Before, records
+//! kept every text as an svndiff of version 2 against its node's skip-delta predecessor (S4 slice 2 c2, A-727 (c)): a
+//! second text path a daemon no longer took after C2 stage B, removed with its delta chains and window reads.
 //!
 //! A repository is also the drive's [`Green`] (A-617): it reads the texts and property lists it holds and names new
 //! ones as it keeps them, so a client's drive and its commit run over one set of records.
@@ -89,14 +86,6 @@ pub struct Repository {
   revision_properties: Vec<Properties>,
   /// Every property list a node-revision names, by content identity, whole (FSFS's form, read in place).
   contents: BTreeMap<ContentIdentity, Vec<u8>>,
-  /// Every text a node-revision names, by content identity, as a delta against its skip-delta predecessor's text
-  /// (S4 slice 2 c2, module docs "Texts").
-  texts: BTreeMap<ContentIdentity, KeptText>,
-  /// How many texts were made whole from their chains ([`Repository::text`]): a read makes a window at a time
-  /// ([`Repository::text_at`]) and never counts here.
-  made_whole: std::cell::Cell<u64>,
-  /// How many delta windows reads made ([`Repository::windows_made`]).
-  windows_made: std::cell::Cell<u64>,
   /// Every text a commit brought through its sink (§4.17.1 "A push's intake"; main's ruling of 2026-11-20 on c2 and
   /// (B)), by content identity, with its length: held once in the repository's content store, read through the lent
   /// [`TextSource`], never copied or deltified here.
@@ -126,9 +115,6 @@ impl Repository {
       index: Index::new(),
       revision_properties: vec![properties],
       contents: BTreeMap::new(),
-      texts: BTreeMap::new(),
-      made_whole: std::cell::Cell::new(0),
-      windows_made: std::cell::Cell::new(0),
       stored: BTreeMap::new(),
       locks: LockTable::new(),
       transactions: 0,
@@ -171,9 +157,7 @@ impl Repository {
 
   /// Whether the records hold a text or a property list under `identity`.
   pub fn holds(&self, identity: &ContentIdentity) -> bool {
-    self.contents.contains_key(identity)
-      || self.texts.contains_key(identity)
-      || self.stored.contains_key(identity)
+    self.contents.contains_key(identity) || self.stored.contains_key(identity)
   }
 
   /// The length of a text held in the content store, none for a text the records do not keep as stored.
@@ -186,8 +170,8 @@ impl Repository {
     self.stored.iter().map(|(identity, len)| (identity, *len))
   }
 
-  /// Whether the records hold `identity` as the kind a row names it as: a text (kept as a delta, or bytes a property
-  /// list holds too) or a property list (whole, read in place). The same bytes may be both.
+  /// Whether the records hold `identity` as the kind a row names it as: a text (named stored, or bytes a property list
+  /// holds too) or a property list (whole, read in place). The same bytes may be both.
   fn holds_as(&self, identity: &ContentIdentity, as_text: bool) -> bool {
     if as_text {
       self.holds(identity)
@@ -196,266 +180,37 @@ impl Repository {
     }
   }
 
-  /// The text held under `identity`, made from its delta and its base's, the base's from its own, down its chain of
-  /// skip-delta predecessors (module docs, "Texts": at most `log2` of its node's predecessors deltas applied); none
-  /// when the records hold no such text, or its chain does not hold together.
+  /// The text held under `identity` whose bytes the records hold themselves: a property list's bytes, read as a text
+  /// (module docs, "Texts"); none for a text named stored, whose bytes are where the records' caller holds them.
   pub fn text(&self, identity: &ContentIdentity) -> Option<Cow<'_, [u8]>> {
-    if !self.texts.contains_key(identity) {
-      // A text whose bytes are a property list's too is that list's bytes.
-      return self
-        .contents
-        .get(identity)
-        .map(|bytes| Cow::Borrowed(bytes.as_slice()));
-    }
-    let mut chain = Vec::new();
-    let mut at = *identity;
-    loop {
-      let kept = self.texts.get(&at)?;
-      chain.push(kept);
-      match kept.base {
-        Some(base) if chain.len() <= MAX_CHAIN => at = base,
-        Some(_) => return None,
-        None => break,
-      }
-    }
-    let mut bytes = Vec::new();
-    for kept in chain.iter().rev() {
-      let (_, windows) = svndiff::decode_all(&kept.delta).ok()?;
-      bytes = svndiff::apply_all(&bytes, &windows).ok()?;
-    }
-    self.made_whole.set(self.made_whole.get().saturating_add(1));
-    Some(Cow::Owned(bytes))
+    self
+      .contents
+      .get(identity)
+      .map(|bytes| Cow::Borrowed(bytes.as_slice()))
   }
 
-  /// How many texts were made whole from their chains: the reads' non-vacuity counter (a read makes a window at a time).
-  pub fn texts_made_whole(&self) -> u64 {
-    self.made_whole.get()
-  }
-
-  /// How many delta windows reads asked for were made ([`Repository::text_at`], [`Repository::text_in`]; the base windows
-  /// each is made from are not counted): the reads' non-vacuity counter (a reader with a [`WindowCache`] makes each
-  /// window it reads once).
-  pub fn windows_made(&self) -> u64 {
-    self.windows_made.get()
-  }
-
-  /// [`Repository::text_at`] for a reader keeping `cache` across its steps: the window holding `offset` lent from the
-  /// cache when it holds it, else made once, kept in the cache and lent. A text kept whole is lent in place.
+  /// [`Repository::text`] from `offset` to its end: empty at its end, none past it or for a text the records do not
+  /// hold. `cache` is a reader's window cache, which a text held in one piece does not need.
   pub fn text_in<'a>(
     &'a self,
     identity: &ContentIdentity,
     offset: u64,
-    cache: &'a mut crate::reads::WindowCache,
+    _cache: &'a mut crate::reads::WindowCache,
   ) -> Option<Cow<'a, [u8]>> {
-    if let Some(bytes) = self.contents.get(identity) {
-      return bytes
-        .get(usize::try_from(offset).ok()?..)
-        .map(Cow::Borrowed);
-    }
-    let kept = self.texts.get(identity)?;
-    if offset >= kept.len() {
-      return (offset == kept.len()).then_some(Cow::Borrowed(&[]));
-    }
-    let holds = cache.held.as_ref().is_some_and(|(held, start, bytes)| {
-      held == identity
-        && *start <= offset
-        && offset < start.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
-    });
-    if !holds {
-      let index = kept.window_holding(offset)?;
-      let (start, made) = self.made_window(kept, index, 0)?;
-      cache.held = Some((*identity, start, made));
-    }
-    let (_, start, bytes) = cache.held.as_ref()?;
-    bytes
-      .get(usize::try_from(offset.checked_sub(*start)?).ok()?..)
-      .map(Cow::Borrowed)
+    from_offset(self.text(identity)?, offset)
   }
 
-  /// The bytes of the text held under `identity` from `offset` to the end of the delta window that holds `offset`: one
-  /// window made, its source view made the same way from its base's windows, never the text whole (§4.17.4 item 11: a
-  /// read streams, nothing is assembled whole). Empty at the text's end; none past it, or for a text not held.
+  /// [`Repository::text`] from `offset` to its end, copied: empty at its end, none past it or for a text the records do
+  /// not hold.
   pub fn text_at(&self, identity: &ContentIdentity, offset: u64) -> Option<Vec<u8>> {
-    if let Some(bytes) = self.contents.get(identity) {
-      // A text whose bytes are a property list's too is that list's bytes.
-      return bytes
-        .get(usize::try_from(offset).ok()?..)
-        .map(<[u8]>::to_vec);
-    }
-    let kept = self.texts.get(identity)?;
-    if offset >= kept.len() {
-      return (offset == kept.len()).then(Vec::new);
-    }
-    let index = kept.window_holding(offset)?;
-    let (start, made) = self.made_window(kept, index, 0)?;
-    made
-      .get(usize::try_from(offset.checked_sub(start)?).ok()?..)
+    self
+      .contents
+      .get(identity)?
+      .get(usize::try_from(offset).ok()?..)
       .map(<[u8]>::to_vec)
   }
 
-  /// Window `index` of `kept`'s delta made: where its bytes start in the text, and the bytes. Its source view comes
-  /// from the base's windows ([`Repository::range_of`]), `depth` deltas down the chain.
-  fn made_window(&self, kept: &KeptText, index: usize, depth: usize) -> Option<(u64, Vec<u8>)> {
-    if depth > MAX_CHAIN {
-      return None;
-    }
-    let (start, _, at) = *kept.windows.get(index)?;
-    let mut decoder = svndiff::Decoder::new();
-    let header = kept.delta.get(..svndiff::HEADER_LEN)?;
-    matches!(
-      decoder.decode(header).ok()?,
-      svndiff::Decoded::Header { .. }
-    )
-    .then_some(())?;
-    let svndiff::Decoded::Window { window, .. } = decoder.decode(kept.delta.get(at..)?).ok()?
-    else {
-      return None;
-    };
-    let source = if window.source_len > 0 {
-      self.range_of(
-        &kept.base?,
-        window.source_offset,
-        window.source_len,
-        depth.saturating_add(1),
-      )?
-    } else {
-      Vec::new()
-    };
-    let mut made = Vec::with_capacity(usize::try_from(window.target_len).ok()?);
-    svndiff::apply(&window, &source, &mut made).ok()?;
-    // A window a read asked for; the base windows its source view is made from are part of making it.
-    if depth == 0 {
-      self
-        .windows_made
-        .set(self.windows_made.get().saturating_add(1));
-    }
-    Some((start, made))
-  }
-
-  /// `len` bytes of the text held under `identity` from `offset`, made window by window ([`Repository::made_window`]).
-  fn range_of(
-    &self,
-    identity: &ContentIdentity,
-    offset: u64,
-    len: u64,
-    depth: usize,
-  ) -> Option<Vec<u8>> {
-    let end = offset.checked_add(len)?;
-    if let Some(bytes) = self.contents.get(identity) {
-      return bytes
-        .get(usize::try_from(offset).ok()?..usize::try_from(end).ok()?)
-        .map(<[u8]>::to_vec);
-    }
-    let kept = self.texts.get(identity)?;
-    let mut out = Vec::with_capacity(usize::try_from(len).ok()?);
-    let mut at = offset;
-    while at < end {
-      let index = kept.window_holding(at)?;
-      let (start, made) = self.made_window(kept, index, depth)?;
-      let from = usize::try_from(at.checked_sub(start)?).ok()?;
-      let to = usize::try_from(
-        end
-          .min(start.saturating_add(u64::try_from(made.len()).ok()?))
-          .checked_sub(start)?,
-      )
-      .ok()?;
-      let piece = made.get(from..to)?;
-      if piece.is_empty() {
-        return None;
-      }
-      out.extend_from_slice(piece);
-      at = at.saturating_add(u64::try_from(piece.len()).ok()?);
-    }
-    Some(out)
-  }
-
-  /// How many deltas reading the text held under `identity` applies ([`Repository::text`]); none when not held.
-  pub fn text_chain(&self, identity: &ContentIdentity) -> Option<usize> {
-    let mut at = *identity;
-    let mut applied = 0usize;
-    loop {
-      let kept = self.texts.get(&at)?;
-      applied = applied.saturating_add(1);
-      match kept.base {
-        Some(base) if applied <= MAX_CHAIN => at = base,
-        Some(_) => return None,
-        None => return Some(applied),
-      }
-    }
-  }
-
-  /// The delta text `identity` is kept as and the text it is against (S4 c2: an svndiff of version 2 against its
-  /// skip-delta base, none for a first version): what an FSFS view names as a `DELTA` representation (A-645 P3). None
-  /// for a text the records keep whole, its bytes a property list's too.
-  pub fn text_delta(&self, identity: &ContentIdentity) -> Option<(Option<ContentIdentity>, &[u8])> {
-    let kept = self.texts.get(identity)?;
-    Some((kept.base, kept.delta.as_slice()))
-  }
-
-  /// The bytes the texts' deltas hold.
-  pub fn text_bytes(&self) -> u64 {
-    self
-      .texts
-      .values()
-      .map(|kept| u64::try_from(kept.delta.len()).unwrap_or(u64::MAX))
-      .fold(0, u64::saturating_add)
-  }
-
-  /// Keeps the texts `fresh` brings that the rows of `revision` name (module docs, "Texts"): each as a delta against
-  /// the text of its node's skip-delta predecessor, a first version against nothing; property lists whole. What the
-  /// texts' deltas take less than their bytes did.
-  fn keep_fresh(
-    &mut self,
-    revision: Revision,
-    changes: &[ChangedPath],
-    fresh: BTreeMap<ContentIdentity, Vec<u8>>,
-  ) -> Result<u64, StepRefusal> {
-    let mut saved = 0u64;
-    for change in changes {
-      saved = saved.saturating_add(self.keep_one_fresh(revision, change, &fresh)?);
-    }
-    self.keep_lists(changes, fresh);
-    Ok(saved)
-  }
-
-  /// Keeps the text `change` names, if `fresh` brings it and the records do not hold it ([`Repository::keep_fresh`]'s
-  /// one row): a delta against its node's skip-delta predecessor's text. What its delta takes less than its bytes did.
-  fn keep_one_fresh(
-    &mut self,
-    revision: Revision,
-    change: &ChangedPath,
-    fresh: &BTreeMap<ContentIdentity, Vec<u8>>,
-  ) -> Result<u64, StepRefusal> {
-    let Some(text) = change.text else {
-      return Ok(0);
-    };
-    if self.texts.contains_key(&text.identity) {
-      return Ok(0);
-    }
-    let Some(bytes) = fresh.get(&text.identity) else {
-      return Ok(0);
-    };
-    let base = self.skip_base(&change.path, revision, &text.identity);
-    let base_bytes = match base {
-      Some(base) => self.text(&base).ok_or(StepRefusal::Corrupt)?.into_owned(),
-      None => Vec::new(),
-    };
-    let (delta, windows) = encode_delta(&base_bytes, bytes).ok_or(StepRefusal::Corrupt)?;
-    let saved = u64::try_from(bytes.len())
-      .unwrap_or(u64::MAX)
-      .saturating_sub(u64::try_from(delta.len()).unwrap_or(u64::MAX));
-    self.texts.insert(
-      text.identity,
-      KeptText {
-        base,
-        delta,
-        windows,
-      },
-    );
-    Ok(saved)
-  }
-
-  /// Keeps whole the property lists `changes` name that `fresh` brings; a text's bytes are in its delta alone.
+  /// Keeps whole the property lists `changes` name that `fresh` brings (module docs, "Texts": no text is kept).
   fn keep_lists(&mut self, changes: &[ChangedPath], fresh: BTreeMap<ContentIdentity, Vec<u8>>) {
     let lists: BTreeSet<ContentIdentity> = changes
       .iter()
@@ -469,32 +224,6 @@ impl Repository {
         self.contents.insert(identity, bytes);
       }
     }
-  }
-
-  /// The text of the skip-delta predecessor of the node at `path` in `revision` (FSFS's rule, `fs_fs.c`
-  /// `choose_delta_base`: the predecessor whose count is the node's with its lowest set bit cleared); none for a node with
-  /// no predecessor, one whose base holds no text the records keep, or the text itself.
-  fn skip_base(
-    &self,
-    path: &str,
-    revision: Revision,
-    identity: &ContentIdentity,
-  ) -> Option<ContentIdentity> {
-    let base = self.skip_target(path, revision)?;
-    (base != *identity && self.texts.contains_key(&base)).then_some(base)
-  }
-
-  /// The text of the skip-delta predecessor of the node at `path` in `revision`, wherever it is kept; none for a node
-  /// with no predecessor, or one with no text.
-  fn skip_target(&self, path: &str, revision: Revision) -> Option<ContentIdentity> {
-    let node = self.index.node(path, revision).ok().flatten()?;
-    let count = node.predecessor_count();
-    let target = count & count.saturating_sub(1);
-    let mut at = node;
-    for _ in 0..count.saturating_sub(target) {
-      at = self.index.node_revision(at.predecessor()?).ok()?;
-    }
-    Some(at.text()?.identity)
   }
 
   /// The properties a node's property list holds.
@@ -687,7 +416,8 @@ impl Repository {
       },
       properties,
       contents: fresh.into_iter().collect(),
-      // An import's texts arrive whole: kept by the records (`KeptText`) until imports stream too.
+      // An import's texts arrive whole, among the contents: its caller takes them out and stores them before the
+      // step (`Repository::take_texts`), which keeps none.
       stored: BTreeMap::new(),
       lock_entries: Vec::new(),
     })
@@ -749,8 +479,8 @@ impl Repository {
       lock_entries,
     } = checked;
     let (revision, changes, held) = self.apply_rows(planned, &properties, &fresh, &lock_entries)?;
-    let saved = self.keep_fresh(revision, &changes, fresh)?;
-    self.finish_revision((stored, properties), (held, saved));
+    self.keep_lists(&changes, fresh);
+    self.finish_revision((stored, properties), held);
     Ok(revision)
   }
 
@@ -790,22 +520,21 @@ impl Repository {
     Ok((revision, changes, held))
   }
 
-  /// [`Repository::apply`]'s last part, once its texts are kept: its stored texts named, its properties kept, and what
-  /// the records hold, `held` less what the deltas `saved`.
+  /// [`Repository::apply`]'s last part, once its property lists are kept: its stored texts named, its properties
+  /// kept, and what the records hold.
   fn finish_revision(
     &mut self,
     (stored, properties): (BTreeMap<ContentIdentity, u64>, Properties),
-    (held, saved): (u64, u64),
+    held: u64,
   ) {
     for (identity, len) in stored {
       self.stored.entry(identity).or_insert(len);
     }
     self.revision_properties.push(properties);
-    self.held = held.saturating_sub(saved);
+    self.held = held;
   }
 
-  /// A recorded revision's replay begun ([`RevisionReplay`]; R4: a recovery replayed a revision's record whole, its every
-  /// text deltified in one step): checked as [`Repository::commit_record`] checks it.
+  /// A recorded revision's replay begun ([`RevisionReplay`]): checked as [`Repository::commit_record`] checks it.
   ///
   /// # Errors
   /// Every refusal of [`Repository::check`]'s.
@@ -815,16 +544,15 @@ impl Repository {
     })
   }
 
-  /// One step of `replay` ([`RevisionReplay`]): its rows applied at its first step, then the texts of at most `most`
-  /// of its rows (one at least) kept each step, then its properties and stored texts; the revision once it is whole,
-  /// none while steps remain. Until then the records are mid-revision, which a recovery lends to no reader.
+  /// One step of `replay` ([`RevisionReplay`]): its rows applied at its first step, its property lists, properties and
+  /// stored texts kept at its second; the revision once it is whole, none while a step remains. Until then the records
+  /// are mid-revision, which a recovery lends to no reader.
   ///
   /// # Errors
   /// Every refusal of [`Repository::apply`]'s; [`StepRefusal::Corrupt`] for a replay already ended.
   pub fn replay_step(
     &mut self,
     replay: &mut RevisionReplay,
-    most: usize,
   ) -> Result<Option<Revision>, StepRefusal> {
     match std::mem::replace(&mut replay.stage, ReplayStage::Ended) {
       ReplayStage::Checked(checked) => {
@@ -837,46 +565,27 @@ impl Repository {
         } = *checked;
         let (revision, changes, held) =
           self.apply_rows(planned, &properties, &fresh, &lock_entries)?;
-        replay.stage = ReplayStage::Keeping(Box::new(Keeping {
+        replay.stage = ReplayStage::Applied(Box::new(Applied {
           revision,
           changes,
-          at: 0,
           fresh,
           stored,
           properties,
           held,
-          saved: 0,
         }));
         Ok(None)
       }
-      ReplayStage::Keeping(mut keeping) => {
-        let end = keeping
-          .at
-          .saturating_add(most.max(1))
-          .min(keeping.changes.len());
-        while keeping.at < end {
-          if let Some(change) = keeping.changes.get(keeping.at) {
-            let saved = self.keep_one_fresh(keeping.revision, change, &keeping.fresh)?;
-            keeping.saved = keeping.saved.saturating_add(saved);
-          }
-          keeping.at = keeping.at.saturating_add(1);
-        }
-        if keeping.at < keeping.changes.len() {
-          replay.stage = ReplayStage::Keeping(keeping);
-          return Ok(None);
-        }
-        let Keeping {
+      ReplayStage::Applied(applied) => {
+        let Applied {
           revision,
           changes,
           fresh,
           stored,
           properties,
           held,
-          saved,
-          ..
-        } = *keeping;
+        } = *applied;
         self.keep_lists(&changes, fresh);
-        self.finish_revision((stored, properties), (held, saved));
+        self.finish_revision((stored, properties), held);
         Ok(Some(revision))
       }
       ReplayStage::Ended => Err(StepRefusal::Corrupt),
@@ -972,18 +681,15 @@ impl Repository {
       if self.holds_as(&identity, as_text) || fresh.contains_key(&identity) {
         continue;
       }
-      // A text its commit stored in the content store: the records name it, and hold none of its bytes.
-      if as_text && stored.contains_key(&identity) {
-        continue;
+      if as_text {
+        // A text its commit stored: the records name it, and hold none of its bytes. One the revision carries inline
+        // is refused (module docs, "Texts"): its caller stores it first (`Repository::take_texts`).
+        if stored.contains_key(&identity) {
+          continue;
+        }
+        return Err(StepRefusal::Corrupt);
       }
-      // A property list whose bytes the records hold as a text is those bytes: no client brings what is held.
-      let bytes = match brought.remove(&identity) {
-        Some(bytes) => bytes,
-        None => self
-          .text(&identity)
-          .ok_or(StepRefusal::Corrupt)?
-          .into_owned(),
-      };
+      let bytes = brought.remove(&identity).ok_or(StepRefusal::Corrupt)?;
       fresh.insert(identity, bytes);
     }
     Ok(fresh)
@@ -1013,68 +719,8 @@ impl Repository {
   }
 }
 
-/// A text the records keep (module docs, "Texts"): the text it was made against, none for a first version, and the
-/// svndiff (version 2, LZ4 sections) that makes it from that text.
-#[derive(Clone, Debug)]
-struct KeptText {
-  /// The skip-delta predecessor's text the delta is against.
-  base: Option<ContentIdentity>,
-  /// The delta's bytes.
-  delta: Vec<u8>,
-  /// Each window of the delta: where its target bytes start in the text, how many it makes, and where its encoding
-  /// starts in [`KeptText::delta`], so a read makes the window it needs alone ([`Repository::text_at`]).
-  windows: Vec<(u64, u64, usize)>,
-}
-
-impl KeptText {
-  /// The text's length: what its windows make.
-  fn len(&self) -> u64 {
-    self
-      .windows
-      .last()
-      .map_or(0, |(start, len, _)| start.saturating_add(*len))
-  }
-
-  /// The window whose target bytes hold `offset`.
-  fn window_holding(&self, offset: u64) -> Option<usize> {
-    let after = self
-      .windows
-      .partition_point(|(start, _, _)| *start <= offset);
-    let index = after.checked_sub(1)?;
-    let (start, len, _) = self.windows.get(index)?;
-    (offset < start.saturating_add(*len)).then_some(index)
-  }
-}
-
-/// The most deltas one read applies: a node's predecessor count is a `u64`, and the skip-delta rule halves the distance
-/// to the first version at every step (module docs, "Texts"), so a chain longer than this does not hold together.
-/// Derived: a `u64`'s 64 halvings, and the first version.
-const MAX_CHAIN: usize = 65;
-
-/// An encoded delta and its windows: each window's (offset into the target, target length, offset into the delta).
-type EncodedDelta = (Vec<u8>, Vec<(u64, u64, usize)>);
-
-/// `target` as an svndiff of version 2 against `source`, each window's sections LZ4 blocks where that is shorter, as
-/// FSFS 1.10 and later write a representation; none if the encoder refuses a window it made, which it never does.
-fn encode_delta(source: &[u8], target: &[u8]) -> Option<EncodedDelta> {
-  let room = std::num::NonZeroUsize::new(usize::try_from(svndiff::WINDOW_LIMIT).ok()?)?;
-  let mut encoder = svndiff::Encoder::new(svndiff::Version::Two);
-  let mut out = encoder.header().to_vec();
-  let mut windows = Vec::new();
-  let mut made = 0u64;
-  for window in svndiff::deltas(source, target, room).ok()? {
-    windows.push((made, window.target_len, out.len()));
-    made = made.saturating_add(window.target_len);
-    encoder
-      .window(&window, svndiff::Compression::Lz4, &mut out)
-      .ok()?;
-  }
-  Some((out, windows))
-}
-
-/// A recorded revision's replay a bounded step at a time ([`Repository::replay_revision`], [`Repository::replay_step`];
-/// R4 of Ada's close list: a recovery replayed a revision's record whole, every text it brought deltified in one step,
-/// so one large revision held its shard): where it stands.
+/// A recorded revision's replay a step at a time ([`Repository::replay_revision`], [`Repository::replay_step`]): where it
+/// stands. Its rows are applied at one step and the rest kept at the next, so a recovery yields between them.
 #[derive(Debug)]
 pub struct RevisionReplay {
   /// Where it stands.
@@ -1086,31 +732,27 @@ pub struct RevisionReplay {
 enum ReplayStage {
   /// Checked; its rows not yet applied.
   Checked(Box<Checked>),
-  /// Its rows applied; its texts being kept a step's worth at a time.
-  Keeping(Box<Keeping>),
+  /// Its rows applied; its property lists, properties and stored texts not yet kept.
+  Applied(Box<Applied>),
   /// Ended.
   Ended,
 }
 
-/// A replayed revision's texts being kept ([`ReplayStage::Keeping`]).
+/// A replayed revision whose rows are applied ([`ReplayStage::Applied`]).
 #[derive(Debug)]
-struct Keeping {
+struct Applied {
   /// The revision.
   revision: Revision,
   /// Its rows.
   changes: Vec<ChangedPath>,
-  /// How many of its rows' texts are kept.
-  at: usize,
-  /// The texts and property lists it brought.
+  /// The property lists it brought.
   fresh: BTreeMap<ContentIdentity, Vec<u8>>,
   /// The texts its commit stored.
   stored: BTreeMap<ContentIdentity, u64>,
   /// Its revision properties.
   properties: Properties,
-  /// What the records hold with it before its deltas save.
+  /// What the records hold with it.
   held: u64,
-  /// What its texts' deltas have saved so far.
-  saved: u64,
 }
 
 /// A revision the commit step checked against a repository ([`Repository::check`]): what [`Repository::apply`]
@@ -1298,8 +940,8 @@ pub trait TextSource {
   }
 }
 
-/// The records hold their own texts until the green's content index serves them (S4's second slice, A-716): a text
-/// is the bytes held under its identity.
+/// The records as a text source: the text bytes they hold themselves, a property list's read as a text (module docs,
+/// "Texts"); every text named stored is the caller's source's ([`WithTexts`]).
 impl TextSource for Repository {
   fn text(&self, identity: &ContentIdentity) -> Option<Cow<'_, [u8]>> {
     Repository::text(self, identity)
@@ -1323,23 +965,11 @@ impl TextSource for Repository {
   }
 }
 
-/// A text being read a bounded step at a time ([`TextSource::read_step`]): the bytes read so far, and, for a text the
-/// records keep as a chain of deltas, where its rebuild stands: the chain from its first delta, the level being made,
-/// how much of that level's delta is decoded, the level below whole and the level being made so far.
+/// A text being read a bounded step at a time ([`TextSource::read_step`]): the bytes read so far.
 #[derive(Clone, Debug, Default)]
 pub struct TextReading {
   /// The text's bytes read so far; the whole text once a step answered true.
   bytes: Vec<u8>,
-  /// The chain's identities, its first delta (against nothing) first; empty before the rebuild's first step.
-  chain: Vec<ContentIdentity>,
-  /// The level being made, an index into `chain`.
-  level: usize,
-  /// How many bytes of that level's delta are decoded.
-  decoded: usize,
-  /// The delta's decoder.
-  decoder: svndiff::Decoder,
-  /// The level below, whole: the source the level's windows read.
-  below: Vec<u8>,
 }
 
 impl TextReading {
@@ -1382,74 +1012,14 @@ impl TextReading {
 }
 
 impl Repository {
-  /// The chain of kept texts `identity`'s is made from, its first delta first: none for a chain past [`MAX_CHAIN`] or
-  /// one naming a text not kept.
-  fn chain_of(&self, identity: &ContentIdentity) -> Option<Vec<ContentIdentity>> {
-    let mut chain = Vec::new();
-    let mut at = *identity;
-    loop {
-      let kept = self.texts.get(&at)?;
-      chain.push(at);
-      match kept.base {
-        Some(base) if chain.len() <= MAX_CHAIN => at = base,
-        Some(_) => return None,
-        None => break,
-      }
-    }
-    chain.reverse();
-    Some(chain)
-  }
-
   /// One step of reading the text held under `identity` into `reading` ([`TextSource::read_step`]): a property list's
-  /// bytes copied a window's room a step; a kept text made from its chain one svndiff window a step, its first delta
-  /// first, each level read against the one below it whole, as [`Repository::text`] makes it whole.
+  /// bytes, the only text bytes the records hold, copied a window's room a step.
   pub fn read_step(&self, identity: &ContentIdentity, reading: &mut TextReading) -> Option<bool> {
-    if !self.texts.contains_key(identity) {
-      return self
-        .contents
-        .get(identity)
-        .map(|bytes| reading.copy_step(bytes));
-    }
-    if reading.chain.is_empty() {
-      reading.chain = self.chain_of(identity)?;
-      reading.bytes.clear();
-    }
-    let kept = self.texts.get(reading.chain.get(reading.level)?)?;
-    decoded_step(reading, &kept.delta)?;
-    if reading.decoded < kept.delta.len() {
-      return Some(false);
-    }
-    reading.decoder.finish(&[]).ok()?;
-    reading.level = reading.level.checked_add(1)?;
-    reading.decoded = 0;
-    reading.decoder = svndiff::Decoder::new();
-    if reading.level >= reading.chain.len() {
-      reading.below = Vec::new();
-      return Some(true);
-    }
-    reading.below = std::mem::take(&mut reading.bytes);
-    Some(false)
+    self
+      .contents
+      .get(identity)
+      .map(|bytes| reading.copy_step(bytes))
   }
-}
-
-/// The next piece of a level's `delta` decoded into `reading`: its header, or a window applied over the level below;
-/// none for a delta cut short or one that does not decode.
-fn decoded_step(reading: &mut TextReading, delta: &[u8]) -> Option<()> {
-  let rest = delta.get(reading.decoded..)?;
-  match reading.decoder.decode(rest).ok()? {
-    svndiff::Decoded::Header { consumed, .. } => {
-      reading.decoded = reading.decoded.checked_add(consumed)?;
-    }
-    svndiff::Decoded::Window { window, consumed } => {
-      let start = usize::try_from(window.source_offset).ok()?;
-      let end = start.checked_add(usize::try_from(window.source_len).ok()?)?;
-      let view = reading.below.get(start..end)?;
-      svndiff::apply(&window, view, &mut reading.bytes).ok()?;
-      reading.decoded = reading.decoded.checked_add(consumed)?;
-    }
-    svndiff::Decoded::NeedMore { .. } => return None,
-  }
-  Some(())
 }
 
 /// `text` from `offset` to its end: none past it, as a read's source answers.

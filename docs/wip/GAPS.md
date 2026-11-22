@@ -3115,7 +3115,10 @@
 > revision's texts held apart) and the presenter's (its texts in a content store, as a node's are); the FSFS view over
 > them writes every text `PLAIN`, as the presenter's does (the stock `svnadmin` reading of it is main's run: no svn on
 > the Mac); `changeset_ab` reads the records' own deltas and waits on main's call (retire, or derive its deltas);
-> (3) owed: `KeptText`, its delta chains and window reads removed from the records, with the 7 step tests of them).
+> (3) BUILT 2026-11-21, A-842: the records keep no text, a text carried inline refused `Corrupt`, `changeset_ab`
+> retired (its numbers stand in BENCHMARKS at b51f908f2). Owed: the FSFS view's `DELTA` writer has no source now
+> (`fsfs::TextDeltas` answers none everywhere): removed, or fed per-file deltas derived from the changeset log (Ada's
+> ruling of 2026-11-20 ~13:35), main's call; and the stock `svnadmin` reading of the all-`PLAIN` view, main's run).
 > Stage C,
 > an import as one sliced changeset (today a changeset a record). A submitted version's revision (`svn_made`) takes the
 > one landing order since A-804 (2026-11-21, w-rewrite-ops; main 01:52, the deferred-submit hook, `crate::made_commit`):
