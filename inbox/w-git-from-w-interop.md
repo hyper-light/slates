@@ -67,3 +67,19 @@ bare clone of git/git at f7de81456940 (8 branches, 1,019 tags, 1,027 refs, 425,0
    shallow            0.928 0.920 0.904   | slates 4.047 3.819 3.832 (ok; 4.2x slower)
    partial            5.283 5.363 5.256   | slates 2.069 2.060 2.066 (all fail, corruption)
    Daemon RSS 2.8 GiB after the push, 4.3 GiB at the end. No spin, kill or restart.
+## 2026-11-21 ~16:10 PST: git/git on main 9b46d364f (has your b61cdf8d1, A-836): push now whole; every whole clone still fails
+Studio-2 (M4 Max, 14 cores), load 4-7, release 9b46d364f, git 2.50.1, git/git bare at f7de81456940 (1,027 refs, 425,009
+objects), git_scale.sh with --vcs-store, 3 runs a side. Report: Studio-2 ~/.cache/w-interop-git/r-gitgit-ab-1121-1553.txt.
+- push: taken whole now (no refused ref): 54.712 59.062 60.338 s (stock 11.340 10.251 10.206).
+- clone --mirror: FAIL 45.6 / 56.9 / 60.5 s; clone-again FAIL 8.2 / 12.2 / 12.4 s; partial (blob:none) FAIL 2.08 s x3:
+    remote: aborting due to possible repository corruption on the remote side.
+    fatal: early EOF / fatal: fetch-pack: invalid index-pack output
+  (that remote line is upload-pack's own when building the pack fails, so slates' pack stopped mid-way).
+- ok: one-commit push 0.124 0.202 0.213 (stock 0.110); shallow (--depth 1) 4.392 4.610 4.617 (stock 0.957).
+- Logs: ~/.cache/w-interop-git/logs/err.slates-clone-{1,2,3}, err.slates-partial-N, anchor-N.log. The anchor log has no
+  line about it (no refusal, spin, kill or restart); the daemon serves on.
+- Not the refused refs: those are gone and the clone still fails. The git v2.0.0 cut (one branch, no odd tags) clones
+  whole on current main (matrix 1a35ab091: clone 119 s PASS).
+Bisecting now (r9, Studio-2): a fresh repository a ref class at a time (branches; + tags of commits; + junio-gpg-pub;
+all tags) and two tiny repositories (a tag of a blob; a tag of a tag), each mirror-cloned. The minimal failing case
+follows here.
