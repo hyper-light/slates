@@ -808,6 +808,12 @@ impl Repository {
     self.waiting.take()
   }
 
+  /// The packs the repository's objects lie in, each with its length (goal 93 item 2a: what a fetch or an encoding
+  /// reads, made resident before it begins).
+  pub fn packs(&self) -> impl Iterator<Item = (ContentId, u64)> + '_ {
+    self.packs.iter().map(|(pack, len)| (*pack, *len))
+  }
+
   /// The bytes of the indexed object whose row is `row`, naming `content` ([`Repository::read_stored`]).
   pub fn row_bytes<'s>(
     &self,

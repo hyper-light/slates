@@ -120,7 +120,11 @@ impl Rates {
         .saturating_sub(start)
         .checked_div(kib)
         .unwrap_or(0);
-      *saved = len.saturating_sub(deflated).saturating_mul(PER_MILLE) / len;
+      *saved = len
+        .saturating_sub(deflated)
+        .saturating_mul(PER_MILLE)
+        .checked_div(len)
+        .unwrap_or(0);
     }
     let mut changed = corpus.clone();
     let step = usize::try_from(KIB).unwrap_or(1);

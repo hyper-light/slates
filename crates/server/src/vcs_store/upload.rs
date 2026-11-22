@@ -131,10 +131,90 @@ impl StoreLender for ShardStores {
   /// amended), every version admitted with no walk has its sets derived, a turn at a time ([`super::git_derive`]), waited
   /// for whole: the answer is made from them.
   async fn encode(&mut self, id: RepositoryId) {
+    // Goal 93 item 2a: the packs the answer reads made resident first, so no read of it meets a let-go window.
+    resident(id).await;
     // A-614 amended: the sets of versions admitted with no walk derived first, which the answer and the encoding read.
     super::git_derive::derive_for_read(id).await;
     super::git_encode::encode_for_fetch(id).await;
   }
+}
+
+/// Counter: a let-go window of a git repository's pack that could not be brought back before a fetch or an encoding
+/// read it (goal 93 item 2a, [`resident`]): its read then refuses typed, as an unreadable object's does. Format: a
+/// counter name.
+pub(crate) const RESIDENT_REFUSED: &str = "vcs_store.git_resident.refused";
+
+/// Makes every pack of git repository `id` resident before a fetch's answer or its encoding reads it (goal 93 item 2a;
+/// main 01a20182's ruling of 2026-11-22 05:45): each let-go window of each pack the repository's objects lie in brought
+/// back from the node's store (`super::read_through::bring_back`), a window at a time off the shard's step. A clone
+/// reads nearly every window of its packs, so bringing them back first costs what reading through would, and no read
+/// of the answer, which cannot be taken again mid-pack byte for byte, meets a let-go window. Its windows are let go
+/// again once the repository is idle. The bytes brought back; a window that could not be counted [`RESIDENT_REFUSED`].
+pub(crate) async fn resident(id: RepositoryId) -> u64 {
+  let away = crate::state::with_state(|state| {
+    let (content, store) = state.vcs_stores.git(id)?;
+    Some(away_in(content, store.repository.packs()))
+  })
+  .flatten()
+  .unwrap_or_default();
+  brought_back_all(away).await
+}
+
+/// The let-go windows of `packs` (each a pack and its length) in `content`, each as the read that would meet it waits
+/// for it: one an away window, none for a pack held whole.
+pub(crate) fn away_in(
+  content: &slates_vcs::ContentStore,
+  packs: impl Iterator<Item = (slates_vcs::ContentId, u64)>,
+) -> Vec<slates_git::store::packed::Waited> {
+  let window = to_u64(content.window()).max(1);
+  packs
+    .flat_map(|(pack, len)| {
+      (0..len.div_ceil(window))
+        .map(move |index| index.saturating_mul(window))
+        .filter(|offset| content.away_window(&pack, len, *offset).is_some())
+        .map(move |offset| slates_git::store::packed::Waited { pack, len, offset })
+        .collect::<Vec<_>>()
+    })
+    .collect()
+}
+
+/// Brings back each of `away`'s windows from the node's store: the bytes put back; each one refused counted
+/// [`RESIDENT_REFUSED`].
+pub(crate) async fn brought_back_all(away: Vec<slates_git::store::packed::Waited>) -> u64 {
+  let mut brought = 0_u64;
+  for waited in away {
+    match super::read_through::bring_back(waited).await {
+      Ok(bytes) => brought = brought.saturating_add(bytes),
+      Err(_) => {
+        let _ = crate::state::with_state_counted(|state| state.count(RESIDENT_REFUSED, 1));
+      }
+    }
+  }
+  brought
+}
+
+/// Brings back the let-go window a read of git repository `id` met and noted (`Repository::waiting`), where one did;
+/// whether one did (goal 93 item 2a: what a driver checks after every turn, so the next turn reads it).
+pub(crate) async fn brought_back_waited(id: RepositoryId) -> bool {
+  let waited = crate::state::with_state(|state| {
+    state
+      .vcs_stores
+      .git(id)
+      .and_then(|(_, store)| store.repository.waiting())
+  })
+  .flatten();
+  let Some(waited) = waited else {
+    return false;
+  };
+  if super::read_through::bring_back(waited).await.is_err() {
+    let _ = crate::state::with_state_counted(|state| state.count(RESIDENT_REFUSED, 1));
+  }
+  true
+}
+
+/// `len` as a word.
+fn to_u64(len: usize) -> u64 {
+  u64::try_from(len).unwrap_or(u64::MAX)
 }
 
 /// Runs `step` over repository `id`'s git store on `state`'s shard (the module doc): as upload-pack answers a request of
