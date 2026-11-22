@@ -57,12 +57,14 @@ fail() { FAILS=$((FAILS + 1)); echo "FAIL $*" | tee -a "$RESULTS"; }
 # Runs stock hg as step $2 of server $1, with the config words of key $3 (stock, http, ssh, or none: a local command),
 # the rest its arguments, bounded; keeps its output and status as WORK/<server>.<step>.{out,err,status}. Stock is the
 # oracle: its status is recorded; another server's must equal it, or the step FAILs with both statuses and the tail of
-# its stderr.
+# its stderr, then what the slates anchor and daemon logged while the step ran (`anchor_since`): a watchdog's kill, a
+# restart, a refusal, so a failing round names its cause.
 run() {
-  local server=$1 name=$2 key=$3 code want
+  local server=$1 name=$2 key=$3 code want from
   shift 3
   local -a words=()
   [ "$key" != none ] && eval 'words=(${CFG_'"$key"'[@]+"${CFG_'"$key"'[@]}"})'
+  from=$(anchor_lines)
   bounded "${H[@]}" ${words[@]+"${words[@]}"} "$@" > "$WORK/$server.$name.out" 2> "$WORK/$server.$name.err"
   code=$?
   echo "$code" > "$WORK/$server.$name.status"
@@ -77,7 +79,17 @@ run() {
     local why="status $code, stock's $want"
     [ "$code" = 142 ] && why="$why: killed at the ${BOUND}s bound (a hang; an HTTP edge spin is GAPS' vcs_http.rs:850)"
     fail "$server $name: $why; stderr: $(tail -3 "$WORK/$server.$name.err" | tr '\n' ' ')"
+    anchor_since "$from" | sed 's/^/  anchor: /' | tee -a "$RESULTS"
   fi
+}
+
+# How many lines the slates anchor's log holds now (0 before an anchor starts).
+anchor_lines() { if [ -n "${ANCHOR_LOG:-}" ] && [ -f "$ANCHOR_LOG" ]; then wc -l < "$ANCHOR_LOG" | tr -d ' '; else echo 0; fi; }
+
+# What the slates anchor and its daemon logged after line $1, their start's derived values left out, the last 30 lines.
+anchor_since() {
+  [ -n "${ANCHOR_LOG:-}" ] && [ -f "$ANCHOR_LOG" ] || return 0
+  tail -n "+$(($1 + 1))" "$ANCHOR_LOG" | grep -vE '^slates daemon: [a-z0-9_]+ = ' | tail -30
 }
 
 # The state of repository $1 as WORK/state.$2.<kind>: every changeset (node, parents, branch, phase), tags, bookmarks,
@@ -146,6 +158,7 @@ start_stock() {
 # URL_http, URL_ssh, CFG_http, CFG_ssh, ANCHOR, DAEMON.
 start_slates() {
   local instance="w-balance-hgc-$$-$1" log="$WORK/anchor-$1.log" exports token streak=0 port sshport fp known
+  ANCHOR_LOG=$log
   mkdir -p "$WORK/store-$1"
   "$SLATES" --instance "$instance" anchor --vcs-http 127.0.0.1:0 --vcs-ssh 127.0.0.1:0 --vcs-store "$WORK/store-$1" \
     > /dev/null 2> "$log" &

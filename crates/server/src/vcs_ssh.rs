@@ -931,7 +931,14 @@ impl<S: SshSite> Link<S> {
     )
     .await;
     match self.settle(outcome)? {
-      Some(Ok(taken)) => self.session.consume_output(taken).map_err(|_| Why::Refused),
+      // A socket that takes every write at once never parks the connection, so the loop yields after each: one write
+      // and one offer a poll, however fast the client reads (main 01a20182's fixture round, 2026-11-21: one poll of an
+      // SSH clone ran 3.5 s in `vcs_ssh::offer`, the daemon killed mid-answer).
+      Some(Ok(taken)) => {
+        let consumed = self.session.consume_output(taken).map_err(|_| Why::Refused);
+        yield_now().await;
+        consumed
+      }
       Some(Err(_)) => {
         self.tracker.abandon();
         Err(Why::Failed)
@@ -984,6 +991,7 @@ impl<S: SshSite> Link<S> {
   /// Hands the unread bytes to the session: whether it took any. The edge's own work on the handshake is counted into
   /// the connection's first measurement, and the handshake ends when the bytes established the transport.
   fn feed(&mut self) -> bool {
+    let _doing = slates_rt::futures::doing("vcs_ssh::feed");
     let started_ns = now_ns();
     let taken = match self.session.receive(&self.unread, started_ns) {
       Ok(taken) => taken,
@@ -1065,6 +1073,8 @@ impl<S: SshSite> Link<S> {
   /// The client's `exec`: dispatched by the site for the proven principal, and accepted; run, or refused as its tool
   /// refuses. The session raises none before a proof; one without a principal is refused as a failed request.
   fn on_exec(&mut self, command: &Asked, git_protocol: Option<&[u8]>) {
+    // A-740: a shard stuck in a connection's step names it.
+    let _doing = slates_rt::futures::doing("vcs_ssh::exec");
     let Some(principal) = self.principal.as_ref() else {
       let _ = self.session.answer_exec(false);
       return;
@@ -1152,6 +1162,7 @@ impl<S: SshSite> Link<S> {
   /// command wrote can reach its client, and a send read as nothing taken would hold the connection for a
   /// [`SessionEvent::Writable`] that never comes.
   fn offer(&mut self) -> Result<Turn, Why> {
+    let _doing = slates_rt::futures::doing("vcs_ssh::offer");
     let Some(running) = self.running.as_mut() else {
       return Ok(Turn::Idle);
     };
@@ -1218,6 +1229,7 @@ impl<S: SshSite> Link<S> {
 
   /// The command exited with `status` and its output is sent: `exit-status`, EOF and close, and the connection closes.
   fn exit(&mut self, status: u32) -> Turn {
+    let _doing = slates_rt::futures::doing("vcs_ssh::exit");
     if self.session.finish(status).is_err() {
       return Turn::Idle;
     }

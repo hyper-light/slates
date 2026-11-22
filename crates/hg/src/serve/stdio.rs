@@ -95,7 +95,7 @@ pub struct Stdio {
   /// The client's bytes not yet served.
   input: Vec<u8>,
   /// Answer bytes for standard output, not yet taken by the channel.
-  stdout: Vec<u8>,
+  stdout: Output,
   /// Error bytes for standard error, not yet taken by the channel.
   stderr: Vec<u8>,
   /// Whether the client's input has ended.
@@ -196,7 +196,7 @@ impl Stdio {
     Self {
       capacity,
       input: Vec::new(),
-      stdout: Vec::new(),
+      stdout: Output::default(),
       stderr: Vec::new(),
       input_ended: false,
       ended: false,
@@ -265,7 +265,7 @@ impl Stdio {
       store,
       &self.input,
       &mut admission,
-      (&mut self.stdout, &mut self.stderr),
+      (self.stdout.buffer(), &mut self.stderr),
       &mut self.answering,
     ) {
       Read::Done(step, used) => self.taken(step, used),
@@ -318,7 +318,7 @@ impl Stdio {
       };
     };
     let mut admission = Admission::new(room);
-    match answering.step(store, &mut admission, &mut self.stdout) {
+    match answering.step(store, &mut admission, self.stdout.buffer()) {
       Ok(true) => Progress::Streamed { more: true },
       Ok(false) => {
         self.answering = None;
@@ -387,7 +387,7 @@ impl Stdio {
     self.push = Pushing::None;
     ssh::respond_error(
       &session::message(&refused),
-      &mut self.stdout,
+      self.stdout.buffer(),
       &mut self.stderr,
     );
     self.taken(
@@ -417,13 +417,13 @@ impl Stdio {
       }
     };
     if let Some(words) = raced {
-      ssh::respond(&words, &mut self.stdout);
+      ssh::respond(&words, self.stdout.buffer());
       let step = Step::Answered {
         refused: Some(Refused::Push),
       };
       return self.taken(step, used);
     }
-    ssh::respond(&[], &mut self.stdout);
+    ssh::respond(&[], self.stdout.buffer());
     self.push = Pushing::Taking(Push {
       heads,
       bundle: Vec::new(),
@@ -465,7 +465,7 @@ impl Stdio {
     };
     match keys::refused(refusal, &request, &mut admission) {
       Ok(answer) => {
-        ssh::respond(&answer, &mut self.stdout);
+        ssh::respond(&answer, self.stdout.buffer());
         let step = Step::Answered {
           refused: Some(Refused::Pushkey(refusal)),
         };
@@ -509,7 +509,7 @@ impl Stdio {
     match batch.step(store, Transport::Ssh, &mut admission) {
       Ok(BatchStep::Answered(answer)) => match admission.charge(ssh::respond_len(&answer)) {
         Ok(()) => {
-          ssh::respond(&answer, &mut self.stdout);
+          ssh::respond(&answer, self.stdout.buffer());
           self.taken(Step::Answered { refused: None }, used)
         }
         Err(past) => self.answered_out_of_band(Refused::from(past), used),
@@ -538,7 +538,7 @@ impl Stdio {
   fn answered_out_of_band(&mut self, refused: Refused, used: usize) -> Progress {
     ssh::respond_error(
       &session::message(&refused),
-      &mut self.stdout,
+      self.stdout.buffer(),
       &mut self.stderr,
     );
     self.taken(
@@ -601,10 +601,10 @@ impl Stdio {
     match core::mem::take(&mut self.push) {
       Pushing::Landing(Asked::Pushkey) => {
         match keys::answer(outcome, admission) {
-          Ok(answer) => ssh::respond(&answer, &mut self.stdout),
+          Ok(answer) => ssh::respond(&answer, self.stdout.buffer()),
           Err(past) => ssh::respond_error(
             &session::message(&Refused::from(past)),
-            &mut self.stdout,
+            self.stdout.buffer(),
             &mut self.stderr,
           ),
         }
@@ -619,7 +619,7 @@ impl Stdio {
           self.batching = None;
           ssh::respond_error(
             &session::message(&refused),
-            &mut self.stdout,
+            self.stdout.buffer(),
             &mut self.stderr,
           );
         }
@@ -655,11 +655,11 @@ impl Stdio {
     match framed {
       Ok((stderr, stdout)) => {
         self.stderr.extend_from_slice(&stderr);
-        self.stdout.extend_from_slice(&stdout);
+        self.stdout.buffer().extend_from_slice(&stdout);
       }
       Err(refused) => ssh::respond_error(
         &session::message(&refused),
-        &mut self.stdout,
+        self.stdout.buffer(),
         &mut self.stderr,
       ),
     }
@@ -677,7 +677,7 @@ impl Stdio {
 
   /// The answer bytes for standard output not yet taken: sent after [`Stdio::stderr`]'s.
   pub fn stdout(&self) -> &[u8] {
-    &self.stdout
+    self.stdout.unsent()
   }
 
   /// The error bytes for standard error not yet taken: sent before [`Stdio::stdout`]'s.
@@ -687,7 +687,14 @@ impl Stdio {
 
   /// The channel took the first `count` bytes of [`Stdio::stdout`].
   pub fn sent_stdout(&mut self, count: usize) {
-    self.stdout.drain(..count.min(self.stdout.len()));
+    self.stdout.taken(count);
+  }
+
+  /// The bytes of standard output moved to make room since the session began ([`Output`]): the non-vacuity count of
+  /// the answer's sending in pieces, nothing for an answer taken in any number of pieces before more is made.
+  #[cfg(test)]
+  pub(crate) fn stdout_moved(&self) -> u64 {
+    self.stdout.moved
   }
 
   /// The channel took the first `count` bytes of [`Stdio::stderr`].
@@ -769,3 +776,56 @@ fn unencodable() -> Refused {
 #[cfg(test)]
 #[path = "stdio_tests.rs"]
 mod tests;
+
+/// Standard output's bytes not yet taken by the channel (found by use, 2026-11-21, main 01a20182's fixture round: an
+/// SSH clone of a 64 MiB revision spun its shard past the watchdog in `vcs_ssh::offer`). The channel takes an answer a
+/// packet at a time, about 32 KiB, and a `Vec` drained from its front moved every byte behind each piece: a 64 MiB
+/// revision's chunk moved about 64 GiB in all. Here a cursor marks what was taken: [`Output::taken`] moves nothing, and
+/// the bytes taken are dropped at once when all are, or before more are written behind them ([`Output::buffer`]), each
+/// byte moved at most once.
+#[derive(Debug, Default)]
+struct Output {
+  /// The bytes written, the first `sent` of them taken.
+  bytes: Vec<u8>,
+  /// How many of `bytes` the channel took.
+  sent: usize,
+  /// Bytes moved to make room: what [`Output::buffer`] moved down.
+  #[cfg(test)]
+  moved: u64,
+}
+
+impl Output {
+  /// The bytes not yet taken.
+  fn unsent(&self) -> &[u8] {
+    self.bytes.get(self.sent..).unwrap_or_default()
+  }
+
+  /// Whether every byte written was taken.
+  fn is_empty(&self) -> bool {
+    self.unsent().is_empty()
+  }
+
+  /// The channel took the next `count` bytes; all taken, the buffer is empty again.
+  fn taken(&mut self, count: usize) {
+    self.sent = self.sent.saturating_add(count).min(self.bytes.len());
+    if self.sent == self.bytes.len() {
+      self.bytes.clear();
+      self.sent = 0;
+    }
+  }
+
+  /// The buffer to write more behind what is not yet taken, the bytes taken dropped first.
+  fn buffer(&mut self) -> &mut Vec<u8> {
+    if self.sent > 0 {
+      #[cfg(test)]
+      {
+        self.moved = self.moved.saturating_add(
+          u64::try_from(self.bytes.len().saturating_sub(self.sent)).unwrap_or(u64::MAX),
+        );
+      }
+      self.bytes.drain(..self.sent);
+      self.sent = 0;
+    }
+    &mut self.bytes
+  }
+}
