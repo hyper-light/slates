@@ -19339,7 +19339,7 @@ fn restore_held_image(
     crate::vcs_store::restore_windows(
       state,
       &held.windows,
-      (&held.lists, &held.names, &held.region_holds),
+      (&held.lists, &held.names, &held.region_holds, &held.aways),
     );
   }
   state.store.content.arena_mut().commit_live();

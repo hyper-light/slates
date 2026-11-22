@@ -602,3 +602,45 @@ fn output_taken_a_packet_at_a_time_moves_no_byte() {
   );
   assert_eq!(output.unsent().len(), PACKET_PIECE + 4);
 }
+
+/// The bytes the channel takes of an answer an offer in [`every_captured_session_is_taken_a_few_bytes_at_a_time`]:
+/// fewer than any answer of the captured sessions holds, so each is taken in many pieces.
+const FEW_BYTES: usize = 3;
+
+/// The SSH clone cut of 2026-11-21 (`Output`: the channel takes an answer a packet at a time). Do: hand each captured
+/// session's client bytes whole, then let the channel take every answer [`FEW_BYTES`] at a time, standard error first,
+/// stepping only once both are taken. Expect the bytes on standard output equal to the session's whole answers, taken
+/// in more pieces than answers, and no byte of standard output moved to make room (`Stdio::stdout_moved` zero): a
+/// drain from the front a piece at a time would move every byte behind each piece.
+#[test]
+fn every_captured_session_is_taken_a_few_bytes_at_a_time() {
+  for (served, client) in session_stores() {
+    let input = [client, b"\n"].concat();
+    let wanted = expected(&served, client).0.stdout;
+    let mut stdio = Stdio::new(input.len());
+    stdio.receive(&input).unwrap();
+    stdio.eof();
+    let (mut stdout, mut pieces, mut answers) = (Vec::new(), 0usize, 0usize);
+    loop {
+      while !stdio.stderr().is_empty() || !stdio.stdout().is_empty() {
+        let err = stdio.stderr().len().min(FEW_BYTES);
+        stdio.sent_stderr(err);
+        let out = stdio.stdout().len().min(FEW_BYTES);
+        stdout.extend_from_slice(&stdio.stdout()[..out]);
+        stdio.sent_stdout(out);
+        pieces += 1;
+      }
+      match stdio.step(&served, ROOM) {
+        Progress::Waiting => break,
+        Progress::Stepped { .. } => answers += 1,
+        _ => {}
+      }
+      if stdio.finished() {
+        break;
+      }
+    }
+    assert_eq!(stdout, wanted, "the session's whole answers");
+    assert!(pieces > answers, "{pieces} pieces for {answers} answers");
+    assert_eq!(stdio.stdout_moved(), 0, "no byte moved to make room");
+  }
+}

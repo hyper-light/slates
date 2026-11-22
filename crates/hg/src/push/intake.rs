@@ -52,6 +52,27 @@ pub enum Refused {
   Unindexed(Unindexed),
 }
 
+impl Refused {
+  /// Where it is the intake past its admission, by a charge, by its changegroup's framing, by a delta's text or by a
+  /// keeping's own room: what was asked past what was left. Such a refusal leaves the intake as it was before the begin
+  /// or the step it refused (the module doc's "Bounded"), so its driver takes that again once its room has grown (main
+  /// 01a20182's ruling of 2026-11-22 03:03: an intake past its admission waits, never refused).
+  pub fn past_admission(&self) -> Option<crate::PastAdmission> {
+    match self {
+      Refused::Unverified(
+        Unverified::PastAdmission(past)
+        | Unverified::Changegroup(crate::changegroup::Refusal::PastAdmission(past))
+        | Unverified::Delta {
+          fault: crate::delta::Refusal::PastAdmission(past),
+          ..
+        },
+      )
+      | Refused::Unindexed(Unindexed::PastAdmission(past)) => Some(*past),
+      _ => None,
+    }
+  }
+}
+
 impl From<Unverified> for Refused {
   fn from(refused: Unverified) -> Self {
     Refused::Unverified(refused)
@@ -416,6 +437,27 @@ struct StoreAsk {
   text: Option<Vec<u8>>,
   /// Why it could not be read, if it could not.
   refused: Option<Refused>,
+}
+
+/// What reading a revision's text as its log's reader reads it found ([`Taker::read_of`]), noted once it is kept
+/// ([`Taker::apply_read`]).
+enum ReadAs {
+  /// A changeset, and the manifest it names.
+  Changeset {
+    /// The changeset's node.
+    node: Node,
+    /// Its manifest's node.
+    manifest: Node,
+  },
+  /// A manifest, and the entries it writes beside its first parent's.
+  Manifest {
+    /// The manifest's node.
+    node: Node,
+    /// The entries written: each path and its file node.
+    written: Vec<(Vec<u8>, Node)>,
+  },
+  /// A file revision: nothing to note.
+  File,
 }
 
 /// What a file delta's base came to ([`Taker::file_base`]).
@@ -789,24 +831,31 @@ impl Taker {
     self.stage = stage;
   }
 
-  /// Names `log` among the intake's logs, once per log, charging its name.
-  fn note_logged(
-    &mut self,
+  /// The name `log` takes among the intake's logs, once per log, its name charged to `admission`; nothing is noted
+  /// until [`Taker::note_logged`] takes it, so a refusal after it leaves the intake as it was.
+  fn logged_of(
+    &self,
     log: Log<'_>,
     store: &ContentStore,
     admission: &mut Admission,
-  ) -> Result<(), Refused> {
+  ) -> Result<Option<(LogOf, u32)>, Refused> {
     if self.logged {
-      return Ok(());
+      return Ok(None);
     }
     let named = log_of(log);
     admission.charge_items::<(LogOf, u32)>(1)?;
     if let LogOf::File(path) = &named {
       admission.charge(to_u64(path.len()))?;
     }
-    self.intaken.logs.push((named, self.fork.len(store, log)));
-    self.logged = true;
-    Ok(())
+    Ok(Some((named, self.fork.len(store, log))))
+  }
+
+  /// Notes the log [`Taker::logged_of`] charged, where it named one.
+  fn note_logged(&mut self, logged: Option<(LogOf, u32)>) {
+    if let Some(logged) = logged {
+      self.intaken.logs.push(logged);
+      self.logged = true;
+    }
   }
 
   /// Whether revision `node` of `log` is passed over: brought already by this push, or held already by the fork (a
@@ -1037,8 +1086,21 @@ impl Taker {
     (kept, identity): (Option<ContentId>, Option<[u8; 32]>),
     (store, admission): (&mut ContentStore, &mut Admission),
   ) -> Result<(), Refused> {
+    // Every charge first, to a trial of the admission, then the keep, then every note and the trial taken: a refusal
+    // anywhere leaves the intake where it was and the admission unspent, so the step is taken again whole once its room
+    // has grown (main 01a20182's ruling of 2026-11-22 03:03: an intake past its admission waits, never refused).
+    let mut trial = *admission;
+    let read = self.read_of(log, revision, &text, store, &mut trial)?;
+    let logged = self.logged_of(log, store, &mut trial)?;
+    let path = match log {
+      Log::Changelog => CHANGELOG_PATH,
+      Log::Manifest => MANIFEST_PATH,
+      Log::File(path) => path,
+    };
+    trial.charge_items::<Node>(1)?;
+    trial.charge_items::<KeptText>(1)?;
+    trial.charge(to_u64(path.len()))?;
     let mut room = *admission;
-    self.read_as_its_log(log, revision, &text, store, admission)?;
     let arrived = Arrived {
       node: revision.node,
       p1: revision.p1,
@@ -1046,7 +1108,6 @@ impl Taker {
       link: revision.link,
       text,
     };
-    self.note_logged(log, store, admission)?;
     let previous = self
       .last
       .as_ref()
@@ -1059,20 +1120,15 @@ impl Taker {
       kept,
       &mut room,
     )?;
-    admission.charge_items::<Node>(1)?;
+    *admission = trial;
+    self.apply_read(read);
+    self.note_logged(logged);
     self.brought.insert(revision.node);
     self.intaken.kept = self.intaken.kept.saturating_add(1);
     self.intaken.bytes = self
       .intaken
       .bytes
       .saturating_add(to_u64(arrived.text.len()));
-    admission.charge_items::<KeptText>(1)?;
-    let path = match log {
-      Log::Changelog => CHANGELOG_PATH,
-      Log::Manifest => MANIFEST_PATH,
-      Log::File(path) => path,
-    };
-    admission.charge(to_u64(path.len()))?;
     let identity = identity.unwrap_or_else(|| *blake3::hash(&arrived.text).as_bytes());
     self.intaken.texts.push(KeptText {
       path: path.to_vec(),
@@ -1242,25 +1298,24 @@ impl Taker {
     Some(Cow::Owned(text.into_owned()))
   }
 
-  /// Reads `text` as `log`'s reader reads it: a changeset's manifest noted; a manifest's or a file revision's link a
-  /// changeset the fork holds, a manifest's entries read and its first parent noted, a file revision's block split.
-  fn read_as_its_log(
-    &mut self,
+  /// Reads `text` as `log`'s reader reads it, charging `admission` what noting it will hold: a changeset's manifest; a
+  /// manifest's or a file revision's link a changeset the fork holds, a manifest's entries read, a file revision's block
+  /// split. Nothing is noted until [`Taker::apply_read`] takes what it found.
+  fn read_of(
+    &self,
     log: Log<'_>,
     revision: &Revision<'_>,
     text: &[u8],
     store: &ContentStore,
     admission: &mut Admission,
-  ) -> Result<(), Refused> {
+  ) -> Result<ReadAs, Refused> {
     let node = revision.node;
     if log == Log::Changelog {
       let manifest = changeset::decode(text)
         .and_then(|read| read.manifest_node())
         .map_err(|fault| Unverified::Changeset { node, fault })?;
       admission.charge_items::<(Node, Node)>(2)?;
-      self.manifest_of.push((node, manifest));
-      self.intaken.changesets.push(node);
-      return Ok(());
+      return Ok(ReadAs::Changeset { node, manifest });
     }
     if self
       .fork
@@ -1296,10 +1351,22 @@ impl Taker {
         admission.charge(written.iter().fold(0_u64, |bytes, (path, _)| {
           bytes.saturating_add(to_u64(path.len()))
         }))?;
-        self.manifests.push((node, written));
+        return Ok(ReadAs::Manifest { node, written });
       }
     }
-    Ok(())
+    Ok(ReadAs::File)
+  }
+
+  /// Notes what [`Taker::read_of`] read and charged: a changeset's manifest, a manifest's entries written.
+  fn apply_read(&mut self, read: ReadAs) {
+    match read {
+      ReadAs::Changeset { node, manifest } => {
+        self.manifest_of.push((node, manifest));
+        self.intaken.changesets.push(node);
+      }
+      ReadAs::Manifest { node, written } => self.manifests.push((node, written)),
+      ReadAs::File => {}
+    }
   }
 
   /// The check of the new changeset at `at`: its manifest the null node, or one the fork holds.

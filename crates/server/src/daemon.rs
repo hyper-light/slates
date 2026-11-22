@@ -8262,6 +8262,183 @@ mod tests {
     );
   }
 
+  /// What a restart must keep of the repository content store whole (A-767 C1 step 2b): its windows let go with their
+  /// lengths, its lists and its names, each in order.
+  type StoreWhole = (
+    Vec<(slates_vcs::ContentId, u64)>,
+    Vec<slates_vcs::ContentId>,
+    Vec<(slates_vcs::ContentId, slates_vcs::ContentId)>,
+  );
+
+  /// The shard's repository content store as [`StoreWhole`] holds it; none without one.
+  fn store_whole(state: &crate::state::ShardState) -> Option<StoreWhole> {
+    let content = state.vcs_stores.content()?;
+    Some((
+      content.aways().collect(),
+      content.lists().map(|(identity, _)| identity).collect(),
+      content.names().collect(),
+    ))
+  }
+
+  /// Lets go of the shard's repository content store each window of `windows` that `pick` chooses and is still held:
+  /// marked landed, as a changeset carrying it would mark it.
+  fn let_go_picked(
+    state: &mut crate::state::ShardState,
+    windows: &[slates_vcs::ContentId],
+    pick: &mut impl FnMut() -> bool,
+  ) {
+    let lent = crate::vcs_store::Lent::new(&mut state.store, &mut state.vcs_stores);
+    let Some(content) = lent.stores.content_mut() else {
+      return;
+    };
+    for window in windows {
+      if pick() && !content.is_away(window) && content.mark_landed(window) {
+        let _ = content.let_go(window);
+      }
+    }
+  }
+
+  /// A-767 C1 step 2b (main's ruling (a) of 2026-11-22 02:52: the image records the windows let go, and restore keeps
+  /// them; the recovery oracle's shape, `crates/db/tests/model.rs`). Do: on a daemon over a retained anchor segment and
+  /// content object, write `main`'s one file of 1 MiB in a work and submit it; then three times let go a seeded choice of
+  /// its still-held windows, publish, stop and start a successor; at the end bring the object back by its bytes. Expect:
+  /// each successor's content store whole as its predecessor published it (the same windows let go with the same
+  /// lengths, lists and names), none of the image's pieces refused, at least one window let go in all, and the object
+  /// brought back whole by its identity, the same bytes.
+  #[test]
+  fn t_c1_windows_let_go_survive_warm_restarts_whole_and_come_back_by_their_bytes() {
+    use slates_anchor::AnchorSegment;
+    const LARGE: usize = 1 << 20;
+    let profile = test_profile();
+    let instance = format!("c1-away-{}", std::process::id());
+    let store = crate::test_store::TestStore::start("c1-away");
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    config.vcs_disk = Some(store.handle());
+    let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
+      .unwrap()
+      .with_content(&super::content_name_of(&instance), config.content_bytes())
+      .unwrap();
+    let rendezvous = slates_ipc::HeldRendezvous::hold(&instance).unwrap();
+    let source = || {
+      let (handoff, len) = segment.handoff().unwrap();
+      super::SegmentSource::Handoff {
+        handoff,
+        len,
+        content: segment.content_handoff().unwrap(),
+        rendezvous: rendezvous.adoption(),
+      }
+    };
+    let blob: Vec<u8> = (0..LARGE)
+      .map(|at| u8::try_from(at % 251).unwrap_or(u8::MAX))
+      .collect();
+    let identity = slates_vcs::ContentId::of(&blob);
+    let len = u64::try_from(LARGE).unwrap();
+    let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
+    first.bootstrap(true).unwrap();
+    let written = blob.clone();
+    let windows = first
+      .observe(first.shards.first().copied(), move |state| {
+        use crate::vcs_store::paths::tests::{ask, git_repository};
+        use slates_ipc::protocol::{ReplyBody, RequestBody};
+        let (_, green) = git_repository(state, "large");
+        let ReplyBody::WorkCreated { id: work, .. } = ask(
+          state,
+          RequestBody::CreateWork {
+            green,
+            name: "work-large".to_owned(),
+          },
+        ) else {
+          return Vec::new();
+        };
+        ask(
+          state,
+          RequestBody::Edit {
+            work,
+            path: "/large".to_owned(),
+            at: 0,
+            delete_len: 0,
+            bytes: written.clone(),
+          },
+        );
+        ask(state, crate::identities::authored(work, "large"));
+        crate::vcs_store::paths::whole_build::settle(state);
+        let window = state
+          .vcs_stores
+          .content()
+          .map_or(1, slates_vcs::ContentStore::window);
+        written
+          .chunks(window)
+          .map(slates_vcs::ContentId::of)
+          .collect::<Vec<_>>()
+      })
+      .unwrap();
+    assert!(windows.len() > 1, "the file past one window");
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut daemon = first;
+    for _round in 0..3 {
+      let windows = windows.clone();
+      let mut picked = seed;
+      let published = daemon
+        .observe(daemon.shards.first().copied(), move |state| {
+          let mut pick = || {
+            picked = picked
+              .wrapping_mul(6_364_136_223_846_793_005)
+              .wrapping_add(1_442_695_040_888_963_407);
+            picked >> 62 == 0
+          };
+          let_go_picked(state, &windows, &mut pick);
+          store_whole(state)
+        })
+        .unwrap();
+      seed = seed.wrapping_add(1);
+      daemon.publish_every_shard().unwrap();
+      daemon.stop();
+      daemon = super::Daemon::start(&profile, config.clone(), source()).unwrap();
+      let shard = daemon.shards.first().copied();
+      let seen = daemon
+        .observe(shard, |state| {
+          let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+          (
+            store_whole(state),
+            count(crate::vcs_store::NODES_UNRESTORED),
+          )
+        })
+        .unwrap();
+      assert_eq!(
+        seen,
+        (published, 0),
+        "the store whole as published, none refused"
+      );
+    }
+    let blob_back = blob.clone();
+    let after = daemon
+      .observe(daemon.shards.first().copied(), move |state| {
+        // A reader brings it back within the room its step is lent, as every read-through does.
+        crate::vcs_store::within_budget(state, len, |stores| {
+          let content = stores
+            .content_mut()
+            .ok_or(None::<slates_vcs::ContentRefused>)?;
+          let away = content.aways().count();
+          content
+            .bring_back_object(&identity, &blob_back)
+            .map_err(Some)?;
+          Ok::<_, Option<slates_vcs::ContentRefused>>((away, content.object_bytes(&identity, len)))
+        })
+      })
+      .unwrap();
+    daemon.stop();
+    let (away, bytes) = after.expect("the store brought it back");
+    assert!(
+      away > 0,
+      "a window let go in all, so the restore of one was held"
+    );
+    assert_eq!(
+      bytes.as_deref(),
+      Some(blob.as_slice()),
+      "the same bytes by identity"
+    );
+  }
+
   /// P2 with A-727 a3b (main's ruling of 2026-11-21: the pushed path's survival, derived on first read, A-823). Do: on a
   /// daemon over a retained anchor segment and content object, push a create of `main` whose one file is 1 MiB (past any
   /// node's window), and read the file's object by its identity; read `main` through the door and read the object

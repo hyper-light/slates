@@ -253,6 +253,9 @@ pub(crate) struct VcsStores {
   window_storage: Option<Box<dyn slates_vcs::WindowStorage>>,
   /// A recovery's lists and names of the content store (A-727 slice a3b), taken in when the store is made.
   restored_nodes: Option<RestoredNodes>,
+  /// A recovery's windows let go of the content store, each with its length (A-767 C1 step 2b), taken in before the
+  /// lists when the store is made.
+  restored_aways: Vec<(slates_vcs::ContentId, u64)>,
   /// What the content store took back of them: restored, refused (counted by the recovery).
   nodes_restored: (u64, u64),
   /// A recovery's region holds (A-724 piece 8c), held again when the content store is made over the restored windows.
@@ -1360,12 +1363,22 @@ impl VcsStores {
         None => ContentStore::new(self.charged, window),
       }?;
       self.content = Some(content);
-      // A recovery's lists and names (a3b), over the windows the storage handed back: counted by the owner.
+      // A recovery's windows let go, then its lists and names (a3b), over the windows the storage handed back: counted
+      // by the owner. The windows let go first, since a list holds the nodes it names.
+      let aways = std::mem::take(&mut self.restored_aways);
+      let (mut offered, mut refused) = (u64::try_from(aways.len()).unwrap_or(u64::MAX), 0u64);
+      if let Some(content) = self.content.as_mut() {
+        refused = content.restore_away(aways);
+      }
       if let (Some((lists, names)), Some(content)) =
         (self.restored_nodes.take(), self.content.as_mut())
       {
-        let offered = u64::try_from(lists.len().saturating_add(names.len())).unwrap_or(u64::MAX);
-        let refused = content.restore_nodes(lists, names);
+        offered = offered.saturating_add(
+          u64::try_from(lists.len().saturating_add(names.len())).unwrap_or(u64::MAX),
+        );
+        refused = refused.saturating_add(content.restore_nodes(lists, names));
+      }
+      if offered > 0 {
         self.nodes_restored = (offered.saturating_sub(refused), refused);
       }
       if let Some(content) = self.content.as_mut() {
@@ -3553,6 +3566,7 @@ pub(crate) type NodesToRestore<'a> = (
   &'a [(slates_vcs::ContentId, Vec<u8>)],
   &'a [(slates_vcs::ContentId, slates_vcs::ContentId)],
   &'a [slates_vcs::ContentId],
+  &'a [(slates_vcs::ContentId, u64)],
 );
 
 /// Takes the repository windows the shard image names back (A-727 slice a3), before the volumes and the records: each
@@ -3561,13 +3575,15 @@ pub(crate) type NodesToRestore<'a> = (
 pub(crate) fn restore_windows(
   state: &mut ShardState,
   pieces: &[(u64, Vec<u8>)],
-  (lists, names, region): NodesToRestore<'_>,
+  (lists, names, region, aways): NodesToRestore<'_>,
 ) {
   if state.vcs_stores.content.is_some() {
     return;
   }
   // The region holds are taken back with the lists and names, when the content store is made (A-724 piece 8c).
   state.vcs_stores.restored_region = region.to_vec();
+  // The windows let go are taken in before the lists that name them, when the content store is made (A-767 C1 step 2b).
+  state.vcs_stores.restored_aways = aways.to_vec();
   // The lists and names are taken in when the content store is made over the windows (`VcsStores::content_made`).
   if !lists.is_empty() || !names.is_empty() {
     state.vcs_stores.restored_nodes = Some((lists.to_vec(), names.to_vec()));
