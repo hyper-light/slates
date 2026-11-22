@@ -2016,7 +2016,8 @@
 > `slates_vcs::mrc::Curve` (fixed-size SHARDS; `cargo test -p slates-vcs --lib mrc`, 4 of 4, macOS arm64, this Mac).
 > Open: nothing reads content through it yet; the marginal-utility partition and the CPU weights follow.
 > **A-724 piece 2b (A-845): the learned rates built, not yet fed** (`slates_vcs::rate`, `cargo test -p slates-vcs --lib
-> rate::`, 5 of 5, macOS arm64, this Mac). Open: fed on the owner shard beside `usage::Learned`.
+> rate::`, 5 of 5, macOS arm64, this Mac); since 2026-11-21 the one learned demand: it replaced `usage::Learned`, fed
+> at each answered work (`slates_vcs::usage`). Open: principals' `Decayed` and the curves fed on the owner shard.
 > **A-724 piece 2c (A-846): memory by marginal utility built, not yet applied** (`slates_vcs::partition`, `cargo test
 > -p slates-vcs --lib partition::`, 4 of 4, macOS arm64, this Mac). Open: computed on the owner shard and published.
 >

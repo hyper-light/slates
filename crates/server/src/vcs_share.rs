@@ -17,9 +17,9 @@
 //!
 //! **Demand, learned.** The asker claims what it holds and all the shard can admit, so its room is what the others'
 //! claims leave. Each other repository with intakes under way claims what it holds plus, for each intake, the bytes its
-//! next intake is learned to bring (its usage row, `ShardState::vcs_usage`, A-724 piece 2's `slates_vcs::Learned`: a
-//! mean of its answered intakes' bytes decayed by its own rhythm of intakes, so a repository whose pushes grew claims
-//! their new size, not its lifetime's mean). One
+//! next intake is learned to bring (its usage row, `ShardState::vcs_usage`, A-724 piece 2's `slates_vcs::Rates`: the
+//! mean bytes of its answered intakes at the horizon that best predicted each of them, so a repository whose pushes grew
+//! claims their new size, not its lifetime's mean). One
 //! with no answered intake yet claims everything the shard can admit, its first value taken from the machine, never a
 //! literal. Weights are equal: the repository is the unit of fairness (§4.17.5).
 //!
@@ -292,7 +292,7 @@ fn held_by(state: &ShardState, id: RepositoryId) -> u64 {
 
 /// What repository `id` claims with `works` under way (`[intakes, fetches]`) while it holds `held` (module docs, "Demand,
 /// learned"): what it holds plus, for each live work, the bytes a work of its kind is learned to bring or use
-/// (`slates_vcs::Learned`, A-724 pieces 2 and 3d), or all the shard can admit for a kind none of whose works was answered
+/// (`slates_vcs::Rates`, A-724 pieces 2 and 3d), or all the shard can admit for a kind none of whose works was answered
 /// yet.
 fn demand_of(
   state: &ShardState,

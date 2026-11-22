@@ -103,7 +103,7 @@ pub use rate::{Decayed, Rates};
 pub use rule::Compaction;
 pub use share::{Claim, Granted, amount_of, divide, whole_units};
 pub use table::{RowRef, TableRefused, TableView};
-pub use usage::{Learned, Ledger, PrincipalCount, Usage, Work, WorkUsage};
+pub use usage::{Ledger, PrincipalCount, Usage, Work, WorkUsage};
 
 #[cfg(test)]
 mod tests;

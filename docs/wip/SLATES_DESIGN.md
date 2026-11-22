@@ -16513,8 +16513,13 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > decay learned from the repository's own gaps: a ladder of decayed counts at `base · 2^k` up to its age, each gap
 > scored by its Poisson log-likelihood (the intensity at the arrival less its integral over the gap), the best rung the
 > horizon; scale-free (doubled gaps double the horizon exactly); `keep` is the curve's aging; `Decayed`, a principal's,
-> read at its repository's horizon. Owed: feeding both on the owner shard (`slates_vcs::usage`, beside A-724 piece 2's
-> `Learned`, after main's split of A-724 between w-balance and w-multirepo).
+> read at its repository's horizon. One learned demand (main's ruling, 2026-11-21): `Rates` replaced A-724 piece 2a's
+> `usage::Learned`; each usage row's kinds are `Rates`, fed once a work is answered (`Rates::answered`), and its
+> `bytes_per_work` is the mean at a second horizon the same ladder chooses, the rung whose mean best predicted each
+> work's bytes (squared error; the shortest among equals), since a steady rhythm makes the arrival horizon the longest
+> and 100 small intakes then three 64 times larger would read 2.8 small there. Learned's properties held: within the
+> range seen, a new size from its first work, a work after a silence outweighing the past; noisy sizes read as their
+> mean. Owed: the principals' `Decayed` and the curves fed on the owner shard.
 
 > **Status (2026-11-21, A-846: piece 2's memory share by marginal utility).** `slates_vcs::partition`: a shard's room
 > divided among its repositories, each first guaranteed the lesser of A-188's floor (the room over the repositories
