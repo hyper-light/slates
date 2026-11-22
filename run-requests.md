@@ -7153,7 +7153,7 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - **Red:** a tag lookup refused "a .hgtags text not read from the changeset store"; a stream, clone or pull of a pushed
   repository failing `hg verify` (the whole-place change); `vcs_store.hg_lookup_store_asks` unmoved.
 
-## w-sessionlog (2026-11-21 ~11:20 PST), goal 93 git correctness by use -- crates/cli/tests/git_correctness.rs (868bc1fde)
+## w-sessionlog (2026-11-21 ~11:20 PST), goal 93 git correctness by use -- crates/cli/tests/git_correctness.rs (868bc1fde; stock side = git http-backend since b3b818933)
 - Platform: macOS arm64 and Linux x86_64 (a Studio and a Linux runner), RELEASE build of origin/main, git >= 2.50,
   OpenSSH (SSH rows), git-lfs if present (the LFS row skips loudly without it).
 - Tag kinds (seconds):
@@ -7166,7 +7166,7 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   Datasets: (1) git/git whole: `git clone --bare https://github.com/git/git.git` (r16 used f7de81456940, 1,027 refs);
   (2) the Linux tree, shallow cut: `git clone --bare --depth 50000 https://github.com/torvalds/linux.git` (its shallow
   and partial rows are the ones main's piece names); a full Linux mirror only on a box with >100 GB free.
-  Red looks like: any FAIL row; r16 predicts on git/git `push-whole` (junio-gpg-pub, v1.0rc1-6 rejected),
+  Red looks like: any FAIL row; CONFIRMED 16:00 on git/git whole: `push-whole` (junio-gpg-pub, v1.0rc1-6 rejected),
   `ls-remote`, and `clone`/`clone-ssh`/`partial` ("possible repository corruption on the remote side"). Each red row
   -> w-git as its own inbox file with the row's text.
 
@@ -7480,3 +7480,52 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - **Platform:** macOS arm64 (Studio); the gates also on Linux.
 - **Green:** the record's 527 ms is gone. The longest step is the build plus the encoding, about 123 ms at 1 GiB, with
   no watchdog line. **Red:** a hold step past a few ms, or the watchdog firing; send it to w-engine.
+
+- 2026-11-21 (round at ed4661d40), Linux VCS lane failed again: r36 dropped (adacachy didn't answer in 15 s); its
+  resubmit r38 on adacachy2 ran 34 min and "the kiln runner closed the connection". ~/w-lint-vcs-shallow is broken (a
+  `git clone --depth 1` over https that never finished) and there's no log. Three tries this afternoon (sync, full clone,
+  shallow clone) have all died while the code was being brought to adacachy2. Owner: the runner path (adacachy2's
+  GitHub reach or kiln's link), not a slates test. What would unblock it: a working slates checkout on a Linux x86_64
+  runner that I may fetch into.
+
+- w-balance (2026-11-21, A-724 / goal 93 correctness, main's order: many repositories on one daemon; landed 0fb1fd79b):
+    SLATES_MANY_N='2 16 64' SLATES_TEST_HG="uvx --quiet --python 3.12 --from mercurial==7.2 hg" \
+    cargo test --release -p slates-cli --test vcs_many_repositories -- --ignored --nocapture
+  (SLATES_MANY_TOOLS limits the tools; default git hg svn). Platforms: Linux x86_64, macOS arm64, Linux arm64; needs
+  git, stock hg 7.2 and stock svn/svnrdump/svnadmin 1.15, each tool skipped loudly without its client.
+  Green: "MANY N=<n> tools [...]: 0 failures" for every N and the test passes. Red: each "N=<n>: ..." line names the
+  repository and what differed (a push or fetch refused with its client's words; fsck/verify failing; another
+  repository's commits, refs, bookmarks, tags or revisions in its history; its marker wrong; the late repository not
+  whole; the destroyed one still served).
+  Known red today (git, N = 2, macOS debug): only the destroy (no `slates repository destroy` verb exists: completion
+  gap in GAPS); every other check held. A red other than that goes to the tool's owner (w-git, w-hg, w-svn).
+  UPDATE 2026-11-21 (w-multirepo, A-843, 87337c6fa on main): the destroy verb exists; git N = 2 macOS arm64 debug:
+  "MANY N=2 tools [Git]: 0 failures". Expect hg to show w-hg's PastAdmission {asked: 15, left: 0} leak until its fix
+  lands (main 16:48); cite w-hg's red for it.
+
+- w-multirepo (2026-11-21, A-724 piece 7 / A-849, f60f02350 on main; main's 17:22 ruling: CPU equal-weight DRR vs
+  learned weights, the data decides). The many-repository load proof with fetches, as an interleaved release A/B:
+    A = release `slates` built from origin/main (equal-weight DRR per repository, vcs_share::turns)
+    B = release `slates` built from agents/w-multirepo-learned-weights (main's 17:22 ruling: §4.17.5's WFQ, a
+        repository holding its learned CPU demand over the least live one's turns at once), merged onto the same main
+    C = release `slates` built from agents/w-balance-turn-weights (7d4d938bc: a turn per distinct principal + spare
+        turns), merged onto the same main
+  for round in 1 2 3; do for bin in A B C; do
+    python3 crates/cli/bench/multi_repo_load.py $BIN ~/.cache/g309-scale/src.git v0.99 v1.0.0 v1.5.0 \
+      --steps 1,10,100 --per-repository-cap 3 --fetches
+  done; done
+  Platform: macOS arm64, the big Studio (adas-mac-studio.local-2; needs mem=16g, its own --vcs-store dirs under
+  ~/.cache/slates-bench-stores, removed per daemon). Dataset: a bare clone of git/git at ~/.cache/g309-scale/src.git.
+  Read per step and class: push p99 / fair share (one shard a repository), and the new "class N fetches: ... p99 (Kx
+  alone)". Green: class 0 (the smallest) push and fetch within 2x their fair share / alone at R=100, no refusals, daemon
+  alive. Red: a class-0 ratio past 2x, any refusal storm or a daemon gone; B or C wins only if it beats A on class 0's p99
+  in all three rounds without costing the large classes more than it gains (else rejected, recorded in BENCHMARKS).
+  Proved locally (debug, M-series Mac, R=0): push alone 2.3 s, fetch alone 10.3 s, both whole; the steps stopped on this
+  Mac's memory pressure guard (8.9 GB free), as they should.
+- 2026-11-21 (round at 3a00d432d), Linux VCS lane: r46 and its resubmit r51 both ended with "00aad8daff2f... (adacachy2) did not
+  answer the sync in 60s". No test ran. The balancer places every linux/amd64 ask on adacachy2 (adacachy is loaded),
+  and every try today has died bringing the code there: sync, full clone, shallow clone. Owner: adacachy2's kiln link.
+  Need: a Linux x86_64 runner that takes a sync, or that one restored.
+- 2026-11-21 (round at 40d816c29), Linux VCS lane: r53 (adacachy2) and its resubmit r55, which this time went to adacachy
+  451397fc, both ended "did not answer the sync in 60s". Both Linux x86_64 runners now refuse a sync from Studio-2;
+  no test ran. Same owner and same need as above.

@@ -310,3 +310,14 @@ landing and its replay red first.
 - **Left before step 2:** `push/tree.rs`, after the push spin (your order).
 - **Now:** the push spin. Piece A, the intake a window a step, is written with its red test; it compiles in the retest
   build and its own run is next.
+
+## The hg concurrency admission red: FIXED, landed on origin/main 687cd98b1 (commit 521fe3689; 2026-11-21)
+- **Cause:** `vcs_store::index_upkeep::slice` lent each merge step the shard's whole admittable room, and the lend's
+  `make_room` claimed the whole shared arena pool for one shard (28.6 GB). The other shard was left at capacity 0 and
+  admittable 0, and refused even capabilities.
+- **Fix:** a merge step is lent `Merge::cut_bytes`.
+- **Tests:**
+  - the index_upkeep merge tests, red before ("grown 11453071360 of 11453071360") and green after;
+  - by use, concurrency at N=2 and 10 passes (debug).
+- **Git siblings in GAPS:** restage, seal and `git_hooks`' seal lend whole rooms. w-multirepo told.
+- **Next:** the SSH truncation red, then the push spin, then tree.rs.

@@ -424,3 +424,38 @@
 - VCS lane: Linux r36 dropped (adacachy didn't answer in 15 s), so I resubmitted it once as r38 (shallow clone).
   Windows r37 is queued for jupiter.
 - Disk: 33 GB free after the round (other workers' builds), so I deleted my own debug target (19 GB, literal path): 51 GB free.
+- VCS lane, Windows (jupiter, 19ad3d506): git/hg/svn/vcs didn't build (aws-lc-sys needs NASM, missing there; next try
+  AWS_LC_SYS_NO_ASM=1). Server vcs_/git_/hg_/svn_: the process died with exit 4 when the watchdog wedged a shard under
+  parallel load. The hg_push test it hit passes alone (r41), so it went to w-bugs. Linux: r38 still running.
+- VCS lane, Linux: r38 (the resubmit of r36) died with its clone broken after 34 min; in run-requests.md. No Linux count yet.
+
+## 2026-11-21 round at 39c36af9d
+- Red: server tests/merge_check.rs (A-840): casts became try_from, the conflict loop is now resolved_until_rebased,
+  and the harness allow gained unwrap_in_result. merge_check 11/11. The rest of the wall was clean.
+- VCS lane: kiln refused the first submits ("not connected to the kiln server"). Resubmitted as Windows r45
+  (AWS_LC_SYS_NO_ASM=1, server tests 4 at a time) and Linux r46 (synced from Studio-2).
+- Landed e97604cbb (merge_check) and 33e41f583:
+  - vcs mrc.rs: isolate_lowest_one.
+  - server repository.rs: A-843's destroy test split, 24/10.
+  - server idle_sweep.rs: A-838's test is cfg(unix), because it breaks slates-server's Windows lib test build.
+- VCS lane, Windows (jupiter, 6cbbe5ee2, AWS_LC_SYS_PREBUILT_NASM=1; NO_ASM wants CMake): slates-git 589/0 (4 ignored),
+  slates-hg 402/0, slates-svn 584/0 (3 ignored) + fsfs_view 5 + propfind_allocations 1, slates-vcs 110/0. Server
+  vcs_/git_/hg_/svn_ didn't compile on Windows (A-838's test); fixed in 33e41f583, rerun next. Linux: r46 running.
+- VCS lane, Windows server (33e41f583, 4 threads): the process died with exit 4 after 4 tests. The watchdog wedged
+  t_a767_c5's git push task; alone it passes in 0.81 s, so it's on w-bugs (concurrency in one process, not load).
+  No server count on Windows.
+
+## 2026-11-21 round at 3a00d432d
+- Reds:
+  - server hg_push Landing::Unbuilt: boxed (large_enum_variant).
+  - grants.rs and partition/tests.rs: precedence.
+  - vcs content.rs and mrc.rs: two literals derived (size_of::<u64>(), 2^u64::BITS).
+- Focused local: vcs --lib 125, server hg_push|vcs_share 36. Fmt, structural, unsafe and the six cross targets were clean.
+- VCS lane: Linux r46 dropped (adacachy2 didn't answer the sync), so I resubmitted it once as r51. Windows: the counts
+  from the last round stand (crates green); the server's are blocked on w-bugs' watchdog exit.
+- VCS lane, Linux: r46 and r51 both failed adacachy2's sync; in run-requests.md. No Linux count today.
+
+## 2026-11-21 round at 40d816c29 (nothing to land)
+- Clean: host clippy, fmt, structural, literals, unsafe, the six cross targets.
+- VCS lane: Windows r52 (crates at 40d816c29) and Linux r53 (synced) submitted.
+- VCS lane, Linux: r53 (adacachy2) and r55 (adacachy) both failed the sync; in run-requests.md.

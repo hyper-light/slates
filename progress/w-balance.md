@@ -211,3 +211,12 @@ Depends on: w-perf A-723 (one copy per byte), w-git A-719/A-722 (sliced intake).
 - 2026-11-20 (base 0f6814561): v3 (ii) built, gated off: 09427301d codec+replay, c42b938f2 home_in_region, 7317f6cce writer (homing in the decision, edges await), 36c6ed55d rebuild fetches names from region homes (read_in_region). Next: the takeover test (multi-process, crates/cli/tests): no multi-node test takes a repository over today even for v2, so it proves v2 then v3; then flip the gate in the same change; then the release A/B. run31 (co-location) still unread: Studio not answering.
 - 2026-11-20 (base f35a6ca31): homes keep/read whole objects by BLAKE3 (d068491a1, a6b5a4d25); v3 and barrier tests wait on events (f35a6ca31, w-git's report). A/B r71/r73 on the Studio: not answering, memory pressure (354-595 MB free).
 - 2026-11-20 (base c5ba38665): DONE main's three items: owner's token survives takeover (e73283fd6, workaround removed), v3 switch on (08fba4007, homing restored in the HTTP edge + never-wait fallback), local release A/B (c5ba38665: no measurable v3 cost on one node). Earlier today: f95edf68e takeover fix. For main to delete: /Users/adalundhe/slates-work/w-balance-ab (worktree; untracked __pycache__ only).
+
+## 2026-11-21 evening: A-724 handed to w-multirepo (main's 16:43 order); back in goal 93's reserve
+- Landed before the order reached me: 0fb1fd79b (many-repos test), 6cbbe5ee2 (2a learned demand), 6372a0b89 (3b PastShare),
+  de3fd468a + c7b9f66d1 (3c hg/svn intakes counted), 0ff00a51c (3d fetch a live claim). Handoff:
+  inbox/w-multirepo-from-w-balance-handoff.md. Earlier today: 97d8131bc (hg correctness lane), C1 closed.
+- Queued with main (non-93): P4 turn-weights A/B (branch agents/w-balance-turn-weights 7d4d938bc, result now
+  w-multirepo's) and 89a/86a 1,000-client A/B (mine to land or build (a) on its result).
+- For main to delete: ~/slates-work/w-balance (a clone), ~/slates-work/w-balance-docs; on adacachy ~/.cache/w-balance-p2,
+  ~/.cache/w-balance-run32, ~/.cache/w-balance-thin, ~/.cache/w-balance-bin (if made).

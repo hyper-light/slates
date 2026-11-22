@@ -22,6 +22,8 @@ of current origin/main; every run has a timeout_s; each round reported in inbox/
 - N=2 proved locally: 3 of 3 pass (macOS arm64, this Mac, 69 to 237 s), fmt clean.
 - run-requests.md has the round. inbox/main-from-loadtest-scale-93.md has the report.
 - Stopped: rounds are main's; reds go to w-git through main.
+- Main's round GREEN (2026-11-21 16:22 PST): big Studio, release, main b61cdf8d1, SLATES_GIT_CONCURRENCY=2,10,50,
+  3 of 3 in 178 s. Recorded by main. In the reserve.
 
 ## For main to delete
 - ~/slates-work/93-stock-race (the stock-git race control)

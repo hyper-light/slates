@@ -374,3 +374,18 @@ recovery it fails (folded (0, 13)); with the slice deadline taken out the 400-re
 fails. Focused tests 99/99 on the merged tree 10760328f. Still one step a batch: append_versions' pre-record loop
 (w-rewrite-ops', inbox/w-rewrite-ops-from-w-svn-a814-sliced-commit.md) and follow/fold/release after the last slice.
 Next: finding (2) re-measured on the merged tree; main runs git-2000.
+
+## 2026-11-21 evening PST: the KeptText move is done (main's 10:35 item 3, go at 14:52)
+- Piece 1: 41ce54f67 (merged 270df0d72). `migration::Standalone`, records standing alone with their texts held apart.
+  `Repository::take_texts` moved from the server. The migration tests run on it.
+- Piece 2: e465b0e0c (merged dba4ae793). Moved onto it: `fsfs_view`, `propfind_allocations`, `replay_bench`,
+  `fsfs_view_bench`, vcs_ssh's svn tests, and the presenter's tests (texts in a content store).
+- Piece 3, A-842: cc55404fa (merged 2ed0eec43). The records keep no text: `KeptText`, its delta chains and window
+  reads are gone. A text carried inline is refused `Corrupt`. A replay is two steps. `changeset_ab` is retired.
+- Tests: svn lib 584/584, `fsfs_view` 5/5, `propfind_allocations` 1/1, server `--lib svn` 113/113.
+- For main:
+  - Run request: the stock svnadmin/svnlook reading of the all-PLAIN FSFS view (`fsfs_view
+    stock_svnadmin_and_svnlook_read_the_view`, svn 1.15 host).
+  - Their call: the view's DELTA writer has no source now (remove it, or feed it derived deltas).
+  - The ignored git-2000 measurement's column is renamed `records_stored_text_bytes`.
+- Still waiting: main's r2 git-2000 re-measure of A-835, for finding (2).

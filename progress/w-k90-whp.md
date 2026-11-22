@@ -134,5 +134,17 @@ every profile name a run leaves behind here; no other admin steps or installs.
 - Next after A-791: the anchor's credential hold across restart + recovery (A-555 part 3 remainder); then the
   Shards-owed items list (goal 92 part 2).
 
+## 2026-11-21 ~15:50 PST: back after a ~22 h stall (a kiln `output` call hung; adas-macbook-pro-2 restarted, r53 lost)
+- A-791 LANDED on slates main (2da4c55e5, landed by w-k90-microvm for main while I was offline; in cc29bfc4c), then
+  REMOVED by A-795 (6f29c8de5: the S3 base removed whole, Ada 2026-11-20 "I didn't specify s3. I said nfs"). Goal 92b
+  deleted by Ada; nothing of A-555 is left to build.
+- Goal 92a (the six Shards-owed items) was reassigned to w-k90-kvm while I was offline and CLOSED by it
+  (inbox/main-from-w-k90-kvm-close.md, 2026-11-21 ~02:10: items 1, 3, 4 hold; 2, 5, 6 built and landed on kiln
+  110f4115f, 64624e059, 3ba7efe6c). Nothing of 92a is mine.
+- My kiln goal stack: done (WHP goal met). NO assigned work remains.
+- Cleanup done: slates branches agents/w-k90-whp-a555, -a791 and kiln agents/w-k90-whp deleted; ~/slates-work/w-k90-whp-a555
+  and -a791 removed; this MacBook's ~/.cache scratch removed (kept ~/.cache/w-k90-whp-logs, evidence, small).
+- r45 (Linux, FUSE parking test) is moot (parking removed by A-795); stop it if kiln still holds it.
+
 ## For main to delete
-- (none)
+- (none: adas-macbook-pro-2's ~/.cache/w-k90-whp-slates* removed by me 2026-11-21 ~16:00 PST; r45 no longer held by kiln)
