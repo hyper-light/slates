@@ -357,6 +357,108 @@ fn an_overlay_whose_loaded_base_directory_was_removed_recovers_and_refuses_only_
   answers_without_src(&mut recovered_back, &mut host, &mut after_back);
 }
 
+/// An overlay over `/src/lib.rs`, `/src/mod.rs` and `/top.txt` with `/src/lib.rs` read (so `/src` is listed) and
+/// `/src/agent.rs` written in the overlay, imaged: the host, the store and the image.
+fn listed_src_with_an_overlay_file() -> (SimHost, Store, slates_vfs::recover::VolumeImage) {
+  let mut host = SimHost::new();
+  host.mkdir("/src");
+  host.replace_file("/src/lib.rs", b"the base's own");
+  host.replace_file("/src/mod.rs", b"never read");
+  host.replace_file("/top.txt", b"at the root");
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  assert_eq!(
+    read_all(&mut vol, &mut host, &mut store, "/src/lib.rs").unwrap(),
+    b"the base's own"
+  );
+  let src = vol
+    .with_host(&mut host)
+    .resolve(&mut store, "/src")
+    .unwrap();
+  let Child::Dir(src) = src.child else {
+    panic!("/src is a directory");
+  };
+  let agent = vol
+    .with_host(&mut host)
+    .create_file(&mut store, src, "agent.rs", 0o644)
+    .unwrap();
+  vol
+    .with_host(&mut host)
+    .write(&mut store, agent, 0, b"the overlay's own")
+    .unwrap();
+  let image = vol.to_image(&store, Some(&mut host)).unwrap();
+  (host, store, image)
+}
+
+/// Bug (docs/bugs/2026-11-22-overlay-gone-base-directory-first-use.md; w-svn's find on origin/main): since A-833 a
+/// recovery reopens a base directory at its first use, and when that first use was the directory's own attributes (an
+/// NFS LOOKUP's reply) the directory found gone refused itself, `BaseUnavailable`, where every later use answered from
+/// the volume's node. Do: image an overlay whose listed `/src` holds the overlay's `/src/agent.rs`; remove `/src` from
+/// the disk and recover; first of all, stat `/src`. Expect: the stat answers (the directory is the volume's own node),
+/// and the volume answers as `answers_without_src` says.
+#[test]
+fn a_gone_base_directorys_first_use_after_recovery_answers_from_its_node() {
+  let (mut host, store, image) = listed_src_with_an_overlay_file();
+  host.advance_ns(10);
+  host.remove("/src");
+  let (mut after, recovered) = recover_over(&mut host, &store, &image);
+  let mut recovered =
+    recovered.expect("an overlay whose loaded base directory is gone still recovers");
+  let src = recovered
+    .with_host(&mut host)
+    .resolve(&mut after, "/src")
+    .unwrap();
+  assert!(
+    recovered
+      .with_host(&mut host)
+      .stat(&mut after, src.inode)
+      .is_ok(),
+    "the gone directory's first use, its attributes, answers from its node"
+  );
+  answers_without_src(&mut recovered, &mut host, &mut after);
+}
+
+/// Format: the host's code for its descriptors spent (`EMFILE`, 24 on Linux and macOS).
+#[cfg(not(windows))]
+const EXHAUSTED: i32 = 24;
+/// Format: see the other arm; Windows' `ERROR_TOO_MANY_OPEN_FILES` (winerror.h, 4).
+#[cfg(windows)]
+const EXHAUSTED: i32 = 4;
+
+/// Main 01a20182's ruling of 2026-11-22 (A-833's lazy reopen and the descriptor limit): a base directory's first use
+/// after a recovery that meets the descriptor limit refuses that use, never records the live directory gone. Do: image
+/// an overlay whose listed `/src` holds `/src/lib.rs`; recover with `/src` still on the disk; arm the host to refuse the
+/// next open of `/src` with its descriptors spent; read `/src/lib.rs`, then read it again. Expect: the first read
+/// refused `BaseUnavailable` with the host's code, the second the base's bytes, and `/src/mod.rs` the disk's. Red
+/// before: the second read refused too, the directory recorded gone for good.
+#[test]
+fn a_base_directorys_first_use_at_the_descriptor_limit_never_records_it_gone() {
+  let (mut host, store, image) = listed_src_with_an_overlay_file();
+  let (mut after, recovered) = recover_over(&mut host, &store, &image);
+  let mut recovered = recovered.expect("the overlay recovers");
+  let exhausted = slates_vfs::host::OsCode::native(EXHAUSTED);
+  host.fail(
+    slates_vfs::host::sim::SimVerb::OpenDir,
+    "/src",
+    slates_vfs::host::HostError::Unavailable(exhausted),
+    1,
+  );
+  assert_eq!(
+    read_all(&mut recovered, &mut host, &mut after, "/src/lib.rs"),
+    Err(VfsError::BaseUnavailable(Some(exhausted))),
+    "the use at the limit is refused, with the host's code"
+  );
+  assert_eq!(
+    read_all(&mut recovered, &mut host, &mut after, "/src/lib.rs").unwrap(),
+    b"the base's own",
+    "the next use reopens the live directory"
+  );
+  assert_eq!(
+    read_all(&mut recovered, &mut host, &mut after, "/src/mod.rs").unwrap(),
+    b"never read"
+  );
+}
+
 /// The guard beside it: a base directory another directory replaced is not the directory the image recorded, and
 /// reopening a path alone never substitutes another base (§4.5 recovery, "validated source identity"). Do: read a file
 /// in a subdirectory and image the overlay; then make another directory and rename it over the subdirectory; recover.

@@ -585,6 +585,21 @@ pub(crate) const GONE_DIRECTORY: crate::host::OsCode = crate::host::OsCode::Errn
 #[cfg(windows)]
 pub(crate) const GONE_DIRECTORY: crate::host::OsCode = crate::host::OsCode::Win32(2);
 
+/// Whether a host's refusal may pass: the process's or the system's descriptors spent (`EMFILE`, `ENFILE`), or on
+/// Windows its handles (`slates_machine::descriptors`), never a sign that what was opened is gone.
+fn passes(refused: &HostError) -> bool {
+  match refused {
+    #[cfg(unix)]
+    HostError::Unavailable(crate::host::OsCode::Errno(errno)) => {
+      slates_machine::descriptors::is_exhaustion_errno(*errno)
+    }
+    HostError::Unavailable(crate::host::OsCode::Win32(code)) => {
+      slates_machine::descriptors::is_exhaustion_win32(*code)
+    }
+    _ => false,
+  }
+}
+
 /// The code a base directory recovery could not reopen is refused with, typed by its numbering (A-539): the host's own;
 /// [`GONE_DIRECTORY`] when the host says only that it is not there as a directory.
 pub(crate) fn unavailable_code(error: HostError) -> Option<crate::host::OsCode> {
@@ -1932,18 +1947,31 @@ impl Overlay<'_> {
     self.follow_live_disk(store, no)?;
     // A merged directory's link count is known once its listing is (`refresh_dir_nlink`). A directory recovery could not
     // reacquire keeps the count it was recovered with: it is the volume's own node, which holds its overlay entries and
-    // answers for itself, while only its untouched base entries refuse (§4.8's failure matrix).
+    // answers for itself, while only its untouched base entries refuse (§4.8's failure matrix). Since A-833 a recovery
+    // reacquires a directory at its first use, so that use is the one that finds it gone (`reacquire` records it
+    // unavailable and refuses): it answers from the node as every later use does, never refuses the directory itself
+    // (docs/bugs/2026-11-22-overlay-gone-base-directory-first-use.md).
     if let Body::Directory(dir) = self.vol.inode(store, no)?.body
       && store.dirs.get(dir)?.base == BaseDirState::Merged
-      && !self
-        .vol
-        .base
-        .as_ref()
-        .is_some_and(|plane| plane.unavailable.contains_key(&no))
+      && !self.base_dir_unavailable(no)
     {
-      self.load_listing(store, dir)?;
+      match self.load_listing(store, dir) {
+        Ok(_) => {}
+        Err(VfsError::BaseUnavailable(_)) if self.base_dir_unavailable(no) => {}
+        Err(refused) => return Err(refused),
+      }
     }
     self.vol.observe(store, no)
+  }
+
+  /// Whether directory `no`'s base directory is recorded unavailable: gone, unreadable or another at its path, its
+  /// untouched entries refused from here on (`reacquire`).
+  fn base_dir_unavailable(&self, no: InodeNo) -> bool {
+    self
+      .vol
+      .base
+      .as_ref()
+      .is_some_and(|plane| plane.unavailable.contains_key(&no))
   }
 
   /// For an unwitnessed base entry: validates the directory's listing (one `fstat` of the
@@ -2166,7 +2194,14 @@ impl Overlay<'_> {
     {
       self.host.close_dir(opened);
     }
+    // A refusal that passes (descriptors spent) says nothing of the directory: this use is refused, its listing kept, so
+    // the next use reopens it, never recorded gone for good (main 01a20182's ruling of 2026-11-22: under A-833's lazy
+    // reopen a first use at the descriptor limit would otherwise refuse a live directory's untouched entries forever).
+    let passes = passes(&refused);
     let code = unavailable_code(refused);
+    if passes {
+      return Err(VfsError::BaseUnavailable(code));
+    }
     let plane = self.plane()?;
     plane.listings.remove(&dir_no);
     plane.unavailable.insert(

@@ -3789,7 +3789,10 @@
 > its content store lacks before the green's replay; sampled 130.8 MB to 108.0 MB. Owed: main's daemon A/B; piece (c),
 > the batch's commit adopting the scratch member's files; the append's `judge_named` (its own landing, w-git and w-hg
 > told first). Not A-865's: `recovery.rs`'s `an_overlay_whose_base_directory_was_removed_serves_its_own_files_after_a_restart`
-> fails at origin/main 7ced987e6 as well (LOOKUP status, `tests/common/nfs.rs:238`).
+> failed at origin/main 7ced987e6 as well (LOOKUP status, `tests/common/nfs.rs:238`). **Closed (w-interop, 2026-11-22):**
+> A-833's lazy reopen made a gone base directory's first use, its attributes, refuse the directory itself; it now
+> answers from the volume's node, and a reopen that meets the descriptor limit no longer records a live directory gone
+> (`docs/bugs/2026-11-22-overlay-gone-base-directory-first-use.md`).
 > Still to measure: the A-742 floor's A/B only if the
 > footprint still stays (main's ruling). A local 64 KiB floor gave 47 MB of footprint at 2 s idle, against 363 MB, at
 > 19.4 s against 12.0 s (debug).
