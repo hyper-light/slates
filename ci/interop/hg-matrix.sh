@@ -130,7 +130,10 @@ row clone-rev "${HG[@]}" clone -q -r 'default' "$URL" c
 row stream-clone "${HG[@]}" clone -q --stream "$URL" d
 row ssh-clone "${HG[@]}" clone -q "$SSHURL" e
 row ssh-pull "${HG[@]}" -R a pull -q "$SSHURL"
-row ssh-push bash -c "cd e && echo ssh >ssh.txt && ${HG[*]} commit -qAm ssh && ${HG[*]} push -r . $SSHURL"
+# Its own working copy, cloned from `a` on disk (no server), so it pushes over SSH whether or not ssh-clone's `e` was
+# made: on main 01a20182's run 45037561866 every leg's ssh-clone was red and ssh-push failed at 0 s on `cd: e`.
+row ssh-push bash -c "${HG[*]} clone -q a f && cd f && echo ssh >ssh.txt && ${HG[*]} commit -qAm ssh \
+  && ${HG[*]} push -r . $SSHURL"
 
 echo "---- summary ($(printf '%s\n' "${ROWS[@]}" | grep -c '^PASS') of ${#ROWS[@]} passed)"
 echo "daemon peak RSS over every row: $((RUN_PEAK_KIB / 1024)) MiB"
