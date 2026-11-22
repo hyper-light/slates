@@ -3206,4 +3206,118 @@ mod tests {
       "the count before, after the copy ({copy_answer}), after the directory"
     );
   }
+
+  /// A-854 (main 01a20182, 2026-11-21 23:04: the A-825 load regression on main after d44f0166a). Do: on one shard, make a
+  /// green and eight works over it, each editing its own file; hand the green's owner each work's sealed submit as a
+  /// work's shard asks it (`owner_judge`, the path of every submit from another shard of the node). Expect: each accepted
+  /// at the next version, and the eight cost the shard no committed publication (`publish.committed`): a small
+  /// increment's entry carries it, durable with its append, as before format 6, so nothing is ordered before the append.
+  /// Failing first: one whole-shard publication an accept (eight), the hold made durable before each entry; at 1,000
+  /// clients the accept's server p50 went from 0.44 ms to 356-429 ms (main's A/B, big Studio).
+  #[test]
+  fn accepted_owner_submits_cost_publications_that_do_not_grow_with_their_number() {
+    const WORKS: u64 = 8;
+    let (accepted, published) = crate::daemon::audit_on_shard(|state| {
+      let owner = slates_db::catalog::Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      };
+      let created = crate::verbs::dispatch(
+        state,
+        1,
+        &owner,
+        slates_ipc::protocol::RequestBody::CreateGreen {
+          name: "owner-submits".to_owned(),
+          require_evidence: false,
+          base: None,
+        },
+      );
+      let slates_ipc::protocol::ReplyBody::GreenCreated { id: green } = created else {
+        panic!("no green: {created:?}")
+      };
+      let works: Vec<DbVolumeId> = (1..=WORKS)
+        .map(|n| {
+          let made = crate::verbs::dispatch(
+            state,
+            1,
+            &owner,
+            slates_ipc::protocol::RequestBody::CreateWork {
+              green,
+              name: format!("owner-submit-{n}"),
+            },
+          );
+          let slates_ipc::protocol::ReplyBody::WorkCreated { id: work, .. } = made else {
+            panic!("no work: {made:?}")
+          };
+          let edited = crate::verbs::dispatch(
+            state,
+            1,
+            &owner,
+            slates_ipc::protocol::RequestBody::Edit {
+              work,
+              path: format!("file-{n}"),
+              at: 0,
+              delete_len: 0,
+              bytes: vec![b'x'; 4096],
+            },
+          );
+          assert!(
+            matches!(edited, slates_ipc::protocol::ReplyBody::Edited),
+            "{edited:?}"
+          );
+          crate::verbs::to_db_volume(work)
+        })
+        .collect();
+      let published = |state: &crate::state::ShardState| {
+        state
+          .refusals
+          .get(crate::verbs::SHARD_PUBLISHED)
+          .copied()
+          .unwrap_or(0)
+      };
+      let before = published(state);
+      let mut accepted = Vec::new();
+      for (n, work) in (1..=WORKS).zip(works) {
+        let sealed = super::composed(state, super::seal(state, work), Vec::new());
+        let policy = crate::verbs::SubmitPolicy::of_work(
+          state,
+          work,
+          (
+            crate::verbs::Approval::None,
+            None,
+            slates_ipc::protocol::Authorship::default(),
+          ),
+        );
+        let back = crate::merge_service::ReplyRoute {
+          shard: state.shard,
+          client_index: 0,
+          request: n,
+          through_work: true,
+        };
+        let reply = crate::verbs::owner_judge(
+          state,
+          (7, slates_wire::request::RequestId::from_word(n)),
+          (sealed, Vec::new(), policy),
+          back,
+        );
+        accepted.push(match reply {
+          Some(slates_ipc::protocol::ReplyBody::Submitted {
+            version: Some(version),
+            ..
+          }) => version,
+          other => panic!("submit {n}: {other:?}"),
+        });
+      }
+      (accepted, published(state) - before)
+    });
+    assert_eq!(
+      accepted,
+      (1..=WORKS).collect::<Vec<_>>(),
+      "each owner submit accepted"
+    );
+    assert_eq!(
+      published, 0,
+      "{WORKS} accepted owner submits cost {published} publications; A-825's parent paid none"
+    );
+  }
 }
