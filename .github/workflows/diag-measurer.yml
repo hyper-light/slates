@@ -70,7 +70,8 @@ jobs:
               [ -f "$W/src-$s/crates/${crate#slates-}/tests/round_robin.rs" ] || continue
               if ( cd "$W/src-$s" && CARGO_TARGET_DIR="$W/target-$s" cargo test --release --locked -p $crate --test round_robin -- --nocapture ) > "$W/logs/test-$s-$crate.log" 2>&1; then rc=0; else rc=$?; fi
               echo "arm $s $crate round_robin test exit $rc";
-              if [ $rc != 0 ] && [ "$s" != "${ARMS:0:9}" ]; then tail -30 "$W/logs/test-$s-$crate.log"; exit 1; fi grep -E "^error\[|test result|panicked|skipping|grants" "$W/logs/test-$s-$crate.log" | head -4
+              if [ $rc != 0 ] && [ "$s" != "${ARMS:0:9}" ]; then tail -30 "$W/logs/test-$s-$crate.log"; exit 1; fi
+              grep -E "^error\[|test result|panicked|skipping|grants" "$W/logs/test-$s-$crate.log" | head -4
             done
           done
       - name: Interleaved rounds, loaded then quiet
