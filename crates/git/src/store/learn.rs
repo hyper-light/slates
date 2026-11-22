@@ -61,6 +61,9 @@ pub struct Exchange {
 pub struct Rates {
   /// Nanoseconds a KiB of input takes to deflate, by level.
   pub deflate_ns_per_kib: [u64; LEVELS_USIZE],
+  /// What deflating the corpus saved, by level, in thousandths of its input (A-859 part A: the cold price's anchor,
+  /// [`Exchange::cold`]).
+  pub deflate_saved_per_mille: [u64; LEVELS_USIZE],
   /// Nanoseconds a KiB of a delta search's source and target takes.
   pub search_ns_per_kib: u64,
 }
@@ -102,15 +105,22 @@ impl Rates {
   pub fn measure(clock: &mut dyn Clock) -> Rates {
     let corpus = corpus(DEFLATE_WINDOW.saturating_mul(2));
     let kib = (u64::try_from(corpus.len()).unwrap_or(u64::MAX) / KIB).max(1);
+    let len = u64::try_from(corpus.len()).unwrap_or(u64::MAX).max(1);
     let mut deflate_ns_per_kib = [0_u64; LEVELS_USIZE];
-    for (level, slot) in (0..LEVELS).zip(deflate_ns_per_kib.iter_mut()) {
+    let mut deflate_saved_per_mille = [0_u64; LEVELS_USIZE];
+    for ((level, slot), saved) in (0..LEVELS)
+      .zip(deflate_ns_per_kib.iter_mut())
+      .zip(deflate_saved_per_mille.iter_mut())
+    {
       let start = clock.now_ns();
-      let _ = super::fragment::deflate(&corpus, level);
+      let deflated =
+        super::fragment::deflate(&corpus, level).map_or(len, |out| crate::to_u64(out.len()));
       *slot = clock
         .now_ns()
         .saturating_sub(start)
         .checked_div(kib)
         .unwrap_or(0);
+      *saved = len.saturating_sub(deflated).saturating_mul(PER_MILLE) / len;
     }
     let mut changed = corpus.clone();
     let step = usize::try_from(KIB).unwrap_or(1);
@@ -126,10 +136,18 @@ impl Rates {
       .unwrap_or(0);
     Rates {
       deflate_ns_per_kib,
+      deflate_saved_per_mille,
       search_ns_per_kib,
     }
   }
 }
+
+/// Format: zlib's default level, what git deflates at unless `core.compression` says otherwise [B: zlib.h,
+/// `Z_DEFAULT_COMPRESSION` is level 6; git's `config.c`, `core.compression` -1 is zlib's default].
+pub const GIT_DEFAULT_LEVEL: u32 = 6;
+
+/// Format: thousandths, the unit of [`Rates::deflate_saved_per_mille`].
+const PER_MILLE: u64 = 1000;
 
 /// `len` text-like bytes: words of lowercase letters drawn by a xorshift generator from a fixed seed, separated by
 /// spaces and a line break every few words.
@@ -159,6 +177,28 @@ fn corpus(len: usize) -> Vec<u8> {
 }
 
 impl Exchange {
+  /// The price of a byte before any link it is sent over has been learned (A-859 part A, main 01a20182's ruling of
+  /// 2026-11-22 06:32): the price at which deflating at git's default level ([`GIT_DEFAULT_LEVEL`]) just pays on this
+  /// machine, `p₀ = d / s`, where `d` is that level's measured nanoseconds a byte ([`Rates::deflate_ns_per_kib`] over
+  /// [`KIB`]) and `s` the fraction of its input it saved on the same corpus ([`Rates::deflate_saved_per_mille`]); so
+  /// `ns = d_KiB × 1000` buys `bytes = KiB × s‰`. Both anchors are the machine's own measurement (R3). An object that
+  /// deflates as well as text does pays at git's level, as stock git deflates every object; one that saves less does
+  /// not, and is sent at the level that pays.
+  pub fn cold(rates: Rates) -> Exchange {
+    let level = usize::try_from(GIT_DEFAULT_LEVEL).unwrap_or(0);
+    let ns_per_kib = rates.deflate_ns_per_kib.get(level).copied().unwrap_or(0);
+    let saved = rates
+      .deflate_saved_per_mille
+      .get(level)
+      .copied()
+      .unwrap_or(0);
+    Exchange {
+      ns: ns_per_kib.saturating_mul(PER_MILLE).max(1),
+      bytes: KIB.saturating_mul(saved).max(1),
+      rates,
+    }
+  }
+
   /// Whether saving `saved` bytes pays for `ns` nanoseconds.
   pub fn pays(&self, saved: u64, ns: u64) -> bool {
     let worth = u128::from(saved).saturating_mul(u128::from(self.ns));

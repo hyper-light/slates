@@ -843,3 +843,83 @@ fn t_a859_a_fetchs_stream_counts_each_path_its_objects_took_on_its_shard() {
   assert_eq!(counted, expected, "{stream:?}");
   assert!(counted.iter().any(|count| *count > 0), "{stream:?}");
 }
+
+/// A-859 part A (main 01a20182's rulings of 2026-11-22 04:30 and 06:32: a fetched byte priced at its link, never at
+/// memcpy; cold, the price where deflate at git's default level just pays; learned from the writes that waited for the
+/// peer, from an answer's first wait on). Do: on an audit shard, read the fetch's exchange; teach the shard's pacing a
+/// MiB less a byte of a slow link's writes (a microsecond a byte), past one write that did not wait; read the exchange
+/// again; teach it a byte more; read it a third time. Expect: first the cold price (`Exchange::cold` of the machine's
+/// rates), a byte dearer than memcpy prices one; still cold short of the learned bound, the write before the first wait
+/// teaching nothing; then the link's own price, a microsecond a byte, and the learned bytes counted.
+#[test]
+fn t_a859_a_shard_prices_a_fetched_byte_cold_until_its_link_is_learned() {
+  use super::{LINK_LEARNED, Pacing, Sent, exchange, learn_link};
+  use slates_git::store::learn::Exchange;
+  crate::test_store::audit_on_stored_shard("vcs_store-link", |state| {
+    let rates = state.config.git_rates;
+    let cold = exchange(state);
+    let memcpy_priced = u128::from(cold.ns) * u128::from(state.config.memcpy_bytes_per_second)
+      > u128::from(cold.bytes) * 1_000_000_000;
+    let mut pacing = Pacing::default();
+    let early = pacing.sent(Sent {
+      bytes: 1 << 20,
+      ns: 1,
+      waited: false,
+    });
+    let slow = |bytes: u64| Sent {
+      bytes,
+      ns: bytes * 1_000,
+      waited: true,
+    };
+    for taught in [pacing.sent(slow((1 << 20) - 1))].into_iter().flatten() {
+      learn_link(state, taught);
+    }
+    let short = exchange(state);
+    for taught in [pacing.sent(slow(1))].into_iter().flatten() {
+      learn_link(state, taught);
+    }
+    let learned = exchange(state);
+    let counted = state.refusals.get(LINK_LEARNED).copied();
+    assert_eq!(
+      (cold, memcpy_priced, early, short),
+      (Exchange::cold(rates), true, None, Exchange::cold(rates)),
+    );
+    assert_eq!(
+      (learned.ns, learned.bytes, counted),
+      ((1 << 20) * 1_000, 1 << 20, Some(1 << 20)),
+    );
+  });
+}
+
+/// A-859 part A (main 01a20182's ruling of 2026-11-22 06:32: the loop's absence). Do: pace an answer made slowly, as a
+/// starved shard makes one: many writes far apart, each into a socket with room (none waited), the time between them
+/// long; then a link's price learned past its bound and halved past its memory. Expect: the slow answer teaches the
+/// price nothing, so a clone slow for its own making never prices its link dearer; the halved price is the same
+/// nanoseconds a byte.
+#[test]
+fn t_a859_an_answer_slow_for_its_own_making_teaches_its_link_price_nothing() {
+  use super::{LinkPrice, Pacing, Sent};
+  let mut pacing = Pacing::default();
+  let taught: Vec<(u64, u64)> = (0..1_000)
+    .filter_map(|_| {
+      pacing.sent(Sent {
+        bytes: 64 << 10,
+        ns: 2_000,
+        waited: false,
+      })
+    })
+    .collect();
+  assert!(taught.is_empty(), "{taught:?}");
+  let mut price = LinkPrice::default();
+  for _ in 0..200 {
+    price.learn((1_000_000, 1 << 20));
+  }
+  let rates = slates_git::store::learn::Rates {
+    deflate_ns_per_kib: [1; 10],
+    deflate_saved_per_mille: [500; 10],
+    search_ns_per_kib: 1,
+  };
+  let learned = price.exchange(rates).expect("learned");
+  assert_eq!(learned.ns / learned.bytes, 0, "under a nanosecond a byte");
+  assert_eq!(learned.ns * (1 << 20) / learned.bytes, 1_000_000);
+}
