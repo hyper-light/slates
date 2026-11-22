@@ -18139,3 +18139,34 @@ four times the lane's. The owner's step fell from 502-594 to 270-299 ms and the 
 run to none. Datagram batching (main's 2026-11-20 23:50 step 5) is not shown needed by any measurement and is dropped
 (main, 2026-11-21 14:56). The holder route passes 5/5 at 320 and 512 MiB (r2), which counts toward the lane's proof;
 the bench's local 512 MiB submit still ends in exit 4 (one step of 1.05-1.09 s of CPU) until w-work-cow's A-841 lands.
+
+## A-825's load regression closed by A-854: a small increment carried in its chain entry (w-shared; main 01a20182's A/B, 2026-11-22)
+
+**Question.** Chain entry format 6 (A-825) held every increment in the owner's content store, so every accept published
+the whole shard before its entry was appended. d44f0166a cut that to one publication an accept, not none. A-854 (main
+205e7e828) carries an increment up to min(1 MiB, the chain cap / 64) in its entry, so the accept publishes nothing. Done
+when B's SubmitAccepted p50 is within 10% of A's in every round.
+
+**Command.** Release `load_bench --tree linux-v7.4-rc1/fs (2,365 files, 51 MB) --clients 1000 --hot-files 800
+--per-connection 32 --rounds 20 --reply-patience 60 --think-us 50000`. A = 544020bd2 (A-825's parent), B = 059578d78
+(has 205e7e828), interleaved A B B A A B. Hardware: main's MacBook Pro (Adas-MacBook-Pro-2, 18 CPUs, macOS arm64), under a
+load of 40 to 65 from other sessions, because kiln's API was hung since about 00:40. Logs:
+`~/.cache/main-01a20182/r7/` on that MacBook (summary.txt, run-{1..6}-{A,B}.log).
+
+| run | arm | SubmitAccepted p50 / p99 (ms) | SubmitConflict p50 | Rebase p50 | Edit p50 | server SubmitAccepted p99 | server Round p99 | verdicts/s | wall |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | A | 2.64 / 155.8 | 4.15 | 5.59 | 0.45 | 151.5 | 1,629 | 1,207 | 34 s |
+| 2 | B | 1.05 / 49.0 | 1.30 | 0.80 | 0.72 | 14.4 | 116 | 2,561 | 16 s |
+| 3 | B | 1.19 / 52.8 | 1.57 | 0.86 | 0.75 | 16.7 | 164 | 2,451 | 17 s |
+| 4 | A | 9.54 / 221.4 | 12.26 | 17.56 | 2.00 | 213.2 | 2,601 | 925 | 45 s |
+| 5 | A | 13.47 / 213.0 | 18.14 | 25.83 | 1.48 | 211.0 | 2,613 | 990 | 42 s |
+| 6 | B | 0.66 / 13.2 | 0.69 | 0.47 | 0.40 | 8.6 | 35 | 3,601 | 11 s |
+
+Every run: oracle failures 0, refusals 0, lost 0.
+
+**Reading.**
+- B's p50 is at or under A's on every kind, so the done condition is met. B's tails are 3 to 15 times smaller.
+- Neither arm meets load_bench's 1 ms p99 bound at this machine's load. That is informational, not this A/B's question.
+- Beside it, the quiet reference: on the big Studio (M3 Ultra, 32 cores, 2026-11-21 23:03) A's SubmitAccepted p50 was
+  0.38 to 0.45 ms. On the same hardware B at a3e673efc (format 6 with d44f0166a, before A-854) was 356 to 429 ms.
+- A-825 is closed by A-854 (GAPS).
