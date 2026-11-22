@@ -53,6 +53,7 @@ const EXCHANGE: Exchange = Exchange {
   bytes: 1,
   rates: crate::store::learn::Rates {
     deflate_ns_per_kib: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+    deflate_saved_per_mille: [500; 10],
     search_ns_per_kib: 1,
   },
 };

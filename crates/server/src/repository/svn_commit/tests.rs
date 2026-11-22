@@ -2357,3 +2357,66 @@ fn a_text_refused_part_way_through_its_put_leaves_the_store_as_it_was() {
   );
   assert_eq!(after, before, "the store after the refused put's release");
 }
+
+/// Shape: the texts [`an_increments_post_state_is_sized_once_by_its_texts`] adds, in path order: a larger one first,
+/// so a buffer grown a text at a time doubles past what the next two need.
+const POST_TEXTS: [(&str, usize); 3] = [
+  ("/trunk/p", 3_000),
+  ("/trunk/q", 1_000),
+  ("/trunk/r", 1_000),
+];
+
+/// Goal 93, P7 finding (2) (main 01a20182's routing of 2026-11-22 06:01: the import's per-text churners, the largest
+/// first): the largest in w-svn's local attribution after A-862 was the increment's post-state, 19.9 MB of 157 MB.
+/// Do: land revision 1, then stage revision 2's three texts as a landing does (`stage_texts`), check it, and build its
+/// green increment. Expect: the post-state holds the three texts, its buffer sized once at exactly their length.
+/// Failing first: the buffer grew a text at a time, doubling (6,000 bytes for 5,000), about twice a revision's texts
+/// over an import.
+#[test]
+fn an_increments_post_state_is_sized_once_by_its_texts() {
+  let built = stored(|| async move {
+    let (svn, green) = subversion("svn").await;
+    commit((&owner(), svn), first(), None).await.unwrap();
+    let texts: Vec<Vec<u8>> = POST_TEXTS
+      .iter()
+      .map(|(_, len)| vec![b'x'; *len])
+      .zip(1u8..)
+      .map(|(mut bytes, at)| {
+        bytes[0] = at;
+        bytes
+      })
+      .collect();
+    let rows = POST_TEXTS
+      .iter()
+      .zip(&texts)
+      .map(|((path, _), bytes)| file(path, Action::Add, bytes))
+      .collect();
+    let contents: Vec<&[u8]> = texts.iter().map(Vec::as_slice).collect();
+    let mut revision = revision(1, rows, &contents);
+    let (storing, _) = super::stage_texts(svn, &mut revision, Vec::new())
+      .await
+      .unwrap()
+      .unwrap();
+    on(|state| {
+      // The records' room lent for the step, as a landing's check is lent it.
+      assert!(crate::vcs_store::lend_svn(state, svn, 0));
+      let (checked, record) = super::checked(state, svn, revision, None).unwrap();
+      crate::vcs_store::settle_svn(state, svn);
+      let built = super::version_of(
+        state,
+        (svn, green),
+        (&checked, Default::default()),
+        super::identity(&record),
+      )
+      .unwrap();
+      super::release_stored(state, storing);
+      (built.post_state.len(), built.post_state.capacity())
+    })
+  });
+  let texts: usize = POST_TEXTS.iter().map(|(_, len)| len).sum();
+  assert_eq!(
+    built,
+    (texts, texts),
+    "the post-state's length and capacity"
+  );
+}

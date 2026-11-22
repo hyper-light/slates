@@ -987,9 +987,14 @@ impl DaemonConfig {
     derivations.push(note("copy_slice_bytes", &copy_slice_bytes));
     let git_rates = git_rates();
     derivations.push(format!(
-      "git_rates = deflate ns a KiB by level {:?}, delta search {} ns a KiB: measured once a process over a seeded \
-       text corpus of two deflate windows on the machine's monotonic clock (anchors [\"zlib\", \"deltas\"])",
-      git_rates.deflate_ns_per_kib, git_rates.search_ns_per_kib
+      "git_rates = deflate ns a KiB by level {:?}, saving {:?} thousandths of its input by level, delta search {} ns a \
+       KiB: measured once a process over a seeded text corpus of two deflate windows on the machine's monotonic clock \
+       (anchors [\"zlib\", \"deltas\"]); a fetched byte's cold price (A-859 part A) is level {}'s ns a byte over its \
+       saved fraction",
+      git_rates.deflate_ns_per_kib,
+      git_rates.deflate_saved_per_mille,
+      git_rates.search_ns_per_kib,
+      slates_git::store::learn::GIT_DEFAULT_LEVEL
     ));
     let codec = codec_policy(profile);
     derivations.push(format!(
