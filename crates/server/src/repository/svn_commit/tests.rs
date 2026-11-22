@@ -2284,3 +2284,76 @@ fn t_a724_a_subversion_commit_is_counted_and_learned_on_its_repositorys_usage_ro
     "the commit counted and its bytes learned"
   );
 }
+
+/// Shape: [`a_text_refused_part_way_through_its_put_leaves_the_store_as_it_was`]'s text, long enough that the windows
+/// kept before its refusal are many whatever window the store derives.
+const PART_PUT_BYTES: usize = 4 << 20;
+/// Shape: the bytes of that text its reader answers before it refuses the next piece: half of it.
+const PART_PUT_ANSWERED: usize = PART_PUT_BYTES / 2;
+/// Shape: the most its reader answers a piece, so the put takes many steps whatever copy slice the machine derives.
+const PART_PUT_PIECE: usize = 64 << 10;
+
+/// Goal 93 (main 01a20182, 2026-11-22 03:55 PST; a sibling of P7 finding (2)'s `put_window` cut). Do: put a 4 MiB text
+/// into the content store a piece of at most 64 KiB a step (`store_step_from`) until its reader refuses a piece half-way, then
+/// release what the landing holds, as every refused landing does (`release_stored`). Expect: windows kept before the
+/// refusal (the test's non-vacuity), the step refused `Corrupt`, and the store's entries and bytes used what they were
+/// before the put. Failing first: the step took the text's writer out of the landing's `Storing` before the piece was
+/// read and put, so a refusal dropped it with its kept windows still held, and the release found nothing to abandon.
+#[test]
+fn a_text_refused_part_way_through_its_put_leaves_the_store_as_it_was() {
+  let seen = stored(|| async move {
+    let (_svn, _green) = subversion("svn").await;
+    let bytes: Vec<u8> = (0..PART_PUT_BYTES)
+      .map(|at| u8::try_from(at % 251).unwrap_or(0))
+      .collect();
+    let text = identity(&bytes);
+    let reader = |wanted: &ContentIdentity, offset: u64, len: usize| {
+      let start = usize::try_from(offset)
+        .ok()
+        .filter(|start| *wanted == text && *start < PART_PUT_ANSWERED)?;
+      bytes
+        .get(
+          start
+            ..start
+              .saturating_add(len.min(PART_PUT_PIECE))
+              .min(PART_PUT_BYTES),
+        )
+        .map(std::borrow::Cow::Borrowed)
+    };
+    on(|state| {
+      let content = |state: &ShardState| {
+        state
+          .vcs_stores
+          .content()
+          .map(|store| (store.len(), store.used()))
+      };
+      let before = content(state);
+      let mut storing = super::Storing {
+        queue: std::collections::VecDeque::from([(text, u64::try_from(PART_PUT_BYTES).unwrap())]),
+        ..super::Storing::default()
+      };
+      let refused = loop {
+        match super::store_step_from(state, &mut storing, &reader) {
+          Ok(false) => continue,
+          answer => break answer,
+        }
+      };
+      let kept = content(state);
+      super::release_stored(state, storing);
+      (before, kept, refused, content(state))
+    })
+  });
+  let (before, kept, refused, after) = seen;
+  assert!(
+    kept
+      .zip(before)
+      .is_some_and(|(kept, before)| kept.1 > before.1),
+    "windows were kept before the refusal: {before:?} then {kept:?}"
+  );
+  assert_eq!(
+    refused,
+    Err(super::corrupt()),
+    "the step refused at the missing piece"
+  );
+  assert_eq!(after, before, "the store after the refused put's release");
+}

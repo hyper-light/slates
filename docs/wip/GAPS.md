@@ -3611,6 +3611,13 @@
 > refusal the wire answers without a Subversion number (`BudgetExceeded`, `ContentUnavailable`, `Format`) does not
 > name what landed; the same dump resumes all the same. Owed: the import's time and peak re-measured on git-2000
 > (main's run), which closes P7's finding (3) or not. The entry below is its history.
+> **FIXED (w-svn, 2026-11-22; main 01a20182 03:55 PST, a sibling of finding (2)'s `put_window` cut): a text refused
+> part-way through its put into the content store left its kept windows held for good.** `svn_commit::store_step_from`
+> took the text's writer out of the landing's `Storing` before it read and put the piece, so a refusal (a piece the
+> reader lacked, a window or the finish refused) dropped the writer, and the landing's release found nothing to abandon.
+> The writer now stays in `Storing` until its object is finished, so every refusal leaves it for the release. Red: a
+> 4 MiB text refused half-way left 8 entries, 2,097,152 bytes, after its release; green: the store as it was
+> (`a_text_refused_part_way_through_its_put_leaves_the_store_as_it_was`).
 > **P7's finding (2) OPEN, RED: an import's freed memory is not given back (2026-11-22, w-svn; main 01a20182's ruling of
 > 00:09, option 3).** Main's r11 (git-2000, release): physical footprint 43 MiB before, 527 MiB after 30 s of idle,
 > 484 MiB held. Only 155 MB of it is live (heap in use +104 MB, arena 51 MB); the rest is blocks under A-742's 1 MiB

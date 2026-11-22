@@ -1164,6 +1164,7 @@ mod vhost_form {
   use slates_client::{
     Client as Typed, ClientError, CreateSpec, Deadlines, Intent, ReadAt, Refusal, VolumeId,
   };
+  use slates_ipc::IpcError;
 
   use super::*;
 
