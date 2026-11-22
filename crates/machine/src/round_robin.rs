@@ -62,18 +62,17 @@ pub fn granted_priority() -> Result<i32, Declined> {
 
 /// Puts the calling thread in `SCHED_RR` at `priority`, reset on fork.
 #[cfg(target_os = "linux")]
-fn set_round_robin(priority: i32) -> Result<(), Declined> {
+fn set_round_robin(priority: i32, reset_on_fork: bool) -> Result<(), Declined> {
   let param = libc::sched_param {
     sched_priority: priority,
   };
-  // SAFETY: pid 0 is the calling thread; `param` is a valid `sched_param` on this frame, read for the call only.
-  let rc = unsafe {
-    libc::sched_setscheduler(
-      0,
-      libc::SCHED_RR | libc::SCHED_RESET_ON_FORK,
-      &raw const param,
-    )
+  let policy = if reset_on_fork {
+    libc::SCHED_RR | libc::SCHED_RESET_ON_FORK
+  } else {
+    libc::SCHED_RR
   };
+  // SAFETY: pid 0 is the calling thread; `param` is a valid `sched_param` on this frame, read for the call only.
+  let rc = unsafe { libc::sched_setscheduler(0, policy, &raw const param) };
   if rc == 0 {
     Ok(())
   } else {
@@ -94,7 +93,8 @@ fn last_errno() -> i32 {
 #[cfg(target_os = "linux")]
 pub fn take_current() -> Result<i32, Declined> {
   let priority = granted_priority()?;
-  set_round_robin(priority)?;
+  // A shard's thread holds the class for good, so a child it spawns (a hook) must start time-share.
+  set_round_robin(priority, true)?;
   Ok(priority)
 }
 
@@ -189,7 +189,10 @@ pub fn raise_for_park() -> Result<ParkClass, ParkSkipped> {
   if [rr, fifo, SCHED_DEADLINE].contains(&prior.sched_policy) {
     return Err(ParkSkipped::AlreadyRealTime);
   }
-  set_round_robin(priority).map_err(ParkSkipped::Declined)?;
+  // Without `SCHED_RESET_ON_FORK`: an unprivileged thread cannot clear that flag once set (sched(7)), so a park raised
+  // with it could never be put back (CI ubuntu-24.04-arm, run 45023871879: every restore refused EPERM). The thread is
+  // blocked in its wait for the whole raise and forks nothing meanwhile, so the flag buys nothing here.
+  set_round_robin(priority, false).map_err(ParkSkipped::Declined)?;
   Ok(ParkClass { prior })
 }
 
@@ -206,8 +209,16 @@ impl ParkClass {
     }
     let errno = last_errno();
     let plain = libc::sched_param { sched_priority: 0 };
+    // Lowered to time-share keeping `SCHED_RESET_ON_FORK`, which an unprivileged thread may set but never clear, so the
+    // lowering cannot be refused for the flag (CI run 45023871879: a plain `SCHED_OTHER` was).
     // SAFETY: as in `set_round_robin`: the calling thread, a valid `sched_param` on this frame.
-    let _ = unsafe { libc::sched_setscheduler(0, libc::SCHED_OTHER, &raw const plain) };
+    let _ = unsafe {
+      libc::sched_setscheduler(
+        0,
+        libc::SCHED_OTHER | libc::SCHED_RESET_ON_FORK,
+        &raw const plain,
+      )
+    };
     Err(errno)
   }
 
