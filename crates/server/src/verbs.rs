@@ -19339,7 +19339,7 @@ fn restore_held_image(
     crate::vcs_store::restore_windows(
       state,
       &held.windows,
-      (&held.lists, &held.names, &held.region_holds),
+      (&held.lists, &held.names, &held.region_holds, &held.aways),
     );
   }
   state.store.content.arena_mut().commit_live();
@@ -24760,6 +24760,9 @@ mod tests {
       ),
       "{submitted:?}"
     );
+    // The checkpoint the reset's floor move began, taken whole if it went to turns (A-579): it does when anything waits
+    // on the shard, and no turn runs inside this step.
+    crate::merge_service::settle_checkpoints(state);
     super::to_db_volume(id)
   }
 

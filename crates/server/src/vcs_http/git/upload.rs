@@ -139,13 +139,6 @@ impl<L> UploadServices<L> {
       room_patience_ns: ROOM_PATIENCE_NS,
     }
   }
-
-  /// These services, an answer held past its room waiting `ns` for more (tests: a patience a test can wait out).
-  #[cfg(test)]
-  pub(crate) fn with_room_patience(mut self, ns: u64) -> Self {
-    self.room_patience_ns = ns;
-    self
-  }
 }
 
 impl<L: StoreLender + Clone> GitServices for UploadServices<L> {
