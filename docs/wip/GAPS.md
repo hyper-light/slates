@@ -187,6 +187,11 @@
 >   98-137 against 213-242 million turns a second: not starved, but the daemon now takes the CPU it needs ahead of them.
 >   No demotion was seen. **Open:** 84a's bar on macOS. The p99 is under 1 ms in 11 of 12 round medians, the p999 in
 >   4 of 12. The client-only arm (TC) was measured and rejected (p999 up to 29.9 ms).
+>   The refining job's turns paced (A-783's turn, to the ceiling or to its own quantum), measured and rejected (w-perf,
+>   2026-11-22; BENCHMARKS "84a on macOS: the refining job's turns paced"): dead even with main on one runner's
+>   interleaved rounds. Stamped under TB, the loaded tail's deferred replies are submits parked behind their refinement
+>   and resumed. A plain forward's two wakes measure 7-21 µs from kick to run, and the resumed run is all CPU (not
+>   demoted). Main's own interleaved A/B (run 45009478174) misses p999 in most rounds in both arms; the gap stays open.
 > - Windows (CI, run 44857045148): no 1 ms band (queued p99 5–49 µs); accept p99 0.13–0.31 ms, conflict 0.11–0.29 ms;
 >   p999 0.2–62 ms. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–7).
 >
