@@ -16,9 +16,20 @@
 > untouched entries), and an unreacquired one's record goes into the next image unchanged, with no `fstat`. Red on main:
 > 201 host handles after recovering 200 listed directories; green: 1
 > (`a_recovery_reopens_only_the_root_and_reacquires_each_directory_at_its_first_use`).
-> **Still open (main):** (1) a directory listed in this daemon's life keeps its listing and its open directory until the
-> directory leaves the volume: bounded by the directories used, not by a derived budget; the listings need an idle
-> close, now that `reacquire` can reopen any of them. (2) The anchor counts a daemon that died before it served as
+> **Closed (A-838, 2026-11-21): idle base directories close their descriptors.** A use of a base directory marks its
+> listing and owes the idle sweep a look (`Store::base_dirs_owed`, set by `Overlay::reacquire`), which arms a pass; each
+> pass runs every overlay's idle-directory cycle (`Overlay::close_idle_directories`) a slice a turn, half the shard's
+> step quantum each (`crate::idle_sweep::close_idle_directories` in crates/server/src/idle_sweep.rs). A directory used
+> since the last look keeps its descriptor; one unused since closes it, keeping its identity, and is reacquired by its
+> path at its next use (`same_object`, else `BaseUnavailable`); its cached entries stay and its fingerprint is compared
+> again then. A pass that kept any directory arms the next. So a directory's descriptor goes one to two intervals after
+> its last use, and a volume no client uses holds only its root's. Counted `base.idle_dirs_closed`. Green: the vfs
+> sweep's two looks keep then close 20 directories, and a closed one reopens at its next use and shows an outsider's
+> change (`an_idle_base_directory_closes_its_descriptor_and_reopens_at_its_next_use`,
+> `a_closed_directory_shows_an_outsiders_change_at_its_next_use`); on a daemon, 16 listed directories of an idle
+> overlay closed 2.16 s after their last use (1 s interval), the root's descriptor kept
+> (`an_idle_overlays_listed_directories_close_and_its_root_stays_open`, this MacBook at load 44).
+> **Still open (main):** (1) closed by A-838 above. (2) The anchor counts a daemon that died before it served as
 > recovered and never backs off. (3) Witnessed descriptors are bounded only by the large-class copies a volume holds.
 > (4) `image()` still `fstat`s every reacquired directory at each publication.
 > **The descriptor backstop, platform half (w-bugs, A-837; Ada 2026-11-21, "a way to avoid descriptor exhaustion"):
@@ -72,7 +83,7 @@
 > (A-787 part 2's park, 2a498b90f). 10 server lib tests (repository, vcs_store paths and commits) failed from that
 > commit on, bisected against its parent 81d8baea5; such a verb now composes unrefined and is answered (6459374).
 
-> **Open, after goal 93 (w-fed-faults, A-821; main's ruling 2026-11-21 14:23): a refined submit's commit is one step past the bound in debug.** On the 2 MiB re-indent the step is 270-340 ms in debug against 100 ms (release 24.6 ms), the commit's history re-anchor ~219 ms of it (A-821 took composition, verdict and encode off it). The fix, when A-818 2b reopens: build the commit's new history tree off the step on 2b's persistent trees (a slice a turn, `places.change` staged), install it in O(1) in the one step, and fall back in-step when the head moved; 2b's branch as built is slower here (2,011 ms debug, 89 ms release).
+> **Open, after goal 93 (w-fed-faults, A-821; main's ruling 2026-11-21 14:23): a refined submit's commit is one step past the bound in debug.** On the 2 MiB re-indent the step is 270-340 ms in debug against 100 ms (release 24.6 ms), the commit's history re-anchor ~219 ms of it (A-821 took composition, verdict and encode off it). The fix, when A-818 2b reopens: build the commit's new history tree off the step on 2b's persistent trees (a slice a turn, `places.change` staged), install it in O(1) in the one step, and fall back in-step when the head moved; 2b's branch as built is slower here (2,011 ms debug, 89 ms release). Measured on 2b's branch (c4278fd3c) merged into main 1a35ab091: the test exits 4 in debug every run (the watchdog's kill at refining.rs:187, 3,534 ms of CPU in one poll), and the release longest step rises from 24.6 to 91.7 ms; `history::change` spends 41 ms in `anchor.places.change` (92,354 parts) and 42 ms in `trees.rebuild` (92,356 nodes) in release, about 0.45 µs a part a pass, ten times that in debug. Main's ruling of 14:30 makes `a_large_rewrite_is_refined_over_many_turns_off_the_submit` 2b's landing gate (debug with no watchdog kill, release no worse than main's 24.6 ms); w-rewrite-ops owns the fix, chosen by A/B among (a) a bulk linear path for a many-part change, (b) an off-step build with `places.change` staged and an O(1) install, (c) a derived part cap naming the block whole.
 
 > **CLOSED (w-hg, 2026-11-21): five Mercurial tests of `vcs_http::daemon_edge` failed on macOS arm64**
 > (`a_mercurial_repositorys_store_is_served_...`, `a_stock_mercurial_push_...`, the clone, stream clone and push
@@ -24920,9 +24931,14 @@ in what lands. Branch tips as of 2026-11-10:
 > against main's 2.48-4.47 (ReadHead 3.09-4.38 against 1.04-1.94), while p999 and max are better; at Z = 50 ms every
 > kind's p99 is under 1 ms in 5 of 5 rounds. (b) LANDED 2026-11-21 (a key's old entry subtracted at its first change:
 > the fold hashes current bytes only, no history reads), with a fix to a checkpoint's sum taken mid-fold. OWED: (b)'s A/B
-> (does Z = 20 ms p99 return to main's?); slice the checkpoint's last step (~43 ms: build 5.7, encode 9.5, record 24.4
-> of 49 MB) and single key folds of up to 13.4 ms (slicing inside a key landed and was reverted the same day: a fold of
-> 47.6-52.6 s, design amendment A-579).
+> (does Z = 20 ms p99 return to main's?; main's run, `run-requests.md`, blocked while main's own regression stands:
+> SubmitAccepted server p50 0.29 ms at 4d0ad1674 against 184 ms at 1a35ab091, Z = 50 ms, macOS arm64, not A-579's,
+> window c1449f629..b3f674640 unbisected). DEFERRED past goal 93 (goal 89b's): the checkpoint's last step, ~43 ms
+> (build 5.7, encode 9.5, record 24.4 of 49 MB), plan: slice build and encode under the paced turn budget now, and record
+> by identity in the content store only inside w-shared's chain format 6 (main's 02:06 ruling); and single key folds of
+> up to 13.4 ms, plan: a slice that keeps a hot file's partial short with a guaranteed past-deadline share derived from
+> the latency budget (main's 23:50 ruling), since slicing inside a key landed and was reverted the same day (a fold of
+> 47.6-52.6 s, every past-deadline turn at the 100 ms ceiling; ed4661d40, design amendment A-579).
 
 > **A-805's preview oracle (2026-11-21, w-engine; main's order):** a held verdict's preview reads as its commit over the
 > copy and identity oracles' generated histories and through `Greens::preview`, red with copy and link effects dropped.
