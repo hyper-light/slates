@@ -556,3 +556,10 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
   7. Reds: the entry's size independent of its texts; crash oracle killed (1) between the texts' landing and the
      entry's commit, and (2) between the entry's commit and its checkpoint; the bring-back count is 0 without a crash.
   8. Sampled number on the tree dump, sent to main for the daemon A/B.
+- Rulings (main, ~11:50): take the pre-pass in the svn green's recovery. It brings back only the named runs of entries
+  past the checkpoint, sliced a text a step, its bound stated. The append's `judge_named` is its own landing after
+  (a)+(b): red = 0 cloned read bytes; tell w-git and w-hg first.
+- ORDER FOUND: `verbs::rebuild_recovered` replays the greens (`rebuild_records`, ~19259) BEFORE the repositories'
+  stores (`vcs_store::recover`, ~19300). `bring_whole` needs only `vcs_disk` and a content store, not the svn records,
+  so the pre-pass goes in `rebuild_record`'s Green arm for an svn green: make the content store, then bring back.
+  Verify `content_made` can run there.
