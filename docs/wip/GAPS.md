@@ -94,7 +94,10 @@
 > a third round's churn under a hundredth (`crates/git/tests/recent_ring.rs`); main's RSS round owed (run-requests).
 > Main's r15 at abcadd753 (A-861 and its charge): peak 531.2, after the push 327.4, after the clone 365.9 MiB, against
 > 815.2, 667.5 and 737.8 at f577268d3; still past the bound 177.7. (2a) LANDED A-863: a read of a let-go window brings it
-> back from the node's store; the RSS test now prints the memory gauges at each reading. (2b), the let-go after a landing,
+> back from the node's store; the RSS test now prints the memory gauges at each reading. git's driver hook (w-git): a
+> fetch's and an encoding's packs made resident before they read (`vcs_store::upload::resident`), and a window an
+> encoding turn met let go brought back before the next; a let-go must wait for no fetch live and no encoding under way,
+> since a pack's answer cannot be taken again mid-pack byte for byte. (2b), the let-go after a landing,
 > next: a landed pack's windows have several holders, which `let_go` refuses (`Shared`).
 > Owed, in main's order: (1) the push's temporaries cut at their source (w-shared);
 > (2) landed windows and the pack let go once durable (w-shared, with w-git); (3) the recent-objects cache given back
