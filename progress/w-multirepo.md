@@ -38,3 +38,5 @@ Clone: ~/slates-work/w-multirepo; target ~/.cache/w-multirepo-target.noindex; st
   (3) partition at the learning cadence -> immutable per-shard snapshot -> room reads grants (tell w-balance first).
 - LANDED 44b7ce290 (principals' rates) and db79945ab (curves fed by git fetch reads via vcs_store::observed). Reported.
 - NEXT 2d part 3: aging + partition at cadence + snapshot + room reads grants (tell w-balance first).
+- LANDED b84bc12e4: vcs_share::grants (partition at the learning cadence). Room shape sent to w-balance (waiting OK).
+- NEXT: piece 7 harness extension (fetches + hg/svn in multi_repo_load.py) and the CPU A/B run request.

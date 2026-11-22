@@ -12,3 +12,16 @@
 - Owed next (2d part 3): curves aged at the horizon, partition at the learning cadence, published as an immutable
   per-shard snapshot that vcs_share::room reads (I'll tell w-balance before touching room's body). Then pushes'/hg/svn
   reads feeding curves (their owners' step sites: w-git git_push charge_*, w-hg, w-svn).
+
+## Part 3 (2026-11-21 ~20:35)
+- LANDED b84bc12e4 (on main 4a4399f40, checked): crate::vcs_share::grants: one Grants value a shard, every usage row's
+  curve aged at its read horizon (Ledger::age_curves) and divided by slates_vcs::partition at the learning cadence
+  (shortest read horizon among those served, or a change of the set served); counted vcs_share.grants_divided.
+  Test: vcs_share::grants::tests::t_a724_the_grants_are_divided_at_the_learning_cadence_and_kept_between; with
+  w-balance's merged hg fetch claim, vcs_share:: + t_a724 24/24 (macOS arm64, this Mac).
+- Not yet read by admission: the room's shape is with w-balance (inbox/w-balance-from-w-multirepo-room-shape.md, cc
+  you): contested room = (grant - held)+ + lendable (spare + idle repositories' unused grants); fast path and the
+  snapshot-slot DRF unchanged; a repository with no curve falls back to today's claim. I build it on w-balance's or
+  your word.
+- Meanwhile: piece 7 (the load proof with fetches and hg/svn in the mix, the CPU A/B: equal DRR vs learned weights vs
+  w-balance's turn-weights branch) as a harness + run request.
