@@ -387,7 +387,7 @@ fn t_a856_a_grant_is_learned_from_reads_and_given_back_when_idle() {
       .content()
       .map_or(0, |content| content.charged());
     super::super::lend(&mut state.store, &mut state.vcs_stores, 0);
-    let exchange = super::exchange(&state.config);
+    let exchange = super::exchange(state);
     let (held, charged) = {
       // Read through a lend: the pack's windows lie in the shard's chunk store.
       let lent = super::super::Lent::new(&mut state.store, &mut state.vcs_stores);

@@ -17170,6 +17170,77 @@ and p999 within A's spread, round by round.
   decides 84a's p999 on these runners.
 - Rejected: a dead-even A/B does not land.
 
+## 84a on Linux: the round-robin real-time class for the shards and the client's park, measured and rejected (w-perf; 2026-11-22)
+
+**What was measured first.** CI's Linux runners (4 CPUs, two spinners a CPU), the shards' and the client's parks stamped
+(diagnostic branch `diag-measurer-w-perf-84a`, never main; runs 45017505026, 45018893846):
+- Kernel 7.0.0-1017/1020-azure, `CONFIG_HZ=1000`, `CONFIG_PREEMPT_LAZY=y`, the scheduler features `RUN_TO_PARITY`,
+  `WAKEUP_PREEMPTION` and `PREEMPT_SHORT` on, `base_slice_ns` 2,100,000.
+- No timer was late. A woken or runnable shard did not get its CPU against the spinners.
+  - ubuntu-24.04-arm: a kicked shard ran 920 µs after its kick at the median and 2,990 µs at p99, in about 22,000 of
+    35,000 kicks a round, its kick on time.
+  - ubuntu-latest: a runnable shard took requests 2.8-3.9 ms after they landed, in the p99 tail.
+- The runner account's `RLIMIT_RTPRIO` is 0 soft and 0 hard (g220's probe, run 44991298743, likewise; `chrt -r 1`
+  refused). So the arms were measured under an administrator's grant, `sudo prlimit --rtprio=1:1` on each step's
+  shell, for every arm alike. The daemon asks nothing (R10).
+
+**The arms** (branches `diag-measurer-w-perf-84a-linux-ab` and `agents/w-perf-84a-arm-d2`, never main; A = d2c6635a2, main
+4a1686023 plus the loaded form's throughput line):
+- B 21179849c: a tracking runtime's shards take `SCHED_RR | SCHED_RESET_ON_FORK` at the class's lowest priority where
+  `RLIMIT_RTPRIO` grants it and `RLIMIT_RTTIME` is unlimited (grant or skip), and park at once when idle.
+- C' 2c69390ba: the shards spin R9's floor alone at RR (50 µs against the class's 100 ms timeslice, 0.05%), plus the
+  client's synchronous reply wait in RR for its park alone: `sched_getattr` before, the exact `sched_setattr` after, a
+  refused restore the call's typed refusal.
+- D' 7cba67b4a: B plus the client's park in RR.
+- C and D first raised the park with `SCHED_RESET_ON_FORK`. An unprivileged thread can never clear that flag, so every
+  restore was refused EPERM, and the fallback's plain `SCHED_OTHER` too (run 45023871879). C' and D' raise the park
+  without it (the thread is blocked in its wait and forks nothing), and the fallback lowers keeping the flag.
+
+**The stamped run** (45020845000, A against B, stamped). Kick -> run on ubuntu-24.04-arm: p50 921 · 921 · 921 µs (A)
+against 8 · 8 · 8 (B); p99 2,987-2,989 against 13-18. The x86 p999 tail's queued hop: 2,993-3,054 against 4-5. The tail
+moved to the client's time-share wake (written -> seen in the p999 tail 57-60 µs in A, 2,531-2,979 in B).
+
+**The four-arm run** (45036903025, both runners, 5 loaded and 3 quiet rounds interleaved, every arm's `round_robin`
+tests green and A's red, the client's parks taken 3,236-8,588 a run with no restore refused). Each cell is a round's
+median, µs.
+
+ubuntu-latest:
+
+| | A | B | C' | D' |
+|---|---|---|---|---|
+| accept p99 | 3997 · 3998 · 3998 · 3184 · 3998 | 1997 · 1998 · 1995 · 1999 · 2000 | 1878 · 2640 · 2202 · 2392 · 2576 | 2374 · 1965 · 3353 · 2669 · 2667 |
+| accept p999 | 5997 · 6090 · 5240 · 5980 · 5995 | 3091 · 2474 · 3158 · 3445 · 2989 | 4143 · 3987 · 4719 · 4205 · 4138 | 3538 · 3562 · 4591 · 4529 · 3691 |
+| conflict p99 | 4127 · 5990 · 3295 · 4004 · 3300 | 2000 · 2002 · 2004 · 2002 · 2003 | 1709 · 1445 · 1353 · 1908 · 1760 | 2813 · 2216 · 2696 · 2195 · 2195 |
+| conflict p999 | 6000 · 6114 · 4196 · 6000 · 6054 | 3134 · 3067 · 3989 · 2995 · 3181 | 3106 · 2965 · 4217 · 3344 · 3899 | 4128 · 3965 · 4968 · 3830 · 3824 |
+| load, M spinner turns/s | 121-127 | 122-131 | 95-100 | 102-106 |
+| quiet accept p50 | 127 · 129 · 152 | 152 · 145 · 159 | 127 · 126 · 169 | 164 · 161 · 164 |
+| R9 spinning p99 | 100 · 100 · 98 | 96 · 99 · 101 | 122 · 121 · 99 | 104 · 94 · 123 |
+
+ubuntu-24.04-arm:
+
+| | A | B | C' | D' |
+|---|---|---|---|---|
+| accept p99 | 340 · 325 · 325 · 326 · 336 | 215 · 1998 · 2997 · 1998 · 1998 | 938 · 1531 · 1650 · 1061 · 1801 | 2085 · 1799 · 2187 · 1739 · 2521 |
+| accept p999 | 3995 · 3993 · 368 · 358 · 1462 | 2343 · 2483 · 3001 · 2390 · 2706 | 4111 · 3716 · 4307 · 4462 · 4490 | 4139 · 3924 · 4098 · 2523 · 4239 |
+| conflict p99 | 881 · 827 · 428 · 2728 · 732 | 187 · 2001 · 2001 · 2001 · 2005 | 295 · 1468 · 365 · 313 · 170 | 2619 · 1668 · 1306 · 2119 · 2002 |
+| conflict p999 | 4002 · 1974 · 2823 · 5000 · 2968 | 2486 · 2632 · 2655 · 3001 · 3449 | 4058 · 4832 · 3188 · 4139 · 3886 | 5648 · 3976 · 4036 · 3811 · 4047 |
+| load, M spinner turns/s | 359-363 | 346-363 | 258-270 | 286-290 |
+| quiet accept p50 | 114 · 118 · 110 | 146 · 149 · 151 | 115 · 119 · 117 | 158 · 155 · 163 |
+| R9 spinning p99 | 90 · 84 · 103 | 115 · 115 · 115 | 82 · 91 · 106 | 120 · 113 · 113 |
+
+**Rejected, all three.**
+- None meets 1 ms loaded.
+- C' is the best RR arm on conflict p99, and its floor spin holds the quiet path and R9 within A's spread. But its
+  accept p99 is 0.94-2.6 ms (A's on ubuntu-24.04-arm is 325-340 µs), and it costs the spinners 20-27% of their
+  throughput: each real-time client wake preempts one.
+- B loses the quiet path (accept p50 +10-35%, R9 p99 up to 115 µs).
+- D' loses most.
+- The tail that remains is structural, and still pinned at whole milliseconds. The client's own code between its
+  parks runs time-share by design: the user's code never runs at real-time priority. With two spinners a CPU and a
+  2.1 ms base slice under lazy preemption it waits whole slices.
+- Stock runner accounts grant no `RLIMIT_RTPRIO` at all, so even the arms' best case exists only under an
+  administrator's grant.
+
 ## The client's reply wait, arm C: measured and rejected, B (A-799) stays (85a; g222's last step, recorded by w-provision-gate; 2026-11-21)
 
 **The run.** GitHub run 44884335146 (branch `diag-measurer-g222-20`, "g222 A/B/C of the client reply wait on every

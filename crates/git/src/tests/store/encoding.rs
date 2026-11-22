@@ -205,6 +205,7 @@ const PUT_BYTES: u64 = 64;
 const A_NANOSECOND_A_BYTE: crate::store::learn::Exchange = crate::store::learn::Exchange {
   rates: crate::store::learn::Rates {
     deflate_ns_per_kib: [1024; 10],
+    deflate_saved_per_mille: [500; 10],
     search_ns_per_kib: 1024,
   },
   ..EXCHANGE
