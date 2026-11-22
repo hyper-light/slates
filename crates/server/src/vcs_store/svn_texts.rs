@@ -122,7 +122,8 @@ pub(crate) async fn bring_whole(
     return false;
   };
   let from = u128::from_be_bytes(repository.bytes);
-  let mut writing = slates_vcs::Writing::default();
+  // Begun with its length at its first piece, the text's window buffer is reserved once (goal 93, svn finding (2)).
+  let mut writing: Option<slates_vcs::Writing> = None;
   let mut offset = 0u64;
   while offset < len {
     let piece = match disk.text(from, identity, offset).await {
@@ -138,9 +139,10 @@ pub(crate) async fn bring_whole(
       state.count(PIECE_FETCHED, 1);
       state.count(BYTES_BROUGHT, brought);
       crate::vcs_store::within_budget(state, brought, |stores| {
-        stores
-          .content_mut()
-          .is_some_and(|content| content.put_window(&mut writing, &piece).is_ok())
+        stores.content_mut().is_some_and(|content| {
+          let writing = writing.get_or_insert_with(|| content.begin_object_of_length(len));
+          content.put_window(writing, &piece).is_ok()
+        })
       })
     });
     if put != Some(true) {
@@ -153,6 +155,7 @@ pub(crate) async fn bring_whole(
       let Some(content) = stores.content_mut() else {
         return false;
       };
+      let mut writing = writing.unwrap_or_else(|| content.begin_object_of_length(len));
       if offset != len {
         content.abandon_object(writing);
         return false;
