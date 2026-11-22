@@ -459,3 +459,9 @@
 - Clean: host clippy, fmt, structural, literals, unsafe, the six cross targets.
 - VCS lane: Windows r52 (crates at 40d816c29) and Linux r53 (synced) submitted.
 - VCS lane, Linux: r53 (adacachy2) and r55 (adacachy) both failed the sync; in run-requests.md.
+
+## 2026-11-21 round at 2d078e4fa (landed c3683ac19)
+- Reds, all from A-579's 2d078e4fa: the CHECKPOINT_KINDS literal (now CHUNK_STAGED + 1); the server checkpoint crash
+  test at 12/10 (staged_and_published); the cluster piece-at-a-time hold test at 14/10 (holds_as_the_whole_does).
+- Focused local: cluster content 18, server checkpoint 12. Fmt, structural, unsafe and the six cross targets were clean.
+- VCS lane: Windows r54 still queued (jupiter's link down). Linux: both runners refuse the sync (run-requests.md).
