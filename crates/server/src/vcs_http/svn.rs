@@ -860,19 +860,31 @@ impl<S: SvnStores> SvnExchange<S> {
     let path = self.path.clone();
     let segments: Vec<&str> = path.split('/').filter(|name| !name.is_empty()).collect();
     let method = self.method.clone();
-    if let Some(revision) = revision_resource(method.as_str(), &segments) {
-      return Some(self.revision_proppatch(&revision, gone).await);
+    match revision_resource(method.as_str(), &segments) {
+      Some(revision) => Some(self.revision_proppatch(&revision, gone).await),
+      None => self.commit_request(method.as_str(), &segments, gone).await,
     }
-    if let Some(answer) = self.on_special_path(method.as_str(), &segments) {
+  }
+
+  /// [`SvnExchange::commit_side`]'s requests on a commit's own paths and verbs: a transaction's or a working resource's
+  /// special path first (`on_special_path`), then a POST to `!svn/me`, a DeltaV v1 MKACTIVITY, a CHECKOUT, a MERGE, a
+  /// LOCK or an UNLOCK; none for every other request.
+  async fn commit_request(
+    &mut self,
+    method: &str,
+    segments: &[&str],
+    gone: ClientGone<'_>,
+  ) -> Option<HttpAnswer> {
+    if let Some(answer) = self.on_special_path(method, segments) {
       return Some(answer);
     }
-    Some(match (method.as_str(), segments.as_slice()) {
+    Some(match (method, segments) {
       ("POST", [first, "me"]) if *first == site::SPECIAL => self.post(gone).await,
       ("MKACTIVITY", [first, "act", activity]) if *first == site::SPECIAL => {
         let activity = (*activity).to_owned();
         self.make_activity(&activity, gone).await
       }
-      ("CHECKOUT", _) => self.checkout(&segments),
+      ("CHECKOUT", _) => self.checkout(segments),
       ("MERGE", _) => self.merge(gone).await,
       ("LOCK", _) => self.lock(gone).await,
       ("UNLOCK", _) => self.unlock(gone).await,
