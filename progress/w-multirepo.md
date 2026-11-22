@@ -59,3 +59,5 @@ Clone: ~/slates-work/w-multirepo; target ~/.cache/w-multirepo-target.noindex; st
   9c, per w-balance's handoff notes.
 - main 01a20182 21:35: piece 4 YES (evict past grant) but needs git/hg read-through first (asked); piece 6 HOLD (GAPS
   line landed); piece 7 (a) LANDED 2beeb7502 multi_repo_stock.py + run request. Tracked .pyc flagged to main.
+- LANDED ad15cf2e4 (A-851): piece 4 my half (let go past grant, behind a test reader); red-test notes to w-git/w-hg
+  queued; reported. Remaining A-724: piece 5 (intake off owner: w-git's intake), 8b, 9c; piece 6 deferred.
