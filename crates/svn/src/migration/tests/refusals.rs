@@ -337,6 +337,15 @@ fn a_delta_that_reads_past_its_base_is_refused() {
 #[test]
 fn an_import_past_the_room_is_refused() {
   let dump = first_revision().bytes();
+  let (zero_held, first_properties) = revision_zero_held_and_first_properties();
+  refused_within_the_records_room(&dump, zero_held + first_properties - 1);
+  refused_within_the_sinks_room(&dump, zero_held + first_properties);
+  refused_within_the_index_room(&dump);
+}
+
+/// What a repository holding revision 0 alone holds, and the bytes of the first revision's properties
+/// ([`an_import_past_the_room_is_refused`]).
+fn revision_zero_held_and_first_properties() -> (u64, u64) {
   let mut zero = created();
   let mut only_zero = Dump::new(Format::Two, None);
   only_zero.revision(
@@ -348,21 +357,31 @@ fn an_import_past_the_room_is_refused() {
     .iter()
     .map(|(name, value)| (name.len() + value.len()) as u64)
     .sum();
-  let short = zero.held() + first_properties - 1;
+  (zero.held(), first_properties)
+}
+
+/// `dump` imported into a repository whose room is `short` bytes, one less than revision 0 and the first revision's
+/// properties: refused `Room` (`E160000`) at the properties, the repository unchanged.
+fn refused_within_the_records_room(dump: &[u8], short: u64) {
   let mut small = created_within(Room {
     entries: ROOMY.entries,
     bytes: short,
   });
-  let refusal = import_whole(&mut small, &dump).unwrap_err();
+  let refusal = import_whole(&mut small, dump).unwrap_err();
   assert!(
     matches!(refusal, MigrationRefusal::Room { room, .. } if room == short),
     "{refusal:?}"
   );
   assert_eq!(refusal.subversion_code(), 160_000);
   assert_eq!(small.youngest(), 0);
+}
+
+/// `dump` imported into a repository whose room of `bytes` holds the first revision's properties, through a sink that
+/// holds one byte less than its text: refused `Room` at the text, within the sink's room, the repository unchanged.
+fn refused_within_the_sinks_room(dump: &[u8], bytes: u64) {
   let mut roomy = created_within(Room {
     entries: ROOMY.entries,
-    bytes: zero.held() + first_properties,
+    bytes,
   });
   let cap = TEXT.len() as u64 - 1;
   let capped = Capped {
@@ -371,7 +390,7 @@ fn an_import_past_the_room_is_refused() {
     used: Cell::new(0),
   };
   let mut importer = Importer::new(ADMISSION);
-  let mut rest = dump.as_slice();
+  let mut rest = dump;
   let refusal = loop {
     let (records, _) = roomy.importing();
     match importer.import(records, &capped, rest, true) {
@@ -388,11 +407,16 @@ fn an_import_past_the_room_is_refused() {
     "{refusal:?}"
   );
   assert_eq!(roomy.youngest(), 0);
+}
+
+/// `dump` imported into a repository whose index room holds fewer entries than its nodes: the index's own `Room`, the
+/// repository unchanged.
+fn refused_within_the_index_room(dump: &[u8]) {
   let mut few = created_within(Room {
     entries: 2,
     bytes: ROOMY.bytes,
   });
-  let refusal = import_whole(&mut few, &dump).unwrap_err();
+  let refusal = import_whole(&mut few, dump).unwrap_err();
   assert!(
     matches!(refusal, MigrationRefusal::Index(IndexRefusal::Room { .. })),
     "{refusal:?}"
