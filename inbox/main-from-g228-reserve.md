@@ -1,0 +1,1 @@
+- g228 (2026-11-21 21:20 PST): in goal 93's reserve since 12:42 (main 01a1ff2e: 'no runs; I send you the next red an owner hands off'); waiting for that piece. 85a's state and leads: inbox/main-from-g228-free.md.
