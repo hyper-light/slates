@@ -3608,8 +3608,12 @@
 > churn for 25.6 MB of text. Red: `an_import_measured` now gates the idle footprint's growth at `HELD_FACTOR` (2) times
 > what the import still holds live. Cut so far (w-svn's sites): the importer's text buffer sized once from its header,
 > admitted first; a stored text streamed into the increment from the store's lent windows, not read back whole; the
-> landing's store pieces lent. Owed: the other owners' copies (the content store's `put_window` and `release_one`; the
-> engine's `judge_held`, two `push_slice`, `Increment::encode`, `chain_entry::encode_carrying`), then A-742's floor
+> landing's store pieces lent; a text put into the content store a copy slice at a time begun with its length
+> (`ContentStore::begin_object_of_length`, w-svn for A-851's absent owner, main's routing of 03:46): its window's buffer
+> reserved once rather than doubled from the first slice, 97.5 MB in 400 allocations to 26.2 MB in 100 for 26.2 MB of
+> text, the band's churn from 10.7 to 8.0 times the text
+> (`an_object_begun_with_its_length_reserves_its_windows_buffer_once`). Owed: the other owners' copies (the content
+> store's `release_one`; the engine's `judge_held`, two `push_slice`, `Increment::encode`), then A-742's floor
 > re-derived by a release A/B only if the footprint still stays (main's ruling). The changeset landing's piece copies
 > are cut too (w-svn, main's routing of 00:57): `slates_store::owner::SlicedLanding::part` answers its buffer emptied
 > once written, and the svn landing fills one buffer a landing (`a_sliced_landings_part_gives_its_buffer_back_to_be_filled_again`).
