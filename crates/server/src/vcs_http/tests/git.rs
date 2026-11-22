@@ -164,7 +164,7 @@ impl Repositories for Held {
 
   fn find(&self, name: &str) -> Option<RepositoryRecord> {
     let (tool, rules) = match name {
-      "r.git" => (VcsTool::Git, self.rules.clone()),
+      "r.git" | "project" => (VcsTool::Git, self.rules.clone()),
       "hg" => (VcsTool::Mercurial, Vec::new()),
       _ => return None,
     };
@@ -1103,5 +1103,29 @@ fn the_daemons_lfs_serves_every_endpoint_deciding_its_status_after_its_body() {
       (StatusMode::AfterBody, true),
       "{method} {target}"
     );
+  }
+}
+
+/// main 01a20182's r28 (stock_git_verbs' lfs row on a machine with git-lfs: "batch response: Repository or object not
+/// found: http://127.0.0.1:50074/project.git/info/lfs/objects/batch"; git-lfs's server discovery appends `.git/info/lfs`
+/// to a remote URL that does not end in `.git` [B: git-lfs, docs/api/server-discovery.md]). Do: as the owner, `POST` the
+/// batch API of `project`, a repository whose name has no `.git`, at `/project.git/info/lfs/objects/batch`, as git-lfs
+/// asks it of a clone of `/project`; and the locks API of `r.git` at `/r.git/info/lfs/locks`. Expect: both served, after
+/// their bodies, proven, and the service told the repository's own name, `project` and `r.git`: a name that names a
+/// repository is taken as it is, and only one that names none is read as git-lfs derived it. Red before: `404`.
+#[test]
+fn an_lfs_request_at_its_remotes_dot_git_endpoint_reaches_the_repository_named_without_it() {
+  let mut site = lfs_site(Carried);
+  for (target, named) in [
+    ("/project.git/info/lfs/objects/batch", "\"project\""),
+    ("/r.git/info/lfs/locks", "\"r.git\""),
+  ] {
+    let asked = request("POST", target, &[LFS_BODY, OWNER_BEARER]);
+    let (_, _, status, mut exchange, proven) = served_lfs(ready(site.answer(&head(&asked), true)));
+    assert_eq!((status, proven), (StatusMode::AfterBody, true), "{target}");
+    ready(exchange.body(b"{}")).unwrap();
+    ready(exchange.body_end(ClientGone::never())).unwrap();
+    let said = String::from_utf8_lossy(&replies(&mut exchange).concat()).into_owned();
+    assert!(said.contains(&format!("repo: {named}")), "{target}: {said}");
   }
 }
