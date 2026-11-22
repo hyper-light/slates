@@ -104,6 +104,9 @@ pub(crate) const REUSE_NO_ENTRY: &str = "vcs_store.git_encode.reuse_no_entry";
 /// Counter: objects whose pushed entry a finished encoding could not read, encoded instead (A-859). Format: a counter
 /// name.
 pub(crate) const REUSE_UNREAD: &str = "vcs_store.git_encode.reuse_unread";
+/// Counter: objects whose pushed entry a finished encoding found not to match the CRC32 its row keeps, read and judged
+/// instead (A-864). Format: a counter name.
+pub(crate) const REUSE_CRC_MISSED: &str = "vcs_store.git_encode.reuse_crc_missed";
 /// Counter: an encoding refused, its version left unencoded. Format: a counter name.
 pub(crate) const REFUSED: &str = "vcs_store.git_encode.refused";
 
@@ -207,7 +210,7 @@ fn turn_lent(
   let encoding_at = stores.encodings.0.get(&id).map(|(_, at)| *at);
   let mut kept = 0;
   let mut past = 0;
-  let mut reused = [0_u64; 5];
+  let mut reused = [0_u64; 6];
   let mut past_by_stage = [0_u64; UNITS_PAST_BUDGET_BY_STAGE.len()];
   let advanced: Option<Result<Progress, StoreRefused>> =
     stores.encodings.0.get_mut(&id).map(|(encoding, _)| {
@@ -261,6 +264,7 @@ fn turn_lent(
           counted.reuse_refused,
           counted.reuse_no_entry,
           counted.reuse_unread,
+          counted.reuse_crc_missed,
         ];
       }
       kept = encoded_bytes(stores, id, encoding_at);
@@ -282,6 +286,7 @@ fn turn_lent(
     REUSE_REFUSED,
     REUSE_NO_ENTRY,
     REUSE_UNREAD,
+    REUSE_CRC_MISSED,
   ]
   .iter()
   .zip(reused)

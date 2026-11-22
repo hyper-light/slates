@@ -12768,6 +12768,29 @@ mod tests {
   /// began at. Never a push half held.
   #[test]
   fn t_b1_a_crash_at_any_segment_boundary_leaves_a_push_whole_or_absent() {
+    let bundle = b1_four_changeset_bundle();
+    let (before, recovered, after, outcome, _) = b1_crash("b1-answered", &bundle, None);
+    assert!(
+      matches!(outcome, Some(slates_hg::push::Outcome::Accepted(_))),
+      "{outcome:?}"
+    );
+    let named = before.2.expect("the answered push's run is named");
+    let segments = named.last - named.first + 1;
+    assert!(segments > 1, "the push landed as {segments} segments");
+    assert_eq!(
+      recovered.0, 4,
+      "the successor holds the answered push whole"
+    );
+    assert_eq!((recovered.2, recovered.3), (Some(named), 0));
+    assert_eq!(after.0, 4);
+    for crash in 1..=segments {
+      b1_crash_leaves_none_then_whole(&bundle, crash, segments, &named);
+    }
+  }
+
+  /// The oracle's push: four changesets on one line, each a file of 1,536 bytes, so that a push cut at
+  /// [`B1_SEGMENT_BYTES`] lands as several segments.
+  fn b1_four_changeset_bundle() -> Vec<u8> {
     use crate::repository::hg_push::tests::history_of;
     let files: Vec<Vec<u8>> = (0..4u8)
       .map(|at| {
@@ -12791,45 +12814,41 @@ mod tests {
       })
       .collect();
     let made = history_of(&commits);
-    let bundle = crate::vcs_http::daemon_edge_tests::history_bundle(&made, &[0, 1, 2, 3]);
-    let (before, recovered, after, outcome, _) = b1_crash("b1-answered", &bundle, None);
-    assert!(
-      matches!(outcome, Some(slates_hg::push::Outcome::Accepted(_))),
-      "{outcome:?}"
+    crate::vcs_http::daemon_edge_tests::history_bundle(&made, &[0, 1, 2, 3])
+  }
+
+  /// One crash of the oracle, after `crash` of the answered push's `segments` segments: the crashed push never
+  /// answered and a second push parked on the turn; none of the push is held before the crash or after the
+  /// successor's recovery, no replay is refused and no entry names the crashed run; and the push again is held whole,
+  /// its run beginning at the sequence the answered push's run `named` began at.
+  fn b1_crash_leaves_none_then_whole(
+    bundle: &[u8],
+    crash: u64,
+    segments: u64,
+    named: &slates_hg::import::record::Run,
+  ) {
+    let (before, recovered, after, outcome, parked) =
+      b1_crash(&format!("b1-crash-{crash}"), bundle, Some(crash));
+    println!(
+      "(b1) crash after {crash} of {segments} segments: before {before:?}, recovered {recovered:?}, after {after:?}"
     );
-    let named = before.2.expect("the answered push's run is named");
-    let segments = named.last - named.first + 1;
-    assert!(segments > 1, "the push landed as {segments} segments");
+    assert!(outcome.is_none(), "the crashed push never answered");
+    assert!(parked > 0, "a second push parked on the turn");
     assert_eq!(
-      recovered.0, 4,
-      "the successor holds the answered push whole"
+      before.0, 0,
+      "the crashed push's fork never replaced the index"
     );
-    assert_eq!((recovered.2, recovered.3), (Some(named), 0));
-    assert_eq!(after.0, 4);
-    for crash in 1..=segments {
-      let (before, recovered, after, outcome, parked) =
-        b1_crash(&format!("b1-crash-{crash}"), &bundle, Some(crash));
-      println!(
-        "(b1) crash after {crash} of {segments} segments: before {before:?}, recovered {recovered:?}, after {after:?}"
-      );
-      assert!(outcome.is_none(), "the crashed push never answered");
-      assert!(parked > 0, "a second push parked on the turn");
-      assert_eq!(
-        before.0, 0,
-        "the crashed push's fork never replaced the index"
-      );
-      assert_eq!(
-        recovered.0, 0,
-        "a crash after {crash} segments leaves none of the push held"
-      );
-      assert_eq!(recovered.3, 0, "no replay refused");
-      assert_eq!(recovered.2, None, "no entry names the crashed run");
-      assert_eq!(after.0, 4, "the push again is held whole");
-      let run = after.2.expect("the push again names its run");
-      assert_eq!(
-        run.first, named.first,
-        "the push again took the crashed run's sequences"
-      );
-    }
+    assert_eq!(
+      recovered.0, 0,
+      "a crash after {crash} segments leaves none of the push held"
+    );
+    assert_eq!(recovered.3, 0, "no replay refused");
+    assert_eq!(recovered.2, None, "no entry names the crashed run");
+    assert_eq!(after.0, 4, "the push again is held whole");
+    let run = after.2.expect("the push again names its run");
+    assert_eq!(
+      run.first, named.first,
+      "the push again took the crashed run's sequences"
+    );
   }
 }

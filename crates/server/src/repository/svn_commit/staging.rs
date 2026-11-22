@@ -175,7 +175,6 @@ impl Staging {
     if self.records.len() >= MAX_RECORDS {
       return Some(Flush::Sections);
     }
-    let texts = stored_bytes(revision);
     let charge = admission_charge(revision);
     let admittable = state.store.admittable();
     // A test's cap counts what the batch holds as the shard's charge does: its texts, its post-state, and the texts
@@ -188,7 +187,9 @@ impl Staging {
           .carried
           .iter()
           .fold(0u64, |total, text| total.saturating_add(text.len));
-        let holds = carried.saturating_add(self.held).saturating_add(texts);
+        let holds = carried
+          .saturating_add(self.held)
+          .saturating_add(stored_bytes(revision));
         admittable.min(cap.saturating_sub(holds))
       });
     (charge > admittable).then_some(Flush::Admission)

@@ -2262,6 +2262,10 @@ fn admit_object(
   if let Some(claimed) = incoming.claimed
     && store.repository.object(content, &claimed).is_some()
   {
+    // A-864: its entry is still noted, so the one before it ends where it begins and a delta against it is named.
+    if let Some(offset) = offset {
+      push.entry_at(offset, claimed);
+    }
     return Ok(());
   }
   let naming = store.repository.naming();
