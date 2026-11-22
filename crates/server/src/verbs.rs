@@ -18408,6 +18408,7 @@ fn acknowledge(state: &mut ShardState, client_id: u32, up_to: u32, owed: &[u32])
   // times in two days — also `…-acknowledge-keyed-on-ephemeral-member-id.md`,
   // `2026-09-14-ack-keyed-under-ephemeral-member-id.md` and `2026-09-14-ack-keyed-on-ephemeral-member-id.md`).
   let origin = state.origin_anchor.0;
+  let g222_p = slates_machine::clock::monotonic_ns();
   let owed = match acknowledgement_owing(state, up_to, owed) {
     Ok(owed) => owed,
     Err(refusal) => {
@@ -18415,7 +18416,9 @@ fn acknowledge(state: &mut ShardState, client_id: u32, up_to: u32, owed: &[u32])
       return refused(refusal);
     }
   };
-  match state.db.mutate(
+  crate::g222_diag::part(g222_p, "ack:owing");
+  let g222_p = slates_machine::clock::monotonic_ns();
+  let g222_mutated = state.db.mutate(
     &mut state.segment,
     &Op::CompletionsAcknowledged {
       origin,
@@ -18424,7 +18427,9 @@ fn acknowledge(state: &mut ShardState, client_id: u32, up_to: u32, owed: &[u32])
       owed,
     },
     now,
-  ) {
+  );
+  crate::g222_diag::part(g222_p, "ack:mutate");
+  match g222_mutated {
     Ok(_) => ReplyBody::Acknowledged,
     Err(e) => refused(refusal_of_db(&e)),
   }

@@ -601,9 +601,21 @@ pub fn dump_ring(path: &str) {
 
 pub fn dump_polls(path: &str) {
   slates_rt::g222_polls::dump(path);
-  dump_serves(&format!("{path}.serves"));
   slates_ipc::endpoint::g222_dump_sends(&format!("{path}.sends"));
   dump_bell(&format!("{path}.bell"));
+  // w-perf 84a: the db's snapshots join the long serves by name, so a verb or a part they ran inside shows them.
+  let snapshots = slates_db::replay::G222_SNAPSHOTS
+    .lock()
+    .map(|mut rows| std::mem::take(&mut *rows))
+    .unwrap_or_default();
+  if let Ok(mut serves) = SERVES.lock() {
+    for (shard, began, ns) in snapshots {
+      if serve_is_long(ns) {
+        serves.push((shard, began, ns, "db:snapshot".to_owned()));
+      }
+    }
+  }
+  dump_serves(&format!("{path}.serves"));
 }
 
 /// Shape: doorbell thread kicks kept.

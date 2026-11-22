@@ -888,6 +888,13 @@ impl Db {
 
   /// Publishes the partition into the alternate snapshot slot and releases the log behind it.
   pub fn snapshot(&mut self, segment: &mut AnchorSegment) -> Result<(), DbError> {
+    let g222_began = slates_machine::clock::monotonic_ns();
+    let g222_result = self.snapshot_inner(segment);
+    g222_snapshot(g222_began);
+    g222_result
+  }
+
+  fn snapshot_inner(&mut self, segment: &mut AnchorSegment) -> Result<(), DbError> {
     let seq = self.next_seq.saturating_sub(1);
     let started = Instant::now();
     let snapshot = self.partition.to_snapshot(seq);
@@ -1630,5 +1637,32 @@ mod tests {
     drop(db);
     let db = recover(&mut segment, 0, caps(), 0).unwrap().0;
     assert_eq!(seen(&db), Some(MOUNT), "restored from a snapshot");
+  }
+}
+
+/// Diagnostic only (w-perf 84a, never main): every snapshot's (shard, start ns, length ns), the shard read from the
+/// thread's name.
+#[doc(hidden)]
+#[allow(clippy::disallowed_types)]
+pub static G222_SNAPSHOTS: std::sync::Mutex<Vec<(u16, u64, u64)>> =
+  std::sync::Mutex::new(Vec::new());
+
+#[allow(
+  clippy::all,
+  clippy::pedantic,
+  clippy::disallowed_methods,
+  clippy::disallowed_types
+)]
+fn g222_snapshot(began: u64) {
+  let ns = slates_machine::clock::monotonic_ns().saturating_sub(began);
+  let shard = std::thread::current()
+    .name()
+    .and_then(|name| name.strip_prefix("slates-shard-"))
+    .and_then(|id| id.parse::<u16>().ok())
+    .unwrap_or(u16::MAX);
+  if let Ok(mut rows) = G222_SNAPSHOTS.lock() {
+    if rows.len() < 100_000 {
+      rows.push((shard, began, ns));
+    }
   }
 }
