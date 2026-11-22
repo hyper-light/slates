@@ -25,3 +25,13 @@ it: the member whose head is the commit, else the default branch's); its reach s
 base (a tag of a held commit brings its tag object alone); a fetch's plan follows a version's base to its base's runs.
 Replaces the from-nothing first version; recovery replays the base from the record. Claim an A-number for it when you
 rule. Until then I work (1) as soon as the cause comes back.
+
+## Addendum (same day): where (2) lives, and one more guard
+- A-614's ruling (A) already derives a create's reach sets from `from`, a green and version whose head is the create's
+  own head (`Reach::Remade { from }`). A tag's head is its tag object, never another green's head, so `from` is none and
+  every tag's sets (and then its fragments) are the closure of its whole history from nothing. The fix narrows to: a
+  create whose head is a tag (a chain) peeled to an object another green's version heads takes that version as `from`
+  for its sets, and as its fragments' base, plus the tag objects themselves; a fetch's plan follows that base.
+- Ruled out at unit scale for (1): deferred reach sets. `t_goal93_a_clone_answered_before_its_reach_sets_are_derived_is_
+  whole` (a 600-commit create, its sets deferred, fetched before any derivation) answers whole. So (1)'s cause still
+  waits on w-sessionlog's log line from 03c0e2e14.
