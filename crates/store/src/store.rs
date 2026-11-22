@@ -555,6 +555,58 @@ impl Store {
       .collect()
   }
 
+  /// Forgets repository `repository`'s changeset `sequence`, one no register named (main 01a20182's ruling of
+  /// 2026-11-22 12:00: a push's run abandoned, its rows forgotten at its abandonment, counted and bounded): its `C`
+  /// row; each payload's `P` row where it still names this record's bytes; its `Texts` rows, each text's `T` row and
+  /// each version's `I` row moved to another changeset that kept the same text where this one was its first keeper
+  /// (`texts::forget_rows`); then the engine checkpointed at the log's end, so a recovery's replay never puts them back.
+  /// Its record's bytes stay in the log, the owed cleaner of unnamed log space's (GAPS). The rows forgotten or moved,
+  /// none where no such changeset landed: bounded by the changeset's own sections.
+  ///
+  /// # Errors
+  /// [`StoreError::BadRow`] for a row or section that does not decode; the log's and the engine's refusals.
+  pub fn forget(&mut self, repository: u128, sequence: u64) -> Result<u64, StoreError> {
+    let key = changeset_key(repository, sequence);
+    let Some(row) = changeset_row(&mut self.rows, &key)? else {
+      return Ok(0);
+    };
+    let mut forgotten = 0_u64;
+    let mut buffer = Vec::new();
+    for section in self.sections(&row)? {
+      match section.kind {
+        SectionKind::Payload => {
+          let identity =
+            identity_of_range(self.log.file(), section.offset, section.len, &mut buffer)?;
+          let mut content = [0u8; CONTENT_KEY_BYTES];
+          content_key(&identity, &mut content);
+          if self.rows.get(&content, &mut self.value)?
+            && u64_at(&self.value, 0) == Some(section.offset)
+          {
+            self.rows.delete(&content)?;
+            forgotten = forgotten.saturating_add(1);
+          }
+        }
+        SectionKind::Texts => {
+          let entries = section_texts(self.log.file(), &section, &mut buffer)?;
+          let Store { rows, log, .. } = self;
+          let mut entries_of = |rows: &mut ShardDb<DeviceFile>, keeper: u64| {
+            texts_of_changeset(rows, log, repository, keeper)
+          };
+          forgotten = forgotten.saturating_add(crate::texts::forget_rows(
+            rows,
+            (repository, sequence),
+            &entries,
+            &mut entries_of,
+          )?);
+        }
+        _ => {}
+      }
+    }
+    self.rows.delete(&key)?;
+    self.rows.checkpoint(self.log.end())?;
+    Ok(forgotten.saturating_add(1))
+  }
+
   /// Checkpoints the engine at the log's end, so a recovery replays only what lands after.
   pub fn checkpoint(&mut self) -> Result<(), StoreError> {
     self.rows.checkpoint(self.log.end())?;
@@ -642,6 +694,61 @@ pub fn grant_id(device: u64, inode: u64) -> u64 {
 /// so a shard's reserve of tens of GiB (a Mac Studio's) refused every landing (A-645 (a)'s run found it).
 fn memtable_bytes(memory: usize) -> usize {
   memory.min(usize::try_from(u32::MAX).unwrap_or(usize::MAX))
+}
+
+/// The changeset row at `key`, decoded; none where no changeset landed there.
+fn changeset_row<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  key: &[u8],
+) -> Result<Option<Changeset>, StoreError> {
+  let mut value = Vec::new();
+  if !rows.get(key, &mut value)? {
+    return Ok(None);
+  }
+  decode_changeset(key, &value).map(Some)
+}
+
+/// The `Texts` entries of a committed record's section `section`, read whole from `file` into `buffer`.
+fn section_texts<F: BlockFile>(
+  file: &F,
+  section: &crate::log::Section,
+  buffer: &mut Vec<u8>,
+) -> Result<Vec<crate::texts::TextEntry>, StoreError> {
+  buffer.clear();
+  buffer.resize(
+    usize::try_from(section.len).map_err(|_| StoreError::Sizing("a texts section past memory"))?,
+    0,
+  );
+  file
+    .read_exact_at(buffer, section.offset)
+    .map_err(LogError::from)?;
+  crate::texts::decode(buffer).map_err(|_| StoreError::BadRow)
+}
+
+/// The `Texts` entries of repository `repository`'s changeset `sequence`, read back from `log` (none where it landed
+/// none, or no such changeset is held).
+fn texts_of_changeset<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  log: &ChangesetLog<F>,
+  repository: u128,
+  sequence: u64,
+) -> Result<Vec<crate::texts::TextEntry>, StoreError> {
+  let Some(row) = changeset_row(rows, &changeset_key(repository, sequence))? else {
+    return Ok(Vec::new());
+  };
+  let located = Located {
+    offset: row.offset,
+    header: log.header_at(row.offset)?,
+    identity: row.identity,
+    len: row.len,
+  };
+  let mut buffer = Vec::new();
+  for section in log.sections(&located)? {
+    if section.kind == SectionKind::Texts {
+      return section_texts(log.file(), &section, &mut buffer);
+    }
+  }
+  Ok(Vec::new())
 }
 
 /// The changeset row's key.

@@ -19549,10 +19549,14 @@ async fn rebuild_record(
         .repositories()
         .member(record.id)
         .cloned();
+      // A Subversion green's named texts the content store lacks brought back first (A-760's pre-pass), and given back
+      // once it is replayed.
+      let brought = crate::vcs_store::svn_texts::bring_back_named(state, record.id, slices).await;
       let versions = match member {
         Some(member) => rebuild_member_sliced(state, record, &member, slices).await,
         None => rebuild_green_sliced(state, record, slices).await,
       };
+      crate::repository::svn_commit::release_texts(state, None, &brought);
       for version in versions {
         crate::merge_service::enqueue_recovered_record(state, record.id, version);
         slices.unit_done().await;

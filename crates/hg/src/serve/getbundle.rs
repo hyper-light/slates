@@ -56,7 +56,7 @@ use super::pull::{self, Outgoing};
 use super::{Refusal, Repository, Rev, RevSet, node_of, parents_of};
 use crate::bundle2::{Bundle2, Event, Param, Part};
 use crate::capabilities::{self, Bundle2Capabilities};
-use crate::changegroup::{self, Changegroup, Group, Revision, Version};
+use crate::changegroup::{self, Revision, Version};
 use crate::obsmarkers::{self, Format, Marker};
 use crate::out::{Measure, Out};
 use crate::read::to_u64;
@@ -634,7 +634,7 @@ fn frame_after(parts: &[Built], first: u32, admission: &mut Admission) -> Result
 /// Whether a fetch of `outgoing` is walked by its links ([`Walk::begin`]): a clone of every head, the client holding
 /// nothing (no common revision) and the view serving every changeset, so every changeset is missing and every manifest
 /// and file revision is sent: the walk visits what it sends. Any fetch whose client holds something is made from the
-/// changesets it lacks ([`named_changegroup`]), so a pull of one changeset costs what it sends, never a walk of every
+/// changesets it lacks ([`Named`]), so a pull of one changeset costs what it sends, never a walk of every
 /// row of the history for its links (goal 93 perf: a one-changeset pull of Mercurial's history took 4.2 s by the
 /// walk). Decided from the fetch's own counts, nothing walked.
 fn by_links(store: &impl Store, outgoing: &Outgoing) -> bool {
@@ -660,7 +660,7 @@ pub fn changegroup(
   Ok(out)
 }
 
-/// The changegroup of `outgoing` in `version` made by the changesets that name each revision ([`named_changegroup`]),
+/// The changegroup of `outgoing` in `version` made by the changesets that name each revision ([`Named`]),
 /// whatever the fetch, its payload whole: the two walks' oracle.
 #[cfg(test)]
 pub(crate) fn named_changegroup_whole(
@@ -721,9 +721,9 @@ pub struct Walk {
   version: Version,
   /// Where the walk stands; none once the changegroup's end is written.
   at: Option<At>,
-  /// A fetch the links cannot walk ([`named_changegroup`]): its changegroup, made whole when it began, written in one
-  /// step.
-  named: Option<Vec<u8>>,
+  /// A fetch the links cannot walk, walked by the changesets that name each revision ([`Named`]), until its file
+  /// section ([`Walk::pull`]).
+  named: Option<Named>,
   /// The file revisions read from the changeset store ahead of their steps ([`Ahead`]).
   files: Files,
   /// A pull's file section, once its changelog and manifests are written ([`Pull`]).
@@ -820,7 +820,7 @@ impl Walk {
   }
 
   /// A walk of the changegroup of `outgoing` in `version` at its start, by the links if `linked`, else by the
-  /// changesets that name each revision ([`named_changegroup`]), its changelog and manifests made whole within
+  /// changesets that name each revision ([`Named`]), a unit a step, within
   /// `admission`.
   fn begun(
     store: &impl Store,
@@ -838,9 +838,14 @@ impl Walk {
       pull: None,
     };
     if !linked {
-      let (written, pull) = named_changegroup(store, outgoing, version, admission)?;
-      walk.named = Some(written);
-      walk.pull = Some(pull);
+      walk.named = Some(Named {
+        held: common_ancestors(store, &outgoing.common, admission)?,
+        stage: NamedStage::Changelog(0),
+        manifests: Vec::new(),
+        seen_manifests: BTreeSet::new(),
+        files: BTreeMap::new(),
+        seen_files: BTreeSet::new(),
+      });
       walk.at = None;
     }
     Ok(walk)
@@ -853,9 +858,13 @@ impl Walk {
     room: &mut Admission,
     out: &mut Vec<u8>,
   ) -> Result<bool, Refusal> {
-    if let Some(named) = self.named.take() {
-      out.extend_from_slice(&named);
-      return Ok(self.pull.is_some());
+    if let Some(mut named) = self.named.take() {
+      if named.step(store, (&self.missing, self.version), room, out)? {
+        self.pull = Some(named.pull());
+      } else {
+        self.named = Some(named);
+      }
+      return Ok(true);
     }
     if let Some(pull) = &mut self.pull {
       if pull.ended {
@@ -1221,30 +1230,12 @@ impl Walk {
   /// charged to `room` before they are written.
   fn put(
     &self,
-    (node, parents, link, flags): (Node, [Node; 2], Node, u16),
+    revision: (Node, [Node; 2], Node, u16),
     text: &[u8],
     room: &mut Admission,
     out: &mut Vec<u8>,
   ) -> Result<(), Refusal> {
-    room.charge(to_u64(delta::HUNK_HEADER_LEN.saturating_add(text.len())))?;
-    let revision = Revision {
-      node,
-      p1: parents[0],
-      p2: parents[1],
-      base: NULL_NODE,
-      link,
-      flags: if self.version == Version::V02 {
-        0
-      } else {
-        flags
-      },
-      info: None,
-      protocol_flags: 0,
-      data: text,
-      sidedata: None,
-    };
-    changegroup::put_revision_whole(&revision, self.version, out)
-      .map_err(|_| unencodable("a revision"))
+    put_whole(revision, self.version, text, room, out)
   }
 }
 
@@ -1650,68 +1641,182 @@ impl Pull {
   }
 }
 
-/// What one revision of the changegroup carries before its delta is written.
-struct Entry<'s> {
-  /// Its node and parents.
-  node: Node,
-  /// Its parents.
-  parents: [Node; 2],
-  /// The changeset it is linked to in this changegroup.
-  link: Node,
-  /// Its flags.
-  flags: u16,
-  /// Its full text, lent by the store.
-  text: Cow<'s, [u8]>,
+/// A fetch the links cannot walk (a pull, a clone of some heads; 7.2's `cgpacker` off its link-revision fast path),
+/// walked by the changesets that name each revision a unit a step (main 01a20182's order of 2026-11-22 10:40: a clone
+/// of half of Mercurial's 57,054-changeset history made this changegroup whole in one step, 4.1 s in a debug build,
+/// its shard killed for spinning). Each step one missing changeset, oldest first: its entry written whole, linked to
+/// itself, its manifest lent (once a changeset) and the file revisions its manifest names at the paths it lists
+/// planned, each linked to the first missing changeset naming it, those whose own link the client holds left out; then
+/// each manifest the missing changesets name, a step each in its log's order, lent again and written whole; then the
+/// file section ([`Pull`]). What it keeps between steps is the plan, never a text. Bounded by what the fetch sends,
+/// never the repository.
+#[derive(Debug)]
+struct Named {
+  /// The changesets the client holds: the common heads and their ancestors.
+  held: RevSet,
+  /// Where it stands.
+  stage: NamedStage,
+  /// Each manifest a missing changeset names: its position in its log, its node and its link, in their log's order
+  /// once the changelog is written.
+  manifests: Vec<(u64, Node, Node)>,
+  /// The manifests planned.
+  seen_manifests: BTreeSet<Node>,
+  /// The file revisions planned, by path, each with its position in its log.
+  files: BTreeMap<Vec<u8>, Vec<(u64, PlannedRevision)>>,
+  /// The file revisions looked up.
+  seen_files: BTreeSet<(Vec<u8>, Node)>,
 }
 
-/// The changegroup of `outgoing` in `version` by the changesets that name each revision (7.2's `cgpacker` off its
-/// link-revision fast path), encoded whole: a fetch that leaves some served changeset neither sent nor held, or a view
-/// that hides some, whose revisions a link names past what the client holds after it. Bounded by what the fetch
-/// sends, never the repository. Each missing changeset's text is lent once and each manifest's once (A-680): the
-/// changesets' entries hold their texts, which the paths they list are read from, and each path's file node is found
-/// in the text of the manifest's entry ([`manifest::find`]).
-pub(crate) fn named_changegroup(
-  store: &impl Store,
-  outgoing: &Outgoing,
-  version: Version,
-  admission: &mut Admission,
-) -> Result<(Vec<u8>, Pull), Refusal> {
-  let held = common_ancestors(store, &outgoing.common, admission)?;
-  let missing: Vec<Rev> = outgoing.missing.iter().collect();
-  admission.charge_items::<Rev>(missing.len())?;
-  let changelog = changelog_entries(store, &missing, admission)?;
-  let (manifests, files) = named_revisions(store, &changelog, &held, admission)?;
-  let mut written = encode_changegroup(version, &changelog, &manifests, &[], admission)?;
-  // The file list's end, which the pull's file section writes once its groups are sent.
-  written.truncate(written.len().saturating_sub(changegroup::LENGTH_LEN));
-  Ok((written, Pull::new(files, held)))
+/// Where a [`Named`] walk stands.
+#[derive(Clone, Copy, Debug)]
+enum NamedStage {
+  /// The changelog's group, from this served revision.
+  Changelog(Rev),
+  /// The manifests' group, from this one of [`Named::manifests`].
+  Manifests(usize),
 }
 
-/// The missing changesets' entries, oldest first, each linked to itself and holding its text, lent once.
-fn changelog_entries<'s>(
-  store: &'s impl Store,
-  missing: &[Rev],
-  admission: &mut Admission,
-) -> Result<Vec<Entry<'s>>, Refusal> {
-  admission.charge_items::<Entry<'_>>(missing.len())?;
-  let mut entries = Vec::with_capacity(missing.len());
-  for rev in missing {
-    let node = node_of(store, *rev)?;
+impl Named {
+  /// The walk's next unit (the type's docs), what it lends and keeps charged to `room`: whether the manifests' group is
+  /// written, the file section next ([`Named::pull`]).
+  fn step(
+    &mut self,
+    store: &impl Store,
+    (missing, version): (&pull::Ranges, Version),
+    room: &mut Admission,
+    out: &mut Vec<u8>,
+  ) -> Result<bool, Refusal> {
+    match self.stage {
+      NamedStage::Changelog(from) => {
+        let Some(rev) = missing.next_from(from) else {
+          changegroup::put_end(out);
+          self
+            .manifests
+            .sort_unstable_by_key(|(position, _, _)| *position);
+          self.stage = NamedStage::Manifests(0);
+          return Ok(false);
+        };
+        self.changeset(store, (rev, version), room, out)?;
+        self.stage = NamedStage::Changelog(rev.saturating_add(1));
+        Ok(false)
+      }
+      NamedStage::Manifests(at) => {
+        let Some((_, node, link)) = self.manifests.get(at).copied() else {
+          changegroup::put_end(out);
+          if version.has_tree_list() {
+            changegroup::put_end(out);
+          }
+          return Ok(true);
+        };
+        let logged = store.manifest(&node, room)?.ok_or_else(no_manifest)?;
+        put_whole(
+          (node, logged.parents, link, logged.flags),
+          version,
+          &logged.text,
+          room,
+          out,
+        )?;
+        self.stage = NamedStage::Manifests(at.saturating_add(1));
+        Ok(false)
+      }
+    }
+  }
+
+  /// Missing changeset `rev` written whole, linked to itself, and what its manifest names at the paths it lists planned.
+  fn changeset(
+    &mut self,
+    store: &impl Store,
+    (rev, version): (Rev, Version),
+    room: &mut Admission,
+    out: &mut Vec<u8>,
+  ) -> Result<(), Refusal> {
+    let node = node_of(store, rev)?;
     let parent =
       |parent: Option<Rev>| parent.map_or(Ok(NULL_NODE), |parent| node_of(store, parent));
-    let [first, second] = parents_of(store, *rev)?;
+    let [first, second] = parents_of(store, rev)?;
+    let parents = [parent(first)?, parent(second)?];
     let text = store
-      .changeset_text(*rev, admission)?
+      .changeset_text(rev, room)?
       .ok_or_else(no_changeset_text)?;
-    entries.push(Entry {
-      node,
-      parents: [parent(first)?, parent(second)?],
-      link: node,
-      flags: 0,
-      text,
-    });
+    put_whole((node, parents, node, 0), version, &text, room, out)?;
+    let (manifest, touched) = read_changeset(&text)?;
+    let logged = store.manifest(&manifest, room)?.ok_or_else(no_manifest)?;
+    manifest::decode(&logged.text).map_err(|_| no_manifest())?;
+    if self.seen_manifests.insert(manifest) {
+      room.charge_items::<(u64, Node, Node)>(1)?;
+      self.manifests.push((logged.position, manifest, node));
+    }
+    for path in touched
+      .split(|byte| *byte == NEWLINE)
+      .filter(|path| !path.is_empty())
+    {
+      let Some(found) = manifest::find(&logged.text, path) else {
+        continue;
+      };
+      if !self.seen_files.insert((path.to_vec(), found.node)) {
+        continue;
+      }
+      let entry = store.file_entry(path, &found.node).ok_or(Refusal::Store {
+        what: "a file revision",
+      })?;
+      room.charge_items::<(u64, PlannedRevision, Vec<u8>, Node)>(1)?;
+      room.charge(to_u64(path.len()).saturating_mul(2))?;
+      if !store
+        .rev(&entry.link)
+        .is_some_and(|rev| self.held.contains(rev))
+      {
+        self.files.entry(path.to_vec()).or_default().push((
+          entry.position,
+          PlannedRevision {
+            node: found.node,
+            entry,
+            link: node,
+          },
+        ));
+      }
+    }
+    Ok(())
   }
-  Ok(entries)
+
+  /// The file section over what was planned, each group in its log's order.
+  fn pull(self) -> Pull {
+    let files = self
+      .files
+      .into_iter()
+      .map(|(path, mut revisions)| {
+        revisions.sort_unstable_by_key(|(position, _)| *position);
+        (
+          path,
+          revisions.into_iter().map(|(_, planned)| planned).collect(),
+        )
+      })
+      .collect();
+    Pull::new(files, self.held)
+  }
+}
+
+/// A revision written whole against the null base in `version`, its delta charged to `room`.
+fn put_whole(
+  (node, parents, link, flags): (Node, [Node; 2], Node, u16),
+  version: Version,
+  text: &[u8],
+  room: &mut Admission,
+  out: &mut Vec<u8>,
+) -> Result<(), Refusal> {
+  room.charge(to_u64(delta::HUNK_HEADER_LEN.saturating_add(text.len())))?;
+  let revision = Revision {
+    node,
+    p1: parents[0],
+    p2: parents[1],
+    base: NULL_NODE,
+    link,
+    flags: if version == Version::V02 { 0 } else { flags },
+    info: None,
+    protocol_flags: 0,
+    data: text,
+    sidedata: None,
+  };
+  changegroup::put_revision_whole(&revision, version, out).map_err(|_| unencodable("a revision"))
 }
 
 /// A changeset's manifest node and the paths it touches, read from its text.
@@ -1726,10 +1831,6 @@ fn read_changeset(text: &[u8]) -> Result<(Node, &[u8]), Refusal> {
   Ok((manifest, changeset.files))
 }
 
-/// The manifests a changegroup carries and its file groups by path, each path read from a changeset's text: each file
-/// revision by its node, its row's entry and the missing changeset this changegroup links it to.
-type Named<'s> = (Vec<Entry<'s>>, Vec<(Vec<u8>, Vec<PlannedRevision>)>);
-
 /// A file revision a pull sends: its node, its log's row, and the changeset this changegroup links it to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PlannedRevision {
@@ -1739,174 +1840,6 @@ pub(crate) struct PlannedRevision {
   entry: FileEntry,
   /// The changeset it is linked to in this changegroup.
   link: Node,
-}
-
-/// A revision found for a group, with its position in its log: what orders the group.
-type Placed<'s> = (u64, Entry<'s>);
-
-/// Every manifest the missing changesets name and, by path, the file revisions their manifests name at the paths they
-/// list: each linked to the first missing changeset that names it, the file revisions whose own link the client holds
-/// left out, each group in its log's order. Each manifest is lent once and checked whole before its paths are looked up
-/// in it by halving.
-fn named_revisions<'t, 's>(
-  store: &'s impl Store,
-  changelog: &'t [Entry<'s>],
-  held: &RevSet,
-  admission: &mut Admission,
-) -> Result<Named<'s>, Refusal> {
-  let mut manifests: Vec<Placed<'s>> = Vec::new();
-  let mut seen_manifests: BTreeMap<Node, usize> = BTreeMap::new();
-  let mut files: BTreeMap<&'t [u8], Vec<(u64, PlannedRevision)>> = BTreeMap::new();
-  let mut seen_files = BTreeSet::new();
-  for changeset in changelog {
-    let link = changeset.node;
-    let (manifest, touched) = read_changeset(&changeset.text)?;
-    let at = match seen_manifests.get(&manifest) {
-      Some(at) => *at,
-      None => {
-        let logged = store
-          .manifest(&manifest, admission)?
-          .ok_or_else(no_manifest)?;
-        manifest::decode(&logged.text).map_err(|_| no_manifest())?;
-        admission.charge_items::<(Placed<'_>, Node, usize)>(1)?;
-        manifests.push((logged.position, entry(manifest, link, logged)));
-        let at = manifests.len().saturating_sub(1);
-        seen_manifests.insert(manifest, at);
-        at
-      }
-    };
-    let Some((_, kept)) = manifests.get(at) else {
-      return Err(no_manifest());
-    };
-    for path in touched
-      .split(|byte| *byte == NEWLINE)
-      .filter(|path| !path.is_empty())
-    {
-      let Some(found) = manifest::find(&kept.text, path) else {
-        continue;
-      };
-      if seen_files.insert((path, found.node)) {
-        let entry = store.file_entry(path, &found.node).ok_or(Refusal::Store {
-          what: "a file revision",
-        })?;
-        admission.charge_items::<(u64, PlannedRevision, &[u8], Node)>(1)?;
-        if !store.rev(&entry.link).is_some_and(|rev| held.contains(rev)) {
-          files.entry(path).or_default().push((
-            entry.position,
-            PlannedRevision {
-              node: found.node,
-              entry,
-              link,
-            },
-          ));
-        }
-      }
-    }
-  }
-  manifests.sort_unstable_by_key(|(position, _)| *position);
-  let files = files
-    .into_iter()
-    .map(|(path, mut revisions)| {
-      revisions.sort_unstable_by_key(|(position, _)| *position);
-      (
-        path.to_vec(),
-        revisions.into_iter().map(|(_, planned)| planned).collect(),
-      )
-    })
-    .collect();
-  Ok((
-    manifests.into_iter().map(|(_, entry)| entry).collect(),
-    files,
-  ))
-}
-
-/// A logged revision's entry, linked to `link`.
-fn entry<'s>(node: Node, link: Node, logged: Logged<'s>) -> Entry<'s> {
-  Entry {
-    node,
-    parents: logged.parents,
-    link,
-    flags: logged.flags,
-    text: logged.text,
-  }
-}
-
-/// Writes every entry's full-text delta into one buffer, charged first, and encodes the changegroup from it.
-fn encode_changegroup(
-  version: Version,
-  changelog: &[Entry<'_>],
-  manifests: &[Entry<'_>],
-  files: &[(&[u8], Vec<Entry<'_>>)],
-  admission: &mut Admission,
-) -> Result<Vec<u8>, Refusal> {
-  let all = || {
-    changelog
-      .iter()
-      .chain(manifests)
-      .chain(files.iter().flat_map(|(_, entries)| entries))
-  };
-  let len = all().fold(0_usize, |total, entry| {
-    total
-      .saturating_add(delta::HUNK_HEADER_LEN)
-      .saturating_add(entry.text.len())
-  });
-  admission.charge(to_u64(len))?;
-  let count = all().count();
-  admission.charge_items::<(usize, Revision<'_>)>(count)?;
-  let mut deltas = Vec::with_capacity(len);
-  let mut ends = Vec::with_capacity(count);
-  for entry in all() {
-    delta::encode_full_text(&entry.text, &mut deltas).map_err(|_| unencodable("a full text"))?;
-    ends.push(deltas.len());
-  }
-  let starts = core::iter::once(0).chain(ends.iter().copied());
-  let revisions: Vec<Revision<'_>> = all()
-    .zip(starts.zip(&ends))
-    .map(|(entry, (start, end))| Revision {
-      node: entry.node,
-      p1: entry.parents[0],
-      p2: entry.parents[1],
-      base: NULL_NODE,
-      link: entry.link,
-      flags: if version == Version::V02 {
-        0
-      } else {
-        entry.flags
-      },
-      info: None,
-      protocol_flags: 0,
-      data: deltas.get(start..*end).unwrap_or_default(),
-      sidedata: None,
-    })
-    .collect();
-  let manifests_end = changelog.len().saturating_add(manifests.len());
-  let mut groups = Vec::with_capacity(files.len());
-  let mut at = manifests_end;
-  for (path, entries) in files {
-    let end = at.saturating_add(entries.len());
-    groups.push(Group {
-      name: path,
-      revisions: at..end,
-    });
-    at = end;
-  }
-  let changegroup = Changegroup {
-    version,
-    revisions,
-    changelog: 0..changelog.len(),
-    manifests: changelog.len()..manifests_end,
-    trees: Vec::new(),
-    files: groups,
-  };
-  let len = changegroup
-    .encoded_len()
-    .map_err(|_| unencodable("a changegroup"))?;
-  admission.charge(len)?;
-  let mut out = Vec::new();
-  changegroup
-    .encode(&mut out)
-    .map_err(|_| unencodable("a changegroup"))?;
-  Ok(out)
 }
 
 /// The revisions every one of `revs` descends from: themselves and all their ancestors, a bit each of the view.

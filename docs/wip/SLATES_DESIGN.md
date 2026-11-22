@@ -60973,4 +60973,76 @@ owed.
   (a row's entry read back); `slates-server` `git_push::tests::t_a859_a_clone_of_a_deltified_push_sends_its_entries_as_they_lie`
   (none rebuilt). A bit flipped in a stored entry's bytes themselves leaves no copy to rebuild it from: the rebuild's
   check refuses it and the answer refuses typed, never sending it.
-- **Owed.** main's git/git whole round: the clone within PATIENCE, the encoding's `reuse_unread` 0.
+- **Piece 1, the loose stage in pack order** (main 01a20182's ruling of 2026-11-22, ahead of bounded residency). The
+  loose stage met objects by position (type, then id), so its reads jumped about each pack, every window read many
+  times. Now its objects are first read into an order (`Stage::Order`, a row a unit; three words an object charged to
+  the request's admission: a pack's ordinal, an offset and a position, 24 bytes, 3.6 MB for git/git's 150,000) and
+  sorted by pack and offset, those held whole last by position: each pack is read front to back, as git writes the
+  entries it reuses, an offset delta's base always before it, each window wanted once. Counted `backward_reads`.
+  `git_push::tests::t_a859_a_clone_of_a_deltified_push_sends_its_entries_as_they_lie`: 0 backward reads (88 in position
+  order), its streamed clone 17,299 bytes, the pushed pack's own, in 175 turns where 403 went before.
+- **Piece 2, a fetch's look-ahead** (main 01a20182's ruling of 2026-11-22: residency bounded by a turn's windows). A
+  unit of the stream whose pushed entry lies in a let-go window, or a copy under way that reaches one, stops before it
+  writes or keeps anything; the turn ends there, the window named (`Upload::waiting`), and the unit is taken again on
+  the next turn, so a turn's sideband framing is a turn's as ever. Before each turn, off it, the fetch's driver (both
+  edges) brings back the window the last turn stopped at and the `LOOK_AHEAD_WINDOWS` (two) the next turn reads first
+  (`Upload::reading_next`: a pack is read front to back, piece 1). A fetch no longer makes its repository's packs
+  resident; an encoding does, where one is due (`git_encode::encoding_due`). Counted `ahead_brought` and
+  `stopped_brought`. Tests: `slates-git` `a864_a_turn_that_meets_a_let_go_window_stops_cleanly_and_the_clone_is_byte_identical`
+  (every window of a landed pack let go: stopped and brought back, the clone byte for byte; red: refused);
+  `slates-server` `t_a864_a_fetchs_look_ahead_brings_back_a_turns_windows_never_its_pack` (two of four windows).
+- **Owed.** main's git/git whole round: the clone within PATIENCE, the encoding's `reuse_unread` 0. Piece 3: the windows
+  a fetch brought back let go behind its cursor (w-shared's `let_go_read`, with 2b(a)), so residency at its peak is a
+  turn's windows, gauged; and the end-to-end red over a real pushed pack, which needs 2b(a)'s let-go of `Shared`
+  windows. The encoding's own look-ahead: it still makes a due version's packs resident whole.
+
+### A-865 — A Subversion increment names its stored texts (A-760), and a recovery brings back the names its content store lacks (2026-11-22, w-svn; main 01a20182's rulings of 11:05, ~11:35 and ~11:50 PST, goal 93, P7 finding (2); A-760, A-862, A-863, C2 stage C)
+Applied in the same change to:
+- `crates/server/src/repository/svn_commit.rs`: `Building::insert` names a text stored in the content store as a whole
+  `NamedRun` (its op sourced after the inline bytes, `build` patching each such source once their length is known, and
+  checking it against what `Increment::push_named` numbers). It copies into the post-state only a text the revision or
+  the records hold themselves. `read_named` reads every run into its own buffer before the increment is judged, counted
+  (`repository.svn_commit.named_read_bytes`). `Building` keeps no content store.
+- `crates/server/src/repository/svn_commit/staging.rs`: the batch reads its revisions' runs, its holding counts them
+  with the post-state, and `KILL_BEFORE_ENTRY` is a test's kill between the changeset and its entry.
+- `crates/server/src/import_batch.rs`: the scratch member judges with `Green::submit_named`, new in
+  `crates/merge/src/engine.rs` (`judge_named`, then the commit), so each run's buffer becomes its file with no copy.
+- `crates/server/src/repository/push.rs`: `RecordedBatch::apply_slice` reads a version's runs again before the real
+  green applies it. The texts are held until the batch's landing ends; piece (c), adopting the scratch member's files,
+  would drop this read.
+- `crates/server/src/vcs_store/svn_texts.rs`: `bring_back_named`, the recovery's pre-pass; `bring_whole_in`, the bring of a
+  text where the state is the recovery's; `put_brought`, `finish_brought` shared with `bring_whole`; counter
+  `vcs_store.svn_texts.named_brought_back`.
+- `crates/server/src/verbs.rs`: `rebuild_record`'s Green arm runs the pre-pass before a green's replay and gives its
+  texts back after.
+- Tests: `an_increment_names_its_stored_texts_and_carries_none_of_their_bytes`,
+  `an_increments_record_names_its_texts_not_their_bytes` (svn_commit); in store_tests,
+  `a_batch_killed_between_its_commits_slices_recovers_and_resumes_to_the_same_history` (now asserting texts brought
+  back), `a_batch_killed_between_its_changeset_and_its_entry_lands_again_whole`,
+  `a_cleanly_restarted_import_brings_back_no_named_text` and
+  `a_region_held_window_is_restored_beside_the_named_texts_brought_back`. GAPS.
+
+Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_import_measured` over git-2000) owed.
+- **Why.** After A-862 an import's texts sit in the content store by identity, yet its increments copied each into their
+  post-state (`Building::append_text`), their chain entries carried them (`Increment::encode`), and the scratch member
+  made each file again from that copy. A-760 had built the mechanism: an increment names a run of the content plane,
+  read into a buffer of its own that the commit makes the file. GAPS named the Subversion landing's use of it w-svn's.
+- **What.** Building names every stored text, so the log records names, never bytes. The runs are read in the build
+  step, the same bound as the copy they replace; turns come with piece (c). The scratch member takes the buffers as its
+  files. The real green reads the runs once more at the batch's apply.
+- **The invariant.** An entry naming a text commits only once the changeset holding the text is durable on the node's
+  store. `Staging::land` awaits `landing::land_changeset` before `ImportBatch::commit` appends the entry, and a client's
+  commit lands its changeset before its entry (`svn_commit::landed_with`).
+- **Recovery (main's ruling (i)).** A death between an entry's commit and its checkpoint leaves entries naming texts the
+  content store need not hold. The cold recovery replays greens before it remakes the repositories' stores, so a
+  pre-pass in the green's rebuild brings back, a text a unit, every named text the green's chain past its checkpoint
+  names and the store lacks, from the changeset's `Payload` through `vcs_disk`. That is at most one batch's texts,
+  bounded by its admission. Making the content store there takes in the image's windows and region holds as before,
+  since `restore_held_image` sets them before the greens replay. The replay's `ContentMissing` stays a true fence.
+- **Evidence.**
+  - Red: 5,000 bytes inline and no run named, now 0 inline and three runs. The killed batch's successor fenced its
+    green, `ContentMissing { version: 1 }`; now it recovers, folded, with texts brought back. After a clean restart the
+    count is 0.
+  - w-svn's byte-sampled in-process attribution (500 files of 8 KiB, then 300 revisions of 3 changed, 11.65 MB):
+    130.8 MB allocated before, 108.0 MB after. `Increment::encode`, the post-state and the scratch member's `apply`
+    leave the sites; `read_step` stands twice, for the scratch member and for the real green.

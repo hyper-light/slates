@@ -606,6 +606,19 @@
 >   whole run, past the patience for a long enough one; the structural fix is a per-push staging log, the run landing
 >   apart from the repository's log and named in one step, so pushes to one repository need no turn between them.
 >   Owed, main's: the whole-history push on ubuntu and its peak RSS before and after (run-requests.md).
+> - The whole history's clones spun (main 01a20182's order of 2026-11-22 10:40; CI 45037561866: 4 spins, kills and
+>   restarts a leg, at `vcs_http.rs:850` polls 1-16 and `vcs_ssh::hg::streamed_turn` polls ~11,000). Measured over the
+>   served view of a pushed 57,054-changeset line (debug, MacBook arm64, each call the unit one step takes): a clone of
+>   the line's middle (`clone -r`, every pull with something in common too) made its changesets' and manifests' groups
+>   whole in its walk's begin, 4.1 s; a stream gathered the rows of as many logs as its room holds, every revision's
+>   node, in one step. BUILT (w-hg): `getbundle::Named` walks such a fetch a unit a step (a changeset written and its
+>   manifest's files planned, then a manifest a step in its log's order, then the file section), its begin lending no
+>   text (`a_pull_walked_by_its_changesets_lends_no_text_in_its_begin_and_two_at_most_a_step`; the begin at 20,000
+>   changesets 674 to 23 ms), a manifest lent twice, a step each, never kept past it; a stream gathers an ask a content
+>   window's worth of rows a step (`render::rows_a_step`;
+>   `a_streams_ask_for_a_long_logs_rows_is_gathered_a_window_a_step`). Still a walk of the history a call, each well
+>   under the watchdog's window in release: `heads` 194 ms and `branchmap` 603 ms at 57,054 in debug; next if a run
+>   names them.
 > - Part 3, a manifest's written entries kept once BUILT (2026-11-22, w-hg; main's 05:13 order): a whole or null-base
 >   manifest revision's written entries are its every line, and each was kept for the files' check once a snapshot,
 >   the bulk of a whole-history push's 1.37 GB held (main's 04:59 measure). Now a manifest's entries are a step's
@@ -829,7 +842,12 @@
 > successor mints a killed creation's id again; its new changeset 0 is the row the store gives, the orphan's never
 > (`a_creation_after_a_restart_never_meets_a_killed_creations_orphaned_changeset`, green unchanged: a `(repository,
 > sequence)` row is the newest landing at it, the only one the register can name). The orphan's log bytes stay until
-> the cleaner of unnamed log space (owed).
+> the cleaner of unnamed log space (owed). Its rows can be forgotten now (2026-11-22, w-hg; main 01a20182's ruling of
+> 12:00, for an abandoned push's run): `Store::forget` / `StoreHandle::forget` drops an unnamed changeset's `C`, `H`
+> and `K` rows and its `P` rows where they name its bytes, and moves each `T` and `I` row it owned to the next
+> changeset that kept the same text (the new `K` keeper rows, by text), the engine checkpointed after so a replay
+> never puts them back (`a_forgotten_changesets_rows_go_and_a_text_another_kept_moves_to_it`,
+> `a_changeset_forgotten_through_the_owner_stays_forgotten_across_a_restart`); its log bytes stay this cleaner's.
 >
 > **A-773 (2026-11-20, w-sessionlog).** BUILT: `slates log [--json]`, the session log naming collided works and landings
 > awaiting a grant first. A-788 serves it over MCP (`slates.log`) and the SDKs' sync clients; owed: their async forms.
@@ -3768,8 +3786,16 @@
 > The engine's splice sizes its file once at what it makes (`engine::made_len`;
 > `a_splice_makes_its_bytes_in_one_buffer_of_their_length`, 6,000 bytes held for 4,000, now 4,000): dead even on the
 > import, which replaces files whole (130.7 to 130.8 MB sampled), and on 300 partial splices over 200 files of 64 KiB
-> 43,945,798 B allocated before, 21,594,432 B after (w-svn's local probe, main's ruling of 11:05). Next (main's ruling):
-> the svn landing names its stored texts as A-760 runs, in three pieces.
+> 43,945,798 B allocated before, 21,594,432 B after (w-svn's local probe, main's ruling of 11:05). A-865 (w-svn): the
+> svn landing names its stored texts as A-760 runs, its entries recording names, and a cold recovery brings back what
+> its content store lacks before the green's replay; sampled 130.8 MB to 108.0 MB. The append every push shares judges
+> with `judge_named` (w-svn, main's ruling of ~11:50, w-git and w-hg told first and clear), so a named work's read
+> buffers move into its verdict, never cloned (`repository.push.read_cloned_bytes`;
+> `a_named_works_verdict_takes_its_read_texts_and_clones_none`: 50,000 bytes cloned, now 0). Reusing a judged work
+> after a refused append is impossible by construction: `append` takes its changes by value and a refusal gives none
+> back (`a_refused_named_append_is_retried_only_with_a_work_built_again`). Owed: main's daemon A/B; piece (c), the
+> batch's commit adopting the scratch member's files. Not A-865's: `recovery.rs`'s `an_overlay_whose_base_directory_was_removed_serves_its_own_files_after_a_restart`
+> fails at origin/main 7ced987e6 as well (LOOKUP status, `tests/common/nfs.rs:238`).
 > Still to measure: the A-742 floor's A/B only if the
 > footprint still stays (main's ruling). A local 64 KiB floor gave 47 MB of footprint at 2 s idle, against 363 MB, at
 > 19.4 s against 12.0 s (debug).

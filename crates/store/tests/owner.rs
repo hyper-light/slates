@@ -503,3 +503,65 @@ fn an_owner_whose_store_cannot_open_answers_every_request_why() {
   }
   assert!(owner.stop().is_err(), "the stop answers the open's error");
 }
+
+/// Main 01a20182's ruling of 2026-11-22 12:00 (an abandoned run's rows forgotten at its abandonment). Do: from a shard's
+/// task, land two changesets through the owner, forget the first, forget it again; stop the owner and start a new one.
+/// Expect the first forgetting to forget rows and the second none; the owner then listing only the second changeset,
+/// the first's payload unread; and the same after the restart.
+#[test]
+fn a_changeset_forgotten_through_the_owner_stays_forgotten_across_a_restart() {
+  let dir = scratch("forget");
+  let payload = b"an abandoned segment's payload".to_vec();
+  let identity = *blake3::hash(&payload).as_bytes();
+  let len = payload.len() as u64;
+  let owner = start(&dir);
+  let handle = owner.handle();
+  let runtime = runtime();
+  let (forgot, again, listed, read) = runtime
+    .block_on(async move {
+      handle
+        .land(
+          header(1),
+          vec![
+            (SectionKind::Record, b"segment".to_vec()),
+            (SectionKind::Payload, payload),
+          ],
+        )
+        .await
+        .unwrap();
+      handle
+        .land(header(2), vec![(SectionKind::Record, b"named".to_vec())])
+        .await
+        .unwrap();
+      let forgot = handle.forget(11, 1).await.unwrap();
+      let again = handle.forget(11, 1).await.unwrap();
+      let listed = handle.changesets(11, 0, 10).await.unwrap();
+      let read = handle.piece(identity, len, 0).await.unwrap();
+      (forgot, again, listed, read)
+    })
+    .unwrap();
+  assert!(forgot >= 2, "{forgot} rows forgotten");
+  assert_eq!(again, 0);
+  assert_eq!(
+    listed.iter().map(|row| row.sequence).collect::<Vec<_>>(),
+    [2]
+  );
+  assert_eq!(read, None);
+  owner.stop().unwrap();
+  let owner = start(&dir);
+  let handle = owner.handle();
+  let (listed, read) = runtime
+    .block_on(async move {
+      (
+        handle.changesets(11, 0, 10).await.unwrap(),
+        handle.piece(identity, len, 0).await.unwrap(),
+      )
+    })
+    .unwrap();
+  assert_eq!(
+    listed.iter().map(|row| row.sequence).collect::<Vec<_>>(),
+    [2]
+  );
+  assert_eq!(read, None);
+  owner.stop().unwrap();
+}
