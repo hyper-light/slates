@@ -1067,3 +1067,100 @@ proptest! {
     prop_assert!(store.is_empty());
   }
 }
+
+/// The pack that answers `answer` in one turn at `exchange`, the price of a byte the fetch is sent at.
+fn streamed_at(
+  repository: &Repository,
+  store: &ContentStore,
+  answer: Answer,
+  exchange: crate::store::learn::Exchange,
+) -> Vec<u8> {
+  let mut upload = Upload::new(answer, repository);
+  let mut clock = Ticks(0);
+  let mut pack = Vec::new();
+  let mut admission = Admission::new(u64::MAX);
+  for _ in 0..1024 {
+    let turn = Turn {
+      clock: &mut clock,
+      exchange,
+      quantum_ns: u64::MAX,
+    };
+    if upload
+      .advance(repository, store, turn, &mut admission, &mut pack)
+      .unwrap()
+      == Progress::Done
+    {
+      return pack;
+    }
+  }
+  panic!("the stream never ended");
+}
+
+/// Shape: rates like an arm64 machine's at git's default level, so the cold price is a few tens of nanoseconds a byte:
+/// deflate's levels from 2 µs to 60 µs a KiB, each saving a little more of a text corpus, and a search 4 µs a KiB.
+const MEASURED: crate::store::learn::Rates = crate::store::learn::Rates {
+  deflate_ns_per_kib: [
+    2_000, 8_000, 9_000, 11_000, 14_000, 17_000, 20_000, 26_000, 40_000, 60_000,
+  ],
+  deflate_saved_per_mille: [0, 520, 540, 560, 580, 590, 600, 605, 608, 610],
+  search_ns_per_kib: 4_000,
+};
+
+/// A-859 part A (main 01a20182's rulings of 2026-11-22 04:30 and 06:32: a fetched byte priced at its link, never at
+/// memcpy; until a link is learned, at the price where deflating at git's default level just pays). Do: push one
+/// commit over a text file no pack brought (kept as content: nothing stored to send on as it lies), and stream its
+/// clone at the cold price of [`MEASURED`], at a fast link's price (a nanosecond for ten bytes, past what deflate costs
+/// a byte saved) and at a slow link's (a microsecond a byte). Expect: the cold price deflates the file as stock git's
+/// default would, its pack well under the objects' bytes; the fast link's spends no CPU, the pack at the objects' bytes
+/// or past; the slow link's compresses at least as hard as the cold price's.
+#[test]
+fn a859_a_fetched_byte_is_priced_at_its_link_cold_at_deflates_break_even() {
+  use crate::store::learn::Exchange;
+  let format = ObjectFormat::Sha1;
+  let mut store = store();
+  let mut repository = Repository::new(format);
+  let file = blob(format, &text(20, &[]));
+  let root = tree(format, &[(Mode::File, b"notes", file.id)]);
+  let head = commit(format, root.id, &[], 1);
+  let objects = vec![head.clone(), root, file];
+  let raw: usize = objects.iter().map(|made| made.content.len()).sum();
+  push_and_move(&mut repository, &mut store, objects, &[(1, Some(head.id))]).unwrap();
+  let clone = Answer::objects(&reached_now(&repository, &store, 1));
+  let cold = streamed_at(&repository, &store, clone.clone(), Exchange::cold(MEASURED));
+  let fast = streamed_at(
+    &repository,
+    &store,
+    clone.clone(),
+    Exchange {
+      ns: 1,
+      bytes: 10,
+      rates: MEASURED,
+    },
+  );
+  let slow = streamed_at(
+    &repository,
+    &store,
+    clone,
+    Exchange {
+      ns: 1_000,
+      bytes: 1,
+      rates: MEASURED,
+    },
+  );
+  eprintln!(
+    "A-859 part A: objects {raw} bytes; pack cold {}, fast link {}, slow link {}",
+    cold.len(),
+    fast.len(),
+    slow.len()
+  );
+  assert!(
+    cold.len() * 2 < raw,
+    "cold: deflated as git's default would"
+  );
+  assert!(fast.len() >= raw, "fast link: no CPU spent deflating");
+  assert!(
+    slow.len() <= cold.len(),
+    "slow link: at least as compressed"
+  );
+  repository.release(&mut store).unwrap();
+}

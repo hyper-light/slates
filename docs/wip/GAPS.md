@@ -221,6 +221,14 @@
 >   interleaved rounds. Stamped under TB, the loaded tail's deferred replies are submits parked behind their refinement
 >   and resumed. A plain forward's two wakes measure 7-21 µs from kick to run, and the resumed run is all CPU (not
 >   demoted). Main's own interleaved A/B (run 45009478174) misses p999 in most rounds in both arms; the gap stays open.
+> - **Linux, the round-robin real-time class for the shards and the client's park, measured and rejected (w-perf,
+>   2026-11-22; BENCHMARKS "84a on Linux: the round-robin real-time class").** On CI's runners (kernel 7.0,
+>   `PREEMPT_LAZY`, `RUN_TO_PARITY`, 2.1 ms base slice) a woken shard waited for its CPU: kick -> run p50 920 µs, and
+>   8 µs in `SCHED_RR`. But with the shards and the client's park in the class, the client's own time-share code still
+>   waits whole slices: accept p99 0.94-2.6 ms, p999 3.0-4.8 ms, and the spinners lost 20-27% of their throughput. The
+>   runner account's `RLIMIT_RTPRIO` is 0:0, so even that needs an administrator's grant. **Open:** 84a's Linux bar
+>   under two spinners a CPU, short of user code at real-time priority (ruled out) or a less oversubscribed lane, main's
+>   call.
 > - Windows (CI, run 44857045148): no 1 ms band (queued p99 5–49 µs); accept p99 0.13–0.31 ms, conflict 0.11–0.29 ms;
 >   p999 0.2–62 ms. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–7).
 >
@@ -735,8 +743,11 @@
 > A-859 BUILT, part B (2026-11-22, w-git; main 03:38): a git/git clone moved 4-5 GiB, every object whole and
 > uncompressed (the encoder priced a byte at memcpy's 0.14 ns). Now an object pushed in a pack is sent on as its entry
 > lies there, checked against its name first, its delta reused where its base precedes it (`t_a859_…`: 20,916 bytes
-> against the pushed 17,299, where 89,439 went before). Owed: part A, a fetched byte priced at the network (§4.11);
-> main's git/git whole round and `fsck --strict`.
+> against the pushed 17,299, where 89,439 went before); a stored entry reused whenever one exists, a delta's wanted
+> base placed first (3fa634049). Part A BUILT: a fetched byte priced at its link, learned per shard from the HTTP
+> edge's writes that waited for the peer, cold at deflate's measured break-even at git's level 6 (§4.11). Owed: the
+> SSH edge's writes heard (SSH fetches price cold), a price per client, not per shard; main's git/git whole round and
+> `fsck --strict`.
 > A-860 BUILT (2026-11-22, w-git): a repository gone idle lets go of the objects its reads keep (git.recent_bytes held
 > 53.9 MB after a git/git clone). Owed: the push side's held windows and pack, w-shared's.
 > R2, the load-only edge tests, CLOSED (2026-11-21, w-git): a push's answer under side-band-64k wrote its first

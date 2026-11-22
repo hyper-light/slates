@@ -119,6 +119,19 @@ const WATCHES_ITS_CLIENT: &[u8] = b"watch";
 /// Whether an [`Echo`] of [`WATCHES_ITS_CLIENT`] saw its client go: one test's alone.
 static SAW_ITS_CLIENT_GO: AtomicBool = AtomicBool::new(false);
 
+/// Shape: a body [`Echo`] answers with [`LARGE_RUNS`] runs of [`LARGE_RUN`] bytes, many times a socket's send buffer, so
+/// a client that waits before it reads makes the edge's writes wait for it (A-859 part A).
+const LARGE: &[u8] = b"large";
+/// Shape: the runs of [`LARGE`]'s reply.
+const LARGE_RUNS: u32 = 64;
+/// Shape: the bytes of each run of [`LARGE`]'s reply, 128 KiB.
+const LARGE_RUN: usize = 128 << 10;
+
+std::thread_local! {
+  /// The writes an [`Echo`] heard ([`Exchange::sent`]), on the shard's thread, which the test's thread runs.
+  static SENT: std::cell::RefCell<Vec<crate::vcs_store::upload::Sent>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// An exchange replying `echo:` and the body it took, in one run; naming its reply's fields, or failing as its reply
 /// begins, for the bodies [`TYPED`] and [`FAILS_AS_IT_BEGINS`].
 #[derive(Default)]
@@ -129,6 +142,8 @@ struct Echo {
   replied: bool,
   /// How many times its reply's fields were asked for.
   asked: u32,
+  /// How many runs of [`LARGE`]'s reply it wrote.
+  runs: u32,
 }
 
 impl Exchange for Echo {
@@ -164,6 +179,11 @@ impl Exchange for Echo {
   }
 
   async fn reply(&mut self, out: &mut Vec<u8>, _gone: ClientGone<'_>) -> Result<bool, Failed> {
+    if self.body == LARGE {
+      self.runs = self.runs.saturating_add(1);
+      out.resize(LARGE_RUN, b'x');
+      return Ok(self.runs < LARGE_RUNS);
+    }
     if self.replied {
       return Ok(false);
     }
@@ -171,6 +191,10 @@ impl Exchange for Echo {
     out.extend_from_slice(b"echo:");
     out.extend_from_slice(&self.body);
     Ok(true)
+  }
+
+  fn sent(&mut self, sent: crate::vcs_store::upload::Sent) {
+    SENT.with(|log| log.borrow_mut().push(sent));
   }
 }
 
@@ -769,4 +793,41 @@ fn a_service_answering_after_the_body_learns_its_client_has_gone() {
     (false, true),
     "the signal is quiet while the client waits for its answer, and resolves once it closes"
   );
+}
+
+/// A-859 part A (main 01a20182's ruling of 2026-11-22 06:32: a link's price learned from the time the edge's writes
+/// waited for the peer, from the first write that found the socket full). Do: ask for [`LARGE`]'s reply, 8 MiB, and
+/// wait a tenth of a liveness window before reading it all. Expect: the exchange hears every write of its reply but its
+/// last run's, written after the exchange is let go, their bytes within a run of the reply's; some found the socket full and waited, the first of them after writes that
+/// did not, which a buffer with room takes at once; and what a fetch's pacing learns from them, the bytes from that
+/// first wait on, is past a MiB.
+#[test]
+fn a859_a_reply_to_a_client_that_reads_late_waits_for_it_and_the_edge_hears_each_write() {
+  SENT.with(|log| log.borrow_mut().clear());
+  let (read, _) = served(TWO_SEATS, None, |address| {
+    let mut stream = connect(address);
+    stream.write_all(&post(LARGE, true)).expect("the request");
+    std::thread::sleep(Duration::from_nanos(MOMENT_NS));
+    read_until(&mut stream, LAST_CHUNK)
+  });
+  let sent = SENT.with(|log| log.borrow().clone());
+  let reply = u64::from(LARGE_RUNS) * u64::try_from(LARGE_RUN).unwrap();
+  let written: u64 = sent.iter().map(|sent| sent.bytes).sum();
+  let first_wait = sent.iter().position(|sent| sent.waited);
+  let mut pacing = crate::vcs_store::upload::Pacing::default();
+  let learned: u64 = sent
+    .iter()
+    .filter_map(|sent| pacing.sent(*sent))
+    .map(|(_, bytes)| bytes)
+    .sum();
+  assert!(read.ends_with(LAST_CHUNK), "the reply read whole");
+  assert!(
+    written.saturating_add(u64::try_from(LARGE_RUN).unwrap()) >= reply,
+    "{written} written of a {reply}-byte reply"
+  );
+  assert!(
+    first_wait.is_some(),
+    "a write waited for the client: {sent:?}"
+  );
+  assert!(learned > 1 << 20, "learned {learned} bytes");
 }
