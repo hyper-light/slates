@@ -435,3 +435,13 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
      turn (cpu, steps, longest step) in hg.rs; ubuntu-latest, CPUs oversubscribed 2x by busy loops, hg's whole history,
      hg-matrix STEP_LIMIT 1500. First push failed in setup (rustup cargo-fmt conflict) -> components as ci.yml. Lead:
      hg_http::begin runs in one poll (a getbundle's changeset set for clone-rev, the store listing for stream-clone).
+- LEDGER UPDATE (2026-11-22 ~03:55 PST): git matrix on the v2.0.0 cut is 27/27 -> that row CLOSED.
+  Last green: main's r11, main 257f19ebf (after w-git's A-857), release, the MacBook, Apple git 2.50.1 (Apple Git-155),
+  `env -u GIT_CONFIG_COUNT`, PUSH_REFS='v2.0.0^{commit}:refs/heads/master', STEP_LIMIT=1200: every row green, deepen
+  106 s, partial-clone, partial-blame, ssh-clone, ssh-push, ssh-fetch included. (deepen closed earlier by A-855 at
+  81dc7ca3b; branch-push/tag-push/merge-push/rebase-push/fetch-prune/tag-delete/ssh-push PastRoom closed by A-857.)
+  Still open on the git side: git/git whole (f7de81456940, 1,019 tags), w-git's pack-size piece.
+- Also landed today for the wall (main's Linux/lint keeper role while w-lint is unreachable): 3253e2035 (store_root
+  st_dev), 8673d528a (fuse::serve split + hangup readiness wait), 07af60280 (vendor/rustfmt.toml), 0fde44ef2
+  (recovery.rs unused instants). Queued after the spin repro: bound recovery.rs's three content-scrub waits (main's
+  ruling 03:45: progress-judged, window from the daemon's cadence, a typed failure that prints what it saw).
