@@ -11,7 +11,7 @@ import sys
 COLS = ["queued", "served", "landed", "written", "deferred", "complete", "owner_met", "owner_kick_after",
         "owner_kick_run", "owner_run_start", "owner_work", "origin_met", "origin_kick_after", "origin_kick_run",
         "origin_run_home", "home_written", "placement", "resolve_met", "resolve_kick_after", "resolve_kick_run",
-        "resolve_run_at"]
+        "resolve_run_at", "mask", "deliver_file", "deliver_line"]
 AT = {name: at for at, name in enumerate(COLS)}
 
 
@@ -64,6 +64,23 @@ ring = [r for r in rows(sys.argv[1] + ".ring") if len(r) >= len(COLS)]
 deferred = [r for r in ring if r[AT["deferred"]] == 1]
 print(f"deferred n {len(deferred)}: forwards {sum(1 for r in deferred if r[AT['complete']] == 1)}, accepted submits "
       f"{sum(1 for r in deferred if r[AT['complete']] == 2)}, unstamped {sum(1 for r in deferred if r[AT['complete']] == 0)}")
+files = {}
+try:
+    for line in open(sys.argv[1] + ".ring"):
+        if line.startswith("# deliver file "):
+            _, _, _, hashed, name = line.split(maxsplit=4)
+            files[int(hashed)] = name.strip().rsplit("/", 1)[-1]
+except OSError:
+    pass
+groups = {}
+for r in deferred:
+    key = (r[AT["complete"]], r[AT["mask"]], files.get(r[AT["deliver_file"]], "-"), r[AT["deliver_line"]])
+    groups.setdefault(key, []).append(r[AT["served"]])
+print(" by kind, stamps made (sent 1 started 2 replied 4 home 8 waiting 16 resolved 32 delivered 64) and deliver site:")
+for key, served in sorted(groups.items(), key=lambda item: -len(item[1])):
+    served.sort()
+    print(f"   complete {key[0]} mask {key[1]:3} deliver {key[2]}:{key[3]}: n {len(served)} served p50/p99/p999/max us "
+          f"{us(pc(served, .5))} {us(pc(served, .99))} {us(pc(served, .999))} {us(served[-1])}")
 for kind, flag, parts in (("forwards", 1, FORWARD), ("accepted submits", 2, ACCEPTED)):
     whole = sorted((r for r in deferred if r[AT["complete"]] == flag), key=lambda r: r[AT["served"]])
     if not whole:

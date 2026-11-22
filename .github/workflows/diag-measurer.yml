@@ -40,6 +40,7 @@ jobs:
           W="$RUNNER_TEMP/msr"; mkdir -p "$W/logs"
           cargo build --release --locked -p slates-client --example edit_merge_bench > "$W/logs/build.log" 2>&1 || { tail -30 "$W/logs/build.log"; exit 1; }
           cp target/release/examples/edit_merge_bench "$W/bench"; shasum -a 256 "$W/bench"
+          echo "runner cpus $(sysctl -n hw.ncpu) memory $(($(sysctl -n hw.memsize) / 1073741824)) GiB"
           uname -a; sysctl -n hw.ncpu hw.perflevel0.physicalcpu hw.perflevel1.physicalcpu 2>/dev/null; sw_vers; launchctl print system 2>/dev/null | grep -i -m3 timer || true
       - name: Rounds, loaded then quiet, split by hop
         run: |

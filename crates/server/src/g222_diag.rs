@@ -140,7 +140,8 @@ static RING: [[AtomicU64; RING_COLS]; RING_CAP] =
 
 /// w-perf 84a: a forwarded request's stamps across its shards, by request id, host monotonic ns: sent (origin), started
 /// (owner) with the owner's last park [began, kicked, returned], the reply sent home (owner), the reply's task run
-/// (origin) with the origin's last park.
+/// (origin) with the origin's last park; a submit's wait for its version's acceptance (AUD-11) and its resolution with the
+/// owner's last park; which stamps were made; and where `state::deliver` was called for it.
 #[derive(Clone, Copy, Default)]
 struct Fwd {
   sent: u64,
@@ -149,23 +150,28 @@ struct Fwd {
   replied: u64,
   home: u64,
   origin_woke: [u64; 3],
-  /// A submit's reply deferred to its version's acceptance (AUD-11): when it began waiting, on the owner.
   waiting: u64,
-  /// When its version was placed and the reply resolved, on the owner, with the owner's last park then.
   resolved: u64,
   resolve_woke: [u64; 3],
+  /// Which stamps were made: sent 1, started 2, replied 4, home 8, waiting 16, resolved 32, delivered 64.
+  mask: u64,
+  /// The `state::deliver` call's file (a short hash, named in the ring's header) and line.
+  deliver_file: u64,
+  deliver_line: u64,
 }
 static FWD: std::sync::Mutex<Option<std::collections::HashMap<u64, Fwd>>> =
   std::sync::Mutex::new(None);
+/// The files `deliver` was called from, by short hash.
+static FILES: std::sync::Mutex<Option<std::collections::HashMap<u64, String>>> =
+  std::sync::Mutex::new(None);
 /// Shape: forwards kept in flight at once.
 const FWD_CAP: usize = 100_000;
-/// A forward's split: complete (1, or 0 for a forward some stamp missed, all zero), then for the owner how it met its
-/// message ([`side`]: met, kick lateness after the send, kick -> run, run -> stamp), the owner's work (started -> reply
-/// sent), the same four for the origin and its reply, and the origin's reply task to the reply written.
-/// Then, for a submit answered at its version's acceptance (`complete` 2, where the owner's work runs to the wait's
-/// start and the origin's side is measured from the resolution): the wait for placement (waiting -> resolved), and how
-/// the owner met the placement's arrival ([`side`] from the wait's start).
-const FWD_COLS: usize = 16;
+/// A deferred reply's split: complete (1 a forward answered at once, 2 a submit answered at its acceptance, 0 a reply
+/// some stamp missed), then for the owner how it met the forward ([`side`]: met, kick lateness after the send, kick ->
+/// run, run -> stamp), the owner's work (start -> reply sent, or -> the acceptance wait's start), the same four for the
+/// origin from the reply's sending, the origin's reply task to the reply written; for an accepted submit the wait for
+/// placement and how the owner met it; and for every one the stamps made and the `deliver` call's file and line.
+const FWD_COLS: usize = 19;
 
 fn fwd(request: u64, change: impl FnOnce(&mut Fwd)) {
   if let Ok(mut guard) = FWD.lock() {
@@ -186,6 +192,7 @@ pub fn fwd_sent(request: u64) {
   fwd(request, |f| {
     *f = Fwd {
       sent: at,
+      mask: 1,
       ..Fwd::default()
     }
   });
@@ -193,9 +200,9 @@ pub fn fwd_sent(request: u64) {
 
 /// On the owner, as the forward's task starts.
 pub fn fwd_started(request: u64) {
-  let at = now_mono();
-  let woke = last_here();
+  let (at, woke) = (now_mono(), last_here());
   fwd(request, |f| {
+    f.mask |= 2;
     f.started = at;
     f.owner_woke = woke;
   });
@@ -204,14 +211,17 @@ pub fn fwd_started(request: u64) {
 /// On the owner, as the reply is sent home.
 pub fn fwd_replied(request: u64) {
   let at = now_mono();
-  fwd(request, |f| f.replied = at);
+  fwd(request, |f| {
+    f.mask |= 4;
+    f.replied = at;
+  });
 }
 
 /// On the origin, as the reply's task runs.
 pub fn fwd_home(request: u64) {
-  let at = now_mono();
-  let woke = last_here();
+  let (at, woke) = (now_mono(), last_here());
   fwd(request, |f| {
+    f.mask |= 8;
     f.home = at;
     f.origin_woke = woke;
   });
@@ -220,20 +230,58 @@ pub fn fwd_home(request: u64) {
 /// On the owner, as a submit's reply begins waiting for its version's acceptance.
 pub fn acc_waiting(request: u64) {
   let at = now_mono();
-  fwd(request, |f| f.waiting = at);
+  fwd(request, |f| {
+    f.mask |= 16;
+    f.waiting = at;
+  });
 }
 
 /// On the owner, as a submit's version is placed and its reply resolved.
 pub fn acc_resolved(request: u64) {
-  let at = now_mono();
-  let woke = last_here();
+  let (at, woke) = (now_mono(), last_here());
   fwd(request, |f| {
+    f.mask |= 32;
     f.resolved = at;
     f.resolve_woke = woke;
   });
 }
 
-/// The split of request `request`'s forward, its reply written at `written`; taken out of the table.
+/// On the origin, as a reply from elsewhere is queued for its client's ring (`state::deliver`): where it was called.
+pub fn delivered(request: u64, at: &std::panic::Location<'_>) {
+  let file = at.file().bytes().fold(0u64, |hash, byte| {
+    hash.wrapping_mul(31).wrapping_add(u64::from(byte))
+  }) % 1_000_000;
+  let line = u64::from(at.line());
+  fwd(request, |f| {
+    f.mask |= 64;
+    f.deliver_file = file;
+    f.deliver_line = line;
+  });
+  if let Ok(mut guard) = FILES.lock() {
+    guard
+      .get_or_insert_with(std::collections::HashMap::new)
+      .entry(file)
+      .or_insert_with(|| at.file().to_owned());
+  }
+}
+
+/// The files `deliver` was called from, as header lines.
+fn files_header() -> String {
+  FILES
+    .lock()
+    .ok()
+    .and_then(|guard| {
+      guard.as_ref().map(|files| {
+        files
+          .iter()
+          .map(|(hash, name)| format!("# deliver file {hash} {name}\n"))
+          .collect()
+      })
+    })
+    .unwrap_or_default()
+}
+
+/// The split of request `request`'s reply, written at `written`; taken out of the table.
 fn fwd_split(request: u64, written: u64) -> [u64; FWD_COLS] {
   let Some(f) = FWD
     .lock()
@@ -242,19 +290,20 @@ fn fwd_split(request: u64, written: u64) -> [u64; FWD_COLS] {
   else {
     return [0; FWD_COLS];
   };
+  let mut out = [0; FWD_COLS];
+  out[16] = f.mask;
+  out[17] = f.deliver_file;
+  out[18] = f.deliver_line;
   let accepted = f.replied == 0 && f.waiting != 0 && f.resolved != 0;
   if f.sent == 0 || f.started == 0 || f.home == 0 || (f.replied == 0 && !accepted) {
-    return [0; FWD_COLS];
+    return out;
   }
   let sent_home = if accepted { f.resolved } else { f.replied };
   let worked_to = if accepted { f.waiting } else { f.replied };
-  let owner = side(f.sent, f.started, f.owner_woke);
-  let origin = side(sent_home, f.home, f.origin_woke);
-  let mut out = [0; FWD_COLS];
   out[0] = if accepted { 2 } else { 1 };
-  out[1..5].copy_from_slice(&owner);
+  out[1..5].copy_from_slice(&side(f.sent, f.started, f.owner_woke));
   out[5] = worked_to.saturating_sub(f.started);
-  out[6..10].copy_from_slice(&origin);
+  out[6..10].copy_from_slice(&side(sent_home, f.home, f.origin_woke));
   out[10] = written.saturating_sub(f.home);
   if accepted {
     out[11] = f.resolved.saturating_sub(f.waiting);
@@ -320,8 +369,9 @@ fn ring_row_split(landed: u64, taken: u64, written: u64, deferred: u64, split: [
 pub fn dump_ring(path: &str) {
   use std::io::Write;
   let n = RING_TAKEN.load(Relaxed).min(RING_CAP);
-  let mut out = format!(
-    "# client sends {} rings {}\nqueued\tserved\tlanded\twritten\tdeferred\tcomplete\towner_met\towner_kick_after\towner_kick_run\towner_run_start\towner_work\torigin_met\torigin_kick_after\torigin_kick_run\torigin_run_home\thome_written\tplacement\tresolve_met\tresolve_kick_after\tresolve_kick_run\tresolve_run_at\n",
+  let mut out = files_header();
+  out += &format!(
+    "# client sends {} rings {}\nqueued\tserved\tlanded\twritten\tdeferred\tcomplete\towner_met\towner_kick_after\towner_kick_run\towner_run_start\towner_work\torigin_met\torigin_kick_after\torigin_kick_run\torigin_run_home\thome_written\tplacement\tresolve_met\tresolve_kick_after\tresolve_kick_run\tresolve_run_at\tmask\tdeliver_file\tdeliver_line\n",
     slates_ipc::endpoint::G222_SENDS.swap(0, Relaxed),
     slates_ipc::endpoint::G222_RINGS.swap(0, Relaxed)
   );
