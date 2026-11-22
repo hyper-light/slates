@@ -1702,3 +1702,21 @@ fn t_a694_a_push_making_two_bookmarks_makes_two_greens() {
     }
   });
 }
+
+/// Main 01a20182's (ii) of 2026-11-22 05:01 (w-interop's whole-history push of hg: its keeping fit its repository's
+/// ceiling, but no step could run in what was left, and it waited for room that could never come). Do: on an audit
+/// shard, its ceiling 1,000 bytes (`vcs_share::wait::TEST_CEILING`), size a push's need holding 100 bytes and keeping
+/// 400 more, its widest whole text first 500 bytes, then 501. Expect the need admitted within the ceiling where keeping
+/// and the widest text fit it (1,000), and the push refused in the typed words that it could never be taken
+/// (`PAST_CEILING`) where they pass it by a byte. Red before: the second admitted the ceiling, its step left to wait.
+#[test]
+fn a_push_whose_keeping_and_its_widest_step_pass_its_repositorys_ceiling_is_refused_at_once() {
+  crate::test_store::audit_on_stored_shard("hg-least-step", |state| {
+    crate::vcs_share::wait::TEST_CEILING.with(|ceiling| ceiling.set(1_000));
+    let fits = super::need_of(state, (100, 400, 500), 2_000);
+    let passes = super::need_of(state, (100, 400, 501), 2_000);
+    crate::vcs_share::wait::TEST_CEILING.with(|ceiling| ceiling.set(0));
+    assert_eq!(fits.ok(), Some(1_000));
+    assert_eq!(passes.err(), Some(super::past_ceiling()));
+  });
+}

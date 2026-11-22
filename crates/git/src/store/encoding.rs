@@ -445,6 +445,7 @@ impl Encoding {
       let progress = match self
         .unit(repository, store, (exchange, quantum_ns))
         .and_then(|progress| self.true_up(store).map(|()| progress))
+        .inspect(|_| repository.true_up_recent(store))
       {
         Ok(progress) => progress,
         Err(refused) => {

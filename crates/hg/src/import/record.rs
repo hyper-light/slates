@@ -96,15 +96,19 @@ const REFERENCE_VERSION: u32 = 7;
 /// repository's empty store, and the import checked every manifest before its entry named the run.
 /// Format: the segment record's version, the eighth.
 const SEGMENT_VERSION: u32 = 8;
-/// Format: the version of an import's record in the repository's register once its history is on the changeset log
-/// (A-767 C1 step 3): the head, then the first and the last sequence of the run of segment changesets its import landed
-/// ([`write_run_reference`], [`run_of`]). The register holds this reference; the segments' records and payloads are
-/// the log's.
+/// Format: the version of an import's or a push's record in the repository's register once its revisions are on the
+/// changeset log as a run of segments (A-767 C1 step 3; a push's, main 01a20182's ruling (b1) of 2026-11-22 04:44): the
+/// head, its source an import's or a push's, then the first and the last sequence of the run of segment changesets it
+/// landed ([`write_run_reference`], [`run_of`]). The register holds this reference; the segments' records and payloads
+/// are the log's.
 const RUN_VERSION: u32 = 9;
 
-/// An import's run of segment changesets on the changeset log, as its register record names it ([`RUN_VERSION`]).
+/// An import's or a push's run of segment changesets on the changeset log, as its register record names it
+/// ([`RUN_VERSION`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Run {
+  /// Whose run it is: an import's or a push's.
+  pub source: Source,
   /// The room the import ran within.
   pub room: u64,
   /// The first segment's sequence.
@@ -114,28 +118,40 @@ pub struct Run {
 }
 
 /// The register's record of an import landed as the segment changesets `first` to `last` ([`RUN_VERSION`]).
-pub fn write_run_reference(room: u64, (first, last): (u64, u64)) -> Vec<u8> {
+pub fn write_run_reference(room: u64, run: (u64, u64)) -> Vec<u8> {
+  run_reference(Source::Import, room, run)
+}
+
+/// The register's record of a push landed as the segment changesets `first` to `last` ([`RUN_VERSION`]; main 01a20182's
+/// ruling (b1) of 2026-11-22 04:44). A made changeset lands as one changeset ([`write_made_reference`]).
+pub fn write_push_run_reference(room: u64, run: (u64, u64)) -> Vec<u8> {
+  run_reference(Source::Push, room, run)
+}
+
+/// [`RUN_VERSION`]'s record of `source`'s run.
+fn run_reference(source: Source, room: u64, (first, last): (u64, u64)) -> Vec<u8> {
   let mut out = Vec::new();
   out.extend_from_slice(&MAGIC.to_le_bytes());
   out.extend_from_slice(&RUN_VERSION.to_le_bytes());
-  out.push(Source::Import.byte());
+  out.push(source.byte());
   out.extend_from_slice(&room.to_le_bytes());
   out.extend_from_slice(&first.to_le_bytes());
   out.extend_from_slice(&last.to_le_bytes());
   out
 }
 
-/// The run a register record names, where it is an import's run reference ([`RUN_VERSION`]); `None` for any other
-/// record, a run whose last precedes its first, and a reference that does not read whole.
+/// The run a register record names, where it is an import's or a push's run reference ([`RUN_VERSION`]); `None` for any
+/// other record, a run whose last precedes its first, and a reference that does not read whole.
 pub fn run_of(bytes: &[u8]) -> Option<Run> {
   let mut reader = Reader { rest: bytes };
   let (version, source, room) = head(&mut reader).ok()?;
-  if version != RUN_VERSION || source != Source::Import {
+  if version != RUN_VERSION || !matches!(source, Source::Import | Source::Push) {
     return None;
   }
   let first = reader.long().ok()?;
   let last = reader.long().ok()?;
   (reader.rest.is_empty() && first <= last).then_some(Run {
+    source,
     room: room.left(),
     first,
     last,
@@ -556,10 +572,11 @@ impl Writer {
     Writer::of(logs, (Source::Import, room), (IDENTITY_VERSION, true))
   }
 
-  /// Starts an import's segment record ([`SEGMENT_VERSION`]): `ranges` the revisions whose deltas lie in the segment,
-  /// each log's from its first to the one past its last, in the import's order; `markers` whether it is the last
-  /// segment, which holds the index's markers; `room` the room the import ran within.
+  /// Starts an import's or a push's (`source`) segment record ([`SEGMENT_VERSION`]): `ranges` the revisions whose deltas
+  /// lie in the segment, each log's from its first to the one past its last, in the stream's order; `markers` whether
+  /// it is an import's last segment, which holds the index's markers; `room` the room the import or intake ran within.
   pub fn begin_segment(
+    source: Source,
     ranges: &[(Log<'_>, u32, u32)],
     room: u64,
     markers: bool,
@@ -573,7 +590,7 @@ impl Writer {
       Log::Manifest => (MANIFEST_TAG, Vec::new(), *first, *end),
       Log::File(path) => (FILE_TAG, path.to_vec(), *first, *end),
     }));
-    Writer::of(logs, (Source::Import, room), (SEGMENT_VERSION, markers))
+    Writer::of(logs, (source, room), (SEGMENT_VERSION, markers))
   }
 
   /// Starts a push's record (A-680 part 2c, A-720) of the revisions it kept in `logs` (each a log and its first kept

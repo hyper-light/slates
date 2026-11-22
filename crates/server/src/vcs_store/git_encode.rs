@@ -448,10 +448,9 @@ pub(crate) fn give_back_idle(state: &mut ShardState, id: RepositoryId) {
     .map_or(0, |(encoding, _)| encoding.held_bytes());
   drop_under_way(state, id);
   // A-860: what its reads keep (the objects read lately, git's delta base cache) is given back too, its budget kept.
-  let recent = match state.vcs_stores.entries.get(&id) {
-    Some(super::RepositoryStore::Git(store)) => store.repository.let_go_recent(),
-    _ => 0,
-  };
+  let recent = state.vcs_stores.git(id).map_or(0, |(content, store)| {
+    store.repository.let_go_recent(content)
+  });
   let mut given = under_way.saturating_add(recent);
   if let Some(grant) = crate::vcs_share::budget(state, id) {
     let held = crate::vcs_share::held(state, id);

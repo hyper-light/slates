@@ -1994,6 +1994,8 @@ impl GitPush {
           .push
           .keep_read(object.offset, object.kind, object.content);
       }
+      // What it keeps read lately is charged on the store's room (A-861).
+      self.push.true_up_recent(content);
       Ok(())
     })
   }

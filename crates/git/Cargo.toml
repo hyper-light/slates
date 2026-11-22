@@ -24,6 +24,9 @@ slates-vcs = { workspace = true }
 # The merge engine a push becomes a work in (§4.17.1 shared piece 4, A-618): the store reads a push's trees for it.
 slates-merge = { workspace = true }
 slates-pace = { workspace = true }
+# The mapped-allocation floor a push's objects read lately are laid in chunks of (A-742's floor, so each chunk is given
+# back whole), and, in the tests, the allocator whose live figures hold them to it.
+slates-mem = { workspace = true }
 
 [dev-dependencies]
 slates-test-seeds = { workspace = true }
