@@ -1,9 +1,10 @@
 name: diag measurer
-# main 01a20182 (2026-11-22 02:23 PST): w-interop's revprop-http row (61f26030b, cherry-picked onto origin/main 059578d78)
-# proved by the whole svn matrix, over both main routes, on macos-latest with Homebrew's stock Subversion 1.15.0. Its own
-# proving run was on the big Studio, which kiln's hung API no longer reaches. The dump is the repository's fixture
+# main 01a20182 (2026-11-22 14:15 PST): the whole svn matrix over both main routes (svn://, HTTPv2) on Linux as well as
+# macOS: ubuntu-latest and ubuntu-24.04-arm with Ubuntu's stock Subversion, macos-latest with Homebrew's. goal 93's
+# "interop with stock clients proven" holds on macOS (33/33 at 059578d78 + 61f26030b, CI 45012238025); Linux has run
+# the hg matrix (24/24, CI 45065911852) but not svn's. The dump is the repository's fixture
 # (crates/svn/fixtures/dump/full.dump, 14 revisions under trunk/). Run only from `diag-measurer-*` branches, never main;
-# every log is an artifact.
+# every log is an artifact, one name per leg.
 
 on:
   push:
@@ -14,8 +15,12 @@ env:
 
 jobs:
   svn-matrix:
-    name: svn matrix (macos-latest)
-    runs-on: macos-latest
+    name: svn matrix (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     defaults:
       run:
@@ -25,9 +30,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
-      # The same tool ci.yml's macOS suite lane installs.
+      - uses: Swatinem/rust-cache@v2
+      # The same tools ci.yml's suite lanes install.
       - name: Stock Subversion
-        run: brew install subversion && svn --version --quiet
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then brew install subversion; else sudo apt-get update -q && sudo apt-get install -y -q subversion; fi
+          svn --version --quiet
       - name: Build
         run: cargo build --release --locked -p slates-cli --bin slates
       - name: The matrix over each main route
@@ -44,7 +52,7 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
-          name: svn-matrix-logs
+          name: svn-matrix-logs-${{ matrix.os }}
           path: |
             ${{ runner.temp }}/matrix-*.out
             ${{ runner.temp }}/matrix-*/logs
