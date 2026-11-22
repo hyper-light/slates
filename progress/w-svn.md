@@ -389,3 +389,8 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
   - Their call: the view's DELTA writer has no source now (remove it, or feed it derived deltas).
   - The ignored git-2000 measurement's column is renamed `records_stored_text_bytes`.
 - Still waiting: main's r2 git-2000 re-measure of A-835, for finding (2).
+
+## 2026-11-21 ~22:30 PST: main 01a20182's 21:35 rulings done
+- The FSFS DELTA writer is removed: 792c62308, merged 235d62418.
+- w-balance has leave for A-724 piece 3 in my files (`inbox/w-balance-from-w-svn-admission.md`).
+- Main runs the stock fsfs_view leg (big Studio) and the git-2000 re-measure of A-835. Waiting on them for finding (2).
