@@ -16,3 +16,7 @@ Clone: ~/slates-work/w-multirepo; target ~/.cache/w-multirepo-target.noindex; st
 - 17:05 main asked whether piece 1 landed: answered yes (agents_send), 87337c6fa.
 - LANDED 517c732fa (main 8a0483cd8): A-844 slates_vcs::mrc. Reported inbox/main-from-w-multirepo-piece2a.md.
 - NEXT 2b: decayed rates (works/bytes per repository and principal; decay from measured inter-arrival times).
+- OVERLAP: w-balance still on A-724 (eccdf9b0f Learned "2a", 94efbcbe2 3b PastShare, says it's on piece 2). Asked main
+  for a split (~17:35); hands off usage.rs and vcs_share until then. Told w-balance (inbox overlap note).
+- LANDED 3b06a10d5 (main 4c43bbbe5): A-845 slates_vcs::rate. Reported.
+- NEXT 2c core: slates_vcs partition by marginal utility (UCP lookahead) over Curves above the floor; pure.
