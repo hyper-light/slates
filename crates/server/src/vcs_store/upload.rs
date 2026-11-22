@@ -41,8 +41,8 @@
 use slates_db::catalog::{Principal, RepositoryId, RepositoryRecord};
 use slates_git::Admission;
 use slates_git::receive::HiddenRefs;
-use slates_git::store::NamedRef;
 use slates_git::store::learn::{Clock, Exchange};
+use slates_git::store::{NamedRef, UploadCounters};
 use slates_git::upload::{Fragments, PackPlan, PackRefused, PackSource, Served, Streamed};
 use slates_vcs::Work;
 
@@ -183,7 +183,7 @@ fn lend_uncounted<R>(
     })
     .collect();
   let mut packs = ShardPacks::of(&state.config);
-  super::lent_to_read((&mut state.store, &mut state.vcs_stores), |stores| {
+  let lent = super::lent_to_read((&mut state.store, &mut state.vcs_stores), |stores| {
     let (content, store) = stores.git_ref(id)?;
     let served = Served {
       repository: &store.repository,
@@ -192,7 +192,9 @@ fn lend_uncounted<R>(
       head: &head,
     };
     Some(step(&served, &mut packs))
-  })
+  });
+  packs.count_on(state);
+  lent
 }
 
 /// A fork of a git repository's store as it stood at `stamp` (A-745, §4.17.1 "A fetch's answer" rule 4;
@@ -325,6 +327,7 @@ fn lend_held_in<R>(
       Some(step(&served, &mut packs))
     })
   });
+  packs.count_on(state);
   if lent.is_some() {
     let now = slates_rt::futures::now_ns();
     state
@@ -410,6 +413,26 @@ pub(super) fn exchange(config: &DaemonConfig) -> Exchange {
   }
 }
 
+/// Counters: the paths a fetch's stream sent its objects by (`slates_git::store::UploadCounters`, A-859; main 01a20182's
+/// order of 2026-11-22 04:53), counted on its shard as each step of its answer writes, so the daemon's status says which
+/// path a clone's objects took, a clone cut short too. Format: each a counter name and the stream's count it adds.
+pub(crate) const STREAM_COUNTED: [(&str, fn(&UploadCounters) -> u64); 10] = [
+  ("vcs_store.git_upload.parts_copied", |c| c.parts_copied),
+  ("vcs_store.git_upload.entries_copied", |c| c.entries_copied),
+  ("vcs_store.git_upload.headers_rewritten", |c| {
+    c.headers_rewritten
+  }),
+  ("vcs_store.git_upload.made_whole", |c| c.made_whole),
+  ("vcs_store.git_upload.loose_whole", |c| c.loose_whole),
+  ("vcs_store.git_upload.loose_deltas", |c| c.loose_deltas),
+  ("vcs_store.git_upload.loose_unsearched", |c| {
+    c.loose_unsearched
+  }),
+  ("vcs_store.git_upload.reused_whole", |c| c.reused_whole),
+  ("vcs_store.git_upload.reused_deltas", |c| c.reused_deltas),
+  ("vcs_store.git_upload.reuse_refused", |c| c.reuse_refused),
+];
+
 /// A-639's stream as upload-pack's pack source on the owner shard (the module doc): each turn on the shard's clock, at
 /// the owner's exchange, within the step quantum the shard keeps when the step was lent.
 #[derive(Clone, Copy, Debug)]
@@ -418,6 +441,9 @@ pub(crate) struct ShardPacks {
   exchange: Exchange,
   /// The nanoseconds a turn may spend.
   quantum_ns: u64,
+  /// The stream's counters before this step's first write and after its last, for the shard to count what the step's
+  /// writes added once it ends ([`STREAM_COUNTED`]); none where the step wrote none.
+  counted: Option<(UploadCounters, UploadCounters)>,
 }
 
 impl ShardPacks {
@@ -426,6 +452,20 @@ impl ShardPacks {
     ShardPacks {
       exchange: exchange(config),
       quantum_ns: config.step_quantum_ns(),
+      counted: None,
+    }
+  }
+
+  /// Counts on `state` what the stream's writes counted in this step ([`STREAM_COUNTED`]).
+  fn count_on(&self, state: &mut ShardState) {
+    let Some((before, after)) = self.counted else {
+      return;
+    };
+    for (name, of) in STREAM_COUNTED {
+      let by = of(&after).saturating_sub(of(&before));
+      if by > 0 {
+        state.count(name, by);
+      }
     }
   }
 
@@ -469,9 +509,14 @@ impl PackSource for ShardPacks {
     out: &mut Vec<u8>,
     room: usize,
   ) -> Result<bool, PackRefused> {
-    self
+    let before = self
+      .counted
+      .map_or_else(|| pack.counters(), |(before, _)| before);
+    let written = self
       .fragments(&mut ShardClock)
-      .write(served, pack, admission, out, room)
+      .write(served, pack, admission, out, room);
+    self.counted = Some((before, pack.counters()));
+    written
   }
 }
 

@@ -2363,51 +2363,69 @@ async fn take_sliced(
 ) -> Option<Result<Forked, PushOutcome>> {
   // A-740: a shard stuck in this step names it.
   let _doing = slates_rt::futures::doing("hg_push::take");
+  let mut admitted = room.left();
+  let mut taking = match taking_begun(repository, changegroup, lend, (room, &mut admitted)).await? {
+    Ok(taking) => taking,
+    Err(outcome) => return Some(Err(outcome)),
+  };
+  if let Err(outcome) = stepped_to_end(repository, &mut taking, lend, (room, &mut admitted)).await?
+  {
+    return Some(Err(outcome));
+  }
+  Some(Ok(settled(taking)?))
+}
+
+/// `take_sliced`'s begin: the intake begun after any waits, then admitted its known need (`admitted_its_need`), its
+/// first room the step's working set. The taking, or the push's refusal; none where the store went away.
+async fn taking_begun(
+  repository: RepositoryId,
+  changegroup: (Version, Vec<u8>),
+  lend: u64,
+  (room, admitted): (&mut Admission, &mut u64),
+) -> Option<Result<Taking, PushOutcome>> {
   #[cfg(test)]
   {
     let first = TEST_FIRST_INTAKE_ROOM.with(|first| first.replace(0));
     if first > 0 {
       *room = Admission::new(first);
+      *admitted = first;
     }
   }
-  let mut admitted = room.left();
-  let step = admitted;
-  let mut taking =
-    match begun_after_waits(repository, changegroup, lend, (room, &mut admitted)).await? {
-      Ok(taking) => taking,
-      Err(outcome) => return Some(Err(outcome)),
-    };
+  let step = *admitted;
+  let mut taking = match begun_after_waits(repository, changegroup, lend, (room, admitted)).await? {
+    Ok(taking) => taking,
+    Err(outcome) => return Some(Err(outcome)),
+  };
   #[cfg(test)]
   {
     let left = TEST_STEP_ROOM.with(|left| left.replace(0));
     if left > 0 {
       let held = admitted.saturating_sub(room.left());
-      admitted = held.saturating_add(left);
-      *room = Admission::new(admitted);
+      *admitted = held.saturating_add(left);
+      *room = Admission::new(*admitted);
       let _ = room.charge(held);
     }
   }
   let sized = crate::state::with_state(|state| {
-    admitted_its_need(
-      state,
-      repository,
-      (&mut taking, step),
-      (room, &mut admitted),
-    )
+    admitted_its_need(state, repository, (&mut taking, step), (room, admitted))
   })?;
-  if let Err(outcome) = sized {
-    return Some(Err(outcome));
-  }
+  Some(sized.map(|()| taking))
+}
+
+/// `take_sliced`'s steps: a slice at a time, a yield between slices, until the intake is done. A file delta's base
+/// landed before the push is read from the node's changeset store between slices (A-767 C1); a step past its admission
+/// waits and is taken again (`retaken`). The push's refusal where one is; none where the store went away.
+async fn stepped_to_end(
+  repository: RepositoryId,
+  taking: &mut Taking,
+  lend: u64,
+  (room, admitted): (&mut Admission, &mut u64),
+) -> Option<Result<(), PushOutcome>> {
   loop {
     let sliced = crate::state::with_state(|state| taking.slice(state, lend, room));
     match sliced.flatten()? {
       Ok(Stepped::More) => slates_rt::futures::yield_now().await,
-      Ok(Stepped::Done) => {
-        let forked = taking.finish()?;
-        let _ = crate::state::with_state(|state| count_bases(state, &forked.intaken));
-        return Some(Ok(forked));
-      }
-      // A file delta's base landed before the push, read from the node's changeset store between slices (A-767 C1).
+      Ok(Stepped::Done) => return Some(Ok(())),
       Ok(Stepped::Store) => {
         let intake = taking.intake.as_mut()?;
         if !vcs_store::hg_view::answer_store_wants(intake, repository).await {
@@ -2417,14 +2435,25 @@ async fn take_sliced(
       // The slice answers a whole changegroup's want as its truncation; none reaches here.
       Ok(Stepped::Wanted(range)) => return Some(Err(intake_outcome(&whole_wanted(&[], range)))),
       Err(refused) => {
-        if let Err(outcome) =
-          retaken(repository, (&mut taking, refused), (room, &mut admitted)).await?
+        if let Err(outcome) = retaken(
+          repository,
+          (&mut *taking, refused),
+          (&mut *room, &mut *admitted),
+        )
+        .await?
         {
           return Some(Err(outcome));
         }
       }
     }
   }
+}
+
+/// `take_sliced`'s settle: the intake finished into its fork, its delta bases counted. None where the store went away.
+fn settled(taking: Taking) -> Option<Forked> {
+  let forked = taking.finish()?;
+  let _ = crate::state::with_state(|state| count_bases(state, &forked.intaken));
+  Some(forked)
 }
 
 /// Counter: a push admitted its known need up front at its begin, past the room it was first given (main 01a20182's
