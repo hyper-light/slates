@@ -16464,8 +16464,12 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > admit. Both edges word it naming the share (or the room) and that a retry may pass once others' pushes end (or the
 > slot is laid out larger); the HTTP edge answers `503`, never `413`. Red first:
 > `t_a724_a_push_past_its_share_is_refused_retryable_naming_the_share` (untyped `Exchange(PastAdmission { asked: 72,
-> left: 49 })` before). Owed in piece 3: Mercurial's and Subversion's words and their intakes counted live,
-> backpressure before refusal, a fetch's room as a claim of its own.
+> left: 49 })` before). **Piece 3c (2026-11-21):** a Mercurial push (`hg_push::unbundle`, both edges) is live among the
+> shard's intakes from its start until it ends, begun on its repository's usage row with its principal, and answered
+> there with its bundle's bytes, learned as the repository's demand; before, an hg push left no row and divided no one's
+> room (`a_mercurial_push_is_counted_and_learned_on_its_repositorys_usage_row`, red first). Owed in piece 3: Mercurial's
+> share refusal typed in its words, Subversion's intakes counted live and its words, backpressure before refusal, a
+> fetch's room as a claim of its own.
 
 > **Status (2026-11-20, A-724 piece 3a: one room for every admission).** `crate::vcs_share::room` (`slates-server`) is
 > the one room a version-control work is admitted on its owner shard: git's push as it starts, git's fetch, Mercurial's
@@ -55128,6 +55132,10 @@ Applied in the same change to:
   `git_push::words` names the share and that a retry may pass; the HTTP edge answers `503`. Red first (slot narrowed to
   461 bytes, the share 230): the refusal was untyped before. Tests: slates-server `vcs_share` 12/12, `git_push` 31/31,
   `vcs_http::git` 20/20, `vcs_ssh` 71/71.
+- **Piece 3c, Mercurial's push counted (2026-11-21).** `hg_push::unbundle` holds a `vcs_share::Live` guard for the push's
+  whole run and counts it on the usage row (`begun` with its principal, `answered` with its bundle's bytes); the body is
+  `unbundled`. Red first: the push left no row. Tests: slates-server `vcs_ssh::tests::hg` 13/13, `repository::hg_push`
+  18/18, `vcs_http::hg` 9/9, `hg_view` 7/7, `vcs_share` 12/12.
 - **Applied in the same change to** §4.17.5 (new), GAPS, amendments.tsv.
 - **Owed.** Pieces 2 to 7 (§4.17.5's status); a fetch's answered count at its pack's last step; Mercurial's and
   Subversion's intakes and reads counted; the rows in `slates status`.

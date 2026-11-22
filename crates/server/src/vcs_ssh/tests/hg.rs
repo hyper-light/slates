@@ -1806,3 +1806,51 @@ fn an_ssh_answer_refused_past_its_start_exits_as_an_abort() {
     String::from_utf8_lossy(&transcript.err)
   );
 }
+
+/// A-724 piece 3c (§4.17.5 "What a repository costs, counted" and "Learned demand": every tool's intakes counted, so a
+/// Mercurial repository's pushes divide the shard's room with git's). Do: run stock 7.2's push over SSH through the
+/// daemon's lenders, as [`stock_7_2s_push_over_ssh_lands_through_the_daemons_lenders_as_7_2_answered_it`] does, and read
+/// the repository's usage row after. Expect: the push counted as one intake begun and answered, its principal named in
+/// the row's summary, and its bundle's bytes learned as the repository's next intake.
+#[test]
+fn a_mercurial_push_is_counted_and_learned_on_its_repositorys_usage_row() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let record =
+    crate::daemon::observe_first(&daemon, |state| drafted_history(state, "counted-over-ssh"));
+  let id = record.id;
+  let (sent, outcome) = mpsc::sync_channel(1);
+  crate::daemon::observe_first(&daemon, move |_state| {
+    let task = slates_rt::futures::spawn(async move {
+      let _ = sent.send(stock_push_session(&record).await);
+    })
+    .expect("the session's task");
+    slates_rt::futures::detach(task).expect("detached");
+  });
+  let channel = outcome.recv_timeout(PATIENCE).expect("the session ended");
+  let row = crate::daemon::observe_first(&daemon, move |state| {
+    state.vcs_usage.usage(&id).map(|row| {
+      (
+        row.intake.begun,
+        row.intake.answered,
+        row.learned(slates_vcs::Work::Intake).bytes_per_work(),
+        row
+          .principals()
+          .iter()
+          .any(|slot| slot.principal == owner()),
+      )
+    })
+  });
+  daemon.stop();
+  assert_eq!(
+    channel.expect("the session served").exited,
+    Some(EXIT_STATUS)
+  );
+  let Some((begun, answered, learned, named)) = row else {
+    panic!("the push left no usage row");
+  };
+  assert_eq!((begun, answered, named), (1, 1, true));
+  assert!(
+    learned.is_some_and(|bytes| bytes > 0),
+    "its bytes learned: {learned:?}"
+  );
+}
