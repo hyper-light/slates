@@ -3226,7 +3226,9 @@ fn changeset_wanted(
     named,
     packed,
     names_held: holds(&named.0),
-    pack_held: holds(&packed.0),
+    // A pack whose windows a landed push let go (goal 93 item 2b) is not held whole: read again from the node's store,
+    // its put bringing them back, so its replay reads every object.
+    pack_held: content.is_some_and(|content| content.holds_whole(&packed.0)),
   };
   (always || !wanted.names_held || !wanted.pack_held).then_some(wanted)
 }

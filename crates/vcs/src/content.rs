@@ -1880,6 +1880,17 @@ impl ContentStore {
     (u64::try_from(bytes.len()).ok()? == len).then_some(bytes)
   }
 
+  /// Whether the store holds the object `identity` names whole in memory: held, and none of its windows let go
+  /// ([`ContentStore::let_go`]). A reader that needs its bytes and finds it not whole reads it again from where it was
+  /// landed, and its put brings the windows let go back.
+  pub fn holds_whole(&self, identity: &ContentId) -> bool {
+    self.contains(identity)
+      && self
+        .object_windows(identity)
+        .iter()
+        .all(|window| !self.is_away(window))
+  }
+
   /// Whether the store holds the content `identity` names.
   pub fn contains(&self, identity: &ContentId) -> bool {
     let identity = &self.resolve(identity);

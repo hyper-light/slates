@@ -101,6 +101,8 @@ fn turn_lent(state: &mut ShardState, id: RepositoryId, quantum_ns: u64) -> (Turn
     }
   };
   let mut deriving = deriving;
+  // A miss an earlier step left noted is not this turn's: cleared, so only a read of this turn names what it waits for.
+  let _ = repository.waiting();
   let (outcome, derived) = paced(repository, content, &mut deriving, quantum_ns);
   let answer = match outcome {
     Ok(Turned::More) => {
@@ -183,8 +185,10 @@ pub(crate) async fn derive_for_read(id: RepositoryId) {
   loop {
     match crate::state::with_state_counted(|state| turn(state, id)) {
       Some(Turned::More) => slates_rt::futures::yield_now().await,
+      // A window brought back, turned again; one that brought nothing back (back already, or refused) would only meet the
+      // same miss again, so the derivation stops there as a refused one does.
       Some(Turned::Waiting(waited)) => {
-        if super::read_through::bring_back(waited).await.is_err() {
+        if !matches!(super::read_through::bring_back(waited).await, Ok(brought) if brought > 0) {
           return;
         }
       }
