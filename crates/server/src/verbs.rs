@@ -18752,8 +18752,20 @@ async fn run_pin(mut job: PinJob) {
 /// Serves every ready request of every client, retries deferred replies, steps destroys and
 /// expires leases; returns whether anything was done.
 pub fn serve_round(state: &mut ShardState) -> bool {
+  // w-perf 84a (diag, never main): each part of the round that runs long is recorded as a long serve by its name.
+  let g222_part = |began: u64, name: &str| {
+    let ns = slates_machine::clock::monotonic_ns().saturating_sub(began);
+    if crate::g222_diag::serve_is_long(ns) {
+      crate::g222_diag::long_serve(began, ns, name.to_owned());
+    }
+  };
+  let g222_began = slates_machine::clock::monotonic_ns();
   let mut any = retry_forwards(state);
+  g222_part(g222_began, "round:retry_forwards");
+  let g222_began = slates_machine::clock::monotonic_ns();
   any |= retry_deferred(state);
+  g222_part(g222_began, "round:retry_deferred");
+  let g222_began = slates_machine::clock::monotonic_ns();
   let handles: Vec<(u32, Handle<ClientSlot>)> = state
     .clients
     .iter()
@@ -18765,6 +18777,7 @@ pub fn serve_round(state: &mut ShardState) -> bool {
   for (index, handle) in handles {
     any |= serve_client(state, index, handle, now);
   }
+  g222_part(g222_began, "round:clients (whole)");
   // The closed loop's clock (`loop_hold`; A-326): the end of a round's client I/O, the requests of its clients' loops
   // read and the replies to them written, before the round's background work, so a client's think time is read from its
   // reply, not from the round's start, and a destroy's slices, a lease's expiry or an acknowledgement never stand in for
@@ -18772,8 +18785,12 @@ pub fn serve_round(state: &mut ShardState) -> bool {
   if std::mem::take(&mut state.loop_io) {
     state.last_client_io_ns = state.clock.monotonic_ns();
   }
+  let g222_began = slates_machine::clock::monotonic_ns();
   any |= step_destroys(state);
+  g222_part(g222_began, "round:step_destroys");
+  let g222_began = slates_machine::clock::monotonic_ns();
   any |= expire_leases(state) > 0;
+  g222_part(g222_began, "round:expire_leases");
   any
 }
 
