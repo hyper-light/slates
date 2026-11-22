@@ -60668,3 +60668,37 @@ Applied in the same change to:
   learned, 262,144 bytes here, the task finishes the encoding as before).
 - **Left** (GAPS): each object's deflate makes a fresh state (97 GB made over one clone), owed next; past its grant a
   repository's fragments are not kept on disk under its grant, only not made ahead; main's RSS round over git/git.
+
+### A-858 — Every child the daemon spawns is handed only its three streams; a hook's exit is read whenever the kernel has it (2026-11-22, w-svn; main 01a20182's ruling (a) of 02:06 PST on the hook pipe race, and its constraint of 03:22; A-622, A-597, A-645 (a))
+Applied in the same change to:
+- `crates/ipc/src/confined_spawn.rs` (new): `spawn`, through `posix_spawn` with file actions naming the child's standard
+  streams alone, its directory and its group; on macOS `POSIX_SPAWN_CLOEXEC_DEFAULT`; `SpawnedChild` (wait, try_wait,
+  the group's kill). `unsafe-budget.toml`: slates-ipc 147 → 160, each site named.
+- `crates/server/src/hook_driver.rs`: hooks (git's, Mercurial's and Subversion's) and the daemon's own helpers
+  (`run_helper`, a view's `slates mount`) spawned through it; `read_exit` asks the kernel at every wake, and a run whose
+  watch fired before its status was readable yields and reads again.
+- `crates/cli/tests/svn_interop.rs`: an anchor's guard lets go the hook views mounted in its store before it stops its
+  daemon, then removes the store within a bound.
+- `docs/wip/GAPS.md`.
+
+- **Why.** main's parallel daemon_edge set timed out hooked DAV requests at the client's 10 s read (2 of 12 runs), and
+  macos-latest's HTTPv2 `svn propset --revprop` hung 120 s. Two causes, found in turn:
+  - macOS has no `pipe2`. A pipe made while another thread spawned leaked into that child, which then held a hook's
+    words stream open past the hook's exit.
+  - macOS posts a process's exit note a moment before the process can be waited for. A first run, which has no
+    learned deadline, whose words had ended had nothing left to wake it.
+  A red run's cleanup then sat in `remove_dir_all`'s `openat` beneath a view whose daemon was gone. And a kernel NFS
+  mount whose daemon dies under it has panicked a Mac (2026-10-06).
+- **What.** The standard library's `Command` cannot restrict what a child inherits, so the daemon spawns through
+  `confined_spawn`. A child holds its three streams and nothing else. Linux's standard pipes are atomic
+  (`pipe2(O_CLOEXEC)`), so the same spawn serves there without the flag. The driver treats the exit watch as a wake
+  alone, and the status read without reaping as what says the hook exited. The test guard's order is: unmount the
+  views, stop the daemon, remove the directory.
+- **Evidence.**
+  - `hooks_spawned_at_once_each_end_at_their_own_exit` (32 at once, 4 rounds): against the previous driver, red 2 of 3
+    runs ("a refusing hook's run took 4012475167 ns", held by a sleeping hook until its kill). With the seam alone,
+    red about 1 of 2 (a refusing run never ended: the exit note seen, `waitid` none). With both, 20 of 20 green.
+  - `confined_spawn`'s `a_child_holds_only_the_streams_its_spawn_names`: a descriptor with close-on-exec cleared is
+    not held by the child (macOS).
+  - `a_failing_test_lets_its_hook_view_go_before_its_daemon` (CI only): the guard's order under a deliberate failure.
+

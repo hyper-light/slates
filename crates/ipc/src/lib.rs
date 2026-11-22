@@ -37,6 +37,8 @@
 /// `net.Socket` refuses an eventfd), converting the eventfd's readability to a pollable self-pipe.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub mod completion;
+#[cfg(unix)]
+pub mod confined_spawn;
 pub mod delivery;
 pub mod doorbell;
 pub mod endpoint;

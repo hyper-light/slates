@@ -508,6 +508,19 @@
 >     7.2 streams the imported repository and verifies it clean.
 > - The two recovery tests that polled a register-held import record by hand are gone with that path; the restart test
 >   holds the run's recovery.
+> **A stock client's push of a long history refused past its one admission (2026-11-22, w-hg; main 01a20182's order of
+> 03:03, w-interop's ubuntu find: `Delta { log: Manifests, .. PastAdmission { asked: 73365, left: 50646 } }`, the push's
+> own earlier deltas having spent it). IN FLIGHT.**
+> - Part 1 BUILT: a refusal past its admission leaves the intake where it was, so the step is taken again whole once the
+>   room grows. `push::intake` `keep_taken` charges everything to a trial of the admission before it keeps the revision
+>   and notes it after (`Taker::read_of` / `apply_read`, `logged_of` / `note_logged`); before, a charge after the keep
+>   refused with the revision already kept, and its retake passed it over unnoted. `Refused::past_admission` names
+>   every such refusal (a charge, the framing, a delta's text, the keeping's room). Held by
+>   `push::intake::tests::a_step_refused_past_its_admission_is_taken_again_whole_in_a_grown_room` (rooms of a quarter,
+>   a half and all but a byte of what the push holds; red with the charges after the keep: 20 kept for 21).
+> - Part 2, next: the push's driver (`hg_push::take_sliced`) waits for room under w-git's shared `vcs_share::RoomWait`
+>   (main's ruling: one wait for git and hg) and takes the step again in the room it gives; a piece past the most the
+>   repository could ever be lent is refused typed.
 > **A push's work counted a file revision's metadata markers as bytes (2026-11-22, w-hg; w-interop's find, ubuntu,
 > `hg push --new-branch -f -r 2000` of hg's own history refused `LengthDiffers { said: 10101, given: 10097 }` on
 > `hgext/hbisect.py`). FIXED.** 2a's `IndexHeld::file_bytes_len` (d93f98369) took a file revision's bytes as its text's
@@ -2853,8 +2866,11 @@
 > its chain's best message. Still seen (2 of 12 runs): a hook's first run, which has no learned bound, waits on its
 > words stream past its exit when a process spawned at the same instant elsewhere in the process inherited the
 > stream's write end (macOS has no `pipe2`, so std's pipe is made close-on-exec a call later), until the client's
-> 10 s read gives up. Owed: a ruling on spawning hooks with no inherited descriptors, or ending a drain once the
-> hook's process group is empty.
+> 10 s read gives up. RULED (a) and BUILT, A-858: every child the daemon spawns is handed only its three streams
+> (`slates_ipc::confined_spawn`), and the driver reads an exit the watch posted before it was waitable, the second cause
+> the concurrent-spawn test found. Owed: the macos-latest proof of the HTTPv2 propset hang's end and the guard's order
+> (a diag-measurer branch; never on Ada's Macs, main's constraint of 2026-11-22 03:22), and w-lint's Linux and Windows
+> cross-target round. Windows spawns no hooks yet (A-622's Windows part), so it has no seam to change.
 > **svn replay by stock clients (w-interop, 2026-11-20; A-703):** `svn-matrix.sh` gains `svnrdump dump` and
 > `svnsync initialize/synchronize` over svn://, each compared with the dump stock svnserve 1.15.0 made of the same history
 > (`crates/svn/fixtures/replay`, `EXPECT_RDUMP`, `EXPECT_SYNC`): over the reads fixtures' repository both are

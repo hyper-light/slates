@@ -860,13 +860,7 @@ impl<S: SvnStores> SvnExchange<S> {
     let path = self.path.clone();
     let segments: Vec<&str> = path.split('/').filter(|name| !name.is_empty()).collect();
     let method = self.method.clone();
-    // A revision property change (`deadprops.c` `save_value` on a revision resource: HTTPv2's `!svn/rev/N`, DeltaV
-    // v1's baseline `!svn/bln/N`), its hooks waited on.
-    if method.as_str() == "PROPPATCH"
-      && let [first, "rev" | "bln", revision] = segments.as_slice()
-      && *first == site::SPECIAL
-    {
-      let revision = (*revision).to_owned();
+    if let Some(revision) = revision_resource(method.as_str(), &segments) {
       return Some(self.revision_proppatch(&revision, gone).await);
     }
     if let Some(answer) = self.on_special_path(method.as_str(), &segments) {
@@ -1802,6 +1796,17 @@ impl<S: SvnStores> SvnExchange<S> {
       }
     }
     answered
+  }
+}
+
+/// The revision a revision property change names (`deadprops.c` `save_value` on a revision resource: HTTPv2's
+/// `!svn/rev/N`, DeltaV v1's baseline `!svn/bln/N`), for a PROPPATCH of one; none for any other request.
+fn revision_resource(method: &str, segments: &[&str]) -> Option<String> {
+  match (method, segments) {
+    ("PROPPATCH", [first, "rev" | "bln", revision]) if *first == site::SPECIAL => {
+      Some((*revision).to_owned())
+    }
+    _ => None,
   }
 }
 

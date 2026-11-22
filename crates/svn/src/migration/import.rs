@@ -516,10 +516,13 @@ impl Importer {
       if whole && length > 0 {
         let bytes = usize::try_from(length).map_err(|_| MigrationRefusal::Corrupt)?;
         open.charged = self.charge(repository, bytes)?;
-        open.bytes.try_reserve_exact(bytes).map_err(|_| MigrationRefusal::Room {
-          needed: length,
-          room: repository.room().bytes,
-        })?;
+        open
+          .bytes
+          .try_reserve_exact(bytes)
+          .map_err(|_| MigrationRefusal::Room {
+            needed: length,
+            room: repository.room().bytes,
+          })?;
       }
       self.text = Some(open);
     }
