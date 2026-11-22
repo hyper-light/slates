@@ -1098,6 +1098,24 @@
 > through it (clone over HTTP and SSH, round trips, forced heads). Owed: file revisions, which the store keeps whole,
 > go the same way once the changeset shape keeps them as Mercurial's deltas. And the clone's time against stock's
 > 283 s, measured again, release.
+> **An SSH clone of a large revision spun its shard past the watchdog (2026-11-21, w-hg; main 01a20182's fixture round
+> at a3e673efc: 91 of 92, `ssh clone-after` cut, "stream ended unexpectedly (got 8113614 bytes, expected 16777334)").
+> FIXED.** Reproduced by a reduced lane (fixture; SSH push, push-head, -f, -B, a draft and tag, then clone; debug):
+> the lane's new per-step anchor print named "shard 1 is spinning: 3509 ms of CPU without a step ... in task
+> `vcs_ssh::offer`", the daemon killed and the clone cut. Two causes, both fixed:
+> - Mercurial's standard output (`serve::stdio::Stdio`) was a `Vec` drained from its front as the channel took each
+>   packet (about 32 KiB), so a whole revision's chunk moved every byte behind each piece: about 64 GiB for 64 MiB.
+>   Now a cursor (`stdio::Output`): taking moves nothing, and taken bytes go at once when all are or before more are
+>   written behind them. Held by `serve::stdio::tests::output_taken_a_packet_at_a_time_moves_no_byte` (red with the old
+>   drain: 266,338,304 bytes moved for a 4 MiB answer).
+> - The connection's loop (`vcs_ssh` `Link::write`) never yielded while the socket took every write at once, so all
+>   of an answer's offers ran in one poll; it now yields after each write.
+> - The lane (`bench/hg_correctness.sh`) prints what the anchor and daemon logged during a failing step
+>   (`anchor_since`); the hg SSH steps and the loop's synchronous parts carry `doing` labels (`vcs_ssh::exec`, `feed`,
+>   `offer`, `exit`, `hg::answered_step`, `hg::streamed_turn`), so a kill names its step.
+> - Siblings, not changed (their owners'): `vcs_ssh/git.rs` `sent` and `vcs_ssh/svn.rs` `sent` drain their output from
+>   the front the same way; each holds a turn's slice, not a whole revision, and the loop's yield bounds a poll to one
+>   offer, so neither can spin the shard now; a cursor would save the copies.
 > **The SSH edge wrote bytes twice across a rekey (2026-11-21, w-hg; found by reading, main 01a20182's order of 21:35).
 > FIXED.** The edge's write (`vcs_ssh` `Link::write`) raced `TcpStream::write_all` against the session's key timer; a
 > timer that came due while the write waited on a full socket dropped it, and all its bytes were written again, the
