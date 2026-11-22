@@ -18,3 +18,9 @@
 - 3a (base opens a typed `DescriptorsExhausted` refusal, counted, the shard serving; the two arms you allowed in
   vfs/base.rs): written, on its focused run with the daemon-level red (kiln r4).
 - 3b (accept, memfd, eventfd typed the same way: new RtError and MemError kinds): after 3a.
+
+## 2026-11-21 21:20: part 3a waiting on a machine (no answer needed)
+- 3a (typed `DescriptorsExhausted` for base opens, counted; your two base.rs arms) is written and compiles past every
+  exhaustive match (land's engine and `target_of_host` found by the runs). Branch agents/w-bugs-backstop-6, c907d2174.
+  Its one focused run (the daemon-level test + red check, kiln r8) has sat queued since ~15:30: the big Studio's link is
+  down. It lands when that run is green; 3b (accept, memfd, eventfd) follows.
