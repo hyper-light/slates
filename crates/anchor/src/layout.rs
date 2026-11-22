@@ -18,9 +18,11 @@ pub const MAGIC: u32 = 0x4E41_4C53;
 /// 13 the copies' section and the sum each behind a presence byte, written beside a copy's record alone (checkpoint
 /// version 5, A-626 part 3, continued (1), 2026-11-19), 14 a work's logged journal may hold a copy (`LoggedOp::Copy`,
 /// A-626 part 4, 2026-11-19), 15 a token's credential record keeps its CRAM-MD5 keyed contexts beside its hash
-/// (`CredentialKind::HttpToken`'s field, A-692, 2026-11-19). An older segment is refused, never misread.
+/// (`CredentialKind::HttpToken`'s field, A-692, 2026-11-19), 16 a green's checkpoint is named, not carried: its record and
+/// a snapshot hold the identity and length its encoding is held under in the owner shard's content store (A-579's last
+/// step, on chain entry format 6's rule, 2026-11-21). An older segment is refused, never misread.
 /// Format: this layout's number in the history above.
-pub const LAYOUT_VERSION: u32 = 15;
+pub const LAYOUT_VERSION: u32 = 16;
 /// Format: the layout before A-237's host-scoped principals, refused with what to do about it.
 pub const LAYOUT_BEFORE_HOST_SCOPED_PRINCIPALS: u32 = 4;
 /// Format: one content-pool extent's owner word (A-98): 0 while the extent is free, else its owning partition plus

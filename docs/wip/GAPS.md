@@ -2021,8 +2021,9 @@
 > **A-724 piece 2d part 2 (A-844): curves fed by git's fetches** (`vcs_store::observed`;
 > `t_a724_a_fetchs_reads_are_noted_in_its_own_repositorys_curve`). Open: pushes', hg's and svn's reads.
 > **A-724 piece 2d part 3 (A-846): grants divided at the learning cadence, not yet read by admission**
-> (`vcs_share::grants`, `t_a724_the_grants_are_divided_at_the_learning_cadence_and_kept_between`). Open: `room` reading
-> them.
+> (`vcs_share::grants`, `t_a724_the_grants_are_divided_at_the_learning_cadence_and_kept_between`); the room reads them
+> since A-846 part 3 (`t_a724_a_contested_room_reads_the_published_grants`,
+> `t_a724_a_live_repository_with_no_curve_leaves_the_room_divided_as_before`). Open: pushes', hg's and svn's reads.
 > **A-724 piece 7 (A-849): the load proof's fetches** (`multi_repo_load.py --fetches`; harness daemons given a
 > `--vcs-store`, without which `repository create --tool git` failed since A-767 C5). Open: hg and svn in the mix; the
 > rounds (main's).
@@ -25040,10 +25041,15 @@ in what lands. Branch tips as of 2026-11-10:
 > kind's p99 is under 1 ms in 5 of 5 rounds. (b) LANDED 2026-11-21 (a key's old entry subtracted at its first change:
 > the fold hashes current bytes only, no history reads), with a fix to a checkpoint's sum taken mid-fold. OWED: (b)'s A/B
 > (does Z = 20 ms p99 return to main's?; main's run, `run-requests.md`, blocked while main's own regression stands:
-> SubmitAccepted server p50 0.29 ms at 4d0ad1674 against 184 ms at 1a35ab091, Z = 50 ms, macOS arm64, not A-579's,
-> window c1449f629..b3f674640 unbisected). DEFERRED past goal 93 (goal 89b's): the checkpoint's last step, ~43 ms
-> (build 5.7, encode 9.5, record 24.4 of 49 MB), plan: slice build and encode under the paced turn budget now, and record
-> by identity in the content store only inside w-shared's chain format 6 (main's 02:06 ruling); and single key folds of
+> SubmitAccepted server p50 0.29 ms at 4d0ad1674 against 184 ms at 1a35ab091, Z = 50 ms, macOS arm64, not A-579's;
+> BISECTED 2026-11-21 to 6088ccb72, A-825's format 6 (w-shared): its parent 544020bd2 p50 0.38 / p99 0.84 ms, it 237.9 /
+> 1,192 ms, release `load_bench` one round each on the big Studio; the likely mechanism is A-825's owed cost, a
+> whole-shard publication (`publish_held_increments` -> `publish_shard`) in every accepted version's step on the owner;
+> handed to w-shared, `inbox/w-shared-from-w-engine-format6-regression.md`). The checkpoint's record LANDED by name
+> (goal 93's, main's 15:00: a 1 GiB green's was 650-1,063 ms in one step, record 527 ms): held in the owner's content
+> store a chunk a quantum, published, recorded as `CheckpointRef` (layout 16). OWED, piece 2: its build and encoding
+> are still one step (52 + 71 ms at 1 GiB; 5.7 + 9.5 ms at load_bench's 49 MB), inside the watchdog's 1 s window.
+> DEFERRED past goal 93 (goal 89b's): single key folds of
 > up to 13.4 ms, plan: a slice that keeps a hot file's partial short with a guaranteed past-deadline share derived from
 > the latency budget (main's 23:50 ruling), since slicing inside a key landed and was reverted the same day (a fold of
 > 47.6-52.6 s, every past-deadline turn at the 100 ms ceiling; ed4661d40, design amendment A-579).

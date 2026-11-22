@@ -23,6 +23,13 @@
 //! with no answered intake yet claims everything the shard can admit, its first value taken from the machine, never a
 //! literal. Weights are equal: the repository is the unit of fairness (§4.17.5).
 //!
+//! **Shares, published** (A-724 piece 2d). Once every repository taking new room has a working-set curve, memory is
+//! read from the shard's published grants ([`grants`]: the room divided by marginal utility at the learning cadence),
+//! never divided per request: the asker's memory room is its grant less what it holds, plus what is lendable (the
+//! spare, and the grants of repositories with no live work that they do not use), so a hot repository never takes a
+//! live small one's grant. A live repository with no curve yet (a newcomer) leaves memory divided per request as above,
+//! so no grant is promised twice. Counted [`BY_GRANTS`]. The snapshot slot is divided as above either way.
+//!
 //! **The cold trigger** (A-724 piece 4). What a repository holds counts its rebuildable values too (a git repository's
 //! kept fragments). Each claimant found holding more than its grant gives back, by §4.11's cost model
 //! (`crate::vcs_store::git_encode::relieve`), the values worth more as room than as time saved, before the asker's room
@@ -53,6 +60,8 @@ use crate::state::ShardState;
 pub(crate) const FAST: &str = "vcs_share.fast";
 /// Counter: rooms divided among repositories with intakes under way. Format: a counter name.
 pub(crate) const DIVIDED: &str = "vcs_share.divided";
+/// Counter: contested rooms whose memory was read from the published grants (A-724 piece 2d). Format: a counter name.
+pub(crate) const BY_GRANTS: &str = "vcs_share.by_grants";
 /// Counter: rooms the repository's share narrowed below what the shard could admit. Format: a counter name.
 pub(crate) const NARROWED: &str = "vcs_share.narrowed";
 
@@ -218,31 +227,50 @@ pub(crate) fn room(state: &mut ShardState, repository: RepositoryId) -> Room {
     })
     .collect();
   let grants = divide(&capacity.map(amount_of), &claims);
+  // A-724 piece 2d: with every live claimant's curve divided in the shard's published grants, memory is read from them
+  // (module docs, "Shares, published"); a live repository with no curve yet leaves memory divided here, as before, so
+  // a newcomer is never given all the shard admits beside grants that already sum to the room.
+  let published = published_memory(state, &claimants);
+  let memory_grants: Vec<u64> = match &published {
+    Some((each, _)) => each.clone(),
+    None => grants
+      .iter()
+      .map(|grant| grant.granted.first().copied().map_or(0, whole_units))
+      .collect(),
+  };
   // The cold trigger (A-724 piece 4): each claimant holding more memory than its grant gives back what its rebuildable
   // values are worth giving back, by §4.11's cost model at its pressure (what it holds over its grant).
   for ((id, _), (grant, holding)) in claimants.iter().zip(
-    grants
+    memory_grants
       .iter()
-      .filter_map(|grant| grant.granted.first())
+      .copied()
       .zip(held.iter().map(|held| held[0])),
   ) {
-    let grant = whole_units(*grant);
     if holding > grant {
       let pressure = amount_of(holding) / amount_of(grant.max(1));
       crate::vcs_store::git_encode::relieve(state, *id, holding.saturating_sub(grant), pressure);
     }
   }
-  let own = grants
+  let mut own = grants
     .first()
     .map_or([0, 0], |grant| grant.granted.map(whole_units));
   let own_held = [
     held_by(state, repository),
     snapshot_held_by(state, repository),
   ];
-  let headroom = [
+  let mut headroom = [
     own[0].saturating_sub(own_held[0]),
     own[1].saturating_sub(own_held[1]),
   ];
+  if let Some((each, lendable)) = published {
+    state.count(BY_GRANTS, 1);
+    let grant = each.first().copied().unwrap_or(0);
+    own[0] = grant.saturating_add(lendable);
+    headroom[0] = grant
+      .saturating_sub(own_held[0])
+      .saturating_add(lendable)
+      .min(admittable);
+  }
   let shared = headroom[0].min(headroom[1]);
   if shared >= admittable.min(slot_room) {
     return alone(admittable, slot_room);
@@ -257,6 +285,44 @@ pub(crate) fn room(state: &mut ShardState, repository: RepositoryId) -> Room {
       held: own_held.get(binding).copied().unwrap_or(0),
     },
   }
+}
+
+/// The published memory grants of `claimants` ([`grants`]) and the room lendable beside them, when every one has a
+/// curve divided in them: each claimant's grant in order, and the spare plus every repository with no live work's grant
+/// it does not use (§4.17.5 "work-conserving": room a share leaves unused is lent). `None` when one has no curve or no
+/// grant yet, so its memory is divided per request among the live ones as before.
+fn published_memory(
+  state: &mut ShardState,
+  claimants: &[(RepositoryId, [u64; 2])],
+) -> Option<(Vec<u64>, u64)> {
+  let curved = claimants.iter().all(|(id, _)| {
+    state
+      .vcs_usage
+      .usage(id)
+      .is_some_and(|row| row.curve().is_some())
+  });
+  if !curved {
+    return None;
+  }
+  let now = slates_rt::futures::now_ns();
+  grants::current_at(state, now);
+  let published = &state.vcs_grants;
+  let each: Vec<u64> = claimants
+    .iter()
+    .map(|(id, _)| published.of(*id))
+    .collect::<Option<_>>()?;
+  let idle = state
+    .vcs_usage
+    .rows()
+    .map(|(id, _)| *id)
+    .filter(|id| !claimants.iter().any(|(live, _)| live == id))
+    .filter_map(|id| {
+      published
+        .of(id)
+        .map(|grant| grant.saturating_sub(held_by(state, id)))
+    })
+    .fold(0u64, u64::saturating_add);
+  Some((each, published.spare.saturating_add(idle)))
 }
 
 /// A repository's room with no other taking new room: all the shard can admit, or the snapshot slot's room left where
@@ -316,9 +382,6 @@ fn demand_of(
     })
 }
 
-// A-724 piece 2d: read by the room once its admission reads the published grants (A-724 piece 3's side); until then a
-// daemon build calls none of it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod grants;
 pub(crate) mod place;
 pub(crate) mod turns;

@@ -179,18 +179,39 @@ fn inputs_extents(bytes: &[u8]) -> (Vec<Extent>, u64) {
   let extents: Vec<Extent> = bytes
     .chunks(inputs_chunk_bytes().max(1))
     .map(|piece| {
-      let len = u64::try_from(piece.len()).unwrap_or(u64::MAX);
-      let extent = Extent {
-        offset,
-        len,
-        chunk: slates_archive::archive::hash_of(piece),
-        chunk_offset: 0,
-      };
-      offset = offset.saturating_add(len);
+      let extent = inputs_extent(offset, piece);
+      offset = offset.saturating_add(extent.len);
       extent
     })
     .collect();
   (extents, offset)
+}
+
+/// The extent of an inputs archive naming `piece`, one chunk of its bytes at `offset`: the chunk's identity the BLAKE3
+/// of the piece. [`inputs_extents`] a piece at a time, so a large encoding's manifest is hashed over a shard's turns (a
+/// green's checkpoint, A-579, `merge_service::CheckpointHold`).
+pub(crate) fn inputs_extent(offset: u64, piece: &[u8]) -> Extent {
+  Extent {
+    offset,
+    len: u64::try_from(piece.len()).unwrap_or(u64::MAX),
+    chunk: slates_archive::archive::hash_of(piece),
+    chunk_offset: 0,
+  }
+}
+
+/// [`inputs_manifest_archive`] of extents already hashed ([`inputs_extent`], in order) over `size` bytes: the same archive
+/// as the one call makes of the same bytes.
+pub(crate) fn inputs_manifest_archive_of(
+  extents: Vec<Extent>,
+  size: u64,
+  created_unix: u64,
+  page: u32,
+) -> Archive {
+  inputs_archive_of(
+    inputs_manifest(extents, size),
+    Vec::new(),
+    (created_unix, page),
+  )
 }
 
 /// An inputs archive's manifest: one file named `INPUTS_ENTRY_NAME` of `size` bytes over `extents`.

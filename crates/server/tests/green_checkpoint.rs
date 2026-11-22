@@ -463,8 +463,9 @@ fn two_clients_taking_turns_keep_folding_and_recover_whole() {
 /// version 1, keep a second work at version 1 (so the chain cannot fold past it), land ten versions each overwriting the
 /// file with 8 KiB, read the shard's held content; then destroy the second work, land one more version (whose accept
 /// checkpoints the chain at the risen floor), and read it again. Expect: while the floor is held, at least the ten 8 KiB
-/// increments are held and charged; once the chain folds, at most the newest version's, above the checkpoint, is held,
-/// at a tenth of the charge or less.
+/// increments are held and charged; once the chain folds, the store holds the checkpoint (A-579's last step: named by
+/// its record, held where the increments are) and at most the newest version's increment, above it: two manifests at
+/// most, at a quarter of the charge or less (one file's 8 KiB each, against eleven).
 #[test]
 fn a_versions_increment_is_held_until_its_version_folds_into_a_checkpoint() {
   let profile = common::machine_profile();
@@ -508,8 +509,8 @@ fn a_versions_increment_is_held_until_its_version_folds_into_a_checkpoint() {
     "the unfolded versions' increments are held and charged: {held:?}"
   );
   assert!(
-    folded.manifests <= 1 && folded.charged * 10 <= held.charged,
-    "the folded versions' increments are given back, at most the newest version's left above the checkpoint: {folded:?}, \
+    folded.manifests <= 2 && folded.charged * 4 <= held.charged,
+    "the folded versions' increments are given back, the checkpoint and at most the newest version's left: {folded:?}, \
      held before {held:?}"
   );
 }

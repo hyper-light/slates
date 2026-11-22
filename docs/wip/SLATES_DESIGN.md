@@ -11505,7 +11505,10 @@ names one.) A holder's replica folds where its owner's engine had folded when it
 holds (the record names the floor), so no replica keeps more history than its owner (A-385). A checkpoint reads the
 head's identity, whose backlog (every key changed since it was last read) is folded a paced step at a time on the owner
 and finished in turns by a task of its own, each turn's share the fold left spread over the turns before the next
-checkpoint is due (A-579): no step hashes the backlog whole.
+checkpoint is due (A-579): no step hashes the backlog whole. The checkpoint itself is held in the owner shard's content
+store, its chunks hashed and staged a unit at a time with a quantum a turn while someone waits, then published and
+recorded by name (`CheckpointRef`: identity and length), so the partition never carries its bytes (A-579's last step,
+chain entry format 6's rule; the build and encoding are still one step, owed).
 
 > **Status (2026-11-19, A-668: two inserts at one point meet in both orders).** A delta's operations are walked in
 > order and the walk stops at the first one lying past the range: one starting after the range's end, or at its end
@@ -16554,9 +16557,13 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > shard keeps one `Grants` value, replaced whole: every row's curve aged to now at its read horizon
 > (`Ledger::age_curves`), its misses a second its counts over that horizon, the shard's admittable room divided by
 > `slates_vcs::partition`. It is divided again once the shortest read horizon among the repositories served has passed,
-> or at once when that set changes, and read in between (`current_at`; counted `vcs_share.grants_divided`). Owed: the
-> room's admission reading it (a repository admitted against its grant, else the spare; agreed with A-724 piece 3's
-> side first), and pushes', Mercurial's and Subversion's reads feeding the curves.
+> or at once when that set changes, and read in between (`current_at`; counted `vcs_share.grants_divided`). Since
+> A-846 part 3 (agreed with w-balance, A-724 piece 3's side) the room reads it: once every repository taking new room
+> has a curve, the asker's memory room is its grant less what it holds plus what is lendable (the spare and idle
+> repositories' unused grants), the cold trigger relieving each past its published grant (counted
+> `vcs_share.by_grants`); a live repository with no curve yet leaves memory divided per request, so a newcomer is never
+> promised a grant twice; the snapshot slot is divided as before. Owed: pushes', Mercurial's and Subversion's reads
+> feeding the curves (until then only git's fetching repositories take the grant path).
 
 > **Status (2026-11-21, A-849: piece 7's proof gains fetches).** `crates/cli/bench/multi_repo_load.py --fetches`
 > seeds every repository with its class's pack, then sends Zipf-skewed protocol v2 fetches beside the pushes, each
@@ -59864,12 +59871,53 @@ Applied in the same change to:
   to 47.6-52.6 s at 1,000 clients (hot files change several times a second), past its doubling deadline, where a turn's
   share is all that is left: steps of up to the ceiling for the rest of the run. Reverted; owed again with a slice that
   keeps a hot file's partial short and a share past the deadline that stays bounded (main's 23:50 ruling).
-- **Owed:** (b)'s A/B at Z = 20 and 50 ms; the checkpoint's remaining one step (~43 ms: build, encode, a 49 MB record),
-  its durable form a question for main; single keys of up to 13.4 ms sliced (above); w-git's member loop in turns on
-  `fold_identity_step`.
+- **The checkpoint by name, held in turns (A-579's last step, piece 1; main's order of 15:00, goal 93's, since it
+  scales).** w-work-cow measured a 1 GiB green's checkpoint right after its sliced submit at 650-1,063 ms in one step:
+  build 52, encode 71, record 527 ms of `db.mutate_owned`. That stalls the watchdog for any green that large, a big
+  git, Mercurial or Subversion import among them. The shape is A-760's and A-825's (format (a), riding chain entry
+  format 6, since that is on main):
+  - **Where the bytes are.** The encoding is held in the owner shard's content store as an inputs archive
+    (`merge_service::CheckpointHold`), under an object of its own derived from the green
+    (`checkpoint_object`, BLAKE3 key derivation). A store keeps one stage an object, and an owner's fetch of a holder's
+    increment (A-826) stages the green's own.
+  - **Held in turns.** Its chunks (1 MiB, `inputs_chunk_bytes`) are hashed into the manifest a unit at a time, then
+    copied into the stage a unit at a time (`ContentHold::stage_lent_piece`, new: `hold_lent` a piece at a time, the
+    caller's own hash not taken again). Each turn's share is one quantum while someone waits, never the deadline's
+    spread: past a deadline that spread is everything at once, which is what sank the key slices above.
+  - **Recorded by name.** Format 6's order: the partition's check, a publication, then the record
+    `Op::GreenCheckpointed { checkpoint: CheckpointRef { identity, len } }`, so no record names content a restarted
+    store lacks. The partition charges the name's 40 bytes, and the store charges the encoding (A-714's rule). The
+    anchor's layout is 16, and a layout-15 segment is refused.
+  - **Given back.** A checkpoint replaced is given back once the new one is recorded. A refused hold gives back what it
+    stored. A checkpoint the chain's cap takes at once (`Doubling::Now`) is taken whole, and the turns' stage gives way
+    to it (`merge.checkpoint.hold_superseded`). Recovery gives back whatever the record does not name: a stage a stop
+    left part-way, or one held before a kill kept its record (`release_unnamed_checkpoints`,
+    `merge.checkpoint.unnamed_released`). A store lacking the named checkpoint fences the green `ContentMissing`.
+  - **Counters:** `merge.checkpoint.hold_steps`, `hold_longest_step_ns`, `hold_superseded`, `hold_restarted`,
+    `unnamed_released`.
+  - **Tests** (focused, macOS arm64, this Mac, local, 2026-11-21):
+    - `merge_service::checkpoint_hold_tests::a_large_checkpoint_is_held_a_chunk_a_step_with_someone_waiting_and_recorded_by_name`:
+      three 1 MiB files; at least two hold steps a chunk; held whole and decoding; the green rebuilt from it equal.
+      Red with the hold taken whole in its step: "the hold took 1 steps for 4 chunks".
+    - `…::a_checkpoint_stopped_part_way_leaves_the_previous_one_and_the_next_completes`: a warm restart over a held
+      segment, the hold stopped after one chunk staged and the stage published. The first checkpoint stands, held
+      whole; the green is recovered at version 2; the stage is gone; the next checkpoint completes under another name,
+      and the first one's content is given back. Red with recovery's release removed: the stage was still there.
+    - `verbs::tests::a_green_replays_from_its_checkpoint_and_a_corrupt_one_is_fenced`, now with `ContentMissing`.
+    - `slates-cluster`'s `a_lent_hold_made_a_piece_at_a_time_holds_what_the_one_call_holds`.
+    - `slates-anchor`'s `a_segment_from_before_checkpoints_by_reference_is_refused_at_start`.
+  - **Left, piece 2:** the build and the encoding are still one step (52 + 71 ms at 1 GiB), now well inside the
+    watchdog's 1 s window.
+- **Owed:** (b)'s A/B at Z = 20 and 50 ms; the checkpoint's build and encoding sliced (piece 2, above); single keys of up
+  to 13.4 ms sliced (above); w-git's member loop in turns on `fold_identity_step`.
 - **Applied in the same change to** `crates/merge` (`engine`: `fold_identity_step`, `identity_backlog`,
   `identity_folded`; `tests/identity.rs`), `crates/server` (`merge_service`, `git_push`: `shard_pace_env`;
-  `repository` tests), §4.16, GAPS, BENCHMARKS.md.
+  `repository` tests), §4.16, GAPS, BENCHMARKS.md. The checkpoint by name: `crates/db` (`partition::CheckpointRef`,
+  `GreenCheckpoint`, `Op::GreenCheckpointed`, the replay split and the model, cadence and entry tests), `crates/anchor`
+  (`LAYOUT_VERSION` 16 and its refusal test), `crates/cluster` (`ContentHold::stage_lent_piece`), `crates/server`
+  (`merge_service`: `CheckpointHold`, `checkpoint_object`, `checkpoint_bytes`, `release_unnamed_checkpoints`, `held_bytes`;
+  `merge_origin`: `inputs_extent`, `inputs_manifest_archive_of`; `verbs`: the replay and the recovery's release;
+  `daemon`: the identities read; `tests/green_checkpoint.rs`'s retention bound).
 
 
 ### A-818 — A path's history as a persistent piece tree a version, piece 1: the pure module and its oracle (2026-11-21, w-rewrite-ops; main 09:40 PST, A-803 (c); A-793, A-809)

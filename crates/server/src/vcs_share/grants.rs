@@ -212,4 +212,83 @@ mod tests {
       );
     });
   }
+
+  /// A-724 piece 2d (§4.17.5 "Admission": a work admitted against its repository's share, else the room nobody's share
+  /// is using). Do: give two repositories curves (100 and 300 one-window objects) and fetch horizons, make both live,
+  /// and ask each one's room. Expect: each room read from the published grants (counted `vcs_share.by_grants`), at most
+  /// its grant plus the spare (the snapshot slot, divided as before, may bind sooner), so the hot one's room leaves out
+  /// the small one's grant.
+  #[test]
+  fn t_a724_a_contested_room_reads_the_published_grants() {
+    crate::test_store::audit_on_stored_shard("vcs_share-grants", |state| {
+      let (small, hot) = (id(5), id(6));
+      used(state, small, (50, 1), (100, 2_000));
+      used(state, hot, (50, 1), (300, 6_000));
+      let _live = (
+        crate::vcs_share::Live::begin(small),
+        crate::vcs_share::Live::begin(hot),
+      );
+      let before = state
+        .refusals
+        .get(crate::vcs_share::BY_GRANTS)
+        .copied()
+        .unwrap_or(0);
+      let small_room = crate::vcs_share::room(state, small);
+      let hot_room = crate::vcs_share::room(state, hot);
+      assert_eq!(
+        state
+          .refusals
+          .get(crate::vcs_share::BY_GRANTS)
+          .copied()
+          .unwrap_or(0),
+        before + 2
+      );
+      let grants = state.vcs_grants.clone();
+      let (small_grant, hot_grant) = (grants.of(small).unwrap_or(0), grants.of(hot).unwrap_or(0));
+      // Memory binds at most at the grant and the spare; the snapshot slot, divided as before, may bind sooner.
+      assert!(
+        small_room.bytes <= small_grant + grants.spare,
+        "{small_room:?} {grants:?}"
+      );
+      assert!(
+        hot_room.bytes <= hot_grant + grants.spare,
+        "{hot_room:?} {grants:?}"
+      );
+      assert!(
+        hot_room.bytes + small_grant <= grants.room,
+        "the hot repository took the small one's grant"
+      );
+    });
+  }
+
+  /// A-724 piece 2d (no overcommit at a newcomer, w-balance's condition). Do: give one repository a curve and a
+  /// second, live beside it, none (its first work). Expect: the room not read from the grants (`vcs_share.by_grants`
+  /// unmoved) but divided per request as before, so the newcomer is not given all the shard admits.
+  #[test]
+  fn t_a724_a_live_repository_with_no_curve_leaves_the_room_divided_as_before() {
+    crate::test_store::audit_on_stored_shard("vcs_share-grants", |state| {
+      let (curved, newcomer) = (id(7), id(8));
+      used(state, curved, (50, 1), (100, 2_000));
+      state.vcs_usage.answered(&newcomer, Work::Intake, 100, 1);
+      let _live = (
+        crate::vcs_share::Live::begin(curved),
+        crate::vcs_share::Live::begin(newcomer),
+      );
+      let before = state
+        .refusals
+        .get(crate::vcs_share::BY_GRANTS)
+        .copied()
+        .unwrap_or(0);
+      let room = crate::vcs_share::room(state, newcomer);
+      assert_eq!(
+        state
+          .refusals
+          .get(crate::vcs_share::BY_GRANTS)
+          .copied()
+          .unwrap_or(0),
+        before
+      );
+      assert!(room.bytes < state.store.admittable(), "{room:?}");
+    });
+  }
 }
