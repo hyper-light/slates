@@ -293,6 +293,15 @@ impl Step {
       Step::Delete { .. } | Step::Defer { .. } => None,
     }
   }
+
+  /// [`Step::work`], the work lent mutably: its verdict takes its named runs' buffers (A-760, `Green::judge_named`).
+  fn work_mut(&mut self) -> Option<(DbVolumeId, &mut Increment)> {
+    match self {
+      Step::Update { green, work } => Some((*green, work)),
+      Step::Create { record, work, .. } => work.as_mut().map(|work| (record.id, work)),
+      Step::Delete { .. } | Step::Defer { .. } => None,
+    }
+  }
 }
 
 /// What a push holds before it commits, given back if it is refused: the branches made in memory, and the greens whose
@@ -967,13 +976,13 @@ fn plan_delete(
 fn push_planned(
   state: &mut ShardState,
   record: &RepositoryRecord,
-  (steps, parts): (Vec<Step>, EntryParts),
+  (mut steps, parts): (Vec<Step>, EntryParts),
   (held, ahead): (&mut Held, &[crate::held_ahead::HeldAhead]),
   mut stored: Option<Stored<'_, '_>>,
 ) -> Result<Appended, AppendRefused> {
   make(state, &steps, held).map_err(AppendRefused::Changes)?;
   secure(state, &steps, held).map_err(AppendRefused::Changes)?;
-  let verdicts = judge(state, &steps, held).map_err(AppendRefused::Changes)?;
+  let verdicts = judge(state, &mut steps, held).map_err(AppendRefused::Changes)?;
   let made: Vec<VolumeRecord> = steps
     .iter()
     .filter_map(|step| match step {
@@ -1245,24 +1254,41 @@ enum Verdict {
   Before(u64),
 }
 
-/// Each work's verdict, held (`Green::judge`), in the order of the steps (none for a step with no work); or every
-/// work refused.
+/// Counter: the bytes of named runs (A-760) a work still held once an accepted verdict was taken: a verdict that cloned
+/// them rather than took them (`Green::judge` against `Green::judge_named`), a copy of every named text a push brings.
+/// Format: a counter name in the status report.
+pub(crate) const READ_CLONED_BYTES: &str = "repository.push.read_cloned_bytes";
+
+/// Each work's verdict, held (`Green::judge_named`: a work naming its content gives its read runs' buffers to the
+/// verdict, which the commit makes its files with no copy, A-760), in the order of the steps (none for a step with no
+/// work); or every work refused. Before, `Green::judge` cloned every read buffer into the verdict (goal 93, main
+/// 01a20182's ruling of 2026-11-22 ~11:50).
 fn judge(
   state: &mut ShardState,
-  steps: &[Step],
+  steps: &mut [Step],
   held: &mut Held,
 ) -> Result<Vec<Option<Verdict>>, Vec<ChangeRefused>> {
   let mut verdicts = Vec::new();
   let mut refused = Vec::new();
-  for (index, step) in steps.iter().enumerate() {
-    let Some((green, work)) = step.work() else {
+  for (index, step) in steps.iter_mut().enumerate() {
+    let Some((green, work)) = step.work_mut() else {
       verdicts.push(None);
       continue;
     };
     let judgment = state
       .greens
       .get_mut(&green)
-      .map(|mut engine| engine.judge(work));
+      .map(|mut engine| engine.judge_named(work));
+    // An accepted verdict takes the runs' buffers: any the work still holds were cloned. A refused one takes none, and
+    // they go with the work.
+    let kept = (0..work.named.runs.len())
+      .filter_map(|at| work.read_run(at))
+      .fold(0u64, |total, run| {
+        total.saturating_add(u64::try_from(run.len()).unwrap_or(u64::MAX))
+      });
+    if kept > 0 && matches!(judgment, Some(Judgment::Accepted(_))) {
+      state.count(READ_CLONED_BYTES, kept);
+    }
     let why = match judgment {
       Some(Judgment::Accepted(judged)) => {
         verdicts.push(Some(Verdict::Held(Box::new(judged))));

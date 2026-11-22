@@ -2486,3 +2486,35 @@ fn an_increments_record_names_its_texts_not_their_bytes() {
   });
   assert_eq!(encoded.first(), encoded.get(1), "{encoded:?}");
 }
+
+/// Goal 93, A-760's append (main 01a20182's ruling of 2026-11-22 ~11:50: `judge_named` in the append every push shares,
+/// its own landing). Do: land revision 1, then commit revision 2 adding a file of 50,000 bytes, its text stored and
+/// named (A-865). Expect: its text read once (`NAMED_READ_BYTES`), and its verdict taking the read buffer rather than
+/// cloning it (`push::READ_CLONED_BYTES` 0). Failing first: the append judged with `Green::judge`, which clones every
+/// read buffer into the verdict: 50,000 bytes cloned.
+#[test]
+fn a_named_works_verdict_takes_its_read_texts_and_clones_none() {
+  let counted = stored(|| async move {
+    let (svn, _green) = subversion("svn").await;
+    commit((&owner(), svn), first(), None).await.unwrap();
+    let bytes = vec![b'n'; 50_000];
+    let rows = vec![file("/trunk/named", Action::Add, &bytes)];
+    let read = |state: &ShardState, name: &str| state.refusals.get(name).copied().unwrap_or(0);
+    let before = on(|state| {
+      (
+        read(state, super::NAMED_READ_BYTES),
+        read(state, crate::repository::push::READ_CLONED_BYTES),
+      )
+    });
+    commit((&owner(), svn), revision(1, rows, &[&bytes]), None)
+      .await
+      .unwrap();
+    on(|state| {
+      (
+        read(state, super::NAMED_READ_BYTES).saturating_sub(before.0),
+        read(state, crate::repository::push::READ_CLONED_BYTES).saturating_sub(before.1),
+      )
+    })
+  });
+  assert_eq!(counted, (50_000, 0), "(read, cloned)");
+}
