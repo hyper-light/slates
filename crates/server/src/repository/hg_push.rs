@@ -2452,25 +2452,41 @@ fn admitted_its_need(
     return Ok(());
   };
   let held = admitted.saturating_sub(room.left());
-  let keeping = held.saturating_add(intake.bookkeeping());
-  let ceiling = crate::vcs_share::wait::ceiling(state, repository);
-  // What the push must keep past the ceiling can never be taken here; a step's room past it is the step's to wait for.
-  if keeping > ceiling {
-    return Err(PushOutcome::refused(&abort(PAST_CEILING.to_vec())));
-  }
-  let need = keeping.saturating_add(step).min(ceiling);
+  let need = need_of(state, repository, (held, intake.bookkeeping()), step)?;
   if need <= *admitted {
     return Ok(());
   }
-  let mut grown = Admission::new(need);
-  grown
-    .charge(held)
-    .map_err(|_| PushOutcome::refused(&abort(PAST_CEILING.to_vec())))?;
-  *room = grown;
+  *room = grown_to(need, held)?;
   *admitted = need;
   taking.room = need;
   state.count(PUSH_NEED_ADMITTED, 1);
   Ok(())
+}
+
+/// A push's known need: what it holds and what its steps will keep, with `step` for a step's working set, within the
+/// repository's ceiling (what others do not hold); refused, typed, where what it must keep is past the ceiling, since it
+/// could never be taken there. A step's room past the ceiling is the step's to wait for.
+fn need_of(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  (held, bookkeeping): (u64, u64),
+  step: u64,
+) -> Result<u64, PushOutcome> {
+  let keeping = held.saturating_add(bookkeeping);
+  let ceiling = crate::vcs_share::wait::ceiling(state, repository);
+  if keeping > ceiling {
+    return Err(PushOutcome::refused(&abort(PAST_CEILING.to_vec())));
+  }
+  Ok(keeping.saturating_add(step).min(ceiling))
+}
+
+/// An admission of `need` bytes, `held` of them charged first: what the push already holds.
+fn grown_to(need: u64, held: u64) -> Result<Admission, PushOutcome> {
+  let mut grown = Admission::new(need);
+  grown
+    .charge(held)
+    .map_err(|_| PushOutcome::refused(&abort(PAST_CEILING.to_vec())))?;
+  Ok(grown)
 }
 
 /// The intake begun over `changegroup` within `room`, `admitted` the bytes it was last admitted: a begin past its

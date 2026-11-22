@@ -290,14 +290,17 @@ impl Intake {
   /// (`Taker::keep_taken`, `read_of`, `logged_of`). Each revision its node, its kept text and its path; each changeset
   /// its manifest's and its own nodes noted; each manifest its entry, at most one written entry for each
   /// [`LEAST_MANIFEST_LINE`] bytes of its delta and the delta's bytes for their paths; each log its name, a file's its
-  /// path. A step's own working set (its delta, its base, its rebuilt text) is apart: charged to a copy and let go.
+  /// path. A step's own working set (its delta, its base, its rebuilt text) is apart: charged to a copy and let go. Every
+  /// sum saturates, so a count past what a `u64` holds reads as the most there is, past any repository's ceiling, and its
+  /// push is refused, never admitted a wrapped need.
   pub fn bookkeeping(&self) -> u64 {
     let framed = &self.frame.0;
     let each = to_u64(size_of::<Node>().saturating_add(size_of::<KeptText>()));
     let kept = |count: usize, path: u64| to_u64(count).saturating_mul(each.saturating_add(path));
     let changelog = framed.changelog.len();
-    let changesets = kept(changelog, to_u64(CHANGELOG_PATH.len()))
-      .saturating_add(to_u64(changelog).saturating_mul(to_u64(2 * size_of::<(Node, Node)>())));
+    let changesets = kept(changelog, to_u64(CHANGELOG_PATH.len())).saturating_add(
+      to_u64(changelog).saturating_mul(to_u64(size_of::<(Node, Node)>().saturating_mul(2))),
+    );
     let manifests = framed
       .revisions
       .get(framed.manifests.clone())
@@ -307,7 +310,10 @@ impl Intake {
         kept(framed.manifests.len(), to_u64(MANIFEST_PATH.len())),
         |total, placed| {
           let data = placed.data.end.saturating_sub(placed.data.start);
-          let entries = data / LEAST_MANIFEST_LINE + 1;
+          let entries = data
+            .checked_div(LEAST_MANIFEST_LINE)
+            .unwrap_or(data)
+            .saturating_add(1);
           total
             .saturating_add(to_u64(size_of::<ManifestWrites>()))
             .saturating_add(entries.saturating_mul(to_u64(size_of::<(Vec<u8>, Node)>())))
