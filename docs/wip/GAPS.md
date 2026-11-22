@@ -2883,9 +2883,14 @@
 > stream's write end (macOS has no `pipe2`, so std's pipe is made close-on-exec a call later), until the client's
 > 10 s read gives up. RULED (a) and BUILT, A-858: every child the daemon spawns is handed only its three streams
 > (`slates_ipc::confined_spawn`), and the driver reads an exit the watch posted before it was waitable, the second cause
-> the concurrent-spawn test found. Owed: the macos-latest proof of the HTTPv2 propset hang's end and the guard's order
-> (a diag-measurer branch; never on Ada's Macs, main's constraint of 2026-11-22 03:22), and w-lint's Linux and Windows
-> cross-target round. Windows spawns no hooks yet (A-622's Windows part), so it has no seam to change.
+> the concurrent-spawn test found. PROVEN on macos-latest (main 01a20182's CI 45018545878, 2026-11-22, at 00844de07):
+> the session ran 33.57 s, past the propset that hung at 120 s, and the guard's deliberate failure left 0 views mounted.
+> The session then went red on `svn status -u -v --xml`, the test's own: the same 15 entries, the same in every
+> field, in two orders, since stock `svn` reports a directory's children in its working copy's hash order, seeded afresh
+> each run. FIXED in the comparison (w-svn): a status's entries are compared in text order, every other output's as
+> answered (`entries_in_order`; `the_comparison_leaves_status_entry_order_out_and_nothing_else`). Owed: main's rerun
+> on macos-latest, and w-lint's Linux and Windows cross-target round. Windows spawns no hooks yet (A-622's Windows
+> part), so it has no seam to change.
 > **svn replay by stock clients (w-interop, 2026-11-20; A-703):** `svn-matrix.sh` gains `svnrdump dump` and
 > `svnsync initialize/synchronize` over svn://, each compared with the dump stock svnserve 1.15.0 made of the same history
 > (`crates/svn/fixtures/replay`, `EXPECT_RDUMP`, `EXPECT_SYNC`): over the reads fixtures' repository both are
