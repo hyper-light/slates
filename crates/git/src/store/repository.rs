@@ -631,6 +631,21 @@ impl Repository {
     self.depth.limit()
   }
 
+  /// The bytes its reads keep of the objects read lately (`packed::Recent`, git's delta base cache).
+  pub fn recent_bytes(&self) -> u64 {
+    to_u64(self.reading.borrow_mut().recent().bytes())
+  }
+
+  /// Gives back the objects read lately and its read buffers' room (A-860: what a repository gone idle holds of its
+  /// reads is given back, its cache's budget kept for the reads after): the bytes given back.
+  pub fn let_go_recent(&self) -> u64 {
+    let mut reading = self.reading.borrow_mut();
+    let kept = to_u64(reading.recent().bytes());
+    reading.recent().let_go();
+    reading.shrink(0);
+    kept
+  }
+
   /// The longest object its packs hold (A-859): what reading a stored entry's data is held to.
   pub(super) fn largest_object(&self) -> u64 {
     self.largest
