@@ -315,10 +315,11 @@ fn texts_of(
 /// A-680 part 1: do pack the changesets a clone of `states` asks for over its served view, its store's window longer
 /// than every text. Expect exactly the three served changesets, their three manifests and the file revisions they name
 /// (`a`, `b`, and `c` as amended: neither the hidden changeset's `c` nor the secret one's `d`), every text hashing to
-/// its node; the two markers lent when the view was made and each text since lent once: in place, but for the one
-/// manifest the index keeps as its delta against the one before (A-729), rebuilt from its chain and so copied.
+/// its node; the two markers lent when the view was made, each changeset's text since lent once and each manifest's
+/// twice (a step each: planned, then sent): in place, but for the one manifest the index keeps as its delta against the
+/// one before (A-729), rebuilt from its chain and so copied, each time.
 #[test]
-fn a_clone_over_the_view_carries_its_changesets_each_text_lent_once_in_place() {
+fn a_clone_over_the_view_carries_its_changesets_each_text_lent_in_place() {
   let (imported, store) = imported("states");
   let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
     .unwrap()
@@ -360,11 +361,14 @@ fn a_clone_over_the_view_carries_its_changesets_each_text_lent_once_in_place() {
     (b"c", vec![b"c amended\n".to_vec()]),
   ];
   assert_eq!(files, expected);
+  // Each changeset's text lent once and each manifest's twice: once as the changeset naming it is sent, its files
+  // planned, and once as it is sent in its log's order, a step each (main 01a20182's order of 2026-11-22 10:40: a
+  // lent text is the step's, never kept past it).
   assert_eq!(
     view.lends(),
     Lends {
-      in_place: 10,
-      copied: 1
+      in_place: 12,
+      copied: 2
     }
   );
 }
@@ -1235,7 +1239,7 @@ fn carried(packed: &[u8]) -> BTreeSet<(Vec<u8>, Node, Node)> {
 
 /// A-745 (the link walk over a real index). Do: import each of `fixtures/state`'s repositories and clone each view
 /// that serves every changeset its changelog holds, by its links (`changegroup`, walking the manifest log and the file
-/// logs from row to row) and by the changesets that name each revision (`named_changegroup`, 7.2's slow path). Expect
+/// logs from row to row) and by the changesets that name each revision (`getbundle::Named`, 7.2's slow path). Expect
 /// the two to carry the same revisions with the same links, and at least one view walked by its links.
 #[test]
 fn a_full_clone_walked_by_its_links_carries_what_the_namers_name() {
@@ -1751,4 +1755,96 @@ fn a_batch_of_lookups_reads_the_tags_once() {
     String::from_utf8(answer).unwrap(),
     "1 c3daaa7ea5f5d20902f12c53611fefce7e15cefa\n;0 unknown revision 'nope'\n"
   );
+}
+
+/// Main 01a20182's order of 2026-11-22 10:40 (CI 45037561866: a stream clone of Mercurial's 57,054-changeset history
+/// spun its shard past a second, the changelog's nodes gathered for one ask in one step). Do: build a line of five
+/// times [`crate::render::rows_a_step`] changesets; stream it whole, and again a step at a time. Expect the same bytes;
+/// and at least four steps that only gather an ask's nodes (no bytes written, nothing asked yet), so no step reads more
+/// than a content window's worth of rows. Red before: none, the whole changelog gathered in one step.
+#[test]
+fn a_streams_ask_for_a_long_logs_rows_is_gathered_a_window_a_step() {
+  use super::super::stream::stream_out;
+  let probe = build(&[], false);
+  let long = usize::try_from(crate::render::rows_a_step(&probe.store) * 5).unwrap();
+  let line: Vec<Made> = (0..long)
+    .map(|rev| Made {
+      parents: [rev.checked_sub(1), None],
+      root: None,
+      marker: None,
+      bookmark: false,
+    })
+    .collect();
+  let built = build(&line, false);
+  let view = view_of(&built, true);
+  let mut whole = Vec::new();
+  stream_out(
+    &view,
+    &mut whole_texts(&built.index, &built.store),
+    &mut room(),
+    &mut whole,
+  )
+  .unwrap();
+  let mut streaming = crate::render::Streaming::default();
+  let mut source = whole_texts(&built.index, &built.store);
+  let (mut stepped, mut gathering) = (Vec::new(), 0);
+  loop {
+    crate::render::answer_want(&mut streaming, &mut source).unwrap();
+    let before = stepped.len();
+    let more = streaming
+      .step(&built.index, &built.store, &mut room(), &mut stepped)
+      .unwrap();
+    if !more {
+      break;
+    }
+    if stepped.len() == before && streaming.wants().is_none() {
+      gathering += 1;
+    }
+  }
+  assert_eq!(stepped, whole);
+  assert!(
+    gathering >= 4,
+    "{gathering} steps gathered a {long}-changeset log's ask"
+  );
+}
+
+/// Main 01a20182's order of 2026-11-22 10:40 (CI 45037561866: a clone of some heads of Mercurial's 57,054-changeset
+/// history made its changesets' and manifests' groups whole in its walk's begin, 4.1 s in a debug build, and its shard
+/// was killed for spinning). Do: over `states`' served view, begin the walk of a pull whose client holds the first
+/// changeset (by the changesets that name each revision, not the links), then step it to its end. Expect the begin to
+/// lend no text; no step to lend more than two (a changeset's and its manifest's); and the changegroup the one the
+/// oracle makes whole. Red before: the begin lent every missing changeset's and manifest's text.
+#[test]
+fn a_pull_walked_by_its_changesets_lends_no_text_in_its_begin_and_two_at_most_a_step() {
+  let (imported, store) = imported("states");
+  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
+    .unwrap()
+    .answering_from_its_texts();
+  let lent = |view: &Indexed<'_>| {
+    let lends = view.lends();
+    lends.in_place + lends.copied
+  };
+  let outgoing = pull::Outgoing {
+    heads: vec![view.count() - 1],
+    common: vec![0],
+    missing: (1..view.count()).map(|rev| rev..rev + 1).collect(),
+  };
+  let before = lent(&view);
+  let mut walk =
+    super::super::getbundle::Walk::begin(&view, &outgoing, Version::V03, &mut room()).unwrap();
+  assert_eq!(lent(&view), before, "the begin lent no text");
+  let (mut out, mut most) = (Vec::new(), 0);
+  loop {
+    let at = lent(&view);
+    let more = walk.step(&view, &mut room(), &mut out).unwrap();
+    most = most.max(lent(&view) - at);
+    if !more {
+      break;
+    }
+  }
+  assert!(most <= 2, "a step lent {most} texts");
+  let whole =
+    super::super::getbundle::named_changegroup_whole(&view, &outgoing, Version::V03, &mut room())
+      .unwrap();
+  assert_eq!(out, whole);
 }

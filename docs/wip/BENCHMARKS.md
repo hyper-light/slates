@@ -17241,6 +17241,63 @@ ubuntu-24.04-arm:
 - Stock runner accounts grant no `RLIMIT_RTPRIO` at all, so even the arms' best case exists only under an
   administrator's grant.
 
+## 84a on Linux: EEVDF's requested slice for the shards and the client's park (arm E), measured and rejected (w-perf; 2026-11-22)
+
+**The arm** (E 0b568ac91 on A d2c6635a2, branch `agents/w-perf-84a-arm-e`, never main). It uses no privilege and no
+real-time class.
+- A fair thread may ask its own slice through `sched_setattr`'s `sched_runtime` (Linux 6.12 and later). The kernel's
+  unprivileged checks of a fair policy judge its nice alone (`user_check_sched_setscheduler`), and `sched_getattr`
+  reports the slice back. With `PREEMPT_SHORT` on, a waking task with a shorter slice may cancel the running one's
+  `RUN_TO_PARITY` protection.
+- `slates_machine::fair_slice`:
+  - a tracking runtime's shards ask a slice of their idle window, R9's floor (50 µs; the kernel held 100 µs, its least);
+  - the client's synchronous reply wait asks the daemon's published window for each park, its whole scheduling put
+    back after.
+
+**The run** (45056790029, the stock runner account, no grant; plain A and E interleaved, 5 loaded and 3 quiet rounds;
+stamped builds A_diag2 7f9a3ff66 and E_diag 58f792741 interleaved, 3 loaded rounds).
+- E's tests pass, and A's red is confirmed.
+- The client's sliced parks were taken 5,827 a run, with none skipped and no restore refused.
+- Each cell is a round's median, µs.
+
+ubuntu-latest:
+
+| | A | E |
+|---|---|---|
+| loaded accept p99 | 3242 · 2921 · 3993 · 2889 · 2664 | 1820 · 1642 · 1342 · 1282 · 1672 |
+| loaded accept p999 | 6082 · 4746 · 3996 · 3335 · 3210 | 1950 · 1844 · 2067 · 1992 · 1962 |
+| loaded conflict p99 | 3230 · 3999 · 3999 · 4001 · 3016 | 1291 · 1287 · 1281 · 1352 · 4000 |
+| loaded conflict p999 | 4204 · 5749 · 5516 · 6144 · 3333 | 1936 · 1824 · 1900 · 1936 · 4016 |
+| load, M spinner turns/s | 127-138 | 128-137 |
+| quiet accept p50 | 88 · 88 · 89 | 124 · 112 · 123 |
+| R9 spinning p99 | 59 · 68 · 69 | 84 · 72 · 71 |
+| stamped: p999 tail's queued hop | 3056 · 3004 · 3089 | 759 · 995 · 778 |
+
+ubuntu-24.04-arm:
+
+| | A | E |
+|---|---|---|
+| loaded accept p99 | 3995 · 395 · 3993 · 2995 · 404 | 664 · 345 · 3997 · 392 · 354 |
+| loaded accept p999 | 4994 · 3994 · 5992 · 4994 · 1336 | 1630 · 360 · 5996 · 1091 · 391 |
+| loaded conflict p99 | 843 · 868 · 343 · 3999 · 3999 | 3999 · 328 · 342 · 798 · 875 |
+| loaded conflict p999 | 2765 · 1988 · 1792 · 5001 · 5999 | 5000 · 732 · 963 · 4002 · 2849 |
+| load, M spinner turns/s | 360-363 | 359-363 |
+| quiet accept p50 | 114 · 108 · 111 | 119 · 117 · 115 |
+| R9 spinning p99 | 85 · 83 · 86 | 90 · 88 · 89 |
+| stamped: kick -> run p50 / p99 | 920-922 / 2987-2990 | 915-916 / 998-999 |
+| stamped: p999 tail's client wake | 59 · 60 · 60 | 983 · 989 · 985 |
+
+**Rejected, and the floor measured.**
+- E cuts the loaded tail with the neighbours' share level: x86 p999 from 3.2-6.1 to about 1.9 ms, and arm in 4 of 5
+  rounds.
+- But a wakeup's p99 pins at one tick: kick -> run 998-999 µs, and the client's wake 983-989 µs. Under
+  `CONFIG_PREEMPT_LAZY` at `HZ=1000` a woken fair task still waits for the next tick.
+- A loaded edit and merge has a shard hop and the client's wake, so it floors at about 1.3-2.0 ms p99 on x86, and a
+  bad round still reaches 4 ms on arm.
+- It also costs the quiet path on x86: quiet accept p50 +30-40%, R9's p99 +15-20%, and more system CPU.
+- In the fair class on these kernels, 84a's 1 ms loaded bar is below the tick: unreachable by any arm that keeps the
+  daemon and the client fair.
+
 ## The client's reply wait, arm C: measured and rejected, B (A-799) stays (85a; g222's last step, recorded by w-provision-gate; 2026-11-21)
 
 **The run.** GitHub run 44884335146 (branch `diag-measurer-g222-20`, "g222 A/B/C of the client reply wait on every

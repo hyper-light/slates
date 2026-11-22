@@ -590,7 +590,7 @@ pub(crate) type StreamCount = (&'static str, fn(&UploadCounters) -> u64);
 /// Counters: the paths a fetch's stream sent its objects by (`slates_git::store::UploadCounters`, A-859; main 01a20182's
 /// order of 2026-11-22 04:53), counted on its shard as each step of its answer writes, so the daemon's status says which
 /// path a clone's objects took, a clone cut short too. Format: each a counter name and the stream's count it adds.
-pub(crate) const STREAM_COUNTED: [StreamCount; 12] = [
+pub(crate) const STREAM_COUNTED: [StreamCount; 15] = [
   ("vcs_store.git_upload.parts_copied", |c| c.parts_copied),
   ("vcs_store.git_upload.entries_copied", |c| c.entries_copied),
   ("vcs_store.git_upload.headers_rewritten", |c| {
@@ -607,6 +607,11 @@ pub(crate) const STREAM_COUNTED: [StreamCount; 12] = [
   ("vcs_store.git_upload.reuse_refused", |c| c.reuse_refused),
   ("vcs_store.git_upload.reuse_no_entry", |c| c.reuse_no_entry),
   ("vcs_store.git_upload.reuse_unread", |c| c.reuse_unread),
+  ("vcs_store.git_upload.reuse_crc_missed", |c| {
+    c.reuse_crc_missed
+  }),
+  ("vcs_store.git_upload.reuse_rebuilt", |c| c.reuse_rebuilt),
+  ("vcs_store.git_upload.backward_reads", |c| c.backward_reads),
 ];
 
 /// A-639's stream as upload-pack's pack source on the owner shard (the module doc): each turn on the shard's clock, at

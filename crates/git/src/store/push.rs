@@ -31,6 +31,13 @@ use crate::objects::commit::Commit;
 use super::naming::NameRefused;
 use super::packed::{self, Base, Bases, InPack, PackSource, PackedRefused, Scratch};
 
+#[cfg(test)]
+std::thread_local! {
+  /// Tests only (A-864's hostile red): the next entry's kept CRC32 made to disagree with its raw bytes by one bit, as a
+  /// bit flipped in its stored bytes would, taken once.
+  pub(crate) static MISKEEP_NEXT_CRC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The identity the push's own pack is read under ([`PackSource`] for [`Push`]): it is held by the push, not the content
 /// store, so no store identity names it.
 const OWN_PACK: ContentId = ContentId([0; 32]);
@@ -175,6 +182,10 @@ pub struct Push {
   pack: Vec<u8>,
   /// The objects of `pack`, by name. One entry an object: what names it to where it lies.
   placed: BTreeMap<ObjectId, Placed>,
+  /// Where each entry of `pack` begins, every one its source sent, those the repository held already among them, and
+  /// the object it holds (A-864): what tells an entry's raw length (to the next entry, or the pack's trailer) and an
+  /// offset delta's base, as git's pack index does.
+  entries: BTreeMap<u64, ObjectId>,
   /// The pack put in the content store as one content by the push's staging, a window a unit (A-722's record v4: rows
   /// name their objects by where they lie in it, never a second copy inflated): its identity and length, held by the
   /// push until its rows hold it.
@@ -199,6 +210,7 @@ impl Push {
       staged: None,
       pack: Vec::new(),
       placed: BTreeMap::new(),
+      entries: BTreeMap::new(),
       stored_pack: None,
       largest: 0,
       reading: RefCell::new(Scratch::default()),
@@ -271,6 +283,7 @@ impl Push {
       (None, Some((number, content, _))) => Some((number, content)),
       (None, None) => None,
     };
+    self.entries.insert(offset, id);
     if let Some(held) = again {
       return if held == (number, identity) {
         Ok((id, Admitted::Again))
@@ -551,6 +564,41 @@ impl Push {
         .object(id.as_bytes())
         .map(|(_, content, _)| StoredAt::Whole(content)),
     }
+  }
+
+  /// Notes that the entry beginning at `offset` of the push's pack holds `id`, an object the repository holds already and
+  /// the push passes over (A-864): so the entry before it is known to end there, and a delta against it is named.
+  pub fn entry_at(&mut self, offset: u64, id: ObjectId) {
+    self.entries.insert(offset, id);
+  }
+
+  /// What a row keeps of placed object `id`'s entry in the push's pack (A-864, `rows::PackedRow`): its raw length, to the
+  /// next entry or the pack's trailer; the CRC32 of those raw bytes; and for a delta, the object it is a delta against
+  /// (an offset delta's by the entry it names, a reference delta's by its name). None for an object not placed, or an
+  /// entry whose header cannot be read, which a fetch then encodes.
+  pub(crate) fn entry_of(&self, id: &ObjectId) -> Option<(u64, u32, Option<ObjectId>)> {
+    let offset = self.placed.get(id)?.offset;
+    let trailer =
+      crate::to_u64(self.pack.len()).checked_sub(crate::to_u64(self.format.raw_len()))?;
+    let end = self
+      .entries
+      .range(offset.saturating_add(1)..)
+      .next()
+      .map_or(trailer, |(next, _)| *next);
+    let raw = self
+      .pack
+      .get(usize::try_from(offset).ok()?..usize::try_from(end).ok()?)?;
+    let mut admission = Admission::new(u64::MAX);
+    let (header, _) = crate::entry::read(raw, offset, self.format, &mut admission).ok()??;
+    let base = match header.representation {
+      crate::entry::Representation::Whole(_) => None,
+      crate::entry::Representation::OfsDelta { base } => Some(*self.entries.get(&base)?),
+      crate::entry::Representation::RefDelta { base } => Some(base),
+    };
+    let crc = crc32fast::hash(raw);
+    #[cfg(test)]
+    let crc = crc ^ u32::from(MISKEEP_NEXT_CRC.with(|next| next.replace(false)));
+    Some((end.saturating_sub(offset), crc, base))
   }
 
   /// The longest object of the push's own pack.

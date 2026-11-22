@@ -60931,6 +60931,43 @@ owed.
   which may go once the node's store holds the bytes is 2b's.
 
 
+### A-864 — A pushed entry is checked by the CRC32 its row keeps, and sent on with no object read (2026-11-22, w-git; main 01a20182's r17 of 07:08 and ruling of 07:31 PST, goal 93; A-859, A-722 record v4)
+
+- **Why.** r17: git/git's clone over HTTP sent 147,449 pushed entries as they lay (`reused_whole` 84,439, `reused_deltas`
+  63,010, none encoded), yet was killed at 120 s. Each reused entry was rebuilt to be checked: inflated to find where it
+  ends (its row kept only where it begins), an offset delta's base reconstructed and named to learn its id, then the
+  object named (a delta's reconstructed, its delta applied and compared): two reconstructions, an inflate and a SHA-1 an
+  object, about what encoding it costs. The encoding made ahead met a further 8,505 `reuse_unread`: an offset delta
+  whose base lies in the same pushed pack but another version, which its table of this version's offsets did not hold.
+- **Change.** As a push is staged, each placed object's row keeps what git's pack index keeps of its entry and its base
+  (`rows::PackedRow`, under the row's `IN_PACK` mark): where the entry begins, its raw length (to the next entry or the
+  pack's trailer, every entry the source sent noted by `Push::entry_at`, those the repository held already among them),
+  the CRC32 of its raw bytes, and for a delta the position of the object it is a delta against. A fetch's stream and the
+  encoding then send the entry on by these alone: its header read, the CRC32 of its raw bytes checked against the kept
+  one, its data copied, a delta's base by the position its row names (placed first where it is still wanted, and of any
+  version). No object is read. A CRC32 miss rebuilds the object to check it as before (`reuse_crc_missed`,
+  `reuse_rebuilt`), as git's `write_no_reuse_object` stands behind its CRC check. git's own bar is lower: upload-pack's
+  `pack-objects --stdout` copies a reused entry with no check, the client's `index-pack` verifying it
+  (`builtin/pack-objects.c` at f7de81456, lines 664-688, read by main). No reader of an earlier row layout is kept (the
+  stores are pre-release, banned item 7): a row without the mark is an object held whole, never an old row.
+- **Tests.** `slates-git` `store::tests::packed::a864_a_clone_sends_each_pushed_entry_on_by_its_kept_crc_rebuilding_none`
+  (stock git's captured `create` push landed and cloned: 3 of 3 sent by CRC32, none rebuilt; red: 3 rebuilt) and
+  `a864_an_entry_whose_crc_misses_is_rebuilt_and_the_clone_is_whole` (its first entry's kept CRC32 one bit off, as a bit
+  flipped in its stored bytes leaves it: one missed and rebuilt, the clone whole); `an_object_row_reads_back_and_a_hostile_one_is_refused`
+  (a row's entry read back); `slates-server` `git_push::tests::t_a859_a_clone_of_a_deltified_push_sends_its_entries_as_they_lie`
+  (none rebuilt). A bit flipped in a stored entry's bytes themselves leaves no copy to rebuild it from: the rebuild's
+  check refuses it and the answer refuses typed, never sending it.
+- **Piece 1, the loose stage in pack order** (main 01a20182's ruling of 2026-11-22, ahead of bounded residency). The
+  loose stage met objects by position (type, then id), so its reads jumped about each pack, every window read many
+  times. Now its objects are first read into an order (`Stage::Order`, a row a unit; three words an object charged to
+  the request's admission: a pack's ordinal, an offset and a position, 24 bytes, 3.6 MB for git/git's 150,000) and
+  sorted by pack and offset, those held whole last by position: each pack is read front to back, as git writes the
+  entries it reuses, an offset delta's base always before it, each window wanted once. Counted `backward_reads`.
+  `git_push::tests::t_a859_a_clone_of_a_deltified_push_sends_its_entries_as_they_lie`: 0 backward reads (88 in position
+  order), its streamed clone 17,299 bytes, the pushed pack's own, in 175 turns where 403 went before.
+- **Owed.** main's git/git whole round: the clone within PATIENCE, the encoding's `reuse_unread` 0. Pieces 2 and 3: a
+  turn's windows brought back ahead of it and let go behind it, residency at its peak a turn's windows.
+
 ### A-865 — A Subversion increment names its stored texts (A-760), and a recovery brings back the names its content store lacks (2026-11-22, w-svn; main 01a20182's rulings of 11:05, ~11:35 and ~11:50 PST, goal 93, P7 finding (2); A-760, A-862, A-863, C2 stage C)
 Applied in the same change to:
 - `crates/server/src/repository/svn_commit.rs`: `Building::insert` names a text stored in the content store as a whole
