@@ -485,3 +485,15 @@
   a_mercurial_push_larger… and a_mercurial_stream_clone_larger…), failing before and after merging main.
   Left (GAPS): atomic pushes' moves meet no base among each other; a fetch's plan does not follow a base. NEXT: bug (1)
   (a fetch cut short while the encoding runs), after the file split with w-balance in writing.
+- 2026-11-22 ~01:40 PST: A-855 (bug 1) LANDED 51e280aba (merge 81dc7ca3b). Cause measured: each edge admitted an
+  answer min(request room, shard room), the request room one client region = 32 slots x 2 x 4 KiB = 256 KiB (Studio-2
+  anchor log), shards with GiBs free; the walk's tables are ~148-165 KB for 506-1,019 tags of a line (unit probes), more
+  for git/git's history, so its clone outgrew 256 KiB -> PastAdmission after `packfile` -> abort. Fix: the answer is
+  admitted its repository's shard room (HTTP and SSH; the request body still the edge room); a refusal past it before
+  the pack begins is held (Answer::holding/held/written/skip_written/give_up), the HTTP edge makes it again in a wider
+  room passing over what it wrote (counted vcs_http.git.answered_again), gives up only past OBSERVE_BUDGET_NS.
+  Reds: daemon_edge a_clone_of_git_gits_many_refs… (quarter region, red: cut), a_fetch_past_its_room_waits… (red: ERR);
+  slates-git upload::tests::clone::a_clone_held_past_its_room…. Focused: slates-git upload+negotiation 120/120;
+  slates-server vcs_http/vcs_ssh/vcs_store::upload 166 pass + the 3 hg daemon_edge tests failing before this change too.
+  Left (GAPS): SSH edge's wait (gives up at once); a refusal after the pack began still cuts. NEXT (main 00:31 ruling):
+  encode_behind's memory (2.1 GB with no client), red first.
