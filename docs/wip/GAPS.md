@@ -508,6 +508,19 @@
 >     7.2 streams the imported repository and verifies it clean.
 > - The two recovery tests that polled a register-held import record by hand are gone with that path; the restart test
 >   holds the run's recovery.
+> **A stock client's push of a long history refused past its one admission (2026-11-22, w-hg; main 01a20182's order of
+> 03:03, w-interop's ubuntu find: `Delta { log: Manifests, .. PastAdmission { asked: 73365, left: 50646 } }`, the push's
+> own earlier deltas having spent it). IN FLIGHT.**
+> - Part 1 BUILT: a refusal past its admission leaves the intake where it was, so the step is taken again whole once the
+>   room grows. `push::intake` `keep_taken` charges everything to a trial of the admission before it keeps the revision
+>   and notes it after (`Taker::read_of` / `apply_read`, `logged_of` / `note_logged`); before, a charge after the keep
+>   refused with the revision already kept, and its retake passed it over unnoted. `Refused::past_admission` names
+>   every such refusal (a charge, the framing, a delta's text, the keeping's room). Held by
+>   `push::intake::tests::a_step_refused_past_its_admission_is_taken_again_whole_in_a_grown_room` (rooms of a quarter,
+>   a half and all but a byte of what the push holds; red with the charges after the keep: 20 kept for 21).
+> - Part 2, next: the push's driver (`hg_push::take_sliced`) waits for room under w-git's shared `vcs_share::RoomWait`
+>   (main's ruling: one wait for git and hg) and takes the step again in the room it gives; a piece past the most the
+>   repository could ever be lent is refused typed.
 > **A push's work counted a file revision's metadata markers as bytes (2026-11-22, w-hg; w-interop's find, ubuntu,
 > `hg push --new-branch -f -r 2000` of hg's own history refused `LengthDiffers { said: 10101, given: 10097 }` on
 > `hgext/hbisect.py`). FIXED.** 2a's `IndexHeld::file_bytes_len` (d93f98369) took a file revision's bytes as its text's

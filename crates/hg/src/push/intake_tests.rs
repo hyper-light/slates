@@ -1024,3 +1024,89 @@ fn a_revision_longer_than_a_window_is_taken_a_window_a_step() {
   assert_eq!(large.spread, 0);
   assert_eq!(small.kept, large.kept);
 }
+
+/// Whether `refused` is the intake past its admission ([`Refused::past_admission`]).
+fn past_admission(refused: &Refused) -> bool {
+  refused.past_admission().is_some()
+}
+
+/// `part` taken a step at a time within one admission of `first` bytes, as a push's slices take it; each step refused
+/// past its admission taken again in an admission grown by `first`, carrying what the push already holds (what the
+/// shared room wait gives an intake, main 01a20182's ruling of 2026-11-22 03:03): the fork, what was brought, and the
+/// steps refused and taken again.
+fn intake_growing(
+  part: &ChangegroupPart,
+  (index, store): (&mut HgIndex, &mut ContentStore),
+  first: u64,
+) -> (HgIndex, Intaken, u64) {
+  let mut admitted = first;
+  let mut retaken = 0u64;
+  // The framing first: nothing is held before it, so a begin past its admission begins again in a grown room.
+  let (mut intake, mut admission) = loop {
+    let mut admission = Admission::new(admitted);
+    match Intake::begin((part.version, &part.payload), index, store, &mut admission) {
+      Ok(intake) => break (intake, admission),
+      Err(refused) => {
+        assert!(
+          past_admission(&refused),
+          "only past its admission: {refused:?}"
+        );
+        admitted += first;
+        retaken += 1;
+      }
+    }
+  };
+  loop {
+    match intake.step(&part.payload, store, &mut admission) {
+      Ok(Stepped::Store) => intake.answer_from_fork(store),
+      Ok(stepped) if more(&stepped) => {}
+      Ok(_) => break,
+      Err(refused) => {
+        assert!(
+          past_admission(&refused),
+          "only past its admission: {refused:?}"
+        );
+        let held = admitted - admission.left();
+        admitted += first;
+        admission = Admission::new(admitted);
+        admission.charge(held).unwrap();
+        retaken += 1;
+      }
+    }
+  }
+  let (fork, intaken) = finished(intake);
+  (fork, intaken, retaken)
+}
+
+/// Main 01a20182's order of 2026-11-22 03:03 (w-interop's find on ubuntu: stock 7.2's push of hg's whole history
+/// refused `Delta { log: Manifests, .. PastAdmission { asked: 73365, left: 50646 } }`, the push's own earlier deltas
+/// having spent its one admission). Do: take the stock changegroup once within room enough and note what it held; then
+/// take it within a quarter, a half and all but a byte of that, each step refused past its admission taken again in a
+/// grown admission. Expect each to end with the same rows and the same brought as the take with room enough, at least one
+/// step taken again for each, and every refusal one past the admission: a step refused leaves the intake where it was.
+#[test]
+fn a_step_refused_past_its_admission_is_taken_again_whole_in_a_grown_room() {
+  let part = stock();
+  let mut whole_store = store();
+  let mut empty = HgIndex::new();
+  let mut ample = Admission::new(1 << 30);
+  let (mut whole_fork, whole_brought, _) =
+    intake(&part, &mut empty, &mut whole_store, &mut ample).unwrap();
+  let whole_rows = rows(&mut whole_fork, &whole_store);
+  let held = (1u64 << 30) - ample.left();
+  for first in [held / 4, held / 2, held - 1] {
+    let mut store = store();
+    let mut empty = HgIndex::new();
+    let (mut fork, brought, retaken) = intake_growing(&part, (&mut empty, &mut store), first);
+    assert!(retaken > 0, "a room of {first} for {held} refused a step");
+    assert_eq!(
+      rows(&mut fork, &store),
+      whole_rows,
+      "the rows of room enough, room {first}"
+    );
+    assert_eq!(
+      brought, whole_brought,
+      "what room enough brought, room {first}"
+    );
+  }
+}
