@@ -1218,6 +1218,13 @@ fn make_dir_through_drive(path: &str) -> std::io::Result<()> {
   std::fs::create_dir(path)
 }
 
+/// Renames a file over another through the mounted drive, as [`write_through_drive`] writes: a volume in RAM, never the
+/// disk (R1).
+#[allow(clippy::disallowed_methods)]
+fn rename_through_drive(from: &str, to: &str) -> std::io::Result<()> {
+  std::fs::rename(from, to)
+}
+
 /// The components of a kernel name of exactly `units` UTF-16 units (each with its leading `\`), each within WinFsp's
 /// component limit; a directory chain shared by every shorter name, so a ladder of lengths reuses it.
 fn long_components(units: usize) -> Vec<String> {
@@ -2493,6 +2500,31 @@ fn an_overlay_of_a_windows_directory_keeps_its_files_read_only_state_and_attribu
   cmd(&["rmdir", "/S", "/Q", &base]);
 }
 
+/// A green seeded with `f` (three lines, accepted) and a work over it: the green and the work.
+fn green_seeded_with_a_work(
+  client: &mut slates_client::Client,
+) -> (slates_client::VolumeId, slates_client::VolumeId) {
+  let green = client.create_green("winfsp-green", false).unwrap();
+  let (seed, _) = client.create_work(green, "winfsp-seed").unwrap();
+  client.edit(seed, "f", 0, 0, b"one\ntwo\nthree\n").unwrap();
+  assert!(matches!(
+    client.submit(seed).unwrap(),
+    slates_client::Submitted::Accepted(_)
+  ));
+  let (work, _) = client.create_work(green, "winfsp-work").unwrap();
+  (green, work)
+}
+
+/// Saves `f` under the drive's `root` as an editor does: the green's bytes read, the whole new content written to a
+/// temporary beside it, and the temporary renamed over it.
+fn save_as_an_editor_does(root: &str) {
+  let file = format!("{root}f");
+  assert_eq!(std::fs::read(&file).unwrap(), b"one\ntwo\nthree\n");
+  let temp = format!("{root}.f.swp");
+  write_through_drive(&temp, b"one\nTWO\nthree\n").unwrap();
+  rename_through_drive(&temp, &file).unwrap();
+}
+
 /// A-774 C1 (a work mounts and works through WinFsp). Do: through the SDK seed a green with `f` = "one\ntwo\nthree\n"
 /// and make a work over it; mount the work at a drive with `slates mount`; through Windows read `f`, save it as an
 /// editor does (the whole new content written to a temporary beside it, renamed over it); unmount; submit the work with
@@ -2511,14 +2543,7 @@ fn a_work_mounted_through_winfsp_saves_and_its_submit_lands_the_save() {
   )
   .get();
   let mut client = slates_client::Client::connect(&instance, deadlines).unwrap();
-  let green = client.create_green("winfsp-green", false).unwrap();
-  let (seed, _) = client.create_work(green, "winfsp-seed").unwrap();
-  client.edit(seed, "f", 0, 0, b"one\ntwo\nthree\n").unwrap();
-  assert!(matches!(
-    client.submit(seed).unwrap(),
-    slates_client::Submitted::Accepted(_)
-  ));
-  let (work, _) = client.create_work(green, "winfsp-work").unwrap();
+  let (green, work) = green_seeded_with_a_work(&mut client);
   let id: String = work
     .bytes
     .iter()
@@ -2530,11 +2555,7 @@ fn a_work_mounted_through_winfsp_saves_and_its_submit_lands_the_save() {
   assert_eq!(code, 0, "mount: {err}");
   let root = format!("{drive}\\");
   wait_ready(&root);
-  let file = format!("{root}f");
-  assert_eq!(std::fs::read(&file).unwrap(), b"one\ntwo\nthree\n");
-  let temp = format!("{root}.f.swp");
-  std::fs::write(&temp, b"one\nTWO\nthree\n").unwrap();
-  std::fs::rename(&temp, &file).unwrap();
+  save_as_an_editor_does(&root);
   let (code, _, err) = run(&instance, &["unmount", &drive]);
   assert_eq!(code, 0, "unmount: {err}");
   let verdict = client.submit(work).unwrap();
