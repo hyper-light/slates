@@ -346,6 +346,16 @@
 > - Siblings, git's (main routes): `git_hooks.rs` (`within_budget(state, room, ..)` for a push's seal) and
 >   `vcs_store.rs`'s `restage_turn` (`stage_room`) and `SealingPush::turn` (`self.room`) lend rooms that may be the
 >   whole admittable; each grows the arena by it. A lend should name its step's bytes.
+>   Measured (g227, 2026-11-21, main's piece; Studio-4, debug, `audit_on_stored_shard`, pool 12.87 GB). These siblings
+>   lend a room bounded by the push, not the shard's room. A push's seal (`SealingPush::turn`, whose `stage_room` is
+>   `restage_turn`'s too) lent 18,564 bytes a turn for 64 files and 1,139,460 for 4,096 files. The arena grew by
+>   8,589,934,592 bytes on the first turn either way: one pool extent, whatever the lend. So "grown < pool" holds
+>   before any change (8.6 of 12.9 GB), no red can be written to it, and a smaller lend would not change the growth.
+>   No change made. `git_hooks.rs`'s seal lends `seal_len`, the seal's own length, likewise bounded (not measured).
+>   Found, not worked: the arena grows a whole extent at a time (`content_pool::ContentPool::claim`, power-of-two
+>   parts of a partition's slice), so the first lend past a shard's free capacity takes an extent of up to 8 GiB of
+>   a 12.9 GB pool, however few bytes it needs. w-hg's merge, lent `admittable()`, took extent after extent until
+>   the pool was gone.
 
 > **Goal 93 perf, hg serve (2026-11-21, w-perf; main's order 00:22 and ruling 01:05).** Found by a profile of a
 > one-changeset pull of Mercurial's history (24.95 s) and a stream clone (288 s): (1) every lookup in a
