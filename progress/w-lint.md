@@ -441,3 +441,6 @@
 - VCS lane, Windows (jupiter, 6cbbe5ee2, AWS_LC_SYS_PREBUILT_NASM=1; NO_ASM wants CMake): slates-git 589/0 (4 ignored),
   slates-hg 402/0, slates-svn 584/0 (3 ignored) + fsfs_view 5 + propfind_allocations 1, slates-vcs 110/0. Server
   vcs_/git_/hg_/svn_ didn't compile on Windows (A-838's test); fixed in 33e41f583, rerun next. Linux: r46 running.
+- VCS lane, Windows server (33e41f583, 4 threads): the process died with exit 4 after 4 tests. The watchdog wedged
+  t_a767_c5's git push task; alone it passes in 0.81 s, so it's on w-bugs (concurrency in one process, not load).
+  No server count on Windows.
