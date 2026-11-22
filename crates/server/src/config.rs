@@ -790,7 +790,7 @@ impl DaemonConfig {
 
   /// Derived (A-789): the content pool extents an anchor may hold for this daemon across a restart on Windows, where
   /// each extent is a section of its own: every extent the layout can name, `partitions × POOL_EXTENTS_PER_PARTITION`
-  /// (at most one per bit of a slice's arena length in units, `content_pool::arena_parts`).
+  /// (`content_pool::arena_parts` cuts a slice into at most that many parts).
   pub fn held_extent_bound(&self) -> usize {
     usize::from(self.geometry.partitions.max(1))
       .saturating_mul(slates_anchor::layout::POOL_EXTENTS_PER_PARTITION)
