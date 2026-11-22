@@ -1867,13 +1867,16 @@ fn a_large_commit_measured() {
 /// P7 of Ada's close list (A-772's daemon peak against the dump; a measurement, not a gate). Do: start an anchor whose
 /// daemon holds a changeset store, create a Subversion repository, and import the dump `SLATES_SVN_IMPORT_DUMP` names
 /// through the CLI (`slates repository import`), sampling the daemon's resident bytes while it runs; then ask the daemon
-/// its memory by kind (`slates status --memory`). Expect nothing: print the import's answer and seconds, the daemon's
-/// resident bytes before and at its peak against the dump's bytes, and the memory report's lines. The real daemon
-/// binary, so its own allocator (a large allocation a mapping of its own, given back when freed), not a test binary's.
-/// With `SLATES_SVN_IMPORT_HOLD` naming a path, the daemon is held after the import for main's heap attribution (P7's
-/// finding (2)): its pid written to the path, and the daemon kept until the path is deleted, at most [`PATIENCE`].
+/// its memory by kind (`slates status --memory`) before, after, and 2 s and 30 s into its idle. Print the import's
+/// answer and seconds, the daemon's resident bytes before and at its peak against the dump's bytes, and each sample's
+/// memory lines. Expect (P7's finding (2), main 01a20182's ruling of 2026-11-22): the daemon's physical footprint after
+/// 30 s of idle grown by at most [`HELD_FACTOR`] times what it still holds live ([`held_after_import`]); before the
+/// finding's fix it kept 484 MiB of git-2000's import against 155 MB live. The real daemon binary, so its own allocator
+/// (a large allocation a mapping of its own, given back when freed), not a test binary's. With `SLATES_SVN_IMPORT_HOLD`
+/// naming a path, the daemon is held after the samples for an attribution: its pid written to the path, and the daemon
+/// kept until the path is deleted, at most [`PATIENCE`].
 #[test]
-#[ignore = "a measurement: SLATES_SVN_IMPORT_DUMP=... cargo test --release -p slates-cli --test svn_interop -- --ignored an_import_measured --nocapture"]
+#[ignore = "a measurement and gate: SLATES_SVN_IMPORT_DUMP=... cargo test --release -p slates-cli --test svn_interop -- --ignored an_import_measured --nocapture"]
 #[allow(clippy::disallowed_methods)] // test code: the hold's pid file, at the path the measurer names
 fn an_import_measured() {
   let Ok(dump) = std::env::var("SLATES_SVN_IMPORT_DUMP") else {
@@ -1885,7 +1888,7 @@ fn an_import_measured() {
   let (_anchor, _lines, _issuer) = start_anchor(&instance, &[]);
   create_repository(&instance);
   let before = daemon_rss_kib(&instance);
-  memory_sample(&instance, "before");
+  let at_start = memory_sample(&instance, "before");
   let mut child = Command::new(env!("CARGO_BIN_EXE_slates"))
     .args([
       "--instance",
@@ -1932,16 +1935,18 @@ fn an_import_measured() {
     err.join().unwrap().trim()
   );
   memory_sample(&instance, "after");
-  if let Ok(hold) = std::env::var("SLATES_SVN_IMPORT_HOLD") {
-    // The daemon's memory while it idles (P7's finding (2): r10 found 1.96 GB resident after the import): what it gives
-    // back over its idle ticks, read in its own process (`status --memory`), nothing suspending it.
-    for (label, wait) in [("idle 2 s", 2), ("idle 30 s", 28)] {
-      let waited = Instant::now();
-      while waited.elapsed() < Duration::from_secs(wait) {
-        pause();
-      }
-      memory_sample(&instance, label);
+  // The daemon's memory while it idles (P7's finding (2): r10 found 1.96 GB resident after the import): what it gives
+  // back over its idle ticks, read in its own process (`status --memory`), nothing suspending it.
+  let mut idle = at_start;
+  for (label, wait) in [("idle 2 s", 2), ("idle 30 s", 28)] {
+    let waited = Instant::now();
+    while waited.elapsed() < Duration::from_secs(wait) {
+      pause();
     }
+    idle = memory_sample(&instance, label);
+  }
+  let held_after = held_after_import(&at_start, &idle);
+  if let Ok(hold) = std::env::var("SLATES_SVN_IMPORT_HOLD") {
     let pid = daemon_pid(&instance).expect("the daemon's pid");
     std::fs::write(&hold, format!("{pid}\n")).unwrap();
     println!("an_import_measured: held, daemon pid {pid} in {hold}; delete it to end");
@@ -1951,12 +1956,61 @@ fn an_import_measured() {
     }
     let _ = std::fs::remove_file(&hold);
   }
+  if let Err(red) = held_after {
+    panic!("{red}");
+  }
 }
+
+/// What a memory sample read: the daemon's physical footprint (none where `top` does not say it), its heap's bytes in
+/// live allocations, and its shards' arena bytes allocated, each in bytes.
+#[derive(Clone, Copy, Debug, Default)]
+struct MemorySample {
+  /// Physical footprint, bytes.
+  footprint: Option<u64>,
+  /// The heap's bytes in live allocations (`memory: heap ... resident_bytes`, `slates_mem::heap::stats().in_use`).
+  heap_in_use: u64,
+  /// Every shard's arena bytes allocated (`content_range.arena.allocated`).
+  arena: u64,
+}
+
+/// P7's finding (2), main 01a20182's ruling of 2026-11-22 00:09 (the red: the idle footprint after the import against a
+/// derived multiple of what the import still holds). What the import still holds once the daemon idled is what its
+/// own report counts as live: its heap's bytes in live allocations and its arenas' bytes allocated, each grown since
+/// `before`. The footprint may exceed it by the allocator's own waste and no more: a size-class allocator rounds a block
+/// up to its class, at most to twice its size (classes grow by at most a factor of two), so the footprint's growth is
+/// bounded by [`HELD_FACTOR`] times the live growth. Refused, the figures that broke it; skipped (Ok) where `top` read no
+/// footprint (off macOS).
+fn held_after_import(before: &MemorySample, idle: &MemorySample) -> Result<(), String> {
+  let (Some(at_start), Some(at_idle)) = (before.footprint, idle.footprint) else {
+    eprintln!(
+      "an_import_measured: no physical footprint read here; the held-memory bound is not checked"
+    );
+    return Ok(());
+  };
+  let live = idle
+    .heap_in_use
+    .saturating_sub(before.heap_in_use)
+    .saturating_add(idle.arena.saturating_sub(before.arena));
+  let grown = at_idle.saturating_sub(at_start);
+  let bound = live.saturating_mul(HELD_FACTOR);
+  if grown > bound {
+    return Err(format!(
+      "an_import_measured: the daemon's footprint grew {grown} B over the import and 30 s of idle, past {HELD_FACTOR} x \
+       what it still holds live ({live} B: heap in use and arena allocated grown): {} B not given back",
+      grown.saturating_sub(bound)
+    ));
+  }
+  Ok(())
+}
+
+/// Derived: a size-class allocator rounds a block up to its class, classes growing by at most a factor of two, so live
+/// bytes take at most twice their size in pages (finding (2)'s bound, [`held_after_import`]).
+const HELD_FACTOR: u64 = 2;
 
 /// Prints instance `instance`'s daemon memory at `label` (P7's finding (2)): its resident bytes as `ps` reads them, and
 /// the memory report's heap and mapped kinds and the shards' arena bytes (`slates status --memory`), read in the daemon's
 /// own process, so nothing suspends it (A-232's gotcha: `vmmap` and `heap` did, and the anchor's watchdog ended it).
-fn memory_sample(instance: &str, label: &str) {
+fn memory_sample(instance: &str, label: &str) -> MemorySample {
   let rss = daemon_rss_kib(instance);
   let footprint = daemon_pid(instance).and_then(footprint_kib);
   let (_, memory, _) = slates(instance, &["status", "--memory"]);
@@ -1973,6 +2027,27 @@ fn memory_sample(instance: &str, label: &str) {
     "an_import_measured: memory {label}: daemon RSS {rss} KiB, physical footprint {footprint:?} KiB\n  {}",
     lines.join("\n  ")
   );
+  let figure = |line: &str, key: &str| -> Option<u64> {
+    line
+      .split_once(key)?
+      .1
+      .split_whitespace()
+      .next()?
+      .parse()
+      .ok()
+  };
+  MemorySample {
+    footprint: footprint.map(|kib| kib.saturating_mul(1024)),
+    heap_in_use: lines
+      .iter()
+      .filter(|line| line.contains("memory: heap "))
+      .find_map(|line| figure(line, "resident_bytes="))
+      .unwrap_or(0),
+    arena: lines
+      .iter()
+      .filter_map(|line| figure(line, "arena.allocated: "))
+      .sum(),
+  }
 }
 
 /// Process `pid`'s physical footprint in KiB as macOS `top` reads it (its `MEM` column, from `proc_pid_rusage`'s

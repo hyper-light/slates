@@ -3471,6 +3471,19 @@
 > refusal the wire answers without a Subversion number (`BudgetExceeded`, `ContentUnavailable`, `Format`) does not
 > name what landed; the same dump resumes all the same. Owed: the import's time and peak re-measured on git-2000
 > (main's run), which closes P7's finding (3) or not. The entry below is its history.
+> **P7's finding (2) OPEN, RED: an import's freed memory is not given back (2026-11-22, w-svn; main 01a20182's ruling of
+> 00:09, option 3).** Main's r11 (git-2000, release): physical footprint 43 MiB before, 527 MiB after 30 s of idle,
+> 484 MiB held. Only 155 MB of it is live (heap in use +104 MB, arena 51 MB); the rest is blocks under A-742's 1 MiB
+> large-path floor that the system allocator keeps for reuse after the import freed them. Attributed by allocation site
+> (an in-process allocator recording every 16 KiB to 1 MiB allocation): each text is copied about 15 times, 440 MB of
+> churn for 25.6 MB of text. Red: `an_import_measured` now gates the idle footprint's growth at `HELD_FACTOR` (2) times
+> what the import still holds live. Cut so far (w-svn's sites): the importer's text buffer sized once from its header,
+> admitted first; a stored text streamed into the increment from the store's lent windows, not read back whole; the
+> landing's store pieces lent. Owed: the other owners' copies (the content store's `put_window` and `release_one`; the
+> engine's `judge_held`, two `push_slice`, `Increment::encode`, `chain_entry::encode_carrying`; the changeset landing's
+> owned pieces, `slates_store::owner::SlicedLanding::part`), then A-742's floor re-derived by a release A/B only if the
+> footprint still stays (main's ruling). A local 64 KiB floor gave 47 MB of footprint at 2 s idle, against 363 MB, at
+> 19.4 s against 12.0 s (debug).
 > **A-822's commit held the shard past its watchdog; A-835 slices it (2026-11-21, w-svn; main's ruling of 12:43).**
 > Main's git-2000 run over A-822 had the watchdog kill the anchor twice: the batch's 2,000 versions applied in one step.
 > A-835 applies a recorded batch a slice a turn and folds a recovered Subversion green to its readers (the 434 MB under
