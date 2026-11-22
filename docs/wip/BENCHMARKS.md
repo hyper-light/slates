@@ -17298,6 +17298,56 @@ ubuntu-24.04-arm:
 - In the fair class on these kernels, 84a's 1 ms loaded bar is below the tick: unreachable by any arm that keeps the
   daemon and the client fair.
 
+## 84a on macOS: the doorbell thread under the time-constraint policy, measured, not landed (w-perf; 2026-11-22)
+
+**What was measured first.** The diagnostic branch is `diag-measurer-w-perf-84a-mac-tail` (never main; CI
+macos-latest, 3 CPUs, two spinners a CPU, TB as on main). Each loaded run ranked only the bench's timed requests and
+joined them to their taking shard's parks:
+- Runs 45065854565 and 45067781801: in 6 of 8 rounds of the first run, 7 to 11 of the 12 p999-tail requests landed
+  while their shard was parked. Their parks ended 0.2 to 13 ms after the landing.
+- 47 of 48 such parks ended tens to hundreds of ms before their own timeout, so the wake was late, not lost.
+- The park stamp could not say which wake. Only `registry::kick_if_parked` records a kick; the doorbell thread and
+  Linux's client eventfd call `Kick::kick` directly.
+- A stamp per hop then named the late one. The client saw the shard's idle announcement and rang within 2 to 8 µs. The
+  doorbell thread then woke 0.15 to 12 ms after the ring (p999-tail medians; max 17 ms). Its kick and the shard's run
+  took tens of µs.
+- No wake was lost: every ring was followed by the bell thread's wake and its kick of that shard.
+- Linux (run 45067930278, both runners) has no doorbell thread: a parked shard ran 7 to 14 µs after the landing.
+  Linux's p999 is queued and served time on shards that were not parked.
+
+**The arm** (6aa639211, env-gated `G222_BELL_TB` on the diagnostic branch): the doorbell thread asks for the shards'
+policy (`time_constraint::set_current_from` with the shards' window, macOS only). The kernel took it in 16 of 16 runs
+(computation 50 µs).
+
+**The run.** Run 45069134608: one job, 8 rounds, base and arm alternating, each a quiet run and a loaded run, with the
+control (`g222_floor` under the same policy) beside every loaded run. Cells are the bench's pooled goal lines
+(3 × 1,000 samples), µs, rounds in order.
+
+| | base | arm |
+|---|---|---|
+| loaded accept p999 | 877 · 685 · 1094 · 1261 · 813 · 5045 · 6719 · 5669 | 709 · 898 · 1430 · 1164 · 10136 · 7446 · 4849 · 4597 |
+| loaded conflict p999 | 862 · 1012 · 538 · 968 · 1414 · 6226 · 14235 · 5997 | 603 · 1087 · 708 · 460 · 2068 · 6055 · 5810 · 6313 |
+| loaded accept p99 | 600 · 310 · 446 · 450 · 451 · 1803 · 1522 · 899 | 478 · 562 · 568 · 591 · 558 · 1451 · 938 · 750 |
+| loaded conflict p99 | 504 · 363 · 386 · 460 · 505 · 2054 · 4479 · 881 | 359 · 468 · 454 · 315 · 587 · 1903 · 865 · 608 |
+| quiet accept p50 | 165 · 145 · 150 · 282 · 264 · 302 · 286 · 290 | 324 · 151 · 158 · 162 · 350 · 251 · 372 · 315 |
+| quiet accept p99 | 412 · 673 · 533 · 609 · 747 · 813 · 1117 · 567 | 972 · 502 · 779 · 481 · 1503 · 1058 · 941 · 859 |
+| rung -> bell woke, p99 tail median | 42 · 11 · 6 · 269 · 13 · 1450 · 2133 · 538 | 6 · 7 · 7 · 4 · 7 · 8 · 7 · 5 |
+| rung -> bell woke, p99 tail max | 515 · 1023 · 153 · 2891 · 719 · 13480 · 16873 · 9150 | 11 · 199 · 11 · 12 · 9 · 622 · 1129 · 34 |
+| control p999 median | 66 · 39 · 38 · 49 · 49 · 111 · 57 · 69 | 38 · 40 · 46 · 39 · 64 · 99 · 70 · 75 |
+
+**Not landed.** The test set before the run had three parts: the ring-to-wake hop falls to the shards' band, the timed
+p999 is under 1 ms in most rounds, and quiet is no worse.
+- The hop passes: 4 to 8 µs medians in every round, against base's 6 to 2,133.
+- The p999 fails in both arms: both forms are under 1 ms in 1 of 8 rounds each. The median over rounds is accept 3,013
+  against 1,178 and conflict 1,578 against 1,213. The loaded p99 is under 1 ms in 7 of 8 rounds against 6 of 8.
+- Quiet is not shown no worse: accept p99 is worse in 5 of 8 rounds (median 900 against 641). The p50 is even.
+- With the bell hop fixed, the arm's p999 tails (rounds 5 to 8) are served time inside `serve_loop` polls of 4 to
+  15 ms, attributed to the task's own CPU. Base's rounds 6 to 8 are the same. That is a bounded-work bug (§3), and it
+  binds 84a's macOS p999 whatever the bell does.
+- **Retry condition:** run the same A/B again once `serve_loop`'s polls are bounded to their quantum.
+- Also seen once (arm round 5): four tail requests whose client rang 13 ms after publishing. The client thread was
+  descheduled between its push and its read of the announcement. It is watched, not acted on.
+
 ## The client's reply wait, arm C: measured and rejected, B (A-799) stays (85a; g222's last step, recorded by w-provision-gate; 2026-11-21)
 
 **The run.** GitHub run 44884335146 (branch `diag-measurer-g222-20`, "g222 A/B/C of the client reply wait on every
