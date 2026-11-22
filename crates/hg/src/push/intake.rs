@@ -290,14 +290,17 @@ impl Intake {
   /// (`Taker::keep_taken`, `read_of`, `logged_of`). Each revision its node, its kept text and its path; each changeset
   /// its manifest's and its own nodes noted; each manifest its entry, at most one written entry for each
   /// [`LEAST_MANIFEST_LINE`] bytes of its delta and the delta's bytes for their paths; each log its name, a file's its
-  /// path. A step's own working set (its delta, its base, its rebuilt text) is apart: charged to a copy and let go.
+  /// path. A step's own working set (its delta, its base, its rebuilt text) is apart: charged to a copy and let go. Every
+  /// sum saturates, so a count past what a `u64` holds reads as the most there is, past any repository's ceiling, and its
+  /// push is refused, never admitted a wrapped need.
   pub fn bookkeeping(&self) -> u64 {
     let framed = &self.frame.0;
     let each = to_u64(size_of::<Node>().saturating_add(size_of::<KeptText>()));
     let kept = |count: usize, path: u64| to_u64(count).saturating_mul(each.saturating_add(path));
     let changelog = framed.changelog.len();
-    let changesets = kept(changelog, to_u64(CHANGELOG_PATH.len()))
-      .saturating_add(to_u64(changelog).saturating_mul(to_u64(2 * size_of::<(Node, Node)>())));
+    let changesets = kept(changelog, to_u64(CHANGELOG_PATH.len())).saturating_add(
+      to_u64(changelog).saturating_mul(to_u64(size_of::<(Node, Node)>().saturating_mul(2))),
+    );
     let manifests = framed
       .revisions
       .get(framed.manifests.clone())
@@ -307,7 +310,10 @@ impl Intake {
         kept(framed.manifests.len(), to_u64(MANIFEST_PATH.len())),
         |total, placed| {
           let data = placed.data.end.saturating_sub(placed.data.start);
-          let entries = data / LEAST_MANIFEST_LINE + 1;
+          let entries = data
+            .checked_div(LEAST_MANIFEST_LINE)
+            .unwrap_or(data)
+            .saturating_add(1);
           total
             .saturating_add(to_u64(size_of::<ManifestWrites>()))
             .saturating_add(entries.saturating_mul(to_u64(size_of::<(Vec<u8>, Node)>())))
@@ -326,6 +332,28 @@ impl Intake {
       .saturating_add(manifests)
       .saturating_add(logs)
       .saturating_add(files)
+  }
+
+  /// The least room one of its steps takes, told from its framing (main 01a20182's order of 2026-11-22 05:04): the widest
+  /// text a delta against the null base carries, its one hunk's insert (`delta::whole_text_start`, a whole refused as
+  /// `NotWhole` otherwise), since a step rebuilds such a text whole and charges it before it keeps any of it. Zero where
+  /// none comes whole. A push whose keeping and this are past its repository's ceiling could never be taken there.
+  pub fn widest_full_text(&self) -> u64 {
+    self
+      .frame
+      .0
+      .revisions
+      .iter()
+      .filter(|placed| placed.base == NULL_NODE)
+      .map(|placed| {
+        placed
+          .data
+          .end
+          .saturating_sub(placed.data.start)
+          .saturating_sub(to_u64(delta::HUNK_HEADER_LEN))
+      })
+      .max()
+      .unwrap_or(0)
   }
 }
 
@@ -362,6 +390,120 @@ struct Taker {
   asked: Option<StoreAsk>,
   /// A revision longer than one window, being taken a window a step.
   pending: Option<Box<Pending>>,
+  /// The segments its kept texts are cut into as they are taken, where its driver asks for them ([`Intake::cutting`]).
+  cutting: Option<Cutting>,
+}
+
+/// A push's kept texts cut into segments as they are taken (main 01a20182's ruling (b1) of 2026-11-22 04:44: a push
+/// lands as a run of segment changesets, as an import does): each segment the revisions whose deltas lie in a slice of
+/// at least `bound` bytes of the changegroup, so the push holds one segment's texts at a time, never the whole list.
+struct Cutting {
+  /// The least bytes of the changegroup a segment is cut at.
+  bound: u64,
+  /// The segment being cut: where its slice of the changegroup begins and ends, each log's kept revisions in it, their
+  /// texts, and what those texts charged.
+  open: Option<Open>,
+  /// The segments cut and not yet taken, oldest first.
+  ready: VecDeque<PushSegment>,
+}
+
+impl Cutting {
+  /// Notes `kept`, revision `rev` of `log` in the fork, its text charged `charged`; cuts the segment once its slice
+  /// reaches the bound.
+  fn kept(&mut self, log: LogOf, rev: u32, kept: KeptText, charged: u64) {
+    let open = self.open.get_or_insert_with(|| Open {
+      slice: kept.place.start..kept.place.end,
+      ranges: Vec::new(),
+      texts: Vec::new(),
+      charged: 0,
+    });
+    open.slice.end = open.slice.end.max(kept.place.end);
+    match open.ranges.last_mut() {
+      Some((last, _, end)) if *last == log && *end == rev => *end = rev.saturating_add(1),
+      _ => open.ranges.push((log, rev, rev.saturating_add(1))),
+    }
+    open.charged = open.charged.saturating_add(charged);
+    open.texts.push(kept);
+    if open.slice.end.saturating_sub(open.slice.start) >= self.bound {
+      self.cut();
+    }
+  }
+
+  /// Cuts the segment being cut into the ready ones, its texts' places made its slice's own.
+  fn cut(&mut self) {
+    let Some(open) = self.open.take() else {
+      return;
+    };
+    let from = open.slice.start;
+    let texts = open
+      .texts
+      .into_iter()
+      .map(|kept| KeptText {
+        place: kept.place.start.saturating_sub(from)..kept.place.end.saturating_sub(from),
+        ..kept
+      })
+      .collect();
+    self.ready.push_back(PushSegment {
+      slice: open.slice,
+      ranges: open.ranges,
+      texts,
+      charged: open.charged,
+    });
+  }
+}
+
+/// A segment being cut ([`Cutting`]).
+struct Open {
+  /// Its slice of the changegroup.
+  slice: Range<u64>,
+  /// Each log's kept revisions in it, from the first to the one past the last, in the order they were kept.
+  ranges: Vec<(LogOf, u32, u32)>,
+  /// Their texts, places within the whole changegroup until it is cut.
+  texts: Vec<KeptText>,
+  /// What their texts charged the push's admission.
+  charged: u64,
+}
+
+/// A segment of a push's kept revisions, cut ([`Intake::take_segment`]): its slice of the changegroup (its changeset's
+/// `Payload`), each log's kept revisions in it (its `Record`'s rows, `record::Writer::begin_segment`), their texts with
+/// places within the slice (its `Texts`), and what those texts charged the push's admission, which its driver gives back
+/// once the segment is landed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PushSegment {
+  /// Its slice of the changegroup.
+  pub slice: Range<u64>,
+  /// Each log's kept revisions in it, from the first to the one past the last.
+  pub ranges: Vec<(LogOf, u32, u32)>,
+  /// Their texts, each place within the slice.
+  pub texts: Vec<KeptText>,
+  /// What their texts charged the push's admission.
+  pub charged: u64,
+}
+
+/// The `Record` of `segment` (main's ruling (b1)): record v8 of a push's source, each log's kept revisions in it read by
+/// identity from `fork`, the intake's fork or the fork it finished as, `room` the room the intake began within; what a
+/// replay appends after the rows the segments before it appended, no text rebuilt. Refused where a row cannot be read
+/// or written.
+pub fn segment_record(
+  fork: &HgIndex,
+  segment: &PushSegment,
+  room: u64,
+  store: &ContentStore,
+) -> Result<Vec<u8>, crate::import::record::WriteRefused> {
+  use crate::import::record::{Source, WriteRefused, Writer};
+  let mut ranges = Vec::new();
+  ranges
+    .try_reserve(segment.ranges.len())
+    .map_err(|_| WriteRefused::Allocation)?;
+  ranges.extend(
+    segment
+      .ranges
+      .iter()
+      .map(|(log, first, end)| (log_named(log), *first, *end)),
+  );
+  let mut writer = Writer::begin_segment(Source::Push, &ranges, room, false)?;
+  while writer.step(fork, store)? {}
+  writer.finish().ok_or(WriteRefused::Allocation)
 }
 
 /// A revision longer than the content store's window taken over as many steps as it has windows (A-767 C1, the push
@@ -672,8 +814,42 @@ impl Intake {
         cache: BaseCache::within(room),
         asked: None,
         pending: None,
+        cutting: None,
       },
     })
+  }
+
+  /// The intake, its kept texts cut into segments of at least `bound` bytes of the changegroup as they are taken
+  /// ([`Intake::take_segment`]), never held whole (main's ruling (b1)).
+  pub fn cutting(mut self, bound: u64) -> Self {
+    self.taker.cutting = Some(Cutting {
+      bound: bound.max(1),
+      open: None,
+      ready: VecDeque::new(),
+    });
+    self
+  }
+
+  /// The next segment cut, oldest first; none while the one being cut is short of its bound.
+  pub fn take_segment(&mut self) -> Option<PushSegment> {
+    self.taker.cutting.as_mut()?.ready.pop_front()
+  }
+
+  /// The `Record` of `segment`, cut from this intake (main's ruling (b1)): [`segment_record`] over its fork.
+  pub fn segment_record(
+    &self,
+    segment: &PushSegment,
+    room: u64,
+    store: &ContentStore,
+  ) -> Result<Vec<u8>, crate::import::record::WriteRefused> {
+    segment_record(&self.taker.fork, segment, room, store)
+  }
+
+  /// Cuts the segment being cut whatever its length: the push's last, once every unit is taken.
+  pub fn cut_rest(&mut self) {
+    if let Some(cutting) = self.taker.cutting.as_mut() {
+      cutting.cut();
+    }
   }
 
   /// Takes the next unit of the changegroup whose bytes are `payload`, the ones it began with (module docs). Refused,
@@ -1179,14 +1355,22 @@ impl Taker {
       .bytes
       .saturating_add(to_u64(arrived.text.len()));
     let identity = identity.unwrap_or_else(|| *blake3::hash(&arrived.text).as_bytes());
-    self.intaken.texts.push(KeptText {
+    let kept = KeptText {
       path: path.to_vec(),
       node: revision.node,
       identity,
       len: to_u64(arrived.text.len()),
       base,
       place,
-    });
+    };
+    match self.cutting.as_mut() {
+      Some(cutting) => {
+        let rev = self.fork.len(store, log).saturating_sub(1);
+        let charged = to_u64(size_of::<KeptText>()).saturating_add(to_u64(path.len()));
+        cutting.kept(log_of(log), rev, kept, charged);
+      }
+      None => self.intaken.texts.push(kept),
+    }
     self.last_identity = Some((revision.node, identity));
     // The text kept before this one may be a later delta's base: the push's cache keeps it ((b2)).
     if let (Log::File(_), Some((node, text))) = (log, self.last.take()) {

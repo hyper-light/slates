@@ -346,7 +346,7 @@ pub(crate) fn turn(
 /// the changeset store's memtable, what one of its flushes turns into one bundle (`store_sizing` in `slates-api`'s
 /// daemon: the content plane's chunk, the unit of copy-on-write, times SplinterDB's fanout). An import holds one segment
 /// at a time, and lands as many changesets as its changegroup has segments.
-fn segment_bytes(state: &ShardState) -> usize {
+pub(crate) fn segment_bytes(state: &ShardState) -> usize {
   let fanout: slates_machine::Derived<usize> = slates_machine::derived!(
     8,
     "SplinterDB's target fanout, as the daemon's store_sizing sizes the store's memtable",

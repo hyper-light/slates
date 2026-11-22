@@ -1627,7 +1627,7 @@ fn a_committed_text_is_let_go_by_the_content_store_and_read_through_the_store() 
     &daemon,
     move || async move {
       let texts = slates_svn::commit::drive::HeldTexts::new();
-      let staged = texts.stage().unwrap();
+      let staged = texts.stage(None).unwrap();
       texts.append(staged, &committed).unwrap();
       texts.seal(staged, named.identity).unwrap();
       let work = Work {

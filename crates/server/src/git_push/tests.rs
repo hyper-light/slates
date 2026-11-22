@@ -2775,19 +2775,22 @@ async fn stepped(repository: RepositoryId, request: &[u8]) -> Stepped {
 /// A-752 (main's order of 2026-11-20, w-git's measure: one command bringing 3,502 objects over a flat 3,500-file tree
 /// built its work in one step, 374 to 642 ms debug, so a monorepo's push would outlast the watchdog), with A-783's rule
 /// (a turn yields at its quantum when someone waits). Do: create `main` at a flat tree of [`FLAT_FILES`] files, then push
-/// a commit changing every file, answering a step at a time, no one else on the shard. Expect: both `ok`; the update's
-/// build a unit at a time (a unit a file at least), in a tenth as many turns as quanta or fewer (no one waited, so each
-/// turn went on), none past its ceiling (the watchdog's look) by more than a unit and its opening, and none past its
-/// budget (`push.build.past_budget` 0).
+/// a commit changing every file, answering a step at a time, no one else on the shard; then fetch `main`'s head. Expect:
+/// both `ok`; the update's build a unit at a time (a unit a file at least) in more than one turn, its turns going on past
+/// their first quantum while no one waited (`more_quanta` moved), none past its ceiling (the watchdog's look) by more
+/// than a unit and its opening, and none past its budget (`push.build.past_budget` 0); the fetch holding every object
+/// both pushes brought, each once. How many quanta a turn spans is the host's speed over its quantum, not the build's
+/// slicing: "a tenth as many turns as quanta" failed 1 in 3 alone at load ~40, "960 turns for 8081 quanta", every turn
+/// within its bounds (main 01a20182's order of 2026-11-22 06:13).
 #[test]
 fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let repository = crate::daemon::observe_first(&daemon, |state| git_repository(state, "flat"));
-  let (first, objects) = flat_commit(FLAT_FILES, "first", None);
+  let (first, first_objects) = flat_commit(FLAT_FILES, "first", None);
   let create = request(
     &[("", &first.to_string(), b"refs/heads/main")],
     CAPABILITIES,
-    &pack_of_objects(&objects),
+    &pack_of_objects(&first_objects),
   );
   let created = pushed_in_steps(&daemon, repository, &create);
   let before = crate::daemon::observe_first(&daemon, |state| state.push_turns);
@@ -2799,6 +2802,9 @@ fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
   );
   let updated = pushed_in_steps(&daemon, repository, &update);
   let after = crate::daemon::observe_first(&daemon, |state| state.push_turns);
+  let fetched = crate::daemon::observe_first(&daemon, move |state| {
+    fetched_ids(state, repository, &[second])
+  });
   daemon.stop();
   let (created, created_longest) = created.unwrap();
   let (updated, updated_longest) = updated.unwrap();
@@ -2818,10 +2824,10 @@ fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
     units >= FLAT_FILES as u64,
     "the update's work ran {units} units for {FLAT_FILES} files"
   );
-  // A-783: no one waited, so each turn went on to its ceiling: far fewer turns than quanta.
+  // Sliced: more than one turn. A-783: no one waited, so turns went on past their first quantum.
   assert!(
-    turns * 10 < quanta,
-    "{turns} turns for {quanta} quanta: the turns did not go on while no one waited"
+    turns > 1 && after.more_quanta > before.more_quanta,
+    "{turns} turns for {quanta} quanta: the build was not sliced, or its turns did not go on while no one waited"
   );
   let ceiling = crate::daemon::HEARTBEAT_NS;
   assert!(
@@ -2830,6 +2836,19 @@ fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
     after.longest_ns
   );
   assert_eq!(after.past_budget, 0, "{after:?}");
+  let brought: std::collections::BTreeSet<ObjectId> = first_objects
+    .into_iter()
+    .chain(objects)
+    .map(|(kind, bytes)| {
+      slates_git::object_name::name_of(ObjectFormat::Sha1, kind, &bytes).unwrap()
+    })
+    .collect();
+  let set: std::collections::BTreeSet<ObjectId> = fetched.iter().copied().collect();
+  assert_eq!(
+    (fetched.len(), &set),
+    (brought.len(), &brought),
+    "the fetch of main's head holds every object both pushes brought, each once"
+  );
 }
 
 /// A-724 piece 8c and A-722's record v4 (main's rulings of 2026-11-20: a record names its names and its pack only once
@@ -3147,8 +3166,12 @@ const REUSED_ENTRY_SLACK: usize = 10 + 10 + 20;
 /// a delta against the one before); clone every ref whole before any version is encoded (the stream's loose stage), then
 /// encode its versions and clone again (from the kept fragments). Expect: each clone's pack at most the pushed pack's
 /// bytes plus [`REUSED_ENTRY_SLACK`] an object (each pushed entry sent on as it lies), printing both; the stream and the
-/// encoding each counting entries reused whole and deltas reused, none refused; each clone whole, every object once. Red
-/// before: every object whole and uncompressed, the clone near the objects' raw size.
+/// encoding each counting entries reused whole and every pushed delta reused, none refused; each clone whole, every
+/// object once; and no pushed object encoded afresh by either (main 01a20182's ruling of 2026-11-22 05:38: a stored entry
+/// reused whenever one exists). Red before: every object whole and uncompressed, the clone near the objects' raw size;
+/// then (main's order of 04:53) the stream reusing 20 of the 39 deltas, a delta whose base's position (by type, then id)
+/// came after its own sent fresh, where git's `write_one` writes a delta's base first; then 117 of the pushed commits,
+/// trees and tags searched and encoded afresh, their whole entries passed over where the encoder would try a delta.
 #[test]
 fn t_a859_a_clone_of_a_deltified_push_sends_its_entries_as_they_lie() {
   use slates_git::object_name::Kind;
@@ -3205,11 +3228,22 @@ fn t_a859_a_clone_of_a_deltified_push_sends_its_entries_as_they_lie() {
       "the streamed clone's pack {} past {bound}",
       streamed.len()
     );
+    let deltas = u64::try_from(TAGGED_LINE - 1).unwrap();
     assert!(
       counted_streamed.reused_whole > 0
-        && counted_streamed.reused_deltas > 0
+        && counted_streamed.reused_deltas == deltas
         && counted_streamed.reuse_refused == 0,
-      "{counted_streamed:?}"
+      "every one of the {deltas} pushed deltas reused: {counted_streamed:?}"
+    );
+    // main 01a20182's ruling of 2026-11-22 05:38: a stored entry is reused whenever one exists, so no pushed object is
+    // searched or encoded afresh.
+    assert_eq!(
+      (
+        counted_streamed.loose_whole + counted_streamed.loose_deltas,
+        counted_streamed.reused_whole + counted_streamed.reused_deltas,
+      ),
+      (0, u64::try_from(objects.len()).unwrap()),
+      "every pushed object sent as its entry lies, none encoded: {counted_streamed:?}"
     );
     assert_whole_clone(&streamed, objects.len());
     while crate::vcs_store::git_encode::turn(state, repository)
@@ -3235,8 +3269,94 @@ fn t_a859_a_clone_of_a_deltified_push_sends_its_entries_as_they_lie() {
       "the clone's pack {} past {bound}",
       clone.len()
     );
-    assert!(reused.0 > 0 && reused.1 > 0 && reused.2 == 0, "{reused:?}");
+    assert!(
+      reused.0 > 0 && reused.1 == deltas && reused.2 == 0,
+      "{reused:?}"
+    );
+    assert_eq!(
+      reused.0 + reused.1,
+      u64::try_from(objects.len()).unwrap(),
+      "every pushed object kept as its entry lies, none encoded: {reused:?}"
+    );
     assert_whole_clone(&clone, objects.len());
+  });
+}
+
+/// Shape: the files of [`t_a859_an_encoding_places_a_pushed_deltas_base_before_it`]'s one commit, each a line longer
+/// than the one before, so each after the first is pushed as a delta against a smaller one.
+const GROWING_FILES: usize = 8;
+
+/// A-859 (main 01a20182's order of 2026-11-22 04:53: write deltas in the stored pack's own order, as git's pack reuse
+/// does). Do: push one commit of [`GROWING_FILES`] files, each a line longer than the one before, its pack as stock git
+/// sends one (each blob after the first a delta against the one before, a smaller one); encode its version, then clone
+/// it from the kept fragments. Expect: every pushed delta reused by the encoding, none refused, though the encoding
+/// orders the larger first, so each delta's base is placed before it (git's `write_one`); the clone whole. Red before:
+/// no delta reused, each one's base still in the encoding's order behind it.
+#[test]
+fn t_a859_an_encoding_places_a_pushed_deltas_base_before_it() {
+  use slates_git::object_name::{Kind, name_of};
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
+    let repository = git_repository(state, "based");
+    let blobs: Vec<Vec<u8>> = (0..GROWING_FILES)
+      .map(|file| {
+        (0..=file + 20)
+          .flat_map(|line| {
+            format!("line {line:04} of a file that grows a line a file, long enough to delta\n")
+              .into_bytes()
+          })
+          .collect()
+      })
+      .collect();
+    let mut tree = Vec::new();
+    for (file, blob) in blobs.iter().enumerate() {
+      tree.extend_from_slice(format!("100644 file{file:02}\0").as_bytes());
+      tree.extend_from_slice(
+        name_of(ObjectFormat::Sha1, Kind::Blob, blob)
+          .unwrap()
+          .as_bytes(),
+      );
+    }
+    let tree_id = name_of(ObjectFormat::Sha1, Kind::Tree, &tree).unwrap();
+    let commit = format!(
+      "tree {tree_id}\nauthor A <a@example.com> 1700000000 +0000\n\
+       committer A <a@example.com> 1700000000 +0000\n\ngrowing files\n"
+    )
+    .into_bytes();
+    let commit_id = name_of(ObjectFormat::Sha1, Kind::Commit, &commit).unwrap();
+    let mut objects = vec![(Kind::Commit, commit), (Kind::Tree, tree)];
+    objects.extend(blobs.into_iter().map(|blob| (Kind::Blob, blob)));
+    let pack = deltified_pack(&objects);
+    let id = commit_id.to_string();
+    let commands: Vec<(&str, &str, &[u8])> = vec![("", id.as_str(), b"refs/heads/main")];
+    let received = pushed(state, repository, &request(&commands, CAPABILITIES, &pack));
+    assert!(
+      reasons(&received).iter().all(|reason| reason == b"ok"),
+      "{:?}",
+      received.outcomes
+    );
+    while crate::vcs_store::git_derive::turn(state, repository)
+      != crate::vcs_store::git_derive::Turned::Idle
+    {}
+    while crate::vcs_store::git_encode::turn(state, repository)
+      != crate::vcs_store::git_encode::Turned::Idle
+    {}
+    let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+    let reused = (
+      count(crate::vcs_store::git_encode::REUSED_DELTAS),
+      count(crate::vcs_store::git_encode::REUSE_REFUSED),
+    );
+    assert_eq!(
+      reused,
+      (u64::try_from(GROWING_FILES - 1).unwrap(), 0),
+      "every pushed delta reused, none refused"
+    );
+    let fetch = crate::vcs_store::upload::tests::fetch(&[commit_id], &[]);
+    let (answer, _) =
+      crate::vcs_store::upload::tests::fetched_with_counters(state, (repository, &owner()), &fetch);
+    assert_whole_clone(
+      &crate::vcs_store::upload::tests::pack_of(&answer),
+      objects.len(),
+    );
   });
 }
 

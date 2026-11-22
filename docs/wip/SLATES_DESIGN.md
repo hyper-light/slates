@@ -58199,6 +58199,18 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > An import refused midway leaves an unnamed run that recovery passes over, and the next landing takes the last named
 > sequence plus one (decision 2).
 
+> **Status (2026-11-22, a push lands as a run of segment changesets; main 01a20182's rulings (b1) and (i) of 04:44).**
+> A push's intake cuts its kept texts into segments of an import's size and lands each as it is cut, between its
+> slices: `Record` the segment's rows by identity (record v8, the push's source), `Payload` its slice of the
+> changegroup, `Texts` its texts; what the texts charged the push's admission is given back once each lands. The
+> push's entry names the run (record v9, the push's source byte 1), and a restart replays it as an import's run, rows by
+> identity, no payload read. A run's rows are numbered after the index's, and a replay reads its sequences first to
+> last, so the repository's landing turn (Subversion's, which Mercurial's made changesets hold too) is held from the
+> run's first segment to the entry; a push of the same repository parks for it within the room wait's patience, and a
+> fork made stale before the turn is taken again inside it, never re-based. A run no entry names is abandoned: its
+> sequences are landed again by the next landing, each store row the newest landing at it. A made changeset stays one
+> changeset (record v7). `repository::hg_run`; crash oracle `t_b1_a_crash_at_any_segment_boundary_leaves_a_push_whole_or_absent`.
+
 > **Status (2026-11-21, C1: made changesets on the changeset store; main's ruling of 09:00).** A changeset the server
 > makes of a submitted version is a changegroup the server builds, taken through the push's own intake and landed as
 > a push's changeset (made record, `Payload`, `Texts`), named by a made reference in the register's entry, through the
@@ -60755,9 +60767,13 @@ Applied in the same change to:
 - **Change (part B).** An object pushed in a pack is sent on as its entry lies there, as git's `pack-objects` reuses a
   packed entry before it searches, both where fragments are made and in the stream's loose stage; each entry checked
   first against the object's name (a delta through its base), a corrupt one refused and the object encoded instead;
-  a delta reused only where its base precedes it in the pack the client reads; a whole entry reused only where the
-  encoder would try no delta for the object (git's order: a packed delta reused, else a search, else the whole entry's
-  data copied), the reused object kept as a later one's candidate base. Part A (owed next): a fetched byte
+  a delta reused only where its base precedes it in the pack the client reads, a still-wanted base placed first (git's
+  `write_one`: the stream's loose stage meets objects by type then id, the encoding by type then the largest first, so
+  each keeps a stack of bases to place ahead, as deep as the deepest chain any push carried); a whole entry reused
+  whenever it has one (main 01a20182's ruling of 2026-11-22 05:38, superseding "only where the encoder would try no
+  delta": git/git's clone spent its time in `Search::step` on objects that had a stored form), the reused object kept
+  as a later one's candidate base. Counted where reuse is not taken: `reuse_refused` (its check failed),
+  `reuse_no_entry` (kept as content, in no pack) and `reuse_unread` (its entry or base unread). Part A (owed next): a fetched byte
   priced at the network, so what no pushed entry holds deflates and deltas within the learned budget.
 - **Tests.** `slates-server` `git_push::tests::t_a859_a_clone_of_a_deltified_push_sends_its_entries_as_they_lie` (the
   line above pushed as stock git sends it, 17,299 bytes: cloned before encoding in 20,916 (121 whole, 20 deltas reused,
@@ -60767,3 +60783,88 @@ Applied in the same change to:
   places later is encoded, not reordered; the loose stage's table of where each object begins is charged once to the
   request (a word pair an object, A-745 rule 1), `an_object_past_a_window_gets_a_delta_exactly_when_its_search_fits_the_admission`
   sizing its room with it.
+
+### A-860 — A git repository gone idle lets go of the objects its reads keep (2026-11-22, w-git for UI goal 93; main 01a20182's note of 04:24 PST; A-856's rule, A-722's recent objects)
+Applied in the same change to: `crates/git/src/store/packed.rs` (`Recent::let_go`), `crates/git/src/store/repository.rs`
+(`recent_bytes`, `let_go_recent`), `crates/server/src/vcs_store/git_encode.rs` (`give_back_idle` lets them go), GAPS.
+
+- **Found by use.** w-shared's gauges: `git.recent_bytes`, a repository's objects read lately (git's delta base cache),
+  held at its budget, 53.9 MB, after a git/git v2.0.0 clone had ended, 0.2 MB before it. The cache's budget is the
+  repository's largest pack, and nothing let it go between reads.
+- **Change.** As a repository goes idle (its last fetch ending, or the task making its encoding ahead stopping with no
+  fetch answered, A-856), the objects its reads keep are let go and its read buffers' room given back, the cache's budget
+  kept for the reads after; counted with the rest in `vcs_store.git_encode.given_back_idle`.
+- **Tests.** `slates-server` `vcs_store::git_encode::tests::t_a860_a_repository_gone_idle_lets_go_of_the_objects_its_reads_keep`
+  (the encoding's reads kept 417 bytes here; once the fetch ended, back to the 32 before; red before: 417 held).
+
+### A-861 — Objects read lately lie in chunks given back whole, never on the system heap (2026-11-22, w-shared; main 01a20182's rulings of 04:24 and 04:56 PST, goal 93; A-742, A-860)
+Applied in the same change to: `crates/git/src/store/packed.rs` (`Recent`: chunks, a hash index, one order queue;
+`let_go` gives back every chunk; `true_up`, `release`), `crates/git/src/store/push.rs`, `repository.rs` and
+`encoding.rs` (the charge's owners), `crates/server/src/vcs_store.rs` and `git_encode.rs`, `crates/git/Cargo.toml`
+(`slates-mem`), `crates/mem/src/large.rs`
+(`Heap::system_allocated`), `crates/server/src/memory_gauges.rs` (`mem.gauge.process.system_allocated_bytes`),
+`crates/git/tests/recent_ring.rs`, GAPS.
+
+Status: built 2026-11-22, macOS arm64 (focused tests); main's RSS round owed.
+- Why: a landed push of git/git v2.0.0 kept 772-787 MiB for a 56 MB pack. The memory status's gauges put 550-600 MB of
+  it in freed memory the system allocator kept. The push inflates its 164,488 objects to 2,301 MB, none of them 1 MiB,
+  and kept each, as read lately, as its own buffer, freed oldest first as newer came: a stream of blocks under
+  A-742's mapped floor, each held for seconds, which the allocator does not give back.
+- Rule: `Recent` lays each object's bytes end to end in chunks one mapped floor long (or its budget, when that is shorter),
+  each reserved once and never grown, and gives back the oldest chunk whole when the budget would be passed. An object a
+  chunk long or longer is taken whole as a chunk of its own (the large path), and one past the budget is not kept. A
+  growing budget (a push's, as its pack arrives) adds chunks, never a copy.
+- Safety: an object is found by its chunk's number and range; every chunk ever laid takes the next number, so an
+  object whose chunk has gone is a miss, never another object's bytes. Its bytes are lent as a slice of `&self`, so none
+  outlives the read. No `unsafe`. The chunks are the push's or the repository's, so they go when it does (landed,
+  refused, abandoned, or a dropped future), and `let_go` (A-860) gives back every one.
+- Index: a hash table, which allocates nothing once grown to the budget's objects (a B-tree split and gave back a node
+  every few: 142 bytes an object), and one order queue.
+- Charged (main 01a20182's ruling of 05:17: an uncharged holder makes the admission's numbers lie): `Recent::true_up`
+  charges the owner's content store for the chunks held, trued up where the owner holds the store mutably (a push after
+  each admission turn, a repository after each encoding unit, since a clone's reads fill it), and where the store's room
+  cannot take it the oldest chunks go until it can. `Recent::release` gives back the chunks and the charge: a push's
+  when it is committed or abandoned, a repository's when it goes idle (A-860's give-back). A read between two true-ups
+  only lays chunks the next one charges.
+- Evidence: `a_push_keeps_its_objects_read_lately_off_the_system_heap` (its own binary, `LargeMapped` global): red, the
+  system path's live bytes grew 6,582,872 bytes keeping 8 MiB; green, under a tenth of the budget, and a third round's churn
+  past the objects handed over under a hundredth. `recent_tests`: a gone chunk's object a miss, a large object a chunk
+  of its own, one past the budget not kept, `let_go` holding nothing.
+
+### A-862 — A Subversion import holds no text: each goes into its caller's sink a piece at a time as the dump is read (2026-11-22, w-svn; main 01a20182's order of 05:28 PST, goal 93, P7 finding (2); A-628, A-716, A-842, C2 stage C)
+Applied in the same change to:
+- `crates/svn/src/migration/import.rs`: `Importer::import` takes a `commit::drive::TextSink`, the seam a client's
+  commit's drive writes through. A text is staged with its header's length where it has one. Each piece of a whole
+  text, and each applied window of a delta, is named (BLAKE3), digested (MD5, SHA-1) and put into the sink as it
+  passes, then sealed at its end. A delta whose base the same revision made reads the base back from the sink. The
+  room no longer charges a text's bytes; the sink's room refuses them (`MigrationRefusal::Room`).
+- `crates/svn/src/migration/records.rs`: `Transaction::set_text` takes the text named, not its bytes; the transaction
+  names its texts stored by length, and `revision_of` hands them over in `Revision::stored`.
+- `crates/svn/src/migration/standalone.rs`: records standing alone keep an import's texts in a `HeldTexts` sink, held
+  apart once their revision commits and given up where the import is refused; `Standalone::importing` lends the
+  records with the sink to a caller that drives the import itself.
+- `crates/svn/src/commit/drive/texts.rs`: `TextSink::stage` takes the text's length where its writer knows it.
+  `HeldTexts` reserves that length once, refused rather than aborted where memory cannot hold it.
+- `crates/server/src/vcs_store/svn_import/texts.rs` (new): the daemon's sink, the shard's content store. A text begins
+  with its length (`begin_object_of_length`), is kept a window at a time within the call's lent budget, and is sealed
+  under the identity the import named it by, which must be the store's. Each sealed text holds one count until its
+  revision's landing takes it; an import that ends otherwise gives all of them back.
+- `crates/server/src/vcs_store/svn_import.rs`, `crates/server/src/repository/svn_commit.rs` (`stage_texts`,
+  `hand_over`), `crates/server/src/repository/svn_commit/staging.rs` (`Staging::stage`; `due_before` charges a
+  revision's stored texts once, in its post-state, since the shard charged them in the content store as the dump was
+  read; a test's admission cap counts them among what the batch holds, as that charge does), `crates/server/src/vcs_store.rs`
+  (`VcsStores::subversion_with_content`).
+- `crates/svn/tests/import_heap.rs` (new; `slates-mem` a dev-dependency of slates-svn), the room refusal test
+  (`an_import_past_the_room_is_refused`: the text's room is the sink's), GAPS.
+
+Status: built 2026-11-22, macOS arm64 (focused tests); main's gauged `an_import_measured` over git-2000 owed.
+- **Why.** P7 finding (2): an import's footprint stays after it ends, the system allocator keeping its freed
+  temporaries. In w-svn's attribution each text was copied about ten times on the heap below the mapped floor. The
+  first copy was the importer's: `node_record` read each text into a buffer of its header's length, and the revision
+  carried it to its landing, which put it into the content store from there.
+- **What.** The import writes each text where it will live as the dump is read, through the seam a client's commit
+  already uses. The revision names its texts stored, and the landing takes the sink's holds as the texts it put.
+- **Evidence.** `an_import_holds_no_text_whole_on_the_system_heap`: 8 revisions rewriting one file of 524,288 bytes
+  (half the mapped floor), handed to the import 64 KiB at a time. At 2bb00e1cc, through `Standalone::import`, the
+  system allocator's path allocated 4,299,277 bytes and held 4,216,626 live after. Now it allocates 92,309 bytes and
+  holds 21,680 live after.

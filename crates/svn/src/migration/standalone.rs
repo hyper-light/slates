@@ -10,13 +10,17 @@
 //!
 //! **What.** It is the records ([`core::ops::Deref`]) with a text source beside them: a read source, a green and a
 //! text source over both, as [`WithTexts`] is over a daemon's.
+//!
+//! **An import's texts** (the import's module docs, "Texts") go into a sink of its own, in memory ([`HeldTexts`]), as
+//! they are read; a revision's are held here once it commits, the rest given up then, and every one given up where the
+//! import is refused.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use super::records::{TextReading, TextSource, from_offset};
 use super::{Importer, Importing, MigrationRefusal, Repository, WithTexts};
-use crate::commit::drive::Green;
+use crate::commit::drive::{Green, HeldTexts};
 use crate::commit::record::Record;
 use crate::commit::revision::{Revision as RevisionToCommit, StepRefusal};
 use crate::index::{ContentIdentity, Revision};
@@ -31,6 +35,8 @@ pub struct Standalone {
   records: Repository,
   /// Every text the records name stored, by identity, whole.
   texts: BTreeMap<ContentIdentity, Vec<u8>>,
+  /// The texts an import put while it reads a revision, held here once its revision commits (module docs).
+  imported: HeldTexts,
 }
 
 impl Standalone {
@@ -39,6 +45,7 @@ impl Standalone {
     Self {
       records,
       texts: BTreeMap::new(),
+      imported: HeldTexts::new(),
     }
   }
 
@@ -69,7 +76,7 @@ impl Standalone {
   /// # Errors
   /// The records' step's refusal.
   pub fn commit(&mut self, mut revision: RevisionToCommit) -> Result<Revision, StepRefusal> {
-    let taken = self.records.take_texts(&mut revision);
+    let taken = self.texts_of(&mut revision);
     let committed = self.records.commit(revision)?;
     for (identity, bytes) in taken {
       self.texts.entry(identity).or_insert(bytes);
@@ -83,7 +90,7 @@ impl Standalone {
   /// # Errors
   /// As [`Repository::check`].
   pub fn check(&self, mut revision: RevisionToCommit) -> Result<Checked, StepRefusal> {
-    let texts = self.records.take_texts(&mut revision);
+    let texts = self.texts_of(&mut revision);
     let checked = self.records.check(revision)?;
     Ok(Checked { checked, texts })
   }
@@ -98,7 +105,7 @@ impl Standalone {
     locks: &CommitLocks,
     now: AprTime,
   ) -> Result<Checked, StepRefusal> {
-    let texts = self.records.take_texts(&mut revision);
+    let texts = self.texts_of(&mut revision);
     let checked = self.records.check_work(revision, locks, now)?;
     Ok(Checked { checked, texts })
   }
@@ -114,6 +121,21 @@ impl Standalone {
       self.texts.entry(identity).or_insert(bytes);
     }
     Ok(applied)
+  }
+
+  /// The texts `revision` brings that the records do not hold, by identity: those among its contents taken out
+  /// ([`Repository::take_texts`]), and those an import put that it names stored, taken from the import's sink; every
+  /// other text the import put given up (module docs, "An import's texts").
+  fn texts_of(&self, revision: &mut RevisionToCommit) -> BTreeMap<ContentIdentity, Vec<u8>> {
+    let mut texts = self.records.take_texts(revision);
+    let mut imported = self.imported.take_sealed();
+    self.imported.clear();
+    for identity in revision.stored.keys() {
+      if let Some(bytes) = imported.remove(identity) {
+        texts.entry(*identity).or_insert(bytes);
+      }
+    }
+    texts
   }
 
   /// Applies lock entries as [`Repository::apply_lock_entries`] does.
@@ -148,8 +170,9 @@ impl Standalone {
     importer.supply_base(&self.records, text, bytes.into_owned())
   }
 
-  /// Runs `importer` over `buffer` as [`Importer::import`] does, answering its asks for a base from here; a record it
-  /// hands over is the caller's to commit ([`Standalone::commit_record`]).
+  /// Runs `importer` over `buffer` as [`Importer::import`] does, its texts put into the sink held here (module docs,
+  /// "An import's texts") and its asks for a base answered from here; a record it hands over is the caller's to commit
+  /// ([`Standalone::commit_record`]).
   ///
   /// # Errors
   /// As [`Importer::import`] and [`Standalone::supply_base`].
@@ -162,7 +185,15 @@ impl Standalone {
     let mut offset = 0usize;
     loop {
       let rest = buffer.get(offset..).unwrap_or_default();
-      match importer.import(&mut self.records, rest, ended)? {
+      let imported = match importer.import(&mut self.records, &self.imported, rest, ended) {
+        Ok(imported) => imported,
+        // Refused, the texts the import put are given up with its revision.
+        Err(refused) => {
+          self.imported.clear();
+          return Err(refused);
+        }
+      };
+      match imported {
         Importing::Base { consumed, text } => {
           self.supply_base(importer, &text)?;
           offset = offset
@@ -193,6 +224,12 @@ impl Standalone {
   /// The text held under `identity`, whole: held apart, or a property list's bytes the records hold.
   pub fn text(&self, identity: &ContentIdentity) -> Option<Cow<'_, [u8]>> {
     TextSource::text(self, identity)
+  }
+
+  /// The records' mutable side and the import's sink (module docs, "An import's texts"): what a caller that drives an
+  /// [`Importer`] itself, answering its asks for a base, hands each call ([`Standalone::import`] answers them from here).
+  pub fn importing(&mut self) -> (&mut Repository, &HeldTexts) {
+    (&mut self.records, &self.imported)
   }
 
   /// The records' mutable side, for a test that changes them under the texts.

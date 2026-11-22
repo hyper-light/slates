@@ -98,6 +98,12 @@ pub(crate) const REUSED_WHOLE: &str = "vcs_store.git_encode.reused_whole";
 pub(crate) const REUSED_DELTAS: &str = "vcs_store.git_encode.reused_deltas";
 /// Counter: objects whose pushed entry failed its check and were encoded instead (A-859). Format: a counter name.
 pub(crate) const REUSE_REFUSED: &str = "vcs_store.git_encode.reuse_refused";
+/// Counter: objects a finished encoding found in no pack the store holds, encoded with no entry to reuse (A-859).
+/// Format: a counter name.
+pub(crate) const REUSE_NO_ENTRY: &str = "vcs_store.git_encode.reuse_no_entry";
+/// Counter: objects whose pushed entry a finished encoding could not read, encoded instead (A-859). Format: a counter
+/// name.
+pub(crate) const REUSE_UNREAD: &str = "vcs_store.git_encode.reuse_unread";
 /// Counter: an encoding refused, its version left unencoded. Format: a counter name.
 pub(crate) const REFUSED: &str = "vcs_store.git_encode.refused";
 
@@ -192,7 +198,7 @@ fn turn_lent(
   let encoding_at = stores.encodings.0.get(&id).map(|(_, at)| *at);
   let mut kept = 0;
   let mut past = 0;
-  let mut reused = [0_u64; 3];
+  let mut reused = [0_u64; 5];
   let mut past_by_stage = [0_u64; UNITS_PAST_BUDGET_BY_STAGE.len()];
   let advanced: Option<Result<Progress, StoreRefused>> =
     stores.encodings.0.get_mut(&id).map(|(encoding, _)| {
@@ -244,6 +250,8 @@ fn turn_lent(
           counted.reused_whole,
           counted.reused_deltas,
           counted.reuse_refused,
+          counted.reuse_no_entry,
+          counted.reuse_unread,
         ];
       }
       kept = encoded_bytes(stores, id, encoding_at);
@@ -259,9 +267,15 @@ fn turn_lent(
   if begun {
     state.count(BEGUN, 1);
   }
-  for (name, by) in [REUSED_WHOLE, REUSED_DELTAS, REUSE_REFUSED]
-    .iter()
-    .zip(reused)
+  for (name, by) in [
+    REUSED_WHOLE,
+    REUSED_DELTAS,
+    REUSE_REFUSED,
+    REUSE_NO_ENTRY,
+    REUSE_UNREAD,
+  ]
+  .iter()
+  .zip(reused)
   {
     if by > 0 {
       state.count(name, by);
@@ -421,7 +435,8 @@ fn ahead_allowed(state: &mut ShardState, id: RepositoryId) -> bool {
 }
 
 /// Gives back what repository `id` holds of derived values as it goes idle (A-856, "given back when idle"): its
-/// encoding under way dropped (its parts' charge with it; the next fetch begins that version again), and its kept
+/// encoding under way dropped (its parts' charge with it; the next fetch begins that version again), the objects its
+/// reads keep let go (A-860), and its kept
 /// fragments past its learned grant given back by §4.11's cost model ([`relieve`]); counted [`GIVEN_BACK_IDLE`]. A
 /// repository with no grant learned yet keeps its fragments: nothing tells what they are worth.
 pub(crate) fn give_back_idle(state: &mut ShardState, id: RepositoryId) {
@@ -432,7 +447,11 @@ pub(crate) fn give_back_idle(state: &mut ShardState, id: RepositoryId) {
     .get(&id)
     .map_or(0, |(encoding, _)| encoding.held_bytes());
   drop_under_way(state, id);
-  let mut given = under_way;
+  // A-860: what its reads keep (the objects read lately, git's delta base cache) is given back too, its budget kept.
+  let recent = state.vcs_stores.git(id).map_or(0, |(content, store)| {
+    store.repository.let_go_recent(content)
+  });
+  let mut given = under_way.saturating_add(recent);
   if let Some(grant) = crate::vcs_share::budget(state, id) {
     let held = crate::vcs_share::held(state, id);
     if held > grant {
@@ -515,6 +534,18 @@ fn encode_behind(state: &mut ShardState, id: RepositoryId) {
       state.vcs_stores.encodings.1.remove(&id);
     }
   }
+}
+
+/// The units repository `id`'s encoding under way has done (none when none is under way): a test's sign that its turns
+/// progress (`vcs_store::upload::tests`'s judge of a drive).
+#[cfg(test)]
+pub(crate) fn units_done(state: &ShardState, id: RepositoryId) -> Option<u64> {
+  state
+    .vcs_stores
+    .encodings
+    .0
+    .get(&id)
+    .map(|(encoding, _)| encoding.counters().units)
 }
 
 #[cfg(test)]

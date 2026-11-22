@@ -6,7 +6,7 @@ use std::borrow::Cow;
 
 use slates_vcs::ContentStore;
 
-use super::{Intake, Intaken, KeptText, Refused, Stepped};
+use super::{Intake, Intaken, KeptText, PushSegment, Refused, Stepped};
 use crate::bundle2::Bundle2;
 use crate::fixtures::CG03;
 use crate::index::{HgIndex, Log};
@@ -1144,4 +1144,204 @@ fn an_intakes_bookkeeping_covers_what_its_steps_keep() {
   assert!(told > 0, "a push keeps something");
   assert!(kept <= told, "kept {kept} of the {told} told");
   finished(intake);
+}
+
+/// Format: the bytes of the stock changegroup a segment is cut at in [`an_intake_cuts_its_kept_texts_into_segments`]:
+/// small, so the stock push cuts into several.
+const SEGMENT_BYTES: u64 = 256;
+
+/// Main 01a20182's ruling (b1) of 2026-11-22 04:44 (a push lands as a run of segment changesets; it holds one segment's
+/// kept texts at a time). Do: take the stock changegroup whole once without cutting and once cut at [`SEGMENT_BYTES`],
+/// taking each segment as it is cut and the rest once every unit is taken. Expect more than one segment; the segments'
+/// texts, each place moved back by its slice's start, the texts the uncut take kept, in order; each text's place within
+/// its slice; every log's kept revisions covered by the segments' ranges with none twice; what each charged more than
+/// nothing; and the cut take bringing no texts of its own.
+#[test]
+fn an_intake_cuts_its_kept_texts_into_segments() {
+  let part = stock();
+  let mut whole_store = store();
+  let mut empty = HgIndex::new();
+  let (_, whole, _) = intake(&part, &mut empty, &mut whole_store, &mut room()).unwrap();
+  let (segments, cut) = cut_take(&part, SEGMENT_BYTES);
+  assert!(segments.len() > 1, "{} segments", segments.len());
+  assert!(
+    cut.texts.is_empty(),
+    "the cut take holds no texts of its own"
+  );
+  assert_eq!(
+    segments_texts(&segments),
+    whole.texts,
+    "the segments' texts the uncut take's"
+  );
+  assert_each_revision_once(&segments);
+}
+
+/// `part` taken whole into an empty index, cut at `bound`: each segment taken as it is cut, the rest once every unit is
+/// taken; the segments and what the take brought.
+fn cut_take(part: &ChangegroupPart, bound: u64) -> (Vec<PushSegment>, Intaken) {
+  let mut store = store();
+  let mut index = HgIndex::new();
+  let mut admission = room();
+  let mut taking = Intake::begin(
+    (part.version, &part.payload),
+    &mut index,
+    &mut store,
+    &mut admission,
+  )
+  .unwrap()
+  .cutting(bound);
+  let mut segments = Vec::new();
+  loop {
+    let stepped = taking
+      .step(&part.payload, &mut store, &mut admission)
+      .unwrap();
+    segments.extend(std::iter::from_fn(|| taking.take_segment()));
+    match stepped {
+      Stepped::Store => taking.answer_from_fork(&store),
+      stepped if more(&stepped) => {}
+      _ => break,
+    }
+  }
+  taking.cut_rest();
+  segments.extend(std::iter::from_fn(|| taking.take_segment()));
+  let (_, cut) = finished(taking);
+  (segments, cut)
+}
+
+/// The texts of `segments`, in order, each place moved back by its slice's start; each segment charged more than
+/// nothing, and each place within its slice.
+fn segments_texts(segments: &[PushSegment]) -> Vec<KeptText> {
+  let mut texts = Vec::new();
+  for segment in segments {
+    assert!(segment.charged > 0);
+    let len = segment.slice.end - segment.slice.start;
+    for kept in &segment.texts {
+      assert!(kept.place.end <= len, "a text's place within its slice");
+      let mut whole_place = kept.clone();
+      whole_place.place =
+        kept.place.start + segment.slice.start..kept.place.end + segment.slice.start;
+      texts.push(whole_place);
+    }
+  }
+  texts
+}
+
+/// Every log's kept revisions covered by `segments`' ranges, each once and in order.
+fn assert_each_revision_once(segments: &[PushSegment]) {
+  let mut covered: std::collections::BTreeMap<String, Vec<u32>> = std::collections::BTreeMap::new();
+  for (log, first, end) in segments.iter().flat_map(|segment| &segment.ranges) {
+    covered
+      .entry(format!("{log:?}"))
+      .or_default()
+      .extend(*first..*end);
+  }
+  for (log, revisions) in covered {
+    let mut sorted = revisions.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(
+      sorted, revisions,
+      "{log}'s kept revisions each once, in order"
+    );
+  }
+}
+
+/// Main 01a20182's order of 2026-11-22 05:04 (a push whose keeping and a step's least room are past its repository's
+/// ceiling is refused typed at its begin, never waited for): the sound lower bound on a step's room the framing tells.
+/// Do: begin stock 7.2's changegroup and read its widest full text; take it whole. Expect the widest text a delta
+/// against the null base carries (its one hunk's insert) among the decoded revisions, more than nothing, and no more than
+/// the longest text a step rebuilt and charged.
+#[test]
+fn an_intakes_widest_full_text_is_the_least_room_a_step_of_it_takes() {
+  let part = stock();
+  let decoded =
+    crate::changegroup::Changegroup::decode(&part.payload, part.version, &mut room()).unwrap();
+  let mut groups = vec![
+    decoded.group(&decoded.changelog),
+    decoded.group(&decoded.manifests),
+  ];
+  groups.extend(
+    decoded
+      .files
+      .iter()
+      .map(|group| decoded.group(&group.revisions)),
+  );
+  let expected = groups
+    .iter()
+    .flat_map(|group| group.iter())
+    .filter(|revision| revision.base == crate::NULL_NODE)
+    .map(|revision| {
+      (revision.data.len() as u64).saturating_sub(crate::delta::HUNK_HEADER_LEN as u64)
+    })
+    .max()
+    .unwrap();
+  let mut store = store();
+  let mut index = HgIndex::new();
+  let begun = Intake::begin(
+    (part.version, &part.payload),
+    &mut index,
+    &mut store,
+    &mut room(),
+  )
+  .unwrap();
+  let widest = begun.widest_full_text();
+  begun.abandon(&mut store).unwrap();
+  assert!(widest > 0, "stock 7.2's bundle carries whole texts");
+  assert_eq!(widest, expected, "the widest whole text the framing tells");
+  let (fork, intaken, _) = intake(&part, &mut index, &mut store, &mut room()).unwrap();
+  assert!(
+    widest <= intaken.longest_step_bytes,
+    "{widest} past the longest text a step charged, {}",
+    intaken.longest_step_bytes
+  );
+  fork.release(&mut store).unwrap();
+}
+
+/// Main 01a20182's ruling (b1) of 2026-11-22 04:44 (a push's segment changeset's `Record`: record v8, its rows by
+/// identity, as an import's segment's). Do: take stock 7.2's changegroup into an empty index cut at [`SEGMENT_BYTES`],
+/// writing each segment's record as it is cut and the rest's once every unit is taken; replay the records in order into
+/// another empty index over the same content store. Expect more than one record, each a push's; and the replayed
+/// index the intake's fork row for row.
+#[test]
+fn a_pushs_segment_records_replay_in_order_to_its_forks_rows() {
+  let part = stock();
+  let mut store = store();
+  let mut index = HgIndex::new();
+  let mut admission = room();
+  let mut taking = Intake::begin(
+    (part.version, &part.payload),
+    &mut index,
+    &mut store,
+    &mut admission,
+  )
+  .unwrap()
+  .cutting(SEGMENT_BYTES);
+  let mut records = Vec::new();
+  let mut recorded = |taking: &mut Intake, store: &ContentStore| {
+    while let Some(segment) = taking.take_segment() {
+      records.push(taking.segment_record(&segment, 1 << 20, store).unwrap());
+    }
+  };
+  loop {
+    let stepped = taking
+      .step(&part.payload, &mut store, &mut admission)
+      .unwrap();
+    recorded(&mut taking, &store);
+    match stepped {
+      Stepped::Store => taking.answer_from_fork(&store),
+      stepped if more(&stepped) => {}
+      _ => break,
+    }
+  }
+  taking.cut_rest();
+  recorded(&mut taking, &store);
+  let (mut fork, _) = finished(taking);
+  assert!(records.len() > 1, "{} records", records.len());
+  let mut replayed = HgIndex::new();
+  for bytes in &records {
+    crate::import::record::replay(bytes, &mut replayed, &mut store).unwrap();
+  }
+  assert_eq!(rows(&mut replayed, &store), rows(&mut fork, &store));
+  replayed.release(&mut store).unwrap();
+  fork.release(&mut store).unwrap();
 }

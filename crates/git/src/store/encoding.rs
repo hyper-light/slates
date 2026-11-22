@@ -38,7 +38,7 @@
 //! object, its base and the candidates its learned window tries are held whole while it is encoded, as before.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use slates_vcs::{ContentId, ContentStore, Writing};
 
@@ -52,6 +52,7 @@ use super::packed::{self, InPack, PackSource};
 use super::positions::Positions;
 use super::push::StoredAt;
 use super::repository::{Repository, StoreRefused};
+use super::rows::ObjectRow;
 use super::upload::{Progress, Turn};
 
 /// An object's place in the encoding's order: its type, its length (the largest first), its id, and its position.
@@ -71,6 +72,9 @@ struct Part {
   encoder: Encoder,
   bytes: Vec<u8>,
   placed: Vec<Placed>,
+  /// Where each placed object's record is in `placed`, by its id (A-859: a reused delta's base found in one lookup,
+  /// however many the part holds).
+  by_id: HashMap<ObjectId, usize>,
 }
 
 impl Part {
@@ -80,7 +84,19 @@ impl Part {
       encoder: Encoder::new(true),
       bytes: Vec::new(),
       placed: Vec::new(),
+      by_id: HashMap::new(),
     }
+  }
+
+  /// `record` placed in the part, its entry's bytes written already.
+  fn place(&mut self, record: Placed) {
+    self.by_id.insert(record.id, self.placed.len());
+    self.placed.push(fragment::in_fragment(record));
+  }
+
+  /// The record of `id` placed in the part; none where it is not.
+  fn placed_of(&self, id: &ObjectId) -> Option<&Placed> {
+    self.placed.get(*self.by_id.get(id)?)
   }
 }
 
@@ -96,6 +112,69 @@ enum Current {
   Put(Box<Putting>),
   /// Its pushed entry's data being copied a window a unit (A-859), its header written.
   Copy(Box<Copying>),
+}
+
+/// Whether a pushed entry may be sent on for `object` (A-859): its name its bytes', and then, whole, its data (inflated in
+/// `scratch`) the object its name says; a delta, its data applied to its base `base_id` the object's bytes.
+fn entry_checked(
+  repository: &Repository,
+  store: &ContentStore,
+  (object, raw, scratch, base_id): (&Reading, &packed::RawEntry, &[u8], Option<ObjectId>),
+) -> bool {
+  let format = repository.format();
+  let named = |bytes: &[u8]| {
+    crate::object_name::name_of(format, object.kind, bytes).is_ok_and(|named| named == object.id)
+  };
+  if !named(&object.bytes) {
+    return false;
+  }
+  match base_id {
+    None => raw.representation == Representation::Whole(object.kind) && named(scratch),
+    Some(base) => repository
+      .indexed(store, &base)
+      .and_then(|(row, content)| {
+        repository.read_stored(store, &repository.stored_of(&row, content), row.len)
+      })
+      .is_some_and(|base_bytes| {
+        let mut built = Vec::new();
+        crate::delta::apply_to(&base_bytes, scratch, &mut built).is_ok() && built == object.bytes
+      }),
+  }
+}
+
+/// The copy of `object`'s pushed entry (`raw`, at `place`) written at `at` as `placed` says, its header `header`
+/// written and counted into its CRC.
+fn copying_of(
+  object: &Reading,
+  (place, raw): (InPack, &packed::RawEntry),
+  (at, depth, stored, base): (u64, u64, Stored, Option<u64>),
+  header: &[u8],
+) -> Copying {
+  let mut crc = crc32fast::Hasher::new();
+  crc.update(header);
+  Copying {
+    placed: Placed {
+      id: object.id,
+      position: object.position,
+      kind: object.kind,
+      offset: at,
+      crc: 0,
+      depth,
+      stored,
+      base,
+    },
+    object: ToEncode {
+      id: object.id,
+      position: object.position,
+      kind: object.kind,
+      bytes: object.bytes.clone(),
+      named: None,
+    },
+    place,
+    from: raw.data,
+    end: raw.end,
+    crc,
+  }
 }
 
 /// A pushed entry being copied into a part (A-859): its record (its CRC once its last byte is copied), its object (kept
@@ -216,6 +295,11 @@ pub struct EncodingCounters {
   pub reused_deltas: u64,
   /// Objects whose stored entry failed its check (its data not the object its name says) and were encoded instead.
   pub reuse_refused: u64,
+  /// Objects that lie in no pack the store holds (kept as content), encoded with no entry to reuse (A-859).
+  pub reuse_no_entry: u64,
+  /// Objects whose pushed entry could not be read, or whose offset delta's base is no object of this encoding, encoded
+  /// instead (A-859).
+  pub reuse_unread: u64,
 }
 
 /// A version's fragments, or a green's base pack, being encoded (module docs).
@@ -232,6 +316,10 @@ pub struct Encoding {
   others: BTreeSet<Key>,
   /// The blobs not yet encoded, in order.
   blobs: BTreeSet<Key>,
+  /// The objects the part encodes before it goes on in its order, the last first (A-859, git's `write_one`: a delta's
+  /// base written before it): an object whose pushed entry is a delta against one still in the order, and that base
+  /// above it; as deep as the deepest chain any push carried (`Repository::learned_depth`).
+  ahead: Vec<Key>,
   /// The commits, trees and tags' part, once encoded.
   objects: Option<Encoded>,
   stage: Stage,
@@ -285,6 +373,7 @@ impl Encoding {
       named: BTreeMap::new(),
       others: BTreeSet::new(),
       blobs: BTreeSet::new(),
+      ahead: Vec::new(),
       objects: None,
       stage,
       spent_ns: 0,
@@ -356,6 +445,7 @@ impl Encoding {
       let progress = match self
         .unit(repository, store, (exchange, quantum_ns))
         .and_then(|progress| self.true_up(store).map(|()| progress))
+        .inspect(|_| repository.true_up_recent(store))
       {
         Ok(progress) => progress,
         Err(refused) => {
@@ -565,16 +655,8 @@ impl Encoding {
           };
           let at = PACK_HEADER_LEN.saturating_add(to_u64(part.bytes.len()));
           // A-859: an object pushed in a pack is sent on as its entry lies there, where its check holds and its base
-          // the client reads; otherwise it is encoded.
-          let tries = {
-            let learning = repository.learning(exchange);
-            part
-              .encoder
-              .would_try(object.kind, named.is_some(), &learning)
-          };
-          if let Some((header, copying)) =
-            self.reused(repository, store, (&part, &object, tries, at))
-          {
+          // the client reads (main 01a20182's ruling of 2026-11-22 05:38: whenever it has one); otherwise it is encoded.
+          if let Some((header, copying)) = self.reused(repository, store, (&part, &object, at)) {
             part.bytes.extend_from_slice(&header);
             return Ok(Stage::Encode {
               blobs,
@@ -630,7 +712,7 @@ impl Encoding {
           part
             .encoder
             .remember(object, (placed.offset, placed.depth), &learning);
-          part.placed.push(fragment::in_fragment(placed));
+          part.place(placed);
           self.counters.objects = self.counters.objects.saturating_add(1);
           None
         }
@@ -653,7 +735,7 @@ impl Encoding {
           }
           Put::Done(bytes, record) => {
             part.bytes.extend_from_slice(&bytes);
-            part.placed.push(fragment::in_fragment(record));
+            part.place(record);
             self.counters.objects = self.counters.objects.saturating_add(1);
             None
           }
@@ -678,82 +760,38 @@ impl Encoding {
     &mut self,
     repository: &Repository,
     store: &ContentStore,
-    (part, object, tries, at): (&Part, &Reading, bool, u64),
+    (part, object, at): (&Part, &Reading, u64),
   ) -> Option<(Vec<u8>, Copying)> {
     let StoredAt::InPack(place) = object.stored else {
+      self.counters.reuse_no_entry = self.counters.reuse_no_entry.saturating_add(1);
       return None;
     };
-    let format = repository.format();
     let mut scratch = Vec::new();
-    let raw = packed::raw_entry(
+    let Ok(raw) = packed::raw_entry(
       store,
-      (place, format),
+      (place, repository.format()),
       (&mut scratch, repository.largest_object().max(object.len)),
-    )
-    .ok()?;
-    let named_ok = crate::object_name::name_of(format, object.kind, &object.bytes)
-      .is_ok_and(|named| named == object.id);
-    // A whole entry is sent on only where encoding it would try no delta (git searches first, then reuses it whole).
-    if matches!(raw.representation, Representation::Whole(_)) && tries {
+    ) else {
+      self.counters.reuse_unread = self.counters.reuse_unread.saturating_add(1);
       return None;
-    }
+    };
     let base_id = match raw.representation {
       Representation::Whole(_) => None,
-      Representation::OfsDelta { base } => Some(*self.offsets.get(&(place.pack, base))?),
+      Representation::OfsDelta { base } => {
+        let Some(base) = self.offsets.get(&(place.pack, base)) else {
+          self.counters.reuse_unread = self.counters.reuse_unread.saturating_add(1);
+          return None;
+        };
+        Some(*base)
+      }
       Representation::RefDelta { base } => Some(base),
     };
-    let checked = named_ok
-      && match base_id {
-        None => {
-          raw.representation == Representation::Whole(object.kind)
-            && crate::object_name::name_of(format, object.kind, &scratch)
-              .is_ok_and(|named| named == object.id)
-        }
-        Some(base) => repository
-          .indexed(store, &base)
-          .and_then(|(row, content)| {
-            repository.read_stored(store, &repository.stored_of(&row, content), row.len)
-          })
-          .is_some_and(|base_bytes| {
-            let mut built = Vec::new();
-            crate::delta::apply_to(&base_bytes, &scratch, &mut built).is_ok()
-              && built == object.bytes
-          }),
-      };
-    if !checked {
+    let (representation, depth, stored, base) =
+      self.placement(repository, store, (part, object.kind, base_id))?;
+    if !entry_checked(repository, store, (object, &raw, &scratch, base_id)) {
       self.counters.reuse_refused = self.counters.reuse_refused.saturating_add(1);
       return None;
     }
-    let (representation, depth, stored, base) = match base_id {
-      None => (Representation::Whole(object.kind), 0, Stored::Whole, None),
-      Some(base) => {
-        if let Some(placed) = part.placed.iter().find(|placed| placed.id == base) {
-          let depth = placed.depth.saturating_add(1);
-          if depth > repository.learned_depth() {
-            return None;
-          }
-          let base_at = placed.offset.saturating_add(PACK_HEADER_LEN);
-          (
-            Representation::OfsDelta { base: base_at },
-            depth,
-            Stored::Offset,
-            Some(base_at),
-          )
-        } else {
-          let (row, _) = repository.indexed(store, &base)?;
-          if self.positions.contains(row.position) {
-            // Its base is one this encoding places later: it is encoded, so no delta precedes its base.
-            return None;
-          }
-          (
-            Representation::RefDelta { base },
-            1,
-            Stored::Reference,
-            Some(row.position),
-          )
-        }
-      }
-    };
     let mut header = Vec::new();
     entry::write(
       entry::Header {
@@ -764,37 +802,97 @@ impl Encoding {
       &mut header,
     )
     .ok()?;
-    let mut crc = crc32fast::Hasher::new();
-    crc.update(&header);
     if stored == Stored::Whole {
       self.counters.reused_whole = self.counters.reused_whole.saturating_add(1);
     } else {
       self.counters.reused_deltas = self.counters.reused_deltas.saturating_add(1);
     }
-    let copying = Copying {
-      placed: Placed {
-        id: object.id,
-        position: object.position,
-        kind: object.kind,
-        offset: at,
-        crc: 0,
-        depth,
-        stored,
-        base,
-      },
-      object: ToEncode {
-        id: object.id,
-        position: object.position,
-        kind: object.kind,
-        bytes: object.bytes.clone(),
-        named: None,
-      },
-      place,
-      from: raw.data,
-      end: raw.end,
-      crc,
-    };
+    let copying = copying_of(object, (place, &raw), (at, depth, stored, base), &header);
     Some((header, copying))
+  }
+
+  /// How a reused entry of `kind` names its base `base_id` (A-859): whole; an offset delta to an earlier entry of this
+  /// part, its chain within the deepest any push carried; or a reference delta to an object of an earlier version,
+  /// beginning a chain. Its representation, its chain's depth, how it holds its object and its base's record; none where
+  /// the base is one this encoding places later (it is encoded, so no delta precedes its base) or the chain would be
+  /// past the depth.
+  fn placement(
+    &self,
+    repository: &Repository,
+    store: &ContentStore,
+    (part, kind, base_id): (&Part, Kind, Option<ObjectId>),
+  ) -> Option<(Representation, u64, Stored, Option<u64>)> {
+    let Some(base) = base_id else {
+      return Some((Representation::Whole(kind), 0, Stored::Whole, None));
+    };
+    if let Some(placed) = part.placed_of(&base) {
+      let depth = placed.depth.saturating_add(1);
+      if depth > repository.learned_depth() {
+        return None;
+      }
+      let base_at = placed.offset.saturating_add(PACK_HEADER_LEN);
+      return Some((
+        Representation::OfsDelta { base: base_at },
+        depth,
+        Stored::Offset,
+        Some(base_at),
+      ));
+    }
+    let (row, _) = repository.indexed(store, &base)?;
+    if self.positions.contains(row.position) {
+      return None;
+    }
+    Some((
+      Representation::RefDelta { base },
+      1,
+      Stored::Reference,
+      Some(row.position),
+    ))
+  }
+
+  /// The base to place before the object `row` names (A-859, git's `write_one`): where its pushed entry is a delta
+  /// against an object still in the part's order, not yet placed, within the deepest chain any push carried, that
+  /// base taken out of the order to go first. Read from the entry's header alone; none to go on with the object.
+  fn base_first(
+    &mut self,
+    repository: &Repository,
+    store: &ContentStore,
+    (part, blobs): (&Part, bool),
+    (row, content): (&ObjectRow, ContentId),
+  ) -> Option<Key> {
+    let StoredAt::InPack(place) = repository.stored_of(row, content) else {
+      return None;
+    };
+    if to_u64(self.ahead.len()) >= repository.learned_depth() {
+      return None;
+    }
+    let header = packed::entry_header(
+      store,
+      (place, repository.format()),
+      repository.largest_object().max(row.len),
+    )
+    .ok()?;
+    let base = match header.representation {
+      Representation::Whole(_) => return None,
+      Representation::OfsDelta { base } => *self.offsets.get(&(place.pack, base))?,
+      Representation::RefDelta { base } => base,
+    };
+    if part.placed_of(&base).is_some() {
+      return None;
+    }
+    let (base_row, _) = repository.indexed(store, &base)?;
+    let key = (
+      base_row.kind,
+      Reverse(base_row.len),
+      base,
+      base_row.position,
+    );
+    let order = if blobs {
+      &mut self.blobs
+    } else {
+      &mut self.others
+    };
+    order.remove(&key).then_some(key)
   }
 
   /// The part's next object begun: its row and its named base's row read, its bytes left to read a window a unit;
@@ -810,12 +908,22 @@ impl Encoding {
     } else {
       &mut self.others
     };
-    let Some((_, _, id, position)) = order.pop_first() else {
+    let Some(key) = self.ahead.pop().or_else(|| order.pop_first()) else {
       return Ok(self.part_ended(blobs, part));
     };
+    let (_, _, id, position) = key;
     let (row, content) = repository
       .indexed(store, &id)
       .ok_or(StoreRefused::Missing { id })?;
+    if let Some(base) = self.base_first(repository, store, (&part, blobs), (&row, content)) {
+      self.ahead.push(key);
+      self.ahead.push(base);
+      return Ok(Stage::Encode {
+        blobs,
+        part: Box::new(part),
+        current: None,
+      });
+    }
     let object = Reading {
       id,
       position,
