@@ -1978,7 +1978,8 @@ struct MemorySample {
 /// own report counts as live: its heap's bytes in live allocations and its arenas' bytes allocated, each grown since
 /// `before`. The footprint may exceed it by the allocator's own waste and no more: a size-class allocator rounds a block
 /// up to its class, at most to twice its size (classes grow by at most a factor of two), so the footprint's growth is
-/// bounded by [`HELD_FACTOR`] times the live growth. Refused, the figures that broke it; skipped (Ok) where `top` read no
+/// bounded by [`HELD_FACTOR`] times the live growth, and each footprint read off by `top`'s resolution
+/// ([`FOOTPRINT_RESOLUTION`]). Refused, the figures that broke it; skipped (Ok) where `top` read no
 /// footprint (off macOS).
 fn held_after_import(before: &MemorySample, idle: &MemorySample) -> Result<(), String> {
   let (Some(at_start), Some(at_idle)) = (before.footprint, idle.footprint) else {
@@ -1992,7 +1993,10 @@ fn held_after_import(before: &MemorySample, idle: &MemorySample) -> Result<(), S
     .saturating_sub(before.heap_in_use)
     .saturating_add(idle.arena.saturating_sub(before.arena));
   let grown = at_idle.saturating_sub(at_start);
-  let bound = live.saturating_mul(HELD_FACTOR);
+  // Each footprint read is `top`'s, rounded to its resolution: the two reads' difference may be off by one each.
+  let bound = live
+    .saturating_mul(HELD_FACTOR)
+    .saturating_add(FOOTPRINT_RESOLUTION.saturating_mul(2));
   if grown > bound {
     return Err(format!(
       "an_import_measured: the daemon's footprint grew {grown} B over the import and 30 s of idle, past {HELD_FACTOR} x \
@@ -2003,6 +2007,10 @@ fn held_after_import(before: &MemorySample, idle: &MemorySample) -> Result<(), S
   Ok(())
 }
 
+/// Format: the resolution of `top`'s `MEM` column, which reads a footprint in whole MiB once it passes a few MiB (read as
+/// 46080K, 51200K, 56320K: multiples of 1,024 KiB); the held-memory bound allows it once a read.
+const FOOTPRINT_RESOLUTION: u64 = 1 << 20;
+
 /// Derived: a size-class allocator rounds a block up to its class, classes growing by at most a factor of two, so live
 /// bytes take at most twice their size in pages (finding (2)'s bound, [`held_after_import`]).
 const HELD_FACTOR: u64 = 2;
@@ -2012,7 +2020,7 @@ const HELD_FACTOR: u64 = 2;
 /// own process, so nothing suspends it (A-232's gotcha: `vmmap` and `heap` did, and the anchor's watchdog ended it).
 fn memory_sample(instance: &str, label: &str) -> MemorySample {
   let rss = daemon_rss_kib(instance);
-  let footprint = daemon_pid(instance).and_then(footprint_kib);
+  let footprint = daemon_pid(instance).and_then(footprint_within);
   let (_, memory, _) = slates(instance, &["status", "--memory"]);
   let lines: Vec<&str> = memory
     .lines()
@@ -2047,6 +2055,24 @@ fn memory_sample(instance: &str, label: &str) -> MemorySample {
       .iter()
       .filter_map(|line| figure(line, "arena.allocated: "))
       .sum(),
+  }
+}
+
+/// Shape: how long a sample waits for `top` to read a footprint it missed (main 01a20182's run of 2026-11-22 01:36 read
+/// none at the 2 s sample, once in four): a bound on a transient miss, far above one read's few hundred milliseconds.
+const FOOTPRINT_PATIENCE: Duration = Duration::from_secs(5);
+
+/// [`footprint_kib`] asked again until it reads one or [`FOOTPRINT_PATIENCE`] passes; none off macOS.
+fn footprint_within(pid: u32) -> Option<u64> {
+  let started = Instant::now();
+  loop {
+    if let Some(footprint) = footprint_kib(pid) {
+      return Some(footprint);
+    }
+    if !cfg!(target_os = "macos") || started.elapsed() >= FOOTPRINT_PATIENCE {
+      return None;
+    }
+    pause();
   }
 }
 
