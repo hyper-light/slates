@@ -497,9 +497,13 @@ fn stock_svn_sessions_hold_against_stock_svnserve() {
 }
 
 /// The anchor process, killed and reaped when dropped, so a failed assertion leaves no daemon behind; what it says
-/// after its daemon served is copied to this process's standard error by `drain`, which the drop joins.
+/// after its daemon served is copied to this process's standard error by `drain`, which the drop joins within
+/// [`DRAIN_PATIENCE`].
 struct Anchor {
   child: Child,
+  /// Its instance, which names its daemon and every helper the daemon starts (a view's `slates mount`) on their command
+  /// lines: each is killed with the anchor ([`instance_processes`]).
+  instance: String,
   drain: Option<std::thread::JoinHandle<()>>,
   /// The directory its daemon's changeset store lives in (`--vcs-store`; C2: a daemon without one makes no Subversion
   /// repository), removed after the anchor is killed; none where the caller named its own.
@@ -507,13 +511,50 @@ struct Anchor {
 }
 
 impl Drop for Anchor {
+  /// Kills the anchor, then its daemon and every process of its instance, which hold the drain's pipe open (the daemon
+  /// leaves on its own once it sees the anchor gone, but a helper it started need not), and waits for the drain at most
+  /// [`DRAIN_PATIENCE`]: main's all-verbs round of 2026-11-21 sat at 0% CPU for 18 minutes after a failed assertion,
+  /// joining a drain the daemon's side still held.
   fn drop(&mut self) {
     let _ = self.child.kill();
     let _ = self.child.wait();
+    for pid in instance_processes(&self.instance) {
+      let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+    }
     if let Some(drain) = self.drain.take() {
-      let _ = drain.join();
+      let started = Instant::now();
+      while !drain.is_finished() && started.elapsed() < DRAIN_PATIENCE {
+        pause();
+      }
+      if drain.is_finished() {
+        let _ = drain.join();
+      } else {
+        eprintln!(
+          "the anchor's drain was still held {DRAIN_PATIENCE:?} after its processes were killed: left to end with the test"
+        );
+      }
     }
   }
+}
+
+/// Shape: how long a dropped anchor's drain may take to end once its processes are killed: a guard against a holder
+/// nobody killed, far above the instant a killed process's pipe closes, never a measure of it.
+const DRAIN_PATIENCE: Duration = Duration::from_secs(10);
+
+/// Every process whose command line names `instance` but the anchor's own (`ps`): its daemon and the helpers the daemon
+/// started.
+fn instance_processes(instance: &str) -> Vec<u32> {
+  let Ok(listed) = Command::new("ps")
+    .args(["-A", "-o", "pid=,command="])
+    .output()
+  else {
+    return Vec::new();
+  };
+  String::from_utf8_lossy(&listed.stdout)
+    .lines()
+    .filter(|line| line.contains(&format!("--instance {instance} ")) && !line.contains(" anchor "))
+    .filter_map(|line| line.split_whitespace().next()?.parse().ok())
+    .collect()
 }
 
 /// Runs `slates --instance INSTANCE ARGS`: its exit code and both outputs.
@@ -586,6 +627,7 @@ fn start_anchor(instance: &str, edges: &[&str]) -> (Anchor, Vec<String>, IssuerS
   let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
   let mut anchor = Anchor {
     child,
+    instance: instance.to_owned(),
     drain: None,
     _store: store,
   };
@@ -2212,43 +2254,43 @@ fn use_choices() -> (Vec<String>, u64) {
   (verbs, samples)
 }
 
-/// The control: stock FSFS repository `control` under `root` loaded with `dump`, cut to its first
+/// The control: stock FSFS repository [`REPOSITORY`] under `root` (named as slates' is, so an answer that names the
+/// repository, `svn info`'s `path`, names it alike) loaded with `dump`, cut to its first
 /// `SLATES_SVN_USE_REVISIONS` revisions where that is set, its revision property changes allowed by a hook. The cut
 /// dump's path, for slates' import.
 #[allow(clippy::disallowed_methods)] // test code: the control's repository, hook and the cut dump, in the scratch
 fn use_control_loaded(scratch: &str, root: &str, dump: &str) -> String {
-  let control_repository = format!("{root}/control");
+  let control_repository = format!("{root}/{REPOSITORY}");
   let made = tool("svnadmin", scratch, &["create", &control_repository]);
   assert_eq!(made.0, 0, "svnadmin create: {made:?}");
-  let loaded = Command::new("svnadmin")
-    .args(["load", "-q", &control_repository])
-    .stdin(std::fs::File::open(dump).unwrap())
-    .output()
-    .unwrap();
-  assert!(loaded.status.success(), "svnadmin load: {loaded:?}");
+  // Every stock tool through `tool`, so each wait is bounded (`--file`, svnadmin 1.10's, in place of a piped stream).
+  let loaded = tool(
+    "svnadmin",
+    scratch,
+    &["load", "-q", "--file", dump, &control_repository],
+  );
+  assert_eq!(loaded.0, 0, "svnadmin load: {loaded:?}");
   let cut = format!("{scratch}/cut.dump");
-  let mut range = vec!["dump", "-q", control_repository.as_str()];
+  let mut range = vec![
+    "dump",
+    "-q",
+    "--file",
+    cut.as_str(),
+    control_repository.as_str(),
+  ];
   let revisions = std::env::var("SLATES_SVN_USE_REVISIONS").ok();
   let upper = revisions.as_ref().map(|n| format!("0:{n}"));
   if let Some(upper) = upper.as_deref() {
     range.extend(["-r", upper]);
   }
-  let dumped = Command::new("svnadmin").args(&range).output().unwrap();
-  assert!(dumped.status.success(), "svnadmin dump: {dumped:?}");
-  std::fs::write(&cut, dumped.stdout).unwrap();
+  let dumped = tool("svnadmin", scratch, &range);
+  assert_eq!(dumped.0, 0, "svnadmin dump: {dumped:?}");
   if revisions.is_some() {
-    let again = format!("{root}/control-cut");
+    let again = format!("{root}/{REPOSITORY}-cut");
     let made = tool("svnadmin", scratch, &["create", &again]);
     assert_eq!(made.0, 0, "svnadmin create: {made:?}");
-    let loaded = Command::new("svnadmin")
-      .args(["load", "-q", &again])
-      .stdin(std::fs::File::open(&cut).unwrap())
-      .output()
-      .unwrap();
-    assert!(
-      loaded.status.success(),
-      "svnadmin load of the cut: {loaded:?}"
-    );
+    let loaded = tool("svnadmin", scratch, &["load", "-q", "--file", &cut, &again]);
+    assert_eq!(loaded.0, 0, "svnadmin load of the cut: {loaded:?}");
     std::fs::remove_dir_all(&control_repository).unwrap();
     std::fs::rename(&again, &control_repository).unwrap();
   }
@@ -2597,7 +2639,7 @@ fn a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve() {
         ),
       ],
     ),
-    url: format!("svn+{CONTROL_TUNNEL}://localhost/control"),
+    url: format!("svn+{CONTROL_TUNNEL}://localhost/{REPOSITORY}"),
   };
   // Slates: the same revisions imported, served on the route `SLATES_SVN_USE_ROUTE` names (svn:// by default).
   let route = std::env::var("SLATES_SVN_USE_ROUTE").unwrap_or_else(|_| "svn".to_owned());

@@ -249,6 +249,14 @@ impl Merge {
   pub fn tables_cut(&self) -> usize {
     self.cuts.len()
   }
+
+  /// The bytes of the tables cut so far: what its last step puts into the content store ([`Index::merge_step`]), and
+  /// so all the room a step is lent (a step before it cuts a table into memory and puts nothing).
+  pub fn cut_bytes(&self) -> u64 {
+    self.cuts.iter().fold(0_u64, |total, cut| {
+      total.saturating_add(u64::try_from(cut.bytes.len()).unwrap_or(u64::MAX))
+    })
+  }
 }
 
 /// What one step of a merge did.

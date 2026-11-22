@@ -16491,6 +16491,16 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > hold. Owed: the landed changesets of a destroyed repository on the node's store (A-767), which only a landing may
 > remove (R1).
 
+> **Status (2026-11-21, A-844: piece 2's working set, the miss-ratio curve).** `slates_vcs::mrc::Curve` is a
+> repository's working set as fixed-size SHARDS (spatially hashed sampling, the threshold falling as the sampled set
+> passes its capacity, counts rescaled), its reuse distances in O(log capacity) by a Fenwick tree over access slots, in
+> power-of-two bins of the content window; exact against Mattson's LRU stack at rate one; aged by its owner's keep. By
+> measurement SHARDS_adj was rejected (objects of a window or more never fall in its smallest bin), and accuracy is the
+> capacity's: 8,000 keys erred 0.008 to 0.049 in mean absolute miss ratio on a skewed trace, 2,000 keys +0.06 to +0.09
+> (module docs), so the slots grow with the keys a repository has. Owed in piece 2: the decayed rates, the partition by
+> marginal utility above A-188's floor, the CPU weights, and the owner shard reading content through it with the
+> shares published as a snapshot.
+
 **Role.** One slates server serves many repositories at once, from toys to monorepos the size of Google's or Meta's,
 several of those at once, and divides its memory, its CPU, its admission and its placement among them by what their
 agents and clients actually do (Ada, 2026-11-20). No repository has a fixed share: every share is a stated formula

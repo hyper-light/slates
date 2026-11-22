@@ -136,7 +136,10 @@ pub(crate) fn slice(state: &mut ShardState, id: RepositoryId, budget_ns: u64) ->
       return false;
     };
     let started = slates_rt::futures::now_ns();
-    let room = state.store.admittable();
+    // Lent what the step can put (its tables cut so far, which its last step puts whole), never the shard's whole room:
+    // a lend grows the arena from the pool the shards share, and a merge lent all it could admit claimed the whole pool
+    // for its shard, so another shard admitted nothing (main's red of 2026-11-21 16:18, hg concurrency at N=10).
+    let room = job.merge.cut_bytes();
     let stepped = within_budget(state, room, |stores| {
       let (content, index) = index_of(stores, id)?;
       Some(index.merge_step(content, &mut job.merge))
@@ -204,8 +207,9 @@ mod tests {
       let keys: Vec<Vec<u8>> = (0..4u8)
         .flat_map(|batch| (0..64u8).map(move |at| vec![b'Z', batch, at]))
         .collect();
-      let room = state.store.admittable();
-      let runs = within_budget(state, room, |stores| {
+      // Lent what the rows hold (each key, its payload, framed twice over at most), never the shard's whole room.
+      let rows = u64::try_from(keys.len() * (512 + 3) * 2).unwrap();
+      let runs = within_budget(state, rows, |stores| {
         let (content, index) = index_of(stores, id).unwrap();
         let before = index.run_tables().len();
         for batch in keys.chunks(64) {
@@ -227,11 +231,24 @@ mod tests {
       });
       assert_eq!(runs, 4);
       built(state, id);
+      // The pool the arena could still claim beside what it holds: a merge's lend must not claim it (main's red of
+      // 2026-11-21 16:18: one shard's merge claimed the whole pool, and the other shard admitted nothing).
+      let pool = state
+        .store
+        .admittable()
+        .saturating_sub(state.store.budget.admittable());
+      let capacity = state.store.budget.capacity();
       let mut slices = 0usize;
       while slice(state, id, 0) {
         slices = slices.saturating_add(1);
         assert!(slices < 10_000, "the merge ended");
       }
+      let grown = state.store.budget.capacity().saturating_sub(capacity);
+      assert!(pool > 0, "the pool had room to claim");
+      assert!(
+        grown < pool,
+        "a merge claimed the pool: grown {grown} of {pool}"
+      );
       merged_into_one_run(state, id, &keys);
     });
   }
