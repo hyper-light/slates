@@ -4,7 +4,7 @@
 //! not lent, and an SSH session the SSH site's services start over the daemon's lender.
 
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use slates_db::catalog::{Principal, RepositoryId, RepositoryRecord, VolumeId as DbVolumeId};
 use slates_git::Admission;
@@ -12,7 +12,7 @@ use slates_git::http::Version;
 use slates_git::object_name::{ObjectFormat, ObjectId};
 use slates_git::pktline::{self, MAX_LEN, Packet};
 use slates_git::unpack::{self, NoIndex};
-use slates_git::upload::{self, Asked, Refusal, Written};
+use slates_git::upload::{self, Answer, Asked, Refusal, Streamed, Written};
 use slates_ipc::protocol::{
   PolicyEffect, PolicyEntry, PolicyNames, PolicyRight, PolicyRule, PolicyWho, ReplyBody,
   RequestBody, VcsTool,
@@ -31,9 +31,15 @@ use crate::vcs_ssh::site::{Command, Next, Service, Services, Start, ToolServices
 
 /// Shape: the room a request and its answer are admitted: far past the tests' few small objects.
 const ROOM: u64 = 1 << 20;
-/// Shape: the most steps an answer or a session's request may take here, far past a few small objects' packets: a
-/// bound, so an answer that never ended would fail the test rather than hold it.
+/// Shape: the most steps a session's request or an encoding may take here, far past a few small objects' packets: a
+/// bound, so one that never ended would fail the test rather than hold it. An answer is bounded by its progress
+/// instead ([`ANSWER_STALLED_INTERVALS`]).
 const STEPS: usize = 1 << 12;
+/// Shape: the daemon's liveness intervals an answer may go without progress before it is judged never to end: far past
+/// any wait between two of its steps' bytes or counters on a loaded host (main 01a20182's order of 2026-11-22 05:47:
+/// `t_goal93_a_clone_answered_before_its_reach_sets_are_derived_is_whole`, at load ~35, spent [`STEPS`] steps of a turn's
+/// quantum each, ~one unit of its pack a step, with 131,053 of its 164,196 bytes written, every step progressing).
+const ANSWER_STALLED_INTERVALS: u64 = 60;
 /// Shape: the uid of a reader the repository's owner is not.
 const READER: u32 = 4321;
 /// Shape: how long the test waits for the SSH session's task: four liveness windows, past every step it takes.
@@ -96,17 +102,60 @@ pub(crate) fn answered(
     upload::serve(served, Version::V2, asked, packs, &mut admission)
   })
   .expect("the request's step lent");
+  let out = written_to_end(state, id, &mut answer, &mut admission);
+  (out, answer.refusal().cloned())
+}
+
+/// `answer`'s steps on the shard, each lent the objects alone, one pkt-line's room a step, until it ends: its bytes. Its
+/// steps are paced, a turn's quantum each and at least one unit of its pack (`Fragments`, A-718), so how many it takes is
+/// the host's load and not the answer's: it is judged never to end only once [`ANSWER_STALLED_INTERVALS`] liveness
+/// intervals pass with neither a byte written nor its pack's counters moved (its turns aside), and the failure says
+/// what it saw.
+fn written_to_end(
+  state: &mut ShardState,
+  id: RepositoryId,
+  answer: &mut Answer<Streamed>,
+  admission: &mut Admission,
+) -> Vec<u8> {
+  let window = Duration::from_nanos(
+    crate::daemon::LIVENESS_BUDGET_NS.saturating_mul(ANSWER_STALLED_INTERVALS),
+  );
+  let seen = |answer: &Answer<Streamed>, out: &[u8]| {
+    let counters = answer
+      .pack_source()
+      .map(|pack| slates_git::store::UploadCounters {
+        turns: 0,
+        ..pack.counters()
+      });
+    (out.len(), counters)
+  };
   let mut out = Vec::new();
-  for _ in 0..STEPS {
+  let mut last = seen(answer, &out);
+  let mut progressed = Instant::now();
+  let mut steps = 0u64;
+  loop {
     let written = lend_on(state, (id, None), |served, packs| {
-      answer.write(served, packs, &mut admission, &mut out, MAX_LEN)
+      answer.write(served, packs, admission, &mut out, MAX_LEN)
     })
     .expect("the answer's step lent");
+    steps += 1;
     if written == Written::End {
-      return (out, answer.refusal().cloned());
+      return out;
+    }
+    let now = seen(answer, &out);
+    if now != last {
+      last = now;
+      progressed = Instant::now();
+    } else if progressed.elapsed() >= window {
+      panic!(
+        "an answer that never ended: no progress for {:?} (the window, {ANSWER_STALLED_INTERVALS} liveness \
+         intervals), after {steps} steps and {} bytes; its pack's counters {:?}",
+        progressed.elapsed(),
+        out.len(),
+        last.1
+      );
     }
   }
-  panic!("an answer that never ended: {out:?}")
 }
 
 /// [`answered`] for a `fetch`, with what the pack's stream did: its bytes, and its counters (A-718).
@@ -126,18 +175,9 @@ pub(crate) fn fetched_with_counters(
     )
   })
   .expect("the request's step lent");
-  let mut out = Vec::new();
-  for _ in 0..STEPS {
-    let written = lend_on(state, (id, None), |served, packs| {
-      answer.write(served, packs, &mut admission, &mut out, MAX_LEN)
-    })
-    .expect("the answer's step lent");
-    if written == Written::End {
-      let counters = answer.pack_source().expect("a fetch's pack").counters();
-      return (out, counters);
-    }
-  }
-  panic!("an answer that never ended: {out:?}")
+  let out = written_to_end(state, id, &mut answer, &mut admission);
+  let counters = answer.pack_source().expect("a fetch's pack").counters();
+  (out, counters)
 }
 
 /// Turns repository `id`'s encoding until it is idle, as a fetch's request does before its answer (A-718); the turns
