@@ -124,12 +124,79 @@ fn divide(state: &mut ShardState, now_ns: u64) -> Grants {
   }
 }
 
+/// Counter: windows let go to the node's store past their repository's grant (A-724 piece 4). Format: a counter name.
+pub(crate) const LET_GO_WINDOWS: &str = "vcs_share.let_go_windows";
+/// Counter: the bytes those windows freed. Format: a counter name.
+pub(crate) const LET_GO_BYTES: &str = "vcs_share.let_go_bytes";
+
+/// Lets go repository `id`'s coldest windows past its published grant (A-724 piece 4, §4.17.5 "The cold trigger";
+/// main 01a20182's ruling of 2026-11-21): `candidates` are the windows its tool names as its own; their bytes still held
+/// here less its grant is what it holds past its share, and the windows read least recently go first
+/// (`ContentStore::last_read`) until it holds no more than its grant. A window the store refuses to let go (another
+/// holder keeps it, no landed changeset holds it yet, or it is gone already) is passed over, so another repository's
+/// grant never loses a window here. It runs as a step of its own (`vcs_store::within_budget`: the chunk store lent, the
+/// shard's charge trued up after). The bytes freed; none without a grant.
+///
+/// Its callers are the tools' read-through (w-git's and w-hg's, after their correctness items): until a read that
+/// misses falls through to the node's store, a daemon build lets nothing go, and a test is the reader.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn let_go_past_grant(
+  state: &mut ShardState,
+  id: RepositoryId,
+  candidates: &[slates_vcs::ContentId],
+) -> u64 {
+  let Some(grant) = state.vcs_grants.of(id) else {
+    return 0;
+  };
+  let Some(content) = state.vcs_stores.content() else {
+    return 0;
+  };
+  let mut held: Vec<(u64, slates_vcs::ContentId, u64)> = candidates
+    .iter()
+    .filter(|identity| !content.is_away(identity))
+    .filter_map(|identity| {
+      Some((
+        content.last_read(identity)?,
+        *identity,
+        content.len_of(identity)?,
+      ))
+    })
+    .collect();
+  let in_memory = held
+    .iter()
+    .fold(0u64, |sum, (_, _, len)| sum.saturating_add(*len));
+  let mut over = in_memory.saturating_sub(grant);
+  held.sort_unstable_by_key(|(read, ..)| *read);
+  // Within a step of its own: the shard's chunk store lent to the content store, its charge trued up after.
+  let (freed, windows) = crate::vcs_store::within_budget(state, 0, |stores| {
+    let (mut freed, mut windows) = (0u64, 0u64);
+    if let Some(content) = stores.content_mut() {
+      for (_, identity, _) in held {
+        if over == 0 {
+          break;
+        }
+        if let Ok(bytes) = content.let_go(&identity) {
+          freed = freed.saturating_add(bytes);
+          windows = windows.saturating_add(1);
+          over = over.saturating_sub(bytes);
+        }
+      }
+    }
+    (freed, windows)
+  });
+  if windows > 0 {
+    state.count(LET_GO_WINDOWS, windows);
+    state.count(LET_GO_BYTES, freed);
+  }
+  freed
+}
+
 #[cfg(test)]
 mod tests {
   use slates_db::catalog::RepositoryId;
   use slates_vcs::Work;
 
-  use super::current_at;
+  use super::{Grants, current_at};
   use crate::state::ShardState;
 
   /// Shape: a millisecond in the shard clock's nanoseconds, the tests' rhythm.
@@ -289,6 +356,53 @@ mod tests {
         before
       );
       assert!(room.bytes < state.store.admittable(), "{room:?}");
+    });
+  }
+
+  /// A-724 piece 4 (§4.17.5 "The cold trigger"; main's ruling: a repository's cached windows past its published grant
+  /// let go, never windows another repository's grant keeps). Do: put ten landed windows of 1,000 bytes, a second holder
+  /// keeping the coldest; read the last four recently; publish a grant of 4,000 bytes for the repository and let go past
+  /// it. Expect: 6,000 bytes freed, the six coldest windows the shared one does not count among let go (windows 1 to 6),
+  /// the shared one and the four hot ones kept, counted.
+  #[test]
+  fn t_a724_a_repositorys_coldest_windows_past_its_grant_are_let_go() {
+    crate::test_store::audit_on_stored_shard("vcs_share-grants", |state| {
+      // A repository made so its shard's content store exists.
+      let (repository, _) =
+        crate::vcs_store::tests::repository(state, "cold", slates_ipc::protocol::VcsTool::Git);
+      let windows: Vec<slates_vcs::ContentId> =
+        crate::vcs_store::within_budget(state, 1 << 16, |stores| {
+          let content = stores.content_mut().expect("a content store");
+          let windows: Vec<_> = (0..10u8)
+            .map(|at| content.put(&[at; 1_000]).expect("put"))
+            .collect();
+          content.put(&[0u8; 1_000]).expect("a second holder");
+          for window in &windows {
+            assert!(content.mark_landed(window));
+          }
+          windows
+        });
+      let content = state.vcs_stores.content().expect("a content store");
+      for (at, window) in windows.iter().enumerate() {
+        let _ = content.bytes_of(window);
+        if at >= 6 {
+          let _ = content.bytes_of(window);
+        }
+      }
+      state.vcs_grants = Grants {
+        generation: 1,
+        given: [(repository, 4_000)].into_iter().collect(),
+        served: vec![repository],
+        ..Grants::default()
+      };
+      let freed = super::let_go_past_grant(state, repository, &windows);
+      assert_eq!(freed, 6_000);
+      let content = state.vcs_stores.content().expect("a content store");
+      let away: Vec<usize> = (0..10)
+        .filter(|at| content.is_away(&windows[*at]))
+        .collect();
+      assert_eq!(away, vec![1, 2, 3, 4, 5, 6]);
+      assert_eq!(state.refusals.get(super::LET_GO_WINDOWS).copied(), Some(6));
     });
   }
 }

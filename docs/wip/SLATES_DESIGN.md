@@ -16577,6 +16577,15 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > disk's free bytes, a client's peak resident set against free memory). Proved for hg locally (debug, M-series Mac,
 > R = 1 and 2: every push and fetch whole, 1.0x to 1.2x alone); svn runs on the big Studio, main's round.
 
+> **Status (2026-11-21, A-851: piece 4, the cold trigger amended).** RAM compression is dropped (above). The content
+> store lets a window go once its owner marks it landed (`ContentStore::mark_landed`) and one holder alone keeps it
+> (`let_go`, `Kept::Away`: holders and length kept, a read misses; brought back by its own bytes, `bring_back`, or a
+> put of them; counted). The shard lets go a repository's coldest windows (by `last_read`) past its published grant
+> (`vcs_share::grants::let_go_past_grant`, a step of its own), passing over every window another holder keeps. Owed:
+> the read-through (a git or Mercurial read that misses falling to the node's store, as `vcs_store::svn_texts` does:
+> w-git's and w-hg's, queued as red tests), the owners marking landed windows, and the tools naming each repository's
+> windows; until then a test is the reader and a daemon lets nothing go.
+
 > **Status (2026-11-21, CPU: the open decision; main's ruling of 17:22).** A shard's CPU is divided among its
 > repositories by equal-weight deficit round robin (`vcs_share::turns`, A-724 piece 3c: one turn a repository a round,
 > max-min fair among those with work); CPU joins dominant-resource fairness for admission only. The weighted fair
@@ -16609,7 +16618,9 @@ read where they are kept.
 
 **Hot, warm and cold.** A repository's bytes are *hot* (its heads' trees, its works under way, its live intakes),
 *warm* (recent history, as much as its memory share holds) or *cold* (the rest, and every index that can be rebuilt).
-RAM only (R1): there is no disk tier, so cold means compressed, held only on peers, or both.
+Amended by A-851 (Ada's storage ruling, A-767): a repository's full content lives on the node's disk store in its landed
+changesets, and RAM holds its changes and a learned cache, so cold means let go from RAM and read back from the node's
+store when read; RAM compression of cold content is dropped.
 
 **Learned demand** (piece 2). For each repository and each principal: decayed rates of works and bytes, their decay set
 by the repository's own measured inter-arrival times; and its working set as a miss-ratio curve built by spatially
@@ -16635,8 +16646,10 @@ another's floor.
 
 **The cold trigger** (piece 4). §4.11's cost model, with `value_of_byte` raised by the repository's overrun of its memory
 share, chooses in cost order: drop derived values and caches (pack fragments, reach sets, A-718's deltas: rebuild cost
-times predicted reads against their bytes); compress cold content; hold cold content only at its f+1 holders (§4.10),
-fetched by identity when read.
+times predicted reads against their bytes); let go the repository's coldest windows past its published grant, those a
+landed changeset on the node's store holds and no other holder keeps, each read back through the node's store when
+next read (A-851, replacing "compress cold content"); hold cold content only at its f+1 holders (§4.10), fetched by
+identity when read.
 
 **Giant repositories** (pieces 5, 6). Load never moves ownership (§4.10). The owner keeps the repository's register (its
 refs and the ordered landing, §4.17.1 intake rule 4), its indexes' tails and fences and its hot set; everything else

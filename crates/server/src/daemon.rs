@@ -5144,6 +5144,7 @@ async fn init_shard(
     node_regions,
     region_mirrors,
     held_content: slates_cluster::content::ContentHold::new(),
+    held_publication_owed: false,
     pending_tombstones: std::collections::BTreeMap::new(),
     work_routes: crate::work_route::WorkRoutes::default(),
     seals: std::collections::BTreeMap::new(),
