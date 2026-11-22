@@ -324,10 +324,10 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   - D 69c483e8d: B plus the client's reply-wait park in RR (sched_getattr, exact restore, a typed refusal if refused,
     counted).
   - C 0a7e06c56: D with the shards spinning R9's floor alone at RR, floor spins counted.
-  - Four-arm A/B: run 45023871879 (branch diag-measurer-w-perf-84a-linux-ab, A d2c6635a2). MAIN reads it (§8). Not
-    mine to wait on.
+  - Four-arm A/B: run 45023871879 (branch diag-measurer-w-perf-84a-linux-ab, A d2c6635a2). Mine to read.
 - To LAND C (or D) if main's table says so: a clean branch from origin/main, cherry-picking d2c6635a2, 21179849c,
   69c483e8d and 0a7e06c56 only (never the diag workflow commits on that branch). Then focused tests (slates-rt and
   slates-machine round_robin, slates-ipc endpoint), fmt; design, GAPS and BENCHMARKS lines; claim an A-number.
-- Rule from main (05:05 PST): agents never push diag CI, A/B or bench runs, or wait on CI. Prepare the branch unpushed or
-  write run-requests.md, then tell main.
+- Rule (main 05:06 PST, correcting its own 05:05): an arm's interleaved design A/B is the agent's own to run and read
+  (Ada, 2026-11-20: "make your agents do A|B testing"). Still main's: clippy, other platforms' lint checks, suites, a
+  landing's confirming rounds, and the wall.
