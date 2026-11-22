@@ -1755,6 +1755,7 @@ impl ShardContext {
       slates_machine::clock::monotonic_ns().saturating_sub(g222_began),
       g222_kicked,
       g222_kick,
+      (self.id, g222_began),
     );
     self.wait_ended();
     if lost {
@@ -2244,6 +2245,22 @@ impl ShardContext {
     self.current_task.set(None);
     let done = matches!(poll, Poll::Ready(()));
     let attributed = self.attribute_poll(start, ended);
+    if let Some(attributed) = attributed {
+      let length = ended.saturating_sub(start);
+      let mono_end = slates_machine::clock::monotonic_ns();
+      let allowed = start
+        .saturating_add(self.quantum_ns())
+        .max(self.poll_allowed_until_ns.get())
+        .saturating_sub(start);
+      crate::g222_polls::record([
+        u64::from(self.id),
+        mono_end.saturating_sub(length),
+        length,
+        allowed,
+        attributed as u64,
+        u64::from(label),
+      ]);
+    }
     let dropped = self.with_inner(|inner| {
       after_poll(
         inner,

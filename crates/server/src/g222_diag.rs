@@ -134,7 +134,7 @@ pub fn dump(path: &str) {
 // Ring split: for every request a shard takes, (landed → taken, taken → reply written), ns.
 const RING_CAP: usize = 300_000;
 /// The ring row's columns: queued, served, landed, written, deferred, then a forward's split (w-perf 84a, [`FWD_COLS`]).
-const RING_COLS: usize = 5 + FWD_COLS;
+const RING_COLS: usize = 5 + FWD_COLS + 1;
 static RING: [[AtomicU64; RING_COLS]; RING_CAP] =
   [const { [const { AtomicU64::new(0) }; RING_COLS] }; RING_CAP];
 
@@ -565,6 +565,11 @@ fn ring_row_split(landed: u64, taken: u64, written: u64, deferred: u64, split: [
     RING[n][2].store(landed, Relaxed);
     RING[n][3].store(written, Relaxed);
     RING[n][4].store(deferred, Relaxed);
+    // w-perf 84a: the shard the row was written on (the request's taking shard), the last column.
+    RING[n][RING_COLS - 1].store(
+      slates_rt::registry::current_shard().map_or(u64::MAX, u64::from),
+      Relaxed,
+    );
   }
 }
 
@@ -586,6 +591,10 @@ pub fn dump_ring(path: &str) {
     let _ = f.write_all(out.as_bytes());
   }
   RING_TAKEN.store(0, Relaxed);
+}
+
+pub fn dump_polls(path: &str) {
+  slates_rt::g222_polls::dump(path);
 }
 
 pub fn dump_parks(path: &str) {

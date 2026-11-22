@@ -80,7 +80,9 @@ static PAUSE: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
 static LOADED_OVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Diagnostic only (g222): the client's spin for a reply, `G222_CLIENT_SPIN_NS`, else the library's wait.
 fn g222_spin() -> Option<u64> {
-  std::env::var("G222_CLIENT_SPIN_NS").ok().and_then(|v| v.parse().ok())
+  std::env::var("G222_CLIENT_SPIN_NS")
+    .ok()
+    .and_then(|v| v.parse().ok())
 }
 /// Format: a million, the unit the load's throughput is printed in.
 const MILLION_TURNS: f64 = 1e6;
@@ -968,6 +970,7 @@ impl Drop for G222Dump {
       slates_server::g222_diag::dump(&path);
       slates_server::g222_diag::dump_ring(&format!("{path}.ring"));
       slates_server::g222_diag::dump_parks(&format!("{path}.parks"));
+      slates_server::g222_diag::dump_polls(&format!("{path}.polls"));
       slates_ipc::endpoint::g222_dump_client(&format!("{path}.client"));
       slates_ipc::endpoint::g222_dump_cparks(&format!("{path}.cparks"));
     }

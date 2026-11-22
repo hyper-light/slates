@@ -114,7 +114,7 @@ pub fn g222_raise_qos() {
 pub mod g222_parks {
   use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
   pub const CAP: usize = 600_000;
-  pub static ROWS: [[AtomicU64; 5]; CAP] = [const { [const { AtomicU64::new(0) }; 5] }; CAP];
+  pub static ROWS: [[AtomicU64; 7]; CAP] = [const { [const { AtomicU64::new(0) }; 7] }; CAP];
   pub static N: AtomicUsize = AtomicUsize::new(0);
   /// Shape: shards a diagnostic run keeps a last park for.
   pub const SHARDS: usize = 64;
@@ -158,16 +158,11 @@ pub mod g222_parks {
       .map(|b| b.swap(0, Relaxed).to_string())
       .collect();
     let mut out = format!("# harvest_us_log2 {}\n", bins.join(" "));
-    out.push_str("timeout\twaited\tended\tkick_after\twake_after\n");
+    out.push_str("timeout\twaited\tended\tkick_after\twake_after\tshard\tbegan\n");
     for row in ROWS.iter().take(n) {
-      out.push_str(&format!(
-        "{}\t{}\t{}\t{}\t{}\n",
-        row[0].load(Relaxed),
-        row[1].load(Relaxed),
-        row[2].load(Relaxed),
-        row[3].load(Relaxed),
-        row[4].load(Relaxed)
-      ));
+      let line: Vec<String> = row.iter().map(|v| v.load(Relaxed).to_string()).collect();
+      out.push_str(&line.join("\t"));
+      out.push('\n');
     }
     if let Ok(mut f) = std::fs::File::create(path) {
       let _ = f.write_all(out.as_bytes());
@@ -177,7 +172,7 @@ pub mod g222_parks {
 }
 
 #[doc(hidden)]
-pub(crate) fn g222_park(timeout: u64, waited: u64, ended: u64, kick: (u64, u64)) {
+pub(crate) fn g222_park(timeout: u64, waited: u64, ended: u64, kick: (u64, u64), at: (u16, u64)) {
   use std::sync::atomic::Ordering::Relaxed;
   let n = g222_parks::N.fetch_add(1, Relaxed);
   if let Some(row) = g222_parks::ROWS.get(n) {
@@ -186,6 +181,52 @@ pub(crate) fn g222_park(timeout: u64, waited: u64, ended: u64, kick: (u64, u64))
     row[2].store(ended, Relaxed);
     row[3].store(kick.0, Relaxed);
     row[4].store(kick.1, Relaxed);
+    row[5].store(u64::from(at.0), Relaxed);
+    row[6].store(at.1, Relaxed);
+  }
+}
+
+/// Diagnostic only (w-perf 84a, never main): every poll past its allowed quantum, host monotonic ns: its shard, its
+/// start, its length, the quantum it was allowed, how it was attributed (`attribution::Attribution` as a code) and its
+/// task's label, to join a queued request's wait to the step that held its shard.
+#[doc(hidden)]
+#[allow(clippy::disallowed_types, missing_docs)]
+pub mod g222_polls {
+  use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+  pub const CAP: usize = 200_000;
+  pub static ROWS: [[AtomicU64; 6]; CAP] = [const { [const { AtomicU64::new(0) }; 6] }; CAP];
+  pub static N: AtomicUsize = AtomicUsize::new(0);
+  pub fn record(row: [u64; 6]) {
+    let n = N.fetch_add(1, Relaxed);
+    if let Some(slot) = ROWS.get(n) {
+      for (cell, value) in slot.iter().zip(row) {
+        cell.store(value, Relaxed);
+      }
+    }
+  }
+  pub fn dump(path: &str) {
+    use std::io::Write;
+    let n = N.load(Relaxed).min(CAP);
+    let mut out = String::from("shard\tstart\tlength\tallowed\tattribution\tlabel\n");
+    let mut labels = std::collections::BTreeMap::new();
+    for row in ROWS.iter().take(n) {
+      let line: Vec<u64> = row.iter().map(|v| v.load(Relaxed)).collect();
+      if let Some(label) = line.get(5).and_then(|l| u32::try_from(*l).ok()) {
+        labels.entry(label).or_insert_with(|| {
+          crate::label::label_of(label).map_or_else(|| "unlabelled".to_owned(), |l| l.to_string())
+        });
+      }
+      let text: Vec<String> = line.iter().map(u64::to_string).collect();
+      out.push_str(&text.join("\t"));
+      out.push('\n');
+    }
+    for (index, name) in labels {
+      out.push_str(&format!("# label {index} {name}\n"));
+    }
+    if let Ok(mut f) = std::fs::File::create(path) {
+      let _ = f.write_all(out.as_bytes());
+    }
+    N.store(0, Relaxed);
   }
 }
 

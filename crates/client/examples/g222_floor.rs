@@ -1,6 +1,8 @@
 //! Diagnostic only (g222, never main): the lane's own scheduling floor beside the bench (main's ask, 84a). Two threads
 //! hand a token back and forth through `park`/`unpark` (a futex on Linux), each round trip timed on the monotonic
 //! clock; under the same load the bench runs in, its percentiles are the floor any cross-thread wake meets there.
+//! With `G222_FLOOR_TB` set (w-perf 84a, macOS), both threads take Mach's time-constraint policy from that window in ns,
+//! as the daemon's shards and the client's reply wait do (A-831), so it is the control for the bench's own wakes.
 #![allow(
   clippy::all,
   clippy::pedantic,
@@ -33,8 +35,15 @@ fn main() {
         }
       });
     }
+    let tb = std::env::var("G222_FLOOR_TB").ok().and_then(|v| v.parse::<u64>().ok());
+    if let Some(window) = tb {
+      let _ = slates_machine::time_constraint::set_current_from(window);
+    }
     let main = std::thread::current();
     let echo = scope.spawn(move || {
+      if let Some(window) = tb {
+        let _ = slates_machine::time_constraint::set_current_from(window);
+      }
       let mut seen = 0u64;
       loop {
         while TURN.load(Ordering::Acquire) == seen {
