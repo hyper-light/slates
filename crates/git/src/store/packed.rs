@@ -252,6 +252,18 @@ impl Scratch {
     &mut self.recent
   }
 
+  /// What it holds now (the memory status's gauges): its buffers' room, and the bytes of the objects read lately.
+  pub fn held(&self) -> (u64, u64) {
+    let room = [&self.built, &self.next, &self.delta, &self.header]
+      .iter()
+      .map(|buffer| buffer.capacity())
+      .fold(0usize, usize::saturating_add);
+    (
+      u64::try_from(room).unwrap_or(u64::MAX),
+      u64::try_from(self.recent.bytes).unwrap_or(u64::MAX),
+    )
+  }
+
   /// Gives back every buffer's room past `keep` bytes: the work's working set, learned by its caller (MEMORY SIZING:
   /// nothing stays resident because a past object was large).
   pub fn shrink(&mut self, keep: usize) {

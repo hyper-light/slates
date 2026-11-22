@@ -80,6 +80,17 @@
 > before an entry's append (A-825 "Cost owed"), measured by the lane's release bench; since A-854 paid only by an
 > increment over 1 MiB, the smaller carried in its entry.
 
+> **Open (w-shared, 2026-11-22; main 01a20182 03:17, 04:24 PST): a landed git push keeps 772-787 MiB resident for a
+> 56 MB pack** (git_interop `the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the_history`,
+> git/git v2.0.0, release, the MacBook; bound 178.2 MiB). Attributed by the memory status's gauges (`mem.gauge.*`,
+> `crate::memory_gauges`, landed with this entry), in MB after the push: the system allocator's live blocks 55.9 (of
+> them the index tables 23.5); the repository's windows 61.3 in shard 0's arena and the pushed pack 53.9 on shard 1;
+> the 14 startup mapped blocks 13.8 resident; the rest, about 550-600 MB, is freed memory the system allocator kept
+> after the push's 971 MiB peak (its temporaries under the 1 MiB mapped floor). After the clone the git Repository's
+> objects read lately hold 53.9 more. Owed, in main's order: (1) the push's temporaries cut at their source (w-shared);
+> (2) landed windows and the pack let go once durable (w-shared, with w-git); (3) the recent-objects cache given back
+> after a fetch (w-git); (4) the index tables, decided after.
+
 > **FIXED (w-shared, 2026-11-22; goal 93, svn finding (2), main 01a20182 00:19 PST): a chain entry's buffer was reserved at
 > the admission's bound,** which counts the increment's whole post-state, though a text's splice names it by reference:
 > every imported text cost an allocation of its own size (26.2 MB for 25.6 MB of text in w-svn's attribution,

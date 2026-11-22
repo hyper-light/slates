@@ -512,6 +512,19 @@ impl Bases for IndexBases<'_> {
   }
 }
 
+/// What a repository holds outside the content store ([`Repository::held`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RepositoryHeld {
+  /// Its read scratch's buffers' room.
+  pub scratch: u64,
+  /// The bytes of the objects it read lately.
+  pub recent: u64,
+  /// The entries of its in-memory maps.
+  pub map_entries: u64,
+  /// What it charged the content store.
+  pub charged: u64,
+}
+
 /// A git repository's store (module docs).
 #[derive(Debug)]
 pub struct Repository {
@@ -701,6 +714,28 @@ impl Repository {
         .ok()?;
         (u64::try_from(out.len()).ok() == Some(len)).then_some(Cow::Owned(out))
       }
+    }
+  }
+
+  /// What the repository holds outside the content store (the memory status's gauges): its read scratch's buffers' room
+  /// and objects read lately ([`packed::Scratch::held`]), and the entries of its in-memory maps (chains, heads, peeled
+  /// tags, kinds and landings).
+  pub fn held(&self) -> RepositoryHeld {
+    let (scratch, recent) = self.reading.borrow().held();
+    let entries = [
+      self.chains.len(),
+      self.heads.len(),
+      self.peeled.len(),
+      self.kinds.len(),
+      self.landings.len(),
+    ]
+    .into_iter()
+    .fold(0usize, usize::saturating_add);
+    RepositoryHeld {
+      scratch,
+      recent,
+      map_entries: u64::try_from(entries).unwrap_or(u64::MAX),
+      charged: self.charged,
     }
   }
 
