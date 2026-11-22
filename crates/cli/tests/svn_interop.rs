@@ -946,7 +946,8 @@ fn holds_a_timestamp(line: &str) -> bool {
 /// `<date>` element whose value is on it, left out; `author` (the leg's one committer) written `AUTHOR`; `url` (the
 /// leg's repository URL) written `URL`. Nothing else is changed.
 fn comparable(output: &str, author: &str, url: &str) -> String {
-  output
+  let ordered = attributes_in_order(output);
+  ordered
     .lines()
     .filter(|line| !holds_a_timestamp(line))
     .map(|line| line.replace(url, "URL").replace(author, "AUTHOR"))
@@ -955,6 +956,90 @@ fn comparable(output: &str, author: &str, url: &str) -> String {
       text.push('\n');
       text
     })
+}
+
+/// `output` with each XML start tag's attributes in name order, where `output` is XML (its first line `<?xml`); any
+/// other output as it is. Stock `svn`'s XML writer (`svn_xml_make_open_tag`) takes a tag's attributes through an APR hash
+/// whose seed APR draws afresh for every hash, so it writes them in a different order run to run, against `svnserve` as
+/// against slates (main 01a20182's run r13: 8 of `svn log --xml --verbose`'s 23 `path` elements over `svnserve` alone
+/// in an order other than the most common): XML's own rule, that attribute order is no part of a document (XML 1.0
+/// §3.1), is what is compared. The client writes each attribute on a line of its own beneath its tag, three spaces in,
+/// the tag's close after the last; so are they kept, sorted, the close moved to the new last.
+fn attributes_in_order(output: &str) -> String {
+  if !output.starts_with("<?xml") {
+    return output.to_owned();
+  }
+  let mut out = String::with_capacity(output.len());
+  let mut group: Vec<(String, String)> = Vec::new();
+  let flush = |group: &mut Vec<(String, String)>, out: &mut String| {
+    let close = group
+      .last()
+      .map(|(_, rest)| rest.clone())
+      .unwrap_or_default();
+    group.sort_by(|a, b| a.0.cmp(&b.0));
+    let last = group.len().saturating_sub(1);
+    for (at, (attribute, _)) in group.iter().enumerate() {
+      out.push_str("   ");
+      out.push_str(attribute);
+      if at == last {
+        out.push_str(&close);
+      }
+      out.push('\n');
+    }
+    group.clear();
+  };
+  for line in output.lines() {
+    match attribute_line(line) {
+      Some(parts) => group.push(parts),
+      None => {
+        flush(&mut group, &mut out);
+        out.push_str(line);
+        out.push('\n');
+      }
+    }
+  }
+  flush(&mut group, &mut out);
+  out
+}
+
+/// A line of one attribute as stock `svn`'s XML writer lays it out (`   name="value"`, the tag's close after it on the
+/// last): the attribute and what follows its closing quote; none for any other line.
+fn attribute_line(line: &str) -> Option<(String, String)> {
+  let rest = line.strip_prefix("   ")?;
+  let (name, value) = rest.split_once("=\"")?;
+  if name.is_empty()
+    || !name
+      .chars()
+      .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == ':')
+  {
+    return None;
+  }
+  let end = value.find('"')?;
+  let attribute = format!("{name}=\"{}\"", value.get(..end)?);
+  Some((attribute, value.get(end + 1..)?.to_owned()))
+}
+
+/// main 01a20182's run r13 (big Studio, stock svn 1.15): `svn log --xml --verbose` over HTTPv2 and against `svnserve`
+/// differed only in the order of each `path` element's attributes, which stock `svn` writes in a hash's order
+/// ([`attributes_in_order`]). Do: compare the same log entry with its attributes in two orders, then with one value
+/// changed, and a text output whose lines look like attributes. Expect: the first two the same once compared, the third
+/// still different, the text output unchanged.
+#[test]
+fn the_comparison_leaves_xml_attribute_order_out_and_nothing_else() {
+  let one = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<log>\n<path\n   text-mods=\"false\"\n   kind=\"dir\"\n   \
+             action=\"A\"\n   prop-mods=\"false\">/imported</path>\n</log>\n";
+  let two = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<log>\n<path\n   action=\"A\"\n   prop-mods=\"false\"\n   \
+             text-mods=\"false\"\n   kind=\"dir\">/imported</path>\n</log>\n";
+  let changed = two.replace("action=\"A\"", "action=\"M\"");
+  let text = "   b=\"2\"\n   a=\"1\"\n";
+  assert_eq!(
+    (
+      comparable(one, "alice", "URL") == comparable(two, "alice", "URL"),
+      comparable(&changed, "alice", "URL") == comparable(two, "alice", "URL"),
+      attributes_in_order(text),
+    ),
+    (true, false, text.to_owned())
+  );
 }
 
 /// The HTTPv2 session (A-681 part C, by use), run as `svn` against `url`, a fresh repository whose `pre-revprop-change`
@@ -1782,13 +1867,16 @@ fn a_large_commit_measured() {
 /// P7 of Ada's close list (A-772's daemon peak against the dump; a measurement, not a gate). Do: start an anchor whose
 /// daemon holds a changeset store, create a Subversion repository, and import the dump `SLATES_SVN_IMPORT_DUMP` names
 /// through the CLI (`slates repository import`), sampling the daemon's resident bytes while it runs; then ask the daemon
-/// its memory by kind (`slates status --memory`). Expect nothing: print the import's answer and seconds, the daemon's
-/// resident bytes before and at its peak against the dump's bytes, and the memory report's lines. The real daemon
-/// binary, so its own allocator (a large allocation a mapping of its own, given back when freed), not a test binary's.
-/// With `SLATES_SVN_IMPORT_HOLD` naming a path, the daemon is held after the import for main's heap attribution (P7's
-/// finding (2)): its pid written to the path, and the daemon kept until the path is deleted, at most [`PATIENCE`].
+/// its memory by kind (`slates status --memory`) before, after, and 2 s and 30 s into its idle. Print the import's
+/// answer and seconds, the daemon's resident bytes before and at its peak against the dump's bytes, and each sample's
+/// memory lines. Expect (P7's finding (2), main 01a20182's ruling of 2026-11-22): the daemon's physical footprint after
+/// 30 s of idle grown by at most [`HELD_FACTOR`] times what it still holds live ([`held_after_import`]); before the
+/// finding's fix it kept 484 MiB of git-2000's import against 155 MB live. The real daemon binary, so its own allocator
+/// (a large allocation a mapping of its own, given back when freed), not a test binary's. With `SLATES_SVN_IMPORT_HOLD`
+/// naming a path, the daemon is held after the samples for an attribution: its pid written to the path, and the daemon
+/// kept until the path is deleted, at most [`PATIENCE`].
 #[test]
-#[ignore = "a measurement: SLATES_SVN_IMPORT_DUMP=... cargo test --release -p slates-cli --test svn_interop -- --ignored an_import_measured --nocapture"]
+#[ignore = "a measurement and gate: SLATES_SVN_IMPORT_DUMP=... cargo test --release -p slates-cli --test svn_interop -- --ignored an_import_measured --nocapture"]
 #[allow(clippy::disallowed_methods)] // test code: the hold's pid file, at the path the measurer names
 fn an_import_measured() {
   let Ok(dump) = std::env::var("SLATES_SVN_IMPORT_DUMP") else {
@@ -1800,7 +1888,7 @@ fn an_import_measured() {
   let (_anchor, _lines, _issuer) = start_anchor(&instance, &[]);
   create_repository(&instance);
   let before = daemon_rss_kib(&instance);
-  memory_sample(&instance, "before");
+  let at_start = memory_sample(&instance, "before");
   let mut child = Command::new(env!("CARGO_BIN_EXE_slates"))
     .args([
       "--instance",
@@ -1847,16 +1935,18 @@ fn an_import_measured() {
     err.join().unwrap().trim()
   );
   memory_sample(&instance, "after");
-  if let Ok(hold) = std::env::var("SLATES_SVN_IMPORT_HOLD") {
-    // The daemon's memory while it idles (P7's finding (2): r10 found 1.96 GB resident after the import): what it gives
-    // back over its idle ticks, read in its own process (`status --memory`), nothing suspending it.
-    for (label, wait) in [("idle 2 s", 2), ("idle 30 s", 28)] {
-      let waited = Instant::now();
-      while waited.elapsed() < Duration::from_secs(wait) {
-        pause();
-      }
-      memory_sample(&instance, label);
+  // The daemon's memory while it idles (P7's finding (2): r10 found 1.96 GB resident after the import): what it gives
+  // back over its idle ticks, read in its own process (`status --memory`), nothing suspending it.
+  let mut idle = at_start;
+  for (label, wait) in [("idle 2 s", 2), ("idle 30 s", 28)] {
+    let waited = Instant::now();
+    while waited.elapsed() < Duration::from_secs(wait) {
+      pause();
     }
+    idle = memory_sample(&instance, label);
+  }
+  let held_after = held_after_import(&at_start, &idle);
+  if let Ok(hold) = std::env::var("SLATES_SVN_IMPORT_HOLD") {
     let pid = daemon_pid(&instance).expect("the daemon's pid");
     std::fs::write(&hold, format!("{pid}\n")).unwrap();
     println!("an_import_measured: held, daemon pid {pid} in {hold}; delete it to end");
@@ -1866,14 +1956,71 @@ fn an_import_measured() {
     }
     let _ = std::fs::remove_file(&hold);
   }
+  if let Err(red) = held_after {
+    panic!("{red}");
+  }
 }
+
+/// What a memory sample read: the daemon's physical footprint (none where `top` does not say it), its heap's bytes in
+/// live allocations, and its shards' arena bytes allocated, each in bytes.
+#[derive(Clone, Copy, Debug, Default)]
+struct MemorySample {
+  /// Physical footprint, bytes.
+  footprint: Option<u64>,
+  /// The heap's bytes in live allocations (`memory: heap ... resident_bytes`, `slates_mem::heap::stats().in_use`).
+  heap_in_use: u64,
+  /// Every shard's arena bytes allocated (`content_range.arena.allocated`).
+  arena: u64,
+}
+
+/// P7's finding (2), main 01a20182's ruling of 2026-11-22 00:09 (the red: the idle footprint after the import against a
+/// derived multiple of what the import still holds). What the import still holds once the daemon idled is what its
+/// own report counts as live: its heap's bytes in live allocations and its arenas' bytes allocated, each grown since
+/// `before`. The footprint may exceed it by the allocator's own waste and no more: a size-class allocator rounds a block
+/// up to its class, at most to twice its size (classes grow by at most a factor of two), so the footprint's growth is
+/// bounded by [`HELD_FACTOR`] times the live growth, and each footprint read off by `top`'s resolution
+/// ([`FOOTPRINT_RESOLUTION`]). Refused, the figures that broke it; skipped (Ok) where `top` read no
+/// footprint (off macOS).
+fn held_after_import(before: &MemorySample, idle: &MemorySample) -> Result<(), String> {
+  let (Some(at_start), Some(at_idle)) = (before.footprint, idle.footprint) else {
+    eprintln!(
+      "an_import_measured: no physical footprint read here; the held-memory bound is not checked"
+    );
+    return Ok(());
+  };
+  let live = idle
+    .heap_in_use
+    .saturating_sub(before.heap_in_use)
+    .saturating_add(idle.arena.saturating_sub(before.arena));
+  let grown = at_idle.saturating_sub(at_start);
+  // Each footprint read is `top`'s, rounded to its resolution: the two reads' difference may be off by one each.
+  let bound = live
+    .saturating_mul(HELD_FACTOR)
+    .saturating_add(FOOTPRINT_RESOLUTION.saturating_mul(2));
+  if grown > bound {
+    return Err(format!(
+      "an_import_measured: the daemon's footprint grew {grown} B over the import and 30 s of idle, past {HELD_FACTOR} x \
+       what it still holds live ({live} B: heap in use and arena allocated grown): {} B not given back",
+      grown.saturating_sub(bound)
+    ));
+  }
+  Ok(())
+}
+
+/// Format: the resolution of `top`'s `MEM` column, which reads a footprint in whole MiB once it passes a few MiB (read as
+/// 46080K, 51200K, 56320K: multiples of 1,024 KiB); the held-memory bound allows it once a read.
+const FOOTPRINT_RESOLUTION: u64 = 1 << 20;
+
+/// Derived: a size-class allocator rounds a block up to its class, classes growing by at most a factor of two, so live
+/// bytes take at most twice their size in pages (finding (2)'s bound, [`held_after_import`]).
+const HELD_FACTOR: u64 = 2;
 
 /// Prints instance `instance`'s daemon memory at `label` (P7's finding (2)): its resident bytes as `ps` reads them, and
 /// the memory report's heap and mapped kinds and the shards' arena bytes (`slates status --memory`), read in the daemon's
 /// own process, so nothing suspends it (A-232's gotcha: `vmmap` and `heap` did, and the anchor's watchdog ended it).
-fn memory_sample(instance: &str, label: &str) {
+fn memory_sample(instance: &str, label: &str) -> MemorySample {
   let rss = daemon_rss_kib(instance);
-  let footprint = daemon_pid(instance).and_then(footprint_kib);
+  let footprint = daemon_pid(instance).and_then(footprint_within);
   let (_, memory, _) = slates(instance, &["status", "--memory"]);
   let lines: Vec<&str> = memory
     .lines()
@@ -1888,6 +2035,45 @@ fn memory_sample(instance: &str, label: &str) {
     "an_import_measured: memory {label}: daemon RSS {rss} KiB, physical footprint {footprint:?} KiB\n  {}",
     lines.join("\n  ")
   );
+  let figure = |line: &str, key: &str| -> Option<u64> {
+    line
+      .split_once(key)?
+      .1
+      .split_whitespace()
+      .next()?
+      .parse()
+      .ok()
+  };
+  MemorySample {
+    footprint: footprint.map(|kib| kib.saturating_mul(1024)),
+    heap_in_use: lines
+      .iter()
+      .filter(|line| line.contains("memory: heap "))
+      .find_map(|line| figure(line, "resident_bytes="))
+      .unwrap_or(0),
+    arena: lines
+      .iter()
+      .filter_map(|line| figure(line, "arena.allocated: "))
+      .sum(),
+  }
+}
+
+/// Shape: how long a sample waits for `top` to read a footprint it missed (main 01a20182's run of 2026-11-22 01:36 read
+/// none at the 2 s sample, once in four): a bound on a transient miss, far above one read's few hundred milliseconds.
+const FOOTPRINT_PATIENCE: Duration = Duration::from_secs(5);
+
+/// [`footprint_kib`] asked again until it reads one or [`FOOTPRINT_PATIENCE`] passes; none off macOS.
+fn footprint_within(pid: u32) -> Option<u64> {
+  let started = Instant::now();
+  loop {
+    if let Some(footprint) = footprint_kib(pid) {
+      return Some(footprint);
+    }
+    if !cfg!(target_os = "macos") || started.elapsed() >= FOOTPRINT_PATIENCE {
+      return None;
+    }
+    pause();
+  }
 }
 
 /// Process `pid`'s physical footprint in KiB as macOS `top` reads it (its `MEM` column, from `proc_pid_rusage`'s

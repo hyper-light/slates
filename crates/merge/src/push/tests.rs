@@ -1875,3 +1875,81 @@ fn a_signature_recorded_on_a_version_in_the_owed_tail_is_kept() {
   );
   assert_eq!(twin.signature(2), Some(verdict));
 }
+
+/// A store whose blobs are not at hand until fetched ([`Unavailable::NotYet`]): a text let go from RAM to the node's
+/// changeset store, as an imported Mercurial repository's are (A-767 C1). It counts the waits a build reported.
+struct Away<'s> {
+  /// The store whose bytes it gives once fetched.
+  store: &'s Store,
+  /// The blobs fetched so far.
+  fetched: std::cell::RefCell<std::collections::BTreeSet<ObjectKey>>,
+}
+
+impl PushObjects for Away<'_> {
+  fn tree(&self, id: ObjectKey) -> Result<Vec<TreeEntry>, Unavailable> {
+    self.store.tree(id)
+  }
+
+  fn blob_len(&self, id: ObjectKey) -> Result<u64, Unavailable> {
+    self.store.blob_len(id)
+  }
+
+  fn blob(&self, id: ObjectKey) -> Result<Cow<'_, [u8]>, Unavailable> {
+    if !self.fetched.borrow().contains(&id) {
+      return Err(Unavailable::NotYet);
+    }
+    self.store.blob(id)
+  }
+}
+
+/// A-767 C1 step 2a (main 01a20182's ruling of 2026-11-22 00:05: a push over an import reads its held file texts
+/// through the changeset store, never whole in a step). Do: land a tree of 40 files, then build a push changing each of
+/// them over a store that gives no blob's bytes until the build's owner fetches the blob it waits for
+/// ([`Building::waiting`]), a turn at a time. Expect: the work the one-call build makes over the whole store, byte for
+/// byte; one wait for each file the push changed, each naming a blob the push holds; and no turn ending with no wait and
+/// no work while a blob is owed.
+#[test]
+fn a_build_waits_for_each_blob_not_at_hand_and_takes_its_unit_again() {
+  const FILES: usize = 40;
+  let mut store = Store::default();
+  let mut green = Green::new();
+  let named = |word: &str| -> Files {
+    (0..FILES)
+      .map(|at| (format!("f{at:03}"), file(format!("{word} {at}").as_bytes())))
+      .collect()
+  };
+  let (_, outcome, tree) = land(&mut store, &mut green, None, &named("base"), &head(1));
+  assert!(
+    matches!(
+      outcome,
+      Outcome::Accepted { .. } | Outcome::Identical { .. }
+    ),
+    "{outcome:?}"
+  );
+  let pushed = put(&mut store, &named("next"));
+  let second = head(2);
+  let push = push(green.head(), Some(tree), pushed, &second);
+  let whole = build(&push, &green, &store, u64::MAX).unwrap();
+  let away = Away {
+    store: &store,
+    fetched: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+  };
+  let mut building = Building::new(&push, u64::MAX, crate::pace::Pace::unbounded());
+  let mut waits = 0usize;
+  let built = loop {
+    if let Some(built) = building.advance(&green, &away) {
+      break built;
+    }
+    let id = building
+      .waiting()
+      .expect("an unbounded turn ends for a blob it waits for");
+    assert!(
+      store.objects.contains_key(&id) && !away.fetched.borrow().contains(&id),
+      "the wait names a blob the store holds and the build has not been given"
+    );
+    away.fetched.borrow_mut().insert(id);
+    waits += 1;
+  };
+  assert_eq!(built.unwrap(), whole, "the same work as the one-call build");
+  assert_eq!(waits, FILES, "one wait for each file the push changed");
+}

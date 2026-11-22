@@ -699,3 +699,113 @@ fn a_changegroup_is_verified_within_exactly_the_room_it_needs() {
     ));
   }
 }
+
+/// A repository whose file texts are not at hand until fetched (A-767 C1: texts an import let go to the node's changeset
+/// store): it knows each file revision's row (its names and length), and gives a text only once its owner fetched it.
+struct LetGo<'k> {
+  /// The repository whose texts it gives once fetched.
+  kept: &'k Kept,
+  /// The file revisions fetched so far.
+  fetched: BTreeSet<(Vec<u8>, Node)>,
+}
+
+impl Held for LetGo<'_> {
+  fn changeset_text(&self, node: &Node) -> Option<Cow<'_, [u8]>> {
+    self.kept.changeset_text(node)
+  }
+
+  fn manifest_text(&self, node: &Node) -> Option<Cow<'_, [u8]>> {
+    self.kept.manifest_text(node)
+  }
+
+  fn file_text(&self, path: &[u8], node: &Node) -> Option<Cow<'_, [u8]>> {
+    if !self.fetched.contains(&(path.to_vec(), *node)) {
+      return None;
+    }
+    self.kept.file_text(path, node)
+  }
+
+  fn file_names(&self, path: &[u8], node: &Node) -> Option<verify::FileNames> {
+    self.kept.file_names(path, node)
+  }
+
+  fn file_bytes_len(&self, path: &[u8], node: &Node) -> Option<u64> {
+    self.kept.file_bytes_len(path, node)
+  }
+}
+
+/// A-767 C1 step 2a (main 01a20182's ruling of 2026-11-22 00:05: a push's work reads the repository's held file texts
+/// through the changeset store, never whole in a step). Do: land `default`'s line to revision 3 of the stock bundle, then
+/// build the work moving it to revision 7 a turn at a time over a repository that holds every revision but gives no file
+/// text until fetched; at each turn that waits, answer its ask as the store would (its row, then its text) and fetch the
+/// text it was given. Expect: the work the one-call build makes over the whole repository, byte for byte; each ask a
+/// rows' want naming one file revision, then a texts' want; and at least one wait, so the read-through ran.
+#[test]
+fn a_work_reading_texts_not_at_hand_waits_and_asks_the_store_for_each() {
+  use crate::render::{StoreWants, StoredPlace, StoredRevision, Want};
+  let verified = verify::verify(&stock_part(Version::V03), &Kept::default(), &mut room()).unwrap();
+  let mut kept = Kept::default();
+  kept.keep(&verified, |_| true);
+  let mut green = Green::new();
+  let third = log_node(3);
+  land(&mut green, None, &third, (&verified, &Kept::default()));
+  let head = log_node(7);
+  let moved = Move {
+    name: NAME,
+    base_version: green.head(),
+    base: Some(&third),
+    head: &head,
+  };
+  let nothing = Verified::default();
+  let whole = tree::work(&moved, &green, (&nothing, &kept), WORK_ROOM, &mut room()).unwrap();
+  let mut away = LetGo {
+    kept: &kept,
+    fetched: BTreeSet::new(),
+  };
+  let pace = slates_merge::pace::Pace::unbounded();
+  let mut building =
+    tree::begin_work(&moved, (&nothing, &away), (WORK_ROOM, pace), &mut room()).unwrap();
+  let mut waits = 0usize;
+  let built = loop {
+    if let Some(built) = building.advance(&green, (&nothing, &away)) {
+      break built;
+    }
+    assert!(
+      building.ask_waited(WORK_ROOM),
+      "an unbounded turn ends waiting for a text"
+    );
+    let Some(Want::Rows { logs }) = building.wants().cloned() else {
+      panic!("a rows' want first");
+    };
+    let [(path, nodes)] = logs.as_slice() else {
+      panic!("one log asked: {logs:?}");
+    };
+    let [node] = nodes.as_slice() else {
+      panic!("one revision asked: {nodes:?}");
+    };
+    let place = StoredPlace {
+      payload: [0; 32],
+      offset: 0,
+      len: 0,
+    };
+    building.give_rows(vec![vec![Some(StoredRevision {
+      text: [1; 32],
+      base: None,
+      place,
+    })]]);
+    assert!(
+      matches!(building.wants(), Some(Want::Texts { .. })),
+      "then its text"
+    );
+    let text = kept
+      .file_text(path, node)
+      .expect("the repository holds it")
+      .into_owned();
+    building.give_texts(vec![text]);
+    let (given_path, given_node, _) = building.take_given().expect("the text given");
+    away.fetched.insert((given_path, given_node));
+    waits += 1;
+  };
+  assert_eq!(built.unwrap(), whole, "the work the one-call build makes");
+  assert!(waits > 0, "the read-through ran");
+}

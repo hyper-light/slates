@@ -73,10 +73,12 @@ enum Request {
     len: u64,
     answer: Sender<Result<(), StoreError>>,
   },
+  /// A part's bytes, answered with the same buffer emptied once written, for the landing's next part
+  /// ([`SlicedLanding::part`]).
   Part {
     landing: u64,
     bytes: Vec<u8>,
-    answer: Sender<Result<(), StoreError>>,
+    answer: Sender<Result<Vec<u8>, StoreError>>,
   },
   Commit {
     landing: u64,
@@ -309,9 +311,8 @@ fn refuse_all(incoming: &mut ChannelReceiver<Request>, reason: &str) {
   while let Ok(request) = incoming.blocking_recv() {
     match request {
       Request::Begin { answer, .. } => drop(answer.try_send(unopened(reason))),
-      Request::Section { answer, .. } | Request::Part { answer, .. } => {
-        drop(answer.try_send(unopened(reason)))
-      }
+      Request::Section { answer, .. } => drop(answer.try_send(unopened(reason))),
+      Request::Part { answer, .. } => drop(answer.try_send(unopened(reason))),
       Request::Commit { answer, .. } | Request::Land { answer, .. } => {
         drop(answer.try_send(unopened(reason)))
       }
@@ -396,7 +397,7 @@ fn serve(
       }
       Request::Part {
         landing,
-        bytes,
+        mut bytes,
         answer,
       } => {
         let step = landings.check(landing).and_then(|()| {
@@ -405,8 +406,12 @@ fn serve(
           }
           store.landing_part(&bytes)
         });
-        drop(bytes);
-        let _ = answer.try_send(landings.failed_lets_go(&mut store, step));
+        // Written, the buffer goes back emptied for the landing's next part: one buffer a landing, not one a part.
+        let given = landings.failed_lets_go(&mut store, step).map(|()| {
+          bytes.clear();
+          bytes
+        });
+        let _ = answer.try_send(given);
       }
       Request::Commit { landing, answer } => {
         // A commit that fails lets the record go (`commit_open` took it); a stranger's commit touches nothing.
@@ -877,8 +882,10 @@ impl SlicedLanding {
   }
 
   /// Writes the next `bytes` of the open section, at most one piece ([`PIECE_BYTES`]: the read's unit, so a landing in
-  /// flight holds no more than a piece a request); moved in and let go once written.
-  pub async fn part(&mut self, bytes: Vec<u8>) -> Result<(), OwnerError> {
+  /// flight holds no more than a piece a request); moved in, and answered with the same buffer emptied once written, for
+  /// the caller to fill with the next part (P7's finding (2): a fresh buffer a part was one of an import's copies of its
+  /// every text, churn the system allocator keeps). Refused, the buffer is let go.
+  pub async fn part(&mut self, bytes: Vec<u8>) -> Result<Vec<u8>, OwnerError> {
     let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
     let request = Request::Part {
       landing: self.number,
