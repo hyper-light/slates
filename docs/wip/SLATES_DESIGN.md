@@ -16497,6 +16497,13 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > marginal utility above A-188's floor, the CPU weights, and the owner shard reading content through it with the
 > shares published as a snapshot.
 
+> **Status (2026-11-21, A-845: piece 2's decayed rates).** `slates_vcs::rate::Rates`: works and bytes a second, the
+> decay learned from the repository's own gaps: a ladder of decayed counts at `base · 2^k` up to its age, each gap
+> scored by its Poisson log-likelihood (the intensity at the arrival less its integral over the gap), the best rung the
+> horizon; scale-free (doubled gaps double the horizon exactly); `keep` is the curve's aging; `Decayed`, a principal's,
+> read at its repository's horizon. Owed: feeding both on the owner shard (`slates_vcs::usage`, beside A-724 piece 2's
+> `Learned`, after main's split of A-724 between w-balance and w-multirepo).
+
 **Role.** One slates server serves many repositories at once, from toys to monorepos the size of Google's or Meta's,
 several of those at once, and divides its memory, its CPU, its admission and its placement among them by what their
 agents and clients actually do (Ada, 2026-11-20). No repository has a fixed share: every share is a stated formula
