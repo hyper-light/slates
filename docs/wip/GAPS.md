@@ -2027,8 +2027,11 @@
 > since A-846 part 3 (`t_a724_a_contested_room_reads_the_published_grants`,
 > `t_a724_a_live_repository_with_no_curve_leaves_the_room_divided_as_before`). Open: pushes', hg's and svn's reads.
 > **A-724 piece 7 (A-849): the load proof's fetches** (`multi_repo_load.py --fetches`; harness daemons given a
-> `--vcs-store`, without which `repository create --tool git` failed since A-767 C5). Open: hg and svn in the mix; the
-> rounds (main's).
+> `--vcs-store`, without which `repository create --tool git` failed since A-767 C5); hg and svn by their stock clients
+> (`multi_repo_stock.py`, main's 21:35 ruling (a)). Open: the rounds (main's).
+> **A-724 piece 6 DEFERRED (main 01a20182, 2026-11-21 21:35):** the fleet's placement of content by identity (amends
+> §4.10) waits until goal 93's servers are complete and correct; Ada asked for many repositories on a single server, and
+> the N=1 homes and the region rule exist (1729a9c5a, 58f756e0a, 9f57e4810).
 > **A-724 piece 2c (A-846): memory by marginal utility built, not yet applied** (`slates_vcs::partition`, `cargo test
 > -p slates-vcs --lib partition::`, 4 of 4, macOS arm64, this Mac). Open: computed on the owner shard and published.
 >
