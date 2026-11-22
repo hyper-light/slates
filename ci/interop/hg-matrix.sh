@@ -104,10 +104,12 @@ echo "hg $(h --version | head -1); source $SOURCE $(h -R "$SOURCE" log -r 'all()
 
 # DIAG (diag branch only): PUSH_CHUNK pushes the history a PUSH_CHUNK of revisions at a time (`-r REV -f`, ancestors
 # with it) then the rest, as hg_scale.sh does, for a server whose one push of it is refused; the repository is the same.
+# A chunk refused in words that ask for it ("push again") is pushed again, up to six times, a second more each time.
 if [ -n "${PUSH_CHUNK:-}" ]; then
-  export PUSH_CHUNK SOURCE URL
+  PUSH_ERR=$WORK/push-chunk.err
+  export PUSH_CHUNK SOURCE URL PUSH_ERR
   export HG_WORDS="${HG[*]}"
-  row push-all bash -c 'tip=$($HG_WORDS -R "$SOURCE" log -r tip -T "{rev}"); for rev in $(seq "$PUSH_CHUNK" "$PUSH_CHUNK" "$tip") tip; do $HG_WORDS -R "$SOURCE" push -q --new-branch -f -r "$rev" "$URL"; c=$?; [ $c -le 1 ] || { echo "chunk at $rev exit $c"; exit $c; }; done'
+  row push-all bash -c 'tip=$($HG_WORDS -R "$SOURCE" log -r tip -T "{rev}"); tries=0; for rev in $(seq "$PUSH_CHUNK" "$PUSH_CHUNK" "$tip") tip; do for try in 1 2 3 4 5 6; do $HG_WORDS -R "$SOURCE" push -q --new-branch -f -r "$rev" "$URL" 2>"$PUSH_ERR"; c=$?; [ $c -le 1 ] && break; grep -q "push again" "$PUSH_ERR" || break; tries=$((tries+1)); sleep $try; done; [ $c -le 1 ] || { cat "$PUSH_ERR"; echo "chunk at $rev exit $c after $try tries"; exit $c; }; done; echo "chunks pushed; retried on push again: $tries"'
 else
 row push-all "${HG[@]}" -R "$SOURCE" push "${PUSH[@]}" "$URL"
 fi
