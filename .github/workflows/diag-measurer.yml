@@ -58,7 +58,7 @@ jobs:
           for i in $(seq $(( $(nproc) * 2 ))); do (while :; do :; done) & done
           sleep 20; echo "load with burners $(cat /proc/loadavg)"
           set +e
-          HG="$RUNNER_TEMP/hgvenv/bin/hg" STEP_LIMIT=2400 ci/interop/hg-matrix.sh "$PWD/target/release/slates" "$RUNNER_TEMP/hg-src" "$RUNNER_TEMP/matrix-hg" 2>&1 | tee "$RUNNER_TEMP/matrix-hg.out"
+          DIAG_STOP_AFTER_PUSH=1 HG="$RUNNER_TEMP/hgvenv/bin/hg" STEP_LIMIT=2400 ci/interop/hg-matrix.sh "$PWD/target/release/slates" "$RUNNER_TEMP/hg-src" "$RUNNER_TEMP/matrix-hg" 2>&1 | tee "$RUNNER_TEMP/matrix-hg.out"
           rc=${PIPESTATUS[0]}
           echo "load after $(cat /proc/loadavg)"
           A=$RUNNER_TEMP/matrix-hg/anchor.log

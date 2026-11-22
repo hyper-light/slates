@@ -116,6 +116,13 @@ row push-all "${HG[@]}" -R "$SOURCE" push "${PUSH[@]}" "$URL"
 # push-all, before any later row can spin and restart it.
 s status --json >"$WORK/status-after-push.json" 2>"$WORK/status-after-push.err" ||
   echo "DIAG status after push failed: $(head -3 "$WORK/status-after-push.err")"
+# DIAG (diag branch only): stop here when asked, so the read after push-all doesn't wait on rows that still spin.
+if [ "${DIAG_STOP_AFTER_PUSH:-0}" = 1 ]; then
+  printf '%s\n' "---- stopped after push-all (DIAG_STOP_AFTER_PUSH)" "${ROWS[@]}"
+  echo "daemon peak RSS over every row: $((RUN_PEAK_KIB / 1024)) MiB"
+  s status --json >"$WORK/status.json" 2>/dev/null || true
+  exit 0
+fi
 fi
 row identify "${HG[@]}" identify "$URL"
 row clone "${HG[@]}" clone -q "$URL" a
