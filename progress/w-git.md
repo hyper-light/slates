@@ -521,3 +521,12 @@
   give_back_idle. Focused: git 217, server vcs_store/vcs_share/t_a859 143. NEXT (main 04:53): git_interop whole-repository
   test prints each clone edge's pack bytes (slates, stock) and reuse counters; then the stored-pack order if it refuses
   reuse; then A-859 part A; deflate reuse.
+- 2026-11-22 ~06:40 PST: A-859 stream counters LANDED 6ac1ee4be (vcs_store.git_upload.* on the shard; git_interop's
+  whole-repository round prints each edge's clone time, pack bytes beside stock's, and reuse counts, from a guard that
+  speaks on a killed clone too). A-859 order+reuse LANDED 3fa634049 (merge 2acbba249), per main's 05:38 sample/ruling:
+  a stored entry always reused (would_try gate removed); a delta's still-wanted base placed first (write_one) in the
+  stream and the encoding; the part's base lookup a map; Positions::next_from on a bit table from from's word (was a
+  scan from the table's start per loose object); reuse_no_entry and reuse_unread counted; StreamCount alias (clippy).
+  Reds: deltified clone 20/39 deltas then 117/160 encoded afresh -> 39/39, 0; encoding base-first 0/7 -> 7/7.
+  Focused: server 197, git 195. NEXT: main's git/git round reads the counters; A-859 part A; deflate reuse; the
+  upload/encoding hook for w-shared's read-through (Away windows).
