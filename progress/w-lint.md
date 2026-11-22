@@ -458,3 +458,4 @@
 ## 2026-11-21 round at 40d816c29 (nothing to land)
 - Clean: host clippy, fmt, structural, literals, unsafe, the six cross targets.
 - VCS lane: Windows r52 (crates at 40d816c29) and Linux r53 (synced) submitted.
+- VCS lane, Linux: r53 (adacachy2) and r55 (adacachy) both failed the sync; in run-requests.md.

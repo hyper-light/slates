@@ -7514,3 +7514,6 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   answer the sync in 60s". No test ran. The balancer places every linux/amd64 ask on adacachy2 (adacachy is loaded),
   and every try today has died bringing the code there: sync, full clone, shallow clone. Owner: adacachy2's kiln link.
   Need: a Linux x86_64 runner that takes a sync, or that one restored.
+- 2026-11-21 (round at 40d816c29), Linux VCS lane: r53 (adacachy2) and its resubmit r55, which this time went to adacachy
+  451397fc, both ended "did not answer the sync in 60s". Both Linux x86_64 runners now refuse a sync from Studio-2;
+  no test ran. Same owner and same need as above.
