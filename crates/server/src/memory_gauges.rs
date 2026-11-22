@@ -12,7 +12,8 @@
 //!   current files, history, change index, rejected results.
 //! - `held.*`: the shard's content hold's charge and objects (inputs, checkpoints, replicas), and its chains' entries and
 //!   bytes.
-//! - `process.*` (the control shard alone, the process's figures once): the system allocator's live bytes, and the
+//! - `process.*` (the control shard alone, the process's figures once): the system allocator's live bytes and the bytes
+//!   it ever allocated (its churn), and the
 //!   mapped blocks live and their resident bytes (`slates_mem::large::heap`). A resident set past the live bytes and
 //!   the mapped blocks' resident pages is what the system allocator kept of freed blocks.
 
@@ -31,6 +32,10 @@ pub(crate) fn rows(state: &ShardState, memory: bool) -> Vec<RefusalCount> {
     let heap = slates_mem::large::heap();
     rows.extend([
       ("mem.gauge.process.system_live_bytes", heap.system_live),
+      (
+        "mem.gauge.process.system_allocated_bytes",
+        heap.system_allocated,
+      ),
       ("mem.gauge.process.mapped_blocks", heap.mapped_blocks),
       (
         "mem.gauge.process.mapped_resident_bytes",
