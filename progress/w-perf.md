@@ -287,3 +287,13 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
 - OPEN (mine): background deltify job (supersede hook from w-svn), svn storage A/B (whole/skip-delta/FSFS, all N),
   c3 (drop records fallback), review w-svn's sliced exporter `load`, push_load/git_scale rerun (w-git A-722 p3).
 - w-lint red (content-once test) passes at bf10a773a; asked main for w-lint's base.
+
+## 2026-11-21 ~22:00 PST (main 01a20182's note, inbox/w-perf-from-main-01a20182-ssh-rekey.md)
+- Landed today: 70dd82623 (sha1_ab, paced intake slices 406fa7f35), 2ab402b95 (HTTP fetch keepalive), 1a8859a3f (SSH
+  fetch keepalive).
+- CLOSED by A-842 (w-svn cc55404fa): c3 (records keep no text; fallback gone) and the background deltify job. Under the
+  changeset ruling, svn deltas are derived, never stored.
+- e0d79f557: already landed in adapted form as 406fa7f35 (70dd82623); nothing more lands. Its checks_bytes part stays
+  with the held fan-out 2abe7cae3. The other held P commits stay held until goal 93's servers are complete and correct.
+- NOW: the SSH edge's rekey write duplication (goal 93 C). Waiting on w-hg's written go
+  (inbox/w-hg-from-w-perf-ssh-rekey-go.md); reading meanwhile.
