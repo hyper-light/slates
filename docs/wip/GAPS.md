@@ -2779,6 +2779,14 @@
 > a refusal is answered as one `mod_dav_svn` error (the first of its chain), where `mod_dav` answers a PROPPATCH that
 > fails with a `207` whose failing property is `500` and the rest `424` (the client's words for it unchecked); HTTP
 > applies no authz write rules to a revision property change, as it applies none to a commit (`Setup::rules` none).
+> Its parallel-set flake (main 01a20182, 2026-11-22; 3 of 16 runs: "blocked by pre-revprop-change hook (exit code 0)")
+> was the runner's: a deadline's timer that fired before a hook's own exit was seen timed the hook out with its own
+> exit code; FIXED (the reaped status a code, not the kill's signal, the run is judged by it). A refusal now answers
+> its chain's best message. Still seen (2 of 12 runs): a hook's first run, which has no learned bound, waits on its
+> words stream past its exit when a process spawned at the same instant elsewhere in the process inherited the
+> stream's write end (macOS has no `pipe2`, so std's pipe is made close-on-exec a call later), until the client's
+> 10 s read gives up. Owed: a ruling on spawning hooks with no inherited descriptors, or ending a drain once the
+> hook's process group is empty.
 > **svn replay by stock clients (w-interop, 2026-11-20; A-703):** `svn-matrix.sh` gains `svnrdump dump` and
 > `svnsync initialize/synchronize` over svn://, each compared with the dump stock svnserve 1.15.0 made of the same history
 > (`crates/svn/fixtures/replay`, `EXPECT_RDUMP`, `EXPECT_SYNC`): over the reads fixtures' repository both are
