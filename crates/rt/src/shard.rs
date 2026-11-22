@@ -116,6 +116,11 @@ pub struct Counters {
   /// Holds asked of the shard that it declined, since the idle turn a request would meet took at least as long as its
   /// wake estimate (A-387, [`crate::held_turn::hold_pays`]): a non-vacuity count of the decline.
   pub idle_holds_declined: u64,
+  /// A real-time shard's floor spins (84a's Linux half; `ShardContext::real_time_class`) that met work before the floor
+  /// ran out: the floor spin's non-vacuity count, beside [`Counters::real_time_spins_parked`].
+  pub real_time_spins_met: u64,
+  /// A real-time shard's floor spins that ran out with nothing to do, after which the shard parked.
+  pub real_time_spins_parked: u64,
   /// The expected length of the idle turn a request lands in, nanoseconds, as the shard has learned it from its own
   /// spins ([`crate::held_turn::HeldTurn::met_ns`]); 0 until its first measured turn or while it tracks no wake
   /// estimate.
@@ -386,10 +391,15 @@ pub struct ShardContext {
   batch_left: Cell<usize>,
   fixed_spin_ns: u64,
   /// Whether the shard's thread holds Linux's round-robin real-time class (`slates_machine::round_robin`, 84a's Linux
-  /// half): then it never spins idle. It parks at once when it has no work, its idle window none and its closed-loop
-  /// holds declined, since a spinning real-time thread takes its CPU from every time-share task and meets the kernel's
-  /// real-time throttling.
-  parks_at_once: bool,
+  /// half): then its idle spin is R9's floor alone, the provisioning window R9's rule needs, and never the
+  /// estimate-scaled window or a closed-loop hold (up to 471 ms). A long spin at real-time priority would take its CPU
+  /// from every time-share task and meet the kernel's real-time throttling. Parking at once instead cost the quiet path
+  /// on CI's runners (quiet accept p50 +10-35%, R9's p99 82-85 -> 111-114 µs on ubuntu-24.04-arm, run 45020495221).
+  real_time_class: bool,
+  /// A real-time shard's floor spins that met work, and those that ran out and parked
+  /// ([`Counters::real_time_spins_met`]).
+  real_time_spins_met: Cell<u64>,
+  real_time_spins_parked: Cell<u64>,
   /// Whether the driver's clock is real time: the simulation's is not the kicker's clock nor the thread's
   /// CPU clock, so a simulated shard neither measures its wakes nor judges polls by CPU time (it stays
   /// deterministic).
@@ -593,7 +603,9 @@ impl ShardContext {
       poll_allowed_until_ns: Cell::new(0),
       batch_left: Cell::new(0),
       fixed_spin_ns: config.spin_ns,
-      parks_at_once: slates_machine::round_robin::holds() == Some(true),
+      real_time_class: slates_machine::round_robin::holds() == Some(true),
+      real_time_spins_met: Cell::new(0),
+      real_time_spins_parked: Cell::new(0),
       real_time: driver.kind() != DriverKind::Simulation,
       attribution: Cell::new(Tracker::default()),
       entry: registry::entry(seed.id),
@@ -710,8 +722,8 @@ impl ShardContext {
     let now = self.now_ns();
     self.activity_ns.set(Some(now));
     let met_turn = self.held_turn.get().and_then(|turns| turns.met_ns());
-    // A real-time shard never spins idle (`parks_at_once`): its hold is declined, counted, as an unpaid one is.
-    if self.parks_at_once || !hold_pays(met_turn, self.wake_cost_ns()) {
+    // A real-time shard's spin is R9's floor alone (`real_time_class`): its hold is declined, counted, as an unpaid one is.
+    if self.real_time_class || !hold_pays(met_turn, self.wake_cost_ns()) {
       self
         .idle_holds_declined
         .set(self.idle_holds_declined.get().saturating_add(1));
@@ -826,6 +838,8 @@ impl ShardContext {
     c.idle_window_ns = self.idle_window_ns();
     c.idle_holds = self.idle_holds.get();
     c.idle_holds_declined = self.idle_holds_declined.get();
+    c.real_time_spins_met = self.real_time_spins_met.get();
+    c.real_time_spins_parked = self.real_time_spins_parked.get();
     let held_turn = self.held_turn.get();
     c.held_turn_ns = held_turn.and_then(|turns| turns.met_ns()).unwrap_or(0);
     c.held_turns = held_turn.map_or(0, |turns| turns.turns());
@@ -1485,6 +1499,14 @@ impl ShardContext {
     }
     self.update_attribution(Tracker::wait_began);
     let found = self.spin_for_work(window_end, deadline_ns);
+    if self.real_time_class {
+      let count = if found {
+        &self.real_time_spins_met
+      } else {
+        &self.real_time_spins_parked
+      };
+      count.set(count.get().saturating_add(1));
+    }
     if let (Some(entry), Some(met)) = (
       self.entry,
       self.held_turn.get().and_then(|turns| turns.met_ns()),
@@ -1743,9 +1765,9 @@ impl ShardContext {
   /// provisioning floor alone (ratio 0, `slates_server::config::NO_ESTIMATE_MULTIPLE`), under its watchdog's window
   /// (`slates_server::config::IDLE_SPIN_CEILING`). The configured spin while the shard tracks none.
   pub fn idle_window_ns(&self) -> u64 {
-    // A real-time shard parks at once when idle (`parks_at_once`).
-    if self.parks_at_once {
-      return 0;
+    // A real-time shard spins R9's floor alone (`real_time_class`), within its ceiling.
+    if self.real_time_class {
+      return self.idle_floor_ns.min(self.idle_ceiling_ns);
     }
     self.wake.get().map_or(self.fixed_spin_ns, |estimate| {
       estimate

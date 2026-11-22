@@ -3,7 +3,8 @@
 //! shard behind busy time-share neighbours ran a millisecond or more after its kick: 920 µs at the median, 2,990 µs at
 //! p99 on ubuntu-24.04-arm, and on ubuntu-latest a spinning shard took requests 2.8-3.9 ms after they landed (run
 //! 45017505026, 4 CPUs, two spinners a CPU). A thread in the class runs ahead of every time-share thread when runnable.
-//! It must never spin at that priority, or it would take its CPU from every time-share task. Where the account grants
+//! It must never spin long at that priority, or it would take its CPU from every time-share task: it spins R9's floor
+//! alone. Where the account grants
 //! no real-time priority (`RLIMIT_RTPRIO`), or limits a real-time thread's run (`RLIMIT_RTTIME`), the shard stays
 //! time-share, logged: grant or skip, never a privilege (R10).
 
@@ -98,11 +99,11 @@ fn granted() -> bool {
 
 /// 84a, Linux. Do: start a one-shard runtime that tracks a wake estimate (as the daemon's do), and one that tracks none;
 /// on each shard, ask whether its thread holds the round-robin real-time class, and its idle window. Expect, where the
-/// account's limits grant the class: the tracking runtime's shard holds it and parks at once (an idle window of none),
+/// account's limits grant the class: the tracking runtime's shard holds it and spins only R9's floor (its idle window the floor),
 /// and the other does not hold it and keeps its window. Where they grant none, the tracking shard stays time-share and
 /// keeps its window. Until 84a's Linux half no shard held it. Off Linux the class is Linux's and the test skips loudly.
 #[test]
-fn a_tracking_runtimes_shard_takes_the_round_robin_class_where_granted_and_parks_at_once() {
+fn a_tracking_runtimes_shard_takes_the_round_robin_class_where_granted_and_spins_only_its_floor() {
   if !cfg!(target_os = "linux") {
     eprintln!("skipping: the round-robin real-time class is Linux's");
     return;
@@ -112,7 +113,7 @@ fn a_tracking_runtimes_shard_takes_the_round_robin_class_where_granted_and_parks
   if granted() {
     assert_eq!(
       (tracking_holds, tracking_window),
-      (Some(true), 0),
+      (Some(true), WINDOW_NS),
       "a latency-tracking runtime's shard holds the class and never spins idle"
     );
   } else {

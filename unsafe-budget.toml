@@ -247,10 +247,12 @@
 #   by BLAKE3.
 
 [budget]
-slates-machine = 107
-# 2026-11-22 (+3, 84a Linux, w-perf): `round_robin.rs`, a shard thread's real-time class on Linux, grant-or-skip:
-#   `sched_get_priority_min(SCHED_RR)` (the class's lowest priority, a query), `sched_setscheduler` of the calling
-#   thread, and `sched_getscheduler` of it. rustix 1.1.4 has none of the three.
+slates-machine = 111
+# 2026-11-22 (+7, 84a Linux, w-perf): `round_robin.rs`, a shard's and a client's reply wait's real-time class on Linux,
+#   grant-or-skip: `sched_get_priority_min(SCHED_RR)` (the class's lowest priority, a query), `sched_setscheduler` of
+#   the calling thread (to the class, and down to time-share should a restore fail), `sched_getscheduler`,
+#   `sched_getattr` and `sched_setattr` (a park's exact read and restore), and `sched_rr_get_interval` (the timeslice the
+#   idle floor is logged against). rustix 1.1.4 has none of them.
 # 2026-11-21 (+3, A-837 part 2, one a platform): `descriptors.rs`, the learned descriptor ceiling counted without a
 #   descriptor: macOS `proc_pidinfo(PROC_PIDLISTFDS)` sized with no buffer, Windows `GetProcessHandleCount`, and Linux
 #   the close of the spare descriptor its count gives up (an `OwnedFd` remade from the raw one the module alone holds).

@@ -14,9 +14,11 @@
 //! `SIGXCPU` to a real-time thread that runs past it without blocking, and that signal ends the process. Anywhere else
 //! the thread stays time-share, and [`take_current`] says why.
 //!
-//! **Never spin at real-time priority.** A shard that holds the class parks when it has no work: its idle window and
-//! its closed-loop holds are off (`slates_rt`'s shard). A spinning real-time thread would take its CPU from every
-//! time-share task, and the kernel's real-time throttling would then stall it.
+//! **Never spin long at real-time priority.** A shard that holds the class spins at most R9's provisioning floor when it
+//! has no work, then parks: no estimate-scaled window and no closed-loop hold (`slates_rt`'s shard,
+//! `real_time_class`). A long spin at real-time priority would take its CPU from every time-share task, and the
+//! kernel's real-time throttling would then stall it. Parking at once lost the quiet path R9's floor buys (run
+//! 45020495221).
 
 /// Why a thread did not take the round-robin class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -234,6 +236,30 @@ pub fn holds() -> Option<bool> {
 #[cfg(not(target_os = "linux"))]
 pub fn take_current() -> Result<i32, Declined> {
   Err(Declined::Unsupported)
+}
+
+/// The round-robin class's timeslice for the calling thread, nanoseconds (`sched_rr_get_interval`); `None` where it
+/// cannot be read.
+#[cfg(target_os = "linux")]
+pub fn timeslice_ns() -> Option<u64> {
+  let mut slice = libc::timespec {
+    tv_sec: 0,
+    tv_nsec: 0,
+  };
+  // SAFETY: pid 0 is the calling thread; `slice` is a `timespec` on this frame, which the kernel fills.
+  let rc = unsafe { libc::sched_rr_get_interval(0, &raw mut slice) };
+  (rc == 0).then(|| {
+    u64::try_from(slice.tv_sec)
+      .unwrap_or(0)
+      .saturating_mul(1_000_000_000)
+      .saturating_add(u64::try_from(slice.tv_nsec).unwrap_or(0))
+  })
+}
+
+/// Off Linux: none.
+#[cfg(not(target_os = "linux"))]
+pub fn timeslice_ns() -> Option<u64> {
+  None
 }
 
 /// Off Linux: no real-time class is granted here.
