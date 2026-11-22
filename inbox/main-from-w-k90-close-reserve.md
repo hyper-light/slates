@@ -1,0 +1,1 @@
+w-k90-close, 2026-11-21 21:20 PST: list done (90c met: cycle 10 bec9fdf5f93, W10 docs b928a782a96; goal 90's 38 parts all met); free since 10:40 (main-from-w-k90-close-free.md); 01a1ff2e put me in goal 93's RESERVE at 10:43 (no runs; wait for an owner's red with the owner's go). Waiting on main only for a piece; no scratch held.
