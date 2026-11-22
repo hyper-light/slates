@@ -502,7 +502,7 @@ pub(crate) async fn land_revision(
     Ok(brought) => brought,
     Err(refused) => return Some(Err(refused)),
   };
-  let (storing, carried) = match stage_texts(repository, &mut revision).await? {
+  let (storing, carried) = match stage_texts(repository, &mut revision, Vec::new()).await? {
     Ok(staged) => staged,
     Err(refused) => {
       let _ = crate::state::with_state(|state| release_texts(state, None, &brought));
@@ -547,16 +547,27 @@ pub(crate) async fn land_revision(
 
 /// Stages the texts `revision` brings for its landing (C2 stage B part 2 (b)): each taken out of its contents and named
 /// stored ([`take_texts`]), put through repository `repository`'s content store a copy slice a step, as a client's
-/// commit's are, so its changeset carries them as Payload with Texts rows and the records keep none in RAM. What was
-/// put, held until the landing ends ([`release_stored`]), and what the changeset carries. None where the shard's state
-/// is gone; refused with what was put given back.
+/// commit's are, so its changeset carries them as Payload with Texts rows and the records keep none in RAM; and the
+/// texts an import's sink put already, `imported`, each holding one count of the store (`vcs_store::svn_import::texts`),
+/// taken as put ([`hand_over`]). What was put, held until the landing ends ([`release_stored`]), and what the changeset
+/// carries. None where the shard's state is gone; refused with what was put given back, `imported` too.
 async fn stage_texts(
   repository: RepositoryId,
   revision: &mut Revision,
+  imported: Vec<ContentIdentity>,
 ) -> Option<Result<(Storing, Vec<landing::LandedText>), Uncommitted>> {
   let texts = crate::state::with_state(|state| take_texts(state, repository, revision))?;
   let begun = crate::state::with_state(|state| {
-    storing_of(state, repository, (&revision.record.changes, texts.keys()))
+    match storing_of(state, repository, (&revision.record.changes, texts.keys())) {
+      Ok(mut storing) => {
+        hand_over(state, repository, revision, imported, &mut storing);
+        Ok(storing)
+      }
+      Err(refused) => {
+        release_texts(state, None, &imported);
+        Err(refused)
+      }
+    }
   })?;
   let mut storing = match begun {
     Ok(storing) => storing,
@@ -585,6 +596,30 @@ async fn stage_texts(
   drop(texts);
   let carried = texts_carried(&revision.record.changes, &storing.put);
   Some(Ok((storing, carried)))
+}
+
+/// Takes the holds an import's sink took on the texts `revision` names stored, `imported`, as texts `storing` put, one
+/// each; gives back every other: one the records hold already, one sealed twice, one the revision does not name.
+fn hand_over(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  revision: &Revision,
+  imported: Vec<ContentIdentity>,
+  storing: &mut Storing,
+) {
+  let mut spare = Vec::new();
+  for identity in imported {
+    let held = state
+      .vcs_stores
+      .subversion_records(repository)
+      .is_none_or(|records| records.holds(&identity));
+    if revision.stored.contains_key(&identity) && !held && !storing.put.contains(&identity) {
+      storing.put.push(identity);
+    } else {
+      spare.push(identity);
+    }
+  }
+  release_texts(state, None, &spare);
 }
 
 /// The texts of `revision` repository `repository`'s records do not hold, taken out and named stored
@@ -1017,7 +1052,7 @@ pub(crate) async fn land_made<T>(
   commit: impl FnOnce(&mut ShardState, MadeEntry) -> Result<T, Uncommitted>,
 ) -> Option<Result<T, Uncommitted>> {
   let mut revision = revision;
-  let (storing, carried) = match stage_texts(repository, &mut revision).await? {
+  let (storing, carried) = match stage_texts(repository, &mut revision, Vec::new()).await? {
     Ok(staged) => staged,
     Err(refused) => {
       let _ = crate::state::with_state(|state| turn.give_back(state));

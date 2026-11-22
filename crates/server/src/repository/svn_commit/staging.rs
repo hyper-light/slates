@@ -5,8 +5,9 @@
 //! git-2000's 2,001 revisions took 24.5 s against 8.2 s before the store (GAPS, "C2 stage C waits").
 //!
 //! **What.** A [`Staging`] holds the repository's landing turn for its life, so no other landing moves the records it
-//! advances. Each revision ([`Staging::stage`]) has its texts taken out and put into the content store, named stored
-//! (as `land_revision` does); its copies from older revisions planned (`super::restore`); it is checked and applied to
+//! advances. Each revision ([`Staging::stage`]) arrives with its texts in the content store already, put by the import's
+//! sink as the dump was read and named stored (`crate::vcs_store::svn_import::texts`; goal 93, P7 finding (2)), their
+//! holds handed to the batch (`svn_commit::stage_texts`); its copies from older revisions planned (`super::restore`); it is checked and applied to
 //! the records in RAM, and its increment, built against the batch's scratch member, staged there (`ImportBatch::stage`).
 //! [`Staging::land`] lands one changeset: every text the batch put as its `Payload` with `Texts` rows, then one `Record`
 //! section a revision in order. Then it commits every version and the changeset's reference as one register entry
@@ -155,7 +156,13 @@ impl Staging {
     if self.records.len() >= MAX_RECORDS {
       return Some(Flush::Sections);
     }
-    let charge = brought(revision).saturating_mul(2);
+    // Its texts arrive named stored, put by the import's sink as the dump was read, and count twice as contents do:
+    // in the content store, and again in its increment's post-state.
+    let texts = revision
+      .stored
+      .values()
+      .fold(0u64, |total, len| total.saturating_add(*len));
+    let charge = brought(revision).saturating_add(texts).saturating_mul(2);
     let admittable = state.store.admittable();
     #[cfg(test)]
     let admittable = ADMISSION_CAP
@@ -170,13 +177,18 @@ impl Staging {
     (charge > admittable).then_some(Flush::Admission)
   }
 
-  /// Stages `revision` (module docs): its texts put into the content store and named stored, its copies planned, then
-  /// checked, applied to the records in RAM and its version staged in the batch. None where the shard's state is
-  /// gone; refused as `land_revision` refuses, the batch then to be abandoned.
-  pub(crate) async fn stage(&mut self, revision: Revision) -> Option<Result<(), Uncommitted>> {
+  /// Stages `revision` (module docs): the texts the import put for it, `imported`, taken with their holds, any of its
+  /// contents put into the content store and named stored, its copies planned, then checked, applied to the records in
+  /// RAM and its version staged in the batch. None where the shard's state is gone; refused as `land_revision` refuses,
+  /// the batch then to be abandoned.
+  pub(crate) async fn stage(
+    &mut self,
+    revision: Revision,
+    imported: Vec<ContentIdentity>,
+  ) -> Option<Result<(), Uncommitted>> {
     let repository = self.repository;
     let mut revision = revision;
-    let (storing, carried) = match super::stage_texts(repository, &mut revision).await? {
+    let (storing, carried) = match super::stage_texts(repository, &mut revision, imported).await? {
       Ok(staged) => staged,
       Err(refused) => return Some(Err(refused)),
     };

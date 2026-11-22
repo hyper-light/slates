@@ -27,6 +27,9 @@ unicode-normalization = { workspace = true }
 # which A-599 took for CRAM-MD5 and which keeps its chaining state private, so production no longer runs it.
 md-5 = { workspace = true }
 proptest = { workspace = true }
+# The slates binary's allocator, the global one in `tests/import_heap.rs`: its figures read what an import allocates on
+# the system allocator's path (goal 93, P7 finding (2)), as slates-git's `recent_ring.rs` reads a push's.
+slates-mem = { workspace = true }
 slates-test-seeds = { workspace = true }
 # The changeset A/B's segment codecs (`examples/changeset_ab.rs`), as slates-hg's same example compresses its log.
 zstd = { workspace = true }

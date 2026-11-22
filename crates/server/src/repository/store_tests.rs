@@ -579,7 +579,7 @@ fn file_work(
   use slates_svn::index::{Action, ChangedPath, NodeKind};
   let text = slates_svn::commit::drive::text_of(bytes).unwrap();
   let texts = slates_svn::commit::drive::HeldTexts::new();
-  let staged = texts.stage().unwrap();
+  let staged = texts.stage(None).unwrap();
   texts.append(staged, bytes).unwrap();
   texts.seal(staged, text.identity).unwrap();
   let mut changes = Vec::new();
