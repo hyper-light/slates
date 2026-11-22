@@ -504,3 +504,12 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - Raised with main: the gate's "live" is the heap's in_use growth, which counts untouched bytes (1.30 GB at a 44 MB
   footprint). The gauges will show whether it overstates live.
 - Waiting on main: r13's reading, then the node_record streaming cut if the holders point there.
+
+## 2026-11-22 ~06:30 PST: A-862, the import's texts streamed (main's order of 05:28)
+- f159578c3: `Importer::import` takes the commit drive's `TextSink`, and each text goes into it a piece at a time as
+  the dump is read, named stored. The daemon's sink is the content store; its holds go to the landing.
+- Red first: `an_import_holds_no_text_whole_on_the_system_heap`, 8 × 512 KiB. The system-path churn was 4,299,277 B at
+  2bb00e1cc and is 92,309 B now.
+- Tests: svn lib 585/585, the svn import tests 7/7, server svn 114/114 (on the merged tree too), store_tests 10/10.
+- Filed: main's gauged an_import_measured over git-2000 (run-requests.md).
+- Next, per main: the next-largest per-text churner given a buffer the import owns, reused.

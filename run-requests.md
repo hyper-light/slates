@@ -7555,3 +7555,16 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   (the landed windows 61.3 MB and pack 53.9 MB let go) and w-git's recent give-back land. Red for A-861: that remainder
   still past 300 MB (then the pack reader's own per-object buffers are next, phase B).
 
+
+- w-svn (2026-11-22, A-862 f159578c3 on main; main 01a20182's 05:28 order, goal 93, P7 finding (2)): the import's
+  texts streamed into the content store, measured as r14 measured it at 2bb00e1cc:
+    SLATES_SVN_IMPORT_DUMP=<git-2000.dump> \
+      cargo test --release -p slates-cli --test svn_interop -- --ignored an_import_measured --nocapture
+  Platform: macOS arm64, this MacBook. r14 at 2bb00e1cc is the baseline: footprint at idle 30 s 936 MB, 600.3 MB not
+  given back, process.system_allocated_bytes 33.59 GB cumulative, system_live 106.9 MB, mapped_resident 30.3 MB,
+  greens.content_bytes 50.6 MB.
+  Read: the gate's line, and the summed gauges at "after" and "idle 30 s" (system_allocated_bytes, system_live_bytes,
+  mapped_resident_bytes, vcs_content.*, greens.*, held.*), and the footprint past system live + mapped resident + arena.
+  Green for A-862: system_allocated_bytes down by at least one copy of the dump's texts against r14's 33.59 GB, and the
+  peak no higher. The gate is expected to stay red: the other per-text churners are next. Red for A-862: the import
+  refused or slower than r14's 8.2 s by more than its noise, or system_allocated_bytes not lower.
