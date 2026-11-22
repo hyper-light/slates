@@ -7036,7 +7036,7 @@ impl HeldMount {
     let (code, _, err) = unmount_through_the_cli(&self.instance, &self.mount_point.path);
     assert_eq!(code, 0, "slates unmount: {err}");
     assert!(
-      wait_for(&held.instance, || attachments_of(&self.instance, &self.id)
+      wait_for(&self.instance, || attachments_of(&self.instance, &self.id)
         == "0"),
       "the unmount ends the attachment"
     );

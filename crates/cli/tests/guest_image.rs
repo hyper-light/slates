@@ -1709,14 +1709,17 @@ fn kill_the_vmm_under_its_launcher(guest: &mut Guest) -> u64 {
   )
   .unwrap();
   // While the launcher's tree gains CPU (until 2026-11-20 within `QUIT_WAIT`).
-  let mut judged = vm::Judged::of(guest.vm.id());
+  let mut judged = vm::process_wait::Judged::of(guest.vm.id());
   let status = loop {
     if let Some(status) = guest.vm.try_wait().unwrap() {
       break status;
     }
     let verdict = judged.judge();
     assert!(
-      matches!(verdict, vm::Verdict::Waiting { .. } | vm::Verdict::Gone),
+      matches!(
+        verdict,
+        vm::process_wait::Verdict::Waiting { .. } | vm::process_wait::Verdict::Gone
+      ),
       "the launcher ended once its VMM was killed: its processes are {verdict:?}\n{}",
       guest.transcript()
     );
