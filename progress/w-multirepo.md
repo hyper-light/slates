@@ -44,3 +44,9 @@ Clone: ~/slates-work/w-multirepo; target ~/.cache/w-multirepo-target.noindex; st
   turn-weights). Reported.
 - OPEN: room reads grants (await w-balance OK; inbox/w-balance-from-w-multirepo-room-shape.md), curve feeding from
   pushes/hg/svn (other owners' step sites), hg/svn in load proof.
+- main 05:32: many-repository rounds on 3e910809f all pass (git 97.8 s, hg 173.9 s, svn 200.9 s, big Studio release).
+- LANDED 7cd88b047: §4.17.5 CPU open-decision status. BRANCH agents/w-multirepo-learned-weights 1cec5ee82 (A/B arm B;
+  worktree ~/slates-work/w-multirepo-weights, target ~/.cache/w-multirepo-weights-target.noindex). Run request: 3 arms.
+- WAITING: w-balance yes/no on the room shape (asked again via agents_send).
+- For main to delete when the A/B is done: ~/.cache/w-multirepo-weights-target.noindex, worktree above (I'll remove the
+  worktree myself with git worktree remove once the branch is settled).
