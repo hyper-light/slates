@@ -133,7 +133,104 @@ pub fn dump(path: &str) {
 
 // Ring split: for every request a shard takes, (landed → taken, taken → reply written), ns.
 const RING_CAP: usize = 300_000;
-static RING: [[AtomicU64; 5]; RING_CAP] = [const { [const { AtomicU64::new(0) }; 5] }; RING_CAP];
+/// The ring row's columns: queued, served, landed, written, deferred, then a forward's split (w-perf 84a, [`FWD_COLS`]).
+const RING_COLS: usize = 5 + FWD_COLS;
+static RING: [[AtomicU64; RING_COLS]; RING_CAP] =
+  [const { [const { AtomicU64::new(0) }; RING_COLS] }; RING_CAP];
+
+/// w-perf 84a: a forwarded request's stamps across its shards, by request id, host monotonic ns: sent (origin), started
+/// (owner) with the owner's last park [began, kicked, returned], the reply sent home (owner), the reply's task run
+/// (origin) with the origin's last park.
+#[derive(Clone, Copy, Default)]
+struct Fwd {
+  sent: u64,
+  started: u64,
+  owner_woke: [u64; 3],
+  replied: u64,
+  home: u64,
+  origin_woke: [u64; 3],
+}
+static FWD: std::sync::Mutex<Option<std::collections::HashMap<u64, Fwd>>> =
+  std::sync::Mutex::new(None);
+/// Shape: forwards kept in flight at once.
+const FWD_CAP: usize = 100_000;
+/// A forward's split: complete (1, or 0 for a forward some stamp missed, all zero), then for the owner how it met its
+/// message ([`side`]: met, kick lateness after the send, kick -> run, run -> stamp), the owner's work (started -> reply
+/// sent), the same four for the origin and its reply, and the origin's reply task to the reply written.
+const FWD_COLS: usize = 11;
+
+fn fwd(request: u64, change: impl FnOnce(&mut Fwd)) {
+  if let Ok(mut guard) = FWD.lock() {
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    if map.len() < FWD_CAP || map.contains_key(&request) {
+      change(map.entry(request).or_default());
+    }
+  }
+}
+
+fn last_here() -> [u64; 3] {
+  slates_rt::registry::current_shard().map_or([0; 3], slates_rt::g222_parks::last)
+}
+
+/// On the origin, as a request is sent to its owner.
+pub fn fwd_sent(request: u64) {
+  let at = now_mono();
+  fwd(request, |f| {
+    *f = Fwd {
+      sent: at,
+      ..Fwd::default()
+    }
+  });
+}
+
+/// On the owner, as the forward's task starts.
+pub fn fwd_started(request: u64) {
+  let at = now_mono();
+  let woke = last_here();
+  fwd(request, |f| {
+    f.started = at;
+    f.owner_woke = woke;
+  });
+}
+
+/// On the owner, as the reply is sent home.
+pub fn fwd_replied(request: u64) {
+  let at = now_mono();
+  fwd(request, |f| f.replied = at);
+}
+
+/// On the origin, as the reply's task runs.
+pub fn fwd_home(request: u64) {
+  let at = now_mono();
+  let woke = last_here();
+  fwd(request, |f| {
+    f.home = at;
+    f.origin_woke = woke;
+  });
+}
+
+/// The split of request `request`'s forward, its reply written at `written`; taken out of the table.
+fn fwd_split(request: u64, written: u64) -> [u64; FWD_COLS] {
+  let Some(f) = FWD
+    .lock()
+    .ok()
+    .and_then(|mut guard| guard.as_mut().and_then(|map| map.remove(&request)))
+  else {
+    return [0; FWD_COLS];
+  };
+  if f.sent == 0 || f.started == 0 || f.replied == 0 || f.home == 0 {
+    return [0; FWD_COLS];
+  }
+  let owner = side(f.sent, f.started, f.owner_woke);
+  let origin = side(f.replied, f.home, f.origin_woke);
+  let mut out = [0; FWD_COLS];
+  out[0] = 1;
+  out[1..5].copy_from_slice(&owner);
+  out[5] = f.replied.saturating_sub(f.started);
+  out[6..10].copy_from_slice(&origin);
+  out[10] = written.saturating_sub(f.home);
+  out
+}
 static RING_TAKEN: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
@@ -157,7 +254,9 @@ pub fn forget(request: u64) {
 /// A reply written for a request taken in an earlier step (resumed or forwarded): a ring row flagged deferred.
 pub fn deferred_written(request: u64) {
   if let Some((landed, taken)) = TAKES.with(|t| t.borrow_mut().remove(&request)) {
-    ring_row(landed, taken, now_mono(), 1);
+    let written = now_mono();
+    let split = fwd_split(request, written);
+    ring_row_split(landed, taken, written, 1, split);
   }
 }
 
@@ -170,8 +269,15 @@ pub fn ring(landed: u64, taken: u64, written: u64) {
 }
 
 fn ring_row(landed: u64, taken: u64, written: u64, deferred: u64) {
+  ring_row_split(landed, taken, written, deferred, [0; FWD_COLS]);
+}
+
+fn ring_row_split(landed: u64, taken: u64, written: u64, deferred: u64, split: [u64; FWD_COLS]) {
   let n = RING_TAKEN.fetch_add(1, Relaxed);
   if n < RING_CAP {
+    for (slot, value) in RING[n][5..].iter().zip(split) {
+      slot.store(value, Relaxed);
+    }
     RING[n][0].store(taken.saturating_sub(landed), Relaxed);
     RING[n][1].store(written.saturating_sub(taken), Relaxed);
     RING[n][2].store(landed, Relaxed);
@@ -184,19 +290,14 @@ pub fn dump_ring(path: &str) {
   use std::io::Write;
   let n = RING_TAKEN.load(Relaxed).min(RING_CAP);
   let mut out = format!(
-    "# client sends {} rings {}\nqueued\tserved\tlanded\twritten\tdeferred\n",
+    "# client sends {} rings {}\nqueued\tserved\tlanded\twritten\tdeferred\tcomplete\towner_met\towner_kick_after\towner_kick_run\towner_run_start\towner_work\torigin_met\torigin_kick_after\torigin_kick_run\torigin_run_home\thome_written\n",
     slates_ipc::endpoint::G222_SENDS.swap(0, Relaxed),
     slates_ipc::endpoint::G222_RINGS.swap(0, Relaxed)
   );
   for row in RING.iter().take(n) {
-    out.push_str(&format!(
-      "{}\t{}\t{}\t{}\t{}\n",
-      row[0].load(Relaxed),
-      row[1].load(Relaxed),
-      row[2].load(Relaxed),
-      row[3].load(Relaxed),
-      row[4].load(Relaxed)
-    ));
+    let line: Vec<String> = row.iter().map(|v| v.load(Relaxed).to_string()).collect();
+    out.push_str(&line.join("\t"));
+    out.push('\n');
   }
   if let Ok(mut f) = std::fs::File::create(path) {
     let _ = f.write_all(out.as_bytes());

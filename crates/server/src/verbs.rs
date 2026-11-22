@@ -3707,9 +3707,11 @@ fn send_forward(
     request,
     refused(Refusal::Overloaded { shard: owner }),
   );
+  crate::g222_diag::fwd_sent(request);
   let task = SpawnRequest::new(
     Box::pin(async move {
       unstarted.started();
+      crate::g222_diag::fwd_started(request);
       // The closed loop this forward was made for comes back to this shard only after going round the others: the
       // owner holds its window for it (A-326).
       if hold_ns > 0 {
@@ -3787,7 +3789,9 @@ fn send_forward(
       let Some(reply) = reply else {
         return;
       };
+      crate::g222_diag::fwd_replied(request);
       crate::xshard::send_reply_home(origin, move || {
+        crate::g222_diag::fwd_home(request);
         // What the verb owes its client besides the reply (a stream end, A-161) goes home with it, for `send_reply`
         // to hand over first. A shard whose state is out of reach drops it, counted, and the stream then ends.
         if let Some(carried) = carried {
