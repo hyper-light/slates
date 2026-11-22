@@ -678,6 +678,11 @@ fn measure(
         rows.entry(format!("{part}_{pct}")).or_default().push(value);
       }
     }
+    println!(
+      "client sliced parks\t{}_f{files}_{load}: {:?}",
+      form.key(),
+      fixture.client.sliced_parks()
+    );
     fixture.client.destroy(fixture.leader).unwrap();
     fixture.client.destroy(fixture.follower).unwrap();
     fixture.client.destroy(fixture.green).unwrap();
