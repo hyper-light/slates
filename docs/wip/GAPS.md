@@ -101,6 +101,13 @@
 > pack let go once no fetch is answered and no encoding runs (else owed to the idle give-back), whatever its windows'
 > holders (`ContentStore::let_go_landed`), every window a home holds here kept (`vcs_store::landed_pin`; a one-shard
 > daemon lets nothing go until (2b)(b), homes' own read-through, next).
+> **HELD (main 01a20182, 2026-11-22 15:40):** no landed pack is let go or owed from a push's commit (`vcs_store::commit`),
+> since r52 (the big Studio, main 6f6e87d82) found readers that do not bring a let-go window back: once git/git's push
+> ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's tag peel through
+> `StoreGraph::named`, shallow and filter tree walks), and stock git read "possible repository corruption" on ls-remote
+> and every clone (stock_git_verbs 1 of 8). Lifted when w-git's fetch-side readers (A-855's held answer, brought back and
+> made again) and the push decision's reads bring a let-go window back, with w-shared's red: annotated tags pushed, the
+> push ended, idle, then ls-remote and a clone byte-identical to stock.
 > Owed, in main's order: (1) the push's temporaries cut at their source (w-shared);
 > (2) landed windows and the pack let go once durable (w-shared, with w-git); (3) the recent-objects cache given back
 > after a fetch (w-git); (4) the index tables, decided after.

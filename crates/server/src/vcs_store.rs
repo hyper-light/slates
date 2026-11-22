@@ -2355,10 +2355,6 @@ fn based_moves(
 /// hold its moves alone. Refused, nothing of the store changed and the push still holds its objects.
 pub(crate) fn commit(state: &mut ShardState, sealed: &mut SealedPush) -> Result<(), GitRefused> {
   let repository = sealed.repository;
-  // The pack the staging put in the content store, where its changeset landed on the node's store (A-767 C5).
-  let landed_pack = (sealed.landed > 0)
-    .then(|| sealed.push.stored_pack())
-    .flatten();
   let unkept = within_budget(state, 0, |stores| {
     let (content, store) = stores.git(repository).ok_or(GitRefused::NoStore)?;
     commit_moves(
@@ -2370,22 +2366,13 @@ pub(crate) fn commit(state: &mut ShardState, sealed: &mut SealedPush) -> Result<
   })?;
   sealed.objects = RecordWriter::default();
   state.count(VALUE_UNKEPT, unkept);
-  if let Some((pack, _)) = landed_pack {
-    // Never under a fetch's answer or an encoding (w-git's driver makes the packs resident before either, and no read
-    // of theirs meets a window let go mid-answer), nor under a push still deciding its refs (the push committing it is
-    // one: a non-atomic push's later refs, each an entry of its own, read its objects): owed until the push ends or the
-    // repository goes idle.
-    if landed_let_go_may(state, repository, 0) {
-      let_go_landed_pack(state, &pack);
-    } else {
-      state
-        .vcs_stores
-        .landed_owed
-        .entry(repository)
-        .or_default()
-        .push(pack);
-    }
-  }
+  // A landed push's pack stays resident: its let-go (goal 93 item 2b) is safe only once every git read of the
+  // repository brings a let-go window back, and some do not yet. Run r52 (2026-11-22, the big Studio, main 6f6e87d82):
+  // once git/git's push ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's
+  // tag peel among the reads), so stock git read "possible repository corruption" on ls-remote and every clone. So no
+  // landed pack is let go or owed here until w-git's read-through covers every reader; the let-go itself
+  // (`let_go_landed_pack`, `let_go_owed`) is unchanged and tested directly (read_through's tests), and nothing reaches it
+  // from a push. GAPS: goal 93 item 2b.
   Ok(())
 }
 
