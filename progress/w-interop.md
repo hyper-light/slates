@@ -445,3 +445,13 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   st_dev), 8673d528a (fuse::serve split + hangup readiness wait), 07af60280 (vendor/rustfmt.toml), 0fde44ef2
   (recovery.rs unused instants). Queued after the spin repro: bound recovery.rs's three content-scrub waits (main's
   ruling 03:45: progress-judged, window from the daemon's cadence, a typed failure that prints what it saw).
+- LEDGER UPDATE (2026-11-22 ~04:30 PST, from main 01a20182):
+  - git/git verbs GREEN: git_correctness stock_git_verbs_on_a_real_repository_match_stock_git 25/25 at main
+    257f19ebf (main's r11, the MacBook, git/git f7de814569, Apple git 2.50.1, 2,072 s).
+  - svn HTTPv2 against stock svnserve GREEN: 1/1, macos-latest, svn 1.15.0 (CI 45021179639, main 272513fe4).
+  - Still open: git/git whole (main's run going; then B's pack reuse, w-git); hg's whole-history push (w-hg's
+    admission fix (a): CI 45020211733 refused a manifest delta PastAdmission on all three jobs), the spin judged after.
+- Linux keeper today, also landed: a98ac2d21 (virtiofs vhost_form IpcError), ecc490d91 (confined_spawn test gate),
+  0422eef65 (slates-cli Linux targets: HeldMount::unmount, vm/mod.rs process_wait module + NoLine; both HeldMount FUSE
+  tests 2/2 under SLATES_TEST_CLI=1, run 45022002841), feb59936b (shards.rs IpcError). In test: e6b6f6953 (recovery.rs's
+  three content-scrub waits judged on progress, typed Stalled; diag-measurer-w-interop-waits).
