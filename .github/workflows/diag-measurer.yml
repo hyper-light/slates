@@ -63,7 +63,7 @@ jobs:
           echo "load after $(cat /proc/loadavg)"
           A=$RUNNER_TEMP/matrix-hg/anchor.log
           echo "spins $(grep -cE 'is spinning' $A); kills $(grep -cE 'killing it' $A); restarts $(grep -cE 'daemon exited' $A)"
-          grep -E 'is spinning|killing it' $A | cut -c1-300
+          grep -E 'is spinning|killing it' $A | cut -c1-300 || true
           echo "== held-ahead increments the content store refused (NoCapacity, StaleStage or Unstaged)"
           grep "a push's increment held ahead was refused by the content store" $A | cut -c1-300 | sort | uniq -c | head -20 || true
           echo "== w-hg's give-up line"; grep "a push's intake waited for room and gave up" $A | cut -c1-400 | sort | uniq -c | head -20 || true
