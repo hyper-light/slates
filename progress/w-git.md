@@ -530,3 +530,8 @@
   Reds: deltified clone 20/39 deltas then 117/160 encoded afresh -> 39/39, 0; encoding base-first 0/7 -> 7/7.
   Focused: server 197, git 195. NEXT: main's git/git round reads the counters; A-859 part A; deflate reuse; the
   upload/encoding hook for w-shared's read-through (Away windows).
+- 2026-11-22 ~08:20 PST: A-859 part A LANDED 52411acd9 (merge f2fdfa2a9): a fetched byte priced at its link (HTTP
+  writes that waited, per shard), cold at deflate's measured break-even p0 = d6/s6; written_bytes counted. Goal 93
+  item 2a driver hook LANDED 41b1e2b49 (merge c207cb0b1): packs made resident before a fetch and an encoding, a turn's
+  waiting window brought back; 2b(a)'s let-go must wait for no fetch live (told w-shared). NEXT: A-864 (claimed),
+  CRC32 reuse per main 07:31; then deflate reuse.
