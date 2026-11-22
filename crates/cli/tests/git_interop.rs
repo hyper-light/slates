@@ -1095,7 +1095,13 @@ fn print_gauges(instance: &str, when: &str) {
   let (_, report, _) = slates(instance, &[], &["status", "--memory"]);
   let rows: Vec<&str> = report
     .lines()
-    .filter(|line| line.contains("mem.gauge.") || line.starts_with("memory: "))
+    .filter(|line| {
+      line.contains("mem.gauge.")
+        || line.starts_with("memory: ")
+        || line.contains("vcs_store.landed.")
+        || line.contains("vcs_store.read_through.")
+        || line.contains("vcs_store.git_resident")
+    })
     .collect();
   eprintln!("gauges at {when}:\n  {}", rows.join("\n  "));
 }

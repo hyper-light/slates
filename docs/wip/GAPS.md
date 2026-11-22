@@ -97,8 +97,10 @@
 > back from the node's store; the RSS test now prints the memory gauges at each reading. git's driver hook (w-git): a
 > fetch's and an encoding's packs made resident before they read (`vcs_store::upload::resident`), and a window an
 > encoding turn met let go brought back before the next; a let-go must wait for no fetch live and no encoding under way,
-> since a pack's answer cannot be taken again mid-pack byte for byte. (2b), the let-go after a landing,
-> next: a landed pack's windows have several holders, which `let_go` refuses (`Shared`).
+> since a pack's answer cannot be taken again mid-pack byte for byte. (2b)(a) LANDED (w-shared): a landed push's staged
+> pack let go once no fetch is answered and no encoding runs (else owed to the idle give-back), whatever its windows'
+> holders (`ContentStore::let_go_landed`), every window a home holds here kept (`vcs_store::landed_pin`; a one-shard
+> daemon lets nothing go until (2b)(b), homes' own read-through, next).
 > Owed, in main's order: (1) the push's temporaries cut at their source (w-shared);
 > (2) landed windows and the pack let go once durable (w-shared, with w-git); (3) the recent-objects cache given back
 > after a fetch (w-git); (4) the index tables, decided after.

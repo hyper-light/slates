@@ -325,4 +325,59 @@ mod tests {
     assert_eq!(pinned_count, u64::try_from(pinned).unwrap());
     assert!(whole, "the object read whole once brought back");
   }
+
+  /// w-git's fetch look-ahead (goal 93): a window a read brought back is let go again once passed
+  /// ([`crate::vcs_store::let_go_read`]). Do: on a store-backed daemon, put a one-window object held twice, its bytes
+  /// landed on the node's store, mark it landed, let it go landed, bring it back, then let it go again through
+  /// `let_go_read` among this shard and one more that is its home; then once more with this shard its home. Expect: the
+  /// bring-back puts it back and it reads; `let_go_read` lets it go again (still landed, whatever its holders); with
+  /// this shard its home, refused `Pinned { by: "homes" }`.
+  #[test]
+  fn a_window_brought_back_is_let_go_again_once_read() {
+    let (_store, daemon) = crate::test_store::audit_daemon_stored();
+    let answered = crate::daemon::observe_first(&daemon, |state| {
+      let _ = crate::git_push::tests::git_repository(state, "read-again");
+      let bytes = b"one window, read and let go again".to_vec();
+      let id = ContentId::of(&bytes);
+      crate::vcs_store::within_budget(state, 64, |stores| {
+        let content = stores.content_mut().unwrap();
+        content.put_object(&bytes).unwrap();
+        content.hold(&id).unwrap();
+        content.mark_landed(&id);
+        content.let_go_landed(&id, None).unwrap();
+        content.bring_back(&id, &bytes).unwrap();
+      });
+      let here = state.shard;
+      let elsewhere = (1..200u16)
+        .map(|other| vec![here, here.wrapping_add(other)])
+        .find(|shards| crate::vcs_store::homes::home_of(shards, &id) != Some(here))
+        .unwrap();
+      let homed = state.shards.clone();
+      state.shards = elsewhere;
+      let again = crate::vcs_store::let_go_read(state, &id);
+      let away = state
+        .vcs_stores
+        .content()
+        .is_some_and(|content| content.is_away(&id));
+      crate::vcs_store::within_budget(state, 64, |stores| {
+        stores
+          .content_mut()
+          .unwrap()
+          .bring_back(&id, &bytes)
+          .unwrap();
+      });
+      state.shards = vec![here];
+      let pinned = crate::vcs_store::let_go_read(state, &id);
+      state.shards = homed;
+      (again, away, pinned)
+    });
+    daemon.stop();
+    let (again, away, pinned) = answered;
+    assert!(matches!(again, Ok(bytes) if bytes > 0), "{again:?}");
+    assert!(away, "let go again");
+    assert_eq!(
+      pinned,
+      Err(slates_vcs::LetGoRefused::Pinned { by: "homes" })
+    );
+  }
 }

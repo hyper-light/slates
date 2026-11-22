@@ -60936,7 +60936,13 @@ owed.
   window brought back and the derivation begun afresh from the versions still due; in the encoding's turn the wait is
   put back on the repository for its driver (`Repository::wait_for`). Counted: `vcs_store.landed.let_go_bytes`,
   `vcs_store.landed.pinned`. Evidence: `a_landed_window_goes_whatever_its_holders_unless_a_holder_pins_it` (vcs),
-  `a_landed_packs_windows_go_but_those_a_home_holds_here` (server, store-backed). Lands after w-git's driver wait in
-  upload and the encoding.
+  `a_landed_packs_windows_go_but_those_a_home_holds_here` (server, store-backed). Never while a fetch of the repository
+  is answered or its encoding is under way (w-git's driver makes the packs resident before either and takes no unit
+  again mid-answer): then the pack is owed (`VcsStores`'s `landed_owed`) and let go at the repository's idle give-back
+  (`vcs_store::let_go_owed` from `git_encode::give_back_idle`). A recovery's region hold that cannot be taken back is
+  counted and logged (`vcs_store.region_holds_unrestored`), never skipped, since it is a window's pin; the counts are
+  taken at the first settle after the content store is made, which may be any step after the recovery. Evidence:
+  `t_goal93_a_region_held_window_stays_pinned_across_a_restart` (a region hold, a stop and start over the same segment,
+  the let-go refused `Pinned { by: "homes" }`).
 - Open: 2b(b), homes' read-through (window -> payload identity and offset), which lifts the homes' pin.
 

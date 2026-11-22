@@ -8000,6 +8000,10 @@ mod tests {
           .map(|other| vec![here, here.wrapping_add(other)])
           .find(|shards| crate::vcs_store::homes::home_of(shards, &identity) != Some(here))
           .unwrap();
+        // The content store made by its first use, as a home's read makes it (`homes::read_here`): the restore of
+        // the region holds the image carried runs there.
+        let window = state.store.content.chunk_bytes();
+        state.vcs_stores.content_made(window).unwrap();
         let pin = crate::vcs_store::landed_pin(here, &shards, &identity);
         let refused = crate::vcs_store::within_budget(state, 0, |stores| {
           let content = stores.content_mut()?;

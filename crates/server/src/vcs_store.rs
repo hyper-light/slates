@@ -1315,6 +1315,30 @@ pub(crate) fn settle(state: &mut ShardState) {
   if !settle_in(&mut state.store, &mut state.vcs_stores) {
     state.count(CHARGE_SHORT, 1);
   }
+  count_region_restored(state);
+}
+
+/// Counts what the content store's making took back of a recovery's region holds ([`VcsStores::content_made`], which may
+/// run in any step after the recovery: the store is made by its first use), and logs the ones it could not: a region
+/// hold is the pin that keeps a landed window in RAM (goal 93 item 2b, main 01a20182's ruling of 2026-11-22 07:33).
+fn count_region_restored(state: &mut ShardState) {
+  if state.vcs_stores.region_restored.0 == 0 && state.vcs_stores.region_restored.1.is_empty() {
+    return;
+  }
+  let (held, unheld) = std::mem::take(&mut state.vcs_stores.region_restored);
+  state.count(REGION_HOLDS_RESTORED, held);
+  if let Some(first) = unheld.first() {
+    state.count(
+      REGION_HOLDS_UNRESTORED,
+      u64::try_from(unheld.len()).unwrap_or(u64::MAX),
+    );
+    slates_machine::log_line!(
+      "slates-server: partition {}: {} region holds of the shard image not taken back (the first {first:?}): their windows \
+       are no longer pinned for the region",
+      state.partition,
+      unheld.len()
+    );
+  }
 }
 
 /// The room a Subversion repository's records may grow into now: what they hold, charged, and every byte the shard's
@@ -2359,6 +2383,27 @@ pub(crate) fn commit(state: &mut ShardState, sealed: &mut SealedPush) -> Result<
     }
   }
   Ok(())
+}
+
+/// Lets go again the window `window` a read brought back ([`read_through::bring_back`]) once the read has passed it (w-git's
+/// fetch look-ahead, goal 93): by the same rules as a landed pack's let-go, a landed window whatever its holders, unless a
+/// home holds it here ([`landed_pin`], refused `Pinned`, which its caller leaves). The bytes freed. A window a second
+/// fetch still needs is brought back again by that fetch's own read: a read again, never another's bytes.
+pub(crate) fn let_go_read(
+  state: &mut ShardState,
+  window: &slates_vcs::ContentId,
+) -> Result<u64, slates_vcs::LetGoRefused> {
+  let pin = landed_pin(state.shard, &state.shards, window);
+  let freed = within_budget(state, 0, |stores| {
+    stores
+      .content_mut()
+      .ok_or(slates_vcs::LetGoRefused::NotHeld)?
+      .let_go_landed(window, pin)
+  });
+  if let Ok(bytes) = freed {
+    state.count(LANDED_LET_GO_BYTES, bytes);
+  }
+  freed
 }
 
 /// Lets go of the landed packs repository `id` owes a let-go ([`VcsStores`]'s `landed_owed`): what its going idle runs
@@ -3774,20 +3819,7 @@ fn release_unheld_windows(state: &mut ShardState) {
   let (restored, refused) = std::mem::take(&mut state.vcs_stores.nodes_restored);
   state.count(NODES_RESTORED, restored);
   state.count(NODES_UNRESTORED, refused);
-  let (held, unheld) = std::mem::take(&mut state.vcs_stores.region_restored);
-  state.count(REGION_HOLDS_RESTORED, held);
-  if let Some(first) = unheld.first() {
-    state.count(
-      REGION_HOLDS_UNRESTORED,
-      u64::try_from(unheld.len()).unwrap_or(u64::MAX),
-    );
-    slates_machine::log_line!(
-      "slates-server: partition {}: {} region holds of the shard image not taken back (the first {first:?}): their windows \
-       are no longer pinned for the region",
-      state.partition,
-      unheld.len()
-    );
-  }
+  count_region_restored(state);
   let freed = {
     let lent = Lent::new(&mut state.store, &mut state.vcs_stores);
     lent
