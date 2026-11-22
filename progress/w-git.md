@@ -511,3 +511,8 @@
   room_waits_for_room_and_is_made). Focused: merge push 21, git receive 51, server repository/green_ready/vcs_share/
   git_push 149, daemon t_a727b/t_a767 2. NEXT: main's matrix + git/git rerun (master "cannot lock ref" judged there);
   then the clone pack-size gap (4-5 GiB vs ~300 MB); then deflate reuse; A-855's fetch wait onto vcs_share::wait owed.
+- 2026-11-22 ~04:35 PST: A-859 part B LANDED 6e795cf41 (merge 1721d8c52): pushed pack entries sent on as they lie
+  (fragments and the stream's loose stage), checked against the object's name first; deltified 17,299-byte push clones
+  in 20,858-20,916 (89,439 before). Also clone.rs A-855 test split (clippy). Focused: slates-git store+upload+
+  negotiation 217, slates-server vcs_store/git_push/vcs_http::git 171. NEXT: A-859 part A (a fetched byte priced at the
+  network, §4.11), then the recent-objects cache given back when idle (main 04:24), then deflate reuse.
