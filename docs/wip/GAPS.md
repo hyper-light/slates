@@ -25066,7 +25066,12 @@ in what lands. Branch tips as of 2026-11-10:
 > BISECTED 2026-11-21 to 6088ccb72, A-825's format 6 (w-shared): its parent 544020bd2 p50 0.38 / p99 0.84 ms, it 237.9 /
 > 1,192 ms, release `load_bench` one round each on the big Studio; the likely mechanism is A-825's owed cost, a
 > whole-shard publication (`publish_held_increments` -> `publish_shard`) in every accepted version's step on the owner;
-> handed to w-shared, `inbox/w-shared-from-w-engine-format6-regression.md`). The checkpoint's record LANDED by name
+> handed to w-shared, `inbox/w-shared-from-w-engine-format6-regression.md`; FIXED d44f0166a, w-shared: inside a
+> transaction the verb's own publication carries the hold before the record is appended at the commit, so an accept
+> publishes once, its verb's; `verbs::commit_settled` publishes what is still unpublished and abandons the transaction,
+> typed, when it cannot; red 3 publications for one accepted submit, green 1 (`publish.committed`,
+> `an_accepted_submit_costs_its_shard_one_publication`, macOS arm64, this Mac; the kill -9 recovery test,
+> green_checkpoint, works_off_owner and the holder submits green); main's confirming load_bench A/B owed). The checkpoint's record LANDED by name
 > (goal 93's, main's 15:00: a 1 GiB green's was 650-1,063 ms in one step, record 527 ms): held in the owner's content
 > store a chunk a quantum, published, recorded as `CheckpointRef` (layout 16). OWED, piece 2: its build and encoding
 > are still one step (52 + 71 ms at 1 GiB; 5.7 + 9.5 ms at load_bench's 49 MB), inside the watchdog's 1 s window.
