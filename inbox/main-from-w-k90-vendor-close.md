@@ -33,3 +33,23 @@
 - Item 4, scattered plans: `7ffddbdf0`.
 - The deterministic level: `7c37b6fee`. Its release A/B goes into BENCHMARKS next: a dead heat on CPU, and B writes the
   same bytes every run.
+
+## C1 goal 90a: vendoring and every platform's build. CLOSED (2026-11-21)
+- Item: Slates re-vendored into kiln with `container_engine::export_engine`, and kiln built and tested on every
+  platform.
+- Commit: kiln main `877ab71ea`, Slates at `8ce3d61523e1`, contract 57. Built and tested on kiln main `ca3ea6166`, which
+  contains it and kiln's `1e7c632bc` (vendored.rs reads Cargo.lock with `\n` line ends).
+- Tests: each platform runs `cargo check --locked -p kiln --all-targets`, then `cargo test -p kiln --lib --
+  workspace::slates`, then `--test vendored --test slates_roles`.
+
+  | platform | check | lib workspace::slates | slates_roles | vendored |
+  |---|---|---|---|---|
+  | macOS arm64 (local, on 877ab71ea) | clean | 68 passed (with workspace::container) | 1 passed | 11 passed |
+  | Linux x86_64 (runner 451397fc, kiln run r1) | exit 0 | 59 passed | 1 passed | 11 passed |
+  | Windows x86_64 (jupiter, kiln run r2) | exit 0 | 56 passed | not built on Windows (0 tests) | 11 passed |
+
+  - Also: `KILN_SHARDS=lint cargo xwin check --locked -p kiln --all-targets` passes for `x86_64-pc-windows-msvc` and
+    `aarch64-pc-windows-msvc`.
+  - `scripts/vendor.py check slates`: 0 differences.
+- An earlier jupiter run on `877ab71ea` itself failed two `ac_m1_4_*` vendored tests. Both were line-ending failures in
+  the tests, which kiln fixed in `1e7c632bc`.
