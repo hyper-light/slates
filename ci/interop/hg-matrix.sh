@@ -112,6 +112,10 @@ if [ -n "${PUSH_CHUNK:-}" ]; then
   row push-all bash -c 'tip=$($HG_WORDS -R "$SOURCE" log -r tip -T "{rev}"); tries=0; for rev in $(seq "$PUSH_CHUNK" "$PUSH_CHUNK" "$tip") tip; do for try in 1 2 3 4 5 6; do $HG_WORDS -R "$SOURCE" push -q --new-branch -f -r "$rev" "$URL" 2>"$PUSH_ERR"; c=$?; [ $c -le 1 ] && break; grep -q "push again" "$PUSH_ERR" || break; tries=$((tries+1)); sleep $try; done; [ $c -le 1 ] || { cat "$PUSH_ERR"; echo "chunk at $rev exit $c after $try tries"; exit $c; }; done; echo "chunks pushed; retried on push again: $tries"'
 else
 row push-all "${HG[@]}" -R "$SOURCE" push "${PUSH[@]}" "$URL"
+# DIAG (diag branch only; w-hg's ask, main 01a20182 2026-11-22 11:16): what holds the daemon's memory right after
+# push-all, before any later row can spin and restart it.
+s status --json >"$WORK/status-after-push.json" 2>"$WORK/status-after-push.err" ||
+  echo "DIAG status after push failed: $(head -3 "$WORK/status-after-push.err")"
 fi
 row identify "${HG[@]}" identify "$URL"
 row clone "${HG[@]}" clone -q "$URL" a

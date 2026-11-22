@@ -83,6 +83,18 @@ jobs:
           hits = list(walk(json.load(open(sys.argv[1]))))
           for kind in kinds:
               print(kind, sum(h.get("count", 0) for h in hits if h.get("kind") == kind))' $RUNNER_TEMP/matrix-hg/status.json || true
+          echo "== DIAG what holds memory right after push-all (content_range.*, mem.gauge.*)"; python3 -c 'import json,sys
+          def walk(o):
+              if isinstance(o, dict):
+                  k = o.get("kind")
+                  if isinstance(k, str) and (k.startswith("content_range.") or k.startswith("mem.gauge.")): yield o
+                  for v in o.values(): yield from walk(v)
+              elif isinstance(o, list):
+                  for v in o: yield from walk(v)
+          totals = {}
+          for h in walk(json.load(open(sys.argv[1]))):
+              totals[h["kind"]] = totals.get(h["kind"], 0) + (h.get("count") or h.get("value") or 0)
+          for kind in sorted(totals): print(kind, totals[kind])' $RUNNER_TEMP/matrix-hg/status-after-push.json || true
           echo "== peak RSS (compare be9279f4f)"; grep -E "daemon peak RSS|^(PASS|FAIL) (push-all|clone|clone-rev|stream-clone) " $RUNNER_TEMP/matrix-hg.out | sort -u | cut -c1-200 || true
           echo "== DIAG turns, by cpu"; grep 'DIAG hg-http turn' $A | sed 's/.*turn //' | sort -t= -k3 -n -r | head -20 || true
           echo "== DIAG begins over 10 ms cpu"; grep 'DIAG hg-http begin' $A | awk '{for(i=1;i<=NF;i++) if($i ~ /^cpu_us=/){split($i,a,"="); if (a[2] > 10000) print}}' | cut -c1-260 || true
@@ -97,4 +109,5 @@ jobs:
             ${{ runner.temp }}/matrix-hg/anchor.log
             ${{ runner.temp }}/matrix-hg/logs
             ${{ runner.temp }}/matrix-hg/status.json
+            ${{ runner.temp }}/matrix-hg/status-after-push.json
           if-no-files-found: warn
