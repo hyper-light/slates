@@ -470,3 +470,11 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   - Per main 05:05 (CLAUDE.md §8): no more CI, diag pushes or platform/lint checks from me. The hg whole-history
     rerun waits on w-hg's (b1); its diag branch is local and unpushed (worktree w-interop-httpspin, 3b11e1771) for
     main to push. Still open: git/git whole (w-git's pack-size piece); hg whole-history (w-hg's (i)/(b1)).
+- LANDED 695c62a4b (2026-11-22 ~06:15 PST, main 01a20182's order of 05:47, moved from w-git):
+  git_push::tests::t_goal93_a_clone_answered_before_its_reach_sets_are_derived_is_whole under load was the test's
+  shape, not a stall. Red alone at load ~33: upload/tests.rs's `answered` spent its fixed 4,096 steps with 131,053 of
+  164,196 bytes out; every step is a quantum and at least one unit of the pack (Fragments / Upload::advance). Now
+  `answered` and `fetched_with_counters` drive to Written::End via `written_to_end`, failing only after 60 liveness
+  intervals with no byte and no pack-counter movement (Stalled-style message). Load 39-47: 5/5 alone; git_push::
+  vcs_store:: 153/153, 152/153. Seen meanwhile, w-git's: t_a752's A-783 assert "960 turns for 8081 quanta" fails ~1 in
+  3 alone at load ~40 (git_push/tests.rs:2822, turns*10 < quanta).
