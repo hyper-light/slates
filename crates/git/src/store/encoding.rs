@@ -323,6 +323,9 @@ pub struct Encoding {
   /// base written before it): an object whose pushed entry is a delta against one still in the order, and that base
   /// above it; as deep as the deepest chain any push carried (`Repository::learned_depth`).
   ahead: Vec<Key>,
+  /// The let-go window a unit met and stopped at, its work kept to be taken again once it is brought back (A-864 piece
+  /// 2's encoding side): taken by [`Encoding::waiting`].
+  waiting: core::cell::Cell<Option<packed::Waited>>,
   /// The commits, trees and tags' part, once encoded.
   objects: Option<Encoded>,
   stage: Stage,
@@ -377,6 +380,7 @@ impl Encoding {
       others: BTreeSet::new(),
       blobs: BTreeSet::new(),
       ahead: Vec::new(),
+      waiting: core::cell::Cell::new(None),
       objects: None,
       stage,
       spent_ns: 0,
@@ -472,10 +476,24 @@ impl Encoding {
       if progress == Progress::Done {
         return Ok(Progress::Done);
       }
-      if clock.now_ns().saturating_sub(start) >= quantum_ns {
+      if self.stopped() || clock.now_ns().saturating_sub(start) >= quantum_ns {
         return Ok(Progress::More);
       }
     }
+  }
+
+  /// Whether a unit stopped at a let-go window ([`Encoding::waiting`]) not yet taken: its driver ends the turn there.
+  pub fn stopped(&self) -> bool {
+    let waiting = self.waiting.take();
+    self.waiting.set(waiting);
+    waiting.is_some()
+  }
+
+  /// The let-go window the encoding's last turn stopped at, its unit kept to be taken again once the window is brought
+  /// back (A-864 piece 2's encoding side; a pack's windows brought back as the encoding reads them, never all at once):
+  /// taken. None where the turn met none.
+  pub fn waiting(&self) -> Option<packed::Waited> {
+    self.waiting.take()
   }
 
   /// The encoding driven to its end in one turn whose quantum is never spent: the one-call form of
@@ -684,9 +702,22 @@ impl Encoding {
         }
       }
       Current::Copy(ref mut copying) => {
-        let lent = store
-          .piece(&copying.place.pack, copying.place.len, copying.from)
-          .ok_or(StoreRefused::FragmentUnreadable)?;
+        let Some(lent) = store.piece(&copying.place.pack, copying.place.len, copying.from) else {
+          // A piece let go stops the unit, nothing copied, to be taken again once it is brought back.
+          if store.away(&copying.place.pack, copying.place.len, copying.from) {
+            self.waiting.set(Some(packed::Waited {
+              pack: copying.place.pack,
+              len: copying.place.len,
+              offset: copying.from,
+            }));
+            return Ok(Stage::Encode {
+              blobs,
+              part: Box::new(part),
+              current: Some(current),
+            });
+          }
+          return Err(StoreRefused::FragmentUnreadable);
+        };
         let want = usize::try_from(copying.end.saturating_sub(copying.from)).unwrap_or(usize::MAX);
         let piece = lent
           .get(..want.min(lent.len()).min(window))
@@ -990,6 +1021,18 @@ impl Encoding {
     if let Some(packed) = row.pack {
       let at = PACK_HEADER_LEN.saturating_add(to_u64(part.bytes.len()));
       let place = repository.stored_of(&row, content);
+      // One whose entry lies in a let-go window stops before anything of it is kept, to be taken again.
+      if let StoredAt::InPack(place) = place
+        && let Some(waited) = away_in_range(store, place, place.offset.saturating_add(packed.len))
+      {
+        self.ahead.push(key);
+        self.waiting.set(Some(waited));
+        return Ok(Stage::Encode {
+          blobs,
+          part: Box::new(part),
+          current: None,
+        });
+      }
       if let StoredAt::InPack(place) = place
         && let Some((header, copying)) = self.reused_as_kept(
           repository,
@@ -1142,4 +1185,20 @@ impl Encoding {
     }
     Ok(Stage::Done)
   }
+}
+
+/// The first let-go window of `place`'s pack that its bytes up to `to` lie in (A-864 piece 2's encoding side): what a
+/// unit reading them waits for; none where every window of them is held.
+fn away_in_range(store: &ContentStore, place: InPack, to: u64) -> Option<packed::Waited> {
+  let window = to_u64(store.window()).max(1);
+  let first = place.offset.checked_div(window)?;
+  let last = to.saturating_sub(1).max(place.offset).checked_div(window)?;
+  (first..=last)
+    .map(|index| index.saturating_mul(window).max(place.offset))
+    .find(|offset| store.away(&place.pack, place.len, *offset))
+    .map(|offset| packed::Waited {
+      pack: place.pack,
+      len: place.len,
+      offset,
+    })
 }
