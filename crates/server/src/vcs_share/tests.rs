@@ -323,3 +323,71 @@ fn t_a724_a_push_past_its_share_is_refused_retryable_naming_the_share() {
     },
   );
 }
+
+/// A-724 piece 3d (§4.17.5 "Admission and backpressure": a fetch's room is a claim of its own). Do: push stock git's
+/// fixtures into a repository and hold its generation as a fetch's answer does (`ShardStores::hold`), then ask another
+/// repository's room while the hold lasts, and again once it is given back. Expect: while the fetch is in flight, the
+/// other's room divided with it (bound by its share, counted divided); once it ends, the other alone again, by the fast
+/// path.
+#[test]
+fn t_a724_a_fetch_in_flight_is_a_claim_on_the_room() {
+  crate::test_store::audit_on_stored_shard("vcs_share", |state| {
+    let fetched = git_repository(state, "fetched");
+    let toy = git_repository(state, "toy");
+    crate::git_push::tests::pushed_from_the_fixtures(state, fetched, &["create", "update"]);
+    let held = crate::vcs_store::upload::hold_in(state, fetched, &owner()).expect("held");
+    let divided = room(state, toy);
+    assert!(
+      matches!(divided.bound, Bound::Share { .. }),
+      "a fetch in flight divides the room: {divided:?}"
+    );
+    drop(held);
+    assert!(matches!(
+      room(state, toy).bound,
+      Bound::Shard | Bound::Snapshot { .. }
+    ));
+  });
+}
+
+/// A-724 piece 3d. Do: on a store-holding daemon, push stock git's fixtures into a repository; then, from a task on its
+/// shard as an edge's answer runs, hold its generation, report 5,000 bytes written by the answer, and give the hold
+/// back. Expect: the fetch answered on the repository's usage row, its 5,000 bytes learned as its fetch demand.
+#[test]
+fn t_a724_a_fetchs_answer_is_counted_and_learned_on_its_repositorys_usage_row() {
+  use crate::vcs_http::git::upload::StoreLender;
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let fetched = crate::daemon::observe_first(&daemon, |state| {
+    let fetched = git_repository(state, "fetched");
+    crate::git_push::tests::pushed_from_the_fixtures(state, fetched, &["create", "update"]);
+    fetched
+  });
+  let (sent, done) = std::sync::mpsc::sync_channel(1);
+  crate::daemon::observe_first(&daemon, move |_| {
+    let task = slates_rt::futures::spawn(async move {
+      let mut lender = crate::vcs_store::upload::ShardStores;
+      let held = lender.hold(fetched, &owner());
+      if let Some(held) = held.as_ref() {
+        lender.wrote(held, 5_000);
+      }
+      let _ = sent.send(held.is_some());
+    })
+    .unwrap();
+    slates_rt::futures::detach(task).unwrap();
+  });
+  assert!(
+    done
+      .recv_timeout(std::time::Duration::from_secs(60))
+      .unwrap(),
+    "held"
+  );
+  let row = crate::daemon::observe_first(&daemon, move |state| {
+    state.vcs_usage.usage(&fetched).map(|row| {
+      (
+        row.fetch.answered,
+        row.learned(Work::Fetch).bytes_per_work(),
+      )
+    })
+  });
+  daemon.stop();
+  assert_eq!(row, Some((1, Some(5_000))));
+}

@@ -33,10 +33,13 @@
 //! its records' bytes of it, claims them and its traffic's mean, and its room is the lesser headroom; alone, the lesser
 //! of what the shard admits and what the slot has left ([`Bound::Snapshot`]).
 //!
-//! **Live intakes.** An intake is live from its start until its [`Live`] guard drops (the push answered, refused or
-//! abandoned however its edge ended), kept in a map of this shard's thread apart from its state, so a guard dropped
-//! while the state is borrowed still counts its end. One entry a repository with an intake under way, so bounded by
-//! the partition's repositories.
+//! **Live works.** An intake is live from its start until its [`Live`] guard drops (the push or commit answered,
+//! refused or abandoned however its edge ended); a fetch's answer is live while it holds its repository's generation
+//! ([`Live::fetch`], A-724 piece 3d: a fetch's room is a claim of its own). Every repository with a live work of either
+//! kind is a claimant in another's room, claiming what it holds plus, for each live work, what a work of that kind is
+//! learned to bring or use. Kept in a map of this shard's thread apart from its state, so a guard dropped while the state
+//! is borrowed still counts its end. One entry a repository with a work under way, so bounded by the partition's
+//! repositories.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -84,27 +87,49 @@ pub(crate) struct Room {
 }
 
 std::thread_local! {
-  /// Each repository's intakes under way on this shard's thread (module docs, "Live intakes").
-  static LIVE: RefCell<BTreeMap<RepositoryId, u64>> = const { RefCell::new(BTreeMap::new()) };
+  /// Each repository's works under way on this shard's thread, by kind (module docs, "Live intakes"): `[intakes,
+  /// fetches]`.
+  static LIVE: RefCell<BTreeMap<RepositoryId, [u64; 2]>> = const { RefCell::new(BTreeMap::new()) };
 }
 
-/// An intake under way, counted live until it drops (module docs).
+/// The slot of `work` in a repository's live counts.
+fn slot(work: Work) -> usize {
+  match work {
+    Work::Intake => 0,
+    Work::Fetch => 1,
+  }
+}
+
+/// A work under way, counted live until it drops (module docs): an intake ([`Live::begin`]) or a fetch's answer
+/// ([`Live::fetch`], A-724 piece 3d).
 #[derive(Debug)]
 pub(crate) struct Live {
   /// Its repository.
   repository: RepositoryId,
+  /// Its kind.
+  work: Work,
 }
 
 impl Live {
   /// Counts an intake of `repository`'s live.
   pub(crate) fn begin(repository: RepositoryId) -> Live {
+    Live::of(repository, Work::Intake)
+  }
+
+  /// Counts a fetch's answer of `repository`'s live (A-724 piece 3d: a fetch's room is a claim of its own).
+  pub(crate) fn fetch(repository: RepositoryId) -> Live {
+    Live::of(repository, Work::Fetch)
+  }
+
+  fn of(repository: RepositoryId, work: Work) -> Live {
     LIVE.with(|live| {
-      if let Ok(mut live) = live.try_borrow_mut() {
-        let count = live.entry(repository).or_insert(0);
+      if let Ok(mut live) = live.try_borrow_mut()
+        && let Some(count) = live.entry(repository).or_insert([0, 0]).get_mut(slot(work))
+      {
         *count = count.saturating_add(1);
       }
     });
-    Live { repository }
+    Live { repository, work }
   }
 }
 
@@ -112,10 +137,12 @@ impl Drop for Live {
   fn drop(&mut self) {
     LIVE.with(|live| {
       if let Ok(mut live) = live.try_borrow_mut()
-        && let Some(count) = live.get_mut(&self.repository)
+        && let Some(counts) = live.get_mut(&self.repository)
       {
-        *count = count.saturating_sub(1);
-        if *count == 0 {
+        if let Some(count) = counts.get_mut(slot(self.work)) {
+          *count = count.saturating_sub(1);
+        }
+        if counts.iter().all(|count| *count == 0) {
           live.remove(&self.repository);
         }
       }
@@ -123,12 +150,12 @@ impl Drop for Live {
   }
 }
 
-/// Each repository with intakes under way on this shard, and how many.
-fn live_intakes() -> Vec<(RepositoryId, u64)> {
+/// Each repository with works under way on this shard, and how many of each kind (`[intakes, fetches]`).
+fn live_works() -> Vec<(RepositoryId, [u64; 2])> {
   LIVE.with(|live| {
     live
       .try_borrow()
-      .map(|live| live.iter().map(|(id, count)| (*id, *count)).collect())
+      .map(|live| live.iter().map(|(id, counts)| (*id, *counts)).collect())
       .unwrap_or_default()
   })
 }
@@ -139,8 +166,8 @@ pub(crate) fn room(state: &mut ShardState, repository: RepositoryId) -> Room {
   // A-724 piece 8a: a push's record grows its partition's snapshot (today by about its pack), so the slot's room left
   // is a resource as memory is (`slates_db::replay::Db::snapshot_room`).
   let slot_room = state.db.snapshot_room(&state.segment);
-  let live = live_intakes();
-  let others: Vec<(RepositoryId, u64)> = live
+  let live = live_works();
+  let others: Vec<(RepositoryId, [u64; 2])> = live
     .iter()
     .copied()
     .filter(|(id, _)| *id != repository)
@@ -153,8 +180,8 @@ pub(crate) fn room(state: &mut ShardState, repository: RepositoryId) -> Room {
   let own_live = live
     .iter()
     .find(|(id, _)| *id == repository)
-    .map_or(0, |(_, count)| *count);
-  let mut claimants = vec![(repository, own_live.saturating_add(1))];
+    .map_or([0, 0], |(_, counts)| *counts);
+  let mut claimants = vec![(repository, own_live)];
   claimants.extend(others);
   let held: Vec<[u64; 2]> = claimants
     .iter()
@@ -172,7 +199,7 @@ pub(crate) fn room(state: &mut ShardState, repository: RepositoryId) -> Room {
     .iter()
     .zip(&held)
     .enumerate()
-    .map(|(at, ((id, intakes), held))| {
+    .map(|(at, ((id, works), held))| {
       let demand = if at == 0 {
         [
           held[0].saturating_add(admittable),
@@ -180,8 +207,8 @@ pub(crate) fn room(state: &mut ShardState, repository: RepositoryId) -> Room {
         ]
       } else {
         [
-          demand_of(state, *id, (held[0], *intakes), admittable),
-          demand_of(state, *id, (held[1], *intakes), slot_room),
+          demand_of(state, *id, (held[0], *works), admittable),
+          demand_of(state, *id, (held[1], *works), slot_room),
         ]
       };
       Claim {
@@ -263,21 +290,30 @@ fn held_by(state: &ShardState, id: RepositoryId) -> u64 {
     .saturating_add(crate::vcs_store::git_encode::kept_bytes(state, id))
 }
 
-/// What repository `id` claims with `intakes` under way while it holds `held` (module docs, "Demand, learned"): what it
-/// holds plus its learned next intake's bytes for each (`slates_vcs::Learned`, A-724 piece 2), or plus all the shard can
-/// admit before any was answered.
+/// What repository `id` claims with `works` under way (`[intakes, fetches]`) while it holds `held` (module docs, "Demand,
+/// learned"): what it holds plus, for each live work, the bytes a work of its kind is learned to bring or use
+/// (`slates_vcs::Learned`, A-724 pieces 2 and 3d), or all the shard can admit for a kind none of whose works was answered
+/// yet.
 fn demand_of(
   state: &ShardState,
   id: RepositoryId,
-  (held, intakes): (u64, u64),
+  (held, works): (u64, [u64; 2]),
   admittable: u64,
 ) -> u64 {
-  let per_intake = state
-    .vcs_usage
-    .usage(&id)
-    .and_then(|row| row.learned(Work::Intake).bytes_per_work())
-    .unwrap_or(admittable);
-  held.saturating_add(per_intake.saturating_mul(intakes))
+  let learned = |work: Work| {
+    state
+      .vcs_usage
+      .usage(&id)
+      .and_then(|row| row.learned(work).bytes_per_work())
+      .unwrap_or(admittable)
+  };
+  [Work::Intake, Work::Fetch]
+    .into_iter()
+    .zip(works)
+    .filter(|(_, live)| *live > 0)
+    .fold(held, |claim, (work, live)| {
+      claim.saturating_add(learned(work).saturating_mul(live))
+    })
 }
 
 pub(crate) mod place;

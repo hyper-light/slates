@@ -16472,7 +16472,12 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > with its principal, answered with its texts' bytes (each text once)
 > (`t_a724_a_subversion_commit_is_counted_and_learned_on_its_repositorys_usage_row`, red first). Owed in piece 3:
 > Mercurial's and Subversion's share refusals typed in their words, Subversion's commit admitted against the room at all
-> (its texts arrive into the conversation's sink unadmitted), backpressure before refusal, a fetch's room as a claim.
+> (its texts arrive into the conversation's sink unadmitted), backpressure before refusal. **Piece 3d (2026-11-21):** a
+> git fetch's answer is live while it holds its repository's generation (`Live::fetch` in `GitGeneration`), so its
+> repository is a claimant in every other's room, claiming what it holds plus its learned fetch demand a live fetch; the
+> answer's bytes, reported by both edges as they write (`StoreLender::wrote`), are learned on the usage row when the
+> generation is given back (`t_a724_a_fetch_in_flight_is_a_claim_on_the_room`,
+> `t_a724_a_fetchs_answer_is_counted_and_learned_on_its_repositorys_usage_row`, red first). Mercurial's fetch is owed.
 
 > **Status (2026-11-20, A-724 piece 3a: one room for every admission).** `crate::vcs_share::room` (`slates-server`) is
 > the one room a version-control work is admitted on its owner shard: git's push as it starts, git's fetch, Mercurial's
@@ -55153,6 +55158,12 @@ Applied in the same change to:
   lands and counts the commit on the usage row (`begun`, `answered` with its texts' bytes, each identity once); the body
   is `landed_work`. Found reading it: no Subversion commit is admitted against the room at all. Red first: no row.
   Tests: slates-server `svn` 112/112, `repository::svn_commit` 31/31, `vcs_svn` 15/15, `store_tests` 9/9.
+- **Piece 3d, a fetch's room a claim of its own (2026-11-21).** `vcs_share::Live` counts `[intakes, fetches]` a
+  repository; `Live::fetch` is held by a git fetch's `GitGeneration`, whose drop answers the fetch on the usage row with
+  the bytes the edges reported writing (`StoreLender::wrote`, defaulted; called by the HTTP and SSH edges after each
+  reply step). The room's claims add each live work's learned bytes by kind (`demand_of`). Red first: a fetch in flight
+  divided no one's room; its answer was never counted. Tests: slates-server `vcs_share` 14/14, `vcs_store::upload` 7/7,
+  `vcs_http::git` 20/20, `vcs_ssh` 72/72.
 - **Applied in the same change to** §4.17.5 (new), GAPS, amendments.tsv.
 - **Owed.** Pieces 2 to 7 (§4.17.5's status); a fetch's answered count at its pack's last step; Mercurial's and
   Subversion's intakes and reads counted; the rows in `slates status`.
