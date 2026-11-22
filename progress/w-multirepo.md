@@ -54,3 +54,6 @@ Clone: ~/slates-work/w-multirepo; target ~/.cache/w-multirepo-target.noindex; st
   except curve feeding by push/hg/svn reads (seam routed via main).
 - 21:16 MAIN CHANGED: now kiln agent 01a201824d307ecc9e135c64ae3cb848 ("Slates", adas-macbook-pro-2). 01a1ff2e gone.
   It reads every inbox/main-from-* since 15:00. Asked for the piece 6 ruling (inbox/main-from-w-multirepo-piece6-ruling.md).
+- Asked main (01a20182): piece 7 hg/svn load shape (inbox/main-from-w-multirepo-piece7-hgsvn.md). Remaining queue after
+  rulings: pieces 4 (compression of cold content), 5 (intake off the owner shard), 8b (slot derived, re-laid segment),
+  9c, per w-balance's handoff notes.
