@@ -4182,11 +4182,22 @@ mod tests {
       sliced.complete_stage(&mut room.space(), OBJECT),
       Ok(identity)
     );
-    assert!(sliced.holds_manifest(OBJECT, &identity));
+    holds_as_the_whole_does((&sliced, &room), &whole, &archive, &identity);
+  }
+
+  /// `sliced` (its arena in `room`) holds `archive` under `identity` as `whole` does: the manifest held with no stage
+  /// left, every chunk read back byte for byte, and the same charge and chunk count.
+  fn holds_as_the_whole_does(
+    (sliced, room): (&ContentHold, &TestSpace),
+    whole: &ContentHold,
+    archive: &Archive,
+    identity: &[u8; 32],
+  ) {
+    assert!(sliced.holds_manifest(OBJECT, identity));
     assert_eq!(sliced.stage_count(), 0);
     for chunk in &archive.chunks {
       assert_eq!(
-        sliced.held_raw(&room.arena, OBJECT, &identity, &chunk.identity),
+        sliced.held_raw(&room.arena, OBJECT, identity, &chunk.identity),
         Some(&chunk.payload[..])
       );
     }

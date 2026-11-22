@@ -215,6 +215,31 @@ fn a_large_checkpoint_is_held_a_chunk_a_step_with_someone_waiting_and_recorded_b
   );
 }
 
+/// Looks until `daemon`'s hold of green `id`'s next checkpoint has staged a chunk while its checkpoint is still the first,
+/// then publishes the shard so the stage is in its image: the green's head and head identity then, if it is served.
+fn staged_and_published(
+  daemon: &crate::Daemon,
+  id: slates_db::catalog::VolumeId,
+) -> Option<(u64, [u8; 32])> {
+  for _ in 0..LOOKS {
+    let staged = crate::daemon::observe_first(daemon, move |state| {
+      let staged = state.held_content.stage_count() > 0
+        && state.db.partition().green_checkpoint(id).map(|(v, _)| v) == Some(1);
+      staged.then(|| {
+        crate::verbs::publish_held_increments(state).unwrap();
+        state
+          .greens
+          .get_mut(&id)
+          .map(|mut engine| (engine.head(), engine.head_identity()))
+      })
+    });
+    if let Some(before) = staged {
+      return before;
+    }
+  }
+  panic!("the hold never staged its first chunk");
+}
+
 /// A-579's last step, crash safety. Do: on a daemon over a held segment, write a green one version (its first
 /// checkpoint); then, with someone waiting and the hold set to stop after one chunk
 /// staged, write a second version, which asks its next checkpoint in turns; once the hold has staged its chunk, publish
@@ -270,25 +295,7 @@ fn a_checkpoint_stopped_part_way_leaves_the_previous_one_and_the_next_completes(
     named
   });
   let object = checkpoint_object(id);
-  let mut looks = 0;
-  let before = loop {
-    let staged = crate::daemon::observe_first(&first, move |state| {
-      let staged = state.held_content.stage_count() > 0
-        && state.db.partition().green_checkpoint(id).map(|(v, _)| v) == Some(1);
-      staged.then(|| {
-        crate::verbs::publish_held_increments(state).unwrap();
-        state
-          .greens
-          .get_mut(&id)
-          .map(|mut engine| (engine.head(), engine.head_identity()))
-      })
-    });
-    if let Some(before) = staged {
-      break before;
-    }
-    looks += 1;
-    assert!(looks < LOOKS, "the hold never staged its first chunk");
-  };
+  let before = staged_and_published(&first, id);
   // The crash, part-way: nothing more published.
   first.stop();
   let second = crate::Daemon::start(&profile, config, source()).unwrap();

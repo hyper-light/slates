@@ -345,7 +345,7 @@ const CHUNK_HASHED: usize = 1;
 /// The pace kind of one chunk of a checkpoint's encoding copied into its content store stage ([`CheckpointHold::step`]).
 const CHUNK_STAGED: usize = 2;
 /// The pace kinds a checkpoint's work is measured in: [`IDENTITY_KEY`], [`CHUNK_HASHED`], [`CHUNK_STAGED`].
-pub(crate) const CHECKPOINT_KINDS: usize = 3;
+pub(crate) const CHECKPOINT_KINDS: usize = CHUNK_STAGED + 1;
 
 /// Takes `green`'s checkpoint in turns (A-579): its identity's backlog folded a paced step a turn, then its encoding held
 /// in the content store a paced step a turn (`hold`, begun already when the identity was folded in the asking step),
