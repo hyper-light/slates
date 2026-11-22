@@ -84,33 +84,84 @@ fn main() {
   let sems = &sems;
   let pipes = &pipes;
   let mech = mech.as_str();
-  // Words and acknowledgements in one shared anonymous mapping, a page apart as the daemon's client regions are.
+  // Words and acknowledgements. By default one shared anonymous mapping, a page apart. With `PROBE_SHM=1`, as the
+  // daemon's client regions are: each waiter's own `shm_open` object of `PROBE_REGION_MB` (default 8), mapped twice,
+  // the waiter waiting through one mapping and the waker writing, waking and reading the acknowledgement through the
+  // other; `PROBE_WRITE_KB` bytes are written into the waker's mapping before each wake, as a reply's body is.
   let page = 16_384usize;
-  // SAFETY: an anonymous shared mapping of the stated length; checked below.
-  let base = unsafe {
-    libc::mmap(
-      std::ptr::null_mut(),
-      page * waiters * 2,
-      libc::PROT_READ | libc::PROT_WRITE,
-      libc::MAP_SHARED | libc::MAP_ANON,
-      -1,
-      0,
-    )
+  let shm = flag("PROBE_SHM");
+  let region: usize = std::env::var("PROBE_REGION_MB")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(8)
+    << 20;
+  let write_bytes: usize = std::env::var("PROBE_WRITE_KB")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(0)
+    << 10;
+  let map = |fd: i32, len: usize| -> usize {
+    // SAFETY: a shared mapping of the stated length, of an anonymous region or of `fd`; checked below.
+    let at = unsafe {
+      libc::mmap(
+        std::ptr::null_mut(),
+        len,
+        libc::PROT_READ | libc::PROT_WRITE,
+        if fd < 0 {
+          libc::MAP_SHARED | libc::MAP_ANON
+        } else {
+          libc::MAP_SHARED
+        },
+        fd,
+        0,
+      )
+    };
+    assert!(at != libc::MAP_FAILED, "mmap");
+    at as usize
   };
-  assert!(base != libc::MAP_FAILED, "mmap");
-  let base = base as usize;
-  let word = |i: usize| -> &'static AtomicU32 {
-    // SAFETY: inside the mapping, aligned, zeroed, live for the process.
-    unsafe { &*((base as *mut u8).add(i * 2 * page).cast::<AtomicU32>()) }
+  let (waiter_maps, waker_maps): (Vec<usize>, Vec<usize>) = if shm {
+    (0..waiters)
+      .map(|i| {
+        let name = std::ffi::CString::new(format!("/g222p{}-{i}", std::process::id())).unwrap();
+        // SAFETY: a NUL-terminated name; the object is unlinked at once, its mappings keep it.
+        let fd = unsafe {
+          libc::shm_open(
+            name.as_ptr(),
+            libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
+            0o600,
+          )
+        };
+        assert!(fd >= 0, "shm_open");
+        // SAFETY: the object just opened.
+        unsafe {
+          assert_eq!(libc::ftruncate(fd, region as libc::off_t), 0, "ftruncate");
+          libc::shm_unlink(name.as_ptr());
+        }
+        let pair = (map(fd, region), map(fd, region));
+        // SAFETY: the descriptor, no longer needed once mapped.
+        unsafe { libc::close(fd) };
+        pair
+      })
+      .unzip()
+  } else {
+    let base = map(-1, page * waiters * 2);
+    let at: Vec<usize> = (0..waiters).map(|i| base + i * 2 * page).collect();
+    (at.clone(), at)
   };
-  let ack = |i: usize| -> &'static AtomicU32 {
-    // SAFETY: as above, the second page of the pair.
-    unsafe {
-      &*((base as *mut u8)
-        .add((i * 2 + 1) * page)
-        .cast::<AtomicU32>())
-    }
+  let waiter_maps = &waiter_maps;
+  let waker_maps = &waker_maps;
+  // SAFETY (all four): inside a live mapping, aligned, zeroed, live for the process.
+  let word =
+    move |i: usize| -> &'static AtomicU32 { unsafe { &*(waiter_maps[i] as *const AtomicU32) } };
+  let ack = move |i: usize| -> &'static AtomicU32 {
+    unsafe { &*((waiter_maps[i] + page) as *const AtomicU32) }
   };
+  let wword =
+    move |i: usize| -> &'static AtomicU32 { unsafe { &*(waker_maps[i] as *const AtomicU32) } };
+  let wack = move |i: usize| -> &'static AtomicU32 {
+    unsafe { &*((waker_maps[i] + page) as *const AtomicU32) }
+  };
+  let body = move |i: usize| -> usize { waker_maps[i] + 2 * page };
   let (wait_flags, wake_flags) = if shared {
     (
       libc::OS_SYNC_WAIT_ON_ADDRESS_SHARED,
@@ -217,13 +268,23 @@ fn main() {
           let mut out = Vec::with_capacity(wakes);
           for n in 0..wakes {
             let i = k * per + n % per;
-            let next = word(i).load(Ordering::Relaxed) + 1;
+            let next = wword(i).load(Ordering::Relaxed) + 1;
             // Give the waiter time to sleep again, as a client parks between requests.
             let settle = mono();
             while mono() - settle < 50_000 {
               std::hint::spin_loop();
             }
-            word(i).store(next, Ordering::Release);
+            if shm && write_bytes > 0 {
+              // SAFETY: inside the waker's mapping of this waiter's region.
+              unsafe {
+                std::ptr::write_bytes(
+                  body(i) as *mut u8,
+                  (n & 0xff) as u8,
+                  write_bytes.min(region - 2 * page),
+                )
+              };
+            }
+            wword(i).store(next, Ordering::Release);
             let (w0, c0) = (mono(), cpu());
             // SAFETY: a live word of the mapping.
             unsafe {
@@ -235,12 +296,12 @@ fn main() {
                   libc::write(pipes[i].1, [1u8].as_ptr().cast(), 1);
                 }
                 _ => {
-                  libc::os_sync_wake_by_address_any(word(i).as_ptr().cast(), 4, wake_flags);
+                  libc::os_sync_wake_by_address_any(wword(i).as_ptr().cast(), 4, wake_flags);
                 }
               }
             }
             out.push((mono() - w0, cpu() - c0));
-            while ack(i).load(Ordering::Acquire) != next {
+            while wack(i).load(Ordering::Acquire) != next {
               std::thread::yield_now();
             }
           }
@@ -268,7 +329,9 @@ fn main() {
   let long: Vec<&(u64, u64)> = rows.iter().flatten().filter(|r| r.0 >= 1_000_000).collect();
   let on_cpu = long.iter().filter(|r| r.1 * 10 >= r.0 * 9).count();
   println!(
-    "probe mech={} churn={} shared={} waker_tb={} waiter_tb={} wakers={} waiters={} spinners/core={}: wake wall p50 {:.1} p99 {:.1} p999 {:.1} max {:.1} us; >=1 ms {} ({} on CPU >=90%)",
+    "probe shm={} write_kb={} mech={} churn={} shared={} waker_tb={} waiter_tb={} wakers={} waiters={} spinners/core={}: wake wall p50 {:.1} p99 {:.1} p999 {:.1} max {:.1} us; >=1 ms {} ({} on CPU >=90%)",
+    u8::from(shm),
+    write_bytes >> 10,
     mech,
     u8::from(churn),
     u8::from(shared),
