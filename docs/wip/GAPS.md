@@ -3691,7 +3691,12 @@
 > no whole text is buffered (`an_import_holds_no_text_whole_on_the_system_heap`: 8 texts of 512 KiB, the system
 > path's churn 4,299,277 B at 2bb00e1cc, 92,309 B now). main's r14 at 2bb00e1cc, before it: 600.3 MB not given back,
 > `process.system_allocated_bytes` 33.59 GB cumulative for a 447 MB dump, live about 190 MB. Owed: the next-largest
-> per-text churners given buffers the import owns (main's routing), and main's gauged re-measure.
+> per-text churners given buffers the import owns (main's routing), and main's gauged re-measure. Next cut (w-svn): an
+> increment's post-state sized once by its texts, where it doubled a text at a time
+> (`an_increments_post_state_is_sized_once_by_its_texts`: 6,000 bytes held for 5,000, now 5,000), the largest of the
+> import's sites in w-svn's sampled in-process attribution (500 files, 300 revisions, 11.65 MB: 168.9 MB allocated at
+> 2bb00e1cc, 156.6 MB with A-862, 142.3 MB with this). r16 (main's daemon, 73e46f842: 51.35 GB against r14's 33.41 GB)
+> is not reproduced in-process; a back-to-back daemon A/B is asked.
 > Still to measure: the A-742 floor's A/B only if the
 > footprint still stays (main's ruling). A local 64 KiB floor gave 47 MB of footprint at 2 s idle, against 363 MB, at
 > 19.4 s against 12.0 s (debug).
