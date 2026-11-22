@@ -961,7 +961,7 @@ fn a_deferred_create_is_made_when_first_reached_and_reads_as_the_eager_create() 
         name: "owed".to_owned(),
         from: main,
         version: 0,
-        push: slates_merge::push::DeferredPush::of(&owed_push, ROOM),
+        push: slates_merge::push::DeferredPush::of(&owed_push),
       },
     ];
     let pushed = push(state, &owner(), repo, changes, EntryParts::default()).expect("pushed");
@@ -1087,16 +1087,13 @@ fn an_untouched_materialized_green_past_the_bound_is_dropped_back_and_made_again
       name: name.to_owned(),
       from: main,
       version: 0,
-      push: slates_merge::push::DeferredPush::of(
-        &slates_merge::push::Push {
-          name: [tag; 32],
-          base_version: 0,
-          base_tree: None,
-          tree,
-          head: Some(b"h1"),
-        },
-        ROOM,
-      ),
+      push: slates_merge::push::DeferredPush::of(&slates_merge::push::Push {
+        name: [tag; 32],
+        base_version: 0,
+        base_tree: None,
+        tree,
+        head: Some(b"h1"),
+      }),
     };
     push(
       state,
@@ -1272,7 +1269,7 @@ fn a_holders_replica_owes_the_same_push_and_a_takeover_makes_it_the_eager_green(
         name: "owed".to_owned(),
         from: main,
         version: 0,
-        push: slates_merge::push::DeferredPush::of(&owed_push, ROOM),
+        push: slates_merge::push::DeferredPush::of(&owed_push),
       },
     ];
     push(state, &owner(), repo, changes, EntryParts::default()).expect("pushed");
@@ -1293,7 +1290,7 @@ fn a_holders_replica_owes_the_same_push_and_a_takeover_makes_it_the_eager_green(
     );
     let mut replica = replica_owing_the_record((&inputs, identity), &built);
     let mut building = replica
-      .materializing(slates_merge::pace::Pace::unbounded())
+      .materializing(slates_merge::pace::Pace::unbounded(), ROOM)
       .expect("it owes a push");
     let made = loop {
       if let Some(made) = building.advance(&replica, &store) {
@@ -1336,16 +1333,13 @@ fn a_materialization_past_the_greens_retention_room_is_refused_before_it_commits
       name: "owed".to_owned(),
       from: main,
       version: 0,
-      push: slates_merge::push::DeferredPush::of(
-        &slates_merge::push::Push {
-          name: [3; 32],
-          base_version: 0,
-          base_tree: None,
-          tree,
-          head: Some(b"h1"),
-        },
-        ROOM,
-      ),
+      push: slates_merge::push::DeferredPush::of(&slates_merge::push::Push {
+        name: [3; 32],
+        base_version: 0,
+        base_tree: None,
+        tree,
+        head: Some(b"h1"),
+      }),
     };
     push(state, &owner(), repo, vec![change], EntryParts::default()).expect("pushed");
     let owed = state
@@ -1840,4 +1834,82 @@ fn a_push_held_ahead_of_its_landing_is_named_by_its_step() {
       "a hold no entry names is given back"
     );
   });
+}
+
+/// A-857 (item 1, a regression: main's git matrix on git/git's v2.0.0 cut at 81dc7ca3b refused a one-commit branch push
+/// and a tag push, "[remote rejected] (failed to update ref)", the anchor logging a green's owed push refused building
+/// `PastRoom { asked: 183803, room: 182886 }`: the build ran within the room recorded when the push began, A-724's
+/// learned demand, past which the whole tree's listing went). Do: push a create that owes its push; make the first room
+/// its build is given one byte, as a small push's learned demand left one smaller than its tree's listing, the room after
+/// it its repository's own; read it as a client's recorded request. Expect: the build past its room waits for room and is
+/// made again within the room that came, so the green is made once and the read answered; counted waited and taken
+/// (`merge.green.materialize_waited`, `vcs_share.room_waits_taken`), refused never. Red before: refused building
+/// `PastRoom`, the read answered `ContentUnavailable`.
+#[test]
+fn a_deferred_build_past_its_room_waits_for_room_and_is_made() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let ask = slates_wire::request::RequestId {
+    client: 7,
+    sequence: 1,
+  };
+  let owed = crate::daemon::observe_first(&daemon, move |state| {
+    let (repo, main) = repository(state, "p2-past-room");
+    let mut store = Store::default();
+    let tree = store.put_tree(&[("f", b"one"), ("g", b"two")]);
+    let change = BranchChange::CreateDeferred {
+      name: "owed".to_owned(),
+      from: main,
+      version: 0,
+      push: slates_merge::push::DeferredPush::of(&slates_merge::push::Push {
+        name: [5; 32],
+        base_version: 0,
+        base_tree: None,
+        tree,
+        head: Some(b"h1"),
+      }),
+    };
+    push(state, &owner(), repo, vec![change], EntryParts::default()).expect("pushed");
+    let owed = state
+      .db
+      .partition()
+      .repositories()
+      .branch(repo, "owed")
+      .expect("the branch");
+    OWED_STORE.with(|held| *held.borrow_mut() = store);
+    crate::green_ready::TEST_OBJECTS.with(|objects| objects.set(Some(owed_objects)));
+    crate::green_ready::TEST_ROOMS.with(|rooms| rooms.borrow_mut().push_back(1));
+    owed
+  });
+  let read = crate::daemon::observe_first(&daemon, move |state| {
+    crate::verbs::run_recorded_for_test(
+      state,
+      (7, ask),
+      &owner(),
+      RequestBody::Versions {
+        green: crate::verbs::to_wire_volume(owed),
+      },
+    )
+  });
+  assert!(read.is_none(), "the read parks");
+  let answered = answered_on_shard(&daemon, ask);
+  let counted = crate::daemon::observe_first(&daemon, move |state| {
+    let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+    (
+      state.greens.is_owing(&owed),
+      count(crate::green_ready::MATERIALIZED),
+      count(crate::green_ready::MATERIALIZE_WAITED),
+      count(crate::vcs_share::wait::TAKEN),
+      count(crate::green_ready::MATERIALIZE_REFUSED),
+    )
+  });
+  daemon.stop();
+  assert!(
+    matches!(answered, Some(ReplyBody::Versions { .. })),
+    "{answered:?}"
+  );
+  assert_eq!(
+    counted,
+    (false, 1, 1, 1, 0),
+    "waited, made once, refused never"
+  );
 }

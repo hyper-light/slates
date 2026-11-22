@@ -487,7 +487,7 @@ where
           base_version: 0,
           ..push
         };
-        DeferredPush::of(&rebased, self.room)
+        DeferredPush::of(&rebased)
       })
     };
     let at = |read: GreenRead<'_>, version: Version| {

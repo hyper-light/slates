@@ -22,6 +22,13 @@
 //! **Bounds.** The parked requests of the shard are bounded by its client seats, as a whole build's are; a request past
 //! that is refused `Overloaded`. A materialization's turn runs under half the shard's step quantum.
 //!
+//! **Room** (A-857). A build runs within the room its repository has as it is built (`crate::vcs_share::room`), never one
+//! recorded when its push began: a small push's learned demand recorded about 180 KB, past which git/git's v2.0.0 tree
+//! listing went, and its branch and tag pushes were refused. A build past its room waits for room
+//! (`crate::vcs_share::wait`, the one wait git and hg share), its parked requests held, and is begun again within the
+//! room that came, counted [`MATERIALIZE_WAITED`]; refused `ContentUnavailable` only past the wait's patience, or at once
+//! past all its repository could ever be lent.
+//!
 //! **Retention.** A build's work is secured against the green's retention room before it commits, as a submit's
 //! admission secures one: past it the green keeps owing, counted [`MATERIALIZE_OVER_ROOM`], its requests answered
 //! `BudgetExceeded`. Settled after.
@@ -43,6 +50,9 @@ pub(crate) const MATERIALIZE_REFUSED: &str = "merge.green.materialize_refused";
 /// secured as a submit's admission secures them), the green left owing and its requests answered `BudgetExceeded`.
 /// Format: a counter name.
 pub(crate) const MATERIALIZE_OVER_ROOM: &str = "merge.green.materialize_over_room";
+/// Counter: a materialization whose build ran past its room and waited for room (A-857), made again once room came or
+/// refused past the wait's patience (`crate::vcs_share::wait`). Format: a counter name.
+pub(crate) const MATERIALIZE_WAITED: &str = "merge.green.materialize_waited";
 /// Counter: a request parked on a green's materialization. Format: a counter name.
 pub(crate) const PARKED: &str = "merge.green.materialize_parked";
 /// Counter: a request refused `Overloaded` at the parked bound, or with no route to park on. Format: a counter name.
@@ -50,6 +60,14 @@ pub(crate) const PARK_REFUSED: &str = "merge.green.materialize_park_refused";
 /// Counter: a materialized green nobody wrote to, dropped back to owing its push ([`keep_within_bound`]). Format: a
 /// counter name.
 pub(crate) const DEMATERIALIZED: &str = "merge.green.dematerialized";
+
+#[cfg(test)]
+thread_local! {
+  /// A test's rooms for a materialization's builds, given first, in order, in place of its repository's room (A-857), so
+  /// a test makes a build's room short and then grow as other works ending would.
+  pub(crate) static TEST_ROOMS: std::cell::RefCell<std::collections::VecDeque<u64>> =
+    const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
 
 #[cfg(test)]
 thread_local! {
@@ -94,6 +112,9 @@ pub(crate) struct Materializations {
   /// The greens materialized here, least recently read first: those nobody wrote to since may be dropped back to owing
   /// ([`keep_within_bound`]).
   kept: std::collections::VecDeque<DbVolumeId>,
+  /// The greens whose build ran past its room and waits for room (A-857): their materialization is under way, its
+  /// task holding the wait, so a request reaching one parks on it rather than starting another.
+  waiting: std::collections::BTreeSet<DbVolumeId>,
 }
 
 /// Whether a green's content can be read now ([`green_ready`]).
@@ -117,7 +138,7 @@ pub(crate) fn green_ready(state: &mut ShardState, green: DbVolumeId) -> GreenRea
     }
     return GreenReady::Ready;
   }
-  if !state.materializations.building.contains_key(&green) {
+  if !is_building(state, green) {
     start(state, green);
   }
   GreenReady::Materializing
@@ -126,6 +147,45 @@ pub(crate) fn green_ready(state: &mut ShardState, green: DbVolumeId) -> GreenRea
 /// Whether `green`'s materialization is under way: started by [`green_ready`] and neither made nor refused yet.
 pub(crate) fn is_building(state: &ShardState, green: DbVolumeId) -> bool {
   state.materializations.building.contains_key(&green)
+    || state.materializations.waiting.contains(&green)
+}
+
+/// The repository whose member `green` is, if any.
+fn repository_of(state: &ShardState, green: DbVolumeId) -> Option<RepositoryId> {
+  state
+    .db
+    .partition()
+    .repositories()
+    .member(green)
+    .map(|member| member.repository)
+}
+
+/// The room `green`'s build is made within now (A-857): its repository's room on this shard as it is built
+/// (`crate::vcs_share::room`), never one recorded when its push began; all the shard could admit for a green no
+/// repository holds.
+fn build_room(state: &mut ShardState, green: DbVolumeId) -> u64 {
+  #[cfg(test)]
+  if let Some(room) = TEST_ROOMS.with(|rooms| rooms.borrow_mut().pop_front()) {
+    return room;
+  }
+  match repository_of(state, green) {
+    Some(repository) => crate::vcs_share::room(state, repository).bytes,
+    None => state.store.admittable(),
+  }
+}
+
+/// `green`'s build begun within `room`, kept under way: whether there was one to begin.
+fn begin_build(state: &mut ShardState, green: DbVolumeId, room: u64) -> bool {
+  let pace = slates_merge::pace::Pace::new(slates_rt::futures::now_ns);
+  let Some(building) = state
+    .greens
+    .lend(&green)
+    .and_then(|engine| engine.materializing(pace, room))
+  else {
+    return false;
+  };
+  state.materializations.building.insert(green, building);
+  true
 }
 
 /// The green owing a push that `body` reaches, if any: its volume when that is such a green, or the green of the work it
@@ -219,7 +279,25 @@ pub(crate) fn park_request(
 pub(crate) fn make_building_now(state: &mut ShardState) {
   let greens: Vec<DbVolumeId> = state.materializations.building.keys().copied().collect();
   for green in greens {
-    while !turn(state, green) {}
+    let mut wait = None;
+    loop {
+      let turned = turn(state, green);
+      // A build past its room is made again at once where room has come; one that would wait is refused here, a
+      // synchronous test holding the shard so that no room could come.
+      let step = match turned {
+        Turned::More => continue,
+        Turned::Done => break,
+        Turned::PastRoom { asked, room } => waited(state, green, &mut wait, (asked, room)),
+      };
+      match step {
+        Step::Yield => {}
+        Step::Wait(_) => {
+          give_up(state, green);
+          break;
+        }
+        Step::End => break,
+      }
+    }
   }
 }
 
@@ -232,17 +310,13 @@ pub(crate) fn made_now(state: &mut ShardState, green: DbVolumeId) {
   }
 }
 
-/// Starts `green`'s materialization: its owed push's build, driven by a task of the shard a turn at a time.
+/// Starts `green`'s materialization: its owed push's build within its repository's room now ([`build_room`]), driven by a
+/// task of the shard a turn at a time.
 fn start(state: &mut ShardState, green: DbVolumeId) {
-  let pace = slates_merge::pace::Pace::new(slates_rt::futures::now_ns);
-  let Some(building) = state
-    .greens
-    .lend(&green)
-    .and_then(|engine| engine.materializing(pace))
-  else {
+  let room = build_room(state, green);
+  if !begin_build(state, green, room) {
     return;
-  };
-  state.materializations.building.insert(green, building);
+  }
   let started = slates_rt::futures::spawn(materialize(green))
     .and_then(slates_rt::futures::detach)
     .is_ok();
@@ -252,28 +326,122 @@ fn start(state: &mut ShardState, green: DbVolumeId) {
   }
 }
 
-/// [`start`]'s task: a turn of the build at each of the shard's turns until it is done, then the commit.
+/// What a turn of a materialization's build came to.
+enum Turned {
+  /// More of it to build.
+  More,
+  /// Built and committed, or refused, its parked requests run again or answered.
+  Done,
+  /// Run past its room (A-857): what it asked and the room it had; it waits for room, its parked requests held.
+  PastRoom { asked: u64, room: u64 },
+}
+
+/// What the materialization's task does next.
+enum Step {
+  /// Turns again after the shard's next turn.
+  Yield,
+  /// Waits this many nanoseconds for room, then asks again.
+  Wait(u64),
+  /// Is done.
+  End,
+}
+
+/// [`start`]'s task: a turn of the build at each of the shard's turns until it is done, then the commit; a build past its
+/// room waits for room and is made again within it ([`waited`], A-857).
 async fn materialize(green: DbVolumeId) {
+  let mut past: Option<(u64, u64)> = None;
+  let mut held = None;
   loop {
-    match crate::state::with_state(|state| turn(state, green)) {
-      Some(false) => slates_rt::futures::yield_now().await,
-      Some(true) | None => return,
+    let step = crate::state::with_state(|state| {
+      if let Some(refused) = past {
+        return waited(state, green, &mut held, refused);
+      }
+      match turn(state, green) {
+        Turned::More => Step::Yield,
+        Turned::Done => Step::End,
+        Turned::PastRoom { asked, room } => {
+          past = Some((asked, room));
+          waited(state, green, &mut held, (asked, room))
+        }
+      }
+    });
+    match step {
+      Some(Step::Yield) => {
+        if held.is_none() {
+          past = None;
+        }
+        slates_rt::futures::yield_now().await;
+      }
+      Some(Step::Wait(ns)) => {
+        // A sleep the runtime refuses ends the wait early: the next turn asks again.
+        let _ = slates_rt::futures::sleep(ns).await;
+      }
+      Some(Step::End) | None => return,
     }
   }
 }
 
-/// One turn of `green`'s build, under half the shard's step quantum: whether it is done (built and committed, or
-/// refused, its parked requests run again or answered).
-fn turn(state: &mut ShardState, green: DbVolumeId) -> bool {
-  let Some(mut building) = state.materializations.building.remove(&green) else {
-    return true;
+/// A turn of `green`'s build's wait for room, past its room (`asked` of `room`; A-857, `crate::vcs_share::wait`): its
+/// build begun again within the room that came, or waiting on, or given up past the wait's patience (or past all its
+/// repository could ever be lent), its parked requests answered `ContentUnavailable` as before. Counted
+/// [`MATERIALIZE_WAITED`] as it begins to wait.
+fn waited(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  held: &mut Option<crate::vcs_share::wait::RoomWait>,
+  (asked, room): (u64, u64),
+) -> Step {
+  let now = slates_rt::futures::now_ns();
+  let Some(repository) = repository_of(state, green) else {
+    give_up(state, green);
+    return Step::End;
   };
-  let repository = state
-    .db
-    .partition()
-    .repositories()
-    .member(green)
-    .map(|member| member.repository);
+  if held.is_none() {
+    state.count(MATERIALIZE_WAITED, 1);
+    state.materializations.waiting.insert(green);
+  }
+  let wait = held.get_or_insert_with(|| crate::vcs_share::wait::RoomWait::new(room, now));
+  match wait.turn(
+    state,
+    repository,
+    (Some(asked), now, crate::daemon::HEARTBEAT_NS),
+  ) {
+    crate::vcs_share::wait::Waited::Again(room) => {
+      *held = None;
+      state.materializations.waiting.remove(&green);
+      if begin_build(state, green, room) {
+        Step::Yield
+      } else {
+        give_up(state, green);
+        Step::End
+      }
+    }
+    crate::vcs_share::wait::Waited::Wait(ns) => Step::Wait(ns),
+    crate::vcs_share::wait::Waited::GiveUp => {
+      *held = None;
+      give_up(state, green);
+      Step::End
+    }
+  }
+}
+
+/// Gives up `green`'s materialization past its room: logged, its parked requests answered `ContentUnavailable`, the
+/// green still owing, so a retry starts it again.
+fn give_up(state: &mut ShardState, green: DbVolumeId) {
+  state.materializations.waiting.remove(&green);
+  slates_machine::log_line!(
+    "slates-server: partition {}: a green's owed push was refused building: past its room after waiting for room",
+    state.partition
+  );
+  refuse_parked(state, green, Refusal::ContentUnavailable);
+}
+
+/// One turn of `green`'s build, under half the shard's step quantum: what it came to ([`Turned`]).
+fn turn(state: &mut ShardState, green: DbVolumeId) -> Turned {
+  let Some(mut building) = state.materializations.building.remove(&green) else {
+    return Turned::Done;
+  };
+  let repository = repository_of(state, green);
   let quantum = state.config.step_quantum_ns() / 2;
   building
     .pace()
@@ -281,7 +449,7 @@ fn turn(state: &mut ShardState, green: DbVolumeId) -> bool {
   // The build's turn over the green and its tool's objects; why it cannot run, where it cannot. Read with the stores
   // lent room and the shard's chunk store, as a push's build reads them: a tool's objects lie in windows that chunk
   // store keeps, and a settled content store admits no parse.
-  let advanced: Option<Result<slates_merge::push::Built, String>> =
+  let advanced: Option<Result<slates_merge::push::Built, Failed>> =
     crate::vcs_store::with_room(state, |state| match state.greens.lend(&green) {
       Some(engine) => {
         let mut turned = None;
@@ -289,18 +457,18 @@ fn turn(state: &mut ShardState, green: DbVolumeId) -> bool {
           turned = Some(building.advance(&engine, objects));
         });
         match turned {
-          Some(advanced) if found => {
-            advanced.map(|built| built.map_err(|refused| format!("{refused:?}")))
-          }
-          _ => Some(Err("no objects for the green's repository".to_owned())),
+          Some(advanced) if found => advanced.map(|built| built.map_err(Failed::of)),
+          _ => Some(Err(Failed::Other(
+            "no objects for the green's repository".to_owned(),
+          ))),
         }
       }
-      None => Some(Err("the green is not here".to_owned())),
+      None => Some(Err(Failed::Other("the green is not here".to_owned()))),
     });
   match advanced {
     None => {
       state.materializations.building.insert(green, building);
-      false
+      Turned::More
     }
     Some(Ok(built)) => {
       // Secured before it commits, as a submit's admission secures a work's history and change index
@@ -314,7 +482,7 @@ fn turn(state: &mut ShardState, green: DbVolumeId) -> bool {
       if let Err(available) = crate::verbs::secure_retention(state, green, secured) {
         state.count(MATERIALIZE_OVER_ROOM, 1);
         refuse_parked(state, green, Refusal::BudgetExceeded { available });
-        return true;
+        return Turned::Done;
       }
       let made = state
         .greens
@@ -340,15 +508,35 @@ fn turn(state: &mut ShardState, green: DbVolumeId) -> bool {
         );
         refuse_parked(state, green, Refusal::ContentUnavailable);
       }
-      true
+      Turned::Done
     }
-    Some(Err(refused)) => {
+    // A-857: a build past its room waits for room, its parked requests held, never refused while room may come.
+    Some(Err(Failed::PastRoom { asked, room })) => Turned::PastRoom { asked, room },
+    Some(Err(Failed::Other(refused))) => {
       slates_machine::log_line!(
-        "slates-server: partition {}: a green's owed push was refused building: {refused:?}",
+        "slates-server: partition {}: a green's owed push was refused building: {refused}",
         state.partition
       );
       refuse_parked(state, green, Refusal::ContentUnavailable);
-      true
+      Turned::Done
+    }
+  }
+}
+
+/// Why a turn of a build failed: past its room (A-857: it waits for room), or any other refusal, named for the log.
+enum Failed {
+  /// The work would keep `asked` bytes past the `room` it was given.
+  PastRoom { asked: u64, room: u64 },
+  /// Any other refusal, as the log names it.
+  Other(String),
+}
+
+impl Failed {
+  /// `refused`, as a build's turn failed.
+  fn of(refused: slates_merge::push::PushRefused) -> Failed {
+    match refused {
+      slates_merge::push::PushRefused::PastRoom { asked, room } => Failed::PastRoom { asked, room },
+      other => Failed::Other(format!("{other:?}")),
     }
   }
 }

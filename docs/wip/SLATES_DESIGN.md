@@ -60656,3 +60656,32 @@ Applied in the same change to:
   learned, 262,144 bytes here, the task finishes the encoding as before).
 - **Left** (GAPS): each object's deflate makes a fresh state (97 GB made over one clone), owed next; past its grant a
   repository's fragments are not kept on disk under its grant, only not made ahead; main's RSS round over git/git.
+
+### A-857 — A deferred build runs within its repository's room as it is built, and one past it waits for room (bug, a regression, 2026-11-22, w-git for UI goal 93; main 01a20182's rulings of 02:12, 02:52 and 03:03 PST; P2, A-724, A-855)
+Applied in the same change to:
+- `crates/merge/src/push.rs`: `DeferredPush` holds no room; its record is version 2 (version 1, which recorded its push's
+  room, refused); `DeferredPush::building(pace, room)`. `crates/merge/src/engine.rs`: `Green::materializing(pace, room)`.
+- `crates/git/src/receive/works.rs`: a deferred create records its push alone.
+- `crates/server/src/green_ready.rs`: a build begun within its repository's room now (`build_room`); a build past its
+  room (`PushRefused::PastRoom`) waits (`waited`, a waiting green parks requests as a building one does), begun again
+  within the room that came, given up past patience; counter `merge.green.materialize_waited`.
+- `crates/server/src/vcs_share/wait.rs` (new): `RoomWait`, `Waited`, `ceiling`, counters `vcs_share.room_waits`,
+  `room_waits_taken`, `room_waits_given_up`: the one wait git and hg share (w-hg's PastAdmission next).
+- GAPS (§4.17).
+
+- **Found by use.** Main's git matrix on git/git's v2.0.0 cut at 81dc7ca3b: branch-push, tag-push and ssh-push refused
+  "[remote rejected] (failed to update ref)", 20 of 27 (26 of 27 at 907c246ac); git/git's push-whole refused `jch`,
+  `next` and `seen`. The anchor logged a green's owed push refused building `PastRoom { asked: 183803, room: 182886 }`
+  and `PastRoom { asked: 32271331, room: 32122804 }`.
+- **Cause.** A created ref's green owes its push (P2), built when first reached, within the room its `DeferredPush`
+  recorded at the push's start. Since A-724's learned demand a small push records a room near its learned demand, past
+  which a whole tree's listing goes; and a push waits at the green's door for that build, so the push failed.
+- **Change.** The record keeps no room; a build runs within its repository's room as it is built, and one past it waits
+  for room (§4.17.1 rule 2's wait, A-855's, now `vcs_share::wait`), never refused while room may come.
+- **Tests.** `slates-server` `repository::push::tests::a_deferred_build_past_its_room_waits_for_room_and_is_made` (the
+  first room one byte: waited, made, the read answered, counted waited and taken, refused never; red before with the
+  room recorded at one byte: refused `PastRoom`, the read answered `ContentUnavailable`);
+  `vcs_share::wait::tests::a_wait_answers_again_when_the_room_grows_waits_until_then_and_gives_up_past_patience_or_the_ceiling`;
+  `slates-merge` `push::tests::a_deferred_push_record_refuses_every_damaged_form` (version 1 refused).
+- **Left** (GAPS): A-855's HTTP fetch wait onto `vcs_share::wait` (it keeps its own form, the same rule); main's rerun of
+  the matrix and git/git, which names whether master's "cannot lock ref" stands apart from this.
