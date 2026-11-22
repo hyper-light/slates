@@ -16487,7 +16487,11 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > repository is a claimant in every other's room, claiming what it holds plus its learned fetch demand a live fetch; the
 > answer's bytes, reported by both edges as they write (`StoreLender::wrote`), are learned on the usage row when the
 > generation is given back (`t_a724_a_fetch_in_flight_is_a_claim_on_the_room`,
-> `t_a724_a_fetchs_answer_is_counted_and_learned_on_its_repositorys_usage_row`, red first). Mercurial's fetch is owed.
+> `t_a724_a_fetchs_answer_is_counted_and_learned_on_its_repositorys_usage_row`, red first). Mercurial's fetch likewise
+> (2026-11-21, w-hg's leave): its streamed answer's `hg_view::Generation` holds `Live::fetch` and is answered with the
+> bytes both edges report writing (`HgStores::wrote`); a generation held for a batch's lookup writes nothing and teaches
+> nothing (`t_a724_a_mercurial_fetch_in_flight_is_a_claim_on_the_room`,
+> `t_a724_a_mercurial_fetchs_answer_is_learned_and_a_lookups_hold_teaches_nothing`, red first).
 
 > **Status (2026-11-20, A-724 piece 3a: one room for every admission).** `crate::vcs_share::room` (`slates-server`) is
 > the one room a version-control work is admitted on its owner shard: git's push as it starts, git's fetch, Mercurial's
@@ -55212,6 +55216,11 @@ Applied in the same change to:
   reply step). The room's claims add each live work's learned bytes by kind (`demand_of`). Red first: a fetch in flight
   divided no one's room; its answer was never counted. Tests: slates-server `vcs_share` 14/14, `vcs_store::upload` 7/7,
   `vcs_http::git` 20/20, `vcs_ssh` 72/72.
+- **Piece 3d for Mercurial (2026-11-21, w-hg's leave).** `hg_view::Generation` holds `vcs_share::Live::fetch` and a
+  written count fed by both edges after each streamed turn (`HgStores::wrote`, defaulted); its drop answers the fetch on
+  the usage row only where its answer wrote something, so a batch's lookup hold teaches no zero demand. Red first (a
+  held generation divided no room; with the lookup answered too, two fetches counted). Tests: slates-server `vcs_share`
+  16/16, `vcs_ssh::tests::hg` 13/13, `vcs_http::hg` 9/9, `hg_view` 7/7, `repository::hg_push` 18/18.
 - **Applied in the same change to** §4.17.5 (new), GAPS, amendments.tsv.
 - **Owed.** Pieces 2 to 7 (§4.17.5's status); a fetch's answered count at its pack's last step; Mercurial's and
   Subversion's intakes and reads counted; the rows in `slates status`.

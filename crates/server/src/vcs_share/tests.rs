@@ -391,3 +391,96 @@ fn t_a724_a_fetchs_answer_is_counted_and_learned_on_its_repositorys_usage_row() 
   daemon.stop();
   assert_eq!(row, Some((1, Some(5_000))));
 }
+
+/// Makes Mercurial repository `name`, empty, on the shard: its id.
+fn hg_repository(state: &mut ShardState, name: &str) -> RepositoryId {
+  use slates_ipc::protocol::{ObjectFormat, RequestBody, VcsTool};
+  let reply = crate::test_store::create(
+    state,
+    &owner(),
+    RequestBody::CreateRepository {
+      name: name.to_owned(),
+      tool: VcsTool::Mercurial,
+      format: ObjectFormat::Sha1,
+      default_branch: crate::repository::hg_push::line_name(b"default", 0),
+      green: None,
+    },
+  );
+  assert!(
+    matches!(reply, slates_ipc::protocol::ReplyBody::GreenCreated { .. }),
+    "{reply:?}"
+  );
+  state
+    .db
+    .partition()
+    .repositories()
+    .repository_named(name)
+    .expect("made")
+    .id
+}
+
+/// A-724 piece 3d for Mercurial (w-hg's leave, 2026-11-21). Do: make a Mercurial repository and hold its generation as a
+/// fetch's streamed answer does (`hg_view::hold_in`), then ask a git repository's room while the hold lasts, and again
+/// once it is given back. Expect: while the fetch is in flight, the other's room divided with it; once it ends, alone.
+#[test]
+fn t_a724_a_mercurial_fetch_in_flight_is_a_claim_on_the_room() {
+  crate::test_store::audit_on_stored_shard("vcs_share", |state| {
+    let fetched = hg_repository(state, "fetched");
+    let toy = git_repository(state, "toy");
+    let mut held_room = slates_hg::Admission::new(u64::MAX);
+    let held = crate::vcs_store::hg_view::hold_in(state, fetched, &mut held_room).expect("held");
+    let divided = room(state, toy);
+    assert!(
+      matches!(divided.bound, Bound::Share { .. }),
+      "a Mercurial fetch in flight divides the room: {divided:?}"
+    );
+    drop(held);
+    assert!(matches!(
+      room(state, toy).bound,
+      Bound::Shard | Bound::Snapshot { .. }
+    ));
+  });
+}
+
+/// A-724 piece 3d for Mercurial. Do: on a store-holding daemon, make a Mercurial repository; from a task on its shard,
+/// hold its generation and give it back writing nothing (a batch's lookup), then hold it again, report 5,000 bytes
+/// written by a streamed answer, and give it back. Expect: one fetch answered on the repository's usage row, its 5,000
+/// bytes learned: the lookup's hold taught nothing.
+#[test]
+fn t_a724_a_mercurial_fetchs_answer_is_learned_and_a_lookups_hold_teaches_nothing() {
+  use crate::vcs_http::hg::HgStores;
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let fetched = crate::daemon::observe_first(&daemon, |state| hg_repository(state, "fetched"));
+  let (sent, done) = std::sync::mpsc::sync_channel(1);
+  crate::daemon::observe_first(&daemon, move |_| {
+    let task = slates_rt::futures::spawn(async move {
+      let mut stores = crate::vcs_store::hg_view::ServedViews;
+      let looked = stores.hold(fetched, &mut slates_hg::Admission::new(u64::MAX));
+      let held_once = looked.is_some();
+      drop(looked);
+      let streamed = stores.hold(fetched, &mut slates_hg::Admission::new(u64::MAX));
+      if let Some(held) = streamed.as_ref() {
+        stores.wrote(held, 5_000);
+      }
+      let _ = sent.send(held_once && streamed.is_some());
+    })
+    .unwrap();
+    slates_rt::futures::detach(task).unwrap();
+  });
+  assert!(
+    done
+      .recv_timeout(std::time::Duration::from_secs(60))
+      .unwrap(),
+    "held twice"
+  );
+  let row = crate::daemon::observe_first(&daemon, move |state| {
+    state.vcs_usage.usage(&fetched).map(|row| {
+      (
+        row.fetch.answered,
+        row.learned(Work::Fetch).bytes_per_work(),
+      )
+    })
+  });
+  daemon.stop();
+  assert_eq!(row, Some((1, Some(5_000))));
+}

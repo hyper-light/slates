@@ -71,6 +71,10 @@ impl HgStores for ServedViews {
     crate::state::with_state(|state| lend_held_in(state, hold, room, step)).flatten()
   }
 
+  fn wrote(&mut self, hold: &Generation, bytes: u64) {
+    hold.written.set(hold.written.get().saturating_add(bytes));
+  }
+
   fn holds(&self, id: RepositoryId) -> bool {
     crate::state::with_state(|state| held(state, id)).unwrap_or(false)
   }
@@ -351,6 +355,12 @@ pub(crate) struct Generation {
   roots: Vec<PhaseHead>,
   /// The register's bookmarks as they stood.
   bookmarks: BookmarkHeads,
+  /// The fetch counted live while its streamed answer holds this generation (A-724 piece 3d: a fetch's room is a claim
+  /// of its own).
+  _fetching: crate::vcs_share::Live,
+  /// The bytes its answer has written so far, as its edge reports them (`HgStores::wrote`): learned as the repository's
+  /// fetch demand once the answer ends.
+  written: core::cell::Cell<u64>,
 }
 
 impl Generation {
@@ -364,10 +374,23 @@ impl Generation {
 }
 
 impl Drop for Generation {
+  /// Gives the fork back and, where its answer wrote anything, answers the fetch on its repository's usage row with those
+  /// bytes (A-724 piece 3d). A generation held for a batch's lookup writes nothing and teaches nothing.
   fn drop(&mut self) {
-    if let Some(index) = self.index.take() {
-      crate::state::with_state(|state| release_generation(state, index)).unwrap_or_default();
-    }
+    let (id, written) = (self.id, self.written.get());
+    let index = self.index.take();
+    crate::state::with_state(|state| {
+      if let Some(index) = index {
+        release_generation(state, index);
+      }
+      if written > 0 {
+        let now = slates_rt::futures::now_ns();
+        state
+          .vcs_usage
+          .answered(&id, slates_vcs::Work::Fetch, written, now);
+      }
+    })
+    .unwrap_or_default();
   }
 }
 
@@ -403,6 +426,8 @@ pub(crate) fn hold_in(
     index: Some(index),
     roots,
     bookmarks,
+    _fetching: crate::vcs_share::Live::fetch(id),
+    written: core::cell::Cell::new(0),
   })
 }
 
