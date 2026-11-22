@@ -478,3 +478,10 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   intervals with no byte and no pack-counter movement (Stalled-style message). Load 39-47: 5/5 alone; git_push::
   vcs_store:: 153/153, 152/153. Seen meanwhile, w-git's: t_a752's A-783 assert "960 turns for 8081 quanta" fails ~1 in
   3 alone at load ~40 (git_push/tests.rs:2822, turns*10 < quanta).
+- LANDED 35ba1403c (2026-11-22 ~06:30 PST, main 45f0abeba; main's order of 06:13, the sibling sweep after 695c62a4b):
+  upload/tests.rs: one progress judge (Judge, 60 liveness intervals with nothing shown changing) for every paced drive:
+  answered/fetched_with_counters, the A-745 test's in_turns, `encoded` (units via test-only git_encode::units_done,
+  versions derived/encoded), `run_command` (bytes); STEPS removed. t_a752: the load ratio `turns * 10 < quanta`
+  (red: "960 turns for 8081 quanta", 1 in 3 alone at load ~40) replaced by: units >= files, turns > 1, more_quanta moved,
+  ceiling and budget bounds, and a fetch of the head holding every object both pushes brought. Load 41-47: t_a752 4/4
+  alone; git_push:: vcs_store:: 153/153 twice; check --tests clean on the merged main.
