@@ -751,6 +751,10 @@
 > edge's writes that waited for the peer, cold at deflate's measured break-even at git's level 6 (§4.11). Owed: the
 > SSH edge's writes heard (SSH fetches price cold), a price per client, not per shard; main's git/git whole round and
 > `fsck --strict`.
+> A-864 BUILT (2026-11-22, w-git; main's r17): a reused pushed entry was rebuilt to be checked (inflated, its base and
+> itself reconstructed, named), so git/git's clone, every entry reused, ran past 120 s. Now each row keeps its entry's
+> raw length, CRC32 and base (git's pack index, A-864); reuse checks the CRC32 and copies, no object read; a miss is
+> rebuilt. Owed: main's git/git whole round.
 > A-860 BUILT (2026-11-22, w-git): a repository gone idle lets go of the objects its reads keep (git.recent_bytes held
 > 53.9 MB after a git/git clone). Owed: the push side's held windows and pack, w-shared's.
 > R2, the load-only edge tests, CLOSED (2026-11-21, w-git): a push's answer under side-band-64k wrote its first
