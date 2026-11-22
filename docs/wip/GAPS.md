@@ -80,6 +80,21 @@
 > before an entry's append (A-825 "Cost owed"), measured by the lane's release bench; since A-854 paid only by an
 > increment over 1 MiB, the smaller carried in its entry.
 
+> **FIXED (w-shared, 2026-11-22; goal 93, svn finding (2), main 01a20182 00:19 PST): a chain entry's buffer was reserved at
+> the admission's bound,** which counts the increment's whole post-state, though a text's splice names it by reference:
+> every imported text cost an allocation of its own size (26.2 MB for 25.6 MB of text in w-svn's attribution,
+> `chain_entry::encode_carrying` <- `push::append_versions`), kept as the chain entry's capacity. Now reserved at the
+> entry's exact length (`entry_bytes`, checked against what is written). Red: a 193-byte entry for 256 KiB of text
+> reserved 262,395 bytes; green: capacity equals length, for held, carrying and every-effect entries
+> (`an_entrys_buffer_is_reserved_at_its_length_not_its_texts`). The finding's other copies are their owners'
+> (`inbox/main-from-w-svn-finding2-sites.md`).
+
+> **Open (found by w-shared, 2026-11-22): `repository::tests::each_verb_moves_the_names_log_and_each_members_version_its_own_log`
+> fails on main,** before A-854 too (b00ed749a, a3e673efc plus a test; macOS arm64, debug): "the doubling rule's inputs
+> say fold, yet no checkpoint was taken: FoldInputs { floor: 2, to_fold: 532, held_bytes: 0 }". Not bisected further; a
+> likely cause is 2d078e4fa (A-579's last step: the checkpoint held a chunk a paced quantum, so it may end after the
+> step that asked for it, where the test's `write_until_folded` reads the floor at once). Main's to route.
+
 > **FIXED (w-fed-faults, 2026-11-21): a whole-file rewrite outside a recorded request was refused `Overloaded`**
 > (A-787 part 2's park, 2a498b90f). 10 server lib tests (repository, vcs_store paths and commits) failed from that
 > commit on, bisected against its parent 81d8baea5; such a verb now composes unrefined and is answered (6459374).
@@ -3489,6 +3504,22 @@
 > refusal the wire answers without a Subversion number (`BudgetExceeded`, `ContentUnavailable`, `Format`) does not
 > name what landed; the same dump resumes all the same. Owed: the import's time and peak re-measured on git-2000
 > (main's run), which closes P7's finding (3) or not. The entry below is its history.
+> **P7's finding (2) OPEN, RED: an import's freed memory is not given back (2026-11-22, w-svn; main 01a20182's ruling of
+> 00:09, option 3).** Main's r11 (git-2000, release): physical footprint 43 MiB before, 527 MiB after 30 s of idle,
+> 484 MiB held. Only 155 MB of it is live (heap in use +104 MB, arena 51 MB); the rest is blocks under A-742's 1 MiB
+> large-path floor that the system allocator keeps for reuse after the import freed them. Attributed by allocation site
+> (an in-process allocator recording every 16 KiB to 1 MiB allocation): each text is copied about 15 times, 440 MB of
+> churn for 25.6 MB of text. Red: `an_import_measured` now gates the idle footprint's growth at `HELD_FACTOR` (2) times
+> what the import still holds live. Cut so far (w-svn's sites): the importer's text buffer sized once from its header,
+> admitted first; a stored text streamed into the increment from the store's lent windows, not read back whole; the
+> landing's store pieces lent. Owed: the other owners' copies (the content store's `put_window` and `release_one`; the
+> engine's `judge_held`, two `push_slice`, `Increment::encode`, `chain_entry::encode_carrying`), then A-742's floor
+> re-derived by a release A/B only if the footprint still stays (main's ruling). The changeset landing's piece copies
+> are cut too (w-svn, main's routing of 00:57): `slates_store::owner::SlicedLanding::part` answers its buffer emptied
+> once written, and the svn landing fills one buffer a landing (`a_sliced_landings_part_gives_its_buffer_back_to_be_filled_again`).
+> Still to measure: the A-742 floor's A/B only if the
+> footprint still stays (main's ruling). A local 64 KiB floor gave 47 MB of footprint at 2 s idle, against 363 MB, at
+> 19.4 s against 12.0 s (debug).
 > **A-822's commit held the shard past its watchdog; A-835 slices it (2026-11-21, w-svn; main's ruling of 12:43).**
 > Main's git-2000 run over A-822 had the watchdog kill the anchor twice: the batch's 2,000 versions applied in one step.
 > A-835 applies a recorded batch a slice a turn and folds a recovered Subversion green to its readers (the 434 MB under

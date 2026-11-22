@@ -177,12 +177,14 @@ thread_local! {
 /// Shape: the sections of a changeset that brings texts besides its records: its `Payload` and its `Texts`.
 const SECTIONS_BESIDE_RECORDS: u16 = 2;
 
-/// Every one of `texts` sent into `landing`'s `Payload` a content piece at a time, in order: the payload's identity,
-/// and each text's place in it.
+/// Every one of `texts` sent into `landing`'s `Payload` a content piece at a time, in order, through `buffer` (each
+/// part's buffer, given back by the landing to be filled again: P7's finding (2), one buffer a landing, not one a
+/// part): the payload's identity, each text's place in it, and the buffer.
 async fn sent_payload(
   landing: &mut slates_store::owner::SlicedLanding,
   texts: &[LandedText],
-) -> Result<([u8; 32], Vec<(u64, u64)>), Uncommitted> {
+  mut buffer: Vec<u8>,
+) -> Result<([u8; 32], Vec<(u64, u64)>, Vec<u8>), Uncommitted> {
   let mut hasher = blake3::Hasher::new();
   let mut places = Vec::with_capacity(texts.len());
   let mut at = 0u64;
@@ -190,20 +192,21 @@ async fn sent_payload(
     places.push((at, text.len));
     let mut sent = 0u64;
     while sent < text.len {
-      let piece = content_piece(text, sent).ok_or(Uncommitted::NotHeld)?;
-      if piece.is_empty() {
+      buffer.clear();
+      content_piece(text, sent, &mut buffer).ok_or(Uncommitted::NotHeld)?;
+      if buffer.is_empty() {
         return Err(Uncommitted::NotHeld);
       }
-      hasher.update(&piece);
-      sent = sent.saturating_add(u64::try_from(piece.len()).unwrap_or(u64::MAX));
-      landing
-        .part(piece)
+      hasher.update(&buffer);
+      sent = sent.saturating_add(u64::try_from(buffer.len()).unwrap_or(u64::MAX));
+      buffer = landing
+        .part(buffer)
         .await
         .map_err(|_| Uncommitted::Unstored)?;
     }
     at = at.saturating_add(text.len);
   }
-  Ok((*hasher.finalize().as_bytes(), places))
+  Ok((*hasher.finalize().as_bytes(), places, buffer))
 }
 
 /// [`land_changeset`]'s sliced landing.
@@ -227,7 +230,9 @@ async fn land_sliced(
     .section(SectionKind::Payload, payload_len)
     .await
     .map_err(unstored)?;
-  let (payload, places) = sent_payload(&mut landing, texts).await?;
+  // One buffer for the landing's every part, given back by each to be filled again (P7's finding (2)).
+  let buffer = Vec::with_capacity(slates_store::store::PIECE_BYTES);
+  let (payload, places, mut buffer) = sent_payload(&mut landing, texts, buffer).await?;
   let entries: Vec<slates_store::texts::TextEntry> = texts
     .iter()
     .zip(places)
@@ -254,15 +259,18 @@ async fn land_sliced(
     let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     landing.section(kind, len).await.map_err(unstored)?;
     for piece in bytes.chunks(slates_store::store::PIECE_BYTES) {
-      landing.part(piece.to_vec()).await.map_err(unstored)?;
+      buffer.clear();
+      buffer.extend_from_slice(piece);
+      buffer = landing.part(buffer).await.map_err(unstored)?;
     }
   }
   landing.commit().await.map(drop).map_err(unstored)
 }
 
-/// The next piece of `text` from `offset` as the content store holds it, at most one of the store's pieces; none where
-/// the content store does not hold it whole or the shard's state is gone.
-fn content_piece(text: &LandedText, offset: u64) -> Option<Vec<u8>> {
+/// The next piece of `text` from `offset` as the content store holds it, at most one of the store's pieces, appended to
+/// `into` (the landing's one buffer): copied once from the store's lent run, into a buffer already made. None where the
+/// content store does not hold it whole or the shard's state is gone.
+fn content_piece(text: &LandedText, offset: u64, into: &mut Vec<u8>) -> Option<()> {
   crate::state::with_state(|state| {
     crate::vcs_store::within_budget(state, 0, |stores| {
       let run =
@@ -270,7 +278,8 @@ fn content_piece(text: &LandedText, offset: u64) -> Option<Vec<u8>> {
           .content()?
           .run_at(&slates_vcs::ContentId(text.identity), text.len, offset)?;
       let take = run.len().min(slates_store::store::PIECE_BYTES);
-      run.get(..take).map(<[u8]>::to_vec)
+      into.extend_from_slice(run.get(..take)?);
+      Some(())
     })
   })
   .flatten()

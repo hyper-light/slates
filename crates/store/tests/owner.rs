@@ -406,6 +406,58 @@ fn a_changeset_lands_in_parts_alone_and_a_dropped_one_leaves_nothing() {
   owner.stop().unwrap();
 }
 
+/// P7's finding (2), main 01a20182's routing of 2026-11-22 00:57 (a sliced landing took a fresh `Vec` a part, each
+/// part's bytes copied into it: the import's churn of sub-1 MiB blocks the system allocator keeps). Do: open a sliced
+/// landing and send a 200,000-byte payload a piece at a time through one buffer, filling again the buffer each part
+/// gives back; commit; read the payload back by identity. Expect: every part answered with the same buffer (its
+/// allocation, its capacity kept) emptied for the next piece, never a new one; the payload landed whole.
+#[test]
+fn a_sliced_landings_part_gives_its_buffer_back_to_be_filled_again() {
+  use slates_store::store::PIECE_BYTES;
+  let dir = scratch("sliced-buffer");
+  let payload: Vec<u8> = (0..200_000u32).map(|at| (at % 241) as u8).collect();
+  let identity = *blake3::hash(&payload).as_bytes();
+  let len = payload.len() as u64;
+  let owner = start(&dir);
+  let handle = owner.handle();
+  let runtime = runtime();
+  let to_land = payload.clone();
+  let (kept, read) = runtime
+    .block_on(async move {
+      let mut landing = handle
+        .begin(Header {
+          sections: 1,
+          ..header(1)
+        })
+        .await
+        .unwrap();
+      landing.section(SectionKind::Payload, len).await.unwrap();
+      let mut buffer = Vec::with_capacity(PIECE_BYTES);
+      let (at, capacity) = (buffer.as_ptr(), buffer.capacity());
+      let mut kept = true;
+      for piece in to_land.chunks(PIECE_BYTES) {
+        buffer.extend_from_slice(piece);
+        buffer = landing.part(buffer).await.unwrap();
+        kept &= buffer.as_ptr() == at && buffer.capacity() == capacity && buffer.is_empty();
+      }
+      landing.commit().await.unwrap();
+      let mut read = Vec::new();
+      while (read.len() as u64) < len {
+        read.extend(
+          handle
+            .piece(identity, len, read.len() as u64)
+            .await
+            .unwrap()
+            .unwrap(),
+        );
+      }
+      (kept, read)
+    })
+    .unwrap();
+  assert_eq!((kept, read == payload), (true, true));
+  owner.stop().unwrap();
+}
+
 /// Goal 93, jupiter's red (w-k90-win, 2026-11-21: the owner thread gone with no word, every `repository create` answered
 /// `Overloaded`). Do: start an owner on a sizing the engine refuses (no memory, no disk), so its store cannot open; from a
 /// shard's task land a changeset and list changesets through it. Expect: each answered the store's own refusal, saying
