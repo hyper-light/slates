@@ -60838,8 +60838,9 @@ Applied in the same change to:
   under the identity the import named it by, which must be the store's. Each sealed text holds one count until its
   revision's landing takes it; an import that ends otherwise gives all of them back.
 - `crates/server/src/vcs_store/svn_import.rs`, `crates/server/src/repository/svn_commit.rs` (`stage_texts`,
-  `hand_over`), `crates/server/src/repository/svn_commit/staging.rs` (`Staging::stage`; `due_before` counts a revision's
-  stored texts twice, as it counted its contents), `crates/server/src/vcs_store.rs`
+  `hand_over`), `crates/server/src/repository/svn_commit/staging.rs` (`Staging::stage`; `due_before` charges a
+  revision's stored texts once, in its post-state, since the shard charged them in the content store as the dump was
+  read; a test's admission cap counts them among what the batch holds, as that charge does), `crates/server/src/vcs_store.rs`
   (`VcsStores::subversion_with_content`).
 - `crates/svn/tests/import_heap.rs` (new; `slates-mem` a dev-dependency of slates-svn), the room refusal test
   (`an_import_past_the_room_is_refused`: the text's room is the sink's), GAPS.
