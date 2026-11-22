@@ -436,7 +436,9 @@ impl Positions {
     }
   }
 
-  /// The least position the set holds at `from` or after it (A-639).
+  /// The least position the set holds at `from` or after it (A-639): found by halving the runs or the list, and in a bit
+  /// table from the word that holds `from` on, never its words before (main 01a20182's sample of 2026-11-22 05:38: a
+  /// git/git clone's loose stage asking a table from its start for each object, quadratic in its span).
   pub fn next_from(&self, from: u64) -> Option<u64> {
     match &self.form {
       Form::Runs(runs) => {
@@ -444,9 +446,27 @@ impl Positions {
         runs.get(at).map(|run| run.0.max(from))
       }
       Form::List(list) => list.get(list.partition_point(|held| *held < from)).copied(),
-      Form::Bits { start, words } => bits_of(*start, words).find(|position| *position >= from),
+      Form::Bits { start, words } => bit_from(*start, words, from),
     }
   }
+}
+
+/// The least position at `from` or after it whose bit is set in the table of `words` from `start` (a word's first
+/// position), read from the word that holds `from` on.
+fn bit_from(start: u64, words: &[u64], from: u64) -> Option<u64> {
+  let offset = from.saturating_sub(start);
+  let mut at = usize::try_from(offset / WORD_BITS).ok()?;
+  let mut mask = u64::MAX << (offset % WORD_BITS);
+  while let Some(word) = words.get(at) {
+    let held = word & mask;
+    if held != 0 {
+      let word_start = start.saturating_add(crate::to_u64(at).saturating_mul(WORD_BITS));
+      return Some(word_start.saturating_add(u64::from(held.trailing_zeros())));
+    }
+    mask = u64::MAX;
+    at = at.saturating_add(1);
+  }
+  None
 }
 
 /// Adds `position` to the runs `runs` in place: whether they did not hold it. Halving finds the run it falls in or
@@ -561,6 +581,18 @@ mod tests {
       }
       prop_assert_eq!(set.iter().collect::<Vec<_>>(), model.iter().copied().collect::<Vec<_>>());
       prop_assert_eq!(set, Positions::of(model.into_iter().collect()));
+    }
+
+    /// A-859 (main 01a20182's sample of 2026-11-22 05:38: a bit table's `next_from` read from the table's start). Do:
+    /// make a set of random positions whole, in whatever form costs least (a bit table among them), and ask it the least
+    /// position at or after each `from` across and past its span. Expect: each the ordered set's answer.
+    #[test]
+    fn a859_the_least_position_from_any_point_is_the_sets_in_every_form(drawn in proptest::collection::vec(0u64..600, 0..300)) {
+      let model: BTreeSet<u64> = drawn.iter().copied().collect();
+      let set = Positions::of(model.iter().copied().collect());
+      for from in 0..700 {
+        prop_assert_eq!(set.next_from(from), model.range(from..).next().copied(), "from {}", from);
+      }
     }
   }
 

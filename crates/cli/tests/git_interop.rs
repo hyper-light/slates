@@ -2119,7 +2119,7 @@ fn edge_advertisement(port: u16, token: &str) -> Option<Vec<u8>> {
 
 /// Format: the daemon's counters of the paths a clone's objects took (main 01a20182's order of 2026-11-22 04:53): the
 /// fetch stream's (`vcs_store::upload::STREAM_COUNTED`) and the encoding made ahead's (`vcs_store::git_encode`'s).
-const CLONE_PATHS: [&str; 13] = [
+const CLONE_PATHS: [&str; 17] = [
   "vcs_store.git_upload.parts_copied",
   "vcs_store.git_upload.entries_copied",
   "vcs_store.git_upload.headers_rewritten",
@@ -2130,9 +2130,13 @@ const CLONE_PATHS: [&str; 13] = [
   "vcs_store.git_upload.reused_whole",
   "vcs_store.git_upload.reused_deltas",
   "vcs_store.git_upload.reuse_refused",
+  "vcs_store.git_upload.reuse_no_entry",
+  "vcs_store.git_upload.reuse_unread",
   "vcs_store.git_encode.reused_whole",
   "vcs_store.git_encode.reused_deltas",
   "vcs_store.git_encode.reuse_refused",
+  "vcs_store.git_encode.reuse_no_entry",
+  "vcs_store.git_encode.reuse_unread",
 ];
 
 /// The values of counters `names` in the daemon's status report (`slates status --json`, each counter an object

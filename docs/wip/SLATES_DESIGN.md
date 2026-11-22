@@ -60755,9 +60755,13 @@ Applied in the same change to:
 - **Change (part B).** An object pushed in a pack is sent on as its entry lies there, as git's `pack-objects` reuses a
   packed entry before it searches, both where fragments are made and in the stream's loose stage; each entry checked
   first against the object's name (a delta through its base), a corrupt one refused and the object encoded instead;
-  a delta reused only where its base precedes it in the pack the client reads; a whole entry reused only where the
-  encoder would try no delta for the object (git's order: a packed delta reused, else a search, else the whole entry's
-  data copied), the reused object kept as a later one's candidate base. Part A (owed next): a fetched byte
+  a delta reused only where its base precedes it in the pack the client reads, a still-wanted base placed first (git's
+  `write_one`: the stream's loose stage meets objects by type then id, the encoding by type then the largest first, so
+  each keeps a stack of bases to place ahead, as deep as the deepest chain any push carried); a whole entry reused
+  whenever it has one (main 01a20182's ruling of 2026-11-22 05:38, superseding "only where the encoder would try no
+  delta": git/git's clone spent its time in `Search::step` on objects that had a stored form), the reused object kept
+  as a later one's candidate base. Counted where reuse is not taken: `reuse_refused` (its check failed),
+  `reuse_no_entry` (kept as content, in no pack) and `reuse_unread` (its entry or base unread). Part A (owed next): a fetched byte
   priced at the network, so what no pushed entry holds deflates and deltas within the learned budget.
 - **Tests.** `slates-server` `git_push::tests::t_a859_a_clone_of_a_deltified_push_sends_its_entries_as_they_lie` (the
   line above pushed as stock git sends it, 17,299 bytes: cloned before encoding in 20,916 (121 whole, 20 deltas reused,
