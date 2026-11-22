@@ -508,6 +508,16 @@
 >     7.2 streams the imported repository and verifies it clean.
 > - The two recovery tests that polled a register-held import record by hand are gone with that path; the restart test
 >   holds the run's recovery.
+> **A push's work counted a file revision's metadata markers as bytes (2026-11-22, w-hg; w-interop's find, ubuntu,
+> `hg push --new-branch -f -r 2000` of hg's own history refused `LengthDiffers { said: 10101, given: 10097 }` on
+> `hgext/hbisect.py`). FIXED.** 2a's `IndexHeld::file_bytes_len` (d93f98369) took a file revision's bytes as its text's
+> length less its block's, but the block the row keeps is what lies between the text's two `\1\n` markers
+> (`filerev::split`), so every revision with a block, empty (a text beginning with the marker, 7.2's escape) or not (a
+> copy), was said four bytes longer than its bytes. Now the block counts with both markers. Held by
+> `push::made::tests::a_file_revisions_length_of_bytes_leaves_out_its_whole_block` (plain, copied, escaped; red: the
+> escaped one said 29 for 25 bytes). Swept: the served view and the index frame a block with its markers against the
+> row's length (`indexed.rs`, `index.rs` `framed_text`), and the intake and the work's own texts split through
+> `filerev::split`; this was the one count off.
 > **C1 step 2 for the import, the import keeping no file text (main 01a20182's ruling of 2026-11-22 00:05). IN FLIGHT.**
 > - 2a BUILT (2026-11-22, w-hg): the read-through. `slates_merge::push::Unavailable::NotYet`, a blob the store holds
 >   but has not at hand: the sliced build (`Building`) takes the unit that read it again once its owner fetched it
