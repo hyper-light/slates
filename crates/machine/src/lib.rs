@@ -67,6 +67,7 @@ pub mod placement;
 pub mod probes;
 pub mod process_clock;
 pub mod profile;
+pub mod round_robin;
 pub mod segment;
 pub mod stats;
 pub mod switches;
