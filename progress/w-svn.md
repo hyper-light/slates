@@ -394,3 +394,16 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - The FSFS DELTA writer is removed: 792c62308, merged 235d62418.
 - w-balance has leave for A-724 piece 3 in my files (`inbox/w-balance-from-w-svn-admission.md`).
 - Main runs the stock fsfs_view leg (big Studio) and the git-2000 re-measure of A-835. Waiting on them for finding (2).
+
+## 2026-11-21 ~23:50 PST: finding (2), attribution under way
+- r10's lines: heap 1.49 GB in use after the import; segment and content kinds near zero.
+- But the daemon has 1.30 GB of heap allocated before any import (smoke, RSS 84 MB), so the heap figure is mostly its
+  startup allocation.
+- In-process probe (local, uncommitted, in svn_import/tests.rs): 400 rewrites of a 256 KiB file, a 105 MB dump.
+  - RSS 179 MB before, 867 MB after.
+  - Live owners afterwards hold almost nothing: the green its head, records 24 KB, content store empty, no volumes.
+  - The chunk arena holds 317 MB after the import, given back within 1 s of idle; RSS stays 789 MB.
+  - macOS RSS keeps MADV_FREE_REUSABLE pages, so the footprint is the true figure.
+- Landed: `an_import_measured` samples status --memory, RSS and footprint (via top) before, after, and 2 s and 30 s
+  into the hold. 4bc541ca5 and c74f35cc1, merged 78e584f18.
+- Waiting: main's git-2000 run of it. Then the red test, on footprint after an import and an idle tick.
