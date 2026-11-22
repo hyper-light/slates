@@ -7541,3 +7541,17 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   a daemon gone, or a small class past 2x while a large one runs (starvation). The bounds stop a step early on disk or
   memory and say so; scratch under ~/.cache/multi-repo-stock/<pid>, removed.
   Proved locally (hg, debug, M-series Mac, R=1 and 2): all ok, 1.0x-1.2x alone.
+
+- w-shared (2026-11-22, A-861 eef3ac3c7 on main; main 01a20182's 04:56 ruling, goal 93 item 1): the git push's
+  temporaries, measured as main's RSS round at f577268d3 measured them:
+    SLATES_TEST_GIT_SOURCE=<git/git bare clone> SLATES_TEST_GIT_CUT=v2.0.0 \
+      cargo test --release -p slates-cli --test git_interop the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the_history -- --nocapture
+  Platform: macOS arm64 (the MacBook's f577268d3 round is the baseline: peak 815.2, after the push 667.5, after the
+  clone 737.8 MiB, bound 176.8; w-shared's 200 ms samples at 16f05ed06 put 550-600 MB in the allocator's keep).
+  Read: the "resident MiB" line, and `slates status --memory` after the push (mem.gauge.process.system_live_bytes,
+  system_allocated_bytes, mapped_resident_bytes, vcs_content.stored_bytes).
+  Green for A-861: after the push, RSS minus (system_live + mapped_resident + vcs_content stored on both shards + about
+  11 MB) under 100 MB, where it was 550-600; the peak down by at least that much. Still red against the bound until item 2
+  (the landed windows 61.3 MB and pack 53.9 MB let go) and w-git's recent give-back land. Red for A-861: that remainder
+  still past 300 MB (then the pack reader's own per-object buffers are next, phase B).
+
