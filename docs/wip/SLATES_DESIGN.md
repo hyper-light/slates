@@ -16467,6 +16467,12 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > per-principal rates, the working set's miss-ratio curve and memory by marginal utility, CPU weights, and the shares
 > published to siblings.
 
+> **Status (2026-11-21, A-724 piece 3: Mercurial's push past its share).** `hg_push::unbundle` refuses a bundle
+> larger than its room has left, where the room is a share or the snapshot slot's room, before it is read, in 7.2's
+> `pusherr` form naming the bound and that a retry may pass
+> (`t_a724_a_mercurial_push_past_its_share_is_refused_naming_the_share`, red first). Owed in piece 3: Subversion's
+> admission and its words (with w-svn), backpressure before refusal (with w-git).
+
 > **Status (2026-11-21, A-724 piece 3b: git's push past its share refused typed and retryable).** A git push keeps what
 > bound its room when it began (`vcs_share::Bound`); a refusal past its admission is typed by it: `PushFailed::PastShare
 > { past, share, held }` where the room was the repository's share while others pushed, `PastSnapshot { past, room }`
@@ -16487,7 +16493,11 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > repository is a claimant in every other's room, claiming what it holds plus its learned fetch demand a live fetch; the
 > answer's bytes, reported by both edges as they write (`StoreLender::wrote`), are learned on the usage row when the
 > generation is given back (`t_a724_a_fetch_in_flight_is_a_claim_on_the_room`,
-> `t_a724_a_fetchs_answer_is_counted_and_learned_on_its_repositorys_usage_row`, red first). Mercurial's fetch is owed.
+> `t_a724_a_fetchs_answer_is_counted_and_learned_on_its_repositorys_usage_row`, red first). Mercurial's fetch likewise
+> (2026-11-21, w-hg's leave): its streamed answer's `hg_view::Generation` holds `Live::fetch` and is answered with the
+> bytes both edges report writing (`HgStores::wrote`); a generation held for a batch's lookup writes nothing and teaches
+> nothing (`t_a724_a_mercurial_fetch_in_flight_is_a_claim_on_the_room`,
+> `t_a724_a_mercurial_fetchs_answer_is_learned_and_a_lookups_hold_teaches_nothing`, red first).
 
 > **Status (2026-11-20, A-724 piece 3a: one room for every admission).** `crate::vcs_share::room` (`slates-server`) is
 > the one room a version-control work is admitted on its owner shard: git's push as it starts, git's fetch, Mercurial's
@@ -16529,7 +16539,39 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > work's bytes (squared error; the shortest among equals), since a steady rhythm makes the arrival horizon the longest
 > and 100 small intakes then three 64 times larger would read 2.8 small there. Learned's properties held: within the
 > range seen, a new size from its first work, a work after a silence outweighing the past; noisy sizes read as their
-> mean. Owed: the principals' `Decayed` and the curves fed on the owner shard.
+> mean. Each principal's slot in a usage row keeps a `Decayed` a kind, read as the repository's rate times its share
+> of the slots' decayed counts (a slot's count read alone at today's horizon read 793 a second for 1,000, the horizon
+> having moved); a rate is read over its count's filled share, `1 - e^{-age/τ}`.
+
+> **Status (2026-11-21, A-844 part 2: the curves fed on the owner shard).** Each usage row keeps its repository's
+> curve, lent to the shard's content store for each of its steps (`vcs_store::observed`; `ContentStore::observe`):
+> every content the step reads (`get`, `bytes_of`, a window's read) is noted in it, keyed by its identity's first
+> eight bytes, a step inside a step restoring the outer curve. Its capacity is the content windows the repository's
+> floor holds, `room / (repositories served × window)` (`vcs_store::curve_keys`): a working set that fits the floor is
+> sampled whole. Fed today by git's fetches (both lends of `vcs_store::upload`).
+
+> **Status (2026-11-21, A-846 part 2: the grants, divided at the learning cadence).** `crate::vcs_share::grants`: each
+> shard keeps one `Grants` value, replaced whole: every row's curve aged to now at its read horizon
+> (`Ledger::age_curves`), its misses a second its counts over that horizon, the shard's admittable room divided by
+> `slates_vcs::partition`. It is divided again once the shortest read horizon among the repositories served has passed,
+> or at once when that set changes, and read in between (`current_at`; counted `vcs_share.grants_divided`). Owed: the
+> room's admission reading it (a repository admitted against its grant, else the spare; agreed with A-724 piece 3's
+> side first), and pushes', Mercurial's and Subversion's reads feeding the curves.
+
+> **Status (2026-11-21, A-849: piece 7's proof gains fetches).** `crates/cli/bench/multi_repo_load.py --fetches`
+> seeds every repository with its class's pack, then sends Zipf-skewed protocol v2 fetches beside the pushes, each
+> class's fetch p50 and p99 against its fetch alone. The harnesses' daemons get their own `--vcs-store` (push_load's
+> `Daemon`), without which no git repository could be made since A-767 C5. Proved locally (debug, M-series Mac): a
+> push alone 2.3 s and a fetch alone 10.3 s of git/git v0.99 (4,507 objects), both whole; the steps are main's rounds.
+> Owed: Mercurial and Subversion repositories in the mix.
+
+> **Status (2026-11-21, CPU: the open decision; main's ruling of 17:22).** A shard's CPU is divided among its
+> repositories by equal-weight deficit round robin (`vcs_share::turns`, A-724 piece 3c: one turn a repository a round,
+> max-min fair among those with work); CPU joins dominant-resource fairness for admission only. The weighted fair
+> queuing this section designs ("each weight its learned demand capped at its measured use") is open: piece 7's load
+> proof decides it, an interleaved release A/B of equal weights (main), learned weights (`agents/w-multirepo-learned-weights`:
+> a repository may hold its learned CPU demand over the least live one's turns at once) and a turn a distinct principal
+> (`agents/w-balance-turn-weights`), held to the smallest class's p99 against its fair share (run-requests.md, A-849).
 
 > **Status (2026-11-21, A-846: piece 2's memory share by marginal utility).** `slates_vcs::partition`: a shard's room
 > divided among its repositories, each first guaranteed the lesser of A-188's floor (the room over the repositories
@@ -55195,6 +55237,16 @@ Applied in the same change to:
   reply step). The room's claims add each live work's learned bytes by kind (`demand_of`). Red first: a fetch in flight
   divided no one's room; its answer was never counted. Tests: slates-server `vcs_share` 14/14, `vcs_store::upload` 7/7,
   `vcs_http::git` 20/20, `vcs_ssh` 72/72.
+- **Piece 3d for Mercurial (2026-11-21, w-hg's leave).** `hg_view::Generation` holds `vcs_share::Live::fetch` and a
+  written count fed by both edges after each streamed turn (`HgStores::wrote`, defaulted); its drop answers the fetch on
+  the usage row only where its answer wrote something, so a batch's lookup hold teaches no zero demand. Red first (a
+  held generation divided no room; with the lookup answered too, two fetches counted). Tests: slates-server `vcs_share`
+  16/16, `vcs_ssh::tests::hg` 13/13, `vcs_http::hg` 9/9, `hg_view` 7/7, `repository::hg_push` 18/18.
+- **Piece 3, Mercurial's share refusal (2026-11-21, w-hg's leave).** `hg_push::unbundle` refuses, before `front` reads
+  the bundle, a bundle larger than its room has left where the room is the repository's share (or the snapshot slot's
+  room): 7.2's `pusherr` (`Outcome::Unprocessed`) naming the bound and that a retry may pass (`past_its_bound`), as
+  git's `PastShare` does. Red first: refused `Bundle1` before, saying nothing of the share. Tests: slates-server
+  `vcs_share` 17/17, `vcs_ssh::tests::hg` 13/13, `vcs_http::hg` 9/9, `hg_view` 7/7, `repository::hg_push` 18/18.
 - **Applied in the same change to** §4.17.5 (new), GAPS, amendments.tsv.
 - **Owed.** Pieces 2 to 7 (§4.17.5's status); a fetch's answered count at its pack's last step; Mercurial's and
   Subversion's intakes and reads counted; the rows in `slates status`.

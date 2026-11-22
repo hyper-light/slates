@@ -30,6 +30,7 @@ import asyncio
 import os
 import re
 import resource
+import shutil
 import subprocess
 import sys
 import time
@@ -92,8 +93,12 @@ class Daemon:
     def __init__(self, slates: str, instance: str = ""):
         self.slates = slates
         self.instance = instance or f"w-perf-push-load-{os.getpid()}"
+        # The version-control store a git repository's changesets land in (A-767: a repository needs it since C5), one a
+        # daemon, removed when it stops; never /tmp (CLAUDE.md §2 item 3).
+        self.store = os.path.join(os.path.expanduser("~/.cache/slates-bench-stores"), self.instance)
+        os.makedirs(self.store, exist_ok=True)
         self.anchor = subprocess.Popen(
-            [slates, "--instance", self.instance, "anchor", "--vcs-http", "127.0.0.1:0"],
+            [slates, "--instance", self.instance, "anchor", "--vcs-http", "127.0.0.1:0", "--vcs-store", self.store],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
@@ -145,6 +150,7 @@ class Daemon:
                 os.kill(self.pid, 9)
             except ProcessLookupError:
                 pass
+        shutil.rmtree(self.store, ignore_errors=True)
 
 
 async def push(port: int, token: str, repository: str, body: bytes) -> tuple[float, str]:

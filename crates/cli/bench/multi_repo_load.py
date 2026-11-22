@@ -32,11 +32,18 @@ fresh daemon, so no step meets what another left.
 
 Nothing is written outside memory: the packs are read from `git pack-objects`'s pipe and the daemon is RAM-only.
 
-Usage: multi_repo_load.py SLATES SOURCE REV [REV ...] [--steps 1,10,100,1000]
+The fetches (A-724 piece 7, `--fetches`; §4.17.5 "Proof": a fetch is a repository's work as a push is). Each step's
+repositories are first given their class's pack once (unmeasured), then the burst sends, beside the pushes, fetches by
+the same Zipf law: each a protocol v2 `fetch` of the class's head over the HTTP edge, its time to the whole answer.
+Each class's fetch alone is measured after its push alone, and a step reports each class's fetches at p50 and p99 and
+their ratio to alone: no starvation means a small repository's fetch p99 stays within its fair share as its push does.
+
+Usage: multi_repo_load.py SLATES SOURCE REV [REV ...] [--steps 1,10,100,1000] [--fetches]
   SLATES  the release `slates` binary
   SOURCE  a git repository holding every REV (a bare clone of the dataset)
   REV     one revision a size class, smallest first (e.g. v0.99 v1.0.0 v1.5.0 v2.0.0 of git/git)
   --steps the repository counts of the steps, in order (default: powers of ten up to the open-file room)
+  --fetches  seed every repository, then send fetches beside the pushes (above)
   --per-repository-cap N  at most N pushes to one repository in a step (main's order of 2026-11-20: below the 19
           concurrent v1.5.0 pushes to one repository that end the daemon until A-722 lands)
 """
@@ -176,6 +183,59 @@ async def push(port: int, token: str, repository: str, body: bytes, branch: str)
     return end - start, words
 
 
+def fetch_request(head: str) -> bytes:
+    """git's protocol v2 `fetch` of HEAD alone: `want`, `no-progress`, `done`, as a clone of one branch sends it."""
+    lines = [pkt_line(b"command=fetch\n"), b"0001", pkt_line(f"want {head}\n".encode()), pkt_line(b"no-progress\n"),
+             pkt_line(b"done\n"), b"0000"]
+    return b"".join(lines)
+
+
+async def fetch(port: int, token: str, repository: str, body: bytes) -> tuple[float, str]:
+    """One fetch over its own connection: its wall time to the whole answer, and `ok` (a packfile section answered in
+    full) or its refusal's words."""
+    start = time.perf_counter()
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        head = (
+            f"POST /{repository}/git-upload-pack HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+            f"Authorization: Bearer {token}\r\nGit-Protocol: version=2\r\n"
+            f"Content-Type: application/x-git-upload-pack-request\r\n"
+            f"Accept: application/x-git-upload-pack-result\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+        ).encode()
+        writer.write(head)
+        writer.write(body)
+        await writer.drain()
+        status_line = await reader.readline()
+        headers = {}
+        while (line := await reader.readline()) not in (b"\r\n", b"\n", b""):
+            name, _, value = line.decode("latin-1").partition(":")
+            headers[name.strip().lower()] = value.strip()
+        if headers.get("transfer-encoding", "").lower() == "chunked":
+            answer = b""
+            while True:
+                size = int((await reader.readline()).strip() or b"0", 16)
+                if size == 0:
+                    break
+                answer += await reader.readexactly(size)
+                await reader.readline()
+        elif "content-length" in headers:
+            answer = await reader.readexactly(int(headers["content-length"]))
+        else:
+            answer = await reader.read()
+        writer.close()
+        status = status_line.split(b" ")[1].decode() if b" " in status_line else "?"
+        if status != "200":
+            words = f"http {status}: {answer[:80]!r}"
+        elif b"packfile\n" in answer and answer.endswith(b"0000"):
+            words = "ok"
+        else:
+            found = re.findall(rb"(ERR [^\n]*|fatal: [^\n]*)", answer)
+            words = "answer: " + (b"; ".join(found)[:120].decode("latin-1") if found else repr(answer[-80:]))
+    except (OSError, asyncio.IncompleteReadError, ValueError) as error:
+        words = f"transport: {type(error).__name__}: {error}"[:120]
+    return time.perf_counter() - start, words
+
+
 async def sample_peak(pid: int, stop: asyncio.Event) -> int:
     peak = 0
     while not stop.is_set():
@@ -189,15 +249,20 @@ def quantile(times: list[float], q: float) -> float:
     return ordered[min(len(ordered) - 1, int(q * len(ordered)))] if ordered else float("nan")
 
 
-async def burst(daemon: Daemon, pushes: list[tuple[str, int, bytes, str]]) -> tuple[list[tuple[int, float, str]], float, int, int]:
-    """Sends every push at once: each one's class, time and words; the wall time; the resident set before and at peak."""
+async def burst(
+    daemon: Daemon, pushes: list[tuple[str, int, bytes, str]], fetches: list[tuple[str, int, bytes]] = ()
+) -> tuple[list[tuple[int, float, str]], float, int, int]:
+    """Sends every push and every fetch at once: each push's class, time and words; the wall time; the resident set
+    before and at peak. Each fetch's class, time and words are kept in `burst.fetched`."""
     before = rss_kib(daemon.pid)
     stop = asyncio.Event()
     sampler = asyncio.create_task(sample_peak(daemon.pid, stop))
     start = time.perf_counter()
-    answers = await asyncio.gather(
-        *(push(daemon.port, daemon.token, name, body, branch) for name, _, body, branch in pushes)
+    answers, fetched = await asyncio.gather(
+        asyncio.gather(*(push(daemon.port, daemon.token, name, body, branch) for name, _, body, branch in pushes)),
+        asyncio.gather(*(fetch(daemon.port, daemon.token, name, body) for name, _, body in fetches)),
     )
+    burst.fetched = [(size, took, words) for (_, size, _), (took, words) in zip(fetches, fetched)]
     wall = time.perf_counter() - start
     stop.set()
     peak = await sampler
@@ -356,6 +421,9 @@ def main():
         at = args.index("--steps")
         steps = [int(n) for n in args[at + 1].split(",")]
         del args[at : at + 2]
+    fetching = "--fetches" in args
+    if fetching:
+        args.remove("--fetches")
     cap = None
     if "--per-repository-cap" in args:
         at = args.index("--per-repository-cap")
@@ -375,12 +443,17 @@ def main():
 
     # Alone: one push of each class on its own daemon, the baseline each class's starvation is judged against, and the
     # first measure of the memory a push of the class holds.
-    alone, held_mib = [], []
+    alone, held_mib, fetch_alone = [], [], []
     for size, (pack, head, _) in enumerate(packs):
         daemon = fresh_daemon(slates, f"alone{size}")
         try:
             daemon.cli("repository", "create", "alone", "--tool", "git", "--default-branch", "main")
             results, _, before, peak = asyncio.run(burst(daemon, [("alone", size, request(head, pack, "p0"), "p0")]))
+            if fetching:
+                asyncio.run(burst(daemon, [], [("alone", size, fetch_request(head))]))
+                fetch_took, fetch_words = burst.fetched[0][1], burst.fetched[0][2]
+                fetch_alone.append(fetch_took)
+                print(f"alone class {size} fetch: {fetch_took:.3f} s, {fetch_words}", flush=True)
         finally:
             daemon.stop()
         took, words = results[0][1], results[0][2]
@@ -416,8 +489,24 @@ def main():
                 for k in range(count):
                     branch = f"p{k}"
                     pushes.append((f"r{rank}", size, request(head, pack, branch), branch))
+            fetches = []
+            if fetching:
+                # Seeded first, unmeasured: every repository given its class's pack once, so it has a head to fetch.
+                for rank in range(1, repositories + 1):
+                    if not counts[rank - 1]:
+                        daemon.cli("repository", "create", f"r{rank}", "--tool", "git", "--default-branch", "main")
+                seeds = [(f"r{rank}", size, request(packs[size][1], packs[size][0], "seed"), "seed")
+                         for rank, size in enumerate(classes, start=1)]
+                seeded, _, _, _ = asyncio.run(burst(daemon, seeds))
+                unseeded = sum(1 for _, _, words in seeded if words != "ok")
+                if unseeded:
+                    print(f"R={repositories}: {unseeded} of {len(seeds)} seeds refused", flush=True)
+                for rank, (count, size) in enumerate(zip(counts, classes), start=1):
+                    for _ in range(count):
+                        fetches.append((f"r{rank}", size, fetch_request(packs[size][1])))
             capacity = shard_count(daemon)
-            results, wall, before, peak = asyncio.run(burst(daemon, pushes))
+            results, wall, before, peak = asyncio.run(burst(daemon, pushes, fetches))
+            fetched = burst.fetched
             alive = rss_kib(daemon.pid) > 0
             seen = counters(daemon) if alive else {}
             rows = usage_rows(daemon) if alive else {}
@@ -541,6 +630,18 @@ def main():
                   f"p50 {quantile(times, 0.5):.3f} s, p99 {p99:.3f} s ({p99 / alone[size]:.1f}x alone); "
                   f"starvation {p99 / ideal_owner:.2f}x its fair share (one shard a repository, ideal p99 {ideal_owner:.3f} s), "
                   f"{p99 / ideal_spread:.2f}x spread (ideal {ideal_spread:.3f} s); "
+                  + ", ".join(f"{k} x{v}" for k, v in sorted(kinds.items(), key=lambda kv: -kv[1])), flush=True)
+        for size in range(len(packs)):
+            mine = [(took, words) for got, took, words in fetched if got == size]
+            if not mine:
+                continue
+            times = [took for took, _ in mine]
+            kinds: dict[str, int] = {}
+            for _, words in mine:
+                kinds[words] = kinds.get(words, 0) + 1
+            p99 = quantile(times, 0.99)
+            print(f"  class {size} fetches: {len(mine)}, p50 {quantile(times, 0.5):.3f} s, p99 {p99:.3f} s "
+                  f"({p99 / fetch_alone[size]:.1f}x alone); "
                   + ", ".join(f"{k} x{v}" for k, v in sorted(kinds.items(), key=lambda kv: -kv[1])), flush=True)
         # Learn each class's memory a push from this step, apportioned by its share of the bytes sent.
         sent = sum(len(packs[size][0]) * count for size, count in zip(classes, counts)) or 1

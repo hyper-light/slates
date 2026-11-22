@@ -27,7 +27,7 @@ fn uniform(objects: u64, reads: usize, salt: u64) -> Curve {
     state ^= state << 13;
     state ^= state >> 7;
     state ^= state << 17;
-    curve.read(key_of(salt << 32 | state % objects), GRANULE);
+    curve.read(key_of((salt << 32) | (state % objects)), GRANULE);
   }
   curve
 }

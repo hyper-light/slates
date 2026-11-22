@@ -192,6 +192,7 @@ async fn streamed_turn<S: HgStores>(
   let start = slates_rt::futures::now_ns();
   let bound = usize::try_from(turn_room).unwrap_or(usize::MAX);
   let mut paced = crate::vcs_store::paced_turn(quantum, start);
+  let before = stdio.stdout().len();
   let turned = stores
     .lend_held(generation, &mut admission, |store, _| {
       loop {
@@ -208,6 +209,11 @@ async fn streamed_turn<S: HgStores>(
     .ok_or_else(unheld);
   paced.close(slates_rt::futures::now_ns(), costs);
   crate::vcs_store::hg_view::turn_taken();
+  // A-724 piece 3d: what the turn wrote, learned as the fetch's demand once its answer ends.
+  stores.wrote(
+    generation,
+    u64::try_from(stdio.stdout().len().saturating_sub(before)).unwrap_or(u64::MAX),
+  );
   turned
 }
 

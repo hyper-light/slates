@@ -162,6 +162,9 @@ pub(crate) trait HgStores {
     room: &mut Admission,
     step: impl for<'s> FnOnce(&Self::Store<'s>, &mut Admission) -> R,
   ) -> Option<R>;
+  /// The answer streamed over `hold` wrote `bytes` more (A-724 piece 3d): what its fetch is learned to use once it ends.
+  /// Stores that learn nothing do nothing.
+  fn wrote(&mut self, _hold: &Self::Hold, _bytes: u64) {}
 
   /// Answers what a streamed answer asks of the changeset store before its next step (`slates_hg::render::StoreWants`;
   /// A-767 C1): by default from what `hold`'s view reads at once (a test's lender,
@@ -721,6 +724,7 @@ impl<S: HgStores> HgExchange<S> {
       .ok_or(Failed(Status::INTERNAL_SERVER_ERROR))?;
     let costs = &mut self.costs;
     let mut paced = crate::vcs_store::paced_turn(quantum, start);
+    let before = out.len();
     let turned = self
       .stores
       .lend_held(generation, &mut admission, |store, room| {
@@ -747,6 +751,11 @@ impl<S: HgStores> HgExchange<S> {
       });
     paced.close(slates_rt::futures::now_ns(), costs);
     crate::vcs_store::hg_view::turn_taken();
+    // A-724 piece 3d: what the turn wrote, learned as the fetch's demand once its answer ends.
+    self.stores.wrote(
+      generation,
+      u64::try_from(out.len().saturating_sub(before)).unwrap_or(u64::MAX),
+    );
     match turned {
       Some(Ok(more)) => Ok(more),
       Some(Err(_)) => Err(Failed(Status::INTERNAL_SERVER_ERROR)),

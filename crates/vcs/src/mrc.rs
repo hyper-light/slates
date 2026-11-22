@@ -70,7 +70,7 @@ pub fn keys_within(bytes: usize) -> usize {
 }
 
 /// One repository's miss-ratio curve (module docs).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Curve {
   /// The most sampled keys kept.
   capacity: usize,
@@ -116,9 +116,18 @@ impl Curve {
     }
   }
 
+  /// Bounds the curve to `capacity` sampled keys (at least one) from now, its owner having derived the bound again:
+  /// a lower one drops the largest hashes at once, as a read past it would.
+  pub fn bound(&mut self, capacity: usize) {
+    self.capacity = capacity.max(1);
+    while self.keys.len() > self.capacity {
+      self.shrink();
+    }
+  }
+
   /// The sampling rate now: the fraction of keys sampled.
   pub fn sampling_rate(&self) -> f64 {
-    self.threshold as f64 / 2f64.powi(64)
+    self.threshold as f64 / f64::from(u64::BITS).exp2()
   }
 
   /// One read of the object whose uniform hash is `key` and whose length is `bytes`.

@@ -971,8 +971,8 @@
 > and learned; Subversion's commits too (at `land_work`). **Open, found reading it:** no Subversion commit is admitted
 > against the room at all: its texts arrive into the conversation's sink with no admission, so a commit's bytes are
 > bounded by the edge's item limits alone, not the shard's room or the repository's share. Piece 3d landed: a git
-> fetch's answer is a live claim on the room and its bytes are learned. Owed in piece 3: svn's admission, Mercurial's
-> and Subversion's share refusals in their words, Mercurial's fetch as a claim, backpressure before refusal.
+> fetch's answer is a live claim on the room and its bytes are learned. Owed in piece 3: svn's admission, Subversion's
+> share refusal in its words (Mercurial's landed 2026-11-21), backpressure before refusal (Mercurial's fetch claim landed 2026-11-21).
 > In flight, paused for goal 93 (2026-11-21): run 31 (cap 3, Studio-2, 9865bb832) found shard-mates took 4.5 s of the
 > busiest repository's 41.3 s span and its shard ran steps 23.2 s of it: its own three pushes of one agent shared one
 > turn. The fix (a turn an agent, spare turns taken; red first) is on branch agents/w-balance-turn-weights, 928df7d1b,
@@ -2017,7 +2017,15 @@
 > Open: nothing reads content through it yet; the marginal-utility partition and the CPU weights follow.
 > **A-724 piece 2b (A-845): the learned rates built, not yet fed** (`slates_vcs::rate`, `cargo test -p slates-vcs --lib
 > rate::`, 5 of 5, macOS arm64, this Mac); since 2026-11-21 the one learned demand: it replaced `usage::Learned`, fed
-> at each answered work (`slates_vcs::usage`). Open: principals' `Decayed` and the curves fed on the owner shard.
+> at each answered work (`slates_vcs::usage`); each principal's rate read from its usage slot.
+> **A-724 piece 2d part 2 (A-844): curves fed by git's fetches** (`vcs_store::observed`;
+> `t_a724_a_fetchs_reads_are_noted_in_its_own_repositorys_curve`). Open: pushes', hg's and svn's reads.
+> **A-724 piece 2d part 3 (A-846): grants divided at the learning cadence, not yet read by admission**
+> (`vcs_share::grants`, `t_a724_the_grants_are_divided_at_the_learning_cadence_and_kept_between`). Open: `room` reading
+> them.
+> **A-724 piece 7 (A-849): the load proof's fetches** (`multi_repo_load.py --fetches`; harness daemons given a
+> `--vcs-store`, without which `repository create --tool git` failed since A-767 C5). Open: hg and svn in the mix; the
+> rounds (main's).
 > **A-724 piece 2c (A-846): memory by marginal utility built, not yet applied** (`slates_vcs::partition`, `cargo test
 > -p slates-vcs --lib partition::`, 4 of 4, macOS arm64, this Mac). Open: computed on the owner shard and published.
 >
