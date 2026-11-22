@@ -174,6 +174,10 @@ pub enum Unavailable {
     /// The bytes the store had left.
     room: u64,
   },
+  /// The store holds the blob but not its bytes at hand: its owner gives them once it has asked for them between turns
+  /// (a text let go from RAM to the node's changeset store, A-767 C1). The build waits at the unit that read it and
+  /// takes that unit again ([`Building::waiting`]); where that unit cannot be taken again, the build is refused with it.
+  NotYet,
 }
 
 /// The objects a push names, read by their ids: the repository's store with the push's own objects above it in its
@@ -358,6 +362,10 @@ pub fn build<O: PushObjects + ?Sized>(
     if let Some(built) = building.advance(green, objects) {
       return built;
     }
+    // A build in one call cannot wait for a blob not at hand: refused with it ([`Unavailable::NotYet`]).
+    if let Some(refused) = building.waiting.take() {
+      return Err(refused);
+    }
   }
 }
 
@@ -395,6 +403,9 @@ pub struct Building {
   pace: Pace,
   /// Where the build is.
   stage: Stage,
+  /// What the last turn waited for, until the next turn: the read of a blob not at hand ([`Unavailable::NotYet`]), as
+  /// the refusal a build that cannot wait answers.
+  waiting: Option<PushRefused>,
 }
 
 /// A push a green owes as its next version, its work not built (P2, main's ruling of 2026-11-21 05:12; A-647's derived
@@ -654,6 +665,16 @@ impl Building {
       room,
       pace,
       stage: Stage::Begin,
+      waiting: None,
+    }
+  }
+
+  /// The blob the last turn stopped for: its bytes not at hand ([`Unavailable::NotYet`]), so the owner fetches them
+  /// before the next turn, which takes the same unit again; none when the turn stopped for its pace.
+  pub fn waiting(&self) -> Option<ObjectKey> {
+    match &self.waiting {
+      Some(PushRefused::Object { id, .. }) => Some(*id),
+      _ => None,
     }
   }
 
@@ -679,6 +700,7 @@ impl Building {
     green: &Green,
     objects: &O,
   ) -> Option<Result<Built, PushRefused>> {
+    self.waiting = None;
     loop {
       // The composition asks the pace itself, a unit at each of its own ticks; every other stage asks before a unit.
       // So a turn whose budget is shorter than one unit still runs one unit of the composition (its first tick takes
@@ -692,6 +714,16 @@ impl Building {
         Ok(Some(built)) => {
           self.stage = Stage::Done;
           return Some(Ok(built));
+        }
+        // A blob not at hand where its unit was put back: the turn ends waiting for it.
+        Err(
+          refused @ PushRefused::Object {
+            why: Unavailable::NotYet,
+            ..
+          },
+        ) if !matches!(self.stage, Stage::Done) => {
+          self.waiting = Some(refused);
+          return None;
         }
         Err(refused) => {
           self.stage = Stage::Done;
@@ -726,7 +758,20 @@ impl Building {
       Stage::Copies { walk, at, base } => self.copies_unit(green, walk, at, base),
       Stage::Compose { walk, work } => self.compose_unit(walk, work)?,
       Stage::Post(mut posting) => {
-        match posting.unit(objects, self.push.head.as_deref(), self.pace.slices())? {
+        let laid = match posting.unit(objects, self.push.head.as_deref(), self.pace.slices()) {
+          // The unit read nothing it kept: put back, to be taken again once the blob is at hand.
+          Err(
+            refused @ PushRefused::Object {
+              why: Unavailable::NotYet,
+              ..
+            },
+          ) => {
+            self.stage = Stage::Post(posting);
+            return Err(refused);
+          }
+          other => other?,
+        };
+        match laid {
           None => Stage::Post(posting),
           Some((doc, post_state, reads)) => Stage::Identity(Box::new(Hashing::new(
             (&self.push.name, self.push.base_version),
@@ -1399,7 +1444,19 @@ impl Posting {
     };
     let (source, from) = match op.kind {
       OpKind::Overwrite | OpKind::Insert | OpKind::Extend => {
-        let bytes = file_bytes(&mut self.walk, objects, path)?;
+        let bytes = match file_bytes(&mut self.walk, objects, path) {
+          // Not at hand: this operation is taken again ([`Unavailable::NotYet`]).
+          Err(
+            refused @ PushRefused::Object {
+              why: Unavailable::NotYet,
+              ..
+            },
+          ) => {
+            self.at = self.at.saturating_sub(1);
+            return Err(refused);
+          }
+          other => other?,
+        };
         (bytes, self.plan.get(&op.src).copied())
       }
       OpKind::SetXattr => (Cow::Borrowed(head.unwrap_or_default()), Some(0)),
@@ -1435,13 +1492,13 @@ fn file_bytes<'o, O: PushObjects + ?Sized>(
     .ok_or_else(|| PushRefused::Unplaced {
       path: path.to_owned(),
     })?;
-  walk.reads.blobs = walk.reads.blobs.saturating_add(1);
   let refused = |why| PushRefused::Object {
     path: path.to_owned(),
     id,
     why,
   };
   let bytes = objects.blob(id).map_err(refused)?;
+  walk.reads.blobs = walk.reads.blobs.saturating_add(1);
   let given = to_u64(bytes.len());
   if given != said {
     return Err(refused(Unavailable::LengthDiffers { said, given }));

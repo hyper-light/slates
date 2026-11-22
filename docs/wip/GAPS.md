@@ -494,6 +494,24 @@
 >     7.2 streams the imported repository and verifies it clean.
 > - The two recovery tests that polled a register-held import record by hand are gone with that path; the restart test
 >   holds the run's recovery.
+> **C1 step 2 for the import, the import keeping no file text (main 01a20182's ruling of 2026-11-22 00:05). IN FLIGHT.**
+> - 2a BUILT (2026-11-22, w-hg): the read-through. `slates_merge::push::Unavailable::NotYet`, a blob the store holds
+>   but has not at hand: the sliced build (`Building`) takes the unit that read it again once its owner fetched it
+>   (`Building::waiting`); the posting's file reads are taken again, a one-call `build` is refused with it. Mercurial's
+>   work (`push::tree`) answers `NotYet` for a held file revision whose text is not at hand and tells its length from its
+>   row (`Held::file_bytes_len`), asks the node's changeset store for it through `StoreWants` (`WorkBuild::ask_waited`,
+>   rows then text), and the push's driver brings it back into the content store by its row's identities
+>   (`hg_push::built_works`, `push::held::bring_back_file`, `ContentStore::bring_back_object`; counted
+>   `vcs.hg.push_work_texts_read`). Held by `merge push::tests::a_build_waits_for_each_blob_not_at_hand_and_takes_its_unit_again`
+>   (red without the wait: refused `NotYet`), `hg push::work_tests::a_work_reading_texts_not_at_hand_waits_and_asks_the_store_for_each`
+>   (red with `Missing` for `NotYet`) and `vcs content::an_object_let_go_is_brought_back_whole_by_its_own_bytes`.
+>   Nothing is let go yet, so no behaviour changes until 2b.
+> - 2b, next: each import segment's file windows marked landed and let go once the segment is durable; a symlink's
+>   target read again in the walk; main's red (after a fixture import `ContentStore::used` is the changelog's and the
+>   manifests' bytes alone; a clone and a push over the import verify clean against stock 7.2).
+> - IN FLIGHT, the immediately next piece (main's ruling: the import's resident bound reached in two consecutive
+>   pieces): the changelog's and the manifests' texts off the content store too, read through the store as file texts
+>   are.
 > Owed (C1's remaining steps, main's order): step 1, file texts read through the store; step 2, the intake keeping no
 > whole text. Then w-perf measures R2.
 > - a clone's file revisions served from the Texts rows.
