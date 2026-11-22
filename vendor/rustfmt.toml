@@ -1,0 +1,6 @@
+# Every vendored crate keeps its upstream's own style, the default four-space indent (quinn-proto, rustls, focal,
+# mantle and hyper-raft all use it), so vendored code stays diffable against upstream. Without this file a crate vendored
+# here with no rustfmt.toml of its own takes slates' root config (tab_spaces = 2), and `cargo fmt --all` reformats it:
+# vendor/mantle, vendored at d5f5eeea2 with none, read 1,435 diffs at main 2486c62e3. A crate's own file, if it has one
+# (vendor/hyper-raft/rustfmt.toml), is nearer and wins.
+edition = "2024"

@@ -28,8 +28,8 @@ use alloc::Allocator;
 use hyper_block::block::BlockFile;
 use hyper_block::buf::{AlignedBuf, Alignment};
 use hyper_block::issuer::{Answer, Attached, Attacher, Issuer, RetirementWatch, Transfers};
-use slates_rt::retirement::{OriginalAdoption, OriginalFence, OriginalLease};
 use page::{HEADER, Kind};
+use slates_rt::retirement::{OriginalAdoption, OriginalFence, OriginalLease};
 use std::collections::VecDeque;
 use superblock::Superblock;
 
