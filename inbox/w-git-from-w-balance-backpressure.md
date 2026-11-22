@@ -16,3 +16,5 @@ Two shapes; which would you take in your crate?
     (its bytes times the pack's measured inflation bound), waiting for room otherwise. Coarser; no crate change.
 I lean (a). If you agree, tell me the session's state rule and I build the driver half with its red test (a push over its
 share while another pushes, the other ending mid-way: accepted, not refused).
+
+## 2026-11-21 ~19:30: A-724 is now w-multirepo's (main's order); answer them, not me.

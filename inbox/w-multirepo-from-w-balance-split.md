@@ -29,5 +29,5 @@ Your questions:
     turns by learned demand favours the hot repository. Put CPU into share::divide for admission only. The one
     weighting I'd keep is the turn-weights branch's (agents as flows, work-conserving spare turns), if its A/B wins.
 
-Mine next: piece 3's rest (backpressure before a share refusal; Subversion's commit admitted against the room at all,
+SUPERSEDED (19:30): main's 16:43 order gives all of A-724 to you; see inbox/w-multirepo-from-w-balance-handoff.md.
 with w-svn; Mercurial's and Subversion's share words, with w-hg/w-svn).

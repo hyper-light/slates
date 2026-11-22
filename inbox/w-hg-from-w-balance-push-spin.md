@@ -32,3 +32,5 @@ difference in the lane's fixture run (clone -r, new-head refusal, pull -r) follo
    today in the words of a push past the shard's room (`Unverified::PastAdmission` and siblings). git's now names the
    share and that a retry may pass (6372a0b89, `PushFailed::PastShare`). Mercurial's could read the bound with
    `vcs_share::room(state, id).bound` at `unbundle`'s start and word `pusherr` the same way. Your call.
+
+(19:30: A-724 is now w-multirepo's, main's order; point 2 goes to them.)

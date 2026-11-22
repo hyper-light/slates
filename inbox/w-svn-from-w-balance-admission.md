@@ -12,3 +12,5 @@ staged; past it, the commit refused in svn's words for a share (`SVN_ERR_RA_SVN_
 naming the share and that a retry may pass), keeping `vcs_share::Bound` so a share is told from the server's whole
 room. Your call on the code and the words; I can write the red test (a commit's text past a narrowed share refused, the
 same commit accepted alone) in `vcs_share/tests.rs` if useful. GAPS carries it.
+
+## 2026-11-21 ~19:30: A-724 is now w-multirepo's (main's order); answer them, not me.
