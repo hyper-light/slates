@@ -229,9 +229,14 @@
 >   `PREEMPT_LAZY`, `RUN_TO_PARITY`, 2.1 ms base slice) a woken shard waited for its CPU: kick -> run p50 920 µs, and
 >   8 µs in `SCHED_RR`. But with the shards and the client's park in the class, the client's own time-share code still
 >   waits whole slices: accept p99 0.94-2.6 ms, p999 3.0-4.8 ms, and the spinners lost 20-27% of their throughput. The
->   runner account's `RLIMIT_RTPRIO` is 0:0, so even that needs an administrator's grant. **Open:** 84a's Linux bar
->   under two spinners a CPU, short of user code at real-time priority (ruled out) or a less oversubscribed lane, main's
->   call.
+>   runner account's `RLIMIT_RTPRIO` is 0:0, so even that needs an administrator's grant.
+>   EEVDF's requested slice (arm E, no privilege; BENCHMARKS "84a on Linux: EEVDF's requested slice") cut the loaded
+>   tail with the neighbours' share level (x86 p999 3.2-6.1 -> ~1.9 ms). But a wakeup's p99 pins at one tick (kick ->
+>   run 998-999 µs, the client's wake 983-989 µs under `PREEMPT_LAZY` at `HZ=1000`), so a loaded edit and merge floors
+>   at about 1.3-2.0 ms p99. It also cost x86's quiet p50 30-40%, so it is rejected too.
+>   **Open (main to Ada):** 84a's 1 ms loaded bar on Linux. In the fair class it is below the kernel's 1 ms tick, and
+>   in the real-time class the client's own time-share code waits whole slices. The measured floor is about one tick a
+>   hop, 1.3-2.0 ms p99.
 > - Windows (CI, run 44857045148): no 1 ms band (queued p99 5–49 µs); accept p99 0.13–0.31 ms, conflict 0.11–0.29 ms;
 >   p999 0.2–62 ms. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–7).
 >
