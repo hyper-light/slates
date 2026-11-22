@@ -238,11 +238,36 @@ impl<'v, H: Held + ?Sized> Trees<'v, H> {
   }
 
   /// The text of the file revision `node`: the push's or the repository's, by the path a laid-out manifest named it at.
+  /// A revision the repository holds whose text is not at hand (let go to the node's changeset store, A-767 C1) is
+  /// [`Unavailable::NotYet`]: the build waits for it while its owner reads it from the store.
   fn file_text(&self, node: &Node) -> Result<Cow<'v, [u8]>, Unavailable> {
     let path = self.paths.get(node).ok_or(Unavailable::Missing)?;
     match self.verified.file(path, node) {
       Some(arrived) => Ok(Cow::Borrowed(arrived.text.as_slice())),
-      None => self.held.file_text(path, node).ok_or(Unavailable::Missing),
+      None => self.held.file_text(path, node).ok_or_else(|| {
+        if self.held.file_names(path, node).is_some() {
+          Unavailable::NotYet
+        } else {
+          Unavailable::Missing
+        }
+      }),
+    }
+  }
+
+  /// The length of the file revision `id`'s bytes: the push's from its text, the repository's from its row, never its
+  /// text read (a walk's unit asks it, and cannot wait).
+  fn bytes_len(&self, id: ObjectKey) -> Result<u64, Unavailable> {
+    let node = Node::try_from(id.as_bytes()).map_err(|_| Unavailable::NotABlob)?;
+    let path = self.paths.get(&node).ok_or(Unavailable::Missing)?;
+    match self.verified.file(path, &node) {
+      Some(arrived) => {
+        let split = filerev::split(&arrived.text).map_err(|_| Unavailable::Malformed)?;
+        Ok(to_u64(split.bytes.len()))
+      }
+      None => self
+        .held
+        .file_bytes_len(path, &node)
+        .ok_or(Unavailable::Missing),
     }
   }
 
@@ -268,7 +293,7 @@ impl<H: Held + ?Sized> PushObjects for Trees<'_, H> {
   }
 
   fn blob_len(&self, id: ObjectKey) -> Result<u64, Unavailable> {
-    Ok(to_u64(self.bytes(id)?.len()))
+    self.bytes_len(id)
   }
 
   fn blob(&self, id: ObjectKey) -> Result<Cow<'_, [u8]>, Unavailable> {
@@ -408,6 +433,24 @@ pub struct WorkBuild {
   layout: Layout,
   /// The builder.
   building: push::Building,
+  /// The repository's file revision the build waits for, read from the node's changeset store between turns
+  /// ([`WorkBuild::ask_waited`]).
+  asked: Option<TextAsk>,
+}
+
+/// A file revision the repository holds whose text the build waits for (A-767 C1: a text an import let go): its rows
+/// asked of the node's changeset store, then its whole text, within the room its turn had.
+struct TextAsk {
+  /// The file's path.
+  path: Vec<u8>,
+  /// The revision's node.
+  node: Node,
+  /// What is asked next.
+  want: Option<crate::render::Want>,
+  /// The most bytes its text may hold.
+  most: u64,
+  /// Its text, once given.
+  text: Option<Vec<u8>>,
 }
 
 /// Begins building the work of `moved` (as [`work`] builds it whole): its base's and its head's trees laid out within
@@ -445,10 +488,46 @@ pub fn begin_work(
       paths: trees.paths,
     },
     building,
+    asked: None,
   })
 }
 
 impl WorkBuild {
+  /// Begins asking the node's changeset store for the file revision the last turn waited for ([`push::Building::waiting`],
+  /// A-767 C1), its text within `most` bytes: whether one was waited for. Its owner answers the ask
+  /// ([`crate::render::StoreWants`]), then takes the text ([`WorkBuild::take_given`]) into its content store before the next
+  /// turn.
+  pub fn ask_waited(&mut self, most: u64) -> bool {
+    let Some(node) = self
+      .building
+      .waiting()
+      .and_then(|id| Node::try_from(id.as_bytes()).ok())
+    else {
+      return false;
+    };
+    let Some(path) = self.layout.paths.get(&node).cloned() else {
+      return false;
+    };
+    self.asked = Some(TextAsk {
+      want: Some(crate::render::Want::Rows {
+        logs: vec![(path.clone(), vec![node])],
+      }),
+      path,
+      node,
+      most,
+      text: None,
+    });
+    true
+  }
+
+  /// The text the store gave for the revision asked ([`WorkBuild::ask_waited`]), taken with its path and node; none when
+  /// the store kept no such revision or gave no text.
+  pub fn take_given(&mut self) -> Option<(Vec<u8>, Node, Vec<u8>)> {
+    let asked = self.asked.take()?;
+    let text = asked.text?;
+    Some((asked.path, asked.node, text))
+  }
+
   /// The pace its turns run under: its owner begins each turn on it.
   pub fn pace(&self) -> &slates_merge::pace::Pace {
     self.building.pace()
@@ -473,5 +552,44 @@ impl WorkBuild {
       paths: trees.paths,
     };
     advanced.map(|built| built.map_err(WorkRefused::Push))
+  }
+}
+
+impl crate::render::StoreWants for WorkBuild {
+  fn wants(&self) -> Option<&crate::render::Want> {
+    self.asked.as_ref().and_then(|asked| asked.want.as_ref())
+  }
+
+  fn give_rows(&mut self, rows: Vec<Vec<Option<crate::render::StoredRevision>>>) {
+    let Some(asked) = self.asked.as_mut() else {
+      return;
+    };
+    asked.want = rows
+      .into_iter()
+      .next()
+      .and_then(|log| log.into_iter().next())
+      .flatten()
+      .map(|row| crate::render::Want::Texts {
+        texts: vec![row.text],
+        most: asked.most,
+      });
+  }
+
+  fn give_chunks(&mut self, _chunks: Vec<Vec<u8>>) {
+    if let Some(asked) = self.asked.as_mut() {
+      asked.want = None;
+    }
+  }
+
+  fn give_texts(&mut self, texts: Vec<Vec<u8>>) {
+    let Some(asked) = self.asked.as_mut() else {
+      return;
+    };
+    asked.want = None;
+    asked.text = texts.into_iter().next();
+  }
+
+  fn reads_bases(&self) -> bool {
+    true
   }
 }
