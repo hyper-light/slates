@@ -27,10 +27,13 @@ jobs:
           toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # A virtualenv at a fixed path, not `pip --user`: the matrix runs with HOME set to its scratch, where a user
+      # install's libraries are not (the first run's every row: "abort: couldn't find mercurial libraries").
       - name: Stock Mercurial 7.2
         run: |
-          python3 -m pip install --disable-pip-version-check --no-input --user "mercurial==7.2"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          python3 -m venv "$RUNNER_TEMP/hgvenv"
+          "$RUNNER_TEMP/hgvenv/bin/pip" install --disable-pip-version-check --no-input "mercurial==7.2"
+          echo "$RUNNER_TEMP/hgvenv/bin" >> "$GITHUB_PATH"
       - name: Build
         run: cargo build --release --locked -p slates-cli --bin slates
       - name: Mercurial's own history (a tag at a time, so a cut transfer is retried small)
@@ -48,7 +51,7 @@ jobs:
           for i in $(seq $(( $(nproc) * 2 ))); do (while :; do :; done) & done
           sleep 20; echo "load with burners $(cat /proc/loadavg)"
           set +e
-          STEP_LIMIT=1500 ci/interop/hg-matrix.sh "$PWD/target/release/slates" "$RUNNER_TEMP/hg-src" "$RUNNER_TEMP/matrix-hg" 2>&1 | tee "$RUNNER_TEMP/matrix-hg.out"
+          HG="$RUNNER_TEMP/hgvenv/bin/hg" STEP_LIMIT=1500 ci/interop/hg-matrix.sh "$PWD/target/release/slates" "$RUNNER_TEMP/hg-src" "$RUNNER_TEMP/matrix-hg" 2>&1 | tee "$RUNNER_TEMP/matrix-hg.out"
           rc=${PIPESTATUS[0]}
           echo "load after $(cat /proc/loadavg)"
           A=$RUNNER_TEMP/matrix-hg/anchor.log
