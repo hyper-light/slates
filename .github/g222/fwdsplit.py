@@ -10,7 +10,8 @@ import sys
 
 COLS = ["queued", "served", "landed", "written", "deferred", "complete", "owner_met", "owner_kick_after",
         "owner_kick_run", "owner_run_start", "owner_work", "origin_met", "origin_kick_after", "origin_kick_run",
-        "origin_run_home", "home_written"]
+        "origin_run_home", "home_written", "placement", "resolve_met", "resolve_kick_after", "resolve_kick_run",
+        "resolve_run_at"]
 AT = {name: at for at, name in enumerate(COLS)}
 
 
@@ -42,42 +43,56 @@ def origin_wait(r):
     return r[AT["origin_kick_after"]] + r[AT["origin_kick_run"]] + r[AT["origin_run_home"]]
 
 
-PARTS = {
+FORWARD = {
     "owner wake (send -> task start)": owner_wait,
     "owner work (start -> reply sent)": lambda r: r[AT["owner_work"]],
     "origin wake (reply sent -> reply task)": origin_wait,
     "origin write (reply task -> written)": lambda r: r[AT["home_written"]],
 }
+ACCEPTED = {
+    "owner wake (send -> task start)": owner_wait,
+    "owner work (start -> acceptance wait)": lambda r: r[AT["owner_work"]],
+    "placement (wait -> resolved)": lambda r: r[AT["placement"]],
+    "origin wake (resolved -> reply task)": origin_wait,
+    "origin write (reply task -> written)": lambda r: r[AT["home_written"]],
+}
+SIDES = {"owner": ("owner_met", "owner_kick_after", "owner_kick_run", "owner_run_start"),
+         "origin": ("origin_met", "origin_kick_after", "origin_kick_run", "origin_run_home"),
+         "owner at resolution": ("resolve_met", "resolve_kick_after", "resolve_kick_run", "resolve_run_at")}
 
 ring = [r for r in rows(sys.argv[1] + ".ring") if len(r) >= len(COLS)]
-deferred = sorted((r for r in ring if r[AT["deferred"]] == 1), key=lambda r: r[AT["served"]])
-whole = [r for r in deferred if r[AT["complete"]] == 1]
-print(f"forwards: deferred n {len(deferred)}, stamped whole {len(whole)}")
-if not whole:
-    sys.exit(0)
-served = [r[AT["served"]] for r in whole]
-print(f"  served p50/p99/p999/max us {us(pc(served, .5))} {us(pc(served, .99))} {us(pc(served, .999))} {us(served[-1])}")
-for name, part in PARTS.items():
-    values = sorted(part(r) for r in whole)
-    print(f"  {name} p50/p99/p999 us {us(pc(values, .5))} {us(pc(values, .99))} {us(pc(values, .999))}")
-n = len(whole)
-for label, tail in (("p99 tail", whole[int(n * .99):]), ("p999 tail", whole[int(n * .999):]),
-                    ("body (p50 and below)", whole[: n // 2])):
-    if not tail:
+deferred = [r for r in ring if r[AT["deferred"]] == 1]
+print(f"deferred n {len(deferred)}: forwards {sum(1 for r in deferred if r[AT['complete']] == 1)}, accepted submits "
+      f"{sum(1 for r in deferred if r[AT['complete']] == 2)}, unstamped {sum(1 for r in deferred if r[AT['complete']] == 0)}")
+for kind, flag, parts in (("forwards", 1, FORWARD), ("accepted submits", 2, ACCEPTED)):
+    whole = sorted((r for r in deferred if r[AT["complete"]] == flag), key=lambda r: r[AT["served"]])
+    if not whole:
         continue
-    dominant = {}
-    for r in tail:
-        name = max(PARTS, key=lambda part: PARTS[part](r))
-        dominant[name] = dominant.get(name, 0) + 1
-    print(f"  {label}: n {len(tail)}, served med {us(med([r[AT['served']] for r in tail]))} us; dominant {dominant}")
-    print("    medians us " + "; ".join(f"{name} {us(med([part(r) for r in tail]))}" for name, part in PARTS.items()))
-    for side in ("owner", "origin"):
-        met = {0: 0, 1: 0, 2: 0}
+    served = [r[AT["served"]] for r in whole]
+    print(f" {kind}: n {len(whole)} served p50/p99/p999/max us {us(pc(served, .5))} {us(pc(served, .99))} "
+          f"{us(pc(served, .999))} {us(served[-1])}")
+    for name, part in parts.items():
+        values = sorted(part(r) for r in whole)
+        print(f"   {name} p50/p99/p999 us {us(pc(values, .5))} {us(pc(values, .99))} {us(pc(values, .999))}")
+    n = len(whole)
+    for label, tail in (("p99 tail", whole[int(n * .99):]), ("p999 tail", whole[int(n * .999):]),
+                        ("body (p50 and below)", whole[: n // 2])):
+        if not tail:
+            continue
+        dominant = {}
         for r in tail:
-            met[r[AT[side + "_met"]]] = met.get(r[AT[side + "_met"]], 0) + 1
-        kicked = [r for r in tail if r[AT[side + "_met"]] == 1]
-        print(f"    {side} met: running {met[0]} kicked {met[1]} woken otherwise {met[2]}; kicked: kick lateness med "
-              f"{us(med([r[AT[side + '_kick_after']] for r in kicked]))} kick->run med "
-              f"{us(med([r[AT[side + '_kick_run']] for r in kicked]))} max "
-              f"{us(max([r[AT[side + '_kick_run']] for r in kicked], default=0))} run->stamp med "
-              f"{us(med([r[AT[side + '_run_start' if side == 'owner' else side + '_run_home']] for r in kicked]))} us")
+            name = max(parts, key=lambda part: parts[part](r))
+            dominant[name] = dominant.get(name, 0) + 1
+        print(f"   {label}: n {len(tail)}, served med {us(med([r[AT['served']] for r in tail]))} us; dominant {dominant}")
+        print("     medians us " + "; ".join(f"{name} {us(med([part(r) for r in tail]))}" for name, part in parts.items()))
+        for side, (met_at, late_at, run_at, after_at) in SIDES.items():
+            if side == "owner at resolution" and flag != 2:
+                continue
+            met = {0: 0, 1: 0, 2: 0}
+            for r in tail:
+                met[r[AT[met_at]]] = met.get(r[AT[met_at]], 0) + 1
+            kicked = [r for r in tail if r[AT[met_at]] == 1]
+            print(f"     {side} met: running {met[0]} kicked {met[1]} woken otherwise {met[2]}; kicked: kick lateness med "
+                  f"{us(med([r[AT[late_at]] for r in kicked]))} kick->run med {us(med([r[AT[run_at]] for r in kicked]))} "
+                  f"max {us(max([r[AT[run_at]] for r in kicked], default=0))} run->stamp med "
+                  f"{us(med([r[AT[after_at]] for r in kicked]))} us")

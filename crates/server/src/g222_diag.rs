@@ -149,6 +149,11 @@ struct Fwd {
   replied: u64,
   home: u64,
   origin_woke: [u64; 3],
+  /// A submit's reply deferred to its version's acceptance (AUD-11): when it began waiting, on the owner.
+  waiting: u64,
+  /// When its version was placed and the reply resolved, on the owner, with the owner's last park then.
+  resolved: u64,
+  resolve_woke: [u64; 3],
 }
 static FWD: std::sync::Mutex<Option<std::collections::HashMap<u64, Fwd>>> =
   std::sync::Mutex::new(None);
@@ -157,7 +162,10 @@ const FWD_CAP: usize = 100_000;
 /// A forward's split: complete (1, or 0 for a forward some stamp missed, all zero), then for the owner how it met its
 /// message ([`side`]: met, kick lateness after the send, kick -> run, run -> stamp), the owner's work (started -> reply
 /// sent), the same four for the origin and its reply, and the origin's reply task to the reply written.
-const FWD_COLS: usize = 11;
+/// Then, for a submit answered at its version's acceptance (`complete` 2, where the owner's work runs to the wait's
+/// start and the origin's side is measured from the resolution): the wait for placement (waiting -> resolved), and how
+/// the owner met the placement's arrival ([`side`] from the wait's start).
+const FWD_COLS: usize = 16;
 
 fn fwd(request: u64, change: impl FnOnce(&mut Fwd)) {
   if let Ok(mut guard) = FWD.lock() {
@@ -209,6 +217,22 @@ pub fn fwd_home(request: u64) {
   });
 }
 
+/// On the owner, as a submit's reply begins waiting for its version's acceptance.
+pub fn acc_waiting(request: u64) {
+  let at = now_mono();
+  fwd(request, |f| f.waiting = at);
+}
+
+/// On the owner, as a submit's version is placed and its reply resolved.
+pub fn acc_resolved(request: u64) {
+  let at = now_mono();
+  let woke = last_here();
+  fwd(request, |f| {
+    f.resolved = at;
+    f.resolve_woke = woke;
+  });
+}
+
 /// The split of request `request`'s forward, its reply written at `written`; taken out of the table.
 fn fwd_split(request: u64, written: u64) -> [u64; FWD_COLS] {
   let Some(f) = FWD
@@ -218,17 +242,24 @@ fn fwd_split(request: u64, written: u64) -> [u64; FWD_COLS] {
   else {
     return [0; FWD_COLS];
   };
-  if f.sent == 0 || f.started == 0 || f.replied == 0 || f.home == 0 {
+  let accepted = f.replied == 0 && f.waiting != 0 && f.resolved != 0;
+  if f.sent == 0 || f.started == 0 || f.home == 0 || (f.replied == 0 && !accepted) {
     return [0; FWD_COLS];
   }
+  let sent_home = if accepted { f.resolved } else { f.replied };
+  let worked_to = if accepted { f.waiting } else { f.replied };
   let owner = side(f.sent, f.started, f.owner_woke);
-  let origin = side(f.replied, f.home, f.origin_woke);
+  let origin = side(sent_home, f.home, f.origin_woke);
   let mut out = [0; FWD_COLS];
-  out[0] = 1;
+  out[0] = if accepted { 2 } else { 1 };
   out[1..5].copy_from_slice(&owner);
-  out[5] = f.replied.saturating_sub(f.started);
+  out[5] = worked_to.saturating_sub(f.started);
   out[6..10].copy_from_slice(&origin);
   out[10] = written.saturating_sub(f.home);
+  if accepted {
+    out[11] = f.resolved.saturating_sub(f.waiting);
+    out[12..16].copy_from_slice(&side(f.waiting, f.resolved, f.resolve_woke));
+  }
   out
 }
 static RING_TAKEN: AtomicUsize = AtomicUsize::new(0);
@@ -290,7 +321,7 @@ pub fn dump_ring(path: &str) {
   use std::io::Write;
   let n = RING_TAKEN.load(Relaxed).min(RING_CAP);
   let mut out = format!(
-    "# client sends {} rings {}\nqueued\tserved\tlanded\twritten\tdeferred\tcomplete\towner_met\towner_kick_after\towner_kick_run\towner_run_start\towner_work\torigin_met\torigin_kick_after\torigin_kick_run\torigin_run_home\thome_written\n",
+    "# client sends {} rings {}\nqueued\tserved\tlanded\twritten\tdeferred\tcomplete\towner_met\towner_kick_after\towner_kick_run\towner_run_start\towner_work\torigin_met\torigin_kick_after\torigin_kick_run\torigin_run_home\thome_written\tplacement\tresolve_met\tresolve_kick_after\tresolve_kick_run\tresolve_run_at\n",
     slates_ipc::endpoint::G222_SENDS.swap(0, Relaxed),
     slates_ipc::endpoint::G222_RINGS.swap(0, Relaxed)
   );

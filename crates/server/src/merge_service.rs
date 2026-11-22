@@ -4382,6 +4382,9 @@ pub(crate) fn defer_acceptance(state: &mut ShardState, green: DbVolumeId, versio
   };
   let object = ObjectId(green.bytes);
   let route = state.reply_route.take();
+  if let Some(route) = route.as_ref() {
+    crate::g222_diag::acc_waiting(route.request);
+  }
   state
     .merge
     .awaiting
@@ -4626,7 +4629,9 @@ fn resolve_accepted(state: &mut ShardState, object: ObjectId, placed: u64) {
         continue;
       };
       let (origin, id) = (entry.origin, entry.id);
+      crate::g222_diag::acc_resolved(route.request);
       if crate::xshard::hand_reply_home(route.shard, move || {
+        crate::g222_diag::fwd_home(route.request);
         if route.through_work {
           let _ = crate::state::with_state_counted(|s| {
             crate::work_home::answered_late(s, origin, id, recorded);
