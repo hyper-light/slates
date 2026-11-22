@@ -14,8 +14,15 @@ env:
 
 jobs:
   hg-matrix-loaded:
-    name: hg matrix, loaded (ubuntu-latest)
-    runs-on: ubuntu-latest
+    name: hg matrix, loaded (${{ matrix.runner }}, run ${{ matrix.run }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest, run: 1 }
+          - { runner: ubuntu-latest, run: 2 }
+          - { runner: ubuntu-24.04-arm, run: 1 }
     timeout-minutes: 300
     defaults:
       run:
@@ -51,19 +58,20 @@ jobs:
           for i in $(seq $(( $(nproc) * 2 ))); do (while :; do :; done) & done
           sleep 20; echo "load with burners $(cat /proc/loadavg)"
           set +e
-          PUSH_CHUNK=2000 HG="$RUNNER_TEMP/hgvenv/bin/hg" STEP_LIMIT=2400 ci/interop/hg-matrix.sh "$PWD/target/release/slates" "$RUNNER_TEMP/hg-src" "$RUNNER_TEMP/matrix-hg" 2>&1 | tee "$RUNNER_TEMP/matrix-hg.out"
+          PUSH_CHUNK=500 HG="$RUNNER_TEMP/hgvenv/bin/hg" STEP_LIMIT=2400 ci/interop/hg-matrix.sh "$PWD/target/release/slates" "$RUNNER_TEMP/hg-src" "$RUNNER_TEMP/matrix-hg" 2>&1 | tee "$RUNNER_TEMP/matrix-hg.out"
           rc=${PIPESTATUS[0]}
           echo "load after $(cat /proc/loadavg)"
           A=$RUNNER_TEMP/matrix-hg/anchor.log
           echo "spins $(grep -cE 'is spinning' $A); kills $(grep -cE 'killing it' $A); restarts $(grep -cE 'daemon exited' $A)"
           grep -E 'is spinning|killing it' $A | cut -c1-300
-          echo "== DIAG lines"; grep 'DIAG hg-http' $A | cut -c1-300 | sort -t= -k3 | tail -60
+          echo "== DIAG turns, by cpu"; grep 'DIAG hg-http turn' $A | sed 's/.*turn //' | sort -t= -k3 -n -r | head -20 || true
+          echo "== DIAG begins over 10 ms cpu"; grep 'DIAG hg-http begin' $A | awk '{for(i=1;i<=NF;i++) if($i ~ /^cpu_us=/){split($i,a,"="); if (a[2] > 10000) print}}' | cut -c1-260 || true
           exit $rc
       - name: Keep the logs
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
-          name: hg-matrix-loaded-logs
+          name: hg-matrix-loaded-logs-${{ matrix.runner }}-${{ matrix.run }}
           path: |
             ${{ runner.temp }}/matrix-hg.out
             ${{ runner.temp }}/matrix-hg/anchor.log
