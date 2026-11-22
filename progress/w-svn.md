@@ -563,3 +563,11 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
   stores (`vcs_store::recover`, ~19300). `bring_whole` needs only `vcs_disk` and a content store, not the svn records,
   so the pre-pass goes in `rebuild_record`'s Green arm for an svn green: make the content store, then bring back.
   Verify `content_made` can run there.
+- 39c2b8b07 landed A-865, A-760's pieces (a)+(b) for the svn landing.
+  - Increments name their stored texts; entries record names.
+  - Recovery's pre-pass (`svn_texts::bring_back_named`) brings back what the content store lacks.
+  - Sampled 130.8 MB to 108.0 MB.
+  - Reds: 5,000 bytes inline before; the kill-between-slices successor fenced ContentMissing before; region holds are
+    kept on the early store.
+- r21 (main): 3c1c8b504 (w-shared's gauges) raised the footprint not given back. w-shared is fixing it.
+- Next: the append's `judge_named`, its own landing, with w-git and w-hg told first; then piece (c).
