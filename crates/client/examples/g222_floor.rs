@@ -35,7 +35,9 @@ fn main() {
         }
       });
     }
-    let tb = std::env::var("G222_FLOOR_TB").ok().and_then(|v| v.parse::<u64>().ok());
+    let tb = std::env::var("G222_FLOOR_TB")
+      .ok()
+      .and_then(|v| v.parse::<u64>().ok());
     if let Some(window) = tb {
       let _ = slates_machine::time_constraint::set_current_from(window);
     }

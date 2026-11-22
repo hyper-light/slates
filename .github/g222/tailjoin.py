@@ -93,13 +93,26 @@ def split(r, window):
     return hi - lo, in_polls, in_parks, rest, dominant, parks
 
 
-total = sorted(ring, key=lambda r: r[0] + r[1])
+timed = set()
+try:
+    for line in open(base + ".timed"):
+        if line[:1].isdigit():
+            client, edit, submit = (int(v) for v in line.split("\t")[:3])
+            timed.add((client, edit))
+            timed.add((client, submit))
+except OSError:
+    pass
+# Only the bench's timed requests (its edits and submits), when the bench says which: its untimed housekeeping
+# between runs (destroys, creates, span drains) is not what its percentiles measure.
+ranked = [r for r in ring if (r[-3], r[-2]) in timed] if timed else ring
+print(f"timed requests {len(ranked)} of {len(ring)} rows")
+total = sorted(ranked, key=lambda r: r[0] + r[1])
 n = len(total)
 all_serves = [serve for serves in by_shard_serves.values() for serve in serves]
 serve_verbs = {}
 for serve in all_serves:
-    count, total = serve_verbs.get(serve[3], (0, 0))
-    serve_verbs[serve[3]] = (count + 1, total + serve[2])
+    seen, spent = serve_verbs.get(serve[3], (0, 0))
+    serve_verbs[serve[3]] = (seen + 1, spent + serve[2])
 print("long serves (>= 200 us) by verb: " + "; ".join(f"{verb} n {count} total {us(total)} us max "
       f"{us(max(s[2] for s in all_serves if s[3] == verb))} us" for verb, (count, total) in
       sorted(serve_verbs.items(), key=lambda item: -item[1][1])[:8]))
@@ -129,6 +142,20 @@ for label, low in (("p99 tail", .99), ("p999 tail", .999)):
               f"in parks {us(med([p[2] for p in parts]))}, short work {us(med([p[3] for p in parts]))}")
         for cause, count in sorted(causes.items(), key=lambda item: -item[1])[:6]:
             print(f"     {count:4} {cause}")
+        if window == "queued":
+            # A request that landed while its shard was parked: how that park ended, and how long after the landing.
+            met = {"kicked": [], "timer or other": [], "untimed": [], "found pending": [], "not parked": []}
+            for r in tail:
+                landed, shard = r[2], r[-1]
+                holding = [park for _, park in overlap(by_shard_parks.get(shard, []), landed, landed + 1)]
+                if not holding:
+                    met["not parked"].append(0)
+                    continue
+                park = holding[0]
+                name = {1: "kicked", 0: "timer or other", 2: "untimed", 3: "found pending"}.get(park[2], "timer or other")
+                met[name].append(park[1] - landed)
+            print("     shard at landing: " + "; ".join(f"{name} {len(waits)} (then ran after med {us(med(waits))} us)"
+                                                   for name, waits in met.items() if waits))
         verbs = {}
         for r in tail:
             queued, served, landed, written, shard = r[0], r[1], r[2], r[3], r[-1]

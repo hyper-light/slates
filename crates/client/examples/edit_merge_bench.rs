@@ -652,6 +652,15 @@ fn measure(
         std::thread::park_timeout(*pause);
       }
       let sample = fixture.sample(form, n % files);
+      if let Ok(mut timed) = G222_TIMED.lock() {
+        timed.push((
+          fixture.client.last_request().client,
+          sample.edit_request,
+          sample.submit_request,
+          sample.edit,
+          sample.submit,
+        ));
+      }
       edits.push(sample.edit);
       submits.push(sample.submit);
       totals.push(sample.edit.saturating_add(sample.submit));
@@ -963,6 +972,11 @@ fn sweep(instance: &str, load: &str, selection: &Selection) {
   }
 }
 
+/// Diagnostic only (w-perf 84a): every timed sample's client, edit and submit sequences, and its edit and submit ns.
+#[allow(clippy::disallowed_types)]
+static G222_TIMED: std::sync::Mutex<Vec<(u32, u32, u32, u64, u64)>> =
+  std::sync::Mutex::new(Vec::new());
+
 struct G222Dump;
 impl Drop for G222Dump {
   fn drop(&mut self) {
@@ -971,6 +985,15 @@ impl Drop for G222Dump {
       slates_server::g222_diag::dump_ring(&format!("{path}.ring"));
       slates_server::g222_diag::dump_parks(&format!("{path}.parks"));
       slates_server::g222_diag::dump_polls(&format!("{path}.polls"));
+      if let Ok(mut timed) = G222_TIMED.lock() {
+        let mut out = String::from("client\tedit\tsubmit\tedit_ns\tsubmit_ns\n");
+        for (client, edit, submit, edit_ns, submit_ns) in timed.drain(..) {
+          out.push_str(&format!(
+            "{client}\t{edit}\t{submit}\t{edit_ns}\t{submit_ns}\n"
+          ));
+        }
+        let _ = std::fs::write(format!("{path}.timed"), out);
+      }
       slates_ipc::endpoint::g222_dump_client(&format!("{path}.client"));
       slates_ipc::endpoint::g222_dump_cparks(&format!("{path}.cparks"));
     }

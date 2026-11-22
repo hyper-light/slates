@@ -134,7 +134,7 @@ pub fn dump(path: &str) {
 // Ring split: for every request a shard takes, (landed → taken, taken → reply written), ns.
 const RING_CAP: usize = 300_000;
 /// The ring row's columns: queued, served, landed, written, deferred, then a forward's split (w-perf 84a, [`FWD_COLS`]).
-const RING_COLS: usize = 5 + FWD_COLS + 1;
+const RING_COLS: usize = 5 + FWD_COLS + 3;
 static RING: [[AtomicU64; RING_COLS]; RING_CAP] =
   [const { [const { AtomicU64::new(0) }; RING_COLS] }; RING_CAP];
 
@@ -538,7 +538,7 @@ pub fn deferred_written(request: u64) {
   if let Some((landed, taken)) = TAKES.with(|t| t.borrow_mut().remove(&request)) {
     let written = now_mono();
     let split = fwd_split(request, written);
-    ring_row_split(landed, taken, written, 1, split);
+    ring_row_split(landed, taken, written, 1, split, request);
   }
 }
 
@@ -546,15 +546,18 @@ fn now_mono() -> u64 {
   slates_machine::clock::monotonic_ns()
 }
 
-pub fn ring(landed: u64, taken: u64, written: u64) {
-  ring_row(landed, taken, written, 0);
+pub fn ring(landed: u64, taken: u64, written: u64, request: u64) {
+  ring_row_split(landed, taken, written, 0, [0; FWD_COLS], request);
 }
 
-fn ring_row(landed: u64, taken: u64, written: u64, deferred: u64) {
-  ring_row_split(landed, taken, written, deferred, [0; FWD_COLS]);
-}
-
-fn ring_row_split(landed: u64, taken: u64, written: u64, deferred: u64, split: [u64; FWD_COLS]) {
+fn ring_row_split(
+  landed: u64,
+  taken: u64,
+  written: u64,
+  deferred: u64,
+  split: [u64; FWD_COLS],
+  request: u64,
+) {
   let n = RING_TAKEN.fetch_add(1, Relaxed);
   if n < RING_CAP {
     for (slot, value) in RING[n][5..].iter().zip(split) {
@@ -565,7 +568,10 @@ fn ring_row_split(landed: u64, taken: u64, written: u64, deferred: u64, split: [
     RING[n][2].store(landed, Relaxed);
     RING[n][3].store(written, Relaxed);
     RING[n][4].store(deferred, Relaxed);
-    // w-perf 84a: the shard the row was written on (the request's taking shard), the last column.
+    // w-perf 84a: the request's client and sequence, then the shard the row was written on (its taking shard), last.
+    let id = slates_wire::request::RequestId::from_word(request);
+    RING[n][RING_COLS - 3].store(u64::from(id.client), Relaxed);
+    RING[n][RING_COLS - 2].store(u64::from(id.sequence), Relaxed);
     RING[n][RING_COLS - 1].store(
       slates_rt::registry::current_shard().map_or(u64::MAX, u64::from),
       Relaxed,

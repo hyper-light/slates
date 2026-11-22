@@ -19026,7 +19026,12 @@ fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, 
           // Written synchronously: the span ends at the reply written.
           let written_ns = state.clock.monotonic_ns();
           if let Some(landed) = g222_landed {
-            crate::g222_diag::ring(landed, g222_taken, slates_machine::clock::monotonic_ns());
+            crate::g222_diag::ring(
+              landed,
+              g222_taken,
+              slates_machine::clock::monotonic_ns(),
+              request.request,
+            );
           }
           let label = u32::from(state.partition);
           crate::telemetry::emit(state, ring.end(label, written_ns));
