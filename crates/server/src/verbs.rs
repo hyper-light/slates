@@ -3047,7 +3047,8 @@ pub(crate) fn route_gated(
     | RequestBody::SetRepositoryPolicy { repository, .. }
     | RequestBody::ImportRepository { repository, .. }
     | RequestBody::DescribeRepositoryPolicy { repository }
-    | RequestBody::ExportDump { repository, .. } => {
+    | RequestBody::ExportDump { repository, .. }
+    | RequestBody::DestroyRepository { repository } => {
       Some(owner_of_name(repository, state.shards.len()))
     }
     // A work lives on the shard that serves its creation, its client's own (A-400): its edits and its submits are read
@@ -5910,6 +5911,9 @@ fn dispatch_inner(
     } => crate::repository::bind_branch(state, principal, (&repository, &name), green),
     RequestBody::RetireBranch { repository, name } => {
       crate::repository::retire_branch(state, principal, (&repository, &name))
+    }
+    RequestBody::DestroyRepository { repository } => {
+      crate::repository::destroy_repository(state, principal, &repository)
     }
     RequestBody::SetRepositoryPolicy {
       repository,
