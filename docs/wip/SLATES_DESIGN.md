@@ -60410,7 +60410,8 @@ Applied in the same change to:
   module docs "Texts".
 - `crates/svn/src/migration/standalone.rs` (pieces 1 and 2, 41ce54f67 and e465b0e0c): `Standalone`, records with their
   texts held apart by identity, the crate's tests, integration tests and benches on it; `Repository::take_texts`.
-- `crates/svn/src/fsfs.rs`: `TextDeltas` answers none for the records; docs.
+- `crates/svn/src/fsfs.rs`: the `DELTA` writer and its `TextDeltas` seam removed (main 01a20182, 21:35); every text
+  `PLAIN`. `crates/server/src/vcs_store/svn_presenter.rs`: `PresentRefusal::DeltaPiece` removed.
 - `crates/svn/src/commit/revision.rs`: `StepRefusal::Corrupt`'s doc names an inline text.
 - `crates/server/src/vcs_store.rs` (`replay_step` without a row count), `vcs_store/svn_texts.rs` (`HeadTexts`' docs),
   `repository/svn_commit.rs` (`take_texts` delegates), and the vcs_ssh and presenter tests (piece 2).
@@ -60423,9 +60424,9 @@ Applied in the same change to:
   step, held apart by identity, the records naming each stored by its length. The records' own keeping is gone. A
   revision that carries a text inline is refused `Corrupt`, `SVN_ERR_FS_CORRUPT` (`E160004`), the refusal for a text
   the records do not hold. The FSFS view over records holding no delta writes every text `PLAIN`, as the presenter's
-  view already did. Its `DELTA` writer stays behind `TextDeltas`, with no source answering one: whether to remove it,
-  or feed it per-file deltas derived from the changeset log (Ada's ruling of 2026-11-20 ~13:35), is main's call
-  (GAPS).
+  view already did. Its `DELTA` writer, with no source answering one, is removed by main 01a20182's ruling of 21:35
+  PST (`fsfs::TextDeltas`, `StoredDelta`, `FilePiece::Delta`, the presenter's `DeltaPiece` refusal): under the changeset
+  ruling (Ada's of 2026-11-20 ~13:35) a per-file delta is derived data, built when a measured item needs one.
 - **Evidence.**
   - `a_text_carried_inline_is_refused_and_records_standing_alone_hold_it_apart` (red before: bare records kept the
     text).
@@ -60434,3 +60435,30 @@ Applied in the same change to:
   - slates-server `--lib svn` 113/113 (2 ignored), its `svn_texts` fixture taking its other texts out as a landing does.
   - The ignored git-2000 measurement now prints `records_stored_text_bytes` where it printed `records_text_bytes`.
   - The stock `svnadmin`/`svnlook` reading of the all-`PLAIN` view is main's run, since there is no svn on the Mac.
+
+### A-848 — The content pool grows an arena by what a claim needs (2026-11-21, w-sizing; main 01a1ff2e 17:20 and 01a20182 21:35, goal 93; Ada's MEMORY SIZING rule; A-98, A-789)
+Applied in the same change to: `crates/server/src/content_pool.rs` (`arena_parts`, `ContentPool::best_fit`, `claim`,
+the module docs, tests), `crates/mem/src/arena.rs` (`ExtentSource::claim(want)`, `ChunkArena::grow` passes what it
+still lacks), `crates/anchor/src/layout.rs` (`LAYOUT_VERSION` 17, `POOL_EXTENTS_PER_PARTITION`'s doc),
+`crates/server/src/config.rs` (`held_extent_bound`'s doc), GAPS.
+
+Status: built 2026-11-21, every platform (the cut and the claim are platform-free).
+- Why: a slice's arena range was cut into its binary parts, largest first, and a claim took the first free one, so any
+  first lend past a shard's free room took its slice's largest extent. On Studio-4 (g227) a push seal's 18,564-byte turn
+  grew the arena by 8,589,934,592 bytes of a 12.87 GB pool, and w-hg's merge took extent after extent until the other
+  shard's pushes were refused `PastAdmission { left: 0 }`.
+- Rule: a slice is cut into a run doubling from one pool unit (1, 1, 2, 4, ... units, each as long as all before it),
+  then what the run leaves in power-of-two parts, largest first. Every part is still a power-of-two number of units (a
+  buddy region's need) and the lengths still divide one another (the pressure hold's greedy stays optimal). A claim
+  is told what the arena still lacks and takes the smallest free part that covers it, else the largest; equal lengths
+  go to the claimer's own slice first. An arena so grows by its need rounded up to a power of two of units, and
+  doubles while claims keep coming.
+- An extent id now names another range of the content object, so the layout version is 17 and an older segment is
+  refused, never misread. A slice holds about two parts per bit of its length in units, at most
+  `POOL_EXTENTS_PER_PARTITION` (64).
+- Measured (Studio-4, debug, `cargo test -p slates-server --lib content_pool::tests`; unit 262,144 bytes, slice arena
+  12,884,901,888): an 18,564-byte lend, which the budget lacked as 10,504,324 bytes with the operation headroom, grew the
+  arena by 8,589,934,592 bytes before and by 16,777,216 after (64 units, the need rounded up to a power of two); two
+  shards lending in turn grew 4,294,967,296 bytes on the first turn before, and every turn within that bound after.
+- Not in this change: the share cap (GAPS, ruled 21:35): best fit does not stop a lend of a whole `admittable()` from
+  taking the pool.

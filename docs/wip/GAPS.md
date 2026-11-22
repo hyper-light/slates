@@ -356,6 +356,16 @@
 >   parts of a partition's slice), so the first lend past a shard's free capacity takes an extent of up to 8 GiB of
 >   a 12.9 GB pool, however few bytes it needs. w-hg's merge, lent `admittable()`, took extent after extent until
 >   the pool was gone.
+>   **FIXED by A-848 (w-sizing, 2026-11-21; main 01a1ff2e 17:20, 01a20182 21:35):** a slice is cut into a run doubling
+>   from one pool unit, then the rest's binary parts, and a claim takes the smallest free part covering what the arena
+>   lacks (`ExtentSource::claim(want)`, `ContentPool::best_fit`). Red then green on Studio-4 (debug, unit 262,144
+>   bytes, slice arena 12,884,901,888): an 18,564-byte lend past a shard's free room, which its budget lacked as
+>   10,504,324 bytes with the operation headroom, grew its arena by 8,589,934,592 bytes before and by 16,777,216 after
+>   (the need rounded up to a power of two of units); two shards lending small rooms in turn, 8 turns each, grew
+>   4,294,967,296 bytes on the first turn before, and within that bound every turn after, every ask admitted
+>   (`content_pool::tests`). Layout version 17. **OPEN, ruled (main 01a20182 21:35): the share cap.** Best fit does not
+>   stop a lend of a whole `admittable()` from taking the pool. A shard refused room posts a bounded, typed want, and
+>   every shard above its learned demand gives back at its next turn while one is posted; red first on g227's case.
 
 > **Goal 93 perf, hg serve (2026-11-21, w-perf; main's order 00:22 and ruling 01:05).** Found by a profile of a
 > one-changeset pull of Mercurial's history (24.95 s) and a stream clone (288 s): (1) every lookup in a
@@ -3187,9 +3197,10 @@
 > them writes every text `PLAIN`, as the presenter's does (the stock `svnadmin` reading of it is main's run: no svn on
 > the Mac); `changeset_ab` reads the records' own deltas and waits on main's call (retire, or derive its deltas);
 > (3) BUILT 2026-11-21, A-842: the records keep no text, a text carried inline refused `Corrupt`, `changeset_ab`
-> retired (its numbers stand in BENCHMARKS at b51f908f2). Owed: the FSFS view's `DELTA` writer has no source now
-> (`fsfs::TextDeltas` answers none everywhere): removed, or fed per-file deltas derived from the changeset log (Ada's
-> ruling of 2026-11-20 ~13:35), main's call; and the stock `svnadmin` reading of the all-`PLAIN` view, main's run).
+> retired (its numbers stand in BENCHMARKS at b51f908f2). The FSFS view's `DELTA` writer, left with no source,
+> REMOVED by main 01a20182's ruling of 21:35 (`fsfs::TextDeltas`, `StoredDelta`, `FilePiece::Delta` and the presenter's
+> `DeltaPiece` refusal gone): under the changeset ruling a per-file delta is derived when a measured item needs one.
+> Owed: the stock `svnadmin` reading of the all-`PLAIN` view, main's run on the big Studio).
 > Stage C,
 > an import as one sliced changeset (today a changeset a record). A submitted version's revision (`svn_made`) takes the
 > one landing order since A-804 (2026-11-21, w-rewrite-ops; main 01:52, the deferred-submit hook, `crate::made_commit`):

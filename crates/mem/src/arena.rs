@@ -100,7 +100,9 @@ fn scrub(region: &mut Region, offset: usize, len: usize) {
 /// to one arena at a time under a stable id.
 pub trait ExtentSource: Send {
   /// One more extent for this arena, with the id its blocks are named by, or `None` when the pool has none free.
-  fn claim(&mut self) -> Option<(u16, Region)>;
+  /// `want` is the bytes the arena still lacks (A-848): a source holding extents of several lengths hands out the
+  /// smallest that covers it, else its largest, so an arena grows by what its admissions need.
+  fn claim(&mut self, want: usize) -> Option<(u16, Region)>;
   /// Returns extent `id`, wholly free, to the pool.
   fn release(&mut self, id: u16, region: Region);
   /// Claims the pool took but could not hand out (the OS refused to map the extent), so far: a claim refused this
@@ -328,7 +330,8 @@ impl ChunkArena {
   pub fn grow(&mut self, bytes: usize) -> usize {
     let mut added = 0usize;
     while added < bytes {
-      let Some((id, region)) = self.source.as_mut().and_then(|source| source.claim()) else {
+      let want = bytes.saturating_sub(added);
+      let Some((id, region)) = self.source.as_mut().and_then(|source| source.claim(want)) else {
         break;
       };
       let before = self.capacity();
@@ -1528,7 +1531,7 @@ mod tests {
   }
 
   impl ExtentSource for TestPool {
-    fn claim(&mut self) -> Option<(u16, Region)> {
+    fn claim(&mut self, _want: usize) -> Option<(u16, Region)> {
       self.free.pop()
     }
     fn release(&mut self, id: u16, region: Region) {
@@ -1611,8 +1614,8 @@ mod tests {
   }
 
   impl ExtentSource for RacedPool {
-    fn claim(&mut self) -> Option<(u16, Region)> {
-      self.pool.claim()
+    fn claim(&mut self, want: usize) -> Option<(u16, Region)> {
+      self.pool.claim(want)
     }
     fn release(&mut self, id: u16, region: Region) {
       self.pool.release(id, region);
