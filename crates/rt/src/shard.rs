@@ -385,6 +385,11 @@ pub struct ShardContext {
   /// with it, so neither the queue nor the control channel shows them, yet each waits on this poll.
   batch_left: Cell<usize>,
   fixed_spin_ns: u64,
+  /// Whether the shard's thread holds Linux's round-robin real-time class (`slates_machine::round_robin`, 84a's Linux
+  /// half): then it never spins idle. It parks at once when it has no work, its idle window none and its closed-loop
+  /// holds declined, since a spinning real-time thread takes its CPU from every time-share task and meets the kernel's
+  /// real-time throttling.
+  parks_at_once: bool,
   /// Whether the driver's clock is real time: the simulation's is not the kicker's clock nor the thread's
   /// CPU clock, so a simulated shard neither measures its wakes nor judges polls by CPU time (it stays
   /// deterministic).
@@ -588,6 +593,7 @@ impl ShardContext {
       poll_allowed_until_ns: Cell::new(0),
       batch_left: Cell::new(0),
       fixed_spin_ns: config.spin_ns,
+      parks_at_once: slates_machine::round_robin::holds() == Some(true),
       real_time: driver.kind() != DriverKind::Simulation,
       attribution: Cell::new(Tracker::default()),
       entry: registry::entry(seed.id),
@@ -704,7 +710,8 @@ impl ShardContext {
     let now = self.now_ns();
     self.activity_ns.set(Some(now));
     let met_turn = self.held_turn.get().and_then(|turns| turns.met_ns());
-    if !hold_pays(met_turn, self.wake_cost_ns()) {
+    // A real-time shard never spins idle (`parks_at_once`): its hold is declined, counted, as an unpaid one is.
+    if self.parks_at_once || !hold_pays(met_turn, self.wake_cost_ns()) {
       self
         .idle_holds_declined
         .set(self.idle_holds_declined.get().saturating_add(1));
@@ -1779,6 +1786,10 @@ impl ShardContext {
   /// provisioning floor alone (ratio 0, `slates_server::config::NO_ESTIMATE_MULTIPLE`), under its watchdog's window
   /// (`slates_server::config::IDLE_SPIN_CEILING`). The configured spin while the shard tracks none.
   pub fn idle_window_ns(&self) -> u64 {
+    // A real-time shard parks at once when idle (`parks_at_once`).
+    if self.parks_at_once {
+      return 0;
+    }
     self.wake.get().map_or(self.fixed_spin_ns, |estimate| {
       estimate
         .mean_ns()

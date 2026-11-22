@@ -588,6 +588,9 @@ impl Runtime {
       // A latency-tracking runtime's shard runs in macOS's real-time band (A-831, `slates_machine::time_constraint`):
       // woken behind busy time-share neighbours it ran only when their quanta ended (84a: a loaded edit and merge's p99
       // 14-17 ms, 0.4-2.1 ms under the policy). Its computation is its idle window, doubled until the kernel takes it.
+      // On Linux the same shard takes the round-robin real-time class where the account's limits grant it
+      // (`slates_machine::round_robin`, 84a's Linux half; grant or skip, never a privilege), and then parks at once when
+      // idle (the shard's `parks_at_once`).
       let real_time_window_ns = config.wake_tracking.is_some().then_some(config.spin_ns);
       let spawned = std::thread::Builder::new()
         .name(format!("slates-shard-{id}"))
@@ -598,6 +601,14 @@ impl Runtime {
           {
             slates_machine::log_line!(
               "slates-rt: shard {id} runs time-share: the kernel took no time-constraint policy from {window_ns} ns"
+            );
+          }
+          if real_time_window_ns.is_some()
+            && cfg!(target_os = "linux")
+            && let Err(declined) = slates_machine::round_robin::take_current()
+          {
+            slates_machine::log_line!(
+              "slates-rt: shard {id} runs time-share: no round-robin real-time class ({declined:?})"
             );
           }
           run_worker(seed, core, ready)
