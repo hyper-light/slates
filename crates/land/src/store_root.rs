@@ -376,7 +376,20 @@ fn identity_of(dir: &OwnedFd, key: String) -> Result<TargetIdentity, StoreRootRe
   })?;
   Ok(TargetIdentity {
     key: key.into_boxed_str(),
-    device: u64::try_from(stat.st_dev).unwrap_or(u64::MAX),
+    device: device_of(&stat),
     inode: stat.st_ino,
   })
+}
+
+/// The directory's device as the identity's `u64`, on Linux: glibc's and musl's `st_dev` already is one.
+#[cfg(target_os = "linux")]
+fn device_of(stat: &rustix::fs::Stat) -> u64 {
+  stat.st_dev
+}
+
+/// See the Linux arm: elsewhere `st_dev` is narrower and signed (macOS's `dev_t` is an `i32`), so it is widened checked,
+/// a negative one, which names no device, kept apart as `u64::MAX`.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn device_of(stat: &rustix::fs::Stat) -> u64 {
+  u64::try_from(stat.st_dev).unwrap_or(u64::MAX)
 }

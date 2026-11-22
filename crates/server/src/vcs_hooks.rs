@@ -1637,13 +1637,19 @@ impl HookRun {
         Step::Wait { wake_at_ns: None }
       }
       Event::Exited { status, .. } => {
-        let outcome = match why {
-          Kill::PastBound(bound_ns) => Outcome::TimedOut {
+        let outcome = match (why, status) {
+          // The hook exited on its own before the kill reached it (the deadline's timer fired before its exit was
+          // seen): the status is its own code, never the kill's signal, so it is judged by its own exit, as `svnserve`,
+          // which has no deadline, judges every hook. The cut stays taught, so the next bound backs off.
+          (Kill::PastBound(_), ExitStatus::Code(_)) => {
+            Outcome::of_exit(status, std::mem::take(&mut self.words))
+          }
+          (Kill::PastBound(bound_ns), _) => Outcome::TimedOut {
             bound_ns,
             status,
             words: std::mem::take(&mut self.words),
           },
-          Kill::ClientLeft => Outcome::Abandoned,
+          (Kill::ClientLeft, _) => Outcome::Abandoned,
         };
         self.finish(outcome, false)
       }
@@ -2958,6 +2964,41 @@ mod tests {
       "a first run five windows long is waited for past its length next time: {:?}",
       times.bound_ns()
     );
+  }
+
+  /// main 01a20182's flake of 2026-11-22 (the DAV revprop test in the parallel daemon_edge set, 3 of 16 runs under
+  /// load: "Revprop change blocked by pre-revprop-change hook (exit code 0) with no output"). Do: after eight quick
+  /// runs, run the hook again and let the timer fire at its deadline before its exit is seen; the hook had already
+  /// exited on its own, status 0, so the kill finds nothing to end and the exit then reports that status. Expect: the
+  /// run judged by its own exit, accepted with its words, its leftovers ended; the cut still taught (the next bound
+  /// doubled). Before, it was timed out with the hook's own exit code 0, and so refused.
+  #[test]
+  fn a_hook_that_exited_on_its_own_before_its_kill_is_judged_by_its_own_exit() {
+    let mut times = learned();
+    let bound = times.bound_ns().expect("learned");
+    let (mut run, _) = HookRun::started(START_NS, &times, CAP);
+    let deadline = START_NS + bound;
+    run.on(Event::Output(b"done"), &mut times);
+    assert_eq!(
+      run.on(Event::Timer { now_ns: deadline }, &mut times),
+      Step::Kill
+    );
+    assert_eq!(
+      run.on(
+        Event::Exited {
+          status: ExitStatus::Code(0),
+          at_ns: deadline,
+        },
+        &mut times
+      ),
+      Step::Done {
+        outcome: Outcome::Accepted {
+          words: words(b"done"),
+        },
+        end_leftovers: false,
+      }
+    );
+    assert_eq!(times.bound_ns(), Some(2 * bound));
   }
 
   /// A-597 (the learned deadline, RFC 6298 with Karn's rule and the back-off). Do: after eight quick runs, run the hook

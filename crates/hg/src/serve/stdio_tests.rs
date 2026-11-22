@@ -578,7 +578,9 @@ const PACKET_PIECE: usize = 32 * 1024;
 /// taken moves only the part not yet taken, once.
 #[test]
 fn output_taken_a_packet_at_a_time_moves_no_byte() {
-  let answer: Vec<u8> = (0..4 << 20).map(|at: usize| (at % 251) as u8).collect();
+  let answer: Vec<u8> = (0..4 << 20)
+    .map(|at: usize| u8::try_from(at % 251).unwrap())
+    .collect();
   let mut output = Output::default();
   output.buffer().extend_from_slice(&answer);
   let mut taken = Vec::new();

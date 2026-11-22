@@ -16,9 +16,16 @@ Usage: git_to_svn_dump.py GIT_DIR REF [LIMIT] > dump
   LIMIT    keep only the newest LIMIT commits (the oldest one kept is written whole as revision 1); default all
 """
 
+import os
 import subprocess
 import sys
 import time
+
+# Every git here reads SOURCE alone, outside every configuration: none from the system, the user or the environment (a
+# runner may inject keys through GIT_CONFIG_COUNT/KEY_n/VALUE_n, kiln's among them), so what it reports is the
+# repository's.
+GIT_ENV = {k: v for k, v in os.environ.items() if not k.startswith("GIT_CONFIG_") and k != "GIT_DIR"}
+GIT_ENV.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_COUNT="0", LC_ALL="C")
 
 
 def revision_properties(author, date, message):
@@ -43,7 +50,7 @@ class Converter:
         self.git_dir = git_dir
         self.out = out
         self.batch = subprocess.Popen(
-            ["git", "-C", git_dir, "cat-file", "--batch"], stdin=subprocess.PIPE, stdout=subprocess.PIPE
+            ["git", "-C", git_dir, "cat-file", "--batch"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=GIT_ENV
         )
         # Every directory under trunk/ and the count of its entries (files and directories), and every file.
         self.directories = {"trunk": 0}
@@ -54,6 +61,7 @@ class Converter:
             input=b"",
             check=True,
             stdout=subprocess.PIPE,
+            env=GIT_ENV,
         ).stdout.decode().strip()
 
     def blob(self, object_id):
@@ -141,7 +149,7 @@ class Converter:
         """The commit's changes against its first parent (or the empty tree), deletions first."""
         command = ["git", "-C", self.git_dir, "diff-tree", "-r", "--no-renames", "--raw", "-z"]
         command += [parent or self.empty_tree, commit]
-        fields = subprocess.run(command, check=True, stdout=subprocess.PIPE).stdout.split(b"\0")
+        fields = subprocess.run(command, check=True, stdout=subprocess.PIPE, env=GIT_ENV).stdout.split(b"\0")
         deletions, puts = [], []
         for header, raw_path in zip(fields[0::2], fields[1::2]):
             old_mode, new_mode, _, new_id, status = header.decode().lstrip(":").split()
@@ -159,6 +167,7 @@ class Converter:
             ["git", "-C", self.git_dir, "show", "-s", "--format=%an%x00%ct%x00%B", commit],
             check=True,
             stdout=subprocess.PIPE,
+            env=GIT_ENV,
         ).stdout
         author, seconds, message = info.split(b"\0", 2)
         date = time.strftime("%Y-%m-%dT%H:%M:%S.000000Z", time.gmtime(int(seconds))).encode()
@@ -181,7 +190,7 @@ def main():
     git_dir, ref = sys.argv[1], sys.argv[2]
     limit = int(sys.argv[3]) if len(sys.argv) > 3 else None
     commits = subprocess.run(
-        ["git", "-C", git_dir, "rev-list", "--first-parent", "--reverse", ref], check=True, stdout=subprocess.PIPE
+        ["git", "-C", git_dir, "rev-list", "--first-parent", "--reverse", ref], check=True, stdout=subprocess.PIPE, env=GIT_ENV
     ).stdout.split()
     commits = [commit.decode() for commit in commits]
     if limit is not None:

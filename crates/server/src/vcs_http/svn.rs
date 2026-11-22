@@ -1808,10 +1808,15 @@ impl<S: SvnStores> SvnExchange<S> {
 /// A lock verb refused by its pre-hook, `chain` its errors, outermost first: answered as `dav_svn__convert_err` answers
 /// the hook's error, its status from the error, `500` where it names none ("Failed to create new lock.", A-733).
 fn hook_refused(chain: &[(u32, String)]) -> HttpAnswer {
-  let (code, message) = chain
-    .first()
+  // The chain's own code, worded by its best message: the first that says anything (`svn_err_best_message`), so a chain
+  // whose head carries no words of its own still tells the client the hook's.
+  let code = chain.first().map_or(UNSUPPORTED_FEATURE, |(code, _)| *code);
+  let message = chain
+    .iter()
+    .map(|(_, message)| message)
+    .find(|message| !message.is_empty())
     .cloned()
-    .unwrap_or((UNSUPPORTED_FEATURE, String::new()));
+    .unwrap_or_default();
   locking::error_answer(
     locking::convert_status(code, HTTP_INTERNAL_SERVER_ERROR),
     true,

@@ -1734,7 +1734,9 @@ fn a_push_held_ahead_of_its_landing_is_named_by_its_step() {
   crate::test_store::audit_on_stored_shard("repository-push-held-ahead", |state| {
     let (repo, main) = repository(state, "ahead");
     let chunk = crate::merge_origin::inputs_chunk_bytes();
-    let large: Vec<u8> = (0..chunk * 3 + 1).map(|at| (at % 251) as u8).collect();
+    let large: Vec<u8> = (0..chunk * 3 + 1)
+      .map(|at| u8::try_from(at % 251).unwrap())
+      .collect();
     let mut store = Store::default();
     let tree = store.put_tree(&[("large", &large)]);
     let changed = store.put_tree(&[("large", b"small")]);
