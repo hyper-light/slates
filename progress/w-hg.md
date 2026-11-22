@@ -311,3 +311,17 @@ before its landing; green; owes its non-vacuity test that the landing took more 
 ~/.cache/w-hg-2b-letgo.patch (2b: the import lets each segment's file windows go once durable; needs 2b (1) first).
 Not reproduced, logged: CI's cold-repository "push again" (log line "a push's increment held ahead was refused by the
 content store"), a wait's give-up ("a push's intake waited for room and gave up").
+
+## 2026-11-22 ~11:20 PST (w-hg, main 01a20182)
+Landed since 05:00: 47edbe430 (take_sliced split, intake cutting, widest_full_text), faa87e583 (v9 push run reference,
+wall sites), b61a5934f/746f4753f ((b1) segment runs + (i) landing turn; Rebasing removed; crash oracle; head-of-line
+537 ms measured), 89d75e30b (manifest entries kept once; bound linear), 5c15d3e8a (v10 push segment record, base by
+node, replay over a moved index).
+Now (main 10:40, the spin before staging): stream row gathering sliced a content window a step (render::rows_held;
+red a_streams_ask_for_a_long_logs_rows_is_gathered_a_window_a_step proven; hg 416/416; not landed, server tests next).
+Running: daemon_edge diag_the_longest_step_of_each_read_a_clone_of_a_long_history_makes at 57,054 changesets (debug).
+Suspects next: heads/branchmap (one step over every revision), getbundle named_changegroup (clone -r, every missing
+changeset's entry at once).
+Then: staging pieces (bounded stale re-base; store staging key kind; forgetting an abandoned key's rows), and a push's
+texts let go once their segment lands (RSS 5.5 GB; asked main for content_range.*.resident after push-all).
+Held as patches still: ~/.cache/w-hg-2b-1-works.patch, ~/.cache/w-hg-2b-letgo.patch.
