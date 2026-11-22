@@ -3224,8 +3224,9 @@
 > - 1b, BUILT below.
 > **A large hg push spun its shard past the watchdog (goal 93 correctness; found by w-balance by use, inbox
 > w-hg-from-w-balance-push-spin.md: a 64+32 MiB push, shard 8 at 3.1 s in one poll in `hg_push::take` and
-> `hg_push::unbundle`, the daemon killed). The hg side FIXED (2026-11-21, w-hg; main's ruling (1) of 13:26); the merge
-> engine's apply OPEN (below).**
+> `hg_push::unbundle`, the daemon killed). FIXED (2026-11-21, w-hg; main's ruling (1) of 13:26, then 01a1ff2e's 17:26
+> option (a) and main 01a20182's 21:35 order for (D)): the 64+32 MiB push by use passes in debug, 56.7 s, no shard
+> spinning (before (D): killed in `hg_push::landing`).**
 > - Measured (one 64 MiB revision's intake step, test profile, proportions only): `put_object` 59 s, sha1dc 50 s,
 >   BLAKE3 20 s, the delta's apply 0.05 s: every cost grew with the file.
 > - (A) The intake: a revision longer than the content store's window is taken over as many steps as it has windows
@@ -3246,11 +3247,22 @@
 >   5.5 s each. Both are now hashed once, a content window at a time, yielding at half the step quantum
 >   (`hg_push::hashed_sliced`: `named_payload`, `named_push`); the references take the payload's name
 >   (`record::PayloadName`); the judging 0 ms.
-> - OPEN, the merge engine's: `push::push_planned` → `apply_planned` applies the built 96 MiB increment to the green in
->   one step (verdicts 6 to 23 ms, the apply past the 3.3 s window, the daemon killed). P2's `materialize` commits a
->   built work the same way. Main rules who slices it (inbox, 2026-11-21).
+> - (D) The landing's apply: timed a phase at a time (debug, the 64+32 MiB push), the verdict took 7 to 220 ms and
+>   `push::hold_increments` the rest, past 3,480 ms of CPU. That is the work's encoding held whole as its version's
+>   inputs archive (`merge_service::hold_increment`: every 1 MiB chunk BLAKE3-hashed and copied into its block in the
+>   landing's step), not the green's commit. Now each work whose green is at its base is held before the landing a unit
+>   a turn (`crate::held_ahead::AheadHold`, the checkpoint's paced hold, A-579: a chunk hashed, the stage opened on the
+>   green's object for its next version, a chunk staged, the stage completed; half the step quantum a turn,
+>   `hg_push::held_ahead`). The landing's step names the held inputs (`push::hold_increment` →
+>   `merge_service::increment_already_held`, nothing hashed or copied), and what no entry names is given back after it,
+>   whatever it answered (`held_ahead::give_back`); a crash leaves only unnamed content, which recovery gives back.
+>   Counted `push.held_ahead.units`, `.held`, `.named`.
+>   Owed (D): git's large updates and P2's `materialize` to take the same hold before their own steps (main's "one
+>   sliced apply"); a new green's work (a branch created by the push) is still held whole in the step; the work's
+>   encoding is one copy in the first unit; `Green::make_step` (A-760) is still called by no server path.
 > - Held by `push::intake::tests::a_revision_longer_than_a_window_is_taken_a_window_a_step` (red before: one step took
->   the whole text), the server hg suites (the daemon-edge pushes through the sliced works), and by use
+>   the whole text), `repository::push::tests::a_push_held_ahead_of_its_landing_is_named_by_its_step` (red with the
+>   step's naming removed: `push.held_ahead.named` 0), the server hg suites (the daemon-edge pushes through the sliced works), and by use
 >   `hg_interop::stock_hg_pushes_large_files_and_the_daemon_keeps_serving` (ignored; w-balance's repro; main's rounds).
 > - Owed (slates-merge, A-752 "units still one object's size"): the builder lays a file's bytes in one unit, so a
 >   64 MiB file is still one unit of the work's post-state (a copy, no hash), noted to w-engine.

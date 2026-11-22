@@ -499,6 +499,8 @@ pub(crate) struct Prepared {
   pub(crate) changegroup: Option<u32>,
   /// Its transaction's id, which every hook of it reads (`HG_TXNID`; [`transaction_id`]).
   pub(crate) transaction: String,
+  /// Its works' increments held before its landing's step (`crate::held_ahead`): none for works built in that step.
+  held_ahead: Vec<crate::held_ahead::HeldAhead>,
 }
 
 /// One name a push changes as its admission asks about it (A-622 part 2's `admit`): its namespace and label, the right
@@ -598,6 +600,7 @@ pub(crate) fn prepare<V: Repository, H: Held>(
     changegroup: unbundle.changegroup().map(|(id, _)| id),
     transaction: transaction_id(&terms.1),
     forked: None,
+    held_ahead: Vec::new(),
   })
 }
 
@@ -644,11 +647,17 @@ pub(crate) enum Works<'a> {
     built: &'a mut BTreeMap<WorkKey, Increment>,
     /// Whether one the plan names was missing.
     missed: bool,
+    /// Their increments held in the content store before the landing (`crate::held_ahead`), which its step names.
+    ahead: &'a [crate::held_ahead::HeldAhead],
   },
   /// Planned: each move's key listed and nothing built, a placeholder in each work's place that the plan's caller
   /// drops ([`built_works`]).
   Planning(&'a mut Vec<WorkKey>),
 }
+
+/// Format: slates' words for a push whose works' increments the content store refused to hold before its landing (its
+/// room, or a newer placement on a green's object): nothing of it is kept, and the client may push again.
+const UNHELD: &[u8] = b"push refused: the content store could not hold its increments; push again";
 
 /// Format: slates' words for a push whose works, built before its landing, are not those its landing's plan names.
 const UNBUILT: &[u8] = b"push refused: its works were built for another plan than its landing's";
@@ -674,7 +683,7 @@ fn work<H: Held>(
         named: slates_merge::named::Named::default(),
       });
     }
-    Works::Built { built, missed } => {
+    Works::Built { built, missed, .. } => {
       return built.remove(&key).ok_or_else(|| {
         *missed = true;
         abort(UNBUILT.to_vec())
@@ -1248,6 +1257,7 @@ pub(crate) fn land(
     forked,
     replied,
     wanted,
+    held_ahead,
     ..
   } = prepared;
   // A fork made from an index another push replaced since names its parents by numbers that index no longer gives:
@@ -1296,7 +1306,13 @@ pub(crate) fn land(
     }
   };
   let appended = match record {
-    Some(record) => push::push_hg(state, (principal, repository), changes, parts, record),
+    Some(record) => push::push_hg(
+      state,
+      (principal, repository),
+      (changes, &held_ahead),
+      parts,
+      record,
+    ),
     None => RepositoryLogs::append(state, principal, repository, changes, parts),
   };
   match appended {
@@ -1506,23 +1522,38 @@ async fn landed_after_rebases(
         return Some(outcome);
       }
     };
+    // Their increments held in the content store next, a unit a turn: the landing's step names them, never hashes or
+    // copies them (`crate::held_ahead`).
+    let ahead = match held_ahead(&built).await? {
+      Ok(ahead) => ahead,
+      Err(_) => {
+        give_back(forked);
+        return Some(PushOutcome::refused(&abort(UNHELD.to_vec())));
+      }
+    };
     let landing_step = slates_rt::futures::doing("hg_push::landing");
-    let tried = crate::state::with_state(|state| match forked.take() {
-      Some(stale) if is_stale(state, repository, &stale) => Err(Box::new(stale)),
-      fresh => Ok(landing(
-        state,
-        repository,
-        (principal, name),
-        unbundle,
-        fresh,
-        (
-          &mut Works::Built {
-            built: &mut built,
-            missed: false,
-          },
-          room,
-        ),
-      )),
+    let tried = crate::state::with_state(|state| {
+      let tried = match forked.take() {
+        Some(stale) if is_stale(state, repository, &stale) => Err(Box::new(stale)),
+        fresh => Ok(landing(
+          state,
+          repository,
+          (principal, name),
+          unbundle,
+          fresh,
+          (
+            &mut Works::Built {
+              built: &mut built,
+              missed: false,
+              ahead: &ahead,
+            },
+            room,
+          ),
+        )),
+      };
+      // What the landing's entry did not name is given back, whatever it answered.
+      crate::held_ahead::give_back(state, &ahead);
+      tried
     });
     drop(landing_step);
     match tried? {
@@ -1655,6 +1686,52 @@ async fn built_works(
     }
   }
   Some(Ok((plan, built)))
+}
+
+/// Each of `built`'s works that moves its green from the head it is at, its increment held in the content store a unit a
+/// turn before the landing (`crate::held_ahead`): the turn runs units for half the shard's quantum, then yields. A work
+/// for a new green, or from a version that is no longer its green's head, is left to the landing's step, which holds it
+/// whole. None where the shard's state is gone; refused typed where the content store refuses a hold, whose hold leaves
+/// nothing, and what the earlier works held is given back.
+async fn held_ahead(
+  built: &BTreeMap<WorkKey, Increment>,
+) -> Option<Result<Vec<crate::held_ahead::HeldAhead>, slates_ipc::protocol::Refusal>> {
+  let _doing = slates_rt::futures::doing("hg_push::held_ahead");
+  let mut ahead = Vec::new();
+  for (&(green, base_version, ..), work) in built {
+    let begun = crate::state::with_state(|state| {
+      let head = state.greens.get(&green).map(|engine| engine.head());
+      (head == Some(base_version))
+        .then(|| crate::held_ahead::AheadHold::new(green, base_version.saturating_add(1), work))
+    })?;
+    let Some(mut hold) = begun else {
+      continue;
+    };
+    loop {
+      let turned = crate::state::with_state(|state| {
+        let until =
+          slates_rt::futures::now_ns().saturating_add((state.config.step_quantum_ns() / 2).max(1));
+        loop {
+          match hold.unit(state) {
+            Ok(crate::held_ahead::Ahead::More) if slates_rt::futures::now_ns() < until => {}
+            other => break other,
+          }
+        }
+      })?;
+      match turned {
+        Ok(crate::held_ahead::Ahead::More) => slates_rt::futures::yield_now().await,
+        Ok(crate::held_ahead::Ahead::Held(held)) => {
+          ahead.push(held);
+          break;
+        }
+        Err(refusal) => {
+          let _ = crate::state::with_state(|state| crate::held_ahead::give_back(state, &ahead));
+          return Some(Err(refusal));
+        }
+      }
+    }
+  }
+  Some(Ok(ahead))
 }
 
 /// What repository `id` holds as a push's works read it: through the push's fork where it has one, else the store's
@@ -2560,6 +2637,9 @@ fn landing(
     }
   };
   prepared.forked = forked;
+  if let Works::Built { ahead, .. } = works {
+    prepared.held_ahead = ahead.to_vec();
+  }
   let landed = land(state, (principal, repository), prepared);
   if landed.released.is_err() {
     state.count(vcs_store::RELEASE_REFUSED, 1);
