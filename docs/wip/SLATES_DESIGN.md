@@ -16554,9 +16554,13 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > shard keeps one `Grants` value, replaced whole: every row's curve aged to now at its read horizon
 > (`Ledger::age_curves`), its misses a second its counts over that horizon, the shard's admittable room divided by
 > `slates_vcs::partition`. It is divided again once the shortest read horizon among the repositories served has passed,
-> or at once when that set changes, and read in between (`current_at`; counted `vcs_share.grants_divided`). Owed: the
-> room's admission reading it (a repository admitted against its grant, else the spare; agreed with A-724 piece 3's
-> side first), and pushes', Mercurial's and Subversion's reads feeding the curves.
+> or at once when that set changes, and read in between (`current_at`; counted `vcs_share.grants_divided`). Since
+> A-846 part 3 (agreed with w-balance, A-724 piece 3's side) the room reads it: once every repository taking new room
+> has a curve, the asker's memory room is its grant less what it holds plus what is lendable (the spare and idle
+> repositories' unused grants), the cold trigger relieving each past its published grant (counted
+> `vcs_share.by_grants`); a live repository with no curve yet leaves memory divided per request, so a newcomer is never
+> promised a grant twice; the snapshot slot is divided as before. Owed: pushes', Mercurial's and Subversion's reads
+> feeding the curves (until then only git's fetching repositories take the grant path).
 
 > **Status (2026-11-21, A-849: piece 7's proof gains fetches).** `crates/cli/bench/multi_repo_load.py --fetches`
 > seeds every repository with its class's pack, then sends Zipf-skewed protocol v2 fetches beside the pushes, each

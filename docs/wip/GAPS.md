@@ -2021,8 +2021,9 @@
 > **A-724 piece 2d part 2 (A-844): curves fed by git's fetches** (`vcs_store::observed`;
 > `t_a724_a_fetchs_reads_are_noted_in_its_own_repositorys_curve`). Open: pushes', hg's and svn's reads.
 > **A-724 piece 2d part 3 (A-846): grants divided at the learning cadence, not yet read by admission**
-> (`vcs_share::grants`, `t_a724_the_grants_are_divided_at_the_learning_cadence_and_kept_between`). Open: `room` reading
-> them.
+> (`vcs_share::grants`, `t_a724_the_grants_are_divided_at_the_learning_cadence_and_kept_between`); the room reads them
+> since A-846 part 3 (`t_a724_a_contested_room_reads_the_published_grants`,
+> `t_a724_a_live_repository_with_no_curve_leaves_the_room_divided_as_before`). Open: pushes', hg's and svn's reads.
 > **A-724 piece 7 (A-849): the load proof's fetches** (`multi_repo_load.py --fetches`; harness daemons given a
 > `--vcs-store`, without which `repository create --tool git` failed since A-767 C5). Open: hg and svn in the mix; the
 > rounds (main's).
