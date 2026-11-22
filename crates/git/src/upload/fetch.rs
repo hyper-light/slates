@@ -412,8 +412,8 @@ pub(super) struct Before {
 
 /// What the sections before a pack made of an answer.
 pub(super) enum Sections<K> {
-  /// The whole answer: `pack-objects` died as it began.
-  Died(Answer<K>),
+  /// The whole answer: `pack-objects` died as it began (boxed: an answer is most of the section's size).
+  Died(Box<Answer<K>>),
   /// The bytes before the pack, the pack's framing, and how many bytes they took.
   Pack(Vec<u8>, Framing, u64),
 }
@@ -477,7 +477,8 @@ impl Before {
           out,
         )
       })?;
-      return Answer::died(bytes, self.said, refusal, true, admission).map(Sections::Died);
+      return Answer::died(bytes, self.said, refusal, true, admission)
+        .map(|died| Sections::Died(Box::new(died)));
     }
     let header = if self.at_the_pack {
       Header::AtThePack

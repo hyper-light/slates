@@ -1,17 +1,20 @@
 //! A-718 continued's tests: a fetch's bounded wait for its repository's encoding, and the task that finishes it.
 
-use super::{BEHIND, Turned, UNITS_PAST_BUDGET, encode_within, turn};
+use super::{AHEAD_STOPPED, BEHIND, Turned, UNITS_PAST_BUDGET, encode_within, turn};
 
-/// A-718 continued (a fetch never waits past its window). Do: push the fixtures' `create` and `update` into a git
-/// repository, leaving its versions unencoded; run a fetch's encoding with a wait of nothing; then let the shard run
-/// until the encoding is idle. Expect: the wait ends with the encoding not idle and one fetch counted behind; the task
-/// it started encodes every version (none unencoded), then lets the repository go from the set it keeps.
+/// A-718 continued (a fetch never waits past its window), A-856 (made ahead only while a fetch is answered, within the
+/// repository's learned grant). Do: push the fixtures' `create` and `update` into a git repository, leaving its versions
+/// unencoded; answer a fetch of it (its guard held live, a step lent so its curve and grant are learned); run a fetch's
+/// encoding with a wait of nothing; then let the shard run until the encoding is idle; then let the fetch end. Expect:
+/// the wait ends with the encoding not idle and one fetch counted behind; the task it started encodes every version
+/// (none unencoded), then lets the repository go from the set it keeps.
 #[test]
 fn t_a718_a_fetch_that_stops_waiting_leaves_a_task_that_finishes_the_encoding() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let id = crate::daemon::observe_first(&daemon, |state| {
     let id = crate::git_push::tests::git_repository(state, "behind");
     crate::git_push::tests::pushed_from_the_fixtures(state, id, &["create", "update"]);
+    answered_live(state, id);
     let unencoded = state
       .vcs_stores
       .git_ref(id)
@@ -51,6 +54,80 @@ fn t_a718_a_fetch_that_stops_waiting_leaves_a_task_that_finishes_the_encoding() 
   }
   daemon.stop();
   assert_eq!(done, Some((1, None, false)));
+}
+
+/// Shape: how long a test's fetch is answered (held live), past every wait the tests here give the shard.
+const ANSWERED_NS: u64 = 60_000_000_000;
+
+/// A fetch of repository `id` answered now, as an edge's would be: a clone of `main` answered whole first (its reads
+/// teach its usage row's curve, so its grant is learned from them), and its guard counted live by a task of this shard
+/// for [`ANSWERED_NS`].
+fn answered_live(state: &mut crate::state::ShardState, id: slates_db::catalog::RepositoryId) {
+  let fetching = crate::vcs_share::Live::fetch(id);
+  let (_, refused) = crate::vcs_store::upload::tests::answered(
+    state,
+    (id, &crate::git_push::tests::owner()),
+    slates_git::upload::Asked::Request(&crate::vcs_store::upload::tests::fetch(
+      &[],
+      &["refs/heads/main"],
+    )),
+  );
+  assert_eq!(refused, None, "the clone answered");
+  let answering = slates_rt::futures::spawn(async move {
+    let _fetching = fetching;
+    let _ = slates_rt::futures::sleep(ANSWERED_NS).await;
+  })
+  .expect("a task");
+  let _ = slates_rt::futures::detach(answering);
+}
+
+/// A-856 (main's ruling of 2026-11-22 00:30: "nothing grows while no client is connected"; clients measured git/git's
+/// clone at 917 MiB as it ended and 1,695 MiB 90 s later with no client, the task behind it still encoding). Do: push the
+/// fixtures' `create` and `update`, leaving its versions unencoded; with no fetch of it answered, run a fetch's encoding
+/// with a wait of nothing, as a client that went away leaves it; then let the shard run. Expect: the task behind it stops
+/// at its first turn, counted `ahead_stopped`, and lets the repository go from the set it keeps; versions are left
+/// unencoded and no encoding is held under way, so nothing grows until a fetch asks again. Red before: the task encoded
+/// every version with no fetch there.
+#[test]
+fn t_a856_with_no_fetch_answered_nothing_is_encoded_ahead() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let id = crate::daemon::observe_first(&daemon, |state| {
+    let id = crate::git_push::tests::git_repository(state, "nobody");
+    crate::git_push::tests::pushed_from_the_fixtures(state, id, &["create", "update"]);
+    let waited = slates_rt::futures::spawn(async move {
+      let _ = encode_within(id, 0).await;
+    })
+    .unwrap();
+    let _ = slates_rt::futures::detach(waited);
+    id
+  });
+  let mut seen = None;
+  // Derived: 600 looks 20 ms apart, the wait the task is given to stop.
+  let deadline =
+    std::time::Instant::now() + std::time::Duration::from_millis(20).saturating_mul(600);
+  while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+    let now = crate::daemon::observe_first(&daemon, move |state| {
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      (
+        count(BEHIND),
+        count(AHEAD_STOPPED),
+        super::ahead_under_way(state, id),
+        state.vcs_stores.encodings.0.contains_key(&id),
+        state
+          .vcs_stores
+          .git_ref(id)
+          .and_then(|(_, store)| store.repository.first_unencoded())
+          .is_some(),
+      )
+    });
+    if now.0 > 0 && !now.2 {
+      seen = Some(now);
+      break;
+    }
+    std::thread::park_timeout(std::time::Duration::from_millis(20).min(left));
+  }
+  daemon.stop();
+  assert_eq!(seen, Some((1, 1, false, false, true)));
 }
 
 /// A-718 (§4.3's step budget; found by use by w-interop: a 56 MB push of git/git cut at v2.0.0 left the shard spinning
@@ -235,4 +312,147 @@ async fn drive(id: slates_db::catalog::RepositoryId, request: Vec<u8>) -> Driven
     quantum,
     counters.map(|counters| (counters, window)),
   )
+}
+
+/// Shape: [`t_a856_a_grant_is_learned_from_reads_and_given_back_when_idle`]'s larger repository's one file: a few of the
+/// store's windows (256 KiB here), more than the fixtures' clone reads, and small enough that a debug build pushes and
+/// encodes it within one poll.
+const LARGER_FILE: usize = 1 << 20;
+
+/// [`LARGER_FILE`] bytes no deflate shrinks (a xorshift stream, Marsaglia 2003), so its fragments are as large as it.
+fn incompressible() -> Vec<u8> {
+  let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+  (0..LARGER_FILE)
+    .map(|_| {
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      state.to_le_bytes()[0]
+    })
+    .collect()
+}
+
+/// What repository `id`'s fetch of `main` is answered with `arguments` besides, whole: asserted not refused.
+fn fetched_main(
+  state: &mut crate::state::ShardState,
+  id: slates_db::catalog::RepositoryId,
+  arguments: &[&str],
+) {
+  let mut asked = vec!["want-ref refs/heads/main".to_owned()];
+  asked.extend(arguments.iter().map(|argument| (*argument).to_owned()));
+  asked.extend(["no-progress".to_owned(), "done".to_owned()]);
+  let (_, refused) = crate::vcs_store::upload::tests::answered(
+    state,
+    (id, &crate::git_push::tests::owner()),
+    slates_git::upload::Asked::Request(&crate::vcs_store::upload::tests::request("fetch", &asked)),
+  );
+  assert_eq!(refused, None);
+}
+
+/// A-856 (main's check of 2026-11-22 02:29: a grant learned, not a floor, a cap or a region's size passed through; and
+/// what is held given back when idle). Do: clone the fixtures' small repository whole, and a repository of one
+/// incompressible [`LARGER_FILE`]-byte file whole, reading each one's grant (`vcs_share::budget`: the shard's room
+/// divided by the repositories' curves, each curve the content windows its fetches read, a window's bytes each); then
+/// begin the larger's version's encoding, turning it until its parts hold bytes, as a fetch that went away leaves it;
+/// then let the repository go idle. Expect: the larger's grant past the smaller's, each a whole number of the store's
+/// windows (one and three here: the clones read that many); the encoding's parts charged to the content store while
+/// held; and, idle, the encoding dropped, the store's charge back at its figure before the encoding began, counted
+/// `given_back_idle`.
+#[test]
+fn t_a856_a_grant_is_learned_from_reads_and_given_back_when_idle() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let seen = crate::daemon::observe_first(&daemon, |state| {
+    let small = crate::git_push::tests::git_repository(state, "small");
+    crate::git_push::tests::pushed_from_the_fixtures(state, small, &["create", "update"]);
+    let larger = crate::git_push::tests::git_repository(state, "larger");
+    let (create, _) = crate::git_push::tests::create_of_file(incompressible());
+    let received = crate::git_push::tests::pushed(state, larger, &create);
+    assert!(
+      received
+        .outcomes
+        .iter()
+        .all(|outcome| matches!(outcome, slates_git::receive::Outcome::Ok(_)))
+    );
+    fetched_main(state, small, &[]);
+    fetched_main(state, larger, &[]);
+    let window = state
+      .vcs_stores
+      .content()
+      .map_or(0, |content| u64::try_from(content.window()).unwrap());
+    let grants = (
+      crate::vcs_share::budget(state, small).unwrap(),
+      crate::vcs_share::budget(state, larger).unwrap(),
+    );
+    while crate::vcs_store::git_derive::turn(state, larger)
+      == crate::vcs_store::git_derive::Turned::More
+    {}
+    let idle_charged = state
+      .vcs_stores
+      .content()
+      .map_or(0, |content| content.charged());
+    super::super::lend(&mut state.store, &mut state.vcs_stores, 0);
+    let (held, charged) = {
+      let (content, store) = state.vcs_stores.git(larger).expect("the store");
+      let (green, version) = store
+        .repository
+        .first_unencoded()
+        .expect("a version unencoded");
+      let mut encoding =
+        slates_git::store::Encoding::fragments(&store.repository, content, green, version).unwrap();
+      let mut clock = super::ShardClock;
+      while encoding.held_bytes() == 0 {
+        let turned = encoding.advance(
+          &mut store.repository,
+          content,
+          slates_git::store::Turn {
+            clock: &mut clock,
+            exchange: super::exchange(&state.config),
+            quantum_ns: 0,
+          },
+        );
+        assert_eq!(turned, Ok(slates_git::store::Progress::More));
+      }
+      let held = encoding.held_bytes();
+      let charged = content.charged();
+      state
+        .vcs_stores
+        .encodings
+        .0
+        .insert(larger, (encoding, (green, version)));
+      (held, charged)
+    };
+    super::super::settle(state);
+    super::give_back_idle(state, larger);
+    let after = state
+      .vcs_stores
+      .content()
+      .map_or(0, |content| content.charged());
+    let given = state
+      .refusals
+      .get(super::GIVEN_BACK_IDLE)
+      .copied()
+      .unwrap_or(0);
+    let under_way = state.vcs_stores.encodings.0.contains_key(&larger);
+    (
+      window,
+      grants,
+      (idle_charged, held, charged, after, given, under_way),
+    )
+  });
+  daemon.stop();
+  let (window, (small, larger), (idle_charged, held, charged, after, given, under_way)) = seen;
+  assert!(larger > small, "learned from reads: {small} then {larger}");
+  assert!(
+    small % window == 0 && larger % window == 0,
+    "a whole number of {window}-byte windows: {small}, {larger}"
+  );
+  assert!(
+    charged >= idle_charged + held,
+    "held parts charged: {charged} past {idle_charged}, {held} held"
+  );
+  assert_eq!(
+    (after, given, under_way),
+    (idle_charged, held, false),
+    "given back when idle"
+  );
 }
