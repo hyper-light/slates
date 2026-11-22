@@ -407,3 +407,10 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - Landed: `an_import_measured` samples status --memory, RSS and footprint (via top) before, after, and 2 s and 30 s
   into the hold. 4bc541ca5 and c74f35cc1, merged 78e584f18.
 - Waiting: main's git-2000 run of it. Then the red test, on footprint after an import and an idle tick.
+
+## 2026-11-22 ~00:35 PST: the HTTPv2 revprop red is fixed
+- d843d2325, merged 946e39c22: the edge serves PROPPATCH on !svn/rev/N and !svn/bln/N, judged by the shared
+  RevisionPropertyChange path, with both revprop hooks and the landing turn.
+- Main's r6: fsfs_view's stock leg GREEN.
+- Waiting: main's rerun of stock_svn_over_httpv2_answers_as_stock_svnserve_byte_for_byte, and r11's finding (2)
+  blocks. My finding (2) probe is still local, in svn_import/tests.rs.
