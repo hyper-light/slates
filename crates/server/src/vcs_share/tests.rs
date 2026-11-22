@@ -484,3 +484,55 @@ fn t_a724_a_mercurial_fetchs_answer_is_learned_and_a_lookups_hold_teaches_nothin
   daemon.stop();
   assert_eq!(row, Some((1, Some(5_000))));
 }
+
+/// A-724 piece 3, Mercurial's share refusal (w-hg's leave, 2026-11-21). Do: on a store-holding daemon whose partition's
+/// snapshot slot has 461 bytes of room (so a share is a few hundred bytes, as in the git test above), make a Mercurial
+/// repository and a git repository; from a task on its shard, with a git push live, push a bundle larger than the
+/// Mercurial repository's share through `hg_push::unbundle`, admitted the room as an edge admits it. Expect: refused
+/// before its bundle is read, in 7.2's `pusherr` form, its words naming the repository's share and saying a retry may
+/// pass once other repositories' pushes end; never the words of a push past the server's room.
+#[test]
+fn t_a724_a_mercurial_push_past_its_share_is_refused_naming_the_share() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored_configured(|config| {
+    config.geometry.snapshot_bytes = 6_400;
+  });
+  let (pushed, other) = crate::daemon::observe_first(&daemon, |state| {
+    (
+      hg_repository(state, "pushed"),
+      git_repository(state, "other"),
+    )
+  });
+  let (sent, outcome) = std::sync::mpsc::sync_channel(1);
+  crate::daemon::observe_first(&daemon, move |_| {
+    let task = slates_rt::futures::spawn(async move {
+      let pushing = Live::begin(other);
+      let room = crate::state::with_state(|state| super::room(state, pushed)).unwrap();
+      let bundle = vec![0u8; usize::try_from(room.bytes).unwrap() + 1];
+      let mut admission = slates_hg::Admission::new(room.bytes);
+      let heads = slates_hg::push::check::HeadsArgument::Force;
+      let outcome =
+        crate::repository::hg_push::unbundle(pushed, (&owner(), &heads, &bundle), &mut admission)
+          .await;
+      drop(pushing);
+      let _ = sent.send((room.bound, outcome));
+    })
+    .unwrap();
+    slates_rt::futures::detach(task).unwrap();
+  });
+  let (bound, outcome) = outcome
+    .recv_timeout(std::time::Duration::from_secs(60))
+    .unwrap();
+  daemon.stop();
+  assert!(
+    matches!(bound, Bound::Share { .. }),
+    "the room was a share: {bound:?}"
+  );
+  let Some(slates_hg::push::Outcome::Unprocessed(words)) = outcome else {
+    panic!("refused before its bundle was read: {outcome:?}");
+  };
+  let words = String::from_utf8_lossy(&words);
+  assert!(
+    words.contains("share") && words.contains("retry"),
+    "a share's refusal names the share and says a retry may pass: {words:?}"
+  );
+}

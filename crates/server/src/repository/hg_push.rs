@@ -1386,7 +1386,16 @@ pub(crate) async fn unbundle(
       .vcs_usage
       .begun(&repository, principal, slates_vcs::Work::Intake, now);
   });
-  let outcome = unbundled(repository, pushing, room).await;
+  // A-724 piece 3 (w-hg's leave): a bundle larger than what its room has left, where the room is the repository's share
+  // while others push (or the snapshot slot's room), is refused before it is read, in words naming that bound, never
+  // as a push past the server's room.
+  let past = crate::state::with_state(|state| {
+    past_its_bound(state, repository, lend_of(bundle), room.left())
+  });
+  let outcome = match past.flatten() {
+    Some(words) => Some(PushOutcome::Unprocessed(words)),
+    None => unbundled(repository, pushing, room).await,
+  };
   if outcome.is_some() {
     let _ = crate::state::with_state(|state| {
       let now = slates_rt::futures::now_ns();
@@ -1396,6 +1405,39 @@ pub(crate) async fn unbundle(
     });
   }
   outcome
+}
+
+/// 7.2's `pusherr` words for a push of `asked` bytes whose room had `left` (A-724 piece 3, §4.17.5 "Admission and
+/// backpressure"), where the room is bound by the repository's share while other repositories push, or by its
+/// partition's snapshot slot's room: worded as git's `PushFailed::PastShare` and `PastSnapshot` are, naming the bound and
+/// that a retry may pass. None where the bundle fits, or where the room is all the shard can admit (a push past that is
+/// refused as it is read, in the words of a push past the server's room).
+fn past_its_bound(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  asked: u64,
+  left: u64,
+) -> Option<Vec<u8>> {
+  if asked <= left {
+    return None;
+  }
+  match crate::vcs_share::room(state, repository).bound {
+    crate::vcs_share::Bound::Share { share, held } => Some(
+      format!(
+        "push refused: the push needs {asked} bytes where the repository's share of this server had {left} left (its \
+         share {share} bytes, {held} of them held) while other repositories push: retry once their pushes end\n"
+      )
+      .into_bytes(),
+    ),
+    crate::vcs_share::Bound::Snapshot { room } => Some(
+      format!(
+        "push refused: the push needs {asked} bytes where its partition's snapshot had {left} left of {room}: retry once \
+         the server lays its snapshot out larger\n"
+      )
+      .into_bytes(),
+    ),
+    crate::vcs_share::Bound::Shard => None,
+  }
 }
 
 /// [`unbundle`]'s push, uncounted.
