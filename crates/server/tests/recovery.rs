@@ -4170,6 +4170,100 @@ fn a_deleted_files_memory_goes_back_to_the_os() {
 #[cfg(target_os = "linux")]
 const IDLE_INTERVALS_WATCHED: u64 = 3;
 
+/// Shape: the sweep intervals a content wait goes with no progress before it calls the daemon stuck: as many as
+/// [`give_back_finished`]'s, well past a loaded host's gaps between the passes that find a shard idle. The window is
+/// this many sweep intervals, each the liveness budget the idle sweep runs at (`daemon::LIVENESS_BUDGET_NS`).
+#[cfg(target_os = "linux")]
+const CONTENT_STALLED_INTERVALS: u64 = 60;
+
+/// The content plane's counters a content wait reads as progress: each kind of its sweep's tick, and its seals.
+#[cfg(target_os = "linux")]
+const CONTENT_PROGRESS: [&str; 5] = [
+  "content.ticks.idle",
+  "content.ticks.busy",
+  "content.ticks.deferred",
+  "content.ticks.sealing",
+  "content.sealed",
+];
+
+/// A content wait that saw no progress for its window ([`until_content_settles`]): what it waited for and everything
+/// it last saw, so a hang explains itself.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct Stalled {
+  /// What was waited for.
+  what: &'static str,
+  /// How long since the wait last saw progress.
+  since_progress: Duration,
+  /// The window it was given.
+  window: Duration,
+  /// What was left at the last look.
+  left: usize,
+  /// [`CONTENT_PROGRESS`]'s counters at the last look, by name.
+  counters: Vec<(&'static str, u64)>,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for Stalled {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "waiting for {}: no progress for {:?} (the window, {:?}, is {CONTENT_STALLED_INTERVALS} sweep intervals); {} \
+       left; the content counters {:?}",
+      self.what, self.since_progress, self.window, self.left, self.counters
+    )
+  }
+}
+
+/// Waits until `left` answers zero while the content plane progresses: `left` falls, or one of
+/// [`CONTENT_PROGRESS`]'s counters rises (its sweep ticked, or sealed). Answers the last `left`; [`Stalled`] once
+/// [`CONTENT_STALLED_INTERVALS`] sweep intervals pass with neither. Until 2026-11-22 these waits were unbounded loops
+/// (6ad65005a took their wall bounds out), which a sweep that never came left spinning until CI's job timeout, saying
+/// nothing.
+#[cfg(target_os = "linux")]
+fn until_content_settles(
+  client: &mut Client,
+  what: &'static str,
+  mut left: impl FnMut(&mut Client) -> usize,
+) -> Result<usize, Stalled> {
+  let window = Duration::from_nanos(
+    slates_server::daemon::LIVENESS_BUDGET_NS.saturating_mul(CONTENT_STALLED_INTERVALS),
+  );
+  let read = |client: &mut Client| -> Vec<u64> {
+    CONTENT_PROGRESS
+      .iter()
+      .map(|kind| counter(client, kind))
+      .collect()
+  };
+  let mut last_left = left(client);
+  let mut last_counters = read(client);
+  let mut progressed = Instant::now();
+  while last_left > 0 {
+    if progressed.elapsed() >= window {
+      return Err(Stalled {
+        what,
+        since_progress: progressed.elapsed(),
+        window,
+        left: last_left,
+        counters: CONTENT_PROGRESS
+          .iter()
+          .copied()
+          .zip(last_counters)
+          .collect(),
+      });
+    }
+    std::thread::yield_now();
+    let now_left = left(client);
+    let now_counters = read(client);
+    if now_left < last_left || now_counters != last_counters {
+      progressed = Instant::now();
+    }
+    last_left = now_left;
+    last_counters = now_counters;
+  }
+  Ok(last_left)
+}
+
 /// Condition 9, a deleted file, and the cost of the rule that scrubs it. Do: write a marker file, publish every shard (as
 /// a transport's barrier does), delete the file, and leave the volume idle; then watch the shards' publications for a
 /// few sweep intervals. Expect: the marker gone from the content object within the bound, and then no further publication: the
@@ -4204,11 +4298,10 @@ fn a_deleted_files_plaintext_leaves_the_content_object() {
   daemon.publish_every_shard().unwrap();
   let written = occurrences_in_content(&content, MARKER);
   client.fs_remove((volume, attachment), "gone").unwrap();
-  let mut left = occurrences_in_content(&content, MARKER);
-  while left > 0 {
-    std::thread::yield_now();
-    left = occurrences_in_content(&content, MARKER);
-  }
+  let left = until_content_settles(&mut client, "the deleted file's plaintext to leave", |_| {
+    occurrences_in_content(&content, MARKER)
+  })
+  .unwrap_or_else(|stalled| panic!("{stalled}"));
   let published = |daemon: &Daemon| -> u64 {
     daemon
       .db_publication_counters()
@@ -4270,15 +4363,15 @@ fn a_sealed_files_plaintext_leaves_the_content_object() {
     .unwrap();
   let content = format!("slates-con-{tag}");
   let written = occurrences_in_content(&content, MARKER);
-  while counter(&mut client, "content.sealed") == 0 {
-    std::hint::spin_loop();
-  }
+  until_content_settles(&mut client, "the idle sweep to seal the file", |client| {
+    usize::from(counter(client, "content.sealed") == 0)
+  })
+  .unwrap_or_else(|stalled| panic!("{stalled}"));
   let sealed = counter(&mut client, "content.sealed");
-  let mut left = occurrences_in_content(&content, MARKER);
-  while left > 0 {
-    std::thread::yield_now();
-    left = occurrences_in_content(&content, MARKER);
-  }
+  let left = until_content_settles(&mut client, "the sealed file's plaintext to leave", |_| {
+    occurrences_in_content(&content, MARKER)
+  })
+  .unwrap_or_else(|stalled| panic!("{stalled}"));
   let read = client.read(volume, "secret", slates_ipc::protocol::ReadAt::Head);
   daemon.stop();
   drop(anchor);
