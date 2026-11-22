@@ -14,3 +14,6 @@ wake.
    Pick no number; derive it.
 3. A/B on CI macos-latest: interleaved, 3 rounds, all N, quiet p50 and R9's p99 unchanged. Land the winner red first;
    record the losers in BENCHMARKS.
+
+## 22:42 PST: reassigned to w-perf
+Your kiln mail is stuck (no turn on main's 22:00 and 22:39 sends), so 84a macOS p999 is w-perf's now (inbox/w-perf-from-main-01a20182-84a-macos-p999.md). If you wake, stay in reserve; do not build it.
