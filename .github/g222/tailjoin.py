@@ -165,3 +165,54 @@ for label, low in (("p99 tail", .99), ("p999 tail", .999)):
         if verbs:
             print("     long serves overlapping, by time: " + "; ".join(
                 f"{verb} {us(ns)} us" for verb, ns in sorted(verbs.items(), key=lambda item: -item[1])[:6]))
+
+# w-perf 84a: the client-to-shard wake, hop by hop, for each tail request that landed while its shard was parked and
+# whose park ended without the runtime's own kick: did the client ring (it saw the shard's idle announcement), when
+# did the doorbell thread wake after the ring, when did it kick the shard, and when did the shard's park end.
+sends = {}
+for row in rows(base + ".polls.sends"):
+    if len(row) >= 5:
+        sends[(row[0], row[1])] = row
+bell = {}
+for row in rows(base + ".polls.bell"):
+    if len(row) >= 4:
+        bell.setdefault(row[2], []).append(row)
+for shard in bell:
+    bell[shard].sort(key=lambda row: row[3])
+if sends:
+    for label, low in (("p99 tail", .99), ("p999 tail", .999)):
+        tail = total[int(n * low):]
+        hops = {"no ring (client saw no announcement)": [], "rang": []}
+        ring_to_wake, wake_to_kick, kick_to_run, landed_to_ring = [], [], [], []
+        unkicked = 0
+        for r in tail:
+            landed, shard = r[2], r[-1]
+            holding = [park for _, park in overlap(by_shard_parks.get(shard, []), landed, landed + 1)]
+            if not holding or holding[0][2] == 1:
+                continue
+            park_end = holding[0][1]
+            send = sends.get((r[-3], r[-2]))
+            if send is None:
+                continue
+            if send[3] == 0:
+                hops["no ring (client saw no announcement)"].append(park_end - landed)
+                continue
+            hops["rang"].append(park_end - landed)
+            rung = send[4]
+            landed_to_ring.append(rung - landed)
+            kicks = bell.get(shard, [])
+            at = bisect.bisect_left([row[3] for row in kicks], rung)
+            if at >= len(kicks) or kicks[at][3] > park_end + 50_000:
+                unkicked += 1
+                continue
+            woke, _, _, kicked = kicks[at]
+            ring_to_wake.append(max(0, woke - rung))
+            wake_to_kick.append(kicked - max(woke, rung))
+            kick_to_run.append(park_end - kicked)
+        print(f" wake hops, {label}: " + "; ".join(f"{name} {len(v)} (park ended after landing med {us(med(v))} us)"
+                                                 for name, v in hops.items() if v))
+        if hops["rang"]:
+            print(f"   landed -> rung med {us(med(landed_to_ring))} us; rung -> bell thread woke med {us(med(ring_to_wake))} "
+                  f"(max {us(max(ring_to_wake, default=0))}); woke -> kicked med {us(med(wake_to_kick))}; "
+                  f"kicked -> shard ran med {us(med(kick_to_run))} (max {us(max(kick_to_run, default=0))}); "
+                  f"rung but no kick before the park ended {unkicked}")

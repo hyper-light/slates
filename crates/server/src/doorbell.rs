@@ -124,6 +124,7 @@ fn run(
         return;
       }
     };
+    let g222_woke = slates_machine::clock::monotonic_ns();
     let rang = now != seen;
     seen = now;
     if stopped(stop) {
@@ -139,7 +140,9 @@ fn run(
           return;
         }
       };
+      let g222_took = slates_machine::clock::monotonic_ns();
       kick_pending(&pending, kicks, rang_flag);
+      crate::g222_diag::bell(g222_woke, g222_took, &pending.shards);
     }
   }
 }

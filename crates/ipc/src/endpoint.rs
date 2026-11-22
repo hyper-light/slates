@@ -93,6 +93,47 @@ pub static G222_CPARKS: [[std::sync::atomic::AtomicU64; 4]; 300_000] =
 #[allow(clippy::disallowed_types)]
 pub static G222_CPARKS_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Diagnostic only (w-perf 84a, never main): per client send, (request word, published ns, 1 if the shard had announced
+/// idle so the client rang, the ring's end ns or 0).
+#[doc(hidden)]
+#[allow(clippy::disallowed_types)]
+pub static G222_SENDROWS: [[std::sync::atomic::AtomicU64; 4]; 600_000] =
+  [const { [const { std::sync::atomic::AtomicU64::new(0) }; 4] }; 600_000];
+/// Diagnostic only (w-perf 84a, never main).
+#[doc(hidden)]
+#[allow(clippy::disallowed_types)]
+pub static G222_SENDROWS_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Diagnostic only (w-perf 84a, never main): the client's sends as TSV (client, sequence, published, rang, rung).
+#[doc(hidden)]
+#[allow(
+  clippy::all,
+  clippy::pedantic,
+  clippy::disallowed_methods,
+  clippy::disallowed_types
+)]
+pub fn g222_dump_sends(path: &str) {
+  use std::io::Write;
+  let n = G222_SENDROWS_N
+    .swap(0, Ordering::Relaxed)
+    .min(G222_SENDROWS.len());
+  let mut out = String::from("client\tsequence\tpublished\trang\trung\n");
+  for row in G222_SENDROWS.iter().take(n) {
+    let word = row[0].load(Ordering::Relaxed);
+    out.push_str(&format!(
+      "{}\t{}\t{}\t{}\t{}\n",
+      word >> 32,
+      word & u64::from(u32::MAX),
+      row[1].load(Ordering::Relaxed),
+      row[2].load(Ordering::Relaxed),
+      row[3].load(Ordering::Relaxed)
+    ));
+  }
+  if let Ok(mut f) = std::fs::File::create(path) {
+    let _ = f.write_all(out.as_bytes());
+  }
+}
+
 /// Diagnostic only (w-perf 84a, never main): the client's parks as TSV.
 #[doc(hidden)]
 #[allow(
@@ -754,6 +795,7 @@ impl ClientEnd {
   /// a shard that missed this request on its re-check is always rung, and only that shard is woken (A-381).
   pub fn send(&mut self, slot: &Slot) -> Result<(), IpcError> {
     let cmd = self.region.cmd();
+    let g222_published = slates_machine::clock::monotonic_ns();
     let stamp = crate::slot::stamp_now();
     cmd.push(self.region.object_mut(), self.next_request, slot, stamp)?;
     self.request_stamp = stamp;
@@ -770,6 +812,20 @@ impl ClientEnd {
       if let Some(bell) = &self.doorbell {
         bell.ring(self.region.shard())?;
       }
+    }
+    let g222_n = G222_SENDROWS_N.fetch_add(1, Ordering::Relaxed);
+    if let Some(row) = G222_SENDROWS.get(g222_n) {
+      row[0].store(slot.request, Ordering::Relaxed);
+      row[1].store(g222_published, Ordering::Relaxed);
+      row[2].store(u64::from(parked), Ordering::Relaxed);
+      row[3].store(
+        if parked {
+          slates_machine::clock::monotonic_ns()
+        } else {
+          0
+        },
+        Ordering::Relaxed,
+      );
     }
     Ok(())
   }

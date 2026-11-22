@@ -602,6 +602,43 @@ pub fn dump_ring(path: &str) {
 pub fn dump_polls(path: &str) {
   slates_rt::g222_polls::dump(path);
   dump_serves(&format!("{path}.serves"));
+  slates_ipc::endpoint::g222_dump_sends(&format!("{path}.sends"));
+  dump_bell(&format!("{path}.bell"));
+}
+
+/// Shape: doorbell thread kicks kept.
+const BELL_CAP: usize = 600_000;
+/// w-perf 84a: per shard the doorbell thread kicked, (its wait's return ns, its marks taken ns, the shard, kicked ns).
+static BELL: std::sync::Mutex<Vec<(u64, u64, u16, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// w-perf 84a: the doorbell thread woke at `woke`, took its marks at `took`, then kicked `shards`.
+pub fn bell(woke: u64, took: u64, shards: &[u16]) {
+  let kicked = slates_machine::clock::monotonic_ns();
+  if let Ok(mut rows) = BELL.lock() {
+    if shards.is_empty() && rows.len() < BELL_CAP {
+      rows.push((woke, took, u16::MAX, kicked));
+    }
+    for shard in shards {
+      if rows.len() < BELL_CAP {
+        rows.push((woke, took, *shard, kicked));
+      }
+    }
+  }
+}
+
+fn dump_bell(path: &str) {
+  use std::io::Write;
+  let rows = BELL
+    .lock()
+    .map(|mut rows| std::mem::take(&mut *rows))
+    .unwrap_or_default();
+  let mut out = String::from("woke\ttook\tshard\tkicked\n");
+  for (woke, took, shard, kicked) in rows {
+    out.push_str(&format!("{woke}\t{took}\t{shard}\t{kicked}\n"));
+  }
+  if let Ok(mut f) = std::fs::File::create(path) {
+    let _ = f.write_all(out.as_bytes());
+  }
 }
 
 /// w-perf 84a: a serve this long (or longer) is recorded with its verb: past every quantum the shards derive here.
