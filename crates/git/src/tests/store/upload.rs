@@ -369,15 +369,18 @@ fn files_named(format: ObjectFormat, pack: &[u8], objects: &[Made]) -> Vec<(Obje
 /// holds (the two files' bytes and `Search::held_most` of them), with `ofs-delta` and without, in one turn and a unit
 /// a turn; then within one byte less. Expect: with the room, the earlier file whole and the later a delta naming it,
 /// by its offset back or, without `ofs-delta`, by its id; the same bytes over any turns; every byte given back by the
-/// stream's end; read back to the version's objects, each once. One byte short: both files whole, the fall-back
-/// counted once, every byte given back.
+/// stream's end but the loose stage's table of where each object begins (A-859), charged once; read back to the
+/// version's objects, each once. One byte short: both files whole, the fall-back counted once, every byte given back
+/// but that table.
 #[test]
 fn an_object_past_a_window_gets_a_delta_exactly_when_its_search_fits_the_admission() {
   let format = ObjectFormat::Sha1;
   let mut store = store();
   let (repository, objects) = two_large_files(format, &mut store);
   let (first, second) = (objects[2].content.len(), objects[3].content.len());
-  let charge = to_u64(first + second) + Search::held_most(first, second);
+  // A-859: the loose stage's table of where each object it sends begins, a word pair an object, charged once.
+  let table = to_u64(objects.len() * size_of::<(u64, u64)>());
+  let charge = to_u64(first + second) + Search::held_most(first, second) + table;
   let mut answer = Answer::objects(&repository.brought(&store, 1, 0).unwrap());
   for ofs in [true, false] {
     answer.ofs = ofs;
@@ -387,7 +390,7 @@ fn an_object_past_a_window_gets_a_delta_exactly_when_its_search_fits_the_admissi
     let later = if ofs { Names::Offset } else { Names::Id(base) };
     assert_eq!(
       (named[0].1, named[1].1, left),
-      (Names::Whole, later, [charge, charge])
+      (Names::Whole, later, [charge - table, charge - table])
     );
     let loose = (
       counters.loose_whole,
@@ -409,7 +412,7 @@ fn an_object_past_a_window_gets_a_delta_exactly_when_its_search_fits_the_admissi
       Names::Whole,
       Names::Whole,
       (4, 0, 1),
-      [charge - 1, charge - 1]
+      [charge - 1 - table, charge - 1 - table]
     )
   );
   repository.release(&mut store).unwrap();

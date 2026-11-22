@@ -661,6 +661,11 @@
 > learned demand) and was refused `PastRoom`, so branch, tag and master pushes failed on git/git. Now it runs within its
 > repository's room as it is built and waits for room past it (`vcs_share::wait`, shared with hg). Owed: A-855's fetch
 > wait moved onto it; main's matrix and git/git rerun (master's "cannot lock ref" judged there).
+> A-859 BUILT, part B (2026-11-22, w-git; main 03:38): a git/git clone moved 4-5 GiB, every object whole and
+> uncompressed (the encoder priced a byte at memcpy's 0.14 ns). Now an object pushed in a pack is sent on as its entry
+> lies there, checked against its name first, its delta reused where its base precedes it (`t_a859_…`: 20,916 bytes
+> against the pushed 17,299, where 89,439 went before). Owed: part A, a fetched byte priced at the network (§4.11);
+> main's git/git whole round and `fsck --strict`.
 > R2, the load-only edge tests, CLOSED (2026-11-21, w-git): a push's answer under side-band-64k wrote its first
 > keepalive two intervals after its body (`body_end` waited one interval unwritten, then the reply its own before
 > appending it), 10 s, the client's patience, so every push answer past 5 s failed (18 of 18 at load 24, the timing
@@ -2888,8 +2893,10 @@
 > The session then went red on `svn status -u -v --xml`, the test's own: the same 15 entries, the same in every
 > field, in two orders, since stock `svn` reports a directory's children in its working copy's hash order, seeded afresh
 > each run. FIXED in the comparison (w-svn): a status's entries are compared in text order, every other output's as
-> answered (`entries_in_order`; `the_comparison_leaves_status_entry_order_out_and_nothing_else`). Owed: main's rerun
-> on macos-latest, and w-lint's Linux and Windows cross-target round. Windows spawns no hooks yet (A-622's Windows
+> answered (`entries_in_order`; `the_comparison_leaves_status_entry_order_out_and_nothing_else`). **CLOSED by use**
+> (main 01a20182's CI 45021179639, 2026-11-22, macos-latest, Homebrew svn 1.15.0, at 272513fe4 on 738b4e0af): the
+> session passes 1 of 1 in 33.54 s, byte for byte against `svnserve`, and the guard leaves 0 views mounted. Owed:
+> w-lint's Linux and Windows cross-target round. Windows spawns no hooks yet (A-622's Windows
 > part), so it has no seam to change.
 > **svn replay by stock clients (w-interop, 2026-11-20; A-703):** `svn-matrix.sh` gains `svnrdump dump` and
 > `svnsync initialize/synchronize` over svn://, each compared with the dump stock svnserve 1.15.0 made of the same history
