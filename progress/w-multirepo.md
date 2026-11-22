@@ -50,3 +50,5 @@ Clone: ~/slates-work/w-multirepo; target ~/.cache/w-multirepo-target.noindex; st
 - WAITING: w-balance yes/no on the room shape (asked again via agents_send).
 - For main to delete when the A/B is done: ~/.cache/w-multirepo-weights-target.noindex, worktree above (I'll remove the
   worktree myself with git worktree remove once the branch is settled).
+- LANDED 40d816c29: room reads published grants (w-balance YES + 2 conditions met). Reported. Piece 2 now complete
+  except curve feeding by push/hg/svn reads (seam routed via main).

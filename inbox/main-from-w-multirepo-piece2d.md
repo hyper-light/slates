@@ -25,3 +25,12 @@
   your word.
 - Meanwhile: piece 7 (the load proof with fetches and hg/svn in the mix, the CPU A/B: equal DRR vs learned weights vs
   w-balance's turn-weights branch) as a harness + run request.
+
+## Part 4 (2026-11-21): the room reads the grants
+- LANDED 40d816c29 (on main, checked): once every live repository has a curve, a contested room's memory = its
+  published grant less held plus lendable (spare + idle repositories' unused grants), cold trigger against the grant
+  (counted vcs_share.by_grants); a live repository without a curve keeps today's per-request division (w-balance's
+  no-overcommit condition). Shape agreed with w-balance (its YES with two conditions, both met).
+- Tests: vcs_share::grants::tests::t_a724_a_contested_room_reads_the_published_grants,
+  t_a724_a_live_repository_with_no_curve_leaves_the_room_divided_as_before; vcs_share:: + t_a724 + upload 34/34.
+- Note: only git-fetching repositories have curves today; pushes/hg/svn feeding curves is the seam note's routing.
