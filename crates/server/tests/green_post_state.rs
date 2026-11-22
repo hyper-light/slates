@@ -677,6 +677,14 @@ fn prepared_and_taken(counts: &std::collections::BTreeMap<&'static str, u64>) {
 /// and 16 step quanta, its longest turn, the submit's longest step and those past the ceiling, and the submits' phases
 /// summed. The job's turns and the submit's longest step.
 fn refinement_reported(counts: &std::collections::BTreeMap<&'static str, u64>) -> (u64, u64) {
+  let (turns, _, submit_longest) = refinement_units_reported(counts);
+  (turns, submit_longest)
+}
+
+/// [`refinement_reported`], with the units the jobs ran (`merge.refine.units`): (turns, units, the submit's longest step).
+fn refinement_units_reported(
+  counts: &std::collections::BTreeMap<&'static str, u64>,
+) -> (u64, u64, u64) {
   let turns = counts.get("merge.refine.turns").copied().unwrap_or(0);
   let past: Vec<u64> = [
     "merge.refine.past_quantum",
@@ -692,7 +700,10 @@ fn refinement_reported(counts: &std::collections::BTreeMap<&'static str, u64>) -
     .get("merge.refine.longest_turn_us")
     .copied()
     .unwrap_or(0);
-  eprintln!("refinement: {turns} turns, past 1/2/4/16 quanta: {past:?}, longest {longest} us");
+  let units = counts.get("merge.refine.units").copied().unwrap_or(0);
+  eprintln!(
+    "refinement: {turns} turns of {units} units, past 1/2/4/16 quanta: {past:?}, longest {longest} us"
+  );
   let submit_longest = counts
     .get("merge.submit.longest_step_us")
     .copied()
@@ -711,7 +722,8 @@ fn refinement_reported(counts: &std::collections::BTreeMap<&'static str, u64>) -
     phase("merge.submit.judge_ns"),
     phase("merge.submit.append_ns")
   );
-  (turns, submit_longest)
+  let units = counts.get("merge.refine.units").copied().unwrap_or(0);
+  (turns, units, submit_longest)
 }
 
 /// A source file of at least `len` bytes, one call a line, each line distinct.
@@ -736,11 +748,85 @@ fn reindented(text: &str) -> String {
     .collect()
 }
 
+/// Shape: the files [`a_small_rewrites_refinement_runs_its_units_in_paced_turns`] re-indents, as the edit-and-merge
+/// bench's ten files.
+const SMALL_REWRITE_FILES: usize = 10;
+/// Shape: each such file's size, a few KiB of source lines.
+const SMALL_REWRITE_BYTES: usize = 4 << 10;
+
+/// Goal 84a (found by use: CI macos-latest, run 45000596198; 9,000 submits a round parked behind their refinement, whose
+/// job yielded after each of its 10 to 12 units, so each waited out that many trips round the shard's ready tasks, the
+/// submits' loaded p999 850-1,394 µs). Do: on a one-shard daemon, seed a green with [`SMALL_REWRITE_FILES`] files of
+/// [`SMALL_REWRITE_BYTES`]; from one work, re-indent every line of each (a formatter's pass, saved whole); submit it.
+/// Expect: accepted, every head re-indented, and the refinement's job having run its units (`merge.refine.units`) in
+/// fewer turns than units (`merge.refine.turns`): with no one else waiting on the shard a paced turn takes the next unit
+/// (A-783's turn), where a turn a unit yielded after each.
+#[test]
+fn a_small_rewrites_refinement_runs_its_units_in_paced_turns() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-refine-paced-{}", std::process::id());
+  let daemon = Daemon::start(
+    &profile,
+    DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS)),
+    slates_server::SegmentSource::Create {
+      name: common::fixture_object("slates-seg", "refine-paced"),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let green = client.create_green("refine-paced-green", false).unwrap();
+  let (seed, _) = client.create_work(green, "refine-paced-seed").unwrap();
+  let files: Vec<(String, String)> = (0..SMALL_REWRITE_FILES)
+    .map(|n| (format!("f{n}"), generated_calls(SMALL_REWRITE_BYTES)))
+    .collect();
+  for (name, text) in &files {
+    client.edit(seed, name, 0, 0, text.as_bytes()).unwrap();
+  }
+  let seeded = client.submit(seed);
+  let (formatter, _) = client.create_work(green, "refine-paced-format").unwrap();
+  for (name, text) in &files {
+    let whole = u64::try_from(text.len()).unwrap();
+    client
+      .edit(formatter, name, 0, whole, reindented(text).as_bytes())
+      .unwrap();
+  }
+  let format = client.submit(formatter);
+  let heads: Vec<bool> = files
+    .iter()
+    .map(|(name, text)| {
+      client.read(green, name, ReadAt::Head).as_deref().ok() == Some(reindented(text).as_bytes())
+    })
+    .collect();
+  let counts = daemon.refusals_on_every_shard().unwrap();
+  let (turns, units, _) = refinement_units_reported(&counts);
+  drop(client);
+  daemon.stop();
+  assert!(
+    matches!(seeded, Ok(Submitted::Accepted(1))),
+    "seeded: {seeded:?}"
+  );
+  assert!(
+    matches!(format, Ok(Submitted::Accepted(2))),
+    "format: {format:?}"
+  );
+  assert!(
+    heads.iter().all(|head| *head),
+    "every head re-indented: {heads:?}"
+  );
+  assert!(
+    turns > 0 && turns < units,
+    "the job's units ran in fewer turns: {turns} turns of {units} units"
+  );
+}
+
 /// Close item R3 (A-787 part 2). Do: on a one-shard daemon, seed a green's `f` with 2 MiB of source lines; from one work,
 /// change one call in it by a declared edit; from another, re-indent every line of the file (a formatter's pass, saved
 /// whole); submit the edit, then the pass. Expect: both accepted, the head the re-indented file with the edit, and the
-/// refinement having run as a job of the shard over many turns (`merge.refine.turns`), never inside the verb. Until
-/// A-787 part 2 the submit refined the 2 MiB in its own step.
+/// refinement having run as a job of the shard over many units (`merge.refine.units`), never inside the verb, in fewer
+/// paced turns than units. Until A-787 part 2 the submit refined the 2 MiB in its own step.
 #[test]
 fn a_large_rewrite_is_refined_over_many_turns_off_the_submit() {
   let profile = common::machine_profile();
@@ -776,7 +862,7 @@ fn a_large_rewrite_is_refined_over_many_turns_off_the_submit() {
   let format = client.submit(formatter);
   let head = client.read(green, "f", ReadAt::Head);
   let counts = daemon.refusals_on_every_shard().unwrap();
-  let (turns, submit_longest) = refinement_reported(&counts);
+  let (turns, units, submit_longest) = refinement_units_reported(&counts);
   drop(client);
   daemon.stop();
   assert!(
@@ -796,7 +882,12 @@ fn a_large_rewrite_is_refined_over_many_turns_off_the_submit() {
     head.as_deref().ok() == Some(expected.as_bytes()),
     "the head is the re-indented file with the edit"
   );
-  assert!(turns > 50, "the refinement ran over many turns: {turns}");
+  // The job's work ran as many units off the verb; its paced turns gather them while no one else waits (A-783's turn,
+  // goal 84a), so the turns are fewer than the units and at least one.
+  assert!(
+    units > 50 && (1..units).contains(&turns),
+    "the refinement ran over many units in fewer turns: {turns} turns of {units} units"
+  );
   // The formatter's submit waited on its refinement, and the refinement job prepared its increment, its verdict and
   // its encoding a bounded slice a turn, which the submit took (A-787 part 3): its step judges by position and commits.
   // Its commit's history re-anchor (A-818's) and the chain's append still run in that step; the step's bound is held
