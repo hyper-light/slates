@@ -958,8 +958,10 @@
 > working set's miss-ratio curve and memory by marginal utility, CPU weights, the shares published to siblings.
 > Piece 3b landed (2026-11-21): a git push past its share is refused typed (`PushFailed::PastShare`, or `PastSnapshot`
 > past the slot's room) and retryable (`503`, words naming the share). Piece 3c landed: Mercurial's pushes counted live
-> and learned. Owed in piece 3: Mercurial's share refusal in its words, Subversion's intakes live and its words,
-> backpressure before refusal, a fetch's room as a claim.
+> and learned; Subversion's commits too (at `land_work`). **Open, found reading it:** no Subversion commit is admitted
+> against the room at all: its texts arrive into the conversation's sink with no admission, so a commit's bytes are
+> bounded by the edge's item limits alone, not the shard's room or the repository's share. Owed in piece 3: that
+> admission, Mercurial's and Subversion's share refusals in their words, backpressure before refusal, a fetch's room.
 > In flight, paused for goal 93 (2026-11-21): run 31 (cap 3, Studio-2, 9865bb832) found shard-mates took 4.5 s of the
 > busiest repository's 41.3 s span and its shard ran steps 23.2 s of it: its own three pushes of one agent shared one
 > turn. The fix (a turn an agent, spare turns taken; red first) is on branch agents/w-balance-turn-weights, 928df7d1b,
