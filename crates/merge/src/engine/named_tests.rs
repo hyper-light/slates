@@ -464,3 +464,40 @@ fn spliced_and_created(
   assert_eq!(created, whole);
   assert_eq!(created.as_ptr(), whole_buffer, "the whole run was copied");
 }
+
+/// Goal 93, A-760 for a recorded version (main 01a20182's ruling of 2026-11-22 ~13:35, the Subversion import's batch:
+/// its real green applies each version as its entry records it, after the scratch member judged it). Do: judge and
+/// commit a work creating `big` from a 4 MiB named run on one green; on a fresh green, apply the version as its entry
+/// records it (`Green::apply_recorded`) from the same work read again. Expect: the replayed file the text's bytes and
+/// the very buffer its run was read into (no copy), its head identity the judged green's. Failing first: the recorded
+/// apply made the file with `apply`, a copy of the run's bytes (the import's 12.3 MB `apply` ← `apply_recorded` site).
+#[test]
+fn a_recorded_versions_whole_run_becomes_the_file_with_no_copy() {
+  const TEXT: usize = 4 << 20;
+  let bytes: Vec<u8> = (0..TEXT)
+    .map(|at| u8::try_from(at % 239).unwrap())
+    .collect();
+  let mut plane = Plane::default();
+  let object = plane.put(bytes.clone());
+  let mut judged_work = named_create("big", object);
+  while !judged_work.read_step(&plane, 1 << 20).unwrap() {}
+  let mut judging = Green::new();
+  let judged = match judging.judge_named(&mut judged_work) {
+    super::Judgment::Accepted(judged) => judged,
+    other => panic!("not accepted: {other:?}"),
+  };
+  let (version, applied) = judging.commit_judged(judged).unwrap();
+  let mut work = named_create("big", object);
+  while !work.read_step(&plane, 1 << 20).unwrap() {}
+  let buffer = work.post().runs[0].as_ptr();
+  let mut replaying = Green::new();
+  assert_eq!(replaying.apply_recorded(&mut work, &applied), version);
+  assert_eq!(replaying.head_identity(), judging.head_identity());
+  let file = replaying.content("big").unwrap();
+  assert_eq!(file, bytes.as_slice());
+  assert_eq!(
+    file.as_ptr(),
+    buffer,
+    "the recorded file is a copy of its run"
+  );
+}

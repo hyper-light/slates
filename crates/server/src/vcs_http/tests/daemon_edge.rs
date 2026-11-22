@@ -3362,82 +3362,162 @@ fn a_mercurial_push_parks_for_its_repositorys_landing_turn_and_no_other_waits() 
   assert_eq!(unmoved, heads, "the refused push moved nothing");
 }
 
-/// Format: the segment bound [`a_small_push_waits_behind_a_whole_history_push_for_its_landing_turn`]'s long push is cut
-/// at, so its run takes the turn at its first few changesets.
+/// Format: the segment bound a long push of [`a_one_changeset_push_lands_during_a_long_push_and_readers_see_only_named`]
+/// and [`a_long_push_stale_twice_is_re_based_once_holding_the_turn_and_lands`] is cut at, so its run lands segments
+/// from its first few changesets.
 const LONG_SEGMENT_BYTES: u64 = 32 * 1024;
 
-/// Format: the changesets of [`a_small_push_waits_behind_a_whole_history_push_for_its_landing_turn`]'s long push: a
-/// line long enough to land as tens of segments, short enough to answer within a client's patience in a debug build
-/// under a whole suite's load.
-const LONG_CHANGESETS: usize = 200;
+/// Starts a push of a line of [`FRESH_CHANGESETS`] changesets to `name` on a thread of its own, cut at
+/// [`LONG_SEGMENT_BYTES`] and parked once its run has landed two segments (`hg_run::TEST_PARK_AFTER_SEGMENTS`), its
+/// segments unnamed; returns the line's tip and the push's thread once it has parked.
+fn a_long_push_parked(
+  daemon: &Daemon,
+  (port, certificate): (u16, &CertificateDer<'static>),
+  name: &str,
+) -> (
+  slates_hg::Node,
+  std::thread::JoinHandle<(u16, String, Vec<u8>)>,
+) {
+  crate::daemon::observe_at(daemon, REPOSITORY, |_| {
+    crate::repository::hg_run::TEST_SEGMENT_BYTES.with(|bound| bound.set(LONG_SEGMENT_BYTES));
+    crate::repository::hg_run::TEST_PARK_AFTER_SEGMENTS.with(|park| park.set(2));
+    crate::repository::hg_run::TEST_RELEASE.with(|release| release.set(false));
+  });
+  let (made, bundle) = a_line_of(FRESH_CHANGESETS);
+  let long = {
+    let (certificate, name) = (certificate.clone(), name.to_owned());
+    std::thread::spawn(move || hg_unbundle((port, &certificate), &name, &bundle))
+  };
+  while counted_on(
+    daemon,
+    REPOSITORY,
+    crate::repository::hg_run::SEGMENTS_LANDED,
+  ) < 2
+  {
+    assert!(
+      !long.is_finished(),
+      "the long push answered before it parked"
+    );
+    std::thread::sleep(Duration::from_millis(5));
+  }
+  (made[FRESH_CHANGESETS - 1].node, long)
+}
 
-/// Main 01a20182's ruling (i) of 2026-11-22 04:44 ("measure how long a small push waits behind a whole-history push and
-/// record it in GAPS"). Do: start a two-shard daemon over loopback TLS; create a Mercurial repository; push a line of
-/// [`LONG_CHANGESETS`] changesets on a thread of its own, cut at [`LONG_SEGMENT_BYTES`]; once its run holds the
-/// repository's landing turn, push one unrelated changeset with no bookmark. Expect both `200`; the small push parked
-/// once, its wait counted; and the repository's heads both pushes' tips. Prints the small push's wait and the long
-/// push's span, for GAPS.
+/// Lets a long push parked by [`a_long_push_parked`] go on.
+fn release_long_push(daemon: &Daemon) {
+  crate::daemon::observe_at(daemon, REPOSITORY, |_| {
+    crate::repository::hg_run::TEST_RELEASE.with(|release| release.set(true));
+  });
+}
+
+/// Main 01a20182's rulings of 2026-11-22 07:32 and 12:00 (staging: a push lands its segments apart from its
+/// repository's landing turn, which it takes only for its entry's commit; readers see only named sequences). Do: start a
+/// two-shard daemon over loopback TLS; create a Mercurial repository; start a push of [`FRESH_CHANGESETS`] changesets
+/// and park it once two of its segments have landed; ask `heads`; push one unrelated changeset with no bookmark; ask
+/// `heads` and `lookup` the long push's tip; let the long push go on; ask `heads`. Expect the one-changeset push `200`
+/// with no wait for the landing turn (before: it waited out the long push's run, 69 to 80% of its span in release);
+/// `heads` the empty repository's, then the small push's tip alone, the long push's tip unknown, though its segments
+/// are on the store; the long push then `200`, its fork re-based over the small push's entry, and `heads` both tips.
 #[test]
-fn a_small_push_waits_behind_a_whole_history_push_for_its_landing_turn() {
+fn a_one_changeset_push_lands_during_a_long_push_and_readers_see_only_named() {
   let (identity, certificate) = identity();
   let (daemon, _instance) = daemon_named(Some(identity));
   let port = daemon.vcs_http_port().expect("the edge started");
   let name = hg_name_on_the_repositorys_partition();
   enroll(&daemon, OWNER_TOKEN, OWNER, None);
-  let (made, bundle) = a_line_of(LONG_CHANGESETS);
   create_empty_hg(&daemon, &name);
-  crate::daemon::observe_at(&daemon, REPOSITORY, |_| {
-    crate::repository::hg_run::TEST_SEGMENT_BYTES.with(|bound| bound.set(LONG_SEGMENT_BYTES));
-  });
-  let began = std::time::Instant::now();
-  let long = {
-    let (certificate, name) = (certificate.clone(), name.clone());
-    std::thread::spawn(move || hg_unbundle((port, &certificate), &name, &bundle))
-  };
-  let held = loop {
-    let held = crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
-      state
-        .refusals
-        .get(crate::repository::hg_run::SEGMENTS_LANDED)
-        .copied()
-        .unwrap_or(0)
-        > 0
-    });
-    if held || long.is_finished() {
-      break held;
-    }
-    // The harness paces its looks at the long push's turn; the daemon under test waits on its drivers.
-    #[allow(clippy::disallowed_methods)]
-    std::thread::sleep(Duration::from_millis(5));
-  };
+  let edge = (port, &certificate);
+  let (long_tip, long) = a_long_push_parked(&daemon, edge, &name);
+  let empty = hg_command(edge, &name, "heads");
   let small = history_of(&[("lonely", "lonely", b"a small push\n", None, "default")]);
-  let pushed = hg_unbundle((port, &certificate), &name, &bundle_of(&small, &[0], None));
-  let long = long.join().expect("the long push answered");
-  let span = began.elapsed();
-  let counted = |name: &'static str| {
-    crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
-      state.refusals.get(name).copied().unwrap_or(0)
-    })
-  };
-  let (waits, waited_ns, segments) = (
-    counted(crate::repository::hg_run::TURN_WAITS),
-    counted(crate::repository::hg_run::TURN_WAITED_NS),
-    counted(crate::repository::hg_run::SEGMENTS_LANDED),
+  let began = std::time::Instant::now();
+  let pushed = hg_unbundle(edge, &name, &bundle_of(&small, &[0], None));
+  let small_took = began.elapsed();
+  let waits = counted_on(&daemon, REPOSITORY, crate::repository::hg_run::TURN_WAITS);
+  let during = hg_command(edge, &name, "heads");
+  let unknown = hg_command(
+    edge,
+    &name,
+    &format!("lookup&key={}", crate::verbs::hex_of(&long_tip)),
   );
-  let heads = hg_command((port, &certificate), &name, "heads");
+  release_long_push(&daemon);
+  let long = long.join().expect("the long push answered");
+  let rebased = counted_on(&daemon, REPOSITORY, crate::repository::hg_run::REBASED);
+  let after = hg_command(edge, &name, "heads");
   daemon.stop();
   println!(
-    "(i) a small push waited {:.1} ms behind a {LONG_CHANGESETS}-changeset push of {segments} segments that took {:.1} ms",
-    waited_ns as f64 / 1e6,
-    span.as_secs_f64() * 1e3
+    "staging: a one-changeset push took {small_took:?} during a {FRESH_CHANGESETS}-changeset push"
   );
-  assert!(held, "the long push's run held the turn before it answered");
-  assert_eq!(long.0, 200, "{}", String::from_utf8_lossy(&long.2));
   assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
-  assert_eq!(waits, 1, "the small push parked once");
-  assert!(waited_ns > 0);
-  let heads = String::from_utf8_lossy(&heads.1).into_owned();
-  for tip in [&made[LONG_CHANGESETS - 1].node, &small[0].node] {
-    assert!(heads.contains(&crate::verbs::hex_of(tip)), "{heads}");
+  assert_eq!(waits, 0, "the small push never waited for the landing turn");
+  assert_eq!(empty, (200, format!("{}\n", "0".repeat(40)).into_bytes()));
+  let small_tip = crate::verbs::hex_of(&small[0].node);
+  assert_eq!(
+    during,
+    (200, format!("{small_tip}\n").into_bytes()),
+    "only the named push"
+  );
+  assert!(
+    !String::from_utf8_lossy(&unknown.1).starts_with("1 "),
+    "the long push's tip unknown: {}",
+    String::from_utf8_lossy(&unknown.1)
+  );
+  assert_eq!(long.0, 200, "{}", String::from_utf8_lossy(&long.2));
+  assert_eq!(
+    rebased, 1,
+    "the long push's fork re-based over the small push's entry"
+  );
+  let after = String::from_utf8_lossy(&after.1).into_owned();
+  for tip in [crate::verbs::hex_of(&long_tip), small_tip] {
+    assert!(after.contains(&tip), "{after}");
+  }
+}
+
+/// Main 01a20182's ruling of 2026-11-22 07:32 (a stale fork's re-base bounded, banned item 8: after one re-base off the
+/// landing turn, the next is taken holding it, so another push can never extend the retry). Do: start a push of
+/// [`FRESH_CHANGESETS`] changesets and park it once two segments have landed; push one unrelated changeset; have the
+/// repository's index counted changed once more right after the long push's first re-base
+/// (`hg_run::TEST_STALE_AFTER_REBASE`, as another push landing then would); let the long push go on. Expect the long
+/// push `200`, re-based twice, the second holding the turn (`vcs.hg.push_rebased_in_turn` 1), and `heads` both tips.
+#[test]
+fn a_long_push_stale_twice_is_re_based_once_holding_the_turn_and_lands() {
+  let (identity, certificate) = identity();
+  let (daemon, _instance) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  create_empty_hg(&daemon, &name);
+  let edge = (port, &certificate);
+  let (long_tip, long) = a_long_push_parked(&daemon, edge, &name);
+  let small = history_of(&[("lonely", "lonely", b"a small push\n", None, "default")]);
+  let pushed = hg_unbundle(edge, &name, &bundle_of(&small, &[0], None));
+  crate::daemon::observe_at(&daemon, REPOSITORY, |_| {
+    crate::repository::hg_run::TEST_STALE_AFTER_REBASE.with(|stale| stale.set(true));
+  });
+  release_long_push(&daemon);
+  let long = long.join().expect("the long push answered");
+  let rebased = (
+    counted_on(&daemon, REPOSITORY, crate::repository::hg_run::REBASED),
+    counted_on(
+      &daemon,
+      REPOSITORY,
+      crate::repository::hg_run::REBASED_IN_TURN,
+    ),
+  );
+  let after = hg_command(edge, &name, "heads");
+  daemon.stop();
+  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
+  assert_eq!(long.0, 200, "{}", String::from_utf8_lossy(&long.2));
+  assert_eq!(
+    rebased,
+    (2, 1),
+    "re-based off the turn, then once holding it"
+  );
+  let after = String::from_utf8_lossy(&after.1).into_owned();
+  for tip in [
+    crate::verbs::hex_of(&long_tip),
+    crate::verbs::hex_of(&small[0].node),
+  ] {
+    assert!(after.contains(&tip), "{after}");
   }
 }

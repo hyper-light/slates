@@ -517,7 +517,7 @@ impl RecordedBatch {
         .greens
         .get_mut(&self.green)
         .filter(|_| read)
-        .map(|mut engine| engine.apply_recorded(&step.increment, &step.applied));
+        .map(|mut engine| engine.apply_recorded(&mut step.increment, &step.applied));
       if applied != Some(version) {
         // Recorded, and not applied as judged: the green is made again from its chain, which holds every version.
         state.count(BATCH_APPLY_REFUSED, 1);

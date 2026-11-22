@@ -424,13 +424,13 @@ pub(crate) fn commit<T, E>(
 /// [`commit`]'s step, its preview held by the caller.
 fn commit_held<T, E>(
   state: &mut ShardState,
-  pending: Pending,
+  mut pending: Pending,
   tool: impl FnOnce(&mut ShardState) -> Result<T, E>,
 ) -> Option<Result<T, E>> {
   let (green, version) = pending.version();
   // The verdict was held, not applied (module docs, 2): it applies now, at the head it was judged at, as its chain
   // entry records it (`Green::apply_recorded`, what a recovery replays). A green that moved meanwhile commits nothing.
-  if !crate::verbs::apply_accepted(state, &pending.parts) {
+  if !crate::verbs::apply_accepted(state, &mut pending.parts) {
     abandon(state, (pending.request(), green));
     return None;
   }
