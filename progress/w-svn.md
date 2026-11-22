@@ -441,3 +441,12 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - Store owner tests 5/5. Server svn tests 113/114: a DAV hook test flaked on a WouldBlock read at load 74, 3/3 alone.
 - Checked first: w-hg holds no unlanded store work.
 - Waiting: main's r18 git-2000 attribution, and the HTTPv2 rerun at 0de4c75ea or later.
+
+## 2026-11-22 ~03:00 PST
+- f301b9f0d: the measurement's footprint read retries a miss, and its bound allows top's 1 MiB resolution.
+- 8db529eec (merged 059578d78): the revprop test's flake was the hook runner. A hook that exited on its own before its
+  kill was timed out with its own code 0; it is now judged by its own exit. The DAV refusal answers its chain's best
+  message.
+- A sibling flake remains: a first-run hook's words pipe inherited by a concurrent spawn. Asked main to rule:
+  (a) no inherited fds, (b) end the drain when the hook's group is empty, (c) both.
+- Waiting: that ruling; the HTTPv2 rerun at 0de4c75ea or later; finding (2)'s routed copies.
