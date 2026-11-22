@@ -707,6 +707,87 @@ fn stock_git_clones_pushes_and_fetches_over_the_vcs_http_edge_with_a_bearer_toke
   round_trip(&git, &format!("http://127.0.0.1:{}/{REPOSITORY}", leg.port));
 }
 
+/// §4.17.2 "A push" and "A fetch" (gitrevisions(7): a ref may name any object; git-tag(1): a tag may tag a blob, a
+/// tree or another tag). Found by use: git/git's `junio-gpg-pub` tags a blob and `v1.0rc1`..`v1.0rc6` name neither a
+/// commit nor a tree; pushing git/git whole to slates refused them ("names neither a commit nor a tree", `! [remote
+/// rejected] v1.0rc3 -> v1.0rc3 (ref names no tree)`) and every whole clone after it failed "possible repository
+/// corruption on the remote side" (w-interop's A/B on main a8ee99bf7, 2026-11-21), where stock git daemon took and
+/// served them. Do: over the HTTP edge, in one push, push a branch with an annotated tag of a blob, a lightweight tag of
+/// the same blob, an annotated tag of that tag, and an annotated tag of a tree; then clone the repository as a mirror.
+/// Expect the push taken whole, the mirror's refs naming exactly the objects the source's do, and `git fsck --full`
+/// clean in the mirror, as against stock git's own server.
+#[test]
+fn stock_git_pushes_and_clones_tags_of_a_blob_a_tree_and_a_tag() {
+  let Some(program) = stock_git() else {
+    eprintln!(
+      "skipping stock git's tags of a blob and of a tag: no stock git here (set {STOCK_GIT} to the command that runs it)"
+    );
+    return;
+  };
+  let Some(leg) = http_leg("tags") else {
+    return;
+  };
+  let scratch = Scratch::new("git-http-tags");
+  let header = format!("http.extraHeader=Authorization: Bearer {}", leg.token);
+  let git = Git::new(&program, &scratch, "tags", vec!["-c".to_owned(), header]);
+  let url = format!("http://127.0.0.1:{}/{REPOSITORY}", leg.port);
+  let source = git.copy("source");
+  git.ok(&git.scratch, &["init", "-q", "-b", BRANCH, &source]);
+  put(&source, "first\n");
+  git.ok(&source, &["add", FILE]);
+  git.ok(&source, &["commit", "-q", "-m", "first"]);
+  let blob = git
+    .ok(&source, &["hash-object", "-w", FILE])
+    .trim()
+    .to_owned();
+  git.ok(&source, &["tag", "-a", "blob-tag", "-m", "a blob", &blob]);
+  git.ok(&source, &["tag", "light-blob", &blob]);
+  git.ok(
+    &source,
+    &[
+      "tag",
+      "-a",
+      "tag-of-tag",
+      "-m",
+      "a tag of a tag",
+      "blob-tag",
+    ],
+  );
+  git.ok(
+    &source,
+    &["tag", "-a", "tree-tag", "-m", "a tree", "HEAD^{tree}"],
+  );
+  let pushed = git.run(&source, &["push", &url, BRANCH, "--tags"]);
+  let refs = |dir: &str| {
+    let listed = git.ok(
+      dir,
+      &[
+        "for-each-ref",
+        "--format=%(objectname) %(objecttype) %(refname)",
+      ],
+    );
+    let mut lines: Vec<String> = listed.lines().map(str::to_owned).collect();
+    lines.sort();
+    lines
+  };
+  let mirror = git.copy("mirror");
+  let cloned = git.run(&git.scratch, &["clone", "-q", "--mirror", &url, &mirror]);
+  let (mirror_refs, fsck) = if cloned.0 == 0 {
+    (refs(&mirror), git.run(&mirror, &["fsck", "--full"]).0)
+  } else {
+    (Vec::new(), -1)
+  };
+  assert_eq!(
+    (pushed.0, cloned.0, mirror_refs, fsck),
+    (0, 0, refs(&source), 0),
+    "push: {}{}; clone: {}{}",
+    pushed.1,
+    pushed.2,
+    cloned.1,
+    cloned.2
+  );
+}
+
 /// Format: the kinds of mapped memory `slates status --json` reports under `memory` (§4.14, A-232's gotcha): the anchor
 /// segment, the anchor content object (the shards' arenas among its bytes), the shards' arenas, the clients' ring
 /// regions, and the heap.

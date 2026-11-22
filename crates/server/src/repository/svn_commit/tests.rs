@@ -2258,3 +2258,29 @@ fn copies_oracle_a_copy_from_any_revision_is_its_source_as_it_stood_then() {
     );
   });
 }
+
+/// A-724 piece 3c (§4.17.5 "What a repository costs, counted" and "Learned demand": every tool's intakes counted).
+/// Do: on a store-holding daemon, land a Subversion revision adding one file of 4,096 bytes through `land_work`, the
+/// step both ra_svn transports and the HTTP edge call, then read the repository's usage row. Expect: the commit counted
+/// as one intake begun and answered, and its text's bytes, exactly, learned as the repository's next intake.
+#[test]
+fn t_a724_a_subversion_commit_is_counted_and_learned_on_its_repositorys_usage_row() {
+  let bytes = crate::test_store::noise(4096);
+  let (_store, daemon, id) =
+    crate::test_store::a_text_only_the_store_holds(&owner(), "counted", &bytes);
+  let row = crate::daemon::observe_first(&daemon, move |state| {
+    state.vcs_usage.usage(&id).map(|row| {
+      (
+        row.intake.begun,
+        row.intake.answered,
+        row.learned(slates_vcs::Work::Intake).bytes_per_work(),
+      )
+    })
+  });
+  daemon.stop();
+  assert_eq!(
+    row,
+    Some((1, 1, Some(4096))),
+    "the commit counted and its bytes learned"
+  );
+}

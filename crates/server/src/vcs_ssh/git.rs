@@ -217,6 +217,12 @@ impl<L: StoreLender> UploadCommand<L> {
       None => lender.lend_objects(*repository, step),
     }
     .ok_or_else(unheld)?;
+    if let Some(held) = generation.as_ref() {
+      lender.wrote(
+        held,
+        u64::try_from(out.len().saturating_sub(before)).unwrap_or(u64::MAX),
+      );
+    }
     let now = slates_rt::futures::now_ns();
     if out.len() > before
       || (now.saturating_sub(*last_written_ns) >= *keepalive_ns && made.write_keepalive(out))

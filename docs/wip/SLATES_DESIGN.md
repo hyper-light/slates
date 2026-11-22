@@ -15516,6 +15516,11 @@ and export by landing).
 > `OutOfSequence`). A Subversion repository serves no session while it imports, as a Mercurial one is not lent, so no
 > session reads a revision the register has not committed.
 >
+> **Status (2026-11-21, A-842).** The Subversion records keep no text: a row's text is named stored, its bytes where
+> the records' caller holds them (a daemon's node store and content store, `migration::Standalone` for records
+> standing alone), and a text a revision carries inline is refused `Corrupt`. The records' skip-delta keeping (S4 c2)
+> is gone, with its window reads; the FSFS view writes every text `PLAIN`.
+>
 > **Status (2026-11-21, A-835).** A recorded batch is applied to its green a slice a turn under the shard's quantum
 > (`push::RecordedBatch`, `repository.import_batch.apply_slices`), the landing turn and the import's read gate held to
 > the last slice; a kill between slices recovers from the batch's record. A recovered Subversion green folds to its
@@ -16432,6 +16437,16 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 
 #### 4.17.5 Many repositories on one server, balanced by learned usage (A-724)
 
+> **Status (2026-11-21, open decision: the CPU share; main's ruling of 17:22).** The first step is accepted: CPU divided by
+> equal-weight deficit round robin among repositories with runnable work (`vcs_share::turns`, a turn a repository a
+> round, max-min fair, so no repository starves), and CPU entered as a resource beside memory and the snapshot slot in
+> admission's dominant-resource division only. "Shares" below designs weighted fair queuing with each repository's
+> weight its learned demand capped at its measured use; whether that weighting stands is decided by data, not argument:
+> piece 7's load proof A/Bs equal weights against learned weights (release, interleaved, every round shown: each class's
+> p99 against its fair share, and the toys' p99 alone), and the weighting lands only if it wins. Owners: w-multirepo
+> (piece 2's rest and piece 7); the turn-weights variant (a turn per distinct principal and spare turns,
+> `agents/w-balance-turn-weights`) is one arm of the same A/B.
+
 > **Status (2026-11-20, A-724 piece 1).** Designed below; piece 1 built: each repository's usage counted on its owner
 > shard (`slates_vcs::usage`, kept as `ShardState::vcs_usage`; git's push steps and fetch steps count on it). Owed, in
 > order: the learned demand and the shares (piece 2; the division itself built, `slates_vcs::share::divide`, weighted
@@ -16441,6 +16456,38 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > shard and content homed by identity across shards (5; the homes built: `vcs_store::homes`; intake off the owner owed), the fleet's placement by identity (6, main's ruling first: it
 > amends §4.10's content placement), the many-repository load proof (7), the snapshot sized by its data (8) and a
 > giant repository's index across partitions (9), both designed below.
+
+> **Status (2026-11-21, A-724 piece 2a: the learned demand of admission).** Each answered work's bytes feed its kind's
+> decayed mean on the repository's usage row (`slates_vcs::Learned`): the estimate moves toward a work's bytes by
+> `1 - e^(-Δ/τ)`, `Δ` the gap since the previous answered work and `τ` the repository's own decayed mean gap, learned
+> the same way; the first work's bytes are the first value. A git push carries its byte total to its answer. The room's
+> claims (`vcs_share::demand_of`) read it in place of the lifetime mean: a monorepo whose pushes grew 64-fold claims
+> about the new size after three of them, where its lifetime mean had left a toy 6,437,986,017 of 6,442,445,005 bytes
+> (`t_a724_a_repositorys_claim_follows_its_learned_demand_not_its_lifetime_mean`, red first). Owed in piece 2: the
+> per-principal rates, the working set's miss-ratio curve and memory by marginal utility, CPU weights, and the shares
+> published to siblings.
+
+> **Status (2026-11-21, A-724 piece 3b: git's push past its share refused typed and retryable).** A git push keeps what
+> bound its room when it began (`vcs_share::Bound`); a refusal past its admission is typed by it: `PushFailed::PastShare
+> { past, share, held }` where the room was the repository's share while others pushed, `PastSnapshot { past, room }`
+> where it was the partition's snapshot slot's room left, git's own refusal unchanged where it was all the shard could
+> admit. Both edges word it naming the share (or the room) and that a retry may pass once others' pushes end (or the
+> slot is laid out larger); the HTTP edge answers `503`, never `413`. Red first:
+> `t_a724_a_push_past_its_share_is_refused_retryable_naming_the_share` (untyped `Exchange(PastAdmission { asked: 72,
+> left: 49 })` before). **Piece 3c (2026-11-21):** a Mercurial push (`hg_push::unbundle`, both edges) is live among the
+> shard's intakes from its start until it ends, begun on its repository's usage row with its principal, and answered
+> there with its bundle's bytes, learned as the repository's demand; before, an hg push left no row and divided no one's
+> room (`a_mercurial_push_is_counted_and_learned_on_its_repositorys_usage_row`, red first). A Subversion commit is counted
+> the same way at `svn_commit::land_work`, where svn://, svn+ssh and the HTTP edge meet: live while it lands, begun
+> with its principal, answered with its texts' bytes (each text once)
+> (`t_a724_a_subversion_commit_is_counted_and_learned_on_its_repositorys_usage_row`, red first). Owed in piece 3:
+> Mercurial's and Subversion's share refusals typed in their words, Subversion's commit admitted against the room at all
+> (its texts arrive into the conversation's sink unadmitted), backpressure before refusal. **Piece 3d (2026-11-21):** a
+> git fetch's answer is live while it holds its repository's generation (`Live::fetch` in `GitGeneration`), so its
+> repository is a claimant in every other's room, claiming what it holds plus its learned fetch demand a live fetch; the
+> answer's bytes, reported by both edges as they write (`StoreLender::wrote`), are learned on the usage row when the
+> generation is given back (`t_a724_a_fetch_in_flight_is_a_claim_on_the_room`,
+> `t_a724_a_fetchs_answer_is_counted_and_learned_on_its_repositorys_usage_row`, red first). Mercurial's fetch is owed.
 
 > **Status (2026-11-20, A-724 piece 3a: one room for every admission).** `crate::vcs_share::room` (`slates-server`) is
 > the one room a version-control work is admitted on its owner shard: git's push as it starts, git's fetch, Mercurial's
@@ -16452,6 +16499,41 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > binds). Owed: A-722's reservation checking this room and its typed refusal carrying the bound, with git's, Mercurial's
 > and Subversion's words for a share (the seam proposed to w-git); Mercurial's and Subversion's intakes counted live;
 > backpressure before refusal; a fetch's room as a claim of its own.
+
+> **Status (2026-11-21, A-843: a repository destroyed whole, its neighbours untouched).** The correctness proof of many
+> repositories on one daemon (`crates/cli/tests/vcs_many_repositories.rs`, w-balance) destroys one repository a tool
+> mid-load. `DestroyRepository` (`slates repository destroy NAME`, its owner's verb, `crate::repository::
+> destroy_repository`) does it on the owner shard as one verb, everything judged before its first record: the record,
+> namespace and logs (`Op::RepositoryDestroyed`), every member green leaves first (each its own destroy), the holds its
+> git records kept, its tool store and its usage row (`vcs_store::free`). A content another repository holds keeps that
+> hold. Owed: the landed changesets of a destroyed repository on the node's store (A-767), which only a landing may
+> remove (R1).
+
+> **Status (2026-11-21, A-844: piece 2's working set, the miss-ratio curve).** `slates_vcs::mrc::Curve` is a
+> repository's working set as fixed-size SHARDS (spatially hashed sampling, the threshold falling as the sampled set
+> passes its capacity, counts rescaled), its reuse distances in O(log capacity) by a Fenwick tree over access slots, in
+> power-of-two bins of the content window; exact against Mattson's LRU stack at rate one; aged by its owner's keep. By
+> measurement SHARDS_adj was rejected (objects of a window or more never fall in its smallest bin), and accuracy is the
+> capacity's: 8,000 keys erred 0.008 to 0.049 in mean absolute miss ratio on a skewed trace, 2,000 keys +0.06 to +0.09
+> (module docs), so the slots grow with the keys a repository has. Owed in piece 2: the decayed rates, the partition by
+> marginal utility above A-188's floor, the CPU weights, and the owner shard reading content through it with the
+> shares published as a snapshot.
+
+> **Status (2026-11-21, A-845: piece 2's decayed rates).** `slates_vcs::rate::Rates`: works and bytes a second, the
+> decay learned from the repository's own gaps: a ladder of decayed counts at `base · 2^k` up to its age, each gap
+> scored by its Poisson log-likelihood (the intensity at the arrival less its integral over the gap), the best rung the
+> horizon; scale-free (doubled gaps double the horizon exactly); `keep` is the curve's aging; `Decayed`, a principal's,
+> read at its repository's horizon. Owed: feeding both on the owner shard (`slates_vcs::usage`, beside A-724 piece 2's
+> `Learned`, after main's split of A-724 between w-balance and w-multirepo).
+
+> **Status (2026-11-21, A-846: piece 2's memory share by marginal utility).** `slates_vcs::partition`: a shard's room
+> divided among its repositories, each first guaranteed the lesser of A-188's floor (the room over the repositories
+> served now) and what its curve can use, the rest by Qureshi and Patt's lookahead (each next extension, ending at a
+> curve's bin edge, to the repository saving the most misses a second per byte); room no curve would use returned as
+> spare to lend. Held to brute force on straight curves (within 1%), a scan's step won over a steadier neighbour, a flat
+> curve given nothing. The floor is a guarantee, not a grant: given whole, `room / n` each left nothing to divide.
+> Owed: the CPU weights (WFQ by learned demand capped at use), and the owner shard computing it at its learning cadence
+> and publishing the shares as an immutable snapshot.
 
 **Role.** One slates server serves many repositories at once, from toys to monorepos the size of Google's or Meta's,
 several of those at once, and divides its memory, its CPU, its admission and its placement among them by what their
@@ -55082,6 +55164,32 @@ Applied in the same change to:
   a heavy principal named exactly; rows apart); `slates-server`
   `git_push::tests::t_a724_a_repositorys_pushes_are_counted_on_its_own_usage_row` (stock git's fixture pushes counted
   on the pushed repository's row, bytes exact, its owner named for each; an idle repository has none).
+- **Piece 2a, the learned demand of admission (2026-11-21).** `slates_vcs::usage::Learned`: per repository and kind
+  of work, the bytes of its answered works as a mean decayed by `1 - e^(-Δ/τ)`, `τ` the repository's own decayed mean
+  gap between answered works (no fixed half-life, D-11; the first work its own first value), a convex combination of
+  the bytes seen (property test). `Ledger::answered` takes the work's bytes; git's push carries its total; the room's
+  claims read it (`vcs_share::demand_of`). Red first: a monorepo grown 64-fold left a toy all but 0.07% of the room on
+  its lifetime mean; on its learned demand, at most the room less half its new size. Tests: slates-vcs `usage` 7/7,
+  slates-server `vcs_share` 11/11, `git_push` 30/30.
+- **Piece 3b, git's push past its share (2026-11-21).** The push keeps its room's `Bound`; `ReceivePack::bounded` types
+  a refusal past admission as `PushFailed::PastShare` or `PastSnapshot` (git's own where the shard's whole room bound);
+  `git_push::words` names the share and that a retry may pass; the HTTP edge answers `503`. Red first (slot narrowed to
+  461 bytes, the share 230): the refusal was untyped before. Tests: slates-server `vcs_share` 12/12, `git_push` 31/31,
+  `vcs_http::git` 20/20, `vcs_ssh` 71/71.
+- **Piece 3c, Mercurial's push counted (2026-11-21).** `hg_push::unbundle` holds a `vcs_share::Live` guard for the push's
+  whole run and counts it on the usage row (`begun` with its principal, `answered` with its bundle's bytes); the body is
+  `unbundled`. Red first: the push left no row. Tests: slates-server `vcs_ssh::tests::hg` 13/13, `repository::hg_push`
+  18/18, `vcs_http::hg` 9/9, `hg_view` 7/7, `vcs_share` 12/12.
+- **Piece 3c, Subversion's commit counted (2026-11-21).** `svn_commit::land_work` holds a `vcs_share::Live` guard while it
+  lands and counts the commit on the usage row (`begun`, `answered` with its texts' bytes, each identity once); the body
+  is `landed_work`. Found reading it: no Subversion commit is admitted against the room at all. Red first: no row.
+  Tests: slates-server `svn` 112/112, `repository::svn_commit` 31/31, `vcs_svn` 15/15, `store_tests` 9/9.
+- **Piece 3d, a fetch's room a claim of its own (2026-11-21).** `vcs_share::Live` counts `[intakes, fetches]` a
+  repository; `Live::fetch` is held by a git fetch's `GitGeneration`, whose drop answers the fetch on the usage row with
+  the bytes the edges reported writing (`StoreLender::wrote`, defaulted; called by the HTTP and SSH edges after each
+  reply step). The room's claims add each live work's learned bytes by kind (`demand_of`). Red first: a fetch in flight
+  divided no one's room; its answer was never counted. Tests: slates-server `vcs_share` 14/14, `vcs_store::upload` 7/7,
+  `vcs_http::git` 20/20, `vcs_ssh` 72/72.
 - **Applied in the same change to** §4.17.5 (new), GAPS, amendments.tsv.
 - **Owed.** Pieces 2 to 7 (§4.17.5's status); a fetch's answered count at its pack's last step; Mercurial's and
   Subversion's intakes and reads counted; the rows in `slates status`.
@@ -60169,3 +60277,37 @@ Applied in the same change to:
   an annotated tag of it and a tag of a tag of the commit, every command `ok` and each advertised at its object; `ls-refs`
   with `peel` naming the signed blob's tag peeled to the blob and the tag of a tag peeled to the commit, none for the bare
   blob; a fetch of the three holding them, the inner tag and the commit. Red before: each refused `ref names no tree`.
+
+### A-842 — The Subversion records keep no text; records standing alone hold theirs apart (2026-11-21, w-svn; main's 10:35 item 3 and 14:52 PST "take the KeptText fixture move"; C2 stage B part 2 (b), A-727 (c), A-645 P3, A-819)
+Applied in the same change to:
+- `crates/svn/src/migration/records.rs`: `KeptText`, its skip-delta chains (`text_chain`, `skip_base`), window reads
+  (`made_window`, `range_of`), counters (`texts_made_whole`, `windows_made`), `text_delta`, `text_bytes` and the chained
+  `read_step` removed; `text`, `text_at`, `text_in` and `read_step` answer the bytes the records hold (a property list
+  read as a text); the step refuses a text carried inline `Corrupt`; a replay is two steps (rows, then the rest);
+  module docs "Texts".
+- `crates/svn/src/migration/standalone.rs` (pieces 1 and 2, 41ce54f67 and e465b0e0c): `Standalone`, records with their
+  texts held apart by identity, the crate's tests, integration tests and benches on it; `Repository::take_texts`.
+- `crates/svn/src/fsfs.rs`: `TextDeltas` answers none for the records; docs.
+- `crates/svn/src/commit/revision.rs`: `StepRefusal::Corrupt`'s doc names an inline text.
+- `crates/server/src/vcs_store.rs` (`replay_step` without a row count), `vcs_store/svn_texts.rs` (`HeadTexts`' docs),
+  `repository/svn_commit.rs` (`take_texts` delegates), and the vcs_ssh and presenter tests (piece 2).
+- `crates/svn/examples/changeset_ab.rs` retired; `docs/wip/BENCHMARKS.md` notes it; `docs/wip/GAPS.md`.
+
+- **Why.** Since C2 stage B part 2 (b) a daemon's records name every text stored, its bytes on the node's store. The
+  records still kept texts of their own, as skip-delta svndiffs, for records standing alone: a second text path that
+  only tests, fixtures and benches reached, and a footgun (a caller that forgot to store a text had it kept in RAM).
+- **What.** Records standing alone take their texts the daemon's way (`Standalone`): out of each revision before its
+  step, held apart by identity, the records naming each stored by its length. The records' own keeping is gone. A
+  revision that carries a text inline is refused `Corrupt`, `SVN_ERR_FS_CORRUPT` (`E160004`), the refusal for a text
+  the records do not hold. The FSFS view over records holding no delta writes every text `PLAIN`, as the presenter's
+  view already did. Its `DELTA` writer stays behind `TextDeltas`, with no source answering one: whether to remove it,
+  or feed it per-file deltas derived from the changeset log (Ada's ruling of 2026-11-20 ~13:35), is main's call
+  (GAPS).
+- **Evidence.**
+  - `a_text_carried_inline_is_refused_and_records_standing_alone_hold_it_apart` (red before: bare records kept the
+    text).
+  - slates-svn lib 584/584 (the 6 tests of the kept deltas removed with them), `fsfs_view` 5/5,
+    `propfind_allocations` 1/1.
+  - slates-server `--lib svn` 113/113 (2 ignored), its `svn_texts` fixture taking its other texts out as a landing does.
+  - The ignored git-2000 measurement now prints `records_stored_text_bytes` where it printed `records_text_bytes`.
+  - The stock `svnadmin`/`svnlook` reading of the all-`PLAIN` view is main's run, since there is no svn on the Mac.

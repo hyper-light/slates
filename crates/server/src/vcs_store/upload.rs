@@ -106,6 +106,10 @@ impl StoreLender for ShardStores {
     crate::state::with_state_counted(|state| lend_held_in(state, hold, step)).flatten()
   }
 
+  fn wrote(&mut self, hold: &GitGeneration, bytes: u64) {
+    hold.written.set(hold.written.get().saturating_add(bytes));
+  }
+
   /// A-718: every version of repository `id` encoded as its fragments and kept, a turn at a time, before a fetch's answer
   /// is made, so the answer copies them rather than searching its objects for deltas ([`super::git_encode`]); waited for
   /// at most one liveness window, past which the answer begins and a task finishes the encoding behind it. First (A-614
@@ -130,7 +134,8 @@ pub(crate) fn lend_on<R>(
   let began = slates_rt::futures::now_ns();
   let lent = lend_uncounted(state, (id, reader), step);
   // A-724 piece 1: a request's step (one with a reader) begins a fetch on the repository's usage row; every step that
-  // was lent is counted with its time. Owed: a fetch's answered count, at the pack's last step.
+  // was lent is counted with its time. Its answer is counted, and its bytes learned, as its generation is given back
+  // (`GitGeneration`'s drop, A-724 piece 3d).
   if lent.is_some() {
     let now = slates_rt::futures::now_ns();
     if let Some(reader) = reader {
@@ -204,18 +209,34 @@ pub(crate) struct GitGeneration {
   refs: Vec<(Vec<u8>, u64)>,
   /// The full name of the branch `HEAD` named.
   head: Vec<u8>,
+  /// The fetch counted live while its answer holds this generation (A-724 piece 3d: a fetch's room is a claim of its own).
+  _fetching: crate::vcs_share::Live,
+  /// The bytes the answer has written so far, as its edge reports them ([`StoreLender::wrote`]): learned as the
+  /// repository's fetch demand once the answer ends.
+  written: core::cell::Cell<u64>,
 }
 
 impl Drop for GitGeneration {
+  /// Gives the fork back and answers the fetch on its repository's usage row with the bytes its answer wrote (A-724
+  /// piece 3d).
   fn drop(&mut self) {
-    let (id, stamp) = (self.id, self.stamp);
-    crate::state::with_state(|state| release_fork(state, id, stamp)).unwrap_or_default();
+    let (id, stamp, written) = (self.id, self.stamp, self.written.get());
+    crate::state::with_state(|state| {
+      release_fork(state, id, stamp);
+      let now = slates_rt::futures::now_ns();
+      state.vcs_usage.answered(&id, Work::Fetch, written, now);
+    })
+    .unwrap_or_default();
   }
 }
 
 /// Holds repository `id`'s generation as `state` holds it now for `reader` ([`GitGeneration`]): the fork at the stamp it
 /// stands at, made where none is kept; none when it is not lendable here or cannot be forked.
-fn hold_in(state: &mut ShardState, id: RepositoryId, reader: &Principal) -> Option<GitGeneration> {
+pub(crate) fn hold_in(
+  state: &mut ShardState,
+  id: RepositoryId,
+  reader: &Principal,
+) -> Option<GitGeneration> {
   let (record, head) = lendable(state, id)?;
   let refs = readable_refs(state, record, reader)?;
   let stamp = state.vcs_stores.git_ref(id)?.1.repository.stamp();
@@ -249,6 +270,8 @@ fn hold_in(state: &mut ShardState, id: RepositoryId, reader: &Principal) -> Opti
     stamp,
     refs,
     head,
+    _fetching: crate::vcs_share::Live::fetch(id),
+    written: core::cell::Cell::new(0),
   })
 }
 

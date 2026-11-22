@@ -15676,7 +15676,9 @@ texts together. Beside the hg columns it times the import (the dump streamed in,
 skip-delta chains (svn's checkpoint spacing: a read applies at most that many deltas) and reads RSS against the
 history's whole-text bytes (Ada's sizing rule).
 
-**Command.** `cargo build --release -p slates-svn --example changeset_ab` at b51f908f2 (with the example), then
+**Command.** (The example was retired by A-842 on 2026-11-21 with the records' kept deltas it read; these numbers
+stand, and the command runs at the commit it names.) `cargo build --release -p slates-svn --example changeset_ab` at
+b51f908f2 (with the example), then
 `/usr/bin/time -l changeset_ab ~/.cache/w-svn-gitgit/git-2000.dump <A|B> 2000`, interleaved A B A B A B, capped at
 600 s a run. Machine: Adas-MacBook-Pro-2.local (Apple M5 Max, 18 cores, 128 GiB, macOS 26.4.1), 2026-11-20
 15:09 to 15:12 PST, shared with other agents' builds, load average 22.9 at the start, 50.0 at the end (not quiesced, so

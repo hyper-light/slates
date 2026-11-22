@@ -330,6 +330,33 @@
 > Owed: the sweeps at N=12 on each platform with each client (main's run request), each failure a red test to its
 > server's owner.
 >
+> **An index merge claimed the whole arena pool for its shard, and the other shard admitted nothing (goal 93
+> correctness; main's round of 2026-11-21 16:18: `vcs_concurrency::concurrent_stock_hg_pushes_hold` at N=10, the lone
+> seed push refused "unreadable request: PastAdmission { asked: 15, left: 0 }"). FIXED (w-hg).**
+> - Cause, logged: the N=10 repository lives on shard 1, whose `Store::admittable` was 0 (capacity 0, the pool's
+>   claimable 0), while shard 0 held all 45.8 GB. `vcs_store::index_upkeep::slice` lent each merge step
+>   `within_budget(state, state.store.admittable())`, and a lend grows the arena from the pool the shards share
+>   (`Store::make_room`) by what it is lent: one merge step grew shard 0's arena by 28.6 GB, every byte the pool had. No
+>   push leaked; the admission was right to refuse a shard with nothing.
+> - Fix: a merge step is lent what it can put, its tables cut so far (`Merge::cut_bytes`; only its last step puts them,
+>   the steps before cut a table into memory).
+> - Held by `index_upkeep::tests::a_{mercurial,git}_index_built_whole_is_merged_a_table_a_step_into_one_run` (red
+>   before: "a merge claimed the pool: grown 11453071360 of 11453071360"; non-vacuity, the pool had room to claim), and
+>   by use the concurrency round at N=2 then 10 (debug, MacBook).
+> - Siblings, git's (main routes): `git_hooks.rs` (`within_budget(state, room, ..)` for a push's seal) and
+>   `vcs_store.rs`'s `restage_turn` (`stage_room`) and `SealingPush::turn` (`self.room`) lend rooms that may be the
+>   whole admittable; each grows the arena by it. A lend should name its step's bytes.
+>   Measured (g227, 2026-11-21, main's piece; Studio-4, debug, `audit_on_stored_shard`, pool 12.87 GB). These siblings
+>   lend a room bounded by the push, not the shard's room. A push's seal (`SealingPush::turn`, whose `stage_room` is
+>   `restage_turn`'s too) lent 18,564 bytes a turn for 64 files and 1,139,460 for 4,096 files. The arena grew by
+>   8,589,934,592 bytes on the first turn either way: one pool extent, whatever the lend. So "grown < pool" holds
+>   before any change (8.6 of 12.9 GB), no red can be written to it, and a smaller lend would not change the growth.
+>   No change made. `git_hooks.rs`'s seal lends `seal_len`, the seal's own length, likewise bounded (not measured).
+>   Found, not worked: the arena grows a whole extent at a time (`content_pool::ContentPool::claim`, power-of-two
+>   parts of a partition's slice), so the first lend past a shard's free capacity takes an extent of up to 8 GiB of
+>   a 12.9 GB pool, however few bytes it needs. w-hg's merge, lent `admittable()`, took extent after extent until
+>   the pool was gone.
+
 > **Goal 93 perf, hg serve (2026-11-21, w-perf; main's order 00:22 and ruling 01:05).** Found by a profile of a
 > one-changeset pull of Mercurial's history (24.95 s) and a stream clone (288 s): (1) every lookup in a
 > `slates_vcs::Index` walked every run, since the learned merge had no caller (155 runs after hg-src's import, 123 visited
@@ -499,6 +526,13 @@
 > a time through `StorePacks` rather than whole; the push's pack held twice in RAM until it lands (its own
 > buffer and the content store's windows); a node whose store lacks a record's changeset reading its names from their
 > region homes, held by a test of its own (the rebuild test now reads the node's store).
+> OPEN (goal 93, w-git; w-sessionlog's reduction 2026-11-21): a whole clone of git/git with 506 tags or more is aborted
+> "possible repository corruption on the remote side". The repository's encoding never finishes (its first version,
+> master's whole history, begun and never kept; each tag's first version is encoded over everything it reaches, so the
+> work grows with tags times history), and a fetch that stops waiting for it is answered with the pack unfinished. Not
+> reproduced at a unit's scale (`t_goal93_a_whole_clone_…`, `t_goal93_a_clone_answered_while_…`: 40 tags of a delta-heavy
+> line, fetched before, during and after the encoding, whole). The HTTP edge now counts a refused answer
+> (`vcs_http.git.upload_refused`) and logs its typed refusal, so w-sessionlog's repro names the cause; then red and fix.
 > A-836 BUILT (2026-11-21, w-git; w-interop r16): a ref may name any object. A tag chain is peeled to its end and a ref
 > naming a blob holds no files (its green at git's empty tree), so git/git's `junio-gpg-pub` and `v1.0rc1`..`rc6` are
 > taken and served (`t_a836_…`). Owed: w-interop's rerun of git/git's push and clones over it.
@@ -929,6 +963,16 @@
 > (`unpack::Reader::resolve_turn`); per-repository push counters by phase in `slates status`. Owed: the small
 > repositories' wait was per-push turns (fixed: `vcs_share::turns`, a repository's pushes one turn a round); owed:
 > its by-use proof at cap 3 and 10, and weights learned from usage in place of one turn a repository.
+> Piece 2a landed (2026-11-21): the room's claims read each repository's learned demand (`slates_vcs::Learned`, a mean
+> decayed by its own rhythm of intakes) in place of the lifetime mean. Owed in piece 2: per-principal rates, the
+> working set's miss-ratio curve and memory by marginal utility, CPU weights, the shares published to siblings.
+> Piece 3b landed (2026-11-21): a git push past its share is refused typed (`PushFailed::PastShare`, or `PastSnapshot`
+> past the slot's room) and retryable (`503`, words naming the share). Piece 3c landed: Mercurial's pushes counted live
+> and learned; Subversion's commits too (at `land_work`). **Open, found reading it:** no Subversion commit is admitted
+> against the room at all: its texts arrive into the conversation's sink with no admission, so a commit's bytes are
+> bounded by the edge's item limits alone, not the shard's room or the repository's share. Piece 3d landed: a git
+> fetch's answer is a live claim on the room and its bytes are learned. Owed in piece 3: svn's admission, Mercurial's
+> and Subversion's share refusals in their words, Mercurial's fetch as a claim, backpressure before refusal.
 > In flight, paused for goal 93 (2026-11-21): run 31 (cap 3, Studio-2, 9865bb832) found shard-mates took 4.5 s of the
 > busiest repository's 41.3 s span and its shard ran steps 23.2 s of it: its own three pushes of one agent shared one
 > turn. The fix (a turn an agent, spare turns taken; red first) is on branch agents/w-balance-turn-weights, 928df7d1b,
@@ -1956,6 +2000,26 @@
 > its hidden refs are owed there); the daemon starting the SSH edge (A-684); other platforms' runs (main's); the
 > exchange moved by the live memory-pressure and load signals, as the codec policy's. The live stock `git clone` over
 > the daemon's edge is built since (stock git's interop tests, next).
+> **Many repositories on one daemon (2026-11-21, w-balance, A-724 / goal 93 correctness; main's order):**
+> `crates/cli/tests/vcs_many_repositories.rs` `many_repositories_on_one_daemon_each_hold_exactly_their_own_history`
+> (ignored; main runs N = 2, 16, 64 for git, hg and svn): N repositories a tool pushed twice by their own stock clients
+> all at once, fetched during the second pushes, one a tool created and one destroyed mid-load; each then checked alone
+> (git `fsck --strict`, exactly its commits and refs; hg `verify`, its changesets, bookmark and tag; svn its two
+> revisions, paths and log, `svnrdump dump` into `svnadmin verify`). Focused run (git, N = 2, macOS debug, dba4ae793):
+> every push, fetch, check and the mid-load creation held. The mid-load destroy is closed by A-843 (2026-11-21,
+> w-multirepo): `slates repository destroy NAME` (`DestroyRepository`) destroys a repository whole on its owner shard;
+> focused run (git, N = 2, macOS arm64 debug, this Mac): `MANY N=2 tools [Git]: 0 failures`, the destroyed repository
+> refused a fetch and every other held. **Open:** a destroyed repository's landed changesets stay in the node's
+> append-only store log (A-767), which only a landing may compact (R1); hg and svn at N = 2, 16, 64 are main's rounds.
+>
+> **A-724 piece 2a (2026-11-21, w-multirepo, A-844): the working set's miss-ratio curve built, not yet fed.**
+> `slates_vcs::mrc::Curve` (fixed-size SHARDS; `cargo test -p slates-vcs --lib mrc`, 4 of 4, macOS arm64, this Mac).
+> Open: nothing reads content through it yet; the marginal-utility partition and the CPU weights follow.
+> **A-724 piece 2b (A-845): the learned rates built, not yet fed** (`slates_vcs::rate`, `cargo test -p slates-vcs --lib
+> rate::`, 5 of 5, macOS arm64, this Mac). Open: fed on the owner shard beside `usage::Learned`.
+> **A-724 piece 2c (A-846): memory by marginal utility built, not yet applied** (`slates_vcs::partition`, `cargo test
+> -p slates-vcs --lib partition::`, 4 of 4, macOS arm64, this Mac). Open: computed on the owner shard and published.
+>
 > **The hg correctness lane (2026-11-21, w-balance, UI goal 93 correctness by use):** `crates/cli/tests/hg_interop.rs`
 > `stock_hg_gets_what_stock_hg_serve_gives_on_every_verb_over_http_and_ssh` (ignored; main runs it) drives
 > `crates/cli/bench/hg_correctness.sh`: stock hg 7.2 against stock `hg serve` (the oracle), slates over HTTP and slates
@@ -3102,7 +3166,10 @@
 > revision's texts held apart) and the presenter's (its texts in a content store, as a node's are); the FSFS view over
 > them writes every text `PLAIN`, as the presenter's does (the stock `svnadmin` reading of it is main's run: no svn on
 > the Mac); `changeset_ab` reads the records' own deltas and waits on main's call (retire, or derive its deltas);
-> (3) owed: `KeptText`, its delta chains and window reads removed from the records, with the 7 step tests of them).
+> (3) BUILT 2026-11-21, A-842: the records keep no text, a text carried inline refused `Corrupt`, `changeset_ab`
+> retired (its numbers stand in BENCHMARKS at b51f908f2). Owed: the FSFS view's `DELTA` writer has no source now
+> (`fsfs::TextDeltas` answers none everywhere): removed, or fed per-file deltas derived from the changeset log (Ada's
+> ruling of 2026-11-20 ~13:35), main's call; and the stock `svnadmin` reading of the all-`PLAIN` view, main's run).
 > Stage C,
 > an import as one sliced changeset (today a changeset a record). A submitted version's revision (`svn_made`) takes the
 > one landing order since A-804 (2026-11-21, w-rewrite-ops; main 01:52, the deferred-submit hook, `crate::made_commit`):

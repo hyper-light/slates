@@ -1486,7 +1486,8 @@ fn measure_svnsync_replay_range_over_the_tunnel() {
       state
         .vcs_stores
         .subversion_records(id)
-        .map(|records| records.text_bytes()),
+        // The records keep no text (A-842): the bytes of the texts they name stored, on the node's store.
+        .map(|records| records.stored_texts().map(|(_, len)| len).sum::<u64>()),
       state
         .refusals
         .get(crate::repository::svn_commit::landing::LANDED)
@@ -1593,7 +1594,7 @@ fn measure_svnsync_replay_range_over_the_tunnel() {
     .count();
   println!(
     "MEASURE dump_bytes {dump_bytes} resident_kib started {started_kib} imported {imported_kib} replayed \
-     {replayed_kib} records_text_bytes {text_bytes:?}"
+     {replayed_kib} records_stored_text_bytes {text_bytes:?}"
   );
   println!(
     "MEASURE import_s {:.1} changesets_landed {landed} youngest {youngest:?} replay r1..r{last} wall_s {:.2} \

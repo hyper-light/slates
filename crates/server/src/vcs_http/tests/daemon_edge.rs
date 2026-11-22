@@ -2559,3 +2559,40 @@ fn stock_svn_commits_over_deltav_v1_on_a_daemons_loopback_edge() {
     "the edge made {activities} v1 activities"
   );
 }
+
+/// Goal 93 (w-sessionlog's red by use: git/git's whole clones were answered "possible repository corruption on the
+/// remote side", and nothing on the server said why). Do: start a two-shard daemon with an edge; create a git repository;
+/// as its owner, fetch an object it does not hold (git's own `not our ref`). Expect: the fetch answered refused, in git's
+/// words, and the refusal counted once on the shard that served it (`vcs_http.git.upload_refused`), its typed refusal
+/// named in the log. Before, a refused answer was counted nowhere.
+#[test]
+fn a_refused_fetch_over_the_daemons_edge_is_counted() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let held_nowhere = ObjectId::from_bytes(GitFormat::Sha1, &[0x11; 20]).expect("an id");
+  let fetched = uploaded((port, &certificate), &name, &fetch_of(held_nowhere));
+  let refused: u64 = (0..2)
+    .map(|partition| {
+      counted_on(
+        &daemon,
+        partition,
+        crate::vcs_http::git::upload::UPLOAD_REFUSED,
+      )
+    })
+    .sum();
+  daemon.stop();
+  assert_eq!(fetched.0, 200);
+  assert!(
+    fetched
+      .1
+      .windows(b"ERR ".len())
+      .any(|window| window == b"ERR "),
+    "{:?}",
+    String::from_utf8_lossy(&fetched.1)
+  );
+  assert_eq!(refused, 1, "the refused answer counted once");
+}

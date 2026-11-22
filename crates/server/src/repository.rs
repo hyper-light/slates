@@ -835,7 +835,7 @@ fn record_repository(
 /// or a new empty one, whose version 0's merge record is enqueued as a new green's is.
 fn install_root(
   state: &mut ShardState,
-  repository: RepositoryId,
+  repository: slates_db::catalog::RepositoryId,
   root: DbVolumeId,
   (adopted, svn_created): (bool, &[u8]),
 ) {
@@ -953,7 +953,7 @@ fn source_of(
 /// changeset below a head names none yet (GAPS A-575).
 fn hg_source(
   state: &mut ShardState,
-  repository: RepositoryId,
+  repository: slates_db::catalog::RepositoryId,
   from: &str,
 ) -> Result<DbVolumeId, Refusal> {
   let mut room = slates_hg::Admission::new(crate::vcs_share::room(state, repository).bytes);
@@ -1168,6 +1168,71 @@ pub(crate) fn retire_branch(
     Ok(()) => ReplyBody::Acknowledged,
     Err(refusal) => refused(refusal),
   }
+}
+
+/// `DestroyRepository` (§4.17.5, A-843): its owner destroys repository `repository` whole on this, its owner shard.
+/// Everything a later step could refuse is judged before the first record, since what a refused verb recorded commits
+/// with its refusal: the repository's own destroy (`Op::RepositoryDestroyed`: its record, its namespace and its logs),
+/// and each member green, held on this partition and administered by `principal`. Then, in the verb's transaction: the
+/// repository's destroy; each member's own destroy (`merge_service::destroy_merge_volume`), leaves first, in the reverse
+/// of the order they joined, so no green is destroyed while a member made from it stands (`BranchedFrom`); the holds
+/// its git records kept of their names and packs, read while its register still named them; and its tool store and its
+/// usage row (`vcs_store::free`). Nothing another repository holds is touched: a content both held keeps the other's
+/// hold. A push or fetch of the repository under way finds its store gone at its next turn and is refused as for a
+/// name never made. Answered `Destroyed`.
+pub(crate) fn destroy_repository(
+  state: &mut ShardState,
+  principal: &Principal,
+  repository: &str,
+) -> ReplyBody {
+  let record = match owned_repository(state, principal, repository, "destroy_repository") {
+    Ok(record) => record,
+    Err(reply) => return *reply,
+  };
+  let destroyed = Op::RepositoryDestroyed {
+    repository: record.id,
+  };
+  if let Err(refusal) = admits(state, &destroyed) {
+    return refused(refusal);
+  }
+  // Leaves first: `members_of` lists a member after the member it was made from.
+  let mut members: Vec<DbVolumeId> = state
+    .db
+    .partition()
+    .repositories()
+    .members_of(record.id)
+    .map(|member| member.green)
+    .collect();
+  members.reverse();
+  for green in &members {
+    let Some(volume) = state.db.partition().volume(*green) else {
+      return refused(Refusal::NotFound);
+    };
+    if !matches!(volume.policy.role, Role::Green { .. }) {
+      return refused(Refusal::NotFound);
+    }
+    if !crate::verbs::rights_of(volume, principal).admin {
+      return forbidden("destroy_repository");
+    }
+  }
+  let holds = crate::vcs_store::record_holds(state, record.id);
+  if let Err(refusal) = self::record(state, &destroyed) {
+    return refused(refusal);
+  }
+  for green in members {
+    match crate::merge_service::destroy_merge_volume(state, principal, to_wire_volume(green)) {
+      Some(ReplyBody::Destroyed) => {}
+      // Judged above (a green, administered by `principal`), so only a refusal no guard foresaw, the log at its
+      // capacity: the verb's refusal.
+      Some(reply) => return reply,
+      None => return refused(Refusal::NotFound),
+    }
+  }
+  for identity in holds {
+    crate::vcs_store::release_names(state, &identity);
+  }
+  crate::vcs_store::free(state, record.id);
+  ReplyBody::Destroyed
 }
 
 /// What [`set_policy`] sets a policy to, as the wire carries it: its rules, its hooks, its hooks-env sections and the
@@ -1681,6 +1746,118 @@ mod tests {
       wrong_verbs_refused_by_kind(state);
       assert_eq!(state.greens.busy_lends(), 0);
     });
+  }
+
+  /// A-843 (§4.17.5: a repository destroyed while others are served disturbs none of them). Do: make repositories
+  /// `doomed` and `kept`, write each root, branch each, and branch `doomed`'s branch again; destroy `doomed` as another
+  /// principal, then as its owner, then once more; then make a repository named `doomed` again.
+  /// Expect: the stranger refused `Forbidden` with nothing changed; the owner answered `Destroyed`: the name gone (a
+  /// branch of it `NotFound`), each of its three greens gone from the catalog and from the engines, its store and its
+  /// usage row no longer held; `kept` whole (its record, both greens' bytes, its store); the second destroy `NotFound`;
+  /// the name made again as a new, empty repository.
+  #[test]
+  fn a_destroyed_repository_goes_whole_and_leaves_every_other_untouched() {
+    crate::test_store::audit_on_stored_shard("repository-destroy", |state| {
+      let destroy = |state: &mut ShardState, principal: &Principal| {
+        ask(
+          state,
+          principal,
+          RequestBody::DestroyRepository {
+            repository: "doomed".to_owned(),
+          },
+        )
+      };
+      let (doomed_greens, kept_greens) = doomed_and_kept(state);
+      let [doomed_root, doomed_branch, doomed_leaf] = doomed_greens;
+      let (doomed, kept) = (repository(state, "doomed"), repository(state, "kept"));
+
+      assert!(matches!(
+        refusal(destroy(state, &stranger())),
+        Refusal::Forbidden { .. }
+      ));
+      assert_eq!(
+        file(state, doomed_leaf).as_deref(),
+        Some(b"doomed".as_slice())
+      );
+
+      let destroyed = destroy(state, &owner());
+      assert!(matches!(destroyed, ReplyBody::Destroyed), "{destroyed:?}");
+      doomed_gone(state, doomed, [doomed_root, doomed_branch, doomed_leaf]);
+      kept_whole(state, kept, kept_greens);
+
+      assert!(matches!(
+        refusal(destroy(state, &owner())),
+        Refusal::NotFound
+      ));
+      let again = green_of(create(state, "doomed", "main"));
+      assert_eq!(file(state, again), None);
+      assert_ne!(repository(state, "doomed"), doomed);
+    });
+  }
+
+  /// Repositories `doomed` (its root written, a branch of it and a branch of that) and `kept` (its root written and a
+  /// branch), each store held: `doomed`'s three greens and `kept`'s two.
+  fn doomed_and_kept(state: &mut ShardState) -> ([VolumeId; 3], (VolumeId, VolumeId)) {
+    let doomed_root = green_of(create(state, "doomed", "main"));
+    assert_eq!(write(state, doomed_root, b"doomed", 1), 1);
+    let doomed_branch = green_of(branch(state, ("doomed", "topic", "main"), None));
+    let doomed_leaf = green_of(branch(state, ("doomed", "leaf", "topic"), None));
+    let kept_root = green_of(create(state, "kept", "main"));
+    assert_eq!(write(state, kept_root, b"kept", 2), 1);
+    let kept_branch = green_of(branch(state, ("kept", "topic", "main"), None));
+    let (doomed, kept) = (repository(state, "doomed"), repository(state, "kept"));
+    assert!(state.vcs_stores.holds(doomed) && state.vcs_stores.holds(kept));
+    (
+      [doomed_root, doomed_branch, doomed_leaf],
+      (kept_root, kept_branch),
+    )
+  }
+
+  /// Repository `doomed` (`repository`, its `greens`) gone whole after its destroy: its name, each green from the catalog
+  /// and the engines, its store; a branch of it `NotFound`.
+  fn doomed_gone(
+    state: &mut ShardState,
+    repository: slates_db::catalog::RepositoryId,
+    greens: [VolumeId; 3],
+  ) {
+    let partition = state.db.partition();
+    assert!(
+      partition
+        .repositories()
+        .repository_named("doomed")
+        .is_none()
+    );
+    for green in greens {
+      assert!(
+        partition.volume(to_db_volume(green)).is_none(),
+        "{green:?} still recorded"
+      );
+      assert!(
+        state.greens.get(&to_db_volume(green)).is_none(),
+        "{green:?} still served"
+      );
+    }
+    assert!(
+      !state.vcs_stores.holds(repository),
+      "the destroyed repository's store is held"
+    );
+    assert!(matches!(
+      refusal(branch(state, ("doomed", "again", "main"), None)),
+      Refusal::NotFound
+    ));
+  }
+
+  /// Repository `kept` (`repository`, its root and branch) whole beside a destroy: its store held, both greens' bytes,
+  /// and its branch still written.
+  fn kept_whole(
+    state: &mut ShardState,
+    repository: slates_db::catalog::RepositoryId,
+    (root, branch): (VolumeId, VolumeId),
+  ) {
+    assert!(state.vcs_stores.holds(repository));
+    assert_eq!(file(state, root).as_deref(), Some(b"kept".as_slice()));
+    assert_eq!(file(state, branch).as_deref(), Some(b"kept".as_slice()));
+    assert_eq!(write(state, branch, b"still", 3), 1);
   }
 
   /// Repository `linux` made, its root written twice while a work holds version 1, and branched at version 1 and at

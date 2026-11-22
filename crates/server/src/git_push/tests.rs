@@ -2178,6 +2178,278 @@ fn t_a836_refs_naming_a_blob_and_tags_of_tags_are_taken_and_advertised() {
   });
 }
 
+/// Shape: the commits, each tagged, of [`t_goal93_a_whole_clone_of_a_line_with_an_annotated_tag_of_every_commit_is_whole`]:
+/// enough tags that their versions' runs overlap many times, as git/git's 1,012 tags on master's history do.
+const TAGGED_LINE: usize = 40;
+
+/// A commit of one file, `notes`, holding the first `at + 1` lines of a long text, over `parent`: a line of these is a
+/// history git and the encoder store as deltas of one another, as git/git's is. Its id and its objects.
+fn growing_commit(
+  at: usize,
+  parent: Option<ObjectId>,
+) -> (ObjectId, Vec<(slates_git::object_name::Kind, Vec<u8>)>) {
+  use slates_git::object_name::{Kind, name_of};
+  let blob: Vec<u8> = (0..=at)
+    .flat_map(|line| {
+      format!("line {line:04} of the notes, long enough that a delta of the file is far smaller than the file\n")
+        .into_bytes()
+    })
+    .collect();
+  let blob_id = name_of(ObjectFormat::Sha1, Kind::Blob, &blob).unwrap();
+  let mut tree = b"100644 notes\0".to_vec();
+  tree.extend_from_slice(blob_id.as_bytes());
+  let tree_id = name_of(ObjectFormat::Sha1, Kind::Tree, &tree).unwrap();
+  let parent = parent
+    .map(|parent| format!("parent {parent}\n"))
+    .unwrap_or_default();
+  let commit = format!(
+    "tree {tree_id}\n{parent}author A <a@example.com> 1700000000 +0000\n\
+     committer A <a@example.com> 1700000000 +0000\n\nnotes {at}\n"
+  )
+  .into_bytes();
+  let commit_id = name_of(ObjectFormat::Sha1, Kind::Commit, &commit).unwrap();
+  (
+    commit_id,
+    vec![
+      (Kind::Commit, commit),
+      (Kind::Tree, tree),
+      (Kind::Blob, blob),
+    ],
+  )
+}
+
+/// Shape: the most turns [`t_goal93_a_whole_clone_of_a_line_with_an_annotated_tag_of_every_commit_is_whole`]'s encoding
+/// may take before the test calls it unending: far past its versions' work done once.
+const ENCODE_TURNS_BOUND: usize = 1 << 16;
+
+/// Goal 93's whole-clone abort, its shape at a unit's scale (w-sessionlog's red by use: a whole clone of git/git pushed
+/// to slates is aborted "possible repository corruption on the remote side" once master's annotated tags are pushed with
+/// it; master alone, or master and one tag, clones whole). Do: push a line of [`TAGGED_LINE`] commits of a growing file
+/// (deltas of one another) as `main` with an annotated tag of each commit, all in one push; fetch every ref's object as
+/// `git clone` asks, `done`, first with nothing encoded, then once the repository's encoding is idle (from the versions'
+/// kept fragments, A-718). Expect: the push `ok` for every ref; each fetch answered with no refusal, its pack whole and
+/// holding every object pushed, each once. Not red at this scale (the abort needs git/git's, w-sessionlog bisecting):
+/// kept as the shape's guard. It prints the encoding's turns, which grow with tags times history (each tag's first
+/// version is encoded over everything it reaches): 41 versions, 11,733 turns here.
+#[test]
+fn t_goal93_a_whole_clone_of_a_line_with_an_annotated_tag_of_every_commit_is_whole() {
+  use slates_git::object_name::Kind;
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
+    let repository = git_repository(state, "tagged-line");
+    let mut objects = Vec::new();
+    let mut commits = Vec::new();
+    let mut parent = None;
+    for at in 0..TAGGED_LINE {
+      let (commit, made) = growing_commit(at, parent);
+      objects.extend(made);
+      commits.push(commit);
+      parent = Some(commit);
+    }
+    let mut named: Vec<(ObjectId, Vec<u8>)> =
+      vec![(*commits.last().unwrap(), b"refs/heads/main".to_vec())];
+    for (at, commit) in commits.iter().enumerate() {
+      let name = format!("v{at}");
+      let (tag, bytes) = tag_object(&name, (*commit, "commit"));
+      objects.push((Kind::Tag, bytes));
+      named.push((tag, format!("refs/tags/{name}").into_bytes()));
+    }
+    let ids: Vec<String> = named.iter().map(|(id, _)| id.to_string()).collect();
+    let commands: Vec<(&str, &str, &[u8])> = named
+      .iter()
+      .zip(&ids)
+      .map(|((_, name), id)| ("", id.as_str(), name.as_slice()))
+      .collect();
+    let received = pushed(
+      state,
+      repository,
+      &request(&commands, CAPABILITIES, &pack_of_objects(&objects)),
+    );
+    assert!(
+      reasons(&received).iter().all(|reason| reason == b"ok"),
+      "{:?}",
+      received.outcomes
+    );
+    use crate::vcs_store::upload::tests::{answered, fetch, pack_of};
+    let wants: Vec<ObjectId> = named.iter().map(|(id, _)| *id).collect();
+    let pushed_ids: std::collections::BTreeSet<ObjectId> = objects
+      .iter()
+      .map(|(kind, bytes)| {
+        slates_git::object_name::name_of(ObjectFormat::Sha1, *kind, bytes).unwrap()
+      })
+      .collect();
+    // Fetched as a fresh repository answers (nothing encoded yet), then from the versions' kept fragments (A-718), as a
+    // daemon serves a clone once its encoding has run.
+    for round in ["before the encoding", "from the kept fragments"] {
+      if round == "from the kept fragments" {
+        let mut turns = 0usize;
+        while crate::vcs_store::git_encode::turn(state, repository)
+          != crate::vcs_store::git_encode::Turned::Idle
+        {
+          turns += 1;
+          assert!(turns < ENCODE_TURNS_BOUND, "an encoding that never ended");
+        }
+        let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+        eprintln!(
+          "goal 93 tagged line: {} versions encoded in {turns} turns",
+          count(crate::vcs_store::git_encode::ENCODED)
+        );
+      }
+      let fetched = answered(
+        state,
+        (repository, &owner()),
+        slates_git::upload::Asked::Request(&fetch(&wants, &[])),
+      );
+      assert_eq!(fetched.1, None, "the clone's fetch refused, {round}");
+      let unpacked = slates_git::unpack::read_whole(
+        &pack_of(&fetched.0),
+        ObjectFormat::Sha1,
+        &slates_git::unpack::NoIndex,
+        &mut slates_git::Admission::new(u64::MAX),
+      )
+      .unwrap_or_else(|refused| panic!("not a whole pack {round}: {refused:?}"));
+      let fetched_ids: std::collections::BTreeSet<ObjectId> =
+        unpacked.objects.iter().map(|object| object.id).collect();
+      assert_eq!(
+        (unpacked.objects.len(), &fetched_ids),
+        (pushed_ids.len(), &pushed_ids),
+        "the clone holds every object pushed, each once, {round}"
+      );
+    }
+  });
+}
+
+/// Goal 93's whole-clone abort (w-sessionlog's reduction, 2026-11-21 16:15: a clone of git/git with 506 tags or more
+/// stops waiting for the repository's encoding, `encode_for_fetch`'s bounded wait, and is answered while the encoding is
+/// under way; its pack ends `aborting due to possible repository corruption on the remote side`, every clone after it
+/// too). Do: push the tagged line of [`t_goal93_a_whole_clone_of_a_line_with_an_annotated_tag_of_every_commit_is_whole`];
+/// turn its encoding a few turns at a time, and between each few fetch every ref's object, as a clone that stopped
+/// waiting does, until the encoding is idle. Expect: every fetch answered with no refusal, its pack whole and holding
+/// every object pushed, each once, whatever the encoding had kept so far. Not red at this scale, even fetched after every
+/// turn (the abort needs git/git's: objects past a window and a first version that never finishes encoding); kept as the
+/// guard of a fetch answered mid-encoding, and the HTTP edge now counts and logs a refused answer's cause.
+#[test]
+fn t_goal93_a_clone_answered_while_the_encoding_is_under_way_is_whole() {
+  use slates_git::object_name::Kind;
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let mut objects = Vec::new();
+  let mut commits = Vec::new();
+  let mut parent = None;
+  for at in 0..TAGGED_LINE {
+    let (commit, made) = growing_commit(at, parent);
+    objects.extend(made);
+    commits.push(commit);
+    parent = Some(commit);
+  }
+  let mut named: Vec<(ObjectId, Vec<u8>)> =
+    vec![(*commits.last().unwrap(), b"refs/heads/main".to_vec())];
+  for (at, commit) in commits.iter().enumerate() {
+    let name = format!("v{at}");
+    let (tag, bytes) = tag_object(&name, (*commit, "commit"));
+    objects.push((Kind::Tag, bytes));
+    named.push((tag, format!("refs/tags/{name}").into_bytes()));
+  }
+  let ids: Vec<String> = named.iter().map(|(id, _)| id.to_string()).collect();
+  let commands: Vec<(&str, &str, &[u8])> = named
+    .iter()
+    .zip(&ids)
+    .map(|((_, name), id)| ("", id.as_str(), name.as_slice()))
+    .collect();
+  let pushing = request(&commands, CAPABILITIES, &pack_of_objects(&objects));
+  // The push a poll of its own, as each round below is: the shard steps between them, as a daemon's does.
+  let (repository, reasons_pushed) = crate::daemon::observe_first(&daemon, move |state| {
+    let repository = git_repository(state, "encoding-under-way");
+    (repository, reasons(&pushed(state, repository, &pushing)))
+  });
+  assert!(
+    reasons_pushed.iter().all(|reason| reason == b"ok"),
+    "{reasons_pushed:?}"
+  );
+  let pushed_ids: std::collections::BTreeSet<ObjectId> = objects
+    .iter()
+    .map(|(kind, bytes)| {
+      slates_git::object_name::name_of(ObjectFormat::Sha1, *kind, bytes).unwrap()
+    })
+    .collect();
+  let wants: Vec<ObjectId> = named.iter().map(|(id, _)| *id).collect();
+  let mut fetches = 0usize;
+  let mut rounds = 0usize;
+  loop {
+    let wanting = wants.clone();
+    // A round: a few turns of the encoding, then a fetch of every ref's object as a clone that stopped waiting asks.
+    let (fetched, idle) = crate::daemon::observe_first(&daemon, move |state| {
+      let mut idle = false;
+      for _ in 0..ENCODING_TURNS_BETWEEN_FETCHES {
+        if crate::vcs_store::git_encode::turn(state, repository)
+          == crate::vcs_store::git_encode::Turned::Idle
+        {
+          idle = true;
+          break;
+        }
+      }
+      (fetched_ids(state, repository, &wanting), idle)
+    });
+    fetches += 1;
+    rounds += 1;
+    let set: std::collections::BTreeSet<ObjectId> = fetched.iter().copied().collect();
+    assert_eq!(
+      (fetched.len(), &set),
+      (pushed_ids.len(), &pushed_ids),
+      "fetch {fetches}: every object pushed, each once"
+    );
+    if idle {
+      break;
+    }
+    assert!(rounds < ENCODE_TURNS_BOUND, "an encoding that never ended");
+  }
+  daemon.stop();
+  assert!(
+    fetches > 1,
+    "fetched only once: the encoding was never under way"
+  );
+}
+
+/// Shape: the encoding's turns between two fetches of [`t_goal93_a_clone_answered_while_the_encoding_is_under_way_is_whole`]:
+/// few enough that many fetches meet a version's encoding under way.
+const ENCODING_TURNS_BETWEEN_FETCHES: usize = 1;
+
+/// Goal 93's whole-clone abort, its likely cause (w-sessionlog's reduction: past ~500 tags of git/git a clone stops
+/// waiting for the repository's encoding, `encode_for_fetch`'s bounded wait, which derives each version's reach sets
+/// first, A-614 amended, and is answered with its pack unfinished). Do: push a line of [`PACED_HISTORY`] commits as one
+/// create (its versions' reach sets deferred, as git/git's whole push leaves them), then, with no derivation run, fetch
+/// its head as `git clone` asks. Expect: the fetch answered with no refusal, its pack whole, holding every object pushed,
+/// each once: a fetch costs time, never its answer. Red before the fix: refused, the pack ended with git's abort words.
+#[test]
+fn t_goal93_a_clone_answered_before_its_reach_sets_are_derived_is_whole() {
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
+    let repository = git_repository(state, "underived");
+    let mut objects = Vec::new();
+    let mut parent = None;
+    for at in 0..PACED_HISTORY {
+      let (commit, made) = flat_commit(1, &format!("line {at}"), parent);
+      objects.extend(made);
+      parent = Some(commit);
+    }
+    let head = parent.unwrap();
+    let head_hex = head.to_string();
+    let created = [("", head_hex.as_str(), b"refs/heads/main".as_slice())];
+    let received = pushed(
+      state,
+      repository,
+      &request(&created, CAPABILITIES, &pack_of_objects(&objects)),
+    );
+    assert_eq!(reasons(&received), [b"ok".to_vec()]);
+    let fetched = fetched_ids(state, repository, &[head]);
+    let set: std::collections::BTreeSet<ObjectId> = fetched.iter().copied().collect();
+    let pushed_ids: std::collections::BTreeSet<ObjectId> = objects
+      .iter()
+      .map(|(kind, bytes)| {
+        slates_git::object_name::name_of(ObjectFormat::Sha1, *kind, bytes).unwrap()
+      })
+      .collect();
+    assert_eq!((fetched.len(), &set), (pushed_ids.len(), &pushed_ids));
+  });
+}
+
 /// `repository`'s tags as `ls-refs` with `peel` lists them to its owner, a line each.
 fn tags_listed_peeled(state: &mut ShardState, repository: RepositoryId) -> Vec<String> {
   use crate::vcs_store::upload::tests::{answered, lines_of, request as upload_request};

@@ -40,6 +40,10 @@ use super::{GitServices, ServiceRefused, Start};
 use crate::vcs_http::{ClientGone, Exchange, Failed};
 
 /// Where repositories' stores are lent to upload-pack, afresh for each step of an answer (the module doc).
+/// Counter: a git fetch over HTTP answered refused (a pack the store could not finish, a request refused), its typed
+/// refusal named in the log. Format: a counter name.
+pub(crate) const UPLOAD_REFUSED: &str = "vcs_http.git.upload_refused";
+
 pub(crate) trait StoreLender {
   /// Where a fetch's pack comes from (A-639's fragments, through A-653's source over the store's stream).
   type Packs: PackSource;
@@ -83,6 +87,10 @@ pub(crate) trait StoreLender {
     hold: &Self::Hold,
     step: impl FnOnce(&Served<'_>, &mut Self::Packs) -> R,
   ) -> Option<R>;
+
+  /// The answer made over `hold` wrote `bytes` more (A-724 piece 3d): what its fetch is learned to use once it ends. A
+  /// lender that learns nothing does nothing.
+  fn wrote(&mut self, _hold: &Self::Hold, _bytes: u64) {}
 
   /// Makes repository `id`'s store ready for a fetch's answer before it is made (A-718): the shard's lender encodes every
   /// version not yet encoded as its fragments, a turn at a time, yielding between turns, so the answer copies them. A
@@ -249,6 +257,12 @@ impl<L: StoreLender> Exchange for Upload<L> {
       None => lender.lend_objects(*repository, step),
     }
     .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
+    if let Some(held) = generation.as_ref() {
+      lender.wrote(
+        held,
+        u64::try_from(out.len().saturating_sub(before)).unwrap_or(u64::MAX),
+      );
+    }
     let now = slates_rt::futures::now_ns();
     if out.len() > before
       || (now.saturating_sub(*last_written_ns) >= *keepalive_ns && made.write_keepalive(out))
@@ -258,6 +272,14 @@ impl<L: StoreLender> Exchange for Upload<L> {
     if written != Written::More {
       // The answer is written: its generation is given back.
       *generation = None;
+      // A refused answer (a pack the store could not finish ends with git's abort words, A-639) is counted and named in
+      // the log by its typed refusal, so a client's "possible repository corruption" has its cause on the server.
+      if let Some(refusal) = made.refusal() {
+        slates_machine::log_line!(
+          "slates-server: a git fetch of repository {repository:?} was answered refused: {refusal:?}"
+        );
+        let _ = crate::state::with_state_counted(|state| state.count(UPLOAD_REFUSED, 1));
+      }
     }
     Ok(written == Written::More)
   }
