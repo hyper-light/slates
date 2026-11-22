@@ -530,3 +530,62 @@ fn a_made_changesets_record_replays_to_its_made_node() {
   assert_eq!(read.record(), written);
   index.release(&mut store).unwrap();
 }
+
+/// w-interop's find of 2026-11-22 (ubuntu: `hg push --new-branch -f -r 2000` of hg's own history refused
+/// `Push(Object { path: "hgext/hbisect.py", .. LengthDiffers { said: 10101, given: 10097 } })`: four bytes, a metadata
+/// block's two markers). Do: keep three file revisions in an index, one plain, one copied (its block names the source),
+/// one whose bytes begin with the marker (7.2 escapes it with an empty block); ask the repository each one's length of
+/// bytes from its row (`Held::file_bytes_len`, what a push's work asks before it reads). Expect each the length of the
+/// bytes past its block, as `filerev::split` reads its text: a block's markers counted with the block, never as bytes.
+#[test]
+fn a_file_revisions_length_of_bytes_leaves_out_its_whole_block() {
+  use crate::push::verify::Held;
+  let mut store = ContentStore::new(1 << 24, WINDOW).unwrap();
+  let mut index = HgIndex::new();
+  let escaped = [crate::filerev::MARKER, b"begins with the marker\n"].concat();
+  let one = commit(
+    (&mut index, &mut store),
+    NULL_NODE,
+    &[
+      Change {
+        path: b"plain",
+        after: Some((b"plain bytes\n", Flag::Regular)),
+        copied_from: None,
+      },
+      Change {
+        path: b"escaped",
+        after: Some((&escaped, Flag::Regular)),
+        copied_from: None,
+      },
+    ],
+    (b"default", b"one"),
+  );
+  let two = commit(
+    (&mut index, &mut store),
+    one.0,
+    &[Change {
+      path: b"copied",
+      after: Some((b"plain bytes\n", Flag::Regular)),
+      copied_from: Some(b"plain"),
+    }],
+    (b"default", b"two"),
+  );
+  let held = IndexHeld::new(&index, &store);
+  let manifest = held.manifest_text(&two.1).expect("the manifest");
+  for path in [&b"plain"[..], b"escaped", b"copied"] {
+    let node = crate::manifest::find(&manifest, path)
+      .expect("the file")
+      .node;
+    let text = held.file_text(path, &node).expect("its text");
+    let bytes = crate::filerev::split(&text)
+      .expect("a file revision")
+      .bytes
+      .len();
+    assert_eq!(
+      held.file_bytes_len(path, &node),
+      Some(crate::read::to_u64(bytes)),
+      "{}",
+      String::from_utf8_lossy(path)
+    );
+  }
+}
