@@ -7,7 +7,7 @@
 - Focused tests: slates-hg lib 403/403, server lib hg 72/72.
 - The 64+32 MiB repro stays #[ignore]d on the merge engine's one-step apply.
 
-**Ready to land after its focused retest:** 068ba0990, `vcs_ssh: a send the session refuses ends the connection refused`.
+**LANDED bc241a580** (068ba0990 merged; vcs_ssh lib 72/72 on the merged tree), `vcs_ssh: a send the session refuses ends the connection refused`.
 - It replaces offer()'s `unwrap_or(0)`, which 01a1ff2e asked for.
 - It adds `stock_hg_clones_a_large_file_whole_over_the_ssh_edge`, #[ignore]d, by use. It pushes 16 MiB of noise over SSH, clones it back and verifies it. It PASSES in debug on a MacBook (2 shards). One large file does not reproduce the cut.
 
