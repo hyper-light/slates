@@ -3495,8 +3495,11 @@
 > what the import still holds live. Cut so far (w-svn's sites): the importer's text buffer sized once from its header,
 > admitted first; a stored text streamed into the increment from the store's lent windows, not read back whole; the
 > landing's store pieces lent. Owed: the other owners' copies (the content store's `put_window` and `release_one`; the
-> engine's `judge_held`, two `push_slice`, `Increment::encode`, `chain_entry::encode_carrying`; the changeset landing's
-> owned pieces, `slates_store::owner::SlicedLanding::part`), then A-742's floor re-derived by a release A/B only if the
+> engine's `judge_held`, two `push_slice`, `Increment::encode`, `chain_entry::encode_carrying`), then A-742's floor
+> re-derived by a release A/B only if the footprint still stays (main's ruling). The changeset landing's piece copies
+> are cut too (w-svn, main's routing of 00:57): `slates_store::owner::SlicedLanding::part` answers its buffer emptied
+> once written, and the svn landing fills one buffer a landing (`a_sliced_landings_part_gives_its_buffer_back_to_be_filled_again`).
+> Still to measure: the A-742 floor's A/B only if the
 > footprint still stays (main's ruling). A local 64 KiB floor gave 47 MB of footprint at 2 s idle, against 363 MB, at
 > 19.4 s against 12.0 s (debug).
 > **A-822's commit held the shard past its watchdog; A-835 slices it (2026-11-21, w-svn; main's ruling of 12:43).**
