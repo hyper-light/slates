@@ -363,9 +363,13 @@
 >   10,504,324 bytes with the operation headroom, grew its arena by 8,589,934,592 bytes before and by 16,777,216 after
 >   (the need rounded up to a power of two of units); two shards lending small rooms in turn, 8 turns each, grew
 >   4,294,967,296 bytes on the first turn before, and within that bound every turn after, every ask admitted
->   (`content_pool::tests`). Layout version 17. **OPEN, ruled (main 01a20182 21:35): the share cap.** Best fit does not
->   stop a lend of a whole `admittable()` from taking the pool. A shard refused room posts a bounded, typed want, and
->   every shard above its learned demand gives back at its next turn while one is posted; red first on g227's case.
+>   (`content_pool::tests`). Layout version 17. **The share cap FIXED by A-853 (main 01a20182 21:35, ruled):** a shard
+>   refused room posts a bounded want in its pool want word; the first post sends one message to each other shard,
+>   and one holding more than its demand publishes and gives back its wholly free extents. Red then green on Studio-4
+>   (`a_shards_burst_no_longer_starves_another_shards_push`): after shard 0's burst took the pool, shard 1's
+>   18,564-byte ask was still refused after 10 s (admittable 0) before, and admitted after, shard 0 counting
+>   `pool.want_answered`. Layout version 18. Not done: demand is what the shard needs now, not a learned (decayed)
+>   figure, so a shard that bursts again re-claims what it gave back.
 
 > **Goal 93 perf, hg serve (2026-11-21, w-perf; main's order 00:22 and ruling 01:05).** Found by a profile of a
 > one-changeset pull of Mercurial's history (24.95 s) and a stream clone (288 s): (1) every lookup in a

@@ -15,6 +15,14 @@
 //! slice's largest part first: a push seal's 18,564-byte turn grew a shard's arena by 8,589,934,592 bytes (g227,
 //! Studio-4, 2026-11-21).
 //!
+//! **Wants (A-853, the share cap).** A shard whose admission the pool cannot cover posts the room it lacks in its want
+//! word, beside the owner words in the anchor segment, bounded by the pool; it withdraws it once it grows. The post
+//! that finds no want standing sends one message to each other shard, and a shard holding more capacity than its
+//! demand (commitments, the operation headroom, the pressure hold) publishes, whose commit returns every wholly free
+//! extent past that demand. No fixed share: a shard grows into the whole pool while no other wants, and gives back when
+//! one does. Before A-853 a shard's burst kept the pool until its next publication, and a push on another shard was
+//! refused `PastAdmission { left: 0 }` (g227).
+//!
 //! **Names.** An extent's id is `partition × POOL_EXTENTS_PER_PARTITION + part`, and the arena holds it under that id,
 //! so a block's (region, offset) name is the same in every daemon and an image needs no extent table.
 //!
@@ -40,6 +48,7 @@ use slates_mem::shared::Handoff;
 
 use crate::config::DaemonConfig;
 use crate::error::ServerError;
+use crate::state::ShardState;
 
 /// Format: the partition the pressure hold claims pool extents under (§4.2, admission.md §5.5). Never a partition: an
 /// extent's id is the `u16` `partition × POOL_EXTENTS_PER_PARTITION + part`, so every partition is below
@@ -510,6 +519,31 @@ impl ExtentSource for ContentPool {
     self.hold_open = open;
   }
 
+  fn want(&mut self, bytes: usize) {
+    // Bounded: never more than the whole pool, which no arena can lack more of.
+    let pool = self
+      .parts
+      .iter()
+      .map(|(_, len)| *len)
+      .sum::<usize>()
+      .saturating_mul(usize::from(self.partitions));
+    let bytes = u64::try_from(bytes.min(pool)).unwrap_or(u64::MAX);
+    match self.segment.post_pool_want(self.partition, bytes) {
+      // The first post of a want tells the other shards, once: a task, since the arena posting it is borrowed inside
+      // this shard's state.
+      Ok(true) => {
+        if slates_rt::futures::spawn(tell_the_others_of_a_want())
+          .and_then(slates_rt::futures::detach)
+          .is_err()
+        {
+          self.refused = self.refused.saturating_add(1);
+        }
+      }
+      Ok(false) => {}
+      Err(_) => self.refused = self.refused.saturating_add(1),
+    }
+  }
+
   fn release(&mut self, id: u16, region: Region) {
     // Unmapped first: the word may be claimed by another shard the moment it is released.
     drop(region);
@@ -540,9 +574,48 @@ impl ExtentSource for ContentPool {
   }
 }
 
+/// Counter: wants this shard answered by giving back what its demand does not need (A-853): a publication, after which
+/// its wholly free extents went back to the pool.
+const WANT_ANSWERED: &str = "pool.want_answered";
+/// Counter: wants this shard was told of while it held no more than its demand: nothing to give.
+const WANT_NOTHING_TO_GIVE: &str = "pool.want_nothing_to_give";
+/// Counter: wants this shard could not answer: its publication refused, or the message to another shard not carried.
+const WANT_REFUSED: &str = "pool.want_refused";
+
+/// Tells every other shard that this one has posted a want (A-853, the share cap: main 01a20182 2026-11-21 21:35): one
+/// message each on its bounded channel, carried while the channel is full ([`crate::xshard::run_on_waiting`]). Sent
+/// only by the post that found no want standing, so a shard refused again and again sends no more than its first.
+async fn tell_the_others_of_a_want() {
+  let Some((origin, shards)) =
+    crate::state::with_state(|state| (state.shard, state.shards.clone()))
+  else {
+    return;
+  };
+  for shard in shards.into_iter().filter(|shard| *shard != origin) {
+    crate::xshard::run_on_waiting(origin, shard, answer_a_want, WANT_REFUSED);
+  }
+}
+
+/// Answers another shard's want on this one (A-853): when its arena holds more capacity than its demand (every
+/// commitment, the operation headroom and the pressure hold, `Store::demand`), it publishes, and the publication's
+/// commit returns every wholly free extent past that demand to the pool (`Store::release_idle`, run after a committed
+/// publication so no image names a returned block). A shard at its demand has nothing to give. The want is not read
+/// for an amount: everything past demand goes back, since the refused shard may need it all and claims by best fit.
+fn answer_a_want(state: &mut ShardState) {
+  let capacity = u64::try_from(state.store.content.arena().capacity()).unwrap_or(u64::MAX);
+  if capacity <= state.store.demand() {
+    state.count(WANT_NOTHING_TO_GIVE, 1);
+    return;
+  }
+  match crate::verbs::publish_shard(state) {
+    Ok(_) => state.count(WANT_ANSWERED, 1),
+    Err(_) => state.count(WANT_REFUSED, 1),
+  }
+}
+
 #[cfg(test)]
 mod tests {
-  use crate::state::ShardState;
+  use super::ShardState;
 
   /// Derived: the bytes g227's push seal lent a turn for 64 files (Studio-4, 2026-11-21; GAPS, g227's measurement),
   /// the lend that grew a shard's arena by a whole 8 GiB extent.
@@ -639,5 +712,56 @@ mod tests {
         );
       }
     }
+  }
+
+  /// Shape: how long [`a_shards_burst_no_longer_starves_another_shards_push`] gives the burst's shard to answer the
+  /// other's want, a bound on the test, not a tuning: a give-back is one publication on an idle shard.
+  const WANT_ANSWERED_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+  /// The share cap (main 01a20182 2026-11-21 21:35, ruled; g227's case). Do: on a two-shard daemon, shard 0 makes room
+  /// for all it could admit (a burst, as w-hg's merge lent `admittable()`), which takes the pool; then shard 1 asks room
+  /// for one push seal's turn past what it holds. Expect: the first ask refused (the burst holds the pool: the case's
+  /// precondition), and a later ask admitted within [`WANT_ANSWERED_WITHIN`], shard 0 having given back what its
+  /// demand does not need (its `pool.want_answered` counted, the non-vacuity counter). Before, shard 0 kept the pool and every push on shard 1 was refused
+  /// `PastAdmission { left: 0 }` (g227, Studio-4).
+  #[test]
+  fn a_shards_burst_no_longer_starves_another_shards_push() {
+    let daemon = crate::daemon::audit_daemon_of(2);
+    let burst = crate::daemon::observe_at(&daemon, 0, |state| {
+      let all = state.store.admittable();
+      state.store.make_room(all)
+    });
+    assert!(burst > 0, "the burst grew shard 0's arena (non-vacuity)");
+    let (asked, admittable, ..) = crate::daemon::observe_at(&daemon, 1, ask_one_turn_whole);
+    assert!(
+      admittable < asked,
+      "the burst holds the pool: asked {asked}, admittable {admittable}"
+    );
+    let began = std::time::Instant::now();
+    loop {
+      let (asked, admittable, ..) = crate::daemon::observe_at(&daemon, 1, ask_one_turn_whole);
+      if admittable >= asked {
+        break;
+      }
+      assert!(
+        began.elapsed() < WANT_ANSWERED_WITHIN,
+        "shard 1 still starved: asked {asked}, admittable {admittable}"
+      );
+      std::thread::yield_now();
+    }
+    let answered = crate::daemon::observe_at(&daemon, 0, |state| {
+      state
+        .refusals
+        .get(super::WANT_ANSWERED)
+        .copied()
+        .unwrap_or(0)
+    });
+    assert!(answered > 0, "shard 0 answered the want (non-vacuity)");
+  }
+
+  /// [`ask_one_turn`] where the turn must be admitted whole: room for what the shard holds free, at least a turn more.
+  fn ask_one_turn_whole(state: &mut ShardState) -> (u64, u64, u64) {
+    let (asked, lacked, grown, _, admittable) = ask_one_turn(state);
+    (asked, admittable, lacked.max(grown))
   }
 }

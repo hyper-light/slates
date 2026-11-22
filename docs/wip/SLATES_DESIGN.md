@@ -60449,3 +60449,26 @@ Status: built 2026-11-21, every platform (the cut and the claim are platform-fre
   shards lending in turn grew 4,294,967,296 bytes on the first turn before, and every turn within that bound after.
 - Not in this change: the share cap (GAPS, ruled 21:35): best fit does not stop a lend of a whole `admittable()` from
   taking the pool.
+
+### A-853 — The share cap: a refused shard's want, answered by the shards above their demand (2026-11-21, w-sizing; main 01a20182's ruling of 21:35, goal 93; A-848, A-98)
+Applied in the same change to: `crates/anchor/src/layout.rs` (the pool region's want words, `LAYOUT_VERSION` 18),
+`crates/anchor/src/segment.rs` (`post_pool_want`, `pool_want`), `crates/mem/src/arena.rs` (`ExtentSource::want`,
+`ChunkArena::make_room` posts it), `crates/vfs/src/volume.rs` (`Store::demand`), `crates/server/src/content_pool.rs`
+(`ContentPool::want`, `tell_the_others_of_a_want`, `answer_a_want`, the module docs, the test), GAPS.
+
+Status: built 2026-11-21, every platform.
+- Why: after A-848 a lend still grows an arena by what it is lent, so a lend of a shard's whole `admittable()` (w-hg's
+  merge, g227) took the pool, and the shard kept it until its next publication: pushes on the other shard were refused
+  `PastAdmission { left: 0 }`.
+- Rule (one mechanism, no fixed share): a shard whose growth the pool cannot cover posts what it lacks in its want word
+  (the pool region holds one a partition after the owner words), bounded by the whole pool, and withdraws it when it
+  next grows. The post that finds none standing spawns one task on the refused shard that sends each other shard one
+  message on its bounded channel (`xshard::run_on_waiting`). A shard told of a want whose arena holds more than its
+  demand (`Store::demand`: every commitment, the operation headroom and the pressure hold) publishes, and the commit's
+  `release_idle` returns every wholly free extent past that demand. Extents go back only after a committed
+  publication, so no image names a returned block. A shard grows into the whole pool while no other wants.
+- No polling, no lock: the want is one word swapped, and the tell is sent once per want, not per refusal.
+- Measured (Studio-4, debug, `cargo test -p slates-server --lib content_pool::tests`): after shard 0's burst, shard 1's
+  18,564-byte ask was refused for 10 s, admittable 0, before; admitted at once after, shard 0 counting
+  `pool.want_answered`.
+- Open: demand is the shard's need now, not learned and decayed, so a shard that bursts again re-claims what it gave.

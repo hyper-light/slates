@@ -115,6 +115,10 @@ pub trait ExtentSource: Send {
   /// admission.md §5.5: a takeover's recovery runs past the hold, which never revokes a committed claim). A source
   /// with no hold has nothing to open.
   fn open_hold(&mut self, _open: bool) {}
+  /// Posts the bytes this arena was refused for want of free extents, 0 once it grew by what it lacked (A-853, the
+  /// share cap): a source shared with other arenas tells them, so one holding more than its demand gives back. A
+  /// source with no other arena has no one to tell.
+  fn want(&mut self, _bytes: usize) {}
 }
 
 /// The arena.
@@ -366,7 +370,9 @@ impl ChunkArena {
     // Growing from the pool takes on the pressure debt the daemon's sampler left for the next shard to grow (§4.2,
     // `budget::Pressure`): the arena grows by it too, and the budget holds it once grown.
     let needed = deficit.saturating_add(budget.debt());
+    let needed_bytes = usize::try_from(needed).unwrap_or(usize::MAX);
     if u64::try_from(self.claimable()).unwrap_or(u64::MAX) < needed {
+      self.post_want(needed_bytes);
       return 0;
     }
     let before = self.capacity();
@@ -376,11 +382,20 @@ impl ChunkArena {
       // The claims just taken hold no block, so they are wholly free and go back first (the newest regions are
       // returned first), down to the capacity the arena had before.
       self.shrink(before);
+      self.post_want(needed_bytes);
       return 0;
     }
+    self.post_want(0);
     budget.extend(added);
     budget.absorb_debt();
     added
+  }
+
+  /// Posts `bytes` as this arena's want to its source ([`ExtentSource::want`]); nothing without a source.
+  fn post_want(&mut self, bytes: usize) {
+    if let Some(source) = self.source.as_mut() {
+      source.want(bytes);
+    }
   }
 
   /// Returns every held region that is wholly free (no live or deferred block) to the source, keeping

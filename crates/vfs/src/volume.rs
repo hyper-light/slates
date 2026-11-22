@@ -316,17 +316,24 @@ impl Store {
     }
   }
 
+  /// The capacity this shard's work needs held now: every commitment, the operation headroom and the pressure hold.
+  /// What [`Store::release_idle`] keeps, and what a shard compares its capacity with when another shard's want is posted
+  /// (A-853, the share cap).
+  pub fn demand(&self) -> u64 {
+    self
+      .budget
+      .committed()
+      .saturating_add(self.budget.headroom())
+      .saturating_add(self.budget.hold())
+  }
+
   /// Returns the arena's wholly free extents to its pool, keeping the capacity every commitment, the operation
   /// headroom and the pressure hold need (A-98): the bytes returned. Run after a committed publication, when no
   /// deferred free holds an extent the committed image might still name. The hold is kept because it is free room the
   /// daemon's sampler took from this shard (§4.2): returned to the pool, it would be claimable by any shard until the
   /// next refresh withheld it again.
   pub fn release_idle(&mut self) -> u64 {
-    let keep = self
-      .budget
-      .committed()
-      .saturating_add(self.budget.headroom())
-      .saturating_add(self.budget.hold());
+    let keep = self.demand();
     let returned = self
       .content
       .arena_mut()

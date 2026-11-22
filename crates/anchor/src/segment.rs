@@ -117,11 +117,12 @@ fn segment_words(geometry: &Geometry) -> Words {
           STUCK_LABEL_WORDS.saturating_add(4),
           Width::U64,
         )),
-      // The content pool's owner words (A-98), each claimed by compare-and-swap.
+      // The content pool's owner words (A-98), each claimed by compare-and-swap, then a want word a partition (A-853).
       RegionKind::Pool => words.with(WordRun::strided(
         at,
         size_of::<u64>(),
-        usize::from(geometry.partitions).saturating_mul(crate::layout::POOL_EXTENTS_PER_PARTITION),
+        usize::from(geometry.partitions)
+          .saturating_mul(crate::layout::POOL_EXTENTS_PER_PARTITION.saturating_add(1)),
         Width::U64,
       )),
       RegionKind::Log(_) => words.with(WordRun::strided(
@@ -1125,6 +1126,35 @@ impl AnchorSegment {
         .compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire)
         .is_ok(),
     )
+  }
+
+  /// Partition `partition`'s want word (A-853), after every owner word, refused past the partitions.
+  fn want_word(&self, partition: u16) -> Result<&AtomicU64, AnchorError> {
+    if partition >= self.geometry.partitions {
+      return Err(AnchorError::Geometry {
+        reason: "a pool want past the partitions",
+      });
+    }
+    let at = self
+      .pool_extents()
+      .checked_add(usize::from(partition))
+      .and_then(|word| word.checked_mul(crate::layout::POOL_WORD_BYTES))
+      .ok_or(AnchorError::Geometry {
+        reason: "a pool want offset overflows",
+      })?;
+    self.word_at(self.spec(RegionKind::Pool)?, at)
+  }
+
+  /// Posts the room `partition` was refused, `bytes` (0 withdraws it), and returns whether it was not posted before
+  /// (A-853, the share cap): a refused partition posts what it lacks, and only the post that finds none standing tells
+  /// the others, so a partition refused again and again sends no more than its first.
+  pub fn post_pool_want(&self, partition: u16, bytes: u64) -> Result<bool, AnchorError> {
+    Ok(self.want_word(partition)?.swap(bytes, Ordering::AcqRel) == 0 && bytes > 0)
+  }
+
+  /// The room `partition` has posted as refused, 0 when it wants none (A-853).
+  pub fn pool_want(&self, partition: u16) -> Result<u64, AnchorError> {
+    Ok(self.want_word(partition)?.load(Ordering::Acquire))
   }
 
   /// The pool extents `partition` holds, ascending (A-98: what its recovery checks its image against).
