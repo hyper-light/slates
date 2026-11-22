@@ -450,3 +450,21 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - A sibling flake remains: a first-run hook's words pipe inherited by a concurrent spawn. Asked main to rule:
   (a) no inherited fds, (b) end the drain when the hook's group is empty, (c) both.
 - Waiting: that ruling; the HTTPv2 rerun at 0de4c75ea or later; finding (2)'s routed copies.
+
+## 2026-11-22 ~03:45 PST: A-858 landed; clippy findings fixed
+- A-858 (main's ruling (a) and the guard order of 03:22): bd94fed6f, merged as 9b1b4ccdf.
+  - Every child the daemon spawns goes through `slates_ipc::confined_spawn` (posix_spawn, CLOEXEC_DEFAULT on macOS).
+  - The hook driver rereads `waitid` after an exit note the kernel posted early.
+  - The svn_interop guard unmounts its views before it stops its daemon.
+  - Red first: 32 hooks at once, red 2 of 3 on the old driver; 20 of 20 green after.
+- Clippy findings: 2d65eefbf (the commit_side split) and 00844de07 (confined_spawn's records own themselves, no
+  mem::forget). The unsafe budget for slates-ipc is now 159.
+  - All 12 sites are posix_spawn FFI, which rustix does not wrap; the waits and the group kill already go through
+    rustix.
+- Main pushed the macOS proof, diag-measurer-w-svn-858 at afa560c26, as run 45018545878. Main's clippy rerun is
+  45018575168 at 16489f046.
+- Waiting on main for:
+  - those two results;
+  - finding (2)'s routed copies (w-multirepo, w-engine, w-shared), then the git-2000 re-measure.
+- Red on run 45018545878 would be a new piece for me: the propset hang still there (its sample shows the wait), the
+  guard test failing, or a view left mounted.
