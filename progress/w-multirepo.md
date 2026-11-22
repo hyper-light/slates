@@ -23,3 +23,5 @@ Clone: ~/slates-work/w-multirepo; target ~/.cache/w-multirepo-target.noindex; st
 - LANDED 19f31bfb7 (main 0ecd7ee1e): A-846 slates_vcs::partition. Reported. Main's lint touched mrc.rs (fine, 13/13).
 - NEXT: 2d wiring (owner shard: curves fed from content reads, rates from begun/stepped, partition at the learning
   cadence, snapshot published) -- needs main's split ruling. Meanwhile: piece 7 (load proof test), which is mine.
+- 18:00 PARKED on main's A-724 split ruling (all remaining A-724 work touches w-balance's live files). Sent the CPU
+  weights design question + 2d wiring plan: inbox/main-from-w-multirepo-question-cpu.md.
