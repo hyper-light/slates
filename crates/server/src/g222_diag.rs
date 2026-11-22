@@ -648,6 +648,14 @@ const SERVES_CAP: usize = 100_000;
 /// Every long serve: shard, start (monotonic ns), length, verb.
 static SERVES: std::sync::Mutex<Vec<(u16, u64, u64, String)>> = std::sync::Mutex::new(Vec::new());
 
+/// w-perf 84a: a part of the serve path begun at `began`, recorded as a long serve by `name` when it ran long.
+pub fn part(began: u64, name: &str) {
+  let ns = slates_machine::clock::monotonic_ns().saturating_sub(began);
+  if serve_is_long(ns) {
+    long_serve(began, ns, name.to_owned());
+  }
+}
+
 pub fn serve_is_long(ns: u64) -> bool {
   ns >= LONG_SERVE_NS
 }

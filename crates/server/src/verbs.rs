@@ -18775,7 +18775,9 @@ pub fn serve_round(state: &mut ShardState) -> bool {
   // One clock read per round marks every client served in it (the reap's silence clock).
   let now = state.clock.monotonic_ns();
   for (index, handle) in handles {
+    let g222_p = slates_machine::clock::monotonic_ns();
     any |= serve_client(state, index, handle, now);
+    crate::g222_diag::part(g222_p, "client:serve_client (whole)");
   }
   g222_part(g222_began, "round:clients (whole)");
   // The closed loop's clock (`loop_hold`; A-326): the end of a round's client I/O, the requests of its clients' loops
@@ -18862,7 +18864,12 @@ fn retry_deferred(state: &mut ShardState) -> bool {
         .completion(origin, id.client, id.sequence)
       {
         Seen::New if not_started(&reply) => unrecorded_not_started(state, reply),
-        Seen::New => record_completion(state, origin, id, reply),
+        Seen::New => {
+          let g222_p = slates_machine::clock::monotonic_ns();
+          let recorded = record_completion(state, origin, id, reply);
+          crate::g222_diag::part(g222_p, "deferred:record_completion");
+          recorded
+        }
         _ => reply,
       }
     };
@@ -18979,10 +18986,12 @@ fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, 
   let mut any = false;
   let batch = state.config.runtime.batch.max(1);
   for _ in 0..batch {
+    let g222_p = slates_machine::clock::monotonic_ns();
     let taken = match state.clients.get_mut(handle) {
       Ok(c) => c.end.try_take(),
       Err(_) => break,
     };
+    crate::g222_diag::part(g222_p, "client:try_take");
     let request = match taken {
       Ok(Some(r)) => r,
       Ok(None) => break,
@@ -18993,7 +19002,10 @@ fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, 
     };
     any = true;
     // A slot the gate ended is gone, and the next take finds it so.
-    if !to_serve(state, index, handle, &request) {
+    let g222_p = slates_machine::clock::monotonic_ns();
+    let admitted = to_serve(state, index, handle, &request);
+    crate::g222_diag::part(g222_p, "client:to_serve");
+    if !admitted {
       continue;
     }
     let g222_taken = slates_machine::clock::monotonic_ns();
@@ -19007,6 +19019,8 @@ fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, 
     if let Some(landed) = g222_landed {
       crate::g222_diag::took(request.request, landed, g222_taken);
     }
+    crate::g222_diag::part(g222_taken, "client:diag_took");
+    let g222_p = slates_machine::clock::monotonic_ns();
     // The `ring.request` span (§4.14) opens the request's trace as a root at the slot read: the client
     // is the entry point, its request id the replay identity. `now` (this round's single clock read,
     // §4.7) stands for the read time — a small, conservative over-estimate within one batch, not a
@@ -19018,6 +19032,7 @@ fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, 
       now,
     );
     state.current_span = Some(ring.context());
+    crate::g222_diag::part(g222_p, "client:open_root");
     let g222_serve_began = slates_machine::clock::monotonic_ns();
     let served = serve(state, handle, &request, now);
     let g222_serve_ns = slates_machine::clock::monotonic_ns().saturating_sub(g222_serve_began);
@@ -19038,8 +19053,14 @@ fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, 
     state.forward_hold_ns = 0;
     match served {
       Served::Reply(mut reply) => {
+        let g222_p = slates_machine::clock::monotonic_ns();
         crate::g222_diag::forget(request.request);
-        if send_reply(state, index, request.request, &mut reply) {
+        crate::g222_diag::part(g222_p, "client:diag_forget");
+        let g222_p = slates_machine::clock::monotonic_ns();
+        let sent = send_reply(state, index, request.request, &mut reply);
+        crate::g222_diag::part(g222_p, "client:send_reply");
+        if sent {
+          let g222_p = slates_machine::clock::monotonic_ns();
           // Written synchronously: the span ends at the reply written.
           let written_ns = state.clock.monotonic_ns();
           if let Some(landed) = g222_landed {
@@ -19052,6 +19073,7 @@ fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, 
           }
           let label = u32::from(state.partition);
           crate::telemetry::emit(state, ring.end(label, written_ns));
+          crate::g222_diag::part(g222_p, "client:diag_ring+emit");
         } else {
           // The ring was full: the open span rides the deferred reply and ends when it is written.
           state.deferred.push(Deferred {
@@ -19065,7 +19087,11 @@ fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, 
       }
       // A forwarded (or scattered) request: its reply returns through `deliver`, which takes the open
       // span back out and ends it at the write.
-      Served::Forwarded => remember_forwarded_ring(state, request.request, ring),
+      Served::Forwarded => {
+        let g222_p = slates_machine::clock::monotonic_ns();
+        remember_forwarded_ring(state, request.request, ring);
+        crate::g222_diag::part(g222_p, "client:remember_forwarded");
+      }
     }
   }
   any
@@ -19101,7 +19127,9 @@ pub(crate) fn send_reply(
   // A stream end owed for this request goes first, over the client's control socket, so the client finds it waiting
   // when it reads the reply (A-161); on Windows it is duplicated into the client's process and its value written into
   // the reply (A-179). It is taken out here whatever becomes of the reply.
+  let g222_p = slates_machine::clock::monotonic_ns();
   crate::shards::deliver_handoff(state, client_index, request, reply);
+  crate::g222_diag::part(g222_p, "reply:deliver_handoff");
   let Some(generation) = state.clients.generation_at(client_index) else {
     return true;
   };
@@ -19148,9 +19176,14 @@ pub(crate) fn send_reply(
   };
   // Room first, then the body (`DaemonEnd::reply_message`): a reply packed before a full ring refused it was written
   // over the bulk body of the oldest reply the client had not taken.
-  match client.end.reply_message(request, reply) {
+  let g222_p = slates_machine::clock::monotonic_ns();
+  let g222_written = client.end.reply_message(request, reply);
+  crate::g222_diag::part(g222_p, "reply:reply_message");
+  match g222_written {
     Ok(()) => {
+      let g222_p = slates_machine::clock::monotonic_ns();
       crate::g222_diag::deferred_written(request);
+      crate::g222_diag::part(g222_p, "reply:diag_deferred_written");
       true
     }
     Err(IpcError::RingFull) => false,
