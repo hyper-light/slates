@@ -511,3 +511,120 @@ fn a_logs_versions_by_tool_id_are_read_in_one_scan() {
   );
   let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Lands repository 1's changeset `sequence` with a record, the one `payload`, and a `Texts` section naming `entries`,
+/// each placed whole in the payload.
+fn land_texts(store: &mut Store, sequence: u64, payload: &[u8], entries: &[(&str, &[u8], &[u8])]) {
+  let staging = Staging::new(1 << 20);
+  let entries: Vec<TextEntry> = entries
+    .iter()
+    .map(|(path, tool_id, text)| TextEntry {
+      path: path.as_bytes().to_vec(),
+      tool_id: tool_id.to_vec(),
+      text: *blake3::hash(text).as_bytes(),
+      len: text.len() as u64,
+      base: None,
+      place: Place {
+        payload: *blake3::hash(payload).as_bytes(),
+        offset: 0,
+        len: payload.len() as u64,
+      },
+    })
+    .collect();
+  let section = texts::encode(&entries);
+  store
+    .land(
+      Header {
+        tool: Tool::Mercurial,
+        repository: 1,
+        sequence,
+        judged_over: sequence - 1,
+        grant: 1,
+        work: 0,
+        time_ns: sequence,
+        sections: 0,
+      },
+      &[
+        (SectionKind::Record, Contents::Bytes(b"segment")),
+        (SectionKind::Payload, Contents::Bytes(payload)),
+        (SectionKind::Texts, Contents::Bytes(&section)),
+      ],
+      &staging,
+    )
+    .unwrap();
+}
+
+/// Main 01a20182's ruling of 2026-11-22 12:00 (an abandoned push's run: its rows forgotten at its abandonment, counted
+/// and bounded, never another's). Do: land changeset 1 keeping texts `x` at `p` (tool id `n1`) and `y` at `p` (`n2`),
+/// then changeset 2 keeping `x` again, a copy at `q` (`m1`), as a named push that brought the same text after it;
+/// forget changeset 1; reopen the store (its recovery). Expect the rows forgotten counted; changeset 1 gone from the
+/// log's rows and its payload no longer read; `x`'s text row moved to changeset 2, as its own place; `y`'s text row
+/// and `p`'s versions gone; `q`'s version intact; all of it so after the recovery; and forgetting it again forgets
+/// nothing. Red before: no way to forget a changeset's rows.
+#[test]
+fn a_forgotten_changesets_rows_go_and_a_text_another_kept_moves_to_it() {
+  let dir = scratch("forget");
+  let (x, y) = (
+    b"the text both kept\n".as_slice(),
+    b"the text only the forgotten kept\n".as_slice(),
+  );
+  let (first, second) = (
+    b"the forgotten changeset's payload".as_slice(),
+    b"the named changeset's payload".as_slice(),
+  );
+  let id = |bytes: &[u8]| *blake3::hash(bytes).as_bytes();
+  let look = |store: &mut Store| {
+    let staging = Staging::new(0);
+    (
+      store
+        .changesets(1, 0, 10)
+        .unwrap()
+        .iter()
+        .map(|row| row.sequence)
+        .collect::<Vec<_>>(),
+      store
+        .piece(&staging, &id(first), first.len() as u64, 0)
+        .unwrap()
+        .is_some(),
+      store
+        .text_row(1, &id(x))
+        .unwrap()
+        .map(|row| (row.sequence, row.place.payload)),
+      store.text_row(1, &id(y)).unwrap(),
+      store
+        .texts_by_tools(1, b"p", &[b"n1".to_vec(), b"n2".to_vec()])
+        .unwrap(),
+      store
+        .texts_by_tools(1, b"q", &[b"m1".to_vec()])
+        .unwrap()
+        .into_iter()
+        .map(|found| found.map(|(text, row)| (text, row.sequence)))
+        .collect::<Vec<_>>(),
+    )
+  };
+  let forgotten = {
+    let mut store = open(&dir);
+    land_texts(&mut store, 1, first, &[("p", b"n1", x), ("p", b"n2", y)]);
+    land_texts(&mut store, 2, second, &[("q", b"m1", x)]);
+    assert_eq!(
+      store.text_row(1, &id(x)).unwrap().map(|row| row.sequence),
+      Some(1)
+    );
+    let forgotten = store.forget(1, 1).unwrap();
+    assert_eq!(store.forget(1, 1).unwrap(), 0, "nothing left to forget");
+    forgotten
+  };
+  let mut store = open(&dir);
+  let seen = look(&mut store);
+  assert!(forgotten >= 6, "{forgotten} rows forgotten or moved");
+  assert_eq!(seen.0, vec![2], "changeset 1's row forgotten");
+  assert!(!seen.1, "its payload no longer read");
+  assert_eq!(
+    seen.2,
+    Some((2, id(second))),
+    "x's text row moved to changeset 2"
+  );
+  assert_eq!(seen.3, None, "y's text row forgotten");
+  assert_eq!(seen.4, vec![None, None], "p's versions forgotten");
+  assert_eq!(seen.5, vec![Some((id(x), 2))], "q's version intact");
+}
