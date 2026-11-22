@@ -10,3 +10,10 @@ slates origin/main dba4ae793 (diag run 44968040276, branch diag-measurer-w-k90-w
   (which publishes win_arm64 wheels) in flight: diag-measurer-w-k90-win-store-2. jupiter rerun when kiln is back.
 - No red, so nothing handed to w-work-mount / w-git / w-hg. Next: the git and hg matrices (tell me the queue's file if it
   isn't w-interop's Windows matrix).
+
+## ~17:10 PST: arm64 hg green -- store lane GREEN on both Windows runners
+- windows-11-arm, SLATES_TEST_HG="uvx --quiet --from mercurial==7.2.4 hg": stock_hg_clones_pulls_and_pushes_over_the_
+  vcs_http_edge ok (1 passed, 6.56 s, no skip; diag run 44969321647, origin/main dba4ae793). Mercurial 7.2 under uvx's
+  Python 3.12 gives no runnable hg on arm64 (no win_arm64 wheel for that pairing); 7.2.4 does, as Slates' CI pins it.
+- With run 44968040276: git and hg both green by use on windows-latest and windows-11-arm. jupiter still unreached
+  (kiln down); I rerun there when it answers.
