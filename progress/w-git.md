@@ -457,3 +457,17 @@
   t_goal93_a_whole_clone_of_a_line_with_an_annotated_tag_of_every_commit_is_whole (uncommitted, w-git-p2): 40 tags of a
   line, encode to idle, fetch all: PASSES with flat blobs (41 versions in 5,191 turns: each tag's first version encodes
   everything it reaches, O(tags x history) -- a perf/RSS finding to report); now trying delta-heavy content.
+- 2026-11-21 ~22:30 PST: main 01a20182 (session uds 23415.sock; kiln 01a201824d307ecc9e135c64ae3cb848) ruled bug (2)
+  YES as A-850 (claimed, pushed). Bug (1)'s cause (w-sessionlog rerun): Negotiation(PastAdmission{asked 7912, left 283})
+  -- the never-finished encoding holds the room. (1) after A-850; agree file split with w-balance (piece 3, resumable
+  admission) in writing first. Landed meanwhile: 39c36af9d, 03c0e2e14 (upload refusal counted+logged), 3e910809f.
+  A-850 RED written (uncommitted, w-git-p2): t_a850_tags_of_held_commits_bring_their_tag_objects_alone: 2,620 brought
+  vs 160 pushed. Design:
+  (a) store admitting.rs `unwalked`: `from` also found by peeling a tag chain (push or index bytes) to its target and
+      taking the green+version heading it.
+  (b) deriving.rs: a first version (!before) with a base brings indexed_alone(walk) (relative), reached = base u walk
+      (today brought = reached).
+  (c) record v6: each move carries its base (green key, version); SealedPush::record writes it; replay hands it to the
+      admission (no search); v5 refused typed (Retired like v1/v2? or Version). Recovery test replaying the base.
+  Runs (negotiation/one_round) start after a common version >= 0, so D(0) never enters a run: no plan change needed
+  for runs; fragments of v0 shrink to the tag object.
