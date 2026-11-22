@@ -2160,20 +2160,7 @@ fn t_a836_refs_naming_a_blob_and_tags_of_tags_are_taken_and_advertised() {
     }
     // Served as git serves them: `ls-refs` with `peel` names each tag's object peeled through every tag it names, and a
     // fetch wanting the three answers a pack holding them and everything they reach.
-    use crate::vcs_store::upload::tests::{
-      answered, fetch, lines_of, pack_of, request as upload_request,
-    };
-    let asking = ["peel".to_owned(), "ref-prefix refs/tags/".to_owned()];
-    let listed = answered(
-      state,
-      (repository, &owner()),
-      slates_git::upload::Asked::Request(&upload_request("ls-refs", &asking)),
-    );
-    assert_eq!(listed.1, None, "ls-refs refused");
-    let lines: Vec<String> = lines_of(&listed.0)
-      .iter()
-      .map(|line| String::from_utf8_lossy(line).trim_end().to_owned())
-      .collect();
+    let lines = tags_listed_peeled(state, repository);
     for expected in [
       format!("{blob} refs/tags/junio-gpg-pub"),
       format!("{signed} refs/tags/signed-blob peeled:{blob}"),
@@ -2184,20 +2171,7 @@ fn t_a836_refs_naming_a_blob_and_tags_of_tags_are_taken_and_advertised() {
         "{expected} not listed: {lines:?}"
       );
     }
-    let fetched = answered(
-      state,
-      (repository, &owner()),
-      slates_git::upload::Asked::Request(&fetch(&[blob, signed, rc], &[])),
-    );
-    assert_eq!(fetched.1, None, "fetch refused");
-    let unpacked = slates_git::unpack::read_whole(
-      &pack_of(&fetched.0),
-      ObjectFormat::Sha1,
-      &slates_git::unpack::NoIndex,
-      &mut slates_git::Admission::new(u64::MAX),
-    )
-    .expect("a whole pack");
-    let ids: Vec<ObjectId> = unpacked.objects.iter().map(|object| object.id).collect();
+    let ids = fetched_ids(state, repository, &[blob, signed, rc]);
     for id in [blob, signed, rc, inner, first] {
       assert!(ids.contains(&id), "{id} not fetched: {ids:?}");
     }
@@ -2342,6 +2316,45 @@ fn t_goal93_a_whole_clone_of_a_line_with_an_annotated_tag_of_every_commit_is_who
       );
     }
   });
+}
+
+/// `repository`'s tags as `ls-refs` with `peel` lists them to its owner, a line each.
+fn tags_listed_peeled(state: &mut ShardState, repository: RepositoryId) -> Vec<String> {
+  use crate::vcs_store::upload::tests::{answered, lines_of, request as upload_request};
+  let asking = ["peel".to_owned(), "ref-prefix refs/tags/".to_owned()];
+  let listed = answered(
+    state,
+    (repository, &owner()),
+    slates_git::upload::Asked::Request(&upload_request("ls-refs", &asking)),
+  );
+  assert_eq!(listed.1, None, "ls-refs refused");
+  lines_of(&listed.0)
+    .iter()
+    .map(|line| String::from_utf8_lossy(line).trim_end().to_owned())
+    .collect()
+}
+
+/// The objects of the pack a fetch of `wants` from `repository` answers its owner.
+fn fetched_ids(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  wants: &[ObjectId],
+) -> Vec<ObjectId> {
+  use crate::vcs_store::upload::tests::{answered, fetch, pack_of};
+  let fetched = answered(
+    state,
+    (repository, &owner()),
+    slates_git::upload::Asked::Request(&fetch(wants, &[])),
+  );
+  assert_eq!(fetched.1, None, "fetch refused");
+  let unpacked = slates_git::unpack::read_whole(
+    &pack_of(&fetched.0),
+    ObjectFormat::Sha1,
+    &slates_git::unpack::NoIndex,
+    &mut slates_git::Admission::new(u64::MAX),
+  )
+  .expect("a whole pack");
+  unpacked.objects.iter().map(|object| object.id).collect()
 }
 
 /// Shape: the files of a flat head in [`t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time`], as w-git

@@ -11,7 +11,8 @@ use slates_mem::arena::ChunkArena;
 use slates_mem::region::Region;
 use slates_svn::dump::{Admission, Uuid};
 use slates_svn::migration::Repository as SvnRecords;
-use slates_svn::migration::{Importer, Importing, Room, WithTexts};
+use slates_svn::migration::{Importer, Importing, Room, Standalone, WithTexts};
+use slates_vcs::ContentStore;
 use slates_vfs::NameEquivalence;
 use slates_vfs::clock::StepClock;
 use slates_vfs::quota::Quota;
@@ -37,25 +38,40 @@ const OWNER: (u32, u32) = (501, 20);
 /// Shape: the bytes a read asks for at once: prime, so reads start and end inside pieces.
 const READ_BYTES: usize = 1021;
 
-/// The records `dump` makes.
-fn imported(dump: &[u8]) -> SvnRecords {
+/// Shape: a content store's window, room for a few rows a table, as the import's own tests make one.
+const STORE_WINDOW: usize = 1 << 12;
+
+/// Shape: a content store's budget, the golden history's texts many times over.
+const STORE_ROOM: u64 = 1 << 24;
+
+/// The records `dump` makes, and a content store holding every text they name stored, as a daemon's records name its
+/// texts and its shard's content store holds them (the KeptText move: no records keep a text themselves).
+fn imported(dump: &[u8]) -> (SvnRecords, ContentStore) {
   let uuid = Uuid::parse(b"00000000-0000-4000-8000-000000000738").unwrap();
-  let mut records = SvnRecords::new(uuid, b"2026-11-20T00:00:00.000000Z", ROOMY).unwrap();
+  let mut standalone =
+    Standalone::new(SvnRecords::new(uuid, b"2026-11-20T00:00:00.000000Z", ROOMY).unwrap());
   let mut importer = Importer::new(ADMISSION);
   let mut rest = dump;
   loop {
-    match importer.import(&mut records, rest, true).unwrap() {
-      Importing::Done => return records,
+    match standalone.import(&mut importer, rest, true).unwrap() {
+      Importing::Done => break,
       Importing::NeedMore { .. } => panic!("the whole dump was given"),
       Importing::Commit { consumed, record } => {
         rest = &rest[consumed..];
-        records.commit_record(*record).unwrap();
+        standalone.commit_record(*record).unwrap();
       }
       Importing::Base { text, .. } => {
-        panic!("the records hold every text, yet the import asked for {text:?}")
+        panic!(
+          "the import's bases are supplied from the texts held apart, yet it asked for {text:?}"
+        )
       }
     }
   }
+  let mut store = ContentStore::new(STORE_ROOM, STORE_WINDOW).unwrap();
+  for (_, bytes) in standalone.texts_apart() {
+    store.put_object(bytes).unwrap();
+  }
+  (standalone.records().clone(), store)
 }
 
 /// A vfs store and a volume for the view.
@@ -193,10 +209,10 @@ fn revision_reads_back(
 /// and the reads' counts covering every byte read.
 #[test]
 fn the_presented_volume_holds_the_fsfs_view_byte_for_byte() {
-  let records = imported(FULL);
+  let (records, content) = imported(FULL);
   let head = HeadTexts {
     green: None,
-    store: None,
+    store: Some(&content),
     records: &records,
     pieces: None,
   };
@@ -252,14 +268,14 @@ fn the_presented_volume_holds_the_fsfs_view_byte_for_byte() {
 /// as `fsfs` writes it, and every other revision's unchanged.
 #[test]
 fn a_revision_property_change_rewrites_that_revisions_properties_file() {
-  let mut records = imported(FULL);
+  let (mut records, content) = imported(FULL);
   let (mut store, mut volume) = volume();
   let root = volume.root_inode(&store).unwrap();
   let mut presented = Presented::new();
   {
     let head = HeadTexts {
       green: None,
-      store: None,
+      store: Some(&content),
       records: &records,
       pieces: None,
     };
@@ -288,7 +304,7 @@ fn a_revision_property_change_rewrites_that_revisions_properties_file() {
   records.set_revision_properties(1, properties).unwrap();
   let head = HeadTexts {
     green: None,
-    store: None,
+    store: Some(&content),
     records: &records,
     pieces: None,
   };

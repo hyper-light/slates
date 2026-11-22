@@ -7,7 +7,7 @@ use super::support::{
 };
 use crate::dump::Format;
 use crate::index::{Action, ChangedPath, NodeKind};
-use crate::migration::{Properties, Repository};
+use crate::migration::{Properties, Standalone};
 
 /// The bytes of a file the first revision adds.
 const TEXT: &[u8] = b"a text\n";
@@ -35,14 +35,14 @@ fn first_revision() -> Dump {
 }
 
 /// A created repository with `dump` imported.
-fn imported(dump: &Dump) -> Repository {
+fn imported(dump: &Dump) -> Standalone {
   let mut repository = created();
   import_whole(&mut repository, &dump.bytes()).unwrap();
   repository
 }
 
 /// The changed paths of `repository`'s youngest revision.
-fn youngest_changes(repository: &Repository) -> Vec<ChangedPath> {
+fn youngest_changes(repository: &Standalone) -> Vec<ChangedPath> {
   repository
     .index()
     .changes(repository.youngest())
@@ -285,7 +285,7 @@ fn a_replacement_by_a_copy_of_the_node_it_replaces_imports_and_round_trips() {
 }
 
 /// Holds `repository` to the history its own export imports to.
-fn same_history_through_its_export(repository: &Repository) {
+fn same_history_through_its_export(repository: &Standalone) {
   let mut again = created();
   import_whole(
     &mut again,

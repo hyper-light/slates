@@ -5328,6 +5328,8 @@ pub(crate) async fn seal_idle_content() -> bool {
   if aged.is_none() {
     return true;
   }
+  // Idle base directories give their descriptors back first (A-838): a pass that kept any is not settled.
+  let directories_idle = crate::idle_sweep::close_idle_directories().await;
   let mut sealed_this_tick = 0u64;
   loop {
     let turn = state::with_state(|s| {
@@ -5387,7 +5389,7 @@ pub(crate) async fn seal_idle_content() -> bool {
       .any(|(_, slot)| slot.volume.sweep_owes())
   })
   .unwrap_or(false);
-  purged && !owes
+  purged && !owes && directories_idle
 }
 
 /// The idle shard's emptied write log, its pages given back (`crate::write_log::WriteLog::purge`).

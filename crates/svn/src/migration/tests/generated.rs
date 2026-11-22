@@ -15,7 +15,7 @@ use super::support::{
 use crate::dump::Format;
 use crate::index::NodeKind;
 use crate::migration::paths::{absolute, join};
-use crate::migration::{Properties, Repository};
+use crate::migration::{Properties, Standalone};
 
 /// The names a generated node takes: plain, with a dot, a space and a colon.
 const NAMES: [&str; 5] = ["a", "b.txt", "c d", "dir", "e:f"];
@@ -368,7 +368,7 @@ fn failed(refusal: impl std::fmt::Debug) -> TestCaseError {
 
 /// Holds `repository` to the model's trees: every path any revision held present exactly where its tree holds it,
 /// of its kind, with its text and its properties.
-fn holds_the_model(repository: &Repository, trees: &[Tree]) -> Result<(), TestCaseError> {
+fn holds_the_model(repository: &Standalone, trees: &[Tree]) -> Result<(), TestCaseError> {
   let every_path: BTreeSet<&String> = trees.iter().flat_map(Tree::keys).collect();
   for (revision, tree) in trees.iter().enumerate() {
     for path in &every_path {
@@ -380,7 +380,7 @@ fn holds_the_model(repository: &Repository, trees: &[Tree]) -> Result<(), TestCa
 
 /// Holds the node at `path` in `revision` to the model's `expected`.
 fn holds_the_node(
-  repository: &Repository,
+  repository: &Standalone,
   revision: u64,
   path: &str,
   expected: Option<&ModelNode>,
@@ -421,7 +421,7 @@ fn holds_the_node(
 
 /// Holds `repository`'s export to import into a new repository as the same history and to export again to the same
 /// bytes.
-fn round_trips(repository: &Repository, piece: usize) -> Result<(), TestCaseError> {
+fn round_trips(repository: &Standalone, piece: usize) -> Result<(), TestCaseError> {
   let exported = export_all(repository).map_err(failed)?;
   let mut again = created();
   import(&mut again, &exported, piece).map_err(failed)?;
@@ -432,7 +432,7 @@ fn round_trips(repository: &Repository, piece: usize) -> Result<(), TestCaseErro
 
 /// Holds `repository`'s format-3 export, every text a delta and every changed list a change, to import into a new
 /// repository as the same history and to export again to the same bytes (A-652).
-fn round_trips_through_deltas(repository: &Repository, piece: usize) -> Result<(), TestCaseError> {
+fn round_trips_through_deltas(repository: &Standalone, piece: usize) -> Result<(), TestCaseError> {
   let exported = export_deltas(repository).map_err(failed)?;
   let mut again = created();
   import(&mut again, &exported, piece).map_err(failed)?;
@@ -444,7 +444,7 @@ fn round_trips_through_deltas(repository: &Repository, piece: usize) -> Result<(
 /// Holds `repository`'s history exported in two parts, split after revision `split` picks, and imported part after
 /// part to be the same history.
 fn round_trips_in_parts(
-  repository: &Repository,
+  repository: &Standalone,
   split: u16,
   piece: usize,
 ) -> Result<(), TestCaseError> {
