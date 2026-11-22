@@ -81,6 +81,25 @@ impl Flush {
   }
 }
 
+/// The lengths of the texts `revision` names stored.
+fn stored_bytes(revision: &Revision) -> u64 {
+  revision
+    .stored
+    .values()
+    .fold(0u64, |total, len| total.saturating_add(*len))
+}
+
+/// What staging `revision` asks of the shard beyond what it holds already ([`Staging::due_before`]): its contents twice,
+/// into the content store and again in its increment's post-state; its texts once more, in the post-state, since the
+/// import's sink put them into the content store as the dump was read (A-862), where the shard charged them already,
+/// so its admittable bytes count them now. Charged twice, a batch that fits was landed early and the admission's
+/// figures lied (main 01a20182's ruling of 2026-11-22 06:22).
+fn admission_charge(revision: &Revision) -> u64 {
+  brought(revision)
+    .saturating_mul(2)
+    .saturating_add(stored_bytes(revision))
+}
+
 /// An import's revisions staged since its last landing (module docs).
 pub(crate) struct Staging {
   /// The repository's landing turn, held for the batch's life.
@@ -156,15 +175,8 @@ impl Staging {
     if self.records.len() >= MAX_RECORDS {
       return Some(Flush::Sections);
     }
-    // Its contents come twice, into the content store and again in its increment's post-state. Its texts come once
-    // more, in the post-state: the import's sink put them into the content store as the dump was read (A-862), where
-    // the shard charged them already, so the shard's admittable bytes count them now. Charged twice, a batch that
-    // fits was landed early and the admission's figures lied (main 01a20182's ruling of 2026-11-22 06:22).
-    let texts = revision
-      .stored
-      .values()
-      .fold(0u64, |total, len| total.saturating_add(*len));
-    let charge = brought(revision).saturating_mul(2).saturating_add(texts);
+    let texts = stored_bytes(revision);
+    let charge = admission_charge(revision);
     let admittable = state.store.admittable();
     // A test's cap counts what the batch holds as the shard's charge does: its texts, its post-state, and the texts
     // the open revision put into the content store already.
@@ -421,5 +433,46 @@ impl Staging {
     if let Some(turn) = self.turn.take() {
       turn.give_back(state);
     }
+  }
+}
+
+#[cfg(test)]
+mod charge_tests {
+  use std::collections::BTreeMap;
+
+  use slates_svn::commit::revision::Revision;
+  use slates_svn::index::RevisionRecord;
+
+  /// Shape: a revision's property bytes, its contents' bytes and its stored texts' lengths, each apart from the others.
+  const PROPERTY: (&[u8], &[u8]) = (b"svn:log", b"one");
+  /// Shape: see [`PROPERTY`].
+  const CONTENT: usize = 100;
+  /// Shape: see [`PROPERTY`].
+  const STORED: [u64; 2] = [1_000, 10_000];
+
+  /// Goal 93, A-862 (main 01a20182's ruling of 2026-11-22 06:22: a double charge refuses a batch that fits and makes
+  /// the admission's figures lie). Do: charge a revision bringing a property, a content of [`CONTENT`] bytes and two
+  /// texts named stored, as the import's sink put them into the content store before its batch judges it. Expect: its
+  /// property and content twice (into the store and again in its increment's post-state), its texts once (the
+  /// post-state alone: the shard charged them in the content store already). Failing first: f159578c3 charged the
+  /// texts twice too.
+  #[test]
+  fn a_revisions_texts_already_in_the_store_are_charged_once() {
+    let revision = Revision {
+      head: 0,
+      record: RevisionRecord {
+        transaction: "0-0".to_owned(),
+        changes: Vec::new(),
+      },
+      properties: BTreeMap::from([(PROPERTY.0.to_vec(), PROPERTY.1.to_vec())]),
+      contents: BTreeMap::from([([1; 32], vec![0; CONTENT])]),
+      stored: BTreeMap::from([([2; 32], STORED[0]), ([3; 32], STORED[1])]),
+      lock_entries: Vec::new(),
+    };
+    let brought = u64::try_from(PROPERTY.0.len() + PROPERTY.1.len() + CONTENT).unwrap();
+    assert_eq!(
+      super::admission_charge(&revision),
+      2 * brought + STORED[0] + STORED[1]
+    );
   }
 }

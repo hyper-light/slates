@@ -1507,6 +1507,23 @@ impl<'b> Building<'b> {
   /// The increment, based at `head` and identified by `id`: every row in path order, then what the revision removes.
   fn build(mut self, head: u64, id: [u8; 32]) -> Result<Increment, Uncommitted> {
     let checked = self.checked;
+    // The post-state holds each text the rows set: sized once at their length, so no append grows it (P7 finding (2):
+    // grown a text at a time it doubled, the largest of an import's churners after A-862). A copy's restored texts may
+    // still grow it past them.
+    let texts = checked
+      .changes()
+      .iter()
+      .filter_map(|row| row.text)
+      .try_fold(0usize, |total, text| {
+        usize::try_from(text.size)
+          .ok()
+          .and_then(|size| total.checked_add(size))
+      })
+      .ok_or_else(corrupt)?;
+    self
+      .post
+      .try_reserve_exact(texts)
+      .map_err(|_| Uncommitted::Budget { available: 0 })?;
     for row in checked.changes() {
       self.row(row)?;
     }

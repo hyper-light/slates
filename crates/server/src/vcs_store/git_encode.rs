@@ -153,7 +153,7 @@ pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Turned {
 /// [`turn`]'s work: what it came to, and the bytes of the fragments it kept (zero unless a version was finished).
 fn turn_uncounted(state: &mut ShardState, id: RepositoryId) -> (Turned, u64) {
   let quantum_ns = state.config.step_quantum_ns();
-  let exchange = exchange(&state.config);
+  let exchange = exchange(state);
   let mut clock = ShardClock;
   let clock: &mut dyn Clock = &mut clock;
   super::lend(&mut state.store, &mut state.vcs_stores, 0);
@@ -349,7 +349,7 @@ pub(crate) fn relieve(
   }
   let per_byte_ns = amount_of(row.derive_ns) / amount_of(row.derive_bytes);
   let reads = amount_of(row.fetch.begun) / amount_of(row.intake.answered.max(1));
-  let price = exchange(&state.config);
+  let price = exchange(state);
   let prices = Prices {
     ns_per_byte: amount_of(price.ns) / amount_of(price.bytes.max(1)),
     pressure,

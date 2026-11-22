@@ -46,7 +46,6 @@ use slates_git::store::{NamedRef, UploadCounters};
 use slates_git::upload::{Fragments, PackPlan, PackRefused, PackSource, Served, Streamed};
 use slates_vcs::Work;
 
-use crate::config::DaemonConfig;
 use crate::git_push::{PolicyHidden, ref_of};
 use crate::state::ShardState;
 use crate::vcs_http::git::StoreLender;
@@ -62,9 +61,6 @@ std::thread_local! {
   pub(crate) static ROOMS: std::cell::RefCell<std::collections::VecDeque<u64>> =
     const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
 }
-
-/// Format: nanoseconds in a second, the measured throughput's unit of time against the exchange's.
-const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 /// The lender of this shard's stores to upload-pack (the module doc): the HTTP edge's, and the SSH site's once the
 /// daemon starts its edge. It holds nothing; each step borrows the shard's state for its own length.
@@ -120,6 +116,13 @@ impl StoreLender for ShardStores {
 
   fn wrote(&mut self, hold: &GitGeneration, bytes: u64) {
     hold.written.set(hold.written.get().saturating_add(bytes));
+    if bytes > 0 {
+      let _ = crate::state::with_state_counted(|state| state.count(WRITTEN, bytes));
+    }
+  }
+
+  fn paced(&mut self, taught: (u64, u64)) {
+    let _ = crate::state::with_state_counted(|state| learn_link(state, taught));
   }
 
   /// A-718: every version of repository `id` encoded as its fragments and kept, a turn at a time, before a fetch's answer
@@ -182,7 +185,7 @@ fn lend_uncounted<R>(
       green: *green,
     })
     .collect();
-  let mut packs = ShardPacks::of(&state.config);
+  let mut packs = ShardPacks::of(state);
   let lent = super::lent_to_read((&mut state.store, &mut state.vcs_stores), |stores| {
     let (content, store) = stores.git_ref(id)?;
     let served = Served {
@@ -310,7 +313,7 @@ fn lend_held_in<R>(
       green: *green,
     })
     .collect();
-  let mut packs = ShardPacks::of(&state.config);
+  let mut packs = ShardPacks::of(state);
   let lent = super::observed(state, hold.id, |state| {
     super::lent_to_read((&mut state.store, &mut state.vcs_stores), |stores| {
       let fork = stores
@@ -402,15 +405,103 @@ fn readable_refs(
 }
 
 /// Derived: the owner's exchange, what a byte the fragments' encoder saves is worth in its time (§4.11's value of a byte
-/// over its value of CPU, at neutral): the time this machine takes to copy the byte, as the archive's codec policy prices
-/// a byte at neutral (`DaemonConfig::codec`), so a second buys the measured memcpy throughput's bytes
-/// (`DaemonConfig::memcpy_bytes_per_second`, at least one byte).
-pub(super) fn exchange(config: &DaemonConfig) -> Exchange {
-  Exchange {
-    ns: NANOS_PER_SECOND,
-    bytes: config.memcpy_bytes_per_second.max(1),
-    rates: config.git_rates,
+/// over its value of CPU; A-859 part A, main 01a20182's rulings of 2026-11-22 04:30 and 06:32): the price of a byte on
+/// the links this shard's fetches are sent over, learned from the time their writes waited for the peer
+/// ([`LinkPrice`]); until it is learned, the price at which deflating at git's default level just pays on this machine
+/// (`Exchange::cold`, from `DaemonConfig::git_rates`). Never the time a copy in memory takes: a fetched byte crosses a
+/// link, and pricing it at memcpy's 0.14 ns sent git/git's clone uncompressed.
+pub(super) fn exchange(state: &ShardState) -> Exchange {
+  state
+    .vcs_stores
+    .git_link
+    .exchange(state.config.git_rates)
+    .unwrap_or_else(|| Exchange::cold(state.config.git_rates))
+}
+
+/// Format: the bytes sent past a link's first wait before its price is learned (A-859 part A): a MiB, past a socket
+/// send buffer's few hundred KiB (macOS's 128 KiB default, Linux's autotuned up to 4 MiB), so the price rests on
+/// writes the peer paced rather than on a few that happened to meet a full buffer.
+const LINK_LEARNED_FROM: u64 = 1 << 20;
+
+/// Format: the bytes a link's price remembers before both its sums are halved (A-859 part A): 64 MiB, a few clones of
+/// a mid-sized repository, so the price follows the links the shard sends over now and an old one fades.
+const LINK_MEMORY: u64 = 64 << 20;
+
+/// Counter: the bytes git fetches' answers wrote, counted as each step writes them, so a clone cut short says what it
+/// was sent (main 01a20182's r17, 2026-11-22 07:08). Format: a counter name.
+pub(crate) const WRITTEN: &str = "vcs_store.git_upload.written_bytes";
+
+/// Counter: bytes a git fetch sent past its link's first wait, which the shard's link price was learned from (A-859
+/// part A; its non-vacuity: the price moved). Format: a counter name.
+pub(crate) const LINK_LEARNED: &str = "vcs_store.git_link.learned_bytes";
+
+/// The price of a byte on this shard's links (A-859 part A, main 01a20182's ruling of 2026-11-22 06:32): the
+/// nanoseconds the edges' writes of git's fetch answers waited for the peer to take their bytes, over those bytes, each
+/// answer's counted from its first write that found the socket full ([`Sent::waited`]), since writes into a buffer with
+/// room take no time whatever the link and would read a slow link as free. Time slates spends making the answer is not
+/// in it, so a clone slow for its encoding never prices its link dearer (the loop a whole answer's wall time would make).
+/// Both sums are halved past [`LINK_MEMORY`], so the price is the recent links'.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LinkPrice {
+  /// The nanoseconds the writes waited.
+  ns: u64,
+  /// The bytes they wrote.
+  bytes: u64,
+}
+
+impl LinkPrice {
+  /// Learns a write of `bytes` that took `ns` to be taken, past its answer's first wait.
+  pub(crate) fn learn(&mut self, (ns, bytes): (u64, u64)) {
+    self.ns = self.ns.saturating_add(ns);
+    self.bytes = self.bytes.saturating_add(bytes);
+    while self.bytes > LINK_MEMORY {
+      self.ns /= 2;
+      self.bytes /= 2;
+    }
   }
+
+  /// The exchange it prices a byte at, with the machine's `rates`: none until [`LINK_LEARNED_FROM`] bytes have been
+  /// learned.
+  pub(crate) fn exchange(&self, rates: slates_git::store::learn::Rates) -> Option<Exchange> {
+    (self.bytes >= LINK_LEARNED_FROM).then_some(Exchange {
+      ns: self.ns,
+      bytes: self.bytes,
+      rates,
+    })
+  }
+}
+
+/// One write of a fetch's answer to its peer (A-859 part A), as its edge saw it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Sent {
+  /// The bytes written.
+  pub(crate) bytes: u64,
+  /// The nanoseconds the write took, to the peer taking its last byte.
+  pub(crate) ns: u64,
+  /// Whether it found the socket full and waited for the peer.
+  pub(crate) waited: bool,
+}
+
+/// What a fetch's answer has learned of its link (A-859 part A): nothing until a write waits for the peer; from it on,
+/// each write's bytes and time, learned into the shard's [`LinkPrice`] as they are written.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Pacing {
+  /// Whether a write has waited.
+  waited: bool,
+}
+
+impl Pacing {
+  /// What `sent` teaches the shard's price: its bytes and time once this or an earlier write has waited; none before.
+  pub(crate) fn sent(&mut self, sent: Sent) -> Option<(u64, u64)> {
+    self.waited |= sent.waited;
+    self.waited.then_some((sent.ns, sent.bytes))
+  }
+}
+
+/// Learns `taught` into `state`'s link price, counted [`LINK_LEARNED`].
+pub(crate) fn learn_link(state: &mut ShardState, taught: (u64, u64)) {
+  state.vcs_stores.git_link.learn(taught);
+  state.count(LINK_LEARNED, taught.1);
 }
 
 /// A counter of a fetch's stream's paths ([`STREAM_COUNTED`]): its name and the stream's count it adds.
@@ -452,11 +543,11 @@ pub(crate) struct ShardPacks {
 }
 
 impl ShardPacks {
-  /// The source on a shard `config` configures, at its step quantum now.
-  fn of(config: &DaemonConfig) -> ShardPacks {
+  /// The source on `state`'s shard, at its link's price and its step quantum now.
+  fn of(state: &ShardState) -> ShardPacks {
     ShardPacks {
-      exchange: exchange(config),
-      quantum_ns: config.step_quantum_ns(),
+      exchange: exchange(state),
+      quantum_ns: state.config.step_quantum_ns(),
       counted: None,
     }
   }
