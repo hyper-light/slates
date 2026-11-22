@@ -23,8 +23,10 @@
 //! version-control edge may hold, as a Mercurial import's room is (`hg_import::room_of`); a line, a property entry or an
 //! svndiff window past it refuses the dump. The records are lent every byte the shard could admit for each call
 //! (`lend_svn`), so a revision's texts may be as large as the shard can hold; what the import holds between its turns
-//! (its read buffer, the open revision's properties and texts, its transaction's new contents) is charged to the shard's
-//! budget as retention at the end of each turn, trued up, and given back when it ends. One import a repository at a time.
+//! (its read buffer, the open revision's properties, its transaction's new property lists) is charged to the shard's
+//! budget as retention at the end of each turn, trued up, and given back when it ends. Its texts it never holds: each is
+//! put into the shard's content store a piece at a time as the dump is read, charged there as it is kept ([`texts`];
+//! goal 93, P7 finding (2)), and handed to its revision's landing. One import a repository at a time.
 //!
 //! **Cancellation.** The import lives in the shard's map keyed by its repository, and the task that runs it holds the key
 //! alone, so a task dropped between turns leaks nothing; freeing the repository gives the import back ([`abandon`]).
@@ -47,6 +49,7 @@ use crate::state::ShardState;
 // Its import helpers serve the export's tests too (`crate::repository::svn_export`, A-652 part 3).
 #[cfg(test)]
 pub(crate) mod tests;
+pub(crate) mod texts;
 
 /// Counter: an import started, its file open. Format: a counter name in the status report.
 pub(crate) const STARTED: &str = "vcs_store.svn_import.started";
@@ -95,6 +98,10 @@ pub(crate) struct Importing {
   /// The revisions staged since the last landing, landed as one changeset and one register entry (C2 stage C,
   /// `svn_commit::staging`).
   staging: Option<Staging>,
+  /// The texts the import put into the content store for the revision it reads ([`texts`]).
+  texts: texts::ImportTexts,
+  /// The texts the owed record's revision brought, each holding one count of the content store: handed to its landing.
+  owed_texts: Vec<slates_svn::index::ContentIdentity>,
   /// The stream ended with revisions staged: they land before the import ends ([`land_owed`]).
   flush_end: bool,
   /// The import's holding was not admitted with revisions staged: they land before it reads on ([`land_owed`]).
@@ -239,6 +246,8 @@ pub(crate) fn begin(
     owed: None,
     base_owed: None,
     staging: None,
+    texts: texts::ImportTexts::default(),
+    owed_texts: Vec::new(),
     flush_end: false,
     flush_admission: false,
   };
@@ -321,18 +330,22 @@ fn unit(
   let slice = usize::try_from(state.config.copy_slice_bytes()).unwrap_or(usize::MAX);
   importing.fill(slice)?;
   crate::vcs_store::lend_svn(state, id, 0);
-  let answer = match state
-    .vcs_stores
-    .subversion(id)
-    .and_then(|svn| svn.records.as_mut())
-  {
-    Some(records) => Ok(
-      importing
-        .importer
-        .import(records, &importing.buffer, importing.ended),
-    ),
-    None => Err(LoadFailed::NoStore),
-  };
+  // The content store lent room for every byte the call could put: the texts the buffer holds.
+  let lent = u64::try_from(importing.buffer.len()).unwrap_or(u64::MAX);
+  let answer = crate::vcs_store::within_budget(state, lent, |stores| {
+    let Some((records, store)) = stores.subversion_with_content(id) else {
+      return Err(LoadFailed::NoStore);
+    };
+    let Importing {
+      importer,
+      texts,
+      buffer,
+      ended,
+      ..
+    } = &mut *importing;
+    let sink = texts::InStore::new(texts, store);
+    Ok(importer.import(records, &sink, buffer, *ended))
+  });
   crate::vcs_store::settle_svn(state, id);
   match answer? {
     Ok(Imported::NeedMore { consumed, needed }) => {
@@ -344,6 +357,8 @@ fn unit(
       importing.consume(consumed);
       importing.needed = 0;
       importing.owed = Some(*record);
+      // The revision's texts go with it to its landing, their holds its own.
+      importing.owed_texts = importing.texts.take_sealed();
       Ok(Unit::Owed)
     }
     Ok(Imported::Base { consumed, text }) => {
@@ -512,7 +527,10 @@ pub(crate) async fn land_owed(id: RepositoryId) -> Option<Result<(), LoadFailed>
       core::mem::take(&mut importing.flush_end).then_some(Flush::End)
     };
     Some((
-      importing.owed.take(),
+      (
+        importing.owed.take(),
+        std::mem::take(&mut importing.owed_texts),
+      ),
       flush,
       importing.principal.clone(),
       importing.staging.take(),
@@ -527,14 +545,18 @@ pub(crate) async fn land_owed(id: RepositoryId) -> Option<Result<(), LoadFailed>
 /// whether a revision landed. None where the shard's state is gone.
 async fn owed_landed(
   (principal, id): (&Principal, RepositoryId),
-  record: Option<Record>,
+  (record, texts): (Option<Record>, Vec<slates_svn::index::ContentIdentity>),
   flush: Option<Flush>,
   staging: &mut Option<Staging>,
 ) -> Option<Result<bool, LoadFailed>> {
+  if !matches!(record, Some(Record::Revision(_))) && !texts.is_empty() {
+    // Only a revision brings texts; any others are given back.
+    crate::state::with_state(|state| svn_commit::release_texts(state, None, &texts))?;
+  }
   Some(match (record, flush) {
     (Some(Record::Revision(revision)), _) => {
       let number = revision.head.saturating_add(1);
-      stage_owed((principal, id), staging, revision)
+      stage_owed((principal, id), staging, (revision, texts))
         .await?
         .map(|()| true)
         .map_err(|refusal| load_failed(refusal, number))
@@ -629,14 +651,21 @@ fn owed_settled(
   }
 }
 
-/// Stages an imported `revision` in `staging`'s batch, landing the batch first where the revision's charge would not be
-/// admitted or the changeset is full (`Staging::due_before`), and beginning one where none is under way (C2 stage C).
-/// Refused, the batch is given up. None where the shard's state is gone.
+/// Stages an imported `revision` in `staging`'s batch with the `texts` the import put for it ([`texts`]), landing the
+/// batch first where the revision's charge would not be admitted or the changeset is full (`Staging::due_before`), and
+/// beginning one where none is under way (C2 stage C). Refused, the batch is given up, and the texts with it. None
+/// where the shard's state is gone.
 async fn stage_owed(
   (principal, id): (&Principal, RepositoryId),
   staging: &mut Option<Staging>,
-  revision: slates_svn::commit::revision::Revision,
+  (revision, texts): (
+    slates_svn::commit::revision::Revision,
+    Vec<slates_svn::index::ContentIdentity>,
+  ),
 ) -> Option<Result<(), Uncommitted>> {
+  let give_back = |texts: &[slates_svn::index::ContentIdentity]| {
+    crate::state::with_state(|state| svn_commit::release_texts(state, None, texts))
+  };
   let due = staging.as_ref().and_then(|batch| {
     crate::state::with_state(|state| batch.due_before(state, &revision)).flatten()
   });
@@ -644,16 +673,20 @@ async fn stage_owed(
     && let Some(batch) = staging.take()
     && let Err(refused) = batch.land(principal, cause).await?
   {
+    give_back(&texts)?;
     return Some(Err(refused));
   }
   let mut batch = match staging.take() {
     Some(batch) => batch,
     None => match Staging::begin(id).await? {
       Ok(batch) => batch,
-      Err(refused) => return Some(Err(refused)),
+      Err(refused) => {
+        give_back(&texts)?;
+        return Some(Err(refused));
+      }
     },
   };
-  match batch.stage(revision).await? {
+  match batch.stage(revision, texts).await? {
     Ok(()) => {
       *staging = Some(batch);
       Some(Ok(()))
@@ -720,6 +753,14 @@ fn end(state: &mut ShardState, mut importing: Importing) {
   if let Some(staging) = importing.staging.take() {
     staging.abandon(state);
   }
+  // The texts the import put and no landing took are given back.
+  let owed = std::mem::take(&mut importing.owed_texts);
+  svn_commit::release_texts(state, None, &owed);
+  crate::vcs_store::within_budget(state, 0, |stores| {
+    if let Some(store) = stores.content_mut() {
+      importing.texts.give_back(store);
+    }
+  });
   state.store.budget.credit_retention(importing.charged);
   importing.host.close_file(importing.file);
   importing.host.close_dir(importing.directory);

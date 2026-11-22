@@ -195,8 +195,9 @@ enum Stage {
   },
   /// The new changeset at this position: its manifest present.
   ManifestsPresent(usize),
-  /// The new manifest at this position: its changed files present.
-  FilesPresent(usize),
+  /// The file revisions the new manifests name that the fork lacked when each was read: present now, a window of
+  /// them a step ([`Taker::files_present`]).
+  FilesPresent,
   /// Everything taken.
   Done,
 }
@@ -277,20 +278,15 @@ pub struct Intake {
   taker: Taker,
 }
 
-/// A new manifest and the entries its delta wrote: each file's path and file revision.
-type ManifestWrites = (Node, Vec<(Vec<u8>, Node)>);
-/// Format: the fewest bytes a manifest's line takes: a path of one byte, its NUL, a node's forty hex digits and the line's
-/// end. A delta's bytes write at most one entry for each this many of them ([`Intake::bookkeeping`]).
-const LEAST_MANIFEST_LINE: u64 = 1 + 1 + 40 + 1;
-
 impl Intake {
   /// The most its steps keep charged to the push's admission from the first to the last (main 01a20182's ruling (a) of
   /// 2026-11-22 04:23: a push's need is known at its begin, so it is admitted it up front, never the learned demand that
   /// predicts an unknown one): told from its framing before any revision is taken, by the charges the steps make
   /// (`Taker::keep_taken`, `read_of`, `logged_of`). Each revision its node, its kept text and its path; each changeset
-  /// its manifest's and its own nodes noted; each manifest its entry, at most one written entry for each
-  /// [`LEAST_MANIFEST_LINE`] bytes of its delta and the delta's bytes for their paths; each log its name, a file's its
-  /// path. A step's own working set (its delta, its base, its rebuilt text) is apart: charged to a copy and let go. Every
+  /// its manifest's and its own nodes noted; each file revision once more, its path and node, for the new manifests
+  /// that await it (`Taker::awaited`, once across the push however many snapshots name it); each log its name, a file's
+  /// its path, as its group opens and as its log is noted. A step's own working set (its delta, its base, its rebuilt
+  /// text, a manifest's written entries) is apart: charged to a copy and let go. Every
   /// sum saturates, so a count past what a `u64` holds reads as the most there is, past any repository's ceiling, and its
   /// push is refused, never admitted a wrapped need.
   pub fn bookkeeping(&self) -> u64 {
@@ -301,37 +297,46 @@ impl Intake {
     let changesets = kept(changelog, to_u64(CHANGELOG_PATH.len())).saturating_add(
       to_u64(changelog).saturating_mul(to_u64(size_of::<(Node, Node)>().saturating_mul(2))),
     );
-    let manifests = framed
-      .revisions
-      .get(framed.manifests.clone())
-      .unwrap_or_default()
-      .iter()
-      .fold(
-        kept(framed.manifests.len(), to_u64(MANIFEST_PATH.len())),
-        |total, placed| {
-          let data = placed.data.end.saturating_sub(placed.data.start);
-          let entries = data
-            .checked_div(LEAST_MANIFEST_LINE)
-            .unwrap_or(data)
-            .saturating_add(1);
-          total
-            .saturating_add(to_u64(size_of::<ManifestWrites>()))
-            .saturating_add(entries.saturating_mul(to_u64(size_of::<(Vec<u8>, Node)>())))
-            .saturating_add(data)
-        },
-      );
+    let manifests = kept(framed.manifests.len(), to_u64(MANIFEST_PATH.len()));
     let logs = to_u64(2usize.saturating_add(framed.files.len()))
       .saturating_mul(to_u64(size_of::<(LogOf, u32)>()));
+    // Each file revision once more for the new manifests awaiting it ([`Taker::awaited`]): its path and node, however
+    // many snapshots name it.
+    let awaited = to_u64(size_of::<(Vec<u8>, Node)>());
     let files = framed.files.iter().fold(0u64, |total, (name, revisions)| {
       let path = name.end.saturating_sub(name.start);
       total
         .saturating_add(kept(revisions.len(), path))
-        .saturating_add(path)
+        .saturating_add(to_u64(revisions.len()).saturating_mul(awaited.saturating_add(path)))
+        // Its path twice: as its group opens (`Taker::files`) and as its log is noted (`logged_of`).
+        .saturating_add(path.saturating_mul(2))
     });
     changesets
       .saturating_add(manifests)
       .saturating_add(logs)
       .saturating_add(files)
+  }
+
+  /// The least room one of its steps takes, told from its framing (main 01a20182's order of 2026-11-22 05:04): the widest
+  /// text a delta against the null base carries, its one hunk's insert (`delta::whole_text_start`, a whole refused as
+  /// `NotWhole` otherwise), since a step rebuilds such a text whole and charges it before it keeps any of it. Zero where
+  /// none comes whole. A push whose keeping and this are past its repository's ceiling could never be taken there.
+  pub fn widest_full_text(&self) -> u64 {
+    self
+      .frame
+      .0
+      .revisions
+      .iter()
+      .filter(|placed| placed.base == NULL_NODE)
+      .map(|placed| {
+        placed
+          .data
+          .end
+          .saturating_sub(placed.data.start)
+          .saturating_sub(to_u64(delta::HUNK_HEADER_LEN))
+      })
+      .max()
+      .unwrap_or(0)
   }
 }
 
@@ -345,9 +350,13 @@ struct Taker {
   brought: BTreeSet<Node>,
   /// Each new changeset and the manifest its text names.
   manifest_of: Vec<(Node, Node)>,
-  /// Each new manifest and the entries its delta wrote (each file's path and file revision), which its files' check
-  /// reads ([`Taker::files_present`]): what the push changed, never a whole manifest.
-  manifests: Vec<ManifestWrites>,
+  /// The file revisions the new manifests' written entries name (each file's path and node) that the fork lacked when
+  /// each was read, each once across the push, however many snapshots name it (main 01a20182's order of 2026-11-22
+  /// 05:13): what the files' check reads once every file is taken ([`Taker::files_present`]).
+  awaited: BTreeSet<(Vec<u8>, Node)>,
+  /// The file revisions the push's framing brings: the most [`Taker::awaited`] may name, since a file revision neither
+  /// held nor brought is missing.
+  bringing: u64,
   /// The text kept last, and its node: the next revision's base where its delta names it.
   last: Option<(Node, Vec<u8>)>,
   /// The identity of the text kept last, so the next revision's base is named without hashing it again.
@@ -368,6 +377,120 @@ struct Taker {
   asked: Option<StoreAsk>,
   /// A revision longer than one window, being taken a window a step.
   pending: Option<Box<Pending>>,
+  /// The segments its kept texts are cut into as they are taken, where its driver asks for them ([`Intake::cutting`]).
+  cutting: Option<Cutting>,
+}
+
+/// A push's kept texts cut into segments as they are taken (main 01a20182's ruling (b1) of 2026-11-22 04:44: a push
+/// lands as a run of segment changesets, as an import does): each segment the revisions whose deltas lie in a slice of
+/// at least `bound` bytes of the changegroup, so the push holds one segment's texts at a time, never the whole list.
+struct Cutting {
+  /// The least bytes of the changegroup a segment is cut at.
+  bound: u64,
+  /// The segment being cut: where its slice of the changegroup begins and ends, each log's kept revisions in it, their
+  /// texts, and what those texts charged.
+  open: Option<Open>,
+  /// The segments cut and not yet taken, oldest first.
+  ready: VecDeque<PushSegment>,
+}
+
+impl Cutting {
+  /// Notes `kept`, revision `rev` of `log` in the fork, its text charged `charged`; cuts the segment once its slice
+  /// reaches the bound.
+  fn kept(&mut self, log: LogOf, rev: u32, kept: KeptText, charged: u64) {
+    let open = self.open.get_or_insert_with(|| Open {
+      slice: kept.place.start..kept.place.end,
+      ranges: Vec::new(),
+      texts: Vec::new(),
+      charged: 0,
+    });
+    open.slice.end = open.slice.end.max(kept.place.end);
+    match open.ranges.last_mut() {
+      Some((last, _, end)) if *last == log && *end == rev => *end = rev.saturating_add(1),
+      _ => open.ranges.push((log, rev, rev.saturating_add(1))),
+    }
+    open.charged = open.charged.saturating_add(charged);
+    open.texts.push(kept);
+    if open.slice.end.saturating_sub(open.slice.start) >= self.bound {
+      self.cut();
+    }
+  }
+
+  /// Cuts the segment being cut into the ready ones, its texts' places made its slice's own.
+  fn cut(&mut self) {
+    let Some(open) = self.open.take() else {
+      return;
+    };
+    let from = open.slice.start;
+    let texts = open
+      .texts
+      .into_iter()
+      .map(|kept| KeptText {
+        place: kept.place.start.saturating_sub(from)..kept.place.end.saturating_sub(from),
+        ..kept
+      })
+      .collect();
+    self.ready.push_back(PushSegment {
+      slice: open.slice,
+      ranges: open.ranges,
+      texts,
+      charged: open.charged,
+    });
+  }
+}
+
+/// A segment being cut ([`Cutting`]).
+struct Open {
+  /// Its slice of the changegroup.
+  slice: Range<u64>,
+  /// Each log's kept revisions in it, from the first to the one past the last, in the order they were kept.
+  ranges: Vec<(LogOf, u32, u32)>,
+  /// Their texts, places within the whole changegroup until it is cut.
+  texts: Vec<KeptText>,
+  /// What their texts charged the push's admission.
+  charged: u64,
+}
+
+/// A segment of a push's kept revisions, cut ([`Intake::take_segment`]): its slice of the changegroup (its changeset's
+/// `Payload`), each log's kept revisions in it (its `Record`'s rows, `record::Writer::begin_segment`), their texts with
+/// places within the slice (its `Texts`), and what those texts charged the push's admission, which its driver gives back
+/// once the segment is landed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PushSegment {
+  /// Its slice of the changegroup.
+  pub slice: Range<u64>,
+  /// Each log's kept revisions in it, from the first to the one past the last.
+  pub ranges: Vec<(LogOf, u32, u32)>,
+  /// Their texts, each place within the slice.
+  pub texts: Vec<KeptText>,
+  /// What their texts charged the push's admission.
+  pub charged: u64,
+}
+
+/// The `Record` of `segment` (main's ruling (b1)): record v8 of a push's source, each log's kept revisions in it read by
+/// identity from `fork`, the intake's fork or the fork it finished as, `room` the room the intake began within; what a
+/// replay appends after the rows the segments before it appended, no text rebuilt. Refused where a row cannot be read
+/// or written.
+pub fn segment_record(
+  fork: &HgIndex,
+  segment: &PushSegment,
+  room: u64,
+  store: &ContentStore,
+) -> Result<Vec<u8>, crate::import::record::WriteRefused> {
+  use crate::import::record::{Source, WriteRefused, Writer};
+  let mut ranges = Vec::new();
+  ranges
+    .try_reserve(segment.ranges.len())
+    .map_err(|_| WriteRefused::Allocation)?;
+  ranges.extend(
+    segment
+      .ranges
+      .iter()
+      .map(|(log, first, end)| (log_named(log), *first, *end)),
+  );
+  let mut writer = Writer::begin_segment(Source::Push, &ranges, room, false)?;
+  while writer.step(fork, store)? {}
+  writer.finish().ok_or(WriteRefused::Allocation)
 }
 
 /// A revision longer than the content store's window taken over as many steps as it has windows (A-767 C1, the push
@@ -504,12 +627,10 @@ enum ReadAs {
     /// Its manifest's node.
     manifest: Node,
   },
-  /// A manifest, and the entries it writes beside its first parent's.
+  /// A manifest, and the file revisions its written entries name that the fork lacks and none before awaited.
   Manifest {
-    /// The manifest's node.
-    node: Node,
-    /// The entries written: each path and its file node.
-    written: Vec<(Vec<u8>, Node)>,
+    /// Each path and its file node.
+    awaited: Vec<(Vec<u8>, Node)>,
   },
   /// A file revision: nothing to note.
   File,
@@ -661,6 +782,9 @@ impl Intake {
     room: u64,
   ) -> Result<Self, Refused> {
     let fork = index.fork(store).map_err(Unindexed::Fork)?;
+    let bringing = frame.0.files.iter().fold(0_u64, |total, (_, revisions)| {
+      total.saturating_add(to_u64(revisions.len()))
+    });
     Ok(Intake {
       frame,
       taker: Taker {
@@ -668,7 +792,8 @@ impl Intake {
         stage: Stage::Changelog(0),
         brought: BTreeSet::new(),
         manifest_of: Vec::new(),
-        manifests: Vec::new(),
+        awaited: BTreeSet::new(),
+        bringing,
         last: None,
         last_identity: None,
         logged: false,
@@ -678,8 +803,42 @@ impl Intake {
         cache: BaseCache::within(room),
         asked: None,
         pending: None,
+        cutting: None,
       },
     })
+  }
+
+  /// The intake, its kept texts cut into segments of at least `bound` bytes of the changegroup as they are taken
+  /// ([`Intake::take_segment`]), never held whole (main's ruling (b1)).
+  pub fn cutting(mut self, bound: u64) -> Self {
+    self.taker.cutting = Some(Cutting {
+      bound: bound.max(1),
+      open: None,
+      ready: VecDeque::new(),
+    });
+    self
+  }
+
+  /// The next segment cut, oldest first; none while the one being cut is short of its bound.
+  pub fn take_segment(&mut self) -> Option<PushSegment> {
+    self.taker.cutting.as_mut()?.ready.pop_front()
+  }
+
+  /// The `Record` of `segment`, cut from this intake (main's ruling (b1)): [`segment_record`] over its fork.
+  pub fn segment_record(
+    &self,
+    segment: &PushSegment,
+    room: u64,
+    store: &ContentStore,
+  ) -> Result<Vec<u8>, crate::import::record::WriteRefused> {
+    segment_record(&self.taker.fork, segment, room, store)
+  }
+
+  /// Cuts the segment being cut whatever its length: the push's last, once every unit is taken.
+  pub fn cut_rest(&mut self) {
+    if let Some(cutting) = self.taker.cutting.as_mut() {
+      cutting.cut();
+    }
   }
 
   /// Takes the next unit of the changegroup whose bytes are `payload`, the ones it began with (module docs). Refused,
@@ -717,7 +876,7 @@ impl Intake {
       }
       Stage::Files { file, at } => taker.file_step((frame, payload), (file, at), store, admission),
       Stage::ManifestsPresent(at) => taker.manifest_present(at, store),
-      Stage::FilesPresent(at) => taker.files_present(at, store),
+      Stage::FilesPresent => taker.files_present(store),
       Stage::Done => Ok(Stepped::Done),
     }
   }
@@ -1185,14 +1344,22 @@ impl Taker {
       .bytes
       .saturating_add(to_u64(arrived.text.len()));
     let identity = identity.unwrap_or_else(|| *blake3::hash(&arrived.text).as_bytes());
-    self.intaken.texts.push(KeptText {
+    let kept = KeptText {
       path: path.to_vec(),
       node: revision.node,
       identity,
       len: to_u64(arrived.text.len()),
       base,
       place,
-    });
+    };
+    match self.cutting.as_mut() {
+      Some(cutting) => {
+        let rev = self.fork.len(store, log).saturating_sub(1);
+        let charged = to_u64(size_of::<KeptText>()).saturating_add(to_u64(path.len()));
+        cutting.kept(log_of(log), rev, kept, charged);
+      }
+      None => self.intaken.texts.push(kept),
+    }
     self.last_identity = Some((revision.node, identity));
     // The text kept before this one may be a later delta's base: the push's cache keeps it ((b2)).
     if let (Log::File(_), Some((node, text))) = (log, self.last.take()) {
@@ -1396,17 +1563,7 @@ impl Taker {
       }
       _ => {
         manifest::decode(text).map_err(|fault| Unverified::Manifest { node, fault })?;
-        let written = written_entries(text, revision).map_err(|fault| Unverified::Delta {
-          log: log_of(log),
-          node,
-          fault,
-        })?;
-        admission.charge_items::<(Node, Vec<(Vec<u8>, Node)>)>(1)?;
-        admission.charge_items::<(Vec<u8>, Node)>(written.len())?;
-        admission.charge(written.iter().fold(0_u64, |bytes, (path, _)| {
-          bytes.saturating_add(to_u64(path.len()))
-        }))?;
-        return Ok(ReadAs::Manifest { node, written });
+        return self.awaited_of(text, revision, (store, admission));
       }
     }
     Ok(ReadAs::File)
@@ -1419,7 +1576,7 @@ impl Taker {
         self.manifest_of.push((node, manifest));
         self.intaken.changesets.push(node);
       }
-      ReadAs::Manifest { node, written } => self.manifests.push((node, written)),
+      ReadAs::Manifest { awaited } => self.awaited.extend(awaited),
       ReadAs::File => {}
     }
   }
@@ -1427,7 +1584,7 @@ impl Taker {
   /// The check of the new changeset at `at`: its manifest the null node, or one the fork holds.
   fn manifest_present(&mut self, at: usize, store: &ContentStore) -> Result<Stepped, Refused> {
     let Some((changeset, manifest)) = self.manifest_of.get(at).copied() else {
-      self.stage = Stage::FilesPresent(0);
+      self.stage = Stage::FilesPresent;
       return Ok(Stepped::More);
     };
     if manifest != NULL_NODE && self.fork.rev(store, Log::Manifest, &manifest).is_none() {
@@ -1443,29 +1600,58 @@ impl Taker {
     Ok(Stepped::More)
   }
 
-  /// The check of the new manifest at `at`: every entry its delta wrote audited and held by the fork's file log (main's
-  /// ruling of 2026-11-21 05:12 (a)). An entry its delta left as its base had it was checked when that base was: held by
-  /// the fork before the push, or checked earlier in it. Its text and its first parent's were rebuilt from their chains
-  /// here before, two whole texts a manifest: 57% of hg-src's first push (w-perf's profile, base 94c1696bb).
-  fn files_present(&mut self, at: usize, store: &ContentStore) -> Result<Stepped, Refused> {
-    let Some((_, written)) = self.manifests.get(at) else {
-      self.stage = Stage::Done;
-      return Ok(Stepped::Done);
-    };
-    for (path, node) in written {
-      audit(path)?;
-      if self.fork.rev(store, Log::File(path), node).is_none() {
-        return Err(
-          Unverified::MissingFile {
-            path: path.clone(),
-            node: *node,
-          }
-          .into(),
-        );
+  /// The files' check: each file revision the new manifests awaited ([`Taker::awaited`]) the fork holds now, given
+  /// back as it is checked, its paths' bytes at most the content store's window a step (the store's unit, as a long
+  /// revision is taken); every file taken, a revision still missing is refused.
+  fn files_present(&mut self, store: &ContentStore) -> Result<Stepped, Refused> {
+    let window = to_u64(store.window());
+    let mut bytes = 0_u64;
+    while bytes < window {
+      let Some((path, node)) = self.awaited.pop_first() else {
+        self.stage = Stage::Done;
+        return Ok(Stepped::Done);
+      };
+      if self.fork.rev(store, Log::File(&path), &node).is_none() {
+        return Err(Unverified::MissingFile { path, node }.into());
       }
+      bytes = bytes.saturating_add(to_u64(path.len()));
     }
-    self.stage = Stage::FilesPresent(at.saturating_add(1));
     Ok(Stepped::More)
+  }
+
+  /// What a new manifest's text `text` awaits ([`ReadAs::Manifest`]): of the entries its delta wrote
+  /// (`written_entries`, a step's working set, charged to a copy of `admission`), each path audited, the file revisions
+  /// the fork lacks and none before awaited, charged to `admission` as [`Taker::awaited`] keeps them. Refused where the
+  /// manifest names a path that may not stand, or where what is awaited would pass what the push brings: a file
+  /// revision neither held nor brought is missing.
+  fn awaited_of(
+    &self,
+    text: &[u8],
+    revision: &Revision<'_>,
+    (store, admission): (&ContentStore, &mut Admission),
+  ) -> Result<ReadAs, Refused> {
+    let written = written_entries(text, revision).map_err(|fault| Unverified::Delta {
+      log: LogOf::Manifests,
+      node: revision.node,
+      fault,
+    })?;
+    let mut working = *admission;
+    working.charge_items::<(Vec<u8>, Node)>(written.len())?;
+    let mut awaited = Vec::new();
+    for (path, node) in written {
+      audit(&path)?;
+      let held = self.fork.rev(store, Log::File(&path), &node).is_some();
+      if held || self.awaited.contains(&(path.clone(), node)) {
+        continue;
+      }
+      if to_u64(self.awaited.len().saturating_add(awaited.len())) >= self.bringing {
+        return Err(Unverified::MissingFile { path, node }.into());
+      }
+      admission.charge_items::<(Vec<u8>, Node)>(1)?;
+      admission.charge(to_u64(path.len()))?;
+      awaited.push((path, node));
+    }
+    Ok(ReadAs::Manifest { awaited })
   }
 }
 

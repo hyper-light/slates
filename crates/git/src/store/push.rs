@@ -605,8 +605,21 @@ impl Push {
     self.staged.take()
   }
 
+  /// Charges `store` for the objects the push keeps read lately as they stand ([`super::packed::Recent::true_up`],
+  /// A-861): run after each turn of its admission.
+  pub fn true_up_recent(&mut self, store: &mut ContentStore) {
+    self.reading.get_mut().recent().true_up(store);
+  }
+
+  /// Gives back the objects the push keeps read lately and their charge on `store` (A-861): what its landing and its
+  /// abandoning run.
+  pub fn release_recent(&mut self, store: &mut ContentStore) {
+    self.reading.get_mut().recent().release(store);
+  }
+
   /// Gives back every hold the push took, its staged rows' included, leaving nothing behind.
   pub fn abandon(mut self, store: &mut ContentStore) -> Result<(), ContentRefused> {
+    self.release_recent(store);
     let staged = self.staged.take().map(|staged| staged.fork.release(store));
     let placed = self.release_placed(store);
     let quarantine = self.quarantine.abandon(store).and(placed);
@@ -674,6 +687,10 @@ impl PackSource for PushSource<'_> {
       return self.push.piece(pack, len, offset);
     }
     self.store.piece(pack, len, offset)
+  }
+
+  fn away(&self, pack: &ContentId, len: u64, offset: u64) -> bool {
+    *pack != OWN_PACK && self.store.away(pack, len, offset)
   }
 }
 
