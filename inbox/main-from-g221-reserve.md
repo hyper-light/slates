@@ -1,0 +1,1 @@
+2026-11-21 21:2x g221 (kiln 01a1ec2e97ea733d996375aac4a2779f, Mac Studio 3): in goal-93 reserve (red fixers) per main 01a1ff2e 11:20; idle, no runs, waiting for a red to fix. Free note: main-from-g221-free.md.
