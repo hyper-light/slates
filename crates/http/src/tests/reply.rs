@@ -1,4 +1,7 @@
-use super::{BadField, Body, CONTINUE, LAST_CHUNK, Status, bare, chunk, head, refusal};
+use super::{
+  BadField, Body, CHUNK_SIZE_LINE_BYTES, CONTINUE, LAST_CHUNK, Status, bare, chunk_size_line, head,
+  refusal,
+};
 
 /// A-595: do write a chunked reply's head kept open, and one closed. Expect the status line, the fields in order, the
 /// framing, `Connection: close` only when asked, and the empty line, byte for byte.
@@ -81,14 +84,24 @@ fn a_field_that_could_split_the_reply_is_refused_with_nothing_written() {
   );
 }
 
-/// A-595: do write chunks of several sizes, an empty one, the last chunk and the interim `100 Continue`. Expect each
-/// size in lowercase hexadecimal, nothing for no data, and RFC 9112's own framing.
+/// A-595 and A-830: do write the size lines of chunks of several sizes, the largest a `usize` holds among them, and
+/// frame two runs with them as the edge does (the line, the run, CRLF). Expect each size in lowercase hexadecimal and
+/// CRLF, within [`CHUNK_SIZE_LINE_BYTES`], RFC 9112's own framing, the last chunk and the interim `100 Continue`.
 #[test]
 fn chunks_are_framed_by_their_hexadecimal_size() {
+  let mut line = [0; CHUNK_SIZE_LINE_BYTES];
+  assert_eq!(chunk_size_line(1, &mut line), b"1\r\n");
+  assert_eq!(chunk_size_line(10, &mut line), b"a\r\n");
+  assert_eq!(chunk_size_line(300, &mut line), b"12c\r\n");
+  assert_eq!(chunk_size_line(0x1_0000, &mut line), b"10000\r\n");
+  let largest = format!("{:x}\r\n", usize::MAX);
+  assert_eq!(chunk_size_line(usize::MAX, &mut line), largest.as_bytes());
   let mut out = Vec::new();
-  chunk(b"0123456789", &mut out);
-  chunk(b"", &mut out);
-  chunk(&[b'x'; 300], &mut out);
+  for run in [&b"0123456789"[..], &[b'x'; 300][..]] {
+    out.extend_from_slice(chunk_size_line(run.len(), &mut line));
+    out.extend_from_slice(run);
+    out.extend_from_slice(b"\r\n");
+  }
   let mut expected = b"a\r\n0123456789\r\n12c\r\n".to_vec();
   expected.extend_from_slice(&[b'x'; 300]);
   expected.extend_from_slice(b"\r\n");

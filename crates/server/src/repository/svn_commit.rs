@@ -562,12 +562,13 @@ async fn stage_texts(
     Ok(storing) => storing,
     Err(refused) => return Some(Err(refused)),
   };
+  // Each piece lent from the text the landing holds, never copied out (P7's finding (2)).
   let piece = |identity: &ContentIdentity, offset: u64, len: usize| {
     let bytes = texts.get(identity)?;
     let start = usize::try_from(offset).ok()?;
     bytes
       .get(start..start.saturating_add(len).min(bytes.len()))
-      .map(<[u8]>::to_vec)
+      .map(std::borrow::Cow::Borrowed)
   };
   loop {
     let stepped = crate::state::with_state(|state| store_step_from(state, &mut storing, &piece))?;
@@ -757,12 +758,15 @@ pub(crate) fn store_step(
   texts: &dyn slates_svn::commit::drive::TextSink,
 ) -> Result<bool, Uncommitted> {
   store_step_from(state, storing, &|identity, offset, len| {
-    texts.sealed_piece(identity, offset, len)
+    texts
+      .sealed_piece(identity, offset, len)
+      .map(std::borrow::Cow::Owned)
   })
 }
 
-/// A reader of a text's pieces: a text, an offset, at most a length; its bytes there, or none.
-type PieceOf<'a> = dyn Fn(&ContentIdentity, u64, usize) -> Option<Vec<u8>> + 'a;
+/// A reader of a text's pieces: a text, an offset, at most a length; its bytes there, lent where the reader holds the
+/// text (an import's landing: no copy, P7's finding (2)), or none.
+type PieceOf<'a> = dyn Fn(&ContentIdentity, u64, usize) -> Option<std::borrow::Cow<'a, [u8]>> + 'a;
 
 /// [`store_step`] reading each piece from `piece` (a text, an offset, at most a length).
 fn store_step_from(
@@ -1808,25 +1812,36 @@ impl<'b> Building<'b> {
     Ok(())
   }
 
-  /// `text`'s bytes: brought by the revision, held by the records, or stored in the content store by its commit. Until
-  /// the green's increment can name stored content (A-716 1b, w-engine's), a stored text is read whole into it.
-  fn text_bytes(&self, text: &Text) -> Result<std::borrow::Cow<'b, [u8]>, Uncommitted> {
+  /// Appends `text`'s bytes to the increment's post-state: brought by the revision or held by the records, copied once
+  /// from where they lie; stored in the content store by its commit, copied a window at a time from the store's lent
+  /// windows (`ContentStore::run_at`), never read whole into a buffer of its own first (P7's finding (2): that read was
+  /// one of the import's sub-1 MiB copies of every text). The copy into the post-state stays until the green's increment
+  /// can name stored content (A-716 1b, w-engine's). Its length.
+  fn append_text(&mut self, text: &Text) -> Result<u64, Uncommitted> {
     let checked: &'b Checked = self.checked;
     let records: &'b Repository = self.records;
     let store: Option<&'b slates_vcs::ContentStore> = self.store;
-    checked
+    let held = checked
       .fresh()
       .get(&text.identity)
       .map(|bytes| std::borrow::Cow::Borrowed(bytes.as_slice()))
-      .or_else(|| records.text(&text.identity))
-      .or_else(|| {
-        let store = store?;
-        let root = store.root_of(&slates_vcs::ContentId(text.identity));
-        store
-          .object_bytes(&root, text.size)
-          .map(std::borrow::Cow::Owned)
-      })
-      .ok_or_else(corrupt)
+      .or_else(|| records.text(&text.identity));
+    if let Some(bytes) = held {
+      self.post.extend_from_slice(&bytes);
+      return u64::try_from(bytes.len()).map_err(|_| corrupt());
+    }
+    let store = store.ok_or_else(corrupt)?;
+    let identity = slates_vcs::ContentId(text.identity);
+    let mut appended = 0u64;
+    while appended < text.size {
+      let run = store
+        .run_at(&identity, text.size, appended)
+        .filter(|run| !run.is_empty())
+        .ok_or_else(corrupt)?;
+      self.post.extend_from_slice(&run);
+      appended = appended.saturating_add(u64::try_from(run.len()).map_err(|_| corrupt())?);
+    }
+    Ok(appended)
   }
 
   /// The file at `path`, `len` bytes long, given `text` whole, or emptied for none.
@@ -1842,13 +1857,11 @@ impl<'b> Building<'b> {
 
   /// `text`'s bytes inserted at the start of the file at `path`; nothing for an empty text.
   fn insert(&mut self, path: &str, text: &Text) -> Result<(), Uncommitted> {
-    let bytes = self.text_bytes(text)?;
-    if bytes.is_empty() {
+    let src = u64::try_from(self.post.len()).map_err(|_| corrupt())?;
+    let len = self.append_text(text)?;
+    if len == 0 {
       return Ok(());
     }
-    let src = u64::try_from(self.post.len()).map_err(|_| corrupt())?;
-    let len = u64::try_from(bytes.len()).map_err(|_| corrupt())?;
-    self.post.extend_from_slice(&bytes);
     self.op_at(OpKind::Insert, path, (0, len, src), 0);
     Ok(())
   }

@@ -85,7 +85,10 @@
 
 mod locks;
 pub use locks::{LockHookCall, PreHooked};
-pub use revprops::{RevisionPropertyAction, RevisionPropertyCall};
+pub use revprops::{
+  RevisionPropertyAction, RevisionPropertyCall, RevisionPropertyChange, changed_properties,
+  pre_revprop_change, revision_property_refused,
+};
 mod replays;
 mod revprops;
 #[cfg(test)]

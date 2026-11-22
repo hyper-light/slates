@@ -12352,7 +12352,12 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
    the protocol's order needs them (the missing set), charged as below.
 2. *Admission charges the slice in flight.* Each slice's bytes are charged to the request's room as they are made and
    given back once sent; the tables of rule 1 are charged once, at the start. The answer's whole size never meets the
-   room, so a request's room bounds a slice, never a repository.
+   room, so a request's room bounds a slice, never a repository. The request's own bytes are held to the edge's request
+   room (one region); its answer, whose tables grow with the repository's objects and wants, is admitted what its
+   repository's shard admits it (A-724's share), never one region (A-855: git/git's clone of 1,019 tags outgrew a
+   region's 256 KiB). A refusal past that room before the pack begins costs time, never an answer: the answer is held,
+   made again in a wider room once the shard gives one, passing over what it wrote, and refused as before only past the
+   daemon's observation budget.
 3. *Every slice runs a turn at a time* under the shard's step quantum (§4.3), the repository's view lent for that turn
    alone; a yield between slices.
 4. *Fetches run concurrently, one repository's too.* A fetch reads the index as it stood when it began (a hold on that
@@ -13912,7 +13917,14 @@ speaks receive-pack's exchange of the pack protocol [B: gitprotocol-pack] on eit
    D(k) to it; a version that rewrote the branch computes its D(k) against the old set the same way, then makes the set
    again from the newest version, on any green of the repository, whose head the new head descends from (found through
    the commit rows, so a rebased feature branch starts from its target branch's set), walking only what lies beyond it.
-   The union rule holds within each run of fast-forwards; the fetch's walk (below) covers the rest.
+   The union rule holds within each run of fast-forwards; the fetch's walk (below) covers the rest. A green's first
+   version (no version before it has a head: a create, or a ref made again after its delete) records D(0) relative to
+   the version it was made at, its base, found at its admission and recorded in its push's record (A-850): the green
+   another green's head is its head or the commit its tags peel to (A-753), else the nearest commit back from that commit,
+   by generation number, that a committed version's head peels to, that version less its own tags. D(0) is then what its
+   head reaches and its base does not; a push without `atomic` decides its commands oldest commit first, so a whole
+   history's tags pushed into an empty repository each bring what the one below does not reach, about the history and
+   its tags in all, not tags times history.
 4. **Pack fragments.** Each version's D(k) is also kept encoded, once, as a pack fragment stored as content: each
    object zlib-compressed, deltas chosen by the learned window and depth (below), a base inside the fragment named by
    offset (`OBJ_OFS_DELTA`) and a base in an earlier version named by id (`OBJ_REF_DELTA`), and each entry's CRC32 kept,
@@ -16037,7 +16049,9 @@ version (item 3.5). A change (`change-rev-prop`, `change-rev-prop2`, or PROPPATC
 repository's register (§4.17.1), ordered with the versions and replicated with them: validated as a commit's are; gated
 by pre-revprop-change, whose absence refuses every change (`E165006`, Subversion's default, notes §7); compared with
 the old value the client sent (`atomic-revprops`, `E160049` on a difference); then applied; post-revprop-change
-observes. A read sees the newest entry.
+observes. A read sees the newest entry. (Status 2026-11-21: built over ra_svn by A-702; over HTTP the same night,
+w-svn, after main's r6 red: the edge's PROPPATCH of `!svn/rev/N` or `!svn/bln/N`, `slates_svn::dav::revprops`, judged by
+the one `serve::RevisionPropertyChange` path both edges share.)
 
 *7. Locks.* Each lock is an entry of the repository's register: the path, a token (`opaquelocktoken:` and a UUID, drawn
 on the owner before the append so every holder replays the same token), the owner (the principal), a comment, and its
@@ -45026,7 +45040,8 @@ reads §4.17.1's shared rule), §4.17.1 (A-534's owed green at any commit, now p
   `a_fast_forward_brings_only_what_its_green_had_not_reached` (a reached directory skipped whole, counted),
   `a_ref_made_at_another_refs_head_reuses_its_set_without_a_walk` (the walk counter unmoved),
   `a_rewrite_brings_what_its_old_head_did_not_reach_and_makes_its_set_again`,
-  `a_deleted_ref_reaches_nothing_and_made_again_brings_all_its_head_reaches`,
+  `a_deleted_ref_reaches_nothing_and_made_again_brings_all_its_head_reaches` (renamed by A-850
+  `a_deleted_ref_reaches_nothing_and_made_again_at_its_old_version_brings_nothing_beyond_it`),
   `a_versions_tree_is_read_from_its_rows_and_a_path_resolves_one_tree_a_component`,
   `an_abandoned_push_leaves_nothing_and_a_false_claim_is_refused`,
   `a_missing_parent_an_unsealed_push_and_a_foreign_push_are_refused`,
@@ -60436,6 +60451,58 @@ Applied in the same change to:
   - The ignored git-2000 measurement now prints `records_stored_text_bytes` where it printed `records_text_bytes`.
   - The stock `svnadmin`/`svnlook` reading of the all-`PLAIN` view is main's run, since there is no svn on the Mac.
 
+### A-850 — A created ref's first version is made at a recorded base: D(0) relative to it, a push decided oldest first (bug, 2026-11-21, w-git for UI goal 93; main's rulings of 17:06, 21:35 and 22:40 PST; record r16; §4.17.2 item 3, A-614, A-647, A-753, A-662)
+Applied in the same change to:
+- `crates/git/src/store/admitting.rs`: a create's or a rewrite's admission takes the version it is made at, its base:
+  another green's version whose head is its head or the commit its tags peel to, else the search back
+  (`Phase::Base`, `base_search_unit`, a commit a unit, counted `base_searched`) to the nearest commit a committed
+  version peels to; each move notes the commit its head peels to.
+- `crates/git/src/store/repository.rs`: the peeled map (each commit a committed version's head peels to, the first such
+  version; charged with the chains; copied by a fork); `Move::base`, `Repository::based` (a replay takes the recorded
+  base, refused typed `StoreRefused::Base`), `Repository::peeled_generation`.
+- `crates/git/src/store/deriving.rs`, `crates/git/src/store/reach.rs`: a first version made at a base brings its walk
+  beyond the base alone; a base is taken less its own tags (`base_set`), whole where its head is the version's own.
+- `crates/git/src/receive/mod.rs`: `Judge::rank`; a push without `atomic` decides its commands by rank, its outcomes
+  reported in the order sent.
+- `crates/server/src/git_push.rs`, `crates/server/src/vcs_store.rs`: the server's judge ranks a command by the
+  generation number of the commit its new value peels to (`SealedPush::rank`); the record's moves carry their bases.
+- `crates/server/src/vcs_store/record.rs`: the push record's version 6, each move's base after its head; version 5 (and
+  3 and 4) refused typed `RecordRefused::Version`, no shim.
+- §4.17.2 item 3; GAPS (§4.17).
+
+- **Found by use.** r16 pushed git/git (master and about 1,000 annotated tags) into an empty repository in one push; its
+  encoding never finished, and clones of it were cut short (w-sessionlog, w-interop). A tag's head is its tag object, so
+  no green's head was its head: each tag's first version was remade from nothing and brought everything its commit
+  reaches, and its fragments encoded that, tags times history. The unit's shape measured it: 40 tags of a line,
+  41 versions in 11,733 encoding turns.
+- **Cause.** A-753's base (the green whose head is the new value) never matched a tag, and the derivation's search back,
+  which did find a base, was not recorded and left D(0) whole. With versions committed before the push only, an empty
+  repository's tags would each walk to the root regardless (main's 22:40 ruling), so the push's moves must come oldest
+  first, each meeting the one below.
+- **Change.** At its admission a create or a rewrite finds its base: A-753's, extended through the commit its tags peel
+  to, else the nearest commit back by generation number that a committed version's head peels to (the peeled map, made
+  by the commits in the log's order, so a store made again holds the same). The base is the move's `Reach::Remade`
+  `from`, recorded in the record (version 6) and taken from it by a replay (`based`), never decided again from the heads
+  a replay meets. Its first version's D(0) is the walk from its head beyond the base's reached set less the base's own
+  tags; its reached set is that set and the walk, as before. A push without `atomic` is decided oldest commit first
+  (`Judge::rank`), its report in the order sent. An exact base (the green whose reached set holds the tag's commit) was
+  rejected: a reachability test per tag is tags times history commit reads at admission (main, 22:40).
+- **Tests.** `slates-server` `git_push::tests::t_a850_r16_a_history_and_its_tags_pushed_whole_into_an_empty_repository_bring_each_object_once`
+  (1,012 commits, `main` and 506 annotated tags sent by ref name, one push into an empty repository: every object
+  brought once, 3,542; the encoding ended in 517 turns; the fetch's pack whole; red with the search but the commands
+  decided as sent, 9,557 brought; red before the change, each tag's whole history);
+  `vcs_store::tests::t_a850_a_recovery_replays_each_moves_base_from_its_record` (the recovered store alike; a record
+  rewritten to name no base replays with none, the tag then bringing its commit's history; a base never made, or at the
+  tag's own green, refused `Base`); `vcs_store::tests::t_a850_a_version_6_record_names_its_moves_bases_its_names_its_pack_and_its_changeset`
+  (the encoding; versions 3 and 5 refused typed); `t_a662_hostile_records_are_refused_by_kind` (a base marker of
+  neither kind). `slates-git` `receive::tests::append::without_atomic_commands_are_decided_by_rank_and_reported_as_sent`;
+  the store's oracle (`store::tests::oracle`) holds the model's own statement of the base rule; `t_a647` (the reach type
+  and the derivation agree on every version); the delete-and-make-again and rewrite tests now name the base met
+  (§4.17.2 item 6's "made again brings all its head reaches" is now "brings what its base, its own old version, does
+  not reach").
+- **Left** (GAPS): an atomic push's moves meet no base among each other (its moves commit together); a fetch's plan does
+  not yet follow a base (a run never holds a D(0), so a want of a tag made at a base is answered by the walk, whole).
+
 ### A-848 — The content pool grows an arena by what a claim needs (2026-11-21, w-sizing; main 01a1ff2e 17:20 and 01a20182 21:35, goal 93; Ada's MEMORY SIZING rule; A-98, A-789)
 Applied in the same change to: `crates/server/src/content_pool.rs` (`arena_parts`, `ContentPool::best_fit`, `claim`,
 the module docs, tests), `crates/mem/src/arena.rs` (`ExtentSource::claim(want)`, `ChunkArena::grow` passes what it
@@ -60485,3 +60552,107 @@ Status: built 2026-11-21, every platform.
   18,564-byte ask was refused for 10 s, admittable 0, before; admitted at once after, shard 0 counting
   `pool.want_answered`.
 - Open: demand is the shard's need now, not learned and decayed, so a shard that bursts again re-claims what it gave.
+
+### A-854 — A small increment is carried in its chain entry; only a large one is held (chain entry format 7) (2026-11-21, w-shared; main 01a20182's 23:04 PST, the A-825 load regression after d44f0166a; §4.16 "Commit", §4.8, AUD-05; A-825, A-826)
+Applied in the same change to: `crates/merge/src/chain_entry.rs` (`VERSION` 7, `encode_carrying`, `carried`, the module
+docs, the golden vectors), `crates/server/src/verbs.rs` (`increment_held`, `CARRIED_INCREMENT_MAX`, `record_accepted`,
+the chain room, the replay's read), `crates/server/src/merge_service.rs` (`carried_increment`, `entry_increment`,
+`version_inputs`, `chain_names`, the fold's size), `crates/server/src/daemon.rs`, `crates/server/src/work_home.rs` (the
+red test), GAPS.
+
+Status: built 2026-11-21, macOS arm64 (focused tests); main's load_bench A/B owed.
+- Why: format 6 holds every increment in the owner shard's content store and its entry names it. An entry is durable
+  when its append returns, a hold only once the shard's next publication commits its image, so each accept published
+  the whole shard before its entry (d44f0166a cut that to one an accept, never to none). A submit from another shard of
+  the node (`owner_judge`) had no publication of its own before A-825; with one, the accept's server p50 at 1,000
+  clients went from 0.43-0.45 ms to 356-429 ms and the machine's load from 7 to 21-35 (main's A/B, big Studio, 3
+  rounds). w-engine's two ways out were to group the publications or to make a hold durable without one. Grouping
+  leaves at least one publication on an uncontended accept's path, where A had none, so it cannot come within 10% of A.
+  The entry's own append is the durable step the accept already pays, so the second way is taken: a small increment is
+  made durable by riding in it.
+- Rule: an increment whose encoding is at most `CARRIED_INCREMENT_MAX` (1 MiB) and a 64th of the partition's green-chain
+  cap (`CARRIED_CHAIN_SHARE`, derived: a carrying chain holds at least 64 versions before its cap) is carried in its entry
+  after its inputs
+  (a present marker and the bytes), its inputs named as a held one's would be (the inputs archive's manifest identity
+  and length), so its merge record names its inputs alike. Nothing is held for it, so no publication is ordered before
+  its append, and its chain room is charged its bytes, as before format 6. A larger increment is held and published
+  first exactly as A-825 and A-826 have it. A holder's fetched increment (A-826) small enough is carried as well, read
+  from the store; the fetched copy is then named by no entry and goes at the next fold (`chain_names` counts held
+  entries only). Every reader takes a carrying entry's increment from the entry: the replay, the identities' read, a
+  version's inputs (`InputsAt::Record`) and the fold's size. A version 6 entry is refused `BadVersion`, on A-621's
+  precedent.
+- Order kept: an image still precedes a successful completion wherever the entry names held content (§4.8, AUD-05); a
+  carrying entry names nothing outside its own append.
+- Evidence: `accepted_owner_submits_cost_publications_that_do_not_grow_with_their_number` (eight submits through
+  `owner_judge`): red 8 committed publications, green 0. `a_carrying_entry_holds_its_increment_after_its_inputs` and
+  `a_held_increments_entry_encodes_to_its_golden_bytes` (format 7's two shapes, byte for byte).
+- Open: the 1 MiB bound is a judgment, not a measured crossover (a sweep across it is owed). The held path keeps its
+  whole-shard publication for increments above it.
+
+### A-855 — A fetch's answer is admitted its repository's room, and one past it waits, never cut (bug, 2026-11-22, w-git for UI goal 93; main 01a20182's rulings of 21:35 PST 2026-11-21 and 00:26 PST: "a refusal costs time, never an answer"; §4.17.1 "A fetch's answer" rule 2, A-745, A-724)
+Applied in the same change to:
+- `crates/server/src/vcs_http/git/upload.rs`: an answer admitted its repository's shard room, the request's body still
+  the edge's request room; `Upload::wait_for_room` (made again in a wider room, counted `vcs_http.git.answered_again`;
+  a keepalive interval a wait; given up past `ROOM_PATIENCE_NS`, the observation budget).
+- `crates/server/src/vcs_ssh/git.rs`, `crates/server/src/vcs_ssh/site.rs`: an answer admitted its shard room; the
+  command's dead request room removed.
+- `crates/git/src/upload/answer.rs`: `Answer::holding`, `held`, `written`, `skip_written`, `give_up`: a refusal past its
+  room before the pack's source begins (the request read, the negotiation, the sections' charges, the source's begin)
+  held, its words kept unwritten; an answer made again passes over what the client has.
+- `crates/server/src/vcs_store/upload.rs`: a test's room script (`ROOMS`, tests only).
+- §4.17.1 rule 2; GAPS (§4.17).
+
+- **Found by use.** r16-git on the big Studio (release b099adee4, A-850 merged; git/git f7de814569, 1,019 tags): `git
+  clone` over HTTP and SSH aborted "remote: aborting due to possible repository corruption on the remote side"; the
+  anchor's log named `Negotiation(PastAdmission { asked: 7912, left: 283 })` (w-sessionlog's rerun of 2026-11-21).
+- **Cause.** Each edge admitted an answer `min(request room, shard room)`, the request room one client region: 32 slots
+  × 2 × 4,096 bytes, 256 KiB (Studio-2's anchor log: `slots_per_ring = 32`; its shards had GiBs free). The answer's walk
+  keeps tables of a bit or a word an object and a few words a want (rule 1): 148,343 bytes for 506 tags of a 1,012-commit
+  line, 151,007 for 4,048 commits, 164,807 for 1,019 tags (unit probes, this Mac); git/git's history and positions over
+  many landings take more, past 256 KiB at 506 tags and not at 253. So waiting could never have helped: the bound was a
+  constant, and a refusal after the `packfile` header ended the pack with git's abort words.
+- **Change.** An answer is admitted its repository's room on its shard; the edge's room still bounds the request's own
+  bytes. A refusal past that room before the pack's source begins is held, not answered; the edge re-asks the room each
+  turn (a keepalive written meanwhile) and, once it has grown, makes the answer again over the same generation within it,
+  passing over the bytes it wrote (the same answer, byte for byte, under that generation); past the observation budget
+  the refusal is answered as before. A refusal once the pack's source began is unchanged: its bytes are out.
+- **Tests.** `slates-server` `vcs_http::daemon_edge::tests::a_clone_of_git_gits_many_refs_is_answered_whole_over_the_daemons_edge`
+  (1,019 tags of a line through the daemon's edge, its region a quarter of the derived one, the answer measured past the
+  edge's room: `200`, every object, no abort; red with the one-region room) and
+  `a_fetch_past_its_room_waits_for_more_and_is_answered_whole` (the shard's next room the request's length: `200`, every
+  object, answered again once, refused never; red without the hold: the answer an `ERR` line); `slates-git`
+  `upload::tests::clone::a_clone_held_past_its_room_and_answered_again_in_a_wider_one_is_the_whole_answer` (small.git's
+  stock clone held at the widest room that holds it, made again whole byte for byte, an answer passing over each count of
+  bytes through its `packfile` header, given up answered as before).
+- **Left** (GAPS): the SSH edge admits an answer its shard room but does not yet wait (a held refusal there is given up
+  at once); a refusal once the pack's source began still ends the pack.
+
+### A-856 — A git encoding's parts are charged, and fragments are made ahead only for a client within its repository's grant (2026-11-22, w-git for UI goal 93; main 01a20182's rulings of 00:30 and 01:55 PST, Ada: "our memory should be far less than that"; A-718, A-724 pieces 2d and 4)
+Applied in the same change to:
+- `crates/git/src/store/encoding.rs`: `Encoding::held_bytes`, `release`; each unit trues up a charge on the content
+  store for the parts held (refused typed where the store has no room), given back at the end or on a refusal.
+- `crates/server/src/vcs_store/git_encode.rs`: `encode_ahead` (the task behind a fetch, turned only while
+  `ahead_allowed`: a fetch of the repository answered, and its holding within its learned grant), `give_back_idle`,
+  `drop_under_way` (an encoding's charge given back as it is dropped), counters `ahead_stopped` and `given_back_idle`.
+- `crates/server/src/vcs_store/upload.rs`: a repository's last fetch ending gives back what it holds past its grant.
+- `crates/server/src/vcs_share.rs`: `fetches_live`, `held`, `budget` (the learned grant, `grants::current_at`).
+- GAPS (§4.17).
+
+- **Found by use.** clients' table (big Studio, release a3e673efc, git/git v2.0.0 over HTTP): RSS 47 MiB at the start,
+  917 MiB at the clone's end, 1,695 MiB 90 s later with no client, still rising ~8 MiB/s; shard 0 still turning the
+  encoding behind the clone; +1.53 GB of >= 1 MiB blocks, the encoder's parts (`Part.bytes`, 2.5 GB live at its most)
+  "charged to no budget". a3e673efc predates A-850, under which each tag's first version encoded its whole history.
+- **Change.** The parts an encoding holds between its units are charged to the content store, so the shard's budget
+  sees them and an encoding past it is refused, a fetch then searching instead. The task behind a fetch that stopped
+  waiting turns the encoding only while a fetch of the repository is answered and the repository holds less than its
+  learned grant (none before its curve has learned a read, so a repository nothing has read makes nothing ahead); past
+  either it stops. As a repository goes idle, its encoding under way is dropped and what it holds past its grant given
+  back by the cold trigger's cost model, as A-724 piece 4 gives back under contention.
+- **Tests.** `slates-git` `store::tests::encoding::an_encodings_parts_are_charged_to_the_store_as_they_grow_and_given_back_at_its_end`
+  (red with the charge off: 154 bytes held, none charged); `slates-server`
+  `vcs_store::git_encode::tests::t_a856_with_no_fetch_answered_nothing_is_encoded_ahead` (the task stops at its first
+  turn, versions left unencoded, nothing held under way; red before: every version encoded with no fetch there) and
+  `t_a718_a_fetch_that_stops_waiting_leaves_a_task_that_finishes_the_encoding` (with a fetch answered and its grant
+  learned, 262,144 bytes here, the task finishes the encoding as before).
+- **Left** (GAPS): each object's deflate makes a fresh state (97 GB made over one clone), owed next; past its grant a
+  repository's fragments are not kept on disk under its grant, only not made ahead; main's RSS round over git/git.

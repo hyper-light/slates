@@ -209,3 +209,129 @@ fn a_stock_clones_fetch_is_answered_with_every_object() {
   assert_eq!(every.len(), 32);
   assert_eq!(names, every);
 }
+
+/// small.git's clone `fetch` answered in turns within `admission`, held past its room ([`crate::upload::Answer::holding`])
+/// and passing over `skip` bytes the client has: the bytes written until it ends or is held, and the answer.
+fn answered_holding(
+  served: &crate::upload::Served<'_>,
+  fixture: &served::Served,
+  admission: &mut Admission,
+  skip: usize,
+) -> (Vec<u8>, crate::upload::Answer<super::WholePack>) {
+  let mut source = WholeObjects::new(&fixture.objects);
+  let mut answer = crate::upload::serve_in_turns(
+    served,
+    Version::V2,
+    Asked::Request(FETCH),
+    &mut source,
+    admission,
+  )
+  .holding()
+  .skip_written(skip);
+  let mut bytes = Vec::new();
+  while answer.held().is_none()
+    && answer.write_within(
+      served,
+      &mut source,
+      admission,
+      &mut bytes,
+      usize::MAX,
+      &mut || true,
+    ) == Written::More
+  {}
+  (bytes, answer)
+}
+
+/// A-855 (main's ruling of 2026-11-21: a refusal costs time, never an answer; git/git's clone over a request's room was
+/// answered refused `PastAdmission` and its pack cut with git's abort words). Do: answer small.git's stock clone `fetch`
+/// in turns within each room from none up, holding a refusal past its room, the widest room that holds it taken; answer
+/// it again within
+/// an unbounded room passing over what the held one wrote; answer it whole passing over each count of its first bytes
+/// through its `packfile` section's header; then hold it once more and give it up. Expect: the held answer refused
+/// nothing yet and wrote no abort; what it wrote and what the answer made again wrote together are the whole answer byte
+/// for byte; an answer passing over `k` bytes writes the whole answer's bytes after its `k`th; given up, the answer
+/// refused `PastAdmission` and written as it was before the change.
+#[test]
+fn a_clone_held_past_its_room_and_answered_again_in_a_wider_one_is_the_whole_answer() {
+  let (fixture, _) = small();
+  let names = branches();
+  let refs = refs(&names);
+  let served = serving(&fixture, &refs, b"refs/heads/main");
+  let (whole, answer) = answered_holding(&served, &fixture, &mut Admission::new(u64::MAX), 0);
+  assert!(answer.refusal().is_none() && answer.held().is_none());
+  // The widest room that still holds it: its last stage to run past its room.
+  let (room, bytes, answer) = (0..u64::try_from(whole.len()).unwrap().saturating_mul(4))
+    .map(|room| {
+      let (bytes, answer) = answered_holding(&served, &fixture, &mut Admission::new(room), 0);
+      (room, bytes, answer)
+    })
+    .take_while(|(_, _, answer)| answer.held().is_some())
+    .last()
+    .expect("a room past which the clone is held");
+  assert!(answer.refusal().is_none(), "held, not refused");
+  assert!(
+    !bytes
+      .windows(crate::upload::ABORT.len())
+      .any(|window| window == crate::upload::ABORT),
+    "no abort written while held"
+  );
+  let (rest, again) = answered_holding(
+    &served,
+    &fixture,
+    &mut Admission::new(u64::MAX),
+    answer.written(),
+  );
+  assert!(again.refusal().is_none() && again.held().is_none());
+  assert_eq!(
+    [bytes, rest].concat(),
+    whole,
+    "answered whole, byte for byte"
+  );
+  let header = b"000dpackfile\n".len();
+  assert!(whole.starts_with(b"000dpackfile\n"));
+  for skip in 0..=header {
+    let (rest, _) = answered_holding(&served, &fixture, &mut Admission::new(u64::MAX), skip);
+    assert_eq!(
+      rest.as_slice(),
+      whole.get(skip..).unwrap(),
+      "passing over {skip} bytes"
+    );
+  }
+  let (_, mut given_up) = answered_holding(&served, &fixture, &mut Admission::new(room), 0);
+  given_up.give_up();
+  let mut ended = Vec::new();
+  let mut source = WholeObjects::new(&fixture.objects);
+  while given_up.write(
+    &served,
+    &mut source,
+    &mut Admission::new(u64::MAX),
+    &mut ended,
+    usize::MAX,
+  ) == Written::More
+  {}
+  assert!(given_up.held().is_none() && given_up.refusal().is_some());
+  let mut unheld_source = WholeObjects::new(&fixture.objects);
+  let mut unheld_admission = Admission::new(room);
+  let mut unheld = crate::upload::serve_in_turns(
+    &served,
+    Version::V2,
+    Asked::Request(FETCH),
+    &mut unheld_source,
+    &mut unheld_admission,
+  );
+  let mut unheld_bytes = Vec::new();
+  while unheld.write_within(
+    &served,
+    &mut unheld_source,
+    &mut unheld_admission,
+    &mut unheld_bytes,
+    usize::MAX,
+    &mut || true,
+  ) == Written::More
+  {}
+  assert_eq!(
+    (ended, given_up.refusal()),
+    (unheld_bytes, unheld.refusal()),
+    "given up: answered as before the change"
+  );
+}

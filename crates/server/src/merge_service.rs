@@ -805,10 +805,10 @@ pub(crate) fn fold_inputs(state: &ShardState, green: DbVolumeId) -> Option<FoldI
       .iter()
       .take(folds)
       .map(|entry| {
-        let named = slates_merge::chain_entry::inputs(entry)
-          .ok()
-          .and_then(|inputs| usize::try_from(inputs.len).ok())
-          .unwrap_or(0);
+        // A carried increment is in the entry's own length (format 7, A-854); a held one is beside it. Read from the
+        // header unchecked: this runs at every floor move, and hashing each entry to fold was a cost an accept.
+        let named =
+          usize::try_from(slates_merge::chain_entry::held_len(entry)).unwrap_or(usize::MAX);
         entry.len().saturating_add(named)
       })
       .sum(),
@@ -2791,10 +2791,12 @@ pub(crate) fn version_inputs(
   if slates_merge::push::DeferredPush::is_record(entry) {
     return Some(InputsAt::Record(entry));
   }
-  // The record's inputs are the increment a holder judges afresh (§4.16 "Apply on holders"), not what this node resolved.
-  slates_merge::chain_entry::inputs(entry)
-    .ok()
-    .map(InputsAt::Held)
+  // The record's inputs are the increment a holder judges afresh (§4.16 "Apply on holders"), not what this node resolved:
+  // the bytes the entry carries (format 7, A-854), else the increment it names in the content store.
+  match slates_merge::chain_entry::placement(entry).ok()? {
+    (_, Some(carried)) => Some(InputsAt::Record(carried)),
+    (inputs, None) => Some(InputsAt::Held(inputs)),
+  }
 }
 
 /// Where a version's inputs are ([`version_inputs`]).
@@ -2802,7 +2804,7 @@ pub(crate) fn version_inputs(
 pub(crate) enum InputsAt<'a> {
   /// A chain entry's increment, which the content store holds (chain entry format 6).
   Held(slates_merge::chain_entry::Inputs),
-  /// A deferred push's record (P2), the chain's own bytes.
+  /// The chain's own bytes: a deferred push's record (P2), or the increment a chain entry carries (format 7, A-854).
   Record(&'a [u8]),
 }
 
@@ -2878,6 +2880,37 @@ pub(crate) fn hold_increment(
   }
 }
 
+/// What placing a version's increment `increment` in its chain entry did (format 7, A-854): nothing held, so nothing to
+/// give back (`fresh` false), named by the identity [`hold_increment`] would have held it under, so its merge record
+/// names its inputs alike whichever way they are kept. Counted.
+pub(crate) fn carried_increment(state: &mut ShardState, increment: &[u8]) -> HeldIncrement {
+  state.count(INPUTS_CARRIED_IN_ENTRY, 1);
+  HeldIncrement {
+    inputs: slates_merge::chain_entry::Inputs {
+      identity: MergeShardState::inputs_identity(increment, archive_page(state)),
+      len: u64::try_from(increment.len()).unwrap_or(u64::MAX),
+    },
+    fresh: false,
+  }
+}
+
+/// Format: a version's increment carried in its chain entry (format 7, A-854), the non-vacuity count of
+/// [`carried_increment`].
+pub(crate) const INPUTS_CARRIED_IN_ENTRY: &str = "merge.inputs.carried_in_entry";
+
+/// The encoding of the increment chain entry `entry` of `green` records: the bytes it carries (format 7, A-854), else the
+/// ones this shard's content store holds under its inputs ([`increment_of`]). None when neither has it whole.
+pub(crate) fn entry_increment<'a>(
+  state: &'a ShardState,
+  green: DbVolumeId,
+  entry: &'a [u8],
+) -> Option<std::borrow::Cow<'a, [u8]>> {
+  match slates_merge::chain_entry::placement(entry).ok()? {
+    (_, Some(carried)) => Some(std::borrow::Cow::Borrowed(carried)),
+    (inputs, None) => increment_of(state, green, &inputs),
+  }
+}
+
 /// [`hold_increment`] for an increment this shard's content store already holds under `inputs` (lane (A) 3b: fetched
 /// from the holder that composed it before its verb ran), nothing copied or hashed again: `fresh`, so a refused verdict
 /// gives it back unless an entry names it (`release_refused_increment` checks). Not held any more (released since):
@@ -2919,14 +2952,15 @@ pub(crate) fn release_refused_increment(
   }
 }
 
-/// The increments `green`'s chain names.
+/// The increments `green`'s chain names in the content store: an entry carrying its own (format 7, A-854) names none
+/// there, so a copy held for it (a holder's fetched submit) goes at the next fold.
 fn chain_names(state: &ShardState, green: DbVolumeId) -> BTreeSet<[u8; 32]> {
   state
     .db
     .partition()
     .green_chain(green)
     .iter()
-    .filter_map(|entry| slates_merge::chain_entry::inputs(entry).ok())
+    .filter_map(|entry| slates_merge::chain_entry::held_inputs(entry).ok().flatten())
     .map(|inputs| inputs.identity)
     .collect()
 }

@@ -1178,6 +1178,33 @@ impl ContentStore {
     Ok(())
   }
 
+  /// Brings back every window let go of the object `identity` names ([`ContentStore::put_object`]'s identity), from
+  /// `bytes`, the object's whole bytes its reader read from the node's store (A-767 C1: a Mercurial push's work reading a
+  /// text an import let go): they must be the object's own, by its identity; each window is checked and admitted as
+  /// [`ContentStore::bring_back`] checks and admits one, and a window held already is passed over. How many came back.
+  ///
+  /// # Errors
+  /// `NotHeld` for bytes that are not the object's; a window's refusal as [`ContentStore::bring_back`]'s, the windows
+  /// before it brought back.
+  pub fn bring_back_object(
+    &mut self,
+    identity: &ContentId,
+    bytes: &[u8],
+  ) -> Result<u64, ContentRefused> {
+    if ContentId::of(bytes) != *identity {
+      return Err(ContentRefused::NotHeld);
+    }
+    let mut back = 0u64;
+    for piece in bytes.chunks(self.window.get()) {
+      let window = ContentId::of(piece);
+      if self.is_away(&window) {
+        self.bring_back(&window, piece)?;
+        back = back.saturating_add(1);
+      }
+    }
+    Ok(back)
+  }
+
   /// Whether the window `identity` names was let go ([`ContentStore::let_go`]) and not brought back.
   pub fn is_away(&self, identity: &ContentId) -> bool {
     let identity = self.resolve(identity);
@@ -2403,25 +2430,109 @@ mod tests {
     let mut store = ContentStore::new(1 << 20, 4096).unwrap();
     let bytes = vec![7u8; 1000];
     let id = store.put(&bytes).unwrap();
-    assert_eq!(store.let_go(&id), Err(LetGoRefused::NotLanded));
-    assert!(store.mark_landed(&id));
+    let before = let_go_once_landed(&mut store, &id);
+    brought_back_by_its_own_bytes(&mut store, (&id, &bytes), before);
+  }
+
+  /// The window `id` refused `NotLanded`, then marked and let go: freed, read as nothing, its length kept, counted, a
+  /// second let-go refused `Away`. The store's count before it was let go.
+  fn let_go_once_landed(store: &mut ContentStore, id: &ContentId) -> u64 {
+    assert_eq!(store.let_go(id), Err(LetGoRefused::NotLanded));
+    assert!(store.mark_landed(id));
     let before = store.content_bytes;
-    assert_eq!(store.let_go(&id), Ok(1000));
+    assert_eq!(store.let_go(id), Ok(1000));
     assert_eq!(store.content_bytes, before - 1000);
-    assert!(store.is_away(&id));
-    assert_eq!(store.bytes_of(&id), None);
-    assert_eq!(store.len_of(&id), Some(1000));
-    assert_eq!(store.let_go(&id), Err(LetGoRefused::Away));
+    assert!(store.is_away(id));
+    assert_eq!(store.bytes_of(id), None);
+    assert_eq!(store.len_of(id), Some(1000));
+    assert_eq!(store.let_go(id), Err(LetGoRefused::Away));
     assert_eq!(store.counters.let_go, 1);
+    before
+  }
+
+  /// The window `id`, let go, refused other bytes and brought back by `bytes`, its own: read whole, counted, the store's
+  /// count `before` again.
+  fn brought_back_by_its_own_bytes(
+    store: &mut ContentStore,
+    (id, bytes): (&ContentId, &[u8]),
+    before: u64,
+  ) {
     assert_eq!(
-      store.bring_back(&id, &vec![8u8; 1000]),
+      store.bring_back(id, &vec![8u8; 1000]),
       Err(ContentRefused::NotHeld)
     );
-    store.bring_back(&id, &bytes).unwrap();
-    assert!(!store.is_away(&id));
-    assert_eq!(store.bytes_of(&id).as_deref(), Some(bytes.as_slice()));
+    store.bring_back(id, bytes).unwrap();
+    assert!(!store.is_away(id));
+    assert_eq!(store.bytes_of(id).as_deref(), Some(bytes));
     assert_eq!(store.counters.brought_back, 1);
     assert_eq!(store.content_bytes, before);
+  }
+
+  /// `len` bytes of a pattern that repeats every 251, so no two windows of a test's object are alike.
+  fn patterned(len: usize) -> Vec<u8> {
+    (0..len).map(|at| u8::try_from(at % 251).unwrap()).collect()
+  }
+
+  /// A-767 C1 step 2a (a push's work reading a text an import let go). Do: put an object of three windows and a part,
+  /// mark each window landed and let it go, then bring the object back from bytes not its own, and from its own. Expect:
+  /// every window away and its bytes out of the store's count; other bytes refused `NotHeld`, nothing brought back; its
+  /// own bytes bring back all four windows, each read whole, the count as before, and a second bring-back brings none.
+  #[test]
+  fn an_object_let_go_is_brought_back_whole_by_its_own_bytes() {
+    let window = 4096usize;
+    let mut store = ContentStore::new(1 << 22, window).unwrap();
+    let bytes = patterned(window * 3 + 100);
+    let object = store.put_object(&bytes).unwrap();
+    let before = store.content_bytes;
+    let windows: Vec<ContentId> = bytes.chunks(window).map(ContentId::of).collect();
+    let_go_each(&mut store, &windows);
+    assert!(
+      store.content_bytes < before,
+      "the windows' bytes left the count"
+    );
+    let mut other = bytes.clone();
+    other[0] ^= 1;
+    assert_eq!(
+      store.bring_back_object(&object, &other),
+      Err(ContentRefused::NotHeld)
+    );
+    assert!(
+      windows.iter().all(|id| store.is_away(id)),
+      "nothing brought back by other bytes"
+    );
+    brought_back_whole(&mut store, (&object, &bytes), (&windows, window), before);
+  }
+
+  /// Each of `windows` marked landed and let go.
+  fn let_go_each(store: &mut ContentStore, windows: &[ContentId]) {
+    for id in windows {
+      assert!(store.mark_landed(id));
+      store.let_go(id).unwrap();
+      assert!(store.is_away(id));
+    }
+  }
+
+  /// `object` brought back by `bytes`, its own: every one of its `windows` (`window` bytes each) read whole, the store's
+  /// count `before` again, and a second bring-back bringing none.
+  fn brought_back_whole(
+    store: &mut ContentStore,
+    (object, bytes): (&ContentId, &[u8]),
+    (windows, window): (&[ContentId], usize),
+    before: u64,
+  ) {
+    assert_eq!(
+      store.bring_back_object(object, bytes),
+      Ok(u64::try_from(windows.len()).unwrap())
+    );
+    for (id, piece) in windows.iter().zip(bytes.chunks(window)) {
+      assert_eq!(store.bytes_of(id).as_deref(), Some(piece));
+    }
+    assert_eq!(store.content_bytes, before);
+    assert_eq!(
+      store.bring_back_object(object, bytes),
+      Ok(0),
+      "held already: none again"
+    );
   }
 
   /// A-724 piece 4. Do: let go a landed window, then put the same bytes again (a new push bringing them). Expect: the put

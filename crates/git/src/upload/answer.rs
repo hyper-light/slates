@@ -28,14 +28,15 @@ use super::fetch::{Before, Sections};
 use super::v0::Opened;
 use super::{ABORT, PackPlan, PackRefused, PackSource, Refusal, Refused, Served};
 use crate::negotiation::{
-  Acknowledgments, Answer as NegotiatedAnswer, Counters, Filter, Negotiating, Outcome, ShallowInfo,
+  Acknowledgments, Answer as NegotiatedAnswer, Counters, Filter, Negotiating, Outcome,
+  Refusal as NegotiationRefusal, ShallowInfo,
 };
 use crate::out::Out;
 use crate::pktline::{self, Packet};
 use crate::sideband::{self, Band, MAX_BAND_DATA};
 use crate::store::StoreGraph;
 use crate::v2::fetch::{Event, Response};
-use crate::{Admission, to_u64};
+use crate::{Admission, PastAdmission, to_u64};
 
 /// Format: what an error line begins with outside a multiplexed response (`packet_writer_error`).
 const ERR: &[u8] = b"ERR ";
@@ -131,6 +132,29 @@ impl Framing {
   }
 }
 
+/// A refusal past an answer's room held for its caller (A-855, [`Answer::holding`]).
+struct Held {
+  /// The room it ran past.
+  past: PastAdmission,
+  /// The refusal, answered as it was made if the caller gives up.
+  refusal: Refusal,
+  /// For one made before the sections the pack follows were written, the words it answers with, kept unwritten; none
+  /// for one made after them, which ends the pack with git's band-3 words ([`Answer::abandon`]).
+  words: Option<Vec<u8>>,
+}
+
+/// The room a refusal ran past, where it is one an answer made again in a wider room could avoid (A-855): the answer's
+/// own room, the request's as it is read, the negotiation's, or the pack source's as it begins.
+fn past_room(refusal: &Refusal) -> Option<PastAdmission> {
+  match refusal {
+    Refusal::PastAdmission(past)
+    | Refusal::Wire(crate::v2::Refusal::PastAdmission(past))
+    | Refusal::Negotiation(NegotiationRefusal::PastAdmission(past))
+    | Refusal::Pack(PackRefused::PastAdmission(past)) => Some(*past),
+    _ => None,
+  }
+}
+
 /// What a step left to write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Written {
@@ -157,6 +181,16 @@ pub struct Answer<K> {
   ends_session: bool,
   /// The pack's objects still being chosen, before its source begins (A-745).
   choosing: Option<Box<Choosing>>,
+  /// Whether a negotiation refused past its admission before the pack's source begins is held for its caller, not
+  /// answered (A-855: a refusal costs time, never an answer; [`Answer::holding`]).
+  holds: bool,
+  /// The refusal held: the answer stopped, nothing more written but git's keepalive, until its caller answers again in
+  /// a wider room ([`Answer::skip_written`]) or gives up ([`Answer::give_up`]).
+  held: Option<Held>,
+  /// The bytes of its head the client already has from an earlier answer to the same request, which this one passes
+  /// over as it makes them (A-855: the answer made again is the same answer, byte for byte, under the generation both
+  /// were made from).
+  already: usize,
 }
 
 /// A fetch still being negotiated (A-745, §4.17.1 "A fetch's answer" rule 3): the negotiation (`ready`'s search, the
@@ -278,6 +312,9 @@ impl<K> Answer<K> {
       counters: None,
       ends_session: false,
       choosing: None,
+      holds: false,
+      held: None,
+      already: 0,
     }
   }
 
@@ -374,6 +411,22 @@ impl<K> Answer<K> {
   /// not ready); once the choice ends, the pack's source begun from the plan it made. Refused before its sections, the
   /// answer is the refusal alone, as a request refused whole is answered.
   fn choose<P: PackSource<Pack = K>>(
+    &mut self,
+    served: &Served<'_>,
+    packs: &mut P,
+    admission: &mut Admission,
+    spent: &mut dyn FnMut() -> bool,
+  ) {
+    // A refusal answered in place of this answer keeps whether it is held, and what the client has (A-855).
+    let (holds, already) = (self.holds, self.already);
+    self.choose_unit(served, packs, admission, spent);
+    self.holds = holds;
+    self.already = already;
+    self.hold_refused();
+  }
+
+  /// [`Answer::choose`]'s step.
+  fn choose_unit<P: PackSource<Pack = K>>(
     &mut self,
     served: &Served<'_>,
     packs: &mut P,
@@ -512,7 +565,7 @@ impl<K> Answer<K> {
       Opening::V2(before) => before
         .write(sections, admission)
         .map(|written| match written {
-          Sections::Died(answer) => Err(Box::new(answer)),
+          Sections::Died(answer) => Err(answer),
           Sections::Pack(head, framing, at) => Ok((head, framing, at)),
         }),
       Opening::V0(opening) => match opening.write(sections.1, admission) {
@@ -599,6 +652,18 @@ impl<K> Answer<K> {
   /// it: git's band-3 words where the framing has a band to say them on, else nothing, so the pack is missing; refused
   /// with `refusal`. Their packet is within what [`Answer::choosing`] charged.
   fn abandon(&mut self, refusal: Refusal) {
+    // A-855: one held is not ended here; its caller makes the answer again in a wider room, or gives up.
+    if self.holds
+      && self.pack.is_none()
+      && let Some(past) = past_room(&refusal)
+    {
+      self.held = Some(Held {
+        past,
+        refusal,
+        words: None,
+      });
+      return;
+    }
     if let Some(choosing) = self.choosing.take()
       && choosing.framing.is_some_and(Framing::is_banded)
     {
@@ -624,6 +689,71 @@ impl<K> Answer<K> {
   /// Why the exchange was refused, if it was: the answer then carries the words the client is told.
   pub fn refusal(&self) -> Option<&Refusal> {
     self.refusal.as_ref()
+  }
+
+  /// This answer, a negotiation refused past its admission before its pack's source begins held for its caller rather
+  /// than answered (A-855, main's ruling of 2026-11-21: a refusal costs time, never an answer): the answer then writes
+  /// nothing more but git's keepalive ([`Answer::held`]), and its caller either answers the request again within a wider
+  /// room, passing over what this one wrote ([`Answer::skip_written`]), or gives up ([`Answer::give_up`]), which answers
+  /// the refusal as it would have been. A refusal once the pack's source began is answered as before: its bytes are out.
+  pub fn holding(mut self) -> Answer<K> {
+    self.holds = true;
+    self.hold_refused();
+    self
+  }
+
+  /// Holds the answer's refusal, where it is held ([`Answer::holding`]), it ran past a room, nothing of it is written
+  /// and no pack's source began: its words kept unwritten for [`Answer::give_up`].
+  fn hold_refused(&mut self) {
+    if !self.holds || self.held.is_some() || self.head_written > 0 || self.pack.is_some() {
+      return;
+    }
+    let Some(past) = self.refusal.as_ref().and_then(past_room) else {
+      return;
+    };
+    let Some(refusal) = self.refusal.take() else {
+      return;
+    };
+    self.held = Some(Held {
+      past,
+      refusal,
+      words: Some(core::mem::take(&mut self.head)),
+    });
+  }
+
+  /// The room a held refusal ran past ([`Answer::holding`]), if one is held.
+  pub fn held(&self) -> Option<&PastAdmission> {
+    self.held.as_ref().map(|held| &held.past)
+  }
+
+  /// How many bytes of the answer are written: what an answer made again to the same request passes over
+  /// ([`Answer::skip_written`]).
+  pub fn written(&self) -> usize {
+    self.head_written
+  }
+
+  /// This answer, made again to a request an earlier answer had written `bytes` of before it was held (A-855): those
+  /// bytes are passed over as this one makes them, the client having them already. Only the bytes before the pack can be
+  /// so: an answer is held before its pack's source begins.
+  pub fn skip_written(mut self, bytes: usize) -> Answer<K> {
+    self.already = bytes;
+    self
+  }
+
+  /// Gives up a held refusal ([`Answer::holding`]): answered as it would have been had it not been held, its words
+  /// written next. Nothing when nothing is held.
+  pub fn give_up(&mut self) {
+    let Some(held) = self.held.take() else {
+      return;
+    };
+    self.holds = false;
+    match held.words {
+      Some(words) => {
+        self.head = words;
+        self.refusal = Some(held.refusal);
+      }
+      None => self.abandon(held.refusal),
+    }
   }
 
   /// How a `fetch`'s negotiation went: wants answered in one round, commits walked. `None` for any other exchange.
@@ -665,9 +795,16 @@ impl<K> Answer<K> {
     room: usize,
     spent: &mut dyn FnMut() -> bool,
   ) -> Written {
+    // An answer made again passes over what the client has (A-855), as its head grows to hold it.
+    if self.head_written < self.already {
+      self.head_written = self.already.min(self.head.len());
+    }
     let put = put_from(&self.head, self.head_written, out, room);
     self.head_written = self.head_written.saturating_add(put);
     if self.head_written < self.head.len() {
+      return Written::More;
+    }
+    if self.held.is_some() {
       return Written::More;
     }
     if self.choosing.is_some() {

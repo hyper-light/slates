@@ -10863,34 +10863,72 @@ pub(crate) const SUBMIT_LONGEST_STEP_US: &str = "merge.submit.longest_step_us";
 /// Counter: submit judgments whose one step ran past the shard's derived step bound (`step_ceiling_ns`, A-783).
 pub(crate) const SUBMIT_STEPS_PAST_CEILING: &str = "merge.submit.steps_past_ceiling";
 
-/// `inc` admitted and held before its verdict: encoded (by the refinement job where it prepared it, A-787 part 3, else
-/// here), its chain room admitted and its retention secured, then held in the shard's content store, where its chain
-/// entry names it (lane (A), chain entry format 6), refused typed at the shard's room, the green's retention settled
-/// again on that refusal.
+/// `inc` admitted and placed before its verdict: encoded (by the refinement job where it prepared it, A-787 part 3, else
+/// here), its chain room admitted and its retention secured, then, up to [`CARRIED_INCREMENT_MAX`], given back to be
+/// carried in its chain entry (format 7, A-854: durable with the append, nothing held), else held in the shard's content
+/// store, where its chain entry names it (lane (A), chain entry format 6), refused typed at the shard's room, the green's
+/// retention settled again on that refusal.
 fn increment_held(
   state: &mut ShardState,
   sealed: &crate::work_home::SealedWork,
   green_id: DbVolumeId,
   inc: &slates_merge::engine::Increment,
-) -> Result<crate::merge_service::HeldIncrement, Refusal> {
-  // A holder's submit names an increment this shard already holds (lane (A) 3b): neither encoded nor hashed again.
+) -> Result<(crate::merge_service::HeldIncrement, Option<Vec<u8>>), Refusal> {
+  // A holder's submit names an increment this shard already holds (lane (A) 3b): neither encoded nor hashed again. One
+  // small enough is carried all the same, read from the store, so its accept orders no publication before its append.
   if let Some(inputs) = sealed.held {
-    chain_room_admitted(state, green_id, inc)?;
+    let carried = usize::try_from(inputs.len)
+      .is_ok_and(|len| carries(state, len))
+      .then(|| crate::merge_service::increment_of(state, green_id, &inputs))
+      .flatten()
+      .map(std::borrow::Cow::into_owned);
+    chain_room_admitted(state, green_id, inc, carried.as_ref().map_or(0, Vec::len))?;
     retention_secured(state, green_id, inc)?;
-    return crate::merge_service::increment_already_held(state, green_id, inputs).inspect_err(
-      |_| {
+    return crate::merge_service::increment_already_held(state, green_id, inputs)
+      .map(|held| (held, carried))
+      .inspect_err(|_| {
         let _ = crate::merge_service::settle_green_retention(state, green_id);
-      },
-    );
+      });
   }
   let increment_bytes =
     crate::refining::take_encoded(state, sealed.work, inc.id).unwrap_or_else(|| inc.encode());
-  chain_room_admitted(state, green_id, inc)?;
+  if carries(state, increment_bytes.len()) {
+    chain_room_admitted(state, green_id, inc, increment_bytes.len())?;
+    retention_secured(state, green_id, inc)?;
+    let held = crate::merge_service::carried_increment(state, &increment_bytes);
+    return Ok((held, Some(increment_bytes)));
+  }
+  chain_room_admitted(state, green_id, inc, 0)?;
   retention_secured(state, green_id, inc)?;
   let next = state.db.partition().green_head(green_id).saturating_add(1);
-  crate::merge_service::hold_increment(state, green_id, next, &increment_bytes).inspect_err(|_| {
-    let _ = crate::merge_service::settle_green_retention(state, green_id);
-  })
+  crate::merge_service::hold_increment(state, green_id, next, &increment_bytes)
+    .map(|held| (held, None))
+    .inspect_err(|_| {
+      let _ = crate::merge_service::settle_green_retention(state, green_id);
+    })
+}
+
+/// Shape: the largest increment encoding a chain entry carries (format 7, A-854); a larger one is held in the owner
+/// shard's content store (format 6). Carried, an increment costs its bytes in the entry's append and the chain's room, as
+/// every increment did before format 6, and its accept orders nothing before the append; held, it costs a publication of
+/// the shard's image before the append, a fixed cost of the shard's whole state, but its step neither copies it into the
+/// log nor encodes it again (A-825: at 256 MiB the owner's step went from 667-681 ms to 437-476 ms). At 1,000 clients
+/// over the Linux kernel, every increment a few kilobytes, the publication took the accept's server p50 from 0.44 ms to
+/// 356-429 ms (main's A/B, 2026-11-21). The bound is where the step's copy of the increment (about 2.6 ms a mebibyte at
+/// A-825's 256 MiB rate) is still of the order of one publication; it is a judgment, not a measured crossover, and a
+/// sweep across it is owed. A chain whose cap is small carries less ([`CARRIED_CHAIN_SHARE`]).
+pub(crate) const CARRIED_INCREMENT_MAX: usize = 1 << 20;
+
+/// Shape: the share of the partition's green-chain cap one carried increment may take, at most (A-854): a carrying chain
+/// holds at least this many versions before its cap, so carrying never makes a small chain fold or refuse an entry a
+/// version where held increments would not.
+pub(crate) const CARRIED_CHAIN_SHARE: usize = 64;
+
+/// Whether an increment encoding `len` bytes long is carried in its chain entry: at most [`CARRIED_INCREMENT_MAX`] and
+/// [`CARRIED_CHAIN_SHARE`]'s share of the partition's green-chain cap, derived (A-854).
+fn carries(state: &ShardState, len: usize) -> bool {
+  let share = state.db.partition().caps().green_chain_bytes / CARRIED_CHAIN_SHARE;
+  len <= CARRIED_INCREMENT_MAX.min(share)
 }
 
 /// The `merge.verdict` chokepoint span (§4.14) from `start` to `end`, labeled `accepted` (1) or not (0), opened within
@@ -10909,18 +10947,22 @@ fn verdict_span_emitted(state: &mut ShardState, (start, end): (u64, u64), accept
 }
 
 /// Whether green `green_id`'s chain admits an entry for `inc`, at the most it can be: its bound plus the room a copy
-/// from a version its source changed after adds (A-626 part 2), derived from what the green's histories hold.
+/// from a version its source changed after adds (A-626 part 2), derived from what the green's histories hold, plus the
+/// `carried` bytes of its encoding the entry carries (format 7, A-854).
 fn chain_room_admitted(
   state: &mut ShardState,
   green_id: DbVolumeId,
   inc: &slates_merge::engine::Increment,
+  carried: usize,
 ) -> Result<(), Refusal> {
   let room = state
     .greens
     .get(&green_id)
     .map(|engine| engine.copy_entry_room(inc))
     .ok_or(Refusal::NotFound)?;
-  let bound = slates_merge::chain_entry::entry_bound(inc).saturating_add(room);
+  let bound = slates_merge::chain_entry::entry_bound(inc)
+    .saturating_add(room)
+    .saturating_add(carried);
   let admission = Op::GreenAdvanced {
     green: green_id,
     increment: vec![0; bound],
@@ -11064,8 +11106,8 @@ fn judged_submission(
   // What the chain will hold is the increment and what its verdict resolves it to (A-257), known only after the verdict,
   // so the admission charges the most an entry for this increment can be.
   // Encoded by the refinement job where it prepared the increment (A-787 part 3), else here.
-  let held_increment = match increment_held(state, sealed, green_id, &inc) {
-    Ok(held) => held,
+  let (held_increment, carried) = match increment_held(state, sealed, green_id, &inc) {
+    Ok(placed) => placed,
     Err(refusal) => return refused(refusal),
   };
   let walked_before = state
@@ -11131,6 +11173,7 @@ fn judged_submission(
         work: sealed.work,
         version,
         held_increment,
+        carried,
         increment: inc,
         applied,
         verification: signed.verification,
@@ -11179,6 +11222,8 @@ pub(crate) struct AcceptedParts {
   pub(crate) version: u64,
   /// Where the content store holds the increment, as its chain entry names it (chain entry format 6).
   held_increment: crate::merge_service::HeldIncrement,
+  /// The increment's encoding its entry carries, when it is carried (format 7, A-854) rather than held.
+  carried: Option<Vec<u8>>,
   /// The increment.
   increment: slates_merge::engine::Increment,
   /// What its verdict resolved it to (A-257).
@@ -11211,6 +11256,7 @@ impl AcceptedParts {
       work,
       version,
       held_increment,
+      carried: None,
       increment,
       applied: Some(applied),
       verification: slates_ipc::protocol::Verification::Unsigned,
@@ -11229,6 +11275,7 @@ pub(crate) fn commit_accepted(state: &mut ShardState, parts: AcceptedParts) -> R
     work,
     version,
     held_increment,
+    carried,
     increment: inc,
     applied,
     verification,
@@ -11249,7 +11296,7 @@ pub(crate) fn commit_accepted(state: &mut ShardState, parts: AcceptedParts) -> R
     state,
     (green_id, work),
     version,
-    (held_increment.inputs, &inc),
+    ((held_increment.inputs, carried.as_deref()), &inc),
     (applied.as_deref(), &verification),
   ) {
     crate::merge_service::release_refused_increment(state, green_id, held_increment);
@@ -11315,8 +11362,8 @@ fn record_accepted(
   state: &mut ShardState,
   (green, work): (DbVolumeId, DbVolumeId),
   version: u64,
-  (inputs, increment): (
-    slates_merge::chain_entry::Inputs,
+  ((inputs, carried), increment): (
+    (slates_merge::chain_entry::Inputs, Option<&[u8]>),
     &slates_merge::engine::Increment,
   ),
   (applied, verification): (
@@ -11335,8 +11382,8 @@ fn record_accepted(
         .map(|mut engine| engine.head_identity())
     })
     .flatten();
-  let entry = slates_merge::chain_entry::encode(
-    inputs,
+  let entry = slates_merge::chain_entry::encode_carrying(
+    (inputs, carried),
     increment,
     applied.unwrap_or_default(),
     crate::merge_service::SubmitCompletion::of_current(state, work)
@@ -11349,9 +11396,12 @@ fn record_accepted(
     green,
     increment: entry,
   };
-  // The entry names content the store must hold across a kill: the append is durable in the segment when it returns, the
-  // hold only once a publication commits its image, so the hold is published first (lane (A), condition 1).
-  publish_held_increments(state)?;
+  // An entry naming held content needs the store to hold it across a kill: the append is durable in the segment when it
+  // returns, the hold only once a publication commits its image, so the hold is published first (lane (A), condition 1).
+  // An entry carrying its increment (format 7, A-854) is whole in its append: nothing to order.
+  if carried.is_none() {
+    publish_held_increments(state)?;
+  }
   let now = state.clock.monotonic_ns();
   state
     .db
@@ -20374,12 +20424,15 @@ fn replay_chain_entry(
         *next = next.saturating_add(1);
         return Ok(false);
       }
-      // The increment the entry names, from the content store it was held in before its entry was appended (chain entry
-      // format 6): one the store lacks fences the green, as a corrupt entry does.
-      let inputs = slates_merge::chain_entry::inputs(bytes)
-        .map_err(|_| GreenFence::EntryCorrupt { version })?;
-      let increment = crate::merge_service::increment_of(state, id, &inputs)
-        .ok_or(GreenFence::ContentMissing { version })?;
+      // The increment the entry carries (format 7, A-854), or the one it names, from the content store it was held in
+      // before its entry was appended (format 6): one the store lacks fences the green, as a corrupt entry does.
+      let increment = match slates_merge::chain_entry::placement(bytes)
+        .map_err(|_| GreenFence::EntryCorrupt { version })?
+      {
+        (_, Some(carried)) => std::borrow::Cow::Borrowed(carried),
+        (inputs, None) => crate::merge_service::increment_of(state, id, &inputs)
+          .ok_or(GreenFence::ContentMissing { version })?,
+      };
       Box::new(
         slates_merge::chain_entry::decode(bytes, &increment)
           .map_err(|_| GreenFence::EntryCorrupt { version })?,

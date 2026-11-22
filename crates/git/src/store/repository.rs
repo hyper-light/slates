@@ -134,6 +134,15 @@ pub enum StoreRefused {
   FragmentUnreadable,
   /// The pack's trailer could not be made (SHA-1's collision detection refused it).
   TrailerRefused,
+  /// A replayed move's recorded base (A-850, [`Repository::based`]) is not a version this repository could have made
+  /// it at: no such version of another green, one whose head is neither the move's head nor the commit it peels to, or
+  /// a base named for a move admitted otherwise than remade with no walk.
+  Base {
+    /// The base's green.
+    green: u64,
+    /// The base's version.
+    version: u64,
+  },
   /// An answer named a position the repository never gave (A-639).
   NoPosition {
     /// The position.
@@ -194,6 +203,9 @@ pub struct StoreCounters {
   pub remade: u64,
   /// Of those, the ones that started from another green's set.
   pub bases_found: u64,
+  /// Commits a create's or a rewrite's search back for its base met at its admission and passed (A-850): the search's
+  /// non-vacuity counter, which grows with a push's history, not with its tags times its history.
+  pub base_searched: u64,
   /// Moves admitted with no walk, their versions' sets the closure of their heads, derived on first read (A-614
   /// amended, main's ruling (A)).
   pub deferred: u64,
@@ -401,6 +413,9 @@ pub struct Move {
   green: u64,
   from: Option<u64>,
   to: Option<ObjectId>,
+  /// The commit `to` peels to, where it peels to one: what the commit notes the version under, a base a later create's
+  /// search back may meet (A-850, the repository's peeled map).
+  peeled: Option<ObjectId>,
   brought: Members,
   reach: Reach,
 }
@@ -424,6 +439,19 @@ impl Move {
   /// The object it moves its green to; none for a delete.
   pub fn to(&self) -> Option<ObjectId> {
     self.to
+  }
+
+  /// The version it was made at (A-850): for a create or a rewrite admitted with no walk, the green and its version
+  /// whose head is the move's own head or the commit its tags peel to, found at its admission, which its sets are
+  /// relative to and which a push's record names so that a replay takes the same ([`Repository::based`]); none for any
+  /// other move.
+  pub fn base(&self) -> Option<(u64, u64)> {
+    match self.reach {
+      Reach::Remade {
+        from: Some((green, version)),
+      } => Some((green, to_u64(version))),
+      _ => None,
+    }
   }
 
   /// The same move of `green`: a move admitted for a ref before its append named the green that holds it (A-722 part
@@ -493,7 +521,11 @@ pub struct Repository {
   chains: BTreeMap<u64, Chain>,
   /// For each commit some green's current head names, by its position, those greens.
   heads: BTreeMap<u64, BTreeSet<u64>>,
-  /// What the chains and the head map charge the store.
+  /// For each commit a committed version's head peels to, by its position, the first such version (A-850): what a
+  /// create's or a rewrite's search back at its admission meets as its base. Made by the commits alone, in the log's
+  /// order, so a store made again from the log holds the same.
+  peeled: BTreeMap<u64, (u64, usize)>,
+  /// What the chains, the head map and the peeled map charge the store.
   charged: u64,
   /// The version that brought each position, as runs: each run's first position to its end (exclusive), the green and
   /// that green's version (A-722: kept beside the rows, which no longer carry it, so a push can write its rows before it
@@ -545,6 +577,7 @@ impl Repository {
       next_position: 0,
       chains: BTreeMap::new(),
       heads: BTreeMap::new(),
+      peeled: BTreeMap::new(),
       charged: 0,
       landings: BTreeMap::new(),
       kinds: BTreeMap::new(),
@@ -1022,7 +1055,7 @@ impl Repository {
   }
 
   /// The commit `id` peels to: itself, or the commit a chain of tags names; `None` for a tree or a blob.
-  fn peel(
+  pub(super) fn peel(
     &self,
     store: &ContentStore,
     push: &Push,
@@ -1109,6 +1142,7 @@ impl Repository {
         green,
         from,
         to: None,
+        peeled: None,
         brought: Members::default(),
         reach: Reach::Emptied,
       });
@@ -1125,6 +1159,68 @@ impl Repository {
       },
     )? {}
     admitting.admitted().ok_or(StoreRefused::Unsealed)
+  }
+
+  /// The generation number of the commit `id` peels to, read through `push` and the index (A-850): what a push's
+  /// command is decided by ([`crate::receive::Judge::rank`]), so its moves are admitted oldest first and each one's
+  /// search back meets the one below. None for an object neither holds, or one that peels to no commit.
+  pub fn peeled_generation(&self, store: &ContentStore, push: &Push, id: ObjectId) -> Option<u64> {
+    let commit = self.peel(store, push, id).ok()??;
+    self.generation(store, push, &commit).ok()
+  }
+
+  /// `movement`, admitted against the store as a replay finds it, with the base its push's record names in place of the
+  /// one its admission found (A-850): the record, not the heads the replay meets, decides what the version's sets are
+  /// relative to, so a store made again from the log derives the same sets and fragments. Refused
+  /// [`StoreRefused::Base`] when `base` names no version with a head, one whose head peels to no commit,
+  /// or to a commit neither the one the move's head peels to nor of a lower generation number (no ancestor of it; an
+  /// ancestor is not proved, which would walk), or names one for a move not remade with no walk; a remade move whose
+  /// record names none takes none.
+  pub fn based(
+    &self,
+    store: &ContentStore,
+    push: &Push,
+    mut movement: Move,
+    base: Option<(u64, u64)>,
+  ) -> Result<Move, StoreRefused> {
+    let to = movement.to;
+    let Reach::Remade { from } = &mut movement.reach else {
+      return match base {
+        None => Ok(movement),
+        Some((green, version)) => Err(StoreRefused::Base { green, version }),
+      };
+    };
+    let Some((green, version)) = base else {
+      *from = None;
+      return Ok(movement);
+    };
+    let refused = StoreRefused::Base { green, version };
+    let at = usize::try_from(version).map_err(|_| refused)?;
+    // The moving green's own versions are all made before the move: any is a base its search back may meet.
+    let head = self
+      .chains
+      .get(&green)
+      .and_then(|chain| chain.versions.get(at))
+      .and_then(|made_at| made_at.head)
+      .ok_or(refused)?;
+    let to = to.ok_or(refused)?;
+    let at_head = matches!(self.locate(store, push, &to), Some(Place::Indexed { row, .. }) if row.position == head);
+    if !at_head {
+      let base_commit = self
+        .id_at(store, head)
+        .map(|id| self.peel(store, push, id))
+        .transpose()?
+        .flatten()
+        .ok_or(refused)?;
+      let commit = self.peel(store, push, to)?.ok_or(refused)?;
+      if base_commit != commit
+        && self.generation(store, push, &base_commit)? >= self.generation(store, push, &commit)?
+      {
+        return Err(refused);
+      }
+    }
+    *from = Some((green, at));
+    Ok(movement)
   }
 
   /// Commits `push` and `moves` once the verdict accepts them: a position and rows for each object new to the
@@ -1171,7 +1267,9 @@ impl Repository {
     let put: Vec<ContentId> = values.iter().flatten().copied().collect();
     let added = store.used().saturating_sub(before);
     let chains = self.chains_with(planned, &values);
-    let total = footprint(&self.chains, &chains, &heads);
+    // Each move notes at most one commit more in the peeled map: charged at that bound, the next charge exact.
+    let peeled = self.peeled.len().saturating_add(moves.len());
+    let total = footprint(&self.chains, &chains, (&heads, peeled));
     let more = total.saturating_sub(self.charged);
     if let Err(refused) = store.charge(more) {
       give_back(store, &put)?;
@@ -1241,6 +1339,20 @@ impl Repository {
     self.chains.extend(chains);
     self.heads = heads;
     self.next_position = next;
+    // A-850: each version's commit, the first version noted under it, for a later create's search back.
+    for (movement, version) in moves.iter().zip(&versions) {
+      let position = movement
+        .peeled
+        .and_then(|commit| self.indexed(store, &commit))
+        .map(|(row, _)| row.position);
+      if let Some(position) = position {
+        let version = usize::try_from(*version).unwrap_or(usize::MAX);
+        self
+          .peeled
+          .entry(position)
+          .or_insert((movement.green, version));
+      }
+    }
     // Each version committed with its value is a base a later derivation may search back to (`deriving`).
     for (movement, version) in moves.iter().zip(&versions) {
       let version = usize::try_from(*version).unwrap_or(usize::MAX);
@@ -1735,6 +1847,7 @@ impl Repository {
       next_position: self.next_position,
       chains: self.chains.clone(),
       heads: self.heads.clone(),
+      peeled: self.peeled.clone(),
       charged: self.charged,
       landings: self.landings.clone(),
       kinds: self.kinds.clone(),
@@ -1881,7 +1994,7 @@ fn move_head(
 fn footprint(
   current: &BTreeMap<u64, Chain>,
   planned: &BTreeMap<u64, Chain>,
-  heads: &BTreeMap<u64, BTreeSet<u64>>,
+  (heads, peeled): (&BTreeMap<u64, BTreeSet<u64>>, usize),
 ) -> u64 {
   let chains = current
     .iter()
@@ -1894,8 +2007,14 @@ fn footprint(
   let entries = heads
     .values()
     .fold(0_usize, |total, greens| total.saturating_add(greens.len()));
-  chains.saturating_add(bytes(entries, HEAD_BYTES))
+  chains
+    .saturating_add(bytes(entries, HEAD_BYTES))
+    .saturating_add(bytes(peeled, PEELED_BYTES))
 }
+
+/// Derived: what one entry of the peeled map charges the store: a commit's position, a green and a version, three
+/// words.
+const PEELED_BYTES: usize = size_of::<(u64, (u64, usize))>();
 
 /// Derived: what one run of the landing map charges the store: its key and its value, four words.
 const LANDING_BYTES: usize = size_of::<(u64, (u64, u64, u64))>();
@@ -2046,7 +2165,11 @@ impl Repository {
 
   /// Charges what the chains and the head map take now against what was charged.
   fn recharge(&mut self, store: &mut ContentStore) -> Result<(), StoreRefused> {
-    let total = footprint(&self.chains, &BTreeMap::new(), &self.heads);
+    let total = footprint(
+      &self.chains,
+      &BTreeMap::new(),
+      (&self.heads, self.peeled.len()),
+    );
     if total > self.charged {
       store.charge(total.saturating_sub(self.charged))?;
     } else {

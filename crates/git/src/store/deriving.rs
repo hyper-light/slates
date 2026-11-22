@@ -16,8 +16,10 @@
 //! - a create or a rewrite takes a base: the version its record names, or else the nearest commit back from its head,
 //!   by generation number, that a version whose sets are known peels to, that version's reached set less its own tags
 //!   (which the new head need not reach; the walk adds any it does). It walks from its head, stopping at the base: the
-//!   base and the walk are its reached set. What it brought is that set where no version came before it with a head,
-//!   else the walk from its head stopping at the version before's set.
+//!   base and the walk are its reached set. What it brought, where no version came before it with a head, is the walk
+//!   alone when its base is the version it was made at, found at its admission (A-850: a branch made at another's head,
+//!   a tag of a commit another green heads, brings what the base does not reach), else that whole set; where a version
+//!   came before it with a head, the walk from its head stopping at the version before's set.
 //!
 //! Every unit is one object of a walk or one commit of the search back, so a turn holds its shard no longer than its
 //! quantum, however long the history; and a run of versions read in their heads' generation order (a fetch of many
@@ -76,8 +78,14 @@ enum Step {
   /// A create's or a rewrite's search back from its head for the nearest commit a version whose sets are known peels
   /// to.
   Base(Descent),
-  /// The walk from its head beyond its base: the base and the walk are its reached set.
-  Reached { base: Positions, walk: Walk },
+  /// The walk from its head beyond its base: the base and the walk are its reached set. `made_at`: the base is the
+  /// version the green was made at, found at its admission (A-850), so a first version brings the walk alone; a base
+  /// found by a search back, or none, leaves a first version bringing its whole reached set.
+  Reached {
+    base: Positions,
+    walk: Walk,
+    made_at: bool,
+  },
   /// A fast-forward's walk from its head beyond the version before's set: what it brought, which grows that set.
   Grown { previous: Positions, walk: Walk },
   /// The walk from its head beyond the version before's set, its reached set known: what it brought.
@@ -310,6 +318,28 @@ impl Repository {
     Some(self.indexed(store, &commit)?.0.position)
   }
 
+  /// What a version whose head is at `head` and made at `base` takes from it (A-850): `reached`, the base's reached
+  /// set, less the base's own tags, which the version made at it need not reach (its walk adds any it does); whole where
+  /// the base's head is the version's own.
+  pub(super) fn base_set(
+    &self,
+    store: &ContentStore,
+    ((green, version), head): ((u64, usize), Option<u64>),
+    reached: Positions,
+  ) -> Positions {
+    let base_head = self
+      .chains
+      .get(&green)
+      .and_then(|chain| chain.versions.get(version))
+      .and_then(|record| record.head);
+    match base_head {
+      Some(base_head) if Some(base_head) != head => {
+        reached.difference(&self.tag_chain(store, base_head))
+      }
+      _ => reached,
+    }
+  }
+
   /// The positions of the tags from the object at `position` to the commit it peels to: what a version reaches that a
   /// version whose head peels to that commit, or descends from it, need not.
   fn tag_chain(&self, store: &ContentStore, position: u64) -> Positions {
@@ -379,21 +409,28 @@ impl Repository {
         .map_or(Step::Base(descent), |base| Step::Reached {
           walk: Walk::from(head, base.clone()),
           base,
+          made_at: false,
         }),
-      Step::Reached { base, mut walk } => {
+      Step::Reached {
+        base,
+        mut walk,
+        made_at,
+      } => {
         if self.walk_unit(store, &deriving.push, &mut walk)? {
-          Step::Reached { base, walk }
+          Step::Reached {
+            base,
+            walk,
+            made_at,
+          }
         } else {
-          let reached = base.union(&indexed_alone(walk)?);
+          let found = indexed_alone(walk)?;
+          let reached = base.union(&found);
           if !before {
+            // A green's first version brings what it reaches beyond the version it was made at (A-850: a tag of a held
+            // commit brings its tag objects alone), the whole of what it reaches where it was made at none.
+            let brought = if made_at { found } else { reached.clone() };
             deriving.waiting.pop();
-            return Ok(Unit::Sets(
-              key,
-              Sets {
-                brought: reached.clone(),
-                reached,
-              },
-            ));
+            return Ok(Unit::Sets(key, Sets { brought, reached }));
           }
           let previous = self.sets(store, key.0, key.1.saturating_sub(1))?.reached;
           Step::Brought {
@@ -474,6 +511,7 @@ impl Repository {
           return Ok(now(Step::Reached {
             base: Positions::new(),
             walk: Walk::from(head, Positions::new()),
+            made_at: false,
           }));
         }
         if unknown(previous)? {
@@ -493,10 +531,12 @@ impl Repository {
           if unknown(base)? {
             return Ok(Begun::Needs(base));
           }
-          let set = self.sets(store, base.0, base.1)?.reached;
+          let reached = self.sets(store, base.0, base.1)?.reached;
+          let set = self.base_set(store, (base, record.head), reached);
           return Ok(now(Step::Reached {
             walk: Walk::from(head, set.clone()),
             base: set,
+            made_at: true,
           }));
         }
         let push = Push::new(self.format);
@@ -508,6 +548,7 @@ impl Repository {
           None => Ok(now(Step::Reached {
             base: Positions::new(),
             walk: Walk::from(head, Positions::new()),
+            made_at: false,
           })),
         }
       }
@@ -533,14 +574,7 @@ impl Repository {
     if let Some(found) = known.filter(|found| *found != key) {
       self.count(|counters| counters.bases_found = counters.bases_found.saturating_add(1));
       let reached = self.sets(store, found.0, found.1)?.reached;
-      let tags = self
-        .chains
-        .get(&found.0)
-        .and_then(|chain| chain.versions.get(found.1))
-        .and_then(|record| record.head)
-        .map(|head| self.tag_chain(store, head))
-        .unwrap_or_default();
-      return Ok(Some(reached.difference(&tags)));
+      return Ok(Some(self.base_set(store, (found, None), reached)));
     }
     for parent in self.parents(store, push, &id)? {
       descent.push(parent, self.generation(store, push, &parent)?);

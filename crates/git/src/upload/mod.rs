@@ -83,7 +83,8 @@ pub const AGENT: &str = concat!("slates/", env!("CARGO_PKG_VERSION"));
 
 /// Format: git's band-3 words for a pack that could not be finished (`upload-pack.c` `create_pack_file`'s
 /// `abort_msg`).
-const ABORT: &[u8] = b"aborting due to possible repository corruption on the remote side.";
+pub(crate) const ABORT: &[u8] =
+  b"aborting due to possible repository corruption on the remote side.";
 
 /// A repository as upload-pack serves it. It is lent afresh for each step of an answer, so a shard's state is never held
 /// across a wait.

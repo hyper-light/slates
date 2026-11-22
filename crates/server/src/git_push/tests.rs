@@ -1597,11 +1597,16 @@ fn stored_zlib(data: &[u8]) -> Vec<u8> {
 
 /// A create of `main` at a root commit whose one file is `bytes` long, as stock git posts it, and the file's name.
 pub(crate) fn large_create(bytes: usize) -> (Vec<u8>, ObjectId) {
-  use slates_git::entry::{self, Header, Representation};
-  use slates_git::object_name::{Kind, name_of};
   let blob: Vec<u8> = (0..bytes)
     .map(|at| u8::try_from(at % 251).unwrap_or(u8::MAX))
     .collect();
+  create_of_file(blob)
+}
+
+/// A create of `main` at a root commit whose one file holds `blob`, as stock git posts it, and the file's name.
+pub(crate) fn create_of_file(blob: Vec<u8>) -> (Vec<u8>, ObjectId) {
+  use slates_git::entry::{self, Header, Representation};
+  use slates_git::object_name::{Kind, name_of};
   let blob_id = name_of(ObjectFormat::Sha1, Kind::Blob, &blob).unwrap();
   let mut tree = b"100644 large\0".to_vec();
   tree.extend_from_slice(blob_id.as_bytes());
@@ -2450,6 +2455,179 @@ fn t_goal93_a_clone_answered_before_its_reach_sets_are_derived_is_whole() {
   });
 }
 
+/// Shape: r16's history at a unit's scale (main's ruling of 2026-11-21 22:40: git/git's master and its tags pushed
+/// whole into an empty repository in one push): the commits of the line, a tag on every [`TAG_EVERY`]th.
+const R16_HISTORY: usize = 1012;
+
+/// Shape: how far apart r16's tags lie on its line: [`R16_HISTORY`] over this is 506 tags, w-sessionlog's count past
+/// which the clone aborted.
+const TAG_EVERY: usize = 2;
+
+/// A commit of one small file of its own, `at`, over `parent`, as a long history's commits are at the scale a unit
+/// test holds: its id and its objects (the commit, its tree, its blob).
+fn line_commit(
+  at: usize,
+  parent: Option<ObjectId>,
+) -> (ObjectId, Vec<(slates_git::object_name::Kind, Vec<u8>)>) {
+  use slates_git::object_name::{Kind, name_of};
+  let blob = format!("commit {at} of the line\n").into_bytes();
+  let blob_id = name_of(ObjectFormat::Sha1, Kind::Blob, &blob).unwrap();
+  let mut tree = b"100644 at\0".to_vec();
+  tree.extend_from_slice(blob_id.as_bytes());
+  let tree_id = name_of(ObjectFormat::Sha1, Kind::Tree, &tree).unwrap();
+  let parent = parent
+    .map(|parent| format!("parent {parent}\n"))
+    .unwrap_or_default();
+  let commit = format!(
+    "tree {tree_id}\n{parent}author A <a@example.com> 1700000000 +0000\n\
+     committer A <a@example.com> 1700000000 +0000\n\nline {at}\n"
+  )
+  .into_bytes();
+  let commit_id = name_of(ObjectFormat::Sha1, Kind::Commit, &commit).unwrap();
+  (
+    commit_id,
+    vec![
+      (Kind::Commit, commit),
+      (Kind::Tree, tree),
+      (Kind::Blob, blob),
+    ],
+  )
+}
+
+/// A-850, r16's shape (main's ruling of 2026-11-21 22:40: git/git's master and its ~1,000 tags pushed whole into an
+/// empty repository in one push never finished encoding, each tag's first version bringing everything its commit
+/// reaches). Do: push a line of [`R16_HISTORY`] commits as `main` and an annotated tag of every [`TAG_EVERY`]th commit,
+/// their commands sent by ref name as git sends them, into an empty repository in one push; derive every version's
+/// sets; sum what each version of each ref brought (D(k), what its fragments encode); encode to the end; fetch every ref
+/// whole. Expect: every ref `ok`; the sum exactly the objects pushed, each brought once (the derived multiple of history
+/// and tags is one on a line: the push's commands are decided oldest commit first, so each create's search back at its
+/// admission meets the move below it, its base, and brings only what that base does not reach); the search's counter
+/// moved and within the history's commits; the encoding ends within its bound; the fetch's pack whole, every object
+/// pushed once. Red before: each tag's first version brought its commit's whole history, about tags times history; with
+/// the search but its commands decided as sent, 9,557 brought against 3,542 (2026-11-21, this Mac).
+#[test]
+fn t_a850_r16_a_history_and_its_tags_pushed_whole_into_an_empty_repository_bring_each_object_once()
+{
+  use slates_git::object_name::Kind;
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let mut objects = Vec::new();
+  let mut commits = Vec::new();
+  let mut parent = None;
+  for at in 0..R16_HISTORY {
+    let (commit, made) = line_commit(at, parent);
+    objects.extend(made);
+    commits.push(commit);
+    parent = Some(commit);
+  }
+  let mut named: Vec<(ObjectId, Vec<u8>)> =
+    vec![(*commits.last().unwrap(), b"refs/heads/main".to_vec())];
+  for (at, commit) in commits
+    .iter()
+    .enumerate()
+    .filter(|(at, _)| at % TAG_EVERY == 0)
+  {
+    let name = format!("v{at}");
+    let (tag, bytes) = tag_object(&name, (*commit, "commit"));
+    objects.push((Kind::Tag, bytes));
+    named.push((tag, format!("refs/tags/{name}").into_bytes()));
+  }
+  assert_eq!(
+    named.len(),
+    R16_HISTORY / TAG_EVERY + 1,
+    "main and 506 tags"
+  );
+  // Sent as git sends a push's commands, by ref name: v0, v10, v100, v1000, v1002, ..., far from the history's order.
+  named.sort_by(|one, other| one.1.cmp(&other.1));
+  let ids: Vec<String> = named.iter().map(|(id, _)| id.to_string()).collect();
+  let commands: Vec<(&str, &str, &[u8])> = named
+    .iter()
+    .zip(&ids)
+    .map(|((_, name), id)| ("", id.as_str(), name.as_slice()))
+    .collect();
+  let pushing = request(&commands, CAPABILITIES, &pack_of_objects(&objects));
+  // The push a poll of its own, and each turn of the derivation and of the encoding below one too: the shard steps
+  // between them, as a daemon's does.
+  let (repository, reasons_pushed) = crate::daemon::observe_first(&daemon, move |state| {
+    let repository = git_repository(state, "r16-shape");
+    (repository, reasons(&pushed(state, repository, &pushing)))
+  });
+  assert!(
+    reasons_pushed.iter().all(|reason| reason == b"ok"),
+    "{reasons_pushed:?}"
+  );
+  let mut turns = 0usize;
+  while crate::daemon::observe_first(&daemon, move |state| {
+    crate::vcs_store::git_derive::turn(state, repository)
+  }) != crate::vcs_store::git_derive::Turned::Idle
+  {
+    turns += 1;
+    assert!(turns < ENCODE_TURNS_BOUND, "a derivation that never ended");
+  }
+  let names: Vec<Vec<u8>> = named.iter().map(|(_, name)| name.clone()).collect();
+  let (brought, searched) = crate::daemon::observe_first(&daemon, move |state| {
+    let keys: Vec<u64> = names
+      .iter()
+      .map(|name| {
+        let name = std::str::from_utf8(name).unwrap();
+        let green = state
+          .db
+          .partition()
+          .repositories()
+          .branch(repository, name.strip_prefix("refs/heads/").unwrap_or(name))
+          .unwrap_or_else(|| panic!("{name} bound"));
+        crate::vcs_store::green_key(green)
+      })
+      .collect();
+    let lent = crate::vcs_store::Lent::new(&mut state.store, &mut state.vcs_stores);
+    let (content, git) = lent.stores.git_ref(repository).expect("the store");
+    let mut brought = 0u64;
+    for key in keys {
+      for version in 0..git.versions(key).len() {
+        brought += git
+          .repository
+          .brought(content, key, version)
+          .unwrap_or_else(|refused| panic!("{key} v{version}: {refused:?}"))
+          .len();
+      }
+    }
+    (brought, git.repository.counters().base_searched)
+  });
+  assert_eq!(
+    brought,
+    u64::try_from(objects.len()).unwrap(),
+    "each object brought once: each tag's first version brings what the tag below it does not reach"
+  );
+  assert!(
+    searched > 0 && searched <= u64::try_from(R16_HISTORY).unwrap(),
+    "the search back met {searched} commits"
+  );
+  let mut turns = 0usize;
+  while crate::daemon::observe_first(&daemon, move |state| {
+    crate::vcs_store::git_encode::turn(state, repository)
+  }) != crate::vcs_store::git_encode::Turned::Idle
+  {
+    turns += 1;
+    assert!(turns < ENCODE_TURNS_BOUND, "an encoding that never ended");
+  }
+  eprintln!("A-850 r16 shape: the encoding ended in {turns} turns");
+  let pushed_ids: std::collections::BTreeSet<ObjectId> = objects
+    .iter()
+    .map(|(kind, bytes)| {
+      slates_git::object_name::name_of(ObjectFormat::Sha1, *kind, bytes).unwrap()
+    })
+    .collect();
+  let wants: Vec<ObjectId> = named.iter().map(|(id, _)| *id).collect();
+  let fetched =
+    crate::daemon::observe_first(&daemon, move |state| fetched_ids(state, repository, &wants));
+  daemon.stop();
+  let set: std::collections::BTreeSet<ObjectId> = fetched.iter().copied().collect();
+  assert_eq!(
+    (fetched.len(), &set),
+    (pushed_ids.len(), &pushed_ids),
+    "the clone holds every object pushed, each once"
+  );
+}
+
 /// `repository`'s tags as `ls-refs` with `peel` lists them to its owner, a line each.
 fn tags_listed_peeled(state: &mut ShardState, repository: RepositoryId) -> Vec<String> {
   use crate::vcs_store::upload::tests::{answered, lines_of, request as upload_request};
@@ -2683,7 +2861,7 @@ fn t_a724_a_pushs_record_names_its_names_once_they_are_homed_in_the_region() {
   let versions = sent.recv().expect("checked");
   assert!(!versions.is_empty(), "no record");
   assert!(
-    versions.iter().all(|version| *version == 5),
+    versions.iter().all(|version| *version == 6),
     "versions {versions:?}"
   );
 }

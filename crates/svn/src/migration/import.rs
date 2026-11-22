@@ -185,6 +185,10 @@ struct OpenText {
   /// A delta's base the repository keeps elsewhere, as its caller supplied it ([`Importing::Base`]); none where the
   /// transaction or the repository holds the base, read from there a window at a time.
   base: Option<Vec<u8>>,
+  /// The bytes a whole text charged the room as it opened, its header's length (its buffer made that size once, so its
+  /// pieces never grow it: P7's finding (2), each growth a copy of the text); zero for a delta, whose windows charge as
+  /// they are made.
+  charged: u64,
 }
 
 impl Importer {
@@ -495,7 +499,9 @@ impl Importer {
       });
     }
     if let Some(section) = header.text {
-      let open = open_text(&path, facts, section)?;
+      let whole = section.delta.is_none();
+      let length = section.length;
+      let mut open = open_text(&path, facts, section)?;
       // A base the records name but keep elsewhere is asked of the caller before a window reads it.
       if let TextForm::Delta {
         base: Some(identity),
@@ -504,6 +510,16 @@ impl Importer {
         && repository.stored_len(&identity).is_some()
       {
         self.wanted_base = Some(identity);
+      }
+      // A whole text's length is its header's: admitted against the room first, then its buffer made once at that size
+      // (the length is checked before anything is allocated for it).
+      if whole && length > 0 {
+        let bytes = usize::try_from(length).map_err(|_| MigrationRefusal::Corrupt)?;
+        open.charged = self.charge(repository, bytes)?;
+        open.bytes.try_reserve_exact(bytes).map_err(|_| MigrationRefusal::Room {
+          needed: length,
+          room: repository.room().bytes,
+        })?;
       }
       self.text = Some(open);
     }
@@ -557,10 +573,19 @@ impl Importer {
     Ok(())
   }
 
-  /// A piece of a whole text.
+  /// A piece of a whole text, into the buffer its opening sized and charged; a piece past the header's length is refused
+  /// `Corrupt`.
   fn text_piece(&mut self, repository: &Repository, bytes: &[u8]) -> Result<(), MigrationRefusal> {
-    self.charge(repository, bytes.len())?;
+    let charged = self.text.as_ref().map_or(0, |open| open.charged);
+    if charged == 0 {
+      self.charge(repository, bytes.len())?;
+    }
     let open = self.text.as_mut().ok_or(MigrationRefusal::Corrupt)?;
+    let after = u64::try_from(open.bytes.len().saturating_add(bytes.len()))
+      .map_err(|_| MigrationRefusal::Corrupt)?;
+    if charged > 0 && after > charged {
+      return Err(MigrationRefusal::Corrupt);
+    }
     open.bytes.extend_from_slice(bytes);
     Ok(())
   }
@@ -612,8 +637,9 @@ impl Importer {
       .as_mut()
       .and_then(|revision| revision.transaction.as_mut())
       .ok_or(MigrationRefusal::Corrupt)?;
+    let charged = if open.charged > 0 { open.charged } else { size };
     transaction.set_text(repository, &node.path, open.bytes, digests)?;
-    self.in_flight = self.in_flight.saturating_sub(size);
+    self.in_flight = self.in_flight.saturating_sub(charged);
     Ok(())
   }
 
@@ -822,6 +848,7 @@ fn open_text(path: &str, facts: Facts, section: TextSection) -> Result<OpenText,
     expected: (section.md5, section.sha1),
     bytes: Vec::new(),
     base: None,
+    charged: 0,
   })
 }
 

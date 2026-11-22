@@ -113,6 +113,11 @@ pub(super) struct Model {
   indexed: BTreeSet<ObjectId>,
   /// Each ref's versions' heads.
   pub(super) heads: BTreeMap<u64, Vec<Option<ObjectId>>>,
+  /// What each ref's first version (no version before it with a head) takes from the version it was made at (A-850):
+  /// that version's reach, less its own tags where its head is not the first version's.
+  bases: BTreeMap<(u64, usize), BTreeSet<ObjectId>>,
+  /// For each commit a version's head peels to, the first such version, in the order the versions were made.
+  peeled: BTreeMap<ObjectId, (u64, usize)>,
   seconds: u64,
 }
 
@@ -128,6 +133,8 @@ impl Model {
       commits: Vec::new(),
       indexed: BTreeSet::new(),
       heads: BTreeMap::new(),
+      bases: BTreeMap::new(),
+      peeled: BTreeMap::new(),
       seconds: 0,
     }
   }
@@ -254,12 +261,70 @@ impl Model {
       .collect()
   }
 
-  /// D(k): what version `version` of `green` reaches and version `version - 1` does not.
+  /// `green`'s next version, at `head` (none: a delete), noted with what it takes from the version it was made at where
+  /// it is a first version (no version before it with a head), and noted under the commit its head peels to (A-850).
+  fn note_version(&mut self, green: u64, head: Option<ObjectId>) {
+    let versions = self.heads.entry(green).or_default();
+    let version = versions.len();
+    let first = versions.last().is_none_or(Option::is_none);
+    if let Some(head) = head.filter(|_| first)
+      && let Some(base) = self.base_of(green, head)
+    {
+      self.bases.insert((green, version), base);
+    }
+    self.heads.entry(green).or_default().push(head);
+    if let Some(head) = head {
+      let commit = self.peel(head);
+      if self.generation.contains_key(&commit) {
+        self.peeled.entry(commit).or_insert((green, version));
+      }
+    }
+  }
+
+  /// What a first version of `green` at `head` takes from the version it is made at, by the design's rule (A-850):
+  /// another ref's version whose head is `head`, taken whole; else one whose head is the commit `head`'s tag names;
+  /// else, back from that commit along its parents, the first commit a version peels to (of any ref, this one's earlier
+  /// versions too), the first such version, less its own tags. None where no version is found.
+  fn base_of(&self, green: u64, head: ObjectId) -> Option<BTreeSet<ObjectId>> {
+    let heading = |id: ObjectId| {
+      self
+        .heads
+        .iter()
+        .any(|(other, heads)| *other != green && heads.last().copied().flatten() == Some(id))
+    };
+    if heading(head) {
+      return Some(self.reach(Some(head)));
+    }
+    let commit = self.peel(head);
+    if commit != head && heading(commit) {
+      return Some(self.reach(Some(commit)));
+    }
+    let mut at = Some(commit).filter(|commit| self.generation.contains_key(commit));
+    while let Some(id) = at {
+      if let Some((other, version)) = self.peeled.get(&id) {
+        let base_head = self.heads[other][*version];
+        let tags: BTreeSet<ObjectId> = base_head
+          .filter(|base_head| self.peel(*base_head) != *base_head)
+          .into_iter()
+          .collect();
+        return Some(self.reach(base_head).difference(&tags).copied().collect());
+      }
+      // A commit's names are its tree, then its parents: a model commit has one at most.
+      at = self.names[&id].get(1).copied();
+    }
+    None
+  }
+
+  /// D(k): what version `version` of `green` reaches and version `version - 1` does not; for a first version made at
+  /// another ref's version, what it reaches and that version does not (A-850).
   fn brought(&self, green: u64, version: usize) -> Vec<ObjectId> {
     let heads = &self.heads[&green];
-    let before = version
-      .checked_sub(1)
-      .map_or_else(BTreeSet::new, |previous| self.reach(heads[previous]));
+    let before = match self.bases.get(&(green, version)) {
+      Some(base) => base.clone(),
+      None => version
+        .checked_sub(1)
+        .map_or_else(BTreeSet::new, |previous| self.reach(heads[previous])),
+    };
     self
       .reach(heads[version])
       .difference(&before)
@@ -352,7 +417,7 @@ fn commit_op(
   }
   model.indexed.extend(objects.iter().map(|object| object.id));
   real.pushed(objects, &[(green, Some(head))]);
-  model.heads.entry(green).or_default().push(Some(head));
+  model.note_version(green, Some(head));
 }
 
 fn at_op(real: &mut Real, model: &mut Model, green: u64, other: u64) {
@@ -360,7 +425,7 @@ fn at_op(real: &mut Real, model: &mut Model, green: u64, other: u64) {
     return;
   };
   real.pushed(Vec::new(), &[(green, Some(head))]);
-  model.heads.entry(green).or_default().push(Some(head));
+  model.note_version(green, Some(head));
 }
 
 fn tag_op(real: &mut Real, model: &mut Model, green: u64, at: usize, annotated: bool) {
@@ -375,7 +440,7 @@ fn tag_op(real: &mut Real, model: &mut Model, green: u64, at: usize, annotated: 
   let objects = model.unindexed(head);
   model.indexed.extend(objects.iter().map(|object| object.id));
   real.pushed(objects, &[(green, Some(head))]);
-  model.heads.entry(green).or_default().push(Some(head));
+  model.note_version(green, Some(head));
 }
 
 fn delete_op(real: &mut Real, model: &mut Model, green: u64) {
@@ -383,7 +448,7 @@ fn delete_op(real: &mut Real, model: &mut Model, green: u64) {
     return;
   }
   real.pushed(Vec::new(), &[(green, None)]);
-  model.heads.entry(green).or_default().push(None);
+  model.note_version(green, None);
 }
 
 pub(super) fn apply(real: &mut Real, model: &mut Model, op: &Op) {

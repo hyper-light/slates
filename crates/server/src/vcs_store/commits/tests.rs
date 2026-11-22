@@ -909,7 +909,7 @@ fn t_c5b_p3_a_git_made_commit_is_answered_only_once_its_changeset_landed_and_com
   );
   assert_eq!(
     seen.1,
-    (true, 1, 1, Some(5u32.to_le_bytes().to_vec())),
+    (true, 1, 1, Some(6u32.to_le_bytes().to_vec())),
     "answered once its changeset landed and both committed, recorded v5"
   );
 }
@@ -919,7 +919,7 @@ fn t_c5b_p3_a_git_made_commit_is_answered_only_once_its_changeset_landed_and_com
 /// landed and before its step commits (as a `kill -9` there leaves it); make the store again from what is durable, as a
 /// restart does; then run the same request again. Expect: after the kill, the state before (the durable head 0, no store
 /// version of the green, the register's records as before the submit, the request not answered); the retry lands once
-/// (one record more than before the submit, version 5), the request answered, the durable head 1, the green at its
+/// (one record more than before the submit, version 6), the request answered, the durable head 1, the green at its
 /// first store version. Before the hook the version and its commit were durable in the verb's step, landed nowhere.
 #[test]
 fn t_c5b_p3_a_kill_between_a_made_commits_landing_and_its_step_recovers_to_before_and_the_retry_lands_once()
@@ -1029,8 +1029,8 @@ fn t_c5b_p3_a_kill_between_a_made_commits_landing_and_its_step_recovers_to_befor
   );
   assert_eq!(
     (after_retry, newest),
-    ((1, 1, held + 1, true), Some(5u32.to_le_bytes().to_vec())),
-    "the retry landed once, recorded version 5, and answered"
+    ((1, 1, held + 1, true), Some(6u32.to_le_bytes().to_vec())),
+    "the retry landed once, recorded version 6, and answered"
   );
 }
 

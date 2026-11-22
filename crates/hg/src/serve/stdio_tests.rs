@@ -8,7 +8,7 @@
 use super::super::Refusal;
 use super::super::getbundle::tests::{Served, cloned, serve_whole, session_stores};
 use super::super::session::{Refused, Step};
-use super::{PastWindow, Progress, Push, Stdio};
+use super::{Output, PastWindow, Progress, Push, Stdio};
 use crate::Admission;
 use crate::push::Outcome;
 use crate::push::check::HeadsArgument;
@@ -564,4 +564,41 @@ fn a_batched_pushkey_is_landed_between_its_neighbours() {
       true,
     )
   );
+}
+
+/// Format: the bytes one SSH data packet carries of an answer, about what the channel takes an offer
+/// ([`output_taken_a_packet_at_a_time_moves_no_byte`]).
+const PACKET_PIECE: usize = 32 * 1024;
+
+/// The SSH clone cut of main 01a20182's fixture round (2026-11-21: `ssh clone-after`, "stream ended unexpectedly (got
+/// 8113614 bytes, expected 16777334)"; reproduced: the watchdog killed the daemon in `vcs_ssh::offer`). Do: write an
+/// answer of 4 MiB into standard output and let the channel take it a packet at a time; then write a second answer
+/// after half of a third was taken. Expect every byte taken in order, no byte moved while the answer is taken in pieces
+/// (each piece once cost a move of every byte behind it, about 64 GiB for a 64 MiB revision), and writing behind a part
+/// taken moves only the part not yet taken, once.
+#[test]
+fn output_taken_a_packet_at_a_time_moves_no_byte() {
+  let answer: Vec<u8> = (0..4 << 20)
+    .map(|at: usize| u8::try_from(at % 251).unwrap())
+    .collect();
+  let mut output = Output::default();
+  output.buffer().extend_from_slice(&answer);
+  let mut taken = Vec::new();
+  while !output.is_empty() {
+    let piece = output.unsent().len().min(PACKET_PIECE);
+    taken.extend_from_slice(&output.unsent()[..piece]);
+    output.taken(piece);
+  }
+  assert!(taken == answer, "every byte taken, in order");
+  assert_eq!(output.moved, 0, "no byte moved while the answer was taken");
+  output
+    .buffer()
+    .extend_from_slice(&answer[..PACKET_PIECE * 2]);
+  output.taken(PACKET_PIECE);
+  output.buffer().extend_from_slice(b"next");
+  assert_eq!(
+    output.moved, PACKET_PIECE as u64,
+    "only the part not taken moved, once"
+  );
+  assert_eq!(output.unsent().len(), PACKET_PIECE + 4);
 }
