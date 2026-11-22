@@ -4177,7 +4177,7 @@ fn svn_step_in(
       .map_err(ReplayRefused::SvnStep)?,
   };
   loop {
-    match records.replay_step(&mut replay, 1) {
+    match records.replay_step(&mut replay) {
       Ok(Some(_)) => return Ok(None),
       Ok(None) if slates_rt::futures::now_ns() >= deadline_ns => return Ok(Some(replay)),
       Ok(None) => {}

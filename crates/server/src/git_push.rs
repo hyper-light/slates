@@ -211,6 +211,9 @@ pub(crate) struct ReceivePack<P = Unpresented> {
   admission: Admission,
   /// The push counted live among its repository's intakes until it drops (A-724, `crate::vcs_share`).
   _live: crate::vcs_share::Live,
+  /// The client's bytes this push read, in all: what it brought, learned as its repository's demand once it is answered
+  /// (A-724 piece 2, `slates_vcs::Learned`).
+  read_bytes: u64,
   /// The push counted decoding on its shard until it drops (A-724, `crate::vcs_share::place`): the load the placement
   /// of A-722's intake off the owner shard reads.
   _decoding: crate::vcs_share::place::Decoding,
@@ -516,6 +519,7 @@ impl<P> ReceivePack<P> {
       session,
       admission: Admission::new(crate::vcs_share::room(state, repository).bytes),
       _live: crate::vcs_share::Live::begin(repository),
+      read_bytes: 0,
       _decoding: crate::vcs_share::place::Decoding::begin(state.shard),
       quarantine: GitPush::begin(&state.vcs_stores, repository),
       unadmitted: None,
@@ -540,6 +544,7 @@ impl<P> ReceivePack<P> {
       session.input_into(bytes, site, admission)
     });
     let bytes_in = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    self.read_bytes = self.read_bytes.saturating_add(bytes_in);
     charge_step(state, self.repository, began, bytes_in);
     let read = read?;
     self.keep_refusal_names()?;
@@ -1081,7 +1086,7 @@ impl<P: crate::git_hooks::PresentView> ReceivePack<P> {
   ) -> Result<Answering, PushFailed> {
     let began = slates_rt::futures::now_ns();
     let stepped = self.answer_turn(state, out);
-    charge_answer(state, self.repository, began, &stepped);
+    charge_answer(state, (self.repository, self.read_bytes), began, &stepped);
     stepped
   }
 
@@ -1181,7 +1186,7 @@ impl<P> ReceivePack<P> {
   ) -> Result<Answering, PushFailed> {
     let began = slates_rt::futures::now_ns();
     let stepped = self.answer_turn(state, out);
-    charge_answer(state, self.repository, began, &stepped);
+    charge_answer(state, (self.repository, self.read_bytes), began, &stepped);
     stepped
   }
 
@@ -1603,10 +1608,10 @@ fn charge_phase(
 }
 
 /// Counts a step of a push's answer that began at `began` (A-724 piece 1), and the push as answered when the step
-/// answered it whole.
+/// answered it whole, its `read_bytes` learned as the repository's demand (A-724 piece 2).
 fn charge_answer(
   state: &mut ShardState,
-  repository: RepositoryId,
+  (repository, read_bytes): (RepositoryId, u64),
   began: u64,
   stepped: &Result<Answering, PushFailed>,
 ) {
@@ -1617,9 +1622,12 @@ fn charge_answer(
   };
   charge_phase(state, repository, began, 0, phase);
   if let Ok(Answering::Answered(_)) = stepped {
-    state
-      .vcs_usage
-      .answered(&repository, Work::Intake, slates_rt::futures::now_ns());
+    state.vcs_usage.answered(
+      &repository,
+      Work::Intake,
+      read_bytes,
+      slates_rt::futures::now_ns(),
+    );
   }
 }
 

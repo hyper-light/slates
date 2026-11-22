@@ -15516,6 +15516,11 @@ and export by landing).
 > `OutOfSequence`). A Subversion repository serves no session while it imports, as a Mercurial one is not lent, so no
 > session reads a revision the register has not committed.
 >
+> **Status (2026-11-21, A-842).** The Subversion records keep no text: a row's text is named stored, its bytes where
+> the records' caller holds them (a daemon's node store and content store, `migration::Standalone` for records
+> standing alone), and a text a revision carries inline is refused `Corrupt`. The records' skip-delta keeping (S4 c2)
+> is gone, with its window reads; the FSFS view writes every text `PLAIN`.
+>
 > **Status (2026-11-21, A-835).** A recorded batch is applied to its green a slice a turn under the shard's quantum
 > (`push::RecordedBatch`, `repository.import_batch.apply_slices`), the landing turn and the import's read gate held to
 > the last slice; a kill between slices recovers from the batch's record. A recovered Subversion green folds to its
@@ -16441,6 +16446,16 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > shard and content homed by identity across shards (5; the homes built: `vcs_store::homes`; intake off the owner owed), the fleet's placement by identity (6, main's ruling first: it
 > amends §4.10's content placement), the many-repository load proof (7), the snapshot sized by its data (8) and a
 > giant repository's index across partitions (9), both designed below.
+
+> **Status (2026-11-21, A-724 piece 2a: the learned demand of admission).** Each answered work's bytes feed its kind's
+> decayed mean on the repository's usage row (`slates_vcs::Learned`): the estimate moves toward a work's bytes by
+> `1 - e^(-Δ/τ)`, `Δ` the gap since the previous answered work and `τ` the repository's own decayed mean gap, learned
+> the same way; the first work's bytes are the first value. A git push carries its byte total to its answer. The room's
+> claims (`vcs_share::demand_of`) read it in place of the lifetime mean: a monorepo whose pushes grew 64-fold claims
+> about the new size after three of them, where its lifetime mean had left a toy 6,437,986,017 of 6,442,445,005 bytes
+> (`t_a724_a_repositorys_claim_follows_its_learned_demand_not_its_lifetime_mean`, red first). Owed in piece 2: the
+> per-principal rates, the working set's miss-ratio curve and memory by marginal utility, CPU weights, and the shares
+> published to siblings.
 
 > **Status (2026-11-20, A-724 piece 3a: one room for every admission).** `crate::vcs_share::room` (`slates-server`) is
 > the one room a version-control work is admitted on its owner shard: git's push as it starts, git's fetch, Mercurial's
@@ -55091,6 +55106,13 @@ Applied in the same change to:
   a heavy principal named exactly; rows apart); `slates-server`
   `git_push::tests::t_a724_a_repositorys_pushes_are_counted_on_its_own_usage_row` (stock git's fixture pushes counted
   on the pushed repository's row, bytes exact, its owner named for each; an idle repository has none).
+- **Piece 2a, the learned demand of admission (2026-11-21).** `slates_vcs::usage::Learned`: per repository and kind
+  of work, the bytes of its answered works as a mean decayed by `1 - e^(-Δ/τ)`, `τ` the repository's own decayed mean
+  gap between answered works (no fixed half-life, D-11; the first work its own first value), a convex combination of
+  the bytes seen (property test). `Ledger::answered` takes the work's bytes; git's push carries its total; the room's
+  claims read it (`vcs_share::demand_of`). Red first: a monorepo grown 64-fold left a toy all but 0.07% of the room on
+  its lifetime mean; on its learned demand, at most the room less half its new size. Tests: slates-vcs `usage` 7/7,
+  slates-server `vcs_share` 11/11, `git_push` 30/30.
 - **Applied in the same change to** §4.17.5 (new), GAPS, amendments.tsv.
 - **Owed.** Pieces 2 to 7 (§4.17.5's status); a fetch's answered count at its pack's last step; Mercurial's and
   Subversion's intakes and reads counted; the rows in `slates status`.
@@ -60178,3 +60200,37 @@ Applied in the same change to:
   an annotated tag of it and a tag of a tag of the commit, every command `ok` and each advertised at its object; `ls-refs`
   with `peel` naming the signed blob's tag peeled to the blob and the tag of a tag peeled to the commit, none for the bare
   blob; a fetch of the three holding them, the inner tag and the commit. Red before: each refused `ref names no tree`.
+
+### A-842 — The Subversion records keep no text; records standing alone hold theirs apart (2026-11-21, w-svn; main's 10:35 item 3 and 14:52 PST "take the KeptText fixture move"; C2 stage B part 2 (b), A-727 (c), A-645 P3, A-819)
+Applied in the same change to:
+- `crates/svn/src/migration/records.rs`: `KeptText`, its skip-delta chains (`text_chain`, `skip_base`), window reads
+  (`made_window`, `range_of`), counters (`texts_made_whole`, `windows_made`), `text_delta`, `text_bytes` and the chained
+  `read_step` removed; `text`, `text_at`, `text_in` and `read_step` answer the bytes the records hold (a property list
+  read as a text); the step refuses a text carried inline `Corrupt`; a replay is two steps (rows, then the rest);
+  module docs "Texts".
+- `crates/svn/src/migration/standalone.rs` (pieces 1 and 2, 41ce54f67 and e465b0e0c): `Standalone`, records with their
+  texts held apart by identity, the crate's tests, integration tests and benches on it; `Repository::take_texts`.
+- `crates/svn/src/fsfs.rs`: `TextDeltas` answers none for the records; docs.
+- `crates/svn/src/commit/revision.rs`: `StepRefusal::Corrupt`'s doc names an inline text.
+- `crates/server/src/vcs_store.rs` (`replay_step` without a row count), `vcs_store/svn_texts.rs` (`HeadTexts`' docs),
+  `repository/svn_commit.rs` (`take_texts` delegates), and the vcs_ssh and presenter tests (piece 2).
+- `crates/svn/examples/changeset_ab.rs` retired; `docs/wip/BENCHMARKS.md` notes it; `docs/wip/GAPS.md`.
+
+- **Why.** Since C2 stage B part 2 (b) a daemon's records name every text stored, its bytes on the node's store. The
+  records still kept texts of their own, as skip-delta svndiffs, for records standing alone: a second text path that
+  only tests, fixtures and benches reached, and a footgun (a caller that forgot to store a text had it kept in RAM).
+- **What.** Records standing alone take their texts the daemon's way (`Standalone`): out of each revision before its
+  step, held apart by identity, the records naming each stored by its length. The records' own keeping is gone. A
+  revision that carries a text inline is refused `Corrupt`, `SVN_ERR_FS_CORRUPT` (`E160004`), the refusal for a text
+  the records do not hold. The FSFS view over records holding no delta writes every text `PLAIN`, as the presenter's
+  view already did. Its `DELTA` writer stays behind `TextDeltas`, with no source answering one: whether to remove it,
+  or feed it per-file deltas derived from the changeset log (Ada's ruling of 2026-11-20 ~13:35), is main's call
+  (GAPS).
+- **Evidence.**
+  - `a_text_carried_inline_is_refused_and_records_standing_alone_hold_it_apart` (red before: bare records kept the
+    text).
+  - slates-svn lib 584/584 (the 6 tests of the kept deltas removed with them), `fsfs_view` 5/5,
+    `propfind_allocations` 1/1.
+  - slates-server `--lib svn` 113/113 (2 ignored), its `svn_texts` fixture taking its other texts out as a landing does.
+  - The ignored git-2000 measurement now prints `records_stored_text_bytes` where it printed `records_text_bytes`.
+  - The stock `svnadmin`/`svnlook` reading of the all-`PLAIN` view is main's run, since there is no svn on the Mac.
