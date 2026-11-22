@@ -7490,3 +7490,21 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   UPDATE 2026-11-21 (w-multirepo, A-843, 87337c6fa on main): the destroy verb exists; git N = 2 macOS arm64 debug:
   "MANY N=2 tools [Git]: 0 failures". Expect hg to show w-hg's PastAdmission {asked: 15, left: 0} leak until its fix
   lands (main 16:48); cite w-hg's red for it.
+
+- w-multirepo (2026-11-21, A-724 piece 7 / A-849, f60f02350 on main; main's 17:22 ruling: CPU equal-weight DRR vs
+  learned weights, the data decides). The many-repository load proof with fetches, as an interleaved release A/B:
+    A = release `slates` built from origin/main (equal-weight DRR per repository, vcs_share::turns)
+    B = release `slates` built from agents/w-balance-turn-weights (7d4d938bc: a turn per distinct principal + spare
+        turns), merged onto the same main
+  for round in 1 2 3; do for bin in A B; do
+    python3 crates/cli/bench/multi_repo_load.py $BIN ~/.cache/g309-scale/src.git v0.99 v1.0.0 v1.5.0 \
+      --steps 1,10,100 --per-repository-cap 3 --fetches
+  done; done
+  Platform: macOS arm64, the big Studio (adas-mac-studio.local-2; needs mem=16g, its own --vcs-store dirs under
+  ~/.cache/slates-bench-stores, removed per daemon). Dataset: a bare clone of git/git at ~/.cache/g309-scale/src.git.
+  Read per step and class: push p99 / fair share (one shard a repository), and the new "class N fetches: ... p99 (Kx
+  alone)". Green: class 0 (the smallest) push and fetch within 2x their fair share / alone at R=100, no refusals, daemon
+  alive. Red: a class-0 ratio past 2x, any refusal storm or a daemon gone; B wins only if it beats A on class 0's p99 in
+  all three rounds without costing the large classes more than it gains (else rejected, recorded in BENCHMARKS).
+  Proved locally (debug, M-series Mac, R=0): push alone 2.3 s, fetch alone 10.3 s, both whole; the steps stopped on this
+  Mac's memory pressure guard (8.9 GB free), as they should.
