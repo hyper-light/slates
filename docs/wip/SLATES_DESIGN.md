@@ -60392,7 +60392,8 @@ Applied in the same change to:
   module docs "Texts".
 - `crates/svn/src/migration/standalone.rs` (pieces 1 and 2, 41ce54f67 and e465b0e0c): `Standalone`, records with their
   texts held apart by identity, the crate's tests, integration tests and benches on it; `Repository::take_texts`.
-- `crates/svn/src/fsfs.rs`: `TextDeltas` answers none for the records; docs.
+- `crates/svn/src/fsfs.rs`: the `DELTA` writer and its `TextDeltas` seam removed (main 01a20182, 21:35); every text
+  `PLAIN`. `crates/server/src/vcs_store/svn_presenter.rs`: `PresentRefusal::DeltaPiece` removed.
 - `crates/svn/src/commit/revision.rs`: `StepRefusal::Corrupt`'s doc names an inline text.
 - `crates/server/src/vcs_store.rs` (`replay_step` without a row count), `vcs_store/svn_texts.rs` (`HeadTexts`' docs),
   `repository/svn_commit.rs` (`take_texts` delegates), and the vcs_ssh and presenter tests (piece 2).
@@ -60405,9 +60406,9 @@ Applied in the same change to:
   step, held apart by identity, the records naming each stored by its length. The records' own keeping is gone. A
   revision that carries a text inline is refused `Corrupt`, `SVN_ERR_FS_CORRUPT` (`E160004`), the refusal for a text
   the records do not hold. The FSFS view over records holding no delta writes every text `PLAIN`, as the presenter's
-  view already did. Its `DELTA` writer stays behind `TextDeltas`, with no source answering one: whether to remove it,
-  or feed it per-file deltas derived from the changeset log (Ada's ruling of 2026-11-20 ~13:35), is main's call
-  (GAPS).
+  view already did. Its `DELTA` writer, with no source answering one, is removed by main 01a20182's ruling of 21:35
+  PST (`fsfs::TextDeltas`, `StoredDelta`, `FilePiece::Delta`, the presenter's `DeltaPiece` refusal): under the changeset
+  ruling (Ada's of 2026-11-20 ~13:35) a per-file delta is derived data, built when a measured item needs one.
 - **Evidence.**
   - `a_text_carried_inline_is_refused_and_records_standing_alone_hold_it_apart` (red before: bare records kept the
     text).

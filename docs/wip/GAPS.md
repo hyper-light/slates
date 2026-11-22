@@ -3177,9 +3177,10 @@
 > them writes every text `PLAIN`, as the presenter's does (the stock `svnadmin` reading of it is main's run: no svn on
 > the Mac); `changeset_ab` reads the records' own deltas and waits on main's call (retire, or derive its deltas);
 > (3) BUILT 2026-11-21, A-842: the records keep no text, a text carried inline refused `Corrupt`, `changeset_ab`
-> retired (its numbers stand in BENCHMARKS at b51f908f2). Owed: the FSFS view's `DELTA` writer has no source now
-> (`fsfs::TextDeltas` answers none everywhere): removed, or fed per-file deltas derived from the changeset log (Ada's
-> ruling of 2026-11-20 ~13:35), main's call; and the stock `svnadmin` reading of the all-`PLAIN` view, main's run).
+> retired (its numbers stand in BENCHMARKS at b51f908f2). The FSFS view's `DELTA` writer, left with no source,
+> REMOVED by main 01a20182's ruling of 21:35 (`fsfs::TextDeltas`, `StoredDelta`, `FilePiece::Delta` and the presenter's
+> `DeltaPiece` refusal gone): under the changeset ruling a per-file delta is derived when a measured item needs one.
+> Owed: the stock `svnadmin` reading of the all-`PLAIN` view, main's run on the big Studio).
 > Stage C,
 > an import as one sliced changeset (today a changeset a record). A submitted version's revision (`svn_made`) takes the
 > one landing order since A-804 (2026-11-21, w-rewrite-ops; main 01:52, the deferred-submit hook, `crate::made_commit`):

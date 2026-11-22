@@ -102,8 +102,6 @@ pub(crate) enum PresentRefusal {
   View(ViewRefusal),
   /// The volume refused a step.
   Volume(VfsError),
-  /// A revision file named a stored delta, which no piece can name (the source answered one; `WithTexts` never does).
-  DeltaPiece,
 }
 
 impl From<ViewRefusal> for PresentRefusal {
@@ -213,7 +211,6 @@ impl Presented {
               len: size,
             }
           }
-          FilePiece::Delta { .. } => return Err(PresentRefusal::DeltaPiece),
         });
       }
       laid
