@@ -69,16 +69,21 @@ jobs:
           echo "== w-hg's give-up line"; grep "a push's intake waited for room and gave up" $A | cut -c1-400 | sort | uniq -c | head -20 || true
           echo "== the typed refusal"; grep -h "needs more room than its repository could ever be lent on its shard" $A $RUNNER_TEMP/matrix-hg/logs/*.log | cut -c1-400 | sort | uniq -c | head -20 || true
           echo "== push-all's log"; tail -c 3000 $RUNNER_TEMP/matrix-hg/logs/push-all.log || true
-          echo "== vcs.hg.push_need_admitted"; python3 -c 'import json,sys
+          echo "== the push's outcome"; grep -E "^(PASS|FAIL) push-all" $RUNNER_TEMP/matrix-hg.out | head -1 | cut -c1-400 || true
+          echo "== past-ceiling log line (typed, at the wait)"; grep "a push's intake needs more than its repository could ever be lent" $A | cut -c1-400 | sort | uniq -c | head -20 || true
+          echo "== the counters (vcs.hg.push_segments_landed, vcs.hg.push_runs_abandoned, vcs.hg.push_need_admitted, the room waits)"; python3 -c 'import json,sys
+          kinds = ["vcs.hg.push_segments_landed", "vcs.hg.push_runs_abandoned", "vcs.hg.push_need_admitted",
+                   "vcs.hg.push_intake_room_waits", "vcs_share.room_waits_given_up", "vcs_share.room_waits_past_ceiling"]
           def walk(o):
               if isinstance(o, dict):
-                  if o.get("kind") == "vcs.hg.push_need_admitted": yield o
+                  if o.get("kind") in kinds: yield o
                   for v in o.values(): yield from walk(v)
               elif isinstance(o, list):
                   for v in o: yield from walk(v)
           hits = list(walk(json.load(open(sys.argv[1]))))
-          print("entries", len(hits), "count", sum(h.get("count", 0) for h in hits))' $RUNNER_TEMP/matrix-hg/status.json || true
-          grep -o '.\{0,120\}vcs\.hg\.push_need_admitted.\{0,120\}' $RUNNER_TEMP/matrix-hg/status.json | head -5 || true
+          for kind in kinds:
+              print(kind, sum(h.get("count", 0) for h in hits if h.get("kind") == kind))' $RUNNER_TEMP/matrix-hg/status.json || true
+          echo "== peak RSS (compare be9279f4f)"; grep -E "daemon peak RSS|^(PASS|FAIL) (push-all|clone|clone-rev|stream-clone) " $RUNNER_TEMP/matrix-hg.out | sort -u | cut -c1-200 || true
           echo "== DIAG turns, by cpu"; grep 'DIAG hg-http turn' $A | sed 's/.*turn //' | sort -t= -k3 -n -r | head -20 || true
           echo "== DIAG begins over 10 ms cpu"; grep 'DIAG hg-http begin' $A | awk '{for(i=1;i<=NF;i++) if($i ~ /^cpu_us=/){split($i,a,"="); if (a[2] > 10000) print}}' | cut -c1-260 || true
           exit $rc
