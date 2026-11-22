@@ -758,7 +758,6 @@ impl Repository {
         let base = match base {
           Some((green, at)) => {
             let reached = values.next().ok_or(wrong)?.reached.clone();
-            let at = usize::try_from(at).map_err(|_| wrong)?;
             self.base_set(store, ((green, at), record.head), reached)
           }
           None => Positions::new(),

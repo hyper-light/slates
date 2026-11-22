@@ -134,6 +134,9 @@ row revprop-svn bash -c "sv propset -q --revprop -r1 svn:log matrix-svn \$0 \
   && [ \"\$(sv propget --revprop -r1 svn:log \$0)\" = matrix-svn ]" "$SVNURL"
 row revprop-ssh bash -c "ss propset -q --revprop -r1 svn:log matrix-ssh \$0 \
   && [ \"\$(ss propget --revprop -r1 svn:log \$0)\" = matrix-ssh ]" "$SSHURL"
+# The same over HTTP (DAV): stock svn changes a revision property with PROPPATCH on the revision's resource.
+row revprop-http bash -c "sh_ propset -q --revprop -r1 svn:log matrix-http \$0 \
+  && [ \"\$(sh_ propget --revprop -r1 svn:log \$0)\" = matrix-http ]" "$HTTPURL"
 row info bash -c "$R info $URL/trunk"
 row ls bash -c "$R ls $URL/trunk"
 row cat bash -c "f=\$($R ls $URL/trunk | grep -v /\$ | head -1) && $R cat $URL/trunk/\$f"

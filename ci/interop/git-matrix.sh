@@ -17,7 +17,12 @@ STEP_LIMIT=${STEP_LIMIT:-3600}
 read -r -a PUSH_REFS <<<"${PUSH_REFS:-refs/heads/*:refs/heads/* refs/tags/*:refs/tags/*}"
 rm -rf "$WORK" && mkdir -p "$WORK" || exit 1
 cd "$WORK" || exit 1
-export GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 HOME="$WORK/home"
+# Stock git outside every configuration but the matrix's own: no system file, the scratch home's file as the global one,
+# and none passed in the environment. A runner may inject keys there (kiln's: GIT_CONFIG_COUNT/KEY_n/VALUE_n with
+# commit.gpgsign and tag.gpgsign true, its own signer and a credential helper), which made every commit and tag sign and
+# fail whenever that signer was down; git_scale.sh shuts them out the same way.
+unset GIT_CONFIG_PARAMETERS GIT_ASKPASS SSH_ASKPASS GIT_DIR GIT_WORK_TREE GIT_PROTOCOL
+export GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_COUNT=0 HOME="$WORK/home" GIT_CONFIG_GLOBAL="$WORK/home/.gitconfig"
 mkdir -p "$HOME"
 git config --global user.name Matrix && git config --global user.email matrix@example.com
 git config --global init.defaultBranch main
