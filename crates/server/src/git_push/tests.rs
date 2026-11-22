@@ -2412,6 +2412,44 @@ fn t_goal93_a_clone_answered_while_the_encoding_is_under_way_is_whole() {
 /// few enough that many fetches meet a version's encoding under way.
 const ENCODING_TURNS_BETWEEN_FETCHES: usize = 1;
 
+/// Goal 93's whole-clone abort, its likely cause (w-sessionlog's reduction: past ~500 tags of git/git a clone stops
+/// waiting for the repository's encoding, `encode_for_fetch`'s bounded wait, which derives each version's reach sets
+/// first, A-614 amended, and is answered with its pack unfinished). Do: push a line of [`PACED_HISTORY`] commits as one
+/// create (its versions' reach sets deferred, as git/git's whole push leaves them), then, with no derivation run, fetch
+/// its head as `git clone` asks. Expect: the fetch answered with no refusal, its pack whole, holding every object pushed,
+/// each once: a fetch costs time, never its answer. Red before the fix: refused, the pack ended with git's abort words.
+#[test]
+fn t_goal93_a_clone_answered_before_its_reach_sets_are_derived_is_whole() {
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
+    let repository = git_repository(state, "underived");
+    let mut objects = Vec::new();
+    let mut parent = None;
+    for at in 0..PACED_HISTORY {
+      let (commit, made) = flat_commit(1, &format!("line {at}"), parent);
+      objects.extend(made);
+      parent = Some(commit);
+    }
+    let head = parent.unwrap();
+    let head_hex = head.to_string();
+    let created = [("", head_hex.as_str(), b"refs/heads/main".as_slice())];
+    let received = pushed(
+      state,
+      repository,
+      &request(&created, CAPABILITIES, &pack_of_objects(&objects)),
+    );
+    assert_eq!(reasons(&received), [b"ok".to_vec()]);
+    let fetched = fetched_ids(state, repository, &[head]);
+    let set: std::collections::BTreeSet<ObjectId> = fetched.iter().copied().collect();
+    let pushed_ids: std::collections::BTreeSet<ObjectId> = objects
+      .iter()
+      .map(|(kind, bytes)| {
+        slates_git::object_name::name_of(ObjectFormat::Sha1, *kind, bytes).unwrap()
+      })
+      .collect();
+    assert_eq!((fetched.len(), &set), (pushed_ids.len(), &pushed_ids));
+  });
+}
+
 /// `repository`'s tags as `ls-refs` with `peel` lists them to its owner, a line each.
 fn tags_listed_peeled(state: &mut ShardState, repository: RepositoryId) -> Vec<String> {
   use crate::vcs_store::upload::tests::{answered, lines_of, request as upload_request};
