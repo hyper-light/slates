@@ -575,3 +575,12 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
   50,000 bytes cloned before, now 0. Reuse after a refused append is impossible by construction (append takes its
   changes by value). w-git and w-hg checked and are clear.
 - Next: piece (c), the batch's commit adopting the scratch member's files instead of re-reading the runs.
+- r29 (main, big Studio): 43a6df642 passed the give-back check 2 of 2, at about 300 MB of footprint. main later found
+  the give-back reading bimodal on every arm (r39); two rounds aren't enough to judge.
+- Piece (c) as a swap was ruled out (w-engine's fast-forward, paused).
+- 4142eb60e landed option 2: `Green::apply_recorded` takes its work mutably and moves a whole run's re-read buffer
+  into the file. Red: the file was a copy. Sampled 108.0 MB to 96.2 MB.
+- Tests: slates-merge all 17 targets; svn 118/118 (three named runs; quiet runs twice stopped by the watchdog at load
+  42-82); git_push, hg_push, store_tests, made_commit green.
+- Left per text: two `read_step`s (the batch's re-read would go with w-engine's fast-forward); the content store's
+  `release_one` copy (w-shared's).
