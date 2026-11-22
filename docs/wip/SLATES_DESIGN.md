@@ -16467,9 +16467,12 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > left: 49 })` before). **Piece 3c (2026-11-21):** a Mercurial push (`hg_push::unbundle`, both edges) is live among the
 > shard's intakes from its start until it ends, begun on its repository's usage row with its principal, and answered
 > there with its bundle's bytes, learned as the repository's demand; before, an hg push left no row and divided no one's
-> room (`a_mercurial_push_is_counted_and_learned_on_its_repositorys_usage_row`, red first). Owed in piece 3: Mercurial's
-> share refusal typed in its words, Subversion's intakes counted live and its words, backpressure before refusal, a
-> fetch's room as a claim of its own.
+> room (`a_mercurial_push_is_counted_and_learned_on_its_repositorys_usage_row`, red first). A Subversion commit is counted
+> the same way at `svn_commit::land_work`, where svn://, svn+ssh and the HTTP edge meet: live while it lands, begun
+> with its principal, answered with its texts' bytes (each text once)
+> (`t_a724_a_subversion_commit_is_counted_and_learned_on_its_repositorys_usage_row`, red first). Owed in piece 3:
+> Mercurial's and Subversion's share refusals typed in their words, Subversion's commit admitted against the room at all
+> (its texts arrive into the conversation's sink unadmitted), backpressure before refusal, a fetch's room as a claim.
 
 > **Status (2026-11-20, A-724 piece 3a: one room for every admission).** `crate::vcs_share::room` (`slates-server`) is
 > the one room a version-control work is admitted on its owner shard: git's push as it starts, git's fetch, Mercurial's
@@ -55146,6 +55149,10 @@ Applied in the same change to:
   whole run and counts it on the usage row (`begun` with its principal, `answered` with its bundle's bytes); the body is
   `unbundled`. Red first: the push left no row. Tests: slates-server `vcs_ssh::tests::hg` 13/13, `repository::hg_push`
   18/18, `vcs_http::hg` 9/9, `hg_view` 7/7, `vcs_share` 12/12.
+- **Piece 3c, Subversion's commit counted (2026-11-21).** `svn_commit::land_work` holds a `vcs_share::Live` guard while it
+  lands and counts the commit on the usage row (`begun`, `answered` with its texts' bytes, each identity once); the body
+  is `landed_work`. Found reading it: no Subversion commit is admitted against the room at all. Red first: no row.
+  Tests: slates-server `svn` 112/112, `repository::svn_commit` 31/31, `vcs_svn` 15/15, `store_tests` 9/9.
 - **Applied in the same change to** §4.17.5 (new), GAPS, amendments.tsv.
 - **Owed.** Pieces 2 to 7 (§4.17.5's status); a fetch's answered count at its pack's last step; Mercurial's and
   Subversion's intakes and reads counted; the rows in `slates status`.

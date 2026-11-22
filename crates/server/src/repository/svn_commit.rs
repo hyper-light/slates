@@ -228,7 +228,52 @@ impl Uncommitted {
 /// and landed through the step ([`landed_with`]: the store, then the register). Committed or refused, the content store
 /// lets go every text the landing put: a committed text is its changeset's on the node's store, read through it (C2
 /// stage B part 2 (b)). None where the shard's state is gone (its shutdown).
+///
+/// The commit is counted as its repository's intake (A-724 piece 3c, §4.17.5): live among the shard's intakes while it
+/// lands (`crate::vcs_share::Live`, so other repositories' rooms are divided meanwhile), begun on the repository's usage
+/// row with its principal, and answered there with its texts' bytes, learned as the repository's next intake
+/// (`slates_vcs::Learned`), once it comes to an answer.
 pub(crate) async fn land_work(
+  (principal, repository): (&Principal, RepositoryId),
+  work: Work,
+  texts: &dyn slates_svn::commit::drive::TextSink,
+) -> Option<Result<Committed, Uncommitted>> {
+  let bytes = texts_bytes(&work);
+  let _live = crate::vcs_share::Live::begin(repository);
+  let _ = crate::state::with_state(|state| {
+    let now = slates_rt::futures::now_ns();
+    state
+      .vcs_usage
+      .begun(&repository, principal, slates_vcs::Work::Intake, now);
+  });
+  let landed = landed_work((principal, repository), work, texts).await;
+  if landed.is_some() {
+    let _ = crate::state::with_state(|state| {
+      let now = slates_rt::futures::now_ns();
+      state
+        .vcs_usage
+        .answered(&repository, slates_vcs::Work::Intake, bytes, now);
+    });
+  }
+  landed
+}
+
+/// The bytes of the texts `work` made, each counted once: what the commit brought.
+fn texts_bytes(work: &Work) -> u64 {
+  let sizes: BTreeMap<ContentIdentity, u64> = work
+    .record
+    .changes
+    .iter()
+    .filter_map(|change| change.text.map(|text| (text.identity, text.size)))
+    .filter(|(identity, _)| work.texts.contains(identity))
+    .collect();
+  sizes
+    .values()
+    .fold(0u64, |total, size| total.saturating_add(*size))
+}
+
+/// [`land_work`]'s landing, uncounted.
+async fn landed_work(
   (principal, repository): (&Principal, RepositoryId),
   work: Work,
   texts: &dyn slates_svn::commit::drive::TextSink,
