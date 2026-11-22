@@ -1,3 +1,6 @@
+# 2026-11-21 17:18 (w-forming): hg concurrency GREEN (main: big Studio, de3fd468a with w-hg's 521fe3689, release,
+# N=10 50, 330 s); the PastAdmission red is closed. Both halves of vcs_concurrency now green. In reserve: no runs.
+
 # 2026-11-21 16:23 (w-forming): main ran vcs_concurrency (big Studio, b61cdf8d1, release, N=2,10,50): svn GREEN
 # (292 s); hg RED at N=10 -- the seed push refused PastAdmission { asked: 15, left: 0 }, an admission leak, now w-hg's
 # first item. Still in goal 93's reserve: no runs.
