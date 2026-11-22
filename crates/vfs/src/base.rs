@@ -140,6 +140,12 @@ pub(crate) struct Listing {
   /// The directory a recovery holds an unreacquired listing to ([`Fingerprint::same_object`]): the image's record, kept
   /// until the first use reacquires it, and written into the next image unchanged. `None` once reacquired.
   recorded: Option<Fingerprint>,
+  /// Whether the directory was used since the idle sweep last looked (A-838): set at every use ([`Overlay::reacquire`]),
+  /// cleared by the sweep, which closes the descriptor of a listing it finds unused ([`Overlay::close_idle_directories`]),
+  /// so a directory's descriptor goes one to two sweep intervals after its last use and a volume no client uses holds
+  /// none. Until 2026-11-21 every listed directory kept its descriptor for the volume's life: kiln's restarted daemon on
+  /// adacachy held 79,038 of them two minutes after its start.
+  used: bool,
   /// The immutable source path below the base root, independent of overlay renames.
   source: Vec<String>,
   fingerprint: Option<Fingerprint>,
@@ -529,6 +535,9 @@ pub struct BasePlane {
   /// Descriptors taken out of `descriptors` by a reclaim that had no host to close them with (the volume reclaims an
   /// inode on its own): closed when the next [`Overlay`] borrow ends. Bounded by `descriptors`, which each left.
   closing: Vec<HostFile>,
+  /// Where the idle-directory sweep resumes ([`Overlay::close_idle_directories`], A-838): the last listing it looked at,
+  /// `None` at the start of a cycle.
+  idle_cursor: Option<InodeNo>,
   /// The base entry each whiteout hides, by (directory inode, name): its fingerprint at the
   /// removal, the landing's witnessed base for a delete (§4.15). Versioned by epoch (A-48).
   whiteouts: Versioned<(InodeNo, Box<str>), Fingerprint>,
@@ -617,6 +626,7 @@ impl BasePlane {
       Listing {
         dir: Some(config.root),
         recorded: None,
+        used: false,
         source: Vec::new(),
         fingerprint: None,
         entries: None,
@@ -637,6 +647,7 @@ impl BasePlane {
       drift_writes: 0,
       descriptors: BTreeMap::new(),
       closing: Vec::new(),
+      idle_cursor: None,
       transient: Vec::new(),
       deferred: Vec::new(),
       whiteouts: Versioned::default(),
@@ -700,6 +711,7 @@ impl BasePlane {
           Listing {
             dir: listing.dir,
             recorded: listing.recorded,
+            used: false,
             source: listing.source.clone(),
             fingerprint: None,
             entries: None,
@@ -1352,6 +1364,17 @@ impl Drop for Overlay<'_> {
   }
 }
 
+/// What one slice of the idle-directory sweep did ([`Overlay::close_idle_directories`], A-838).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IdleDirectories {
+  /// Directories whose descriptor this slice closed: unused since the sweep last looked.
+  pub closed: usize,
+  /// Directories used since the sweep last looked: kept open, and marked unused for the next look.
+  pub held: usize,
+  /// Whether the slice stopped at its deadline before the cycle reached the last listing.
+  pub more: bool,
+}
+
 impl Overlay<'_> {
   /// The volume.
   pub fn volume(&mut self) -> &mut Volume {
@@ -1412,6 +1435,63 @@ impl Overlay<'_> {
     })
   }
 
+  /// One slice of the idle-directory sweep (A-838; §4.5's base plane, the bounded-work rule): from where the last slice
+  /// stopped, each listing but the root's is looked at until `deadline_ns` on the volume's clock. A directory used since
+  /// the last look keeps its descriptor and is marked unused; one unused since closes it, keeping the directory's
+  /// identity (its listing's fingerprint, or the host's answer now) as the record a later use reacquires it by
+  /// ([`Self::reacquire`]: its source path, held to the same object, else `BaseUnavailable`). So a directory's
+  /// descriptor goes one to two sweeps after its last use, and a volume no client uses holds none but its root's. The
+  /// listing's cached entries stay; its watch goes with the descriptor (`HostFs::close_dir`), and its fingerprint is
+  /// compared again at the next use.
+  pub fn close_idle_directories(&mut self, deadline_ns: u64) -> Result<IdleDirectories, VfsError> {
+    let mut done = IdleDirectories::default();
+    loop {
+      let plane = self.vol.base.as_mut().ok_or(VfsError::NotOverlay)?;
+      let root = plane.root;
+      let next = match plane.idle_cursor {
+        Some(after) => plane
+          .listings
+          .range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
+          .next()
+          .map(|(no, _)| *no),
+        None => plane.listings.keys().next().copied(),
+      };
+      plane.idle_cursor = next;
+      let Some(no) = next else {
+        return Ok(done);
+      };
+      if let Some(listing) = plane.listings.get_mut(&no)
+        && let Some(open) = listing.dir
+        && open != root
+      {
+        if listing.used {
+          listing.used = false;
+          done.held = done.held.saturating_add(1);
+        } else {
+          let identity = match listing.fingerprint {
+            Some(known) => Some(known),
+            None => self.host.fingerprint_dir(open).ok(),
+          };
+          match identity {
+            Some(identity) => {
+              listing.dir = None;
+              listing.recorded = Some(identity);
+              listing.watch = WatchState::Unavailable;
+              self.host.close_dir(open);
+              done.closed = done.closed.saturating_add(1);
+            }
+            // A directory the host cannot describe now keeps its descriptor until a later look can.
+            None => done.held = done.held.saturating_add(1),
+          }
+        }
+      }
+      if self.vol.clock.monotonic_ns() >= deadline_ns {
+        done.more = true;
+        return Ok(done);
+      }
+    }
+  }
+
   fn plane(&mut self) -> Result<&mut BasePlane, VfsError> {
     self.vol.base.as_mut().ok_or(VfsError::NotOverlay)
   }
@@ -1438,7 +1518,7 @@ impl Overlay<'_> {
     let now = self.host.now_ns();
     let policy = self.vol.policy;
     let granularity = i64::try_from(self.granularity()).unwrap_or(i64::MAX);
-    let host_dir = self.reacquire(dir_no)?;
+    let host_dir = self.reacquire(store, dir_no)?;
     let plane = self.vol.base.as_mut().ok_or(VfsError::NotOverlay)?;
     let listing = plane
       .listings
@@ -1966,7 +2046,7 @@ impl Overlay<'_> {
         Child::File(no)
       }
       HostKind::Symlink => {
-        let parent_dir = self.listing_dir(parent_no)?;
+        let parent_dir = self.listing_dir(store, parent_no)?;
         let target = self
           .host
           .read_link(parent_dir, &entry.name)
@@ -1984,7 +2064,7 @@ impl Overlay<'_> {
         Child::Symlink(no)
       }
       HostKind::Dir => {
-        let parent_dir = self.listing_dir(parent_no)?;
+        let parent_dir = self.listing_dir(store, parent_no)?;
         let opened = self
           .host
           .open_dir(parent_dir, &entry.name)
@@ -2013,6 +2093,7 @@ impl Overlay<'_> {
           Listing {
             dir: Some(opened),
             recorded: None,
+            used: false,
             source,
             fingerprint: None,
             entries: None,
@@ -2029,8 +2110,8 @@ impl Overlay<'_> {
     Ok(Located { child, inode: no })
   }
 
-  fn listing_dir(&mut self, dir_no: InodeNo) -> Result<HostDir, VfsError> {
-    self.reacquire(dir_no)
+  fn listing_dir(&mut self, store: &Store, dir_no: InodeNo) -> Result<HostDir, VfsError> {
+    self.reacquire(store, dir_no)
   }
 
   /// The open directory of a merged directory's listing, reacquired now if a recovery recorded it and nothing has used it
@@ -2040,18 +2121,26 @@ impl Overlay<'_> {
   /// (§4.8's failure matrix, A-153), as a recovery that reopened it eagerly refused it. Until 2026-11-21 a recovery
   /// reopened every directory the image recorded in one step: kiln's daemon on adacachy recorded about 192,000 and was
   /// killed by the liveness watchdog a second into every restart.
-  fn reacquire(&mut self, dir_no: InodeNo) -> Result<HostDir, VfsError> {
-    let plane = self.vol.base.as_ref().ok_or(VfsError::NotOverlay)?;
+  fn reacquire(&mut self, store: &Store, dir_no: InodeNo) -> Result<HostDir, VfsError> {
+    let plane = self.vol.base.as_mut().ok_or(VfsError::NotOverlay)?;
     if let Some(gone) = plane.unavailable.get(&dir_no) {
       return Err(VfsError::BaseUnavailable(gone.code));
     }
-    let listing = plane.listings.get(&dir_no).ok_or(VfsError::NotOverlay)?;
+    let root = plane.root;
+    let listing = plane
+      .listings
+      .get_mut(&dir_no)
+      .ok_or(VfsError::NotOverlay)?;
     if let Some(open) = listing.dir {
+      // A held directory other than the root owes the idle sweep a look (A-838).
+      if !listing.used && open != root {
+        listing.used = true;
+        store.base_dirs_owed.set(true);
+      }
       return Ok(open);
     }
     let recorded = listing.recorded.ok_or(VfsError::RecoveryIncomplete)?;
     let source = listing.source.clone();
-    let root = plane.root;
     let refused = match recovery::open_source(self.host, root, &source)? {
       Err(refused) => Some((None, refused)),
       Ok(opened) => match self.host.fingerprint_dir(opened) {
@@ -2060,7 +2149,9 @@ impl Overlay<'_> {
           if let Some(listing) = plane.listings.get_mut(&dir_no) {
             listing.dir = Some(opened);
             listing.recorded = None;
+            listing.used = true;
           }
+          store.base_dirs_owed.set(true);
           return Ok(opened);
         }
         Ok(_) => Some((Some(opened), HostError::NotFound)),
@@ -2809,7 +2900,7 @@ impl Overlay<'_> {
       .as_ref()
       .and_then(|b| b.witness_homes.head(&no).cloned())
     {
-      let host_dir = self.listing_dir(parent)?;
+      let host_dir = self.listing_dir(store, parent)?;
       return Ok((host_dir, name.to_string()));
     }
     let inode = self.vol.inode(store, no)?;
@@ -2821,7 +2912,7 @@ impl Overlay<'_> {
       .name_of(&store.blocks, home.hash, no)
       .ok_or(VfsError::NotFound)?
       .to_owned();
-    let host_dir = self.listing_dir(home.parent())?;
+    let host_dir = self.listing_dir(store, home.parent())?;
     Ok((host_dir, name))
   }
 
@@ -2952,7 +3043,7 @@ impl Overlay<'_> {
       return Ok(());
     }
     let home = (parent, node.name.clone());
-    let host_dir = self.listing_dir(no)?;
+    let host_dir = self.listing_dir(store, no)?;
     let fingerprint = self.host.fingerprint_dir(host_dir).map_err(host_refusal)?;
     let witness = Witness {
       fingerprint,
@@ -4072,7 +4163,7 @@ impl Overlay<'_> {
       }
       Since::ChangedDir { no, dir, name } => {
         self.forget_landed(store, &landed.path)?;
-        self.rebase_directory(no, dir, &name, landed.written)
+        self.rebase_directory(store, no, dir, &name, landed.written)
       }
       Since::Other => Ok(()),
     }
@@ -4177,6 +4268,7 @@ impl Overlay<'_> {
   /// as a metadata entry from what landed. Forgotten with the landed entry, it would never land.
   fn rebase_directory(
     &mut self,
+    store: &Store,
     no: InodeNo,
     dir: InodeNo,
     name: &str,
@@ -4185,7 +4277,7 @@ impl Overlay<'_> {
     let fingerprint = match written {
       Some(written) => written.fingerprint,
       None => {
-        let listed = self.listing_dir(no)?;
+        let listed = self.listing_dir(store, no)?;
         self.host.fingerprint_dir(listed).map_err(host_refusal)?
       }
     };
@@ -4294,6 +4386,7 @@ impl Overlay<'_> {
               Listing {
                 dir: Some(opened),
                 recorded: None,
+                used: false,
                 source,
                 fingerprint: None,
                 entries: None,

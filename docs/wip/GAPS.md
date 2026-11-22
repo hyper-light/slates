@@ -16,9 +16,20 @@
 > untouched entries), and an unreacquired one's record goes into the next image unchanged, with no `fstat`. Red on main:
 > 201 host handles after recovering 200 listed directories; green: 1
 > (`a_recovery_reopens_only_the_root_and_reacquires_each_directory_at_its_first_use`).
-> **Still open (main):** (1) a directory listed in this daemon's life keeps its listing and its open directory until the
-> directory leaves the volume: bounded by the directories used, not by a derived budget; the listings need an idle
-> close, now that `reacquire` can reopen any of them. (2) The anchor counts a daemon that died before it served as
+> **Closed (A-838, 2026-11-21): idle base directories close their descriptors.** A use of a base directory marks its
+> listing and owes the idle sweep a look (`Store::base_dirs_owed`, set by `Overlay::reacquire`), which arms a pass; each
+> pass runs every overlay's idle-directory cycle (`Overlay::close_idle_directories`) a slice a turn, half the shard's
+> step quantum each (`crate::idle_sweep::close_idle_directories` in crates/server/src/idle_sweep.rs). A directory used
+> since the last look keeps its descriptor; one unused since closes it, keeping its identity, and is reacquired by its
+> path at its next use (`same_object`, else `BaseUnavailable`); its cached entries stay and its fingerprint is compared
+> again then. A pass that kept any directory arms the next. So a directory's descriptor goes one to two intervals after
+> its last use, and a volume no client uses holds only its root's. Counted `base.idle_dirs_closed`. Green: the vfs
+> sweep's two looks keep then close 20 directories, and a closed one reopens at its next use and shows an outsider's
+> change (`an_idle_base_directory_closes_its_descriptor_and_reopens_at_its_next_use`,
+> `a_closed_directory_shows_an_outsiders_change_at_its_next_use`); on a daemon, 16 listed directories of an idle
+> overlay closed 2.16 s after their last use (1 s interval), the root's descriptor kept
+> (`an_idle_overlays_listed_directories_close_and_its_root_stays_open`, this MacBook at load 44).
+> **Still open (main):** (1) closed by A-838 above. (2) The anchor counts a daemon that died before it served as
 > recovered and never backs off. (3) Witnessed descriptors are bounded only by the large-class copies a volume holds.
 > (4) `image()` still `fstat`s every reacquired directory at each publication.
 > **The descriptor backstop, platform half (w-bugs, A-837; Ada 2026-11-21, "a way to avoid descriptor exhaustion"):

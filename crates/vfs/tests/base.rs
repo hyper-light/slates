@@ -715,6 +715,82 @@ fn an_open_base_file_keeps_its_descriptor_until_its_last_close() {
   );
 }
 
+/// An idle base directory's descriptor is closed by the idle sweep and reopened at its next use (A-838, 2026-11-21). Do:
+/// read one file in each of 20 base directories (the root and the 20 held), run the sweep's look twice, then read a
+/// file in one directory again. Expect: the first look keeps all 20 (each used since) and the second closes all 20 (the
+/// root alone held); the read gets its bytes, reopening that one directory alone. Before, every listed directory kept
+/// its descriptor for the volume's life: kiln's restarted daemon on adacachy held 79,038 two minutes after its start.
+#[test]
+fn an_idle_base_directory_closes_its_descriptor_and_reopens_at_its_next_use() {
+  let mut host = SimHost::new();
+  populate(&mut host, 20, 20);
+  host.advance_ns(2);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  for f in 0..20 {
+    read_all(&mut vol, &mut host, &mut store, &format!("/d{f}/f{f}")).unwrap();
+  }
+  assert_eq!(host.open_handles(), 21, "the root and 20 used directories");
+  assert!(
+    store.base_dirs_owed.get(),
+    "a used directory owes the sweep a look"
+  );
+  let first = vol
+    .with_host(&mut host)
+    .close_idle_directories(u64::MAX)
+    .unwrap();
+  assert_eq!((first.closed, first.held, first.more), (0, 20, false));
+  assert_eq!(host.open_handles(), 21, "each was used since the last look");
+  let second = vol
+    .with_host(&mut host)
+    .close_idle_directories(u64::MAX)
+    .unwrap();
+  assert_eq!((second.closed, second.held, second.more), (20, 0, false));
+  assert_eq!(
+    host.open_handles(),
+    1,
+    "the root alone: no directory is in use"
+  );
+  assert_eq!(
+    read_all(&mut vol, &mut host, &mut store, "/d7/f7").unwrap(),
+    b"file 7"
+  );
+  assert_eq!(
+    host.open_handles(),
+    2,
+    "the root and the one directory used again"
+  );
+}
+
+/// A directory an outsider changes while its descriptor is closed shows the change at its next use (A-838, A-153).
+/// Do: list a base directory, close it by two looks of the idle sweep, add a file to it on the disk, then look the new
+/// file up. Expect the new file's bytes: the directory is reacquired as the same object, and its listing is read again
+/// because its fingerprint moved.
+#[test]
+fn a_closed_directory_shows_an_outsiders_change_at_its_next_use() {
+  let mut host = SimHost::new();
+  host.mkdir("/src");
+  host.replace_file("/src/main.rs", b"fn main() {}");
+  host.advance_ns(2);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  read_all(&mut vol, &mut host, &mut store, "/src/main.rs").unwrap();
+  for _ in 0..2 {
+    vol
+      .with_host(&mut host)
+      .close_idle_directories(u64::MAX)
+      .unwrap();
+  }
+  assert_eq!(host.open_handles(), 1, "src closed");
+  host.advance_ns(10);
+  host.replace_file("/src/lib.rs", b"pub fn lib() {}");
+  host.advance_ns(10);
+  assert_eq!(
+    read_all(&mut vol, &mut host, &mut store, "/src/lib.rs").unwrap(),
+    b"pub fn lib() {}"
+  );
+}
+
 /// A drift re-check the host refuses is reported, never passed (2026-10-07). Do: in the worked example, arm the host
 /// to refuse opening the witnessed `/src/lib.rs` (an I/O error) and ask for the status; then clear the fault and ask
 /// again. Expect: the first status lists `/src/lib.rs` as unverified with the host's refusal and no drift; the

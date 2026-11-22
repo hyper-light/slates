@@ -19,10 +19,22 @@
 //!
 //! **The first pass** is armed when the shard starts, a sweep's interval on, for what a restart left: the recovery
 //! memory no restart reads, given back by an idle pass (A-117).
+//!
+//! **Idle base directories close their descriptors (A-838).** A use of an overlay's base directory marks it and owes
+//! the sweep a look (`Store::base_dirs_owed`, set by `Overlay::reacquire`), which arms a pass. Each pass looks at every
+//! overlay's directories a slice a turn ([`close_idle_directories`]): one used since the last look keeps its
+//! descriptor and is marked unused, one unused since closes it and is reacquired by its path at its next use. So a
+//! directory's descriptor goes one to two intervals after its last use, and a volume no client uses holds only its
+//! root's. A pass that kept any directory (`held`) is not settled and arms the next. Until 2026-11-21 every listed
+//! directory kept its descriptor for the volume's life: kiln's restarted daemon on adacachy held 79,038 of them two
+//! minutes after its start.
 
 use slates_vfs::clock::Clock;
 
 use crate::state::{self, ShardState};
+
+/// Format: the status count of base directories the idle sweep closed (A-838): each unused a whole interval.
+pub(crate) const BASE_DIRS_CLOSED: &str = "base.idle_dirs_closed";
 
 /// Derived: a sweep's interval, how long after what owes it a pass runs: the liveness budget, the reap loop's tick
 /// it replaces (A-99's aging unit: a file is sealed one to two intervals after its last write).
@@ -93,8 +105,64 @@ pub(crate) fn after_borrow(s: &mut ShardState) {
     return;
   }
   let written = std::mem::take(&mut s.store.sweep_owed);
-  if written || arena_seen(s) != s.idle_sweep_seen || s.store.content.arena().deferred_bytes() > 0 {
+  let directories = s.store.base_dirs_owed.take();
+  if written
+    || directories
+    || arena_seen(s) != s.idle_sweep_seen
+    || s.store.content.arena().deferred_bytes() > 0
+  {
     arm(s);
+  }
+}
+
+/// A pass's look at every overlay's base directories (A-838): each volume's idle-directory cycle run to its end, a
+/// slice a turn, each slice bounded by half the shard's step quantum on its clock, the shard yielding between slices.
+/// A volume whose cycle ended this pass is not looked at again in it, so a directory is closed only on a second pass's
+/// look. Whether every directory looked at was idle: a pass that kept any is not settled.
+pub(crate) async fn close_idle_directories() -> bool {
+  let mut done: Vec<slates_mem::Handle<state::VolumeSlot>> = Vec::new();
+  let mut kept = 0usize;
+  loop {
+    let turn = state::with_state(|s| {
+      let deadline = s
+        .clock
+        .monotonic_ns()
+        .saturating_add(s.config.step_quantum_ns() / 2);
+      let (mut closed, mut held, mut more) = (0usize, 0usize, false);
+      let ShardState { volumes, .. } = &mut *s;
+      for (handle, slot) in volumes.iter_mut_all() {
+        if done.contains(&handle) {
+          continue;
+        }
+        let Some(host) = slot.host.as_mut() else {
+          continue;
+        };
+        // A volume whose plane cannot be swept (no longer an overlay) is passed over, as one with nothing to close.
+        let Ok(slice) = slot.volume.with_host(host).close_idle_directories(deadline) else {
+          done.push(handle);
+          continue;
+        };
+        closed = closed.saturating_add(slice.closed);
+        held = held.saturating_add(slice.held);
+        if slice.more {
+          more = true;
+          break;
+        }
+        done.push(handle);
+      }
+      if closed > 0 {
+        s.count(BASE_DIRS_CLOSED, u64::try_from(closed).unwrap_or(u64::MAX));
+      }
+      (held, more)
+    });
+    let Some((held, more)) = turn else {
+      return true;
+    };
+    kept = kept.saturating_add(held);
+    if !more {
+      return kept == 0;
+    }
+    slates_rt::futures::yield_now().await;
   }
 }
 
@@ -196,6 +264,140 @@ mod tests {
     assert!(wrote, "the file was written");
     assert!(armed, "the write armed a pass");
     assert!(swept, "the pass ran: {seen}");
+  }
+
+  /// Shape: the base directories the A-838 test lists under its overlay's root: enough that a sweep closing none, or
+  /// some, cannot pass for one closing all.
+  const LISTED_DIRECTORIES: usize = 16;
+
+  /// The descriptors the host of the shard's only overlay holds now, `None` with no overlay on a disk host.
+  fn base_descriptors(state: &mut crate::state::ShardState) -> Option<usize> {
+    state.volumes.iter_mut_all().find_map(|(_, slot)| {
+      slot
+        .host
+        .as_ref()?
+        .as_disk()
+        .map(|host| host.open_handles())
+    })
+  }
+
+  /// Creates an overlay of `base` and lists its root and then each of its [`LISTED_DIRECTORIES`] directories: the
+  /// descriptors its host held before any listing (the root's) and after them, `None` where a verb was refused.
+  fn overlay_listed(state: &mut crate::state::ShardState, base: String) -> Option<(usize, usize)> {
+    use slates_ipc::protocol::{ReadAt, ReplyBody, RequestBody};
+    let principal = slates_db::catalog::Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    };
+    let ReplyBody::Created { id } = crate::verbs::dispatch(
+      state,
+      1,
+      &principal,
+      RequestBody::Create {
+        name: "idle-dirs".to_owned(),
+        size: slates_ipc::protocol::SizeClass::Bounded { limit: 1 << 20 },
+        names: slates_ipc::protocol::NamePolicy::Exact,
+        require_locked: false,
+        base: Some(base),
+      },
+    ) else {
+      return None;
+    };
+    // The root's descriptor alone, before any listing: listing a directory opens each child directory it finds.
+    let rooted = base_descriptors(state)?;
+    let list = |state: &mut crate::state::ShardState, path: String| {
+      !matches!(
+        crate::verbs::dispatch(
+          state,
+          1,
+          &principal,
+          RequestBody::ReadDir {
+            volume: id,
+            path,
+            at: ReadAt::Head,
+            cursor: 0,
+          },
+        ),
+        ReplyBody::Refused { .. }
+      )
+    };
+    if !list(state, "/".to_owned()) {
+      return None;
+    }
+    for directory in 0..LISTED_DIRECTORIES {
+      if !list(state, format!("/d{directory}")) {
+        return None;
+      }
+    }
+    Some((rooted, base_descriptors(state)?))
+  }
+
+  /// A-838. Do: on a one-shard daemon whose sweep has settled, overlay a scratch directory holding
+  /// [`LISTED_DIRECTORIES`] directories, each with a file; list the root and then each directory, so the overlay's host
+  /// holds a descriptor for each; then leave the volume idle and look until its host holds only what it held before
+  /// any listing, the root's. Expect: the listings opened a descriptor each; the sweep closed every one within a few intervals
+  /// (one to two after the last use), counting each (`base.idle_dirs_closed`), and the root's stayed. Before, every
+  /// listed directory kept its descriptor for the volume's life: kiln's restarted daemon on adacachy held 79,038.
+  #[test]
+  #[allow(clippy::disallowed_methods)] // test code: the overlay's base, made in its own scratch directory
+  fn an_idle_overlays_listed_directories_close_and_its_root_stays_open() {
+    let interval = Duration::from_nanos(super::interval_ns());
+    let dir = crate::git_hooks::tests::ScratchDir::new();
+    for directory in 0..LISTED_DIRECTORIES {
+      let path = dir.path.join(format!("d{directory}"));
+      std::fs::create_dir(&path).expect("a base directory");
+      std::fs::write(path.join("file"), b"base").expect("a base file");
+    }
+    let daemon = crate::daemon::audit_daemon_of(1);
+    let _ = daemon.give_back_recovery_on_every_shard();
+    let first = look_until(&daemon, interval * FIRST_SETTLE_INTERVALS, |state| {
+      passes(state) > 0 && settled(state)
+    });
+    let closed_before = crate::daemon::observe_first(&daemon, |state| {
+      state
+        .refusals
+        .get(super::BASE_DIRS_CLOSED)
+        .copied()
+        .unwrap_or(0)
+    });
+    let base = dir.path.to_string_lossy().into_owned();
+    let listed = crate::daemon::observe_first(&daemon, move |state| overlay_listed(state, base));
+    let rooted = listed.map_or(0, |(rooted, _)| rooted);
+    let begun = Instant::now();
+    let closed = look_until(&daemon, interval * 10, move |state| {
+      base_descriptors(state) == Some(rooted)
+    });
+    let took = begun.elapsed();
+    let (held, counted) = crate::daemon::observe_first(&daemon, |state| {
+      (
+        base_descriptors(state),
+        state
+          .refusals
+          .get(super::BASE_DIRS_CLOSED)
+          .copied()
+          .unwrap_or(0),
+      )
+    });
+    daemon.stop();
+    assert!(first, "the first pass ran and settled the shard");
+    let (rooted, opened) = listed.expect("the overlay was made and its directories listed");
+    assert_eq!(
+      opened,
+      rooted + LISTED_DIRECTORIES,
+      "each listed directory held a descriptor"
+    );
+    assert!(
+      closed,
+      "the idle directories closed within {:?}: the host holds {held:?}, {rooted} before any listing",
+      interval * 10
+    );
+    assert!(
+      counted - closed_before >= LISTED_DIRECTORIES as u64,
+      "the sweep counted each close: {counted} after {closed_before}"
+    );
+    println!(
+      "{LISTED_DIRECTORIES} idle directories closed {took:?} after their last use (a sweep's interval is {interval:?})"
+    );
   }
 
   /// What the shard's sweep has done and owes, for a failure's message.
