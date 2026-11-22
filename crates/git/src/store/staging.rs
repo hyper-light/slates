@@ -29,8 +29,12 @@ use super::{Repository, StoreRefused};
 use crate::object_name::{Kind, ObjectId};
 
 /// A new object as staging meets it: its id, type, the content its row names (its own, or the pack it lies in), its
-/// length, and where its entry begins in that pack for one read from a pack.
-type Fresh = (ObjectId, Kind, ContentId, u64, Option<u64>);
+/// length, and for one read from a pack, its entry there ([`InPackFresh`]).
+type Fresh = (ObjectId, Kind, ContentId, u64, Option<InPackFresh>);
+
+/// A new object's entry in the pack it lies in, as staging meets it (A-864): where it begins, its raw length, the CRC32
+/// of its raw bytes, and a delta's base by name, its position given once the rows are written.
+type InPackFresh = (u64, u64, u32, Option<ObjectId>);
 
 /// A push's seal and stage under way (module docs).
 #[derive(Debug)]
@@ -243,12 +247,21 @@ impl Repository {
     Ok(())
   }
 
-  /// The content the row of the push's object `id` names and where its entry begins there: its own content, held
-  /// whole; or the push's pack its staging put in the store ([`Step::Packing`]) and the entry's offset.
-  fn stored_for_row(push: &Push, id: &ObjectId) -> Result<(ContentId, Option<u64>), StoreRefused> {
+  /// The content the row of the push's object `id` names and its entry there: its own content, held whole; or the push's
+  /// pack its staging put in the store ([`Step::Packing`]) and the entry, its place, raw length, CRC32 and base found
+  /// from the pack the push holds (A-864, `Push::entry_of`).
+  fn stored_for_row(
+    push: &Push,
+    id: &ObjectId,
+  ) -> Result<(ContentId, Option<InPackFresh>), StoreRefused> {
     match push.stored(id) {
       Some(StoredAt::Whole(content)) => Ok((content, None)),
-      Some(StoredAt::InPack(place)) => Ok((place.pack, Some(place.offset))),
+      Some(StoredAt::InPack(place)) => {
+        let (len, crc, base) = push
+          .entry_of(id)
+          .ok_or(StoreRefused::Malformed { id: *id })?;
+        Ok((place.pack, Some((place.offset, len, crc, base))))
+      }
       None => Err(StoreRefused::Unreadable { id: *id }),
     }
   }
@@ -438,11 +451,22 @@ impl Repository {
     fork: &mut Index,
   ) -> Result<(), StoreRefused> {
     let position = self.position_of(store, positions, &id)?;
+    let pack = match offset {
+      Some((offset, raw, crc, base)) => Some(rows::PackedRow {
+        offset,
+        len: raw,
+        crc,
+        base: base
+          .map(|base| self.position_of(store, positions, &base))
+          .transpose()?,
+      }),
+      None => None,
+    };
     let row = ObjectRow {
       kind,
       len,
       position,
-      offset,
+      pack,
       commit: self.commit_row(store, push, positions, &id, kind)?,
     };
     let key = rows::object_key(&id);

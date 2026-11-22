@@ -491,6 +491,23 @@ pub struct Streaming {
   not_served: bool,
   /// The room the last step was given, which sizes the next batch of chunks.
   room_hint: u64,
+  /// The rows' ask being gathered, a window of nodes a step ([`Streaming::rows_held`]).
+  gathering: Option<Gathering>,
+}
+
+/// A [`Want::Rows`] being gathered (main 01a20182's order of 2026-11-22 10:40: a stream of a 57,054-changeset history
+/// spun its shard past a second gathering the changelog's nodes in one step): the logs gathered whole, their walk, the
+/// bytes their rows will take, and the log being gathered, its next revision and its nodes so far.
+#[derive(Debug)]
+struct Gathering {
+  /// Each log gathered: its name and its revisions' nodes, in order.
+  logs: Vec<(Vec<u8>, Vec<Node>)>,
+  /// Those logs as the walk names them.
+  wanted: Vec<Walked>,
+  /// What their rows will take.
+  bytes: u64,
+  /// The log being gathered, its next revision, and its nodes so far.
+  at: (Walked, u32, Vec<Node>),
 }
 
 impl Default for Streaming {
@@ -506,6 +523,7 @@ impl Default for Streaming {
       chunks: VecDeque::new(),
       not_served: false,
       room_hint: 0,
+      gathering: None,
     }
   }
 }
@@ -588,39 +606,69 @@ impl Streaming {
   }
 
   /// Whether the rows of `log` are held, the logs walked before it let go; asks for them when not, with the logs after
-  /// it, as many as the room the last step was given holds (one at least).
+  /// it, as many as the room the last step was given holds (one at least). The ask's nodes are gathered at most a
+  /// content window's worth of rows a step ([`rows_a_step`]), so no step reads a whole log's rows, however long.
   fn rows_held(
     &mut self,
     index: &HgIndex,
     store: &ContentStore,
     log: &Walked,
   ) -> Result<bool, Refused> {
-    while let Some(front) = self.held.front() {
-      if front.log == *log {
-        return Ok(true);
+    if self.gathering.is_none() {
+      while let Some(front) = self.held.front() {
+        if front.log == *log {
+          return Ok(true);
+        }
+        self.held.pop_front();
       }
-      self.held.pop_front();
+      self.gathering = Some(Gathering {
+        logs: Vec::new(),
+        wanted: Vec::new(),
+        bytes: 0,
+        at: (log.clone(), 0, Vec::new()),
+      });
     }
     let row_bytes = to_u64(core::mem::size_of::<StoredRevision>());
-    let (mut logs, mut wanted, mut bytes) = (Vec::new(), Vec::new(), 0_u64);
-    let mut next = Some(log.clone());
-    while let Some(at) = next {
+    let mut budget = rows_a_step(store);
+    let Some(gathering) = self.gathering.as_mut() else {
+      return Ok(false);
+    };
+    loop {
+      let (at, rev, nodes) = &mut gathering.at;
       let count = index.len(store, at.log());
-      let cost = u64::from(count).saturating_mul(row_bytes);
-      if !logs.is_empty() && bytes.saturating_add(cost) > self.room_hint {
-        break;
+      if *rev == 0 {
+        let cost = u64::from(count).saturating_mul(row_bytes);
+        if !gathering.logs.is_empty() && gathering.bytes.saturating_add(cost) > self.room_hint {
+          break;
+        }
+        gathering.bytes = gathering.bytes.saturating_add(cost);
+        nodes
+          .try_reserve_exact(usize::try_from(count).map_err(|_| Refused::TooLong)?)
+          .map_err(|_| Refused::TooLong)?;
       }
-      bytes = bytes.saturating_add(cost);
-      let mut nodes = Vec::with_capacity(usize::try_from(count).map_err(|_| Refused::TooLong)?);
-      for rev in 0..count {
-        nodes.push(node_of(index, store, &at, rev)?);
+      while *rev < count {
+        if budget == 0 {
+          return Ok(false);
+        }
+        nodes.push(node_of(index, store, at, *rev)?);
+        *rev = rev.saturating_add(1);
+        budget = budget.saturating_sub(1);
       }
-      logs.push((at.stored_name(), nodes));
-      next = next_log(&at, index, store);
-      wanted.push(at);
+      let next = next_log(at, index, store);
+      let done = core::mem::take(nodes);
+      gathering.logs.push((at.stored_name(), done));
+      gathering.wanted.push(at.clone());
+      match next {
+        Some(next) => gathering.at = (next, 0, Vec::new()),
+        None => break,
+      }
     }
-    self.want = Some(Want::Rows { logs });
-    self.wanted_logs = wanted;
+    if let Some(gathering) = self.gathering.take() {
+      self.want = Some(Want::Rows {
+        logs: gathering.logs,
+      });
+      self.wanted_logs = gathering.wanted;
+    }
     Ok(false)
   }
 
@@ -858,6 +906,12 @@ fn first_log(index: &HgIndex, store: &ContentStore) -> Option<Walked> {
     Some((path, _, _)) => Some(Walked::File(path)),
     None => next_log(&Walked::File(Vec::new()), index, store),
   }
+}
+
+/// Derived: the rows a stream's step reads to gather an ask ([`Streaming::rows_held`]): a content window's worth of
+/// their stored form, the store's own unit of a step (as a long revision is taken a window a step), one at least.
+pub(crate) fn rows_a_step(store: &ContentStore) -> u64 {
+  (to_u64(store.window()) / to_u64(core::mem::size_of::<StoredRevision>()).max(1)).max(1)
 }
 
 /// The log after `log` in the walk's order that holds a revision.

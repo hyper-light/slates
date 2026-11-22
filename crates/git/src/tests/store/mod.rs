@@ -395,7 +395,7 @@ fn commit_row() -> ObjectRow {
     kind: Kind::Commit,
     len: 210,
     position: 7,
-    offset: None,
+    pack: None,
     commit: Some(CommitRow {
       tree: 5,
       date: 1_700_000_000,
@@ -415,7 +415,23 @@ fn an_object_row_reads_back_and_a_hostile_one_is_refused() {
     commit: None,
     ..commit_row()
   };
-  for row in [blob_row.clone(), commit_row()] {
+  // A-864: a row of an object in a pack keeps its entry's place, raw length, CRC32 and base, a delta's and a whole one's.
+  let in_pack = |base| ObjectRow {
+    pack: Some(crate::store::rows::PackedRow {
+      offset: 12,
+      len: 345,
+      crc: 0xDEAD_BEEF,
+      base,
+    }),
+    ..blob_row.clone()
+  };
+  for row in [
+    blob_row.clone(),
+    commit_row(),
+    in_pack(None),
+    in_pack(Some(0)),
+    in_pack(Some(9)),
+  ] {
     assert_eq!(rows::decode(&rows::encode(&row)), Some(row));
   }
   let encoded = rows::encode(&commit_row());

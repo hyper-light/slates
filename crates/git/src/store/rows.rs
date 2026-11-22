@@ -7,14 +7,19 @@
 //! integers little-endian:
 //!
 //! ```text
-//! row    = kind (u8, the pack's number) | length (u64) | position (u64) [| offset (u64)] [| commit]
+//! row    = kind (u8, the pack's number) | length (u64) | position (u64) [| entry] [| commit]
+//! entry  = offset (u64) | raw length (u64) | CRC32 (u64, its low half) | base (u64, a position plus one; 0 for none)
 //! commit = tree (u64, a position) | date (u64) | generation (u64) | parents (u32) | each parent (u64, a position)
 //! ```
 //!
 //! **An object in a pack** (A-722's record v4, rows by pack place): its row names the pack the push brought it in, held
 //! once as content, and carries where its entry begins there (`offset`), the kind's byte marked [`IN_PACK`]; the object
 //! is read where it lies (`store::packed`), never held a second time inflated. An object held whole (the server's own
-//! commits) names its own content and carries no offset.
+//! commits) names its own content and carries no entry. With its offset the row keeps what git's pack index keeps of the
+//! entry, and its base, all found once as the push is staged (A-864): the entry's raw length (header and compressed data),
+//! the CRC32 of those raw bytes, and for a delta the position of the object it is a delta against. A fetch sends the
+//! entry on as it lies by these alone: its CRC checked, its bytes copied, no object read (git's own reuse checks no more,
+//! `builtin/pack-objects.c`'s `write_reuse_object`).
 //!
 //! A row holds nothing known only once its push lands, so a push can write its rows as its objects arrive (A-722): the
 //! version that brought an object is the repository's landing map's, by position (`Repository::bringer_of`). A commit's part
@@ -28,14 +33,15 @@ use crate::object_name::{Kind, ObjectFormat, ObjectId};
 
 use super::naming::kind_of;
 
-/// Format: the most bytes of an object row's payload but a commit's part: its type and three words, an in-pack row's
-/// offset the third (A-722's room).
-pub const OBJECT_PAYLOAD_BYTES: usize = 1 + 3 * WORD_BYTES;
+/// Format: the most bytes of an object row's payload but a commit's part: its type, its length and position, and an
+/// in-pack row's entry, four words (A-722's room; A-864).
+pub const OBJECT_PAYLOAD_BYTES: usize = 1 + 6 * WORD_BYTES;
 
 /// Format: the bytes of a commit's part but its parents: three words and the parents' count.
 pub const COMMIT_PART_BYTES: usize = 3 * WORD_BYTES + COUNT_BYTES;
 
-/// Format: the mark on an object row's kind byte for an object read from a pack, an offset word following its position.
+/// Format: the mark on an object row's kind byte for an object read from a pack, its entry's four words following its
+/// position.
 pub const IN_PACK: u8 = 0x80;
 
 /// Format: the first byte of an object row's key, which the object's id follows.
@@ -59,11 +65,23 @@ pub struct ObjectRow {
   pub len: u64,
   /// Its position.
   pub position: u64,
-  /// Where its entry begins in the pack its row names, for an object read from a pack (module docs); `None` for one
-  /// held whole.
-  pub offset: Option<u64>,
+  /// Its entry in the pack its row names, for an object read from a pack (module docs); `None` for one held whole.
+  pub pack: Option<PackedRow>,
   /// A commit's part; `None` for any other type.
   pub commit: Option<CommitRow>,
+}
+
+/// What an object row keeps of its object's entry in the pack the row names (module docs; A-864).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PackedRow {
+  /// Where the entry begins.
+  pub offset: u64,
+  /// Its raw length: its header and its compressed data.
+  pub len: u64,
+  /// The CRC32 of those raw bytes, as git's pack index keeps it.
+  pub crc: u32,
+  /// For a delta, the position of the object it is a delta against; `None` for a whole entry.
+  pub base: Option<u64>,
 }
 
 /// A commit's part of its row (module docs).
@@ -97,13 +115,16 @@ pub fn position_key(position: u64) -> Vec<u8> {
 
 /// An object row's payload.
 pub fn encode(row: &ObjectRow) -> Vec<u8> {
-  let mark = if row.offset.is_some() { IN_PACK } else { 0 };
+  let mark = if row.pack.is_some() { IN_PACK } else { 0 };
   let mut out = vec![row.kind.pack_number() | mark];
   for word in [row.len, row.position] {
     out.extend_from_slice(&word.to_le_bytes());
   }
-  if let Some(offset) = row.offset {
-    out.extend_from_slice(&offset.to_le_bytes());
+  if let Some(pack) = row.pack {
+    let base = pack.base.map_or(0, |base| base.saturating_add(1));
+    for word in [pack.offset, pack.len, u64::from(pack.crc), base] {
+      out.extend_from_slice(&word.to_le_bytes());
+    }
   }
   if let Some(commit) = &row.commit {
     for word in [commit.tree, commit.date, commit.generation] {
@@ -152,8 +173,19 @@ pub fn decode(payload: &[u8]) -> Option<ObjectRow> {
   let kind = kind_of(marked & !IN_PACK)?;
   let mut fields = Fields { bytes: rest };
   let (len, position) = (fields.word()?, fields.word()?);
-  let offset = if marked & IN_PACK != 0 {
-    Some(fields.word()?)
+  let pack = if marked & IN_PACK != 0 {
+    let (offset, len, crc, base) = (
+      fields.word()?,
+      fields.word()?,
+      fields.word()?,
+      fields.word()?,
+    );
+    Some(PackedRow {
+      offset,
+      len,
+      crc: u32::try_from(crc).ok()?,
+      base: base.checked_sub(1),
+    })
   } else {
     None
   };
@@ -166,7 +198,7 @@ pub fn decode(payload: &[u8]) -> Option<ObjectRow> {
     kind,
     len,
     position,
-    offset,
+    pack,
     commit,
   })
 }

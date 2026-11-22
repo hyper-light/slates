@@ -52,7 +52,7 @@ use super::packed::{self, InPack, PackSource};
 use super::positions::Positions;
 use super::push::StoredAt;
 use super::repository::{Repository, StoreRefused};
-use super::rows::ObjectRow;
+use super::rows::{self, ObjectRow};
 use super::upload::{Progress, Turn};
 
 /// An object's place in the encoding's order: its type, its length (the largest first), its id, and its position.
@@ -163,13 +163,13 @@ fn copying_of(
       stored,
       base,
     },
-    object: ToEncode {
+    object: Some(ToEncode {
       id: object.id,
       position: object.position,
       kind: object.kind,
       bytes: object.bytes.clone(),
       named: None,
-    },
+    }),
     place,
     from: raw.data,
     end: raw.end,
@@ -178,10 +178,11 @@ fn copying_of(
 }
 
 /// A pushed entry being copied into a part (A-859): its record (its CRC once its last byte is copied), its object (kept
-/// as a candidate base after), where its data lies and how far it is copied, and the CRC of what is copied so far.
+/// as a candidate base after, where it was read: one sent on by its kept CRC32 is not, A-864), where its data lies and
+/// how far it is copied, and the CRC of what is copied so far.
 struct Copying {
   placed: Placed,
-  object: ToEncode,
+  object: Option<ToEncode>,
   place: InPack,
   from: u64,
   end: u64,
@@ -297,6 +298,8 @@ pub struct EncodingCounters {
   pub reuse_refused: u64,
   /// Objects that lie in no pack the store holds (kept as content), encoded with no entry to reuse (A-859).
   pub reuse_no_entry: u64,
+  /// Objects whose pushed entry's raw bytes did not match the CRC32 its row keeps (A-864), read and judged instead.
+  pub reuse_crc_missed: u64,
   /// Objects whose pushed entry could not be read, or whose offset delta's base is no object of this encoding, encoded
   /// instead (A-859).
   pub reuse_unread: u64,
@@ -604,8 +607,8 @@ impl Encoding {
     let (row, content) = repository
       .indexed(store, &id)
       .ok_or(StoreRefused::Missing { id })?;
-    if let Some(offset) = row.offset {
-      self.offsets.insert((content, offset), id);
+    if let Some(packed) = row.pack {
+      self.offsets.insert((content, packed.offset), id);
     }
     let order = if row.kind == Kind::Blob {
       &mut self.blobs
@@ -708,10 +711,12 @@ impl Encoding {
             ..
           } = *copying;
           placed.crc = crc.finalize();
-          let learning = repository.learning(exchange);
-          part
-            .encoder
-            .remember(object, (placed.offset, placed.depth), &learning);
+          if let Some(object) = object {
+            let learning = repository.learning(exchange);
+            part
+              .encoder
+              .remember(object, (placed.offset, placed.depth), &learning);
+          }
           part.place(placed);
           self.counters.objects = self.counters.objects.saturating_add(1);
           None
@@ -811,6 +816,75 @@ impl Encoding {
     Some((header, copying))
   }
 
+  /// `id`'s pushed entry sent on as it lies by what its row keeps of it (A-864, `rows::PackedRow`; git's
+  /// `write_reuse_object`): its header read, the CRC32 of its raw bytes checked against the kept one, a delta's base by
+  /// the position its row names, placed as [`Encoding::placement`] places one; its header written at `at` and its data to
+  /// copy, no object read. None where its CRC32 misses (counted `reuse_crc_missed`), its header cannot be read, or its
+  /// base is not placed: the object is then read and judged as before.
+  fn reused_as_kept(
+    &mut self,
+    repository: &Repository,
+    store: &ContentStore,
+    (part, (id, position, kind), place, packed): (
+      &Part,
+      (ObjectId, u64, Kind),
+      InPack,
+      rows::PackedRow,
+    ),
+    at: u64,
+  ) -> Option<(Vec<u8>, Copying)> {
+    let room = repository.largest_object();
+    let (header, data) = packed::entry_header(store, (place, repository.format()), room).ok()?;
+    if packed::raw_crc(store, place, packed.len).ok() != Some(packed.crc) {
+      self.counters.reuse_crc_missed = self.counters.reuse_crc_missed.saturating_add(1);
+      return None;
+    }
+    let base_id = match (header.representation, packed.base) {
+      (Representation::Whole(whole), None) if whole == kind => None,
+      (Representation::OfsDelta { .. } | Representation::RefDelta { .. }, Some(base)) => {
+        Some(repository.id_at(store, base)?)
+      }
+      _ => return None,
+    };
+    let (representation, depth, stored, base) =
+      self.placement(repository, store, (part, kind, base_id))?;
+    let mut written = Vec::new();
+    entry::write(
+      entry::Header {
+        representation,
+        size: header.size,
+      },
+      at,
+      &mut written,
+    )
+    .ok()?;
+    if stored == Stored::Whole {
+      self.counters.reused_whole = self.counters.reused_whole.saturating_add(1);
+    } else {
+      self.counters.reused_deltas = self.counters.reused_deltas.saturating_add(1);
+    }
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(&written);
+    let copying = Copying {
+      placed: Placed {
+        id,
+        position,
+        kind,
+        offset: at,
+        crc: 0,
+        depth,
+        stored,
+        base,
+      },
+      object: None,
+      place,
+      from: data,
+      end: place.offset.saturating_add(packed.len),
+      crc,
+    };
+    Some((written, copying))
+  }
+
   /// How a reused entry of `kind` names its base `base_id` (A-859): whole; an offset delta to an earlier entry of this
   /// part, its chain within the deepest any push carried; or a reference delta to an object of an earlier version,
   /// beginning a chain. Its representation, its chain's depth, how it holds its object and its base's record; none where
@@ -852,31 +926,19 @@ impl Encoding {
 
   /// The base to place before the object `row` names (A-859, git's `write_one`): where its pushed entry is a delta
   /// against an object still in the part's order, not yet placed, within the deepest chain any push carried, that
-  /// base taken out of the order to go first. Read from the entry's header alone; none to go on with the object.
+  /// base taken out of the order to go first. Read from the base its row keeps (A-864); none to go on with the object.
   fn base_first(
     &mut self,
     repository: &Repository,
     store: &ContentStore,
     (part, blobs): (&Part, bool),
-    (row, content): (&ObjectRow, ContentId),
+    (row, _content): (&ObjectRow, ContentId),
   ) -> Option<Key> {
-    let StoredAt::InPack(place) = repository.stored_of(row, content) else {
-      return None;
-    };
     if to_u64(self.ahead.len()) >= repository.learned_depth() {
       return None;
     }
-    let header = packed::entry_header(
-      store,
-      (place, repository.format()),
-      repository.largest_object().max(row.len),
-    )
-    .ok()?;
-    let base = match header.representation {
-      Representation::Whole(_) => return None,
-      Representation::OfsDelta { base } => *self.offsets.get(&(place.pack, base))?,
-      Representation::RefDelta { base } => base,
-    };
+    // A-864: a delta's base by the position its row keeps, of any version, no header read.
+    let base = repository.id_at(store, row.pack?.base?)?;
     if part.placed_of(&base).is_some() {
       return None;
     }
@@ -923,6 +985,27 @@ impl Encoding {
         part: Box::new(part),
         current: None,
       });
+    }
+    // A-864: an entry its row keeps is sent on by its CRC32, its object never read.
+    if let Some(packed) = row.pack {
+      let at = PACK_HEADER_LEN.saturating_add(to_u64(part.bytes.len()));
+      let place = repository.stored_of(&row, content);
+      if let StoredAt::InPack(place) = place
+        && let Some((header, copying)) = self.reused_as_kept(
+          repository,
+          store,
+          (&part, (id, position, row.kind), place, packed),
+          at,
+        )
+      {
+        let mut part = part;
+        part.bytes.extend_from_slice(&header);
+        return Ok(Stage::Encode {
+          blobs,
+          part: Box::new(part),
+          current: Some(Box::new(Current::Copy(Box::new(copying)))),
+        });
+      }
     }
     let object = Reading {
       id,

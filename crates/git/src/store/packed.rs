@@ -752,9 +752,29 @@ pub fn entry_header(
   store: &dyn PackSource,
   (place, format): (InPack, ObjectFormat),
   room: u64,
-) -> Result<entry::Header, PackedRefused> {
+) -> Result<(entry::Header, u64), PackedRefused> {
   let mut header = Vec::new();
-  header_at(store, place, format, (&mut header, room)).map(|(found, _)| found)
+  header_at(store, place, format, (&mut header, room))
+}
+
+/// The CRC32 of the `len` raw bytes at `place` in a held pack (A-864): what git's pack index keeps of an entry, its
+/// header and compressed data read a window at a time, nothing inflated. Refused as [`read`] refuses a piece it cannot
+/// read, or where the pack ends first.
+pub fn raw_crc(store: &dyn PackSource, place: InPack, len: u64) -> Result<u32, PackedRefused> {
+  let mut hasher = crc32fast::Hasher::new();
+  let mut left = len;
+  each_window_from(store, place, |piece| {
+    let take = usize::try_from(left).unwrap_or(usize::MAX).min(piece.len());
+    hasher.update(piece.get(..take).unwrap_or_default());
+    left = left.saturating_sub(u64::try_from(take).unwrap_or(u64::MAX));
+    left > 0
+  })?;
+  if left > 0 {
+    return Err(PackedRefused::Unread {
+      at: place.offset.saturating_add(len.saturating_sub(left)),
+    });
+  }
+  Ok(hasher.finalize())
 }
 
 /// The entry at `place` in a held pack as it lies there ([`RawEntry`], A-859): its header read, and its data inflated

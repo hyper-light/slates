@@ -229,9 +229,14 @@
 >   `PREEMPT_LAZY`, `RUN_TO_PARITY`, 2.1 ms base slice) a woken shard waited for its CPU: kick -> run p50 920 µs, and
 >   8 µs in `SCHED_RR`. But with the shards and the client's park in the class, the client's own time-share code still
 >   waits whole slices: accept p99 0.94-2.6 ms, p999 3.0-4.8 ms, and the spinners lost 20-27% of their throughput. The
->   runner account's `RLIMIT_RTPRIO` is 0:0, so even that needs an administrator's grant. **Open:** 84a's Linux bar
->   under two spinners a CPU, short of user code at real-time priority (ruled out) or a less oversubscribed lane, main's
->   call.
+>   runner account's `RLIMIT_RTPRIO` is 0:0, so even that needs an administrator's grant.
+>   EEVDF's requested slice (arm E, no privilege; BENCHMARKS "84a on Linux: EEVDF's requested slice") cut the loaded
+>   tail with the neighbours' share level (x86 p999 3.2-6.1 -> ~1.9 ms). But a wakeup's p99 pins at one tick (kick ->
+>   run 998-999 µs, the client's wake 983-989 µs under `PREEMPT_LAZY` at `HZ=1000`), so a loaded edit and merge floors
+>   at about 1.3-2.0 ms p99. It also cost x86's quiet p50 30-40%, so it is rejected too.
+>   **Open (main to Ada):** 84a's 1 ms loaded bar on Linux. In the fair class it is below the kernel's 1 ms tick, and
+>   in the real-time class the client's own time-share code waits whole slices. The measured floor is about one tick a
+>   hop, 1.3-2.0 ms p99.
 > - Windows (CI, run 44857045148): no 1 ms band (queued p99 5–49 µs); accept p99 0.13–0.31 ms, conflict 0.11–0.29 ms;
 >   p999 0.2–62 ms. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–7).
 >
@@ -599,6 +604,19 @@
 >   whole run, past the patience for a long enough one; the structural fix is a per-push staging log, the run landing
 >   apart from the repository's log and named in one step, so pushes to one repository need no turn between them.
 >   Owed, main's: the whole-history push on ubuntu and its peak RSS before and after (run-requests.md).
+> - The whole history's clones spun (main 01a20182's order of 2026-11-22 10:40; CI 45037561866: 4 spins, kills and
+>   restarts a leg, at `vcs_http.rs:850` polls 1-16 and `vcs_ssh::hg::streamed_turn` polls ~11,000). Measured over the
+>   served view of a pushed 57,054-changeset line (debug, MacBook arm64, each call the unit one step takes): a clone of
+>   the line's middle (`clone -r`, every pull with something in common too) made its changesets' and manifests' groups
+>   whole in its walk's begin, 4.1 s; a stream gathered the rows of as many logs as its room holds, every revision's
+>   node, in one step. BUILT (w-hg): `getbundle::Named` walks such a fetch a unit a step (a changeset written and its
+>   manifest's files planned, then a manifest a step in its log's order, then the file section), its begin lending no
+>   text (`a_pull_walked_by_its_changesets_lends_no_text_in_its_begin_and_two_at_most_a_step`; the begin at 20,000
+>   changesets 674 to 23 ms), a manifest lent twice, a step each, never kept past it; a stream gathers an ask a content
+>   window's worth of rows a step (`render::rows_a_step`;
+>   `a_streams_ask_for_a_long_logs_rows_is_gathered_a_window_a_step`). Still a walk of the history a call, each well
+>   under the watchdog's window in release: `heads` 194 ms and `branchmap` 603 ms at 57,054 in debug; next if a run
+>   names them.
 > - Part 3, a manifest's written entries kept once BUILT (2026-11-22, w-hg; main's 05:13 order): a whole or null-base
 >   manifest revision's written entries are its every line, and each was kept for the files' check once a snapshot,
 >   the bulk of a whole-history push's 1.37 GB held (main's 04:59 measure). Now a manifest's entries are a step's
@@ -751,6 +769,10 @@
 > edge's writes that waited for the peer, cold at deflate's measured break-even at git's level 6 (§4.11). Owed: the
 > SSH edge's writes heard (SSH fetches price cold), a price per client, not per shard; main's git/git whole round and
 > `fsck --strict`.
+> A-864 BUILT (2026-11-22, w-git; main's r17): a reused pushed entry was rebuilt to be checked (inflated, its base and
+> itself reconstructed, named), so git/git's clone, every entry reused, ran past 120 s. Now each row keeps its entry's
+> raw length, CRC32 and base (git's pack index, A-864); reuse checks the CRC32 and copies, no object read; a miss is
+> rebuilt. Owed: main's git/git whole round.
 > A-860 BUILT (2026-11-22, w-git): a repository gone idle lets go of the objects its reads keep (git.recent_bytes held
 > 53.9 MB after a git/git clone). Owed: the push side's held windows and pack, w-shared's.
 > R2, the load-only edge tests, CLOSED (2026-11-21, w-git): a push's answer under side-band-64k wrote its first
