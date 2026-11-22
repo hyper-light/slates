@@ -102,7 +102,15 @@ PUSH=(--new-branch -f)
 [ -n "${PUSH_REV:-}" ] && PUSH+=(-r "$PUSH_REV")
 echo "hg $(h --version | head -1); source $SOURCE $(h -R "$SOURCE" log -r 'all()' -T x | wc -c | tr -d ' ') changesets; http $HTTP ssh $SSH"
 
+# DIAG (diag branch only): PUSH_CHUNK pushes the history a PUSH_CHUNK of revisions at a time (`-r REV -f`, ancestors
+# with it) then the rest, as hg_scale.sh does, for a server whose one push of it is refused; the repository is the same.
+if [ -n "${PUSH_CHUNK:-}" ]; then
+  export PUSH_CHUNK SOURCE URL
+  export HG_WORDS="${HG[*]}"
+  row push-all bash -c 'tip=$($HG_WORDS -R "$SOURCE" log -r tip -T "{rev}"); for rev in $(seq "$PUSH_CHUNK" "$PUSH_CHUNK" "$tip") tip; do $HG_WORDS -R "$SOURCE" push -q -f -r "$rev" "$URL"; c=$?; [ $c -le 1 ] || { echo "chunk at $rev exit $c"; exit $c; }; done'
+else
 row push-all "${HG[@]}" -R "$SOURCE" push "${PUSH[@]}" "$URL"
+fi
 row identify "${HG[@]}" identify "$URL"
 row clone "${HG[@]}" clone -q "$URL" a
 row verify "${HG[@]}" -R a verify -q
