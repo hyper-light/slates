@@ -1,0 +1,33 @@
+name: diag measurer
+# w-interop (2026-11-22): the Linux compile and focused tests of virtiofs.rs's vhost_form import fix, a Linux-only
+# module no macOS run compiles. Run only from `diag-measurer-*` branches, never main.
+
+on:
+  push:
+    branches: ["diag-measurer-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  focused:
+    name: virtiofs vhost_form (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: rustfmt --edition 2024 --check crates/server/tests/virtiofs.rs
+      - name: the virtiofs target compiles
+        run: cargo test --locked -p slates-server --test virtiofs --no-run
+      - name: slates-server --test virtiofs vhost_form
+        timeout-minutes: 30
+        run: cargo test --locked -p slates-server --test virtiofs vhost_form -- --nocapture 2>&1 | grep -E '^test |test result|skipping|panicked' || true; exit ${PIPESTATUS[0]}
