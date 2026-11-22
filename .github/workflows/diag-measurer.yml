@@ -4,7 +4,10 @@ name: diag-measurer
 # interleaved in one job a runner. A = d2c6635a2 (main 4a1686023 plus the loaded form's throughput line); B = 21179849c
 # (A plus slates_machine::round_robin and the shards' park-at-once). Red/green first: crates/rt/tests/round_robin.rs on
 # each arm. Each quiet run's CPU is timed (an RR shard must idle near zero), the load's throughput printed (its
-# time-share neighbours must not starve). Diagnostics only: diag-measurer-* branches, never main.
+# time-share neighbours must not starve). The runner's account is granted RLIMIT_RTPRIO 1 the way an administrator
+# grants it (pam_limits, systemd's LimitRTPRIO=), by `sudo prlimit` on each step's shell, inherited by both arms alike:
+# stock, the account has soft 0 and hard 0 (g220's probe, run 44991298743), where B declines and equals A by design.
+# Diagnostics only: diag-measurer-* branches, never main.
 
 on:
   push:
@@ -45,6 +48,7 @@ jobs:
           true
       - name: Build the arms and run the red/green test on each
         run: |
+          sudo prlimit --pid $$ --rtprio=1:1; echo "granted: rtprio soft $(ulimit -r) hard $(ulimit -Hr), rttime $(ulimit -R)"
           W="$RUNNER_TEMP/msr"; mkdir -p "$W/logs"
           for arm in $ARMS; do
             s="${arm:0:9}"; mkdir -p "$W/src-$s" "$W/bin-$s"
@@ -62,6 +66,7 @@ jobs:
           done
       - name: Interleaved rounds, loaded then quiet
         run: |
+          sudo prlimit --pid $$ --rtprio=1:1; echo "granted: rtprio soft $(ulimit -r) hard $(ulimit -Hr), rttime $(ulimit -R)"
           W="$RUNNER_TEMP/msr"
           order() { if [ $(( $1 % 2 )) = 1 ]; then echo $ARMS; else echo $ARMS | awk '{print $2, $1}'; fi; }
           set +e
