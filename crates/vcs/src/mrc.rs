@@ -306,7 +306,7 @@ impl Curve {
       } else {
         sum.saturating_sub(bytes)
       };
-      at = at.saturating_add(at & at.wrapping_neg());
+      at = at.saturating_add(at.isolate_lowest_one());
       if at == 0 || at > self.sums.len() {
         break;
       }

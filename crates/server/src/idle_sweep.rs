@@ -268,9 +268,11 @@ mod tests {
 
   /// Shape: the base directories the A-838 test lists under its overlay's root: enough that a sweep closing none, or
   /// some, cannot pass for one closing all.
+  #[cfg(unix)] // its scratch base is git_hooks' ScratchDir, Unix only
   const LISTED_DIRECTORIES: usize = 16;
 
   /// The descriptors the host of the shard's only overlay holds now, `None` with no overlay on a disk host.
+  #[cfg(unix)] // its scratch base is git_hooks' ScratchDir, Unix only
   fn base_descriptors(state: &mut crate::state::ShardState) -> Option<usize> {
     state.volumes.iter_mut_all().find_map(|(_, slot)| {
       slot
@@ -283,6 +285,7 @@ mod tests {
 
   /// Creates an overlay of `base` and lists its root and then each of its [`LISTED_DIRECTORIES`] directories: the
   /// descriptors its host held before any listing (the root's) and after them, `None` where a verb was refused.
+  #[cfg(unix)] // its scratch base is git_hooks' ScratchDir, Unix only
   fn overlay_listed(state: &mut crate::state::ShardState, base: String) -> Option<(usize, usize)> {
     use slates_ipc::protocol::{ReadAt, ReplyBody, RequestBody};
     let principal = slates_db::catalog::Principal::Uid {
@@ -338,6 +341,7 @@ mod tests {
   /// any listing, the root's. Expect: the listings opened a descriptor each; the sweep closed every one within a few intervals
   /// (one to two after the last use), counting each (`base.idle_dirs_closed`), and the root's stayed. Before, every
   /// listed directory kept its descriptor for the volume's life: kiln's restarted daemon on adacachy held 79,038.
+  #[cfg(unix)] // its scratch base is git_hooks' ScratchDir, Unix only
   #[test]
   #[allow(clippy::disallowed_methods)] // test code: the overlay's base, made in its own scratch directory
   fn an_idle_overlays_listed_directories_close_and_its_root_stays_open() {

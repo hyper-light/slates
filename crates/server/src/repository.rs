@@ -835,7 +835,7 @@ fn record_repository(
 /// or a new empty one, whose version 0's merge record is enqueued as a new green's is.
 fn install_root(
   state: &mut ShardState,
-  repository: RepositoryId,
+  repository: slates_db::catalog::RepositoryId,
   root: DbVolumeId,
   (adopted, svn_created): (bool, &[u8]),
 ) {
@@ -953,7 +953,7 @@ fn source_of(
 /// changeset below a head names none yet (GAPS A-575).
 fn hg_source(
   state: &mut ShardState,
-  repository: RepositoryId,
+  repository: slates_db::catalog::RepositoryId,
   from: &str,
 ) -> Result<DbVolumeId, Refusal> {
   let mut room = slates_hg::Admission::new(crate::vcs_share::room(state, repository).bytes);
@@ -1767,15 +1767,9 @@ mod tests {
           },
         )
       };
-      let doomed_root = green_of(create(state, "doomed", "main"));
-      assert_eq!(write(state, doomed_root, b"doomed", 1), 1);
-      let doomed_branch = green_of(branch(state, ("doomed", "topic", "main"), None));
-      let doomed_leaf = green_of(branch(state, ("doomed", "leaf", "topic"), None));
-      let kept_root = green_of(create(state, "kept", "main"));
-      assert_eq!(write(state, kept_root, b"kept", 2), 1);
-      let kept_branch = green_of(branch(state, ("kept", "topic", "main"), None));
+      let (doomed_greens, kept_greens) = doomed_and_kept(state);
+      let [doomed_root, doomed_branch, doomed_leaf] = doomed_greens;
       let (doomed, kept) = (repository(state, "doomed"), repository(state, "kept"));
-      assert!(state.vcs_stores.holds(doomed) && state.vcs_stores.holds(kept));
 
       assert!(matches!(
         refusal(destroy(state, &stranger())),
@@ -1788,39 +1782,8 @@ mod tests {
 
       let destroyed = destroy(state, &owner());
       assert!(matches!(destroyed, ReplyBody::Destroyed), "{destroyed:?}");
-      let partition = state.db.partition();
-      assert!(
-        partition
-          .repositories()
-          .repository_named("doomed")
-          .is_none()
-      );
-      for green in [doomed_root, doomed_branch, doomed_leaf] {
-        assert!(
-          partition.volume(to_db_volume(green)).is_none(),
-          "{green:?} still recorded"
-        );
-        assert!(
-          state.greens.get(&to_db_volume(green)).is_none(),
-          "{green:?} still served"
-        );
-      }
-      assert!(
-        !state.vcs_stores.holds(doomed),
-        "the destroyed repository's store is held"
-      );
-      assert!(matches!(
-        refusal(branch(state, ("doomed", "again", "main"), None)),
-        Refusal::NotFound
-      ));
-
-      assert!(state.vcs_stores.holds(kept));
-      assert_eq!(file(state, kept_root).as_deref(), Some(b"kept".as_slice()));
-      assert_eq!(
-        file(state, kept_branch).as_deref(),
-        Some(b"kept".as_slice())
-      );
-      assert_eq!(write(state, kept_branch, b"still", 3), 1);
+      doomed_gone(state, doomed, [doomed_root, doomed_branch, doomed_leaf]);
+      kept_whole(state, kept, kept_greens);
 
       assert!(matches!(
         refusal(destroy(state, &owner())),
@@ -1830,6 +1793,71 @@ mod tests {
       assert_eq!(file(state, again), None);
       assert_ne!(repository(state, "doomed"), doomed);
     });
+  }
+
+  /// Repositories `doomed` (its root written, a branch of it and a branch of that) and `kept` (its root written and a
+  /// branch), each store held: `doomed`'s three greens and `kept`'s two.
+  fn doomed_and_kept(state: &mut ShardState) -> ([VolumeId; 3], (VolumeId, VolumeId)) {
+    let doomed_root = green_of(create(state, "doomed", "main"));
+    assert_eq!(write(state, doomed_root, b"doomed", 1), 1);
+    let doomed_branch = green_of(branch(state, ("doomed", "topic", "main"), None));
+    let doomed_leaf = green_of(branch(state, ("doomed", "leaf", "topic"), None));
+    let kept_root = green_of(create(state, "kept", "main"));
+    assert_eq!(write(state, kept_root, b"kept", 2), 1);
+    let kept_branch = green_of(branch(state, ("kept", "topic", "main"), None));
+    let (doomed, kept) = (repository(state, "doomed"), repository(state, "kept"));
+    assert!(state.vcs_stores.holds(doomed) && state.vcs_stores.holds(kept));
+    (
+      [doomed_root, doomed_branch, doomed_leaf],
+      (kept_root, kept_branch),
+    )
+  }
+
+  /// Repository `doomed` (`repository`, its `greens`) gone whole after its destroy: its name, each green from the catalog
+  /// and the engines, its store; a branch of it `NotFound`.
+  fn doomed_gone(
+    state: &mut ShardState,
+    repository: slates_db::catalog::RepositoryId,
+    greens: [VolumeId; 3],
+  ) {
+    let partition = state.db.partition();
+    assert!(
+      partition
+        .repositories()
+        .repository_named("doomed")
+        .is_none()
+    );
+    for green in greens {
+      assert!(
+        partition.volume(to_db_volume(green)).is_none(),
+        "{green:?} still recorded"
+      );
+      assert!(
+        state.greens.get(&to_db_volume(green)).is_none(),
+        "{green:?} still served"
+      );
+    }
+    assert!(
+      !state.vcs_stores.holds(repository),
+      "the destroyed repository's store is held"
+    );
+    assert!(matches!(
+      refusal(branch(state, ("doomed", "again", "main"), None)),
+      Refusal::NotFound
+    ));
+  }
+
+  /// Repository `kept` (`repository`, its root and branch) whole beside a destroy: its store held, both greens' bytes,
+  /// and its branch still written.
+  fn kept_whole(
+    state: &mut ShardState,
+    repository: slates_db::catalog::RepositoryId,
+    (root, branch): (VolumeId, VolumeId),
+  ) {
+    assert!(state.vcs_stores.holds(repository));
+    assert_eq!(file(state, root).as_deref(), Some(b"kept".as_slice()));
+    assert_eq!(file(state, branch).as_deref(), Some(b"kept".as_slice()));
+    assert_eq!(write(state, branch, b"still", 3), 1);
   }
 
   /// Repository `linux` made, its root written twice while a work holds version 1, and branched at version 1 and at
