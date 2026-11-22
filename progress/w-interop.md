@@ -428,3 +428,10 @@ partial-blame red in both, my 30-commit source being too short, not the leak).
   (item 1). The tag-kinds test is green (A-836, 880785755).
 - Windows (git, hg, svn): main's, run by w-k90-win (main 01a1ff2e, 14:31).
 Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part closes on that evidence.
+- 2026-11-22 ~02:45: main moved w-bugs' two rows of my part to me (w-bugs told, inbox 0f7a2a70d):
+  1. git matrix deepen: main reruns it on 81dc7ca3b (A-855); if red, red test first, fix, land.
+  2. HTTP edge spin under hg on loaded Linux (vcs_http.rs:850): diag branch diag-measurer-w-interop-httpspin
+     (e03bfc259, 6d2ed15ef): DIAG timing of hg_http::begin (wall/cpu, whole vs streamed, the query) and of each streamed
+     turn (cpu, steps, longest step) in hg.rs; ubuntu-latest, CPUs oversubscribed 2x by busy loops, hg's whole history,
+     hg-matrix STEP_LIMIT 1500. First push failed in setup (rustup cargo-fmt conflict) -> components as ci.yml. Lead:
+     hg_http::begin runs in one poll (a getbundle's changeset set for clone-rev, the store listing for stream-clone).
