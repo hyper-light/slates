@@ -24,3 +24,5 @@
 - If it's empty, I keep digging in the SSH edge.
 
 **Also found, not yet fixed (its own piece, needs a ruling):** vcs_ssh `write()` drops a write_all that the session's rekey timer interrupts, then writes all its bytes again. If part of them were already written, the stream gets duplicated bytes and the client fails its MAC check. It fires only when the key time (an hour) passes during a write blocked on a full socket.
+
+**OWNER? (one line):** 01a1ff2e's 17:26 ruling gave me the sliced apply, option (a): the post-state in the green's chunk store a slice a turn before landing, one apply shared by hg, git and P2, w-engine told first. Its 17:27 note then called the same apply "w-engine's checkpoint item", and A-579's checkpoint-by-name has landed since (2d078e4fa). Which of us builds it? Until you rule, I'm not touching w-engine's Green apply.
