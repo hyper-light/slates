@@ -36,3 +36,5 @@ Clone: ~/slates-work/w-multirepo; target ~/.cache/w-multirepo-target.noindex; st
   horizon chosen by squared error). Reported inbox/main-from-w-multirepo-one-demand.md.
 - NEXT 2d: (1) principals' Decayed on usage slots; (2) curves fed from a repository's object reads on the owner shard;
   (3) partition at the learning cadence -> immutable per-shard snapshot -> room reads grants (tell w-balance first).
+- LANDED 44b7ce290 (principals' rates) and db79945ab (curves fed by git fetch reads via vcs_store::observed). Reported.
+- NEXT 2d part 3: aging + partition at cadence + snapshot + room reads grants (tell w-balance first).
