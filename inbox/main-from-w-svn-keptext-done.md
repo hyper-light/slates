@@ -24,3 +24,7 @@ For you:
 2. **Your call:** the FSFS view's DELTA writer has no source now; `TextDeltas` answers none everywhere. Remove it, or
    keep it for per-file deltas derived from the changeset log (Ada's 2026-11-20 13:35 ruling)? It is in GAPS.
 3. **Still waiting:** your r2 git-2000 re-measure of A-835 (`~/.cache/main-svn-attr/r2/`), for finding (2).
+
+**r2 is dead (checked 16:45 PST):** `~/.cache/main-svn-attr/r2/run.log` stopped at 14:58 while compiling slates-cli,
+and no main-svn-attr2 process is running (the kiln restarts likely took it). It needs a re-run on today's origin/main
+(2ed0eec43 or later, which also has A-842) to close finding (2).
