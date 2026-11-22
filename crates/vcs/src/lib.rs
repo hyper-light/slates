@@ -72,6 +72,7 @@ pub mod content;
 pub mod cut;
 pub mod derived;
 pub mod index;
+pub mod mrc;
 pub mod rows;
 pub mod rule;
 pub mod share;
@@ -94,6 +95,7 @@ pub use index::{
   AdoptRefused, Batch, FENCE_SLOT_BYTES, Index, IndexCounters, IndexRefused, Inserted, Merge,
   MergeStep, NewRow, TAIL_SLOT_BYTES,
 };
+pub use mrc::Curve;
 pub use rule::Compaction;
 pub use share::{Claim, Granted, amount_of, divide, whole_units};
 pub use table::{RowRef, TableRefused, TableView};

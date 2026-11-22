@@ -1981,6 +1981,10 @@
 > refused a fetch and every other held. **Open:** a destroyed repository's landed changesets stay in the node's
 > append-only store log (A-767), which only a landing may compact (R1); hg and svn at N = 2, 16, 64 are main's rounds.
 >
+> **A-724 piece 2a (2026-11-21, w-multirepo, A-844): the working set's miss-ratio curve built, not yet fed.**
+> `slates_vcs::mrc::Curve` (fixed-size SHARDS; `cargo test -p slates-vcs --lib mrc`, 4 of 4, macOS arm64, this Mac).
+> Open: nothing reads content through it yet; the rates, the marginal-utility partition and the CPU weights follow.
+>
 > **The hg correctness lane (2026-11-21, w-balance, UI goal 93 correctness by use):** `crates/cli/tests/hg_interop.rs`
 > `stock_hg_gets_what_stock_hg_serve_gives_on_every_verb_over_http_and_ssh` (ignored; main runs it) drives
 > `crates/cli/bench/hg_correctness.sh`: stock hg 7.2 against stock `hg serve` (the oracle), slates over HTTP and slates
