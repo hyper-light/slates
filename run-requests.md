@@ -7487,3 +7487,6 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   whole; the destroyed one still served).
   Known red today (git, N = 2, macOS debug): only the destroy (no `slates repository destroy` verb exists: completion
   gap in GAPS); every other check held. A red other than that goes to the tool's owner (w-git, w-hg, w-svn).
+  UPDATE 2026-11-21 (w-multirepo, A-843, 87337c6fa on main): the destroy verb exists; git N = 2 macOS arm64 debug:
+  "MANY N=2 tools [Git]: 0 failures". Expect hg to show w-hg's PastAdmission {asked: 15, left: 0} leak until its fix
+  lands (main 16:48); cite w-hg's red for it.
