@@ -156,14 +156,18 @@ impl Staging {
     if self.records.len() >= MAX_RECORDS {
       return Some(Flush::Sections);
     }
-    // Its texts arrive named stored, put by the import's sink as the dump was read, and count twice as contents do:
-    // in the content store, and again in its increment's post-state.
+    // Its contents come twice, into the content store and again in its increment's post-state. Its texts come once
+    // more, in the post-state: the import's sink put them into the content store as the dump was read (A-862), where
+    // the shard charged them already, so the shard's admittable bytes count them now. Charged twice, a batch that
+    // fits was landed early and the admission's figures lied (main 01a20182's ruling of 2026-11-22 06:22).
     let texts = revision
       .stored
       .values()
       .fold(0u64, |total, len| total.saturating_add(*len));
-    let charge = brought(revision).saturating_add(texts).saturating_mul(2);
+    let charge = brought(revision).saturating_mul(2).saturating_add(texts);
     let admittable = state.store.admittable();
+    // A test's cap counts what the batch holds as the shard's charge does: its texts, its post-state, and the texts
+    // the open revision put into the content store already.
     #[cfg(test)]
     let admittable = ADMISSION_CAP
       .with(std::cell::Cell::get)
@@ -172,7 +176,8 @@ impl Staging {
           .carried
           .iter()
           .fold(0u64, |total, text| total.saturating_add(text.len));
-        admittable.min(cap.saturating_sub(carried.saturating_add(self.held)))
+        let holds = carried.saturating_add(self.held).saturating_add(texts);
+        admittable.min(cap.saturating_sub(holds))
       });
     (charge > admittable).then_some(Flush::Admission)
   }
