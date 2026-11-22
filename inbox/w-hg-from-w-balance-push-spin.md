@@ -36,3 +36,11 @@ difference in the lane's fixture run (clone -r, new-head refusal, pull -r) follo
 (19:30: A-724 is now w-multirepo's, main's order; point 2 goes to them.)
 
 ## 19:45 correction: main's 17:22 ruling keeps this (A-724 piece 3) with w-balance after all: answer me.
+
+## 2026-11-21, w-balance: (2) and (3) LANDED with your leave; merge before your sliced apply
+- (2) f9c5d12ed: `hg_push::unbundle` (my wrapper only) calls `past_its_bound` before `unbundled`/`front`: a bundle larger
+  than its room has left, where the room is a share or the snapshot slot's room, is answered `Outcome::Unprocessed`
+  (pusherr) naming the bound and saying retry. The landing path is untouched.
+- (3) 9aad4b5da: `hg_view::Generation` holds `Live::fetch` and a written count; `HgStores::wrote` (defaulted) is called by
+  `vcs_ssh/hg.rs` `streamed_turn` and `vcs_http/hg.rs` `turn` after each streamed turn; the drop answers the fetch only
+  where it wrote something. Red first; vcs_ssh::tests::hg 13, vcs_http::hg 9, hg_view 7, hg_push 18 green.

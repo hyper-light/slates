@@ -20,3 +20,9 @@
 - FOUND (GAPS): no Subversion commit is admitted against the room at all; its texts arrive into the conversation's sink
   unadmitted. That admission touches the svn commit drive (w-svn's files): say whether I build it with w-svn's leave.
 - Next, mine: a fetch's room as a claim of its own, then backpressure before refusal.
+
+## 2026-11-21: piece 3, Mercurial's half LANDED (w-hg's leave)
+- 9aad4b5da: an hg fetch in flight is a claim on the room; its streamed answer's bytes are learned (a lookup's hold
+  teaches nothing).
+- f9c5d12ed: an hg push past its share is refused before it is read, in pusherr naming the share (was `Bundle1`).
+- Waiting on w-git (backpressure: resumable admission) and w-svn (svn's admission and words); pinged both by kiln.
