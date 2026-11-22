@@ -1723,6 +1723,7 @@ dependencies = [
  "serde_json",
  "sha1-checked",
  "slates-http",
+ "slates-mem",
  "slates-merge",
  "slates-pace",
  "slates-test-seeds",
