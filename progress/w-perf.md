@@ -331,3 +331,12 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
 - Rule (main 05:06 PST, correcting its own 05:05): an arm's interleaved design A/B is the agent's own to run and read
   (Ada, 2026-11-20: "make your agents do A|B testing"). Still main's: clippy, other platforms' lint checks, suites, a
   landing's confirming rounds, and the wall.
+- ~08:30 PST: 84a Linux CLOSED as measured-and-rejected. LANDED 519fe5568 (docs only): BENCHMARKS "84a on Linux: the
+  round-robin real-time class...", with the stamped run, the kernel facts, RTPRIO 0:0, and the four-arm tables
+  (45036903025), plus a GAPS 84a line.
+  - None of B, C', D' meets 1 ms. C' is best on conflict p99 and holds quiet and R9, but its accept p99 is
+    0.94-2.6 ms and the spinners lose 20-27% of their throughput.
+  - The remaining tail is the client's own time-share code waiting whole 2.1 ms slices (structural). Open as main's
+    call: a less oversubscribed lane, or the bar re-stated for Linux.
+  - No code landed. The arms are on origin/diag-measurer-w-perf-84a-linux-ab and origin/agents/w-perf-84a-arm-d2.
+  - Lesson recorded: SCHED_RESET_ON_FORK can't be cleared unprivileged, so a temporary raise must not set it.
