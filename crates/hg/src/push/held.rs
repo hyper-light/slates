@@ -74,8 +74,10 @@ impl Held for IndexHeld<'_> {
     })
   }
 
-  /// The row's own length (A-767 C1): its text's, less its metadata block's, which the store keeps whether or not the
-  /// text's bytes are at hand; no text read.
+  /// The row's own length (A-767 C1): its text's, less its metadata block's whole, which the store keeps whether or
+  /// not the text's bytes are at hand; no text read. The block the row names is what lies between the text's two
+  /// markers (`filerev::split`), so a text with a block, empty or not, spends its length and both markers' on it (an
+  /// empty block's four bytes were once counted as bytes: `LengthDiffers { said: 10101, given: 10097 }`, w-interop).
   fn file_bytes_len(&self, path: &[u8], node: &Node) -> Option<u64> {
     let log = Log::File(path);
     let rev = self.index.rev(self.store, log, node)?;
@@ -84,7 +86,9 @@ impl Held for IndexHeld<'_> {
       return None;
     }
     let block = match row.block {
-      Some(block) => self.store.len_of(&block)?,
+      Some(block) => self.store.len_of(&block)?.checked_add(crate::read::to_u64(
+        crate::filerev::MARKER.len().saturating_mul(2),
+      ))?,
       None => 0,
     };
     row.len.checked_sub(block)

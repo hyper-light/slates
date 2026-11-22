@@ -256,3 +256,71 @@ fn an_objects_search_and_deflate_steps_are_sized_by_their_measured_cost_within_t
   turned.release(&mut store_turned).unwrap();
   whole.release(&mut store_whole).unwrap();
 }
+
+/// A-856 (main's ruling of 2026-11-22 00:30: an encoding's parts were held outside every budget, clients' table naming
+/// 2.5 GB live behind git/git's clone). Do: encode the second of [`two_versions`] a turn at a time with a quantum of
+/// nothing, reading after each turn what the encoding holds and what the content store has charged; encode a twin's in
+/// one pass; then begin it again on a third, turn it until it holds part bytes, and release it. Expect: after every turn
+/// the store's charge covers what the encoding holds of its parts, which grows past nothing before the end; at the end
+/// it holds nothing and the store's charge is the twin's, nothing of the parts left charged; released, the third's charge
+/// is back where it began.
+#[test]
+fn an_encodings_parts_are_charged_to_the_store_as_they_grow_and_given_back_at_its_end() {
+  let format = ObjectFormat::Sha1;
+  let (mut store, mut store_whole) = (store(), store());
+  let mut repository = two_versions(format, &mut store);
+  let mut whole = two_versions(format, &mut store_whole);
+  whole
+    .encode_fragments(&mut store_whole, (1, 1), &mut Ticks(0), EXCHANGE)
+    .unwrap();
+  let charged = store.charged();
+  let mut encoding = Encoding::fragments(&repository, &store, 1, 1).unwrap();
+  let mut clock = Ticks(0);
+  let mut most = 0;
+  loop {
+    let turn = Turn {
+      clock: &mut clock,
+      exchange: EXCHANGE,
+      quantum_ns: 0,
+    };
+    let progress = encoding.advance(&mut repository, &mut store, turn).unwrap();
+    assert!(
+      store.charged() >= charged + encoding.held_bytes(),
+      "charged as held: {} past {charged}, {} held",
+      store.charged(),
+      encoding.held_bytes()
+    );
+    most = most.max(encoding.held_bytes());
+    if progress == Progress::Done {
+      break;
+    }
+  }
+  assert!(most > 0, "the parts were held between turns");
+  assert_eq!(encoding.held_bytes(), 0);
+  assert_eq!(
+    store.charged(),
+    store_whole.charged(),
+    "no part left charged"
+  );
+  repository.release(&mut store).unwrap();
+  whole.release(&mut store_whole).unwrap();
+  let mut store = super::store();
+  let mut repository = two_versions(format, &mut store);
+  let charged = store.charged();
+  let mut encoding = Encoding::fragments(&repository, &store, 1, 1).unwrap();
+  while encoding.held_bytes() == 0 {
+    let turn = Turn {
+      clock: &mut clock,
+      exchange: EXCHANGE,
+      quantum_ns: 0,
+    };
+    assert_eq!(
+      encoding.advance(&mut repository, &mut store, turn).unwrap(),
+      Progress::More
+    );
+  }
+  assert!(store.charged() >= charged + encoding.held_bytes());
+  encoding.release(&mut store);
+  assert_eq!(store.charged(), charged, "released, nothing charged");
+  repository.release(&mut store).unwrap();
+}
