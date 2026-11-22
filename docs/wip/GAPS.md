@@ -929,6 +929,9 @@
 > (`unpack::Reader::resolve_turn`); per-repository push counters by phase in `slates status`. Owed: the small
 > repositories' wait was per-push turns (fixed: `vcs_share::turns`, a repository's pushes one turn a round); owed:
 > its by-use proof at cap 3 and 10, and weights learned from usage in place of one turn a repository.
+> Piece 2a landed (2026-11-21): the room's claims read each repository's learned demand (`slates_vcs::Learned`, a mean
+> decayed by its own rhythm of intakes) in place of the lifetime mean. Owed in piece 2: per-principal rates, the
+> working set's miss-ratio curve and memory by marginal utility, CPU weights, the shares published to siblings.
 > In flight, paused for goal 93 (2026-11-21): run 31 (cap 3, Studio-2, 9865bb832) found shard-mates took 4.5 s of the
 > busiest repository's 41.3 s span and its shard ran steps 23.2 s of it: its own three pushes of one agent shared one
 > turn. The fix (a turn an agent, spare turns taken; red first) is on branch agents/w-balance-turn-weights, 928df7d1b,
