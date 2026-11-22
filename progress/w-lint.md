@@ -428,3 +428,9 @@
   AWS_LC_SYS_NO_ASM=1). Server vcs_/git_/hg_/svn_: the process died with exit 4 when the watchdog wedged a shard under
   parallel load. The hg_push test it hit passes alone (r41), so it went to w-bugs. Linux: r38 still running.
 - VCS lane, Linux: r38 (the resubmit of r36) died with its clone broken after 34 min; in run-requests.md. No Linux count yet.
+
+## 2026-11-21 round at 39c36af9d
+- Red: server tests/merge_check.rs (A-840): casts became try_from, the conflict loop is now resolved_until_rebased,
+  and the harness allow gained unwrap_in_result. merge_check 11/11. The rest of the wall was clean.
+- VCS lane: kiln refused the first submits ("not connected to the kiln server"). Resubmitted as Windows r45
+  (AWS_LC_SYS_NO_ASM=1, server tests 4 at a time) and Linux r46 (synced from Studio-2).
