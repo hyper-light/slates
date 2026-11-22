@@ -442,7 +442,10 @@ fn refused(failure: PushFailed) -> ServiceRefused {
     PushFailed::NoStore => ServiceRefused::Unavailable,
     PushFailed::Policy(_) => ServiceRefused::Unreadable,
     PushFailed::Exchange(_) | PushFailed::Unchecked => ServiceRefused::Unwritable,
-    PushFailed::Unlanded => ServiceRefused::Unavailable,
+    // Past a share or the snapshot's room (A-724 piece 3b): retryable, so the site's unavailable.
+    PushFailed::Unlanded | PushFailed::PastShare { .. } | PushFailed::PastSnapshot { .. } => {
+      ServiceRefused::Unavailable
+    }
   }
 }
 
@@ -455,6 +458,9 @@ fn failed(failure: PushFailed) -> Failed {
     PushFailed::Policy(_) => Status::INTERNAL_SERVER_ERROR,
     PushFailed::Unchecked => Status::BAD_REQUEST,
     PushFailed::Unlanded => Status::SERVICE_UNAVAILABLE,
+    // Past a share or the snapshot's room (A-724 piece 3b): retryable once other pushes end or the slot grows, never
+    // `413`, which says the push is too large for the server whatever else happens.
+    PushFailed::PastShare { .. } | PushFailed::PastSnapshot { .. } => Status::SERVICE_UNAVAILABLE,
     PushFailed::Exchange(refusal) => exchange_status(refusal),
   })
 }

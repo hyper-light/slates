@@ -23,8 +23,11 @@
 //! client seats (`clients_per_shard`), the most principals one shard can serve at once, so any principal with more than
 //! one seat's share of a repository's work is always named. Its cost is `k` small entries a repository.
 //!
-//! **What it is not.** The ledger counts; it decides nothing. The learned demand and the shares derived from it are
-//! A-724's later pieces, which read these rows. Every count saturates, so a long-lived repository's counts never wrap to
+//! **Learned demand** (A-724 piece 2, [`Learned`]). Each answered work's bytes also feed its kind's decayed mean, the
+//! repository's expected next work, weighed by the repository's own rhythm of answered works.
+//!
+//! **What it is not.** The ledger counts and learns; it decides nothing. The shares derived from it are read where
+//! works are admitted (`slates-server`'s `vcs_share`). Every count saturates, so a long-lived repository's counts never wrap to
 //! a small number.
 
 use std::collections::BTreeMap;
@@ -56,6 +59,66 @@ pub struct WorkUsage {
   pub longest_step_ns: u64,
 }
 
+/// A kind of work's learned demand on one repository (A-724 piece 2; §4.17.5 "Learned demand"): the bytes its next work
+/// is expected to bring, as a mean decayed by the repository's own measured inter-arrival time.
+///
+/// **The rule.** Each answered work's bytes `x` arrive `Δ` after the previous answered work's. The estimate moves toward
+/// `x` by `α = 1 - e^(-Δ/τ)`, where `τ` is the repository's decayed mean gap between answered works, learned by the same
+/// rule from the gaps themselves. So a work after a silence longer than the repository's usual gap outweighs what came
+/// before it (the past it would average is stale), and works in a burst average among themselves: a busy repository
+/// forgets fast in wall time and an idle one slowly, each by its own rhythm, never a fixed half-life (D-11). The first
+/// work's bytes are the first value and its gap to the second the first `τ` (§4.17.5: "a first value is the first work's
+/// own size"), so no literal seeds either. Every estimate is a convex combination of the bytes seen, so it never leaves
+/// their range (the oracle's property).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Learned {
+  /// Works learned from.
+  pub works: u64,
+  /// The decayed mean bytes a work brought.
+  pub bytes: f64,
+  /// The decayed mean gap between answered works, in the shard clock's nanoseconds; zero until a second work.
+  pub gap_ns: f64,
+  /// The shard clock's nanoseconds at the latest work learned from.
+  pub last_ns: u64,
+}
+
+impl Learned {
+  /// The bytes the next work is expected to bring, once any work was learned from.
+  pub fn bytes_per_work(&self) -> Option<u64> {
+    (self.works > 0).then(|| crate::share::whole_units(self.bytes))
+  }
+
+  /// Learns from one work that brought `bytes`, answered at `now_ns` (the rule above).
+  fn learn(&mut self, bytes: u64, now_ns: u64) {
+    let sample = crate::share::amount_of(bytes);
+    if self.works == 0 {
+      self.bytes = sample;
+    } else {
+      let gap = crate::share::amount_of(now_ns.saturating_sub(self.last_ns));
+      // Before a second work there is no rhythm to weigh by: the first gap is its own scale.
+      let scale = if self.gap_ns > 0.0 { self.gap_ns } else { gap };
+      let weight = if scale > 0.0 {
+        1.0 - (-gap / scale).exp()
+      } else {
+        1.0
+      };
+      let weight = if weight.is_finite() {
+        weight.clamp(0.0, 1.0)
+      } else {
+        1.0
+      };
+      self.bytes += weight * (sample - self.bytes);
+      self.gap_ns = if self.gap_ns > 0.0 {
+        self.gap_ns + weight * (gap - self.gap_ns)
+      } else {
+        gap
+      };
+    }
+    self.works = self.works.saturating_add(1);
+    self.last_ns = self.last_ns.max(now_ns);
+  }
+}
+
 /// One slot of a repository's principal summary (module docs).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrincipalCount<P> {
@@ -68,7 +131,7 @@ pub struct PrincipalCount<P> {
 }
 
 /// One repository's row (module docs).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Usage<P> {
   /// Its intakes.
   pub intake: WorkUsage,
@@ -82,6 +145,10 @@ pub struct Usage<P> {
   pub derive_ns: u64,
   /// The bytes of derived values those nanoseconds kept: with `derive_ns`, what making one byte again costs.
   pub derive_bytes: u64,
+  /// Its intakes' learned demand (A-724 piece 2).
+  pub intake_learned: Learned,
+  /// Its fetches' learned demand (A-724 piece 2).
+  pub fetch_learned: Learned,
   /// The principal summary: at most the ledger's `principal_slots` slots, in no order.
   principals: Vec<PrincipalCount<P>>,
 }
@@ -96,6 +163,8 @@ impl<P> Usage<P> {
       last_ns: now_ns,
       derive_ns: 0,
       derive_bytes: 0,
+      intake_learned: Learned::default(),
+      fetch_learned: Learned::default(),
       principals: Vec::new(),
     }
   }
@@ -105,6 +174,14 @@ impl<P> Usage<P> {
     match work {
       Work::Intake => &self.intake,
       Work::Fetch => &self.fetch,
+    }
+  }
+
+  /// The learned demand of `work` (A-724 piece 2).
+  pub fn learned(&self, work: Work) -> &Learned {
+    match work {
+      Work::Intake => &self.intake_learned,
+      Work::Fetch => &self.fetch_learned,
     }
   }
 
@@ -204,10 +281,16 @@ impl<R: Ord + Clone, P: Clone + Eq> Ledger<R, P> {
     counts.bytes_in = counts.bytes_in.saturating_add(bytes_in);
   }
 
-  /// A work of kind `work` on `repository` was answered at `now_ns`.
-  pub fn answered(&mut self, repository: &R, work: Work, now_ns: u64) {
-    let counts = self.row(repository, now_ns).work_mut(work);
+  /// A work of kind `work` on `repository` was answered at `now_ns`, having brought `bytes` of the client's in all: its
+  /// count, and its bytes learned as the repository's demand ([`Learned`]).
+  pub fn answered(&mut self, repository: &R, work: Work, bytes: u64, now_ns: u64) {
+    let row = self.row(repository, now_ns);
+    let counts = row.work_mut(work);
     counts.answered = counts.answered.saturating_add(1);
+    match work {
+      Work::Intake => row.intake_learned.learn(bytes, now_ns),
+      Work::Fetch => row.fetch_learned.learn(bytes, now_ns),
+    }
   }
 
   /// Making `repository`'s derived values ran `ns` on the shard's clock and kept `bytes` (zero for a turn that kept
@@ -246,7 +329,7 @@ impl<R: Ord + Clone, P: Clone + Eq> Ledger<R, P> {
 
 #[cfg(test)]
 mod tests {
-  use super::{Ledger, Work, WorkUsage};
+  use super::{Learned, Ledger, Work, WorkUsage};
   use proptest::prelude::*;
   use std::collections::BTreeMap;
 
@@ -331,7 +414,7 @@ mod tests {
             counts.bytes_in += u64::from(bytes);
           }
           Event::Answered(repository, intake) => {
-            ledger.answered(&repository, work_of(intake), now);
+            ledger.answered(&repository, work_of(intake), 0, now);
             row(&mut model, repository);
             let row = model.get_mut(&repository).unwrap();
             let counts = if intake { &mut row.intake } else { &mut row.fetch };
@@ -408,7 +491,7 @@ mod tests {
     let mut ledger: Ledger<u32, u32> = Ledger::new(4);
     ledger.begun(&1, &10, Work::Intake, 5);
     ledger.stepped(&1, Work::Intake, (900, 4096), 6);
-    ledger.answered(&1, Work::Intake, 7);
+    ledger.answered(&1, Work::Intake, 4096, 7);
     ledger.begun(&2, &11, Work::Fetch, 8);
     let toy = ledger.usage(&2).unwrap();
     assert_eq!(toy.intake, WorkUsage::default());
@@ -426,5 +509,78 @@ mod tests {
       }
     );
     assert_eq!((pushed.first_ns, pushed.last_ns), (5, 7));
+  }
+
+  proptest! {
+    #![proptest_config(slates_test_seeds::unseeded(ProptestConfig::with_cases(300)))]
+
+    /// A-724 piece 2 (§4.17.5 "Learned demand"): do any works, of any bytes, answered at any gaps (repeated instants
+    /// too), expect the learned bytes always within the range of the bytes seen (a convex combination), the first work's
+    /// bytes the first value, and every work counted.
+    #[test]
+    fn learned_demand_never_leaves_the_range_of_the_bytes_seen(
+      works in proptest::collection::vec((any::<u32>(), 0u64..1 << 20), 1..200),
+    ) {
+      let mut learned = Learned::default();
+      let (mut now, mut least, mut most) = (0u64, u64::MAX, 0u64);
+      for (at, (bytes, gap)) in works.iter().enumerate() {
+        now = now.saturating_add(*gap);
+        learned.learn(u64::from(*bytes), now);
+        least = least.min(u64::from(*bytes));
+        most = most.max(u64::from(*bytes));
+        if at == 0 {
+          prop_assert_eq!(learned.bytes_per_work(), Some(u64::from(*bytes)));
+        }
+        let expected = learned.bytes_per_work().unwrap();
+        prop_assert!(expected >= least && expected <= most, "{expected} outside [{least}, {most}]");
+      }
+      prop_assert_eq!(learned.works, u64::try_from(works.len()).unwrap());
+    }
+  }
+
+  /// A-724 piece 2: do works of one size at a steady rhythm, then works of a size 64 times larger at the same rhythm,
+  /// expect the steady size learned exactly, and the new size followed within a few works (at least half of it after
+  /// three) where the lifetime mean, A-724 piece 3's first demand, has moved by under a tenth of it.
+  #[test]
+  fn learned_demand_follows_a_repositorys_new_size_where_its_lifetime_mean_lags() {
+    let (small, large, gap) = (1u64 << 10, 1u64 << 16, 1_000_000u64);
+    let mut learned = Learned::default();
+    let mut now = 0;
+    for _ in 0..100 {
+      now += gap;
+      learned.learn(small, now);
+    }
+    assert_eq!(learned.bytes_per_work(), Some(small));
+    for _ in 0..3 {
+      now += gap;
+      learned.learn(large, now);
+    }
+    let lifetime_mean = (100 * small + 3 * large) / 103;
+    assert!(
+      learned.bytes_per_work().unwrap() >= large / 2,
+      "{learned:?}"
+    );
+    assert!(
+      lifetime_mean < large / 10,
+      "the lifetime mean {lifetime_mean} lags"
+    );
+  }
+
+  /// A-724 piece 2: do many small works at a steady rhythm, then one large work after a silence a hundred gaps long,
+  /// expect that work to outweigh all before it (its estimate nearly its size): what came before is stale.
+  #[test]
+  fn a_work_after_a_long_silence_outweighs_the_stale_past() {
+    let (small, large, gap) = (1u64 << 10, 1u64 << 20, 1_000u64);
+    let mut learned = Learned::default();
+    let mut now = 0;
+    for _ in 0..50 {
+      now += gap;
+      learned.learn(small, now);
+    }
+    learned.learn(large, now + 100 * gap);
+    assert!(
+      learned.bytes_per_work().unwrap() > large - large / 100,
+      "{learned:?}"
+    );
   }
 }
