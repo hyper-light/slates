@@ -99,9 +99,10 @@ const SEGMENT_VERSION: u32 = 8;
 /// Format: the version of a push's segment record on the changeset log (main 01a20182's ruling of 2026-11-22 06:57: a
 /// push lands its segments apart from its repository's landing turn, so another push may land between a segment and the
 /// entry naming it): a [`SEGMENT_VERSION`] record whose each manifest's or file revision's stored delta names its base
-/// by node, never by number. Its replay appends each row over the index as it is then, one it holds passed over: a
-/// delta resting on the log's last revision is kept as stored, any other is read over its base by node and kept again
-/// against the revision before it, as the index keeps a manifest (A-729), the same row a stale fork's re-base keeps.
+/// by node, never by number. Its replay appends each row over the index as it is then, one it holds passed over: a file
+/// revision's whole, and a delta resting on the log's last revision, kept as stored; any other manifest (a whole, or a
+/// delta on an earlier revision, read over its base by node) kept again against the revision before it, as the index
+/// keeps a manifest (A-729): the same row a stale fork's re-base keeps, whether or not another push landed between.
 const PUSH_SEGMENT_VERSION: u32 = 10;
 /// Format: the version of an import's or a push's record in the repository's register once its revisions are on the
 /// changeset log as a run of segments (A-767 C1 step 3; a push's, main 01a20182's ruling (b1) of 2026-11-22 04:44): the
@@ -1981,41 +1982,47 @@ impl Revisions {
       bytes,
       block,
     };
-    let numbers = match self.stored_on(store, log, base)? {
-      Some(on) => self
-        .fork
-        .append_stored(store, log, &[(row, (on, delta_len, chain))]),
-      None => self.kept_again(store, log, (row, delta_len), base),
+    let numbers = match self.stored_on(store, log, base) {
+      // Its chain rests on its base's as the fork keeps it now: past its text's length, the index would keep it whole
+      // (`index::kept_as`'s bound), and so does the replay.
+      Keeping::AsStored(_, Some(below)) if below.saturating_add(delta_len) > len => {
+        self.kept_again(store, log, (row, delta_len), base)
+      }
+      Keeping::AsStored(on, below) => {
+        let chain = below.map_or(chain, |below| below.saturating_add(delta_len));
+        self
+          .fork
+          .append_stored(store, log, &[(row, (on, delta_len, chain))])
+      }
+      Keeping::Again => self.kept_again(store, log, (row, delta_len), base),
     }
     .map_err(ImportRefused::<Infallible>::Index)?;
     settle::<Infallible>(&mut self.fork, store, radix, rev, &numbers)?;
     Ok(())
   }
 
-  /// The number a row's stored delta rests on as the fork is now: its number where the record named it
-  /// ([`SEGMENT_VERSION`]) or none ([`NONE`]), the log's last revision where the record names that one by node
-  /// ([`PUSH_SEGMENT_VERSION`]); none where it names another, whose row is kept again ([`Revisions::kept_again`]).
-  fn stored_on(
-    &self,
-    store: &ContentStore,
-    log: Log<'_>,
-    base: Base,
-  ) -> Result<Option<u32>, Refused> {
+  /// How a row is kept over the fork as it is now: as stored where its record names its base by number
+  /// ([`SEGMENT_VERSION`]), where it is a file revision's whole, or where its stored delta rests on the log's last
+  /// revision by node ([`PUSH_SEGMENT_VERSION`]); else again ([`Revisions::kept_again`]): a manifest kept whole, or as a
+  /// delta on a revision before the log's last, is kept as the index keeps a new manifest (A-729), against the revision
+  /// before it, as a stale fork's re-base keeps it, whether or not another push landed between.
+  fn stored_on(&self, store: &ContentStore, log: Log<'_>, base: Base) -> Keeping {
     let node = match base {
-      Base::Number(number) => return Ok(Some(number)),
-      Base::Node(node) if node == NULL_NODE => return Ok(Some(NONE)),
+      Base::Number(number) => return Keeping::AsStored(number, None),
+      Base::Node(node) if node == NULL_NODE && log != Log::Manifest => {
+        return Keeping::AsStored(NONE, None);
+      }
       Base::Node(node) => node,
     };
     let last = self.fork.len(store, log).checked_sub(1);
-    let last_node = last.and_then(|last| match log {
-      Log::Changelog => None,
-      _ => self.fork.revision(store, log, last).map(|row| row.node),
-    });
-    Ok((last_node == Some(node)).then_some(last).flatten())
+    match last.and_then(|last| Some((last, self.fork.revision(store, log, last)?))) {
+      Some((last, row)) if row.node == node => Keeping::AsStored(last, Some(row.chain)),
+      _ => Keeping::Again,
+    }
   }
 
-  /// A row whose stored delta rests on `base`, a revision before the log's last (another push landed after it): its
-  /// text read over its base by node and kept again, the index keeping it as its own against the revision before it.
+  /// A row kept again ([`Revisions::stored_on`]): a whole as it is, a stored delta's text read over its base by node;
+  /// the index keeping it as its own against the revision before it.
   fn kept_again(
     &mut self,
     store: &mut ContentStore,
@@ -2027,6 +2034,9 @@ impl Revisions {
     let Base::Node(base) = base else {
       return Err(unread);
     };
+    if base == NULL_NODE {
+      return self.fork.append_revisions(store, log, &[row]);
+    }
     let text = self
       .fork
       .rev(store, log, &base)
@@ -2057,6 +2067,15 @@ impl Revisions {
       }
     }
   }
+}
+
+/// How a replayed row is kept ([`Revisions::stored_on`]).
+enum Keeping {
+  /// As its record stored it, its delta on this number; its chain the delta's over that revision's chain where the
+  /// record named its base by node ([`PUSH_SEGMENT_VERSION`]), else as recorded.
+  AsStored(u32, Option<u64>),
+  /// Again, as the index keeps a new revision.
+  Again,
 }
 
 /// What a row's stored delta rests on, as its record names it.
