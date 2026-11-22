@@ -525,3 +525,13 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - Tests: server svn 116/116 on the merged tree; slates-vcs content 20/20.
 - Next: r18's verdict, then the next churner. Mine left: the sink's window buffer, one a text, to be reused by the
   import. The rest are the engine's and the content store's.
+
+## 2026-11-22 ~11:00 PST: the sink's buffer reused; the splice cut held; A-760 proposed
+- 1a882f47d: the import's sink keeps one window buffer for all its texts (`ContentStore::begin_object_reusing`).
+  Red first. Sampled: 142.3 MB to 130.7 MB.
+- r18 (main): A-862 is innocent. r16's doubling was the machine; both bases leave about 560-600 MB not given back.
+  r12's base, 1721d8c52, is under r19.
+- Held uncommitted, awaiting main's ruling: `engine::apply` sized once (`made_len`). Red proven, but dead even
+  (130.7 to 130.8 MB): an import replaces files whole.
+- Proposed to main: the svn landing names its stored texts as A-760 named runs, removing the post-state, make_mapped
+  and encode copies, instead of shaving judge_held and encode one by one.
