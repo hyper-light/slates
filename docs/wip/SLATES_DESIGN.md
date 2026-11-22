@@ -60899,7 +60899,17 @@ owed.
 - Evidence: `a_read_of_a_let_go_window_names_it_and_reads_once_it_is_brought_back` (git: every read of the update push's
   let-go pack refused `Away`, brought back, then the object read whole); `a_let_go_window_is_brought_back_from_the_nodes_store_and_read_whole`
   (server, store-backed: four windows let go, each brought back from the node's store, the object read whole).
-- Open: the let-go after a landing (item 2b), where `ContentStore::let_go` refuses a window more than one holder keeps
-  (`Shared`): a landed push's pack window has several (the push, the repository's pack, its home's region hold), and
-  which may go once the node's store holds the bytes is 2b's.
+- 2b(a) (main 01a20182's rulings of 06:58 and 07:00): once a push's record commits and its changeset landed, its pack
+  as the staging put it in the shard's content store is let go (`vcs_store::let_go_landed_pack`), every window by
+  `ContentStore::let_go_landed`, which lets a landed window go whatever its holders count unless its owner names a
+  holder that pins it, refused `Pinned { by }`. A home pins a window (it reads by the window's identity alone, so it
+  cannot bring it back until 2b(b)): where the window's home is this shard by rendezvous over the node's shards, or the
+  shard holds it for the region (`vcs_store::landed_pin`). The pin is read from where the home is, never a flag, so a
+  restart cannot drop it. A `git_derive` read that meets a let-go window waits (`git_derive::Turned::Waiting`), the
+  window brought back and the derivation begun afresh from the versions still due; in the encoding's turn the wait is
+  put back on the repository for its driver (`Repository::wait_for`). Counted: `vcs_store.landed.let_go_bytes`,
+  `vcs_store.landed.pinned`. Evidence: `a_landed_window_goes_whatever_its_holders_unless_a_holder_pins_it` (vcs),
+  `a_landed_packs_windows_go_but_those_a_home_holds_here` (server, store-backed). Lands after w-git's driver wait in
+  upload and the encoding.
+- Open: 2b(b), homes' read-through (window -> payload identity and offset), which lifts the homes' pin.
 

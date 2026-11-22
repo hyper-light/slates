@@ -808,6 +808,14 @@ impl Repository {
     self.waiting.take()
   }
 
+  /// Notes `waited` as what a step waits for, where none is noted yet ([`Repository::waiting`]): what a caller that took
+  /// a step's miss to act on it gives back when another step of its turn is the one its driver brings it back for.
+  pub fn wait_for(&self, waited: packed::Waited) {
+    if self.waiting.get().is_none() {
+      self.waiting.set(Some(waited));
+    }
+  }
+
   /// The bytes of the indexed object whose row is `row`, naming `content` ([`Repository::read_stored`]).
   pub fn row_bytes<'s>(
     &self,

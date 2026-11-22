@@ -594,23 +594,36 @@ pub(crate) fn region_changes_committed() {
 
 /// The region holds a recovered shard image carried, taken back once its content store is made over the restored
 /// windows (`super::VcsStores::content_made`): each held again where the store has it (a restored window is held by no
-/// one until something holds it, and is freed once every record is replayed, `release_unheld`). How many were held.
+/// one until something holds it, and is freed once every record is replayed, `release_unheld`). How many were held, and
+/// the ones it could not take back (the store lacks the window, refused its hold, or the set was borrowed), never skipped
+/// unseen: a region hold is the pin that keeps a landed window in RAM (goal 93 item 2b, main 01a20182's ruling of
+/// 2026-11-22 07:33), so one lost is counted and logged by the recovery.
 pub(crate) fn restore_region_holds(
   content: &mut slates_vcs::ContentStore,
   identities: &[ContentId],
-) -> u64 {
+) -> (u64, Vec<ContentId>) {
   let mut held = 0u64;
+  let mut refused = Vec::new();
   for identity in identities {
-    if content.contains(identity) && content.hold(identity).is_ok() {
-      REGION_HELD.with(|region| {
-        if let Ok(mut region) = region.try_borrow_mut() {
-          region.insert(*identity);
-        }
-      });
+    if !content.contains(identity) || content.hold(identity).is_err() {
+      refused.push(*identity);
+      continue;
+    }
+    let kept = REGION_HELD.with(|region| {
+      region
+        .try_borrow_mut()
+        .map(|mut region| region.insert(*identity))
+        .is_ok()
+    });
+    if kept {
       held = held.saturating_add(1);
+    } else {
+      // Held in the store, but not named as the region's: given back, so the store's count and the set agree.
+      let _ = content.release(identity);
+      refused.push(*identity);
     }
   }
-  held
+  (held, refused)
 }
 
 /// Keeps the window `bytes` on this shard for the region (module docs, "From the region"): a window held for the region
