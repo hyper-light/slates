@@ -60978,7 +60978,13 @@ owed.
 - **Owed.** main's git/git whole round: the clone within PATIENCE, the encoding's `reuse_unread` 0. Piece 3: the windows
   a fetch brought back let go behind its cursor (w-shared's `let_go_read`, with 2b(a)), so residency at its peak is a
   turn's windows, gauged; and the end-to-end red over a real pushed pack, which needs 2b(a)'s let-go of `Shared`
-  windows. The encoding's own look-ahead: it still makes a due version's packs resident whole.
+  windows.
+- **The encoding's side** (main 01a20182's note of 2026-11-22: the last whole-pack residency). An encoding unit whose
+  pushed entry lies in a let-go window, or a copy reaching one, stops the same way (`Encoding::waiting`, `stopped`), its
+  object put back first in line; its driver brings that window back before the next turn. Nothing makes a repository's
+  packs resident whole any more. Test: `slates-git`
+  `a864_an_encoding_that_meets_a_let_go_window_stops_cleanly_and_keeps_the_same_fragments` (every window let go: stopped,
+  every object reused, the clone of its fragments byte for byte the clone of an encoding that met none; red: refused).
 
 ### A-865 — A Subversion increment names its stored texts (A-760), and a recovery brings back the names its content store lacks (2026-11-22, w-svn; main 01a20182's rulings of 11:05, ~11:35 and ~11:50 PST, goal 93, P7 finding (2); A-760, A-862, A-863, C2 stage C)
 Applied in the same change to:
