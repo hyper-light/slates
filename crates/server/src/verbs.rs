@@ -12956,7 +12956,20 @@ fn refinement_owed(
 }
 
 /// Runs each parked submit again in its own transaction, in the order they came, and answers it on its route.
+#[track_caller]
 pub(crate) fn resume_all(state: &mut ShardState, parked: Vec<ParkedSubmit>) {
+  let g222_at = std::panic::Location::caller();
+  let g222_now = state.clock.monotonic_ns();
+  for submit in &parked {
+    if let Some(route) = submit.route.as_ref() {
+      crate::g222_diag::resumed(
+        route.request,
+        g222_now.saturating_sub(submit.parked_ns),
+        g222_at,
+      );
+    }
+  }
+  crate::g222_diag::resumes_done();
   for submit in parked {
     let ParkedSubmit {
       origin,

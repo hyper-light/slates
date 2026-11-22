@@ -528,6 +528,7 @@ fn finish(
     state.refining.done.remove(&work);
   }
   if let Some(parked) = state.refining.parked.remove(&work) {
+    crate::g222_diag::job_turns(turns.0);
     crate::verbs::resume_all(state, parked);
   }
   crate::work_home::refined(state, work);

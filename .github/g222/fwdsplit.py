@@ -11,7 +11,7 @@ import sys
 COLS = ["queued", "served", "landed", "written", "deferred", "complete", "owner_met", "owner_kick_after",
         "owner_kick_run", "owner_run_start", "owner_work", "origin_met", "origin_kick_after", "origin_kick_run",
         "origin_run_home", "home_written", "placement", "resolve_met", "resolve_kick_after", "resolve_kick_run",
-        "resolve_run_at", "mask", "deliver_file", "deliver_line"]
+        "resolve_run_at", "mask", "deliver_file", "deliver_line", "park_wait", "resume_file", "resume_line", "job_turns"]
 AT = {name: at for at, name in enumerate(COLS)}
 
 
@@ -74,13 +74,24 @@ except OSError:
     pass
 groups = {}
 for r in deferred:
-    key = (r[AT["complete"]], r[AT["mask"]], files.get(r[AT["deliver_file"]], "-"), r[AT["deliver_line"]])
-    groups.setdefault(key, []).append(r[AT["served"]])
-print(" by kind, stamps made (sent 1 started 2 replied 4 home 8 waiting 16 resolved 32 delivered 64) and deliver site:")
-for key, served in sorted(groups.items(), key=lambda item: -len(item[1])):
-    served.sort()
-    print(f"   complete {key[0]} mask {key[1]:3} deliver {key[2]}:{key[3]}: n {len(served)} served p50/p99/p999/max us "
-          f"{us(pc(served, .5))} {us(pc(served, .99))} {us(pc(served, .999))} {us(served[-1])}")
+    key = (r[AT["complete"]], r[AT["mask"]], files.get(r[AT["deliver_file"]], "-"), r[AT["deliver_line"]],
+           files.get(r[AT["resume_file"]], "-"), r[AT["resume_line"]])
+    groups.setdefault(key, []).append(r)
+print(" by kind, stamps made (sent 1 started 2 replied 4 home 8 waiting 16 resolved 32 delivered 64 resumed 128),"
+      " deliver site and resume site:")
+for key, members in sorted(groups.items(), key=lambda item: -len(item[1])):
+    members.sort(key=lambda r: r[AT["served"]])
+    served = [r[AT["served"]] for r in members]
+    print(f"   complete {key[0]} mask {key[1]:3} deliver {key[2]}:{key[3]} resume {key[4]}:{key[5]}: n {len(served)} "
+          f"served p50/p99/p999/max us {us(pc(served, .5))} {us(pc(served, .99))} {us(pc(served, .999))} {us(served[-1])}")
+    if key[1] & 128:
+        waits = sorted(r[AT["park_wait"]] for r in members)
+        turns = sorted(r[AT["job_turns"]] for r in members)
+        tail = members[int(len(members) * .99):]
+        print(f"     park wait p50/p99/p999 us {us(pc(waits, .5))} {us(pc(waits, .99))} {us(pc(waits, .999))}; job turns "
+              f"p50/p99/max {pc(turns, .5)} {pc(turns, .99)} {turns[-1]}; served p99 tail: park wait med "
+              f"{us(med([r[AT['park_wait']] for r in tail]))} us of served med {us(med([r[AT['served']] for r in tail]))}"
+              f" us, job turns med {med([r[AT['job_turns']] for r in tail])}")
 for kind, flag, parts in (("forwards", 1, FORWARD), ("accepted submits", 2, ACCEPTED)):
     whole = sorted((r for r in deferred if r[AT["complete"]] == flag), key=lambda r: r[AT["served"]])
     if not whole:

@@ -158,6 +158,52 @@ struct Fwd {
   /// The `state::deliver` call's file (a short hash, named in the ring's header) and line.
   deliver_file: u64,
   deliver_line: u64,
+  /// A parked submit run again (`verbs::resume_all`): how long it was parked, who resumed it, and the refining job's
+  /// turns when a refinement's end resumed it.
+  park_wait: u64,
+  resume_file: u64,
+  resume_line: u64,
+  job_turns: u64,
+}
+
+thread_local! {
+  /// The turns of the refining job whose end is resuming its parked submits now (0 for any other resume).
+  static JOB_TURNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A refining job ended after `turns` turns: its parked submits are resumed next.
+pub fn job_turns(turns: u64) {
+  JOB_TURNS.set(turns);
+}
+
+fn file_hash(at: &std::panic::Location<'_>) -> u64 {
+  let file = at.file().bytes().fold(0u64, |hash, byte| {
+    hash.wrapping_mul(31).wrapping_add(u64::from(byte))
+  }) % 1_000_000;
+  if let Ok(mut guard) = FILES.lock() {
+    guard
+      .get_or_insert_with(std::collections::HashMap::new)
+      .entry(file)
+      .or_insert_with(|| at.file().to_owned());
+  }
+  file
+}
+
+/// A parked submit of request `request` run again after `waited` ns parked, resumed from `at`.
+pub fn resumed(request: u64, waited: u64, at: &std::panic::Location<'_>) {
+  let (file, line, turns) = (file_hash(at), u64::from(at.line()), JOB_TURNS.get());
+  fwd(request, |f| {
+    f.mask |= 128;
+    f.park_wait = waited;
+    f.resume_file = file;
+    f.resume_line = line;
+    f.job_turns = turns;
+  });
+}
+
+/// The resumes of one `resume_all` are done.
+pub fn resumes_done() {
+  JOB_TURNS.set(0);
 }
 static FWD: std::sync::Mutex<Option<std::collections::HashMap<u64, Fwd>>> =
   std::sync::Mutex::new(None);
@@ -171,7 +217,8 @@ const FWD_CAP: usize = 100_000;
 /// run, run -> stamp), the owner's work (start -> reply sent, or -> the acceptance wait's start), the same four for the
 /// origin from the reply's sending, the origin's reply task to the reply written; for an accepted submit the wait for
 /// placement and how the owner met it; and for every one the stamps made and the `deliver` call's file and line.
-const FWD_COLS: usize = 19;
+/// And for a parked submit run again: its park's wait, the resume's file and line, and the refining job's turns.
+const FWD_COLS: usize = 23;
 
 fn fwd(request: u64, change: impl FnOnce(&mut Fwd)) {
   if let Ok(mut guard) = FWD.lock() {
@@ -294,6 +341,10 @@ fn fwd_split(request: u64, written: u64) -> [u64; FWD_COLS] {
   out[16] = f.mask;
   out[17] = f.deliver_file;
   out[18] = f.deliver_line;
+  out[19] = f.park_wait;
+  out[20] = f.resume_file;
+  out[21] = f.resume_line;
+  out[22] = f.job_turns;
   let accepted = f.replied == 0 && f.waiting != 0 && f.resolved != 0;
   if f.sent == 0 || f.started == 0 || f.home == 0 || (f.replied == 0 && !accepted) {
     return out;
@@ -371,7 +422,7 @@ pub fn dump_ring(path: &str) {
   let n = RING_TAKEN.load(Relaxed).min(RING_CAP);
   let mut out = files_header();
   out += &format!(
-    "# client sends {} rings {}\nqueued\tserved\tlanded\twritten\tdeferred\tcomplete\towner_met\towner_kick_after\towner_kick_run\towner_run_start\towner_work\torigin_met\torigin_kick_after\torigin_kick_run\torigin_run_home\thome_written\tplacement\tresolve_met\tresolve_kick_after\tresolve_kick_run\tresolve_run_at\tmask\tdeliver_file\tdeliver_line\n",
+    "# client sends {} rings {}\nqueued\tserved\tlanded\twritten\tdeferred\tcomplete\towner_met\towner_kick_after\towner_kick_run\towner_run_start\towner_work\torigin_met\torigin_kick_after\torigin_kick_run\torigin_run_home\thome_written\tplacement\tresolve_met\tresolve_kick_after\tresolve_kick_run\tresolve_run_at\tmask\tdeliver_file\tdeliver_line\tpark_wait\tresume_file\tresume_line\tjob_turns\n",
     slates_ipc::endpoint::G222_SENDS.swap(0, Relaxed),
     slates_ipc::endpoint::G222_RINGS.swap(0, Relaxed)
   );
