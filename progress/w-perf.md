@@ -301,3 +301,33 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   w-hg landed the fix as a3e673efc (`TcpStream::write_some`, red `vcs_ssh::tests::hg::a_rekey_during_a_blocked_write_sends_no_byte_twice`).
   My uncommitted slates-rt `TcpStream::write` and its test were dropped unlanded; nothing of mine is in vcs_ssh.
   Back on goal 93's reserve, no runs.
+
+## 2026-11-22 ~05:10 PST: 84a (macOS p999, then Linux), main 01a20182's piece; stopped at main's §8 correction
+- LANDED: 4a1686023 (docs only). The refining job's paced turns, two arms, were measured and rejected: dead even with
+  main on one runner's interleaved rounds. BENCHMARKS "84a on macOS: the refining job's turns paced" holds both runs'
+  tables (45006705328, 45010946191); GAPS 84a has a line.
+- macOS read, stamped under TB (diag-measurer-w-perf-84a, never main):
+  - No wait holds p999. Shard parks: 0-1 of ~16k a round waited >= 1 ms past their timeout. Client parks 0.9-1.2 ms:
+    3-10 of ~73k. The client's wake has a median of 4-12 µs in the tails.
+  - The slow classes:
+    - submits parked behind their refinement (the job's yields plus the resumed run, all CPU);
+    - lease_wait work-queue verbs (2.6% of requests, no single leg).
+  - Round-to-round variance dominates. The macOS close needs more rounds a run, main's call.
+- Linux read (runs 45017505026, 45018893846):
+  - Kernel 7.0 azure, HZ=1000, PREEMPT_LAZY, RUN_TO_PARITY, base slice 2.1 ms.
+  - A woken or runnable shard doesn't get its CPU against the spinners: arm kick -> run p50 920 µs; x86 queued 2.8-3.9 ms.
+  - RLIMIT_RTPRIO is 0:0 on the stock runner account.
+- Linux arm, under an administrator's RTPRIO 1:1 grant (sudo prlimit, both arms; the daemon asks nothing, R10):
+  - B 21179849c, the shards in SCHED_RR (grant or skip): kick -> run 921 -> 8 µs (stamped run 45020845000). The tail
+    moved to the client's time-share wake (2.5-3.0 ms). Plain A/B 45020495221: no starvation; the quiet path worse
+    (p50 +10-35%, arm R9 p99 82 -> 111 µs).
+  - D 69c483e8d: B plus the client's reply-wait park in RR (sched_getattr, exact restore, a typed refusal if refused,
+    counted).
+  - C 0a7e06c56: D with the shards spinning R9's floor alone at RR, floor spins counted.
+  - Four-arm A/B: run 45023871879 (branch diag-measurer-w-perf-84a-linux-ab, A d2c6635a2). MAIN reads it (§8). Not
+    mine to wait on.
+- To LAND C (or D) if main's table says so: a clean branch from origin/main, cherry-picking d2c6635a2, 21179849c,
+  69c483e8d and 0a7e06c56 only (never the diag workflow commits on that branch). Then focused tests (slates-rt and
+  slates-machine round_robin, slates-ipc endpoint), fmt; design, GAPS and BENCHMARKS lines; claim an A-number.
+- Rule from main (05:05 PST): agents never push diag CI, A/B or bench runs, or wait on CI. Prepare the branch unpushed or
+  write run-requests.md, then tell main.
