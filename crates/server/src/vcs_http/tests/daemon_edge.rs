@@ -1421,6 +1421,63 @@ fn a_mercurial_push_past_its_first_admission_waits_for_room_and_lands_whole() {
   );
 }
 
+/// Shape: the push's first room in [`a_mercurial_push_whose_wait_is_past_its_repositorys_ceiling_is_refused_in_the_typed_words`]:
+/// short of its begin's first charge (176 bytes), past the reply that answers its refusal (131), since the edge frames
+/// the reply within the room the push was given.
+const CEILING_ROOM: u64 = 160;
+
+/// Main 01a20182's (ii) of 2026-11-22 05:01 (w-interop's whole-history push of hg on arm: its need passed its
+/// repository's ceiling while it waited, and it was answered its step's bare `PastAdmission`, the wait's give-up past
+/// the ceiling told as one past its patience). Do: start a two-shard daemon over loopback TLS; create a Mercurial
+/// repository; push one changeset as stock hg posts it, its intake's first room [`CEILING_ROOM`] bytes
+/// (`hg_push::TEST_FIRST_INTAKE_ROOM`) and its repository's ceiling one byte (`vcs_share::wait::TEST_CEILING`), so its
+/// begin's wait is for more than it could ever be lent. Expect the push refused in the typed words that it could never
+/// be taken (`hg_push::PAST_CEILING`), no wait taken (`vcs_share.room_waits_taken` zero). Red before: its step's bare
+/// `PastAdmission` refusal.
+#[test]
+fn a_mercurial_push_whose_wait_is_past_its_repositorys_ceiling_is_refused_in_the_typed_words() {
+  let (identity, certificate) = identity();
+  let (daemon, _instance) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  create_empty_hg(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let made = history_of(&[(
+    "ceiling",
+    "ceiling",
+    b"a push past its repository's ceiling\n",
+    None,
+    "default",
+  )]);
+  crate::daemon::observe_at(&daemon, REPOSITORY, |_| {
+    crate::repository::hg_push::TEST_FIRST_INTAKE_ROOM.with(|first| first.set(CEILING_ROOM));
+    crate::vcs_share::wait::TEST_CEILING.with(|ceiling| ceiling.set(1));
+  });
+  let pushed = hg_unbundle((port, &certificate), &name, &history_bundle(&made, &[0]));
+  let taken = (0..daemon.shards().len())
+    .map(|partition| {
+      crate::daemon::observe_at(&daemon, partition, |state| {
+        state
+          .refusals
+          .get(crate::vcs_share::wait::TAKEN)
+          .copied()
+          .unwrap_or(0)
+      })
+    })
+    .sum::<u64>();
+  crate::daemon::observe_at(&daemon, REPOSITORY, |_| {
+    crate::vcs_share::wait::TEST_CEILING.with(|ceiling| ceiling.set(0));
+  });
+  daemon.stop();
+  let words = crate::repository::hg_push::PAST_CEILING;
+  assert!(
+    pushed.2.windows(words.len()).any(|at| at == words),
+    "the push refused in the typed words past its ceiling: {}",
+    String::from_utf8_lossy(&pushed.2)
+  );
+  assert_eq!(taken, 0, "no wait was taken");
+}
+
 /// Main 01a20182's order of 2026-11-22 03:35 (w-interop's ubuntu find: a chunked push of hg's history at revision 12,000
 /// answered `push refused: the content store could not hold its increments; push again`). Do: start a two-shard daemon
 /// over loopback TLS; create a Mercurial repository; push one changeset as stock hg posts it, its increments' first hold

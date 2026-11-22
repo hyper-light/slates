@@ -2273,7 +2273,7 @@ async fn taking_begun(
     }
   }
   let sized = crate::state::with_state(|state| {
-    admitted_its_need(state, repository, (&mut taking, step), (room, admitted))
+    admitted_its_need(state, (&mut taking, step), (room, admitted))
   })?;
   Some(sized.map(|()| taking))
 }
@@ -2425,7 +2425,7 @@ pub(crate) const PUSH_NEED_ADMITTED: &str = "vcs.hg.push_need_admitted";
 
 /// Format: slates' words for a push whose known need is past the most its repository could ever be lent on its shard:
 /// it could never be taken there, so it is refused at once, never waited for.
-const PAST_CEILING: &[u8] =
+pub(crate) const PAST_CEILING: &[u8] =
   b"push refused: it needs more room than its repository could ever be lent on its shard";
 
 /// `taking`'s push admitted its known need up front (main 01a20182's ruling (a) of 2026-11-22 04:23): what its begin holds
@@ -2436,7 +2436,6 @@ const PAST_CEILING: &[u8] =
 /// it was taken within.
 fn admitted_its_need(
   state: &mut ShardState,
-  repository: RepositoryId,
   (taking, step): (&mut Taking, u64),
   (room, admitted): (&mut Admission, &mut u64),
 ) -> Result<(), PushOutcome> {
@@ -2444,7 +2443,11 @@ fn admitted_its_need(
     return Ok(());
   };
   let held = admitted.saturating_sub(room.left());
-  let need = need_of(state, repository, (held, intake.bookkeeping()), step)?;
+  let need = need_of(
+    state,
+    (held, intake.bookkeeping(), intake.widest_full_text()),
+    step,
+  )?;
   if need <= *admitted {
     return Ok(());
   }
@@ -2456,18 +2459,18 @@ fn admitted_its_need(
 }
 
 /// A push's known need: what it holds and what its steps will keep, with `step` for a step's working set, within the
-/// repository's ceiling (what others do not hold); refused, typed, where what it must keep is past the ceiling, since it
-/// could never be taken there. A step's room past the ceiling is the step's to wait for.
+/// repository's ceiling (`vcs_share::wait::ceiling`); refused, typed, where what it must keep and the least room one of
+/// its steps takes (`least`, `Intake::widest_full_text`) are past the ceiling, since it could never be taken there
+/// (main 01a20182's (ii) of 2026-11-22 05:01). A step's room past the ceiling beyond that least is the step's to wait for.
 fn need_of(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  (held, bookkeeping): (u64, u64),
+  state: &ShardState,
+  (held, bookkeeping, least): (u64, u64, u64),
   step: u64,
 ) -> Result<u64, PushOutcome> {
   let keeping = held.saturating_add(bookkeeping);
-  let ceiling = crate::vcs_share::wait::ceiling(state, repository);
-  if keeping > ceiling {
-    return Err(PushOutcome::refused(&abort(PAST_CEILING.to_vec())));
+  let ceiling = crate::vcs_share::wait::ceiling(state);
+  if keeping.saturating_add(least) > ceiling {
+    return Err(past_ceiling());
   }
   Ok(keeping.saturating_add(step).min(ceiling))
 }
@@ -2475,9 +2478,7 @@ fn need_of(
 /// An admission of `need` bytes, `held` of them charged first: what the push already holds.
 fn grown_to(need: u64, held: u64) -> Result<Admission, PushOutcome> {
   let mut grown = Admission::new(need);
-  grown
-    .charge(held)
-    .map_err(|_| PushOutcome::refused(&abort(PAST_CEILING.to_vec())))?;
+  grown.charge(held).map_err(|_| past_ceiling())?;
   Ok(grown)
 }
 
@@ -2510,7 +2511,10 @@ async fn begun_after_waits(
         *admitted = grown;
         *room = Admission::new(grown);
       }
-      Err(()) => return Some(Err(PushOutcome::refused(&intake_refused(&refused)))),
+      Err(WaitEnded::PastCeiling) => return Some(Err(past_ceiling())),
+      Err(WaitEnded::Patience) => {
+        return Some(Err(PushOutcome::refused(&intake_refused(&refused))));
+      }
     }
   }
 }
@@ -2529,8 +2533,10 @@ async fn retaken(
   };
   let held = admitted.saturating_sub(room.left());
   let needed = held.saturating_add(past.asked);
-  let Ok(grown) = room_after_wait(repository, *admitted, Some(needed)).await? else {
-    return Some(Err(intake_outcome(&refused)));
+  let grown = match room_after_wait(repository, *admitted, Some(needed)).await? {
+    Ok(grown) => grown,
+    Err(WaitEnded::PastCeiling) => return Some(Err(past_ceiling())),
+    Err(WaitEnded::Patience) => return Some(Err(intake_outcome(&refused))),
   };
   let mut regrown = Admission::new(grown);
   if regrown.charge(held).is_err() {
@@ -2569,15 +2575,28 @@ thread_local! {
 /// 2026-11-22 03:03). Format: a counter name in the status report.
 pub(crate) const INTAKE_ROOM_WAITS: &str = "vcs.hg.push_intake_room_waits";
 
+/// How a push's wait for room ended without room (`vcs_share::wait`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitEnded {
+  /// No room came within the wait's patience: the push's step is answered its own refusal.
+  Patience,
+  /// Its need is past the most the repository could ever be lent: the push is answered [`PAST_CEILING`].
+  PastCeiling,
+}
+
+/// The push's refusal past the most its repository could ever be lent ([`PAST_CEILING`]).
+fn past_ceiling() -> PushOutcome {
+  PushOutcome::refused(&abort(PAST_CEILING.to_vec()))
+}
+
 /// Waits for repository `id`'s room to grow past `admitted` and cover `needed` where it is known (`vcs_share::wait`):
 /// a push's intake past its admission, or its increments past what the content store can hold now. The room the wait
-/// gave; `Err` where it gave up (its patience, or a need past the most the repository could ever be lent); none where
-/// the shard's state is gone.
+/// gave; how it ended where it gave none ([`WaitEnded`]); none where the shard's state is gone.
 async fn room_after_wait(
   id: RepositoryId,
   admitted: u64,
   needed: Option<u64>,
-) -> Option<Result<u64, ()>> {
+) -> Option<Result<u64, WaitEnded>> {
   let mut wait = crate::vcs_share::wait::RoomWait::new(admitted, slates_rt::futures::now_ns());
   let _ = crate::state::with_state(|state| state.count(INTAKE_ROOM_WAITS, 1));
   loop {
@@ -2598,17 +2617,27 @@ async fn room_after_wait(
         let _ = slates_rt::futures::sleep(ns).await;
       }
       crate::vcs_share::wait::Waited::GiveUp => {
-        // Named in the daemon's log with its numbers, so a run that meets it says whether the push's need passed the
-        // repository's ceiling or the wait its patience (main 01a20182's order of 2026-11-22 04:15).
+        // Named in the daemon's log with its numbers, so a run that meets it says what the push needed against the
+        // room and ceiling its patience ran out under (main 01a20182's order of 2026-11-22 04:15).
         let _ = crate::state::with_state(|state| {
-          let ceiling = crate::vcs_share::wait::ceiling(state, id);
+          let ceiling = crate::vcs_share::wait::ceiling(state);
           let room = crate::vcs_share::room(state, id).bytes;
           slates_machine::log_line!(
             "slates-server: a push's intake waited for room and gave up: it needed {needed:?} bytes, was admitted \
              {admitted}, the repository's room is {room} and its ceiling {ceiling}"
           );
         });
-        return Some(Err(()));
+        return Some(Err(WaitEnded::Patience));
+      }
+      crate::vcs_share::wait::Waited::PastCeiling => {
+        let _ = crate::state::with_state(|state| {
+          let ceiling = crate::vcs_share::wait::ceiling(state);
+          slates_machine::log_line!(
+            "slates-server: a push's intake needs more than its repository could ever be lent: it needed {needed:?} \
+             bytes, was admitted {admitted}, the ceiling is {ceiling}"
+          );
+        });
+        return Some(Err(WaitEnded::PastCeiling));
       }
     }
   }

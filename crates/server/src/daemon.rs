@@ -8587,7 +8587,7 @@ mod tests {
         let task = slates_rt::futures::spawn(async move {
           let (repository, _) = crate::repository::svn_commit::tests::subversion("barrier").await;
           let texts = slates_svn::commit::drive::HeldTexts::new();
-          let staged = texts.stage().unwrap();
+          let staged = texts.stage(None).unwrap();
           texts.append(staged, &put).unwrap();
           texts.seal(staged, text.identity).unwrap();
           let work = slates_svn::commit::drive::Work {
