@@ -8587,7 +8587,7 @@ mod tests {
         let task = slates_rt::futures::spawn(async move {
           let (repository, _) = crate::repository::svn_commit::tests::subversion("barrier").await;
           let texts = slates_svn::commit::drive::HeldTexts::new();
-          let staged = texts.stage().unwrap();
+          let staged = texts.stage(None).unwrap();
           texts.append(staged, &put).unwrap();
           texts.seal(staged, text.identity).unwrap();
           let work = slates_svn::commit::drive::Work {
@@ -12443,5 +12443,309 @@ mod tests {
         && shortfall.coincident_failures == 2,
       "the shortfall carries the measured loss, the accepted ε and the failure count: {shortfall:?}"
     );
+  }
+
+  /// Format: the segment bound [`t_b1_a_crash_at_any_segment_boundary_leaves_a_push_whole_or_absent`]'s push is cut at:
+  /// about a changeset a segment.
+  const B1_SEGMENT_BYTES: u64 = 2048;
+
+  /// The principal [`t_b1_a_crash_at_any_segment_boundary_leaves_a_push_whole_or_absent`]'s repository is made and
+  /// pushed by.
+  fn b1_owner() -> slates_db::catalog::Principal {
+    slates_db::catalog::Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 1234,
+    }
+  }
+
+  /// What a daemon over a retained segment saw of the oracle's repository: its changesets, the last sequence it counts
+  /// landed, the run its register names last, and the replays refused.
+  type B1Seen = (u32, u64, Option<slates_hg::import::record::Run>, u64);
+
+  /// The oracle's look at `repository` on `state`.
+  fn b1_seen(
+    state: &mut crate::state::ShardState,
+    repository: slates_db::catalog::RepositoryId,
+  ) -> B1Seen {
+    let changesets = state
+      .vcs_stores
+      .mercurial_ref(repository)
+      .map_or(0, |(content, store)| {
+        store.index.len(content, slates_hg::index::Log::Changelog)
+      });
+    let records = state.db.partition().repositories();
+    let run = (0..)
+      .map_while(|index| records.object_record(repository, index))
+      .filter_map(slates_hg::import::record::run_of)
+      .last();
+    (
+      changesets,
+      state.vcs_stores.landed_of(repository).unwrap_or(0),
+      run,
+      state
+        .refusals
+        .get(crate::vcs_store::REPLAY_REFUSED)
+        .copied()
+        .unwrap_or(0),
+    )
+  }
+
+  /// Pushes `bundle` to `repository` from a task on `daemon`'s shard through the daemon's driver
+  /// (`hg_push::unbundle`), admitted the room an edge admits; its outcome sent on `sent` once answered.
+  fn b1_push(
+    daemon: &super::Daemon,
+    repository: slates_db::catalog::RepositoryId,
+    bundle: &[u8],
+    sent: std::sync::mpsc::Sender<Option<slates_hg::push::Outcome>>,
+  ) {
+    let bundle = bundle.to_vec();
+    daemon
+      .observe(daemon.shards.first().copied(), move |state| {
+        let room = crate::vcs_share::room(state, repository).bytes;
+        let bundle = bundle.clone();
+        let sent = sent.clone();
+        let task = slates_rt::futures::spawn(async move {
+          let heads = slates_hg::push::check::HeadsArgument::Force;
+          let mut admission = slates_hg::Admission::new(room);
+          let outcome = crate::repository::hg_push::unbundle(
+            repository,
+            (&b1_owner(), &heads, &bundle),
+            &mut admission,
+          )
+          .await;
+          let _ = sent.send(outcome);
+        })
+        .unwrap();
+        slates_rt::futures::detach(task).unwrap();
+      })
+      .unwrap();
+  }
+
+  /// `daemon`'s shard looked at with `look` until it answers some, or the liveness budget's bound passes.
+  fn b1_until<T: Send + 'static>(
+    daemon: &super::Daemon,
+    look: impl FnOnce(&mut crate::state::ShardState) -> Option<T> + Clone + Send + 'static,
+  ) -> Option<T> {
+    let started = std::time::Instant::now();
+    let bound = std::time::Duration::from_nanos(10 * crate::daemon::LIVENESS_BUDGET_NS);
+    while started.elapsed() < bound {
+      if let Ok(Some(seen)) = daemon.observe(daemon.shards.first().copied(), look.clone()) {
+        return Some(seen);
+      }
+      std::thread::park_timeout(std::time::Duration::from_millis(20));
+    }
+    None
+  }
+
+  /// One crash of the oracle (main 01a20182's ruling (b1)): on a daemon over a retained anchor segment holding a store,
+  /// make a Mercurial repository and push `bundle` to it cut at [`B1_SEGMENT_BYTES`]; where `crash` names a segment
+  /// count, park the push once its run has landed that many, push `bundle` again (parked on the turn), and stop the
+  /// daemon with nothing more published, as a kill -9 leaves it; else stop it once the push is answered. Then start a
+  /// successor over the same segment and store, wait for its recovery of the repository, push `bundle` again there,
+  /// and look. What the first saw before its crash, the successor after its recovery, and after its push; and the
+  /// first's outcome where it answered.
+  fn b1_crash(
+    name: &str,
+    bundle: &[u8],
+    crash: Option<u64>,
+  ) -> (
+    B1Seen,
+    B1Seen,
+    B1Seen,
+    Option<slates_hg::push::Outcome>,
+    u64,
+  ) {
+    use slates_anchor::AnchorSegment;
+    let profile = test_profile();
+    let instance = format!("{name}-{}", std::process::id());
+    let store = crate::test_store::TestStore::start(name);
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    config.vcs_disk = Some(store.handle());
+    let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
+      .unwrap()
+      .with_content(&super::content_name_of(&instance), config.content_bytes())
+      .unwrap();
+    let rendezvous = slates_ipc::HeldRendezvous::hold(&instance).unwrap();
+    let source = || {
+      let (handoff, len) = segment.handoff().unwrap();
+      super::SegmentSource::Handoff {
+        handoff,
+        len,
+        content: segment.content_handoff().unwrap(),
+        rendezvous: rendezvous.adoption(),
+      }
+    };
+    let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
+    first.bootstrap(true).unwrap();
+    let at = crash.unwrap_or(0);
+    let repository = first
+      .observe(first.shards.first().copied(), move |state| {
+        crate::repository::hg_run::TEST_SEGMENT_BYTES.with(|bound| bound.set(B1_SEGMENT_BYTES));
+        crate::repository::hg_run::TEST_PARK_AFTER_SEGMENTS.with(|park| park.set(at));
+        let reply = crate::test_store::create(
+          state,
+          &b1_owner(),
+          slates_ipc::protocol::RequestBody::CreateRepository {
+            name: "oracle".to_owned(),
+            tool: slates_ipc::protocol::VcsTool::Mercurial,
+            format: slates_ipc::protocol::ObjectFormat::Sha1,
+            default_branch: crate::repository::hg_push::line_name(b"default", 0),
+            green: None,
+          },
+        );
+        assert!(
+          matches!(reply, slates_ipc::protocol::ReplyBody::GreenCreated { .. }),
+          "{reply:?}"
+        );
+        state
+          .db
+          .partition()
+          .repositories()
+          .repository_named("oracle")
+          .unwrap()
+          .id
+      })
+      .unwrap();
+    let (sent, answered) = std::sync::mpsc::channel();
+    b1_push(&first, repository, bundle, sent.clone());
+    let (outcome, parked) = match crash {
+      Some(segments) => {
+        let landed = b1_until(&first, move |state| {
+          let count = state
+            .refusals
+            .get(crate::repository::hg_run::SEGMENTS_LANDED)
+            .copied()
+            .unwrap_or(0);
+          (count == segments).then_some(())
+        });
+        assert!(landed.is_some(), "the push landed {segments} segments");
+        b1_push(&first, repository, bundle, sent);
+        let parked = b1_until(&first, |state| {
+          state
+            .refusals
+            .get(crate::repository::hg_run::TURN_WAITS)
+            .copied()
+            .filter(|waits| *waits > 0)
+        });
+        (None, parked.unwrap_or(0))
+      }
+      None => (answered.recv().ok().flatten(), 0),
+    };
+    let before = first
+      .observe(first.shards.first().copied(), move |state| {
+        b1_seen(state, repository)
+      })
+      .unwrap();
+    // The crash: nothing more published.
+    first.stop();
+    let second = super::Daemon::start(&profile, config, source()).unwrap();
+    let recovered = b1_until(&second, move |state| {
+      let done = state.vcs_stores.unrecovered(repository).is_none()
+        && !state.vcs_stores.rebuilding(repository)
+        && state.vcs_stores.holds(repository);
+      let refused = state
+        .refusals
+        .get(crate::vcs_store::REPLAY_REFUSED)
+        .copied()
+        .unwrap_or(0);
+      (done || refused > 0).then(|| b1_seen(state, repository))
+    })
+    .expect("the successor recovered the repository or refused its replay");
+    second
+      .observe(second.shards.first().copied(), |_| {
+        crate::repository::hg_run::TEST_SEGMENT_BYTES.with(|bound| bound.set(B1_SEGMENT_BYTES));
+      })
+      .unwrap();
+    let (sent, again) = std::sync::mpsc::channel();
+    b1_push(&second, repository, bundle, sent);
+    let again = again.recv().ok().flatten();
+    assert!(
+      matches!(again, Some(slates_hg::push::Outcome::Accepted(_))),
+      "the successor took the push again: {again:?}"
+    );
+    let after = second
+      .observe(second.shards.first().copied(), move |state| {
+        b1_seen(state, repository)
+      })
+      .unwrap();
+    second.stop();
+    drop(segment);
+    (before, recovered, after, outcome, parked)
+  }
+
+  /// Main 01a20182's ruling (b1) of 2026-11-22 04:44 (a push lands as a run of segment changesets; a crash oracle at
+  /// each segment boundary, `crates/land/tests/oracle.rs`'s pattern, with a second push parked on the turn). Do: push
+  /// four changesets of 1.5 KiB files cut at [`B1_SEGMENT_BYTES`] through [`b1_crash`]: once to its answer, then with a
+  /// crash after each count of segments its run lands, a second push parked on the turn each time. Expect, answered:
+  /// the push accepted, its run named, and a successor holding its four changesets with no replay refused (a second
+  /// push of the same bundle lands nothing new). Each crash: the run's segments landed, the second push parked; a
+  /// successor holding none of the push's changesets, counting its next sequence from the creation's, no replay
+  /// refused; its push again accepted, its four changesets held, and its run beginning at the sequence the crashed one
+  /// began at. Never a push half held.
+  #[test]
+  fn t_b1_a_crash_at_any_segment_boundary_leaves_a_push_whole_or_absent() {
+    use crate::repository::hg_push::tests::history_of;
+    let files: Vec<Vec<u8>> = (0..4u8)
+      .map(|at| {
+        (0..1536u32)
+          .map(|byte| b'a' + u8::try_from((byte + u32::from(at)) % 26).unwrap())
+          .collect()
+      })
+      .collect();
+    let leaked: &'static [Vec<u8>] = Box::leak(files.into_boxed_slice());
+    let commits: Vec<crate::repository::hg_push::tests::Commit> = ["one", "two", "three", "four"]
+      .into_iter()
+      .enumerate()
+      .map(|(at, name)| {
+        (
+          name,
+          name,
+          leaked[at].as_slice(),
+          at.checked_sub(1),
+          "default",
+        )
+      })
+      .collect();
+    let made = history_of(&commits);
+    let bundle = crate::vcs_http::daemon_edge_tests::history_bundle(&made, &[0, 1, 2, 3]);
+    let (before, recovered, after, outcome, _) = b1_crash("b1-answered", &bundle, None);
+    assert!(
+      matches!(outcome, Some(slates_hg::push::Outcome::Accepted(_))),
+      "{outcome:?}"
+    );
+    let named = before.2.expect("the answered push's run is named");
+    let segments = named.last - named.first + 1;
+    assert!(segments > 1, "the push landed as {segments} segments");
+    assert_eq!(
+      recovered.0, 4,
+      "the successor holds the answered push whole"
+    );
+    assert_eq!((recovered.2, recovered.3), (Some(named), 0));
+    assert_eq!(after.0, 4);
+    for crash in 1..=segments {
+      let (before, recovered, after, outcome, parked) =
+        b1_crash(&format!("b1-crash-{crash}"), &bundle, Some(crash));
+      println!(
+        "(b1) crash after {crash} of {segments} segments: before {before:?}, recovered {recovered:?}, after {after:?}"
+      );
+      assert!(outcome.is_none(), "the crashed push never answered");
+      assert!(parked > 0, "a second push parked on the turn");
+      assert_eq!(
+        before.0, 0,
+        "the crashed push's fork never replaced the index"
+      );
+      assert_eq!(
+        recovered.0, 0,
+        "a crash after {crash} segments leaves none of the push held"
+      );
+      assert_eq!(recovered.3, 0, "no replay refused");
+      assert_eq!(recovered.2, None, "no entry names the crashed run");
+      assert_eq!(after.0, 4, "the push again is held whole");
+      let run = after.2.expect("the push again names its run");
+      assert_eq!(
+        run.first, named.first,
+        "the push again took the crashed run's sequences"
+      );
+    }
   }
 }

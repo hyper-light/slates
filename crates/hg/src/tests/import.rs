@@ -1542,6 +1542,45 @@ fn an_import_writes_the_changegroup_a_push_of_its_history_brings() {
   }
 }
 
+/// Main 01a20182's ruling (b1) of 2026-11-22 04:44 (a push lands as a run of segment changesets; its entry names the
+/// run, record v9). Do: write a push's run reference of segments 4 to 11 in a room of 1 MiB; read it back; write an
+/// import's of the same run. Expect the golden bytes (the magic, version 9, the push's source byte 1, the room, the first
+/// and the last sequence, each little-endian); the run read back whole as a push's; the import's the same bytes but its
+/// source byte, read back as an import's.
+#[test]
+fn a_pushs_run_reference_is_the_golden_bytes_and_reads_back_as_a_pushs() {
+  use crate::import::record::{Run, Source, run_of, write_push_run_reference, write_run_reference};
+  let written = write_push_run_reference(1 << 20, (4, 11));
+  let golden: Vec<u8> = [
+    &b"SHGR"[..],
+    &9u32.to_le_bytes(),
+    &[1],
+    &(1u64 << 20).to_le_bytes(),
+    &4u64.to_le_bytes(),
+    &11u64.to_le_bytes(),
+  ]
+  .concat();
+  assert_eq!(written, golden);
+  assert_eq!(
+    run_of(&written),
+    Some(Run {
+      source: Source::Push,
+      room: 1 << 20,
+      first: 4,
+      last: 11
+    })
+  );
+  let imported = write_run_reference(1 << 20, (4, 11));
+  let source_at = 8;
+  assert_eq!(imported[source_at], 0);
+  assert_eq!(imported[..source_at], written[..source_at]);
+  assert_eq!(imported[source_at + 1..], written[source_at + 1..]);
+  assert_eq!(
+    run_of(&imported).map(|run| run.source),
+    Some(Source::Import)
+  );
+}
+
 /// A-767 C1 step 3 (an import's run in the register, `record::write_run_reference`). Do: write a run's reference, read
 /// it back; cut it at every length, add a byte, and name a run whose last precedes its first; replay the reference as
 /// a record. Expect the run read back whole; every damaged one read as no run; and the replay refused by version (the
@@ -1553,6 +1592,7 @@ fn an_imports_run_reference_reads_back_whole_or_not_at_all() {
   assert_eq!(
     run_of(&written),
     Some(Run {
+      source: crate::import::record::Source::Import,
       room: 1 << 20,
       first: 3,
       last: 9

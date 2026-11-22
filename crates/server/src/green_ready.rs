@@ -417,7 +417,7 @@ fn waited(
       }
     }
     crate::vcs_share::wait::Waited::Wait(ns) => Step::Wait(ns),
-    crate::vcs_share::wait::Waited::GiveUp => {
+    crate::vcs_share::wait::Waited::GiveUp | crate::vcs_share::wait::Waited::PastCeiling => {
       *held = None;
       give_up(state, green);
       Step::End
