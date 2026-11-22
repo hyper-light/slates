@@ -1690,6 +1690,12 @@ impl Client {
     self.end.parks_ended_by_looks()
   }
 
+  /// The synchronous reply wait's parks in Linux's round-robin real-time class, and those it skipped by why (84a;
+  /// `ClientEnd::real_time_parks`).
+  pub fn real_time_parks(&self) -> slates_ipc::endpoint::RealTimeParks {
+    self.end.real_time_parks()
+  }
+
   /// Sends `body` as the next request and returns the reply body, refusals typed.
   pub fn call(&mut self, body: &RequestBody) -> Result<ReplyBody, ClientError> {
     // Every `ack_every` requests, the client acknowledges them first (one request), so the daemon's retained records

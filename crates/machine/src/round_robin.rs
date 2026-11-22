@@ -40,13 +40,12 @@ pub enum Declined {
   Unsupported,
 }
 
-/// Puts the calling thread in `SCHED_RR` at the class's lowest priority, reset on fork, where the account's limits allow
-/// it (the module doc): the priority it took, or why it took none.
+/// The real-time priority this account's limits grant a thread (the module doc): the class's lowest, where
+/// `RLIMIT_RTPRIO` grants at least it and `RLIMIT_RTTIME` is unlimited; or why none.
 #[cfg(target_os = "linux")]
-pub fn take_current() -> Result<i32, Declined> {
+pub fn granted_priority() -> Result<i32, Declined> {
   use rustix::process::{Resource, getrlimit};
-  let rttime = getrlimit(Resource::Rttime).current;
-  if let Some(limit_us) = rttime {
+  if let Some(limit_us) = getrlimit(Resource::Rttime).current {
     return Err(Declined::RunTimeLimited { limit_us });
   }
   // SAFETY: a pure query of the kernel's priority range for a policy constant; no memory is passed.
@@ -56,8 +55,14 @@ pub fn take_current() -> Result<i32, Declined> {
   if lowest < 0 || granted.is_some_and(|limit| limit < lowest_u64) {
     return Err(Declined::NoPriorityGranted { limit: granted });
   }
+  Ok(lowest)
+}
+
+/// Puts the calling thread in `SCHED_RR` at `priority`, reset on fork.
+#[cfg(target_os = "linux")]
+fn set_round_robin(priority: i32) -> Result<(), Declined> {
   let param = libc::sched_param {
-    sched_priority: lowest,
+    sched_priority: priority,
   };
   // SAFETY: pid 0 is the calling thread; `param` is a valid `sched_param` on this frame, read for the call only.
   let rc = unsafe {
@@ -68,12 +73,153 @@ pub fn take_current() -> Result<i32, Declined> {
     )
   };
   if rc == 0 {
-    Ok(lowest)
+    Ok(())
   } else {
     Err(Declined::Refused {
-      errno: std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+      errno: last_errno(),
     })
   }
+}
+
+/// The calling thread's last `errno`.
+#[cfg(target_os = "linux")]
+fn last_errno() -> i32 {
+  std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
+/// Puts the calling thread in `SCHED_RR` at the class's lowest priority, reset on fork, where the account's limits allow
+/// it (the module doc): the priority it took, or why it took none.
+#[cfg(target_os = "linux")]
+pub fn take_current() -> Result<i32, Declined> {
+  let priority = granted_priority()?;
+  set_round_robin(priority)?;
+  Ok(priority)
+}
+
+/// The kernel's `struct sched_attr` (sched_setattr(2)), its first version: what `sched_getattr` reads of a thread's
+/// whole scheduling (policy, flags, nice, priority and a deadline thread's terms) and `sched_setattr` puts back.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SchedAttr {
+  size: u32,
+  sched_policy: u32,
+  sched_flags: u64,
+  sched_nice: i32,
+  sched_priority: u32,
+  sched_runtime: u64,
+  sched_deadline: u64,
+  sched_period: u64,
+}
+
+/// Format: `SCHED_ATTR_SIZE_VER0`, the first version's size in bytes, which every kernel since `sched_setattr` (3.14)
+/// reads and writes.
+#[cfg(target_os = "linux")]
+const SCHED_ATTR_SIZE: u32 = 48;
+
+/// Format: `SCHED_DEADLINE`, the deadline class's policy number (the libc crate names no constant for it).
+#[cfg(target_os = "linux")]
+const SCHED_DEADLINE: u32 = 6;
+
+/// A thread's own scheduling, read before a real-time park, and put back exactly by [`ParkClass::restore`].
+#[derive(Debug)]
+pub struct ParkClass {
+  /// The thread's whole scheduling before the park.
+  #[cfg(target_os = "linux")]
+  prior: SchedAttr,
+}
+
+/// Why a park stayed in its thread's own class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParkSkipped {
+  /// The account's limits grant no real-time class, or the kernel refused it ([`Declined`]).
+  Declined(Declined),
+  /// The thread is in a real-time class of its own already, which it keeps.
+  AlreadyRealTime,
+  /// The thread's scheduling could not be read, so it could not be put back: the park stays as it is.
+  Unreadable {
+    /// The `errno`.
+    errno: i32,
+  },
+}
+
+#[cfg(target_os = "linux")]
+std::thread_local! {
+  /// This thread's grant, decided at its first park: the priority, or why none.
+  static GRANT: std::cell::Cell<Option<Result<i32, Declined>>> = const { std::cell::Cell::new(None) };
+}
+
+/// Raises the calling thread to `SCHED_RR` for one park (a client's synchronous reply wait, 84a's Linux half): its whole
+/// scheduling read first (`sched_getattr`), to be put back exactly once the park returns ([`ParkClass::restore`]). A thread
+/// already in a real-time class keeps its own; one the account's limits deny stays as it is (decided once a thread).
+/// A woken time-share thread behind busy neighbours waited out their slices for its reply: on CI's Linux runners, with
+/// the shards in the class, the client's wake was 2.5-3.0 ms in the p999 tail (run 45020845000).
+#[cfg(target_os = "linux")]
+pub fn raise_for_park() -> Result<ParkClass, ParkSkipped> {
+  let grant = GRANT.with(|cell| {
+    let grant = cell.get().unwrap_or_else(granted_priority);
+    cell.set(Some(grant));
+    grant
+  });
+  let priority = grant.map_err(ParkSkipped::Declined)?;
+  let mut prior = SchedAttr {
+    size: SCHED_ATTR_SIZE,
+    ..SchedAttr::default()
+  };
+  // SAFETY: pid 0 is the calling thread; `prior` is a `sched_attr` of the stated size on this frame, which the kernel
+  // fills; flags 0, as the call requires.
+  let read = unsafe {
+    libc::syscall(
+      libc::SYS_sched_getattr,
+      0,
+      &raw mut prior,
+      SCHED_ATTR_SIZE,
+      0,
+    )
+  };
+  if read != 0 {
+    return Err(ParkSkipped::Unreadable {
+      errno: last_errno(),
+    });
+  }
+  let rr = u32::try_from(libc::SCHED_RR).unwrap_or(u32::MAX);
+  let fifo = u32::try_from(libc::SCHED_FIFO).unwrap_or(u32::MAX);
+  if [rr, fifo, SCHED_DEADLINE].contains(&prior.sched_policy) {
+    return Err(ParkSkipped::AlreadyRealTime);
+  }
+  set_round_robin(priority).map_err(ParkSkipped::Declined)?;
+  Ok(ParkClass { prior })
+}
+
+impl ParkClass {
+  /// Puts the thread's own scheduling back exactly as [`raise_for_park`] read it. A refusal is the `errno`, and the
+  /// thread is then lowered to the plain time-share class, so it never runs its caller's code at real-time priority;
+  /// lowering one's own thread asks no privilege.
+  #[cfg(target_os = "linux")]
+  pub fn restore(self) -> Result<(), i32> {
+    // SAFETY: pid 0 is the calling thread; `prior` is the `sched_attr` read from it, of its stated size; flags 0.
+    let put = unsafe { libc::syscall(libc::SYS_sched_setattr, 0, &raw const self.prior, 0) };
+    if put == 0 {
+      return Ok(());
+    }
+    let errno = last_errno();
+    let plain = libc::sched_param { sched_priority: 0 };
+    // SAFETY: as in `set_round_robin`: the calling thread, a valid `sched_param` on this frame.
+    let _ = unsafe { libc::sched_setscheduler(0, libc::SCHED_OTHER, &raw const plain) };
+    Err(errno)
+  }
+
+  /// Off Linux nothing was raised.
+  #[cfg(not(target_os = "linux"))]
+  pub fn restore(self) -> Result<(), i32> {
+    Ok(())
+  }
+}
+
+/// Off Linux: no class to raise to.
+#[cfg(not(target_os = "linux"))]
+pub fn raise_for_park() -> Result<ParkClass, ParkSkipped> {
+  Err(ParkSkipped::Declined(Declined::Unsupported))
 }
 
 /// Whether the calling thread is in `SCHED_RR` now; `None` where it cannot be read (off Linux).
@@ -87,6 +233,12 @@ pub fn holds() -> Option<bool> {
 /// Off Linux: not taken.
 #[cfg(not(target_os = "linux"))]
 pub fn take_current() -> Result<i32, Declined> {
+  Err(Declined::Unsupported)
+}
+
+/// Off Linux: no real-time class is granted here.
+#[cfg(not(target_os = "linux"))]
+pub fn granted_priority() -> Result<i32, Declined> {
   Err(Declined::Unsupported)
 }
 
