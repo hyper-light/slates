@@ -297,3 +297,7 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   with the held fan-out 2abe7cae3. The other held P commits stay held until goal 93's servers are complete and correct.
 - NOW: the SSH edge's rekey write duplication (goal 93 C). Waiting on w-hg's written go
   (inbox/w-hg-from-w-perf-ssh-rekey-go.md); reading meanwhile.
+- ~22:45 PST: STOOD DOWN from the SSH rekey write duplication (main 01a20182; inbox/w-perf-from-main-01a20182-rekey-closed.md).
+  w-hg landed the fix as a3e673efc (`TcpStream::write_some`, red `vcs_ssh::tests::hg::a_rekey_during_a_blocked_write_sends_no_byte_twice`).
+  My uncommitted slates-rt `TcpStream::write` and its test were dropped unlanded; nothing of mine is in vcs_ssh.
+  Back on goal 93's reserve, no runs.
