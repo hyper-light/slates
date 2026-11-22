@@ -887,6 +887,14 @@ impl<S: SshSite> Link<S> {
         rekeyed.key_time_ns / NS_PER_MS
       );
     }
+    // The session's timer (its key time) runs in every pass that finds it due, not only in a wait that races it: a
+    // client that takes every write at once never parks the loop, and its keys must still be replaced on time.
+    let now = now_ns();
+    if self.session.next_timer_ns().is_some_and(|due| due <= now)
+      && self.session.poll_timers(now).is_err()
+    {
+      return Some(Exit::Ended(Why::Refused));
+    }
     if !self.session.pending_output().is_empty() {
       return self.write().await.err().map(Exit::Ended);
     }

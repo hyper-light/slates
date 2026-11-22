@@ -1783,7 +1783,7 @@ const REKEYING_KEY_TIME_NS: u64 = GROWN_PAUSE_MS * 1_000_000 / 10;
 fn a_rekey_during_a_blocked_write_sends_no_byte_twice() {
   let grown: &'static Grown = Box::leak(Box::new(Grown::made()));
   let head = *grown.changesets.last().expect("a head");
-  let (transcript, _) = served_keyed(
+  let (transcript, seen) = served_keyed(
     (ONE_SEAT, Some(REKEYING_KEY_TIME_NS)),
     move || {
       ToolSite::new(
@@ -1798,7 +1798,9 @@ fn a_rekey_during_a_blocked_write_sends_no_byte_twice() {
       )
     },
     move |address| {
-      let mut peer = Peer::connect(address)?;
+      // Patient: the test holds the bytes, not the latency, and a loaded host's shard may pause past a read's
+      // patience; a byte sent twice still fails the client's MAC.
+      let mut peer = Peer::connect_patient(address)?;
       (query(&mut peer, &HELD_SEED)? == 60).then_some(())?;
       (sign(&mut peer, &HELD_SEED)? == 52).then_some(())?;
       exec(&mut peer, b"hg -R hg/r serve --stdio").then_some(())?;
@@ -1816,7 +1818,7 @@ fn a_rekey_during_a_blocked_write_sends_no_byte_twice() {
   assert_eq!(
     (transcript.status, transcript.ended),
     (Some(EXIT_STATUS), true),
-    "{sent} bytes of the answer read over {exchanges} key exchanges"
+    "{sent} bytes of the answer read over {exchanges} key exchanges; the edge saw {seen:?}"
   );
   assert!(
     sent > usize::try_from(GROWN_CHANGESETS).unwrap() * GROWN_FILE,

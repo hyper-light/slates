@@ -143,6 +143,11 @@ pub(crate) struct Client {
   kexinit: Vec<u8>,
   pub(crate) server_kexinit: Option<Vec<u8>>,
   in_exchange: bool,
+  /// Whether the client sent its own NEWKEYS in the exchange under way: until it has, RFC 4253 §7.1 lets it send no
+  /// upper-layer message, so [`Client::send`] holds them ([`Client::held_sends`]), as OpenSSH does.
+  sent_own_newkeys: bool,
+  /// The upper-layer messages held since the client's KEXINIT, sent in order once it sent its NEWKEYS.
+  held_sends: Vec<Vec<u8>>,
   exchanges: usize,
   private: [u8; 32],
   /// The key exchange agreed, once the server's KEXINIT is read.
@@ -185,6 +190,8 @@ impl Client {
       kexinit: Vec::new(),
       server_kexinit: None,
       in_exchange: false,
+      sent_own_newkeys: false,
+      held_sends: Vec::new(),
       exchanges: 0,
       private: [0; 32],
       kex_method: None,
@@ -481,6 +488,10 @@ impl Client {
     if self.strict {
       self.send_sequence = 0;
     }
+    self.sent_own_newkeys = true;
+    for held in core::mem::take(&mut self.held_sends) {
+      self.send(&held);
+    }
   }
 
   fn on_server_newkeys(&mut self) {
@@ -524,6 +535,7 @@ impl Client {
   fn send_kexinit(&mut self) {
     self.exchanges += 1;
     self.in_exchange = true;
+    self.sent_own_newkeys = false;
     self.ecdh_sent = false;
     self.private = self
       .options
@@ -572,6 +584,15 @@ impl Client {
 
   /// Seals `payload` as the client's next packet.
   pub(crate) fn send(&mut self, payload: &[u8]) {
+    // RFC 4253 §7.1: between its KEXINIT and its NEWKEYS a party sends only the transport's own messages; an
+    // upper-layer one (a channel's window adjust, its data) waits for the new keys.
+    if self.in_exchange
+      && !self.sent_own_newkeys
+      && payload.first().is_some_and(|number| *number >= 50)
+    {
+      self.held_sends.push(payload.to_vec());
+      return;
+    }
     let (alignment, length_aligned) = match self.seal {
       Seal::Clear => (8, true),
       Seal::Gcm { .. } => (16, false),

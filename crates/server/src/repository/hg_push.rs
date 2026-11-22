@@ -647,6 +647,9 @@ pub(crate) enum Works<'a> {
     built: &'a mut BTreeMap<WorkKey, Increment>,
     /// Whether one the plan names was missing.
     missed: bool,
+    /// How many of the plan's changes each work still moves: a work moving two changes (a line and the bookmark made
+    /// at it) is lent a copy until its last, which takes it.
+    uses: &'a mut BTreeMap<WorkKey, usize>,
     /// Their increments held in the content store before the landing (`crate::held_ahead`), which its step names.
     ahead: &'a [crate::held_ahead::HeldAhead],
   },
@@ -683,7 +686,21 @@ fn work<H: Held>(
         named: slates_merge::named::Named::default(),
       });
     }
-    Works::Built { built, missed, .. } => {
+    Works::Built {
+      built,
+      missed,
+      uses,
+      ..
+    } => {
+      let left = uses.get(&key).copied().unwrap_or(0);
+      if left > 1 {
+        uses.insert(key, left.saturating_sub(1));
+        if let Some(work) = built.get(&key) {
+          return Ok(work.clone());
+        }
+      } else {
+        uses.remove(&key);
+      }
       return built.remove(&key).ok_or_else(|| {
         *missed = true;
         abort(UNBUILT.to_vec())
@@ -1546,6 +1563,7 @@ async fn landed_after_rebases(
               built: &mut built,
               missed: false,
               ahead: &ahead,
+              uses: &mut uses_of(&plan),
             },
             room,
           ),
@@ -1574,6 +1592,16 @@ async fn landed_after_rebases(
       },
     }
   }
+}
+
+/// How many of a plan's changes each of its works moves ([`Works::Built`]'s `uses`).
+fn uses_of(plan: &[WorkKey]) -> BTreeMap<WorkKey, usize> {
+  let mut uses = BTreeMap::new();
+  for key in plan {
+    let counted: &mut usize = uses.entry(*key).or_insert(0);
+    *counted = counted.saturating_add(1);
+  }
+  uses
 }
 
 /// Gives a push's fork back where its landing will not take it.
