@@ -1903,6 +1903,8 @@ fn svn_point_name(point: slates_ipc::protocol::HookPointName) -> &'static str {
     Point::SvnPostLock => "post-lock",
     Point::SvnPreUnlock => "pre-unlock",
     Point::SvnPostUnlock => "post-unlock",
+    Point::SvnPreRevpropChange => "pre-revprop-change",
+    Point::SvnPostRevpropChange => "post-revprop-change",
     _ => "other",
   }
 }
@@ -2116,6 +2118,116 @@ fn a_dav_commit_runs_its_repositorys_commit_hooks_as_mod_dav_svn_runs_them() {
   assert!(
     body.contains("<S:post-commit-err>") && body.contains("post said no"),
     "{body}"
+  );
+}
+
+/// A PROPPATCH body setting `svn:log` to `value` as ra_serf writes it (`commit.c` `create_proppatch_body`,
+/// `write_prop_xml`), with `V:old-value` naming `expected` where it is given.
+#[cfg(unix)]
+fn log_proppatch(value: &str, expected: Option<&str>) -> Vec<u8> {
+  let old = expected.map_or_else(String::new, |old| {
+    format!("<V:old-value>{old}</V:old-value>")
+  });
+  format!(
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?><D:propertyupdate xmlns:D=\"DAV:\" \
+     xmlns:V=\"http://subversion.tigris.org/xmlns/dav/\" xmlns:C=\"http://subversion.tigris.org/xmlns/custom/\" \
+     xmlns:S=\"http://subversion.tigris.org/xmlns/svn/\"><D:set><D:prop><S:log>{old}{value}</S:log></D:prop>\
+     </D:set></D:propertyupdate>"
+  )
+  .into_bytes()
+}
+
+/// main 01a20182's red of 2026-11-21 23:24 (run r6, stock svn 1.15 over HTTPv2: `svn propset --revprop --revision 3
+/// svn:log ...` refused, the edge serving no PROPPATCH on `!svn/rev/N`; `deadprops.c` `save_value` makes it through
+/// `svn_repos_fs_change_rev_prop4`). Do: on a daemon's HTTP edge, a repository whose policy runs pre- and
+/// post-revprop-change hooks that record their arguments and standard input and accept; commit revision 1 over DAV;
+/// PROPPATCH `!svn/rev/1` as ra_serf does: `svn:log` set with no expectation, then set again expecting the first value,
+/// then set expecting that first value once more. Expect: the first two `207`, the second showing the first landed; the
+/// third refused "revprop 'svn:log' has unexpected value in filesystem" (FSFS's base-value check); pre-revprop-change
+/// given REPOS, the revision, the user, the name and `M`, the new value on its standard input; post-revprop-change the
+/// old value.
+#[cfg(unix)]
+#[test]
+fn a_dav_proppatch_of_a_revision_changes_its_property_through_its_revprop_hooks() {
+  use slates_ipc::protocol::HookPointName;
+  let dir = crate::git_hooks::tests::ScratchDir::new();
+  let at = dir.path.display().to_string();
+  let pre = crate::vcs_svn::tests::hook_script(
+    &dir.path,
+    "pre-revprop-change",
+    &format!("for arg in \"$@\"; do echo \"$arg\"; done > {at}/pre.args\ncat > {at}/pre.in"),
+  );
+  let post = crate::vcs_svn::tests::hook_script(
+    &dir.path,
+    "post-revprop-change",
+    &format!("cat > {at}/post.in"),
+  );
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge serves");
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let name = svn_name_on_the_repositorys_partition();
+  create_svn_hooked(
+    &daemon,
+    &name,
+    vec![
+      (HookPointName::SvnPreRevpropChange, pre),
+      (HookPointName::SvnPostRevpropChange, post),
+    ],
+  );
+  let (_, _, merged, _) = dav_commit((port, &certificate), &name, b"hello\n");
+  let revision = format!("/{name}/!svn/rev/1");
+  let patch = |body: Vec<u8>| {
+    dav(
+      (port, &certificate),
+      ("PROPPATCH", &revision),
+      &["Content-Type: text/xml"],
+      &body,
+    )
+  };
+  let first = patch(log_proppatch("an edit", None));
+  let second = patch(log_proppatch("a second edit", Some("an edit")));
+  let stale = patch(log_proppatch("stale", Some("an edit")));
+  daemon.stop();
+  #[allow(clippy::disallowed_methods)]
+  // test code: what the hooks recorded in its own scratch directory
+  let read = |file: &str| std::fs::read_to_string(dir.path.join(file)).unwrap_or_default();
+  let repos = format!("{}/{name}", crate::vcs_svn::tests::TEST_ROOT);
+  let args: Vec<String> = read("pre.args").lines().map(str::to_owned).collect();
+  assert_eq!(
+    (merged, first.0, second.0),
+    (200, 207, 207),
+    "first: {}\nsecond: {}",
+    first.2,
+    second.2
+  );
+  assert!(
+    stale.0 >= 400
+      && stale
+        .2
+        .contains("revprop 'svn:log' has unexpected value in filesystem"),
+    "{}: {}",
+    stale.0,
+    stale.2
+  );
+  assert_eq!(
+    (
+      args.first().map(String::as_str),
+      args.get(1).map(String::as_str),
+      args.get(3).map(String::as_str),
+      args.get(4).map(String::as_str),
+      read("pre.in"),
+      read("post.in"),
+    ),
+    (
+      Some(repos.as_str()),
+      Some("1"),
+      Some("svn:log"),
+      Some("M"),
+      "stale".to_owned(),
+      "an edit".to_owned(),
+    ),
+    "pre-revprop-change {args:?}"
   );
 }
 
@@ -2596,3 +2708,223 @@ fn a_refused_fetch_over_the_daemons_edge_is_counted() {
   );
   assert_eq!(refused, 1, "the refused answer counted once");
 }
+
+/// Shape: git/git's refs (A-855; r16's dataset f7de814569 holds 1,019 tags over 83,079 commits, whose whole clone
+/// outgrew a region's 256 KiB). On a line of this many commits, each tagged, the clone's answer takes 164,807 bytes
+/// (this Mac, 2026-11-22), so the test's daemon is given a region a quarter of the size ([`REGION_SHARE`]), and the test
+/// holds the need past its edge's room.
+const TAGGED_REFS: usize = 1_019;
+
+/// Shape: the share of its derived region's bulk the git-scale clone's daemon is given (A-855), so a line's clone of
+/// git/git's refs outgrows one region as git/git's history outgrew the derived one.
+const REGION_SHARE: u64 = 4;
+
+/// Stock git's request creating `main` at the last of a line of `commits` commits (three objects each) and an annotated
+/// tag `refs/tags/v<n>` of each, the tags' commands in name order as git sends them: the request, every ref's object, and
+/// the count of objects it brings.
+fn tagged_history(commits: usize) -> (Vec<u8>, Vec<ObjectId>, usize) {
+  use slates_git::object_name::Kind;
+  let mut objects: Vec<(Kind, Vec<u8>)> = Vec::new();
+  let mut parent: Option<ObjectId> = None;
+  let mut tags: Vec<(String, ObjectId)> = Vec::new();
+  for at in 0..commits {
+    let blob = format!("tagged {at}\n").into_bytes();
+    let mut tree = b"100644 file\0".to_vec();
+    tree.extend_from_slice(git_name(Kind::Blob, &blob).as_bytes());
+    let tree_id = git_name(Kind::Tree, &tree);
+    let parent_line = parent.map_or_else(String::new, |parent| format!("parent {parent}\n"));
+    let commit = format!(
+      "tree {tree_id}\n{parent_line}author A <a@example.com> 1700000000 +0000\n\
+       committer A <a@example.com> 1700000000 +0000\n\ncommit {at}\n"
+    )
+    .into_bytes();
+    let commit_id = git_name(Kind::Commit, &commit);
+    let tag = format!(
+      "object {commit_id}\ntype commit\ntag v{at}\ntagger A <a@example.com> 1700000000 +0000\n\nv{at}\n"
+    )
+    .into_bytes();
+    tags.push((format!("refs/tags/v{at}"), git_name(Kind::Tag, &tag)));
+    parent = Some(commit_id);
+    objects.extend([
+      (Kind::Commit, commit),
+      (Kind::Tree, tree),
+      (Kind::Blob, blob),
+      (Kind::Tag, tag),
+    ]);
+  }
+  let last = parent.expect("a commit");
+  tags.sort();
+  let listed: Vec<(Kind, &[u8])> = objects
+    .iter()
+    .map(|(kind, bytes)| (*kind, bytes.as_slice()))
+    .collect();
+  let mut request = Vec::new();
+  let line = format!("{ZERO} {last} refs/heads/main\0{CAPABILITIES}");
+  pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("the command");
+  for (name, id) in &tags {
+    let line = format!("{ZERO} {id} {name}");
+    pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("a command");
+  }
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request.extend_from_slice(&stored_pack(&listed));
+  let mut wants = vec![last];
+  wants.extend(tags.iter().map(|(_, id)| *id));
+  (request, wants, objects.len())
+}
+
+/// A v2 `fetch` of every one of `wants` with `done`, `ofs-delta` and no progress, as `git clone` asks for a repository's
+/// refs.
+fn whole_fetch_of(wants: &[ObjectId]) -> Vec<u8> {
+  let mut request = Vec::new();
+  pktline::write(Packet::Data(b"command=fetch\n"), &mut request).expect("the command");
+  pktline::write(Packet::Delim, &mut request).expect("the delimiter");
+  for want in wants {
+    pktline::write(
+      Packet::Data(format!("want {want}\n").as_bytes()),
+      &mut request,
+    )
+    .expect("a want");
+  }
+  for argument in ["ofs-delta\n", "no-progress\n", "done\n"] {
+    pktline::write(Packet::Data(argument.as_bytes()), &mut request).expect("an argument");
+  }
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request
+}
+
+/// The room the answer to `fetch` of repository `name` takes, answered whole on its shard in an unbounded room: what its
+/// walk's tables, its request and its pack's buffers are charged.
+fn room_needed(daemon: &Daemon, name: &str, fetch: &[u8]) -> u64 {
+  let (name, fetch) = (name.to_owned(), fetch.to_vec());
+  crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
+    let id = state
+      .db
+      .partition()
+      .repositories()
+      .repository_named(&name)
+      .expect("the repository")
+      .id;
+    let unbounded = u64::MAX >> 1;
+    let mut admission = slates_git::Admission::new(unbounded);
+    let mut answer =
+      crate::vcs_store::upload::lend_on(state, (id, Some(&owner())), |served, packs| {
+        slates_git::upload::serve(
+          served,
+          slates_git::http::Version::V2,
+          slates_git::upload::Asked::Request(&fetch),
+          packs,
+          &mut admission,
+        )
+      })
+      .expect("lent");
+    let mut out = Vec::new();
+    while crate::vcs_store::upload::lend_on(state, (id, None), |served, packs| {
+      answer.write(
+        served,
+        packs,
+        &mut admission,
+        &mut out,
+        slates_git::pktline::MAX_LEN,
+      )
+    })
+    .expect("lent")
+      == slates_git::upload::Written::More
+    {}
+    unbounded.saturating_sub(admission.left())
+  })
+}
+
+/// The first bytes of `answer`, as text, for a failure's message.
+fn opening(answer: &[u8]) -> String {
+  String::from_utf8_lossy(answer.get(..answer.len().min(400)).unwrap_or_default()).into_owned()
+}
+
+/// A-855 (found by use: r16-git on the big Studio, release b099adee4 over git/git f7de814569: `git clone` aborted
+/// "remote: aborting due to possible repository corruption on the remote side", the anchor's log naming
+/// `Negotiation(PastAdmission { asked: 7912, left: 283 })`; an answer was admitted one ring region, 256 KiB, whatever its
+/// repository). Do: on a daemon whose region is a [`REGION_SHARE`]th of its derived one, push a line of [`TAGGED_REFS`]
+/// commits, `main` and a tag of each, through the daemon's edge; measure
+/// the room a whole fetch's answer takes; then fetch every ref whole as `git clone` asks. Expect: the answer needs more
+/// than the edge's request room (the shape's guard); the fetch `200`, a packfile section holding every object pushed,
+/// and no abort: an answer's walk is admitted what its repository's shard admits it, never one region. Red before: the
+/// pack cut with git's abort words.
+#[test]
+fn a_clone_of_git_gits_many_refs_is_answered_whole_over_the_daemons_edge() {
+  let (identity, certificate) = identity();
+  let (daemon, _) = daemon_configured(Some(identity), |config| {
+    config.region.bulk_bytes /= REGION_SHARE;
+  });
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, wants, objects) = tagged_history(TAGGED_REFS);
+  let created = pushed(edge, &name, &request);
+  let edge_room = crate::vcs_http::daemon_edge::bounds_of(daemon.config()).room;
+  let fetch = whole_fetch_of(&wants);
+  let needed = room_needed(&daemon, &name, &fetch);
+  let fetched = uploaded(edge, &name, &fetch);
+  daemon.stop();
+  assert_eq!(created.0, 200, "{}", opening(&created.1));
+  assert!(
+    needed > edge_room,
+    "the shape's answer needs {needed}, within one region's {edge_room}"
+  );
+  assert_eq!(fetched.0, 200, "{}", opening(&fetched.1));
+  assert!(
+    !fetched
+      .1
+      .windows(b"aborting".len())
+      .any(|window| window == b"aborting"),
+    "the pack cut short"
+  );
+  assert_eq!(ids_in(&fetched_pack(&fetched.1)).len(), objects);
+}
+
+/// A-855 (main's ruling of 2026-11-21: a refusal costs time, never an answer; red first: a fetch refused `PastAdmission`
+/// at negotiation waits and is answered whole). Do: push [`tagged_history`] of a few commits through the daemon's edge;
+/// make the next room its repository's shard gives a fetch the fetch request's own length (room for its body, none for
+/// its answer, as other works holding the shard's room would leave it), then the shard's own; fetch every ref whole. Expect: the fetch `200`, a packfile section holding every object pushed
+/// and no abort; the answer made again once, counted `vcs_http.git.answered_again`, and nothing counted refused. Red
+/// before: the fetch answered refused in its first room.
+#[test]
+fn a_fetch_past_its_room_waits_for_more_and_is_answered_whole() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, wants, objects) = tagged_history(TAGGED_FEW);
+  let created = pushed(edge, &name, &request);
+  let fetch = whole_fetch_of(&wants);
+  let short = u64::try_from(fetch.len()).expect("a length");
+  crate::daemon::observe_at(&daemon, REPOSITORY, move |_| {
+    crate::vcs_store::upload::ROOMS.with(|rooms| rooms.borrow_mut().push_back(short));
+  });
+  let fetched = uploaded(edge, &name, &fetch);
+  let counted = crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
+    let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+    (
+      count(crate::vcs_http::git::upload::ANSWERED_AGAIN),
+      count(crate::vcs_http::git::upload::UPLOAD_REFUSED),
+    )
+  });
+  daemon.stop();
+  assert_eq!(created.0, 200, "{}", opening(&created.1));
+  assert_eq!(fetched.0, 200, "{}", opening(&fetched.1));
+  assert!(
+    !fetched
+      .1
+      .windows(b"aborting".len())
+      .any(|window| window == b"aborting"),
+    "the pack cut short"
+  );
+  assert_eq!(ids_in(&fetched_pack(&fetched.1)).len(), objects);
+  assert_eq!(counted, (1, 0), "answered again once, refused never");
+}
+
+/// Shape: [`a_fetch_past_its_room_waits_for_more_and_is_answered_whole`]'s line: a few commits, each tagged.
+const TAGGED_FEW: usize = 8;

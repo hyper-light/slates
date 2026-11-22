@@ -154,6 +154,15 @@ pub trait Judge {
     true
   }
 
+  /// Where `command` comes in a push without `atomic` (A-850): its commands are decided by rank, lowest first, ties in
+  /// the order sent, and their outcomes reported in the order sent whatever their rank. A store whose moves are made at
+  /// the versions below them ranks each by the generation number of the commit its new value peels to, so a push of a
+  /// whole history's tags into an empty repository decides each after the one below it. A judge that ranks nothing
+  /// decides in the order sent.
+  fn rank(&mut self, _command: &Command, _pushed: &Pushed<'_>) -> u64 {
+    0
+  }
+
   /// Appends one accepted command's entry to its ref's own log, on its own (a push without
   /// `atomic`): what report-status-v2 reports of it (nothing for a plain update), or why not
   /// ([`FAILED_TO_UPDATE`] when the ref moved since its verdict read it).
@@ -614,9 +623,14 @@ pub struct Deciding<A> {
   by_id: Vec<(ObjectId, usize)>,
   /// Each command's refusal by the checks, taken as its step comes.
   early: Vec<Option<Outcome>>,
-  /// The outcomes so far, in the order sent.
+  /// The outcomes so far, in the order sent: under `atomic` made in that order; without it each in its command's slot,
+  /// as the commands are decided by rank.
   outcomes: Vec<Outcome>,
-  /// The next command.
+  /// Without `atomic`, each command's outcome in the order sent, as it is decided ([`Judge::rank`]).
+  placed: Vec<Option<Outcome>>,
+  /// Without `atomic`, the commands' indices in the order they are decided, once ranked: none before the first step.
+  order: Option<Vec<usize>>,
+  /// The next command: under `atomic` its index, without it its place in `order`.
   at: usize,
   /// Under `atomic`, each command accepted so far with its verdict.
   accepted: Vec<(usize, A)>,
@@ -635,10 +649,16 @@ impl<A> Deciding<A> {
     } = checked;
     let count = request.commands.len();
     let outcomes = charged_vec(count, admission)?;
-    let accepted = if request.requested.atomic {
-      charged_vec(count, admission)?
+    let (accepted, placed) = if request.requested.atomic {
+      (charged_vec(count, admission)?, Vec::new())
     } else {
-      Vec::new()
+      let mut placed = charged_vec(count, admission)?;
+      placed.extend((0..count).map(|_| None));
+      // The ranking's table, each command's rank and index, charged now so its step allocates nothing uncharged.
+      admission
+        .charge_items::<(u64, usize)>(count)
+        .map_err(Refusal::PastAdmission)?;
+      (Vec::new(), placed)
     };
     Ok(Self {
       request,
@@ -646,6 +666,8 @@ impl<A> Deciding<A> {
       by_id,
       early,
       outcomes,
+      placed,
+      order: None,
       at: 0,
       accepted,
       done: count == 0,
@@ -688,10 +710,21 @@ impl<A> Deciding<A> {
 
   /// What was received, once every outcome is made.
   pub fn received(self) -> Received {
+    let outcomes = if self.request.requested.atomic {
+      self.outcomes
+    } else {
+      // Every slot is filled once every outcome is made; one that is not (a decision taken before its end) reads as
+      // unapplied, as its command was.
+      self
+        .placed
+        .into_iter()
+        .map(|placed| placed.unwrap_or_else(|| refused(FAILED_TO_UPDATE, None)))
+        .collect()
+    };
     Received {
       request: self.request,
       unpacked: self.unpacked,
-      outcomes: self.outcomes,
+      outcomes,
     }
   }
 }
@@ -704,7 +737,13 @@ fn each_step<A, J: Judge<Accepted = A> + ?Sized>(
   pushed: &Pushed<'_>,
   judge: &mut J,
 ) {
-  let at = deciding.at;
+  let order = deciding
+    .order
+    .get_or_insert_with(|| ranked(&deciding.request.commands, pushed, judge));
+  let Some(&at) = order.get(deciding.at) else {
+    deciding.done = true;
+    return;
+  };
   // A command no check refused: one with no early outcome, its slot empty or past the checks' table.
   let unrefused = deciding.early.get(at).is_none_or(Option::is_none);
   if unrefused
@@ -724,9 +763,27 @@ fn each_step<A, J: Judge<Accepted = A> + ?Sized>(
     },
     (None, None) => return deciding.done = true,
   };
-  deciding.outcomes.push(outcome);
-  deciding.at = at.saturating_add(1);
+  if let Some(slot) = deciding.placed.get_mut(at) {
+    *slot = Some(outcome);
+  }
+  deciding.at = deciding.at.saturating_add(1);
   deciding.done = deciding.at >= deciding.request.commands.len();
+}
+
+/// The indices of `commands` in the order a push without `atomic` decides them (A-850, [`Judge::rank`]): by rank, lowest
+/// first, ties in the order sent. Its table was charged with the decision's ([`Deciding::new`]).
+fn ranked<J: Judge + ?Sized>(
+  commands: &[Command],
+  pushed: &Pushed<'_>,
+  judge: &mut J,
+) -> Vec<usize> {
+  let mut ranks: Vec<(u64, usize)> = commands
+    .iter()
+    .enumerate()
+    .map(|(at, command)| (judge.rank(command, pushed), at))
+    .collect();
+  ranks.sort_unstable();
+  ranks.into_iter().map(|(_, at)| at).collect()
 }
 
 /// One step of an atomic push: every command or none ("Either all refs are updated or none",

@@ -24,6 +24,8 @@ struct Logs {
   declining: Vec<Vec<u8>>,
   /// Every append made, as the refs it moved.
   appended: Vec<Vec<Vec<u8>>>,
+  /// Each ref's rank, by name ([`Judge::rank`]); a ref with none ranks 0.
+  ranks: BTreeMap<Vec<u8>, u64>,
 }
 
 impl Logs {
@@ -53,6 +55,10 @@ fn moved_line(name: &[u8]) -> Vec<u8> {
 
 impl Judge for Logs {
   type Accepted = u64;
+
+  fn rank(&mut self, command: &Command, _pushed: &Pushed<'_>) -> u64 {
+    self.ranks.get(&command.name).copied().unwrap_or_default()
+  }
 
   fn judge(&mut self, command: &Command, _pushed: &Pushed<'_>) -> Result<u64, Declined> {
     if self.declining.contains(&command.name) {
@@ -165,6 +171,33 @@ fn without_atomic_each_ref_moves_on_its_own_log() {
   let applied = Outcome::Ok(Vec::new());
   assert_eq!(outcomes, [applied.clone(), failed, applied]);
   let each = [owned(&[b"refs/heads/a"]), owned(&[b"refs/heads/c"])];
+  assert_eq!(logs.appended, each);
+}
+
+/// A-850 (a push without `atomic` decides its commands by rank, its outcomes in the order sent). Do: create three refs
+/// ranked c, then a, then b, the second sent (b) declined by its verdict. Expect: c appended before a, b never; the
+/// outcomes in the order sent, a applied, b its own reason, c applied.
+#[test]
+fn without_atomic_commands_are_decided_by_rank_and_reported_as_sent() {
+  let mut logs = Logs {
+    declining: owned(&[b"refs/heads/b"]),
+    ranks: [
+      (b"refs/heads/a", 1),
+      (b"refs/heads/b", 2),
+      (b"refs/heads/c", 0),
+    ]
+    .into_iter()
+    .map(|(name, rank)| (name.to_vec(), rank))
+    .collect(),
+    ..Logs::default()
+  };
+  let outcomes = three_creates(false, &mut logs);
+  let applied = Outcome::Ok(Vec::new());
+  assert_eq!(
+    outcomes,
+    [applied.clone(), refused(b"hook declined", None), applied]
+  );
+  let each = [owned(&[b"refs/heads/c"]), owned(&[b"refs/heads/a"])];
   assert_eq!(logs.appended, each);
 }
 

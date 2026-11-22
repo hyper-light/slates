@@ -1054,8 +1054,9 @@ fn positions_of(repository: &Repository, store: &ContentStore, objects: &[&Made]
 
 /// A-614, §4.17.2 item 3 (a set made again from the newest green head below). Do: make ref 1 at a two-commit history,
 /// make ref 2 at ref 1's head with nothing pushed, then make ref 3 at a new commit over that head. Expect: ref 2's
-/// D(0) and reached set ref 1's, found as a base with no object walked; ref 3's D(0) and reached set ref 1's and the new
-/// commit's own three objects, the walk visiting only those.
+/// reached set ref 1's, found as a base with no object walked, and its D(0) empty, relative to the version it was made
+/// at (A-850); ref 3's reached set ref 1's and the new commit's own three objects, the walk visiting only those, and
+/// its D(0) those three alone (its base, ref 1's version 0, met by its admission's search back from the new commit).
 #[test]
 fn a_ref_made_at_another_refs_head_reuses_its_set_without_a_walk() {
   let format = ObjectFormat::Sha1;
@@ -1072,10 +1073,7 @@ fn a_ref_made_at_another_refs_head_reuses_its_set_without_a_walk() {
       repository.reached(&store, 2, 0),
       repository.brought(&store, 2, 0)
     ),
-    (
-      repository.reached(&store, 1, 0),
-      repository.reached(&store, 1, 0)
-    )
+    (repository.reached(&store, 1, 0), Ok(Positions::new()))
   );
   let top3 = blob(format, b"three\n");
   let root4 = tree(format, &[(Mode::File, b"top", top3.id)]);
@@ -1091,7 +1089,7 @@ fn a_ref_made_at_another_refs_head_reuses_its_set_without_a_walk() {
       repository.brought(&store, 3, 0),
       repository.reached(&store, 3, 0)
     ),
-    (Ok(expected.clone()), Ok(expected))
+    (Ok(own), Ok(expected))
   );
   repository.release(&mut store).unwrap();
   assert!(store.is_empty());
@@ -1198,11 +1196,12 @@ fn a_rewrite_brings_what_its_old_head_did_not_reach_and_makes_its_set_again() {
   assert!(store.is_empty());
 }
 
-/// A-614, §4.17.2 item 6 (a deleted ref). Do: make ref 1 at a commit, delete it, then make it again at the same commit.
-/// Expect: the deletion a version with no head, nothing brought and nothing reached; made again, D(2) everything its
-/// head reaches, and its head and tree read back.
+/// A-614, §4.17.2 item 6 (a deleted ref), A-850 (a version is made at the nearest version back, its own earlier ones
+/// too). Do: make ref 1 at a commit, delete it, then make it again at the same commit. Expect: the deletion a version
+/// with no head, nothing brought and nothing reached; made again at its own version 0, its reached set everything its
+/// head reaches, D(2) nothing beyond that base, and its head and tree read back.
 #[test]
-fn a_deleted_ref_reaches_nothing_and_made_again_brings_all_its_head_reaches() {
+fn a_deleted_ref_reaches_nothing_and_made_again_at_its_old_version_brings_nothing_beyond_it() {
   let format = ObjectFormat::Sha256;
   let mut store = store();
   let mut repository = Repository::new(format);
@@ -1230,12 +1229,19 @@ fn a_deleted_ref_reaches_nothing_and_made_again_brings_all_its_head_reaches() {
   push_and_move(&mut repository, &mut store, Vec::new(), &[(1, Some(head))]).unwrap();
   let all = sorted(first.iter().map(|object| object.id).collect());
   assert_eq!(
-    ids(
-      &repository,
-      &store,
-      &repository.brought(&store, 1, 2).unwrap()
+    (
+      ids(
+        &repository,
+        &store,
+        &repository.brought(&store, 1, 2).unwrap()
+      ),
+      ids(
+        &repository,
+        &store,
+        &repository.reached(&store, 1, 2).unwrap()
+      )
     ),
-    all
+    (Vec::new(), all)
   );
   assert_eq!(
     (repository.head(&store, 1, 2), repository.tree(&store, 1, 2)),

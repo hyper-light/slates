@@ -16,7 +16,12 @@
 //! holder and a successor judge them afresh (§4.16 "Apply on holders"). Until format 6 the entry carried the bytes
 //! themselves, so a 512 MiB increment was copied into the log in the owner's one durable step; now the content store
 //! holds them once, from before the verdict, and the step appends a few hundred bytes. A reader resolves the identity
-//! there and hands the bytes to [`decode`]: the effects below are read against the increment. Then each
+//! there and hands the bytes to [`decode`]: the effects below are read against the increment. Format 7 (A-854) lets an
+//! entry carry its increment after its inputs instead, for an increment up to the service's bound: an entry is durable
+//! when its append returns, a hold only once the shard's next publication commits its image, so a held increment's
+//! accept paid a whole-shard publication before its append, where a carried one pays its bytes in the append, as before
+//! format 6 (at 1,000 clients the accept's p50 went from 0.44 ms to 400 ms held). A reader takes a carrying entry's
+//! increment from [`carried`], any other's from the content store. Then each
 //! [`Applied`] effect: content by reference to the increment's post-state (the mapped ops of a splice, the declared ops
 //! of a create, the source path of a rename), a copied tree by its two paths (A-586), so no file's bytes are recorded
 //! twice; every other dimension by value.
@@ -46,9 +51,10 @@ const MAGIC: u32 = u32::from_le_bytes(*b"GCHN");
 /// an op's path index to 64 bits (its record is the ops document's, version 2), 6 since lane (A) named the increment by
 /// its inputs identity and length in place of its bytes (module docs). A version 5 entry is refused `BadVersion`, never
 /// read by a second path: a segment is read only by the build that wrote it, its anchor restarting the daemon from its
-/// own image (§2.7; A-621's precedent).
-/// Format: version 6, as above.
-const VERSION: u32 = 6;
+/// own image (§2.7; A-621's precedent). 7 since A-854 let an entry carry its increment's bytes (module docs); a
+/// version 6 entry is refused `BadVersion` on the same precedent.
+/// Format: version 7, as above.
+const VERSION: u32 = 7;
 /// Format: a head identity and the entry's digest, each a BLAKE3 hash.
 const HASH_BYTES: usize = 32;
 /// Format: the byte that marks a head identity, a completion key or a submitting work present.
@@ -65,10 +71,23 @@ const COMPLETION_BYTES: usize = 8 + 4 + 4 + 1 + WORK_BYTES;
 /// Format: a signature's verdict at its largest: its marker, the verdict's kind and detail, and the signer's fingerprint.
 const SIGNATURE_BYTES: usize = 1 + 1 + 1 + HASH_BYTES;
 /// Format: the fixed bytes of an entry around its parts: magic, version, the increment's inputs identity and length, the
-/// effect count, the completion's marker and key, the identity's marker and hash, the signature's section, and the
+/// marker of its carried bytes, the effect count, the completion's marker and key, the identity's marker and hash, the signature's section, and the
 /// digest.
-const ENTRY_OVERHEAD_BYTES: usize =
-  4 + 4 + HASH_BYTES + 8 + 4 + 1 + COMPLETION_BYTES + 1 + HASH_BYTES + SIGNATURE_BYTES + HASH_BYTES;
+const ENTRY_OVERHEAD_BYTES: usize = 4
+  + 4
+  + HASH_BYTES
+  + 8
+  + 1
+  + 4
+  + 1
+  + COMPLETION_BYTES
+  + 1
+  + HASH_BYTES
+  + SIGNATURE_BYTES
+  + HASH_BYTES;
+/// Format: an entry's bytes before its carried increment and its effects: magic, version, the inputs' identity and
+/// length, the carried marker, then (after the carried bytes) the effect count.
+const HEADER_BYTES: usize = 4 + 4 + HASH_BYTES + 8 + 1 + WORD_BYTES;
 /// Format: an effect's largest fixed part: its tag and three length prefixes or counts.
 const EFFECT_OVERHEAD_BYTES: usize = 1 + 3 * 4;
 /// Format: the smallest an effect can encode to: its tag and one length prefix.
@@ -472,7 +491,8 @@ mod tag {
 /// The largest an entry for `increment` can encode to, whatever its verdict resolves it to: what the service charges
 /// the chain before the verdict, so an accepted version is always recorded. Every effect comes from a declared op and
 /// names at most two of the document's strings; mapped ops are at most the declared ones; values are in the post-state.
-/// The increment's own bytes are not in it: the content store holds them, charged there (format 6).
+/// The increment's own bytes are not in it: the content store holds them, charged there (format 6), or the entry
+/// carries them (format 7), charged by the caller that chose to, its encoding's length on top.
 pub fn entry_bound(increment: &Increment) -> usize {
   let ops = increment.doc.ops.len();
   let longest_string = increment
@@ -507,14 +527,50 @@ pub fn encode(
   identity: Option<[u8; 32]>,
   signature: Option<Signature>,
 ) -> Vec<u8> {
-  // Reserved at the entry's bound once, never grown (A-742).
-  let mut out = Vec::with_capacity(entry_bound(increment));
+  encode_carrying(
+    (inputs, None),
+    increment,
+    applied,
+    completion,
+    identity,
+    signature,
+  )
+}
+
+/// [`encode`], the entry carrying `carried`, the increment's encoding (`inputs.len` bytes), when one is given (format 7,
+/// A-854): durable with the entry's append, no hold ordered before it.
+pub fn encode_carrying(
+  (inputs, carried): (Inputs, Option<&[u8]>),
+  increment: &Increment,
+  applied: &[Applied],
+  completion: Option<Completion>,
+  identity: Option<[u8; 32]>,
+  signature: Option<Signature>,
+) -> Vec<u8> {
+  let declared = Declared::of(increment);
+  // Reserved at the entry's exact length once, never grown (A-742) and never over: the admission's bound counts the whole
+  // post-state, which a text's splice names by reference, so reserving it cost every text an allocation of its size
+  // (goal 93, svn finding (2): 26.2 MB for 25.6 MB of imported text), then kept as the chain entry's capacity.
+  let exact = entry_bytes(
+    carried.map_or(0, <[u8]>::len),
+    &declared,
+    applied,
+    (completion, identity, signature),
+  );
+  let mut out = Vec::with_capacity(exact);
   out.extend_from_slice(&MAGIC.to_le_bytes());
   out.extend_from_slice(&VERSION.to_le_bytes());
   out.extend_from_slice(&inputs.identity);
   out.extend_from_slice(&inputs.len.to_le_bytes());
+  match carried {
+    Some(bytes) => {
+      debug_assert_eq!(u64::try_from(bytes.len()).ok(), Some(inputs.len));
+      out.push(PRESENT);
+      out.extend_from_slice(bytes);
+    }
+    None => out.push(ABSENT),
+  }
   put_count(&mut out, applied.len());
-  let declared = Declared::of(increment);
   for effect in applied {
     put_applied(&mut out, &declared, effect);
   }
@@ -544,7 +600,87 @@ pub fn encode(
   put_signature(&mut out, signature);
   let digest = *blake3::hash(&out).as_bytes();
   out.extend_from_slice(&digest);
+  debug_assert_eq!(
+    out.len(),
+    exact,
+    "an entry's length is what entry_bytes sizes"
+  );
   out
+}
+
+/// The bytes [`encode_carrying`] writes for an entry carrying `carried` bytes of its increment's encoding, with `applied`'s
+/// effects and its trailers, without writing them: the entry's exact length, which its buffer is reserved at.
+fn entry_bytes(
+  carried: usize,
+  declared: &Declared<'_>,
+  applied: &[Applied],
+  (completion, identity, signature): (Option<Completion>, Option<[u8; 32]>, Option<Signature>),
+) -> usize {
+  let effects = applied
+    .iter()
+    .map(|effect| applied_bytes(declared, effect))
+    .fold(0usize, usize::saturating_add);
+  // A completion's marker, and its key with the work's marker, and the work's id where it names one.
+  let completion = completion.map_or(1, |key| {
+    let without_work = 1usize.saturating_add(COMPLETION_BYTES.saturating_sub(WORK_BYTES));
+    key
+      .work
+      .map_or(without_work, |_| without_work.saturating_add(WORK_BYTES))
+  });
+  let identity = identity.map_or(1, |_| 1usize.saturating_add(HASH_BYTES));
+  let signature = signature.map_or(1, |_| SIGNATURE_BYTES);
+  HEADER_BYTES
+    .saturating_add(carried)
+    .saturating_add(effects)
+    .saturating_add(completion)
+    .saturating_add(identity)
+    .saturating_add(signature)
+    .saturating_add(HASH_BYTES)
+}
+
+/// The bytes [`put_applied`] writes for `applied`, without writing them.
+fn applied_bytes(declared: &Declared<'_>, applied: &Applied) -> usize {
+  let tagged = |paths: &[&str]| {
+    paths
+      .iter()
+      .map(|path| string_len(path.as_bytes()))
+      .fold(1usize, usize::saturating_add)
+  };
+  let ops = |ops: &[Op]| WORD_BYTES.saturating_add(ops.len().saturating_mul(OP_BYTES));
+  match applied {
+    Applied::Special(path, node) => {
+      tagged(&[path]).saturating_add(WORD_BYTES.saturating_add(node.encoded_len()))
+    }
+    Applied::Spliced(path, applied) if applied.as_slice() == declared.ops_for(path) => {
+      tagged(&[path])
+    }
+    Applied::Spliced(path, applied) | Applied::Created(path, applied) => {
+      tagged(&[path]).saturating_add(ops(applied))
+    }
+    Applied::Copied {
+      dst,
+      from,
+      ops: applied,
+    } if applied.is_empty() => tagged(&[dst, from]),
+    Applied::Copied {
+      dst,
+      from,
+      ops: applied,
+    } => tagged(&[dst, from]).saturating_add(ops(applied)),
+    Applied::RemoveSpecial(path)
+    | Applied::RemoveContent(path)
+    | Applied::MakeDir(path)
+    | Applied::RemoveDir(path)
+    | Applied::RemoveSymlink(path)
+    | Applied::RemoveHardlink(path) => tagged(&[path]),
+    Applied::Mode(path, _) => tagged(&[path]).saturating_add(WORD_BYTES),
+    Applied::Symlink(path, target) | Applied::Hardlink(path, target) => tagged(&[path, target]),
+    Applied::SetXattr(path, name, value) => tagged(&[path, name]).saturating_add(string_len(value)),
+    Applied::RemoveXattr(path, name) => tagged(&[path, name]),
+    Applied::CopyTree { dst, from, fix, .. } => {
+      tagged(&[dst, from]).saturating_add(fix.as_deref().map_or(0, fix_bytes))
+    }
+  }
 }
 
 /// Appends a signature's verdict (module docs): a present marker and the verdict, or an absent marker alone.
@@ -581,21 +717,68 @@ pub(crate) fn take_signature(reader: &mut Reader<'_>) -> Result<Option<Signature
 
 /// The increment an entry names, checking the entry's digest: where a reader resolves its bytes (format 6).
 pub fn inputs(entry: &[u8]) -> Result<Inputs, DocDecodeError> {
+  take_inputs(&mut checked(entry)?).map(|(inputs, _)| inputs)
+}
+
+/// The increment's encoding the entry carries (format 7), checking the entry's digest; `None` for one whose increment
+/// the content store holds under its [`inputs`].
+pub fn carried(entry: &[u8]) -> Result<Option<&[u8]>, DocDecodeError> {
+  take_inputs(&mut checked(entry)?).map(|(_, carried)| carried)
+}
+
+/// The increment an entry names, and the encoding it carries when it carries one (format 7, A-854), checking the entry's
+/// digest once: what a reader needs to find its bytes.
+pub fn placement(entry: &[u8]) -> Result<(Inputs, Option<&[u8]>), DocDecodeError> {
   take_inputs(&mut checked(entry)?)
 }
 
-fn take_inputs(reader: &mut Reader<'_>) -> Result<Inputs, DocDecodeError> {
+/// The increment an entry names in the content store (format 6), checking the entry's digest; `None` for one that carries
+/// its own (format 7, A-854).
+pub fn held_inputs(entry: &[u8]) -> Result<Option<Inputs>, DocDecodeError> {
+  take_inputs(&mut checked(entry)?).map(|(inputs, carried)| carried.is_none().then_some(inputs))
+}
+
+/// The length of the increment an entry names beside it in the content store, read from its header without checking its
+/// digest: 0 for one that carries its own (format 7, A-854) and for bytes that are no entry. A size for the checkpoint's
+/// doubling rule, read on every floor move: it hashes nothing, as the sum of entry lengths it extends did; any reader of
+/// what the entry records checks the digest.
+pub fn held_len(entry: &[u8]) -> u64 {
+  let mut reader = Reader::new(entry);
+  let header = (|| {
+    if reader.u32()? != MAGIC || reader.u32()? != VERSION {
+      return Err(DocDecodeError::BadVersion);
+    }
+    reader.bytes(HASH_BYTES)?;
+    let len = reader.u64()?;
+    Ok((len, reader.u8()?))
+  })();
+  match header {
+    Ok((len, ABSENT)) => len,
+    Ok(_) | Err(_) => 0,
+  }
+}
+
+fn take_inputs<'a>(reader: &mut Reader<'a>) -> Result<(Inputs, Option<&'a [u8]>), DocDecodeError> {
   let identity = <[u8; HASH_BYTES]>::try_from(reader.bytes(HASH_BYTES)?)
     .map_err(|_| DocDecodeError::Truncated)?;
   let len = reader.u64()?;
-  Ok(Inputs { identity, len })
+  let carried = match reader.u8()? {
+    PRESENT => {
+      let len = usize::try_from(len).map_err(|_| DocDecodeError::Truncated)?;
+      Some(reader.bytes(len)?)
+    }
+    ABSENT => None,
+    _ => return Err(DocDecodeError::BadKind),
+  };
+  Ok((Inputs { identity, len }, carried))
 }
 
-/// Decodes an entry, its increment's encoding `increment_bytes` as the content store holds it under the entry's
-/// [`inputs`]: typed refusals, never a panic. Bytes of another length than the entry names are refused `Truncated`.
+/// Decodes an entry, its increment's encoding `increment_bytes` as the entry carries it ([`carried`]) or the content
+/// store holds it under the entry's [`inputs`]: typed refusals, never a panic. Bytes of another length than the entry
+/// names are refused `Truncated`.
 pub fn decode(entry: &[u8], increment_bytes: &[u8]) -> Result<ChainEntry, DocDecodeError> {
   let mut reader = checked(entry)?;
-  let inputs = take_inputs(&mut reader)?;
+  let (inputs, _) = take_inputs(&mut reader)?;
   if u64::try_from(increment_bytes.len()).ok() != Some(inputs.len) {
     return Err(DocDecodeError::Truncated);
   }
@@ -1065,12 +1248,13 @@ mod tests {
     }
   }
 
-  /// Lane (A), format 6 (golden vector). Do: encode the entry of a one-file version spliced as declared, its
-  /// increment named by an identity of 32 bytes of 0xab and a length of 300, with no completion, head identity or
-  /// signature. Expect: these bytes, byte for byte: magic and version 6, the identity and the length, one effect (the
-  /// splice's tag and its path), three absent markers, then the BLAKE3 of all of it.
+  /// Lane (A), format 6, as format 7 writes it (A-854; golden vector). Do: encode the entry of a one-file version spliced
+  /// as declared, its increment named by an identity of 32 bytes of 0xab and a length of 300, held (not carried), with no
+  /// completion, head identity or signature. Expect: these bytes, byte for byte: magic and version 7, the identity and
+  /// the length, the absent marker of carried bytes, one effect (the splice's tag and its path), three absent markers,
+  /// then the BLAKE3 of all of it.
   #[test]
-  fn a_format_six_entry_encodes_to_its_golden_bytes() {
+  fn a_held_increments_entry_encodes_to_its_golden_bytes() {
     let increment = one_file(b"abc");
     let applied = vec![Applied::Spliced("f".to_owned(), increment.doc.ops.clone())];
     let inputs = Inputs {
@@ -1079,11 +1263,13 @@ mod tests {
     };
     let out = encode(inputs, &increment, &applied, None, None, None);
     let mut golden = [
-      // "GCHN", version 6.
-      &b"GCHN\x06\x00\x00\x00"[..],
+      // "GCHN", version 7.
+      &b"GCHN\x07\x00\x00\x00"[..],
       &[0xab; 32],
       // The length, 300.
       b"\x2c\x01\x00\x00\x00\x00\x00\x00",
+      // Not carried: the content store holds it.
+      b"\x00",
       // One effect: a splice as declared, of "f".
       b"\x01\x00\x00\x00\x10\x01\x00\x00\x00f",
       // No completion, no head identity, no signature.
@@ -1094,6 +1280,72 @@ mod tests {
     golden.extend_from_slice(&digest);
     assert_eq!(out, golden);
     assert_eq!(inputs, super::inputs(&out).unwrap());
+    assert_eq!(super::carried(&out), Ok(None));
+  }
+
+  /// A-854 (format 7, golden vector). Do: encode the same one-file version's entry carrying its increment's encoding, and
+  /// decode it from the bytes it carries; then one whose carried marker was rewritten to 2 and its digest made again.
+  /// Expect: magic and version 7, the identity and the encoding's length, the present marker and the encoding byte for
+  /// byte, then the held entry's effects and markers, and the digest; [`super::carried`] gives the encoding back, the
+  /// entry decodes from it to what was recorded, its size grows with the increment's by exactly its encoding, and it
+  /// names nothing in the content store (`held_inputs` none, `held_len` 0) where the held entry names its inputs. The
+  /// marker 2 is refused `BadKind`.
+  #[test]
+  fn a_carrying_entry_holds_its_increment_after_its_inputs() {
+    let increment = one_file(b"abc");
+    let increment_bytes = increment.encode();
+    let applied = vec![Applied::Spliced("f".to_owned(), increment.doc.ops.clone())];
+    let inputs = held(&increment_bytes);
+    let out = encode_carrying(
+      (inputs, Some(&increment_bytes)),
+      &increment,
+      &applied,
+      None,
+      None,
+      None,
+    );
+    let mut golden = [
+      &b"GCHN\x07\x00\x00\x00"[..],
+      &inputs.identity,
+      &inputs.len.to_le_bytes(),
+      b"\x01",
+      &increment_bytes,
+      b"\x01\x00\x00\x00\x10\x01\x00\x00\x00f",
+      b"\x00\x00\x00",
+    ]
+    .concat();
+    let digest = *blake3::hash(&golden).as_bytes();
+    golden.extend_from_slice(&digest);
+    assert_eq!(out, golden);
+    assert_eq!(super::carried(&out), Ok(Some(&increment_bytes[..])));
+    let entry = decode(&out, super::carried(&out).unwrap().unwrap()).unwrap();
+    assert_eq!(
+      (entry.inputs, entry.increment, entry.applied),
+      (inputs, increment.clone(), applied.clone())
+    );
+    let held_entry = encode(inputs, &increment, &applied, None, None, None);
+    assert_eq!(out.len(), held_entry.len() + increment_bytes.len());
+    assert_eq!(
+      (super::held_inputs(&out), super::held_len(&out)),
+      (Ok(None), 0)
+    );
+    assert_eq!(
+      (
+        super::held_inputs(&held_entry),
+        super::held_len(&held_entry)
+      ),
+      (Ok(Some(inputs)), inputs.len)
+    );
+    let marker = 8 + 32 + 8;
+    let mut body = golden[..golden.len() - 32].to_vec();
+    body[marker] = 2;
+    let digest = *blake3::hash(&body).as_bytes();
+    body.extend_from_slice(&digest);
+    assert_eq!(super::carried(&body), Err(DocDecodeError::BadKind));
+    assert_eq!(
+      decode(&body, &increment_bytes),
+      Err(DocDecodeError::BadKind)
+    );
   }
 
   /// Lane (A), format 6. Do: record the same one-file version with a 3-byte file and with a 4 MiB one. Expect: the two
@@ -1122,9 +1374,9 @@ mod tests {
     assert_eq!(sizes[0], sizes[1]);
   }
 
-  /// Lane (A), format 6 (typed refusals). Do: decode a format-6 entry given bytes one short of the length it names; read
-  /// one whose version word is 5; and one whose identity's first byte was flipped after it was written. Expect:
-  /// `Truncated` (not the increment it names), `BadVersion` (a version 5 entry is never read by a second path) and
+  /// Lane (A), format 6 (typed refusals). Do: decode an entry given bytes one short of the length it names; read one
+  /// whose version word is 6; and one whose identity's first byte was flipped after it was written. Expect:
+  /// `Truncated` (not the increment it names), `BadVersion` (a version 6 entry is never read by a second path) and
   /// `Truncated` (the digest refuses it), each from `decode` and the version and digest from `inputs` too.
   #[test]
   fn a_format_six_entry_refuses_other_bytes_versions_and_damage() {
@@ -1135,13 +1387,13 @@ mod tests {
       decode(&bytes, &increment_bytes[1..]),
       Err(DocDecodeError::Truncated)
     );
-    let mut five = bytes.clone();
-    five[4] = 5;
+    let mut six = bytes.clone();
+    six[4] = 6;
     assert_eq!(
-      decode(&five, &increment_bytes),
+      decode(&six, &increment_bytes),
       Err(DocDecodeError::BadVersion)
     );
-    assert_eq!(super::inputs(&five), Err(DocDecodeError::BadVersion));
+    assert_eq!(super::inputs(&six), Err(DocDecodeError::BadVersion));
     let mut damaged = bytes;
     damaged[8] ^= 1;
     assert_eq!(
@@ -1149,6 +1401,130 @@ mod tests {
       Err(DocDecodeError::Truncated)
     );
     assert_eq!(super::inputs(&damaged), Err(DocDecodeError::Truncated));
+  }
+
+  /// Goal 93, svn finding (2) (main 01a20182, 2026-11-22 00:19 PST; Ada's rule: what the design can avoid, it does not
+  /// allocate). Do: encode the held entry of a one-file version whose file is 256 KiB, spliced as declared, with a
+  /// completion, a head identity and a signature; then the same version's entry carrying an increment's encoding, and an
+  /// entry of every effect kind. Expect: each entry's buffer reserved at exactly its encoded length, never grown and
+  /// never over: the held one a few hundred bytes for 256 KiB of text. Failing first: the encoder reserved the
+  /// admission's bound, which counts the whole post-state (a by-value effect may take its bytes from it), so every text
+  /// of an import cost an allocation of its own size: 26.2 MB for 25.6 MB of text in w-svn's attribution
+  /// (`push::append_versions`), the buffer then kept as the chain entry's capacity.
+  #[test]
+  fn an_entrys_buffer_is_reserved_at_its_length_not_its_texts() {
+    let body = vec![b'x'; 256 << 10];
+    let increment = one_file(&body);
+    let applied = vec![Applied::Spliced("f".to_owned(), increment.doc.ops.clone())];
+    let completion = Completion {
+      origin: 1,
+      client: 2,
+      sequence: 3,
+      work: Some([4; WORK_BYTES]),
+    };
+    let signature = Signature {
+      kind: 1,
+      detail: 2,
+      fingerprint: [5; 32],
+    };
+    let held = encode(
+      Inputs {
+        identity: [0xab; 32],
+        len: 300,
+      },
+      &increment,
+      &applied,
+      Some(completion),
+      Some([6; 32]),
+      Some(signature),
+    );
+    assert!(held.len() < 4096, "a held entry is small: {}", held.len());
+    assert_eq!(
+      held.capacity(),
+      held.len(),
+      "the held entry's buffer for 256 KiB of text"
+    );
+    let small = one_file(b"abc");
+    let small_bytes = small.encode();
+    let small_applied = vec![Applied::Spliced("f".to_owned(), small.doc.ops.clone())];
+    let carrying = encode_carrying(
+      (held_for_tests(&small_bytes), Some(&small_bytes)),
+      &small,
+      &small_applied,
+      None,
+      None,
+      None,
+    );
+    assert_eq!(
+      carrying.capacity(),
+      carrying.len(),
+      "a carrying entry's buffer"
+    );
+    let every = every_kind_applied(&small);
+    let entry = encode(
+      held_for_tests(&small_bytes),
+      &small,
+      &every,
+      Some(completion),
+      None,
+      Some(signature),
+    );
+    assert_eq!(
+      entry.capacity(),
+      entry.len(),
+      "an entry of every effect kind"
+    );
+  }
+
+  /// One effect of every kind [`put_applied`] writes, each of its encodings: a splice as declared and one mapped, a copy
+  /// with and without edits, a tree copy with and without its fix.
+  fn every_kind_applied(increment: &Increment) -> Vec<Applied> {
+    let op = increment.doc.ops.clone();
+    let node = SpecialNode {
+      kind: crate::special::SpecialKind::Fifo,
+      uid: 1,
+      gid: 2,
+      atime: 3,
+      mtime: 4,
+      ctime: 5,
+      btime: 6,
+    };
+    let tree = |fix| Applied::CopyTree {
+      dst: "t".to_owned(),
+      from: "s".to_owned(),
+      version: 1,
+      replace: false,
+      fix,
+    };
+    vec![
+      Applied::Special("p".to_owned(), node),
+      Applied::RemoveSpecial("p".to_owned()),
+      Applied::Spliced("f".to_owned(), op.clone()),
+      Applied::Spliced("g".to_owned(), op.clone()),
+      Applied::Created("h".to_owned(), op.clone()),
+      Applied::Copied {
+        dst: "i".to_owned(),
+        from: "f".to_owned(),
+        ops: Vec::new(),
+      },
+      Applied::Copied {
+        dst: "j".to_owned(),
+        from: "f".to_owned(),
+        ops: op,
+      },
+      Applied::RemoveContent("k".to_owned()),
+      Applied::MakeDir("d".to_owned()),
+      Applied::RemoveDir("e".to_owned()),
+      Applied::Mode("f".to_owned(), 0o755),
+      Applied::Symlink("l".to_owned(), "f".to_owned()),
+      Applied::RemoveSymlink("m".to_owned()),
+      Applied::Hardlink("n".to_owned(), "f".to_owned()),
+      Applied::RemoveHardlink("o".to_owned()),
+      Applied::SetXattr("f".to_owned(), "user.a".to_owned(), b"value".to_vec()),
+      Applied::RemoveXattr("f".to_owned(), "user.b".to_owned()),
+      tree(None),
+      tree(Some(Box::new(every_kind_fix()))),
+    ]
   }
 
   thread_local! {

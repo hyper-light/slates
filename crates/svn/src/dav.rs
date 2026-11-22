@@ -62,6 +62,7 @@ mod report_locations;
 mod report_mergeinfo;
 pub mod request;
 pub mod response;
+pub mod revprops;
 pub mod site;
 mod time;
 pub mod update;

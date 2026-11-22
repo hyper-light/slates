@@ -1957,6 +1957,17 @@ struct ServerJudge<'j> {
 impl Judge for ServerJudge<'_> {
   type Accepted = Entry;
 
+  /// A push without `atomic` decides its commands oldest commit first (A-850): each create's search back for its base
+  /// then meets the move below it, so git/git's tags pushed whole into an empty repository bring about its history and
+  /// its tags, not tags times history. A delete ranks first; its outcome, as every command's, is reported in the order
+  /// sent.
+  fn rank(&mut self, command: &Command, _pushed: &Pushed<'_>) -> u64 {
+    if command.is_delete() {
+      return 0;
+    }
+    self.push.rank(self.state, command.new)
+  }
+
   /// A turn of the admission of `command`'s move (A-722 part 4c), for the shard's step quantum and a unit at least: the
   /// walk of what it brings, which its append then takes whole ([`SealedPush::admit`]). A delete needs none.
   fn ready(&mut self, command: &Command, pushed: &Pushed<'_>) -> bool {

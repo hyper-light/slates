@@ -3106,8 +3106,7 @@ impl Daemon {
         identities.sort_unstable();
         identities.extend(partition.green_chain(volume).iter().enumerate().filter_map(
           |(index, bytes)| {
-            let inputs = slates_merge::chain_entry::inputs(bytes).ok()?;
-            let increment = crate::merge_service::increment_of(s, volume, &inputs)?;
+            let increment = crate::merge_service::entry_increment(s, volume, bytes)?;
             slates_merge::chain_entry::decode(bytes, &increment)
               .ok()
               .map(|entry| {
@@ -7945,7 +7944,7 @@ mod tests {
   /// sends it, homed and landed as the edge does; stop the daemon with nothing more published, as a kill -9 leaves it,
   /// and start a successor over the same segment and store. Expect: the successor recovers the repository by reading the
   /// changeset its record names from the store (one read, no replay refused), `main` at the pushed commit, its record
-  /// version 5 naming sequence 1, and its next landing at sequence 2; the store's log holds the push as one git
+  /// version 6 naming sequence 1, and its next landing at sequence 2; the store's log holds the push as one git
   /// changeset of the repository at sequence 1, after the creation's 0, whose `Names` and `Payload` sections are the
   /// record's names and pack, the payload the BLAKE3 the record names. Before C5 no push landed anything into the store.
   #[test]
@@ -8082,7 +8081,7 @@ mod tests {
     let [(version, sequence, Some(pack))] = records[..] else {
       panic!("one record naming a pack: {records:?}")
     };
-    assert_eq!((version, sequence), (5, 1));
+    assert_eq!((version, sequence), (6, 1));
     // The store's log, read back from its files: the creation, then the push as one changeset.
     store.stop_owner();
     let dir = store.dir().to_path_buf();
