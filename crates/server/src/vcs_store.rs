@@ -2372,10 +2372,10 @@ pub(crate) fn commit(state: &mut ShardState, sealed: &mut SealedPush) -> Result<
   state.count(VALUE_UNKEPT, unkept);
   if let Some((pack, _)) = landed_pack {
     // Never under a fetch's answer or an encoding (w-git's driver makes the packs resident before either, and no read
-    // of theirs meets a window let go mid-answer): owed until the repository goes idle.
-    if crate::vcs_share::fetches_live(repository) == 0
-      && !git_encode::ahead_under_way(state, repository)
-    {
+    // of theirs meets a window let go mid-answer), nor under a push still deciding its refs (the push committing it is
+    // one: a non-atomic push's later refs, each an entry of its own, read its objects): owed until the push ends or the
+    // repository goes idle.
+    if landed_let_go_may(state, repository, 0) {
       let_go_landed_pack(state, &pack);
     } else {
       state
@@ -2410,9 +2410,36 @@ pub(crate) fn let_go_read(
   freed
 }
 
+/// Whether repository `id`'s landed packs may be let go now (goal 93 item 2b): no fetch of it answered, no encoding of
+/// it under way, and no intake of it under way but `own` (a push's own, as it ends): a push still deciding its refs
+/// reads the objects its pack staged (w-git and main 01a20182, 2026-11-22: a non-atomic many-ref push's later refs).
+fn landed_let_go_may(state: &ShardState, id: RepositoryId, own: u64) -> bool {
+  crate::vcs_share::fetches_live(id) == 0
+    && !git_encode::ahead_under_way(state, id)
+    && crate::vcs_share::intakes_live(id) <= own
+}
+
 /// Lets go of the landed packs repository `id` owes a let-go ([`VcsStores`]'s `landed_owed`): what its going idle runs
-/// (`git_encode::give_back_idle`), no fetch of it answered and no encoding under way.
+/// (`git_encode::give_back_idle`), no fetch of it answered and no encoding under way. Kept owed while a push of it is
+/// under way, whose later refs read their objects: its end lets them go ([`let_go_owed_as_push_ends`]).
 pub(crate) fn let_go_owed(state: &mut ShardState, id: RepositoryId) {
+  if crate::vcs_share::intakes_live(id) > 0 {
+    return;
+  }
+  let_go_owed_now(state, id);
+}
+
+/// Lets go of the landed packs repository `id` owes a let-go as a push of it ends (its `ReceivePack` dropped, its own
+/// intake still counted): where no other intake, no fetch and no encoding of it is under way; else the last of them to
+/// end does, or its going idle.
+pub(crate) fn let_go_owed_as_push_ends(state: &mut ShardState, id: RepositoryId) {
+  if state.vcs_stores.landed_owed.contains_key(&id) && landed_let_go_may(state, id, 1) {
+    let_go_owed_now(state, id);
+  }
+}
+
+/// [`let_go_owed`]'s let-go, its conditions met.
+fn let_go_owed_now(state: &mut ShardState, id: RepositoryId) {
   let owed = state.vcs_stores.landed_owed.remove(&id).unwrap_or_default();
   for pack in owed {
     let_go_landed_pack(state, &pack);
@@ -3968,7 +3995,7 @@ async fn replay_hg_run(
 ) -> Result<(), ReplayRefused> {
   let disk = state.vcs_disk.clone().ok_or(ReplayRefused::Unlanded)?;
   let repository = u128::from_be_bytes(id.bytes);
-  for sequence in run.first..=run.last {
+  for sequence in run.sequences() {
     let bytes = segment_record(&disk, repository, sequence)
       .await
       .ok_or(ReplayRefused::Unlanded)?;
@@ -3985,7 +4012,9 @@ async fn replay_hg_run(
       slices.unit_done().await;
     }
   }
-  state.vcs_stores.landed_changeset(id, run.last);
+  if let Some(last) = run.last() {
+    state.vcs_stores.landed_changeset(id, last);
+  }
   Ok(())
 }
 
@@ -3995,7 +4024,7 @@ async fn rebuild_hg_run(id: RepositoryId, run: slates_hg::import::record::Run) -
     return Unit::Refused(ReplayRefused::Unlanded);
   };
   let repository = u128::from_be_bytes(id.bytes);
-  for sequence in run.first..=run.last {
+  for sequence in run.sequences() {
     let Some(bytes) = segment_record(&disk, repository, sequence).await else {
       return Unit::Refused(ReplayRefused::Unlanded);
     };
@@ -4022,8 +4051,10 @@ async fn rebuild_hg_run(id: RepositoryId, run: slates_hg::import::record::Run) -
       slates_rt::futures::yield_now().await;
     }
   }
-  crate::state::with_state(|state| state.vcs_stores.landed_changeset(id, run.last))
-    .unwrap_or_default();
+  if let Some(last) = run.last() {
+    crate::state::with_state(|state| state.vcs_stores.landed_changeset(id, last))
+      .unwrap_or_default();
+  }
   Unit::Replayed
 }
 

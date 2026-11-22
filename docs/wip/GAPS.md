@@ -284,7 +284,9 @@
 > object and 1,362 MiB resident before, 0 and 123 MiB after. Open: the arena's address-space range in the content
 > object, a held extent's free pages. **Windows' section per extent written (A-789, main 18:40):** the anchor holds
 > each extent's section across a restart (`WHAT_CONTENT_EXTENT`); its build and tests are owed to w-lint on jupiter
-> (run-requests; red: commit kept after a destroyed volume's burst). **Open (R2, found 2026-11-20 19:45):** the macOS give-back
+> (run-requests; red: commit kept after a destroyed volume's burst). **Closed 2026-11-22 (w-interop):** the burst test's
+> red below was a shard keeping its burst's 1 GiB extent for 10 MiB of headroom, and the test measuring process RSS;
+> `docs/bugs/2026-11-22-a-shard-kept-a-1-gib-extent-for-10-mib-of-headroom.md`. **Open (R2, found 2026-11-20 19:45):** the macOS give-back
 > depends on the machine: recovery's `a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone` passed on a quiet
 > adas-macbook-pro-2 (1,648 -> 123 MiB) but kept 1,366 MiB there later and 335-336 MiB on the big Studio at 5,433 free
 > pages, at A-789's own commit too. Not the pressure hold: with the test's own pressure readings injected (none, and a
@@ -603,9 +605,22 @@
 >   **Measured** (`a_small_push_waits_behind_a_whole_history_push_for_its_landing_turn`, MacBook arm64, debug, one run):
 >   a one-changeset push waited 537 ms behind a 200-changeset push cut into 32 segments that took 729 ms; 4,047 ms
 >   behind a 500-changeset push of 488 segments (4 KiB bound) that took 4,358 ms. A small push waits out a long push's
->   whole run, past the patience for a long enough one; the structural fix is a per-push staging log, the run landing
->   apart from the repository's log and named in one step, so pushes to one repository need no turn between them.
->   Owed, main's: the whole-history push on ubuntu and its peak RSS before and after (run-requests.md).
+>   whole run, past the patience for a long enough one (release, main's r20: 69 to 80% of the long push's span).
+> - Staging BUILT (2026-11-22, w-hg; main 01a20182's rulings of 07:32 and 12:00): a push lands its segments apart from
+>   its repository's landing turn, at sequences its owner shard allocates (serialized with no lock), other landings
+>   between them; its entry names them as ranges (record v11, `record::write_push_runs_reference`, at most one range a
+>   segment; golden `a_pushs_runs_reference_is_the_golden_bytes_and_reads_back_as_its_ranges`), and the turn is taken
+>   for the entry's commit alone. A fork another landing made stale is re-based by node (`hg_push::rebase`) before its
+>   works are planned, off the turn; stale again once the turn is taken, re-based holding it, the turn held to the end,
+>   so at most one re-base off it and one in it (counted `vcs.hg.push_rebased`, `..._rebased_in_turn`). The live
+>   re-base and a restart's v10 replay make the same index (e72a3d97f). An abandoned run is forgotten as it ends: each
+>   sequence's rows dropped (`StoreHandle::forget`, c2ef17856; counted `vcs.hg.push_run_rows_forgotten`), its log bytes
+>   the owed cleaner's (below). Held by `a_one_changeset_push_lands_during_a_long_push_and_readers_see_only_named` (a
+>   one-changeset push took 13 ms during a 500-changeset push in debug, no turn waited; `heads` the small push's tip
+>   alone, the long push's tip unknown though its segments are on the store; the long push then re-based and landed),
+>   `a_long_push_stale_twice_is_re_based_once_holding_the_turn_and_lands`,
+>   `a_dropped_run_is_forgotten_and_the_next_push_lands_past_it`, and the crash oracle killed with an unnamed run's rows
+>   present (`t_b1_a_crash_at_any_segment_boundary_leaves_a_push_whole_or_absent`).
 > - The whole history's clones spun (main 01a20182's order of 2026-11-22 10:40; CI 45037561866: 4 spins, kills and
 >   restarts a leg, at `vcs_http.rs:850` polls 1-16 and `vcs_ssh::hg::streamed_turn` polls ~11,000). Measured over the
 >   served view of a pushed 57,054-changeset line (debug, MacBook arm64, each call the unit one step takes): a clone of
@@ -25417,7 +25432,14 @@ after every takeover (Goal 85b C3: 5 of 5 replays stalled at `live_chaos.rs:2465
 `live_ship::tests::the_publications_behind_a_whole_capture_are_held_to_the_credit_its_body_takes` (2 queued, 1 refused
 before; 3 queued, none refused after); this fleet test passes again (fleet `a_live_` 11/11).
 
-### 2026-11-20: a destroyed burst's extents not given back on Adas-Mac-Studio-2 — open (w-lint's finding, not worked: Ada's close order)
+### 2026-11-20: a destroyed burst's extents not given back on Adas-Mac-Studio-2 — closed 2026-11-22 (w-interop; `docs/bugs/2026-11-22-a-shard-kept-a-1-gib-extent-for-10-mib-of-headroom.md`)
+> **Closed:** the shard kept its burst's 1 GiB extent whole for its 10 MiB of operation headroom
+> (`ChunkArena::shrink` skips a region whose return leaves capacity under what it keeps); an idle give-back now trades
+> it for the smallest extent that keeps the headroom (`ChunkArena::shrink_trading`, 1,024 MiB held to 16 MiB after the
+> destroy). The test measured process RSS, which in its one process counts the test's own payload and its copies (1.0
+> GiB of freed large blocks macOS's allocator keeps): it now measures the pool by its own pages (the content object and
+> the arenas' held extents). A separate daemon's heap held resident (main's r41, about 1.3 GB against 31 to 60 MB
+> live) is its own piece, the idle heap give-back.
 `cargo test -p slates-server --test recovery a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone` (A-789,
 362bd8c39, red -> green on adas-macbook-pro-2 quiet: 1,622 -> 123 MiB) fails on main's own code on Adas-Mac-Studio-2,
 three runs of three on the merge 287055d5b: 41-42 MiB before the burst, 1,341-1,342 MiB after its volume was destroyed, for a

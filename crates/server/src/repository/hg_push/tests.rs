@@ -1695,19 +1695,17 @@ fn t_a694_a_push_making_two_bookmarks_makes_two_greens() {
 }
 
 std::thread_local! {
-  /// The task holding a run [`a_dropped_runs_turn_comes_back_and_its_sequences_are_landed_again`] cancels.
+  /// The task holding a run [`a_dropped_run_is_forgotten_and_the_next_push_lands_past_it`] cancels.
   static RUN_TASK: core::cell::Cell<Option<slates_rt::TaskId>> = const { core::cell::Cell::new(None) };
   /// Whether that task's stand-in changeset landed on the store.
   static STAND_IN_LANDED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
-/// A push's run, as [`a_dropped_runs_turn_comes_back_and_its_sequences_are_landed_again`] holds one: repository
-/// `repository`'s landing turn taken, one changeset landed on the node's store at its next sequence (a segment's
-/// stand-in, its record no record of the repository's), then held until the task is cancelled.
+/// A push's run, as [`a_dropped_run_is_forgotten_and_the_next_push_lands_past_it`] holds one: one changeset landed on
+/// the node's store at repository `repository`'s next sequence (a segment's stand-in: a record no record of the
+/// repository's and a payload), then held until the task is cancelled.
 async fn run_held_until_dropped(repository: RepositoryId) {
-  let Some(Ok(mut run)) = super::super::hg_run::Run::begin(repository).await else {
-    return;
-  };
+  let mut run = super::super::hg_run::Run::new(repository);
   let landing = crate::state::with_state(|state| {
     let disk = state.vcs_disk.clone()?;
     let sequence = state.vcs_stores.next_changeset(repository)?;
@@ -1721,10 +1719,16 @@ async fn run_held_until_dropped(repository: RepositoryId) {
       time_ns: slates_rt::futures::now_ns(),
       sections: 0,
     };
-    let parts = vec![(
-      slates_store::log::SectionKind::Record,
-      b"abandoned".to_vec(),
-    )];
+    let parts = vec![
+      (
+        slates_store::log::SectionKind::Record,
+        b"abandoned".to_vec(),
+      ),
+      (
+        slates_store::log::SectionKind::Payload,
+        b"an abandoned segment".to_vec(),
+      ),
+    ];
     Some((disk, header, parts))
   })
   .flatten();
@@ -1756,15 +1760,19 @@ fn until(
   }
 }
 
-/// Main 01a20182's ruling (i) of 2026-11-22 04:44 (the turn ends on every terminal path, a dropped future's included)
-/// and (b1) (an abandoned run's space comes back). Do: on a running daemon holding a changeset store, make a Mercurial
-/// repository; in a task, take its landing turn as a push's run does and land one changeset at its next sequence, then
-/// park; cancel the task; push two changesets to it; make its store again from its log (the sliced
-/// `vcs_store::rebuild`). Expect the turn held and the sequence counted while the task runs; once it is dropped, the
-/// turn free, the repository's next sequence counted from the last named again, the run counted abandoned; the push's
-/// run beginning at the abandoned one's sequence, the store's row there the push's; and the rebuild the push's history.
+/// The count of `name` on `state`.
+fn counted(state: &ShardState, name: &str) -> u64 {
+  state.refusals.get(name).copied().unwrap_or(0)
+}
+
+/// Main 01a20182's ruling of 2026-11-22 12:00 (an abandoned run's rows forgotten at its abandonment, counted and bounded;
+/// a dropped future's included). Do: on a running daemon holding a changeset store, make a Mercurial repository; in a
+/// task, land one changeset at its next sequence as a push's run does, then park; cancel the task; push two changesets
+/// to it; make its store again from its log (the sliced `vcs_store::rebuild`). Expect the run counted abandoned once it
+/// drops and its changeset's rows forgotten (its `C` and `P` rows at least); the push's run beginning past the abandoned
+/// sequence, which no landing takes again while the daemon runs; and the rebuild the push's history.
 #[test]
-fn a_dropped_runs_turn_comes_back_and_its_sequences_are_landed_again() {
+fn a_dropped_run_is_forgotten_and_the_next_push_lands_past_it() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let (repository, root, named) = crate::daemon::observe_first(&daemon, |state| {
     let hg = Hg::new(state, "dropped");
@@ -1773,25 +1781,19 @@ fn a_dropped_runs_turn_comes_back_and_its_sequences_are_landed_again() {
     RUN_TASK.with(|held| held.set(Some(task)));
     (hg.repository, hg.root, named)
   });
-  let held = until(&daemon, move |state| {
-    state.vcs_stores.svn_landings.held(repository)
-      && STAND_IN_LANDED.with(core::cell::Cell::get)
+  let landed = until(&daemon, move |state| {
+    STAND_IN_LANDED.with(core::cell::Cell::get)
       && state.vcs_stores.landed_of(repository) == Some(named + 1)
   });
   crate::daemon::observe_first(&daemon, |_| {
     let task = RUN_TASK.with(core::cell::Cell::take).unwrap();
     slates_rt::futures::cancel(task).unwrap();
   });
-  let freed = until(&daemon, move |state| {
-    !state.vcs_stores.svn_landings.held(repository)
+  let forgotten = until(&daemon, |state| {
+    counted(state, super::super::hg_run::RUN_ROWS_FORGOTTEN) >= 2
   });
-  let (counted, abandoned, (run, tip)) = crate::daemon::observe_first(&daemon, move |state| {
-    let counted = state.vcs_stores.landed_of(repository);
-    let abandoned = state
-      .refusals
-      .get(super::super::hg_run::RUNS_ABANDONED)
-      .copied()
-      .unwrap_or(0);
+  let (abandoned, (run, tip)) = crate::daemon::observe_first(&daemon, move |state| {
+    let abandoned = counted(state, super::super::hg_run::RUNS_ABANDONED);
     let made = history_of(&[
       ("one", "one", b"one\n", None, "default"),
       ("two", "two", b"two\n", Some(0), "default"),
@@ -1808,36 +1810,24 @@ fn a_dropped_runs_turn_comes_back_and_its_sequences_are_landed_again() {
       .filter_map(slates_hg::import::record::run_of)
       .last();
     crate::vcs_store::rebuild(state, repository);
-    (counted, abandoned, (run, made[1].node))
+    (abandoned, (run, made[1].node))
   });
   let rebuilt = until(&daemon, move |state| {
     !state.vcs_stores.rebuilding(repository)
   });
   let head = crate::daemon::observe_first(&daemon, move |state| head(state, root));
   daemon.stop();
-  assert!(
-    held,
-    "the task's run took the turn and landed a changeset at a sequence"
-  );
-  assert!(freed, "the dropped run gave its turn back");
-  assert_eq!(
-    counted,
-    Some(named),
-    "the next sequence counted from the last named"
-  );
+  assert!(landed, "the task's run landed a changeset at a sequence");
+  assert!(forgotten, "the dropped run's rows forgotten");
   assert_eq!(abandoned, 1);
   let run = run.expect("the push's entry names its run");
   assert_eq!(
-    run.first,
-    named + 1,
-    "the push's run took the abandoned one's sequence"
+    run.first(),
+    Some(named + 2),
+    "the push's run past the abandoned sequence"
   );
   assert!(rebuilt, "still rebuilding after {TASK_WAIT:?}");
-  assert_eq!(
-    head,
-    Some(tip),
-    "the rebuild replayed the push's run, not the abandoned row"
-  );
+  assert_eq!(head, Some(tip), "the rebuild replayed the push's run");
 }
 
 /// Main 01a20182's (ii) of 2026-11-22 05:01 (w-interop's whole-history push of hg: its keeping fit its repository's

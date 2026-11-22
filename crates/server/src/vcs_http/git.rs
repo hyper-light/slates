@@ -42,7 +42,9 @@
 //! `/name.git/info/refs`. No second spelling is tried.
 //!
 //! **Git LFS** (A-629; §4.17.2 "Large files"): a request under `<repo>/info/lfs`, the LFS server URL git-lfs derives
-//! from a remote, is routed by `slates_git::lfs::serve::route` (the batch API, the locks API and the basic adapter's
+//! from a remote (`<remote>.git/info/lfs` for a remote not ending `.git`, so a repository named without `.git` is reached
+//! at its name with `.git` too, where no repository has that name: [`GitSite::lfs_named`]), is routed by
+//! `slates_git::lfs::serve::route` (the batch API, the locks API and the basic adapter's
 //! transfers this server hands out) and taken in the same order: its route refused whoever asks (`405` with `Allow`,
 //! `400`, `414`, `415`, `406`), a request naming no authority `400`; its credentials, a `401` naming each challenge in
 //! `LFS-Authenticate` too, as `slates_git::lfs::serve` answers one (A-629 part 1); its repository, moved to its shard
@@ -697,6 +699,7 @@ impl<A: Authenticator, R: Repositories, S: GitServices, L: LfsService + Clone> G
       Ok(proven) => proven,
       Err(refused) => return lfs_challenged(self.refuse(refused, false)),
     };
+    let routed = self.lfs_named(routed);
     match self.lfs_gate(&routed.repo, &proven.principal) {
       Gate::Open => {}
       Gate::Elsewhere(shard) => {
@@ -734,6 +737,25 @@ impl<A: Authenticator, R: Repositories, S: GitServices, L: LfsService + Clone> G
   }
 
   /// How the repository named `name` stands with `principal` for Git LFS (the module doc, steps 3 and 4).
+  /// `routed` naming the repository git-lfs meant (main 01a20182's r28): its name as asked where a repository has it;
+  /// else, for one ending `.git`, the name without it, where a repository has that. git-lfs finds its server at the
+  /// remote's URL with `.git/info/lfs` appended where the URL does not end in `.git` [B: git-lfs,
+  /// `docs/api/server-discovery.md`], so a clone of `/project` asks `/project.git/info/lfs`. The exact name always wins:
+  /// a repository named `project.git` is reached at `/project.git/info/lfs` whatever `project` is.
+  fn lfs_named(&self, mut routed: Routed) -> Routed {
+    let known = |name: &str| {
+      matches!(self.repositories.locate(name), Located::Elsewhere(_))
+        || self.repositories.find(name).is_some()
+    };
+    if !known(&routed.repo)
+      && let Some(bare) = routed.repo.strip_suffix(".git")
+      && known(bare)
+    {
+      routed.repo = bare.to_owned();
+    }
+    routed
+  }
+
   fn lfs_gate(&self, name: &str, principal: &Principal) -> Gate {
     if let Located::Elsewhere(shard) = self.repositories.locate(name) {
       return Gate::Elsewhere(shard);
