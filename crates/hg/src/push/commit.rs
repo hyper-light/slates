@@ -131,6 +131,7 @@ pub(crate) fn keep_one(
   store: &mut ContentStore,
   log: Log<'_>,
   (arrived, previous): (&Arrived, Option<(&Node, &[u8])>),
+  kept: Option<ContentId>,
   admission: &mut Admission,
 ) -> Result<(), Unindexed> {
   let mut puts = Puts::default();
@@ -139,7 +140,7 @@ pub(crate) fn keep_one(
     Log::Changelog => changesets(fork, store, one, &mut puts, admission),
     Log::Manifest | Log::File(_) => {
       let files = matches!(log, Log::File(_));
-      revisions(store, one, &mut puts, admission, files).and_then(|group| {
+      revisions(store, (one, kept), &mut puts, admission, files).and_then(|group| {
         fork
           .append_revisions_after(store, log, &group, previous)
           .map(drop)
@@ -168,10 +169,10 @@ fn append(
   admission: &mut Admission,
 ) -> Result<(), Unindexed> {
   changesets(fork, store, &verified.changesets, puts, admission)?;
-  let manifests = revisions(store, &verified.manifests, puts, admission, false)?;
+  let manifests = revisions(store, (&verified.manifests, None), puts, admission, false)?;
   fork.append_revisions(store, Log::Manifest, &manifests)?;
   for (path, arrived) in &verified.files {
-    let group = revisions(store, arrived, puts, admission, true)?;
+    let group = revisions(store, (arrived, None), puts, admission, true)?;
     fork.append_revisions(store, Log::File(path), &group)?;
   }
   Ok(())
@@ -223,10 +224,12 @@ fn changesets(
 }
 
 /// A manifest log's or a file log's group, each text kept: a file revision's block apart from its bytes and its
-/// parents in the order 7.2 stores them.
+/// parents in the order 7.2 stores them. `kept` names a file revision's bytes its caller kept already, streamed a
+/// window at a time over its steps (A-767 C1, `super::intake`'s pending revision), for a group of one; held here as a
+/// put's hold is, and given back with them.
 fn revisions(
   store: &mut ContentStore,
-  arrived: &[Arrived],
+  (arrived, kept): (&[Arrived], Option<ContentId>),
   puts: &mut Puts,
   admission: &mut Admission,
   files: bool,
@@ -244,7 +247,14 @@ fn revisions(
         .metadata
         .map(|block| puts.put(store, block))
         .transpose()?;
-      (p1, p2, puts.put(store, split.bytes)?, block)
+      let bytes = match kept {
+        Some(kept) => {
+          puts.0.push(kept);
+          kept
+        }
+        None => puts.put(store, split.bytes)?,
+      };
+      (p1, p2, bytes, block)
     } else {
       let text = puts.put(store, &revision.text)?;
       (revision.p1, revision.p2, text, None)

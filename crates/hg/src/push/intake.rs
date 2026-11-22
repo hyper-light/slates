@@ -31,7 +31,7 @@ use core::ops::Range;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use slates_vcs::{ContentStore, IndexRefused};
+use slates_vcs::{ContentId, ContentStore, IndexRefused};
 
 use super::classify::ReadChangeset;
 use super::commit::{Unindexed, keep_one};
@@ -100,6 +100,11 @@ pub struct Intaken {
   pub base_rebuilds: u64,
   /// The file delta bases read from the node's changeset store between steps: a revision landed before the push.
   pub base_store_reads: u64,
+  /// The most text bytes one step hashed and kept (A-767 C1, the push spin): a revision longer than the content
+  /// store's window is taken over as many steps as it has windows ([`Pending`]), so no step's work grows with a file.
+  pub longest_step_bytes: u64,
+  /// The revisions taken over more than one step, a window a step ([`Pending`]).
+  pub spread: u64,
 }
 
 /// Format: the path a `Texts` entry gives the changelog's revisions: no tracked path holds a NUL (7.2's
@@ -285,6 +290,62 @@ struct Taker {
   cache: BaseCache,
   /// A file delta's base asked of the store, and its answer.
   asked: Option<StoreAsk>,
+  /// A revision longer than one window, being taken a window a step.
+  pending: Option<Box<Pending>>,
+}
+
+/// A revision longer than the content store's window taken over as many steps as it has windows (A-767 C1, the push
+/// spin w-balance found: a 64 MiB file revision hashed with sha1dc, hashed again for its identity and kept, in one step,
+/// spun its shard past the watchdog's window): rebuilt in the step that met it; then each step hashes one window of
+/// its text into its node's check and its identity, and keeps the window of a file's bytes through the store's
+/// streamed put ([`ContentStore::put_window`]); the last checks the node and keeps the row. Derived: a window a step,
+/// the content store's own window, so a step's work is bounded by the store's unit, whatever the file.
+struct Pending {
+  /// Its log; a file's path owned.
+  log: PendingLog,
+  /// Its node, first and second parents and link, the dataless revision its log's reader reads.
+  meta: (Node, Node, Node, Node),
+  /// Its delta base's identity, none for a whole.
+  base: Option<[u8; 32]>,
+  /// Where it lies in the payload, past a whole's hunk.
+  place: Range<u64>,
+  /// Its whole text.
+  text: Vec<u8>,
+  /// The text's bytes hashed so far.
+  at: usize,
+  /// Its node's check.
+  checking: node::Checking,
+  /// Its identity's hash.
+  identity: blake3::Hasher,
+  /// Where a file's bytes begin in its text, past its metadata block; none for a changeset or a manifest.
+  bytes_from: Option<usize>,
+  /// A file's bytes being kept.
+  writing: Option<slates_vcs::Writing>,
+  /// The stage after it.
+  after: Stage,
+  /// A file revision's position in its group, for a later delta's base.
+  position: Option<usize>,
+}
+
+/// The log of a [`Pending`] revision.
+enum PendingLog {
+  /// The changelog.
+  Changelog,
+  /// The manifest log.
+  Manifest,
+  /// A file log, by its path.
+  File(Vec<u8>),
+}
+
+impl PendingLog {
+  /// The log it names.
+  fn log(&self) -> Log<'_> {
+    match self {
+      PendingLog::Changelog => Log::Changelog,
+      PendingLog::Manifest => Log::Manifest,
+      PendingLog::File(path) => Log::File(path),
+    }
+  }
 }
 
 /// The push's own file texts a later delta may name as its base (A-767 C1, main's ruling (b2)): the texts kept before
@@ -519,6 +580,7 @@ impl Intake {
         positions: BTreeMap::new(),
         cache: BaseCache::within(room),
         asked: None,
+        pending: None,
       },
     })
   }
@@ -532,6 +594,9 @@ impl Intake {
     admission: &mut Admission,
   ) -> Result<Stepped, Refused> {
     let Intake { frame, taker } = self;
+    if taker.pending.is_some() {
+      return taker.advance_pending(store, admission);
+    }
     match taker.stage {
       Stage::Changelog(at) => {
         let next = match frame.placed(payload, &frame.0.changelog, at) {
@@ -571,7 +636,15 @@ impl Intake {
   }
 
   /// Gives the fork back: the repository's index and the content store as they were before the intake began.
-  pub fn abandon(self, store: &mut ContentStore) -> Result<(), IndexRefused> {
+  pub fn abandon(mut self, store: &mut ContentStore) -> Result<(), IndexRefused> {
+    if let Some(writing) = self
+      .taker
+      .pending
+      .take()
+      .and_then(|pending| pending.writing)
+    {
+      store.abandon_object(writing);
+    }
     self.taker.fork.release(store)
   }
 }
@@ -589,12 +662,21 @@ impl Taker {
       self.enter(after);
       return Ok(Stepped::More);
     };
-    self.take(log, (&revision, place), None, (store, admission))?;
-    self.stage = match self.stage {
+    let after = match self.stage {
       Stage::Changelog(at) => Stage::Changelog(at.saturating_add(1)),
       Stage::Manifests(at) => Stage::Manifests(at.saturating_add(1)),
       other => other,
     };
+    // A revision longer than a window is taken over the steps after this one ([`Pending`]), which move the stage on.
+    if self.take(
+      log,
+      (&revision, place),
+      None,
+      (store, admission),
+      (after, None),
+    )? {
+      self.stage = after;
+    }
     Ok(Stepped::More)
   }
 
@@ -671,21 +753,26 @@ impl Taker {
         }
       }
     };
+    let after = Stage::Files {
+      file,
+      at: at.saturating_add(1),
+    };
+    let position = (!kept_before).then_some(at);
     let taken = self.take(
       Log::File(&path),
       (&revision, place),
       given,
       (store, admission),
+      (after, position),
     );
-    if taken.is_ok() && !kept_before {
-      self.positions.insert(revision.node, at);
-    }
     self.path = Some(path);
-    taken?;
-    self.stage = Stage::Files {
-      file,
-      at: at.saturating_add(1),
-    };
+    // A revision longer than a window is taken over the steps after this one ([`Pending`]), which move the stage on.
+    if taken? {
+      if let Some(position) = position {
+        self.positions.insert(revision.node, position);
+      }
+      self.stage = after;
+    }
     Ok(Stepped::More)
   }
 
@@ -750,9 +837,10 @@ impl Taker {
     (revision, place): (&Revision<'_>, Range<u64>),
     given: Option<Vec<u8>>,
     (store, admission): (&mut ContentStore, &mut Admission),
-  ) -> Result<(), Refused> {
+    (after, position): (Stage, Option<usize>),
+  ) -> Result<bool, Refused> {
     if self.already_brought(log, revision.node, store, admission)? {
-      return Ok(());
+      return Ok(true);
     }
     self.check_known(log, revision, store)?;
     let mut room = *admission;
@@ -772,6 +860,22 @@ impl Taker {
     if base_rebuilt {
       self.intaken.rebuilt = self.intaken.rebuilt.saturating_add(1);
     }
+    // A whole is kept as its raw text (the store's contract, A-767 C1): its place past the one hunk it arrived in.
+    let place = if base.is_none() {
+      let start = delta::whole_text_start(revision.data).ok_or_else(|| Unverified::NotWhole {
+        log: log_of(log),
+        node: revision.node,
+      })?;
+      place.start.saturating_add(to_u64(start))..place.end
+    } else {
+      place
+    };
+    let window = store.window();
+    if text.len() > window {
+      self.begin_pending(log, revision, (text, base, place), (after, position))?;
+      return Ok(false);
+    }
+    self.intaken.longest_step_bytes = self.intaken.longest_step_bytes.max(to_u64(text.len()));
     node::check(&revision.node, &revision.p1, &revision.p2, &text).map_err(|fault| {
       Unverified::Node {
         log: log_of(log),
@@ -779,6 +883,161 @@ impl Taker {
         fault,
       }
     })?;
+    self.keep_taken(
+      log,
+      revision,
+      (text, base, place),
+      (None, None),
+      (store, admission),
+    )?;
+    Ok(true)
+  }
+
+  /// Begins taking a revision longer than one window over the steps that follow ([`Pending`]): its text rebuilt, its
+  /// place, and where a file's bytes begin past its metadata block.
+  fn begin_pending(
+    &mut self,
+    log: Log<'_>,
+    revision: &Revision<'_>,
+    (text, base, place): (Vec<u8>, Option<[u8; 32]>, Range<u64>),
+    (after, position): (Stage, Option<usize>),
+  ) -> Result<(), Refused> {
+    let (pending_log, bytes_from) = match log {
+      Log::Changelog => (PendingLog::Changelog, None),
+      Log::Manifest => (PendingLog::Manifest, None),
+      Log::File(path) => {
+        let split = filerev::split(&text).map_err(|fault| Unverified::FileRevision {
+          path: path.to_vec(),
+          node: revision.node,
+          fault,
+        })?;
+        let from = text.len().saturating_sub(split.bytes.len());
+        (PendingLog::File(path.to_vec()), Some(from))
+      }
+    };
+    self.intaken.spread = self.intaken.spread.saturating_add(1);
+    self.pending = Some(Box::new(Pending {
+      log: pending_log,
+      meta: (revision.node, revision.p1, revision.p2, revision.link),
+      base,
+      place,
+      text,
+      at: 0,
+      checking: node::Checking::new(&revision.node, &revision.p1, &revision.p2),
+      identity: blake3::Hasher::new(),
+      bytes_from,
+      writing: None,
+      after,
+      position,
+    }));
+    Ok(())
+  }
+
+  /// One step of a [`Pending`] revision: its next window hashed into its node's check and its identity, and kept where
+  /// it is a file's bytes; after its last, its node checked and its row kept, and the stage moved on.
+  fn advance_pending(
+    &mut self,
+    store: &mut ContentStore,
+    admission: &mut Admission,
+  ) -> Result<Stepped, Refused> {
+    let window = store.window();
+    let Some(pending) = self.pending.as_mut() else {
+      return Ok(Stepped::More);
+    };
+    let end = pending.text.len().min(pending.at.saturating_add(window));
+    let piece = pending.text.get(pending.at..end).unwrap_or_default();
+    pending.checking.update(piece);
+    pending.identity.update(piece);
+    if let Some(from) = pending.bytes_from {
+      let start = pending.at.max(from);
+      if let Some(bytes) = pending
+        .text
+        .get(start..end)
+        .filter(|bytes| !bytes.is_empty())
+      {
+        let writing = pending.writing.get_or_insert_with(|| store.begin_object());
+        store
+          .put_window(writing, bytes)
+          .map_err(|refused| Refused::Unindexed(Unindexed::from(refused)))?;
+      }
+    }
+    self.intaken.longest_step_bytes = self
+      .intaken
+      .longest_step_bytes
+      .max(to_u64(end.saturating_sub(pending.at)));
+    pending.at = end;
+    if pending.at < pending.text.len() {
+      return Ok(Stepped::More);
+    }
+    let Some(pending) = self.pending.take() else {
+      return Ok(Stepped::More);
+    };
+    let Pending {
+      log,
+      meta: (node, p1, p2, link),
+      base,
+      place,
+      text,
+      checking,
+      identity,
+      writing,
+      after,
+      position,
+      ..
+    } = *pending;
+    let log = log.log();
+    checking.finish().map_err(|fault| Unverified::Node {
+      log: log_of(log),
+      node,
+      fault,
+    })?;
+    let kept = match writing {
+      Some(mut writing) => Some(
+        store
+          .finish_object(&mut writing)
+          .map_err(|refused| Refused::Unindexed(Unindexed::from(refused)))?,
+      ),
+      None => None,
+    };
+    let revision = Revision {
+      node,
+      p1,
+      p2,
+      base: NULL_NODE,
+      link,
+      flags: 0,
+      info: None,
+      protocol_flags: 0,
+      data: &[],
+      sidedata: None,
+    };
+    let identity = *identity.finalize().as_bytes();
+    self.keep_taken(
+      log,
+      &revision,
+      (text, base, place),
+      (kept, Some(identity)),
+      (store, admission),
+    )?;
+    if let Some(position) = position {
+      self.positions.insert(node, position);
+    }
+    self.stage = after;
+    Ok(Stepped::More)
+  }
+
+  /// Keeps a revision whose node is checked (module docs): read as its log reads it, its row appended into the fork
+  /// (`kept` its file bytes where they were streamed already), its `Texts` entry named (`identity` where it was hashed
+  /// already), and it the text kept last.
+  fn keep_taken(
+    &mut self,
+    log: Log<'_>,
+    revision: &Revision<'_>,
+    (text, base, place): (Vec<u8>, Option<[u8; 32]>, Range<u64>),
+    (kept, identity): (Option<ContentId>, Option<[u8; 32]>),
+    (store, admission): (&mut ContentStore, &mut Admission),
+  ) -> Result<(), Refused> {
+    let mut room = *admission;
     self.read_as_its_log(log, revision, &text, store, admission)?;
     let arrived = Arrived {
       node: revision.node,
@@ -792,7 +1051,14 @@ impl Taker {
       .last
       .as_ref()
       .map(|(node, text)| (node, text.as_slice()));
-    keep_one(&mut self.fork, store, log, (&arrived, previous), &mut room)?;
+    keep_one(
+      &mut self.fork,
+      store,
+      log,
+      (&arrived, previous),
+      kept,
+      &mut room,
+    )?;
     admission.charge_items::<Node>(1)?;
     self.brought.insert(revision.node);
     self.intaken.kept = self.intaken.kept.saturating_add(1);
@@ -807,17 +1073,7 @@ impl Taker {
       Log::File(path) => path,
     };
     admission.charge(to_u64(path.len()))?;
-    let identity = *blake3::hash(&arrived.text).as_bytes();
-    // A whole is kept as its raw text (the store's contract, A-767 C1): its place past the one hunk it arrived in.
-    let place = if base.is_none() {
-      let start = delta::whole_text_start(revision.data).ok_or_else(|| Unverified::NotWhole {
-        log: log_of(log),
-        node: revision.node,
-      })?;
-      place.start.saturating_add(to_u64(start))..place.end
-    } else {
-      place
-    };
+    let identity = identity.unwrap_or_else(|| *blake3::hash(&arrived.text).as_bytes());
     self.intaken.texts.push(KeptText {
       path: path.to_vec(),
       node: revision.node,

@@ -1250,14 +1250,17 @@ fn drive(
   {
     return Some(outcome);
   }
-  super::landing(
+  match super::landing(
     state,
     repository,
-    (principal, bundle),
+    (principal, super::push_name(repository, bundle)),
     &unbundle,
     forked,
-    room,
-  )
+    (&mut super::Works::Whole, room),
+  ) {
+    super::Landing::Done(outcome) => outcome,
+    super::Landing::Unbuilt(_) => None,
+  }
 }
 
 /// A rule over `names` matching `pattern`, deciding a submit with `effect` for `who`.

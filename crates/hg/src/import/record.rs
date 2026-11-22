@@ -175,17 +175,37 @@ impl Reference {
 /// [`REFERENCE_VERSION`]).
 pub fn write_push_reference(
   room: u64,
-  (version, changegroup): (Version, &[u8]),
+  (version, payload): (Version, PayloadName),
   sequence: u64,
 ) -> Vec<u8> {
-  write_reference(Source::Push, room, (version, changegroup), sequence)
+  write_reference(Source::Push, room, (version, payload), sequence)
+}
+
+/// A changeset's payload named by what a reference holds of it: its BLAKE3 and its length, hashed by its caller (a
+/// push's driver hashes a large payload a quantum at a time, A-767 C1: the push spin).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PayloadName {
+  /// The payload's BLAKE3.
+  pub identity: [u8; 32],
+  /// Its length.
+  pub len: u64,
+}
+
+impl PayloadName {
+  /// The name of `payload`, hashed whole.
+  pub fn of(payload: &[u8]) -> PayloadName {
+    PayloadName {
+      identity: *blake3::hash(payload).as_bytes(),
+      len: to_u64(payload.len()),
+    }
+  }
 }
 
 /// The register's record of a changeset the server made of `green`'s `version` (A-731), landed as changeset `sequence`
 /// whose changegroup is `changegroup`: [`write_push_reference`]'s form with the made source.
 pub fn write_made_reference(
   room: u64,
-  (version, changegroup): (Version, &[u8]),
+  (version, payload): (Version, PayloadName),
   sequence: u64,
   (green, made): (u64, u64),
 ) -> Vec<u8> {
@@ -195,7 +215,7 @@ pub fn write_made_reference(
       version: made,
     },
     room,
-    (version, changegroup),
+    (version, payload),
     sequence,
   )
 }
@@ -204,14 +224,14 @@ pub fn write_made_reference(
 fn write_reference(
   source: Source,
   room: u64,
-  (version, changegroup): (Version, &[u8]),
+  (version, payload): (Version, PayloadName),
   sequence: u64,
 ) -> Vec<u8> {
   let mut out = Vec::new();
   write_head_alone(&mut out, (REFERENCE_VERSION, source, room));
   out.extend_from_slice(version.name());
-  out.extend_from_slice(blake3::hash(changegroup).as_bytes());
-  out.extend_from_slice(&to_u64(changegroup.len()).to_le_bytes());
+  out.extend_from_slice(&payload.identity);
+  out.extend_from_slice(&payload.len.to_le_bytes());
   out.extend_from_slice(&sequence.to_le_bytes());
   out
 }

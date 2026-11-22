@@ -389,3 +389,89 @@ pub fn work(
   };
   push::build(&push, green, &trees, room).map_err(WorkRefused::Push)
 }
+
+/// A version's trees laid out, owned (A-767 C1, the push spin w-balance found): what a work's build keeps between its
+/// turns, so its manifests are laid out once, not a turn at a time.
+pub struct Layout {
+  /// Every directory laid out, by its name.
+  dirs: BTreeMap<ObjectKey, Vec<TreeEntry>>,
+  /// Each file node a laid-out manifest names, with the path naming it.
+  paths: BTreeMap<Node, Vec<u8>>,
+}
+
+/// A push's work built a unit a turn (A-767 C1, the push spin: a 64 MiB file's work built in one step spun its shard
+/// past the watchdog; main's ruling of 2026-11-21 13:26, (1)): both trees laid out once ([`begin_work`]), then A-618's
+/// sliced builder advanced over them a turn at a time, the push's revisions and the repository's lent each turn
+/// ([`WorkBuild::advance`]). The work is the push's own until its landing takes it: nothing else reads it.
+pub struct WorkBuild {
+  /// The trees laid out.
+  layout: Layout,
+  /// The builder.
+  building: push::Building,
+}
+
+/// Begins building the work of `moved` (as [`work`] builds it whole): its base's and its head's trees laid out within
+/// `admission`, and the builder made within `room`, its turns under `pace`.
+pub fn begin_work(
+  moved: &Move<'_>,
+  revisions: (&Verified, &(impl Held + ?Sized)),
+  (room, pace): (u64, slates_merge::pace::Pace),
+  admission: &mut Admission,
+) -> Result<WorkBuild, WorkRefused> {
+  let (verified, held) = revisions;
+  let mut trees = Trees::new(verified, held);
+  let base_tree = match moved.base.filter(|base| **base != NULL_NODE) {
+    Some(base) => Some(
+      trees
+        .lay_out_changeset(base, admission)
+        .map_err(WorkRefused::Layout)?,
+    ),
+    None => None,
+  };
+  let tree = trees
+    .lay_out_changeset(moved.head, admission)
+    .map_err(WorkRefused::Layout)?;
+  let pushed = Push {
+    name: moved.name,
+    base_version: moved.base_version,
+    base_tree,
+    tree,
+    head: Some(moved.head.as_slice()),
+  };
+  let building = push::Building::new(&pushed, room, pace);
+  Ok(WorkBuild {
+    layout: Layout {
+      dirs: trees.dirs,
+      paths: trees.paths,
+    },
+    building,
+  })
+}
+
+impl WorkBuild {
+  /// The pace its turns run under: its owner begins each turn on it.
+  pub fn pace(&self) -> &slates_merge::pace::Pace {
+    self.building.pace()
+  }
+
+  /// One turn over `green`, its objects the trees laid out over `revisions` (the push's and the repository's, lent for
+  /// the turn): the work or the refusal once built; none while units remain.
+  pub fn advance<H: Held + ?Sized>(
+    &mut self,
+    green: &Green,
+    (verified, held): (&Verified, &H),
+  ) -> Option<Result<Built, WorkRefused>> {
+    let trees = Trees {
+      verified,
+      held,
+      dirs: core::mem::take(&mut self.layout.dirs),
+      paths: core::mem::take(&mut self.layout.paths),
+    };
+    let advanced = self.building.advance(green, &trees);
+    self.layout = Layout {
+      dirs: trees.dirs,
+      paths: trees.paths,
+    };
+    advanced.map(|built| built.map_err(WorkRefused::Push))
+  }
+}

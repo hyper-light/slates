@@ -449,10 +449,12 @@ fn prepared(state: &mut ShardState, made: &Made) -> Result<Prepared, Unmade> {
     None => return Err(Unmade::NotHead),
   };
   let made_key = (green_key(made.green), made.version);
+  // A made changeset's payload is named whole, as its intake takes it whole (`hg_push::take_whole`; owed, GAPS).
+  let name = slates_hg::import::record::PayloadName::of(&forked.changegroup.1);
   match crate::repository::hg_push::changeset_landing(
     state,
     made.repository,
-    &mut forked,
+    (&mut forked, name),
     Some(made_key),
   ) {
     Some(changeset) => Ok((forked, changeset)),

@@ -3214,6 +3214,38 @@
 >     store and verifies clean (0 asks before);
 >   - hg_interop 15/15 against stock hg 7.2.
 > - 1b, BUILT below.
+> **A large hg push spun its shard past the watchdog (goal 93 correctness; found by w-balance by use, inbox
+> w-hg-from-w-balance-push-spin.md: a 64+32 MiB push, shard 8 at 3.1 s in one poll in `hg_push::take` and
+> `hg_push::unbundle`, the daemon killed). The hg side FIXED (2026-11-21, w-hg; main's ruling (1) of 13:26); the merge
+> engine's apply OPEN (below).**
+> - Measured (one 64 MiB revision's intake step, test profile, proportions only): `put_object` 59 s, sha1dc 50 s,
+>   BLAKE3 20 s, the delta's apply 0.05 s: every cost grew with the file.
+> - (A) The intake: a revision longer than the content store's window is taken over as many steps as it has windows
+>   (`push::intake::Pending`): each step hashes one window into the node's check (`node::Checking`, sha1dc as before)
+>   and the identity, and keeps the window of a file's bytes through the store's streamed put
+>   (`ContentStore::put_window`); the last checks the node and keeps the row (`keep_one` takes the streamed bytes).
+>   Derived: the content store's own window a step. Counted `Intaken::longest_step_bytes`, `spread`.
+> - (B) The landing: each move's work is built before the landing step a unit a turn (`hg_push::built_works`:
+>   the moves planned as the landing judges them, `Works::Planning`; the trees laid out once, `tree::begin_work`;
+>   A-618's sliced `Building` advanced under half the shard's step quantum, `tree::WorkBuild`), and the landing's one
+>   step takes the built increments (`Works::Built`). Nothing reads a half-built work; a stale fork rebases and builds
+>   again; a plan that moved between the build and the landing builds again, the same plan missing twice refused,
+>   typed (`UNBUILT`); a daemon killed meanwhile leaves nothing, the push retried whole. Counted
+>   `vcs.hg.push_works_built`, `vcs.hg.push_work_turns`.
+> - (C) Two whole hashes of the push's bytes each in one step, found by timing each step of `unbundle` (debug, the
+>   64+32 MiB push): the changeset's payload BLAKE3, for its reference and its `Texts` places, 186 s in one step; and
+>   the push's name, a BLAKE3 of the whole bundle (A-618), hashed in every judging (planning, landing, the works), 1 to
+>   5.5 s each. Both are now hashed once, a content window at a time, yielding at half the step quantum
+>   (`hg_push::hashed_sliced`: `named_payload`, `named_push`); the references take the payload's name
+>   (`record::PayloadName`); the judging 0 ms.
+> - OPEN, the merge engine's: `push::push_planned` → `apply_planned` applies the built 96 MiB increment to the green in
+>   one step (verdicts 6 to 23 ms, the apply past the 3.3 s window, the daemon killed). P2's `materialize` commits a
+>   built work the same way. Main rules who slices it (inbox, 2026-11-21).
+> - Held by `push::intake::tests::a_revision_longer_than_a_window_is_taken_a_window_a_step` (red before: one step took
+>   the whole text), the server hg suites (the daemon-edge pushes through the sliced works), and by use
+>   `hg_interop::stock_hg_pushes_large_files_and_the_daemon_keeps_serving` (ignored; w-balance's repro; main's rounds).
+> - Owed (slates-merge, A-752 "units still one object's size"): the builder lays a file's bytes in one unit, so a
+>   64 MiB file is still one unit of the work's post-state (a copy, no hash), noted to w-engine.
 > **Three more readers of whole file texts gone: made changesets, the presence check, the served view's `file` (A-767
 > C1, 2026-11-21, w-hg; main's order of 10:34). BUILT.**
 > - `push/made.rs`: whether a version's file keeps its parent's node (7.2's `filelog.cmp`) is told by the two texts'
