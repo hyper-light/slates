@@ -414,3 +414,13 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - Main's r6: fsfs_view's stock leg GREEN.
 - Waiting: main's rerun of stock_svn_over_httpv2_answers_as_stock_svnserve_byte_for_byte, and r11's finding (2)
   blocks. My finding (2) probe is still local, in svn_import/tests.rs.
+
+## 2026-11-22 ~01:20 PST: finding (2), cause found
+- Main's r11 (git-2000, release): physical footprint 43 MiB before, 527 MiB at 30 s idle, 484 MiB held.
+  - Live heap +104 MB; arena 51 MB.
+  - Malloc's freed-but-kept memory +846 MB, the bulk.
+- Reproduced in debug with a 100 MB dump: 363 MB held at 30 s.
+- With A-742's large-path floor lowered from 64 to 4 pages (experiment, reverted): 47 MB, at baseline. The import was
+  slower, 19.4 s against 12.0 s.
+- Asked main to rule: (1) rederive the floor, (2) cut the import's sub-1 MiB churn, or (3) both.
+- Filed: content.purged_bytes keeps climbing during idle.
