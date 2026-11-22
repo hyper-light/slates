@@ -83,3 +83,18 @@ objects), git_scale.sh with --vcs-store, 3 runs a side. Report: Studio-2 ~/.cach
 Bisecting now (r9, Studio-2): a fresh repository a ref class at a time (branches; + tags of commits; + junio-gpg-pub;
 all tags) and two tiny repositories (a tag of a blob; a tag of a tag), each mirror-cloned. The minimal failing case
 follows here.
+## 2026-11-21 ~23:45 PST: the whole-clone "corruption" bisected: annotated tags of commits, in git/git's numbers (not the odd tags)
+r9, Studio-2, release 9b46d364f (has b61cdf8d1), one anchor (`--vcs-http --vcs-store`), a fresh repository per row,
+`git clone --mirror` then `fsck`. Report: Studio-2 ~/.cache/w-interop-git/r-bisect-1121-1607.txt (work dir
+~/.cache/w-interop-git/bisect/, anchor.log there).
+  tiny-blobtag   (1 commit + an annotated tag of a blob):        push 0 s ok; clone ok; refs 2; fsck ok
+  tiny-tagoftag  (1 commit + a tag of an annotated tag):         push 0 s ok; clone ok; refs 3; fsck ok
+  gg-branches    (git/git's 8 branches only):                    push 55 s ok; clone 428 s ok; refs 8; fsck ok
+  gg-commit-tags (8 branches + the 1,018 tags whose ^{} is a commit): push 185 s ok; clone FAILED:
+      remote: aborting due to possible repository corruption on the remote side. fatal: early EOF
+      fatal: fetch-pack: invalid index-pack output
+(junio-gpg-pub tags a blob; v1.0rc1 is a tag of a tag: both fine in the tiny cases.) So the pack fails once the
+repository holds git/git's annotated tags of commits; the branches' own whole history packs and clones correctly (if
+slowly: 428 s, stock ~10 s). Not narrowed further yet (how many tags, or which); say if you want me to.
+Probably the same defect: the git matrix's deepen row ("bad pack header", after the matrix pushed and deleted a tag) on
+1a35ab091, while deepen on a fresh repository of git v2.0.0 works for every N 1..100 (r5).
