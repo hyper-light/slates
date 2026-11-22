@@ -125,6 +125,9 @@ pub enum StoreError {
   NoLanding,
   /// The owner's queue of landings waiting for an open sliced landing is full (the asker's `OwnerError::Busy`).
   Held,
+  /// The store could not be opened when its owner started (goal 93; jupiter's red, 2026-11-21): the owner stays and
+  /// answers every request with the open's reason, in its words, rather than ending with no word.
+  Unopened(Box<str>),
 }
 
 impl fmt::Display for StoreError {
@@ -139,6 +142,9 @@ impl fmt::Display for StoreError {
       Self::NotStaged => f.write_str("a section named a content that is not staged"),
       Self::Held => f.write_str("the store's owner holds as many landings as it may wait"),
       Self::NoLanding => f.write_str("no such landing is open (committed, abandoned or another's)"),
+      Self::Unopened(reason) => {
+        write!(f, "the version-control store could not be opened: {reason}")
+      }
     }
   }
 }

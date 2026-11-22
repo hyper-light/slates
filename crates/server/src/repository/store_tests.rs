@@ -153,6 +153,59 @@ fn each_tool_creates_a_repository_into_the_store() {
   daemon.stop();
 }
 
+/// Goal 93, jupiter's red (w-k90-win, 2026-11-21: the store's owner ended with no word and every `repository create`
+/// answered `Overloaded { shard: 0 }`, hiding the store's own reason). Do: start a daemon holding a store whose owner
+/// cannot open it (a sizing the engine refuses), create a git repository through the verb, and read the answer its
+/// request was completed with. Expect: the store's own refusal, saying it could not be opened, never `Overloaded`; no
+/// repository recorded.
+#[test]
+fn a_creation_the_store_refuses_answers_the_stores_reason() {
+  let store = TestStore::start_sized(
+    "refused",
+    slates_store::store::Sizing {
+      memory: 0,
+      disk: 0,
+      extent_bytes: 128 << 10,
+      fanout: 8,
+    },
+  );
+  let profile = crate::daemon::test_profile();
+  let instance = format!("vcs-store-refused-{}", std::process::id());
+  let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(SHARDS));
+  config.vcs_disk = Some(store.handle());
+  let daemon = Daemon::start(&profile, config, SegmentSource::Create { name: instance }).unwrap();
+  daemon.bootstrap(true).unwrap();
+  let name = "refused-git";
+  let partition = usize::from(crate::verbs::owner_of_name(name, usize::from(SHARDS)));
+  let asked = (name, VcsTool::Git, ObjectFormat::Sha1, "main");
+  let request = 1u64;
+  let created = crate::daemon::observe_at(&daemon, partition, move |state| {
+    routed_create(state, (&owner(), request), asked)
+  });
+  assert!(matches!(created, ReplyBody::Acknowledged), "{created:?}");
+  wait_for(&daemon, partition, super::CREATION_UNLANDED, 1);
+  let id = slates_wire::request::RequestId::from_word(request);
+  let answered = crate::daemon::observe_at(&daemon, partition, move |state| {
+    match state.db.partition().completion(1, id.client, id.sequence) {
+      slates_wire::request::Seen::Completed(bytes) => {
+        <ReplyBody as slates_wire::Wire>::from_bytes(&bytes).ok()
+      }
+      _ => None,
+    }
+  });
+  let Some(ReplyBody::Refused { refusal }) = answered else {
+    panic!("the creation's request answered a refusal: {answered:?}");
+  };
+  match &refusal {
+    slates_ipc::protocol::Refusal::StoreRefused { reason } => assert!(
+      reason.contains("could not be opened"),
+      "the store's own reason: {reason}"
+    ),
+    other => panic!("the store's own refusal, not {other:?}"),
+  }
+  daemon.stop();
+}
+
 /// A-767 C6 (svn onto the changeset store; main's order of 2026-11-20 19:50: "a push's landing as a changeset append,
 /// and its replay", red first on the real store). Do: start a daemon holding a store, create a Subversion repository,
 /// land a client's accepted work adding `/trunk` through the commit's landing (`svn_commit::land_work`), wait for its
