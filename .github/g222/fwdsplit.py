@@ -11,7 +11,8 @@ import sys
 COLS = ["queued", "served", "landed", "written", "deferred", "complete", "owner_met", "owner_kick_after",
         "owner_kick_run", "owner_run_start", "owner_work", "origin_met", "origin_kick_after", "origin_kick_run",
         "origin_run_home", "home_written", "placement", "resolve_met", "resolve_kick_after", "resolve_kick_run",
-        "resolve_run_at", "mask", "deliver_file", "deliver_line", "park_wait", "resume_file", "resume_line", "job_turns"]
+        "resolve_run_at", "mask", "deliver_file", "deliver_line", "park_wait", "resume_file", "resume_line", "job_turns", "resumed_before",
+        "ran_before", "delivered_before"]
 AT = {name: at for at, name in enumerate(COLS)}
 
 
@@ -92,6 +93,20 @@ for key, members in sorted(groups.items(), key=lambda item: -len(item[1])):
               f"p50/p99/max {pc(turns, .5)} {pc(turns, .99)} {turns[-1]}; served p99 tail: park wait med "
               f"{us(med([r[AT['park_wait']] for r in tail]))} us of served med {us(med([r[AT['served']] for r in tail]))}"
               f" us, job turns med {med([r[AT['job_turns']] for r in tail])}")
+        resumed = [r for r in members if r[AT["resumed_before"]] and r[AT["ran_before"]] and r[AT["delivered_before"]]]
+        legs = {
+            "before the park (taken -> parked)": lambda r: max(0, r[AT["served"]] - r[AT["resumed_before"]] - r[AT["park_wait"]]),
+            "park (the job)": lambda r: r[AT["park_wait"]],
+            "resumed run (verb again, commit)": lambda r: r[AT["resumed_before"]] - r[AT["ran_before"]],
+            "home (hand_reply_home -> deliver)": lambda r: r[AT["ran_before"]] - r[AT["delivered_before"]],
+            "write (deliver -> written)": lambda r: r[AT["delivered_before"]],
+        }
+        resumed.sort(key=lambda r: r[AT["served"]])
+        for label, low in (("all", 0), ("p99 tail", .99), ("p999 tail", .999)):
+            part = resumed[int(len(resumed) * low):]
+            if part:
+                print(f"     legs {label} (n {len(part)}) medians us: " + "; ".join(
+                    f"{name} {us(med([leg(r) for r in part]))}" for name, leg in legs.items()))
 for kind, flag, parts in (("forwards", 1, FORWARD), ("accepted submits", 2, ACCEPTED)):
     whole = sorted((r for r in deferred if r[AT["complete"]] == flag), key=lambda r: r[AT["served"]])
     if not whole:

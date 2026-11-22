@@ -13011,6 +13011,9 @@ pub(crate) fn resume_all(state: &mut ShardState, parked: Vec<ParkedSubmit>) {
         reply
       }
     };
+    if let Some(route) = route.as_ref() {
+      crate::g222_diag::resume_ran(route.request);
+    }
     if let (Some(reply), Some(route)) = (reply, route)
       && !answered_on(route, (origin, id), reply)
     {
