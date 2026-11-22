@@ -107,7 +107,7 @@ echo "hg $(h --version | head -1); source $SOURCE $(h -R "$SOURCE" log -r 'all()
 if [ -n "${PUSH_CHUNK:-}" ]; then
   export PUSH_CHUNK SOURCE URL
   export HG_WORDS="${HG[*]}"
-  row push-all bash -c 'tip=$($HG_WORDS -R "$SOURCE" log -r tip -T "{rev}"); for rev in $(seq "$PUSH_CHUNK" "$PUSH_CHUNK" "$tip") tip; do $HG_WORDS -R "$SOURCE" push -q -f -r "$rev" "$URL"; c=$?; [ $c -le 1 ] || { echo "chunk at $rev exit $c"; exit $c; }; done'
+  row push-all bash -c 'tip=$($HG_WORDS -R "$SOURCE" log -r tip -T "{rev}"); for rev in $(seq "$PUSH_CHUNK" "$PUSH_CHUNK" "$tip") tip; do $HG_WORDS -R "$SOURCE" push -q --new-branch -f -r "$rev" "$URL"; c=$?; [ $c -le 1 ] || { echo "chunk at $rev exit $c"; exit $c; }; done'
 else
 row push-all "${HG[@]}" -R "$SOURCE" push "${PUSH[@]}" "$URL"
 fi
