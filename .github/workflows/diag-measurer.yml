@@ -40,19 +40,21 @@ jobs:
       - name: git matrix (v2.0.0) and hg matrix
         run: |
           set +e
+          T="$(cygpath -u "$RUNNER_TEMP")"
           S="$(cygpath -w "$PWD/target/release/slates.exe")"
-          PUSH_REFS='v2.0.0^{commit}:refs/heads/master' timeout 7200 bash ci/interop/git-matrix.sh "$S" "$RUNNER_TEMP/git-src" "$RUNNER_TEMP/mx-git" > gitmx.txt 2>&1; g=$?
+          PUSH_REFS='v2.0.0^{commit}:refs/heads/master' timeout 7200 bash ci/interop/git-matrix.sh "$S" "$T/git-src" "$T/mx-git" > gitmx.txt 2>&1; g=$?
           rows=$(grep -E "^(PASS|FAIL)" gitmx.txt | awk '{printf "%s %s %s; ", $1, $2, $3}')
-          restarts=$(grep -c "restarted as pid" "$RUNNER_TEMP/mx-git/anchor.log" 2>/dev/null); kills=$(grep -c -i "killed\|stuck" "$RUNNER_TEMP/mx-git/anchor.log" 2>/dev/null)
+          restarts=$(grep -c "restarted as pid" "$T/mx-git/anchor.log" 2>/dev/null); kills=$(grep -c -i "killed\|stuck" "$T/mx-git/anchor.log" 2>/dev/null)
+          echo "::notice title=git anchor restarts and kills::$(grep -i -E 'restarted as pid|killed|stuck|spun|watchdog ended' "$T/mx-git/anchor.log" | grep -v 'the watchdog beats every' | cut -c1-500 | head -8 | sed 's/%/%25/g' | awk 'BEGIN{ORS="%0A"}{print}')"
           echo "::notice title=git matrix v2.0.0::exit=$g restarts=$restarts kills_or_stuck=$kills%0A$rows%0A$(tail -3 gitmx.txt | tr '\n' ' ')"
-          if [ -d "$RUNNER_TEMP/hg-src" ]; then
-            HG="$RUNNER_TEMP/bin/hg" timeout 7200 bash ci/interop/hg-matrix.sh "$S" "$RUNNER_TEMP/hg-src" "$RUNNER_TEMP/mx-hg" > hgmx.txt 2>&1; h=$?
+          if [ -d "$T/hg-src" ]; then
+            HG="$T/bin/hg" timeout 7200 bash ci/interop/hg-matrix.sh "$S" "$T/hg-src" "$T/mx-hg" > hgmx.txt 2>&1; h=$?
             rows=$(grep -E "^(PASS|FAIL)" hgmx.txt | awk '{printf "%s %s %s; ", $1, $2, $3}')
-            restarts=$(grep -c "restarted as pid" "$RUNNER_TEMP/mx-hg/anchor.log" 2>/dev/null)
+            restarts=$(grep -c "restarted as pid" "$T/mx-hg/anchor.log" 2>/dev/null)
             echo "::notice title=hg matrix::exit=$h restarts=$restarts%0A$rows%0A$(tail -3 hgmx.txt | tr '\n' ' ')"
           fi
           for f in "$RUNNER_TEMP"/mx-git/*.log "$RUNNER_TEMP"/mx-hg/*.log; do :; done
-          mkdir -p logs; cp gitmx.txt hgmx.txt logs/ 2>/dev/null; cp -r "$RUNNER_TEMP/mx-git" logs/mx-git 2>/dev/null; cp -r "$RUNNER_TEMP/mx-hg" logs/mx-hg 2>/dev/null
+          mkdir -p logs; cp gitmx.txt hgmx.txt logs/ 2>/dev/null; cp -r "$T/mx-git" logs/mx-git 2>/dev/null; cp -r "$T/mx-hg" logs/mx-hg 2>/dev/null
           for x in mx-git mx-hg; do for l in logs/$x/*.out logs/$x/*.log; do [ -f "$l" ] || continue; case "$l" in *anchor*) ;; *) if grep -q -i "fatal\|abort\|error" "$l"; then echo "::warning title=$x $(basename $l)::$(grep -i -m3 'fatal\|abort\|error' "$l" | tr '\n' ' ' | cut -c1-400)"; fi;; esac; done; done 2>/dev/null | head -20
       - name: Keep the logs
         if: ${{ !cancelled() }}
