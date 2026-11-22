@@ -104,6 +104,9 @@ pub(crate) const REUSE_NO_ENTRY: &str = "vcs_store.git_encode.reuse_no_entry";
 /// Counter: objects whose pushed entry a finished encoding could not read, encoded instead (A-859). Format: a counter
 /// name.
 pub(crate) const REUSE_UNREAD: &str = "vcs_store.git_encode.reuse_unread";
+/// Counter: objects whose pushed entry a finished encoding found not to match the CRC32 its row keeps, read and judged
+/// instead (A-864). Format: a counter name.
+pub(crate) const REUSE_CRC_MISSED: &str = "vcs_store.git_encode.reuse_crc_missed";
 /// Counter: an encoding refused, its version left unencoded. Format: a counter name.
 pub(crate) const REFUSED: &str = "vcs_store.git_encode.refused";
 
@@ -198,7 +201,7 @@ fn turn_lent(
   let encoding_at = stores.encodings.0.get(&id).map(|(_, at)| *at);
   let mut kept = 0;
   let mut past = 0;
-  let mut reused = [0_u64; 5];
+  let mut reused = [0_u64; 6];
   let mut past_by_stage = [0_u64; UNITS_PAST_BUDGET_BY_STAGE.len()];
   let advanced: Option<Result<Progress, StoreRefused>> =
     stores.encodings.0.get_mut(&id).map(|(encoding, _)| {
@@ -252,6 +255,7 @@ fn turn_lent(
           counted.reuse_refused,
           counted.reuse_no_entry,
           counted.reuse_unread,
+          counted.reuse_crc_missed,
         ];
       }
       kept = encoded_bytes(stores, id, encoding_at);
@@ -273,6 +277,7 @@ fn turn_lent(
     REUSE_REFUSED,
     REUSE_NO_ENTRY,
     REUSE_UNREAD,
+    REUSE_CRC_MISSED,
   ]
   .iter()
   .zip(reused)
@@ -474,6 +479,8 @@ pub(crate) fn ahead_under_way(state: &ShardState, id: RepositoryId) -> bool {
 /// counted [`AHEAD_STOPPED`], and its repository has no fetch answered now, what it holds is given back
 /// ([`give_back_idle`]). Returns at once where the shard's state is not lent.
 async fn encode_ahead(id: RepositoryId) {
+  // Goal 93 item 2a: the packs the encoding reads made resident first.
+  super::upload::resident(id).await;
   loop {
     let turned = crate::state::with_state_counted(|state| {
       if !ahead_allowed(state, id) {
@@ -486,7 +493,12 @@ async fn encode_ahead(id: RepositoryId) {
       turn(state, id)
     });
     match turned {
-      Some(Turned::More) => slates_rt::futures::yield_now().await,
+      Some(Turned::More) => {
+        // A window a turn's read met let go is brought back before the next turn reads it again.
+        if !super::upload::brought_back_waited(id).await {
+          slates_rt::futures::yield_now().await;
+        }
+      }
       Some(Turned::Idle) | None => return,
     }
   }
@@ -501,13 +513,20 @@ pub(crate) async fn encode_for_fetch(id: RepositoryId) {
 /// [`encode_for_fetch`] with the wait `wait_ns` long: whether the encoding was idle when it returned.
 pub(crate) async fn encode_within(id: RepositoryId, wait_ns: u64) -> bool {
   let began = slates_rt::futures::now_ns();
+  // Goal 93 item 2a: the packs the encoding reads made resident first.
+  super::upload::resident(id).await;
   loop {
     match crate::state::with_state_counted(|state| turn(state, id)) {
       Some(Turned::More) if slates_rt::futures::now_ns().saturating_sub(began) >= wait_ns => {
         let _ = crate::state::with_state_counted(|state| encode_behind(state, id));
         return false;
       }
-      Some(Turned::More) => slates_rt::futures::yield_now().await,
+      Some(Turned::More) => {
+        // A window a turn's read met let go is brought back before the next turn reads it again.
+        if !super::upload::brought_back_waited(id).await {
+          slates_rt::futures::yield_now().await;
+        }
+      }
       Some(Turned::Idle) | None => return true,
     }
   }

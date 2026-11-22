@@ -120,15 +120,15 @@ pub(crate) mod lfs_record;
 pub(crate) mod named_objects;
 pub(crate) mod owed;
 pub(crate) mod paths;
-pub(crate) mod record;
-// Owed caller: A-645 P3's presenter, which makes a hook's view of referenced files.
-#[cfg_attr(not(test), allow(dead_code))] // Owed caller: record v3 (w-perf's A-727 (b)).
-pub(crate) mod record_names;
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) mod referenced;
 #[cfg_attr(not(test), allow(dead_code))]
 // Owed caller: w-git's C5 (the push landed on the store, its replay).
 pub(crate) mod read_through;
+pub(crate) mod record;
+#[cfg_attr(not(test), allow(dead_code))] // Owed caller: record v3 (w-perf's A-727 (b)).
+pub(crate) mod record_names;
+// Owed caller: A-645 P3's presenter, which makes a hook's view of referenced files.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod referenced;
 pub(crate) mod store_packs;
 pub(crate) mod svn_import;
 pub(crate) mod svn_made;
@@ -2224,6 +2224,10 @@ fn admit_object(
   if let Some(claimed) = incoming.claimed
     && store.repository.object(content, &claimed).is_some()
   {
+    // A-864: its entry is still noted, so the one before it ends where it begins and a delta against it is named.
+    if let Some(offset) = offset {
+      push.entry_at(offset, claimed);
+    }
     return Ok(());
   }
   let naming = store.repository.naming();

@@ -1501,10 +1501,13 @@ fn fits_base(ops: &[Op], base_len: u64, post_len: u64) -> bool {
   })
 }
 
-/// Applies content ops to `base`, drawing added bytes from `post_state` — the byte splice.
+/// Applies content ops to `base`, drawing added bytes from `post_state` — the byte splice. Its bytes are made in one
+/// buffer sized once at their length ([`made_len`]; goal 93, P7 finding (2): grown a piece at a time it doubled, about
+/// twice every file an import's increments made, the largest of its churners after A-862).
 fn apply(base: &[u8], ops: &[Op], post_state: crate::named::Post<'_>) -> Vec<u8> {
   let base_len = base.len() as u64;
-  let mut out = Vec::new();
+  let made = made_len(base_len, ops, post_state.len());
+  let mut out = Vec::with_capacity(usize::try_from(made).unwrap_or(0));
   let mut pos = 0u64;
   for op in ops {
     if op.at > pos {
@@ -1532,6 +1535,37 @@ fn apply(base: &[u8], ops: &[Op], post_state: crate::named::Post<'_>) -> Vec<u8>
     );
   }
   out
+}
+
+/// The length [`apply`] makes of a base of `base_len` bytes under `ops` over a post-state of `post_len` bytes, with its
+/// clamps: a base run to the base, an added run to the post-state (`named::Post::span`). An ops document is not checked
+/// against its base when decoded, so this is what `apply` writes, never more, where [`applied_len`] trusts the ops.
+fn made_len(base_len: u64, ops: &[Op], post_len: u64) -> u64 {
+  let added = |op: &Op| {
+    op.src
+      .saturating_add(op.len)
+      .min(post_len)
+      .saturating_sub(op.src)
+  };
+  let mut out = 0u64;
+  let mut pos = 0u64;
+  for op in ops {
+    if op.at > pos {
+      out = out.saturating_add(op.at.min(base_len).saturating_sub(pos));
+      pos = op.at;
+    }
+    match op.kind {
+      OpKind::Delete => pos = pos.saturating_add(op.len),
+      OpKind::Truncate => pos = base_len,
+      OpKind::Overwrite => {
+        out = out.saturating_add(added(op));
+        pos = pos.saturating_add(op.len);
+      }
+      OpKind::Insert | OpKind::Extend => out = out.saturating_add(added(op)),
+      _ => {}
+    }
+  }
+  out.saturating_add(base_len.saturating_sub(pos))
 }
 
 /// The length [`apply`] makes of a base of `base_len` bytes under `ops`, without making it (A-760).
@@ -7148,6 +7182,8 @@ mod copy_checkpoint;
 
 mod copy_restate;
 
+#[cfg(test)]
+mod apply_tests;
 #[cfg(test)]
 mod copy_tests;
 #[cfg(test)]

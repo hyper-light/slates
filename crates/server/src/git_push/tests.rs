@@ -3160,6 +3160,35 @@ fn deltified_pack(objects: &[(slates_git::object_name::Kind, Vec<u8>)]) -> Vec<u
 /// named by its id in place of an offset (twenty bytes, SHA-1).
 const REUSED_ENTRY_SLACK: usize = 10 + 10 + 20;
 
+/// A line of [`TAGGED_LINE`] growing commits, each tagged: its objects (every commit's, then every tag's) and its refs
+/// in name order (`refs/heads/main` at the last commit, `refs/tags/v<n>` at each commit's tag).
+#[allow(clippy::type_complexity)]
+fn tagged_line() -> (
+  Vec<(slates_git::object_name::Kind, Vec<u8>)>,
+  Vec<(ObjectId, Vec<u8>)>,
+) {
+  use slates_git::object_name::Kind;
+  let mut objects = Vec::new();
+  let mut commits = Vec::new();
+  let mut parent = None;
+  for at in 0..TAGGED_LINE {
+    let (commit, made) = growing_commit(at, parent);
+    objects.extend(made);
+    commits.push(commit);
+    parent = Some(commit);
+  }
+  let mut named: Vec<(ObjectId, Vec<u8>)> =
+    vec![(*commits.last().unwrap(), b"refs/heads/main".to_vec())];
+  for (at, commit) in commits.iter().enumerate() {
+    let name = format!("v{at}");
+    let (tag, bytes) = tag_object(&name, (*commit, "commit"));
+    objects.push((Kind::Tag, bytes));
+    named.push((tag, format!("refs/tags/{name}").into_bytes()));
+  }
+  named.sort_by(|one, other| one.1.cmp(&other.1));
+  (objects, named)
+}
+
 /// A-859 (main's ruling of 2026-11-22 03:38; found by use: a git/git clone from slates moved 4-5 GiB where stock git's pack
 /// is about 300 MB, every object sent whole and uncompressed: 160 of 160 whole at unit scale). Do: push a line of
 /// [`TAGGED_LINE`] commits of a growing file and a tag of each, its pack as stock git sends one (each blob after the first
@@ -3174,27 +3203,9 @@ const REUSED_ENTRY_SLACK: usize = 10 + 10 + 20;
 /// trees and tags searched and encoded afresh, their whole entries passed over where the encoder would try a delta.
 #[test]
 fn t_a859_a_clone_of_a_deltified_push_sends_its_entries_as_they_lie() {
-  use slates_git::object_name::Kind;
   crate::test_store::audit_on_stored_shard("git-push", |state| {
     let repository = git_repository(state, "reused");
-    let mut objects = Vec::new();
-    let mut commits = Vec::new();
-    let mut parent = None;
-    for at in 0..TAGGED_LINE {
-      let (commit, made) = growing_commit(at, parent);
-      objects.extend(made);
-      commits.push(commit);
-      parent = Some(commit);
-    }
-    let mut named: Vec<(ObjectId, Vec<u8>)> =
-      vec![(*commits.last().unwrap(), b"refs/heads/main".to_vec())];
-    for (at, commit) in commits.iter().enumerate() {
-      let name = format!("v{at}");
-      let (tag, bytes) = tag_object(&name, (*commit, "commit"));
-      objects.push((Kind::Tag, bytes));
-      named.push((tag, format!("refs/tags/{name}").into_bytes()));
-    }
-    named.sort_by(|one, other| one.1.cmp(&other.1));
+    let (objects, named) = tagged_line();
     let pack = deltified_pack(&objects);
     let ids: Vec<String> = named.iter().map(|(id, _)| id.to_string()).collect();
     let commands: Vec<(&str, &str, &[u8])> = named
@@ -3244,6 +3255,17 @@ fn t_a859_a_clone_of_a_deltified_push_sends_its_entries_as_they_lie() {
       ),
       (0, u64::try_from(objects.len()).unwrap()),
       "every pushed object sent as its entry lies, none encoded: {counted_streamed:?}"
+    );
+    // A-864: each sent on by its kept CRC32, none rebuilt to be checked; the pack read front to back (piece 1), no
+    // pushed entry read before the one read before it.
+    assert_eq!(
+      (
+        counted_streamed.reuse_rebuilt,
+        counted_streamed.reuse_crc_missed,
+        counted_streamed.backward_reads
+      ),
+      (0, 0, 0),
+      "{counted_streamed:?}"
     );
     assert_whole_clone(&streamed, objects.len());
     while crate::vcs_store::git_encode::turn(state, repository)

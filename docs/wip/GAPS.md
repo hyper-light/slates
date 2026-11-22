@@ -94,7 +94,10 @@
 > a third round's churn under a hundredth (`crates/git/tests/recent_ring.rs`); main's RSS round owed (run-requests).
 > Main's r15 at abcadd753 (A-861 and its charge): peak 531.2, after the push 327.4, after the clone 365.9 MiB, against
 > 815.2, 667.5 and 737.8 at f577268d3; still past the bound 177.7. (2a) LANDED A-863: a read of a let-go window brings it
-> back from the node's store; the RSS test now prints the memory gauges at each reading. (2b), the let-go after a landing,
+> back from the node's store; the RSS test now prints the memory gauges at each reading. git's driver hook (w-git): a
+> fetch's and an encoding's packs made resident before they read (`vcs_store::upload::resident`), and a window an
+> encoding turn met let go brought back before the next; a let-go must wait for no fetch live and no encoding under way,
+> since a pack's answer cannot be taken again mid-pack byte for byte. (2b), the let-go after a landing,
 > next: a landed pack's windows have several holders, which `let_go` refuses (`Shared`).
 > Owed, in main's order: (1) the push's temporaries cut at their source (w-shared);
 > (2) landed windows and the pack let go once durable (w-shared, with w-git); (3) the recent-objects cache given back
@@ -226,9 +229,14 @@
 >   `PREEMPT_LAZY`, `RUN_TO_PARITY`, 2.1 ms base slice) a woken shard waited for its CPU: kick -> run p50 920 µs, and
 >   8 µs in `SCHED_RR`. But with the shards and the client's park in the class, the client's own time-share code still
 >   waits whole slices: accept p99 0.94-2.6 ms, p999 3.0-4.8 ms, and the spinners lost 20-27% of their throughput. The
->   runner account's `RLIMIT_RTPRIO` is 0:0, so even that needs an administrator's grant. **Open:** 84a's Linux bar
->   under two spinners a CPU, short of user code at real-time priority (ruled out) or a less oversubscribed lane, main's
->   call.
+>   runner account's `RLIMIT_RTPRIO` is 0:0, so even that needs an administrator's grant.
+>   EEVDF's requested slice (arm E, no privilege; BENCHMARKS "84a on Linux: EEVDF's requested slice") cut the loaded
+>   tail with the neighbours' share level (x86 p999 3.2-6.1 -> ~1.9 ms). But a wakeup's p99 pins at one tick (kick ->
+>   run 998-999 µs, the client's wake 983-989 µs under `PREEMPT_LAZY` at `HZ=1000`), so a loaded edit and merge floors
+>   at about 1.3-2.0 ms p99. It also cost x86's quiet p50 30-40%, so it is rejected too.
+>   **Open (main to Ada):** 84a's 1 ms loaded bar on Linux. In the fair class it is below the kernel's 1 ms tick, and
+>   in the real-time class the client's own time-share code waits whole slices. The measured floor is about one tick a
+>   hop, 1.3-2.0 ms p99.
 > - Windows (CI, run 44857045148): no 1 ms band (queued p99 5–49 µs); accept p99 0.13–0.31 ms, conflict 0.11–0.29 ms;
 >   p999 0.2–62 ms. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–7).
 >
@@ -761,6 +769,10 @@
 > edge's writes that waited for the peer, cold at deflate's measured break-even at git's level 6 (§4.11). Owed: the
 > SSH edge's writes heard (SSH fetches price cold), a price per client, not per shard; main's git/git whole round and
 > `fsck --strict`.
+> A-864 BUILT (2026-11-22, w-git; main's r17): a reused pushed entry was rebuilt to be checked (inflated, its base and
+> itself reconstructed, named), so git/git's clone, every entry reused, ran past 120 s. Now each row keeps its entry's
+> raw length, CRC32 and base (git's pack index, A-864); reuse checks the CRC32 and copies, no object read; a miss is
+> rebuilt. Owed: main's git/git whole round.
 > A-860 BUILT (2026-11-22, w-git): a repository gone idle lets go of the objects its reads keep (git.recent_bytes held
 > 53.9 MB after a git/git clone). Owed: the push side's held windows and pack, w-shared's.
 > R2, the load-only edge tests, CLOSED (2026-11-21, w-git): a push's answer under side-band-64k wrote its first
@@ -3760,7 +3772,15 @@
 > (`an_increments_post_state_is_sized_once_by_its_texts`: 6,000 bytes held for 5,000, now 5,000), the largest of the
 > import's sites in w-svn's sampled in-process attribution (500 files, 300 revisions, 11.65 MB: 168.9 MB allocated at
 > 2bb00e1cc, 156.6 MB with A-862, 142.3 MB with this). r16 (main's daemon, 73e46f842: 51.35 GB against r14's 33.41 GB)
-> is not reproduced in-process; a back-to-back daemon A/B is asked.
+> was the machine (main's r18, interleaved at one load: 73e46f842 3-5% below 2bb00e1cc, both about 560-600 MB not given
+> back). Then the import's sink keeps one window buffer for all its texts (`ContentStore::begin_object_reusing`,
+> `objects_begun_in_turn_on_one_buffer_never_make_another`): 142.3 MB to 130.7 MB sampled. Next, largest first: the
+> engine's `push_slice` (two sites), `Increment::encode`, `judge_held`; the content store's `release_one` (w-shared's).
+> The engine's splice sizes its file once at what it makes (`engine::made_len`;
+> `a_splice_makes_its_bytes_in_one_buffer_of_their_length`, 6,000 bytes held for 4,000, now 4,000): dead even on the
+> import, which replaces files whole (130.7 to 130.8 MB sampled), and on 300 partial splices over 200 files of 64 KiB
+> 43,945,798 B allocated before, 21,594,432 B after (w-svn's local probe, main's ruling of 11:05). Next (main's ruling):
+> the svn landing names its stored texts as A-760 runs, in three pieces.
 > Still to measure: the A-742 floor's A/B only if the
 > footprint still stays (main's ruling). A local 64 KiB floor gave 47 MB of footprint at 2 s idle, against 363 MB, at
 > 19.4 s against 12.0 s (debug).

@@ -707,11 +707,11 @@ impl Repository {
   /// Where the object whose row is `row`, naming `content`, is: at its offset in the pack the row names, for an object
   /// read from a pack; its own content otherwise.
   pub fn stored_of(&self, row: &ObjectRow, content: ContentId) -> StoredAt {
-    match row.offset {
-      Some(offset) => StoredAt::InPack(InPack {
+    match row.pack {
+      Some(packed) => StoredAt::InPack(InPack {
         pack: content,
         len: self.packs.get(&content).copied().unwrap_or(0),
-        offset,
+        offset: packed.offset,
       }),
       None => StoredAt::Whole(content),
     }
@@ -806,6 +806,12 @@ impl Repository {
   /// and takes the step again, never counting the read missing.
   pub fn waiting(&self) -> Option<packed::Waited> {
     self.waiting.take()
+  }
+
+  /// The packs the repository's objects lie in, each with its length (goal 93 item 2a: what a fetch or an encoding
+  /// reads, made resident before it begins).
+  pub fn packs(&self) -> impl Iterator<Item = (ContentId, u64)> + '_ {
+    self.packs.iter().map(|(pack, len)| (*pack, *len))
   }
 
   /// The bytes of the indexed object whose row is `row`, naming `content` ([`Repository::read_stored`]).

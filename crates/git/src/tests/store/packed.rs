@@ -520,3 +520,91 @@ fn a_read_of_a_let_go_window_names_it_and_reads_once_it_is_brought_back() {
   }
   assert!(brought > 0, "no read met a let-go window");
 }
+
+/// The captured `create` push landed in an empty repository as a live push lands it, its objects held where they lie in
+/// its stored pack, every object's row keeping its entry (A-864): the repository, its store and the push's objects.
+fn landed_create() -> (Repository, ContentStore, Vec<unpack::Object>) {
+  let (_, request, before) = PUSHES[0];
+  let (pack, held) = captured(request, before);
+  let whole = read_whole(&pack, &held);
+  let mut store = ContentStore::new(1 << 26, 1 << 12).unwrap();
+  let mut repository = Repository::new(ObjectFormat::Sha1);
+  let naming = GitNaming {
+    format: ObjectFormat::Sha1,
+  };
+  let mut push = Push::new(ObjectFormat::Sha1);
+  push.extend_pack(&pack);
+  for object in &whole.objects {
+    push
+      .admit_placed::<_, Infallible>(&store, &naming, (incoming(object), object.offset))
+      .unwrap();
+  }
+  repository.seal(&store, &mut push).unwrap();
+  repository.stage(&mut store, &mut push).unwrap();
+  let commit = whole
+    .objects
+    .iter()
+    .find(|object| object.kind == Kind::Commit)
+    .unwrap()
+    .id;
+  let moved = repository.admit(&store, &push, 1, Some(commit)).unwrap();
+  repository.commit(&mut store, &mut push, &[moved]).unwrap();
+  super::derive_all(&repository, &mut store);
+  push.abandon(&mut store).unwrap();
+  (repository, store, whole.objects)
+}
+
+/// The objects of `pack`, read whole as `index-pack` reads one, by name with their bytes.
+fn objects_of(pack: &[u8]) -> BTreeMap<ObjectId, Vec<u8>> {
+  read_whole(pack, &Held(BTreeMap::new()))
+    .objects
+    .into_iter()
+    .map(|object| (object.id, object.content))
+    .collect()
+}
+
+/// A-864 (main 01a20182's r17, 2026-11-22 07:08: git/git's clone reused 147,449 entries in 120 s, each rebuilt to be
+/// checked, inflated, its delta applied and named; ruled 07:31: checked by the CRC32 git's pack index keeps). Do: land
+/// stock git's captured `create` push and stream its clone before any version is encoded. Expect: every object sent on
+/// as its entry lies, none rebuilt and no CRC32 missed; the clone's objects the push's, each once. Red before: each
+/// reused entry rebuilt.
+#[test]
+fn a864_a_clone_sends_each_pushed_entry_on_by_its_kept_crc_rebuilding_none() {
+  let (repository, store, objects) = landed_create();
+  let clone = super::Answer::objects(&super::reached_now(&repository, &store, 1));
+  let (pack, counters) = super::streamed(&repository, &store, clone, u64::MAX);
+  let sent = counters.reused_whole + counters.reused_deltas;
+  assert_eq!(
+    (sent, counters.reuse_rebuilt, counters.reuse_crc_missed),
+    (crate::to_u64(objects.len()), 0, 0),
+    "{counters:?}"
+  );
+  let expected: BTreeMap<ObjectId, Vec<u8>> = objects
+    .into_iter()
+    .map(|object| (object.id, object.content))
+    .collect();
+  assert_eq!(objects_of(&pack), expected);
+}
+
+/// A-864's hostile red (main 01a20182's ruling of 2026-11-22 07:31: a reused entry whose raw bytes do not match its kept
+/// CRC32 is rebuilt, as git's `write_no_reuse_object` is). Do: land the `create` push with its first entry's kept CRC32
+/// one bit off its raw bytes (`push::MISKEEP_NEXT_CRC`), as a bit flipped in its stored bytes would leave it, then stream
+/// its clone. Expect: one CRC32 missed and that one object rebuilt to be checked, every other sent on by its CRC32; the
+/// clone's objects the push's, each once, byte for byte.
+#[test]
+fn a864_an_entry_whose_crc_misses_is_rebuilt_and_the_clone_is_whole() {
+  crate::store::push::MISKEEP_NEXT_CRC.with(|next| next.set(true));
+  let (repository, store, objects) = landed_create();
+  let clone = super::Answer::objects(&super::reached_now(&repository, &store, 1));
+  let (pack, counters) = super::streamed(&repository, &store, clone, u64::MAX);
+  assert_eq!(
+    (counters.reuse_crc_missed, counters.reuse_rebuilt),
+    (1, 1),
+    "{counters:?}"
+  );
+  let expected: BTreeMap<ObjectId, Vec<u8>> = objects
+    .into_iter()
+    .map(|object| (object.id, object.content))
+    .collect();
+  assert_eq!(objects_of(&pack), expected);
+}

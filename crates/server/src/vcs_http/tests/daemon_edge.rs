@@ -3324,6 +3324,8 @@ fn a_mercurial_push_parks_for_its_repositorys_landing_turn_and_no_other_waits() 
     );
     std::thread::spawn(move || hg_unbundle((port, &certificate), &first, &bundle))
   };
+  // The test holds the landing turn while the parked push waits for it; the daemon under test waits on its drivers.
+  #[allow(clippy::disallowed_methods)]
   std::thread::sleep(TURN_HELD);
   let waiting = (
     counted(crate::repository::hg_run::TURN_WAITS),
@@ -3404,6 +3406,8 @@ fn a_small_push_waits_behind_a_whole_history_push_for_its_landing_turn() {
     if held || long.is_finished() {
       break held;
     }
+    // The harness paces its looks at the long push's turn; the daemon under test waits on its drivers.
+    #[allow(clippy::disallowed_methods)]
     std::thread::sleep(Duration::from_millis(5));
   };
   let small = history_of(&[("lonely", "lonely", b"a small push\n", None, "default")]);

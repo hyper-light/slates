@@ -869,34 +869,42 @@ fn a_status_during_a_push_reports_the_daemons_memory_by_kind_while_the_anchor_ke
 
 /// Shape: the variable naming a real repository whose cut the memory test pushes in place of its made history (a
 /// git/git mirror, say), with [`HISTORY_CUT_VARIABLE`]; unset, the made history of [`HISTORY_COMMITS`] commits.
+#[cfg(unix)]
 const HISTORY_SOURCE_VARIABLE: &str = "SLATES_TEST_GIT_SOURCE";
 
 /// Shape: the variable naming the revision of [`HISTORY_SOURCE_VARIABLE`]'s repository the memory test pushes
 /// (`v2.0.0`, the cut w-interop's 7,421 MiB was measured on); its commit is pushed as [`BRANCH`].
+#[cfg(unix)]
 const HISTORY_CUT_VARIABLE: &str = "SLATES_TEST_GIT_CUT";
 
 /// Shape: the files of the memory test's histories, in [`HISTORY_DIRECTORIES`] directories: a source tree's count
 /// (git/git v2.0.0 holds about 2,500), so each version's tree, and whatever a server keeps per path or per object,
 /// is large beside the change one commit brings.
+#[cfg(unix)]
 const HISTORY_FILES: usize = 2_000;
 
 /// Shape: the directories the memory test's files lie in, each its own tree, as a source tree nests its files.
+#[cfg(unix)]
 const HISTORY_DIRECTORIES: usize = 20;
 
 /// Shape: the lines of each of the memory test's files, [`HISTORY_LINE_BYTES`] each (half a KiB a file).
+#[cfg(unix)]
 const HISTORY_FILE_LINES: usize = 16;
 
 /// Shape: the bytes of each line of the memory test's files (`line NN of file NNNNN` written to this width).
+#[cfg(unix)]
 const HISTORY_LINE_BYTES: usize = 32;
 
 /// Shape: the commits of the memory test's measured history after its first, which adds every file: each rewrites one
 /// line of one file, as most commits of a source history do, so the pack stock git sends grows by a delta a commit
 /// while the history's versions, trees and objects grow by a whole tree's worth of paths each.
+#[cfg(unix)]
 const HISTORY_COMMITS: usize = 200;
 
 /// Shape: the commits of the memory test's warm-up history after its first, the same shape: what a push and a clone of
 /// the tree cost the daemon whatever the history brings (the edge's buffers, a repository's store, the shards' first
 /// pages, one version of the tree).
+#[cfg(unix)]
 const WARM_COMMITS: usize = 2;
 
 /// Makes repository `name` in the memory test's daemon (`slates repository create`, A-685).
@@ -2138,7 +2146,7 @@ fn edge_advertisement(port: u16, token: &str) -> Option<Vec<u8>> {
 
 /// Format: the daemon's counters of the paths a clone's objects took (main 01a20182's order of 2026-11-22 04:53): the
 /// fetch stream's (`vcs_store::upload::STREAM_COUNTED`) and the encoding made ahead's (`vcs_store::git_encode`'s).
-const CLONE_PATHS: [&str; 18] = [
+const CLONE_PATHS: [&str; 22] = [
   "vcs_store.git_upload.written_bytes",
   "vcs_store.git_upload.parts_copied",
   "vcs_store.git_upload.entries_copied",
@@ -2152,11 +2160,15 @@ const CLONE_PATHS: [&str; 18] = [
   "vcs_store.git_upload.reuse_refused",
   "vcs_store.git_upload.reuse_no_entry",
   "vcs_store.git_upload.reuse_unread",
+  "vcs_store.git_upload.reuse_crc_missed",
+  "vcs_store.git_upload.reuse_rebuilt",
+  "vcs_store.git_upload.backward_reads",
   "vcs_store.git_encode.reused_whole",
   "vcs_store.git_encode.reused_deltas",
   "vcs_store.git_encode.reuse_refused",
   "vcs_store.git_encode.reuse_no_entry",
   "vcs_store.git_encode.reuse_unread",
+  "vcs_store.git_encode.reuse_crc_missed",
 ];
 
 /// The values of counters `names` in the daemon's status report (`slates status --json`, each counter an object
