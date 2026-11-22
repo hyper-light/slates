@@ -5702,8 +5702,8 @@ impl Green {
     self.owed = None;
     // The versions recorded after the owed one, in order, as a replay applies them.
     let mut head = committed;
-    for (inc, applied) in std::mem::take(&mut self.owed_tail) {
-      head = self.apply_recorded(&inc, &applied);
+    for (mut inc, applied) in std::mem::take(&mut self.owed_tail) {
+      head = self.apply_recorded(&mut inc, &applied);
     }
     // The verdicts recorded while it owed, on the versions now applied.
     for (version, signature) in std::mem::take(&mut self.owed_signatures) {
@@ -6234,7 +6234,7 @@ impl Green {
   /// increment already accepted commits nothing and returns the version it was accepted as.
   pub fn apply_recorded(
     &mut self,
-    inc: &Increment,
+    inc: &mut Increment,
     applied: &[crate::chain_entry::Applied],
   ) -> u64 {
     // A green that owes a push takes a later recorded version in order, to apply once it is materialized (P2): the
@@ -6256,12 +6256,27 @@ impl Green {
       return self.head();
     }
     let copies = copy::EntryCopies::of(applied);
-    let effects = applied
+    let mut effects: Vec<Effect> = applied
       .iter()
       .map(|effect| self.effect_of(effect, (inc.post(), &copies)))
       .collect();
+    // A file a named run makes whole takes the run's buffer, read for this apply (A-760), with no copy, as a judged
+    // verdict's commit does (`Green::commit_held`); every other file is made first, while every buffer is in place.
+    let mut read = core::mem::take(&mut inc.named.read.0);
+    let wholes = self.whole_runs(&effects, &inc.post_state, &read);
+    let skip: Vec<usize> = wholes.iter().map(|(place, _)| *place).collect();
+    self.make_mapped(
+      &mut effects,
+      crate::named::Post::of(&inc.post_state, &read),
+      &skip,
+    );
+    move_whole_runs(&mut effects, &mut read, &wholes);
     let version = self.head().saturating_add(1);
-    self.commit(effects, version, inc.post());
+    self.commit(
+      effects,
+      version,
+      crate::named::Post::of(&inc.post_state, &read),
+    );
     self.accepted.insert(inc.id, version);
     version
   }
@@ -6312,21 +6327,15 @@ impl Green {
     match applied {
       Applied::Special(path, node) => Effect::Special(path.clone(), *node),
       Applied::RemoveSpecial(path) => Effect::RemoveSpecial(path.clone()),
+      // Left unmade: the commit makes it from the head, or moves a named run's buffer into it whole (A-760).
       Applied::Spliced(path, ops) => {
-        let current = self.content.get(path).unwrap_or_default();
-        Effect::SetContent(
-          path.clone(),
-          Some(apply(current, ops, post_state)),
-          ops.clone(),
-          ContentSource::Mapped,
-        )
+        Effect::SetContent(path.clone(), None, ops.clone(), ContentSource::Mapped)
       }
       Applied::Created(path, declared) => {
-        let bytes = apply(&[], declared, post_state);
-        let ops = vec![insert_whole(bytes.len() as u64)];
+        let ops = vec![insert_whole(made_len(0, declared, post_state.len()))];
         Effect::SetContent(
           path.clone(),
-          Some(bytes),
+          None,
           ops,
           ContentSource::Created(declared.clone()),
         )
@@ -7361,7 +7370,7 @@ mod tests {
       "the entry carries what the verdict resolved"
     );
     assert_eq!(
-      replayed.apply_recorded(&decoded.increment, &decoded.applied),
+      replayed.apply_recorded(&mut decoded.increment.clone(), &decoded.applied),
       2
     );
     assert_eq!(

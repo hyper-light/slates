@@ -3791,8 +3791,13 @@
 > buffers move into its verdict, never cloned (`repository.push.read_cloned_bytes`;
 > `a_named_works_verdict_takes_its_read_texts_and_clones_none`: 50,000 bytes cloned, now 0). Reusing a judged work
 > after a refused append is impossible by construction: `append` takes its changes by value and a refusal gives none
-> back (`a_refused_named_append_is_retried_only_with_a_work_built_again`). Owed: main's daemon A/B; piece (c), the
-> batch's commit adopting the scratch member's files. Not A-865's: `recovery.rs`'s `an_overlay_whose_base_directory_was_removed_serves_its_own_files_after_a_restart`
+> back (`a_refused_named_append_is_retried_only_with_a_work_built_again`). main's r29 (big Studio, load ~2, git-2000):
+> A-865's parent passed the give-back check 1 of 2 (499,712 · 300,032 KiB footprint at idle 30 s); 43a6df642 2 of 2
+> (302,080 · 303,104 KiB), RSS at idle 775 MB against 155 MB live, the peak 1.13 GB. Piece (c) ruled out as a swap (the
+> scratch member numbers its own versions; a fast-forward would be w-engine's, paused); option 2 instead: a recorded
+> version's whole-run file takes the run's read buffer with no copy (`Green::apply_recorded` takes its work mutably and
+> moves whole runs as `commit_held` does; `a_recorded_versions_whole_run_becomes_the_file_with_no_copy`), sampled
+> 108.0 MB to 96.2 MB. Owed: the content store's `release_one` copy (w-shared's), the two `read_step`s. Not A-865's: `recovery.rs`'s `an_overlay_whose_base_directory_was_removed_serves_its_own_files_after_a_restart`
 > fails at origin/main 7ced987e6 as well (LOOKUP status, `tests/common/nfs.rs:238`).
 > Still to measure: the A-742 floor's A/B only if the
 > footprint still stays (main's ruling). A local 64 KiB floor gave 47 MB of footprint at 2 s idle, against 363 MB, at
