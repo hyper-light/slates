@@ -94,7 +94,10 @@
 > a third round's churn under a hundredth (`crates/git/tests/recent_ring.rs`); main's RSS round owed (run-requests).
 > Main's r15 at abcadd753 (A-861 and its charge): peak 531.2, after the push 327.4, after the clone 365.9 MiB, against
 > 815.2, 667.5 and 737.8 at f577268d3; still past the bound 177.7. (2a) LANDED A-863: a read of a let-go window brings it
-> back from the node's store; the RSS test now prints the memory gauges at each reading. (2b), the let-go after a landing,
+> back from the node's store; the RSS test now prints the memory gauges at each reading. git's driver hook (w-git): a
+> fetch's and an encoding's packs made resident before they read (`vcs_store::upload::resident`), and a window an
+> encoding turn met let go brought back before the next; a let-go must wait for no fetch live and no encoding under way,
+> since a pack's answer cannot be taken again mid-pack byte for byte. (2b), the let-go after a landing,
 > next: a landed pack's windows have several holders, which `let_go` refuses (`Shared`).
 > Owed, in main's order: (1) the push's temporaries cut at their source (w-shared);
 > (2) landed windows and the pack let go once durable (w-shared, with w-git); (3) the recent-objects cache given back
@@ -221,6 +224,14 @@
 >   interleaved rounds. Stamped under TB, the loaded tail's deferred replies are submits parked behind their refinement
 >   and resumed. A plain forward's two wakes measure 7-21 µs from kick to run, and the resumed run is all CPU (not
 >   demoted). Main's own interleaved A/B (run 45009478174) misses p999 in most rounds in both arms; the gap stays open.
+> - **Linux, the round-robin real-time class for the shards and the client's park, measured and rejected (w-perf,
+>   2026-11-22; BENCHMARKS "84a on Linux: the round-robin real-time class").** On CI's runners (kernel 7.0,
+>   `PREEMPT_LAZY`, `RUN_TO_PARITY`, 2.1 ms base slice) a woken shard waited for its CPU: kick -> run p50 920 µs, and
+>   8 µs in `SCHED_RR`. But with the shards and the client's park in the class, the client's own time-share code still
+>   waits whole slices: accept p99 0.94-2.6 ms, p999 3.0-4.8 ms, and the spinners lost 20-27% of their throughput. The
+>   runner account's `RLIMIT_RTPRIO` is 0:0, so even that needs an administrator's grant. **Open:** 84a's Linux bar
+>   under two spinners a CPU, short of user code at real-time priority (ruled out) or a less oversubscribed lane, main's
+>   call.
 > - Windows (CI, run 44857045148): no 1 ms band (queued p99 5–49 µs); accept p99 0.13–0.31 ms, conflict 0.11–0.29 ms;
 >   p999 0.2–62 ms. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–7).
 >
@@ -588,10 +599,17 @@
 >   whole run, past the patience for a long enough one; the structural fix is a per-push staging log, the run landing
 >   apart from the repository's log and named in one step, so pushes to one repository need no turn between them.
 >   Owed, main's: the whole-history push on ubuntu and its peak RSS before and after (run-requests.md).
-> - Part 3, next (main's 05:13 order, straight after (b1)): a manifest's written entries kept once across the push. A
->   whole or null-base manifest revision's `written_entries` are its every line, kept for the files-present check once a
->   snapshot, the bulk of a whole-history push's 1.37 GB held (main's 04:59 measure); (b1)'s segments do not free them.
->   Red: a push of many whole manifest snapshots keeps one copy's worth.
+> - Part 3, a manifest's written entries kept once BUILT (2026-11-22, w-hg; main's 05:13 order): a whole or null-base
+>   manifest revision's written entries are its every line, and each was kept for the files' check once a snapshot,
+>   the bulk of a whole-history push's 1.37 GB held (main's 04:59 measure). Now a manifest's entries are a step's
+>   working set (charged to a copy); of them the intake keeps only the file revisions the fork lacks, each once across
+>   the push (`Taker::awaited`), refused at once as missing where they would outnumber the file revisions the push
+>   brings, and checked once every file is taken, a window of paths a step, each given back as checked. The bound
+>   (`Intake::bookkeeping`) counts each file revision once more for it, never a manifest's delta; it also counts a file
+>   group's path twice, as the steps charge it (the old manifest term's slack had hidden that). Held by
+>   `push::intake::tests::a_push_of_many_whole_manifest_snapshots_keeps_one_copy_of_their_entries`: a line of 60 then
+>   120 changesets, every manifest a full snapshot, kept 39,844 then 79,624 bytes, the bound the same (red: 134,764
+>   then 456,664, growing with the square).
 > - Not reproduced here, logged: w-interop's fresh repository's first 500-revision push refused at once on CI's x86 and
 >   arm runners (main's order of 03:49 and 03:50). `a_fresh_repositorys_first_push_of_hundreds_of_changesets_is_taken_at_once`
 >   (500 changesets pushed with no gap after the create) passes on this Mac. Every content-store refusal of a held-ahead
@@ -728,8 +746,11 @@
 > A-859 BUILT, part B (2026-11-22, w-git; main 03:38): a git/git clone moved 4-5 GiB, every object whole and
 > uncompressed (the encoder priced a byte at memcpy's 0.14 ns). Now an object pushed in a pack is sent on as its entry
 > lies there, checked against its name first, its delta reused where its base precedes it (`t_a859_…`: 20,916 bytes
-> against the pushed 17,299, where 89,439 went before). Owed: part A, a fetched byte priced at the network (§4.11);
-> main's git/git whole round and `fsck --strict`.
+> against the pushed 17,299, where 89,439 went before); a stored entry reused whenever one exists, a delta's wanted
+> base placed first (3fa634049). Part A BUILT: a fetched byte priced at its link, learned per shard from the HTTP
+> edge's writes that waited for the peer, cold at deflate's measured break-even at git's level 6 (§4.11). Owed: the
+> SSH edge's writes heard (SSH fetches price cold), a price per client, not per shard; main's git/git whole round and
+> `fsck --strict`.
 > A-860 BUILT (2026-11-22, w-git): a repository gone idle lets go of the objects its reads keep (git.recent_bytes held
 > 53.9 MB after a git/git clone). Owed: the push side's held windows and pack, w-shared's.
 > R2, the load-only edge tests, CLOSED (2026-11-21, w-git): a push's answer under side-band-64k wrote its first
@@ -3724,7 +3745,15 @@
 > no whole text is buffered (`an_import_holds_no_text_whole_on_the_system_heap`: 8 texts of 512 KiB, the system
 > path's churn 4,299,277 B at 2bb00e1cc, 92,309 B now). main's r14 at 2bb00e1cc, before it: 600.3 MB not given back,
 > `process.system_allocated_bytes` 33.59 GB cumulative for a 447 MB dump, live about 190 MB. Owed: the next-largest
-> per-text churners given buffers the import owns (main's routing), and main's gauged re-measure.
+> per-text churners given buffers the import owns (main's routing), and main's gauged re-measure. Next cut (w-svn): an
+> increment's post-state sized once by its texts, where it doubled a text at a time
+> (`an_increments_post_state_is_sized_once_by_its_texts`: 6,000 bytes held for 5,000, now 5,000), the largest of the
+> import's sites in w-svn's sampled in-process attribution (500 files, 300 revisions, 11.65 MB: 168.9 MB allocated at
+> 2bb00e1cc, 156.6 MB with A-862, 142.3 MB with this). r16 (main's daemon, 73e46f842: 51.35 GB against r14's 33.41 GB)
+> was the machine (main's r18, interleaved at one load: 73e46f842 3-5% below 2bb00e1cc, both about 560-600 MB not given
+> back). Then the import's sink keeps one window buffer for all its texts (`ContentStore::begin_object_reusing`,
+> `objects_begun_in_turn_on_one_buffer_never_make_another`): 142.3 MB to 130.7 MB sampled. Next, largest first: the
+> engine's `push_slice` (two sites), `Increment::encode`, `judge_held`; the content store's `release_one` (w-shared's).
 > Still to measure: the A-742 floor's A/B only if the
 > footprint still stays (main's ruling). A local 64 KiB floor gave 47 MB of footprint at 2 s idle, against 363 MB, at
 > 19.4 s against 12.0 s (debug).

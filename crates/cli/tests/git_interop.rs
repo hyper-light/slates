@@ -2138,7 +2138,8 @@ fn edge_advertisement(port: u16, token: &str) -> Option<Vec<u8>> {
 
 /// Format: the daemon's counters of the paths a clone's objects took (main 01a20182's order of 2026-11-22 04:53): the
 /// fetch stream's (`vcs_store::upload::STREAM_COUNTED`) and the encoding made ahead's (`vcs_store::git_encode`'s).
-const CLONE_PATHS: [&str; 17] = [
+const CLONE_PATHS: [&str; 18] = [
+  "vcs_store.git_upload.written_bytes",
   "vcs_store.git_upload.parts_copied",
   "vcs_store.git_upload.entries_copied",
   "vcs_store.git_upload.headers_rewritten",
@@ -2186,14 +2187,17 @@ fn counters_of(instance: &str, names: &[&str]) -> Option<Vec<u64>> {
   })
 }
 
-/// The bytes of the packs a repository at `dir` keeps (`objects/pack/*.pack`): a fresh mirror clone's, the pack its
-/// server sent.
+/// The bytes of the packs a repository at `dir` keeps (`objects/pack/*.pack`), and of the one `index-pack` is still
+/// receiving (`tmp_pack_*`): a fresh mirror clone's, the pack its server sent; one cut short, what it had sent.
 fn pack_file_bytes(dir: &str) -> u64 {
   std::fs::read_dir(format!("{dir}/objects/pack"))
     .map(|entries| {
       entries
         .filter_map(Result::ok)
-        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "pack"))
+        .filter(|entry| {
+          entry.path().extension().is_some_and(|ext| ext == "pack")
+            || entry.file_name().to_string_lossy().starts_with("tmp_pack_")
+        })
         .filter_map(|entry| entry.metadata().ok())
         .map(|metadata| metadata.len())
         .sum()

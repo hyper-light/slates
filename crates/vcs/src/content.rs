@@ -405,6 +405,15 @@ impl Writing {
   pub fn windows_kept(&self) -> usize {
     self.windows.len()
   }
+
+  /// The buffer the object's windows were filled in, taken out, emptied: what a writer that puts object after object
+  /// hands the next one ([`ContentStore::begin_object_reusing`]). Taken from a writer not yet finished, its pending
+  /// bytes go with it, so it is taken once the object is finished or before it is abandoned.
+  pub fn take_buffer(&mut self) -> Vec<u8> {
+    let mut buffer = std::mem::take(&mut self.pending);
+    buffer.clear();
+    buffer
+  }
 }
 
 /// The content store (module docs).
@@ -804,6 +813,27 @@ impl ContentStore {
     let window = self.window.get();
     Writing {
       pending: Vec::with_capacity(usize::try_from(len).map_or(window, |len| len.min(window))),
+      ..Writing::default()
+    }
+  }
+
+  /// Starts an object of `len` bytes (none: not known) as [`ContentStore::begin_object_of_length`] does, its window's
+  /// buffer `buffer`, a previous object's ([`Writing::take_buffer`]): a writer that puts object after object (an
+  /// import's texts) owns one buffer and hands it from each to the next, so no object allocates one of its own (P7
+  /// finding (2), main 01a20182's routing of 2026-11-22 07:38: one buffer a text was among the import's churners).
+  /// Where it is shorter than the object needs (the window, or `len` if shorter), it is grown once, to the window, so
+  /// it grows at most once over the writer's life.
+  pub fn begin_object_reusing(&self, len: Option<u64>, mut buffer: Vec<u8>) -> Writing {
+    let window = self.window.get();
+    let wanted = len.map_or(window, |len| {
+      usize::try_from(len).map_or(window, |len| len.min(window))
+    });
+    buffer.clear();
+    if buffer.capacity() < wanted {
+      buffer.reserve_exact(window);
+    }
+    Writing {
+      pending: buffer,
       ..Writing::default()
     }
   }
@@ -2638,6 +2668,59 @@ mod tests {
       );
       assert_eq!(held(&whole), held(&streamed), "{len}");
     }
+  }
+
+  /// Goal 93, P7 finding (2) (main 01a20182's routing of 2026-11-22 07:38: the import's sink made one window buffer a
+  /// text). Do: put four objects in turn, each begun on the buffer the one before handed back (`take_buffer`), the first
+  /// on an empty one: half a window, three windows and a half, a quarter window, and one of unknown length, in pieces of
+  /// a quarter window, the third abandoned part-way. Expect: the buffer grown once, at the first object, to the window,
+  /// and never grown or moved after; every finished object the one put whole; the abandoned one leaving nothing held.
+  /// Failing first: each object made a buffer of its own.
+  #[test]
+  fn objects_begun_in_turn_on_one_buffer_never_make_another() {
+    let mut whole = ContentStore::new(1 << 20, NARROW).unwrap();
+    let mut streamed = ContentStore::new(1 << 20, NARROW).unwrap();
+    let mut buffer = Vec::new();
+    let mut seen: Option<(usize, *const u8)> = None;
+    for (at, len) in [NARROW / 2, 3 * NARROW + NARROW / 2, NARROW / 4, 2 * NARROW]
+      .into_iter()
+      .enumerate()
+    {
+      let bytes: Vec<u8> = (0..len)
+        .map(|byte| u8::try_from((byte * 7 + at) % 251).unwrap())
+        .collect();
+      let known = (at != 3).then(|| u64::try_from(len).unwrap());
+      let mut writing = streamed.begin_object_reusing(known, std::mem::take(&mut buffer));
+      let now = (writing.pending.capacity(), writing.pending.as_ptr());
+      assert_eq!(now.0, NARROW, "object {at}: the buffer is the window's");
+      if let Some(seen) = seen {
+        assert_eq!(
+          now, seen,
+          "object {at}: the same buffer, neither grown nor moved"
+        );
+      }
+      seen = Some(now);
+      if at == 2 {
+        streamed.put_window(&mut writing, &bytes[..1]).unwrap();
+        buffer = writing.take_buffer();
+        streamed.abandon_object(writing);
+        continue;
+      }
+      for piece in bytes.chunks(NARROW / 4) {
+        streamed.put_window(&mut writing, piece).unwrap();
+      }
+      assert_eq!(
+        streamed.finish_object(&mut writing).unwrap(),
+        whole.put_object(&bytes).unwrap(),
+        "object {at}"
+      );
+      buffer = writing.take_buffer();
+    }
+    assert_eq!(
+      held(&whole),
+      held(&streamed),
+      "the objects finished, nothing of the abandoned one"
+    );
   }
 
   /// `object` put into one store whole and into another `piece` bytes at a time, twice each: the same root, the same

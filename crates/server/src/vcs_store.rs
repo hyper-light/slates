@@ -120,15 +120,15 @@ pub(crate) mod lfs_record;
 pub(crate) mod named_objects;
 pub(crate) mod owed;
 pub(crate) mod paths;
-pub(crate) mod record;
-// Owed caller: A-645 P3's presenter, which makes a hook's view of referenced files.
-#[cfg_attr(not(test), allow(dead_code))]
-// Owed caller: w-git's C5 (the push landed on the store, its replay).
 pub(crate) mod read_through;
+pub(crate) mod record;
 #[cfg_attr(not(test), allow(dead_code))] // Owed caller: record v3 (w-perf's A-727 (b)).
 pub(crate) mod record_names;
+// Owed caller: A-645 P3's presenter, which makes a hook's view of referenced files.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod referenced;
+#[cfg_attr(not(test), allow(dead_code))]
+// Owed caller: w-git's C5 (the push landed on the store, its replay).
 pub(crate) mod store_packs;
 pub(crate) mod svn_import;
 pub(crate) mod svn_made;
@@ -243,6 +243,9 @@ pub(crate) struct VcsStores {
   /// repository stood at when a fetch began, shared by every fetch that began there, given back with its last holder;
   /// bounded by the fetches the shard's edges seat.
   git_forks: BTreeMap<RepositoryId, Vec<upload::GitFork>>,
+  /// The price of a byte git's fetches send over this shard's links, learned from the time their writes waited for the
+  /// peer (A-859 part A, [`upload::LinkPrice`]).
+  pub(crate) git_link: upload::LinkPrice,
   /// What each repository's entries' objects, which the partition's register keeps (A-662), hold of the shard's budget,
   /// charged as retention ([`settle_objects`]): bounded by the partition's repositories.
   objects_charged: BTreeMap<RepositoryId, u64>,

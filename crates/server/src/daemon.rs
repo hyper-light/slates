@@ -8004,7 +8004,10 @@ mod tests {
         let refused = crate::vcs_store::within_budget(state, 0, |stores| {
           let content = stores.content_mut()?;
           content.mark_landed(&identity);
-          Some((content.let_go_landed(&identity, pin), content.is_away(&identity)))
+          Some((
+            content.let_go_landed(&identity, pin),
+            content.is_away(&identity),
+          ))
         });
         let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
         (

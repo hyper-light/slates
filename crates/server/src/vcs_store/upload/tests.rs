@@ -843,3 +843,164 @@ fn t_a859_a_fetchs_stream_counts_each_path_its_objects_took_on_its_shard() {
   assert_eq!(counted, expected, "{stream:?}");
   assert!(counted.iter().any(|count| *count > 0), "{stream:?}");
 }
+
+/// A-859 part A (main 01a20182's rulings of 2026-11-22 04:30 and 06:32: a fetched byte priced at its link, never at
+/// memcpy; cold, the price where deflate at git's default level just pays; learned from the writes that waited for the
+/// peer, from an answer's first wait on). Do: on an audit shard, read the fetch's exchange; teach the shard's pacing a
+/// MiB less a byte of a slow link's writes (a microsecond a byte), past one write that did not wait; read the exchange
+/// again; teach it a byte more; read it a third time. Expect: first the cold price (`Exchange::cold` of the machine's
+/// rates), a byte dearer than memcpy prices one; still cold short of the learned bound, the write before the first wait
+/// teaching nothing; then the link's own price, a microsecond a byte, and the learned bytes counted.
+#[test]
+fn t_a859_a_shard_prices_a_fetched_byte_cold_until_its_link_is_learned() {
+  use super::{LINK_LEARNED, Pacing, Sent, exchange, learn_link};
+  use slates_git::store::learn::Exchange;
+  crate::test_store::audit_on_stored_shard("vcs_store-link", |state| {
+    let rates = state.config.git_rates;
+    let cold = exchange(state);
+    let memcpy_priced = u128::from(cold.ns) * u128::from(state.config.memcpy_bytes_per_second)
+      > u128::from(cold.bytes) * 1_000_000_000;
+    let mut pacing = Pacing::default();
+    let early = pacing.sent(Sent {
+      bytes: 1 << 20,
+      ns: 1,
+      waited: false,
+    });
+    let slow = |bytes: u64| Sent {
+      bytes,
+      ns: bytes * 1_000,
+      waited: true,
+    };
+    for taught in [pacing.sent(slow((1 << 20) - 1))].into_iter().flatten() {
+      learn_link(state, taught);
+    }
+    let short = exchange(state);
+    for taught in [pacing.sent(slow(1))].into_iter().flatten() {
+      learn_link(state, taught);
+    }
+    let learned = exchange(state);
+    let counted = state.refusals.get(LINK_LEARNED).copied();
+    assert_eq!(
+      (cold, memcpy_priced, early, short),
+      (Exchange::cold(rates), true, None, Exchange::cold(rates)),
+    );
+    assert_eq!(
+      (learned.ns, learned.bytes, counted),
+      ((1 << 20) * 1_000, 1 << 20, Some(1 << 20)),
+    );
+  });
+}
+
+/// A-859 part A (main 01a20182's ruling of 2026-11-22 06:32: the loop's absence). Do: pace an answer made slowly, as a
+/// starved shard makes one: many writes far apart, each into a socket with room (none waited), the time between them
+/// long; then a link's price learned past its bound and halved past its memory. Expect: the slow answer teaches the
+/// price nothing, so a clone slow for its own making never prices its link dearer; the halved price is the same
+/// nanoseconds a byte.
+#[test]
+fn t_a859_an_answer_slow_for_its_own_making_teaches_its_link_price_nothing() {
+  use super::{LinkPrice, Pacing, Sent};
+  let mut pacing = Pacing::default();
+  let taught: Vec<(u64, u64)> = (0..1_000)
+    .filter_map(|_| {
+      pacing.sent(Sent {
+        bytes: 64 << 10,
+        ns: 2_000,
+        waited: false,
+      })
+    })
+    .collect();
+  assert!(taught.is_empty(), "{taught:?}");
+  let mut price = LinkPrice::default();
+  for _ in 0..200 {
+    price.learn((1_000_000, 1 << 20));
+  }
+  let rates = slates_git::store::learn::Rates {
+    deflate_ns_per_kib: [1; 10],
+    deflate_saved_per_mille: [500; 10],
+    search_ns_per_kib: 1,
+  };
+  let learned = price.exchange(rates).expect("learned");
+  assert_eq!(learned.ns / learned.bytes, 0, "under a nanosecond a byte");
+  assert_eq!(learned.ns * (1 << 20) / learned.bytes, 1_000_000);
+}
+
+/// Goal 93 item 2a (main 01a20182's ruling of 2026-11-22 05:45; w-git's driver hook: a fetch's and an encoding's packs
+/// made resident before they read). Do: on a store-backed daemon, put a pack of three windows and a part in the shard's
+/// content store, land its bytes on the node's store as a changeset's `Payload`, mark every window landed and let it
+/// go; list what [`super::away_in`] finds of it, bring that back ([`super::brought_back_all`]), list again, and read the
+/// pack whole. Expect: its four windows found let go, all brought back (their bytes the pack's), none found after, and
+/// the pack read whole as it was put. Failing first: nothing made a repository's packs resident, so a clone's read of a
+/// let-go window refused `Unread`.
+#[test]
+fn t_goal93_a_repositorys_let_go_pack_is_made_resident_before_it_is_read() {
+  use slates_vcs::ContentId;
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (sent, got) = std::sync::mpsc::channel();
+  crate::daemon::observe_first(&daemon, move |state| {
+    let _ = crate::git_push::tests::git_repository(state, "resident");
+    let window = state
+      .vcs_stores
+      .content()
+      .map_or(1 << 18, slates_vcs::ContentStore::window);
+    let bytes: Vec<u8> = (0..3 * window + 100)
+      .map(|at| u8::try_from(at % 251).unwrap())
+      .collect();
+    let len = u64::try_from(bytes.len()).unwrap();
+    let root = crate::vcs_store::within_budget(state, len, |stores| {
+      stores.content_mut().unwrap().put_object(&bytes).unwrap()
+    });
+    let header = slates_store::log::Header {
+      tool: slates_store::log::Tool::Git,
+      repository: 1,
+      sequence: 0,
+      judged_over: 0,
+      grant: 0,
+      work: 0,
+      time_ns: slates_rt::futures::now_ns(),
+      sections: 0,
+    };
+    let parts = vec![(slates_store::log::SectionKind::Payload, bytes.clone())];
+    assert!(crate::test_store::land_blocking(
+      state.vcs_disk.clone().unwrap(),
+      header,
+      parts
+    ));
+    let _ = crate::vcs_store::within_budget(state, 0, |stores| {
+      let content = stores.content_mut().unwrap();
+      let ids: Vec<ContentId> = bytes.chunks(window).map(ContentId::of).collect();
+      for id in &ids {
+        assert!(content.mark_landed(id) && content.let_go(id).is_ok());
+      }
+    });
+    let away = super::away_in(
+      state.vcs_stores.content().unwrap(),
+      [(root, len)].into_iter(),
+    );
+    let task = slates_rt::futures::spawn(async move {
+      let found = away.len();
+      let brought = super::brought_back_all(away).await;
+      let after = crate::state::with_state(|state| {
+        super::away_in(
+          state.vcs_stores.content().unwrap(),
+          [(root, len)].into_iter(),
+        )
+        .len()
+      });
+      let read = crate::state::with_state(|state| {
+        crate::vcs_store::lent_to_read((&mut state.store, &mut state.vcs_stores), |stores| {
+          stores
+            .content()
+            .and_then(|content| content.object_bytes(&root, len))
+        })
+      })
+      .flatten();
+      let _ = sent.send((found, brought, after, read == Some(bytes)));
+    })
+    .unwrap();
+    slates_rt::futures::detach(task).unwrap();
+  });
+  let (found, brought, after, whole) = got.recv().expect("made resident");
+  daemon.stop();
+  assert_eq!((found, after, whole), (4, Some(0), true));
+  assert!(brought > 0, "{brought}");
+}
