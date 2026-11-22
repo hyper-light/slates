@@ -561,6 +561,11 @@
 > (`t_a850_r16_…`). Owed: main's git/git rounds over it; an atomic push's moves meet no base among each other; a fetch's
 > plan does not follow a base (a want of a tag made at one is answered by the walk); bug (1), a fetch cut short while
 > the encoding runs, is next.
+> A-855 BUILT (2026-11-22, w-git; main 01a20182 00:26): bug (1). A fetch's answer was admitted one client region
+> (256 KiB), whatever its repository; git/git's 1,019 tags outgrew it and the pack ended with git's abort words. Now an
+> answer is admitted its repository's shard room, and a refusal past it before the pack begins is held and made again
+> in a wider room, never cut (`t_…a_clone_of_git_gits_many_refs…`, `a_fetch_past_its_room_waits…`). Owed: main's git/git
+> rounds over it; the SSH edge's wait (it gives a held refusal up at once); a refusal once the pack began still cuts it.
 > R2, the load-only edge tests, CLOSED (2026-11-21, w-git): a push's answer under side-band-64k wrote its first
 > keepalive two intervals after its body (`body_end` waited one interval unwritten, then the reply its own before
 > appending it), 10 s, the client's patience, so every push answer past 5 s failed (18 of 18 at load 24, the timing
