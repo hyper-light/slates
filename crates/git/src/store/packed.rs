@@ -47,6 +47,15 @@ pub trait PackSource {
   /// The pack `pack` (of `len` bytes) from `offset` on, as far as one lent piece reaches; none where it is not held or
   /// `offset` is past its end.
   fn piece(&self, pack: &ContentId, len: u64, offset: u64) -> Option<Cow<'_, [u8]>>;
+
+  /// Whether the piece at `offset` of `pack` is not lent because it is let go (held on the node's store, not here: A-724
+  /// piece 4, `ContentStore::let_go`): a read that meets it is refused [`PackedRefused::Away`], for its owner to bring it
+  /// back and read again (goal 93, main 01a20182's ruling of 2026-11-22 05:45), never [`PackedRefused::Unread`]. None by
+  /// default: a source that lets nothing go.
+  fn away(&self, pack: &ContentId, len: u64, offset: u64) -> bool {
+    let _ = (pack, len, offset);
+    false
+  }
 }
 
 /// A pack the content store holds, by its identity: a piece is the window `offset` lies in, from `offset` on.
@@ -62,6 +71,37 @@ impl PackSource for ContentStore {
     match self.window_at(pack, len, offset.checked_div(window)?)? {
       Cow::Borrowed(lent) => lent.get(within..).map(Cow::Borrowed),
       Cow::Owned(copied) => copied.get(within..).map(|rest| Cow::Owned(rest.to_vec())),
+    }
+  }
+
+  fn away(&self, pack: &ContentId, len: u64, offset: u64) -> bool {
+    self.away_window(pack, len, offset).is_some()
+  }
+}
+
+/// A let-go piece of a held pack a read met ([`PackedRefused::Away`]), named for its owner to bring back before the read
+/// is taken again (goal 93, main 01a20182's ruling of 2026-11-22 05:45): the pack (its content root), its length, and
+/// the offset met.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Waited {
+  /// The pack.
+  pub pack: ContentId,
+  /// The pack's length.
+  pub len: u64,
+  /// Where in the pack the read met it.
+  pub offset: u64,
+}
+
+impl PackedRefused {
+  /// The let-go piece this refusal met, where it is [`PackedRefused::Away`].
+  pub fn waited(&self) -> Option<Waited> {
+    match *self {
+      PackedRefused::Away { pack, len, at } => Some(Waited {
+        pack,
+        len,
+        offset: at,
+      }),
+      _ => None,
     }
   }
 }
@@ -130,6 +170,16 @@ pub enum PackedRefused {
     /// Where the entry it led back to begins.
     at: u64,
   },
+  /// The bytes at this offset of the pack are let go (held on the node's store, [`PackSource::away`]): its owner brings
+  /// them back and reads again.
+  Away {
+    /// The pack.
+    pack: ContentId,
+    /// The pack's length.
+    len: u64,
+    /// Where in the pack.
+    at: u64,
+  },
 }
 
 /// One delta on a chain: where its data begins in its pack, and the size it inflates to.
@@ -188,6 +238,8 @@ pub struct Recent {
   held: usize,
   /// The most bytes the chunks hold: zero keeps none.
   budget: usize,
+  /// What its owner's content store is charged for the chunks ([`Recent::true_up`]), so the store's room counts them.
+  charged: u64,
 }
 
 /// One chunk of [`Recent`]'s: its bytes, laid end to end within the room it was reserved with.
@@ -341,23 +393,28 @@ impl Recent {
 
   /// Gives back the oldest chunks, whole, until `len` bytes more fit the budget, forgetting the objects laid in them.
   fn make_room(&mut self, len: usize) {
-    while self.held.saturating_add(len) > self.budget {
-      let Some(oldest) = self.chunks.pop_front() else {
-        return;
-      };
-      let number = self.first;
-      self.first = self.first.saturating_add(1);
-      self.held = self.held.saturating_sub(oldest.bytes.capacity());
-      while let Some(&(key, chunk)) = self.order.front()
-        && chunk == number
+    while self.held.saturating_add(len) > self.budget && !self.chunks.is_empty() {
+      self.drop_oldest();
+    }
+  }
+
+  /// Gives back the oldest chunk whole, forgetting the objects laid in it.
+  fn drop_oldest(&mut self) {
+    let Some(oldest) = self.chunks.pop_front() else {
+      return;
+    };
+    let number = self.first;
+    self.first = self.first.saturating_add(1);
+    self.held = self.held.saturating_sub(oldest.bytes.capacity());
+    while let Some(&(key, chunk)) = self.order.front()
+      && chunk == number
+    {
+      self.order.pop_front();
+      if let Some((_, lent)) = self.objects.get(&key)
+        && lent.chunk == number
       {
-        self.order.pop_front();
-        if let Some((_, lent)) = self.objects.get(&key)
-          && lent.chunk == number
-        {
-          self.bytes = self.bytes.saturating_sub(lent.len);
-          self.objects.remove(&key);
-        }
+        self.bytes = self.bytes.saturating_sub(lent.len);
+        self.objects.remove(&key);
       }
     }
   }
@@ -379,6 +436,54 @@ impl Recent {
     self.order = VecDeque::new();
     self.bytes = 0;
     self.held = 0;
+  }
+
+  /// Charges `store` for the chunks held now past what it charged before, or gives back what they no longer hold (main
+  /// 01a20182's ruling of 2026-11-22 05:17: an uncharged holder makes the admission's numbers lie). Where the store's room
+  /// cannot take the charge, the oldest chunks are given back until it can: the store's room bounds what is kept, as the
+  /// budget does. Run by its owner wherever it holds the store mutably (a push's admission turns, a repository's encoding
+  /// turns); a read between two only lays chunks the next charges.
+  pub fn true_up(&mut self, store: &mut ContentStore) {
+    let held = u64::try_from(self.held).unwrap_or(u64::MAX);
+    if held < self.charged {
+      if store.discharge(self.charged.saturating_sub(held)).is_ok() {
+        self.charged = held;
+      }
+      return;
+    }
+    // What the chunks may hold: what they are charged now and the store's room, less what the store is past its budget
+    // (a budget lowered under what is charged).
+    let past = store.used().saturating_sub(store.budget());
+    let fits = self
+      .charged
+      .saturating_add(store.room())
+      .saturating_sub(past);
+    let fits = usize::try_from(fits).unwrap_or(usize::MAX);
+    while self.held > fits && !self.chunks.is_empty() {
+      self.drop_oldest();
+    }
+    let held = u64::try_from(self.held).unwrap_or(u64::MAX);
+    if held > self.charged {
+      if store.charge(held.saturating_sub(self.charged)).is_ok() {
+        self.charged = held;
+      }
+    } else if store.discharge(self.charged.saturating_sub(held)).is_ok() {
+      self.charged = held;
+    }
+  }
+
+  /// Gives back every chunk ([`Recent::let_go`]) and everything charged for them to `store`: what its owner runs when it
+  /// ends (a push landed or abandoned) or goes idle.
+  pub fn release(&mut self, store: &mut ContentStore) {
+    self.let_go();
+    if store.discharge(self.charged).is_ok() {
+      self.charged = 0;
+    }
+  }
+
+  /// What its owner's store is charged for it now.
+  pub fn charged(&self) -> u64 {
+    self.charged
   }
 
   /// Holds what is kept to `budget` bytes from now on, the oldest given back to fit.
@@ -538,9 +643,17 @@ fn each_window_from(
 ) -> Result<(), PackedRefused> {
   let mut at = place.offset;
   while at < place.len {
-    let lent = store
-      .piece(&place.pack, place.len, at)
-      .ok_or(PackedRefused::Unread { at })?;
+    let Some(lent) = store.piece(&place.pack, place.len, at) else {
+      return Err(if store.away(&place.pack, place.len, at) {
+        PackedRefused::Away {
+          pack: place.pack,
+          len: place.len,
+          at,
+        }
+      } else {
+        PackedRefused::Unread { at }
+      });
+    };
     if lent.is_empty() {
       return Err(PackedRefused::Unread { at });
     }
@@ -631,6 +744,17 @@ pub struct RawEntry {
   pub data: u64,
   /// Where its compressed data ends: the next byte past it.
   pub end: u64,
+}
+
+/// The header of the entry at `place` in a held pack (A-859): how it holds its object, its base where a delta's, read
+/// with nothing inflated, so a delta's base is found before its data is read. Refused as [`raw_entry`] refuses one.
+pub fn entry_header(
+  store: &dyn PackSource,
+  (place, format): (InPack, ObjectFormat),
+  room: u64,
+) -> Result<entry::Header, PackedRefused> {
+  let mut header = Vec::new();
+  header_at(store, place, format, (&mut header, room)).map(|(found, _)| found)
 }
 
 /// The entry at `place` in a held pack as it lies there ([`RawEntry`], A-859): its header read, and its data inflated
@@ -738,6 +862,46 @@ mod recent_tests {
     assert!(recent.get(at(3)).is_some());
     assert!(recent.chunks.get(1).is_some_and(|chunk| chunk.whole));
     assert!(recent.held <= 4 * chunk());
+  }
+
+  /// A-861's charge (main 01a20182, 2026-11-22 05:17: an uncharged holder makes the admission's numbers lie). Do: with a
+  /// budget of four chunks over a store whose room is four and a half, keep objects until four chunks' worth and true
+  /// up; then take the store's room down to one and a half chunks' worth of charge and true up again; then release.
+  /// Expect: the store charged exactly the chunks held after each true-up, the second giving back the oldest chunks
+  /// until the charge fits the room (two chunks kept); none charged and none held after the release.
+  #[test]
+  fn the_chunks_are_charged_on_the_stores_room_and_given_back_with_it() {
+    let room = u64::try_from(9 * chunk() / 2).unwrap();
+    let mut store = slates_vcs::ContentStore::new(room, 4096).unwrap();
+    let mut recent = Recent::default();
+    recent.set_budget(4 * chunk());
+    for n in 0..16 {
+      recent.keep(at(n), Kind::Blob, vec![1; chunk() / 4]);
+    }
+    recent.true_up(&mut store);
+    assert_eq!(recent.charged(), u64::try_from(recent.held).unwrap());
+    assert_eq!(store.charged(), recent.charged());
+    store.set_budget(
+      recent
+        .charged()
+        .saturating_sub(u64::try_from(chunk() * 2).unwrap())
+        + u64::try_from(chunk() / 2).unwrap(),
+    );
+    recent.true_up(&mut store);
+    assert_eq!(store.charged(), recent.charged());
+    assert!(
+      store.charged() <= store.budget(),
+      "charged {} past {}",
+      store.charged(),
+      store.budget()
+    );
+    assert_eq!(
+      recent.chunks.len(),
+      2,
+      "the oldest given back to fit the room"
+    );
+    recent.release(&mut store);
+    assert_eq!((store.charged(), recent.charged(), recent.held), (0, 0, 0));
   }
 
   /// A-860 with the chunks (w-git's let_go): do: keep objects, let go, read one back, keep one more. Expect: nothing held

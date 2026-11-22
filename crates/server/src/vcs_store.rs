@@ -128,6 +128,7 @@ pub(crate) mod record_names;
 pub(crate) mod referenced;
 #[cfg_attr(not(test), allow(dead_code))]
 // Owed caller: w-git's C5 (the push landed on the store, its replay).
+pub(crate) mod read_through;
 pub(crate) mod store_packs;
 pub(crate) mod svn_import;
 pub(crate) mod svn_made;
@@ -773,6 +774,23 @@ impl VcsStores {
       return None;
     }
     self.svn_unlent(id)
+  }
+
+  /// Repository `id`'s Subversion records and the shard's content store, lent together for one step: an import's call,
+  /// which reads the records and puts its texts into the store as it reads (`svn_import::texts`). None as
+  /// [`VcsStores::subversion`] answers none, or where either is not made.
+  pub(crate) fn subversion_with_content(
+    &mut self,
+    id: RepositoryId,
+  ) -> Option<(&mut SvnRecords, &mut ContentStore)> {
+    if self.rebuild_turns.contains_key(&id) {
+      return None;
+    }
+    let content = self.content.as_mut()?;
+    match self.entries.get_mut(&id)? {
+      RepositoryStore::Subversion(store) => Some((store.records.as_mut()?, content)),
+      _ => None,
+    }
   }
 
   /// [`VcsStores::subversion`] whether or not the store is lent: a rebuild's own replay reaches it this way.
@@ -1555,7 +1573,7 @@ fn hand_chunks_back(
 /// A-614's store lists a tree, a tag or a commit within the content store's room (`ContentStore::room`), as A-638's view
 /// does, and a settled store has none, its budget being what it holds. Read only, the stores hold after it what they
 /// held before, so the room lent is given back and nothing is charged.
-fn lent_to_read<T>(
+pub(crate) fn lent_to_read<T>(
   (store, stores): (&mut Store, &mut VcsStores),
   read: impl FnOnce(&VcsStores) -> T,
 ) -> T {
@@ -1994,6 +2012,8 @@ impl GitPush {
           .push
           .keep_read(object.offset, object.kind, object.content);
       }
+      // What it keeps read lately is charged on the store's room (A-861).
+      self.push.true_up_recent(content);
       Ok(())
     })
   }
