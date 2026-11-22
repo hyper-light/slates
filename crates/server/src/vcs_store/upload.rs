@@ -132,7 +132,7 @@ pub(crate) fn lend_on<R>(
   step: impl FnOnce(&Served<'_>, &mut ShardPacks) -> R,
 ) -> Option<R> {
   let began = slates_rt::futures::now_ns();
-  let lent = lend_uncounted(state, (id, reader), step);
+  let lent = super::observed(state, id, |state| lend_uncounted(state, (id, reader), step));
   // A-724 piece 1: a request's step (one with a reader) begins a fetch on the repository's usage row; every step that
   // was lent is counted with its time. Its answer is counted, and its bytes learned, as its generation is given back
   // (`GitGeneration`'s drop, A-724 piece 3d).
@@ -291,19 +291,21 @@ fn lend_held_in<R>(
     })
     .collect();
   let mut packs = ShardPacks::of(&state.config);
-  let lent = super::lent_to_read((&mut state.store, &mut state.vcs_stores), |stores| {
-    let fork = stores
-      .git_forks
-      .get(&hold.id)?
-      .iter()
-      .find(|fork| fork.stamp == hold.stamp)?;
-    let served = Served {
-      repository: &fork.repository,
-      store: stores.content.as_ref()?,
-      refs: &refs,
-      head: &hold.head,
-    };
-    Some(step(&served, &mut packs))
+  let lent = super::observed(state, hold.id, |state| {
+    super::lent_to_read((&mut state.store, &mut state.vcs_stores), |stores| {
+      let fork = stores
+        .git_forks
+        .get(&hold.id)?
+        .iter()
+        .find(|fork| fork.stamp == hold.stamp)?;
+      let served = Served {
+        repository: &fork.repository,
+        store: stores.content.as_ref()?,
+        refs: &refs,
+        head: &hold.head,
+      };
+      Some(step(&served, &mut packs))
+    })
   });
   if lent.is_some() {
     let now = slates_rt::futures::now_ns();

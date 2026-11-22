@@ -2017,8 +2017,10 @@
 > Open: nothing reads content through it yet; the marginal-utility partition and the CPU weights follow.
 > **A-724 piece 2b (A-845): the learned rates built, not yet fed** (`slates_vcs::rate`, `cargo test -p slates-vcs --lib
 > rate::`, 5 of 5, macOS arm64, this Mac); since 2026-11-21 the one learned demand: it replaced `usage::Learned`, fed
-> at each answered work (`slates_vcs::usage`); each principal's rate read from its usage slot. Open: the curves fed on
-> the owner shard.
+> at each answered work (`slates_vcs::usage`); each principal's rate read from its usage slot.
+> **A-724 piece 2d part 2 (A-844): curves fed by git's fetches** (`vcs_store::observed`;
+> `t_a724_a_fetchs_reads_are_noted_in_its_own_repositorys_curve`). Open: pushes', hg's and svn's reads; aging, the
+> partition at the learning cadence and its published snapshot.
 > **A-724 piece 2c (A-846): memory by marginal utility built, not yet applied** (`slates_vcs::partition`, `cargo test
 > -p slates-vcs --lib partition::`, 4 of 4, macOS arm64, this Mac). Open: computed on the owner shard and published.
 >

@@ -902,6 +902,65 @@ fn made(stores: &mut VcsStores, record: &RepositoryRecord, window: usize) -> Res
 /// A store not made ([`made`]).
 struct Unmade;
 
+/// Runs `step` with repository `id`'s miss-ratio curve lent to the shard's content store, so every content its step
+/// reads is noted in it (A-724 piece 2d; §4.17.5 "Learned demand"): taken from its usage row, bounded to the windows
+/// its floor holds ([`curve_keys`]), lent for the step and given back, the curve lent before restored, so a step inside
+/// a step is noted in its own repository's. With no content store made yet, `step` runs unobserved.
+pub(crate) fn observed<R>(
+  state: &mut ShardState,
+  id: RepositoryId,
+  step: impl FnOnce(&mut ShardState) -> R,
+) -> R {
+  let Some(granule) = state
+    .vcs_stores
+    .content()
+    .map(|content| u64::try_from(content.window()).unwrap_or(u64::MAX))
+  else {
+    return step(state);
+  };
+  let now = slates_rt::futures::now_ns();
+  let capacity = curve_keys(state);
+  let curve = state.vcs_usage.take_curve(&id, (capacity, granule), now);
+  let before = state
+    .vcs_stores
+    .content()
+    .and_then(|content| content.observe(Some(curve)));
+  let answer = step(state);
+  let lent = state
+    .vcs_stores
+    .content()
+    .and_then(|content| content.observe(before));
+  if let Some(curve) = lent {
+    state.vcs_usage.put_curve(&id, curve);
+  }
+  answer
+}
+
+/// The sampled keys a repository's curve keeps (A-724 piece 2d): the content windows its floor of the shard's room
+/// holds, `room / (repositories served × window)`, at least one. A curve need resolve no more than its floor could
+/// cache: a working set that fits it is sampled whole, a larger one at that resolution, the curve costing about
+/// `56 / window` of the floor (0.09% at a 64 KiB window). Measured accuracy (`slates_vcs::mrc`): 8,000 keys, a floor of
+/// about 512 MiB, erred 0.008 to 0.049; a smaller floor's curve is coarser.
+pub(crate) fn curve_keys(state: &ShardState) -> usize {
+  let served = u64::try_from(state.vcs_usage.rows().count())
+    .unwrap_or(u64::MAX)
+    .max(1);
+  let window = state
+    .vcs_stores
+    .content()
+    .map_or(1, |content| {
+      u64::try_from(content.window()).unwrap_or(u64::MAX)
+    })
+    .max(1);
+  let keys = state
+    .store
+    .admittable()
+    .checked_div(served)
+    .and_then(|floor| floor.checked_div(window))
+    .unwrap_or(0);
+  usize::try_from(keys).unwrap_or(usize::MAX).max(1)
+}
+
 /// Frees repository `id`'s store with the repository (module docs): an import of it under way given back first
 /// ([`hg_import::abandon`], [`svn_import::abandon`]), then every hold of its rows, tables, versions and derived values
 /// given back to the content store, then the shard's charge trued up to what remains. A refusal while giving back is

@@ -33,6 +33,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::mrc::Curve;
 use crate::rate::{Decayed, Rates};
 
 /// Format: the shard clock's grain, the nanosecond: where a learned demand's ladder of horizons starts.
@@ -119,6 +120,8 @@ pub struct Usage<P> {
   pub fetch_learned: Rates,
   /// The principal summary: at most the ledger's `principal_slots` slots, in no order.
   principals: Vec<PrincipalCount<P>>,
+  /// Its working set's miss-ratio curve (A-724 piece 2d), made at its first lent step; away while lent.
+  curve: Option<Curve>,
 }
 
 impl<P> Usage<P> {
@@ -134,7 +137,13 @@ impl<P> Usage<P> {
       intake_learned: Rates::new(CLOCK_GRAIN_NS),
       fetch_learned: Rates::new(CLOCK_GRAIN_NS),
       principals: Vec::new(),
+      curve: None,
     }
+  }
+
+  /// Its working set's miss-ratio curve, once a step of its was observed (`Ledger::take_curve`).
+  pub fn curve(&self) -> Option<&Curve> {
+    self.curve.as_ref()
   }
 
   /// The counts of `work`.
@@ -296,6 +305,32 @@ impl<R: Ord + Clone, P: Clone + Eq> Ledger<R, P> {
     let row = self.row(repository, now_ns);
     row.derive_ns = row.derive_ns.saturating_add(ns);
     row.derive_bytes = row.derive_bytes.saturating_add(bytes);
+  }
+
+  /// Takes `repository`'s miss-ratio curve out of its row to lend to a step of its (A-724 piece 2d), bounded to
+  /// `capacity` sampled keys, or a new one of that capacity counting in windows of `granule` bytes; the row is made at
+  /// `now_ns` when it has none. [`Ledger::put_curve`] gives it back.
+  pub fn take_curve(
+    &mut self,
+    repository: &R,
+    (capacity, granule): (usize, u64),
+    now_ns: u64,
+  ) -> Curve {
+    let row = self.row(repository, now_ns);
+    let mut curve = row
+      .curve
+      .take()
+      .unwrap_or_else(|| Curve::new(capacity, granule));
+    curve.bound(capacity);
+    curve
+  }
+
+  /// Gives `repository`'s curve back to its row after its step; dropped when the row is gone (the repository left
+  /// meanwhile).
+  pub fn put_curve(&mut self, repository: &R, curve: Curve) {
+    if let Some(row) = self.rows.get_mut(repository) {
+      row.curve = Some(curve);
+    }
   }
 
   /// Drops `repository`'s row: it is gone from this shard.
