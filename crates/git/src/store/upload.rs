@@ -461,6 +461,11 @@ pub struct Upload<A> {
   order: Vec<(u64, u64, u64)>,
   /// Each pack the loose stage's objects lie in, by its ordinal in `order`, in the order first met.
   packs: BTreeMap<ContentId, u64>,
+  /// The same packs by ordinal, each with its length.
+  pack_lens: Vec<(ContentId, u64)>,
+  /// The let-go window a unit met and stopped at, its work kept to be taken again once it is brought back (goal 93
+  /// item 2a's look-ahead, A-864 piece 2): taken by [`Upload::waiting`].
+  waiting: core::cell::Cell<Option<packed::Waited>>,
   /// Where the loose stage last read a pushed entry: its pack and offset (counting [`UploadCounters::backward_reads`]).
   last_read: Option<(ContentId, u64)>,
   by_entry: Option<ByEntry>,
@@ -498,6 +503,8 @@ impl<A: Answered> Upload<A> {
       ahead: Vec::new(),
       order: Vec::new(),
       packs: BTreeMap::new(),
+      pack_lens: Vec::new(),
+      waiting: core::cell::Cell::new(None),
       last_read: None,
       by_entry: None,
       pending: None,
@@ -538,6 +545,8 @@ impl<A: Answered> Upload<A> {
     loop {
       match self.step(&mut context, out) {
         Ok(Progress::Done) => return Ok(Progress::Done),
+        // A unit met a let-go window and stopped, nothing of it written: the turn ends, the window to be brought back.
+        Ok(Progress::More) if self.is_waiting() => return Ok(Progress::More),
         Ok(Progress::More) => {}
         Err(refused) => {
           self.stage = Stage::Refused(refused);
@@ -553,6 +562,15 @@ impl<A: Answered> Upload<A> {
   /// One unit of work: what is owed first, then a part's next entry, then the stage's next step.
   fn step(&mut self, cx: &mut Context<'_>, out: &mut impl Out) -> Result<Progress, StoreRefused> {
     if let Some(pending) = self.pending.take() {
+      if let Pending::Copy {
+        content, len, from, ..
+      } = pending
+        && let Some(waited) = away_from(cx.store, (content, len), (from, from.saturating_add(1)))
+      {
+        self.pending = Some(pending);
+        self.waiting.set(Some(waited));
+        return Ok(Progress::More);
+      }
       self.pending = self.owed(cx, pending, out)?;
       return Ok(Progress::More);
     }
@@ -1160,6 +1178,41 @@ impl<A: Answered> Upload<A> {
     })
   }
 
+  /// Whether a unit stopped at a let-go window ([`Upload::waiting`]) not yet taken.
+  fn is_waiting(&self) -> bool {
+    let waiting = self.waiting.take();
+    self.waiting.set(waiting);
+    waiting.is_some()
+  }
+
+  /// The let-go window the stream's last turn stopped at, its unit kept to be taken again once the window is brought
+  /// back (goal 93 item 2a; A-864 piece 2): taken, so the next turn reads on. None where the turn met none.
+  pub fn waiting(&self) -> Option<packed::Waited> {
+    self.waiting.take()
+  }
+
+  /// Where the stream's next turn begins to read a pushed pack (A-864 piece 2, a turn's windows brought back ahead of
+  /// it): the pack, its length and the offset, from the copy under way or the loose stage's next object in its order;
+  /// the stage reads each pack front to back from there. None where it reads no pack next.
+  pub fn reading_next(&self) -> Option<packed::Waited> {
+    if let Some(Pending::Copy {
+      content, len, from, ..
+    }) = &self.pending
+    {
+      return Some(packed::Waited {
+        pack: *content,
+        len: *len,
+        offset: *from,
+      });
+    }
+    let Stage::Loose { from } = self.stage else {
+      return None;
+    };
+    let (pack, offset, _) = *self.order.get(usize::try_from(from).ok()?)?;
+    let (pack, len) = *self.pack_lens.get(usize::try_from(pack).ok()?)?;
+    Some(packed::Waited { pack, len, offset })
+  }
+
   /// One unit of the loose stage's order (A-864's piece 1; main 01a20182's ruling of 2026-11-22): where the next object
   /// no part covered lies read from its row, the object noted by its pack and offset there, or last by its position for
   /// one held whole; with none left, the order sorted, so the loose stage reads each pack's entries in the pack's own
@@ -1178,7 +1231,10 @@ impl<A: Answered> Upload<A> {
     let key = match stored {
       StoredAt::InPack(place) => {
         let packs = to_u64(self.packs.len());
-        let pack = *self.packs.entry(place.pack).or_insert(packs);
+        let pack = *self.packs.entry(place.pack).or_insert_with(|| {
+          self.pack_lens.push((place.pack, place.len));
+          packs
+        });
         (pack, place.offset, position)
       }
       StoredAt::Whole(_) => (u64::MAX, position, position),
@@ -1216,6 +1272,20 @@ impl<A: Answered> Upload<A> {
       }
     };
     let (id, row, stored) = cx.repository.stored_at(cx.store, position)?;
+    // A unit whose pushed entry lies in a let-go window stops before it writes or keeps anything, to be taken again.
+    if let (StoredAt::InPack(place), Some(packed)) = (stored, row.pack)
+      && let Some(waited) = away_from(
+        cx.store,
+        (place.pack, place.len),
+        (place.offset, place.offset.saturating_add(packed.len)),
+      )
+    {
+      if matches!(next, Stage::Loose { from: after } if after == from) {
+        self.ahead.push(position);
+      }
+      self.waiting.set(Some(waited));
+      return Ok(Stage::Loose { from });
+    }
     cx.admission
       .charge_items::<(u64, u64)>(1)
       .map_err(|_| StoreRefused::PackTooLarge)?;
@@ -2167,4 +2237,20 @@ fn entry_refused(refusal: entry::Refusal) -> StoreRefused {
 
 fn to_u64(len: usize) -> u64 {
   u64::try_from(len).unwrap_or(u64::MAX)
+}
+
+/// The first let-go window of the `len`-byte pack `pack` that bytes `from` to `to` lie in (goal 93 item 2a; A-864 piece
+/// 2): what a unit reading them waits for; none where every window of them is held.
+fn away_from(
+  store: &ContentStore,
+  (pack, len): (ContentId, u64),
+  (from, to): (u64, u64),
+) -> Option<packed::Waited> {
+  let window = to_u64(store.window()).max(1);
+  let first = from.checked_div(window)?;
+  let last = to.saturating_sub(1).max(from).checked_div(window)?;
+  (first..=last)
+    .map(|index| index.saturating_mul(window).max(from))
+    .find(|offset| store.away_window(&pack, len, *offset).is_some())
+    .map(|offset| packed::Waited { pack, len, offset })
 }

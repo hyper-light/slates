@@ -107,6 +107,18 @@ impl Streamed {
   pub fn counters(&self) -> UploadCounters {
     self.upload.counters()
   }
+
+  /// Where the stream's next turn begins to read a pushed pack, and the let-go window its last turn stopped at, taken
+  /// (A-864 piece 2, `store::Upload::reading_next` and `store::Upload::waiting`): what its driver brings back before
+  /// the next turn.
+  pub fn pack_reads(
+    &self,
+  ) -> (
+    Option<crate::store::packed::Waited>,
+    Option<crate::store::packed::Waited>,
+  ) {
+    (self.upload.reading_next(), self.upload.waiting())
+  }
 }
 
 /// A-639's stream as the service's [`PackSource`]: each turn on the owner's clock, at its exchange (what a saved byte

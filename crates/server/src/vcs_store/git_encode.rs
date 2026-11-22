@@ -134,11 +134,35 @@ pub(crate) enum Turned {
 }
 
 /// One turn of repository `id`'s encoding (the module doc), within the shard's quantum on its clock.
+impl super::VcsStores {
+  /// The let-go window repository `id`'s encoding last stopped at, taken (A-864 piece 2's encoding side): what its
+  /// driver brings back before the next turn.
+  pub(crate) fn stopped_encoding(
+    &self,
+    id: RepositoryId,
+  ) -> Option<slates_git::store::packed::Waited> {
+    self
+      .encodings
+      .0
+      .get(&id)
+      .and_then(|(encoding, _)| encoding.waiting())
+  }
+}
+
 pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Turned {
   // A-614 amended: a version's D(k), which its fragments are encoded from, derived first where it is not known, so an
   // encoding turned by any path (a fetch's wait, the task behind it) never meets a version left for its first reader.
-  if super::git_derive::turn(state, id) == super::git_derive::Turned::More {
-    return Turned::More;
+  match super::git_derive::turn(state, id) {
+    super::git_derive::Turned::More => return Turned::More,
+    // A derivation's read met a window let go: kept on the repository for the encoding's driver to bring back
+    // (`Repository::waiting`, `read_through::bring_back`), the turn answered not done.
+    super::git_derive::Turned::Waiting(waited) => {
+      if let Some((_, store)) = state.vcs_stores.git_ref(id) {
+        store.repository.wait_for(waited);
+      }
+      return Turned::More;
+    }
+    super::git_derive::Turned::Idle => {}
   }
   let began = slates_rt::futures::now_ns();
   let (turned, kept) = turn_uncounted(state, id);
@@ -224,6 +248,8 @@ fn turn_lent(
             quantum_ns,
           },
         ) {
+          // A-864 piece 2: a unit stopped at a let-go window ends the turn; its driver brings the window back.
+          Ok(Progress::More) if encoding.stopped() => break Ok(Progress::More),
           Ok(Progress::More) => {}
           other => break other,
         }
@@ -445,6 +471,8 @@ fn ahead_allowed(state: &mut ShardState, id: RepositoryId) -> bool {
 /// fragments past its learned grant given back by §4.11's cost model ([`relieve`]); counted [`GIVEN_BACK_IDLE`]. A
 /// repository with no grant learned yet keeps its fragments: nothing tells what they are worth.
 pub(crate) fn give_back_idle(state: &mut ShardState, id: RepositoryId) {
+  // Goal 93 item 2b: the landed packs it owes a let-go, now that no fetch of it is answered (`vcs_store::let_go_owed`).
+  super::let_go_owed(state, id);
   let under_way = state
     .vcs_stores
     .encodings
@@ -479,8 +507,6 @@ pub(crate) fn ahead_under_way(state: &ShardState, id: RepositoryId) -> bool {
 /// counted [`AHEAD_STOPPED`], and its repository has no fetch answered now, what it holds is given back
 /// ([`give_back_idle`]). Returns at once where the shard's state is not lent.
 async fn encode_ahead(id: RepositoryId) {
-  // Goal 93 item 2a: the packs the encoding reads made resident first.
-  super::upload::resident(id).await;
   loop {
     let turned = crate::state::with_state_counted(|state| {
       if !ahead_allowed(state, id) {
@@ -513,8 +539,6 @@ pub(crate) async fn encode_for_fetch(id: RepositoryId) {
 /// [`encode_for_fetch`] with the wait `wait_ns` long: whether the encoding was idle when it returned.
 pub(crate) async fn encode_within(id: RepositoryId, wait_ns: u64) -> bool {
   let began = slates_rt::futures::now_ns();
-  // Goal 93 item 2a: the packs the encoding reads made resident first.
-  super::upload::resident(id).await;
   loop {
     match crate::state::with_state_counted(|state| turn(state, id)) {
       Some(Turned::More) if slates_rt::futures::now_ns().saturating_sub(began) >= wait_ns => {

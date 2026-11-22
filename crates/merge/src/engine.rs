@@ -5733,6 +5733,17 @@ impl Green {
     self.commit_judgment(judgment)
   }
 
+  /// [`Green::submit_resolved`] for a work whose named runs are read (A-760): judged by [`Green::judge_named`], so each
+  /// run's buffer is taken from `inc` into the verdict and made its file with no copy, then committed at once. `inc`
+  /// keeps its names, its runs' bytes now the green's.
+  pub fn submit_named(
+    &mut self,
+    inc: &mut Increment,
+  ) -> (Outcome, Option<Vec<crate::chain_entry::Applied>>) {
+    let judgment = self.judge_named(inc);
+    self.commit_judgment(judgment)
+  }
+
   /// [`Green::submit_resolved`] for a verdict computed on another copy of this green (A-658 part 3b; A-697 part c: a
   /// holder's replica computed it, and its owner takes it by position): judged by [`Green::judge_computed`], then
   /// committed at once at the head it was judged at, so the outcome and what the chain records equal what

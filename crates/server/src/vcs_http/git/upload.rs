@@ -110,10 +110,30 @@ pub(crate) trait StoreLender {
   /// nothing.
   fn paced(&mut self, _taught: (u64, u64)) {}
 
+  /// Where an answer's `pack` reads next and the let-go window its last turn stopped at (A-864 piece 2): none by
+  /// default, for a source that reads no let-go window.
+  fn pack_reads(_pack: &<Self::Packs as PackSource>::Pack) -> PackReads {
+    PackReads::default()
+  }
+
+  /// Brings back, before an answer's next turn, the let-go window its last turn stopped at and those its next turn
+  /// reads first (A-864 piece 2). Nothing by default.
+  async fn read_ahead(&mut self, _reads: PackReads) {}
+
   /// Makes repository `id`'s store ready for a fetch's answer before it is made (A-718): the shard's lender encodes every
   /// version not yet encoded as its fragments, a turn at a time, yielding between turns, so the answer copies them. A
   /// lender whose store needs nothing made does nothing.
   async fn encode(&mut self, _id: RepositoryId) {}
+}
+
+/// Where an answer's pack reads next and the let-go window its last turn stopped at (A-864 piece 2,
+/// `slates_git::upload::Streamed::pack_reads`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PackReads {
+  /// Where its next turn begins to read a pushed pack.
+  pub(crate) next: Option<slates_git::store::packed::Waited>,
+  /// The let-go window its last turn stopped at.
+  pub(crate) stopped: Option<slates_git::store::packed::Waited>,
 }
 
 /// git's services with upload-pack served from the stores `lender` lends, each request admitted the room its stores'
@@ -298,6 +318,10 @@ impl<L: StoreLender> Exchange for Upload<L> {
     let Some(made) = answer.as_mut() else {
       return Err(Failed(Status::INTERNAL_SERVER_ERROR));
     };
+    // A-864 piece 2: the windows the next turn reads brought back first, off the turn, so it never meets one let go.
+    if let Some(pack) = made.pack_source() {
+      lender.read_ahead(L::pack_reads(pack)).await;
+    }
     let before = out.len();
     let step = |served: &Served<'_>, packs: &mut L::Packs| {
       let mut spent = packs.turn();

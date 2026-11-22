@@ -7948,6 +7948,90 @@ mod tests {
     );
   }
 
+  /// Goal 93 item 2b(a) (main 01a20182's ruling of 2026-11-22 07:33: a region hold is a landed window's pin, and nothing
+  /// tested it across a restart). Do: on a store-backed daemon, hold a window for the region on its shard
+  /// (`homes::keep_for_region`) and publish the shard's image; stop the daemon and start its successor over the same
+  /// segment; on the shard, mark the window landed and ask to let it go landed, among this shard and a second whose
+  /// rendezvous ranks the window's home there (so only the restored region hold can pin it). Expect: the region hold
+  /// taken back (none refused), and the let-go refused `Pinned { by: "homes" }`, the window still held. Failing first:
+  /// a restore that skipped the hold would leave the window unpinned, let go, its bytes lost to the region's readers.
+  #[test]
+  fn t_goal93_a_region_held_window_stays_pinned_across_a_restart() {
+    use slates_anchor::AnchorSegment;
+    let store = crate::test_store::TestStore::start("region-pin");
+    let profile = test_profile();
+    let instance = format!("region-pin-{}", std::process::id());
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    config.vcs_disk = Some(store.handle());
+    let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
+      .unwrap()
+      .with_content(&super::content_name_of(&instance), config.content_bytes())
+      .unwrap();
+    let rendezvous = slates_ipc::HeldRendezvous::hold(&instance).unwrap();
+    let source = || {
+      let (handoff, len) = segment.handoff().unwrap();
+      super::SegmentSource::Handoff {
+        handoff,
+        len,
+        content: segment.content_handoff().unwrap(),
+        rendezvous: rendezvous.adoption(),
+      }
+    };
+    let bytes = b"a window held for the region, pinned across a restart".to_vec();
+    let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
+    first.bootstrap(true).unwrap();
+    let shard = first.shards.first().copied();
+    let kept_bytes = bytes.clone();
+    let identity = first
+      .observe(shard, move |state| {
+        let (identity, _) = crate::vcs_store::homes::keep_for_region(state, &kept_bytes).unwrap();
+        crate::verbs::publish_shard(state).unwrap();
+        identity
+      })
+      .unwrap();
+    first.stop();
+    let second = super::Daemon::start(&profile, config, source()).unwrap();
+    let shard = second.shards.first().copied();
+    let answered = second
+      .observe(shard, move |state| {
+        let here = state.shard;
+        // A second shard whose rendezvous ranks the window's home there: only the region hold can pin it.
+        let shards = (1..200u16)
+          .map(|other| vec![here, here.wrapping_add(other)])
+          .find(|shards| crate::vcs_store::homes::home_of(shards, &identity) != Some(here))
+          .unwrap();
+        // The content store made by its first use, as a home's read makes it (`homes::read_here`): the restore of
+        // the region holds the image carried runs there.
+        let window = state.store.content.chunk_bytes();
+        state.vcs_stores.content_made(window).unwrap();
+        let pin = crate::vcs_store::landed_pin(here, &shards, &identity);
+        let refused = crate::vcs_store::within_budget(state, 0, |stores| {
+          let content = stores.content_mut()?;
+          content.mark_landed(&identity);
+          Some((
+            content.let_go_landed(&identity, pin),
+            content.is_away(&identity),
+          ))
+        });
+        let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+        (
+          refused,
+          count(crate::vcs_store::REGION_HOLDS_RESTORED),
+          count(crate::vcs_store::REGION_HOLDS_UNRESTORED),
+        )
+      })
+      .unwrap();
+    second.stop();
+    let (refused, restored, unrestored) = answered;
+    assert_eq!(unrestored, 0, "no region hold refused at the restore");
+    assert!(restored >= 1, "the region hold taken back");
+    assert_eq!(
+      refused,
+      Some((Err(slates_vcs::LetGoRefused::Pinned { by: "homes" }), false)),
+      "the region-held window pinned after the restart"
+    );
+  }
+
   /// A-767 C5 (git onto the changeset store; main's order of 2026-11-20 ~21:20: "red first: a stock git push lands as
   /// one changeset, and a daemon restarted with kill -9 replays it"). Do: on a daemon over a retained anchor segment
   /// holding a store (the one shared test store), create a git repository and push the fixtures' `create` as stock git
