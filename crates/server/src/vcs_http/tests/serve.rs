@@ -807,6 +807,8 @@ fn a859_a_reply_to_a_client_that_reads_late_waits_for_it_and_the_edge_hears_each
   let (read, _) = served(TWO_SEATS, None, |address| {
     let mut stream = connect(address);
     stream.write_all(&post(LARGE, true)).expect("the request");
+    // The client reads late on purpose, so the edge's writes meet a full socket; the edge under test waits on its drivers.
+    #[allow(clippy::disallowed_methods)]
     std::thread::sleep(Duration::from_nanos(MOMENT_NS));
     read_until(&mut stream, LAST_CHUNK)
   });

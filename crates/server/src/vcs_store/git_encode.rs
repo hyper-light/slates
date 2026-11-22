@@ -474,6 +474,8 @@ pub(crate) fn ahead_under_way(state: &ShardState, id: RepositoryId) -> bool {
 /// counted [`AHEAD_STOPPED`], and its repository has no fetch answered now, what it holds is given back
 /// ([`give_back_idle`]). Returns at once where the shard's state is not lent.
 async fn encode_ahead(id: RepositoryId) {
+  // Goal 93 item 2a: the packs the encoding reads made resident first.
+  super::upload::resident(id).await;
   loop {
     let turned = crate::state::with_state_counted(|state| {
       if !ahead_allowed(state, id) {
@@ -486,7 +488,12 @@ async fn encode_ahead(id: RepositoryId) {
       turn(state, id)
     });
     match turned {
-      Some(Turned::More) => slates_rt::futures::yield_now().await,
+      Some(Turned::More) => {
+        // A window a turn's read met let go is brought back before the next turn reads it again.
+        if !super::upload::brought_back_waited(id).await {
+          slates_rt::futures::yield_now().await;
+        }
+      }
       Some(Turned::Idle) | None => return,
     }
   }
@@ -501,13 +508,20 @@ pub(crate) async fn encode_for_fetch(id: RepositoryId) {
 /// [`encode_for_fetch`] with the wait `wait_ns` long: whether the encoding was idle when it returned.
 pub(crate) async fn encode_within(id: RepositoryId, wait_ns: u64) -> bool {
   let began = slates_rt::futures::now_ns();
+  // Goal 93 item 2a: the packs the encoding reads made resident first.
+  super::upload::resident(id).await;
   loop {
     match crate::state::with_state_counted(|state| turn(state, id)) {
       Some(Turned::More) if slates_rt::futures::now_ns().saturating_sub(began) >= wait_ns => {
         let _ = crate::state::with_state_counted(|state| encode_behind(state, id));
         return false;
       }
-      Some(Turned::More) => slates_rt::futures::yield_now().await,
+      Some(Turned::More) => {
+        // A window a turn's read met let go is brought back before the next turn reads it again.
+        if !super::upload::brought_back_waited(id).await {
+          slates_rt::futures::yield_now().await;
+        }
+      }
       Some(Turned::Idle) | None => return true,
     }
   }
