@@ -1657,6 +1657,7 @@ fn a_repository_policys_hook_lets_stock_svn_change_a_revision_property() {
 
 /// Sends one HTTP/1.1 request to the edge at `port` and reads its whole answer: `method` at `path`, a bearer `token`,
 /// the request's other `headers` and `body`; the answer's text.
+#[cfg(unix)]
 fn edge_request(
   port: u16,
   (method, path): (&str, &str),
@@ -1805,6 +1806,7 @@ fn a_failing_test_lets_its_hook_view_go_before_its_daemon() {
 /// commits as a dump were the repository whose hooks the owner shard's one liveness budget refused (w-interop's svn
 /// matrix, release, Mac Studio, 2026-11-20: "its owner shard did not answer in time"), and a debug build lays each out
 /// slower than that release did.
+#[cfg(unix)]
 const MANY_REVISIONS: u64 = 2_000;
 
 /// Shape: the files of the one directory every revision of [`many_revisions_dump`] changes a file of: as many as
@@ -1812,10 +1814,12 @@ const MANY_REVISIONS: u64 = 2_000;
 /// FSFS view carries the listing of each directory on a changed path, so each revision costs the view as much as this
 /// listing; a history of one file lays 2,000 revisions out inside a liveness budget even in a debug build (this test
 /// with one file passed on main a51023f57, 22.8 s).
+#[cfg(unix)]
 const MANY_REVISIONS_FILES: u64 = 4_872;
 
 /// A dump of `revisions` revisions under `trunk/`: the first adds [`MANY_REVISIONS_FILES`] files, each later one
 /// changes one of them: the history a hook's first view must lay out a revision at a time.
+#[cfg(unix)]
 fn many_revisions_dump(revisions: u64) -> Vec<u8> {
   let props = |log: &str| format!("K 7\nsvn:log\nV {}\n{log}\nPROPS-END\n", log.len());
   let file = |path: String, action: &str, body: &str| {
