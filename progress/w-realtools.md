@@ -94,3 +94,4 @@ Brief: briefs/w-realtools.md. Clone: ~/slates-work/w-realtools (object store), w
   ~/.cache/w-realtools-93-target.noindex on adas-macbook-pro-2, Adas-Mac-Studio-2 and adas-mac-studio.local-2 (debug
   targets, delete freely); ~/.cache/w-realtools-clone on adas-macbook-pro-2; on Studio-4 the shallow checkout
   ~/slates-work/w-realtools-93 (210 MB) and this state folder.
+- 21:16 PST: main is now kiln agent 01a201824d307ecc9e135c64ae3cb848 (01a1ff2e gone). Nothing waiting on main outside my inbox notes; still in goal 93's reserve, no runs.
