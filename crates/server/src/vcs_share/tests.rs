@@ -244,3 +244,82 @@ fn t_a724_a_repositorys_claim_follows_its_learned_demand_not_its_lifetime_mean()
     drop(pushing);
   });
 }
+
+/// Feeds `request` to a push of `repository`'s by its owner, piece by piece as an edge does: the first refusal, if any.
+fn first_refusal(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  request: &[u8],
+) -> Option<crate::git_push::PushFailed> {
+  let mut advertised = Vec::new();
+  let mut push = crate::git_push::ReceivePack::start(
+    state,
+    (&owner(), repository),
+    true,
+    &mut advertised,
+    crate::git_push::Unpresented,
+  )
+  .expect("started");
+  for piece in request.chunks(64) {
+    if let Err(refused) = push.input(state, piece) {
+      return Some(refused);
+    }
+  }
+  if let Err(refused) = push.end(state) {
+    return Some(refused);
+  }
+  let mut answer = Vec::new();
+  loop {
+    match push.answer_step(state, &mut answer) {
+      Err(refused) => return Some(refused),
+      Ok(crate::git_push::Answering::Answered(_)) => return None,
+      Ok(crate::git_push::Answering::Turned) => {
+        crate::git_push::tests::carry_blocking(state, &mut push)
+      }
+      #[cfg(unix)]
+      Ok(step @ crate::git_push::Answering::Hook(_)) => panic!("no hook: {step:?}"),
+    }
+  }
+}
+
+/// A-724 piece 3b (§4.17.5 "Admission and backpressure": past its share, a work is refused typed and retryable, naming
+/// the share). Do: on a daemon whose partition's snapshot slot has 461 bytes of room (a shard's memory is too large to
+/// divide this small in a test, and the slot is divided with it, A-724 piece 8a), push stock git's first fixture into a
+/// toy repository while a monorepo pushes, so the toy's room is its share of the slot (230 bytes), then again once the
+/// monorepo's push has ended. Expect: beside the monorepo, refused past its share, typed so, its words naming the share
+/// and what it holds and saying a retry may pass once others' pushes end, never git's words for a push too large for the
+/// server; alone, not refused for a share.
+#[test]
+fn t_a724_a_push_past_its_share_is_refused_retryable_naming_the_share() {
+  crate::test_store::audit_on_stored_shard_configured(
+    "vcs_share",
+    |state| {
+      let monorepo = git_repository(state, "monorepo");
+      let toy = git_repository(state, "toy");
+      let request = crate::git_push::tests::chain()[0].0.request;
+      let pushing = Live::begin(monorepo);
+      assert!(matches!(room(state, toy).bound, Bound::Share { .. }));
+      let refused = first_refusal(state, toy, request).expect("refused past its share");
+      assert!(
+        matches!(refused, crate::git_push::PushFailed::PastShare { .. }),
+        "typed as past its share: {refused:?}"
+      );
+      let words = crate::git_push::words::failed(&refused, "toy");
+      assert!(
+        words.contains("share") && words.contains("retry"),
+        "a share's refusal names the share and says a retry may pass: {words:?}"
+      );
+      drop(pushing);
+      let alone = first_refusal(state, toy, request);
+      assert!(
+        !matches!(alone, Some(crate::git_push::PushFailed::PastShare { .. })),
+        "alone, not refused for a share: {alone:?}"
+      );
+    },
+    |config| {
+      // The slot shrunk so its room, divided, binds a push of a few hundred bytes (6,400 bytes less the partition's
+      // state leaves 461 here).
+      config.geometry.snapshot_bytes = 6_400;
+    },
+  );
+}
