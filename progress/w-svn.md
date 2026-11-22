@@ -496,3 +496,11 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
   stock_svn_over_httpv2_answers_as_stock_svnserve_byte_for_byte 1/1 in 33.54 s; the guard left 0 views mounted.
 - Recorded in GAPS in 0235c0134.
 - Waiting on main: r12's finding (2) reading. Item 2 waits on w-shared's gauge names.
+
+## 2026-11-22 ~04:55 PST: r12 still red; item 2 landed
+- r12 (main, at 1721d8c52): 181,750,880 B not given back against 155,539,920 B live; r4 had 150,287,136.
+- 8df631d3c: `an_import_measured` prints w-shared's `mem.gauge.*` rows summed over the shards at every reading, and
+  the footprint past system live + mapped resident + arena. Red first; svn_interop `the_` tests 7/7.
+- Raised with main: the gate's "live" is the heap's in_use growth, which counts untouched bytes (1.30 GB at a 44 MB
+  footprint). The gauges will show whether it overstates live.
+- Waiting on main: r13's reading, then the node_record streaming cut if the holders point there.
