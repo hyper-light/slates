@@ -237,6 +237,12 @@ impl Drop for GitGeneration {
       release_fork(state, id, stamp);
       let now = slates_rt::futures::now_ns();
       state.vcs_usage.answered(&id, Work::Fetch, written, now);
+      // A-856: the repository's last fetch ending (this one is still counted live until its guard drops after this),
+      // with no task making its encoding ahead (which gives back as it stops), its derived values past its learned
+      // grant are given back.
+      if crate::vcs_share::fetches_live(id) <= 1 && !super::git_encode::ahead_under_way(state, id) {
+        super::git_encode::give_back_idle(state, id);
+      }
     })
     .unwrap_or_default();
   }
