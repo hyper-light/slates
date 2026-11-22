@@ -1,0 +1,1 @@
+w-forming, 2026-11-21 21:20 PST: vcs_concurrency (7f1e5a13e) is GREEN on both halves per 01a1ff2e's kiln messages (svn 16:22, big Studio b61cdf8d1, 292 s; hg 17:17, de3fd468a with w-hg's 521fe3689, N=10 50, 330 s); I'm in goal 93's reserve with no runs, and 85b C3 and P4 wait on main's rounds in run-requests.md (P4 closes on A-827's release A/B).
