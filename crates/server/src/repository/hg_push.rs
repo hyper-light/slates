@@ -1311,7 +1311,38 @@ pub(crate) struct Forked {
 /// shard's step quantum and a yield between, so a push of any size never holds the shard past a step and pushes to one
 /// repository are taken side by side; then, in one step, judged over the view as it is at landing and landed. What it
 /// came to, as 7.2 answers it before a transport frames the answer; none when no served view could be made.
+///
+/// The push is counted as its repository's intake (A-724 piece 3c, §4.17.5): live among the shard's intakes from its
+/// start until it ends however it ends (`crate::vcs_share::Live`, so other repositories' rooms are divided while it
+/// runs), begun on the repository's usage row with its principal, and answered there with its bundle's bytes, learned
+/// as the repository's next intake (`slates_vcs::Learned`), once it comes to an answer.
 pub(crate) async fn unbundle(
+  repository: RepositoryId,
+  pushing: Pushing<'_>,
+  room: &mut Admission,
+) -> Option<PushOutcome> {
+  let (principal, _, bundle) = pushing;
+  let _live = crate::vcs_share::Live::begin(repository);
+  let _ = crate::state::with_state(|state| {
+    let now = slates_rt::futures::now_ns();
+    state
+      .vcs_usage
+      .begun(&repository, principal, slates_vcs::Work::Intake, now);
+  });
+  let outcome = unbundled(repository, pushing, room).await;
+  if outcome.is_some() {
+    let _ = crate::state::with_state(|state| {
+      let now = slates_rt::futures::now_ns();
+      state
+        .vcs_usage
+        .answered(&repository, slates_vcs::Work::Intake, lend_of(bundle), now);
+    });
+  }
+  outcome
+}
+
+/// [`unbundle`]'s push, uncounted.
+async fn unbundled(
   repository: RepositoryId,
   (principal, heads, bundle): Pushing<'_>,
   room: &mut Admission,

@@ -330,6 +330,23 @@
 > Owed: the sweeps at N=12 on each platform with each client (main's run request), each failure a red test to its
 > server's owner.
 >
+> **An index merge claimed the whole arena pool for its shard, and the other shard admitted nothing (goal 93
+> correctness; main's round of 2026-11-21 16:18: `vcs_concurrency::concurrent_stock_hg_pushes_hold` at N=10, the lone
+> seed push refused "unreadable request: PastAdmission { asked: 15, left: 0 }"). FIXED (w-hg).**
+> - Cause, logged: the N=10 repository lives on shard 1, whose `Store::admittable` was 0 (capacity 0, the pool's
+>   claimable 0), while shard 0 held all 45.8 GB. `vcs_store::index_upkeep::slice` lent each merge step
+>   `within_budget(state, state.store.admittable())`, and a lend grows the arena from the pool the shards share
+>   (`Store::make_room`) by what it is lent: one merge step grew shard 0's arena by 28.6 GB, every byte the pool had. No
+>   push leaked; the admission was right to refuse a shard with nothing.
+> - Fix: a merge step is lent what it can put, its tables cut so far (`Merge::cut_bytes`; only its last step puts them,
+>   the steps before cut a table into memory).
+> - Held by `index_upkeep::tests::a_{mercurial,git}_index_built_whole_is_merged_a_table_a_step_into_one_run` (red
+>   before: "a merge claimed the pool: grown 11453071360 of 11453071360"; non-vacuity, the pool had room to claim), and
+>   by use the concurrency round at N=2 then 10 (debug, MacBook).
+> - Siblings, git's (main routes): `git_hooks.rs` (`within_budget(state, room, ..)` for a push's seal) and
+>   `vcs_store.rs`'s `restage_turn` (`stage_room`) and `SealingPush::turn` (`self.room`) lend rooms that may be the
+>   whole admittable; each grows the arena by it. A lend should name its step's bytes.
+
 > **Goal 93 perf, hg serve (2026-11-21, w-perf; main's order 00:22 and ruling 01:05).** Found by a profile of a
 > one-changeset pull of Mercurial's history (24.95 s) and a stream clone (288 s): (1) every lookup in a
 > `slates_vcs::Index` walked every run, since the learned merge had no caller (155 runs after hg-src's import, 123 visited
@@ -940,8 +957,9 @@
 > decayed by its own rhythm of intakes) in place of the lifetime mean. Owed in piece 2: per-principal rates, the
 > working set's miss-ratio curve and memory by marginal utility, CPU weights, the shares published to siblings.
 > Piece 3b landed (2026-11-21): a git push past its share is refused typed (`PushFailed::PastShare`, or `PastSnapshot`
-> past the slot's room) and retryable (`503`, words naming the share). Owed in piece 3: Mercurial's and Subversion's
-> share words and live intakes, backpressure before refusal, a fetch's room as a claim.
+> past the slot's room) and retryable (`503`, words naming the share). Piece 3c landed: Mercurial's pushes counted live
+> and learned. Owed in piece 3: Mercurial's share refusal in its words, Subversion's intakes live and its words,
+> backpressure before refusal, a fetch's room as a claim.
 > In flight, paused for goal 93 (2026-11-21): run 31 (cap 3, Studio-2, 9865bb832) found shard-mates took 4.5 s of the
 > busiest repository's 41.3 s span and its shard ran steps 23.2 s of it: its own three pushes of one agent shared one
 > turn. The fix (a turn an agent, spare turns taken; red first) is on branch agents/w-balance-turn-weights, 928df7d1b,
