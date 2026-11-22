@@ -77,6 +77,7 @@ use slates_svn::dav::commit::{
 };
 use slates_svn::dav::locking::{self, HttpAnswer, LockHttp, UnlockHttp};
 use slates_svn::dav::response::MergeResponse;
+use slates_svn::dav::revprops;
 use slates_svn::dav::site::{
   self, Answer as SiteAnswer, Budget, Headers, Quantum, Report, ReportProgress, Request, Served,
 };
@@ -234,6 +235,22 @@ pub(crate) trait SvnStores {
     ) -> (Vec<LockEntry>, HttpAnswer),
   ) -> Option<Result<HttpAnswer, Uncommitted>> {
     let _unserved = (id, principal, judge);
+    None
+  }
+
+  /// Lands `change`, a revision property change its pre-revprop-change hook allowed, on repository `id` by `principal`
+  /// through the owner's step (A-702 part 2's landing, as ra_svn's change lands): the landing turn taken, the
+  /// revision's properties judged afresh over the records (`slates_svn::serve::changed_properties`: a revision not
+  /// held, a held value other than the one expected) and landed as `Record::RevisionProperties` with no wait between,
+  /// so no other change lands in between. The judgment's or the landing's refusal as its chain; none where this lender
+  /// serves no changes or does not hold `id`'s records.
+  async fn change_revision_property(
+    &mut self,
+    id: RepositoryId,
+    principal: &Principal,
+    change: &slates_svn::serve::RevisionPropertyChange,
+  ) -> Option<Result<(), Vec<(u32, String)>>> {
+    let _unserved = (id, principal, change);
     None
   }
 
@@ -805,6 +822,12 @@ const HTTP_CONFLICT: u16 = 409;
 /// Not Implemented.
 /// Format: RFC 9110 §15.6.2.
 const HTTP_NOT_IMPLEMENTED: u16 = 501;
+/// Service Unavailable: a repository whose store this shard no longer holds (module documentation, step 6).
+/// Format: RFC 9110 §15.6.4.
+const HTTP_SERVICE_UNAVAILABLE: u16 = 503;
+/// A request body `mod_dav_svn` cannot read (`SVN_ERR_DAV_MALFORMED_DATA`).
+/// Format: `svn_error_codes.h`, the DAV category's start, 175,000, plus 9.
+const DAV_MALFORMED_DATA: u32 = 175_009;
 /// The words a commit is refused with at a point where the repository configures a hook, which this site does not run
 /// yet, as the svn+ssh tunnel words it.
 const HOOK_NOT_RUN_WORDS: &str = "This server does not run this repository's hooks yet";
@@ -837,6 +860,15 @@ impl<S: SvnStores> SvnExchange<S> {
     let path = self.path.clone();
     let segments: Vec<&str> = path.split('/').filter(|name| !name.is_empty()).collect();
     let method = self.method.clone();
+    // A revision property change (`deadprops.c` `save_value` on a revision resource: HTTPv2's `!svn/rev/N`, DeltaV
+    // v1's baseline `!svn/bln/N`), its hooks waited on.
+    if method.as_str() == "PROPPATCH"
+      && let [first, "rev" | "bln", revision] = segments.as_slice()
+      && *first == site::SPECIAL
+    {
+      let revision = (*revision).to_owned();
+      return Some(self.revision_proppatch(&revision, gone).await);
+    }
     if let Some(answer) = self.on_special_path(method.as_str(), &segments) {
       return Some(answer);
     }
@@ -1227,6 +1259,89 @@ impl<S: SvnStores> SvnExchange<S> {
     self.on_transaction(name, |commit, world, hooks| {
       commit.copy(world, hooks, (source, revision), &target)
     })
+  }
+
+  /// A PROPPATCH of revision `revision`'s resource (`slates_svn::dav::revprops`; `deadprops.c` `save_value`, each
+  /// property one `svn_repos_fs_change_rev_prop4`): each change in the body's order judged before its hooks as
+  /// `svnserve` judges ra_svn's (`revision_property_refused`), pre-revprop-change run with the principal as its user
+  /// (a repository with none configured refuses every change, E165006), landed through the owner's step, then
+  /// post-revprop-change with the old value; `207` with each property's `200` once all are made. A refusal is answered
+  /// as `mod_dav_svn` converts an error, the changes before it standing, as each of `mod_dav`'s is made in turn.
+  async fn revision_proppatch(&mut self, revision: &str, gone: ClientGone<'_>) -> HttpAnswer {
+    let Ok(revision) = revision.parse::<u64>() else {
+      return commit::unserved("A PROPPATCH of a revision that is no number");
+    };
+    let bounds = xml_bounds(self.request_room);
+    let changes = match revprops::revision_property_changes(revision, &self.body, &bounds) {
+      Ok(changes) => changes,
+      Err(_) => {
+        return locking::error_answer(
+          HTTP_BAD_REQUEST,
+          true,
+          DAV_MALFORMED_DATA,
+          "The PROPPATCH body could not be read",
+        );
+      }
+    };
+    let user = crate::lfs::owner_name(&self.principal);
+    let room = to_usize(self.request_room);
+    for change in &changes {
+      let judged = self.stores.lend(self.repository, &self.principal, |lent| {
+        match slates_svn::serve::revision_property_refused(lent.index, lent.rules, change) {
+          Some(chain) => Err(chain),
+          None => Ok(slates_svn::serve::pre_revprop_change(
+            lent.repository,
+            change,
+            user.clone(),
+          )),
+        }
+      });
+      let (old, mut call) = match judged {
+        Some(Ok(judged)) => judged,
+        Some(Err(chain)) => return hook_refused(&chain),
+        None => return bare_status(HTTP_SERVICE_UNAVAILABLE),
+      };
+      let site = HookSite::Http(gone, &self.policy);
+      let hooked = self.hooked();
+      match crate::vcs_svn::revision_property_hook(
+        site,
+        &hooked,
+        room,
+        HookPoint::SvnPreRevpropChange,
+        &call,
+      )
+      .await
+      {
+        Some(Ok(())) => {}
+        Some(Err(chain)) => return hook_refused(&chain),
+        None => return hook_refused(&[(UNSUPPORTED_FEATURE, CLIENT_LEFT_WORDS.to_owned())]),
+      }
+      match self
+        .stores
+        .change_revision_property(self.repository, &self.principal, change)
+        .await
+      {
+        Some(Ok(())) => {}
+        Some(Err(chain)) => return hook_refused(&chain),
+        None => return bare_status(HTTP_SERVICE_UNAVAILABLE),
+      }
+      call.value = old.unwrap_or_default();
+      match crate::vcs_svn::revision_property_hook(
+        HookSite::Http(gone, &self.policy),
+        &hooked,
+        room,
+        HookPoint::SvnPostRevpropChange,
+        &call,
+      )
+      .await
+      {
+        Some(Ok(())) => {}
+        // The change stands: `svn_repos_fs_change_rev_prop4` returns post-revprop-change's failure after it.
+        Some(Err(chain)) => return hook_refused(&chain),
+        None => return hook_refused(&[(UNSUPPORTED_FEATURE, CLIENT_LEFT_WORDS.to_owned())]),
+      }
+    }
+    revprops::revision_proppatched(&changes)
   }
 
   /// A MERGE of the transaction its body names: closed, judged, landed through the owner's step, answered with the new

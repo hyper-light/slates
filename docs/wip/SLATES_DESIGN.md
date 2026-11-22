@@ -16044,7 +16044,9 @@ version (item 3.5). A change (`change-rev-prop`, `change-rev-prop2`, or PROPPATC
 repository's register (§4.17.1), ordered with the versions and replicated with them: validated as a commit's are; gated
 by pre-revprop-change, whose absence refuses every change (`E165006`, Subversion's default, notes §7); compared with
 the old value the client sent (`atomic-revprops`, `E160049` on a difference); then applied; post-revprop-change
-observes. A read sees the newest entry.
+observes. A read sees the newest entry. (Status 2026-11-21: built over ra_svn by A-702; over HTTP the same night,
+w-svn, after main's r6 red: the edge's PROPPATCH of `!svn/rev/N` or `!svn/bln/N`, `slates_svn::dav::revprops`, judged by
+the one `serve::RevisionPropertyChange` path both edges share.)
 
 *7. Locks.* Each lock is an entry of the repository's register: the path, a token (`opaquelocktoken:` and a UUID, drawn
 on the owner before the append so every holder replays the same token), the owner (the principal), a comment, and its
@@ -60545,3 +60547,39 @@ Status: built 2026-11-21, every platform.
   18,564-byte ask was refused for 10 s, admittable 0, before; admitted at once after, shard 0 counting
   `pool.want_answered`.
 - Open: demand is the shard's need now, not learned and decayed, so a shard that bursts again re-claims what it gave.
+
+### A-854 — A small increment is carried in its chain entry; only a large one is held (chain entry format 7) (2026-11-21, w-shared; main 01a20182's 23:04 PST, the A-825 load regression after d44f0166a; §4.16 "Commit", §4.8, AUD-05; A-825, A-826)
+Applied in the same change to: `crates/merge/src/chain_entry.rs` (`VERSION` 7, `encode_carrying`, `carried`, the module
+docs, the golden vectors), `crates/server/src/verbs.rs` (`increment_held`, `CARRIED_INCREMENT_MAX`, `record_accepted`,
+the chain room, the replay's read), `crates/server/src/merge_service.rs` (`carried_increment`, `entry_increment`,
+`version_inputs`, `chain_names`, the fold's size), `crates/server/src/daemon.rs`, `crates/server/src/work_home.rs` (the
+red test), GAPS.
+
+Status: built 2026-11-21, macOS arm64 (focused tests); main's load_bench A/B owed.
+- Why: format 6 holds every increment in the owner shard's content store and its entry names it. An entry is durable
+  when its append returns, a hold only once the shard's next publication commits its image, so each accept published
+  the whole shard before its entry (d44f0166a cut that to one an accept, never to none). A submit from another shard of
+  the node (`owner_judge`) had no publication of its own before A-825; with one, the accept's server p50 at 1,000
+  clients went from 0.43-0.45 ms to 356-429 ms and the machine's load from 7 to 21-35 (main's A/B, big Studio, 3
+  rounds). w-engine's two ways out were to group the publications or to make a hold durable without one. Grouping
+  leaves at least one publication on an uncontended accept's path, where A had none, so it cannot come within 10% of A.
+  The entry's own append is the durable step the accept already pays, so the second way is taken: a small increment is
+  made durable by riding in it.
+- Rule: an increment whose encoding is at most `CARRIED_INCREMENT_MAX` (1 MiB) and a 64th of the partition's green-chain
+  cap (`CARRIED_CHAIN_SHARE`, derived: a carrying chain holds at least 64 versions before its cap) is carried in its entry
+  after its inputs
+  (a present marker and the bytes), its inputs named as a held one's would be (the inputs archive's manifest identity
+  and length), so its merge record names its inputs alike. Nothing is held for it, so no publication is ordered before
+  its append, and its chain room is charged its bytes, as before format 6. A larger increment is held and published
+  first exactly as A-825 and A-826 have it. A holder's fetched increment (A-826) small enough is carried as well, read
+  from the store; the fetched copy is then named by no entry and goes at the next fold (`chain_names` counts held
+  entries only). Every reader takes a carrying entry's increment from the entry: the replay, the identities' read, a
+  version's inputs (`InputsAt::Record`) and the fold's size. A version 6 entry is refused `BadVersion`, on A-621's
+  precedent.
+- Order kept: an image still precedes a successful completion wherever the entry names held content (§4.8, AUD-05); a
+  carrying entry names nothing outside its own append.
+- Evidence: `accepted_owner_submits_cost_publications_that_do_not_grow_with_their_number` (eight submits through
+  `owner_judge`): red 8 committed publications, green 0. `a_carrying_entry_holds_its_increment_after_its_inputs` and
+  `a_held_increments_entry_encodes_to_its_golden_bytes` (format 7's two shapes, byte for byte).
+- Open: the 1 MiB bound is a judgment, not a measured crossover (a sweep across it is owed). The held path keeps its
+  whole-shard publication for increments above it.

@@ -1903,6 +1903,8 @@ fn svn_point_name(point: slates_ipc::protocol::HookPointName) -> &'static str {
     Point::SvnPostLock => "post-lock",
     Point::SvnPreUnlock => "pre-unlock",
     Point::SvnPostUnlock => "post-unlock",
+    Point::SvnPreRevpropChange => "pre-revprop-change",
+    Point::SvnPostRevpropChange => "post-revprop-change",
     _ => "other",
   }
 }
@@ -2116,6 +2118,116 @@ fn a_dav_commit_runs_its_repositorys_commit_hooks_as_mod_dav_svn_runs_them() {
   assert!(
     body.contains("<S:post-commit-err>") && body.contains("post said no"),
     "{body}"
+  );
+}
+
+/// A PROPPATCH body setting `svn:log` to `value` as ra_serf writes it (`commit.c` `create_proppatch_body`,
+/// `write_prop_xml`), with `V:old-value` naming `expected` where it is given.
+#[cfg(unix)]
+fn log_proppatch(value: &str, expected: Option<&str>) -> Vec<u8> {
+  let old = expected.map_or_else(String::new, |old| {
+    format!("<V:old-value>{old}</V:old-value>")
+  });
+  format!(
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?><D:propertyupdate xmlns:D=\"DAV:\" \
+     xmlns:V=\"http://subversion.tigris.org/xmlns/dav/\" xmlns:C=\"http://subversion.tigris.org/xmlns/custom/\" \
+     xmlns:S=\"http://subversion.tigris.org/xmlns/svn/\"><D:set><D:prop><S:log>{old}{value}</S:log></D:prop>\
+     </D:set></D:propertyupdate>"
+  )
+  .into_bytes()
+}
+
+/// main 01a20182's red of 2026-11-21 23:24 (run r6, stock svn 1.15 over HTTPv2: `svn propset --revprop --revision 3
+/// svn:log ...` refused, the edge serving no PROPPATCH on `!svn/rev/N`; `deadprops.c` `save_value` makes it through
+/// `svn_repos_fs_change_rev_prop4`). Do: on a daemon's HTTP edge, a repository whose policy runs pre- and
+/// post-revprop-change hooks that record their arguments and standard input and accept; commit revision 1 over DAV;
+/// PROPPATCH `!svn/rev/1` as ra_serf does: `svn:log` set with no expectation, then set again expecting the first value,
+/// then set expecting that first value once more. Expect: the first two `207`, the second showing the first landed; the
+/// third refused "revprop 'svn:log' has unexpected value in filesystem" (FSFS's base-value check); pre-revprop-change
+/// given REPOS, the revision, the user, the name and `M`, the new value on its standard input; post-revprop-change the
+/// old value.
+#[cfg(unix)]
+#[test]
+fn a_dav_proppatch_of_a_revision_changes_its_property_through_its_revprop_hooks() {
+  use slates_ipc::protocol::HookPointName;
+  let dir = crate::git_hooks::tests::ScratchDir::new();
+  let at = dir.path.display().to_string();
+  let pre = crate::vcs_svn::tests::hook_script(
+    &dir.path,
+    "pre-revprop-change",
+    &format!("for arg in \"$@\"; do echo \"$arg\"; done > {at}/pre.args\ncat > {at}/pre.in"),
+  );
+  let post = crate::vcs_svn::tests::hook_script(
+    &dir.path,
+    "post-revprop-change",
+    &format!("cat > {at}/post.in"),
+  );
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge serves");
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let name = svn_name_on_the_repositorys_partition();
+  create_svn_hooked(
+    &daemon,
+    &name,
+    vec![
+      (HookPointName::SvnPreRevpropChange, pre),
+      (HookPointName::SvnPostRevpropChange, post),
+    ],
+  );
+  let (_, _, merged, _) = dav_commit((port, &certificate), &name, b"hello\n");
+  let revision = format!("/{name}/!svn/rev/1");
+  let patch = |body: Vec<u8>| {
+    dav(
+      (port, &certificate),
+      ("PROPPATCH", &revision),
+      &["Content-Type: text/xml"],
+      &body,
+    )
+  };
+  let first = patch(log_proppatch("an edit", None));
+  let second = patch(log_proppatch("a second edit", Some("an edit")));
+  let stale = patch(log_proppatch("stale", Some("an edit")));
+  daemon.stop();
+  #[allow(clippy::disallowed_methods)]
+  // test code: what the hooks recorded in its own scratch directory
+  let read = |file: &str| std::fs::read_to_string(dir.path.join(file)).unwrap_or_default();
+  let repos = format!("{}/{name}", crate::vcs_svn::tests::TEST_ROOT);
+  let args: Vec<String> = read("pre.args").lines().map(str::to_owned).collect();
+  assert_eq!(
+    (merged, first.0, second.0),
+    (200, 207, 207),
+    "first: {}\nsecond: {}",
+    first.2,
+    second.2
+  );
+  assert!(
+    stale.0 >= 400
+      && stale
+        .2
+        .contains("revprop 'svn:log' has unexpected value in filesystem"),
+    "{}: {}",
+    stale.0,
+    stale.2
+  );
+  assert_eq!(
+    (
+      args.first().map(String::as_str),
+      args.get(1).map(String::as_str),
+      args.get(3).map(String::as_str),
+      args.get(4).map(String::as_str),
+      read("pre.in"),
+      read("post.in"),
+    ),
+    (
+      Some(repos.as_str()),
+      Some("1"),
+      Some("svn:log"),
+      Some("M"),
+      "stale".to_owned(),
+      "an edit".to_owned(),
+    ),
+    "pre-revprop-change {args:?}"
   );
 }
 

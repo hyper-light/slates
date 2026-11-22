@@ -3106,8 +3106,7 @@ impl Daemon {
         identities.sort_unstable();
         identities.extend(partition.green_chain(volume).iter().enumerate().filter_map(
           |(index, bytes)| {
-            let inputs = slates_merge::chain_entry::inputs(bytes).ok()?;
-            let increment = crate::merge_service::increment_of(s, volume, &inputs)?;
+            let increment = crate::merge_service::entry_increment(s, volume, bytes)?;
             slates_merge::chain_entry::decode(bytes, &increment)
               .ok()
               .map(|entry| {

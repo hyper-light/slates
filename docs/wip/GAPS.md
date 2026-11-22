@@ -77,7 +77,8 @@
 > its changeset, which A-767's log holds on disk once landed (w-store's wiring): the two carry the same content until
 > the changeset store names it, so a repository's increments are charged in RAM until their versions fold. Owed with
 > A-767's wiring: the entry naming the changeset's content where the log holds it. Also owed: the extra publication
-> before an entry's append (A-825 "Cost owed"), measured by the lane's release bench.
+> before an entry's append (A-825 "Cost owed"), measured by the lane's release bench; since A-854 paid only by an
+> increment over 1 MiB, the smaller carried in its entry.
 
 > **FIXED (w-fed-faults, 2026-11-21): a whole-file rewrite outside a recorded request was refused `Overloaded`**
 > (A-787 part 2's park, 2a498b90f). 10 server lib tests (repository, vcs_store paths and commits) failed from that
@@ -2735,7 +2736,16 @@
 > properties set and deleted, an import, the log, list, cat, proplist, blame, diff and status) over HTTPv2 and against
 > stock svnserve over FSFS, comparing each command's output with timestamps left out. Not yet run (no svn on this Mac):
 > main's run on a Studio with svn 1.15 (run-requests.md). By reading, the edge serves no PROPPATCH on `!svn/rev/N`, so
-> `svn propset --revprop` over HTTP is expected red (w-svn's, if so).
+> `svn propset --revprop` over HTTP is expected red (w-svn's, if so). RED in main 01a20182's run r6 (2026-11-21, big
+> Studio, a3e673efc: E200007 at the first `svn propset --revprop`); BUILT the same night (w-svn): the edge serves a
+> PROPPATCH of a revision resource (HTTPv2's `!svn/rev/N`, DeltaV v1's `!svn/bln/N`; `slates_svn::dav::revprops`,
+> `deadprops.c` `save_value`), each property judged as `svnserve` judges ra_svn's change (the shared
+> `slates_svn::serve::RevisionPropertyChange`), pre-revprop-change run, landed through the owner's step under the
+> landing turn, post-revprop-change with the old value, `207` with each property's `200`; ra_serf's atomic old value
+> (`V:old-value`, `V:old-value-absent`) checked against the held value. Owed: main's rerun of the differential test;
+> a refusal is answered as one `mod_dav_svn` error (the first of its chain), where `mod_dav` answers a PROPPATCH that
+> fails with a `207` whose failing property is `500` and the rest `424` (the client's words for it unchecked); HTTP
+> applies no authz write rules to a revision property change, as it applies none to a commit (`Setup::rules` none).
 > **svn replay by stock clients (w-interop, 2026-11-20; A-703):** `svn-matrix.sh` gains `svnrdump dump` and
 > `svnsync initialize/synchronize` over svn://, each compared with the dump stock svnserve 1.15.0 made of the same history
 > (`crates/svn/fixtures/replay`, `EXPECT_RDUMP`, `EXPECT_SYNC`): over the reads fixtures' repository both are
@@ -25121,7 +25131,13 @@ in what lands. Branch tips as of 2026-11-10:
 > publishes once, its verb's; `verbs::commit_settled` publishes what is still unpublished and abandons the transaction,
 > typed, when it cannot; red 3 publications for one accepted submit, green 1 (`publish.committed`,
 > `an_accepted_submit_costs_its_shard_one_publication`, macOS arm64, this Mac; the kill -9 recovery test,
-> green_checkpoint, works_off_owner and the holder submits green); main's confirming load_bench A/B owed). The checkpoint's record LANDED by name
+> green_checkpoint, works_off_owner and the holder submits green); main's confirming A/B (23:03 PST, big Studio, 1,000
+> clients, 3 rounds interleaved) found it NOT fixed: A 544020bd2 p50 0.425-0.447 ms, B a3e673efc 356.5-429.3 ms, since
+> the one publication left was still a whole-shard one on every accept's path, where A had none. A-854 (w-shared): an
+> increment up to 1 MiB is carried in its chain entry (format 7), durable with its append, so its accept publishes
+> nothing; red 8 publications for eight `owner_judge` accepts, green 0
+> (`accepted_owner_submits_cost_publications_that_do_not_grow_with_their_number`); main's A/B owed, done when B's p50 is
+> within 10% of A's in every round). The checkpoint's record LANDED by name
 > (goal 93's, main's 15:00: a 1 GiB green's was 650-1,063 ms in one step, record 527 ms): held in the owner's content
 > store a chunk a quantum, published, recorded as `CheckpointRef` (layout 16). OWED, piece 2: its build and encoding
 > are still one step (52 + 71 ms at 1 GiB; 5.7 + 9.5 ms at load_bench's 49 MB), inside the watchdog's 1 s window.

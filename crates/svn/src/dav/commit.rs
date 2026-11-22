@@ -1141,7 +1141,7 @@ fn property_changes(body: &[u8], bounds: &Bounds) -> Result<PropertyChanges, Dav
 }
 
 /// A property element's Subversion name; none for a namespace Subversion does not keep properties in.
-fn property_name(property: &Element) -> Option<Vec<u8>> {
+pub(super) fn property_name(property: &Element) -> Option<Vec<u8>> {
   match property.namespace.as_str() {
     SVN_PROPS => Some(format!("{SVN_PREFIX}{}", property.name).into_bytes()),
     CUSTOM_PROPS => Some(property.name.clone().into_bytes()),
@@ -1160,7 +1160,7 @@ fn property_value(property: &Element) -> Option<Vec<u8>> {
 }
 
 /// `207` with each changed property's `200`, as `mod_dav` answers a PROPPATCH that succeeds whole.
-fn proppatched(changes: &[(Vec<u8>, Option<Vec<u8>>)]) -> HttpAnswer {
+pub(super) fn proppatched(changes: &[(Vec<u8>, Option<Vec<u8>>)]) -> HttpAnswer {
   let mut body = String::from(
     "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:multistatus xmlns:D=\"DAV:\" xmlns:ns1=\"",
   );
@@ -1193,7 +1193,7 @@ const BASE64_BITS: u32 = 6;
 
 /// `text` decoded from base64 (RFC 4648 §4, whitespace skipped, as `svn_base64_decode_string` reads it); none where
 /// it holds a byte outside the alphabet.
-fn base64_decode(text: &str) -> Option<Vec<u8>> {
+pub(super) fn base64_decode(text: &str) -> Option<Vec<u8>> {
   let mut out = Vec::new();
   let mut buffer = 0u32;
   let mut held = 0u32;

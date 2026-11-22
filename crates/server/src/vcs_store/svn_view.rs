@@ -222,6 +222,32 @@ impl SvnStores for ServedRecords {
     .await?;
     Some(landed.map(|()| answer))
   }
+
+  async fn change_revision_property(
+    &mut self,
+    id: RepositoryId,
+    principal: &Principal,
+    change: &slates_svn::serve::RevisionPropertyChange,
+  ) -> Option<Result<(), Vec<(u32, String)>>> {
+    // The landing turn, held from the judgment to the record's landing (C2): no other change lands in between.
+    let turn = svn_commit::landing::turn(id).await?;
+    let judged = crate::state::with_state(|state| {
+      lend_in(state, id, |lent| {
+        slates_svn::serve::changed_properties(lent.repository, change)
+      })
+    })
+    .flatten()?;
+    let properties = match judged {
+      Ok(properties) => properties,
+      Err(chain) => return Some(Err(chain)),
+    };
+    let record = slates_svn::commit::record::Record::RevisionProperties {
+      revision: change.revision,
+      properties,
+    };
+    let landed = svn_commit::land_record_with(turn, (principal, id), record).await?;
+    Some(landed.map_err(|refused| vec![refused.failure()]))
+  }
 }
 
 /// Whether repository `id`'s records are here to serve: held, and no import under way (C2 stage C: an import's batch
