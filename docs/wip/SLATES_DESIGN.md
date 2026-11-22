@@ -55652,6 +55652,18 @@ Applied in the same change to: GAPS (§4.17). Status: designed; slices (a1) to (
   before the records, so an object past a window is whole by its identity after a restart with no record's bytes.
   Test `daemon::tests::t_a727_a3b_an_object_past_a_window_survives_a_warm_restart_by_its_identity` (1 MiB file),
   red with the pieces left out.
+- **Windows let go ride the image (2026-11-22, w-hg; main 01a20182's ruling (a) of 02:52, A-767 C1 step 2b).** A window
+  let go (`ContentStore::let_go`, the cold trigger's and an import's let-go once its segment is durable) keeps its
+  entry, its length and its landed mark; the shard image carries it as a piece of kind 15 (its identity, then its
+  length), whole in every image (`ContentStore::aways`) and as a change in every delta (`away_changes`: put while let
+  go, removed once brought back or freed). A restart takes the windows let go back before the lists, which hold the
+  nodes they name (`restore_away`), so each stays let go, never absent: a reader brings it back by its own bytes
+  (`bring_back_object`). The image is the recovery's one truth: a window the image never named stays absent, a typed
+  `NotHeld`, never adopted as let go (rejected: replay inferring "let go" from "absent", which would swallow a window
+  lost for real). Tests `vcs content::windows_let_go_survive_a_restart_as_let_go_and_come_back_by_their_bytes` (red
+  without `restore_away`: 4 lists and names refused) and `daemon::tests::t_c1_windows_let_go_survive_warm_restarts_whole_and_come_back_by_their_bytes`
+  (three warm restarts after seeded let-go rounds, the store whole as published each time, the object brought back the
+  same bytes by its identity).
 
 
 ### A-664 Subversion objects — A version a work submits to a Subversion repository's green becomes the revision the server makes of it (bug, 2026-11-20, w-shared for UI goal 93)

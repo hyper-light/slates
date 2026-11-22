@@ -89,11 +89,20 @@
 > (`an_entrys_buffer_is_reserved_at_its_length_not_its_texts`). The finding's other copies are their owners'
 > (`inbox/main-from-w-svn-finding2-sites.md`).
 
-> **Open (found by w-shared, 2026-11-22): `repository::tests::each_verb_moves_the_names_log_and_each_members_version_its_own_log`
-> fails on main,** before A-854 too (b00ed749a, a3e673efc plus a test; macOS arm64, debug): "the doubling rule's inputs
-> say fold, yet no checkpoint was taken: FoldInputs { floor: 2, to_fold: 532, held_bytes: 0 }". Not bisected further; a
-> likely cause is 2d078e4fa (A-579's last step: the checkpoint held a chunk a paced quantum, so it may end after the
-> step that asked for it, where the test's `write_until_folded` reads the floor at once). Main's to route.
+> **FIXED (w-shared, 2026-11-22; main 01a20182 02:23 PST): `repository::tests::each_verb_moves_the_names_log_and_each_members_version_its_own_log`
+> failed on main** ("the doubling rule's inputs say fold, yet no checkpoint was taken: FoldInputs { floor: 2, to_fold:
+> 532, held_bytes: 0 }"). Bisected: it passes at 2d078e4fa^ (40d816c29) and fails at 2d078e4fa (A-579's last step, piece
+> 1), each built in its own target (macOS arm64, debug). Cause: since 2d078e4fa a checkpoint's hold yields after a unit
+> when anything waits on the shard (`others_waiting`; here a repository build's task), and the rest runs as
+> `checkpoint_in_turns`, a task no turn of which runs inside the test's one step. The shard counted
+> `merge.checkpoint.in_turns` 1 after one 85 µs hold step. The test then read the floor and concluded no checkpoint was
+> taken. That was the decision taken from the hold: the pacing is A-579's design, and the product's readers (the base
+> check, the recovery sweep) read the recorded floor, where a checkpoint in turns is simply not yet taken. Fix, tests
+> only: `merge_service::settle_checkpoints` (cfg(test)) takes each checkpoint still in turns whole, its stage giving way
+> as at the chain's cap, the way `whole_build::settle` does for a build. `write_until_folded` calls it after each write.
+> The sweep found one sibling that held only because nothing waited on its shard:
+> `verbs::tests::a_green_replays_from_its_checkpoint_and_a_corrupt_one_is_fenced` (its `green_at_version_one`), now
+> settled too. `repository::tests` 3007's test drives the turns through the daemon on purpose and is unchanged.
 
 > **FIXED (w-fed-faults, 2026-11-21): a whole-file rewrite outside a recorded request was refused `Overloaded`**
 > (A-787 part 2's park, 2a498b90f). 10 server lib tests (repository, vcs_store paths and commits) failed from that
@@ -187,6 +196,11 @@
 >   98-137 against 213-242 million turns a second: not starved, but the daemon now takes the CPU it needs ahead of them.
 >   No demotion was seen. **Open:** 84a's bar on macOS. The p99 is under 1 ms in 11 of 12 round medians, the p999 in
 >   4 of 12. The client-only arm (TC) was measured and rejected (p999 up to 29.9 ms).
+>   The refining job's turns paced (A-783's turn, to the ceiling or to its own quantum), measured and rejected (w-perf,
+>   2026-11-22; BENCHMARKS "84a on macOS: the refining job's turns paced"): dead even with main on one runner's
+>   interleaved rounds. Stamped under TB, the loaded tail's deferred replies are submits parked behind their refinement
+>   and resumed. A plain forward's two wakes measure 7-21 µs from kick to run, and the resumed run is all CPU (not
+>   demoted). Main's own interleaved A/B (run 45009478174) misses p999 in most rounds in both arms; the gap stays open.
 > - Windows (CI, run 44857045148): no 1 ms band (queued p99 5–49 µs); accept p99 0.13–0.31 ms, conflict 0.11–0.29 ms;
 >   p999 0.2–62 ms. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–7).
 >
@@ -506,6 +520,11 @@
 >   (red without the wait: refused `NotYet`), `hg push::work_tests::a_work_reading_texts_not_at_hand_waits_and_asks_the_store_for_each`
 >   (red with `Missing` for `NotYet`) and `vcs content::an_object_let_go_is_brought_back_whole_by_its_own_bytes`.
 >   Nothing is let go yet, so no behaviour changes until 2b.
+> - 2b part (2a) BUILT (2026-11-22, w-hg; main's ruling (a) of 02:52): a window let go survives a warm restart as let
+>   go (image piece kind 15; `ContentStore::aways`, `away_changes`, `restore_away` before the lists; design section
+>   "Windows let go ride the image"); `ContentStore::let_go_object` lets every window of an object go but those
+>   another holds. Held by `vcs content::windows_let_go_survive_a_restart_as_let_go_and_come_back_by_their_bytes` and
+>   `daemon::tests::t_c1_windows_let_go_survive_warm_restarts_whole_and_come_back_by_their_bytes`.
 > - 2b, next: each import segment's file windows marked landed and let go once the segment is durable; a symlink's
 >   target read again in the walk; main's red (after a fixture import `ContentStore::used` is the changelog's and the
 >   manifests' bytes alone; a clone and a push over the import verify clean against stock 7.2).
@@ -25232,8 +25251,10 @@ in what lands. Branch tips as of 2026-11-10:
 > the one publication left was still a whole-shard one on every accept's path, where A had none. A-854 (w-shared): an
 > increment up to 1 MiB is carried in its chain entry (format 7), durable with its append, so its accept publishes
 > nothing; red 8 publications for eight `owner_judge` accepts, green 0
-> (`accepted_owner_submits_cost_publications_that_do_not_grow_with_their_number`); main's A/B owed, done when B's p50 is
-> within 10% of A's in every round). The checkpoint's record LANDED by name
+> (`accepted_owner_submits_cost_publications_that_do_not_grow_with_their_number`); CLOSED by A-854, 2026-11-22: main's
+> interleaved A/B on its MacBook (1,000 clients, Z = 50 ms, A 544020bd2, B 059578d78) put B's SubmitAccepted p50 at
+> 0.66-1.19 ms against A's 2.64-13.47 ms at that machine's load, every kind at or under A's, tails 3 to 15 times smaller,
+> no oracle failures (BENCHMARKS, "A-825's load regression closed by A-854")). The checkpoint's record LANDED by name
 > (goal 93's, main's 15:00: a 1 GiB green's was 650-1,063 ms in one step, record 527 ms): held in the owner's content
 > store a chunk a quantum, published, recorded as `CheckpointRef` (layout 16). OWED, piece 2: its build and encoding
 > are still one step (52 + 71 ms at 1 GiB; 5.7 + 9.5 ms at load_bench's 49 MB), inside the watchdog's 1 s window.

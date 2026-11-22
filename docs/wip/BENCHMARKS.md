@@ -17107,6 +17107,69 @@ No refusal and no demotion was logged by any arm.
 - **84a's bar is still open on macOS.** The loaded p99 is under 1 ms in 11 of 12 round medians (worst 2.11 ms), the
   p999 in 4 of 12 (0.70-4.56 ms).
 
+## 84a on macOS: the refining job's turns paced, measured and rejected, two arms (w-perf; 2026-11-22)
+
+**What was measured first.** Under TB, every deferred reply of the loaded edit and merge was stamped with the
+`state::deliver` call that queued it (diagnostic branch `diag-measurer-w-perf-84a`, never main; CI macos-latest,
+3 CPUs, runs 44999419622, 45000596198, 45002216958, 45003559966, 45005328491). About 16,500 of the ~58,000 requests a
+round are deferred replies:
+- 6,012 plain forwards to the owner shard and back: taken -> written p999 88-344 µs. The owner's and the origin's
+  kick -> run medians were 7-21 µs, so the forward's two wakes are not the 1 ms tail.
+- 9,000 submits parked behind their refinement (A-787 part 2), resumed by the job's end (`refining.rs`) and answered by
+  `verbs::answered_on`: taken -> written p999 850-3,105 µs, the tail. Their legs, as medians of the p99 tail:
+  - before the park 36-73 µs;
+  - the job 132-247 µs;
+  - the resumed run (the verb again, its commit) 159-320 µs;
+  - home 30-46 µs;
+  - the write 16-24 µs.
+- The job yielded after each of its 10 to 12 units.
+- The resumed run is all CPU: wall minus thread CPU 0-1 µs at every percentile, so it is not preempted or demoted.
+- Inside it, no checkpoint ran, in 0 of 27,000. A shard publication ran in 6,000 of 9,000, but the verb's CPU is the
+  same with or without one (p99 166-209 µs against 180-205 µs).
+- No code path is singled out for the verb's own CPU tail, about 4 times its median.
+
+**The arms.** B1 (888cde6d6): the job's units run in A-783's paced turns (`vcs_store::paced_turn`), going on while no
+one else waits, up to the shard's ceiling. B2 (7d82bdfdb): the same, each turn ending at its own quantum whoever waits.
+Red first for both: `a_small_rewrites_refinement_runs_its_units_in_paced_turns` (main: a turn a unit, 9,557 of them in
+a debug build; B1: 7,764 units in 6 turns; B2: 7,505 units in 7,341 debug turns).
+
+**The runs.** CI macos-latest (3 CPUs), one job each, the arms interleaved: `edit_merge_bench` loaded (two spinners a
+CPU) and quiet, then `provision_bench`. Each cell is a round's median of its runs, µs, every round in order.
+
+Run 45006705328 (`diag-measurer-w-perf-84a-ab`), A = b099adee4 (main with TB) against B1:
+
+| | A | B1 |
+|---|---|---|
+| loaded accept p999 | 1585 · 1151 · 4341 · 2046 · 2832 | 1158 · 589 · 2594 · 1443 · 2688 |
+| loaded conflict p99 | 472 · 510 · 508 · 504 · 445 | 838 · 699 · 630 · 404 · 464 |
+| loaded conflict p999 | 1706 · 1346 · 1927 · 1355 · 1159 | 1454 · 3418 · 2745 · 809 · 1218 |
+| quiet accept f10 p50 | 283 · 182 · 164 | 381 · 273 · 230 |
+| quiet accept f10 p999 | 1258 · 544 · 448 | 2756 · 1314 · 1779 |
+
+Run 45010946191 (the same branch), A against B1 against B2:
+
+| | A | B1 | B2 |
+|---|---|---|---|
+| loaded accept p99 | 1284 · 560 · 525 · 484 · 389 | 446 · 452 · 400 · 426 · 401 | 457 · 491 · 365 · 567 · 460 |
+| loaded accept p999 | 2593 · 627 · 701 · 841 · 646 | 689 · 1364 · 499 · 603 · 541 | 722 · 684 · 552 · 768 · 984 |
+| loaded conflict p99 | 565 · 340 · 284 · 440 · 381 | 460 · 376 · 873 · 379 · 409 | 400 · 545 · 304 · 514 · 405 |
+| loaded conflict p999 | 1238 · 457 · 484 · 821 · 512 | 716 · 582 · 1592 · 510 · 772 | 811 · 1267 · 424 · 1521 · 823 |
+| quiet accept f10 p50 | 195 · 184 · 154 | 219 · 160 · 148 | 160 · 146 · 150 |
+| quiet accept f10 p999 | 1573 · 593 · 354 | 676 · 452 · 489 | 976 · 561 · 610 |
+| quiet conflict f10 p999 | 2580 · 435 · 414 | 748 · 1368 · 480 | 496 · 370 · 373 |
+| R9 spinning p99 | 247 · 115 · 122 | 242 · 216 · 239 | 128 · 110 · 108 |
+
+**Rejected, both.** Main's rule (2026-11-22): win the loaded p99 and p999 of both forms, and hold the quiet f10 p50
+and p999 within A's spread, round by round.
+- B1 wins accept p999 (5 of 5 in the first run, 4 of 5 in the second). It loses conflict p99 (3 of 5 in the first run)
+  and is mixed on conflict p999. Its quiet loss in the first run (3 of 3 rounds) did not repeat in the second.
+- B2 wins accept p99 in 3 of 5 rounds and ties accept p999 (median 722 against A's 701). It loses conflict p99 in 4 of
+  5 and conflict p999 in 3 of 5. It holds quiet.
+- A's own spread on one runner (loaded p999 457-2,593 µs here; main's run 45009478174: loaded p999 over 1 ms in 9 to 14
+  of 15 rounds in each of its own two arms) exceeds any arm's difference. The refining job's leg is real, but not what
+  decides 84a's p999 on these runners.
+- Rejected: a dead-even A/B does not land.
+
 ## The client's reply wait, arm C: measured and rejected, B (A-799) stays (85a; g222's last step, recorded by w-provision-gate; 2026-11-21)
 
 **The run.** GitHub run 44884335146 (branch `diag-measurer-g222-20`, "g222 A/B/C of the client reply wait on every
@@ -18139,3 +18202,34 @@ four times the lane's. The owner's step fell from 502-594 to 270-299 ms and the 
 run to none. Datagram batching (main's 2026-11-20 23:50 step 5) is not shown needed by any measurement and is dropped
 (main, 2026-11-21 14:56). The holder route passes 5/5 at 320 and 512 MiB (r2), which counts toward the lane's proof;
 the bench's local 512 MiB submit still ends in exit 4 (one step of 1.05-1.09 s of CPU) until w-work-cow's A-841 lands.
+
+## A-825's load regression closed by A-854: a small increment carried in its chain entry (w-shared; main 01a20182's A/B, 2026-11-22)
+
+**Question.** Chain entry format 6 (A-825) held every increment in the owner's content store, so every accept published
+the whole shard before its entry was appended. d44f0166a cut that to one publication an accept, not none. A-854 (main
+205e7e828) carries an increment up to min(1 MiB, the chain cap / 64) in its entry, so the accept publishes nothing. Done
+when B's SubmitAccepted p50 is within 10% of A's in every round.
+
+**Command.** Release `load_bench --tree linux-v7.4-rc1/fs (2,365 files, 51 MB) --clients 1000 --hot-files 800
+--per-connection 32 --rounds 20 --reply-patience 60 --think-us 50000`. A = 544020bd2 (A-825's parent), B = 059578d78
+(has 205e7e828), interleaved A B B A A B. Hardware: main's MacBook Pro (Adas-MacBook-Pro-2, 18 CPUs, macOS arm64), under a
+load of 40 to 65 from other sessions, because kiln's API was hung since about 00:40. Logs:
+`~/.cache/main-01a20182/r7/` on that MacBook (summary.txt, run-{1..6}-{A,B}.log).
+
+| run | arm | SubmitAccepted p50 / p99 (ms) | SubmitConflict p50 | Rebase p50 | Edit p50 | server SubmitAccepted p99 | server Round p99 | verdicts/s | wall |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | A | 2.64 / 155.8 | 4.15 | 5.59 | 0.45 | 151.5 | 1,629 | 1,207 | 34 s |
+| 2 | B | 1.05 / 49.0 | 1.30 | 0.80 | 0.72 | 14.4 | 116 | 2,561 | 16 s |
+| 3 | B | 1.19 / 52.8 | 1.57 | 0.86 | 0.75 | 16.7 | 164 | 2,451 | 17 s |
+| 4 | A | 9.54 / 221.4 | 12.26 | 17.56 | 2.00 | 213.2 | 2,601 | 925 | 45 s |
+| 5 | A | 13.47 / 213.0 | 18.14 | 25.83 | 1.48 | 211.0 | 2,613 | 990 | 42 s |
+| 6 | B | 0.66 / 13.2 | 0.69 | 0.47 | 0.40 | 8.6 | 35 | 3,601 | 11 s |
+
+Every run: oracle failures 0, refusals 0, lost 0.
+
+**Reading.**
+- B's p50 is at or under A's on every kind, so the done condition is met. B's tails are 3 to 15 times smaller.
+- Neither arm meets load_bench's 1 ms p99 bound at this machine's load. That is informational, not this A/B's question.
+- Beside it, the quiet reference: on the big Studio (M3 Ultra, 32 cores, 2026-11-21 23:03) A's SubmitAccepted p50 was
+  0.38 to 0.45 ms. On the same hardware B at a3e673efc (format 6 with d44f0166a, before A-854) was 356 to 429 ms.
+- A-825 is closed by A-854 (GAPS).

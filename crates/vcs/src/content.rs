@@ -385,6 +385,9 @@ pub struct ContentStore {
   lists_changed: BTreeSet<ContentId>,
   /// The objects named or unnamed since its owner last took the changes (A-727 slice a3b).
   names_changed: BTreeSet<ContentId>,
+  /// The windows let go, brought back or freed away since its owner last took the changes (A-767 C1 step 2b): the
+  /// shard image carries every window let go, so a restart keeps it as let go, never as absent.
+  away_changed: BTreeSet<ContentId>,
   /// Where the windows' bytes are kept (A-727).
   storage: Box<dyn WindowStorage>,
   /// The longest content the store holds: the content plane's window.
@@ -562,6 +565,7 @@ impl ContentStore {
       rooted: BTreeMap::new(),
       lists_changed: BTreeSet::new(),
       names_changed: BTreeSet::new(),
+      away_changed: BTreeSet::new(),
       storage: Box::new(HeapWindows::default()),
       window,
       fanout,
@@ -1054,6 +1058,9 @@ impl ContentStore {
     let Some(freed) = self.entries.remove(identity) else {
       return Err(ContentRefused::NotHeld);
     };
+    if matches!(freed.kept, Kept::Away { .. }) {
+      self.away_changed.insert(*identity);
+    }
     // A freed root takes its object's name with it (module docs, "The identity rule").
     if let Some(named) = self.rooted.remove(identity) {
       self.objects.remove(&named);
@@ -1144,6 +1151,7 @@ impl ContentStore {
       return Err(LetGoRefused::Shared);
     }
     held.kept = Kept::Away { len };
+    self.away_changed.insert(identity);
     self.storage.release(window);
     let freed = u64::try_from(len).unwrap_or(u64::MAX);
     self.content_bytes = self.content_bytes.saturating_sub(freed);
@@ -1173,9 +1181,32 @@ impl ContentStore {
     if let Some(held) = self.entries.get_mut(&identity) {
       held.kept = Kept::Stored { window, len };
     }
+    self.away_changed.insert(identity);
     self.content_bytes = self.content_bytes.saturating_add(need);
     self.counters.brought_back = self.counters.brought_back.saturating_add(1);
     Ok(())
+  }
+
+  /// Marks every window of the object `identity` names landed and lets go each one it alone holds (A-767 C1 step 2b: a
+  /// Mercurial import's file revisions, once the changeset carrying them is durable on the node's store): the bytes
+  /// freed. A window another holder keeps stays, as [`ContentStore::let_go`] keeps it (`Shared`), and one let go already
+  /// stays away; the object's lists stay, so its windows' identities and lengths are still its own and a reader brings
+  /// it back by its bytes ([`ContentStore::bring_back_object`]).
+  pub fn let_go_object(&mut self, identity: &ContentId) -> u64 {
+    let mut windows = Vec::new();
+    let mut walk = self.windows(identity);
+    while let Some(window) = walk.next_window() {
+      windows.push(window);
+    }
+    let mut freed = 0u64;
+    for window in &windows {
+      if self.mark_landed(window)
+        && let Ok(bytes) = self.let_go(window)
+      {
+        freed = freed.saturating_add(bytes);
+      }
+    }
+    freed
   }
 
   /// Brings back every window let go of the object `identity` names ([`ContentStore::put_object`]'s identity), from
@@ -1364,6 +1395,64 @@ impl ContentStore {
   pub fn clear_changes(&mut self) {
     self.lists_changed.clear();
     self.names_changed.clear();
+    self.away_changed.clear();
+  }
+
+  /// Every window let go ([`ContentStore::let_go`]) and not brought back, with its length: what a shard image carries
+  /// whole, so a restart keeps each as let go (A-767 C1 step 2b, main's ruling (a) of 2026-11-22 02:52).
+  pub fn aways(&self) -> impl Iterator<Item = (ContentId, u64)> + '_ {
+    self
+      .entries
+      .iter()
+      .filter_map(|(identity, held)| match held.kept {
+        Kept::Away { len } => Some((*identity, u64::try_from(len).unwrap_or(u64::MAX))),
+        _ => None,
+      })
+  }
+
+  /// The windows let go, brought back or freed since the owner last took the changes: each with its length while it is
+  /// let go, none once it is not (brought back, or freed): what a delta carries of [`ContentStore::aways`].
+  pub fn away_changes(&self) -> Vec<(ContentId, Option<u64>)> {
+    self
+      .away_changed
+      .iter()
+      .map(|identity| {
+        let away = match self.entries.get(identity).map(|held| &held.kept) {
+          Some(Kept::Away { len }) => Some(u64::try_from(*len).unwrap_or(u64::MAX)),
+          _ => None,
+        };
+        (*identity, away)
+      })
+      .collect()
+  }
+
+  /// Takes back the windows let go that a shard image carried ([`ContentStore::aways`]), before its lists
+  /// ([`ContentStore::restore_nodes`], which hold the nodes they name): each an entry of no bytes and its length, landed,
+  /// held by no one until a list or a row holds it again, read as nothing until brought back by its own bytes. One the
+  /// store holds already, or of no length or past a window, is left out: the image recorded it, so the store never
+  /// infers one (a window the image never named stays absent, a reader's typed `NotHeld`). The count left out.
+  pub fn restore_away(&mut self, aways: Vec<(ContentId, u64)>) -> u64 {
+    let mut refused = 0u64;
+    for (identity, len) in aways {
+      let len = usize::try_from(len)
+        .ok()
+        .filter(|len| *len > 0 && *len <= self.window.get());
+      let Some(len) = len.filter(|_| !self.entries.contains_key(&identity)) else {
+        refused = refused.saturating_add(1);
+        continue;
+      };
+      self.entries.insert(
+        identity,
+        Held {
+          kept: Kept::Away { len },
+          form: Form::Window,
+          holders: 0,
+          landed: true,
+          last_read: core::cell::Cell::new(0),
+        },
+      );
+    }
+    refused
   }
 
   /// Takes back the lists and names a shard image carried (A-727 slice a3b), after the windows its storage restored
@@ -1768,6 +1857,19 @@ impl Windows<'_> {
         return Some(identity);
       }
       self.stack.pop();
+    }
+  }
+
+  /// The next window's identity, its lists walked through and none read: what [`ContentStore::let_go_object`] lets
+  /// go; `None` once every list is read, or at a content the store does not hold.
+  fn next_window(&mut self) -> Option<ContentId> {
+    loop {
+      let identity = self.next_identity()?;
+      let held = self.store.entries.get(&identity)?;
+      if held.form != Form::List {
+        return Some(identity);
+      }
+      self.stack.push((held.here()?, 0));
     }
   }
 }
@@ -2532,6 +2634,104 @@ mod tests {
       store.bring_back_object(object, bytes),
       Ok(0),
       "held already: none again"
+    );
+  }
+
+  /// A-767 C1 step 2b. Do: put an object of three windows and a part, and a window another holder keeps as well; let go
+  /// each object; then bring the first back. Expect: the object's four windows let go, their bytes freed and out of the
+  /// count, the store's lists kept; the shared window kept whole; the first object brought back whole by its own bytes.
+  #[test]
+  fn an_object_is_let_go_window_by_window_but_what_another_holds() {
+    let window = 4096usize;
+    let mut store = ContentStore::new(1 << 22, window).unwrap();
+    let bytes = patterned(window * 3 + 100);
+    let object = store.put_object(&bytes).unwrap();
+    let shared = store.put_object(&[9u8; 300]).unwrap();
+    store.hold(&shared).unwrap();
+    let before = store.content_bytes;
+    assert_eq!(
+      store.let_go_object(&object),
+      u64::try_from(bytes.len()).unwrap()
+    );
+    assert_eq!(
+      store.content_bytes,
+      before - u64::try_from(bytes.len()).unwrap()
+    );
+    assert!(
+      bytes
+        .chunks(window)
+        .all(|piece| store.is_away(&ContentId::of(piece)))
+    );
+    assert_eq!(
+      store.let_go_object(&shared),
+      0,
+      "a window another holds stays"
+    );
+    assert!(!store.is_away(&shared));
+    assert_eq!(store.bring_back_object(&object, &bytes), Ok(4));
+    assert_eq!(
+      store.object_bytes(&object, u64::try_from(bytes.len()).unwrap()),
+      Some(bytes)
+    );
+  }
+
+  /// A-767 C1 step 2b (main's ruling (a) of 2026-11-22 02:52: the image records the windows let go). Do: put an object
+  /// of three windows and a part and a one-window object, let both go, carry the store's windows let go, lists and names
+  /// into a fresh store as a restart's image does (`aways`, `lists`, `names`; nothing of their bytes), then hold each as
+  /// its row would, bring each back by its bytes, and hold a window the image never named. Expect: every window carried
+  /// as let go with its length and the changes naming each; the holds taken; each object brought back whole, the same
+  /// bytes by identity; the window never named refused `NotHeld`, never adopted.
+  #[test]
+  fn windows_let_go_survive_a_restart_as_let_go_and_come_back_by_their_bytes() {
+    let window = 4096usize;
+    let mut before = ContentStore::new(1 << 22, window).unwrap();
+    let large = patterned(window * 3 + 100);
+    let small = vec![4u8; 700];
+    let objects = [
+      (before.put_object(&large).unwrap(), large.clone()),
+      (before.put_object(&small).unwrap(), small.clone()),
+    ];
+    for (object, _) in &objects {
+      before.let_go_object(object);
+    }
+    let aways: Vec<(ContentId, u64)> = before.aways().collect();
+    assert_eq!(
+      aways.len(),
+      5,
+      "four windows of the first and the second whole"
+    );
+    assert!(
+      before.away_changes().iter().all(|(_, len)| len.is_some()),
+      "each let go, named with its length"
+    );
+    let lists: Vec<(ContentId, Vec<u8>)> = before
+      .lists()
+      .map(|(id, bytes)| (id, bytes.to_vec()))
+      .collect();
+    let names: Vec<(ContentId, ContentId)> = before.names().collect();
+    let mut after = ContentStore::new(1 << 22, window).unwrap();
+    assert_eq!(
+      after.restore_away(aways),
+      0,
+      "every window let go taken back"
+    );
+    assert_eq!(
+      after.restore_nodes(lists, names),
+      0,
+      "every list and name taken back"
+    );
+    for (object, bytes) in &objects {
+      after.hold(object).unwrap();
+      after.bring_back_object(object, bytes).unwrap();
+      let len = u64::try_from(bytes.len()).unwrap();
+      assert_eq!(
+        after.object_bytes(object, len).as_deref(),
+        Some(bytes.as_slice())
+      );
+    }
+    assert_eq!(
+      after.hold(&ContentId::of(b"never named")),
+      Err(ContentRefused::NotHeld)
     );
   }
 

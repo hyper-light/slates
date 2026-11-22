@@ -450,18 +450,7 @@ async fn encode_ahead(id: RepositoryId) {
   }
 }
 
-/// Turns repository `id`'s encoding until every version's fragments are kept, yielding between turns (the module doc):
-/// what a fetch's request runs before its answer is made. Returns at once where the shard's state is not lent.
-pub(crate) async fn settle_encodings(id: RepositoryId) {
-  loop {
-    match crate::state::with_state_counted(|state| turn(state, id)) {
-      Some(Turned::More) => slates_rt::futures::yield_now().await,
-      Some(Turned::Idle) | None => return,
-    }
-  }
-}
-
-/// A fetch's encoding (A-718 continued): repository `id`'s encoding turned as [`settle_encodings`] turns it, for at most
+/// A fetch's encoding (A-718 continued): repository `id`'s encoding turned a turn at a time, yielding between, for at most
 /// [`FETCH_WAIT_NS`]; past it the fetch answers, and a task finishes the encoding behind it ([`encode_behind`]).
 pub(crate) async fn encode_for_fetch(id: RepositoryId) {
   encode_within(id, FETCH_WAIT_NS).await;
