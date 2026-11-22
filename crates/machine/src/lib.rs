@@ -60,6 +60,7 @@ pub mod derived;
 pub mod descriptors;
 pub mod error;
 pub mod facts;
+pub mod fair_slice;
 pub mod log;
 pub mod memory_pressure;
 pub mod memory_stall;
