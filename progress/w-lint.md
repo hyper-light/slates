@@ -469,3 +469,10 @@
 ## 2026-11-21 round at 6f47e4027 (nothing to land)
 - Clean: host clippy, fmt, structural, literals, unsafe, the six cross targets.
 - VCS lane: Windows r54 still queued (jupiter's link down). Linux: both runners refuse the sync (run-requests.md).
+
+## 2026-11-21 round at 1d42ec90f (landed 40148f1e7)
+- Red: server repository.rs type_complexity, fixed with a CreationLanded alias. Fmt, xtask and the six cross targets were clean.
+- Found: repository::tests::each_verb_moves_the_names_log... fails 3/3 on macOS, the checkpoint doubling rule asserting
+  ("held_bytes: 0"); sent to w-engine, since A-579 is theirs. repository:: otherwise 93/94.
+- VCS lane: Linux r56 (sync false, fetching the exact commit; main's ruling) — kiln didn't answer my status read.
+  Windows r54 is still queued.
