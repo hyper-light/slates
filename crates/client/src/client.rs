@@ -1690,6 +1690,12 @@ impl Client {
     self.end.parks_ended_by_looks()
   }
 
+  /// The synchronous reply wait's parks under an asked EEVDF slice, and those it skipped (84a's arm E;
+  /// `ClientEnd::sliced_parks`).
+  pub fn sliced_parks(&self) -> slates_ipc::endpoint::SlicedParks {
+    self.end.sliced_parks()
+  }
+
   /// Sends `body` as the next request and returns the reply body, refusals typed.
   pub fn call(&mut self, body: &RequestBody) -> Result<ReplyBody, ClientError> {
     // Every `ack_every` requests, the client acknowledges them first (one request), so the daemon's retained records

@@ -247,7 +247,9 @@
 #   by BLAKE3.
 
 [budget]
-slates-machine = 104
+slates-machine = 106
+# 2026-11-22 (+2, 84a Linux arm E, w-perf): `fair_slice.rs`, a fair thread's requested EEVDF slice:
+#   `sched_getattr` and `sched_setattr` of the calling thread. rustix 1.1.4 has neither.
 # 2026-11-21 (+3, A-837 part 2, one a platform): `descriptors.rs`, the learned descriptor ceiling counted without a
 #   descriptor: macOS `proc_pidinfo(PROC_PIDLISTFDS)` sized with no buffer, Windows `GetProcessHandleCount`, and Linux
 #   the close of the spare descriptor its count gives up (an `OwnedFd` remade from the raw one the module alone holds).

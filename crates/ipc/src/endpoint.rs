@@ -199,6 +199,8 @@ pub struct ClientEnd {
   request_stamp: u32,
   /// Wakes the client had to park for (the spin-to-park ratio's numerator).
   parks: u64,
+  /// Its synchronous reply wait's parks under an asked EEVDF slice, and those it skipped ([`SlicedParks`], 84a's arm E).
+  sliced_parks: SlicedParks,
   /// Replies taken.
   replies: u64,
   /// Parks a wake ended with no reply in the ring — a spurious return from the OS wait, or a previous
@@ -294,6 +296,7 @@ impl ClientEnd {
       next_reply: 0,
       request_stamp: 0,
       parks: 0,
+      sliced_parks: SlicedParks::default(),
       replies: 0,
       unanswered_wakes: 0,
       parks_ended_by_looks: 0,
@@ -659,6 +662,11 @@ impl ClientEnd {
     self.parks_ended_by_looks
   }
 
+  /// The synchronous reply wait's parks under an asked EEVDF slice, and those it skipped (see the field).
+  pub fn sliced_parks(&self) -> SlicedParks {
+    self.sliced_parks
+  }
+
   /// The ring index the next request takes (its bulk chunk is chosen by it).
   pub fn next_request_index(&self) -> u64 {
     self.next_request
@@ -888,6 +896,7 @@ impl ClientEnd {
     }
     self.parks = self.parks.saturating_add(1);
     real_time_once(u64::from(self.region.spin_ns()));
+    let sliced = self.slice_for_park();
     let switches_before = slates_machine::switches::switches_now();
     let g222_timeout = match ends {
       Ends::At(deadline_ns) => {
@@ -899,11 +908,23 @@ impl ClientEnd {
     let parked = match ends {
       Ends::At(deadline_ns) => {
         let remaining = deadline_ns.map(|deadline| deadline.saturating_sub(elapsed_ns(started)));
-        self.park_until(expected, remaining)?
+        self.park_until(expected, remaining)
       }
-      Ends::Departure => self.park_until_departure(expected, look_timeout_ns)?,
+      Ends::Departure => self.park_until_departure(expected, look_timeout_ns),
     };
     let returned_ns = slates_machine::clock::monotonic_ns();
+    // The thread's own scheduling back before anything else, whatever the park answered.
+    if let Some(slice) = sliced
+      && let Err(code) = slice.restore()
+    {
+      self.sliced_parks.restore_failed = self.sliced_parks.restore_failed.saturating_add(1);
+      self.region.client_parked()?.store(0, Ordering::Release);
+      return Err(IpcError::OsRefused {
+        call: "sched_setattr (a sliced park's restore)",
+        code: Some(code),
+      });
+    }
+    let parked = parked?;
     let g222_n = G222_CPARKS_N.fetch_add(1, Ordering::Relaxed);
     if let Some(row) = G222_CPARKS.get(g222_n) {
       row[0].store(g222_timeout.unwrap_or(u64::MAX), Ordering::Relaxed);
@@ -2406,7 +2427,45 @@ mod tests {
   }
 }
 
+/// A client's synchronous reply wait's parks under an asked EEVDF slice (84a's arm E, `slates_machine::fair_slice`), and
+/// those it skipped. Elsewhere than Linux every park is skipped.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SlicedParks {
+  /// Parks under the asked slice, the thread's own scheduling put back after each.
+  pub taken: u64,
+  /// Parks that kept the thread's own slice (not Linux, not the plain fair class, or refused).
+  pub skipped: u64,
+  /// Restores the kernel refused, each the call's typed refusal. Expected none.
+  pub restore_failed: u64,
+}
+
+impl ClientEnd {
+  /// Asks EEVDF for the daemon's published window (R9's floor) as this thread's slice for the coming park, so its
+  /// reply's wake may preempt busy fair neighbours (84a's arm E: woken by its reply, the client waited out their
+  /// 2.1 ms slices on CI's runners, run 45020845000). Counted either way; the first skip on a thread is logged.
+  fn slice_for_park(&mut self) -> Option<slates_machine::fair_slice::ParkSlice> {
+    let window_ns = u64::from(self.region.spin_ns());
+    match slates_machine::fair_slice::raise_for_park(window_ns) {
+      Ok(slice) => {
+        self.sliced_parks.taken = self.sliced_parks.taken.saturating_add(1);
+        Some(slice)
+      }
+      Err(skipped) => {
+        self.sliced_parks.skipped = self.sliced_parks.skipped.saturating_add(1);
+        if cfg!(target_os = "linux") && !SLICE_SKIP_LOGGED.with(|logged| logged.replace(true)) {
+          slates_machine::log_line!(
+            "slates-ipc: a reply wait parks with its own slice: {skipped:?}"
+          );
+        }
+        None
+      }
+    }
+  }
+}
+
 thread_local! {
+  /// Whether this thread has logged its reply wait's first skipped sliced park ([`ClientEnd::slice_for_park`]).
+  static SLICE_SKIP_LOGGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
   /// Whether this thread has asked for the time-constraint policy ([`real_time_once`]).
   static REAL_TIME_ASKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
