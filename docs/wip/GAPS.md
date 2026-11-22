@@ -25041,8 +25041,11 @@ in what lands. Branch tips as of 2026-11-10:
 > kind's p99 is under 1 ms in 5 of 5 rounds. (b) LANDED 2026-11-21 (a key's old entry subtracted at its first change:
 > the fold hashes current bytes only, no history reads), with a fix to a checkpoint's sum taken mid-fold. OWED: (b)'s A/B
 > (does Z = 20 ms p99 return to main's?; main's run, `run-requests.md`, blocked while main's own regression stands:
-> SubmitAccepted server p50 0.29 ms at 4d0ad1674 against 184 ms at 1a35ab091, Z = 50 ms, macOS arm64, not A-579's,
-> window c1449f629..b3f674640 unbisected). The checkpoint's record LANDED by name
+> SubmitAccepted server p50 0.29 ms at 4d0ad1674 against 184 ms at 1a35ab091, Z = 50 ms, macOS arm64, not A-579's;
+> BISECTED 2026-11-21 to 6088ccb72, A-825's format 6 (w-shared): its parent 544020bd2 p50 0.38 / p99 0.84 ms, it 237.9 /
+> 1,192 ms, release `load_bench` one round each on the big Studio; the likely mechanism is A-825's owed cost, a
+> whole-shard publication (`publish_held_increments` -> `publish_shard`) in every accepted version's step on the owner;
+> handed to w-shared, `inbox/w-shared-from-w-engine-format6-regression.md`). The checkpoint's record LANDED by name
 > (goal 93's, main's 15:00: a 1 GiB green's was 650-1,063 ms in one step, record 527 ms): held in the owner's content
 > store a chunk a quantum, published, recorded as `CheckpointRef` (layout 16). OWED, piece 2: its build and encoding
 > are still one step (52 + 71 ms at 1 GiB; 5.7 + 9.5 ms at load_bench's 49 MB), inside the watchdog's 1 s window.
