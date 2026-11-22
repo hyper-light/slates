@@ -7,13 +7,10 @@
 // Each test binary uses part of the harness.
 #![allow(dead_code)]
 
+/// The suites' wait judgment, for a test of these harnesses' VMs (`guest_image`'s and `pmem`'s launchers name
+/// `vm::process_wait::...`): a module of the harness, not re-exports, so a binary that uses none of it has nothing unused.
 #[path = "../support/process_wait.rs"]
-mod process_wait;
-
-#[cfg(target_os = "linux")]
-pub(crate) use process_wait::await_exit_of;
-/// The suites' wait judgment, for a test of these harnesses' VMs (`guest_image`'s launcher).
-pub(crate) use process_wait::{InstanceWait, Judged, Verdict};
+pub(crate) mod process_wait;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
@@ -23,6 +20,15 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use slates_guest_probe::protocol::{Command as Ask, Reply};
+
+/// Why no console line came ([`Guest::next_line`]): what its caller fails with, beside the console's last lines.
+#[derive(Debug)]
+pub(crate) enum NoLine {
+  /// The VM's process tree stopped progressing, spent its CPU budget or is gone: the wait's verdict.
+  GaveUp(process_wait::Verdict),
+  /// The console's reader ended.
+  Closed,
+}
 
 /// Shape: the pause between polls of a starting daemon.
 pub(crate) const POLL: Duration = Duration::from_millis(20);
@@ -470,20 +476,19 @@ impl Guest {
   }
 
   /// The next line on the console, waited for while the VM's process tree gains CPU (`process_wait::Judged`: the VMM
-  /// and the device processes it forks; the guest's work is their CPU), failing the test with the console's last lines
-  /// once the tree stalls, spends its CPU budget or is gone. Until 2026-11-20 each wait had a wall bound of its own.
-  fn next_line(&mut self, what: &str) -> Result<String, RecvTimeoutError> {
+  /// and the device processes it forks; the guest's work is their CPU); [`NoLine`] once the tree stalls, spends its CPU
+  /// budget or is gone, or the console closes, for the caller to fail with the console's last lines. Until 2026-11-20
+  /// each wait had a wall bound of its own.
+  fn next_line(&mut self) -> Result<String, NoLine> {
     let mut judged = process_wait::Judged::of(self.vm.id());
     loop {
       match self.lines.recv_timeout(POLL) {
+        Ok(line) => return Ok(line),
+        Err(RecvTimeoutError::Disconnected) => return Err(NoLine::Closed),
         Err(RecvTimeoutError::Timeout) => match judged.judge() {
           process_wait::Verdict::Waiting { .. } => {}
-          gave_up => panic!(
-            "no {what}: the VM's processes are {gave_up:?}\n{}",
-            self.transcript()
-          ),
+          gave_up => return Err(NoLine::GaveUp(gave_up)),
         },
-        other => return other,
       }
     }
   }
@@ -492,7 +497,7 @@ impl Guest {
   /// failure's report.
   pub(crate) fn next_reply(&mut self) -> Reply {
     loop {
-      match self.next_line("reply") {
+      match self.next_line() {
         Ok(line) => {
           let parsed = Reply::parse(&line, self.most_bytes);
           self.keep(line.clone());
@@ -505,10 +510,13 @@ impl Guest {
             });
           }
         }
-        Err(RecvTimeoutError::Timeout) => {
-          panic!("no reply\n{}", self.transcript())
+        Err(NoLine::GaveUp(verdict)) => {
+          panic!(
+            "no reply: the VM's processes are {verdict:?}\n{}",
+            self.transcript()
+          )
         }
-        Err(RecvTimeoutError::Disconnected) => {
+        Err(NoLine::Closed) => {
           panic!("the VM's console closed\n{}", self.transcript())
         }
       }
@@ -559,17 +567,20 @@ impl Guest {
   /// kept, not answered: a caller expects none while it waits.
   pub(crate) fn expect_line(&mut self, words: &str) -> String {
     loop {
-      match self.next_line(words) {
+      match self.next_line() {
         Ok(line) => {
           self.keep(line.clone());
           if line.contains(words) {
             return line;
           }
         }
-        Err(RecvTimeoutError::Timeout) => {
-          panic!("no line holding `{words}`\n{}", self.transcript())
+        Err(NoLine::GaveUp(verdict)) => {
+          panic!(
+            "no line holding `{words}`: the VM's processes are {verdict:?}\n{}",
+            self.transcript()
+          )
         }
-        Err(RecvTimeoutError::Disconnected) => {
+        Err(NoLine::Closed) => {
           panic!(
             "the VM's console closed before `{words}`\n{}",
             self.transcript()

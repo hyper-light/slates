@@ -749,9 +749,23 @@ impl ContentStore {
   /// Starts an object put a window at a time ([`ContentStore::put_window`], [`ContentStore::finish_object`]): what an
   /// intake streams, its bytes arriving in pieces it never holds whole (§4.17.1 "A push's intake", rule 1; Subversion's
   /// commit texts, A-727 slice c). The same object [`ContentStore::put_object`] keeps, the same root, its windows kept as
-  /// each fills.
+  /// each fills. For an object whose length is not known until its last piece; one whose length is known begins with
+  /// [`ContentStore::begin_object_of_length`].
   pub fn begin_object(&self) -> Writing {
     Writing::default()
+  }
+
+  /// Starts an object of `len` bytes put a window at a time, as [`ContentStore::begin_object`] does, its window's buffer
+  /// reserved once now at the window or `len` if shorter, so no piece grows or moves it (goal 93, svn finding (2)):
+  /// begun empty, the buffer doubled from the first piece, and a 256 KiB text put in 65 KB copy slices made allocations
+  /// of 65, 130, 260 and 520 KB, 3.7 times the text, each below the large-path floor the system allocator keeps
+  /// (A-742). An object longer than `len` stays correct, its buffer growing past the reservation as an unsized one would.
+  pub fn begin_object_of_length(&self, len: u64) -> Writing {
+    let window = self.window.get();
+    Writing {
+      pending: Vec::with_capacity(usize::try_from(len).map_or(window, |len| len.min(window))),
+      ..Writing::default()
+    }
   }
 
   /// Takes `bytes`, the object's next piece of any length: every window it fills is kept at once (one holder, which the
@@ -2418,6 +2432,41 @@ mod tests {
       store.release(&pure).unwrap();
       assert_eq!(store.object_bytes(&pure, len), None);
       assert_eq!(store.len(), 0, "window {window}: nothing left");
+    }
+  }
+
+  /// Goal 93, svn finding (2) (main 01a20182, 2026-11-22 03:46 PST; Ada's rule: what the design can avoid, it does not
+  /// allocate). Do: begin an object of half a window, and one of three windows and a half, each with its length, and
+  /// put it in pieces of a quarter window. Expect: the window's buffer reserved once, at the begin, at the window or the
+  /// object's length if shorter, never grown or moved by a piece; the object the one put whole. Failing first: the
+  /// buffer grew by doubling from the first piece, so a 256 KiB text put in 65 KB copy slices made allocations of 65,
+  /// 130, 260 and 520 KB: 97.5 MB for 26.2 MB of text, 400 allocations, in w-svn's attribution
+  /// (`svn_commit::store_step_from`).
+  #[test]
+  fn an_object_begun_with_its_length_reserves_its_windows_buffer_once() {
+    for len in [NARROW / 2, 3 * NARROW + NARROW / 2] {
+      let bytes: Vec<u8> = (0..len)
+        .map(|at| u8::try_from(at * 7 % 251).unwrap())
+        .collect();
+      let mut whole = ContentStore::new(1 << 20, NARROW).unwrap();
+      let mut streamed = ContentStore::new(1 << 20, NARROW).unwrap();
+      let mut writing = streamed.begin_object_of_length(u64::try_from(len).unwrap());
+      let reserved = (writing.pending.capacity(), writing.pending.as_ptr());
+      assert_eq!(reserved.0, len.min(NARROW), "{len}: reserved at the begin");
+      for piece in bytes.chunks(NARROW / 4) {
+        streamed.put_window(&mut writing, piece).unwrap();
+        assert_eq!(
+          (writing.pending.capacity(), writing.pending.as_ptr()),
+          reserved,
+          "{len}: a piece neither grows nor moves the window's buffer"
+        );
+      }
+      assert_eq!(
+        streamed.finish_object(&mut writing).unwrap(),
+        whole.put_object(&bytes).unwrap(),
+        "{len}"
+      );
+      assert_eq!(held(&whole), held(&streamed), "{len}");
     }
   }
 

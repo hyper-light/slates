@@ -4204,7 +4204,6 @@ fn a_deleted_files_plaintext_leaves_the_content_object() {
   daemon.publish_every_shard().unwrap();
   let written = occurrences_in_content(&content, MARKER);
   client.fs_remove((volume, attachment), "gone").unwrap();
-  let started = Instant::now();
   let mut left = occurrences_in_content(&content, MARKER);
   while left > 0 {
     std::thread::yield_now();
@@ -4271,12 +4270,10 @@ fn a_sealed_files_plaintext_leaves_the_content_object() {
     .unwrap();
   let content = format!("slates-con-{tag}");
   let written = occurrences_in_content(&content, MARKER);
-  let started = Instant::now();
   while counter(&mut client, "content.sealed") == 0 {
     std::hint::spin_loop();
   }
   let sealed = counter(&mut client, "content.sealed");
-  let scrub_started = Instant::now();
   let mut left = occurrences_in_content(&content, MARKER);
   while left > 0 {
     std::thread::yield_now();

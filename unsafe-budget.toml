@@ -187,10 +187,10 @@
 #   ruling (a) on the hook pipe race: macOS has no `pipe2`, so a pipe made while another thread spawned leaked into that
 #   child and held a hook's words stream open past its exit), Unix: `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT` on
 #   macOS, which the standard library's `Command` cannot ask for, each libc call unsafe by signature — the
-#   `posix_spawn_file_actions_addchdir_np` declaration the pinned libc lacks on Apple (1), the file actions' and
-#   attributes' destroy on drop (1), their zeroed storage (1), the two `init`s (2) and the actions' destroy when the
-#   attributes' `init` fails (1), `adddup2` and `addopen` for the standard streams (2), `addchdir_np` (1), `setflags`
-#   (1), the signal sets made and set (1), `setpgroup` (1), and `posix_spawn` itself (1) (13). 147 → 160.
+#   `posix_spawn_file_actions_addchdir_np` declaration the pinned libc lacks on Apple (1), each record's `init` in its
+#   own boxed storage with its `assume_init` (2) and each one's destroy on drop (2), `adddup2` and `addopen` for the
+#   standard streams (2), `addchdir_np` (1), `setflags` (1), the signal sets made and set (1), `setpgroup` (1), and
+#   `posix_spawn` itself (1) (12). 147 → 159.
 # slates-server (5): the Windows liveness probe of a client's
 #   process (`peer.rs`, added 2026-09-05 with the dead-client reclaim): open, wait with a zero
 #   timeout, close (3), compiled only for Windows; and the daemon adopting the anchor's inherited
@@ -521,7 +521,7 @@ slates-db = 0
 # SYNCHRONIZE and PROCESS_QUERY_LIMITED_INFORMATION (OpenProcess, the handle adopted), reads its creation time
 # (GetProcessTimes, also of the daemon's own pseudo-handle, GetCurrentProcess) to tell it from a process given its pid
 # after it, and waits on the claim's Event and the process at once (WaitForMultipleObjects); compiled only for Windows.
-slates-ipc = 160
+slates-ipc = 159
 # 2026-11-18 (+1, A-452, `mach_claim.rs` compiled only for macOS; the budget raised by g251b, which found it over): the
 #   region fetch's receive ends on the kernel's send-once notification when the owner went away holding the fetch's
 #   reply right, and `fetch` destroys that notification with `mach_msg_destroy` (1), as every other refused or
