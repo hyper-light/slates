@@ -20,3 +20,6 @@ Clone: ~/slates-work/w-multirepo; target ~/.cache/w-multirepo-target.noindex; st
   for a split (~17:35); hands off usage.rs and vcs_share until then. Told w-balance (inbox overlap note).
 - LANDED 3b06a10d5 (main 4c43bbbe5): A-845 slates_vcs::rate. Reported.
 - NEXT 2c core: slates_vcs partition by marginal utility (UCP lookahead) over Curves above the floor; pure.
+- LANDED 19f31bfb7 (main 0ecd7ee1e): A-846 slates_vcs::partition. Reported. Main's lint touched mrc.rs (fine, 13/13).
+- NEXT: 2d wiring (owner shard: curves fed from content reads, rates from begun/stepped, partition at the learning
+  cadence, snapshot published) -- needs main's split ruling. Meanwhile: piece 7 (load proof test), which is mine.
