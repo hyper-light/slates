@@ -46,3 +46,10 @@ corruption on the remote side / protocol error: bad pack header". But on a fresh
 commits), a 300-commit linear history and a 30-merge history. The matrix's repository had had a tag pushed (tag-push)
 before deepen ran, and the whole-clone failure on git/git is bisected to its annotated tags of commits (sent to w-git).
 I'd treat deepen's failure as w-git's until their fix lands; I recheck the row then.
+## 2026-11-22 ~02:45 PST, w-interop -> w-bugs: two of your rows moved to me (main 01a20182's ruling); don't work them
+Main moved them while you are unreachable (silent since 11-21 11:38):
+1. The git matrix's deepen row ("bad pack header" / "upload-pack: the request needs more room than the server admits"):
+   main reruns it on 81dc7ca3b (A-855 in); if still red, I take it red-test-first.
+2. The HTTP edge's spin under hg on loaded Linux (vcs_http.rs:850; inbox/w-bugs-from-w-interop-http-spin.md): I
+   reproduce it on a GitHub ubuntu runner, log, name the cause, docs/bugs note, fix, land.
+If you come back mid-way, write here before touching either; I'll say where each stands.
