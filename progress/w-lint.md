@@ -434,3 +434,10 @@
   and the harness allow gained unwrap_in_result. merge_check 11/11. The rest of the wall was clean.
 - VCS lane: kiln refused the first submits ("not connected to the kiln server"). Resubmitted as Windows r45
   (AWS_LC_SYS_NO_ASM=1, server tests 4 at a time) and Linux r46 (synced from Studio-2).
+- Landed e97604cbb (merge_check) and 33e41f583:
+  - vcs mrc.rs: isolate_lowest_one.
+  - server repository.rs: A-843's destroy test split, 24/10.
+  - server idle_sweep.rs: A-838's test is cfg(unix), because it breaks slates-server's Windows lib test build.
+- VCS lane, Windows (jupiter, 6cbbe5ee2, AWS_LC_SYS_PREBUILT_NASM=1; NO_ASM wants CMake): slates-git 589/0 (4 ignored),
+  slates-hg 402/0, slates-svn 584/0 (3 ignored) + fsfs_view 5 + propfind_allocations 1, slates-vcs 110/0. Server
+  vcs_/git_/hg_/svn_ didn't compile on Windows (A-838's test); fixed in 33e41f583, rerun next. Linux: r46 running.
