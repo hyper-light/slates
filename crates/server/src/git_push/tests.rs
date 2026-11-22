@@ -3256,13 +3256,15 @@ fn t_a859_a_clone_of_a_deltified_push_sends_its_entries_as_they_lie() {
       (0, u64::try_from(objects.len()).unwrap()),
       "every pushed object sent as its entry lies, none encoded: {counted_streamed:?}"
     );
-    // A-864: each sent on by its kept CRC32, none rebuilt to be checked.
+    // A-864: each sent on by its kept CRC32, none rebuilt to be checked; the pack read front to back (piece 1), no
+    // pushed entry read before the one read before it.
     assert_eq!(
       (
         counted_streamed.reuse_rebuilt,
-        counted_streamed.reuse_crc_missed
+        counted_streamed.reuse_crc_missed,
+        counted_streamed.backward_reads
       ),
-      (0, 0),
+      (0, 0, 0),
       "{counted_streamed:?}"
     );
     assert_whole_clone(&streamed, objects.len());

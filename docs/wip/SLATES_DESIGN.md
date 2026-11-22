@@ -60957,4 +60957,13 @@ owed.
   (a row's entry read back); `slates-server` `git_push::tests::t_a859_a_clone_of_a_deltified_push_sends_its_entries_as_they_lie`
   (none rebuilt). A bit flipped in a stored entry's bytes themselves leaves no copy to rebuild it from: the rebuild's
   check refuses it and the answer refuses typed, never sending it.
-- **Owed.** main's git/git whole round: the clone within PATIENCE, the encoding's `reuse_unread` 0.
+- **Piece 1, the loose stage in pack order** (main 01a20182's ruling of 2026-11-22, ahead of bounded residency). The
+  loose stage met objects by position (type, then id), so its reads jumped about each pack, every window read many
+  times. Now its objects are first read into an order (`Stage::Order`, a row a unit; three words an object charged to
+  the request's admission: a pack's ordinal, an offset and a position, 24 bytes, 3.6 MB for git/git's 150,000) and
+  sorted by pack and offset, those held whole last by position: each pack is read front to back, as git writes the
+  entries it reuses, an offset delta's base always before it, each window wanted once. Counted `backward_reads`.
+  `git_push::tests::t_a859_a_clone_of_a_deltified_push_sends_its_entries_as_they_lie`: 0 backward reads (88 in position
+  order), its streamed clone 17,299 bytes, the pushed pack's own, in 175 turns where 403 went before.
+- **Owed.** main's git/git whole round: the clone within PATIENCE, the encoding's `reuse_unread` 0. Pieces 2 and 3: a
+  turn's windows brought back ahead of it and let go behind it, residency at its peak a turn's windows.
