@@ -8,6 +8,7 @@
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(
   clippy::unwrap_used,
+  clippy::unwrap_in_result,
   clippy::expect_used,
   clippy::panic,
   clippy::indexing_slicing
@@ -807,6 +808,52 @@ const HISTORY_SLOTS: u64 = 4;
 /// Shape: see [`HISTORY_FILES`].
 const HISTORY_SLOT: u64 = 8;
 
+/// Resolves work `work` (the history's `index`) over `windows` until it rebases: each ask replaces the work's `slots`
+/// that a window given up so far overlaps with its `bytes`, and a resolution that conflicts again gives up its windows
+/// too. Each ask is said in `said`.
+fn resolved_until_rebased(
+  client: &mut Client,
+  (index, work): (usize, VolumeId),
+  windows: Vec<slates_ipc::protocol::MergeWindow>,
+  (slots, bytes): (&std::collections::BTreeSet<(usize, u64)>, &[u8]),
+  said: &mut Vec<String>,
+) {
+  let mut over = windows;
+  loop {
+    let replacement = slots
+      .iter()
+      .filter(|(file, at)| {
+        over.iter().any(|w| {
+          w.path == HISTORY_FILES[*file] && *at < w.at + w.len.max(1) && w.at < at + HISTORY_SLOT
+        })
+      })
+      .map(|(file, at)| WorkChange::Edit {
+        path: HISTORY_FILES[*file].to_owned(),
+        at: *at,
+        delete_len: HISTORY_SLOT,
+        bytes: bytes.to_vec(),
+      })
+      .collect();
+    match client
+      .resolve_conflict(work, over.clone(), replacement)
+      .unwrap()
+    {
+      Rebased::Rebased(head) => {
+        said.push(format!("work {index} resolved over {over:?} at {head}"));
+        return;
+      }
+      Rebased::Conflict(more) => {
+        said.push(format!("work {index} resolution kept conflicting {more:?}"));
+        for window in more {
+          if !over.contains(&window) {
+            over.push(window);
+          }
+        }
+      }
+    }
+  }
+}
+
 /// One generated history of A-840 resolutions (the load harness's pattern, serial): `works` works over one green, each
 /// writing three slots drawn by `seed`, submitted in a drawn order; a conflict resolved in one ask, the windows given up
 /// accumulated until it succeeds, the work's slots in them written again. Every accept's version must hold the work's
@@ -844,7 +891,10 @@ fn one_ask_history(
       .unwrap();
     let mut slots = std::collections::BTreeSet::new();
     while slots.len() < 3 {
-      slots.insert((draw(2) as usize, draw(HISTORY_SLOTS) * HISTORY_SLOT));
+      slots.insert((
+        usize::try_from(draw(2)).unwrap(),
+        draw(HISTORY_SLOTS) * HISTORY_SLOT,
+      ));
     }
     let bytes =
       format!("w{index}......").into_bytes()[..usize::try_from(HISTORY_SLOT).unwrap()].to_vec();
@@ -869,7 +919,7 @@ fn one_ask_history(
       return Err(format!("no progress\n{}", said.join("\n")));
     }
     let open: Vec<usize> = (0..works).filter(|index| !plans[*index].4).collect();
-    let index = open[draw(open.len() as u64) as usize];
+    let index = open[usize::try_from(draw(u64::try_from(open.len()).unwrap())).unwrap()];
     let (work, slots, bytes, _, _) = plans[index].clone();
     match client.submit(work).unwrap() {
       Submitted::Accepted(version) => {
@@ -893,42 +943,7 @@ fn one_ask_history(
       }
       Submitted::Conflict(windows) => {
         said.push(format!("work {index} conflict {windows:?}"));
-        let mut over = windows;
-        loop {
-          let replacement = slots
-            .iter()
-            .filter(|(file, at)| {
-              over.iter().any(|w| {
-                w.path == HISTORY_FILES[*file]
-                  && *at < w.at + w.len.max(1)
-                  && w.at < at + HISTORY_SLOT
-              })
-            })
-            .map(|(file, at)| WorkChange::Edit {
-              path: HISTORY_FILES[*file].to_owned(),
-              at: *at,
-              delete_len: HISTORY_SLOT,
-              bytes: bytes.clone(),
-            })
-            .collect();
-          match client
-            .resolve_conflict(work, over.clone(), replacement)
-            .unwrap()
-          {
-            Rebased::Rebased(head) => {
-              said.push(format!("work {index} resolved over {over:?} at {head}"));
-              break;
-            }
-            Rebased::Conflict(more) => {
-              said.push(format!("work {index} resolution kept conflicting {more:?}"));
-              for window in more {
-                if !over.contains(&window) {
-                  over.push(window);
-                }
-              }
-            }
-          }
-        }
+        resolved_until_rebased(client, (index, work), windows, (&slots, &bytes), &mut said);
       }
       other => return Err(format!("work {index}: {other:?}\n{}", said.join("\n"))),
     }
@@ -937,7 +952,7 @@ fn one_ask_history(
       let (rival, _) = client
         .create_work(green, &format!("hist-{seed}-r{steps}"))
         .unwrap();
-      let file = draw(2) as usize;
+      let file = usize::try_from(draw(2)).unwrap();
       let at = draw(HISTORY_SLOTS) * HISTORY_SLOT;
       let rival_bytes =
         format!("r{steps}........").into_bytes()[..usize::try_from(HISTORY_SLOT).unwrap()].to_vec();
