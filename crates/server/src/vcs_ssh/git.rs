@@ -310,6 +310,11 @@ impl<L: StoreLender> Command for UploadCommand<L> {
 
   async fn step(&mut self, _gone: ClientGone<'_>) -> Result<Stepped, Refused> {
     if self.answer.is_some() {
+      // A-864 piece 2: the windows the next turn reads brought back first, off the turn.
+      if let Some(pack) = self.answer.as_ref().and_then(|made| made.pack_source()) {
+        let reads = L::pack_reads(pack);
+        self.lender.read_ahead(reads).await;
+      }
       let next = self.write_answer()?;
       return Ok(Stepped { consumed: 0, next });
     }

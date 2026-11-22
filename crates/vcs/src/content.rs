@@ -294,6 +294,41 @@ enum Kept {
   },
 }
 
+/// What a content store holds ([`ContentStore::census`]): each kind of entry's count and bytes, by where its bytes are.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ContentCensus {
+  /// Windows kept by the window storage (the shard's chunk store, or the heap where it has none).
+  pub stored: u64,
+  /// Their bytes.
+  pub stored_bytes: u64,
+  /// Windows let go (A-724 piece 4): kept on the node's store, not here.
+  pub away: u64,
+  /// Their bytes.
+  pub away_bytes: u64,
+  /// Windows kept in the store's own memory.
+  pub here_windows: u64,
+  /// Their bytes.
+  pub here_window_bytes: u64,
+  /// Lists, in the store's own memory.
+  pub lists: u64,
+  /// Their bytes.
+  pub list_bytes: u64,
+  /// Index tables, in the store's own memory.
+  pub tables: u64,
+  /// Their bytes.
+  pub table_bytes: u64,
+  /// Derived nodes, in the store's own memory.
+  pub derived: u64,
+  /// Their bytes.
+  pub derived_bytes: u64,
+  /// Objects named by their identity.
+  pub objects: u64,
+  /// The bytes counted against the store's budget.
+  pub used: u64,
+  /// The bytes structures beside it charged to it.
+  pub charged: u64,
+}
+
 /// What the store has done, for the tests' non-vacuity checks and the owner's accounting.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ContentCounters {
@@ -370,6 +405,15 @@ impl Writing {
   pub fn windows_kept(&self) -> usize {
     self.windows.len()
   }
+
+  /// The buffer the object's windows were filled in, taken out, emptied: what a writer that puts object after object
+  /// hands the next one ([`ContentStore::begin_object_reusing`]). Taken from a writer not yet finished, its pending
+  /// bytes go with it, so it is taken once the object is finished or before it is abandoned.
+  pub fn take_buffer(&mut self) -> Vec<u8> {
+    let mut buffer = std::mem::take(&mut self.pending);
+    buffer.clear();
+    buffer
+  }
 }
 
 /// The content store (module docs).
@@ -385,6 +429,9 @@ pub struct ContentStore {
   lists_changed: BTreeSet<ContentId>,
   /// The objects named or unnamed since its owner last took the changes (A-727 slice a3b).
   names_changed: BTreeSet<ContentId>,
+  /// The windows let go, brought back or freed away since its owner last took the changes (A-767 C1 step 2b): the
+  /// shard image carries every window let go, so a restart keeps it as let go, never as absent.
+  away_changed: BTreeSet<ContentId>,
   /// Where the windows' bytes are kept (A-727).
   storage: Box<dyn WindowStorage>,
   /// The longest content the store holds: the content plane's window.
@@ -417,6 +464,11 @@ pub enum LetGoRefused {
   Shared,
   /// Already let go.
   Away,
+  /// A holder of it cannot bring it back by its own read path ([`ContentStore::let_go_landed`]): it stays.
+  Pinned {
+    /// The holder that pins it.
+    by: &'static str,
+  },
 }
 
 /// A byte count as the store keeps it.
@@ -562,6 +614,7 @@ impl ContentStore {
       rooted: BTreeMap::new(),
       lists_changed: BTreeSet::new(),
       names_changed: BTreeSet::new(),
+      away_changed: BTreeSet::new(),
       storage: Box::new(HeapWindows::default()),
       window,
       fanout,
@@ -745,9 +798,44 @@ impl ContentStore {
   /// Starts an object put a window at a time ([`ContentStore::put_window`], [`ContentStore::finish_object`]): what an
   /// intake streams, its bytes arriving in pieces it never holds whole (§4.17.1 "A push's intake", rule 1; Subversion's
   /// commit texts, A-727 slice c). The same object [`ContentStore::put_object`] keeps, the same root, its windows kept as
-  /// each fills.
+  /// each fills. For an object whose length is not known until its last piece; one whose length is known begins with
+  /// [`ContentStore::begin_object_of_length`].
   pub fn begin_object(&self) -> Writing {
     Writing::default()
+  }
+
+  /// Starts an object of `len` bytes put a window at a time, as [`ContentStore::begin_object`] does, its window's buffer
+  /// reserved once now at the window or `len` if shorter, so no piece grows or moves it (goal 93, svn finding (2)):
+  /// begun empty, the buffer doubled from the first piece, and a 256 KiB text put in 65 KB copy slices made allocations
+  /// of 65, 130, 260 and 520 KB, 3.7 times the text, each below the large-path floor the system allocator keeps
+  /// (A-742). An object longer than `len` stays correct, its buffer growing past the reservation as an unsized one would.
+  pub fn begin_object_of_length(&self, len: u64) -> Writing {
+    let window = self.window.get();
+    Writing {
+      pending: Vec::with_capacity(usize::try_from(len).map_or(window, |len| len.min(window))),
+      ..Writing::default()
+    }
+  }
+
+  /// Starts an object of `len` bytes (none: not known) as [`ContentStore::begin_object_of_length`] does, its window's
+  /// buffer `buffer`, a previous object's ([`Writing::take_buffer`]): a writer that puts object after object (an
+  /// import's texts) owns one buffer and hands it from each to the next, so no object allocates one of its own (P7
+  /// finding (2), main 01a20182's routing of 2026-11-22 07:38: one buffer a text was among the import's churners).
+  /// Where it is shorter than the object needs (the window, or `len` if shorter), it is grown once, to the window, so
+  /// it grows at most once over the writer's life.
+  pub fn begin_object_reusing(&self, len: Option<u64>, mut buffer: Vec<u8>) -> Writing {
+    let window = self.window.get();
+    let wanted = len.map_or(window, |len| {
+      usize::try_from(len).map_or(window, |len| len.min(window))
+    });
+    buffer.clear();
+    if buffer.capacity() < wanted {
+      buffer.reserve_exact(window);
+    }
+    Writing {
+      pending: buffer,
+      ..Writing::default()
+    }
   }
 
   /// Takes `bytes`, the object's next piece of any length: every window it fills is kept at once (one holder, which the
@@ -1054,6 +1142,9 @@ impl ContentStore {
     let Some(freed) = self.entries.remove(identity) else {
       return Err(ContentRefused::NotHeld);
     };
+    if matches!(freed.kept, Kept::Away { .. }) {
+      self.away_changed.insert(*identity);
+    }
     // A freed root takes its object's name with it (module docs, "The identity rule").
     if let Some(named) = self.rooted.remove(identity) {
       self.objects.remove(&named);
@@ -1143,12 +1234,85 @@ impl ContentStore {
     if held.holders > 1 {
       return Err(LetGoRefused::Shared);
     }
-    held.kept = Kept::Away { len };
+    Ok(self.released_away(identity, window, len))
+  }
+
+  /// Lets go of the window `identity` names, marked landed ([`ContentStore::mark_landed`]: a landed changeset on the
+  /// node's store holds its bytes), whatever its holders count, unless `pinned_by` names a holder of it that cannot bring
+  /// it back by its own read path (main 01a20182's ruling of 2026-11-22 06:58: a landed window may go only where every
+  /// holder of it can). What [`ContentStore::let_go`] refuses `Shared` this lets go: the holders are a landed push's own
+  /// (its staged pack, its repository's pack), each a reader that brings the window back by its pack's identity. The
+  /// store keeps no holder's kind, so its owner names the pinning one (a home, read by the window's identity alone, by
+  /// where the identity's home is: `slates-server`'s homes), which holds across a restart. The bytes freed.
+  ///
+  /// # Errors
+  /// `NotHeld`, `NotAWindow`, `Away` and `NotLanded` as [`ContentStore::let_go`]; `Pinned` naming the holder.
+  pub fn let_go_landed(
+    &mut self,
+    identity: &ContentId,
+    pinned_by: Option<&'static str>,
+  ) -> Result<u64, LetGoRefused> {
+    let identity = self.resolve(identity);
+    let held = self
+      .entries
+      .get_mut(&identity)
+      .ok_or(LetGoRefused::NotHeld)?;
+    let (window, len) = match held.kept {
+      Kept::Stored { window, len } if held.form == Form::Window => (window, len),
+      Kept::Away { .. } => return Err(LetGoRefused::Away),
+      _ => return Err(LetGoRefused::NotAWindow),
+    };
+    if !held.landed {
+      return Err(LetGoRefused::NotLanded);
+    }
+    if let Some(by) = pinned_by {
+      return Err(LetGoRefused::Pinned { by });
+    }
+    Ok(self.released_away(identity, window, len))
+  }
+
+  /// Every window of the object `identity` names marked landed and let go ([`ContentStore::let_go_landed`]), each but
+  /// those `pinned_by` names a pinning holder of: the bytes freed and the windows kept pinned.
+  pub fn let_go_object_landed(
+    &mut self,
+    identity: &ContentId,
+    pinned_by: &dyn Fn(&ContentId) -> Option<&'static str>,
+  ) -> (u64, u64) {
+    let (mut freed, mut pinned) = (0u64, 0u64);
+    for window in self.object_windows(identity) {
+      if !self.mark_landed(&window) {
+        continue;
+      }
+      match self.let_go_landed(&window, pinned_by(&window)) {
+        Ok(bytes) => freed = freed.saturating_add(bytes),
+        Err(LetGoRefused::Pinned { .. }) => pinned = pinned.saturating_add(1),
+        Err(_) => {}
+      }
+    }
+    (freed, pinned)
+  }
+
+  /// The windows of the object `identity` names, in order: itself where it is one window.
+  fn object_windows(&self, identity: &ContentId) -> Vec<ContentId> {
+    let mut windows = Vec::new();
+    let mut walk = self.windows(identity);
+    while let Some(window) = walk.next_window() {
+      windows.push(window);
+    }
+    windows
+  }
+
+  /// Marks the window `identity` (kept as `window`, `len` bytes) let go, its storage given back: the bytes freed.
+  fn released_away(&mut self, identity: ContentId, window: StoredWindow, len: usize) -> u64 {
+    if let Some(held) = self.entries.get_mut(&identity) {
+      held.kept = Kept::Away { len };
+    }
+    self.away_changed.insert(identity);
     self.storage.release(window);
     let freed = u64::try_from(len).unwrap_or(u64::MAX);
     self.content_bytes = self.content_bytes.saturating_sub(freed);
     self.counters.let_go = self.counters.let_go.saturating_add(1);
-    Ok(freed)
+    freed
   }
 
   /// Brings back a window let go, from `bytes` its reader read from the node's store (A-724 piece 4; the tools'
@@ -1173,9 +1337,32 @@ impl ContentStore {
     if let Some(held) = self.entries.get_mut(&identity) {
       held.kept = Kept::Stored { window, len };
     }
+    self.away_changed.insert(identity);
     self.content_bytes = self.content_bytes.saturating_add(need);
     self.counters.brought_back = self.counters.brought_back.saturating_add(1);
     Ok(())
+  }
+
+  /// Marks every window of the object `identity` names landed and lets go each one it alone holds (A-767 C1 step 2b: a
+  /// Mercurial import's file revisions, once the changeset carrying them is durable on the node's store): the bytes
+  /// freed. A window another holder keeps stays, as [`ContentStore::let_go`] keeps it (`Shared`), and one let go already
+  /// stays away; the object's lists stay, so its windows' identities and lengths are still its own and a reader brings
+  /// it back by its bytes ([`ContentStore::bring_back_object`]).
+  pub fn let_go_object(&mut self, identity: &ContentId) -> u64 {
+    let mut windows = Vec::new();
+    let mut walk = self.windows(identity);
+    while let Some(window) = walk.next_window() {
+      windows.push(window);
+    }
+    let mut freed = 0u64;
+    for window in &windows {
+      if self.mark_landed(window)
+        && let Ok(bytes) = self.let_go(window)
+      {
+        freed = freed.saturating_add(bytes);
+      }
+    }
+    freed
   }
 
   /// Brings back every window let go of the object `identity` names ([`ContentStore::put_object`]'s identity), from
@@ -1364,6 +1551,64 @@ impl ContentStore {
   pub fn clear_changes(&mut self) {
     self.lists_changed.clear();
     self.names_changed.clear();
+    self.away_changed.clear();
+  }
+
+  /// Every window let go ([`ContentStore::let_go`]) and not brought back, with its length: what a shard image carries
+  /// whole, so a restart keeps each as let go (A-767 C1 step 2b, main's ruling (a) of 2026-11-22 02:52).
+  pub fn aways(&self) -> impl Iterator<Item = (ContentId, u64)> + '_ {
+    self
+      .entries
+      .iter()
+      .filter_map(|(identity, held)| match held.kept {
+        Kept::Away { len } => Some((*identity, u64::try_from(len).unwrap_or(u64::MAX))),
+        _ => None,
+      })
+  }
+
+  /// The windows let go, brought back or freed since the owner last took the changes: each with its length while it is
+  /// let go, none once it is not (brought back, or freed): what a delta carries of [`ContentStore::aways`].
+  pub fn away_changes(&self) -> Vec<(ContentId, Option<u64>)> {
+    self
+      .away_changed
+      .iter()
+      .map(|identity| {
+        let away = match self.entries.get(identity).map(|held| &held.kept) {
+          Some(Kept::Away { len }) => Some(u64::try_from(*len).unwrap_or(u64::MAX)),
+          _ => None,
+        };
+        (*identity, away)
+      })
+      .collect()
+  }
+
+  /// Takes back the windows let go that a shard image carried ([`ContentStore::aways`]), before its lists
+  /// ([`ContentStore::restore_nodes`], which hold the nodes they name): each an entry of no bytes and its length, landed,
+  /// held by no one until a list or a row holds it again, read as nothing until brought back by its own bytes. One the
+  /// store holds already, or of no length or past a window, is left out: the image recorded it, so the store never
+  /// infers one (a window the image never named stays absent, a reader's typed `NotHeld`). The count left out.
+  pub fn restore_away(&mut self, aways: Vec<(ContentId, u64)>) -> u64 {
+    let mut refused = 0u64;
+    for (identity, len) in aways {
+      let len = usize::try_from(len)
+        .ok()
+        .filter(|len| *len > 0 && *len <= self.window.get());
+      let Some(len) = len.filter(|_| !self.entries.contains_key(&identity)) else {
+        refused = refused.saturating_add(1);
+        continue;
+      };
+      self.entries.insert(
+        identity,
+        Held {
+          kept: Kept::Away { len },
+          form: Form::Window,
+          holders: 0,
+          landed: true,
+          last_read: core::cell::Cell::new(0),
+        },
+      );
+    }
+    refused
   }
 
   /// Takes back the lists and names a shard image carried (A-727 slice a3b), after the windows its storage restored
@@ -1570,6 +1815,39 @@ impl ContentStore {
     }
   }
 
+  /// The window of the object `root` (`len` bytes long) that holds byte `offset`, where it is let go
+  /// ([`ContentStore::let_go`]): its identity and its range in the object, for a reader that met it to have its bytes
+  /// brought back ([`ContentStore::bring_back`]) before it reads on. `None` where that window is held, or the store does
+  /// not hold the path down to it.
+  pub fn away_window(
+    &self,
+    root: &ContentId,
+    len: u64,
+    offset: u64,
+  ) -> Option<(ContentId, u64, u64)> {
+    let root = &self.resolve(root);
+    let window = u64::try_from(self.window.get()).ok()?;
+    let fanout = u64::try_from(self.fanout.get()).ok()?;
+    let windows = len.div_ceil(window).max(1);
+    let index = offset.checked_div(window)?;
+    if index >= windows {
+      return None;
+    }
+    let height = list_levels(windows, fanout)?;
+    let identity = self.window_identity(root, (height, fanout), index)?;
+    let Kept::Away { len: away } = self.entries.get(&identity)?.kept else {
+      return None;
+    };
+    let start = index.checked_mul(window)?;
+    Some((identity, start, u64::try_from(away).ok()?))
+  }
+
+  /// The identity (the plain BLAKE3 of its bytes) of the object this store keeps as `root`: the name the node's store
+  /// keys it by. A root that is a window is its own identity.
+  pub fn object_identity(&self, root: &ContentId) -> ContentId {
+    self.rooted.get(root).copied().unwrap_or(*root)
+  }
+
   /// The identity of window `index` under `root`, read down the one list a level of a tree `height` lists deep, each of
   /// `fanout` children: at each level the child is that level's digit of `index` in the fanout's base.
   fn window_identity(
@@ -1600,6 +1878,17 @@ impl ContentStore {
       bytes.extend_from_slice(&window);
     }
     (u64::try_from(bytes.len()).ok()? == len).then_some(bytes)
+  }
+
+  /// Whether the store holds the object `identity` names whole in memory: held, and none of its windows let go
+  /// ([`ContentStore::let_go`]). A reader that needs its bytes and finds it not whole reads it again from where it was
+  /// landed, and its put brings the windows let go back.
+  pub fn holds_whole(&self, identity: &ContentId) -> bool {
+    self.contains(identity)
+      && self
+        .object_windows(identity)
+        .iter()
+        .all(|window| !self.is_away(window))
   }
 
   /// Whether the store holds the content `identity` names.
@@ -1651,6 +1940,31 @@ impl ContentStore {
   /// The bytes charged now.
   pub fn charged(&self) -> u64 {
     self.charged_bytes
+  }
+
+  /// What the store holds, by where its bytes are and what they are (the memory status's gauges, main's ruling of
+  /// 2026-11-22 03:46): a walk of every entry, so only a memory status asks.
+  pub fn census(&self) -> ContentCensus {
+    let mut census = ContentCensus {
+      objects: u64::try_from(self.objects.len()).unwrap_or(u64::MAX),
+      used: self.used(),
+      charged: self.charged_bytes,
+      ..ContentCensus::default()
+    };
+    for held in self.entries.values() {
+      let len = u64::try_from(held.len()).unwrap_or(u64::MAX);
+      let (count, bytes) = match (&held.kept, held.form) {
+        (Kept::Away { .. }, _) => (&mut census.away, &mut census.away_bytes),
+        (Kept::Stored { .. }, _) => (&mut census.stored, &mut census.stored_bytes),
+        (Kept::Here(_), Form::Window) => (&mut census.here_windows, &mut census.here_window_bytes),
+        (Kept::Here(_), Form::List) => (&mut census.lists, &mut census.list_bytes),
+        (Kept::Here(_), Form::Table) => (&mut census.tables, &mut census.table_bytes),
+        (Kept::Here(_), Form::Derived) => (&mut census.derived, &mut census.derived_bytes),
+      };
+      *count = count.saturating_add(1);
+      *bytes = bytes.saturating_add(len);
+    }
+    census
   }
 
   /// What the store has done.
@@ -1768,6 +2082,19 @@ impl Windows<'_> {
         return Some(identity);
       }
       self.stack.pop();
+    }
+  }
+
+  /// The next window's identity, its lists walked through and none read: what [`ContentStore::let_go_object`] lets
+  /// go; `None` once every list is read, or at a content the store does not hold.
+  fn next_window(&mut self) -> Option<ContentId> {
+    loop {
+      let identity = self.next_identity()?;
+      let held = self.store.entries.get(&identity)?;
+      if held.form != Form::List {
+        return Some(identity);
+      }
+      self.stack.push((held.here()?, 0));
     }
   }
 }
@@ -2319,6 +2646,94 @@ mod tests {
     }
   }
 
+  /// Goal 93, svn finding (2) (main 01a20182, 2026-11-22 03:46 PST; Ada's rule: what the design can avoid, it does not
+  /// allocate). Do: begin an object of half a window, and one of three windows and a half, each with its length, and
+  /// put it in pieces of a quarter window. Expect: the window's buffer reserved once, at the begin, at the window or the
+  /// object's length if shorter, never grown or moved by a piece; the object the one put whole. Failing first: the
+  /// buffer grew by doubling from the first piece, so a 256 KiB text put in 65 KB copy slices made allocations of 65,
+  /// 130, 260 and 520 KB: 97.5 MB for 26.2 MB of text, 400 allocations, in w-svn's attribution
+  /// (`svn_commit::store_step_from`).
+  #[test]
+  fn an_object_begun_with_its_length_reserves_its_windows_buffer_once() {
+    for len in [NARROW / 2, 3 * NARROW + NARROW / 2] {
+      let bytes: Vec<u8> = (0..len)
+        .map(|at| u8::try_from(at * 7 % 251).unwrap())
+        .collect();
+      let mut whole = ContentStore::new(1 << 20, NARROW).unwrap();
+      let mut streamed = ContentStore::new(1 << 20, NARROW).unwrap();
+      let mut writing = streamed.begin_object_of_length(u64::try_from(len).unwrap());
+      let reserved = (writing.pending.capacity(), writing.pending.as_ptr());
+      assert_eq!(reserved.0, len.min(NARROW), "{len}: reserved at the begin");
+      for piece in bytes.chunks(NARROW / 4) {
+        streamed.put_window(&mut writing, piece).unwrap();
+        assert_eq!(
+          (writing.pending.capacity(), writing.pending.as_ptr()),
+          reserved,
+          "{len}: a piece neither grows nor moves the window's buffer"
+        );
+      }
+      assert_eq!(
+        streamed.finish_object(&mut writing).unwrap(),
+        whole.put_object(&bytes).unwrap(),
+        "{len}"
+      );
+      assert_eq!(held(&whole), held(&streamed), "{len}");
+    }
+  }
+
+  /// Goal 93, P7 finding (2) (main 01a20182's routing of 2026-11-22 07:38: the import's sink made one window buffer a
+  /// text). Do: put four objects in turn, each begun on the buffer the one before handed back (`take_buffer`), the first
+  /// on an empty one: half a window, three windows and a half, a quarter window, and one of unknown length, in pieces of
+  /// a quarter window, the third abandoned part-way. Expect: the buffer grown once, at the first object, to the window,
+  /// and never grown or moved after; every finished object the one put whole; the abandoned one leaving nothing held.
+  /// Failing first: each object made a buffer of its own.
+  #[test]
+  fn objects_begun_in_turn_on_one_buffer_never_make_another() {
+    let mut whole = ContentStore::new(1 << 20, NARROW).unwrap();
+    let mut streamed = ContentStore::new(1 << 20, NARROW).unwrap();
+    let mut buffer = Vec::new();
+    let mut seen: Option<(usize, *const u8)> = None;
+    for (at, len) in [NARROW / 2, 3 * NARROW + NARROW / 2, NARROW / 4, 2 * NARROW]
+      .into_iter()
+      .enumerate()
+    {
+      let bytes: Vec<u8> = (0..len)
+        .map(|byte| u8::try_from((byte * 7 + at) % 251).unwrap())
+        .collect();
+      let known = (at != 3).then(|| u64::try_from(len).unwrap());
+      let mut writing = streamed.begin_object_reusing(known, std::mem::take(&mut buffer));
+      let now = (writing.pending.capacity(), writing.pending.as_ptr());
+      assert_eq!(now.0, NARROW, "object {at}: the buffer is the window's");
+      if let Some(seen) = seen {
+        assert_eq!(
+          now, seen,
+          "object {at}: the same buffer, neither grown nor moved"
+        );
+      }
+      seen = Some(now);
+      if at == 2 {
+        streamed.put_window(&mut writing, &bytes[..1]).unwrap();
+        buffer = writing.take_buffer();
+        streamed.abandon_object(writing);
+        continue;
+      }
+      for piece in bytes.chunks(NARROW / 4) {
+        streamed.put_window(&mut writing, piece).unwrap();
+      }
+      assert_eq!(
+        streamed.finish_object(&mut writing).unwrap(),
+        whole.put_object(&bytes).unwrap(),
+        "object {at}"
+      );
+      buffer = writing.take_buffer();
+    }
+    assert_eq!(
+      held(&whole),
+      held(&streamed),
+      "the objects finished, nothing of the abandoned one"
+    );
+  }
+
   /// `object` put into one store whole and into another `piece` bytes at a time, twice each: the same root, the same
   /// contents and bytes used, and the object read back.
   fn assert_put_by_pieces_is_put_whole(object: &[u8], piece: usize) {
@@ -2430,25 +2845,47 @@ mod tests {
     let mut store = ContentStore::new(1 << 20, 4096).unwrap();
     let bytes = vec![7u8; 1000];
     let id = store.put(&bytes).unwrap();
-    assert_eq!(store.let_go(&id), Err(LetGoRefused::NotLanded));
-    assert!(store.mark_landed(&id));
+    let before = let_go_once_landed(&mut store, &id);
+    brought_back_by_its_own_bytes(&mut store, (&id, &bytes), before);
+  }
+
+  /// The window `id` refused `NotLanded`, then marked and let go: freed, read as nothing, its length kept, counted, a
+  /// second let-go refused `Away`. The store's count before it was let go.
+  fn let_go_once_landed(store: &mut ContentStore, id: &ContentId) -> u64 {
+    assert_eq!(store.let_go(id), Err(LetGoRefused::NotLanded));
+    assert!(store.mark_landed(id));
     let before = store.content_bytes;
-    assert_eq!(store.let_go(&id), Ok(1000));
+    assert_eq!(store.let_go(id), Ok(1000));
     assert_eq!(store.content_bytes, before - 1000);
-    assert!(store.is_away(&id));
-    assert_eq!(store.bytes_of(&id), None);
-    assert_eq!(store.len_of(&id), Some(1000));
-    assert_eq!(store.let_go(&id), Err(LetGoRefused::Away));
+    assert!(store.is_away(id));
+    assert_eq!(store.bytes_of(id), None);
+    assert_eq!(store.len_of(id), Some(1000));
+    assert_eq!(store.let_go(id), Err(LetGoRefused::Away));
     assert_eq!(store.counters.let_go, 1);
+    before
+  }
+
+  /// The window `id`, let go, refused other bytes and brought back by `bytes`, its own: read whole, counted, the store's
+  /// count `before` again.
+  fn brought_back_by_its_own_bytes(
+    store: &mut ContentStore,
+    (id, bytes): (&ContentId, &[u8]),
+    before: u64,
+  ) {
     assert_eq!(
-      store.bring_back(&id, &vec![8u8; 1000]),
+      store.bring_back(id, &vec![8u8; 1000]),
       Err(ContentRefused::NotHeld)
     );
-    store.bring_back(&id, &bytes).unwrap();
-    assert!(!store.is_away(&id));
-    assert_eq!(store.bytes_of(&id).as_deref(), Some(bytes.as_slice()));
+    store.bring_back(id, bytes).unwrap();
+    assert!(!store.is_away(id));
+    assert_eq!(store.bytes_of(id).as_deref(), Some(bytes));
     assert_eq!(store.counters.brought_back, 1);
     assert_eq!(store.content_bytes, before);
+  }
+
+  /// `len` bytes of a pattern that repeats every 251, so no two windows of a test's object are alike.
+  fn patterned(len: usize) -> Vec<u8> {
+    (0..len).map(|at| u8::try_from(at % 251).unwrap()).collect()
   }
 
   /// A-767 C1 step 2a (a push's work reading a text an import let go). Do: put an object of three windows and a part,
@@ -2459,15 +2896,11 @@ mod tests {
   fn an_object_let_go_is_brought_back_whole_by_its_own_bytes() {
     let window = 4096usize;
     let mut store = ContentStore::new(1 << 22, window).unwrap();
-    let bytes: Vec<u8> = (0..window * 3 + 100).map(|at| (at % 251) as u8).collect();
+    let bytes = patterned(window * 3 + 100);
     let object = store.put_object(&bytes).unwrap();
     let before = store.content_bytes;
     let windows: Vec<ContentId> = bytes.chunks(window).map(ContentId::of).collect();
-    for id in &windows {
-      assert!(store.mark_landed(id));
-      store.let_go(id).unwrap();
-      assert!(store.is_away(id));
-    }
+    let_go_each(&mut store, &windows);
     assert!(
       store.content_bytes < before,
       "the windows' bytes left the count"
@@ -2482,15 +2915,180 @@ mod tests {
       windows.iter().all(|id| store.is_away(id)),
       "nothing brought back by other bytes"
     );
-    assert_eq!(store.bring_back_object(&object, &bytes), Ok(4));
+    brought_back_whole(&mut store, (&object, &bytes), (&windows, window), before);
+  }
+
+  /// Each of `windows` marked landed and let go.
+  fn let_go_each(store: &mut ContentStore, windows: &[ContentId]) {
+    for id in windows {
+      assert!(store.mark_landed(id));
+      store.let_go(id).unwrap();
+      assert!(store.is_away(id));
+    }
+  }
+
+  /// `object` brought back by `bytes`, its own: every one of its `windows` (`window` bytes each) read whole, the store's
+  /// count `before` again, and a second bring-back bringing none.
+  fn brought_back_whole(
+    store: &mut ContentStore,
+    (object, bytes): (&ContentId, &[u8]),
+    (windows, window): (&[ContentId], usize),
+    before: u64,
+  ) {
+    assert_eq!(
+      store.bring_back_object(object, bytes),
+      Ok(u64::try_from(windows.len()).unwrap())
+    );
     for (id, piece) in windows.iter().zip(bytes.chunks(window)) {
       assert_eq!(store.bytes_of(id).as_deref(), Some(piece));
     }
     assert_eq!(store.content_bytes, before);
     assert_eq!(
-      store.bring_back_object(&object, &bytes),
+      store.bring_back_object(object, bytes),
       Ok(0),
       "held already: none again"
+    );
+  }
+
+  /// A-767 C1 step 2b. Do: put an object of three windows and a part, and a window another holder keeps as well; let go
+  /// each object; then bring the first back. Expect: the object's four windows let go, their bytes freed and out of the
+  /// count, the store's lists kept; the shared window kept whole; the first object brought back whole by its own bytes.
+  #[test]
+  fn an_object_is_let_go_window_by_window_but_what_another_holds() {
+    let window = 4096usize;
+    let mut store = ContentStore::new(1 << 22, window).unwrap();
+    let bytes = patterned(window * 3 + 100);
+    let object = store.put_object(&bytes).unwrap();
+    let shared = store.put_object(&[9u8; 300]).unwrap();
+    store.hold(&shared).unwrap();
+    let before = store.content_bytes;
+    assert_eq!(
+      store.let_go_object(&object),
+      u64::try_from(bytes.len()).unwrap()
+    );
+    assert_eq!(
+      store.content_bytes,
+      before - u64::try_from(bytes.len()).unwrap()
+    );
+    assert!(
+      bytes
+        .chunks(window)
+        .all(|piece| store.is_away(&ContentId::of(piece)))
+    );
+    assert_eq!(
+      store.let_go_object(&shared),
+      0,
+      "a window another holds stays"
+    );
+    assert!(!store.is_away(&shared));
+    assert_eq!(store.bring_back_object(&object, &bytes), Ok(4));
+    assert_eq!(
+      store.object_bytes(&object, u64::try_from(bytes.len()).unwrap()),
+      Some(bytes)
+    );
+  }
+
+  /// Goal 93 item 2b (main 01a20182's ruling of 2026-11-22 06:58: a landed window may go whatever its holders count, but
+  /// only where every holder of it can bring it back). Do: put an object of three windows and a part, hold each window
+  /// twice more (a landed push's holders: its staged pack, its repository's), then let it go landed with the second window named
+  /// pinned by a home; then let it go landed with none pinned; bring every window back by the object's bytes. Expect:
+  /// `let_go` refuses each `Shared`; the first landed let-go frees every window but the pinned one, which is refused
+  /// `Pinned { by: "homes" }` and stays; the second frees that one too; the object read whole once brought back.
+  #[test]
+  fn a_landed_window_goes_whatever_its_holders_unless_a_holder_pins_it() {
+    let window = 4096usize;
+    let mut store = ContentStore::new(1 << 22, window).unwrap();
+    let bytes = patterned(window * 3 + 100);
+    let object = store.put_object(&bytes).unwrap();
+    let windows: Vec<ContentId> = bytes.chunks(window).map(ContentId::of).collect();
+    for id in &windows {
+      store.hold(id).unwrap();
+      store.hold(id).unwrap();
+      assert!(store.mark_landed(id));
+      assert_eq!(store.let_go(id), Err(LetGoRefused::Shared));
+    }
+    let pinned = windows[1];
+    assert_eq!(
+      store.let_go_landed(&pinned, Some("homes")),
+      Err(LetGoRefused::Pinned { by: "homes" })
+    );
+    let (freed, kept) =
+      store.let_go_object_landed(&object, &|id| (*id == pinned).then_some("homes"));
+    assert_eq!(kept, 1, "the pinned window kept");
+    assert_eq!(freed, u64::try_from(bytes.len() - window).unwrap());
+    assert!(!store.is_away(&pinned));
+    assert!(
+      windows
+        .iter()
+        .filter(|id| **id != pinned)
+        .all(|id| store.is_away(id))
+    );
+    let (freed, kept) = store.let_go_object_landed(&object, &|_| None);
+    assert_eq!((freed, kept), (u64::try_from(window).unwrap(), 0));
+    assert_eq!(store.bring_back_object(&object, &bytes), Ok(4));
+    assert_eq!(
+      store.object_bytes(&object, u64::try_from(bytes.len()).unwrap()),
+      Some(bytes)
+    );
+  }
+
+  /// A-767 C1 step 2b (main's ruling (a) of 2026-11-22 02:52: the image records the windows let go). Do: put an object
+  /// of three windows and a part and a one-window object, let both go, carry the store's windows let go, lists and names
+  /// into a fresh store as a restart's image does (`aways`, `lists`, `names`; nothing of their bytes), then hold each as
+  /// its row would, bring each back by its bytes, and hold a window the image never named. Expect: every window carried
+  /// as let go with its length and the changes naming each; the holds taken; each object brought back whole, the same
+  /// bytes by identity; the window never named refused `NotHeld`, never adopted.
+  #[test]
+  fn windows_let_go_survive_a_restart_as_let_go_and_come_back_by_their_bytes() {
+    let window = 4096usize;
+    let mut before = ContentStore::new(1 << 22, window).unwrap();
+    let large = patterned(window * 3 + 100);
+    let small = vec![4u8; 700];
+    let objects = [
+      (before.put_object(&large).unwrap(), large.clone()),
+      (before.put_object(&small).unwrap(), small.clone()),
+    ];
+    for (object, _) in &objects {
+      before.let_go_object(object);
+    }
+    let aways: Vec<(ContentId, u64)> = before.aways().collect();
+    assert_eq!(
+      aways.len(),
+      5,
+      "four windows of the first and the second whole"
+    );
+    assert!(
+      before.away_changes().iter().all(|(_, len)| len.is_some()),
+      "each let go, named with its length"
+    );
+    let lists: Vec<(ContentId, Vec<u8>)> = before
+      .lists()
+      .map(|(id, bytes)| (id, bytes.to_vec()))
+      .collect();
+    let names: Vec<(ContentId, ContentId)> = before.names().collect();
+    let mut after = ContentStore::new(1 << 22, window).unwrap();
+    assert_eq!(
+      after.restore_away(aways),
+      0,
+      "every window let go taken back"
+    );
+    assert_eq!(
+      after.restore_nodes(lists, names),
+      0,
+      "every list and name taken back"
+    );
+    for (object, bytes) in &objects {
+      after.hold(object).unwrap();
+      after.bring_back_object(object, bytes).unwrap();
+      let len = u64::try_from(bytes.len()).unwrap();
+      assert_eq!(
+        after.object_bytes(object, len).as_deref(),
+        Some(bytes.as_slice())
+      );
+    }
+    assert_eq!(
+      after.hold(&ContentId::of(b"never named")),
+      Err(ContentRefused::NotHeld)
     );
   }
 

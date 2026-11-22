@@ -6,7 +6,7 @@ use std::borrow::Cow;
 
 use slates_vcs::ContentStore;
 
-use super::{Intake, Intaken, KeptText, Refused, Stepped};
+use super::{Intake, Intaken, KeptText, PushSegment, Refused, Stepped};
 use crate::bundle2::Bundle2;
 use crate::fixtures::CG03;
 use crate::index::{HgIndex, Log};
@@ -1023,4 +1023,571 @@ fn a_revision_longer_than_a_window_is_taken_a_window_a_step() {
   );
   assert_eq!(large.spread, 0);
   assert_eq!(small.kept, large.kept);
+}
+
+/// Whether `refused` is the intake past its admission ([`Refused::past_admission`]).
+fn past_admission(refused: &Refused) -> bool {
+  refused.past_admission().is_some()
+}
+
+/// `part` taken a step at a time within one admission of `first` bytes, as a push's slices take it; each step refused
+/// past its admission taken again in an admission grown by `first`, carrying what the push already holds (what the
+/// shared room wait gives an intake, main 01a20182's ruling of 2026-11-22 03:03): the fork, what was brought, and the
+/// steps refused and taken again.
+fn intake_growing(
+  part: &ChangegroupPart,
+  (index, store): (&mut HgIndex, &mut ContentStore),
+  first: u64,
+) -> (HgIndex, Intaken, u64) {
+  let mut admitted = first;
+  let mut retaken = 0u64;
+  // The framing first: nothing is held before it, so a begin past its admission begins again in a grown room.
+  let (mut intake, mut admission) = loop {
+    let mut admission = Admission::new(admitted);
+    match Intake::begin((part.version, &part.payload), index, store, &mut admission) {
+      Ok(intake) => break (intake, admission),
+      Err(refused) => {
+        assert!(
+          past_admission(&refused),
+          "only past its admission: {refused:?}"
+        );
+        admitted += first;
+        retaken += 1;
+      }
+    }
+  };
+  loop {
+    match intake.step(&part.payload, store, &mut admission) {
+      Ok(Stepped::Store) => intake.answer_from_fork(store),
+      Ok(stepped) if more(&stepped) => {}
+      Ok(_) => break,
+      Err(refused) => {
+        assert!(
+          past_admission(&refused),
+          "only past its admission: {refused:?}"
+        );
+        let held = admitted - admission.left();
+        admitted += first;
+        admission = Admission::new(admitted);
+        admission.charge(held).unwrap();
+        retaken += 1;
+      }
+    }
+  }
+  let (fork, intaken) = finished(intake);
+  (fork, intaken, retaken)
+}
+
+/// Main 01a20182's order of 2026-11-22 03:03 (w-interop's find on ubuntu: stock 7.2's push of hg's whole history
+/// refused `Delta { log: Manifests, .. PastAdmission { asked: 73365, left: 50646 } }`, the push's own earlier deltas
+/// having spent its one admission). Do: take the stock changegroup once within room enough and note what it held; then
+/// take it within a quarter, a half and all but a byte of that, each step refused past its admission taken again in a
+/// grown admission. Expect each to end with the same rows and the same brought as the take with room enough, at least one
+/// step taken again for each, and every refusal one past the admission: a step refused leaves the intake where it was.
+#[test]
+fn a_step_refused_past_its_admission_is_taken_again_whole_in_a_grown_room() {
+  let part = stock();
+  let mut whole_store = store();
+  let mut empty = HgIndex::new();
+  let mut ample = Admission::new(1 << 30);
+  let (mut whole_fork, whole_brought, _) =
+    intake(&part, &mut empty, &mut whole_store, &mut ample).unwrap();
+  let whole_rows = rows(&mut whole_fork, &whole_store);
+  let held = (1u64 << 30) - ample.left();
+  for first in [held / 4, held / 2, held - 1] {
+    let mut store = store();
+    let mut empty = HgIndex::new();
+    let (mut fork, brought, retaken) = intake_growing(&part, (&mut empty, &mut store), first);
+    assert!(retaken > 0, "a room of {first} for {held} refused a step");
+    assert_eq!(
+      rows(&mut fork, &store),
+      whole_rows,
+      "the rows of room enough, room {first}"
+    );
+    assert_eq!(
+      brought, whole_brought,
+      "what room enough brought, room {first}"
+    );
+  }
+}
+
+/// Main 01a20182's ruling (a) of 2026-11-22 04:23 (a push admitted its known need up front). Do: begin the stock
+/// changegroup within room enough, note what the begin charged, ask the intake its bookkeeping (`Intake::bookkeeping`),
+/// then take it whole and note what its steps left charged. Expect what the steps kept no more than the bookkeeping
+/// told, and the bookkeeping more than nothing: the push's need, known before a revision is taken, covers what it keeps.
+#[test]
+fn an_intakes_bookkeeping_covers_what_its_steps_keep() {
+  let part = stock();
+  let mut store = store();
+  let mut index = HgIndex::new();
+  let mut admission = Admission::new(1 << 30);
+  let mut intake = Intake::begin(
+    (part.version, &part.payload),
+    &mut index,
+    &mut store,
+    &mut admission,
+  )
+  .unwrap();
+  let after_begin = admission.left();
+  let told = intake.bookkeeping();
+  loop {
+    match intake
+      .step(&part.payload, &mut store, &mut admission)
+      .unwrap()
+    {
+      Stepped::Store => intake.answer_from_fork(&store),
+      stepped if more(&stepped) => {}
+      _ => break,
+    }
+  }
+  let kept = after_begin - admission.left();
+  assert!(told > 0, "a push keeps something");
+  assert!(kept <= told, "kept {kept} of the {told} told");
+  finished(intake);
+}
+
+/// Format: the bytes of the stock changegroup a segment is cut at in [`an_intake_cuts_its_kept_texts_into_segments`]:
+/// small, so the stock push cuts into several.
+const SEGMENT_BYTES: u64 = 256;
+
+/// Main 01a20182's ruling (b1) of 2026-11-22 04:44 (a push lands as a run of segment changesets; it holds one segment's
+/// kept texts at a time). Do: take the stock changegroup whole once without cutting and once cut at [`SEGMENT_BYTES`],
+/// taking each segment as it is cut and the rest once every unit is taken. Expect more than one segment; the segments'
+/// texts, each place moved back by its slice's start, the texts the uncut take kept, in order; each text's place within
+/// its slice; every log's kept revisions covered by the segments' ranges with none twice; what each charged more than
+/// nothing; and the cut take bringing no texts of its own.
+#[test]
+fn an_intake_cuts_its_kept_texts_into_segments() {
+  let part = stock();
+  let mut whole_store = store();
+  let mut empty = HgIndex::new();
+  let (_, whole, _) = intake(&part, &mut empty, &mut whole_store, &mut room()).unwrap();
+  let (segments, cut) = cut_take(&part, SEGMENT_BYTES);
+  assert!(segments.len() > 1, "{} segments", segments.len());
+  assert!(
+    cut.texts.is_empty(),
+    "the cut take holds no texts of its own"
+  );
+  assert_eq!(
+    segments_texts(&segments),
+    whole.texts,
+    "the segments' texts the uncut take's"
+  );
+  assert_each_revision_once(&segments);
+}
+
+/// `part` taken whole into an empty index, cut at `bound`: each segment taken as it is cut, the rest once every unit is
+/// taken; the segments and what the take brought.
+fn cut_take(part: &ChangegroupPart, bound: u64) -> (Vec<PushSegment>, Intaken) {
+  let mut store = store();
+  let mut index = HgIndex::new();
+  let mut admission = room();
+  let mut taking = Intake::begin(
+    (part.version, &part.payload),
+    &mut index,
+    &mut store,
+    &mut admission,
+  )
+  .unwrap()
+  .cutting(bound);
+  let mut segments = Vec::new();
+  loop {
+    let stepped = taking
+      .step(&part.payload, &mut store, &mut admission)
+      .unwrap();
+    segments.extend(std::iter::from_fn(|| taking.take_segment()));
+    match stepped {
+      Stepped::Store => taking.answer_from_fork(&store),
+      stepped if more(&stepped) => {}
+      _ => break,
+    }
+  }
+  taking.cut_rest();
+  segments.extend(std::iter::from_fn(|| taking.take_segment()));
+  let (_, cut) = finished(taking);
+  (segments, cut)
+}
+
+/// The texts of `segments`, in order, each place moved back by its slice's start; each segment charged more than
+/// nothing, and each place within its slice.
+fn segments_texts(segments: &[PushSegment]) -> Vec<KeptText> {
+  let mut texts = Vec::new();
+  for segment in segments {
+    assert!(segment.charged > 0);
+    let len = segment.slice.end - segment.slice.start;
+    for kept in &segment.texts {
+      assert!(kept.place.end <= len, "a text's place within its slice");
+      let mut whole_place = kept.clone();
+      whole_place.place =
+        kept.place.start + segment.slice.start..kept.place.end + segment.slice.start;
+      texts.push(whole_place);
+    }
+  }
+  texts
+}
+
+/// Every log's kept revisions covered by `segments`' ranges, each once and in order.
+fn assert_each_revision_once(segments: &[PushSegment]) {
+  let mut covered: std::collections::BTreeMap<String, Vec<u32>> = std::collections::BTreeMap::new();
+  for (log, first, end) in segments.iter().flat_map(|segment| &segment.ranges) {
+    covered
+      .entry(format!("{log:?}"))
+      .or_default()
+      .extend(*first..*end);
+  }
+  for (log, revisions) in covered {
+    let mut sorted = revisions.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(
+      sorted, revisions,
+      "{log}'s kept revisions each once, in order"
+    );
+  }
+}
+
+/// Main 01a20182's order of 2026-11-22 05:04 (a push whose keeping and a step's least room are past its repository's
+/// ceiling is refused typed at its begin, never waited for): the sound lower bound on a step's room the framing tells.
+/// Do: begin stock 7.2's changegroup and read its widest full text; take it whole. Expect the widest text a delta
+/// against the null base carries (its one hunk's insert) among the decoded revisions, more than nothing, and no more than
+/// the longest text a step rebuilt and charged.
+#[test]
+fn an_intakes_widest_full_text_is_the_least_room_a_step_of_it_takes() {
+  let part = stock();
+  let decoded =
+    crate::changegroup::Changegroup::decode(&part.payload, part.version, &mut room()).unwrap();
+  let mut groups = vec![
+    decoded.group(&decoded.changelog),
+    decoded.group(&decoded.manifests),
+  ];
+  groups.extend(
+    decoded
+      .files
+      .iter()
+      .map(|group| decoded.group(&group.revisions)),
+  );
+  let expected = groups
+    .iter()
+    .flat_map(|group| group.iter())
+    .filter(|revision| revision.base == crate::NULL_NODE)
+    .map(|revision| {
+      (revision.data.len() as u64).saturating_sub(crate::delta::HUNK_HEADER_LEN as u64)
+    })
+    .max()
+    .unwrap();
+  let mut store = store();
+  let mut index = HgIndex::new();
+  let begun = Intake::begin(
+    (part.version, &part.payload),
+    &mut index,
+    &mut store,
+    &mut room(),
+  )
+  .unwrap();
+  let widest = begun.widest_full_text();
+  begun.abandon(&mut store).unwrap();
+  assert!(widest > 0, "stock 7.2's bundle carries whole texts");
+  assert_eq!(widest, expected, "the widest whole text the framing tells");
+  let (fork, intaken, _) = intake(&part, &mut index, &mut store, &mut room()).unwrap();
+  assert!(
+    widest <= intaken.longest_step_bytes,
+    "{widest} past the longest text a step charged, {}",
+    intaken.longest_step_bytes
+  );
+  fork.release(&mut store).unwrap();
+}
+
+/// Main 01a20182's ruling (b1) of 2026-11-22 04:44 (a push's segment changeset's `Record`: record v8, its rows by
+/// identity, as an import's segment's). Do: take stock 7.2's changegroup into an empty index cut at [`SEGMENT_BYTES`],
+/// writing each segment's record as it is cut and the rest's once every unit is taken; replay the records in order into
+/// another empty index over the same content store. Expect more than one record, each a push's; and the replayed
+/// index the intake's fork row for row.
+#[test]
+fn a_pushs_segment_records_replay_in_order_to_its_forks_rows() {
+  let part = stock();
+  let mut store = store();
+  let mut index = HgIndex::new();
+  let mut admission = room();
+  let mut taking = Intake::begin(
+    (part.version, &part.payload),
+    &mut index,
+    &mut store,
+    &mut admission,
+  )
+  .unwrap()
+  .cutting(SEGMENT_BYTES);
+  let mut records = Vec::new();
+  let mut recorded = |taking: &mut Intake, store: &ContentStore| {
+    while let Some(segment) = taking.take_segment() {
+      records.push(taking.segment_record(&segment, 1 << 20, store).unwrap());
+    }
+  };
+  loop {
+    let stepped = taking
+      .step(&part.payload, &mut store, &mut admission)
+      .unwrap();
+    recorded(&mut taking, &store);
+    match stepped {
+      Stepped::Store => taking.answer_from_fork(&store),
+      stepped if more(&stepped) => {}
+      _ => break,
+    }
+  }
+  taking.cut_rest();
+  recorded(&mut taking, &store);
+  let (mut fork, _) = finished(taking);
+  assert!(records.len() > 1, "{} records", records.len());
+  let mut replayed = HgIndex::new();
+  for bytes in &records {
+    crate::import::record::replay(bytes, &mut replayed, &mut store).unwrap();
+  }
+  assert_eq!(rows(&mut replayed, &store), rows(&mut fork, &store));
+  replayed.release(&mut store).unwrap();
+  fork.release(&mut store).unwrap();
+}
+
+/// A changegroup 03 of a line of `n` changesets, the `k`th adding file `f{k}`, its manifest listing every file so far
+/// and sent whole against the null base (a full snapshot each), as a whole-history push of a revlog storing snapshots
+/// sends them; every revision whole.
+fn snapshots_push(n: usize) -> Vec<u8> {
+  let paths: Vec<String> = (0..n).map(|k| format!("f{k:03}")).collect();
+  adding_files(Line::default(), &paths).0
+}
+
+/// Where a line of changesets ends: its last changeset and manifest, and the manifest's lines.
+#[derive(Clone, Debug, Default)]
+struct Line {
+  /// The last changeset.
+  changeset: Node,
+  /// Its manifest.
+  manifest: Node,
+  /// The manifest's lines.
+  lines: Vec<Vec<u8>>,
+}
+
+/// A changegroup 03 of a changeset for each of `paths` after `after`, each adding its file (one whole revision, its
+/// text naming its path) to the manifest before it, the manifest sent whole against the null base; and where the line
+/// then ends.
+fn adding_files(after: Line, paths: &[String]) -> (Vec<u8>, Line) {
+  use crate::changegroup::{self as cg, Revision, Version};
+  use crate::{NULL_NODE, node};
+  let hex = |node: &Node| {
+    let mut out = Vec::new();
+    crate::pushkey::encode_hex(node, &mut out);
+    out
+  };
+  let whole = |(node, p1, link): (Node, Node, Node), text: &[u8], out: &mut Vec<u8>| {
+    let revision = Revision {
+      node,
+      p1,
+      p2: NULL_NODE,
+      base: NULL_NODE,
+      link,
+      flags: 0,
+      info: None,
+      protocol_flags: 0,
+      data: text,
+      sidedata: None,
+    };
+    cg::put_revision_whole(&revision, Version::V03, out).unwrap();
+  };
+  let mut line = after;
+  let (mut changesets, mut manifests, mut files) = (Vec::new(), Vec::new(), Vec::new());
+  for path in paths {
+    let path = path.as_bytes().to_vec();
+    let text = [b"file ", &path[..], b"\n"].concat();
+    let file = node::compute(&NULL_NODE, &NULL_NODE, &text).unwrap();
+    line
+      .lines
+      .push([&path[..], b"\0", &hex(&file), b"\n"].concat());
+    line.lines.sort();
+    let manifest_text = line.lines.concat();
+    let manifest_node = node::compute(&line.manifest, &NULL_NODE, &manifest_text).unwrap();
+    let changeset_text = [
+      &hex(&manifest_node)[..],
+      b"\ntest\n0 0\n",
+      &path,
+      b"\n\nchange",
+    ]
+    .concat();
+    let changeset_node = node::compute(&line.changeset, &NULL_NODE, &changeset_text).unwrap();
+    changesets.push((changeset_node, line.changeset, changeset_text));
+    manifests.push((manifest_node, line.manifest, manifest_text, changeset_node));
+    files.push((path, file, text, changeset_node));
+    (line.changeset, line.manifest) = (changeset_node, manifest_node);
+  }
+  let mut out = Vec::new();
+  for (node, p1, text) in &changesets {
+    whole((*node, *p1, *node), text, &mut out);
+  }
+  cg::put_end(&mut out);
+  for (node, p1, text, link) in &manifests {
+    whole((*node, *p1, *link), text, &mut out);
+  }
+  cg::put_end(&mut out);
+  cg::put_end(&mut out);
+  files.sort_by(|left, right| left.0.cmp(&right.0));
+  for (path, node, text, link) in &files {
+    cg::put_name(path, &mut out).unwrap();
+    whole((*node, NULL_NODE, *link), text, &mut out);
+    cg::put_end(&mut out);
+  }
+  cg::put_end(&mut out);
+  (out, line)
+}
+
+/// What taking `payload` (a changegroup 03) whole into an empty index kept charged to its admission past its begin, and
+/// what its bookkeeping told at the begin.
+fn kept_and_told(payload: &[u8]) -> (u64, u64) {
+  let mut store = store();
+  let mut index = HgIndex::new();
+  let mut admission = room();
+  let mut intake = Intake::begin(
+    (crate::changegroup::Version::V03, payload),
+    &mut index,
+    &mut store,
+    &mut admission,
+  )
+  .unwrap();
+  let (after_begin, told) = (admission.left(), intake.bookkeeping());
+  while more(&intake.step(payload, &mut store, &mut admission).unwrap()) {}
+  let (fork, _) = finished(intake);
+  fork.release(&mut store).unwrap();
+  (after_begin - admission.left(), told)
+}
+
+/// Main 01a20182's order of 2026-11-22 05:13 (w-interop's whole-history push of hg: 1.37 GB held, the bulk each whole or
+/// null-base manifest's every line, kept for the files' check once a snapshot). Do: take a line of 60 changesets whose
+/// manifests are each a full snapshot, then of 120. Expect what the intake kept, and what its bookkeeping told, to grow
+/// with the changesets (twice the line, less than three times the keeping): each manifest's (path, node) kept once
+/// across the push, never a copy a snapshot (which grows with their square, four times); and the bookkeeping covering
+/// the keeping. Red before: a snapshot's every line kept.
+#[test]
+fn a_push_of_many_whole_manifest_snapshots_keeps_one_copy_of_their_entries() {
+  let (short_kept, short_told) = kept_and_told(&snapshots_push(60));
+  let (long_kept, long_told) = kept_and_told(&snapshots_push(120));
+  println!("kept {short_kept} then {long_kept}, told {short_told} then {long_told}");
+  assert!(
+    long_kept <= long_told,
+    "kept {long_kept} of {long_told} told"
+  );
+  assert!(
+    long_kept * 2 < short_kept * 5 && long_told * 2 < short_told * 5,
+    "kept {short_kept} then {long_kept}, told {short_told} then {long_told}: past linear in the changesets"
+  );
+}
+
+/// `payload`, a changegroup 03, taken into a fork of `index` cut at every kept text, each segment's record written as it
+/// is cut and the rest's once every unit is taken, each store want answered from the fork; the records, and the fork,
+/// which holds their contents (as a push's fork holds them to its entry), and what the take brought.
+fn segment_records_over(
+  payload: &[u8],
+  index: &mut HgIndex,
+  store: &mut ContentStore,
+) -> (Vec<Vec<u8>>, HgIndex, Intaken) {
+  let mut admission = room();
+  let mut taking = Intake::begin(
+    (crate::changegroup::Version::V03, payload),
+    index,
+    store,
+    &mut admission,
+  )
+  .unwrap()
+  .cutting(1);
+  let mut records = Vec::new();
+  let mut recorded = |taking: &mut Intake, store: &ContentStore| {
+    while let Some(segment) = taking.take_segment() {
+      records.push(taking.segment_record(&segment, 1 << 20, store).unwrap());
+    }
+  };
+  loop {
+    let stepped = taking.step(payload, store, &mut admission).unwrap();
+    recorded(&mut taking, store);
+    match stepped {
+      Stepped::More => {}
+      Stepped::Store => taking.answer_from_fork(store),
+      _ => break,
+    }
+  }
+  taking.cut_rest();
+  recorded(&mut taking, store);
+  let (fork, intaken) = finished(taking);
+  (records, fork, intaken)
+}
+
+/// Main 01a20182's ruling of 2026-11-22 06:57 (a push lands its segments apart from its repository's turn, which it
+/// takes only for its entry's commit, so another push may land between its segments and its entry). Do: land a line of
+/// four changesets, each adding a file; over it, cut a push of three more into segments and write their records; land
+/// another push of one changeset over the same line meanwhile; replay the first push's records onto the index as that
+/// left it. Expect every manifest the first push brought held and reading as its fork read it (some kept as a delta
+/// against the manifest before it, A-729), though the other push's manifest now stands before it. Red before: a record
+/// kept a manifest's stored delta by its base's number, the one before it, which the other push's manifest took.
+#[test]
+fn a_pushs_segments_replay_onto_an_index_another_push_moved_their_bases_by_node() {
+  let names =
+    |range: core::ops::Range<usize>| range.map(|k| format!("f{k:03}")).collect::<Vec<_>>();
+  let (first, line) = adding_files(Line::default(), &names(0..4));
+  let mut store = store();
+  let (mut index, _, _) = taken_counting(&first, &mut HgIndex::new(), &mut store, None);
+  let held = index.len(&store, Log::Manifest);
+  let (pushed, _) = adding_files(line.clone(), &names(4..7));
+  let (other, _) = adding_files(line, &names(9..10));
+  let (records, fork, _) = segment_records_over(&pushed, &mut index, &mut store);
+  assert!(records.len() > 1, "{} records", records.len());
+  let (moved, _, _) = taken_counting(&other, &mut index, &mut store, None);
+  core::mem::replace(&mut index, moved)
+    .release(&mut store)
+    .unwrap();
+  for bytes in &records {
+    crate::import::record::replay(bytes, &mut index, &mut store).unwrap();
+  }
+  let mut deltas = 0;
+  for rev in held..fork.len(&store, Log::Manifest) {
+    let row = fork.revision(&store, Log::Manifest, rev).expect("its row");
+    deltas += usize::from(row.base != crate::index::NONE);
+    let at = index.rev(&store, Log::Manifest, &row.node).expect("held");
+    assert_eq!(
+      index.revision_text(&store, Log::Manifest, at),
+      fork.revision_text(&store, Log::Manifest, rev),
+      "manifest {rev}, replayed at {at}"
+    );
+  }
+  assert!(deltas > 0, "the push kept a manifest as a delta");
+  index.release(&mut store).unwrap();
+  fork.release(&mut store).unwrap();
+}
+
+/// Main 01a20182's ruling of 2026-11-22 07:32 (staging: a push's fork made stale by another push's landing is re-based
+/// before its entry, and a restart replays its segments' records over the index as it stood: the two must agree). Do:
+/// over a line of four changesets each adding a file, cut a push of three more into segments and write their records;
+/// land another push of one changeset over the same line; re-base the first push's fork onto the index that left
+/// (`Rebase`), and, apart, replay its records onto the same index. Expect the two indexes row for row the same, the
+/// re-based one holding the push.
+#[test]
+fn a_stale_forks_re_base_and_its_segments_replay_make_the_same_index() {
+  let names =
+    |range: core::ops::Range<usize>| range.map(|k| format!("f{k:03}")).collect::<Vec<_>>();
+  let (first, line) = adding_files(Line::default(), &names(0..4));
+  let mut store = store();
+  let (mut index, _, _) = taken_counting(&first, &mut HgIndex::new(), &mut store, None);
+  let (pushed, _) = adding_files(line.clone(), &names(4..7));
+  let (other, _) = adding_files(line, &names(9..10));
+  let (records, stale, intaken) = segment_records_over(&pushed, &mut index, &mut store);
+  let (moved, _, _) = taken_counting(&other, &mut index, &mut store, None);
+  core::mem::replace(&mut index, moved)
+    .release(&mut store)
+    .unwrap();
+  let mut replayed = index.fork(&mut store).unwrap();
+  for bytes in &records {
+    crate::import::record::replay(bytes, &mut replayed, &mut store).unwrap();
+  }
+  let rebase = super::Rebase::begin(stale, &intaken, &mut index, &mut store)
+    .ok()
+    .unwrap();
+  let (mut rebased, again) = rebased(rebase, &mut store);
+  assert_eq!(again.changesets.len(), 3, "{again:?}");
+  assert_eq!(rows(&mut rebased, &store), rows(&mut replayed, &store));
+  for held in [rebased, replayed, index] {
+    held.release(&mut store).unwrap();
+  }
 }

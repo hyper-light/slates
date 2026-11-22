@@ -425,15 +425,15 @@ pub struct DeferredPush {
   tree: ObjectKey,
   /// The head it sets, in the tool's form.
   head: Option<Vec<u8>>,
-  /// The room its build runs within.
-  room: u64,
 }
 
 /// Format: a deferred push record's magic, "GDEF" little-endian: a chain record of its own kind, never a chain entry's
 /// ("GCHN"), so a reader of either tells them apart at the first word.
 const DEFERRED_MAGIC: u32 = u32::from_le_bytes(*b"GDEF");
-/// Format: a deferred push record's version; a decoder refuses any other.
-const DEFERRED_VERSION: u32 = 1;
+/// Format: a deferred push record's version; a decoder refuses any other. Version 2 (A-857) holds no room: a build runs
+/// within the room its repository has when it is built, never one recorded when its push began (version 1 recorded
+/// A-724's learned demand for the push, past which a whole tree's listing went: git/git's branch and tag pushes refused).
+const DEFERRED_VERSION: u32 = 2;
 /// Format: a deferred push record's digest, a BLAKE3 hash of what precedes it.
 const DEFERRED_DIGEST_BYTES: usize = 32;
 /// Format: the byte that marks an optional part present.
@@ -442,15 +442,14 @@ const DEFERRED_PRESENT: u8 = 1;
 const DEFERRED_ABSENT: u8 = 0;
 
 impl DeferredPush {
-  /// The push `push` owed, its build within `room` bytes.
-  pub fn of(push: &Push<'_>, room: u64) -> DeferredPush {
+  /// The push `push` owed.
+  pub fn of(push: &Push<'_>) -> DeferredPush {
     DeferredPush {
       name: push.name,
       base_version: push.base_version,
       base_tree: push.base_tree,
       tree: push.tree,
       head: push.head.map(<[u8]>::to_vec),
-      room,
     }
   }
 
@@ -470,19 +469,18 @@ impl DeferredPush {
     self.base_version.saturating_add(1)
   }
 
-  /// Its build, each turn under `pace`.
-  pub fn building(&self, pace: Pace) -> Building {
-    Building::new(&self.push(), self.room, pace)
+  /// Its build within `room` bytes, the room its repository has as it is built (A-857), each turn under `pace`.
+  pub fn building(&self, pace: Pace, room: u64) -> Building {
+    Building::new(&self.push(), room, pace)
   }
 
-  /// Its record: the magic, the version, the push and its room, and the digest of them.
+  /// Its record: the magic, the version, the push, and the digest of them.
   pub fn encode(&self) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&DEFERRED_MAGIC.to_le_bytes());
     out.extend_from_slice(&DEFERRED_VERSION.to_le_bytes());
     out.extend_from_slice(&self.name);
     out.extend_from_slice(&self.base_version.to_le_bytes());
-    out.extend_from_slice(&self.room.to_le_bytes());
     put_key(&mut out, Some(&self.tree));
     put_key(&mut out, self.base_tree.as_ref());
     match &self.head {
@@ -517,7 +515,6 @@ impl DeferredPush {
     }
     let name = <[u8; 32]>::try_from(reader.take(32)?).ok()?;
     let base_version = reader.u64()?;
-    let room = reader.u64()?;
     let tree = reader.key()??;
     let base_tree = reader.key()?;
     let head = reader.head()?;
@@ -527,7 +524,6 @@ impl DeferredPush {
       base_tree,
       tree,
       head,
-      room,
     })
   }
 }

@@ -8,7 +8,7 @@
 //! serves the next submit's made commit alone.
 //!
 //! **What.** [`start`] keeps a build of the green's head as a record ([`Build`]) and a task of the shard drives it
-//! ([`drive`], as `super::super::git_encode::settle_encodings` drives an encoding): each [`slice`] puts the head's files,
+//! ([`drive`], as `super::super::git_encode::encode_within` drives an encoding): each [`slice`] puts the head's files,
 //! one a unit, lent the room each brings, until the shard's step budget is spent (§4.3's quantum, at least one file),
 //! settles the charge, and yields; the last builds the map and trees of what was put and keeps them as the green's head
 //! (`Plan::Put`, as a recovery's sliced remake does). The files are read from the green at each slice by their paths,

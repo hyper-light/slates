@@ -1309,13 +1309,18 @@ fn wire_history_bundle() -> Vec<u8> {
 
 /// A bundle2 as stock hg 7.2 pushes `made`'s changesets at `revs`: their changegroup (version 03), and bookmark `main`
 /// at the first.
-fn history_bundle(made: &[Made], revs: &[usize]) -> Vec<u8> {
+pub(crate) fn history_bundle(made: &[Made], revs: &[usize]) -> Vec<u8> {
+  bundle_of(made, revs, Some(made[0].node))
+}
+
+/// [`history_bundle`] with bookmark `main` at `main` where given, and no bookmarks part where not.
+fn bundle_of(made: &[Made], revs: &[usize], main: Option<slates_hg::Node>) -> Vec<u8> {
   let group = changegroup(made, revs);
   let mut marks = Vec::new();
   hg_bookmarks::encode(
     &[Bookmark {
       name: b"main",
-      node: Some(made[0].node),
+      node: main,
     }],
     &mut marks,
   )
@@ -1327,31 +1332,321 @@ fn history_bundle(made: &[Made], revs: &[usize]) -> Vec<u8> {
     params,
     depth: 0,
   };
+  let mut parts = vec![part(
+    b"CHANGEGROUP",
+    0,
+    vec![Param {
+      key: b"version",
+      value: b"03",
+    }],
+  )];
+  let mut events = vec![Event::Open(0), Event::Chunk(&group.payload), Event::Close];
+  if main.is_some() {
+    parts.push(part(b"BOOKMARKS", 1, Vec::new()));
+    events.extend([Event::Open(1), Event::Chunk(&marks), Event::Close]);
+  }
   let bundle = Bundle2 {
     params: Vec::new(),
-    parts: vec![
-      part(
-        b"CHANGEGROUP",
-        0,
-        vec![Param {
-          key: b"version",
-          value: b"03",
-        }],
-      ),
-      part(b"BOOKMARKS", 1, Vec::new()),
-    ],
-    events: vec![
-      Event::Open(0),
-      Event::Chunk(&group.payload),
-      Event::Close,
-      Event::Open(1),
-      Event::Chunk(&marks),
-      Event::Close,
-    ],
+    parts,
+    events,
   };
   let mut out = Vec::new();
   bundle.encode(&mut out).expect("a bundle2");
   out
+}
+
+/// Format: the first room a push's intake is given in
+/// [`a_mercurial_push_past_its_first_admission_waits_for_room_and_lands_whole`]: far less than its changegroup's
+/// framing, as a small learned demand left one on w-interop's runner.
+const STARVED_ROOM: u64 = 64;
+
+/// Main 01a20182's order of 2026-11-22 03:03 (w-interop's ubuntu find: stock 7.2's push of hg's history refused
+/// `Delta { log: Manifests, .. PastAdmission { asked: 73365, left: 50646 } }`; the rule, A-857: an intake past its
+/// admission waits for room, never refused). Do: start a two-shard daemon over loopback TLS; create a Mercurial
+/// repository; push one changeset as stock hg posts it, its intake's first room [`STARVED_ROOM`] bytes
+/// (`hg_push::TEST_FIRST_INTAKE_ROOM`); then ask `heads`. Expect the push `200` in `application/mercurial-0.1`, `heads`
+/// the pushed changeset, and the wait counted (`vcs.hg.push_intake_room_waits`, `vcs_share.room_waits_taken`). Red
+/// before: the push refused past its admission.
+#[test]
+fn a_mercurial_push_past_its_first_admission_waits_for_room_and_lands_whole() {
+  let (identity, certificate) = identity();
+  let (daemon, _instance) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  create_empty_hg(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let made = history_of(&[(
+    "starved",
+    "starved",
+    b"a push past its first room\n",
+    None,
+    "default",
+  )]);
+  crate::daemon::observe_at(&daemon, REPOSITORY, |_| {
+    crate::repository::hg_push::TEST_FIRST_INTAKE_ROOM.with(|first| first.set(STARVED_ROOM));
+  });
+  let pushed = hg_unbundle(edge, &name, &history_bundle(&made, &[0]));
+  let heads = hg_command(edge, &name, "heads");
+  let counted = |name: &'static str| {
+    (0..daemon.shards().len())
+      .map(|partition| {
+        crate::daemon::observe_at(&daemon, partition, move |state| {
+          state.refusals.get(name).copied().unwrap_or(0)
+        })
+      })
+      .sum::<u64>()
+  };
+  let waits = (
+    counted(crate::repository::hg_push::INTAKE_ROOM_WAITS),
+    counted(crate::vcs_share::wait::TAKEN),
+  );
+  daemon.stop();
+  assert_eq!(
+    (pushed.0, pushed.1.as_str()),
+    (200, "application/mercurial-0.1"),
+    "{}",
+    String::from_utf8_lossy(&pushed.2)
+  );
+  let tip = crate::verbs::hex_of(&made[0].node);
+  assert_eq!(
+    heads,
+    (200, format!("{tip}\n").into_bytes()),
+    "{}",
+    String::from_utf8_lossy(&pushed.2)
+  );
+  assert!(
+    waits.0 > 0 && waits.1 > 0,
+    "the intake waited for room and took it: {waits:?}"
+  );
+}
+
+/// Shape: the push's first room in [`a_mercurial_push_whose_wait_is_past_its_repositorys_ceiling_is_refused_in_the_typed_words`]:
+/// short of its begin's first charge (176 bytes), past the reply that answers its refusal (131), since the edge frames
+/// the reply within the room the push was given.
+const CEILING_ROOM: u64 = 160;
+
+/// Main 01a20182's (ii) of 2026-11-22 05:01 (w-interop's whole-history push of hg on arm: its need passed its
+/// repository's ceiling while it waited, and it was answered its step's bare `PastAdmission`, the wait's give-up past
+/// the ceiling told as one past its patience). Do: start a two-shard daemon over loopback TLS; create a Mercurial
+/// repository; push one changeset as stock hg posts it, its intake's first room [`CEILING_ROOM`] bytes
+/// (`hg_push::TEST_FIRST_INTAKE_ROOM`) and its repository's ceiling one byte (`vcs_share::wait::TEST_CEILING`), so its
+/// begin's wait is for more than it could ever be lent. Expect the push refused in the typed words that it could never
+/// be taken (`hg_push::PAST_CEILING`), no wait taken (`vcs_share.room_waits_taken` zero). Red before: its step's bare
+/// `PastAdmission` refusal.
+#[test]
+fn a_mercurial_push_whose_wait_is_past_its_repositorys_ceiling_is_refused_in_the_typed_words() {
+  let (identity, certificate) = identity();
+  let (daemon, _instance) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  create_empty_hg(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let made = history_of(&[(
+    "ceiling",
+    "ceiling",
+    b"a push past its repository's ceiling\n",
+    None,
+    "default",
+  )]);
+  crate::daemon::observe_at(&daemon, REPOSITORY, |_| {
+    crate::repository::hg_push::TEST_FIRST_INTAKE_ROOM.with(|first| first.set(CEILING_ROOM));
+    crate::vcs_share::wait::TEST_CEILING.with(|ceiling| ceiling.set(1));
+  });
+  let pushed = hg_unbundle((port, &certificate), &name, &history_bundle(&made, &[0]));
+  let taken = (0..daemon.shards().len())
+    .map(|partition| {
+      crate::daemon::observe_at(&daemon, partition, |state| {
+        state
+          .refusals
+          .get(crate::vcs_share::wait::TAKEN)
+          .copied()
+          .unwrap_or(0)
+      })
+    })
+    .sum::<u64>();
+  crate::daemon::observe_at(&daemon, REPOSITORY, |_| {
+    crate::vcs_share::wait::TEST_CEILING.with(|ceiling| ceiling.set(0));
+  });
+  daemon.stop();
+  let words = crate::repository::hg_push::PAST_CEILING;
+  assert!(
+    pushed.2.windows(words.len()).any(|at| at == words),
+    "the push refused in the typed words past its ceiling: {}",
+    String::from_utf8_lossy(&pushed.2)
+  );
+  assert_eq!(taken, 0, "no wait was taken");
+}
+
+/// Main 01a20182's order of 2026-11-22 03:35 (w-interop's ubuntu find: a chunked push of hg's history at revision 12,000
+/// answered `push refused: the content store could not hold its increments; push again`). Do: start a two-shard daemon
+/// over loopback TLS; create a Mercurial repository; push one changeset as stock hg posts it, its increments' first hold
+/// refused as a full content store refuses it (`hg_push::TEST_HOLD_REFUSED`); then ask `heads`. Expect the push `200` in
+/// `application/mercurial-0.1`, `heads` the pushed changeset, and the wait counted (`vcs.hg.push_held_ahead_room_waits`).
+/// Red before: `push again` to a stock client.
+#[test]
+fn a_mercurial_push_its_store_cannot_hold_for_now_waits_for_room_and_lands_whole() {
+  let (identity, certificate) = identity();
+  let (daemon, _instance) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  create_empty_hg(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let made = history_of(&[(
+    "held",
+    "held",
+    b"a push the store holds once room comes\n",
+    None,
+    "default",
+  )]);
+  crate::daemon::observe_at(&daemon, REPOSITORY, |_| {
+    crate::repository::hg_push::TEST_HOLD_REFUSED.with(|refused| refused.set(true));
+  });
+  let pushed = hg_unbundle(edge, &name, &history_bundle(&made, &[0]));
+  let heads = hg_command(edge, &name, "heads");
+  let waits = (0..daemon.shards().len())
+    .map(|partition| {
+      crate::daemon::observe_at(&daemon, partition, |state| {
+        state
+          .refusals
+          .get(crate::repository::hg_push::HELD_AHEAD_ROOM_WAITS)
+          .copied()
+          .unwrap_or(0)
+      })
+    })
+    .sum::<u64>();
+  daemon.stop();
+  assert_eq!(
+    (pushed.0, pushed.1.as_str()),
+    (200, "application/mercurial-0.1"),
+    "{}",
+    String::from_utf8_lossy(&pushed.2)
+  );
+  let tip = crate::verbs::hex_of(&made[0].node);
+  assert_eq!(heads, (200, format!("{tip}\n").into_bytes()));
+  assert!(waits > 0, "the push waited for the store's room");
+}
+
+/// A line of `changesets` changesets, each adding a file of its own, and the bundle stock hg posts to push them all.
+fn a_line_of(changesets: usize) -> (Vec<Made>, Vec<u8>) {
+  let paths: &'static [String] = Box::leak(
+    (0..changesets)
+      .map(|at| format!("file-{at}"))
+      .collect::<Vec<_>>()
+      .into_boxed_slice(),
+  );
+  let texts: &'static [Vec<u8>] = Box::leak(
+    (0..changesets)
+      .map(|at| format!("revision {at}\n").into_bytes())
+      .collect::<Vec<_>>()
+      .into_boxed_slice(),
+  );
+  let commits: Vec<Commit> = (0..changesets)
+    .map(|at| {
+      (
+        paths[at].as_str(),
+        paths[at].as_str(),
+        texts[at].as_slice(),
+        at.checked_sub(1),
+        "default",
+      )
+    })
+    .collect();
+  let made = history_of(&commits);
+  let bundle = history_bundle(&made, &(0..changesets).collect::<Vec<_>>());
+  (made, bundle)
+}
+
+/// Format: the room left to the steps of [`a_mercurial_push_is_admitted_its_known_need_and_never_waits_for_its_own_keeping`]'s
+/// push once its begin is taken: far less than what its changesets keep.
+const STEP_ROOM: u64 = 64;
+
+/// Main 01a20182's ruling (a) of 2026-11-22 04:23 (w-interop's whole-history push of hg on ubuntu and arm refused at a
+/// manifest delta: the push's own keeping spent the one room it held, and a wait for room no one else held could never
+/// end). Do: start a two-shard daemon over loopback TLS; create a Mercurial repository; push a line of
+/// [`FRESH_CHANGESETS`] changesets as stock hg posts it, the room left to its steps after its begin [`STEP_ROOM`] bytes
+/// (`hg_push::TEST_STEP_ROOM`); then ask `heads`. Expect the push `200`, `heads` the line's last changeset, the push
+/// admitted its known need once (`vcs.hg.push_need_admitted`), and no step waiting for room
+/// (`vcs.hg.push_intake_room_waits` zero). Red before: its steps waited for room the push already held.
+#[test]
+fn a_mercurial_push_is_admitted_its_known_need_and_never_waits_for_its_own_keeping() {
+  let (identity, certificate) = identity();
+  let (daemon, _instance) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let (made, bundle) = a_line_of(FRESH_CHANGESETS);
+  create_empty_hg(&daemon, &name);
+  crate::daemon::observe_at(&daemon, REPOSITORY, |_| {
+    crate::repository::hg_push::TEST_STEP_ROOM.with(|left| left.set(STEP_ROOM));
+  });
+  let pushed = hg_unbundle((port, &certificate), &name, &bundle);
+  let heads = hg_command((port, &certificate), &name, "heads");
+  let counted = |counter: &'static str| {
+    (0..daemon.shards().len())
+      .map(|partition| {
+        crate::daemon::observe_at(&daemon, partition, move |state| {
+          state.refusals.get(counter).copied().unwrap_or(0)
+        })
+      })
+      .sum::<u64>()
+  };
+  let (admitted, waited) = (
+    counted(crate::repository::hg_push::PUSH_NEED_ADMITTED),
+    counted(crate::repository::hg_push::INTAKE_ROOM_WAITS),
+  );
+  daemon.stop();
+  assert_eq!(
+    (pushed.0, pushed.1.as_str()),
+    (200, "application/mercurial-0.1"),
+    "{}",
+    String::from_utf8_lossy(&pushed.2)
+  );
+  let tip = crate::verbs::hex_of(&made[FRESH_CHANGESETS - 1].node);
+  assert_eq!(heads, (200, format!("{tip}\n").into_bytes()));
+  assert_eq!(
+    (admitted, waited),
+    (1, 0),
+    "its need admitted once, no step waiting for its own keeping"
+  );
+}
+
+/// Format: the changesets of [`a_fresh_repositorys_first_push_of_hundreds_of_changesets_is_taken_at_once`]'s push, as
+/// w-interop's 500-revision chunks were.
+const FRESH_CHANGESETS: usize = 500;
+
+/// Main 01a20182's order of 2026-11-22 03:50 (w-interop: a fresh repository's first 500-revision chunk refused at once,
+/// `the content store could not hold its increments; push again`, the daemon at 64 to 88 MiB on x86 and arm). Do: start
+/// a two-shard daemon over loopback TLS; create a Mercurial repository and, with no gap, push a line of
+/// [`FRESH_CHANGESETS`] changesets as stock hg posts it; then ask `heads`. Expect the push `200` in
+/// `application/mercurial-0.1` and `heads` the line's last changeset: a first push is taken whole, never told to push
+/// again.
+#[test]
+fn a_fresh_repositorys_first_push_of_hundreds_of_changesets_is_taken_at_once() {
+  let (identity, certificate) = identity();
+  let (daemon, _instance) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let (made, bundle) = a_line_of(FRESH_CHANGESETS);
+  create_empty_hg(&daemon, &name);
+  let pushed = hg_unbundle((port, &certificate), &name, &bundle);
+  let heads = hg_command((port, &certificate), &name, "heads");
+  daemon.stop();
+  assert_eq!(
+    (pushed.0, pushed.1.as_str()),
+    (200, "application/mercurial-0.1"),
+    "{}",
+    String::from_utf8_lossy(&pushed.2)
+  );
+  let tip = crate::verbs::hex_of(&made[FRESH_CHANGESETS - 1].node);
+  assert_eq!(
+    heads,
+    (200, format!("{tip}\n").into_bytes()),
+    "{}",
+    String::from_utf8_lossy(&pushed.2)
+  );
 }
 
 /// A-711 (found by use, 2026-11-20: stock hg 7.2's push of Mercurial's own repository, 57,036 changesets in an 84 MiB
@@ -2928,3 +3223,221 @@ fn a_fetch_past_its_room_waits_for_more_and_is_answered_whole() {
 
 /// Shape: [`a_fetch_past_its_room_waits_for_more_and_is_answered_whole`]'s line: a few commits, each tagged.
 const TAGGED_FEW: usize = 8;
+
+std::thread_local! {
+  /// A repository's landing turn a test holds on the shard's thread ([`a_mercurial_push_parks_for_its_repositorys_landing_turn_and_no_other_waits`]).
+  static HELD_TURN: core::cell::RefCell<Option<crate::repository::svn_commit::landing::Turn>> =
+    const { core::cell::RefCell::new(None) };
+}
+
+/// Derived: how long [`a_mercurial_push_parks_for_its_repositorys_landing_turn_and_no_other_waits`] holds the turn
+/// while its push parks: long past a push's own landing on loopback, so a push that did not park would have answered.
+const TURN_HELD: Duration = Duration::from_millis(400);
+
+/// Takes repository `name`'s landing turn on its shard and holds it there ([`HELD_TURN`]); `patience_ns` a push's
+/// patience for it there from now on, none for the server's own.
+fn hold_turn(daemon: &Daemon, name: &str, patience_ns: u64) {
+  let name = name.to_owned();
+  crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
+    let id = state
+      .db
+      .partition()
+      .repositories()
+      .repository_named(&name)
+      .map(|record| record.id)
+      .expect("the repository");
+    let turn =
+      crate::repository::svn_commit::landing::Turn::take_now(state, id).expect("the turn free");
+    HELD_TURN.with(|held| *held.borrow_mut() = Some(turn));
+    crate::repository::hg_run::TEST_TURN_PATIENCE_NS.with(|patience| patience.set(patience_ns));
+  });
+}
+
+/// Gives back the landing turn [`hold_turn`] holds.
+fn give_back_turn(daemon: &Daemon) {
+  crate::daemon::observe_at(daemon, REPOSITORY, |state| {
+    if let Some(turn) = HELD_TURN.with(|held| held.borrow_mut().take()) {
+      turn.give_back(state);
+    }
+  });
+}
+
+/// The `n`th Mercurial repository's name that routes to [`REPOSITORY`]'s partition, from the first.
+fn hg_names_on_the_repositorys_partition(n: usize) -> Vec<String> {
+  (0u32..)
+    .map(|serial| format!("hg-{serial}"))
+    .filter(|name| {
+      usize::from(crate::verbs::owner_of_name(name, usize::from(SHARDS))) == REPOSITORY
+    })
+    .take(n)
+    .collect()
+}
+
+/// Main 01a20182's ruling (i) of 2026-11-22 04:44 (a push lands under its repository's landing turn from its first
+/// segment to its commit; a same-repository push needing it parks with its intake held, under the patience, refused
+/// typed past it; other repositories never wait). Do: start a two-shard daemon over loopback TLS; create two Mercurial
+/// repositories on one shard; hold the first's landing turn (as a long push's run holds it); push a changeset to the
+/// second; push one to the first on a thread of its own, wait [`TURN_HELD`] and give the turn back; then, the turn held
+/// again with a patience of 50 ms, push another to the first. Expect the second's push `200` with no wait counted; the
+/// first's parked (`vcs.hg.push_turn_waits`) and still unanswered while the turn is held, then `200` and its head the
+/// pushed changeset, the wait counted at least [`TURN_HELD`]; and the last refused in slates' words for a turn held past
+/// its patience, counted given up, the repository's head unmoved.
+#[test]
+fn a_mercurial_push_parks_for_its_repositorys_landing_turn_and_no_other_waits() {
+  let (identity, certificate) = identity();
+  let (daemon, _instance) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let names = hg_names_on_the_repositorys_partition(2);
+  let (first, second) = (names[0].clone(), names[1].clone());
+  create_empty_hg(&daemon, &first);
+  create_empty_hg(&daemon, &second);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let made = history_of(&[
+    (
+      "parked",
+      "parked",
+      b"a push behind a held turn\n",
+      None,
+      "default",
+    ),
+    (
+      "refused",
+      "refused",
+      b"a push past its patience\n",
+      Some(0),
+      "default",
+    ),
+  ]);
+  let counted = |name: &'static str| {
+    crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+      state.refusals.get(name).copied().unwrap_or(0)
+    })
+  };
+  hold_turn(&daemon, &first, 0);
+  let other = hg_unbundle((port, &certificate), &second, &history_bundle(&made, &[0]));
+  let other_waits = counted(crate::repository::hg_run::TURN_WAITS);
+  let parked = {
+    let (bundle, certificate, first) = (
+      history_bundle(&made, &[0]),
+      certificate.clone(),
+      first.clone(),
+    );
+    std::thread::spawn(move || hg_unbundle((port, &certificate), &first, &bundle))
+  };
+  // The test holds the landing turn while the parked push waits for it; the daemon under test waits on its drivers.
+  #[allow(clippy::disallowed_methods)]
+  std::thread::sleep(TURN_HELD);
+  let waiting = (
+    counted(crate::repository::hg_run::TURN_WAITS),
+    parked.is_finished(),
+  );
+  give_back_turn(&daemon);
+  let parked = parked.join().expect("the parked push answered");
+  let waited_ns = counted(crate::repository::hg_run::TURN_WAITED_NS);
+  let heads = hg_command((port, &certificate), &first, "heads");
+  hold_turn(&daemon, &first, 50_000_000);
+  let refused = hg_unbundle((port, &certificate), &first, &history_bundle(&made, &[1]));
+  let given_up = counted(crate::repository::hg_run::TURN_GIVEN_UP);
+  give_back_turn(&daemon);
+  let unmoved = hg_command((port, &certificate), &first, "heads");
+  daemon.stop();
+  println!("(i) a push parked {waited_ns} ns behind a held landing turn");
+  assert_eq!(other.0, 200, "{}", String::from_utf8_lossy(&other.2));
+  assert_eq!(other_waits, 0, "another repository's push never waits");
+  assert_eq!(waiting, (1, false), "the first's push parked, unanswered");
+  assert_eq!(parked.0, 200, "{}", String::from_utf8_lossy(&parked.2));
+  let tip = crate::verbs::hex_of(&made[0].node);
+  assert_eq!(heads, (200, format!("{tip}\n").into_bytes()));
+  assert!(
+    u128::from(waited_ns) >= TURN_HELD.as_nanos(),
+    "waited {waited_ns} ns"
+  );
+  let words = crate::repository::hg_run::TURN_PAST_PATIENCE;
+  assert!(
+    refused.2.windows(words.len()).any(|at| at == words),
+    "{}",
+    String::from_utf8_lossy(&refused.2)
+  );
+  assert_eq!(given_up, 1);
+  assert_eq!(unmoved, heads, "the refused push moved nothing");
+}
+
+/// Format: the segment bound [`a_small_push_waits_behind_a_whole_history_push_for_its_landing_turn`]'s long push is cut
+/// at, so its run takes the turn at its first few changesets.
+const LONG_SEGMENT_BYTES: u64 = 32 * 1024;
+
+/// Format: the changesets of [`a_small_push_waits_behind_a_whole_history_push_for_its_landing_turn`]'s long push: a
+/// line long enough to land as tens of segments, short enough to answer within a client's patience in a debug build
+/// under a whole suite's load.
+const LONG_CHANGESETS: usize = 200;
+
+/// Main 01a20182's ruling (i) of 2026-11-22 04:44 ("measure how long a small push waits behind a whole-history push and
+/// record it in GAPS"). Do: start a two-shard daemon over loopback TLS; create a Mercurial repository; push a line of
+/// [`LONG_CHANGESETS`] changesets on a thread of its own, cut at [`LONG_SEGMENT_BYTES`]; once its run holds the
+/// repository's landing turn, push one unrelated changeset with no bookmark. Expect both `200`; the small push parked
+/// once, its wait counted; and the repository's heads both pushes' tips. Prints the small push's wait and the long
+/// push's span, for GAPS.
+#[test]
+fn a_small_push_waits_behind_a_whole_history_push_for_its_landing_turn() {
+  let (identity, certificate) = identity();
+  let (daemon, _instance) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let (made, bundle) = a_line_of(LONG_CHANGESETS);
+  create_empty_hg(&daemon, &name);
+  crate::daemon::observe_at(&daemon, REPOSITORY, |_| {
+    crate::repository::hg_run::TEST_SEGMENT_BYTES.with(|bound| bound.set(LONG_SEGMENT_BYTES));
+  });
+  let began = std::time::Instant::now();
+  let long = {
+    let (certificate, name) = (certificate.clone(), name.clone());
+    std::thread::spawn(move || hg_unbundle((port, &certificate), &name, &bundle))
+  };
+  let held = loop {
+    let held = crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
+      state
+        .refusals
+        .get(crate::repository::hg_run::SEGMENTS_LANDED)
+        .copied()
+        .unwrap_or(0)
+        > 0
+    });
+    if held || long.is_finished() {
+      break held;
+    }
+    // The harness paces its looks at the long push's turn; the daemon under test waits on its drivers.
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(Duration::from_millis(5));
+  };
+  let small = history_of(&[("lonely", "lonely", b"a small push\n", None, "default")]);
+  let pushed = hg_unbundle((port, &certificate), &name, &bundle_of(&small, &[0], None));
+  let long = long.join().expect("the long push answered");
+  let span = began.elapsed();
+  let counted = |name: &'static str| {
+    crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+      state.refusals.get(name).copied().unwrap_or(0)
+    })
+  };
+  let (waits, waited_ns, segments) = (
+    counted(crate::repository::hg_run::TURN_WAITS),
+    counted(crate::repository::hg_run::TURN_WAITED_NS),
+    counted(crate::repository::hg_run::SEGMENTS_LANDED),
+  );
+  let heads = hg_command((port, &certificate), &name, "heads");
+  daemon.stop();
+  println!(
+    "(i) a small push waited {:.1} ms behind a {LONG_CHANGESETS}-changeset push of {segments} segments that took {:.1} ms",
+    waited_ns as f64 / 1e6,
+    span.as_secs_f64() * 1e3
+  );
+  assert!(held, "the long push's run held the turn before it answered");
+  assert_eq!(long.0, 200, "{}", String::from_utf8_lossy(&long.2));
+  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
+  assert_eq!(waits, 1, "the small push parked once");
+  assert!(waited_ns > 0);
+  let heads = String::from_utf8_lossy(&heads.1).into_owned();
+  for tip in [&made[LONG_CHANGESETS - 1].node, &small[0].node] {
+    assert!(heads.contains(&crate::verbs::hex_of(tip)), "{heads}");
+  }
+}

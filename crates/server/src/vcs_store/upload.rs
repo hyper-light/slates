@@ -41,12 +41,11 @@
 use slates_db::catalog::{Principal, RepositoryId, RepositoryRecord};
 use slates_git::Admission;
 use slates_git::receive::HiddenRefs;
-use slates_git::store::NamedRef;
 use slates_git::store::learn::{Clock, Exchange};
+use slates_git::store::{NamedRef, UploadCounters};
 use slates_git::upload::{Fragments, PackPlan, PackRefused, PackSource, Served, Streamed};
 use slates_vcs::Work;
 
-use crate::config::DaemonConfig;
 use crate::git_push::{PolicyHidden, ref_of};
 use crate::state::ShardState;
 use crate::vcs_http::git::StoreLender;
@@ -62,9 +61,6 @@ std::thread_local! {
   pub(crate) static ROOMS: std::cell::RefCell<std::collections::VecDeque<u64>> =
     const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
 }
-
-/// Format: nanoseconds in a second, the measured throughput's unit of time against the exchange's.
-const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 /// The lender of this shard's stores to upload-pack (the module doc): the HTTP edge's, and the SSH site's once the
 /// daemon starts its edge. It holds nothing; each step borrows the shard's state for its own length.
@@ -120,6 +116,22 @@ impl StoreLender for ShardStores {
 
   fn wrote(&mut self, hold: &GitGeneration, bytes: u64) {
     hold.written.set(hold.written.get().saturating_add(bytes));
+    if bytes > 0 {
+      let _ = crate::state::with_state_counted(|state| state.count(WRITTEN, bytes));
+    }
+  }
+
+  fn pack_reads(pack: &Streamed) -> crate::vcs_http::git::upload::PackReads {
+    let (next, stopped) = pack.pack_reads();
+    crate::vcs_http::git::upload::PackReads { next, stopped }
+  }
+
+  async fn read_ahead(&mut self, reads: crate::vcs_http::git::upload::PackReads) {
+    read_ahead(reads).await;
+  }
+
+  fn paced(&mut self, taught: (u64, u64)) {
+    let _ = crate::state::with_state_counted(|state| learn_link(state, taught));
   }
 
   /// A-718: every version of repository `id` encoded as its fragments and kept, a turn at a time, before a fetch's answer
@@ -128,10 +140,123 @@ impl StoreLender for ShardStores {
   /// amended), every version admitted with no walk has its sets derived, a turn at a time ([`super::git_derive`]), waited
   /// for whole: the answer is made from them.
   async fn encode(&mut self, id: RepositoryId) {
+    // A-864 piece 2: the answer's own reads are brought back a turn ahead (`read_ahead`); its encoding's packs, where
+    // one is due, by the encoding (`git_encode::encode_within`).
     // A-614 amended: the sets of versions admitted with no walk derived first, which the answer and the encoding read.
     super::git_derive::derive_for_read(id).await;
     super::git_encode::encode_for_fetch(id).await;
   }
+}
+
+/// Counter: a let-go window of a git repository's pack that could not be brought back before a fetch or an encoding
+/// read it (goal 93 item 2a; A-864 piece 2's look-ahead): its read then refuses typed, as an unreadable object's does.
+/// Format: a counter name.
+pub(crate) const RESIDENT_REFUSED: &str = "vcs_store.git_resident.refused";
+
+/// The let-go windows of `packs` (each a pack and its length) in `content`, each as the read that would meet it waits
+/// for it: one an away window, none for a pack held whole.
+pub(crate) fn away_in(
+  content: &slates_vcs::ContentStore,
+  packs: impl Iterator<Item = (slates_vcs::ContentId, u64)>,
+) -> Vec<slates_git::store::packed::Waited> {
+  let window = to_u64(content.window()).max(1);
+  packs
+    .flat_map(|(pack, len)| {
+      (0..len.div_ceil(window))
+        .map(move |index| index.saturating_mul(window))
+        .filter(|offset| content.away_window(&pack, len, *offset).is_some())
+        .map(move |offset| slates_git::store::packed::Waited { pack, len, offset })
+        .collect::<Vec<_>>()
+    })
+    .collect()
+}
+
+/// Brings back each of `away`'s windows from the node's store: the bytes put back; each one refused counted
+/// [`RESIDENT_REFUSED`].
+pub(crate) async fn brought_back_all(away: Vec<slates_git::store::packed::Waited>) -> u64 {
+  let mut brought = 0_u64;
+  for waited in away {
+    match super::read_through::bring_back(waited).await {
+      Ok(bytes) => brought = brought.saturating_add(bytes),
+      Err(_) => {
+        let _ = crate::state::with_state_counted(|state| state.count(RESIDENT_REFUSED, 1));
+      }
+    }
+  }
+  brought
+}
+
+/// Format: the windows a fetch's look-ahead brings back ahead of its next turn (A-864 piece 2): the one it begins to read
+/// in and the next, so a turn reading on into the next window finds it held; one reading past them stops cleanly there.
+const LOOK_AHEAD_WINDOWS: u64 = 2;
+
+/// Counter: windows a fetch's look-ahead brought back ahead of its turn (A-864 piece 2). Format: a counter name.
+pub(crate) const AHEAD_BROUGHT: &str = "vcs_store.git_resident.ahead_brought";
+/// Counter: windows a fetch's turn stopped at, let go, and brought back before its next (A-864 piece 2). Format: a
+/// counter name.
+pub(crate) const STOPPED_BROUGHT: &str = "vcs_store.git_resident.stopped_brought";
+
+/// A fetch's look-ahead (A-864 piece 2; main 01a20182's ruling of 2026-11-22): before its next turn, off the turn, the
+/// let-go window its last turn stopped at, and those of the [`LOOK_AHEAD_WINDOWS`] its next turn reads first, brought
+/// back from the node's store; the turn then reads on without meeting one, and one reading past them stops cleanly at a
+/// unit's boundary, nothing of it written (`slates_git::store::Upload::waiting`).
+pub(crate) async fn read_ahead(reads: crate::vcs_http::git::upload::PackReads) {
+  if let Some(stopped) = reads.stopped
+    && super::read_through::bring_back(stopped)
+      .await
+      .is_ok_and(|bytes| bytes > 0)
+  {
+    let _ = crate::state::with_state_counted(|state| state.count(STOPPED_BROUGHT, 1));
+  }
+  let Some(next) = reads.next else {
+    return;
+  };
+  let away = crate::state::with_state(|state| {
+    let content = state.vcs_stores.content()?;
+    let window = to_u64(content.window()).max(1);
+    let first = next.offset / window;
+    Some(
+      (first..first.saturating_add(LOOK_AHEAD_WINDOWS))
+        .map(|index| index.saturating_mul(window).max(next.offset))
+        .filter(|offset| *offset < next.len)
+        .filter(|offset| content.away_window(&next.pack, next.len, *offset).is_some())
+        .map(|offset| slates_git::store::packed::Waited { offset, ..next })
+        .collect::<Vec<_>>(),
+    )
+  })
+  .flatten()
+  .unwrap_or_default();
+  let windows = to_u64(away.len());
+  if brought_back_all(away).await > 0 {
+    let _ = crate::state::with_state_counted(|state| state.count(AHEAD_BROUGHT, windows));
+  }
+}
+
+/// Brings back the let-go window a read of git repository `id` met and noted (`Repository::waiting`), where one did;
+/// whether one did (goal 93 item 2a: what a driver checks after every turn, so the next turn reads it).
+pub(crate) async fn brought_back_waited(id: RepositoryId) -> bool {
+  // A-864 piece 2: the window an encoding unit stopped at, else one a read met and noted.
+  let waited = crate::state::with_state(|state| {
+    state.vcs_stores.stopped_encoding(id).or_else(|| {
+      state
+        .vcs_stores
+        .git(id)
+        .and_then(|(_, store)| store.repository.waiting())
+    })
+  })
+  .flatten();
+  let Some(waited) = waited else {
+    return false;
+  };
+  if super::read_through::bring_back(waited).await.is_err() {
+    let _ = crate::state::with_state_counted(|state| state.count(RESIDENT_REFUSED, 1));
+  }
+  true
+}
+
+/// `len` as a word.
+fn to_u64(len: usize) -> u64 {
+  u64::try_from(len).unwrap_or(u64::MAX)
 }
 
 /// Runs `step` over repository `id`'s git store on `state`'s shard (the module doc): as upload-pack answers a request of
@@ -182,8 +307,8 @@ fn lend_uncounted<R>(
       green: *green,
     })
     .collect();
-  let mut packs = ShardPacks::of(&state.config);
-  super::lent_to_read((&mut state.store, &mut state.vcs_stores), |stores| {
+  let mut packs = ShardPacks::of(state);
+  let lent = super::lent_to_read((&mut state.store, &mut state.vcs_stores), |stores| {
     let (content, store) = stores.git_ref(id)?;
     let served = Served {
       repository: &store.repository,
@@ -192,7 +317,9 @@ fn lend_uncounted<R>(
       head: &head,
     };
     Some(step(&served, &mut packs))
-  })
+  });
+  packs.count_on(state);
+  lent
 }
 
 /// A fork of a git repository's store as it stood at `stamp` (A-745, §4.17.1 "A fetch's answer" rule 4;
@@ -237,6 +364,12 @@ impl Drop for GitGeneration {
       release_fork(state, id, stamp);
       let now = slates_rt::futures::now_ns();
       state.vcs_usage.answered(&id, Work::Fetch, written, now);
+      // A-856: the repository's last fetch ending (this one is still counted live until its guard drops after this),
+      // with no task making its encoding ahead (which gives back as it stops), its derived values past its learned
+      // grant are given back.
+      if crate::vcs_share::fetches_live(id) <= 1 && !super::git_encode::ahead_under_way(state, id) {
+        super::git_encode::give_back_idle(state, id);
+      }
     })
     .unwrap_or_default();
   }
@@ -302,7 +435,7 @@ fn lend_held_in<R>(
       green: *green,
     })
     .collect();
-  let mut packs = ShardPacks::of(&state.config);
+  let mut packs = ShardPacks::of(state);
   let lent = super::observed(state, hold.id, |state| {
     super::lent_to_read((&mut state.store, &mut state.vcs_stores), |stores| {
       let fork = stores
@@ -319,6 +452,7 @@ fn lend_held_in<R>(
       Some(step(&served, &mut packs))
     })
   });
+  packs.count_on(state);
   if lent.is_some() {
     let now = slates_rt::futures::now_ns();
     state
@@ -393,16 +527,136 @@ fn readable_refs(
 }
 
 /// Derived: the owner's exchange, what a byte the fragments' encoder saves is worth in its time (§4.11's value of a byte
-/// over its value of CPU, at neutral): the time this machine takes to copy the byte, as the archive's codec policy prices
-/// a byte at neutral (`DaemonConfig::codec`), so a second buys the measured memcpy throughput's bytes
-/// (`DaemonConfig::memcpy_bytes_per_second`, at least one byte).
-pub(super) fn exchange(config: &DaemonConfig) -> Exchange {
-  Exchange {
-    ns: NANOS_PER_SECOND,
-    bytes: config.memcpy_bytes_per_second.max(1),
-    rates: config.git_rates,
+/// over its value of CPU; A-859 part A, main 01a20182's rulings of 2026-11-22 04:30 and 06:32): the price of a byte on
+/// the links this shard's fetches are sent over, learned from the time their writes waited for the peer
+/// ([`LinkPrice`]); until it is learned, the price at which deflating at git's default level just pays on this machine
+/// (`Exchange::cold`, from `DaemonConfig::git_rates`). Never the time a copy in memory takes: a fetched byte crosses a
+/// link, and pricing it at memcpy's 0.14 ns sent git/git's clone uncompressed.
+pub(super) fn exchange(state: &ShardState) -> Exchange {
+  state
+    .vcs_stores
+    .git_link
+    .exchange(state.config.git_rates)
+    .unwrap_or_else(|| Exchange::cold(state.config.git_rates))
+}
+
+/// Format: the bytes sent past a link's first wait before its price is learned (A-859 part A): a MiB, past a socket
+/// send buffer's few hundred KiB (macOS's 128 KiB default, Linux's autotuned up to 4 MiB), so the price rests on
+/// writes the peer paced rather than on a few that happened to meet a full buffer.
+const LINK_LEARNED_FROM: u64 = 1 << 20;
+
+/// Format: the bytes a link's price remembers before both its sums are halved (A-859 part A): 64 MiB, a few clones of
+/// a mid-sized repository, so the price follows the links the shard sends over now and an old one fades.
+const LINK_MEMORY: u64 = 64 << 20;
+
+/// Counter: the bytes git fetches' answers wrote, counted as each step writes them, so a clone cut short says what it
+/// was sent (main 01a20182's r17, 2026-11-22 07:08). Format: a counter name.
+pub(crate) const WRITTEN: &str = "vcs_store.git_upload.written_bytes";
+
+/// Counter: bytes a git fetch sent past its link's first wait, which the shard's link price was learned from (A-859
+/// part A; its non-vacuity: the price moved). Format: a counter name.
+pub(crate) const LINK_LEARNED: &str = "vcs_store.git_link.learned_bytes";
+
+/// The price of a byte on this shard's links (A-859 part A, main 01a20182's ruling of 2026-11-22 06:32): the
+/// nanoseconds the edges' writes of git's fetch answers waited for the peer to take their bytes, over those bytes, each
+/// answer's counted from its first write that found the socket full ([`Sent::waited`]), since writes into a buffer with
+/// room take no time whatever the link and would read a slow link as free. Time slates spends making the answer is not
+/// in it, so a clone slow for its encoding never prices its link dearer (the loop a whole answer's wall time would make).
+/// Both sums are halved past [`LINK_MEMORY`], so the price is the recent links'.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LinkPrice {
+  /// The nanoseconds the writes waited.
+  ns: u64,
+  /// The bytes they wrote.
+  bytes: u64,
+}
+
+impl LinkPrice {
+  /// Learns a write of `bytes` that took `ns` to be taken, past its answer's first wait.
+  pub(crate) fn learn(&mut self, (ns, bytes): (u64, u64)) {
+    self.ns = self.ns.saturating_add(ns);
+    self.bytes = self.bytes.saturating_add(bytes);
+    while self.bytes > LINK_MEMORY {
+      self.ns /= 2;
+      self.bytes /= 2;
+    }
+  }
+
+  /// The exchange it prices a byte at, with the machine's `rates`: none until [`LINK_LEARNED_FROM`] bytes have been
+  /// learned.
+  pub(crate) fn exchange(&self, rates: slates_git::store::learn::Rates) -> Option<Exchange> {
+    (self.bytes >= LINK_LEARNED_FROM).then_some(Exchange {
+      ns: self.ns,
+      bytes: self.bytes,
+      rates,
+    })
   }
 }
+
+/// One write of a fetch's answer to its peer (A-859 part A), as its edge saw it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Sent {
+  /// The bytes written.
+  pub(crate) bytes: u64,
+  /// The nanoseconds the write took, to the peer taking its last byte.
+  pub(crate) ns: u64,
+  /// Whether it found the socket full and waited for the peer.
+  pub(crate) waited: bool,
+}
+
+/// What a fetch's answer has learned of its link (A-859 part A): nothing until a write waits for the peer; from it on,
+/// each write's bytes and time, learned into the shard's [`LinkPrice`] as they are written.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Pacing {
+  /// Whether a write has waited.
+  waited: bool,
+}
+
+impl Pacing {
+  /// What `sent` teaches the shard's price: its bytes and time once this or an earlier write has waited; none before.
+  pub(crate) fn sent(&mut self, sent: Sent) -> Option<(u64, u64)> {
+    self.waited |= sent.waited;
+    self.waited.then_some((sent.ns, sent.bytes))
+  }
+}
+
+/// Learns `taught` into `state`'s link price, counted [`LINK_LEARNED`].
+pub(crate) fn learn_link(state: &mut ShardState, taught: (u64, u64)) {
+  state.vcs_stores.git_link.learn(taught);
+  state.count(LINK_LEARNED, taught.1);
+}
+
+/// A counter of a fetch's stream's paths ([`STREAM_COUNTED`]): its name and the stream's count it adds.
+pub(crate) type StreamCount = (&'static str, fn(&UploadCounters) -> u64);
+
+/// Counters: the paths a fetch's stream sent its objects by (`slates_git::store::UploadCounters`, A-859; main 01a20182's
+/// order of 2026-11-22 04:53), counted on its shard as each step of its answer writes, so the daemon's status says which
+/// path a clone's objects took, a clone cut short too. Format: each a counter name and the stream's count it adds.
+pub(crate) const STREAM_COUNTED: [StreamCount; 17] = [
+  ("vcs_store.git_upload.parts_copied", |c| c.parts_copied),
+  ("vcs_store.git_upload.parts_by_entry", |c| c.parts_by_entry),
+  ("vcs_store.git_upload.entries_judged", |c| c.entries_judged),
+  ("vcs_store.git_upload.entries_copied", |c| c.entries_copied),
+  ("vcs_store.git_upload.headers_rewritten", |c| {
+    c.headers_rewritten
+  }),
+  ("vcs_store.git_upload.made_whole", |c| c.made_whole),
+  ("vcs_store.git_upload.loose_whole", |c| c.loose_whole),
+  ("vcs_store.git_upload.loose_deltas", |c| c.loose_deltas),
+  ("vcs_store.git_upload.loose_unsearched", |c| {
+    c.loose_unsearched
+  }),
+  ("vcs_store.git_upload.reused_whole", |c| c.reused_whole),
+  ("vcs_store.git_upload.reused_deltas", |c| c.reused_deltas),
+  ("vcs_store.git_upload.reuse_refused", |c| c.reuse_refused),
+  ("vcs_store.git_upload.reuse_no_entry", |c| c.reuse_no_entry),
+  ("vcs_store.git_upload.reuse_unread", |c| c.reuse_unread),
+  ("vcs_store.git_upload.reuse_crc_missed", |c| {
+    c.reuse_crc_missed
+  }),
+  ("vcs_store.git_upload.reuse_rebuilt", |c| c.reuse_rebuilt),
+  ("vcs_store.git_upload.backward_reads", |c| c.backward_reads),
+];
 
 /// A-639's stream as upload-pack's pack source on the owner shard (the module doc): each turn on the shard's clock, at
 /// the owner's exchange, within the step quantum the shard keeps when the step was lent.
@@ -412,14 +666,31 @@ pub(crate) struct ShardPacks {
   exchange: Exchange,
   /// The nanoseconds a turn may spend.
   quantum_ns: u64,
+  /// The stream's counters before this step's first write and after its last, for the shard to count what the step's
+  /// writes added once it ends ([`STREAM_COUNTED`]); none where the step wrote none.
+  counted: Option<(UploadCounters, UploadCounters)>,
 }
 
 impl ShardPacks {
-  /// The source on a shard `config` configures, at its step quantum now.
-  fn of(config: &DaemonConfig) -> ShardPacks {
+  /// The source on `state`'s shard, at its link's price and its step quantum now.
+  fn of(state: &ShardState) -> ShardPacks {
     ShardPacks {
-      exchange: exchange(config),
-      quantum_ns: config.step_quantum_ns(),
+      exchange: exchange(state),
+      quantum_ns: state.config.step_quantum_ns(),
+      counted: None,
+    }
+  }
+
+  /// Counts on `state` what the stream's writes counted in this step ([`STREAM_COUNTED`]).
+  fn count_on(&self, state: &mut ShardState) {
+    let Some((before, after)) = self.counted else {
+      return;
+    };
+    for (name, of) in STREAM_COUNTED {
+      let by = of(&after).saturating_sub(of(&before));
+      if by > 0 {
+        state.count(name, by);
+      }
     }
   }
 
@@ -463,9 +734,14 @@ impl PackSource for ShardPacks {
     out: &mut Vec<u8>,
     room: usize,
   ) -> Result<bool, PackRefused> {
-    self
+    let before = self
+      .counted
+      .map_or_else(|| pack.counters(), |(before, _)| before);
+    let written = self
       .fragments(&mut ShardClock)
-      .write(served, pack, admission, out, room)
+      .write(served, pack, admission, out, room);
+    self.counted = Some((before, pack.counters()));
+    written
   }
 }
 

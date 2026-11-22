@@ -5,8 +5,9 @@
 //! git-2000's 2,001 revisions took 24.5 s against 8.2 s before the store (GAPS, "C2 stage C waits").
 //!
 //! **What.** A [`Staging`] holds the repository's landing turn for its life, so no other landing moves the records it
-//! advances. Each revision ([`Staging::stage`]) has its texts taken out and put into the content store, named stored
-//! (as `land_revision` does); its copies from older revisions planned (`super::restore`); it is checked and applied to
+//! advances. Each revision ([`Staging::stage`]) arrives with its texts in the content store already, put by the import's
+//! sink as the dump was read and named stored (`crate::vcs_store::svn_import::texts`; goal 93, P7 finding (2)), their
+//! holds handed to the batch (`svn_commit::stage_texts`); its copies from older revisions planned (`super::restore`); it is checked and applied to
 //! the records in RAM, and its increment, built against the batch's scratch member, staged there (`ImportBatch::stage`).
 //! [`Staging::land`] lands one changeset: every text the batch put as its `Payload` with `Texts` rows, then one `Record`
 //! section a revision in order. Then it commits every version and the changeset's reference as one register entry
@@ -53,6 +54,14 @@ thread_local! {
 
 #[cfg(test)]
 thread_local! {
+  /// A test's kill of a batch's landing once its changeset is durable on the node's store and before its entry is
+  /// appended (A-760's crash oracle, main 01a20182's ruling of 2026-11-22 ~11:35): nothing after it runs, as after a
+  /// `kill -9`; it clears itself as it fires.
+  pub(crate) static KILL_BEFORE_ENTRY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
   /// A test's kill of a batch's landing after this many slices of its recorded apply (the sliced commit's crash test):
   /// nothing after it runs, as after a `kill -9`; it clears itself as it fires.
   pub(crate) static KILL_AT_COMMIT_SLICE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
@@ -78,6 +87,25 @@ impl Flush {
       Flush::End => FLUSHED_END,
     }
   }
+}
+
+/// The lengths of the texts `revision` names stored.
+fn stored_bytes(revision: &Revision) -> u64 {
+  revision
+    .stored
+    .values()
+    .fold(0u64, |total, len| total.saturating_add(*len))
+}
+
+/// What staging `revision` asks of the shard beyond what it holds already ([`Staging::due_before`]): its contents twice,
+/// into the content store and again in its increment's post-state; its texts once more, in the post-state, since the
+/// import's sink put them into the content store as the dump was read (A-862), where the shard charged them already,
+/// so its admittable bytes count them now. Charged twice, a batch that fits was landed early and the admission's
+/// figures lied (main 01a20182's ruling of 2026-11-22 06:22).
+fn admission_charge(revision: &Revision) -> u64 {
+  brought(revision)
+    .saturating_mul(2)
+    .saturating_add(stored_bytes(revision))
 }
 
 /// An import's revisions staged since its last landing (module docs).
@@ -155,8 +183,10 @@ impl Staging {
     if self.records.len() >= MAX_RECORDS {
       return Some(Flush::Sections);
     }
-    let charge = brought(revision).saturating_mul(2);
+    let charge = admission_charge(revision);
     let admittable = state.store.admittable();
+    // A test's cap counts what the batch holds as the shard's charge does: its texts, its post-state, and the texts
+    // the open revision put into the content store already.
     #[cfg(test)]
     let admittable = ADMISSION_CAP
       .with(std::cell::Cell::get)
@@ -165,18 +195,26 @@ impl Staging {
           .carried
           .iter()
           .fold(0u64, |total, text| total.saturating_add(text.len));
-        admittable.min(cap.saturating_sub(carried.saturating_add(self.held)))
+        let holds = carried
+          .saturating_add(self.held)
+          .saturating_add(stored_bytes(revision));
+        admittable.min(cap.saturating_sub(holds))
       });
     (charge > admittable).then_some(Flush::Admission)
   }
 
-  /// Stages `revision` (module docs): its texts put into the content store and named stored, its copies planned, then
-  /// checked, applied to the records in RAM and its version staged in the batch. None where the shard's state is
-  /// gone; refused as `land_revision` refuses, the batch then to be abandoned.
-  pub(crate) async fn stage(&mut self, revision: Revision) -> Option<Result<(), Uncommitted>> {
+  /// Stages `revision` (module docs): the texts the import put for it, `imported`, taken with their holds, any of its
+  /// contents put into the content store and named stored, its copies planned, then checked, applied to the records in
+  /// RAM and its version staged in the batch. None where the shard's state is gone; refused as `land_revision` refuses,
+  /// the batch then to be abandoned.
+  pub(crate) async fn stage(
+    &mut self,
+    revision: Revision,
+    imported: Vec<ContentIdentity>,
+  ) -> Option<Result<(), Uncommitted>> {
     let repository = self.repository;
     let mut revision = revision;
-    let (storing, carried) = match super::stage_texts(repository, &mut revision).await? {
+    let (storing, carried) = match super::stage_texts(repository, &mut revision, imported).await? {
       Ok(staged) => staged,
       Err(refused) => return Some(Err(refused)),
     };
@@ -251,14 +289,23 @@ impl Staging {
       if records.youngest() != head {
         return Err(Uncommitted::Diverged);
       }
-      let store = vcs_stores.content();
       batch
         .with_engine_in(greens, |engine| {
-          Building::new((records, store), engine, (&checked, plans)).build(head, work_identity)
+          Building::new(records, engine, (&checked, plans)).build(head, work_identity)
         })
         .ok_or(Uncommitted::NotHeld)?
     })?;
-    let post = u64::try_from(built.post_state.len()).unwrap_or(u64::MAX);
+    // The texts it names read before the scratch member judges it (A-760), and held as its post-state is.
+    let mut built = built;
+    super::read_named(state, &mut built)?;
+    let named = built
+      .named
+      .runs
+      .iter()
+      .fold(0u64, |total, run| total.saturating_add(run.len));
+    let post = u64::try_from(built.post_state.len())
+      .unwrap_or(u64::MAX)
+      .saturating_add(named);
     let growth = grown(&checked);
     crate::vcs_store::reserve_svn(state, repository, growth)
       .map_err(|available| Uncommitted::Budget { available })?;
@@ -326,8 +373,16 @@ impl Staging {
     };
     let records = std::mem::take(&mut self.records);
     let revisions = records.len();
+    // The changeset, every text the batch's entry names in its Payload, is durable before the entry is appended: so a
+    // named text outlives every entry naming it (A-760; `vcs_store::svn_texts::bring_back_named` relies on it).
     let landed =
       landing::land_changeset(&disk, (repository, sequence), records, &self.carried).await;
+    #[cfg(test)]
+    if KILL_BEFORE_ENTRY.with(std::cell::Cell::get) {
+      KILL_BEFORE_ENTRY.with(|kill| kill.set(false));
+      // A kill: nothing after it runs, as after a `kill -9` between the changeset and its entry.
+      std::future::pending::<()>().await;
+    }
     let recorded = crate::state::with_state(|state| {
       landed.and_then(|()| {
         if landing::next_sequence(state, repository) != sequence {
@@ -404,5 +459,46 @@ impl Staging {
     if let Some(turn) = self.turn.take() {
       turn.give_back(state);
     }
+  }
+}
+
+#[cfg(test)]
+mod charge_tests {
+  use std::collections::BTreeMap;
+
+  use slates_svn::commit::revision::Revision;
+  use slates_svn::index::RevisionRecord;
+
+  /// Shape: a revision's property bytes, its contents' bytes and its stored texts' lengths, each apart from the others.
+  const PROPERTY: (&[u8], &[u8]) = (b"svn:log", b"one");
+  /// Shape: see [`PROPERTY`].
+  const CONTENT: usize = 100;
+  /// Shape: see [`PROPERTY`].
+  const STORED: [u64; 2] = [1_000, 10_000];
+
+  /// Goal 93, A-862 (main 01a20182's ruling of 2026-11-22 06:22: a double charge refuses a batch that fits and makes
+  /// the admission's figures lie). Do: charge a revision bringing a property, a content of [`CONTENT`] bytes and two
+  /// texts named stored, as the import's sink put them into the content store before its batch judges it. Expect: its
+  /// property and content twice (into the store and again in its increment's post-state), its texts once (the
+  /// post-state alone: the shard charged them in the content store already). Failing first: f159578c3 charged the
+  /// texts twice too.
+  #[test]
+  fn a_revisions_texts_already_in_the_store_are_charged_once() {
+    let revision = Revision {
+      head: 0,
+      record: RevisionRecord {
+        transaction: "0-0".to_owned(),
+        changes: Vec::new(),
+      },
+      properties: BTreeMap::from([(PROPERTY.0.to_vec(), PROPERTY.1.to_vec())]),
+      contents: BTreeMap::from([([1; 32], vec![0; CONTENT])]),
+      stored: BTreeMap::from([([2; 32], STORED[0]), ([3; 32], STORED[1])]),
+      lock_entries: Vec::new(),
+    };
+    let brought = u64::try_from(PROPERTY.0.len() + PROPERTY.1.len() + CONTENT).unwrap();
+    assert_eq!(
+      super::admission_charge(&revision),
+      2 * brought + STORED[0] + STORED[1]
+    );
   }
 }

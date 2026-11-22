@@ -4,7 +4,7 @@
 //! not lent, and an SSH session the SSH site's services start over the daemon's lender.
 
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use slates_db::catalog::{Principal, RepositoryId, RepositoryRecord, VolumeId as DbVolumeId};
 use slates_git::Admission;
@@ -12,7 +12,7 @@ use slates_git::http::Version;
 use slates_git::object_name::{ObjectFormat, ObjectId};
 use slates_git::pktline::{self, MAX_LEN, Packet};
 use slates_git::unpack::{self, NoIndex};
-use slates_git::upload::{self, Asked, Refusal, Written};
+use slates_git::upload::{self, Answer, Asked, Refusal, Streamed, Written};
 use slates_ipc::protocol::{
   PolicyEffect, PolicyEntry, PolicyNames, PolicyRight, PolicyRule, PolicyWho, ReplyBody,
   RequestBody, VcsTool,
@@ -31,9 +31,13 @@ use crate::vcs_ssh::site::{Command, Next, Service, Services, Start, ToolServices
 
 /// Shape: the room a request and its answer are admitted: far past the tests' few small objects.
 const ROOM: u64 = 1 << 20;
-/// Shape: the most steps an answer or a session's request may take here, far past a few small objects' packets: a
-/// bound, so an answer that never ended would fail the test rather than hold it.
-const STEPS: usize = 1 << 12;
+/// Shape: the daemon's liveness intervals a drive (an answer's steps, an encoding's turns, an SSH command's steps) may go
+/// without progress before it is judged never to end ([`Judge`]): far past any wait between two of its signs of
+/// progress on a loaded host. Paced work's steps are a turn's quantum each and at least one unit, so how many a drive
+/// takes is the host's load, never a bound (main 01a20182's order of 2026-11-22 05:47:
+/// `t_goal93_a_clone_answered_before_its_reach_sets_are_derived_is_whole`, at load ~35, spent a fixed 4,096 steps with
+/// 131,053 of its 164,196 bytes written, every step progressing; its siblings by the order of 06:13).
+const STALLED_INTERVALS: u64 = 60;
 /// Shape: the uid of a reader the repository's owner is not.
 const READER: u32 = 4321;
 /// Shape: how long the test waits for the SSH session's task: four liveness windows, past every step it takes.
@@ -96,21 +100,101 @@ pub(crate) fn answered(
     upload::serve(served, Version::V2, asked, packs, &mut admission)
   })
   .expect("the request's step lent");
+  let out = written_to_end(state, id, &mut answer, &mut admission);
+  (out, answer.refusal().cloned())
+}
+
+/// `answer`'s steps on the shard, each lent the objects alone, one pkt-line's room a step, until it ends: its bytes. Its
+/// steps are paced, a turn's quantum each and at least one unit of its pack (`Fragments`, A-718), so how many it takes is
+/// the host's load and not the answer's: it is judged never to end only once [`STALLED_INTERVALS`] liveness intervals
+/// pass with neither a byte written nor its pack's counters moved ([`answer_seen`], its turns aside), and the failure
+/// says what it saw ([`Judge`]).
+fn written_to_end(
+  state: &mut ShardState,
+  id: RepositoryId,
+  answer: &mut Answer<Streamed>,
+  admission: &mut Admission,
+) -> Vec<u8> {
   let mut out = Vec::new();
-  for _ in 0..STEPS {
+  let mut judge = Judge::new("an answer", answer_seen(answer, &out));
+  loop {
     let written = lend_on(state, (id, None), |served, packs| {
-      answer.write(served, packs, &mut admission, &mut out, MAX_LEN)
+      answer.write(served, packs, admission, &mut out, MAX_LEN)
     })
     .expect("the answer's step lent");
     if written == Written::End {
-      return (out, answer.refusal().cloned());
+      return out;
+    }
+    if let Err(stalled) = judge.stepped(answer_seen(answer, &out)) {
+      panic!("{stalled}: (bytes written, its pack's counters)")
     }
   }
-  panic!("an answer that never ended: {out:?}")
+}
+
+/// What an answer shows of its progress, `out` its bytes so far: their count, and its pack's counters, its turns aside
+/// (a turn is taken whether or not it progressed).
+fn answer_seen(
+  answer: &Answer<Streamed>,
+  out: &[u8],
+) -> (usize, Option<slates_git::store::UploadCounters>) {
+  let counters = answer
+    .pack_source()
+    .map(|pack| slates_git::store::UploadCounters {
+      turns: 0,
+      ..pack.counters()
+    });
+  (out.len(), counters)
+}
+
+/// A drive's judge ([`STALLED_INTERVALS`]): what the drive last showed of its progress (`P`, compared step to step), when
+/// it last changed, and the steps taken.
+struct Judge<P> {
+  /// What is driven, as its failure names it.
+  what: &'static str,
+  /// What it showed after its last step.
+  last: P,
+  /// When that last changed.
+  progressed: Instant,
+  /// The steps taken.
+  steps: u64,
+}
+
+impl<P: PartialEq + core::fmt::Debug> Judge<P> {
+  /// A judge of `what`, which shows `seen` before its first step.
+  fn new(what: &'static str, seen: P) -> Judge<P> {
+    Judge {
+      what,
+      last: seen,
+      progressed: Instant::now(),
+      steps: 0,
+    }
+  }
+
+  /// After a step that did not end the drive, showing `seen`: its words once [`STALLED_INTERVALS`] liveness intervals
+  /// passed with nothing it shows changed, naming its steps and what it last showed.
+  fn stepped(&mut self, seen: P) -> Result<(), String> {
+    self.steps += 1;
+    if seen != self.last {
+      self.last = seen;
+      self.progressed = Instant::now();
+      return Ok(());
+    }
+    let window =
+      Duration::from_nanos(crate::daemon::LIVENESS_BUDGET_NS.saturating_mul(STALLED_INTERVALS));
+    let since = self.progressed.elapsed();
+    if since < window {
+      return Ok(());
+    }
+    Err(format!(
+      "{} that never ended: no progress for {since:?} (the window, {STALLED_INTERVALS} liveness intervals), after {} \
+       steps, last showing {:?}",
+      self.what, self.steps, self.last
+    ))
+  }
 }
 
 /// [`answered`] for a `fetch`, with what the pack's stream did: its bytes, and its counters (A-718).
-fn fetched_with_counters(
+pub(crate) fn fetched_with_counters(
   state: &mut ShardState,
   (id, reader): (RepositoryId, &Principal),
   wants: &[u8],
@@ -126,29 +210,33 @@ fn fetched_with_counters(
     )
   })
   .expect("the request's step lent");
-  let mut out = Vec::new();
-  for _ in 0..STEPS {
-    let written = lend_on(state, (id, None), |served, packs| {
-      answer.write(served, packs, &mut admission, &mut out, MAX_LEN)
-    })
-    .expect("the answer's step lent");
-    if written == Written::End {
-      let counters = answer.pack_source().expect("a fetch's pack").counters();
-      return (out, counters);
-    }
-  }
-  panic!("an answer that never ended: {out:?}")
+  let out = written_to_end(state, id, &mut answer, &mut admission);
+  let counters = answer.pack_source().expect("a fetch's pack").counters();
+  (out, counters)
 }
 
-/// Turns repository `id`'s encoding until it is idle, as a fetch's request does before its answer (A-718); the turns
-/// taken, within [`STEPS`].
+/// Turns repository `id`'s encoding until it is idle, as a fetch's request does before its answer (A-718): the turns
+/// taken. Judged on its progress ([`Judge`]): the units its encoding under way has done, the versions derived and
+/// encoded.
 fn encoded(state: &mut ShardState, id: RepositoryId) -> usize {
-  for turns in 0..STEPS {
-    if super::super::git_encode::turn(state, id) == super::super::git_encode::Turned::Idle {
-      return turns;
+  use super::super::{git_derive, git_encode};
+  let seen = |state: &ShardState| {
+    let counted = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+    (
+      git_encode::units_done(state, id),
+      counted(git_derive::DERIVED),
+      counted(git_encode::ENCODED),
+    )
+  };
+  let mut judge = Judge::new("an encoding", seen(state));
+  let mut turns = 0;
+  while git_encode::turn(state, id) != git_encode::Turned::Idle {
+    turns += 1;
+    if let Err(stalled) = judge.stepped(seen(state)) {
+      panic!("{stalled}: (its units, versions derived, versions encoded)")
     }
   }
-  panic!("an encoding that never ended")
+  turns
 }
 
 /// The data packets of `bytes` up to the first flush, each whole; a stream that ends before one fails the test.
@@ -464,7 +552,8 @@ fn t_a682_a_store_not_held_here_is_not_lent() {
 /// it waits for; a refusal's words and status instead, if it refused.
 async fn run_command(command: &mut impl Command) -> Result<(Vec<u8>, Next), String> {
   let mut written = Vec::new();
-  for _ in 0..STEPS {
+  let mut judge = Judge::new("a command", 0usize);
+  loop {
     let stepped = command
       .step(crate::vcs_ssh::site::ClientGone::never())
       .await
@@ -475,8 +564,10 @@ async fn run_command(command: &mut impl Command) -> Result<(Vec<u8>, Next), Stri
     if stepped.next != Next::More {
       return Ok((written, stepped.next));
     }
+    judge
+      .stepped(written.len())
+      .map_err(|stalled| format!("{stalled} bytes: {written:?}"))?;
   }
-  Err(format!("a step bound passed: {written:?}"))
 }
 
 /// One SSH session of git's upload-pack over `record`'s repository, as the SSH site's services start it over the
@@ -556,7 +647,8 @@ fn t_a682_an_ssh_session_fetches_through_the_daemons_lender() {
 /// A-718 (§4.17.2 "A push" item 8: a pushed version encoded once, off the answer's path, so a fetch copies its kept
 /// fragments rather than searching its objects for deltas again). Do: push one commit to a git repository's `main`
 /// through A-635's append on the owner shard and fetch it; then turn the repository's encoding until it is idle, turn it
-/// again, and fetch the commit again. Expect: the first fetch encodes its three objects afresh and copies no kept part;
+/// again, and fetch the commit again. Expect: the first fetch sends its three objects from the stream's loose stage
+/// (each sent on as its pushed entry lies, A-859, or encoded afresh) and copies no kept part;
 /// the encoding keeps the version's fragments once (counted encoded once, and a second encoding idle at once, nothing
 /// encoded again); the second fetch copies kept parts and encodes nothing afresh; both packs hold exactly the commit,
 /// its tree and its blob, read as index-pack reads one.
@@ -577,8 +669,9 @@ fn t_a718_a_pushed_version_is_encoded_once_and_fetched_from_its_kept_fragments()
       (before, after, encoded_count, again, objects)
     });
   assert_eq!((encoded_count, again), (Some(1), 0));
-  let fresh =
-    |counters: &slates_git::store::UploadCounters| counters.loose_whole + counters.loose_deltas;
+  let fresh = |counters: &slates_git::store::UploadCounters| {
+    counters.loose_whole + counters.loose_deltas + counters.reused_whole + counters.reused_deltas
+  };
   assert_eq!(
     (before.1.parts_copied, fresh(&before.1) > 0),
     (0, true),
@@ -669,7 +762,8 @@ fn a745_a_fetch_answers_from_the_generation_it_began_on_whatever_lands_meanwhile
         })
         .expect("the request's step lent");
         let mut out = Vec::new();
-        for step in 0..STEPS {
+        let mut judge = Judge::new("an answer in turns", answer_seen(&answer, &out));
+        loop {
           let write = |served: &upload::Served<'_>, packs: &mut super::ShardPacks| {
             answer.write_within(
               served,
@@ -686,14 +780,16 @@ fn a745_a_fetch_answers_from_the_generation_it_began_on_whatever_lands_meanwhile
             lend_on(state, (id, None), write)
           }
           .expect("the answer's step lent");
-          if step == 0 {
+          if judge.steps == 0 {
             land(state);
           }
           if written == Written::End {
             return out;
           }
+          if let Err(stalled) = judge.stepped(answer_seen(&answer, &out)) {
+            panic!("{stalled}: (bytes written, its pack's counters)")
+          }
         }
-        panic!("an answer that never ended")
       };
       let mut landed = false;
       let held = in_turns(state, began, true, &mut |state| {
@@ -722,4 +818,278 @@ fn a745_a_fetch_answers_from_the_generation_it_began_on_whatever_lands_meanwhile
     said(&start),
     "lent the objects alone, an answer's later steps lose its refs"
   );
+}
+
+/// A-859 (main 01a20182's order of 2026-11-22 04:53: the whole-repository round must say which path a clone's objects
+/// took). Do: push one commit to a git repository's `main` and fetch it, its stream's own counters read at its end.
+/// Expect: the shard counts each of the stream's paths ([`super::STREAM_COUNTED`]) as the stream counted it, so the
+/// daemon's status says which path a clone's objects took, and the fetch took one (its objects sent fresh, so the
+/// counts are not all zero).
+#[test]
+fn t_a859_a_fetchs_stream_counts_each_path_its_objects_took_on_its_shard() {
+  let (stream, counted) = crate::test_store::audit_on_stored_shard("vcs_store-upload", |state| {
+    let (id, _, head) = pushed_repository(state, "counted", &[]);
+    let (_, stream) = fetched_with_counters(state, (id, &owner()), &fetch(&[head], &[]));
+    let counted: Vec<u64> = super::STREAM_COUNTED
+      .iter()
+      .map(|(name, _)| state.refusals.get(*name).copied().unwrap_or(0))
+      .collect();
+    (stream, counted)
+  });
+  let expected: Vec<u64> = super::STREAM_COUNTED
+    .iter()
+    .map(|(_, of)| of(&stream))
+    .collect();
+  assert_eq!(counted, expected, "{stream:?}");
+  assert!(counted.iter().any(|count| *count > 0), "{stream:?}");
+}
+
+/// A-859 part A (main 01a20182's rulings of 2026-11-22 04:30 and 06:32: a fetched byte priced at its link, never at
+/// memcpy; cold, the price where deflate at git's default level just pays; learned from the writes that waited for the
+/// peer, from an answer's first wait on). Do: on an audit shard, read the fetch's exchange; teach the shard's pacing a
+/// MiB less a byte of a slow link's writes (a microsecond a byte), past one write that did not wait; read the exchange
+/// again; teach it a byte more; read it a third time. Expect: first the cold price (`Exchange::cold` of the machine's
+/// rates), a byte dearer than memcpy prices one; still cold short of the learned bound, the write before the first wait
+/// teaching nothing; then the link's own price, a microsecond a byte, and the learned bytes counted.
+#[test]
+fn t_a859_a_shard_prices_a_fetched_byte_cold_until_its_link_is_learned() {
+  use super::{LINK_LEARNED, Pacing, Sent, exchange, learn_link};
+  use slates_git::store::learn::Exchange;
+  crate::test_store::audit_on_stored_shard("vcs_store-link", |state| {
+    let rates = state.config.git_rates;
+    let cold = exchange(state);
+    let memcpy_priced = u128::from(cold.ns) * u128::from(state.config.memcpy_bytes_per_second)
+      > u128::from(cold.bytes) * 1_000_000_000;
+    let mut pacing = Pacing::default();
+    let early = pacing.sent(Sent {
+      bytes: 1 << 20,
+      ns: 1,
+      waited: false,
+    });
+    let slow = |bytes: u64| Sent {
+      bytes,
+      ns: bytes * 1_000,
+      waited: true,
+    };
+    for taught in [pacing.sent(slow((1 << 20) - 1))].into_iter().flatten() {
+      learn_link(state, taught);
+    }
+    let short = exchange(state);
+    for taught in [pacing.sent(slow(1))].into_iter().flatten() {
+      learn_link(state, taught);
+    }
+    let learned = exchange(state);
+    let counted = state.refusals.get(LINK_LEARNED).copied();
+    assert_eq!(
+      (cold, memcpy_priced, early, short),
+      (Exchange::cold(rates), true, None, Exchange::cold(rates)),
+    );
+    assert_eq!(
+      (learned.ns, learned.bytes, counted),
+      ((1 << 20) * 1_000, 1 << 20, Some(1 << 20)),
+    );
+  });
+}
+
+/// A-859 part A (main 01a20182's ruling of 2026-11-22 06:32: the loop's absence). Do: pace an answer made slowly, as a
+/// starved shard makes one: many writes far apart, each into a socket with room (none waited), the time between them
+/// long; then a link's price learned past its bound and halved past its memory. Expect: the slow answer teaches the
+/// price nothing, so a clone slow for its own making never prices its link dearer; the halved price is the same
+/// nanoseconds a byte.
+#[test]
+fn t_a859_an_answer_slow_for_its_own_making_teaches_its_link_price_nothing() {
+  use super::{LinkPrice, Pacing, Sent};
+  let mut pacing = Pacing::default();
+  let taught: Vec<(u64, u64)> = (0..1_000)
+    .filter_map(|_| {
+      pacing.sent(Sent {
+        bytes: 64 << 10,
+        ns: 2_000,
+        waited: false,
+      })
+    })
+    .collect();
+  assert!(taught.is_empty(), "{taught:?}");
+  let mut price = LinkPrice::default();
+  for _ in 0..200 {
+    price.learn((1_000_000, 1 << 20));
+  }
+  let rates = slates_git::store::learn::Rates {
+    deflate_ns_per_kib: [1; 10],
+    deflate_saved_per_mille: [500; 10],
+    search_ns_per_kib: 1,
+  };
+  let learned = price.exchange(rates).expect("learned");
+  assert_eq!(learned.ns / learned.bytes, 0, "under a nanosecond a byte");
+  assert_eq!(learned.ns * (1 << 20) / learned.bytes, 1_000_000);
+}
+
+/// Goal 93 item 2a (main 01a20182's ruling of 2026-11-22 05:45; w-git's driver hook: a fetch's and an encoding's packs
+/// made resident before they read). Do: on a store-backed daemon, put a pack of three windows and a part in the shard's
+/// content store, land its bytes on the node's store as a changeset's `Payload`, mark every window landed and let it
+/// go; list what [`super::away_in`] finds of it, bring that back ([`super::brought_back_all`]), list again, and read the
+/// pack whole. Expect: its four windows found let go, all brought back (their bytes the pack's), none found after, and
+/// the pack read whole as it was put. Failing first: nothing made a repository's packs resident, so a clone's read of a
+/// let-go window refused `Unread`.
+#[test]
+fn t_goal93_a_repositorys_let_go_pack_is_made_resident_before_it_is_read() {
+  use slates_vcs::ContentId;
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (sent, got) = std::sync::mpsc::channel();
+  crate::daemon::observe_first(&daemon, move |state| {
+    let _ = crate::git_push::tests::git_repository(state, "resident");
+    let window = state
+      .vcs_stores
+      .content()
+      .map_or(1 << 18, slates_vcs::ContentStore::window);
+    let bytes: Vec<u8> = (0..3 * window + 100)
+      .map(|at| u8::try_from(at % 251).unwrap())
+      .collect();
+    let len = u64::try_from(bytes.len()).unwrap();
+    let root = crate::vcs_store::within_budget(state, len, |stores| {
+      stores.content_mut().unwrap().put_object(&bytes).unwrap()
+    });
+    let header = slates_store::log::Header {
+      tool: slates_store::log::Tool::Git,
+      repository: 1,
+      sequence: 0,
+      judged_over: 0,
+      grant: 0,
+      work: 0,
+      time_ns: slates_rt::futures::now_ns(),
+      sections: 0,
+    };
+    let parts = vec![(slates_store::log::SectionKind::Payload, bytes.clone())];
+    assert!(crate::test_store::land_blocking(
+      state.vcs_disk.clone().unwrap(),
+      header,
+      parts
+    ));
+    crate::vcs_store::within_budget(state, 0, |stores| {
+      let content = stores.content_mut().unwrap();
+      let ids: Vec<ContentId> = bytes.chunks(window).map(ContentId::of).collect();
+      for id in &ids {
+        assert!(content.mark_landed(id) && content.let_go(id).is_ok());
+      }
+    });
+    let away = super::away_in(
+      state.vcs_stores.content().unwrap(),
+      [(root, len)].into_iter(),
+    );
+    let task = slates_rt::futures::spawn(async move {
+      let found = away.len();
+      let brought = super::brought_back_all(away).await;
+      let after = crate::state::with_state(|state| {
+        super::away_in(
+          state.vcs_stores.content().unwrap(),
+          [(root, len)].into_iter(),
+        )
+        .len()
+      });
+      let read = crate::state::with_state(|state| {
+        crate::vcs_store::lent_to_read((&mut state.store, &mut state.vcs_stores), |stores| {
+          stores
+            .content()
+            .and_then(|content| content.object_bytes(&root, len))
+        })
+      })
+      .flatten();
+      let _ = sent.send((found, brought, after, read == Some(bytes)));
+    })
+    .unwrap();
+    slates_rt::futures::detach(task).unwrap();
+  });
+  let (found, brought, after, whole) = got.recv().expect("made resident");
+  daemon.stop();
+  assert_eq!((found, after, whole), (4, Some(0), true));
+  assert!(brought > 0, "{brought}");
+}
+
+/// A-864 piece 2 (main 01a20182's ruling of 2026-11-22: residency bounded by a turn's windows, never a pack's). Do: on a
+/// store-backed daemon, put a pack of four windows in the shard's content store, land its bytes on the node's store and
+/// let every window go; run a fetch's look-ahead for a next turn beginning at the pack's first byte; then for one that
+/// stopped at its last window. Expect: the look-ahead brings back the first two windows alone (`LOOK_AHEAD_WINDOWS`), the
+/// last two still let go; then the window the turn stopped at, the third still let go; each counted.
+#[test]
+fn t_a864_a_fetchs_look_ahead_brings_back_a_turns_windows_never_its_pack() {
+  use slates_git::store::packed::Waited;
+  use slates_vcs::ContentId;
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (sent, got) = std::sync::mpsc::channel();
+  crate::daemon::observe_first(&daemon, move |state| {
+    let _ = crate::git_push::tests::git_repository(state, "look-ahead");
+    let window = state
+      .vcs_stores
+      .content()
+      .map_or(1 << 18, slates_vcs::ContentStore::window);
+    let bytes: Vec<u8> = (0..3 * window + 100)
+      .map(|at| u8::try_from(at % 251).unwrap())
+      .collect();
+    let len = u64::try_from(bytes.len()).unwrap();
+    let root = crate::vcs_store::within_budget(state, len, |stores| {
+      stores.content_mut().unwrap().put_object(&bytes).unwrap()
+    });
+    let header = slates_store::log::Header {
+      tool: slates_store::log::Tool::Git,
+      repository: 1,
+      sequence: 0,
+      judged_over: 0,
+      grant: 0,
+      work: 0,
+      time_ns: slates_rt::futures::now_ns(),
+      sections: 0,
+    };
+    let parts = vec![(slates_store::log::SectionKind::Payload, bytes.clone())];
+    assert!(crate::test_store::land_blocking(
+      state.vcs_disk.clone().unwrap(),
+      header,
+      parts
+    ));
+    crate::vcs_store::within_budget(state, 0, |stores| {
+      let content = stores.content_mut().unwrap();
+      for id in bytes.chunks(window).map(ContentId::of) {
+        assert!(content.mark_landed(&id) && content.let_go(&id).is_ok());
+      }
+    });
+    let step = u64::try_from(window).unwrap();
+    let away = move |state: &mut crate::state::ShardState| -> Vec<bool> {
+      let content = state.vcs_stores.content().unwrap();
+      (0..4u64)
+        .map(|index| content.away_window(&root, len, index * step).is_some())
+        .collect()
+    };
+    let task = slates_rt::futures::spawn(async move {
+      let at = |offset| Waited {
+        pack: root,
+        len,
+        offset,
+      };
+      super::read_ahead(crate::vcs_http::git::upload::PackReads {
+        next: Some(at(0)),
+        stopped: None,
+      })
+      .await;
+      let ahead = crate::state::with_state(away);
+      super::read_ahead(crate::vcs_http::git::upload::PackReads {
+        next: None,
+        stopped: Some(at(3 * step + 7)),
+      })
+      .await;
+      let stopped = crate::state::with_state(away);
+      let counted = crate::state::with_state(|state| {
+        (
+          state.refusals.get(super::AHEAD_BROUGHT).copied(),
+          state.refusals.get(super::STOPPED_BROUGHT).copied(),
+        )
+      });
+      let _ = sent.send((ahead, stopped, counted));
+    })
+    .unwrap();
+    slates_rt::futures::detach(task).unwrap();
+  });
+  let (ahead, stopped, counted) = got.recv().expect("looked ahead");
+  daemon.stop();
+  assert_eq!(ahead, Some(vec![false, false, true, true]));
+  assert_eq!(stopped, Some(vec![false, false, true, false]));
+  assert_eq!(counted, Some((Some(2), Some(1))));
 }

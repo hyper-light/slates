@@ -8942,6 +8942,25 @@ rest restores. Insufficient memory to hold a compressed copy: Refused before wor
 **Derived constants.** All from the profile and per-volume observations; the only fixed rule is
 the format floor.
 
+**A fetched git byte** (A-859 part A). A git fetch's pack crosses a link, so the value of a byte it
+saves is the link's price, never local memcpy's: the nanoseconds the HTTP edge's writes of fetch
+answers waited for the peer to take their bytes, over those bytes, learned per shard
+(`vcs_store::upload::LinkPrice`). An answer teaches it only from its first write that found the
+socket full on (a write into a buffer with room takes no time whatever the link), and the time
+slates spends making an answer is never in it, so a clone slow for its own encoding does not price
+its link dearer. Until a MiB past a first wait is learned, a byte is priced cold: at the break-even
+where deflating at git's default level (zlib's 6) just pays on this machine, `p₀ = d₆ / s₆`, `d₆`
+the measured nanoseconds a byte of that level on the profile's seeded text corpus and `s₆` the
+fraction of the corpus it saved (`learn::Rates`, `Exchange::cold`), so a pack is deflated as stock
+git deflates one until the link says otherwise. The price governs what has no stored form: a pushed
+entry is sent on as it lies (A-859 part B).
+
+> **Status (2026-11-22, A-859 part A).** A git fetch priced a byte at memcpy's 0.14 ns, so nothing
+> it encoded deflated or deltified: git/git's clone went 3-4 GiB where stock's pack is ~300 MB. Now a
+> fetched byte is priced at its link as above, cold at deflate's measured break-even. Owed (GAPS):
+> the SSH edge's link (its writes are not yet heard, so SSH fetches price cold), a price per client
+> rather than per shard, and the archive's own question below.
+
 > **Status (2026-10-20).** The cost model above ran with no inputs in some builds and not
 > others until this date. The boot profile's codec probe was compiled out wherever
 > `slates-machine` was reached as a dependency — it was declared `default-features = false` on
@@ -55652,6 +55671,18 @@ Applied in the same change to: GAPS (§4.17). Status: designed; slices (a1) to (
   before the records, so an object past a window is whole by its identity after a restart with no record's bytes.
   Test `daemon::tests::t_a727_a3b_an_object_past_a_window_survives_a_warm_restart_by_its_identity` (1 MiB file),
   red with the pieces left out.
+- **Windows let go ride the image (2026-11-22, w-hg; main 01a20182's ruling (a) of 02:52, A-767 C1 step 2b).** A window
+  let go (`ContentStore::let_go`, the cold trigger's and an import's let-go once its segment is durable) keeps its
+  entry, its length and its landed mark; the shard image carries it as a piece of kind 15 (its identity, then its
+  length), whole in every image (`ContentStore::aways`) and as a change in every delta (`away_changes`: put while let
+  go, removed once brought back or freed). A restart takes the windows let go back before the lists, which hold the
+  nodes they name (`restore_away`), so each stays let go, never absent: a reader brings it back by its own bytes
+  (`bring_back_object`). The image is the recovery's one truth: a window the image never named stays absent, a typed
+  `NotHeld`, never adopted as let go (rejected: replay inferring "let go" from "absent", which would swallow a window
+  lost for real). Tests `vcs content::windows_let_go_survive_a_restart_as_let_go_and_come_back_by_their_bytes` (red
+  without `restore_away`: 4 lists and names refused) and `daemon::tests::t_c1_windows_let_go_survive_warm_restarts_whole_and_come_back_by_their_bytes`
+  (three warm restarts after seeded let-go rounds, the store whole as published each time, the object brought back the
+  same bytes by its identity).
 
 
 ### A-664 Subversion objects — A version a work submits to a Subversion repository's green becomes the revision the server makes of it (bug, 2026-11-20, w-shared for UI goal 93)
@@ -58110,6 +58141,15 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > past it; a landing let go uncommitted is abandoned (its liveness channel's sender dropped, the owner woken), the log's
 > end never moved. Held by `a_changeset_lands_in_parts_alone_and_a_dropped_one_leaves_nothing` (`tests/owner.rs`).
 
+> **Status (2026-11-22, C5's read-through: a let-go window brought back; A-863, w-shared, main 01a20182's ruling of
+> 05:45).** A home's RAM copy of a landed pack may go once that home's node store holds it durably (one rule for every f:
+> on a laptop the single home is the owner, which lands the push as one changeset; in a fleet a home holding the pack
+> only in RAM keeps it). A git read of a window let go is refused `PackedRefused::Away` (its pack, length and offset),
+> the `Repository` keeps the first such miss (`Repository::waiting`), and `vcs_store::read_through::bring_back` reads the
+> window from the node's store (`StoreHandle::piece`, the payload by its BLAKE3, `ContentStore::object_identity`) and puts
+> it back (`ContentStore::bring_back`); the driver takes the step again (w-git's, in upload and the encoding). The
+> let-go after a landing itself is item 2b, owed.
+
 > **Status (2026-11-20, C5's store side: git's pack read from the store).** `crates/server/src/vcs_store/store_packs.rs`
 > (`StorePacks`): git's synchronous `PackSource::piece` over the store, which only its owner thread reads. An awaited
 > `fill(pack, len, offset, until)` fetches the store's pieces (`PIECE_BYTES`, aligned in the pack) covering a range
@@ -58186,6 +58226,18 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > the push's intake derives from the same changegroup on all five 7.2 formats (main's oracle of the two encodings).
 > An import refused midway leaves an unnamed run that recovery passes over, and the next landing takes the last named
 > sequence plus one (decision 2).
+
+> **Status (2026-11-22, a push lands as a run of segment changesets; main 01a20182's rulings (b1) and (i) of 04:44).**
+> A push's intake cuts its kept texts into segments of an import's size and lands each as it is cut, between its
+> slices: `Record` the segment's rows by identity (record v8, the push's source), `Payload` its slice of the
+> changegroup, `Texts` its texts; what the texts charged the push's admission is given back once each lands. The
+> push's entry names the run (record v9, the push's source byte 1), and a restart replays it as an import's run, rows by
+> identity, no payload read. A run's rows are numbered after the index's, and a replay reads its sequences first to
+> last, so the repository's landing turn (Subversion's, which Mercurial's made changesets hold too) is held from the
+> run's first segment to the entry; a push of the same repository parks for it within the room wait's patience, and a
+> fork made stale before the turn is taken again inside it, never re-based. A run no entry names is abandoned: its
+> sequences are landed again by the next landing, each store row the newest landing at it. A made changeset stays one
+> changeset (record v7). `repository::hg_run`; crash oracle `t_b1_a_crash_at_any_segment_boundary_leaves_a_push_whole_or_absent`.
 
 > **Status (2026-11-21, C1: made changesets on the changeset store; main's ruling of 09:00).** A changeset the server
 > makes of a submitted version is a changegroup the server builds, taken through the push's own intake and landed as
@@ -60626,3 +60678,377 @@ Applied in the same change to:
   bytes through its `packfile` header, given up answered as before).
 - **Left** (GAPS): the SSH edge admits an answer its shard room but does not yet wait (a held refusal there is given up
   at once); a refusal once the pack's source began still ends the pack.
+
+### A-856 — A git encoding's parts are charged, and fragments are made ahead only for a client within its repository's grant (2026-11-22, w-git for UI goal 93; main 01a20182's rulings of 00:30 and 01:55 PST, Ada: "our memory should be far less than that"; A-718, A-724 pieces 2d and 4)
+Applied in the same change to:
+- `crates/git/src/store/encoding.rs`: `Encoding::held_bytes`, `release`; each unit trues up a charge on the content
+  store for the parts held (refused typed where the store has no room), given back at the end or on a refusal.
+- `crates/server/src/vcs_store/git_encode.rs`: `encode_ahead` (the task behind a fetch, turned only while
+  `ahead_allowed`: a fetch of the repository answered, and its holding within its learned grant), `give_back_idle`,
+  `drop_under_way` (an encoding's charge given back as it is dropped), counters `ahead_stopped` and `given_back_idle`.
+- `crates/server/src/vcs_store/upload.rs`: a repository's last fetch ending gives back what it holds past its grant.
+- `crates/server/src/vcs_share.rs`: `fetches_live`, `held`, `budget` (the learned grant, `grants::current_at`).
+- GAPS (§4.17).
+
+- **Found by use.** clients' table (big Studio, release a3e673efc, git/git v2.0.0 over HTTP): RSS 47 MiB at the start,
+  917 MiB at the clone's end, 1,695 MiB 90 s later with no client, still rising ~8 MiB/s; shard 0 still turning the
+  encoding behind the clone; +1.53 GB of >= 1 MiB blocks, the encoder's parts (`Part.bytes`, 2.5 GB live at its most)
+  "charged to no budget". a3e673efc predates A-850, under which each tag's first version encoded its whole history.
+- **Change.** The parts an encoding holds between its units are charged to the content store, so the shard's budget
+  sees them and an encoding past it is refused, a fetch then searching instead. The task behind a fetch that stopped
+  waiting turns the encoding only while a fetch of the repository is answered and the repository holds less than its
+  learned grant (none before its curve has learned a read, so a repository nothing has read makes nothing ahead); past
+  either it stops. As a repository goes idle, its encoding under way is dropped and what it holds past its grant given
+  back by the cold trigger's cost model, as A-724 piece 4 gives back under contention.
+- **Tests.** `slates-git` `store::tests::encoding::an_encodings_parts_are_charged_to_the_store_as_they_grow_and_given_back_at_its_end`
+  (red with the charge off: 154 bytes held, none charged); `slates-server`
+  `vcs_store::git_encode::tests::t_a856_with_no_fetch_answered_nothing_is_encoded_ahead` (the task stops at its first
+  turn, versions left unencoded, nothing held under way; red before: every version encoded with no fetch there) and
+  `t_a718_a_fetch_that_stops_waiting_leaves_a_task_that_finishes_the_encoding` (with a fetch answered and its grant
+  learned, 262,144 bytes here, the task finishes the encoding as before).
+- **Left** (GAPS): each object's deflate makes a fresh state (97 GB made over one clone), owed next; past its grant a
+  repository's fragments are not kept on disk under its grant, only not made ahead; main's RSS round over git/git.
+
+### A-857 — A deferred build runs within its repository's room as it is built, and one past it waits for room (bug, a regression, 2026-11-22, w-git for UI goal 93; main 01a20182's rulings of 02:12, 02:52 and 03:03 PST; P2, A-724, A-855)
+Applied in the same change to:
+- `crates/merge/src/push.rs`: `DeferredPush` holds no room; its record is version 2 (version 1, which recorded its push's
+  room, refused); `DeferredPush::building(pace, room)`. `crates/merge/src/engine.rs`: `Green::materializing(pace, room)`.
+- `crates/git/src/receive/works.rs`: a deferred create records its push alone.
+- `crates/server/src/green_ready.rs`: a build begun within its repository's room now (`build_room`); a build past its
+  room (`PushRefused::PastRoom`) waits (`waited`, a waiting green parks requests as a building one does), begun again
+  within the room that came, given up past patience; counter `merge.green.materialize_waited`.
+- `crates/server/src/vcs_share/wait.rs` (new): `RoomWait`, `Waited`, `ceiling`, counters `vcs_share.room_waits`,
+  `room_waits_taken`, `room_waits_given_up`: the one wait git and hg share (w-hg's PastAdmission next).
+- GAPS (§4.17).
+
+- **Found by use.** Main's git matrix on git/git's v2.0.0 cut at 81dc7ca3b: branch-push, tag-push and ssh-push refused
+  "[remote rejected] (failed to update ref)", 20 of 27 (26 of 27 at 907c246ac); git/git's push-whole refused `jch`,
+  `next` and `seen`. The anchor logged a green's owed push refused building `PastRoom { asked: 183803, room: 182886 }`
+  and `PastRoom { asked: 32271331, room: 32122804 }`.
+- **Cause.** A created ref's green owes its push (P2), built when first reached, within the room its `DeferredPush`
+  recorded at the push's start. Since A-724's learned demand a small push records a room near its learned demand, past
+  which a whole tree's listing goes; and a push waits at the green's door for that build, so the push failed.
+- **Change.** The record keeps no room; a build runs within its repository's room as it is built, and one past it waits
+  for room (§4.17.1 rule 2's wait, A-855's, now `vcs_share::wait`), never refused while room may come.
+- **Tests.** `slates-server` `repository::push::tests::a_deferred_build_past_its_room_waits_for_room_and_is_made` (the
+  first room one byte: waited, made, the read answered, counted waited and taken, refused never; red before with the
+  room recorded at one byte: refused `PastRoom`, the read answered `ContentUnavailable`);
+  `vcs_share::wait::tests::a_wait_answers_again_when_the_room_grows_waits_until_then_and_gives_up_past_patience_or_the_ceiling`;
+  `slates-merge` `push::tests::a_deferred_push_record_refuses_every_damaged_form` (version 1 refused).
+- **Left** (GAPS): A-855's HTTP fetch wait onto `vcs_share::wait` (it keeps its own form, the same rule); main's rerun of
+  the matrix and git/git, which names whether master's "cannot lock ref" stands apart from this.
+
+### A-858 — Every child the daemon spawns is handed only its three streams; a hook's exit is read whenever the kernel has it (2026-11-22, w-svn; main 01a20182's ruling (a) of 02:06 PST on the hook pipe race, and its constraint of 03:22; A-622, A-597, A-645 (a))
+Applied in the same change to:
+- `crates/ipc/src/confined_spawn.rs` (new): `spawn`, through `posix_spawn` with file actions naming the child's standard
+  streams alone, its directory and its group; on macOS `POSIX_SPAWN_CLOEXEC_DEFAULT`; `SpawnedChild` (wait, try_wait,
+  the group's kill). `unsafe-budget.toml`: slates-ipc 147 → 160, each site named.
+- `crates/server/src/hook_driver.rs`: hooks (git's, Mercurial's and Subversion's) and the daemon's own helpers
+  (`run_helper`, a view's `slates mount`) spawned through it; `read_exit` asks the kernel at every wake, and a run whose
+  watch fired before its status was readable yields and reads again.
+- `crates/cli/tests/svn_interop.rs`: an anchor's guard lets go the hook views mounted in its store before it stops its
+  daemon, then removes the store within a bound.
+- `docs/wip/GAPS.md`.
+
+- **Why.** main's parallel daemon_edge set timed out hooked DAV requests at the client's 10 s read (2 of 12 runs), and
+  macos-latest's HTTPv2 `svn propset --revprop` hung 120 s. Two causes, found in turn:
+  - macOS has no `pipe2`. A pipe made while another thread spawned leaked into that child, which then held a hook's
+    words stream open past the hook's exit.
+  - macOS posts a process's exit note a moment before the process can be waited for. A first run, which has no
+    learned deadline, whose words had ended had nothing left to wake it.
+  A red run's cleanup then sat in `remove_dir_all`'s `openat` beneath a view whose daemon was gone. And a kernel NFS
+  mount whose daemon dies under it has panicked a Mac (2026-10-06).
+- **What.** The standard library's `Command` cannot restrict what a child inherits, so the daemon spawns through
+  `confined_spawn`. A child holds its three streams and nothing else. Linux's standard pipes are atomic
+  (`pipe2(O_CLOEXEC)`), so the same spawn serves there without the flag. The driver treats the exit watch as a wake
+  alone, and the status read without reaping as what says the hook exited. The test guard's order is: unmount the
+  views, stop the daemon, remove the directory.
+- **Evidence.**
+  - `hooks_spawned_at_once_each_end_at_their_own_exit` (32 at once, 4 rounds): against the previous driver, red 2 of 3
+    runs ("a refusing hook's run took 4012475167 ns", held by a sleeping hook until its kill). With the seam alone,
+    red about 1 of 2 (a refusing run never ended: the exit note seen, `waitid` none). With both, 20 of 20 green.
+  - `confined_spawn`'s `a_child_holds_only_the_streams_its_spawn_names`: a descriptor with close-on-exec cleared is
+    not held by the child (macOS).
+  - `a_failing_test_lets_its_hook_view_go_before_its_daemon` (CI only): the guard's order under a deliberate failure.
+
+### A-859 — A git object received in a pack is sent on as its entry lies there: git's pack reuse (bug, 2026-11-22, w-git for UI goal 93; main 01a20182's ruling of 03:38 PST; part B; §4.17.2 items 4 and "A fetch", A-639, A-718, A-722)
+Applied in the same change to:
+- `crates/git/src/store/packed.rs`: `raw_entry`, an entry as it lies (its representation, its size, where its data
+  begins and ends), its data inflated once to find its end; `inflate_into` answers where the data ended.
+- `crates/git/src/store/encoding.rs`: `Encoding::reused`, `Current::Copy` (a pushed entry's data copied into a part a
+  window a unit), the pack places of the encoding's objects (`offsets`), counters `reused_whole`, `reused_deltas`,
+  `reuse_refused`; `crates/git/src/store/fragment.rs`: `Encoder::remember` shared with a reused entry.
+- `crates/git/src/store/upload.rs`: the loose stage's `reused` (a whole entry or a delta whose base precedes it, sent as
+  an offset delta where the client said `ofs-delta`), `loose_at`, the same three counters on `UploadCounters`.
+- `crates/git/src/store/repository.rs`: `read_entry`, `largest_object`.
+- `crates/server/src/vcs_store/git_encode.rs`: counters `vcs_store.git_encode.reused_whole`, `reused_deltas`,
+  `reuse_refused`.
+- GAPS (§4.17).
+
+- **Found by use.** Main's git/git whole-repository round: a mirror clone over HTTP ran past its 120 s patience; the
+  SSH edge rekeyed four times at about 1 GiB each for one clone of a 334 MB repository, 12 to 15 times stock's pack.
+- **Cause, measured.** Every object went whole and uncompressed: a line of 40 commits of a growing file and 40 tags,
+  160 objects, 87,282 bytes raw, cloned in 89,439 bytes before encoding (`loose_whole: 160, loose_deltas: 0`) and from
+  kept fragments alike (stored zlib alone is 89,042). The fragments' encoder prices a saved byte at the owner's
+  exchange, a byte's memcpy cost (7.4 GB a second here, 0.14 ns a byte), so no deflate level and no delta trial ever
+  paid; and nothing reused what the client's pack already held compressed and deltified.
+- **Change (part B).** An object pushed in a pack is sent on as its entry lies there, as git's `pack-objects` reuses a
+  packed entry before it searches, both where fragments are made and in the stream's loose stage; each entry checked
+  first against the object's name (a delta through its base), a corrupt one refused and the object encoded instead;
+  a delta reused only where its base precedes it in the pack the client reads, a still-wanted base placed first (git's
+  `write_one`: the stream's loose stage meets objects by type then id, the encoding by type then the largest first, so
+  each keeps a stack of bases to place ahead, as deep as the deepest chain any push carried); a whole entry reused
+  whenever it has one (main 01a20182's ruling of 2026-11-22 05:38, superseding "only where the encoder would try no
+  delta": git/git's clone spent its time in `Search::step` on objects that had a stored form), the reused object kept
+  as a later one's candidate base. Counted where reuse is not taken: `reuse_refused` (its check failed),
+  `reuse_no_entry` (kept as content, in no pack) and `reuse_unread` (its entry or base unread). Part A (built after B,
+  main 01a20182's rulings of 2026-11-22 04:30 and 06:32): a fetched byte priced at its link, the nanoseconds the HTTP
+  edge's writes waited for the peer over their bytes, learned per shard from each answer's first wait on (never the
+  answer's wall time, which a CPU-bound clone would read as a slow link and ratchet into harder compression); cold,
+  deflate's measured break-even at git's default level, `p₀ = d₆ / s₆` (§4.11, "A fetched git byte"). Tests:
+  `slates-git` `a859_a_fetched_byte_is_priced_at_its_link_cold_at_deflates_break_even` (626 bytes of objects: 287 cold,
+  697 at a fast link's price, 285 at a slow one's); `slates-server`
+  `t_a859_a_shard_prices_a_fetched_byte_cold_until_its_link_is_learned`,
+  `t_a859_an_answer_slow_for_its_own_making_teaches_its_link_price_nothing`, and
+  `vcs_http::tests::a859_a_reply_to_a_client_that_reads_late_waits_for_it_and_the_edge_hears_each_write`.
+- **Tests.** `slates-server` `git_push::tests::t_a859_a_clone_of_a_deltified_push_sends_its_entries_as_they_lie` (the
+  line above pushed as stock git sends it, 17,299 bytes: cloned before encoding in 20,916 (121 whole, 20 deltas reused,
+  none refused) and from kept fragments in 20,858 (121 whole, 39 deltas), each within the pushed pack plus 40 bytes an
+  object, and whole; red before: 89,439, every object whole and uncompressed).
+- **Left** (GAPS): part A; `fsck --strict` over a stock clone (main's git/git rounds); a delta whose base this pack
+  places later is encoded, not reordered; the loose stage's table of where each object begins is charged once to the
+  request (a word pair an object, A-745 rule 1), `an_object_past_a_window_gets_a_delta_exactly_when_its_search_fits_the_admission`
+  sizing its room with it.
+
+### A-860 — A git repository gone idle lets go of the objects its reads keep (2026-11-22, w-git for UI goal 93; main 01a20182's note of 04:24 PST; A-856's rule, A-722's recent objects)
+Applied in the same change to: `crates/git/src/store/packed.rs` (`Recent::let_go`), `crates/git/src/store/repository.rs`
+(`recent_bytes`, `let_go_recent`), `crates/server/src/vcs_store/git_encode.rs` (`give_back_idle` lets them go), GAPS.
+
+- **Found by use.** w-shared's gauges: `git.recent_bytes`, a repository's objects read lately (git's delta base cache),
+  held at its budget, 53.9 MB, after a git/git v2.0.0 clone had ended, 0.2 MB before it. The cache's budget is the
+  repository's largest pack, and nothing let it go between reads.
+- **Change.** As a repository goes idle (its last fetch ending, or the task making its encoding ahead stopping with no
+  fetch answered, A-856), the objects its reads keep are let go and its read buffers' room given back, the cache's budget
+  kept for the reads after; counted with the rest in `vcs_store.git_encode.given_back_idle`.
+- **Tests.** `slates-server` `vcs_store::git_encode::tests::t_a860_a_repository_gone_idle_lets_go_of_the_objects_its_reads_keep`
+  (the encoding's reads kept 417 bytes here; once the fetch ended, back to the 32 before; red before: 417 held).
+
+### A-861 — Objects read lately lie in chunks given back whole, never on the system heap (2026-11-22, w-shared; main 01a20182's rulings of 04:24 and 04:56 PST, goal 93; A-742, A-860)
+Applied in the same change to: `crates/git/src/store/packed.rs` (`Recent`: chunks, a hash index, one order queue;
+`let_go` gives back every chunk; `true_up`, `release`), `crates/git/src/store/push.rs`, `repository.rs` and
+`encoding.rs` (the charge's owners), `crates/server/src/vcs_store.rs` and `git_encode.rs`, `crates/git/Cargo.toml`
+(`slates-mem`), `crates/mem/src/large.rs`
+(`Heap::system_allocated`), `crates/server/src/memory_gauges.rs` (`mem.gauge.process.system_allocated_bytes`),
+`crates/git/tests/recent_ring.rs`, GAPS.
+
+Status: built 2026-11-22, macOS arm64 (focused tests); main's RSS round owed.
+- Why: a landed push of git/git v2.0.0 kept 772-787 MiB for a 56 MB pack. The memory status's gauges put 550-600 MB of
+  it in freed memory the system allocator kept. The push inflates its 164,488 objects to 2,301 MB, none of them 1 MiB,
+  and kept each, as read lately, as its own buffer, freed oldest first as newer came: a stream of blocks under
+  A-742's mapped floor, each held for seconds, which the allocator does not give back.
+- Rule: `Recent` lays each object's bytes end to end in chunks one mapped floor long (or its budget, when that is shorter),
+  each reserved once and never grown, and gives back the oldest chunk whole when the budget would be passed. An object a
+  chunk long or longer is taken whole as a chunk of its own (the large path), and one past the budget is not kept. A
+  growing budget (a push's, as its pack arrives) adds chunks, never a copy.
+- Safety: an object is found by its chunk's number and range; every chunk ever laid takes the next number, so an
+  object whose chunk has gone is a miss, never another object's bytes. Its bytes are lent as a slice of `&self`, so none
+  outlives the read. No `unsafe`. The chunks are the push's or the repository's, so they go when it does (landed,
+  refused, abandoned, or a dropped future), and `let_go` (A-860) gives back every one.
+- Index: a hash table, which allocates nothing once grown to the budget's objects (a B-tree split and gave back a node
+  every few: 142 bytes an object), and one order queue.
+- Charged (main 01a20182's ruling of 05:17: an uncharged holder makes the admission's numbers lie): `Recent::true_up`
+  charges the owner's content store for the chunks held, trued up where the owner holds the store mutably (a push after
+  each admission turn, a repository after each encoding unit, since a clone's reads fill it), and where the store's room
+  cannot take it the oldest chunks go until it can. `Recent::release` gives back the chunks and the charge: a push's
+  when it is committed or abandoned, a repository's when it goes idle (A-860's give-back). A read between two true-ups
+  only lays chunks the next one charges.
+- Evidence: `a_push_keeps_its_objects_read_lately_off_the_system_heap` (its own binary, `LargeMapped` global): red, the
+  system path's live bytes grew 6,582,872 bytes keeping 8 MiB; green, under a tenth of the budget, and a third round's churn
+  past the objects handed over under a hundredth. `recent_tests`: a gone chunk's object a miss, a large object a chunk
+  of its own, one past the budget not kept, `let_go` holding nothing.
+
+### A-862 — A Subversion import holds no text: each goes into its caller's sink a piece at a time as the dump is read (2026-11-22, w-svn; main 01a20182's order of 05:28 PST, goal 93, P7 finding (2); A-628, A-716, A-842, C2 stage C)
+Applied in the same change to:
+- `crates/svn/src/migration/import.rs`: `Importer::import` takes a `commit::drive::TextSink`, the seam a client's
+  commit's drive writes through. A text is staged with its header's length where it has one. Each piece of a whole
+  text, and each applied window of a delta, is named (BLAKE3), digested (MD5, SHA-1) and put into the sink as it
+  passes, then sealed at its end. A delta whose base the same revision made reads the base back from the sink. The
+  room no longer charges a text's bytes; the sink's room refuses them (`MigrationRefusal::Room`).
+- `crates/svn/src/migration/records.rs`: `Transaction::set_text` takes the text named, not its bytes; the transaction
+  names its texts stored by length, and `revision_of` hands them over in `Revision::stored`.
+- `crates/svn/src/migration/standalone.rs`: records standing alone keep an import's texts in a `HeldTexts` sink, held
+  apart once their revision commits and given up where the import is refused; `Standalone::importing` lends the
+  records with the sink to a caller that drives the import itself.
+- `crates/svn/src/commit/drive/texts.rs`: `TextSink::stage` takes the text's length where its writer knows it.
+  `HeldTexts` reserves that length once, refused rather than aborted where memory cannot hold it.
+- `crates/server/src/vcs_store/svn_import/texts.rs` (new): the daemon's sink, the shard's content store. A text begins
+  with its length (`begin_object_of_length`), is kept a window at a time within the call's lent budget, and is sealed
+  under the identity the import named it by, which must be the store's. Each sealed text holds one count until its
+  revision's landing takes it; an import that ends otherwise gives all of them back.
+- `crates/server/src/vcs_store/svn_import.rs`, `crates/server/src/repository/svn_commit.rs` (`stage_texts`,
+  `hand_over`), `crates/server/src/repository/svn_commit/staging.rs` (`Staging::stage`; `due_before` charges a
+  revision's stored texts once, in its post-state, since the shard charged them in the content store as the dump was
+  read; a test's admission cap counts them among what the batch holds, as that charge does), `crates/server/src/vcs_store.rs`
+  (`VcsStores::subversion_with_content`).
+- `crates/svn/tests/import_heap.rs` (new; `slates-mem` a dev-dependency of slates-svn), the room refusal test
+  (`an_import_past_the_room_is_refused`: the text's room is the sink's), GAPS.
+
+Status: built 2026-11-22, macOS arm64 (focused tests); main's gauged `an_import_measured` over git-2000 owed.
+- **Why.** P7 finding (2): an import's footprint stays after it ends, the system allocator keeping its freed
+  temporaries. In w-svn's attribution each text was copied about ten times on the heap below the mapped floor. The
+  first copy was the importer's: `node_record` read each text into a buffer of its header's length, and the revision
+  carried it to its landing, which put it into the content store from there.
+- **What.** The import writes each text where it will live as the dump is read, through the seam a client's commit
+  already uses. The revision names its texts stored, and the landing takes the sink's holds as the texts it put.
+- **Evidence.** `an_import_holds_no_text_whole_on_the_system_heap`: 8 revisions rewriting one file of 524,288 bytes
+  (half the mapped floor), handed to the import 64 KiB at a time. At 2bb00e1cc, through `Standalone::import`, the
+  system allocator's path allocated 4,299,277 bytes and held 4,216,626 live after. Now it allocates 92,309 bytes and
+  holds 21,680 live after.
+
+### A-863 — A git read of a let-go window brings it back from the node's store (2026-11-22, w-shared; main 01a20182's ruling of 05:45 PST, goal 93 item 2a; A-767 C5, A-724 piece 4, A-851)
+Applied in the same change to: `crates/git/src/store/packed.rs` (`PackSource::away`, `PackedRefused::Away`, `Waited`),
+`crates/git/src/store/repository.rs` (`waiting`, the first miss kept), `crates/git/src/store/push.rs` (`PushSource`'s
+`away`), `crates/vcs/src/content.rs` (`away_window`, `object_identity`), `crates/server/src/vcs_store/read_through.rs`
+(`bring_back`), `crates/cli/tests/git_interop.rs` (the RSS test prints the memory gauges at each reading), the C5 status.
+
+Status: built 2026-11-22, macOS arm64 (focused tests); the drivers' wait (w-git) and the let-go after a landing (item 2b)
+owed.
+- Why: a landed push's pack is held in RAM twice, its staged copy on the repository's shard and its windows homed in
+  the region (61.3 and 53.9 MB for git/git v2.0.0), while the node's store holds it durably as the changeset's
+  `Payload`. Letting the windows go (A-724 piece 4's `Kept::Away`) needs a read that meets one to bring it back: a let-go
+  window is not lent, so a read of it was refused `Unread`, the object missing.
+- Rule: a `PackSource` says where a piece it does not lend is let go (`away`, false by default); the pack reader refuses
+  such a read `Away` naming the pack, its length and the offset. The `Repository` keeps the first miss its reads meet,
+  not overwritten by a second, so its owner brings back what the step stopped on. `bring_back` finds, on the shard, the
+  window holding the offset and the pack's identity, reads the window's bytes from the node's store off the shard's
+  step, and puts it back within the room its step is lent, checked by its identity; a window back already is nothing to
+  do. Counted (`vcs_store.read_through.brought_back`, `_bytes`).
+- Evidence: `a_read_of_a_let_go_window_names_it_and_reads_once_it_is_brought_back` (git: every read of the update push's
+  let-go pack refused `Away`, brought back, then the object read whole); `a_let_go_window_is_brought_back_from_the_nodes_store_and_read_whole`
+  (server, store-backed: four windows let go, each brought back from the node's store, the object read whole).
+- 2b(a) (main 01a20182's rulings of 06:58 and 07:00): once a push's record commits and its changeset landed, its pack
+  as the staging put it in the shard's content store is let go (`vcs_store::let_go_landed_pack`), every window by
+  `ContentStore::let_go_landed`, which lets a landed window go whatever its holders count unless its owner names a
+  holder that pins it, refused `Pinned { by }`. A home pins a window (it reads by the window's identity alone, so it
+  cannot bring it back until 2b(b)): where the window's home is this shard by rendezvous over the node's shards, or the
+  shard holds it for the region (`vcs_store::landed_pin`). The pin is read from where the home is, never a flag, so a
+  restart cannot drop it. A `git_derive` read that meets a let-go window waits (`git_derive::Turned::Waiting`), the
+  window brought back and the derivation begun afresh from the versions still due; in the encoding's turn the wait is
+  put back on the repository for its driver (`Repository::wait_for`). Counted: `vcs_store.landed.let_go_bytes`,
+  `vcs_store.landed.pinned`. Evidence: `a_landed_window_goes_whatever_its_holders_unless_a_holder_pins_it` (vcs),
+  `a_landed_packs_windows_go_but_those_a_home_holds_here` (server, store-backed). Never while a fetch of the repository
+  is answered or its encoding is under way (w-git's driver makes the packs resident before either and takes no unit
+  again mid-answer): then the pack is owed (`VcsStores`'s `landed_owed`) and let go at the repository's idle give-back
+  (`vcs_store::let_go_owed` from `git_encode::give_back_idle`). A recovery's region hold that cannot be taken back is
+  counted and logged (`vcs_store.region_holds_unrestored`), never skipped, since it is a window's pin; the counts are
+  taken at the first settle after the content store is made, which may be any step after the recovery. Evidence:
+  `t_goal93_a_region_held_window_stays_pinned_across_a_restart` (a region hold, a stop and start over the same segment,
+  the let-go refused `Pinned { by: "homes" }`).
+- Open: 2b(b), homes' read-through (window -> payload identity and offset), which lifts the homes' pin.
+
+
+### A-864 — A pushed entry is checked by the CRC32 its row keeps, and sent on with no object read (2026-11-22, w-git; main 01a20182's r17 of 07:08 and ruling of 07:31 PST, goal 93; A-859, A-722 record v4)
+
+- **Why.** r17: git/git's clone over HTTP sent 147,449 pushed entries as they lay (`reused_whole` 84,439, `reused_deltas`
+  63,010, none encoded), yet was killed at 120 s. Each reused entry was rebuilt to be checked: inflated to find where it
+  ends (its row kept only where it begins), an offset delta's base reconstructed and named to learn its id, then the
+  object named (a delta's reconstructed, its delta applied and compared): two reconstructions, an inflate and a SHA-1 an
+  object, about what encoding it costs. The encoding made ahead met a further 8,505 `reuse_unread`: an offset delta
+  whose base lies in the same pushed pack but another version, which its table of this version's offsets did not hold.
+- **Change.** As a push is staged, each placed object's row keeps what git's pack index keeps of its entry and its base
+  (`rows::PackedRow`, under the row's `IN_PACK` mark): where the entry begins, its raw length (to the next entry or the
+  pack's trailer, every entry the source sent noted by `Push::entry_at`, those the repository held already among them),
+  the CRC32 of its raw bytes, and for a delta the position of the object it is a delta against. A fetch's stream and the
+  encoding then send the entry on by these alone: its header read, the CRC32 of its raw bytes checked against the kept
+  one, its data copied, a delta's base by the position its row names (placed first where it is still wanted, and of any
+  version). No object is read. A CRC32 miss rebuilds the object to check it as before (`reuse_crc_missed`,
+  `reuse_rebuilt`), as git's `write_no_reuse_object` stands behind its CRC check. git's own bar is lower: upload-pack's
+  `pack-objects --stdout` copies a reused entry with no check, the client's `index-pack` verifying it
+  (`builtin/pack-objects.c` at f7de81456, lines 664-688, read by main). No reader of an earlier row layout is kept (the
+  stores are pre-release, banned item 7): a row without the mark is an object held whole, never an old row.
+- **Tests.** `slates-git` `store::tests::packed::a864_a_clone_sends_each_pushed_entry_on_by_its_kept_crc_rebuilding_none`
+  (stock git's captured `create` push landed and cloned: 3 of 3 sent by CRC32, none rebuilt; red: 3 rebuilt) and
+  `a864_an_entry_whose_crc_misses_is_rebuilt_and_the_clone_is_whole` (its first entry's kept CRC32 one bit off, as a bit
+  flipped in its stored bytes leaves it: one missed and rebuilt, the clone whole); `an_object_row_reads_back_and_a_hostile_one_is_refused`
+  (a row's entry read back); `slates-server` `git_push::tests::t_a859_a_clone_of_a_deltified_push_sends_its_entries_as_they_lie`
+  (none rebuilt). A bit flipped in a stored entry's bytes themselves leaves no copy to rebuild it from: the rebuild's
+  check refuses it and the answer refuses typed, never sending it.
+- **Piece 1, the loose stage in pack order** (main 01a20182's ruling of 2026-11-22, ahead of bounded residency). The
+  loose stage met objects by position (type, then id), so its reads jumped about each pack, every window read many
+  times. Now its objects are first read into an order (`Stage::Order`, a row a unit; three words an object charged to
+  the request's admission: a pack's ordinal, an offset and a position, 24 bytes, 3.6 MB for git/git's 150,000) and
+  sorted by pack and offset, those held whole last by position: each pack is read front to back, as git writes the
+  entries it reuses, an offset delta's base always before it, each window wanted once. Counted `backward_reads`.
+  `git_push::tests::t_a859_a_clone_of_a_deltified_push_sends_its_entries_as_they_lie`: 0 backward reads (88 in position
+  order), its streamed clone 17,299 bytes, the pushed pack's own, in 175 turns where 403 went before.
+- **Piece 2, a fetch's look-ahead** (main 01a20182's ruling of 2026-11-22: residency bounded by a turn's windows). A
+  unit of the stream whose pushed entry lies in a let-go window, or a copy under way that reaches one, stops before it
+  writes or keeps anything; the turn ends there, the window named (`Upload::waiting`), and the unit is taken again on
+  the next turn, so a turn's sideband framing is a turn's as ever. Before each turn, off it, the fetch's driver (both
+  edges) brings back the window the last turn stopped at and the `LOOK_AHEAD_WINDOWS` (two) the next turn reads first
+  (`Upload::reading_next`: a pack is read front to back, piece 1). A fetch no longer makes its repository's packs
+  resident; an encoding does, where one is due (`git_encode::encoding_due`). Counted `ahead_brought` and
+  `stopped_brought`. Tests: `slates-git` `a864_a_turn_that_meets_a_let_go_window_stops_cleanly_and_the_clone_is_byte_identical`
+  (every window of a landed pack let go: stopped and brought back, the clone byte for byte; red: refused);
+  `slates-server` `t_a864_a_fetchs_look_ahead_brings_back_a_turns_windows_never_its_pack` (two of four windows).
+- **Owed.** main's git/git whole round: the clone within PATIENCE, the encoding's `reuse_unread` 0. Piece 3: the windows
+  a fetch brought back let go behind its cursor (w-shared's `let_go_read`, with 2b(a)), so residency at its peak is a
+  turn's windows, gauged; and the end-to-end red over a real pushed pack, which needs 2b(a)'s let-go of `Shared`
+  windows.
+- **The encoding's side** (main 01a20182's note of 2026-11-22: the last whole-pack residency). An encoding unit whose
+  pushed entry lies in a let-go window, or a copy reaching one, stops the same way (`Encoding::waiting`, `stopped`), its
+  object put back first in line; its driver brings that window back before the next turn. Nothing makes a repository's
+  packs resident whole any more. Test: `slates-git`
+  `a864_an_encoding_that_meets_a_let_go_window_stops_cleanly_and_keeps_the_same_fragments` (every window let go: stopped,
+  every object reused, the clone of its fragments byte for byte the clone of an encoding that met none; red: refused).
+
+### A-865 — A Subversion increment names its stored texts (A-760), and a recovery brings back the names its content store lacks (2026-11-22, w-svn; main 01a20182's rulings of 11:05, ~11:35 and ~11:50 PST, goal 93, P7 finding (2); A-760, A-862, A-863, C2 stage C)
+Applied in the same change to:
+- `crates/server/src/repository/svn_commit.rs`: `Building::insert` names a text stored in the content store as a whole
+  `NamedRun` (its op sourced after the inline bytes, `build` patching each such source once their length is known, and
+  checking it against what `Increment::push_named` numbers). It copies into the post-state only a text the revision or
+  the records hold themselves. `read_named` reads every run into its own buffer before the increment is judged, counted
+  (`repository.svn_commit.named_read_bytes`). `Building` keeps no content store.
+- `crates/server/src/repository/svn_commit/staging.rs`: the batch reads its revisions' runs, its holding counts them
+  with the post-state, and `KILL_BEFORE_ENTRY` is a test's kill between the changeset and its entry.
+- `crates/server/src/import_batch.rs`: the scratch member judges with `Green::submit_named`, new in
+  `crates/merge/src/engine.rs` (`judge_named`, then the commit), so each run's buffer becomes its file with no copy.
+- `crates/server/src/repository/push.rs`: `RecordedBatch::apply_slice` reads a version's runs again before the real
+  green applies it. The texts are held until the batch's landing ends; piece (c), adopting the scratch member's files,
+  would drop this read.
+- `crates/server/src/vcs_store/svn_texts.rs`: `bring_back_named`, the recovery's pre-pass; `bring_whole_in`, the bring of a
+  text where the state is the recovery's; `put_brought`, `finish_brought` shared with `bring_whole`; counter
+  `vcs_store.svn_texts.named_brought_back`.
+- `crates/server/src/verbs.rs`: `rebuild_record`'s Green arm runs the pre-pass before a green's replay and gives its
+  texts back after.
+- Tests: `an_increment_names_its_stored_texts_and_carries_none_of_their_bytes`,
+  `an_increments_record_names_its_texts_not_their_bytes` (svn_commit); in store_tests,
+  `a_batch_killed_between_its_commits_slices_recovers_and_resumes_to_the_same_history` (now asserting texts brought
+  back), `a_batch_killed_between_its_changeset_and_its_entry_lands_again_whole`,
+  `a_cleanly_restarted_import_brings_back_no_named_text` and
+  `a_region_held_window_is_restored_beside_the_named_texts_brought_back`. GAPS.
+
+Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_import_measured` over git-2000) owed.
+- **Why.** After A-862 an import's texts sit in the content store by identity, yet its increments copied each into their
+  post-state (`Building::append_text`), their chain entries carried them (`Increment::encode`), and the scratch member
+  made each file again from that copy. A-760 had built the mechanism: an increment names a run of the content plane,
+  read into a buffer of its own that the commit makes the file. GAPS named the Subversion landing's use of it w-svn's.
+- **What.** Building names every stored text, so the log records names, never bytes. The runs are read in the build
+  step, the same bound as the copy they replace; turns come with piece (c). The scratch member takes the buffers as its
+  files. The real green reads the runs once more at the batch's apply.
+- **The invariant.** An entry naming a text commits only once the changeset holding the text is durable on the node's
+  store. `Staging::land` awaits `landing::land_changeset` before `ImportBatch::commit` appends the entry, and a client's
+  commit lands its changeset before its entry (`svn_commit::landed_with`).
+- **Recovery (main's ruling (i)).** A death between an entry's commit and its checkpoint leaves entries naming texts the
+  content store need not hold. The cold recovery replays greens before it remakes the repositories' stores, so a
+  pre-pass in the green's rebuild brings back, a text a unit, every named text the green's chain past its checkpoint
+  names and the store lacks, from the changeset's `Payload` through `vcs_disk`. That is at most one batch's texts,
+  bounded by its admission. Making the content store there takes in the image's windows and region holds as before,
+  since `restore_held_image` sets them before the greens replay. The replay's `ContentMissing` stays a true fence.
+- **Evidence.**
+  - Red: 5,000 bytes inline and no run named, now 0 inline and three runs. The killed batch's successor fenced its
+    green, `ContentMissing { version: 1 }`; now it recovers, folded, with texts brought back. After a clean restart the
+    count is 0.
+  - w-svn's byte-sampled in-process attribution (500 files of 8 KiB, then 300 revisions of 3 changed, 11.65 MB):
+    130.8 MB allocated before, 108.0 MB after. `Increment::encode`, the post-state and the scratch member's `apply`
+    leave the sites; `read_step` stands twice, for the scratch member and for the real green.

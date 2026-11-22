@@ -1597,11 +1597,16 @@ fn stored_zlib(data: &[u8]) -> Vec<u8> {
 
 /// A create of `main` at a root commit whose one file is `bytes` long, as stock git posts it, and the file's name.
 pub(crate) fn large_create(bytes: usize) -> (Vec<u8>, ObjectId) {
-  use slates_git::entry::{self, Header, Representation};
-  use slates_git::object_name::{Kind, name_of};
   let blob: Vec<u8> = (0..bytes)
     .map(|at| u8::try_from(at % 251).unwrap_or(u8::MAX))
     .collect();
+  create_of_file(blob)
+}
+
+/// A create of `main` at a root commit whose one file holds `blob`, as stock git posts it, and the file's name.
+pub(crate) fn create_of_file(blob: Vec<u8>) -> (Vec<u8>, ObjectId) {
+  use slates_git::entry::{self, Header, Representation};
+  use slates_git::object_name::{Kind, name_of};
   let blob_id = name_of(ObjectFormat::Sha1, Kind::Blob, &blob).unwrap();
   let mut tree = b"100644 large\0".to_vec();
   tree.extend_from_slice(blob_id.as_bytes());
@@ -2500,11 +2505,16 @@ fn line_commit(
 /// moved and within the history's commits; the encoding ends within its bound; the fetch's pack whole, every object
 /// pushed once. Red before: each tag's first version brought its commit's whole history, about tags times history; with
 /// the search but its commands decided as sent, 9,557 brought against 3,542 (2026-11-21, this Mac).
-#[test]
-fn t_a850_r16_a_history_and_its_tags_pushed_whole_into_an_empty_repository_bring_each_object_once()
-{
+/// A pushed history: its objects (each a type and its bytes) and each ref's object and name.
+type PushedHistory = (
+  Vec<(slates_git::object_name::Kind, Vec<u8>)>,
+  Vec<(ObjectId, Vec<u8>)>,
+);
+
+/// r16's history (A-850): a line of [`R16_HISTORY`] commits as `main` and an annotated tag of every [`TAG_EVERY`]th
+/// commit, the refs sorted by name as git sends them.
+fn r16_history() -> PushedHistory {
   use slates_git::object_name::Kind;
-  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let mut objects = Vec::new();
   let mut commits = Vec::new();
   let mut parent = None;
@@ -2526,13 +2536,70 @@ fn t_a850_r16_a_history_and_its_tags_pushed_whole_into_an_empty_repository_bring
     objects.push((Kind::Tag, bytes));
     named.push((tag, format!("refs/tags/{name}").into_bytes()));
   }
+  // Sent as git sends a push's commands, by ref name: v0, v10, v100, v1000, v1002, ..., far from the history's order.
+  named.sort_by(|one, other| one.1.cmp(&other.1));
+  (objects, named)
+}
+
+/// Turns `turn` a poll at a time on `daemon` until it answers `idle`, at most [`ENCODE_TURNS_BOUND`] times: the turns.
+fn turned_to_idle<T: PartialEq + Send + 'static>(
+  daemon: &crate::daemon::Daemon,
+  turn: impl Fn(&mut ShardState) -> T + Clone + Send + 'static,
+  idle: T,
+) -> usize {
+  let mut turns = 0usize;
+  while crate::daemon::observe_first(daemon, turn.clone()) != idle {
+    turns += 1;
+    assert!(turns < ENCODE_TURNS_BOUND, "a turn that never ended");
+  }
+  turns
+}
+
+/// What every version of each of `names`' refs in `repository` brought, summed (D(k), what its fragments encode), and the
+/// commits its admissions' searches back for a base met.
+fn brought_and_searched(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  names: &[Vec<u8>],
+) -> (u64, u64) {
+  let keys: Vec<u64> = names
+    .iter()
+    .map(|name| {
+      let name = std::str::from_utf8(name).unwrap();
+      let green = state
+        .db
+        .partition()
+        .repositories()
+        .branch(repository, name.strip_prefix("refs/heads/").unwrap_or(name))
+        .unwrap_or_else(|| panic!("{name} bound"));
+      crate::vcs_store::green_key(green)
+    })
+    .collect();
+  let lent = crate::vcs_store::Lent::new(&mut state.store, &mut state.vcs_stores);
+  let (content, git) = lent.stores.git_ref(repository).expect("the store");
+  let mut brought = 0u64;
+  for key in keys {
+    for version in 0..git.versions(key).len() {
+      brought += git
+        .repository
+        .brought(content, key, version)
+        .unwrap_or_else(|refused| panic!("{key} v{version}: {refused:?}"))
+        .len();
+    }
+  }
+  (brought, git.repository.counters().base_searched)
+}
+
+#[test]
+fn t_a850_r16_a_history_and_its_tags_pushed_whole_into_an_empty_repository_bring_each_object_once()
+{
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (objects, named) = r16_history();
   assert_eq!(
     named.len(),
     R16_HISTORY / TAG_EVERY + 1,
     "main and 506 tags"
   );
-  // Sent as git sends a push's commands, by ref name: v0, v10, v100, v1000, v1002, ..., far from the history's order.
-  named.sort_by(|one, other| one.1.cmp(&other.1));
   let ids: Vec<String> = named.iter().map(|(id, _)| id.to_string()).collect();
   let commands: Vec<(&str, &str, &[u8])> = named
     .iter()
@@ -2550,42 +2617,14 @@ fn t_a850_r16_a_history_and_its_tags_pushed_whole_into_an_empty_repository_bring
     reasons_pushed.iter().all(|reason| reason == b"ok"),
     "{reasons_pushed:?}"
   );
-  let mut turns = 0usize;
-  while crate::daemon::observe_first(&daemon, move |state| {
-    crate::vcs_store::git_derive::turn(state, repository)
-  }) != crate::vcs_store::git_derive::Turned::Idle
-  {
-    turns += 1;
-    assert!(turns < ENCODE_TURNS_BOUND, "a derivation that never ended");
-  }
+  turned_to_idle(
+    &daemon,
+    move |state| crate::vcs_store::git_derive::turn(state, repository),
+    crate::vcs_store::git_derive::Turned::Idle,
+  );
   let names: Vec<Vec<u8>> = named.iter().map(|(_, name)| name.clone()).collect();
   let (brought, searched) = crate::daemon::observe_first(&daemon, move |state| {
-    let keys: Vec<u64> = names
-      .iter()
-      .map(|name| {
-        let name = std::str::from_utf8(name).unwrap();
-        let green = state
-          .db
-          .partition()
-          .repositories()
-          .branch(repository, name.strip_prefix("refs/heads/").unwrap_or(name))
-          .unwrap_or_else(|| panic!("{name} bound"));
-        crate::vcs_store::green_key(green)
-      })
-      .collect();
-    let lent = crate::vcs_store::Lent::new(&mut state.store, &mut state.vcs_stores);
-    let (content, git) = lent.stores.git_ref(repository).expect("the store");
-    let mut brought = 0u64;
-    for key in keys {
-      for version in 0..git.versions(key).len() {
-        brought += git
-          .repository
-          .brought(content, key, version)
-          .unwrap_or_else(|refused| panic!("{key} v{version}: {refused:?}"))
-          .len();
-      }
-    }
-    (brought, git.repository.counters().base_searched)
+    brought_and_searched(state, repository, &names)
   });
   assert_eq!(
     brought,
@@ -2596,14 +2635,11 @@ fn t_a850_r16_a_history_and_its_tags_pushed_whole_into_an_empty_repository_bring
     searched > 0 && searched <= u64::try_from(R16_HISTORY).unwrap(),
     "the search back met {searched} commits"
   );
-  let mut turns = 0usize;
-  while crate::daemon::observe_first(&daemon, move |state| {
-    crate::vcs_store::git_encode::turn(state, repository)
-  }) != crate::vcs_store::git_encode::Turned::Idle
-  {
-    turns += 1;
-    assert!(turns < ENCODE_TURNS_BOUND, "an encoding that never ended");
-  }
+  let turns = turned_to_idle(
+    &daemon,
+    move |state| crate::vcs_store::git_encode::turn(state, repository),
+    crate::vcs_store::git_encode::Turned::Idle,
+  );
   eprintln!("A-850 r16 shape: the encoding ended in {turns} turns");
   let pushed_ids: std::collections::BTreeSet<ObjectId> = objects
     .iter()
@@ -2739,19 +2775,22 @@ async fn stepped(repository: RepositoryId, request: &[u8]) -> Stepped {
 /// A-752 (main's order of 2026-11-20, w-git's measure: one command bringing 3,502 objects over a flat 3,500-file tree
 /// built its work in one step, 374 to 642 ms debug, so a monorepo's push would outlast the watchdog), with A-783's rule
 /// (a turn yields at its quantum when someone waits). Do: create `main` at a flat tree of [`FLAT_FILES`] files, then push
-/// a commit changing every file, answering a step at a time, no one else on the shard. Expect: both `ok`; the update's
-/// build a unit at a time (a unit a file at least), in a tenth as many turns as quanta or fewer (no one waited, so each
-/// turn went on), none past its ceiling (the watchdog's look) by more than a unit and its opening, and none past its
-/// budget (`push.build.past_budget` 0).
+/// a commit changing every file, answering a step at a time, no one else on the shard; then fetch `main`'s head. Expect:
+/// both `ok`; the update's build a unit at a time (a unit a file at least) in more than one turn, its turns going on past
+/// their first quantum while no one waited (`more_quanta` moved), none past its ceiling (the watchdog's look) by more
+/// than a unit and its opening, and none past its budget (`push.build.past_budget` 0); the fetch holding every object
+/// both pushes brought, each once. How many quanta a turn spans is the host's speed over its quantum, not the build's
+/// slicing: "a tenth as many turns as quanta" failed 1 in 3 alone at load ~40, "960 turns for 8081 quanta", every turn
+/// within its bounds (main 01a20182's order of 2026-11-22 06:13).
 #[test]
 fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let repository = crate::daemon::observe_first(&daemon, |state| git_repository(state, "flat"));
-  let (first, objects) = flat_commit(FLAT_FILES, "first", None);
+  let (first, first_objects) = flat_commit(FLAT_FILES, "first", None);
   let create = request(
     &[("", &first.to_string(), b"refs/heads/main")],
     CAPABILITIES,
-    &pack_of_objects(&objects),
+    &pack_of_objects(&first_objects),
   );
   let created = pushed_in_steps(&daemon, repository, &create);
   let before = crate::daemon::observe_first(&daemon, |state| state.push_turns);
@@ -2763,6 +2802,9 @@ fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
   );
   let updated = pushed_in_steps(&daemon, repository, &update);
   let after = crate::daemon::observe_first(&daemon, |state| state.push_turns);
+  let fetched = crate::daemon::observe_first(&daemon, move |state| {
+    fetched_ids(state, repository, &[second])
+  });
   daemon.stop();
   let (created, created_longest) = created.unwrap();
   let (updated, updated_longest) = updated.unwrap();
@@ -2782,10 +2824,10 @@ fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
     units >= FLAT_FILES as u64,
     "the update's work ran {units} units for {FLAT_FILES} files"
   );
-  // A-783: no one waited, so each turn went on to its ceiling: far fewer turns than quanta.
+  // Sliced: more than one turn. A-783: no one waited, so turns went on past their first quantum.
   assert!(
-    turns * 10 < quanta,
-    "{turns} turns for {quanta} quanta: the turns did not go on while no one waited"
+    turns > 1 && after.more_quanta > before.more_quanta,
+    "{turns} turns for {quanta} quanta: the build was not sliced, or its turns did not go on while no one waited"
   );
   let ceiling = crate::daemon::HEARTBEAT_NS;
   assert!(
@@ -2794,6 +2836,19 @@ fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
     after.longest_ns
   );
   assert_eq!(after.past_budget, 0, "{after:?}");
+  let brought: std::collections::BTreeSet<ObjectId> = first_objects
+    .into_iter()
+    .chain(objects)
+    .map(|(kind, bytes)| {
+      slates_git::object_name::name_of(ObjectFormat::Sha1, kind, &bytes).unwrap()
+    })
+    .collect();
+  let set: std::collections::BTreeSet<ObjectId> = fetched.iter().copied().collect();
+  assert_eq!(
+    (fetched.len(), &set),
+    (brought.len(), &brought),
+    "the fetch of main's head holds every object both pushes brought, each once"
+  );
 }
 
 /// A-724 piece 8c and A-722's record v4 (main's rulings of 2026-11-20: a record names its names and its pack only once
@@ -2856,7 +2911,9 @@ fn t_a724_a_pushs_record_names_its_names_once_they_are_homed_in_the_region() {
   let versions = sent.recv().expect("checked");
   assert!(!versions.is_empty(), "no record");
   assert!(
-    versions.iter().all(|version| *version == 6),
+    versions
+      .iter()
+      .all(|version| *version == crate::vcs_store::record::VERSION_LANDED),
     "versions {versions:?}"
   );
 }
@@ -3051,4 +3108,291 @@ fn t_a767_c5b_a_push_whose_homing_no_edge_takes_is_refused() {
       "nothing of the push in the register"
     );
   });
+}
+
+/// A pack as stock git's client sends a history: `objects` in order, each whole but the blobs after the first, each a
+/// REF_DELTA against the blob before it (`slates_git::store::delta_of`), every entry's data in stored zlib blocks.
+fn deltified_pack(objects: &[(slates_git::object_name::Kind, Vec<u8>)]) -> Vec<u8> {
+  use slates_git::entry::{self, Header, Representation};
+  use slates_git::object_name::Kind;
+  let mut pack = Vec::new();
+  let count = u32::try_from(objects.len()).unwrap();
+  let mut writer = slates_git::pack::Writer::new(ObjectFormat::Sha1, count, &mut pack);
+  let mut at = entry::PACK_HEADER_LEN;
+  let mut previous: Option<&Vec<u8>> = None;
+  for (kind, content) in objects {
+    let delta = match (kind, previous) {
+      (Kind::Blob, Some(base)) => slates_git::store::delta_of(base, content).map(|delta| {
+        let base = slates_git::object_name::name_of(ObjectFormat::Sha1, Kind::Blob, base).unwrap();
+        (base, delta)
+      }),
+      _ => None,
+    };
+    let (header, data) = match delta {
+      Some((base, delta)) => (
+        Header {
+          representation: Representation::RefDelta { base },
+          size: u64::try_from(delta.len()).unwrap(),
+        },
+        stored_zlib(&delta),
+      ),
+      None => (
+        Header {
+          representation: Representation::Whole(*kind),
+          size: u64::try_from(content.len()).unwrap(),
+        },
+        stored_zlib(content),
+      ),
+    };
+    if *kind == Kind::Blob {
+      previous = Some(content);
+    }
+    entry::write(header, at, &mut writer).unwrap();
+    slates_git::out::Out::put(&mut writer, &data);
+    at += entry::written_len(header, at).unwrap() + u64::try_from(data.len()).unwrap();
+  }
+  writer.finish().unwrap();
+  pack
+}
+
+/// Format: what an entry may carry past the pushed one's bytes when it is sent on (A-859): its header written again,
+/// at most a type-and-size's varint and an offset's (ten bytes each for a 64-bit value), and a reference delta's base
+/// named by its id in place of an offset (twenty bytes, SHA-1).
+const REUSED_ENTRY_SLACK: usize = 10 + 10 + 20;
+
+/// A line of [`TAGGED_LINE`] growing commits, each tagged: its objects (every commit's, then every tag's) and its refs
+/// in name order (`refs/heads/main` at the last commit, `refs/tags/v<n>` at each commit's tag).
+#[allow(clippy::type_complexity)]
+fn tagged_line() -> (
+  Vec<(slates_git::object_name::Kind, Vec<u8>)>,
+  Vec<(ObjectId, Vec<u8>)>,
+) {
+  use slates_git::object_name::Kind;
+  let mut objects = Vec::new();
+  let mut commits = Vec::new();
+  let mut parent = None;
+  for at in 0..TAGGED_LINE {
+    let (commit, made) = growing_commit(at, parent);
+    objects.extend(made);
+    commits.push(commit);
+    parent = Some(commit);
+  }
+  let mut named: Vec<(ObjectId, Vec<u8>)> =
+    vec![(*commits.last().unwrap(), b"refs/heads/main".to_vec())];
+  for (at, commit) in commits.iter().enumerate() {
+    let name = format!("v{at}");
+    let (tag, bytes) = tag_object(&name, (*commit, "commit"));
+    objects.push((Kind::Tag, bytes));
+    named.push((tag, format!("refs/tags/{name}").into_bytes()));
+  }
+  named.sort_by(|one, other| one.1.cmp(&other.1));
+  (objects, named)
+}
+
+/// A-859 (main's ruling of 2026-11-22 03:38; found by use: a git/git clone from slates moved 4-5 GiB where stock git's pack
+/// is about 300 MB, every object sent whole and uncompressed: 160 of 160 whole at unit scale). Do: push a line of
+/// [`TAGGED_LINE`] commits of a growing file and a tag of each, its pack as stock git sends one (each blob after the first
+/// a delta against the one before); clone every ref whole before any version is encoded (the stream's loose stage), then
+/// encode its versions and clone again (from the kept fragments). Expect: each clone's pack at most the pushed pack's
+/// bytes plus [`REUSED_ENTRY_SLACK`] an object (each pushed entry sent on as it lies), printing both; the stream and the
+/// encoding each counting entries reused whole and every pushed delta reused, none refused; each clone whole, every
+/// object once; and no pushed object encoded afresh by either (main 01a20182's ruling of 2026-11-22 05:38: a stored entry
+/// reused whenever one exists). Red before: every object whole and uncompressed, the clone near the objects' raw size;
+/// then (main's order of 04:53) the stream reusing 20 of the 39 deltas, a delta whose base's position (by type, then id)
+/// came after its own sent fresh, where git's `write_one` writes a delta's base first; then 117 of the pushed commits,
+/// trees and tags searched and encoded afresh, their whole entries passed over where the encoder would try a delta.
+#[test]
+fn t_a859_a_clone_of_a_deltified_push_sends_its_entries_as_they_lie() {
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
+    let repository = git_repository(state, "reused");
+    let (objects, named) = tagged_line();
+    let pack = deltified_pack(&objects);
+    let ids: Vec<String> = named.iter().map(|(id, _)| id.to_string()).collect();
+    let commands: Vec<(&str, &str, &[u8])> = named
+      .iter()
+      .zip(&ids)
+      .map(|((_, name), id)| ("", id.as_str(), name.as_slice()))
+      .collect();
+    let received = pushed(state, repository, &request(&commands, CAPABILITIES, &pack));
+    assert!(
+      reasons(&received).iter().all(|reason| reason == b"ok"),
+      "{:?}",
+      received.outcomes
+    );
+    while crate::vcs_store::git_derive::turn(state, repository)
+      != crate::vcs_store::git_derive::Turned::Idle
+    {}
+    let wants: Vec<ObjectId> = named.iter().map(|(id, _)| *id).collect();
+    let fetch = crate::vcs_store::upload::tests::fetch(&wants, &[]);
+    let bound = pack.len() + objects.len() * REUSED_ENTRY_SLACK;
+    // Cloned before any version is encoded: every object from the stream's loose stage.
+    let (streamed, counted_streamed) =
+      crate::vcs_store::upload::tests::fetched_with_counters(state, (repository, &owner()), &fetch);
+    let streamed = crate::vcs_store::upload::tests::pack_of(&streamed);
+    eprintln!(
+      "A-859 before encoding: pushed pack {} bytes, clone pack {} bytes; {counted_streamed:?}",
+      pack.len(),
+      streamed.len()
+    );
+    assert!(
+      streamed.len() <= bound,
+      "the streamed clone's pack {} past {bound}",
+      streamed.len()
+    );
+    let deltas = u64::try_from(TAGGED_LINE - 1).unwrap();
+    assert!(
+      counted_streamed.reused_whole > 0
+        && counted_streamed.reused_deltas == deltas
+        && counted_streamed.reuse_refused == 0,
+      "every one of the {deltas} pushed deltas reused: {counted_streamed:?}"
+    );
+    // main 01a20182's ruling of 2026-11-22 05:38: a stored entry is reused whenever one exists, so no pushed object is
+    // searched or encoded afresh.
+    assert_eq!(
+      (
+        counted_streamed.loose_whole + counted_streamed.loose_deltas,
+        counted_streamed.reused_whole + counted_streamed.reused_deltas,
+      ),
+      (0, u64::try_from(objects.len()).unwrap()),
+      "every pushed object sent as its entry lies, none encoded: {counted_streamed:?}"
+    );
+    // A-864: each sent on by its kept CRC32, none rebuilt to be checked; the pack read front to back (piece 1), no
+    // pushed entry read before the one read before it.
+    assert_eq!(
+      (
+        counted_streamed.reuse_rebuilt,
+        counted_streamed.reuse_crc_missed,
+        counted_streamed.backward_reads
+      ),
+      (0, 0, 0),
+      "{counted_streamed:?}"
+    );
+    assert_whole_clone(&streamed, objects.len());
+    while crate::vcs_store::git_encode::turn(state, repository)
+      != crate::vcs_store::git_encode::Turned::Idle
+    {}
+    let (answer, counted) =
+      crate::vcs_store::upload::tests::fetched_with_counters(state, (repository, &owner()), &fetch);
+    let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+    let reused = (
+      count(crate::vcs_store::git_encode::REUSED_WHOLE),
+      count(crate::vcs_store::git_encode::REUSED_DELTAS),
+      count(crate::vcs_store::git_encode::REUSE_REFUSED),
+    );
+    let raw: usize = objects.iter().map(|(_, bytes)| bytes.len()).sum();
+    let clone = crate::vcs_store::upload::tests::pack_of(&answer);
+    eprintln!(
+      "A-859: pushed pack {} bytes, clone pack {} bytes, objects' raw {raw}; reused (whole, deltas, refused) {reused:?}; {counted:?}",
+      pack.len(),
+      clone.len()
+    );
+    assert!(
+      clone.len() <= bound,
+      "the clone's pack {} past {bound}",
+      clone.len()
+    );
+    assert!(
+      reused.0 > 0 && reused.1 == deltas && reused.2 == 0,
+      "{reused:?}"
+    );
+    assert_eq!(
+      reused.0 + reused.1,
+      u64::try_from(objects.len()).unwrap(),
+      "every pushed object kept as its entry lies, none encoded: {reused:?}"
+    );
+    assert_whole_clone(&clone, objects.len());
+  });
+}
+
+/// Shape: the files of [`t_a859_an_encoding_places_a_pushed_deltas_base_before_it`]'s one commit, each a line longer
+/// than the one before, so each after the first is pushed as a delta against a smaller one.
+const GROWING_FILES: usize = 8;
+
+/// A-859 (main 01a20182's order of 2026-11-22 04:53: write deltas in the stored pack's own order, as git's pack reuse
+/// does). Do: push one commit of [`GROWING_FILES`] files, each a line longer than the one before, its pack as stock git
+/// sends one (each blob after the first a delta against the one before, a smaller one); encode its version, then clone
+/// it from the kept fragments. Expect: every pushed delta reused by the encoding, none refused, though the encoding
+/// orders the larger first, so each delta's base is placed before it (git's `write_one`); the clone whole. Red before:
+/// no delta reused, each one's base still in the encoding's order behind it.
+#[test]
+fn t_a859_an_encoding_places_a_pushed_deltas_base_before_it() {
+  use slates_git::object_name::{Kind, name_of};
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
+    let repository = git_repository(state, "based");
+    let blobs: Vec<Vec<u8>> = (0..GROWING_FILES)
+      .map(|file| {
+        (0..=file + 20)
+          .flat_map(|line| {
+            format!("line {line:04} of a file that grows a line a file, long enough to delta\n")
+              .into_bytes()
+          })
+          .collect()
+      })
+      .collect();
+    let mut tree = Vec::new();
+    for (file, blob) in blobs.iter().enumerate() {
+      tree.extend_from_slice(format!("100644 file{file:02}\0").as_bytes());
+      tree.extend_from_slice(
+        name_of(ObjectFormat::Sha1, Kind::Blob, blob)
+          .unwrap()
+          .as_bytes(),
+      );
+    }
+    let tree_id = name_of(ObjectFormat::Sha1, Kind::Tree, &tree).unwrap();
+    let commit = format!(
+      "tree {tree_id}\nauthor A <a@example.com> 1700000000 +0000\n\
+       committer A <a@example.com> 1700000000 +0000\n\ngrowing files\n"
+    )
+    .into_bytes();
+    let commit_id = name_of(ObjectFormat::Sha1, Kind::Commit, &commit).unwrap();
+    let mut objects = vec![(Kind::Commit, commit), (Kind::Tree, tree)];
+    objects.extend(blobs.into_iter().map(|blob| (Kind::Blob, blob)));
+    let pack = deltified_pack(&objects);
+    let id = commit_id.to_string();
+    let commands: Vec<(&str, &str, &[u8])> = vec![("", id.as_str(), b"refs/heads/main")];
+    let received = pushed(state, repository, &request(&commands, CAPABILITIES, &pack));
+    assert!(
+      reasons(&received).iter().all(|reason| reason == b"ok"),
+      "{:?}",
+      received.outcomes
+    );
+    while crate::vcs_store::git_derive::turn(state, repository)
+      != crate::vcs_store::git_derive::Turned::Idle
+    {}
+    while crate::vcs_store::git_encode::turn(state, repository)
+      != crate::vcs_store::git_encode::Turned::Idle
+    {}
+    let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+    let reused = (
+      count(crate::vcs_store::git_encode::REUSED_DELTAS),
+      count(crate::vcs_store::git_encode::REUSE_REFUSED),
+    );
+    assert_eq!(
+      reused,
+      (u64::try_from(GROWING_FILES - 1).unwrap(), 0),
+      "every pushed delta reused, none refused"
+    );
+    let fetch = crate::vcs_store::upload::tests::fetch(&[commit_id], &[]);
+    let (answer, _) =
+      crate::vcs_store::upload::tests::fetched_with_counters(state, (repository, &owner()), &fetch);
+    assert_whole_clone(
+      &crate::vcs_store::upload::tests::pack_of(&answer),
+      objects.len(),
+    );
+  });
+}
+
+/// `pack` is a whole pack of `objects` objects, each once, every delta resolved to its object (read as `index-pack`
+/// reads one).
+fn assert_whole_clone(pack: &[u8], objects: usize) {
+  let unpacked = slates_git::unpack::read_whole(
+    pack,
+    ObjectFormat::Sha1,
+    &slates_git::unpack::NoIndex,
+    &mut slates_git::Admission::new(u64::MAX),
+  )
+  .expect("a whole pack");
+  let fetched: std::collections::BTreeSet<ObjectId> =
+    unpacked.objects.iter().map(|object| object.id).collect();
+  assert_eq!((unpacked.objects.len(), fetched.len()), (objects, objects));
 }

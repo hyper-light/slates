@@ -502,7 +502,7 @@ pub(crate) async fn land_revision(
     Ok(brought) => brought,
     Err(refused) => return Some(Err(refused)),
   };
-  let (storing, carried) = match stage_texts(repository, &mut revision).await? {
+  let (storing, carried) = match stage_texts(repository, &mut revision, Vec::new()).await? {
     Ok(staged) => staged,
     Err(refused) => {
       let _ = crate::state::with_state(|state| release_texts(state, None, &brought));
@@ -547,16 +547,27 @@ pub(crate) async fn land_revision(
 
 /// Stages the texts `revision` brings for its landing (C2 stage B part 2 (b)): each taken out of its contents and named
 /// stored ([`take_texts`]), put through repository `repository`'s content store a copy slice a step, as a client's
-/// commit's are, so its changeset carries them as Payload with Texts rows and the records keep none in RAM. What was
-/// put, held until the landing ends ([`release_stored`]), and what the changeset carries. None where the shard's state
-/// is gone; refused with what was put given back.
+/// commit's are, so its changeset carries them as Payload with Texts rows and the records keep none in RAM; and the
+/// texts an import's sink put already, `imported`, each holding one count of the store (`vcs_store::svn_import::texts`),
+/// taken as put ([`hand_over`]). What was put, held until the landing ends ([`release_stored`]), and what the changeset
+/// carries. None where the shard's state is gone; refused with what was put given back, `imported` too.
 async fn stage_texts(
   repository: RepositoryId,
   revision: &mut Revision,
+  imported: Vec<ContentIdentity>,
 ) -> Option<Result<(Storing, Vec<landing::LandedText>), Uncommitted>> {
   let texts = crate::state::with_state(|state| take_texts(state, repository, revision))?;
   let begun = crate::state::with_state(|state| {
-    storing_of(state, repository, (&revision.record.changes, texts.keys()))
+    match storing_of(state, repository, (&revision.record.changes, texts.keys())) {
+      Ok(mut storing) => {
+        hand_over(state, repository, revision, imported, &mut storing);
+        Ok(storing)
+      }
+      Err(refused) => {
+        release_texts(state, None, &imported);
+        Err(refused)
+      }
+    }
   })?;
   let mut storing = match begun {
     Ok(storing) => storing,
@@ -585,6 +596,30 @@ async fn stage_texts(
   drop(texts);
   let carried = texts_carried(&revision.record.changes, &storing.put);
   Some(Ok((storing, carried)))
+}
+
+/// Takes the holds an import's sink took on the texts `revision` names stored, `imported`, as texts `storing` put, one
+/// each; gives back every other: one the records hold already, one sealed twice, one the revision does not name.
+fn hand_over(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  revision: &Revision,
+  imported: Vec<ContentIdentity>,
+  storing: &mut Storing,
+) {
+  let mut spare = Vec::new();
+  for identity in imported {
+    let held = state
+      .vcs_stores
+      .subversion_records(repository)
+      .is_none_or(|records| records.holds(&identity));
+    if revision.stored.contains_key(&identity) && !held && !storing.put.contains(&identity) {
+      storing.put.push(identity);
+    } else {
+      spare.push(identity);
+    }
+  }
+  release_texts(state, None, &spare);
 }
 
 /// The texts of `revision` repository `repository`'s records do not hold, taken out and named stored
@@ -777,40 +812,82 @@ fn store_step_from(
   let slice = usize::try_from(state.config.copy_slice_bytes())
     .unwrap_or(usize::MAX)
     .max(1);
-  let (identity, len, mut writing, sent) = match storing.current.take() {
-    Some(current) => current,
-    None => match storing.queue.pop_front() {
-      Some((identity, len)) => (identity, len, slates_vcs::Writing::default(), 0),
-      None => return Ok(true),
-    },
+  // The text's writer stays in `storing` until its object is finished, so a refusal at any step (a piece the reader
+  // lacks, a window or the finish refused) leaves it where the landing's release abandons it (`release_stored`) with
+  // the windows it kept. Taken out first, a refusal dropped it with them still held.
+  if storing.current.is_none() {
+    let Some((identity, len)) = storing.queue.pop_front() else {
+      return Ok(true);
+    };
+    // Begun with its length, the text's window buffer is reserved once rather than doubled a copy slice at a time
+    // (goal 93, svn finding (2)).
+    let store = state.vcs_stores.content().ok_or(Uncommitted::NotHeld)?;
+    storing.current = Some((identity, len, store.begin_object_of_length(len), 0));
+  }
+  let Some((identity, len, writing, sent)) = storing.current.as_mut() else {
+    return Ok(true);
   };
-  let piece = piece(&identity, sent, slice).ok_or_else(corrupt)?;
+  let (identity, len) = (*identity, *len);
+  let piece = piece(&identity, *sent, slice).ok_or_else(corrupt)?;
   let piece_len = u64::try_from(piece.len()).unwrap_or(u64::MAX);
-  let kept = crate::vcs_store::within_budget(state, piece_len, |stores| {
+  let finished = crate::vcs_store::within_budget(state, piece_len, |stores| {
     let store = stores.content_mut().ok_or(Uncommitted::NotHeld)?;
     store
-      .put_window(&mut writing, &piece)
+      .put_window(writing, &piece)
       .map_err(|refused| store_refused(&refused))?;
-    let sent = sent.saturating_add(piece_len);
-    if sent < len && !piece.is_empty() {
-      return Ok(Some((writing, sent)));
+    *sent = sent.saturating_add(piece_len);
+    if *sent < len && !piece.is_empty() {
+      return Ok(false);
     }
     let made = store
-      .finish_object(&mut writing)
+      .finish_object(writing)
       .map_err(|refused| store_refused(&refused))?;
     if made != slates_vcs::ContentId(identity) {
       let _ = store.release(&made);
       return Err(corrupt());
     }
-    Ok(None)
-  });
-  match kept {
-    Ok(Some((writing, sent))) => storing.current = Some((identity, len, writing, sent)),
-    Ok(None) => storing.put.push(identity),
-    Err(refused) => return Err(refused),
+    Ok(true)
+  })?;
+  if finished {
+    storing.current = None;
+    storing.put.push(identity);
   }
   Ok(storing.queue.is_empty() && storing.current.is_none())
 }
+
+/// Reads every run `work` names (A-760) from the shard's content store into its own buffer, in this one step: its bound
+/// is the copy the post-state made of the same texts before, a copy slice a turn coming with the batch's turns (main
+/// 01a20182's ruling of 2026-11-22 ~11:35). Counted ([`NAMED_READ_BYTES`]). Refused `Unstored` where the store does
+/// not hold a text it names: the landing brings back every stored text the content store let go before it builds
+/// (`bring_stored`).
+pub(crate) fn read_named(state: &mut ShardState, work: &mut Increment) -> Result<(), Uncommitted> {
+  if work.unread().is_none() {
+    return Ok(());
+  }
+  let total = work
+    .named
+    .runs
+    .iter()
+    .fold(0u64, |total, run| total.saturating_add(run.len));
+  {
+    let store = state.vcs_stores.content().ok_or(Uncommitted::NotHeld)?;
+    let objects = crate::vcs_store::named_objects::PlaneObjects {
+      store,
+      kept_in: &state.store.content,
+    };
+    while !work
+      .read_step(&objects, total.max(1))
+      .map_err(|_| Uncommitted::Unstored)?
+    {}
+  }
+  state.count(NAMED_READ_BYTES, total);
+  Ok(())
+}
+
+/// Counter: the bytes of the texts a Subversion increment names (A-760) read from the content store into its runs'
+/// buffers before it is judged ([`read_named`]): once a byte of each text a landing builds. Format: a counter name in
+/// the status report.
+pub(crate) const NAMED_READ_BYTES: &str = "repository.svn_commit.named_read_bytes";
 
 /// The commit step's answer to a content store's refusal: past the shard's room, `Budget`; anything else the store
 /// refuses, `Corrupt`.
@@ -1009,7 +1086,7 @@ pub(crate) async fn land_made<T>(
   commit: impl FnOnce(&mut ShardState, MadeEntry) -> Result<T, Uncommitted>,
 ) -> Option<Result<T, Uncommitted>> {
   let mut revision = revision;
-  let (storing, carried) = match stage_texts(repository, &mut revision).await? {
+  let (storing, carried) = match stage_texts(repository, &mut revision, Vec::new()).await? {
     Ok(staged) => staged,
     Err(refused) => {
       let _ = crate::state::with_state(|state| turn.give_back(state));
@@ -1349,17 +1426,17 @@ fn version_of(
   (checked, plans): (&Checked, restore::CopyPlans),
   identity: [u8; 32],
 ) -> Result<Increment, Uncommitted> {
-  // Built with the content store's chunks lent, so a text the commit stored reads from it (A-727's lend).
+  // Built over the records and the green alone: a text the commit stored is named (A-760), read after
+  // ([`read_named`]).
   let built = crate::vcs_store::lent_state(state, |state| {
     let records = state
       .vcs_stores
       .subversion_records(repository)
       .ok_or(Uncommitted::NotHeld)?;
-    let store = state.vcs_stores.content();
     let engine = state.greens.get(&green).ok_or(Uncommitted::NotHeld)?;
     let head = records.youngest();
     if engine.head() == head {
-      Building::new((records, store), &engine, (checked, plans)).build(head, identity)
+      Building::new(records, &engine, (checked, plans)).build(head, identity)
     } else {
       Err(Uncommitted::Diverged)
     }
@@ -1369,7 +1446,10 @@ fn version_of(
     Err(Uncommitted::Unsupported { .. }) => state.count(UNSUPPORTED, 1),
     _ => {}
   }
-  built
+  // The texts it names read before it is judged (A-760: the engine refuses an unread run).
+  let mut built = built?;
+  read_named(state, &mut built)?;
+  Ok(built)
 }
 
 /// The work identity of the revision whose record is `record` (module docs): one revision's alone, as its record is.
@@ -1416,16 +1496,23 @@ struct Building<'b> {
   records: &'b Repository,
   /// The repository's green, at the same head.
   engine: &'b Green,
-  /// The repository's content store, lent: where a text its commit stored is read from (§4.17.1 "A push's intake").
-  store: Option<&'b slates_vcs::ContentStore>,
   /// The revision, checked.
   checked: &'b Checked,
   /// Its rows, by path.
   rows: BTreeMap<&'b str, &'b ChangedPath>,
   /// The document.
   doc: OpsDoc,
-  /// The post-state.
+  /// The post-state's inline bytes: the property lists' identities, and a text the revision or the records hold
+  /// themselves.
   post: Vec<u8>,
+  /// The texts stored in the content store that the increment names rather than carries (A-760), each whole, in the
+  /// order their ops were made.
+  runs: Vec<slates_merge::named::NamedRun>,
+  /// The named runs' bytes so far: where the next run starts, counted from the first run's start.
+  runs_len: u64,
+  /// The ops whose sources lie in the named runs, counted from the first run's start until the build ends, when the
+  /// inline bytes' length is added to each.
+  run_ops: Vec<usize>,
   /// The green paths the revision removes, unless a later row makes them again.
   gone: BTreeMap<String, Stood>,
   /// The restores of the revision's copies from older revisions, by their rows' paths ([`restore::plan`]), each taken
@@ -1438,7 +1525,7 @@ struct Building<'b> {
 impl<'b> Building<'b> {
   /// An empty increment for `checked` over `records` and `engine`.
   fn new(
-    (records, store): (&'b Repository, Option<&'b slates_vcs::ContentStore>),
+    records: &'b Repository,
     engine: &'b Green,
     (checked, plans): (&'b Checked, restore::CopyPlans),
   ) -> Self {
@@ -1450,11 +1537,13 @@ impl<'b> Building<'b> {
     Self {
       records,
       engine,
-      store,
       checked,
       rows,
       doc: OpsDoc::default(),
       post: Vec::new(),
+      runs: Vec::new(),
+      runs_len: 0,
+      run_ops: Vec::new(),
       gone: BTreeMap::new(),
       plans,
       restores: BTreeMap::new(),
@@ -1464,6 +1553,24 @@ impl<'b> Building<'b> {
   /// The increment, based at `head` and identified by `id`: every row in path order, then what the revision removes.
   fn build(mut self, head: u64, id: [u8; 32]) -> Result<Increment, Uncommitted> {
     let checked = self.checked;
+    // The post-state holds each text the rows set that is not named (`Building::insert`): sized once at their length,
+    // so no append grows it (P7 finding (2): grown a text at a time it doubled). A copy's restored texts may still grow
+    // it past them.
+    let texts = checked
+      .changes()
+      .iter()
+      .filter_map(|row| row.text)
+      .filter(|text| self.held_inline(text).is_some())
+      .try_fold(0usize, |total, text| {
+        usize::try_from(text.size)
+          .ok()
+          .and_then(|size| total.checked_add(size))
+      })
+      .ok_or_else(corrupt)?;
+    self
+      .post
+      .try_reserve_exact(texts)
+      .map_err(|_| Uncommitted::Budget { available: 0 })?;
     for row in checked.changes() {
       self.row(row)?;
     }
@@ -1478,16 +1585,32 @@ impl<'b> Building<'b> {
       };
       self.op(kind, &path);
     }
+    // A named run's bytes follow the inline ones in the post-state's one address space (`slates_merge::named`), so each
+    // op sourced from a run is moved past them now that their length is known.
+    let inline = u64::try_from(self.post.len()).map_err(|_| corrupt())?;
     let mut doc = self.doc;
+    for at in &self.run_ops {
+      let op = doc.ops.get_mut(*at).ok_or_else(corrupt)?;
+      op.src = op.src.checked_add(inline).ok_or_else(corrupt)?;
+    }
     doc.canonicalize();
-    Ok(Increment {
+    let mut increment = Increment {
       id,
       base: head,
       doc,
       post_state: self.post,
       evidence: Vec::new(),
       named: Default::default(),
-    })
+    };
+    let mut at = inline;
+    for run in self.runs {
+      // Each run where its ops' sources say it starts: the engine numbers it the same way.
+      if increment.push_named(run) != Some(at) {
+        return Err(corrupt());
+      }
+      at = at.checked_add(run.len).ok_or_else(corrupt)?;
+    }
+    Ok(increment)
   }
 
   /// One row (module docs).
@@ -1812,36 +1935,16 @@ impl<'b> Building<'b> {
     Ok(())
   }
 
-  /// Appends `text`'s bytes to the increment's post-state: brought by the revision or held by the records, copied once
-  /// from where they lie; stored in the content store by its commit, copied a window at a time from the store's lent
-  /// windows (`ContentStore::run_at`), never read whole into a buffer of its own first (P7's finding (2): that read was
-  /// one of the import's sub-1 MiB copies of every text). The copy into the post-state stays until the green's increment
-  /// can name stored content (A-716 1b, w-engine's). Its length.
-  fn append_text(&mut self, text: &Text) -> Result<u64, Uncommitted> {
+  /// `text`'s bytes where the revision brings them or the records hold them themselves (a property list's bytes read as
+  /// a text): what the post-state carries inline. None for a text stored in the content store, which is named.
+  fn held_inline(&self, text: &Text) -> Option<std::borrow::Cow<'b, [u8]>> {
     let checked: &'b Checked = self.checked;
     let records: &'b Repository = self.records;
-    let store: Option<&'b slates_vcs::ContentStore> = self.store;
-    let held = checked
+    checked
       .fresh()
       .get(&text.identity)
       .map(|bytes| std::borrow::Cow::Borrowed(bytes.as_slice()))
-      .or_else(|| records.text(&text.identity));
-    if let Some(bytes) = held {
-      self.post.extend_from_slice(&bytes);
-      return u64::try_from(bytes.len()).map_err(|_| corrupt());
-    }
-    let store = store.ok_or_else(corrupt)?;
-    let identity = slates_vcs::ContentId(text.identity);
-    let mut appended = 0u64;
-    while appended < text.size {
-      let run = store
-        .run_at(&identity, text.size, appended)
-        .filter(|run| !run.is_empty())
-        .ok_or_else(corrupt)?;
-      self.post.extend_from_slice(&run);
-      appended = appended.saturating_add(u64::try_from(run.len()).map_err(|_| corrupt())?);
-    }
-    Ok(appended)
+      .or_else(|| records.text(&text.identity))
   }
 
   /// The file at `path`, `len` bytes long, given `text` whole, or emptied for none.
@@ -1855,14 +1958,35 @@ impl<'b> Building<'b> {
     }
   }
 
-  /// `text`'s bytes inserted at the start of the file at `path`; nothing for an empty text.
+  /// `text`'s bytes inserted at the start of the file at `path`; nothing for an empty text. A text the revision or the
+  /// records hold is copied into the post-state; one stored in the content store is named whole (A-760; goal 93, P7
+  /// finding (2): the copy was the import's largest per-text copy after A-862), its bytes read into a buffer of their own
+  /// before the increment is judged ([`read_named`]), which the commit makes the file.
   fn insert(&mut self, path: &str, text: &Text) -> Result<(), Uncommitted> {
-    let src = u64::try_from(self.post.len()).map_err(|_| corrupt())?;
-    let len = self.append_text(text)?;
-    if len == 0 {
+    if let Some(bytes) = self.held_inline(text) {
+      let src = u64::try_from(self.post.len()).map_err(|_| corrupt())?;
+      let len = u64::try_from(bytes.len()).map_err(|_| corrupt())?;
+      self.post.extend_from_slice(&bytes);
+      if len > 0 {
+        self.op_at(OpKind::Insert, path, (0, len, src), 0);
+      }
       return Ok(());
     }
-    self.op_at(OpKind::Insert, path, (0, len, src), 0);
+    if text.size == 0 {
+      return Ok(());
+    }
+    let src = self.runs_len;
+    self.runs.push(slates_merge::named::NamedRun {
+      identity: slates_merge::named::Identity {
+        hash: text.identity,
+        len: text.size,
+      },
+      offset: 0,
+      len: text.size,
+    });
+    self.runs_len = self.runs_len.checked_add(text.size).ok_or_else(corrupt)?;
+    self.op_at(OpKind::Insert, path, (0, text.size, src), 0);
+    self.run_ops.push(self.doc.ops.len().saturating_sub(1));
     Ok(())
   }
 

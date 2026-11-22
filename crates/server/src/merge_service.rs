@@ -831,6 +831,21 @@ pub(crate) fn checkpoint_green_when(state: &mut ShardState, green: DbVolumeId, d
   let _ = hold.step(state, None);
 }
 
+/// Takes whole now each checkpoint of this shard still held in turns (A-579's paced hold, [`checkpoint_in_turns`]): what
+/// a test running inside one step of its shard calls before it reads a fold that a floor move asked for, since no task's
+/// turn runs until the step ends. The turns' stage gives way to it, as at the chain's cap ([`checkpoint_green_when`]);
+/// the task's next turn, if it ever runs, finds none and ends. As `vcs_store::paths::whole_build::settle` does for a
+/// build.
+#[cfg(test)]
+pub(crate) fn settle_checkpoints(state: &mut ShardState) {
+  let greens: Vec<DbVolumeId> = state.merge.checkpointing.iter().copied().collect();
+  for green in greens {
+    checkpoint_green_when(state, green, Doubling::Wait);
+    state.merge.checkpointing.remove(&green);
+    checkpoint_ended(state, green);
+  }
+}
+
 /// Counter: a green's chain checkpointed (W3), the non-vacuity count of [`checkpoint_green`].
 pub(crate) const CHECKPOINT_TAKEN: &str = "merge.checkpoint.taken";
 /// Counter: a checkpoint the engine could not take at the floor (its histories folded past it); the chain stays

@@ -1501,10 +1501,13 @@ fn fits_base(ops: &[Op], base_len: u64, post_len: u64) -> bool {
   })
 }
 
-/// Applies content ops to `base`, drawing added bytes from `post_state` — the byte splice.
+/// Applies content ops to `base`, drawing added bytes from `post_state` — the byte splice. Its bytes are made in one
+/// buffer sized once at their length ([`made_len`]; goal 93, P7 finding (2): grown a piece at a time it doubled, about
+/// twice every file an import's increments made, the largest of its churners after A-862).
 fn apply(base: &[u8], ops: &[Op], post_state: crate::named::Post<'_>) -> Vec<u8> {
   let base_len = base.len() as u64;
-  let mut out = Vec::new();
+  let made = made_len(base_len, ops, post_state.len());
+  let mut out = Vec::with_capacity(usize::try_from(made).unwrap_or(0));
   let mut pos = 0u64;
   for op in ops {
     if op.at > pos {
@@ -1532,6 +1535,37 @@ fn apply(base: &[u8], ops: &[Op], post_state: crate::named::Post<'_>) -> Vec<u8>
     );
   }
   out
+}
+
+/// The length [`apply`] makes of a base of `base_len` bytes under `ops` over a post-state of `post_len` bytes, with its
+/// clamps: a base run to the base, an added run to the post-state (`named::Post::span`). An ops document is not checked
+/// against its base when decoded, so this is what `apply` writes, never more, where [`applied_len`] trusts the ops.
+fn made_len(base_len: u64, ops: &[Op], post_len: u64) -> u64 {
+  let added = |op: &Op| {
+    op.src
+      .saturating_add(op.len)
+      .min(post_len)
+      .saturating_sub(op.src)
+  };
+  let mut out = 0u64;
+  let mut pos = 0u64;
+  for op in ops {
+    if op.at > pos {
+      out = out.saturating_add(op.at.min(base_len).saturating_sub(pos));
+      pos = op.at;
+    }
+    match op.kind {
+      OpKind::Delete => pos = pos.saturating_add(op.len),
+      OpKind::Truncate => pos = base_len,
+      OpKind::Overwrite => {
+        out = out.saturating_add(added(op));
+        pos = pos.saturating_add(op.len);
+      }
+      OpKind::Insert | OpKind::Extend => out = out.saturating_add(added(op)),
+      _ => {}
+    }
+  }
+  out.saturating_add(base_len.saturating_sub(pos))
 }
 
 /// The length [`apply`] makes of a base of `base_len` bytes under `ops`, without making it (A-760).
@@ -5639,10 +5673,11 @@ impl Green {
     self.owed.as_ref()
   }
 
-  /// The build of the push this green owes, each turn under `pace`: drive it with [`crate::push::Building::advance`]
+  /// The build of the push this green owes within `room` bytes (A-857: the room its repository has as it is built), each
+  /// turn under `pace`: drive it with [`crate::push::Building::advance`]
   /// over this green and the push's objects, then give its work to [`Green::materialize`]. None when nothing is owed.
-  pub fn materializing(&self, pace: crate::pace::Pace) -> Option<crate::push::Building> {
-    self.owed.as_ref().map(|owed| owed.building(pace))
+  pub fn materializing(&self, pace: crate::pace::Pace, room: u64) -> Option<crate::push::Building> {
+    self.owed.as_ref().map(|owed| owed.building(pace, room))
   }
 
   /// Commits `built`, the owed push's work, as the owed version, and clears the debt: the green is then the green the
@@ -5667,8 +5702,8 @@ impl Green {
     self.owed = None;
     // The versions recorded after the owed one, in order, as a replay applies them.
     let mut head = committed;
-    for (inc, applied) in std::mem::take(&mut self.owed_tail) {
-      head = self.apply_recorded(&inc, &applied);
+    for (mut inc, applied) in std::mem::take(&mut self.owed_tail) {
+      head = self.apply_recorded(&mut inc, &applied);
     }
     // The verdicts recorded while it owed, on the versions now applied.
     for (version, signature) in std::mem::take(&mut self.owed_signatures) {
@@ -5695,6 +5730,17 @@ impl Green {
   ) -> (Outcome, Option<Vec<crate::chain_entry::Applied>>) {
     // One verdict for a submit and a push (A-635): judged, then committed at once, at the head it was judged at.
     let judgment = self.judge(inc);
+    self.commit_judgment(judgment)
+  }
+
+  /// [`Green::submit_resolved`] for a work whose named runs are read (A-760): judged by [`Green::judge_named`], so each
+  /// run's buffer is taken from `inc` into the verdict and made its file with no copy, then committed at once. `inc`
+  /// keeps its names, its runs' bytes now the green's.
+  pub fn submit_named(
+    &mut self,
+    inc: &mut Increment,
+  ) -> (Outcome, Option<Vec<crate::chain_entry::Applied>>) {
+    let judgment = self.judge_named(inc);
     self.commit_judgment(judgment)
   }
 
@@ -6188,7 +6234,7 @@ impl Green {
   /// increment already accepted commits nothing and returns the version it was accepted as.
   pub fn apply_recorded(
     &mut self,
-    inc: &Increment,
+    inc: &mut Increment,
     applied: &[crate::chain_entry::Applied],
   ) -> u64 {
     // A green that owes a push takes a later recorded version in order, to apply once it is materialized (P2): the
@@ -6210,12 +6256,27 @@ impl Green {
       return self.head();
     }
     let copies = copy::EntryCopies::of(applied);
-    let effects = applied
+    let mut effects: Vec<Effect> = applied
       .iter()
       .map(|effect| self.effect_of(effect, (inc.post(), &copies)))
       .collect();
+    // A file a named run makes whole takes the run's buffer, read for this apply (A-760), with no copy, as a judged
+    // verdict's commit does (`Green::commit_held`); every other file is made first, while every buffer is in place.
+    let mut read = core::mem::take(&mut inc.named.read.0);
+    let wholes = self.whole_runs(&effects, &inc.post_state, &read);
+    let skip: Vec<usize> = wholes.iter().map(|(place, _)| *place).collect();
+    self.make_mapped(
+      &mut effects,
+      crate::named::Post::of(&inc.post_state, &read),
+      &skip,
+    );
+    move_whole_runs(&mut effects, &mut read, &wholes);
     let version = self.head().saturating_add(1);
-    self.commit(effects, version, inc.post());
+    self.commit(
+      effects,
+      version,
+      crate::named::Post::of(&inc.post_state, &read),
+    );
     self.accepted.insert(inc.id, version);
     version
   }
@@ -6266,21 +6327,15 @@ impl Green {
     match applied {
       Applied::Special(path, node) => Effect::Special(path.clone(), *node),
       Applied::RemoveSpecial(path) => Effect::RemoveSpecial(path.clone()),
+      // Left unmade: the commit makes it from the head, or moves a named run's buffer into it whole (A-760).
       Applied::Spliced(path, ops) => {
-        let current = self.content.get(path).unwrap_or_default();
-        Effect::SetContent(
-          path.clone(),
-          Some(apply(current, ops, post_state)),
-          ops.clone(),
-          ContentSource::Mapped,
-        )
+        Effect::SetContent(path.clone(), None, ops.clone(), ContentSource::Mapped)
       }
       Applied::Created(path, declared) => {
-        let bytes = apply(&[], declared, post_state);
-        let ops = vec![insert_whole(bytes.len() as u64)];
+        let ops = vec![insert_whole(made_len(0, declared, post_state.len()))];
         Effect::SetContent(
           path.clone(),
-          Some(bytes),
+          None,
           ops,
           ContentSource::Created(declared.clone()),
         )
@@ -7148,6 +7203,8 @@ mod copy_checkpoint;
 mod copy_restate;
 
 #[cfg(test)]
+mod apply_tests;
+#[cfg(test)]
 mod copy_tests;
 #[cfg(test)]
 mod named_tests;
@@ -7313,7 +7370,7 @@ mod tests {
       "the entry carries what the verdict resolved"
     );
     assert_eq!(
-      replayed.apply_recorded(&decoded.increment, &decoded.applied),
+      replayed.apply_recorded(&mut decoded.increment.clone(), &decoded.applied),
       2
     );
     assert_eq!(

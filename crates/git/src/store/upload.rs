@@ -20,7 +20,14 @@
 //!    small blobs from the parts of blobs entry by entry, as kept, deltas and all. Then each object still wanted is
 //!    offered the parts of the version its row says brought it, once each: a partial clone's later fetch of blobs by
 //!    their ids wants no head, and its blobs are found so.
-//! 3. **The rest**, which no part covered (a version not yet encoded), encoded in position order by the fragments'
+//! 3. **The rest**, which no part covered (a version not yet encoded), in position order. An object pushed in a pack
+//!    is first sent on as its entry lies there (A-859, git's pack reuse: `pack-objects` reuses an object's packed
+//!    entry before it searches): a whole entry's compressed data copied, once it inflates to the object its name says;
+//!    a delta whose base precedes it in this pack (sent already, or placed by this stage before it, its base placed
+//!    first where it is still wanted, as git's `write_one` writes a delta's base first), once the delta applied to its
+//!    base gives the object its name says, as an offset delta to a base this stage placed where the client said
+//!    `ofs-delta` and by its base's name otherwise; a whole entry whenever it has one (main 01a20182's ruling of
+//!    2026-11-22 05:38: an object with a stored form is never searched). Every other object is encoded by the fragments'
 //!    encoder: a delta against an earlier one of its kind within the learned window and depth, at the learned level,
 //!    the rules copied from the repository when the stream begins. An object past a window is searched by the same
 //!    rules against the earlier ones past a window of its kind, the nearest first, as many as the learned window
@@ -94,10 +101,11 @@ use crate::{Admission, Hold, PastAdmission};
 use super::deltas::{Search, SearchStep, delta_most};
 use super::fragment::{self, Encoder, FragmentRefused, Learning, Placed, Stored, ToEncode};
 use super::learn::{Clock, Exchange, Levels, Window};
+use super::packed::{self, InPack};
 use super::positions::Positions;
 use super::push::StoredAt;
 use super::repository::{Kept, Repository, StoreRefused};
-use super::rows::ObjectRow;
+use super::rows::{self, ObjectRow};
 
 /// Format: git's four object types, each asked of a filter to learn whether it sends everything.
 const KINDS: [Kind; 4] = [Kind::Commit, Kind::Tree, Kind::Blob, Kind::Tag];
@@ -175,12 +183,53 @@ pub struct UploadCounters {
   /// Objects past a window no part covered that had a candidate base, sent whole because the request's admission
   /// could not hold their search (module docs, **What it sends** 3); each is counted in `loose_whole` too.
   pub loose_unsearched: u64,
+  /// Objects no part covered sent on as their pushed entry lies, whole, its compressed data copied (A-859, git's pack
+  /// reuse).
+  pub reused_whole: u64,
+  /// Objects no part covered sent on as their pushed delta (A-859), its base sent before it in this pack.
+  pub reused_deltas: u64,
+  /// Objects whose pushed entry failed its check (its data not the object its name says), encoded instead (A-859).
+  pub reuse_refused: u64,
+  /// Objects no part covered that lie in no pack the store holds (kept as content), encoded with no entry to reuse
+  /// (A-859).
+  pub reuse_no_entry: u64,
+  /// Objects no part covered whose pushed entry, or a delta's base, could not be read, encoded instead (A-859).
+  pub reuse_unread: u64,
+  /// Objects no part covered whose pushed entry's raw bytes did not match the CRC32 its row keeps (A-864), rebuilt to
+  /// be checked.
+  pub reuse_crc_missed: u64,
+  /// The loose stage's reads of a pushed entry that lay before the one read before it in the same pack (A-864's piece 1:
+  /// none where the stage reads each pack front to back).
+  pub backward_reads: u64,
+  /// Objects no part covered whose pushed entry was rebuilt to be checked (inflated, a delta applied, named): those with
+  /// a CRC32 miss or no kept entry (A-864: none, for a pushed pack's objects).
+  pub reuse_rebuilt: u64,
   /// The most of the answer's kept units (runs, listed positions or table words) one unit of reading its objects read:
   /// a window's worth at most, however many the answer holds (module docs, **Slices**).
   pub objects_read_most: u64,
   /// The most of a part's entries in position order one unit of marking its wanted entries read: a window's worth of
   /// handles at most, however many entries the part holds (module docs, **Slices**).
   pub marks_read_most: u64,
+}
+
+/// What the loose stage does with an object's pushed entry (A-859).
+enum Reuse {
+  /// Sent on as it lies: its header written, what copies its data.
+  Sent(Pending),
+  /// A delta whose base, still wanted, is placed first: the base's position.
+  BaseFirst(u64),
+  /// Encoded instead.
+  Encode,
+}
+
+/// How a pushed delta goes on (A-859).
+enum DeltaReuse {
+  /// As this delta.
+  As(Representation),
+  /// After its base, still wanted, at this position.
+  BaseFirst(u64),
+  /// Not as it lies: encoded instead.
+  No,
 }
 
 /// Where the stream is (module docs).
@@ -212,7 +261,10 @@ enum Stage {
     from: u64,
     offered: BTreeSet<(u64, u64, bool)>,
   },
-  /// Encoding what no part covered, from position `from` on.
+  /// Reading where each object no part covered lies, from position `from` on, into the loose stage's order (A-864's
+  /// piece 1: a pack's objects in the pack's own order).
+  Order { from: u64 },
+  /// Sending what no part covered, from the loose stage's order's `from`th object on.
   Loose { from: u64 },
   /// The trailer.
   Trailer,
@@ -397,6 +449,25 @@ pub struct Upload<A> {
   encoder: Encoder,
   /// For each kind, the objects past a window a later one's search may try, the nearest last.
   large: BTreeMap<Kind, VecDeque<Large>>,
+  /// Where each object the loose stage sent begins in the pack, by its position (A-859: a reused delta names a base
+  /// the loose stage sent by its offset back), a word an object, charged to the request's admission as it grows.
+  loose_at: BTreeMap<u64, u64>,
+  /// The positions the loose stage places before it goes on, the last first (A-859, git's `write_one`: a delta's base
+  /// written before it): a pushed delta whose base is still wanted and not yet placed, and its base above it; as deep
+  /// as the deepest chain any push carried (`Repository::learned_depth`), a word an object charged with the stage's.
+  ahead: Vec<u64>,
+  /// The objects no part covered, in the order the loose stage sends them ([`Upload::order_unit`]): each by its pack's
+  /// ordinal (`packs`), its offset there and its position, those held whole last by position.
+  order: Vec<(u64, u64, u64)>,
+  /// Each pack the loose stage's objects lie in, by its ordinal in `order`, in the order first met.
+  packs: BTreeMap<ContentId, u64>,
+  /// The same packs by ordinal, each with its length.
+  pack_lens: Vec<(ContentId, u64)>,
+  /// The let-go window a unit met and stopped at, its work kept to be taken again once it is brought back (goal 93
+  /// item 2a's look-ahead, A-864 piece 2): taken by [`Upload::waiting`].
+  waiting: core::cell::Cell<Option<packed::Waited>>,
+  /// Where the loose stage last read a pushed entry: its pack and offset (counting [`UploadCounters::backward_reads`]).
+  last_read: Option<(ContentId, u64)>,
   by_entry: Option<ByEntry>,
   pending: Option<Pending>,
   counters: UploadCounters,
@@ -428,6 +499,13 @@ impl<A: Answered> Upload<A> {
       depth,
       encoder,
       large: BTreeMap::new(),
+      loose_at: BTreeMap::new(),
+      ahead: Vec::new(),
+      order: Vec::new(),
+      packs: BTreeMap::new(),
+      pack_lens: Vec::new(),
+      waiting: core::cell::Cell::new(None),
+      last_read: None,
       by_entry: None,
       pending: None,
       counters: UploadCounters::default(),
@@ -467,6 +545,8 @@ impl<A: Answered> Upload<A> {
     loop {
       match self.step(&mut context, out) {
         Ok(Progress::Done) => return Ok(Progress::Done),
+        // A unit met a let-go window and stopped, nothing of it written: the turn ends, the window to be brought back.
+        Ok(Progress::More) if self.is_waiting() => return Ok(Progress::More),
         Ok(Progress::More) => {}
         Err(refused) => {
           self.stage = Stage::Refused(refused);
@@ -482,6 +562,15 @@ impl<A: Answered> Upload<A> {
   /// One unit of work: what is owed first, then a part's next entry, then the stage's next step.
   fn step(&mut self, cx: &mut Context<'_>, out: &mut impl Out) -> Result<Progress, StoreRefused> {
     if let Some(pending) = self.pending.take() {
+      if let Pending::Copy {
+        content, len, from, ..
+      } = pending
+        && let Some(waited) = away_from(cx.store, (content, len), (from, from.saturating_add(1)))
+      {
+        self.pending = Some(pending);
+        self.waiting.set(Some(waited));
+        return Ok(Progress::More);
+      }
       self.pending = self.owed(cx, pending, out)?;
       return Ok(Progress::More);
     }
@@ -516,6 +605,7 @@ impl<A: Answered> Upload<A> {
       Stage::CoverFrom => Ok(self.cover_from(cx)),
       Stage::Cover { greens, at, part } => self.cover(cx, greens, at, part),
       Stage::Holders { from, offered } => self.holders(cx, from, offered),
+      Stage::Order { from } => self.order_unit(cx, from),
       Stage::Loose { from } => self.loose(cx, from, out),
       Stage::Trailer => self.trailer(out),
       Stage::Done => Ok(Stage::Done),
@@ -1066,7 +1156,7 @@ impl<A: Answered> Upload<A> {
     mut offered: BTreeSet<(u64, u64, bool)>,
   ) -> Result<Stage, StoreRefused> {
     let Some(position) = self.wanted.next_from(from) else {
-      return Ok(Stage::Loose { from: 0 });
+      return Ok(Stage::Order { from: 0 });
     };
     let (_, row, _) = cx.repository.stored_at(cx.store, position)?;
     let blobs = row.kind == Kind::Blob;
@@ -1088,6 +1178,73 @@ impl<A: Answered> Upload<A> {
     })
   }
 
+  /// Whether a unit stopped at a let-go window ([`Upload::waiting`]) not yet taken.
+  fn is_waiting(&self) -> bool {
+    let waiting = self.waiting.take();
+    self.waiting.set(waiting);
+    waiting.is_some()
+  }
+
+  /// The let-go window the stream's last turn stopped at, its unit kept to be taken again once the window is brought
+  /// back (goal 93 item 2a; A-864 piece 2): taken, so the next turn reads on. None where the turn met none.
+  pub fn waiting(&self) -> Option<packed::Waited> {
+    self.waiting.take()
+  }
+
+  /// Where the stream's next turn begins to read a pushed pack (A-864 piece 2, a turn's windows brought back ahead of
+  /// it): the pack, its length and the offset, from the copy under way or the loose stage's next object in its order;
+  /// the stage reads each pack front to back from there. None where it reads no pack next.
+  pub fn reading_next(&self) -> Option<packed::Waited> {
+    if let Some(Pending::Copy {
+      content, len, from, ..
+    }) = &self.pending
+    {
+      return Some(packed::Waited {
+        pack: *content,
+        len: *len,
+        offset: *from,
+      });
+    }
+    let Stage::Loose { from } = self.stage else {
+      return None;
+    };
+    let (pack, offset, _) = *self.order.get(usize::try_from(from).ok()?)?;
+    let (pack, len) = *self.pack_lens.get(usize::try_from(pack).ok()?)?;
+    Some(packed::Waited { pack, len, offset })
+  }
+
+  /// One unit of the loose stage's order (A-864's piece 1; main 01a20182's ruling of 2026-11-22): where the next object
+  /// no part covered lies read from its row, the object noted by its pack and offset there, or last by its position for
+  /// one held whole; with none left, the order sorted, so the loose stage reads each pack's entries in the pack's own
+  /// order, front to back (as git writes the entries it reuses), its bases before their offset deltas and each window
+  /// wanted once. Each object noted is charged three words to the request's admission (a pack's ordinal, an offset and
+  /// a position: 24 bytes an object, 3.6 MB for git/git's 150,000).
+  fn order_unit(&mut self, cx: &mut Context<'_>, from: u64) -> Result<Stage, StoreRefused> {
+    let Some(position) = self.wanted.next_from(from) else {
+      self.order.sort_unstable();
+      return Ok(Stage::Loose { from: 0 });
+    };
+    let (_, _, stored) = cx.repository.stored_at(cx.store, position)?;
+    cx.admission
+      .charge_items::<(u64, u64, u64)>(1)
+      .map_err(|_| StoreRefused::PackTooLarge)?;
+    let key = match stored {
+      StoredAt::InPack(place) => {
+        let packs = to_u64(self.packs.len());
+        let pack = *self.packs.entry(place.pack).or_insert_with(|| {
+          self.pack_lens.push((place.pack, place.len));
+          packs
+        });
+        (pack, place.offset, position)
+      }
+      StoredAt::Whole(_) => (u64::MAX, position, position),
+    };
+    self.order.push(key);
+    Ok(Stage::Order {
+      from: position.saturating_add(1),
+    })
+  }
+
   /// One object no part covered (module docs, **What it sends** 3): encoded with the fragments' encoder when it is a
   /// window long at most; past a window, searched against the earlier ones past a window when the request's admission
   /// holds the search, and sent whole otherwise (`loose_large`).
@@ -1097,14 +1254,58 @@ impl<A: Answered> Upload<A> {
     from: u64,
     out: &mut impl Out,
   ) -> Result<Stage, StoreRefused> {
-    let Some(position) = self.wanted.next_from(from) else {
-      return Ok(Stage::Trailer);
+    let (position, next) = match self.ahead.pop() {
+      Some(position) => (position, Stage::Loose { from }),
+      None => {
+        let Some(&(_, _, position)) = usize::try_from(from).ok().and_then(|at| self.order.get(at))
+        else {
+          return Ok(Stage::Trailer);
+        };
+        let next = Stage::Loose {
+          from: from.saturating_add(1),
+        };
+        // Placed already, ahead of its turn as a delta's base.
+        if self.loose_at.contains_key(&position) {
+          return Ok(next);
+        }
+        (position, next)
+      }
     };
-    self.entries = self.entries.saturating_add(1);
     let (id, row, stored) = cx.repository.stored_at(cx.store, position)?;
-    let next = Stage::Loose {
-      from: position.saturating_add(1),
-    };
+    // A unit whose pushed entry lies in a let-go window stops before it writes or keeps anything, to be taken again.
+    if let (StoredAt::InPack(place), Some(packed)) = (stored, row.pack)
+      && let Some(waited) = away_from(
+        cx.store,
+        (place.pack, place.len),
+        (place.offset, place.offset.saturating_add(packed.len)),
+      )
+    {
+      if matches!(next, Stage::Loose { from: after } if after == from) {
+        self.ahead.push(position);
+      }
+      self.waiting.set(Some(waited));
+      return Ok(Stage::Loose { from });
+    }
+    cx.admission
+      .charge_items::<(u64, u64)>(1)
+      .map_err(|_| StoreRefused::PackTooLarge)?;
+    self.loose_at.insert(position, self.at);
+    match self.reused(cx, (id, &row, stored, position), out)? {
+      Reuse::Sent(pending) => {
+        self.entries = self.entries.saturating_add(1);
+        self.pending = Some(pending);
+        return Ok(next);
+      }
+      Reuse::BaseFirst(base) => {
+        // Placed after its base, which goes first (its charge kept for its place on `ahead`).
+        self.loose_at.remove(&position);
+        self.ahead.push(position);
+        self.ahead.push(base);
+        return Ok(Stage::Loose { from });
+      }
+      Reuse::Encode => {}
+    }
+    self.entries = self.entries.saturating_add(1);
     if row.len > to_u64(cx.store.window()) {
       self.pending = Some(self.loose_large(cx, (id, row, stored), out)?);
       return Ok(next);
@@ -1138,6 +1339,260 @@ impl<A: Answered> Upload<A> {
     }
     self.emit(&entry, out);
     Ok(next)
+  }
+
+  /// `id`'s pushed entry sent on as it lies (A-859, git's pack reuse), once its check holds (a whole entry's data
+  /// inflates to the object its name says; a delta's, applied to its base, to the object, which its name says) and its
+  /// base precedes it in this pack: sent already, or placed by this loose stage before it, its base placed first where it
+  /// is still wanted (git's `write_one`). The delta goes as an offset delta to a base the loose stage placed where the
+  /// client said `ofs-delta`, otherwise by its base's name. Its header written, what copies its data a window a unit;
+  /// its base's position to place first; or none, to encode it instead.
+  fn reused(
+    &mut self,
+    cx: &mut Context<'_>,
+    (id, row, stored, position): (ObjectId, &ObjectRow, StoredAt, u64),
+    out: &mut impl Out,
+  ) -> Result<Reuse, StoreRefused> {
+    let StoredAt::InPack(place) = stored else {
+      self.counters.reuse_no_entry = self.counters.reuse_no_entry.saturating_add(1);
+      return Ok(Reuse::Encode);
+    };
+    if self
+      .last_read
+      .is_some_and(|(pack, offset)| pack == place.pack && place.offset < offset)
+    {
+      self.counters.backward_reads = self.counters.backward_reads.saturating_add(1);
+    }
+    self.last_read = Some((place.pack, place.offset));
+    if let Some(packed) = row.pack
+      && let Some(reuse) = self.reused_as_kept(cx, (row, place, packed), out)?
+    {
+      return Ok(reuse);
+    }
+    // A-864: rebuilt to be checked only where the kept CRC32 missed.
+    self.counters.reuse_rebuilt = self.counters.reuse_rebuilt.saturating_add(1);
+    let mut scratch = Vec::new();
+    let room = cx.repository.largest_object().max(row.len);
+    let Ok(raw) = packed::raw_entry(cx.store, (place, self.format), (&mut scratch, room)) else {
+      self.counters.reuse_unread = self.counters.reuse_unread.saturating_add(1);
+      return Ok(Reuse::Encode);
+    };
+    let representation = match raw.representation {
+      Representation::Whole(kind) => {
+        let checked = kind == row.kind
+          && crate::object_name::name_of(self.format, kind, &scratch)
+            .is_ok_and(|named| named == id);
+        if !checked {
+          self.counters.reuse_refused = self.counters.reuse_refused.saturating_add(1);
+          return Ok(Reuse::Encode);
+        }
+        Representation::Whole(kind)
+      }
+      delta => {
+        let Some((base, base_bytes)) = self.base_of(cx, (place, delta)) else {
+          self.counters.reuse_unread = self.counters.reuse_unread.saturating_add(1);
+          return Ok(Reuse::Encode);
+        };
+        match self.delta_reused(cx, (id, row, stored), (base, &base_bytes, &scratch))? {
+          DeltaReuse::As(representation) => representation,
+          DeltaReuse::BaseFirst(base) => return Ok(Reuse::BaseFirst(base)),
+          DeltaReuse::No => return Ok(Reuse::Encode),
+        }
+      }
+    };
+    let mut header = Vec::new();
+    entry::write(
+      Header {
+        representation,
+        size: raw.size,
+      },
+      self.at,
+      &mut header,
+    )
+    .map_err(entry_refused)?;
+    if matches!(representation, Representation::Whole(_)) {
+      self.counters.reused_whole = self.counters.reused_whole.saturating_add(1);
+      // Kept as a later object's candidate base, as an object this stage deflates whole is.
+      if row.len > to_u64(cx.store.window()) {
+        let large = Large {
+          id,
+          kind: row.kind,
+          len: row.len,
+          stored,
+          at: self.at,
+          depth: 0,
+        };
+        self.remember_large(large, cx.exchange);
+      } else {
+        let learning = Learning {
+          window: &mut self.window,
+          levels: &mut self.levels,
+          depth: self.depth,
+          exchange: cx.exchange,
+        };
+        let object = ToEncode {
+          id,
+          position,
+          kind: row.kind,
+          bytes: scratch,
+          named: None,
+        };
+        self.encoder.remember(object, (self.at, 0), &learning);
+      }
+    } else {
+      self.counters.reused_deltas = self.counters.reused_deltas.saturating_add(1);
+    }
+    self.emit(&header, out);
+    Ok(Reuse::Sent(Pending::Copy {
+      content: place.pack,
+      len: place.len,
+      from: raw.data,
+      to: raw.end,
+    }))
+  }
+
+  /// `row`'s pushed entry sent on as it lies by what its row keeps of it (A-864, `rows::PackedRow`; git's
+  /// `write_reuse_object`): its header read, the CRC32 of its raw bytes checked against the kept one, a delta's base by
+  /// the position its row names, placed first where it is still wanted (git's `write_one`); then its data copied, no
+  /// object read. None where its CRC32 misses (counted `reuse_crc_missed`) or its header cannot be read: the caller
+  /// rebuilds the object to check it, as before.
+  fn reused_as_kept(
+    &mut self,
+    cx: &mut Context<'_>,
+    (row, place, packed): (&ObjectRow, InPack, rows::PackedRow),
+    out: &mut impl Out,
+  ) -> Result<Option<Reuse>, StoreRefused> {
+    let room = cx.repository.largest_object().max(row.len);
+    let Ok((header, data)) = packed::entry_header(cx.store, (place, self.format), room) else {
+      return Ok(None);
+    };
+    if packed::raw_crc(cx.store, place, packed.len).ok() != Some(packed.crc) {
+      self.counters.reuse_crc_missed = self.counters.reuse_crc_missed.saturating_add(1);
+      return Ok(None);
+    }
+    let representation = match (header.representation, packed.base) {
+      (Representation::Whole(kind), None) if kind == row.kind => Representation::Whole(kind),
+      (Representation::OfsDelta { .. } | Representation::RefDelta { .. }, Some(base)) => {
+        let placed = self.sent.contains(base) || self.loose_at.contains_key(&base);
+        if !placed {
+          if self.wanted.contains(base) && to_u64(self.ahead.len()) < cx.repository.learned_depth()
+          {
+            return Ok(Some(Reuse::BaseFirst(base)));
+          }
+          return Ok(Some(Reuse::Encode));
+        }
+        match self.loose_at.get(&base) {
+          Some(base_at) if self.answer.ofs_delta() => Representation::OfsDelta { base: *base_at },
+          _ => Representation::RefDelta {
+            base: cx
+              .repository
+              .id_at(cx.store, base)
+              .ok_or(StoreRefused::NoPosition { position: base })?,
+          },
+        }
+      }
+      _ => return Ok(None),
+    };
+    let mut written = Vec::new();
+    entry::write(
+      Header {
+        representation,
+        size: header.size,
+      },
+      self.at,
+      &mut written,
+    )
+    .map_err(entry_refused)?;
+    if matches!(representation, Representation::Whole(_)) {
+      self.counters.reused_whole = self.counters.reused_whole.saturating_add(1);
+    } else {
+      self.counters.reused_deltas = self.counters.reused_deltas.saturating_add(1);
+    }
+    self.emit(&written, out);
+    Ok(Some(Reuse::Sent(Pending::Copy {
+      content: place.pack,
+      len: place.len,
+      from: data,
+      to: place.offset.saturating_add(packed.len),
+    })))
+  }
+
+  /// A pushed delta's base (A-859): an OFS_DELTA's the entry at its offset of the same pack, read and named; a
+  /// REF_DELTA's the object it names. Its name and its bytes; none where it is not read.
+  fn base_of(
+    &self,
+    cx: &Context<'_>,
+    (place, delta): (InPack, Representation),
+  ) -> Option<(ObjectId, Vec<u8>)> {
+    match delta {
+      Representation::OfsDelta { base } => {
+        let (kind, bytes) = cx.repository.read_entry(
+          cx.store,
+          InPack {
+            offset: base,
+            ..place
+          },
+        )?;
+        let base = crate::object_name::name_of(self.format, kind, &bytes).ok()?;
+        Some((base, bytes))
+      }
+      Representation::RefDelta { base } => {
+        let (row, content) = cx.repository.indexed(cx.store, &base)?;
+        let bytes = cx
+          .repository
+          .row_bytes(cx.store, &row, content)?
+          .into_owned();
+        Some((base, bytes))
+      }
+      Representation::Whole(_) => None,
+    }
+  }
+
+  /// How a pushed delta of `id` against `base` goes on (A-859), once its base precedes it in this pack (sent already, or
+  /// by this loose stage before it) and its data (`delta`, inflated) applied to the base's bytes gives the object, which
+  /// its name says: an offset delta to a base this stage placed where the client said `ofs-delta`, by its base's name
+  /// otherwise. Its base's position to place first where the base is still wanted and not yet placed, within the
+  /// deepest chain any push carried ([`Upload`]'s `ahead`); none where its base does not precede it otherwise;
+  /// refused-and-counted where its check fails.
+  fn delta_reused(
+    &mut self,
+    cx: &Context<'_>,
+    (id, row, stored): (ObjectId, &ObjectRow, StoredAt),
+    (base, base_bytes, delta): (ObjectId, &[u8], &[u8]),
+  ) -> Result<DeltaReuse, StoreRefused> {
+    let Some((base_row, _)) = cx.repository.indexed(cx.store, &base) else {
+      return Ok(DeltaReuse::No);
+    };
+    let before =
+      self.sent.contains(base_row.position) || self.loose_at.contains_key(&base_row.position);
+    if !before {
+      let first = self.wanted.contains(base_row.position)
+        && to_u64(self.ahead.len()) < cx.repository.learned_depth();
+      return Ok(if first {
+        DeltaReuse::BaseFirst(base_row.position)
+      } else {
+        DeltaReuse::No
+      });
+    }
+    let object = cx
+      .repository
+      .read_stored(cx.store, &stored, row.len)
+      .ok_or(StoreRefused::Unreadable { id })?;
+    let mut built = Vec::new();
+    let checked = crate::object_name::name_of(self.format, row.kind, &object)
+      .is_ok_and(|named| named == id)
+      && crate::delta::apply_to(base_bytes, delta, &mut built).is_ok()
+      && built.as_slice() == object.as_ref();
+    if !checked {
+      self.counters.reuse_refused = self.counters.reuse_refused.saturating_add(1);
+      return Ok(DeltaReuse::No);
+    }
+    Ok(DeltaReuse::As(
+      match self.loose_at.get(&base_row.position) {
+        Some(base_at) if self.answer.ofs_delta() => Representation::OfsDelta { base: *base_at },
+        _ => Representation::RefDelta { base },
+      },
+    ))
   }
 
   /// An object past a window (module docs, **What it sends** 3): searched when it has candidates and the request's
@@ -1782,4 +2237,20 @@ fn entry_refused(refusal: entry::Refusal) -> StoreRefused {
 
 fn to_u64(len: usize) -> u64 {
   u64::try_from(len).unwrap_or(u64::MAX)
+}
+
+/// The first let-go window of the `len`-byte pack `pack` that bytes `from` to `to` lie in (goal 93 item 2a; A-864 piece
+/// 2): what a unit reading them waits for; none where every window of them is held.
+fn away_from(
+  store: &ContentStore,
+  (pack, len): (ContentId, u64),
+  (from, to): (u64, u64),
+) -> Option<packed::Waited> {
+  let window = to_u64(store.window()).max(1);
+  let first = from.checked_div(window)?;
+  let last = to.saturating_sub(1).max(from).checked_div(window)?;
+  (first..=last)
+    .map(|index| index.saturating_mul(window).max(from))
+    .find(|offset| store.away_window(&pack, len, *offset).is_some())
+    .map(|offset| packed::Waited { pack, len, offset })
 }

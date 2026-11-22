@@ -1058,8 +1058,13 @@ impl Import {
     }
     let index = &self.imported.index;
     let refused = |refused| ImportRefused::Unemitted(emit::EmitRefused::Record(refused));
-    let mut writer =
-      record::Writer::begin_segment(&emitter.ranges(), self.initial, last).map_err(refused)?;
+    let mut writer = record::Writer::begin_segment(
+      record::Source::Import,
+      &emitter.ranges(),
+      self.initial,
+      last,
+    )
+    .map_err(refused)?;
     while writer.step(index, store).map_err(refused)? {}
     let written = writer
       .finish()

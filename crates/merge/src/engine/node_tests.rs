@@ -280,7 +280,7 @@ fn submit_and_replay(
   let increment = work.at(live.head(), id);
   match live.submit_resolved(&increment) {
     (Outcome::Accepted { .. } | Outcome::Identical { .. }, Some(applied)) => {
-      replica.apply_recorded(&increment, &applied);
+      replica.apply_recorded(&mut increment.clone(), &applied);
       Ok(())
     }
     other => Err(format!("{other:?}")),

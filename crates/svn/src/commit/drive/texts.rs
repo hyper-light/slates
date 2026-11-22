@@ -38,11 +38,12 @@ pub enum TextRefused {
 /// Where a drive puts its new texts (the module documentation). Its methods take `&self`: it is lent with the
 /// repository's sources for one call, and keeps its state inside.
 pub trait TextSink {
-  /// Starts a new text.
+  /// Starts a new text, `len` bytes long where its writer knows its length before its bytes (an import's whole text,
+  /// its dump header's length), so the sink sizes what holds it once; none where it does not (a delta's result).
   ///
   /// # Errors
-  /// [`TextRefused`].
-  fn stage(&self) -> Result<StagedText, TextRefused>;
+  /// [`TextRefused`]: [`TextRefused::Room`] where a sink cannot make room for a text of `len` bytes.
+  fn stage(&self, len: Option<u64>) -> Result<StagedText, TextRefused>;
 
   /// Appends `bytes`, a window's new text, to `staged`.
   ///
@@ -65,7 +66,7 @@ pub trait TextSink {
 }
 
 /// A sink in memory (the module documentation): staged texts by number, sealed ones by identity.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct HeldTexts {
   /// The texts being staged.
   staged: RefCell<BTreeMap<StagedText, Vec<u8>>>,
@@ -100,13 +101,22 @@ impl HeldTexts {
 }
 
 impl TextSink for HeldTexts {
-  fn stage(&self) -> Result<StagedText, TextRefused> {
+  fn stage(&self, len: Option<u64>) -> Result<StagedText, TextRefused> {
+    // A known length is made room for once, so the text's appends never grow its buffer; refused, not aborted, where
+    // memory cannot hold it.
+    let mut bytes = Vec::new();
+    if let Some(len) = len {
+      let len = usize::try_from(len).map_err(|_| TextRefused::Room { available: 0 })?;
+      bytes
+        .try_reserve_exact(len)
+        .map_err(|_| TextRefused::Room { available: 0 })?;
+    }
     let number = self.next.get();
     self
       .next
       .set(number.checked_add(1).ok_or(TextRefused::Held)?);
     let staged = StagedText(number);
-    self.staged.borrow_mut().insert(staged, Vec::new());
+    self.staged.borrow_mut().insert(staged, bytes);
     Ok(staged)
   }
 

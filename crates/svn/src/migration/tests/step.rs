@@ -556,10 +556,8 @@ fn an_import_asks_its_caller_for_a_delta_base_the_records_keep_elsewhere() {
     let mut rest = stream.as_slice();
     let mut asked = Vec::new();
     loop {
-      match importer
-        .import(repository.records_mut(), rest, true)
-        .unwrap()
-      {
+      let (records, texts) = repository.importing();
+      match importer.import(records, texts, rest, true).unwrap() {
         Importing::Base { consumed, text } => {
           asked.push(text);
           assert_eq!(

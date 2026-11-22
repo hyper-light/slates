@@ -553,7 +553,12 @@ impl Encoder {
 
   /// Keeps `object`, written at `at` with a chain `depth` deep, as a candidate while its chain has
   /// room, and lets go of the candidates of its kind past what the window tries now.
-  fn remember(&mut self, object: ToEncode, (at, depth): (u64, u64), learning: &Learning<'_>) {
+  pub(crate) fn remember(
+    &mut self,
+    object: ToEncode,
+    (at, depth): (u64, u64),
+    learning: &Learning<'_>,
+  ) {
     if depth >= learning.depth {
       return;
     }

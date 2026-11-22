@@ -869,34 +869,42 @@ fn a_status_during_a_push_reports_the_daemons_memory_by_kind_while_the_anchor_ke
 
 /// Shape: the variable naming a real repository whose cut the memory test pushes in place of its made history (a
 /// git/git mirror, say), with [`HISTORY_CUT_VARIABLE`]; unset, the made history of [`HISTORY_COMMITS`] commits.
+#[cfg(unix)]
 const HISTORY_SOURCE_VARIABLE: &str = "SLATES_TEST_GIT_SOURCE";
 
 /// Shape: the variable naming the revision of [`HISTORY_SOURCE_VARIABLE`]'s repository the memory test pushes
 /// (`v2.0.0`, the cut w-interop's 7,421 MiB was measured on); its commit is pushed as [`BRANCH`].
+#[cfg(unix)]
 const HISTORY_CUT_VARIABLE: &str = "SLATES_TEST_GIT_CUT";
 
 /// Shape: the files of the memory test's histories, in [`HISTORY_DIRECTORIES`] directories: a source tree's count
 /// (git/git v2.0.0 holds about 2,500), so each version's tree, and whatever a server keeps per path or per object,
 /// is large beside the change one commit brings.
+#[cfg(unix)]
 const HISTORY_FILES: usize = 2_000;
 
 /// Shape: the directories the memory test's files lie in, each its own tree, as a source tree nests its files.
+#[cfg(unix)]
 const HISTORY_DIRECTORIES: usize = 20;
 
 /// Shape: the lines of each of the memory test's files, [`HISTORY_LINE_BYTES`] each (half a KiB a file).
+#[cfg(unix)]
 const HISTORY_FILE_LINES: usize = 16;
 
 /// Shape: the bytes of each line of the memory test's files (`line NN of file NNNNN` written to this width).
+#[cfg(unix)]
 const HISTORY_LINE_BYTES: usize = 32;
 
 /// Shape: the commits of the memory test's measured history after its first, which adds every file: each rewrites one
 /// line of one file, as most commits of a source history do, so the pack stock git sends grows by a delta a commit
 /// while the history's versions, trees and objects grow by a whole tree's worth of paths each.
+#[cfg(unix)]
 const HISTORY_COMMITS: usize = 200;
 
 /// Shape: the commits of the memory test's warm-up history after its first, the same shape: what a push and a clone of
 /// the tree cost the daemon whatever the history brings (the edge's buffers, a repository's store, the shards' first
 /// pages, one version of the tree).
+#[cfg(unix)]
 const WARM_COMMITS: usize = 2;
 
 /// Makes repository `name` in the memory test's daemon (`slates repository create`, A-685).
@@ -1087,6 +1095,25 @@ fn peak_while<T>(pid: &str, work: impl FnOnce() -> T) -> (T, u64) {
   })
 }
 
+/// Prints the daemon's memory gauges (`slates status --memory`'s `mem.gauge.*` rows, `crate::memory_gauges` of
+/// slates-server) labelled `when`: what holds its memory by its own accounting at each reading, so a resident set past the
+/// bound names its holders (main 01a20182's ask of 2026-11-22 06:28).
+#[cfg(unix)]
+fn print_gauges(instance: &str, when: &str) {
+  let (_, report, _) = slates(instance, &[], &["status", "--memory"]);
+  let rows: Vec<&str> = report
+    .lines()
+    .filter(|line| {
+      line.contains("mem.gauge.")
+        || line.starts_with("memory: ")
+        || line.contains("vcs_store.landed.")
+        || line.contains("vcs_store.read_through.")
+        || line.contains("vcs_store.git_resident")
+    })
+    .collect();
+  eprintln!("gauges at {when}:\n  {}", rows.join("\n  "));
+}
+
 /// What one round of the memory test measured: the pack's bytes, the daemon's peak resident set while its push and its
 /// clone ran, and its settled resident set after each.
 #[cfg(unix)]
@@ -1159,6 +1186,7 @@ fn the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the
       git.ok(&source, &["push", "-q", &url, &refspec]);
     });
     let pushed = settled_resident(&pid);
+    print_gauges(&leg.instance, &format!("{name} after the push"));
     let clone = git.copy(&format!("{name}-clone"));
     let ((), clone_peak) = peak_while(&pid, || {
       git.ok(&git.scratch, &["clone", "-q", &url, &clone]);
@@ -1176,10 +1204,15 @@ fn the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the
       pack,
       peak: push_peak.max(clone_peak),
       pushed,
-      cloned: settled_resident(&pid),
+      cloned: {
+        let cloned = settled_resident(&pid);
+        print_gauges(&leg.instance, &format!("{name} after the clone"));
+        cloned
+      },
     }
   };
   let start = settled_resident(&pid);
+  print_gauges(&leg.instance, "the start");
   let warm = round("warm", WARM_COMMITS, None);
   // W: the range the warm-up's resident set moved over, from its least (the start or its settled end, whichever the
   // idle give-back left lower) to its peak: what a push and a clone cost, and the noise of reading them, whatever
@@ -2117,12 +2150,163 @@ fn edge_advertisement(port: u16, token: &str) -> Option<Vec<u8>> {
   Some(out.stdout)
 }
 
-/// The whole-repository session against `url`, an empty repository, from `source` ([`tagged_source`]): every branch
-/// and tag pushed; the listing equal to the source's; a mirror clone that `fsck --full --strict` passes, its refs the
-/// source's; a push from a work clone fetched back into the mirror, the listings equal again; a shallow clone one
-/// commit deep, deepened by one; a partial clone (`--filter=blob:none`) that checks its tip out, its archive's bytes
-/// the source's.
-fn whole_session(git: &Git, source: &str, url: &str) {
+/// Format: the daemon's counters of the paths a clone's objects took (main 01a20182's order of 2026-11-22 04:53): the
+/// fetch stream's (`vcs_store::upload::STREAM_COUNTED`) and the encoding made ahead's (`vcs_store::git_encode`'s).
+const CLONE_PATHS: [&str; 24] = [
+  "vcs_store.git_upload.written_bytes",
+  "vcs_store.git_upload.parts_copied",
+  "vcs_store.git_upload.parts_by_entry",
+  "vcs_store.git_upload.entries_judged",
+  "vcs_store.git_upload.entries_copied",
+  "vcs_store.git_upload.headers_rewritten",
+  "vcs_store.git_upload.made_whole",
+  "vcs_store.git_upload.loose_whole",
+  "vcs_store.git_upload.loose_deltas",
+  "vcs_store.git_upload.loose_unsearched",
+  "vcs_store.git_upload.reused_whole",
+  "vcs_store.git_upload.reused_deltas",
+  "vcs_store.git_upload.reuse_refused",
+  "vcs_store.git_upload.reuse_no_entry",
+  "vcs_store.git_upload.reuse_unread",
+  "vcs_store.git_upload.reuse_crc_missed",
+  "vcs_store.git_upload.reuse_rebuilt",
+  "vcs_store.git_upload.backward_reads",
+  "vcs_store.git_encode.reused_whole",
+  "vcs_store.git_encode.reused_deltas",
+  "vcs_store.git_encode.reuse_refused",
+  "vcs_store.git_encode.reuse_no_entry",
+  "vcs_store.git_encode.reuse_unread",
+  "vcs_store.git_encode.reuse_crc_missed",
+];
+
+/// The values of counters `names` in the daemon's status report (`slates status --json`, each counter an object
+/// `{"count":N,"kind":"name"}`, one a shard that counted it), read once: each its sum, zero where none counted; none
+/// where the status could not be read.
+fn counters_of(instance: &str, names: &[&str]) -> Option<Vec<u64>> {
+  let (code, status, _) = slates(instance, &[], &["status", "--json"]);
+  (code == 0).then(|| {
+    names
+      .iter()
+      .map(|name| {
+        let kind = format!("\"kind\":\"{name}\"");
+        status
+          .match_indices(&kind)
+          .filter_map(|(at, _)| {
+            let object = status.get(status.get(..at)?.rfind('{')?..at)?;
+            let count = object.get(object.find("\"count\":")? + "\"count\":".len()..)?;
+            count
+              .chars()
+              .take_while(char::is_ascii_digit)
+              .collect::<String>()
+              .parse::<u64>()
+              .ok()
+          })
+          .sum()
+      })
+      .collect()
+  })
+}
+
+/// The bytes of the packs a repository at `dir` keeps (`objects/pack/*.pack`), and of the one `index-pack` is still
+/// receiving (`tmp_pack_*`): a fresh mirror clone's, the pack its server sent; one cut short, what it had sent.
+fn pack_file_bytes(dir: &str) -> u64 {
+  std::fs::read_dir(format!("{dir}/objects/pack"))
+    .map(|entries| {
+      entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+          entry.path().extension().is_some_and(|ext| ext == "pack")
+            || entry.file_name().to_string_lossy().starts_with("tmp_pack_")
+        })
+        .filter_map(|entry| entry.metadata().ok())
+        .map(|metadata| metadata.len())
+        .sum()
+    })
+    .unwrap_or(0)
+}
+
+/// What a whole-repository mirror clone over one edge took (main 01a20182's order of 2026-11-22 04:53), said on stderr
+/// when dropped, so a clone killed past [`PATIENCE`] says it too, before its daemon goes: the time, the pack bytes slates
+/// sent beside stock's, and each of [`CLONE_PATHS`]'s counts the clone added.
+struct CloneReport<'a> {
+  /// The step (main 01a20182's r28: each heavy step of the session says what it did, a killed one too).
+  step: &'static str,
+  /// The edge's daemon's instance.
+  instance: &'a str,
+  /// The repository the step makes or fills: its pack directory is `objects/pack` beneath it (`.git/objects/pack` for
+  /// a work tree's).
+  mirror: &'a str,
+  /// The bytes of stock git's own clone of the source ([`stock_clone_bytes`]).
+  stock: u64,
+  /// The counters before the clone.
+  before: Option<Vec<u64>>,
+  /// When it began.
+  began: Instant,
+}
+
+impl Drop for CloneReport<'_> {
+  fn drop(&mut self) {
+    let after = counters_of(self.instance, &CLONE_PATHS);
+    let paths: Vec<String> = match (&self.before, &after) {
+      (Some(before), Some(after)) => CLONE_PATHS
+        .iter()
+        .zip(before.iter().zip(after))
+        .map(|(name, (before, after))| format!("{name}={}", after.saturating_sub(*before)))
+        .collect(),
+      _ => vec!["(the daemon's status could not be read)".to_owned()],
+    };
+    eprintln!(
+      "whole-repository {} over {}: {:?}; pack bytes slates {} stock {}; {}",
+      self.step,
+      self.instance,
+      self.began.elapsed(),
+      pack_file_bytes(self.mirror),
+      self.stock,
+      paths.join(" ")
+    );
+  }
+}
+
+/// A report of `step` ([`CloneReport`]) on the daemon of `instance`, filling the repository at `dir`, beside stock's
+/// `stock` bytes of a whole clone, begun now.
+fn reported<'a>(
+  step: &'static str,
+  (instance, dir, stock): (&'a str, &'a str, u64),
+) -> CloneReport<'a> {
+  CloneReport {
+    step,
+    instance,
+    mirror: dir,
+    stock,
+    before: counters_of(instance, &CLONE_PATHS),
+    began: Instant::now(),
+  }
+}
+
+/// The bytes of the pack stock git's own upload-pack sends a mirror clone of `source` (`git clone --mirror --no-local`
+/// over `file://`), to say beside slates' ([`CloneReport`]).
+fn stock_clone_bytes(git: &Git, source: &str) -> u64 {
+  let stock = git.copy("stock.git");
+  git.ok(
+    &git.scratch,
+    &[
+      "clone",
+      "-q",
+      "--mirror",
+      "--no-local",
+      &file_url(source),
+      &stock,
+    ],
+  );
+  pack_file_bytes(&stock)
+}
+
+/// The whole-repository session against `url`, an empty repository on the daemon of `instance`, from `source`
+/// ([`tagged_source`]): every branch and tag pushed; the listing equal to the source's; a mirror clone that `fsck --full
+/// --strict` passes, its refs the source's, its pack bytes and paths said beside `stock`'s bytes ([`CloneReport`]); a
+/// push from a work clone fetched back into the mirror, the listings equal again; a shallow clone one commit deep,
+/// deepened by one; a partial clone (`--filter=blob:none`) that checks its tip out, its archive's bytes the source's.
+fn whole_session(git: &Git, source: &str, (url, instance, stock): (&str, &str, u64)) {
   git.ok(
     source,
     &[
@@ -2141,7 +2325,17 @@ fn whole_session(git: &Git, source: &str, url: &str) {
     "the pushed listing is the source's"
   );
   let mirror = git.copy("mirror.git");
-  git.ok(&git.scratch, &["clone", "-q", "--mirror", url, &mirror]);
+  {
+    let _report = CloneReport {
+      step: "mirror clone",
+      instance,
+      mirror: &mirror,
+      stock,
+      before: counters_of(instance, &CLONE_PATHS),
+      began: Instant::now(),
+    };
+    git.ok(&git.scratch, &["clone", "-q", "--mirror", url, &mirror]);
+  }
   git.ok(&mirror, &["fsck", "--full", "--strict", "--no-progress"]);
   assert_eq!(
     refs_of(git, &mirror),
@@ -2149,7 +2343,11 @@ fn whole_session(git: &Git, source: &str, url: &str) {
     "the mirror clone's refs are the source's"
   );
   let work = git.copy("work");
-  git.ok(&git.scratch, &["clone", "-q", url, &work]);
+  let work_git = format!("{work}/.git");
+  {
+    let _report = reported("work clone", (instance, &work_git, stock));
+    git.ok(&git.scratch, &["clone", "-q", url, &work]);
+  }
   let branch = git
     .ok(&work, &["symbolic-ref", "--short", "HEAD"])
     .trim()
@@ -2167,7 +2365,10 @@ fn whole_session(git: &Git, source: &str, url: &str) {
       "HEAD:refs/heads/slates-topic",
     ],
   );
-  git.ok(&mirror, &["fetch", "-q", "--prune", "origin"]);
+  {
+    let _report = reported("mirror fetch", (instance, &mirror, stock));
+    git.ok(&mirror, &["fetch", "-q", "--prune", "origin"]);
+  }
   let listed = git.ok(&git.scratch, &["ls-remote", url]);
   let mirrored = git.ok(&git.scratch, &["ls-remote", &mirror]);
   assert_eq!(
@@ -2177,10 +2378,14 @@ fn whole_session(git: &Git, source: &str, url: &str) {
   );
   git.ok(&mirror, &["fsck", "--full", "--strict", "--no-progress"]);
   let shallow = git.copy("shallow");
-  git.ok(
-    &git.scratch,
-    &["clone", "-q", "--depth", "1", url, &shallow],
-  );
+  let shallow_git = format!("{shallow}/.git");
+  {
+    let _report = reported("shallow clone", (instance, &shallow_git, stock));
+    git.ok(
+      &git.scratch,
+      &["clone", "-q", "--depth", "1", url, &shallow],
+    );
+  }
   assert_eq!(
     git.ok(&shallow, &["rev-list", "--count", "HEAD"]).trim(),
     "1",
@@ -2194,10 +2399,14 @@ fn whole_session(git: &Git, source: &str, url: &str) {
     "deepened by one"
   );
   let partial = git.copy("partial");
-  git.ok(
-    &git.scratch,
-    &["clone", "-q", "--filter=blob:none", url, &partial],
-  );
+  let partial_git = format!("{partial}/.git");
+  {
+    let _report = reported("partial clone", (instance, &partial_git, stock));
+    git.ok(
+      &git.scratch,
+      &["clone", "-q", "--filter=blob:none", url, &partial],
+    );
+  }
   git.ok(&partial, &["fsck", "--no-progress"]);
   let tip = git.commit_of(&partial, "HEAD");
   let ours = archive(git, &partial, &tip, &git.copy("partial.tar"));
@@ -2213,7 +2422,9 @@ fn whole_session(git: &Git, source: &str, url: &str) {
 /// [`EDGES`] names (HTTP with a bearer token, SSH with an enrolled key), run [`whole_session`] against an empty
 /// repository; over HTTP, also read the edge's `git-upload-pack` advertisement right after the push and compare its ref
 /// lines byte for byte with stock git's own `http-backend` serving the source. Expect every step as stated, every
-/// listing, ref and archive equal, and the advertisements' ref lines identical. Skips loudly without stock git, the
+/// listing, ref and archive equal, and the advertisements' ref lines identical; each edge's mirror clone says its time,
+/// its pack bytes beside stock git's own clone's and the paths its objects took ([`CloneReport`], said a clone killed past
+/// [`PATIENCE`] too). Skips loudly without stock git, the
 /// dataset, OpenSSH (the SSH edge) or curl (the advertisement), as the round trips do.
 #[test]
 #[ignore = "an interop round over a whole repository (CLAUDE.md §8: main runs it): SLATES_TEST_GIT_DATASET=<repo> cargo test --release -p slates-cli --test git_interop -- --ignored --exact stock_git_carries_a_whole_repository_over_each_edge"]
@@ -2233,6 +2444,7 @@ fn stock_git_carries_a_whole_repository_over_each_edge() {
   let plain = Git::new(&program, &scratch, "source", Vec::new());
   let source = format!("{}/source.git", scratch.path);
   tagged_source(&plain, &dataset, &source);
+  let stock = stock_clone_bytes(&plain, &source);
   if edges.split(',').any(|edge| edge == "http") {
     let Some(leg) = http_leg("whole") else {
       return;
@@ -2261,7 +2473,7 @@ fn stock_git_carries_a_whole_repository_over_each_edge() {
       }
       None => eprintln!("skipping the advertisement's byte compare: no curl here"),
     }
-    whole_session(&git, &source, &url);
+    whole_session(&git, &source, (&url, &leg.instance, stock));
     eprintln!("whole-repository session over HTTP: every step held");
   }
   if edges.split(',').any(|edge| edge == "ssh") {
@@ -2295,7 +2507,11 @@ fn stock_git_carries_a_whole_repository_over_each_edge() {
     whole_session(
       &git,
       &source,
-      &format!("ssh://{USER}@127.0.0.1:{port}/{REPOSITORY}"),
+      (
+        &format!("ssh://{USER}@127.0.0.1:{port}/{REPOSITORY}"),
+        &instance,
+        stock,
+      ),
     );
     eprintln!("whole-repository session over SSH: every step held");
   }

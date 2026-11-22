@@ -32,6 +32,12 @@ impl Admission {
     self.left
   }
 
+  /// Gives back `bytes` a holder charged and let go (a push's segment of kept texts once it is landed, A-767 C1 (b1)):
+  /// the bytes left grow by them, saturating.
+  pub fn give_back(&mut self, bytes: u64) {
+    self.left = self.left.saturating_add(bytes);
+  }
+
   /// Charges `bytes`, or refuses and charges nothing.
   pub fn charge(&mut self, bytes: u64) -> Result<(), PastAdmission> {
     match self.left.checked_sub(bytes) {

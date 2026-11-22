@@ -17107,6 +17107,247 @@ No refusal and no demotion was logged by any arm.
 - **84a's bar is still open on macOS.** The loaded p99 is under 1 ms in 11 of 12 round medians (worst 2.11 ms), the
   p999 in 4 of 12 (0.70-4.56 ms).
 
+## 84a on macOS: the refining job's turns paced, measured and rejected, two arms (w-perf; 2026-11-22)
+
+**What was measured first.** Under TB, every deferred reply of the loaded edit and merge was stamped with the
+`state::deliver` call that queued it (diagnostic branch `diag-measurer-w-perf-84a`, never main; CI macos-latest,
+3 CPUs, runs 44999419622, 45000596198, 45002216958, 45003559966, 45005328491). About 16,500 of the ~58,000 requests a
+round are deferred replies:
+- 6,012 plain forwards to the owner shard and back: taken -> written p999 88-344 µs. The owner's and the origin's
+  kick -> run medians were 7-21 µs, so the forward's two wakes are not the 1 ms tail.
+- 9,000 submits parked behind their refinement (A-787 part 2), resumed by the job's end (`refining.rs`) and answered by
+  `verbs::answered_on`: taken -> written p999 850-3,105 µs, the tail. Their legs, as medians of the p99 tail:
+  - before the park 36-73 µs;
+  - the job 132-247 µs;
+  - the resumed run (the verb again, its commit) 159-320 µs;
+  - home 30-46 µs;
+  - the write 16-24 µs.
+- The job yielded after each of its 10 to 12 units.
+- The resumed run is all CPU: wall minus thread CPU 0-1 µs at every percentile, so it is not preempted or demoted.
+- Inside it, no checkpoint ran, in 0 of 27,000. A shard publication ran in 6,000 of 9,000, but the verb's CPU is the
+  same with or without one (p99 166-209 µs against 180-205 µs).
+- No code path is singled out for the verb's own CPU tail, about 4 times its median.
+
+**The arms.** B1 (888cde6d6): the job's units run in A-783's paced turns (`vcs_store::paced_turn`), going on while no
+one else waits, up to the shard's ceiling. B2 (7d82bdfdb): the same, each turn ending at its own quantum whoever waits.
+Red first for both: `a_small_rewrites_refinement_runs_its_units_in_paced_turns` (main: a turn a unit, 9,557 of them in
+a debug build; B1: 7,764 units in 6 turns; B2: 7,505 units in 7,341 debug turns).
+
+**The runs.** CI macos-latest (3 CPUs), one job each, the arms interleaved: `edit_merge_bench` loaded (two spinners a
+CPU) and quiet, then `provision_bench`. Each cell is a round's median of its runs, µs, every round in order.
+
+Run 45006705328 (`diag-measurer-w-perf-84a-ab`), A = b099adee4 (main with TB) against B1:
+
+| | A | B1 |
+|---|---|---|
+| loaded accept p999 | 1585 · 1151 · 4341 · 2046 · 2832 | 1158 · 589 · 2594 · 1443 · 2688 |
+| loaded conflict p99 | 472 · 510 · 508 · 504 · 445 | 838 · 699 · 630 · 404 · 464 |
+| loaded conflict p999 | 1706 · 1346 · 1927 · 1355 · 1159 | 1454 · 3418 · 2745 · 809 · 1218 |
+| quiet accept f10 p50 | 283 · 182 · 164 | 381 · 273 · 230 |
+| quiet accept f10 p999 | 1258 · 544 · 448 | 2756 · 1314 · 1779 |
+
+Run 45010946191 (the same branch), A against B1 against B2:
+
+| | A | B1 | B2 |
+|---|---|---|---|
+| loaded accept p99 | 1284 · 560 · 525 · 484 · 389 | 446 · 452 · 400 · 426 · 401 | 457 · 491 · 365 · 567 · 460 |
+| loaded accept p999 | 2593 · 627 · 701 · 841 · 646 | 689 · 1364 · 499 · 603 · 541 | 722 · 684 · 552 · 768 · 984 |
+| loaded conflict p99 | 565 · 340 · 284 · 440 · 381 | 460 · 376 · 873 · 379 · 409 | 400 · 545 · 304 · 514 · 405 |
+| loaded conflict p999 | 1238 · 457 · 484 · 821 · 512 | 716 · 582 · 1592 · 510 · 772 | 811 · 1267 · 424 · 1521 · 823 |
+| quiet accept f10 p50 | 195 · 184 · 154 | 219 · 160 · 148 | 160 · 146 · 150 |
+| quiet accept f10 p999 | 1573 · 593 · 354 | 676 · 452 · 489 | 976 · 561 · 610 |
+| quiet conflict f10 p999 | 2580 · 435 · 414 | 748 · 1368 · 480 | 496 · 370 · 373 |
+| R9 spinning p99 | 247 · 115 · 122 | 242 · 216 · 239 | 128 · 110 · 108 |
+
+**Rejected, both.** Main's rule (2026-11-22): win the loaded p99 and p999 of both forms, and hold the quiet f10 p50
+and p999 within A's spread, round by round.
+- B1 wins accept p999 (5 of 5 in the first run, 4 of 5 in the second). It loses conflict p99 (3 of 5 in the first run)
+  and is mixed on conflict p999. Its quiet loss in the first run (3 of 3 rounds) did not repeat in the second.
+- B2 wins accept p99 in 3 of 5 rounds and ties accept p999 (median 722 against A's 701). It loses conflict p99 in 4 of
+  5 and conflict p999 in 3 of 5. It holds quiet.
+- A's own spread on one runner (loaded p999 457-2,593 µs here; main's run 45009478174: loaded p999 over 1 ms in 9 to 14
+  of 15 rounds in each of its own two arms) exceeds any arm's difference. The refining job's leg is real, but not what
+  decides 84a's p999 on these runners.
+- Rejected: a dead-even A/B does not land.
+
+## 84a on Linux: the round-robin real-time class for the shards and the client's park, measured and rejected (w-perf; 2026-11-22)
+
+**What was measured first.** CI's Linux runners (4 CPUs, two spinners a CPU), the shards' and the client's parks stamped
+(diagnostic branch `diag-measurer-w-perf-84a`, never main; runs 45017505026, 45018893846):
+- Kernel 7.0.0-1017/1020-azure, `CONFIG_HZ=1000`, `CONFIG_PREEMPT_LAZY=y`, the scheduler features `RUN_TO_PARITY`,
+  `WAKEUP_PREEMPTION` and `PREEMPT_SHORT` on, `base_slice_ns` 2,100,000.
+- No timer was late. A woken or runnable shard did not get its CPU against the spinners.
+  - ubuntu-24.04-arm: a kicked shard ran 920 µs after its kick at the median and 2,990 µs at p99, in about 22,000 of
+    35,000 kicks a round, its kick on time.
+  - ubuntu-latest: a runnable shard took requests 2.8-3.9 ms after they landed, in the p99 tail.
+- The runner account's `RLIMIT_RTPRIO` is 0 soft and 0 hard (g220's probe, run 44991298743, likewise; `chrt -r 1`
+  refused). So the arms were measured under an administrator's grant, `sudo prlimit --rtprio=1:1` on each step's
+  shell, for every arm alike. The daemon asks nothing (R10).
+
+**The arms** (branches `diag-measurer-w-perf-84a-linux-ab` and `agents/w-perf-84a-arm-d2`, never main; A = d2c6635a2, main
+4a1686023 plus the loaded form's throughput line):
+- B 21179849c: a tracking runtime's shards take `SCHED_RR | SCHED_RESET_ON_FORK` at the class's lowest priority where
+  `RLIMIT_RTPRIO` grants it and `RLIMIT_RTTIME` is unlimited (grant or skip), and park at once when idle.
+- C' 2c69390ba: the shards spin R9's floor alone at RR (50 µs against the class's 100 ms timeslice, 0.05%), plus the
+  client's synchronous reply wait in RR for its park alone: `sched_getattr` before, the exact `sched_setattr` after, a
+  refused restore the call's typed refusal.
+- D' 7cba67b4a: B plus the client's park in RR.
+- C and D first raised the park with `SCHED_RESET_ON_FORK`. An unprivileged thread can never clear that flag, so every
+  restore was refused EPERM, and the fallback's plain `SCHED_OTHER` too (run 45023871879). C' and D' raise the park
+  without it (the thread is blocked in its wait and forks nothing), and the fallback lowers keeping the flag.
+
+**The stamped run** (45020845000, A against B, stamped). Kick -> run on ubuntu-24.04-arm: p50 921 · 921 · 921 µs (A)
+against 8 · 8 · 8 (B); p99 2,987-2,989 against 13-18. The x86 p999 tail's queued hop: 2,993-3,054 against 4-5. The tail
+moved to the client's time-share wake (written -> seen in the p999 tail 57-60 µs in A, 2,531-2,979 in B).
+
+**The four-arm run** (45036903025, both runners, 5 loaded and 3 quiet rounds interleaved, every arm's `round_robin`
+tests green and A's red, the client's parks taken 3,236-8,588 a run with no restore refused). Each cell is a round's
+median, µs.
+
+ubuntu-latest:
+
+| | A | B | C' | D' |
+|---|---|---|---|---|
+| accept p99 | 3997 · 3998 · 3998 · 3184 · 3998 | 1997 · 1998 · 1995 · 1999 · 2000 | 1878 · 2640 · 2202 · 2392 · 2576 | 2374 · 1965 · 3353 · 2669 · 2667 |
+| accept p999 | 5997 · 6090 · 5240 · 5980 · 5995 | 3091 · 2474 · 3158 · 3445 · 2989 | 4143 · 3987 · 4719 · 4205 · 4138 | 3538 · 3562 · 4591 · 4529 · 3691 |
+| conflict p99 | 4127 · 5990 · 3295 · 4004 · 3300 | 2000 · 2002 · 2004 · 2002 · 2003 | 1709 · 1445 · 1353 · 1908 · 1760 | 2813 · 2216 · 2696 · 2195 · 2195 |
+| conflict p999 | 6000 · 6114 · 4196 · 6000 · 6054 | 3134 · 3067 · 3989 · 2995 · 3181 | 3106 · 2965 · 4217 · 3344 · 3899 | 4128 · 3965 · 4968 · 3830 · 3824 |
+| load, M spinner turns/s | 121-127 | 122-131 | 95-100 | 102-106 |
+| quiet accept p50 | 127 · 129 · 152 | 152 · 145 · 159 | 127 · 126 · 169 | 164 · 161 · 164 |
+| R9 spinning p99 | 100 · 100 · 98 | 96 · 99 · 101 | 122 · 121 · 99 | 104 · 94 · 123 |
+
+ubuntu-24.04-arm:
+
+| | A | B | C' | D' |
+|---|---|---|---|---|
+| accept p99 | 340 · 325 · 325 · 326 · 336 | 215 · 1998 · 2997 · 1998 · 1998 | 938 · 1531 · 1650 · 1061 · 1801 | 2085 · 1799 · 2187 · 1739 · 2521 |
+| accept p999 | 3995 · 3993 · 368 · 358 · 1462 | 2343 · 2483 · 3001 · 2390 · 2706 | 4111 · 3716 · 4307 · 4462 · 4490 | 4139 · 3924 · 4098 · 2523 · 4239 |
+| conflict p99 | 881 · 827 · 428 · 2728 · 732 | 187 · 2001 · 2001 · 2001 · 2005 | 295 · 1468 · 365 · 313 · 170 | 2619 · 1668 · 1306 · 2119 · 2002 |
+| conflict p999 | 4002 · 1974 · 2823 · 5000 · 2968 | 2486 · 2632 · 2655 · 3001 · 3449 | 4058 · 4832 · 3188 · 4139 · 3886 | 5648 · 3976 · 4036 · 3811 · 4047 |
+| load, M spinner turns/s | 359-363 | 346-363 | 258-270 | 286-290 |
+| quiet accept p50 | 114 · 118 · 110 | 146 · 149 · 151 | 115 · 119 · 117 | 158 · 155 · 163 |
+| R9 spinning p99 | 90 · 84 · 103 | 115 · 115 · 115 | 82 · 91 · 106 | 120 · 113 · 113 |
+
+**Rejected, all three.**
+- None meets 1 ms loaded.
+- C' is the best RR arm on conflict p99, and its floor spin holds the quiet path and R9 within A's spread. But its
+  accept p99 is 0.94-2.6 ms (A's on ubuntu-24.04-arm is 325-340 µs), and it costs the spinners 20-27% of their
+  throughput: each real-time client wake preempts one.
+- B loses the quiet path (accept p50 +10-35%, R9 p99 up to 115 µs).
+- D' loses most.
+- The tail that remains is structural, and still pinned at whole milliseconds. The client's own code between its
+  parks runs time-share by design: the user's code never runs at real-time priority. With two spinners a CPU and a
+  2.1 ms base slice under lazy preemption it waits whole slices.
+- Stock runner accounts grant no `RLIMIT_RTPRIO` at all, so even the arms' best case exists only under an
+  administrator's grant.
+
+## 84a on Linux: EEVDF's requested slice for the shards and the client's park (arm E), measured and rejected (w-perf; 2026-11-22)
+
+**The arm** (E 0b568ac91 on A d2c6635a2, branch `agents/w-perf-84a-arm-e`, never main). It uses no privilege and no
+real-time class.
+- A fair thread may ask its own slice through `sched_setattr`'s `sched_runtime` (Linux 6.12 and later). The kernel's
+  unprivileged checks of a fair policy judge its nice alone (`user_check_sched_setscheduler`), and `sched_getattr`
+  reports the slice back. With `PREEMPT_SHORT` on, a waking task with a shorter slice may cancel the running one's
+  `RUN_TO_PARITY` protection.
+- `slates_machine::fair_slice`:
+  - a tracking runtime's shards ask a slice of their idle window, R9's floor (50 µs; the kernel held 100 µs, its least);
+  - the client's synchronous reply wait asks the daemon's published window for each park, its whole scheduling put
+    back after.
+
+**The run** (45056790029, the stock runner account, no grant; plain A and E interleaved, 5 loaded and 3 quiet rounds;
+stamped builds A_diag2 7f9a3ff66 and E_diag 58f792741 interleaved, 3 loaded rounds).
+- E's tests pass, and A's red is confirmed.
+- The client's sliced parks were taken 5,827 a run, with none skipped and no restore refused.
+- Each cell is a round's median, µs.
+
+ubuntu-latest:
+
+| | A | E |
+|---|---|---|
+| loaded accept p99 | 3242 · 2921 · 3993 · 2889 · 2664 | 1820 · 1642 · 1342 · 1282 · 1672 |
+| loaded accept p999 | 6082 · 4746 · 3996 · 3335 · 3210 | 1950 · 1844 · 2067 · 1992 · 1962 |
+| loaded conflict p99 | 3230 · 3999 · 3999 · 4001 · 3016 | 1291 · 1287 · 1281 · 1352 · 4000 |
+| loaded conflict p999 | 4204 · 5749 · 5516 · 6144 · 3333 | 1936 · 1824 · 1900 · 1936 · 4016 |
+| load, M spinner turns/s | 127-138 | 128-137 |
+| quiet accept p50 | 88 · 88 · 89 | 124 · 112 · 123 |
+| R9 spinning p99 | 59 · 68 · 69 | 84 · 72 · 71 |
+| stamped: p999 tail's queued hop | 3056 · 3004 · 3089 | 759 · 995 · 778 |
+
+ubuntu-24.04-arm:
+
+| | A | E |
+|---|---|---|
+| loaded accept p99 | 3995 · 395 · 3993 · 2995 · 404 | 664 · 345 · 3997 · 392 · 354 |
+| loaded accept p999 | 4994 · 3994 · 5992 · 4994 · 1336 | 1630 · 360 · 5996 · 1091 · 391 |
+| loaded conflict p99 | 843 · 868 · 343 · 3999 · 3999 | 3999 · 328 · 342 · 798 · 875 |
+| loaded conflict p999 | 2765 · 1988 · 1792 · 5001 · 5999 | 5000 · 732 · 963 · 4002 · 2849 |
+| load, M spinner turns/s | 360-363 | 359-363 |
+| quiet accept p50 | 114 · 108 · 111 | 119 · 117 · 115 |
+| R9 spinning p99 | 85 · 83 · 86 | 90 · 88 · 89 |
+| stamped: kick -> run p50 / p99 | 920-922 / 2987-2990 | 915-916 / 998-999 |
+| stamped: p999 tail's client wake | 59 · 60 · 60 | 983 · 989 · 985 |
+
+**Rejected, and the floor measured.**
+- E cuts the loaded tail with the neighbours' share level: x86 p999 from 3.2-6.1 to about 1.9 ms, and arm in 4 of 5
+  rounds.
+- But a wakeup's p99 pins at one tick: kick -> run 998-999 µs, and the client's wake 983-989 µs. Under
+  `CONFIG_PREEMPT_LAZY` at `HZ=1000` a woken fair task still waits for the next tick.
+- A loaded edit and merge has a shard hop and the client's wake, so it floors at about 1.3-2.0 ms p99 on x86, and a
+  bad round still reaches 4 ms on arm.
+- It also costs the quiet path on x86: quiet accept p50 +30-40%, R9's p99 +15-20%, and more system CPU.
+- In the fair class on these kernels, 84a's 1 ms loaded bar is below the tick: unreachable by any arm that keeps the
+  daemon and the client fair.
+
+## 84a on macOS: the doorbell thread under the time-constraint policy, measured, not landed (w-perf; 2026-11-22)
+
+**What was measured first.** The diagnostic branch is `diag-measurer-w-perf-84a-mac-tail` (never main; CI
+macos-latest, 3 CPUs, two spinners a CPU, TB as on main). Each loaded run ranked only the bench's timed requests and
+joined them to their taking shard's parks:
+- Runs 45065854565 and 45067781801: in 6 of 8 rounds of the first run, 7 to 11 of the 12 p999-tail requests landed
+  while their shard was parked. Their parks ended 0.2 to 13 ms after the landing.
+- 47 of 48 such parks ended tens to hundreds of ms before their own timeout, so the wake was late, not lost.
+- The park stamp could not say which wake. Only `registry::kick_if_parked` records a kick; the doorbell thread and
+  Linux's client eventfd call `Kick::kick` directly.
+- A stamp per hop then named the late one. The client saw the shard's idle announcement and rang within 2 to 8 µs. The
+  doorbell thread then woke 0.15 to 12 ms after the ring (p999-tail medians; max 17 ms). Its kick and the shard's run
+  took tens of µs.
+- No wake was lost: every ring was followed by the bell thread's wake and its kick of that shard.
+- Linux (run 45067930278, both runners) has no doorbell thread: a parked shard ran 7 to 14 µs after the landing.
+  Linux's p999 is queued and served time on shards that were not parked.
+
+**The arm** (6aa639211, env-gated `G222_BELL_TB` on the diagnostic branch): the doorbell thread asks for the shards'
+policy (`time_constraint::set_current_from` with the shards' window, macOS only). The kernel took it in 16 of 16 runs
+(computation 50 µs).
+
+**The run.** Run 45069134608: one job, 8 rounds, base and arm alternating, each a quiet run and a loaded run, with the
+control (`g222_floor` under the same policy) beside every loaded run. Cells are the bench's pooled goal lines
+(3 × 1,000 samples), µs, rounds in order.
+
+| | base | arm |
+|---|---|---|
+| loaded accept p999 | 877 · 685 · 1094 · 1261 · 813 · 5045 · 6719 · 5669 | 709 · 898 · 1430 · 1164 · 10136 · 7446 · 4849 · 4597 |
+| loaded conflict p999 | 862 · 1012 · 538 · 968 · 1414 · 6226 · 14235 · 5997 | 603 · 1087 · 708 · 460 · 2068 · 6055 · 5810 · 6313 |
+| loaded accept p99 | 600 · 310 · 446 · 450 · 451 · 1803 · 1522 · 899 | 478 · 562 · 568 · 591 · 558 · 1451 · 938 · 750 |
+| loaded conflict p99 | 504 · 363 · 386 · 460 · 505 · 2054 · 4479 · 881 | 359 · 468 · 454 · 315 · 587 · 1903 · 865 · 608 |
+| quiet accept p50 | 165 · 145 · 150 · 282 · 264 · 302 · 286 · 290 | 324 · 151 · 158 · 162 · 350 · 251 · 372 · 315 |
+| quiet accept p99 | 412 · 673 · 533 · 609 · 747 · 813 · 1117 · 567 | 972 · 502 · 779 · 481 · 1503 · 1058 · 941 · 859 |
+| rung -> bell woke, p99 tail median | 42 · 11 · 6 · 269 · 13 · 1450 · 2133 · 538 | 6 · 7 · 7 · 4 · 7 · 8 · 7 · 5 |
+| rung -> bell woke, p99 tail max | 515 · 1023 · 153 · 2891 · 719 · 13480 · 16873 · 9150 | 11 · 199 · 11 · 12 · 9 · 622 · 1129 · 34 |
+| control p999 median | 66 · 39 · 38 · 49 · 49 · 111 · 57 · 69 | 38 · 40 · 46 · 39 · 64 · 99 · 70 · 75 |
+
+**Not landed.** The test set before the run had three parts: the ring-to-wake hop falls to the shards' band, the timed
+p999 is under 1 ms in most rounds, and quiet is no worse.
+- The hop passes: 4 to 8 µs medians in every round, against base's 6 to 2,133.
+- The p999 fails in both arms: both forms are under 1 ms in 1 of 8 rounds each. The median over rounds is accept 3,013
+  against 1,178 and conflict 1,578 against 1,213. The loaded p99 is under 1 ms in 7 of 8 rounds against 6 of 8.
+- Quiet is not shown no worse: accept p99 is worse in 5 of 8 rounds (median 900 against 641). The p50 is even.
+- With the bell hop fixed, the arm's p999 tails (rounds 5 to 8) are served time inside `serve_loop` polls of 4 to
+  15 ms, attributed to the task's own CPU. Base's rounds 6 to 8 are the same. That is a bounded-work bug (§3), and it
+  binds 84a's macOS p999 whatever the bell does.
+- **Retry condition:** run the same A/B again once `serve_loop`'s polls are bounded to their quantum.
+- Also seen once (arm round 5): four tail requests whose client rang 13 ms after publishing. The client thread was
+  descheduled between its push and its read of the announcement. It is watched, not acted on.
+
 ## The client's reply wait, arm C: measured and rejected, B (A-799) stays (85a; g222's last step, recorded by w-provision-gate; 2026-11-21)
 
 **The run.** GitHub run 44884335146 (branch `diag-measurer-g222-20`, "g222 A/B/C of the client reply wait on every
@@ -18139,3 +18380,34 @@ four times the lane's. The owner's step fell from 502-594 to 270-299 ms and the 
 run to none. Datagram batching (main's 2026-11-20 23:50 step 5) is not shown needed by any measurement and is dropped
 (main, 2026-11-21 14:56). The holder route passes 5/5 at 320 and 512 MiB (r2), which counts toward the lane's proof;
 the bench's local 512 MiB submit still ends in exit 4 (one step of 1.05-1.09 s of CPU) until w-work-cow's A-841 lands.
+
+## A-825's load regression closed by A-854: a small increment carried in its chain entry (w-shared; main 01a20182's A/B, 2026-11-22)
+
+**Question.** Chain entry format 6 (A-825) held every increment in the owner's content store, so every accept published
+the whole shard before its entry was appended. d44f0166a cut that to one publication an accept, not none. A-854 (main
+205e7e828) carries an increment up to min(1 MiB, the chain cap / 64) in its entry, so the accept publishes nothing. Done
+when B's SubmitAccepted p50 is within 10% of A's in every round.
+
+**Command.** Release `load_bench --tree linux-v7.4-rc1/fs (2,365 files, 51 MB) --clients 1000 --hot-files 800
+--per-connection 32 --rounds 20 --reply-patience 60 --think-us 50000`. A = 544020bd2 (A-825's parent), B = 059578d78
+(has 205e7e828), interleaved A B B A A B. Hardware: main's MacBook Pro (Adas-MacBook-Pro-2, 18 CPUs, macOS arm64), under a
+load of 40 to 65 from other sessions, because kiln's API was hung since about 00:40. Logs:
+`~/.cache/main-01a20182/r7/` on that MacBook (summary.txt, run-{1..6}-{A,B}.log).
+
+| run | arm | SubmitAccepted p50 / p99 (ms) | SubmitConflict p50 | Rebase p50 | Edit p50 | server SubmitAccepted p99 | server Round p99 | verdicts/s | wall |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | A | 2.64 / 155.8 | 4.15 | 5.59 | 0.45 | 151.5 | 1,629 | 1,207 | 34 s |
+| 2 | B | 1.05 / 49.0 | 1.30 | 0.80 | 0.72 | 14.4 | 116 | 2,561 | 16 s |
+| 3 | B | 1.19 / 52.8 | 1.57 | 0.86 | 0.75 | 16.7 | 164 | 2,451 | 17 s |
+| 4 | A | 9.54 / 221.4 | 12.26 | 17.56 | 2.00 | 213.2 | 2,601 | 925 | 45 s |
+| 5 | A | 13.47 / 213.0 | 18.14 | 25.83 | 1.48 | 211.0 | 2,613 | 990 | 42 s |
+| 6 | B | 0.66 / 13.2 | 0.69 | 0.47 | 0.40 | 8.6 | 35 | 3,601 | 11 s |
+
+Every run: oracle failures 0, refusals 0, lost 0.
+
+**Reading.**
+- B's p50 is at or under A's on every kind, so the done condition is met. B's tails are 3 to 15 times smaller.
+- Neither arm meets load_bench's 1 ms p99 bound at this machine's load. That is informational, not this A/B's question.
+- Beside it, the quiet reference: on the big Studio (M3 Ultra, 32 cores, 2026-11-21 23:03) A's SubmitAccepted p50 was
+  0.38 to 0.45 ms. On the same hardware B at a3e673efc (format 6 with d44f0166a, before A-854) was 356 to 429 ms.
+- A-825 is closed by A-854 (GAPS).

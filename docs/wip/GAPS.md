@@ -80,6 +80,31 @@
 > before an entry's append (A-825 "Cost owed"), measured by the lane's release bench; since A-854 paid only by an
 > increment over 1 MiB, the smaller carried in its entry.
 
+> **Open (w-shared, 2026-11-22; main 01a20182 03:17, 04:24 PST): a landed git push keeps 772-787 MiB resident for a
+> 56 MB pack** (git_interop `the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the_history`,
+> git/git v2.0.0, release, the MacBook; bound 178.2 MiB). Attributed by the memory status's gauges (`mem.gauge.*`,
+> `crate::memory_gauges`, landed with this entry), in MB after the push: the system allocator's live blocks 55.9 (of
+> them the index tables 23.5); the repository's windows 61.3 in shard 0's arena and the pushed pack 53.9 on shard 1;
+> the 14 startup mapped blocks 13.8 resident; the rest, about 550-600 MB, is freed memory the system allocator kept
+> after the push's 971 MiB peak (its temporaries under the 1 MiB mapped floor). After the clone the git Repository's
+> objects read lately hold 53.9 more. The source of (1), measured: v2.0.0's 164,488 objects inflate to 2,301 MB, none
+> of 1 MiB or more, each kept as its own buffer by the push's objects read lately (`packed::Recent`, budget the pack's
+> length) and freed oldest first. (1) LANDED A-861: those objects lie in chunks of the mapped floor, given back whole;
+> red, 20,000 objects of 4 KiB kept grew the system path's live bytes by 6,582,872, green under a tenth of the budget, and
+> a third round's churn under a hundredth (`crates/git/tests/recent_ring.rs`); main's RSS round owed (run-requests).
+> Main's r15 at abcadd753 (A-861 and its charge): peak 531.2, after the push 327.4, after the clone 365.9 MiB, against
+> 815.2, 667.5 and 737.8 at f577268d3; still past the bound 177.7. (2a) LANDED A-863: a read of a let-go window brings it
+> back from the node's store; the RSS test now prints the memory gauges at each reading. git's driver hook (w-git): a
+> fetch's and an encoding's packs made resident before they read (`vcs_store::upload::resident`), and a window an
+> encoding turn met let go brought back before the next; a let-go must wait for no fetch live and no encoding under way,
+> since a pack's answer cannot be taken again mid-pack byte for byte. (2b)(a) LANDED (w-shared): a landed push's staged
+> pack let go once no fetch is answered and no encoding runs (else owed to the idle give-back), whatever its windows'
+> holders (`ContentStore::let_go_landed`), every window a home holds here kept (`vcs_store::landed_pin`; a one-shard
+> daemon lets nothing go until (2b)(b), homes' own read-through, next).
+> Owed, in main's order: (1) the push's temporaries cut at their source (w-shared);
+> (2) landed windows and the pack let go once durable (w-shared, with w-git); (3) the recent-objects cache given back
+> after a fetch (w-git); (4) the index tables, decided after.
+
 > **FIXED (w-shared, 2026-11-22; goal 93, svn finding (2), main 01a20182 00:19 PST): a chain entry's buffer was reserved at
 > the admission's bound,** which counts the increment's whole post-state, though a text's splice names it by reference:
 > every imported text cost an allocation of its own size (26.2 MB for 25.6 MB of text in w-svn's attribution,
@@ -89,11 +114,20 @@
 > (`an_entrys_buffer_is_reserved_at_its_length_not_its_texts`). The finding's other copies are their owners'
 > (`inbox/main-from-w-svn-finding2-sites.md`).
 
-> **Open (found by w-shared, 2026-11-22): `repository::tests::each_verb_moves_the_names_log_and_each_members_version_its_own_log`
-> fails on main,** before A-854 too (b00ed749a, a3e673efc plus a test; macOS arm64, debug): "the doubling rule's inputs
-> say fold, yet no checkpoint was taken: FoldInputs { floor: 2, to_fold: 532, held_bytes: 0 }". Not bisected further; a
-> likely cause is 2d078e4fa (A-579's last step: the checkpoint held a chunk a paced quantum, so it may end after the
-> step that asked for it, where the test's `write_until_folded` reads the floor at once). Main's to route.
+> **FIXED (w-shared, 2026-11-22; main 01a20182 02:23 PST): `repository::tests::each_verb_moves_the_names_log_and_each_members_version_its_own_log`
+> failed on main** ("the doubling rule's inputs say fold, yet no checkpoint was taken: FoldInputs { floor: 2, to_fold:
+> 532, held_bytes: 0 }"). Bisected: it passes at 2d078e4fa^ (40d816c29) and fails at 2d078e4fa (A-579's last step, piece
+> 1), each built in its own target (macOS arm64, debug). Cause: since 2d078e4fa a checkpoint's hold yields after a unit
+> when anything waits on the shard (`others_waiting`; here a repository build's task), and the rest runs as
+> `checkpoint_in_turns`, a task no turn of which runs inside the test's one step. The shard counted
+> `merge.checkpoint.in_turns` 1 after one 85 µs hold step. The test then read the floor and concluded no checkpoint was
+> taken. That was the decision taken from the hold: the pacing is A-579's design, and the product's readers (the base
+> check, the recovery sweep) read the recorded floor, where a checkpoint in turns is simply not yet taken. Fix, tests
+> only: `merge_service::settle_checkpoints` (cfg(test)) takes each checkpoint still in turns whole, its stage giving way
+> as at the chain's cap, the way `whole_build::settle` does for a build. `write_until_folded` calls it after each write.
+> The sweep found one sibling that held only because nothing waited on its shard:
+> `verbs::tests::a_green_replays_from_its_checkpoint_and_a_corrupt_one_is_fenced` (its `green_at_version_one`), now
+> settled too. `repository::tests` 3007's test drives the turns through the daemon on purpose and is unchanged.
 
 > **FIXED (w-fed-faults, 2026-11-21): a whole-file rewrite outside a recorded request was refused `Overloaded`**
 > (A-787 part 2's park, 2a498b90f). 10 server lib tests (repository, vcs_store paths and commits) failed from that
@@ -187,6 +221,24 @@
 >   98-137 against 213-242 million turns a second: not starved, but the daemon now takes the CPU it needs ahead of them.
 >   No demotion was seen. **Open:** 84a's bar on macOS. The p99 is under 1 ms in 11 of 12 round medians, the p999 in
 >   4 of 12. The client-only arm (TC) was measured and rejected (p999 up to 29.9 ms).
+>   The refining job's turns paced (A-783's turn, to the ceiling or to its own quantum), measured and rejected (w-perf,
+>   2026-11-22; BENCHMARKS "84a on macOS: the refining job's turns paced"): dead even with main on one runner's
+>   interleaved rounds. Stamped under TB, the loaded tail's deferred replies are submits parked behind their refinement
+>   and resumed. A plain forward's two wakes measure 7-21 µs from kick to run, and the resumed run is all CPU (not
+>   demoted). Main's own interleaved A/B (run 45009478174) misses p999 in most rounds in both arms; the gap stays open.
+> - **Linux, the round-robin real-time class for the shards and the client's park, measured and rejected (w-perf,
+>   2026-11-22; BENCHMARKS "84a on Linux: the round-robin real-time class").** On CI's runners (kernel 7.0,
+>   `PREEMPT_LAZY`, `RUN_TO_PARITY`, 2.1 ms base slice) a woken shard waited for its CPU: kick -> run p50 920 µs, and
+>   8 µs in `SCHED_RR`. But with the shards and the client's park in the class, the client's own time-share code still
+>   waits whole slices: accept p99 0.94-2.6 ms, p999 3.0-4.8 ms, and the spinners lost 20-27% of their throughput. The
+>   runner account's `RLIMIT_RTPRIO` is 0:0, so even that needs an administrator's grant.
+>   EEVDF's requested slice (arm E, no privilege; BENCHMARKS "84a on Linux: EEVDF's requested slice") cut the loaded
+>   tail with the neighbours' share level (x86 p999 3.2-6.1 -> ~1.9 ms). But a wakeup's p99 pins at one tick (kick ->
+>   run 998-999 µs, the client's wake 983-989 µs under `PREEMPT_LAZY` at `HZ=1000`), so a loaded edit and merge floors
+>   at about 1.3-2.0 ms p99. It also cost x86's quiet p50 30-40%, so it is rejected too.
+>   **Open (main to Ada):** 84a's 1 ms loaded bar on Linux. In the fair class it is below the kernel's 1 ms tick, and
+>   in the real-time class the client's own time-share code waits whole slices. The measured floor is about one tick a
+>   hop, 1.3-2.0 ms p99.
 > - Windows (CI, run 44857045148): no 1 ms band (queued p99 5–49 µs); accept p99 0.13–0.31 ms, conflict 0.11–0.29 ms;
 >   p999 0.2–62 ms. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–7).
 >
@@ -494,6 +546,104 @@
 >     7.2 streams the imported repository and verifies it clean.
 > - The two recovery tests that polled a register-held import record by hand are gone with that path; the restart test
 >   holds the run's recovery.
+> **A stock client's push of a long history refused past its one admission (2026-11-22, w-hg; main 01a20182's order of
+> 03:03, w-interop's ubuntu find: `Delta { log: Manifests, .. PastAdmission { asked: 73365, left: 50646 } }`, the push's
+> own earlier deltas having spent it). IN FLIGHT.**
+> - Part 1 BUILT: a refusal past its admission leaves the intake where it was, so the step is taken again whole once the
+>   room grows. `push::intake` `keep_taken` charges everything to a trial of the admission before it keeps the revision
+>   and notes it after (`Taker::read_of` / `apply_read`, `logged_of` / `note_logged`); before, a charge after the keep
+>   refused with the revision already kept, and its retake passed it over unnoted. `Refused::past_admission` names
+>   every such refusal (a charge, the framing, a delta's text, the keeping's room). Held by
+>   `push::intake::tests::a_step_refused_past_its_admission_is_taken_again_whole_in_a_grown_room` (rooms of a quarter,
+>   a half and all but a byte of what the push holds; red with the charges after the keep: 20 kept for 21).
+> - Part 2 BUILT (2026-11-22, w-hg): the push's driver waits for room under w-git's shared `vcs_share::wait::RoomWait`
+>   (A-857; one wait for git and hg) and takes again what was refused in the room it gives. A begin past its admission
+>   begins again; a step past it is taken again, what the push holds charged to the grown room first, and the record
+>   names the room it was taken within, so a replay takes it alike (`hg_push::take_sliced`, `room_after_wait`; counted
+>   `vcs.hg.push_intake_room_waits`). A push whose increments the content store cannot hold for now waits past what the
+>   store could hold and holds them again (`landed_after_builds`; counted `vcs.hg.push_held_ahead_room_waits`, main's
+>   order of 03:35). A need past the most the repository could ever be lent, or a wait past its patience, is refused as
+>   before. Held by `vcs_http::daemon_edge::tests::a_mercurial_push_past_its_first_admission_waits_for_room_and_lands_whole`
+>   (a first room of 64 bytes; red with no wait: `PastAdmission { asked: 127, left: 64 }`) and
+>   `a_mercurial_push_its_store_cannot_hold_for_now_waits_for_room_and_lands_whole` (red: `heads` empty).
+> - Part 3, (a) BUILT (2026-11-22, w-hg; main 01a20182's ruling of 04:23; w-interop's whole-history push of hg refused at
+>   a manifest delta on ubuntu and arm, the push's own keeping having spent the one room it held, a wait for room no one
+>   else held never ending): the push is admitted its known need up front. Its begin decodes the framing, so it knows
+>   every revision before taking one; `Intake::bookkeeping` bounds what its steps will keep (each revision's node, kept
+>   text and path; a changeset's nodes; a manifest's written entries, at most one for each 43 bytes of its delta, and
+>   their paths; each log's name), and `hg_push::admitted_its_need` admits what the begin holds, that, and a step's
+>   room, within the repository's ceiling (what others do not hold, `vcs_share::wait::ceiling`). What it must keep past
+>   the ceiling is refused typed; a step past its room waits, as part 2. Counted `vcs.hg.push_need_admitted`. Held by
+>   `push::intake::tests::an_intakes_bookkeeping_covers_what_its_steps_keep` (the bound over what the steps kept) and
+>   `vcs_http::daemon_edge::tests::a_mercurial_push_is_admitted_its_known_need_and_never_waits_for_its_own_keeping`
+>   (500 changesets, 64 bytes left to the steps after the begin; red without (a): a step waited).
+> - Part 3, (b1) BUILT (2026-11-22, w-hg; main 01a20182's rulings (b1) and (i) of 04:44): a push lands as a run of
+>   segment changesets, as the import does (`repository::hg_run`). Its intake cuts its kept texts into segments of at
+>   least `hg_import::segment_bytes` of its changegroup (`Intake::cutting`), and each lands as it is cut, between the
+>   intake's slices, as an ordinary bounded changeset: `Record` its rows by identity (record v8 of a push's source,
+>   `intake::segment_record`), `Payload` its slice, `Texts` its texts; what its texts charged the admission is given
+>   back once it lands. The entry names the run (record v9 of a push's source, `record::write_push_run_reference`,
+>   golden `a_pushs_run_reference_is_the_golden_bytes_and_reads_back_as_a_pushs`); a replay reads each segment's record
+>   and appends its rows by identity, no payload read (`a_landed_push_replays_as_its_run_of_segments_reading_no_payload`:
+>   6 segments, 0 payload fills). A made changeset keeps one changeset and v7 (`hg_push::take_made`). **The turn**
+>   ((i)): the repository's landing turn (`svn_commit::landing::Turn`, which Mercurial's made changesets hold too) is
+>   taken at the run's first segment, or at the intake's end where it cut none, and held to its commit or give-back; a
+>   same-repository push needing it parks, at most `vcs_share::wait::PATIENCE_NS`, refused typed past it; other
+>   repositories never wait (`a_mercurial_push_parks_for_its_repositorys_landing_turn_and_no_other_waits`). A fork
+>   stale once the turn is taken is taken again inside it from its changegroup; so a push's fork is never stale at its
+>   landing, and the push's re-base (`Rebasing`, `rebase_sliced`, `begin_rebase`) is removed: its only callers were
+>   the push's two drivers (made changesets refuse a stale fork, `hg_made::commit_made`; imports and Subversion never
+>   reached it). Every terminal path ends the turn; a run dropped unsettled settles itself, and a run no entry named
+>   counts its repository's next sequence from the last named again, so the next landing takes its sequences
+>   (`a_dropped_runs_turn_comes_back_and_its_sequences_are_landed_again`: a cancelled task's run, its stand-in
+>   changeset replaced, the rebuild the next push's history). Crash oracle
+>   (`daemon::tests::t_b1_a_crash_at_any_segment_boundary_leaves_a_push_whole_or_absent`): a crash after each of a
+>   push's 3 segments, a second push parked on the turn, leaves a successor holding none of it with no replay refused,
+>   and the push again lands whole at the crashed run's sequences; answered, the successor holds it whole.
+>   **Measured** (`a_small_push_waits_behind_a_whole_history_push_for_its_landing_turn`, MacBook arm64, debug, one run):
+>   a one-changeset push waited 537 ms behind a 200-changeset push cut into 32 segments that took 729 ms; 4,047 ms
+>   behind a 500-changeset push of 488 segments (4 KiB bound) that took 4,358 ms. A small push waits out a long push's
+>   whole run, past the patience for a long enough one; the structural fix is a per-push staging log, the run landing
+>   apart from the repository's log and named in one step, so pushes to one repository need no turn between them.
+>   Owed, main's: the whole-history push on ubuntu and its peak RSS before and after (run-requests.md).
+> - The whole history's clones spun (main 01a20182's order of 2026-11-22 10:40; CI 45037561866: 4 spins, kills and
+>   restarts a leg, at `vcs_http.rs:850` polls 1-16 and `vcs_ssh::hg::streamed_turn` polls ~11,000). Measured over the
+>   served view of a pushed 57,054-changeset line (debug, MacBook arm64, each call the unit one step takes): a clone of
+>   the line's middle (`clone -r`, every pull with something in common too) made its changesets' and manifests' groups
+>   whole in its walk's begin, 4.1 s; a stream gathered the rows of as many logs as its room holds, every revision's
+>   node, in one step. BUILT (w-hg): `getbundle::Named` walks such a fetch a unit a step (a changeset written and its
+>   manifest's files planned, then a manifest a step in its log's order, then the file section), its begin lending no
+>   text (`a_pull_walked_by_its_changesets_lends_no_text_in_its_begin_and_two_at_most_a_step`; the begin at 20,000
+>   changesets 674 to 23 ms), a manifest lent twice, a step each, never kept past it; a stream gathers an ask a content
+>   window's worth of rows a step (`render::rows_a_step`;
+>   `a_streams_ask_for_a_long_logs_rows_is_gathered_a_window_a_step`). Still a walk of the history a call, each well
+>   under the watchdog's window in release: `heads` 194 ms and `branchmap` 603 ms at 57,054 in debug; next if a run
+>   names them.
+> - Part 3, a manifest's written entries kept once BUILT (2026-11-22, w-hg; main's 05:13 order): a whole or null-base
+>   manifest revision's written entries are its every line, and each was kept for the files' check once a snapshot,
+>   the bulk of a whole-history push's 1.37 GB held (main's 04:59 measure). Now a manifest's entries are a step's
+>   working set (charged to a copy); of them the intake keeps only the file revisions the fork lacks, each once across
+>   the push (`Taker::awaited`), refused at once as missing where they would outnumber the file revisions the push
+>   brings, and checked once every file is taken, a window of paths a step, each given back as checked. The bound
+>   (`Intake::bookkeeping`) counts each file revision once more for it, never a manifest's delta; it also counts a file
+>   group's path twice, as the steps charge it (the old manifest term's slack had hidden that). Held by
+>   `push::intake::tests::a_push_of_many_whole_manifest_snapshots_keeps_one_copy_of_their_entries`: a line of 60 then
+>   120 changesets, every manifest a full snapshot, kept 39,844 then 79,624 bytes, the bound the same (red: 134,764
+>   then 456,664, growing with the square).
+> - Not reproduced here, logged: w-interop's fresh repository's first 500-revision push refused at once on CI's x86 and
+>   arm runners (main's order of 03:49 and 03:50). `a_fresh_repositorys_first_push_of_hundreds_of_changesets_is_taken_at_once`
+>   (500 changesets pushed with no gap after the create) passes on this Mac. Every content-store refusal of a held-ahead
+>   increment is now named in the daemon's log, so the next run says which it was.
+> **A push's work counted a file revision's metadata markers as bytes (2026-11-22, w-hg; w-interop's find, ubuntu,
+> `hg push --new-branch -f -r 2000` of hg's own history refused `LengthDiffers { said: 10101, given: 10097 }` on
+> `hgext/hbisect.py`). FIXED.** 2a's `IndexHeld::file_bytes_len` (d93f98369) took a file revision's bytes as its text's
+> length less its block's, but the block the row keeps is what lies between the text's two `\1\n` markers
+> (`filerev::split`), so every revision with a block, empty (a text beginning with the marker, 7.2's escape) or not (a
+> copy), was said four bytes longer than its bytes. Now the block counts with both markers. Held by
+> `push::made::tests::a_file_revisions_length_of_bytes_leaves_out_its_whole_block` (plain, copied, escaped; red: the
+> escaped one said 29 for 25 bytes). Swept: the served view and the index frame a block with its markers against the
+> row's length (`indexed.rs`, `index.rs` `framed_text`), and the intake and the work's own texts split through
+> `filerev::split`; this was the one count off.
 > **C1 step 2 for the import, the import keeping no file text (main 01a20182's ruling of 2026-11-22 00:05). IN FLIGHT.**
 > - 2a BUILT (2026-11-22, w-hg): the read-through. `slates_merge::push::Unavailable::NotYet`, a blob the store holds
 >   but has not at hand: the sliced build (`Building`) takes the unit that read it again once its owner fetched it
@@ -506,6 +656,11 @@
 >   (red without the wait: refused `NotYet`), `hg push::work_tests::a_work_reading_texts_not_at_hand_waits_and_asks_the_store_for_each`
 >   (red with `Missing` for `NotYet`) and `vcs content::an_object_let_go_is_brought_back_whole_by_its_own_bytes`.
 >   Nothing is let go yet, so no behaviour changes until 2b.
+> - 2b part (2a) BUILT (2026-11-22, w-hg; main's ruling (a) of 02:52): a window let go survives a warm restart as let
+>   go (image piece kind 15; `ContentStore::aways`, `away_changes`, `restore_away` before the lists; design section
+>   "Windows let go ride the image"); `ContentStore::let_go_object` lets every window of an object go but those
+>   another holds. Held by `vcs content::windows_let_go_survive_a_restart_as_let_go_and_come_back_by_their_bytes` and
+>   `daemon::tests::t_c1_windows_let_go_survive_warm_restarts_whole_and_come_back_by_their_bytes`.
 > - 2b, next: each import segment's file windows marked landed and let go once the segment is durable; a symlink's
 >   target read again in the walk; main's red (after a fixture import `ContentStore::used` is the changelog's and the
 >   manifests' bytes alone; a clone and a push over the import verify clean against stock 7.2).
@@ -599,6 +754,29 @@
 > answer is admitted its repository's shard room, and a refusal past it before the pack begins is held and made again
 > in a wider room, never cut (`t_…a_clone_of_git_gits_many_refs…`, `a_fetch_past_its_room_waits…`). Owed: main's git/git
 > rounds over it; the SSH edge's wait (it gives a held refusal up at once); a refusal once the pack began still cuts it.
+> A-856 BUILT (2026-11-22, w-git; main 00:30 and 01:55): an encoding's parts are charged to the content store; the task
+> behind a fetch makes fragments ahead only while a fetch is answered and within the repository's learned grant; idle,
+> what is held past the grant is given back (`t_a856_with_no_fetch_answered_nothing_is_encoded_ahead`). Owed: one deflate
+> state a shard (clients: 97 GB of fresh states over one git/git clone); fragments past the grant kept on disk under its
+> grant, not only left unmade; main's RSS round.
+> A-857 BUILT (2026-11-22, w-git; a regression): a deferred build ran within the room its push recorded (a small push's
+> learned demand) and was refused `PastRoom`, so branch, tag and master pushes failed on git/git. Now it runs within its
+> repository's room as it is built and waits for room past it (`vcs_share::wait`, shared with hg). Owed: A-855's fetch
+> wait moved onto it; main's matrix and git/git rerun (master's "cannot lock ref" judged there).
+> A-859 BUILT, part B (2026-11-22, w-git; main 03:38): a git/git clone moved 4-5 GiB, every object whole and
+> uncompressed (the encoder priced a byte at memcpy's 0.14 ns). Now an object pushed in a pack is sent on as its entry
+> lies there, checked against its name first, its delta reused where its base precedes it (`t_a859_…`: 20,916 bytes
+> against the pushed 17,299, where 89,439 went before); a stored entry reused whenever one exists, a delta's wanted
+> base placed first (3fa634049). Part A BUILT: a fetched byte priced at its link, learned per shard from the HTTP
+> edge's writes that waited for the peer, cold at deflate's measured break-even at git's level 6 (§4.11). Owed: the
+> SSH edge's writes heard (SSH fetches price cold), a price per client, not per shard; main's git/git whole round and
+> `fsck --strict`.
+> A-864 BUILT (2026-11-22, w-git; main's r17): a reused pushed entry was rebuilt to be checked (inflated, its base and
+> itself reconstructed, named), so git/git's clone, every entry reused, ran past 120 s. Now each row keeps its entry's
+> raw length, CRC32 and base (git's pack index, A-864); reuse checks the CRC32 and copies, no object read; a miss is
+> rebuilt. Owed: main's git/git whole round.
+> A-860 BUILT (2026-11-22, w-git): a repository gone idle lets go of the objects its reads keep (git.recent_bytes held
+> 53.9 MB after a git/git clone). Owed: the push side's held windows and pack, w-shared's.
 > R2, the load-only edge tests, CLOSED (2026-11-21, w-git): a push's answer under side-band-64k wrote its first
 > keepalive two intervals after its body (`body_end` waited one interval unwritten, then the reply its own before
 > appending it), 10 s, the client's patience, so every push answer past 5 s failed (18 of 18 at load 24, the timing
@@ -664,7 +842,12 @@
 > successor mints a killed creation's id again; its new changeset 0 is the row the store gives, the orphan's never
 > (`a_creation_after_a_restart_never_meets_a_killed_creations_orphaned_changeset`, green unchanged: a `(repository,
 > sequence)` row is the newest landing at it, the only one the register can name). The orphan's log bytes stay until
-> the cleaner of unnamed log space (owed).
+> the cleaner of unnamed log space (owed). Its rows can be forgotten now (2026-11-22, w-hg; main 01a20182's ruling of
+> 12:00, for an abandoned push's run): `Store::forget` / `StoreHandle::forget` drops an unnamed changeset's `C`, `H`
+> and `K` rows and its `P` rows where they name its bytes, and moves each `T` and `I` row it owned to the next
+> changeset that kept the same text (the new `K` keeper rows, by text), the engine checkpointed after so a replay
+> never puts them back (`a_forgotten_changesets_rows_go_and_a_text_another_kept_moves_to_it`,
+> `a_changeset_forgotten_through_the_owner_stays_forgotten_across_a_restart`); its log bytes stay this cleaner's.
 >
 > **A-773 (2026-11-20, w-sessionlog).** BUILT: `slates log [--json]`, the session log naming collided works and landings
 > awaiting a grant first. A-788 serves it over MCP (`slates.log`) and the SDKs' sync clients; owed: their async forms.
@@ -2819,8 +3002,18 @@
 > its chain's best message. Still seen (2 of 12 runs): a hook's first run, which has no learned bound, waits on its
 > words stream past its exit when a process spawned at the same instant elsewhere in the process inherited the
 > stream's write end (macOS has no `pipe2`, so std's pipe is made close-on-exec a call later), until the client's
-> 10 s read gives up. Owed: a ruling on spawning hooks with no inherited descriptors, or ending a drain once the
-> hook's process group is empty.
+> 10 s read gives up. RULED (a) and BUILT, A-858: every child the daemon spawns is handed only its three streams
+> (`slates_ipc::confined_spawn`), and the driver reads an exit the watch posted before it was waitable, the second cause
+> the concurrent-spawn test found. PROVEN on macos-latest (main 01a20182's CI 45018545878, 2026-11-22, at 00844de07):
+> the session ran 33.57 s, past the propset that hung at 120 s, and the guard's deliberate failure left 0 views mounted.
+> The session then went red on `svn status -u -v --xml`, the test's own: the same 15 entries, the same in every
+> field, in two orders, since stock `svn` reports a directory's children in its working copy's hash order, seeded afresh
+> each run. FIXED in the comparison (w-svn): a status's entries are compared in text order, every other output's as
+> answered (`entries_in_order`; `the_comparison_leaves_status_entry_order_out_and_nothing_else`). **CLOSED by use**
+> (main 01a20182's CI 45021179639, 2026-11-22, macos-latest, Homebrew svn 1.15.0, at 272513fe4 on 738b4e0af): the
+> session passes 1 of 1 in 33.54 s, byte for byte against `svnserve`, and the guard leaves 0 views mounted. Owed:
+> w-lint's Linux and Windows cross-target round. Windows spawns no hooks yet (A-622's Windows
+> part), so it has no seam to change.
 > **svn replay by stock clients (w-interop, 2026-11-20; A-703):** `svn-matrix.sh` gains `svnrdump dump` and
 > `svnsync initialize/synchronize` over svn://, each compared with the dump stock svnserve 1.15.0 made of the same history
 > (`crates/svn/fixtures/replay`, `EXPECT_RDUMP`, `EXPECT_SYNC`): over the reads fixtures' repository both are
@@ -3546,6 +3739,13 @@
 > refusal the wire answers without a Subversion number (`BudgetExceeded`, `ContentUnavailable`, `Format`) does not
 > name what landed; the same dump resumes all the same. Owed: the import's time and peak re-measured on git-2000
 > (main's run), which closes P7's finding (3) or not. The entry below is its history.
+> **FIXED (w-svn, 2026-11-22; main 01a20182 03:55 PST, a sibling of finding (2)'s `put_window` cut): a text refused
+> part-way through its put into the content store left its kept windows held for good.** `svn_commit::store_step_from`
+> took the text's writer out of the landing's `Storing` before it read and put the piece, so a refusal (a piece the
+> reader lacked, a window or the finish refused) dropped the writer, and the landing's release found nothing to abandon.
+> The writer now stays in `Storing` until its object is finished, so every refusal leaves it for the release. Red: a
+> 4 MiB text refused half-way left 8 entries, 2,097,152 bytes, after its release; green: the store as it was
+> (`a_text_refused_part_way_through_its_put_leaves_the_store_as_it_was`).
 > **P7's finding (2) OPEN, RED: an import's freed memory is not given back (2026-11-22, w-svn; main 01a20182's ruling of
 > 00:09, option 3).** Main's r11 (git-2000, release): physical footprint 43 MiB before, 527 MiB after 30 s of idle,
 > 484 MiB held. Only 155 MB of it is live (heap in use +104 MB, arena 51 MB); the rest is blocks under A-742's 1 MiB
@@ -3554,11 +3754,56 @@
 > churn for 25.6 MB of text. Red: `an_import_measured` now gates the idle footprint's growth at `HELD_FACTOR` (2) times
 > what the import still holds live. Cut so far (w-svn's sites): the importer's text buffer sized once from its header,
 > admitted first; a stored text streamed into the increment from the store's lent windows, not read back whole; the
-> landing's store pieces lent. Owed: the other owners' copies (the content store's `put_window` and `release_one`; the
-> engine's `judge_held`, two `push_slice`, `Increment::encode`, `chain_entry::encode_carrying`), then A-742's floor
+> landing's store pieces lent; a text put into the content store a copy slice at a time begun with its length
+> (`ContentStore::begin_object_of_length`, w-svn for A-851's absent owner, main's routing of 03:46): its window's buffer
+> reserved once rather than doubled from the first slice, 97.5 MB in 400 allocations to 26.2 MB in 100 for 26.2 MB of
+> text, the band's churn from 10.7 to 8.0 times the text
+> (`an_object_begun_with_its_length_reserves_its_windows_buffer_once`). Owed: the other owners' copies (the content
+> store's `release_one`; the engine's `judge_held`, two `push_slice`, `Increment::encode`), then A-742's floor
 > re-derived by a release A/B only if the footprint still stays (main's ruling). The changeset landing's piece copies
 > are cut too (w-svn, main's routing of 00:57): `slates_store::owner::SlicedLanding::part` answers its buffer emptied
 > once written, and the svn landing fills one buffer a landing (`a_sliced_landings_part_gives_its_buffer_back_to_be_filled_again`).
+> Re-measured (main 01a20182's r12, 2026-11-22, this MacBook, release, at 1721d8c52 with the `put_window` cut): still
+> red, the footprint grown 494,927,872 B against 155,539,920 B live, 181,750,880 B not given back (r4 at 2a8dbcd99:
+> 150,287,136). The cut took allocations out but neither the peak nor what stays. `an_import_measured` now prints the
+> memory status's gauges (w-shared's, `crates/server/src/memory_gauges.rs`) summed over the shards at every reading,
+> and the footprint past the system path's live bytes, the mapped blocks' resident pages and the arenas, so the next
+> reading names the live bytes' holders and what the system allocator kept.
+> The importer's own copy is cut (A-862, w-svn, main's order of 05:28): each text goes into the content store a piece
+> at a time as the dump is read, through the commit drive's `TextSink`, named stored, its hold handed to its landing;
+> no whole text is buffered (`an_import_holds_no_text_whole_on_the_system_heap`: 8 texts of 512 KiB, the system
+> path's churn 4,299,277 B at 2bb00e1cc, 92,309 B now). main's r14 at 2bb00e1cc, before it: 600.3 MB not given back,
+> `process.system_allocated_bytes` 33.59 GB cumulative for a 447 MB dump, live about 190 MB. Owed: the next-largest
+> per-text churners given buffers the import owns (main's routing), and main's gauged re-measure. Next cut (w-svn): an
+> increment's post-state sized once by its texts, where it doubled a text at a time
+> (`an_increments_post_state_is_sized_once_by_its_texts`: 6,000 bytes held for 5,000, now 5,000), the largest of the
+> import's sites in w-svn's sampled in-process attribution (500 files, 300 revisions, 11.65 MB: 168.9 MB allocated at
+> 2bb00e1cc, 156.6 MB with A-862, 142.3 MB with this). r16 (main's daemon, 73e46f842: 51.35 GB against r14's 33.41 GB)
+> was the machine (main's r18, interleaved at one load: 73e46f842 3-5% below 2bb00e1cc, both about 560-600 MB not given
+> back). Then the import's sink keeps one window buffer for all its texts (`ContentStore::begin_object_reusing`,
+> `objects_begun_in_turn_on_one_buffer_never_make_another`): 142.3 MB to 130.7 MB sampled. Next, largest first: the
+> engine's `push_slice` (two sites), `Increment::encode`, `judge_held`; the content store's `release_one` (w-shared's).
+> The engine's splice sizes its file once at what it makes (`engine::made_len`;
+> `a_splice_makes_its_bytes_in_one_buffer_of_their_length`, 6,000 bytes held for 4,000, now 4,000): dead even on the
+> import, which replaces files whole (130.7 to 130.8 MB sampled), and on 300 partial splices over 200 files of 64 KiB
+> 43,945,798 B allocated before, 21,594,432 B after (w-svn's local probe, main's ruling of 11:05). A-865 (w-svn): the
+> svn landing names its stored texts as A-760 runs, its entries recording names, and a cold recovery brings back what
+> its content store lacks before the green's replay; sampled 130.8 MB to 108.0 MB. The append every push shares judges
+> with `judge_named` (w-svn, main's ruling of ~11:50, w-git and w-hg told first and clear), so a named work's read
+> buffers move into its verdict, never cloned (`repository.push.read_cloned_bytes`;
+> `a_named_works_verdict_takes_its_read_texts_and_clones_none`: 50,000 bytes cloned, now 0). Reusing a judged work
+> after a refused append is impossible by construction: `append` takes its changes by value and a refusal gives none
+> back (`a_refused_named_append_is_retried_only_with_a_work_built_again`). main's r29 (big Studio, load ~2, git-2000):
+> A-865's parent passed the give-back check 1 of 2 (499,712 · 300,032 KiB footprint at idle 30 s); 43a6df642 2 of 2
+> (302,080 · 303,104 KiB), RSS at idle 775 MB against 155 MB live, the peak 1.13 GB. Piece (c) ruled out as a swap (the
+> scratch member numbers its own versions; a fast-forward would be w-engine's, paused); option 2 instead: a recorded
+> version's whole-run file takes the run's read buffer with no copy (`Green::apply_recorded` takes its work mutably and
+> moves whole runs as `commit_held` does; `a_recorded_versions_whole_run_becomes_the_file_with_no_copy`), sampled
+> 108.0 MB to 96.2 MB. Owed: the content store's `release_one` copy (w-shared's), the two `read_step`s. Not A-865's: `recovery.rs`'s `an_overlay_whose_base_directory_was_removed_serves_its_own_files_after_a_restart`
+> failed at origin/main 7ced987e6 as well (LOOKUP status, `tests/common/nfs.rs:238`). **Closed (w-interop, 2026-11-22):**
+> A-833's lazy reopen made a gone base directory's first use, its attributes, refuse the directory itself; it now
+> answers from the volume's node, and a reopen that meets the descriptor limit no longer records a live directory gone
+> (`docs/bugs/2026-11-22-overlay-gone-base-directory-first-use.md`).
 > Still to measure: the A-742 floor's A/B only if the
 > footprint still stays (main's ruling). A local 64 KiB floor gave 47 MB of footprint at 2 s idle, against 363 MB, at
 > 19.4 s against 12.0 s (debug).
@@ -25227,8 +25472,10 @@ in what lands. Branch tips as of 2026-11-10:
 > the one publication left was still a whole-shard one on every accept's path, where A had none. A-854 (w-shared): an
 > increment up to 1 MiB is carried in its chain entry (format 7), durable with its append, so its accept publishes
 > nothing; red 8 publications for eight `owner_judge` accepts, green 0
-> (`accepted_owner_submits_cost_publications_that_do_not_grow_with_their_number`); main's A/B owed, done when B's p50 is
-> within 10% of A's in every round). The checkpoint's record LANDED by name
+> (`accepted_owner_submits_cost_publications_that_do_not_grow_with_their_number`); CLOSED by A-854, 2026-11-22: main's
+> interleaved A/B on its MacBook (1,000 clients, Z = 50 ms, A 544020bd2, B 059578d78) put B's SubmitAccepted p50 at
+> 0.66-1.19 ms against A's 2.64-13.47 ms at that machine's load, every kind at or under A's, tails 3 to 15 times smaller,
+> no oracle failures (BENCHMARKS, "A-825's load regression closed by A-854")). The checkpoint's record LANDED by name
 > (goal 93's, main's 15:00: a 1 GiB green's was 650-1,063 ms in one step, record 527 ms): held in the owner's content
 > store a chunk a quantum, published, recorded as `CheckpointRef` (layout 16). OWED, piece 2: its build and encoding
 > are still one step (52 + 71 ms at 1 GiB; 5.7 + 9.5 ms at load_bench's 49 MB), inside the watchdog's 1 s window.

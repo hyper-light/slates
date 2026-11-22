@@ -7,7 +7,13 @@ use super::support::{
 };
 use crate::dump::{CopyFrom, DeltaBase, Digest, DumpError, Format, NodeAction, NodeHeader, Uuid};
 use crate::index::{IndexRefusal, NodeKind};
-use crate::migration::{Exporter, Importer, MigrationRefusal, Properties, Room, Standalone};
+use std::cell::Cell;
+
+use crate::commit::drive::{HeldTexts, StagedText, TextRefused, TextSink};
+use crate::index::ContentIdentity;
+use crate::migration::{
+  Exporter, Importer, Importing, MigrationRefusal, Properties, Room, Standalone,
+};
 use crate::svndiff::{Instruction, SvndiffError, Window};
 
 /// The text the first revision gives `f`.
@@ -322,12 +328,24 @@ fn a_delta_that_reads_past_its_base_is_refused() {
   );
 }
 
-/// A-628 (refusals): do import the first revision into a repository whose room holds revision 0 and the first
-/// revision's properties but not its text, and into one whose index room holds fewer entries than its nodes. Expect
-/// `Room` (`E160000`) at the text and the index's own `Room`, the repository unchanged both times.
+/// A-628 (refusals): do import the first revision into a repository whose room holds revision 0 but not the first
+/// revision's properties; into one whose room holds them but through a sink that holds one byte less than its text (a
+/// daemon's content store past the shard's room: the import's texts are its sink's, never the records', goal 93, P7
+/// finding (2)); and into one whose index room holds fewer entries than its nodes. Expect `Room` (`E160000`) at the
+/// properties within the records' room, `Room` at the text within the sink's, and the index's own `Room`, the
+/// repository unchanged each time.
 #[test]
 fn an_import_past_the_room_is_refused() {
   let dump = first_revision().bytes();
+  let (zero_held, first_properties) = revision_zero_held_and_first_properties();
+  refused_within_the_records_room(&dump, zero_held + first_properties - 1);
+  refused_within_the_sinks_room(&dump, zero_held + first_properties);
+  refused_within_the_index_room(&dump);
+}
+
+/// What a repository holding revision 0 alone holds, and the bytes of the first revision's properties
+/// ([`an_import_past_the_room_is_refused`]).
+fn revision_zero_held_and_first_properties() -> (u64, u64) {
   let mut zero = created();
   let mut only_zero = Dump::new(Format::Two, None);
   only_zero.revision(
@@ -339,29 +357,111 @@ fn an_import_past_the_room_is_refused() {
     .iter()
     .map(|(name, value)| (name.len() + value.len()) as u64)
     .sum();
-  let bytes = zero.held() + first_properties;
+  (zero.held(), first_properties)
+}
+
+/// `dump` imported into a repository whose room is `short` bytes, one less than revision 0 and the first revision's
+/// properties: refused `Room` (`E160000`) at the properties, the repository unchanged.
+fn refused_within_the_records_room(dump: &[u8], short: u64) {
   let mut small = created_within(Room {
+    entries: ROOMY.entries,
+    bytes: short,
+  });
+  let refusal = import_whole(&mut small, dump).unwrap_err();
+  assert!(
+    matches!(refusal, MigrationRefusal::Room { room, .. } if room == short),
+    "{refusal:?}"
+  );
+  assert_eq!(refusal.subversion_code(), 160_000);
+  assert_eq!(small.youngest(), 0);
+}
+
+/// `dump` imported into a repository whose room of `bytes` holds the first revision's properties, through a sink that
+/// holds one byte less than its text: refused `Room` at the text, within the sink's room, the repository unchanged.
+fn refused_within_the_sinks_room(dump: &[u8], bytes: u64) {
+  let mut roomy = created_within(Room {
     entries: ROOMY.entries,
     bytes,
   });
-  let refusal = import_whole(&mut small, &dump).unwrap_err();
-  let expected = MigrationRefusal::Room {
-    needed: bytes + TEXT.len() as u64,
-    room: bytes,
+  let cap = TEXT.len() as u64 - 1;
+  let capped = Capped {
+    held: HeldTexts::new(),
+    cap,
+    used: Cell::new(0),
   };
-  assert_eq!(refusal, expected);
-  assert_eq!(refusal.subversion_code(), 160_000);
-  assert_eq!(small.youngest(), 0);
+  let mut importer = Importer::new(ADMISSION);
+  let mut rest = dump;
+  let refusal = loop {
+    let (records, _) = roomy.importing();
+    match importer.import(records, &capped, rest, true) {
+      Ok(Importing::Commit { consumed, record }) => {
+        rest = &rest[consumed..];
+        roomy.commit_record(*record).unwrap();
+      }
+      Ok(other) => panic!("the import went on past its sink's room: {other:?}"),
+      Err(refusal) => break refusal,
+    }
+  };
+  assert!(
+    matches!(refusal, MigrationRefusal::Room { needed, room } if room == cap && needed > cap),
+    "{refusal:?}"
+  );
+  assert_eq!(roomy.youngest(), 0);
+}
+
+/// `dump` imported into a repository whose index room holds fewer entries than its nodes: the index's own `Room`, the
+/// repository unchanged.
+fn refused_within_the_index_room(dump: &[u8]) {
   let mut few = created_within(Room {
     entries: 2,
     bytes: ROOMY.bytes,
   });
-  let refusal = import_whole(&mut few, &dump).unwrap_err();
+  let refusal = import_whole(&mut few, dump).unwrap_err();
   assert!(
     matches!(refusal, MigrationRefusal::Index(IndexRefusal::Room { .. })),
     "{refusal:?}"
   );
   assert_eq!(few.youngest(), 0);
+}
+
+/// A sink holding at most `cap` bytes of text, refusing past it as a daemon's content store refuses past the shard's
+/// room ([`an_import_past_the_room_is_refused`]).
+struct Capped {
+  /// The texts themselves.
+  held: HeldTexts,
+  /// The most bytes it holds.
+  cap: u64,
+  /// The bytes it holds.
+  used: Cell<u64>,
+}
+
+impl TextSink for Capped {
+  fn stage(&self, _len: Option<u64>) -> Result<StagedText, TextRefused> {
+    self.held.stage(None)
+  }
+
+  fn append(&self, staged: StagedText, bytes: &[u8]) -> Result<(), TextRefused> {
+    let after = self.used.get() + bytes.len() as u64;
+    if after > self.cap {
+      return Err(TextRefused::Room {
+        available: self.cap - self.used.get(),
+      });
+    }
+    self.used.set(after);
+    self.held.append(staged, bytes)
+  }
+
+  fn seal(&self, staged: StagedText, identity: ContentIdentity) -> Result<(), TextRefused> {
+    self.held.seal(staged, identity)
+  }
+
+  fn sealed(&self, identity: &ContentIdentity) -> Option<std::borrow::Cow<'_, [u8]>> {
+    self.held.sealed(identity)
+  }
+
+  fn sealed_piece(&self, identity: &ContentIdentity, offset: u64, len: usize) -> Option<Vec<u8>> {
+    self.held.sealed_piece(identity, offset, len)
+  }
 }
 
 /// A-628 (refusals): do import a stream cut inside its second revision, a byte at a time, then call the import again.

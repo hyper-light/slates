@@ -159,6 +159,37 @@ impl Drop for Live {
   }
 }
 
+/// How many fetches of repository `repository` are answered on this shard now ([`Live::fetch`]): whether a client is
+/// there for its derived values to be made ahead for (A-856, main's ruling of 2026-11-22 00:30: nothing grows
+/// while no client is connected).
+pub(crate) fn fetches_live(repository: RepositoryId) -> u64 {
+  LIVE.with(|live| {
+    live
+      .try_borrow()
+      .ok()
+      .and_then(|live| {
+        live
+          .get(&repository)
+          .and_then(|counts| counts.get(slot(Work::Fetch)).copied())
+      })
+      .unwrap_or(0)
+  })
+}
+
+/// What repository `id` holds of its shard, its rebuildable values included (module docs, "The cold trigger").
+pub(crate) fn held(state: &ShardState, id: RepositoryId) -> u64 {
+  held_by(state, id)
+}
+
+/// Repository `id`'s learned budget on its shard: its memory grant as the shard's room is divided now by the
+/// repositories' working-set curves ([`grants`], aged to now, divided again when due); none before its curve is made.
+/// What its derived values may be made ahead within, and given back to when it is idle (main's ruling of 2026-11-22
+/// 00:30).
+pub(crate) fn budget(state: &mut ShardState, id: RepositoryId) -> Option<u64> {
+  let now = slates_rt::futures::now_ns();
+  grants::current_at(state, now).of(id)
+}
+
 /// Each repository with works under way on this shard, and how many of each kind (`[intakes, fetches]`).
 fn live_works() -> Vec<(RepositoryId, [u64; 2])> {
   LIVE.with(|live| {
@@ -385,6 +416,7 @@ fn demand_of(
 pub(crate) mod grants;
 pub(crate) mod place;
 pub(crate) mod turns;
+pub(crate) mod wait;
 
 #[cfg(test)]
 mod tests;

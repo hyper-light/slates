@@ -579,7 +579,7 @@ fn file_work(
   use slates_svn::index::{Action, ChangedPath, NodeKind};
   let text = slates_svn::commit::drive::text_of(bytes).unwrap();
   let texts = slates_svn::commit::drive::HeldTexts::new();
-  let staged = texts.stage().unwrap();
+  let staged = texts.stage(None).unwrap();
   texts.append(staged, bytes).unwrap();
   texts.seal(staged, text.identity).unwrap();
   let mut changes = Vec::new();
@@ -959,6 +959,9 @@ fn a_recovered_subversion_green_keeps_no_version_its_readers_do_not_name() {
 /// again, import `full.dump` again. Expect, at every boundary: the recovered green at revision 13 and folded to it (the
 /// replay past its checkpoint keeps no version, P7's finding (2)); the import resuming with nothing to land; the history
 /// `full.dump` byte for byte. Before the fold at recovery, the recovered green kept every version the replay made.
+/// Since A-760 the batch's entries name their texts, which the killed daemon's content store took with it: the
+/// successor brings them back from the node's store before the green's replay (`svn_texts::bring_back_named`, counted,
+/// the non-vacuity of this case). Red before it: the green fenced, `ContentMissing { version: 1 }`.
 #[test]
 fn a_batch_killed_between_its_commits_slices_recovers_and_resumes_to_the_same_history() {
   use crate::vcs_store::svn_import::tests::{FULL, FULL_LAST, history, imported};
@@ -997,6 +1000,7 @@ fn a_batch_killed_between_its_commits_slices_recovers_and_resumes_to_the_same_hi
     store.restart_owner();
     let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
     let folded = green_folded(&daemon, repository);
+    let brought = brought_back(&daemon);
     let resumed = crate::test_store::run_on_first(
       &daemon,
       move || async move {
@@ -1023,5 +1027,170 @@ fn a_batch_killed_between_its_commits_slices_recovers_and_resumes_to_the_same_hi
       exported == Some((FULL_LAST, FULL.to_vec())),
       "killed at {kill_at}: full.dump"
     );
+    assert!(
+      brought > 0,
+      "killed at {kill_at}: no named text brought back"
+    );
   }
+}
+
+/// The texts the daemon's recovery brought back for its Subversion greens' named runs (A-760's pre-pass).
+fn brought_back(daemon: &Daemon) -> u64 {
+  crate::daemon::observe_first(daemon, |state| {
+    state
+      .refusals
+      .get(crate::vcs_store::svn_texts::NAMED_BROUGHT_BACK)
+      .copied()
+      .unwrap_or(0)
+  })
+}
+
+/// A-760's crash oracle, its other side (main 01a20182's ruling of 2026-11-22 ~11:35): an entry naming a text commits
+/// only once the changeset holding the text is durable. Do: import `full.dump` (13 revisions in one batch) on a daemon
+/// holding a store, killing its landing once the changeset is durable and before the entry is appended
+/// (`staging::KILL_BEFORE_ENTRY`); stop the daemon and the store's owner, start both again, import `full.dump` again.
+/// Expect: no entry names a text the successor lacks, so nothing is brought back; the import lands every revision
+/// again, its changeset at the same sequence replacing the one no entry named; the history `full.dump` byte for byte.
+#[test]
+fn a_batch_killed_between_its_changeset_and_its_entry_lands_again_whole() {
+  use crate::vcs_store::svn_import::tests::{FULL, FULL_LAST, history, imported};
+  let instance = format!("vcs-store-svn-before-entry-{}", std::process::id());
+  let mut store = TestStore::start("svn-before-entry");
+  let anchor = anchor_of(&instance);
+  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  daemon.bootstrap(true).unwrap();
+  let repository = created_subversion(&daemon, "before-entry");
+  crate::daemon::observe_first(&daemon, move |_state| {
+    super::svn_commit::staging::KILL_BEFORE_ENTRY.with(|kill| kill.set(true));
+    let task = slates_rt::futures::spawn(async move {
+      let _ = imported(repository, FULL).await;
+    })
+    .expect("the import's task");
+    slates_rt::futures::detach(task).expect("detached");
+  });
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+  while crate::daemon::observe_first(&daemon, |_state| {
+    super::svn_commit::staging::KILL_BEFORE_ENTRY.with(std::cell::Cell::get)
+  }) {
+    assert!(std::time::Instant::now() < deadline, "the kill never fired");
+    std::thread::yield_now();
+  }
+  daemon.stop();
+  store.restart_owner();
+  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  let brought = brought_back(&daemon);
+  let resumed = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      imported(repository, FULL)
+        .await
+        .0
+        .map(|loaded| (loaded.revisions, loaded.youngest))
+    },
+    std::time::Duration::from_secs(60),
+  );
+  let exported = crate::test_store::run_on_first(
+    &daemon,
+    move || history(repository),
+    std::time::Duration::from_secs(60),
+  );
+  daemon.stop();
+  assert_eq!(brought, 0, "a text brought back that no entry named");
+  assert_eq!(resumed, Ok((FULL_LAST, FULL_LAST)), "landed again");
+  assert!(exported == Some((FULL_LAST, FULL.to_vec())), "full.dump");
+}
+
+/// A-760's pre-pass on the cold path alone (main 01a20182's ruling of 2026-11-22 ~11:35). Do: import `full.dump` whole on
+/// a daemon holding a store; stop it and the store's owner, start both again, read the history. Expect: nothing brought
+/// back (the batch's checkpoint covers every entry), the history `full.dump` byte for byte.
+#[test]
+fn a_cleanly_restarted_import_brings_back_no_named_text() {
+  use crate::vcs_store::svn_import::tests::{FULL, FULL_LAST, history, imported};
+  let instance = format!("vcs-store-svn-clean-{}", std::process::id());
+  let mut store = TestStore::start("svn-clean-restart");
+  let anchor = anchor_of(&instance);
+  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  daemon.bootstrap(true).unwrap();
+  let repository = created_subversion(&daemon, "clean");
+  let loaded = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      imported(repository, FULL)
+        .await
+        .0
+        .map(|loaded| loaded.youngest)
+    },
+    std::time::Duration::from_secs(60),
+  );
+  assert_eq!(loaded, Ok(FULL_LAST));
+  daemon.stop();
+  store.restart_owner();
+  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  let brought = brought_back(&daemon);
+  let exported = crate::test_store::run_on_first(
+    &daemon,
+    move || history(repository),
+    std::time::Duration::from_secs(60),
+  );
+  daemon.stop();
+  assert_eq!(brought, 0, "the cold path ran without a crash");
+  assert!(exported == Some((FULL_LAST, FULL.to_vec())), "full.dump");
+}
+
+/// A-760's pre-pass beside the image's own restores (main 01a20182's ruling of 2026-11-22 ~11:55): the pre-pass makes
+/// the content store before the repositories' stores are recovered (`vcs_store::recover`), and making it is what takes
+/// in the image's windows and region holds (`VcsStores::content_made`, `homes::restore_region_holds`). Do: on a daemon
+/// holding a store, keep a window for the region (`homes::keep_for_region`), then import `full.dump`, killing its batch
+/// between its entry and its first apply slice; stop the daemon and the store's owner, start both again. Expect: texts
+/// brought back (the pre-pass ran, and made the store); the region's window still held for the region and in the content
+/// store; the green recovered at revision 13 and folded to it.
+#[test]
+fn a_region_held_window_is_restored_beside_the_named_texts_brought_back() {
+  use crate::vcs_store::svn_import::tests::{FULL, FULL_LAST, imported};
+  let instance = format!("vcs-store-svn-region-{}", std::process::id());
+  let mut store = TestStore::start("svn-region-beside");
+  let anchor = anchor_of(&instance);
+  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  daemon.bootstrap(true).unwrap();
+  let repository = created_subversion(&daemon, "region");
+  let window = crate::daemon::observe_first(&daemon, |state| {
+    crate::vcs_store::homes::keep_for_region(state, b"a window the region homes on this shard")
+      .expect("kept for the region")
+      .0
+  });
+  crate::daemon::observe_first(&daemon, move |_state| {
+    super::svn_commit::staging::KILL_AT_COMMIT_SLICE.with(|kill| kill.set(Some(0)));
+    let task = slates_rt::futures::spawn(async move {
+      let _ = imported(repository, FULL).await;
+    })
+    .expect("the import's task");
+    slates_rt::futures::detach(task).expect("detached");
+  });
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+  while crate::daemon::observe_first(&daemon, |_state| {
+    super::svn_commit::staging::KILL_AT_COMMIT_SLICE
+      .with(std::cell::Cell::get)
+      .is_some()
+  }) {
+    assert!(std::time::Instant::now() < deadline, "the kill never fired");
+    std::thread::yield_now();
+  }
+  daemon.stop();
+  store.restart_owner();
+  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  let brought = brought_back(&daemon);
+  let region = crate::daemon::observe_first(&daemon, move |state| {
+    (
+      crate::vcs_store::homes::region_holds_here(&window),
+      state
+        .vcs_stores
+        .content()
+        .is_some_and(|content| content.contains(&window)),
+    )
+  });
+  let folded = green_folded(&daemon, repository);
+  daemon.stop();
+  assert!(brought > 0, "the pre-pass brought nothing back");
+  assert_eq!(region, (1, true), "the region's window after the restart");
+  assert_eq!(folded, Some((FULL_LAST, FULL_LAST)), "recovered and folded");
 }

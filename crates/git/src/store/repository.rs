@@ -512,6 +512,19 @@ impl Bases for IndexBases<'_> {
   }
 }
 
+/// What a repository holds outside the content store ([`Repository::held`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RepositoryHeld {
+  /// Its read scratch's buffers' room.
+  pub scratch: u64,
+  /// The bytes of the objects it read lately.
+  pub recent: u64,
+  /// The entries of its in-memory maps.
+  pub map_entries: u64,
+  /// What it charged the content store.
+  pub charged: u64,
+}
+
 /// A git repository's store (module docs).
 #[derive(Debug)]
 pub struct Repository {
@@ -537,6 +550,9 @@ pub struct Repository {
   /// The buffers its objects are read from their packs with, and the objects read lately (`packed::Scratch`), held to
   /// its largest pack's length; in a cell because a read is a look, not a change.
   reading: RefCell<Scratch>,
+  /// The first let-go piece a read met since its owner last asked ([`Repository::waiting`]): a read that meets one answers
+  /// none, and its owner brings the piece back and takes the step again.
+  waiting: Cell<Option<packed::Waited>>,
   /// The longest object its packs hold: what a read from them is held to (§4.9: every size a stored entry's header
   /// names, and its chain's, checked against it before a buffer grows to it; a read allocates nothing in the store, so
   /// the store's lent room is no bound for it).
@@ -583,6 +599,7 @@ impl Repository {
       kinds: BTreeMap::new(),
       packs: BTreeMap::new(),
       reading: RefCell::new(Scratch::default()),
+      waiting: Cell::new(None),
       largest: 0,
       landings_charged: 0,
       counters: Cell::new(StoreCounters::default()),
@@ -631,6 +648,33 @@ impl Repository {
     self.depth.limit()
   }
 
+  /// The bytes its reads keep of the objects read lately (`packed::Recent`, git's delta base cache).
+  pub fn recent_bytes(&self) -> u64 {
+    to_u64(self.reading.borrow_mut().recent().bytes())
+  }
+
+  /// Gives back the objects read lately and its read buffers' room (A-860: what a repository gone idle holds of its
+  /// reads is given back, its cache's budget kept for the reads after), and what `store` was charged for them (A-861): the
+  /// bytes given back.
+  pub fn let_go_recent(&self, store: &mut ContentStore) -> u64 {
+    let mut reading = self.reading.borrow_mut();
+    let kept = to_u64(reading.recent().bytes());
+    reading.recent().release(store);
+    reading.shrink(0);
+    kept
+  }
+
+  /// Charges `store` for the objects read lately as they stand ([`packed::Recent::true_up`], A-861): what a turn that
+  /// reads the repository's objects runs once it holds the store mutably.
+  pub fn true_up_recent(&self, store: &mut ContentStore) {
+    self.reading.borrow_mut().recent().true_up(store);
+  }
+
+  /// The longest object its packs hold (A-859): what reading a stored entry's data is held to.
+  pub(super) fn largest_object(&self) -> u64 {
+    self.largest
+  }
+
   fn count(&self, change: impl FnOnce(&mut StoreCounters)) {
     let mut counters = self.counters.get();
     change(&mut counters);
@@ -663,11 +707,11 @@ impl Repository {
   /// Where the object whose row is `row`, naming `content`, is: at its offset in the pack the row names, for an object
   /// read from a pack; its own content otherwise.
   pub fn stored_of(&self, row: &ObjectRow, content: ContentId) -> StoredAt {
-    match row.offset {
-      Some(offset) => StoredAt::InPack(InPack {
+    match row.pack {
+      Some(packed) => StoredAt::InPack(InPack {
         pack: content,
         len: self.packs.get(&content).copied().unwrap_or(0),
-        offset,
+        offset: packed.offset,
       }),
       None => StoredAt::Whole(content),
     }
@@ -691,17 +735,91 @@ impl Repository {
         };
         let mut out = Vec::new();
         let mut reading = self.reading.borrow_mut();
-        packed::read(
+        let read = packed::read(
           store,
           (*place, self.format),
           &bases,
           (&mut *reading, self.largest.max(len)),
           &mut out,
-        )
-        .ok()?;
+        );
+        self.note_waited(&read);
+        read.ok()?;
         (u64::try_from(out.len()).ok() == Some(len)).then_some(Cow::Owned(out))
       }
     }
+  }
+
+  /// What the repository holds outside the content store (the memory status's gauges): its read scratch's buffers' room
+  /// and objects read lately ([`packed::Scratch::held`]), and the entries of its in-memory maps (chains, heads, peeled
+  /// tags, kinds and landings).
+  pub fn held(&self) -> RepositoryHeld {
+    let (scratch, recent) = self.reading.borrow().held();
+    let entries = [
+      self.chains.len(),
+      self.heads.len(),
+      self.peeled.len(),
+      self.kinds.len(),
+      self.landings.len(),
+    ]
+    .into_iter()
+    .fold(0usize, usize::saturating_add);
+    RepositoryHeld {
+      scratch,
+      recent,
+      map_entries: u64::try_from(entries).unwrap_or(u64::MAX),
+      charged: self.charged,
+    }
+  }
+
+  /// The object the entry at `place` of a held pack resolves to, whatever its length (A-859: a stored delta's base, read
+  /// to name it and to check the delta against it): its type and bytes; none where it is not read.
+  pub(super) fn read_entry(&self, store: &ContentStore, place: InPack) -> Option<(Kind, Vec<u8>)> {
+    let bases = IndexBases {
+      repository: self,
+      store,
+    };
+    let mut out = Vec::new();
+    let mut reading = self.reading.borrow_mut();
+    let read = packed::read(
+      store,
+      (place, self.format),
+      &bases,
+      (&mut *reading, self.largest),
+      &mut out,
+    );
+    self.note_waited(&read);
+    Some((read.ok()?, out))
+  }
+
+  /// Notes the let-go piece `read` met, the first since its owner last asked ([`Repository::waiting`]).
+  fn note_waited<T>(&self, read: &Result<T, packed::PackedRefused>) {
+    if let Err(refused) = read
+      && let Some(waited) = refused.waited()
+      && self.waiting.get().is_none()
+    {
+      self.waiting.set(Some(waited));
+    }
+  }
+
+  /// The let-go piece a read met since the last ask, taken (goal 93, main 01a20182's ruling of 2026-11-22 05:45): a step
+  /// whose read answered none asks this, and where it names one, its owner brings that piece back from the node's store
+  /// and takes the step again, never counting the read missing.
+  pub fn waiting(&self) -> Option<packed::Waited> {
+    self.waiting.take()
+  }
+
+  /// Notes `waited` as what a step waits for, where none is noted yet ([`Repository::waiting`]): what a caller that took
+  /// a step's miss to act on it gives back when another step of its turn is the one its driver brings it back for.
+  pub fn wait_for(&self, waited: packed::Waited) {
+    if self.waiting.get().is_none() {
+      self.waiting.set(Some(waited));
+    }
+  }
+
+  /// The packs the repository's objects lie in, each with its length (goal 93 item 2a: what a fetch or an encoding
+  /// reads, made resident before it begins).
+  pub fn packs(&self) -> impl Iterator<Item = (ContentId, u64)> + '_ {
+    self.packs.iter().map(|(pack, len)| (*pack, *len))
   }
 
   /// The bytes of the indexed object whose row is `row`, naming `content` ([`Repository::read_stored`]).
@@ -1368,6 +1486,8 @@ impl Repository {
     self.count(|counters| counters.positions = counters.positions.saturating_add(given));
     self.depth.seen(push.deepest());
     push.release_holds(store)?;
+    // The push's objects read lately go with it, their charge given back (A-861).
+    push.release_recent(store);
     Ok(versions)
   }
 
@@ -1853,6 +1973,7 @@ impl Repository {
       kinds: self.kinds.clone(),
       packs: self.packs.clone(),
       reading: RefCell::new(Scratch::default()),
+      waiting: Cell::new(None),
       largest: self.largest,
       landings_charged: self.landings_charged,
       counters: Cell::new(StoreCounters::default()),

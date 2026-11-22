@@ -1272,7 +1272,9 @@ fn a_held_verdict_previewed_reads_as_its_commit_while_its_green_shows_nothing_of
     })
     .unwrap();
   let version = lineage
-    .with(root, |green| green.apply_recorded(&inc, &applied))
+    .with(root, |green| {
+      green.apply_recorded(&mut inc.clone(), &applied)
+    })
     .unwrap();
   assert_eq!(version, 4);
   let committed = lineage

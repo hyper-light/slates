@@ -211,6 +211,11 @@ const KIND_VCS_NAME: u8 = 13;
 /// the region survive its restart), keyed by the identity's first 24 bytes; its bytes the identity.
 const KIND_VCS_REGION_HOLD: u8 = 14;
 
+/// Format: the piece kind of a window let go of the shard's repository content store (A-767 C1 step 2b, main's ruling
+/// (a) of 2026-11-22 02:52: the image records it, so a restart keeps it let go, never absent), keyed by the identity's
+/// first 24 bytes; its bytes the identity, then its length (`u64`, little-endian).
+const KIND_VCS_AWAY: u8 = 15;
+
 /// The key of a repository content store's piece of `kind` for `identity`: its first 24 bytes, as a held chunk's is.
 fn vcs_node_key(kind: u8, identity: &slates_vcs::ContentId) -> PieceKey {
   let object: [u8; 16] = identity.0[..16].try_into().unwrap_or_default();
@@ -221,6 +226,11 @@ fn vcs_node_key(kind: u8, identity: &slates_vcs::ContentId) -> PieceKey {
 /// A list's piece bytes: its identity, then its bytes.
 fn vcs_list_bytes(identity: &slates_vcs::ContentId, bytes: &[u8]) -> Vec<u8> {
   [identity.0.as_slice(), bytes].concat()
+}
+
+/// A window let go's piece bytes: its identity, then its length.
+fn vcs_away_bytes(identity: &slates_vcs::ContentId, len: u64) -> Vec<u8> {
+  [identity.0.as_slice(), &len.to_le_bytes()].concat()
 }
 
 /// A name's piece bytes: the object's identity, then its root.
@@ -346,7 +356,22 @@ pub(crate) fn held_image(state: &ShardState) -> Vec<slates_vfs::recover::HeldPie
       }
     }));
   }
-  // The repository content store's lists and names, so an object past a window is whole after a restart (a3b).
+  // The repository content store's lists, names and objects let go, so an object past a window is whole after a restart
+  // (a3b).
+  vcs_content_pieces(state, &mut pieces);
+  // The windows and objects this shard holds for the region (A-724 piece 8c), so a home's holds survive its restart.
+  for identity in crate::vcs_store::homes::region_held_here() {
+    pieces.push(slates_vfs::recover::HeldPiece {
+      key: vcs_node_key(KIND_VCS_REGION_HOLD, &identity),
+      bytes: identity.0.to_vec(),
+    });
+  }
+  pieces
+}
+
+/// The repository content store's lists, names and objects let go as held pieces (a3b; A-851's windows let go), for
+/// [`held_image`].
+fn vcs_content_pieces(state: &ShardState, pieces: &mut Vec<slates_vfs::recover::HeldPiece>) {
   if let Some(content) = state.vcs_stores.content() {
     for (identity, bytes) in content.lists() {
       pieces.push(slates_vfs::recover::HeldPiece {
@@ -360,15 +385,13 @@ pub(crate) fn held_image(state: &ShardState) -> Vec<slates_vfs::recover::HeldPie
         bytes: vcs_name_bytes(&identity, &root),
       });
     }
+    for (identity, len) in content.aways() {
+      pieces.push(slates_vfs::recover::HeldPiece {
+        key: vcs_node_key(KIND_VCS_AWAY, &identity),
+        bytes: vcs_away_bytes(&identity, len),
+      });
+    }
   }
-  // The windows and objects this shard holds for the region (A-724 piece 8c), so a home's holds survive its restart.
-  for identity in crate::vcs_store::homes::region_held_here() {
-    pieces.push(slates_vfs::recover::HeldPiece {
-      key: vcs_node_key(KIND_VCS_REGION_HOLD, &identity),
-      bytes: identity.0.to_vec(),
-    });
-  }
-  pieces
 }
 
 /// A held checkpoint's piece (A-404), keyed by its green.
@@ -671,6 +694,16 @@ fn vcs_node_changes(
         None => removed.push(key),
       }
     }
+    for (identity, away) in content.away_changes() {
+      let key = vcs_node_key(KIND_VCS_AWAY, &identity);
+      match away {
+        Some(len) => put.push(slates_vfs::recover::HeldPiece {
+          key,
+          bytes: vcs_away_bytes(&identity, len),
+        }),
+        None => removed.push(key),
+      }
+    }
   }
 }
 
@@ -932,6 +965,8 @@ pub(crate) struct RecoveredHeld {
   pub(crate) names: Vec<(slates_vcs::ContentId, slates_vcs::ContentId)>,
   /// The windows and objects the shard held for the region (A-724 piece 8c).
   pub(crate) region_holds: Vec<slates_vcs::ContentId>,
+  /// The repository content store's windows let go, each with its length (A-767 C1 step 2b).
+  pub(crate) aways: Vec<(slates_vcs::ContentId, u64)>,
 }
 
 /// Why a recovered image's held pieces were refused (A-270): never read as less than was held, since a holder that
@@ -1009,6 +1044,7 @@ pub(crate) fn split_held(
     lists: Vec::new(),
     names: Vec::new(),
     region_holds: Vec::new(),
+    aways: Vec::new(),
   };
   let mut heads: BTreeMap<[u8; 16], crate::live_ship::HeldLive> = BTreeMap::new();
   let mut entries: BTreeMap<[u8; 16], Vec<(u64, Vec<u8>)>> = BTreeMap::new();
@@ -1079,6 +1115,16 @@ pub(crate) fn split_held(
         let identity =
           slates_vcs::ContentId::from_slice(&piece.bytes).ok_or(HeldRefused::UnknownKind(kind))?;
         held.region_holds.push(identity);
+      }
+      KIND_VCS_AWAY => {
+        let (identity, len) = piece
+          .bytes
+          .split_at_checked(slates_vcs::content::IDENTITY_BYTES)
+          .ok_or(HeldRefused::UnknownKind(kind))?;
+        let identity =
+          slates_vcs::ContentId::from_slice(identity).ok_or(HeldRefused::UnknownKind(kind))?;
+        let len = <[u8; 8]>::try_from(len).map_err(|_| HeldRefused::UnknownKind(kind))?;
+        held.aways.push((identity, u64::from_le_bytes(len)));
       }
       other => return Err(HeldRefused::UnknownKind(other)),
     }

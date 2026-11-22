@@ -961,7 +961,7 @@ fn a_deferred_create_is_made_when_first_reached_and_reads_as_the_eager_create() 
         name: "owed".to_owned(),
         from: main,
         version: 0,
-        push: slates_merge::push::DeferredPush::of(&owed_push, ROOM),
+        push: slates_merge::push::DeferredPush::of(&owed_push),
       },
     ];
     let pushed = push(state, &owner(), repo, changes, EntryParts::default()).expect("pushed");
@@ -1087,16 +1087,13 @@ fn an_untouched_materialized_green_past_the_bound_is_dropped_back_and_made_again
       name: name.to_owned(),
       from: main,
       version: 0,
-      push: slates_merge::push::DeferredPush::of(
-        &slates_merge::push::Push {
-          name: [tag; 32],
-          base_version: 0,
-          base_tree: None,
-          tree,
-          head: Some(b"h1"),
-        },
-        ROOM,
-      ),
+      push: slates_merge::push::DeferredPush::of(&slates_merge::push::Push {
+        name: [tag; 32],
+        base_version: 0,
+        base_tree: None,
+        tree,
+        head: Some(b"h1"),
+      }),
     };
     push(
       state,
@@ -1272,7 +1269,7 @@ fn a_holders_replica_owes_the_same_push_and_a_takeover_makes_it_the_eager_green(
         name: "owed".to_owned(),
         from: main,
         version: 0,
-        push: slates_merge::push::DeferredPush::of(&owed_push, ROOM),
+        push: slates_merge::push::DeferredPush::of(&owed_push),
       },
     ];
     push(state, &owner(), repo, changes, EntryParts::default()).expect("pushed");
@@ -1293,7 +1290,7 @@ fn a_holders_replica_owes_the_same_push_and_a_takeover_makes_it_the_eager_green(
     );
     let mut replica = replica_owing_the_record((&inputs, identity), &built);
     let mut building = replica
-      .materializing(slates_merge::pace::Pace::unbounded())
+      .materializing(slates_merge::pace::Pace::unbounded(), ROOM)
       .expect("it owes a push");
     let made = loop {
       if let Some(made) = building.advance(&replica, &store) {
@@ -1336,16 +1333,13 @@ fn a_materialization_past_the_greens_retention_room_is_refused_before_it_commits
       name: "owed".to_owned(),
       from: main,
       version: 0,
-      push: slates_merge::push::DeferredPush::of(
-        &slates_merge::push::Push {
-          name: [3; 32],
-          base_version: 0,
-          base_tree: None,
-          tree,
-          head: Some(b"h1"),
-        },
-        ROOM,
-      ),
+      push: slates_merge::push::DeferredPush::of(&slates_merge::push::Push {
+        name: [3; 32],
+        base_version: 0,
+        base_tree: None,
+        tree,
+        head: Some(b"h1"),
+      }),
     };
     push(state, &owner(), repo, vec![change], EntryParts::default()).expect("pushed");
     let owed = state
@@ -1734,35 +1728,18 @@ fn a_push_held_ahead_of_its_landing_is_named_by_its_step() {
   crate::test_store::audit_on_stored_shard("repository-push-held-ahead", |state| {
     let (repo, main) = repository(state, "ahead");
     let chunk = crate::merge_origin::inputs_chunk_bytes();
-    let large: Vec<u8> = (0..chunk * 3 + 1).map(|at| (at % 251) as u8).collect();
+    let large: Vec<u8> = (0..chunk * 3 + 1)
+      .map(|at| u8::try_from(at % 251).unwrap())
+      .collect();
     let mut store = Store::default();
     let tree = store.put_tree(&[("large", &large)]);
     let changed = store.put_tree(&[("large", b"small")]);
     let room = u64::try_from(large.len() * 4).expect("a room");
     let built = |state: &ShardState, (version, base): (u64, Option<ObjectKey>), tree, name| {
-      let engine = state.greens.get(&main).expect("the green's engine");
-      let push = Push {
-        name: [name; 32],
-        base_version: version,
-        base_tree: base,
-        tree,
-        head: Some(b"c1".as_slice()),
-      };
-      slates_merge::push::build(&push, &engine, &store, room)
-        .expect("the work is built")
-        .increment
+      built_within(state, main, (&store, room), ((version, base), tree, name))
     };
     let first = built(state, (0, None), tree, 1);
-    let count = |state: &ShardState, name| state.refusals.get(name).copied().unwrap_or(0);
-    let mut hold = crate::held_ahead::AheadHold::new(main, 1, &first);
-    let mut units = 0u64;
-    let held = loop {
-      units += 1;
-      match hold.unit(state).expect("a unit of the hold") {
-        crate::held_ahead::Ahead::More => assert!(units < 64, "the hold ends"),
-        crate::held_ahead::Ahead::Held(held) => break held,
-      }
-    };
+    let (held, units) = held_ahead(state, main, 1, &first);
     let chunks = held
       .inputs
       .len
@@ -1771,71 +1748,296 @@ fn a_push_held_ahead_of_its_landing_is_named_by_its_step() {
       units > chunks,
       "{units} units for {chunks} chunks: hashed and copied a unit each"
     );
-    let object = slates_db::register::ObjectId(main.bytes);
-    assert!(
-      state
-        .held_content
-        .holds_manifest(object, &held.inputs.identity)
-    );
-    let owner_holds = count(state, crate::merge_service::INPUTS_HELD_BY_OWNER);
-    let change = BranchChange::Update {
-      green: main,
-      work: first,
-    };
-    let pushed = super::push_holding(
-      state,
-      (&owner(), repo),
-      (vec![change], &[held]),
-      EntryParts::default(),
-      None,
-    );
-    assert!(pushed.is_ok(), "the push lands: {pushed:?}");
-    crate::held_ahead::give_back(state, &[held]);
-    assert_eq!(
-      count(state, crate::held_ahead::AHEAD_NAMED),
-      1,
-      "the step named the hold"
-    );
-    assert_eq!(
-      count(state, crate::merge_service::INPUTS_HELD_BY_OWNER),
-      owner_holds,
-      "the step held nothing afresh"
-    );
-    assert!(
-      state
-        .held_content
-        .holds_manifest(object, &held.inputs.identity),
-      "the entry names the held increment, so it stays"
-    );
+    assert_landed_naming_its_hold(state, (repo, main), first, held);
     let second = built(state, (1, Some(tree)), changed, 2);
-    let mut hold = crate::held_ahead::AheadHold::new(main, 2, &second);
-    let refused_hold = loop {
-      match hold.unit(state).expect("a unit of the hold") {
-        crate::held_ahead::Ahead::More => {}
-        crate::held_ahead::Ahead::Held(held) => break held,
-      }
-    };
+    let (refused_hold, _) = held_ahead(state, main, 2, &second);
     let stale = built(state, (0, None), changed, 3);
-    let refused = super::push_holding(
+    assert_refused_giving_its_hold_back(state, (repo, main), stale, refused_hold);
+  });
+}
+
+/// A-857 (item 1, a regression: main's git matrix on git/git's v2.0.0 cut at 81dc7ca3b refused a one-commit branch push
+/// and a tag push, "[remote rejected] (failed to update ref)", the anchor logging a green's owed push refused building
+/// `PastRoom { asked: 183803, room: 182886 }`: the build ran within the room recorded when the push began, A-724's
+/// learned demand, past which the whole tree's listing went). Do: push a create that owes its push; make the first room
+/// its build is given one byte, as a small push's learned demand left one smaller than its tree's listing, the room after
+/// it its repository's own; read it as a client's recorded request. Expect: the build past its room waits for room and is
+/// made again within the room that came, so the green is made once and the read answered; counted waited and taken
+/// (`merge.green.materialize_waited`, `vcs_share.room_waits_taken`), refused never. Red before: refused building
+/// `PastRoom`, the read answered `ContentUnavailable`.
+#[test]
+fn a_deferred_build_past_its_room_waits_for_room_and_is_made() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let ask = slates_wire::request::RequestId {
+    client: 7,
+    sequence: 1,
+  };
+  let owed = crate::daemon::observe_first(&daemon, move |state| {
+    let (repo, main) = repository(state, "p2-past-room");
+    let mut store = Store::default();
+    let tree = store.put_tree(&[("f", b"one"), ("g", b"two")]);
+    let change = BranchChange::CreateDeferred {
+      name: "owed".to_owned(),
+      from: main,
+      version: 0,
+      push: slates_merge::push::DeferredPush::of(&slates_merge::push::Push {
+        name: [5; 32],
+        base_version: 0,
+        base_tree: None,
+        tree,
+        head: Some(b"h1"),
+      }),
+    };
+    push(state, &owner(), repo, vec![change], EntryParts::default()).expect("pushed");
+    let owed = state
+      .db
+      .partition()
+      .repositories()
+      .branch(repo, "owed")
+      .expect("the branch");
+    OWED_STORE.with(|held| *held.borrow_mut() = store);
+    crate::green_ready::TEST_OBJECTS.with(|objects| objects.set(Some(owed_objects)));
+    crate::green_ready::TEST_ROOMS.with(|rooms| rooms.borrow_mut().push_back(1));
+    owed
+  });
+  let read = crate::daemon::observe_first(&daemon, move |state| {
+    crate::verbs::run_recorded_for_test(
       state,
-      (&owner(), repo),
-      (
-        vec![BranchChange::Update {
-          green: main,
-          work: stale,
-        }],
-        &[refused_hold],
-      ),
-      EntryParts::default(),
-      None,
-    );
-    assert!(refused.is_err(), "the stale push is refused: {refused:?}");
-    crate::held_ahead::give_back(state, &[refused_hold]);
-    assert!(
-      !state
-        .held_content
-        .holds_manifest(object, &refused_hold.inputs.identity),
-      "a hold no entry names is given back"
-    );
+      (7, ask),
+      &owner(),
+      RequestBody::Versions {
+        green: crate::verbs::to_wire_volume(owed),
+      },
+    )
+  });
+  assert!(read.is_none(), "the read parks");
+  let answered = answered_on_shard(&daemon, ask);
+  let counted = crate::daemon::observe_first(&daemon, move |state| {
+    let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+    (
+      state.greens.is_owing(&owed),
+      count(crate::green_ready::MATERIALIZED),
+      count(crate::green_ready::MATERIALIZE_WAITED),
+      count(crate::vcs_share::wait::TAKEN),
+      count(crate::green_ready::MATERIALIZE_REFUSED),
+    )
+  });
+  daemon.stop();
+  assert!(
+    matches!(answered, Some(ReplyBody::Versions { .. })),
+    "{answered:?}"
+  );
+  assert_eq!(
+    counted,
+    (false, 1, 1, 1, 0),
+    "waited, made once, refused never"
+  );
+}
+
+/// The work moving `green` from `version` of `base` to `tree`, named by `name`, built over `store` within `room`.
+fn built_within(
+  state: &ShardState,
+  green: DbVolumeId,
+  (store, room): (&Store, u64),
+  ((version, base), tree, name): ((u64, Option<ObjectKey>), ObjectKey, u8),
+) -> Increment {
+  let engine = state.greens.get(&green).expect("the green's engine");
+  let push = Push {
+    name: [name; 32],
+    base_version: version,
+    base_tree: base,
+    tree,
+    head: Some(b"c1".as_slice()),
+  };
+  slates_merge::push::build(&push, &engine, store, room)
+    .expect("the work is built")
+    .increment
+}
+
+/// `work`'s increment held ahead as `green`'s `version` a unit a call (`held_ahead::AheadHold`): what the hold made, and
+/// the units it took.
+fn held_ahead(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  version: u64,
+  work: &Increment,
+) -> (crate::held_ahead::HeldAhead, u64) {
+  let mut hold = crate::held_ahead::AheadHold::new(green, version, work);
+  let mut units = 0u64;
+  loop {
+    units += 1;
+    match hold.unit(state).expect("a unit of the hold") {
+      crate::held_ahead::Ahead::More => assert!(units < 64, "the hold ends"),
+      crate::held_ahead::Ahead::Held(held) => return (held, units),
+    }
+  }
+}
+
+/// The counter `name` of `state`.
+fn counted(state: &ShardState, name: &str) -> u64 {
+  state.refusals.get(name).copied().unwrap_or(0)
+}
+
+/// `work` pushed to `green` with `held`, its increment held ahead: landed, the step naming the hold and holding nothing
+/// afresh, and the content store still holding it once the entry names it.
+fn assert_landed_naming_its_hold(
+  state: &mut ShardState,
+  (repo, green): (RepositoryId, DbVolumeId),
+  work: Increment,
+  held: crate::held_ahead::HeldAhead,
+) {
+  let object = slates_db::register::ObjectId(green.bytes);
+  assert!(
+    state
+      .held_content
+      .holds_manifest(object, &held.inputs.identity)
+  );
+  let owner_holds = counted(state, crate::merge_service::INPUTS_HELD_BY_OWNER);
+  let change = BranchChange::Update { green, work };
+  let pushed = super::push_holding(
+    state,
+    (&owner(), repo),
+    (vec![change], &[held]),
+    EntryParts::default(),
+    None,
+  );
+  assert!(pushed.is_ok(), "the push lands: {pushed:?}");
+  crate::held_ahead::give_back(state, &[held]);
+  assert_eq!(
+    counted(state, crate::held_ahead::AHEAD_NAMED),
+    1,
+    "the step named the hold"
+  );
+  assert_eq!(
+    counted(state, crate::merge_service::INPUTS_HELD_BY_OWNER),
+    owner_holds,
+    "the step held nothing afresh"
+  );
+  assert!(
+    state
+      .held_content
+      .holds_manifest(object, &held.inputs.identity),
+    "the entry names the held increment, so it stays"
+  );
+}
+
+/// `stale`, a work from a version another push moved past, pushed to `green` with `held`: refused, and its hold, named
+/// by no entry, given back.
+fn assert_refused_giving_its_hold_back(
+  state: &mut ShardState,
+  (repo, green): (RepositoryId, DbVolumeId),
+  stale: Increment,
+  held: crate::held_ahead::HeldAhead,
+) {
+  let refused = super::push_holding(
+    state,
+    (&owner(), repo),
+    (vec![BranchChange::Update { green, work: stale }], &[held]),
+    EntryParts::default(),
+    None,
+  );
+  assert!(refused.is_err(), "the stale push is refused: {refused:?}");
+  crate::held_ahead::give_back(state, &[held]);
+  assert!(
+    !state.held_content.holds_manifest(
+      slates_db::register::ObjectId(green.bytes),
+      &held.inputs.identity
+    ),
+    "a hold no entry names is given back"
+  );
+}
+
+/// A work creating `path` from the whole of the content-store object `object`, named (A-760), based at `base`.
+fn named_create(
+  path: &str,
+  object: slates_merge::named::Identity,
+  (id, base): (u8, u64),
+) -> Increment {
+  use slates_merge::increment::{Base, VolumeOp, compose_volume_planned};
+  let journal = vec![
+    VolumeOp::Create {
+      path: path.to_owned(),
+    },
+    VolumeOp::Extend {
+      path: path.to_owned(),
+      at: 0,
+      len: object.len,
+    },
+  ];
+  let (doc, _) = compose_volume_planned(&Base::of_files(Vec::new()), &journal).expect("composed");
+  let mut work = Increment {
+    id: [id; 32],
+    base,
+    doc,
+    post_state: Vec::new(),
+    evidence: Vec::new(),
+    named: Default::default(),
+  };
+  work.push_named(slates_merge::named::NamedRun {
+    identity: object,
+    offset: 0,
+    len: object.len,
+  });
+  work
+}
+
+/// `bytes` put into the shard's content store, held once: its identity.
+fn stored_object(state: &mut ShardState, bytes: &[u8]) -> slates_merge::named::Identity {
+  let room = u64::try_from(bytes.len()).unwrap().saturating_mul(2);
+  let id = crate::vcs_store::within_budget(state, room, |stores| {
+    stores
+      .content_mut()
+      .expect("the content store")
+      .put_object(bytes)
+      .expect("put")
+  });
+  slates_merge::named::Identity {
+    hash: id.0,
+    len: u64::try_from(bytes.len()).unwrap(),
+  }
+}
+
+/// Goal 93, A-760's append (main 01a20182's ruling of 2026-11-22 ~13:30: a work reused after a refused append must be
+/// impossible by construction). `append` takes its changes by value and a refusal gives none back, so a caller retries
+/// only with a work it builds again, its runs read again; never one whose runs a refused verdict took. Do: append a named
+/// work creating `a`; then a stale named work creating `a` again, based before it, which the verdict refuses; then the
+/// change built again against the new head, creating `b`, its runs read, appended. Expect: the first accepted, the stale
+/// one refused, the rebuilt one accepted with its text's bytes; every work's runs read once each, none cloned by a
+/// verdict (`READ_CLONED_BYTES` 0).
+#[test]
+fn a_refused_named_append_is_retried_only_with_a_work_built_again() {
+  crate::test_store::audit_on_stored_shard("push-named-retry", |state| {
+    let (repository, green) = repository(state, "named");
+    let first = vec![b'1'; 20_000];
+    let second = vec![b'2'; 30_000];
+    let (first_object, second_object) =
+      (stored_object(state, &first), stored_object(state, &second));
+    let cloned = |state: &ShardState| {
+      state
+        .refusals
+        .get(super::READ_CLONED_BYTES)
+        .copied()
+        .unwrap_or(0)
+    };
+    let append = |state: &mut ShardState, mut work: Increment| {
+      crate::repository::svn_commit::read_named(state, &mut work).expect("read");
+      push(
+        state,
+        &owner(),
+        repository,
+        vec![BranchChange::Update { green, work }],
+        EntryParts::default(),
+      )
+    };
+    let landed = append(state, named_create("a", first_object, (1, 0)));
+    let stale = append(state, named_create("a", second_object, (2, 0)));
+    // The stale work was moved into the append and is gone with its refusal: the retry is a work built again.
+    let retried = append(state, named_create("b", second_object, (3, 1)));
+    assert!(landed.is_ok(), "{landed:?}");
+    assert!(matches!(stale, Err(AppendRefused::Changes(_))), "{stale:?}");
+    assert!(retried.is_ok(), "{retried:?}");
+    assert_eq!(file(state, green, "a"), Some(first));
+    assert_eq!(file(state, green, "b"), Some(second));
+    assert_eq!(cloned(state), 0, "read bytes cloned by a verdict");
   });
 }

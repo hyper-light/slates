@@ -1,0 +1,383 @@
+//! A git read that met a let-go window, its window brought back from the node's store (goal 93 item 2a; main 01a20182's
+//! ruling of 2026-11-22 05:45: a home's RAM copy may go once its node's store holds the pack durably, and is brought
+//! back by identity on a read).
+//!
+//! **Why.** A landed push's pack lies twice in RAM (its staged copy on the repository's shard and its windows homed in
+//! the region; 61.3 and 53.9 MB for git/git v2.0.0) while the node's store holds it as the push's changeset `Payload`
+//! (A-767 C5). Letting those windows go needs a read that meets one to get it back: a let-go window is not lent, so a
+//! read of it was refused `Unread` and the object was missing.
+//!
+//! **How.** A read of a let-go window is refused `PackedRefused::Away` naming the pack, its length and the offset met,
+//! and the `Repository` keeps the first such miss (`Repository::waiting`). The turn's driver, off the shard's step, awaits
+//! [`bring_back`]: on the shard, the window holding the offset and the pack's identity (the plain BLAKE3 of its bytes,
+//! the key the node's store keeps the `Payload` under, `ContentStore::object_identity`); off it, the window's bytes read
+//! from the node's store a piece at a time (`StoreHandle::piece`); then on the shard again, the window put back
+//! (`ContentStore::bring_back`, which checks its identity), within the room its step is lent. The driver then takes the
+//! same unit again. A window already back is nothing to do.
+
+use slates_git::store::packed::Waited;
+
+use crate::state::with_state;
+
+/// Why a let-go window was not brought back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReadThroughRefused {
+  /// The shard keeps no node store (a daemon without `--vcs-store`), so nothing it holds was let go to one.
+  NoDisk,
+  /// The shard holds no repository content store.
+  NoStore,
+  /// The store's owner refused the read.
+  Owner(String),
+  /// The node's store holds no bytes at this offset of the pack.
+  Missing {
+    /// Where.
+    at: u64,
+  },
+  /// The content store refused the bytes back (another identity, or no room in its step).
+  Refused(slates_vcs::ContentRefused),
+}
+
+/// Format: the status counter of windows a git read brought back from the node's store ([`bring_back`]).
+pub(crate) const BROUGHT_BACK: &str = "vcs_store.read_through.brought_back";
+/// Format: the status counter of their bytes.
+pub(crate) const BROUGHT_BACK_BYTES: &str = "vcs_store.read_through.brought_back_bytes";
+
+/// Brings back the let-go window `waited` names (module docs): the bytes put back; 0 where it is back already.
+pub(crate) async fn bring_back(waited: Waited) -> Result<u64, ReadThroughRefused> {
+  let found = with_state(|state| {
+    let disk = state.vcs_disk.clone().ok_or(ReadThroughRefused::NoDisk)?;
+    let content = state
+      .vcs_stores
+      .content()
+      .ok_or(ReadThroughRefused::NoStore)?;
+    let away = content.away_window(&waited.pack, waited.len, waited.offset);
+    Ok(away.map(|window| (disk, content.object_identity(&waited.pack), window)))
+  })
+  .ok_or(ReadThroughRefused::NoStore)??;
+  let Some((disk, identity, (window, start, len))) = found else {
+    return Ok(0);
+  };
+  let end = start.saturating_add(len);
+  let mut bytes = Vec::new();
+  bytes
+    .try_reserve_exact(usize::try_from(len).unwrap_or(usize::MAX))
+    .map_err(|_| ReadThroughRefused::Refused(slates_vcs::ContentRefused::CountExhausted))?;
+  let mut at = start;
+  while at < end {
+    let piece = disk
+      .piece(identity.0, waited.len, at)
+      .await
+      .map_err(|refused| ReadThroughRefused::Owner(format!("{refused:?}")))?
+      .filter(|piece| !piece.is_empty())
+      .ok_or(ReadThroughRefused::Missing { at })?;
+    let want = usize::try_from(end.saturating_sub(at)).unwrap_or(usize::MAX);
+    let taken = piece.get(..want.min(piece.len())).unwrap_or_default();
+    bytes.extend_from_slice(taken);
+    at = at.saturating_add(u64::try_from(taken.len()).unwrap_or(u64::MAX));
+  }
+  with_state(|state| {
+    let put = crate::vcs_store::within_budget(state, len, |stores| {
+      let content = stores.content_mut().ok_or(ReadThroughRefused::NoStore)?;
+      if !content.is_away(&window) {
+        return Ok(0);
+      }
+      content
+        .bring_back(&window, &bytes)
+        .map(|()| len)
+        .map_err(ReadThroughRefused::Refused)
+    });
+    if let Ok(brought) = put
+      && brought > 0
+    {
+      state.count(BROUGHT_BACK, 1);
+      state.count(BROUGHT_BACK_BYTES, brought);
+    }
+    put
+  })
+  .ok_or(ReadThroughRefused::NoStore)?
+}
+
+#[cfg(test)]
+mod tests {
+  use slates_git::store::packed::Waited;
+  use slates_vcs::ContentId;
+
+  /// Goal 93 item 2a (main 01a20182's ruling of 2026-11-22 05:45: a home's RAM copy may go once its node's store holds
+  /// the pack, brought back by identity on a read). Do: on a store-backed daemon, put a pack of three windows and a part
+  /// in the shard's content store; land its bytes on the node's store as a changeset's `Payload`; mark every window landed
+  /// and let it go; then, for an offset in each window, await [`super::bring_back`] with what a read that met it waits
+  /// for; then read the object whole. Expect: every window let go, each brought back from the node's store (one bring-back
+  /// a window, counted, a second for the same window nothing), and the object read whole as it was put. Failing first:
+  /// a read of a let-go window was refused `Unread`, and nothing brought it back.
+  #[test]
+  fn a_let_go_window_is_brought_back_from_the_nodes_store_and_read_whole() {
+    let (_store, daemon) = crate::test_store::audit_daemon_stored();
+    let (sent, got) = std::sync::mpsc::channel();
+    crate::daemon::observe_first(&daemon, move |state| {
+      // A repository makes the shard's content store.
+      let _ = crate::git_push::tests::git_repository(state, "read-through");
+      let window = state
+        .vcs_stores
+        .content()
+        .map_or(1 << 18, slates_vcs::ContentStore::window);
+      let bytes: Vec<u8> = (0..3 * window + 100)
+        .map(|at| u8::try_from(at % 251).unwrap())
+        .collect();
+      let len = u64::try_from(bytes.len()).unwrap();
+      let root = crate::vcs_store::within_budget(state, len, |stores| {
+        stores.content_mut().unwrap().put_object(&bytes).unwrap()
+      });
+      let header = slates_store::log::Header {
+        tool: slates_store::log::Tool::Git,
+        repository: 1,
+        sequence: 0,
+        judged_over: 0,
+        grant: 0,
+        work: 0,
+        time_ns: slates_rt::futures::now_ns(),
+        sections: 0,
+      };
+      let parts = vec![(slates_store::log::SectionKind::Payload, bytes.clone())];
+      assert!(crate::test_store::land_blocking(
+        state.vcs_disk.clone().unwrap(),
+        header,
+        parts
+      ));
+      let let_go = crate::vcs_store::within_budget(state, 0, |stores| {
+        let content = stores.content_mut().unwrap();
+        let ids: Vec<ContentId> = bytes.chunks(window).map(ContentId::of).collect();
+        ids
+          .iter()
+          .filter(|id| content.mark_landed(id) && content.let_go(id).is_ok())
+          .count()
+      });
+      let task = slates_rt::futures::spawn(async move {
+        let mut brought = Vec::new();
+        for index in 0..4u64 {
+          let offset = index * u64::try_from(window).unwrap() + 7;
+          let waited = Waited {
+            pack: root,
+            len,
+            offset,
+          };
+          brought.push(super::bring_back(waited).await);
+        }
+        let again = super::bring_back(Waited {
+          pack: root,
+          len,
+          offset: 7,
+        })
+        .await;
+        let read = crate::state::with_state(|state| {
+          crate::vcs_store::lent_to_read((&mut state.store, &mut state.vcs_stores), |stores| {
+            stores
+              .content()
+              .and_then(|content| content.object_bytes(&root, len))
+          })
+        })
+        .flatten();
+        let counted = crate::state::with_state(|state| {
+          state
+            .refusals
+            .get(super::BROUGHT_BACK)
+            .copied()
+            .unwrap_or(0)
+        });
+        let _ = sent.send((let_go, brought, again, read == Some(bytes), counted));
+      })
+      .unwrap();
+      slates_rt::futures::detach(task).unwrap();
+    });
+    let (let_go, brought, again, whole, counted) = got.recv().expect("the bring-back answered");
+    daemon.stop();
+    assert_eq!(let_go, 4, "every window let go");
+    assert!(
+      brought
+        .iter()
+        .all(|one| matches!(one, Ok(bytes) if *bytes > 0)),
+      "{brought:?}"
+    );
+    assert_eq!(again, Ok(0), "a window back already is nothing to do");
+    assert!(whole, "the object read whole as it was put");
+    assert_eq!(counted, Some(4));
+  }
+
+  /// Goal 93 item 2b(a) (main 01a20182's rulings of 2026-11-22 06:58 and 07:00 (ii)). Do: on a store-backed daemon, put
+  /// a pack of six windows and a part in the shard's content store, held twice more a window (a landed push's holders:
+  /// its staged pack, its repository's), its bytes landed on the node's store; let it go as a landed push's pack is let
+  /// go, among this shard and one more (a second home), the second picked so the windows' homes split between them; then
+  /// bring each window let go back and read the object whole. Expect: every window whose home is this shard kept,
+  /// refused `Pinned { by: "homes" }` on a let-go asked again (its pin read from where its home is, never from a flag a
+  /// restart would lose); every other window let go whatever its holders, counted with its bytes; the pinned ones
+  /// counted; the object read whole once brought back. Failing first: no landed let-go, every window held in RAM.
+  #[test]
+  fn a_landed_packs_windows_go_but_those_a_home_holds_here() {
+    let (_store, daemon) = crate::test_store::audit_daemon_stored();
+    let (sent, got) = std::sync::mpsc::channel();
+    crate::daemon::observe_first(&daemon, move |state| {
+      let _ = crate::git_push::tests::git_repository(state, "landed-pins");
+      let window = state
+        .vcs_stores
+        .content()
+        .map_or(1 << 18, slates_vcs::ContentStore::window);
+      let bytes: Vec<u8> = (0..6 * window + 100)
+        .map(|at| u8::try_from(at % 253).unwrap())
+        .collect();
+      let len = u64::try_from(bytes.len()).unwrap();
+      let ids: Vec<ContentId> = bytes.chunks(window).map(ContentId::of).collect();
+      let root = crate::vcs_store::within_budget(state, len, |stores| {
+        let content = stores.content_mut().unwrap();
+        let root = content.put_object(&bytes).unwrap();
+        for id in &ids {
+          content.hold(id).unwrap();
+          content.hold(id).unwrap();
+        }
+        root
+      });
+      let header = slates_store::log::Header {
+        tool: slates_store::log::Tool::Git,
+        repository: 2,
+        sequence: 0,
+        judged_over: 0,
+        grant: 0,
+        work: 0,
+        time_ns: slates_rt::futures::now_ns(),
+        sections: 0,
+      };
+      let parts = vec![(slates_store::log::SectionKind::Payload, bytes.clone())];
+      assert!(crate::test_store::land_blocking(
+        state.vcs_disk.clone().unwrap(),
+        header,
+        parts
+      ));
+      let here = state.shard;
+      let shards = (1..200u16)
+        .map(|other| vec![here, here.wrapping_add(other)])
+        .find(|shards| {
+          let homed = ids
+            .iter()
+            .filter(|id| crate::vcs_store::homes::home_of(shards, id) == Some(here))
+            .count();
+          homed > 0 && homed < ids.len()
+        })
+        .expect("a second home that splits the windows");
+      let pinned: Vec<ContentId> = ids
+        .iter()
+        .copied()
+        .filter(|id| crate::vcs_store::homes::home_of(&shards, id) == Some(here))
+        .collect();
+      crate::vcs_store::let_go_landed_pack_among(state, &root, &shards);
+      let (kept, refused, gone) = crate::vcs_store::within_budget(state, 0, |stores| {
+        let content = stores.content_mut().unwrap();
+        let kept = pinned.iter().all(|id| !content.is_away(id));
+        let refused: Vec<_> = pinned
+          .iter()
+          .map(|id| content.let_go_landed(id, crate::vcs_store::landed_pin(here, &shards, id)))
+          .collect();
+        let gone = ids.iter().filter(|id| content.is_away(id)).count();
+        (kept, refused, gone)
+      });
+      let counted = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      let let_go_bytes = counted(crate::vcs_store::LANDED_LET_GO_BYTES);
+      let pinned_count = counted(crate::vcs_store::LANDED_PINNED);
+      let expected = ids.len() - pinned.len();
+      let task = slates_rt::futures::spawn(async move {
+        for index in 0..ids.len() {
+          let offset = u64::try_from(index * window).unwrap();
+          let _ = super::bring_back(Waited {
+            pack: root,
+            len,
+            offset,
+          })
+          .await;
+        }
+        let read = crate::state::with_state(|state| {
+          crate::vcs_store::lent_to_read((&mut state.store, &mut state.vcs_stores), |stores| {
+            stores
+              .content()
+              .and_then(|content| content.object_bytes(&root, len))
+          })
+        })
+        .flatten();
+        let _ = sent.send((
+          kept,
+          refused,
+          (gone, expected),
+          (let_go_bytes, pinned_count, pinned.len()),
+          read == Some(bytes),
+        ));
+      })
+      .unwrap();
+      slates_rt::futures::detach(task).unwrap();
+    });
+    let (kept, refused, (gone, expected), (let_go_bytes, pinned_count, pinned), whole) =
+      got.recv().expect("the let-go answered");
+    daemon.stop();
+    assert!(kept, "a window a home holds here stays");
+    assert!(
+      refused
+        .iter()
+        .all(|refused| *refused == Err(slates_vcs::LetGoRefused::Pinned { by: "homes" })),
+      "{refused:?}"
+    );
+    assert_eq!(gone, expected, "every window no home holds here let go");
+    assert!(let_go_bytes > 0);
+    assert_eq!(pinned_count, u64::try_from(pinned).unwrap());
+    assert!(whole, "the object read whole once brought back");
+  }
+
+  /// w-git's fetch look-ahead (goal 93): a window a read brought back is let go again once passed
+  /// ([`crate::vcs_store::let_go_read`]). Do: on a store-backed daemon, put a one-window object held twice, its bytes
+  /// landed on the node's store, mark it landed, let it go landed, bring it back, then let it go again through
+  /// `let_go_read` among this shard and one more that is its home; then once more with this shard its home. Expect: the
+  /// bring-back puts it back and it reads; `let_go_read` lets it go again (still landed, whatever its holders); with
+  /// this shard its home, refused `Pinned { by: "homes" }`.
+  #[test]
+  fn a_window_brought_back_is_let_go_again_once_read() {
+    let (_store, daemon) = crate::test_store::audit_daemon_stored();
+    let answered = crate::daemon::observe_first(&daemon, |state| {
+      let _ = crate::git_push::tests::git_repository(state, "read-again");
+      let bytes = b"one window, read and let go again".to_vec();
+      let id = ContentId::of(&bytes);
+      crate::vcs_store::within_budget(state, 64, |stores| {
+        let content = stores.content_mut().unwrap();
+        content.put_object(&bytes).unwrap();
+        content.hold(&id).unwrap();
+        content.mark_landed(&id);
+        content.let_go_landed(&id, None).unwrap();
+        content.bring_back(&id, &bytes).unwrap();
+      });
+      let here = state.shard;
+      let elsewhere = (1..200u16)
+        .map(|other| vec![here, here.wrapping_add(other)])
+        .find(|shards| crate::vcs_store::homes::home_of(shards, &id) != Some(here))
+        .unwrap();
+      let homed = state.shards.clone();
+      state.shards = elsewhere;
+      let again = crate::vcs_store::let_go_read(state, &id);
+      let away = state
+        .vcs_stores
+        .content()
+        .is_some_and(|content| content.is_away(&id));
+      crate::vcs_store::within_budget(state, 64, |stores| {
+        stores
+          .content_mut()
+          .unwrap()
+          .bring_back(&id, &bytes)
+          .unwrap();
+      });
+      state.shards = vec![here];
+      let pinned = crate::vcs_store::let_go_read(state, &id);
+      state.shards = homed;
+      (again, away, pinned)
+    });
+    daemon.stop();
+    let (again, away, pinned) = answered;
+    assert!(matches!(again, Ok(bytes) if bytes > 0), "{again:?}");
+    assert!(away, "let go again");
+    assert_eq!(
+      pinned,
+      Err(slates_vcs::LetGoRefused::Pinned { by: "homes" })
+    );
+  }
+}

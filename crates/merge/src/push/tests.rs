@@ -1655,13 +1655,9 @@ fn owing_took_the_record(
   (push, version): (&Push<'_>, u64),
   store: &Store,
 ) -> Vec<u8> {
-  let record = DeferredPush::of(push, u64::MAX).encode();
+  let record = DeferredPush::of(push).encode();
   let owed = DeferredPush::decode(&record).expect("the record decodes");
-  assert_eq!(
-    owed,
-    DeferredPush::of(push, u64::MAX),
-    "the record round-trips"
-  );
+  assert_eq!(owed, DeferredPush::of(push), "the record round-trips");
   let before = reads_of(owing);
   assert_eq!(owing.defer(owed.clone()), Some(version));
   assert!(!owing.is_materialized());
@@ -1693,7 +1689,7 @@ fn replayed_from_record(replayed: &mut Green, record: &[u8], version: u64, store
     Some(version)
   );
   let mut building = replayed
-    .materializing(crate::pace::Pace::unbounded())
+    .materializing(crate::pace::Pace::unbounded(), u64::MAX)
     .unwrap();
   let made = loop {
     if let Some(made) = building.advance(replayed, store) {
@@ -1754,14 +1750,15 @@ fn owed_history(steps: &[Vec<Option<(u8, bool)>>]) {
 }
 
 /// P2's record (`DeferredPush::encode`). Do: decode a record cut at every length, with any byte flipped, with a byte
-/// past its end, and with another record kind's magic. Expect: every one refused (`None`), never a panic, and the whole
-/// record decoded to its push; `is_record` true for it and false for a chain entry's magic.
+/// past its end, with another record kind's magic, and as version 1, whole (A-857: it recorded its push's room). Expect:
+/// every one refused (`None`), never a panic, and the whole record decoded to its push; `is_record` true for it and
+/// false for a chain entry's magic.
 #[test]
 fn a_deferred_push_record_refuses_every_damaged_form() {
   let mut store = Store::default();
   let tree = put(&mut store, &files_of(&[("a", file(b"x"))]));
   let head = head(1);
-  let owed = DeferredPush::of(&push(0, None, tree, &head), 4096);
+  let owed = DeferredPush::of(&push(0, None, tree, &head));
   let record = owed.encode();
   assert_eq!(DeferredPush::decode(&record), Some(owed));
   assert!(DeferredPush::is_record(&record));
@@ -1777,6 +1774,12 @@ fn a_deferred_push_record_refuses_every_damaged_form() {
   let mut longer = record.clone();
   longer.push(0);
   assert_eq!(DeferredPush::decode(&longer), None, "a byte past the end");
+  // A-857: a version-1 record, whole and digested, which recorded its push's room: refused, never read.
+  let mut body = record[..record.len() - 32].to_vec();
+  body[4..8].copy_from_slice(&1u32.to_le_bytes());
+  let digest = *blake3::hash(&body).as_bytes();
+  body.extend_from_slice(&digest);
+  assert_eq!(DeferredPush::decode(&body), None, "version 1 refused");
 }
 
 /// P2's replay tail. Do: land two pushes eagerly on one green; on its twin, defer the first from its record and apply
@@ -1808,11 +1811,11 @@ fn a_version_recorded_after_an_owed_push_is_applied_once_it_is_materialized() {
   assert_eq!(outcome, Outcome::Accepted { version: 2 });
   let mut twin = Green::new();
   assert_eq!(
-    twin.defer(DeferredPush::decode(&DeferredPush::of(&push1, u64::MAX).encode()).unwrap()),
+    twin.defer(DeferredPush::decode(&DeferredPush::of(&push1).encode()).unwrap()),
     Some(1)
   );
   assert_eq!(
-    twin.apply_recorded(&built2.increment, &applied.unwrap()),
+    twin.apply_recorded(&mut built2.increment.clone(), &applied.unwrap()),
     2,
     "the later version answered while owed"
   );
@@ -1860,8 +1863,11 @@ fn a_signature_recorded_on_a_version_in_the_owed_tail_is_kept() {
   };
   assert!(eager.record_signature(2, verdict));
   let mut twin = Green::new();
-  assert_eq!(twin.defer(DeferredPush::of(&push1, u64::MAX)), Some(1));
-  assert_eq!(twin.apply_recorded(&built2.increment, &applied.unwrap()), 2);
+  assert_eq!(twin.defer(DeferredPush::of(&push1)), Some(1));
+  assert_eq!(
+    twin.apply_recorded(&mut built2.increment.clone(), &applied.unwrap()),
+    2
+  );
   assert!(
     twin.record_signature(2, verdict),
     "the verdict of a version the owing green stands for is taken"

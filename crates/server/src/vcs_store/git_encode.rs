@@ -21,7 +21,7 @@
 //!
 //! **Bounds.** One encoding a repository at a time, kept in the map between turns, so the encodings under way are
 //! bounded by the partition's repositories; each holds what `Encoding` holds between its turns (its order, the walk's
-//! bases, the part's bytes so far and its encoder's recent entries), a version's objects at most. Two fetches of one
+//! bases, the part's bytes so far, charged, and its encoder's recent entries), a version's objects at most. Two fetches of one
 //! repository drive the same encoding, whichever turn comes first.
 //!
 //! **Cancellation.** The encoding lives in the map, keyed by its repository, and a request that drives it holds the key
@@ -36,8 +36,19 @@
 //! past it the answer begins, its stream searching what is still unencoded, and a task finishes the encoding behind it
 //! (`encode_behind`), one a repository, so a long history pushed whole never holds a fetch's first byte past the window.
 //!
-//! **Owed** (GAPS' §4.17 entry). The parts' bytes an encoding holds between turns are charged to no budget until the
-//! last unit keeps them as content. A push's own intake could record each object's delta as it arrives, so a pushed
+//! **Made ahead only for a client, within a budget** (A-856, main's ruling of 2026-11-22 00:30: derived data made ahead
+//! is charged to the repository's learned budget, and nothing grows while no client is connected; clients measured
+//! git/git's clone at 917 MiB as it ended and 1,695 MiB 90 s later with no client). The task behind a fetch turns the
+//! encoding only while a fetch of the repository is answered and what the repository holds is within its learned grant
+//! (`crate::vcs_share::budget`: its working-set curve's share of the shard, aged); past either it stops, counted
+//! [`AHEAD_STOPPED`], and nothing is made ahead until a fetch asks again (that fetch's wait encodes, its stream searching
+//! the rest). As a repository goes idle (its last fetch ending, or the task stopping with none answered) its encoding
+//! under way is dropped and its kept fragments past its grant are given back by §4.11's cost model ([`give_back_idle`],
+//! counted [`GIVEN_BACK_IDLE`]). An encoding's parts are charged to the content store as they grow
+//! (`slates_git::store::Encoding::held_bytes`) and given back as they are kept or the encoding is dropped.
+//!
+//! **Owed** (GAPS' §4.17 entry). Each object's deflate makes a fresh state (clients' table: 97 GB made over one git/git
+//! clone), owed next: one a shard, reset. A push's own intake could record each object's delta as it arrives, so a pushed
 //! version needs no search at all (git's pack reuse; w-git's sliced intake). The base pack is not made again here: a
 //! clone is every version's fragments, in order, until the rebuild rule makes one. Kept fragments are not durable: a
 //! recovery makes the store again from the log without them, and the next fetch encodes again.
@@ -80,6 +91,22 @@ pub(crate) const UNITS_PAST_BUDGET_BY_STAGE: [&str; 4] = [
   "vcs_store.git_encode.units_past_budget.encode",
   "vcs_store.git_encode.units_past_budget.keep",
 ];
+/// Counter: objects a finished encoding sent on as their pushed entry lies, whole (A-859, git's pack reuse). Format: a
+/// counter name.
+pub(crate) const REUSED_WHOLE: &str = "vcs_store.git_encode.reused_whole";
+/// Counter: objects a finished encoding sent on as their pushed delta (A-859). Format: a counter name.
+pub(crate) const REUSED_DELTAS: &str = "vcs_store.git_encode.reused_deltas";
+/// Counter: objects whose pushed entry failed its check and were encoded instead (A-859). Format: a counter name.
+pub(crate) const REUSE_REFUSED: &str = "vcs_store.git_encode.reuse_refused";
+/// Counter: objects a finished encoding found in no pack the store holds, encoded with no entry to reuse (A-859).
+/// Format: a counter name.
+pub(crate) const REUSE_NO_ENTRY: &str = "vcs_store.git_encode.reuse_no_entry";
+/// Counter: objects whose pushed entry a finished encoding could not read, encoded instead (A-859). Format: a counter
+/// name.
+pub(crate) const REUSE_UNREAD: &str = "vcs_store.git_encode.reuse_unread";
+/// Counter: objects whose pushed entry a finished encoding found not to match the CRC32 its row keeps, read and judged
+/// instead (A-864). Format: a counter name.
+pub(crate) const REUSE_CRC_MISSED: &str = "vcs_store.git_encode.reuse_crc_missed";
 /// Counter: an encoding refused, its version left unencoded. Format: a counter name.
 pub(crate) const REFUSED: &str = "vcs_store.git_encode.refused";
 
@@ -107,11 +134,35 @@ pub(crate) enum Turned {
 }
 
 /// One turn of repository `id`'s encoding (the module doc), within the shard's quantum on its clock.
+impl super::VcsStores {
+  /// The let-go window repository `id`'s encoding last stopped at, taken (A-864 piece 2's encoding side): what its
+  /// driver brings back before the next turn.
+  pub(crate) fn stopped_encoding(
+    &self,
+    id: RepositoryId,
+  ) -> Option<slates_git::store::packed::Waited> {
+    self
+      .encodings
+      .0
+      .get(&id)
+      .and_then(|(encoding, _)| encoding.waiting())
+  }
+}
+
 pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Turned {
   // A-614 amended: a version's D(k), which its fragments are encoded from, derived first where it is not known, so an
   // encoding turned by any path (a fetch's wait, the task behind it) never meets a version left for its first reader.
-  if super::git_derive::turn(state, id) == super::git_derive::Turned::More {
-    return Turned::More;
+  match super::git_derive::turn(state, id) {
+    super::git_derive::Turned::More => return Turned::More,
+    // A derivation's read met a window let go: kept on the repository for the encoding's driver to bring back
+    // (`Repository::waiting`, `read_through::bring_back`), the turn answered not done.
+    super::git_derive::Turned::Waiting(waited) => {
+      if let Some((_, store)) = state.vcs_stores.git_ref(id) {
+        store.repository.wait_for(waited);
+      }
+      return Turned::More;
+    }
+    super::git_derive::Turned::Idle => {}
   }
   let began = slates_rt::futures::now_ns();
   let (turned, kept) = turn_uncounted(state, id);
@@ -129,7 +180,7 @@ pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Turned {
 /// [`turn`]'s work: what it came to, and the bytes of the fragments it kept (zero unless a version was finished).
 fn turn_uncounted(state: &mut ShardState, id: RepositoryId) -> (Turned, u64) {
   let quantum_ns = state.config.step_quantum_ns();
-  let exchange = exchange(&state.config);
+  let exchange = exchange(state);
   let mut clock = ShardClock;
   let clock: &mut dyn Clock = &mut clock;
   super::lend(&mut state.store, &mut state.vcs_stores, 0);
@@ -174,6 +225,7 @@ fn turn_lent(
   let encoding_at = stores.encodings.0.get(&id).map(|(_, at)| *at);
   let mut kept = 0;
   let mut past = 0;
+  let mut reused = [0_u64; 6];
   let mut past_by_stage = [0_u64; UNITS_PAST_BUDGET_BY_STAGE.len()];
   let advanced: Option<Result<Progress, StoreRefused>> =
     stores.encodings.0.get_mut(&id).map(|(encoding, _)| {
@@ -196,6 +248,8 @@ fn turn_lent(
             quantum_ns,
           },
         ) {
+          // A-864 piece 2: a unit stopped at a let-go window ends the turn; its driver brings the window back.
+          Ok(Progress::More) if encoding.stopped() => break Ok(Progress::More),
           Ok(Progress::More) => {}
           other => break other,
         }
@@ -219,7 +273,17 @@ fn turn_lent(
   let turned = match advanced {
     Some(Ok(Progress::More)) => Turned::More,
     Some(Ok(Progress::Done)) => {
-      stores.encodings.0.remove(&id);
+      if let Some((encoding, _)) = stores.encodings.0.remove(&id) {
+        let counted = encoding.counters();
+        reused = [
+          counted.reused_whole,
+          counted.reused_deltas,
+          counted.reuse_refused,
+          counted.reuse_no_entry,
+          counted.reuse_unread,
+          counted.reuse_crc_missed,
+        ];
+      }
       kept = encoded_bytes(stores, id, encoding_at);
       state.count(ENCODED, 1);
       Turned::More
@@ -232,6 +296,21 @@ fn turn_lent(
   };
   if begun {
     state.count(BEGUN, 1);
+  }
+  for (name, by) in [
+    REUSED_WHOLE,
+    REUSED_DELTAS,
+    REUSE_REFUSED,
+    REUSE_NO_ENTRY,
+    REUSE_UNREAD,
+    REUSE_CRC_MISSED,
+  ]
+  .iter()
+  .zip(reused)
+  {
+    if by > 0 {
+      state.count(name, by);
+    }
   }
   if past > 0 {
     state.count(UNITS_PAST_BUDGET, past);
@@ -301,7 +380,7 @@ pub(crate) fn relieve(
   }
   let per_byte_ns = amount_of(row.derive_ns) / amount_of(row.derive_bytes);
   let reads = amount_of(row.fetch.begun) / amount_of(row.intake.answered.max(1));
-  let price = exchange(&state.config);
+  let price = exchange(state);
   let prices = Prices {
     ns_per_byte: amount_of(price.ns) / amount_of(price.bytes.max(1)),
     pressure,
@@ -351,22 +430,107 @@ pub(crate) fn relieve(
 
 /// Drops repository `id`'s encoding under way, if any: its repository is freed.
 pub(crate) fn abandon(state: &mut ShardState, id: RepositoryId) {
-  state.vcs_stores.encodings.0.remove(&id);
+  drop_under_way(state, id);
   state.vcs_stores.encodings.1.remove(&id);
 }
 
-/// Turns repository `id`'s encoding until every version's fragments are kept, yielding between turns (the module doc):
-/// what a fetch's request runs before its answer is made. Returns at once where the shard's state is not lent.
-pub(crate) async fn settle_encodings(id: RepositoryId) {
+/// Drops repository `id`'s encoding under way, if any, what it charged the content store given back first (A-856).
+fn drop_under_way(state: &mut ShardState, id: RepositoryId) {
+  let stores = &mut state.vcs_stores;
+  if let Some((mut encoding, _)) = stores.encodings.0.remove(&id)
+    && let Some(content) = stores.content.as_mut()
+  {
+    encoding.release(content);
+  }
+  super::settle(state);
+}
+
+/// Counter: a turn of encoding ahead (the task behind a fetch that stopped waiting) not taken, its repository having no
+/// fetch answered now or holding its learned grant already (A-856). Format: a counter name.
+pub(crate) const AHEAD_STOPPED: &str = "vcs_store.git_encode.ahead_stopped";
+
+/// Counter: bytes of a repository's derived values given back as it went idle (A-856): its encoding under way's parts
+/// and its kept fragments past its learned grant. Format: a counter name.
+pub(crate) const GIVEN_BACK_IDLE: &str = "vcs_store.git_encode.given_back_idle";
+
+/// Whether repository `id`'s encoding may be turned ahead of any fetch waiting on it (A-856, main's ruling of
+/// 2026-11-22 00:30: derived data made ahead is charged to the repository's learned budget, and nothing grows while no
+/// client is connected): only while a fetch of it is answered now, and only while what it holds is within its learned
+/// grant (`crate::vcs_share::budget`); none before a grant is learned, so nothing is made ahead without a budget.
+fn ahead_allowed(state: &mut ShardState, id: RepositoryId) -> bool {
+  if crate::vcs_share::fetches_live(id) == 0 {
+    return false;
+  }
+  let held = crate::vcs_share::held(state, id);
+  crate::vcs_share::budget(state, id).is_some_and(|grant| held < grant)
+}
+
+/// Gives back what repository `id` holds of derived values as it goes idle (A-856, "given back when idle"): its
+/// encoding under way dropped (its parts' charge with it; the next fetch begins that version again), the objects its
+/// reads keep let go (A-860), and its kept
+/// fragments past its learned grant given back by §4.11's cost model ([`relieve`]); counted [`GIVEN_BACK_IDLE`]. A
+/// repository with no grant learned yet keeps its fragments: nothing tells what they are worth.
+pub(crate) fn give_back_idle(state: &mut ShardState, id: RepositoryId) {
+  // Goal 93 item 2b: the landed packs it owes a let-go, now that no fetch of it is answered (`vcs_store::let_go_owed`).
+  super::let_go_owed(state, id);
+  let under_way = state
+    .vcs_stores
+    .encodings
+    .0
+    .get(&id)
+    .map_or(0, |(encoding, _)| encoding.held_bytes());
+  drop_under_way(state, id);
+  // A-860: what its reads keep (the objects read lately, git's delta base cache) is given back too, its budget kept.
+  let recent = state.vcs_stores.git(id).map_or(0, |(content, store)| {
+    store.repository.let_go_recent(content)
+  });
+  let mut given = under_way.saturating_add(recent);
+  if let Some(grant) = crate::vcs_share::budget(state, id) {
+    let held = crate::vcs_share::held(state, id);
+    if held > grant {
+      let pressure = slates_vcs::amount_of(held) / slates_vcs::amount_of(grant.max(1));
+      given = given.saturating_add(relieve(state, id, held.saturating_sub(grant), pressure));
+    }
+  }
+  if given > 0 {
+    state.count(GIVEN_BACK_IDLE, given);
+  }
+}
+
+/// Whether a task is making repository `id`'s encoding ahead now ([`encode_behind`]).
+pub(crate) fn ahead_under_way(state: &ShardState, id: RepositoryId) -> bool {
+  state.vcs_stores.encodings.1.contains(&id)
+}
+
+/// Turns repository `id`'s encoding ahead, behind a fetch that stopped waiting (A-718 continued, A-856), yielding
+/// between turns: while [`ahead_allowed`] allows it, until every version's fragments are kept. Where it stops allowed,
+/// counted [`AHEAD_STOPPED`], and its repository has no fetch answered now, what it holds is given back
+/// ([`give_back_idle`]). Returns at once where the shard's state is not lent.
+async fn encode_ahead(id: RepositoryId) {
   loop {
-    match crate::state::with_state_counted(|state| turn(state, id)) {
-      Some(Turned::More) => slates_rt::futures::yield_now().await,
+    let turned = crate::state::with_state_counted(|state| {
+      if !ahead_allowed(state, id) {
+        state.count(AHEAD_STOPPED, 1);
+        if crate::vcs_share::fetches_live(id) == 0 {
+          give_back_idle(state, id);
+        }
+        return Turned::Idle;
+      }
+      turn(state, id)
+    });
+    match turned {
+      Some(Turned::More) => {
+        // A window a turn's read met let go is brought back before the next turn reads it again.
+        if !super::upload::brought_back_waited(id).await {
+          slates_rt::futures::yield_now().await;
+        }
+      }
       Some(Turned::Idle) | None => return,
     }
   }
 }
 
-/// A fetch's encoding (A-718 continued): repository `id`'s encoding turned as [`settle_encodings`] turns it, for at most
+/// A fetch's encoding (A-718 continued): repository `id`'s encoding turned a turn at a time, yielding between, for at most
 /// [`FETCH_WAIT_NS`]; past it the fetch answers, and a task finishes the encoding behind it ([`encode_behind`]).
 pub(crate) async fn encode_for_fetch(id: RepositoryId) {
   encode_within(id, FETCH_WAIT_NS).await;
@@ -381,21 +545,27 @@ pub(crate) async fn encode_within(id: RepositoryId, wait_ns: u64) -> bool {
         let _ = crate::state::with_state_counted(|state| encode_behind(state, id));
         return false;
       }
-      Some(Turned::More) => slates_rt::futures::yield_now().await,
+      Some(Turned::More) => {
+        // A window a turn's read met let go is brought back before the next turn reads it again.
+        if !super::upload::brought_back_waited(id).await {
+          slates_rt::futures::yield_now().await;
+        }
+      }
       Some(Turned::Idle) | None => return true,
     }
   }
 }
 
 /// Starts a task finishing repository `id`'s encoding behind a fetch that stopped waiting, unless one is at it already;
-/// counted [`BEHIND`]. The task ends when the encoding is idle, the repository freed or the shard's state gone.
+/// counted [`BEHIND`]. The task ends when the encoding is idle, the repository freed or the shard's state gone, or when
+/// it may no longer be made ahead ([`encode_ahead`], A-856).
 fn encode_behind(state: &mut ShardState, id: RepositoryId) {
   state.count(BEHIND, 1);
   if !state.vcs_stores.encodings.1.insert(id) {
     return;
   }
   let behind = async move {
-    settle_encodings(id).await;
+    encode_ahead(id).await;
     let _ = crate::state::with_state_counted(|state| state.vcs_stores.encodings.1.remove(&id));
   };
   match slates_rt::futures::spawn(behind) {
@@ -407,6 +577,18 @@ fn encode_behind(state: &mut ShardState, id: RepositoryId) {
       state.vcs_stores.encodings.1.remove(&id);
     }
   }
+}
+
+/// The units repository `id`'s encoding under way has done (none when none is under way): a test's sign that its turns
+/// progress (`vcs_store::upload::tests`'s judge of a drive).
+#[cfg(test)]
+pub(crate) fn units_done(state: &ShardState, id: RepositoryId) -> Option<u64> {
+  state
+    .vcs_stores
+    .encodings
+    .0
+    .get(&id)
+    .map(|(encoding, _)| encoding.counters().units)
 }
 
 #[cfg(test)]

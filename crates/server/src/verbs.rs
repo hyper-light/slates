@@ -4590,6 +4590,8 @@ fn gather_status(request: u64, shard: u16, part: Option<ShardReport>) {
 pub fn shard_report(state: &mut ShardState, memory: bool) -> ShardReport {
   // First, mutably: the residency the memory report reads, when asked (A-744; main's ruling on g228's finding).
   let content_ranges = crate::content_ranges::report(state, memory);
+  // The gauges of what holds the shard's memory, when asked (main's ruling of 2026-11-22 03:46).
+  let memory_gauges = crate::memory_gauges::rows(state, memory);
   let now = state.clock.monotonic_ns();
   let since_boot = now.saturating_sub(state.booted_ns);
   let ring_depth: u64 = state
@@ -4821,6 +4823,7 @@ pub fn shard_report(state: &mut ShardState, memory: bool) -> ShardReport {
       )
       .chain(large_counts(state))
       .chain(content_ranges)
+      .chain(memory_gauges)
       .chain(crate::live_ship::hop_rows(state))
       .chain(busy_harvest_rows())
       .collect(),
@@ -10701,7 +10704,7 @@ fn held_outcome(
 /// Applies the verdict `parts` holds to its green (A-805): at the head it was judged at, as its chain entry records it
 /// (`Green::apply_recorded`, the replay a recovery runs). Whether it committed as its version; false, nothing applied,
 /// where the green moved since or is not here.
-pub(crate) fn apply_accepted(state: &mut ShardState, parts: &AcceptedParts) -> bool {
+pub(crate) fn apply_accepted(state: &mut ShardState, parts: &mut AcceptedParts) -> bool {
   let Some(mut engine) = state.greens.get_mut(&parts.green) else {
     return false;
   };
@@ -10709,7 +10712,7 @@ pub(crate) fn apply_accepted(state: &mut ShardState, parts: &AcceptedParts) -> b
     return false;
   }
   let applied = parts.applied.as_deref().unwrap_or_default();
-  engine.apply_recorded(&parts.increment, applied) == parts.version
+  engine.apply_recorded(&mut parts.increment, applied) == parts.version
 }
 
 /// A green's verdict on an increment and what it applied ([`slates_merge::engine`]'s `submit_resolved`).
@@ -19339,7 +19342,7 @@ fn restore_held_image(
     crate::vcs_store::restore_windows(
       state,
       &held.windows,
-      (&held.lists, &held.names, &held.region_holds),
+      (&held.lists, &held.names, &held.region_holds, &held.aways),
     );
   }
   state.store.content.arena_mut().commit_live();
@@ -19546,10 +19549,14 @@ async fn rebuild_record(
         .repositories()
         .member(record.id)
         .cloned();
+      // A Subversion green's named texts the content store lacks brought back first (A-760's pre-pass), and given back
+      // once it is replayed.
+      let brought = crate::vcs_store::svn_texts::bring_back_named(state, record.id, slices).await;
       let versions = match member {
         Some(member) => rebuild_member_sliced(state, record, &member, slices).await,
         None => rebuild_green_sliced(state, record, slices).await,
       };
+      crate::repository::svn_commit::release_texts(state, None, &brought);
       for version in versions {
         crate::merge_service::enqueue_recovered_record(state, record.id, version);
         slices.unit_done().await;
@@ -20411,8 +20418,8 @@ fn replay_chain_entry(
       return Ok(false);
     }
   }
-  let entry = *entry;
-  let accepted = green.apply_recorded(&entry.increment, &entry.applied);
+  let mut entry = *entry;
+  let accepted = green.apply_recorded(&mut entry.increment, &entry.applied);
   if accepted != version {
     return Err(GreenFence::WrongVersion { version, accepted });
   }
@@ -24760,6 +24767,9 @@ mod tests {
       ),
       "{submitted:?}"
     );
+    // The checkpoint the reset's floor move began, taken whole if it went to turns (A-579): it does when anything waits
+    // on the shard, and no turn runs inside this step.
+    crate::merge_service::settle_checkpoints(state);
     super::to_db_volume(id)
   }
 

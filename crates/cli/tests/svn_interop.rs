@@ -506,8 +506,12 @@ struct Anchor {
   instance: String,
   drain: Option<std::thread::JoinHandle<()>>,
   /// The directory its daemon's changeset store lives in (`--vcs-store`; C2: a daemon without one makes no Subversion
-  /// repository), removed after the anchor is killed; none where the caller named its own.
-  _store: Option<Scratch>,
+  /// repository), removed after the anchor is killed, once what the daemon mounted in it is unmounted; none where the
+  /// caller named its own.
+  store: Option<Scratch>,
+  /// The store directory its daemon was given, its own or the caller's: where the daemon mounts its hook views, each
+  /// let go before the daemon is stopped.
+  store_dir: Option<String>,
 }
 
 impl Drop for Anchor {
@@ -516,6 +520,12 @@ impl Drop for Anchor {
   /// [`DRAIN_PATIENCE`]: main's all-verbs round of 2026-11-21 sat at 0% CPU for 18 minutes after a failed assertion,
   /// joining a drain the daemon's side still held.
   fn drop(&mut self) {
+    // The hook views the daemon mounted in its store let go first, while the daemon still serves them: a kernel NFS
+    // mount whose server dies under it panicked a Mac twice (2026-10-06, `com.apple.filesystems.nfs`), so no daemon is
+    // stopped under a live one, and none is force-unmounted after its daemon is gone.
+    if let Some(dir) = self.store_dir.as_deref() {
+      unmount_under(dir);
+    }
     let _ = self.child.kill();
     let _ = self.child.wait();
     for pid in instance_processes(&self.instance) {
@@ -534,7 +544,74 @@ impl Drop for Anchor {
         );
       }
     }
+    if let Some(store) = self.store.take() {
+      removed_within(store);
+    }
   }
+}
+
+/// Lets go every mount beneath `dir`, deepest first, each `umount` waited for at most [`DRAIN_PATIENCE`]: an anchor's
+/// guard calls it while its daemon still serves the hook views it mounted in its store (`slates mount`, A-645 (a)), so
+/// each unmount is answered by a live server.
+fn unmount_under(dir: &str) {
+  let mut mounted = mounts_under(dir);
+  mounted.sort_by_key(|path| std::cmp::Reverse(path.len()));
+  for path in mounted {
+    let Ok(mut unmounting) = Command::new("umount")
+      .arg(&path)
+      .stdin(Stdio::null())
+      .stdout(Stdio::null())
+      .stderr(Stdio::null())
+      .spawn()
+    else {
+      continue;
+    };
+    let started = Instant::now();
+    while unmounting.try_wait().ok().flatten().is_none() && started.elapsed() < DRAIN_PATIENCE {
+      pause();
+    }
+    let _ = unmounting.kill();
+    let _ = unmounting.wait();
+  }
+}
+
+/// Removes an anchor's store directory once its views are unmounted and its daemon is gone (main 01a20182's run
+/// 45011974996: a red run's cleanup sat 900 s in `remove_dir_all`'s `openat`), on a thread of its own, waited for at
+/// most [`DRAIN_PATIENCE`]; where it is still held, said so and left, so a red run ends red rather than hanging.
+fn removed_within(store: Scratch) {
+  let path = store.path.clone();
+  let removing = std::thread::spawn(move || drop(store));
+  let started = Instant::now();
+  while !removing.is_finished() && started.elapsed() < DRAIN_PATIENCE {
+    pause();
+  }
+  if removing.is_finished() {
+    let _ = removing.join();
+  } else {
+    eprintln!(
+      "the anchor's store {path} was still held {DRAIN_PATIENCE:?} after its views and daemon were let go: left behind"
+    );
+  }
+}
+
+/// The mount points `mount` lists beneath `dir` (each line's `on PATH (` on macOS, `on PATH type` on Linux).
+fn mounts_under(dir: &str) -> Vec<String> {
+  let Ok(listed) = Command::new("mount").stdin(Stdio::null()).output() else {
+    return Vec::new();
+  };
+  String::from_utf8_lossy(&listed.stdout)
+    .lines()
+    .filter_map(|line| {
+      let (_, rest) = line.split_once(" on ")?;
+      let end = rest
+        .find(" (")
+        .into_iter()
+        .chain(rest.find(" type "))
+        .min()?;
+      Some(rest.get(..end)?.to_owned())
+    })
+    .filter(|path| path.starts_with(dir))
+    .collect()
 }
 
 /// Shape: how long a dropped anchor's drain may take to end once its processes are killed: a guard against a holder
@@ -625,11 +702,19 @@ fn start_anchor(instance: &str, edges: &[&str]) -> (Anchor, Vec<String>, IssuerS
     .spawn()
     .unwrap();
   let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+  let store_dir = store.as_ref().map(|store| store.path.clone()).or_else(|| {
+    edges
+      .iter()
+      .position(|edge| *edge == "--vcs-store")
+      .and_then(|at| edges.get(at + 1))
+      .map(|dir| (*dir).to_owned())
+  });
   let mut anchor = Anchor {
     child,
     instance: instance.to_owned(),
     drain: None,
-    _store: store,
+    store,
+    store_dir,
   };
   let (lines, issuer) = lines_until_serving(&mut stderr, instance);
   anchor.drain = Some(std::thread::spawn(move || {
@@ -946,7 +1031,7 @@ fn holds_a_timestamp(line: &str) -> bool {
 /// `<date>` element whose value is on it, left out; `author` (the leg's one committer) written `AUTHOR`; `url` (the
 /// leg's repository URL) written `URL`. Nothing else is changed.
 fn comparable(output: &str, author: &str, url: &str) -> String {
-  let ordered = attributes_in_order(output);
+  let ordered = entries_in_order(&attributes_in_order(output));
   ordered
     .lines()
     .filter(|line| !holds_a_timestamp(line))
@@ -1002,6 +1087,44 @@ fn attributes_in_order(output: &str) -> String {
   out
 }
 
+/// `output` with each run of a status's entries in text order, where `output` is `svn status --xml`'s document (a
+/// `<status>` line); any other output as it is. Stock `svn` reports a directory's children in the order its working
+/// copy's children hash yields them, and APR draws each hash's seed afresh (main 01a20182's macOS run of 2026-11-22: the
+/// same 15 entries over HTTPv2 and against `svnserve`, the top directory's in two rotations of one order), so a status's
+/// entry order is no part of what either server answered. Only a status is reordered: `svn list --xml` writes
+/// `<entry>` elements too, in the order the server sorted them, which is compared. Each entry is kept whole, from its
+/// `<entry` line to its `</entry>`, after its attributes are put in order ([`attributes_in_order`]).
+fn entries_in_order(output: &str) -> String {
+  if !output.lines().any(|line| line == "<status>") {
+    return output.to_owned();
+  }
+  let mut out = String::with_capacity(output.len());
+  let mut run: Vec<String> = Vec::new();
+  let mut entry: Option<String> = None;
+  for line in output.lines() {
+    if let Some(open) = entry.as_mut() {
+      open.push_str(line);
+      open.push('\n');
+      if line == "</entry>" {
+        run.extend(entry.take());
+      }
+      continue;
+    }
+    if line == "<entry" {
+      entry = Some(format!("{line}\n"));
+      continue;
+    }
+    run.sort();
+    out.extend(run.drain(..));
+    out.push_str(line);
+    out.push('\n');
+  }
+  run.sort();
+  out.extend(run.drain(..));
+  out.extend(entry);
+  out
+}
+
 /// A line of one attribute as stock `svn`'s XML writer lays it out (`   name="value"`, the tag's close after it on the
 /// last): the attribute and what follows its closing quote; none for any other line.
 fn attribute_line(line: &str) -> Option<(String, String)> {
@@ -1039,6 +1162,41 @@ fn the_comparison_leaves_xml_attribute_order_out_and_nothing_else() {
       attributes_in_order(text),
     ),
     (true, false, text.to_owned())
+  );
+}
+
+/// main 01a20182's macOS run of 2026-11-22 (CI 45018545878, stock svn 1.15 from brew): `svn status -u -v --xml` over
+/// HTTPv2 and against `svnserve` held the same 15 entries, the same in every field, in two orders: the top directory's
+/// children `imported`, `trunk`, `branches`, `tags` in one and `tags`, `imported`, `trunk`, `branches` in the other, one
+/// a rotation of the other, as a hash's order is ([`entries_in_order`]). Do: compare a status whose target holds two
+/// entries in both orders, then with one entry's commit revision changed, and a status of one entry. Expect: the first
+/// two the same once compared, the third still different, the one-entry status unchanged.
+#[test]
+fn the_comparison_leaves_status_entry_order_out_and_nothing_else() {
+  let entry = |path: &str, commit: u32| {
+    format!(
+      "<entry\n   path=\"{path}\">\n<wc-status\n   item=\"normal\"\n   props=\"none\"\n   revision=\"10\">\n\
+       <commit\n   revision=\"{commit}\">\n<author>AUTHOR</author>\n</commit>\n</wc-status>\n</entry>\n"
+    )
+  };
+  let status = |entries: &[String]| {
+    format!(
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<status>\n<target\n   path=\".\">\n{}<against\n   \
+       revision=\"10\"/>\n</target>\n</status>\n",
+      entries.concat()
+    )
+  };
+  let one = status(&[entry("tags", 8), entry("trunk", 9)]);
+  let two = status(&[entry("trunk", 9), entry("tags", 8)]);
+  let changed = status(&[entry("trunk", 9), entry("tags", 7)]);
+  let single = status(&[entry("tags", 8)]);
+  assert_eq!(
+    (
+      comparable(&one, "alice", "URL") == comparable(&two, "alice", "URL"),
+      comparable(&changed, "alice", "URL") == comparable(&two, "alice", "URL"),
+      comparable(&single, "alice", "URL"),
+    ),
+    (true, false, comparable(&single, "nobody", "nowhere"))
   );
 }
 
@@ -1499,6 +1657,7 @@ fn a_repository_policys_hook_lets_stock_svn_change_a_revision_property() {
 
 /// Sends one HTTP/1.1 request to the edge at `port` and reads its whole answer: `method` at `path`, a bearer `token`,
 /// the request's other `headers` and `body`; the answer's text.
+#[cfg(unix)]
 fn edge_request(
   port: u16,
   (method, path): (&str, &str),
@@ -1582,10 +1741,72 @@ fn a_hooks_repos_path_is_the_repositorys_view_mounted_in_the_store_directory() {
   );
 }
 
+/// main 01a20182's constraint of 2026-11-22 03:22 (a kernel NFS mount whose daemon died under it panicked a Mac twice,
+/// 2026-10-06): a test that fails with a hook's view still mounted must have its guard let the view go while its daemon
+/// still serves it. Do: as [`a_hooks_repos_path_is_the_repositorys_view_mounted_in_the_store_directory`], start an
+/// anchor with a store, configure a start-commit hook and POST, so the hook's view is mounted in the store; then fail on
+/// purpose, the anchor's guard dropped as the failure unwinds. Expect: the failure caught; nothing mounted beneath the
+/// store after it, and no process of the instance left. Runs on CI alone (macos-latest and Linux): never on Ada's Macs,
+/// where a guard that stopped the daemon first would panic the machine.
+#[cfg(unix)]
+#[test]
+#[ignore = "CI only (a deliberate failure with a hook view mounted): cargo test -p slates-cli --test svn_interop -- --ignored a_failing_test_lets_its_hook_view_go_before_its_daemon"]
+#[allow(clippy::disallowed_methods)]
+fn a_failing_test_lets_its_hook_view_go_before_its_daemon() {
+  use std::os::unix::fs::PermissionsExt;
+  let instance = format!("svn-view-failing-{}", std::process::id());
+  let scratch = Scratch::new("svn-view-failing");
+  let store = format!("{}/{STORE}", scratch.path);
+  made_directory(&store);
+  let (anchor, lines, issuer) = start_anchor(
+    &instance,
+    &["--vcs-http", "127.0.0.1:0", "--vcs-store", &store],
+  );
+  let port = http_edge_port(&lines);
+  let Some(issuer) = issuer_or_skip(issuer, "the failing test's view") else {
+    return;
+  };
+  create_repository(&instance);
+  let (_, token) = minted_token(&instance, &issuer);
+  let hook = format!("{}/start-commit", scratch.path);
+  std::fs::write(&hook, "#!/bin/sh\nls \"$1\" > /dev/null\nexit 1\n").unwrap();
+  std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+  let given = format!("start-commit={hook}");
+  let (code, out, err) = slates(
+    &instance,
+    &["repository", "policy", REPOSITORY, "--hook", &given],
+  );
+  assert_eq!(code, 0, "policy: {out}{err}");
+  let _ = edge_request(
+    port,
+    ("POST", &format!("/{REPOSITORY}/!svn/me")),
+    &token,
+    &["Content-Type: application/vnd.svn-skel"],
+    b"( create-txn )",
+  );
+  let mounted_before = mounts_under(&store);
+  let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+    let _held = anchor;
+    panic!("a failure on purpose, the hook's view mounted");
+  }));
+  let left_mounted = mounts_under(&store);
+  let left_running = instance_processes(&instance);
+  assert_eq!(
+    (
+      failed.is_err(),
+      mounted_before.len(),
+      left_mounted,
+      left_running
+    ),
+    (true, 1, Vec::<String>::new(), Vec::<u32>::new())
+  );
+}
+
 /// Shape: the revisions of the repository a hook's first view is laid out for: git/git's newest 2,000 first-parent
 /// commits as a dump were the repository whose hooks the owner shard's one liveness budget refused (w-interop's svn
 /// matrix, release, Mac Studio, 2026-11-20: "its owner shard did not answer in time"), and a debug build lays each out
 /// slower than that release did.
+#[cfg(unix)]
 const MANY_REVISIONS: u64 = 2_000;
 
 /// Shape: the files of the one directory every revision of [`many_revisions_dump`] changes a file of: as many as
@@ -1593,10 +1814,12 @@ const MANY_REVISIONS: u64 = 2_000;
 /// FSFS view carries the listing of each directory on a changed path, so each revision costs the view as much as this
 /// listing; a history of one file lays 2,000 revisions out inside a liveness budget even in a debug build (this test
 /// with one file passed on main a51023f57, 22.8 s).
+#[cfg(unix)]
 const MANY_REVISIONS_FILES: u64 = 4_872;
 
 /// A dump of `revisions` revisions under `trunk/`: the first adds [`MANY_REVISIONS_FILES`] files, each later one
 /// changes one of them: the history a hook's first view must lay out a revision at a time.
+#[cfg(unix)]
 fn many_revisions_dump(revisions: u64) -> Vec<u8> {
   let props = |log: &str| format!("K 7\nsvn:log\nV {}\n{log}\nPROPS-END\n", log.len());
   let file = |path: String, action: &str, body: &str| {
@@ -2031,9 +2254,36 @@ fn memory_sample(instance: &str, label: &str) -> MemorySample {
         || line.contains("give_back")
     })
     .collect();
+  // What each holder holds by the daemon's own accounting, summed over the shards (w-shared's gauges), and what the
+  // footprint holds past the live system-path bytes, the mapped blocks' resident pages and the arenas: what the system
+  // allocator kept of freed blocks (`crates/server/src/memory_gauges.rs`).
+  let gauges = gauges_summed(&memory);
+  let arena: u64 = lines
+    .iter()
+    .filter_map(|line| {
+      line
+        .split_once("arena.allocated: ")?
+        .1
+        .trim()
+        .parse::<u64>()
+        .ok()
+    })
+    .sum();
+  let gauge = |name: &str| gauges.get(name).copied().unwrap_or(0);
+  let accounted = gauge("mem.gauge.process.system_live_bytes")
+    .saturating_add(gauge("mem.gauge.process.mapped_resident_bytes"))
+    .saturating_add(arena);
+  let kept = footprint.map(|kib| kib.saturating_mul(1024).saturating_sub(accounted));
   println!(
-    "an_import_measured: memory {label}: daemon RSS {rss} KiB, physical footprint {footprint:?} KiB\n  {}",
-    lines.join("\n  ")
+    "an_import_measured: memory {label}: daemon RSS {rss} KiB, physical footprint {footprint:?} KiB\n  {}\n  \
+     gauges (summed over shards):\n    {}\n  footprint past system live + mapped resident + arena ({accounted} B): \
+     {kept:?} B",
+    lines.join("\n  "),
+    gauges
+      .iter()
+      .map(|(name, value)| format!("{name} {value}"))
+      .collect::<Vec<_>>()
+      .join("\n    ")
   );
   let figure = |line: &str, key: &str| -> Option<u64> {
     line
@@ -2051,11 +2301,54 @@ fn memory_sample(instance: &str, label: &str) -> MemorySample {
       .filter(|line| line.contains("memory: heap "))
       .find_map(|line| figure(line, "resident_bytes="))
       .unwrap_or(0),
-    arena: lines
-      .iter()
-      .filter_map(|line| figure(line, "arena.allocated: "))
-      .sum(),
+    arena,
   }
+}
+
+/// Format: the prefix of the memory status's gauge rows (`crates/server/src/memory_gauges.rs`), each printed by the CLI
+/// as `shard N refused mem.gauge.<holder>.<measure>: <value>`, once a shard and only where non-zero.
+const GAUGE_PREFIX: &str = "mem.gauge.";
+
+/// The memory status's gauges in `memory` (`slates status --memory`'s output), each summed over the shards that report
+/// it, by name: what each holder of the daemon's memory holds by its own accounting (w-shared's gauges, main 01a20182's
+/// ruling of 2026-11-22 03:46: one mechanism for every measurement).
+fn gauges_summed(memory: &str) -> std::collections::BTreeMap<String, u64> {
+  let mut summed = std::collections::BTreeMap::new();
+  for line in memory.lines() {
+    let Some((_, row)) = line.split_once(" refused ") else {
+      continue;
+    };
+    let Some((name, value)) = row.split_once(": ") else {
+      continue;
+    };
+    let Ok(value) = value.trim().parse::<u64>() else {
+      continue;
+    };
+    if name.starts_with(GAUGE_PREFIX) {
+      let total: &mut u64 = summed.entry(name.to_owned()).or_default();
+      *total = total.saturating_add(value);
+    }
+  }
+  summed
+}
+
+/// P7's finding (2), main 01a20182's ruling of 2026-11-22 03:46 (an import's reading names the holder of what stays
+/// live). Do: sum a memory status's gauges where two shards report one, one shard another, and a row that is no gauge
+/// sits among them. Expect: each gauge once, summed over its shards; the other row left out.
+#[test]
+fn the_memory_gauges_are_summed_over_the_shards() {
+  let memory = "shard 0 refused mem.gauge.greens.content_bytes: 262144\n\
+                shard 0 refused content_range.arena.allocated: 528384\n\
+                shard 1 refused mem.gauge.greens.content_bytes: 100\n\
+                shard 0 refused mem.gauge.process.system_live_bytes: 7\n";
+  let summed: Vec<(String, u64)> = gauges_summed(memory).into_iter().collect();
+  assert_eq!(
+    summed,
+    vec![
+      ("mem.gauge.greens.content_bytes".to_owned(), 262_244),
+      ("mem.gauge.process.system_live_bytes".to_owned(), 7),
+    ]
+  );
 }
 
 /// Shape: how long a sample waits for `top` to read a footprint it missed (main 01a20182's run of 2026-11-22 01:36 read

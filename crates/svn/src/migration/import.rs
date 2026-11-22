@@ -20,6 +20,17 @@
 //! is checked: a whole text's by the reader, a delta's base and result and a copy source's text here, SHA-1 as well as
 //! MD5. Everything the import holds is charged to the repository's room as it arrives.
 //!
+//! **Texts it holds none of** (goal 93, P7 finding (2); main 01a20182's order of 2026-11-22 05:28). Each text goes into
+//! its caller's sink ([`TextSink`], the seam a client's commit's drive writes through) a piece at a time as it is read
+//! or a window at a time as its delta is applied: staged with its header's length where it has one, named (BLAKE3) and
+//! its MD5 and SHA-1 checked as its bytes pass, sealed at its end, and named stored by its length in the revision it
+//! makes. So the import never holds a text whole: a daemon's sink is the shard's content store, records standing alone
+//! keep theirs in memory ([`super::Standalone`]). A delta whose base the same revision made reads it back from the sink.
+//! The caller owns what the sink staged and sealed: a revision's sealed texts are its own once it commits, and every
+//! staged and sealed text of an import refused part-way is the caller's to give back. Before, each whole text was read
+//! into a buffer of its header's length and carried in its revision to the landing, which put it into the content store:
+//! 26.2 MB of the system heap's churn for 26.2 MB of text, held until the revision landed.
+//!
 //! **Committed by its caller's step** (A-652 part 3). What the import changes in the repository it hands its caller as
 //! a record of the commit step's (`crate::commit::record`), one at a time, and reads on only once the caller committed it
 //! ([`Importing::Commit`]): a revision as made, the UUID, revision 0's properties. A caller that holds the records alone
@@ -29,6 +40,7 @@
 use super::MigrationRefusal;
 use super::paths::{ROOT, absolute, canonical_relpath};
 use super::records::{Facts, Properties, Repository, Transaction, node};
+use crate::commit::drive::{StagedText, TextRefused, TextSink};
 use crate::commit::record::Record;
 use crate::dump::{
   Admission, CopyFrom, Digest, Digests, DumpError, Event, Md5, NodeAction, NodeHeader, Property,
@@ -173,22 +185,29 @@ enum TextForm {
   },
 }
 
-/// A text being read.
+/// A text being read: its bytes in the caller's sink as they are made, never here (module docs, "Texts").
 #[derive(Clone, Debug)]
 struct OpenText {
   /// How the section carries it.
   form: TextForm,
   /// The digests its header names for the result.
   expected: (Option<Md5>, Option<Sha1>),
-  /// The text made so far.
-  bytes: Vec<u8>,
-  /// A delta's base the repository keeps elsewhere, as its caller supplied it ([`Importing::Base`]); none where the
-  /// transaction or the repository holds the base, read from there a window at a time.
+  /// The text in the caller's sink.
+  staged: StagedText,
+  /// A whole text's length, its section header's: a piece past it is refused `Corrupt`. None for a delta's result.
+  length: Option<u64>,
+  /// The bytes made so far.
+  size: u64,
+  /// The BLAKE3 of the bytes made so far: the text's identity at its end.
+  namer: blake3::Hasher,
+  /// The MD5 and SHA-1 of the bytes made so far, checked against the header's at its end.
+  digests: Digests,
+  /// A delta's base the import holds whole for its windows: one the caller supplied ([`Importing::Base`]), or one the
+  /// same revision made, read back from the sink; none where the transaction or the repository holds the base, read
+  /// from there a window at a time.
   base: Option<Vec<u8>>,
-  /// The bytes a whole text charged the room as it opened, its header's length (its buffer made that size once, so its
-  /// pieces never grow it: P7's finding (2), each growth a copy of the text); zero for a delta, whose windows charge as
-  /// they are made.
-  charged: u64,
+  /// The window being applied: its target bytes, put into the sink and cleared before the next.
+  window: Vec<u8>,
 }
 
 impl Importer {
@@ -254,7 +273,8 @@ impl Importer {
 
   /// Reads on from the start of `buffer` (the bytes the last call did not consume, then any received since) against
   /// `repository`, handing over each record it makes ([`Importing::Commit`]: a revision once the next one or the
-  /// stream's end comes); `ended` says `buffer` holds the stream's last bytes.
+  /// stream's end comes), each text it reads or makes put into `texts` as its bytes pass (module docs, "Texts");
+  /// `ended` says `buffer` holds the stream's last bytes.
   ///
   /// # Errors
   /// Every refusal of [`MigrationRefusal`] the stream meets. The records committed before it stay; the revision being
@@ -262,6 +282,7 @@ impl Importer {
   pub fn import(
     &mut self,
     repository: &mut Repository,
+    texts: &dyn TextSink,
     buffer: &[u8],
     ended: bool,
   ) -> Result<Importing, MigrationRefusal> {
@@ -271,7 +292,7 @@ impl Importer {
     if self.done {
       return Ok(Importing::Done);
     }
-    let result = self.run(repository, buffer, ended);
+    let result = self.run((repository, texts), buffer, ended);
     if let Err(refusal) = &result {
       self.refused = Some(refusal.clone());
       self.revision = None;
@@ -283,7 +304,7 @@ impl Importer {
   /// or the stream ends.
   fn run(
     &mut self,
-    repository: &mut Repository,
+    (repository, texts): (&mut Repository, &dyn TextSink),
     buffer: &[u8],
     ended: bool,
   ) -> Result<Importing, MigrationRefusal> {
@@ -306,7 +327,7 @@ impl Importer {
         .map_err(MigrationRefusal::Stream)?
       {
         Read::Event { event, consumed } => {
-          let made = self.take(repository, event)?;
+          let made = self.take((repository, texts), event)?;
           offset = offset
             .checked_add(consumed)
             .ok_or(MigrationRefusal::Corrupt)?;
@@ -341,7 +362,7 @@ impl Importer {
   /// Applies one event: the record it makes for the caller to commit, if it makes one.
   fn take(
     &mut self,
-    repository: &mut Repository,
+    (repository, texts): (&mut Repository, &dyn TextSink),
     event: Event<'_>,
   ) -> Result<Option<Record>, MigrationRefusal> {
     let unmade = |done: Result<(), MigrationRefusal>| done.map(|()| None);
@@ -360,12 +381,12 @@ impl Importer {
       Event::Format(_) | Event::Delta(_) => Ok(None),
       Event::Uuid(uuid) => uuid_record(repository, uuid),
       Event::Revision(header) => self.revision_record(repository, &header),
-      Event::Node(header) => unmade(self.node_record(repository, &header)),
+      Event::Node(header) => unmade(self.node_record((repository, texts), &header)),
       Event::Property(property) => unmade(self.property(repository, property)),
       Event::PropertiesEnd => unmade(self.properties_end(repository)),
-      Event::Text(bytes) => unmade(self.text_piece(repository, bytes)),
-      Event::Window(window) => unmade(self.window(repository, &window)),
-      Event::TextEnd => unmade(self.text_end(repository)),
+      Event::Text(bytes) => unmade(self.text_piece(texts, bytes)),
+      Event::Window(window) => unmade(self.window((repository, texts), &window)),
+      Event::TextEnd => unmade(self.text_end((repository, texts))),
     }
   }
 
@@ -470,7 +491,7 @@ impl Importer {
   /// A node record: its action applied to the transaction, and its sections opened.
   fn node_record(
     &mut self,
-    repository: &mut Repository,
+    (repository, texts): (&mut Repository, &dyn TextSink),
     header: &NodeHeader,
   ) -> Result<(), MigrationRefusal> {
     self.node = None;
@@ -499,27 +520,26 @@ impl Importer {
       });
     }
     if let Some(section) = header.text {
-      let whole = section.delta.is_none();
-      let length = section.length;
-      let mut open = open_text(&path, facts, section)?;
-      // A base the records name but keep elsewhere is asked of the caller before a window reads it.
+      // A whole text staged with its header's length, so the sink sizes what holds it once.
+      let length = section.delta.is_none().then_some(section.length);
+      let staged = texts
+        .stage(length)
+        .map_err(|refused| text_refused(refused, length.unwrap_or(0)))?;
+      let mut open = open_text(&path, facts, section, (staged, length))?;
       if let TextForm::Delta {
         base: Some(identity),
       } = open.form
         && transaction.content(repository, &identity).is_none()
-        && repository.stored_len(&identity).is_some()
       {
-        self.wanted_base = Some(identity);
-      }
-      // A whole text's length is its header's: admitted against the room first, then its buffer made once at that size
-      // (the length is checked before anything is allocated for it).
-      if whole && length > 0 {
-        let bytes = usize::try_from(length).map_err(|_| MigrationRefusal::Corrupt)?;
-        open.charged = self.charge(repository, bytes)?;
-        open.bytes.try_reserve_exact(bytes).map_err(|_| MigrationRefusal::Room {
-          needed: length,
-          room: repository.room().bytes,
-        })?;
+        // A base the same revision made is read back from the sink, held whole for its windows and charged as a
+        // supplied base is; one the records name but keep elsewhere is asked of the caller before a window reads it.
+        if let Some(made) = texts.sealed(&identity) {
+          let made = made.into_owned();
+          self.charge(repository, made.len())?;
+          open.base = Some(made);
+        } else if repository.stored_len(&identity).is_some() {
+          self.wanted_base = Some(identity);
+        }
       }
       self.text = Some(open);
     }
@@ -573,27 +593,26 @@ impl Importer {
     Ok(())
   }
 
-  /// A piece of a whole text, into the buffer its opening sized and charged; a piece past the header's length is refused
-  /// `Corrupt`.
-  fn text_piece(&mut self, repository: &Repository, bytes: &[u8]) -> Result<(), MigrationRefusal> {
-    let charged = self.text.as_ref().map_or(0, |open| open.charged);
-    if charged == 0 {
-      self.charge(repository, bytes.len())?;
-    }
+  /// A piece of a whole text, named and digested as it passes and put into the sink (module docs, "Texts"); a piece past
+  /// the header's length is refused `Corrupt`.
+  fn text_piece(&mut self, texts: &dyn TextSink, bytes: &[u8]) -> Result<(), MigrationRefusal> {
     let open = self.text.as_mut().ok_or(MigrationRefusal::Corrupt)?;
-    let after = u64::try_from(open.bytes.len().saturating_add(bytes.len()))
-      .map_err(|_| MigrationRefusal::Corrupt)?;
-    if charged > 0 && after > charged {
+    let after = u64::try_from(bytes.len())
+      .ok()
+      .and_then(|len| open.size.checked_add(len))
+      .ok_or(MigrationRefusal::Corrupt)?;
+    if open.length.is_some_and(|length| after > length) {
       return Err(MigrationRefusal::Corrupt);
     }
-    open.bytes.extend_from_slice(bytes);
-    Ok(())
+    open.made(texts, bytes, after)
   }
 
-  /// One window of a text delta, applied to the base's bytes in its source view.
-  fn window(&mut self, repository: &Repository, window: &Window) -> Result<(), MigrationRefusal> {
-    let made = usize::try_from(window.target_len).map_err(|_| MigrationRefusal::Corrupt)?;
-    self.charge(repository, made)?;
+  /// One window of a text delta, applied to the base's bytes in its source view, its target put into the sink.
+  fn window(
+    &mut self,
+    (repository, texts): (&Repository, &dyn TextSink),
+    window: &Window,
+  ) -> Result<(), MigrationRefusal> {
     let open = self.text.as_mut().ok_or(MigrationRefusal::Corrupt)?;
     let transaction = self
       .revision
@@ -615,14 +634,27 @@ impl Importer {
     };
     let view = source_view(&base, window.source_offset, window.source_len)
       .ok_or(MigrationRefusal::Delta(SvndiffError::SourceShort))?;
-    apply(window, view, &mut open.bytes).map_err(MigrationRefusal::Delta)
+    open.window.clear();
+    apply(window, view, &mut open.window).map_err(MigrationRefusal::Delta)?;
+    let target = std::mem::take(&mut open.window);
+    let after = u64::try_from(target.len())
+      .ok()
+      .and_then(|len| open.size.checked_add(len))
+      .ok_or(MigrationRefusal::Corrupt)?;
+    let made = open.made(texts, &target, after);
+    open.window = target;
+    made
   }
 
-  /// The end of a text: its digests checked against its header's, and the text set on the node.
-  fn text_end(&mut self, repository: &Repository) -> Result<(), MigrationRefusal> {
+  /// The end of a text: its digests checked against its header's, the text sealed in the sink under its identity and
+  /// set on the node, named stored by its length.
+  fn text_end(
+    &mut self,
+    (repository, texts): (&Repository, &dyn TextSink),
+  ) -> Result<(), MigrationRefusal> {
     let open = self.text.take().ok_or(MigrationRefusal::Corrupt)?;
     let node = self.node.as_ref().ok_or(MigrationRefusal::Corrupt)?;
-    let digests = digests_of(&open.bytes)?;
+    let digests = open.digests.finish().map_err(MigrationRefusal::Stream)?;
     let (md5, sha1) = open.expected;
     check_digests(md5, sha1, digests, |expected, actual| {
       MigrationRefusal::ChecksumMismatch {
@@ -631,16 +663,23 @@ impl Importer {
         actual,
       }
     })?;
-    let size = u64::try_from(open.bytes.len()).map_err(|_| MigrationRefusal::Corrupt)?;
+    let identity = *open.namer.finalize().as_bytes();
+    texts
+      .seal(open.staged, identity)
+      .map_err(|refused| text_refused(refused, open.size))?;
     let transaction = self
       .revision
       .as_mut()
       .and_then(|revision| revision.transaction.as_mut())
       .ok_or(MigrationRefusal::Corrupt)?;
-    let charged = if open.charged > 0 { open.charged } else { size };
-    transaction.set_text(repository, &node.path, open.bytes, digests)?;
-    self.in_flight = self.in_flight.saturating_sub(charged);
-    Ok(())
+    let (md5, sha1) = digests;
+    let text = Text {
+      identity,
+      md5,
+      sha1,
+      size: open.size,
+    };
+    transaction.set_text(repository, &node.path, text)
   }
 
   /// Charges `bytes` more to the repository's room, refused when the repository, its transaction and what the import
@@ -819,7 +858,12 @@ fn copy_source(
 
 /// The text a record's text section opens on the node `facts`: refused on a directory, and for a delta, refused
 /// unless its base is the text its header's checksums name.
-fn open_text(path: &str, facts: Facts, section: TextSection) -> Result<OpenText, MigrationRefusal> {
+fn open_text(
+  path: &str,
+  facts: Facts,
+  section: TextSection,
+  (staged, length): (StagedText, Option<u64>),
+) -> Result<OpenText, MigrationRefusal> {
   if facts.kind != NodeKind::File {
     return Err(MigrationRefusal::KindMismatch {
       path: path.to_owned(),
@@ -846,10 +890,47 @@ fn open_text(path: &str, facts: Facts, section: TextSection) -> Result<OpenText,
   Ok(OpenText {
     form,
     expected: (section.md5, section.sha1),
-    bytes: Vec::new(),
+    staged,
+    length,
+    size: 0,
+    namer: blake3::Hasher::new(),
+    digests: Digests::new().map_err(MigrationRefusal::Stream)?,
     base: None,
-    charged: 0,
+    window: Vec::new(),
   })
+}
+
+impl OpenText {
+  /// Takes `bytes`, the text's next bytes made: named and digested, put into `texts`, the text then `after` bytes long.
+  fn made(
+    &mut self,
+    texts: &dyn TextSink,
+    bytes: &[u8],
+    after: u64,
+  ) -> Result<(), MigrationRefusal> {
+    self.namer.update(bytes);
+    self
+      .digests
+      .update(bytes)
+      .map_err(MigrationRefusal::Stream)?;
+    texts
+      .append(self.staged, bytes)
+      .map_err(|refused| text_refused(refused, after))?;
+    self.size = after;
+    Ok(())
+  }
+}
+
+/// The import's refusal for a sink's refusal of a text that would be `needed` bytes long: past the shard's room, the
+/// room's; any other, `Corrupt` (a text the sink does not know, or holds at its most).
+fn text_refused(refused: TextRefused, needed: u64) -> MigrationRefusal {
+  match refused {
+    TextRefused::Room { available } => MigrationRefusal::Room {
+      needed,
+      room: available,
+    },
+    TextRefused::Held | TextRefused::Unknown => MigrationRefusal::Corrupt,
+  }
 }
 
 /// The properties of the node `facts`, as the transaction holds them.

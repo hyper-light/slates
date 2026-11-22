@@ -105,10 +105,35 @@ pub(crate) trait StoreLender {
   /// lender that learns nothing does nothing.
   fn wrote(&mut self, _hold: &Self::Hold, _bytes: u64) {}
 
+  /// A fetch's answer wrote `bytes` past its first write that waited for the peer, taken in `ns` (A-859 part A,
+  /// `crate::vcs_store::upload::Pacing`): what the shard's link price is learned from. A lender that learns nothing does
+  /// nothing.
+  fn paced(&mut self, _taught: (u64, u64)) {}
+
+  /// Where an answer's `pack` reads next and the let-go window its last turn stopped at (A-864 piece 2): none by
+  /// default, for a source that reads no let-go window.
+  fn pack_reads(_pack: &<Self::Packs as PackSource>::Pack) -> PackReads {
+    PackReads::default()
+  }
+
+  /// Brings back, before an answer's next turn, the let-go window its last turn stopped at and those its next turn
+  /// reads first (A-864 piece 2). Nothing by default.
+  async fn read_ahead(&mut self, _reads: PackReads) {}
+
   /// Makes repository `id`'s store ready for a fetch's answer before it is made (A-718): the shard's lender encodes every
   /// version not yet encoded as its fragments, a turn at a time, yielding between turns, so the answer copies them. A
   /// lender whose store needs nothing made does nothing.
   async fn encode(&mut self, _id: RepositoryId) {}
+}
+
+/// Where an answer's pack reads next and the let-go window its last turn stopped at (A-864 piece 2,
+/// `slates_git::upload::Streamed::pack_reads`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PackReads {
+  /// Where its next turn begins to read a pushed pack.
+  pub(crate) next: Option<slates_git::store::packed::Waited>,
+  /// The let-go window its last turn stopped at.
+  pub(crate) stopped: Option<slates_git::store::packed::Waited>,
 }
 
 /// git's services with upload-pack served from the stores `lender` lends, each request admitted the room its stores'
@@ -138,13 +163,6 @@ impl<L> UploadServices<L> {
       keepalive_ns,
       room_patience_ns: ROOM_PATIENCE_NS,
     }
-  }
-
-  /// These services, an answer held past its room waiting `ns` for more (tests: a patience a test can wait out).
-  #[cfg(test)]
-  pub(crate) fn with_room_patience(mut self, ns: u64) -> Self {
-    self.room_patience_ns = ns;
-    self
   }
 }
 
@@ -179,6 +197,7 @@ impl<L: StoreLender + Clone> GitServices for UploadServices<L> {
       admitted: shard,
       held_since: None,
       room_patience_ns: self.room_patience_ns,
+      pacing: crate::vcs_store::upload::Pacing::default(),
     })
   }
 }
@@ -220,9 +239,22 @@ pub(crate) struct Upload<L: StoreLender> {
   held_since: Option<u64>,
   /// How long it waits held for more room ([`ROOM_PATIENCE_NS`]).
   room_patience_ns: u64,
+  /// What its answer's writes have taught of its link (A-859 part A).
+  pacing: crate::vcs_store::upload::Pacing,
 }
 
 impl<L: StoreLender> Exchange for Upload<L> {
+  /// A write of the answer (A-859 part A): learned into the shard's link price once a write of it has waited for the
+  /// peer; an advertisement's teaches nothing, its bytes too few to fill a socket.
+  fn sent(&mut self, sent: crate::vcs_store::upload::Sent) {
+    if self.advertise || self.answer.is_none() {
+      return;
+    }
+    if let Some(taught) = self.pacing.sent(sent) {
+      self.lender.paced(taught);
+    }
+  }
+
   async fn body(&mut self, run: &[u8]) -> Result<(), Failed> {
     self
       .request_room
@@ -286,6 +318,10 @@ impl<L: StoreLender> Exchange for Upload<L> {
     let Some(made) = answer.as_mut() else {
       return Err(Failed(Status::INTERNAL_SERVER_ERROR));
     };
+    // A-864 piece 2: the windows the next turn reads brought back first, off the turn, so it never meets one let go.
+    if let Some(pack) = made.pack_source() {
+      lender.read_ahead(L::pack_reads(pack)).await;
+    }
     let before = out.len();
     let step = |served: &Served<'_>, packs: &mut L::Packs| {
       let mut spent = packs.turn();

@@ -1627,7 +1627,7 @@ fn a_committed_text_is_let_go_by_the_content_store_and_read_through_the_store() 
     &daemon,
     move || async move {
       let texts = slates_svn::commit::drive::HeldTexts::new();
-      let staged = texts.stage().unwrap();
+      let staged = texts.stage(None).unwrap();
       texts.append(staged, &committed).unwrap();
       texts.seal(staged, named.identity).unwrap();
       let work = Work {
@@ -2283,4 +2283,238 @@ fn t_a724_a_subversion_commit_is_counted_and_learned_on_its_repositorys_usage_ro
     Some((1, 1, Some(4096))),
     "the commit counted and its bytes learned"
   );
+}
+
+/// Shape: [`a_text_refused_part_way_through_its_put_leaves_the_store_as_it_was`]'s text, long enough that the windows
+/// kept before its refusal are many whatever window the store derives.
+const PART_PUT_BYTES: usize = 4 << 20;
+/// Shape: the bytes of that text its reader answers before it refuses the next piece: half of it.
+const PART_PUT_ANSWERED: usize = PART_PUT_BYTES / 2;
+/// Shape: the most its reader answers a piece, so the put takes many steps whatever copy slice the machine derives.
+const PART_PUT_PIECE: usize = 64 << 10;
+
+/// Goal 93 (main 01a20182, 2026-11-22 03:55 PST; a sibling of P7 finding (2)'s `put_window` cut). Do: put a 4 MiB text
+/// into the content store a piece of at most 64 KiB a step (`store_step_from`) until its reader refuses a piece half-way, then
+/// release what the landing holds, as every refused landing does (`release_stored`). Expect: windows kept before the
+/// refusal (the test's non-vacuity), the step refused `Corrupt`, and the store's entries and bytes used what they were
+/// before the put. Failing first: the step took the text's writer out of the landing's `Storing` before the piece was
+/// read and put, so a refusal dropped it with its kept windows still held, and the release found nothing to abandon.
+#[test]
+fn a_text_refused_part_way_through_its_put_leaves_the_store_as_it_was() {
+  let seen = stored(|| async move {
+    let (_svn, _green) = subversion("svn").await;
+    let bytes: Vec<u8> = (0..PART_PUT_BYTES)
+      .map(|at| u8::try_from(at % 251).unwrap_or(0))
+      .collect();
+    let text = identity(&bytes);
+    let reader = |wanted: &ContentIdentity, offset: u64, len: usize| {
+      let start = usize::try_from(offset)
+        .ok()
+        .filter(|start| *wanted == text && *start < PART_PUT_ANSWERED)?;
+      bytes
+        .get(
+          start
+            ..start
+              .saturating_add(len.min(PART_PUT_PIECE))
+              .min(PART_PUT_BYTES),
+        )
+        .map(std::borrow::Cow::Borrowed)
+    };
+    on(|state| {
+      let content = |state: &ShardState| {
+        state
+          .vcs_stores
+          .content()
+          .map(|store| (store.len(), store.used()))
+      };
+      let before = content(state);
+      let mut storing = super::Storing {
+        queue: std::collections::VecDeque::from([(text, u64::try_from(PART_PUT_BYTES).unwrap())]),
+        ..super::Storing::default()
+      };
+      let refused = loop {
+        match super::store_step_from(state, &mut storing, &reader) {
+          Ok(false) => continue,
+          answer => break answer,
+        }
+      };
+      let kept = content(state);
+      super::release_stored(state, storing);
+      (before, kept, refused, content(state))
+    })
+  });
+  let (before, kept, refused, after) = seen;
+  assert!(
+    kept
+      .zip(before)
+      .is_some_and(|(kept, before)| kept.1 > before.1),
+    "windows were kept before the refusal: {before:?} then {kept:?}"
+  );
+  assert_eq!(
+    refused,
+    Err(super::corrupt()),
+    "the step refused at the missing piece"
+  );
+  assert_eq!(after, before, "the store after the refused put's release");
+}
+
+/// Shape: the texts [`an_increment_names_its_stored_texts_and_carries_none_of_their_bytes`] adds, in path order.
+const POST_TEXTS: [(&str, usize); 3] = [
+  ("/trunk/p", 3_000),
+  ("/trunk/q", 1_000),
+  ("/trunk/r", 1_000),
+];
+
+/// Goal 93, P7 finding (2), A-760 for the Subversion landing (main 01a20182's rulings of 2026-11-22 11:05 and ~11:35):
+/// a text stored in the content store is named by its increment, never copied into its post-state. Do: land revision 1,
+/// then stage revision 2's three texts as a landing does (`stage_texts`), check it, and build its green increment.
+/// Expect: the post-state carries none of the texts' bytes; the increment names each text whole, in its rows' order, by
+/// its identity and length; every run is read, the read counted once a byte. Failing first: each text was copied into
+/// the post-state (5,000 bytes inline, no run named), the import's largest per-text copy after A-862.
+#[test]
+fn an_increment_names_its_stored_texts_and_carries_none_of_their_bytes() {
+  let made = |at: u8, len: usize| {
+    let mut bytes = vec![b'x'; len];
+    bytes[0] = at;
+    bytes
+  };
+  let built = stored(move || async move {
+    let (svn, green) = subversion("svn").await;
+    commit((&owner(), svn), first(), None).await.unwrap();
+    let texts: Vec<Vec<u8>> = POST_TEXTS
+      .iter()
+      .zip(1u8..)
+      .map(|((_, len), at)| made(at, *len))
+      .collect();
+    let rows = POST_TEXTS
+      .iter()
+      .zip(&texts)
+      .map(|((path, _), bytes)| file(path, Action::Add, bytes))
+      .collect();
+    let contents: Vec<&[u8]> = texts.iter().map(Vec::as_slice).collect();
+    let mut revision = revision(1, rows, &contents);
+    let (storing, _) = super::stage_texts(svn, &mut revision, Vec::new())
+      .await
+      .unwrap()
+      .unwrap();
+    on(|state| {
+      let read = |state: &ShardState| {
+        state
+          .refusals
+          .get(super::NAMED_READ_BYTES)
+          .copied()
+          .unwrap_or(0)
+      };
+      // The records' room lent for the step, as a landing's check is lent it.
+      assert!(crate::vcs_store::lend_svn(state, svn, 0));
+      let (checked, record) = super::checked(state, svn, revision, None).unwrap();
+      crate::vcs_store::settle_svn(state, svn);
+      let read_before = read(state);
+      let built = super::version_of(
+        state,
+        (svn, green),
+        (&checked, Default::default()),
+        super::identity(&record),
+      )
+      .unwrap();
+      super::release_stored(state, storing);
+      let named: Vec<([u8; 32], u64, u64)> = built
+        .named
+        .runs
+        .iter()
+        .map(|run| (run.identity.hash, run.identity.len, run.len))
+        .collect();
+      (
+        built.post_state.len(),
+        named,
+        built.unread().is_none(),
+        read(state).saturating_sub(read_before),
+      )
+    })
+  });
+  let expected: Vec<([u8; 32], u64, u64)> = POST_TEXTS
+    .iter()
+    .zip(1u8..)
+    .map(|((_, len), at)| {
+      let len_bytes = u64::try_from(*len).unwrap();
+      (identity(&made(at, *len)), len_bytes, len_bytes)
+    })
+    .collect();
+  let texts: u64 = POST_TEXTS.iter().map(|(_, len)| *len as u64).sum();
+  assert_eq!(built, (0, expected, true, texts));
+}
+
+/// Shape: the lengths of the two texts [`an_increments_record_names_its_texts_not_their_bytes`] builds increments of.
+const RECORDED_TEXTS: [usize; 2] = [1_000, 100_000];
+
+/// A-760 for the Subversion landing, its log's side (main 01a20182's ruling of 2026-11-22 ~11:35, piece (b)). Do: land
+/// revision 1, then build revision 2's green increment twice, each adding one file at the same path, once with a text of
+/// 1,000 bytes and once with one of 100,000. Expect: the two increments' encodings (what the chain entry records, or
+/// names, of its revision) the same length: a text is recorded by its name, never its bytes. Failing first (before
+/// A-760's naming): each encoding carried its text inline, 99,000 bytes apart.
+#[test]
+fn an_increments_record_names_its_texts_not_their_bytes() {
+  let encoded = stored(|| async move {
+    let (svn, green) = subversion("svn").await;
+    commit((&owner(), svn), first(), None).await.unwrap();
+    let mut lengths = Vec::new();
+    for len in RECORDED_TEXTS {
+      let bytes = vec![b'r'; len];
+      let rows = vec![file("/trunk/recorded", Action::Add, &bytes)];
+      let mut revision = revision(1, rows, &[&bytes]);
+      let (storing, _) = super::stage_texts(svn, &mut revision, Vec::new())
+        .await
+        .unwrap()
+        .unwrap();
+      let length = on(|state| {
+        assert!(crate::vcs_store::lend_svn(state, svn, 0));
+        let (checked, record) = super::checked(state, svn, revision, None).unwrap();
+        crate::vcs_store::settle_svn(state, svn);
+        let built = super::version_of(
+          state,
+          (svn, green),
+          (&checked, Default::default()),
+          super::identity(&record),
+        )
+        .unwrap();
+        super::release_stored(state, storing);
+        built.encode().len()
+      });
+      lengths.push(length);
+    }
+    lengths
+  });
+  assert_eq!(encoded.first(), encoded.get(1), "{encoded:?}");
+}
+
+/// Goal 93, A-760's append (main 01a20182's ruling of 2026-11-22 ~11:50: `judge_named` in the append every push shares,
+/// its own landing). Do: land revision 1, then commit revision 2 adding a file of 50,000 bytes, its text stored and
+/// named (A-865). Expect: its text read once (`NAMED_READ_BYTES`), and its verdict taking the read buffer rather than
+/// cloning it (`push::READ_CLONED_BYTES` 0). Failing first: the append judged with `Green::judge`, which clones every
+/// read buffer into the verdict: 50,000 bytes cloned.
+#[test]
+fn a_named_works_verdict_takes_its_read_texts_and_clones_none() {
+  let counted = stored(|| async move {
+    let (svn, _green) = subversion("svn").await;
+    commit((&owner(), svn), first(), None).await.unwrap();
+    let bytes = vec![b'n'; 50_000];
+    let rows = vec![file("/trunk/named", Action::Add, &bytes)];
+    let read = |state: &ShardState, name: &str| state.refusals.get(name).copied().unwrap_or(0);
+    let before = on(|state| {
+      (
+        read(state, super::NAMED_READ_BYTES),
+        read(state, crate::repository::push::READ_CLONED_BYTES),
+      )
+    });
+    commit((&owner(), svn), revision(1, rows, &[&bytes]), None)
+      .await
+      .unwrap();
+    on(|state| {
+      (
+        read(state, super::NAMED_READ_BYTES).saturating_sub(before.0),
+        read(state, crate::repository::push::READ_CLONED_BYTES).saturating_sub(before.1),
+      )
+    })
+  });
+  assert_eq!(counted, (50_000, 0), "(read, cloned)");
 }
