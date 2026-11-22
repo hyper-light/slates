@@ -215,3 +215,4 @@ Plan: a section per pool extent, closed when wholly free; the anchor holds each 
   into a run doubling from one unit, claim(want) best fit, LAYOUT_VERSION 16, tests for main's two cases. Red tree
   ~/slates-work/w-sizing-claim-red (origin/main + tests, ca8a04b96). Focused runs r8 (fix) and r9 (red) queued: the big
   Studio and main's MacBook did not answer on r3-r7, then every macOS 16-core runner's link went down. Share cap open.
+- A-848 LANDED a953cbd64: 18,564-byte lend 8,589,934,592 -> 16,777,216 bytes of arena (Studio-4). Target deleted. Next: share cap.
