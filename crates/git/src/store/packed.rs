@@ -47,6 +47,15 @@ pub trait PackSource {
   /// The pack `pack` (of `len` bytes) from `offset` on, as far as one lent piece reaches; none where it is not held or
   /// `offset` is past its end.
   fn piece(&self, pack: &ContentId, len: u64, offset: u64) -> Option<Cow<'_, [u8]>>;
+
+  /// Whether the piece at `offset` of `pack` is not lent because it is let go (held on the node's store, not here: A-724
+  /// piece 4, `ContentStore::let_go`): a read that meets it is refused [`PackedRefused::Away`], for its owner to bring it
+  /// back and read again (goal 93, main 01a20182's ruling of 2026-11-22 05:45), never [`PackedRefused::Unread`]. None by
+  /// default: a source that lets nothing go.
+  fn away(&self, pack: &ContentId, len: u64, offset: u64) -> bool {
+    let _ = (pack, len, offset);
+    false
+  }
 }
 
 /// A pack the content store holds, by its identity: a piece is the window `offset` lies in, from `offset` on.
@@ -62,6 +71,37 @@ impl PackSource for ContentStore {
     match self.window_at(pack, len, offset.checked_div(window)?)? {
       Cow::Borrowed(lent) => lent.get(within..).map(Cow::Borrowed),
       Cow::Owned(copied) => copied.get(within..).map(|rest| Cow::Owned(rest.to_vec())),
+    }
+  }
+
+  fn away(&self, pack: &ContentId, len: u64, offset: u64) -> bool {
+    self.away_window(pack, len, offset).is_some()
+  }
+}
+
+/// A let-go piece of a held pack a read met ([`PackedRefused::Away`]), named for its owner to bring back before the read
+/// is taken again (goal 93, main 01a20182's ruling of 2026-11-22 05:45): the pack (its content root), its length, and
+/// the offset met.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Waited {
+  /// The pack.
+  pub pack: ContentId,
+  /// The pack's length.
+  pub len: u64,
+  /// Where in the pack the read met it.
+  pub offset: u64,
+}
+
+impl PackedRefused {
+  /// The let-go piece this refusal met, where it is [`PackedRefused::Away`].
+  pub fn waited(&self) -> Option<Waited> {
+    match *self {
+      PackedRefused::Away { pack, len, at } => Some(Waited {
+        pack,
+        len,
+        offset: at,
+      }),
+      _ => None,
     }
   }
 }
@@ -128,6 +168,16 @@ pub enum PackedRefused {
   /// A REF_DELTA's base leads back to an entry already on the chain.
   Cycle {
     /// Where the entry it led back to begins.
+    at: u64,
+  },
+  /// The bytes at this offset of the pack are let go (held on the node's store, [`PackSource::away`]): its owner brings
+  /// them back and reads again.
+  Away {
+    /// The pack.
+    pack: ContentId,
+    /// The pack's length.
+    len: u64,
+    /// Where in the pack.
     at: u64,
   },
 }
@@ -593,9 +643,17 @@ fn each_window_from(
 ) -> Result<(), PackedRefused> {
   let mut at = place.offset;
   while at < place.len {
-    let lent = store
-      .piece(&place.pack, place.len, at)
-      .ok_or(PackedRefused::Unread { at })?;
+    let Some(lent) = store.piece(&place.pack, place.len, at) else {
+      return Err(if store.away(&place.pack, place.len, at) {
+        PackedRefused::Away {
+          pack: place.pack,
+          len: place.len,
+          at,
+        }
+      } else {
+        PackedRefused::Unread { at }
+      });
+    };
     if lent.is_empty() {
       return Err(PackedRefused::Unread { at });
     }

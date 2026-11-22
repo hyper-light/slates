@@ -58122,6 +58122,15 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > past it; a landing let go uncommitted is abandoned (its liveness channel's sender dropped, the owner woken), the log's
 > end never moved. Held by `a_changeset_lands_in_parts_alone_and_a_dropped_one_leaves_nothing` (`tests/owner.rs`).
 
+> **Status (2026-11-22, C5's read-through: a let-go window brought back; A-863, w-shared, main 01a20182's ruling of
+> 05:45).** A home's RAM copy of a landed pack may go once that home's node store holds it durably (one rule for every f:
+> on a laptop the single home is the owner, which lands the push as one changeset; in a fleet a home holding the pack
+> only in RAM keeps it). A git read of a window let go is refused `PackedRefused::Away` (its pack, length and offset),
+> the `Repository` keeps the first such miss (`Repository::waiting`), and `vcs_store::read_through::bring_back` reads the
+> window from the node's store (`StoreHandle::piece`, the payload by its BLAKE3, `ContentStore::object_identity`) and puts
+> it back (`ContentStore::bring_back`); the driver takes the step again (w-git's, in upload and the encoding). The
+> let-go after a landing itself is item 2b, owed.
+
 > **Status (2026-11-20, C5's store side: git's pack read from the store).** `crates/server/src/vcs_store/store_packs.rs`
 > (`StorePacks`): git's synchronous `PackSource::piece` over the store, which only its owner thread reads. An awaited
 > `fill(pack, len, offset, until)` fetches the store's pieces (`PIECE_BYTES`, aligned in the pack) covering a range
@@ -60814,3 +60823,29 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's RSS round owed.
   system path's live bytes grew 6,582,872 bytes keeping 8 MiB; green, under a tenth of the budget, and a third round's churn
   past the objects handed over under a hundredth. `recent_tests`: a gone chunk's object a miss, a large object a chunk
   of its own, one past the budget not kept, `let_go` holding nothing.
+
+### A-863 — A git read of a let-go window brings it back from the node's store (2026-11-22, w-shared; main 01a20182's ruling of 05:45 PST, goal 93 item 2a; A-767 C5, A-724 piece 4, A-851)
+Applied in the same change to: `crates/git/src/store/packed.rs` (`PackSource::away`, `PackedRefused::Away`, `Waited`),
+`crates/git/src/store/repository.rs` (`waiting`, the first miss kept), `crates/git/src/store/push.rs` (`PushSource`'s
+`away`), `crates/vcs/src/content.rs` (`away_window`, `object_identity`), `crates/server/src/vcs_store/read_through.rs`
+(`bring_back`), `crates/cli/tests/git_interop.rs` (the RSS test prints the memory gauges at each reading), the C5 status.
+
+Status: built 2026-11-22, macOS arm64 (focused tests); the drivers' wait (w-git) and the let-go after a landing (item 2b)
+owed.
+- Why: a landed push's pack is held in RAM twice, its staged copy on the repository's shard and its windows homed in
+  the region (61.3 and 53.9 MB for git/git v2.0.0), while the node's store holds it durably as the changeset's
+  `Payload`. Letting the windows go (A-724 piece 4's `Kept::Away`) needs a read that meets one to bring it back: a let-go
+  window is not lent, so a read of it was refused `Unread`, the object missing.
+- Rule: a `PackSource` says where a piece it does not lend is let go (`away`, false by default); the pack reader refuses
+  such a read `Away` naming the pack, its length and the offset. The `Repository` keeps the first miss its reads meet,
+  not overwritten by a second, so its owner brings back what the step stopped on. `bring_back` finds, on the shard, the
+  window holding the offset and the pack's identity, reads the window's bytes from the node's store off the shard's
+  step, and puts it back within the room its step is lent, checked by its identity; a window back already is nothing to
+  do. Counted (`vcs_store.read_through.brought_back`, `_bytes`).
+- Evidence: `a_read_of_a_let_go_window_names_it_and_reads_once_it_is_brought_back` (git: every read of the update push's
+  let-go pack refused `Away`, brought back, then the object read whole); `a_let_go_window_is_brought_back_from_the_nodes_store_and_read_whole`
+  (server, store-backed: four windows let go, each brought back from the node's store, the object read whole).
+- Open: the let-go after a landing (item 2b), where `ContentStore::let_go` refuses a window more than one holder keeps
+  (`Shared`): a landed push's pack window has several (the push, the repository's pack, its home's region hold), and
+  which may go once the node's store holds the bytes is 2b's.
+

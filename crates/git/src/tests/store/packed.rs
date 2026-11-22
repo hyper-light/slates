@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 
-use slates_vcs::ContentStore;
+use slates_vcs::{ContentId, ContentStore};
 
 use crate::Admission;
 use crate::object_name::{Kind, ObjectFormat, ObjectId};
@@ -432,4 +432,91 @@ fn a_landed_push_is_read_where_it_lies_in_its_stored_pack() {
     grown < inflated,
     "the store grew by {grown} for {inflated} inflated"
   );
+}
+
+/// Goal 93, item 2a (main 01a20182's ruling of 2026-11-22 05:45: a home's RAM copy may go once its node's store holds
+/// the pack, brought back by identity on a read). Do: hold the "update" push's pack in a content store of 64-byte windows,
+/// mark every window landed and let each go; read every object in place, and at each read refused `Away`, bring back the
+/// window it names (its bytes cut from the pack, as the node's store gives them) and read again. Expect: every read of a
+/// let-go window refused `Away` naming the pack, its length and an offset inside a window let go, never `Unread`; and
+/// each object, once its windows are back, the object read whole. Failing first: `Unread`, nothing named to bring back.
+#[test]
+fn a_read_of_a_let_go_window_names_it_and_reads_once_it_is_brought_back() {
+  let (_, request, before) = PUSHES[1];
+  let at = request
+    .windows(4)
+    .position(|magic| magic == b"PACK")
+    .unwrap();
+  let pack = &request[at..];
+  let held = Held(
+    read_whole(before, &Held(BTreeMap::new()))
+      .objects
+      .into_iter()
+      .map(|object| (object.id, (object.kind, object.content)))
+      .collect(),
+  );
+  let whole = read_whole(pack, &held);
+  let mut store = ContentStore::new(1 << 26, SMALL_WINDOW).unwrap();
+  let root = store.put_object(pack).unwrap();
+  let len = u64::try_from(pack.len()).unwrap();
+  // A window is named by the plain BLAKE3 of its bytes, so the pack's cuts name its windows.
+  let windows: Vec<_> = pack.chunks(SMALL_WINDOW).map(ContentId::of).collect();
+  for window in &windows {
+    assert!(store.mark_landed(window));
+    store.let_go(window).unwrap();
+  }
+  let entries = whole
+    .objects
+    .iter()
+    .map(|object| {
+      (
+        object.id,
+        InPack {
+          pack: root,
+          len,
+          offset: object.offset,
+        },
+      )
+    })
+    .collect();
+  let bases = Located {
+    entries,
+    held: &held,
+  };
+  let mut scratch = Scratch::default();
+  let mut out = Vec::new();
+  let mut brought = 0;
+  for object in &whole.objects {
+    let place = InPack {
+      pack: root,
+      len,
+      offset: object.offset,
+    };
+    let kind = loop {
+      match read(
+        &store,
+        (place, ObjectFormat::Sha1),
+        &bases,
+        (&mut scratch, ROOM),
+        &mut out,
+      ) {
+        Ok(kind) => break kind,
+        Err(refused) => {
+          let waited = refused
+            .waited()
+            .unwrap_or_else(|| panic!("at {}: {refused:?}, not Away", object.offset));
+          assert_eq!((waited.pack, waited.len), (root, len));
+          let (window, start, window_len) = store
+            .away_window(&waited.pack, waited.len, waited.offset)
+            .expect("the offset met lies in a window let go");
+          let from = usize::try_from(start).unwrap();
+          let to = from + usize::try_from(window_len).unwrap();
+          store.bring_back(&window, &pack[from..to]).unwrap();
+          brought += 1;
+        }
+      }
+    };
+    assert_eq!((kind, &out), (object.kind, &object.content));
+  }
+  assert!(brought > 0, "no read met a let-go window");
 }

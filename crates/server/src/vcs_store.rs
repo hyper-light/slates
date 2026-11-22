@@ -128,6 +128,7 @@ pub(crate) mod record_names;
 pub(crate) mod referenced;
 #[cfg_attr(not(test), allow(dead_code))]
 // Owed caller: w-git's C5 (the push landed on the store, its replay).
+pub(crate) mod read_through;
 pub(crate) mod store_packs;
 pub(crate) mod svn_import;
 pub(crate) mod svn_made;
@@ -1555,7 +1556,7 @@ fn hand_chunks_back(
 /// A-614's store lists a tree, a tag or a commit within the content store's room (`ContentStore::room`), as A-638's view
 /// does, and a settled store has none, its budget being what it holds. Read only, the stores hold after it what they
 /// held before, so the room lent is given back and nothing is charged.
-fn lent_to_read<T>(
+pub(crate) fn lent_to_read<T>(
   (store, stores): (&mut Store, &mut VcsStores),
   read: impl FnOnce(&VcsStores) -> T,
 ) -> T {
