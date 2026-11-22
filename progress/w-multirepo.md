@@ -13,3 +13,6 @@ Clone: ~/slates-work/w-multirepo; target ~/.cache/w-multirepo-target.noindex; st
 - NEXT piece 2a: slates_vcs::mrc (SHARDS fixed-size MRC, Fenwick distances, pow2 bins of the window, SHARDS_adj).
   Draft at ~/.cache/w-multirepo-scratch/mrc.rs (not in tree). Then 2b decayed rates, 2c utility partition over the
   A-188 floor + WFQ weights, 2d owner-shard wiring + snapshot publication.
+- 17:05 main asked whether piece 1 landed: answered yes (agents_send), 87337c6fa.
+- LANDED 517c732fa (main 8a0483cd8): A-844 slates_vcs::mrc. Reported inbox/main-from-w-multirepo-piece2a.md.
+- NEXT 2b: decayed rates (works/bytes per repository and principal; decay from measured inter-arrival times).
