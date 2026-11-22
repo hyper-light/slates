@@ -688,6 +688,10 @@ impl PackSource for PushSource<'_> {
     }
     self.store.piece(pack, len, offset)
   }
+
+  fn away(&self, pack: &ContentId, len: u64, offset: u64) -> bool {
+    *pack != OWN_PACK && self.store.away(pack, len, offset)
+  }
 }
 
 /// Where a REF_DELTA's base is for an object of the push's pack: an entry of the pack, an object the push holds in the

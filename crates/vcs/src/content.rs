@@ -1708,6 +1708,39 @@ impl ContentStore {
     }
   }
 
+  /// The window of the object `root` (`len` bytes long) that holds byte `offset`, where it is let go
+  /// ([`ContentStore::let_go`]): its identity and its range in the object, for a reader that met it to have its bytes
+  /// brought back ([`ContentStore::bring_back`]) before it reads on. `None` where that window is held, or the store does
+  /// not hold the path down to it.
+  pub fn away_window(
+    &self,
+    root: &ContentId,
+    len: u64,
+    offset: u64,
+  ) -> Option<(ContentId, u64, u64)> {
+    let root = &self.resolve(root);
+    let window = u64::try_from(self.window.get()).ok()?;
+    let fanout = u64::try_from(self.fanout.get()).ok()?;
+    let windows = len.div_ceil(window).max(1);
+    let index = offset.checked_div(window)?;
+    if index >= windows {
+      return None;
+    }
+    let height = list_levels(windows, fanout)?;
+    let identity = self.window_identity(root, (height, fanout), index)?;
+    let Kept::Away { len: away } = self.entries.get(&identity)?.kept else {
+      return None;
+    };
+    let start = index.checked_mul(window)?;
+    Some((identity, start, u64::try_from(away).ok()?))
+  }
+
+  /// The identity (the plain BLAKE3 of its bytes) of the object this store keeps as `root`: the name the node's store
+  /// keys it by. A root that is a window is its own identity.
+  pub fn object_identity(&self, root: &ContentId) -> ContentId {
+    self.rooted.get(root).copied().unwrap_or(*root)
+  }
+
   /// The identity of window `index` under `root`, read down the one list a level of a tree `height` lists deep, each of
   /// `fanout` children: at each level the child is that level's digit of `index` in the fanout's base.
   fn window_identity(

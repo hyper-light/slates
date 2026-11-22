@@ -664,14 +664,17 @@ static LARGE: [[u8; LARGE_LEN]; 6] = [
   [b'f'; LARGE_LEN],
 ];
 
-/// A-767 C1 (the piece-reading intake; R2, a replay holding no payload whole). Do: on a running daemon holding a
-/// changeset store, push six changesets each adding a 128 KiB file (a payload of about 768 KiB, many store pieces);
-/// make the repository's store again from its log (the sliced `vcs_store::rebuild`) and read it once the task ends.
-/// Expect every changeset held again; the replay's window wanted the store's pieces more than once; and it never held
-/// the payload whole, at most one file's delta, a chunk's header and a piece. Red before: the payload was read back
-/// whole (`payload_of`), no want counted.
+/// Format: the segment bound a test's push is cut at: a 128 KiB file's revision a segment, about.
+const SEGMENT_BYTES: u64 = 128 * 1024;
+
+/// A-767 C1 (R2, a replay holding no payload whole), since main 01a20182's ruling (b1) of 2026-11-22 04:44 a push's run
+/// of segment changesets. Do: on a running daemon holding a changeset store, push six changesets each adding a 128 KiB
+/// file (a payload of about 768 KiB, cut at [`SEGMENT_BYTES`]); make the repository's store again from its log (the sliced
+/// `vcs_store::rebuild`) and read it once the task ends. Expect every changeset held again; the push landed as more than
+/// one segment and its run replayed segment by segment; and no byte of its payload read back, its rows appended by
+/// identity. Before (b1) the push's one changeset replayed from its payload a piece at a time, a want a piece.
 #[test]
-fn a_landed_push_replays_from_its_payload_a_piece_at_a_time() {
+fn a_landed_push_replays_as_its_run_of_segments_reading_no_payload() {
   let commits: Vec<Commit> = LARGE
     .iter()
     .zip(["one", "two", "three", "four", "five", "six"])
@@ -683,6 +686,7 @@ fn a_landed_push_replays_from_its_payload_a_piece_at_a_time() {
   let payload = u64::try_from(part.payload.len()).unwrap();
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let repository = crate::daemon::observe_first(&daemon, move |state| {
+    super::super::hg_run::TEST_SEGMENT_BYTES.with(|bound| bound.set(SEGMENT_BYTES));
     let mut hg = Hg::new(state, "pieces");
     let unbundle = Unbundle {
       parts: vec![taken(0, Asks::Changegroup(part))],
@@ -701,38 +705,25 @@ fn a_landed_push_replays_from_its_payload_a_piece_at_a_time() {
       break rebuilding;
     }
   };
-  let (changesets, wants, most) = crate::daemon::observe_first(&daemon, move |state| {
+  let counted = |state: &ShardState, name: &str| state.refusals.get(name).copied().unwrap_or(0);
+  let (changesets, landed, replayed, wants) = crate::daemon::observe_first(&daemon, move |state| {
     let (content, store) = state.vcs_stores.mercurial_ref(repository).unwrap();
     (
       store.index.len(content, Log::Changelog),
-      state
-        .refusals
-        .get(crate::vcs_store::HG_REPLAY_WANTS)
-        .copied()
-        .unwrap_or(0),
-      state
-        .refusals
-        .get(crate::vcs_store::HG_REPLAY_WINDOW_MOST)
-        .copied()
-        .unwrap_or(0),
+      counted(state, super::super::hg_run::SEGMENTS_LANDED),
+      counted(state, crate::vcs_store::HG_REPLAY_SEGMENTS),
+      counted(state, crate::vcs_store::HG_REPLAY_WANTS),
     )
   });
   daemon.stop();
   println!(
-    "A-767 C1 replay: a {payload}-byte payload read in {wants} fills, the window at most {most} bytes"
+    "(b1) replay: a {payload}-byte payload landed as {landed} segments, {replayed} replayed, {wants} payload fills"
   );
   assert!(!rebuilding, "still rebuilding after {TASK_WAIT:?}");
   assert_eq!(changesets, 6);
-  assert!(
-    wants > 1,
-    "the replay wanted the store's pieces {wants} times"
-  );
-  let piece = u64::try_from(slates_store::store::PIECE_BYTES).unwrap();
-  let bound = u64::try_from(LARGE_LEN).unwrap() + piece + 256;
-  assert!(
-    most > 0 && most <= bound && most < payload,
-    "the window held {most} at once, of a {payload}-byte payload"
-  );
+  assert!(landed > 1, "the push landed as {landed} segments");
+  assert_eq!(replayed, landed, "its run replayed segment by segment");
+  assert_eq!(wants, 0, "no byte of its payload read back");
 }
 
 fn assert_plain_landed(state: &ShardState, hg: &Hg, made: &[Made]) {
@@ -1701,6 +1692,152 @@ fn t_a694_a_push_making_two_bookmarks_makes_two_greens() {
       assert_eq!(head(state, green), Some(made[1].node));
     }
   });
+}
+
+std::thread_local! {
+  /// The task holding a run [`a_dropped_runs_turn_comes_back_and_its_sequences_are_landed_again`] cancels.
+  static RUN_TASK: core::cell::Cell<Option<slates_rt::TaskId>> = const { core::cell::Cell::new(None) };
+  /// Whether that task's stand-in changeset landed on the store.
+  static STAND_IN_LANDED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// A push's run, as [`a_dropped_runs_turn_comes_back_and_its_sequences_are_landed_again`] holds one: repository
+/// `repository`'s landing turn taken, one changeset landed on the node's store at its next sequence (a segment's
+/// stand-in, its record no record of the repository's), then held until the task is cancelled.
+async fn run_held_until_dropped(repository: RepositoryId) {
+  let Some(Ok(mut run)) = super::super::hg_run::Run::begin(repository).await else {
+    return;
+  };
+  let landing = crate::state::with_state(|state| {
+    let disk = state.vcs_disk.clone()?;
+    let sequence = state.vcs_stores.next_changeset(repository)?;
+    let header = slates_store::log::Header {
+      tool: slates_store::log::Tool::Mercurial,
+      repository: u128::from_be_bytes(repository.bytes),
+      sequence,
+      judged_over: sequence.saturating_sub(1),
+      grant: 0,
+      work: 0,
+      time_ns: slates_rt::futures::now_ns(),
+      sections: 0,
+    };
+    let parts = vec![(
+      slates_store::log::SectionKind::Record,
+      b"abandoned".to_vec(),
+    )];
+    Some((disk, header, parts))
+  })
+  .flatten();
+  let Some((disk, header, parts)) = landing else {
+    return;
+  };
+  let sequence = header.sequence;
+  if disk.land(header, parts).await.is_ok() {
+    STAND_IN_LANDED.with(|landed| landed.set(true));
+    run.landed(sequence);
+  }
+  std::future::pending::<()>().await;
+  drop(run);
+}
+
+/// Polls the first shard of `daemon` with `look` until it answers true, or [`TASK_WAIT`] passes: whether it did.
+fn until(
+  daemon: &crate::daemon::Daemon,
+  look: impl FnOnce(&mut ShardState) -> bool + Clone + Send + 'static,
+) -> bool {
+  let began = std::time::Instant::now();
+  loop {
+    if crate::daemon::observe_first(daemon, look.clone()) {
+      return true;
+    }
+    if began.elapsed() > TASK_WAIT {
+      return false;
+    }
+  }
+}
+
+/// Main 01a20182's ruling (i) of 2026-11-22 04:44 (the turn ends on every terminal path, a dropped future's included)
+/// and (b1) (an abandoned run's space comes back). Do: on a running daemon holding a changeset store, make a Mercurial
+/// repository; in a task, take its landing turn as a push's run does and land one changeset at its next sequence, then
+/// park; cancel the task; push two changesets to it; make its store again from its log (the sliced
+/// `vcs_store::rebuild`). Expect the turn held and the sequence counted while the task runs; once it is dropped, the
+/// turn free, the repository's next sequence counted from the last named again, the run counted abandoned; the push's
+/// run beginning at the abandoned one's sequence, the store's row there the push's; and the rebuild the push's history.
+#[test]
+fn a_dropped_runs_turn_comes_back_and_its_sequences_are_landed_again() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (repository, root, named) = crate::daemon::observe_first(&daemon, |state| {
+    let hg = Hg::new(state, "dropped");
+    let named = state.vcs_stores.landed_of(hg.repository).unwrap();
+    let task = slates_rt::futures::spawn(run_held_until_dropped(hg.repository)).unwrap();
+    RUN_TASK.with(|held| held.set(Some(task)));
+    (hg.repository, hg.root, named)
+  });
+  let held = until(&daemon, move |state| {
+    state.vcs_stores.svn_landings.held(repository)
+      && STAND_IN_LANDED.with(core::cell::Cell::get)
+      && state.vcs_stores.landed_of(repository) == Some(named + 1)
+  });
+  crate::daemon::observe_first(&daemon, |_| {
+    let task = RUN_TASK.with(core::cell::Cell::take).unwrap();
+    slates_rt::futures::cancel(task).unwrap();
+  });
+  let freed = until(&daemon, move |state| {
+    !state.vcs_stores.svn_landings.held(repository)
+  });
+  let (counted, abandoned, (run, tip)) = crate::daemon::observe_first(&daemon, move |state| {
+    let counted = state.vcs_stores.landed_of(repository);
+    let abandoned = state
+      .refusals
+      .get(super::super::hg_run::RUNS_ABANDONED)
+      .copied()
+      .unwrap_or(0);
+    let made = history_of(&[
+      ("one", "one", b"one\n", None, "default"),
+      ("two", "two", b"two\n", Some(0), "default"),
+    ]);
+    let unbundle = Unbundle {
+      parts: vec![taken(0, Asks::Changegroup(changegroup(&made, &[0, 1])))],
+    };
+    let mut hg = Hg { repository, root };
+    let pushed = hg.push(state, &unbundle, &View::default());
+    assert!(pushed.is_ok(), "{pushed:?}");
+    let records = state.db.partition().repositories();
+    let run = (0..)
+      .map_while(|index| records.object_record(repository, index))
+      .filter_map(slates_hg::import::record::run_of)
+      .last();
+    crate::vcs_store::rebuild(state, repository);
+    (counted, abandoned, (run, made[1].node))
+  });
+  let rebuilt = until(&daemon, move |state| {
+    !state.vcs_stores.rebuilding(repository)
+  });
+  let head = crate::daemon::observe_first(&daemon, move |state| head(state, root));
+  daemon.stop();
+  assert!(
+    held,
+    "the task's run took the turn and landed a changeset at a sequence"
+  );
+  assert!(freed, "the dropped run gave its turn back");
+  assert_eq!(
+    counted,
+    Some(named),
+    "the next sequence counted from the last named"
+  );
+  assert_eq!(abandoned, 1);
+  let run = run.expect("the push's entry names its run");
+  assert_eq!(
+    run.first,
+    named + 1,
+    "the push's run took the abandoned one's sequence"
+  );
+  assert!(rebuilt, "still rebuilding after {TASK_WAIT:?}");
+  assert_eq!(
+    head,
+    Some(tip),
+    "the rebuild replayed the push's run, not the abandoned row"
+  );
 }
 
 /// Main 01a20182's (ii) of 2026-11-22 05:01 (w-interop's whole-history push of hg: its keeping fit its repository's
