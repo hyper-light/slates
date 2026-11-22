@@ -444,9 +444,63 @@ fn t_a856_a_grant_is_learned_from_reads_and_given_back_when_idle() {
     charged >= idle_charged + held,
     "held parts charged: {charged} past {idle_charged}, {held} held"
   );
+  // What it gave back is the parts it held and the objects its reads kept (A-860), so at least the parts.
   assert_eq!(
-    (after, given, under_way),
-    (idle_charged, held, false),
+    (after, under_way),
+    (idle_charged, false),
     "given back when idle"
+  );
+  assert!(given >= held, "given back {given}, the parts {held}");
+}
+
+/// A-860 (main's 04:24 note: `git.recent_bytes`, a repository's objects read lately, held at its budget, 53.9 MB, after a
+/// git/git v2.0.0 clone had ended, 0.2 MB before it; A-856's rule: given back when idle). Do: push the fixtures'
+/// `create` and `update` (their objects read where they lie in their packs); read what the repository's reads keep;
+/// encode its versions as a fetch's wait does (its reads keep the objects they read); then hold its generation as a
+/// fetch does and let the fetch end from a task of the shard, as an edge's request ends. Expect: the encoding's reads
+/// kept more than before; once the fetch ended, what they keep back at or below its figure before, counted
+/// `given_back_idle`. Red before: held at what the encoding left.
+#[test]
+fn t_a860_a_repository_gone_idle_lets_go_of_the_objects_its_reads_keep() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (id, before, during) = crate::daemon::observe_first(&daemon, |state| {
+    let id = crate::git_push::tests::git_repository(state, "idle-reads");
+    crate::git_push::tests::pushed_from_the_fixtures(state, id, &["create", "update"]);
+    let recent = |state: &crate::state::ShardState| {
+      state
+        .vcs_stores
+        .git_ref(id)
+        .map_or(0, |(_, store)| store.repository.recent_bytes())
+    };
+    let before = recent(state);
+    while turn(state, id) == Turned::More {}
+    let during = recent(state);
+    let held = crate::vcs_store::upload::hold_in(state, id, &crate::git_push::tests::owner())
+      .expect("a fetch's hold");
+    let ended = slates_rt::futures::spawn(async move { drop(held) }).expect("a task");
+    let _ = slates_rt::futures::detach(ended);
+    (id, before, during)
+  });
+  let after = crate::daemon::observe_first(&daemon, move |state| {
+    (
+      state
+        .vcs_stores
+        .git_ref(id)
+        .map_or(0, |(_, store)| store.repository.recent_bytes()),
+      state
+        .refusals
+        .get(super::GIVEN_BACK_IDLE)
+        .copied()
+        .unwrap_or(0),
+    )
+  });
+  daemon.stop();
+  assert!(
+    during > before,
+    "the encoding's reads kept nothing: {before} then {during}"
+  );
+  assert!(
+    after.0 <= before && after.1 > 0,
+    "after the fetch: {after:?}, before {before}"
   );
 }

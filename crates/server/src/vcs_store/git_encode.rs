@@ -421,7 +421,8 @@ fn ahead_allowed(state: &mut ShardState, id: RepositoryId) -> bool {
 }
 
 /// Gives back what repository `id` holds of derived values as it goes idle (A-856, "given back when idle"): its
-/// encoding under way dropped (its parts' charge with it; the next fetch begins that version again), and its kept
+/// encoding under way dropped (its parts' charge with it; the next fetch begins that version again), the objects its
+/// reads keep let go (A-860), and its kept
 /// fragments past its learned grant given back by §4.11's cost model ([`relieve`]); counted [`GIVEN_BACK_IDLE`]. A
 /// repository with no grant learned yet keeps its fragments: nothing tells what they are worth.
 pub(crate) fn give_back_idle(state: &mut ShardState, id: RepositoryId) {
@@ -432,7 +433,12 @@ pub(crate) fn give_back_idle(state: &mut ShardState, id: RepositoryId) {
     .get(&id)
     .map_or(0, |(encoding, _)| encoding.held_bytes());
   drop_under_way(state, id);
-  let mut given = under_way;
+  // A-860: what its reads keep (the objects read lately, git's delta base cache) is given back too, its budget kept.
+  let recent = match state.vcs_stores.entries.get(&id) {
+    Some(super::RepositoryStore::Git(store)) => store.repository.let_go_recent(),
+    _ => 0,
+  };
+  let mut given = under_way.saturating_add(recent);
   if let Some(grant) = crate::vcs_share::budget(state, id) {
     let held = crate::vcs_share::held(state, id);
     if held > grant {

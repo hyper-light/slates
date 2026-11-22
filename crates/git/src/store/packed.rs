@@ -367,6 +367,14 @@ impl Recent {
     self.bytes
   }
 
+  /// Gives back every object kept, its budget kept for the reads after (A-860: a repository gone idle holds none).
+  pub fn let_go(&mut self) {
+    self.objects.clear();
+    self.order.clear();
+    self.order.shrink_to_fit();
+    self.bytes = 0;
+  }
+
   /// Holds what is kept to `budget` bytes from now on, the oldest given back to fit.
   pub fn set_budget(&mut self, budget: usize) {
     self.budget = budget;
