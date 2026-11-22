@@ -480,6 +480,32 @@ pub struct PushSegment {
   pub charged: u64,
 }
 
+/// The `Record` of `segment` (main's ruling (b1)): record v8 of a push's source, each log's kept revisions in it read by
+/// identity from `fork`, the intake's fork or the fork it finished as, `room` the room the intake began within; what a
+/// replay appends after the rows the segments before it appended, no text rebuilt. Refused where a row cannot be read
+/// or written.
+pub fn segment_record(
+  fork: &HgIndex,
+  segment: &PushSegment,
+  room: u64,
+  store: &ContentStore,
+) -> Result<Vec<u8>, crate::import::record::WriteRefused> {
+  use crate::import::record::{Source, WriteRefused, Writer};
+  let mut ranges = Vec::new();
+  ranges
+    .try_reserve(segment.ranges.len())
+    .map_err(|_| WriteRefused::Allocation)?;
+  ranges.extend(
+    segment
+      .ranges
+      .iter()
+      .map(|(log, first, end)| (log_named(log), *first, *end)),
+  );
+  let mut writer = Writer::begin_segment(Source::Push, &ranges, room, false)?;
+  while writer.step(fork, store)? {}
+  writer.finish().ok_or(WriteRefused::Allocation)
+}
+
 /// A revision longer than the content store's window taken over as many steps as it has windows (A-767 C1, the push
 /// spin w-balance found: a 64 MiB file revision hashed with sha1dc, hashed again for its identity and kept, in one step,
 /// spun its shard past the watchdog's window): rebuilt in the step that met it; then each step hashes one window of
@@ -807,6 +833,16 @@ impl Intake {
   /// The next segment cut, oldest first; none while the one being cut is short of its bound.
   pub fn take_segment(&mut self) -> Option<PushSegment> {
     self.taker.cutting.as_mut()?.ready.pop_front()
+  }
+
+  /// The `Record` of `segment`, cut from this intake (main's ruling (b1)): [`segment_record`] over its fork.
+  pub fn segment_record(
+    &self,
+    segment: &PushSegment,
+    room: u64,
+    store: &ContentStore,
+  ) -> Result<Vec<u8>, crate::import::record::WriteRefused> {
+    segment_record(&self.taker.fork, segment, room, store)
   }
 
   /// Cuts the segment being cut whatever its length: the push's last, once every unit is taken.

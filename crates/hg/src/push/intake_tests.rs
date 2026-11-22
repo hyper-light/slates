@@ -1296,3 +1296,52 @@ fn an_intakes_widest_full_text_is_the_least_room_a_step_of_it_takes() {
   );
   fork.release(&mut store).unwrap();
 }
+
+/// Main 01a20182's ruling (b1) of 2026-11-22 04:44 (a push's segment changeset's `Record`: record v8, its rows by
+/// identity, as an import's segment's). Do: take stock 7.2's changegroup into an empty index cut at [`SEGMENT_BYTES`],
+/// writing each segment's record as it is cut and the rest's once every unit is taken; replay the records in order into
+/// another empty index over the same content store. Expect more than one record, each a push's; and the replayed
+/// index the intake's fork row for row.
+#[test]
+fn a_pushs_segment_records_replay_in_order_to_its_forks_rows() {
+  let part = stock();
+  let mut store = store();
+  let mut index = HgIndex::new();
+  let mut admission = room();
+  let mut taking = Intake::begin(
+    (part.version, &part.payload),
+    &mut index,
+    &mut store,
+    &mut admission,
+  )
+  .unwrap()
+  .cutting(SEGMENT_BYTES);
+  let mut records = Vec::new();
+  let mut recorded = |taking: &mut Intake, store: &ContentStore| {
+    while let Some(segment) = taking.take_segment() {
+      records.push(taking.segment_record(&segment, 1 << 20, store).unwrap());
+    }
+  };
+  loop {
+    let stepped = taking
+      .step(&part.payload, &mut store, &mut admission)
+      .unwrap();
+    recorded(&mut taking, &store);
+    match stepped {
+      Stepped::Store => taking.answer_from_fork(&store),
+      stepped if more(&stepped) => {}
+      _ => break,
+    }
+  }
+  taking.cut_rest();
+  recorded(&mut taking, &store);
+  let (mut fork, _) = finished(taking);
+  assert!(records.len() > 1, "{} records", records.len());
+  let mut replayed = HgIndex::new();
+  for bytes in &records {
+    crate::import::record::replay(bytes, &mut replayed, &mut store).unwrap();
+  }
+  assert_eq!(rows(&mut replayed, &store), rows(&mut fork, &store));
+  replayed.release(&mut store).unwrap();
+  fork.release(&mut store).unwrap();
+}

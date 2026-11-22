@@ -58208,6 +58208,18 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > An import refused midway leaves an unnamed run that recovery passes over, and the next landing takes the last named
 > sequence plus one (decision 2).
 
+> **Status (2026-11-22, a push lands as a run of segment changesets; main 01a20182's rulings (b1) and (i) of 04:44).**
+> A push's intake cuts its kept texts into segments of an import's size and lands each as it is cut, between its
+> slices: `Record` the segment's rows by identity (record v8, the push's source), `Payload` its slice of the
+> changegroup, `Texts` its texts; what the texts charged the push's admission is given back once each lands. The
+> push's entry names the run (record v9, the push's source byte 1), and a restart replays it as an import's run, rows by
+> identity, no payload read. A run's rows are numbered after the index's, and a replay reads its sequences first to
+> last, so the repository's landing turn (Subversion's, which Mercurial's made changesets hold too) is held from the
+> run's first segment to the entry; a push of the same repository parks for it within the room wait's patience, and a
+> fork made stale before the turn is taken again inside it, never re-based. A run no entry names is abandoned: its
+> sequences are landed again by the next landing, each store row the newest landing at it. A made changeset stays one
+> changeset (record v7). `repository::hg_run`; crash oracle `t_b1_a_crash_at_any_segment_boundary_leaves_a_push_whole_or_absent`.
+
 > **Status (2026-11-21, C1: made changesets on the changeset store; main's ruling of 09:00).** A changeset the server
 > makes of a submitted version is a changegroup the server builds, taken through the push's own intake and landed as
 > a push's changeset (made record, `Payload`, `Texts`), named by a made reference in the register's entry, through the

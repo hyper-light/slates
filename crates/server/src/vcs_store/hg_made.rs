@@ -15,7 +15,7 @@
 //!
 //! **On the changeset store** (A-767 C1; main's ruling of 2026-11-21 09:00, one path). The server builds the made
 //! revisions' changegroup (`slates_hg::push::made::changegroup`), takes it through the push's own intake into a fork
-//! (`hg_push::take_whole`), and lands it as a push's changeset is landed: `Record` (a made record, the green's key and
+//! (`hg_push::take_made`), and lands it as a push's changeset is landed: `Record` (a made record, the green's key and
 //! the version beside the push's head, `import::record::write_made_record`), `Payload`, `Texts`, then the register's
 //! entry naming it by reference (`write_made_reference`). A recorded submit takes the deferred-submit hook (A-807,
 //! `crate::made_commit`, [`make_deferred`]): the repository's landing turn before its verdict, the changeset made from a
@@ -437,7 +437,7 @@ fn prepared(state: &mut ShardState, made: &Made) -> Result<Prepared, Unmade> {
   let changegroup =
     slates_hg::push::made::changegroup(&made.verified, &mut slates_hg::Admission::new(room))
       .map_err(|_| Unmade::Record)?;
-  let taken = crate::repository::hg_push::take_whole(
+  let taken = crate::repository::hg_push::take_made(
     state,
     made.repository,
     (slates_hg::push::made::CHANGEGROUP_VERSION, changegroup),
@@ -449,7 +449,7 @@ fn prepared(state: &mut ShardState, made: &Made) -> Result<Prepared, Unmade> {
     None => return Err(Unmade::NotHead),
   };
   let made_key = (green_key(made.green), made.version);
-  // A made changeset's payload is named whole, as its intake takes it whole (`hg_push::take_whole`; owed, GAPS).
+  // A made changeset's payload is named whole, as its intake takes it whole (`hg_push::take_made`; owed, GAPS).
   let name = slates_hg::import::record::PayloadName::of(&forked.changegroup.1);
   match crate::repository::hg_push::changeset_landing(
     state,
