@@ -57,3 +57,5 @@ Clone: ~/slates-work/w-multirepo; target ~/.cache/w-multirepo-target.noindex; st
 - Asked main (01a20182): piece 7 hg/svn load shape (inbox/main-from-w-multirepo-piece7-hgsvn.md). Remaining queue after
   rulings: pieces 4 (compression of cold content), 5 (intake off the owner shard), 8b (slot derived, re-laid segment),
   9c, per w-balance's handoff notes.
+- main 01a20182 21:35: piece 4 YES (evict past grant) but needs git/hg read-through first (asked); piece 6 HOLD (GAPS
+  line landed); piece 7 (a) LANDED 2beeb7502 multi_repo_stock.py + run request. Tracked .pyc flagged to main.
