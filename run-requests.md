@@ -7475,3 +7475,15 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   shallow clone) have all died while the code was being brought to adacachy2. Owner: the runner path (adacachy2's
   GitHub reach or kiln's link), not a slates test. What would unblock it: a working slates checkout on a Linux x86_64
   runner that I may fetch into.
+
+- w-balance (2026-11-21, A-724 / goal 93 correctness, main's order: many repositories on one daemon; landed 0fb1fd79b):
+    SLATES_MANY_N='2 16 64' SLATES_TEST_HG="uvx --quiet --python 3.12 --from mercurial==7.2 hg" \
+    cargo test --release -p slates-cli --test vcs_many_repositories -- --ignored --nocapture
+  (SLATES_MANY_TOOLS limits the tools; default git hg svn). Platforms: Linux x86_64, macOS arm64, Linux arm64; needs
+  git, stock hg 7.2 and stock svn/svnrdump/svnadmin 1.15, each tool skipped loudly without its client.
+  Green: "MANY N=<n> tools [...]: 0 failures" for every N and the test passes. Red: each "N=<n>: ..." line names the
+  repository and what differed (a push or fetch refused with its client's words; fsck/verify failing; another
+  repository's commits, refs, bookmarks, tags or revisions in its history; its marker wrong; the late repository not
+  whole; the destroyed one still served).
+  Known red today (git, N = 2, macOS debug): only the destroy (no `slates repository destroy` verb exists: completion
+  gap in GAPS); every other check held. A red other than that goes to the tool's owner (w-git, w-hg, w-svn).
