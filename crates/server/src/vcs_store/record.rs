@@ -62,7 +62,7 @@ const MAGIC: u32 = u32::from_le_bytes(*b"SGPR");
 /// moved to a commit it holds, a non-atomic push's later appends) names none: the names' and the pack's identities all
 /// zeros with a count and a length of 0, and a sequence of 0 (C5 part 2b).
 /// Format: this version's number on the wire.
-const VERSION_LANDED: u32 = 6;
+pub(crate) const VERSION_LANDED: u32 = 6;
 
 /// Format: the versions retired by A-824 (C5 part 2b piece 3): 1, each object inflated, and 2 (A-723), the objects
 /// named and the pack inline. Refused [`RecordRefused::Retired`]; 3 and 4, which version 5 replaced, and 5, which

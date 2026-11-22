@@ -356,7 +356,22 @@ pub(crate) fn held_image(state: &ShardState) -> Vec<slates_vfs::recover::HeldPie
       }
     }));
   }
-  // The repository content store's lists and names, so an object past a window is whole after a restart (a3b).
+  // The repository content store's lists, names and objects let go, so an object past a window is whole after a restart
+  // (a3b).
+  vcs_content_pieces(state, &mut pieces);
+  // The windows and objects this shard holds for the region (A-724 piece 8c), so a home's holds survive its restart.
+  for identity in crate::vcs_store::homes::region_held_here() {
+    pieces.push(slates_vfs::recover::HeldPiece {
+      key: vcs_node_key(KIND_VCS_REGION_HOLD, &identity),
+      bytes: identity.0.to_vec(),
+    });
+  }
+  pieces
+}
+
+/// The repository content store's lists, names and objects let go as held pieces (a3b; A-851's windows let go), for
+/// [`held_image`].
+fn vcs_content_pieces(state: &ShardState, pieces: &mut Vec<slates_vfs::recover::HeldPiece>) {
   if let Some(content) = state.vcs_stores.content() {
     for (identity, bytes) in content.lists() {
       pieces.push(slates_vfs::recover::HeldPiece {
@@ -377,14 +392,6 @@ pub(crate) fn held_image(state: &ShardState) -> Vec<slates_vfs::recover::HeldPie
       });
     }
   }
-  // The windows and objects this shard holds for the region (A-724 piece 8c), so a home's holds survive its restart.
-  for identity in crate::vcs_store::homes::region_held_here() {
-    pieces.push(slates_vfs::recover::HeldPiece {
-      key: vcs_node_key(KIND_VCS_REGION_HOLD, &identity),
-      bytes: identity.0.to_vec(),
-    });
-  }
-  pieces
 }
 
 /// A held checkpoint's piece (A-404), keyed by its green.
