@@ -2132,10 +2132,11 @@ fn noise(seed: u64, len: usize) -> Vec<u8> {
 /// 64+32 MiB push spun shard 8 past 3 s in one poll in `hg_push::take` and `hg_push::unbundle`, and the watchdog killed
 /// the daemon). Do: over the HTTP edge, commit a 64 MiB file of noise, then a 32 MiB one, push both with stock 7.2, then
 /// clone. Expect the push to exit 0, the daemon still serving (`slates status`), and the clone holding both changesets.
-/// Ignored: a by-use test main runs (run-requests.md); its red before the fix is the push's `bad HTTP status line`. Still
-/// red in a debug build: the merge engine applies the built 96 MiB increment in one step (GAPS, the sliced apply owed).
+/// Ignored: a by-use test main runs (run-requests.md); its red before the fix is the push's `bad HTTP status line`, and,
+/// in a debug build, the landing's step holding the 96 MiB increment whole (the watchdog's kill in `hg_push::landing`,
+/// fixed by `crate::held_ahead`: 56.7 s in debug, 2026-11-21, MacBook arm64).
 #[test]
-#[ignore = "by use, main's rounds; open: the merge engine applies a large increment in one step (GAPS)"]
+#[ignore = "by use, main's rounds"]
 #[allow(clippy::disallowed_methods)]
 fn stock_hg_pushes_large_files_and_the_daemon_keeps_serving() {
   let Some(hg) = stock_hg() else {

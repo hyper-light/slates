@@ -552,12 +552,22 @@ fn land_then_record(
         },
         1,
       );
+      let landed = landed.map(drop).map_err(|error| {
+        // The store's reason is logged and answered (goal 93; jupiter's red: an owner that could not open its store
+        // was answered `Overloaded` and logged nothing).
+        slates_machine::log_line!(
+          "slates-server: partition {}: repository {}'s creation was not landed: {error}",
+          state.partition,
+          asked.0
+        );
+        refusal_of_owner(state, &error)
+      });
       let reply = recorded_after_landing(
         state,
         &principal,
         (&asked.0, tool, format, &asked.1),
         (adopted, (repository, minted)),
-        (landed.is_ok(), Some(request), svn_created),
+        (landed, Some(request), svn_created),
       );
       (reply, state.shard)
     });
@@ -655,25 +665,40 @@ fn creation_changeset(
   Ok((header, parts, svn_created))
 }
 
+/// The refusal a creation the store did not land answers (goal 93): a full owner queue is the shard's `Overloaded`, to
+/// retry; anything else is the store's own reason, `StoreRefused` (an owner gone, a store that could not be opened, a
+/// refused write). Until jupiter's red of 2026-11-21 every one was `Overloaded`, which hid the store's reason.
+fn refusal_of_owner(state: &ShardState, error: &slates_store::owner::OwnerError) -> Refusal {
+  match error {
+    slates_store::owner::OwnerError::Busy => Refusal::Overloaded { shard: state.shard },
+    other => Refusal::StoreRefused {
+      reason: other.to_string(),
+    },
+  }
+}
+
+/// A creation's landing as [`recorded_after_landing`] records it: what the store answered, the client's request (its origin
+/// and id) where a client asked, and a Subversion repository's creation record.
+type CreationLanded = (
+  Result<(), Refusal>,
+  Option<(u64, slates_wire::request::RequestId)>,
+  Vec<u8>,
+);
+
 /// A landed creation recorded (A-767 item 7, the second step): in one transaction the repository, its root and, for a
 /// client's `request`, its completion, a Subversion repository's from its creation record `svn_created` (C2); a
-/// creation the store refused answered `Overloaded`, nothing recorded of it.
+/// creation the store did not land answered its refusal ([`refusal_of_owner`]), nothing recorded of it.
 fn recorded_after_landing(
   state: &mut ShardState,
   principal: &Principal,
   asked: (&str, VcsTool, ObjectFormat, &str),
   ids: (Option<DbVolumeId>, (RepositoryId, Option<DbVolumeId>)),
-  (landed, request, svn_created): (
-    bool,
-    Option<(u64, slates_wire::request::RequestId)>,
-    Vec<u8>,
-  ),
+  (landed, request, svn_created): CreationLanded,
 ) -> ReplyBody {
   state.db.begin();
-  let reply = if landed {
-    record_created(state, principal, asked, ids, svn_created)
-  } else {
-    refused(Refusal::Overloaded { shard: state.shard })
+  let reply = match landed {
+    Ok(()) => record_created(state, principal, asked, ids, svn_created),
+    Err(refusal) => refused(refusal),
   };
   let reply = match request {
     Some((origin, id)) => crate::verbs::record_completion(state, origin, id, reply),
@@ -713,7 +738,9 @@ pub(crate) fn create_blocking(
     Ok(changeset) => changeset,
     Err(reply) => return *reply,
   };
-  let landed = crate::test_store::land_blocking(disk, header, parts);
+  let landed = crate::test_store::land_answered_blocking(disk, header, parts)
+    .map(drop)
+    .map_err(|error| refusal_of_owner(state, &error));
   recorded_after_landing(
     state,
     principal,

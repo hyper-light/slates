@@ -1800,6 +1800,7 @@ fn an_import_measured() {
   let (_anchor, _lines, _issuer) = start_anchor(&instance, &[]);
   create_repository(&instance);
   let before = daemon_rss_kib(&instance);
+  memory_sample(&instance, "before");
   let mut child = Command::new(env!("CARGO_BIN_EXE_slates"))
     .args([
       "--instance",
@@ -1845,7 +1846,17 @@ fn an_import_measured() {
     out.join().unwrap().trim(),
     err.join().unwrap().trim()
   );
+  memory_sample(&instance, "after");
   if let Ok(hold) = std::env::var("SLATES_SVN_IMPORT_HOLD") {
+    // The daemon's memory while it idles (P7's finding (2): r10 found 1.96 GB resident after the import): what it gives
+    // back over its idle ticks, read in its own process (`status --memory`), nothing suspending it.
+    for (label, wait) in [("idle 2 s", 2), ("idle 30 s", 28)] {
+      let waited = Instant::now();
+      while waited.elapsed() < Duration::from_secs(wait) {
+        pause();
+      }
+      memory_sample(&instance, label);
+    }
     let pid = daemon_pid(&instance).expect("the daemon's pid");
     std::fs::write(&hold, format!("{pid}\n")).unwrap();
     println!("an_import_measured: held, daemon pid {pid} in {hold}; delete it to end");
@@ -1855,6 +1866,57 @@ fn an_import_measured() {
     }
     let _ = std::fs::remove_file(&hold);
   }
+}
+
+/// Prints instance `instance`'s daemon memory at `label` (P7's finding (2)): its resident bytes as `ps` reads them, and
+/// the memory report's heap and mapped kinds and the shards' arena bytes (`slates status --memory`), read in the daemon's
+/// own process, so nothing suspends it (A-232's gotcha: `vmmap` and `heap` did, and the anchor's watchdog ended it).
+fn memory_sample(instance: &str, label: &str) {
+  let rss = daemon_rss_kib(instance);
+  let footprint = daemon_pid(instance).and_then(footprint_kib);
+  let (_, memory, _) = slates(instance, &["status", "--memory"]);
+  let lines: Vec<&str> = memory
+    .lines()
+    .filter(|line| {
+      line.contains("memory: ")
+        || line.contains("arena.allocated")
+        || line.contains("content.purged_bytes")
+        || line.contains("give_back")
+    })
+    .collect();
+  println!(
+    "an_import_measured: memory {label}: daemon RSS {rss} KiB, physical footprint {footprint:?} KiB\n  {}",
+    lines.join("\n  ")
+  );
+}
+
+/// Process `pid`'s physical footprint in KiB as macOS `top` reads it (its `MEM` column, from `proc_pid_rusage`'s
+/// `ri_phys_footprint`, nothing suspended): what memory pressure counts, and what a page the arena's idle purge marked
+/// reusable leaves at once, where `ps`'s RSS keeps it until the kernel takes it (A-105, A-110). None off macOS, or where
+/// `top` says nothing readable.
+fn footprint_kib(pid: u32) -> Option<u64> {
+  let out = Command::new("top")
+    .args(["-l", "1", "-pid", &pid.to_string(), "-stats", "pid,mem"])
+    .output()
+    .ok()?;
+  let text = String::from_utf8_lossy(&out.stdout);
+  let field = text.lines().rev().find_map(|line| {
+    let mut words = line.split_whitespace();
+    (words.next()? == pid.to_string()).then(|| words.next().map(str::to_owned))?
+  })?;
+  let field = field.trim_end_matches(['+', '-']);
+  let (number, unit) = field.split_at(field.find(|c: char| c.is_ascii_alphabetic())?);
+  let number: f64 = number.parse().ok()?;
+  let kib = match unit {
+    "B" => number / 1024.0,
+    "K" => number,
+    "M" => number * 1024.0,
+    "G" => number * 1024.0 * 1024.0,
+    _ => return None,
+  };
+  // A count of KiB, read off a figure `top` rounds: never negative, far below 2^53.
+  #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+  Some(kib as u64)
 }
 
 /// The pid of instance `instance`'s daemon (not its anchor), as `ps` lists it.

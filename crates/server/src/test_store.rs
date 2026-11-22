@@ -37,8 +37,13 @@ pub(crate) struct TestStore {
 
 impl TestStore {
   /// A fresh store named `name`, its owner started.
-  #[allow(clippy::disallowed_methods)] // test code: its own scratch directory
   pub(crate) fn start(name: &str) -> TestStore {
+    TestStore::start_sized(name, SIZING)
+  }
+
+  /// A fresh store named `name`, its owner started with `sizing` (one the engine refuses makes a store that cannot open).
+  #[allow(clippy::disallowed_methods)] // test code: its own scratch directory
+  pub(crate) fn start_sized(name: &str, sizing: Sizing) -> TestStore {
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let number = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let binary = std::env::current_exe().expect("the test binary's path");
@@ -49,7 +54,7 @@ impl TestStore {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("the store's directory");
     let dir = dir.canonicalize().expect("the store's directory");
-    let owner = StoreOwner::start(root(&dir), SIZING, WAITING).expect("the store's owner");
+    let owner = StoreOwner::start(root(&dir), sizing, WAITING).expect("the store's owner");
     TestStore {
       owner: Some(owner),
       dir,

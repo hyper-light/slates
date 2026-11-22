@@ -78,6 +78,10 @@ pub enum DbError {
     /// The record's length.
     len: usize,
   },
+  /// What a record depends on outside the database was not made durable before it would have been appended (chain
+  /// entry format 6: the shard's content image holding an increment an entry names): the transaction was abandoned
+  /// ([`crate::replay::Db::abandon`]) with nothing appended, the cause of its [`DbError::Unpublished`].
+  DependentUnpublished,
   /// A transaction could not be made durable — its record was not appended and the snapshot that
   /// would have carried its effects was not published — so the partition was **rolled back** to its
   /// durable state: the applied effects and the completion record are gone, exactly as a restart
@@ -250,6 +254,10 @@ impl fmt::Display for DbError {
           "record {seq} not published, transaction rolled back: {cause}"
         )
       }
+      Self::DependentUnpublished => write!(
+        f,
+        "what the record depends on (the shard's content image) was not published"
+      ),
       Self::Wire(e) => write!(f, "encoding: {e}"),
       Self::Anchor(e) => write!(f, "segment: {e}"),
       Self::Memory(e) => write!(f, "memory: {e}"),

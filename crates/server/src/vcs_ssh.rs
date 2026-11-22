@@ -251,6 +251,9 @@ pub(crate) struct EdgeState {
   /// How long the authenticated connections lived.
   /// The counts.
   counts: Cell<Counts>,
+  /// A key time a test gives its sessions in place of the RFC's hour, so its rekeys come within the test.
+  #[cfg(test)]
+  key_time_for_test: Cell<Option<u64>>,
 }
 
 impl EdgeState {
@@ -275,6 +278,8 @@ impl EdgeState {
       arriving: Cell::new(0),
       waits: RefCell::new(PhaseWaits::default()),
       counts: Cell::new(Counts::default()),
+      #[cfg(test)]
+      key_time_for_test: Cell::new(None),
     }
   }
 
@@ -311,7 +316,19 @@ impl EdgeState {
   /// The key time a new session's key is replaced at: RFC 4253 §9's hour (the module doc), whatever earlier sessions
   /// lived.
   pub(crate) fn key_time_ns(&self) -> u64 {
+    #[cfg(test)]
+    if let Some(key_time_ns) = self.key_time_for_test.get() {
+      return key_time_ns;
+    }
     RECOMMENDED_KEY_TIME_NS
+  }
+
+  /// The edge's sessions' keys replaced after `key_time_ns` instead of the RFC's hour: a test's, so its rekeys come
+  /// within it.
+  #[cfg(test)]
+  pub(crate) fn with_key_time_ns(self, key_time_ns: u64) -> EdgeState {
+    self.key_time_for_test.set(Some(key_time_ns));
+    self
   }
 
   /// Changes the counts.
@@ -895,23 +912,39 @@ impl<S: SshSite> Link<S> {
     self.read().await.err().map(Exit::Ended)
   }
 
-  /// Writes what the session has to send, within the phase's wait: the client's room is waited for.
+  /// Writes what the kernel takes of what the session has to send, within the phase's wait: the client's room is waited
+  /// for, and the session gives back exactly the bytes taken. The write is cancel-safe (`TcpStream::write_some`), so the
+  /// session's timer coming due while it waits drops a write that took nothing; a write that took part of the bytes
+  /// returned their count first. The edge once raced `write_all`, which loses its count when dropped: a rekey timer
+  /// that came due mid-write wrote the taken part again, and the client's MAC failed (main 01a20182's order,
+  /// 2026-11-21).
   async fn write(&mut self) -> Result<(), Why> {
     let (deadline_ns, overdue) = self.armed()?;
     let bytes = self.session.pending_output().to_vec();
     let marker = self.marker(overdue);
     let timer_ns = self.session.next_timer_ns();
-    let outcome = awaited(self.stream.write_all(&bytes), deadline_ns, timer_ns, marker).await;
+    let outcome = awaited(
+      self.stream.write_some(&bytes),
+      deadline_ns,
+      timer_ns,
+      marker,
+    )
+    .await;
     match self.settle(outcome)? {
-      Some(Ok(())) => self
-        .session
-        .consume_output(bytes.len())
-        .map_err(|_| Why::Refused),
+      // A socket that takes every write at once never parks the connection, so the loop yields after each: one write
+      // and one offer a poll, however fast the client reads (main 01a20182's fixture round, 2026-11-21: one poll of an
+      // SSH clone ran 3.5 s in `vcs_ssh::offer`, the daemon killed mid-answer).
+      Some(Ok(taken)) => {
+        let consumed = self.session.consume_output(taken).map_err(|_| Why::Refused);
+        yield_now().await;
+        consumed
+      }
       Some(Err(_)) => {
         self.tracker.abandon();
         Err(Why::Failed)
       }
-      // The write was set aside whole for the session's timer: none of it was taken, and it is written again.
+      // The write waited for the session's timer to come due and took nothing: the timer runs, and the bytes are
+      // written again.
       None => self.session.poll_timers(now_ns()).map_err(|_| Why::Refused),
     }
   }
@@ -958,6 +991,7 @@ impl<S: SshSite> Link<S> {
   /// Hands the unread bytes to the session: whether it took any. The edge's own work on the handshake is counted into
   /// the connection's first measurement, and the handshake ends when the bytes established the transport.
   fn feed(&mut self) -> bool {
+    let _doing = slates_rt::futures::doing("vcs_ssh::feed");
     let started_ns = now_ns();
     let taken = match self.session.receive(&self.unread, started_ns) {
       Ok(taken) => taken,
@@ -1039,6 +1073,8 @@ impl<S: SshSite> Link<S> {
   /// The client's `exec`: dispatched by the site for the proven principal, and accepted; run, or refused as its tool
   /// refuses. The session raises none before a proof; one without a principal is refused as a failed request.
   fn on_exec(&mut self, command: &Asked, git_protocol: Option<&[u8]>) {
+    // A-740: a shard stuck in a connection's step names it.
+    let _doing = slates_rt::futures::doing("vcs_ssh::exec");
     let Some(principal) = self.principal.as_ref() else {
       let _ = self.session.answer_exec(false);
       return;
@@ -1126,6 +1162,7 @@ impl<S: SshSite> Link<S> {
   /// command wrote can reach its client, and a send read as nothing taken would hold the connection for a
   /// [`SessionEvent::Writable`] that never comes.
   fn offer(&mut self) -> Result<Turn, Why> {
+    let _doing = slates_rt::futures::doing("vcs_ssh::offer");
     let Some(running) = self.running.as_mut() else {
       return Ok(Turn::Idle);
     };
@@ -1192,6 +1229,7 @@ impl<S: SshSite> Link<S> {
 
   /// The command exited with `status` and its output is sent: `exit-status`, EOF and close, and the connection closes.
   fn exit(&mut self, status: u32) -> Turn {
+    let _doing = slates_rt::futures::doing("vcs_ssh::exit");
     if self.session.finish(status).is_err() {
       return Turn::Idle;
     }

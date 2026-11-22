@@ -719,6 +719,9 @@ pub enum HostFault {
   Route(RouteRefusal),
   /// A direct map's hand-off failed and its copy could not be given back (A-174): it is held until this client ends.
   HandOff(Note),
+  /// The node's version-control store refused the change, in its words (goal 93): a store that could not be opened, a
+  /// full disk, a refused write. Nothing of the change was recorded.
+  Store(Note),
 }
 
 /// What slates got wrong: the client and the daemon disagree.
@@ -875,6 +878,7 @@ impl Error {
       Refusal::GrantMismatch => Error::Stale(Stale::Approval),
       Refusal::LandingSuperseded { newer } => Error::Stale(Stale::Superseded { newer }),
       Refusal::StaleMergeView => Error::Stale(Stale::MergeView),
+      Refusal::StoreRefused { reason } => Error::Host(HostFault::Store(Note::new(reason))),
       Refusal::PolicyChanged { current } => Error::Stale(Stale::Policy { current }),
       Refusal::VerdictReplaced { work } => Error::Stale(Stale::Verdict { work }),
       Refusal::GrantInvalid => Error::Stale(Stale::Grant),
@@ -1202,6 +1206,10 @@ impl fmt::Display for HostFault {
       Self::HandOff(note) => write!(
         f,
         "a direct map's hand-off failed and its copy is held until this client ends: {note}"
+      ),
+      Self::Store(note) => write!(
+        f,
+        "StoreRefused: the node's version-control store refused: {note}"
       ),
     }
   }
@@ -1932,6 +1940,7 @@ mod tests {
       },
       HostFault::Memory(Note::new("words")),
       HostFault::HandOff(Note::new("words")),
+      HostFault::Store(Note::new("words")),
     ] {
       let words = Error::Host(fault.clone()).to_string();
       assert!(!words.contains(&format!("{fault:?}")), "{words}");

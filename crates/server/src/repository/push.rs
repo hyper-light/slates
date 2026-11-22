@@ -339,7 +339,7 @@ pub(crate) fn push(
   changes: Vec<BranchChange>,
   parts: EntryParts,
 ) -> Result<Appended, AppendRefused> {
-  push_holding(state, (principal, repository), changes, parts, None)
+  push_holding(state, (principal, repository), (changes, &[]), parts, None)
 }
 
 /// Counter: a version of an import's batch whose recorded apply did not reach its version, the green made again from
@@ -558,7 +558,7 @@ pub(crate) fn push_sealed(
   push_holding(
     state,
     (principal, repository),
-    changes,
+    (changes, &[]),
     parts,
     Some(Stored::Git((sealed, moves))),
   )
@@ -579,7 +579,7 @@ pub(crate) fn push_imported(
   push_holding(
     state,
     (principal, repository),
-    changes,
+    (changes, &[]),
     parts,
     Some(Stored::Imported((index, record))),
   )
@@ -591,14 +591,14 @@ pub(crate) fn push_imported(
 pub(crate) fn push_hg(
   state: &mut ShardState,
   (principal, repository): (&Principal, RepositoryId),
-  changes: Vec<BranchChange>,
+  (changes, ahead): (Vec<BranchChange>, &[crate::held_ahead::HeldAhead]),
   parts: EntryParts,
   record: Vec<u8>,
 ) -> Result<Appended, AppendRefused> {
   push_holding(
     state,
     (principal, repository),
-    changes,
+    (changes, ahead),
     parts,
     Some(Stored::Pushed(record)),
   )
@@ -629,7 +629,7 @@ pub(crate) fn push_lfs(
   push_holding(
     state,
     (principal, repository),
-    Vec::new(),
+    (Vec::new(), &[]),
     EntryParts::default(),
     Some(Stored::Lfs(upload)),
   )
@@ -655,7 +655,7 @@ enum Stored<'p, 'u> {
 fn push_holding(
   state: &mut ShardState,
   (principal, repository): (&Principal, RepositoryId),
-  changes: Vec<BranchChange>,
+  (changes, ahead): (Vec<BranchChange>, &[crate::held_ahead::HeldAhead]),
   parts: EntryParts,
   stored: Option<Stored<'_, '_>>,
 ) -> Result<Appended, AppendRefused> {
@@ -687,7 +687,7 @@ fn push_holding(
   }
   let steps = plan(state, &record, principal, changes).map_err(AppendRefused::Changes)?;
   let mut held = Held::default();
-  let pushed = push_planned(state, &record, (steps, parts), &mut held, stored);
+  let pushed = push_planned(state, &record, (steps, parts), (&mut held, ahead), stored);
   if pushed.is_err() {
     held.give_back(state);
   } else {
@@ -963,7 +963,7 @@ fn push_planned(
   state: &mut ShardState,
   record: &RepositoryRecord,
   (steps, parts): (Vec<Step>, EntryParts),
-  held: &mut Held,
+  (held, ahead): (&mut Held, &[crate::held_ahead::HeldAhead]),
   mut stored: Option<Stored<'_, '_>>,
 ) -> Result<Appended, AppendRefused> {
   make(state, &steps, held).map_err(AppendRefused::Changes)?;
@@ -1046,7 +1046,7 @@ fn push_planned(
     .iter()
     .map(|version| (version.green, version.version))
     .collect();
-  let applied = apply_planned(state, (&steps, verdicts), (entry, made), held);
+  let applied = apply_planned(state, (&steps, verdicts), (entry, made), (held, ahead));
   if applied.is_err() && store_committed {
     // The store is ahead of a log that refused the entry: made again from the log (A-662).
     crate::vcs_store::rebuild(state, record.id);
@@ -1124,9 +1124,9 @@ fn apply_planned(
   state: &mut ShardState,
   (steps, verdicts): (&[Step], Vec<Option<Verdict>>),
   (entry, made): (RepositoryEntry, Vec<VolumeRecord>),
-  held: &mut Held,
+  (held, ahead): (&mut Held, &[crate::held_ahead::HeldAhead]),
 ) -> Result<Appended, AppendRefused> {
-  let increments = hold_increments(state, steps, &verdicts)?;
+  let increments = hold_increments(state, (steps, &verdicts), ahead)?;
   let committed = match commit(state, steps, verdicts) {
     Ok(committed) => committed,
     Err(refused) => {
@@ -1498,15 +1498,15 @@ fn commit(
 /// given back. In the order of the steps, none for a step with no held verdict.
 fn hold_increments(
   state: &mut ShardState,
-  steps: &[Step],
-  verdicts: &[Option<Verdict>],
+  (steps, verdicts): (&[Step], &[Option<Verdict>]),
+  ahead: &[crate::held_ahead::HeldAhead],
 ) -> Result<Vec<Option<crate::merge_service::HeldIncrement>>, AppendRefused> {
   let mut increments = Vec::new();
   for (step, verdict) in steps.iter().zip(verdicts) {
     let held = match (step.work(), verdict) {
       (Some((green, work)), Some(Verdict::Held(judged))) => {
         let version = judged.at().saturating_add(1);
-        match crate::merge_service::hold_increment(state, green, version, &work.encode()) {
+        match hold_increment(state, (green, version), work, ahead) {
           Ok(held) => Some(held),
           Err(refusal) => {
             release_increments(state, steps, increments);
@@ -1519,6 +1519,32 @@ fn hold_increments(
     increments.push(held);
   }
   Ok(increments)
+}
+
+/// `work`'s increment held as `green`'s `version`'s inputs: named where it was held ahead of this step and the content
+/// store still holds it (`crate::held_ahead`, nothing copied or hashed), else held whole now.
+fn hold_increment(
+  state: &mut ShardState,
+  (green, version): (DbVolumeId, u64),
+  work: &Increment,
+  ahead: &[crate::held_ahead::HeldAhead],
+) -> Result<crate::merge_service::HeldIncrement, Refusal> {
+  let named = crate::held_ahead::held_for(ahead, green, &work.id).filter(|held| {
+    state.held_content.holds_manifest(
+      slates_db::register::ObjectId(green.bytes),
+      &held.inputs.identity,
+    )
+  });
+  match named {
+    Some(held) => {
+      state.count(crate::held_ahead::AHEAD_NAMED, 1);
+      Ok(crate::merge_service::HeldIncrement {
+        inputs: held.inputs,
+        fresh: held.fresh,
+      })
+    }
+    None => crate::merge_service::hold_increment(state, green, version, &work.encode()),
+  }
 }
 
 /// Gives back what [`hold_increments`] stored, for a push that records nothing.

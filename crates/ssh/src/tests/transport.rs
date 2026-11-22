@@ -565,7 +565,7 @@ fn a_client_rekey_keeps_the_session_id() {
 
 /// A-594 (RFC 4253 §9; `keylife`): do serve with a key time of one microsecond, poll before and at the deadline, send
 /// while the exchange runs, and finish it. Expect no exchange before the deadline, the server's KEXINIT at it, sends
-/// refused as rekeying until the exchange ends, and sends accepted after.
+/// refused as rekeying until the exchange ends, the client's second exchange done, and sends accepted after.
 #[test]
 fn the_server_rekeys_when_the_key_time_runs_out() {
   let mut config = config();
@@ -583,6 +583,11 @@ fn the_server_rekeys_when_the_key_time_runs_out() {
   );
   session.pump().unwrap();
   assert!(matches!(session.events.last(), Some(Event::Rekeyed(_))));
+  assert_eq!(
+    session.client.exchanges(),
+    2,
+    "the client exchanged its keys again"
+  );
   session.server.send(&[94], 1_000).unwrap();
   session.pump().unwrap();
   assert_eq!(session.last_received(), &[94]);

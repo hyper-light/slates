@@ -773,6 +773,24 @@ impl Db {
     Ok(Some(seq))
   }
 
+  /// Abandons the running transaction before its record is written, as a commit whose append could not be made durable
+  /// rolls it back ([`rollback`](Self::rollback)): the partition re-derived from the segment's durable state, so the
+  /// transaction's effects and its completion record are gone together. For a caller that finds, before committing, that
+  /// something the record depends on is not durable (the server's content image an entry names, chain entry format 6).
+  /// The typed refusal to hand the caller; with no transaction open, nothing is rolled back and the refusal still names
+  /// the cause.
+  pub fn abandon(&mut self, segment: &AnchorSegment, cause: DbError) -> DbError {
+    if self.pending.take().is_none() {
+      return DbError::Unpublished {
+        seq: self.next_seq,
+        cause: Box::new(cause),
+      };
+    }
+    self.logged_in_transaction.clear();
+    let seq = self.next_seq;
+    self.rollback(segment, seq, cause)
+  }
+
   /// Rolls a transaction back after its record could not be made durable (nothing was written):
   /// the partition is re-derived from the segment — the newest published snapshot and the records
   /// after it, the state a restart would build — so the transaction's effects and its completion

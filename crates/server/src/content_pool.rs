@@ -9,16 +9,27 @@
 //!
 //! **Claims.** An extent's owner word in the anchor segment is 0 while free, else its partition plus one, taken and
 //! given back by compare-and-swap (`AnchorSegment::pool_claim`), so the claim outlives a daemon restart as the content
-//! does. A shard claims at admission only (`Store::make_room`), never per write. It tries its own slice's parts first,
-//! largest first, then the following partitions' parts, so shards meet in the pool only when a volume outgrows its
-//! own slice.
+//! does. A shard claims at admission only (`Store::make_room`), never per write, and takes the smallest free part
+//! that covers what it lacks, else the largest (best fit, A-848), its own slice's before the following partitions'
+//! of the same length, so shards meet in the pool only when a volume outgrows its own slice. Before A-848 it took its
+//! slice's largest part first: a push seal's 18,564-byte turn grew a shard's arena by 8,589,934,592 bytes (g227,
+//! Studio-4, 2026-11-21).
+//!
+//! **Wants (A-853, the share cap).** A shard whose admission the pool cannot cover posts the room it lacks in its want
+//! word, beside the owner words in the anchor segment, bounded by the pool; it withdraws it once it grows. The post
+//! that finds no want standing sends one message to each other shard, and a shard holding more capacity than its
+//! demand (commitments, the operation headroom, the pressure hold) publishes, whose commit returns every wholly free
+//! extent past that demand. No fixed share: a shard grows into the whole pool while no other wants, and gives back when
+//! one does. Before A-853 a shard's burst kept the pool until its next publication, and a push on another shard was
+//! refused `PastAdmission { left: 0 }` (g227).
 //!
 //! **Names.** An extent's id is `partition × POOL_EXTENTS_PER_PARTITION + part`, and the arena holds it under that id,
 //! so a block's (region, offset) name is the same in every daemon and an image needs no extent table.
 //!
 //! **Parts.** The unit is one chunk window rounded up to the mapping granule, so every part holds whole chunks and
 //! maps on its own; a part is a power-of-two number of units, since a buddy region uses only the largest
-//! power-of-two run of granules it holds. Cut as one region, a reserve of 170.7 MiB under a 1 GiB cap left 25%
+//! power-of-two run of granules it holds. A slice is cut into a run doubling from one unit (1, 1, 2, 4, ... units),
+//! then the rest's binary parts ([`arena_parts`]), so an arena grows from one unit by its work. Cut as one region, a reserve of 170.7 MiB under a 1 GiB cap left 25%
 //! unallocatable (2026-10-05, BENCHMARKS).
 //!
 //! **The pressure hold.** The memory-pressure hold (§4.2, admission.md §5.5) is the daemon's, not each shard's: what the
@@ -37,6 +48,7 @@ use slates_mem::shared::Handoff;
 
 use crate::config::DaemonConfig;
 use crate::error::ServerError;
+use crate::state::ShardState;
 
 /// Format: the partition the pressure hold claims pool extents under (§4.2, admission.md §5.5). Never a partition: an
 /// extent's id is the `u16` `partition × POOL_EXTENTS_PER_PARTITION + part`, so every partition is below
@@ -133,9 +145,6 @@ pub(crate) fn hold_toward(
   Ok(held)
 }
 
-/// The parts of an arena range of `len` bytes, `(offset, len)` relative to the range: its length cut on `unit` into
-/// power-of-two multiples of it, largest first, the remainder under one `unit` left unused. At most one part per bit
-/// of `len / unit`.
 /// The parts of one slice's arena range in `config`'s layout ([`arena_parts`]): what a Windows extent's length is read
 /// from (`crate::content_extents::extent_len`, A-789).
 #[cfg(windows)]
@@ -143,18 +152,36 @@ pub(crate) fn parts_of(config: &DaemonConfig) -> Vec<(usize, usize)> {
   arena_parts(config.shard_content_layout().arena.1, config.pool_unit())
 }
 
+/// The parts of an arena range of `len` bytes, `(offset, len)` relative to the range, each a power-of-two number of
+/// `unit`s (A-848): first a doubling run (1, 1, 2, 4, ... units, each as long as all before it), then what the run
+/// leaves cut into power-of-two parts, largest first; the remainder under one `unit` left unused. A claim takes the
+/// smallest free part that covers what it needs ([`ContentPool`]'s `claim`), so an arena grows by its need rounded up
+/// to a power of two of units, from one unit, and doubles when claims keep coming. Before A-848 the range was cut
+/// into its binary parts, largest first, and a first claim of 18,564 bytes took an 8,589,934,592-byte part (g227,
+/// Studio-4). At most about two parts per bit of `len / unit`, and never more than `POOL_EXTENTS_PER_PARTITION`.
 pub(crate) fn arena_parts(len: usize, unit: usize) -> Vec<(usize, usize)> {
   let unit = unit.max(1);
-  let mut units = len.checked_div(unit).unwrap_or(0);
-  let mut at = 0usize;
-  let mut parts = Vec::new();
-  while units > 0 {
-    // `units >= 1` in the loop, so it has a top bit.
-    let top = 1usize.checked_shl(units.ilog2()).unwrap_or(0);
-    let part = top.saturating_mul(unit);
-    parts.push((at, part));
-    at = at.saturating_add(part);
-    units = units.saturating_sub(top);
+  let units = len.checked_div(unit).unwrap_or(0);
+  let mut parts: Vec<(usize, usize)> = Vec::new();
+  // The doubling run: one unit, then each part as long as every part before it together (1, 1, 2, 4, ... units), so an
+  // arena that claims them in turn doubles at each claim, from one unit.
+  let mut taken = 0usize;
+  while taken < units && parts.len() < POOL_EXTENTS_PER_PARTITION {
+    let next = taken.max(1);
+    if units.saturating_sub(taken) < next {
+      break;
+    }
+    parts.push((taken.saturating_mul(unit), next.saturating_mul(unit)));
+    taken = taken.saturating_add(next);
+  }
+  // What the run leaves (fewer units than it holds) in power-of-two parts, largest first: one per bit of the rest.
+  let mut rest = units.saturating_sub(taken);
+  while rest > 0 && parts.len() < POOL_EXTENTS_PER_PARTITION {
+    // `rest >= 1` in the loop, so it has a top bit.
+    let top = 1usize.checked_shl(rest.ilog2()).unwrap_or(0);
+    parts.push((taken.saturating_mul(unit), top.saturating_mul(unit)));
+    taken = taken.saturating_add(top);
+    rest = rest.saturating_sub(top);
   }
   parts
 }
@@ -365,6 +392,41 @@ impl ContentPool {
 }
 
 impl ContentPool {
+  /// The free extents in the order a claim of `want` bytes tries them (A-848): those that cover `want`, smallest first,
+  /// then those that do not, largest first; equal lengths in [`ContentPool::candidates`]' order, so this partition's
+  /// own slice before the following ones. An arena so grows by its need rounded up to a power of two of units. Before
+  /// A-848 a claim took the first free part, its slice's largest: 8,589,934,592 bytes for an 18,564-byte lend (g227).
+  /// Claims come at admission only, never per write, so the list is made per claim.
+  fn best_fit(&self, want: usize) -> Vec<u16> {
+    let mut free: Vec<(bool, usize, usize, u16)> = Vec::new();
+    for (order, id) in self.candidates().enumerate() {
+      // An extent whose section is not made, or not yet held by the anchor, is passed over (A-789, Windows): data never
+      // lands where a daemon's death would lose it.
+      #[cfg(windows)]
+      if crate::content_extents::installed() && !crate::content_extents::ready(id) {
+        continue;
+      }
+      if !matches!(self.segment.pool_owner(usize::from(id)), Ok(None)) {
+        continue;
+      }
+      let Some((_, (_, len))) = self.part(id) else {
+        continue;
+      };
+      let covers = len >= want;
+      // Covering parts by length up, the rest by length down.
+      let key = if covers {
+        len
+      } else {
+        usize::MAX.saturating_sub(len)
+      };
+      free.push((!covers, key, order, id));
+    }
+    free.sort_unstable();
+    free.into_iter().map(|(_, _, _, id)| id).collect()
+  }
+}
+
+impl ContentPool {
   /// Maps extent `id`, which this partition has just claimed, for the arena: `None` when the OS would not map it, the
   /// word then given straight back (if even that is refused, the extent stays held by this partition and is released
   /// by the next daemon's `held`).
@@ -437,14 +499,8 @@ impl ContentPool {
 }
 
 impl ExtentSource for ContentPool {
-  fn claim(&mut self) -> Option<(u16, Region)> {
-    for id in self.candidates() {
-      // An extent whose section is not made, or not yet held by the anchor, is passed over (A-789, Windows): data never
-      // lands where a daemon's death would lose it.
-      #[cfg(windows)]
-      if crate::content_extents::installed() && !crate::content_extents::ready(id) {
-        continue;
-      }
+  fn claim(&mut self, want: usize) -> Option<(u16, Region)> {
+    for id in self.best_fit(want) {
       match self.segment.pool_claim(usize::from(id), self.partition) {
         Ok(true) => return self.hand_out(id),
         Ok(false) => {}
@@ -461,6 +517,31 @@ impl ExtentSource for ContentPool {
 
   fn open_hold(&mut self, open: bool) {
     self.hold_open = open;
+  }
+
+  fn want(&mut self, bytes: usize) {
+    // Bounded: never more than the whole pool, which no arena can lack more of.
+    let pool = self
+      .parts
+      .iter()
+      .map(|(_, len)| *len)
+      .sum::<usize>()
+      .saturating_mul(usize::from(self.partitions));
+    let bytes = u64::try_from(bytes.min(pool)).unwrap_or(u64::MAX);
+    match self.segment.post_pool_want(self.partition, bytes) {
+      // The first post of a want tells the other shards, once: a task, since the arena posting it is borrowed inside
+      // this shard's state.
+      Ok(true) => {
+        if slates_rt::futures::spawn(tell_the_others_of_a_want())
+          .and_then(slates_rt::futures::detach)
+          .is_err()
+        {
+          self.refused = self.refused.saturating_add(1);
+        }
+      }
+      Ok(false) => {}
+      Err(_) => self.refused = self.refused.saturating_add(1),
+    }
   }
 
   fn release(&mut self, id: u16, region: Region) {
@@ -490,5 +571,197 @@ impl ExtentSource for ContentPool {
       })
       .filter_map(|id| self.part(id).map(|(_, (_, len))| len))
       .sum()
+  }
+}
+
+/// Counter: wants this shard answered by giving back what its demand does not need (A-853): a publication, after which
+/// its wholly free extents went back to the pool.
+const WANT_ANSWERED: &str = "pool.want_answered";
+/// Counter: wants this shard was told of while it held no more than its demand: nothing to give.
+const WANT_NOTHING_TO_GIVE: &str = "pool.want_nothing_to_give";
+/// Counter: wants this shard could not answer: its publication refused, or the message to another shard not carried.
+const WANT_REFUSED: &str = "pool.want_refused";
+
+/// Tells every other shard that this one has posted a want (A-853, the share cap: main 01a20182 2026-11-21 21:35): one
+/// message each on its bounded channel, carried while the channel is full ([`crate::xshard::run_on_waiting`]). Sent
+/// only by the post that found no want standing, so a shard refused again and again sends no more than its first.
+async fn tell_the_others_of_a_want() {
+  let Some((origin, shards)) =
+    crate::state::with_state(|state| (state.shard, state.shards.clone()))
+  else {
+    return;
+  };
+  for shard in shards.into_iter().filter(|shard| *shard != origin) {
+    crate::xshard::run_on_waiting(origin, shard, answer_a_want, WANT_REFUSED);
+  }
+}
+
+/// Answers another shard's want on this one (A-853): when its arena holds more capacity than its demand (every
+/// commitment, the operation headroom and the pressure hold, `Store::demand`), it publishes, and the publication's
+/// commit returns every wholly free extent past that demand to the pool (`Store::release_idle`, run after a committed
+/// publication so no image names a returned block). A shard at its demand has nothing to give. The want is not read
+/// for an amount: everything past demand goes back, since the refused shard may need it all and claims by best fit.
+fn answer_a_want(state: &mut ShardState) {
+  let capacity = u64::try_from(state.store.content.arena().capacity()).unwrap_or(u64::MAX);
+  if capacity <= state.store.demand() {
+    state.count(WANT_NOTHING_TO_GIVE, 1);
+    return;
+  }
+  match crate::verbs::publish_shard(state) {
+    Ok(_) => state.count(WANT_ANSWERED, 1),
+    Err(_) => state.count(WANT_REFUSED, 1),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::ShardState;
+
+  /// Derived: the bytes g227's push seal lent a turn for 64 files (Studio-4, 2026-11-21; GAPS, g227's measurement),
+  /// the lend that grew a shard's arena by a whole 8 GiB extent.
+  const SEAL_TURN_BYTES: u64 = 18_564;
+
+  /// One ask for room on `state`'s shard: room for what its arena can already admit plus [`SEAL_TURN_BYTES`].
+  /// `(asked, lacked, grown, before, admittable)`: what was asked, what the budget lacked for it (the commitments, the
+  /// operation headroom and the pressure hold beside the ask, and the pressure debt a growth takes on), what the arena
+  /// grew by, its capacity before, and what the shard could admit after.
+  fn ask_one_turn(state: &mut ShardState) -> (u64, u64, u64, u64, u64) {
+    let before = state.store.budget.capacity();
+    let asked = state
+      .store
+      .budget
+      .admittable()
+      .saturating_add(SEAL_TURN_BYTES);
+    let lacked = state
+      .store
+      .budget
+      .deficit(asked)
+      .saturating_add(state.store.budget.debt());
+    state.store.make_room(asked);
+    let grown = state.store.budget.capacity().saturating_sub(before);
+    (
+      asked,
+      lacked,
+      grown,
+      before,
+      state.store.budget.admittable(),
+    )
+  }
+
+  /// The most a growth by `lacked` bytes may take (A-848): `lacked` rounded up to a power-of-two number of `unit`s,
+  /// the length of the smallest part covering it, or the arena's capacity `before` when the parts left are the doubling
+  /// run's next.
+  fn bound(lacked: u64, unit: usize, before: u64) -> u64 {
+    let unit = u64::try_from(unit).unwrap();
+    lacked
+      .div_ceil(unit)
+      .max(1)
+      .next_power_of_two()
+      .saturating_mul(unit)
+      .max(before)
+  }
+
+  /// A-848 (main 2026-11-21 17:20, goal 93; Ada's MEMORY SIZING rule: sized from the work). Do: on a shard, ask room for
+  /// what its arena can already admit plus one push seal's turn (18,564 bytes), so the arena must grow. Expect: it grows
+  /// (non-vacuity), by no more than what its budget lacked rounded up to a power of two of pool units, or its capacity
+  /// before. Before, the first claim took its slice's largest part (8,589,934,592 bytes on Studio-4, g227), however few
+  /// bytes the lend needed.
+  #[test]
+  fn a_small_lend_grows_its_shards_arena_by_its_need_not_an_extent() {
+    let ((asked, lacked, grown, before, admittable), unit, slice) =
+      crate::daemon::audit_on_shard(|state| {
+        let unit = state.config.pool_unit();
+        let slice = state.config.shard_content_layout().arena.1;
+        (ask_one_turn(state), unit, slice)
+      });
+    assert!(grown > 0, "the lend grew the arena (non-vacuity)");
+    assert!(
+      admittable >= asked,
+      "asked {asked}, admittable {admittable}"
+    );
+    assert!(
+      grown <= bound(lacked, unit, before),
+      "a {SEAL_TURN_BYTES}-byte lend grew the arena by {grown} bytes (lacked {lacked}, unit {unit}, capacity before \
+       {before}, slice arena {slice})"
+    );
+  }
+
+  /// Shape: the turns each shard lends in [`two_shards_lending_small_rooms_in_turn_are_both_admitted`]: enough that a
+  /// shard taking more than its turns need would reach the other's slice.
+  const TURNS: usize = 8;
+
+  /// A-848 (main 2026-11-21 17:20, case 2). Do: on a two-shard daemon, each shard in turn asks room for what its arena
+  /// can already admit plus one push seal's turn, [`TURNS`] times. Expect: every ask admitted (the shard's admittable
+  /// at least what it asked), and no turn growing a shard's arena past [`bound`].
+  #[test]
+  fn two_shards_lending_small_rooms_in_turn_are_both_admitted() {
+    let daemon = crate::daemon::audit_daemon_of(2);
+    for turn in 0..TURNS {
+      for partition in 0..2usize {
+        let ((asked, lacked, grown, before, admittable), unit) =
+          crate::daemon::observe_at(&daemon, partition, |state| {
+            (ask_one_turn(state), state.config.pool_unit())
+          });
+        assert!(
+          admittable >= asked,
+          "turn {turn}, shard {partition}: asked {asked}, admittable {admittable}"
+        );
+        assert!(
+          grown <= bound(lacked, unit, before),
+          "turn {turn}, shard {partition}: grew the arena by {grown} (lacked {lacked}, unit {unit}, before {before})"
+        );
+      }
+    }
+  }
+
+  /// Shape: how long [`a_shards_burst_no_longer_starves_another_shards_push`] gives the burst's shard to answer the
+  /// other's want, a bound on the test, not a tuning: a give-back is one publication on an idle shard.
+  const WANT_ANSWERED_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+  /// The share cap (main 01a20182 2026-11-21 21:35, ruled; g227's case). Do: on a two-shard daemon, shard 0 makes room
+  /// for all it could admit (a burst, as w-hg's merge lent `admittable()`), which takes the pool; then shard 1 asks room
+  /// for one push seal's turn past what it holds. Expect: the first ask refused (the burst holds the pool: the case's
+  /// precondition), and a later ask admitted within [`WANT_ANSWERED_WITHIN`], shard 0 having given back what its
+  /// demand does not need (its `pool.want_answered` counted, the non-vacuity counter). Before, shard 0 kept the pool and every push on shard 1 was refused
+  /// `PastAdmission { left: 0 }` (g227, Studio-4).
+  #[test]
+  fn a_shards_burst_no_longer_starves_another_shards_push() {
+    let daemon = crate::daemon::audit_daemon_of(2);
+    let burst = crate::daemon::observe_at(&daemon, 0, |state| {
+      let all = state.store.admittable();
+      state.store.make_room(all)
+    });
+    assert!(burst > 0, "the burst grew shard 0's arena (non-vacuity)");
+    let (asked, admittable, ..) = crate::daemon::observe_at(&daemon, 1, ask_one_turn_whole);
+    assert!(
+      admittable < asked,
+      "the burst holds the pool: asked {asked}, admittable {admittable}"
+    );
+    let began = std::time::Instant::now();
+    loop {
+      let (asked, admittable, ..) = crate::daemon::observe_at(&daemon, 1, ask_one_turn_whole);
+      if admittable >= asked {
+        break;
+      }
+      assert!(
+        began.elapsed() < WANT_ANSWERED_WITHIN,
+        "shard 1 still starved: asked {asked}, admittable {admittable}"
+      );
+      std::thread::yield_now();
+    }
+    let answered = crate::daemon::observe_at(&daemon, 0, |state| {
+      state
+        .refusals
+        .get(super::WANT_ANSWERED)
+        .copied()
+        .unwrap_or(0)
+    });
+    assert!(answered > 0, "shard 0 answered the want (non-vacuity)");
+  }
+
+  /// [`ask_one_turn`] where the turn must be admitted whole: room for what the shard holds free, at least a turn more.
+  fn ask_one_turn_whole(state: &mut ShardState) -> (u64, u64, u64) {
+    let (asked, lacked, grown, _, admittable) = ask_one_turn(state);
+    (asked, admittable, lacked.max(grown))
   }
 }

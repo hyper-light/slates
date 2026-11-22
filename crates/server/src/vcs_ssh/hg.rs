@@ -154,6 +154,8 @@ fn answered_step<S: HgStores>(
   stdio: &mut Stdio,
   generation: &mut Option<S::Hold>,
 ) -> Result<Progress, Refused> {
+  // A-740: a shard stuck in a step names it.
+  let _doing = slates_rt::futures::doing("vcs_ssh::hg::answered_step");
   let answer_room = stores
     .fetch_turn(repository)
     .map_or(room, |(turn_room, _)| turn_room);
@@ -180,6 +182,8 @@ async fn streamed_turn<S: HgStores>(
   stdio: &mut Stdio,
   costs: &mut crate::vcs_store::TurnCosts,
 ) -> Result<Progress, Refused> {
+  // A-740: a shard stuck in a turn names it.
+  let _doing = slates_rt::futures::doing("vcs_ssh::hg::streamed_turn");
   if let Some(wants) = stdio.store_wants()
     && !stores
       .answer_wants((generation, repository, room), wants)

@@ -356,6 +356,20 @@
 >   parts of a partition's slice), so the first lend past a shard's free capacity takes an extent of up to 8 GiB of
 >   a 12.9 GB pool, however few bytes it needs. w-hg's merge, lent `admittable()`, took extent after extent until
 >   the pool was gone.
+>   **FIXED by A-848 (w-sizing, 2026-11-21; main 01a1ff2e 17:20, 01a20182 21:35):** a slice is cut into a run doubling
+>   from one pool unit, then the rest's binary parts, and a claim takes the smallest free part covering what the arena
+>   lacks (`ExtentSource::claim(want)`, `ContentPool::best_fit`). Red then green on Studio-4 (debug, unit 262,144
+>   bytes, slice arena 12,884,901,888): an 18,564-byte lend past a shard's free room, which its budget lacked as
+>   10,504,324 bytes with the operation headroom, grew its arena by 8,589,934,592 bytes before and by 16,777,216 after
+>   (the need rounded up to a power of two of units); two shards lending small rooms in turn, 8 turns each, grew
+>   4,294,967,296 bytes on the first turn before, and within that bound every turn after, every ask admitted
+>   (`content_pool::tests`). Layout version 17. **The share cap FIXED by A-853 (main 01a20182 21:35, ruled):** a shard
+>   refused room posts a bounded want in its pool want word; the first post sends one message to each other shard,
+>   and one holding more than its demand publishes and gives back its wholly free extents. Red then green on Studio-4
+>   (`a_shards_burst_no_longer_starves_another_shards_push`): after shard 0's burst took the pool, shard 1's
+>   18,564-byte ask was still refused after 10 s (admittable 0) before, and admitted after, shard 0 counting
+>   `pool.want_answered`. Layout version 18. Not done: demand is what the shard needs now, not a learned (decayed)
+>   figure, so a shard that bursts again re-claims what it gave back.
 
 > **Goal 93 perf, hg serve (2026-11-21, w-perf; main's order 00:22 and ruling 01:05).** Found by a profile of a
 > one-changeset pull of Mercurial's history (24.95 s) and a stream clone (288 s): (1) every lookup in a
@@ -477,7 +491,9 @@
 > `StoreGrant` (C2 closed). Owed (performance): segmented store files over the granted root, measured against one file; the
 > engine's extent bytes and fanout are the caller's `Sizing` (from its machine profile; the server's derivation is
 > owed with C4). C3 closed; C4 groundwork built: the owner thread and
-> `--vcs-store` (the daemon holds the store; shards hold its handle). Windows' store directory built (2026-11-21, w-work-mount: `NtCreateFile`
+> `--vcs-store` (the daemon holds the store; shards hold its handle). A store that cannot open is logged and answered (2026-11-21, goal 93: the owner logs why and answers every request
+> `StoreError::Unopened`; a creation answers `Refusal::StoreRefused` with the store's reason, never `Overloaded`; jupiter's
+> own open failure, which this now names, is owed its fix). Windows' store directory built (2026-11-21, w-work-mount: `NtCreateFile`
 > relative to the granted directory's handle, identity by volume serial and `FileIdInfo`; green on jupiter (5/5,
 > clippy clean), `crates/land/tests/store_root.rs`, `repository::store_tests::each_tool_creates_a_repository_into_the_store`). Owed: each tool's landing onto it (C4-C6); the
 > engine's memtable learned upward from its rows (it starts at one trunk node, fanout extents, since the machine-sized
@@ -1090,6 +1106,32 @@
 > through it (clone over HTTP and SSH, round trips, forced heads). Owed: file revisions, which the store keeps whole,
 > go the same way once the changeset shape keeps them as Mercurial's deltas. And the clone's time against stock's
 > 283 s, measured again, release.
+> **An SSH clone of a large revision spun its shard past the watchdog (2026-11-21, w-hg; main 01a20182's fixture round
+> at a3e673efc: 91 of 92, `ssh clone-after` cut, "stream ended unexpectedly (got 8113614 bytes, expected 16777334)").
+> FIXED.** Reproduced by a reduced lane (fixture; SSH push, push-head, -f, -B, a draft and tag, then clone; debug):
+> the lane's new per-step anchor print named "shard 1 is spinning: 3509 ms of CPU without a step ... in task
+> `vcs_ssh::offer`", the daemon killed and the clone cut. Two causes, both fixed:
+> - Mercurial's standard output (`serve::stdio::Stdio`) was a `Vec` drained from its front as the channel took each
+>   packet (about 32 KiB), so a whole revision's chunk moved every byte behind each piece: about 64 GiB for 64 MiB.
+>   Now a cursor (`stdio::Output`): taking moves nothing, and taken bytes go at once when all are or before more are
+>   written behind them. Held by `serve::stdio::tests::output_taken_a_packet_at_a_time_moves_no_byte` (red with the old
+>   drain: 266,338,304 bytes moved for a 4 MiB answer).
+> - The connection's loop (`vcs_ssh` `Link::write`) never yielded while the socket took every write at once, so all
+>   of an answer's offers ran in one poll; it now yields after each write.
+> - The lane (`bench/hg_correctness.sh`) prints what the anchor and daemon logged during a failing step
+>   (`anchor_since`); the hg SSH steps and the loop's synchronous parts carry `doing` labels (`vcs_ssh::exec`, `feed`,
+>   `offer`, `exit`, `hg::answered_step`, `hg::streamed_turn`), so a kill names its step.
+> - Siblings, not changed (their owners'): `vcs_ssh/git.rs` `sent` and `vcs_ssh/svn.rs` `sent` drain their output from
+>   the front the same way; each holds a turn's slice, not a whole revision, and the loop's yield bounds a poll to one
+>   offer, so neither can spin the shard now; a cursor would save the copies.
+> **The SSH edge wrote bytes twice across a rekey (2026-11-21, w-hg; found by reading, main 01a20182's order of 21:35).
+> FIXED.** The edge's write (`vcs_ssh` `Link::write`) raced `TcpStream::write_all` against the session's key timer; a
+> timer that came due while the write waited on a full socket dropped it, and all its bytes were written again, the
+> part the kernel had taken included, so the client's MAC failed and the connection ended. It fired only when the key
+> time (RFC 4253's hour) passed during a blocked write. Now the edge writes with `TcpStream::write_some` (slates-rt:
+> cancel-safe, a write happens only in the poll that returns its count) and the session gives back exactly the bytes
+> taken. Held by `vcs_ssh::tests::hg::a_rekey_during_a_blocked_write_sends_no_byte_twice` (keys replaced every 5 ms
+> under a reader slower than the wire; red before: "the server's ChaCha20-Poly1305 packet opens: Unspecified").
 > **A-745 (2026-11-20, w-hg; main's ruling, found by use by w-interop: no clone of Mercurial's own 57,035-revision
 > history was admitted, HTTP, SSH and stream).** RED: §4.17.1 "A fetch's answer" written; the by-use test (a clone of
 > one changeset whose file is twice a request's room, `ERROR:ABORT PastAdmission { asked: 557056, left: 277336 }`)
@@ -2033,8 +2075,16 @@
 > since A-846 part 3 (`t_a724_a_contested_room_reads_the_published_grants`,
 > `t_a724_a_live_repository_with_no_curve_leaves_the_room_divided_as_before`). Open: pushes', hg's and svn's reads.
 > **A-724 piece 7 (A-849): the load proof's fetches** (`multi_repo_load.py --fetches`; harness daemons given a
-> `--vcs-store`, without which `repository create --tool git` failed since A-767 C5). Open: hg and svn in the mix; the
-> rounds (main's).
+> `--vcs-store`, without which `repository create --tool git` failed since A-767 C5); hg and svn by their stock clients
+> (`multi_repo_stock.py`, main's 21:35 ruling (a)). Open: the rounds (main's).
+> **A-724 piece 4 (A-851): let go past the grant, built, no reader yet** (`ContentStore::let_go`/`bring_back`,
+> `vcs_share::grants::let_go_past_grant`; tests `a_landed_window_is_let_go_and_brought_back_by_its_own_bytes`,
+> `t_a724_a_repositorys_coldest_windows_past_its_grant_are_let_go`). Open: git's and hg's read-through (w-git, w-hg:
+> red tests queued in their inboxes), landed marks and window lists from the tools; a restart's image no longer holding
+> a let-go window (recovery reads it back through the node's store, with the read-through).
+> **A-724 piece 6 DEFERRED (main 01a20182, 2026-11-21 21:35):** the fleet's placement of content by identity (amends
+> §4.10) waits until goal 93's servers are complete and correct; Ada asked for many repositories on a single server, and
+> the N=1 homes and the region rule exist (1729a9c5a, 58f756e0a, 9f57e4810).
 > **A-724 piece 2c (A-846): memory by marginal utility built, not yet applied** (`slates_vcs::partition`, `cargo test
 > -p slates-vcs --lib partition::`, 4 of 4, macOS arm64, this Mac). Open: computed on the owner shard and published.
 >
@@ -3185,9 +3235,10 @@
 > them writes every text `PLAIN`, as the presenter's does (the stock `svnadmin` reading of it is main's run: no svn on
 > the Mac); `changeset_ab` reads the records' own deltas and waits on main's call (retire, or derive its deltas);
 > (3) BUILT 2026-11-21, A-842: the records keep no text, a text carried inline refused `Corrupt`, `changeset_ab`
-> retired (its numbers stand in BENCHMARKS at b51f908f2). Owed: the FSFS view's `DELTA` writer has no source now
-> (`fsfs::TextDeltas` answers none everywhere): removed, or fed per-file deltas derived from the changeset log (Ada's
-> ruling of 2026-11-20 ~13:35), main's call; and the stock `svnadmin` reading of the all-`PLAIN` view, main's run).
+> retired (its numbers stand in BENCHMARKS at b51f908f2). The FSFS view's `DELTA` writer, left with no source,
+> REMOVED by main 01a20182's ruling of 21:35 (`fsfs::TextDeltas`, `StoredDelta`, `FilePiece::Delta` and the presenter's
+> `DeltaPiece` refusal gone): under the changeset ruling a per-file delta is derived when a measured item needs one.
+> Owed: the stock `svnadmin` reading of the all-`PLAIN` view, main's run on the big Studio).
 > Stage C,
 > an import as one sliced changeset (today a changeset a record). A submitted version's revision (`svn_made`) takes the
 > one landing order since A-804 (2026-11-21, w-rewrite-ops; main 01:52, the deferred-submit hook, `crate::made_commit`):
@@ -3232,8 +3283,9 @@
 > - 1b, BUILT below.
 > **A large hg push spun its shard past the watchdog (goal 93 correctness; found by w-balance by use, inbox
 > w-hg-from-w-balance-push-spin.md: a 64+32 MiB push, shard 8 at 3.1 s in one poll in `hg_push::take` and
-> `hg_push::unbundle`, the daemon killed). The hg side FIXED (2026-11-21, w-hg; main's ruling (1) of 13:26); the merge
-> engine's apply OPEN (below).**
+> `hg_push::unbundle`, the daemon killed). FIXED (2026-11-21, w-hg; main's ruling (1) of 13:26, then 01a1ff2e's 17:26
+> option (a) and main 01a20182's 21:35 order for (D)): the 64+32 MiB push by use passes in debug, 56.7 s, no shard
+> spinning (before (D): killed in `hg_push::landing`).**
 > - Measured (one 64 MiB revision's intake step, test profile, proportions only): `put_object` 59 s, sha1dc 50 s,
 >   BLAKE3 20 s, the delta's apply 0.05 s: every cost grew with the file.
 > - (A) The intake: a revision longer than the content store's window is taken over as many steps as it has windows
@@ -3254,11 +3306,22 @@
 >   5.5 s each. Both are now hashed once, a content window at a time, yielding at half the step quantum
 >   (`hg_push::hashed_sliced`: `named_payload`, `named_push`); the references take the payload's name
 >   (`record::PayloadName`); the judging 0 ms.
-> - OPEN, the merge engine's: `push::push_planned` → `apply_planned` applies the built 96 MiB increment to the green in
->   one step (verdicts 6 to 23 ms, the apply past the 3.3 s window, the daemon killed). P2's `materialize` commits a
->   built work the same way. Main rules who slices it (inbox, 2026-11-21).
+> - (D) The landing's apply: timed a phase at a time (debug, the 64+32 MiB push), the verdict took 7 to 220 ms and
+>   `push::hold_increments` the rest, past 3,480 ms of CPU. That is the work's encoding held whole as its version's
+>   inputs archive (`merge_service::hold_increment`: every 1 MiB chunk BLAKE3-hashed and copied into its block in the
+>   landing's step), not the green's commit. Now each work whose green is at its base is held before the landing a unit
+>   a turn (`crate::held_ahead::AheadHold`, the checkpoint's paced hold, A-579: a chunk hashed, the stage opened on the
+>   green's object for its next version, a chunk staged, the stage completed; half the step quantum a turn,
+>   `hg_push::held_ahead`). The landing's step names the held inputs (`push::hold_increment` →
+>   `merge_service::increment_already_held`, nothing hashed or copied), and what no entry names is given back after it,
+>   whatever it answered (`held_ahead::give_back`); a crash leaves only unnamed content, which recovery gives back.
+>   Counted `push.held_ahead.units`, `.held`, `.named`.
+>   Owed (D): git's large updates and P2's `materialize` to take the same hold before their own steps (main's "one
+>   sliced apply"); a new green's work (a branch created by the push) is still held whole in the step; the work's
+>   encoding is one copy in the first unit; `Green::make_step` (A-760) is still called by no server path.
 > - Held by `push::intake::tests::a_revision_longer_than_a_window_is_taken_a_window_a_step` (red before: one step took
->   the whole text), the server hg suites (the daemon-edge pushes through the sliced works), and by use
+>   the whole text), `repository::push::tests::a_push_held_ahead_of_its_landing_is_named_by_its_step` (red with the
+>   step's naming removed: `push.held_ahead.named` 0), the server hg suites (the daemon-edge pushes through the sliced works), and by use
 >   `hg_interop::stock_hg_pushes_large_files_and_the_daemon_keeps_serving` (ignored; w-balance's repro; main's rounds).
 > - Owed (slates-merge, A-752 "units still one object's size"): the builder lays a file's bytes in one unit, so a
 >   64 MiB file is still one unit of the work's post-state (a copy, no hash), noted to w-engine.
@@ -25053,7 +25116,12 @@ in what lands. Branch tips as of 2026-11-10:
 > BISECTED 2026-11-21 to 6088ccb72, A-825's format 6 (w-shared): its parent 544020bd2 p50 0.38 / p99 0.84 ms, it 237.9 /
 > 1,192 ms, release `load_bench` one round each on the big Studio; the likely mechanism is A-825's owed cost, a
 > whole-shard publication (`publish_held_increments` -> `publish_shard`) in every accepted version's step on the owner;
-> handed to w-shared, `inbox/w-shared-from-w-engine-format6-regression.md`). The checkpoint's record LANDED by name
+> handed to w-shared, `inbox/w-shared-from-w-engine-format6-regression.md`; FIXED d44f0166a, w-shared: inside a
+> transaction the verb's own publication carries the hold before the record is appended at the commit, so an accept
+> publishes once, its verb's; `verbs::commit_settled` publishes what is still unpublished and abandons the transaction,
+> typed, when it cannot; red 3 publications for one accepted submit, green 1 (`publish.committed`,
+> `an_accepted_submit_costs_its_shard_one_publication`, macOS arm64, this Mac; the kill -9 recovery test,
+> green_checkpoint, works_off_owner and the holder submits green); main's confirming load_bench A/B owed). The checkpoint's record LANDED by name
 > (goal 93's, main's 15:00: a 1 GiB green's was 650-1,063 ms in one step, record 527 ms): held in the owner's content
 > store a chunk a quantum, published, recorded as `CheckpointRef` (layout 16). OWED, piece 2: its build and encoding
 > are still one step (52 + 71 ms at 1 GiB; 5.7 + 9.5 ms at load_bench's 49 MB), inside the watchdog's 1 s window.

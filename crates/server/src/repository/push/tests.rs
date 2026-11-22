@@ -1720,3 +1720,122 @@ fn a_held_verdicts_preview_lives_across_turns_until_its_one_step() {
   );
   assert_eq!(committed.2, members, "the preview retired in the one step");
 }
+
+/// 01a1ff2e's ruling of 2026-11-21 17:26, option (a) (`crate::held_ahead`): a push's increment held in the content
+/// store a unit a step before its landing's step, which names it. Do: build a work adding a file of three chunks and a
+/// byte (`merge_origin::inputs_chunk_bytes`) to a new repository's `main`; hold its increment ahead, a unit a call;
+/// push it with what the hold made; then hold a second work's increment ahead and push it refused (its green owed at a
+/// version another push took). Expect the hold taken over more units than the increment has chunks, each unit within
+/// one chunk's bytes; the landing naming the held inputs (`push.held_ahead.named` 1) and holding none afresh
+/// (`merge.inputs.held_by_owner` unmoved), the content store still holding them once the entry names them; and the
+/// refused push's hold given back (`held_ahead::give_back`), the store no longer holding it.
+#[test]
+fn a_push_held_ahead_of_its_landing_is_named_by_its_step() {
+  crate::test_store::audit_on_stored_shard("repository-push-held-ahead", |state| {
+    let (repo, main) = repository(state, "ahead");
+    let chunk = crate::merge_origin::inputs_chunk_bytes();
+    let large: Vec<u8> = (0..chunk * 3 + 1).map(|at| (at % 251) as u8).collect();
+    let mut store = Store::default();
+    let tree = store.put_tree(&[("large", &large)]);
+    let changed = store.put_tree(&[("large", b"small")]);
+    let room = u64::try_from(large.len() * 4).expect("a room");
+    let built = |state: &ShardState, (version, base): (u64, Option<ObjectKey>), tree, name| {
+      let engine = state.greens.get(&main).expect("the green's engine");
+      let push = Push {
+        name: [name; 32],
+        base_version: version,
+        base_tree: base,
+        tree,
+        head: Some(b"c1".as_slice()),
+      };
+      slates_merge::push::build(&push, &engine, &store, room)
+        .expect("the work is built")
+        .increment
+    };
+    let first = built(state, (0, None), tree, 1);
+    let count = |state: &ShardState, name| state.refusals.get(name).copied().unwrap_or(0);
+    let mut hold = crate::held_ahead::AheadHold::new(main, 1, &first);
+    let mut units = 0u64;
+    let held = loop {
+      units += 1;
+      match hold.unit(state).expect("a unit of the hold") {
+        crate::held_ahead::Ahead::More => assert!(units < 64, "the hold ends"),
+        crate::held_ahead::Ahead::Held(held) => break held,
+      }
+    };
+    let chunks = held
+      .inputs
+      .len
+      .div_ceil(u64::try_from(chunk).expect("a chunk"));
+    assert!(
+      units > chunks,
+      "{units} units for {chunks} chunks: hashed and copied a unit each"
+    );
+    let object = slates_db::register::ObjectId(main.bytes);
+    assert!(
+      state
+        .held_content
+        .holds_manifest(object, &held.inputs.identity)
+    );
+    let owner_holds = count(state, crate::merge_service::INPUTS_HELD_BY_OWNER);
+    let change = BranchChange::Update {
+      green: main,
+      work: first,
+    };
+    let pushed = super::push_holding(
+      state,
+      (&owner(), repo),
+      (vec![change], &[held]),
+      EntryParts::default(),
+      None,
+    );
+    assert!(pushed.is_ok(), "the push lands: {pushed:?}");
+    crate::held_ahead::give_back(state, &[held]);
+    assert_eq!(
+      count(state, crate::held_ahead::AHEAD_NAMED),
+      1,
+      "the step named the hold"
+    );
+    assert_eq!(
+      count(state, crate::merge_service::INPUTS_HELD_BY_OWNER),
+      owner_holds,
+      "the step held nothing afresh"
+    );
+    assert!(
+      state
+        .held_content
+        .holds_manifest(object, &held.inputs.identity),
+      "the entry names the held increment, so it stays"
+    );
+    let second = built(state, (1, Some(tree)), changed, 2);
+    let mut hold = crate::held_ahead::AheadHold::new(main, 2, &second);
+    let refused_hold = loop {
+      match hold.unit(state).expect("a unit of the hold") {
+        crate::held_ahead::Ahead::More => {}
+        crate::held_ahead::Ahead::Held(held) => break held,
+      }
+    };
+    let stale = built(state, (0, None), changed, 3);
+    let refused = super::push_holding(
+      state,
+      (&owner(), repo),
+      (
+        vec![BranchChange::Update {
+          green: main,
+          work: stale,
+        }],
+        &[refused_hold],
+      ),
+      EntryParts::default(),
+      None,
+    );
+    assert!(refused.is_err(), "the stale push is refused: {refused:?}");
+    crate::held_ahead::give_back(state, &[refused_hold]);
+    assert!(
+      !state
+        .held_content
+        .holds_manifest(object, &refused_hold.inputs.identity),
+      "a hold no entry names is given back"
+    );
+  });
+}
