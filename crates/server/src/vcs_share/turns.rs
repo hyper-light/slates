@@ -31,11 +31,16 @@ use std::task::{Context, Poll, Waker};
 
 use slates_db::catalog::RepositoryId;
 
-/// One repository's turn on this shard: whether a push holds it, and the pushes waiting, first first.
+use crate::state::ShardState;
+
+/// One repository's turn on this shard: how many of its pushes hold it, its weight when last asked, and the pushes
+/// waiting, first first.
 #[derive(Debug, Default)]
 struct Line {
-  /// Whether a push holds the turn.
-  held: bool,
+  /// The pushes holding a turn now: at most its weight.
+  held: u32,
+  /// Its weight when a push last asked ([`learned_weight`]): the turns it may hold at once.
+  weight: u32,
   /// The waiting pushes: each its ticket and the waker to wake when the turn is its.
   waiting: VecDeque<(u64, Option<Waker>)>,
 }
@@ -74,19 +79,21 @@ impl Future for Taking {
   fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Turn> {
     let repository = self.repository;
     let ticket = self.ticket;
+    let weight = crate::state::with_state(|state| learned_weight(state, repository)).unwrap_or(1);
     let taken = TURNS.with(|turns| {
       let Ok(mut turns) = turns.try_borrow_mut() else {
         return Err(ticket);
       };
       let Turns { lines, next } = &mut *turns;
       let line = lines.entry(repository).or_default();
+      line.weight = weight;
       let first = line.waiting.front().map(|(id, _)| *id);
       let mine = ticket.is_some() && first == ticket;
-      if !line.held && (line.waiting.is_empty() || mine) {
+      if line.held < weight && (line.waiting.is_empty() || mine) {
         if mine {
           line.waiting.pop_front();
         }
-        line.held = true;
+        line.held = line.held.saturating_add(1);
         return Ok(());
       }
       let ticket = ticket.unwrap_or_else(|| {
@@ -127,12 +134,12 @@ impl Drop for Taking {
       let mut turns = turns.try_borrow_mut().ok()?;
       let line = turns.lines.get_mut(&repository)?;
       line.waiting.retain(|(id, _)| *id != ticket);
-      let woken = if line.held {
+      let woken = if line.held >= line.weight.max(1) {
         None
       } else {
         line.waiting.front_mut().and_then(|(_, waker)| waker.take())
       };
-      if !line.held && line.waiting.is_empty() {
+      if line.held == 0 && line.waiting.is_empty() {
         turns.lines.remove(&repository);
       }
       woken
@@ -165,9 +172,9 @@ impl Drop for Turn {
     let woken = TURNS.with(|turns| {
       let mut turns = turns.try_borrow_mut().ok()?;
       let line = turns.lines.get_mut(&repository)?;
-      line.held = false;
+      line.held = line.held.saturating_sub(1);
       let woken = line.waiting.front_mut().and_then(|(_, waker)| waker.take());
-      if line.waiting.is_empty() {
+      if line.held == 0 && line.waiting.is_empty() {
         turns.lines.remove(&repository);
       }
       woken
@@ -176,6 +183,32 @@ impl Drop for Turn {
       waker.wake();
     }
   }
+}
+
+/// Repository `repository`'s weight (the A/B arm "learned weights", §4.17.5 "CPU ... weighted fair queuing ..., each
+/// weight its learned demand capped at its measured use"; main's 17:22 ruling): its learned CPU demand, its intakes a
+/// second times the shard time an intake took on average, over the least such demand among the repositories with works
+/// live on this shard, rounded, at least one. Capped at its measured use by the line itself: it holds no more turns than
+/// it has pushes. One for a repository with no demand learned, or when none is live.
+fn learned_weight(state: &ShardState, repository: RepositoryId) -> u32 {
+  let now = slates_rt::futures::now_ns();
+  let demand = |id: &RepositoryId| -> Option<f64> {
+    let row = state.vcs_usage.usage(id)?;
+    let rate = row.learned(slates_vcs::Work::Intake).works_per_s(now)?;
+    let works = row.intake.answered.max(1);
+    let per_work = slates_vcs::amount_of(row.intake.step_ns) / slates_vcs::amount_of(works);
+    Some(rate * per_work).filter(|demand| demand.is_finite() && *demand > 0.0)
+  };
+  let Some(own) = demand(&repository) else {
+    return 1;
+  };
+  let least = crate::vcs_share::live_works()
+    .iter()
+    .filter_map(|(id, _)| demand(id))
+    .fold(own, f64::min);
+  u32::try_from(slates_vcs::whole_units((own / least).round()))
+    .unwrap_or(u32::MAX)
+    .max(1)
 }
 
 #[cfg(test)]
@@ -243,6 +276,78 @@ mod tests {
     assert!(
       most_between <= 1,
       "the large repository took {most_between} turns between two of the small one's: {log:?}"
+    );
+  }
+
+  /// The A/B arm "learned weights" (§4.17.5 "CPU"; main's 17:22 ruling). Do: on one shard, two repositories learn
+  /// intakes a millisecond apart, the first's taking 4 ms of the shard each and the second's 1 ms; then, both live,
+  /// four pushes of the first and one of the second take their turns. Expect: the first holds up to four turns at once,
+  /// so between two of the second's turns it takes more than one and at most four, and every push takes all its turns.
+  #[test]
+  fn a_repository_holds_its_learned_demands_turns_at_once() {
+    let daemon = crate::daemon::audit_daemon_of(1);
+    let (heavy, light) = (
+      RepositoryId { bytes: [3; 16] },
+      RepositoryId { bytes: [4; 16] },
+    );
+    crate::daemon::observe_first(&daemon, move |state| {
+      let start = slates_rt::futures::now_ns();
+      for work in 0..40u64 {
+        let at = start.saturating_sub((40 - work) * 1_000_000);
+        for (id, cost) in [(heavy, 4_000_000), (light, 1_000_000)] {
+          state
+            .vcs_usage
+            .stepped(&id, slates_vcs::Work::Intake, (cost, 0), at);
+          state
+            .vcs_usage
+            .answered(&id, slates_vcs::Work::Intake, 100, at);
+        }
+      }
+    });
+    let (sent, answered) = std::sync::mpsc::sync_channel(1);
+    crate::daemon::observe_first(&daemon, move |_| {
+      let task = slates_rt::futures::spawn(async move {
+        let _live = (
+          crate::vcs_share::Live::begin(heavy),
+          crate::vcs_share::Live::begin(light),
+        );
+        let mut pushes = Vec::new();
+        for (repository, tag) in [(heavy, 3u8), (heavy, 3), (heavy, 3), (heavy, 3), (light, 4)] {
+          let push = slates_rt::futures::spawn(async move {
+            for _ in 0..TURNS {
+              let turn = take(repository).await;
+              LOG.with(|log| log.borrow_mut().push(tag));
+              turn.yield_holding().await;
+            }
+          })
+          .unwrap();
+          pushes.push(push);
+        }
+        for push in pushes {
+          let _ = slates_rt::futures::join(push).await;
+        }
+        let _ = sent.send(LOG.with(|log| log.borrow().clone()));
+      })
+      .unwrap();
+      slates_rt::futures::detach(task).unwrap();
+    });
+    let log = answered.recv().unwrap();
+    assert_eq!(log.iter().filter(|r| **r == 3).count(), 4 * TURNS);
+    assert_eq!(log.iter().filter(|r| **r == 4).count(), TURNS);
+    let light_at: Vec<usize> = log
+      .iter()
+      .enumerate()
+      .filter(|(_, r)| **r == 4)
+      .map(|(at, _)| at)
+      .collect();
+    let most_between = light_at
+      .windows(2)
+      .map(|pair| pair[1] - pair[0] - 1)
+      .max()
+      .unwrap_or(0);
+    assert!(
+      (2..=4).contains(&most_between),
+      "{most_between} between: {log:?}"
     );
   }
 }

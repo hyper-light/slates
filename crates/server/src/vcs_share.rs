@@ -151,7 +151,7 @@ impl Drop for Live {
 }
 
 /// Each repository with works under way on this shard, and how many of each kind (`[intakes, fetches]`).
-fn live_works() -> Vec<(RepositoryId, [u64; 2])> {
+pub(crate) fn live_works() -> Vec<(RepositoryId, [u64; 2])> {
   LIVE.with(|live| {
     live
       .try_borrow()
