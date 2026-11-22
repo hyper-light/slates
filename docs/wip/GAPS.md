@@ -284,7 +284,9 @@
 > object and 1,362 MiB resident before, 0 and 123 MiB after. Open: the arena's address-space range in the content
 > object, a held extent's free pages. **Windows' section per extent written (A-789, main 18:40):** the anchor holds
 > each extent's section across a restart (`WHAT_CONTENT_EXTENT`); its build and tests are owed to w-lint on jupiter
-> (run-requests; red: commit kept after a destroyed volume's burst). **Open (R2, found 2026-11-20 19:45):** the macOS give-back
+> (run-requests; red: commit kept after a destroyed volume's burst). **Closed 2026-11-22 (w-interop):** the burst test's
+> red below was a shard keeping its burst's 1 GiB extent for 10 MiB of headroom, and the test measuring process RSS;
+> `docs/bugs/2026-11-22-a-shard-kept-a-1-gib-extent-for-10-mib-of-headroom.md`. **Open (R2, found 2026-11-20 19:45):** the macOS give-back
 > depends on the machine: recovery's `a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone` passed on a quiet
 > adas-macbook-pro-2 (1,648 -> 123 MiB) but kept 1,366 MiB there later and 335-336 MiB on the big Studio at 5,433 free
 > pages, at A-789's own commit too. Not the pressure hold: with the test's own pressure readings injected (none, and a
@@ -25407,7 +25409,14 @@ after every takeover (Goal 85b C3: 5 of 5 replays stalled at `live_chaos.rs:2465
 `live_ship::tests::the_publications_behind_a_whole_capture_are_held_to_the_credit_its_body_takes` (2 queued, 1 refused
 before; 3 queued, none refused after); this fleet test passes again (fleet `a_live_` 11/11).
 
-### 2026-11-20: a destroyed burst's extents not given back on Adas-Mac-Studio-2 — open (w-lint's finding, not worked: Ada's close order)
+### 2026-11-20: a destroyed burst's extents not given back on Adas-Mac-Studio-2 — closed 2026-11-22 (w-interop; `docs/bugs/2026-11-22-a-shard-kept-a-1-gib-extent-for-10-mib-of-headroom.md`)
+> **Closed:** the shard kept its burst's 1 GiB extent whole for its 10 MiB of operation headroom
+> (`ChunkArena::shrink` skips a region whose return leaves capacity under what it keeps); an idle give-back now trades
+> it for the smallest extent that keeps the headroom (`ChunkArena::shrink_trading`, 1,024 MiB held to 16 MiB after the
+> destroy). The test measured process RSS, which in its one process counts the test's own payload and its copies (1.0
+> GiB of freed large blocks macOS's allocator keeps): it now measures the pool by its own pages (the content object and
+> the arenas' held extents). A separate daemon's heap held resident (main's r41, about 1.3 GB against 31 to 60 MB
+> live) is its own piece, the idle heap give-back.
 `cargo test -p slates-server --test recovery a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone` (A-789,
 362bd8c39, red -> green on adas-macbook-pro-2 quiet: 1,622 -> 123 MiB) fails on main's own code on Adas-Mac-Studio-2,
 three runs of three on the merge 287055d5b: 41-42 MiB before the burst, 1,341-1,342 MiB after its volume was destroyed, for a
