@@ -386,3 +386,45 @@ Also: re-run git matrix for A-719 part 1 (81c36bd99) and hg matrix when w-hg's p
   blob/tag refused + clones corrupt -> red test dfe24c8bb (agents/w-interop-gittags, git_interop
   stock_git_pushes_and_clones_tags_of_a_blob_a_tree_and_a_tag), r18 running it unpinned; P (93 perf) waits on R.
 - Red test dfe24c8bb RED locally (MacBook, kiln placed it on 4 failing machines): 3 tags refused "names neither a commit nor a tree"; -> inbox/w-git-from-w-interop-red-tags.md.
+
+## LEDGER: "Interop with stock git, hg and svn clients proven" (2026-11-22 ~03:00 PST, for main 01a20182)
+Landed today for the part: 61f26030b (svn revprop-http row; main f5475cdd8) and 53ab613bd (git matrix and git_to_svn_dump
+outside injected git config; main 89f70868f; red/green on the MacBook, debug, with GIT_CONFIG_COUNT=1 tag.gpgsign=true:
+main's script tag-push "unable to sign the tag" + tag-delete red, the fixed script both green; blame/diff/checkout-old/
+partial-blame red in both, my 30-commit source being too short, not the leak).
+
+### svn (ci/interop/svn-matrix.sh, 33 rows): 33/33 GREEN on both routes
+- Last green: CI run 45012238025 (diag-measurer-main-svn-matrix), main 059578d78 + 61f26030b, macos-latest, Homebrew svn
+  1.15.0, full.dump (14 revisions): ROUTE=svn 33/33, ROUTE=http 33/33.
+- Rows: import, svnrdump-dump, svnsync, revprop-hook, revprop-svn, revprop-ssh, revprop-http, info, ls, cat, checkout,
+  log, log-verbose, blame, diff, export, update-back, commit-add, commit-edit, status, propset, mkdir-url, copy-branch,
+  copy-tag, switch, merge, lock-unlock, delete, revert, http-checkout, http-commit, ssh-checkout, ssh-commit.
+- Large history: r11, big Studio, release e14493d62, svn 1.15.0, git-2000.dump (2,000 revisions): 32/32 svn route and
+  32/32 http route (the 32 rows before revprop-http existed; svnsync 288/280 s).
+- Not counted: svn on Linux and Windows (no stock svn there: an install, Ada's go).
+
+### hg (ci/interop/hg-matrix.sh, 24 rows): GREEN on macOS; two rows red on loaded Linux
+- Last green (macOS): r5 2026-11-20 ~20:59, big Studio, release 907c246ac, Mercurial 7.2 (uvx), hg's whole history
+  (57,035 changesets): 24/24, spins 0. Rows: push-all, identify, clone, verify, same-tip, log, log-graph, annotate, diff,
+  bookmark-push, tag-push, branch-push, clone-b, merge-push, pull-update, rebase-push, incoming, outgoing, phase-public,
+  clone-rev, stream-clone, ssh-clone, ssh-pull, ssh-push.
+- Suite: hg_interop 16/16, 0 skips, main b9fed44e9, Studio-2, debug, Mercurial 7.2 (r12). Main: the hg fixture lane
+  98/98 on the MacBook after aff81b23b.
+- RED on Linux (adacachy, load 35-41, release 481d7abef, r8): clone-rev ("bad HTTP status line") and stream-clone (1,500 s
+  step limit), the daemon killed twice in vcs_http.rs:850 -> OWNER w-bugs (inbox/w-bugs-from-w-interop-http-spin.md).
+  19 rows green there; ssh-clone/ssh-pull/ssh-push not reached (the run's scope was SIGKILLed from outside at 69 min).
+
+### git (ci/interop/git-matrix.sh, 27 rows): 26/27 on the v2.0.0 cut; git/git whole RED
+- Last run (macOS): big Studio, release 1a35ab091, git 2.50.1 (Apple Git-155), git/git cut at v2.0.0: 26/27, spins 0.
+  Green: push-all, push-all-ssh, ls-remote, clone, fsck, same-heads, log, log-graph, blame, diff, show, checkout-old,
+  branch-push, tag-push, clone-b, merge-push, pull, rebase-push, fetch-prune, tag-delete, shallow-clone, partial-clone,
+  partial-blame, ssh-clone, ssh-push, ssh-fetch.
+- Also: the v1.0.0 cut 27/27 on Linux (adacachy, release 481d7abef, r8, git 2.56.0, with --vcs-store).
+- RED deepen ("bad pack header"): deepen itself works on a fresh repository for N 1..100 (r5), so it follows the tag-pack
+  defect -> OWNER w-git (item 1); w-bugs told.
+- RED git/git whole (f7de81456940, 1,019 tags): A/B r6 on 9b46d364f, every whole clone "repository corruption on the remote
+  side"; bisected (r9) to its 1,018 annotated tags of commits. On main's 81dc7ca3b round (yours): stock_git_verbs red,
+  push-whole refusing jch/next/seen on PastRoom (green_ready.rs:347) and a master "cannot lock ref" after -> OWNER w-git
+  (item 1). The tag-kinds test is green (A-836, 880785755).
+- Windows (git, hg, svn): main's, run by w-k90-win (main 01a1ff2e, 14:31).
+Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part closes on that evidence.
