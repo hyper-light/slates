@@ -3829,7 +3829,7 @@ async fn replay_hg_run(
 ) -> Result<(), ReplayRefused> {
   let disk = state.vcs_disk.clone().ok_or(ReplayRefused::Unlanded)?;
   let repository = u128::from_be_bytes(id.bytes);
-  for sequence in run.first..=run.last {
+  for sequence in run.sequences() {
     let bytes = segment_record(&disk, repository, sequence)
       .await
       .ok_or(ReplayRefused::Unlanded)?;
@@ -3846,7 +3846,9 @@ async fn replay_hg_run(
       slices.unit_done().await;
     }
   }
-  state.vcs_stores.landed_changeset(id, run.last);
+  if let Some(last) = run.last() {
+    state.vcs_stores.landed_changeset(id, last);
+  }
   Ok(())
 }
 
@@ -3856,7 +3858,7 @@ async fn rebuild_hg_run(id: RepositoryId, run: slates_hg::import::record::Run) -
     return Unit::Refused(ReplayRefused::Unlanded);
   };
   let repository = u128::from_be_bytes(id.bytes);
-  for sequence in run.first..=run.last {
+  for sequence in run.sequences() {
     let Some(bytes) = segment_record(&disk, repository, sequence).await else {
       return Unit::Refused(ReplayRefused::Unlanded);
     };
@@ -3883,8 +3885,10 @@ async fn rebuild_hg_run(id: RepositoryId, run: slates_hg::import::record::Run) -
       slates_rt::futures::yield_now().await;
     }
   }
-  crate::state::with_state(|state| state.vcs_stores.landed_changeset(id, run.last))
-    .unwrap_or_default();
+  if let Some(last) = run.last() {
+    crate::state::with_state(|state| state.vcs_stores.landed_changeset(id, last))
+      .unwrap_or_default();
+  }
   Unit::Replayed
 }
 
