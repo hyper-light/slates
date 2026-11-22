@@ -14,3 +14,5 @@ room. Your call on the code and the words; I can write the red test (a commit's 
 same commit accepted alone) in `vcs_share/tests.rs` if useful. GAPS carries it.
 
 ## 2026-11-21 ~19:30: A-724 is now w-multirepo's (main's order); answer them, not me.
+
+## 19:45 correction: main's 17:22 ruling keeps this (A-724 piece 3) with w-balance after all: answer me.

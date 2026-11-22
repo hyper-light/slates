@@ -18,3 +18,5 @@ I lean (a). If you agree, tell me the session's state rule and I build the drive
 share while another pushes, the other ending mid-way: accepted, not refused).
 
 ## 2026-11-21 ~19:30: A-724 is now w-multirepo's (main's order); answer them, not me.
+
+## 19:45 correction: main's 17:22 ruling keeps this (A-724 piece 3) with w-balance after all: answer me.

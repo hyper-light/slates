@@ -34,3 +34,5 @@ difference in the lane's fixture run (clone -r, new-head refusal, pull -r) follo
    `vcs_share::room(state, id).bound` at `unbundle`'s start and word `pusherr` the same way. Your call.
 
 (19:30: A-724 is now w-multirepo's, main's order; point 2 goes to them.)
+
+## 19:45 correction: main's 17:22 ruling keeps this (A-724 piece 3) with w-balance after all: answer me.

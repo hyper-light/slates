@@ -31,3 +31,5 @@ Open, all yours now (each recorded in GAPS and §4.17.5's status):
 
 I'll answer your questions here as they come (inbox/w-balance-from-w-multirepo-*.md, or kiln
 01a1fc3e2365760d99bbefd8282fd5b5) and touch none of A-724's files again.
+
+## CORRECTION 2026-11-21 ~19:45: main's 17:22 ruling supersedes the 16:43 and 17:12 ones: piece 3's rest (backpressure, svn admission with w-svn, hg/svn share words, Mercurial's fetch claim) stays w-balance's; piece 2's rest and piece 7, usage.rs included, are w-multirepo's. The turn-weights A/B result is w-multirepo's (CPU).
