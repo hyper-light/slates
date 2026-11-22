@@ -754,13 +754,21 @@ impl Repository {
         }
       }
       Followed::Remade { base } => {
+        let made_at = base.is_some();
         let base = match base {
-          Some(_) => values.next().ok_or(wrong)?.reached.clone(),
+          Some((green, at)) => {
+            let reached = values.next().ok_or(wrong)?.reached.clone();
+            let at = usize::try_from(at).map_err(|_| wrong)?;
+            self.base_set(store, ((green, at), record.head), reached)
+          }
           None => Positions::new(),
         };
-        let reached = base.union(&self.reach_walk(store, head, &base)?);
+        let walk = self.reach_walk(store, head, &base)?;
+        let reached = base.union(&walk);
+        // A-850: a first version made at a base brings what it reaches beyond that base, its own walk.
         let brought = match previous {
           Some(previous) => self.reach_walk(store, head, &previous.reached)?,
+          None if made_at => walk,
           None => reached.clone(),
         };
         Sets { reached, brought }

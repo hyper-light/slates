@@ -140,7 +140,9 @@ pub(crate) mod tests;
 pub(crate) mod upload;
 
 use lfs_record::LfsRecordRefused;
-use record::{Noted, Record, RecordRefused, RecordWriter, RecordedMove, WriteRefused};
+use record::{
+  Noted, Record, RecordRefused, RecordWriter, RecordedBase, RecordedMove, WriteRefused,
+};
 
 /// Counter: a repository whose store could not be made (a window too short for two identities, or a git repository
 /// recorded in no git format): zero on every machine. Format: a counter name in the status report.
@@ -501,6 +503,8 @@ pub(crate) enum GitRefused {
   /// A push's names and pack were homed and landed, but they are no longer what its record would name (another push
   /// committed one of its objects since): the push is refused, for its client's retry, never written inline (C5 part 2b).
   Unlanded,
+  /// A record's moves and their bases (A-850) are not one each: written so, or replayed so.
+  Unaligned,
 }
 
 /// A record not written, in a push's terms: an object whose bytes the content store does not hold whole is one the
@@ -508,6 +512,7 @@ pub(crate) enum GitRefused {
 fn unwritten(refused: WriteRefused) -> GitRefused {
   match refused {
     WriteRefused::Allocation => GitRefused::Allocation,
+    WriteRefused::Unaligned => GitRefused::Unaligned,
   }
 }
 
@@ -1686,7 +1691,9 @@ impl SealedPush {
   /// `commits::make_deferred` and `commits::MadeAfter`).
   pub(crate) fn record(&self, stores: &VcsStores) -> Result<Vec<u8>, GitRefused> {
     let (bytes, now) = self.names_now(stores)?;
-    let moves = (self.push.deepest(), self.keyed.as_slice());
+    // A-850: each move's base, the version it was made at, as its admission found it, so a replay takes the same.
+    let bases: Vec<RecordedBase> = self.moves.iter().map(Move::base).collect();
+    let moves = (self.push.deepest(), self.keyed.as_slice(), bases.as_slice());
     if now == 0 {
       return RecordWriter::finish_packed(moves, None, None, 0).map_err(unwritten);
     }
@@ -1807,6 +1814,20 @@ impl SealedPush {
     if given.is_err() {
       state.count(RELEASE_REFUSED, 1);
     }
+  }
+
+  /// The rank a push without `atomic` decides a command moving a ref to `to` by (A-850, `receive::Judge::rank`): the
+  /// generation number of the commit `to` peels to, read through the push and the repository's index, so its moves are
+  /// admitted oldest first and each create's search back meets the one below. 0 for an object neither holds or one that
+  /// peels to no commit (refused, or decided, in its turn as before).
+  pub(crate) fn rank(&self, state: &mut ShardState, to: ObjectId) -> u64 {
+    let (repository, push) = (self.repository, &self.push);
+    lent_to_read((&mut state.store, &mut state.vcs_stores), |stores| {
+      stores
+        .git_ref(repository)
+        .and_then(|(content, store)| store.repository.peeled_generation(content, push, to))
+        .unwrap_or(0)
+    })
   }
 
   /// One turn of the admission of the move of the green keyed `green` to `to` (A-722 part 4c), begun where `admitting`
@@ -2176,6 +2197,27 @@ fn admit_moves(
     .collect()
 }
 
+/// A replay's admitted `moves`, each made at the base its record names in place of the one the heads the replay met
+/// gave (A-850, `Repository::based`), so the store made again derives the sets and fragments the live one did. Refused
+/// [`GitRefused::Unaligned`] unless there is one base for each move, and as the store refuses a base it could not have
+/// been made at.
+fn based_moves(
+  content: &ContentStore,
+  store: &GitStore,
+  push: &Push,
+  (moves, bases): (Vec<Move>, &[RecordedBase]),
+) -> Result<Vec<Move>, GitRefused> {
+  if moves.len() != bases.len() {
+    return Err(GitRefused::Unaligned);
+  }
+  moves
+    .into_iter()
+    .zip(bases)
+    .map(|(admitted, base)| store.repository.based(content, push, admitted, *base))
+    .collect::<Result<Vec<Move>, StoreRefused>>()
+    .map_err(GitRefused::Store)
+}
+
 /// Commits `sealed` into its repository's store (module docs), once the entry that holds its record has passed the
 /// register's guard and before anything of the entry is applied: positions, rows and versions as A-614's commit makes
 /// them, then each moved green's derived value kept. Committed, the store holds the push's objects and later records
@@ -2371,7 +2413,9 @@ fn replay_push(
   if !recorded_alike(content, store, &remade, record) {
     return Err(ReplayRefused::Diverged);
   }
-  let moves = seal_moves(content, store, push, &record.moves).map_err(ReplayRefused::Git)?;
+  let moves = seal_moves(content, store, push, &record.moves)
+    .and_then(|moves| based_moves(content, store, push, (moves, &record.bases)))
+    .map_err(ReplayRefused::Git)?;
   commit_moves(content, store, push, (&moves, &record.moves)).map_err(ReplayRefused::Git)
 }
 
