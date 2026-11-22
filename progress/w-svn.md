@@ -490,3 +490,9 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - The diag branch merged up to 738b4e0af locally (272513fe4, ~/slates-work/w-svn-diag), unpushed. It's main's to
   push.
 - Waiting on main: the macOS rerun; r12's git-2000 number; w-shared's gauge names for item 2.
+
+## 2026-11-22 ~04:35 PST: svn over HTTPv2 closed by use
+- Main's CI 45021179639 (macos-latest, Homebrew svn 1.15.0, at 272513fe4 on 738b4e0af):
+  stock_svn_over_httpv2_answers_as_stock_svnserve_byte_for_byte 1/1 in 33.54 s; the guard left 0 views mounted.
+- Recorded in GAPS in 0235c0134.
+- Waiting on main: r12's finding (2) reading. Item 2 waits on w-shared's gauge names.
