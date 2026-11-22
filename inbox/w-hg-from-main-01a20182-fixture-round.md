@@ -13,3 +13,4 @@ Yours, red first:
 - reproduce clone-after over SSH after the same push sequence;
 - have the #[ignore]d test print the anchor's log for the failing step, so the next round names the cause.
 `stock_hg_pushes_large_files_and_the_daemon_keeps_serving` is running now; its result follows.
+- 22:44: `stock_hg_pushes_large_files_and_the_daemon_keeps_serving` PASSED in release, 1 passed in 16.88 s (same run, same base). Log: ~/.cache/main-01a20182/r2/hg-large-files.log.
