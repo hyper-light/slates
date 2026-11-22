@@ -80,6 +80,17 @@
 > before an entry's append (A-825 "Cost owed"), measured by the lane's release bench; since A-854 paid only by an
 > increment over 1 MiB, the smaller carried in its entry.
 
+> **Open (w-shared, 2026-11-22; main 01a20182 03:17, 04:24 PST): a landed git push keeps 772-787 MiB resident for a
+> 56 MB pack** (git_interop `the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the_history`,
+> git/git v2.0.0, release, the MacBook; bound 178.2 MiB). Attributed by the memory status's gauges (`mem.gauge.*`,
+> `crate::memory_gauges`, landed with this entry), in MB after the push: the system allocator's live blocks 55.9 (of
+> them the index tables 23.5); the repository's windows 61.3 in shard 0's arena and the pushed pack 53.9 on shard 1;
+> the 14 startup mapped blocks 13.8 resident; the rest, about 550-600 MB, is freed memory the system allocator kept
+> after the push's 971 MiB peak (its temporaries under the 1 MiB mapped floor). After the clone the git Repository's
+> objects read lately hold 53.9 more. Owed, in main's order: (1) the push's temporaries cut at their source (w-shared);
+> (2) landed windows and the pack let go once durable (w-shared, with w-git); (3) the recent-objects cache given back
+> after a fetch (w-git); (4) the index tables, decided after.
+
 > **FIXED (w-shared, 2026-11-22; goal 93, svn finding (2), main 01a20182 00:19 PST): a chain entry's buffer was reserved at
 > the admission's bound,** which counts the increment's whole post-state, though a text's splice names it by reference:
 > every imported text cost an allocation of its own size (26.2 MB for 25.6 MB of text in w-svn's attribution,
@@ -528,6 +539,21 @@
 >   before. Held by `vcs_http::daemon_edge::tests::a_mercurial_push_past_its_first_admission_waits_for_room_and_lands_whole`
 >   (a first room of 64 bytes; red with no wait: `PastAdmission { asked: 127, left: 64 }`) and
 >   `a_mercurial_push_its_store_cannot_hold_for_now_waits_for_room_and_lands_whole` (red: `heads` empty).
+> - Part 3, (a) BUILT (2026-11-22, w-hg; main 01a20182's ruling of 04:23; w-interop's whole-history push of hg refused at
+>   a manifest delta on ubuntu and arm, the push's own keeping having spent the one room it held, a wait for room no one
+>   else held never ending): the push is admitted its known need up front. Its begin decodes the framing, so it knows
+>   every revision before taking one; `Intake::bookkeeping` bounds what its steps will keep (each revision's node, kept
+>   text and path; a changeset's nodes; a manifest's written entries, at most one for each 43 bytes of its delta, and
+>   their paths; each log's name), and `hg_push::admitted_its_need` admits what the begin holds, that, and a step's
+>   room, within the repository's ceiling (what others do not hold, `vcs_share::wait::ceiling`). What it must keep past
+>   the ceiling is refused typed; a step past its room waits, as part 2. Counted `vcs.hg.push_need_admitted`. Held by
+>   `push::intake::tests::an_intakes_bookkeeping_covers_what_its_steps_keep` (the bound over what the steps kept) and
+>   `vcs_http::daemon_edge::tests::a_mercurial_push_is_admitted_its_known_need_and_never_waits_for_its_own_keeping`
+>   (500 changesets, 64 bytes left to the steps after the begin; red without (a): a step waited).
+> - Part 3, (b) next (main's ruling: straight after, not owed): the kept texts' list off the push's room, landed to the
+>   changeset store as it is taken (the landing's `Texts` section, sectioned), so the room bounds a step's working set
+>   alone; proved through the intake, the landing and the replay by the recovery oracle, and the whole-history push's
+>   peak RSS against its working set.
 > - Not reproduced here, logged: w-interop's fresh repository's first 500-revision push refused at once on CI's x86 and
 >   arm runners (main's order of 03:49 and 03:50). `a_fresh_repositorys_first_push_of_hundreds_of_changesets_is_taken_at_once`
 >   (500 changesets pushed with no gap after the create) passes on this Mac. Every content-store refusal of a held-ahead
@@ -3649,6 +3675,12 @@
 > re-derived by a release A/B only if the footprint still stays (main's ruling). The changeset landing's piece copies
 > are cut too (w-svn, main's routing of 00:57): `slates_store::owner::SlicedLanding::part` answers its buffer emptied
 > once written, and the svn landing fills one buffer a landing (`a_sliced_landings_part_gives_its_buffer_back_to_be_filled_again`).
+> Re-measured (main 01a20182's r12, 2026-11-22, this MacBook, release, at 1721d8c52 with the `put_window` cut): still
+> red, the footprint grown 494,927,872 B against 155,539,920 B live, 181,750,880 B not given back (r4 at 2a8dbcd99:
+> 150,287,136). The cut took allocations out but neither the peak nor what stays. `an_import_measured` now prints the
+> memory status's gauges (w-shared's, `crates/server/src/memory_gauges.rs`) summed over the shards at every reading,
+> and the footprint past the system path's live bytes, the mapped blocks' resident pages and the arenas, so the next
+> reading names the live bytes' holders and what the system allocator kept.
 > Still to measure: the A-742 floor's A/B only if the
 > footprint still stays (main's ruling). A local 64 KiB floor gave 47 MB of footprint at 2 s idle, against 363 MB, at
 > 19.4 s against 12.0 s (debug).

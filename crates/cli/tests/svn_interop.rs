@@ -2250,9 +2250,36 @@ fn memory_sample(instance: &str, label: &str) -> MemorySample {
         || line.contains("give_back")
     })
     .collect();
+  // What each holder holds by the daemon's own accounting, summed over the shards (w-shared's gauges), and what the
+  // footprint holds past the live system-path bytes, the mapped blocks' resident pages and the arenas: what the system
+  // allocator kept of freed blocks (`crates/server/src/memory_gauges.rs`).
+  let gauges = gauges_summed(&memory);
+  let arena: u64 = lines
+    .iter()
+    .filter_map(|line| {
+      line
+        .split_once("arena.allocated: ")?
+        .1
+        .trim()
+        .parse::<u64>()
+        .ok()
+    })
+    .sum();
+  let gauge = |name: &str| gauges.get(name).copied().unwrap_or(0);
+  let accounted = gauge("mem.gauge.process.system_live_bytes")
+    .saturating_add(gauge("mem.gauge.process.mapped_resident_bytes"))
+    .saturating_add(arena);
+  let kept = footprint.map(|kib| kib.saturating_mul(1024).saturating_sub(accounted));
   println!(
-    "an_import_measured: memory {label}: daemon RSS {rss} KiB, physical footprint {footprint:?} KiB\n  {}",
-    lines.join("\n  ")
+    "an_import_measured: memory {label}: daemon RSS {rss} KiB, physical footprint {footprint:?} KiB\n  {}\n  \
+     gauges (summed over shards):\n    {}\n  footprint past system live + mapped resident + arena ({accounted} B): \
+     {kept:?} B",
+    lines.join("\n  "),
+    gauges
+      .iter()
+      .map(|(name, value)| format!("{name} {value}"))
+      .collect::<Vec<_>>()
+      .join("\n    ")
   );
   let figure = |line: &str, key: &str| -> Option<u64> {
     line
@@ -2270,11 +2297,54 @@ fn memory_sample(instance: &str, label: &str) -> MemorySample {
       .filter(|line| line.contains("memory: heap "))
       .find_map(|line| figure(line, "resident_bytes="))
       .unwrap_or(0),
-    arena: lines
-      .iter()
-      .filter_map(|line| figure(line, "arena.allocated: "))
-      .sum(),
+    arena,
   }
+}
+
+/// Format: the prefix of the memory status's gauge rows (`crates/server/src/memory_gauges.rs`), each printed by the CLI
+/// as `shard N refused mem.gauge.<holder>.<measure>: <value>`, once a shard and only where non-zero.
+const GAUGE_PREFIX: &str = "mem.gauge.";
+
+/// The memory status's gauges in `memory` (`slates status --memory`'s output), each summed over the shards that report
+/// it, by name: what each holder of the daemon's memory holds by its own accounting (w-shared's gauges, main 01a20182's
+/// ruling of 2026-11-22 03:46: one mechanism for every measurement).
+fn gauges_summed(memory: &str) -> std::collections::BTreeMap<String, u64> {
+  let mut summed = std::collections::BTreeMap::new();
+  for line in memory.lines() {
+    let Some((_, row)) = line.split_once(" refused ") else {
+      continue;
+    };
+    let Some((name, value)) = row.split_once(": ") else {
+      continue;
+    };
+    let Ok(value) = value.trim().parse::<u64>() else {
+      continue;
+    };
+    if name.starts_with(GAUGE_PREFIX) {
+      let total: &mut u64 = summed.entry(name.to_owned()).or_default();
+      *total = total.saturating_add(value);
+    }
+  }
+  summed
+}
+
+/// P7's finding (2), main 01a20182's ruling of 2026-11-22 03:46 (an import's reading names the holder of what stays
+/// live). Do: sum a memory status's gauges where two shards report one, one shard another, and a row that is no gauge
+/// sits among them. Expect: each gauge once, summed over its shards; the other row left out.
+#[test]
+fn the_memory_gauges_are_summed_over_the_shards() {
+  let memory = "shard 0 refused mem.gauge.greens.content_bytes: 262144\n\
+                shard 0 refused content_range.arena.allocated: 528384\n\
+                shard 1 refused mem.gauge.greens.content_bytes: 100\n\
+                shard 0 refused mem.gauge.process.system_live_bytes: 7\n";
+  let summed: Vec<(String, u64)> = gauges_summed(memory).into_iter().collect();
+  assert_eq!(
+    summed,
+    vec![
+      ("mem.gauge.greens.content_bytes".to_owned(), 262_244),
+      ("mem.gauge.process.system_live_bytes".to_owned(), 7),
+    ]
+  );
 }
 
 /// Shape: how long a sample waits for `top` to read a footprint it missed (main 01a20182's run of 2026-11-22 01:36 read
