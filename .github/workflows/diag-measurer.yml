@@ -1,0 +1,66 @@
+name: diag measurer
+# w-interop (2026-11-22): the HTTP edge's spin under stock hg on a loaded Linux host (vcs_http.rs:850, `drive`; the hg
+# matrix's clone-rev and stream-clone rows red on adacachy at load 35-41, 2 kills). kiln reaches no Linux box, so this
+# reproduces it on ubuntu-latest, its CPUs oversubscribed twice over by busy loops, with DIAG timing of hg's `begin` and
+# of each streamed turn (crates/server/src/vcs_http/hg.rs) in the anchor log. Run only from `diag-measurer-*` branches,
+# never main; every log is an artifact.
+
+on:
+  push:
+    branches: ["diag-measurer-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  hg-matrix-loaded:
+    name: hg matrix, loaded (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: Stock Mercurial 7.2
+        run: |
+          python3 -m pip install --disable-pip-version-check --no-input --user "mercurial==7.2"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Build
+        run: cargo build --release --locked -p slates-cli --bin slates
+      - name: Mercurial's own history (a tag at a time, so a cut transfer is retried small)
+        run: |
+          hg version -q | head -1
+          URL=https://www.mercurial-scm.org/repo/hg; S=$RUNNER_TEMP/hg-src
+          for i in 1 2 3; do hg clone -q -U -r 1.0 $URL $S && break; rm -rf $S; sleep 10; done
+          for t in 2.0 3.0 4.0 5.0 6.0 6.5 7.0 tip; do
+            for i in 1 2 3 4; do if [ $t = tip ]; then hg -R $S pull -q $URL && break; else hg -R $S pull -q -r $t $URL && break; fi; sleep 10; done
+            echo "$t: $(hg -R $S log -r tip -T '{rev}')"
+          done
+      - name: The hg matrix with the CPUs oversubscribed twice over
+        run: |
+          echo "nproc $(nproc); load before $(cat /proc/loadavg)"
+          for i in $(seq $(( $(nproc) * 2 ))); do (while :; do :; done) & done
+          sleep 20; echo "load with burners $(cat /proc/loadavg)"
+          set +e
+          STEP_LIMIT=1500 ci/interop/hg-matrix.sh "$PWD/target/release/slates" "$RUNNER_TEMP/hg-src" "$RUNNER_TEMP/matrix-hg" 2>&1 | tee "$RUNNER_TEMP/matrix-hg.out"
+          rc=${PIPESTATUS[0]}
+          echo "load after $(cat /proc/loadavg)"
+          A=$RUNNER_TEMP/matrix-hg/anchor.log
+          echo "spins $(grep -cE 'is spinning' $A); kills $(grep -cE 'killing it' $A); restarts $(grep -cE 'daemon exited' $A)"
+          grep -E 'is spinning|killing it' $A | cut -c1-300
+          echo "== DIAG lines"; grep 'DIAG hg-http' $A | cut -c1-300 | sort -t= -k3 | tail -60
+          exit $rc
+      - name: Keep the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: hg-matrix-loaded-logs
+          path: |
+            ${{ runner.temp }}/matrix-hg.out
+            ${{ runner.temp }}/matrix-hg/anchor.log
+            ${{ runner.temp }}/matrix-hg/logs
+          if-no-files-found: warn

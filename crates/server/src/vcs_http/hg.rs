@@ -640,10 +640,20 @@ impl<S: HgStores> Exchange for HgExchange<S> {
         .await
         .map(|answered| Made::Whole(answered.media_type, answered.body)),
       None => self.stores.lend(id, &mut answering, |store, room| {
-        match hg_http::begin(store, &request, header_line(), &mut Fastest, room) {
+        let diag_began = slates_rt::futures::now_ns();
+        let diag_cpu = diag_thread_cpu_ns();
+        let made = match hg_http::begin(store, &request, header_line(), &mut Fastest, room) {
           hg_http::Begun::Answered(answered) => Made::Whole(answered.media_type, answered.body),
           hg_http::Begun::Streamed(streamed) => Made::Streamed(streamed),
-        }
+        };
+        slates_machine::log_line!(
+          "slates-server: DIAG hg-http begin query={:?} {} wall_us={} cpu_us={}",
+          String::from_utf8_lossy(&self.query).chars().take(120).collect::<String>(),
+          if matches!(made, Made::Whole(..)) { "whole" } else { "streamed" },
+          slates_rt::futures::now_ns().saturating_sub(diag_began) / 1000,
+          diag_thread_cpu_ns().saturating_sub(diag_cpu) / 1000
+        );
+        made
       }),
     }
     .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
@@ -725,6 +735,9 @@ impl<S: HgStores> HgExchange<S> {
     let costs = &mut self.costs;
     let mut paced = crate::vcs_store::paced_turn(quantum, start);
     let before = out.len();
+    let diag_cpu = diag_thread_cpu_ns();
+    let mut diag_steps = 0u64;
+    let mut diag_longest = 0u64;
     let turned = self
       .stores
       .lend_held(generation, &mut admission, |store, room| {
@@ -733,7 +746,11 @@ impl<S: HgStores> HgExchange<S> {
           if !paced.more(crate::vcs_store::ANSWER_STEP, costs) {
             break Ok(true);
           }
-          match streamed.step(store, room, out) {
+          let diag_step = slates_rt::futures::now_ns();
+          let stepped = streamed.step(store, room, out);
+          diag_steps += 1;
+          diag_longest = diag_longest.max(slates_rt::futures::now_ns().saturating_sub(diag_step));
+          match stepped {
             // A step that asks the changeset store ends the turn: the store answers before the next one.
             Ok(true) if slates_hg::render::StoreWants::wants(&*streamed).is_some() => {
               break Ok(true);
@@ -749,7 +766,21 @@ impl<S: HgStores> HgExchange<S> {
           }
         }
       });
-    paced.close(slates_rt::futures::now_ns(), costs);
+    let diag_now = slates_rt::futures::now_ns();
+    let diag_turn_cpu = diag_thread_cpu_ns().saturating_sub(diag_cpu);
+    if diag_turn_cpu > 50_000_000 || diag_longest > 50_000_000 {
+      slates_machine::log_line!(
+        "slates-server: DIAG hg-http turn wall_us={} cpu_us={} steps={} longest_step_us={} wrote={} quantum_us={} room={}",
+        diag_now.saturating_sub(start) / 1000,
+        diag_turn_cpu / 1000,
+        diag_steps,
+        diag_longest / 1000,
+        out.len().saturating_sub(before),
+        quantum / 1000,
+        room
+      );
+    }
+    paced.close(diag_now, costs);
     crate::vcs_store::hg_view::turn_taken();
     // A-724 piece 3d: what the turn wrote, learned as the fetch's demand once its answer ends.
     self.stores.wrote(
@@ -862,3 +893,14 @@ async fn answered_pushkey<S: HgStores>(
 #[cfg(test)]
 #[path = "tests/hg.rs"]
 mod tests;
+
+/// DIAG (never main): this thread's CPU time in nanoseconds, zero where it cannot be read.
+fn diag_thread_cpu_ns() -> u64 {
+  rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime)
+    .tv_sec
+    .unsigned_abs()
+    .saturating_mul(1_000_000_000)
+    .saturating_add(
+      u64::try_from(rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime).tv_nsec).unwrap_or(0),
+    )
+}
