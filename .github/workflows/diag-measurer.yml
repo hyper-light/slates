@@ -1,0 +1,35 @@
+name: diag measurer
+# main 01a20182 (2026-11-22 02:50 PST): w-hg's clippy round after its fix 14b00683a (C1 step 2a's tests), on origin/main,
+# for the four crates its C1 work touches: slates-merge, slates-vcs, slates-hg, slates-server, every target, -D warnings.
+# On GitHub's runners because main's MacBook runs the load_bench A/B now. Both host platforms, so each one's cfg arms
+# are linted. The toolchain step is ci.yml's own (components up front, so rust-toolchain.toml syncs nothing). Run only
+# from `diag-measurer-*` branches, never main.
+
+on:
+  push:
+    branches: ["diag-measurer-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  clippy:
+    name: clippy, four crates (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --locked -p slates-merge -p slates-vcs -p slates-hg -p slates-server --all-targets -- -D warnings
