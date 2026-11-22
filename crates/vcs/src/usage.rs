@@ -33,7 +33,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::rate::Rates;
+use crate::rate::{Decayed, Rates};
 
 /// Format: the shard clock's grain, the nanosecond: where a learned demand's ladder of horizons starts.
 const CLOCK_GRAIN_NS: u64 = 1;
@@ -66,7 +66,7 @@ pub struct WorkUsage {
 }
 
 /// One slot of a repository's principal summary (module docs).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PrincipalCount<P> {
   /// The principal.
   pub principal: P,
@@ -74,6 +74,28 @@ pub struct PrincipalCount<P> {
   pub count: u64,
   /// The most `count` may exceed the principal's true count by: the count of the slot it took over.
   pub overstated: u64,
+  /// Its intakes begun, decayed at its repository's intake horizon (A-724 piece 2; `crate::rate::Decayed`), taken over
+  /// with the slot as `count` is, so overstated by at most what the slot held.
+  pub intakes: Decayed,
+  /// Its fetches begun, decayed at its repository's fetch horizon, taken over likewise.
+  pub fetches: Decayed,
+}
+
+impl<P> PrincipalCount<P> {
+  /// The principal's decayed count of `work`.
+  pub fn decayed(&self, work: Work) -> &Decayed {
+    match work {
+      Work::Intake => &self.intakes,
+      Work::Fetch => &self.fetches,
+    }
+  }
+
+  fn decayed_mut(&mut self, work: Work) -> &mut Decayed {
+    match work {
+      Work::Intake => &mut self.intakes,
+      Work::Fetch => &mut self.fetches,
+    }
+  }
 }
 
 /// One repository's row (module docs).
@@ -150,31 +172,60 @@ impl<P> Usage<P> {
 
 impl<P: Clone + Eq> Usage<P> {
   /// Counts one work of `principal`'s in the summary of at most `slots` slots (module docs, Space-Saving).
-  fn count_principal(&mut self, principal: &P, slots: usize) {
-    if let Some(slot) = self
+  /// Counts one work of `principal`'s of kind `work` at `now_ns` in the summary of at most `slots` slots (module docs,
+  /// Space-Saving): its count, and its decayed count at the repository's horizon for `work`.
+  fn count_principal(&mut self, principal: &P, slots: usize, (work, now_ns): (Work, u64)) {
+    let horizon = self.learned(work).horizon_ns();
+    let at = if let Some(at) = self
       .principals
-      .iter_mut()
-      .find(|slot| slot.principal == *principal)
+      .iter()
+      .position(|slot| slot.principal == *principal)
     {
-      slot.count = slot.count.saturating_add(1);
-      return;
-    }
-    if self.principals.len() < slots {
+      at
+    } else if self.principals.len() < slots {
       self.principals.push(PrincipalCount {
         principal: principal.clone(),
-        count: 1,
+        count: 0,
         overstated: 0,
+        intakes: Decayed::default(),
+        fetches: Decayed::default(),
       });
+      self.principals.len().saturating_sub(1)
+    } else if let Some((at, least)) = self
+      .principals
+      .iter_mut()
+      .enumerate()
+      .min_by_key(|(_, slot)| slot.count)
+    {
+      // Taken over whole: the newcomer inherits the slot's counts, its overstatement bound.
+      least.principal = principal.clone();
+      least.overstated = least.count;
+      at
+    } else {
       return;
+    };
+    if let Some(slot) = self.principals.get_mut(at) {
+      slot.count = slot.count.saturating_add(1);
+      slot.decayed_mut(work).add(now_ns, (1, 0), horizon);
     }
-    if let Some(least) = self.principals.iter_mut().min_by_key(|slot| slot.count) {
-      let inherited = least.count;
-      *least = PrincipalCount {
-        principal: principal.clone(),
-        count: inherited.saturating_add(1),
-        overstated: inherited,
-      };
-    }
+  }
+
+  /// `slot`'s works of kind `work` a second at `now_ns`: the repository's rate times the slot's share of its slots'
+  /// decayed counts. Each count was decayed at whichever horizon the repository had chosen at each moment, so read alone
+  /// at today's horizon it reads low (one principal pushing every millisecond read 793 a second against the
+  /// repository's 1,252 at a 134 ms horizon); every slot was decayed by the same horizons, so their shares are sound.
+  /// `None` before the repository's horizon is learned.
+  pub fn principal_per_s(&self, slot: &PrincipalCount<P>, work: Work, now_ns: u64) -> Option<f64> {
+    let learned = self.learned(work);
+    let rate = learned.works_per_s(now_ns)?;
+    let horizon = learned.horizon_ns();
+    let all: f64 = self
+      .principals
+      .iter()
+      .map(|each| each.decayed(work).works_at(now_ns, horizon))
+      .sum();
+    let own = slot.decayed(work).works_at(now_ns, horizon);
+    (all > 0.0).then(|| rate * own / all)
   }
 }
 
@@ -208,7 +259,7 @@ impl<R: Ord + Clone, P: Clone + Eq> Ledger<R, P> {
     let row = self.row(repository, now_ns);
     let counts = row.work_mut(work);
     counts.begun = counts.begun.saturating_add(1);
-    row.count_principal(principal, slots);
+    row.count_principal(principal, slots, (work, now_ns));
   }
 
   /// A step of a work of kind `work` on `repository` ended at `now_ns`, having run `step_ns` on the shard's clock and read
@@ -455,5 +506,43 @@ mod tests {
       }
     );
     assert_eq!((pushed.first_ns, pushed.last_ns), (5, 7));
+  }
+
+  /// A-845 (§4.17.5 "Learned demand": "for each repository and each principal"). Do: two principals each begin and
+  /// have answered intakes on one repository, the first every millisecond, the second every fourth, for two seconds.
+  /// Expect: each principal's intakes a second read at the repository's horizon within a fifth of its own pace (1,000
+  /// and 250), and none before the repository's horizon is learned.
+  #[test]
+  fn each_principals_rate_is_read_at_its_repositorys_horizon() {
+    let mut ledger: Ledger<u8, u8> = Ledger::new(4);
+    ledger.begun(&1, &1, Work::Intake, 1);
+    let row = ledger.usage(&1).unwrap();
+    assert_eq!(
+      row.principal_per_s(&row.principals()[0], Work::Intake, 1),
+      None
+    );
+    let millisecond = 1_000_000u64;
+    for tick in 1..2_000u64 {
+      let now = 1 + tick * millisecond;
+      ledger.begun(&1, &1, Work::Intake, now);
+      ledger.answered(&1, Work::Intake, 100, now);
+      if tick % 4 == 0 {
+        ledger.begun(&1, &2, Work::Intake, now);
+        ledger.answered(&1, Work::Intake, 100, now);
+      }
+    }
+    let now = 1 + 1_999 * millisecond;
+    let row = ledger.usage(&1).unwrap();
+    let pace = |principal: u8| {
+      let slot = row
+        .principals()
+        .iter()
+        .find(|slot| slot.principal == principal)
+        .unwrap();
+      row.principal_per_s(slot, Work::Intake, now).unwrap()
+    };
+    let (first, second) = (pace(1), pace(2));
+    assert!((first - 1_000.0).abs() < 200.0, "{first}");
+    assert!((second - 250.0).abs() < 50.0, "{second}");
   }
 }

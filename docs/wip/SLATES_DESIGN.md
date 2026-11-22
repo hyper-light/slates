@@ -16529,7 +16529,10 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > work's bytes (squared error; the shortest among equals), since a steady rhythm makes the arrival horizon the longest
 > and 100 small intakes then three 64 times larger would read 2.8 small there. Learned's properties held: within the
 > range seen, a new size from its first work, a work after a silence outweighing the past; noisy sizes read as their
-> mean. Owed: the principals' `Decayed` and the curves fed on the owner shard.
+> mean. Each principal's slot in a usage row keeps a `Decayed` a kind, read as the repository's rate times its share
+> of the slots' decayed counts (a slot's count read alone at today's horizon read 793 a second for 1,000, the horizon
+> having moved); a rate is read over its count's filled share, `1 - e^{-age/τ}`. Owed: the curves fed on the owner
+> shard.
 
 > **Status (2026-11-21, A-846: piece 2's memory share by marginal utility).** `slates_vcs::partition`: a shard's room
 > divided among its repositories, each first guaranteed the lesser of A-188's floor (the room over the repositories

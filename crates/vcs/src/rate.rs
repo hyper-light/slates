@@ -32,6 +32,12 @@
 //! Bytes a second are the arrival horizon's works a second times its mean. The miss-ratio curve's aging is the
 //! arrival horizon's too: [`Rates::keep`] is `e^{-elapsed/τ}`, what `crate::mrc::Curve::decay` takes.
 //!
+//! **Young counts.** A decayed count started at zero holds `1 - e^{-age/τ}` of its steady state after `age`, so read as
+//! `count / τ` a repository whose horizon is near its age (a steady rhythm's most likely horizon is the longest rung)
+//! reads its rate low: one principal pushing every millisecond for two seconds read 793 a second. A rate is therefore
+//! read over the filled share, `count / (τ · (1 - e^{-age/τ}))`, the usual correction of an average decayed from zero;
+//! it is one once the age is several horizons.
+//!
 //! **A principal's rates** ([`Decayed`]) are one decayed count each, read at its repository's horizon: a repository
 //! keeps its principals in a Space-Saving summary of bounded slots (`crate::usage`), and a ladder a slot would cost each
 //! of them its rungs.
@@ -185,7 +191,8 @@ impl Rates {
   /// `count`, kept as of the last work on a rung of time constant `tau_ns`, read as a rate a second at `now_ns`.
   fn at(&self, count: f64, tau_ns: f64, now_ns: u64) -> f64 {
     let since = crate::share::amount_of(now_ns.saturating_sub(self.last_ns));
-    count * (-since / tau_ns).exp() / tau_ns * NANOS_PER_SECOND
+    let age = now_ns.saturating_sub(self.first_ns.unwrap_or(now_ns));
+    count * (-since / tau_ns).exp() / (tau_ns * filled(age, tau_ns)) * NANOS_PER_SECOND
   }
 
   /// Adds the rungs whose time constant the repository's `age_ns` has reached, and the one after them, each a copy of
@@ -239,6 +246,8 @@ pub struct Decayed {
   bytes: f64,
   /// Its last event's time.
   last_ns: u64,
+  /// Its first event's time.
+  first_ns: Option<u64>,
 }
 
 impl Decayed {
@@ -249,14 +258,22 @@ impl Decayed {
     self.works = self.works * decay + works as f64;
     self.bytes = self.bytes * decay + bytes as f64;
     self.last_ns = self.last_ns.max(now_ns);
+    self.first_ns.get_or_insert(now_ns);
   }
 
   /// Works and bytes a second at `now_ns`, read at `tau_ns`; `None` without a horizon.
   pub fn per_s(&self, now_ns: u64, tau_ns: Option<f64>) -> Option<(f64, f64)> {
     let tau = tau_ns.filter(|tau| *tau > 0.0)?;
     let decay = Self::decay(now_ns.saturating_sub(self.last_ns), Some(tau));
-    let scale = decay / tau * NANOS_PER_SECOND;
+    let age = now_ns.saturating_sub(self.first_ns.unwrap_or(now_ns));
+    let scale = decay / (tau * filled(age, tau)) * NANOS_PER_SECOND;
     Some((self.works * scale, self.bytes * scale))
+  }
+
+  /// Its decayed count of works at `now_ns`, decayed at `tau_ns` since its last event: its weight among its
+  /// repository's principals (`crate::usage`), every one of which decayed by the same horizons.
+  pub fn works_at(&self, now_ns: u64, tau_ns: Option<f64>) -> f64 {
+    self.works * Self::decay(now_ns.saturating_sub(self.last_ns), tau_ns)
   }
 
   /// `e^{-elapsed/τ}`, one without a horizon.
@@ -265,6 +282,17 @@ impl Decayed {
       Some(tau) if tau > 0.0 => (-(elapsed_ns as f64) / tau).exp(),
       _ => 1.0,
     }
+  }
+}
+
+/// The share of its steady state a decayed count started `age_ns` ago holds at time constant `tau_ns`, `1 - e^{-age/τ}`
+/// (module docs, "Young counts"); one where that is no positive number (no age yet), so nothing is scaled.
+fn filled(age_ns: u64, tau_ns: f64) -> f64 {
+  let share = 1.0 - (-crate::share::amount_of(age_ns) / tau_ns).exp();
+  if share.is_finite() && share > 0.0 {
+    share
+  } else {
+    1.0
   }
 }
 
