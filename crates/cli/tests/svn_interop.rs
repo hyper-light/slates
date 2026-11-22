@@ -506,8 +506,12 @@ struct Anchor {
   instance: String,
   drain: Option<std::thread::JoinHandle<()>>,
   /// The directory its daemon's changeset store lives in (`--vcs-store`; C2: a daemon without one makes no Subversion
-  /// repository), removed after the anchor is killed; none where the caller named its own.
-  _store: Option<Scratch>,
+  /// repository), removed after the anchor is killed, once what the daemon mounted in it is unmounted; none where the
+  /// caller named its own.
+  store: Option<Scratch>,
+  /// The store directory its daemon was given, its own or the caller's: where the daemon mounts its hook views, each
+  /// let go before the daemon is stopped.
+  store_dir: Option<String>,
 }
 
 impl Drop for Anchor {
@@ -516,6 +520,12 @@ impl Drop for Anchor {
   /// [`DRAIN_PATIENCE`]: main's all-verbs round of 2026-11-21 sat at 0% CPU for 18 minutes after a failed assertion,
   /// joining a drain the daemon's side still held.
   fn drop(&mut self) {
+    // The hook views the daemon mounted in its store let go first, while the daemon still serves them: a kernel NFS
+    // mount whose server dies under it panicked a Mac twice (2026-10-06, `com.apple.filesystems.nfs`), so no daemon is
+    // stopped under a live one, and none is force-unmounted after its daemon is gone.
+    if let Some(dir) = self.store_dir.as_deref() {
+      unmount_under(dir);
+    }
     let _ = self.child.kill();
     let _ = self.child.wait();
     for pid in instance_processes(&self.instance) {
@@ -534,7 +544,74 @@ impl Drop for Anchor {
         );
       }
     }
+    if let Some(store) = self.store.take() {
+      removed_within(store);
+    }
   }
+}
+
+/// Lets go every mount beneath `dir`, deepest first, each `umount` waited for at most [`DRAIN_PATIENCE`]: an anchor's
+/// guard calls it while its daemon still serves the hook views it mounted in its store (`slates mount`, A-645 (a)), so
+/// each unmount is answered by a live server.
+fn unmount_under(dir: &str) {
+  let mut mounted = mounts_under(dir);
+  mounted.sort_by_key(|path| std::cmp::Reverse(path.len()));
+  for path in mounted {
+    let Ok(mut unmounting) = Command::new("umount")
+      .arg(&path)
+      .stdin(Stdio::null())
+      .stdout(Stdio::null())
+      .stderr(Stdio::null())
+      .spawn()
+    else {
+      continue;
+    };
+    let started = Instant::now();
+    while unmounting.try_wait().ok().flatten().is_none() && started.elapsed() < DRAIN_PATIENCE {
+      pause();
+    }
+    let _ = unmounting.kill();
+    let _ = unmounting.wait();
+  }
+}
+
+/// Removes an anchor's store directory once its views are unmounted and its daemon is gone (main 01a20182's run
+/// 45011974996: a red run's cleanup sat 900 s in `remove_dir_all`'s `openat`), on a thread of its own, waited for at
+/// most [`DRAIN_PATIENCE`]; where it is still held, said so and left, so a red run ends red rather than hanging.
+fn removed_within(store: Scratch) {
+  let path = store.path.clone();
+  let removing = std::thread::spawn(move || drop(store));
+  let started = Instant::now();
+  while !removing.is_finished() && started.elapsed() < DRAIN_PATIENCE {
+    pause();
+  }
+  if removing.is_finished() {
+    let _ = removing.join();
+  } else {
+    eprintln!(
+      "the anchor's store {path} was still held {DRAIN_PATIENCE:?} after its views and daemon were let go: left behind"
+    );
+  }
+}
+
+/// The mount points `mount` lists beneath `dir` (each line's `on PATH (` on macOS, `on PATH type` on Linux).
+fn mounts_under(dir: &str) -> Vec<String> {
+  let Ok(listed) = Command::new("mount").stdin(Stdio::null()).output() else {
+    return Vec::new();
+  };
+  String::from_utf8_lossy(&listed.stdout)
+    .lines()
+    .filter_map(|line| {
+      let (_, rest) = line.split_once(" on ")?;
+      let end = rest
+        .find(" (")
+        .into_iter()
+        .chain(rest.find(" type "))
+        .min()?;
+      Some(rest.get(..end)?.to_owned())
+    })
+    .filter(|path| path.starts_with(dir))
+    .collect()
 }
 
 /// Shape: how long a dropped anchor's drain may take to end once its processes are killed: a guard against a holder
@@ -625,11 +702,19 @@ fn start_anchor(instance: &str, edges: &[&str]) -> (Anchor, Vec<String>, IssuerS
     .spawn()
     .unwrap();
   let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+  let store_dir = store.as_ref().map(|store| store.path.clone()).or_else(|| {
+    edges
+      .iter()
+      .position(|edge| *edge == "--vcs-store")
+      .and_then(|at| edges.get(at + 1))
+      .map(|dir| (*dir).to_owned())
+  });
   let mut anchor = Anchor {
     child,
     instance: instance.to_owned(),
     drain: None,
-    _store: store,
+    store,
+    store_dir,
   };
   let (lines, issuer) = lines_until_serving(&mut stderr, instance);
   anchor.drain = Some(std::thread::spawn(move || {
@@ -1579,6 +1664,67 @@ fn a_hooks_repos_path_is_the_repositorys_view_mounted_in_the_store_directory() {
     (seen.as_str(), unmounted.0),
     ("0\n5\n", 0),
     "answer: {answer}; unmount: {unmounted:?}"
+  );
+}
+
+/// main 01a20182's constraint of 2026-11-22 03:22 (a kernel NFS mount whose daemon died under it panicked a Mac twice,
+/// 2026-10-06): a test that fails with a hook's view still mounted must have its guard let the view go while its daemon
+/// still serves it. Do: as [`a_hooks_repos_path_is_the_repositorys_view_mounted_in_the_store_directory`], start an
+/// anchor with a store, configure a start-commit hook and POST, so the hook's view is mounted in the store; then fail on
+/// purpose, the anchor's guard dropped as the failure unwinds. Expect: the failure caught; nothing mounted beneath the
+/// store after it, and no process of the instance left. Runs on CI alone (macos-latest and Linux): never on Ada's Macs,
+/// where a guard that stopped the daemon first would panic the machine.
+#[cfg(unix)]
+#[test]
+#[ignore = "CI only (a deliberate failure with a hook view mounted): cargo test -p slates-cli --test svn_interop -- --ignored a_failing_test_lets_its_hook_view_go_before_its_daemon"]
+#[allow(clippy::disallowed_methods)]
+fn a_failing_test_lets_its_hook_view_go_before_its_daemon() {
+  use std::os::unix::fs::PermissionsExt;
+  let instance = format!("svn-view-failing-{}", std::process::id());
+  let scratch = Scratch::new("svn-view-failing");
+  let store = format!("{}/{STORE}", scratch.path);
+  made_directory(&store);
+  let (anchor, lines, issuer) = start_anchor(
+    &instance,
+    &["--vcs-http", "127.0.0.1:0", "--vcs-store", &store],
+  );
+  let port = http_edge_port(&lines);
+  let Some(issuer) = issuer_or_skip(issuer, "the failing test's view") else {
+    return;
+  };
+  create_repository(&instance);
+  let (_, token) = minted_token(&instance, &issuer);
+  let hook = format!("{}/start-commit", scratch.path);
+  std::fs::write(&hook, "#!/bin/sh\nls \"$1\" > /dev/null\nexit 1\n").unwrap();
+  std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+  let given = format!("start-commit={hook}");
+  let (code, out, err) = slates(
+    &instance,
+    &["repository", "policy", REPOSITORY, "--hook", &given],
+  );
+  assert_eq!(code, 0, "policy: {out}{err}");
+  let _ = edge_request(
+    port,
+    ("POST", &format!("/{REPOSITORY}/!svn/me")),
+    &token,
+    &["Content-Type: application/vnd.svn-skel"],
+    b"( create-txn )",
+  );
+  let mounted_before = mounts_under(&store);
+  let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+    let _held = anchor;
+    panic!("a failure on purpose, the hook's view mounted");
+  }));
+  let left_mounted = mounts_under(&store);
+  let left_running = instance_processes(&instance);
+  assert_eq!(
+    (
+      failed.is_err(),
+      mounted_before.len(),
+      left_mounted,
+      left_running
+    ),
+    (true, 1, Vec::<String>::new(), Vec::<u32>::new())
   );
 }
 
