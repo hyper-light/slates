@@ -1,0 +1,58 @@
+name: diag measurer
+# main 01a20182 (2026-11-22 02:30 PST): the owed svn HTTPv2 rerun at >= 0de4c75ea (w-svn's "XML compared as XML" fix for
+# main's r13 red), on macos-latest with Homebrew's stock Subversion 1.15.0. It runs here because kiln's API is hung and
+# the big Studio, which has svn 1.15, is out of reach. A run still going after 15 minutes is sampled (macOS `sample`: the
+# test binary, svn and svnserve) before it is ended. Run only from `diag-measurer-*` branches, never main; every log is
+# an artifact.
+
+on:
+  push:
+    branches: ["diag-measurer-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  svn-httpv2:
+    name: svn HTTPv2 against svnserve (macos-latest)
+    runs-on: macos-latest
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      # The same tool ci.yml's macOS suite lane installs.
+      - name: Stock Subversion
+        run: brew install subversion && svn --version --quiet && svnserve --version --quiet | head -1
+      - name: Build
+        run: cargo test --release --locked -p slates-cli --test svn_interop --no-run
+      - name: HTTPv2 against svnserve, sampled if it hangs
+        run: |
+          set +e
+          L="$RUNNER_TEMP/logs"; mkdir -p "$L"
+          SLATES_TEST_CLI=1 cargo test --release --locked -p slates-cli --test svn_interop \
+            stock_svn_over_httpv2_answers_as_stock_svnserve_byte_for_byte -- --exact --nocapture > "$L/httpv2.log" 2>&1 &
+          pid=$!
+          for i in $(seq 1 180); do kill -0 $pid 2>/dev/null || break; sleep 5; done
+          if kill -0 $pid 2>/dev/null; then
+            echo "still running after 900 s: sampling the test binary, svn and svnserve"
+            for p in $(pgrep -f 'deps/svn_interop-') $(pgrep -x svn) $(pgrep -x svnserve); do
+              ps -o pid=,ppid=,etime=,command= -p "$p" | cut -c1-200
+              sample "$p" 5 -file "$L/sample-$p.txt" > /dev/null 2>&1
+            done
+            pkill -P $pid; kill $pid
+          fi
+          wait $pid; rc=$?
+          tail -120 "$L/httpv2.log"
+          echo "exit $rc"; exit $rc
+      - name: Keep the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: svn-httpv2-logs
+          path: ${{ runner.temp }}/logs
+          if-no-files-found: warn
