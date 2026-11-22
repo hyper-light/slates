@@ -11505,7 +11505,10 @@ names one.) A holder's replica folds where its owner's engine had folded when it
 holds (the record names the floor), so no replica keeps more history than its owner (A-385). A checkpoint reads the
 head's identity, whose backlog (every key changed since it was last read) is folded a paced step at a time on the owner
 and finished in turns by a task of its own, each turn's share the fold left spread over the turns before the next
-checkpoint is due (A-579): no step hashes the backlog whole.
+checkpoint is due (A-579): no step hashes the backlog whole. The checkpoint itself is held in the owner shard's content
+store, its chunks hashed and staged a unit at a time with a quantum a turn while someone waits, then published and
+recorded by name (`CheckpointRef`: identity and length), so the partition never carries its bytes (A-579's last step,
+chain entry format 6's rule; the build and encoding are still one step, owed).
 
 > **Status (2026-11-19, A-668: two inserts at one point meet in both orders).** A delta's operations are walked in
 > order and the walk stops at the first one lying past the range: one starting after the range's end, or at its end
@@ -16467,6 +16470,12 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > per-principal rates, the working set's miss-ratio curve and memory by marginal utility, CPU weights, and the shares
 > published to siblings.
 
+> **Status (2026-11-21, A-724 piece 3: Mercurial's push past its share).** `hg_push::unbundle` refuses a bundle
+> larger than its room has left, where the room is a share or the snapshot slot's room, before it is read, in 7.2's
+> `pusherr` form naming the bound and that a retry may pass
+> (`t_a724_a_mercurial_push_past_its_share_is_refused_naming_the_share`, red first). Owed in piece 3: Subversion's
+> admission and its words (with w-svn), backpressure before refusal (with w-git).
+
 > **Status (2026-11-21, A-724 piece 3b: git's push past its share refused typed and retryable).** A git push keeps what
 > bound its room when it began (`vcs_share::Bound`); a refusal past its admission is typed by it: `PushFailed::PastShare
 > { past, share, held }` where the room was the repository's share while others pushed, `PastSnapshot { past, room }`
@@ -16487,7 +16496,11 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > repository is a claimant in every other's room, claiming what it holds plus its learned fetch demand a live fetch; the
 > answer's bytes, reported by both edges as they write (`StoreLender::wrote`), are learned on the usage row when the
 > generation is given back (`t_a724_a_fetch_in_flight_is_a_claim_on_the_room`,
-> `t_a724_a_fetchs_answer_is_counted_and_learned_on_its_repositorys_usage_row`, red first). Mercurial's fetch is owed.
+> `t_a724_a_fetchs_answer_is_counted_and_learned_on_its_repositorys_usage_row`, red first). Mercurial's fetch likewise
+> (2026-11-21, w-hg's leave): its streamed answer's `hg_view::Generation` holds `Live::fetch` and is answered with the
+> bytes both edges report writing (`HgStores::wrote`); a generation held for a batch's lookup writes nothing and teaches
+> nothing (`t_a724_a_mercurial_fetch_in_flight_is_a_claim_on_the_room`,
+> `t_a724_a_mercurial_fetchs_answer_is_learned_and_a_lookups_hold_teaches_nothing`, red first).
 
 > **Status (2026-11-20, A-724 piece 3a: one room for every admission).** `crate::vcs_share::room` (`slates-server`) is
 > the one room a version-control work is admitted on its owner shard: git's push as it starts, git's fetch, Mercurial's
@@ -16538,9 +16551,39 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > every content the step reads (`get`, `bytes_of`, a window's read) is noted in it, keyed by its identity's first
 > eight bytes, a step inside a step restoring the outer curve. Its capacity is the content windows the repository's
 > floor holds, `room / (repositories served × window)` (`vcs_store::curve_keys`): a working set that fits the floor is
-> sampled whole. Fed today by git's fetches (both lends of `vcs_store::upload`). Owed: pushes' and Mercurial's and
-> Subversion's reads (their steps' lends), the curves aged at the horizon and divided by `slates_vcs::partition` at the
-> learning cadence, published as an immutable snapshot the room reads.
+> sampled whole. Fed today by git's fetches (both lends of `vcs_store::upload`).
+
+> **Status (2026-11-21, A-846 part 2: the grants, divided at the learning cadence).** `crate::vcs_share::grants`: each
+> shard keeps one `Grants` value, replaced whole: every row's curve aged to now at its read horizon
+> (`Ledger::age_curves`), its misses a second its counts over that horizon, the shard's admittable room divided by
+> `slates_vcs::partition`. It is divided again once the shortest read horizon among the repositories served has passed,
+> or at once when that set changes, and read in between (`current_at`; counted `vcs_share.grants_divided`). Since
+> A-846 part 3 (agreed with w-balance, A-724 piece 3's side) the room reads it: once every repository taking new room
+> has a curve, the asker's memory room is its grant less what it holds plus what is lendable (the spare and idle
+> repositories' unused grants), the cold trigger relieving each past its published grant (counted
+> `vcs_share.by_grants`); a live repository with no curve yet leaves memory divided per request, so a newcomer is never
+> promised a grant twice; the snapshot slot is divided as before. Owed: pushes', Mercurial's and Subversion's reads
+> feeding the curves (until then only git's fetching repositories take the grant path).
+
+> **Status (2026-11-21, A-849: piece 7's proof gains fetches).** `crates/cli/bench/multi_repo_load.py --fetches`
+> seeds every repository with its class's pack, then sends Zipf-skewed protocol v2 fetches beside the pushes, each
+> class's fetch p50 and p99 against its fetch alone. The harnesses' daemons get their own `--vcs-store` (push_load's
+> `Daemon`), without which no git repository could be made since A-767 C5. Proved locally (debug, M-series Mac): a
+> push alone 2.3 s and a fetch alone 10.3 s of git/git v0.99 (4,507 objects), both whole; the steps are main's rounds.
+> Mercurial and Subversion (main's ruling of 21:35, option (a)): `crates/cli/bench/multi_repo_stock.py SLATES hg|svn`,
+> the stock clients driving the same classes (each a git/git revision's tree): every repository seeded by its own
+> working copy, then Zipf-skewed pushes of one small changeset each from that copy, one after another, beside
+> Zipf-skewed fresh clones or checkouts; its bounds derived from the alone runs (a clone's bytes against the scratch
+> disk's free bytes, a client's peak resident set against free memory). Proved for hg locally (debug, M-series Mac,
+> R = 1 and 2: every push and fetch whole, 1.0x to 1.2x alone); svn runs on the big Studio, main's round.
+
+> **Status (2026-11-21, CPU: the open decision; main's ruling of 17:22).** A shard's CPU is divided among its
+> repositories by equal-weight deficit round robin (`vcs_share::turns`, A-724 piece 3c: one turn a repository a round,
+> max-min fair among those with work); CPU joins dominant-resource fairness for admission only. The weighted fair
+> queuing this section designs ("each weight its learned demand capped at its measured use") is open: piece 7's load
+> proof decides it, an interleaved release A/B of equal weights (main), learned weights (`agents/w-multirepo-learned-weights`:
+> a repository may hold its learned CPU demand over the least live one's turns at once) and a turn a distinct principal
+> (`agents/w-balance-turn-weights`), held to the smallest class's p99 against its fair share (run-requests.md, A-849).
 
 > **Status (2026-11-21, A-846: piece 2's memory share by marginal utility).** `slates_vcs::partition`: a shard's room
 > divided among its repositories, each first guaranteed the lesser of A-188's floor (the room over the repositories
@@ -55206,6 +55249,16 @@ Applied in the same change to:
   reply step). The room's claims add each live work's learned bytes by kind (`demand_of`). Red first: a fetch in flight
   divided no one's room; its answer was never counted. Tests: slates-server `vcs_share` 14/14, `vcs_store::upload` 7/7,
   `vcs_http::git` 20/20, `vcs_ssh` 72/72.
+- **Piece 3d for Mercurial (2026-11-21, w-hg's leave).** `hg_view::Generation` holds `vcs_share::Live::fetch` and a
+  written count fed by both edges after each streamed turn (`HgStores::wrote`, defaulted); its drop answers the fetch on
+  the usage row only where its answer wrote something, so a batch's lookup hold teaches no zero demand. Red first (a
+  held generation divided no room; with the lookup answered too, two fetches counted). Tests: slates-server `vcs_share`
+  16/16, `vcs_ssh::tests::hg` 13/13, `vcs_http::hg` 9/9, `hg_view` 7/7, `repository::hg_push` 18/18.
+- **Piece 3, Mercurial's share refusal (2026-11-21, w-hg's leave).** `hg_push::unbundle` refuses, before `front` reads
+  the bundle, a bundle larger than its room has left where the room is the repository's share (or the snapshot slot's
+  room): 7.2's `pusherr` (`Outcome::Unprocessed`) naming the bound and that a retry may pass (`past_its_bound`), as
+  git's `PastShare` does. Red first: refused `Bundle1` before, saying nothing of the share. Tests: slates-server
+  `vcs_share` 17/17, `vcs_ssh::tests::hg` 13/13, `vcs_http::hg` 9/9, `hg_view` 7/7, `repository::hg_push` 18/18.
 - **Applied in the same change to** §4.17.5 (new), GAPS, amendments.tsv.
 - **Owed.** Pieces 2 to 7 (§4.17.5's status); a fetch's answered count at its pack's last step; Mercurial's and
   Subversion's intakes and reads counted; the rows in `slates status`.
@@ -59823,12 +59876,53 @@ Applied in the same change to:
   to 47.6-52.6 s at 1,000 clients (hot files change several times a second), past its doubling deadline, where a turn's
   share is all that is left: steps of up to the ceiling for the rest of the run. Reverted; owed again with a slice that
   keeps a hot file's partial short and a share past the deadline that stays bounded (main's 23:50 ruling).
-- **Owed:** (b)'s A/B at Z = 20 and 50 ms; the checkpoint's remaining one step (~43 ms: build, encode, a 49 MB record),
-  its durable form a question for main; single keys of up to 13.4 ms sliced (above); w-git's member loop in turns on
-  `fold_identity_step`.
+- **The checkpoint by name, held in turns (A-579's last step, piece 1; main's order of 15:00, goal 93's, since it
+  scales).** w-work-cow measured a 1 GiB green's checkpoint right after its sliced submit at 650-1,063 ms in one step:
+  build 52, encode 71, record 527 ms of `db.mutate_owned`. That stalls the watchdog for any green that large, a big
+  git, Mercurial or Subversion import among them. The shape is A-760's and A-825's (format (a), riding chain entry
+  format 6, since that is on main):
+  - **Where the bytes are.** The encoding is held in the owner shard's content store as an inputs archive
+    (`merge_service::CheckpointHold`), under an object of its own derived from the green
+    (`checkpoint_object`, BLAKE3 key derivation). A store keeps one stage an object, and an owner's fetch of a holder's
+    increment (A-826) stages the green's own.
+  - **Held in turns.** Its chunks (1 MiB, `inputs_chunk_bytes`) are hashed into the manifest a unit at a time, then
+    copied into the stage a unit at a time (`ContentHold::stage_lent_piece`, new: `hold_lent` a piece at a time, the
+    caller's own hash not taken again). Each turn's share is one quantum while someone waits, never the deadline's
+    spread: past a deadline that spread is everything at once, which is what sank the key slices above.
+  - **Recorded by name.** Format 6's order: the partition's check, a publication, then the record
+    `Op::GreenCheckpointed { checkpoint: CheckpointRef { identity, len } }`, so no record names content a restarted
+    store lacks. The partition charges the name's 40 bytes, and the store charges the encoding (A-714's rule). The
+    anchor's layout is 16, and a layout-15 segment is refused.
+  - **Given back.** A checkpoint replaced is given back once the new one is recorded. A refused hold gives back what it
+    stored. A checkpoint the chain's cap takes at once (`Doubling::Now`) is taken whole, and the turns' stage gives way
+    to it (`merge.checkpoint.hold_superseded`). Recovery gives back whatever the record does not name: a stage a stop
+    left part-way, or one held before a kill kept its record (`release_unnamed_checkpoints`,
+    `merge.checkpoint.unnamed_released`). A store lacking the named checkpoint fences the green `ContentMissing`.
+  - **Counters:** `merge.checkpoint.hold_steps`, `hold_longest_step_ns`, `hold_superseded`, `hold_restarted`,
+    `unnamed_released`.
+  - **Tests** (focused, macOS arm64, this Mac, local, 2026-11-21):
+    - `merge_service::checkpoint_hold_tests::a_large_checkpoint_is_held_a_chunk_a_step_with_someone_waiting_and_recorded_by_name`:
+      three 1 MiB files; at least two hold steps a chunk; held whole and decoding; the green rebuilt from it equal.
+      Red with the hold taken whole in its step: "the hold took 1 steps for 4 chunks".
+    - `…::a_checkpoint_stopped_part_way_leaves_the_previous_one_and_the_next_completes`: a warm restart over a held
+      segment, the hold stopped after one chunk staged and the stage published. The first checkpoint stands, held
+      whole; the green is recovered at version 2; the stage is gone; the next checkpoint completes under another name,
+      and the first one's content is given back. Red with recovery's release removed: the stage was still there.
+    - `verbs::tests::a_green_replays_from_its_checkpoint_and_a_corrupt_one_is_fenced`, now with `ContentMissing`.
+    - `slates-cluster`'s `a_lent_hold_made_a_piece_at_a_time_holds_what_the_one_call_holds`.
+    - `slates-anchor`'s `a_segment_from_before_checkpoints_by_reference_is_refused_at_start`.
+  - **Left, piece 2:** the build and the encoding are still one step (52 + 71 ms at 1 GiB), now well inside the
+    watchdog's 1 s window.
+- **Owed:** (b)'s A/B at Z = 20 and 50 ms; the checkpoint's build and encoding sliced (piece 2, above); single keys of up
+  to 13.4 ms sliced (above); w-git's member loop in turns on `fold_identity_step`.
 - **Applied in the same change to** `crates/merge` (`engine`: `fold_identity_step`, `identity_backlog`,
   `identity_folded`; `tests/identity.rs`), `crates/server` (`merge_service`, `git_push`: `shard_pace_env`;
-  `repository` tests), §4.16, GAPS, BENCHMARKS.md.
+  `repository` tests), §4.16, GAPS, BENCHMARKS.md. The checkpoint by name: `crates/db` (`partition::CheckpointRef`,
+  `GreenCheckpoint`, `Op::GreenCheckpointed`, the replay split and the model, cadence and entry tests), `crates/anchor`
+  (`LAYOUT_VERSION` 16 and its refusal test), `crates/cluster` (`ContentHold::stage_lent_piece`), `crates/server`
+  (`merge_service`: `CheckpointHold`, `checkpoint_object`, `checkpoint_bytes`, `release_unnamed_checkpoints`, `held_bytes`;
+  `merge_origin`: `inputs_extent`, `inputs_manifest_archive_of`; `verbs`: the replay and the recovery's release;
+  `daemon`: the identities read; `tests/green_checkpoint.rs`'s retention bound).
 
 
 ### A-818 — A path's history as a persistent piece tree a version, piece 1: the pure module and its oracle (2026-11-21, w-rewrite-ops; main 09:40 PST, A-803 (c); A-793, A-809)
@@ -60303,7 +60397,8 @@ Applied in the same change to:
   module docs "Texts".
 - `crates/svn/src/migration/standalone.rs` (pieces 1 and 2, 41ce54f67 and e465b0e0c): `Standalone`, records with their
   texts held apart by identity, the crate's tests, integration tests and benches on it; `Repository::take_texts`.
-- `crates/svn/src/fsfs.rs`: `TextDeltas` answers none for the records; docs.
+- `crates/svn/src/fsfs.rs`: the `DELTA` writer and its `TextDeltas` seam removed (main 01a20182, 21:35); every text
+  `PLAIN`. `crates/server/src/vcs_store/svn_presenter.rs`: `PresentRefusal::DeltaPiece` removed.
 - `crates/svn/src/commit/revision.rs`: `StepRefusal::Corrupt`'s doc names an inline text.
 - `crates/server/src/vcs_store.rs` (`replay_step` without a row count), `vcs_store/svn_texts.rs` (`HeadTexts`' docs),
   `repository/svn_commit.rs` (`take_texts` delegates), and the vcs_ssh and presenter tests (piece 2).
@@ -60316,9 +60411,9 @@ Applied in the same change to:
   step, held apart by identity, the records naming each stored by its length. The records' own keeping is gone. A
   revision that carries a text inline is refused `Corrupt`, `SVN_ERR_FS_CORRUPT` (`E160004`), the refusal for a text
   the records do not hold. The FSFS view over records holding no delta writes every text `PLAIN`, as the presenter's
-  view already did. Its `DELTA` writer stays behind `TextDeltas`, with no source answering one: whether to remove it,
-  or feed it per-file deltas derived from the changeset log (Ada's ruling of 2026-11-20 ~13:35), is main's call
-  (GAPS).
+  view already did. Its `DELTA` writer, with no source answering one, is removed by main 01a20182's ruling of 21:35
+  PST (`fsfs::TextDeltas`, `StoredDelta`, `FilePiece::Delta`, the presenter's `DeltaPiece` refusal): under the changeset
+  ruling (Ada's of 2026-11-20 ~13:35) a per-file delta is derived data, built when a measured item needs one.
 - **Evidence.**
   - `a_text_carried_inline_is_refused_and_records_standing_alone_hold_it_apart` (red before: bare records kept the
     text).
@@ -60331,7 +60426,7 @@ Applied in the same change to:
 ### A-848 — The content pool grows an arena by what a claim needs (2026-11-21, w-sizing; main 01a1ff2e 17:20 and 01a20182 21:35, goal 93; Ada's MEMORY SIZING rule; A-98, A-789)
 Applied in the same change to: `crates/server/src/content_pool.rs` (`arena_parts`, `ContentPool::best_fit`, `claim`,
 the module docs, tests), `crates/mem/src/arena.rs` (`ExtentSource::claim(want)`, `ChunkArena::grow` passes what it
-still lacks), `crates/anchor/src/layout.rs` (`LAYOUT_VERSION` 16, `POOL_EXTENTS_PER_PARTITION`'s doc),
+still lacks), `crates/anchor/src/layout.rs` (`LAYOUT_VERSION` 17, `POOL_EXTENTS_PER_PARTITION`'s doc),
 `crates/server/src/config.rs` (`held_extent_bound`'s doc), GAPS.
 
 Status: built 2026-11-21, every platform (the cut and the claim are platform-free).
@@ -60345,7 +60440,7 @@ Status: built 2026-11-21, every platform (the cut and the claim are platform-fre
   is told what the arena still lacks and takes the smallest free part that covers it, else the largest; equal lengths
   go to the claimer's own slice first. An arena so grows by its need rounded up to a power of two of units, and
   doubles while claims keep coming.
-- An extent id now names another range of the content object, so the layout version is 16 and an older segment is
+- An extent id now names another range of the content object, so the layout version is 17 and an older segment is
   refused, never misread. A slice holds about two parts per bit of its length in units, at most
   `POOL_EXTENTS_PER_PARTITION` (64).
 - Measured (Studio-4, debug, `cargo test -p slates-server --lib content_pool::tests`; unit 262,144 bytes, slice arena

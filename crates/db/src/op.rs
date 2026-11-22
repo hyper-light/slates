@@ -429,14 +429,15 @@ pub enum Op {
   /// A green's checkpoint (W3; §4.16 "Deltas older than the derived retention fold into checkpoint deltas"): the
   /// green's state at `version` beyond its origin, encoded (`slates_merge::checkpoint`), held in place of every
   /// increment up to `version`, which applying it drops. Refused at or below the checkpoint held and past the head.
-  /// Appended (2026-11-06).
+  /// The encoding is held in the owner shard's content store and named here (A-579's last step, format 6's rule):
+  /// recorded only once a publication holds it. Appended (2026-11-06).
   GreenCheckpointed {
     /// The green volume.
     green: VolumeId,
     /// The version the checkpoint is the green's state at.
     version: u64,
-    /// The encoded checkpoint.
-    checkpoint: Vec<u8>,
+    /// Where the encoded checkpoint is held.
+    checkpoint: crate::partition::CheckpointRef,
   },
   /// A live-shipped volume's shipper committed its holder set (A-240): carried by the catalog register to `f + 1`
   /// before the shipper's first entry. Appended (2026-11-06).

@@ -4838,6 +4838,13 @@ pub enum Refusal {
   /// A merge check's view no longer holds (A-796): the green's head moved past the stamp's, or the work changed since it
   /// was checked. Nothing was read or changed; check again. Appended.
   StaleMergeView,
+  /// The node's version-control store refused the change (goal 93; jupiter's red of 2026-11-21): its own reason, such as
+  /// a store that could not be opened, a full disk or a refused write. Nothing of the change was recorded. Until it,
+  /// such a refusal was answered `Overloaded`, which named a busy shard and hid the store's reason. Appended.
+  StoreRefused {
+    /// The store's reason, in its words.
+    reason: String,
+  },
 }
 
 /// Why a copy was refused before any verdict ([`Refusal::CopyRefused`]): `slates_merge::engine::CopyRefusal` on the

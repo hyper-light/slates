@@ -1407,6 +1407,39 @@ fn a_segment_from_before_cram_md5_contexts_is_refused_at_start() {
   );
 }
 
+/// A-579's last step (the anchor's layout 16). Do: create a segment, write layout 15 into its header's version word, and
+/// attach to it. Expect: the attach refused as a wrong layout version. Layout 16's checkpoint record and snapshot name
+/// the checkpoint's encoding held in the content store, where layout 15's carried the bytes, so a layout-15 checkpoint
+/// would be misread; the layout refuses the whole segment once, typed, before anything is served. Before the change
+/// layout 15 was the current one, and the attach succeeded.
+#[test]
+fn a_segment_from_before_checkpoints_by_reference_is_refused_at_start() {
+  use slates_anchor::layout::AT_VERSION;
+  /// Format: the layout before a green's checkpoint was named rather than carried.
+  const BEFORE_CHECKPOINTS_BY_REFERENCE: u32 = 15;
+  let name = format!("slates-anchor-carried-checkpoints-{}", std::process::id());
+  let segment = AnchorSegment::create(&name, &identity(), geometry()).unwrap();
+  let (handoff, len) = handoff_of(&segment);
+  let header = slates_mem::Words::new().with(slates_mem::WordRun::one(
+    slates_anchor::layout::AT_GENERATION,
+    slates_mem::Width::U64,
+  ));
+  let mut mapping = slates_mem::SparseObject::open(&handoff, len, header).unwrap();
+  mapping
+    .write(AT_VERSION, &BEFORE_CHECKPOINTS_BY_REFERENCE.to_le_bytes())
+    .unwrap();
+  let result = AnchorSegment::attach(&handoff, len, &identity());
+  assert!(
+    matches!(
+      result,
+      Err(AnchorError::Layout {
+        reason: "wrong layout version"
+      })
+    ),
+    "a segment from before checkpoints by reference is refused at start: {result:?}"
+  );
+}
+
 /// Shape: how long the graceful stopping child keeps beating after it acknowledges a stop before it exits —
 /// its "drain", long enough that an anchor which did not wait for it would be seen not to.
 const DRAIN_MS: u64 = 100;

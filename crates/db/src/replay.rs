@@ -111,8 +111,10 @@ impl RegisterSplit {
         Op::GreenOriginated { origin, .. } => {
           carried.chain_entries = carried.chain_entries.saturating_add(wide(origin.len()));
         }
-        Op::GreenCheckpointed { checkpoint, .. } => {
-          carried.checkpoints = carried.checkpoints.saturating_add(wide(checkpoint.len()));
+        Op::GreenCheckpointed { .. } => {
+          carried.checkpoints = carried
+            .checkpoints
+            .saturating_add(wide(crate::partition::CheckpointRef::RECORD_BYTES));
         }
         Op::RepositoryAdvanced { entry } => {
           carried.repository_records = carried
@@ -963,7 +965,10 @@ mod tests {
         Op::GreenCheckpointed {
           green,
           version: 1,
-          checkpoint: vec![0; 300],
+          checkpoint: crate::partition::CheckpointRef {
+            identity: [0; 32],
+            len: 300,
+          },
         },
         Op::RepositoryAdvanced {
           entry: crate::catalog::RepositoryEntry {
@@ -987,14 +992,16 @@ mod tests {
     };
     let extra = 64u64;
     let mut split = RegisterSplit::default();
-    split.add_entry(&entry, 1_000 + extra);
-    split.add_entry(&entry, 1_000 + extra);
+    // A checkpoint is carried by its name, never its encoding's length (A-579): 100 + 40 + 500 + 100 bytes an entry.
+    let carried = 740u64;
+    split.add_entry(&entry, carried + extra);
+    split.add_entry(&entry, carried + extra);
     assert_eq!(
       split,
       RegisterSplit {
         repository_records: 1_000,
         chain_entries: 400,
-        checkpoints: 600,
+        checkpoints: 80,
         rest: 2 * extra,
       }
     );

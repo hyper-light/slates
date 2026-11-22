@@ -144,12 +144,17 @@ pub struct MergeShardState {
   /// The greens whose checkpoint is being taken in turns ([`checkpoint_green`], A-579): one task each, which folds the
   /// identity's backlog a paced step at a time and takes the checkpoint at its end.
   pub(crate) checkpointing: BTreeSet<DbVolumeId>,
-  /// What an identity key's fold costs on this shard, learned across checkpoints (`slates_pace::Costs`, A-579).
-  pub(crate) identity_costs: slates_pace::Costs<1>,
+  /// What a checkpoint's units cost on this shard, learned across checkpoints (`slates_pace::Costs`, A-579): an identity
+  /// key's fold, a chunk of its encoding hashed, a chunk staged.
+  pub(crate) checkpoint_costs: slates_pace::Costs<CHECKPOINT_KINDS>,
   /// When each green's last checkpoint was taken here, or when it first asked for one (A-579): the start of the
   /// interval its next checkpoint's identity fold is paced to finish within. One entry a green this shard holds,
   /// pruned of greens gone whenever one is added.
   pub(crate) checkpoint_since: BTreeMap<DbVolumeId, u64>,
+  /// Test only: the chunks a checkpoint's hold stages before it stops advancing, so a test can stop its daemon with a
+  /// hold part-way (`checkpoint_hold_tests`). `None` in every daemon but such a test's.
+  #[cfg(test)]
+  pub(crate) hold_pause_at: Option<usize>,
 }
 
 /// A green attachment's pin: the green and the version its view is fixed at.
@@ -248,31 +253,49 @@ pub(crate) fn checkpoint_green(state: &mut ShardState, green: DbVolumeId) {
   // The identity's backlog first, in a paced step (A-579): a checkpoint reads the head's identity, and a green whose
   // identity was last read thousands of versions ago hashed every file changed since in this one step (73.7 ms of a
   // 100 ms checkpoint at 1,000 clients on the Mac Studio, 2026-11-20; every request the owner serves waited behind it).
-  // When the step's quantum ends with someone waiting, the rest is folded in turns by a task of its own.
+  // Then the checkpoint's encoding is held in the content store a paced step at a time too (a 1 GiB green's record was
+  // 527 ms of one step, w-work-cow 2026-11-21). When a step's quantum ends with someone waiting, the rest is done in
+  // turns by a task of its own.
   let quantum = state.config.step_quantum_ns();
-  if identity_folded_in_a_step(state, green, quantum) {
-    taken_now(state, green);
-    return;
-  }
-  match slates_rt::futures::spawn(checkpoint_in_turns(green)) {
+  let hold = if identity_folded_in_a_step(state, green, quantum) {
+    let Some(mut hold) = CheckpointHold::begin(state, green, Doubling::Wait) else {
+      checkpoint_ended(state, green);
+      return;
+    };
+    if hold.step(state, Some(quantum)) == Held::Ended {
+      checkpoint_ended(state, green);
+      return;
+    }
+    Some(hold)
+  } else {
+    None
+  };
+  let resumed = hold.is_some();
+  match slates_rt::futures::spawn(checkpoint_in_turns(green, hold)) {
     Ok(task) => {
       state.merge.checkpointing.insert(green);
       state.count(CHECKPOINT_IN_TURNS, 1);
       let _ = slates_rt::futures::detach(task);
     }
-    // No room for the task: taken here as before, whole.
-    Err(_) => taken_now(state, green),
+    // No room for the task: taken here as before, whole. A hold begun above is dropped with the task's future and taken
+    // again from the start: its stage gives way to the whole one ([`checkpoint_green_when`]).
+    Err(_) => {
+      if resumed {
+        state.count(CHECKPOINT_HOLD_RESTARTED, 1);
+      }
+      checkpoint_green_when(state, green, Doubling::Wait);
+      checkpoint_ended(state, green);
+    }
   }
 }
 
-/// Takes `green`'s checkpoint now, by the doubling rule, and starts the interval its next one is paced within.
-fn taken_now(state: &mut ShardState, green: DbVolumeId) {
-  checkpoint_green_when(state, green, Doubling::Wait);
+/// Ends a checkpoint of `green`, taken or not: the interval its next one is paced within starts now.
+fn checkpoint_ended(state: &mut ShardState, green: DbVolumeId) {
   let now = slates_rt::futures::now_ns();
   state.merge.checkpoint_since.insert(green, now);
 }
 
-/// One turn's share of a checkpoint's identity fold (A-579), nanoseconds: what is left of it at its measured cost a key
+/// One turn's share of a checkpoint's paced work (A-579), nanoseconds: what is left of it at its measured cost a unit
 /// (`left_ns`), spread over the turns left before its deadline, a turn every `gap_ns` (the time since the last turn, the
 /// shard's measured cycle through its ready tasks). The deadline is the doubling interval (`interval_ns`, the time the
 /// increments it folds took to come, from `began_ns`): the next checkpoint is due after as much again, so this one
@@ -300,7 +323,7 @@ fn identity_folded_in_a_step(state: &mut ShardState, green: DbVolumeId, budget_n
   let mut env = crate::git_push::shard_pace_env(state);
   // The step asks whether anyone waits at the end of its budget, not of the bare quantum ([`turn_budget_ns`]).
   env.quantum_ns = budget_ns.max(env.quantum_ns);
-  let mut costs = state.merge.identity_costs;
+  let mut costs = state.merge.checkpoint_costs;
   let folded = state.greens.get_mut(&green).is_none_or(|mut engine| {
     let mut step = slates_pace::Step::begin(env, (env.clock)());
     let mut done = engine.identity_backlog() == 0;
@@ -310,67 +333,416 @@ fn identity_folded_in_a_step(state: &mut ShardState, green: DbVolumeId, budget_n
     step.close((env.clock)(), &mut costs);
     done
   });
-  state.merge.identity_costs = costs;
+  state.merge.checkpoint_costs = costs;
   state.count(CHECKPOINT_IDENTITY_STEPS, 1);
   folded
 }
 
 /// The pace kind of one identity key's fold ([`identity_folded_in_a_step`]).
 const IDENTITY_KEY: usize = 0;
+/// The pace kind of one chunk of a checkpoint's encoding hashed into its manifest ([`CheckpointHold::step`]).
+const CHUNK_HASHED: usize = 1;
+/// The pace kind of one chunk of a checkpoint's encoding copied into its content store stage ([`CheckpointHold::step`]).
+const CHUNK_STAGED: usize = 2;
+/// The pace kinds a checkpoint's work is measured in: [`IDENTITY_KEY`], [`CHUNK_HASHED`], [`CHUNK_STAGED`].
+pub(crate) const CHECKPOINT_KINDS: usize = CHUNK_STAGED + 1;
 
-/// Takes `green`'s checkpoint in turns (A-579): its identity's backlog folded a paced step a turn, yielding between,
-/// then the checkpoint itself, its doubling rule judged again then. Ends when the green or the shard state is gone.
-async fn checkpoint_in_turns(green: DbVolumeId) {
+/// Takes `green`'s checkpoint in turns (A-579): its identity's backlog folded a paced step a turn, then its encoding held
+/// in the content store a paced step a turn (`hold`, begun already when the identity was folded in the asking step),
+/// yielding between, then recorded. Ends when the checkpoint is recorded or refused, or the green or the shard state is
+/// gone; a hold dropped part-way (the shard stopping) leaves its stage, which the next checkpoint or recovery gives back.
+async fn checkpoint_in_turns(green: DbVolumeId, mut hold: Option<CheckpointHold>) {
   let began = slates_rt::futures::now_ns();
   let mut last_turn = began;
   loop {
-    let folded = crate::state::with_state(|state| {
+    let ended = crate::state::with_state(|state| {
       let now = slates_rt::futures::now_ns();
-      let quantum = state.config.step_quantum_ns();
-      let interval = state
-        .merge
-        .checkpoint_since
-        .get(&green)
-        .map_or(0, |since| began.saturating_sub(*since));
-      let per_key = state.merge.identity_costs.units[IDENTITY_KEY].estimate_ns();
-      let backlog = state
-        .greens
-        .get(&green)
-        .map_or(0, |engine| engine.identity_backlog());
-      let left = per_key.saturating_mul(u64::try_from(backlog).unwrap_or(u64::MAX));
-      let budget = turn_budget_ns(
-        left,
-        (now.saturating_sub(last_turn), quantum),
-        (began, interval, now),
-      );
+      let gap = now.saturating_sub(last_turn);
       last_turn = now;
-      if identity_folded_in_a_step(state, green, budget) {
+      let ended = checkpoint_turn(state, green, &mut hold, (began, gap));
+      if ended {
         state.merge.checkpointing.remove(&green);
-        taken_now(state, green);
+        checkpoint_ended(state, green);
         let span = slates_rt::futures::now_ns().saturating_sub(began);
         let longest = state
           .refusals
           .entry(CHECKPOINT_IN_TURNS_LONGEST_NS)
           .or_insert(0);
         *longest = (*longest).max(span);
-        return true;
       }
-      false
+      ended
     });
-    if folded.unwrap_or(true) {
+    if ended.unwrap_or(true) {
       return;
     }
     slates_rt::futures::yield_now().await;
   }
 }
 
-/// Counter: checkpoints whose identity backlog outlasted one paced step and were finished by a task in turns (A-579),
-/// the non-vacuity count of [`checkpoint_in_turns`].
+/// One turn of [`checkpoint_in_turns`]: the identity's fold, then the hold, each in a step whose budget spreads what is
+/// left over the turns before the checkpoint's deadline ([`turn_budget_ns`]). Whether the checkpoint has ended.
+fn checkpoint_turn(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  hold: &mut Option<CheckpointHold>,
+  (began, gap): (u64, u64),
+) -> bool {
+  let now = slates_rt::futures::now_ns();
+  let quantum = state.config.step_quantum_ns();
+  let interval = state
+    .merge
+    .checkpoint_since
+    .get(&green)
+    .map_or(0, |since| began.saturating_sub(*since));
+  let costs = state.merge.checkpoint_costs;
+  let Some(held) = hold.as_mut() else {
+    let per_key = costs.units[IDENTITY_KEY].estimate_ns();
+    let backlog = state
+      .greens
+      .get(&green)
+      .map_or(0, |engine| engine.identity_backlog());
+    let left = per_key.saturating_mul(u64::try_from(backlog).unwrap_or(u64::MAX));
+    let budget = turn_budget_ns(left, (gap, quantum), (began, interval, now));
+    if !identity_folded_in_a_step(state, green, budget) {
+      return false;
+    }
+    let Some(begun) = CheckpointHold::begin(state, green, Doubling::Wait) else {
+      return true;
+    };
+    *hold = Some(begun);
+    return false;
+  };
+  // The hold's share is the quantum a turn, never the deadline's spread: its units are bounded (a chunk each), and a
+  // share sized to finish by the deadline was everything at once past it, so a first checkpoint, whose interval is
+  // nothing, would run each step to the ceiling (as the identity's key slices did, 47.6-52.6 s, reverted ed4661d40).
+  held.step(state, Some(quantum)) == Held::Ended
+}
+
+/// A green's checkpoint on its way into the owner shard's content store (A-579's last step, chain entry format 6's rule):
+/// built and encoded, then its encoding's chunks hashed into the inputs archive's manifest a unit at a time, then copied
+/// into the store's stage of that manifest a unit at a time, then the stage completed, the shard published and the
+/// checkpoint recorded by name ([`Op::GreenCheckpointed`]). Owned by the step or the task taking it, so dropping it
+/// mid-way leaves nothing but its stage, which the next checkpoint's stage replaces and recovery gives back
+/// ([`release_unnamed_checkpoints`]).
+pub(crate) struct CheckpointHold {
+  /// The green.
+  green: DbVolumeId,
+  /// The version the checkpoint is the green's state at: its checkpoint floor when it was built.
+  version: u64,
+  /// The checkpoint's encoding (`slates_merge::checkpoint`).
+  encoding: Vec<u8>,
+  /// The manifest's extents hashed so far, one a chunk in order.
+  extents: Vec<slates_archive::manifest::Extent>,
+  /// The encoding's bytes hashed so far.
+  hashed: usize,
+  /// The manifest's identity, once every chunk is hashed and its stage is opened.
+  staging: Option<[u8; 32]>,
+  /// The chunks copied into the stage so far.
+  staged: usize,
+}
+
+/// What a step of a [`CheckpointHold`] left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Held {
+  /// Units are left for a later step.
+  More,
+  /// The checkpoint is recorded, or refused and counted.
+  Ended,
+}
+
+impl CheckpointHold {
+  /// Builds and encodes `green`'s checkpoint at its checkpoint floor when the doubling rule takes one now (always, with
+  /// [`Doubling::Now`]): none when the rule waits, the floor folds nothing, or the engine cannot take one there (counted
+  /// `merge.checkpoint.unavailable`; the chain stays whole).
+  pub(crate) fn begin(
+    state: &mut ShardState,
+    green: DbVolumeId,
+    doubling: Doubling,
+  ) -> Option<CheckpointHold> {
+    let inputs = fold_inputs(state, green)?;
+    if doubling == Doubling::Wait && inputs.waits() {
+      return None;
+    }
+    let floor = inputs.floor;
+    // The head's identity beside it (A-257): the amortized rule above bounds how often this reads the identity.
+    let Some(checkpoint) = state.greens.get_mut(&green).and_then(|mut engine| {
+      let mut checkpoint = engine.checkpoint(floor)?;
+      checkpoint.head_check = Some((engine.head(), engine.head_identity()));
+      Some(checkpoint)
+    }) else {
+      state.count(CHECKPOINT_UNAVAILABLE, 1);
+      return None;
+    };
+    Some(CheckpointHold {
+      green,
+      version: floor,
+      encoding: checkpoint.into_encoded(),
+      extents: Vec::new(),
+      hashed: 0,
+      staging: None,
+      staged: 0,
+    })
+  }
+
+  /// Does this hold's units in one step: paced within `budget_ns` (`slates_pace::Step`, at least one unit a step), or all
+  /// of them with none (a checkpoint the chain's cap asks for at once, [`checkpoint_green_when`]). Counted a step of the
+  /// hold, and the step's length noted when it is the longest yet.
+  pub(crate) fn step(&mut self, state: &mut ShardState, budget_ns: Option<u64>) -> Held {
+    let started = slates_rt::futures::now_ns();
+    let held = match budget_ns {
+      None => loop {
+        if self.unit(state) == Held::Ended {
+          break Held::Ended;
+        }
+      },
+      Some(budget_ns) => {
+        let mut env = crate::git_push::shard_pace_env(state);
+        env.quantum_ns = budget_ns.max(env.quantum_ns);
+        let mut costs = state.merge.checkpoint_costs;
+        let mut step = slates_pace::Step::begin(env, (env.clock)());
+        let held = loop {
+          let kind = if self.staging.is_some() {
+            CHUNK_STAGED
+          } else {
+            CHUNK_HASHED
+          };
+          if !step.more(kind, &mut costs) {
+            break Held::More;
+          }
+          if self.unit(state) == Held::Ended {
+            break Held::Ended;
+          }
+        };
+        step.close((env.clock)(), &mut costs);
+        state.merge.checkpoint_costs = costs;
+        held
+      }
+    };
+    state.count(CHECKPOINT_HOLD_STEPS, 1);
+    let took = slates_rt::futures::now_ns().saturating_sub(started);
+    let longest = state
+      .refusals
+      .entry(CHECKPOINT_HOLD_LONGEST_STEP_NS)
+      .or_insert(0);
+    *longest = (*longest).max(took);
+    held
+  }
+
+  /// One unit: a chunk hashed, the stage opened once every chunk is, a chunk staged, or the stage completed and the
+  /// checkpoint recorded.
+  fn unit(&mut self, state: &mut ShardState) -> Held {
+    let object = checkpoint_object(self.green);
+    let Some(manifest) = self.staging else {
+      let chunk = crate::merge_origin::inputs_chunk_bytes().max(1);
+      let end = self.hashed.saturating_add(chunk).min(self.encoding.len());
+      if let Some(piece) = self
+        .encoding
+        .get(self.hashed..end)
+        .filter(|piece| !piece.is_empty())
+      {
+        let offset = u64::try_from(self.hashed).unwrap_or(u64::MAX);
+        self
+          .extents
+          .push(crate::merge_origin::inputs_extent(offset, piece));
+        self.hashed = end;
+        return Held::More;
+      }
+      let archive = crate::merge_origin::inputs_manifest_archive_of(
+        self.extents.clone(),
+        u64::try_from(self.encoding.len()).unwrap_or(u64::MAX),
+        0,
+        archive_page(state),
+      );
+      let identity = archive.manifest_identity();
+      let opened = state.held_content.stage_fetched(
+        &mut crate::content_holder::hold_space(&mut state.store),
+        object,
+        slates_cluster::content::Placed {
+          sequence: self.version,
+        },
+        &archive,
+      );
+      return match opened {
+        // Held already (the same state checkpointed again): nothing to copy.
+        Ok(None) => self.record(state, identity),
+        Ok(Some(_)) => {
+          self.staging = Some(identity);
+          Held::More
+        }
+        Err(_) => {
+          state.count(CHECKPOINT_REFUSED, 1);
+          Held::Ended
+        }
+      };
+    };
+    #[cfg(test)]
+    if state
+      .merge
+      .hold_pause_at
+      .is_some_and(|at| self.staged >= at)
+    {
+      return Held::More;
+    }
+    let Some(extent) = self.extents.get(self.staged) else {
+      let completed = state.held_content.complete_stage(
+        &mut crate::content_holder::hold_space(&mut state.store),
+        object,
+      );
+      return match completed {
+        Ok(identity) => self.record(state, identity),
+        Err(_) => {
+          state.count(CHECKPOINT_REFUSED, 1);
+          Held::Ended
+        }
+      };
+    };
+    let start = usize::try_from(extent.offset).unwrap_or(usize::MAX);
+    let end = usize::try_from(extent.len).map_or(usize::MAX, |len| start.saturating_add(len));
+    let staged = match self.encoding.get(start..end) {
+      Some(piece) => state.held_content.stage_lent_piece(
+        &mut crate::content_holder::hold_space(&mut state.store),
+        object,
+        &manifest,
+        extent.chunk,
+        piece,
+      ),
+      None => Err(slates_cluster::content::ContentRefusal::Unstaged),
+    };
+    match staged {
+      Ok(_) => {
+        self.staged = self.staged.saturating_add(1);
+        Held::More
+      }
+      // Its stage gave way to another checkpoint's (one the chain's cap took at once, [`checkpoint_green_when`]), or the
+      // green went with its content: this one ends, and the next is taken afresh.
+      Err(slates_cluster::content::ContentRefusal::Unstaged) => {
+        state.count(CHECKPOINT_HOLD_SUPERSEDED, 1);
+        Held::Ended
+      }
+      Err(_) => {
+        state.count(CHECKPOINT_REFUSED, 1);
+        Held::Ended
+      }
+    }
+  }
+
+  /// Records the checkpoint held under `identity` (chain entry format 6's order, A-825): the partition's check first, then
+  /// a publication so the store's image holds it, then the record, so no record names content a restarted store lacks.
+  /// Then the checkpoint it replaced is given back, with the folded versions' increments (A-714's retention). A refusal
+  /// gives back what this hold stored, unless the record already names it.
+  fn record(&self, state: &mut ShardState, identity: [u8; 32]) -> Held {
+    let green = self.green;
+    let object = checkpoint_object(green);
+    let named = slates_db::partition::CheckpointRef {
+      identity,
+      len: u64::try_from(self.encoding.len()).unwrap_or(u64::MAX),
+    };
+    let previous = state
+      .db
+      .partition()
+      .green_checkpoint(green)
+      .map(|(_, held)| held);
+    let folded_from = state.db.partition().green_floor(green);
+    let op = Op::GreenCheckpointed {
+      green,
+      version: self.version,
+      checkpoint: named,
+    };
+    let now = state.clock.monotonic_ns();
+    let checked = state.db.partition().check(&op, now).is_ok();
+    let recorded = checked
+      && crate::verbs::publish_held_increments(state).is_ok()
+      && state.db.mutate_owned(&mut state.segment, op, now).is_ok();
+    let space = &mut crate::content_holder::hold_space(&mut state.store);
+    if recorded {
+      if let Some(previous) = previous.filter(|previous| previous.identity != identity) {
+        state
+          .held_content
+          .forget_manifest(space, object, &previous.identity);
+      }
+      state.count(CHECKPOINT_TAKEN, 1);
+      // The folded versions' increments go with their entries (A-714's retention), but for one a later entry names.
+      let head = state.db.partition().green_head(green);
+      release_unnamed_increments(state, green, folded_from, Some(head));
+    } else {
+      if previous.is_none_or(|previous| previous.identity != identity) {
+        state.held_content.forget_manifest(space, object, &identity);
+      }
+      state.count(CHECKPOINT_REFUSED, 1);
+    }
+    Held::Ended
+  }
+}
+
+/// The object a green's checkpoint is held under in its owner shard's content store (A-579): its own, derived from the
+/// green's id, so a checkpoint's stage, open across turns, never meets a stage of the green's own object (an owner's
+/// fetch of a holder's increment, A-826), which a content store keeps one of an object. Held on the owner shard only:
+/// no record, retention rule or route reads it, and it goes with the green ([`destroy`]'s release).
+pub(crate) fn checkpoint_object(green: DbVolumeId) -> ObjectId {
+  let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_OBJECT_CONTEXT);
+  hasher.update(&green.bytes);
+  let derived = hasher.finalize();
+  let mut bytes = [0u8; 16];
+  for (byte, from) in bytes.iter_mut().zip(derived.as_bytes()) {
+    *byte = *from;
+  }
+  ObjectId(bytes)
+}
+
+/// Format: the BLAKE3 key-derivation context a green's checkpoint object is derived under ([`checkpoint_object`]).
+const CHECKPOINT_OBJECT_CONTEXT: &str = "slates 2026-11-21 green checkpoint object";
+
+/// The encoding of `green`'s checkpoint `named`, from this shard's content store (A-579): lent from its one chunk's block
+/// where it is one chunk, else gathered once from its chunks in order. None when the store does not hold it whole.
+pub(crate) fn checkpoint_bytes<'a>(
+  state: &'a ShardState,
+  green: DbVolumeId,
+  named: &slates_db::partition::CheckpointRef,
+) -> Option<std::borrow::Cow<'a, [u8]>> {
+  held_bytes(state, checkpoint_object(green), &named.identity, named.len)
+}
+
+/// Gives back what this shard's content store holds under `green`'s checkpoint object but the checkpoint its partition
+/// names (A-579): a stage a stop left part-way, or a checkpoint held and published before a kill kept its record. The
+/// recovery runs it for every green it rebuilt. Returns how many manifests and stages went.
+pub(crate) fn release_unnamed_checkpoints(state: &mut ShardState, green: DbVolumeId) -> usize {
+  let named = state
+    .db
+    .partition()
+    .green_checkpoint(green)
+    .map(|(_, held)| held.identity);
+  let released = state.held_content.retain(
+    &mut crate::content_holder::hold_space(&mut state.store),
+    checkpoint_object(green),
+    |identity, _| Some(*identity) == named,
+  );
+  if released > 0 {
+    state.count(
+      CHECKPOINT_UNNAMED_RELEASED,
+      u64::try_from(released).unwrap_or(u64::MAX),
+    );
+  }
+  released
+}
+
+/// Counter: checkpoints whose identity backlog or hold outlasted one paced step and were finished by a task in turns
+/// (A-579), the non-vacuity count of [`checkpoint_in_turns`].
 pub(crate) const CHECKPOINT_IN_TURNS: &str = "merge.checkpoint.in_turns";
 /// Counter: the longest a checkpoint in turns took from its first step to its record, nanoseconds (A-579).
 pub(crate) const CHECKPOINT_IN_TURNS_LONGEST_NS: &str = "merge.checkpoint.in_turns_longest_ns";
 /// Counter: the paced steps that folded a checkpoint's identity backlog (A-579).
 pub(crate) const CHECKPOINT_IDENTITY_STEPS: &str = "merge.checkpoint.identity_steps";
+/// Counter: the steps that held a checkpoint's encoding in the content store (A-579's last step), the non-vacuity count
+/// of [`CheckpointHold::step`]: more than one for a checkpoint is the hold spread over turns.
+pub(crate) const CHECKPOINT_HOLD_STEPS: &str = "merge.checkpoint.hold_steps";
+/// Counter: the longest step that held a checkpoint's encoding, nanoseconds (A-579's last step).
+pub(crate) const CHECKPOINT_HOLD_LONGEST_STEP_NS: &str = "merge.checkpoint.hold_longest_step_ns";
+/// Counter: a checkpoint's hold whose stage gave way to another checkpoint's, or whose green went (A-579).
+pub(crate) const CHECKPOINT_HOLD_SUPERSEDED: &str = "merge.checkpoint.hold_superseded";
+/// Counter: a hold begun in the asking step and taken again whole there, the task to finish it refused (A-579).
+pub(crate) const CHECKPOINT_HOLD_RESTARTED: &str = "merge.checkpoint.hold_restarted";
+/// Counter: content held under a checkpoint object that no record names, given back at recovery (A-579).
+pub(crate) const CHECKPOINT_UNNAMED_RELEASED: &str = "merge.checkpoint.unnamed_released";
 
 /// Whether [`checkpoint_green_when`] waits for the increments to fold to reach the held checkpoint's size.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -404,8 +776,6 @@ pub(crate) struct FoldInputs {
   /// The bytes the checkpoint would fold: the chain's entries from the one after the version held (the partition's
   /// `green_floor`) up to `floor`, each with the increment it names in the content store (chain entry format 6).
   pub(crate) to_fold: usize,
-  /// The version the chain begins after: the partition's `green_floor`.
-  pub(crate) held: u64,
   /// The size of the checkpoint the green holds; 0 while it holds none, so its first one is taken at once.
   pub(crate) held_bytes: usize,
 }
@@ -442,10 +812,9 @@ pub(crate) fn fold_inputs(state: &ShardState, green: DbVolumeId) -> Option<FoldI
         entry.len().saturating_add(named)
       })
       .sum(),
-    held,
-    held_bytes: partition
-      .green_checkpoint(green)
-      .map_or(0, |(_, bytes)| bytes.len()),
+    held_bytes: partition.green_checkpoint(green).map_or(0, |(_, held)| {
+      usize::try_from(held.len).unwrap_or(usize::MAX)
+    }),
   })
 }
 
@@ -453,48 +822,13 @@ pub(crate) fn fold_inputs(state: &ShardState, green: DbVolumeId) -> Option<FoldI
 /// the chain's cap does first (`verbs::submit`, A-238), since the floor may have risen since the last accept (a work
 /// destroyed, rebased or reset), and a chain at its cap refuses every submit whose accept would take it.
 pub(crate) fn checkpoint_green_when(state: &mut ShardState, green: DbVolumeId, doubling: Doubling) {
-  let Some(inputs) = fold_inputs(state, green) else {
+  let Some(mut hold) = CheckpointHold::begin(state, green, doubling) else {
     return;
   };
-  if doubling == Doubling::Wait && inputs.waits() {
-    return;
-  }
-  let floor = inputs.floor;
-  // The head's identity beside it (A-257): the amortized rule above bounds how often this reads the identity.
-  let Some(checkpoint) = state.greens.get_mut(&green).and_then(|mut engine| {
-    let mut checkpoint = engine.checkpoint(floor)?;
-    checkpoint.head_check = Some((engine.head(), engine.head_identity()));
-    Some(checkpoint)
-  }) else {
-    state.count(CHECKPOINT_UNAVAILABLE, 1);
-    return;
-  };
-  let op = Op::GreenCheckpointed {
-    green,
-    version: floor,
-    checkpoint: checkpoint.into_encoded(),
-  };
-  let now = state.clock.monotonic_ns();
-  let recorded = state
-    .db
-    .partition()
-    .check(&op, now)
-    // Moved into the record, never copied: the checkpoint is the green's whole changed state (A-742).
-    .and_then(|()| {
-      state
-        .db
-        .mutate_owned(&mut state.segment, op, now)
-        .map(|_| ())
-    });
-  match recorded {
-    Ok(()) => {
-      state.count(CHECKPOINT_TAKEN, 1);
-      // The folded versions' increments go with their entries (A-714's retention), but for one a later entry names.
-      let head = state.db.partition().green_head(green);
-      release_unnamed_increments(state, green, inputs.held, Some(head));
-    }
-    Err(_) => state.count(CHECKPOINT_REFUSED, 1),
-  }
+  // A checkpoint being held in turns gives way to this one, taken whole now: its stage goes (the turns' next unit then
+  // finds none and ends, `merge.checkpoint.hold_superseded`), and with it anything held there no record names.
+  release_unnamed_checkpoints(state, green);
+  let _ = hold.step(state, None);
 }
 
 /// Counter: a green's chain checkpointed (W3), the non-vacuity count of [`checkpoint_green`].
@@ -1569,11 +1903,16 @@ pub(crate) fn destroy_merge_volume(
     state.merge.placed_holders.remove(&object);
     // Its version 0's inputs, made or being made (a job being made sees its entry gone and ends, A-286).
     state.merge.origin_inputs.remove(&object);
-    // Its versions' increments (chain entry format 6), with the chain that named them.
-    let released = state.held_content.forget_object(
-      &mut crate::content_holder::hold_space(&mut state.store),
-      object,
-    );
+    // Its versions' increments (chain entry format 6), with the chain that named them, and its checkpoint (A-579).
+    let space = &mut crate::content_holder::hold_space(&mut state.store);
+    let released = state
+      .held_content
+      .forget_object(space, object)
+      .saturating_add(
+        state
+          .held_content
+          .forget_object(space, checkpoint_object(id)),
+      );
     state.count(
       CHAIN_INPUTS_RELEASED,
       u64::try_from(released).unwrap_or(u64::MAX),
@@ -2626,30 +2965,40 @@ pub(crate) fn increment_of<'a>(
   green: DbVolumeId,
   inputs: &slates_merge::chain_entry::Inputs,
 ) -> Option<std::borrow::Cow<'a, [u8]>> {
-  let object = ObjectId(green.bytes);
+  held_bytes(state, ObjectId(green.bytes), &inputs.identity, inputs.len)
+}
+
+/// The bytes of the inputs archive this shard's content store holds for `object` under `identity`, `len` long: lent from
+/// its one chunk's block where it is one chunk, else gathered once from its chunks in order. None when the store does not
+/// hold it whole, or holds another length. What a chain entry's increment ([`increment_of`]) and a checkpoint
+/// ([`checkpoint_bytes`]) are read through.
+fn held_bytes<'a>(
+  state: &'a ShardState,
+  object: ObjectId,
+  identity: &[u8; 32],
+  len: u64,
+) -> Option<std::borrow::Cow<'a, [u8]>> {
   let arena = state.store.content.arena();
-  let manifest = state
-    .held_content
-    .held_manifest(arena, object, &inputs.identity)?;
+  let manifest = state.held_content.held_manifest(arena, object, identity)?;
   let extents = inputs_extents(&manifest);
   let piece = |extent: &slates_archive::manifest::Extent| {
     state
       .held_content
-      .held_raw(arena, object, &inputs.identity, &extent.chunk)
+      .held_raw(arena, object, identity, &extent.chunk)
       .filter(|bytes| u64::try_from(bytes.len()).ok() == Some(extent.len))
   };
   let bytes = match extents {
     [] => std::borrow::Cow::Borrowed(&[][..]),
     [one] => std::borrow::Cow::Borrowed(piece(one)?),
     several => {
-      let mut whole = Vec::with_capacity(usize::try_from(inputs.len).ok()?);
+      let mut whole = Vec::with_capacity(usize::try_from(len).ok()?);
       for extent in several {
         whole.extend_from_slice(piece(extent)?);
       }
       std::borrow::Cow::Owned(whole)
     }
   };
-  (u64::try_from(bytes.len()).ok() == Some(inputs.len)).then_some(bytes)
+  (u64::try_from(bytes.len()).ok() == Some(len)).then_some(bytes)
 }
 
 /// The page the inputs archive is chunked at (informational in the header; the identity is the
@@ -4733,6 +5082,10 @@ pub(crate) fn placed_version(state: &ShardState, object: ObjectId) -> Option<u64
 fn hex(bytes: &[u8]) -> String {
   bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
+
+#[cfg(test)]
+#[path = "merge_service_checkpoint_tests.rs"]
+mod checkpoint_hold_tests;
 
 #[cfg(test)]
 mod tests {

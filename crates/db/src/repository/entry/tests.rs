@@ -793,7 +793,10 @@ fn an_atomic_record_lives_while_a_greens_log_points_to_it() {
     &Op::GreenCheckpointed {
       green: b,
       version: 1,
-      checkpoint: b"checkpoint".to_vec(),
+      checkpoint: crate::partition::CheckpointRef {
+        identity: [0xC4; 32],
+        len: 10,
+      },
     },
   )
   .unwrap();
@@ -1932,7 +1935,10 @@ impl History {
     let real = self.mutate(&Op::GreenCheckpointed {
       green: volume_of(green),
       version,
-      checkpoint: format!("checkpoint-{green}@{version}").into_bytes(),
+      checkpoint: crate::partition::CheckpointRef {
+        identity: *blake3::hash(format!("checkpoint-{green}@{version}").as_bytes()).as_bytes(),
+        len: version,
+      },
     });
     prop_assert_eq!(real, Answer::Ok);
     Ok(())

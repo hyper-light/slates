@@ -1064,7 +1064,7 @@ impl ContentStore {
   fn note(&self, identity: &ContentId, held: &Held) {
     if let Ok(mut slot) = self.observing.try_borrow_mut()
       && let Some(curve) = slot.as_mut()
-      && let Some(key) = identity.0.first_chunk::<8>()
+      && let Some(key) = identity.0.first_chunk::<{ size_of::<u64>() }>()
     {
       curve.read(
         u64::from_le_bytes(*key),

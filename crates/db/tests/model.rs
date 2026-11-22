@@ -857,7 +857,10 @@ fn op_for_service(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
     Step::GreenCheckpoint(v, at) => Op::GreenCheckpointed {
       green: vid(pick(&ids.live, *v)?),
       version: *at,
-      checkpoint: at.to_be_bytes().to_vec(),
+      checkpoint: slates_db::partition::CheckpointRef {
+        identity: [u8::try_from(*at % 251).unwrap_or(0); 32],
+        len: *at,
+      },
     },
     // An adoption records a new green with its version 0 and every version up to the adopted one; the steps after it
     // advance, checkpoint and destroy it as any green, and a later origin of it is refused, never recorded.
@@ -1685,8 +1688,12 @@ fn snapshots_trim_the_log_and_recovery_restores_them_with_the_tail() {
 
 /// Shape: the bytes of each increment the checkpoint tests advance a green by.
 const INCREMENT_BYTES: usize = 100;
-/// Shape: the bytes of each checkpoint they take: less than what it folds, so the fold returns budget.
-const CHECKPOINT_BYTES: usize = 40;
+/// The checkpoint each of them takes, by its name (A-579): the partition charges its name's 40 bytes, less than what it
+/// folds, so the fold returns budget; the encoding's length is the content store's.
+const CHECKPOINT: slates_db::partition::CheckpointRef = slates_db::partition::CheckpointRef {
+  identity: [0xC0; 32],
+  len: 4096,
+};
 /// Shape: the increments the checkpoint tests' merge budget holds.
 const BUDGET_INCREMENTS: usize = 5;
 
@@ -1715,7 +1722,7 @@ fn checkpoint_at(version: u64) -> Op {
   Op::GreenCheckpointed {
     green: vid(CHECKPOINT_GREEN),
     version,
-    checkpoint: vec![0xC0; CHECKPOINT_BYTES],
+    checkpoint: CHECKPOINT,
   }
 }
 
@@ -1741,10 +1748,7 @@ fn a_checkpoint_returns_what_it_folds() -> (AnchorSegment, Db) {
     partition.green_chain(green),
     &[vec![3; INCREMENT_BYTES], vec![4; INCREMENT_BYTES]]
   );
-  assert_eq!(
-    partition.green_checkpoint(green),
-    Some((3, &[0xC0; CHECKPOINT_BYTES][..]))
-  );
+  assert_eq!(partition.green_checkpoint(green), Some((3, CHECKPOINT)));
   assert_eq!(partition.green_head(green), 5);
   db.mutate(&mut seg, &advance(5), 0).unwrap();
   db.mutate(&mut seg, &advance(6), 0).unwrap();
@@ -1890,7 +1894,7 @@ fn checkpoint_past_the_adoption(seg: &mut AnchorSegment, db: &mut Db) {
       &Op::GreenCheckpointed {
         green,
         version,
-        checkpoint: vec![0xC0; CHECKPOINT_BYTES],
+        checkpoint: CHECKPOINT,
       },
       0,
     );
@@ -1910,7 +1914,7 @@ fn checkpoint_past_the_adoption(seg: &mut AnchorSegment, db: &mut Db) {
     &Op::GreenCheckpointed {
       green,
       version: ADOPTED_AT + 1,
-      checkpoint: vec![0xC0; CHECKPOINT_BYTES],
+      checkpoint: CHECKPOINT,
     },
     0,
   )
