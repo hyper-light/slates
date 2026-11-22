@@ -142,6 +142,8 @@ row ssh-clone "${HG[@]}" clone -q "$SSHURL" e
 row ssh-pull "${HG[@]}" -R a pull -q "$SSHURL"
 row ssh-push bash -c "cd e && echo ssh >ssh.txt && ${HG[*]} commit -qAm ssh && ${HG[*]} push -r . $SSHURL"
 
+# DIAG (diag branch only): the daemon's status, its shards' counters with it, while the anchor still runs.
+s status --json >"$WORK/status.json" 2>"$WORK/status.err" || echo "DIAG status failed: $(head -3 "$WORK/status.err")"
 echo "---- summary ($(printf '%s\n' "${ROWS[@]}" | grep -c '^PASS') of ${#ROWS[@]} passed)"
 echo "daemon peak RSS over every row: $((RUN_PEAK_KIB / 1024)) MiB"
 printf '%s\n' "${ROWS[@]}"

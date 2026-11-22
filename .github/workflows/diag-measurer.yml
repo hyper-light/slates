@@ -66,6 +66,19 @@ jobs:
           grep -E 'is spinning|killing it' $A | cut -c1-300
           echo "== held-ahead increments the content store refused (NoCapacity, StaleStage or Unstaged)"
           grep "a push's increment held ahead was refused by the content store" $A | cut -c1-300 | sort | uniq -c | head -20 || true
+          echo "== w-hg's give-up line"; grep "a push's intake waited for room and gave up" $A | cut -c1-400 | sort | uniq -c | head -20 || true
+          echo "== the typed refusal"; grep -h "needs more room than its repository could ever be lent on its shard" $A $RUNNER_TEMP/matrix-hg/logs/*.log | cut -c1-400 | sort | uniq -c | head -20 || true
+          echo "== push-all's log"; tail -c 3000 $RUNNER_TEMP/matrix-hg/logs/push-all.log || true
+          echo "== vcs.hg.push_need_admitted"; python3 -c 'import json,sys
+          def walk(o):
+              if isinstance(o, dict):
+                  if o.get("kind") == "vcs.hg.push_need_admitted": yield o
+                  for v in o.values(): yield from walk(v)
+              elif isinstance(o, list):
+                  for v in o: yield from walk(v)
+          hits = list(walk(json.load(open(sys.argv[1]))))
+          print("entries", len(hits), "count", sum(h.get("count", 0) for h in hits))' $RUNNER_TEMP/matrix-hg/status.json || true
+          grep -o '.\{0,120\}vcs\.hg\.push_need_admitted.\{0,120\}' $RUNNER_TEMP/matrix-hg/status.json | head -5 || true
           echo "== DIAG turns, by cpu"; grep 'DIAG hg-http turn' $A | sed 's/.*turn //' | sort -t= -k3 -n -r | head -20 || true
           echo "== DIAG begins over 10 ms cpu"; grep 'DIAG hg-http begin' $A | awk '{for(i=1;i<=NF;i++) if($i ~ /^cpu_us=/){split($i,a,"="); if (a[2] > 10000) print}}' | cut -c1-260 || true
           exit $rc
@@ -78,4 +91,5 @@ jobs:
             ${{ runner.temp }}/matrix-hg.out
             ${{ runner.temp }}/matrix-hg/anchor.log
             ${{ runner.temp }}/matrix-hg/logs
+            ${{ runner.temp }}/matrix-hg/status.json
           if-no-files-found: warn
