@@ -1177,6 +1177,18 @@ fn park(
   let asks = need.is_some() && (resuming || !state.work_home.queues.contains_key(&queue_key));
   // A route is the work's own, met here once its queue holds the verb (A-298): nothing goes to the owner for it.
   let routing = asks && matches!(need, Some(Need::Route));
+  let g222_kind = match &need {
+    Some(Need::Files(_)) => 1,
+    Some(Need::Lengths(_)) => 2,
+    Some(Need::Page { .. }) => 3,
+    Some(Need::Sizes) => 4,
+    Some(Need::Verdict { .. }) => 5,
+    Some(Need::Rebase { .. }) => 6,
+    Some(Need::Admit { .. }) => 7,
+    Some(Need::Route) => 9,
+    Some(_) => 10,
+    None => 0,
+  };
   let g222_verdict = asks && matches!(need, Some(Need::Verdict { .. }));
   if g222_verdict {
     crate::g222_diag::stamp(crate::g222_diag::PARK);
@@ -1195,6 +1207,9 @@ fn park(
   }
   if g222_verdict {
     crate::g222_diag::stamp(crate::g222_diag::ASKED);
+  }
+  if let Some(route) = state.reply_route.as_ref() {
+    crate::g222_diag::wh_parked(route.request, g222_kind + if asks { 100 } else { 0 });
   }
   let parked = ParkedVerb {
     verb: ResumedVerb {
@@ -2353,6 +2368,8 @@ async fn send_batches(here: u16, owner: u16) {
     }
     let keys: Vec<DbVolumeId> = batch.iter().map(|item| item.queue).collect();
     crate::g222_diag::stamp(crate::g222_diag::SENDING);
+    let g222_keys: Vec<[u8; 16]> = keys.iter().map(|key| key.bytes).collect();
+    crate::g222_diag::wh_batch(&g222_keys, false);
     let budget = crate::lease::lease_bound_ns();
     // The owner answers within its step budget and hands back the rest (A-797), which go out again first.
     let answers = crate::xshard::call_in_shard_time_given_room(
@@ -2368,6 +2385,7 @@ async fn send_batches(here: u16, owner: u16) {
     )
     .await;
     crate::g222_diag::stamp(crate::g222_diag::BACK);
+    crate::g222_diag::wh_batch(&g222_keys, true);
     let _ = state::with_state_counted(|s| match answers {
       Some((answers, rest)) => {
         for (queue, outcome) in keys.into_iter().zip(answers) {
@@ -2809,7 +2827,18 @@ fn resume_pass(state: &mut ShardState, work: DbVolumeId) {
     if g222_settles {
       crate::g222_diag::stamp(crate::g222_diag::RESUMING);
     }
+    let g222_request = verb.route.as_ref().map(|route| route.request);
+    if let Some(request) = g222_request {
+      crate::g222_diag::wh_resumed(request, work.bytes);
+    }
+    let g222_cpu = slates_rt::g222_parks::thread_cpu_ns();
     crate::lease_wait::run_resumed(state, verb, refused, None);
+    if let Some(request) = g222_request {
+      crate::g222_diag::wh_ran(
+        request,
+        slates_rt::g222_parks::thread_cpu_ns().saturating_sub(g222_cpu),
+      );
+    }
     if let Some((origin, id, waiter)) = forwarded {
       answer_forwarded(state, (origin, id), waiter);
     }

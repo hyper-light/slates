@@ -173,6 +173,72 @@ struct Fwd {
   /// The resumed run's verb's thread CPU (its commit's is the rest), and what ran inside it ([`mark`]'s bits).
   verb_cpu: u64,
   flags: u64,
+  /// A verb parked on its work's queue (`work_home::park`): when, what it needed (a kind code), and whether it asked the
+  /// owner; its queue's batch sent and answered (`send_batches`); its resume (`resume_pass`) and its run's end with
+  /// the run's thread CPU.
+  wh_parked: u64,
+  wh_need: u64,
+  wh_sent: u64,
+  wh_back: u64,
+  wh_resumed: u64,
+  wh_ran: u64,
+  wh_cpu: u64,
+}
+
+/// w-perf 84a: each work queue's last batch sent to its owner and answered, host monotonic ns, by queue key.
+static QUEUES: std::sync::Mutex<Option<std::collections::HashMap<[u8; 16], (u64, u64)>>> =
+  std::sync::Mutex::new(None);
+
+/// A batch of queues `keys` sent to their owner (`at_back` false) or answered (true), now.
+pub fn wh_batch(keys: &[[u8; 16]], at_back: bool) {
+  let now = now_mono();
+  if let Ok(mut guard) = QUEUES.lock() {
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    for key in keys {
+      if map.len() >= FWD_CAP && !map.contains_key(key) {
+        continue;
+      }
+      let entry = map.entry(*key).or_insert((0, 0));
+      if at_back {
+        entry.1 = now;
+      } else {
+        *entry = (now, 0);
+      }
+    }
+  }
+}
+
+/// A verb of request `request` parked on its work's queue, needing `need` (a kind code, 1 asked the owner adds 100).
+pub fn wh_parked(request: u64, need: u64) {
+  let now = now_mono();
+  fwd(request, |f| {
+    f.wh_parked = now;
+    f.wh_need = need;
+  });
+}
+
+/// Request `request`'s parked verb resumes on queue `queue`: its queue's last batch's times kept with it.
+pub fn wh_resumed(request: u64, queue: [u8; 16]) {
+  let now = now_mono();
+  let (sent, back) = QUEUES
+    .lock()
+    .ok()
+    .and_then(|guard| guard.as_ref().and_then(|map| map.get(&queue).copied()))
+    .unwrap_or((0, 0));
+  fwd(request, |f| {
+    f.wh_resumed = now;
+    f.wh_sent = sent;
+    f.wh_back = back;
+  });
+}
+
+/// Request `request`'s resumed verb ran, taking `cpu` ns of the thread.
+pub fn wh_ran(request: u64, cpu: u64) {
+  let now = now_mono();
+  fwd(request, |f| {
+    f.wh_ran = now;
+    f.wh_cpu = cpu;
+  });
 }
 
 /// What ran inside a resumed submit, a bit each ([`mark`]).
@@ -279,7 +345,9 @@ const FWD_CAP: usize = 100_000;
 /// And, before the reply's writing: how long before it the resume began, its verb ran, and `deliver` queued it.
 /// And the resumed run's thread CPU time.
 /// And the resumed verb's own CPU and the flags of what ran inside it.
-const FWD_COLS: usize = 29;
+/// And a work-queue verb's legs: how long before the write it parked, its batch was sent and answered, it resumed and
+/// its run ended; its run's CPU; and its need's kind code.
+const FWD_COLS: usize = 36;
 
 fn fwd(request: u64, change: impl FnOnce(&mut Fwd)) {
   if let Ok(mut guard) = FWD.lock() {
@@ -421,6 +489,13 @@ fn fwd_split(request: u64, written: u64) -> [u64; FWD_COLS] {
   out[26] = f.resume_cpu;
   out[27] = f.verb_cpu;
   out[28] = f.flags;
+  out[29] = before(f.wh_parked);
+  out[30] = before(f.wh_sent);
+  out[31] = before(f.wh_back);
+  out[32] = before(f.wh_resumed);
+  out[33] = before(f.wh_ran);
+  out[34] = f.wh_cpu;
+  out[35] = f.wh_need;
   let accepted = f.replied == 0 && f.waiting != 0 && f.resolved != 0;
   if f.sent == 0 || f.started == 0 || f.home == 0 || (f.replied == 0 && !accepted) {
     return out;
@@ -498,7 +573,7 @@ pub fn dump_ring(path: &str) {
   let n = RING_TAKEN.load(Relaxed).min(RING_CAP);
   let mut out = files_header();
   out += &format!(
-    "# client sends {} rings {}\nqueued\tserved\tlanded\twritten\tdeferred\tcomplete\towner_met\towner_kick_after\towner_kick_run\towner_run_start\towner_work\torigin_met\torigin_kick_after\torigin_kick_run\torigin_run_home\thome_written\tplacement\tresolve_met\tresolve_kick_after\tresolve_kick_run\tresolve_run_at\tmask\tdeliver_file\tdeliver_line\tpark_wait\tresume_file\tresume_line\tjob_turns\tresumed_before\tran_before\tdelivered_before\tresume_cpu\tverb_cpu\tflags\n",
+    "# client sends {} rings {}\nqueued\tserved\tlanded\twritten\tdeferred\tcomplete\towner_met\towner_kick_after\towner_kick_run\towner_run_start\towner_work\torigin_met\torigin_kick_after\torigin_kick_run\torigin_run_home\thome_written\tplacement\tresolve_met\tresolve_kick_after\tresolve_kick_run\tresolve_run_at\tmask\tdeliver_file\tdeliver_line\tpark_wait\tresume_file\tresume_line\tjob_turns\tresumed_before\tran_before\tdelivered_before\tresume_cpu\tverb_cpu\tflags\twh_parked_before\twh_sent_before\twh_back_before\twh_resumed_before\twh_ran_before\twh_cpu\twh_need\n",
     slates_ipc::endpoint::G222_SENDS.swap(0, Relaxed),
     slates_ipc::endpoint::G222_RINGS.swap(0, Relaxed)
   );

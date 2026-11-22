@@ -13,7 +13,8 @@ COLS = ["queued", "served", "landed", "written", "deferred", "complete", "owner_
         "origin_run_home", "home_written", "placement", "resolve_met", "resolve_kick_after", "resolve_kick_run",
         "resolve_run_at", "mask", "deliver_file", "deliver_line", "park_wait", "resume_file", "resume_line", "job_turns", "resumed_before",
         "ran_before", "delivered_before", "resume_cpu", "verb_cpu",
-        "flags"]
+        "flags", "wh_parked_before", "wh_sent_before", "wh_back_before", "wh_resumed_before", "wh_ran_before",
+        "wh_cpu", "wh_need"]
 AT = {name: at for at, name in enumerate(COLS)}
 
 
@@ -155,3 +156,35 @@ for kind, flag, parts in (("forwards", 1, FORWARD), ("accepted submits", 2, ACCE
                   f"{us(med([r[AT[late_at]] for r in kicked]))} kick->run med {us(med([r[AT[run_at]] for r in kicked]))} "
                   f"max {us(max([r[AT[run_at]] for r in kicked], default=0))} run->stamp med "
                   f"{us(med([r[AT[after_at]] for r in kicked]))} us")
+
+# w-perf 84a: the work-queue verbs (work_home::park ... resume_pass, delivered through lease_wait), their legs.
+NEEDS = {1: "files", 2: "lengths", 3: "page", 4: "sizes", 5: "verdict", 6: "rebase", 7: "admit", 9: "route", 10: "other",
+         0: "none"}
+wh = sorted((r for r in deferred if r[AT["wh_parked_before"]] and r[AT["wh_resumed_before"]] and r[AT["wh_ran_before"]]),
+            key=lambda r: r[AT["served"]])
+if wh:
+    kinds = {}
+    for r in wh:
+        need = r[AT["wh_need"]]
+        name = NEEDS.get(need % 100, str(need)) + (" (asked the owner)" if need >= 100 else "")
+        kinds[name] = kinds.get(name, 0) + 1
+    served = [r[AT["served"]] for r in wh]
+    print(f" work-queue verbs: n {len(wh)} {kinds}; served p50/p99/p999/max us {us(pc(served, .5))} {us(pc(served, .99))} "
+          f"{us(pc(served, .999))} {us(served[-1])}")
+    def asked(r):
+        return r[AT["wh_sent_before"]] > 0 and r[AT["wh_back_before"]] > 0
+    legs = {
+        "before the park": lambda r: max(0, r[AT["served"]] - r[AT["wh_parked_before"]]),
+        "park -> batch sent": lambda r: max(0, r[AT["wh_parked_before"]] - r[AT["wh_sent_before"]]) if asked(r) else 0,
+        "batch round trip (sent -> answered)": lambda r: max(0, r[AT["wh_sent_before"]] - r[AT["wh_back_before"]]) if asked(r) else 0,
+        "answered -> resumed": lambda r: max(0, r[AT["wh_back_before"]] - r[AT["wh_resumed_before"]]) if asked(r) else 0,
+        "park -> resumed (whole wait)": lambda r: max(0, r[AT["wh_parked_before"]] - r[AT["wh_resumed_before"]]),
+        "resumed run": lambda r: max(0, r[AT["wh_resumed_before"]] - r[AT["wh_ran_before"]]),
+        "resumed run's CPU": lambda r: r[AT["wh_cpu"]],
+        "run -> written (home, write)": lambda r: r[AT["wh_ran_before"]],
+    }
+    for label, low in (("all", 0), ("p99 tail", .99), ("p999 tail", .999)):
+        part = wh[int(len(wh) * low):]
+        if part:
+            print(f"   legs {label} (n {len(part)}, asked {sum(1 for r in part if asked(r))}) medians us: " + "; ".join(
+                f"{name} {us(med([leg(r) for r in part]))}" for name, leg in legs.items()))
