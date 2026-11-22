@@ -225,11 +225,12 @@ pub fn refusal_of_db(e: &DbError) -> Refusal {
     // here), or the segment refused the publication outright (`Anchor`). A durability failure is not
     // a malformed request: it is typed as such so a client retries under the same id rather than
     // treating its request as wrong.
-    unpublished @ (DbError::Unpublished { .. } | DbError::LogFull { .. } | DbError::Anchor(_)) => {
-      Refusal::Unpublished {
-        reason: format!("{unpublished}"),
-      }
-    }
+    unpublished @ (DbError::Unpublished { .. }
+    | DbError::LogFull { .. }
+    | DbError::Anchor(_)
+    | DbError::DependentUnpublished) => Refusal::Unpublished {
+      reason: format!("{unpublished}"),
+    },
     DbError::Memory(e) => refusal_of_mem(e),
     // Every other database refusal, typed by its class (A-299): until 2026-11-18 each reached a client as `BadRequest`
     // carrying its words. No catch-all: a new database refusal does not compile until it is named.

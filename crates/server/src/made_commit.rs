@@ -468,7 +468,7 @@ fn commit_held<T, E>(
   let route = state.reply_route.take();
   let deferred = std::mem::take(&mut state.acceptance_deferred);
   let reply = crate::verbs::recorded_unless_deferred(state, (origin, id), deferred, reply);
-  let reply = match state.db.commit(&mut state.segment) {
+  let reply = match crate::verbs::commit_settled(state) {
     Ok(_) => reply,
     Err(error) => {
       crate::verbs::reconcile_unpublished_effects(state);

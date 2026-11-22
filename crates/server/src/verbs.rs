@@ -3328,7 +3328,7 @@ fn run_recorded(
     Chokepoint::LogAppend,
     state.clock.monotonic_ns(),
   );
-  let reply = match state.db.commit(&mut state.segment) {
+  let reply = match commit_settled(state) {
     Ok(_) => reply,
     Err(e) => {
       // Nothing of the verb is durable and the partition has been rolled back to its durable state —
@@ -11363,22 +11363,55 @@ fn record_accepted(
   Ok(())
 }
 
-/// Publishes the shard when its content store changed since its last publication (chain entry format 6): what an entry
-/// about to be appended names must be in the committed image first, since the append is durable at once and a kill
-/// before the next publication would leave the entry naming content the restarted store lacks. A refused publication
-/// refuses the append, and a green whose engine committed the version it would have recorded is made again from its
-/// durable checkpoint and chain, as after any refused publication (A-721, [`remake_greens_ahead`]).
+/// Orders an entry about to be appended after the content store's image that holds what it names (chain entry format
+/// 6): a kill between the entry's durable append and the image's publication would leave it naming content the
+/// restarted store lacks. Outside a transaction the append is durable at once, so the shard publishes here first. Inside
+/// one the record is appended only at its commit, after the verb's own publication (`dispatch`: the content image
+/// precedes a completion, §4.8, AUD-05), which carries the hold; so nothing is published here, the transaction is marked
+/// owing it, and [`commit_settled`] publishes whatever is still unpublished before the record (a refused publication of
+/// the verb's, or a path with none), abandoning the transaction when it cannot. Before, every accepted version published
+/// the whole shard here, once more than its verb: at 1,000 clients the accept's server latency went from 0.38 ms to
+/// 237.9 ms at the median (w-engine's bisect, 2026-11-21). A refused publication refuses the append, and a green whose
+/// engine committed the version it would have recorded is made again from its durable checkpoint and chain, as after
+/// any refused publication (A-721, [`remake_greens_ahead`]).
 pub(crate) fn publish_held_increments(state: &mut ShardState) -> Result<(), Refusal> {
-  // A shard with no content object keeps no image (a degraded build): nothing it holds survives it, so there is no
-  // order to keep.
-  let (start, end) = state.content_range;
-  if state.held_content.changed_pieces().is_empty() || state.content.is_none() || end <= start {
+  if !held_unpublished(state) {
+    return Ok(());
+  }
+  if state.db.in_transaction() {
+    state.held_publication_owed = true;
     return Ok(());
   }
   publish_shard(state).map(|_| ()).map_err(|e| {
     remake_greens_ahead(state);
     refusal_of_vfs(&e)
   })
+}
+
+/// Whether the content store changed since the shard's last committed publication. A shard with no content object keeps
+/// no image (a degraded build): nothing it holds survives it, so there is no order to keep.
+fn held_unpublished(state: &ShardState) -> bool {
+  let (start, end) = state.content_range;
+  !state.held_content.changed_pieces().is_empty() && state.content.is_some() && end > start
+}
+
+/// Commits the running transaction ([`slates_db::Db::commit`]) once every increment an entry in it names is in the
+/// shard's committed image (chain entry format 6, [`publish_held_increments`]): what the verb's own publication did not
+/// carry is published now, and a refused publication abandons the transaction, nothing appended
+/// ([`slates_db::Db::abandon`], refused `Unpublished`), for the caller to reconcile as any refused commit. Every commit
+/// that can close a transaction holding such an entry goes through here.
+pub(crate) fn commit_settled(state: &mut ShardState) -> Result<Option<u64>, slates_db::DbError> {
+  if std::mem::take(&mut state.held_publication_owed)
+    && held_unpublished(state)
+    && publish_shard(state).is_err()
+  {
+    return Err(
+      state
+        .db
+        .abandon(&state.segment, slates_db::DbError::DependentUnpublished),
+    );
+  }
+  state.db.commit(&mut state.segment)
 }
 
 fn chain_admits(
@@ -12233,7 +12266,7 @@ fn owner_record(state: &mut ShardState, op: &Op) -> Result<(), slates_db::DbErro
   let now = state.clock.monotonic_ns();
   state.db.begin();
   let applied = state.db.mutate(&mut state.segment, op, now);
-  match (applied, state.db.commit(&mut state.segment)) {
+  match (applied, commit_settled(state)) {
     (Ok(_), Ok(_)) => Ok(()),
     (Err(error), _) | (_, Err(error)) => {
       reconcile_unpublished_effects(state);
@@ -12668,7 +12701,7 @@ pub(crate) fn owner_judge(
   } else {
     record_completion(state, origin, id, reply)
   };
-  match state.db.commit(&mut state.segment) {
+  match commit_settled(state) {
     Ok(_) => (!deferred).then_some(reply),
     Err(error) => {
       reconcile_unpublished_effects(state);
@@ -12990,7 +13023,7 @@ fn resumed_rebase(
   } else {
     record_completion(state, origin, id, reply)
   };
-  match state.db.commit(&mut state.segment) {
+  match commit_settled(state) {
     Ok(_) => (!deferred).then_some(reply),
     Err(error) => {
       reconcile_unpublished_effects(state);
@@ -13018,7 +13051,7 @@ fn resumed_local(
   } else {
     record_completion(state, origin, id, reply)
   };
-  match state.db.commit(&mut state.segment) {
+  match commit_settled(state) {
     Ok(_) => (!deferred).then_some(reply),
     Err(error) => {
       reconcile_unpublished_effects(state);
@@ -21076,6 +21109,7 @@ pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::Vf
   let outcome = publish_captured(state);
   match &outcome {
     Ok(published) => {
+      state.count(SHARD_PUBLISHED, 1);
       // Every volume the publication recorded has its ceiling raised (`Volume::mark_published`, A-150); a volume still
       // short sets the flag again at its next number.
       state.store.counters_low = false;
@@ -21113,6 +21147,10 @@ fn keep_left_out_records_blocks(state: &mut ShardState, published: &Published) {
     state.count(DEFERRED_KEPT, 1);
   }
 }
+
+/// Format: the status counter of the shard's committed publications: one a verb that changes its image (§4.8), and
+/// what holds chain entry format 6's order to one publication a verb, not one more a version.
+pub(crate) const SHARD_PUBLISHED: &str = "publish.committed";
 
 /// Format: the status counter of publications that kept every deferred block for a left-out volume's record (A-430).
 const DEFERRED_KEPT: &str = "arena.deferred_kept_for_left_out";
@@ -24312,6 +24350,93 @@ mod tests {
         (0, expected),
         "the replayed engine is the whole origin's version 0"
       );
+    });
+  }
+
+  /// Chain entry format 6's order without a publication a version (w-engine's bisect of main's load regression to A-825,
+  /// 2026-11-21: an accept's server latency 0.38 ms to 237.9 ms at the median at 1,000 clients, every accepted version
+  /// publishing the whole shard once more than its verb). Do: on one shard, create a green and a work, edit it, and
+  /// submit it as a client's request runs (`run_recorded`), twice. Expect: each submit accepted, and each costs the
+  /// shard exactly one committed publication (`publish.committed`): its verb's, which carries the increment's hold before
+  /// its entry is appended at the transaction's commit. Failing first: two a submit.
+  #[test]
+  fn an_accepted_submit_costs_its_shard_one_publication() {
+    crate::daemon::audit_on_shard(|state| {
+      let owner = Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      };
+      let super::ReplyBody::GreenCreated { id: green } = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::CreateGreen {
+          name: "one-publication".to_owned(),
+          require_evidence: false,
+          base: None,
+        },
+      ) else {
+        panic!("create green")
+      };
+      let reply = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::CreateWork {
+          green,
+          name: "one-publication-work".to_owned(),
+        },
+      );
+      let work = match reply {
+        super::ReplyBody::WorkCreated { id, .. } => id,
+        other => panic!("create work: {other:?}"),
+      };
+      let published = |state: &crate::state::ShardState| {
+        state
+          .refusals
+          .get(super::SHARD_PUBLISHED)
+          .copied()
+          .unwrap_or(0)
+      };
+      for round in 1..=2u64 {
+        let edited = super::dispatch(
+          state,
+          1,
+          &owner,
+          super::RequestBody::Edit {
+            work,
+            path: format!("file-{round}"),
+            at: 0,
+            delete_len: 0,
+            bytes: vec![b'x'; 4096],
+          },
+        );
+        assert!(matches!(edited, super::ReplyBody::Edited), "{edited:?}");
+        let before = published(state);
+        let submitted = super::run_recorded_for_test(
+          state,
+          (7, slates_wire::request::RequestId::from_word(round)),
+          &owner,
+          super::RequestBody::submit(work, Vec::new()),
+        );
+        let after = published(state);
+        assert!(
+          matches!(
+            submitted,
+            Some(super::ReplyBody::Submitted {
+              version: Some(version),
+              ..
+            }) if version == round
+          ),
+          "{submitted:?}"
+        );
+        assert_eq!(
+          after - before,
+          1,
+          "submit {round}: {} publications, one its verb's",
+          after - before
+        );
+      }
     });
   }
 
