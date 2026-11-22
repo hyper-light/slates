@@ -1999,6 +1999,7 @@ dependencies = [
  "lz4_flex",
  "md-5",
  "proptest",
+ "slates-mem",
  "slates-test-seeds",
  "unicode-normalization",
  "zstd",

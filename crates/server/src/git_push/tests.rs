@@ -2775,19 +2775,22 @@ async fn stepped(repository: RepositoryId, request: &[u8]) -> Stepped {
 /// A-752 (main's order of 2026-11-20, w-git's measure: one command bringing 3,502 objects over a flat 3,500-file tree
 /// built its work in one step, 374 to 642 ms debug, so a monorepo's push would outlast the watchdog), with A-783's rule
 /// (a turn yields at its quantum when someone waits). Do: create `main` at a flat tree of [`FLAT_FILES`] files, then push
-/// a commit changing every file, answering a step at a time, no one else on the shard. Expect: both `ok`; the update's
-/// build a unit at a time (a unit a file at least), in a tenth as many turns as quanta or fewer (no one waited, so each
-/// turn went on), none past its ceiling (the watchdog's look) by more than a unit and its opening, and none past its
-/// budget (`push.build.past_budget` 0).
+/// a commit changing every file, answering a step at a time, no one else on the shard; then fetch `main`'s head. Expect:
+/// both `ok`; the update's build a unit at a time (a unit a file at least) in more than one turn, its turns going on past
+/// their first quantum while no one waited (`more_quanta` moved), none past its ceiling (the watchdog's look) by more
+/// than a unit and its opening, and none past its budget (`push.build.past_budget` 0); the fetch holding every object
+/// both pushes brought, each once. How many quanta a turn spans is the host's speed over its quantum, not the build's
+/// slicing: "a tenth as many turns as quanta" failed 1 in 3 alone at load ~40, "960 turns for 8081 quanta", every turn
+/// within its bounds (main 01a20182's order of 2026-11-22 06:13).
 #[test]
 fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let repository = crate::daemon::observe_first(&daemon, |state| git_repository(state, "flat"));
-  let (first, objects) = flat_commit(FLAT_FILES, "first", None);
+  let (first, first_objects) = flat_commit(FLAT_FILES, "first", None);
   let create = request(
     &[("", &first.to_string(), b"refs/heads/main")],
     CAPABILITIES,
-    &pack_of_objects(&objects),
+    &pack_of_objects(&first_objects),
   );
   let created = pushed_in_steps(&daemon, repository, &create);
   let before = crate::daemon::observe_first(&daemon, |state| state.push_turns);
@@ -2799,6 +2802,9 @@ fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
   );
   let updated = pushed_in_steps(&daemon, repository, &update);
   let after = crate::daemon::observe_first(&daemon, |state| state.push_turns);
+  let fetched = crate::daemon::observe_first(&daemon, move |state| {
+    fetched_ids(state, repository, &[second])
+  });
   daemon.stop();
   let (created, created_longest) = created.unwrap();
   let (updated, updated_longest) = updated.unwrap();
@@ -2818,10 +2824,10 @@ fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
     units >= FLAT_FILES as u64,
     "the update's work ran {units} units for {FLAT_FILES} files"
   );
-  // A-783: no one waited, so each turn went on to its ceiling: far fewer turns than quanta.
+  // Sliced: more than one turn. A-783: no one waited, so turns went on past their first quantum.
   assert!(
-    turns * 10 < quanta,
-    "{turns} turns for {quanta} quanta: the turns did not go on while no one waited"
+    turns > 1 && after.more_quanta > before.more_quanta,
+    "{turns} turns for {quanta} quanta: the build was not sliced, or its turns did not go on while no one waited"
   );
   let ceiling = crate::daemon::HEARTBEAT_NS;
   assert!(
@@ -2830,6 +2836,19 @@ fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
     after.longest_ns
   );
   assert_eq!(after.past_budget, 0, "{after:?}");
+  let brought: std::collections::BTreeSet<ObjectId> = first_objects
+    .into_iter()
+    .chain(objects)
+    .map(|(kind, bytes)| {
+      slates_git::object_name::name_of(ObjectFormat::Sha1, kind, &bytes).unwrap()
+    })
+    .collect();
+  let set: std::collections::BTreeSet<ObjectId> = fetched.iter().copied().collect();
+  assert_eq!(
+    (fetched.len(), &set),
+    (brought.len(), &brought),
+    "the fetch of main's head holds every object both pushes brought, each once"
+  );
 }
 
 /// A-724 piece 8c and A-722's record v4 (main's rulings of 2026-11-20: a record names its names and its pack only once

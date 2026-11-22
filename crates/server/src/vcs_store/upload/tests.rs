@@ -4,7 +4,7 @@
 //! not lent, and an SSH session the SSH site's services start over the daemon's lender.
 
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use slates_db::catalog::{Principal, RepositoryId, RepositoryRecord, VolumeId as DbVolumeId};
 use slates_git::Admission;
@@ -12,7 +12,7 @@ use slates_git::http::Version;
 use slates_git::object_name::{ObjectFormat, ObjectId};
 use slates_git::pktline::{self, MAX_LEN, Packet};
 use slates_git::unpack::{self, NoIndex};
-use slates_git::upload::{self, Asked, Refusal, Written};
+use slates_git::upload::{self, Answer, Asked, Refusal, Streamed, Written};
 use slates_ipc::protocol::{
   PolicyEffect, PolicyEntry, PolicyNames, PolicyRight, PolicyRule, PolicyWho, ReplyBody,
   RequestBody, VcsTool,
@@ -31,9 +31,13 @@ use crate::vcs_ssh::site::{Command, Next, Service, Services, Start, ToolServices
 
 /// Shape: the room a request and its answer are admitted: far past the tests' few small objects.
 const ROOM: u64 = 1 << 20;
-/// Shape: the most steps an answer or a session's request may take here, far past a few small objects' packets: a
-/// bound, so an answer that never ended would fail the test rather than hold it.
-const STEPS: usize = 1 << 12;
+/// Shape: the daemon's liveness intervals a drive (an answer's steps, an encoding's turns, an SSH command's steps) may go
+/// without progress before it is judged never to end ([`Judge`]): far past any wait between two of its signs of
+/// progress on a loaded host. Paced work's steps are a turn's quantum each and at least one unit, so how many a drive
+/// takes is the host's load, never a bound (main 01a20182's order of 2026-11-22 05:47:
+/// `t_goal93_a_clone_answered_before_its_reach_sets_are_derived_is_whole`, at load ~35, spent a fixed 4,096 steps with
+/// 131,053 of its 164,196 bytes written, every step progressing; its siblings by the order of 06:13).
+const STALLED_INTERVALS: u64 = 60;
 /// Shape: the uid of a reader the repository's owner is not.
 const READER: u32 = 4321;
 /// Shape: how long the test waits for the SSH session's task: four liveness windows, past every step it takes.
@@ -96,17 +100,97 @@ pub(crate) fn answered(
     upload::serve(served, Version::V2, asked, packs, &mut admission)
   })
   .expect("the request's step lent");
+  let out = written_to_end(state, id, &mut answer, &mut admission);
+  (out, answer.refusal().cloned())
+}
+
+/// `answer`'s steps on the shard, each lent the objects alone, one pkt-line's room a step, until it ends: its bytes. Its
+/// steps are paced, a turn's quantum each and at least one unit of its pack (`Fragments`, A-718), so how many it takes is
+/// the host's load and not the answer's: it is judged never to end only once [`STALLED_INTERVALS`] liveness intervals
+/// pass with neither a byte written nor its pack's counters moved ([`answer_seen`], its turns aside), and the failure
+/// says what it saw ([`Judge`]).
+fn written_to_end(
+  state: &mut ShardState,
+  id: RepositoryId,
+  answer: &mut Answer<Streamed>,
+  admission: &mut Admission,
+) -> Vec<u8> {
   let mut out = Vec::new();
-  for _ in 0..STEPS {
+  let mut judge = Judge::new("an answer", answer_seen(answer, &out));
+  loop {
     let written = lend_on(state, (id, None), |served, packs| {
-      answer.write(served, packs, &mut admission, &mut out, MAX_LEN)
+      answer.write(served, packs, admission, &mut out, MAX_LEN)
     })
     .expect("the answer's step lent");
     if written == Written::End {
-      return (out, answer.refusal().cloned());
+      return out;
+    }
+    if let Err(stalled) = judge.stepped(answer_seen(answer, &out)) {
+      panic!("{stalled}: (bytes written, its pack's counters)")
     }
   }
-  panic!("an answer that never ended: {out:?}")
+}
+
+/// What an answer shows of its progress, `out` its bytes so far: their count, and its pack's counters, its turns aside
+/// (a turn is taken whether or not it progressed).
+fn answer_seen(
+  answer: &Answer<Streamed>,
+  out: &[u8],
+) -> (usize, Option<slates_git::store::UploadCounters>) {
+  let counters = answer
+    .pack_source()
+    .map(|pack| slates_git::store::UploadCounters {
+      turns: 0,
+      ..pack.counters()
+    });
+  (out.len(), counters)
+}
+
+/// A drive's judge ([`STALLED_INTERVALS`]): what the drive last showed of its progress (`P`, compared step to step), when
+/// it last changed, and the steps taken.
+struct Judge<P> {
+  /// What is driven, as its failure names it.
+  what: &'static str,
+  /// What it showed after its last step.
+  last: P,
+  /// When that last changed.
+  progressed: Instant,
+  /// The steps taken.
+  steps: u64,
+}
+
+impl<P: PartialEq + core::fmt::Debug> Judge<P> {
+  /// A judge of `what`, which shows `seen` before its first step.
+  fn new(what: &'static str, seen: P) -> Judge<P> {
+    Judge {
+      what,
+      last: seen,
+      progressed: Instant::now(),
+      steps: 0,
+    }
+  }
+
+  /// After a step that did not end the drive, showing `seen`: its words once [`STALLED_INTERVALS`] liveness intervals
+  /// passed with nothing it shows changed, naming its steps and what it last showed.
+  fn stepped(&mut self, seen: P) -> Result<(), String> {
+    self.steps += 1;
+    if seen != self.last {
+      self.last = seen;
+      self.progressed = Instant::now();
+      return Ok(());
+    }
+    let window =
+      Duration::from_nanos(crate::daemon::LIVENESS_BUDGET_NS.saturating_mul(STALLED_INTERVALS));
+    let since = self.progressed.elapsed();
+    if since < window {
+      return Ok(());
+    }
+    Err(format!(
+      "{} that never ended: no progress for {since:?} (the window, {STALLED_INTERVALS} liveness intervals), after {} \
+       steps, last showing {:?}",
+      self.what, self.steps, self.last
+    ))
+  }
 }
 
 /// [`answered`] for a `fetch`, with what the pack's stream did: its bytes, and its counters (A-718).
@@ -126,29 +210,33 @@ pub(crate) fn fetched_with_counters(
     )
   })
   .expect("the request's step lent");
-  let mut out = Vec::new();
-  for _ in 0..STEPS {
-    let written = lend_on(state, (id, None), |served, packs| {
-      answer.write(served, packs, &mut admission, &mut out, MAX_LEN)
-    })
-    .expect("the answer's step lent");
-    if written == Written::End {
-      let counters = answer.pack_source().expect("a fetch's pack").counters();
-      return (out, counters);
-    }
-  }
-  panic!("an answer that never ended: {out:?}")
+  let out = written_to_end(state, id, &mut answer, &mut admission);
+  let counters = answer.pack_source().expect("a fetch's pack").counters();
+  (out, counters)
 }
 
-/// Turns repository `id`'s encoding until it is idle, as a fetch's request does before its answer (A-718); the turns
-/// taken, within [`STEPS`].
+/// Turns repository `id`'s encoding until it is idle, as a fetch's request does before its answer (A-718): the turns
+/// taken. Judged on its progress ([`Judge`]): the units its encoding under way has done, the versions derived and
+/// encoded.
 fn encoded(state: &mut ShardState, id: RepositoryId) -> usize {
-  for turns in 0..STEPS {
-    if super::super::git_encode::turn(state, id) == super::super::git_encode::Turned::Idle {
-      return turns;
+  use super::super::{git_derive, git_encode};
+  let seen = |state: &ShardState| {
+    let counted = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+    (
+      git_encode::units_done(state, id),
+      counted(git_derive::DERIVED),
+      counted(git_encode::ENCODED),
+    )
+  };
+  let mut judge = Judge::new("an encoding", seen(state));
+  let mut turns = 0;
+  while git_encode::turn(state, id) != git_encode::Turned::Idle {
+    turns += 1;
+    if let Err(stalled) = judge.stepped(seen(state)) {
+      panic!("{stalled}: (its units, versions derived, versions encoded)")
     }
   }
-  panic!("an encoding that never ended")
+  turns
 }
 
 /// The data packets of `bytes` up to the first flush, each whole; a stream that ends before one fails the test.
@@ -464,7 +552,8 @@ fn t_a682_a_store_not_held_here_is_not_lent() {
 /// it waits for; a refusal's words and status instead, if it refused.
 async fn run_command(command: &mut impl Command) -> Result<(Vec<u8>, Next), String> {
   let mut written = Vec::new();
-  for _ in 0..STEPS {
+  let mut judge = Judge::new("a command", 0usize);
+  loop {
     let stepped = command
       .step(crate::vcs_ssh::site::ClientGone::never())
       .await
@@ -475,8 +564,10 @@ async fn run_command(command: &mut impl Command) -> Result<(Vec<u8>, Next), Stri
     if stepped.next != Next::More {
       return Ok((written, stepped.next));
     }
+    judge
+      .stepped(written.len())
+      .map_err(|stalled| format!("{stalled} bytes: {written:?}"))?;
   }
-  Err(format!("a step bound passed: {written:?}"))
 }
 
 /// One SSH session of git's upload-pack over `record`'s repository, as the SSH site's services start it over the
@@ -671,7 +762,8 @@ fn a745_a_fetch_answers_from_the_generation_it_began_on_whatever_lands_meanwhile
         })
         .expect("the request's step lent");
         let mut out = Vec::new();
-        for step in 0..STEPS {
+        let mut judge = Judge::new("an answer in turns", answer_seen(&answer, &out));
+        loop {
           let write = |served: &upload::Served<'_>, packs: &mut super::ShardPacks| {
             answer.write_within(
               served,
@@ -688,14 +780,16 @@ fn a745_a_fetch_answers_from_the_generation_it_began_on_whatever_lands_meanwhile
             lend_on(state, (id, None), write)
           }
           .expect("the answer's step lent");
-          if step == 0 {
+          if judge.steps == 0 {
             land(state);
           }
           if written == Written::End {
             return out;
           }
+          if let Err(stalled) = judge.stepped(answer_seen(&answer, &out)) {
+            panic!("{stalled}: (bytes written, its pack's counters)")
+          }
         }
-        panic!("an answer that never ended")
       };
       let mut landed = false;
       let held = in_turns(state, began, true, &mut |state| {
