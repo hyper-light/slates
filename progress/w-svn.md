@@ -571,3 +571,7 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
     kept on the early store.
 - r21 (main): 3c1c8b504 (w-shared's gauges) raised the footprint not given back. w-shared is fixing it.
 - Next: the append's `judge_named`, its own landing, with w-git and w-hg told first; then piece (c).
+- 43a6df642 landed: the shared append judges with `judge_named`. A named work's read buffers move into its verdict:
+  50,000 bytes cloned before, now 0. Reuse after a refused append is impossible by construction (append takes its
+  changes by value). w-git and w-hg checked and are clear.
+- Next: piece (c), the batch's commit adopting the scratch member's files instead of re-reading the runs.
