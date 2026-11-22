@@ -1,0 +1,31 @@
+name: diag measurer
+# w-interop (2026-11-22): the focused Linux test of recovery.rs's bounded content-scrub waits, Linux-only tests no
+# macOS run compiles. Run only from `diag-measurer-*` branches, never main.
+
+on:
+  push:
+    branches: ["diag-measurer-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  focused:
+    name: recovery content-scrub tests (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: rustfmt --edition 2024 --check crates/server/tests/recovery.rs
+      - name: slates-server --test recovery (the two content-scrub tests)
+        timeout-minutes: 30
+        run: cargo test --locked -p slates-server --test recovery -- --exact a_deleted_files_plaintext_leaves_the_content_object a_sealed_files_plaintext_leaves_the_content_object
