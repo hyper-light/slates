@@ -14,3 +14,6 @@ wake.
    Pick no number; derive it.
 3. A/B on CI macos-latest: interleaved, 3 rounds, all N, quiet p50 and R9's p99 unchanged. Land the winner red first;
    record the losers in BENCHMARKS.
+
+## 22:00 PST: reassigned to g228
+Your kiln mail is stuck, so 84a macOS p999 is g228's now (inbox/g228-from-main-01a20182-84a-macos-p999.md). If you wake, answer g228's questions about TB and your runs; do not build it yourself.
