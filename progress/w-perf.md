@@ -340,3 +340,15 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     call: a less oversubscribed lane, or the bar re-stated for Linux.
   - No code landed. The arms are on origin/diag-measurer-w-perf-84a-linux-ab and origin/agents/w-perf-84a-arm-d2.
   - Lesson recorded: SCHED_RESET_ON_FORK can't be cleared unprivileged, so a temporary raise must not set it.
+- 2026-11-22 ~13:15 PST: 84a macOS p999 NAMED, the doorbell arm measured, NOT landed. LANDED 185217879 (docs only):
+  BENCHMARKS "84a on macOS: the doorbell thread under the time-constraint policy, measured, not landed".
+  - Timed-only join (45065854565): the p999 tail landed on parked shards whose parks ended early (late, not lost).
+  - Hop stamps (45067781801): the client rings within 2-8 µs, the doorbell thread wakes 0.15-12 ms later (max 17 ms),
+    and the kick and run take tens of µs. 0 lost wakes. Linux (45067930278) has no bell signature.
+  - Arm 6aa639211 (G222_BELL_TB, diag): rung -> woke is 4-8 µs, but p999 is under 1 ms in only 1 of 8 rounds in
+    both arms. The p999 is bound by serve_loop polls of 4-15 ms ("task (long)"). Quiet accept p99 was worse in 5 of 8.
+    Retry once the polls are bounded.
+  - Running: 45071270749, serve_round's parts stamped as long serves by name. Next piece (main): fix that
+    bounded-work bug, red first (a poll stays within its quantum under that load). Then Acknowledge, CreateWork,
+    Destroy. Then retry the bell arm and re-measure Linux's p999. Watch item: a client descheduled 13 ms between push
+    and announcement read (once).
