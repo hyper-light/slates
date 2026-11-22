@@ -968,8 +968,11 @@
 > working set's miss-ratio curve and memory by marginal utility, CPU weights, the shares published to siblings.
 > Piece 3b landed (2026-11-21): a git push past its share is refused typed (`PushFailed::PastShare`, or `PastSnapshot`
 > past the slot's room) and retryable (`503`, words naming the share). Piece 3c landed: Mercurial's pushes counted live
-> and learned. Owed in piece 3: Mercurial's share refusal in its words, Subversion's intakes live and its words,
-> backpressure before refusal, a fetch's room as a claim.
+> and learned; Subversion's commits too (at `land_work`). **Open, found reading it:** no Subversion commit is admitted
+> against the room at all: its texts arrive into the conversation's sink with no admission, so a commit's bytes are
+> bounded by the edge's item limits alone, not the shard's room or the repository's share. Piece 3d landed: a git
+> fetch's answer is a live claim on the room and its bytes are learned. Owed in piece 3: svn's admission, Mercurial's
+> and Subversion's share refusals in their words, Mercurial's fetch as a claim, backpressure before refusal.
 > In flight, paused for goal 93 (2026-11-21): run 31 (cap 3, Studio-2, 9865bb832) found shard-mates took 4.5 s of the
 > busiest repository's 41.3 s span and its shard ran steps 23.2 s of it: its own three pushes of one agent shared one
 > turn. The fix (a turn an agent, spare turns taken; red first) is on branch agents/w-balance-turn-weights, 928df7d1b,
@@ -2011,7 +2014,11 @@
 >
 > **A-724 piece 2a (2026-11-21, w-multirepo, A-844): the working set's miss-ratio curve built, not yet fed.**
 > `slates_vcs::mrc::Curve` (fixed-size SHARDS; `cargo test -p slates-vcs --lib mrc`, 4 of 4, macOS arm64, this Mac).
-> Open: nothing reads content through it yet; the rates, the marginal-utility partition and the CPU weights follow.
+> Open: nothing reads content through it yet; the marginal-utility partition and the CPU weights follow.
+> **A-724 piece 2b (A-845): the learned rates built, not yet fed** (`slates_vcs::rate`, `cargo test -p slates-vcs --lib
+> rate::`, 5 of 5, macOS arm64, this Mac). Open: fed on the owner shard beside `usage::Learned`.
+> **A-724 piece 2c (A-846): memory by marginal utility built, not yet applied** (`slates_vcs::partition`, `cargo test
+> -p slates-vcs --lib partition::`, 4 of 4, macOS arm64, this Mac). Open: computed on the owner shard and published.
 >
 > **The hg correctness lane (2026-11-21, w-balance, UI goal 93 correctness by use):** `crates/cli/tests/hg_interop.rs`
 > `stock_hg_gets_what_stock_hg_serve_gives_on_every_verb_over_http_and_ssh` (ignored; main runs it) drives

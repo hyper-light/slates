@@ -16467,9 +16467,17 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > left: 49 })` before). **Piece 3c (2026-11-21):** a Mercurial push (`hg_push::unbundle`, both edges) is live among the
 > shard's intakes from its start until it ends, begun on its repository's usage row with its principal, and answered
 > there with its bundle's bytes, learned as the repository's demand; before, an hg push left no row and divided no one's
-> room (`a_mercurial_push_is_counted_and_learned_on_its_repositorys_usage_row`, red first). Owed in piece 3: Mercurial's
-> share refusal typed in its words, Subversion's intakes counted live and its words, backpressure before refusal, a
-> fetch's room as a claim of its own.
+> room (`a_mercurial_push_is_counted_and_learned_on_its_repositorys_usage_row`, red first). A Subversion commit is counted
+> the same way at `svn_commit::land_work`, where svn://, svn+ssh and the HTTP edge meet: live while it lands, begun
+> with its principal, answered with its texts' bytes (each text once)
+> (`t_a724_a_subversion_commit_is_counted_and_learned_on_its_repositorys_usage_row`, red first). Owed in piece 3:
+> Mercurial's and Subversion's share refusals typed in their words, Subversion's commit admitted against the room at all
+> (its texts arrive into the conversation's sink unadmitted), backpressure before refusal. **Piece 3d (2026-11-21):** a
+> git fetch's answer is live while it holds its repository's generation (`Live::fetch` in `GitGeneration`), so its
+> repository is a claimant in every other's room, claiming what it holds plus its learned fetch demand a live fetch; the
+> answer's bytes, reported by both edges as they write (`StoreLender::wrote`), are learned on the usage row when the
+> generation is given back (`t_a724_a_fetch_in_flight_is_a_claim_on_the_room`,
+> `t_a724_a_fetchs_answer_is_counted_and_learned_on_its_repositorys_usage_row`, red first). Mercurial's fetch is owed.
 
 > **Status (2026-11-20, A-724 piece 3a: one room for every admission).** `crate::vcs_share::room` (`slates-server`) is
 > the one room a version-control work is admitted on its owner shard: git's push as it starts, git's fetch, Mercurial's
@@ -16500,6 +16508,22 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > (module docs), so the slots grow with the keys a repository has. Owed in piece 2: the decayed rates, the partition by
 > marginal utility above A-188's floor, the CPU weights, and the owner shard reading content through it with the
 > shares published as a snapshot.
+
+> **Status (2026-11-21, A-845: piece 2's decayed rates).** `slates_vcs::rate::Rates`: works and bytes a second, the
+> decay learned from the repository's own gaps: a ladder of decayed counts at `base · 2^k` up to its age, each gap
+> scored by its Poisson log-likelihood (the intensity at the arrival less its integral over the gap), the best rung the
+> horizon; scale-free (doubled gaps double the horizon exactly); `keep` is the curve's aging; `Decayed`, a principal's,
+> read at its repository's horizon. Owed: feeding both on the owner shard (`slates_vcs::usage`, beside A-724 piece 2's
+> `Learned`, after main's split of A-724 between w-balance and w-multirepo).
+
+> **Status (2026-11-21, A-846: piece 2's memory share by marginal utility).** `slates_vcs::partition`: a shard's room
+> divided among its repositories, each first guaranteed the lesser of A-188's floor (the room over the repositories
+> served now) and what its curve can use, the rest by Qureshi and Patt's lookahead (each next extension, ending at a
+> curve's bin edge, to the repository saving the most misses a second per byte); room no curve would use returned as
+> spare to lend. Held to brute force on straight curves (within 1%), a scan's step won over a steadier neighbour, a flat
+> curve given nothing. The floor is a guarantee, not a grant: given whole, `room / n` each left nothing to divide.
+> Owed: the CPU weights (WFQ by learned demand capped at use), and the owner shard computing it at its learning cadence
+> and publishing the shares as an immutable snapshot.
 
 **Role.** One slates server serves many repositories at once, from toys to monorepos the size of Google's or Meta's,
 several of those at once, and divides its memory, its CPU, its admission and its placement among them by what their
@@ -55146,6 +55170,16 @@ Applied in the same change to:
   whole run and counts it on the usage row (`begun` with its principal, `answered` with its bundle's bytes); the body is
   `unbundled`. Red first: the push left no row. Tests: slates-server `vcs_ssh::tests::hg` 13/13, `repository::hg_push`
   18/18, `vcs_http::hg` 9/9, `hg_view` 7/7, `vcs_share` 12/12.
+- **Piece 3c, Subversion's commit counted (2026-11-21).** `svn_commit::land_work` holds a `vcs_share::Live` guard while it
+  lands and counts the commit on the usage row (`begun`, `answered` with its texts' bytes, each identity once); the body
+  is `landed_work`. Found reading it: no Subversion commit is admitted against the room at all. Red first: no row.
+  Tests: slates-server `svn` 112/112, `repository::svn_commit` 31/31, `vcs_svn` 15/15, `store_tests` 9/9.
+- **Piece 3d, a fetch's room a claim of its own (2026-11-21).** `vcs_share::Live` counts `[intakes, fetches]` a
+  repository; `Live::fetch` is held by a git fetch's `GitGeneration`, whose drop answers the fetch on the usage row with
+  the bytes the edges reported writing (`StoreLender::wrote`, defaulted; called by the HTTP and SSH edges after each
+  reply step). The room's claims add each live work's learned bytes by kind (`demand_of`). Red first: a fetch in flight
+  divided no one's room; its answer was never counted. Tests: slates-server `vcs_share` 14/14, `vcs_store::upload` 7/7,
+  `vcs_http::git` 20/20, `vcs_ssh` 72/72.
 - **Applied in the same change to** §4.17.5 (new), GAPS, amendments.tsv.
 - **Owed.** Pieces 2 to 7 (§4.17.5's status); a fetch's answered count at its pack's last step; Mercurial's and
   Subversion's intakes and reads counted; the rows in `slates status`.

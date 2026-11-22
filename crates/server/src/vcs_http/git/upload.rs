@@ -88,6 +88,10 @@ pub(crate) trait StoreLender {
     step: impl FnOnce(&Served<'_>, &mut Self::Packs) -> R,
   ) -> Option<R>;
 
+  /// The answer made over `hold` wrote `bytes` more (A-724 piece 3d): what its fetch is learned to use once it ends. A
+  /// lender that learns nothing does nothing.
+  fn wrote(&mut self, _hold: &Self::Hold, _bytes: u64) {}
+
   /// Makes repository `id`'s store ready for a fetch's answer before it is made (A-718): the shard's lender encodes every
   /// version not yet encoded as its fragments, a turn at a time, yielding between turns, so the answer copies them. A
   /// lender whose store needs nothing made does nothing.
@@ -253,6 +257,12 @@ impl<L: StoreLender> Exchange for Upload<L> {
       None => lender.lend_objects(*repository, step),
     }
     .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
+    if let Some(held) = generation.as_ref() {
+      lender.wrote(
+        held,
+        u64::try_from(out.len().saturating_sub(before)).unwrap_or(u64::MAX),
+      );
+    }
     let now = slates_rt::futures::now_ns();
     if out.len() > before
       || (now.saturating_sub(*last_written_ns) >= *keepalive_ns && made.write_keepalive(out))
