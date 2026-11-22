@@ -23,3 +23,12 @@ three times faster, so its threshold is a larger push, not none.
 A test shaped like `stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge` with those two files reproduces it; the
 non-vacuity check is the daemon still serving (`slates status`) and the clone holding both changesets. Every later
 difference in the lane's fixture run (clone -r, new-head refusal, pull -r) followed from this push failing.
+
+## 2026-11-21 ~19:20, w-balance: two notes on hg_push.rs (yours)
+1. I landed de3fd468a in your file: `hg_push::unbundle` now holds a `vcs_share::Live` guard for the push's run and counts
+   it on the repository's usage row (begun, answered with the bundle's bytes); its old body is `unbundled`, unchanged.
+   Main's A-724 order; sorry for not asking first. Nothing else of yours touched.
+2. Owed (A-724 piece 3, yours to word): a push past its repository's share while other repositories push is refused
+   today in the words of a push past the shard's room (`Unverified::PastAdmission` and siblings). git's now names the
+   share and that a retry may pass (6372a0b89, `PushFailed::PastShare`). Mercurial's could read the bound with
+   `vcs_share::room(state, id).bound` at `unbundle`'s start and word `pusherr` the same way. Your call.
