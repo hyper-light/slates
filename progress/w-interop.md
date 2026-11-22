@@ -455,3 +455,18 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   0422eef65 (slates-cli Linux targets: HeldMount::unmount, vm/mod.rs process_wait module + NoLine; both HeldMount FUSE
   tests 2/2 under SLATES_TEST_CLI=1, run 45022002841), feb59936b (shards.rs IpcError). In test: e6b6f6953 (recovery.rs's
   three content-scrub waits judged on progress, typed Stalled; diag-measurer-w-interop-waits).
+- LEDGER UPDATE (2026-11-22 ~05:45 PST):
+  - Windows wall rerun 45023572827 (read from logs, not the job status): windows-11-arm clean; windows-latest fails only
+    on crates/git/src/store/encoding.rs:677 `fn reused` cognitive complexity 11/10 (w-git's A-859 B), which keeps
+    slates-git and its dependents unlinted there. descriptor_raise Windows fix landed: 37649b1d5 (main d28e7672c).
+  - hg whole-history push after w-hg's (a) b624f67d6: CI 45024065064 (main d28e7672c), refused on all 3 jobs;
+    push_need_admitted 3, give-up line 1, typed refusal 0, spins/kills 0/0. The arithmetic: x86 left = admitted - need
+    exactly (61,144 / 36,771), so the begin's need is short of what later steps keep (w-hg's (i)); arm's need was
+    7,164 B past the ceiling and answered the bare PastAdmission. Spin not judgeable (repository stayed empty).
+  - (ii) LANDED ec18aaccb (main abcadd753): Waited::PastCeiling, typed PAST_CEILING words from both hg wait callers;
+    ceiling = min(budget capacity + arena claimable - headroom, whole snapshot slot) (agreed with w-git); need_of
+    refuses keeping + Intake::widest_full_text past the ceiling (w-hg's bound). 4 reds, each red against the old code;
+    slates-server vcs_share:: green_ready hg_push mercurial 67/67 on macOS arm64.
+  - Per main 05:05 (CLAUDE.md §8): no more CI, diag pushes or platform/lint checks from me. The hg whole-history
+    rerun waits on w-hg's (b1); its diag branch is local and unpushed (worktree w-interop-httpspin, 3b11e1771) for
+    main to push. Still open: git/git whole (w-git's pack-size piece); hg whole-history (w-hg's (i)/(b1)).
