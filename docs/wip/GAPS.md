@@ -603,9 +603,22 @@
 >   **Measured** (`a_small_push_waits_behind_a_whole_history_push_for_its_landing_turn`, MacBook arm64, debug, one run):
 >   a one-changeset push waited 537 ms behind a 200-changeset push cut into 32 segments that took 729 ms; 4,047 ms
 >   behind a 500-changeset push of 488 segments (4 KiB bound) that took 4,358 ms. A small push waits out a long push's
->   whole run, past the patience for a long enough one; the structural fix is a per-push staging log, the run landing
->   apart from the repository's log and named in one step, so pushes to one repository need no turn between them.
->   Owed, main's: the whole-history push on ubuntu and its peak RSS before and after (run-requests.md).
+>   whole run, past the patience for a long enough one (release, main's r20: 69 to 80% of the long push's span).
+> - Staging BUILT (2026-11-22, w-hg; main 01a20182's rulings of 07:32 and 12:00): a push lands its segments apart from
+>   its repository's landing turn, at sequences its owner shard allocates (serialized with no lock), other landings
+>   between them; its entry names them as ranges (record v11, `record::write_push_runs_reference`, at most one range a
+>   segment; golden `a_pushs_runs_reference_is_the_golden_bytes_and_reads_back_as_its_ranges`), and the turn is taken
+>   for the entry's commit alone. A fork another landing made stale is re-based by node (`hg_push::rebase`) before its
+>   works are planned, off the turn; stale again once the turn is taken, re-based holding it, the turn held to the end,
+>   so at most one re-base off it and one in it (counted `vcs.hg.push_rebased`, `..._rebased_in_turn`). The live
+>   re-base and a restart's v10 replay make the same index (e72a3d97f). An abandoned run is forgotten as it ends: each
+>   sequence's rows dropped (`StoreHandle::forget`, c2ef17856; counted `vcs.hg.push_run_rows_forgotten`), its log bytes
+>   the owed cleaner's (below). Held by `a_one_changeset_push_lands_during_a_long_push_and_readers_see_only_named` (a
+>   one-changeset push took 13 ms during a 500-changeset push in debug, no turn waited; `heads` the small push's tip
+>   alone, the long push's tip unknown though its segments are on the store; the long push then re-based and landed),
+>   `a_long_push_stale_twice_is_re_based_once_holding_the_turn_and_lands`,
+>   `a_dropped_run_is_forgotten_and_the_next_push_lands_past_it`, and the crash oracle killed with an unnamed run's rows
+>   present (`t_b1_a_crash_at_any_segment_boundary_leaves_a_push_whole_or_absent`).
 > - The whole history's clones spun (main 01a20182's order of 2026-11-22 10:40; CI 45037561866: 4 spins, kills and
 >   restarts a leg, at `vcs_http.rs:850` polls 1-16 and `vcs_ssh::hg::streamed_turn` polls ~11,000). Measured over the
 >   served view of a pushed 57,054-changeset line (debug, MacBook arm64, each call the unit one step takes): a clone of
@@ -3793,8 +3806,13 @@
 > buffers move into its verdict, never cloned (`repository.push.read_cloned_bytes`;
 > `a_named_works_verdict_takes_its_read_texts_and_clones_none`: 50,000 bytes cloned, now 0). Reusing a judged work
 > after a refused append is impossible by construction: `append` takes its changes by value and a refusal gives none
-> back (`a_refused_named_append_is_retried_only_with_a_work_built_again`). Owed: main's daemon A/B; piece (c), the
-> batch's commit adopting the scratch member's files. Not A-865's: `recovery.rs`'s `an_overlay_whose_base_directory_was_removed_serves_its_own_files_after_a_restart`
+> back (`a_refused_named_append_is_retried_only_with_a_work_built_again`). main's r29 (big Studio, load ~2, git-2000):
+> A-865's parent passed the give-back check 1 of 2 (499,712 · 300,032 KiB footprint at idle 30 s); 43a6df642 2 of 2
+> (302,080 · 303,104 KiB), RSS at idle 775 MB against 155 MB live, the peak 1.13 GB. Piece (c) ruled out as a swap (the
+> scratch member numbers its own versions; a fast-forward would be w-engine's, paused); option 2 instead: a recorded
+> version's whole-run file takes the run's read buffer with no copy (`Green::apply_recorded` takes its work mutably and
+> moves whole runs as `commit_held` does; `a_recorded_versions_whole_run_becomes_the_file_with_no_copy`), sampled
+> 108.0 MB to 96.2 MB. Owed: the content store's `release_one` copy (w-shared's), the two `read_step`s. Not A-865's: `recovery.rs`'s `an_overlay_whose_base_directory_was_removed_serves_its_own_files_after_a_restart`
 > failed at origin/main 7ced987e6 as well (LOOKUP status, `tests/common/nfs.rs:238`). **Closed (w-interop, 2026-11-22):**
 > A-833's lazy reopen made a gone base directory's first use, its attributes, refuse the directory itself; it now
 > answers from the volume's node, and a reopen that meets the descriptor limit no longer records a live directory gone

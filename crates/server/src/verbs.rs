@@ -10704,7 +10704,7 @@ fn held_outcome(
 /// Applies the verdict `parts` holds to its green (A-805): at the head it was judged at, as its chain entry records it
 /// (`Green::apply_recorded`, the replay a recovery runs). Whether it committed as its version; false, nothing applied,
 /// where the green moved since or is not here.
-pub(crate) fn apply_accepted(state: &mut ShardState, parts: &AcceptedParts) -> bool {
+pub(crate) fn apply_accepted(state: &mut ShardState, parts: &mut AcceptedParts) -> bool {
   let Some(mut engine) = state.greens.get_mut(&parts.green) else {
     return false;
   };
@@ -10712,7 +10712,7 @@ pub(crate) fn apply_accepted(state: &mut ShardState, parts: &AcceptedParts) -> b
     return false;
   }
   let applied = parts.applied.as_deref().unwrap_or_default();
-  engine.apply_recorded(&parts.increment, applied) == parts.version
+  engine.apply_recorded(&mut parts.increment, applied) == parts.version
 }
 
 /// A green's verdict on an increment and what it applied ([`slates_merge::engine`]'s `submit_resolved`).
@@ -20418,8 +20418,8 @@ fn replay_chain_entry(
       return Ok(false);
     }
   }
-  let entry = *entry;
-  let accepted = green.apply_recorded(&entry.increment, &entry.applied);
+  let mut entry = *entry;
+  let accepted = green.apply_recorded(&mut entry.increment, &entry.applied);
   if accepted != version {
     return Err(GreenFence::WrongVersion { version, accepted });
   }
