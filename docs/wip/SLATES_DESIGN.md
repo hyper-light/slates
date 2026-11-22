@@ -16565,6 +16565,14 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > push alone 2.3 s and a fetch alone 10.3 s of git/git v0.99 (4,507 objects), both whole; the steps are main's rounds.
 > Owed: Mercurial and Subversion repositories in the mix.
 
+> **Status (2026-11-21, CPU: the open decision; main's ruling of 17:22).** A shard's CPU is divided among its
+> repositories by equal-weight deficit round robin (`vcs_share::turns`, A-724 piece 3c: one turn a repository a round,
+> max-min fair among those with work); CPU joins dominant-resource fairness for admission only. The weighted fair
+> queuing this section designs ("each weight its learned demand capped at its measured use") is open: piece 7's load
+> proof decides it, an interleaved release A/B of equal weights (main), learned weights (`agents/w-multirepo-learned-weights`:
+> a repository may hold its learned CPU demand over the least live one's turns at once) and a turn a distinct principal
+> (`agents/w-balance-turn-weights`), held to the smallest class's p99 against its fair share (run-requests.md, A-849).
+
 > **Status (2026-11-21, A-846: piece 2's memory share by marginal utility).** `slates_vcs::partition`: a shard's room
 > divided among its repositories, each first guaranteed the lesser of A-188's floor (the room over the repositories
 > served now) and what its curve can use, the rest by Qureshi and Patt's lookahead (each next extension, ending at a
