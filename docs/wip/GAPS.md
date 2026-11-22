@@ -3658,6 +3658,12 @@
 > re-derived by a release A/B only if the footprint still stays (main's ruling). The changeset landing's piece copies
 > are cut too (w-svn, main's routing of 00:57): `slates_store::owner::SlicedLanding::part` answers its buffer emptied
 > once written, and the svn landing fills one buffer a landing (`a_sliced_landings_part_gives_its_buffer_back_to_be_filled_again`).
+> Re-measured (main 01a20182's r12, 2026-11-22, this MacBook, release, at 1721d8c52 with the `put_window` cut): still
+> red, the footprint grown 494,927,872 B against 155,539,920 B live, 181,750,880 B not given back (r4 at 2a8dbcd99:
+> 150,287,136). The cut took allocations out but neither the peak nor what stays. `an_import_measured` now prints the
+> memory status's gauges (w-shared's, `crates/server/src/memory_gauges.rs`) summed over the shards at every reading,
+> and the footprint past the system path's live bytes, the mapped blocks' resident pages and the arenas, so the next
+> reading names the live bytes' holders and what the system allocator kept.
 > Still to measure: the A-742 floor's A/B only if the
 > footprint still stays (main's ruling). A local 64 KiB floor gave 47 MB of footprint at 2 s idle, against 363 MB, at
 > 19.4 s against 12.0 s (debug).
