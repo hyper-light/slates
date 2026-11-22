@@ -510,6 +510,9 @@ fn landed(
     revision.author().map(str::to_owned),
   );
   let mut next = records.clone();
+  let mut revision = revision;
+  // A text the work carries whole held apart too, as the owner's landing stores it (the KeptText move).
+  stored.borrow_mut().extend(next.take_texts(&mut revision));
   let checked = next
     .check_work(revision, &locks, now)
     .map_err(Unlanded::Step)?;
@@ -580,6 +583,15 @@ impl SvnStores for Lends {
       return None;
     }
     let mut next = self.created.current.get().clone();
+    // Its texts held apart, as the owner's landing puts them on the node's store (the KeptText move).
+    let record = match record {
+      slates_svn::commit::record::Record::Revision(mut revision) => {
+        let taken = next.take_texts(&mut revision);
+        self.created.stored.borrow_mut().extend(taken);
+        slates_svn::commit::record::Record::Revision(revision)
+      }
+      other => other,
+    };
     Some(match next.commit_record(record) {
       Ok(()) => {
         self.created.current.set(Box::leak(Box::new(next)));
@@ -1474,7 +1486,8 @@ fn measure_svnsync_replay_range_over_the_tunnel() {
       state
         .vcs_stores
         .subversion_records(id)
-        .map(|records| records.text_bytes()),
+        // The records keep no text (A-842): the bytes of the texts they name stored, on the node's store.
+        .map(|records| records.stored_texts().map(|(_, len)| len).sum::<u64>()),
       state
         .refusals
         .get(crate::repository::svn_commit::landing::LANDED)
@@ -1581,7 +1594,7 @@ fn measure_svnsync_replay_range_over_the_tunnel() {
     .count();
   println!(
     "MEASURE dump_bytes {dump_bytes} resident_kib started {started_kib} imported {imported_kib} replayed \
-     {replayed_kib} records_text_bytes {text_bytes:?}"
+     {replayed_kib} records_stored_text_bytes {text_bytes:?}"
   );
   println!(
     "MEASURE import_s {:.1} changesets_landed {landed} youngest {youngest:?} replay r1..r{last} wall_s {:.2} \

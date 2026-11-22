@@ -15676,7 +15676,9 @@ texts together. Beside the hg columns it times the import (the dump streamed in,
 skip-delta chains (svn's checkpoint spacing: a read applies at most that many deltas) and reads RSS against the
 history's whole-text bytes (Ada's sizing rule).
 
-**Command.** `cargo build --release -p slates-svn --example changeset_ab` at b51f908f2 (with the example), then
+**Command.** (The example was retired by A-842 on 2026-11-21 with the records' kept deltas it read; these numbers
+stand, and the command runs at the commit it names.) `cargo build --release -p slates-svn --example changeset_ab` at
+b51f908f2 (with the example), then
 `/usr/bin/time -l changeset_ab ~/.cache/w-svn-gitgit/git-2000.dump <A|B> 2000`, interleaved A B A B A B, capped at
 600 s a run. Machine: Adas-MacBook-Pro-2.local (Apple M5 Max, 18 cores, 128 GiB, macOS 26.4.1), 2026-11-20
 15:09 to 15:12 PST, shared with other agents' builds, load average 22.9 at the start, 50.0 at the end (not quiesced, so
@@ -17842,6 +17844,52 @@ rejected the same day, what remains of the owner asks after A-817 is one ask a v
 each verdict, each work's first edit of a file, and a creation's admission and name.
 
 
+## 2026-11-21 — A conflicting rebase that carries the head's bytes over its windows: measured and rejected on the owner asks (w-fed-move, goal 86b)
+
+The idea: when a rebase conflicts, its reply carries the head's bytes over each window, taken at the head the owner
+judged. The client then writes them and rebases again with no version read and no window read. Before this, the client
+spent four or more requests between a conflict and its next rebase: the version, then a read and an edit for each
+window. Now it spends an edit for each window and nothing else. The hope was that the shorter gap would cut the 77% of
+rebases that conflict again, and with them the rebase-kind owner asks (20.1 a client at 10 hot files).
+- **Built.** `Rebased` gained an appended `heads` field, filled at the owner from the engine's head
+  (`head_window_bytes`). The work's shard carried the bytes only when every carried window's bytes fit in the reply.
+  A daemon test went red first (`rebase_conflict_part`: one head's bytes a window, equal to the winner's bytes). The
+  harness wrote the carried bytes and rebased at once; `--read-heads` kept the read path as the other arm.
+- **Kept as:** `~/slates-work/w-fed-move-rebase-heads-rejected.patch` (w-fed-move's machine; 279 lines).
+- **A/B.** Release, in-process, the kernel's `kernel/` (754 files), 1,000 clients, one round, `--per-connection 32`,
+  no think time. Three pairs at each hot-file count, each pair back to back, main eef868f80, this Mac Studio (32 CPUs)
+  under other agents' load (load average 7 to 10). Oracle and own-file failures were 0 and starved clients 0 in all 24
+  runs. Each cell gives the three runs.
+
+| hot files | arm | rebase-kind asks a client | asks a client | window reads a client | rebase conflicts | verdicts/s |
+|---|---|---|---|---|---|---|
+| 300 | read | 1.9, 2.0, 1.9 | 11.0, 11.1, 11.0 | 5.0, 5.2, 4.9 | 586, 614, 465 | 4,145, 4,353, 4,040 |
+| 300 | carry | 1.9, 1.9, 1.9 | 11.0, 11.1, 11.0 | 3.8, 3.9, 3.9 | 514, 509, 489 | 4,075, 4,099, 4,214 |
+| 100 | read | 3.8, 3.3, 3.2 | 13.3, 12.8, 12.7 | 9.7, 8.5, 8.1 | 1,974, 1,567, 1,372 | 4,064, 3,834, 3,701 |
+| 100 | carry | 3.7, 3.3, 3.1 | 13.2, 12.8, 12.6 | 4.9, 5.1, 5.1 | 1,921, 1,431, 1,276 | 4,219, 3,921, 3,958 |
+| 30 | read | 9.0, 8.5, 8.7 | 19.6, 19.1, 19.4 | 23.7, 22.5, 22.9 | 6,052, 5,632, 5,726 | 3,069, 3,301, 3,258 |
+| 30 | carry | 9.2, 8.2, 8.1 | 19.9, 18.9, 18.8 | 8.3, 8.3, 8.5 | 6,167, 5,207, 5,037 | 3,751, 3,579, 3,486 |
+| 10 | read | 20.4, 19.7, 19.3 | 32.7, 31.9, 31.3 | 56.3, 53.9, 53.2 | 15,648, 15,062, 15,051 | 2,633, 2,628, 2,250 |
+| 10 | carry | 19.8, 20.5, 20.1 | 32.2, 33.0, 32.4 | 13.3, 13.3, 12.9 | 14,985, 15,596, 15,433 | 3,323, 3,104, 2,791 |
+
+- **Why rejected.** The owner asks are even at every hot-file count, the rebase-kind ones included (20.4, 19.7 and
+  19.3 against 19.8, 20.5 and 20.1 at 10 hot files). So are the repeat conflicts. The window reads fell 76% at 10 hot
+  files (about 54 to 13 a client), but a window read is answered by the replica the client reads at, not asked of the
+  owner. Verdicts a second rose 17% to 26% at 10 and 30 hot files in every pair, but they were measured on a shared,
+  loaded machine and are not read as a result. A ruling never overrides an even A/B.
+- **Why the gap does not matter here.** The loop is closed: 529 requests are in flight and a request takes about 9 ms
+  (56,901 replies a second). In the two requests the carried bytes save, about 3,300 verdicts a second land some 50
+  verdicts (about 120 over the read path's four requests). At 10 hot files each verdict touches four slots, so a
+  client's slots not yet resolved are almost surely hit in either gap. The repeat rate is saturated, and only a
+  resolution with no gap moves it: the resolution judged at the head took the rebase conflicts from 16,035 to 584 (the
+  record above), but it spent two asks a resolution. The named repeats show it: one client met
+  `bpf/sysfs_btf.c@0+64` on one rebase and `trace/bpf_trace.c@0+64` on the next, both its own slots, both still based
+  at version 0.
+- **What would cut them** (unbuilt; for main's ruling): one ask a resolution with no gap. The conflicting reply would
+  carry the check's stamp, so `ResolveMerge` (discarding the work's operations on its windows, its own slots written
+  again as the replacement) could follow without `CheckMerge`. At 10 hot files that is at most about 6.6 rebase-kind
+  asks a client, from the resolution at the head's 13.2 over two asks.
+
 ## The status memory report's residency: sweep what can hold pages, the report's kinds first (g226, 2026-11-21)
 
 w-sizing's option (a), main's order of 2026-11-20 23:50 (landed 27517bd04). A status asking for the memory report read
@@ -17920,3 +17968,149 @@ The memory report's kinds pass 67 ms after arming in the same run.
   unchanged). **84a not met on Windows:** the loaded p999 stays at 24-34 ms on windows-latest and in windows-11-arm's
   conflicts (its accept p999 lost its 32 ms rounds: 3 of 3 under 0.9 ms against 1 of 3). That is the scheduler's 31.6 ms
   quantum a woken thread waits behind the load's spinners (A-361), which no wait's timer moves; per-wake stamps next.
+
+## A Windows shard kept one level above normal while it runs: 84a's loaded tails under 1 ms (A-834; w-k90-win; 2026-11-21)
+
+- **Question.** With A-828 the timed wait keeps its deadline, yet the loaded p999 stayed at 18-34 ms. g222's stamps over
+  it (diag run 44945557697) put the tail on the shard: 12-22 requests a round of ~42,500 waited over 10 ms in the ring
+  and 16-22 over 10 ms mid-service, 30-100 ms each, multiples of the 31.6 ms quantum. A-361 raised a shard one level
+  for its blocking wait and put it back before it ran, so a runnable shard shared the CPUs round-robin with the load's
+  normal-priority spinners. Does keeping the raise (no privilege: a thread's own level within its class) end it?
+- **A/B first** (diag run 44947142869, same binary, `W90_SHARD_RAISED`): kept raised, loaded p999 238-1,011 µs against
+  0.8-33 ms, 0-4 requests a round over 10 ms against 6-20.
+- **Test, red then green** (`driver::tests::a_windows_shard_stays_one_level_up_after_a_blocking_wait`): red at the test
+  alone on windows-latest and windows-11-arm (level 0 after the wait), green with the change on both.
+- **Command** (diag run 44948887874): `edit_merge_bench --loaded-only --spinners-per-core 2 --files 10 --form accept
+  --form conflict`, then `--quiet-only`, release, BASE (main 8fb2e33db) and FIX (0689bed17) interleaved, 3 rounds. µs.
+
+| windows-latest, loaded | accept p50 / p99 / p999 | conflict p50 / p99 / p999 |
+|---|---|---|
+| base r1 | 128 / 309 / 32,643 | 143 / 237 / 31,854 |
+| fix r1 | 123 / 174 / 579 | 141 / 215 / 305 |
+| fix r2 | 121 / 178 / 699 | 139 / 206 / 317 |
+| base r2 | 123 / 304 / 48,453 | 140 / 242 / 31,888 |
+| base r3 | 124 / 321 / 31,962 | 142 / 252 / 84,866 |
+| fix r3 | 121 / 182 / 642 | 140 / 230 / 410 |
+
+| windows-11-arm, loaded | accept p50 / p99 / p999 | conflict p50 / p99 / p999 |
+|---|---|---|
+| base r1 | 156 / 260 / 28,233 | 155 / 271 / 19,827 |
+| fix r1 | 152 / 319 / 665 | 152 / 225 / 335 |
+| fix r2 | 151 / 248 / 665 | 153 / 223 / 304 |
+| base r2 | 150 / 250 / 31,836 | 154 / 238 / 21,929 |
+| base r3 | 150 / 269 / 4,204 | 151 / 261 / 27,304 |
+| fix r3 | 153 / 236 / 640 | 154 / 217 / 327 |
+
+  Quiet, both runners: fix p99 174-273 µs, p999 275-670 µs; base p99 171-546 µs, p999 285-1,952 µs.
+- **Verdict: landed.** 84a's bar on Windows -- a full edit and merge's loaded p99 and p999 under 1 ms -- is met on
+  windows-latest and windows-11-arm in every round; p50 unchanged. A shard's time at the raised level is bounded by its
+  work and its idle window, after which it parks.
+
+## A path's history as persistent trees of byte identities: writes win, old reads and overwrite memory lose; NOT landed (A-818 piece 2b; 2026-11-21)
+
+- **Question** (main's conditions, 09:40 and 10:35): does the engine switch, with the re-anchor deleted, win writes
+  while reads and memory don't lose, at m = 10/100/1k/10k?
+- **Command:** `cargo run --release -p slates-merge --example history_layers_bench` (the branch's file, using only APIs
+  both sides have). Main is 6a6e35215, exported with `git archive` with the branch's bench file. The branch is
+  `agents/w-rewrite-ops-a818-2b` c4278fd3c.
+- **Machine:** the Mac Studio w-rewrite-ops runs on (32 cores), release, unpinned. Load 4.8 at the start, 1.9 at the
+  end. Main 12:11:16 to 12:42:31, then the branch 12:42:31 to 12:42:35. One interleaved pair: the second pass and option
+  (i)'s rows (`leaf_chunks_bench`) were stopped by goal 93's focus (Ada, ~10:40: start no new non-93 runs). Five rounds
+  a point, all shown.
+- **Verdict: NOT LANDED.**
+  - Writes win where history matters: the alternating stream 35.2 ms against 9.0 µs a change at 10k. Overwrites win at
+    10k (15.2 against 4.2 µs) and lose about 30% at m ≤ 100.
+  - Old reads lose: version 1 after alternating changes is 2 to 9 times slower, after overwrites 1.6 to 2.6 times at
+    m ≤ 1k.
+  - Memory a version loses 7 to 8 times on overwrite streams: 1,017 to 1,297 bytes against 152. Path copying makes
+    O(log n) nodes of 48 bytes a change, where A-809's layer costs one entry. It wins on alternating streams (1,001 to
+    1,806 against 4,135 to 7,050). Many paths changed once are equal (152).
+  - A bounded compaction (main's named fix) would answer the reads, not the overwrite memory. That needs O(1) space a
+    change (DSST's node copying, or keeping A-809's layer for overwrites), a design question for main once goal 93
+    frees the piece.
+
+Main (6a6e35215):
+```
+a	read_version_1_after_overwrites	m	10	ns	1417	958	750	750	875
+a	read_version_1_after_alternating	m	10	ns	625	542	416	417	375
+a	read_version_1_after_overwrites	m	100	ns	1167	916	833	875	792
+a	read_version_1_after_alternating	m	100	ns	1833	1459	1875	1666	1334
+a	read_version_1_after_overwrites	m	1000	ns	1875	1416	1375	2333	2292
+a	read_version_1_after_alternating	m	1000	ns	8625	4417	4625	4584	4084
+a	read_version_1_after_overwrites	m	10000	ns	8917	8250	8500	7875	8208
+a	read_version_1_after_alternating	m	10000	ns	10375	13792	9542	9167	9167
+b	overwrites	history	10	ns_per_change	2952	2641	2500	2478	2456	history_bytes_per_version	152
+b	overwrites	history	100	ns_per_change	2758	2679	2643	2601	2568	history_bytes_per_version	152
+b	overwrites	history	1000	ns_per_change	4046	4142	4201	4038	4026	history_bytes_per_version	152
+b	overwrites	history	10000	ns_per_change	15283	15561	15182	15226	15243	history_bytes_per_version	152
+b	overwrite_insert_alternating	history	10	ns_per_change	236078	235758	237053	237892	234006	history_bytes_per_version	4135
+b	overwrite_insert_alternating	history	100	ns_per_change	527643	528285	530296	528977	540692	history_bytes_per_version	4904
+b	overwrite_insert_alternating	history	1000	ns_per_change	3632369	3632943	3603093	3630616	3602781	history_bytes_per_version	6546
+b	overwrite_insert_alternating	history	10000	ns_per_change	38168979	36181078	34991192	34923873	35158129	history_bytes_per_version	7050
+b	sdk_replace	history	10	ns_per_change	3147	2714	2576	2706	2542	history_bytes_per_version	152
+b	sdk_replace	history	100	ns_per_change	2882	2833	2747	2735	2726	history_bytes_per_version	152
+b	sdk_replace	history	1000	ns_per_change	4258	4052	4148	3981	3780	history_bytes_per_version	152
+b	sdk_replace	history	10000	ns_per_change	15371	15055	15355	15343	15113	history_bytes_per_version	152
+c	many_paths_once_history_bytes_per_version	paths	10	152
+c	many_paths_once_history_bytes_per_version	paths	100	152
+c	many_paths_once_history_bytes_per_version	paths	1000	152
+c	many_paths_once_history_bytes_per_version	paths	10000	152
+```
+Branch (c4278fd3c):
+```
+a	read_version_1_after_overwrites	m	10	ns	9708	3166	2125	2000	1792
+a	read_version_1_after_alternating	m	10	ns	3500	2875	2583	2417	2291
+a	read_version_1_after_overwrites	m	100	ns	2875	2625	2083	2875	3625
+a	read_version_1_after_alternating	m	100	ns	16125	18458	14459	16417	8833
+a	read_version_1_after_overwrites	m	1000	ns	3709	2959	2833	2750	2250
+a	read_version_1_after_alternating	m	1000	ns	14875	11583	10041	8791	8542
+a	read_version_1_after_overwrites	m	10000	ns	7958	6959	6583	6583	6625
+a	read_version_1_after_alternating	m	10000	ns	18750	17500	19459	17709	18917
+b	overwrites	history	10	ns_per_change	3808	3400	3277	3181	3171	history_bytes_per_version	1017
+b	overwrites	history	100	ns_per_change	3631	3583	3496	3483	3378	history_bytes_per_version	1098
+b	overwrites	history	1000	ns_per_change	4040	3933	3929	3956	3876	history_bytes_per_version	1249
+b	overwrites	history	10000	ns_per_change	4461	4289	4374	4173	4239	history_bytes_per_version	1297
+b	overwrite_insert_alternating	history	10	ns_per_change	3678	3366	3167	3117	3127	history_bytes_per_version	1001
+b	overwrite_insert_alternating	history	100	ns_per_change	3686	3597	3567	3535	3499	history_bytes_per_version	1121
+b	overwrite_insert_alternating	history	1000	ns_per_change	5801	5246	5175	5143	5248	history_bytes_per_version	1459
+b	overwrite_insert_alternating	history	10000	ns_per_change	9083	8964	9002	10151	8875	history_bytes_per_version	1806
+b	sdk_replace	history	10	ns_per_change	3991	3624	3459	3247	3234	history_bytes_per_version	1017
+b	sdk_replace	history	100	ns_per_change	3747	3681	3581	3564	3486	history_bytes_per_version	1098
+b	sdk_replace	history	1000	ns_per_change	4285	4039	3999	4007	3935	history_bytes_per_version	1249
+b	sdk_replace	history	10000	ns_per_change	4463	4611	4333	4292	4309	history_bytes_per_version	1297
+c	many_paths_once_history_bytes_per_version	paths	10	152
+c	many_paths_once_history_bytes_per_version	paths	100	152
+c	many_paths_once_history_bytes_per_version	paths	1000	152
+c	many_paths_once_history_bytes_per_version	paths	10000	152
+```
+
+## 2026-11-21 — A conflict resolved in one ask (A-840): accepted (w-fed-move, goal 86b)
+
+The change: the load harness resolves a conflict with `ResolveConflict` (the windows given up, its slots in them
+written again, resolved at the head as it is), one ask with no gap, against the read-and-rebase loop
+(`--resolve rebase`). Release, in-process, the kernel's `kernel/` (754 files), 1,000 clients, one round,
+`--per-connection 32`, no think time; main 03b49b424 with the change; three pairs at each hot-file count, each pair back
+to back; this Mac Studio (32 CPUs) under other agents' load (load average 11 to 15). Oracle failures, own-file failures
+and starved clients were 0 in all 24 runs. Each cell gives the three runs.
+
+| hot files | arm | owner asks a client | rebase-kind | verdict | repeat conflicts | verdicts/s |
+|---|---|---|---|---|---|---|
+| 300 | rebase | 11.3, 11.3, 11.2 | 2.2, 2.1, 2.1 | 2.4, 2.4, 2.4 | 755, 754, 752 | 4,531, 4,423, 4,408 |
+| 300 | one ask | 10.9, 11.0, 11.0 | 1.8, 1.9, 1.8 | 2.4, 2.4, 2.4 | 345, 394, 342 | 4,678, 4,750, 4,791 |
+| 100 | rebase | 13.2, 13.3, 13.2 | 3.7, 3.7, 3.7 | 2.8, 2.8, 2.7 | 1,839, 1,934, 1,987 | 4,037, 4,387, 4,020 |
+| 100 | one ask | 12.5, 12.5, 12.3 | 2.7, 2.7, 2.6 | 3.0, 3.0, 3.0 | 617, 727, 586 | 4,783, 4,735, 4,579 |
+| 30 | rebase | 20.1, 19.7, 19.5 | 9.5, 9.1, 8.9 | 3.9, 3.9, 3.9 | 6,542, 6,102, 6,021 | 3,634, 3,577, 3,208 |
+| 30 | one ask | 17.6, 17.5, 17.2 | 5.7, 5.6, 5.4 | 5.2, 5.2, 5.1 | 1,434, 1,375, 1,357 | 4,595, 4,598, 4,541 |
+| 10 | rebase | 32.9, 33.2, 32.7 | 20.8, 20.9, 20.5 | 5.5, 5.7, 5.5 | 16,351, 16,216, 15,900 | 2,592, 2,631, 2,644 |
+| 10 | one ask | 27.0, 26.8, 26.3 | 10.9, 10.7, 10.4 | 9.5, 9.4, 9.2 | 2,400, 2,306, 2,103 | 4,298, 4,695, 4,505 |
+
+- **Accepted.** Every pair at every hot-file count has fewer owner asks with one ask: about 3% at 300 hot files, 18%
+  at 10; the rebase-kind asks halve at 10. Verdict asks rise (a resolved work submits at once, into the same
+  contention), and are now the largest kind at 10 hot files. Verdicts a second rose in every pair, on a loaded box (not
+  read as a result).
+- **Two runs before this one did not count.** The first (oracle failures 213-342 a run, 202-536 clients starved) found a
+  harness error (a conflicting resolution names only what it kept, so the windows given up must accumulate) and a
+  daemon bug (a work's composition laid zeros for base bytes its shard did not hold:
+  `docs/bugs/2026-11-21-a-composition-laid-zeros-for-base-bytes-its-shard-did-not-hold.md`). The second, with both
+  fixed but the owner's answer still dropping the work's base entries whenever the owner had composed, had 3.9 file
+  asks a client at 10 hot files, which the third run's fix removed.

@@ -19,7 +19,7 @@
 use std::time::{Duration, Instant};
 
 use slates_svn::dump::{Admission, Uuid};
-use slates_svn::migration::{Importer, Importing, Repository, Room};
+use slates_svn::migration::{Importer, Importing, Repository, Room, Standalone};
 use slates_svn::report::drive::Call;
 use slates_svn::report::drive::replay::{Replay, Stepped};
 
@@ -37,10 +37,11 @@ const ADMISSION: Admission = Admission {
 /// Shape: the bytes the import is handed at a time, as a connection would.
 const PIECE: usize = 1 << 20;
 
-/// Imports `dump` into fresh records.
-fn imported(dump: &[u8]) -> Repository {
+/// Imports `dump` into fresh records standing alone, their texts held apart as a daemon's are on the node's store.
+fn imported(dump: &[u8]) -> Standalone {
   let uuid = Uuid::parse(b"00000000-0000-4000-8000-0000000072b1").unwrap();
-  let mut repository = Repository::new(uuid, b"2026-11-20T00:00:00.000000Z", ROOM).unwrap();
+  let mut repository =
+    Standalone::new(Repository::new(uuid, b"2026-11-20T00:00:00.000000Z", ROOM).unwrap());
   let mut importer = Importer::new(ADMISSION);
   let mut held: Vec<u8> = Vec::new();
   let (mut next, mut needed) = (0usize, 1usize);
@@ -50,8 +51,8 @@ fn imported(dump: &[u8]) -> Repository {
       held.extend_from_slice(dump.get(next..end).unwrap());
       next = end;
     }
-    match importer
-      .import(&mut repository, &held, next == dump.len())
+    match repository
+      .import(&mut importer, &held, next == dump.len())
       .unwrap()
     {
       Importing::Done => return repository,
@@ -62,7 +63,7 @@ fn imported(dump: &[u8]) -> Repository {
         held.drain(..consumed);
         needed = more.max(held.len() + 1);
       }
-      // A dump imported whole into fresh records names every base in it: none is asked for.
+      // `Standalone::import` supplies every base from the texts it holds.
       Importing::Base { .. } => panic!("a whole dump's import asked for a base"),
       Importing::Commit { consumed, record } => {
         held.drain(..consumed);
@@ -111,13 +112,11 @@ fn main() {
   per_revision.sort_by_key(|a| std::cmp::Reverse(a.0));
   println!(
     "dump {path} youngest {youngest} import_s {:.1} replay r{first}..r{last} total_s {:.2} mean_ms {:.2} \
-     longest_step_us {} steps {steps_total} texts_made_whole {} windows_made {}",
+     longest_step_us {} steps {steps_total}",
     import.as_secs_f64(),
     total.as_secs_f64(),
     (total / count).as_secs_f64() * 1e3,
     longest_step.as_micros(),
-    repository.texts_made_whole(),
-    repository.windows_made()
   );
   for (took, revision, delta_bytes) in per_revision.iter().take(10) {
     println!(

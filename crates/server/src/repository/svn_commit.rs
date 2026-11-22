@@ -228,7 +228,52 @@ impl Uncommitted {
 /// and landed through the step ([`landed_with`]: the store, then the register). Committed or refused, the content store
 /// lets go every text the landing put: a committed text is its changeset's on the node's store, read through it (C2
 /// stage B part 2 (b)). None where the shard's state is gone (its shutdown).
+///
+/// The commit is counted as its repository's intake (A-724 piece 3c, §4.17.5): live among the shard's intakes while it
+/// lands (`crate::vcs_share::Live`, so other repositories' rooms are divided meanwhile), begun on the repository's usage
+/// row with its principal, and answered there with its texts' bytes, learned as the repository's next intake
+/// (`slates_vcs::Learned`), once it comes to an answer.
 pub(crate) async fn land_work(
+  (principal, repository): (&Principal, RepositoryId),
+  work: Work,
+  texts: &dyn slates_svn::commit::drive::TextSink,
+) -> Option<Result<Committed, Uncommitted>> {
+  let bytes = texts_bytes(&work);
+  let _live = crate::vcs_share::Live::begin(repository);
+  let _ = crate::state::with_state(|state| {
+    let now = slates_rt::futures::now_ns();
+    state
+      .vcs_usage
+      .begun(&repository, principal, slates_vcs::Work::Intake, now);
+  });
+  let landed = landed_work((principal, repository), work, texts).await;
+  if landed.is_some() {
+    let _ = crate::state::with_state(|state| {
+      let now = slates_rt::futures::now_ns();
+      state
+        .vcs_usage
+        .answered(&repository, slates_vcs::Work::Intake, bytes, now);
+    });
+  }
+  landed
+}
+
+/// The bytes of the texts `work` made, each counted once: what the commit brought.
+fn texts_bytes(work: &Work) -> u64 {
+  let sizes: BTreeMap<ContentIdentity, u64> = work
+    .record
+    .changes
+    .iter()
+    .filter_map(|change| change.text.map(|text| (text.identity, text.size)))
+    .filter(|(identity, _)| work.texts.contains(identity))
+    .collect();
+  sizes
+    .values()
+    .fold(0u64, |total, size| total.saturating_add(*size))
+}
+
+/// [`land_work`]'s landing, uncounted.
+async fn landed_work(
   (principal, repository): (&Principal, RepositoryId),
   work: Work,
   texts: &dyn slates_svn::commit::drive::TextSink,
@@ -541,47 +586,18 @@ async fn stage_texts(
   Some(Ok((storing, carried)))
 }
 
-/// Takes out of `revision`'s contents every text its rows name that repository `repository`'s records do not hold, and
-/// names each in its stored texts by its length instead (C2 stage B part 2 (b)): the texts to land in its changeset. A
-/// text whose bytes a row also names as a property list stays among the contents, the records keeping a list whole.
+/// The texts of `revision` repository `repository`'s records do not hold, taken out and named stored
+/// (`Repository::take_texts`): the texts to land in its changeset.
 fn take_texts(
   state: &ShardState,
   repository: RepositoryId,
   revision: &mut Revision,
 ) -> BTreeMap<ContentIdentity, Vec<u8>> {
-  let Some(records) = state.vcs_stores.subversion_records(repository) else {
-    return BTreeMap::new();
-  };
-  let lists: std::collections::BTreeSet<ContentIdentity> = revision
-    .record
-    .changes
-    .iter()
-    .filter_map(|change| match change.properties {
-      Some(PropertyList::Held { identity, .. }) => Some(identity),
-      _ => None,
-    })
-    .collect();
-  let mut texts = BTreeMap::new();
-  for text in revision
-    .record
-    .changes
-    .iter()
-    .filter_map(|change| change.text)
-  {
-    if records.holds(&text.identity) || texts.contains_key(&text.identity) {
-      continue;
-    }
-    let bytes = if lists.contains(&text.identity) {
-      revision.contents.get(&text.identity).cloned()
-    } else {
-      revision.contents.remove(&text.identity)
-    };
-    if let Some(bytes) = bytes {
-      revision.stored.insert(text.identity, text.size);
-      texts.insert(text.identity, bytes);
-    }
-  }
-  texts
+  state
+    .vcs_stores
+    .subversion_records(repository)
+    .map(|records| records.take_texts(revision))
+    .unwrap_or_default()
 }
 
 /// A revision checked for its landing ([`prepare_revision`]): the check, the work identity of its record, the room
@@ -1266,7 +1282,7 @@ fn land(
 /// reads a version it kept (`restore`: a copy from an older revision is made from the head and set back from the
 /// records), and svn's reads are the records', so only a live reader's version (a work's base, a pinned attachment, a
 /// mount) is kept. Before, it folded only past its retention budget, so git-2000's import kept 440 MB of versions.
-fn fold_to_readers(state: &mut ShardState, green: DbVolumeId) {
+pub(crate) fn fold_to_readers(state: &mut ShardState, green: DbVolumeId) {
   let floor = crate::merge_service::reachable_floor(state, green);
   let folded = state
     .greens

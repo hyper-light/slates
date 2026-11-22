@@ -160,6 +160,10 @@ pub struct Store {
   /// Whether a write stamped a file for the idle sweep since the owner last looked (A-715): set where a sealing volume's
   /// write is stamped, taken by the owner, which arms its sweep's deadline then rather than sweeping on a tick.
   pub sweep_owed: bool,
+  /// Whether a base directory was opened or used since the owner last looked (A-838): set by `Overlay::reacquire` (a
+  /// `Cell`, since the verbs that use a directory lend the store shared), taken by the owner, which arms its idle sweep
+  /// so the sweep closes the directories nothing uses (`Overlay::close_idle_directories`).
+  pub base_dirs_owed: std::cell::Cell<bool>,
 }
 
 /// Shape: the share of [`Store::inode_reserve`] under which a volume's reserve is topped up (A-150): a half. The reserve
@@ -248,6 +252,7 @@ impl Store {
       inode_reserve: 0,
       counters_low: false,
       sweep_owed: false,
+      base_dirs_owed: std::cell::Cell::new(false),
     }
   }
 

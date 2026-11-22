@@ -29,6 +29,7 @@
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(
   clippy::unwrap_used,
+  clippy::unwrap_in_result,
   clippy::expect_used,
   clippy::panic,
   clippy::indexing_slicing,
@@ -202,6 +203,9 @@ struct Svn {
   session: String,
   /// The options every command takes before its subcommand.
   options: Vec<String>,
+  /// The environment every command runs with beside `LC_ALL` (a route's own switches: HTTP v1's,
+  /// [`HTTP_V1_SWITCH`]); none for most routes.
+  env: Vec<(String, String)>,
 }
 
 impl Svn {
@@ -218,6 +222,7 @@ impl Svn {
       scratch: scratch.path.clone(),
       session: session.to_owned(),
       options,
+      env: Vec::new(),
     }
   }
 
@@ -233,6 +238,7 @@ impl Svn {
       .args(args)
       .current_dir(dir)
       .env("LC_ALL", "C")
+      .envs(self.env.iter().map(|(name, value)| (name, value)))
       .stdin(Stdio::null())
       .stdout(Stdio::piped())
       .stderr(Stdio::piped())
@@ -491,9 +497,13 @@ fn stock_svn_sessions_hold_against_stock_svnserve() {
 }
 
 /// The anchor process, killed and reaped when dropped, so a failed assertion leaves no daemon behind; what it says
-/// after its daemon served is copied to this process's standard error by `drain`, which the drop joins.
+/// after its daemon served is copied to this process's standard error by `drain`, which the drop joins within
+/// [`DRAIN_PATIENCE`].
 struct Anchor {
   child: Child,
+  /// Its instance, which names its daemon and every helper the daemon starts (a view's `slates mount`) on their command
+  /// lines: each is killed with the anchor ([`instance_processes`]).
+  instance: String,
   drain: Option<std::thread::JoinHandle<()>>,
   /// The directory its daemon's changeset store lives in (`--vcs-store`; C2: a daemon without one makes no Subversion
   /// repository), removed after the anchor is killed; none where the caller named its own.
@@ -501,13 +511,50 @@ struct Anchor {
 }
 
 impl Drop for Anchor {
+  /// Kills the anchor, then its daemon and every process of its instance, which hold the drain's pipe open (the daemon
+  /// leaves on its own once it sees the anchor gone, but a helper it started need not), and waits for the drain at most
+  /// [`DRAIN_PATIENCE`]: main's all-verbs round of 2026-11-21 sat at 0% CPU for 18 minutes after a failed assertion,
+  /// joining a drain the daemon's side still held.
   fn drop(&mut self) {
     let _ = self.child.kill();
     let _ = self.child.wait();
+    for pid in instance_processes(&self.instance) {
+      let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+    }
     if let Some(drain) = self.drain.take() {
-      let _ = drain.join();
+      let started = Instant::now();
+      while !drain.is_finished() && started.elapsed() < DRAIN_PATIENCE {
+        pause();
+      }
+      if drain.is_finished() {
+        let _ = drain.join();
+      } else {
+        eprintln!(
+          "the anchor's drain was still held {DRAIN_PATIENCE:?} after its processes were killed: left to end with the test"
+        );
+      }
     }
   }
+}
+
+/// Shape: how long a dropped anchor's drain may take to end once its processes are killed: a guard against a holder
+/// nobody killed, far above the instant a killed process's pipe closes, never a measure of it.
+const DRAIN_PATIENCE: Duration = Duration::from_secs(10);
+
+/// Every process whose command line names `instance` but the anchor's own (`ps`): its daemon and the helpers the daemon
+/// started.
+fn instance_processes(instance: &str) -> Vec<u32> {
+  let Ok(listed) = Command::new("ps")
+    .args(["-A", "-o", "pid=,command="])
+    .output()
+  else {
+    return Vec::new();
+  };
+  String::from_utf8_lossy(&listed.stdout)
+    .lines()
+    .filter(|line| line.contains(&format!("--instance {instance} ")) && !line.contains(" anchor "))
+    .filter_map(|line| line.split_whitespace().next()?.parse().ok())
+    .collect()
 }
 
 /// Runs `slates --instance INSTANCE ARGS`: its exit code and both outputs.
@@ -580,6 +627,7 @@ fn start_anchor(instance: &str, edges: &[&str]) -> (Anchor, Vec<String>, IssuerS
   let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
   let mut anchor = Anchor {
     child,
+    instance: instance.to_owned(),
     drain: None,
     _store: store,
   };
@@ -1953,12 +2001,27 @@ const USE_PATIENCE: Duration = Duration::from_secs(3600);
 /// their addresses.
 const USE_URL: &str = "<repository>";
 
+/// Format: the environment variable that makes stock `svn`'s HTTP client ignore HTTPv2 and speak HTTPv1 (Subversion's
+/// `libsvn_ra_serf`, `SVN_I_LIKE_LATENCY_SO_IGNORE_HTTPV2`), which `SLATES_SVN_USE_ROUTE=http-v1` sets for its client.
+const HTTP_V1_SWITCH: &str = "SVN_I_LIKE_LATENCY_SO_IGNORE_HTTPV2";
+
 /// Runs stock `program` with `args` in `dir`, killed past [`USE_PATIENCE`]: its exit code and both outputs.
 fn tool(program: &str, dir: &str, args: &[&str]) -> (i32, String, String) {
+  tool_with(program, dir, args, &[])
+}
+
+/// [`tool`], with `env` beside `LC_ALL` (a route's switches, as its client's [`Svn::env`]).
+fn tool_with(
+  program: &str,
+  dir: &str,
+  args: &[&str],
+  env: &[(String, String)],
+) -> (i32, String, String) {
   let mut child = Command::new(program)
     .args(args)
     .current_dir(dir)
     .env("LC_ALL", "C")
+    .envs(env.iter().map(|(name, value)| (name, value)))
     .stdin(Stdio::null())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
@@ -2010,6 +2073,27 @@ impl UseLeg {
       format!("exit {code}: {}", self.plain(&err))
     }
   }
+}
+
+/// `text`, an `svn diff`'s answer, with its per-path blocks (each from an `Index: ` line to the next) sorted, and what
+/// comes before the first kept first: the paths a change touches come in the order the server drove the client's
+/// editor, which stock `svnserve` takes from an APR hash's iteration and no server promises. Found by main's first
+/// round (2026-11-21, `diff r4` on every route): stock's blocks `trunk/link`, `trunk/dir/deep.txt`, `trunk/dir` and
+/// slates' `trunk/dir/deep.txt`, `trunk/dir`, `trunk/link`, each block byte for byte the same.
+fn canonical_diff(text: &str) -> String {
+  let mut head = String::new();
+  let mut blocks: Vec<String> = Vec::new();
+  for line in text.split_inclusive('\n') {
+    if line.starts_with("Index: ") {
+      blocks.push(String::new());
+    }
+    match blocks.last_mut() {
+      Some(block) => block.push_str(line),
+      None => head.push_str(line),
+    }
+  }
+  blocks.sort();
+  head + &blocks.concat()
 }
 
 /// `text` with each XML tag's attributes sorted by name and written on one line, the rest of `text` as it was: stock
@@ -2170,43 +2254,43 @@ fn use_choices() -> (Vec<String>, u64) {
   (verbs, samples)
 }
 
-/// The control: stock FSFS repository `control` under `root` loaded with `dump`, cut to its first
+/// The control: stock FSFS repository [`REPOSITORY`] under `root` (named as slates' is, so an answer that names the
+/// repository, `svn info`'s `path`, names it alike) loaded with `dump`, cut to its first
 /// `SLATES_SVN_USE_REVISIONS` revisions where that is set, its revision property changes allowed by a hook. The cut
 /// dump's path, for slates' import.
 #[allow(clippy::disallowed_methods)] // test code: the control's repository, hook and the cut dump, in the scratch
 fn use_control_loaded(scratch: &str, root: &str, dump: &str) -> String {
-  let control_repository = format!("{root}/control");
+  let control_repository = format!("{root}/{REPOSITORY}");
   let made = tool("svnadmin", scratch, &["create", &control_repository]);
   assert_eq!(made.0, 0, "svnadmin create: {made:?}");
-  let loaded = Command::new("svnadmin")
-    .args(["load", "-q", &control_repository])
-    .stdin(std::fs::File::open(dump).unwrap())
-    .output()
-    .unwrap();
-  assert!(loaded.status.success(), "svnadmin load: {loaded:?}");
+  // Every stock tool through `tool`, so each wait is bounded (`--file`, svnadmin 1.10's, in place of a piped stream).
+  let loaded = tool(
+    "svnadmin",
+    scratch,
+    &["load", "-q", "--file", dump, &control_repository],
+  );
+  assert_eq!(loaded.0, 0, "svnadmin load: {loaded:?}");
   let cut = format!("{scratch}/cut.dump");
-  let mut range = vec!["dump", "-q", control_repository.as_str()];
+  let mut range = vec![
+    "dump",
+    "-q",
+    "--file",
+    cut.as_str(),
+    control_repository.as_str(),
+  ];
   let revisions = std::env::var("SLATES_SVN_USE_REVISIONS").ok();
   let upper = revisions.as_ref().map(|n| format!("0:{n}"));
   if let Some(upper) = upper.as_deref() {
     range.extend(["-r", upper]);
   }
-  let dumped = Command::new("svnadmin").args(&range).output().unwrap();
-  assert!(dumped.status.success(), "svnadmin dump: {dumped:?}");
-  std::fs::write(&cut, dumped.stdout).unwrap();
+  let dumped = tool("svnadmin", scratch, &range);
+  assert_eq!(dumped.0, 0, "svnadmin dump: {dumped:?}");
   if revisions.is_some() {
-    let again = format!("{root}/control-cut");
+    let again = format!("{root}/{REPOSITORY}-cut");
     let made = tool("svnadmin", scratch, &["create", &again]);
     assert_eq!(made.0, 0, "svnadmin create: {made:?}");
-    let loaded = Command::new("svnadmin")
-      .args(["load", "-q", &again])
-      .stdin(std::fs::File::open(&cut).unwrap())
-      .output()
-      .unwrap();
-    assert!(
-      loaded.status.success(),
-      "svnadmin load of the cut: {loaded:?}"
-    );
+    let loaded = tool("svnadmin", scratch, &["load", "-q", "--file", &cut, &again]);
+    assert_eq!(loaded.0, 0, "svnadmin load of the cut: {loaded:?}");
     std::fs::remove_dir_all(&control_repository).unwrap();
     std::fs::rename(&again, &control_repository).unwrap();
   }
@@ -2262,7 +2346,16 @@ fn use_verb_compared(
     "checkout" | "update" | "switch" | "blame" => {
       working_copies_compared(verb, legs, scratch, sampled, failed);
     }
-    "diff" => at_each(failed, &|at| words(&["diff", "-c", at, "{url}"])),
+    "diff" => {
+      // A diff's per-path blocks come in the order the server drove the editor, which no server promises
+      // ([`canonical_diff`]).
+      for at in sampled {
+        let change = at.to_string();
+        let args = ["diff", "-c", change.as_str(), "{url}"];
+        let [a, b] = legs.map(|leg| canonical_diff(&leg.answer(scratch, &args)));
+        compare(failed, verb, &format!("r{at}"), &a, &b);
+      }
+    }
     "revprops" => at_each(failed, &|at| {
       words(&["proplist", "--revprop", "-v", "--xml", "-r", at, "{url}"])
     }),
@@ -2338,7 +2431,7 @@ fn rdump_of(leg: &UseLeg, scratch: &str) -> String {
   let mut args = leg.svn.options.clone();
   args.extend(["dump".to_owned(), "-q".to_owned(), leg.url.clone()]);
   let args: Vec<&str> = args.iter().map(String::as_str).collect();
-  let (code, out, err) = tool("svnrdump", scratch, &args);
+  let (code, out, err) = tool_with("svnrdump", scratch, &args, &leg.svn.env);
   if code == 0 {
     out
   } else {
@@ -2361,7 +2454,7 @@ fn mirror_dump_of(leg: &UseLeg, (scratch, root): (&str, &str)) -> String {
     .chain(leg.svn.options.iter().cloned())
     .collect();
   let init: Vec<&str> = init.iter().map(String::as_str).collect();
-  let (code, out, err) = tool("svnsync", scratch, &init);
+  let (code, out, err) = tool_with("svnsync", scratch, &init, &leg.svn.env);
   if code != 0 {
     return format!("init exit {code}: {}{}", out, leg.plain(&err));
   }
@@ -2370,7 +2463,7 @@ fn mirror_dump_of(leg: &UseLeg, (scratch, root): (&str, &str)) -> String {
     .chain(leg.svn.options.iter().cloned())
     .collect();
   let sync: Vec<&str> = sync.iter().map(String::as_str).collect();
-  let (code, _, err) = tool("svnsync", scratch, &sync);
+  let (code, _, err) = tool_with("svnsync", scratch, &sync, &leg.svn.env);
   if code != 0 {
     return format!("sync exit {code}: {}", leg.plain(&err));
   }
@@ -2444,20 +2537,79 @@ fn use_writes_logged(leg: &UseLeg, scratch: &str, writes: &[&str]) -> String {
   format!("{said}\n{unstamped}")
 }
 
+/// Slates' leg of the correctness by use on `route` (svn, http, http-v1 or ssh), its daemon `instance` with its issuer
+/// surface and its printed `lines`; None (said) where route ssh has no ssh-keygen here.
+fn use_slates_leg(
+  route: &str,
+  scratch: &Scratch,
+  (instance, issuer): (&str, &[(String, String)]),
+  lines: &[String],
+) -> Option<UseLeg> {
+  Some(match route {
+    "svn" => {
+      let (id, token) = minted_token(instance, issuer);
+      UseLeg {
+        name: "slates over svn://",
+        svn: Svn::new(scratch, "slates", credentials(id, token)),
+        url: format!("svn://127.0.0.1:{}/{REPOSITORY}", svn_listener_port(lines)),
+      }
+    }
+    "http" | "http-v1" => {
+      let (_, token) = minted_token(instance, issuer);
+      let mut svn = Svn::new(scratch, "slates", credentials(USER.to_owned(), token));
+      if route == "http-v1" {
+        svn.env.push((HTTP_V1_SWITCH.to_owned(), "1".to_owned()));
+      }
+      UseLeg {
+        name: if route == "http" {
+          "slates over HTTPv2"
+        } else {
+          "slates over HTTPv1"
+        },
+        svn,
+        url: format!("http://127.0.0.1:{}/{REPOSITORY}", http_edge_port(lines)),
+      }
+    }
+    _ => {
+      let Some((key, public)) = ssh_key(scratch) else {
+        eprintln!("skipping svn correctness by use over svn+ssh: no ssh-keygen here");
+        return None;
+      };
+      let (code, out, err) = slates_as_issuer(instance, issuer, &["credential", "key", &public]);
+      assert_eq!(code, 0, "credential key: {out}{err}");
+      let port = port_after(lines, VCS_SSH_LINE).expect("the daemon named its SSH edge's port");
+      let tunnel = format!(
+        "config:tunnels:ssh=ssh -q -F /dev/null -p {port} -i {key} -o IdentitiesOnly=yes -o BatchMode=yes \
+       -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null --"
+      );
+      UseLeg {
+        name: "slates over svn+ssh",
+        svn: Svn::new(
+          scratch,
+          "slates",
+          vec!["--config-option".to_owned(), tunnel],
+        ),
+        url: format!("svn+ssh://{USER}@127.0.0.1/{REPOSITORY}"),
+      }
+    }
+  })
+}
+
 /// Goal 93's Subversion correctness by use (main's lane of 2026-11-21; ignored: main runs its rounds, CLAUDE.md §8).
 /// Do: load the dump `SLATES_SVN_USE_DUMP` names into a stock FSFS repository (`svnadmin load`) served by stock
 /// `svnserve -t`, cut to its first `SLATES_SVN_USE_REVISIONS` revisions where that is set (`svnadmin dump -r`), and
-/// import the same revisions into a slates repository (`slates repository import`) served by the daemon's svn://
-/// listener; then run each verb `SLATES_SVN_USE_VERBS` names (default [`USE_VERBS`]) as stock `svn` 1.15 against both,
+/// import the same revisions into a slates repository (`slates repository import`) served on the route
+/// `SLATES_SVN_USE_ROUTE` names (`svn`, the default: the svn:// listener; `http`: the HTTP edge as HTTPv2; `http-v1`: the
+/// same, its client told to speak HTTPv1 ([`HTTP_V1_SWITCH`]); `ssh`: the SSH edge as svn+ssh, by an enrolled key); then run each verb `SLATES_SVN_USE_VERBS` names (default [`USE_VERBS`]) as stock `svn` 1.15 against both,
 /// reading verbs at [`USE_SAMPLES`] revisions spread over the history (`SLATES_SVN_USE_SAMPLES`), and the writing verbs
 /// (commit, copy, merge, propset of a revision property) as the same edits on both, then their logs. Expect every
 /// answer byte for byte alike once each server's URL is made plain ([`USE_URL`]; a written revision's author and date,
 /// which the servers stamp, left out): log -v, info, a checkout's files and properties, `update -r`, `switch`, blame,
 /// `diff -c`, revision properties, `svnrdump dump`, and an `svnsync` mirror's `svnadmin dump`. A failure names each verb,
 /// its revision and its first differing line. Skips loudly without stock Subversion 1.15 (`svn`, `svnadmin`,
-/// `svnserve`, `svnrdump`, `svnsync`), the dump, or an issuer surface.
+/// `svnserve`, `svnrdump`, `svnsync`), the dump, an issuer surface, or (route `ssh`) OpenSSH.
 #[test]
-#[ignore = "correctness by use, main's rounds: SLATES_SVN_USE_DUMP=git-2000.dump [SLATES_SVN_USE_REVISIONS=N] [SLATES_SVN_USE_VERBS=log,diff] cargo test --release -p slates-cli --test svn_interop -- --ignored a_dump_reads_and_writes_alike --nocapture"]
+#[ignore = "correctness by use, main's rounds: SLATES_SVN_USE_DUMP=git-2000.dump [SLATES_SVN_USE_ROUTE=svn|http|http-v1|ssh] [SLATES_SVN_USE_REVISIONS=N] [SLATES_SVN_USE_VERBS=log,diff] cargo test --release -p slates-cli --test svn_interop -- --ignored a_dump_reads_and_writes_alike --nocapture"]
 fn a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve() {
   let Ok(dump) = std::env::var("SLATES_SVN_USE_DUMP") else {
     eprintln!("skipping svn correctness by use: SLATES_SVN_USE_DUMP names no dump");
@@ -2487,19 +2639,28 @@ fn a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve() {
         ),
       ],
     ),
-    url: format!("svn+{CONTROL_TUNNEL}://localhost/control"),
+    url: format!("svn+{CONTROL_TUNNEL}://localhost/{REPOSITORY}"),
   };
-  // Slates: the same revisions imported, served by the svn:// listener.
+  // Slates: the same revisions imported, served on the route `SLATES_SVN_USE_ROUTE` names (svn:// by default).
+  let route = std::env::var("SLATES_SVN_USE_ROUTE").unwrap_or_else(|_| "svn".to_owned());
+  let edge = match route.as_str() {
+    "svn" => "--vcs-svn",
+    "http" | "http-v1" => "--vcs-http",
+    "ssh" => "--vcs-ssh",
+    other => panic!("SLATES_SVN_USE_ROUTE names no route: {other} (svn, http, http-v1 or ssh)"),
+  };
+  if route == "ssh" && !openssh() {
+    eprintln!("skipping svn correctness by use over svn+ssh: no OpenSSH here (ssh on the PATH)");
+    return;
+  }
   let instance = format!("svn-use-{}", std::process::id());
-  let (_anchor, lines, issuer) = start_anchor(&instance, &["--vcs-svn", "127.0.0.1:0"]);
-  let port = svn_listener_port(&lines);
+  let (_anchor, lines, issuer) = start_anchor(&instance, &[edge, "127.0.0.1:0"]);
   let Some(issuer) = issuer_or_skip(issuer, "svn correctness by use") else {
     return;
   };
   create_repository(&instance);
   let imported = slates(&instance, &["repository", "import", REPOSITORY, &cut]);
   assert_eq!(imported.0, 0, "import: {imported:?}");
-  let (id, token) = minted_token(&instance, &issuer);
   let allowing = format!("{}/allow-revprop-change", scratch.path);
   allowing_hook(&allowing);
   let given = format!("pre-revprop-change={allowing}");
@@ -2508,10 +2669,8 @@ fn a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve() {
     &["repository", "policy", REPOSITORY, "--hook", &given],
   );
   assert_eq!(policy.0, 0, "policy: {policy:?}");
-  let slates_leg = UseLeg {
-    name: "slates",
-    svn: Svn::new(&scratch, "slates", credentials(id, token)),
-    url: format!("svn://127.0.0.1:{port}/{REPOSITORY}"),
+  let Some(slates_leg) = use_slates_leg(&route, &scratch, (&instance, &issuer), &lines) else {
+    return;
   };
   let legs = [&control, &slates_leg];
   let youngest: u64 = control
@@ -2559,4 +2718,19 @@ fn an_xml_tags_attribute_order_is_no_part_of_an_answer() {
     canonical_tags("x <e b=\"two words\" a=\"1\"/> y"),
     "x <e a=\"1\" b=\"two words\"/> y"
   );
+}
+
+/// The comparison's rule for a diff ([`canonical_diff`]). Do: put stock `svnserve`'s and slates' answers to `svn diff
+/// -c 4` over the golden repository (main's round of 2026-11-21), the same three deleted paths in two orders, through
+/// it, and an answer whose blocks differ. Expect the first two one text, and the third still different from them.
+#[test]
+fn a_diffs_path_order_is_no_part_of_an_answer() {
+  let link = "Index: trunk/link\n====\n--- trunk/link\t(revision 3)\n+++ trunk/link\t(nonexistent)\n@@ -1 +0,0 @@\n-link a.txt\n";
+  let deep = "Index: trunk/dir/deep.txt\n====\n--- trunk/dir/deep.txt\t(revision 3)\n+++ trunk/dir/deep.txt\t(nonexistent)\n@@ -1 +0,0 @@\n-deep\n";
+  let dir = "Index: trunk/dir\n====\n--- trunk/dir\t(revision 3)\n+++ trunk/dir\t(nonexistent)\n\nProperty changes on: trunk/dir\nDeleted: custom\n";
+  let stock = format!("{link}{deep}{dir}");
+  let slates = format!("{deep}{dir}{link}");
+  assert_eq!(canonical_diff(&stock), canonical_diff(&slates));
+  let changed = format!("{deep}{dir}{}", link.replace("-link a.txt", "-link b.txt"));
+  assert_ne!(canonical_diff(&stock), canonical_diff(&changed));
 }

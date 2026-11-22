@@ -11,10 +11,10 @@
 //! **Reading** (c3). [`HeadTexts`] is the Subversion sources' text source (`slates_svn::migration::TextSource`). A text
 //! of the head is read from the green, which holds it (borrowed, no copy-out). Any other text is read from the one place
 //! the records say it is kept, never tried in turn: a text a commit stored (main's ruling (B)) from the content store by
-//! its identity, its length the records'; a text the records keep themselves (an import's or a made revision's, as a
-//! skip-delta svndiff, c2) from the records. A text kept in neither is no text. A read takes a piece at a time
-//! (`text_at`): the green's bytes from the offset, the store's window holding it, or the records' delta window holding
-//! it, its source view made window by window down the chain; nothing is made whole.
+//! its identity, its length the records'; a text whose bytes a property list holds too from the records, the only text
+//! bytes they hold (the KeptText move: the records keep no text). A text kept in neither is no text. A read takes a
+//! piece at a time (`text_at`): the green's bytes from the offset, the store's window holding it, or the records' bytes
+//! from it; nothing is made whole.
 //!
 //! **Room.** The table's entries are bounded by what the shard could admit, an entry its identity, its block and its
 //! count: [`set_room`] derives it before each hold, so a hold past it is refused typed and counted, and the text read
@@ -222,8 +222,8 @@ impl TextSource for HeadTexts<'_> {
   }
 
   /// The text from `offset`, a piece at a time (a fetch's read, main's order after w-bugs' runs 10/11): from the green,
-  /// borrowed to the text's end; else the content store's window holding `offset`; else the records' delta window
-  /// holding it. Nothing is made whole.
+  /// borrowed to the text's end; else the content store's window holding `offset`; else the records' own bytes from it.
+  /// Nothing is made whole.
   fn text_at(&self, identity: &ContentIdentity, offset: u64) -> Option<Cow<'_, [u8]>> {
     if let Some(bytes) = self.green.and_then(|green| green.held(identity)) {
       return bytes
@@ -257,8 +257,7 @@ impl TextSource for HeadTexts<'_> {
   }
 
   /// [`TextSource::text_at`] for a reader keeping `cache` across its steps: the green's and the content store's runs
-  /// lent in place as `text_at` lends them; a text the records keep, the delta window the reader is in made once into
-  /// its cache and lent from there.
+  /// lent in place as `text_at` lends them; a text the records hold, lent in place from them.
   fn text_in<'a>(
     &'a self,
     identity: &ContentIdentity,
@@ -274,8 +273,8 @@ impl TextSource for HeadTexts<'_> {
   }
 
   /// A step of the same order: the green's held text a window's room copied, the content store's a window of the
-  /// store read (`ContentStore::window_at`, from the window the bytes read so far reach), the records' a delta window
-  /// applied.
+  /// store read (`ContentStore::window_at`, from the window the bytes read so far reach), the records' own bytes a
+  /// window's room copied.
   fn read_step(&self, identity: &ContentIdentity, reading: &mut TextReading) -> Option<bool> {
     if let Some(bytes) = self.green.and_then(|green| green.held(identity)) {
       return Some(reading.copy_step(bytes));
@@ -499,6 +498,8 @@ mod tests {
     revision
       .stored
       .insert(identity, u64::try_from(bytes.len()).unwrap());
+    // The revision's other texts stored too, as a landing stores them (the records keep none, A-842); not read here.
+    let _ = records.take_texts(&mut revision);
     let checked = records.check(revision).unwrap();
     records.apply(checked).unwrap();
     let texts = HeadTexts {

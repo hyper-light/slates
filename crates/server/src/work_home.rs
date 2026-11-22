@@ -142,8 +142,17 @@ pub(crate) struct SealedWork {
   /// The verdict of `composed` a holder computed on its replica, in its wire form (A-658 part 3a), when the work lives
   /// on a node that holds a replica of a green another node owns (A-697 part c): the owner takes it by position.
   pub(crate) computed: Option<Vec<u8>>,
+  /// Where this shard's content store already holds `composed`'s encoding, when it does (lane (A) 3b: a holder's
+  /// submit, fetched by identity before the verb): the judgment then neither encodes nor hashes it again.
+  pub(crate) held: Option<slates_merge::chain_entry::Inputs>,
   /// A merge check's or resolution's ask (A-796), when the rebase is one: what the green's half does beyond a rebase.
   pub(crate) merge: Option<MergeAsk>,
+  /// Whether the work's shard composes the work's increments itself ([`composed`]: a work off its green's shard), so a
+  /// rebase's answer carries the base entries its next composition needs (A-808), even when this one was not composed
+  /// there: a journal that would not compose on the work's shard ([`crate::verbs::lay_ops`]'s `BaseGone`, A-840) is
+  /// composed by the owner this time, and without the entries every later submit asked the owner for the files (3.9 a
+  /// client at 10 hot files in the 1,000-client stand-in).
+  pub(crate) composes_here: bool,
 }
 
 /// What a merge check or a resolution asks of the green's half beyond a rebase (A-796).
@@ -156,6 +165,9 @@ pub(crate) struct MergeAsk {
   pub(crate) discard: Vec<u64>,
   /// The agent's changes, applied at the head after the kept operations.
   pub(crate) replacement: Vec<slates_ipc::protocol::WorkChange>,
+  /// A one-ask resolution's windows (A-840): the operations in them are retired in place of `discard`, and the rest is
+  /// judged at the head as it is. `None` for a check and for `ResolveMerge`.
+  pub(crate) over: Option<Vec<slates_ipc::protocol::MergeWindow>>,
 }
 
 /// What a clean rebase leaves a work, or the answer when it was not clean.
@@ -427,7 +439,9 @@ fn may_ask(state: &ShardState, principal: &Principal, body: &RequestBody) -> boo
     | RequestBody::ReadMergeCheck { .. } => {
       require_work(state, principal, volume, false, "ask").is_ok()
     }
-    RequestBody::ResolveMerge { .. } => require_work(state, principal, volume, true, "ask").is_ok(),
+    RequestBody::ResolveMerge { .. } | RequestBody::ResolveConflict { .. } => {
+      require_work(state, principal, volume, true, "ask").is_ok()
+    }
     // An approval reaches the verdict only once it verifies (A-285): the owner trusts what it is sent, so a consumer's
     // or a forged approval runs here, where `verbs::submit_approved` refuses it, and nothing reaches the green.
     RequestBody::SubmitApproved {
@@ -520,9 +534,22 @@ fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<N
           head: Some(stamp.head),
           discard: discard.clone(),
           replacement: replacement.clone(),
+          over: None,
         },
       )
     }
+    RequestBody::ResolveConflict {
+      over, replacement, ..
+    } => merge_need(
+      state,
+      work,
+      MergeAsk {
+        head: None,
+        discard: Vec::new(),
+        replacement: replacement.clone(),
+        over: Some(over.clone()),
+      },
+    ),
     RequestBody::ReadMergeCheck {
       stamp,
       path,
@@ -839,6 +866,7 @@ fn composed(state: &ShardState, mut sealed: SealedWork, evidence: Vec<[u8; 32]>)
   let Some(w) = state.works.get(&sealed.work) else {
     return sealed;
   };
+  sealed.composes_here = true;
   if holds_copy(&sealed.journal) {
     return sealed;
   }
@@ -890,7 +918,9 @@ fn seal(state: &ShardState, work: DbVolumeId) -> SealedWork {
     files: w.map(|w| w.files.clone()).unwrap_or_default(),
     composed: None,
     computed: None,
+    held: None,
     merge: None,
+    composes_here: false,
   }
 }
 
@@ -3105,7 +3135,9 @@ mod tests {
       files: super::WorkFiles::default(),
       composed: None,
       computed: None,
+      held: None,
       merge: None,
+      composes_here: false,
     }
   }
 

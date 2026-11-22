@@ -178,7 +178,8 @@ pub enum StepRefusal {
     /// The room's bytes.
     room: u64,
   },
-  /// A text or property list the rows name that neither the repository nor the revision holds, or a count past
+  /// A text or property list the rows name that neither the repository nor the revision holds, a text the revision
+  /// carries inline where its caller stores texts (`crate::migration::Repository::take_texts`), or a count past
   /// 2^64 - 1 (`SVN_ERR_FS_CORRUPT`).
   Corrupt,
   /// An owner's instant this writer cannot write as `svn_time_to_cstring` does (`SVN_ERR_FS_GENERAL`).

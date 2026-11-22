@@ -188,8 +188,28 @@ pub(crate) enum PushFailed {
   NoStore,
   /// Its policy holds a rule git's matcher cannot read (A-622 part 2): refused, never judged without the rule.
   Policy(PushRefusal),
-  /// receive-pack refused the exchange: a request git's protocol does not allow, or one past the push's room.
+  /// receive-pack refused the exchange: a request git's protocol does not allow, or one past the push's room while the
+  /// room was all the shard could admit.
   Exchange(receive::Refusal),
+  /// The push needed more than its room where its room was its repository's share of the shard, other repositories'
+  /// intakes under way (A-724 piece 3b, §4.17.5 "Admission and backpressure"): retryable once theirs end, so answered as
+  /// such, naming the share.
+  PastShare {
+    /// What the push asked and what its room had left.
+    past: slates_git::PastAdmission,
+    /// The repository's share of the contested resource, in bytes.
+    share: u64,
+    /// What the repository held of it already.
+    held: u64,
+  },
+  /// The push needed more than its room where its room was its partition's snapshot slot's room left (A-724 piece 8a):
+  /// retryable once the slot is laid out larger at the next planned handoff, naming the room.
+  PastSnapshot {
+    /// What the push asked and what its room had left.
+    past: slates_git::PastAdmission,
+    /// The slot's room left when the push began.
+    room: u64,
+  },
   /// `answer` asked of a push not yet read whole and checked, or already answered.
   Unchecked,
   /// The push's objects were not homed in the region and landed on the node's changeset store (a homing short, its pack
@@ -211,6 +231,11 @@ pub(crate) struct ReceivePack<P = Unpresented> {
   admission: Admission,
   /// The push counted live among its repository's intakes until it drops (A-724, `crate::vcs_share`).
   _live: crate::vcs_share::Live,
+  /// What bound the push's room when it began (`crate::vcs_share::Bound`): a refusal past it is typed by it.
+  room_bound: crate::vcs_share::Bound,
+  /// The client's bytes this push read, in all: what it brought, learned as its repository's demand once it is answered
+  /// (A-724 piece 2, `slates_vcs::Learned`).
+  read_bytes: u64,
   /// The push counted decoding on its shard until it drops (A-724, `crate::vcs_share::place`): the load the placement
   /// of A-722's intake off the owner shard reads.
   _decoding: crate::vcs_share::place::Decoding,
@@ -510,12 +535,15 @@ impl<P> ReceivePack<P> {
         longest.entry(repository).or_default().begun_at = Some(begun);
       }
     });
+    let room = crate::vcs_share::room(state, repository);
     Ok(ReceivePack {
       repository,
       principal: principal.clone(),
       session,
-      admission: Admission::new(crate::vcs_share::room(state, repository).bytes),
+      admission: Admission::new(room.bytes),
       _live: crate::vcs_share::Live::begin(repository),
+      room_bound: room.bound,
+      read_bytes: 0,
       _decoding: crate::vcs_share::place::Decoding::begin(state.shard),
       quarantine: GitPush::begin(&state.vcs_stores, repository),
       unadmitted: None,
@@ -531,6 +559,24 @@ impl<P> ReceivePack<P> {
     })
   }
 
+  /// `failed` typed by what bound the push's room (A-724 piece 3b): a refusal past its admission becomes
+  /// [`PushFailed::PastShare`] or [`PushFailed::PastSnapshot`] where its room was a share or the snapshot's room, and is
+  /// left as it is where its room was all the shard could admit.
+  fn bounded(&self, failed: PushFailed) -> PushFailed {
+    let past = match failed {
+      PushFailed::Exchange(
+        receive::Refusal::PastAdmission(past)
+        | receive::Refusal::PktLine(slates_git::pktline::Refusal::PastAdmission(past)),
+      ) => past,
+      other => return other,
+    };
+    match self.room_bound {
+      crate::vcs_share::Bound::Share { share, held } => PushFailed::PastShare { past, share, held },
+      crate::vcs_share::Bound::Snapshot { room } => PushFailed::PastSnapshot { past, room },
+      crate::vcs_share::Bound::Shard => failed,
+    }
+  }
+
   /// Hands the push the client's next `bytes`, its pack's objects admitted to the quarantine as
   /// they resolve (A-719 part 3): whether it is now read whole, its checks to make. A refusal of the
   /// exchange ends the push.
@@ -540,9 +586,12 @@ impl<P> ReceivePack<P> {
       session.input_into(bytes, site, admission)
     });
     let bytes_in = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    self.read_bytes = self.read_bytes.saturating_add(bytes_in);
     charge_step(state, self.repository, began, bytes_in);
-    let read = read?;
-    self.keep_refusal_names()?;
+    let read = read.map_err(|failed| self.bounded(failed))?;
+    self
+      .keep_refusal_names()
+      .map_err(|failed| self.bounded(failed))?;
     Ok(read)
   }
 
@@ -594,8 +643,10 @@ impl<P> ReceivePack<P> {
       session.end_into(site, admission)
     });
     charge_step(state, self.repository, began, 0);
-    let ended = ended?;
-    self.keep_refusal_names()?;
+    let ended = ended.map_err(|failed| self.bounded(failed))?;
+    self
+      .keep_refusal_names()
+      .map_err(|failed| self.bounded(failed))?;
     Ok(ended)
   }
 
@@ -1080,8 +1131,10 @@ impl<P: crate::git_hooks::PresentView> ReceivePack<P> {
     out: &mut impl Out,
   ) -> Result<Answering, PushFailed> {
     let began = slates_rt::futures::now_ns();
-    let stepped = self.answer_turn(state, out);
-    charge_answer(state, self.repository, began, &stepped);
+    let stepped = self
+      .answer_turn(state, out)
+      .map_err(|failed| self.bounded(failed));
+    charge_answer(state, (self.repository, self.read_bytes), began, &stepped);
     stepped
   }
 
@@ -1180,8 +1233,10 @@ impl<P> ReceivePack<P> {
     out: &mut impl Out,
   ) -> Result<Answering, PushFailed> {
     let began = slates_rt::futures::now_ns();
-    let stepped = self.answer_turn(state, out);
-    charge_answer(state, self.repository, began, &stepped);
+    let stepped = self
+      .answer_turn(state, out)
+      .map_err(|failed| self.bounded(failed));
+    charge_answer(state, (self.repository, self.read_bytes), began, &stepped);
     stepped
   }
 
@@ -1603,10 +1658,10 @@ fn charge_phase(
 }
 
 /// Counts a step of a push's answer that began at `began` (A-724 piece 1), and the push as answered when the step
-/// answered it whole.
+/// answered it whole, its `read_bytes` learned as the repository's demand (A-724 piece 2).
 fn charge_answer(
   state: &mut ShardState,
-  repository: RepositoryId,
+  (repository, read_bytes): (RepositoryId, u64),
   began: u64,
   stepped: &Result<Answering, PushFailed>,
 ) {
@@ -1617,9 +1672,12 @@ fn charge_answer(
   };
   charge_phase(state, repository, began, 0, phase);
   if let Ok(Answering::Answered(_)) = stepped {
-    state
-      .vcs_usage
-      .answered(&repository, Work::Intake, slates_rt::futures::now_ns());
+    state.vcs_usage.answered(
+      &repository,
+      Work::Intake,
+      read_bytes,
+      slates_rt::futures::now_ns(),
+    );
   }
 }
 
@@ -2443,13 +2501,15 @@ impl ShardGreens<'_, '_> {
     Some((Version { number, tree }, head))
   }
 
-  /// The tree the object `head` names (module docs): a commit's, a tree itself, or that of the commit or tree an
-  /// annotated tag names; none for anything else (a tag of a tag is owed).
+  /// The tree the object `head` names (module docs), as git peels a ref (A-836: a ref may name any object): a commit's,
+  /// a tree itself, the end of a chain of annotated tags followed to its end, and the empty tree for a blob (a ref naming
+  /// no tree holds no files). The chain's tags are distinct objects the store holds, each named by its content, so it
+  /// ends.
   fn tree_of(&self, head: &ObjectId) -> Option<ObjectId> {
     let (content, git) = self.store;
     let mut target = *head;
     let mut row = git.repository.object(content, &target)?;
-    if row.kind == Kind::Tag {
+    while row.kind == Kind::Tag {
       let (_, bytes) = self.indexed.object(&target)?;
       let tag = Tag::parse(bytes, &mut Admission::new(u64::MAX)).ok()?;
       target = tag.object(head.format())?;
@@ -2458,7 +2518,7 @@ impl ShardGreens<'_, '_> {
     match row.kind {
       Kind::Commit => git.repository.id_at(content, row.commit?.tree),
       Kind::Tree => Some(target),
-      _ => None,
+      Kind::Blob | Kind::Tag => slates_git::object_name::empty_tree(head.format()),
     }
   }
 

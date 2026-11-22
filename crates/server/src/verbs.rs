@@ -1126,7 +1126,6 @@ async fn fetch_named_increment(
 ) -> Result<(), Box<ReplyBody>> {
   let id = to_db_volume(green);
   let object = ObjectId(green.bytes);
-  let named = slates_merge::chain_entry::Inputs { identity, len };
   if call_owner(control, shard, move |s| {
     s.held_content.holds_manifest(object, &identity)
   })
@@ -1147,23 +1146,40 @@ async fn fetch_named_increment(
       break false;
     }
   };
-  let bytes = whole
+  // The manifest the fetch staged here, then the increment moved to the owner shard a chunk a call (each its own step,
+  // never the whole increment in one): opened as a stage placed for the version it would make, a chunk at a time, and
+  // completed. On the owner's own shard the fetch staged it in place, and only its placement moves to the version.
+  let manifest = whole
     .then(|| {
       crate::state::with_state(|s| {
-        crate::merge_service::increment_of(s, id, &named).map(std::borrow::Cow::into_owned)
+        s.held_content
+          .held_manifest(s.store.content.arena(), object, &identity)
       })
       .flatten()
     })
     .flatten();
-  let Some(bytes) = bytes else {
+  let Some(manifest) = manifest else {
     let _ = crate::state::with_state(|s| s.count(INPUTS_FETCH_SHORT, 1));
     return Err(Box::new(refused(Refusal::Overloaded { shard: control })));
   };
-  let held = call_owner(control, shard, move |s| {
-    let next = s.db.partition().green_head(id).saturating_add(1);
-    crate::merge_service::hold_increment(s, id, next, &bytes).map(|_| ())
-  })
-  .await?;
+  let held = if shard == control {
+    crate::state::with_state(move |s| {
+      let next = s.db.partition().green_head(id).saturating_add(1);
+      s.held_content
+        .hold_lent(
+          &mut crate::content_holder::hold_space(&mut s.store),
+          object,
+          slates_cluster::content::Placed { sequence: next },
+          &manifest,
+          std::iter::empty(),
+        )
+        .map(|_| ())
+        .map_err(|refusal| held_refusal(refusal, control))
+    })
+    .unwrap_or(Err(Refusal::Overloaded { shard: control }))
+  } else {
+    move_increment((control, shard), (id, object, identity), manifest).await?
+  };
   let _ = crate::state::with_state(|s| {
     // Staged here for the move: released once the owner shard holds it, unless this shard is the owner's, whose hold it is.
     if shard != control {
@@ -1179,6 +1195,76 @@ async fn fetch_named_increment(
     }
   });
   held.map_err(|refusal| Box::new(refused(refusal)))
+}
+
+/// The typed refusal a content hold's refusal is for a holder's submit: no room is the shard's `BudgetExceeded`, any
+/// other `Overloaded` (nothing started; the retry fetches again).
+fn held_refusal(refusal: slates_cluster::content::ContentRefusal, shard: u16) -> Refusal {
+  match refusal {
+    slates_cluster::content::ContentRefusal::NoCapacity { available, .. } => {
+      Refusal::BudgetExceeded { available }
+    }
+    _ => Refusal::Overloaded { shard },
+  }
+}
+
+/// Moves an increment this control shard holds whole under `identity` to the owner `shard`'s content store, placed for
+/// the green's next version (lane (A) 3b): a stage opened there for `manifest`, then each chunk the stage lacks lent
+/// here, copied out once and staged there, a call each, then the stage completed. Every call one chunk's work, so the
+/// owner shard never spends a whole increment's copy and hash in one step. A stage the owner shard already held whole
+/// (an earlier move) is nothing to move.
+async fn move_increment(
+  (control, shard): (u16, u16),
+  (id, object, identity): (DbVolumeId, ObjectId, [u8; 32]),
+  manifest: slates_archive::Archive,
+) -> Result<Result<(), Refusal>, Box<ReplyBody>> {
+  let opened = call_owner(control, shard, move |s| {
+    let next = s.db.partition().green_head(id).saturating_add(1);
+    s.held_content.stage_fetched(
+      &mut crate::content_holder::hold_space(&mut s.store),
+      object,
+      slates_cluster::content::Placed { sequence: next },
+      &manifest,
+    )
+  })
+  .await?;
+  let wanted = match opened {
+    Ok(None) => return Ok(Ok(())),
+    Ok(Some(wanted)) => wanted,
+    Err(refusal) => return Ok(Err(held_refusal(refusal, shard))),
+  };
+  for chunk_id in wanted {
+    let chunk = crate::state::with_state(|s| {
+      s.held_content
+        .held_chunk(s.store.content.arena(), object, &identity, &chunk_id)
+    })
+    .flatten();
+    let Some(chunk) = chunk else {
+      return Ok(Err(Refusal::Overloaded { shard: control }));
+    };
+    let staged = call_owner(control, shard, move |s| {
+      s.held_content.stage_piece(
+        &mut crate::content_holder::hold_space(&mut s.store),
+        object,
+        &identity,
+        chunk,
+      )
+    })
+    .await?;
+    if let Err(refusal) = staged {
+      return Ok(Err(held_refusal(refusal, shard)));
+    }
+  }
+  let completed = call_owner(control, shard, move |s| {
+    s.held_content
+      .complete_stage(&mut crate::content_holder::hold_space(&mut s.store), object)
+  })
+  .await?;
+  Ok(
+    completed
+      .map(|_| ())
+      .map_err(|refusal| held_refusal(refusal, shard)),
+  )
 }
 
 /// Where a forwarded verb runs, and the volume it is made on (none for a work being made): a work over a green on the
@@ -2961,7 +3047,8 @@ pub(crate) fn route_gated(
     | RequestBody::SetRepositoryPolicy { repository, .. }
     | RequestBody::ImportRepository { repository, .. }
     | RequestBody::DescribeRepositoryPolicy { repository }
-    | RequestBody::ExportDump { repository, .. } => {
+    | RequestBody::ExportDump { repository, .. }
+    | RequestBody::DestroyRepository { repository } => {
       Some(owner_of_name(repository, state.shards.len()))
     }
     // A work lives on the shard that serves its creation, its client's own (A-400): its edits and its submits are read
@@ -5689,6 +5776,11 @@ fn dispatch_inner(
       discard,
       replacement,
     } => resolve_merge(state, principal, stamp, discard, replacement),
+    RequestBody::ResolveConflict {
+      work,
+      over,
+      replacement,
+    } => resolve_conflict(state, principal, work, over, replacement),
     RequestBody::Advance {
       attachment,
       version,
@@ -5819,6 +5911,9 @@ fn dispatch_inner(
     } => crate::repository::bind_branch(state, principal, (&repository, &name), green),
     RequestBody::RetireBranch { repository, name } => {
       crate::repository::retire_branch(state, principal, (&repository, &name))
+    }
+    RequestBody::DestroyRepository { repository } => {
+      crate::repository::destroy_repository(state, principal, &repository)
     }
     RequestBody::SetRepositoryPolicy {
       repository,
@@ -9495,7 +9590,7 @@ fn assemble_post_state(
   ),
   (files, base): (&crate::work_files::WorkFiles, crate::work_files::Base<'_>),
   journal: &[VolumeOp],
-) -> Vec<u8> {
+) -> Result<Vec<u8>, crate::work_files::BaseGone> {
   let mut post = vec![0u8; usize::try_from(post_state_size(doc)).unwrap_or(0)];
   lay_ops(
     &mut post,
@@ -9503,12 +9598,13 @@ fn assemble_post_state(
     (files, base),
     journal,
     0..doc.ops.len(),
-  );
-  post
+  )?;
+  Ok(post)
 }
 
 /// Lays the bytes the ops of `doc` in `ops` contribute into `post` ([`assemble_post_state`]'s body, which a sliced
-/// build runs a range at a time, A-787 part 3). Returns the bytes copied, what a slice is budgeted by.
+/// build runs a range at a time, A-787 part 3). Returns the bytes copied, what a slice is budgeted by; or `BaseGone` when
+/// an op's range names base bytes `base` does not hold ([`lay_op`]).
 pub(crate) fn lay_ops(
   post: &mut [u8],
   (doc, plan): (
@@ -9518,15 +9614,20 @@ pub(crate) fn lay_ops(
   (files, base): (&crate::work_files::WorkFiles, crate::work_files::Base<'_>),
   journal: &[VolumeOp],
   ops: std::ops::Range<usize>,
-) -> usize {
+) -> Result<usize, crate::work_files::BaseGone> {
   let mut copied = 0usize;
   for op in doc.ops.get(ops).unwrap_or_default() {
-    copied = copied.saturating_add(lay_op(post, op, (doc, plan), (files, base), journal));
+    copied = copied.saturating_add(lay_op(post, op, (doc, plan), (files, base), journal)?);
   }
-  copied
+  Ok(copied)
 }
 
-/// One op's bytes laid into `post` ([`lay_ops`]): the bytes it copied.
+/// One op's bytes laid into `post` ([`lay_ops`]): the bytes it copied. `BaseGone` when the op's range is held as parts
+/// naming base bytes that `base` cannot read: a work off its green's shard holds a rebased file as parts over the head
+/// (A-806), and a run of its own write equal to the head's is one of them. Until 2026-11-21 that range was laid as
+/// zeros, which the green then took as the work's bytes (A-840's oracle in `tests/merge_check.rs` found it); now the
+/// composition fails and the work's shard hands the owner its journal and files, which the owner composes over its
+/// head.
 fn lay_op(
   post: &mut [u8],
   op: &slates_merge::ops_doc::Op,
@@ -9536,15 +9637,15 @@ fn lay_op(
   ),
   (files, base): (&crate::work_files::WorkFiles, crate::work_files::Base<'_>),
   journal: &[VolumeOp],
-) -> usize {
+) -> Result<usize, crate::work_files::BaseGone> {
   use slates_merge::ops_doc::OpKind;
   let is_file_content =
     |kind: OpKind| matches!(kind, OpKind::Overwrite | OpKind::Insert | OpKind::Extend);
   if op.src == u64::MAX {
-    return 0;
+    return Ok(0);
   }
   let Some(path) = doc.paths.path(op.path) else {
-    return 0;
+    return Ok(0);
   };
   let encoded_node;
   if is_file_content(op.kind) {
@@ -9556,14 +9657,14 @@ fn lay_op(
       usize::try_from(op.src),
       usize::try_from(op.len),
     ) else {
-      return 0;
+      return Ok(0);
     };
     if let Some(into) = post.get_mut(dst..dst.saturating_add(len))
-      && files.copy_range(base, path, *at, into).ok().flatten() != Some(len)
+      && files.copy_range(base, path, *at, into)? != Some(len)
     {
       into.fill(0);
     }
-    return len;
+    return Ok(len);
   }
   // The bytes this op contributes, and the offset into them: an xattr's value or a node.
   let (source, source_at): (&[u8], u64) = if op.kind == OpKind::Mknod {
@@ -9575,7 +9676,7 @@ fn lay_op(
       } if declared == path => Some(node),
       _ => None,
     }) else {
-      return 0;
+      return Ok(0);
     };
     encoded_node = node.encode();
     (&encoded_node, 0)
@@ -9583,21 +9684,21 @@ fn lay_op(
     // The name's index is 64 bits (A-621): until then one past 16 bits was skipped here, so an attribute of a work
     // naming more than 65,535 paths had no value laid in.
     let Some(name) = doc.paths.path(op.at) else {
-      return 0;
+      return Ok(0);
     };
     let Some(value) = declared_xattr(journal, path, name) else {
-      return 0;
+      return Ok(0);
     };
     (value, 0)
   } else {
-    return 0;
+    return Ok(0);
   };
   let (Ok(from), Ok(dst), Ok(len)) = (
     usize::try_from(source_at),
     usize::try_from(op.src),
     usize::try_from(op.len),
   ) else {
-    return 0;
+    return Ok(0);
   };
   let span = (
     post.get_mut(dst..dst.saturating_add(len)),
@@ -9606,7 +9707,7 @@ fn lay_op(
   if let (Some(into), Some(from)) = span {
     into.copy_from_slice(from);
   }
-  len
+  Ok(len)
 }
 
 /// Composes a work volume's declared operations into an increment against its green's base version
@@ -9689,7 +9790,9 @@ pub(crate) fn compose_increment(
       }
     },
   };
-  let post_state = assemble_post_state((&doc, &plan), (files, files_base), journal);
+  // A range held as base bytes this side cannot read is refused, never laid as zeros ([`lay_op`]).
+  let post_state = assemble_post_state((&doc, &plan), (files, files_base), journal)
+    .map_err(|_| Refusal::ContentUnavailable)?;
   // The identity names the work and its base before the post-state and the document (§4.16 data model:
   // `blake3(work_volume, base, post_state, ops_doc, filter)`), so the engine's retry cache answers only a
   // retry of this work's increment. Without them, a second work's identical edit from the same base was
@@ -9924,7 +10027,9 @@ fn take_sealed(state: &mut ShardState, work: DbVolumeId) -> Option<crate::work_h
     files: std::mem::take(&mut w.files),
     composed: None,
     computed: None,
+    held: None,
     merge: None,
+    composes_here: false,
   })
 }
 
@@ -10763,6 +10868,16 @@ fn increment_held(
   green_id: DbVolumeId,
   inc: &slates_merge::engine::Increment,
 ) -> Result<crate::merge_service::HeldIncrement, Refusal> {
+  // A holder's submit names an increment this shard already holds (lane (A) 3b): neither encoded nor hashed again.
+  if let Some(inputs) = sealed.held {
+    chain_room_admitted(state, green_id, inc)?;
+    retention_secured(state, green_id, inc)?;
+    return crate::merge_service::increment_already_held(state, green_id, inputs).inspect_err(
+      |_| {
+        let _ = crate::merge_service::settle_green_retention(state, green_id);
+      },
+    );
+  }
   let increment_bytes =
     crate::refining::take_encoded(state, sealed.work, inc.id).unwrap_or_else(|| inc.encode());
   chain_room_admitted(state, green_id, inc)?;
@@ -11521,10 +11636,114 @@ fn resolve_merge(
         head: Some(stamp.head),
         discard,
         replacement,
+        over: None,
       },
     ),
   };
   settle_rebase(state, work_id, green_id, answer)
+}
+
+/// `ResolveConflict` (§4.16, A-840): one ask resolves a conflict. The green's half gives up the windows `over` names
+/// in the work ([`give_up_windows`]), rebases the rest onto the head as it is and applies the agent's
+/// replacement there; the work is restated at the head as a rebase restates it ([`settle_rebase`]), one recorded step.
+/// What is kept and still conflicts answers the windows, nothing changed. There is no stamp: nothing was judged at an
+/// older head, so nothing can be stale (A-796's check costs an ask and, under contention, was stale at almost every
+/// resolution).
+fn resolve_conflict(
+  state: &mut ShardState,
+  principal: &Principal,
+  work: VolumeId,
+  over: Vec<slates_ipc::protocol::MergeWindow>,
+  replacement: Vec<slates_ipc::protocol::WorkChange>,
+) -> ReplyBody {
+  let (work_id, green_id) =
+    match crate::merge_service::require_work(state, principal, work, true, "resolve") {
+      Ok((record, green)) => (record.id, green),
+      Err(refusal) => return refused(refusal),
+    };
+  let answer = match state.work_home.rebased.take() {
+    Some(answer) => answer,
+    None => local_merge(
+      state,
+      (work_id, green_id),
+      crate::work_home::MergeAsk {
+        head: None,
+        discard: Vec::new(),
+        replacement,
+        over: Some(over),
+      },
+    ),
+  };
+  settle_rebase(state, work_id, green_id, answer)
+}
+
+/// Gives up a one-ask resolution's windows in `doc` (A-840): exactly the windows' bytes, nothing past them. On a
+/// window's path, every operation goes when the window has no length (a namespace conflict's anchor). Otherwise an
+/// overwrite that meets a window keeps its parts outside every window, each with its source offset moved with it, so a
+/// work's adjacent writes held as one operation lose only the window; an insertion, deletion, extension or truncation
+/// that meets one goes whole, since it shifts or ends the file and has no part outside it that means the same alone.
+/// Nothing else of the declaration is read, so the agent's windows alone decide.
+fn give_up_windows(
+  doc: &mut slates_merge::ops_doc::OpsDoc,
+  windows: &[slates_ipc::protocol::MergeWindow],
+) {
+  use slates_merge::ops_doc::OpKind;
+  let paths = &doc.paths;
+  let mut kept = Vec::with_capacity(doc.ops.len());
+  for op in doc.ops.drain(..) {
+    let path = paths.path(op.path).unwrap_or_default();
+    let on_path: Vec<&slates_ipc::protocol::MergeWindow> = windows
+      .iter()
+      .filter(|window| window.path == path)
+      .collect();
+    if on_path.iter().any(|window| window.len == 0) {
+      continue;
+    }
+    let meets = |from: u64, to: u64| {
+      on_path
+        .iter()
+        .any(|window| from < window.at.saturating_add(window.len) && window.at < to)
+    };
+    match op.kind {
+      OpKind::Overwrite => {
+        // The parts of [at, at + len) outside every window, in order.
+        let mut cuts: Vec<(u64, u64)> = on_path
+          .iter()
+          .map(|window| (window.at, window.at.saturating_add(window.len)))
+          .collect();
+        cuts.sort_unstable();
+        let end = op.at.saturating_add(op.len);
+        let mut from = op.at;
+        for (cut_from, cut_to) in cuts {
+          if cut_to <= from || cut_from >= end {
+            continue;
+          }
+          if cut_from > from {
+            kept.push(slates_merge::ops_doc::Op {
+              at: from,
+              len: cut_from.saturating_sub(from),
+              src: op.src.saturating_add(from.saturating_sub(op.at)),
+              ..op
+            });
+          }
+          from = from.max(cut_to);
+        }
+        if from < end {
+          kept.push(slates_merge::ops_doc::Op {
+            at: from,
+            len: end.saturating_sub(from),
+            src: op.src.saturating_add(from.saturating_sub(op.at)),
+            ..op
+          });
+        }
+      }
+      OpKind::Truncate if meets(op.at, u64::MAX) => {}
+      OpKind::Extend | OpKind::Insert | OpKind::Delete
+        if meets(op.at, op.at.saturating_add(op.len.max(1))) => {}
+      _ => kept.push(op),
+    }
+  }
+  doc.ops = kept;
 }
 
 /// The owner's half of a rebase (A-247): maps a work's sealed increment through the green's deltas. The green is never
@@ -11548,7 +11767,7 @@ fn map_rebase(
   merge_answer(
     &engine,
     (green_id, inc),
-    sealed.composed.is_some(),
+    sealed.composed.is_some() || sealed.composes_here,
     sealed.merge.as_ref(),
   )
 }
@@ -11656,20 +11875,26 @@ fn merge_answer(
   if ask.head.is_some_and(|head| head != engine.head()) {
     return RebaseAnswer::Reply(refused(Refusal::StaleMergeView));
   }
+  // A one-ask resolution (A-840) names windows, not indices, gives up exactly their bytes, and is judged at the head as
+  // it is.
+  if let Some(windows) = ask.over.as_deref() {
+    give_up_windows(&mut inc.doc, windows);
+  }
+  let discard = &ask.discard;
+  let resolving_at = ask
+    .head
+    .or_else(|| ask.over.as_ref().map(|_| engine.head()));
   let ops = u64::try_from(inc.doc.ops.len()).unwrap_or(u64::MAX);
-  if ask
-    .discard
-    .windows(2)
-    .any(|pair| pair.first() >= pair.get(1))
-    || ask.discard.last().is_some_and(|index| *index >= ops)
+  if discard.windows(2).any(|pair| pair.first() >= pair.get(1))
+    || discard.last().is_some_and(|index| *index >= ops)
   {
     return RebaseAnswer::Reply(refused(Refusal::BadRequest {
       reason: "a resolution retires distinct operations of the checked declaration, in order"
         .to_owned(),
     }));
   }
-  if !ask.discard.is_empty() {
-    let mut retired = ask.discard.iter().copied().peekable();
+  if !discard.is_empty() {
+    let mut retired = discard.iter().copied().peekable();
     let mut index = 0u64;
     inc.doc.ops.retain(|_| {
       let keep = retired.peek() != Some(&index);
@@ -11680,7 +11905,7 @@ fn merge_answer(
       keep
     });
   }
-  let Some(head) = ask.head else {
+  let Some(head) = resolving_at else {
     let declaration = canonical_declaration(&inc.doc);
     let head = engine.head();
     return match rebase_answer(
@@ -12182,7 +12407,9 @@ fn submit_computed(
     files: crate::work_files::WorkFiles::default(),
     composed: Some(inc),
     computed: Some(computed),
+    held: Some(named),
     merge: None,
+    composes_here: false,
   };
   // A Subversion repository's green: the repository's landing turn before the verdict (`crate::made_commit`), or
   // `Overloaded`, unrecorded, for the forwarding node to retry; its answer waits for the made commit's step, which its

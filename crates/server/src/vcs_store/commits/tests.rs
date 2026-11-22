@@ -16,7 +16,7 @@ use slates_git::upload::Asked;
 use slates_ipc::protocol::WorkOp;
 use slates_vfs::clock::{Clock, HostClock};
 
-use super::KILL_BEFORE_MADE_COMMIT;
+use super::{KILL_BEFORE_MADE_COMMIT, MAP_TURNS, TEST_MAP_BUDGET};
 use super::{MADE, UNMADE};
 use crate::state::ShardState;
 use crate::vcs_store::green_key;
@@ -272,13 +272,25 @@ fn tree_counters(state: &ShardState, repository: RepositoryId) -> TreeCounters {
 }
 
 /// Each record of `repository`'s register past the first `skip`: its moves, and its objects' types in order.
-fn recorded(state: &ShardState, repository: RepositoryId, skip: usize) -> Vec<RecordFacts> {
+fn recorded(state: &mut ShardState, repository: RepositoryId, skip: usize) -> Vec<RecordFacts> {
   records(state, repository)
     .iter()
     .skip(skip)
     .map(|bytes| {
       let record = Record::decode(bytes, FORMAT).expect("a record");
-      let kinds = record.names.iter().map(|name| name.0).collect();
+      // Version 5 keeps its names as a content (C5): read from the shard's content store.
+      let kinds = record
+        .named
+        .and_then(|(identity, count)| {
+          // Read with the shard's chunk store lent, where the names' windows are kept.
+          let lent = crate::vcs_store::Lent::new(&mut state.store, &mut state.vcs_stores);
+          let content = lent.stores.content()?;
+          crate::vcs_store::record_names::names_from_content(content, &identity, count).ok()
+        })
+        .unwrap_or_default()
+        .iter()
+        .map(|name| name.0)
+        .collect();
       (record.moves, kinds)
     })
     .collect()
@@ -1019,5 +1031,105 @@ fn t_c5b_p3_a_kill_between_a_made_commits_landing_and_its_step_recovers_to_befor
     (after_retry, newest),
     ((1, 1, held + 1, true), Some(5u32.to_le_bytes().to_vec())),
     "the retry landed once, recorded version 5, and answered"
+  );
+}
+
+/// Shape: the files each version of [`t_a824_a_made_commits_map_is_put_a_slice_a_turn_over_the_preview`] makes or
+/// changes: enough that a version put whole in one turn is told from one put a path a turn.
+const SLICED_FILES: usize = 8;
+
+/// A-824's owed piece (main's order of 2026-11-21: the change step over the preview, sliced). Do: on a store-backed
+/// daemon, each made commit's map turn given no budget (one path a turn, whatever the machine's load), submit as a
+/// client's recorded requests a root's first version making [`SLICED_FILES`] files, then a version changing every one
+/// of them; wait for each to be answered; clone `main`. Expect: each version's map put in at least as many turns as it
+/// has files (the root's first whole, the second over its change), and the clone holding every file with the second
+/// version's bytes. Before, each version's map was stepped over the preview in one turn, whatever its size.
+#[test]
+fn t_a824_a_made_commits_map_is_put_a_slice_a_turn_over_the_preview() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let seen = crate::test_store::run_on_first(
+    &daemon,
+    || async move {
+      TEST_MAP_BUDGET.with(|budget| budget.set(Some(0)));
+      let (repository, green) =
+        crate::state::with_state(|state| git_repository(state, "sliced-made")).expect("the state");
+      let mut turns = Vec::new();
+      for (sequence, word) in [(1u32, "one"), (2, "two")] {
+        let id = slates_wire::request::RequestId {
+          client: 7,
+          sequence,
+        };
+        let before = crate::state::with_state(|state| {
+          let ask = crate::vcs_store::paths::tests::ask;
+          let made = ask(
+            state,
+            slates_ipc::protocol::RequestBody::CreateWork {
+              green,
+              name: format!("work-{word}"),
+            },
+          );
+          let slates_ipc::protocol::ReplyBody::WorkCreated { id: work, .. } = made else {
+            panic!("no work: {made:?}");
+          };
+          for at in 0..SLICED_FILES {
+            let path = format!("/f{at}");
+            let old_len = if sequence == 1 {
+              0
+            } else {
+              "one\n".len() as u64
+            };
+            ask(
+              state,
+              slates_ipc::protocol::RequestBody::Edit {
+                work,
+                path,
+                at: 0,
+                delete_len: old_len,
+                bytes: format!("{word}\n").into_bytes(),
+              },
+            );
+          }
+          let before = count(state, MAP_TURNS);
+          crate::verbs::run_recorded_for_test(
+            state,
+            (7, id),
+            &owner(),
+            crate::identities::authored(work, word),
+          );
+          before
+        })
+        .expect("the state");
+        let deadline = slates_rt::futures::now_ns()
+          .saturating_add(u64::try_from(MADE_PATIENCE.as_nanos()).unwrap_or(u64::MAX));
+        while !crate::state::with_state(|state| completed(state, 7, id)).unwrap_or(false)
+          && slates_rt::futures::now_ns() < deadline
+        {
+          slates_rt::futures::yield_now().await;
+        }
+        turns.push(crate::state::with_state(|state| count(state, MAP_TURNS) - before).unwrap_or(0));
+      }
+      let files = crate::state::with_state(|state| cloned(state, repository, "main").files)
+        .expect("the state");
+      (turns, files)
+    },
+    MADE_PATIENCE,
+  );
+  daemon.stop();
+  let (turns, files) = seen;
+  assert!(
+    turns.iter().all(|turns| *turns >= SLICED_FILES as u64),
+    "each version's map put a path a turn: {turns:?}"
+  );
+  let expected: Vec<(String, Mode, Vec<u8>)> = (0..SLICED_FILES)
+    .map(|at| (format!("f{at}"), Mode::File, b"two\n".to_vec()))
+    .collect();
+  let expected: Vec<(&str, Mode, &[u8])> = expected
+    .iter()
+    .map(|(path, mode, bytes)| (path.as_str(), *mode, bytes.as_slice()))
+    .collect();
+  assert_eq!(
+    files,
+    listing(&expected),
+    "the clone holds the second version"
   );
 }

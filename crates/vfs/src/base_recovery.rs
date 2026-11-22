@@ -226,6 +226,7 @@ impl BasePlane {
           Listing {
             dir: directory.source.is_empty().then_some(root),
             recorded: (!directory.source.is_empty()).then_some(directory.fingerprint),
+            used: false,
             source: directory.source.clone(),
             fingerprint: None,
             entries: None,

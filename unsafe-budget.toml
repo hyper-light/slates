@@ -247,7 +247,10 @@
 #   by BLAKE3.
 
 [budget]
-slates-machine = 101
+slates-machine = 104
+# 2026-11-21 (+3, A-837 part 2, one a platform): `descriptors.rs`, the learned descriptor ceiling counted without a
+#   descriptor: macOS `proc_pidinfo(PROC_PIDLISTFDS)` sized with no buffer, Windows `GetProcessHandleCount`, and Linux
+#   the close of the spare descriptor its count gives up (an `OwnedFd` remade from the raw one the module alone holds).
 # 2026-11-21 (+4, A-831, macOS only; 97 -> 101): `time_constraint.rs`, Mach's THREAD_TIME_CONSTRAINT_POLICY, which no
 #   crate the workspace takes wraps: the `unsafe extern` block (mach_timebase_info, thread_policy_set/get), the
 #   `thread_policy_set` call in `set_current`, the `thread_policy_get` call in `holds`, and `mach_timebase_info` in

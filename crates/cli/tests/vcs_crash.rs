@@ -973,14 +973,23 @@ impl Hg {
     ended.out
   }
 
-  /// The changeset `default` names at `url`, in full (`hg identify --debug`); `Err` with what hg said when it could not
-  /// answer.
+  /// The changeset `default` names at `url`, in full (`hg identify --debug --id`), read by [`hg_node`]; `Err` with
+  /// what hg said when it could not answer, or named no node.
   fn remote_head(&self, dir: &str, url: &str) -> Result<String, String> {
-    let ended = self.run(dir, &["identify", "--debug", "-r", "default", url]);
+    let ended = self.run(dir, &["identify", "--debug", "--id", "-r", "default", url]);
     if ended.code != Some(0) {
       return Err(format!("{ended:?}"));
     }
-    Ok(ended.out.split_whitespace().next().unwrap_or("").to_owned())
+    hg_node(&ended.out)
+  }
+
+  /// The changeset `rev` names in the repository at `dir`, in full (`hg log -T '{node}'`), read by [`hg_node`].
+  fn node(&self, dir: &str, rev: &str) -> Result<String, String> {
+    let ended = self.run(dir, &["log", "-r", rev, "--template", "{node}\\n"]);
+    if ended.code != Some(0) {
+      return Err(format!("{ended:?}"));
+    }
+    hg_node(&ended.out)
   }
 
   /// `Ok` when a clone of `url` passes `hg verify`, else what failed.
@@ -1005,6 +1014,24 @@ impl Hg {
   }
 }
 
+/// Format: the hex digits of a full Mercurial node (SHA-1, 20 bytes).
+const HG_NODE_HEX: usize = 40;
+
+/// The one full node in `out`, a word of [`HG_NODE_HEX`] hex digits on a line of its own words: what hg printed for a
+/// node, whatever else the command around it printed (`uvx` prints a `using ...` line ahead of hg's answer, which the
+/// first sweeps took for the node: main's round of 2026-11-21 on the big Studio). `Err` naming the output unless
+/// exactly one such word is there.
+fn hg_node(out: &str) -> Result<String, String> {
+  let nodes: Vec<&str> = out
+    .split_whitespace()
+    .filter(|word| word.len() == HG_NODE_HEX && word.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    .collect();
+  match nodes.as_slice() {
+    [node] => Ok((*node).to_owned()),
+    _ => Err(format!("hg named no single node: {out:?}")),
+  }
+}
+
 /// A local hg repository holding `before`, one small file, and `after` on top, the large payload.
 fn hg_work(hg: &Hg, scratch: &Scratch) -> Work {
   let dir = format!("{}/hg-work", scratch.path);
@@ -1013,11 +1040,11 @@ fn hg_work(hg: &Hg, scratch: &Scratch) -> Work {
   write_file(&format!("{dir}/first"), b"before\n");
   hg.ok(&dir, &["add", "first"]);
   hg.ok(&dir, &["commit", "-m", "before"]);
-  let before = hg.ok(&dir, &["log", "-r", ".", "--template", "{node}"]);
+  let before = hg.node(&dir, ".").expect("the before changeset");
   write_payload(&dir);
   hg.ok(&dir, &["add", "payload"]);
   hg.ok(&dir, &["commit", "-m", "after"]);
-  let after = hg.ok(&dir, &["log", "-r", ".", "--template", "{node}"]);
+  let after = hg.node(&dir, ".").expect("the after changeset");
   Work { dir, before, after }
 }
 
@@ -1172,18 +1199,12 @@ fn an_hg_clone_killed_at_any_point_leaves_the_repository_whole_and_a_retry_clone
     let clone = hg.spawn(&scratch.path, &["clone", "-U", &url, &into]);
     let (killed, successor) = served.crash_at(clone.started, delay, pid);
     let ended = clone.end();
-    let cloned_at = (ended.code == Some(0)).then(|| {
-      hg.run(&into, &["log", "-r", "default", "--template", "{node}"])
-        .out
-    });
+    let cloned_at = (ended.code == Some(0)).then(|| hg.node(&into, "default"));
     let head = hg.remote_head(&scratch.path, &url);
     let verified = hg.verified(&scratch, &url, &format!("clone-{point}-after-crash"));
     let again = format!("{}/clone-{point}-again", scratch.path);
     let retry = hg.run(&scratch.path, &["clone", "-U", &url, &again]);
-    let retried_at = (retry.code == Some(0)).then(|| {
-      hg.run(&again, &["log", "-r", "default", "--template", "{node}"])
-        .out
-    });
+    let retried_at = (retry.code == Some(0)).then(|| hg.node(&again, "default"));
     eprintln!(
       "POINT hg clone {point}/{count} kill at {delay:?} (pid {killed} -> {successor:?}): client {:?} in {:?} \
        ({:?}); default {}; verify {}; retry {:?}",
@@ -1213,12 +1234,12 @@ fn an_hg_clone_killed_at_any_point_leaves_the_repository_whole_and_a_retry_clone
       );
     }
     if let Some(node) = &cloned_at
-      && *node != work.after
+      && node.as_deref() != Ok(work.after.as_str())
     {
       faults.add(
         point,
         delay,
-        format!("the clone succeeded at {node}, not after"),
+        format!("the clone succeeded at {node:?}, not after"),
       );
     }
     if ended.code.is_none() {
@@ -1228,7 +1249,7 @@ fn an_hg_clone_killed_at_any_point_leaves_the_repository_whole_and_a_retry_clone
         format!("the client hung past {PATIENCE:?}: {ended:?}"),
       );
     }
-    if retried_at.as_deref() != Some(work.after.as_str()) {
+    if retried_at.as_ref().and_then(|node| node.as_deref().ok()) != Some(work.after.as_str()) {
       faults.add(
         point,
         delay,

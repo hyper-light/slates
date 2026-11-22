@@ -1033,9 +1033,13 @@ impl Daemon {
     // The node's sealing root (A-92): adopted from the previous daemon under this anchor, or made and published into
     // the anchor's locked page; sealing reports itself unavailable, never unlocked, where the OS refuses the lock.
     let sealing = crate::seal_keys::init(&mut segment, config.seal_key_slots);
-    if let Some((was, now)) = limits::raise_descriptor_limit() {
-      slates_machine::log_line!("slates-server: descriptor limit raised from {was} to {now}");
-    }
+    // The descriptor backstop (A-837; Ada 2026-11-21, "a way to avoid descriptor exhaustion"): the soft RLIMIT_NOFILE
+    // raised to the most the platform allows before any shard opens a descriptor, its inputs and outcome logged as the
+    // boot profile's other derived values are.
+    log_descriptor_raise(
+      "slates daemon",
+      slates_machine::facts::raise_descriptor_limit(),
+    );
     let retained = crate::retention::load(&segment)?;
     // The writer every shard's log lines go through (A-305): a shard never waits on standard error, where a thread
     // starved while it held the lock every line takes, or a reader slow to take a line, held a shard a window and the
@@ -5324,6 +5328,8 @@ pub(crate) async fn seal_idle_content() -> bool {
   if aged.is_none() {
     return true;
   }
+  // Idle base directories give their descriptors back first (A-838): a pass that kept any is not settled.
+  let directories_idle = crate::idle_sweep::close_idle_directories().await;
   let mut sealed_this_tick = 0u64;
   loop {
     let turn = state::with_state(|s| {
@@ -5383,7 +5389,7 @@ pub(crate) async fn seal_idle_content() -> bool {
       .any(|(_, slot)| slot.volume.sweep_owes())
   })
   .unwrap_or(false);
-  purged && !owes
+  purged && !owes && directories_idle
 }
 
 /// The idle shard's emptied write log, its pages given back (`crate::write_log::WriteLog::purge`).
@@ -7145,62 +7151,26 @@ fn start_shards_route(
 #[cfg(target_os = "macos")]
 const SHARDS_ROUTE_UNBOUND: &str = "shards.route_unbound";
 
-/// Raises this process's soft descriptor limit to the hard one (no privilege needed); `(before, after)` when it changed.
-/// The daemon calls it at start; the anchor too, since it holds a duplicate of every FUSE device and NFS connection
-/// the daemon hands it (A-61, A-113) — at a shell's soft limit (256 on macOS) it refused holds far below its bound.
-pub fn raise_descriptor_limit() -> Option<(u64, u64)> {
-  limits::raise_descriptor_limit()
-}
-
-mod limits {
-  //! The process's descriptor limit: every client costs descriptors (its region, its control
-  //! channel, its completion signal), and the derived client bound (AC-2.6) is far above the
-  //! soft limit a shell hands out; the daemon raises its own soft limit to the hard one, which
-  //! needs no privilege. Paired `#[cfg]` functions, one signature.
-
-  /// Raises the soft limit to the hard one; `(before, after)` when it changed.
-  #[cfg(unix)]
-  pub(super) fn raise_descriptor_limit() -> Option<(u64, u64)> {
-    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
-    let limit = getrlimit(Resource::Nofile);
-    let current = limit.current?;
-    let maximum = limit.maximum.unwrap_or(u64::MAX);
-    let wanted = platform_cap(maximum);
-    if wanted <= current {
-      return None;
-    }
-    setrlimit(
-      Resource::Nofile,
-      Rlimit {
-        current: Some(wanted),
-        maximum: limit.maximum,
-      },
-    )
-    .ok()?;
-    Some((current, wanted))
-  }
-
-  /// Format: macOS `OPEN_MAX` (`<sys/syslimits.h>`): `setrlimit` refuses a soft descriptor
-  /// limit above it even when the hard limit is unlimited.
-  #[cfg(target_os = "macos")]
-  const MACOS_OPEN_MAX: u64 = 10_240;
-
-  /// macOS caps the soft limit at `OPEN_MAX`.
-  #[cfg(target_os = "macos")]
-  fn platform_cap(maximum: u64) -> u64 {
-    maximum.min(MACOS_OPEN_MAX)
-  }
-
-  #[cfg(all(unix, not(target_os = "macos")))]
-  fn platform_cap(maximum: u64) -> u64 {
-    maximum
-  }
-
-  /// Windows has no per-process handle limit to raise.
-  #[cfg(not(unix))]
-  pub(super) fn raise_descriptor_limit() -> Option<(u64, u64)> {
-    None
-  }
+/// Logs what raising the descriptor limit did (A-837) as the boot profile logs a derived value: the soft limit before,
+/// the hard limit, the platform's cap, the soft limit after, and whether the kernel refused. The daemon calls it at its
+/// start; the anchor too, since it holds a duplicate of every FUSE device and NFS connection the daemon hands it
+/// (A-61, A-113): at a shell's soft limit (256 on macOS) it refused holds far below its bound.
+pub fn log_descriptor_raise(who: &str, raise: slates_machine::facts::DescriptorRaise) {
+  let raise = slates_machine::derived!(
+    raise,
+    "the soft RLIMIT_NOFILE raised at start to min(hard limit, the platform's cap), never lowered; Windows has none",
+    [
+      "rlimit.nofile",
+      "fs.nr_open (Linux)",
+      "kern.maxfilesperproc (macOS)"
+    ]
+  );
+  slates_machine::log_line!(
+    "{who}: descriptor_limit = {:?}: {} (anchors {:?})",
+    raise.value,
+    raise.formula,
+    raise.anchors
+  );
 }
 
 #[cfg(test)]
