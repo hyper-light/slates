@@ -424,3 +424,14 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
   slower, 19.4 s against 12.0 s.
 - Asked main to rule: (1) rederive the floor, (2) cut the import's sub-1 MiB churn, or (3) both.
 - Filed: content.purged_bytes keeps climbing during idle.
+
+## 2026-11-22 ~03:45 PST
+- The HTTPv2 `svn log` red was the test's comparison: stock svn writes XML attributes in a random hash order, even
+  against svnserve. Sorted, the outputs are identical. Fixed in 0de4c75ea; main's rerun is requested. The hang after a
+  panic is not found (asked for a `sample` of the process if it recurs).
+- Finding (2): attributed by allocation site; about 15 copies of each text.
+  - b1efa8edc (merged 9c662576f): my three cuts, and the red. `an_import_measured` gates the idle footprint at 2x what
+    is still live; it is red.
+  - The rest is routed to main for the other owners: content store, engine, push, store owner.
+- Local only: the attribution probe in svn_import/tests.rs (a test-only global allocator), not landed.
+- Waiting: main's routing, git-2000 rerun, and HTTPv2 rerun.
