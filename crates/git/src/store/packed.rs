@@ -367,12 +367,18 @@ impl Recent {
     self.bytes
   }
 
-  /// Gives back every object kept, its budget kept for the reads after (A-860: a repository gone idle holds none).
+  /// Gives back every object kept, its budget kept for the reads after (A-860: a repository gone idle holds none): every
+  /// chunk given back whole, so the pages they took go back to the OS, and the index's own room with them. The chunks'
+  /// numbers go on from past the last, so nothing named before is found in a chunk laid after.
   pub fn let_go(&mut self) {
-    self.objects.clear();
-    self.order.clear();
-    self.order.shrink_to_fit();
+    self.first = self
+      .first
+      .saturating_add(u64::try_from(self.chunks.len()).unwrap_or(u64::MAX));
+    self.chunks = VecDeque::new();
+    self.objects = HashMap::new();
+    self.order = VecDeque::new();
     self.bytes = 0;
+    self.held = 0;
   }
 
   /// Holds what is kept to `budget` bytes from now on, the oldest given back to fit.
@@ -653,4 +659,102 @@ pub fn raw_entry(
     data,
     end,
   })
+}
+
+#[cfg(test)]
+mod recent_tests {
+  use super::{InPack, Recent};
+  use crate::object_name::Kind;
+  use slates_vcs::ContentId;
+
+  /// The entry at `offset` of one pack.
+  fn at(offset: u64) -> InPack {
+    InPack {
+      pack: ContentId([1; 32]),
+      len: u64::MAX,
+      offset,
+    }
+  }
+
+  /// The chunks' length these tests lay objects in.
+  fn chunk() -> usize {
+    slates_mem::large::floor()
+  }
+
+  /// Goal 93 (main 01a20182 04:56, rule 3: a range overwritten is a typed miss, never another's bytes). Do: with a budget
+  /// of two chunks, keep objects of a quarter chunk each, each its own bytes, until five chunks' worth have been kept;
+  /// then read each back. Expect: the newest read back byte for byte; the oldest, whose chunks went, found nowhere (none
+  /// read from a chunk laid after); what is kept never past the budget.
+  #[test]
+  fn an_object_whose_chunk_went_is_a_miss_never_another_objects_bytes() {
+    let mut recent = Recent::default();
+    recent.set_budget(2 * chunk());
+    let len = chunk() / 4;
+    let objects = 20u64;
+    for n in 0..objects {
+      recent.keep(at(n), Kind::Blob, vec![u8::try_from(n).unwrap(); len]);
+      assert!(
+        recent.held <= 2 * chunk(),
+        "held {} past the budget",
+        recent.held
+      );
+    }
+    for n in 0..objects {
+      match recent.get(at(n)) {
+        Some((kind, bytes)) => {
+          assert_eq!(kind, Kind::Blob);
+          assert!(
+            bytes.iter().all(|byte| u64::from(*byte) == n),
+            "object {n}'s bytes"
+          );
+          assert!(n >= objects - 8, "object {n} kept past its chunk's going");
+        }
+        None => assert!(n < objects - 4, "the newest object {n} was given back"),
+      }
+    }
+  }
+
+  /// Goal 93 (rule 2: a large object never forces a grow-and-copy). Do: with a budget of four chunks, keep a quarter
+  /// chunk's object, then one of twice a chunk (taken whole), then one past the budget, then another small one. Expect: the
+  /// large one read back, kept as a chunk of its own (two chunks of the ring: the small one's and its own, then the small
+  /// one's after it); the one past the budget kept nowhere; nothing kept past the budget.
+  #[test]
+  fn an_object_a_chunk_long_is_its_own_chunk_and_one_past_the_budget_is_not_kept() {
+    let mut recent = Recent::default();
+    recent.set_budget(4 * chunk());
+    recent.keep(at(0), Kind::Blob, vec![1; chunk() / 4]);
+    recent.keep(at(1), Kind::Blob, vec![2; 2 * chunk()]);
+    recent.keep(at(2), Kind::Blob, vec![3; 5 * chunk()]);
+    recent.keep(at(3), Kind::Blob, vec![4; chunk() / 4]);
+    assert!(
+      recent
+        .get(at(1))
+        .is_some_and(|(_, bytes)| bytes.len() == 2 * chunk())
+    );
+    assert!(
+      recent.get(at(2)).is_none(),
+      "an object past the budget is not kept"
+    );
+    assert!(recent.get(at(3)).is_some());
+    assert!(recent.chunks.get(1).is_some_and(|chunk| chunk.whole));
+    assert!(recent.held <= 4 * chunk());
+  }
+
+  /// A-860 with the chunks (w-git's let_go): do: keep objects, let go, read one back, keep one more. Expect: nothing held
+  /// or kept after the let-go (no chunk, no index room), the old object a miss, and the new one kept under the same
+  /// budget.
+  #[test]
+  fn let_go_gives_back_every_chunk_and_keeps_the_budget() {
+    let mut recent = Recent::default();
+    recent.set_budget(2 * chunk());
+    for n in 0..6 {
+      recent.keep(at(n), Kind::Blob, vec![5; chunk() / 4]);
+    }
+    recent.let_go();
+    assert_eq!((recent.held, recent.bytes, recent.chunks.len()), (0, 0, 0));
+    assert_eq!(recent.objects.capacity(), 0);
+    assert!(recent.get(at(5)).is_none());
+    recent.keep(at(9), Kind::Blob, vec![6; chunk() / 4]);
+    assert!(recent.get(at(9)).is_some_and(|(_, bytes)| bytes[0] == 6));
+  }
 }
