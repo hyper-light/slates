@@ -507,3 +507,14 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   recovery target 59/60: a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone fails identically on
   unchanged main ("63 MiB before, 1364 MiB after, for a 256 MiB burst"), reported.
 - Disk: deleted w-interop-ceiling/target (6.0 GB); no other target of mine.
+- LEDGER (main, 2026-11-22 ~14:00): svn matrix, stock Subversion (Ubuntu apt; Homebrew), svn:// and HTTPv2, fixture
+  dump: 33/33 on ubuntu-latest, ubuntu-24.04-arm and macos-latest, every route exit 0; CI 45076697206 at main
+  cdad28748's base. Linux joins macOS for svn (beside hg 24/24, CI 45065911852).
+- LANDED 80d62a953 (2026-11-22 ~15:00 PST, main 41eabe8f8): mem ChunkArena::shrink_trading, used by vfs
+  Store::release_idle: a wholly free extent kept only for the headroom is traded for the smallest that keeps it (a
+  256 MiB burst's 1 GiB extent held after the destroy, now 16 MiB). recovery's burst test now measures the pool by its
+  own pages (content object + arenas' held extents), not process RSS (1.0 GiB of the test's own freed large blocks).
+  Red since 362bd8c39; reds: the arena unit test and the burst test with plain shrink. recovery 60/60. Bug note
+  docs/bugs/2026-11-22-a-shard-kept-a-1-gib-extent-for-10-mib-of-headroom.md.
+- NEXT (main's assignment): (b) the idle heap give-back: main's r41 separate daemon held ~1.3 GB heap resident against
+  31-60 MB live.
