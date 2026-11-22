@@ -34,31 +34,34 @@ jobs:
       - name: Build
         run: |
           W="$RUNNER_TEMP/msr"; mkdir -p "$W/logs"
-          cargo build --release --locked -p slates-client --example edit_merge_bench --example g222_floor > "$W/logs/build.log" 2>&1 || { tail -30 "$W/logs/build.log"; exit 1; }
-          cp target/release/examples/edit_merge_bench target/release/examples/g222_floor "$W/"
+          cargo build --release --locked -p slates-client --example edit_merge_bench --example g222_floor --example g222_wake_probe > "$W/logs/build.log" 2>&1 || { tail -30 "$W/logs/build.log"; exit 1; }
+          cp target/release/examples/edit_merge_bench target/release/examples/g222_floor target/release/examples/g222_wake_probe "$W/"
           echo "runner cpus $(sysctl -n hw.ncpu)"; sw_vers 2>/dev/null || true
-      - name: A/B rounds, base and arm alternating, each loaded run stamped with the control beside it
+      - name: The wake probe, every variant, three passes in rotating order
         run: |
           W="$RUNNER_TEMP/msr"; set +e
-          for round in $(seq 1 "$ROUNDS"); do
-            if [ $((round % 2)) -eq 1 ]; then ORDER="base arm"; else ORDER="arm base"; fi
-            for arm in $ORDER; do
-              if [ "$arm" = arm ]; then export G222_BELL_TB=1; else unset G222_BELL_TB; fi
-              Q="$W/logs/quiet-$arm-r$round.log"
-              perl -e 'alarm shift; exec @ARGV' 900 "$W/edit_merge_bench" --quiet-only --files 10 --form accept --form conflict </dev/null > "$Q" 2>&1
-              echo "== quiet $arm r$round exit $?"; grep -E "_quiet_total_p(99|999)\b|doorbell thread runs" "$Q" | cut -c1-160
-              L="$W/logs/loaded-$arm-r$round.log"; F="$W/logs/floor-$arm-r$round.log"
-              echo "== loaded $arm r$round $(date -u +%FT%TZ) load: $(uptime)" | tee "$L"
-              ( while [ ! -e "$W/logs/done-$arm-r$round" ]; do G222_FLOOR_TB=50000 "$W/g222_floor" 20000 0; done ) > "$F" 2>&1 &
-              CONTROL=$!
-              G222_DIAG="$W/logs/loaded-$arm-r$round.tsv" perl -e 'alarm shift; exec @ARGV' 1500 "$W/edit_merge_bench" --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict </dev/null >> "$L" 2>&1
-              echo "exit $?" >> "$L"; touch "$W/logs/done-$arm-r$round"; wait $CONTROL
-              grep -E "_loaded_total_p(99|999)\b|exit|doorbell thread runs" "$L" | sort -u | cut -c1-160
-              echo "control: p999 us $(sed -nE 's/.*p999 ([0-9.]+) us.*/\1/p' "$F" | sort -n | tr '\n' ' ' | cut -c1-200); max us $(sed -nE 's/.*max ([0-9.]+) us.*/\1/p' "$F" | sort -n | tail -1)"
-              python3 .github/g222/tailjoin.py "$W/logs/loaded-$arm-r$round.tsv" | grep -E "timed requests|p999 tail: n|wake hops|landed -> rung" | cut -c1-300
+          V=(
+            "PROBE_MECH=ulock PROBE_SHARED=1 PROBE_WAKER_TB=1 PROBE_WAITER_TB=1|2"
+            "PROBE_MECH=ulock PROBE_SHARED=0 PROBE_WAKER_TB=1 PROBE_WAITER_TB=1|2"
+            "PROBE_MECH=ulock PROBE_SHARED=1 PROBE_WAKER_TB=1 PROBE_WAITER_TB=0|2"
+            "PROBE_MECH=ulock PROBE_SHARED=1 PROBE_WAKER_TB=0 PROBE_WAITER_TB=1|2"
+            "PROBE_MECH=ulock PROBE_SHARED=1 PROBE_WAKER_TB=0 PROBE_WAITER_TB=0|2"
+            "PROBE_MECH=ulock PROBE_SHARED=1 PROBE_WAKER_TB=1 PROBE_WAITER_TB=1|0"
+            "PROBE_MECH=ulock PROBE_SHARED=1 PROBE_WAKER_TB=1 PROBE_WAITER_TB=1 PROBE_WAKERS=1|2"
+            "PROBE_MECH=ulock PROBE_SHARED=1 PROBE_WAKER_TB=1 PROBE_WAITER_TB=1 PROBE_CHURN=1|2"
+            "PROBE_MECH=sem PROBE_WAKER_TB=1 PROBE_WAITER_TB=1|2"
+            "PROBE_MECH=sem PROBE_WAKER_TB=1 PROBE_WAITER_TB=1 PROBE_CHURN=1|2"
+            "PROBE_MECH=pipe PROBE_WAKER_TB=1 PROBE_WAITER_TB=1|2"
+          )
+          for pass in 1 2 3; do
+            n=${#V[@]}
+            for k in $(seq 0 $((n - 1))); do
+              v="${V[$(( (k + pass * 4) % n ))]}"; envs="${v%|*}"; spin="${v#*|}"
+              echo "== pass $pass: $envs spinners $spin"
+              env $envs perl -e 'alarm shift; exec @ARGV' 300 "$W/g222_wake_probe" 10000 "$spin" 2>&1 | tail -2 | tee -a "$W/logs/probe.log"
             done
           done
-          true
+          echo "######## summary"; sort "$W/logs/probe.log" | grep "^probe"
       - name: Keep the logs
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
