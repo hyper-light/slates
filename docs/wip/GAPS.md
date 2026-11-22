@@ -599,6 +599,11 @@
 > answer is admitted its repository's shard room, and a refusal past it before the pack begins is held and made again
 > in a wider room, never cut (`t_…a_clone_of_git_gits_many_refs…`, `a_fetch_past_its_room_waits…`). Owed: main's git/git
 > rounds over it; the SSH edge's wait (it gives a held refusal up at once); a refusal once the pack began still cuts it.
+> A-856 BUILT (2026-11-22, w-git; main 00:30 and 01:55): an encoding's parts are charged to the content store; the task
+> behind a fetch makes fragments ahead only while a fetch is answered and within the repository's learned grant; idle,
+> what is held past the grant is given back (`t_a856_with_no_fetch_answered_nothing_is_encoded_ahead`). Owed: one deflate
+> state a shard (clients: 97 GB of fresh states over one git/git clone); fragments past the grant kept on disk under its
+> grant, not only left unmade; main's RSS round.
 > R2, the load-only edge tests, CLOSED (2026-11-21, w-git): a push's answer under side-band-64k wrote its first
 > keepalive two intervals after its body (`body_end` waited one interval unwritten, then the reply its own before
 > appending it), 10 s, the client's patience, so every push answer past 5 s failed (18 of 18 at load 24, the timing
