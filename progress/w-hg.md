@@ -296,3 +296,18 @@
     (my lean); B, all .hgtags texts kept in RAM; C, .hgtags exempt from step 2;
   - w-perf's answer on intake.rs ownership for the intake's base text (inbox/w-perf-from-w-hg-intake-base.md).
 - Target trimmed by exact paths (4 stale rlibs and .o files, 6.9 to 6.2 GB).
+
+## 2026-11-22 ~05:00 PST (w-hg, main 01a20182)
+Landed today: aff81b23b (daemon-edge reds, Works::Built uses), d93f98369 (C1 2a read-through, NotYet), 14b00683a,
+ed5c20b9d (2b part 2a: away windows ride the image), e765b8245 (LengthDiffers), 2d1399d2c (PastAdmission part 1,
+retakeable intake), ecf8840d7 (part 2, RoomWait), 858908e2c (wall), b624f67d6 (part 3 (a), known need admitted),
+dc1a69fa0 (wall for (a)).
+In flight, ruled (b1) by main 04:44: the push lands as a run of segment changesets as the import does (segments >=
+hg_import::segment_bytes, ordinary bounded landings between the intake's turns; entry names the run, v9; made path
+keeps v7; conditions: space of an abandoned run comes back, crash oracle at each segment boundary, admission = a step +
+one segment, peak RSS before/after).
+Held as patches (not landed): ~/.cache/w-hg-2b-1-works.patch (2b (1): the import's bookmark works built a unit a turn
+before its landing; green; owes its non-vacuity test that the landing took more than one turn);
+~/.cache/w-hg-2b-letgo.patch (2b: the import lets each segment's file windows go once durable; needs 2b (1) first).
+Not reproduced, logged: CI's cold-repository "push again" (log line "a push's increment held ahead was refused by the
+content store"), a wait's give-up ("a push's intake waited for room and gave up").
