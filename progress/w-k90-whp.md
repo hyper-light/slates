@@ -147,6 +147,4 @@ every profile name a run leaves behind here; no other admin steps or installs.
 - r45 (Linux, FUSE parking test) is moot (parking removed by A-795); stop it if kiln still holds it.
 
 ## For main to delete
-- adas-macbook-pro-2.local (e30189): ~/.cache/w-k90-whp-slates, ~/.cache/w-k90-whp-slates-target.noindex,
-  ~/.cache/w-k90-whp-slates2 (my scratch clone and target). The kiln server was not answering at ~15:55 PST; I will
-  delete them myself when it answers.
+- (none: adas-macbook-pro-2's ~/.cache/w-k90-whp-slates* removed by me 2026-11-21 ~16:00 PST; r45 no longer held by kiln)
