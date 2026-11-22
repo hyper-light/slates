@@ -1382,8 +1382,9 @@ fn a_mercurial_push_past_its_first_admission_waits_for_room_and_lands_whole() {
     None,
     "default",
   )]);
-  crate::repository::hg_push::TEST_FIRST_INTAKE_ROOM
-    .store(STARVED_ROOM, core::sync::atomic::Ordering::Relaxed);
+  crate::daemon::observe_at(&daemon, REPOSITORY, |_| {
+    crate::repository::hg_push::TEST_FIRST_INTAKE_ROOM.with(|first| first.set(STARVED_ROOM));
+  });
   let pushed = hg_unbundle(edge, &name, &history_bundle(&made, &[0]));
   let heads = hg_command(edge, &name, "heads");
   let counted = |name: &'static str| {
@@ -1441,7 +1442,9 @@ fn a_mercurial_push_its_store_cannot_hold_for_now_waits_for_room_and_lands_whole
     None,
     "default",
   )]);
-  crate::repository::hg_push::TEST_HOLD_REFUSED.store(true, core::sync::atomic::Ordering::Relaxed);
+  crate::daemon::observe_at(&daemon, REPOSITORY, |_| {
+    crate::repository::hg_push::TEST_HOLD_REFUSED.with(|refused| refused.set(true));
+  });
   let pushed = hg_unbundle(edge, &name, &history_bundle(&made, &[0]));
   let heads = hg_command(edge, &name, "heads");
   let waits = (0..daemon.shards().len())
