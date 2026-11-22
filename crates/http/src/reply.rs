@@ -141,7 +141,7 @@ impl Status {
 pub enum Body {
   /// `Content-Length` bytes; `Length(0)` for a reply with no body.
   Length(u64),
-  /// `Transfer-Encoding: chunked`: the body is [`chunk`]s and then [`LAST_CHUNK`].
+  /// `Transfer-Encoding: chunked`: the body is chunks ([`chunk_size_line`], the run, CRLF) and then [`LAST_CHUNK`].
   Chunked,
   /// No framing field: the body ends when the connection does (RFC 9112 §6.3 item 8), the framing an HTTP/1.0 client
   /// reads. `Connection: close` is written whatever the caller asked.
@@ -262,16 +262,33 @@ pub fn refusal(
   head(status, fields, Body::Length(0), true, out)
 }
 
-/// Writes one chunk of a chunked body: its size in hexadecimal, CRLF, `data` and CRLF. Writes nothing for no data,
-/// since a chunk of size zero would end the body: [`LAST_CHUNK`] does that.
-pub fn chunk(data: &[u8], out: &mut Vec<u8>) {
-  if data.is_empty() {
-    return;
+/// Format: the most bytes a chunk's size line takes: a `usize` in hexadecimal (two digits a byte) and its CRLF.
+pub const CHUNK_SIZE_LINE_BYTES: usize = size_of::<usize>() * 2 + CRLF.len();
+
+/// The size line of a chunk of `len` bytes, its size in lowercase hexadecimal and CRLF, written into `line` with no
+/// allocation: the bytes written, at most [`CHUNK_SIZE_LINE_BYTES`]. A writer frames a run as this line, the run itself
+/// and [`CRLF`], each handed on as it is, so a run is never copied to be framed (A-830).
+pub fn chunk_size_line(len: usize, line: &mut [u8; CHUNK_SIZE_LINE_BYTES]) -> &[u8] {
+  /// Format: the hexadecimal digits, lowercase.
+  const DIGITS: &[u8; 16] = b"0123456789abcdef";
+  let digits = usize::try_from(usize::BITS.saturating_sub(len.leading_zeros()).div_ceil(4))
+    .unwrap_or(0)
+    .max(1);
+  let mut written = 0;
+  for (at, slot) in line.iter_mut().take(digits).enumerate() {
+    let shift = (digits.saturating_sub(at).saturating_sub(1)).saturating_mul(4);
+    let nibble = len
+      .checked_shr(u32::try_from(shift).unwrap_or(u32::MAX))
+      .unwrap_or(0)
+      & 0xf;
+    *slot = DIGITS.get(nibble).copied().unwrap_or(b'0');
+    written = at.saturating_add(1);
   }
-  out.extend_from_slice(format!("{:x}", data.len()).as_bytes());
-  out.extend_from_slice(CRLF);
-  out.extend_from_slice(data);
-  out.extend_from_slice(CRLF);
+  for (slot, byte) in line.iter_mut().skip(written).zip(CRLF) {
+    *slot = *byte;
+    written = written.saturating_add(1);
+  }
+  line.get(..written).unwrap_or_default()
 }
 
 #[cfg(test)]

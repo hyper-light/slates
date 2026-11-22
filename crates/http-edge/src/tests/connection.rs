@@ -10,6 +10,13 @@ use super::{Connection, Decision, Ended, Fields, Next, Phase, StatusMode};
 use crate::credential::{Credential, credential};
 use crate::tls::{ALPN_HTTP_1_1, HttpsSession, ServingIdentity};
 
+/// What `connection` has to write, copied out as a listener writes it, and the buffer handed back.
+fn taken(connection: &mut Connection) -> Vec<u8> {
+  let bytes = connection.output().to_vec();
+  connection.written();
+  bytes
+}
+
 /// Room enough for every request these tests send but the bomb's.
 const ROOM: u64 = 1 << 24;
 
@@ -46,7 +53,7 @@ fn drive(connection: &mut Connection, pieces: &[&[u8]], script: &Script<'_>) -> 
   let (mut body, mut replies) = (Vec::new(), script.reply.iter());
   loop {
     match connection.next_step() {
-      Next::Write => seen.written.extend(connection.take_output()),
+      Next::Write => seen.written.extend(taken(connection)),
       Next::Read => match pieces.next() {
         Some(piece) => connection.receive(piece),
         None => connection.peer_closed(),
@@ -459,7 +466,7 @@ fn fail_after(runs: usize, status: Status) -> (Vec<u8>, Option<Ended>) {
   let mut sent = 0;
   loop {
     match connection.next_step() {
-      Next::Write => written.extend(connection.take_output()),
+      Next::Write => written.extend(taken(&mut connection)),
       Next::Decide => connection.decide(serve(&connection.head().unwrap())),
       Next::Reply if sent == runs => connection.fail(status),
       Next::Reply => {
@@ -514,7 +521,7 @@ fn the_phase_follows_the_exchange() {
   seen.push(step(&mut connection));
   connection.reply_end();
   seen.push(step(&mut connection));
-  connection.take_output();
+  taken(&mut connection);
   seen.push(step(&mut connection));
   let expected = [
     ("Read", Phase::Idle),
@@ -552,7 +559,7 @@ fn drive_tls(
   while !read.ends_with(b"0\r\n\r\n") {
     match connection.next_step() {
       Next::Write => {
-        let output = connection.take_output();
+        let output = taken(connection);
         let mut rest = output.as_slice();
         while !rest.is_empty() {
           client.read_tls(&mut rest).unwrap();
@@ -619,7 +626,7 @@ fn served_with_late_fields(late: Fields, after_first: bool) -> String {
   let mut late = Some(late);
   loop {
     match connection.next_step() {
-      Next::Write => written.extend(connection.take_output()),
+      Next::Write => written.extend(taken(&mut connection)),
       Next::Read if fed => connection.peer_closed(),
       Next::Read => {
         fed = true;
@@ -708,7 +715,7 @@ fn served_after_body((mode, named, after_first): Naming) -> String {
   let mut named = named;
   loop {
     match connection.next_step() {
-      Next::Write => written.extend(connection.take_output()),
+      Next::Write => written.extend(taken(&mut connection)),
       Next::Read if fed => connection.peer_closed(),
       Next::Read => {
         fed = true;
@@ -797,7 +804,7 @@ fn served_with_status(status: Status, after_first: bool) -> String {
   let mut status = Some(status);
   loop {
     match connection.next_step() {
-      Next::Write => written.extend(connection.take_output()),
+      Next::Write => written.extend(taken(&mut connection)),
       Next::Read if fed => connection.peer_closed(),
       Next::Read => {
         fed = true;
@@ -861,7 +868,7 @@ fn a_service_may_answer_no_content_with_no_framing_and_no_body() {
   let mut named = false;
   let written = loop {
     match connection.next_step() {
-      Next::Write => written.extend(connection.take_output()),
+      Next::Write => written.extend(taken(&mut connection)),
       Next::Read if fed == 2 => connection.peer_closed(),
       Next::Read => {
         fed += 1;
@@ -906,7 +913,7 @@ fn an_at_head_routes_reply_head_is_written_before_its_body_is_read() {
   let mut written = Vec::new();
   loop {
     match connection.next_step() {
-      Next::Write => written.extend(connection.take_output()),
+      Next::Write => written.extend(taken(&mut connection)),
       Next::Decide => connection.decide(Decision::Serve {
         fields: fields(&[("Content-Type", "application/x-git-receive-pack-result")]),
         head_only: false,
@@ -922,7 +929,7 @@ fn an_at_head_routes_reply_head_is_written_before_its_body_is_read() {
   let mut ended = false;
   loop {
     match connection.next_step() {
-      Next::Write => written.extend(connection.take_output()),
+      Next::Write => written.extend(taken(&mut connection)),
       Next::Body(_) => connection.body_taken(),
       Next::BodyEnd => {}
       Next::Reply if !ended => {
@@ -958,7 +965,7 @@ fn an_at_head_route_writes_an_interim_run_while_its_body_is_read() {
   let mut interim_sent = false;
   loop {
     match connection.next_step() {
-      Next::Write => written.extend(connection.take_output()),
+      Next::Write => written.extend(taken(&mut connection)),
       Next::Decide => connection.decide(Decision::Serve {
         fields: fields(&[("Content-Type", "application/x-git-receive-pack-result")]),
         head_only: false,
@@ -979,7 +986,7 @@ fn an_at_head_route_writes_an_interim_run_while_its_body_is_read() {
   connection.receive(b"defghij");
   loop {
     match connection.next_step() {
-      Next::Write => written.extend(connection.take_output()),
+      Next::Write => written.extend(taken(&mut connection)),
       Next::Body(_) => connection.body_taken(),
       Next::BodyEnd => {}
       Next::Reply => connection.reply_end(),

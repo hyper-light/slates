@@ -494,6 +494,24 @@
 >     7.2 streams the imported repository and verifies it clean.
 > - The two recovery tests that polled a register-held import record by hand are gone with that path; the restart test
 >   holds the run's recovery.
+> **C1 step 2 for the import, the import keeping no file text (main 01a20182's ruling of 2026-11-22 00:05). IN FLIGHT.**
+> - 2a BUILT (2026-11-22, w-hg): the read-through. `slates_merge::push::Unavailable::NotYet`, a blob the store holds
+>   but has not at hand: the sliced build (`Building`) takes the unit that read it again once its owner fetched it
+>   (`Building::waiting`); the posting's file reads are taken again, a one-call `build` is refused with it. Mercurial's
+>   work (`push::tree`) answers `NotYet` for a held file revision whose text is not at hand and tells its length from its
+>   row (`Held::file_bytes_len`), asks the node's changeset store for it through `StoreWants` (`WorkBuild::ask_waited`,
+>   rows then text), and the push's driver brings it back into the content store by its row's identities
+>   (`hg_push::built_works`, `push::held::bring_back_file`, `ContentStore::bring_back_object`; counted
+>   `vcs.hg.push_work_texts_read`). Held by `merge push::tests::a_build_waits_for_each_blob_not_at_hand_and_takes_its_unit_again`
+>   (red without the wait: refused `NotYet`), `hg push::work_tests::a_work_reading_texts_not_at_hand_waits_and_asks_the_store_for_each`
+>   (red with `Missing` for `NotYet`) and `vcs content::an_object_let_go_is_brought_back_whole_by_its_own_bytes`.
+>   Nothing is let go yet, so no behaviour changes until 2b.
+> - 2b, next: each import segment's file windows marked landed and let go once the segment is durable; a symlink's
+>   target read again in the walk; main's red (after a fixture import `ContentStore::used` is the changelog's and the
+>   manifests' bytes alone; a clone and a push over the import verify clean against stock 7.2).
+> - IN FLIGHT, the immediately next piece (main's ruling: the import's resident bound reached in two consecutive
+>   pieces): the changelog's and the manifests' texts off the content store too, read through the store as file texts
+>   are.
 > Owed (C1's remaining steps, main's order): step 1, file texts read through the store; step 2, the intake keeping no
 > whole text. Then w-perf measures R2.
 > - a clone's file revisions served from the Texts rows.
@@ -576,6 +594,11 @@
 > (`t_a850_r16_…`). Owed: main's git/git rounds over it; an atomic push's moves meet no base among each other; a fetch's
 > plan does not follow a base (a want of a tag made at one is answered by the walk); bug (1), a fetch cut short while
 > the encoding runs, is next.
+> A-855 BUILT (2026-11-22, w-git; main 01a20182 00:26): bug (1). A fetch's answer was admitted one client region
+> (256 KiB), whatever its repository; git/git's 1,019 tags outgrew it and the pack ended with git's abort words. Now an
+> answer is admitted its repository's shard room, and a refusal past it before the pack begins is held and made again
+> in a wider room, never cut (`t_…a_clone_of_git_gits_many_refs…`, `a_fetch_past_its_room_waits…`). Owed: main's git/git
+> rounds over it; the SSH edge's wait (it gives a held refusal up at once); a refusal once the pack began still cuts it.
 > R2, the load-only edge tests, CLOSED (2026-11-21, w-git): a push's answer under side-band-64k wrote its first
 > keepalive two intervals after its body (`body_end` waited one interval unwritten, then the reply its own before
 > appending it), 10 s, the client's patience, so every push answer past 5 s failed (18 of 18 at load 24, the timing
@@ -1122,6 +1145,24 @@
 > through it (clone over HTTP and SSH, round trips, forced heads). Owed: file revisions, which the store keeps whole,
 > go the same way once the changeset shape keeps them as Mercurial's deltas. And the clone's time against stock's
 > 283 s, measured again, release.
+> **Three hg pushes and clones through the daemon's HTTP edge red on main, and a rekey flake (2026-11-22, w-hg; main
+> 01a20182's order of 00:26, found by w-git at b099adee4). FIXED.**
+> - `vcs_http::daemon_edge` `a_mercurial_push_larger_than_one_ring_region_lands_through_the_daemons_edge` (and the
+>   clone and stream clone that read it): the push answered `push refused: its works were built for another plan than
+>   its landing's`. My c34fee871 built each work once before the landing (`Works::Built`), and the landing took a work
+>   out of the built set at its first use; a push whose line and the bookmark made at it share one work (one key, two
+>   changes) found it gone at its second. Now `Works::Built` counts each work's uses from the plan (`uses_of`): every use
+>   but the last is lent a copy, the last takes it.
+> - `vcs_ssh::tests::hg::a_rekey_during_a_blocked_write_sends_no_byte_twice` failed about 1 run in 8 under the
+>   parallel suite, the session refused `Transport(Unexpected { number: 93 })`: the test client sent a channel's
+>   window adjust between its own KEXINIT and its NEWKEYS, which RFC 4253 §7.1 forbids and the server refuses, rightly.
+>   The test client (`crates/ssh/src/tests/client.rs`) now holds upper-layer messages over that span, as OpenSSH does
+>   (0 of 12 runs after). Beside it, the edge polls the session's due timer in every pass (`Link::pass`), so a session
+>   whose writes never block still replaces its keys on time, and the test's reads are patient (the bytes, not the
+>   latency, are its subject).
+> - Not mine, reported: `git_push::tests::t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time` fails its
+>   "turns go on while no one waits" ratio alone at load 40 on this Mac (1,505 turns for 7,046 quanta); its own comment
+>   records the same assertion's load sensitivity.
 > **An SSH clone of a large revision spun its shard past the watchdog (2026-11-21, w-hg; main 01a20182's fixture round
 > at a3e673efc: 91 of 92, `ssh clone-after` cut, "stream ended unexpectedly (got 8113614 bytes, expected 16777334)").
 > FIXED.** Reproduced by a reduced lane (fixture; SSH push, push-head, -f, -B, a draft and tag, then clone; debug):
@@ -2696,6 +2737,17 @@
 > Since A-713 (fetch admission) the v1.0.0 cut passes 26 of 27 (clone, deepen and partial clone among them; the 27th
 > the script's tag row, since fixed); cut at v2.0.0 (56 MB) the push still spins shard 0 and the daemon is killed
 > (main 168ddfa, debug, Mac Studio). hg after A-711 and A-696: 17 of 24, its pushes of hg's history spinning alike.
+> **A-830, the clone's memory by site (clients, 2026-11-22):** main's r6 at a3e673efc (git/git v2.0.0, release, big
+> Studio) is red: a 55,871,063-byte pack peaks at 965 MiB in the push, holds 712 MiB after it and 2,113 MiB after the
+> clone. Attributed with a local live-block and churn recorder (never landed): after the clone, A-718's encode_behind
+> holds each part whole (`slates_git::store::encoding` `Part.bytes`, 2.5 GB live in 4 blocks), and the run makes
+> 116,736 MiB in blocks of 16 KiB or more, 97 GB of it a fresh deflate state per object per trial (`store/fragment.rs`
+> `deflating`, upload's stream and the encoder), which malloc keeps dirty: w-git's files (inbox
+> clients-clone-churn). Fixed here: the HTTP edge's per-run copy, 4,145 MiB in 33,170 blocks over the clone; each run
+> is framed straight into the connection's kept output (`Connection::output` and `written`; the size line from the
+> stack, `reply::chunk_size_line`), `crates/http-edge/tests/reply_allocations.rs` 256 allocations over 64 runs before,
+> 0 after (macOS arm64, this Mac, local). Owed: w-git's encoder and stream (one deflate state a part, parts streamed
+> into the content store), then main's r6 again.
 > **A-830, the git server's memory held to the change (clients, 2026-11-21; Ada's MEMORY SIZING ruling):**
 > `the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the_history` (`crates/cli/tests/
 > git_interop.rs`) holds the daemon's resident set at its peak and settled after a push and a clone to the warm-up's
@@ -3495,8 +3547,11 @@
 > what the import still holds live. Cut so far (w-svn's sites): the importer's text buffer sized once from its header,
 > admitted first; a stored text streamed into the increment from the store's lent windows, not read back whole; the
 > landing's store pieces lent. Owed: the other owners' copies (the content store's `put_window` and `release_one`; the
-> engine's `judge_held`, two `push_slice`, `Increment::encode`, `chain_entry::encode_carrying`; the changeset landing's
-> owned pieces, `slates_store::owner::SlicedLanding::part`), then A-742's floor re-derived by a release A/B only if the
+> engine's `judge_held`, two `push_slice`, `Increment::encode`, `chain_entry::encode_carrying`), then A-742's floor
+> re-derived by a release A/B only if the footprint still stays (main's ruling). The changeset landing's piece copies
+> are cut too (w-svn, main's routing of 00:57): `slates_store::owner::SlicedLanding::part` answers its buffer emptied
+> once written, and the svn landing fills one buffer a landing (`a_sliced_landings_part_gives_its_buffer_back_to_be_filled_again`).
+> Still to measure: the A-742 floor's A/B only if the
 > footprint still stays (main's ruling). A local 64 KiB floor gave 47 MB of footprint at 2 s idle, against 363 MB, at
 > 19.4 s against 12.0 s (debug).
 > **A-822's commit held the shard past its watchdog; A-835 slices it (2026-11-21, w-svn; main's ruling of 12:43).**

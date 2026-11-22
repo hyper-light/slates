@@ -12352,7 +12352,12 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
    the protocol's order needs them (the missing set), charged as below.
 2. *Admission charges the slice in flight.* Each slice's bytes are charged to the request's room as they are made and
    given back once sent; the tables of rule 1 are charged once, at the start. The answer's whole size never meets the
-   room, so a request's room bounds a slice, never a repository.
+   room, so a request's room bounds a slice, never a repository. The request's own bytes are held to the edge's request
+   room (one region); its answer, whose tables grow with the repository's objects and wants, is admitted what its
+   repository's shard admits it (A-724's share), never one region (A-855: git/git's clone of 1,019 tags outgrew a
+   region's 256 KiB). A refusal past that room before the pack begins costs time, never an answer: the answer is held,
+   made again in a wider room once the shard gives one, passing over what it wrote, and refused as before only past the
+   daemon's observation budget.
 3. *Every slice runs a turn at a time* under the shard's step quantum (§4.3), the repository's view lent for that turn
    alone; a yield between slices.
 4. *Fetches run concurrently, one repository's too.* A fetch reads the index as it stood when it began (a hold on that
@@ -60583,3 +60588,41 @@ Status: built 2026-11-21, macOS arm64 (focused tests); main's load_bench A/B owe
   `a_held_increments_entry_encodes_to_its_golden_bytes` (format 7's two shapes, byte for byte).
 - Open: the 1 MiB bound is a judgment, not a measured crossover (a sweep across it is owed). The held path keeps its
   whole-shard publication for increments above it.
+
+### A-855 — A fetch's answer is admitted its repository's room, and one past it waits, never cut (bug, 2026-11-22, w-git for UI goal 93; main 01a20182's rulings of 21:35 PST 2026-11-21 and 00:26 PST: "a refusal costs time, never an answer"; §4.17.1 "A fetch's answer" rule 2, A-745, A-724)
+Applied in the same change to:
+- `crates/server/src/vcs_http/git/upload.rs`: an answer admitted its repository's shard room, the request's body still
+  the edge's request room; `Upload::wait_for_room` (made again in a wider room, counted `vcs_http.git.answered_again`;
+  a keepalive interval a wait; given up past `ROOM_PATIENCE_NS`, the observation budget).
+- `crates/server/src/vcs_ssh/git.rs`, `crates/server/src/vcs_ssh/site.rs`: an answer admitted its shard room; the
+  command's dead request room removed.
+- `crates/git/src/upload/answer.rs`: `Answer::holding`, `held`, `written`, `skip_written`, `give_up`: a refusal past its
+  room before the pack's source begins (the request read, the negotiation, the sections' charges, the source's begin)
+  held, its words kept unwritten; an answer made again passes over what the client has.
+- `crates/server/src/vcs_store/upload.rs`: a test's room script (`ROOMS`, tests only).
+- §4.17.1 rule 2; GAPS (§4.17).
+
+- **Found by use.** r16-git on the big Studio (release b099adee4, A-850 merged; git/git f7de814569, 1,019 tags): `git
+  clone` over HTTP and SSH aborted "remote: aborting due to possible repository corruption on the remote side"; the
+  anchor's log named `Negotiation(PastAdmission { asked: 7912, left: 283 })` (w-sessionlog's rerun of 2026-11-21).
+- **Cause.** Each edge admitted an answer `min(request room, shard room)`, the request room one client region: 32 slots
+  × 2 × 4,096 bytes, 256 KiB (Studio-2's anchor log: `slots_per_ring = 32`; its shards had GiBs free). The answer's walk
+  keeps tables of a bit or a word an object and a few words a want (rule 1): 148,343 bytes for 506 tags of a 1,012-commit
+  line, 151,007 for 4,048 commits, 164,807 for 1,019 tags (unit probes, this Mac); git/git's history and positions over
+  many landings take more, past 256 KiB at 506 tags and not at 253. So waiting could never have helped: the bound was a
+  constant, and a refusal after the `packfile` header ended the pack with git's abort words.
+- **Change.** An answer is admitted its repository's room on its shard; the edge's room still bounds the request's own
+  bytes. A refusal past that room before the pack's source begins is held, not answered; the edge re-asks the room each
+  turn (a keepalive written meanwhile) and, once it has grown, makes the answer again over the same generation within it,
+  passing over the bytes it wrote (the same answer, byte for byte, under that generation); past the observation budget
+  the refusal is answered as before. A refusal once the pack's source began is unchanged: its bytes are out.
+- **Tests.** `slates-server` `vcs_http::daemon_edge::tests::a_clone_of_git_gits_many_refs_is_answered_whole_over_the_daemons_edge`
+  (1,019 tags of a line through the daemon's edge, its region a quarter of the derived one, the answer measured past the
+  edge's room: `200`, every object, no abort; red with the one-region room) and
+  `a_fetch_past_its_room_waits_for_more_and_is_answered_whole` (the shard's next room the request's length: `200`, every
+  object, answered again once, refused never; red without the hold: the answer an `ERR` line); `slates-git`
+  `upload::tests::clone::a_clone_held_past_its_room_and_answered_again_in_a_wider_one_is_the_whole_answer` (small.git's
+  stock clone held at the widest room that holds it, made again whole byte for byte, an answer passing over each count of
+  bytes through its `packfile` header, given up answered as before).
+- **Left** (GAPS): the SSH edge admits an answer its shard room but does not yet wait (a held refusal there is given up
+  at once); a refusal once the pack's source began still ends the pack.

@@ -3,7 +3,10 @@
 //! <repo>/git-upload-pack` answered as `git upload-pack --stateless-rpc` answers one, its request held whole once its
 //! body has ended (upload-pack reads a command request whole, `Asked::Request`) and charged to the request's room: the
 //! edge's request room, or what the repository's shard could admit when the request began where that is less
-//! ([`StoreLender::room`], A-713). A fetch fits it whatever the repository's size (A-745, §4.17.1 "A fetch's answer"): it
+//! ([`StoreLender::room`], A-713). Its answer is admitted what the repository's shard admits it, never one region
+//! (A-855: its walk's tables grow with the repository); one refused past that room before its pack begins is held and
+//! made again once the shard gives more (`Upload::wait_for_room`), never cut. A fetch fits it whatever the repository's
+//! size (A-745, §4.17.1 "A fetch's answer"): it
 //! is answered in turns (`slates_git::upload::serve_in_turns`), its pack's objects chosen a unit at a time within the
 //! shard's step quantum as the answer is written (`Answer::write_within`, the pack source's `turn`), its sets kept as
 //! runs or bits and its pack framed in packets sized from the room.
@@ -43,6 +46,16 @@ use crate::vcs_http::{ClientGone, Exchange, Failed};
 /// Counter: a git fetch over HTTP answered refused (a pack the store could not finish, a request refused), its typed
 /// refusal named in the log. Format: a counter name.
 pub(crate) const UPLOAD_REFUSED: &str = "vcs_http.git.upload_refused";
+
+/// Counter: a git fetch over HTTP whose negotiation ran past its room before its pack began, answered again within the
+/// wider room its repository's shard gave it later (A-855: a refusal costs time, never an answer). Format: a counter
+/// name.
+pub(crate) const ANSWERED_AGAIN: &str = "vcs_http.git.answered_again";
+
+/// How long a fetch held past its room waits for its repository's shard to give it more (A-855): the daemon's
+/// observation budget, the longest it waits on any party before judging it, git's keepalive written meanwhile; past it
+/// the refusal is answered as it was before.
+const ROOM_PATIENCE_NS: u64 = crate::daemon::OBSERVE_BUDGET_NS;
 
 pub(crate) trait StoreLender {
   /// Where a fetch's pack comes from (A-639's fragments, through A-653's source over the store's stream).
@@ -110,6 +123,8 @@ pub(crate) struct UploadServices<L> {
   room: u64,
   /// How long an answer may write nothing before git's keepalive is written (`DaemonConfig::git_keepalive_ns`).
   keepalive_ns: u64,
+  /// How long an answer held past its room waits for more ([`ROOM_PATIENCE_NS`]).
+  room_patience_ns: u64,
 }
 
 impl<L> UploadServices<L> {
@@ -121,7 +136,15 @@ impl<L> UploadServices<L> {
       lender,
       room,
       keepalive_ns,
+      room_patience_ns: ROOM_PATIENCE_NS,
     }
+  }
+
+  /// These services, an answer held past its room waiting `ns` for more (tests: a patience a test can wait out).
+  #[cfg(test)]
+  pub(crate) fn with_room_patience(mut self, ns: u64) -> Self {
+    self.room_patience_ns = ns;
+    self
   }
 }
 
@@ -136,6 +159,9 @@ impl<L: StoreLender + Clone> GitServices for UploadServices<L> {
       .lender
       .room(start.repository.id)
       .ok_or(ServiceRefused::Unavailable)?;
+    // A-855: the request's own bytes are held to the edge's request room; its answer, whose walk keeps tables of a bit
+    // or a word an object and a few words a want (A-745 rule 1), to what its repository's shard admits it (A-724's
+    // share), never one region: git/git's clone of master and 1,019 tags needs more than a region's 256 KiB.
     let room = self.room.min(shard);
     Ok(Upload {
       lender: self.lender.clone(),
@@ -144,12 +170,15 @@ impl<L: StoreLender + Clone> GitServices for UploadServices<L> {
       version: start.version,
       advertise: start.advertise,
       request_room: Admission::new(room),
-      admission: Admission::new(room),
+      admission: Admission::new(shard),
       request: Vec::new(),
       answer: None,
       generation: None,
       keepalive_ns: self.keepalive_ns,
       last_written_ns: slates_rt::futures::now_ns(),
+      admitted: shard,
+      held_since: None,
+      room_patience_ns: self.room_patience_ns,
     })
   }
 }
@@ -170,8 +199,9 @@ pub(crate) struct Upload<L: StoreLender> {
   /// The request's room: its bytes as they arrive (A-745: a request's room bounds the request, and its answer is
   /// admitted on its own).
   request_room: Admission,
-  /// The answer's room: all upload-pack keeps answering the request, the room it began with, a request's own bytes
-  /// never taken from it, as the SSH edge admits each answer afresh (`vcs_ssh::git`'s `serve`).
+  /// The answer's room: all upload-pack keeps answering the request, the room its repository's shard admitted it when it
+  /// began (A-855: the shard's, never the edge's request room), a request's own bytes never taken from it, as the SSH
+  /// edge admits each answer afresh (`vcs_ssh::git`'s `serve`).
   admission: Admission,
   /// The request, as its body arrived.
   request: Vec<u8>,
@@ -183,6 +213,13 @@ pub(crate) struct Upload<L: StoreLender> {
   keepalive_ns: u64,
   /// When the exchange last wrote: its head (written at once), or the answer's last bytes.
   last_written_ns: u64,
+  /// The room the answer was made within (A-855): an answer held past it is made again once its repository's shard can
+  /// give more.
+  admitted: u64,
+  /// Since when the answer has been held past its room, if it is.
+  held_since: Option<u64>,
+  /// How long it waits held for more room ([`ROOM_PATIENCE_NS`]).
+  room_patience_ns: u64,
 }
 
 impl<L: StoreLender> Exchange for Upload<L> {
@@ -216,6 +253,7 @@ impl<L: StoreLender> Exchange for Upload<L> {
     } else {
       lender.encode(*repository).await;
       let held = lender.hold(*repository, reader).ok_or(unavailable)?;
+      // A-855: a negotiation run past its room is held, not answered, until the room grows (`Upload::wait_for_room`).
       let made = lender.lend_held(&held, |served, packs| {
         upload::serve_in_turns(
           served,
@@ -224,6 +262,7 @@ impl<L: StoreLender> Exchange for Upload<L> {
           packs,
           admission,
         )
+        .holding()
       });
       *generation = Some(held);
       made
@@ -269,6 +308,10 @@ impl<L: StoreLender> Exchange for Upload<L> {
     {
       *last_written_ns = now;
     }
+    if made.held().is_some() {
+      self.wait_for_room().await?;
+      return Ok(true);
+    }
     if written != Written::More {
       // The answer is written: its generation is given back.
       *generation = None;
@@ -282,5 +325,71 @@ impl<L: StoreLender> Exchange for Upload<L> {
       }
     }
     Ok(written == Written::More)
+  }
+}
+
+impl<L: StoreLender> Upload<L> {
+  /// A turn of an answer held past its room (A-855, main's ruling of 2026-11-21: a refusal costs time, never an
+  /// answer). Where the repository's shard can give more room than the answer was made within, it is made again within
+  /// it over the same generation, passing over what it wrote, which the answer made again writes alike byte for byte
+  /// (`Answer::skip_written`), and counted [`ANSWERED_AGAIN`]; where it cannot yet, the turn waits a keepalive's interval
+  /// (the next turn writes git's keepalive), at most [`ROOM_PATIENCE_NS`] in all since it was held, past which the
+  /// refusal is answered as it was before (`Answer::give_up`).
+  async fn wait_for_room(&mut self) -> Result<(), Failed> {
+    let Self {
+      lender,
+      repository,
+      version,
+      admission,
+      request,
+      answer,
+      generation,
+      keepalive_ns,
+      admitted,
+      held_since,
+      room_patience_ns,
+      ..
+    } = self;
+    let unavailable = Failed(Status::SERVICE_UNAVAILABLE);
+    let Some(made) = answer.as_mut() else {
+      return Err(Failed(Status::INTERNAL_SERVER_ERROR));
+    };
+    let now = slates_rt::futures::now_ns();
+    let room = lender.room(*repository).unwrap_or(0);
+    if room > *admitted
+      && let Some(held) = generation.as_ref()
+    {
+      let skip = made.written();
+      let mut wider = Admission::new(room);
+      let again = lender
+        .lend_held(held, |served, packs| {
+          upload::serve_in_turns(
+            served,
+            *version,
+            Asked::Request(request.as_slice()),
+            packs,
+            &mut wider,
+          )
+          .holding()
+          .skip_written(skip)
+        })
+        .ok_or(unavailable)?;
+      *made = again;
+      *admission = wider;
+      *admitted = room;
+      *held_since = None;
+      let _ = crate::state::with_state_counted(|state| state.count(ANSWERED_AGAIN, 1));
+      return Ok(());
+    }
+    let since = *held_since.get_or_insert(now);
+    let waited = now.saturating_sub(since);
+    if waited >= *room_patience_ns {
+      made.give_up();
+      return Ok(());
+    }
+    // A sleep the runtime refuses (no timer here) ends the wait early: the next turn asks again.
+    let _ =
+      slates_rt::futures::sleep((*keepalive_ns).min(room_patience_ns.saturating_sub(waited))).await;
+    Ok(())
   }
 }
