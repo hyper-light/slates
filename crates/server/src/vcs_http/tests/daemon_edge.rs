@@ -1470,6 +1470,90 @@ fn a_mercurial_push_its_store_cannot_hold_for_now_waits_for_room_and_lands_whole
   assert!(waits > 0, "the push waited for the store's room");
 }
 
+/// A line of `changesets` changesets, each adding a file of its own, and the bundle stock hg posts to push them all.
+fn a_line_of(changesets: usize) -> (Vec<Made>, Vec<u8>) {
+  let paths: &'static [String] = Box::leak(
+    (0..changesets)
+      .map(|at| format!("file-{at}"))
+      .collect::<Vec<_>>()
+      .into_boxed_slice(),
+  );
+  let texts: &'static [Vec<u8>] = Box::leak(
+    (0..changesets)
+      .map(|at| format!("revision {at}\n").into_bytes())
+      .collect::<Vec<_>>()
+      .into_boxed_slice(),
+  );
+  let commits: Vec<Commit> = (0..changesets)
+    .map(|at| {
+      (
+        paths[at].as_str(),
+        paths[at].as_str(),
+        texts[at].as_slice(),
+        at.checked_sub(1),
+        "default",
+      )
+    })
+    .collect();
+  let made = history_of(&commits);
+  let bundle = history_bundle(&made, &(0..changesets).collect::<Vec<_>>());
+  (made, bundle)
+}
+
+/// Format: the room left to the steps of [`a_mercurial_push_is_admitted_its_known_need_and_never_waits_for_its_own_keeping`]'s
+/// push once its begin is taken: far less than what its changesets keep.
+const STEP_ROOM: u64 = 64;
+
+/// Main 01a20182's ruling (a) of 2026-11-22 04:23 (w-interop's whole-history push of hg on ubuntu and arm refused at a
+/// manifest delta: the push's own keeping spent the one room it held, and a wait for room no one else held could never
+/// end). Do: start a two-shard daemon over loopback TLS; create a Mercurial repository; push a line of
+/// [`FRESH_CHANGESETS`] changesets as stock hg posts it, the room left to its steps after its begin [`STEP_ROOM`] bytes
+/// (`hg_push::TEST_STEP_ROOM`); then ask `heads`. Expect the push `200`, `heads` the line's last changeset, the push
+/// admitted its known need once (`vcs.hg.push_need_admitted`), and no step waiting for room
+/// (`vcs.hg.push_intake_room_waits` zero). Red before: its steps waited for room the push already held.
+#[test]
+fn a_mercurial_push_is_admitted_its_known_need_and_never_waits_for_its_own_keeping() {
+  let (identity, certificate) = identity();
+  let (daemon, _instance) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let (made, bundle) = a_line_of(FRESH_CHANGESETS);
+  create_empty_hg(&daemon, &name);
+  crate::daemon::observe_at(&daemon, REPOSITORY, |_| {
+    crate::repository::hg_push::TEST_STEP_ROOM.with(|left| left.set(STEP_ROOM));
+  });
+  let pushed = hg_unbundle((port, &certificate), &name, &bundle);
+  let heads = hg_command((port, &certificate), &name, "heads");
+  let counted = |counter: &'static str| {
+    (0..daemon.shards().len())
+      .map(|partition| {
+        crate::daemon::observe_at(&daemon, partition, move |state| {
+          state.refusals.get(counter).copied().unwrap_or(0)
+        })
+      })
+      .sum::<u64>()
+  };
+  let (admitted, waited) = (
+    counted(crate::repository::hg_push::PUSH_NEED_ADMITTED),
+    counted(crate::repository::hg_push::INTAKE_ROOM_WAITS),
+  );
+  daemon.stop();
+  assert_eq!(
+    (pushed.0, pushed.1.as_str()),
+    (200, "application/mercurial-0.1"),
+    "{}",
+    String::from_utf8_lossy(&pushed.2)
+  );
+  let tip = crate::verbs::hex_of(&made[FRESH_CHANGESETS - 1].node);
+  assert_eq!(heads, (200, format!("{tip}\n").into_bytes()));
+  assert_eq!(
+    (admitted, waited),
+    (1, 0),
+    "its need admitted once, no step waiting for its own keeping"
+  );
+}
+
 /// Format: the changesets of [`a_fresh_repositorys_first_push_of_hundreds_of_changesets_is_taken_at_once`]'s push, as
 /// w-interop's 500-revision chunks were.
 const FRESH_CHANGESETS: usize = 500;
@@ -1487,32 +1571,7 @@ fn a_fresh_repositorys_first_push_of_hundreds_of_changesets_is_taken_at_once() {
   let port = daemon.vcs_http_port().expect("the edge started");
   let name = hg_name_on_the_repositorys_partition();
   enroll(&daemon, OWNER_TOKEN, OWNER, None);
-  let paths: &'static [String] = Box::leak(
-    (0..FRESH_CHANGESETS)
-      .map(|at| format!("file-{at}"))
-      .collect::<Vec<_>>()
-      .into_boxed_slice(),
-  );
-  let texts: &'static [Vec<u8>] = Box::leak(
-    (0..FRESH_CHANGESETS)
-      .map(|at| format!("revision {at}\n").into_bytes())
-      .collect::<Vec<_>>()
-      .into_boxed_slice(),
-  );
-  let commits: Vec<crate::repository::hg_push::tests::Commit> = (0..FRESH_CHANGESETS)
-    .map(|at| {
-      let parent = at.checked_sub(1);
-      (
-        paths[at].as_str(),
-        paths[at].as_str(),
-        texts[at].as_slice(),
-        parent,
-        "default",
-      )
-    })
-    .collect();
-  let made = history_of(&commits);
-  let bundle = history_bundle(&made, &(0..FRESH_CHANGESETS).collect::<Vec<_>>());
+  let (made, bundle) = a_line_of(FRESH_CHANGESETS);
   create_empty_hg(&daemon, &name);
   let pushed = hg_unbundle((port, &certificate), &name, &bundle);
   let heads = hg_command((port, &certificate), &name, "heads");

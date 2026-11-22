@@ -2371,11 +2371,33 @@ async fn take_sliced(
     }
   }
   let mut admitted = room.left();
+  let step = admitted;
   let mut taking =
     match begun_after_waits(repository, changegroup, lend, (room, &mut admitted)).await? {
       Ok(taking) => taking,
       Err(outcome) => return Some(Err(outcome)),
     };
+  #[cfg(test)]
+  {
+    let left = TEST_STEP_ROOM.with(|left| left.replace(0));
+    if left > 0 {
+      let held = admitted.saturating_sub(room.left());
+      admitted = held.saturating_add(left);
+      *room = Admission::new(admitted);
+      let _ = room.charge(held);
+    }
+  }
+  let sized = crate::state::with_state(|state| {
+    admitted_its_need(
+      state,
+      repository,
+      (&mut taking, step),
+      (room, &mut admitted),
+    )
+  })?;
+  if let Err(outcome) = sized {
+    return Some(Err(outcome));
+  }
   loop {
     let sliced = crate::state::with_state(|state| taking.slice(state, lend, room));
     match sliced.flatten()? {
@@ -2403,6 +2425,52 @@ async fn take_sliced(
       }
     }
   }
+}
+
+/// Counter: a push admitted its known need up front at its begin, past the room it was first given (main 01a20182's
+/// ruling (a) of 2026-11-22 04:23). Format: a counter name in the status report.
+pub(crate) const PUSH_NEED_ADMITTED: &str = "vcs.hg.push_need_admitted";
+
+/// Format: slates' words for a push whose known need is past the most its repository could ever be lent on its shard:
+/// it could never be taken there, so it is refused at once, never waited for.
+const PAST_CEILING: &[u8] =
+  b"push refused: it needs more room than its repository could ever be lent on its shard";
+
+/// `taking`'s push admitted its known need up front (main 01a20182's ruling (a) of 2026-11-22 04:23): what its begin holds
+/// and what its steps will keep (`Intake::bookkeeping`), with `step`, its first room, for a step's working set. A known
+/// need outranks the learned demand that predicts an unknown one, so the push takes it within what others do not hold
+/// (the repository's ceiling, `vcs_share::wait::ceiling`): what it must keep past the ceiling is refused, typed; a step's
+/// room past it is a step's to wait for, as before. Already admitted as much, nothing changes. Its record names the room
+/// it was taken within.
+fn admitted_its_need(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  (taking, step): (&mut Taking, u64),
+  (room, admitted): (&mut Admission, &mut u64),
+) -> Result<(), PushOutcome> {
+  let Some(intake) = taking.intake.as_ref() else {
+    return Ok(());
+  };
+  let held = admitted.saturating_sub(room.left());
+  let keeping = held.saturating_add(intake.bookkeeping());
+  let ceiling = crate::vcs_share::wait::ceiling(state, repository);
+  // What the push must keep past the ceiling can never be taken here; a step's room past it is the step's to wait for.
+  if keeping > ceiling {
+    return Err(PushOutcome::refused(&abort(PAST_CEILING.to_vec())));
+  }
+  let need = keeping.saturating_add(step).min(ceiling);
+  if need <= *admitted {
+    return Ok(());
+  }
+  let mut grown = Admission::new(need);
+  grown
+    .charge(held)
+    .map_err(|_| PushOutcome::refused(&abort(PAST_CEILING.to_vec())))?;
+  *room = grown;
+  *admitted = need;
+  taking.room = need;
+  state.count(PUSH_NEED_ADMITTED, 1);
+  Ok(())
 }
 
 /// The intake begun over `changegroup` within `room`, `admitted` the bytes it was last admitted: a begin past its
@@ -2467,23 +2535,25 @@ async fn retaken(
   Some(Ok(()))
 }
 
-/// A test's refusal of the next push's increments held ahead, once, as a content store full for now refuses them
-/// (`BudgetExceeded`), so the push's wait for room is met by use (w-interop's ubuntu find at revision 12,000).
-/// Kept on the shard that serves the push, so a test's daemon alone meets it.
+// The tests' hooks, kept on the shard that serves the push, so a test's daemon alone meets them.
 #[cfg(test)]
 thread_local! {
+  /// A test's refusal of the next push's increments held ahead, once, as a content store full for now refuses them
+  /// (`BudgetExceeded`), so the push's wait for room is met by use (w-interop's ubuntu find at revision 12,000).
   pub(crate) static TEST_HOLD_REFUSED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+  /// A test's room left to the next push's steps once its begin is taken (0: none), taken once: a learned room leaving
+  /// its bookkeeping nothing, as on w-interop's runners.
+  pub(crate) static TEST_STEP_ROOM: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
 }
 
 /// Counter: a push whose increments the content store could not hold for now, waiting for room before holding them
 /// again (main 01a20182's order of 2026-11-22 03:35). Format: a counter name in the status report.
 pub(crate) const HELD_AHEAD_ROOM_WAITS: &str = "vcs.hg.push_held_ahead_room_waits";
 
-/// A test's first room for the next push's intake, taken once (0: none): a stock push's admission made smaller than its
-/// own bookkeeping, as A-724's learned demand made one on w-interop's runner, so the wait is met by use.
-/// Kept on the shard that serves the push, so a test's daemon alone meets it.
 #[cfg(test)]
 thread_local! {
+  /// A test's first room for the next push's intake, taken once (0: none): a stock push's admission made smaller than its
+  /// own bookkeeping, as A-724's learned demand made one on w-interop's runner, so the wait is met by use.
   pub(crate) static TEST_FIRST_INTAKE_ROOM: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
 }
 

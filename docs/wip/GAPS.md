@@ -528,6 +528,21 @@
 >   before. Held by `vcs_http::daemon_edge::tests::a_mercurial_push_past_its_first_admission_waits_for_room_and_lands_whole`
 >   (a first room of 64 bytes; red with no wait: `PastAdmission { asked: 127, left: 64 }`) and
 >   `a_mercurial_push_its_store_cannot_hold_for_now_waits_for_room_and_lands_whole` (red: `heads` empty).
+> - Part 3, (a) BUILT (2026-11-22, w-hg; main 01a20182's ruling of 04:23; w-interop's whole-history push of hg refused at
+>   a manifest delta on ubuntu and arm, the push's own keeping having spent the one room it held, a wait for room no one
+>   else held never ending): the push is admitted its known need up front. Its begin decodes the framing, so it knows
+>   every revision before taking one; `Intake::bookkeeping` bounds what its steps will keep (each revision's node, kept
+>   text and path; a changeset's nodes; a manifest's written entries, at most one for each 43 bytes of its delta, and
+>   their paths; each log's name), and `hg_push::admitted_its_need` admits what the begin holds, that, and a step's
+>   room, within the repository's ceiling (what others do not hold, `vcs_share::wait::ceiling`). What it must keep past
+>   the ceiling is refused typed; a step past its room waits, as part 2. Counted `vcs.hg.push_need_admitted`. Held by
+>   `push::intake::tests::an_intakes_bookkeeping_covers_what_its_steps_keep` (the bound over what the steps kept) and
+>   `vcs_http::daemon_edge::tests::a_mercurial_push_is_admitted_its_known_need_and_never_waits_for_its_own_keeping`
+>   (500 changesets, 64 bytes left to the steps after the begin; red without (a): a step waited).
+> - Part 3, (b) next (main's ruling: straight after, not owed): the kept texts' list off the push's room, landed to the
+>   changeset store as it is taken (the landing's `Texts` section, sectioned), so the room bounds a step's working set
+>   alone; proved through the intake, the landing and the replay by the recovery oracle, and the whole-history push's
+>   peak RSS against its working set.
 > - Not reproduced here, logged: w-interop's fresh repository's first 500-revision push refused at once on CI's x86 and
 >   arm runners (main's order of 03:49 and 03:50). `a_fresh_repositorys_first_push_of_hundreds_of_changesets_is_taken_at_once`
 >   (500 changesets pushed with no gap after the create) passes on this Mac. Every content-store refusal of a held-ahead
