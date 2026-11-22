@@ -221,6 +221,14 @@
 >   interleaved rounds. Stamped under TB, the loaded tail's deferred replies are submits parked behind their refinement
 >   and resumed. A plain forward's two wakes measure 7-21 µs from kick to run, and the resumed run is all CPU (not
 >   demoted). Main's own interleaved A/B (run 45009478174) misses p999 in most rounds in both arms; the gap stays open.
+> - **Linux, the round-robin real-time class for the shards and the client's park, measured and rejected (w-perf,
+>   2026-11-22; BENCHMARKS "84a on Linux: the round-robin real-time class").** On CI's runners (kernel 7.0,
+>   `PREEMPT_LAZY`, `RUN_TO_PARITY`, 2.1 ms base slice) a woken shard waited for its CPU: kick -> run p50 920 µs, and
+>   8 µs in `SCHED_RR`. But with the shards and the client's park in the class, the client's own time-share code still
+>   waits whole slices: accept p99 0.94-2.6 ms, p999 3.0-4.8 ms, and the spinners lost 20-27% of their throughput. The
+>   runner account's `RLIMIT_RTPRIO` is 0:0, so even that needs an administrator's grant. **Open:** 84a's Linux bar
+>   under two spinners a CPU, short of user code at real-time priority (ruled out) or a less oversubscribed lane, main's
+>   call.
 > - Windows (CI, run 44857045148): no 1 ms band (queued p99 5–49 µs); accept p99 0.13–0.31 ms, conflict 0.11–0.29 ms;
 >   p999 0.2–62 ms. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–7).
 >
