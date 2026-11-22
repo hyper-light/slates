@@ -301,6 +301,32 @@ fn written_within(
   (bytes, answer.refusal().cloned())
 }
 
+/// Whether `bytes` hold git's band-3 words for a pack that could not be finished.
+fn aborts(bytes: &[u8]) -> bool {
+  bytes
+    .windows(crate::upload::ABORT.len())
+    .any(|window| window == crate::upload::ABORT)
+}
+
+/// small.git's clone `fetch`, answered whole passing over each count of its first bytes through its `packfile` section's
+/// header, writes `whole`'s bytes after that count.
+fn assert_skips_each_count(
+  served: &crate::upload::Served<'_>,
+  fixture: &served::Served,
+  whole: &[u8],
+) {
+  let header: &[u8] = b"000dpackfile\n";
+  assert!(whole.starts_with(header));
+  for skip in 0..=header.len() {
+    let (rest, _) = answered_holding(served, fixture, &mut Admission::new(u64::MAX), skip);
+    assert_eq!(
+      rest.as_slice(),
+      whole.get(skip..).unwrap(),
+      "passing over {skip} bytes"
+    );
+  }
+}
+
 /// A-855 (main's ruling of 2026-11-21: a refusal costs time, never an answer; git/git's clone over a request's room was
 /// answered refused `PastAdmission` and its pack cut with git's abort words). Do: answer small.git's stock clone `fetch`
 /// in turns within each room from none up, holding a refusal past its room, the widest room that holds it taken; answer
@@ -319,12 +345,7 @@ fn a_clone_held_past_its_room_and_answered_again_in_a_wider_one_is_the_whole_ans
   assert!(answer.refusal().is_none() && answer.held().is_none());
   let (room, bytes, answer) = widest_held(&served, &fixture, whole.len());
   assert!(answer.refusal().is_none(), "held, not refused");
-  assert!(
-    !bytes
-      .windows(crate::upload::ABORT.len())
-      .any(|window| window == crate::upload::ABORT),
-    "no abort written while held"
-  );
+  assert!(!aborts(&bytes), "no abort written while held");
   let (rest, again) = answered_holding(
     &served,
     &fixture,
@@ -337,15 +358,7 @@ fn a_clone_held_past_its_room_and_answered_again_in_a_wider_one_is_the_whole_ans
     whole,
     "answered whole, byte for byte"
   );
-  assert!(whole.starts_with(b"000dpackfile\n"));
-  for skip in 0..=b"000dpackfile\n".len() {
-    let (rest, _) = answered_holding(&served, &fixture, &mut Admission::new(u64::MAX), skip);
-    assert_eq!(
-      rest.as_slice(),
-      whole.get(skip..).unwrap(),
-      "passing over {skip} bytes"
-    );
-  }
+  assert_skips_each_count(&served, &fixture, &whole);
   let given_up = written_within(&served, &fixture, room, true);
   assert!(given_up.1.is_some(), "given up: refused");
   assert_eq!(

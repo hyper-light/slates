@@ -1184,7 +1184,7 @@ impl<A: Answered> Upload<A> {
     let Ok(raw) = packed::raw_entry(cx.store, (place, self.format), (&mut scratch, room)) else {
       return Ok(None);
     };
-    let base = match raw.representation {
+    let representation = match raw.representation {
       // A whole entry is sent on only where encoding it would try no delta (git searches first, then reuses it whole).
       Representation::Whole(_) if self.would_try(cx, row) => return Ok(None),
       Representation::Whole(kind) => {
@@ -1195,65 +1195,19 @@ impl<A: Answered> Upload<A> {
           self.counters.reuse_refused = self.counters.reuse_refused.saturating_add(1);
           return Ok(None);
         }
-        None
+        Representation::Whole(kind)
       }
-      Representation::OfsDelta { base } => {
-        let Some((kind, bytes)) = cx.repository.read_entry(
-          cx.store,
-          InPack {
-            offset: base,
-            ..place
-          },
-        ) else {
+      delta => {
+        let Some((base, base_bytes)) = self.base_of(cx, (place, delta)) else {
           return Ok(None);
         };
-        let Ok(base) = crate::object_name::name_of(self.format, kind, &bytes) else {
-          return Ok(None);
-        };
-        Some((base, bytes))
-      }
-      Representation::RefDelta { base } => {
-        let Some(bytes) = cx
-          .repository
-          .indexed(cx.store, &base)
-          .and_then(|(row, content)| {
-            cx.repository
-              .row_bytes(cx.store, &row, content)
-              .map(Cow::into_owned)
-          })
-        else {
-          return Ok(None);
-        };
-        Some((base, bytes))
-      }
-    };
-    let representation = match base {
-      None => Representation::Whole(row.kind),
-      Some((base, base_bytes)) => {
-        let Some((base_row, _)) = cx.repository.indexed(cx.store, &base) else {
-          return Ok(None);
-        };
-        let before = self.sent.contains(base_row.position)
-          || (base_row.position < position && self.loose_at.contains_key(&base_row.position));
-        if !before {
-          return Ok(None);
-        }
-        let object = cx
-          .repository
-          .read_stored(cx.store, &stored, row.len)
-          .ok_or(StoreRefused::Unreadable { id })?;
-        let mut built = Vec::new();
-        let checked = crate::object_name::name_of(self.format, row.kind, &object)
-          .is_ok_and(|named| named == id)
-          && crate::delta::apply_to(&base_bytes, &scratch, &mut built).is_ok()
-          && built.as_slice() == object.as_ref();
-        if !checked {
-          self.counters.reuse_refused = self.counters.reuse_refused.saturating_add(1);
-          return Ok(None);
-        }
-        match self.loose_at.get(&base_row.position) {
-          Some(base_at) if self.answer.ofs_delta() => Representation::OfsDelta { base: *base_at },
-          _ => Representation::RefDelta { base },
+        match self.delta_reused(
+          cx,
+          (id, row, stored, position),
+          (base, &base_bytes, &scratch),
+        )? {
+          Some(representation) => representation,
+          None => return Ok(None),
         }
       }
     };
@@ -1305,6 +1259,74 @@ impl<A: Answered> Upload<A> {
       len: place.len,
       from: raw.data,
       to: raw.end,
+    }))
+  }
+
+  /// A pushed delta's base (A-859): an OFS_DELTA's the entry at its offset of the same pack, read and named; a
+  /// REF_DELTA's the object it names. Its name and its bytes; none where it is not read.
+  fn base_of(
+    &self,
+    cx: &Context<'_>,
+    (place, delta): (InPack, Representation),
+  ) -> Option<(ObjectId, Vec<u8>)> {
+    match delta {
+      Representation::OfsDelta { base } => {
+        let (kind, bytes) = cx.repository.read_entry(
+          cx.store,
+          InPack {
+            offset: base,
+            ..place
+          },
+        )?;
+        let base = crate::object_name::name_of(self.format, kind, &bytes).ok()?;
+        Some((base, bytes))
+      }
+      Representation::RefDelta { base } => {
+        let (row, content) = cx.repository.indexed(cx.store, &base)?;
+        let bytes = cx
+          .repository
+          .row_bytes(cx.store, &row, content)?
+          .into_owned();
+        Some((base, bytes))
+      }
+      Representation::Whole(_) => None,
+    }
+  }
+
+  /// How a pushed delta of `id` against `base` goes on (A-859), once its base precedes it in this pack (sent already, or
+  /// by this loose stage before it) and its data (`delta`, inflated) applied to the base's bytes gives the object, which
+  /// its name says: an offset delta to a base this stage placed where the client said `ofs-delta`, by its base's name
+  /// otherwise. None where its base does not precede it; refused-and-counted where its check fails.
+  fn delta_reused(
+    &mut self,
+    cx: &Context<'_>,
+    (id, row, stored, position): (ObjectId, &ObjectRow, StoredAt, u64),
+    (base, base_bytes, delta): (ObjectId, &[u8], &[u8]),
+  ) -> Result<Option<Representation>, StoreRefused> {
+    let Some((base_row, _)) = cx.repository.indexed(cx.store, &base) else {
+      return Ok(None);
+    };
+    let before = self.sent.contains(base_row.position)
+      || (base_row.position < position && self.loose_at.contains_key(&base_row.position));
+    if !before {
+      return Ok(None);
+    }
+    let object = cx
+      .repository
+      .read_stored(cx.store, &stored, row.len)
+      .ok_or(StoreRefused::Unreadable { id })?;
+    let mut built = Vec::new();
+    let checked = crate::object_name::name_of(self.format, row.kind, &object)
+      .is_ok_and(|named| named == id)
+      && crate::delta::apply_to(base_bytes, delta, &mut built).is_ok()
+      && built.as_slice() == object.as_ref();
+    if !checked {
+      self.counters.reuse_refused = self.counters.reuse_refused.saturating_add(1);
+      return Ok(None);
+    }
+    Ok(Some(match self.loose_at.get(&base_row.position) {
+      Some(base_at) if self.answer.ofs_delta() => Representation::OfsDelta { base: *base_at },
+      _ => Representation::RefDelta { base },
     }))
   }
 
