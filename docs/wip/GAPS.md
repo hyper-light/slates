@@ -3757,8 +3757,12 @@
 > The engine's splice sizes its file once at what it makes (`engine::made_len`;
 > `a_splice_makes_its_bytes_in_one_buffer_of_their_length`, 6,000 bytes held for 4,000, now 4,000): dead even on the
 > import, which replaces files whole (130.7 to 130.8 MB sampled), and on 300 partial splices over 200 files of 64 KiB
-> 43,945,798 B allocated before, 21,594,432 B after (w-svn's local probe, main's ruling of 11:05). Next (main's ruling):
-> the svn landing names its stored texts as A-760 runs, in three pieces.
+> 43,945,798 B allocated before, 21,594,432 B after (w-svn's local probe, main's ruling of 11:05). A-865 (w-svn): the
+> svn landing names its stored texts as A-760 runs, its entries recording names, and a cold recovery brings back what
+> its content store lacks before the green's replay; sampled 130.8 MB to 108.0 MB. Owed: main's daemon A/B; piece (c),
+> the batch's commit adopting the scratch member's files; the append's `judge_named` (its own landing, w-git and w-hg
+> told first). Not A-865's: `recovery.rs`'s `an_overlay_whose_base_directory_was_removed_serves_its_own_files_after_a_restart`
+> fails at origin/main 7ced987e6 as well (LOOKUP status, `tests/common/nfs.rs:238`).
 > Still to measure: the A-742 floor's A/B only if the
 > footprint still stays (main's ruling). A local 64 KiB floor gave 47 MB of footprint at 2 s idle, against 363 MB, at
 > 19.4 s against 12.0 s (debug).
