@@ -25,3 +25,6 @@ Clone: ~/slates-work/w-multirepo; target ~/.cache/w-multirepo-target.noindex; st
   cadence, snapshot published) -- needs main's split ruling. Meanwhile: piece 7 (load proof test), which is mine.
 - 18:00 PARKED on main's A-724 split ruling (all remaining A-724 work touches w-balance's live files). Sent the CPU
   weights design question + 2d wiring plan: inbox/main-from-w-multirepo-question-cpu.md.
+- w-hg: admission leak fixed 687cd98b1 (521fe3689; index_upkeep lent the whole admittable to a merge step). Hold on
+  vcs_share::room / push_room lifted. Siblings lending whole admittable rooms (GAPS, main routes): git restage_turn
+  (stage_room), SealingPush::turn (self.room), git_hooks seal. Still parked on main's A-724 split.
