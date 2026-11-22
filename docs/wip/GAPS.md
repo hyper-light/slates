@@ -539,6 +539,21 @@
 >   before. Held by `vcs_http::daemon_edge::tests::a_mercurial_push_past_its_first_admission_waits_for_room_and_lands_whole`
 >   (a first room of 64 bytes; red with no wait: `PastAdmission { asked: 127, left: 64 }`) and
 >   `a_mercurial_push_its_store_cannot_hold_for_now_waits_for_room_and_lands_whole` (red: `heads` empty).
+> - Part 3, (a) BUILT (2026-11-22, w-hg; main 01a20182's ruling of 04:23; w-interop's whole-history push of hg refused at
+>   a manifest delta on ubuntu and arm, the push's own keeping having spent the one room it held, a wait for room no one
+>   else held never ending): the push is admitted its known need up front. Its begin decodes the framing, so it knows
+>   every revision before taking one; `Intake::bookkeeping` bounds what its steps will keep (each revision's node, kept
+>   text and path; a changeset's nodes; a manifest's written entries, at most one for each 43 bytes of its delta, and
+>   their paths; each log's name), and `hg_push::admitted_its_need` admits what the begin holds, that, and a step's
+>   room, within the repository's ceiling (what others do not hold, `vcs_share::wait::ceiling`). What it must keep past
+>   the ceiling is refused typed; a step past its room waits, as part 2. Counted `vcs.hg.push_need_admitted`. Held by
+>   `push::intake::tests::an_intakes_bookkeeping_covers_what_its_steps_keep` (the bound over what the steps kept) and
+>   `vcs_http::daemon_edge::tests::a_mercurial_push_is_admitted_its_known_need_and_never_waits_for_its_own_keeping`
+>   (500 changesets, 64 bytes left to the steps after the begin; red without (a): a step waited).
+> - Part 3, (b) next (main's ruling: straight after, not owed): the kept texts' list off the push's room, landed to the
+>   changeset store as it is taken (the landing's `Texts` section, sectioned), so the room bounds a step's working set
+>   alone; proved through the intake, the landing and the replay by the recovery oracle, and the whole-history push's
+>   peak RSS against its working set.
 > - Not reproduced here, logged: w-interop's fresh repository's first 500-revision push refused at once on CI's x86 and
 >   arm runners (main's order of 03:49 and 03:50). `a_fresh_repositorys_first_push_of_hundreds_of_changesets_is_taken_at_once`
 >   (500 changesets pushed with no gap after the create) passes on this Mac. Every content-store refusal of a held-ahead
@@ -677,6 +692,8 @@
 > lies there, checked against its name first, its delta reused where its base precedes it (`t_a859_…`: 20,916 bytes
 > against the pushed 17,299, where 89,439 went before). Owed: part A, a fetched byte priced at the network (§4.11);
 > main's git/git whole round and `fsck --strict`.
+> A-860 BUILT (2026-11-22, w-git): a repository gone idle lets go of the objects its reads keep (git.recent_bytes held
+> 53.9 MB after a git/git clone). Owed: the push side's held windows and pack, w-shared's.
 > R2, the load-only edge tests, CLOSED (2026-11-21, w-git): a push's answer under side-band-64k wrote its first
 > keepalive two intervals after its body (`body_end` waited one interval unwritten, then the reply its own before
 > appending it), 10 s, the client's patience, so every push answer past 5 s failed (18 of 18 at load 24, the timing
@@ -3658,6 +3675,12 @@
 > re-derived by a release A/B only if the footprint still stays (main's ruling). The changeset landing's piece copies
 > are cut too (w-svn, main's routing of 00:57): `slates_store::owner::SlicedLanding::part` answers its buffer emptied
 > once written, and the svn landing fills one buffer a landing (`a_sliced_landings_part_gives_its_buffer_back_to_be_filled_again`).
+> Re-measured (main 01a20182's r12, 2026-11-22, this MacBook, release, at 1721d8c52 with the `put_window` cut): still
+> red, the footprint grown 494,927,872 B against 155,539,920 B live, 181,750,880 B not given back (r4 at 2a8dbcd99:
+> 150,287,136). The cut took allocations out but neither the peak nor what stays. `an_import_measured` now prints the
+> memory status's gauges (w-shared's, `crates/server/src/memory_gauges.rs`) summed over the shards at every reading,
+> and the footprint past the system path's live bytes, the mapped blocks' resident pages and the arenas, so the next
+> reading names the live bytes' holders and what the system allocator kept.
 > Still to measure: the A-742 floor's A/B only if the
 > footprint still stays (main's ruling). A local 64 KiB floor gave 47 MB of footprint at 2 s idle, against 363 MB, at
 > 19.4 s against 12.0 s (debug).

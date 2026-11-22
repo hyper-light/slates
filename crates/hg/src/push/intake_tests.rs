@@ -1110,3 +1110,38 @@ fn a_step_refused_past_its_admission_is_taken_again_whole_in_a_grown_room() {
     );
   }
 }
+
+/// Main 01a20182's ruling (a) of 2026-11-22 04:23 (a push admitted its known need up front). Do: begin the stock
+/// changegroup within room enough, note what the begin charged, ask the intake its bookkeeping (`Intake::bookkeeping`),
+/// then take it whole and note what its steps left charged. Expect what the steps kept no more than the bookkeeping
+/// told, and the bookkeeping more than nothing: the push's need, known before a revision is taken, covers what it keeps.
+#[test]
+fn an_intakes_bookkeeping_covers_what_its_steps_keep() {
+  let part = stock();
+  let mut store = store();
+  let mut index = HgIndex::new();
+  let mut admission = Admission::new(1 << 30);
+  let mut intake = Intake::begin(
+    (part.version, &part.payload),
+    &mut index,
+    &mut store,
+    &mut admission,
+  )
+  .unwrap();
+  let after_begin = admission.left();
+  let told = intake.bookkeeping();
+  loop {
+    match intake
+      .step(&part.payload, &mut store, &mut admission)
+      .unwrap()
+    {
+      Stepped::Store => intake.answer_from_fork(&store),
+      stepped if more(&stepped) => {}
+      _ => break,
+    }
+  }
+  let kept = after_begin - admission.left();
+  assert!(told > 0, "a push keeps something");
+  assert!(kept <= told, "kept {kept} of the {told} told");
+  finished(intake);
+}

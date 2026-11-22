@@ -60767,3 +60767,16 @@ Applied in the same change to:
   places later is encoded, not reordered; the loose stage's table of where each object begins is charged once to the
   request (a word pair an object, A-745 rule 1), `an_object_past_a_window_gets_a_delta_exactly_when_its_search_fits_the_admission`
   sizing its room with it.
+
+### A-860 — A git repository gone idle lets go of the objects its reads keep (2026-11-22, w-git for UI goal 93; main 01a20182's note of 04:24 PST; A-856's rule, A-722's recent objects)
+Applied in the same change to: `crates/git/src/store/packed.rs` (`Recent::let_go`), `crates/git/src/store/repository.rs`
+(`recent_bytes`, `let_go_recent`), `crates/server/src/vcs_store/git_encode.rs` (`give_back_idle` lets them go), GAPS.
+
+- **Found by use.** w-shared's gauges: `git.recent_bytes`, a repository's objects read lately (git's delta base cache),
+  held at its budget, 53.9 MB, after a git/git v2.0.0 clone had ended, 0.2 MB before it. The cache's budget is the
+  repository's largest pack, and nothing let it go between reads.
+- **Change.** As a repository goes idle (its last fetch ending, or the task making its encoding ahead stopping with no
+  fetch answered, A-856), the objects its reads keep are let go and its read buffers' room given back, the cache's budget
+  kept for the reads after; counted with the rest in `vcs_store.git_encode.given_back_idle`.
+- **Tests.** `slates-server` `vcs_store::git_encode::tests::t_a860_a_repository_gone_idle_lets_go_of_the_objects_its_reads_keep`
+  (the encoding's reads kept 417 bytes here; once the fetch ended, back to the 32 before; red before: 417 held).
