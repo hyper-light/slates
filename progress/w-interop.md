@@ -496,3 +496,14 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   - git/git verbs at 2acbba249 (main's r17): 25/25 (2,847 s). git/git whole still red (mirror clone killed past 120 s;
     w-git's CRC32 reuse).
   - svn: an old kiln r3 (binary 1a35ab091, pre-d843d2325) red revprop-http, stale; ledger 33/33 stands.
+- LEDGER (main, 2026-11-22 ~13:00): hg matrix over Mercurial's whole history (57,054 changesets), stock hg 7.2, HTTP
+  and SSH, CPUs oversubscribed 2x: 24/24 on ubuntu-24.04-arm and ubuntu-latest x2, CI 45065911852 at main 7ced987e6
+  (w-hg's clone-spin fixes); spins 0/1/0, no kills; ssh-push 5-6 s. Open on that row: peak RSS 5.8 GB (w-hg's next),
+  the head-of-line wait (w-hg's staging).
+- LANDED 951be1217 (2026-11-22 ~13:35 PST, main 7240125cf): vfs Overlay::observe answers a gone base directory's
+  first use after recovery from its node (A-833's lazy reopen had made recovery.rs's gone-directory test red on
+  main); Overlay::reacquire never records a directory gone on EMFILE/ENFILE (main's ruling). Bug note
+  docs/bugs/2026-11-22-overlay-gone-base-directory-first-use.md; GAPS closed. Reds: the recovery test, two vfs tests.
+  recovery target 59/60: a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone fails identically on
+  unchanged main ("63 MiB before, 1364 MiB after, for a 256 MiB burst"), reported.
+- Disk: deleted w-interop-ceiling/target (6.0 GB); no other target of mine.
