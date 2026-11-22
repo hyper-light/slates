@@ -7829,7 +7829,8 @@ mod tests {
   /// and its pack by identity, appended only once both are durable (`vcs_store::content_durable`, through the homing);
   /// then stop the daemon without publishing anything more, as a crash between the push and anything after it, and start
   /// a successor over the same segment. Expect: the successor replays the record whole from the content its image holds:
-  /// the repository recovered, `main` at the pushed commit, no replay refused and nothing missing, the record version 4.
+  /// the repository recovered, `main` at the pushed commit, no replay refused and nothing missing, the record at the
+  /// version the writer writes now (`vcs_store::record::VERSION_LANDED`, 6 since A-850).
   /// Without the barrier (the entry appended right after the contents were put) they are in no image and the replay is
   /// refused.
   #[test]
@@ -7935,7 +7936,16 @@ mod tests {
     let seen = got.recv().ok();
     second.stop();
     drop(segment);
-    assert_eq!(seen, Some((true, true, 0, 0, vec![5])));
+    assert_eq!(
+      seen,
+      Some((
+        true,
+        true,
+        0,
+        0,
+        vec![crate::vcs_store::record::VERSION_LANDED]
+      ))
+    );
   }
 
   /// A-767 C5 (git onto the changeset store; main's order of 2026-11-20 ~21:20: "red first: a stock git push lands as
@@ -8081,7 +8091,10 @@ mod tests {
     let [(version, sequence, Some(pack))] = records[..] else {
       panic!("one record naming a pack: {records:?}")
     };
-    assert_eq!((version, sequence), (6, 1));
+    assert_eq!(
+      (version, sequence),
+      (crate::vcs_store::record::VERSION_LANDED, 1)
+    );
     // The store's log, read back from its files: the creation, then the push as one changeset.
     store.stop_owner();
     let dir = store.dir().to_path_buf();

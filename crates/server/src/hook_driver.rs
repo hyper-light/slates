@@ -31,13 +31,12 @@
 //! **Platforms.** Unix (Linux and macOS) here; Windows starts a hook through `slates_ipc::win_spawn` and ends its
 //! descendants with a job object, owed as A-622's Windows part, so this module is built on Unix alone.
 
+use slates_ipc::confined_spawn::SpawnedChild as Child;
 use std::future::Future;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::pin::{Pin, pin};
-use std::process::{Child, Command, Stdio};
 use std::task::Poll;
 
 use slates_ipc::exit_watch::ExitWatch;
@@ -221,63 +220,77 @@ struct Hook {
 impl Hook {
   /// Starts the hook (the module doc): `StartRefused` by the operating system's cause.
   fn spawn(launch: Launch<'_>) -> Result<Self, StartRefused> {
+    use slates_ipc::confined_spawn::{ChildStream, Environment, Spawn};
     let (words_read, words_write) = std::io::pipe().map_err(|error| start_refused(&error))?;
-    let mut command = Command::new(launch.program);
-    command
-      .args(
-        launch
-          .input
-          .args
-          .iter()
-          .map(|arg| std::ffi::OsStr::from_bytes(arg)),
-      )
-      .current_dir(match launch.input.point.directory() {
+    let (input_read, input_write) = std::io::pipe().map_err(|error| start_refused(&error))?;
+    let output_pipe = if launch.input.point.output_is_lock_token() {
+      Some(std::io::pipe().map_err(|error| start_refused(&error))?)
+    } else {
+      None
+    };
+    let args: Vec<&std::ffi::OsStr> = launch
+      .input
+      .args
+      .iter()
+      .map(|arg| std::ffi::OsStr::from_bytes(arg))
+      .collect();
+    let overrides: Vec<(&std::ffi::OsStr, &std::ffi::OsStr)> = launch
+      .input
+      .env
+      .iter()
+      .map(|(name, value)| {
+        let value = match value {
+          EnvValue::Bytes(bytes) => std::ffi::OsStr::from_bytes(bytes),
+          EnvValue::ViewRoot => launch.view_root.as_os_str(),
+        };
+        (std::ffi::OsStr::new(name.as_str()), value)
+      })
+      .collect();
+    let stdout = match launch.input.point.words_from() {
+      WordsFrom::BothStreams => ChildStream::Fd(words_write.as_fd()),
+      WordsFrom::ErrorStream => match &output_pipe {
+        Some((_, write)) => ChildStream::Fd(write.as_fd()),
+        None => ChildStream::Null,
+      },
+    };
+    // Every child the daemon starts is handed only its three streams (`slates_ipc::confined_spawn`, main 01a20182's
+    // ruling of 2026-11-22): no pipe another thread was making as it spawned reaches it.
+    let spawned = slates_ipc::confined_spawn::spawn(&Spawn {
+      program: launch.program,
+      args: &args,
+      // A Subversion hook starts with its hooks-env section alone, never the server's environment (A-623,
+      // `run_hook_cmd`).
+      environment: if launch.input.clean_environment {
+        Environment::Clear
+      } else {
+        Environment::Inherited
+      },
+      overrides: &overrides,
+      directory: match launch.input.point.directory() {
         HookDirectory::ViewRoot => launch.view_root,
         HookDirectory::FilesystemRoot => Path::new(FILESYSTEM_ROOT),
-      })
-      .process_group(0)
-      .stdin(Stdio::piped());
-    // A Subversion hook starts with its hooks-env section alone, never the server's environment (A-623,
-    // `run_hook_cmd`).
-    if launch.input.clean_environment {
-      command.env_clear();
-    }
-    for (name, value) in &launch.input.env {
-      match value {
-        EnvValue::Bytes(bytes) => command.env(name, std::ffi::OsStr::from_bytes(bytes)),
-        EnvValue::ViewRoot => command.env(name, launch.view_root),
-      };
-    }
-    let mut output_read = None;
-    match launch.input.point.words_from() {
-      WordsFrom::BothStreams => {
-        let joined = words_write
-          .try_clone()
-          .map_err(|error| start_refused(&error))?;
-        command.stdout(Stdio::from(joined));
-      }
-      WordsFrom::ErrorStream if launch.input.point.output_is_lock_token() => {
-        let (read, write) = std::io::pipe().map_err(|error| start_refused(&error))?;
-        command.stdout(Stdio::from(write));
-        output_read = Some(read);
-      }
-      WordsFrom::ErrorStream => {
-        command.stdout(Stdio::null());
-      }
-    }
-    command.stderr(Stdio::from(words_write));
-    let mut child = command.spawn().map_err(|error| start_refused(&error))?;
-    // The command holds this side's copies of the words stream's write end: dropped, so the stream ends when the hook
-    // and what it started close theirs.
-    drop(command);
-    let input = child.stdin.take().map(OwnedFd::from);
+      },
+      own_group: true,
+      stdin: ChildStream::Fd(input_read.as_fd()),
+      stdout,
+      stderr: ChildStream::Fd(words_write.as_fd()),
+    });
+    // This side's copies of the child's ends: dropped, so the words stream ends when the hook and what it started close
+    // theirs, and its input when this side closes its own.
+    drop((words_write, input_read));
+    let output_read = output_pipe.map(|(read, write)| {
+      drop(write);
+      read
+    });
+    let mut child = spawned.map_err(|error| start_refused(&error))?;
+    let input = Some(OwnedFd::from(input_write));
     let words = OwnedFd::from(words_read);
     let output = output_read.map(OwnedFd::from);
     let exit = match ExitWatch::on(child.id()) {
       Ok(exit) => exit,
       Err(_) => {
         // Its exit cannot be awaited: killed with its group at once, and waited for (`SIGKILL` makes the wait short).
-        kill_group_of(&child);
+        child.kill_group();
         let _ = child.wait();
         return Err(StartRefused::NoRoom);
       }
@@ -356,6 +369,11 @@ impl Hook {
     let exit = (!self.exit_seen)
       .then(|| self.exit.readiness().map(|fd| fd.as_raw_fd()))
       .flatten();
+    // The watch fired but the status is not readable yet: macOS posts a process's exit note a moment before it can be
+    // waited for (seen: the note and the words' end at 51 ms, `waitid` none, and nothing left to wake the run, which waited
+    // on no deadline until its client gave up). The run yields to the shard once and reads again, until the status is
+    // there; the gap is the kernel's own few microseconds of the exit.
+    let exit_pending = self.exit_seen && !self.exited;
     let mut words = pin!(async move {
       match words {
         Some(fd) => slates_rt::readiness::readable(fd).await,
@@ -377,6 +395,10 @@ impl Hook {
     let mut exit = pin!(async move {
       match exit {
         Some(fd) => slates_rt::readiness::readable(fd).await,
+        None if exit_pending => {
+          futures::yield_now().await;
+          Ok(())
+        }
         None => std::future::pending().await,
       }
     });
@@ -467,18 +489,18 @@ impl Hook {
     Some(Happened::OutputEnded)
   }
 
-  /// The hook's exit, once its watch has it: its status read without reaping it (the struct's doc); none before, and
-  /// none twice. A status not yet readable when the watch fired is read again at the run's next wake (its words' end,
-  /// which an exit brings, or its deadline or its client).
+  /// The hook's exit, once it has exited: its status read without reaping it (the struct's doc); none before, and none
+  /// twice. Asked of the kernel at every wake, its watch or not: a hook that exits before its watch is registered is a
+  /// zombie the watch takes and never fires for (seen on macOS: a refusing hook's words ended at 51 ms and its run waited
+  /// on the watch until the test's bound, 1 of 20 runs of `hooks_spawned_at_once_each_end_at_their_own_exit`), so the
+  /// watch only wakes the run, and the status is what says it exited. A status not yet readable is read again at the
+  /// run's next wake (its words' end, which an exit brings, or its deadline or its client).
   fn read_exit(&mut self) -> Option<Happened> {
     if self.exited {
       return None;
     }
     if !self.exit_seen {
       self.exit_seen = self.exit.exited();
-    }
-    if !self.exit_seen {
-      return None;
     }
     let pid = self
       .child
@@ -504,7 +526,7 @@ impl Hook {
   /// Kills the hook's process group: the hook and what it started that stayed in its group.
   fn kill_group(&self) {
     if let Some(child) = self.child.as_ref() {
-      kill_group_of(child);
+      child.kill_group();
     }
   }
 
@@ -528,7 +550,7 @@ impl Drop for Hook {
     if let Ok(Some(_)) = child.try_wait() {
       return;
     }
-    kill_group_of(&child);
+    child.kill_group();
     let exit = ExitWatch::on(child.id()).ok();
     let handed = futures::spawn(reap_killed(child, exit)).and_then(futures::detach);
     match handed {
@@ -547,14 +569,20 @@ pub(crate) async fn run_helper(
   args: &[&str],
   bound_ns: u64,
 ) -> Result<bool, String> {
-  let mut child = Command::new(program)
-    .args(args)
-    .process_group(0)
-    .stdin(Stdio::null())
-    .stdout(Stdio::null())
-    .stderr(Stdio::null())
-    .spawn()
-    .map_err(|error| format!("could not be started: {error}"))?;
+  use slates_ipc::confined_spawn::{ChildStream, Environment, Spawn};
+  let args: Vec<&std::ffi::OsStr> = args.iter().map(std::ffi::OsStr::new).collect();
+  let mut child = slates_ipc::confined_spawn::spawn(&Spawn {
+    program,
+    args: &args,
+    environment: Environment::Inherited,
+    overrides: &[],
+    directory: Path::new(FILESYSTEM_ROOT),
+    own_group: true,
+    stdin: ChildStream::Null,
+    stdout: ChildStream::Null,
+    stderr: ChildStream::Null,
+  })
+  .map_err(|error| format!("could not be started: {error}"))?;
   let exit = ExitWatch::on(child.id()).ok();
   let waited = futures::within(bound_ns, async {
     loop {
@@ -577,7 +605,7 @@ pub(crate) async fn run_helper(
     Ok(Some(Some(success))) => Ok(success),
     Ok(Some(None)) => Err("could not be waited for".to_owned()),
     Ok(None) | Err(_) => {
-      kill_group_of(&child);
+      child.kill_group();
       let _ = child.wait();
       Err("ran past its bound and was killed".to_owned())
     }
@@ -606,17 +634,6 @@ async fn reap_killed(mut child: Child, exit: Option<ExitWatch>) {
         return;
       }
     }
-  }
-}
-
-/// Kills `child`'s process group, which its unreaped leader keeps reserved; refused only when the group has gone, which
-/// is what the kill was for.
-fn kill_group_of(child: &Child) {
-  if let Some(pid) = i32::try_from(child.id())
-    .ok()
-    .and_then(rustix::process::Pid::from_raw)
-  {
-    let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
   }
 }
 
@@ -1060,6 +1077,62 @@ mod tests {
       words.contains("refused by the hook") && !words.contains("to standard output"),
       "{words}"
     );
+  }
+
+  /// Shape: how many hooks are spawned at once in [`hooks_spawned_at_once_each_end_at_their_own_exit`], half refusing
+  /// at once and half sleeping: enough spawns at once that a pipe made between them leaks into one, as main's parallel
+  /// daemon_edge set leaked one in 2 of 12 runs.
+  const AT_ONCE: usize = 32;
+  /// Shape: the rounds of [`AT_ONCE`] spawns.
+  const ROUNDS: usize = 4;
+  /// Shape: how long a sleeping hook's client stays before it leaves (and its hook is killed with its group): what a
+  /// refusing hook whose words stream leaked into it would wait for.
+  const HOLDER_NS: u64 = 4 * LIVENESS_BUDGET_NS;
+  /// Shape: how long a refusing hook's run may take, spawn and words and exit: half a holder's life, so a run a leaked
+  /// stream held until its holder was killed is never inside it.
+  const QUICK_RUN_NS: u64 = HOLDER_NS / 2;
+
+  /// main 01a20182's ruling of 2026-11-22 02:06 (the hook pipe race, (a)): a pipe made while another thread spawned leaked
+  /// into that child (macOS has no `pipe2`), so a refusing hook's words stream stayed open past its exit, held by a
+  /// stranger, and its first run, with no learned bound, waited until its client's read gave up. Do: [`ROUNDS`] times,
+  /// spawn [`AT_ONCE`] hooks at once, each from a thread of its own, half refusing at once and half sleeping until their
+  /// client leaves after [`HOLDER_NS`]. Expect: every refusing hook refused with its words, its run ended at its own exit
+  /// (within [`QUICK_RUN_NS`]), never held by a sleeping hook that inherited its words stream. Before, the driver spawned
+  /// through `std::process::Command`, which hands a child every descriptor not yet marked close-on-exec.
+  #[test]
+  fn hooks_spawned_at_once_each_end_at_their_own_exit() {
+    for _round in 0..ROUNDS {
+      let runs: Vec<_> = (0..AT_ONCE)
+        .map(|at| {
+          std::thread::spawn(move || {
+            let refusing = at % 2 == 0;
+            let (role, leaves) = if refusing {
+              ("refuse", None)
+            } else {
+              ("sleep", Some(HOLDER_NS))
+            };
+            let ran = drive(
+              None,
+              input(HookPoint::SvnPreCommit, role, &[], Vec::new()),
+              None,
+              leaves,
+            );
+            (refusing, ran)
+          })
+        })
+        .collect();
+      for run in runs {
+        let (refusing, ran) = run.join().expect("the run's thread");
+        if !refusing {
+          continue;
+        }
+        let (outcome, _, took) = ran.expect("the refusing run ended");
+        assert!(
+          text(&outcome).contains("refused by the hook") && took < QUICK_RUN_NS,
+          "a refusing hook's run took {took} ns (a sleeping hook holds its words for {HOLDER_NS} ns): {outcome:?}"
+        );
+      }
+    }
   }
 
   /// A-622 part 3 (the learned deadline, the group's kill, the reap). Do: with a learned bound, run a hook that sleeps.

@@ -30,7 +30,7 @@ use slates_db::catalog::Principal;
 use slates_ipc::protocol::{
   Direction, Intent, NamePolicy, Refusal, ReplyBody, RequestBody, SizeClass, VolumeId, pack, unpack,
 };
-use slates_ipc::{ClientEnd, IpcError, connect};
+use slates_ipc::{ClientEnd, connect};
 use slates_server::shards::{ShardsAsk, ShardsAttached};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 use slates_wire::request::RequestId;
@@ -2637,6 +2637,7 @@ fn flush_cost_after_logged_writes() {
 /// every hostile exchange can be made.
 #[cfg(target_os = "macos")]
 mod route {
+  use slates_ipc::IpcError;
   use slates_ipc::route::{
     Exchange, HELLO_BYTES, Hello, KIND_CHALLENGE, KIND_MALFORMED, KIND_PROOF, NONCE_BYTES,
     OfferKind, SEALED_BYTES,

@@ -201,6 +201,9 @@ impl AheadHold {
 /// The content store's refusal of a hold, in the push's words: its room `BudgetExceeded`, any other (a newer placement
 /// took the green's stage) `ContentUnavailable`.
 fn refused(refusal: ContentRefusal) -> Refusal {
+  // Named in the daemon's log, so a run that meets it says which (main 01a20182's order of 2026-11-22 03:50: a fresh
+  // repository's first push refused on CI's runners, not reproduced on a Mac).
+  slates_machine::log_line!("slates-server: a push's increment held ahead was refused by the content store: {refusal:?}");
   match refusal {
     ContentRefusal::NoCapacity { available, .. } => Refusal::BudgetExceeded { available },
     _ => Refusal::ContentUnavailable,

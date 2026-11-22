@@ -1354,6 +1354,181 @@ fn history_bundle(made: &[Made], revs: &[usize]) -> Vec<u8> {
   out
 }
 
+/// Format: the first room a push's intake is given in
+/// [`a_mercurial_push_past_its_first_admission_waits_for_room_and_lands_whole`]: far less than its changegroup's
+/// framing, as a small learned demand left one on w-interop's runner.
+const STARVED_ROOM: u64 = 64;
+
+/// Main 01a20182's order of 2026-11-22 03:03 (w-interop's ubuntu find: stock 7.2's push of hg's history refused
+/// `Delta { log: Manifests, .. PastAdmission { asked: 73365, left: 50646 } }`; the rule, A-857: an intake past its
+/// admission waits for room, never refused). Do: start a two-shard daemon over loopback TLS; create a Mercurial
+/// repository; push one changeset as stock hg posts it, its intake's first room [`STARVED_ROOM`] bytes
+/// (`hg_push::TEST_FIRST_INTAKE_ROOM`); then ask `heads`. Expect the push `200` in `application/mercurial-0.1`, `heads`
+/// the pushed changeset, and the wait counted (`vcs.hg.push_intake_room_waits`, `vcs_share.room_waits_taken`). Red
+/// before: the push refused past its admission.
+#[test]
+fn a_mercurial_push_past_its_first_admission_waits_for_room_and_lands_whole() {
+  let (identity, certificate) = identity();
+  let (daemon, _instance) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  create_empty_hg(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let made = history_of(&[(
+    "starved",
+    "starved",
+    b"a push past its first room\n",
+    None,
+    "default",
+  )]);
+  crate::repository::hg_push::TEST_FIRST_INTAKE_ROOM
+    .store(STARVED_ROOM, core::sync::atomic::Ordering::Relaxed);
+  let pushed = hg_unbundle(edge, &name, &history_bundle(&made, &[0]));
+  let heads = hg_command(edge, &name, "heads");
+  let counted = |name: &'static str| {
+    (0..daemon.shards().len())
+      .map(|partition| {
+        crate::daemon::observe_at(&daemon, partition, move |state| {
+          state.refusals.get(name).copied().unwrap_or(0)
+        })
+      })
+      .sum::<u64>()
+  };
+  let waits = (
+    counted(crate::repository::hg_push::INTAKE_ROOM_WAITS),
+    counted(crate::vcs_share::wait::TAKEN),
+  );
+  daemon.stop();
+  assert_eq!(
+    (pushed.0, pushed.1.as_str()),
+    (200, "application/mercurial-0.1"),
+    "{}",
+    String::from_utf8_lossy(&pushed.2)
+  );
+  let tip = crate::verbs::hex_of(&made[0].node);
+  assert_eq!(
+    heads,
+    (200, format!("{tip}\n").into_bytes()),
+    "{}",
+    String::from_utf8_lossy(&pushed.2)
+  );
+  assert!(
+    waits.0 > 0 && waits.1 > 0,
+    "the intake waited for room and took it: {waits:?}"
+  );
+}
+
+/// Main 01a20182's order of 2026-11-22 03:35 (w-interop's ubuntu find: a chunked push of hg's history at revision 12,000
+/// answered `push refused: the content store could not hold its increments; push again`). Do: start a two-shard daemon
+/// over loopback TLS; create a Mercurial repository; push one changeset as stock hg posts it, its increments' first hold
+/// refused as a full content store refuses it (`hg_push::TEST_HOLD_REFUSED`); then ask `heads`. Expect the push `200` in
+/// `application/mercurial-0.1`, `heads` the pushed changeset, and the wait counted (`vcs.hg.push_held_ahead_room_waits`).
+/// Red before: `push again` to a stock client.
+#[test]
+fn a_mercurial_push_its_store_cannot_hold_for_now_waits_for_room_and_lands_whole() {
+  let (identity, certificate) = identity();
+  let (daemon, _instance) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  create_empty_hg(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let made = history_of(&[(
+    "held",
+    "held",
+    b"a push the store holds once room comes\n",
+    None,
+    "default",
+  )]);
+  crate::repository::hg_push::TEST_HOLD_REFUSED.store(true, core::sync::atomic::Ordering::Relaxed);
+  let pushed = hg_unbundle(edge, &name, &history_bundle(&made, &[0]));
+  let heads = hg_command(edge, &name, "heads");
+  let waits = (0..daemon.shards().len())
+    .map(|partition| {
+      crate::daemon::observe_at(&daemon, partition, |state| {
+        state
+          .refusals
+          .get(crate::repository::hg_push::HELD_AHEAD_ROOM_WAITS)
+          .copied()
+          .unwrap_or(0)
+      })
+    })
+    .sum::<u64>();
+  daemon.stop();
+  assert_eq!(
+    (pushed.0, pushed.1.as_str()),
+    (200, "application/mercurial-0.1"),
+    "{}",
+    String::from_utf8_lossy(&pushed.2)
+  );
+  let tip = crate::verbs::hex_of(&made[0].node);
+  assert_eq!(heads, (200, format!("{tip}\n").into_bytes()));
+  assert!(waits > 0, "the push waited for the store's room");
+}
+
+/// Format: the changesets of [`a_fresh_repositorys_first_push_of_hundreds_of_changesets_is_taken_at_once`]'s push, as
+/// w-interop's 500-revision chunks were.
+const FRESH_CHANGESETS: usize = 500;
+
+/// Main 01a20182's order of 2026-11-22 03:50 (w-interop: a fresh repository's first 500-revision chunk refused at once,
+/// `the content store could not hold its increments; push again`, the daemon at 64 to 88 MiB on x86 and arm). Do: start
+/// a two-shard daemon over loopback TLS; create a Mercurial repository and, with no gap, push a line of
+/// [`FRESH_CHANGESETS`] changesets as stock hg posts it; then ask `heads`. Expect the push `200` in
+/// `application/mercurial-0.1` and `heads` the line's last changeset: a first push is taken whole, never told to push
+/// again.
+#[test]
+fn a_fresh_repositorys_first_push_of_hundreds_of_changesets_is_taken_at_once() {
+  let (identity, certificate) = identity();
+  let (daemon, _instance) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let paths: &'static [String] = Box::leak(
+    (0..FRESH_CHANGESETS)
+      .map(|at| format!("file-{at}"))
+      .collect::<Vec<_>>()
+      .into_boxed_slice(),
+  );
+  let texts: &'static [Vec<u8>] = Box::leak(
+    (0..FRESH_CHANGESETS)
+      .map(|at| format!("revision {at}\n").into_bytes())
+      .collect::<Vec<_>>()
+      .into_boxed_slice(),
+  );
+  let commits: Vec<crate::repository::hg_push::tests::Commit> = (0..FRESH_CHANGESETS)
+    .map(|at| {
+      let parent = at.checked_sub(1);
+      (
+        paths[at].as_str(),
+        paths[at].as_str(),
+        texts[at].as_slice(),
+        parent,
+        "default",
+      )
+    })
+    .collect();
+  let made = history_of(&commits);
+  let bundle = history_bundle(&made, &(0..FRESH_CHANGESETS).collect::<Vec<_>>());
+  create_empty_hg(&daemon, &name);
+  let pushed = hg_unbundle((port, &certificate), &name, &bundle);
+  let heads = hg_command((port, &certificate), &name, "heads");
+  daemon.stop();
+  assert_eq!(
+    (pushed.0, pushed.1.as_str()),
+    (200, "application/mercurial-0.1"),
+    "{}",
+    String::from_utf8_lossy(&pushed.2)
+  );
+  let tip = crate::verbs::hex_of(&made[FRESH_CHANGESETS - 1].node);
+  assert_eq!(
+    heads,
+    (200, format!("{tip}\n").into_bytes()),
+    "{}",
+    String::from_utf8_lossy(&pushed.2)
+  );
+}
+
 /// A-711 (found by use, 2026-11-20: stock hg 7.2's push of Mercurial's own repository, 57,036 changesets in an 84 MiB
 /// store, answered `abort: HTTP Error 413: Content Too Large` after 7.5 s; hg's twin of A-704). Do: start a two-shard
 /// daemon whose edge serves loopback TLS, each request admitted one ring region (the edge's `Bounds::room`); create a

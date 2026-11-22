@@ -1541,11 +1541,25 @@ async fn landed_after_rebases(
     };
     // Their increments held in the content store next, a unit a turn: the landing's step names them, never hashes or
     // copies them (`crate::held_ahead`).
-    let ahead = match held_ahead(&built).await? {
-      Ok(ahead) => ahead,
-      Err(_) => {
-        give_back(forked);
-        return Some(PushOutcome::refused(&abort(UNHELD.to_vec())));
+    let ahead = loop {
+      match held_ahead(&built).await? {
+        Ok(ahead) => break ahead,
+        // Past what the content store can hold now: the push waits for room (the content store giving windows back, or
+        // others releasing theirs) under the wait shared with git's, and holds its increments again; what the earlier
+        // works held was given back (main 01a20182's order of 2026-11-22 03:35).
+        Err(slates_ipc::protocol::Refusal::BudgetExceeded { available }) => {
+          let _ = crate::state::with_state(|state| state.count(HELD_AHEAD_ROOM_WAITS, 1));
+          // What the store could hold when it refused is what the wait must see the room grow past.
+          let admitted = available;
+          if !matches!(room_after_wait(repository, admitted, None).await?, Ok(_)) {
+            give_back(forked);
+            return Some(PushOutcome::refused(&abort(UNHELD.to_vec())));
+          }
+        }
+        Err(_) => {
+          give_back(forked);
+          return Some(PushOutcome::refused(&abort(UNHELD.to_vec())));
+        }
       }
     };
     let landing_step = slates_rt::futures::doing("hg_push::landing");
@@ -1739,6 +1753,12 @@ async fn held_ahead(
   built: &BTreeMap<WorkKey, Increment>,
 ) -> Option<Result<Vec<crate::held_ahead::HeldAhead>, slates_ipc::protocol::Refusal>> {
   let _doing = slates_rt::futures::doing("hg_push::held_ahead");
+  #[cfg(test)]
+  if TEST_HOLD_REFUSED.swap(false, core::sync::atomic::Ordering::Relaxed) {
+    return Some(Err(slates_ipc::protocol::Refusal::BudgetExceeded {
+      available: 0,
+    }));
+  }
   let mut ahead = Vec::new();
   for (&(green, base_version, ..), work) in built {
     let begun = crate::state::with_state(|state| {
@@ -2299,7 +2319,7 @@ fn begin_intake(
   changegroup: (Version, Vec<u8>),
   lend: u64,
   room: &mut Admission,
-) -> Option<Result<Taking, Box<Refused>>> {
+) -> Option<Result<Taking, IntakeRefused>> {
   vcs_store::within_budget(state, lend, |stores| {
     if stores.rebuilding(repository) {
       return None;
@@ -2317,13 +2337,18 @@ fn begin_intake(
           generation,
           costs: vcs_store::TurnCosts::ZERO,
         }),
-        Err(refused) => Err(intake_refused(&refused)),
+        Err(refused) => Err(refused),
       },
     )
   })
 }
 
 /// `changegroup` taken into its fork a slice at a time, a yield between slices (A-720); none when the store went away.
+/// A begin or a step past the push's admission waits for room (main 01a20182's ruling of 2026-11-22 03:03, the wait
+/// shared with git's, `vcs_share::wait`) and is taken again in the room the wait gives, what the push already holds
+/// charged to it first: a stock client's push of a long history is taken whole, never refused for its own earlier
+/// revisions' bookkeeping. A step past the most the repository could ever be lent, or a wait past its patience, is
+/// refused as before.
 async fn take_sliced(
   repository: RepositoryId,
   changegroup: (Version, Vec<u8>),
@@ -2332,11 +2357,36 @@ async fn take_sliced(
 ) -> Option<Result<Forked, PushOutcome>> {
   // A-740: a shard stuck in this step names it.
   let _doing = slates_rt::futures::doing("hg_push::take");
-  let begun =
-    crate::state::with_state(|state| begin_intake(state, repository, changegroup, lend, room));
-  let mut taking = match begun.flatten()? {
-    Ok(taking) => taking,
-    Err(refused) => return Some(Err(PushOutcome::refused(&refused))),
+  #[cfg(test)]
+  {
+    let first = TEST_FIRST_INTAKE_ROOM.swap(0, core::sync::atomic::Ordering::Relaxed);
+    if first > 0 {
+      *room = Admission::new(first);
+    }
+  }
+  let mut admitted = room.left();
+  let mut taking = loop {
+    let mut tried = *room;
+    let begun = crate::state::with_state(|state| {
+      begin_intake(state, repository, changegroup.clone(), lend, &mut tried)
+    });
+    match begun.flatten()? {
+      Ok(taking) => {
+        *room = tried;
+        break taking;
+      }
+      Err(refused) => match refused.past_admission() {
+        // Nothing is held before the begin: it begins again in the room the wait gives.
+        Some(past) => match room_after_wait(repository, admitted, Some(past.asked)).await? {
+          Ok(grown) => {
+            admitted = grown;
+            *room = Admission::new(admitted);
+          }
+          Err(()) => return Some(Err(PushOutcome::refused(&intake_refused(&refused)))),
+        },
+        None => return Some(Err(PushOutcome::refused(&intake_refused(&refused)))),
+      },
+    }
   };
   loop {
     let sliced = crate::state::with_state(|state| taking.slice(state, lend, room));
@@ -2356,7 +2406,80 @@ async fn take_sliced(
       }
       // The slice answers a whole changegroup's want as its truncation; none reaches here.
       Ok(Stepped::Wanted(range)) => return Some(Err(intake_outcome(&whole_wanted(&[], range)))),
-      Err(refused) => return Some(Err(intake_outcome(&refused))),
+      Err(refused) => {
+        // The step refused left the intake where it was (`slates_hg::push::intake::Refused::past_admission`): it is
+        // taken again in the room the wait gives, what the push holds charged to it first.
+        let Some(past) = refused.past_admission() else {
+          return Some(Err(intake_outcome(&refused)));
+        };
+        let held = admitted.saturating_sub(room.left());
+        let needed = held.saturating_add(past.asked);
+        let grown = match room_after_wait(repository, admitted, Some(needed)).await? {
+          Ok(grown) => grown,
+          Err(()) => return Some(Err(intake_outcome(&refused))),
+        };
+        let mut regrown = Admission::new(grown);
+        if regrown.charge(held).is_err() {
+          return Some(Err(intake_outcome(&refused)));
+        }
+        admitted = grown;
+        *room = regrown;
+        // Its record names the room it was taken within, so a replay takes it in the same room.
+        taking.room = grown;
+      }
+    }
+  }
+}
+
+/// A test's refusal of the next push's increments held ahead, once, as a content store full for now refuses them
+/// (`BudgetExceeded`), so the push's wait for room is met by use (w-interop's ubuntu find at revision 12,000).
+#[cfg(test)]
+pub(crate) static TEST_HOLD_REFUSED: core::sync::atomic::AtomicBool =
+  core::sync::atomic::AtomicBool::new(false);
+
+/// Counter: a push whose increments the content store could not hold for now, waiting for room before holding them
+/// again (main 01a20182's order of 2026-11-22 03:35). Format: a counter name in the status report.
+pub(crate) const HELD_AHEAD_ROOM_WAITS: &str = "vcs.hg.push_held_ahead_room_waits";
+
+/// A test's first room for the next push's intake, taken once (0: none): a stock push's admission made smaller than its
+/// own bookkeeping, as A-724's learned demand made one on w-interop's runner, so the wait is met by use.
+#[cfg(test)]
+pub(crate) static TEST_FIRST_INTAKE_ROOM: core::sync::atomic::AtomicU64 =
+  core::sync::atomic::AtomicU64::new(0);
+
+/// Counter: a push's intake past its admission that waited for room and was taken again (main 01a20182's ruling of
+/// 2026-11-22 03:03). Format: a counter name in the status report.
+pub(crate) const INTAKE_ROOM_WAITS: &str = "vcs.hg.push_intake_room_waits";
+
+/// Waits for repository `id`'s room to grow past `admitted` and cover `needed` where it is known (`vcs_share::wait`):
+/// a push's intake past its admission, or its increments past what the content store can hold now. The room the wait
+/// gave; `Err` where it gave up (its patience, or a need past the most the repository could ever be lent); none where
+/// the shard's state is gone.
+async fn room_after_wait(
+  id: RepositoryId,
+  admitted: u64,
+  needed: Option<u64>,
+) -> Option<Result<u64, ()>> {
+  let mut wait = crate::vcs_share::wait::RoomWait::new(admitted, slates_rt::futures::now_ns());
+  let _ = crate::state::with_state(|state| state.count(INTAKE_ROOM_WAITS, 1));
+  loop {
+    let waited = crate::state::with_state(|state| {
+      wait.turn(
+        state,
+        id,
+        (
+          needed,
+          slates_rt::futures::now_ns(),
+          crate::daemon::HEARTBEAT_NS,
+        ),
+      )
+    })?;
+    match waited {
+      crate::vcs_share::wait::Waited::Again(room) => return Some(Ok(room)),
+      crate::vcs_share::wait::Waited::Wait(ns) => {
+        let _ = slates_rt::futures::sleep(ns).await;
+      }
+      crate::vcs_share::wait::Waited::GiveUp => return Some(Err(())),
     }
   }
 }
@@ -2409,7 +2532,7 @@ pub(crate) fn take_whole(
   let lend = u64::MAX;
   let mut taking = match begin_intake(state, repository, changegroup, lend, room)? {
     Ok(taking) => taking,
-    Err(refused) => return Some(Err(refused)),
+    Err(refused) => return Some(Err(intake_refused(&refused))),
   };
   loop {
     match taking.slice(state, lend, room) {
