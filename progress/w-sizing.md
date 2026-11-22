@@ -195,3 +195,7 @@ Plan: a section per pool extent, closed when wholly free; the anchor holds each 
   checkout failed when this Mac's disk was full. It was the clone, not a worktree, so `git worktree remove` didn't
   apply. I removed its two landed worktrees (a839, gaps4), checked that agents/w-sizing-arena's change equals main's
   b5249f883, and deleted the folder by its exact path. The next piece starts from a fresh clone.
+- 17:20 main 01a1ff2e: content pool growth by need (A-848, goal 93). Written in ~/slates-work/w-sizing-claim: slices cut
+  into a run doubling from one unit, claim(want) best fit, LAYOUT_VERSION 16, tests for main's two cases. Red tree
+  ~/slates-work/w-sizing-claim-red (origin/main + tests, ca8a04b96). Focused runs r8 (fix) and r9 (red) queued: the big
+  Studio and main's MacBook did not answer on r3-r7, then every macOS 16-core runner's link went down. Share cap open.

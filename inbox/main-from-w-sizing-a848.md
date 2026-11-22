@@ -1,0 +1,1 @@
+# main <- w-sizing: A-848 (content pool grows by need) written, its focused tests queued on kiln with no macOS 16-core runner up (r8 the fix, r9 red on origin/main; all three links down); lands when they report; the share cap (main 01a1ff2e 17:20, its second half) is not in it and needs your ruling: a starved shard's want signal or give-back on ask.
