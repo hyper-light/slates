@@ -276,6 +276,10 @@ pub(crate) trait Exchange {
   /// `gone` resolves if the client goes while the reply is made (a git push answered in the reply's turns, which may
   /// run a hook, A-722's keepalive).
   async fn reply(&mut self, out: &mut Vec<u8>, gone: ClientGone<'_>) -> Result<bool, Failed>;
+  /// Hears one write of what the connection sent while this exchange was served (A-859 part A): its bytes, how long the
+  /// peer took them in, and whether the write found the socket full. Nothing by default; git's fetch learns its link's
+  /// price from it.
+  fn sent(&mut self, _sent: crate::vcs_store::upload::Sent) {}
 }
 
 /// How a site answers a request's head.
@@ -430,6 +434,14 @@ impl<G: Exchange, H: Exchange, S: Exchange> Exchange for ToolExchange<G, H, S> {
       Self::Git(exchange) => exchange.reply(out, gone).await,
       Self::Hg(exchange) => exchange.reply(out, gone).await,
       Self::Svn(exchange) => exchange.reply(out, gone).await,
+    }
+  }
+
+  fn sent(&mut self, sent: crate::vcs_store::upload::Sent) {
+    match self {
+      Self::Git(exchange) => exchange.sent(sent),
+      Self::Hg(exchange) => exchange.sent(sent),
+      Self::Svn(exchange) => exchange.sent(sent),
     }
   }
 }
@@ -942,15 +954,22 @@ impl Socket {
     waited(awaited(read, deadline_ns, overdue).await, started_ns)
   }
 
-  /// Writes `bytes` whole, `overdue` called if `deadline_ns` passes first; and whether the wait was overdue.
+  /// Writes `bytes` whole, `overdue` called if `deadline_ns` passes first: whether the write found the socket full and
+  /// waited for the peer to take bytes (A-859 part A: a link's pace), and whether the wait was overdue.
   async fn write(
     &mut self,
     bytes: &[u8],
     deadline_ns: u64,
     overdue: impl FnMut(),
-  ) -> (Waited<()>, bool) {
+  ) -> (Waited<bool>, bool) {
     let started_ns = now_ns();
-    let write = self.stream.write_all(bytes);
+    let mut write = std::pin::pin!(self.stream.write_all(bytes));
+    let mut pended = false;
+    let write = std::future::poll_fn(move |cx| {
+      let polled = write.as_mut().poll(cx);
+      pended |= polled.is_pending();
+      polled.map(|written| written.map(|()| pended))
+    });
     waited(awaited(write, deadline_ns, overdue).await, started_ns)
   }
 
@@ -1067,13 +1086,28 @@ impl<S: Site> Parts<S> {
       return Flow::End(Why::Failed);
     };
     let marker = self.marker(overdue);
+    let bytes = u64::try_from(connection.output().len()).unwrap_or(u64::MAX);
     let waited = self
       .socket
       .write(connection.output(), deadline_ns, marker)
       .await;
     connection.written();
+    let took = match &waited.0 {
+      Waited::Done { waited_ns, .. } => Some(*waited_ns),
+      Waited::Failed => None,
+    };
     match self.settle(phase, waited) {
-      Ok(()) => Flow::Go,
+      Ok(pended) => {
+        // A-859 part A: the service hears how its reply's bytes were taken, a link's pace.
+        if let (Some(ns), Some(started)) = (took, self.service.as_mut()) {
+          started.exchange.sent(crate::vcs_store::upload::Sent {
+            bytes,
+            ns,
+            waited: pended,
+          });
+        }
+        Flow::Go
+      }
       Err(why) => Flow::End(why),
     }
   }
