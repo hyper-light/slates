@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, windows-11-arm]
+        os: [windows-11-arm]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 150
     defaults:
@@ -46,8 +46,8 @@ jobs:
           AWS_LC_SYS_PREBUILT_NASM: "0"
         run: |
           set +e
-          cargo test --release --locked -p slates-cli --test git_interop stock_git_clones_pushes_and_fetches_over_the_vcs_http_edge_with_basic -- --nocapture > git.log 2>&1; g=$?
-          SLATES_TEST_HG="uvx --quiet --python 3.12 --from mercurial==7.2 hg" cargo test --release --locked -p slates-cli --test hg_interop stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge -- --nocapture > hg.log 2>&1; h=$?
+          echo "uvx says: $(uvx --from mercurial==7.2.4 hg --version 2>&1 | head -2 | tr '\n' ' ')"; echo "py312: $(uvx --quiet --python 3.12 --from mercurial==7.2 hg --version 2>&1 | head -3 | tr '\n' ' ')"; g=0; echo skipped-git > git.log
+          SLATES_TEST_HG="uvx --quiet --from mercurial==7.2.4 hg" cargo test --release --locked -p slates-cli --test hg_interop stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge -- --nocapture > hg.log 2>&1; h=$?
           gs=$(grep -E "^test |test result|skipping|panicked" git.log | tr '\n' ' ' | cut -c1-700)
           hs=$(grep -E "^test |test result|skipping|panicked" hg.log | tr '\n' ' ' | cut -c1-700)
           [ -z "$gs" ] && gs=$(grep -E "^error" git.log | head -4 | tr '\n' ' ')
