@@ -92,6 +92,10 @@
 > length) and freed oldest first. (1) LANDED A-861: those objects lie in chunks of the mapped floor, given back whole;
 > red, 20,000 objects of 4 KiB kept grew the system path's live bytes by 6,582,872, green under a tenth of the budget, and
 > a third round's churn under a hundredth (`crates/git/tests/recent_ring.rs`); main's RSS round owed (run-requests).
+> Main's r15 at abcadd753 (A-861 and its charge): peak 531.2, after the push 327.4, after the clone 365.9 MiB, against
+> 815.2, 667.5 and 737.8 at f577268d3; still past the bound 177.7. (2a) LANDED A-863: a read of a let-go window brings it
+> back from the node's store; the RSS test now prints the memory gauges at each reading. (2b), the let-go after a landing,
+> next: a landed pack's windows have several holders, which `let_go` refuses (`Shared`).
 > Owed, in main's order: (1) the push's temporaries cut at their source (w-shared);
 > (2) landed windows and the pack let go once durable (w-shared, with w-git); (3) the recent-objects cache given back
 > after a fetch (w-git); (4) the index tables, decided after.
