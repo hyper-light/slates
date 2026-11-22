@@ -1,0 +1,64 @@
+name: diag-measurer-w-svn
+
+# w-svn, main 01a20182's order of 2026-11-22 03:22 (never main): on macos-latest, the HTTPv2 `svn propset --revprop`
+# hang's end (A-858: a hook's exit read whenever the kernel has it; every child spawned with only its streams) and the
+# svn_interop guard's order (a hook view unmounted while its daemon still serves it), at origin/main 00844de07. Results
+# as annotations; a test still running past 600 s is sampled.
+
+on:
+  push:
+    branches: ["diag-measurer-w-svn-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  svn-httpv2:
+    name: svn over HTTPv2 and the view guard (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: Stock Subversion
+        run: brew install subversion && svn --version --quiet
+      - name: Build the tests
+        run: cargo test --release --locked -p slates-cli --test svn_interop --no-run
+      - name: HTTPv2 against svnserve, and the guard under a deliberate failure
+        run: |
+          set +e
+          # A test still running past 600 s is sampled once, its stack kept.
+          sampler() {
+            sleep 600
+            for pid in $(pgrep -f "svn_interop-.*$1"); do sample "$pid" 5 -file "sample-$1-$pid.txt" > /dev/null 2>&1; done
+          }
+          sampler stock_svn_over_httpv2 & s1=$!
+          cargo test --release --locked -p slates-cli --test svn_interop stock_svn_over_httpv2_answers_as_stock_svnserve_byte_for_byte -- --nocapture > httpv2.log 2>&1; h=$?
+          kill $s1 2>/dev/null
+          sampler a_failing_test_lets & s2=$!
+          cargo test --release --locked -p slates-cli --test svn_interop -- --ignored a_failing_test_lets_its_hook_view_go_before_its_daemon --nocapture > guard.log 2>&1; g=$?
+          kill $s2 2>/dev/null
+          mount | grep -c "svn-view-failing" > mounts-left.txt
+          hs=$(grep -E "^test |test result|skipping|panicked|still held|left behind" httpv2.log | tr '\n' ' ' | cut -c1-700)
+          gs=$(grep -E "^test |test result|skipping|panicked|still held|left behind" guard.log | tr '\n' ' ' | cut -c1-700)
+          echo "::notice title=${{ matrix.os }} svn::httpv2 exit=$h: $hs%0Aguard exit=$g: $gs%0Aviews left mounted: $(cat mounts-left.txt)"
+          if [ $h -ne 0 ]; then echo "::error title=${{ matrix.os }} httpv2 failure::$(grep -E -A14 'panicked|^---- ' httpv2.log | head -40 | sed 's/%/%25/g' | awk 'BEGIN{ORS="%0A"}{print}')"; fi
+          if [ $g -ne 0 ]; then echo "::error title=${{ matrix.os }} guard failure::$(grep -E -A14 'panicked|^---- ' guard.log | head -40 | sed 's/%/%25/g' | awk 'BEGIN{ORS="%0A"}{print}')"; fi
+          [ $h -eq 0 ] && [ $g -eq 0 ]
+      - name: Keep the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: svn-httpv2-${{ matrix.os }}
+          path: |
+            httpv2.log
+            guard.log
+            mounts-left.txt
+            sample-*.txt
+          if-no-files-found: warn
