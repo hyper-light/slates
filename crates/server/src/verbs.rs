@@ -12971,6 +12971,7 @@ pub(crate) fn resume_all(state: &mut ShardState, parked: Vec<ParkedSubmit>) {
   }
   crate::g222_diag::resumes_done();
   for submit in parked {
+    let g222_cpu = slates_rt::g222_parks::thread_cpu_ns();
     let ParkedSubmit {
       origin,
       id,
@@ -13012,7 +13013,10 @@ pub(crate) fn resume_all(state: &mut ShardState, parked: Vec<ParkedSubmit>) {
       }
     };
     if let Some(route) = route.as_ref() {
-      crate::g222_diag::resume_ran(route.request);
+      crate::g222_diag::resume_ran(
+        route.request,
+        slates_rt::g222_parks::thread_cpu_ns().saturating_sub(g222_cpu),
+      );
     }
     if let (Some(reply), Some(route)) = (reply, route)
       && !answered_on(route, (origin, id), reply)

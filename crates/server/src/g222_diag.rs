@@ -168,6 +168,8 @@ struct Fwd {
   resumed_at: u64,
   ran_at: u64,
   delivered_at: u64,
+  /// The resumed run's thread CPU time, ns, beside its wall time (`ran_at - resumed_at`).
+  resume_cpu: u64,
 }
 
 thread_local! {
@@ -208,9 +210,12 @@ pub fn resumed(request: u64, waited: u64, at: &std::panic::Location<'_>) {
 }
 
 /// A resumed submit's verb ran and made its reply.
-pub fn resume_ran(request: u64) {
+pub fn resume_ran(request: u64, cpu_ns: u64) {
   let now = now_mono();
-  fwd(request, |f| f.ran_at = now);
+  fwd(request, |f| {
+    f.ran_at = now;
+    f.resume_cpu = cpu_ns;
+  });
 }
 
 /// The resumes of one `resume_all` are done.
@@ -231,7 +236,8 @@ const FWD_CAP: usize = 100_000;
 /// placement and how the owner met it; and for every one the stamps made and the `deliver` call's file and line.
 /// And for a parked submit run again: its park's wait, the resume's file and line, and the refining job's turns.
 /// And, before the reply's writing: how long before it the resume began, its verb ran, and `deliver` queued it.
-const FWD_COLS: usize = 26;
+/// And the resumed run's thread CPU time.
+const FWD_COLS: usize = 27;
 
 fn fwd(request: u64, change: impl FnOnce(&mut Fwd)) {
   if let Ok(mut guard) = FWD.lock() {
@@ -370,6 +376,7 @@ fn fwd_split(request: u64, written: u64) -> [u64; FWD_COLS] {
   out[23] = before(f.resumed_at);
   out[24] = before(f.ran_at);
   out[25] = before(f.delivered_at);
+  out[26] = f.resume_cpu;
   let accepted = f.replied == 0 && f.waiting != 0 && f.resolved != 0;
   if f.sent == 0 || f.started == 0 || f.home == 0 || (f.replied == 0 && !accepted) {
     return out;
@@ -447,7 +454,7 @@ pub fn dump_ring(path: &str) {
   let n = RING_TAKEN.load(Relaxed).min(RING_CAP);
   let mut out = files_header();
   out += &format!(
-    "# client sends {} rings {}\nqueued\tserved\tlanded\twritten\tdeferred\tcomplete\towner_met\towner_kick_after\towner_kick_run\towner_run_start\towner_work\torigin_met\torigin_kick_after\torigin_kick_run\torigin_run_home\thome_written\tplacement\tresolve_met\tresolve_kick_after\tresolve_kick_run\tresolve_run_at\tmask\tdeliver_file\tdeliver_line\tpark_wait\tresume_file\tresume_line\tjob_turns\tresumed_before\tran_before\tdelivered_before\n",
+    "# client sends {} rings {}\nqueued\tserved\tlanded\twritten\tdeferred\tcomplete\towner_met\towner_kick_after\towner_kick_run\towner_run_start\towner_work\torigin_met\torigin_kick_after\torigin_kick_run\torigin_run_home\thome_written\tplacement\tresolve_met\tresolve_kick_after\tresolve_kick_run\tresolve_run_at\tmask\tdeliver_file\tdeliver_line\tpark_wait\tresume_file\tresume_line\tjob_turns\tresumed_before\tran_before\tdelivered_before\tresume_cpu\n",
     slates_ipc::endpoint::G222_SENDS.swap(0, Relaxed),
     slates_ipc::endpoint::G222_RINGS.swap(0, Relaxed)
   );

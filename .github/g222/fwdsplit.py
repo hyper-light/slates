@@ -12,7 +12,7 @@ COLS = ["queued", "served", "landed", "written", "deferred", "complete", "owner_
         "owner_kick_run", "owner_run_start", "owner_work", "origin_met", "origin_kick_after", "origin_kick_run",
         "origin_run_home", "home_written", "placement", "resolve_met", "resolve_kick_after", "resolve_kick_run",
         "resolve_run_at", "mask", "deliver_file", "deliver_line", "park_wait", "resume_file", "resume_line", "job_turns", "resumed_before",
-        "ran_before", "delivered_before"]
+        "ran_before", "delivered_before", "resume_cpu"]
 AT = {name: at for at, name in enumerate(COLS)}
 
 
@@ -100,6 +100,8 @@ for key, members in sorted(groups.items(), key=lambda item: -len(item[1])):
             "resumed run (verb again, commit)": lambda r: r[AT["resumed_before"]] - r[AT["ran_before"]],
             "home (hand_reply_home -> deliver)": lambda r: r[AT["ran_before"]] - r[AT["delivered_before"]],
             "write (deliver -> written)": lambda r: r[AT["delivered_before"]],
+            "resumed run's CPU": lambda r: r[AT["resume_cpu"]],
+            "resumed run off its CPU (wall - CPU)": lambda r: max(0, r[AT["resumed_before"]] - r[AT["ran_before"]] - r[AT["resume_cpu"]]),
         }
         resumed.sort(key=lambda r: r[AT["served"]])
         for label, low in (("all", 0), ("p99 tail", .99), ("p999 tail", .999)):

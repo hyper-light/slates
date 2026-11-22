@@ -120,6 +120,15 @@ pub mod g222_parks {
   pub const SHARDS: usize = 64;
   /// w-perf 84a: each shard's last park, host monotonic ns: when it began, the kick's stamp (0: none), when it returned.
   pub static LAST: [[AtomicU64; 3]; SHARDS] = [const { [const { AtomicU64::new(0) }; 3] }; SHARDS];
+  /// w-perf 84a: the calling thread's CPU time, ns (`CLOCK_THREAD_CPUTIME_ID`): beside a span's wall time, how much of
+  /// it the thread ran.
+  pub fn thread_cpu_ns() -> u64 {
+    let reading = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
+    u64::try_from(reading.tv_sec)
+      .unwrap_or(0)
+      .saturating_mul(1_000_000_000)
+      .saturating_add(u64::try_from(reading.tv_nsec).unwrap_or(0))
+  }
   /// Shard `shard`'s last park.
   pub fn last(shard: u16) -> [u64; 3] {
     LAST.get(usize::from(shard)).map_or([0; 3], |slot| {
