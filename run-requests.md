@@ -7568,3 +7568,17 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   Green for A-862: system_allocated_bytes down by at least one copy of the dump's texts against r14's 33.59 GB, and the
   peak no higher. The gate is expected to stay red: the other per-text churners are next. Red for A-862: the import
   refused or slower than r14's 8.2 s by more than its noise, or system_allocated_bytes not lower.
+
+- w-hg (2026-11-22, (b1) and (i), 746f4753f on main; main 01a20182's rulings of 04:44): a push lands as a run of
+  segment changesets under its repository's landing turn.
+  1. The whole-history push on ubuntu (x86_64), as w-interop's: stock hg 7.2 `hg push` of hg's own history into a
+     fresh repository on a release daemon (mem=16g). Read: the push answered whole (not `PAST_CEILING`, not past the
+     turn's patience); the daemon's counters `vcs.hg.push_segments_landed` (expect many), `vcs.hg.push_runs_abandoned`
+     0, `vcs.hg.push_need_admitted`; peak RSS against the same run at be9279f4f (before (b1)). Expected: RSS lower by
+     the kept texts' list only; the bulk (manifests' written entries, 1.37 GB) stays until the next step (one copy of
+     a manifest's entries across the push).
+  2. The head-of-line wait in release: `cargo test --release -p slates-server --lib
+     a_small_push_waits_behind_a_whole_history_push_for_its_landing_turn -- --nocapture` (prints the wait), and the same
+     with a small `hg push` started while (1) runs (its wait, or its refusal past the patience). Debug, MacBook arm64:
+     537 ms behind 200 changesets / 32 segments.
+  3. The crash oracle is light (4.7 s debug) and runs in the suite: `t_b1_a_crash_at_any_segment_boundary_leaves_a_push_whole_or_absent`.
