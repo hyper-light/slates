@@ -23,7 +23,12 @@
 //! the abandoned bytes and recovery never sees them (a record verifies only with its trailer).
 //!
 //! **Ending.** When every handle is gone the owner checkpoints the engine at the log's end (so a restart replays
-//! nothing) and its thread returns; [`StoreOwner::stop`] joins it.
+//! nothing) and its thread returns; [`StoreOwner::stop`] joins it. A checkpoint that fails is logged.
+//!
+//! **A store that cannot open (goal 93; jupiter's red of 2026-11-21).** The owner never ends with no word: it logs the
+//! store's path and the open's reason once, and answers every request with [`StoreError::Unopened`] naming it until the
+//! daemon lets it go, so a repository's creation answers the store's own reason (the server's `StoreRefused`). Before,
+//! its thread ended at once, every request met a closed queue (`Gone`), and creations answered `Overloaded`.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -293,6 +298,38 @@ impl StoreOwner {
   }
 }
 
+/// The refusal an unopened store answers a request with.
+fn unopened<T>(reason: &str) -> Result<T, StoreError> {
+  Err(StoreError::Unopened(reason.into()))
+}
+
+/// Answers every request with [`StoreError::Unopened`] naming `reason`, until every handle is gone: the owner of a store
+/// that could not be opened.
+fn refuse_all(incoming: &mut ChannelReceiver<Request>, reason: &str) {
+  while let Ok(request) = incoming.blocking_recv() {
+    match request {
+      Request::Begin { answer, .. } => drop(answer.try_send(unopened(reason))),
+      Request::Section { answer, .. } | Request::Part { answer, .. } => {
+        drop(answer.try_send(unopened(reason)))
+      }
+      Request::Commit { answer, .. } | Request::Land { answer, .. } => {
+        drop(answer.try_send(unopened(reason)))
+      }
+      Request::Dropped => {}
+      Request::Piece { answer, .. } | Request::Text { answer, .. } => {
+        drop(answer.try_send(unopened(reason)))
+      }
+      Request::Sections { answer, .. } => drop(answer.try_send(unopened(reason))),
+      Request::Read { answer, .. } => drop(answer.try_send(unopened(reason))),
+      Request::Changesets { answer, .. } => drop(answer.try_send(unopened(reason))),
+      Request::TextRow { answer, .. } => drop(answer.try_send(unopened(reason))),
+      Request::PathTexts { answer, .. } => drop(answer.try_send(unopened(reason))),
+      Request::TextsByTool { answer, .. } => drop(answer.try_send(unopened(reason))),
+      Request::Places { answer, .. } => drop(answer.try_send(unopened(reason))),
+    }
+  }
+}
+
 /// The owner's loop: open (recovering), then answer requests until every handle is gone, then checkpoint.
 fn serve(
   root: StoreRoot,
@@ -300,7 +337,20 @@ fn serve(
   mut incoming: ChannelReceiver<Request>,
   waiting: usize,
 ) -> Result<(), StoreError> {
-  let mut store = Store::open(root, sizing)?;
+  let at = root.target().key.clone();
+  let mut store = match Store::open(root, sizing) {
+    Ok(store) => store,
+    Err(error) => {
+      // Never ended with no word (goal 93, jupiter's red): the reason is logged once, and every request is answered with
+      // it until the daemon lets the owner go, so a creation names it rather than a gone owner or a busy shard.
+      let reason = error.to_string().into_boxed_str();
+      slates_machine::log_line!(
+        "slates-store: the version-control store at {at} could not be opened: {reason}; every request is refused with it"
+      );
+      refuse_all(&mut incoming, &reason);
+      return Err(error);
+    }
+  };
   // The owner lands bytes the request carries; nothing is staged on its side.
   let staging = Staging::new(0);
   // The texts the owner made from their chains (A-645's derived per-path read form), kept across requests, so a clone
@@ -459,7 +509,13 @@ fn serve(
     }
   }
   store.abandon_landing();
-  store.checkpoint()
+  let checkpointed = store.checkpoint();
+  if let Err(error) = &checkpointed {
+    slates_machine::log_line!(
+      "slates-store: the version-control store at {at} ended without its checkpoint: {error}; a restart replays its log"
+    );
+  }
+  checkpointed
 }
 
 /// The owner's sliced landing, if one is open, and the landings held behind it.

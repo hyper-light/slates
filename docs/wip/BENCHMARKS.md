@@ -18114,3 +18114,28 @@ and starved clients were 0 in all 24 runs. Each cell gives the three runs.
   `docs/bugs/2026-11-21-a-composition-laid-zeros-for-base-bytes-its-shard-did-not-hold.md`). The second, with both
   fixed but the owner's answer still dropping the work's base entries whenever the owner had composed, had 3.9 file
   asks a client at 10 hot files, which the third run's fix removed.
+
+## The holder route's lane, closed at ~800 MB/s on the content plane (A-826, w-shared, 2026-11-21; main's close 21:35 PST)
+
+The close-list item "the lane's ~200 MB/s": a holder's submit carried its whole increment over the forward lane, which
+moved it at about 200 MB/s and, at 320 MiB and above under load, gave up on silence. A-826 names the increment and the
+owner fetches it on the content plane. Command (release, interleaved A/B, a fresh green each run, the holder route
+then the local route in one process): `SLATES_A697_BENCH_FRESH=1 SLATES_A697_BENCH_MIB=<n> SLATES_A697_BENCH_RUNS=1
+cargo test --release -p slates-server --test fleet bench_a697 -- --ignored --nocapture --test-threads=1`.
+
+| A/B | Machine, load | MiB | wall before | wall after | forward before | forward after |
+|---|---|---|---|---|---|---|
+| lane (65133486d) vs content plane (156007d), kiln r32, 2 rounds | Mac Studio, 4-13 | 64 | 410-466 ms | 319-408 ms | 299-357 ms | 188-274 ms |
+| | | 128 | 810-863 ms | 601-613 ms | 584-649 ms | 339-346 ms |
+| | | 256 | 2.41-2.52 s | 1.25-1.29 s | ~2.0 s | 0.72 s |
+| | | 320 | 3.52-3.61 s | 1.51-1.53 s | ~3.0 s | 0.85-0.89 s |
+| | | 512 | refused Overloaded | 2.4 s | - | 1.3 s |
+| owner step halved (1a35ab0 vs 0deb19a), kiln r2, 5 rounds | Mac Studio-3, 2-4 | 256 | 1.03-1.07 s | 0.79-0.87 s | 564-632 ms | 352-414 ms |
+| | | 320 | 1.21-1.33 s | 0.93-1.01 s | 674-780 ms | 374-433 ms |
+| | | 512 | 1.98-2.06 s | 1.46-1.57 s | 1.09-1.17 s | 0.58-0.67 s |
+
+At 512 MiB after both, the forward (which includes the owner's content-plane fetch) is 0.58-0.67 s: about 800 MB/s,
+four times the lane's. The owner's step fell from 502-594 to 270-299 ms and the late beat from 0.74-0.85 s in every
+run to none. Datagram batching (main's 2026-11-20 23:50 step 5) is not shown needed by any measurement and is dropped
+(main, 2026-11-21 14:56). The holder route passes 5/5 at 320 and 512 MiB (r2), which counts toward the lane's proof;
+the bench's local 512 MiB submit still ends in exit 4 (one step of 1.05-1.09 s of CPU) until w-work-cow's A-841 lands.

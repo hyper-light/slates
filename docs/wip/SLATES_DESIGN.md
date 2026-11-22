@@ -16570,7 +16570,21 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > class's fetch p50 and p99 against its fetch alone. The harnesses' daemons get their own `--vcs-store` (push_load's
 > `Daemon`), without which no git repository could be made since A-767 C5. Proved locally (debug, M-series Mac): a
 > push alone 2.3 s and a fetch alone 10.3 s of git/git v0.99 (4,507 objects), both whole; the steps are main's rounds.
-> Owed: Mercurial and Subversion repositories in the mix.
+> Mercurial and Subversion (main's ruling of 21:35, option (a)): `crates/cli/bench/multi_repo_stock.py SLATES hg|svn`,
+> the stock clients driving the same classes (each a git/git revision's tree): every repository seeded by its own
+> working copy, then Zipf-skewed pushes of one small changeset each from that copy, one after another, beside
+> Zipf-skewed fresh clones or checkouts; its bounds derived from the alone runs (a clone's bytes against the scratch
+> disk's free bytes, a client's peak resident set against free memory). Proved for hg locally (debug, M-series Mac,
+> R = 1 and 2: every push and fetch whole, 1.0x to 1.2x alone); svn runs on the big Studio, main's round.
+
+> **Status (2026-11-21, A-851: piece 4, the cold trigger amended).** RAM compression is dropped (above). The content
+> store lets a window go once its owner marks it landed (`ContentStore::mark_landed`) and one holder alone keeps it
+> (`let_go`, `Kept::Away`: holders and length kept, a read misses; brought back by its own bytes, `bring_back`, or a
+> put of them; counted). The shard lets go a repository's coldest windows (by `last_read`) past its published grant
+> (`vcs_share::grants::let_go_past_grant`, a step of its own), passing over every window another holder keeps. Owed:
+> the read-through (a git or Mercurial read that misses falling to the node's store, as `vcs_store::svn_texts` does:
+> w-git's and w-hg's, queued as red tests), the owners marking landed windows, and the tools naming each repository's
+> windows; until then a test is the reader and a daemon lets nothing go.
 
 > **Status (2026-11-21, CPU: the open decision; main's ruling of 17:22).** A shard's CPU is divided among its
 > repositories by equal-weight deficit round robin (`vcs_share::turns`, A-724 piece 3c: one turn a repository a round,
@@ -16604,7 +16618,9 @@ read where they are kept.
 
 **Hot, warm and cold.** A repository's bytes are *hot* (its heads' trees, its works under way, its live intakes),
 *warm* (recent history, as much as its memory share holds) or *cold* (the rest, and every index that can be rebuilt).
-RAM only (R1): there is no disk tier, so cold means compressed, held only on peers, or both.
+Amended by A-851 (Ada's storage ruling, A-767): a repository's full content lives on the node's disk store in its landed
+changesets, and RAM holds its changes and a learned cache, so cold means let go from RAM and read back from the node's
+store when read; RAM compression of cold content is dropped.
 
 **Learned demand** (piece 2). For each repository and each principal: decayed rates of works and bytes, their decay set
 by the repository's own measured inter-arrival times; and its working set as a miss-ratio curve built by spatially
@@ -16630,8 +16646,10 @@ another's floor.
 
 **The cold trigger** (piece 4). §4.11's cost model, with `value_of_byte` raised by the repository's overrun of its memory
 share, chooses in cost order: drop derived values and caches (pack fragments, reach sets, A-718's deltas: rebuild cost
-times predicted reads against their bytes); compress cold content; hold cold content only at its f+1 holders (§4.10),
-fetched by identity when read.
+times predicted reads against their bytes); let go the repository's coldest windows past its published grant, those a
+landed changeset on the node's store holds and no other holder keeps, each read back through the node's store when
+next read (A-851, replacing "compress cold content"); hold cold content only at its f+1 holders (§4.10), fetched by
+identity when read.
 
 **Giant repositories** (pieces 5, 6). Load never moves ownership (§4.10). The owner keeps the repository's register (its
 refs and the ordered landing, §4.17.1 intake rule 4), its indexes' tails and fences and its hot set; everything else
@@ -60392,7 +60410,8 @@ Applied in the same change to:
   module docs "Texts".
 - `crates/svn/src/migration/standalone.rs` (pieces 1 and 2, 41ce54f67 and e465b0e0c): `Standalone`, records with their
   texts held apart by identity, the crate's tests, integration tests and benches on it; `Repository::take_texts`.
-- `crates/svn/src/fsfs.rs`: `TextDeltas` answers none for the records; docs.
+- `crates/svn/src/fsfs.rs`: the `DELTA` writer and its `TextDeltas` seam removed (main 01a20182, 21:35); every text
+  `PLAIN`. `crates/server/src/vcs_store/svn_presenter.rs`: `PresentRefusal::DeltaPiece` removed.
 - `crates/svn/src/commit/revision.rs`: `StepRefusal::Corrupt`'s doc names an inline text.
 - `crates/server/src/vcs_store.rs` (`replay_step` without a row count), `vcs_store/svn_texts.rs` (`HeadTexts`' docs),
   `repository/svn_commit.rs` (`take_texts` delegates), and the vcs_ssh and presenter tests (piece 2).
@@ -60405,9 +60424,9 @@ Applied in the same change to:
   step, held apart by identity, the records naming each stored by its length. The records' own keeping is gone. A
   revision that carries a text inline is refused `Corrupt`, `SVN_ERR_FS_CORRUPT` (`E160004`), the refusal for a text
   the records do not hold. The FSFS view over records holding no delta writes every text `PLAIN`, as the presenter's
-  view already did. Its `DELTA` writer stays behind `TextDeltas`, with no source answering one: whether to remove it,
-  or feed it per-file deltas derived from the changeset log (Ada's ruling of 2026-11-20 ~13:35), is main's call
-  (GAPS).
+  view already did. Its `DELTA` writer, with no source answering one, is removed by main 01a20182's ruling of 21:35
+  PST (`fsfs::TextDeltas`, `StoredDelta`, `FilePiece::Delta`, the presenter's `DeltaPiece` refusal): under the changeset
+  ruling (Ada's of 2026-11-20 ~13:35) a per-file delta is derived data, built when a measured item needs one.
 - **Evidence.**
   - `a_text_carried_inline_is_refused_and_records_standing_alone_hold_it_apart` (red before: bare records kept the
     text).
@@ -60416,3 +60435,53 @@ Applied in the same change to:
   - slates-server `--lib svn` 113/113 (2 ignored), its `svn_texts` fixture taking its other texts out as a landing does.
   - The ignored git-2000 measurement now prints `records_stored_text_bytes` where it printed `records_text_bytes`.
   - The stock `svnadmin`/`svnlook` reading of the all-`PLAIN` view is main's run, since there is no svn on the Mac.
+
+### A-848 — The content pool grows an arena by what a claim needs (2026-11-21, w-sizing; main 01a1ff2e 17:20 and 01a20182 21:35, goal 93; Ada's MEMORY SIZING rule; A-98, A-789)
+Applied in the same change to: `crates/server/src/content_pool.rs` (`arena_parts`, `ContentPool::best_fit`, `claim`,
+the module docs, tests), `crates/mem/src/arena.rs` (`ExtentSource::claim(want)`, `ChunkArena::grow` passes what it
+still lacks), `crates/anchor/src/layout.rs` (`LAYOUT_VERSION` 17, `POOL_EXTENTS_PER_PARTITION`'s doc),
+`crates/server/src/config.rs` (`held_extent_bound`'s doc), GAPS.
+
+Status: built 2026-11-21, every platform (the cut and the claim are platform-free).
+- Why: a slice's arena range was cut into its binary parts, largest first, and a claim took the first free one, so any
+  first lend past a shard's free room took its slice's largest extent. On Studio-4 (g227) a push seal's 18,564-byte turn
+  grew the arena by 8,589,934,592 bytes of a 12.87 GB pool, and w-hg's merge took extent after extent until the other
+  shard's pushes were refused `PastAdmission { left: 0 }`.
+- Rule: a slice is cut into a run doubling from one pool unit (1, 1, 2, 4, ... units, each as long as all before it),
+  then what the run leaves in power-of-two parts, largest first. Every part is still a power-of-two number of units (a
+  buddy region's need) and the lengths still divide one another (the pressure hold's greedy stays optimal). A claim
+  is told what the arena still lacks and takes the smallest free part that covers it, else the largest; equal lengths
+  go to the claimer's own slice first. An arena so grows by its need rounded up to a power of two of units, and
+  doubles while claims keep coming.
+- An extent id now names another range of the content object, so the layout version is 17 and an older segment is
+  refused, never misread. A slice holds about two parts per bit of its length in units, at most
+  `POOL_EXTENTS_PER_PARTITION` (64).
+- Measured (Studio-4, debug, `cargo test -p slates-server --lib content_pool::tests`; unit 262,144 bytes, slice arena
+  12,884,901,888): an 18,564-byte lend, which the budget lacked as 10,504,324 bytes with the operation headroom, grew the
+  arena by 8,589,934,592 bytes before and by 16,777,216 after (64 units, the need rounded up to a power of two); two
+  shards lending in turn grew 4,294,967,296 bytes on the first turn before, and every turn within that bound after.
+- Not in this change: the share cap (GAPS, ruled 21:35): best fit does not stop a lend of a whole `admittable()` from
+  taking the pool.
+
+### A-853 — The share cap: a refused shard's want, answered by the shards above their demand (2026-11-21, w-sizing; main 01a20182's ruling of 21:35, goal 93; A-848, A-98)
+Applied in the same change to: `crates/anchor/src/layout.rs` (the pool region's want words, `LAYOUT_VERSION` 18),
+`crates/anchor/src/segment.rs` (`post_pool_want`, `pool_want`), `crates/mem/src/arena.rs` (`ExtentSource::want`,
+`ChunkArena::make_room` posts it), `crates/vfs/src/volume.rs` (`Store::demand`), `crates/server/src/content_pool.rs`
+(`ContentPool::want`, `tell_the_others_of_a_want`, `answer_a_want`, the module docs, the test), GAPS.
+
+Status: built 2026-11-21, every platform.
+- Why: after A-848 a lend still grows an arena by what it is lent, so a lend of a shard's whole `admittable()` (w-hg's
+  merge, g227) took the pool, and the shard kept it until its next publication: pushes on the other shard were refused
+  `PastAdmission { left: 0 }`.
+- Rule (one mechanism, no fixed share): a shard whose growth the pool cannot cover posts what it lacks in its want word
+  (the pool region holds one a partition after the owner words), bounded by the whole pool, and withdraws it when it
+  next grows. The post that finds none standing spawns one task on the refused shard that sends each other shard one
+  message on its bounded channel (`xshard::run_on_waiting`). A shard told of a want whose arena holds more than its
+  demand (`Store::demand`: every commitment, the operation headroom and the pressure hold) publishes, and the commit's
+  `release_idle` returns every wholly free extent past that demand. Extents go back only after a committed
+  publication, so no image names a returned block. A shard grows into the whole pool while no other wants.
+- No polling, no lock: the want is one word swapped, and the tell is sent once per want, not per refusal.
+- Measured (Studio-4, debug, `cargo test -p slates-server --lib content_pool::tests`): after shard 0's burst, shard 1's
+  18,564-byte ask was refused for 10 s, admittable 0, before; admitted at once after, shard 0 counting
+  `pool.want_answered`.
+- Open: demand is the shard's need now, not learned and decayed, so a shard that bursts again re-claims what it gave.

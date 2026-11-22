@@ -405,3 +405,49 @@ fn a_changeset_lands_in_parts_alone_and_a_dropped_one_leaves_nothing() {
   assert_eq!(again.1, payload[..again.1.len()]);
   owner.stop().unwrap();
 }
+
+/// Goal 93, jupiter's red (w-k90-win, 2026-11-21: the owner thread gone with no word, every `repository create` answered
+/// `Overloaded`). Do: start an owner on a sizing the engine refuses (no memory, no disk), so its store cannot open; from a
+/// shard's task land a changeset and list changesets through it. Expect: each answered the store's own refusal, saying
+/// it could not be opened and why (here the sizing), never `Gone`; and the owner's stop answers the open's error.
+#[test]
+fn an_owner_whose_store_cannot_open_answers_every_request_why() {
+  let dir = scratch("unopened");
+  let grant = StoreGrant {
+    repository: 1,
+    target: StoreRoot::identify(&dir).unwrap(),
+    issued_ns: 0,
+  };
+  let refused = Sizing {
+    memory: 0,
+    disk: 0,
+    extent_bytes: 64 << 10,
+    fanout: 8,
+  };
+  let owner = StoreOwner::start(StoreRoot::open(&dir, &grant).unwrap(), refused, 16).unwrap();
+  let handle = owner.handle();
+  let runtime = runtime();
+  let (landed, listed) = runtime
+    .block_on(async move {
+      let landed = handle
+        .land(header(1), vec![(SectionKind::Record, b"heads".to_vec())])
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string());
+      let listed = handle
+        .changesets(11, 0, 10)
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string());
+      (landed, listed)
+    })
+    .unwrap();
+  for (what, answer) in [("the landing", landed), ("the listing", listed)] {
+    let reason = answer.expect_err(what);
+    assert!(
+      reason.contains("could not be opened") && reason.contains("sizing"),
+      "{what} answered the store's own refusal: {reason}"
+    );
+  }
+  assert!(owner.stop().is_err(), "the stop answers the open's error");
+}

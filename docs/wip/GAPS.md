@@ -356,6 +356,20 @@
 >   parts of a partition's slice), so the first lend past a shard's free capacity takes an extent of up to 8 GiB of
 >   a 12.9 GB pool, however few bytes it needs. w-hg's merge, lent `admittable()`, took extent after extent until
 >   the pool was gone.
+>   **FIXED by A-848 (w-sizing, 2026-11-21; main 01a1ff2e 17:20, 01a20182 21:35):** a slice is cut into a run doubling
+>   from one pool unit, then the rest's binary parts, and a claim takes the smallest free part covering what the arena
+>   lacks (`ExtentSource::claim(want)`, `ContentPool::best_fit`). Red then green on Studio-4 (debug, unit 262,144
+>   bytes, slice arena 12,884,901,888): an 18,564-byte lend past a shard's free room, which its budget lacked as
+>   10,504,324 bytes with the operation headroom, grew its arena by 8,589,934,592 bytes before and by 16,777,216 after
+>   (the need rounded up to a power of two of units); two shards lending small rooms in turn, 8 turns each, grew
+>   4,294,967,296 bytes on the first turn before, and within that bound every turn after, every ask admitted
+>   (`content_pool::tests`). Layout version 17. **The share cap FIXED by A-853 (main 01a20182 21:35, ruled):** a shard
+>   refused room posts a bounded want in its pool want word; the first post sends one message to each other shard,
+>   and one holding more than its demand publishes and gives back its wholly free extents. Red then green on Studio-4
+>   (`a_shards_burst_no_longer_starves_another_shards_push`): after shard 0's burst took the pool, shard 1's
+>   18,564-byte ask was still refused after 10 s (admittable 0) before, and admitted after, shard 0 counting
+>   `pool.want_answered`. Layout version 18. Not done: demand is what the shard needs now, not a learned (decayed)
+>   figure, so a shard that bursts again re-claims what it gave back.
 
 > **Goal 93 perf, hg serve (2026-11-21, w-perf; main's order 00:22 and ruling 01:05).** Found by a profile of a
 > one-changeset pull of Mercurial's history (24.95 s) and a stream clone (288 s): (1) every lookup in a
@@ -477,7 +491,9 @@
 > `StoreGrant` (C2 closed). Owed (performance): segmented store files over the granted root, measured against one file; the
 > engine's extent bytes and fanout are the caller's `Sizing` (from its machine profile; the server's derivation is
 > owed with C4). C3 closed; C4 groundwork built: the owner thread and
-> `--vcs-store` (the daemon holds the store; shards hold its handle). Windows' store directory built (2026-11-21, w-work-mount: `NtCreateFile`
+> `--vcs-store` (the daemon holds the store; shards hold its handle). A store that cannot open is logged and answered (2026-11-21, goal 93: the owner logs why and answers every request
+> `StoreError::Unopened`; a creation answers `Refusal::StoreRefused` with the store's reason, never `Overloaded`; jupiter's
+> own open failure, which this now names, is owed its fix). Windows' store directory built (2026-11-21, w-work-mount: `NtCreateFile`
 > relative to the granted directory's handle, identity by volume serial and `FileIdInfo`; green on jupiter (5/5,
 > clippy clean), `crates/land/tests/store_root.rs`, `repository::store_tests::each_tool_creates_a_repository_into_the_store`). Owed: each tool's landing onto it (C4-C6); the
 > engine's memtable learned upward from its rows (it starts at one trunk node, fanout extents, since the machine-sized
@@ -2025,8 +2041,16 @@
 > since A-846 part 3 (`t_a724_a_contested_room_reads_the_published_grants`,
 > `t_a724_a_live_repository_with_no_curve_leaves_the_room_divided_as_before`). Open: pushes', hg's and svn's reads.
 > **A-724 piece 7 (A-849): the load proof's fetches** (`multi_repo_load.py --fetches`; harness daemons given a
-> `--vcs-store`, without which `repository create --tool git` failed since A-767 C5). Open: hg and svn in the mix; the
-> rounds (main's).
+> `--vcs-store`, without which `repository create --tool git` failed since A-767 C5); hg and svn by their stock clients
+> (`multi_repo_stock.py`, main's 21:35 ruling (a)). Open: the rounds (main's).
+> **A-724 piece 4 (A-851): let go past the grant, built, no reader yet** (`ContentStore::let_go`/`bring_back`,
+> `vcs_share::grants::let_go_past_grant`; tests `a_landed_window_is_let_go_and_brought_back_by_its_own_bytes`,
+> `t_a724_a_repositorys_coldest_windows_past_its_grant_are_let_go`). Open: git's and hg's read-through (w-git, w-hg:
+> red tests queued in their inboxes), landed marks and window lists from the tools; a restart's image no longer holding
+> a let-go window (recovery reads it back through the node's store, with the read-through).
+> **A-724 piece 6 DEFERRED (main 01a20182, 2026-11-21 21:35):** the fleet's placement of content by identity (amends
+> §4.10) waits until goal 93's servers are complete and correct; Ada asked for many repositories on a single server, and
+> the N=1 homes and the region rule exist (1729a9c5a, 58f756e0a, 9f57e4810).
 > **A-724 piece 2c (A-846): memory by marginal utility built, not yet applied** (`slates_vcs::partition`, `cargo test
 > -p slates-vcs --lib partition::`, 4 of 4, macOS arm64, this Mac). Open: computed on the owner shard and published.
 >
@@ -3177,9 +3201,10 @@
 > them writes every text `PLAIN`, as the presenter's does (the stock `svnadmin` reading of it is main's run: no svn on
 > the Mac); `changeset_ab` reads the records' own deltas and waits on main's call (retire, or derive its deltas);
 > (3) BUILT 2026-11-21, A-842: the records keep no text, a text carried inline refused `Corrupt`, `changeset_ab`
-> retired (its numbers stand in BENCHMARKS at b51f908f2). Owed: the FSFS view's `DELTA` writer has no source now
-> (`fsfs::TextDeltas` answers none everywhere): removed, or fed per-file deltas derived from the changeset log (Ada's
-> ruling of 2026-11-20 ~13:35), main's call; and the stock `svnadmin` reading of the all-`PLAIN` view, main's run).
+> retired (its numbers stand in BENCHMARKS at b51f908f2). The FSFS view's `DELTA` writer, left with no source,
+> REMOVED by main 01a20182's ruling of 21:35 (`fsfs::TextDeltas`, `StoredDelta`, `FilePiece::Delta` and the presenter's
+> `DeltaPiece` refusal gone): under the changeset ruling a per-file delta is derived when a measured item needs one.
+> Owed: the stock `svnadmin` reading of the all-`PLAIN` view, main's run on the big Studio).
 > Stage C,
 > an import as one sliced changeset (today a changeset a record). A submitted version's revision (`svn_made`) takes the
 > one landing order since A-804 (2026-11-21, w-rewrite-ops; main 01:52, the deferred-submit hook, `crate::made_commit`):
@@ -25057,7 +25082,12 @@ in what lands. Branch tips as of 2026-11-10:
 > BISECTED 2026-11-21 to 6088ccb72, A-825's format 6 (w-shared): its parent 544020bd2 p50 0.38 / p99 0.84 ms, it 237.9 /
 > 1,192 ms, release `load_bench` one round each on the big Studio; the likely mechanism is A-825's owed cost, a
 > whole-shard publication (`publish_held_increments` -> `publish_shard`) in every accepted version's step on the owner;
-> handed to w-shared, `inbox/w-shared-from-w-engine-format6-regression.md`). The checkpoint's record LANDED by name
+> handed to w-shared, `inbox/w-shared-from-w-engine-format6-regression.md`; FIXED d44f0166a, w-shared: inside a
+> transaction the verb's own publication carries the hold before the record is appended at the commit, so an accept
+> publishes once, its verb's; `verbs::commit_settled` publishes what is still unpublished and abandons the transaction,
+> typed, when it cannot; red 3 publications for one accepted submit, green 1 (`publish.committed`,
+> `an_accepted_submit_costs_its_shard_one_publication`, macOS arm64, this Mac; the kill -9 recovery test,
+> green_checkpoint, works_off_owner and the holder submits green); main's confirming load_bench A/B owed). The checkpoint's record LANDED by name
 > (goal 93's, main's 15:00: a 1 GiB green's was 650-1,063 ms in one step, record 527 ms): held in the owner's content
 > store a chunk a quantum, published, recorded as `CheckpointRef` (layout 16). OWED, piece 2: its build and encoding
 > are still one step (52 + 71 ms at 1 GiB; 5.7 + 9.5 ms at load_bench's 49 MB), inside the watchdog's 1 s window.

@@ -9,9 +9,9 @@
 //! representations lie.
 //!
 //! The format is FSFS format 8 (Subversion 1.10), sharded by 1000, physical addressing; a text is `PLAIN`, read through
-//! its source, since the records keep no text (the KeptText move; before, the `DELTA` representation the records kept
-//! it as, A-645 P3 ruling 3, which [`TextDeltas`] still writes for a source that answers one), entries lists and
-//! property lists `PLAIN`; every stock release since 1.10 reads it (`fs.h` `SVN_FS_FS__FORMAT_NUMBER` and the formats it opens). The evidence is
+//! its source (the records keep no text, A-842; the `DELTA` representation the records' kept deltas were written as,
+//! A-645 P3 ruling 3, went with them: under the changeset ruling, a per-file delta is derived when a measured item needs
+//! one), entries lists and property lists `PLAIN`; every stock release since 1.10 reads it (`fs.h` `SVN_FS_FS__FORMAT_NUMBER` and the formats it opens). The evidence is
 //! Subversion's own writer, read at `libsvn_fs_fs` of the `1.14.x` branch (`d434dc14`): `low_level.c`
 //! (`svn_fs_fs__write_noderev`, `svn_fs_fs__unparse_representation`, `write_change_entry`,
 //! `svn_fs_fs__unparse_revision_trailer`), `id.c` (`svn_fs_fs__id_unparse`) and `structure`. What a revision file
@@ -74,10 +74,6 @@ const MIN_UNPACKED: &[u8] = b"0\n";
 /// Format: `txn-current`, a base-36 line (`structure`, "Transaction IDs").
 const TRANSACTION_COUNTER: &[u8] = b"0\n";
 
-/// What begins a representation stored as a delta against nothing (format 4 and later): the delta's own bytes follow.
-/// Format: `REP_DELTA` and a line feed (`low_level.c` `svn_fs_fs__write_rep_header`).
-const DELTA_SELF: &[u8] = b"DELTA\n";
-
 /// What begins a representation stored whole.
 /// Format: `REP_PLAIN` and a line feed (`low_level.c` `svn_fs_fs__write_rep_header`).
 const PLAIN: &[u8] = b"PLAIN\n";
@@ -139,7 +135,7 @@ struct Representation {
   revision: Revision,
   /// The offset of its `PLAIN` line.
   offset: u64,
-  /// Its bytes, header and `ENDREP` apart: a `PLAIN` representation's text, a `DELTA` one's svndiff.
+  /// Its bytes, header and `ENDREP` apart: a `PLAIN` representation's text.
   size: u64,
   /// The bytes it stands for: a text's length, a `PLAIN` representation's own size.
   expanded: u64,
@@ -172,58 +168,6 @@ enum Segment {
     /// Its length.
     size: u64,
   },
-  /// A text's delta as the records keep it ([`TextDeltas`]), read in place.
-  Delta {
-    /// The text's content identity.
-    identity: ContentIdentity,
-    /// The delta's length.
-    size: u64,
-  },
-}
-
-/// A text's delta as a source keeps it: an svndiff of version 2 against the text of its node's skip-delta predecessor,
-/// or against nothing for a first version -- FSFS 1.10's own representation, so the view names it as a `DELTA`
-/// representation and reads its bytes where they are kept, never making the text (A-645 P3, main's ruling 3). No source
-/// answers one since the records keep no text (the KeptText move): the seam waits on per-file deltas derived from the
-/// changeset log (Ada's ruling of 2026-11-20 ~13:35).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StoredDelta<'a> {
-  /// The text it is against; none for a delta against nothing.
-  pub base: Option<ContentIdentity>,
-  /// Its svndiff bytes.
-  pub bytes: std::borrow::Cow<'a, [u8]>,
-}
-
-/// Where the view reads a text's stored delta.
-pub trait TextDeltas {
-  /// The delta the text `identity` is kept as; none for a text kept whole (one whose bytes a property list holds too),
-  /// which the view writes as a `PLAIN` representation read through [`Source::text`].
-  fn text_delta(&self, identity: &ContentIdentity) -> Option<StoredDelta<'_>>;
-}
-
-/// The records with their texts read from a source keep no delta the view can name: each text is where its source
-/// holds it (a content store, a green), never as the records' own svndiff, so a view over them shows every text whole,
-/// `PLAIN` (A-645 P3: the presenter's view, its texts content-store references, until per-file deltas are derived forms
-/// of the changeset log, Ada's ruling of 2026-11-20 ~13:35).
-impl<T: crate::migration::TextSource + ?Sized> TextDeltas for crate::migration::WithTexts<'_, T> {
-  fn text_delta(&self, _identity: &ContentIdentity) -> Option<StoredDelta<'_>> {
-    None
-  }
-}
-
-/// Records standing alone hold their texts apart, as a daemon's do ([`crate::migration::Standalone`]): no delta the view
-/// can name, every text `PLAIN`.
-impl TextDeltas for crate::migration::Standalone {
-  fn text_delta(&self, _identity: &ContentIdentity) -> Option<StoredDelta<'_>> {
-    None
-  }
-}
-
-/// The records keep no text (the KeptText move): no delta the view can name.
-impl TextDeltas for crate::migration::Repository {
-  fn text_delta(&self, _identity: &ContentIdentity) -> Option<StoredDelta<'_>> {
-    None
-  }
 }
 
 /// A revision file being made.
@@ -257,15 +201,6 @@ impl Writer {
     self
       .segments
       .push((self.length, Segment::Text { identity, size }));
-    self.length = self.length.checked_add(size).ok_or(ViewRefusal::Overflow)?;
-    Ok(())
-  }
-
-  /// Appends a text's stored delta, read in place.
-  fn delta(&mut self, identity: ContentIdentity, size: u64) -> Result<(), ViewRefusal> {
-    self
-      .segments
-      .push((self.length, Segment::Delta { identity, size }));
     self.length = self.length.checked_add(size).ok_or(ViewRefusal::Overflow)?;
     Ok(())
   }
@@ -317,7 +252,7 @@ impl RevisionFile {
   ///
   /// # Errors
   /// [`ViewRefusal::MissingText`] when the green no longer holds a text the file names.
-  pub fn read<S: Source + TextDeltas + ?Sized>(
+  pub fn read<S: Source + ?Sized>(
     &self,
     source: &S,
     offset: u64,
@@ -343,20 +278,6 @@ impl RevisionFile {
             .ok_or(ViewRefusal::MissingText)?
         }
       }
-      Segment::Delta { identity, size } => {
-        let delta = source
-          .text_delta(identity)
-          .ok_or(ViewRefusal::MissingText)?;
-        let inner = usize::try_from(inner.min(*size)).map_err(|_| ViewRefusal::Overflow)?;
-        match delta.bytes {
-          std::borrow::Cow::Borrowed(bytes) => {
-            std::borrow::Cow::Borrowed(bytes.get(inner..).unwrap_or_default())
-          }
-          std::borrow::Cow::Owned(bytes) => {
-            std::borrow::Cow::Owned(bytes.get(inner..).unwrap_or_default().to_vec())
-          }
-        }
-      }
     };
     let taken = run.len().min(most);
     out.extend_from_slice(run.get(..taken).unwrap_or_default());
@@ -377,25 +298,14 @@ pub enum FilePiece<'a> {
     /// Its length.
     size: u64,
   },
-  /// A text's delta as the records keep it ([`TextDeltas`]): `size` bytes.
-  Delta {
-    /// The text's content identity.
-    identity: ContentIdentity,
-    /// The delta's length.
-    size: u64,
-  },
 }
 
 impl RevisionFile {
-  /// Its pieces in file order, nothing read: the made bytes, and each text or delta by identity and length.
+  /// Its pieces in file order, nothing read: the made bytes, and each text by identity and length.
   pub fn pieces(&self) -> impl Iterator<Item = FilePiece<'_>> {
     self.segments.iter().map(|(_, segment)| match segment {
       Segment::Bytes(bytes) => FilePiece::Made(bytes),
       Segment::Text { identity, size } => FilePiece::Text {
-        identity: *identity,
-        size: *size,
-      },
-      Segment::Delta { identity, size } => FilePiece::Delta {
         identity: *identity,
         size: *size,
       },
@@ -441,7 +351,7 @@ impl View {
   ///
   /// # Errors
   /// [`ViewRefusal`] when the index or the green contradicts itself.
-  pub fn advance<S: Source + TextDeltas + ?Sized>(
+  pub fn advance<S: Source + ?Sized>(
     &mut self,
     index: &Index,
     source: &S,
@@ -477,7 +387,7 @@ impl View {
   ///
   /// # Errors
   /// [`ViewRefusal::NotLaidOut`] for a revision [`View::advance`] has not reached; otherwise as `advance`.
-  pub fn revision_file<S: Source + TextDeltas + ?Sized>(
+  pub fn revision_file<S: Source + ?Sized>(
     &self,
     index: &Index,
     source: &S,
@@ -498,7 +408,7 @@ impl View {
 ///
 /// # Errors
 /// [`ViewRefusal::MissingRevisionProperties`] when the green holds none for it.
-pub fn revision_properties_file<S: Source + TextDeltas + ?Sized>(
+pub fn revision_properties_file<S: Source + ?Sized>(
   source: &S,
   revision: Revision,
 ) -> Result<Vec<u8>, ViewRefusal> {
@@ -573,7 +483,7 @@ pub fn fixed_files(uuid: &[u8], youngest: Revision) -> Vec<(&'static str, Vec<u8
 
 /// Makes revision `revision`'s file against the node-revisions `placed` holds from earlier revisions: the writer and
 /// where each node-revision the revision created lies.
-fn build<S: Source + TextDeltas + ?Sized>(
+fn build<S: Source + ?Sized>(
   (placed, texts): (
     &BTreeMap<NodeRevisionId, Placed>,
     &BTreeMap<ContentIdentity, Representation>,
@@ -661,17 +571,13 @@ impl Layout<'_> {
   }
 
   /// Writes `node`'s representations and header, and answers the header's offset.
-  fn node<S: Source + TextDeltas + ?Sized>(
-    &mut self,
-    source: &S,
-    node: &Node<'_>,
-  ) -> Result<u64, ViewRefusal> {
+  fn node<S: Source + ?Sized>(&mut self, source: &S, node: &Node<'_>) -> Result<u64, ViewRefusal> {
     let predecessor = match node.predecessor() {
       Some(id) => Some((self.index.node_revision(id)?, self.placed(id)?)),
       None => None,
     };
     let data = match node.kind() {
-      NodeKind::File => self.file_text(source, node, predecessor.as_ref())?,
+      NodeKind::File => self.file_text(node, predecessor.as_ref())?,
       NodeKind::Directory => self.entries(node, predecessor.as_ref())?,
     };
     let properties = match node.properties() {
@@ -717,12 +623,10 @@ impl Layout<'_> {
     })
   }
 
-  /// A file's text: its predecessor's when equal, the representation a text already has when it has one, otherwise
-  /// its stored delta written here as a `DELTA` representation against its base's (format 8, main's ruling 3), the
-  /// delta's bytes read where the records keep them; a text kept whole (no delta) a `PLAIN` one read through the source.
-  fn file_text<S: Source + TextDeltas + ?Sized>(
+  /// A file's text: its predecessor's when equal, the representation a text already has when it has one, otherwise a
+  /// `PLAIN` one written here, naming the text, whose bytes a read takes through the source ([`RevisionFile::read`]).
+  fn file_text(
     &mut self,
-    source: &S,
     node: &Node<'_>,
     predecessor: Option<&(Node<'_>, Placed)>,
   ) -> Result<Option<Representation>, ViewRefusal> {
@@ -738,26 +642,9 @@ impl Layout<'_> {
       return Ok(Some(placed));
     }
     let offset = self.writer.length;
-    let size = match source.text_delta(&text.identity) {
-      Some(delta) => {
-        let size = u64::try_from(delta.bytes.len()).map_err(|_| ViewRefusal::Overflow)?;
-        match delta.base {
-          Some(base) => {
-            let base = self.text_placed(&base).ok_or(ViewRefusal::Unplaced)?;
-            let header = format!("DELTA {} {} {}\n", base.revision, base.offset, base.size);
-            self.writer.bytes(header.as_bytes())?;
-          }
-          None => self.writer.bytes(DELTA_SELF)?,
-        }
-        self.writer.delta(text.identity, size)?;
-        size
-      }
-      None => {
-        self.writer.bytes(PLAIN)?;
-        self.writer.text(text.identity, text.size)?;
-        text.size
-      }
-    };
+    self.writer.bytes(PLAIN)?;
+    self.writer.text(text.identity, text.size)?;
+    let size = text.size;
     self.writer.bytes(END_REPRESENTATION)?;
     let number = self.uniquifier;
     self.uniquifier = number.checked_add(1).ok_or(ViewRefusal::Overflow)?;
@@ -922,7 +809,7 @@ pub fn transaction_path(name: &str) -> String {
 ///
 /// # Errors
 /// [`ViewRefusal::NotLaidOut`] for a base the view has not reached; otherwise as [`View::advance`].
-pub fn transaction_files<S: Source + TextDeltas + ?Sized>(
+pub fn transaction_files<S: Source + ?Sized>(
   view: &View,
   index: &Index,
   trial: &Trial<'_>,
@@ -1057,7 +944,7 @@ impl Transaction<'_, '_> {
   }
 
   /// Writes `node`'s file, and its property and entries files where it changed them.
-  fn node<S: Source + TextDeltas + ?Sized>(
+  fn node<S: Source + ?Sized>(
     &mut self,
     source: &S,
     node: &Node<'_>,
