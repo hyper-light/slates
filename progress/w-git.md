@@ -516,3 +516,8 @@
   in 20,858-20,916 (89,439 before). Also clone.rs A-855 test split (clippy). Focused: slates-git store+upload+
   negotiation 217, slates-server vcs_store/git_push/vcs_http::git 171. NEXT: A-859 part A (a fetched byte priced at the
   network, §4.11), then the recent-objects cache given back when idle (main 04:24), then deflate reuse.
+- 2026-11-22 ~05:05 PST: clippy splits LANDED f142f5853 (encoding.rs reused, upload.rs stream reused, clone.rs A-855
+  test); A-860 LANDED b51098de3 (merge 4af9997f8): an idle repository lets go of its recent-objects cache from
+  give_back_idle. Focused: git 217, server vcs_store/vcs_share/t_a859 143. NEXT (main 04:53): git_interop whole-repository
+  test prints each clone edge's pack bytes (slates, stock) and reuse counters; then the stored-pack order if it refuses
+  reuse; then A-859 part A; deflate reuse.
