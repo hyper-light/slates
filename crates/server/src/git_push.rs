@@ -2443,13 +2443,15 @@ impl ShardGreens<'_, '_> {
     Some((Version { number, tree }, head))
   }
 
-  /// The tree the object `head` names (module docs): a commit's, a tree itself, or that of the commit or tree an
-  /// annotated tag names; none for anything else (a tag of a tag is owed).
+  /// The tree the object `head` names (module docs), as git peels a ref (A-836: a ref may name any object): a commit's,
+  /// a tree itself, the end of a chain of annotated tags followed to its end, and the empty tree for a blob (a ref naming
+  /// no tree holds no files). The chain's tags are distinct objects the store holds, each named by its content, so it
+  /// ends.
   fn tree_of(&self, head: &ObjectId) -> Option<ObjectId> {
     let (content, git) = self.store;
     let mut target = *head;
     let mut row = git.repository.object(content, &target)?;
-    if row.kind == Kind::Tag {
+    while row.kind == Kind::Tag {
       let (_, bytes) = self.indexed.object(&target)?;
       let tag = Tag::parse(bytes, &mut Admission::new(u64::MAX)).ok()?;
       target = tag.object(head.format())?;
@@ -2458,7 +2460,7 @@ impl ShardGreens<'_, '_> {
     match row.kind {
       Kind::Commit => git.repository.id_at(content, row.commit?.tree),
       Kind::Tree => Some(target),
-      _ => None,
+      Kind::Blob | Kind::Tag => slates_git::object_name::empty_tree(head.format()),
     }
   }
 

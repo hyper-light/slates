@@ -992,12 +992,6 @@ pub struct Green {
   identity_out: BTreeSet<IdentityKey>,
   /// The file keys whose entry was taken out at their first change ([`Green::identities_taken_at_change`]).
   identities_taken_at_change: std::cell::Cell<u64>,
-  /// A large file key's head entry being hashed a slice a step ([`Green::fold_identity_slice`]), nothing of it in
-  /// `identity` until it is whole: dropped, and begun again, whenever its file or the green's copies changed since it
-  /// began, or a whole fold takes its key.
-  identity_partial: Option<PartialFold>,
-  /// The slices a partial key's hashing took past its first ([`Green::identity_slices_within_a_key`]).
-  identity_slices_within_a_key: std::cell::Cell<u64>,
   /// The current files (persistent, [`crate::dims`]).
   content: Files,
   /// The texts held by content identity (A-716, [`crate::held`]): blocks of `content`'s arena, shared with the files
@@ -1775,21 +1769,6 @@ struct StagedFile {
   renamed: bool,
 }
 
-/// A file key's head entry part hashed ([`Green::fold_identity_slice`], A-579).
-#[derive(Debug)]
-struct PartialFold {
-  /// The key, a file's taken out at its change (`identity_out`).
-  key: IdentityKey,
-  /// The version its file last changed at when the hashing began.
-  changed: Option<u64>,
-  /// The green's copy records when it began: a copy grafts bytes without a file change of its own.
-  copies: usize,
-  /// The entry so far.
-  entry: crate::identity::Entry,
-  /// The file's bytes hashed so far.
-  offset: usize,
-}
-
 /// One accepted per-path effect to apply at commit.
 enum Effect {
   /// Set an IPC inode without acquiring a live endpoint.
@@ -2340,146 +2319,31 @@ impl Green {
   /// slice a step, so no one step hashes every file the green changed since the identity was last read: each key's
   /// move reads its entry at its own version and at the head, so commits between two steps leave every key exact.
   pub fn fold_identity_step(&mut self, keys: usize) -> bool {
-    // A whole key's fold takes the partial's key with it: nothing of the partial is in the sum, so it is dropped.
-    self.identity_partial = None;
     for _ in 0..keys {
       let Some(key) = self.identity_dirty.pop_first() else {
         break;
       };
-      self.fold_key(key);
-    }
-    self.fold_finished()
-  }
-
-  /// Brings about `bytes` of the identity's backlog to the head (A-579): keys whole while each fits what is left of the
-  /// budget, and a file key taken out at its change and larger than that hashed a slice at a time across calls, so no
-  /// call hashes much more than `bytes` however large a file is (a key with its history to read, on a green with copies,
-  /// is folded whole). Whether none is left, the identity then the set hash at the head.
-  pub fn fold_identity_slice(&mut self, bytes: usize) -> bool {
-    let budget = bytes.max(1);
-    let mut spent = 0usize;
-    while spent < budget {
-      let left = budget.saturating_sub(spent);
-      if let Some(partial) = self.identity_partial.take() {
-        spent = spent.saturating_add(self.continue_partial(partial, left));
-        continue;
-      }
-      let Some(key) = self.identity_dirty.first().cloned() else {
-        break;
+      let since = self.identity_since(&key);
+      let (out, into) = if self.identity_out.remove(&key) {
+        // Its own entry left the sum at its change (`mark_dirty`): what a copy since gave it, and its entry now.
+        (
+          self.copied_entries(&key, since),
+          self.identity_entries_at_head(&key),
+        )
+      } else {
+        self.identity_moves(&key, since)
       };
-      if let Some(partial) = self.begin_partial(&key, left) {
-        self.identity_partial = Some(partial);
-        continue;
+      for entry in &out {
+        self.identity.remove(entry);
       }
-      let cost = match &key {
-        IdentityKey::File(path) => self.content.get(path).map_or(0, <[u8]>::len),
-        _ => 0,
-      };
-      self.identity_dirty.remove(&key);
-      self.fold_key(key);
-      spent = spent.saturating_add(cost.max(1));
+      for entry in &into {
+        self.identity.add(entry);
+      }
+      self.identity_folded.insert(key, self.head());
     }
-    if self.identity_partial.is_some() {
-      return false;
-    }
-    self.fold_finished()
-  }
-
-  /// A partial hashing of `key` begun, when it is a file taken out at its change larger than `left`.
-  fn begin_partial(&self, key: &IdentityKey, left: usize) -> Option<PartialFold> {
-    let IdentityKey::File(path) = key else {
-      return None;
-    };
-    if !self.identity_out.contains(key) {
-      return None;
-    }
-    let bytes = self.content.get(path)?;
-    if bytes.len() <= left {
-      return None;
-    }
-    Some(PartialFold {
-      key: key.clone(),
-      changed: self.last_changed.get(path).copied(),
-      copies: self.copies.values().map(Vec::len).sum(),
-      entry: crate::identity::Entry::new(IDENTITY_TAG_FILE)
-        .field(path.as_bytes())
-        .open_field(bytes.len()),
-      offset: 0,
-    })
-  }
-
-  /// Hashes at most `left` more bytes of `partial`'s file, and moves its key once whole: the bytes hashed (none when it
-  /// had to begin again, its file or the copies having changed since).
-  fn continue_partial(&mut self, mut partial: PartialFold, left: usize) -> usize {
-    let IdentityKey::File(path) = &partial.key else {
-      return 0;
-    };
-    let copies: usize = self.copies.values().map(Vec::len).sum();
-    let unchanged = self.last_changed.get(path).copied() == partial.changed
-      && copies == partial.copies
-      && self.identity_dirty.contains(&partial.key);
-    let Some(bytes) = self.content.get(path).filter(|_| unchanged) else {
-      // Begun again from its first byte, by the next call.
-      return 0;
-    };
-    let end = partial.offset.saturating_add(left).min(bytes.len());
-    let piece = bytes.get(partial.offset..end).unwrap_or_default();
-    let taken = piece.len();
-    partial.entry = partial.entry.piece(piece);
-    partial.offset = end;
-    if end < bytes.len() {
-      self
-        .identity_slices_within_a_key
-        .set(self.identity_slices_within_a_key.get().saturating_add(1));
-      self.identity_partial = Some(partial);
-      return taken.max(1);
-    }
-    // Whole: what a copy since gave it out, its entry at the head in, as `fold_key` moves a key taken out.
-    let key = partial.key;
-    let since = self.identity_since(&key);
-    for entry in &self.copied_entries(&key, since) {
-      self.identity.remove(entry);
-    }
-    self.identity.add(&partial.entry);
-    self.identity_dirty.remove(&key);
-    self.identity_out.remove(&key);
-    self.identity_folded.insert(key, self.head());
-    taken.max(1)
-  }
-
-  /// The identity's slices taken past a key's first, a large file hashed across calls ([`Green::fold_identity_slice`]):
-  /// the non-vacuity count of the slicing inside a key.
-  pub fn identity_slices_within_a_key(&self) -> u64 {
-    self.identity_slices_within_a_key.get()
-  }
-
-  /// Moves `key`, taken out of the backlog, from the version its entry was taken at to the head.
-  fn fold_key(&mut self, key: IdentityKey) {
-    let since = self.identity_since(&key);
-    let (out, into) = if self.identity_out.remove(&key) {
-      // Its own entry left the sum at its change (`mark_dirty`): what a copy since gave it, and its entry now.
-      (
-        self.copied_entries(&key, since),
-        self.identity_entries_at_head(&key),
-      )
-    } else {
-      self.identity_moves(&key, since)
-    };
-    for entry in &out {
-      self.identity.remove(entry);
-    }
-    for entry in &into {
-      self.identity.add(entry);
-    }
-    self.identity_folded.insert(key, self.head());
-  }
-
-  /// Whether the backlog is empty, the identity then marked whole at the head.
-  fn fold_finished(&mut self) -> bool {
     if !self.identity_dirty.is_empty() {
       return false;
     }
-    self.identity_partial = None;
     self.identity_folded.clear();
     self.identity_out.clear();
     self.identity_version = self.head();

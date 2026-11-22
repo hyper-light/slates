@@ -4,14 +4,16 @@
 
 use std::collections::BTreeMap;
 
-use super::support::{History, ROOMY, created, created_within, digests, history, properties};
+use super::support::{
+  History, ROOMY, created, created_records, created_records_within, digests, history, properties,
+};
 use crate::commit::revision::{Revision as RevisionToCommit, StepRefusal};
 use crate::index::{
   Action, ChangedPath, ContentIdentity, IndexRefusal, NodeKind, PropertyList, RevisionRecord, Text,
 };
 use crate::lock::{AprTime, CommitLocks, Lock, LockEntry, LockRefusal, LockToken};
 use crate::migration::properties::encode;
-use crate::migration::{Repository, Room};
+use crate::migration::{Repository, Room, Standalone};
 
 /// The date of the first revision the tests commit.
 const FIRST_DATE: &str = "2026-11-19T07:00:00.000000Z";
@@ -24,7 +26,7 @@ const FILE: &str = "/trunk/a.txt";
 type Snapshot = (History, String, u64, Vec<Lock>);
 
 /// `repository`, whole.
-fn snapshot(repository: &Repository) -> Snapshot {
+fn snapshot(repository: &Standalone) -> Snapshot {
   (
     history(repository),
     format!("{:?}", repository.index()),
@@ -137,7 +139,7 @@ fn release() -> Vec<LockEntry> {
 
 /// Commits into `repository` what the owner did, in its order: revision 1, bob's lock taken, revision 2 releasing
 /// it, revision 3.
-fn owners_history(repository: &mut Repository) -> Result<(), StepRefusal> {
+fn owners_history(repository: &mut Standalone) -> Result<(), StepRefusal> {
   repository.commit(first())?;
   repository.apply_lock_entries(&[LockEntry::Set(bobs_lock())])?;
   repository.commit(edit(1, b"beta\n", release()))?;
@@ -261,25 +263,25 @@ fn added(revision: &RevisionToCommit) -> u64 {
 /// bytes it needed, then the index's own `Room`; each repository as it was.
 #[test]
 fn a_revision_past_the_room_is_refused_whole() {
-  let needed = created().held() + added(&first());
+  let needed = created_records().held() + added(&first());
   let bytes = Room {
     entries: ROOMY.entries,
     bytes: needed - 1,
   };
-  let mut small = created_within(bytes);
-  let before = snapshot(&small);
+  let mut small = created_records_within(bytes);
+  let before = snapshot(&Standalone::new(small.clone()));
   let refusal = small.commit(first()).unwrap_err();
   let room = StepRefusal::Room {
     needed,
     room: needed - 1,
   };
   assert_eq!((refusal.subversion_code(), refusal), (160_000, room));
-  assert_eq!(snapshot(&small), before);
+  assert_eq!(snapshot(&Standalone::new(small.clone())), before);
   let entries = Room {
     entries: 2,
     bytes: ROOMY.bytes,
   };
-  let mut few = created_within(entries);
+  let mut few = created_records_within(entries);
   let refusal = few.commit(first()).unwrap_err();
   assert!(
     matches!(refusal, StepRefusal::Index(IndexRefusal::Room { .. })),
@@ -332,7 +334,7 @@ fn t_a655_the_steps_check_of_a_work_verifies_the_locks_as_they_stand() {
 /// bound); and the deltas holding under a quarter of the texts' bytes.
 #[test]
 fn s4_c2_a_file_changed_many_times_reads_back_through_a_logarithmic_chain_of_deltas() {
-  let mut repository = created();
+  let mut repository = created_records();
   repository.commit(first()).unwrap();
   let line =
     |at: usize, version: usize| format!("{at:04} line of the file, version {version:04}\n");
@@ -533,7 +535,7 @@ fn an_export_waits_for_each_piece_of_a_stored_text_and_writes_the_same_dump() {
 /// text made whole from its chain by the reads (the counter where the commits left it); the text's end read empty.
 #[test]
 fn s4_c2_a_fetch_reads_a_texts_pieces_a_window_at_a_time_never_making_it_whole() {
-  let mut repository = created();
+  let mut repository = created_records();
   repository.commit(first()).unwrap();
   let line =
     |at: usize, version: usize| format!("{at:06} a line of the long file, version {version:04}\n");
@@ -610,7 +612,7 @@ fn an_export_rebuilds_a_long_delta_chain_a_window_a_call() {
   }
   const LEN: usize = 512 * 1024;
   let mut bytes: Vec<u8> = (0..LEN).map(|at| u8::try_from(at % 251).unwrap()).collect();
-  let mut repository = created();
+  let mut repository = created_records();
   let mut opening = first();
   let (alpha, _) = content(b"alpha\n");
   opening.contents.remove(&alpha);
@@ -674,7 +676,7 @@ fn an_export_rebuilds_a_long_delta_chain_a_window_a_call() {
 /// the reader's own, so a second reader makes the windows again, and reads with no cache make one a piece.
 #[test]
 fn s4_c2_a_reader_makes_each_window_of_a_text_once_whatever_the_pieces() {
-  let mut repository = created();
+  let mut repository = created_records();
   repository.commit(first()).unwrap();
   let line =
     |at: usize, version: usize| format!("{at:06} a line of the long file, version {version:04}\n");
@@ -752,7 +754,7 @@ fn a_replay_makes_each_delta_window_a_bounded_number_of_times() {
   use crate::svndiff::WINDOW_LIMIT;
   const LEN: usize = 512 * 1024;
   let mut bytes: Vec<u8> = (0..LEN).map(|at| u8::try_from(at % 251).unwrap()).collect();
-  let mut repository = created();
+  let mut repository = created_records();
   let mut opening = first();
   let (alpha, _) = content(b"alpha\n");
   opening.contents.remove(&alpha);
@@ -861,8 +863,8 @@ fn a_replayed_revision_keeps_its_texts_a_row_a_step_as_a_whole_commit_does() {
     bytes.extend_from_slice(b"one more line\n");
     bytes
   };
-  let mut whole = created();
-  let mut replayed = created();
+  let mut whole = created_records();
+  let mut replayed = created_records();
   let mut steps = Vec::new();
   for (head, edit) in [(0u64, &same as &dyn Fn(&[u8]) -> Vec<u8>), (1, &changed)] {
     let checked = whole.check(made(head, edit)).unwrap();
@@ -883,7 +885,8 @@ fn a_replayed_revision_keeps_its_texts_a_row_a_step_as_a_whole_commit_does() {
   };
   assert_eq!(
     (
-      super::support::export_all(&replayed).unwrap() == super::support::export_all(&whole).unwrap(),
+      super::support::export_all(&Standalone::new(replayed.clone())).unwrap()
+        == super::support::export_all(&Standalone::new(whole.clone())).unwrap(),
       chains(&replayed) == chains(&whole),
       steps,
     ),
@@ -966,13 +969,13 @@ fn an_import_asks_its_caller_for_a_delta_base_the_records_keep_elsewhere() {
       repository.stored_len(&identity),
     )
   };
-  let mut kept = created();
+  let mut kept = created_records();
   let checked = kept.check(first()).unwrap();
   kept.apply(checked).unwrap();
   let mut naming = first();
   naming.contents.remove(&alpha);
   naming.stored.insert(alpha, 6);
-  let mut stored = created();
+  let mut stored = created_records();
   let checked = stored.check(naming).unwrap();
   stored.apply(checked).unwrap();
   let made_text = Some(made.to_vec());

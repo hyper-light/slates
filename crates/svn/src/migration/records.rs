@@ -22,10 +22,12 @@
 //! 1.10's form) against the text of its node's skip-delta predecessor (FSFS's `choose_delta_base`: the predecessor
 //! whose count is the node's with its lowest set bit cleared), a node's first version against nothing. A read makes the
 //! text from its chain of bases, at most `log2` of the node's predecessors deltas applied ([`Repository::text`]); nothing
-//! is deltified again later. Property lists are kept whole and read in place ([`Repository::content`]). These are the
-//! texts records hold standing alone (a test's, a fixture's, an import before its caller lands it); records a daemon
-//! keeps hold none: since C2 stage B part 2 (b) every text there is named stored, its bytes its changeset's on the
-//! node's store, and the daemon refuses a log that carries texts inline.
+//! is deltified again later. Property lists are kept whole and read in place ([`Repository::content`]). Records a
+//! daemon keeps hold no text: since C2 stage B part 2 (b) every text there is named stored, its bytes its changeset's on
+//! the node's store, and the daemon refuses a log that carries texts inline. Records standing alone hold theirs apart
+//! the same way ([`super::Standalone`], the KeptText move's first piece: the migration tests); what still commits into
+//! bare records (the tests of this keeping, the crate's integration tests and examples, some server tests) keeps them
+//! here until the move's second piece, and the third removes this keeping.
 //!
 //! A repository is also the drive's [`Green`] (A-617): it reads the texts and property lists it holds and names new
 //! ones as it keeps them, so a client's drive and its commit run over one set of records.
@@ -613,6 +615,43 @@ impl Repository {
       Record::Revision(revision) => self.commit(revision).map(drop),
       Record::Locks(entries) => self.apply_lock_entries(&entries),
     }
+  }
+
+  /// Takes out of `revision`'s contents every text its rows name that the records do not hold, and names each in its
+  /// stored texts by its length instead (C2 stage B part 2 (b)): the texts its caller holds apart, a daemon on the
+  /// node's store, records standing alone in [`super::Standalone`]. A text whose bytes a row also names as a property
+  /// list stays among the contents, the records keeping a list whole.
+  pub fn take_texts(&self, revision: &mut RevisionToCommit) -> BTreeMap<ContentIdentity, Vec<u8>> {
+    let lists: BTreeSet<ContentIdentity> = revision
+      .record
+      .changes
+      .iter()
+      .filter_map(|change| match change.properties {
+        Some(PropertyList::Held { identity, .. }) => Some(identity),
+        _ => None,
+      })
+      .collect();
+    let mut texts = BTreeMap::new();
+    for text in revision
+      .record
+      .changes
+      .iter()
+      .filter_map(|change| change.text)
+    {
+      if self.holds(&text.identity) || texts.contains_key(&text.identity) {
+        continue;
+      }
+      let bytes = if lists.contains(&text.identity) {
+        revision.contents.get(&text.identity).cloned()
+      } else {
+        revision.contents.remove(&text.identity)
+      };
+      if let Some(bytes) = bytes {
+        revision.stored.insert(text.identity, text.size);
+        texts.insert(text.identity, bytes);
+      }
+    }
+    texts
   }
 
   /// A transaction on the youngest revision, named as FSFS names it: the base, a `-`, and the repository's count of
@@ -1414,7 +1453,7 @@ fn decoded_step(reading: &mut TextReading, delta: &[u8]) -> Option<()> {
 }
 
 /// `text` from `offset` to its end: none past it, as a read's source answers.
-fn from_offset(text: Cow<'_, [u8]>, offset: u64) -> Option<Cow<'_, [u8]>> {
+pub(super) fn from_offset(text: Cow<'_, [u8]>, offset: u64) -> Option<Cow<'_, [u8]>> {
   let offset = usize::try_from(offset).ok()?;
   match text {
     Cow::Borrowed(bytes) => bytes.get(offset..).map(Cow::Borrowed),

@@ -18081,3 +18081,34 @@ c	many_paths_once_history_bytes_per_version	paths	100	152
 c	many_paths_once_history_bytes_per_version	paths	1000	152
 c	many_paths_once_history_bytes_per_version	paths	10000	152
 ```
+
+## 2026-11-21 — A conflict resolved in one ask (A-840): accepted (w-fed-move, goal 86b)
+
+The change: the load harness resolves a conflict with `ResolveConflict` (the windows given up, its slots in them
+written again, resolved at the head as it is), one ask with no gap, against the read-and-rebase loop
+(`--resolve rebase`). Release, in-process, the kernel's `kernel/` (754 files), 1,000 clients, one round,
+`--per-connection 32`, no think time; main 03b49b424 with the change; three pairs at each hot-file count, each pair back
+to back; this Mac Studio (32 CPUs) under other agents' load (load average 11 to 15). Oracle failures, own-file failures
+and starved clients were 0 in all 24 runs. Each cell gives the three runs.
+
+| hot files | arm | owner asks a client | rebase-kind | verdict | repeat conflicts | verdicts/s |
+|---|---|---|---|---|---|---|
+| 300 | rebase | 11.3, 11.3, 11.2 | 2.2, 2.1, 2.1 | 2.4, 2.4, 2.4 | 755, 754, 752 | 4,531, 4,423, 4,408 |
+| 300 | one ask | 10.9, 11.0, 11.0 | 1.8, 1.9, 1.8 | 2.4, 2.4, 2.4 | 345, 394, 342 | 4,678, 4,750, 4,791 |
+| 100 | rebase | 13.2, 13.3, 13.2 | 3.7, 3.7, 3.7 | 2.8, 2.8, 2.7 | 1,839, 1,934, 1,987 | 4,037, 4,387, 4,020 |
+| 100 | one ask | 12.5, 12.5, 12.3 | 2.7, 2.7, 2.6 | 3.0, 3.0, 3.0 | 617, 727, 586 | 4,783, 4,735, 4,579 |
+| 30 | rebase | 20.1, 19.7, 19.5 | 9.5, 9.1, 8.9 | 3.9, 3.9, 3.9 | 6,542, 6,102, 6,021 | 3,634, 3,577, 3,208 |
+| 30 | one ask | 17.6, 17.5, 17.2 | 5.7, 5.6, 5.4 | 5.2, 5.2, 5.1 | 1,434, 1,375, 1,357 | 4,595, 4,598, 4,541 |
+| 10 | rebase | 32.9, 33.2, 32.7 | 20.8, 20.9, 20.5 | 5.5, 5.7, 5.5 | 16,351, 16,216, 15,900 | 2,592, 2,631, 2,644 |
+| 10 | one ask | 27.0, 26.8, 26.3 | 10.9, 10.7, 10.4 | 9.5, 9.4, 9.2 | 2,400, 2,306, 2,103 | 4,298, 4,695, 4,505 |
+
+- **Accepted.** Every pair at every hot-file count has fewer owner asks with one ask: about 3% at 300 hot files, 18%
+  at 10; the rebase-kind asks halve at 10. Verdict asks rise (a resolved work submits at once, into the same
+  contention), and are now the largest kind at 10 hot files. Verdicts a second rose in every pair, on a loaded box (not
+  read as a result).
+- **Two runs before this one did not count.** The first (oracle failures 213-342 a run, 202-536 clients starved) found a
+  harness error (a conflicting resolution names only what it kept, so the windows given up must accumulate) and a
+  daemon bug (a work's composition laid zeros for base bytes its shard did not hold:
+  `docs/bugs/2026-11-21-a-composition-laid-zeros-for-base-bytes-its-shard-did-not-hold.md`). The second, with both
+  fixed but the owner's answer still dropping the work's base entries whenever the owner had composed, had 3.9 file
+  asks a client at 10 hot files, which the third run's fix removed.

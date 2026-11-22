@@ -83,7 +83,7 @@
 > (A-787 part 2's park, 2a498b90f). 10 server lib tests (repository, vcs_store paths and commits) failed from that
 > commit on, bisected against its parent 81d8baea5; such a verb now composes unrefined and is answered (6459374).
 
-> **Open, after goal 93 (w-fed-faults, A-821; main's ruling 2026-11-21 14:23): a refined submit's commit is one step past the bound in debug.** On the 2 MiB re-indent the step is 270-340 ms in debug against 100 ms (release 24.6 ms), the commit's history re-anchor ~219 ms of it (A-821 took composition, verdict and encode off it). The fix, when A-818 2b reopens: build the commit's new history tree off the step on 2b's persistent trees (a slice a turn, `places.change` staged), install it in O(1) in the one step, and fall back in-step when the head moved; 2b's branch as built is slower here (2,011 ms debug, 89 ms release).
+> **Open, after goal 93 (w-fed-faults, A-821; main's ruling 2026-11-21 14:23): a refined submit's commit is one step past the bound in debug.** On the 2 MiB re-indent the step is 270-340 ms in debug against 100 ms (release 24.6 ms), the commit's history re-anchor ~219 ms of it (A-821 took composition, verdict and encode off it). The fix, when A-818 2b reopens: build the commit's new history tree off the step on 2b's persistent trees (a slice a turn, `places.change` staged), install it in O(1) in the one step, and fall back in-step when the head moved; 2b's branch as built is slower here (2,011 ms debug, 89 ms release). Measured on 2b's branch (c4278fd3c) merged into main 1a35ab091: the test exits 4 in debug every run (the watchdog's kill at refining.rs:187, 3,534 ms of CPU in one poll), and the release longest step rises from 24.6 to 91.7 ms; `history::change` spends 41 ms in `anchor.places.change` (92,354 parts) and 42 ms in `trees.rebuild` (92,356 nodes) in release, about 0.45 µs a part a pass, ten times that in debug. Main's ruling of 14:30 makes `a_large_rewrite_is_refined_over_many_turns_off_the_submit` 2b's landing gate (debug with no watchdog kill, release no worse than main's 24.6 ms); w-rewrite-ops owns the fix, chosen by A/B among (a) a bulk linear path for a many-part change, (b) an off-step build with `places.change` staged and an O(1) install, (c) a derived part cap naming the block whole.
 
 > **CLOSED (w-hg, 2026-11-21): five Mercurial tests of `vcs_http::daemon_edge` failed on macOS arm64**
 > (`a_mercurial_repositorys_store_is_served_...`, `a_stock_mercurial_push_...`, the clone, stream clone and push
@@ -196,6 +196,10 @@
 > The flows build for Linux FUSE and Windows WinFsp too (Windows: the file index, last-write and change times, cargo
 > and git status; the held compile and `make` are Unix's). Open: their Linux and Windows runs (run-requests.md), and
 > memory pressure from a host actually short of memory (the test injects it).
+> Open (found by use 2026-11-21, routed to g224): on Mac Studios (Studio-2 twice, Studio-4) a fresh slates NFS mount's
+> first `opendir` never returns. The client sends GETATTR, LOOKUP, ACCESS and FSSTAT (345 in 30 min) and never
+> READDIR or CREATE, while the daemon answers every call. The same flows pass on adas-macbook-pro-2. The real-tools
+> test now fails in 305 s naming the stall instead of hanging.
 
 > **MEMORY SIZING (Ada 2026-11-20: the daemon held 7.1 GB resident after an 84 MB Mercurial push; w-sizing).** Every
 > buffer, region, reserve and prefault is sized from the work, learned, decays and is given back; a machine total is
@@ -490,10 +494,14 @@
 > the held verdict's preview, its changeset homed and landed, then recorded version 5 with its version in one step
 > (`t_c5b_p3_…`; counter `vcs_commits.made_landed`); a kill between the landing and the step recovers to before and the
 > retry lands once (`t_c5b_p3_a_kill_…`). Part 2 BUILT (A-824): every made commit lands, version 2 is written by no path and
-> refused `Retired` at replay with version 1. Owed (w-git): the change step over the preview in one turn; the replay reading the pack a piece at
+> refused `Retired` at replay with version 1; a made commit's map is put a slice a turn over the preview. Owed (w-git):
+> the replay reading the pack a piece at
 > a time through `StorePacks` rather than whole; the push's pack held twice in RAM until it lands (its own
 > buffer and the content store's windows); a node whose store lacks a record's changeset reading its names from their
 > region homes, held by a test of its own (the rebuild test now reads the node's store).
+> A-836 BUILT (2026-11-21, w-git; w-interop r16): a ref may name any object. A tag chain is peeled to its end and a ref
+> naming a blob holds no files (its green at git's empty tree), so git/git's `junio-gpg-pub` and `v1.0rc1`..`rc6` are
+> taken and served (`t_a836_…`). Owed: w-interop's rerun of git/git's push and clones over it.
 > R2, the load-only edge tests, CLOSED (2026-11-21, w-git): a push's answer under side-band-64k wrote its first
 > keepalive two intervals after its body (`body_end` waited one interval unwritten, then the reply its own before
 > appending it), 10 s, the client's patience, so every push answer past 5 s failed (18 of 18 at load 24, the timing
@@ -683,6 +691,15 @@
 > **A-722 part 4a (2026-11-20, w-git).** BUILT: a git record's pack replayed a turn at a time (read in chunks, objects
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
+>
+> **A-840 (2026-11-21, w-fed-move; goal 86b's owner asks).** FIXED: a conflict is resolved in one ask
+> (`ResolveConflict`: the windows given up, the rest resolved at the head as it is): rebase-kind asks 20.5-20.9 to
+> 10.4-10.9 a client at 10 hot files, all owner asks 32.7-33.2 to 26.3-27.0. Also FIXED, found by its oracle: a work off
+> its green's shard laid zeros for base bytes it did not hold when composing a rebased file (A-806's parts), and the
+> green took them; the composition now goes to the owner. Open: verdict asks are the largest kind (9.2-9.5 a client at
+> 10 hot files); the rebase arm (`--resolve rebase`) is kept only as the comparison's other leg. Main's queue:
+> `work_edit_cow`'s `a_one_byte_edit_of_a_large_file_costs_the_byte_not_the_file` is ended by the watchdog in a debug
+> build on a loaded box, on main before this change too (shard spinning 3.6 s in the submit's first poll).
 >
 > **A-817 (2026-11-21, w-fed-move; goal 86b's owner asks).** FIXED: a file's base bytes are asked only for a whole
 > replacement whose declared base length is the file's (an overwrite at offset 0 had asked them at every rebase and
@@ -3078,7 +3095,12 @@
 > nothing keeps one in RAM but the green's head and a hook view's pins. CLOSED (A-819, main 09:20): the deltify record
 > and APIs retired, a log holding one refused typed at decode and a revision with inline texts at replay
 > (`a_log_holding_a_retired_record_or_inline_texts_is_refused_typed_at_rebuild`); `KeptText` stays for records
-> standing alone, which a daemon's no longer reach. Stage C,
+> standing alone, which a daemon's no longer reach (the KeptText move, main's 10:35 item 3, three pieces: (1) BUILT
+> 2026-11-21, `migration::Standalone` holds standing-alone records' texts apart, named stored, as a daemon's are, and
+> the migration tests run on it (`Repository::take_texts`, shared with the server's landing); (2) owed: the crate's
+> integration tests and examples, `vcs_ssh`'s, the presenter's and `vcs_store`'s tests that commit into bare records;
+> (3) owed: `KeptText`, its delta chains and window reads removed from the records, with the 7 step tests of them).
+> Stage C,
 > an import as one sliced changeset (today a changeset a record). A submitted version's revision (`svn_made`) takes the
 > one landing order since A-804 (2026-11-21, w-rewrite-ops; main 01:52, the deferred-submit hook, `crate::made_commit`):
 > a recorded submit takes the repository's landing turn before its verdict (or parks for it), the verdict applies in
@@ -24906,8 +24928,14 @@ in what lands. Branch tips as of 2026-11-10:
 > against main's 2.48-4.47 (ReadHead 3.09-4.38 against 1.04-1.94), while p999 and max are better; at Z = 50 ms every
 > kind's p99 is under 1 ms in 5 of 5 rounds. (b) LANDED 2026-11-21 (a key's old entry subtracted at its first change:
 > the fold hashes current bytes only, no history reads), with a fix to a checkpoint's sum taken mid-fold. OWED: (b)'s A/B
-> (does Z = 20 ms p99 return to main's?); slice the checkpoint's last step (~43 ms: build 5.7, encode 9.5, record 24.4
-> of 49 MB). Single key folds sliced inside a key since 2026-11-21 (`fold_identity_slice`).
+> (does Z = 20 ms p99 return to main's?; main's run, `run-requests.md`, blocked while main's own regression stands:
+> SubmitAccepted server p50 0.29 ms at 4d0ad1674 against 184 ms at 1a35ab091, Z = 50 ms, macOS arm64, not A-579's,
+> window c1449f629..b3f674640 unbisected). DEFERRED past goal 93 (goal 89b's): the checkpoint's last step, ~43 ms
+> (build 5.7, encode 9.5, record 24.4 of 49 MB), plan: slice build and encode under the paced turn budget now, and record
+> by identity in the content store only inside w-shared's chain format 6 (main's 02:06 ruling); and single key folds of
+> up to 13.4 ms, plan: a slice that keeps a hot file's partial short with a guaranteed past-deadline share derived from
+> the latency budget (main's 23:50 ruling), since slicing inside a key landed and was reverted the same day (a fold of
+> 47.6-52.6 s, every past-deadline turn at the 100 ms ceiling; ed4661d40, design amendment A-579).
 
 > **A-805's preview oracle (2026-11-21, w-engine; main's order):** a held verdict's preview reads as its commit over the
 > copy and identity oracles' generated histories and through `Greens::preview`, red with copy and link effects dropped.
