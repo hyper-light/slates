@@ -454,3 +454,7 @@
 - VCS lane: Linux r46 dropped (adacachy2 didn't answer the sync), so I resubmitted it once as r51. Windows: the counts
   from the last round stand (crates green); the server's are blocked on w-bugs' watchdog exit.
 - VCS lane, Linux: r46 and r51 both failed adacachy2's sync; in run-requests.md. No Linux count today.
+
+## 2026-11-21 round at 40d816c29 (nothing to land)
+- Clean: host clippy, fmt, structural, literals, unsafe, the six cross targets.
+- VCS lane: Windows r52 (crates at 40d816c29) and Linux r53 (synced) submitted.
