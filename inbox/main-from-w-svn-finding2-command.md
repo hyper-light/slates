@@ -44,3 +44,11 @@ Your four samples tell me whether git-2000's 1.96 GB is the same pattern at scal
 (or physical footprint) after an import and an idle tick, bounded by a derived multiple of what the import still
 holds. Then I look at how the arena gives pages back (`release_block`: MADV_FREE leaves pages counted until the
 kernel takes them) and at the malloc zones' retention. If they are not, I look for the live holder.
+
+## Update ~23:45 PST: run at 78e584f18 or later, not 9296695b5
+
+c74f35cc1 (merged 78e584f18) adds the daemon's **physical footprint** to each sample. It reads `top`'s MEM column,
+`proc_pid_rusage`'s `ri_phys_footprint`, without suspending the daemon. On macOS, RSS keeps pages the arena's idle
+purge marked reusable (`MADV_FREE_REUSABLE`) until the kernel takes them, while the footprint drops at once. So the
+footprint, not RSS, says whether the import's memory was given back. The command is otherwise the same. Smoke: 45 MB
+of footprint before the import and 51 MB after, against 85 MB and 105 MB of RSS.
