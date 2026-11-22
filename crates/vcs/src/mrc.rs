@@ -179,6 +179,19 @@ impl Curve {
     past.max(0.0)
   }
 
+  /// The cache sizes, in bytes, where the curve bends: each bin's last distance, `granule * (2^b - 1)`, from the empty
+  /// cache to its last bin holding a read; past the last the curve is flat (cold misses alone). Between two the curve is
+  /// a line, so a cache size that saves the most misses per byte from any start is one of these
+  /// (`crate::partition`).
+  pub fn edges(&self) -> impl Iterator<Item = u64> + '_ {
+    let last = self
+      .bins
+      .iter()
+      .rposition(|count| *count > 0.0)
+      .unwrap_or(0);
+    (0..=last).map(|bin| bin_windows(bin).1.saturating_mul(self.granule))
+  }
+
   /// The bytes of distinct objects read, as the sample estimates them: what a cache holding every one would hold.
   pub fn working_set(&self) -> u64 {
     let rate = self.sampling_rate();

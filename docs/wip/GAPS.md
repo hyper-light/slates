@@ -2006,6 +2006,8 @@
 > Open: nothing reads content through it yet; the marginal-utility partition and the CPU weights follow.
 > **A-724 piece 2b (A-845): the learned rates built, not yet fed** (`slates_vcs::rate`, `cargo test -p slates-vcs --lib
 > rate::`, 5 of 5, macOS arm64, this Mac). Open: fed on the owner shard beside `usage::Learned`.
+> **A-724 piece 2c (A-846): memory by marginal utility built, not yet applied** (`slates_vcs::partition`, `cargo test
+> -p slates-vcs --lib partition::`, 4 of 4, macOS arm64, this Mac). Open: computed on the owner shard and published.
 >
 > **The hg correctness lane (2026-11-21, w-balance, UI goal 93 correctness by use):** `crates/cli/tests/hg_interop.rs`
 > `stock_hg_gets_what_stock_hg_serve_gives_on_every_verb_over_http_and_ssh` (ignored; main runs it) drives

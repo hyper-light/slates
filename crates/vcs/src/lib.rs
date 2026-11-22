@@ -73,6 +73,7 @@ pub mod cut;
 pub mod derived;
 pub mod index;
 pub mod mrc;
+pub mod partition;
 pub mod rate;
 pub mod rows;
 pub mod rule;
@@ -97,6 +98,7 @@ pub use index::{
   MergeStep, NewRow, TAIL_SLOT_BYTES,
 };
 pub use mrc::Curve;
+pub use partition::{Division, Want, partition};
 pub use rate::{Decayed, Rates};
 pub use rule::Compaction;
 pub use share::{Claim, Granted, amount_of, divide, whole_units};
