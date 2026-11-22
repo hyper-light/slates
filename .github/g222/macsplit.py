@@ -59,3 +59,14 @@ try:
         lab=lambda i: '<1us' if i==0 else f'{2**(i-1)}-{2**i}us'
         print('  harvests n',t,'| '+' '.join(f'{lab(i)}:{c}' for i,c in enumerate(h) if c), '| >=512us', sum(h[10:]), '>=1ms', sum(h[11:]))
 except (OSError,IndexError): pass
+
+C=rows(base+'.cparks')
+if C:
+    def show(label, sub):
+        if not sub: return
+        late=sorted(int(r[1])-(0 if int(r[0])>=2**63 else int(r[0])) for r in sub)
+        w=sorted(int(r[1]) for r in sub)
+        band=sum(1 for r in sub if 0.9e6<=int(r[1])<=1.2e6)
+        print(f'  client parks {label}: n {len(sub)} waited p50/p99/p999/max us {pc(w,.5)/1e3:.0f} {pc(w,.99)/1e3:.0f} {pc(w,.999)/1e3:.0f} {w[-1]/1e3:.0f}; waited past timeout p99/max us {pc(late,.99)/1e3:.0f} {late[-1]/1e3:.0f}; waited 0.9-1.2 ms {band}')
+    show('woken', [r for r in C if r[2]=='1'])
+    show('timed out or other', [r for r in C if r[2]=='0'])

@@ -20,11 +20,11 @@ env:
 
 jobs:
   mac-split:
-    name: macOS split (${{ matrix.os }})
+    name: split (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest]
+        os: [macos-latest, ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 240
     defaults:
@@ -41,14 +41,14 @@ jobs:
           cargo build --release --locked -p slates-client --example edit_merge_bench > "$W/logs/build.log" 2>&1 || { tail -30 "$W/logs/build.log"; exit 1; }
           cp target/release/examples/edit_merge_bench "$W/bench"; shasum -a 256 "$W/bench"
           echo "runner cpus $(sysctl -n hw.ncpu) memory $(($(sysctl -n hw.memsize) / 1073741824)) GiB"
-          uname -a; sysctl -n hw.ncpu hw.perflevel0.physicalcpu hw.perflevel1.physicalcpu 2>/dev/null; sw_vers; launchctl print system 2>/dev/null | grep -i -m3 timer || true
+          echo "runner cpus $(nproc 2>/dev/null)"; uname -a; sysctl -n hw.ncpu hw.perflevel0.physicalcpu hw.perflevel1.physicalcpu 2>/dev/null || true; sw_vers 2>/dev/null || true; launchctl print system 2>/dev/null | grep -i -m3 timer || true
       - name: Rounds, loaded then quiet, split by hop
         run: |
           W="$RUNNER_TEMP/msr"; B="$W/bench"; set +e +o pipefail
-          python3 .github/g222/timers.py idle
+          [ "$(uname)" = Darwin ] && python3 .github/g222/timers.py idle
           for round in $(seq 1 "$ROUNDS"); do
             L="$W/logs/loaded-r$round.log"; echo "== loaded round $round $(date -u +%FT%TZ) load: $(uptime)" | tee "$L"
-            ( sleep 60; python3 .github/g222/timers.py "loaded-r$round" ) > "$W/logs/timers-loaded-r$round.log" 2>&1 &
+            ( sleep 60; [ "$(uname)" = Darwin ] && python3 .github/g222/timers.py "loaded-r$round" ) > "$W/logs/timers-loaded-r$round.log" 2>&1 &
             G222_DIAG="$W/logs/loaded-r$round.tsv" perl -e 'alarm shift; exec @ARGV' 1500 "$B" --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict </dev/null >> "$L" 2>&1
             echo "exit $?" >> "$L"; wait; cat "$W/logs/timers-loaded-r$round.log"
             grep -E "f10_loaded_total_p(50|99|999)\b|exit" "$L" | cut -c1-200
@@ -60,11 +60,11 @@ jobs:
             python3 .github/g222/macsplit.py "$W/logs/quiet-r$round.tsv"
             python3 .github/g222/fwdsplit.py "$W/logs/quiet-r$round.tsv"
           done
-          python3 .github/g222/timers.py idle-end
+          [ "$(uname)" = Darwin ] && python3 .github/g222/timers.py idle-end
       - name: Keep the logs
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
-          name: mac-split-logs
+          name: split-logs-${{ matrix.os }}
           path: ${{ runner.temp }}/msr/logs
           if-no-files-found: warn

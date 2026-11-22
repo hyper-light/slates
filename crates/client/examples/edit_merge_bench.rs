@@ -962,6 +962,7 @@ impl Drop for G222Dump {
       slates_server::g222_diag::dump_ring(&format!("{path}.ring"));
       slates_server::g222_diag::dump_parks(&format!("{path}.parks"));
       slates_ipc::endpoint::g222_dump_client(&format!("{path}.client"));
+      slates_ipc::endpoint::g222_dump_cparks(&format!("{path}.cparks"));
     }
   }
 }

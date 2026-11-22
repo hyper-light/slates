@@ -69,7 +69,8 @@ pub static G222_RINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// Diagnostic only (g222, never main): the client's reply spin yields its CPU each turn.
 #[doc(hidden)]
 #[allow(clippy::disallowed_types)]
-pub static G222_SPIN_YIELDS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static G222_SPIN_YIELDS: std::sync::atomic::AtomicBool =
+  std::sync::atomic::AtomicBool::new(false);
 
 /// Diagnostic only (g222, never main): per reply the client took, (request stamp, seen ns, parks in the wait).
 #[doc(hidden)]
@@ -81,15 +82,65 @@ pub static G222_CLIENT: [[std::sync::atomic::AtomicU64; 3]; 300_000] =
 #[allow(clippy::disallowed_types)]
 pub static G222_CLIENT_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Diagnostic only (w-perf 84a, never main): per client park, (its timeout ns or u64::MAX for none, how long it
+/// waited, 1 if a wake ended it and 0 if its timeout or another cause did, 1 if its waker confirmed finding it asleep).
+#[doc(hidden)]
+#[allow(clippy::disallowed_types)]
+pub static G222_CPARKS: [[std::sync::atomic::AtomicU64; 4]; 300_000] =
+  [const { [const { std::sync::atomic::AtomicU64::new(0) }; 4] }; 300_000];
+/// Diagnostic only (w-perf 84a, never main).
+#[doc(hidden)]
+#[allow(clippy::disallowed_types)]
+pub static G222_CPARKS_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Diagnostic only (w-perf 84a, never main): the client's parks as TSV.
+#[doc(hidden)]
+#[allow(
+  clippy::all,
+  clippy::pedantic,
+  clippy::disallowed_methods,
+  clippy::disallowed_types
+)]
+pub fn g222_dump_cparks(path: &str) {
+  use std::io::Write;
+  let n = G222_CPARKS_N
+    .swap(0, Ordering::Relaxed)
+    .min(G222_CPARKS.len());
+  let mut out = String::from("timeout\twaited\twoken\tconfirmed\n");
+  for row in G222_CPARKS.iter().take(n) {
+    let line: Vec<String> = row
+      .iter()
+      .map(|v| v.load(Ordering::Relaxed).to_string())
+      .collect();
+    out.push_str(&line.join("\t"));
+    out.push('\n');
+  }
+  if let Ok(mut f) = std::fs::File::create(path) {
+    let _ = f.write_all(out.as_bytes());
+  }
+}
+
 /// Diagnostic only (g222, never main): the client's replies as TSV.
 #[doc(hidden)]
-#[allow(clippy::all, clippy::pedantic, clippy::disallowed_methods, clippy::disallowed_types)]
+#[allow(
+  clippy::all,
+  clippy::pedantic,
+  clippy::disallowed_methods,
+  clippy::disallowed_types
+)]
 pub fn g222_dump_client(path: &str) {
   use std::io::Write;
-  let n = G222_CLIENT_N.swap(0, Ordering::Relaxed).min(G222_CLIENT.len());
+  let n = G222_CLIENT_N
+    .swap(0, Ordering::Relaxed)
+    .min(G222_CLIENT.len());
   let mut out = String::from("stamp\tseen\tparks\n");
   for row in G222_CLIENT.iter().take(n) {
-    out.push_str(&format!("{}\t{}\t{}\n", row[0].load(Ordering::Relaxed), row[1].load(Ordering::Relaxed), row[2].load(Ordering::Relaxed)));
+    out.push_str(&format!(
+      "{}\t{}\t{}\n",
+      row[0].load(Ordering::Relaxed),
+      row[1].load(Ordering::Relaxed),
+      row[2].load(Ordering::Relaxed)
+    ));
   }
   if let Ok(mut f) = std::fs::File::create(path) {
     let _ = f.write_all(out.as_bytes());
@@ -838,6 +889,12 @@ impl ClientEnd {
     self.parks = self.parks.saturating_add(1);
     real_time_once(u64::from(self.region.spin_ns()));
     let switches_before = slates_machine::switches::switches_now();
+    let g222_timeout = match ends {
+      Ends::At(deadline_ns) => {
+        deadline_ns.map(|deadline| deadline.saturating_sub(elapsed_ns(started)))
+      }
+      Ends::Departure => look_timeout_ns,
+    };
     let waiting_ns = slates_machine::clock::monotonic_ns();
     let parked = match ends {
       Ends::At(deadline_ns) => {
@@ -847,6 +904,13 @@ impl ClientEnd {
       Ends::Departure => self.park_until_departure(expected, look_timeout_ns)?,
     };
     let returned_ns = slates_machine::clock::monotonic_ns();
+    let g222_n = G222_CPARKS_N.fetch_add(1, Ordering::Relaxed);
+    if let Some(row) = G222_CPARKS.get(g222_n) {
+      row[0].store(g222_timeout.unwrap_or(u64::MAX), Ordering::Relaxed);
+      row[1].store(returned_ns.saturating_sub(waiting_ns), Ordering::Relaxed);
+      row[2].store(u64::from(parked.woken), Ordering::Relaxed);
+      row[3].store(u64::from(parked.waker_confirms), Ordering::Relaxed);
+    }
     let teaches = wait_may_teach(
       parked.waker_confirms,
       switches_before,
