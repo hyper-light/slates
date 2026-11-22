@@ -9,5 +9,5 @@ Run r10, this MacBook, release, origin/main bc241a580 (has A-835 and A-842), loa
   "revisions: 0", so it is no fair baseline for the memory.
 Reading: the import now finishes, 29x faster, but its working set stays resident after it ends. That breaks Ada's sizing
 rule (give it back; resident bounded by a derived multiple of the data touched). That is finding (2): yours, red first.
-For the attribution, sample  at the hold rather than vmmap/heap. Tell me the command and
+For the attribution, sample `slates status --json --memory` at the hold rather than vmmap/heap. Tell me the command and
 I run it here, since the dump is only on this Mac.
