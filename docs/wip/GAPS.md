@@ -1098,6 +1098,14 @@
 > through it (clone over HTTP and SSH, round trips, forced heads). Owed: file revisions, which the store keeps whole,
 > go the same way once the changeset shape keeps them as Mercurial's deltas. And the clone's time against stock's
 > 283 s, measured again, release.
+> **The SSH edge wrote bytes twice across a rekey (2026-11-21, w-hg; found by reading, main 01a20182's order of 21:35).
+> FIXED.** The edge's write (`vcs_ssh` `Link::write`) raced `TcpStream::write_all` against the session's key timer; a
+> timer that came due while the write waited on a full socket dropped it, and all its bytes were written again, the
+> part the kernel had taken included, so the client's MAC failed and the connection ended. It fired only when the key
+> time (RFC 4253's hour) passed during a blocked write. Now the edge writes with `TcpStream::write_some` (slates-rt:
+> cancel-safe, a write happens only in the poll that returns its count) and the session gives back exactly the bytes
+> taken. Held by `vcs_ssh::tests::hg::a_rekey_during_a_blocked_write_sends_no_byte_twice` (keys replaced every 5 ms
+> under a reader slower than the wire; red before: "the server's ChaCha20-Poly1305 packet opens: Unspecified").
 > **A-745 (2026-11-20, w-hg; main's ruling, found by use by w-interop: no clone of Mercurial's own 57,035-revision
 > history was admitted, HTTP, SSH and stream).** RED: §4.17.1 "A fetch's answer" written; the by-use test (a clone of
 > one changeset whose file is twice a request's room, `ERROR:ABORT PastAdmission { asked: 557056, left: 277336 }`)

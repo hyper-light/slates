@@ -411,6 +411,26 @@ impl TcpStream {
     netsys::as_fd(&self.socket)
   }
 
+  /// Writes what the kernel takes of `buf` now, awaiting writability through the driver only while it takes nothing:
+  /// how many bytes it took, at least one for a non-empty `buf`. Cancel-safe, as [`TcpStream::write_all`] is not: a
+  /// write happens only in the poll that returns its count, so a caller that drops the future (a timer it races came
+  /// due) has written nothing and writes the same bytes again, and one that awaits it learns exactly what was taken.
+  pub async fn write_some(&self, buf: &[u8]) -> Result<usize, RtError> {
+    if buf.is_empty() {
+      return Ok(0);
+    }
+    loop {
+      match netsys::write(&self.socket, buf)? {
+        // A non-blocking write of a non-empty slice returns bytes written, a would-block, or an error; a zero here
+        // would mean the kernel accepted nothing without blocking, which is a broken pipe.
+        Io::Ready(0) => return Err(netsys::broken_pipe("write")),
+        Io::Ready(n) => return Ok(n),
+        Io::WouldBlock => writable(self.socket.raw_id()).await?,
+        Io::Interrupted => continue,
+      }
+    }
+  }
+
   /// Writes all of `buf`, awaiting writability through the driver whenever the send buffer is full,
   /// so a stalled peer yields the shard rather than blocking it. Returns when every byte is accepted.
   pub async fn write_all(&self, buf: &[u8]) -> Result<(), RtError> {

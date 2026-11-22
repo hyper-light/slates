@@ -41,7 +41,7 @@ use super::super::site::{
 };
 use super::{
   HELD_SEED, HOLDER, Keys, ONE_SEAT, Peer, ROOM_BYTES, TICK_NS, Transcript, exec, query, send_data,
-  served_by, sign, transcript,
+  served_by, served_keyed, sign, transcript,
 };
 use crate::repository::hg_push::tests::{Commit, changegroup, history_of};
 use crate::repository::hg_push::{self, Pushing, line_name};
@@ -1762,6 +1762,61 @@ fn an_ssh_clone_past_many_windows_is_answered_whole() {
     (transcript.status, transcript.ended),
     (Some(EXIT_STATUS), true),
     "{sent} bytes of the answer read"
+  );
+  assert!(
+    sent > usize::try_from(GROWN_CHANGESETS).unwrap() * GROWN_FILE,
+    "{sent} bytes of the answer read"
+  );
+}
+
+/// Shape: the key time [`a_rekey_during_a_blocked_write_sends_no_byte_twice`] gives its sessions: a tenth of
+/// [`GROWN_PAUSE_MS`], so the session's timer comes due while the edge's write waits on a client that pauses.
+const REKEYING_KEY_TIME_NS: u64 = GROWN_PAUSE_MS * 1_000_000 / 10;
+
+/// The rekey write duplication (main 01a20182's order of 2026-11-21 21:35, found by reading): the edge's write raced
+/// the session's key timer, and a timer that came due while the write waited on the client's room dropped the write
+/// and wrote all its bytes again, the part the kernel had taken included. Do: over the edge, its sessions' keys replaced
+/// every [`REKEYING_KEY_TIME_NS`], clone [`Grown`] reading as OpenSSH reads with a reader slower than the wire
+/// ([`transcript_adjusting`]). Expect the whole answer, then exit-status 0, EOF and close: every packet opened, none
+/// sent twice (a byte sent twice fails the client's MAC and ends its read), and the session's keys exchanged again.
+#[test]
+fn a_rekey_during_a_blocked_write_sends_no_byte_twice() {
+  let grown: &'static Grown = Box::leak(Box::new(Grown::made()));
+  let head = *grown.changesets.last().expect("a head");
+  let (transcript, _) = served_keyed(
+    (ONE_SEAT, Some(REKEYING_KEY_TIME_NS)),
+    move || {
+      ToolSite::new(
+        Keys,
+        OneRepository,
+        ToolServices::new(
+          NoGit,
+          GrownLends(grown, Some((8 * GROWN_FILE as u64, 1_000_000))),
+          ThisShard,
+          room(),
+        ),
+      )
+    },
+    move |address| {
+      let mut peer = Peer::connect(address)?;
+      (query(&mut peer, &HELD_SEED)? == 60).then_some(())?;
+      (sign(&mut peer, &HELD_SEED)? == 52).then_some(())?;
+      exec(&mut peer, b"hg -R hg/r serve --stdio").then_some(())?;
+      send_data(&mut peer, &clone_request(&head));
+      let transcript = transcript_adjusting(&mut peer);
+      Some((transcript, peer.client.exchanges()))
+    },
+  );
+  let (transcript, exchanges) = transcript.expect("the session");
+  let sent = transcript.out.len();
+  assert!(
+    exchanges > 1,
+    "{exchanges} key exchanges: the keys were replaced during the answer"
+  );
+  assert_eq!(
+    (transcript.status, transcript.ended),
+    (Some(EXIT_STATUS), true),
+    "{sent} bytes of the answer read over {exchanges} key exchanges"
   );
   assert!(
     sent > usize::try_from(GROWN_CHANGESETS).unwrap() * GROWN_FILE,
