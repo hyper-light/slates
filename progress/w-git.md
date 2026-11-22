@@ -505,3 +505,9 @@
   186, upload+reach 95; slates-server vcs_store/vcs_share/git_push/vcs_http::git 191, git_encode 3/3.
   NEXT: item 1 (deferred build PastRoom regression + master lock, red: one-commit branch push), one wait mechanism with
   w-hg (shared piece in vcs_share); then the clone pack-size gap (4 GiB vs ~300 MB); deflate reuse.
+- 2026-11-22 ~03:45 PST: LANDED 2d9626f25 (record version read from VERSION_LANDED in t_a727b/t_a767/t_c5b_p3/t_a724;
+  PushedHistory type alias) and A-857 61c15790b (DeferredPush keeps no room, record v2; a build runs within
+  vcs_share::room as built; past it waits via vcs_share::wait::RoomWait, shared with w-hg; red a_deferred_build_past_its_
+  room_waits_for_room_and_is_made). Focused: merge push 21, git receive 51, server repository/green_ready/vcs_share/
+  git_push 149, daemon t_a727b/t_a767 2. NEXT: main's matrix + git/git rerun (master "cannot lock ref" judged there);
+  then the clone pack-size gap (4-5 GiB vs ~300 MB); then deflate reuse; A-855's fetch wait onto vcs_share::wait owed.
