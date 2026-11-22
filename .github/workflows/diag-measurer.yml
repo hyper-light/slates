@@ -1,8 +1,9 @@
 name: diag-measurer
 
-# w-perf 84a Linux (main 01a20182's go of 2026-11-22 03:46 PST): A/B of the shards' round-robin real-time class,
-# interleaved in one job a runner. A = d2c6635a2 (main 4a1686023 plus the loaded form's throughput line); B = 21179849c
-# (A plus slates_machine::round_robin and the shards' park-at-once). Red/green first: crates/rt/tests/round_robin.rs on
+# w-perf 84a Linux (main 01a20182's go of 2026-11-22 04:30 PST): the four-arm A/B, interleaved in one job a runner.
+# A = d2c6635a2 (main 4a1686023 plus the loaded form's throughput line); B = 21179849c (A plus the shards' round-robin
+# class, parking at once); C = 0a7e06c56 (the shards spin R9's floor alone, plus the client's reply-wait park in the
+# class); D = 69c483e8d (the shards park at once, plus the client's park in the class). Red/green first: crates/rt/tests/round_robin.rs on
 # each arm. Each quiet run's CPU is timed (an RR shard must idle near zero), the load's throughput printed (its
 # time-share neighbours must not starve). The runner's account is granted RLIMIT_RTPRIO 1 the way an administrator
 # grants it (pam_limits, systemd's LimitRTPRIO=), by `sudo prlimit` on each step's shell, inherited by both arms alike:
@@ -15,7 +16,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: never
-  ARMS: "d2c6635a20cbc5ff0fc09f23235381670aa6ec58 21179849cbf776b7f26095dfc329068c98243cd0"
+  ARMS: "d2c6635a20cbc5ff0fc09f23235381670aa6ec58 21179849cbf776b7f26095dfc329068c98243cd0 0a7e06c56afa9c3ae5f5c2224ba35fe3fc805031 69c483e8d3d6c8f8c2b1ce3a3f57e90308001567"
   ROUNDS: "5"
 
 jobs:
@@ -57,25 +58,29 @@ jobs:
               || { tail -40 "$W/logs/build-$s.log"; exit 1; }
             cp "$W/target-$s/release/examples/edit_merge_bench" "$W/bin-$s/edit_merge_bench"
             cp "$W/target-$s/release/examples/provision_bench" "$W/bin-$s/provision_bench"
-            if [ -f "$W/src-$s/crates/rt/tests/round_robin.rs" ]; then
-              ( cd "$W/src-$s" && CARGO_TARGET_DIR="$W/target-$s" cargo test --release --locked -p slates-rt --test round_robin -- --nocapture ) > "$W/logs/test-$s.log" 2>&1
-              echo "arm $s round_robin test exit $?"; grep -E "test result|panicked|skipping|grants" "$W/logs/test-$s.log" | head -5
-            else
-              echo "arm $s has no round_robin test (A: no shard holds the class)"
+            if [ ! -f "$W/src-$s/crates/rt/tests/round_robin.rs" ]; then
+              # The red half: C's tests against A's tree, where the class does not exist.
+              git show 0a7e06c56afa9c3ae5f5c2224ba35fe3fc805031:crates/rt/tests/round_robin.rs > "$W/src-$s/crates/rt/tests/round_robin.rs"
+              git show 0a7e06c56afa9c3ae5f5c2224ba35fe3fc805031:crates/machine/tests/round_robin.rs > "$W/src-$s/crates/machine/tests/round_robin.rs"
             fi
+            for crate in slates-rt slates-machine; do
+              [ -f "$W/src-$s/crates/${crate#slates-}/tests/round_robin.rs" ] || continue
+              ( cd "$W/src-$s" && CARGO_TARGET_DIR="$W/target-$s" cargo test --release --locked -p $crate --test round_robin -- --nocapture ) > "$W/logs/test-$s-$crate.log" 2>&1
+              echo "arm $s $crate round_robin test exit $?"; grep -E "^error\[|test result|panicked|skipping|grants" "$W/logs/test-$s-$crate.log" | head -4
+            done
           done
       - name: Interleaved rounds, loaded then quiet
         run: |
           sudo prlimit --pid $$ --rtprio=1:1; echo "granted: rtprio soft $(ulimit -r) hard $(ulimit -Hr), rttime $(ulimit -R)"
           W="$RUNNER_TEMP/msr"
-          order() { if [ $(( $1 % 2 )) = 1 ]; then echo $ARMS; else echo $ARMS | awk '{print $2, $1}'; fi; }
+          order() { echo $ARMS | awk -v r=$1 '{n=NF; for(i=0;i<n;i++){j=(i+r-1)%n+1; printf "%s ", $j}}'; }
           set +e
           for round in $(seq 1 "$ROUNDS"); do
             for arm in $(order $round); do
               s="${arm:0:9}"; L="$W/logs/loaded-$s-r$round.log"
               echo "== loaded round $round arm $s $(date -u +%FT%TZ) load: $(uptime)" | tee "$L"
               perl -e 'alarm shift; exec @ARGV' 1200 "$W/bin-$s/edit_merge_bench" --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict </dev/null >> "$L" 2>&1
-              echo "exit $?" >> "$L"; grep -E "round-robin|load throughput|_loaded_total_p(50|99|999)\b|exit" "$L" | cut -c1-220
+              echo "exit $?" >> "$L"; grep -E "round-robin|real-time parks|load throughput|_loaded_total_p(50|99|999)\b|exit" "$L" | sort -u | cut -c1-220
             done
           done
           for round in $(seq 1 3); do
