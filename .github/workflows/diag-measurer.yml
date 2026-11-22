@@ -3,7 +3,10 @@ name: diag-measurer
 # w-perf 84a Linux (main 01a20182's go of 2026-11-22 04:30 PST): the four-arm A/B, interleaved in one job a runner.
 # A = d2c6635a2 (main 4a1686023 plus the loaded form's throughput line); B = 21179849c (A plus the shards' round-robin
 # class, parking at once); C = 0a7e06c56 (the shards spin R9's floor alone, plus the client's reply-wait park in the
-# class); D = 69c483e8d (the shards park at once, plus the client's park in the class). Red/green first: crates/rt/tests/round_robin.rs on
+# class); D = 69c483e8d (the shards park at once, plus the client's park in the class). Run 45023871879 found C's and
+# D's restores refused EPERM (an unprivileged thread cannot clear SCHED_RESET_ON_FORK), so C and D are now
+# C' = 2c69390ba and D' = 7cba67b4a, the park raised without the flag. A failure of B's, C''s or D''s own tests stops
+# the run; A's red is recorded and passed over. Red/green first: crates/rt/tests/round_robin.rs on
 # each arm. Each quiet run's CPU is timed (an RR shard must idle near zero), the load's throughput printed (its
 # time-share neighbours must not starve). The runner's account is granted RLIMIT_RTPRIO 1 the way an administrator
 # grants it (pam_limits, systemd's LimitRTPRIO=), by `sudo prlimit` on each step's shell, inherited by both arms alike:
@@ -16,7 +19,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: never
-  ARMS: "d2c6635a20cbc5ff0fc09f23235381670aa6ec58 21179849cbf776b7f26095dfc329068c98243cd0 0a7e06c56afa9c3ae5f5c2224ba35fe3fc805031 69c483e8d3d6c8f8c2b1ce3a3f57e90308001567"
+  ARMS: "d2c6635a20cbc5ff0fc09f23235381670aa6ec58 21179849cbf776b7f26095dfc329068c98243cd0 2c69390baf4992c7555fefdc24ce0b57fabebc72 7cba67b4aa54dec68efaf6469310d7c4a92ec7e5"
   ROUNDS: "5"
 
 jobs:
@@ -60,13 +63,14 @@ jobs:
             cp "$W/target-$s/release/examples/provision_bench" "$W/bin-$s/provision_bench"
             if [ ! -f "$W/src-$s/crates/rt/tests/round_robin.rs" ]; then
               # The red half: C's tests against A's tree, where the class does not exist.
-              git show 0a7e06c56afa9c3ae5f5c2224ba35fe3fc805031:crates/rt/tests/round_robin.rs > "$W/src-$s/crates/rt/tests/round_robin.rs"
-              git show 0a7e06c56afa9c3ae5f5c2224ba35fe3fc805031:crates/machine/tests/round_robin.rs > "$W/src-$s/crates/machine/tests/round_robin.rs"
+              git show 2c69390baf4992c7555fefdc24ce0b57fabebc72:crates/rt/tests/round_robin.rs > "$W/src-$s/crates/rt/tests/round_robin.rs"
+              git show 2c69390baf4992c7555fefdc24ce0b57fabebc72:crates/machine/tests/round_robin.rs > "$W/src-$s/crates/machine/tests/round_robin.rs"
             fi
             for crate in slates-rt slates-machine; do
               [ -f "$W/src-$s/crates/${crate#slates-}/tests/round_robin.rs" ] || continue
               if ( cd "$W/src-$s" && CARGO_TARGET_DIR="$W/target-$s" cargo test --release --locked -p $crate --test round_robin -- --nocapture ) > "$W/logs/test-$s-$crate.log" 2>&1; then rc=0; else rc=$?; fi
-              echo "arm $s $crate round_robin test exit $rc"; grep -E "^error\[|test result|panicked|skipping|grants" "$W/logs/test-$s-$crate.log" | head -4
+              echo "arm $s $crate round_robin test exit $rc";
+              if [ $rc != 0 ] && [ "$s" != "${ARMS:0:9}" ]; then tail -30 "$W/logs/test-$s-$crate.log"; exit 1; fi grep -E "^error\[|test result|panicked|skipping|grants" "$W/logs/test-$s-$crate.log" | head -4
             done
           done
       - name: Interleaved rounds, loaded then quiet
