@@ -13,15 +13,23 @@ fn counted(state: &ShardState, name: &str) -> u64 {
   state.refusals.get(name).copied().unwrap_or(0)
 }
 
-/// Records on `repository`'s usage row one intake answered after bringing `bytes`, as a push's steps do.
+/// Records on `repository`'s usage row one intake begun at `at`, stepped, and answered after bringing `bytes`, as a
+/// push's steps do.
+fn answered_intake_at(state: &mut ShardState, repository: RepositoryId, bytes: u64, at: u64) {
+  state
+    .vcs_usage
+    .begun(&repository, &owner(), Work::Intake, at);
+  state
+    .vcs_usage
+    .stepped(&repository, Work::Intake, (1, bytes), at + 1);
+  state
+    .vcs_usage
+    .answered(&repository, Work::Intake, bytes, at + 2);
+}
+
+/// [`answered_intake_at`] at the start of the shard's clock.
 fn answered_intake(state: &mut ShardState, repository: RepositoryId, bytes: u64) {
-  state
-    .vcs_usage
-    .begun(&repository, &owner(), Work::Intake, 1);
-  state
-    .vcs_usage
-    .stepped(&repository, Work::Intake, (1, bytes), 2);
-  state.vcs_usage.answered(&repository, Work::Intake, 3);
+  answered_intake_at(state, repository, bytes, 1);
 }
 
 /// A-724 piece 3. Do: ask a repository's room with no other intake under way. Expect: all the shard can admit, by the
@@ -200,4 +208,39 @@ fn t_a724_a_repositorys_room_is_bounded_by_its_partitions_snapshot_slot() {
       config.geometry.snapshot_bytes = config.geometry.page.saturating_mul(1 << 8);
     },
   );
+}
+
+/// A-724 piece 2 (§4.17.5 "Learned demand"). Do: answer a hundred small intakes of a monorepo at a steady rhythm, then
+/// three intakes 64 times larger at the same rhythm, and ask a toy repository's room while the monorepo pushes again.
+/// Expect: the monorepo claims its learned next intake, near the large size, so the toy is left at most the free room
+/// less half of it; its lifetime mean (a hundredth or so of the large size above the small) would have left the toy
+/// nearly everything, overcommitting the shard to the monorepo's next push.
+#[test]
+fn t_a724_a_repositorys_claim_follows_its_learned_demand_not_its_lifetime_mean() {
+  crate::test_store::audit_on_stored_shard("vcs_share", |state| {
+    let monorepo = git_repository(state, "monorepo");
+    let toy = git_repository(state, "toy");
+    let free = state
+      .store
+      .admittable()
+      .min(state.db.snapshot_room(&state.segment));
+    let (small, large, gap) = (free / 4096, free / 64, 1_000_000);
+    let mut at = 1;
+    for _ in 0..100 {
+      answered_intake_at(state, monorepo, small, at);
+      at += gap;
+    }
+    for _ in 0..3 {
+      answered_intake_at(state, monorepo, large, at);
+      at += gap;
+    }
+    let pushing = Live::begin(monorepo);
+    let left = room(state, toy);
+    assert!(
+      left.bytes <= free - large / 2,
+      "the toy is left {} of {free}: the monorepo claimed less than half its learned {large}",
+      left.bytes
+    );
+    drop(pushing);
+  });
 }

@@ -16447,6 +16447,16 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > amends §4.10's content placement), the many-repository load proof (7), the snapshot sized by its data (8) and a
 > giant repository's index across partitions (9), both designed below.
 
+> **Status (2026-11-21, A-724 piece 2a: the learned demand of admission).** Each answered work's bytes feed its kind's
+> decayed mean on the repository's usage row (`slates_vcs::Learned`): the estimate moves toward a work's bytes by
+> `1 - e^(-Δ/τ)`, `Δ` the gap since the previous answered work and `τ` the repository's own decayed mean gap, learned
+> the same way; the first work's bytes are the first value. A git push carries its byte total to its answer. The room's
+> claims (`vcs_share::demand_of`) read it in place of the lifetime mean: a monorepo whose pushes grew 64-fold claims
+> about the new size after three of them, where its lifetime mean had left a toy 6,437,986,017 of 6,442,445,005 bytes
+> (`t_a724_a_repositorys_claim_follows_its_learned_demand_not_its_lifetime_mean`, red first). Owed in piece 2: the
+> per-principal rates, the working set's miss-ratio curve and memory by marginal utility, CPU weights, and the shares
+> published to siblings.
+
 > **Status (2026-11-20, A-724 piece 3a: one room for every admission).** `crate::vcs_share::room` (`slates-server`) is
 > the one room a version-control work is admitted on its owner shard: git's push as it starts, git's fetch, Mercurial's
 > push. It replaces A-704's `git_push::push_room`. A repository alone in taking new room gets all the shard can admit
@@ -16457,6 +16467,15 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > binds). Owed: A-722's reservation checking this room and its typed refusal carrying the bound, with git's, Mercurial's
 > and Subversion's words for a share (the seam proposed to w-git); Mercurial's and Subversion's intakes counted live;
 > backpressure before refusal; a fetch's room as a claim of its own.
+
+> **Status (2026-11-21, A-843: a repository destroyed whole, its neighbours untouched).** The correctness proof of many
+> repositories on one daemon (`crates/cli/tests/vcs_many_repositories.rs`, w-balance) destroys one repository a tool
+> mid-load. `DestroyRepository` (`slates repository destroy NAME`, its owner's verb, `crate::repository::
+> destroy_repository`) does it on the owner shard as one verb, everything judged before its first record: the record,
+> namespace and logs (`Op::RepositoryDestroyed`), every member green leaves first (each its own destroy), the holds its
+> git records kept, its tool store and its usage row (`vcs_store::free`). A content another repository holds keeps that
+> hold. Owed: the landed changesets of a destroyed repository on the node's store (A-767), which only a landing may
+> remove (R1).
 
 **Role.** One slates server serves many repositories at once, from toys to monorepos the size of Google's or Meta's,
 several of those at once, and divides its memory, its CPU, its admission and its placement among them by what their
@@ -55087,6 +55106,13 @@ Applied in the same change to:
   a heavy principal named exactly; rows apart); `slates-server`
   `git_push::tests::t_a724_a_repositorys_pushes_are_counted_on_its_own_usage_row` (stock git's fixture pushes counted
   on the pushed repository's row, bytes exact, its owner named for each; an idle repository has none).
+- **Piece 2a, the learned demand of admission (2026-11-21).** `slates_vcs::usage::Learned`: per repository and kind
+  of work, the bytes of its answered works as a mean decayed by `1 - e^(-Δ/τ)`, `τ` the repository's own decayed mean
+  gap between answered works (no fixed half-life, D-11; the first work its own first value), a convex combination of
+  the bytes seen (property test). `Ledger::answered` takes the work's bytes; git's push carries its total; the room's
+  claims read it (`vcs_share::demand_of`). Red first: a monorepo grown 64-fold left a toy all but 0.07% of the room on
+  its lifetime mean; on its learned demand, at most the room less half its new size. Tests: slates-vcs `usage` 7/7,
+  slates-server `vcs_share` 11/11, `git_push` 30/30.
 - **Applied in the same change to** §4.17.5 (new), GAPS, amendments.tsv.
 - **Owed.** Pieces 2 to 7 (§4.17.5's status); a fetch's answered count at its pack's last step; Mercurial's and
   Subversion's intakes and reads counted; the rows in `slates status`.

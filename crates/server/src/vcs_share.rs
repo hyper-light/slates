@@ -17,7 +17,9 @@
 //!
 //! **Demand, learned.** The asker claims what it holds and all the shard can admit, so its room is what the others'
 //! claims leave. Each other repository with intakes under way claims what it holds plus, for each intake, the bytes its
-//! answered intakes have brought on average (its usage row, `ShardState::vcs_usage`): its own measured traffic. One
+//! next intake is learned to bring (its usage row, `ShardState::vcs_usage`, A-724 piece 2's `slates_vcs::Learned`: a
+//! mean of its answered intakes' bytes decayed by its own rhythm of intakes, so a repository whose pushes grew claims
+//! their new size, not its lifetime's mean). One
 //! with no answered intake yet claims everything the shard can admit, its first value taken from the machine, never a
 //! literal. Weights are equal: the repository is the unit of fairness (§4.17.5).
 //!
@@ -262,7 +264,8 @@ fn held_by(state: &ShardState, id: RepositoryId) -> u64 {
 }
 
 /// What repository `id` claims with `intakes` under way while it holds `held` (module docs, "Demand, learned"): what it
-/// holds plus its answered intakes' mean bytes for each, or plus all the shard can admit before any was answered.
+/// holds plus its learned next intake's bytes for each (`slates_vcs::Learned`, A-724 piece 2), or plus all the shard can
+/// admit before any was answered.
 fn demand_of(
   state: &ShardState,
   id: RepositoryId,
@@ -272,10 +275,7 @@ fn demand_of(
   let per_intake = state
     .vcs_usage
     .usage(&id)
-    .and_then(|row| {
-      let counts = row.work(Work::Intake);
-      counts.bytes_in.checked_div(counts.answered)
-    })
+    .and_then(|row| row.learned(Work::Intake).bytes_per_work())
     .unwrap_or(admittable);
   held.saturating_add(per_intake.saturating_mul(intakes))
 }
