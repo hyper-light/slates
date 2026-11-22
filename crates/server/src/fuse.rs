@@ -835,50 +835,63 @@ async fn serve(attachment: u64) {
         return;
       }
     };
-    if matches!(woke, Woke::Held) {
+    let serving = match woke {
       // Settled at the next wait's start, which arms the next give-up.
-      continue;
+      Woke::Held => true,
+      Woke::Change => change_turn(attachment).await,
+      Woke::Request => request_turns(attachment).await,
+    };
+    if !serving {
+      return;
     }
-    if matches!(woke, Woke::Change) {
-      match state::with_state(|s| turn(s, attachment, TurnKind::Change)) {
-        Some(Turned::Fenced) => crate::daemon::pace(crate::daemon::HEARTBEAT_NS).await,
-        Some(Turned::Ended) | None => {
-          let _ = state::with_state_counted(|s| ended(s, attachment));
-          return;
-        }
-        Some(Turned::Idle | Turned::Served) => {
-          // A round its slice cut that sent nothing has no return to wake the task, and the wait answers at once while
-          // it is owed (A-562): the shard's other tasks run between its slices.
-          if state::with_state(|s| owes_round_now(s, attachment)).unwrap_or(false) {
-            let _ = futures::yield_now().await;
-          }
-        }
+  }
+}
+
+/// A change's turn of the mount ([`serve`]): the owed round delivered; whether the mount still serves (it ended
+/// otherwise, and is ended here).
+async fn change_turn(attachment: u64) -> bool {
+  match state::with_state(|s| turn(s, attachment, TurnKind::Change)) {
+    Some(Turned::Fenced) => crate::daemon::pace(crate::daemon::HEARTBEAT_NS).await,
+    Some(Turned::Ended) | None => {
+      let _ = state::with_state_counted(|s| ended(s, attachment));
+      return false;
+    }
+    Some(Turned::Idle | Turned::Served) => {
+      // A round its slice cut that sent nothing has no return to wake the task, and the wait answers at once while
+      // it is owed (A-562): the shard's other tasks run between its slices.
+      if state::with_state(|s| owes_round_now(s, attachment)).unwrap_or(false) {
+        let _ = futures::yield_now().await;
       }
-      continue;
     }
-    loop {
-      match state::with_state(|s| turn(s, attachment, TurnKind::Request)) {
-        Some(Turned::Idle) => break,
-        Some(Turned::Served) => {
-          // A served request is client activity, as an NFS call and a guest's request are: the shard spins out its
-          // idle window after it, so a burst's next request is read without a kernel wake (§4.3, §4.7). Without it a
-          // mount's shard parked after every request once a CLI client's window lapsed, and each request paid a
-          // wake (uncached lookup median 23 µs → about 60 µs, p90 33 → 200 µs, Linux 6.12, 2026-10-06).
-          slates_rt::registry::with_current(|ctx| ctx.note_activity());
-          // A change this request was refused for a delegation asked for a recall; it is sent now (A-79).
-          let _ = state::with_state_counted(crate::delegation::drain);
-          let _ = futures::yield_now().await;
-        }
-        Some(Turned::Fenced) => {
-          // The requests wait in the kernel, asked again each heartbeat — the cadence at which the
-          // confirmations that restore the lease arrive — as the guest device and a hard NFS mount wait.
-          crate::daemon::pace(crate::daemon::HEARTBEAT_NS).await;
-          break;
-        }
-        Some(Turned::Ended) | None => {
-          let _ = state::with_state_counted(|s| ended(s, attachment));
-          return;
-        }
+  }
+  true
+}
+
+/// The mount's request turns ([`serve`]): requests taken until none waits, yielding between them; whether the mount
+/// still serves (it ended otherwise, and is ended here).
+async fn request_turns(attachment: u64) -> bool {
+  loop {
+    match state::with_state(|s| turn(s, attachment, TurnKind::Request)) {
+      Some(Turned::Idle) => return true,
+      Some(Turned::Served) => {
+        // A served request is client activity, as an NFS call and a guest's request are: the shard spins out its
+        // idle window after it, so a burst's next request is read without a kernel wake (§4.3, §4.7). Without it a
+        // mount's shard parked after every request once a CLI client's window lapsed, and each request paid a
+        // wake (uncached lookup median 23 µs → about 60 µs, p90 33 → 200 µs, Linux 6.12, 2026-10-06).
+        slates_rt::registry::with_current(|ctx| ctx.note_activity());
+        // A change this request was refused for a delegation asked for a recall; it is sent now (A-79).
+        let _ = state::with_state_counted(crate::delegation::drain);
+        let _ = futures::yield_now().await;
+      }
+      Some(Turned::Fenced) => {
+        // The requests wait in the kernel, asked again each heartbeat — the cadence at which the
+        // confirmations that restore the lease arrive — as the guest device and a hard NFS mount wait.
+        crate::daemon::pace(crate::daemon::HEARTBEAT_NS).await;
+        return true;
+      }
+      Some(Turned::Ended) | None => {
+        let _ = state::with_state_counted(|s| ended(s, attachment));
+        return false;
       }
     }
   }
