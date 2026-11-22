@@ -518,9 +518,20 @@
 >   every such refusal (a charge, the framing, a delta's text, the keeping's room). Held by
 >   `push::intake::tests::a_step_refused_past_its_admission_is_taken_again_whole_in_a_grown_room` (rooms of a quarter,
 >   a half and all but a byte of what the push holds; red with the charges after the keep: 20 kept for 21).
-> - Part 2, next: the push's driver (`hg_push::take_sliced`) waits for room under w-git's shared `vcs_share::RoomWait`
->   (main's ruling: one wait for git and hg) and takes the step again in the room it gives; a piece past the most the
->   repository could ever be lent is refused typed.
+> - Part 2 BUILT (2026-11-22, w-hg): the push's driver waits for room under w-git's shared `vcs_share::wait::RoomWait`
+>   (A-857; one wait for git and hg) and takes again what was refused in the room it gives. A begin past its admission
+>   begins again; a step past it is taken again, what the push holds charged to the grown room first, and the record
+>   names the room it was taken within, so a replay takes it alike (`hg_push::take_sliced`, `room_after_wait`; counted
+>   `vcs.hg.push_intake_room_waits`). A push whose increments the content store cannot hold for now waits past what the
+>   store could hold and holds them again (`landed_after_rebases`; counted `vcs.hg.push_held_ahead_room_waits`, main's
+>   order of 03:35). A need past the most the repository could ever be lent, or a wait past its patience, is refused as
+>   before. Held by `vcs_http::daemon_edge::tests::a_mercurial_push_past_its_first_admission_waits_for_room_and_lands_whole`
+>   (a first room of 64 bytes; red with no wait: `PastAdmission { asked: 127, left: 64 }`) and
+>   `a_mercurial_push_its_store_cannot_hold_for_now_waits_for_room_and_lands_whole` (red: `heads` empty).
+> - Not reproduced here, logged: w-interop's fresh repository's first 500-revision push refused at once on CI's x86 and
+>   arm runners (main's order of 03:49 and 03:50). `a_fresh_repositorys_first_push_of_hundreds_of_changesets_is_taken_at_once`
+>   (500 changesets pushed with no gap after the create) passes on this Mac. Every content-store refusal of a held-ahead
+>   increment is now named in the daemon's log, so the next run says which it was.
 > **A push's work counted a file revision's metadata markers as bytes (2026-11-22, w-hg; w-interop's find, ubuntu,
 > `hg push --new-branch -f -r 2000` of hg's own history refused `LengthDiffers { said: 10101, given: 10097 }` on
 > `hgext/hbisect.py`). FIXED.** 2a's `IndexHeld::file_bytes_len` (d93f98369) took a file revision's bytes as its text's
