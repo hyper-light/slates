@@ -540,3 +540,8 @@
   reuse_rebuilt). Reds: a864_a_clone_sends_each_... (3/3 rebuilt -> 0), a864_an_entry_whose_crc_misses_... Focused:
   server 277, git 199. NEXT (main 07:31+): one-turn look-ahead residency in place of whole-pack resident, gauge of
   peak resident windows; then deflate reuse.
+- 2026-11-22 ~11:30 PST: A-864 piece 1 LANDED 8dfa22349 (merge 03dfc4544): loose stage in pack order (88 backward reads
+  -> 0; clone = pushed pack's 17,299 B in 175 turns vs 403). Piece 2 LANDED 7a5ea782a (merge 27cae9bf7): a turn meeting
+  a let-go window stops cleanly, the next turn's two windows brought back ahead; a fetch no longer makes packs resident
+  (only a due encoding). NEXT: piece 3 (let-go behind the cursor, peak_windows gauge) on w-shared's let_go_read with
+  2b(a); then the encoding's look-ahead; deflate reuse.
