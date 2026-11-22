@@ -677,6 +677,14 @@ fn refusal_of_owner(state: &ShardState, error: &slates_store::owner::OwnerError)
   }
 }
 
+/// A creation's landing as [`recorded_after_landing`] records it: what the store answered, the client's request (its origin
+/// and id) where a client asked, and a Subversion repository's creation record.
+type CreationLanded = (
+  Result<(), Refusal>,
+  Option<(u64, slates_wire::request::RequestId)>,
+  Vec<u8>,
+);
+
 /// A landed creation recorded (A-767 item 7, the second step): in one transaction the repository, its root and, for a
 /// client's `request`, its completion, a Subversion repository's from its creation record `svn_created` (C2); a
 /// creation the store did not land answered its refusal ([`refusal_of_owner`]), nothing recorded of it.
@@ -685,11 +693,7 @@ fn recorded_after_landing(
   principal: &Principal,
   asked: (&str, VcsTool, ObjectFormat, &str),
   ids: (Option<DbVolumeId>, (RepositoryId, Option<DbVolumeId>)),
-  (landed, request, svn_created): (
-    Result<(), Refusal>,
-    Option<(u64, slates_wire::request::RequestId)>,
-    Vec<u8>,
-  ),
+  (landed, request, svn_created): CreationLanded,
 ) -> ReplyBody {
   state.db.begin();
   let reply = match landed {
