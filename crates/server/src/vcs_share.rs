@@ -316,6 +316,10 @@ fn demand_of(
     })
 }
 
+// A-724 piece 2d: read by the room once its admission reads the published grants (A-724 piece 3's side); until then a
+// daemon build calls none of it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod grants;
 pub(crate) mod place;
 pub(crate) mod turns;
 

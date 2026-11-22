@@ -2019,8 +2019,10 @@
 > rate::`, 5 of 5, macOS arm64, this Mac); since 2026-11-21 the one learned demand: it replaced `usage::Learned`, fed
 > at each answered work (`slates_vcs::usage`); each principal's rate read from its usage slot.
 > **A-724 piece 2d part 2 (A-844): curves fed by git's fetches** (`vcs_store::observed`;
-> `t_a724_a_fetchs_reads_are_noted_in_its_own_repositorys_curve`). Open: pushes', hg's and svn's reads; aging, the
-> partition at the learning cadence and its published snapshot.
+> `t_a724_a_fetchs_reads_are_noted_in_its_own_repositorys_curve`). Open: pushes', hg's and svn's reads.
+> **A-724 piece 2d part 3 (A-846): grants divided at the learning cadence, not yet read by admission**
+> (`vcs_share::grants`, `t_a724_the_grants_are_divided_at_the_learning_cadence_and_kept_between`). Open: `room` reading
+> them.
 > **A-724 piece 2c (A-846): memory by marginal utility built, not yet applied** (`slates_vcs::partition`, `cargo test
 > -p slates-vcs --lib partition::`, 4 of 4, macOS arm64, this Mac). Open: computed on the owner shard and published.
 >

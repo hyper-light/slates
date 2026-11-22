@@ -791,6 +791,9 @@ pub struct ShardState {
   /// repository with an event, dropped with the repository ([`crate::vcs_store::free`]), so bounded by the partition's
   /// repositories.
   pub(crate) vcs_usage: slates_vcs::Ledger<slates_db::catalog::RepositoryId, Principal>,
+  /// Each repository's memory share on this shard, divided by marginal utility at the learning cadence and kept whole
+  /// between divisions (A-724 piece 2d, [`crate::vcs_share::grants`]): one entry a repository with a usage row.
+  pub(crate) vcs_grants: crate::vcs_share::grants::Grants,
   /// The learned times of the hooks of this shard's repositories (A-622's table, `crate::vcs_hooks::HookTimesTable`):
   /// bounded by the hooks their policies configure. Unix alone, where hooks run.
   #[cfg(unix)]

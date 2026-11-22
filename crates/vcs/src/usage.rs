@@ -122,6 +122,8 @@ pub struct Usage<P> {
   principals: Vec<PrincipalCount<P>>,
   /// Its working set's miss-ratio curve (A-724 piece 2d), made at its first lent step; away while lent.
   curve: Option<Curve>,
+  /// The shard clock's nanoseconds its curve was last aged at ([`Ledger::age_curves`]).
+  curve_aged_ns: u64,
 }
 
 impl<P> Usage<P> {
@@ -138,7 +140,17 @@ impl<P> Usage<P> {
       fetch_learned: Rates::new(CLOCK_GRAIN_NS),
       principals: Vec::new(),
       curve: None,
+      curve_aged_ns: now_ns,
     }
+  }
+
+  /// The horizon its reads are aged and weighed at: its fetches', which read most, else its intakes'; `None` before
+  /// either is learned.
+  pub fn read_horizon_ns(&self) -> Option<f64> {
+    self
+      .fetch_learned
+      .horizon_ns()
+      .or_else(|| self.intake_learned.horizon_ns())
   }
 
   /// Its working set's miss-ratio curve, once a step of its was observed (`Ledger::take_curve`).
@@ -330,6 +342,22 @@ impl<R: Ord + Clone, P: Clone + Eq> Ledger<R, P> {
   pub fn put_curve(&mut self, repository: &R, curve: Curve) {
     if let Some(row) = self.rows.get_mut(repository) {
       row.curve = Some(curve);
+    }
+  }
+
+  /// Ages every curve to `now_ns` at its repository's read horizon (`Rates::keep` of the time since it was last aged),
+  /// so a repository's past reads weigh less as they recede (A-724 piece 2d, §4.17.1 "Every tunable is learned
+  /// online"). A curve whose horizon is not yet learned keeps everything.
+  pub fn age_curves(&mut self, now_ns: u64) {
+    for row in self.rows.values_mut() {
+      let elapsed = now_ns.saturating_sub(row.curve_aged_ns);
+      let keep = row
+        .read_horizon_ns()
+        .map_or(1.0, |tau| (-crate::share::amount_of(elapsed) / tau).exp());
+      if let Some(curve) = row.curve.as_mut() {
+        curve.decay(keep);
+      }
+      row.curve_aged_ns = row.curve_aged_ns.max(now_ns);
     }
   }
 
