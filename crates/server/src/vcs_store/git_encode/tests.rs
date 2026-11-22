@@ -352,10 +352,10 @@ fn fetched_main(
 /// A-856 (main's check of 2026-11-22 02:29: a grant learned, not a floor, a cap or a region's size passed through; and
 /// what is held given back when idle). Do: clone the fixtures' small repository whole, and a repository of one
 /// incompressible [`LARGER_FILE`]-byte file whole, reading each one's grant (`vcs_share::budget`: the shard's room
-/// divided by the repositories' curves, each curve the content windows its fetches read, a window's bytes each); then
+/// divided by the repositories' curves, each curve the content its fetches read); then
 /// begin the larger's version's encoding, turning it until its parts hold bytes, as a fetch that went away leaves it;
-/// then let the repository go idle. Expect: the larger's grant past the smaller's, each a whole number of the store's
-/// windows (one and three here: the clones read that many); the encoding's parts charged to the content store while
+/// then let the repository go idle. Expect: the larger's grant past the smaller's, each the bytes its clone's reads
+/// touched (an object's last window counting its own length); the encoding's parts charged to the content store while
 /// held; and, idle, the encoding dropped, the store's charge back at its figure before the encoding began, counted
 /// `given_back_idle`.
 #[test]
@@ -375,10 +375,6 @@ fn t_a856_a_grant_is_learned_from_reads_and_given_back_when_idle() {
     );
     fetched_main(state, small, &[]);
     fetched_main(state, larger, &[]);
-    let window = state
-      .vcs_stores
-      .content()
-      .map_or(0, |content| u64::try_from(content.window()).unwrap());
     let grants = (
       crate::vcs_share::budget(state, small).unwrap(),
       crate::vcs_share::budget(state, larger).unwrap(),
@@ -391,8 +387,11 @@ fn t_a856_a_grant_is_learned_from_reads_and_given_back_when_idle() {
       .content()
       .map_or(0, |content| content.charged());
     super::super::lend(&mut state.store, &mut state.vcs_stores, 0);
+    let exchange = super::exchange(&state.config);
     let (held, charged) = {
-      let (content, store) = state.vcs_stores.git(larger).expect("the store");
+      // Read through a lend: the pack's windows lie in the shard's chunk store.
+      let lent = super::super::Lent::new(&mut state.store, &mut state.vcs_stores);
+      let (content, store) = lent.stores.git(larger).expect("the store");
       let (green, version) = store
         .repository
         .first_unencoded()
@@ -406,7 +405,7 @@ fn t_a856_a_grant_is_learned_from_reads_and_given_back_when_idle() {
           content,
           slates_git::store::Turn {
             clock: &mut clock,
-            exchange: super::exchange(&state.config),
+            exchange,
             quantum_ns: 0,
           },
         );
@@ -414,8 +413,8 @@ fn t_a856_a_grant_is_learned_from_reads_and_given_back_when_idle() {
       }
       let held = encoding.held_bytes();
       let charged = content.charged();
-      state
-        .vcs_stores
+      lent
+        .stores
         .encodings
         .0
         .insert(larger, (encoding, (green, version)));
@@ -434,18 +433,13 @@ fn t_a856_a_grant_is_learned_from_reads_and_given_back_when_idle() {
       .unwrap_or(0);
     let under_way = state.vcs_stores.encodings.0.contains_key(&larger);
     (
-      window,
       grants,
       (idle_charged, held, charged, after, given, under_way),
     )
   });
   daemon.stop();
-  let (window, (small, larger), (idle_charged, held, charged, after, given, under_way)) = seen;
+  let ((small, larger), (idle_charged, held, charged, after, given, under_way)) = seen;
   assert!(larger > small, "learned from reads: {small} then {larger}");
-  assert!(
-    small % window == 0 && larger % window == 0,
-    "a whole number of {window}-byte windows: {small}, {larger}"
-  );
   assert!(
     charged >= idle_charged + held,
     "held parts charged: {charged} past {idle_charged}, {held} held"

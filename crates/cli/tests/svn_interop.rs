@@ -1031,7 +1031,7 @@ fn holds_a_timestamp(line: &str) -> bool {
 /// `<date>` element whose value is on it, left out; `author` (the leg's one committer) written `AUTHOR`; `url` (the
 /// leg's repository URL) written `URL`. Nothing else is changed.
 fn comparable(output: &str, author: &str, url: &str) -> String {
-  let ordered = attributes_in_order(output);
+  let ordered = entries_in_order(&attributes_in_order(output));
   ordered
     .lines()
     .filter(|line| !holds_a_timestamp(line))
@@ -1087,6 +1087,44 @@ fn attributes_in_order(output: &str) -> String {
   out
 }
 
+/// `output` with each run of a status's entries in text order, where `output` is `svn status --xml`'s document (a
+/// `<status>` line); any other output as it is. Stock `svn` reports a directory's children in the order its working
+/// copy's children hash yields them, and APR draws each hash's seed afresh (main 01a20182's macOS run of 2026-11-22: the
+/// same 15 entries over HTTPv2 and against `svnserve`, the top directory's in two rotations of one order), so a status's
+/// entry order is no part of what either server answered. Only a status is reordered: `svn list --xml` writes
+/// `<entry>` elements too, in the order the server sorted them, which is compared. Each entry is kept whole, from its
+/// `<entry` line to its `</entry>`, after its attributes are put in order ([`attributes_in_order`]).
+fn entries_in_order(output: &str) -> String {
+  if !output.lines().any(|line| line == "<status>") {
+    return output.to_owned();
+  }
+  let mut out = String::with_capacity(output.len());
+  let mut run: Vec<String> = Vec::new();
+  let mut entry: Option<String> = None;
+  for line in output.lines() {
+    if let Some(open) = entry.as_mut() {
+      open.push_str(line);
+      open.push('\n');
+      if line == "</entry>" {
+        run.extend(entry.take());
+      }
+      continue;
+    }
+    if line == "<entry" {
+      entry = Some(format!("{line}\n"));
+      continue;
+    }
+    run.sort();
+    out.extend(run.drain(..));
+    out.push_str(line);
+    out.push('\n');
+  }
+  run.sort();
+  out.extend(run.drain(..));
+  out.extend(entry);
+  out
+}
+
 /// A line of one attribute as stock `svn`'s XML writer lays it out (`   name="value"`, the tag's close after it on the
 /// last): the attribute and what follows its closing quote; none for any other line.
 fn attribute_line(line: &str) -> Option<(String, String)> {
@@ -1124,6 +1162,41 @@ fn the_comparison_leaves_xml_attribute_order_out_and_nothing_else() {
       attributes_in_order(text),
     ),
     (true, false, text.to_owned())
+  );
+}
+
+/// main 01a20182's macOS run of 2026-11-22 (CI 45018545878, stock svn 1.15 from brew): `svn status -u -v --xml` over
+/// HTTPv2 and against `svnserve` held the same 15 entries, the same in every field, in two orders: the top directory's
+/// children `imported`, `trunk`, `branches`, `tags` in one and `tags`, `imported`, `trunk`, `branches` in the other, one
+/// a rotation of the other, as a hash's order is ([`entries_in_order`]). Do: compare a status whose target holds two
+/// entries in both orders, then with one entry's commit revision changed, and a status of one entry. Expect: the first
+/// two the same once compared, the third still different, the one-entry status unchanged.
+#[test]
+fn the_comparison_leaves_status_entry_order_out_and_nothing_else() {
+  let entry = |path: &str, commit: u32| {
+    format!(
+      "<entry\n   path=\"{path}\">\n<wc-status\n   item=\"normal\"\n   props=\"none\"\n   revision=\"10\">\n\
+       <commit\n   revision=\"{commit}\">\n<author>AUTHOR</author>\n</commit>\n</wc-status>\n</entry>\n"
+    )
+  };
+  let status = |entries: &[String]| {
+    format!(
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<status>\n<target\n   path=\".\">\n{}<against\n   \
+       revision=\"10\"/>\n</target>\n</status>\n",
+      entries.concat()
+    )
+  };
+  let one = status(&[entry("tags", 8), entry("trunk", 9)]);
+  let two = status(&[entry("trunk", 9), entry("tags", 8)]);
+  let changed = status(&[entry("trunk", 9), entry("tags", 7)]);
+  let single = status(&[entry("tags", 8)]);
+  assert_eq!(
+    (
+      comparable(&one, "alice", "URL") == comparable(&two, "alice", "URL"),
+      comparable(&changed, "alice", "URL") == comparable(&two, "alice", "URL"),
+      comparable(&single, "alice", "URL"),
+    ),
+    (true, false, comparable(&single, "nobody", "nowhere"))
   );
 }
 
@@ -2177,9 +2250,36 @@ fn memory_sample(instance: &str, label: &str) -> MemorySample {
         || line.contains("give_back")
     })
     .collect();
+  // What each holder holds by the daemon's own accounting, summed over the shards (w-shared's gauges), and what the
+  // footprint holds past the live system-path bytes, the mapped blocks' resident pages and the arenas: what the system
+  // allocator kept of freed blocks (`crates/server/src/memory_gauges.rs`).
+  let gauges = gauges_summed(&memory);
+  let arena: u64 = lines
+    .iter()
+    .filter_map(|line| {
+      line
+        .split_once("arena.allocated: ")?
+        .1
+        .trim()
+        .parse::<u64>()
+        .ok()
+    })
+    .sum();
+  let gauge = |name: &str| gauges.get(name).copied().unwrap_or(0);
+  let accounted = gauge("mem.gauge.process.system_live_bytes")
+    .saturating_add(gauge("mem.gauge.process.mapped_resident_bytes"))
+    .saturating_add(arena);
+  let kept = footprint.map(|kib| kib.saturating_mul(1024).saturating_sub(accounted));
   println!(
-    "an_import_measured: memory {label}: daemon RSS {rss} KiB, physical footprint {footprint:?} KiB\n  {}",
-    lines.join("\n  ")
+    "an_import_measured: memory {label}: daemon RSS {rss} KiB, physical footprint {footprint:?} KiB\n  {}\n  \
+     gauges (summed over shards):\n    {}\n  footprint past system live + mapped resident + arena ({accounted} B): \
+     {kept:?} B",
+    lines.join("\n  "),
+    gauges
+      .iter()
+      .map(|(name, value)| format!("{name} {value}"))
+      .collect::<Vec<_>>()
+      .join("\n    ")
   );
   let figure = |line: &str, key: &str| -> Option<u64> {
     line
@@ -2197,11 +2297,54 @@ fn memory_sample(instance: &str, label: &str) -> MemorySample {
       .filter(|line| line.contains("memory: heap "))
       .find_map(|line| figure(line, "resident_bytes="))
       .unwrap_or(0),
-    arena: lines
-      .iter()
-      .filter_map(|line| figure(line, "arena.allocated: "))
-      .sum(),
+    arena,
   }
+}
+
+/// Format: the prefix of the memory status's gauge rows (`crates/server/src/memory_gauges.rs`), each printed by the CLI
+/// as `shard N refused mem.gauge.<holder>.<measure>: <value>`, once a shard and only where non-zero.
+const GAUGE_PREFIX: &str = "mem.gauge.";
+
+/// The memory status's gauges in `memory` (`slates status --memory`'s output), each summed over the shards that report
+/// it, by name: what each holder of the daemon's memory holds by its own accounting (w-shared's gauges, main 01a20182's
+/// ruling of 2026-11-22 03:46: one mechanism for every measurement).
+fn gauges_summed(memory: &str) -> std::collections::BTreeMap<String, u64> {
+  let mut summed = std::collections::BTreeMap::new();
+  for line in memory.lines() {
+    let Some((_, row)) = line.split_once(" refused ") else {
+      continue;
+    };
+    let Some((name, value)) = row.split_once(": ") else {
+      continue;
+    };
+    let Ok(value) = value.trim().parse::<u64>() else {
+      continue;
+    };
+    if name.starts_with(GAUGE_PREFIX) {
+      let total: &mut u64 = summed.entry(name.to_owned()).or_default();
+      *total = total.saturating_add(value);
+    }
+  }
+  summed
+}
+
+/// P7's finding (2), main 01a20182's ruling of 2026-11-22 03:46 (an import's reading names the holder of what stays
+/// live). Do: sum a memory status's gauges where two shards report one, one shard another, and a row that is no gauge
+/// sits among them. Expect: each gauge once, summed over its shards; the other row left out.
+#[test]
+fn the_memory_gauges_are_summed_over_the_shards() {
+  let memory = "shard 0 refused mem.gauge.greens.content_bytes: 262144\n\
+                shard 0 refused content_range.arena.allocated: 528384\n\
+                shard 1 refused mem.gauge.greens.content_bytes: 100\n\
+                shard 0 refused mem.gauge.process.system_live_bytes: 7\n";
+  let summed: Vec<(String, u64)> = gauges_summed(memory).into_iter().collect();
+  assert_eq!(
+    summed,
+    vec![
+      ("mem.gauge.greens.content_bytes".to_owned(), 262_244),
+      ("mem.gauge.process.system_live_bytes".to_owned(), 7),
+    ]
+  );
 }
 
 /// Shape: how long a sample waits for `top` to read a footprint it missed (main 01a20182's run of 2026-11-22 01:36 read

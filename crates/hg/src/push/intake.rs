@@ -279,6 +279,55 @@ pub struct Intake {
 
 /// A new manifest and the entries its delta wrote: each file's path and file revision.
 type ManifestWrites = (Node, Vec<(Vec<u8>, Node)>);
+/// Format: the fewest bytes a manifest's line takes: a path of one byte, its NUL, a node's forty hex digits and the line's
+/// end. A delta's bytes write at most one entry for each this many of them ([`Intake::bookkeeping`]).
+const LEAST_MANIFEST_LINE: u64 = 1 + 1 + 40 + 1;
+
+impl Intake {
+  /// The most its steps keep charged to the push's admission from the first to the last (main 01a20182's ruling (a) of
+  /// 2026-11-22 04:23: a push's need is known at its begin, so it is admitted it up front, never the learned demand that
+  /// predicts an unknown one): told from its framing before any revision is taken, by the charges the steps make
+  /// (`Taker::keep_taken`, `read_of`, `logged_of`). Each revision its node, its kept text and its path; each changeset
+  /// its manifest's and its own nodes noted; each manifest its entry, at most one written entry for each
+  /// [`LEAST_MANIFEST_LINE`] bytes of its delta and the delta's bytes for their paths; each log its name, a file's its
+  /// path. A step's own working set (its delta, its base, its rebuilt text) is apart: charged to a copy and let go.
+  pub fn bookkeeping(&self) -> u64 {
+    let framed = &self.frame.0;
+    let each = to_u64(size_of::<Node>().saturating_add(size_of::<KeptText>()));
+    let kept = |count: usize, path: u64| to_u64(count).saturating_mul(each.saturating_add(path));
+    let changelog = framed.changelog.len();
+    let changesets = kept(changelog, to_u64(CHANGELOG_PATH.len()))
+      .saturating_add(to_u64(changelog).saturating_mul(to_u64(2 * size_of::<(Node, Node)>())));
+    let manifests = framed
+      .revisions
+      .get(framed.manifests.clone())
+      .unwrap_or_default()
+      .iter()
+      .fold(
+        kept(framed.manifests.len(), to_u64(MANIFEST_PATH.len())),
+        |total, placed| {
+          let data = placed.data.end.saturating_sub(placed.data.start);
+          let entries = data / LEAST_MANIFEST_LINE + 1;
+          total
+            .saturating_add(to_u64(size_of::<ManifestWrites>()))
+            .saturating_add(entries.saturating_mul(to_u64(size_of::<(Vec<u8>, Node)>())))
+            .saturating_add(data)
+        },
+      );
+    let logs = to_u64(2usize.saturating_add(framed.files.len()))
+      .saturating_mul(to_u64(size_of::<(LogOf, u32)>()));
+    let files = framed.files.iter().fold(0u64, |total, (name, revisions)| {
+      let path = name.end.saturating_sub(name.start);
+      total
+        .saturating_add(kept(revisions.len(), path))
+        .saturating_add(path)
+    });
+    changesets
+      .saturating_add(manifests)
+      .saturating_add(logs)
+      .saturating_add(files)
+  }
+}
 
 /// What an intake has made so far: its fork, where it stands, and what it keeps across steps.
 struct Taker {

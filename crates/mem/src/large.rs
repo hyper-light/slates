@@ -25,9 +25,17 @@
 //! **Bound.** The floor is [`FLOOR_PAGES`] pages, so a mapped block wastes at most one page in that many to rounding.
 //! The counters ([`stats`]) are relaxed statistics on a path taken by large blocks alone (698 in the import above),
 //! never a per-item path.
+//!
+//! **What is live (the memory status's gauges, main's ruling of 2026-11-22 03:46).** Two more figures tell what the
+//! process holds from what the allocators kept: [`heap`]'s live bytes on the system allocator's path, summed from
+//! per-thread slots (one relaxed add a block, on a line its thread alone writes in the common case), and the resident
+//! pages of the mapped blocks live now, read from a table of them ([`TRACKED`] at most; past it, counted untracked) only
+//! when the status asks. A resident set past the live bytes and the mapped blocks' resident pages is what the system
+//! allocator kept of freed blocks.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::cell::Cell;
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 /// Derived: a block mapped directly is at least this many pages, so page rounding wastes at most one page in this many
 /// (1/64, 1.6 %) of its mapping. On 16 KiB pages (Apple silicon) the floor is 1 MiB; on 4 KiB pages, 256 KiB.
@@ -42,6 +50,121 @@ static UNMAPPED: AtomicU64 = AtomicU64::new(0);
 static MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
 static RETURNED_BYTES: AtomicU64 = AtomicU64::new(0);
 static REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// Shape: the slots the system path's live bytes are summed in, each its own cache line: threads past this many share.
+const SLOTS: usize = 64;
+
+/// One slot of the system path's live bytes, alone on its cache line.
+#[repr(align(128))]
+struct Slot(AtomicI64);
+
+/// The system path's live bytes, a slot a thread (module docs, "What is live").
+static LIVE: [Slot; SLOTS] = [const { Slot(AtomicI64::new(0)) }; SLOTS];
+
+/// The next slot handed to a thread.
+static NEXT_SLOT: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+  /// This thread's slot, `usize::MAX` until its first block. Const-initialized and without a destructor, so reading it
+  /// allocates nothing (this runs inside the allocator).
+  static MY_SLOT: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+/// Adds `delta` bytes to this thread's slot of the system path's live bytes.
+fn live(delta: i64) {
+  let slot = MY_SLOT
+    .try_with(|slot| {
+      if slot.get() == usize::MAX {
+        slot.set(NEXT_SLOT.fetch_add(1, Ordering::Relaxed) % SLOTS);
+      }
+      slot.get()
+    })
+    .unwrap_or(0);
+  if let Some(Slot(bytes)) = LIVE.get(slot) {
+    bytes.fetch_add(delta, Ordering::Relaxed);
+  }
+}
+
+/// A layout's size as a live-bytes delta.
+fn size_of_layout(layout: Layout) -> i64 {
+  i64::try_from(layout.size()).unwrap_or(i64::MAX)
+}
+
+/// Shape: the mapped blocks the table keeps for the status's residency, at most; one more is counted untracked.
+pub const TRACKED: usize = 4096;
+
+/// The mapped blocks live now: each one's address (0 for a free entry) and its span.
+static BLOCK_AT: [AtomicUsize; TRACKED] = [const { AtomicUsize::new(0) }; TRACKED];
+static BLOCK_SPAN: [AtomicUsize; TRACKED] = [const { AtomicUsize::new(0) }; TRACKED];
+/// Mapped blocks the table had no entry for.
+static UNTRACKED: AtomicU64 = AtomicU64::new(0);
+
+/// Notes a mapped block of `span` bytes at `block` in the table.
+fn track(block: *mut u8, span: usize) {
+  let at = block as usize;
+  for (entry, len) in BLOCK_AT.iter().zip(BLOCK_SPAN.iter()) {
+    if entry
+      .compare_exchange(0, at, Ordering::AcqRel, Ordering::Relaxed)
+      .is_ok()
+    {
+      len.store(span, Ordering::Release);
+      return;
+    }
+  }
+  UNTRACKED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Takes the block at `block` out of the table, before it is unmapped.
+fn untrack(block: *mut u8) {
+  let at = block as usize;
+  for (entry, len) in BLOCK_AT.iter().zip(BLOCK_SPAN.iter()) {
+    if entry.load(Ordering::Acquire) == at {
+      len.store(0, Ordering::Release);
+      entry.store(0, Ordering::Release);
+      return;
+    }
+  }
+  UNTRACKED.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// What the process holds live (module docs, "What is live").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Heap {
+  /// Bytes the system allocator's path holds in live blocks (requested sizes, not its rounding).
+  pub system_live: u64,
+  /// The mapped blocks live now that the table keeps.
+  pub mapped_blocks: u64,
+  /// Of their pages, the bytes resident now.
+  pub mapped_resident: u64,
+  /// Mapped blocks live that the table had no entry for (their pages are not read).
+  pub untracked: u64,
+}
+
+/// The process's live figures now; reading the mapped blocks' residency walks their pages (`mincore`), so only a
+/// memory status asks. A block unmapped while it is read is skipped.
+pub fn heap() -> Heap {
+  let system_live = LIVE
+    .iter()
+    .map(|Slot(bytes)| bytes.load(Ordering::Relaxed))
+    .fold(0i64, i64::saturating_add);
+  let mut found = Heap {
+    system_live: u64::try_from(system_live).unwrap_or(0),
+    untracked: UNTRACKED.load(Ordering::Relaxed),
+    ..Heap::default()
+  };
+  for (entry, len) in BLOCK_AT.iter().zip(BLOCK_SPAN.iter()) {
+    let at = entry.load(Ordering::Acquire);
+    let span = len.load(Ordering::Acquire);
+    if at == 0 || span == 0 {
+      continue;
+    }
+    found.mapped_blocks = found.mapped_blocks.saturating_add(1);
+    if let Ok(residency) = crate::resident::of_range(at as *const u8, span, page()) {
+      found.mapped_resident = found.mapped_resident.saturating_add(residency.resident);
+    }
+  }
+  found
+}
 
 /// What the large path has done since the process began: the give-back counters `slates status` reports.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -112,6 +235,7 @@ fn map(len: usize) -> *mut u8 {
   }
   MAPPED.fetch_add(1, Ordering::Relaxed);
   MAPPED_BYTES.fetch_add(u64::try_from(span).unwrap_or(u64::MAX), Ordering::Relaxed);
+  track(block, span);
   block
 }
 
@@ -131,7 +255,11 @@ unsafe impl GlobalAlloc for LargeMapped {
       return map(layout.size());
     }
     // SAFETY: the caller's layout, forwarded.
-    unsafe { System.alloc(layout) }
+    let block = unsafe { System.alloc(layout) };
+    if !block.is_null() {
+      live(size_of_layout(layout));
+    }
+    block
   }
 
   // SAFETY: unsafe by `GlobalAlloc`'s signature; a fresh anonymous mapping is zeroed.
@@ -141,7 +269,11 @@ unsafe impl GlobalAlloc for LargeMapped {
       return map(layout.size());
     }
     // SAFETY: the caller's layout, forwarded.
-    unsafe { System.alloc_zeroed(layout) }
+    let block = unsafe { System.alloc_zeroed(layout) };
+    if !block.is_null() {
+      live(size_of_layout(layout));
+    }
+    block
   }
 
   // SAFETY: unsafe by `GlobalAlloc`'s signature; the caller frees with the layout it allocated with, so the path agrees.
@@ -150,6 +282,7 @@ unsafe impl GlobalAlloc for LargeMapped {
       let Some(span) = rounded(layout.size()) else {
         return;
       };
+      untrack(ptr);
       // The layout took the mapped path when `ptr` was allocated (it decides the path).
       // SAFETY: so `ptr` is `map`'s mapping of `span` bytes, and the caller frees it once.
       unsafe { os::unmap(ptr, span) };
@@ -158,7 +291,8 @@ unsafe impl GlobalAlloc for LargeMapped {
       return;
     }
     // SAFETY: the system allocator's block, with the layout it was allocated with.
-    unsafe { System.dealloc(ptr, layout) }
+    unsafe { System.dealloc(ptr, layout) };
+    live(size_of_layout(layout).saturating_neg());
   }
 
   // SAFETY: unsafe by `GlobalAlloc`'s signature; a block that changes path is moved, never handed to the other path.
@@ -167,8 +301,14 @@ unsafe impl GlobalAlloc for LargeMapped {
       return std::ptr::null_mut();
     };
     match (mapped(layout), mapped(new_layout)) {
-      // SAFETY: the system allocator's block on both sides, forwarded.
-      (false, false) => unsafe { System.realloc(ptr, layout, new_size) },
+      (false, false) => {
+        // SAFETY: the system allocator's block on both sides, forwarded.
+        let moved = unsafe { System.realloc(ptr, layout, new_size) };
+        if !moved.is_null() {
+          live(size_of_layout(new_layout).saturating_sub(size_of_layout(layout)));
+        }
+        moved
+      }
       (true, true) if rounded(layout.size()) == rounded(new_size) => ptr,
       _ => {
         // A new block by its own path, the bytes both hold copied, then the old block freed by its own path.
@@ -314,6 +454,46 @@ mod tests {
   /// A-742 (main's ruling: the allocator holds no lock). Do: require `Sync` and `Send` of the allocator at compile time.
   /// Expect: it builds. The allocator is a unit struct whose only shared state is the module's atomics, so no `Mutex`,
   /// `RwLock` or other lock can be in it (the lint wall denies them besides).
+  /// The memory status's gauges (main 01a20182, 2026-11-22 03:46: live bytes told apart from the allocators' keep). Do:
+  /// through the allocator itself, allocate a small block and a mapped block four times the floor, write the mapped
+  /// block's first floor's bytes, read the live figures; then free both and read them again. Expect: while held, the
+  /// system path's live bytes at least the small block's, the mapped block in the table and at least its written bytes
+  /// resident; once freed, the block gone from the table. Other tests share the counters, so each reading is held to this
+  /// test's own blocks alone.
+  #[test]
+  fn the_live_figures_follow_the_blocks_held() {
+    let allocator = LargeMapped;
+    let floor = floor();
+    let small = Layout::from_size_align(64 << 10, 8).unwrap();
+    let large = Layout::from_size_align(4 * floor, page()).unwrap();
+    // SAFETY: two fresh blocks of their layouts, written within them and freed once with the same layouts.
+    unsafe {
+      let a = allocator.alloc(small);
+      let b = allocator.alloc(large);
+      assert!(!a.is_null() && !b.is_null());
+      std::ptr::write_bytes(b, 7, floor);
+      let held = heap();
+      let block_held = BLOCK_AT
+        .iter()
+        .any(|entry| entry.load(Ordering::Acquire) == b as usize);
+      allocator.dealloc(a, small);
+      allocator.dealloc(b, large);
+      let block_gone = !BLOCK_AT
+        .iter()
+        .any(|entry| entry.load(Ordering::Acquire) == b as usize);
+      assert!(
+        held.system_live >= small.size() as u64,
+        "the small block is live: {held:?}"
+      );
+      assert!(block_held, "the mapped block is in the table while held");
+      assert!(
+        held.mapped_resident >= floor as u64,
+        "its written pages read resident: {held:?}"
+      );
+      assert!(block_gone, "the freed block left the table");
+    }
+  }
+
   #[test]
   fn the_allocator_is_shared_without_a_lock() {
     fn shared<T: Sync + Send + 'static>(_: &T) {}

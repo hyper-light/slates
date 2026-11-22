@@ -80,6 +80,17 @@
 > before an entry's append (A-825 "Cost owed"), measured by the lane's release bench; since A-854 paid only by an
 > increment over 1 MiB, the smaller carried in its entry.
 
+> **Open (w-shared, 2026-11-22; main 01a20182 03:17, 04:24 PST): a landed git push keeps 772-787 MiB resident for a
+> 56 MB pack** (git_interop `the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the_history`,
+> git/git v2.0.0, release, the MacBook; bound 178.2 MiB). Attributed by the memory status's gauges (`mem.gauge.*`,
+> `crate::memory_gauges`, landed with this entry), in MB after the push: the system allocator's live blocks 55.9 (of
+> them the index tables 23.5); the repository's windows 61.3 in shard 0's arena and the pushed pack 53.9 on shard 1;
+> the 14 startup mapped blocks 13.8 resident; the rest, about 550-600 MB, is freed memory the system allocator kept
+> after the push's 971 MiB peak (its temporaries under the 1 MiB mapped floor). After the clone the git Repository's
+> objects read lately hold 53.9 more. Owed, in main's order: (1) the push's temporaries cut at their source (w-shared);
+> (2) landed windows and the pack let go once durable (w-shared, with w-git); (3) the recent-objects cache given back
+> after a fetch (w-git); (4) the index tables, decided after.
+
 > **FIXED (w-shared, 2026-11-22; goal 93, svn finding (2), main 01a20182 00:19 PST): a chain entry's buffer was reserved at
 > the admission's bound,** which counts the increment's whole post-state, though a text's splice names it by reference:
 > every imported text cost an allocation of its own size (26.2 MB for 25.6 MB of text in w-svn's attribution,
@@ -528,6 +539,21 @@
 >   before. Held by `vcs_http::daemon_edge::tests::a_mercurial_push_past_its_first_admission_waits_for_room_and_lands_whole`
 >   (a first room of 64 bytes; red with no wait: `PastAdmission { asked: 127, left: 64 }`) and
 >   `a_mercurial_push_its_store_cannot_hold_for_now_waits_for_room_and_lands_whole` (red: `heads` empty).
+> - Part 3, (a) BUILT (2026-11-22, w-hg; main 01a20182's ruling of 04:23; w-interop's whole-history push of hg refused at
+>   a manifest delta on ubuntu and arm, the push's own keeping having spent the one room it held, a wait for room no one
+>   else held never ending): the push is admitted its known need up front. Its begin decodes the framing, so it knows
+>   every revision before taking one; `Intake::bookkeeping` bounds what its steps will keep (each revision's node, kept
+>   text and path; a changeset's nodes; a manifest's written entries, at most one for each 43 bytes of its delta, and
+>   their paths; each log's name), and `hg_push::admitted_its_need` admits what the begin holds, that, and a step's
+>   room, within the repository's ceiling (what others do not hold, `vcs_share::wait::ceiling`). What it must keep past
+>   the ceiling is refused typed; a step past its room waits, as part 2. Counted `vcs.hg.push_need_admitted`. Held by
+>   `push::intake::tests::an_intakes_bookkeeping_covers_what_its_steps_keep` (the bound over what the steps kept) and
+>   `vcs_http::daemon_edge::tests::a_mercurial_push_is_admitted_its_known_need_and_never_waits_for_its_own_keeping`
+>   (500 changesets, 64 bytes left to the steps after the begin; red without (a): a step waited).
+> - Part 3, (b) next (main's ruling: straight after, not owed): the kept texts' list off the push's room, landed to the
+>   changeset store as it is taken (the landing's `Texts` section, sectioned), so the room bounds a step's working set
+>   alone; proved through the intake, the landing and the replay by the recovery oracle, and the whole-history push's
+>   peak RSS against its working set.
 > - Not reproduced here, logged: w-interop's fresh repository's first 500-revision push refused at once on CI's x86 and
 >   arm runners (main's order of 03:49 and 03:50). `a_fresh_repositorys_first_push_of_hundreds_of_changesets_is_taken_at_once`
 >   (500 changesets pushed with no gap after the create) passes on this Mac. Every content-store refusal of a held-ahead
@@ -661,6 +687,11 @@
 > learned demand) and was refused `PastRoom`, so branch, tag and master pushes failed on git/git. Now it runs within its
 > repository's room as it is built and waits for room past it (`vcs_share::wait`, shared with hg). Owed: A-855's fetch
 > wait moved onto it; main's matrix and git/git rerun (master's "cannot lock ref" judged there).
+> A-859 BUILT, part B (2026-11-22, w-git; main 03:38): a git/git clone moved 4-5 GiB, every object whole and
+> uncompressed (the encoder priced a byte at memcpy's 0.14 ns). Now an object pushed in a pack is sent on as its entry
+> lies there, checked against its name first, its delta reused where its base precedes it (`t_a859_…`: 20,916 bytes
+> against the pushed 17,299, where 89,439 went before). Owed: part A, a fetched byte priced at the network (§4.11);
+> main's git/git whole round and `fsck --strict`.
 > R2, the load-only edge tests, CLOSED (2026-11-21, w-git): a push's answer under side-band-64k wrote its first
 > keepalive two intervals after its body (`body_end` waited one interval unwritten, then the reply its own before
 > appending it), 10 s, the client's patience, so every push answer past 5 s failed (18 of 18 at load 24, the timing
@@ -2883,9 +2914,16 @@
 > stream's write end (macOS has no `pipe2`, so std's pipe is made close-on-exec a call later), until the client's
 > 10 s read gives up. RULED (a) and BUILT, A-858: every child the daemon spawns is handed only its three streams
 > (`slates_ipc::confined_spawn`), and the driver reads an exit the watch posted before it was waitable, the second cause
-> the concurrent-spawn test found. Owed: the macos-latest proof of the HTTPv2 propset hang's end and the guard's order
-> (a diag-measurer branch; never on Ada's Macs, main's constraint of 2026-11-22 03:22), and w-lint's Linux and Windows
-> cross-target round. Windows spawns no hooks yet (A-622's Windows part), so it has no seam to change.
+> the concurrent-spawn test found. PROVEN on macos-latest (main 01a20182's CI 45018545878, 2026-11-22, at 00844de07):
+> the session ran 33.57 s, past the propset that hung at 120 s, and the guard's deliberate failure left 0 views mounted.
+> The session then went red on `svn status -u -v --xml`, the test's own: the same 15 entries, the same in every
+> field, in two orders, since stock `svn` reports a directory's children in its working copy's hash order, seeded afresh
+> each run. FIXED in the comparison (w-svn): a status's entries are compared in text order, every other output's as
+> answered (`entries_in_order`; `the_comparison_leaves_status_entry_order_out_and_nothing_else`). **CLOSED by use**
+> (main 01a20182's CI 45021179639, 2026-11-22, macos-latest, Homebrew svn 1.15.0, at 272513fe4 on 738b4e0af): the
+> session passes 1 of 1 in 33.54 s, byte for byte against `svnserve`, and the guard leaves 0 views mounted. Owed:
+> w-lint's Linux and Windows cross-target round. Windows spawns no hooks yet (A-622's Windows
+> part), so it has no seam to change.
 > **svn replay by stock clients (w-interop, 2026-11-20; A-703):** `svn-matrix.sh` gains `svnrdump dump` and
 > `svnsync initialize/synchronize` over svn://, each compared with the dump stock svnserve 1.15.0 made of the same history
 > (`crates/svn/fixtures/replay`, `EXPECT_RDUMP`, `EXPECT_SYNC`): over the reads fixtures' repository both are
@@ -3611,6 +3649,13 @@
 > refusal the wire answers without a Subversion number (`BudgetExceeded`, `ContentUnavailable`, `Format`) does not
 > name what landed; the same dump resumes all the same. Owed: the import's time and peak re-measured on git-2000
 > (main's run), which closes P7's finding (3) or not. The entry below is its history.
+> **FIXED (w-svn, 2026-11-22; main 01a20182 03:55 PST, a sibling of finding (2)'s `put_window` cut): a text refused
+> part-way through its put into the content store left its kept windows held for good.** `svn_commit::store_step_from`
+> took the text's writer out of the landing's `Storing` before it read and put the piece, so a refusal (a piece the
+> reader lacked, a window or the finish refused) dropped the writer, and the landing's release found nothing to abandon.
+> The writer now stays in `Storing` until its object is finished, so every refusal leaves it for the release. Red: a
+> 4 MiB text refused half-way left 8 entries, 2,097,152 bytes, after its release; green: the store as it was
+> (`a_text_refused_part_way_through_its_put_leaves_the_store_as_it_was`).
 > **P7's finding (2) OPEN, RED: an import's freed memory is not given back (2026-11-22, w-svn; main 01a20182's ruling of
 > 00:09, option 3).** Main's r11 (git-2000, release): physical footprint 43 MiB before, 527 MiB after 30 s of idle,
 > 484 MiB held. Only 155 MB of it is live (heap in use +104 MB, arena 51 MB); the rest is blocks under A-742's 1 MiB
@@ -3628,6 +3673,12 @@
 > re-derived by a release A/B only if the footprint still stays (main's ruling). The changeset landing's piece copies
 > are cut too (w-svn, main's routing of 00:57): `slates_store::owner::SlicedLanding::part` answers its buffer emptied
 > once written, and the svn landing fills one buffer a landing (`a_sliced_landings_part_gives_its_buffer_back_to_be_filled_again`).
+> Re-measured (main 01a20182's r12, 2026-11-22, this MacBook, release, at 1721d8c52 with the `put_window` cut): still
+> red, the footprint grown 494,927,872 B against 155,539,920 B live, 181,750,880 B not given back (r4 at 2a8dbcd99:
+> 150,287,136). The cut took allocations out but neither the peak nor what stays. `an_import_measured` now prints the
+> memory status's gauges (w-shared's, `crates/server/src/memory_gauges.rs`) summed over the shards at every reading,
+> and the footprint past the system path's live bytes, the mapped blocks' resident pages and the arenas, so the next
+> reading names the live bytes' holders and what the system allocator kept.
 > Still to measure: the A-742 floor's A/B only if the
 > footprint still stays (main's ruling). A local 64 KiB floor gave 47 MB of footprint at 2 s idle, against 363 MB, at
 > 19.4 s against 12.0 s (debug).

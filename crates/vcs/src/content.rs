@@ -294,6 +294,41 @@ enum Kept {
   },
 }
 
+/// What a content store holds ([`ContentStore::census`]): each kind of entry's count and bytes, by where its bytes are.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ContentCensus {
+  /// Windows kept by the window storage (the shard's chunk store, or the heap where it has none).
+  pub stored: u64,
+  /// Their bytes.
+  pub stored_bytes: u64,
+  /// Windows let go (A-724 piece 4): kept on the node's store, not here.
+  pub away: u64,
+  /// Their bytes.
+  pub away_bytes: u64,
+  /// Windows kept in the store's own memory.
+  pub here_windows: u64,
+  /// Their bytes.
+  pub here_window_bytes: u64,
+  /// Lists, in the store's own memory.
+  pub lists: u64,
+  /// Their bytes.
+  pub list_bytes: u64,
+  /// Index tables, in the store's own memory.
+  pub tables: u64,
+  /// Their bytes.
+  pub table_bytes: u64,
+  /// Derived nodes, in the store's own memory.
+  pub derived: u64,
+  /// Their bytes.
+  pub derived_bytes: u64,
+  /// Objects named by their identity.
+  pub objects: u64,
+  /// The bytes counted against the store's budget.
+  pub used: u64,
+  /// The bytes structures beside it charged to it.
+  pub charged: u64,
+}
+
 /// What the store has done, for the tests' non-vacuity checks and the owner's accounting.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ContentCounters {
@@ -1754,6 +1789,31 @@ impl ContentStore {
   /// The bytes charged now.
   pub fn charged(&self) -> u64 {
     self.charged_bytes
+  }
+
+  /// What the store holds, by where its bytes are and what they are (the memory status's gauges, main's ruling of
+  /// 2026-11-22 03:46): a walk of every entry, so only a memory status asks.
+  pub fn census(&self) -> ContentCensus {
+    let mut census = ContentCensus {
+      objects: u64::try_from(self.objects.len()).unwrap_or(u64::MAX),
+      used: self.used(),
+      charged: self.charged_bytes,
+      ..ContentCensus::default()
+    };
+    for held in self.entries.values() {
+      let len = u64::try_from(held.len()).unwrap_or(u64::MAX);
+      let (count, bytes) = match (&held.kept, held.form) {
+        (Kept::Away { .. }, _) => (&mut census.away, &mut census.away_bytes),
+        (Kept::Stored { .. }, _) => (&mut census.stored, &mut census.stored_bytes),
+        (Kept::Here(_), Form::Window) => (&mut census.here_windows, &mut census.here_window_bytes),
+        (Kept::Here(_), Form::List) => (&mut census.lists, &mut census.list_bytes),
+        (Kept::Here(_), Form::Table) => (&mut census.tables, &mut census.table_bytes),
+        (Kept::Here(_), Form::Derived) => (&mut census.derived, &mut census.derived_bytes),
+      };
+      *count = count.saturating_add(1);
+      *bytes = bytes.saturating_add(len);
+    }
+    census
   }
 
   /// What the store has done.

@@ -777,40 +777,45 @@ fn store_step_from(
   let slice = usize::try_from(state.config.copy_slice_bytes())
     .unwrap_or(usize::MAX)
     .max(1);
-  let (identity, len, begun, sent) = match storing.current.take() {
-    Some((identity, len, writing, sent)) => (identity, len, Some(writing), sent),
-    None => match storing.queue.pop_front() {
-      Some((identity, len)) => (identity, len, None, 0),
-      None => return Ok(true),
-    },
-  };
-  let piece = piece(&identity, sent, slice).ok_or_else(corrupt)?;
-  let piece_len = u64::try_from(piece.len()).unwrap_or(u64::MAX);
-  let kept = crate::vcs_store::within_budget(state, piece_len, |stores| {
-    let store = stores.content_mut().ok_or(Uncommitted::NotHeld)?;
+  // The text's writer stays in `storing` until its object is finished, so a refusal at any step (a piece the reader
+  // lacks, a window or the finish refused) leaves it where the landing's release abandons it (`release_stored`) with
+  // the windows it kept. Taken out first, a refusal dropped it with them still held.
+  if storing.current.is_none() {
+    let Some((identity, len)) = storing.queue.pop_front() else {
+      return Ok(true);
+    };
     // Begun with its length, the text's window buffer is reserved once rather than doubled a copy slice at a time
     // (goal 93, svn finding (2)).
-    let mut writing = begun.unwrap_or_else(|| store.begin_object_of_length(len));
+    let store = state.vcs_stores.content().ok_or(Uncommitted::NotHeld)?;
+    storing.current = Some((identity, len, store.begin_object_of_length(len), 0));
+  }
+  let Some((identity, len, writing, sent)) = storing.current.as_mut() else {
+    return Ok(true);
+  };
+  let (identity, len) = (*identity, *len);
+  let piece = piece(&identity, *sent, slice).ok_or_else(corrupt)?;
+  let piece_len = u64::try_from(piece.len()).unwrap_or(u64::MAX);
+  let finished = crate::vcs_store::within_budget(state, piece_len, |stores| {
+    let store = stores.content_mut().ok_or(Uncommitted::NotHeld)?;
     store
-      .put_window(&mut writing, &piece)
+      .put_window(writing, &piece)
       .map_err(|refused| store_refused(&refused))?;
-    let sent = sent.saturating_add(piece_len);
-    if sent < len && !piece.is_empty() {
-      return Ok(Some((writing, sent)));
+    *sent = sent.saturating_add(piece_len);
+    if *sent < len && !piece.is_empty() {
+      return Ok(false);
     }
     let made = store
-      .finish_object(&mut writing)
+      .finish_object(writing)
       .map_err(|refused| store_refused(&refused))?;
     if made != slates_vcs::ContentId(identity) {
       let _ = store.release(&made);
       return Err(corrupt());
     }
-    Ok(None)
-  });
-  match kept {
-    Ok(Some((writing, sent))) => storing.current = Some((identity, len, writing, sent)),
-    Ok(None) => storing.put.push(identity),
-    Err(refused) => return Err(refused),
+    Ok(true)
+  })?;
+  if finished {
+    storing.current = None;
+    storing.put.push(identity);
   }
   Ok(storing.queue.is_empty() && storing.current.is_none())
 }

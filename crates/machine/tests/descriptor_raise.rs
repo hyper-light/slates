@@ -11,12 +11,15 @@
 )]
 
 /// Format: the variable that makes the re-invoked binary the child.
+#[cfg(unix)]
 const CHILD: &str = "SLATES_MACHINE_DESCRIPTOR_RAISE_CHILD";
 
 /// Format: the tag the child's report line carries, found anywhere in a line (libtest's banner precedes it).
+#[cfg(unix)]
 const TAG: &str = "A837-RAISED";
 
 /// Shape: the soft limit the child starts from, far under any hard limit a host gives a process.
+#[cfg(unix)]
 const LOWERED: u64 = 64;
 
 /// A-837. Do: in a child process, lower the soft descriptor limit to 64 and call the start's raise. Expect: the kernel

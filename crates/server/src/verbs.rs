@@ -4590,6 +4590,8 @@ fn gather_status(request: u64, shard: u16, part: Option<ShardReport>) {
 pub fn shard_report(state: &mut ShardState, memory: bool) -> ShardReport {
   // First, mutably: the residency the memory report reads, when asked (A-744; main's ruling on g228's finding).
   let content_ranges = crate::content_ranges::report(state, memory);
+  // The gauges of what holds the shard's memory, when asked (main's ruling of 2026-11-22 03:46).
+  let memory_gauges = crate::memory_gauges::rows(state, memory);
   let now = state.clock.monotonic_ns();
   let since_boot = now.saturating_sub(state.booted_ns);
   let ring_depth: u64 = state
@@ -4821,6 +4823,7 @@ pub fn shard_report(state: &mut ShardState, memory: bool) -> ShardReport {
       )
       .chain(large_counts(state))
       .chain(content_ranges)
+      .chain(memory_gauges)
       .chain(crate::live_ship::hop_rows(state))
       .chain(busy_harvest_rows())
       .collect(),

@@ -197,9 +197,9 @@ impl Launch {
   }
 
   /// The next line holding `words`, waited for while the launcher's process tree (it and its VMM) gains CPU
-  /// (`vm::Judged`; until 2026-11-20 within a 20 s `WAIT`); every line read is kept for a failure's report.
+  /// (`vm::process_wait::Judged`; until 2026-11-20 within a 20 s `WAIT`); every line read is kept for a failure's report.
   fn expect(&mut self, words: &str) -> String {
-    let mut judged = vm::Judged::of(self.launcher.id());
+    let mut judged = vm::process_wait::Judged::of(self.launcher.id());
     loop {
       match self.lines.recv_timeout(vm::POLL) {
         Ok(line) => {
@@ -211,7 +211,7 @@ impl Launch {
         Err(RecvTimeoutError::Timeout) => {
           let verdict = judged.judge();
           assert!(
-            matches!(verdict, vm::Verdict::Waiting { .. }),
+            matches!(verdict, vm::process_wait::Verdict::Waiting { .. }),
             "no line holding `{words}`: the launcher's processes are {verdict:?}; the lines so far:\n{}",
             self.seen.join("\n")
           );
@@ -249,14 +249,17 @@ impl Launch {
   /// Waits for the launcher to end, while its tree gains CPU (until 2026-11-20 within `WAIT`): its exit code, or the
   /// signal that ended it.
   fn ended(&mut self) -> std::process::ExitStatus {
-    let mut judged = vm::Judged::of(self.launcher.id());
+    let mut judged = vm::process_wait::Judged::of(self.launcher.id());
     loop {
       if let Some(status) = self.launcher.try_wait().unwrap() {
         return status;
       }
       let verdict = judged.judge();
       assert!(
-        matches!(verdict, vm::Verdict::Waiting { .. } | vm::Verdict::Gone),
+        matches!(
+          verdict,
+          vm::process_wait::Verdict::Waiting { .. } | vm::process_wait::Verdict::Gone
+        ),
         "the launcher ended: its processes are {verdict:?}; its lines:\n{}",
         self.seen.join("\n")
       );
@@ -320,11 +323,11 @@ impl Rig {
       .unwrap_or_else(|err| panic!("slates read: {err}"))
   }
 
-  /// Waits, while the instance's processes progress (`vm::InstanceWait`; until 2026-11-20 within `WAIT`), until the file
+  /// Waits, while the instance's processes progress (`vm::process_wait::InstanceWait`; until 2026-11-20 within `WAIT`), until the file
   /// holds `byte` over `[at, at + count)`. A write landing during a read is
   /// refused by `slates read` (`READ_CHANGED`, "changed while it was read"), which here is a read to make again.
   fn holds_eventually(&self, (at, byte, count): (usize, u8, usize), what: &str) {
-    let mut progress = vm::InstanceWait::new();
+    let mut progress = vm::process_wait::InstanceWait::new();
     loop {
       match self.read() {
         Ok(held) if held[at..at + count].iter().all(|seen| *seen == byte) => return,
@@ -438,7 +441,7 @@ fn a_pmem_launchers_death_ends_its_vmm() {
   let _ = launch.ended();
   // On the kernel's own word, a pidfd readable at the exit (until 2026-11-20 a poll of /proc within `WAIT`).
   assert!(
-    vm::await_exit_of(u32::try_from(vmm).unwrap()),
+    vm::process_wait::await_exit_of(u32::try_from(vmm).unwrap()),
     "the VMM (process {vmm}) ended with its launcher"
   );
   rig.holds_eventually(
@@ -556,7 +559,7 @@ fn a_copy_no_holder_claims_after_a_takeover_is_written_back_and_let_go() {
   launch.signal(rustix::process::Signal::KILL);
   let _ = launch.ended();
   // While the anchor's tree gains CPU (until 2026-11-20 within `WAIT`).
-  let mut judged = vm::Judged::of(rig.anchor.child.id());
+  let mut judged = vm::process_wait::Judged::of(rig.anchor.child.id());
   while vm::daemon_of(&rig.anchor).is_none_or(|pid| pid == old) {
     judged.look("the anchor restarted its daemon");
     vm::pause();
