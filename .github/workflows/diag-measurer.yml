@@ -1,0 +1,67 @@
+name: diag-measurer
+
+# w-k90-win, main's 14:55 order (never main): the store's by-use proof on Windows -- stock git and stock hg over the
+# VCS HTTP edge against a Windows daemon (`--vcs-store`), release, at origin/main dba4ae793; results as annotations.
+
+on:
+  push:
+    branches: ["diag-measurer-w-k90-win-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  store-by-use:
+    name: store by use (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: NASM (x86_64 Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64 Windows)
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: uv (for stock hg through uvx)
+        run: python -m pip install --quiet uv && uvx --version && git --version
+      - name: Stock git and stock hg over the HTTP edge
+        env:
+          AWS_LC_SYS_PREBUILT_NASM: "0"
+        run: |
+          set +e
+          cargo test --release --locked -p slates-cli --test git_interop stock_git_clones_pushes_and_fetches_over_the_vcs_http_edge_with_basic -- --nocapture > git.log 2>&1; g=$?
+          SLATES_TEST_HG="uvx --quiet --python 3.12 --from mercurial==7.2 hg" cargo test --release --locked -p slates-cli --test hg_interop stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge -- --nocapture > hg.log 2>&1; h=$?
+          gs=$(grep -E "^test |test result|skipping|panicked" git.log | tr '\n' ' ' | cut -c1-700)
+          hs=$(grep -E "^test |test result|skipping|panicked" hg.log | tr '\n' ' ' | cut -c1-700)
+          [ -z "$gs" ] && gs=$(grep -E "^error" git.log | head -4 | tr '\n' ' ')
+          [ -z "$hs" ] && hs=$(grep -E "^error" hg.log | head -4 | tr '\n' ' ')
+          echo "::notice title=${{ matrix.os }} store by use::git exit=$g: $gs%0Ahg exit=$h: $hs"
+          if [ $g -ne 0 ]; then echo "::error title=${{ matrix.os }} git failure::$(grep -E -A12 'panicked|^---- ' git.log | head -40 | sed 's/%/%25/g' | awk 'BEGIN{ORS="%0A"}{print}')"; fi
+          if [ $h -ne 0 ]; then echo "::error title=${{ matrix.os }} hg failure::$(grep -E -A12 'panicked|^---- ' hg.log | head -40 | sed 's/%/%25/g' | awk 'BEGIN{ORS="%0A"}{print}')"; fi
+          [ $g -eq 0 ] && [ $h -eq 0 ]
+      - name: Keep the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: store-by-use-${{ matrix.os }}
+          path: |
+            git.log
+            hg.log
+          if-no-files-found: warn
