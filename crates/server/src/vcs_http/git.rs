@@ -84,7 +84,7 @@ const LFS_AUTHENTICATE: &[u8] = b"LFS-Authenticate";
 const NS_PER_SECOND: u64 = 1_000_000_000;
 
 mod receive;
-mod upload;
+pub(crate) mod upload;
 
 pub(crate) use receive::{ReceiveServices, ShardLender, ThisShard};
 pub(crate) use upload::{StoreLender, UploadServices};

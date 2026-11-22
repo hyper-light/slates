@@ -40,6 +40,10 @@ use super::{GitServices, ServiceRefused, Start};
 use crate::vcs_http::{ClientGone, Exchange, Failed};
 
 /// Where repositories' stores are lent to upload-pack, afresh for each step of an answer (the module doc).
+/// Counter: a git fetch over HTTP answered refused (a pack the store could not finish, a request refused), its typed
+/// refusal named in the log. Format: a counter name.
+pub(crate) const UPLOAD_REFUSED: &str = "vcs_http.git.upload_refused";
+
 pub(crate) trait StoreLender {
   /// Where a fetch's pack comes from (A-639's fragments, through A-653's source over the store's stream).
   type Packs: PackSource;
@@ -258,6 +262,14 @@ impl<L: StoreLender> Exchange for Upload<L> {
     if written != Written::More {
       // The answer is written: its generation is given back.
       *generation = None;
+      // A refused answer (a pack the store could not finish ends with git's abort words, A-639) is counted and named in
+      // the log by its typed refusal, so a client's "possible repository corruption" has its cause on the server.
+      if let Some(refusal) = made.refusal() {
+        slates_machine::log_line!(
+          "slates-server: a git fetch of repository {repository:?} was answered refused: {refusal:?}"
+        );
+        let _ = crate::state::with_state_counted(|state| state.count(UPLOAD_REFUSED, 1));
+      }
     }
     Ok(written == Written::More)
   }

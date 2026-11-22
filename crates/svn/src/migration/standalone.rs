@@ -3,7 +3,7 @@
 //!
 //! **Why.** A daemon's records name every text stored (C2 stage B part 2 (b)): its bytes are its changeset's on the
 //! node's store, read through a lent [`TextSource`]. Records standing alone kept their texts themselves, as deltas
-//! (`KeptText`), a second text path the daemon no longer takes. [`Standalone`] takes them the daemon's way instead:
+//! (`KeptText`), a second text path the daemon no longer took, since removed. [`Standalone`] takes them the daemon's way instead:
 //! each revision's texts the records do not hold are taken out before its step ([`Repository::take_texts`]) and held
 //! here by identity, the records naming each stored by its length; reads, the drives and the export read them through
 //! this holder, the import's delta bases are supplied from it.
@@ -232,8 +232,7 @@ impl TextSource for Standalone {
     if let Some(bytes) = self.texts.get(identity) {
       return Some(Cow::Borrowed(bytes.as_slice()));
     }
-    // A text the records keep themselves (`KeptText`, a revision replayed or imported into them directly), or a
-    // property list's bytes: until the records keep no text (the move's third piece).
+    // A text whose bytes a property list holds too: the only text bytes the records hold.
     TextSource::text(&self.records, identity)
   }
 

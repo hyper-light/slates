@@ -931,21 +931,21 @@ pub(crate) fn free(state: &mut ShardState, id: RepositoryId) {
   settle(state);
 }
 
-/// Lets go of the holds repository `id`'s git records keep of the names and the packs they name (version 5, A-767 C5;
-/// A-824): each record holds one of each, taken when it was written (`put_names`, `hold_for_record`) or replayed. The
-/// records' own, so never [`free`]'s, which a rebuild runs before it replays the same records: what a repository's
-/// destroy lets go of with its records (the destroy verb is owed, GAPS A-662), done by a test meanwhile. Nothing for a
-/// repository of another tool, or one whose store is not held here.
-#[cfg(test)]
-pub(crate) fn release_record_holds(state: &mut ShardState, id: RepositoryId) {
+/// The holds repository `id`'s git records keep of the names and the packs they name (version 5, A-767 C5; A-824):
+/// each record holds one of each, taken when it was written (`put_names`, `hold_for_record`) or replayed. The records'
+/// own, so never [`free`]'s, which a rebuild runs before it replays the same records: a repository's destroy reads them
+/// here while its register still names them, and lets them go once its destroy is recorded (A-843,
+/// `crate::repository::destroy_repository`). Nothing for a repository of another tool, or one whose store is not held
+/// here.
+pub(crate) fn record_holds(state: &ShardState, id: RepositoryId) -> Vec<slates_vcs::ContentId> {
   let Some(format) = state
     .vcs_stores
     .git_ref(id)
     .map(|(_, git)| git.repository.format())
   else {
-    return;
+    return Vec::new();
   };
-  let named: Vec<slates_vcs::ContentId> = state
+  state
     .db
     .partition()
     .repositories()
@@ -959,8 +959,13 @@ pub(crate) fn release_record_holds(state: &mut ShardState, id: RepositoryId) {
         .chain(record.packed)
         .map(|(identity, _)| identity)
     })
-    .collect();
-  for identity in named {
+    .collect()
+}
+
+/// Lets go of every hold [`record_holds`] names for repository `id`, as its destroy does.
+#[cfg(test)]
+pub(crate) fn release_record_holds(state: &mut ShardState, id: RepositoryId) {
+  for identity in record_holds(state, id) {
     release_names(state, &identity);
   }
 }
@@ -4172,7 +4177,7 @@ fn svn_step_in(
       .map_err(ReplayRefused::SvnStep)?,
   };
   loop {
-    match records.replay_step(&mut replay, 1) {
+    match records.replay_step(&mut replay) {
       Ok(Some(_)) => return Ok(None),
       Ok(None) if slates_rt::futures::now_ns() >= deadline_ns => return Ok(Some(replay)),
       Ok(None) => {}

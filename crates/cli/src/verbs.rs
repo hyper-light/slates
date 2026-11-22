@@ -1836,6 +1836,18 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
       client.retire_branch(repository, name)?;
       emit_branch(repository, name, None, json);
     }
+    Verb::RepositoryDestroy { repository } => {
+      client.destroy_repository(repository)?;
+      if json {
+        slates_machine::out_line!(
+          "{}",
+          serde_json::json!({ "repository": repository, "destroyed": true })
+        );
+      } else {
+        slates_machine::out_line!("repository: {repository}");
+        slates_machine::out_line!("destroyed: true");
+      }
+    }
     // Served in `run`, before this: their authority comes from the anchor, not the client.
     Verb::Bootstrap { .. }
     | Verb::RecoveryPlan { .. }

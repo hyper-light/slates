@@ -8,9 +8,10 @@
 //! is stored but the layout a reader needs to name a node-revision: its offset in its revision's file and where its
 //! representations lie.
 //!
-//! The format is FSFS format 8 (Subversion 1.10), sharded by 1000, physical addressing; a text is the `DELTA`
-//! representation the svn records keep it as (an svndiff of version 2 against its skip-delta base, S4 c2, read in place,
-//! A-645 P3 ruling 3), entries lists and property lists `PLAIN`; every stock release since 1.10 reads it (`fs.h` `SVN_FS_FS__FORMAT_NUMBER` and the formats it opens). The evidence is
+//! The format is FSFS format 8 (Subversion 1.10), sharded by 1000, physical addressing; a text is `PLAIN`, read through
+//! its source, since the records keep no text (the KeptText move; before, the `DELTA` representation the records kept
+//! it as, A-645 P3 ruling 3, which [`TextDeltas`] still writes for a source that answers one), entries lists and
+//! property lists `PLAIN`; every stock release since 1.10 reads it (`fs.h` `SVN_FS_FS__FORMAT_NUMBER` and the formats it opens). The evidence is
 //! Subversion's own writer, read at `libsvn_fs_fs` of the `1.14.x` branch (`d434dc14`): `low_level.c`
 //! (`svn_fs_fs__write_noderev`, `svn_fs_fs__unparse_representation`, `write_change_entry`,
 //! `svn_fs_fs__unparse_revision_trailer`), `id.c` (`svn_fs_fs__id_unparse`) and `structure`. What a revision file
@@ -180,9 +181,11 @@ enum Segment {
   },
 }
 
-/// A text's delta as the svn records keep it (S4 c2): an svndiff of version 2 against the text of its node's skip-delta
-/// predecessor, or against nothing for a first version -- FSFS 1.10's own representation, so the view names it as a
-/// `DELTA` representation and reads its bytes where they are kept, never making the text (A-645 P3, main's ruling 3).
+/// A text's delta as a source keeps it: an svndiff of version 2 against the text of its node's skip-delta predecessor,
+/// or against nothing for a first version -- FSFS 1.10's own representation, so the view names it as a `DELTA`
+/// representation and reads its bytes where they are kept, never making the text (A-645 P3, main's ruling 3). No source
+/// answers one since the records keep no text (the KeptText move): the seam waits on per-file deltas derived from the
+/// changeset log (Ada's ruling of 2026-11-20 ~13:35).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredDelta<'a> {
   /// The text it is against; none for a delta against nothing.
@@ -216,13 +219,10 @@ impl TextDeltas for crate::migration::Standalone {
   }
 }
 
+/// The records keep no text (the KeptText move): no delta the view can name.
 impl TextDeltas for crate::migration::Repository {
-  fn text_delta(&self, identity: &ContentIdentity) -> Option<StoredDelta<'_>> {
-    let (base, bytes) = crate::migration::Repository::text_delta(self, identity)?;
-    Some(StoredDelta {
-      base,
-      bytes: std::borrow::Cow::Borrowed(bytes),
-    })
+  fn text_delta(&self, _identity: &ContentIdentity) -> Option<StoredDelta<'_>> {
+    None
   }
 }
 

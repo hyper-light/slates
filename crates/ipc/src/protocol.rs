@@ -1463,6 +1463,15 @@ pub enum RequestBody {
     /// The agent's own changes, in the head's coordinates, applied after the kept operations.
     replacement: Vec<WorkChange>,
   },
+  /// Destroy repository `repository` whole (§4.17.5, A-843): its record, its namespace and its logs, every green of its
+  /// lineage, its tool store and what its records held, and its usage row, on its owner shard as one verb. Every other
+  /// repository is untouched, and a fetch or push of the name afterwards is refused as for a name never made. Its
+  /// owner's verb. Answered `Destroyed`; refused `NotFound`, `Forbidden`, or the partition's refusal of a member's
+  /// destroy, with nothing recorded. Appended.
+  DestroyRepository {
+    /// The repository.
+    repository: String,
+  },
 }
 
 /// What a policy rule's pattern names (§4.17.1 "Policy"; A-622), as `SetRepositoryPolicy` gives it: the names its
@@ -2599,7 +2608,8 @@ impl RequestBody {
       | RequestBody::SetRepositoryPolicy { .. }
       | RequestBody::ImportRepository { .. }
       | RequestBody::DescribeRepositoryPolicy { .. }
-      | RequestBody::ExportDump { .. } => None,
+      | RequestBody::ExportDump { .. }
+      | RequestBody::DestroyRepository { .. } => None,
     }
   }
 
@@ -2611,6 +2621,7 @@ impl RequestBody {
       RequestBody::Create { .. }
         | RequestBody::CreateGreen { .. }
         | RequestBody::CreateRepository { .. }
+        | RequestBody::DestroyRepository { .. }
         | RequestBody::CreateBranch { .. }
         | RequestBody::CreateWork { .. }
         | RequestBody::AdmitWork { .. }
