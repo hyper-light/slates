@@ -26,6 +26,16 @@ pub(crate) fn failed(failed: &PushFailed, name: &str) -> String {
     PushFailed::NoStore => NOT_SERVED.to_owned(),
     PushFailed::Policy(_) => format!("{name}: the repository's policy cannot be read"),
     PushFailed::Exchange(refusal) => exchange_words(refusal),
+    PushFailed::PastShare { past, share, held } => format!(
+      "{name}: the push needs {} bytes where the repository's share of this server had {} left (its share {share} bytes, \
+       {held} of them held) while other repositories push: retry once their pushes end",
+      past.asked, past.left
+    ),
+    PushFailed::PastSnapshot { past, room } => format!(
+      "{name}: the push needs {} bytes where its partition's snapshot had {} left of {room}: retry once the server lays \
+       its snapshot out larger",
+      past.asked, past.left
+    ),
     PushFailed::Unchecked => format!("{name}: the push was answered before it was read whole"),
     PushFailed::Unlanded => format!("{name}: the node's store refused the push's changeset"),
   }

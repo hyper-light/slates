@@ -499,6 +499,13 @@
 > a time through `StorePacks` rather than whole; the push's pack held twice in RAM until it lands (its own
 > buffer and the content store's windows); a node whose store lacks a record's changeset reading its names from their
 > region homes, held by a test of its own (the rebuild test now reads the node's store).
+> OPEN (goal 93, w-git; w-sessionlog's reduction 2026-11-21): a whole clone of git/git with 506 tags or more is aborted
+> "possible repository corruption on the remote side". The repository's encoding never finishes (its first version,
+> master's whole history, begun and never kept; each tag's first version is encoded over everything it reaches, so the
+> work grows with tags times history), and a fetch that stops waiting for it is answered with the pack unfinished. Not
+> reproduced at a unit's scale (`t_goal93_a_whole_clone_…`, `t_goal93_a_clone_answered_while_…`: 40 tags of a delta-heavy
+> line, fetched before, during and after the encoding, whole). The HTTP edge now counts a refused answer
+> (`vcs_http.git.upload_refused`) and logs its typed refusal, so w-sessionlog's repro names the cause; then red and fix.
 > A-836 BUILT (2026-11-21, w-git; w-interop r16): a ref may name any object. A tag chain is peeled to its end and a ref
 > naming a blob holds no files (its green at git's empty tree), so git/git's `junio-gpg-pub` and `v1.0rc1`..`rc6` are
 > taken and served (`t_a836_…`). Owed: w-interop's rerun of git/git's push and clones over it.
@@ -932,6 +939,9 @@
 > Piece 2a landed (2026-11-21): the room's claims read each repository's learned demand (`slates_vcs::Learned`, a mean
 > decayed by its own rhythm of intakes) in place of the lifetime mean. Owed in piece 2: per-principal rates, the
 > working set's miss-ratio curve and memory by marginal utility, CPU weights, the shares published to siblings.
+> Piece 3b landed (2026-11-21): a git push past its share is refused typed (`PushFailed::PastShare`, or `PastSnapshot`
+> past the slot's room) and retryable (`503`, words naming the share). Owed in piece 3: Mercurial's and Subversion's
+> share words and live intakes, backpressure before refusal, a fetch's room as a claim.
 > In flight, paused for goal 93 (2026-11-21): run 31 (cap 3, Studio-2, 9865bb832) found shard-mates took 4.5 s of the
 > busiest repository's 41.3 s span and its shard ran steps 23.2 s of it: its own three pushes of one agent shared one
 > turn. The fix (a turn an agent, spare turns taken; red first) is on branch agents/w-balance-turn-weights, 928df7d1b,
