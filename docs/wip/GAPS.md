@@ -499,6 +499,13 @@
 > a time through `StorePacks` rather than whole; the push's pack held twice in RAM until it lands (its own
 > buffer and the content store's windows); a node whose store lacks a record's changeset reading its names from their
 > region homes, held by a test of its own (the rebuild test now reads the node's store).
+> OPEN (goal 93, w-git; w-sessionlog's reduction 2026-11-21): a whole clone of git/git with 506 tags or more is aborted
+> "possible repository corruption on the remote side". The repository's encoding never finishes (its first version,
+> master's whole history, begun and never kept; each tag's first version is encoded over everything it reaches, so the
+> work grows with tags times history), and a fetch that stops waiting for it is answered with the pack unfinished. Not
+> reproduced at a unit's scale (`t_goal93_a_whole_clone_…`, `t_goal93_a_clone_answered_while_…`: 40 tags of a delta-heavy
+> line, fetched before, during and after the encoding, whole). The HTTP edge now counts a refused answer
+> (`vcs_http.git.upload_refused`) and logs its typed refusal, so w-sessionlog's repro names the cause; then red and fix.
 > A-836 BUILT (2026-11-21, w-git; w-interop r16): a ref may name any object. A tag chain is peeled to its end and a ref
 > naming a blob holds no files (its green at git's empty tree), so git/git's `junio-gpg-pub` and `v1.0rc1`..`rc6` are
 > taken and served (`t_a836_…`). Owed: w-interop's rerun of git/git's push and clones over it.
