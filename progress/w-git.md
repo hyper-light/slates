@@ -535,3 +535,8 @@
   item 2a driver hook LANDED 41b1e2b49 (merge c207cb0b1): packs made resident before a fetch and an encoding, a turn's
   waiting window brought back; 2b(a)'s let-go must wait for no fetch live (told w-shared). NEXT: A-864 (claimed),
   CRC32 reuse per main 07:31; then deflate reuse.
+- 2026-11-22 ~09:40 PST: A-864 LANDED 5f3ced8ea (merge 33797d4f7): rows keep each pushed entry's raw length, CRC32 and
+  base (git's pack index); reuse checks the CRC32 and copies, no object read; a miss rebuilt (reuse_crc_missed,
+  reuse_rebuilt). Reds: a864_a_clone_sends_each_... (3/3 rebuilt -> 0), a864_an_entry_whose_crc_misses_... Focused:
+  server 277, git 199. NEXT (main 07:31+): one-turn look-ahead residency in place of whole-pack resident, gauge of
+  peak resident windows; then deflate reuse.
