@@ -596,6 +596,19 @@
 >   whole run, past the patience for a long enough one; the structural fix is a per-push staging log, the run landing
 >   apart from the repository's log and named in one step, so pushes to one repository need no turn between them.
 >   Owed, main's: the whole-history push on ubuntu and its peak RSS before and after (run-requests.md).
+> - The whole history's clones spun (main 01a20182's order of 2026-11-22 10:40; CI 45037561866: 4 spins, kills and
+>   restarts a leg, at `vcs_http.rs:850` polls 1-16 and `vcs_ssh::hg::streamed_turn` polls ~11,000). Measured over the
+>   served view of a pushed 57,054-changeset line (debug, MacBook arm64, each call the unit one step takes): a clone of
+>   the line's middle (`clone -r`, every pull with something in common too) made its changesets' and manifests' groups
+>   whole in its walk's begin, 4.1 s; a stream gathered the rows of as many logs as its room holds, every revision's
+>   node, in one step. BUILT (w-hg): `getbundle::Named` walks such a fetch a unit a step (a changeset written and its
+>   manifest's files planned, then a manifest a step in its log's order, then the file section), its begin lending no
+>   text (`a_pull_walked_by_its_changesets_lends_no_text_in_its_begin_and_two_at_most_a_step`; the begin at 20,000
+>   changesets 674 to 23 ms), a manifest lent twice, a step each, never kept past it; a stream gathers an ask a content
+>   window's worth of rows a step (`render::rows_a_step`;
+>   `a_streams_ask_for_a_long_logs_rows_is_gathered_a_window_a_step`). Still a walk of the history a call, each well
+>   under the watchdog's window in release: `heads` 194 ms and `branchmap` 603 ms at 57,054 in debug; next if a run
+>   names them.
 > - Part 3, a manifest's written entries kept once BUILT (2026-11-22, w-hg; main's 05:13 order): a whole or null-base
 >   manifest revision's written entries are its every line, and each was kept for the files' check once a snapshot,
 >   the bulk of a whole-history push's 1.37 GB held (main's 04:59 measure). Now a manifest's entries are a step's

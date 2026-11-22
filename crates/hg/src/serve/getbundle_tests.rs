@@ -1792,7 +1792,7 @@ fn an_answer_is_made_a_slice_at_a_time_each_slice_within_its_own_room() {
 /// client holds every served changeset but the newest is made from what it sends, not by walking every manifest and
 /// file revision of the history for their links (7.2's link walk serves a clone of every head, whose rows are what it
 /// sends). Do: pull the newest of twenty changesets, the client holding the nineteen before it; count the walk's steps.
-/// Expect: the walk made from the missing changeset (one step), and its changegroup the oracle's.
+/// Expect: the walk made from the missing changeset, a step a unit it sends, and its changegroup the oracle's.
 #[test]
 fn a_pull_of_one_changeset_is_made_from_what_it_sends_not_the_whole_history() {
   let parents: Vec<[Option<Rev>; 2]> = (0..20u32).map(|rev| [rev.checked_sub(1), None]).collect();
@@ -1820,11 +1820,13 @@ fn a_pull_of_one_changeset_is_made_from_what_it_sends_not_the_whole_history() {
     .map(|file| decoded.group(&file.revisions).len())
     .sum();
   let ours = picked(&decoded);
-  // The changelog and manifests in one step; then a step a file revision sent, a step a group's end and one the file
-  // section's end.
+  // A step a changeset sent and one the changelog's end, a step a manifest sent, its group's end written with the
+  // file section's first unit (main 01a20182's order of 2026-11-22 10:40: never the changelog and manifests whole in
+  // one step); then a step a file revision sent, a step a group's end and one the file section's end.
+  let manifests = decoded.group(&decoded.manifests).len();
   assert_eq!(
     steps,
-    1 + sent + decoded.files.len() + 1,
+    1 + missing.len() + 1 + manifests + sent + decoded.files.len() + 1,
     "a step a unit sent, not a walk of every row"
   );
   assert_eq!(
