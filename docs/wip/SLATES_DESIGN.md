@@ -16437,6 +16437,16 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 
 #### 4.17.5 Many repositories on one server, balanced by learned usage (A-724)
 
+> **Status (2026-11-21, open decision: the CPU share; main's ruling of 17:22).** The first step is accepted: CPU divided by
+> equal-weight deficit round robin among repositories with runnable work (`vcs_share::turns`, a turn a repository a
+> round, max-min fair, so no repository starves), and CPU entered as a resource beside memory and the snapshot slot in
+> admission's dominant-resource division only. "Shares" below designs weighted fair queuing with each repository's
+> weight its learned demand capped at its measured use; whether that weighting stands is decided by data, not argument:
+> piece 7's load proof A/Bs equal weights against learned weights (release, interleaved, every round shown: each class's
+> p99 against its fair share, and the toys' p99 alone), and the weighting lands only if it wins. Owners: w-multirepo
+> (piece 2's rest and piece 7); the turn-weights variant (a turn per distinct principal and spare turns,
+> `agents/w-balance-turn-weights`) is one arm of the same A/B.
+
 > **Status (2026-11-20, A-724 piece 1).** Designed below; piece 1 built: each repository's usage counted on its owner
 > shard (`slates_vcs::usage`, kept as `ShardState::vcs_usage`; git's push steps and fetch steps count on it). Owed, in
 > order: the learned demand and the shares (piece 2; the division itself built, `slates_vcs::share::divide`, weighted
