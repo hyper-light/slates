@@ -550,6 +550,9 @@ pub struct Repository {
   /// The buffers its objects are read from their packs with, and the objects read lately (`packed::Scratch`), held to
   /// its largest pack's length; in a cell because a read is a look, not a change.
   reading: RefCell<Scratch>,
+  /// The first let-go piece a read met since its owner last asked ([`Repository::waiting`]): a read that meets one answers
+  /// none, and its owner brings the piece back and takes the step again.
+  waiting: Cell<Option<packed::Waited>>,
   /// The longest object its packs hold: what a read from them is held to (§4.9: every size a stored entry's header
   /// names, and its chain's, checked against it before a buffer grows to it; a read allocates nothing in the store, so
   /// the store's lent room is no bound for it).
@@ -596,6 +599,7 @@ impl Repository {
       kinds: BTreeMap::new(),
       packs: BTreeMap::new(),
       reading: RefCell::new(Scratch::default()),
+      waiting: Cell::new(None),
       largest: 0,
       landings_charged: 0,
       counters: Cell::new(StoreCounters::default()),
@@ -731,14 +735,15 @@ impl Repository {
         };
         let mut out = Vec::new();
         let mut reading = self.reading.borrow_mut();
-        packed::read(
+        let read = packed::read(
           store,
           (*place, self.format),
           &bases,
           (&mut *reading, self.largest.max(len)),
           &mut out,
-        )
-        .ok()?;
+        );
+        self.note_waited(&read);
+        read.ok()?;
         (u64::try_from(out.len()).ok() == Some(len)).then_some(Cow::Owned(out))
       }
     }
@@ -775,15 +780,32 @@ impl Repository {
     };
     let mut out = Vec::new();
     let mut reading = self.reading.borrow_mut();
-    let kind = packed::read(
+    let read = packed::read(
       store,
       (place, self.format),
       &bases,
       (&mut *reading, self.largest),
       &mut out,
-    )
-    .ok()?;
-    Some((kind, out))
+    );
+    self.note_waited(&read);
+    Some((read.ok()?, out))
+  }
+
+  /// Notes the let-go piece `read` met, the first since its owner last asked ([`Repository::waiting`]).
+  fn note_waited<T>(&self, read: &Result<T, packed::PackedRefused>) {
+    if let Err(refused) = read
+      && let Some(waited) = refused.waited()
+      && self.waiting.get().is_none()
+    {
+      self.waiting.set(Some(waited));
+    }
+  }
+
+  /// The let-go piece a read met since the last ask, taken (goal 93, main 01a20182's ruling of 2026-11-22 05:45): a step
+  /// whose read answered none asks this, and where it names one, its owner brings that piece back from the node's store
+  /// and takes the step again, never counting the read missing.
+  pub fn waiting(&self) -> Option<packed::Waited> {
+    self.waiting.take()
   }
 
   /// The bytes of the indexed object whose row is `row`, naming `content` ([`Repository::read_stored`]).
@@ -1937,6 +1959,7 @@ impl Repository {
       kinds: self.kinds.clone(),
       packs: self.packs.clone(),
       reading: RefCell::new(Scratch::default()),
+      waiting: Cell::new(None),
       largest: self.largest,
       landings_charged: self.landings_charged,
       counters: Cell::new(StoreCounters::default()),

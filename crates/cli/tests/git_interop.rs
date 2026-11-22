@@ -1087,6 +1087,19 @@ fn peak_while<T>(pid: &str, work: impl FnOnce() -> T) -> (T, u64) {
   })
 }
 
+/// Prints the daemon's memory gauges (`slates status --memory`'s `mem.gauge.*` rows, `crate::memory_gauges` of
+/// slates-server) labelled `when`: what holds its memory by its own accounting at each reading, so a resident set past the
+/// bound names its holders (main 01a20182's ask of 2026-11-22 06:28).
+#[cfg(unix)]
+fn print_gauges(instance: &str, when: &str) {
+  let (_, report, _) = slates(instance, &[], &["status", "--memory"]);
+  let rows: Vec<&str> = report
+    .lines()
+    .filter(|line| line.contains("mem.gauge.") || line.starts_with("memory: "))
+    .collect();
+  eprintln!("gauges at {when}:\n  {}", rows.join("\n  "));
+}
+
 /// What one round of the memory test measured: the pack's bytes, the daemon's peak resident set while its push and its
 /// clone ran, and its settled resident set after each.
 #[cfg(unix)]
@@ -1159,6 +1172,7 @@ fn the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the
       git.ok(&source, &["push", "-q", &url, &refspec]);
     });
     let pushed = settled_resident(&pid);
+    print_gauges(&leg.instance, &format!("{name} after the push"));
     let clone = git.copy(&format!("{name}-clone"));
     let ((), clone_peak) = peak_while(&pid, || {
       git.ok(&git.scratch, &["clone", "-q", &url, &clone]);
@@ -1176,10 +1190,15 @@ fn the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the
       pack,
       peak: push_peak.max(clone_peak),
       pushed,
-      cloned: settled_resident(&pid),
+      cloned: {
+        let cloned = settled_resident(&pid);
+        print_gauges(&leg.instance, &format!("{name} after the clone"));
+        cloned
+      },
     }
   };
   let start = settled_resident(&pid);
+  print_gauges(&leg.instance, "the start");
   let warm = round("warm", WARM_COMMITS, None);
   // W: the range the warm-up's resident set moved over, from its least (the start or its settled end, whichever the
   // idle give-back left lower) to its peak: what a push and a clone cost, and the noise of reading them, whatever
