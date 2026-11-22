@@ -5,7 +5,10 @@
 //! quantum allows, one at least: an object the walk of what a fast-forward brings meets, where its green's sets are
 //! known; a commit the fast-forward's descent by generation number meets. A create and a rewrite are admitted with no
 //! walk (A-614 amended, main's ruling (A) of 2026-11-21): their sets are the closure of their heads, derived on first
-//! read (`super::deriving`), as is a fast-forward's over sets never walked.
+//! read (`super::deriving`), as is a fast-forward's over sets never walked. Each is made at a base, found here (A-850):
+//! another green's version whose head is its head or the commit its tags peel to, else, a commit a unit, the nearest
+//! commit back by generation number that a committed version's head peels to (the repository's peeled map); its first
+//! version brings what its head reaches beyond the base, and the push's record names the base for its replay.
 //! [`Repository::admit`] runs the same units to their end, so a move admitted in one turn or many is the same move, and
 //! the store's counters count it alike.
 //!
@@ -45,6 +48,15 @@ enum Phase {
     walk: Walk,
     /// The commit at the green's head.
     old: ObjectId,
+  },
+  /// A create's or a rewrite's search back for its base (A-850): from the commit its head peels to, back by generation
+  /// number, newest first, to the nearest commit a committed version of another green peels to (the repository's peeled
+  /// map), a commit a unit.
+  Base {
+    /// The search.
+    descent: Descent,
+    /// The commit the move's head peels to.
+    peeled: ObjectId,
   },
   /// Whether the move is a fast-forward, by descent from its head back by generation number.
   Descent {
@@ -248,17 +260,53 @@ impl Repository {
         }
         Some(false) => self.unwalked(store, push, admitting),
       },
+      Phase::Base {
+        mut descent,
+        peeled,
+      } => match self.base_search_unit(store, push, &mut descent)? {
+        Some(from) => Ok(self.remade(admitting, from, Some(peeled))),
+        None => Ok(Phase::Base { descent, peeled }),
+      },
       done @ (Phase::Done(_) | Phase::Taken) => Ok(done),
     }
+  }
+
+  /// One commit of a create's or a rewrite's search back for its base (A-850): the base once found, none once the
+  /// history is walked to its roots with none found (`Some(None)`), or none to go on. Any committed version is a base,
+  /// the moving green's own earlier ones too (a rewrite's base below its old head): each was made before the move.
+  fn base_search_unit(
+    &self,
+    store: &ContentStore,
+    push: &Push,
+    descent: &mut Descent,
+  ) -> Result<Option<Option<(u64, usize)>>, StoreRefused> {
+    let Some(id) = descent.next() else {
+      return Ok(Some(None));
+    };
+    let noted = self
+      .indexed(store, &id)
+      .and_then(|(row, _)| self.peeled.get(&row.position).copied());
+    if let Some(found) = noted {
+      return Ok(Some(Some(found)));
+    }
+    self.count(|counters| counters.base_searched = counters.base_searched.saturating_add(1));
+    for parent in self.parents(store, push, &id)? {
+      descent.push(parent, self.generation(store, push, &parent)?);
+    }
+    Ok(descent.is_empty().then_some(None))
   }
 
   /// The admitted fast-forward: grown by what it brought where that was walked, else left for its first reader.
   fn grown(&self, admitting: &Admitting, brought: Option<Members>) -> Phase {
     match brought {
-      Some(brought) => self.done(admitting, brought, Reach::Grown),
+      Some(brought) => self.done(admitting, (brought, Some(admitting.to)), Reach::Grown),
       None => {
         self.count(|counters| counters.deferred = counters.deferred.saturating_add(1));
-        self.done(admitting, Members::default(), Reach::GrownUnwalked)
+        self.done(
+          admitting,
+          (Members::default(), Some(admitting.to)),
+          Reach::GrownUnwalked,
+        )
       }
     }
   }
@@ -274,17 +322,55 @@ impl Repository {
   ) -> Result<Phase, StoreRefused> {
     // A head neither pushed nor indexed is refused here, as the walk refused it, before the commit takes the push's
     // stage (a replayed record naming a commit nobody sent, `vcs_store`'s t_a662).
-    let from = match self.locate(store, push, &admitting.to) {
-      Some(Place::Indexed { row, .. }) => self.heads.get(&row.position).and_then(|greens| {
+    let heading = |position: u64| {
+      self.heads.get(&position).and_then(|greens| {
         let green = greens
           .iter()
           .copied()
           .find(|green| *green != admitting.green)?;
         Some((green, self.chains.get(&green).and_then(Chain::newest)?))
-      }),
+      })
+    };
+    let from = match self.locate(store, push, &admitting.to) {
+      Some(Place::Indexed { row, .. }) => heading(row.position),
       Some(Place::Pushed { .. }) => None,
       None => return Err(StoreRefused::Missing { id: admitting.to }),
     };
+    // A-850: the version the move is made at, its base, which its sets and the fragments they are encoded from are
+    // relative to. A tag (or a chain of them) of a commit another green heads takes that green's version, as a branch
+    // made at another's head does; otherwise the search back from the commit it peels to, by generation number, to the
+    // nearest commit a committed version peels to (a unit a commit, `Phase::Base`). A push's moves are decided oldest
+    // commit first (`receive::Judge::rank`), so git/git's tags pushed whole into an empty repository each meet the one
+    // below: about its history and its tags brought, not tags times history.
+    let peeled = self.peel(store, push, admitting.to)?;
+    let from = match from {
+      Some(from) => Some(from),
+      None => peeled
+        .filter(|commit| *commit != admitting.to)
+        .and_then(|commit| match self.locate(store, push, &commit) {
+          Some(Place::Indexed { row, .. }) => heading(row.position),
+          _ => None,
+        }),
+    };
+    match (from, peeled) {
+      (None, Some(commit)) => {
+        let generation = self.generation(store, push, &commit)?;
+        Ok(Phase::Base {
+          descent: Descent::back_from(commit, generation),
+          peeled: commit,
+        })
+      }
+      (from, peeled) => Ok(self.remade(admitting, from, peeled)),
+    }
+  }
+
+  /// The admitted create or rewrite, its sets left for its first reader, made at `from` where its admission found a base.
+  fn remade(
+    &self,
+    admitting: &Admitting,
+    from: Option<(u64, usize)>,
+    peeled: Option<ObjectId>,
+  ) -> Phase {
     self.count(|counters| {
       counters.remade = counters.remade.saturating_add(1);
       counters.deferred = counters.deferred.saturating_add(1);
@@ -292,15 +378,25 @@ impl Repository {
         counters.bases_found = counters.bases_found.saturating_add(1);
       }
     });
-    Ok(self.done(admitting, Members::default(), Reach::Remade { from }))
+    self.done(
+      admitting,
+      (Members::default(), peeled),
+      Reach::Remade { from },
+    )
   }
 
-  /// The admitted move.
-  fn done(&self, admitting: &Admitting, brought: Members, reach: Reach) -> Phase {
+  /// The admitted move, with what it brought and the commit its head peels to.
+  fn done(
+    &self,
+    admitting: &Admitting,
+    (brought, peeled): (Members, Option<ObjectId>),
+    reach: Reach,
+  ) -> Phase {
     Phase::Done(Box::new(Move {
       green: admitting.green,
       from: admitting.from,
       to: Some(admitting.to),
+      peeled,
       brought,
       reach,
     }))
@@ -427,6 +523,11 @@ impl Descent {
       }
     }
     None
+  }
+
+  /// Whether no commit is left to walk back to.
+  pub(super) fn is_empty(&self) -> bool {
+    self.heap.is_empty()
   }
 
   /// `id`, a parent of generation number `generation`, to walk back to.

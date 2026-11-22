@@ -14,7 +14,7 @@ use slates_ipc::protocol::{ObjectFormat as WireFormat, Refusal, ReplyBody, Reque
 use slates_merge::push as work;
 use slates_vcs::{ContentId, ContentRefused, ContentStore};
 
-use super::record::{Noted, Record, RecordRefused, RecordWriter, RecordedMove};
+use super::record::{Noted, Record, RecordRefused, RecordWriter, RecordedBase, RecordedMove};
 use super::{
   GitPush, GitRefused, GitStore, ReplayRefused, RepositoryStore, Target, admit_object,
   commit_moves, green_key, replay_git, replay_into, seal_moves,
@@ -96,6 +96,19 @@ fn commit(tree: ObjectId, parents: &[ObjectId], date: u64) -> (ObjectId, Vec<u8>
   )
 }
 
+/// An annotated tag named `name` of the commit `target`, as a push brings it.
+fn tag_of(target: ObjectId, name: &str) -> Brought {
+  let text = format!(
+    "object {}\ntype commit\ntag {name}\ntagger T A Gger <tagger@example.com> 0 +0000\n\nA-850\n",
+    hex(target)
+  );
+  (
+    Kind::Tag,
+    name_of(FORMAT, Kind::Tag, text.as_bytes()).expect("named"),
+    text.into_bytes(),
+  )
+}
+
 /// One object a push brings: its type, id and content.
 pub(crate) type Brought = (Kind, ObjectId, Vec<u8>);
 
@@ -153,19 +166,21 @@ fn holding(kind: Kind, bytes: &[u8]) -> (ContentStore, Noted) {
   )
 }
 
-/// A-767 C5's record v5 (it replaces A-722's version 4, which replaced A-724 piece 8c's version 3). Do: write the
-/// record of one move and one object as version 5, its names put as one content first, its pack named by an identity and
-/// a length, and the changeset the store landed them as; then read it back. Expect: the bytes the module's encoding
-/// states: the head at version 5, the moves, the names' identity (the BLAKE3 of the names' rows) and their count, the
-/// pack's identity and its length, the changeset's sequence, and nothing after; read back with the same moves, the
-/// names, the pack and the sequence named, none inline and no pack bytes.
+/// A-850's record v6 (it replaces A-767 C5's version 5, which replaced A-722's version 4 and A-724 piece 8c's version
+/// 3). Do: write the record of one move made at a base and one object as version 6, its names put as one content first,
+/// its pack named by an identity and a length, and the changeset the store landed them as; then read it back, and read
+/// it with its version word made 3 and 5. Expect: the bytes the module's encoding states: the head at version 6, the
+/// move with its base, the names' identity (the BLAKE3 of the names' rows) and their count, the pack's identity and its
+/// length, the changeset's sequence, and nothing after; read back with the same move and base, the names, the pack and
+/// the sequence named, none inline and no pack bytes; versions 3 and 5 refused typed, no shim reading either.
 #[test]
-fn t_a767_c5_a_version_5_record_names_its_names_its_pack_and_its_changeset() {
+fn t_a850_a_version_6_record_names_its_moves_bases_its_names_its_pack_and_its_changeset() {
   let head = ObjectId::from_bytes(FORMAT, &[0xab; 20]).expect("an id");
   let (mut content, noted) = holding(Kind::Blob, b"hi");
   let mut writer = RecordWriter::default();
   writer.object(noted);
   let moves: Vec<RecordedMove> = vec![(9, 5, Some(head))];
+  let bases: Vec<RecordedBase> = vec![Some((4, 2))];
   let names = writer.names_of(|_| true);
   let (identity, count) =
     super::record_names::names_to_content(&mut content, &names).expect("names put");
@@ -179,18 +194,25 @@ fn t_a767_c5_a_version_5_record_names_its_names_its_pack_and_its_changeset() {
     "the names' identity is the BLAKE3 of their rows"
   );
   let pack = slates_vcs::ContentId::of(b"PACK-bytes");
-  let bytes =
-    RecordWriter::finish_packed((3, &moves), Some((identity, count)), Some((pack, 10)), 7)
-      .expect("written");
+  let bytes = RecordWriter::finish_packed(
+    (3, &moves, &bases),
+    Some((identity, count)),
+    Some((pack, 10)),
+    7,
+  )
+  .expect("written");
   let mut expected = Vec::new();
   expected.extend_from_slice(b"SGPR");
-  expected.extend_from_slice(&5u32.to_le_bytes());
+  expected.extend_from_slice(&6u32.to_le_bytes());
   expected.extend_from_slice(&3u64.to_le_bytes());
   expected.extend_from_slice(&1u64.to_le_bytes());
   expected.extend_from_slice(&9u64.to_le_bytes());
   expected.extend_from_slice(&5u64.to_le_bytes());
   expected.push(1);
   expected.extend_from_slice(&[0xab; 20]);
+  expected.push(1);
+  expected.extend_from_slice(&4u64.to_le_bytes());
+  expected.extend_from_slice(&2u64.to_le_bytes());
   expected.extend_from_slice(&identity.0);
   expected.extend_from_slice(&1u64.to_le_bytes());
   expected.extend_from_slice(&pack.0);
@@ -203,29 +225,37 @@ fn t_a767_c5_a_version_5_record_names_its_names_its_pack_and_its_changeset() {
     sequence: 7,
     deepest: 3,
     moves,
+    bases,
   };
   assert_eq!(Record::decode(&bytes, FORMAT), Ok(read));
-  let mut three = bytes.clone();
-  three.splice(4..8, 3u32.to_le_bytes());
-  assert_eq!(
-    Record::decode(&three, FORMAT),
-    Err(super::record::RecordRefused::Version { version: 3 }),
-    "version 3 is no longer read"
-  );
+  for older in [3u32, 5] {
+    let mut old = bytes.clone();
+    old.splice(4..8, older.to_le_bytes());
+    assert_eq!(
+      Record::decode(&old, FORMAT),
+      Err(super::record::RecordRefused::Version { version: older }),
+      "version {older} is no longer read (A-850: a version-5 record names no move's base)"
+    );
+  }
 }
 
-/// A-662 (hostile input on a parser of bytes the log holds), over a version-5 record. Do: read a record cut at every
+/// A-662 (hostile input on a parser of bytes the log holds), over a version-6 record. Do: read a record cut at every
 /// length, one whose moves' count is `u64::MAX`, one of another magic, one of an unknown version and one of each retired
-/// version (1 and 2, which carried a push's objects), one with a marker of neither kind, one read in another format, and
-/// one with a byte after its sequence. Expect: each refused by its kind, never a panic, and no count allocated past what
-/// the bytes could hold.
+/// version (1 and 2, which carried a push's objects), one with a head marker and one with a base marker (A-850) of
+/// neither kind, one read in another format, and one with a byte after its sequence. Expect: each refused by its kind,
+/// never a panic, and no count allocated past what the bytes could hold.
 #[test]
 fn t_a662_hostile_records_are_refused_by_kind() {
   let head = ObjectId::from_bytes(FORMAT, &[0xcd; 20]).expect("an id");
   let names = (ContentId([3; 32]), 1);
   let pack = (ContentId([4; 32]), 9);
-  let bytes = RecordWriter::finish_packed((0, &[(1, 1, Some(head))]), Some(names), Some(pack), 2)
-    .expect("written");
+  let bytes = RecordWriter::finish_packed(
+    (0, &[(1, 1, Some(head))], &[Some((2, 0))]),
+    Some(names),
+    Some(pack),
+    2,
+  )
+  .expect("written");
   for cut in 0..bytes.len() {
     let read = Record::decode(bytes.get(..cut).expect("a prefix"), FORMAT);
     assert!(read.is_err(), "a record cut at {cut} was read");
@@ -321,10 +351,10 @@ fn assert_hostile_counts_and_words(bytes: &[u8]) {
   );
   let magic = with(0..4, b"GCHN");
   assert_eq!(Record::decode(&magic, FORMAT), Err(RecordRefused::Magic));
-  let version = with(4..8, &6u32.to_le_bytes());
+  let version = with(4..8, &7u32.to_le_bytes());
   assert_eq!(
     Record::decode(&version, FORMAT),
-    Err(RecordRefused::Version { version: 6 })
+    Err(RecordRefused::Version { version: 7 })
   );
   for retired in [1u32, 2] {
     let old = with(4..8, &retired.to_le_bytes());
@@ -338,12 +368,15 @@ fn assert_hostile_counts_and_words(bytes: &[u8]) {
 
 /// The markers, the format, the type and the end of `bytes` made hostile, each refused by its kind.
 fn assert_hostile_marks(bytes: &[u8]) {
-  let mut marker = bytes.to_vec();
-  // Format: the move's marker follows the header (24 bytes), its key and its version (16).
-  if let Some(byte) = marker.get_mut(24 + 16) {
-    *byte = 2;
+  // Format: the move's head marker follows the header (24 bytes), its key and its version (16); its base marker follows
+  // the head's id (20).
+  for at in [24 + 16, 24 + 16 + 1 + 20] {
+    let mut marker = bytes.to_vec();
+    if let Some(byte) = marker.get_mut(at) {
+      *byte = 2;
+    }
+    assert_eq!(Record::decode(&marker, FORMAT), Err(RecordRefused::Marker));
   }
-  assert_eq!(Record::decode(&marker, FORMAT), Err(RecordRefused::Marker));
   assert!(Record::decode(bytes, ObjectFormat::Sha256).is_err());
   let mut trailing = bytes.to_vec();
   trailing.push(0);
@@ -373,7 +406,7 @@ struct Live {
 }
 
 /// The record a commit of `moves` writes now as a client's push's append writes it once its edge homed and landed it
-/// (version 5, C5 part 2b): the names of the objects `writer` noted that the store lacks now, by the predicate the
+/// (version 6, C5 part 2b and A-850, each move with its base): the names of the objects `writer` noted that the store lacks now, by the predicate the
 /// commit gives positions by, put as one content, and the push's pack held by its identity (a pack of whole objects
 /// where the push kept none), as their homing leaves them in the content store; no changeset (the model holds no node
 /// store). An append that brings no object names none.
@@ -381,11 +414,12 @@ fn landed_record(
   content: &mut ContentStore,
   store: &GitStore,
   (writer, deepest, pack): (&RecordWriter, u64, &[u8]),
-  moves: &[RecordedMove],
+  (moves, bases): (&[RecordedMove], &[RecordedBase]),
 ) -> Result<Vec<u8>, GitRefused> {
   let names = writer.names_of(|id| store.repository.object(content, id).is_none());
   if names.is_empty() {
-    return RecordWriter::finish_packed((deepest, moves), None, None, 0).map_err(super::unwritten);
+    return RecordWriter::finish_packed((deepest, moves, bases), None, None, 0)
+      .map_err(super::unwritten);
   }
   let named =
     super::record_names::names_to_content(content, &names).map_err(|_| GitRefused::Allocation)?;
@@ -414,8 +448,13 @@ fn landed_record(
     .put_object(pack)
     .map_err(|refused| GitRefused::Object(PushRefused::Content(refused)))?;
   let len = u64::try_from(pack.len()).unwrap_or(u64::MAX);
-  RecordWriter::finish_packed((deepest, moves), Some(named), Some((identity, len)), 0)
-    .map_err(super::unwritten)
+  RecordWriter::finish_packed(
+    (deepest, moves, bases),
+    Some(named),
+    Some((identity, len)),
+    0,
+  )
+  .map_err(super::unwritten)
 }
 
 /// A push admitted and not yet committed, as a sealed push waits for its appends: its quarantine and its record's
@@ -522,11 +561,12 @@ impl Live {
   ) -> Result<(), GitRefused> {
     let admitted = seal_moves(&mut self.content, &mut self.store, &mut pending.push, moves)?;
     let deepest = pending.push.deepest();
+    let bases: Vec<RecordedBase> = admitted.iter().map(slates_git::store::Move::base).collect();
     let record = landed_record(
       &mut self.content,
       &self.store,
       (&pending.writer, deepest, pending.push.pack()),
-      moves,
+      (moves, &bases),
     )?;
     commit_moves(
       &mut self.content,
@@ -1064,8 +1104,8 @@ fn t_a662_a_record_not_what_it_names_is_refused_and_leaves_nothing() {
   let before = live.facts();
   let record = live.records.first().expect("a record").clone();
   let mut changed = record.clone();
-  // Format: the names' identity follows the head (24 bytes) and the one move (17 and its head's 20).
-  if let Some(byte) = changed.get_mut(24 + 17 + 20) {
+  // Format: the names' identity follows the head (24 bytes) and the one move (18 and its head's 20; it has no base).
+  if let Some(byte) = changed.get_mut(24 + 18 + 20) {
     *byte ^= 1;
   }
   let mut store = live.recovered().expect("recovered");
@@ -1080,6 +1120,71 @@ fn t_a662_a_record_not_what_it_names_is_refused_and_leaves_nothing() {
   ));
   assert_eq!(store.facts(), before);
   assert_a_head_nobody_sent_is_refused_and_leaves_nothing(&mut store, &before);
+}
+
+/// What the tag ref keyed 1 brought at its first version, its sets derived first: the count of objects.
+fn tag_brought(live: &mut Live) -> Result<u64, StoreRefused> {
+  live.store.repository.derive(&mut live.content, 1, 0)?;
+  Ok(live.store.repository.brought(&live.content, 1, 0)?.len())
+}
+
+/// A-850 (main's ruling of 2026-11-21 21:35: a created ref's first version records its base, and a recovery replays it
+/// from the record). Do: push a commit as the ref keyed 0, then an annotated tag of it as the ref keyed 1; read the tag
+/// push's record; make the store again from the records; then make it again with the tag's record rewritten to name no
+/// base, to name a version its base green never had, and to name the tag's own green. Expect: the record names the tag
+/// made at ref 0's version 0; live and recovered, the tag's first version brings its tag object alone and the stores are
+/// alike; with no base recorded the replay takes none, though the heads it meets would give one, and the tag brings its
+/// commit's whole history (the record decides, not the replay); each impossible base is refused typed, `Base`.
+#[test]
+fn t_a850_a_recovery_replays_each_moves_base_from_its_record() {
+  let mut live = Live::new();
+  let (objects, head) = commit_of(&[(b"a".to_vec(), b"bytes".to_vec())], &[], FIRST_DATE);
+  live
+    .push(&objects, vec![(0, Some(head))], 0)
+    .expect("pushed");
+  let tag = tag_of(head, "v0");
+  live
+    .push(std::slice::from_ref(&tag), vec![(1, Some(tag.1))], 0)
+    .expect("tagged");
+  let read =
+    Record::decode(live.records.get(1).expect("the tag's record"), FORMAT).expect("a record");
+  assert_eq!(read.bases, vec![Some((0, 0))], "made at ref 0's version 0");
+  let mut recovered = live.recovered().expect("recovered");
+  assert_eq!(recovered.facts(), live.facts());
+  assert_eq!(tag_brought(&mut live), Ok(1), "live: its tag object alone");
+  assert_eq!(
+    tag_brought(&mut recovered),
+    Ok(1),
+    "recovered: its tag object alone"
+  );
+  let rewritten = |bases: &[RecordedBase]| {
+    RecordWriter::finish_packed(
+      (read.deepest, &read.moves, bases),
+      read.named,
+      read.packed,
+      read.sequence,
+    )
+    .expect("written")
+  };
+  *live.records.get_mut(1).expect("the tag's record") = rewritten(&[None]);
+  let mut unbased = live.recovered().expect("recovered with no base");
+  let whole = u64::try_from(objects.len() + 1).expect("a count");
+  assert_eq!(
+    tag_brought(&mut unbased),
+    Ok(whole),
+    "no base recorded: none taken"
+  );
+  for (green, version) in [(0, 5), (1, 0)] {
+    *live.records.get_mut(1).expect("the tag's record") = rewritten(&[Some((green, version))]);
+    assert!(
+      matches!(
+        live.recovered(),
+        Err(ReplayRefused::Git(GitRefused::Store(StoreRefused::Base { green: g, version: v })))
+          if (g, v) == (green, version)
+      ),
+      "a base at ({green}, {version}) is refused"
+    );
+  }
 }
 
 /// A-767 C5's record v5 (A-722's pack homing; A-724 piece 8c's names): a replay reads a version-5 record's names and
@@ -1142,8 +1247,8 @@ fn t_a767_c5_a_version_5_record_replays_from_its_names_and_pack_by_identity_and_
 /// commit nobody sent is refused by the store as `Missing`, and leaves `store`'s facts `before`.
 fn assert_a_head_nobody_sent_is_refused_and_leaves_nothing(store: &mut Live, before: &Facts) {
   let nobody = ObjectId::from_bytes(FORMAT, &[0x5a; 20]).expect("an id");
-  let missing =
-    RecordWriter::finish_packed((0, &[(1, 1, Some(nobody))]), None, None, 0).expect("written");
+  let missing = RecordWriter::finish_packed((0, &[(1, 1, Some(nobody))], &[None]), None, None, 0)
+    .expect("written");
   assert!(matches!(
     replay_git(&mut store.content, &mut store.store, &missing),
     Err(ReplayRefused::Git(GitRefused::Store(_)))
@@ -2305,7 +2410,7 @@ fn t_identity_rule_a_record_naming_an_object_by_its_old_root_is_refused_typed() 
     };
     super::settle(state);
     let altered = RecordWriter::finish_packed(
-      (read.deepest, &read.moves),
+      (read.deepest, &read.moves, &read.bases),
       Some(renamed),
       read.packed,
       read.sequence,

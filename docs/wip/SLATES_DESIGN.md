@@ -13912,7 +13912,14 @@ speaks receive-pack's exchange of the pack protocol [B: gitprotocol-pack] on eit
    D(k) to it; a version that rewrote the branch computes its D(k) against the old set the same way, then makes the set
    again from the newest version, on any green of the repository, whose head the new head descends from (found through
    the commit rows, so a rebased feature branch starts from its target branch's set), walking only what lies beyond it.
-   The union rule holds within each run of fast-forwards; the fetch's walk (below) covers the rest.
+   The union rule holds within each run of fast-forwards; the fetch's walk (below) covers the rest. A green's first
+   version (no version before it has a head: a create, or a ref made again after its delete) records D(0) relative to
+   the version it was made at, its base, found at its admission and recorded in its push's record (A-850): the green
+   another green's head is its head or the commit its tags peel to (A-753), else the nearest commit back from that commit,
+   by generation number, that a committed version's head peels to, that version less its own tags. D(0) is then what its
+   head reaches and its base does not; a push without `atomic` decides its commands oldest commit first, so a whole
+   history's tags pushed into an empty repository each bring what the one below does not reach, about the history and
+   its tags in all, not tags times history.
 4. **Pack fragments.** Each version's D(k) is also kept encoded, once, as a pack fragment stored as content: each
    object zlib-compressed, deltas chosen by the learned window and depth (below), a base inside the fragment named by
    offset (`OBJ_OFS_DELTA`) and a base in an earlier version named by id (`OBJ_REF_DELTA`), and each entry's CRC32 kept,
@@ -45008,7 +45015,8 @@ reads §4.17.1's shared rule), §4.17.1 (A-534's owed green at any commit, now p
   `a_fast_forward_brings_only_what_its_green_had_not_reached` (a reached directory skipped whole, counted),
   `a_ref_made_at_another_refs_head_reuses_its_set_without_a_walk` (the walk counter unmoved),
   `a_rewrite_brings_what_its_old_head_did_not_reach_and_makes_its_set_again`,
-  `a_deleted_ref_reaches_nothing_and_made_again_brings_all_its_head_reaches`,
+  `a_deleted_ref_reaches_nothing_and_made_again_brings_all_its_head_reaches` (renamed by A-850
+  `a_deleted_ref_reaches_nothing_and_made_again_at_its_old_version_brings_nothing_beyond_it`),
   `a_versions_tree_is_read_from_its_rows_and_a_path_resolves_one_tree_a_component`,
   `an_abandoned_push_leaves_nothing_and_a_false_claim_is_refused`,
   `a_missing_parent_an_unsealed_push_and_a_foreign_push_are_refused`,
@@ -60416,3 +60424,55 @@ Applied in the same change to:
   - slates-server `--lib svn` 113/113 (2 ignored), its `svn_texts` fixture taking its other texts out as a landing does.
   - The ignored git-2000 measurement now prints `records_stored_text_bytes` where it printed `records_text_bytes`.
   - The stock `svnadmin`/`svnlook` reading of the all-`PLAIN` view is main's run, since there is no svn on the Mac.
+
+### A-850 — A created ref's first version is made at a recorded base: D(0) relative to it, a push decided oldest first (bug, 2026-11-21, w-git for UI goal 93; main's rulings of 17:06, 21:35 and 22:40 PST; record r16; §4.17.2 item 3, A-614, A-647, A-753, A-662)
+Applied in the same change to:
+- `crates/git/src/store/admitting.rs`: a create's or a rewrite's admission takes the version it is made at, its base:
+  another green's version whose head is its head or the commit its tags peel to, else the search back
+  (`Phase::Base`, `base_search_unit`, a commit a unit, counted `base_searched`) to the nearest commit a committed
+  version peels to; each move notes the commit its head peels to.
+- `crates/git/src/store/repository.rs`: the peeled map (each commit a committed version's head peels to, the first such
+  version; charged with the chains; copied by a fork); `Move::base`, `Repository::based` (a replay takes the recorded
+  base, refused typed `StoreRefused::Base`), `Repository::peeled_generation`.
+- `crates/git/src/store/deriving.rs`, `crates/git/src/store/reach.rs`: a first version made at a base brings its walk
+  beyond the base alone; a base is taken less its own tags (`base_set`), whole where its head is the version's own.
+- `crates/git/src/receive/mod.rs`: `Judge::rank`; a push without `atomic` decides its commands by rank, its outcomes
+  reported in the order sent.
+- `crates/server/src/git_push.rs`, `crates/server/src/vcs_store.rs`: the server's judge ranks a command by the
+  generation number of the commit its new value peels to (`SealedPush::rank`); the record's moves carry their bases.
+- `crates/server/src/vcs_store/record.rs`: the push record's version 6, each move's base after its head; version 5 (and
+  3 and 4) refused typed `RecordRefused::Version`, no shim.
+- §4.17.2 item 3; GAPS (§4.17).
+
+- **Found by use.** r16 pushed git/git (master and about 1,000 annotated tags) into an empty repository in one push; its
+  encoding never finished, and clones of it were cut short (w-sessionlog, w-interop). A tag's head is its tag object, so
+  no green's head was its head: each tag's first version was remade from nothing and brought everything its commit
+  reaches, and its fragments encoded that, tags times history. The unit's shape measured it: 40 tags of a line,
+  41 versions in 11,733 encoding turns.
+- **Cause.** A-753's base (the green whose head is the new value) never matched a tag, and the derivation's search back,
+  which did find a base, was not recorded and left D(0) whole. With versions committed before the push only, an empty
+  repository's tags would each walk to the root regardless (main's 22:40 ruling), so the push's moves must come oldest
+  first, each meeting the one below.
+- **Change.** At its admission a create or a rewrite finds its base: A-753's, extended through the commit its tags peel
+  to, else the nearest commit back by generation number that a committed version's head peels to (the peeled map, made
+  by the commits in the log's order, so a store made again holds the same). The base is the move's `Reach::Remade`
+  `from`, recorded in the record (version 6) and taken from it by a replay (`based`), never decided again from the heads
+  a replay meets. Its first version's D(0) is the walk from its head beyond the base's reached set less the base's own
+  tags; its reached set is that set and the walk, as before. A push without `atomic` is decided oldest commit first
+  (`Judge::rank`), its report in the order sent. An exact base (the green whose reached set holds the tag's commit) was
+  rejected: a reachability test per tag is tags times history commit reads at admission (main, 22:40).
+- **Tests.** `slates-server` `git_push::tests::t_a850_r16_a_history_and_its_tags_pushed_whole_into_an_empty_repository_bring_each_object_once`
+  (1,012 commits, `main` and 506 annotated tags sent by ref name, one push into an empty repository: every object
+  brought once, 3,542; the encoding ended in 517 turns; the fetch's pack whole; red with the search but the commands
+  decided as sent, 9,557 brought; red before the change, each tag's whole history);
+  `vcs_store::tests::t_a850_a_recovery_replays_each_moves_base_from_its_record` (the recovered store alike; a record
+  rewritten to name no base replays with none, the tag then bringing its commit's history; a base never made, or at the
+  tag's own green, refused `Base`); `vcs_store::tests::t_a850_a_version_6_record_names_its_moves_bases_its_names_its_pack_and_its_changeset`
+  (the encoding; versions 3 and 5 refused typed); `t_a662_hostile_records_are_refused_by_kind` (a base marker of
+  neither kind). `slates-git` `receive::tests::append::without_atomic_commands_are_decided_by_rank_and_reported_as_sent`;
+  the store's oracle (`store::tests::oracle`) holds the model's own statement of the base rule; `t_a647` (the reach type
+  and the derivation agree on every version); the delete-and-make-again and rewrite tests now name the base met
+  (§4.17.2 item 6's "made again brings all its head reaches" is now "brings what its base, its own old version, does
+  not reach").
+- **Left** (GAPS): an atomic push's moves meet no base among each other (its moves commit together); a fetch's plan does
+  not yet follow a base (a run never holds a D(0), so a want of a tag made at a base is answered by the walk, whole).

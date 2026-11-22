@@ -536,6 +536,14 @@
 > A-836 BUILT (2026-11-21, w-git; w-interop r16): a ref may name any object. A tag chain is peeled to its end and a ref
 > naming a blob holds no files (its green at git's empty tree), so git/git's `junio-gpg-pub` and `v1.0rc1`..`rc6` are
 > taken and served (`t_a836_…`). Owed: w-interop's rerun of git/git's push and clones over it.
+> A-850 BUILT (2026-11-21, w-git; main's rulings 21:35 and 22:40): the trigger of the abort above. A created ref's
+> first version is made at a base found at its admission (A-753's, through its tags' commit, else the search back by
+> generation to the nearest committed version's commit) and recorded (push record v6, v5 refused typed); D(0) is
+> relative to it; a push without `atomic` is decided oldest commit first. r16's shape at a unit's scale (1,012 commits,
+> main and 506 tags, one push into an empty repository) brings each object once and encodes in 517 turns
+> (`t_a850_r16_…`). Owed: main's git/git rounds over it; an atomic push's moves meet no base among each other; a fetch's
+> plan does not follow a base (a want of a tag made at one is answered by the walk); bug (1), a fetch cut short while
+> the encoding runs, is next.
 > R2, the load-only edge tests, CLOSED (2026-11-21, w-git): a push's answer under side-band-64k wrote its first
 > keepalive two intervals after its body (`body_end` waited one interval unwritten, then the reply its own before
 > appending it), 10 s, the client's patience, so every push answer past 5 s failed (18 of 18 at load 24, the timing

@@ -222,19 +222,20 @@ fn rewritten() -> (ContentStore, Repository) {
   (store, repository)
 }
 
-/// A-647 part 2, A-614 amended (main's ruling (A) of 2026-11-21: a rewrite is admitted with no walk, so no base is
-/// searched for at its admission). Do: A-614's rewrite scenario, then a lazy read of the rewrite's value. Expect: the
-/// history names each fast-forward's parent the version before it, no parent for a create with no base, and for the
-/// rewrite ref 1's version 2 alone; the read derives ref 1's four versions from nothing; and the value is the store's
-/// own sets, which its first reader derived from ref 2's set, the nearest known commit back from the new head.
+/// A-647 part 2, A-614 amended (main's ruling (A) of 2026-11-21: a rewrite is admitted with no walk), A-850 (its base is
+/// searched for at its admission, back from its head to the nearest commit a committed version peels to). Do: A-614's
+/// rewrite scenario, then a lazy read of the rewrite's value. Expect: the history names each fast-forward's parent the
+/// version before it, no parent for a create with no base, ref 2's create its base, ref 1's version 0 at c1, and for the
+/// rewrite ref 1's version 2 and its base, ref 1's version 0, the nearest version back from c2b; the read derives ref 1's
+/// four versions from nothing; and the value is the store's own sets.
 #[test]
 fn t_a647_a_rewrite_is_derived_from_its_previous_version_and_its_sets_base() {
   let (mut store, repository) = rewritten();
   let parents = |version| Graph::parents(&repository, version);
   assert_eq!(parents((1, 0)), Some(Vec::new()));
   assert_eq!(parents((1, 2)), Some(vec![(1, 1)]));
-  assert_eq!(parents((2, 0)), Some(Vec::new()));
-  assert_eq!(parents((1, 3)), Some(vec![(1, 2)]));
+  assert_eq!(parents((2, 0)), Some(vec![(1, 0)]));
+  assert_eq!(parents((1, 3)), Some(vec![(1, 2), (1, 0)]));
   assert_eq!(parents((1, 4)), None);
   let mut ty = ReachSets::declare(WINDOW, Mode::Lazy);
   let mut values = Derivations::new();
@@ -404,7 +405,8 @@ fn served(
 /// A-647 part 3. Do: make ref 1 at a commit, fast-forward it, rewrite it to a root of its own, delete it, and make it
 /// again at its first commit. Expect: every version, not only the newest, serves its D(k) and its reached set (its
 /// head's closure) from its own value: the first commit's objects twice over, the second's beside both commits', the
-/// root's own both ways, nothing, then the first commit's again both ways.
+/// root's own both ways, nothing, then the first commit's reached again and nothing brought beyond its base, the ref's
+/// own version 0 at that commit (A-850).
 #[test]
 fn t_a647_p3_every_version_serves_its_own_sets() {
   let format = ObjectFormat::Sha1;
@@ -434,7 +436,7 @@ fn t_a647_p3_every_version_serves_its_own_sets() {
     (second_ids, both),
     (own_ids.clone(), own_ids),
     (Vec::new(), Vec::new()),
-    (first_ids.clone(), first_ids),
+    (Vec::new(), first_ids),
   ];
   assert_eq!(served(&repository, &store, 1), expected);
   repository.release(&mut store).unwrap();
