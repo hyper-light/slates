@@ -7469,3 +7469,14 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   beat_late 0. The same run's local submit (the bench's second half) still exits 4 at 512 MiB until w-work-cow's
   slicing lands: that is the local route's proof, a separate entry after it lands, not this one.
 - Last measured (kiln r2, Mac Studio-3, load 2-4, 5 rounds): holder 5/5 at 320 and 512, beat_late none.
+
+## w-engine (A-579's last step piece 1, landed 2d078e4fa): heavier gates and the 1 GiB measurement
+- **Gates (main's, §8):** clippy and `cargo xtask check` over slates-db, slates-anchor, slates-cluster and slates-server
+  (new: `CheckpointHold`, `ContentHold::stage_lent_piece`, the layout-16 refusal); the cross-target lint matrix;
+  `slates-db --test model` whole; `slates-cli`'s `an_owners_unfolded_version_is_read_from_its_content_store_after_a_kill`
+  (a real kill over the content store, the same order as the checkpoint's: publication before record).
+- **Measurement:** w-work-cow's 1 GiB green checkpoint after its sliced submit, release. Read
+  `merge.checkpoint.hold_steps` and `merge.checkpoint.hold_longest_step_ns`, and the watchdog's longest step.
+- **Platform:** macOS arm64 (Studio); the gates also on Linux.
+- **Green:** the record's 527 ms is gone. The longest step is the build plus the encoding, about 123 ms at 1 GiB, with
+  no watchdog line. **Red:** a hold step past a few ms, or the watchdog firing; send it to w-engine.

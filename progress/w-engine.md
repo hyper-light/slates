@@ -291,3 +291,8 @@ Red: a focused server test landing a large named text: no step past the quantum,
   merges 946b60b2d, 99729edef; bisect stopped unfinished on main's 14:33 order (goal 93's reserve: start no runs).
 - LANDED 8da724578 (GAPS): A-579's last ~43 ms step and 13.4 ms key folds deferred past goal 93 with plans; (b)'s A/B
   put in run-requests.md for main (blocked by the regression). Now in goal 93's reserve: no runs.
+- 2026-11-21 evening: main's 15:00 order (goal 93): LANDED 2d078e4fa, A-579's last step piece 1. The checkpoint is held in
+  the owner's content store, a chunk a quantum (hashed, then staged), published, then recorded by name (CheckpointRef;
+  anchor layout 16). Red-checked: hold taken whole -> 1 step for 4 chunks; recovery release removed -> stage left.
+  w-work-cow told (kiln send) to put its watchdog assertion back. OWED piece 2: build+encode in one step (52+71 ms at
+  1 GiB). Run request for main: the 1 GiB release measurement and the heavier gates.
