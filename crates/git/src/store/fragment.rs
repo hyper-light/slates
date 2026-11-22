@@ -331,6 +331,18 @@ impl Encoder {
     }
   }
 
+  /// Whether encoding an object of `kind` would try any delta (A-859): a named base where `named`, or an earlier entry
+  /// of its kind the learned window tries, within a learned depth that makes deltas at all. An object pushed whole is
+  /// sent on as its entry lies only where none would be tried, as git's `pack-objects` searches an object before it
+  /// reuses its packed entry whole.
+  pub(crate) fn would_try(&self, kind: Kind, named: bool, learning: &Learning<'_>) -> bool {
+    if learning.depth == 0 {
+      return false;
+    }
+    let recent = self.recent.get(&kind).map_or(0, VecDeque::len);
+    named || learning.window.size(learning.exchange, recent) > 0
+  }
+
   /// Begins encoding `object` as the entry beginning `at` bytes into its pack (A-718: an object a
   /// window's work a step, [`Encoder::step`]): its candidate bases chosen now, as [`Encoder::put`]
   /// tries them, the named base first, then the window's earlier entries of its kind, the nearest
@@ -553,7 +565,12 @@ impl Encoder {
 
   /// Keeps `object`, written at `at` with a chain `depth` deep, as a candidate while its chain has
   /// room, and lets go of the candidates of its kind past what the window tries now.
-  fn remember(&mut self, object: ToEncode, (at, depth): (u64, u64), learning: &Learning<'_>) {
+  pub(crate) fn remember(
+    &mut self,
+    object: ToEncode,
+    (at, depth): (u64, u64),
+    learning: &Learning<'_>,
+  ) {
     if depth >= learning.depth {
       return;
     }

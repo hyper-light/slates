@@ -105,7 +105,9 @@ pub use repository::graph::{GraphFault, NamedRef, StoreGraph};
 pub use repository::protect::{Change, CommitSigners, Unsigned, UnsignedCommit};
 pub use repository::reach::{ReachRefused, ReachSets, Sets};
 pub use repository::staging::Staging;
-pub use repository::{Found, IndexBases, Move, Repository, StoreCounters, StoreRefused};
+pub use repository::{
+  Found, IndexBases, Move, Repository, RepositoryHeld, StoreCounters, StoreRefused,
+};
 pub use upload::{Answered, Progress, Turn, Upload, UploadCounters, Versions};
 
 #[cfg(test)]

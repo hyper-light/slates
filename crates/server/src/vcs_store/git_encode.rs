@@ -91,6 +91,13 @@ pub(crate) const UNITS_PAST_BUDGET_BY_STAGE: [&str; 4] = [
   "vcs_store.git_encode.units_past_budget.encode",
   "vcs_store.git_encode.units_past_budget.keep",
 ];
+/// Counter: objects a finished encoding sent on as their pushed entry lies, whole (A-859, git's pack reuse). Format: a
+/// counter name.
+pub(crate) const REUSED_WHOLE: &str = "vcs_store.git_encode.reused_whole";
+/// Counter: objects a finished encoding sent on as their pushed delta (A-859). Format: a counter name.
+pub(crate) const REUSED_DELTAS: &str = "vcs_store.git_encode.reused_deltas";
+/// Counter: objects whose pushed entry failed its check and were encoded instead (A-859). Format: a counter name.
+pub(crate) const REUSE_REFUSED: &str = "vcs_store.git_encode.reuse_refused";
 /// Counter: an encoding refused, its version left unencoded. Format: a counter name.
 pub(crate) const REFUSED: &str = "vcs_store.git_encode.refused";
 
@@ -185,6 +192,7 @@ fn turn_lent(
   let encoding_at = stores.encodings.0.get(&id).map(|(_, at)| *at);
   let mut kept = 0;
   let mut past = 0;
+  let mut reused = [0_u64; 3];
   let mut past_by_stage = [0_u64; UNITS_PAST_BUDGET_BY_STAGE.len()];
   let advanced: Option<Result<Progress, StoreRefused>> =
     stores.encodings.0.get_mut(&id).map(|(encoding, _)| {
@@ -230,7 +238,14 @@ fn turn_lent(
   let turned = match advanced {
     Some(Ok(Progress::More)) => Turned::More,
     Some(Ok(Progress::Done)) => {
-      stores.encodings.0.remove(&id);
+      if let Some((encoding, _)) = stores.encodings.0.remove(&id) {
+        let counted = encoding.counters();
+        reused = [
+          counted.reused_whole,
+          counted.reused_deltas,
+          counted.reuse_refused,
+        ];
+      }
       kept = encoded_bytes(stores, id, encoding_at);
       state.count(ENCODED, 1);
       Turned::More
@@ -243,6 +258,14 @@ fn turn_lent(
   };
   if begun {
     state.count(BEGUN, 1);
+  }
+  for (name, by) in [REUSED_WHOLE, REUSED_DELTAS, REUSE_REFUSED]
+    .iter()
+    .zip(reused)
+  {
+    if by > 0 {
+      state.count(name, by);
+    }
   }
   if past > 0 {
     state.count(UNITS_PAST_BUDGET, past);
