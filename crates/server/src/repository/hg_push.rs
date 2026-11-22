@@ -1701,6 +1701,20 @@ async fn built_works(
       })
       .flatten()?;
       match advanced {
+        // The turn waited for a file revision the repository holds whose text is not at hand (A-767 C1: one an import
+        // let go): read from the node's changeset store between turns and brought back into the content store.
+        None if building.ask_waited(room.left()) => {
+          if !vcs_store::hg_view::answer_store_wants(&mut building, repository).await {
+            return None;
+          }
+          let brought = crate::state::with_state(|state| {
+            brought_back(state, repository, forked, &mut building)
+          })
+          .flatten();
+          if brought.is_none() {
+            return Some(Err(PushOutcome::refused(&abort(WORK_TEXT_UNREAD.to_vec()))));
+          }
+        }
         None => slates_rt::futures::yield_now().await,
         Some(Ok(work)) => {
           let _ = crate::state::with_state(|state| state.count(WORKS_BUILT, 1));
@@ -1760,6 +1774,32 @@ async fn held_ahead(
     }
   }
   Some(Ok(ahead))
+}
+
+/// Format: slates' words for a push whose work waited for a file revision the repository holds that its changeset store
+/// could not give back (A-767 C1): nothing of the push is kept, and the client may push again.
+const WORK_TEXT_UNREAD: &[u8] =
+  b"push refused: a file revision the repository holds could not be read from its changeset store; push again";
+
+/// Counter: a file revision's text a push's work read back from the node's changeset store, its text not at hand (A-767
+/// C1: an import let it go). Format: a counter name in the status report.
+pub(crate) const WORK_TEXTS_READ: &str = "vcs.hg.push_work_texts_read";
+
+/// The text `building` was given for the file revision it waited for, brought back into repository `id`'s content
+/// store by the identities the push's index (its fork's, else the store's) names: none where nothing was given or the
+/// store refused it (its budget, bytes not the revision's own).
+fn brought_back(
+  state: &mut ShardState,
+  id: RepositoryId,
+  forked: Option<&Forked>,
+  building: &mut tree::WorkBuild,
+) -> Option<()> {
+  let (path, node, text) = building.take_given()?;
+  let (content, store) = state.vcs_stores.mercurial(id)?;
+  let index = forked.map_or(&store.index, |forked| &forked.fork);
+  slates_hg::push::held::bring_back_file((index, content), (&path, &node), &text).ok()?;
+  state.count(WORK_TEXTS_READ, 1);
+  Some(())
 }
 
 /// What repository `id` holds as a push's works read it: through the push's fork where it has one, else the store's

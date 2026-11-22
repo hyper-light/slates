@@ -55,6 +55,14 @@ use crate::vcs_http::git::StoreLender;
 #[cfg(test)]
 pub(crate) mod tests;
 
+#[cfg(test)]
+std::thread_local! {
+  /// Tests only (A-855): the rooms [`ShardStores::room`] answers on this shard's thread before the shard's own, first
+  /// first, so a test makes a fetch's room short and then grow as other works ending would.
+  pub(crate) static ROOMS: std::cell::RefCell<std::collections::VecDeque<u64>> =
+    const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
 /// Format: nanoseconds in a second, the measured throughput's unit of time against the exchange's.
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
@@ -73,6 +81,10 @@ impl StoreLender for ShardStores {
   /// Derived: the room repository `id`'s works are admitted on this shard (`crate::vcs_share::room`, A-724), as a
   /// push's.
   fn room(&mut self, id: RepositoryId) -> Option<u64> {
+    #[cfg(test)]
+    if let Some(room) = ROOMS.with(|rooms| rooms.borrow_mut().pop_front()) {
+      return Some(room);
+    }
     crate::state::with_state_counted(|state| crate::vcs_share::room(state, id).bytes)
   }
 

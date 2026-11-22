@@ -91,6 +91,14 @@ pub trait Held {
     let text = self.file_text(path, node)?;
     FileNames::of(&text)
   }
+  /// The length of the revision `node` of `path`'s file log's bytes (its text past its metadata block), if the log
+  /// holds it. By default told from its text; a store keeping its rows tells it unread, so a revision whose text is not
+  /// at hand (let go to the node's changeset store, A-767 C1) still has its length.
+  fn file_bytes_len(&self, path: &[u8], node: &Node) -> Option<u64> {
+    let text = self.file_text(path, node)?;
+    let split = crate::filerev::split(&text).ok()?;
+    Some(crate::read::to_u64(split.bytes.len()))
+  }
 }
 
 /// A file revision's text named by its parts' identities: its metadata block's, if it has one, and its bytes'. Two texts

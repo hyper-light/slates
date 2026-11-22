@@ -73,4 +73,46 @@ impl Held for IndexHeld<'_> {
       bytes: row.bytes,
     })
   }
+
+  /// The row's own length (A-767 C1): its text's, less its metadata block's, which the store keeps whether or not the
+  /// text's bytes are at hand; no text read.
+  fn file_bytes_len(&self, path: &[u8], node: &Node) -> Option<u64> {
+    let log = Log::File(path);
+    let rev = self.index.rev(self.store, log, node)?;
+    let row = self.index.revision(self.store, log, rev)?;
+    if row.node != *node {
+      return None;
+    }
+    let block = match row.block {
+      Some(block) => self.store.len_of(&block)?,
+      None => 0,
+    };
+    row.len.checked_sub(block)
+  }
+}
+
+/// Brings back into `store` the text of the revision `node` of `path`'s file log that `index` holds, from `text`, the
+/// whole text its reader read from the node's changeset store (A-767 C1: a push's work reading a text an import let go):
+/// its metadata block and its bytes, each by the identity its row names, each window let go brought back.
+///
+/// # Errors
+/// `NotHeld` where the index holds no such revision or the text is not its own; the store's refusal (its budget) as a
+/// put's.
+pub fn bring_back_file(
+  (index, store): (&HgIndex, &mut ContentStore),
+  (path, node): (&[u8], &Node),
+  text: &[u8],
+) -> Result<(), slates_vcs::ContentRefused> {
+  let log = Log::File(path);
+  let row = index
+    .rev(store, log, node)
+    .and_then(|rev| index.revision(store, log, rev))
+    .filter(|row| row.node == *node)
+    .ok_or(slates_vcs::ContentRefused::NotHeld)?;
+  let split = crate::filerev::split(text).map_err(|_| slates_vcs::ContentRefused::NotHeld)?;
+  store.bring_back_object(&row.bytes, split.bytes)?;
+  if let (Some(block), Some(metadata)) = (row.block, split.metadata) {
+    store.bring_back_object(&block, metadata)?;
+  }
+  Ok(())
 }
