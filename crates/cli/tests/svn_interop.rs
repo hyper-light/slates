@@ -1873,6 +1873,7 @@ fn an_import_measured() {
 /// own process, so nothing suspends it (A-232's gotcha: `vmmap` and `heap` did, and the anchor's watchdog ended it).
 fn memory_sample(instance: &str, label: &str) {
   let rss = daemon_rss_kib(instance);
+  let footprint = daemon_pid(instance).and_then(footprint_kib);
   let (_, memory, _) = slates(instance, &["status", "--memory"]);
   let lines: Vec<&str> = memory
     .lines()
@@ -1884,9 +1885,38 @@ fn memory_sample(instance: &str, label: &str) {
     })
     .collect();
   println!(
-    "an_import_measured: memory {label}: daemon RSS {rss} KiB\n  {}",
+    "an_import_measured: memory {label}: daemon RSS {rss} KiB, physical footprint {footprint:?} KiB\n  {}",
     lines.join("\n  ")
   );
+}
+
+/// Process `pid`'s physical footprint in KiB as macOS `top` reads it (its `MEM` column, from `proc_pid_rusage`'s
+/// `ri_phys_footprint`, nothing suspended): what memory pressure counts, and what a page the arena's idle purge marked
+/// reusable leaves at once, where `ps`'s RSS keeps it until the kernel takes it (A-105, A-110). None off macOS, or where
+/// `top` says nothing readable.
+fn footprint_kib(pid: u32) -> Option<u64> {
+  let out = Command::new("top")
+    .args(["-l", "1", "-pid", &pid.to_string(), "-stats", "pid,mem"])
+    .output()
+    .ok()?;
+  let text = String::from_utf8_lossy(&out.stdout);
+  let field = text.lines().rev().find_map(|line| {
+    let mut words = line.split_whitespace();
+    (words.next()? == pid.to_string()).then(|| words.next().map(str::to_owned))?
+  })?;
+  let field = field.trim_end_matches(['+', '-']);
+  let (number, unit) = field.split_at(field.find(|c: char| c.is_ascii_alphabetic())?);
+  let number: f64 = number.parse().ok()?;
+  let kib = match unit {
+    "B" => number / 1024.0,
+    "K" => number,
+    "M" => number * 1024.0,
+    "G" => number * 1024.0 * 1024.0,
+    _ => return None,
+  };
+  // A count of KiB, read off a figure `top` rounds: never negative, far below 2^53.
+  #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+  Some(kib as u64)
 }
 
 /// The pid of instance `instance`'s daemon (not its anchor), as `ps` lists it.
