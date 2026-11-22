@@ -2161,6 +2161,9 @@ mod tests {
     loop {
       *serial += 1;
       let head = write(state, green, format!("v{serial}").as_bytes(), *serial);
+      // A checkpoint the write's floor move began may be held in turns (A-579), with a build's task waiting on this
+      // shard: taken whole here, since no turn runs inside this step.
+      crate::merge_service::settle_checkpoints(state);
       if state.db.partition().green_floor(id) > held {
         return head;
       }

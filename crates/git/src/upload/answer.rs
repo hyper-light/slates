@@ -565,7 +565,7 @@ impl<K> Answer<K> {
       Opening::V2(before) => before
         .write(sections, admission)
         .map(|written| match written {
-          Sections::Died(answer) => Err(Box::new(answer)),
+          Sections::Died(answer) => Err(answer),
           Sections::Pack(head, framing, at) => Ok((head, framing, at)),
         }),
       Opening::V0(opening) => match opening.write(sections.1, admission) {

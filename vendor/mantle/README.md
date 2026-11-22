@@ -20,6 +20,11 @@ integration tests, benches and the workspace's gates stay in mantle. The engine'
 too, with the one support file they include (`engine/tests/support/shared_sim.rs`), because the runtime under them
 changed: `TMPDIR=<a directory of your own> cargo test --manifest-path vendor/mantle/engine/Cargo.toml --lib`.
 
+Formatting: mantle keeps upstream's own style (the default four-space indent), read from `vendor/rustfmt.toml`, which
+every vendored crate without a `rustfmt.toml` of its own takes; so `cargo fmt --all` checks the vendored code against
+the format it was written in and never reformats it to slates' (2026-11-22: without it, 1,435 diffs at main
+2486c62e3). The local changes below are formatted the same way.
+
 ## Local changes (each marked `slates:` where it is not a path)
 
 Main's ruling of 2026-11-20 on A-767 piece 2b: no `hyper-rt` (a second runtime, D-9) and no `unsafe impl Send`/`Sync`;

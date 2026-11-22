@@ -208,6 +208,9 @@ pub struct Encoding {
   /// The owner's time the units so far took: a base pack's making, taught to the rebuild rule.
   spent_ns: u64,
   counters: EncodingCounters,
+  /// The bytes of its parts it holds between units, charged to the content store's budget as they grow (A-856: what an
+  /// encoding holds is charged, never held outside every budget), given back as they are kept or the encoding ends.
+  charged: u64,
 }
 
 impl Encoding {
@@ -255,7 +258,45 @@ impl Encoding {
       stage,
       spent_ns: 0,
       counters: EncodingCounters::default(),
+      charged: 0,
     }
+  }
+
+  /// The bytes of its parts it holds now: the part under way, the commits', trees' and tags' part once encoded, and both
+  /// parts while they are kept (A-856).
+  pub fn held_bytes(&self) -> u64 {
+    let objects = self
+      .objects
+      .as_ref()
+      .map_or(0, |(bytes, _)| to_u64(bytes.len()));
+    let stage = match &self.stage {
+      Stage::Encode { part, .. } => to_u64(part.bytes.len()),
+      Stage::Keep { objects, blobs, .. } => {
+        to_u64(objects.0.len()).saturating_add(to_u64(blobs.0.len()))
+      }
+      _ => 0,
+    };
+    objects.saturating_add(stage)
+  }
+
+  /// Charges `store` for what it holds now past what it charged before, or gives back what it no longer holds (A-856):
+  /// refused where the store's budget has no room, the encoding then refused, a refusal that costs a fetch time, never
+  /// its answer.
+  fn true_up(&mut self, store: &mut ContentStore) -> Result<(), StoreRefused> {
+    let held = self.held_bytes();
+    if held > self.charged {
+      store.charge(held.saturating_sub(self.charged))?;
+    } else {
+      store.discharge(self.charged.saturating_sub(held))?;
+    }
+    self.charged = held;
+    Ok(())
+  }
+
+  /// Gives back everything it charged `store` (A-856): what its owner calls as it drops an encoding not done.
+  pub fn release(&mut self, store: &mut ContentStore) {
+    let _ = store.discharge(self.charged);
+    self.charged = 0;
   }
 
   /// What the encoding did.
@@ -281,10 +322,15 @@ impl Encoding {
     loop {
       let unit_start = clock.now_ns();
       let stage = self.stage_index();
-      let progress = match self.unit(repository, store, (exchange, quantum_ns)) {
+      let progress = match self
+        .unit(repository, store, (exchange, quantum_ns))
+        .and_then(|progress| self.true_up(store).map(|()| progress))
+      {
         Ok(progress) => progress,
         Err(refused) => {
           self.stage = Stage::Refused(refused);
+          self.objects = None;
+          self.release(store);
           return Err(refused);
         }
       };

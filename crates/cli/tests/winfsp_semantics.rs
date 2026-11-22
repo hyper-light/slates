@@ -1655,6 +1655,8 @@ fn git_with_its_symbolic_links_on_works_on_the_drive() {
       .args(args)
       .env("MSYS", "winsymlinks:nativestrict")
       .env("GIT_CONFIG_NOSYSTEM", "1")
+      .env("GIT_CONFIG_COUNT", "0")
+      .env_remove("GIT_CONFIG_PARAMETERS")
       .output()
       .unwrap();
     let words = format!(

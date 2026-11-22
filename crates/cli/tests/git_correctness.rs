@@ -243,6 +243,9 @@ impl Git {
         ("HOME", self.home.as_str()),
         ("GIT_CONFIG_NOSYSTEM", "1"),
         ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        // A runner's own config injected through `GIT_CONFIG_COUNT` (kiln's signs every commit and tag, so a
+        // lightweight tag asked for a message) is cleared, as `git_interop.rs` clears it.
+        ("GIT_CONFIG_COUNT", "0"),
         ("GIT_TERMINAL_PROMPT", "0"),
         ("LC_ALL", "C"),
         ("GIT_AUTHOR_NAME", "Test"),
@@ -852,6 +855,7 @@ fn serve_cgi(stream: std::net::TcpStream, program: &[String], root: &str, home: 
     .env("HOME", home)
     .env("GIT_CONFIG_NOSYSTEM", "1")
     .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("GIT_CONFIG_COUNT", "0")
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
     .stderr(Stdio::null());

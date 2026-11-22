@@ -55652,6 +55652,18 @@ Applied in the same change to: GAPS (§4.17). Status: designed; slices (a1) to (
   before the records, so an object past a window is whole by its identity after a restart with no record's bytes.
   Test `daemon::tests::t_a727_a3b_an_object_past_a_window_survives_a_warm_restart_by_its_identity` (1 MiB file),
   red with the pieces left out.
+- **Windows let go ride the image (2026-11-22, w-hg; main 01a20182's ruling (a) of 02:52, A-767 C1 step 2b).** A window
+  let go (`ContentStore::let_go`, the cold trigger's and an import's let-go once its segment is durable) keeps its
+  entry, its length and its landed mark; the shard image carries it as a piece of kind 15 (its identity, then its
+  length), whole in every image (`ContentStore::aways`) and as a change in every delta (`away_changes`: put while let
+  go, removed once brought back or freed). A restart takes the windows let go back before the lists, which hold the
+  nodes they name (`restore_away`), so each stays let go, never absent: a reader brings it back by its own bytes
+  (`bring_back_object`). The image is the recovery's one truth: a window the image never named stays absent, a typed
+  `NotHeld`, never adopted as let go (rejected: replay inferring "let go" from "absent", which would swallow a window
+  lost for real). Tests `vcs content::windows_let_go_survive_a_restart_as_let_go_and_come_back_by_their_bytes` (red
+  without `restore_away`: 4 lists and names refused) and `daemon::tests::t_c1_windows_let_go_survive_warm_restarts_whole_and_come_back_by_their_bytes`
+  (three warm restarts after seeded let-go rounds, the store whole as published each time, the object brought back the
+  same bytes by its identity).
 
 
 ### A-664 Subversion objects — A version a work submits to a Subversion repository's green becomes the revision the server makes of it (bug, 2026-11-20, w-shared for UI goal 93)
@@ -60626,3 +60638,33 @@ Applied in the same change to:
   bytes through its `packfile` header, given up answered as before).
 - **Left** (GAPS): the SSH edge admits an answer its shard room but does not yet wait (a held refusal there is given up
   at once); a refusal once the pack's source began still ends the pack.
+
+### A-856 — A git encoding's parts are charged, and fragments are made ahead only for a client within its repository's grant (2026-11-22, w-git for UI goal 93; main 01a20182's rulings of 00:30 and 01:55 PST, Ada: "our memory should be far less than that"; A-718, A-724 pieces 2d and 4)
+Applied in the same change to:
+- `crates/git/src/store/encoding.rs`: `Encoding::held_bytes`, `release`; each unit trues up a charge on the content
+  store for the parts held (refused typed where the store has no room), given back at the end or on a refusal.
+- `crates/server/src/vcs_store/git_encode.rs`: `encode_ahead` (the task behind a fetch, turned only while
+  `ahead_allowed`: a fetch of the repository answered, and its holding within its learned grant), `give_back_idle`,
+  `drop_under_way` (an encoding's charge given back as it is dropped), counters `ahead_stopped` and `given_back_idle`.
+- `crates/server/src/vcs_store/upload.rs`: a repository's last fetch ending gives back what it holds past its grant.
+- `crates/server/src/vcs_share.rs`: `fetches_live`, `held`, `budget` (the learned grant, `grants::current_at`).
+- GAPS (§4.17).
+
+- **Found by use.** clients' table (big Studio, release a3e673efc, git/git v2.0.0 over HTTP): RSS 47 MiB at the start,
+  917 MiB at the clone's end, 1,695 MiB 90 s later with no client, still rising ~8 MiB/s; shard 0 still turning the
+  encoding behind the clone; +1.53 GB of >= 1 MiB blocks, the encoder's parts (`Part.bytes`, 2.5 GB live at its most)
+  "charged to no budget". a3e673efc predates A-850, under which each tag's first version encoded its whole history.
+- **Change.** The parts an encoding holds between its units are charged to the content store, so the shard's budget
+  sees them and an encoding past it is refused, a fetch then searching instead. The task behind a fetch that stopped
+  waiting turns the encoding only while a fetch of the repository is answered and the repository holds less than its
+  learned grant (none before its curve has learned a read, so a repository nothing has read makes nothing ahead); past
+  either it stops. As a repository goes idle, its encoding under way is dropped and what it holds past its grant given
+  back by the cold trigger's cost model, as A-724 piece 4 gives back under contention.
+- **Tests.** `slates-git` `store::tests::encoding::an_encodings_parts_are_charged_to_the_store_as_they_grow_and_given_back_at_its_end`
+  (red with the charge off: 154 bytes held, none charged); `slates-server`
+  `vcs_store::git_encode::tests::t_a856_with_no_fetch_answered_nothing_is_encoded_ahead` (the task stops at its first
+  turn, versions left unencoded, nothing held under way; red before: every version encoded with no fetch there) and
+  `t_a718_a_fetch_that_stops_waiting_leaves_a_task_that_finishes_the_encoding` (with a fetch answered and its grant
+  learned, 262,144 bytes here, the task finishes the encoding as before).
+- **Left** (GAPS): each object's deflate makes a fresh state (97 GB made over one clone), owed next; past its grant a
+  repository's fragments are not kept on disk under its grant, only not made ahead; main's RSS round over git/git.
