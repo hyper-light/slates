@@ -98,6 +98,12 @@ pub(crate) const REUSED_WHOLE: &str = "vcs_store.git_encode.reused_whole";
 pub(crate) const REUSED_DELTAS: &str = "vcs_store.git_encode.reused_deltas";
 /// Counter: objects whose pushed entry failed its check and were encoded instead (A-859). Format: a counter name.
 pub(crate) const REUSE_REFUSED: &str = "vcs_store.git_encode.reuse_refused";
+/// Counter: objects a finished encoding found in no pack the store holds, encoded with no entry to reuse (A-859).
+/// Format: a counter name.
+pub(crate) const REUSE_NO_ENTRY: &str = "vcs_store.git_encode.reuse_no_entry";
+/// Counter: objects whose pushed entry a finished encoding could not read, encoded instead (A-859). Format: a counter
+/// name.
+pub(crate) const REUSE_UNREAD: &str = "vcs_store.git_encode.reuse_unread";
 /// Counter: an encoding refused, its version left unencoded. Format: a counter name.
 pub(crate) const REFUSED: &str = "vcs_store.git_encode.refused";
 
@@ -192,7 +198,7 @@ fn turn_lent(
   let encoding_at = stores.encodings.0.get(&id).map(|(_, at)| *at);
   let mut kept = 0;
   let mut past = 0;
-  let mut reused = [0_u64; 3];
+  let mut reused = [0_u64; 5];
   let mut past_by_stage = [0_u64; UNITS_PAST_BUDGET_BY_STAGE.len()];
   let advanced: Option<Result<Progress, StoreRefused>> =
     stores.encodings.0.get_mut(&id).map(|(encoding, _)| {
@@ -244,6 +250,8 @@ fn turn_lent(
           counted.reused_whole,
           counted.reused_deltas,
           counted.reuse_refused,
+          counted.reuse_no_entry,
+          counted.reuse_unread,
         ];
       }
       kept = encoded_bytes(stores, id, encoding_at);
@@ -259,9 +267,15 @@ fn turn_lent(
   if begun {
     state.count(BEGUN, 1);
   }
-  for (name, by) in [REUSED_WHOLE, REUSED_DELTAS, REUSE_REFUSED]
-    .iter()
-    .zip(reused)
+  for (name, by) in [
+    REUSED_WHOLE,
+    REUSED_DELTAS,
+    REUSE_REFUSED,
+    REUSE_NO_ENTRY,
+    REUSE_UNREAD,
+  ]
+  .iter()
+  .zip(reused)
   {
     if by > 0 {
       state.count(name, by);
@@ -520,6 +534,18 @@ fn encode_behind(state: &mut ShardState, id: RepositoryId) {
       state.vcs_stores.encodings.1.remove(&id);
     }
   }
+}
+
+/// The units repository `id`'s encoding under way has done (none when none is under way): a test's sign that its turns
+/// progress (`vcs_store::upload::tests`'s judge of a drive).
+#[cfg(test)]
+pub(crate) fn units_done(state: &ShardState, id: RepositoryId) -> Option<u64> {
+  state
+    .vcs_stores
+    .encodings
+    .0
+    .get(&id)
+    .map(|(encoding, _)| encoding.counters().units)
 }
 
 #[cfg(test)]

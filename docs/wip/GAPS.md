@@ -3690,6 +3690,12 @@
 > memory status's gauges (w-shared's, `crates/server/src/memory_gauges.rs`) summed over the shards at every reading,
 > and the footprint past the system path's live bytes, the mapped blocks' resident pages and the arenas, so the next
 > reading names the live bytes' holders and what the system allocator kept.
+> The importer's own copy is cut (A-862, w-svn, main's order of 05:28): each text goes into the content store a piece
+> at a time as the dump is read, through the commit drive's `TextSink`, named stored, its hold handed to its landing;
+> no whole text is buffered (`an_import_holds_no_text_whole_on_the_system_heap`: 8 texts of 512 KiB, the system
+> path's churn 4,299,277 B at 2bb00e1cc, 92,309 B now). main's r14 at 2bb00e1cc, before it: 600.3 MB not given back,
+> `process.system_allocated_bytes` 33.59 GB cumulative for a 447 MB dump, live about 190 MB. Owed: the next-largest
+> per-text churners given buffers the import owns (main's routing), and main's gauged re-measure.
 > Still to measure: the A-742 floor's A/B only if the
 > footprint still stays (main's ruling). A local 64 KiB floor gave 47 MB of footprint at 2 s idle, against 363 MB, at
 > 19.4 s against 12.0 s (debug).

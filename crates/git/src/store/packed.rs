@@ -746,6 +746,17 @@ pub struct RawEntry {
   pub end: u64,
 }
 
+/// The header of the entry at `place` in a held pack (A-859): how it holds its object, its base where a delta's, read
+/// with nothing inflated, so a delta's base is found before its data is read. Refused as [`raw_entry`] refuses one.
+pub fn entry_header(
+  store: &dyn PackSource,
+  (place, format): (InPack, ObjectFormat),
+  room: u64,
+) -> Result<entry::Header, PackedRefused> {
+  let mut header = Vec::new();
+  header_at(store, place, format, (&mut header, room)).map(|(found, _)| found)
+}
+
 /// The entry at `place` in a held pack as it lies there ([`RawEntry`], A-859): its header read, and its data inflated
 /// once into `scratch` (its size, held to `room` first) to find where it ends and that it inflates whole to its header's
 /// size. Refused as [`read`] refuses an entry it cannot take.

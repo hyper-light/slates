@@ -776,6 +776,23 @@ impl VcsStores {
     self.svn_unlent(id)
   }
 
+  /// Repository `id`'s Subversion records and the shard's content store, lent together for one step: an import's call,
+  /// which reads the records and puts its texts into the store as it reads (`svn_import::texts`). None as
+  /// [`VcsStores::subversion`] answers none, or where either is not made.
+  pub(crate) fn subversion_with_content(
+    &mut self,
+    id: RepositoryId,
+  ) -> Option<(&mut SvnRecords, &mut ContentStore)> {
+    if self.rebuild_turns.contains_key(&id) {
+      return None;
+    }
+    let content = self.content.as_mut()?;
+    match self.entries.get_mut(&id)? {
+      RepositoryStore::Subversion(store) => Some((store.records.as_mut()?, content)),
+      _ => None,
+    }
+  }
+
   /// [`VcsStores::subversion`] whether or not the store is lent: a rebuild's own replay reaches it this way.
   fn svn_unlent(&mut self, id: RepositoryId) -> Option<&mut SvnStore> {
     match self.entries.get_mut(&id)? {
