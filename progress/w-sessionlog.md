@@ -38,3 +38,9 @@ SDK session-log tests run 16:40 (main's 16:18): Python 2 OK, Node 2 pass / 0 ski
 ## Goal 93 git correctness by use (main 10:38, corrected 10:48)
 - Red to w-git: tag of a blob / tag of a tag rejected (inbox/w-git-from-w-sessionlog-tag-kinds.md).
 - LANDED 868bc1fde (merge 21f10f3e4): crates/cli/tests/git_correctness.rs, 2 ignored interop tests; local proof tag 0/6 red, dataset 20/25 on a tiny repo. Rounds are main's (run-requests.md). Stopped.
+
+## 2026-11-21 16:20: git piece done; main 16:18 put me in goal 93 reserve.
+- Reds with w-git: tag kinds (inbox/w-git-from-w-sessionlog-tag-kinds.md); clone corruption reduced to master + 506 tags, encode never finishing + encode_behind abort (inbox/w-git-from-w-sessionlog-clone-corruption.md). Answer w-git questions on the repro.
+- Test: crates/cli/tests/git_correctness.rs (868bc1fde; http-backend stock side b3b818933).
+- Linux-tree rows not run: no tree on Studio-2, GitHub fetch gave 0 bytes in 60 s here; main/w-interop own those rounds.
+- Kept for w-git: ~/.cache/w-sessionlog-git/{pushclone.sh,h0,h0-status/}.
