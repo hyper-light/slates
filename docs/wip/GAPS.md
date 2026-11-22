@@ -506,6 +506,11 @@
 >   (red without the wait: refused `NotYet`), `hg push::work_tests::a_work_reading_texts_not_at_hand_waits_and_asks_the_store_for_each`
 >   (red with `Missing` for `NotYet`) and `vcs content::an_object_let_go_is_brought_back_whole_by_its_own_bytes`.
 >   Nothing is let go yet, so no behaviour changes until 2b.
+> - 2b part (2a) BUILT (2026-11-22, w-hg; main's ruling (a) of 02:52): a window let go survives a warm restart as let
+>   go (image piece kind 15; `ContentStore::aways`, `away_changes`, `restore_away` before the lists; design section
+>   "Windows let go ride the image"); `ContentStore::let_go_object` lets every window of an object go but those
+>   another holds. Held by `vcs content::windows_let_go_survive_a_restart_as_let_go_and_come_back_by_their_bytes` and
+>   `daemon::tests::t_c1_windows_let_go_survive_warm_restarts_whole_and_come_back_by_their_bytes`.
 > - 2b, next: each import segment's file windows marked landed and let go once the segment is durable; a symlink's
 >   target read again in the walk; main's red (after a fixture import `ContentStore::used` is the changelog's and the
 >   manifests' bytes alone; a clone and a push over the import verify clean against stock 7.2).
