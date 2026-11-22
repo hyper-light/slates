@@ -16467,6 +16467,12 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > per-principal rates, the working set's miss-ratio curve and memory by marginal utility, CPU weights, and the shares
 > published to siblings.
 
+> **Status (2026-11-21, A-724 piece 3: Mercurial's push past its share).** `hg_push::unbundle` refuses a bundle
+> larger than its room has left, where the room is a share or the snapshot slot's room, before it is read, in 7.2's
+> `pusherr` form naming the bound and that a retry may pass
+> (`t_a724_a_mercurial_push_past_its_share_is_refused_naming_the_share`, red first). Owed in piece 3: Subversion's
+> admission and its words (with w-svn), backpressure before refusal (with w-git).
+
 > **Status (2026-11-21, A-724 piece 3b: git's push past its share refused typed and retryable).** A git push keeps what
 > bound its room when it began (`vcs_share::Bound`); a refusal past its admission is typed by it: `PushFailed::PastShare
 > { past, share, held }` where the room was the repository's share while others pushed, `PastSnapshot { past, room }`
@@ -55228,6 +55234,11 @@ Applied in the same change to:
   the usage row only where its answer wrote something, so a batch's lookup hold teaches no zero demand. Red first (a
   held generation divided no room; with the lookup answered too, two fetches counted). Tests: slates-server `vcs_share`
   16/16, `vcs_ssh::tests::hg` 13/13, `vcs_http::hg` 9/9, `hg_view` 7/7, `repository::hg_push` 18/18.
+- **Piece 3, Mercurial's share refusal (2026-11-21, w-hg's leave).** `hg_push::unbundle` refuses, before `front` reads
+  the bundle, a bundle larger than its room has left where the room is the repository's share (or the snapshot slot's
+  room): 7.2's `pusherr` (`Outcome::Unprocessed`) naming the bound and that a retry may pass (`past_its_bound`), as
+  git's `PastShare` does. Red first: refused `Bundle1` before, saying nothing of the share. Tests: slates-server
+  `vcs_share` 17/17, `vcs_ssh::tests::hg` 13/13, `vcs_http::hg` 9/9, `hg_view` 7/7, `repository::hg_push` 18/18.
 - **Applied in the same change to** §4.17.5 (new), GAPS, amendments.tsv.
 - **Owed.** Pieces 2 to 7 (§4.17.5's status); a fetch's answered count at its pack's last step; Mercurial's and
   Subversion's intakes and reads counted; the rows in `slates status`.
