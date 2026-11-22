@@ -497,12 +497,17 @@ impl RecordedBatch {
     let most = usize::MAX;
     state.count(BATCH_APPLY_SLICES, 1);
     let mut taken = 0usize;
-    while let Some(step) = self.staged.pop_front() {
+    while let Some(mut step) = self.staged.pop_front() {
       let version = self.first;
       self.first = version.saturating_add(1);
+      // A version naming its texts (A-760) had its runs' buffers taken by the scratch member's verdict: they are read
+      // again from the content store, which holds them until the batch's landing ends (`svn_commit::staging`). One read
+      // in place of the copy the post-state was; adopting the scratch member's files is w-svn's piece (c).
+      let read = crate::repository::svn_commit::read_named(state, &mut step.increment).is_ok();
       let applied = state
         .greens
         .get_mut(&self.green)
+        .filter(|_| read)
         .map(|mut engine| engine.apply_recorded(&step.increment, &step.applied));
       if applied != Some(version) {
         // Recorded, and not applied as judged: the green is made again from its chain, which holds every version.

@@ -1479,12 +1479,12 @@ fn a_push_of_many_whole_manifest_snapshots_keeps_one_copy_of_their_entries() {
 
 /// `payload`, a changegroup 03, taken into a fork of `index` cut at every kept text, each segment's record written as it
 /// is cut and the rest's once every unit is taken, each store want answered from the fork; the records, and the fork,
-/// which holds their contents (as a push's fork holds them to its entry).
+/// which holds their contents (as a push's fork holds them to its entry), and what the take brought.
 fn segment_records_over(
   payload: &[u8],
   index: &mut HgIndex,
   store: &mut ContentStore,
-) -> (Vec<Vec<u8>>, HgIndex) {
+) -> (Vec<Vec<u8>>, HgIndex, Intaken) {
   let mut admission = room();
   let mut taking = Intake::begin(
     (crate::changegroup::Version::V03, payload),
@@ -1511,8 +1511,8 @@ fn segment_records_over(
   }
   taking.cut_rest();
   recorded(&mut taking, store);
-  let (fork, _) = finished(taking);
-  (records, fork)
+  let (fork, intaken) = finished(taking);
+  (records, fork, intaken)
 }
 
 /// Main 01a20182's ruling of 2026-11-22 06:57 (a push lands its segments apart from its repository's turn, which it
@@ -1532,7 +1532,7 @@ fn a_pushs_segments_replay_onto_an_index_another_push_moved_their_bases_by_node(
   let held = index.len(&store, Log::Manifest);
   let (pushed, _) = adding_files(line.clone(), &names(4..7));
   let (other, _) = adding_files(line, &names(9..10));
-  let (records, fork) = segment_records_over(&pushed, &mut index, &mut store);
+  let (records, fork, _) = segment_records_over(&pushed, &mut index, &mut store);
   assert!(records.len() > 1, "{} records", records.len());
   let (moved, _, _) = taken_counting(&other, &mut index, &mut store, None);
   core::mem::replace(&mut index, moved)
@@ -1555,4 +1555,39 @@ fn a_pushs_segments_replay_onto_an_index_another_push_moved_their_bases_by_node(
   assert!(deltas > 0, "the push kept a manifest as a delta");
   index.release(&mut store).unwrap();
   fork.release(&mut store).unwrap();
+}
+
+/// Main 01a20182's ruling of 2026-11-22 07:32 (staging: a push's fork made stale by another push's landing is re-based
+/// before its entry, and a restart replays its segments' records over the index as it stood: the two must agree). Do:
+/// over a line of four changesets each adding a file, cut a push of three more into segments and write their records;
+/// land another push of one changeset over the same line; re-base the first push's fork onto the index that left
+/// (`Rebase`), and, apart, replay its records onto the same index. Expect the two indexes row for row the same, the
+/// re-based one holding the push.
+#[test]
+fn a_stale_forks_re_base_and_its_segments_replay_make_the_same_index() {
+  let names =
+    |range: core::ops::Range<usize>| range.map(|k| format!("f{k:03}")).collect::<Vec<_>>();
+  let (first, line) = adding_files(Line::default(), &names(0..4));
+  let mut store = store();
+  let (mut index, _, _) = taken_counting(&first, &mut HgIndex::new(), &mut store, None);
+  let (pushed, _) = adding_files(line.clone(), &names(4..7));
+  let (other, _) = adding_files(line, &names(9..10));
+  let (records, stale, intaken) = segment_records_over(&pushed, &mut index, &mut store);
+  let (moved, _, _) = taken_counting(&other, &mut index, &mut store, None);
+  core::mem::replace(&mut index, moved)
+    .release(&mut store)
+    .unwrap();
+  let mut replayed = index.fork(&mut store).unwrap();
+  for bytes in &records {
+    crate::import::record::replay(bytes, &mut replayed, &mut store).unwrap();
+  }
+  let rebase = super::Rebase::begin(stale, &intaken, &mut index, &mut store)
+    .ok()
+    .unwrap();
+  let (mut rebased, again) = rebased(rebase, &mut store);
+  assert_eq!(again.changesets.len(), 3, "{again:?}");
+  assert_eq!(rows(&mut rebased, &store), rows(&mut replayed, &store));
+  for held in [rebased, replayed, index] {
+    held.release(&mut store).unwrap();
+  }
 }

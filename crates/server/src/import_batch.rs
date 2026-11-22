@@ -159,7 +159,8 @@ impl ImportBatch {
       let reserved = engine
         .history_reservation(&work)
         .saturating_add(engine.changes_reservation(&work));
-      let (outcome, mut applied) = engine.submit_resolved(&work);
+      // A work naming its texts (A-760, a Subversion revision's) gives the scratch member its runs' buffers as its files.
+      let (outcome, mut applied) = engine.submit_named(&mut work);
       let identity = holders.then(|| engine.head_identity());
       // Back into the green's numbering: the work's copies, and those its verdict records.
       in_numbering(&mut work, |version| version.checked_add(offset));

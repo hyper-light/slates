@@ -54,6 +54,14 @@ thread_local! {
 
 #[cfg(test)]
 thread_local! {
+  /// A test's kill of a batch's landing once its changeset is durable on the node's store and before its entry is
+  /// appended (A-760's crash oracle, main 01a20182's ruling of 2026-11-22 ~11:35): nothing after it runs, as after a
+  /// `kill -9`; it clears itself as it fires.
+  pub(crate) static KILL_BEFORE_ENTRY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
   /// A test's kill of a batch's landing after this many slices of its recorded apply (the sliced commit's crash test):
   /// nothing after it runs, as after a `kill -9`; it clears itself as it fires.
   pub(crate) static KILL_AT_COMMIT_SLICE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
@@ -281,14 +289,23 @@ impl Staging {
       if records.youngest() != head {
         return Err(Uncommitted::Diverged);
       }
-      let store = vcs_stores.content();
       batch
         .with_engine_in(greens, |engine| {
-          Building::new((records, store), engine, (&checked, plans)).build(head, work_identity)
+          Building::new(records, engine, (&checked, plans)).build(head, work_identity)
         })
         .ok_or(Uncommitted::NotHeld)?
     })?;
-    let post = u64::try_from(built.post_state.len()).unwrap_or(u64::MAX);
+    // The texts it names read before the scratch member judges it (A-760), and held as its post-state is.
+    let mut built = built;
+    super::read_named(state, &mut built)?;
+    let named = built
+      .named
+      .runs
+      .iter()
+      .fold(0u64, |total, run| total.saturating_add(run.len));
+    let post = u64::try_from(built.post_state.len())
+      .unwrap_or(u64::MAX)
+      .saturating_add(named);
     let growth = grown(&checked);
     crate::vcs_store::reserve_svn(state, repository, growth)
       .map_err(|available| Uncommitted::Budget { available })?;
@@ -356,8 +373,16 @@ impl Staging {
     };
     let records = std::mem::take(&mut self.records);
     let revisions = records.len();
+    // The changeset, every text the batch's entry names in its Payload, is durable before the entry is appended: so a
+    // named text outlives every entry naming it (A-760; `vcs_store::svn_texts::bring_back_named` relies on it).
     let landed =
       landing::land_changeset(&disk, (repository, sequence), records, &self.carried).await;
+    #[cfg(test)]
+    if KILL_BEFORE_ENTRY.with(std::cell::Cell::get) {
+      KILL_BEFORE_ENTRY.with(|kill| kill.set(false));
+      // A kill: nothing after it runs, as after a `kill -9` between the changeset and its entry.
+      std::future::pending::<()>().await;
+    }
     let recorded = crate::state::with_state(|state| {
       landed.and_then(|()| {
         if landing::next_sequence(state, repository) != sequence {
