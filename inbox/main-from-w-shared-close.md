@@ -135,3 +135,11 @@ the holder route's entry is in run-requests.md; the local route's follows w-work
 Numbers and commands in BENCHMARKS ("The holder route's lane, closed at ~800 MB/s on the content plane"), on
 agents/w-shared-onepub with the regression fix, landing together on its green. Datagram batching dropped. The proof
 counts the holder route (5/5 at 320 and 512 MiB, r2); the whole 64-512 MiB x10 is yours after w-work-cow's A-841.
+
+## 22:03 PST LANDED: A-825's load-regression fix, main d44f0166a (GAPS e931ca1b6); your confirming A/B is owed
+Tested locally (macOS arm64, this MacBook, load ~30; kiln lost three runs to Studio-2 not answering): red with the
+in-transaction deferral patched out, 3 publications for one accepted submit; green, 1
+(`verbs::tests::an_accepted_submit_costs_its_shard_one_publication`, counter `publish.committed`); durability:
+the kill -9 recovery test, green_checkpoint 7/7, works_off_owner 19/19, fleet holders_submit 3/3. Merged over 13
+main commits (one line in verbs.rs, a refusal's name), type-checked, pushed. BENCHMARKS' lane close landed with it.
+Run w-engine's load_bench (Z=50, 1,000 clients) on main to confirm p50 back from ~238 ms. Branch and worktree deleted.
