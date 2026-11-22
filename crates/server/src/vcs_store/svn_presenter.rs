@@ -13,7 +13,10 @@
 //! ([`super::svn_texts::HeadTexts`]): the green's held head text, else the content store's window (a text a commit
 //! stored, A-761), else the records' delta window. [`ViewHolds`] holds each text the content store keeps for as long as
 //! the view's volume holds the file, through the store's `hold` and `release`; a text the records keep lives as long as
-//! the repository's records do, which outlive its view.
+//! the repository's records do, which outlive its view. A stored text the content store let go (C2 stage B part 2 (b))
+//! is brought back whole through the node's store before the files naming it are written ([`ViewTurn::Bringing`]), so
+//! a view pins in RAM every stored text it shows for as long as it lives: reads that wait on the store need the vfs's
+//! referenced reads to wait (GAPS).
 //!
 //! **Nothing in the chunk store.** Every file of the view is a referenced file, the small ones a single made piece, so
 //! the volume holds no content in the shard's chunk store: a read of it is served while that store is lent to the
@@ -58,20 +61,25 @@ const FILE_MODE: u32 = 0o444;
 /// Format: why a configured hook is refused where no view can be shown (A-645 (a)): a hook is shown its repository as a
 /// view slates mounts in its store's granted directory, and this daemon was given none (`--vcs-store`). Answered with
 /// `SVN_ERR_UNSUPPORTED_FEATURE`, as the other hooks this server cannot run are; git's push says it in its reason.
+#[cfg(unix)]
 pub(crate) const UNGRANTED_WORDS: &str = "This server cannot run this repository's hooks: it holds no standing grant to show a hook its repository under (start it with --vcs-store)";
 
 /// Where a shard's hooks are shown their repository (`ShardState::hook_views`, A-645 (a)).
 #[derive(Clone, Debug, Default)]
 pub(crate) enum HookViews {
   /// No store directory was granted: no view can be shown, and a configured hook is refused, typed
-  /// ([`UNGRANTED_WORDS`]).
+  /// (`UNGRANTED_WORDS`, on Unix, where hooks run).
   #[default]
   Ungranted,
   /// The store's granted directory: the repository's view is presented and mounted there, read-only, and that mount is
-  /// the hook's `REPOS-PATH`.
+  /// the hook's `REPOS-PATH`. Its directory is read by `repos_for_hook` alone, which only Unix's hook driver calls: on
+  /// Windows no hook runs, and the variant says only that hooks could be shown (`HookViews::shows`).
+  #[cfg_attr(not(unix), allow(dead_code))]
   Granted(&'static slates_land::store_root::StoreRoot),
   /// A directory the caller made (the in-process hook tests' stand-in for a mounted view,
-  /// `Daemon::record_root_mount`): `REPOS-PATH` is the repository's name beneath it.
+  /// `Daemon::record_root_mount`): `REPOS-PATH` is the repository's name beneath it. Read by `repos_for_hook` alone, as
+  /// `Granted`'s directory is.
+  #[cfg_attr(not(unix), allow(dead_code))]
   Given(std::path::PathBuf),
 }
 
@@ -94,8 +102,6 @@ pub(crate) enum PresentRefusal {
   View(ViewRefusal),
   /// The volume refused a step.
   Volume(VfsError),
-  /// A revision file named a stored delta, which no piece can name (the source answered one; `WithTexts` never does).
-  DeltaPiece,
 }
 
 impl From<ViewRefusal> for PresentRefusal {
@@ -205,7 +211,6 @@ impl Presented {
               len: size,
             }
           }
-          FilePiece::Delta { .. } => return Err(PresentRefusal::DeltaPiece),
         });
       }
       laid
@@ -526,6 +531,7 @@ impl ViewSource<'_> {
       green: self.engine.as_deref(),
       store: self.store,
       records: self.records,
+      pieces: None,
     }
   }
 }
@@ -551,6 +557,7 @@ const UNSHOWN_WORDS: &str = "This server could not show this repository's hook i
 
 /// Format: the suffix of a view's mount point in the store's granted directory, after the repository's name: FSFS's
 /// own word for its repository.
+#[cfg(unix)]
 const MOUNT_POINT_SUFFIX: &str = ".svn";
 
 /// Format: the start of a view volume's name, before the repository's name and the number that routes the name to the
@@ -566,11 +573,19 @@ const REVISIONS_A_SLICE: usize = 1;
 pub(crate) struct ViewSlot {
   volume: slates_db::catalog::VolumeId,
   presented: Presented,
+  #[cfg(unix)]
   mount: Mount,
+  /// Revisions laid out whose files name a stored text the content store let go: written once it is brought back (C2
+  /// stage B part 2 (b)).
+  pending: Option<Laid>,
+  /// The texts brought back for `pending`, each holding one count of the content store until its files are written and
+  /// hold their own.
+  brought: Vec<Identity>,
 }
 
 /// Where a view is mounted.
 #[derive(Debug)]
+#[cfg(unix)]
 enum Mount {
   /// Nowhere yet.
   Unmounted,
@@ -583,6 +598,7 @@ enum Mount {
 /// The `REPOS-PATH` a hook of the repository `id`, named `name`, is handed, as `views` says (`HookViews`): the
 /// repository's view presented and mounted on its owner shard where the store's grant allows it; the name beneath a
 /// given directory for the in-process tests; refused in words, typed by the caller, where neither.
+#[cfg(unix)]
 pub(crate) async fn repos_for_hook(
   views: &HookViews,
   id: slates_db::catalog::RepositoryId,
@@ -605,6 +621,27 @@ pub(crate) async fn repos_for_hook(
   let Some((origin, owner)) = place else {
     return Err(format!("{UNSHOWN_WORDS}: its owner shard did not answer"));
   };
+  show(origin, owner, id).await?;
+  let name_for_mount = name;
+  crate::xshard::task_in_shard_time(
+    origin,
+    owner,
+    move || async move { mounted(root, id, &name_for_mount).await },
+    crate::daemon::LIVENESS_BUDGET_NS,
+  )
+  .await
+  .unwrap_or_else(|| {
+    Err(format!(
+      "{UNSHOWN_WORDS}: its owner shard did not answer its view's mount in time"
+    ))
+  })
+  .map(|path| path.to_string_lossy().into_owned())
+}
+
+/// Shows repository `id`'s view whole on its owner shard `owner`, asked from `origin`: its turns run until it is laid
+/// out and refreshed, each judged on its progress (module docs, "A hook's first view"), a stored text its next files
+/// name brought back between them where the content store let it go. Refused in words.
+async fn show(origin: u16, owner: u16, id: slates_db::catalog::RepositoryId) -> Result<(), String> {
   let mut last = None;
   let mut refreshed_from = 0;
   loop {
@@ -624,6 +661,7 @@ pub(crate) async fn repos_for_hook(
       ViewTurn::Shown => break,
       ViewTurn::Refreshing(next) => refreshed_from = next,
       ViewTurn::Laying(_) => {}
+      ViewTurn::Bringing(identity, len) => bring(origin, owner, id, (identity, len)).await?,
     }
     if last == Some(turn) {
       return Err(format!(
@@ -632,20 +670,52 @@ pub(crate) async fn repos_for_hook(
     }
     last = Some(turn);
   }
-  let name_for_mount = name;
-  crate::xshard::task_in_shard_time(
-    origin,
-    owner,
-    move || async move { mounted(root, id, &name_for_mount).await },
-    crate::daemon::LIVENESS_BUDGET_NS,
-  )
-  .await
-  .unwrap_or_else(|| {
-    Err(format!(
-      "{UNSHOWN_WORDS}: its owner shard did not answer its view's mount in time"
-    ))
+  Ok(())
+}
+
+/// Brings the stored text `identity` of `len` bytes back into the content store of the owner shard `owner` through the
+/// node's store, for the view of repository `id`, whose next files name it (C2 stage B part 2 (b)): its hold kept for
+/// the view's write (`ViewSlot::brought`). The task runs to its end, its waits the store's, which no wall deadline here
+/// judges (`xshard::task_to_its_end`). Refused in words where the store could not give it whole.
+async fn bring(
+  origin: u16,
+  owner: u16,
+  id: slates_db::catalog::RepositoryId,
+  (identity, len): (Identity, u64),
+) -> Result<(), String> {
+  let brought = crate::xshard::task_to_its_end(origin, owner, move || async move {
+    if !super::svn_texts::bring_whole(id, identity, len).await {
+      return false;
+    }
+    crate::state::with_state(|state| match state.svn_views.get_mut(&id) {
+      Some(slot) => {
+        slot.brought.push(identity);
+        true
+      }
+      // The view went meanwhile: what was brought is given back.
+      None => {
+        crate::repository::svn_commit::release_texts(state, None, &[identity]);
+        false
+      }
+    })
+    .unwrap_or(false)
   })
-  .map(|path| path.to_string_lossy().into_owned())
+  .await;
+  if brought == Some(true) {
+    return Ok(());
+  }
+  Err(format!(
+    "{UNSHOWN_WORDS}: a text of its history could not be read from the node's store"
+  ))
+}
+
+/// What one slice of a view's layout came to.
+enum Presenting {
+  /// Revisions written: whether every revision is shown.
+  Advanced(Advance),
+  /// The laid-out revisions name this stored text, of this length, which the content store let go: brought back before
+  /// they are written.
+  Bring(Identity, u64),
 }
 
 /// How far one turn of a hook's view ([`view_turn`]) took it: what the hook's shard judges its wait by.
@@ -657,6 +727,9 @@ enum ViewTurn {
   Refreshing(Revision),
   /// Shown and refreshed whole: ready to mount.
   Shown,
+  /// The next revisions' files name this stored text, of this length, which the content store let go: brought back
+  /// through the node's store before they are written (C2 stage B part 2 (b)).
+  Bringing(Identity, u64),
 }
 
 /// One turn of a hook's view, on its owner shard: the view's volume made where there is none, then its next revisions
@@ -672,7 +745,12 @@ fn view_turn(
   let quantum = slates_rt::futures::step_budget_ns().unwrap_or(state.config.runtime.step_budget_ns);
   let began = slates_rt::futures::now_ns();
   let spent = || slates_rt::futures::now_ns().saturating_sub(began) >= quantum;
-  while present_slice(state, id)? == Advance::More {
+  loop {
+    match present_slice(state, id)? {
+      Presenting::Advanced(Advance::More) => {}
+      Presenting::Advanced(_) => break,
+      Presenting::Bring(identity, len) => return Ok(ViewTurn::Bringing(identity, len)),
+    }
     if spent() {
       let written = state
         .svn_views
@@ -735,18 +813,23 @@ fn slot_for(
     ViewSlot {
       volume: crate::verbs::to_db_volume(volume),
       presented: Presented::new(),
+      #[cfg(unix)]
       mount: Mount::Unmounted,
+      pending: None,
+      brought: Vec::new(),
     },
   );
   Ok(())
 }
 
 /// Lays out and writes the view's next revision, the content store's chunks lent for the step (A-727) so a text it
-/// keeps is held; whether every revision is shown.
+/// keeps is held; whether every revision is shown. A layout naming a stored text the content store let go is kept, and
+/// the text asked to be brought back first (C2 stage B part 2 (b)); the holds the bringing took are given back once the
+/// files hold their own.
 fn present_slice(
   state: &mut crate::state::ShardState,
   id: slates_db::catalog::RepositoryId,
-) -> Result<Advance, String> {
+) -> Result<Presenting, String> {
   let green = crate::repository::svn_commit::green_of(state, id).ok();
   crate::vcs_store::lent_state(state, |state| {
     let crate::state::ShardState {
@@ -759,25 +842,40 @@ fn present_slice(
       ..
     } = state;
     let slot = svn_views.get_mut(&id).ok_or("the view is gone")?;
-    let laid = {
-      let records = vcs_stores
-        .subversion_records(id)
-        .ok_or("the repository's records are not here")?;
-      let engine = green.and_then(|green| greens.get(&green));
-      let texts = HeadTexts {
-        green: engine.as_deref(),
-        store: vcs_stores.content(),
-        records,
-      };
-      let source = slates_svn::migration::WithTexts {
-        records,
-        texts: &texts,
-      };
-      slot
-        .presented
-        .lay_out(&source, REVISIONS_A_SLICE)
-        .map_err(|refusal| format!("{refusal:?}"))?
+    let records = vcs_stores
+      .subversion_records(id)
+      .ok_or("the repository's records are not here")?;
+    let laid = match slot.pending.take() {
+      Some(laid) => laid,
+      None => {
+        let engine = green.and_then(|green| greens.get(&green));
+        let texts = HeadTexts {
+          green: engine.as_deref(),
+          store: vcs_stores.content(),
+          records,
+          pieces: None,
+        };
+        let source = slates_svn::migration::WithTexts {
+          records,
+          texts: &texts,
+        };
+        slot
+          .presented
+          .lay_out(&source, REVISIONS_A_SLICE)
+          .map_err(|refusal| format!("{refusal:?}"))?
+      }
     };
+    // A stored text the content store let go is brought back before the files naming it are written and held.
+    let content = vcs_stores.content();
+    let lacking = laid
+      .stored()
+      .iter()
+      .filter(|identity| !content.is_some_and(|content| content.contains(&ContentId(**identity))))
+      .find_map(|identity| Some((*identity, records.stored_len(identity)?)));
+    if let Some((identity, len)) = lacking {
+      slot.pending = Some(laid);
+      return Ok(Presenting::Bring(identity, len));
+    }
     let handle = *by_id.get(&slot.volume).ok_or("the view volume is gone")?;
     let held = volumes
       .get_mut(handle)
@@ -791,10 +889,18 @@ fn present_slice(
       store: vcs_stores.content_mut(),
       stored: &stored,
     };
-    slot
+    let written = slot
       .presented
       .write((&mut held.volume, store), root, laid, &mut holds)
-      .map_err(|refusal| format!("{refusal:?}"))
+      .map_err(|refusal| format!("{refusal:?}"));
+    // The files hold their own texts now: the holds the bringing took are given back.
+    let brought = std::mem::take(&mut slot.brought);
+    if let Some(content) = vcs_stores.content_mut() {
+      for identity in brought {
+        let _ = content.release(&ContentId(identity));
+      }
+    }
+    written.map(Presenting::Advanced)
   })
 }
 
@@ -827,6 +933,7 @@ fn refresh_slice(
     green: engine.as_deref(),
     store: None,
     records,
+    pieces: None,
   };
   let source = slates_svn::migration::WithTexts {
     records,
@@ -927,16 +1034,6 @@ async fn mount_once(
     )),
     Err(why) => Err(format!("{UNSHOWN_WORDS}: its view's mount helper {why}")),
   }
-}
-
-/// No hook runs on Windows yet (the hook driver is Unix's alone), so no view is mounted there.
-#[cfg(not(unix))]
-async fn mounted(
-  _root: &'static slates_land::store_root::StoreRoot,
-  _id: slates_db::catalog::RepositoryId,
-  _name: &str,
-) -> Result<std::path::PathBuf, String> {
-  Err(format!("{UNSHOWN_WORDS}: no hook runs on this platform"))
 }
 
 #[cfg(test)]

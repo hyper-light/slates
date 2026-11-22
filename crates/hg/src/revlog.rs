@@ -670,6 +670,18 @@ impl Outline {
     source.data(start, len, admission)
   }
 
+  /// The revision `rev`'s chunk is a delta against, its entry `entry` (7.2's `revlog.deltaparent`): none for a full
+  /// snapshot (its base itself), its base under generaldelta, else the revision before it.
+  pub fn delta_parent(&self, rev: u32, entry: &Entry) -> Option<u32> {
+    if entry.base == rev {
+      None
+    } else if self.general_delta {
+      Some(entry.base)
+    } else {
+      rev.checked_sub(1)
+    }
+  }
+
   /// Revision `rev`'s chunk, decompressed: a full text or a delta. Its bytes are charged to `admission` as they are
   /// made.
   pub fn chunk<S: Source>(

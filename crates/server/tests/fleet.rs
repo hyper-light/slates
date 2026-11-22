@@ -26,6 +26,50 @@
 
 use std::time::{Duration, Instant};
 
+/// The allocator calls each thread makes (85a, g228: a live entry's allocations on its owner, counted per shard thread
+/// so the count is exact whatever the host's load, as `slates-db`'s `live_fold_cost` counts a fold's).
+struct CountingAllocator;
+thread_local! {
+  // Const initialization and no destructor: observing an allocation never allocates recursively.
+  static ALLOCATOR_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+// SAFETY: forwards the allocator contract unchanged to the system allocator; the counter observes calls only.
+unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
+  unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+    ALLOCATOR_CALLS.set(ALLOCATOR_CALLS.get().wrapping_add(1));
+    // SAFETY: forwarded unchanged.
+    unsafe { std::alloc::System.alloc(layout) }
+  }
+  unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
+    // SAFETY: forwarded unchanged.
+    unsafe { std::alloc::System.dealloc(pointer, layout) }
+  }
+  unsafe fn realloc(&self, pointer: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+    ALLOCATOR_CALLS.set(ALLOCATOR_CALLS.get().wrapping_add(1));
+    // SAFETY: forwarded unchanged.
+    unsafe { std::alloc::System.realloc(pointer, layout, size) }
+  }
+}
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+/// The allocator calls each of `daemon`'s shard threads has made so far, in shard order.
+fn shard_allocations(daemon: &Daemon) -> Vec<u64> {
+  daemon
+    .shards()
+    .iter()
+    .map(|shard| {
+      daemon
+        .observation(Some(*shard), LIVENESS_BUDGET_NS, |_| ALLOCATOR_CALLS.get())
+        .unwrap()
+        .wait()
+        .unwrap()
+    })
+    .collect()
+}
+
 use rustls::pki_types::PrivateKeyDer;
 use slates_anchor::{AnchorSegment, Geometry};
 use slates_db::HostId;
@@ -16406,6 +16450,62 @@ const LIVE_ROUND: (&str, &str) = ("fleet.live.hop.round", "fleet.live.hop.round_
 /// Format: a holder's count of entries served and their nanoseconds, arrival to answer.
 const LIVE_HOLDER_HOP: (&str, &str) = ("fleet.live.hop.holder", "fleet.live.hop.holder_ns");
 
+/// Each hop timed once a timed `round`, the hops' nanoseconds adding up to the rounds' exactly, and each hop's
+/// `percentiles` ordered within its own time.
+fn hops_add_up_to_the_round(
+  hops: &[(u64, u64)],
+  round: (u64, u64),
+  percentiles: &[(u64, u64, u64)],
+) {
+  for (index, (timed, _)) in hops.iter().enumerate() {
+    assert_eq!(
+      *timed, round.0,
+      "hop {index} is timed once a timed round: {hops:?}, round {round:?}"
+    );
+  }
+  let summed = hops.iter().map(|(_, ns)| *ns).sum::<u64>();
+  assert_eq!(
+    summed, round.1,
+    "the hops' nanoseconds add up to the rounds': {hops:?}, round {round:?}"
+  );
+  for ((p50, p999, max), (_, ns)) in percentiles.iter().zip(hops) {
+    assert!(
+      *p50 <= *p999 && *p999 <= *max && *max <= *ns,
+      "each hop's percentiles are ordered within its own time: {percentiles:?}, sums {hops:?}"
+    );
+  }
+}
+
+/// Each live hop's per-write percentiles beside its sums (g228): (p50, p999, max) in nanoseconds, a hop at a time,
+/// read from the owner's status report, where they are published.
+fn hop_percentiles(client: &mut Client) -> Vec<(u64, u64, u64)> {
+  let ReplyBody::DaemonStatus { report } =
+    client.call(&RequestBody::DaemonStatus { memory: false })
+  else {
+    panic!("the owner reported its status");
+  };
+  let figure = |name: String| -> u64 {
+    report
+      .shards
+      .iter()
+      .flat_map(|shard| shard.refusals.iter())
+      .filter(|row| row.kind == name)
+      .map(|row| row.count)
+      .max()
+      .unwrap_or(0)
+  };
+  LIVE_HOPS
+    .iter()
+    .map(|(timed, _)| {
+      (
+        figure(format!("{timed}.p50_ns")),
+        figure(format!("{timed}.p999_ns")),
+        figure(format!("{timed}.max_ns")),
+      )
+    })
+    .collect()
+}
+
 /// §4.10 "Live shipping" (A-200's owed breakdown, A-396): do write a live-shipped volume over and over from one client,
 /// each write sent once the last was answered. Expect every write answered at durability, its round timed on the owner hop
 /// by hop (the build, the hop to the control shard, the lane, the exchange, the hop back), each hop counted once a timed
@@ -16460,41 +16560,40 @@ fn a_live_writes_round_is_counted_hop_by_hop_and_the_hops_add_up_to_it() {
     count(&daemons[0], LIVE_ROUND.0),
     count(&daemons[0], LIVE_ROUND.1),
   );
-  // Each hop's per-write percentiles beside its sums (g228): (p50, p999, max) in nanoseconds, a hop at a time.
-  // Read from the owner's status report, where they are published.
-  let ReplyBody::DaemonStatus { report } =
-    client.call(&RequestBody::DaemonStatus { memory: false })
-  else {
-    panic!("the owner reported its status");
-  };
-  let figure = |name: String| -> u64 {
-    report
-      .shards
-      .iter()
-      .flat_map(|shard| shard.refusals.iter())
-      .filter(|row| row.kind == name)
-      .map(|row| row.count)
-      .max()
-      .unwrap_or(0)
-  };
-  let percentiles: Vec<(u64, u64, u64)> = LIVE_HOPS
-    .iter()
-    .map(|(timed, _)| {
-      (
-        figure(format!("{timed}.p50_ns")),
-        figure(format!("{timed}.p999_ns")),
-        figure(format!("{timed}.max_ns")),
-      )
-    })
-    .collect();
+  let percentiles = hop_percentiles(&mut client);
+  // The build split into its steps (capture, seal, append, send; g228, 85a): timed for entries made in their
+  // publication's own turn, each step's nanoseconds within the build's.
+  let build_steps: Vec<(u64, u64)> = [
+    "fleet.live.hop.build.capture",
+    "fleet.live.hop.build.keys",
+    "fleet.live.hop.build.seal",
+    "fleet.live.hop.build.append",
+    "fleet.live.hop.build.send",
+  ]
+  .iter()
+  .map(|step| {
+    (
+      count(&daemons[0], step),
+      count(&daemons[0], &format!("{step}_ns")),
+    )
+  })
+  .collect();
   let holders: Vec<u64> = [&daemons[1], &daemons[2]]
     .iter()
     .map(|holder| count(holder, LIVE_HOLDER_HOP.0))
     .collect();
+  // A sealed volume's keys are unwrapped once and kept for its later publications (`seal_keys::BodyKeys`).
+  let body_keys = (
+    count(&daemons[0], "fleet.live.body_keys.kept"),
+    count(&daemons[0], "fleet.live.body_keys.fetched"),
+  );
   for daemon in daemons {
     daemon.stop();
   }
-  eprintln!("hops: (timed, ns) {hops:?}; round {round:?}; holders' serves {holders:?}");
+  eprintln!(
+    "hops: (timed, ns) {hops:?}; round {round:?}; build steps {build_steps:?}; body keys (kept, fetched) {body_keys:?}; \
+     holders' serves {holders:?}"
+  );
   assert!(
     replies
       .iter()
@@ -16502,23 +16601,7 @@ fn a_live_writes_round_is_counted_hop_by_hop_and_the_hops_add_up_to_it() {
     "every write of the loop is answered at durability: {replies:?}"
   );
   assert!(round.0 > 0, "rounds were timed: {round:?}");
-  for (index, (timed, _)) in hops.iter().enumerate() {
-    assert_eq!(
-      *timed, round.0,
-      "hop {index} is timed once a timed round: {hops:?}, round {round:?}"
-    );
-  }
-  let summed = hops.iter().map(|(_, ns)| *ns).sum::<u64>();
-  assert_eq!(
-    summed, round.1,
-    "the hops' nanoseconds add up to the rounds': {hops:?}, round {round:?}"
-  );
-  for ((p50, p999, max), (_, ns)) in percentiles.iter().zip(&hops) {
-    assert!(
-      *p50 <= *p999 && *p999 <= *max && *max <= *ns,
-      "each hop's percentiles are ordered within its own time: {percentiles:?}, sums {hops:?}"
-    );
-  }
+  hops_add_up_to_the_round(&hops, round, &percentiles);
   assert!(
     percentiles.iter().any(|(p50, _, _)| *p50 > 0),
     "the hops' medians were recorded: {percentiles:?}"
@@ -16526,6 +16609,127 @@ fn a_live_writes_round_is_counted_hop_by_hop_and_the_hops_add_up_to_it() {
   assert!(
     holders.iter().any(|served| *served > 0),
     "a holder's serves were timed: {holders:?}"
+  );
+  assert!(
+    body_keys.1 >= 1 && body_keys.0 > body_keys.1,
+    "the volume's keys were fetched and then kept for most publications: (kept, fetched) {body_keys:?}"
+  );
+  build_steps_within_the_build(&hops, &build_steps);
+}
+
+/// Every build step (timed, ns) in `build_steps` timed as often as each other, and their nanoseconds no more than the
+/// build's, the first of `hops`.
+fn build_steps_within_the_build(hops: &[(u64, u64)], build_steps: &[(u64, u64)]) {
+  let build_ns = hops.first().map_or(0, |(_, ns)| *ns);
+  let steps_timed = build_steps.first().map_or(0, |(timed, _)| *timed);
+  assert!(
+    steps_timed > 0 && build_steps.iter().all(|(timed, _)| *timed == steps_timed),
+    "every build step was timed, as often as each other: {build_steps:?}"
+  );
+  let steps_ns: u64 = build_steps.iter().map(|(_, ns)| ns).sum();
+  assert!(
+    steps_ns <= build_ns,
+    "the build's steps add up to no more than the build: {steps_ns} ns against {build_ns} ns ({build_steps:?})"
+  );
+}
+
+/// 85a's entry build (main's order, MEMORY SIZING: zero-alloc first): what a live write costs its owner node in allocator
+/// calls beyond a plain one. Do: on a formed three-node fleet, a plain and a live-shipped volume on the owner, each
+/// written in a warm-up and then a closed loop of writes of `BURST_WRITE_BYTES` (a request fits one ring slot), each answered (the live one at durability); count the
+/// allocator calls of every shard thread of the owner across each loop. Expect: every write answered, and the live loop
+/// costing more calls a write than the plain one (the count's non-vacuity); the difference a write is printed, the
+/// number the entry's build is cut against.
+#[test]
+fn a_live_writes_allocations_on_its_owner_are_counted_against_a_plain_ones() {
+  /// Shape: the writes of each loop, and of each warm-up.
+  const WRITES: u64 = 64;
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
+  let owner = daemons[0].instance().to_owned();
+  let mut client = Client::connect(&owner);
+  let mut volume = |name: &str, live: bool| {
+    let ReplyBody::Created { id } = client.call(&RequestBody::Create {
+      name: name.to_owned(),
+      size: SizeClass::Bounded {
+        limit: BURST_VOLUME_LIMIT,
+      },
+      names: NamePolicy::Exact,
+      require_locked: false,
+      base: None,
+    }) else {
+      panic!("{name} was created");
+    };
+    let attachment = write_attachment(&mut client, id);
+    if live {
+      let shipped = client.call(&RequestBody::LiveShip {
+        volume: id,
+        live_shipped: true,
+      });
+      assert!(
+        matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+        "{name} is live-shipped: {shipped:?}"
+      );
+    }
+    (id, attachment)
+  };
+  let plain = volume("plain-allocations", false);
+  let live = volume("live-allocations", true);
+  let mut write = |(id, attachment): (VolumeId, u64), round: u64| {
+    client.call(&RequestBody::FsWrite {
+      volume: id,
+      attachment,
+      path: "/counted".to_owned(),
+      bytes: vec![u8::try_from(round % 251).unwrap(); BURST_WRITE_BYTES],
+      mode: 0o644,
+    })
+  };
+  let mut answered = 0;
+  let mut counted = |target: (VolumeId, u64),
+                     write: &mut dyn FnMut((VolumeId, u64), u64) -> ReplyBody| {
+    for round in 0..WRITES {
+      write(target, round);
+    }
+    let before: Vec<Vec<u64>> = daemons.iter().map(shard_allocations).collect();
+    for round in 0..WRITES {
+      if matches!(write(target, round), ReplyBody::FsDone { .. }) {
+        answered += 1;
+      }
+    }
+    let after: Vec<Vec<u64>> = daemons.iter().map(shard_allocations).collect();
+    // Per node, per shard: the calls a write.
+    before
+      .iter()
+      .zip(&after)
+      .map(|(was, now)| {
+        was
+          .iter()
+          .zip(now)
+          .map(|(was, now)| now.saturating_sub(*was) / WRITES)
+          .collect::<Vec<u64>>()
+      })
+      .collect::<Vec<Vec<u64>>>()
+  };
+  let plain_split = counted(plain, &mut write);
+  let live_split = counted(live, &mut write);
+  let owner_total =
+    |split: &Vec<Vec<u64>>| split.first().map_or(0, |shards| shards.iter().sum::<u64>());
+  let (plain_calls, live_calls) = (owner_total(&plain_split), owner_total(&live_split));
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "allocator calls a write, per node (owner first) and shard: plain {plain_split:?}, live {live_split:?}; on the owner \
+     plain {plain_calls}, live {live_calls}: live shipping costs {} a write there",
+    live_calls.saturating_sub(plain_calls)
+  );
+  assert_eq!(
+    answered,
+    2 * WRITES,
+    "every write of both loops was answered"
+  );
+  assert!(
+    live_calls > plain_calls,
+    "a live write costs its owner more allocator calls than a plain one: live {live_calls}, plain {plain_calls}"
   );
 }
 
@@ -22887,6 +23091,66 @@ fn a_forward_waiting_for_its_lent_session_is_woken_by_its_return() {
     "each forward woken by the session's return: {before:?} then {after:?}"
   );
   assert_eq!(after.1, before.1, "no wait elapsed unwoken");
+}
+
+/// Lane (A) 3b, content ahead by identity (main's rulings of 2026-11-20 23:50 and 2026-11-21 00:52): a holder's submit
+/// names its increment, and the owner fetches what it lacks from the holder by identity on the content plane, storing
+/// it once, so the forward lane never carries the increment. Do: in a two-node `f = 1` fleet, A's green replicated by
+/// B, B's work writes an 8 MiB file and B submits. Expect: answered `Submitted` at version 2; the request B forwarded
+/// under 64 KiB (`merge.submit.forward_request_bytes`); the owner fetched the increment from B once
+/// (`merge.inputs.fetched_from_holder` 1, at least 8 MiB in `merge.inputs.fetched_from_holder_bytes`). Before, the
+/// request carried the increment's whole encoding (r21, 2026-11-21: at 320 MiB and above the lane resent it in place on
+/// silence until its bound and the submit was refused `Overloaded`).
+#[test]
+fn a_holders_submit_names_its_increment_and_the_owner_fetches_it_by_identity() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let mut owner = Client::connect(&instance_a);
+  let green = bench_green(&mut owner, &daemon_b, "by-identity-green");
+  let mut holder = Client::connect(daemon_b.instance());
+  let work = bench_work(&mut holder, green, "by-identity-work", 8 << 20);
+  let count = |name: &str| {
+    bench_counters([&daemon_a, &daemon_b])
+      .get(name)
+      .copied()
+      .unwrap_or(0)
+  };
+  let before = (
+    count("merge.submit.forward_request_bytes"),
+    count("merge.inputs.fetched_from_holder"),
+    count("merge.inputs.fetched_from_holder_bytes"),
+  );
+  let submitted = holder.call(&RequestBody::submit(work, Vec::new()));
+  let after = (
+    count("merge.submit.forward_request_bytes"),
+    count("merge.inputs.fetched_from_holder"),
+    count("merge.inputs.fetched_from_holder_bytes"),
+  );
+  assert!(
+    matches!(
+      submitted,
+      ReplyBody::Submitted {
+        version: Some(2),
+        ..
+      }
+    ),
+    "{submitted:?}"
+  );
+  let request_bytes = after.0 - before.0;
+  assert!(
+    request_bytes > 0 && request_bytes < 64 << 10,
+    "the forwarded request named the increment, {request_bytes} bytes"
+  );
+  assert_eq!(
+    after.1 - before.1,
+    1,
+    "the owner fetched the increment once"
+  );
+  assert!(
+    after.2 - before.2 >= 8 << 20,
+    "the owner fetched the increment's bytes from the holder: {}",
+    after.2 - before.2
+  );
 }
 
 /// Main's ruling on the lane (2026-11-20, A-697's release bench refused 320 MiB holder submits about half the time): a

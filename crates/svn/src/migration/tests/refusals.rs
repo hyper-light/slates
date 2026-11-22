@@ -7,7 +7,7 @@ use super::support::{
 };
 use crate::dump::{CopyFrom, DeltaBase, Digest, DumpError, Format, NodeAction, NodeHeader, Uuid};
 use crate::index::{IndexRefusal, NodeKind};
-use crate::migration::{Exporter, Importer, MigrationRefusal, Properties, Repository, Room};
+use crate::migration::{Exporter, Importer, MigrationRefusal, Properties, Room, Standalone};
 use crate::svndiff::{Instruction, SvndiffError, Window};
 
 /// The text the first revision gives `f`.
@@ -47,7 +47,7 @@ fn second_revision(nodes: &[Node]) -> Vec<u8> {
 }
 
 /// The refusal importing `dump` into a created repository meets, with the repository it leaves.
-fn refusal(dump: &[u8]) -> (MigrationRefusal, Repository) {
+fn refusal(dump: &[u8]) -> (MigrationRefusal, Standalone) {
   let mut repository = created();
   let refusal = import_whole(&mut repository, dump).expect_err("a refusal");
   (refusal, repository)
@@ -60,8 +60,10 @@ fn refused_as(dump: &[u8], expected: &MigrationRefusal, code: u32) {
   assert_eq!(refusal.subversion_code(), code, "{refusal:?}");
 }
 
-/// A-628 (refusals): do import a stream whose first revision is 2 into a created repository, and a stream of revision
-/// 0 into a repository holding revision 1. Expect `OutOfSequence` (`E160006`) both times, and nothing imported.
+/// A-628 (refusals) with C2 stage C's resume: do import a stream whose first revision is 2 into a created repository;
+/// into a repository holding revision 1, the same stream again, and a stream whose revision 1 is another (its log
+/// changed). Expect `OutOfSequence` (`E160006`) for the first; the same stream read through, nothing imported (a
+/// resume with nothing to add); the other refused `OutOfSequence` at revision 1, nothing imported.
 #[test]
 fn a_revision_that_does_not_continue_the_history_is_refused() {
   let mut skipping = Dump::new(Format::Two, None);
@@ -74,12 +76,24 @@ fn a_revision_that_does_not_continue_the_history_is_refused() {
   let mut repository = created();
   import_whole(&mut repository, &first_revision().bytes()).unwrap();
   let before = history(&repository);
-  let refusal = import_whole(&mut repository, &first_revision().bytes()).unwrap_err();
+  assert_eq!(
+    import_whole(&mut repository, &first_revision().bytes()),
+    Ok(())
+  );
+  assert_eq!(history(&repository), before, "the same stream read through");
+  let mut other = Dump::new(Format::Two, Some(VECTOR_UUID));
+  other
+    .revision(
+      0,
+      &properties(&[("svn:date", "2005-04-07T22:13:00.000000Z")]),
+    )
+    .revision(1, &properties(&[("svn:log", "another")]));
+  let refusal = import_whole(&mut repository, &other.bytes()).unwrap_err();
   assert_eq!(
     refusal,
     MigrationRefusal::OutOfSequence {
       expected: 2,
-      found: 0
+      found: 1
     }
   );
   assert_eq!(history(&repository), before);
@@ -363,7 +377,7 @@ fn a_refused_import_keeps_the_revisions_before_it_and_answers_again_the_same() {
   assert_eq!(refusal, MigrationRefusal::Stream(DumpError::Truncated));
   assert_eq!(refusal.subversion_code(), 200_003);
   assert_eq!(repository.youngest(), 1);
-  let again = importer.import(&mut repository, &whole, true).unwrap_err();
+  let again = repository.import(&mut importer, &whole, true).unwrap_err();
   assert_eq!(again, refusal);
   let mut fresh = created();
   import(&mut fresh, &whole, 1).unwrap();

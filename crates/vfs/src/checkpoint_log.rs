@@ -418,6 +418,27 @@ impl Journal {
     })
   }
 
+  /// What of a shard's recovery memories pages may be resident in, each as `(offset, len)` within its own memory, for
+  /// checkpoint memory `checkpoint_total` and log memory `log_total` bytes long: each checkpoint slot from its start as
+  /// far as it was written since last given back, and the log from its start as far as any frame reached (A-744's
+  /// split, main's ruling on w-sizing's option (a), 2026-11-21: a residency sweep reads only what can hold pages). Before
+  /// the first checkpoint commits, both slots whole as far as a predecessor may have written them.
+  pub fn written_ranges(&self, checkpoint_total: usize, log_total: usize) -> [(usize, usize); 3] {
+    let (first, second) = crate::recover::slots_of_memory(checkpoint_total);
+    let (committed, stale) = match self.committed {
+      Some(slot) => (
+        slot.slot(checkpoint_total),
+        slot.stale_slot(checkpoint_total),
+      ),
+      None => (first, second),
+    };
+    [
+      (committed.0, committed.1.min(self.committed_written)),
+      (stale.0, stale.1.min(self.stale_written)),
+      (0, log_total.min(self.log_written)),
+    ]
+  }
+
   /// Records what of the ranges [`Journal::dead_ranges`] last named was given back, each from the top down so a
   /// give-back may take them a slice at a time: of the stale slot, everything from `stale_from` bytes into it; of the
   /// log, everything from offset `log_from` (never below the tail). `None` records nothing for that region: a range the

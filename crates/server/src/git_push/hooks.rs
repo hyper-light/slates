@@ -463,6 +463,8 @@ fn admitted<P>(
     admitting: &mut None,
     restaging: &mut None,
     preparing: &mut None,
+    making_room: &mut None,
+    door: &mut None,
   };
   judge.admitted(command).is_ok()
 }

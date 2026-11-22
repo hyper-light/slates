@@ -26,7 +26,7 @@ use slates_db::catalog::{
   LandingState, LeaseRecord, LineageEdge, NamePolicy, PlacementState, PolicyRecord, Principal,
   Rights, Role, SizeClass, SnapshotId, SnapshotRecord, VolumeId, VolumeRecord, VolumeState,
 };
-use slates_db::partition::PartitionCaps;
+use slates_db::partition::{Partition, PartitionCaps};
 use slates_db::replay::{SnapshotPolicy, Tail, recover, snapshot_due};
 use slates_db::{Db, DbError, Op};
 use slates_machine::facts::Identity;
@@ -857,7 +857,10 @@ fn op_for_service(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
     Step::GreenCheckpoint(v, at) => Op::GreenCheckpointed {
       green: vid(pick(&ids.live, *v)?),
       version: *at,
-      checkpoint: at.to_be_bytes().to_vec(),
+      checkpoint: slates_db::partition::CheckpointRef {
+        identity: [u8::try_from(*at % 251).unwrap_or(0); 32],
+        len: *at,
+      },
     },
     // An adoption records a new green with its version 0 and every version up to the adopted one; the steps after it
     // advance, checkpoint and destroy it as any green, and a later origin of it is refused, never recorded.
@@ -1685,8 +1688,12 @@ fn snapshots_trim_the_log_and_recovery_restores_them_with_the_tail() {
 
 /// Shape: the bytes of each increment the checkpoint tests advance a green by.
 const INCREMENT_BYTES: usize = 100;
-/// Shape: the bytes of each checkpoint they take: less than what it folds, so the fold returns budget.
-const CHECKPOINT_BYTES: usize = 40;
+/// The checkpoint each of them takes, by its name (A-579): the partition charges its name's 40 bytes, less than what it
+/// folds, so the fold returns budget; the encoding's length is the content store's.
+const CHECKPOINT: slates_db::partition::CheckpointRef = slates_db::partition::CheckpointRef {
+  identity: [0xC0; 32],
+  len: 4096,
+};
 /// Shape: the increments the checkpoint tests' merge budget holds.
 const BUDGET_INCREMENTS: usize = 5;
 
@@ -1715,7 +1722,7 @@ fn checkpoint_at(version: u64) -> Op {
   Op::GreenCheckpointed {
     green: vid(CHECKPOINT_GREEN),
     version,
-    checkpoint: vec![0xC0; CHECKPOINT_BYTES],
+    checkpoint: CHECKPOINT,
   }
 }
 
@@ -1741,10 +1748,7 @@ fn a_checkpoint_returns_what_it_folds() -> (AnchorSegment, Db) {
     partition.green_chain(green),
     &[vec![3; INCREMENT_BYTES], vec![4; INCREMENT_BYTES]]
   );
-  assert_eq!(
-    partition.green_checkpoint(green),
-    Some((3, &[0xC0; CHECKPOINT_BYTES][..]))
-  );
+  assert_eq!(partition.green_checkpoint(green), Some((3, CHECKPOINT)));
   assert_eq!(partition.green_head(green), 5);
   db.mutate(&mut seg, &advance(5), 0).unwrap();
   db.mutate(&mut seg, &advance(6), 0).unwrap();
@@ -1890,7 +1894,7 @@ fn checkpoint_past_the_adoption(seg: &mut AnchorSegment, db: &mut Db) {
       &Op::GreenCheckpointed {
         green,
         version,
-        checkpoint: vec![0xC0; CHECKPOINT_BYTES],
+        checkpoint: CHECKPOINT,
       },
       0,
     );
@@ -1910,7 +1914,7 @@ fn checkpoint_past_the_adoption(seg: &mut AnchorSegment, db: &mut Db) {
     &Op::GreenCheckpointed {
       green,
       version: ADOPTED_AT + 1,
-      checkpoint: vec![0xC0; CHECKPOINT_BYTES],
+      checkpoint: CHECKPOINT,
     },
     0,
   )
@@ -2249,6 +2253,71 @@ fn a_tenants_key_is_erased_with_its_last_volume_on_the_partition() {
   drop(db);
   let recovered = open(&mut segment);
   assert!(!tenant_key(&recovered, first_account) && tenant_key(&recovered, other_account));
+}
+
+/// Shape: the destroys each half of the destroy-cost test times, and the times it takes the least of (noise falls away).
+const DESTROYS_TIMED: u64 = 64;
+/// Shape: the tries whose least time is the cost, so one preempted try does not decide.
+const DESTROY_TRIES: usize = 5;
+/// Shape: the other tenant's volumes the large partition holds beside the destroyed ones: 128 times the small
+/// partition's, so a destroy that walks the partition's volumes costs about that many times more.
+const OTHER_VOLUMES: u64 = 8_192;
+/// Shape: the most the large partition's destroys may cost against the small one's: well under the 128-fold a walk of
+/// the volumes gives, well over what an allocator's noise gives.
+const DESTROY_COST_RATIO_BOUND: u128 = 4;
+
+/// The least time, over [`DESTROY_TRIES`] fresh partitions holding `others` volumes of another tenant, of destroying
+/// [`DESTROYS_TIMED`] volumes of one tenant, one at a time.
+fn least_destroy_time(others: u64) -> std::time::Duration {
+  let caps = PartitionCaps {
+    volumes: 1 << 15,
+    timers: 1 << 15,
+    ..caps()
+  };
+  (0..DESTROY_TRIES)
+    .map(|_| {
+      let mut partition = Partition::new(caps, 0);
+      for n in 0..others {
+        let record = VolumeRecord {
+          owner: principal(1),
+          ..volume(100_000 + n, &format!("other-{n}"))
+        };
+        partition.apply(&Op::VolumeCreated { record }).unwrap();
+      }
+      for n in 1..=DESTROYS_TIMED {
+        let record = VolumeRecord {
+          owner: principal(0),
+          ..volume(n, &format!("mine-{n}"))
+        };
+        partition.apply(&Op::VolumeCreated { record }).unwrap();
+      }
+      let started = std::time::Instant::now();
+      for n in 1..=DESTROYS_TIMED {
+        partition
+          .apply(&Op::VolumeDestroyed { id: vid(n) })
+          .unwrap();
+      }
+      started.elapsed()
+    })
+    .min()
+    .unwrap()
+}
+
+/// A-802 (goal 86b's throughput: found by injection, 10,000 idle works pinning a 1,000-client run cut its verdicts from
+/// 6,513 to 2,506 a second and slowed every answer of the green's owner two to three times; the profile put the works'
+/// shards in `erase_volume_keys`). Do: destroy one tenant's volumes on a partition holding few volumes, and again on one
+/// also holding 8,192 volumes of another tenant. Expect: the destroys cost about the same (within
+/// `DESTROY_COST_RATIO_BOUND`). Before, each destroy collected every volume record of the partition to ask whether its
+/// tenant had one left, so its cost grew with the partition (with 100,000 works at the 100k rung, every work's destroy
+/// walked them all).
+#[test]
+fn a_destroys_cost_does_not_grow_with_the_partitions_other_volumes() {
+  let small = least_destroy_time(0);
+  let large = least_destroy_time(OTHER_VOLUMES);
+  assert!(
+    large.as_nanos() <= small.as_nanos().max(1) * DESTROY_COST_RATIO_BOUND,
+    "{DESTROYS_TIMED} destroys took {large:?} beside {OTHER_VOLUMES} other volumes against {small:?} alone"
+  );
 }
 
 /// A-291 (§4.10 "Ownership follows the writer"): do create a volume, record a snapshot of it and an attachment, release

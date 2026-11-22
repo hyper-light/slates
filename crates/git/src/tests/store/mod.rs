@@ -14,8 +14,9 @@ use crate::objects::tree::{Entry, Mode, compare, write_entries};
 use crate::store::learn::{Clock, Exchange};
 use crate::store::rows::{self, CommitRow, ObjectRow};
 use crate::store::{
-  Answered, COLLISION_WORDS, Entries, Found, GitNaming, Incoming, Move, NameRefused, Positions,
-  Progress, Push, PushRefused, Repository, StoreRefused, Turn, Upload, UploadCounters, Versions,
+  Answered, COLLISION_WORDS, Derived, Entries, Found, GitNaming, Incoming, Move, NameRefused,
+  Positions, Progress, Push, PushRefused, Repository, StoreRefused, Turn, Upload, UploadCounters,
+  Versions,
 };
 
 mod deltas;
@@ -165,9 +166,13 @@ fn push_and_move(
   let committed = admitted.and_then(|admitted| repository.commit(store, &mut push, &admitted));
   if committed.is_err() {
     abandon(push, store);
+  } else {
+    derive_all(repository, store);
   }
   committed
 }
+
+pub(super) use crate::served::derive_all;
 
 /// Abandons `push`, which a test's store always lets go of: a refusal here is the test's own failure.
 fn abandon(push: Push, store: &mut ContentStore) {
@@ -621,6 +626,7 @@ fn land(
 ) {
   let admitted = repository.admit(store, &push, green, Some(to)).unwrap();
   repository.commit(store, &mut push, &[admitted]).unwrap();
+  derive_all(repository, store);
 }
 
 /// A-722 part 3 (a push's rows written before it lands, its landing adopting them). Do: push the merge history, children
@@ -857,9 +863,11 @@ fn admitted_in_turns(
   }
 }
 
-/// A-722 part 4c (a move admitted a unit at a time). Do: push the wide history's first version and admit green 1's
-/// create of it whole and a unit a turn; land it; push its second version and admit green 1's fast-forward to it whole
-/// and a unit a turn. Expect: each move admitted a unit a turn the move admitted whole, over more turns than one.
+/// A-722 part 4c (a move admitted a unit at a time), A-614 amended (a create is admitted with no walk). Do: push the
+/// wide history's first version and admit green 1's create of it whole and a unit a turn; land it and derive its sets;
+/// push its second version and admit green 1's fast-forward to it whole and a unit a turn. Expect: each move admitted a
+/// unit a turn the move admitted whole; the create in one turn, walking nothing; the fast-forward, over sets known, its
+/// walk of what it brings over more turns than one.
 #[test]
 fn a_move_admitted_a_unit_a_turn_is_the_move_admitted_whole() {
   let format = ObjectFormat::Sha1;
@@ -868,17 +876,136 @@ fn a_move_admitted_a_unit_a_turn_is_the_move_admitted_whole() {
   let (first, second, c1, c2) = wide(format);
   let push = sealed(&repository, &mut store, first);
   let whole = repository.admit(&store, &push, 1, Some(c1.id)).unwrap();
+  let walked = repository.counters().walked;
   let (stepped, turns) = admitted_in_turns(&repository, &store, &push, (1, c1.id));
   assert_eq!(stepped, whole);
-  assert!(turns > 1, "{turns} turns");
+  assert_eq!((turns, repository.counters().walked), (1, walked));
   let mut push = push;
   repository.commit(&mut store, &mut push, &[whole]).unwrap();
+  derive_all(&repository, &mut store);
   let push = sealed(&repository, &mut store, second);
   let whole = repository.admit(&store, &push, 1, Some(c2.id)).unwrap();
   let (stepped, turns) = admitted_in_turns(&repository, &store, &push, (1, c2.id));
   assert_eq!(stepped, whole);
   assert!(turns > 1, "{turns} turns");
   push.abandon(&mut store).unwrap();
+  repository.release(&mut store).unwrap();
+  assert!(store.is_empty());
+}
+
+/// Shape: the commits of [`line_with_old_tags`]'s line: enough that a walk of it for each tag is many walks of it.
+const TAGGED_LINE: usize = 48;
+
+/// Shape: an annotated tag every this many commits along [`line_with_old_tags`]'s line.
+const TAG_EVERY: usize = 6;
+
+/// A line of [`TAGGED_LINE`] commits, each changing one file, and an annotated tag of every [`TAG_EVERY`]-th commit,
+/// oldest first: the line's objects, its tip, and the tags.
+fn line_with_old_tags(format: ObjectFormat) -> (Vec<Made>, ObjectId, Vec<Made>) {
+  let (mut objects, mut tags) = (Vec::new(), Vec::new());
+  let mut parent: Option<ObjectId> = None;
+  for at in 0..TAGGED_LINE {
+    let file = blob(format, format!("line {at}\n").as_bytes());
+    let root = tree(format, &[(Mode::File, b"file", file.id)]);
+    let made_commit = commit(
+      format,
+      root.id,
+      &parent.into_iter().collect::<Vec<_>>(),
+      1 + at as u64,
+    );
+    parent = Some(made_commit.id);
+    if at % TAG_EVERY == 0 {
+      let text = format!(
+        "object {}\ntype commit\ntag v{at}\ntagger A <a@example.com> {at} +0000\n\nv{at}\n",
+        made_commit.id
+      );
+      tags.push(made(format, Kind::Tag, text.into_bytes()));
+    }
+    objects.extend([file, root, made_commit]);
+  }
+  (objects, parent.unwrap(), tags)
+}
+
+/// A-614 amended (main's ruling (A) of 2026-11-21, its condition 2: a set derived on first read is sliced under the step
+/// budget and memoized; git/git's whole history, 1,027 refs mostly tags at old commits, was decided in about refs times
+/// history). Do: push a line of [`TAGGED_LINE`] commits as green 0's create, then in one push an annotated tag of every
+/// [`TAG_EVERY`]-th commit as the creates of greens 1 on; derive every version due a unit a turn, each turn's quantum
+/// none, keeping each as it comes; then derive each version again alone from nothing. Expect: the pushes walk nothing;
+/// more turns than versions; each version derived once, and each but the oldest tag's from a base found back along the
+/// line; fewer objects walked than twice the line holds (each segment once, where a walk from nothing a tag walks the
+/// line's history each); and every version's sets those derived from nothing.
+#[test]
+fn t_a614a_tags_at_old_commits_derive_each_from_the_one_before_a_unit_a_turn() {
+  let format = ObjectFormat::Sha1;
+  let mut store = store();
+  let mut repository = Repository::new(format);
+  let (line, tip, tags) = line_with_old_tags(format);
+  let line_objects = u64::try_from(line.len()).unwrap();
+  let mut push = sealed(&repository, &mut store, line);
+  let created = repository.admit(&store, &push, 0, Some(tip)).unwrap();
+  repository
+    .commit(&mut store, &mut push, &[created])
+    .unwrap();
+  let ids: Vec<ObjectId> = tags.iter().map(|tag| tag.id).collect();
+  let mut push = sealed(&repository, &mut store, tags);
+  let moves: Vec<Move> = (1..)
+    .zip(&ids)
+    .map(|(green, id)| repository.admit(&store, &push, green, Some(*id)).unwrap())
+    .collect();
+  repository.commit(&mut store, &mut push, &moves).unwrap();
+  assert_eq!(repository.counters().walked, 0, "the pushes walk nothing");
+  let before = repository.counters();
+  let mut deriving = repository.deriving_due(&store);
+  let (mut clock, mut turns) = (Ticking(0), 0usize);
+  loop {
+    turns += 1;
+    let quantum = crate::store::hook_view::Quantum {
+      clock: &mut clock,
+      ns: 0,
+    };
+    match repository
+      .derive_turn(&store, &mut deriving, quantum)
+      .unwrap()
+    {
+      Derived::More => {}
+      Derived::Sets {
+        green,
+        version,
+        sets,
+      } => repository
+        .keep_derived(&mut store, (green, version), &sets)
+        .unwrap(),
+      Derived::Done => break,
+    }
+  }
+  let after = repository.counters();
+  let versions = 1 + ids.len();
+  assert!(turns > versions, "{turns} turns for {versions} versions");
+  assert_eq!(after.derived - before.derived, versions as u64);
+  assert_eq!(after.bases_found - before.bases_found, ids.len() as u64);
+  let walked = after.walked - before.walked;
+  assert!(
+    walked < 2 * line_objects,
+    "{walked} objects walked, the line holds {line_objects}"
+  );
+  let known: Vec<(Positions, Positions)> = (0..u64::try_from(versions).unwrap())
+    .map(|green| {
+      (
+        repository.reached(&store, green, 0).unwrap(),
+        repository.brought(&store, green, 0).unwrap(),
+      )
+    })
+    .collect();
+  for (green, (reached, brought)) in (0..).zip(&known) {
+    repository.forget_derived(&mut store).unwrap();
+    let alone = repository.derive(&mut store, green, 0).unwrap();
+    assert_eq!(
+      (&alone.reached, &alone.brought),
+      (reached, brought),
+      "green {green}"
+    );
+  }
+  repository.forget_derived(&mut store).unwrap();
   repository.release(&mut store).unwrap();
   assert!(store.is_empty());
 }

@@ -149,6 +149,48 @@ pub(crate) fn sha1(bytes: &[u8]) -> Result<Node, CollisionAttack> {
   hasher.finish()
 }
 
+/// A node check whose text comes a piece at a time (A-767 C1, the push spin found by w-balance: a large revision is taken
+/// over a push's steps, a content window a step, so no step hashes more than a window): the lower parent and the higher
+/// hashed first, then each piece of the text in order, as [`check`] hashes them whole.
+pub struct Checking {
+  /// The node the parents and text must hash to.
+  node: Node,
+  /// The running hash.
+  hasher: Hasher,
+}
+
+impl Checking {
+  /// A check of `node` against parents `p1` and `p2`, no text hashed yet.
+  pub fn new(node: &Node, p1: &Node, p2: &Node) -> Checking {
+    let (low, high) = if p1 <= p2 { (p1, p2) } else { (p2, p1) };
+    let mut hasher = Hasher::new();
+    hasher.update(low);
+    hasher.update(high);
+    Checking {
+      node: *node,
+      hasher,
+    }
+  }
+
+  /// Hashes the text's next piece.
+  pub fn update(&mut self, piece: &[u8]) {
+    self.hasher.update(piece);
+  }
+
+  /// Whether the parents and the pieces hashed are the node, as [`check`] answers.
+  pub fn finish(self) -> Result<(), Refusal> {
+    let computed = self.hasher.finish()?;
+    if computed == self.node {
+      Ok(())
+    } else {
+      Err(Refusal::Mismatch {
+        claimed: self.node,
+        computed,
+      })
+    }
+  }
+}
+
 /// Checks that `node` is what `p1`, `p2` and `text` hash to.
 pub fn check(node: &Node, p1: &Node, p2: &Node, text: &[u8]) -> Result<(), Refusal> {
   let computed = compute(p1, p2, text)?;

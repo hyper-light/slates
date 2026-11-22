@@ -41,7 +41,7 @@ use super::super::site::{
 };
 use super::{
   HELD_SEED, HOLDER, Keys, ONE_SEAT, Peer, ROOM_BYTES, TICK_NS, Transcript, exec, query, send_data,
-  served_by, sign, transcript,
+  served_by, served_keyed, sign, transcript,
 };
 use crate::repository::hg_push::tests::{Commit, changegroup, history_of};
 use crate::repository::hg_push::{self, Pushing, line_name};
@@ -283,14 +283,6 @@ impl Repository for Probed {
   ) -> Result<Option<Node>, slates_hg::serve::Refusal> {
     Ok(None)
   }
-
-  fn tags_text(
-    &self,
-    _node: &Node,
-    _admission: &mut slates_hg::Admission,
-  ) -> Result<Vec<u8>, slates_hg::serve::Refusal> {
-    Err(slates_hg::serve::Refusal::Store { what: "tags" })
-  }
 }
 
 impl Store for Probed {
@@ -310,13 +302,12 @@ impl Store for Probed {
     Ok(None)
   }
 
-  fn file(
+  fn file_entry(
     &self,
     _path: &[u8],
     _node: &Node,
-    _room: &mut slates_hg::Admission,
-  ) -> Result<Option<Logged<'_>>, slates_hg::PastAdmission> {
-    Ok(None)
+  ) -> Option<slates_hg::serve::getbundle::FileEntry> {
+    None
   }
 
   fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
@@ -1488,17 +1479,58 @@ impl Repository for Grown {
   ) -> Result<Option<Node>, slates_hg::serve::Refusal> {
     Ok(None)
   }
-
-  fn tags_text(
-    &self,
-    _node: &Node,
-    _admission: &mut slates_hg::Admission,
-  ) -> Result<Vec<u8>, slates_hg::serve::Refusal> {
-    Err(slates_hg::serve::Refusal::Store { what: "tags" })
-  }
 }
 
 impl Store for Grown {
+  /// The test's changeset store answered at once (A-767 C1): each file revision kept as its whole (every file holds
+  /// [`Grown::bytes`]), its identity the plain BLAKE3 of the bytes, its chunk the bytes (a whole kept raw).
+  fn stored_now(
+    &self,
+    want: &slates_hg::render::Want,
+  ) -> Option<slates_hg::serve::getbundle::Given> {
+    use slates_hg::render::{StoredPlace, StoredRevision, Want};
+    use slates_hg::serve::getbundle::Given;
+    let identity = *blake3::hash(&self.bytes).as_bytes();
+    let len = u64::try_from(self.bytes.len()).ok()?;
+    Some(match want {
+      Want::Rows { logs } => Given::Rows(
+        logs
+          .iter()
+          .map(|(path, nodes)| {
+            nodes
+              .iter()
+              .map(|node| {
+                self
+                  .files
+                  .iter()
+                  .any(|(held, file)| held == path && file == node)
+                  .then_some(StoredRevision {
+                    text: identity,
+                    base: None,
+                    place: StoredPlace {
+                      payload: identity,
+                      offset: 0,
+                      len,
+                    },
+                  })
+              })
+              .collect()
+          })
+          .collect(),
+      ),
+      // A stored whole is its raw text (the store's contract, A-767 C1).
+      Want::Chunks { places } => Given::Chunks(places.iter().map(|_| self.bytes.clone()).collect()),
+      Want::Texts { texts, most } => {
+        let total = (self.bytes.len() as u64).saturating_mul(texts.len() as u64);
+        if total > *most {
+          Given::TextsPast
+        } else {
+          Given::Texts(texts.iter().map(|_| self.bytes.clone()).collect())
+        }
+      }
+    })
+  }
+
   fn changeset_text(
     &self,
     rev: Rev,
@@ -1533,23 +1565,17 @@ impl Store for Grown {
     }))
   }
 
-  fn file(
-    &self,
-    path: &[u8],
-    node: &Node,
-    _room: &mut slates_hg::Admission,
-  ) -> Result<Option<Logged<'_>>, slates_hg::PastAdmission> {
+  fn file_entry(&self, path: &[u8], node: &Node) -> Option<slates_hg::serve::getbundle::FileEntry> {
     let at = self
       .files
       .iter()
-      .position(|(held, file)| held == path && file == node);
-    Ok(at.map(|at| Logged {
+      .position(|(held, file)| held == path && file == node)?;
+    Some(slates_hg::serve::getbundle::FileEntry {
       position: 0,
       parents: [NULL_NODE, NULL_NODE],
       link: self.changesets[at],
       flags: 0,
-      text: Cow::Borrowed(self.bytes.as_slice()),
-    }))
+    })
   }
 
   fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
@@ -1743,6 +1769,61 @@ fn an_ssh_clone_past_many_windows_is_answered_whole() {
   );
 }
 
+/// Shape: the key time [`a_rekey_during_a_blocked_write_sends_no_byte_twice`] gives its sessions: a tenth of
+/// [`GROWN_PAUSE_MS`], so the session's timer comes due while the edge's write waits on a client that pauses.
+const REKEYING_KEY_TIME_NS: u64 = GROWN_PAUSE_MS * 1_000_000 / 10;
+
+/// The rekey write duplication (main 01a20182's order of 2026-11-21 21:35, found by reading): the edge's write raced
+/// the session's key timer, and a timer that came due while the write waited on the client's room dropped the write
+/// and wrote all its bytes again, the part the kernel had taken included. Do: over the edge, its sessions' keys replaced
+/// every [`REKEYING_KEY_TIME_NS`], clone [`Grown`] reading as OpenSSH reads with a reader slower than the wire
+/// ([`transcript_adjusting`]). Expect the whole answer, then exit-status 0, EOF and close: every packet opened, none
+/// sent twice (a byte sent twice fails the client's MAC and ends its read), and the session's keys exchanged again.
+#[test]
+fn a_rekey_during_a_blocked_write_sends_no_byte_twice() {
+  let grown: &'static Grown = Box::leak(Box::new(Grown::made()));
+  let head = *grown.changesets.last().expect("a head");
+  let (transcript, _) = served_keyed(
+    (ONE_SEAT, Some(REKEYING_KEY_TIME_NS)),
+    move || {
+      ToolSite::new(
+        Keys,
+        OneRepository,
+        ToolServices::new(
+          NoGit,
+          GrownLends(grown, Some((8 * GROWN_FILE as u64, 1_000_000))),
+          ThisShard,
+          room(),
+        ),
+      )
+    },
+    move |address| {
+      let mut peer = Peer::connect(address)?;
+      (query(&mut peer, &HELD_SEED)? == 60).then_some(())?;
+      (sign(&mut peer, &HELD_SEED)? == 52).then_some(())?;
+      exec(&mut peer, b"hg -R hg/r serve --stdio").then_some(())?;
+      send_data(&mut peer, &clone_request(&head));
+      let transcript = transcript_adjusting(&mut peer);
+      Some((transcript, peer.client.exchanges()))
+    },
+  );
+  let (transcript, exchanges) = transcript.expect("the session");
+  let sent = transcript.out.len();
+  assert!(
+    exchanges > 1,
+    "{exchanges} key exchanges: the keys were replaced during the answer"
+  );
+  assert_eq!(
+    (transcript.status, transcript.ended),
+    (Some(EXIT_STATUS), true),
+    "{sent} bytes of the answer read over {exchanges} key exchanges"
+  );
+  assert!(
+    sent > usize::try_from(GROWN_CHANGESETS).unwrap() * GROWN_FILE,
+    "{sent} bytes of the answer read"
+  );
+}
+
 /// A-745 (a stream refused past its start). Do: over the edge, clone [`Grown`] with each turn admitted a request's room
 /// alone, less than one of its files. Expect the session to end as 7.2's process ends on an abort: its words on standard
 /// error after the part of the answer already sent, and exit-status 255, never the 0 of a session that served.
@@ -1778,5 +1859,53 @@ fn an_ssh_answer_refused_past_its_start_exits_as_an_abort() {
     (Some(slates_hg::serve::stdio::FAILED_STATUS), true),
     "{}",
     String::from_utf8_lossy(&transcript.err)
+  );
+}
+
+/// A-724 piece 3c (§4.17.5 "What a repository costs, counted" and "Learned demand": every tool's intakes counted, so a
+/// Mercurial repository's pushes divide the shard's room with git's). Do: run stock 7.2's push over SSH through the
+/// daemon's lenders, as [`stock_7_2s_push_over_ssh_lands_through_the_daemons_lenders_as_7_2_answered_it`] does, and read
+/// the repository's usage row after. Expect: the push counted as one intake begun and answered, its principal named in
+/// the row's summary, and its bundle's bytes learned as the repository's next intake.
+#[test]
+fn a_mercurial_push_is_counted_and_learned_on_its_repositorys_usage_row() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let record =
+    crate::daemon::observe_first(&daemon, |state| drafted_history(state, "counted-over-ssh"));
+  let id = record.id;
+  let (sent, outcome) = mpsc::sync_channel(1);
+  crate::daemon::observe_first(&daemon, move |_state| {
+    let task = slates_rt::futures::spawn(async move {
+      let _ = sent.send(stock_push_session(&record).await);
+    })
+    .expect("the session's task");
+    slates_rt::futures::detach(task).expect("detached");
+  });
+  let channel = outcome.recv_timeout(PATIENCE).expect("the session ended");
+  let row = crate::daemon::observe_first(&daemon, move |state| {
+    state.vcs_usage.usage(&id).map(|row| {
+      (
+        row.intake.begun,
+        row.intake.answered,
+        row.learned(slates_vcs::Work::Intake).bytes_per_work(),
+        row
+          .principals()
+          .iter()
+          .any(|slot| slot.principal == owner()),
+      )
+    })
+  });
+  daemon.stop();
+  assert_eq!(
+    channel.expect("the session served").exited,
+    Some(EXIT_STATUS)
+  );
+  let Some((begun, answered, learned, named)) = row else {
+    panic!("the push left no usage row");
+  };
+  assert_eq!((begun, answered, named), (1, 1, true));
+  assert!(
+    learned.is_some_and(|bytes| bytes > 0),
+    "its bytes learned: {learned:?}"
   );
 }

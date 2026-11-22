@@ -890,6 +890,114 @@ fn a_burst_of_plain_statuses_arms_no_residency_sweep_and_a_memory_status_does() 
   }
 }
 
+/// §4.14, the memory report's figures for what a client wrote (w-sizing's report on 599603559, 2026-11-20: on macOS a
+/// status asking for the memory report read the arenas 0 MiB resident with a 256 MiB burst written, so R3's memory split
+/// came back empty; the arenas' figure was the last completed sweep's, and a sweep walking the shard's whole slice of
+/// the content object, tens of GiB at microseconds a page there, had not completed). Do: on a daemon, write
+/// [`BURST_BYTES`] into a volume, a MiB file at a time, each of bytes no page of another repeats; then ask a status for
+/// the memory report, which arms a sweep on the shards' idle time, and look again (as `slates status --memory` asked
+/// again does) until the report says the arenas are measured, within ten liveness budgets. Expect the `arenas` kind
+/// measured within that bound and holding the burst resident, within the report's tolerance
+/// ([`slates_ipc::protocol::MemoryKindReport::resident_bytes`]: pages the host has compressed or paged out are not
+/// resident), here at least seven eighths of the burst. Red on main before the fix: the sweep, walking every range of
+/// the shard's slice whole, 4 GiB of arena and 13 GiB of content object a shard here, never completed within the bound.
+#[test]
+// The look pauses between status requests, as the content-range sweep's own idle-time test does: the shards reach their
+// idle work between looks, which is the condition under test.
+#[allow(clippy::disallowed_methods)]
+fn a_memory_status_right_after_a_burst_reports_the_burst_resident_in_the_arenas() {
+  /// Shape: the burst w-sizing's run wrote before its status read 0.
+  const BURST_BYTES: usize = 256 << 20;
+  /// Shape: one file's bytes, a request's worth the ring carries whole.
+  const FILE_BYTES: usize = 1 << 20;
+  /// Shape: the share of the burst the host may have compressed or paged out by the time the report reads it (an
+  /// eighth), so the test holds the figure to the burst, not to an idle host.
+  const ALLOWED_AWAY: usize = 8;
+  /// Shape: the watch's bound, ten liveness budgets, as the sweep's own idle-time test bounds a whole sweep.
+  const WATCH: std::time::Duration =
+    std::time::Duration::from_nanos(10 * slates_server::daemon::LIVENESS_BUDGET_NS);
+  /// Shape: the pause between two looks: a hundredth of a liveness budget, long against a shard's idle spin.
+  const LOOK: std::time::Duration =
+    std::time::Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS / 100);
+  let (daemon, instance) = daemon("memory-burst");
+  // The burst through the SDK, which carries a MiB a request; the status through the test's own client.
+  let mut writer = slates_client::Client::connect(
+    &instance,
+    slates_client::Deadlines::derive(
+      slates_server::daemon::LIVENESS_BUDGET_NS,
+      slates_db::replay::RECOVERY_BUDGET_NS,
+    )
+    .get(),
+  )
+  .unwrap();
+  let id = writer
+    .create(&slates_client::CreateSpec {
+      name: "memory-burst".to_owned(),
+      size: SizeClass::Bounded {
+        limit: u64::try_from(BURST_BYTES * 2).unwrap(),
+      },
+      names: NamePolicy::Exact,
+      require_locked: false,
+      base: None,
+    })
+    .unwrap();
+  let attachment = writer.attach(id, None, Intent::Write).unwrap();
+  // Each file's bytes from a generator no page repeats, so nothing is shared or deduplicated.
+  let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+  for file in 0..BURST_BYTES / FILE_BYTES {
+    let mut bytes = Vec::with_capacity(FILE_BYTES);
+    while bytes.len() < FILE_BYTES {
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      bytes.extend_from_slice(&state.to_le_bytes());
+    }
+    writer
+      .fs_write(
+        (id, attachment.attachment),
+        &format!("burst-{file}.bin"),
+        &bytes,
+        0o644,
+      )
+      .unwrap();
+  }
+  let mut client = Client::connect(&instance);
+  let started = std::time::Instant::now();
+  let mut looks = 0u32;
+  let arenas = loop {
+    let ReplyBody::DaemonStatus { report } =
+      client.call(&RequestBody::DaemonStatus { memory: true })
+    else {
+      panic!("a memory status");
+    };
+    looks += 1;
+    let arenas = report
+      .memory
+      .iter()
+      .find(|kind| kind.kind == "arenas")
+      .cloned()
+      .unwrap();
+    if arenas.measured || started.elapsed() >= WATCH {
+      break arenas;
+    }
+    std::thread::sleep(LOOK);
+  };
+  let took = started.elapsed();
+  drop(client);
+  drop(daemon);
+  eprintln!(
+    "after a {BURST_BYTES}-byte burst, the arenas after {looks} looks in {took:?}: {arenas:?}"
+  );
+  assert!(
+    arenas.measured,
+    "the arenas measured within {WATCH:?}: {arenas:?}"
+  );
+  assert!(
+    arenas.resident_bytes >= u64::try_from(BURST_BYTES - BURST_BYTES / ALLOWED_AWAY).unwrap(),
+    "the burst resident in the arenas: {arenas:?}"
+  );
+}
+
 /// §4.7 "Shards poll rings while any client has activity within the measured idle window" (A-42): a shard
 /// spins before it parks only within the window its clients' last activity opened. Before 2026-09-29 the
 /// first client's handoff set its shard spinning before every park for good: an idle solo daemon went
@@ -4188,10 +4296,12 @@ fn role_store_verbs_part(
     grant: None,
     signature: None,
   };
-  let Refusal::Unsupported { feature } = refusal_of(client, &land) else {
-    panic!("land of a green");
+  // A green lands as any volume's landing, under a grant (A-774, A-774 part 3: "presented and granted as any volume's
+  // landing", R10), so it is judged as a landing, never refused by its role: here its target does not exist, refused
+  // typed by the target and writing nothing. Before A-774 a green's landing was refused `Unsupported`.
+  let Refusal::Target { .. } = refusal_of(client, &land) else {
+    panic!("a green's landing is judged as any volume's: refused by its missing target");
   };
-  assert!(feature.contains("landing"), "{feature}");
   let Refusal::Unsupported { feature } = refusal_of(client, &RequestBody::Snapshot { volume: w })
   else {
     panic!("snapshot of a work");

@@ -666,8 +666,10 @@ fn a745_reading_a_scattered_answer_reads_a_window_a_unit_never_the_whole_set() {
 /// times a fetch, 365 ms and 1.1 s, the watchdog killing the daemon once, each in a unit marking a part's wanted
 /// entries; module docs, **Slices**). Do: push one version of twelve windows' worth of files, encode it, and answer
 /// every other file one by one, its part read entry by entry; stream it a unit a turn. Expect: read back, exactly the
-/// files answered; no unit of marking read more than a window's worth of the part's entries in position order, where
-/// it had searched the whole order afresh for each of a window's worth of positions (about 11 reads each here).
+/// files answered; no unit of marking read more than a window's bytes of the part's entries in position order (an entry
+/// of the order and the entry it names each read), where it had searched the whole order afresh for each of a window's
+/// worth of positions (about 11 reads each here), and then read a window's worth of handles, sixteen times its window's
+/// bytes (a unit of 928 ms in a deepen of git v2.0.0).
 #[test]
 fn a745_marking_a_parts_wanted_entries_reads_a_window_a_unit() {
   let format = ObjectFormat::Sha1;
@@ -682,9 +684,13 @@ fn a745_marking_a_parts_wanted_entries_reads_a_window_a_unit() {
     wanted
   );
   assert_eq!(counters.parts_by_entry, 1, "{counters:?}");
+  // Shape: a window's bytes of reads, each an entry of the order (a `u32`) and the entry it names; or, for a unit's
+  // first search, what one whole search of the 1,536-entry order reads (twice its 11 bits, and two).
+  let reads = WINDOW / (size_of::<u32>() + size_of::<crate::store::fragment::Placed>());
+  let most = u64::try_from(reads.max(2 * 11 + 2)).unwrap();
   assert!(
-    counters.marks_read_most > 0 && counters.marks_read_most <= u64::try_from(handles).unwrap(),
-    "{counters:?}"
+    counters.marks_read_most > 0 && counters.marks_read_most <= most,
+    "{counters:?}, at most {most}"
   );
   repository.release(&mut store).unwrap();
 }
@@ -1039,7 +1045,7 @@ proptest! {
   #[test]
   fn every_answered_pack_reads_back_as_the_wanted_closure_less_the_clients(sha256 in any::<bool>(), ops in proptest::collection::vec(op(), 1..20), bases in proptest::collection::vec(any::<bool>(), 3), caps in proptest::collection::vec((any::<bool>(), any::<bool>(), 0u8..5, 0u8..3), 1..8)) {
     let format = if sha256 { ObjectFormat::Sha256 } else { ObjectFormat::Sha1 };
-    let mut real = Real { store: store(), repository: Repository::new(format), clock: Ticks(0) };
+    let mut real = Real::new(format);
     let mut model = Model::new(format);
     let half = ops.len() / 2;
     for (at, op) in ops.iter().enumerate() {

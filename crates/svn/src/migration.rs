@@ -50,6 +50,7 @@ mod import;
 mod paths;
 pub(crate) mod properties;
 mod records;
+mod standalone;
 
 #[cfg(test)]
 mod tests;
@@ -57,9 +58,10 @@ mod tests;
 pub use export::{Exporter, Exporting};
 pub use import::{Importer, Importing};
 pub use records::{
-  Before, Checked, DeltaWriter, Deltifiable, Properties, Repository, RevisionReplay, Room,
-  TextReading, TextSource, WithTexts, before,
+  Before, Checked, Properties, Repository, RevisionReplay, Room, TextReading, TextSource,
+  WithTexts, before,
 };
+pub use standalone::{Checked as StandaloneChecked, Standalone};
 
 use crate::commit::revision::StepRefusal;
 use crate::dump::{Digest, DumpError, Uuid};

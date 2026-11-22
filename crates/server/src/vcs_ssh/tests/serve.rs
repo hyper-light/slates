@@ -328,14 +328,35 @@ where
   C: FnOnce(SocketAddrV4) -> R + Send + 'static,
   R: Send + 'static,
 {
+  served_keyed((seats, None), make, client)
+}
+
+/// As [`served_by`], its sessions' keys replaced after `key_time_ns` where one is given (`EdgeState::with_key_time_ns`).
+fn served_keyed<S, M, C, R>(
+  (seats, key_time_ns): (usize, Option<u64>),
+  make: M,
+  client: C,
+) -> (R, Seen)
+where
+  S: SshSite + 'static,
+  S::Keys: Send + 'static,
+  M: Fn() -> S + Clone + Send + 'static,
+  C: FnOnce(SocketAddrV4) -> R + Send + 'static,
+  R: Send + 'static,
+{
   let runtime = runtime();
   let bounds = Bounds::of_shard(seats, ROOM_BYTES, TICK_NS);
   let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), bounds.backlog())
     .expect("a loopback listener");
   let address = listener.local_addr().expect("the listener's address");
+  let edge = EdgeState::new(bounds, HOST_SEED);
+  let edge = match key_time_ns {
+    Some(key_time_ns) => edge.with_key_time_ns(key_time_ns),
+    None => edge,
+  };
   let state = runtime
     .context()
-    .keep(EdgeState::new(bounds, HOST_SEED))
+    .keep(edge)
     .expect("the edge's state kept on its shard");
   runtime
     .spawn(async move {

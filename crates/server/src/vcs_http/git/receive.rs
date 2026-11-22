@@ -23,19 +23,29 @@
 //! client asks version 0 for a push (`remote-curl.c`'s `discover_refs` falls back from version 2 for any service but
 //! upload-pack).
 //!
-//! **Refusals.** A step that fails before any reply is answered with a status, and a reply it cuts short ends the
-//! connection: a request git's protocol does not allow `400`, one past the push's room `413`, memory the system refused
-//! or a store not held here `503`, a repository gone `404`, a policy git's matcher cannot read and an advertisement the
-//! writer refuses `500`. A command's own refusal is no failure: the report answers it, `200`, as `http-backend`'s does. A
-//! request that asks nothing (a flush alone, the probe stock git's client posts before a large push to learn whether it
-//! may, `remote-curl.c`'s `probe_rpc`) is answered with no report, as git's receive-pack writes none for it.
+//! **Refusals.** The reply's head, `200`, is written before the push's body is read, as `http-backend` writes its own
+//! (A-722's `StatusMode::AtHead`), so no step's refusal can be a status. One refused while the body is read cuts the
+//! connection short, as git's own does when its receive-pack dies while `http-backend` still pipes it the body. One
+//! refused once the body is read whole (its checks, its seal, its decision, its homing or landing, the wait for its
+//! records) ends the reply in git's words instead: [`crate::git_push::words`], the SSH site's wording, on band 3, git's
+//! band for a fatal error after which the stream ends (`sideband.c`'s "remote error"), when the client asked its answer
+//! multiplexed, or as git's report of a refused pack, `unpack <words>` and each command `ng` with them, when it asked a
+//! report without side-band-64k (`crate::git_push::ReceivePack::refused_report`); the reply ended cleanly either way,
+//! counted [`PUSH_REFUSED_AFTER_BODY`]. A refusal there once cut
+//! the connection too, which stock git reads as curl's error 18 with no word of why: a whole-history push of git/git
+//! refused past its room in its answer, 6 of 6 cut at 57 to 63 s (w-interop, 2026-11-21). A command's own refusal is no
+//! failure: the report answers it, as `http-backend`'s does. A request that asks nothing (a flush alone, the probe stock
+//! git's client posts before a large push to learn whether it may, `remote-curl.c`'s `probe_rpc`) is answered with no
+//! report, as git's receive-pack writes none for it.
 
 use slates_git::http::{Service, Version};
 use slates_git::pktline::{self, MAX_LEN, Packet};
 use slates_git::receive::Refusal;
+use slates_git::sideband::{self, Band};
 use slates_http::reply::Status;
 
 use super::{GitServices, ServiceRefused, Start};
+use crate::git_push::words::{self, NOT_SERVED};
 use crate::git_push::{Answering, PushFailed, ReceivePack, Unpresented};
 use crate::state::ShardState;
 use crate::vcs_http::{ClientGone, Exchange, Failed};
@@ -47,6 +57,10 @@ const KEEPALIVE: &[u8] = b"0005\x01";
 /// Format: the line git's receive-pack writes before its advertisement to a client asking protocol version 1
 /// (`receive-pack.c`, `cmd_receive_pack`).
 const VERSION_1: &[u8] = b"version 1\n";
+
+/// Counter: pushes refused once their body was read whole, whose reply ended in git's words (the module doc,
+/// "Refusals").
+pub(crate) const PUSH_REFUSED_AFTER_BODY: &str = "vcs_http.git.push_refused_after_body";
 
 /// Where receive-pack is lent its repository's owner shard's state, afresh for each step of a push (the module doc); the
 /// SSH site's receive-pack is lent it the same way (`crate::vcs_ssh`'s `receive`, A-683).
@@ -76,6 +90,59 @@ pub(crate) struct ReceiveServices<L> {
   lender: L,
   /// How long a push's answer may write nothing before git's keepalive is written (`DaemonConfig::git_keepalive_ns`).
   keepalive_ns: u64,
+}
+
+/// A homing or a landing in flight (R2), awaited no longer than the answer may stay silent (`silent_until`): what it
+/// carried, or none once the silence is up (its keepalive is written, and the wait goes on at the next turn).
+async fn carried_within(
+  waiting: &mut slates_rt::sync::ChannelReceiver<crate::git_push::Carried>,
+  silent_until: Option<u64>,
+) -> Result<Option<crate::git_push::Carried>, Cut> {
+  let unavailable = || Cut::Unserved;
+  let Some(until) = silent_until else {
+    return waiting.recv().await.map(Some).map_err(|_| unavailable());
+  };
+  let left = until.saturating_sub(slates_rt::futures::now_ns());
+  match slates_rt::futures::within(left, waiting.recv()).await {
+    Ok(Some(Ok(carried))) => Ok(Some(carried)),
+    Ok(None) => Ok(None),
+    Ok(Some(Err(_))) | Err(_) => Err(unavailable()),
+  }
+}
+
+/// The report held until the push's records are held at f + 1 (§4.8's commit rule; A-724 piece 8c): given once they
+/// are (true), refused when they are not within the commit's budget, or, once `silent_until` passes, left for the
+/// next turn (false) so git's keepalive is written meanwhile (R2).
+async fn held_report_given<L: ShardLender>(
+  lender: &mut L,
+  repository: slates_db::catalog::RepositoryId,
+  (held_report, given): (&mut Option<(Vec<u8>, u64)>, &mut Vec<u8>),
+  silent_until: Option<u64>,
+) -> Result<bool, Cut> {
+  let unavailable = || Cut::Unserved;
+  let began = held_report.as_ref().map_or(0, |(_, began)| *began);
+  let budget = crate::fleet::live_budget();
+  loop {
+    if lender
+      .lend(|state| crate::state_log::names_committed(state, repository))
+      .ok_or_else(unavailable)?
+    {
+      if let Some((report, _)) = held_report.take() {
+        given.extend_from_slice(&report);
+      }
+      return Ok(true);
+    }
+    if slates_rt::futures::now_ns().saturating_sub(began) >= budget.deadline_ns {
+      let _ = lender.lend(|state| state.count(crate::state_log::PUSH_UNCOMMITTED, 1));
+      return Err(unavailable());
+    }
+    if silent_until.is_some_and(|until| slates_rt::futures::now_ns() >= until) {
+      return Ok(false);
+    }
+    slates_rt::futures::sleep(budget.poll_interval_ns.max(1))
+      .await
+      .map_err(|_| unavailable())?;
+  }
 }
 
 impl<L> ReceiveServices<L> {
@@ -109,6 +176,7 @@ impl<L: ShardLender + Clone> GitServices for ReceiveServices<L> {
       .map_err(refused)?;
     Ok(Receive {
       lender: self.lender.clone(),
+      name: start.repository.name.clone(),
       push,
       advertise: start.advertise,
       given,
@@ -127,6 +195,8 @@ impl<L: ShardLender + Clone> GitServices for ReceiveServices<L> {
 pub(crate) struct Receive<L> {
   /// Where the shard's state is lent.
   lender: L,
+  /// The repository's name, for a refusal's words.
+  name: String,
   /// The push, between the edge's turns.
   push: ReceivePack,
   /// Whether the exchange is the advertisement.
@@ -184,19 +254,30 @@ impl<L: ShardLender> Exchange for Receive<L> {
       return Ok(());
     }
     let Self { lender, push, .. } = self;
-    lender
-      .lend(|state| push.end(state))
-      .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?
-      .map_err(failed)?;
+    let ended = match lender.lend(|state| push.end(state)) {
+      Some(Ok(_)) => Ok(()),
+      Some(Err(failure)) => Err(Cut::Failed(failure)),
+      None => Err(Cut::Unserved),
+    };
+    if let Err(cut) = ended {
+      self.cut(cut);
+      return Ok(());
+    }
     // A push under side-band-64k is answered here until its answer would have been silent for git's keepalive interval
     // since the exchange last wrote (its head, or a keepalive while its body was read), then in the reply's turns with
     // the keepalive between (the module doc); one without is answered here whole, as nothing can be written to it but
-    // its report. Either way a refusal before any reply still answers with a status.
+    // its report. Either way a refusal from here on ends the reply in git's words (the module doc, "Refusals").
     let silent_until = self
       .push
       .side_band()
       .then(|| self.last_written_ns.saturating_add(self.keepalive_ns));
-    self.answering = !self.answer_until(gone, silent_until).await?;
+    match self.answer_until(gone, silent_until).await {
+      Ok(answered) => self.answering = !answered,
+      Err(cut) => {
+        self.cut(cut);
+        return Ok(());
+      }
+    }
     // Not answered within the interval: its keepalive is due now, the reply's first run (R2: it was written only after
     // the reply's own interval more, so the first byte after the body came two intervals in, 10 s, the client's patience
     // in the edge tests, which failed 18 of 18 under load).
@@ -209,10 +290,14 @@ impl<L: ShardLender> Exchange for Receive<L> {
   async fn reply(&mut self, out: &mut Vec<u8>, gone: ClientGone<'_>) -> Result<bool, Failed> {
     if self.sent >= self.given.len() && self.answering {
       let silent_until = slates_rt::futures::now_ns().saturating_add(self.keepalive_ns);
-      let answered = self.answer_until(gone, Some(silent_until)).await?;
-      self.answering = !answered;
-      if !answered && self.sent >= self.given.len() {
-        self.given.extend_from_slice(KEEPALIVE);
+      match self.answer_until(gone, Some(silent_until)).await {
+        Ok(answered) => {
+          self.answering = !answered;
+          if !answered && self.sent >= self.given.len() {
+            self.given.extend_from_slice(KEEPALIVE);
+          }
+        }
+        Err(cut) => self.cut(cut),
       }
     }
     let rest = self.given.get(self.sent..).unwrap_or_default();
@@ -223,7 +308,37 @@ impl<L: ShardLender> Exchange for Receive<L> {
   }
 }
 
+/// Why a push whose body was read whole was refused (the module doc, "Refusals").
+enum Cut {
+  /// The driver refused it.
+  Failed(PushFailed),
+  /// Its shard was not lent, its carrying task could not be made or answered, or its records were not held at `f + 1`
+  /// within the commit's budget.
+  Unserved,
+}
+
 impl<L: ShardLender> Receive<L> {
+  /// Ends the reply to a push refused once its body was read whole, `cut`, in git's words (the module doc, "Refusals"):
+  /// on band 3 after what was given already, when the client asked its answer multiplexed, and otherwise as the report
+  /// `unpack <words>` with each command `ng`, when it asked a report; nothing more is answered.
+  fn cut(&mut self, cut: Cut) {
+    self.answering = false;
+    self.carrying = None;
+    self.held_report = None;
+    let _ = self
+      .lender
+      .lend(|state| state.count(PUSH_REFUSED_AFTER_BODY, 1));
+    let words = match cut {
+      Cut::Failed(failure) => words::failed(&failure, &self.name),
+      Cut::Unserved => NOT_SERVED.to_owned(),
+    };
+    if self.push.side_band() {
+      sideband::write(Band::Error, words.as_bytes(), &mut self.given);
+    } else if let Some(report) = self.push.refused_report(&words) {
+      self.given.extend_from_slice(&report);
+    }
+  }
+
   /// Answers the push a step at a time until it is answered (whether it is), or, once `silent_until` passes on the
   /// shard's clock with nothing new to give, until its next turn (A-722's keepalive): each step takes its repository's
   /// turn on the shard and keeps it through the yield after, so a repository's pushes share one turn a round (A-724,
@@ -232,11 +347,11 @@ impl<L: ShardLender> Receive<L> {
     &mut self,
     gone: ClientGone<'_>,
     silent_until: Option<u64>,
-  ) -> Result<bool, Failed> {
+  ) -> Result<bool, Cut> {
     // The client's going ends a hook's run alone, and no hook runs off unix.
     #[cfg(not(unix))]
     let _ = gone;
-    let unavailable = || Failed(Status::SERVICE_UNAVAILABLE);
+    let unavailable = || Cut::Unserved;
     let Self {
       lender,
       push,
@@ -251,54 +366,23 @@ impl<L: ShardLender> Receive<L> {
       // A homing or a landing in flight (R2): awaited no longer than the answer may stay silent, then its keepalive is
       // written and the wait goes on at the next turn.
       if let Some(waiting) = carrying.as_mut() {
-        let carried = match silent_until {
-          Some(until) => {
-            let left = until.saturating_sub(slates_rt::futures::now_ns());
-            match slates_rt::futures::within(left, waiting.recv()).await {
-              Ok(Some(Ok(carried))) => carried,
-              Ok(None) => return Ok(false),
-              Ok(Some(Err(_))) | Err(_) => return Err(unavailable()),
-            }
-          }
-          None => waiting.recv().await.map_err(|_| unavailable())?,
+        let Some(carried) = carried_within(waiting, silent_until).await? else {
+          return Ok(false);
         };
         *carrying = None;
         lender
           .lend(|state| push.homed(state, carried))
           .ok_or_else(unavailable)?;
       }
-      // The report held until the push's records are held at f + 1 (§4.8's commit rule; A-724 piece 8c): given once they
-      // are, refused when they are not within the commit's budget, git's keepalive written meanwhile (R2).
-      if let Some(began) = held_report.as_ref().map(|(_, began)| *began) {
-        let budget = crate::fleet::live_budget();
-        loop {
-          if lender
-            .lend(|state| crate::state_log::names_committed(state, repository))
-            .ok_or_else(unavailable)?
-          {
-            if let Some((report, _)) = held_report.take() {
-              given.extend_from_slice(&report);
-            }
-            return Ok(true);
-          }
-          if slates_rt::futures::now_ns().saturating_sub(began) >= budget.deadline_ns {
-            let _ = lender.lend(|state| state.count(crate::state_log::PUSH_UNCOMMITTED, 1));
-            return Err(unavailable());
-          }
-          if silent_until.is_some_and(|until| slates_rt::futures::now_ns() >= until) {
-            return Ok(false);
-          }
-          slates_rt::futures::sleep(budget.poll_interval_ns.max(1))
-            .await
-            .map_err(|_| unavailable())?;
-        }
+      if held_report.is_some() {
+        return held_report_given(lender, repository, (held_report, given), silent_until).await;
       }
       let turn = crate::vcs_share::turns::take(repository).await;
       let before = given.len();
       let step = lender
         .lend(|state| push.answer_step(state, given))
         .ok_or_else(unavailable)?
-        .map_err(failed)?;
+        .map_err(Cut::Failed)?;
       match step {
         Answering::Answered(_) => {
           // Acknowledged only once its records are held at f + 1 (§4.8's commit rule; A-724 piece 8c): the report goes
@@ -314,13 +398,10 @@ impl<L: ShardLender> Receive<L> {
           return Ok(true);
         }
         Answering::Turned => {
-          let due = silent_until.is_some_and(|until| slates_rt::futures::now_ns() >= until);
-          if due || *sent < given.len() && silent_until.is_some() {
-            return Ok(false);
-          }
-          turn.yield_holding().await;
           // The push's names and pack homed in the region, then landed on the node's store, before its record names
-          // them (A-724 piece 8c; A-767 C5), by a task of its own off the shard's step, awaited at the loop's top.
+          // them (A-724 piece 8c; A-767 C5), by a task of its own off the shard's step, awaited at the loop's top. Taken
+          // before the keepalive's return, so an ask made in the step the keepalive came due in is never left untaken
+          // (which refuses the push, C5 part 2b).
           if let Some(asked) = push.take_homing() {
             let (origin, shards) = lender
               .lend(|state| (state.shard, state.shards.clone()))
@@ -333,6 +414,11 @@ impl<L: ShardLender> Receive<L> {
             .map_err(|_| unavailable())?;
             *carrying = Some(outcome);
           }
+          let due = silent_until.is_some_and(|until| slates_rt::futures::now_ns() >= until);
+          if due || *sent < given.len() && silent_until.is_some() {
+            return Ok(false);
+          }
+          turn.yield_holding().await;
         }
         #[cfg(unix)]
         Answering::Hook(call) => {
@@ -342,7 +428,7 @@ impl<L: ShardLender> Receive<L> {
           lender
             .lend(|state| push.hook_ran(state, answer, given))
             .ok_or_else(unavailable)?
-            .map_err(failed)?;
+            .map_err(Cut::Failed)?;
         }
       }
     }
@@ -356,11 +442,15 @@ fn refused(failure: PushFailed) -> ServiceRefused {
     PushFailed::NoStore => ServiceRefused::Unavailable,
     PushFailed::Policy(_) => ServiceRefused::Unreadable,
     PushFailed::Exchange(_) | PushFailed::Unchecked => ServiceRefused::Unwritable,
-    PushFailed::Unlanded => ServiceRefused::Unavailable,
+    // Past a share or the snapshot's room (A-724 piece 3b): retryable, so the site's unavailable.
+    PushFailed::Unlanded | PushFailed::PastShare { .. } | PushFailed::PastSnapshot { .. } => {
+      ServiceRefused::Unavailable
+    }
   }
 }
 
-/// The status a push step that failed before any reply is answered with (the module doc, "Refusals").
+/// The status a push refused while its body is read fails with: the connection is cut short whatever it is, since the
+/// reply's head is out (the module doc, "Refusals").
 fn failed(failure: PushFailed) -> Failed {
   Failed(match failure {
     PushFailed::NotFound | PushFailed::NotGit => Status::NOT_FOUND,
@@ -368,6 +458,9 @@ fn failed(failure: PushFailed) -> Failed {
     PushFailed::Policy(_) => Status::INTERNAL_SERVER_ERROR,
     PushFailed::Unchecked => Status::BAD_REQUEST,
     PushFailed::Unlanded => Status::SERVICE_UNAVAILABLE,
+    // Past a share or the snapshot's room (A-724 piece 3b): retryable once other pushes end or the slot grows, never
+    // `413`, which says the push is too large for the server whatever else happens.
+    PushFailed::PastShare { .. } | PushFailed::PastSnapshot { .. } => Status::SERVICE_UNAVAILABLE,
     PushFailed::Exchange(refusal) => exchange_status(refusal),
   })
 }
@@ -389,3 +482,7 @@ fn exchange_status(refusal: Refusal) -> Status {
     Refusal::Advertisement(_) | Refusal::LineTooLong { .. } => Status::INTERNAL_SERVER_ERROR,
   }
 }
+
+#[cfg(test)]
+#[path = "../tests/receive.rs"]
+mod tests;

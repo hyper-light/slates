@@ -15,6 +15,10 @@
 # And `amended-root` (A-691): a root made public; a draft on it amended (a marker from the old changeset to the new, the
 # old one hidden), so both are draft roots 7.2 keeps; and another draft on the root made secret afterwards, so it stays
 # among the draft roots 7.2 keeps though its phase is secret.
+# And `hidden-tag` (A-767 C1, lookup's `.hgtags` through the store): a root made public; `seen` tagged at the root
+# in a changeset on it (a visible head whose `.hgtags` names `seen`); a draft on the root, and `hidden-only` tagged at
+# it in a changeset that is then pruned, so the only head whose `.hgtags` names `hidden-only` is hidden and the draft
+# below it a visible head with no `.hgtags`.
 # For each repository R:
 #   R/<path>            every file of .hg/store as stored (but `undo*` and `*.bck`): `phaseroots`, `obsstore` and, in
 #                       states-store, `bookmarks` among them
@@ -63,8 +67,17 @@ amendedroot() {
   printf 'c\n' > c; hg add -q c; hg commit -q -m 'draft root made secret'
   hg phase -q --secret --force -r .
 }
+hiddentag() {
+  printf 'a\n' > a; hg add -q a; hg commit -q -m 'public root'
+  hg phase -q --public -r .
+  hg tag -q -r 0 seen
+  hg update -q -r 0
+  printf 'b\n' > b; hg add -q b; hg commit -q -m 'draft to tag'
+  hg tag -q -r . hidden-only
+  hg debugobsolete -q "$(hg log -r . -T '{node}')"
+}
 hg version -q
-REPOS=(states states-store divergent amended-root)
+REPOS=(states states-store divergent amended-root hidden-tag)
 if [ $# -gt 1 ]; then shift; REPOS=("$@"); fi
 for repo in "${REPOS[@]}"; do
   MAKE=history
@@ -73,6 +86,7 @@ for repo in "${REPOS[@]}"; do
     states-store) EXTRA=(--config format.bookmarks-in-store=yes) ;;
     divergent) EXTRA=(); MAKE=divergence ;;
     amended-root) EXTRA=(); MAKE=amendedroot ;;
+    hidden-tag) EXTRA=(); MAKE=hiddentag ;;
     *) echo "make-state-fixtures.sh: no repository named $repo" >&2; exit 2 ;;
   esac
   export HGTEST_UUIDFILE="$WORK/uuid-$repo"

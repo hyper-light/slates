@@ -333,9 +333,12 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 58 (A-795): the S3 base removed (Ada, 2026-11-20: never asked for): `S3Base`, `S3Style`, `S3Scheme`, `S3Credentials` and
 /// their refusals (`NameRefused`, `EndpointFault`, `BucketFault`, `PrefixFault`), contract 46's, are gone, as are the
 /// wire's `CreateOverS3` and an import's `Pending` (their tags reserved: `RemovedCreateOverS3`, `RemovedPending`).
+/// 59 (C2 stage C): an import lands a Subversion dump's revisions a batch at a time, a batch atomic: the re-exported
+/// [`ImportFault`] gains `SubversionLanded` (appended), the refusal naming the last revision that landed, which the
+/// daemon sends in place of `Subversion`; the same dump imported again resumes after it (2026-11-21).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 58;
+pub const CONTRACT: u32 = 59;
 
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;

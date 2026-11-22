@@ -57,6 +57,7 @@ pub mod budgets;
 pub mod build_cost;
 pub mod clock;
 pub mod derived;
+pub mod descriptors;
 pub mod error;
 pub mod facts;
 pub mod log;
@@ -69,6 +70,7 @@ pub mod profile;
 pub mod segment;
 pub mod stats;
 pub mod switches;
+pub mod time_constraint;
 pub mod wake;
 
 pub use derived::Derived;

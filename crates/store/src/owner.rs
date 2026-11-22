@@ -23,7 +23,12 @@
 //! the abandoned bytes and recovery never sees them (a record verifies only with its trailer).
 //!
 //! **Ending.** When every handle is gone the owner checkpoints the engine at the log's end (so a restart replays
-//! nothing) and its thread returns; [`StoreOwner::stop`] joins it.
+//! nothing) and its thread returns; [`StoreOwner::stop`] joins it. A checkpoint that fails is logged.
+//!
+//! **A store that cannot open (goal 93; jupiter's red of 2026-11-21).** The owner never ends with no word: it logs the
+//! store's path and the open's reason once, and answers every request with [`StoreError::Unopened`] naming it until the
+//! daemon lets it go, so a repository's creation answers the store's own reason (the server's `StoreRefused`). Before,
+//! its thread ended at once, every request met a closed queue (`Gone`), and creations answered `Overloaded`.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -35,7 +40,7 @@ use crate::log::Section;
 use crate::log::{Header, Located, SectionKind};
 use crate::staging::{Identity, Staging};
 use crate::store::{Changeset, Contents, PIECE_BYTES, Sizing, Store, StoreError};
-use crate::texts::{TextCache, TextRow};
+use crate::texts::{Place, TextCache, TextRow};
 
 /// A landed changeset's section as a replay reads it: its kind, where its bytes are in the log and their length, and
 /// the bytes themselves when they fit one read piece ([`PIECE_BYTES`]: a record, a small `Texts`); a longer section is
@@ -50,6 +55,10 @@ pub struct SectionAt {
 
 /// A section of a landing: its kind and its bytes, moved in.
 pub type Part = (SectionKind, Vec<u8>);
+
+/// The rows a texts-by-tool ask answers: for each log asked, each tool id's text identity and row, none where it has
+/// none.
+type TextsAnswer = Result<Vec<Vec<Option<(Identity, TextRow)>>>, StoreError>;
 
 /// A request to the owner, with the channel its answer goes back on.
 enum Request {
@@ -118,6 +127,15 @@ enum Request {
     from: u64,
     limit: usize,
     answer: Sender<Result<Vec<(u64, Identity)>, StoreError>>,
+  },
+  TextsByTool {
+    repository: u128,
+    logs: Vec<(Vec<u8>, Vec<Vec<u8>>)>,
+    answer: Sender<TextsAnswer>,
+  },
+  Places {
+    places: Vec<Place>,
+    answer: Sender<Result<Vec<Vec<u8>>, StoreError>>,
   },
 }
 
@@ -220,6 +238,17 @@ impl fmt::Debug for Request {
         .field("repository", repository)
         .field("from", from)
         .finish_non_exhaustive(),
+      Request::TextsByTool {
+        repository, logs, ..
+      } => f
+        .debug_struct("TextsByTool")
+        .field("repository", repository)
+        .field("logs", &logs.len())
+        .finish_non_exhaustive(),
+      Request::Places { places, .. } => f
+        .debug_struct("Places")
+        .field("places", &places.len())
+        .finish_non_exhaustive(),
       Request::Read { offset, len, .. } => f
         .debug_struct("Read")
         .field("offset", offset)
@@ -269,6 +298,38 @@ impl StoreOwner {
   }
 }
 
+/// The refusal an unopened store answers a request with.
+fn unopened<T>(reason: &str) -> Result<T, StoreError> {
+  Err(StoreError::Unopened(reason.into()))
+}
+
+/// Answers every request with [`StoreError::Unopened`] naming `reason`, until every handle is gone: the owner of a store
+/// that could not be opened.
+fn refuse_all(incoming: &mut ChannelReceiver<Request>, reason: &str) {
+  while let Ok(request) = incoming.blocking_recv() {
+    match request {
+      Request::Begin { answer, .. } => drop(answer.try_send(unopened(reason))),
+      Request::Section { answer, .. } | Request::Part { answer, .. } => {
+        drop(answer.try_send(unopened(reason)))
+      }
+      Request::Commit { answer, .. } | Request::Land { answer, .. } => {
+        drop(answer.try_send(unopened(reason)))
+      }
+      Request::Dropped => {}
+      Request::Piece { answer, .. } | Request::Text { answer, .. } => {
+        drop(answer.try_send(unopened(reason)))
+      }
+      Request::Sections { answer, .. } => drop(answer.try_send(unopened(reason))),
+      Request::Read { answer, .. } => drop(answer.try_send(unopened(reason))),
+      Request::Changesets { answer, .. } => drop(answer.try_send(unopened(reason))),
+      Request::TextRow { answer, .. } => drop(answer.try_send(unopened(reason))),
+      Request::PathTexts { answer, .. } => drop(answer.try_send(unopened(reason))),
+      Request::TextsByTool { answer, .. } => drop(answer.try_send(unopened(reason))),
+      Request::Places { answer, .. } => drop(answer.try_send(unopened(reason))),
+    }
+  }
+}
+
 /// The owner's loop: open (recovering), then answer requests until every handle is gone, then checkpoint.
 fn serve(
   root: StoreRoot,
@@ -276,7 +337,20 @@ fn serve(
   mut incoming: ChannelReceiver<Request>,
   waiting: usize,
 ) -> Result<(), StoreError> {
-  let mut store = Store::open(root, sizing)?;
+  let at = root.target().key.clone();
+  let mut store = match Store::open(root, sizing) {
+    Ok(store) => store,
+    Err(error) => {
+      // Never ended with no word (goal 93, jupiter's red): the reason is logged once, and every request is answered with
+      // it until the daemon lets the owner go, so a creation names it rather than a gone owner or a busy shard.
+      let reason = error.to_string().into_boxed_str();
+      slates_machine::log_line!(
+        "slates-store: the version-control store at {at} could not be opened: {reason}; every request is refused with it"
+      );
+      refuse_all(&mut incoming, &reason);
+      return Err(error);
+    }
+  };
   // The owner lands bytes the request carries; nothing is staged on its side.
   let staging = Staging::new(0);
   // The texts the owner made from their chains (A-645's derived per-path read form), kept across requests, so a clone
@@ -411,6 +485,20 @@ fn serve(
       } => {
         let _ = answer.try_send(store.path_texts(repository, &path, from, limit));
       }
+      Request::TextsByTool {
+        repository,
+        logs,
+        answer,
+      } => {
+        let found: Result<Vec<Vec<_>>, StoreError> = logs
+          .iter()
+          .map(|(path, tool_ids)| store.texts_by_tools(repository, path, tool_ids))
+          .collect();
+        let _ = answer.try_send(found);
+      }
+      Request::Places { places, answer } => {
+        let _ = answer.try_send(store.places_bytes(&staging, &places));
+      }
       Request::Read {
         offset,
         len,
@@ -421,7 +509,13 @@ fn serve(
     }
   }
   store.abandon_landing();
-  store.checkpoint()
+  let checkpointed = store.checkpoint();
+  if let Err(error) = &checkpointed {
+    slates_machine::log_line!(
+      "slates-store: the version-control store at {at} ended without its checkpoint: {error}; a restart replays its log"
+    );
+  }
+  checkpointed
 }
 
 /// The owner's sliced landing, if one is open, and the landings held behind it.
@@ -684,6 +778,34 @@ impl StoreHandle {
         answers,
       )
       .await
+  }
+
+  /// For each log of `logs` (a path and the versions its tool names, Mercurial's nodes), each version in `repository`
+  /// as it landed ([`Store::text_by_tool`]), in order, none for one no landed changeset named. One batch for many logs,
+  /// so a stream asks by its room, never once a log (r20 on hg-src: about 12,000 asks, the serving shard idle half the
+  /// stream); bounded by what the asker's room holds.
+  pub async fn texts_by_tool(
+    &self,
+    repository: u128,
+    logs: Vec<(Vec<u8>, Vec<Vec<u8>>)>,
+  ) -> Result<Vec<Vec<Option<(Identity, TextRow)>>>, OwnerError> {
+    let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
+    self
+      .ask(
+        Request::TextsByTool {
+          repository,
+          logs,
+          answer,
+        },
+        answers,
+      )
+      .await
+  }
+
+  /// The bytes at each of `places` ([`Store::place_bytes`]), in order: a stream's chunks, read in place.
+  pub async fn places(&self, places: Vec<Place>) -> Result<Vec<Vec<u8>>, OwnerError> {
+    let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
+    self.ask(Request::Places { places, answer }, answers).await
   }
 
   /// A path's history in `repository` from sequence `from` on, at most `limit` ([`Store::path_texts`]).

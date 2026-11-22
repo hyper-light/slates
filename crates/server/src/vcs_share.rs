@@ -17,9 +17,18 @@
 //!
 //! **Demand, learned.** The asker claims what it holds and all the shard can admit, so its room is what the others'
 //! claims leave. Each other repository with intakes under way claims what it holds plus, for each intake, the bytes its
-//! answered intakes have brought on average (its usage row, `ShardState::vcs_usage`): its own measured traffic. One
+//! next intake is learned to bring (its usage row, `ShardState::vcs_usage`, A-724 piece 2's `slates_vcs::Rates`: the
+//! mean bytes of its answered intakes at the horizon that best predicted each of them, so a repository whose pushes grew
+//! claims their new size, not its lifetime's mean). One
 //! with no answered intake yet claims everything the shard can admit, its first value taken from the machine, never a
 //! literal. Weights are equal: the repository is the unit of fairness (§4.17.5).
+//!
+//! **Shares, published** (A-724 piece 2d). Once every repository taking new room has a working-set curve, memory is
+//! read from the shard's published grants ([`grants`]: the room divided by marginal utility at the learning cadence),
+//! never divided per request: the asker's memory room is its grant less what it holds, plus what is lendable (the
+//! spare, and the grants of repositories with no live work that they do not use), so a hot repository never takes a
+//! live small one's grant. A live repository with no curve yet (a newcomer) leaves memory divided per request as above,
+//! so no grant is promised twice. Counted [`BY_GRANTS`]. The snapshot slot is divided as above either way.
 //!
 //! **The cold trigger** (A-724 piece 4). What a repository holds counts its rebuildable values too (a git repository's
 //! kept fragments). Each claimant found holding more than its grant gives back, by §4.11's cost model
@@ -31,10 +40,13 @@
 //! its records' bytes of it, claims them and its traffic's mean, and its room is the lesser headroom; alone, the lesser
 //! of what the shard admits and what the slot has left ([`Bound::Snapshot`]).
 //!
-//! **Live intakes.** An intake is live from its start until its [`Live`] guard drops (the push answered, refused or
-//! abandoned however its edge ended), kept in a map of this shard's thread apart from its state, so a guard dropped
-//! while the state is borrowed still counts its end. One entry a repository with an intake under way, so bounded by
-//! the partition's repositories.
+//! **Live works.** An intake is live from its start until its [`Live`] guard drops (the push or commit answered,
+//! refused or abandoned however its edge ended); a fetch's answer is live while it holds its repository's generation
+//! ([`Live::fetch`], A-724 piece 3d: a fetch's room is a claim of its own). Every repository with a live work of either
+//! kind is a claimant in another's room, claiming what it holds plus, for each live work, what a work of that kind is
+//! learned to bring or use. Kept in a map of this shard's thread apart from its state, so a guard dropped while the state
+//! is borrowed still counts its end. One entry a repository with a work under way, so bounded by the partition's
+//! repositories.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -48,6 +60,8 @@ use crate::state::ShardState;
 pub(crate) const FAST: &str = "vcs_share.fast";
 /// Counter: rooms divided among repositories with intakes under way. Format: a counter name.
 pub(crate) const DIVIDED: &str = "vcs_share.divided";
+/// Counter: contested rooms whose memory was read from the published grants (A-724 piece 2d). Format: a counter name.
+pub(crate) const BY_GRANTS: &str = "vcs_share.by_grants";
 /// Counter: rooms the repository's share narrowed below what the shard could admit. Format: a counter name.
 pub(crate) const NARROWED: &str = "vcs_share.narrowed";
 
@@ -82,27 +96,49 @@ pub(crate) struct Room {
 }
 
 std::thread_local! {
-  /// Each repository's intakes under way on this shard's thread (module docs, "Live intakes").
-  static LIVE: RefCell<BTreeMap<RepositoryId, u64>> = const { RefCell::new(BTreeMap::new()) };
+  /// Each repository's works under way on this shard's thread, by kind (module docs, "Live intakes"): `[intakes,
+  /// fetches]`.
+  static LIVE: RefCell<BTreeMap<RepositoryId, [u64; 2]>> = const { RefCell::new(BTreeMap::new()) };
 }
 
-/// An intake under way, counted live until it drops (module docs).
+/// The slot of `work` in a repository's live counts.
+fn slot(work: Work) -> usize {
+  match work {
+    Work::Intake => 0,
+    Work::Fetch => 1,
+  }
+}
+
+/// A work under way, counted live until it drops (module docs): an intake ([`Live::begin`]) or a fetch's answer
+/// ([`Live::fetch`], A-724 piece 3d).
 #[derive(Debug)]
 pub(crate) struct Live {
   /// Its repository.
   repository: RepositoryId,
+  /// Its kind.
+  work: Work,
 }
 
 impl Live {
   /// Counts an intake of `repository`'s live.
   pub(crate) fn begin(repository: RepositoryId) -> Live {
+    Live::of(repository, Work::Intake)
+  }
+
+  /// Counts a fetch's answer of `repository`'s live (A-724 piece 3d: a fetch's room is a claim of its own).
+  pub(crate) fn fetch(repository: RepositoryId) -> Live {
+    Live::of(repository, Work::Fetch)
+  }
+
+  fn of(repository: RepositoryId, work: Work) -> Live {
     LIVE.with(|live| {
-      if let Ok(mut live) = live.try_borrow_mut() {
-        let count = live.entry(repository).or_insert(0);
+      if let Ok(mut live) = live.try_borrow_mut()
+        && let Some(count) = live.entry(repository).or_insert([0, 0]).get_mut(slot(work))
+      {
         *count = count.saturating_add(1);
       }
     });
-    Live { repository }
+    Live { repository, work }
   }
 }
 
@@ -110,10 +146,12 @@ impl Drop for Live {
   fn drop(&mut self) {
     LIVE.with(|live| {
       if let Ok(mut live) = live.try_borrow_mut()
-        && let Some(count) = live.get_mut(&self.repository)
+        && let Some(counts) = live.get_mut(&self.repository)
       {
-        *count = count.saturating_sub(1);
-        if *count == 0 {
+        if let Some(count) = counts.get_mut(slot(self.work)) {
+          *count = count.saturating_sub(1);
+        }
+        if counts.iter().all(|count| *count == 0) {
           live.remove(&self.repository);
         }
       }
@@ -121,12 +159,12 @@ impl Drop for Live {
   }
 }
 
-/// Each repository with intakes under way on this shard, and how many.
-fn live_intakes() -> Vec<(RepositoryId, u64)> {
+/// Each repository with works under way on this shard, and how many of each kind (`[intakes, fetches]`).
+fn live_works() -> Vec<(RepositoryId, [u64; 2])> {
   LIVE.with(|live| {
     live
       .try_borrow()
-      .map(|live| live.iter().map(|(id, count)| (*id, *count)).collect())
+      .map(|live| live.iter().map(|(id, counts)| (*id, *counts)).collect())
       .unwrap_or_default()
   })
 }
@@ -137,8 +175,8 @@ pub(crate) fn room(state: &mut ShardState, repository: RepositoryId) -> Room {
   // A-724 piece 8a: a push's record grows its partition's snapshot (today by about its pack), so the slot's room left
   // is a resource as memory is (`slates_db::replay::Db::snapshot_room`).
   let slot_room = state.db.snapshot_room(&state.segment);
-  let live = live_intakes();
-  let others: Vec<(RepositoryId, u64)> = live
+  let live = live_works();
+  let others: Vec<(RepositoryId, [u64; 2])> = live
     .iter()
     .copied()
     .filter(|(id, _)| *id != repository)
@@ -151,8 +189,8 @@ pub(crate) fn room(state: &mut ShardState, repository: RepositoryId) -> Room {
   let own_live = live
     .iter()
     .find(|(id, _)| *id == repository)
-    .map_or(0, |(_, count)| *count);
-  let mut claimants = vec![(repository, own_live.saturating_add(1))];
+    .map_or([0, 0], |(_, counts)| *counts);
+  let mut claimants = vec![(repository, own_live)];
   claimants.extend(others);
   let held: Vec<[u64; 2]> = claimants
     .iter()
@@ -170,7 +208,7 @@ pub(crate) fn room(state: &mut ShardState, repository: RepositoryId) -> Room {
     .iter()
     .zip(&held)
     .enumerate()
-    .map(|(at, ((id, intakes), held))| {
+    .map(|(at, ((id, works), held))| {
       let demand = if at == 0 {
         [
           held[0].saturating_add(admittable),
@@ -178,8 +216,8 @@ pub(crate) fn room(state: &mut ShardState, repository: RepositoryId) -> Room {
         ]
       } else {
         [
-          demand_of(state, *id, (held[0], *intakes), admittable),
-          demand_of(state, *id, (held[1], *intakes), slot_room),
+          demand_of(state, *id, (held[0], *works), admittable),
+          demand_of(state, *id, (held[1], *works), slot_room),
         ]
       };
       Claim {
@@ -189,31 +227,50 @@ pub(crate) fn room(state: &mut ShardState, repository: RepositoryId) -> Room {
     })
     .collect();
   let grants = divide(&capacity.map(amount_of), &claims);
+  // A-724 piece 2d: with every live claimant's curve divided in the shard's published grants, memory is read from them
+  // (module docs, "Shares, published"); a live repository with no curve yet leaves memory divided here, as before, so
+  // a newcomer is never given all the shard admits beside grants that already sum to the room.
+  let published = published_memory(state, &claimants);
+  let memory_grants: Vec<u64> = match &published {
+    Some((each, _)) => each.clone(),
+    None => grants
+      .iter()
+      .map(|grant| grant.granted.first().copied().map_or(0, whole_units))
+      .collect(),
+  };
   // The cold trigger (A-724 piece 4): each claimant holding more memory than its grant gives back what its rebuildable
   // values are worth giving back, by §4.11's cost model at its pressure (what it holds over its grant).
   for ((id, _), (grant, holding)) in claimants.iter().zip(
-    grants
+    memory_grants
       .iter()
-      .filter_map(|grant| grant.granted.first())
+      .copied()
       .zip(held.iter().map(|held| held[0])),
   ) {
-    let grant = whole_units(*grant);
     if holding > grant {
       let pressure = amount_of(holding) / amount_of(grant.max(1));
       crate::vcs_store::git_encode::relieve(state, *id, holding.saturating_sub(grant), pressure);
     }
   }
-  let own = grants
+  let mut own = grants
     .first()
     .map_or([0, 0], |grant| grant.granted.map(whole_units));
   let own_held = [
     held_by(state, repository),
     snapshot_held_by(state, repository),
   ];
-  let headroom = [
+  let mut headroom = [
     own[0].saturating_sub(own_held[0]),
     own[1].saturating_sub(own_held[1]),
   ];
+  if let Some((each, lendable)) = published {
+    state.count(BY_GRANTS, 1);
+    let grant = each.first().copied().unwrap_or(0);
+    own[0] = grant.saturating_add(lendable);
+    headroom[0] = grant
+      .saturating_sub(own_held[0])
+      .saturating_add(lendable)
+      .min(admittable);
+  }
   let shared = headroom[0].min(headroom[1]);
   if shared >= admittable.min(slot_room) {
     return alone(admittable, slot_room);
@@ -228,6 +285,44 @@ pub(crate) fn room(state: &mut ShardState, repository: RepositoryId) -> Room {
       held: own_held.get(binding).copied().unwrap_or(0),
     },
   }
+}
+
+/// The published memory grants of `claimants` ([`grants`]) and the room lendable beside them, when every one has a
+/// curve divided in them: each claimant's grant in order, and the spare plus every repository with no live work's grant
+/// it does not use (§4.17.5 "work-conserving": room a share leaves unused is lent). `None` when one has no curve or no
+/// grant yet, so its memory is divided per request among the live ones as before.
+fn published_memory(
+  state: &mut ShardState,
+  claimants: &[(RepositoryId, [u64; 2])],
+) -> Option<(Vec<u64>, u64)> {
+  let curved = claimants.iter().all(|(id, _)| {
+    state
+      .vcs_usage
+      .usage(id)
+      .is_some_and(|row| row.curve().is_some())
+  });
+  if !curved {
+    return None;
+  }
+  let now = slates_rt::futures::now_ns();
+  grants::current_at(state, now);
+  let published = &state.vcs_grants;
+  let each: Vec<u64> = claimants
+    .iter()
+    .map(|(id, _)| published.of(*id))
+    .collect::<Option<_>>()?;
+  let idle = state
+    .vcs_usage
+    .rows()
+    .map(|(id, _)| *id)
+    .filter(|id| !claimants.iter().any(|(live, _)| live == id))
+    .filter_map(|id| {
+      published
+        .of(id)
+        .map(|grant| grant.saturating_sub(held_by(state, id)))
+    })
+    .fold(0u64, u64::saturating_add);
+  Some((each, published.spare.saturating_add(idle)))
 }
 
 /// A repository's room with no other taking new room: all the shard can admit, or the snapshot slot's room left where
@@ -261,25 +356,33 @@ fn held_by(state: &ShardState, id: RepositoryId) -> u64 {
     .saturating_add(crate::vcs_store::git_encode::kept_bytes(state, id))
 }
 
-/// What repository `id` claims with `intakes` under way while it holds `held` (module docs, "Demand, learned"): what it
-/// holds plus its answered intakes' mean bytes for each, or plus all the shard can admit before any was answered.
+/// What repository `id` claims with `works` under way (`[intakes, fetches]`) while it holds `held` (module docs, "Demand,
+/// learned"): what it holds plus, for each live work, the bytes a work of its kind is learned to bring or use
+/// (`slates_vcs::Rates`, A-724 pieces 2 and 3d), or all the shard can admit for a kind none of whose works was answered
+/// yet.
 fn demand_of(
   state: &ShardState,
   id: RepositoryId,
-  (held, intakes): (u64, u64),
+  (held, works): (u64, [u64; 2]),
   admittable: u64,
 ) -> u64 {
-  let per_intake = state
-    .vcs_usage
-    .usage(&id)
-    .and_then(|row| {
-      let counts = row.work(Work::Intake);
-      counts.bytes_in.checked_div(counts.answered)
+  let learned = |work: Work| {
+    state
+      .vcs_usage
+      .usage(&id)
+      .and_then(|row| row.learned(work).bytes_per_work())
+      .unwrap_or(admittable)
+  };
+  [Work::Intake, Work::Fetch]
+    .into_iter()
+    .zip(works)
+    .filter(|(_, live)| *live > 0)
+    .fold(held, |claim, (work, live)| {
+      claim.saturating_add(learned(work).saturating_mul(live))
     })
-    .unwrap_or(admittable);
-  held.saturating_add(per_intake.saturating_mul(intakes))
 }
 
+pub(crate) mod grants;
 pub(crate) mod place;
 pub(crate) mod turns;
 

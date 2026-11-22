@@ -256,16 +256,33 @@ pub struct CapturedBase {
   pub snapshot: SnapshotId,
 }
 
-/// One green's checkpoint, as a snapshot carries it (W3; §4.16): the version it is the green's state at, and its
-/// encoding (`slates_merge::checkpoint`). The green's chain holds only the increments after `version`.
-#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+/// One green's checkpoint, as a snapshot carries it (W3; §4.16): the version it is the green's state at, and where its
+/// encoding (`slates_merge::checkpoint`) is held. The green's chain holds only the increments after `version`.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GreenCheckpoint {
   /// The green.
   pub green: VolumeId,
   /// The version it is the green's state at.
   pub version: u64,
-  /// The encoded checkpoint.
-  pub bytes: Vec<u8>,
+  /// Where the encoded checkpoint is held.
+  pub checkpoint: CheckpointRef,
+}
+
+/// Where a green's checkpoint is held (A-579's last step, on chain entry format 6's rule, A-825): the identity of the
+/// archive the owner shard's content store holds its encoding under, and the encoding's length. The partition keeps the
+/// name, never the bytes: a 1 GiB green's checkpoint copied into its record was 527 ms of one step's 650 to 1,063 ms
+/// (w-work-cow, 2026-11-21), and the store holds the bytes as it holds a version's increment.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointRef {
+  /// The held archive's manifest identity.
+  pub identity: [u8; 32],
+  /// The encoding's length in bytes.
+  pub len: u64,
+}
+
+impl CheckpointRef {
+  /// Format: what one checkpoint's name costs the partition's merge budget: its identity and its length, as recorded.
+  pub const RECORD_BYTES: usize = 32 + size_of::<u64>();
 }
 
 /// A green's origin as a reference (A-217): the base volume and snapshot it was walked from, and the BLAKE3 of the
@@ -303,6 +320,11 @@ pub struct Partition {
   caps: PartitionCaps,
   volumes: Slab<VolumeRecord>,
   by_id: Art<Handle<VolumeRecord>>,
+  /// How many volumes of each tenant the partition holds (A-802): what a destroy asks before it erases the tenant's
+  /// sealing key, kept with every volume record added and removed (`insert_volume`, `remove_volume`, the only two), so
+  /// derived again on a snapshot's restore. Bounded by the volumes. Before, a destroy collected every volume record to
+  /// ask, so its cost grew with the partition.
+  tenant_volumes: BTreeMap<u64, usize>,
   by_name: Art<Handle<VolumeRecord>>,
   snapshots: Slab<SnapshotRecord>,
   snapshot_index: Art<Handle<SnapshotRecord>>,
@@ -380,9 +402,10 @@ pub struct Partition {
   /// none), encoded, in commit order, so recovery replays them to rebuild the green. Bounded by `green_chain_bytes`
   /// against the cap.
   green_chains: BTreeMap<VolumeId, Vec<Vec<u8>>>,
-  /// Each checkpointed green's checkpoint (W3; §4.16): its version and its encoding, held in place of every increment
-  /// up to that version. Counted in `green_chain_bytes` against the same cap. Removed with the green.
-  green_checkpoints: BTreeMap<VolumeId, (u64, Vec<u8>)>,
+  /// Each checkpointed green's checkpoint (W3; §4.16): its version and where its encoding is held, in place of every
+  /// increment up to that version. Its name ([`CheckpointRef::RECORD_BYTES`]) is counted in `green_chain_bytes` against
+  /// the same cap; the encoding is the owner shard's content store's (A-579). Removed with the green.
+  green_checkpoints: BTreeMap<VolumeId, (u64, CheckpointRef)>,
   /// The snapshots captured as complete immutable bases (§4.15 `capture_base`, A-291): a clone of one is made with no
   /// base directory. Bounded by the snapshots (one entry a snapshot at most); an entry leaves with its snapshot or its
   /// volume.
@@ -411,6 +434,9 @@ pub struct Partition {
   /// acknowledged edit survives a daemon restart. Counted in `green_chain_bytes` against the same cap; a work's
   /// restatement (an accepted submit, a rebase) replaces its log, and its destroy reclaims it.
   work_logs: BTreeMap<VolumeId, Vec<Vec<u8>>>,
+  /// The largest work log held since start, bytes and entries ([`Partition::work_log_peak`]). A measure, not state:
+  /// not snapshotted.
+  work_log_peak: (usize, usize),
   /// Each green's origin held as a reference to its base snapshot (A-217): a few dozen bytes a green, whatever its
   /// tree, where `green_origins` held the whole tree's bytes. Removed with the green.
   green_origin_refs: BTreeMap<VolumeId, OriginRef>,
@@ -479,6 +505,8 @@ impl Partition {
       caps,
       volumes: Slab::new(caps.segment_slots, caps.volumes),
       by_id: Art::new(),
+      tenant_volumes: BTreeMap::new(),
+      work_log_peak: (0, 0),
       by_name: Art::new(),
       snapshots: Slab::new(caps.segment_slots, caps.snapshots),
       snapshot_index: Art::new(),
@@ -641,7 +669,7 @@ impl Partition {
       checkpoints: self
         .green_checkpoints
         .values()
-        .map(|(_, checkpoint)| checkpoint.len())
+        .map(|_| CheckpointRef::RECORD_BYTES)
         .fold(0, usize::saturating_add),
       work_logs: self.work_logs.len(),
       work_log_bytes: self
@@ -671,13 +699,10 @@ impl Partition {
     self.green_chains.get(&green).map_or(&[], Vec::as_slice)
   }
 
-  /// A green's checkpoint (W3; §4.16): the version it is the green's state at and its encoding, or `None` while the
-  /// green holds none (and for any non-green volume).
-  pub fn green_checkpoint(&self, green: VolumeId) -> Option<(u64, &[u8])> {
-    self
-      .green_checkpoints
-      .get(&green)
-      .map(|(version, bytes)| (*version, bytes.as_slice()))
+  /// A green's checkpoint (W3; §4.16): the version it is the green's state at and where its encoding is held, or `None`
+  /// while the green holds none (and for any non-green volume).
+  pub fn green_checkpoint(&self, green: VolumeId) -> Option<(u64, CheckpointRef)> {
+    self.green_checkpoints.get(&green).copied()
   }
 
   /// A green's head as its durable records hold it: its floor ([`Partition::green_floor`]) and the increments after it.
@@ -715,7 +740,7 @@ impl Partition {
     let held_bytes = self
       .green_checkpoints
       .get(&green)
-      .map_or(0, |(_, bytes)| bytes.len());
+      .map_or(0, |_| CheckpointRef::RECORD_BYTES);
     let chain = self.green_chain(green);
     let out_of_range = DbError::CheckpointOutOfRange {
       version,
@@ -732,17 +757,13 @@ impl Partition {
     Ok((folded, dropped.saturating_add(held_bytes)))
   }
 
-  /// The check of a green's checkpoint (W3): the green exists, the version is in range, and the bytes fit the merge
+  /// The check of a green's checkpoint (W3): the green exists, the version is in range, and its name fits the merge
   /// budget. A checkpoint no larger than what it releases is admitted at any fill, so a partition at its cap can
   /// always fold back under it.
-  fn check_green_checkpoint(
-    &self,
-    green: VolumeId,
-    version: u64,
-    bytes: usize,
-  ) -> Result<(), DbError> {
+  fn check_green_checkpoint(&self, green: VolumeId, version: u64) -> Result<(), DbError> {
     self.volume(green).ok_or(DbError::NotFound)?;
     let (_, released) = self.checkpoint_folds(green, version)?;
+    let bytes = CheckpointRef::RECORD_BYTES;
     if bytes <= released {
       return Ok(());
     }
@@ -751,7 +772,7 @@ impl Partition {
 
   /// Applies a green's checkpoint (W3): drops the increments up to its version and the checkpoint it replaces, and
   /// holds it. Unconditional, as every apply is: a version the check would refuse folds nothing it does not hold.
-  fn apply_green_checkpoint(&mut self, green: VolumeId, version: u64, bytes: &[u8]) {
+  fn apply_green_checkpoint(&mut self, green: VolumeId, version: u64, checkpoint: CheckpointRef) {
     let (folded, released) = self.checkpoint_folds(green, version).unwrap_or((0, 0));
     if let Some(chain) = self.green_chains.get_mut(&green) {
       chain.drain(..folded.min(chain.len()));
@@ -762,10 +783,8 @@ impl Partition {
     self.green_chain_bytes = self
       .green_chain_bytes
       .saturating_sub(released)
-      .saturating_add(bytes.len());
-    self
-      .green_checkpoints
-      .insert(green, (version, bytes.to_vec()));
+      .saturating_add(CheckpointRef::RECORD_BYTES);
+    self.green_checkpoints.insert(green, (version, checkpoint));
     // The green's log below the checkpoint is folded: its pointers to atomic records there go with it (A-642).
     self.repositories.fold_atomic(green, version);
   }
@@ -897,10 +916,7 @@ impl Partition {
     self.seal_keys.remove(&SealKeyOwner::Lineage { volume: id });
     self.seal_keys.remove(&SealKeyOwner::Naming { volume: id });
     if let Some(account) = tenant
-      && !self
-        .volumes()
-        .iter()
-        .any(|volume| volume.owner.tenant() == account)
+      && !self.tenant_volumes.contains_key(&account)
     {
       self.seal_keys.remove(&SealKeyOwner::Tenant { account });
     }
@@ -1918,11 +1934,7 @@ impl Partition {
         self.volume(*work).ok_or(DbError::NotFound)?;
         self.merge_bytes_fit(self.work_log_bytes(*work), entry.len())
       }
-      Op::GreenCheckpointed {
-        green,
-        version,
-        checkpoint,
-      } => self.check_green_checkpoint(*green, *version, checkpoint.len()),
+      Op::GreenCheckpointed { green, version, .. } => self.check_green_checkpoint(*green, *version),
       Op::GreenOriginated { green, origin } => {
         self.volume(*green).ok_or(DbError::NotFound)?;
         self.check_version_zero_unrecorded(*green)?;
@@ -2776,6 +2788,7 @@ impl Partition {
       Op::WorkLogged { work, entry } => {
         self.green_chain_bytes = self.green_chain_bytes.saturating_add(entry.len());
         self.work_logs.entry(*work).or_default().push(entry.clone());
+        self.note_work_log(*work);
         Ok(())
       }
       Op::WorkRestated { work, entry } => {
@@ -2785,6 +2798,7 @@ impl Partition {
           .saturating_sub(released)
           .saturating_add(entry.len());
         self.work_logs.insert(*work, vec![entry.clone()]);
+        self.note_work_log(*work);
         Ok(())
       }
       Op::GreenCheckpointed {
@@ -2792,10 +2806,25 @@ impl Partition {
         version,
         checkpoint,
       } => {
-        self.apply_green_checkpoint(*green, *version, checkpoint);
+        self.apply_green_checkpoint(*green, *version, *checkpoint);
         Ok(())
       }
     }
+  }
+
+  /// Notes `work`'s log as it stands after an entry, if it is the largest this partition has held (A-806's measure).
+  fn note_work_log(&mut self, work: VolumeId) {
+    let bytes = self.work_log_bytes(work);
+    if bytes > self.work_log_peak.0 {
+      let entries = self.work_logs.get(&work).map_or(0, Vec::len);
+      self.work_log_peak = (bytes, entries);
+    }
+  }
+
+  /// The largest work log this partition has held since it started, its bytes and its entries then (A-806's measure: a
+  /// work log that grows with one work's history is unbounded growth).
+  pub fn work_log_peak(&self) -> (usize, usize) {
+    self.work_log_peak
   }
 
   /// The bytes a work's log holds now.
@@ -2871,8 +2900,11 @@ impl Partition {
     let id = record.id;
     let name = record.name.clone();
     let lease = record.lease.clone();
+    let tenant = record.owner.tenant();
     let h = self.volumes.insert(record)?;
     self.by_id.insert(&id.bytes, h);
+    let held = self.tenant_volumes.entry(tenant).or_insert(0);
+    *held = held.saturating_add(1);
     self.by_name.insert(name.as_bytes(), h);
     if let Some(lease) = lease {
       self.index_lease(id, &lease)?;
@@ -2894,6 +2926,13 @@ impl Partition {
     let h = self.by_id.remove(&id.bytes).ok_or(DbError::NotFound)?;
     let record = self.volumes.remove(h)?;
     self.by_name.remove(record.name.as_bytes());
+    let tenant = record.owner.tenant();
+    match self.tenant_volumes.get_mut(&tenant) {
+      Some(held) if *held > 1 => *held = held.saturating_sub(1),
+      _ => {
+        self.tenant_volumes.remove(&tenant);
+      }
+    }
     if let Some(lease) = &record.lease {
       self.leases_by_holder.remove(&lease.holder.key());
     }
@@ -2916,8 +2955,13 @@ impl Partition {
     self.carried.remove(&id);
     // A destroyed green leaves the namespace that bound it (§4.17.1, A-515).
     self.repositories.green_removed(id);
-    // A destroyed green's merge chain is reclaimed with it (its increments can never be replayed for
-    // a volume that no longer exists), returning its bytes to the chain budget.
+    self.reclaim_chains_of(id);
+    Ok(())
+  }
+
+  /// A destroyed volume's merge records reclaimed with it, their bytes returned to the chain budget: a green's chain,
+  /// origin and checkpoint (its increments can never be replayed for a volume that no longer exists), and a work's log.
+  fn reclaim_chains_of(&mut self, id: VolumeId) {
     if let Some(chain) = self.green_chains.remove(&id) {
       let bytes: usize = chain.iter().map(Vec::len).sum();
       self.green_chain_bytes = self.green_chain_bytes.saturating_sub(bytes);
@@ -2927,15 +2971,15 @@ impl Partition {
     }
     self.green_origin_refs.remove(&id);
     self.green_adoptions.remove(&id);
-    if let Some((_, checkpoint)) = self.green_checkpoints.remove(&id) {
-      self.green_chain_bytes = self.green_chain_bytes.saturating_sub(checkpoint.len());
+    if self.green_checkpoints.remove(&id).is_some() {
+      self.green_chain_bytes = self
+        .green_chain_bytes
+        .saturating_sub(CheckpointRef::RECORD_BYTES);
     }
-    // A destroyed work's log can never be replayed either.
     let log = self.work_log_bytes(id);
     if self.work_logs.remove(&id).is_some() {
       self.green_chain_bytes = self.green_chain_bytes.saturating_sub(log);
     }
-    Ok(())
   }
 
   fn insert_snapshot(&mut self, record: SnapshotRecord) -> Result<(), DbError> {
@@ -3088,10 +3132,10 @@ impl Partition {
       green_checkpoints: self
         .green_checkpoints
         .iter()
-        .map(|(green, (version, bytes))| GreenCheckpoint {
+        .map(|(green, (version, checkpoint))| GreenCheckpoint {
           green: *green,
           version: *version,
-          bytes: bytes.clone(),
+          checkpoint: *checkpoint,
         })
         .collect(),
       green_adoptions: self.green_adoptions.values().copied().collect(),
@@ -3414,10 +3458,10 @@ impl Partition {
     for checkpoint in &snapshot.green_checkpoints {
       self.green_chain_bytes = self
         .green_chain_bytes
-        .saturating_add(checkpoint.bytes.len());
+        .saturating_add(CheckpointRef::RECORD_BYTES);
       self.green_checkpoints.insert(
         checkpoint.green,
-        (checkpoint.version, checkpoint.bytes.clone()),
+        (checkpoint.version, checkpoint.checkpoint),
       );
     }
     for log in &snapshot.work_logs {

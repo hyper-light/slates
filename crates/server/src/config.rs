@@ -486,7 +486,8 @@ pub struct DaemonConfig {
   /// The version-control servers' HTTP edge (§4.17.2 "Transports" item 1; A-625 part 3), when the operator starts one:
   /// none from [`DaemonConfig::derive`].
   pub vcs_http: Option<VcsHttpConfig>,
-  /// How long a git push's answer over the HTTP edge may write nothing before the edge writes git's keepalive (A-722):
+  /// How long a git push's or fetch's answer over the HTTP edge may write nothing before the edge writes git's keepalive
+  /// (A-722; a fetch's only inside its pack's section):
   /// [`GIT_KEEPALIVE_NS`] from [`DaemonConfig::derive`].
   pub git_keepalive_ns: u64,
   /// The version-control servers' SSH edge (§4.17.2 "Transports" item 2; A-684), when the operator starts one: none from
@@ -701,7 +702,8 @@ impl DaemonConfig {
   /// start. In order: the write log (A-63); the two reserve-sized image slots, the committed recovery image
   /// and the one being written (§4.8); the delta log (A-68); the DAX range table (A-365); and the shard's arena range,
   /// its chunk arena's one region (A-64), the reserve's length, starting on the mapping granule so it can be mapped on
-  /// its own. The slice's length is a granule multiple too, so every shard's arena starts on one. The slots are sized
+  /// its own. On macOS the arena's extents are objects of their own (A-789), so the slice (its stride) ends where the
+  /// arena's range would begin; `arena` still names the arena's capacity, which the pool cuts into its parts. The slice's length is a granule multiple too, so every shard's arena starts on one. The slots are sized
   /// as before the arena moved in: an image now carries metadata, not content, and only the pages it reaches are
   /// backed.
   pub fn shard_content_layout(&self) -> ShardContentLayout {
@@ -725,8 +727,12 @@ impl DaemonConfig {
     let arena_start = dax_ranges_end
       .checked_next_multiple_of(granule)
       .unwrap_or(usize::MAX);
+    // The arena's range is part of the object only where its extents are ranges of it (Linux's memfd, and Windows when
+    // no anchor holds the extents' sections). On macOS every extent is an object of its own (A-789,
+    // `slates_mem::extent_handoff`), so the range would be address space nothing maps: the slice ends where it begins.
+    let arena_in_object = !cfg!(target_os = "macos");
     let stride = arena_start
-      .saturating_add(reserve)
+      .saturating_add(if arena_in_object { reserve } else { 0 })
       .checked_next_multiple_of(granule)
       .unwrap_or(usize::MAX);
     ShardContentLayout {
@@ -784,7 +790,7 @@ impl DaemonConfig {
 
   /// Derived (A-789): the content pool extents an anchor may hold for this daemon across a restart on Windows, where
   /// each extent is a section of its own: every extent the layout can name, `partitions × POOL_EXTENTS_PER_PARTITION`
-  /// (at most one per bit of a slice's arena length in units, `content_pool::arena_parts`).
+  /// (`content_pool::arena_parts` cuts a slice into at most that many parts).
   pub fn held_extent_bound(&self) -> usize {
     usize::from(self.geometry.partitions.max(1))
       .saturating_mul(slates_anchor::layout::POOL_EXTENTS_PER_PARTITION)

@@ -658,6 +658,13 @@ pub(crate) fn let_go_for_region(
   let_go_here(state, identity)
 }
 
+/// The holds this shard keeps of `identity` for the region: 1 where it is the identity's home and keeps it, else 0. A
+/// replay counts it apart from its record's own hold (`super::replay_push`): a window restored with its region hold is
+/// held by the region, never yet by its record.
+pub(crate) fn region_holds_here(identity: &ContentId) -> u64 {
+  REGION_HELD.with(|held| u64::from(held.try_borrow().is_ok_and(|held| held.contains(identity))))
+}
+
 /// The windows this shard holds for the region, in identity order: what the healer walks (module docs, "The healer").
 pub(crate) fn region_held_here() -> Vec<ContentId> {
   REGION_HELD.with(|held| {

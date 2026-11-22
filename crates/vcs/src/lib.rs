@@ -72,6 +72,9 @@ pub mod content;
 pub mod cut;
 pub mod derived;
 pub mod index;
+pub mod mrc;
+pub mod partition;
+pub mod rate;
 pub mod rows;
 pub mod rule;
 pub mod share;
@@ -84,16 +87,19 @@ pub use arrival::{
 };
 pub use cold::{Prices, Rebuildable, choose};
 pub use content::{
-  ContentCounters, ContentId, ContentRefused, ContentStore, DerivedNode, Form, HeapWindows, Stored,
-  StoredWindow, WindowStorage, Windows, Writing,
+  ContentCounters, ContentId, ContentRefused, ContentStore, DerivedNode, Form, HeapWindows,
+  LetGoRefused, Stored, StoredWindow, WindowStorage, Windows, Writing,
 };
 pub use derived::{
   Derivations, DerivedCounters, DerivedRefused, DerivedType, Fill, Graph, Mode, Progress, Read,
 };
 pub use index::{
-  AdoptRefused, Batch, FENCE_SLOT_BYTES, Index, IndexCounters, IndexRefused, Inserted, NewRow,
-  TAIL_SLOT_BYTES,
+  AdoptRefused, Batch, FENCE_SLOT_BYTES, Index, IndexCounters, IndexRefused, Inserted, Merge,
+  MergeStep, NewRow, TAIL_SLOT_BYTES,
 };
+pub use mrc::Curve;
+pub use partition::{Division, Want, partition};
+pub use rate::{Decayed, Rates};
 pub use rule::Compaction;
 pub use share::{Claim, Granted, amount_of, divide, whole_units};
 pub use table::{RowRef, TableRefused, TableView};

@@ -71,6 +71,27 @@ pub(crate) type Key = (u64, usize);
 struct Done {
   key: Key,
   refined: Option<(OpsDoc, PostStatePlan)>,
+  /// What the job prepared for the parked submit off its step (A-787 part 3), none when nothing was.
+  prepared: Option<Prepared>,
+}
+
+/// A refined submit's increment, verdict and encoding, made by the job a bounded slice a turn so the submit's own step
+/// only commits (A-787 part 3; main's ruling of 2026-11-21 09:25 on the 415 ms step): the increment composed as
+/// `verbs::compose_increment` composes it (its post-state laid a copy slice a turn, its identity hashed a hash slice a
+/// turn), its verdict computed at the head the job saw (`Green::compute`, which the submit takes by position:
+/// `Green::submit_computed`, judging again only what a later head changed), and its encoding. For the submit that
+/// parked with `evidence`; taken a part at a time as the submit reaches each, and gone with the work's next refinement.
+struct Prepared {
+  /// The submit's evidence, which the increment carries.
+  evidence: Vec<[u8; 32]>,
+  /// The increment, until the submit takes it.
+  increment: Option<slates_merge::engine::Increment>,
+  /// The increment's identity.
+  id: [u8; 32],
+  /// Its verdict computed at the head the job saw, until the submit takes it.
+  computed: Option<slates_merge::engine::Computed>,
+  /// Its encoding, until the submit takes it.
+  encoded: Option<Vec<u8>>,
 }
 
 /// The shard's refinements: the jobs running, their results, and the local verbs waiting on them.
@@ -299,6 +320,7 @@ fn with_base<R>(
       green: Some(&*engine),
       fetched: None,
       version,
+      entries: None,
     });
   }
   if let Some(replica) = state
@@ -310,12 +332,14 @@ fn with_base<R>(
       green: Some(replica),
       fetched: None,
       version,
+      entries: None,
     });
   }
   f(crate::work_files::Base {
     green: None,
     fetched: crate::work_home::parked_fetched(state, work),
     version,
+    entries: None,
   })
 }
 
@@ -367,7 +391,8 @@ fn job(work: DbVolumeId, green: DbVolumeId, owed: Owed) -> Job {
             Some(true) => break,
             Some(false) => slates_rt::futures::yield_now().await,
             None => {
-              let _ = crate::state::with_state(|s| finish(s, work, (key, None), (turns, longest)));
+              let _ =
+                crate::state::with_state(|s| finish(s, work, (key, None, None), (turns, longest)));
               return;
             }
           }
@@ -431,8 +456,21 @@ fn job(work: DbVolumeId, green: DbVolumeId, owed: Owed) -> Job {
       }
       slates_rt::futures::yield_now().await;
     }
-    let _ =
-      crate::state::with_state(|s| finish(s, work, (key, Some((doc, plan))), (turns, longest)));
+    // The parked submit's increment, verdict and encoding, a bounded slice a turn (A-787 part 3).
+    let prepared = prepare(
+      (work, green, key),
+      (&doc, &plan),
+      (&mut turns, &mut longest),
+    )
+    .await;
+    let _ = crate::state::with_state(|s| {
+      finish(
+        s,
+        work,
+        (key, Some((doc, plan)), prepared),
+        (turns, longest),
+      )
+    });
   };
   (Box::pin(task), key)
 }
@@ -454,7 +492,7 @@ fn turn(turns: &mut TurnCounts, longest: &mut u64, began: u64) {
 fn finish(
   state: &mut ShardState,
   work: DbVolumeId,
-  (key, refined): (Key, Option<(OpsDoc, PostStatePlan)>),
+  (key, refined, prepared): (Key, Option<(OpsDoc, PostStatePlan)>, Option<Prepared>),
   (turns, longest): (TurnCounts, u64),
 ) {
   if refined.is_none() {
@@ -475,7 +513,17 @@ fn finish(
   }
   // A work gone takes its result with it: nothing would read it.
   if state.works.contains_key(&work) {
-    state.refining.done.insert(work, Done { key, refined });
+    if prepared.is_some() {
+      state.count(PREPARED, 1);
+    }
+    state.refining.done.insert(
+      work,
+      Done {
+        key,
+        refined,
+        prepared,
+      },
+    );
   } else {
     state.refining.done.remove(&work);
   }
@@ -483,4 +531,267 @@ fn finish(
     crate::verbs::resume_all(state, parked);
   }
   crate::work_home::refined(state, work);
+}
+
+/// Counter: a refined submit's increment, verdict and encoding prepared off its step (A-787 part 3). Format: a counter
+/// name in the daemon's status report.
+pub(crate) const PREPARED: &str = "merge.refine.prepared";
+/// Counter: the slices a prepared submit's increment, verdict and encoding took (its post-state's copy slices, its
+/// identity's hash slices, and one each for its document's encoding, its verdict and the increment's encoding): the
+/// non-vacuity figure of the slicing. Format: a counter name in the daemon's status report.
+pub(crate) const PREPARE_SLICES: &str = "merge.submit.prepare_slices";
+/// Counter: a prepared increment compared whole with the one `verbs::compose_increment` composes (a debug build's
+/// oracle, A-821), and those that differed. Format: counter names in the daemon's status report.
+pub(crate) const PREPARED_CHECKED: &str = "merge.refine.prepared_checked";
+/// Counter: see [`PREPARED_CHECKED`].
+pub(crate) const PREPARED_MISMATCH: &str = "merge.refine.prepared_mismatch";
+/// Counter: a prepared increment, verdict or encoding the submit took (each part once). Format: a counter name in the
+/// daemon's status report.
+pub(crate) const PREPARED_TAKEN: &str = "merge.submit.prepared_taken";
+
+/// One bounded turn of a prepare: runs `step` on the shard's state, counts the turn and the slice, and yields.
+async fn prepare_turn<T>(
+  (turns, longest): (&mut TurnCounts, &mut u64),
+  step: impl FnOnce(&mut ShardState) -> Option<T>,
+) -> Option<T> {
+  let began = slates_rt::futures::now_ns();
+  let done = crate::state::with_state(|s| {
+    let done = step(s);
+    s.count(PREPARE_SLICES, 1);
+    done
+  })
+  .flatten();
+  turn(turns, longest, began);
+  slates_rt::futures::yield_now().await;
+  done
+}
+
+/// What the work still is and what the green holds for a prepare's turn: `None` once the work changed (another key),
+/// the green is not on this shard, or no local submit waits for the refinement.
+fn still_owed(s: &ShardState, (work, green, key): (DbVolumeId, DbVolumeId, Key)) -> Option<()> {
+  let w = s.works.get(&work)?;
+  ((w.base_version, w.journal.len()) == key && s.greens.contains_key(&green)).then_some(())
+}
+
+/// Prepares the parked submit's increment, verdict and encoding over `(doc, plan)`, the refinement's result, a bounded
+/// slice a turn ([`Prepared`]): the post-state a copy slice a turn (the shard's measured memcpy rate within its
+/// quantum), the identity a hash slice a turn (its measured BLAKE3 rate), and the document's encoding, the verdict and
+/// the increment's encoding a turn each. `None`, nothing kept, where nothing waits for it or the work or the green
+/// changed: the submit then composes and judges in its step as before.
+async fn prepare(
+  (work, green, key): (DbVolumeId, DbVolumeId, Key),
+  (doc, plan): (&OpsDoc, &PostStatePlan),
+  (turns, longest): (&mut TurnCounts, &mut u64),
+) -> Option<Prepared> {
+  let at = (work, green, key);
+  let evidence = crate::state::with_state(|s| {
+    still_owed(s, at)?;
+    crate::verbs::parked_local_evidence(s.refining.parked.get(&work)?)
+  })
+  .flatten()?;
+  let post = laid_post_state(at, (doc, plan), (&mut *turns, &mut *longest)).await?;
+  let doc_bytes = prepare_turn((&mut *turns, &mut *longest), |s| {
+    still_owed(s, at)?;
+    Some(doc.encode())
+  })
+  .await?;
+  let id = hashed_identity(at, (&doc_bytes, &post), (&mut *turns, &mut *longest)).await?;
+  drop(doc_bytes);
+  let increment = slates_merge::engine::Increment {
+    id,
+    base: key.0,
+    doc: doc.clone(),
+    post_state: post,
+    evidence: evidence.clone(),
+    named: Default::default(),
+  };
+  // The oracle, in a debug build: the increment composed whole as the submit's own step composes it (main's
+  // `compose_increment`), compared whole with the sliced one, in a turn of its own (A-821).
+  #[cfg(debug_assertions)]
+  let _ = prepare_turn((&mut *turns, &mut *longest), |s| {
+    let whole = crate::verbs::composed_whole(
+      s,
+      (work, green, key.0),
+      (doc.clone(), plan.clone()),
+      evidence.clone(),
+    )?;
+    s.count(PREPARED_CHECKED, 1);
+    if whole != increment {
+      s.count(PREPARED_MISMATCH, 1);
+    }
+    Some(())
+  })
+  .await;
+  let computed = prepare_turn((&mut *turns, &mut *longest), |s| {
+    still_owed(s, at)?;
+    s.greens.get(&green)?.compute(&increment).ok()
+  })
+  .await?;
+  let encoded = prepare_turn((&mut *turns, &mut *longest), |s| {
+    still_owed(s, at)?;
+    Some(increment.encode())
+  })
+  .await?;
+  Some(Prepared {
+    evidence,
+    increment: Some(increment),
+    id,
+    computed: Some(computed),
+    encoded: Some(encoded),
+  })
+}
+
+/// The prepared part of `work`'s submit `take` reads (A-787 part 3), counted when taken.
+fn take_prepared<T>(
+  state: &mut ShardState,
+  work: DbVolumeId,
+  take: impl FnOnce(&mut Prepared) -> Option<T>,
+) -> Option<T> {
+  let taken = state
+    .refining
+    .done
+    .get_mut(&work)
+    .and_then(|done| done.prepared.as_mut())
+    .and_then(take);
+  if taken.is_some() {
+    state.count(PREPARED_TAKEN, 1);
+  }
+  taken
+}
+
+/// The increment the job prepared for `work`'s submit under `key` with `evidence` (A-787 part 3), taken once.
+pub(crate) fn take_increment(
+  state: &mut ShardState,
+  work: DbVolumeId,
+  key: Key,
+  evidence: &[[u8; 32]],
+) -> Option<slates_merge::engine::Increment> {
+  let matches = state
+    .refining
+    .done
+    .get(&work)
+    .is_some_and(|done| done.key == key);
+  if !matches {
+    return None;
+  }
+  take_prepared(state, work, |prepared| {
+    (prepared.evidence == evidence)
+      .then(|| prepared.increment.take())
+      .flatten()
+  })
+}
+
+/// The encoding of the increment `id` the job prepared for `work`'s submit (A-787 part 3), taken once.
+pub(crate) fn take_encoded(
+  state: &mut ShardState,
+  work: DbVolumeId,
+  id: [u8; 32],
+) -> Option<Vec<u8>> {
+  take_prepared(state, work, |prepared| {
+    (prepared.id == id)
+      .then(|| prepared.encoded.take())
+      .flatten()
+  })
+}
+
+/// The verdict on the increment `id` the job computed for `work`'s submit (A-787 part 3), taken once.
+pub(crate) fn take_computed(
+  state: &mut ShardState,
+  work: DbVolumeId,
+  id: [u8; 32],
+) -> Option<slates_merge::engine::Computed> {
+  take_prepared(state, work, |prepared| {
+    (prepared.id == id)
+      .then(|| prepared.computed.take())
+      .flatten()
+  })
+}
+
+/// The increment's post-state laid over `(doc, plan)` a copy slice a turn ([`prepare`]): the ops whose bytes fit the
+/// shard's copy slice within its quantum (its measured memcpy rate), at least one a turn.
+async fn laid_post_state(
+  at: (DbVolumeId, DbVolumeId, Key),
+  (doc, plan): (&OpsDoc, &PostStatePlan),
+  (turns, longest): (&mut TurnCounts, &mut u64),
+) -> Option<Vec<u8>> {
+  let (work, green, key) = at;
+  let size = usize::try_from(crate::verbs::post_state_size(doc)).ok()?;
+  let mut post = vec![0u8; size];
+  let ops = doc.ops.len();
+  let mut next = 0usize;
+  while next < ops {
+    next = prepare_turn((&mut *turns, &mut *longest), |s| {
+      still_owed(s, at)?;
+      let budget = s
+        .config
+        .copy_slice_bytes_within(s.config.step_quantum_ns())
+        .max(1);
+      let mut end = next;
+      let mut bytes = 0u64;
+      while end < ops && (end == next || bytes < budget) {
+        bytes = bytes.saturating_add(doc.ops.get(end).map_or(0, |op| op.len));
+        end = end.saturating_add(1);
+      }
+      let w = s.works.get(&work)?;
+      let engine = s.greens.get(&green)?;
+      let base = crate::work_files::Base {
+        green: Some(&*engine),
+        fetched: None,
+        version: key.0,
+        entries: None,
+      };
+      // A range the green's bytes cannot fill gives the job up, so the composition runs unrefined.
+      crate::verbs::lay_ops(
+        &mut post,
+        (doc, plan),
+        (&w.files, base),
+        &w.journal,
+        next..end,
+      )
+      .ok()?;
+      Some(end)
+    })
+    .await?;
+  }
+  Some(post)
+}
+
+/// The increment's identity hashed a hash slice a turn ([`prepare`]): the work and its base, then the encoded document
+/// and the post-state, as `verbs::compose_increment` hashes them, each turn the shard's hash slice within its quantum
+/// (its measured BLAKE3 rate).
+async fn hashed_identity(
+  at: (DbVolumeId, DbVolumeId, Key),
+  (doc_bytes, post): (&[u8], &[u8]),
+  (turns, longest): (&mut TurnCounts, &mut u64),
+) -> Option<[u8; 32]> {
+  let (work, _, key) = at;
+  let mut hasher = crate::verbs::identity_hasher(work, key.0);
+  let whole = doc_bytes.len().saturating_add(post.len());
+  let mut hashed = 0usize;
+  while hashed < whole {
+    hashed = prepare_turn((&mut *turns, &mut *longest), |s| {
+      let slice = s
+        .config
+        .archive_slice_bytes_within(s.config.step_quantum_ns())
+        .max(1);
+      let end = hashed
+        .saturating_add(usize::try_from(slice).unwrap_or(usize::MAX))
+        .min(whole);
+      let doc_end = doc_bytes.len();
+      if hashed < doc_end {
+        hasher.update(doc_bytes.get(hashed..end.min(doc_end)).unwrap_or_default());
+      }
+      if end > doc_end {
+        let from = hashed.saturating_sub(doc_end);
+        hasher.update(
+          post
+            .get(from..end.saturating_sub(doc_end))
+            .unwrap_or_default(),
+        );
+      }
+      Some(end)
+    })
+    .await?;
+  }
+  Some(*hasher.finalize().as_bytes())
 }

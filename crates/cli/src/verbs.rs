@@ -787,46 +787,58 @@ fn serve_merge(client: &mut Client, verb: &Verb, json: bool) -> Result<(), Clien
         }
       }
     }
-    Verb::CheckMerge { work } => {
-      let checked = client.check_merge(*work)?;
-      if json {
-        slates_machine::out_line!("{}", slates_mcp::merge_check_json(&checked));
-      } else {
-        slates_machine::out_line!(
-          "checked: head {} base {} revision {}",
-          checked.stamp.head,
-          checked.stamp.base,
-          checked.stamp.revision
-        );
-        for (index, op) in checked.declaration.iter().enumerate() {
-          slates_machine::out_line!(
-            "op {index}: {} kind {} at {} len {}",
-            op.path,
-            op.kind,
-            op.at,
-            op.len
-          );
-        }
-        print_windows(&checked.conflicts);
-      }
-    }
-    Verb::ResolveMerge { resolution } => {
-      let args: serde_json::Value =
-        serde_json::from_str(resolution).map_err(|error| bad_resolution(error.to_string()))?;
-      let (stamp, discard, replacement) =
-        slates_mcp::resolve_args(&args).map_err(bad_resolution)?;
-      let outcome = client.resolve_merge(stamp, &discard, replacement)?;
-      if json {
-        slates_machine::out_line!("{}", rebase_json(&outcome));
-      } else {
-        match outcome {
-          Rebased::Rebased(version) => slates_machine::out_line!("resolved: {version}"),
-          Rebased::Conflict(windows) => print_windows(&windows),
-        }
-      }
-    }
+    Verb::CheckMerge { work } => merge_check_verb(client, *work, json)?,
+    Verb::ResolveMerge { resolution } => merge_resolve_verb(client, resolution, json)?,
     // Only the merge verbs above reach here.
     _ => {}
+  }
+  Ok(())
+}
+
+/// `check-merge`: the work's early-conflict check (A-796), as JSON or as lines: its stamp, its declaration's operations
+/// and the conflict windows.
+fn merge_check_verb(client: &mut Client, work: VolumeId, json: bool) -> Result<(), ClientError> {
+  let checked = client.check_merge(work)?;
+  if json {
+    slates_machine::out_line!("{}", slates_mcp::merge_check_json(&checked));
+  } else {
+    slates_machine::out_line!(
+      "checked: head {} base {} revision {}",
+      checked.stamp.head,
+      checked.stamp.base,
+      checked.stamp.revision
+    );
+    for (index, op) in checked.declaration.iter().enumerate() {
+      slates_machine::out_line!(
+        "op {index}: {} kind {} at {} len {}",
+        op.path,
+        op.kind,
+        op.at,
+        op.len
+      );
+    }
+    print_windows(&checked.conflicts);
+  }
+  Ok(())
+}
+
+/// `resolve-merge`: a resolution bound to a check (A-796), read from its JSON, as JSON or as a line.
+fn merge_resolve_verb(
+  client: &mut Client,
+  resolution: &str,
+  json: bool,
+) -> Result<(), ClientError> {
+  let args: serde_json::Value =
+    serde_json::from_str(resolution).map_err(|error| bad_resolution(error.to_string()))?;
+  let (stamp, discard, replacement) = slates_mcp::resolve_args(&args).map_err(bad_resolution)?;
+  let outcome = client.resolve_merge(stamp, &discard, replacement)?;
+  if json {
+    slates_machine::out_line!("{}", rebase_json(&outcome));
+  } else {
+    match outcome {
+      Rebased::Rebased(version) => slates_machine::out_line!("resolved: {version}"),
+      Rebased::Conflict(windows) => print_windows(&windows),
+    }
   }
   Ok(())
 }
@@ -1823,6 +1835,18 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     Verb::BranchRetire { repository, name } => {
       client.retire_branch(repository, name)?;
       emit_branch(repository, name, None, json);
+    }
+    Verb::RepositoryDestroy { repository } => {
+      client.destroy_repository(repository)?;
+      if json {
+        slates_machine::out_line!(
+          "{}",
+          serde_json::json!({ "repository": repository, "destroyed": true })
+        );
+      } else {
+        slates_machine::out_line!("repository: {repository}");
+        slates_machine::out_line!("destroyed: true");
+      }
     }
     // Served in `run`, before this: their authority comes from the anchor, not the client.
     Verb::Bootstrap { .. }

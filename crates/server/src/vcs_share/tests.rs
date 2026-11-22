@@ -13,15 +13,23 @@ fn counted(state: &ShardState, name: &str) -> u64 {
   state.refusals.get(name).copied().unwrap_or(0)
 }
 
-/// Records on `repository`'s usage row one intake answered after bringing `bytes`, as a push's steps do.
+/// Records on `repository`'s usage row one intake begun at `at`, stepped, and answered after bringing `bytes`, as a
+/// push's steps do.
+fn answered_intake_at(state: &mut ShardState, repository: RepositoryId, bytes: u64, at: u64) {
+  state
+    .vcs_usage
+    .begun(&repository, &owner(), Work::Intake, at);
+  state
+    .vcs_usage
+    .stepped(&repository, Work::Intake, (1, bytes), at + 1);
+  state
+    .vcs_usage
+    .answered(&repository, Work::Intake, bytes, at + 2);
+}
+
+/// [`answered_intake_at`] at the start of the shard's clock.
 fn answered_intake(state: &mut ShardState, repository: RepositoryId, bytes: u64) {
-  state
-    .vcs_usage
-    .begun(&repository, &owner(), Work::Intake, 1);
-  state
-    .vcs_usage
-    .stepped(&repository, Work::Intake, (1, bytes), 2);
-  state.vcs_usage.answered(&repository, Work::Intake, 3);
+  answered_intake_at(state, repository, bytes, 1);
 }
 
 /// A-724 piece 3. Do: ask a repository's room with no other intake under way. Expect: all the shard can admit, by the
@@ -199,5 +207,332 @@ fn t_a724_a_repositorys_room_is_bounded_by_its_partitions_snapshot_slot() {
       // The slot shrunk below the shard's admittable room, as a giant repository's partition meets it.
       config.geometry.snapshot_bytes = config.geometry.page.saturating_mul(1 << 8);
     },
+  );
+}
+
+/// A-724 piece 2 (§4.17.5 "Learned demand"). Do: answer a hundred small intakes of a monorepo at a steady rhythm, then
+/// three intakes 64 times larger at the same rhythm, and ask a toy repository's room while the monorepo pushes again.
+/// Expect: the monorepo claims its learned next intake, near the large size, so the toy is left at most the free room
+/// less half of it; its lifetime mean (a hundredth or so of the large size above the small) would have left the toy
+/// nearly everything, overcommitting the shard to the monorepo's next push.
+#[test]
+fn t_a724_a_repositorys_claim_follows_its_learned_demand_not_its_lifetime_mean() {
+  crate::test_store::audit_on_stored_shard("vcs_share", |state| {
+    let monorepo = git_repository(state, "monorepo");
+    let toy = git_repository(state, "toy");
+    let free = state
+      .store
+      .admittable()
+      .min(state.db.snapshot_room(&state.segment));
+    let (small, large, gap) = (free / 4096, free / 64, 1_000_000);
+    let mut at = 1;
+    for _ in 0..100 {
+      answered_intake_at(state, monorepo, small, at);
+      at += gap;
+    }
+    for _ in 0..3 {
+      answered_intake_at(state, monorepo, large, at);
+      at += gap;
+    }
+    let pushing = Live::begin(monorepo);
+    let left = room(state, toy);
+    assert!(
+      left.bytes <= free - large / 2,
+      "the toy is left {} of {free}: the monorepo claimed less than half its learned {large}",
+      left.bytes
+    );
+    drop(pushing);
+  });
+}
+
+/// Feeds `request` to a push of `repository`'s by its owner, piece by piece as an edge does: the first refusal, if any.
+fn first_refusal(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  request: &[u8],
+) -> Option<crate::git_push::PushFailed> {
+  let mut advertised = Vec::new();
+  let mut push = crate::git_push::ReceivePack::start(
+    state,
+    (&owner(), repository),
+    true,
+    &mut advertised,
+    crate::git_push::Unpresented,
+  )
+  .expect("started");
+  for piece in request.chunks(64) {
+    if let Err(refused) = push.input(state, piece) {
+      return Some(refused);
+    }
+  }
+  if let Err(refused) = push.end(state) {
+    return Some(refused);
+  }
+  let mut answer = Vec::new();
+  loop {
+    match push.answer_step(state, &mut answer) {
+      Err(refused) => return Some(refused),
+      Ok(crate::git_push::Answering::Answered(_)) => return None,
+      Ok(crate::git_push::Answering::Turned) => {
+        crate::git_push::tests::carry_blocking(state, &mut push)
+      }
+      #[cfg(unix)]
+      Ok(step @ crate::git_push::Answering::Hook(_)) => panic!("no hook: {step:?}"),
+    }
+  }
+}
+
+/// A-724 piece 3b (§4.17.5 "Admission and backpressure": past its share, a work is refused typed and retryable, naming
+/// the share). Do: on a daemon whose partition's snapshot slot has 461 bytes of room (a shard's memory is too large to
+/// divide this small in a test, and the slot is divided with it, A-724 piece 8a), push stock git's first fixture into a
+/// toy repository while a monorepo pushes, so the toy's room is its share of the slot (230 bytes), then again once the
+/// monorepo's push has ended. Expect: beside the monorepo, refused past its share, typed so, its words naming the share
+/// and what it holds and saying a retry may pass once others' pushes end, never git's words for a push too large for the
+/// server; alone, not refused for a share.
+#[test]
+fn t_a724_a_push_past_its_share_is_refused_retryable_naming_the_share() {
+  crate::test_store::audit_on_stored_shard_configured(
+    "vcs_share",
+    |state| {
+      let monorepo = git_repository(state, "monorepo");
+      let toy = git_repository(state, "toy");
+      let request = crate::git_push::tests::chain()[0].0.request;
+      let pushing = Live::begin(monorepo);
+      assert!(matches!(room(state, toy).bound, Bound::Share { .. }));
+      let refused = first_refusal(state, toy, request).expect("refused past its share");
+      assert!(
+        matches!(refused, crate::git_push::PushFailed::PastShare { .. }),
+        "typed as past its share: {refused:?}"
+      );
+      let words = crate::git_push::words::failed(&refused, "toy");
+      assert!(
+        words.contains("share") && words.contains("retry"),
+        "a share's refusal names the share and says a retry may pass: {words:?}"
+      );
+      drop(pushing);
+      let alone = first_refusal(state, toy, request);
+      assert!(
+        !matches!(alone, Some(crate::git_push::PushFailed::PastShare { .. })),
+        "alone, not refused for a share: {alone:?}"
+      );
+    },
+    |config| {
+      // The slot shrunk so its room, divided, binds a push of a few hundred bytes (6,400 bytes less the partition's
+      // state leaves 461 here).
+      config.geometry.snapshot_bytes = 6_400;
+    },
+  );
+}
+
+/// A-724 piece 3d (§4.17.5 "Admission and backpressure": a fetch's room is a claim of its own). Do: push stock git's
+/// fixtures into a repository and hold its generation as a fetch's answer does (`ShardStores::hold`), then ask another
+/// repository's room while the hold lasts, and again once it is given back. Expect: while the fetch is in flight, the
+/// other's room divided with it (bound by its share, counted divided); once it ends, the other alone again, by the fast
+/// path.
+#[test]
+fn t_a724_a_fetch_in_flight_is_a_claim_on_the_room() {
+  crate::test_store::audit_on_stored_shard("vcs_share", |state| {
+    let fetched = git_repository(state, "fetched");
+    let toy = git_repository(state, "toy");
+    crate::git_push::tests::pushed_from_the_fixtures(state, fetched, &["create", "update"]);
+    let held = crate::vcs_store::upload::hold_in(state, fetched, &owner()).expect("held");
+    let divided = room(state, toy);
+    assert!(
+      matches!(divided.bound, Bound::Share { .. }),
+      "a fetch in flight divides the room: {divided:?}"
+    );
+    drop(held);
+    assert!(matches!(
+      room(state, toy).bound,
+      Bound::Shard | Bound::Snapshot { .. }
+    ));
+  });
+}
+
+/// A-724 piece 3d. Do: on a store-holding daemon, push stock git's fixtures into a repository; then, from a task on its
+/// shard as an edge's answer runs, hold its generation, report 5,000 bytes written by the answer, and give the hold
+/// back. Expect: the fetch answered on the repository's usage row, its 5,000 bytes learned as its fetch demand.
+#[test]
+fn t_a724_a_fetchs_answer_is_counted_and_learned_on_its_repositorys_usage_row() {
+  use crate::vcs_http::git::upload::StoreLender;
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let fetched = crate::daemon::observe_first(&daemon, |state| {
+    let fetched = git_repository(state, "fetched");
+    crate::git_push::tests::pushed_from_the_fixtures(state, fetched, &["create", "update"]);
+    fetched
+  });
+  let (sent, done) = std::sync::mpsc::sync_channel(1);
+  crate::daemon::observe_first(&daemon, move |_| {
+    let task = slates_rt::futures::spawn(async move {
+      let mut lender = crate::vcs_store::upload::ShardStores;
+      let held = lender.hold(fetched, &owner());
+      if let Some(held) = held.as_ref() {
+        lender.wrote(held, 5_000);
+      }
+      let _ = sent.send(held.is_some());
+    })
+    .unwrap();
+    slates_rt::futures::detach(task).unwrap();
+  });
+  assert!(
+    done
+      .recv_timeout(std::time::Duration::from_secs(60))
+      .unwrap(),
+    "held"
+  );
+  let row = crate::daemon::observe_first(&daemon, move |state| {
+    state.vcs_usage.usage(&fetched).map(|row| {
+      (
+        row.fetch.answered,
+        row.learned(Work::Fetch).bytes_per_work(),
+      )
+    })
+  });
+  daemon.stop();
+  assert_eq!(row, Some((1, Some(5_000))));
+}
+
+/// Makes Mercurial repository `name`, empty, on the shard: its id.
+fn hg_repository(state: &mut ShardState, name: &str) -> RepositoryId {
+  use slates_ipc::protocol::{ObjectFormat, RequestBody, VcsTool};
+  let reply = crate::test_store::create(
+    state,
+    &owner(),
+    RequestBody::CreateRepository {
+      name: name.to_owned(),
+      tool: VcsTool::Mercurial,
+      format: ObjectFormat::Sha1,
+      default_branch: crate::repository::hg_push::line_name(b"default", 0),
+      green: None,
+    },
+  );
+  assert!(
+    matches!(reply, slates_ipc::protocol::ReplyBody::GreenCreated { .. }),
+    "{reply:?}"
+  );
+  state
+    .db
+    .partition()
+    .repositories()
+    .repository_named(name)
+    .expect("made")
+    .id
+}
+
+/// A-724 piece 3d for Mercurial (w-hg's leave, 2026-11-21). Do: make a Mercurial repository and hold its generation as a
+/// fetch's streamed answer does (`hg_view::hold_in`), then ask a git repository's room while the hold lasts, and again
+/// once it is given back. Expect: while the fetch is in flight, the other's room divided with it; once it ends, alone.
+#[test]
+fn t_a724_a_mercurial_fetch_in_flight_is_a_claim_on_the_room() {
+  crate::test_store::audit_on_stored_shard("vcs_share", |state| {
+    let fetched = hg_repository(state, "fetched");
+    let toy = git_repository(state, "toy");
+    let mut held_room = slates_hg::Admission::new(u64::MAX);
+    let held = crate::vcs_store::hg_view::hold_in(state, fetched, &mut held_room).expect("held");
+    let divided = room(state, toy);
+    assert!(
+      matches!(divided.bound, Bound::Share { .. }),
+      "a Mercurial fetch in flight divides the room: {divided:?}"
+    );
+    drop(held);
+    assert!(matches!(
+      room(state, toy).bound,
+      Bound::Shard | Bound::Snapshot { .. }
+    ));
+  });
+}
+
+/// A-724 piece 3d for Mercurial. Do: on a store-holding daemon, make a Mercurial repository; from a task on its shard,
+/// hold its generation and give it back writing nothing (a batch's lookup), then hold it again, report 5,000 bytes
+/// written by a streamed answer, and give it back. Expect: one fetch answered on the repository's usage row, its 5,000
+/// bytes learned: the lookup's hold taught nothing.
+#[test]
+fn t_a724_a_mercurial_fetchs_answer_is_learned_and_a_lookups_hold_teaches_nothing() {
+  use crate::vcs_http::hg::HgStores;
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let fetched = crate::daemon::observe_first(&daemon, |state| hg_repository(state, "fetched"));
+  let (sent, done) = std::sync::mpsc::sync_channel(1);
+  crate::daemon::observe_first(&daemon, move |_| {
+    let task = slates_rt::futures::spawn(async move {
+      let mut stores = crate::vcs_store::hg_view::ServedViews;
+      let looked = stores.hold(fetched, &mut slates_hg::Admission::new(u64::MAX));
+      let held_once = looked.is_some();
+      drop(looked);
+      let streamed = stores.hold(fetched, &mut slates_hg::Admission::new(u64::MAX));
+      if let Some(held) = streamed.as_ref() {
+        stores.wrote(held, 5_000);
+      }
+      let _ = sent.send(held_once && streamed.is_some());
+    })
+    .unwrap();
+    slates_rt::futures::detach(task).unwrap();
+  });
+  assert!(
+    done
+      .recv_timeout(std::time::Duration::from_secs(60))
+      .unwrap(),
+    "held twice"
+  );
+  let row = crate::daemon::observe_first(&daemon, move |state| {
+    state.vcs_usage.usage(&fetched).map(|row| {
+      (
+        row.fetch.answered,
+        row.learned(Work::Fetch).bytes_per_work(),
+      )
+    })
+  });
+  daemon.stop();
+  assert_eq!(row, Some((1, Some(5_000))));
+}
+
+/// A-724 piece 3, Mercurial's share refusal (w-hg's leave, 2026-11-21). Do: on a store-holding daemon whose partition's
+/// snapshot slot has 461 bytes of room (so a share is a few hundred bytes, as in the git test above), make a Mercurial
+/// repository and a git repository; from a task on its shard, with a git push live, push a bundle larger than the
+/// Mercurial repository's share through `hg_push::unbundle`, admitted the room as an edge admits it. Expect: refused
+/// before its bundle is read, in 7.2's `pusherr` form, its words naming the repository's share and saying a retry may
+/// pass once other repositories' pushes end; never the words of a push past the server's room.
+#[test]
+fn t_a724_a_mercurial_push_past_its_share_is_refused_naming_the_share() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored_configured(|config| {
+    config.geometry.snapshot_bytes = 6_400;
+  });
+  let (pushed, other) = crate::daemon::observe_first(&daemon, |state| {
+    (
+      hg_repository(state, "pushed"),
+      git_repository(state, "other"),
+    )
+  });
+  let (sent, outcome) = std::sync::mpsc::sync_channel(1);
+  crate::daemon::observe_first(&daemon, move |_| {
+    let task = slates_rt::futures::spawn(async move {
+      let pushing = Live::begin(other);
+      let room = crate::state::with_state(|state| super::room(state, pushed)).unwrap();
+      let bundle = vec![0u8; usize::try_from(room.bytes).unwrap() + 1];
+      let mut admission = slates_hg::Admission::new(room.bytes);
+      let heads = slates_hg::push::check::HeadsArgument::Force;
+      let outcome =
+        crate::repository::hg_push::unbundle(pushed, (&owner(), &heads, &bundle), &mut admission)
+          .await;
+      drop(pushing);
+      let _ = sent.send((room.bound, outcome));
+    })
+    .unwrap();
+    slates_rt::futures::detach(task).unwrap();
+  });
+  let (bound, outcome) = outcome
+    .recv_timeout(std::time::Duration::from_secs(60))
+    .unwrap();
+  daemon.stop();
+  assert!(
+    matches!(bound, Bound::Share { .. }),
+    "the room was a share: {bound:?}"
+  );
+  let Some(slates_hg::push::Outcome::Unprocessed(words)) = outcome else {
+    panic!("refused before its bundle was read: {outcome:?}");
+  };
+  let words = String::from_utf8_lossy(&words);
+  assert!(
+    words.contains("share") && words.contains("retry"),
+    "a share's refusal names the share and says a retry may pass: {words:?}"
   );
 }

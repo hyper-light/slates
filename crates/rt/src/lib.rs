@@ -39,6 +39,7 @@
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 mod attribution;
+pub mod busy_harvest;
 pub mod control;
 pub mod driver;
 pub mod error;

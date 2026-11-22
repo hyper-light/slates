@@ -268,6 +268,10 @@ pub enum Turn<'a> {
   /// a command run again after its authentication): write the output, then call again with the
   /// same input.
   Wrote,
+  /// A drive waits for a text's piece its repository reads asynchronously (C2 stage B part 2;
+  /// [`reads::Repository::fetchable`]): write the output, fetch the piece and make it readable to the repository,
+  /// then call again with the same input.
+  Waiting(reads::Wanted),
   /// The client answered the greeting, `consumed` bytes: the caller resolves its URL and calls
   /// [`Connection::open`] or [`Connection::refuse`].
   Opened {
@@ -1667,6 +1671,10 @@ impl Connection {
       reads::Progress::More => Phase::Streaming(established, stream),
       reads::Progress::Done => Phase::Commands(established),
       reads::Progress::Close => return Err(Refused::Aborted),
+      reads::Progress::Waiting(wanted) => {
+        self.phase = Phase::Streaming(established, stream);
+        return Ok(Turn::Waiting(wanted));
+      }
     };
     Ok(Turn::Wrote)
   }
@@ -1706,6 +1714,10 @@ impl Connection {
       ExchangeTurn::Wrote => {
         self.phase = Phase::Reporting(established, exchange);
         Turn::Wrote
+      }
+      ExchangeTurn::Waiting(wanted) => {
+        self.phase = Phase::Reporting(established, exchange);
+        Turn::Waiting(wanted)
       }
       ExchangeTurn::Answered { consumed } => {
         self.phase = Phase::Commands(established);

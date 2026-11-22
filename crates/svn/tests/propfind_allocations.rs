@@ -11,7 +11,7 @@ use slates_svn::dav::Bounds;
 use slates_svn::dav::site::{Answer, Request, Served, answer};
 use slates_svn::dump::{Admission, Uuid};
 use slates_svn::lock::{AprTime, LockTable};
-use slates_svn::migration::{Importer, Importing, Repository, Room};
+use slates_svn::migration::{Importer, Importing, Repository, Room, Standalone};
 
 struct Counting;
 thread_local! {
@@ -103,18 +103,24 @@ fn dump() -> Vec<u8> {
 }
 
 /// The repository `dump` makes.
-fn imported() -> Repository {
+fn imported() -> Standalone {
   let uuid = Uuid::parse(UUID.as_bytes()).unwrap();
-  let mut repository = Repository::new(uuid, b"2026-11-20T00:00:00.000000Z", ROOM).unwrap();
+  let mut repository =
+    Standalone::new(Repository::new(uuid, b"2026-11-20T00:00:00.000000Z", ROOM).unwrap());
   let mut importer = Importer::new(Admission {
     buffer_bytes: 1 << 20,
   });
   let dump = dump();
   let mut rest = dump.as_slice();
   loop {
-    match importer.import(&mut repository, rest, true).unwrap() {
+    match repository.import(&mut importer, rest, true).unwrap() {
       Importing::Done => return repository,
       Importing::NeedMore { .. } => panic!("the whole dump was given"),
+      Importing::Base { text, .. } => {
+        panic!(
+          "the import's bases are supplied from the texts held apart, yet it asked for {text:?}"
+        )
+      }
       Importing::Commit { consumed, record } => {
         rest = rest.get(consumed..).unwrap_or_default();
         repository.commit_record(*record).unwrap();
@@ -124,7 +130,7 @@ fn imported() -> Repository {
 }
 
 /// The allocations this thread made answering a depth-1 PROPFIND of `/trunk` asking `body`, and the answer's bytes.
-fn counted(repository: &Repository, locks: &LockTable, body: &[u8]) -> (usize, usize) {
+fn counted(repository: &Standalone, locks: &LockTable, body: &[u8]) -> (usize, usize) {
   let served = Served {
     index: repository.index(),
     repository,

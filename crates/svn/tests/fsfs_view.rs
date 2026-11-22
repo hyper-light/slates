@@ -18,7 +18,7 @@ use std::process::Command;
 use slates_svn::dump::{Admission, Uuid};
 use slates_svn::fsfs::{self, Advance, RevisionFile, View};
 use slates_svn::index::RevisionRecord;
-use slates_svn::migration::{Importer, Importing, Repository, Room};
+use slates_svn::migration::{Importer, Importing, Repository, Room, Standalone};
 
 /// `svnadmin dump -q` of the vectors' repository.
 const FULL: &[u8] = include_bytes!("../fixtures/dump/full.dump");
@@ -52,15 +52,21 @@ const REVISION_ZERO: &[u8] = b"PLAIN\nEND\nENDREP\nid: 0.0.r0/17\ntype: dir\ncou
 text: 0 0 4 4 2d2977d1c96f487abe4a1e202dd03b4e\ncpath: /\n\n\n17 107\n";
 
 /// The repository `dump` makes.
-fn imported(dump: &[u8]) -> Repository {
+fn imported(dump: &[u8]) -> Standalone {
   let uuid = Uuid::parse(b"00000000-0000-4000-8000-000000000738").unwrap();
-  let mut repository = Repository::new(uuid, b"2026-11-20T00:00:00.000000Z", ROOMY).unwrap();
+  let mut repository =
+    Standalone::new(Repository::new(uuid, b"2026-11-20T00:00:00.000000Z", ROOMY).unwrap());
   let mut importer = Importer::new(ADMISSION);
   let mut rest = dump;
   loop {
-    match importer.import(&mut repository, rest, true).unwrap() {
+    match repository.import(&mut importer, rest, true).unwrap() {
       Importing::Done => return repository,
       Importing::NeedMore { .. } => panic!("the whole dump was given"),
+      Importing::Base { text, .. } => {
+        panic!(
+          "the import's bases are supplied from the texts held apart, yet it asked for {text:?}"
+        )
+      }
       Importing::Commit { consumed, record } => {
         rest = &rest[consumed..];
         repository.commit_record(*record).unwrap();
@@ -70,7 +76,7 @@ fn imported(dump: &[u8]) -> Repository {
 }
 
 /// `repository`'s view laid out `budget` node-revisions a call, and the calls it took.
-fn laid_out(repository: &Repository, budget: usize) -> (View, usize) {
+fn laid_out(repository: &Standalone, budget: usize) -> (View, usize) {
   let mut view = View::new();
   let mut calls = 0;
   loop {
@@ -86,7 +92,7 @@ fn laid_out(repository: &Repository, budget: usize) -> (View, usize) {
 }
 
 /// Every byte of `file`, read [`READ_BYTES`] at a time.
-fn read_whole(file: &RevisionFile, repository: &Repository) -> Vec<u8> {
+fn read_whole(file: &RevisionFile, repository: &Standalone) -> Vec<u8> {
   let mut bytes = Vec::new();
   loop {
     let offset = bytes.len() as u64;
@@ -103,7 +109,7 @@ fn read_whole(file: &RevisionFile, repository: &Repository) -> Vec<u8> {
 }
 
 /// Revision `revision`'s file of `view`, whole.
-fn revision_bytes(view: &View, repository: &Repository, revision: u64) -> Vec<u8> {
+fn revision_bytes(view: &View, repository: &Standalone, revision: u64) -> Vec<u8> {
   let file = view
     .revision_file(repository.index(), repository, revision)
     .unwrap();
@@ -114,7 +120,8 @@ fn revision_bytes(view: &View, repository: &Repository, revision: u64) -> Vec<u8
 #[test]
 fn revision_zero_is_the_file_svnadmin_create_writes() {
   let uuid = Uuid::parse(b"00000000-0000-4000-8000-000000000738").unwrap();
-  let repository = Repository::new(uuid, b"2026-11-20T00:00:00.000000Z", ROOMY).unwrap();
+  let repository =
+    Standalone::new(Repository::new(uuid, b"2026-11-20T00:00:00.000000Z", ROOMY).unwrap());
   let (view, _) = laid_out(&repository, 1);
   assert_eq!(revision_bytes(&view, &repository, 0), REVISION_ZERO);
   assert_eq!(
@@ -134,7 +141,6 @@ fn a_budget_slices_the_layout_by_revision_and_every_header_names_its_own_place()
   let (whole, one) = laid_out(&repository, usize::MAX);
   assert_eq!(one, 1);
   assert_eq!(calls as u64, youngest + 1, "a revision a call");
-  let mut deltas = 0;
   for revision in 0..=youngest {
     let bytes = revision_bytes(&sliced, &repository, revision);
     assert_eq!(
@@ -145,18 +151,7 @@ fn a_budget_slices_the_layout_by_revision_and_every_header_names_its_own_place()
     assert_eq!(sliced.revision_length(revision), Some(bytes.len() as u64));
     assert_the_trailer_names_the_root_and_the_changes(&bytes, revision);
     assert_every_header_names_its_own_place(&bytes, revision);
-    deltas += find_all(&bytes, b"\nDELTA");
   }
-  // Ruling 3 (A-645 P3): a text is its stored delta, never made whole; the golden history's texts are many.
-  assert!(deltas > 0, "the view wrote no DELTA representation");
-}
-
-/// How many times `needle` occurs in `haystack`.
-fn find_all(haystack: &[u8], needle: &[u8]) -> usize {
-  haystack
-    .windows(needle.len())
-    .filter(|window| *window == needle)
-    .count()
 }
 
 /// Revision `revision`'s file `bytes`: its trailer names the root's header (an ID naming this revision and offset, its
@@ -249,7 +244,7 @@ impl Drop for Scratch {
 
 /// Writes `repository`'s view as FSFS's files beneath `root`.
 #[allow(clippy::disallowed_methods)]
-fn materialize(view: &View, repository: &Repository, root: &str) {
+fn materialize(view: &View, repository: &Standalone, root: &str) {
   let youngest = repository.youngest();
   for directory in fsfs::directories(youngest) {
     std::fs::create_dir_all(format!("{root}/{directory}")).unwrap();
@@ -326,7 +321,7 @@ fn stock_svnadmin_and_svnlook_read_the_view_as_the_repository_the_dump_was_taken
 }
 
 /// The repository of `FULL`'s revisions before `revision`: the dump cut where that revision's record begins.
-fn imported_before(revision: u64) -> Repository {
+fn imported_before(revision: u64) -> Standalone {
   let marker = format!("Revision-number: {revision}\n");
   let at = find(FULL, marker.as_bytes()).unwrap();
   imported(&FULL[..at])
@@ -337,12 +332,12 @@ fn imported_before(revision: u64) -> Repository {
 struct Retried {
   name: String,
   files: fsfs::TransactionFiles,
-  before: Repository,
+  before: Standalone,
   view: View,
 }
 
 /// Revision `revision`'s work of `full`, tried on the revision before it.
-fn retried(full: &Repository, revision: u64) -> Retried {
+fn retried(full: &Standalone, revision: u64) -> Retried {
   let before = imported_before(revision);
   let (view, _) = laid_out(&before, usize::MAX);
   let name = full
@@ -417,7 +412,7 @@ fn each_revisions_work_makes_a_transaction_directory_rooted_at_node_0_0() {
 
 /// Writes a retried transaction's directory and prototype file beneath `root`, its repository written there first.
 #[allow(clippy::disallowed_methods)]
-fn materialize_transaction(retried: &Retried, full: &Repository, root: &str) {
+fn materialize_transaction(retried: &Retried, full: &Standalone, root: &str) {
   materialize(&retried.view, &retried.before, root);
   for directory in &retried.files.directories {
     std::fs::create_dir_all(format!("{root}/{directory}")).unwrap();

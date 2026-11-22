@@ -866,3 +866,976 @@ fn t_a694_an_append_makes_each_new_branch_its_own_green() {
     );
   });
 }
+
+thread_local! {
+  /// P2's test: the store an owed push reads its objects from, on the shard's thread.
+  static OWED_STORE: std::cell::RefCell<Store> = std::cell::RefCell::new(Store::default());
+}
+
+/// P2's test objects: [`OWED_STORE`], as `crate::green_ready` reads an owed push's objects.
+fn owed_objects() -> Box<dyn PushObjects> {
+  Box::new(OWED_STORE.with(|store| store.borrow().clone()))
+}
+
+/// A request's completion as its reply, if recorded.
+fn completed_reply(
+  state: &ShardState,
+  (origin, id): (u64, slates_wire::request::RequestId),
+) -> Option<ReplyBody> {
+  match state
+    .db
+    .partition()
+    .completion(origin, id.client, id.sequence)
+  {
+    slates_wire::request::Seen::Completed(bytes) => {
+      <ReplyBody as slates_wire::Wire>::from_bytes(&bytes).ok()
+    }
+    _ => None,
+  }
+}
+
+/// The owed green's version 1 durable, its chain entry the push's record (not a work) and shorter than the eager
+/// green's.
+fn owed_is_its_record(state: &ShardState, (owed, eager): (DbVolumeId, DbVolumeId)) {
+  let partition = state.db.partition();
+  assert_eq!(partition.green_head(owed), 1, "the owed version is durable");
+  let owed_entry = partition
+    .green_chain(owed)
+    .first()
+    .cloned()
+    .expect("the owed entry");
+  let eager_entry = partition
+    .green_chain(eager)
+    .first()
+    .cloned()
+    .expect("the eager entry");
+  assert!(
+    slates_merge::push::DeferredPush::is_record(&owed_entry),
+    "the push's record, not a work"
+  );
+  assert!(
+    owed_entry.len() < eager_entry.len(),
+    "{} against {}",
+    owed_entry.len(),
+    eager_entry.len()
+  );
+}
+
+/// P2 (main's ruling of 2026-11-21 05:12; w-git's request): a created ref's green owes its push and is made when first
+/// reached. Do: push one change creating branch `eager` with its built work and one creating `owed` deferring the same
+/// tree (`BranchChange::CreateDeferred`); read `owed` around the door; fold and checkpoint it; then create a work over it
+/// as a client's recorded request, and wait for the answer; then replay it from its durable chain. Expect:
+/// - `owed` owes its push: `Greens::get` lends nothing (counted), its durable head is 1, its version-1 entry is the
+///   push's record and far smaller than `eager`'s, and its fold and checkpoint do nothing;
+/// - the request parks (no answer, no completion), the green is materialized, then the request is answered, a work
+///   created over version 1;
+/// - `owed` then reads as `eager`: the same head, files and head identity;
+/// - its replay from the durable chain stands at its base and owes version 1 again, as a restart leaves it.
+#[test]
+fn a_deferred_create_is_made_when_first_reached_and_reads_as_the_eager_create() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let id = slates_wire::request::RequestId {
+    client: 7,
+    sequence: 1,
+  };
+  let (eager, owed) = crate::daemon::observe_first(&daemon, move |state| {
+    let (repo, main) = repository(state, "p2");
+    let mut store = Store::default();
+    let tree = store.put_tree(&[("f", b"one"), ("g", b"two")]);
+    let built = work(state, main, (0, None), (tree, b"h1"), (&store, 1));
+    let owed_push = slates_merge::push::Push {
+      name: [2; 32],
+      base_version: 0,
+      base_tree: None,
+      tree,
+      head: Some(b"h1"),
+    };
+    let changes = vec![
+      BranchChange::Create {
+        name: "eager".to_owned(),
+        from: main,
+        version: 0,
+        work: Some(built),
+      },
+      BranchChange::CreateDeferred {
+        name: "owed".to_owned(),
+        from: main,
+        version: 0,
+        push: slates_merge::push::DeferredPush::of(&owed_push, ROOM),
+      },
+    ];
+    let pushed = push(state, &owner(), repo, changes, EntryParts::default()).expect("pushed");
+    assert!(pushed.recorded);
+    let branch_of = |name: &str| {
+      state
+        .db
+        .partition()
+        .repositories()
+        .branch(repo, name)
+        .expect("the branch")
+    };
+    let (eager, owed) = (branch_of("eager"), branch_of("owed"));
+    assert!(
+      state.greens.is_owing(&owed),
+      "the deferred green owes its push"
+    );
+    let reached = state.greens.owing_reached();
+    assert!(state.greens.get(&owed).is_none(), "no lend around the door");
+    assert_eq!(
+      state.greens.owing_reached(),
+      reached + 1,
+      "the reach counted"
+    );
+    owed_is_its_record(state, (owed, eager));
+    crate::merge_service::checkpoint_green(state, owed);
+    assert!(
+      state.db.partition().green_checkpoint(owed).is_none(),
+      "an owing green's checkpoint is nothing"
+    );
+    OWED_STORE.with(|held| *held.borrow_mut() = store);
+    crate::green_ready::TEST_OBJECTS.with(|objects| objects.set(Some(owed_objects)));
+    let parked = crate::verbs::run_recorded_for_test(
+      state,
+      (7, id),
+      &owner(),
+      RequestBody::CreateWork {
+        green: crate::verbs::to_wire_volume(owed),
+        name: "over-owed".to_owned(),
+      },
+    );
+    assert!(parked.is_none(), "parked, not answered: {parked:?}");
+    assert!(
+      completed_reply(state, (7, id)).is_none(),
+      "nothing recorded while parked"
+    );
+    (eager, owed)
+  });
+  let began = std::time::Instant::now();
+  let answered = loop {
+    let answered =
+      crate::daemon::observe_first(&daemon, move |state| completed_reply(state, (7, id)));
+    if answered.is_some() || began.elapsed() > std::time::Duration::from_secs(60) {
+      break answered;
+    }
+  };
+  let (reads, replayed, made) = crate::daemon::observe_first(&daemon, move |state| {
+    let mut read = |green: DbVolumeId| {
+      let mut engine = state.greens.get_mut(&green).expect("materialized");
+      let files: Vec<(String, Vec<u8>)> = engine
+        .files()
+        .map(|(path, bytes)| (path, bytes.to_vec()))
+        .collect();
+      (engine.head(), files, engine.head_identity())
+    };
+    let reads = (read(owed), read(eager));
+    let made = state
+      .refusals
+      .get(crate::green_ready::MATERIALIZED)
+      .copied();
+    (
+      reads,
+      crate::verbs::replay_green_for_test(state, owed),
+      made,
+    )
+  });
+  daemon.stop();
+  assert!(
+    matches!(answered, Some(ReplyBody::WorkCreated { .. })),
+    "the parked request answered once the green was made: {answered:?}"
+  );
+  assert_eq!(made, Some(1), "materialized once");
+  assert_eq!(reads.0, reads.1, "the owed green reads as the eager one");
+  assert_eq!(
+    replayed,
+    Some((0, Some(1))),
+    "replayed, it stands at its base and owes version 1 again"
+  );
+}
+
+/// Waits on `daemon`'s first shard until request `id` of origin 7 is answered, within a minute: its reply.
+fn answered_on_shard(
+  daemon: &crate::daemon::Daemon,
+  id: slates_wire::request::RequestId,
+) -> Option<ReplyBody> {
+  let began = std::time::Instant::now();
+  loop {
+    let answered =
+      crate::daemon::observe_first(daemon, move |state| completed_reply(state, (7, id)));
+    if answered.is_some() || began.elapsed() > std::time::Duration::from_secs(60) {
+      return answered;
+    }
+  }
+}
+
+/// P2's memory-sizing rule (main's order of 05:16: derived content is never kept unbounded). Do: create two branches
+/// that each owe a push, keep at most one untouched green materialized, then read the first, the second, and the first
+/// again, each as a client's recorded request that writes nothing. Expect: each read answered; reading the second
+/// drops the first back to owing (counted), and reading the first again makes it again; three materializations and the
+/// drops counted, the second still materialized at the end.
+#[test]
+fn an_untouched_materialized_green_past_the_bound_is_dropped_back_and_made_again_when_read() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let ask = |sequence: u32| slates_wire::request::RequestId {
+    client: 7,
+    sequence,
+  };
+  let (first, second) = crate::daemon::observe_first(&daemon, move |state| {
+    let (repo, main) = repository(state, "p2-bound");
+    let mut store = Store::default();
+    let tree = store.put_tree(&[("f", b"one"), ("g", b"two")]);
+    let owed = |name: &str, tag: u8| BranchChange::CreateDeferred {
+      name: name.to_owned(),
+      from: main,
+      version: 0,
+      push: slates_merge::push::DeferredPush::of(
+        &slates_merge::push::Push {
+          name: [tag; 32],
+          base_version: 0,
+          base_tree: None,
+          tree,
+          head: Some(b"h1"),
+        },
+        ROOM,
+      ),
+    };
+    push(
+      state,
+      &owner(),
+      repo,
+      vec![owed("first", 1), owed("second", 2)],
+      EntryParts::default(),
+    )
+    .expect("pushed");
+    let branch_of = |name: &str| {
+      state
+        .db
+        .partition()
+        .repositories()
+        .branch(repo, name)
+        .expect("the branch")
+    };
+    OWED_STORE.with(|held| *held.borrow_mut() = store);
+    crate::green_ready::TEST_OBJECTS.with(|objects| objects.set(Some(owed_objects)));
+    crate::green_ready::TEST_KEEP_BOUND.with(|bound| bound.set(Some(1)));
+    (branch_of("first"), branch_of("second"))
+  });
+  let read = |sequence: u32, green: DbVolumeId| {
+    crate::daemon::observe_first(&daemon, move |state| {
+      crate::verbs::run_recorded_for_test(
+        state,
+        (7, ask(sequence)),
+        &owner(),
+        RequestBody::Versions {
+          green: crate::verbs::to_wire_volume(green),
+        },
+      )
+    })
+  };
+  assert!(read(1, first).is_none(), "the first read parks");
+  let one = answered_on_shard(&daemon, ask(1));
+  assert!(read(2, second).is_none(), "the second read parks");
+  let two = answered_on_shard(&daemon, ask(2));
+  let after_two = crate::daemon::observe_first(&daemon, move |state| {
+    (
+      state.greens.is_owing(&first),
+      state.greens.is_owing(&second),
+    )
+  });
+  assert!(read(3, first).is_none(), "the first, dropped, parks again");
+  let three = answered_on_shard(&daemon, ask(3));
+  let counted = crate::daemon::observe_first(&daemon, move |state| {
+    let count = |name| state.refusals.get(name).copied().unwrap_or(0);
+    (
+      count(crate::green_ready::MATERIALIZED),
+      count(crate::green_ready::DEMATERIALIZED),
+      state.greens.is_owing(&first),
+    )
+  });
+  daemon.stop();
+  for (n, answer) in [one, two, three].into_iter().enumerate() {
+    assert!(
+      matches!(answer, Some(ReplyBody::Versions { .. })),
+      "read {} answered: {answer:?}",
+      n + 1
+    );
+  }
+  assert_eq!(
+    after_two,
+    (true, false),
+    "the first dropped back to owing, the second kept"
+  );
+  assert_eq!(
+    counted,
+    (3, 2, false),
+    "three made, two dropped (first, then second), the first made at the end"
+  );
+}
+
+/// A holder's replica at version 0 given the owing green's shipped `inputs` (the push's record) and `identity`: its
+/// base's identity; it then owes version 1, stands for it with the record's identity, and refuses a later increment
+/// (made from `built`) while it owes, nothing applied. The replica.
+fn replica_owing_the_record(
+  (inputs, identity): (&[u8], [u8; 32]),
+  built: &slates_merge::engine::Increment,
+) -> slates_merge::engine::Green {
+  let mut replica = slates_merge::engine::Green::new();
+  assert_eq!(
+    identity,
+    replica.head_identity(),
+    "the owing green's identity is its base's"
+  );
+  assert_eq!(
+    crate::merge_service::apply_inputs(&mut replica, inputs, 1),
+    Ok(())
+  );
+  assert!(!replica.is_materialized());
+  assert_eq!(replica.reached(), 1, "the replica stands for version 1");
+  assert_eq!(
+    replica.head_identity(),
+    identity,
+    "its identity is the record's"
+  );
+  let mut later = built.clone();
+  later.id = [9; 32];
+  later.base = 1;
+  assert_eq!(
+    crate::merge_service::apply_inputs(&mut replica, &later.encode(), 2),
+    Err(crate::merge_service::REPLICA_OWES)
+  );
+  assert_eq!(replica.reached(), 1, "nothing applied while it owes");
+  replica
+}
+
+/// An import batch over `batch_main` (at its first version) with three revisions staged a revision at a time: the
+/// green shows nothing of them, and a replay of its durable chain (a crash's recovery) reaches the first version alone.
+fn staged_batch(
+  state: &mut ShardState,
+  batch_main: DbVolumeId,
+  (trees, store): (&[ObjectKey], &Store),
+) -> crate::import_batch::ImportBatch {
+  let mut batch = crate::import_batch::ImportBatch::begin(state, batch_main).expect("a batch");
+  for n in 1..4u8 {
+    let index = usize::from(n);
+    let next = batch_work(
+      state,
+      &batch,
+      (trees[index - 1], trees[index], &[n]),
+      (store, n + 1),
+    );
+    assert_eq!(batch.stage(state, next), Ok(u64::from(n) + 1));
+  }
+  assert_eq!(
+    green_reads(state, batch_main).0,
+    1,
+    "the green shows nothing of a staged batch"
+  );
+  // A crash now recovers to before the batch: what a replay of the durable chain reaches.
+  assert_eq!(
+    crate::verbs::replay_green_for_test(state, batch_main),
+    Some((1, None)),
+    "nothing of it durable"
+  );
+  batch
+}
+
+/// P2 at f > 0 (main's order of 05:51, R8: laptop and fleet one code path). Do: push an eager create and an owed create
+/// of the same tree; take the merge record the owner ships holders for the owed version 1 (`enqueue_record`'s inputs and
+/// identity); apply it to a holder's replica of the green at version 0 as a holder does (`apply_inputs`, the record's
+/// recomputation and the ledger rebuild alike); offer the replica a later increment; then adopt the replica as a
+/// takeover successor does and make it from the push's objects, as the successor's door would. Expect:
+/// - the shipped inputs are the push's record, not a work, and the identity the owing green's (its base's);
+/// - the replica owes version 1 (`reached`), its head identity the record's, so a takeover counting it finds it whole;
+/// - a later increment is refused `merge.replica.owes` while it owes, nothing applied;
+/// - made, the adopted replica reads as the eager green: head, files, head identity.
+#[test]
+fn a_holders_replica_owes_the_same_push_and_a_takeover_makes_it_the_eager_green() {
+  crate::test_store::audit_on_stored_shard("p2-holder", |state| {
+    let (repo, main) = repository(state, "p2-holder");
+    let mut store = Store::default();
+    let tree = store.put_tree(&[("f", b"one"), ("g", b"two")]);
+    let built = work(state, main, (0, None), (tree, b"h1"), (&store, 1));
+    let owed_push = slates_merge::push::Push {
+      name: [2; 32],
+      base_version: 0,
+      base_tree: None,
+      tree,
+      head: Some(b"h1"),
+    };
+    let changes = vec![
+      BranchChange::Create {
+        name: "eager".to_owned(),
+        from: main,
+        version: 0,
+        work: Some(built.clone()),
+      },
+      BranchChange::CreateDeferred {
+        name: "owed".to_owned(),
+        from: main,
+        version: 0,
+        push: slates_merge::push::DeferredPush::of(&owed_push, ROOM),
+      },
+    ];
+    push(state, &owner(), repo, changes, EntryParts::default()).expect("pushed");
+    let branch_of = |name: &str| {
+      state
+        .db
+        .partition()
+        .repositories()
+        .branch(repo, name)
+        .expect("the branch")
+    };
+    let (eager, owed) = (branch_of("eager"), branch_of("owed"));
+    let (inputs, identity) =
+      crate::merge_service::shipped_for_test(state, owed, 1).expect("the shipped record");
+    assert!(
+      slates_merge::push::DeferredPush::is_record(&inputs),
+      "the push's record is the inputs"
+    );
+    let mut replica = replica_owing_the_record((&inputs, identity), &built);
+    let mut building = replica
+      .materializing(slates_merge::pace::Pace::unbounded())
+      .expect("it owes a push");
+    let made = loop {
+      if let Some(made) = building.advance(&replica, &store) {
+        break made.expect("built");
+      }
+    };
+    assert_eq!(replica.materialize(&made.increment), Ok(1));
+    let mut engine = state.greens.get_mut(&eager).expect("the eager green");
+    let files = |green: &slates_merge::engine::Green| -> Vec<(String, Vec<u8>)> {
+      green
+        .files()
+        .map(|(path, bytes)| (path, bytes.to_vec()))
+        .collect()
+    };
+    assert_eq!(
+      (replica.head(), files(&replica), replica.head_identity()),
+      (engine.head(), files(&engine), engine.head_identity()),
+      "the adopted replica, made, reads as the eager green"
+    );
+  });
+}
+
+/// P2's retention (main's order of 05:51: secured before the build commits, as the admission rule charges, with a typed
+/// refusal at the room). Do: push a create that owes its push; hold the green's retention charge at its cap; read it as a
+/// client's recorded request; then free the room and read again. Expect: with no room the materialization is refused
+/// before it commits (counted `merge.green.materialize_over_room`), the green still owes, nothing recorded; with room the
+/// second read makes it and is answered. Settled after the commit, as before this change, it committed past the room.
+#[test]
+fn a_materialization_past_the_greens_retention_room_is_refused_before_it_commits() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let ask = |sequence: u32| slates_wire::request::RequestId {
+    client: 7,
+    sequence,
+  };
+  let owed = crate::daemon::observe_first(&daemon, move |state| {
+    let (repo, main) = repository(state, "p2-room");
+    let mut store = Store::default();
+    let tree = store.put_tree(&[("f", b"one"), ("g", b"two")]);
+    let change = BranchChange::CreateDeferred {
+      name: "owed".to_owned(),
+      from: main,
+      version: 0,
+      push: slates_merge::push::DeferredPush::of(
+        &slates_merge::push::Push {
+          name: [3; 32],
+          base_version: 0,
+          base_tree: None,
+          tree,
+          head: Some(b"h1"),
+        },
+        ROOM,
+      ),
+    };
+    push(state, &owner(), repo, vec![change], EntryParts::default()).expect("pushed");
+    let owed = state
+      .db
+      .partition()
+      .repositories()
+      .branch(repo, "owed")
+      .expect("the branch");
+    OWED_STORE.with(|held| *held.borrow_mut() = store);
+    crate::green_ready::TEST_OBJECTS.with(|objects| objects.set(Some(owed_objects)));
+    // The green's own retention cap, held: no room for any byte more.
+    let cap = u64::try_from(crate::merge_service::rejected_cache_budget(state)).unwrap_or(u64::MAX);
+    state.green_retention.insert(owed, cap);
+    owed
+  });
+  let read = |sequence: u32| {
+    crate::daemon::observe_first(&daemon, move |state| {
+      crate::verbs::run_recorded_for_test(
+        state,
+        (7, ask(sequence)),
+        &owner(),
+        RequestBody::Versions {
+          green: crate::verbs::to_wire_volume(owed),
+        },
+      )
+    })
+  };
+  assert!(read(1).is_none(), "the first read parks");
+  let began = std::time::Instant::now();
+  let refused = loop {
+    let seen = crate::daemon::observe_first(&daemon, move |state| {
+      (
+        state
+          .refusals
+          .get(crate::green_ready::MATERIALIZE_OVER_ROOM)
+          .copied()
+          .unwrap_or(0),
+        state.greens.is_owing(&owed),
+        completed_reply(state, (7, ask(1))).is_some(),
+      )
+    });
+    if seen.0 > 0 || began.elapsed() > std::time::Duration::from_secs(60) {
+      break seen;
+    }
+  };
+  crate::daemon::observe_first(&daemon, move |state| {
+    state.green_retention.insert(owed, 0);
+  });
+  assert!(read(2).is_none(), "the second read parks");
+  let answered = answered_on_shard(&daemon, ask(2));
+  let made = crate::daemon::observe_first(&daemon, move |state| {
+    (
+      state.greens.is_owing(&owed),
+      state
+        .refusals
+        .get(crate::green_ready::MATERIALIZED)
+        .copied()
+        .unwrap_or(0),
+    )
+  });
+  daemon.stop();
+  assert_eq!(
+    refused,
+    (1, true, false),
+    "refused before it committed: still owing, nothing recorded"
+  );
+  assert!(
+    matches!(answered, Some(ReplyBody::Versions { .. })),
+    "{answered:?}"
+  );
+  assert_eq!(made, (false, 1), "made once there was room");
+}
+
+/// A revision's work for an import's batch: `tree` pushed over `base`, built against the batch's green as its staged
+/// revisions leave it, numbered as the green numbers it (based at the batch's head).
+fn batch_work(
+  state: &mut ShardState,
+  batch: &crate::import_batch::ImportBatch,
+  (base, tree, head): (ObjectKey, ObjectKey, &[u8]),
+  (store, name): (&Store, u8),
+) -> Increment {
+  let mut built = batch
+    .with_engine(state, |engine| {
+      let push = Push {
+        name: [name; 32],
+        base_version: engine.head(),
+        base_tree: Some(base),
+        tree,
+        head: Some(head),
+      };
+      slates_merge::push::build(&push, engine, store, ROOM)
+        .expect("the work is built")
+        .increment
+    })
+    .expect("the batch's green");
+  built.base = batch.head();
+  built
+}
+
+/// A green as a test compares it: head, files, head identity, durable head.
+type GreenRead = (u64, Vec<(String, Vec<u8>)>, [u8; 32], u64);
+
+/// Reads a green as a test compares it: head, files, head identity, durable head (its checkpoint and chain).
+fn green_reads(state: &mut ShardState, green: DbVolumeId) -> GreenRead {
+  let durable = state.db.partition().green_head(green);
+  let mut engine = state.greens.get_mut(&green).expect("the green");
+  let files = engine
+    .files()
+    .map(|(path, bytes)| (path, bytes.to_vec()))
+    .collect();
+  (engine.head(), files, engine.head_identity(), durable)
+}
+
+/// C2 stage C, the green's side (A-814; main's order of 06:11). Do: on two git repositories, commit a first version,
+/// then three more revisions, on one green each as its own entry (each bringing a changeset's reference, as an svn
+/// revision does), on the other through one import batch (staged a revision at a time against the batch's green, then
+/// committed with one reference); read the batch's green while staged; replay it after. Expect:
+/// - while staged, the batch's green shows nothing (its head the first version's), and a replay of its durable chain,
+///   what a crash recovers, reaches the first version alone;
+/// - committed, the two greens read alike: head 4, the same files and head identity, durable at 4;
+/// - the batched repository's register took one entry for the three revisions where the other took three;
+/// - the batched green replayed from its chain reaches the same head.
+#[test]
+fn an_import_batch_commits_its_revisions_as_one_entry_and_reads_as_one_by_one() {
+  crate::test_store::audit_on_stored_shard("import-batch", |state| {
+    let (one_by_one, seq_main) = repository(state, "one-by-one");
+    let (batched, batch_main) = repository(state, "batched");
+    let mut store = Store::default();
+    let trees: Vec<ObjectKey> = [
+      &[("f", &b"zero"[..])][..],
+      &[("f", &b"one"[..]), ("g", &b"g1"[..])][..],
+      &[("f", &b"two"[..]), ("g", &b"g1"[..])][..],
+      &[("f", &b"two"[..]), ("g", &b"g3"[..]), ("h", &b"new"[..])][..],
+    ]
+    .iter()
+    .map(|files| store.put_tree(files))
+    .collect();
+    let reference = |n: u8| EntryParts {
+      objects: vec![b'r', n],
+      ..EntryParts::default()
+    };
+    for (repo, green) in [(one_by_one, seq_main), (batched, batch_main)] {
+      let first = work(state, green, (0, None), (trees[0], b"h0"), (&store, 1));
+      push(
+        state,
+        &owner(),
+        repo,
+        vec![BranchChange::Update { green, work: first }],
+        reference(0),
+      )
+      .expect("the first version");
+    }
+    for n in 1..4u8 {
+      let index = usize::from(n);
+      let next = work(
+        state,
+        seq_main,
+        (u64::from(n), Some(trees[index - 1])),
+        (trees[index], &[n]),
+        (&store, n + 1),
+      );
+      push(
+        state,
+        &owner(),
+        one_by_one,
+        vec![BranchChange::Update {
+          green: seq_main,
+          work: next,
+        }],
+        reference(n),
+      )
+      .expect("a revision, one entry");
+    }
+    let batch = staged_batch(state, batch_main, (&trees, &store));
+    let mut recorded = batch
+      .commit(state, (&owner(), batched), reference(9))
+      .expect("committed");
+    // Applied a slice at a time after its record (`RecordedBatch::apply_slice`).
+    let made = loop {
+      if let Some(made) = recorded.apply_slice(state) {
+        break made;
+      }
+    };
+    assert_eq!(made, vec![2, 3, 4]);
+    assert_eq!(
+      green_reads(state, batch_main),
+      green_reads(state, seq_main),
+      "the batch reads as one by one"
+    );
+    let entries = |repo| state.db.partition().repositories().object_count(repo);
+    assert_eq!(
+      (entries(one_by_one), entries(batched)),
+      (4, 2),
+      "three entries against one for the revisions"
+    );
+    assert_eq!(
+      crate::verbs::replay_green_for_test(state, batch_main),
+      Some((4, None)),
+      "the record replays whole"
+    );
+  });
+}
+
+/// C2 stage C's refusals (A-814). Do: stage two revisions into a batch over a green at version 1, then abandon it; stage
+/// two again and commit them as another principal; stage one based off the batch's head. Expect: abandoned, the green
+/// and its chain are as they were; the commit refused `Forbidden`, nothing applied or recorded; the off-head work refused
+/// `NotAtHead`, nothing kept.
+#[test]
+fn an_import_batch_refused_or_abandoned_leaves_its_green_as_it_was() {
+  crate::test_store::audit_on_stored_shard("import-batch-refused", |state| {
+    let (repo, main) = repository(state, "refused");
+    let mut store = Store::default();
+    let zero = store.put_tree(&[("f", b"zero")]);
+    let one = store.put_tree(&[("f", b"one")]);
+    let two = store.put_tree(&[("f", b"two")]);
+    let first = work(state, main, (0, None), (zero, b"h0"), (&store, 1));
+    push(
+      state,
+      &owner(),
+      repo,
+      vec![BranchChange::Update {
+        green: main,
+        work: first,
+      }],
+      EntryParts::default(),
+    )
+    .expect("the first version");
+    let before = green_reads(state, main);
+    let staged_two = |state: &mut ShardState| {
+      let mut batch = crate::import_batch::ImportBatch::begin(state, main).expect("a batch");
+      let w1 = batch_work(state, &batch, (zero, one, b"h1"), (&store, 2));
+      batch.stage(state, w1).expect("staged");
+      let w2 = batch_work(state, &batch, (one, two, b"h2"), (&store, 3));
+      batch.stage(state, w2).expect("staged");
+      batch
+    };
+    staged_two(state).abandon(state);
+    assert_eq!(green_reads(state, main), before, "abandoned: as it was");
+    let refused = staged_two(state)
+      .commit(state, (&stranger(), repo), EntryParts::default())
+      .err();
+    assert!(
+      matches!(
+        refused,
+        Some(AppendRefused::Repository(Refusal::Forbidden { .. }))
+      ),
+      "{refused:?}"
+    );
+    assert_eq!(green_reads(state, main), before, "refused: as it was");
+    let mut batch = crate::import_batch::ImportBatch::begin(state, main).expect("a batch");
+    let mut off = batch_work(state, &batch, (zero, one, b"h1"), (&store, 4));
+    off.base = 0;
+    assert_eq!(
+      batch.stage(state, off),
+      Err(crate::import_batch::StageRefused::NotAtHead { head: 1 })
+    );
+    assert_eq!(batch.staged(), 0);
+    batch.abandon(state);
+    assert_eq!(green_reads(state, main), before);
+  });
+}
+
+thread_local! {
+  /// The preview test's pending accept, kept on the shard's thread from one step to the next.
+  static HELD_PENDING: std::cell::RefCell<Option<crate::made_commit::Pending>> = const { std::cell::RefCell::new(None) };
+}
+
+/// P2's preview lifetime (main's ruling of 2026-11-21 07:30, for w-git's C5 2b piece 3: a made commit's path map is
+/// built a slice a turn against the version the held verdict makes). Do: on a git green at version 1, judge a second
+/// work and hold its verdict's preview with a pending accept (`made_commit::hold_preview`); in a later step of the shard,
+/// read through it (`with_held_preview`); in a third, commit the accept (`made_commit::commit`). Expect:
+/// - while held, the preview reads as version 2 (the work's bytes), the green still at version 1 with its own bytes,
+///   and its lineage holds one member more (the preview);
+/// - the read in a later step counts `vcs.made.preview_held_across_turns` once;
+/// - committed, the green is at version 2 with the work's bytes, and the preview is retired (the lineage back to its
+///   members).
+#[test]
+fn a_held_verdicts_preview_lives_across_turns_until_its_one_step() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (main, repo, members) = crate::daemon::observe_first(&daemon, move |state| {
+    let (repo, main) = repository(state, "held-preview");
+    let mut store = Store::default();
+    let one = store.put_tree(&[("f", b"one")]);
+    let two = store.put_tree(&[("f", b"two"), ("g", b"new")]);
+    let first = work(state, main, (0, None), (one, b"h1"), (&store, 1));
+    push(
+      state,
+      &owner(),
+      repo,
+      vec![BranchChange::Update {
+        green: main,
+        work: first,
+      }],
+      EntryParts::default(),
+    )
+    .expect("version 1");
+    let members = state.greens.lineage_len(repo);
+    let second = work(state, main, (1, Some(one)), (two, b"h2"), (&store, 2));
+    let judged = match state
+      .greens
+      .get_mut(&main)
+      .expect("the green")
+      .judge(&second)
+    {
+      slates_merge::engine::Judgment::Accepted(judged) => judged,
+      other => panic!("not accepted: {other:?}"),
+    };
+    let parts = crate::verbs::AcceptedParts::for_test(
+      state,
+      (main, main, 2),
+      (second, judged.applied().to_vec()),
+    );
+    let mut pending = crate::made_commit::Pending::for_test(parts);
+    assert!(
+      crate::made_commit::hold_preview(state, &mut pending, judged),
+      "a preview held"
+    );
+    assert_eq!(
+      state.greens.lineage_len(repo),
+      members + 1,
+      "the preview is a member while held"
+    );
+    HELD_PENDING.with(|held| *held.borrow_mut() = Some(pending));
+    (main, repo, members)
+  });
+  let later = crate::daemon::observe_first(&daemon, move |state| {
+    let mut pending = HELD_PENDING
+      .with(|held| held.borrow_mut().take())
+      .expect("the pending accept");
+    let previewed = crate::made_commit::with_held_preview(state, &mut pending, |engine| {
+      engine.content("g").map(<[u8]>::to_vec)
+    });
+    let green = state
+      .greens
+      .get(&main)
+      .map(|engine| (engine.head(), engine.content("f").map(<[u8]>::to_vec)));
+    let counted = state
+      .refusals
+      .get(crate::made_commit::PREVIEW_HELD_ACROSS_TURNS)
+      .copied();
+    HELD_PENDING.with(|held| *held.borrow_mut() = Some(pending));
+    (previewed, green, counted)
+  });
+  let committed = crate::daemon::observe_first(&daemon, move |state| {
+    let pending = HELD_PENDING
+      .with(|held| held.borrow_mut().take())
+      .expect("the pending accept");
+    let made = crate::made_commit::commit(state, pending, |_| Ok::<(), ()>(()));
+    let green = state
+      .greens
+      .get(&main)
+      .map(|engine| (engine.head(), engine.content("g").map(<[u8]>::to_vec)));
+    (made, green, state.greens.lineage_len(repo))
+  });
+  daemon.stop();
+  assert_eq!(
+    later.0,
+    Some(Some(b"new".to_vec())),
+    "the preview reads as version 2 in a later step"
+  );
+  assert_eq!(
+    later.1,
+    Some((1, Some(b"one".to_vec()))),
+    "the green shows version 1 while the verdict is held"
+  );
+  assert_eq!(later.2, Some(1), "held across a turn, counted once");
+  assert_eq!(committed.0, Some(Ok(())));
+  assert_eq!(
+    committed.1,
+    Some((2, Some(b"new".to_vec()))),
+    "committed in the one step"
+  );
+  assert_eq!(committed.2, members, "the preview retired in the one step");
+}
+
+/// 01a1ff2e's ruling of 2026-11-21 17:26, option (a) (`crate::held_ahead`): a push's increment held in the content
+/// store a unit a step before its landing's step, which names it. Do: build a work adding a file of three chunks and a
+/// byte (`merge_origin::inputs_chunk_bytes`) to a new repository's `main`; hold its increment ahead, a unit a call;
+/// push it with what the hold made; then hold a second work's increment ahead and push it refused (its green owed at a
+/// version another push took). Expect the hold taken over more units than the increment has chunks, each unit within
+/// one chunk's bytes; the landing naming the held inputs (`push.held_ahead.named` 1) and holding none afresh
+/// (`merge.inputs.held_by_owner` unmoved), the content store still holding them once the entry names them; and the
+/// refused push's hold given back (`held_ahead::give_back`), the store no longer holding it.
+#[test]
+fn a_push_held_ahead_of_its_landing_is_named_by_its_step() {
+  crate::test_store::audit_on_stored_shard("repository-push-held-ahead", |state| {
+    let (repo, main) = repository(state, "ahead");
+    let chunk = crate::merge_origin::inputs_chunk_bytes();
+    let large: Vec<u8> = (0..chunk * 3 + 1).map(|at| (at % 251) as u8).collect();
+    let mut store = Store::default();
+    let tree = store.put_tree(&[("large", &large)]);
+    let changed = store.put_tree(&[("large", b"small")]);
+    let room = u64::try_from(large.len() * 4).expect("a room");
+    let built = |state: &ShardState, (version, base): (u64, Option<ObjectKey>), tree, name| {
+      let engine = state.greens.get(&main).expect("the green's engine");
+      let push = Push {
+        name: [name; 32],
+        base_version: version,
+        base_tree: base,
+        tree,
+        head: Some(b"c1".as_slice()),
+      };
+      slates_merge::push::build(&push, &engine, &store, room)
+        .expect("the work is built")
+        .increment
+    };
+    let first = built(state, (0, None), tree, 1);
+    let count = |state: &ShardState, name| state.refusals.get(name).copied().unwrap_or(0);
+    let mut hold = crate::held_ahead::AheadHold::new(main, 1, &first);
+    let mut units = 0u64;
+    let held = loop {
+      units += 1;
+      match hold.unit(state).expect("a unit of the hold") {
+        crate::held_ahead::Ahead::More => assert!(units < 64, "the hold ends"),
+        crate::held_ahead::Ahead::Held(held) => break held,
+      }
+    };
+    let chunks = held
+      .inputs
+      .len
+      .div_ceil(u64::try_from(chunk).expect("a chunk"));
+    assert!(
+      units > chunks,
+      "{units} units for {chunks} chunks: hashed and copied a unit each"
+    );
+    let object = slates_db::register::ObjectId(main.bytes);
+    assert!(
+      state
+        .held_content
+        .holds_manifest(object, &held.inputs.identity)
+    );
+    let owner_holds = count(state, crate::merge_service::INPUTS_HELD_BY_OWNER);
+    let change = BranchChange::Update {
+      green: main,
+      work: first,
+    };
+    let pushed = super::push_holding(
+      state,
+      (&owner(), repo),
+      (vec![change], &[held]),
+      EntryParts::default(),
+      None,
+    );
+    assert!(pushed.is_ok(), "the push lands: {pushed:?}");
+    crate::held_ahead::give_back(state, &[held]);
+    assert_eq!(
+      count(state, crate::held_ahead::AHEAD_NAMED),
+      1,
+      "the step named the hold"
+    );
+    assert_eq!(
+      count(state, crate::merge_service::INPUTS_HELD_BY_OWNER),
+      owner_holds,
+      "the step held nothing afresh"
+    );
+    assert!(
+      state
+        .held_content
+        .holds_manifest(object, &held.inputs.identity),
+      "the entry names the held increment, so it stays"
+    );
+    let second = built(state, (1, Some(tree)), changed, 2);
+    let mut hold = crate::held_ahead::AheadHold::new(main, 2, &second);
+    let refused_hold = loop {
+      match hold.unit(state).expect("a unit of the hold") {
+        crate::held_ahead::Ahead::More => {}
+        crate::held_ahead::Ahead::Held(held) => break held,
+      }
+    };
+    let stale = built(state, (0, None), changed, 3);
+    let refused = super::push_holding(
+      state,
+      (&owner(), repo),
+      (
+        vec![BranchChange::Update {
+          green: main,
+          work: stale,
+        }],
+        &[refused_hold],
+      ),
+      EntryParts::default(),
+      None,
+    );
+    assert!(refused.is_err(), "the stale push is refused: {refused:?}");
+    crate::held_ahead::give_back(state, &[refused_hold]);
+    assert!(
+      !state
+        .held_content
+        .holds_manifest(object, &refused_hold.inputs.identity),
+      "a hold no entry names is given back"
+    );
+  });
+}

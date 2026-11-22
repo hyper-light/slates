@@ -30,6 +30,7 @@ import asyncio
 import os
 import re
 import resource
+import shutil
 import subprocess
 import sys
 import time
@@ -89,26 +90,35 @@ def rss_kib(pid: int) -> int:
 class Daemon:
     """An anchor and its daemon, with the HTTP edge on loopback and a token."""
 
-    def __init__(self, slates: str, instance: str = ""):
+    def __init__(self, slates: str, instance: str = "", svn: bool = False):
         self.slates = slates
         self.instance = instance or f"w-perf-push-load-{os.getpid()}"
+        # The version-control store a git repository's changesets land in (A-767: a repository needs it since C5), one a
+        # daemon, removed when it stops; never /tmp (CLAUDE.md §2 item 3).
+        self.store = os.path.join(os.path.expanduser("~/.cache/slates-bench-stores"), self.instance)
+        os.makedirs(self.store, exist_ok=True)
         self.anchor = subprocess.Popen(
-            [slates, "--instance", self.instance, "anchor", "--vcs-http", "127.0.0.1:0"],
+            [slates, "--instance", self.instance, "anchor", "--vcs-http", "127.0.0.1:0", "--vcs-store", self.store]
+            + (["--vcs-svn", "127.0.0.1:0"] if svn else []),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
         )
         self.lines: list[str] = []
-        self.port = self.pid = None
+        self.port = self.pid = self.svn_port = None
         exports = None
         deadline = time.time() + 120
-        while time.time() < deadline and (self.port is None or exports is None or not self.serving()):
+        while time.time() < deadline and (
+            self.port is None or exports is None or not self.serving() or (svn and self.svn_port is None)
+        ):
             line = self.anchor.stderr.readline()
             if not line:
                 raise SystemExit("the anchor ended:\n" + "".join(self.lines[-20:]))
             self.lines.append(line)
             if m := re.search(r"HTTP edge serves cleartext on 127\.0\.0\.1:(\d+)", line):
                 self.port = int(m.group(1))
+            if m := re.search(r"svn:// listener serves on 127\.0\.0\.1:(\d+)", line):
+                self.svn_port = int(m.group(1))
             if m := re.search(r"up; daemon pid (\d+);", line):
                 self.pid = int(m.group(1))
             if m := re.match(r"slates anchor: issuer surface: export (.*)", line):
@@ -123,6 +133,7 @@ class Daemon:
         env.update(dict(pair.split("=", 1) for pair in exports))
         minted = self.cli("credential", "token", env=env).stdout
         self.token = re.search(r"^token: (\S+)", minted, re.M).group(1)
+        self.token_id = re.search(r"^id: (\S+)", minted, re.M).group(1)
 
     def serving(self) -> bool:
         return any(f"instance {self.instance} serving on" in line for line in self.lines)
@@ -145,6 +156,7 @@ class Daemon:
                 os.kill(self.pid, 9)
             except ProcessLookupError:
                 pass
+        shutil.rmtree(self.store, ignore_errors=True)
 
 
 async def push(port: int, token: str, repository: str, body: bytes) -> tuple[float, str]:

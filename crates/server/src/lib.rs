@@ -87,13 +87,19 @@ pub mod greens;
 pub mod head;
 #[cfg(target_os = "linux")]
 mod held_copy;
+pub(crate) mod placement_cache;
 // A held NFS connection's send ledger and the judgment its adoption takes (A-550): kept on Linux alone; elsewhere its
 // pure parts are compiled and held by every host's tests, and only its no-op seams are called.
+mod green_ready;
+mod held_ahead;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod held_send;
 pub mod histogram;
 mod identities;
 mod image;
+#[cfg_attr(not(test), allow(dead_code))]
+// Its caller outside tests is svn's import driver (w-svn, C2 stage C).
+mod import_batch;
 pub mod landing;
 mod landing_entries;
 pub mod lease;
@@ -101,6 +107,7 @@ mod lease_wait;
 mod lfs;
 mod live_hold;
 mod live_ship;
+mod made_commit;
 mod member_task;
 // Version 0 of a green over a base, made, shipped and seeded a slice at a time at `f > 0` (§4.16, A-286).
 mod merge_origin;

@@ -121,9 +121,38 @@ type Driven = (
   Option<(slates_git::store::EncodingCounters, u64)>,
 );
 
+/// `push` answered a step a poll, its carries awaited between: whether every ref it updated was accepted.
+async fn answered(push: &mut crate::git_push::ReceivePack) -> bool {
+  use crate::git_push::Answering;
+  let mut answer = Vec::new();
+  loop {
+    let step =
+      crate::state::with_state_counted(|state| match push.answer_step(state, &mut answer) {
+        Ok(Answering::Answered(received)) => Some(
+          received
+            .outcomes
+            .iter()
+            .all(|outcome| matches!(outcome, slates_git::receive::Outcome::Ok(_))),
+        ),
+        Ok(_) => None,
+        Err(_) => Some(false),
+      });
+    match step {
+      Some(Some(ok)) => return ok,
+      Some(None) => {
+        slates_rt::futures::yield_now().await;
+        if crate::git_push::tests::carry_awaited(push).await.is_err() {
+          return false;
+        }
+      }
+      None => return false,
+    }
+  }
+}
+
 /// Pushes `request` to repository `id` a step a poll, then turns its encoding a turn a poll until it is idle.
 async fn drive(id: slates_db::catalog::RepositoryId, request: Vec<u8>) -> Driven {
-  use crate::git_push::{Answering, ReceivePack, Unpresented};
+  use crate::git_push::{ReceivePack, Unpresented};
   let started = crate::state::with_state_counted(|state| {
     let mut advertised = Vec::new();
     ReceivePack::start(
@@ -144,25 +173,7 @@ async fn drive(id: slates_db::catalog::RepositoryId, request: Vec<u8>) -> Driven
   }
   drop(request);
   let _ = crate::state::with_state_counted(|state| push.end(state).is_ok());
-  let mut answer = Vec::new();
-  let ok = loop {
-    let step =
-      crate::state::with_state_counted(|state| match push.answer_step(state, &mut answer) {
-        Ok(Answering::Answered(received)) => Some(
-          received
-            .outcomes
-            .iter()
-            .all(|outcome| matches!(outcome, slates_git::receive::Outcome::Ok(_))),
-        ),
-        Ok(_) => None,
-        Err(_) => Some(false),
-      });
-    match step {
-      Some(Some(ok)) => break ok,
-      Some(None) => slates_rt::futures::yield_now().await,
-      None => break false,
-    }
-  };
+  let ok = answered(&mut push).await;
   let quantum =
     crate::state::with_state_counted(|state| state.config.step_quantum_ns()).unwrap_or(0);
   let (mut turns, mut longest, mut counters) = (0u64, 0u64, None);

@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::ops::{Deref, DerefMut};
 
 use slates_db::catalog::{RepositoryId, VolumeId};
-use slates_merge::engine::{Green, Lent, Lineage, LineageGreen, LineageRefused, Release};
+use slates_merge::engine::{Green, Judged, Lent, Lineage, LineageGreen, LineageRefused, Release};
 
 /// The shard's green engines (module docs).
 #[derive(Default)]
@@ -38,10 +38,21 @@ pub struct Greens {
   lineages: BTreeMap<RepositoryId, RefCell<Lineage>>,
   /// Lends refused because the member's lineage was lent already, or had a member taken out (module docs).
   busy: Cell<u64>,
+  /// Lends refused because the green owes a push (P2, `crate::green_ready`): the reach around the choke point, counted.
+  owing_reached: Cell<u64>,
   /// Retired members' releases still owed, oldest first (module docs, "A retire is sliced").
   pending: VecDeque<(RepositoryId, Release)>,
   /// Whether this shard's release task is running.
   releasing: bool,
+}
+
+/// A held verdict previewed as a member of its green's lineage ([`Greens::preview`]).
+#[must_use = "a preview holds its lineage's nodes until it is retired"]
+pub struct Preview {
+  /// The lineage.
+  repository: RepositoryId,
+  /// The preview's handle there.
+  handle: LineageGreen,
 }
 
 /// What one unit of the queued releases did ([`Greens::release_unit`]).
@@ -104,8 +115,60 @@ impl DerefMut for GreenMut<'_> {
 }
 
 impl Greens {
-  /// `id`'s engine, lent: `None` when there is none, or when its lineage is lent already (counted).
+  /// `id`'s engine, lent: `None` when there is none, when its lineage is lent already (counted), or when it owes a push
+  /// and holds no content yet (P2; counted): every reader reaches a green's content through `crate::green_ready`, which
+  /// materializes it first, so nothing reads around it. [`Greens::lend`] lends one that owes, for the materializer.
   pub fn get(&self, id: &VolumeId) -> Option<GreenRef<'_>> {
+    let lent = self.lend(id)?;
+    if lent.is_materialized() {
+      return Some(lent);
+    }
+    self
+      .owing_reached
+      .set(self.owing_reached.get().saturating_add(1));
+    None
+  }
+
+  /// `id`'s engine, lent for a write: as [`Greens::get`], `None` for a green that owes a push (counted).
+  pub fn get_mut(&mut self, id: &VolumeId) -> Option<GreenMut<'_>> {
+    let owing = self.lend(id).is_some_and(|lent| !lent.is_materialized());
+    if owing {
+      self
+        .owing_reached
+        .set(self.owing_reached.get().saturating_add(1));
+      return None;
+    }
+    self.lend_mut(id)
+  }
+
+  /// Makes `id`'s green owe `push` (P2, `Green::defer`): the version it owes, or none (no such green, or one that cannot
+  /// owe it).
+  pub fn defer(&mut self, id: &VolumeId, push: slates_merge::push::DeferredPush) -> Option<u64> {
+    self.lend_mut(id)?.defer(push)
+  }
+
+  /// The members `repository`'s lineage holds, its previews among them: a test's view.
+  #[cfg(test)]
+  pub fn lineage_len(&mut self, repository: RepositoryId) -> usize {
+    self
+      .lineages
+      .get_mut(&repository)
+      .map_or(0, |lineage| lineage.get_mut().len())
+  }
+
+  /// Whether `id`'s green owes a push (P2): held, and not materialized.
+  pub fn is_owing(&self, id: &VolumeId) -> bool {
+    self.lend(id).is_some_and(|lent| !lent.is_materialized())
+  }
+
+  /// Reaches refused because the green owed a push ([`Greens::get`]): zero in a build where every reader goes through
+  /// `crate::green_ready`.
+  pub fn owing_reached(&self) -> u64 {
+    self.owing_reached.get()
+  }
+
+  /// `id`'s engine, lent whether or not it owes a push: the materializer's, a replay's and a create's lend alone (P2).
+  pub fn lend(&self, id: &VolumeId) -> Option<GreenRef<'_>> {
     if let Some(green) = self.alone.get(id) {
       return Some(GreenRef::Alone(green));
     }
@@ -121,9 +184,9 @@ impl Greens {
     lent.map(|lent| GreenRef::Member(Box::new(lent)))
   }
 
-  /// `id`'s engine, lent for a write: `None` when there is none, or when a member of its lineage is taken out
-  /// (counted).
-  pub fn get_mut(&mut self, id: &VolumeId) -> Option<GreenMut<'_>> {
+  /// `id`'s engine, lent for a write whether or not it owes a push: the materializer's, a replay's and a create's (P2).
+  /// `None` when there is none, or when a member of its lineage is taken out (counted).
+  pub fn lend_mut(&mut self, id: &VolumeId) -> Option<GreenMut<'_>> {
     if let Some(green) = self.alone.get_mut(id) {
       return Some(GreenMut::Alone(green));
     }
@@ -234,6 +297,74 @@ impl Greens {
     let handle = lineage.get_mut().branch(source, version)?;
     self.members.insert(id, (repository, handle));
     Ok(())
+  }
+
+  /// The held verdict `judged` of member `id`'s green previewed as a member of its lineage of its own (A-805,
+  /// `Lineage::preview`): what a reader that must see the version before it commits reads ([`Greens::with_preview`]),
+  /// while `id`'s engine shows nothing of it. Retire it with [`Greens::retire_preview`] in the same step. Refused as the
+  /// lineage refuses it; `Stale` for a green standing alone.
+  pub fn preview(&mut self, id: &VolumeId, judged: Judged) -> Result<Preview, LineageRefused> {
+    let (repository, source) = *self.members.get(id).ok_or(LineageRefused::Stale)?;
+    let lineage = self
+      .lineages
+      .get_mut(&repository)
+      .ok_or(LineageRefused::Stale)?;
+    let handle = lineage.get_mut().preview(source, judged)?;
+    Ok(Preview { repository, handle })
+  }
+
+  /// Runs `call` on `preview`'s engine.
+  pub fn with_preview<R>(
+    &mut self,
+    preview: &Preview,
+    call: impl FnOnce(&Green) -> R,
+  ) -> Result<R, LineageRefused> {
+    let lineage = self
+      .lineages
+      .get_mut(&preview.repository)
+      .ok_or(LineageRefused::Stale)?;
+    lineage.get_mut().with(preview.handle, |green| call(green))
+  }
+
+  /// A scratch member of member `id`'s lineage at its head, O(1) (`Lineage::branch`): what an import's batch advances its
+  /// revisions in (C2 stage C, A-814), the green showing nothing of them until the batch commits. Retire it with
+  /// [`Greens::retire_preview`]. Refused as the lineage refuses a branch; `Stale` for a green standing alone.
+  pub fn preview_at_head(&mut self, id: &VolumeId) -> Result<Preview, LineageRefused> {
+    let (repository, source) = *self.members.get(id).ok_or(LineageRefused::Stale)?;
+    let lineage = self
+      .lineages
+      .get_mut(&repository)
+      .ok_or(LineageRefused::Stale)?;
+    let head = lineage.get_mut().with(source, |green| green.head())?;
+    let handle = lineage.get_mut().branch(source, head)?;
+    Ok(Preview { repository, handle })
+  }
+
+  /// Runs `call` on `preview`'s engine, for a write.
+  pub fn with_preview_mut<R>(
+    &mut self,
+    preview: &Preview,
+    call: impl FnOnce(&mut Green) -> R,
+  ) -> Result<R, LineageRefused> {
+    let lineage = self
+      .lineages
+      .get_mut(&preview.repository)
+      .ok_or(LineageRefused::Stale)?;
+    lineage.get_mut().with(preview.handle, call)
+  }
+
+  /// Retires `preview`, its holds given back at once: a preview at its green's head shares every node but the ones its
+  /// one version copied, so its release is that version's paths, never the tree.
+  pub fn retire_preview(&mut self, preview: Preview) {
+    let Some(lineage) = self.lineages.get_mut(&preview.repository) else {
+      return;
+    };
+    if let Ok(mut release) = lineage.get_mut().retire(preview.handle) {
+      while self
+        .release_step(preview.repository, &mut release)
+        .is_ok_and(|more| more)
+      {}
+    }
   }
 
   /// Retires member `id` from its lineage: its engine is gone at once, and what it held comes back as a [`Release`] to
@@ -356,5 +487,184 @@ impl Greens {
       .get(&repository)
       .and_then(|lineage| lineage.try_borrow().ok())
       .map(|lineage| lineage.walked())
+  }
+}
+
+#[cfg(test)]
+mod preview_tests {
+  #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+  use super::*;
+  use slates_merge::engine::{Increment, Judgment, Outcome};
+  use slates_merge::increment::{VolumeOp, compose_volume_planned};
+
+  /// The property list's attribute, as a Subversion repository's green keeps it.
+  const PROPS: &str = "slates.svn.props";
+
+  /// One path's reads as a Subversion revision is made of them (`vcs_store::svn_made`).
+  type Reads = (
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    bool,
+    Option<String>,
+    bool,
+    Option<String>,
+    bool,
+  );
+
+  fn reads_at(green: &Green, path: &str, since: u64) -> Reads {
+    (
+      green.content(path).map(<[u8]>::to_vec),
+      green.xattr(path, PROPS).map(<[u8]>::to_vec),
+      green.is_dir(path),
+      green.symlink(path).map(str::to_owned),
+      green.special(path).is_some(),
+      green.hardlink(path).map(str::to_owned),
+      green.copied_after(path, since),
+    )
+  }
+
+  /// `journal` composed against `green`'s head as increment `id`, `bytes` its post-state.
+  fn increment(green: &Green, id: u8, journal: &[VolumeOp], bytes: &[u8]) -> Increment {
+    let (doc, _) = compose_volume_planned(&green.current_base(), journal).unwrap();
+    Increment {
+      id: [id; 32],
+      base: green.head(),
+      doc,
+      post_state: bytes.to_vec(),
+      evidence: Vec::new(),
+      named: Default::default(),
+    }
+  }
+
+  /// A-805 through the server's `Greens::preview` (the wrapper svn's landing previews a held verdict with). Do: found a
+  /// repository's lineage with an empty green; for each of six versions (a tree made with a file, its attribute and mode
+  /// set, a symbolic link and a hard link to the file, the file renamed, the renamed file's mode set, the tree copied),
+  /// judge it through the member's engine, preview the held verdict, read every path through `with_preview`, retire the
+  /// preview, then commit the version for real. Expect: the green unchanged by the preview (its head, and the lineage
+  /// back to its one member once retired); the preview's changed paths and every path's reads (bytes, property list,
+  /// kind, link target, IPC node, hard link's primary, copied after) the committed green's at the new version.
+  #[test]
+  fn a_preview_through_greens_reads_as_the_commit_does() {
+    let repository = RepositoryId { bytes: [1; 16] };
+    let id = VolumeId { bytes: [2; 16] };
+    let mut greens = Greens::default();
+    assert!(greens.found(repository, id, Green::new()).is_ok());
+    let paths = [
+      "trunk", "trunk/a", "trunk/b", "trunk/l", "trunk/h", "branch", "branch/b", "branch/l",
+      "branch/h",
+    ];
+    let steps: Vec<(Vec<VolumeOp>, &[u8])> = vec![
+      (
+        vec![
+          VolumeOp::Mkdir {
+            path: "trunk".to_owned(),
+          },
+          VolumeOp::Create {
+            path: "trunk/a".to_owned(),
+          },
+          VolumeOp::Extend {
+            path: "trunk/a".to_owned(),
+            at: 0,
+            len: 5,
+          },
+        ],
+        b"alpha",
+      ),
+      (
+        vec![
+          VolumeOp::SetXattr {
+            path: "trunk/a".to_owned(),
+            name: PROPS.to_owned(),
+            value: b"p".to_vec(),
+          },
+          VolumeOp::SetMode {
+            path: "trunk/a".to_owned(),
+            mode: 0o640,
+          },
+        ],
+        b"",
+      ),
+      (
+        vec![
+          VolumeOp::Symlink {
+            path: "trunk/l".to_owned(),
+            target: "a".to_owned(),
+          },
+          VolumeOp::Link {
+            path: "trunk/h".to_owned(),
+            target: "trunk/a".to_owned(),
+          },
+        ],
+        b"",
+      ),
+      (
+        vec![VolumeOp::Rename {
+          from: "trunk/a".to_owned(),
+          to: "trunk/b".to_owned(),
+        }],
+        b"",
+      ),
+      (
+        vec![VolumeOp::SetMode {
+          path: "trunk/b".to_owned(),
+          mode: 0o600,
+        }],
+        b"",
+      ),
+      (vec![], b""),
+    ];
+    for (index, (journal, bytes)) in steps.into_iter().enumerate() {
+      let step = u8::try_from(index).unwrap();
+      let head = greens.get(&id).unwrap().head();
+      let journal = if journal.is_empty() {
+        vec![VolumeOp::Copy {
+          from: "trunk".to_owned(),
+          to: "branch".to_owned(),
+          version: head,
+          replace: false,
+        }]
+      } else {
+        journal
+      };
+      let inc = increment(&greens.get(&id).unwrap(), step, &journal, bytes);
+      let Judgment::Accepted(judged) = greens.get_mut(&id).unwrap().judge(&inc) else {
+        panic!("step {index} not accepted");
+      };
+      let preview = greens.preview(&id, judged).unwrap();
+      let (changed, viewed) = greens
+        .with_preview(&preview, |view| {
+          let reads: Vec<Reads> = paths.iter().map(|path| reads_at(view, path, 0)).collect();
+          (view.changed_between(0, 1), reads)
+        })
+        .unwrap();
+      greens.retire_preview(preview);
+      assert_eq!(
+        greens.get(&id).unwrap().head(),
+        head,
+        "step {index}: the preview moved the green"
+      );
+      assert_eq!(
+        greens.lineage_len(repository),
+        1,
+        "step {index}: the preview stayed a member"
+      );
+      let outcome = greens.get_mut(&id).unwrap().submit(&inc);
+      assert!(
+        matches!(outcome, Outcome::Accepted { .. }),
+        "step {index}: {outcome:?}"
+      );
+      let green = greens.get(&id).unwrap();
+      assert_eq!(
+        changed,
+        green.changed_between(head, head + 1),
+        "step {index}"
+      );
+      let committed: Vec<Reads> = paths
+        .iter()
+        .map(|path| reads_at(&green, path, head))
+        .collect();
+      assert_eq!(viewed, committed, "step {index}");
+    }
   }
 }

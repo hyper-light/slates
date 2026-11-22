@@ -8,6 +8,13 @@
 //! shard's step quantum as the answer is written (`Answer::write_within`, the pack source's `turn`), its sets kept as
 //! runs or bits and its pack framed in packets sized from the room.
 //!
+//! **git's keepalive** (A-722's on the fetch). An answer's step may write nothing: its pack's objects still being
+//! chosen after the `packfile` section's head is written, or its source framing nothing new. Once the answer has been
+//! silent for the keepalive interval (`DaemonConfig::git_keepalive_ns`, git's own five seconds), the step writes git's
+//! keepalive where the answer may carry one (`Answer::write_keepalive`: inside a banded pack's section, as git's
+//! `create_pack_file` writes `0005\1` while `pack-objects` is silent), so a client reading with a deadline is never left
+//! waiting on a pack still being planned. The head is written at once (A-722's `StatusMode::AtHead`).
+//!
 //! **The store, lent a step at a time.** A repository's store is lent afresh for each step of an answer ([`StoreLender`];
 //! A-640 part 2: "It is lent afresh for each step of an answer, so a shard's state is never held across a wait"), and the
 //! answer is written a slice at a time, one whole pkt-line's room a step (`slates_git::pktline::MAX_LEN`, the format's
@@ -33,6 +40,10 @@ use super::{GitServices, ServiceRefused, Start};
 use crate::vcs_http::{ClientGone, Exchange, Failed};
 
 /// Where repositories' stores are lent to upload-pack, afresh for each step of an answer (the module doc).
+/// Counter: a git fetch over HTTP answered refused (a pack the store could not finish, a request refused), its typed
+/// refusal named in the log. Format: a counter name.
+pub(crate) const UPLOAD_REFUSED: &str = "vcs_http.git.upload_refused";
+
 pub(crate) trait StoreLender {
   /// Where a fetch's pack comes from (A-639's fragments, through A-653's source over the store's stream).
   type Packs: PackSource;
@@ -77,6 +88,10 @@ pub(crate) trait StoreLender {
     step: impl FnOnce(&Served<'_>, &mut Self::Packs) -> R,
   ) -> Option<R>;
 
+  /// The answer made over `hold` wrote `bytes` more (A-724 piece 3d): what its fetch is learned to use once it ends. A
+  /// lender that learns nothing does nothing.
+  fn wrote(&mut self, _hold: &Self::Hold, _bytes: u64) {}
+
   /// Makes repository `id`'s store ready for a fetch's answer before it is made (A-718): the shard's lender encodes every
   /// version not yet encoded as its fragments, a turn at a time, yielding between turns, so the answer copies them. A
   /// lender whose store needs nothing made does nothing.
@@ -93,13 +108,20 @@ pub(crate) struct UploadServices<L> {
   /// The room one request may hold: the edge's (A-745, §4.17.1 "A fetch's answer" rule 2: a request's room bounds a
   /// slice, never a repository).
   room: u64,
+  /// How long an answer may write nothing before git's keepalive is written (`DaemonConfig::git_keepalive_ns`).
+  keepalive_ns: u64,
 }
 
 impl<L> UploadServices<L> {
   /// Upload-pack over `lender`'s stores, each request admitted `room`, the edge's request room, or what its stores'
-  /// shard could admit when it began where that is less.
-  pub(crate) fn new(lender: L, room: u64) -> Self {
-    Self { lender, room }
+  /// shard could admit when it began where that is less; git's keepalive written after `keepalive_ns` of a silent
+  /// answer (the module doc).
+  pub(crate) fn new(lender: L, room: u64, keepalive_ns: u64) -> Self {
+    Self {
+      lender,
+      room,
+      keepalive_ns,
+    }
   }
 }
 
@@ -126,6 +148,8 @@ impl<L: StoreLender + Clone> GitServices for UploadServices<L> {
       request: Vec::new(),
       answer: None,
       generation: None,
+      keepalive_ns: self.keepalive_ns,
+      last_written_ns: slates_rt::futures::now_ns(),
     })
   }
 }
@@ -155,6 +179,10 @@ pub(crate) struct Upload<L: StoreLender> {
   answer: Option<Answer<<L::Packs as PackSource>::Pack>>,
   /// The generation a request's answer began on, held until the answer is written (A-745 rule 4).
   generation: Option<L::Hold>,
+  /// How long the answer may write nothing before git's keepalive is written.
+  keepalive_ns: u64,
+  /// When the exchange last wrote: its head (written at once), or the answer's last bytes.
+  last_written_ns: u64,
 }
 
 impl<L: StoreLender> Exchange for Upload<L> {
@@ -212,11 +240,14 @@ impl<L: StoreLender> Exchange for Upload<L> {
       admission,
       answer,
       generation,
+      keepalive_ns,
+      last_written_ns,
       ..
     } = self;
     let Some(made) = answer.as_mut() else {
       return Err(Failed(Status::INTERNAL_SERVER_ERROR));
     };
+    let before = out.len();
     let step = |served: &Served<'_>, packs: &mut L::Packs| {
       let mut spent = packs.turn();
       made.write_within(served, packs, admission, out, MAX_LEN, &mut spent)
@@ -226,9 +257,29 @@ impl<L: StoreLender> Exchange for Upload<L> {
       None => lender.lend_objects(*repository, step),
     }
     .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
+    if let Some(held) = generation.as_ref() {
+      lender.wrote(
+        held,
+        u64::try_from(out.len().saturating_sub(before)).unwrap_or(u64::MAX),
+      );
+    }
+    let now = slates_rt::futures::now_ns();
+    if out.len() > before
+      || (now.saturating_sub(*last_written_ns) >= *keepalive_ns && made.write_keepalive(out))
+    {
+      *last_written_ns = now;
+    }
     if written != Written::More {
       // The answer is written: its generation is given back.
       *generation = None;
+      // A refused answer (a pack the store could not finish ends with git's abort words, A-639) is counted and named in
+      // the log by its typed refusal, so a client's "possible repository corruption" has its cause on the server.
+      if let Some(refusal) = made.refusal() {
+        slates_machine::log_line!(
+          "slates-server: a git fetch of repository {repository:?} was answered refused: {refusal:?}"
+        );
+        let _ = crate::state::with_state_counted(|state| state.count(UPLOAD_REFUSED, 1));
+      }
     }
     Ok(written == Written::More)
   }

@@ -1388,8 +1388,12 @@ pub enum RequestBody {
     work: VolumeId,
     /// Its green.
     green: VolumeId,
-    /// The increment, as `Increment::encode` writes it.
-    increment: Vec<u8>,
+    /// The increment, by the identity its inputs archive is held under on the asking node (its manifest identity, the
+    /// one the version's merge record and chain entry name; lane (A) 3b): the owner fetches what it lacks from that node
+    /// by identity on the content plane and stores it once, so the forward carries no increment.
+    increment: [u8; 32],
+    /// The increment's encoding's length in bytes.
+    increment_len: u64,
     /// Its verdict, as `Computed::encode` writes it (A-658 part 3a).
     computed: Vec<u8>,
     /// What the owner judges the write policy, the signature and the commit by.
@@ -1441,6 +1445,32 @@ pub enum RequestBody {
     discard: Vec<u64>,
     /// The agent's own changes, in the head's coordinates, applied after the kept operations.
     replacement: Vec<WorkChange>,
+  },
+  /// Resolves a conflict in one ask (A-840): the agent names the windows it gives up, and the green's half takes the
+  /// work's writes out of exactly those windows, rebases the rest onto the head as it is and applies `replacement`
+  /// there, as one recorded step, restating the work at the head as `ResolveMerge` does. An overwrite keeps its bytes
+  /// outside every window; an insertion, deletion, extension or truncation that meets a window goes whole, since it
+  /// shifts or ends the file; a zero-length window, a namespace conflict's anchor, gives up every operation on its
+  /// path. Nothing is judged at an older head, so there is no check to go stale. What is kept and still conflicts at the
+  /// head answers `Rebased` with those windows only, nothing changed: a resolution sent after it names them and the
+  /// windows given up before. No merge is inferred: every window given up and every byte written is the agent's
+  /// declaration (D-27). Appended.
+  ResolveConflict {
+    /// The work volume.
+    work: VolumeId,
+    /// The windows the agent gives up, in base coordinates, as a conflict named them.
+    over: Vec<MergeWindow>,
+    /// The agent's own changes, in the head's coordinates, applied after the kept operations.
+    replacement: Vec<WorkChange>,
+  },
+  /// Destroy repository `repository` whole (§4.17.5, A-843): its record, its namespace and its logs, every green of its
+  /// lineage, its tool store and what its records held, and its usage row, on its owner shard as one verb. Every other
+  /// repository is untouched, and a fetch or push of the name afterwards is refused as for a name never made. Its
+  /// owner's verb. Answered `Destroyed`; refused `NotFound`, `Forbidden`, or the partition's refusal of a member's
+  /// destroy, with nothing recorded. Appended.
+  DestroyRepository {
+    /// The repository.
+    repository: String,
   },
 }
 
@@ -2172,13 +2202,19 @@ pub struct MemoryKindReport {
   pub mappings: u64,
   /// The address space it reserves: the mappings' lengths, or for the heap what the allocators hold from the OS.
   pub reserved_bytes: u64,
-  /// Its bytes in RAM, from the kernel's page table at the last completed sweep of the shard that maps it (or for the
-  /// heap the bytes live allocations hold, now); 0 until a sweep completes ([`MemoryKindReport::measured`]).
+  /// Its bytes in RAM, from the kernel's page table (or for the heap the bytes live allocations hold, now); 0 until
+  /// measured ([`MemoryKindReport::measured`]). For `arenas` and `regions`, the arenas' held runs and the clients' rings
+  /// as the last sweep to pass them found them: a sweep walks them first, so they are read within one pass over what is
+  /// held, not over the address space reserved (main's ruling of 2026-11-21 on w-sizing's option (a)); for `segment` and
+  /// `content`, the mappings whole, read at the request. Tolerance: a page the host has compressed or paged out since it
+  /// was written is not resident and is not counted, so a figure may fall short of what was written by what the host
+  /// took away; it never counts a page not in RAM, nor a freed arena block's page (resident until the idle purge).
   pub resident_bytes: u64,
   /// Its bytes written, where the OS says (macOS); `None` where it does not, and for the heap.
   pub modified_bytes: Option<u64>,
-  /// Whether `resident_bytes` is a reading: each sweep that maps the kind has completed at least once (each status
-  /// request advances a shard's sweep, A-744's bound).
+  /// Whether `resident_bytes` is a reading: on every shard that maps the kind, a sweep has passed its ranges at least once
+  /// (a status asking for the memory report arms one on the shard's idle time, A-744; asked again, the report reads it,
+  /// and the shard's `content_range.sweep.kinds_at_ns` says when).
   pub measured: bool,
 }
 
@@ -2481,6 +2517,7 @@ impl RequestBody {
         stamp: MergeStamp { work: volume, .. },
         ..
       }
+      | RequestBody::ResolveConflict { work: volume, .. }
       | RequestBody::ReadBase { volume, .. }
       | RequestBody::Digest { volume, .. }
       | RequestBody::Rewitness { volume, .. }
@@ -2571,7 +2608,8 @@ impl RequestBody {
       | RequestBody::SetRepositoryPolicy { .. }
       | RequestBody::ImportRepository { .. }
       | RequestBody::DescribeRepositoryPolicy { .. }
-      | RequestBody::ExportDump { .. } => None,
+      | RequestBody::ExportDump { .. }
+      | RequestBody::DestroyRepository { .. } => None,
     }
   }
 
@@ -2583,6 +2621,7 @@ impl RequestBody {
       RequestBody::Create { .. }
         | RequestBody::CreateGreen { .. }
         | RequestBody::CreateRepository { .. }
+        | RequestBody::DestroyRepository { .. }
         | RequestBody::CreateBranch { .. }
         | RequestBody::CreateWork { .. }
         | RequestBody::AdmitWork { .. }
@@ -2598,6 +2637,7 @@ impl RequestBody {
         | RequestBody::SubmitApproved { .. }
         | RequestBody::Rebase { .. }
         | RequestBody::ResolveMerge { .. }
+        | RequestBody::ResolveConflict { .. }
         | RequestBody::Clone { .. }
         | RequestBody::Resize { .. }
         | RequestBody::Destroy { .. }
@@ -4798,6 +4838,13 @@ pub enum Refusal {
   /// A merge check's view no longer holds (A-796): the green's head moved past the stamp's, or the work changed since it
   /// was checked. Nothing was read or changed; check again. Appended.
   StaleMergeView,
+  /// The node's version-control store refused the change (goal 93; jupiter's red of 2026-11-21): its own reason, such as
+  /// a store that could not be opened, a full disk or a refused write. Nothing of the change was recorded. Until it,
+  /// such a refusal was answered `Overloaded`, which named a busy shard and hid the store's reason. Appended.
+  StoreRefused {
+    /// The store's reason, in its words.
+    reason: String,
+  },
 }
 
 /// Why a copy was refused before any verdict ([`Refusal::CopyRefused`]): `slates_merge::engine::CopyRefusal` on the
@@ -4873,8 +4920,9 @@ pub enum ImportFault {
   /// The import was given back before its end: its repository was freed.
   Abandoned,
   /// A Subversion dump the import refused as `svnadmin load` refuses the same stream (A-652 part 3): Subversion's error
-  /// number, the revision being loaded, and the path the refusal names. The revisions committed before it stay, as
-  /// `svnadmin load` keeps them. Appended.
+  /// number, the revision being loaded, and the path the refusal names. No daemon of this build sends it: since C2
+  /// stage C an import lands its revisions in batches, and refuses as [`ImportFault::SubversionLanded`] does, naming
+  /// what landed. Appended.
   Subversion {
     /// Subversion's error number (`svn_error_codes.h`).
     code: u32,
@@ -4882,6 +4930,21 @@ pub enum ImportFault {
     revision: Option<u64>,
     /// The path the refusal names, empty where it names none.
     path: String,
+  },
+  /// A Subversion dump the import refused as `svnadmin load` refuses the same stream (A-652 part 3; C2 stage C):
+  /// Subversion's error number, the revision being loaded, the path the refusal names, and the last revision that
+  /// landed. An import lands its revisions a batch at a time, a batch one changeset and atomic, so the revisions of the
+  /// batch the refusal ended are given up, where `svnadmin load` keeps each as it goes; the repository stands at
+  /// `landed`, and the same dump imported again resumes after it. Appended.
+  SubversionLanded {
+    /// Subversion's error number (`svn_error_codes.h`).
+    code: u32,
+    /// The revision being loaded; none before the stream's first revision record.
+    revision: Option<u64>,
+    /// The path the refusal names, empty where it names none.
+    path: String,
+    /// The repository's youngest revision as the refusal left it: the last that landed.
+    landed: u64,
   },
 }
 

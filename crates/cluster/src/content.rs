@@ -860,6 +860,46 @@ enum Adopt {
   Manifest([u8; 16], [u8; 32]),
 }
 
+/// A chunk's fields and its payload, lent: what storing a chunk reads, whether it came off the wire owned or is lent from
+/// bytes the caller holds ([`ContentHold::hold_lent`]).
+struct ChunkView<'a> {
+  identity: [u8; 32],
+  raw_len: u64,
+  stored_len: u64,
+  encoding: Encoding,
+  level: u8,
+  dictionary: [u8; 32],
+  payload: &'a [u8],
+}
+
+impl<'a> ChunkView<'a> {
+  fn of(chunk: &'a Chunk) -> ChunkView<'a> {
+    ChunkView {
+      identity: chunk.identity,
+      raw_len: chunk.raw_len,
+      stored_len: chunk.stored_len,
+      encoding: chunk.encoding,
+      level: chunk.level,
+      dictionary: chunk.dictionary,
+      payload: &chunk.payload,
+    }
+  }
+
+  /// A raw chunk of `payload`, whose identity the caller hashed.
+  fn raw(identity: [u8; 32], payload: &'a [u8]) -> ChunkView<'a> {
+    let len = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+    ChunkView {
+      identity,
+      raw_len: len,
+      stored_len: len,
+      encoding: Encoding::Raw,
+      level: 0,
+      dictionary: [0; 32],
+      payload,
+    }
+  }
+}
+
 /// A chunk stored in the arena once, whatever objects reference it: its block, its charge (the block's
 /// length), the fields a `Chunk` carries besides its payload, how many objects reference it, and how many
 /// stages have it verified and kept (AUD-29-55). Its block goes when both counts are zero.
@@ -1174,6 +1214,65 @@ impl ContentHold {
     outcome
   }
 
+  /// [`hold`](Self::hold) of an archive whose chunks the caller holds as bytes (lane (A), format 6: an owner holding its
+  /// version's increment as the version's inputs): `manifest` is the archive with no chunks, its one file's extents
+  /// raw chunks over `pieces` in order, each piece's identity the BLAKE3 of its bytes (the inputs archive's rule). Each
+  /// piece the hold lacks is hashed, checked against the manifest's references and copied once, into its block; no
+  /// chunk is built around it. The same admission, charges and refusals as `hold`, and the same identity back.
+  pub fn hold_lent<'a>(
+    &mut self,
+    space: &mut HoldSpace<'_>,
+    object: ObjectId,
+    placed: Placed,
+    manifest: &Archive,
+    pieces: impl IntoIterator<Item = &'a [u8]>,
+  ) -> Result<[u8; 32], ContentRefusal> {
+    if !manifest.chunks.is_empty() {
+      return Err(ContentRefusal::Unreferenced);
+    }
+    let identity = manifest.manifest_identity();
+    let (opened, created) = self.open_stage(space, object, placed, manifest)?;
+    if let Opened::Held = opened {
+      return Ok(identity);
+    }
+    let mut outcome = Ok(identity);
+    for piece in pieces {
+      let view = ChunkView::raw(*blake3::hash(piece).as_bytes(), piece);
+      if let Err(refusal) = self.stage_view(space, object, &identity, view, None) {
+        outcome = Err(refusal);
+        break;
+      }
+    }
+    let outcome = outcome.and_then(|_| self.promote(space, object));
+    if outcome.is_err() && created {
+      self.drop_stage(space, object);
+    }
+    outcome
+  }
+
+  /// A chunk's raw payload as stored for a manifest held for `object`, lent from `arena`: `None` unless the object
+  /// holds that manifest whole, its held content references the chunk, and the chunk is stored raw (AUD-29-45, as
+  /// [`held_chunk`](Self::held_chunk)). What an owner reads its version's increment through (format 6), copied nowhere.
+  pub fn held_raw<'a>(
+    &self,
+    arena: &'a ChunkArena,
+    object: ObjectId,
+    identity: &[u8; 32],
+    chunk: &[u8; 32],
+  ) -> Option<&'a [u8]> {
+    let held = self.objects.get(&object)?;
+    if !held.manifests.contains_key(identity) || !held.chunks.contains_key(chunk) {
+      return None;
+    }
+    let stored = self.chunks.get(chunk)?;
+    if stored.encoding != Encoding::Raw {
+      return None;
+    }
+    arena
+      .bytes(stored.extent)?
+      .get(..usize::try_from(stored.stored_len).ok()?)
+  }
+
   /// The arena block length `len` bytes take, as a charge; `NoCapacity` when no block class fits.
   fn block_bytes(arena: &ChunkArena, len: u64) -> Result<u64, ContentRefusal> {
     usize::try_from(len)
@@ -1357,6 +1456,19 @@ impl ContentHold {
     manifest: &[u8; 32],
     chunk: Chunk,
   ) -> Result<u64, ContentRefusal> {
+    self.stage_view(space, object, manifest, ChunkView::of(&chunk), Some(&chunk))
+  }
+
+  /// [`stage_chunk`](Self::stage_chunk) over a chunk's view: `owned` is the chunk to verify when it came off the wire,
+  /// `None` for a raw chunk lent from bytes the caller hashed into its identity ([`ContentHold::hold_lent`]).
+  fn stage_view(
+    &mut self,
+    space: &mut HoldSpace<'_>,
+    object: ObjectId,
+    manifest: &[u8; 32],
+    chunk: ChunkView<'_>,
+    owned: Option<&Chunk>,
+  ) -> Result<u64, ContentRefusal> {
     let identity = chunk.identity;
     let Some(stage) = self
       .stages
@@ -1387,7 +1499,7 @@ impl ContentHold {
         stored.staged = stored.staged.saturating_add(1);
       }
     } else {
-      self.store_new_chunk(space, &chunk, entry)?;
+      self.store_new_chunk(space, &chunk, owned, entry)?;
     }
     let Some(stage) = self.stages.get_mut(&object) else {
       return Err(ContentRefusal::Unstaged);
@@ -1406,7 +1518,8 @@ impl ContentHold {
   fn store_new_chunk(
     &mut self,
     space: &mut HoldSpace<'_>,
-    chunk: &Chunk,
+    chunk: &ChunkView<'_>,
+    owned: Option<&Chunk>,
     entry: u64,
   ) -> Result<(), ContentRefusal> {
     let block = Self::block_bytes(space.arena, chunk.stored_len)?;
@@ -1417,13 +1530,15 @@ impl ContentHold {
     };
     let index = chunk_entry_bytes().saturating_add(entry);
     self.take(space, block, scratch, index)?;
-    if let Err(refusal) = Self::verify(space, &[chunk], scratch) {
+    if let Some(owned) = owned
+      && let Err(refusal) = Self::verify(space, &[owned], scratch)
+    {
       self.give(space, block, scratch, index);
       return Err(refusal);
     }
     // Verification is done: its scratch goes back before anything is stored.
     space.budget.credit_replicated(scratch);
-    let extent = match self.place_bytes(space.arena, &chunk.payload, Adopt::Chunk(chunk.identity)) {
+    let extent = match self.place_bytes(space.arena, chunk.payload, Adopt::Chunk(chunk.identity)) {
       Ok(extent) => extent,
       Err(refusal) => {
         self.give(space, block, 0, index);
@@ -1946,6 +2061,30 @@ impl ContentHold {
     chunk: Chunk,
   ) -> Result<u64, ContentRefusal> {
     self.stage_chunk(space, object, manifest, chunk)
+  }
+
+  /// Keeps one raw piece of bytes the caller holds in `object`'s stage of `manifest`, copied once into its block, with
+  /// no chunk built around it: [`hold_lent`](Self::hold_lent) a piece at a time, so a large hold is spread over a
+  /// shard's turns (a green's checkpoint, A-579: a 1 GiB checkpoint is about 1,000 pieces of 1 MiB). The stage is opened
+  /// by [`stage_fetched`](Self::stage_fetched) and completed by [`complete_stage`](Self::complete_stage). `identity` is
+  /// the BLAKE3 of `piece`, which the caller hashed in making `manifest` from the same bytes: it is not hashed again, so
+  /// only the owner of the bytes may call this, never a path a peer's bytes reach (a peer's chunk is verified,
+  /// [`stage_piece`](Self::stage_piece)). Returns how many chunks the stage still lacks.
+  pub fn stage_lent_piece(
+    &mut self,
+    space: &mut HoldSpace<'_>,
+    object: ObjectId,
+    manifest: &[u8; 32],
+    identity: [u8; 32],
+    piece: &[u8],
+  ) -> Result<u64, ContentRefusal> {
+    self.stage_view(
+      space,
+      object,
+      manifest,
+      ChunkView::raw(identity, piece),
+      None,
+    )
   }
 
   /// Completes `object`'s stage into a held manifest once its closure is whole; `Incomplete` while chunks
@@ -3970,6 +4109,100 @@ mod tests {
     .encode();
     fetch.push(0);
     assert_eq!(ContentMessage::decode(&fetch), Err(ContentError::BadLength));
+  }
+
+  /// A-579's last step: a lent hold made a piece at a time holds what the one call holds. Do: hold a two-chunk archive's
+  /// bytes in one `hold_lent` call; on a second hold, open the stage of the same manifest, stage one piece, read the
+  /// stage's progress, stage the other, and complete it. Expect: the same identity, the manifest held, every chunk read
+  /// back byte for byte, and the same charge; before the last piece the manifest is not held and its stage has one
+  /// chunk; a piece the manifest does not reference is refused `Unreferenced`, nothing stored.
+  #[test]
+  fn a_lent_hold_made_a_piece_at_a_time_holds_what_the_one_call_holds() {
+    let archive = two_chunk_archive();
+    let manifest = with_chunks(&archive, Vec::new());
+    let pieces: Vec<&[u8]> = archive
+      .chunks
+      .iter()
+      .map(|chunk| &chunk.payload[..])
+      .collect();
+    let mut whole = ContentHold::new();
+    let mut whole_room = TestSpace::new();
+    let identity = whole
+      .hold_lent(
+        &mut whole_room.space(),
+        OBJECT,
+        Placed::default(),
+        &manifest,
+        pieces.iter().copied(),
+      )
+      .unwrap();
+
+    let mut sliced = ContentHold::new();
+    let mut room = TestSpace::new();
+    let lacking = sliced
+      .stage_fetched(&mut room.space(), OBJECT, Placed::default(), &manifest)
+      .unwrap();
+    assert_eq!(lacking.map(|missing| missing.len()), Some(2));
+    let stray = b"not in the manifest";
+    assert_eq!(
+      sliced.stage_lent_piece(
+        &mut room.space(),
+        OBJECT,
+        &identity,
+        *blake3::hash(stray).as_bytes(),
+        stray,
+      ),
+      Err(ContentRefusal::Unreferenced)
+    );
+    let first = &archive.chunks[0];
+    assert_eq!(
+      sliced.stage_lent_piece(
+        &mut room.space(),
+        OBJECT,
+        &identity,
+        first.identity,
+        &first.payload
+      ),
+      Ok(1)
+    );
+    assert_eq!(sliced.staged_of(OBJECT, &identity), Some(1));
+    assert!(!sliced.holds_manifest(OBJECT, &identity));
+    let second = &archive.chunks[1];
+    assert_eq!(
+      sliced.stage_lent_piece(
+        &mut room.space(),
+        OBJECT,
+        &identity,
+        second.identity,
+        &second.payload
+      ),
+      Ok(0)
+    );
+    assert_eq!(
+      sliced.complete_stage(&mut room.space(), OBJECT),
+      Ok(identity)
+    );
+    holds_as_the_whole_does((&sliced, &room), &whole, &archive, &identity);
+  }
+
+  /// `sliced` (its arena in `room`) holds `archive` under `identity` as `whole` does: the manifest held with no stage
+  /// left, every chunk read back byte for byte, and the same charge and chunk count.
+  fn holds_as_the_whole_does(
+    (sliced, room): (&ContentHold, &TestSpace),
+    whole: &ContentHold,
+    archive: &Archive,
+    identity: &[u8; 32],
+  ) {
+    assert!(sliced.holds_manifest(OBJECT, identity));
+    assert_eq!(sliced.stage_count(), 0);
+    for chunk in &archive.chunks {
+      assert_eq!(
+        sliced.held_raw(&room.arena, OBJECT, identity, &chunk.identity),
+        Some(&chunk.payload[..])
+      );
+    }
+    assert_eq!(sliced.charged_bytes(), whole.charged_bytes());
+    assert_eq!(sliced.chunk_count(), whole.chunk_count());
   }
 
   /// §4.10 placement closure: a hold refuses an archive whose manifest references a chunk neither

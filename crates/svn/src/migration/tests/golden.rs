@@ -14,7 +14,7 @@ use crate::commit::record::Record;
 use crate::dump::Format;
 use crate::index::{Action, ChangedPath, NodeKind};
 use crate::migration::paths::{compare_paths, relative};
-use crate::migration::{Importer, Importing, MigrationRefusal, Repository};
+use crate::migration::{Importer, Importing, MigrationRefusal, Standalone};
 
 /// Format 2, every revision whole (`svnadmin dump`).
 const FULL: &[u8] = include_bytes!("../../../fixtures/dump/full.dump");
@@ -63,7 +63,7 @@ fn vector(name: &str) -> &'static [u8] {
 }
 
 /// A created repository with `dumps` imported one after the other, each whole.
-fn imported(dumps: &[&str]) -> Repository {
+fn imported(dumps: &[&str]) -> Standalone {
   let mut repository = created();
   for name in dumps {
     import_whole(&mut repository, vector(name))
@@ -75,7 +75,7 @@ fn imported(dumps: &[&str]) -> Repository {
 /// `svnlook changed --copy-info`'s account of every revision of `repository` but 0, as the index records them: a
 /// revision's paths in `svn_path_compare_paths` order, a directory's with a `/`, an addition `A` (`A +` and its source
 /// for a copy), a deletion `D`, a replacement both, a modification `U` or `_` for its text and `U` for its properties.
-fn changed_account(repository: &Repository) -> String {
+fn changed_account(repository: &Standalone) -> String {
   let mut account = String::new();
   for revision in 1..=repository.youngest() {
     writeln!(account, "r{revision}").expect("a line");
@@ -138,7 +138,7 @@ fn shown(path: &str, kind: NodeKind) -> String {
 }
 
 /// Holds `repository` to the history `full.dump` makes and to `full.dump`'s bytes once exported.
-fn holds_the_full_history(name: &str, repository: &Repository, whole: &History) {
+fn holds_the_full_history(name: &str, repository: &Standalone, whole: &History) {
   assert!(history(repository) == *whole, "{name}: its history");
   assert!(
     export_all(repository).unwrap() == vector("full.dump"),
@@ -194,7 +194,7 @@ fn a_history_imported_from_deltas_in_parts_or_in_pieces_is_the_one_imported_whol
 }
 
 /// A created repository with `dump` imported, its bytes arriving `piece` at a time.
-fn imported_in_pieces(dump: &[u8], piece: usize) -> Repository {
+fn imported_in_pieces(dump: &[u8], piece: usize) -> Standalone {
   let mut repository = created();
   import(&mut repository, dump, piece)
     .unwrap_or_else(|refusal| panic!("pieces of {piece}: {refusal:?}"));
@@ -328,7 +328,6 @@ fn named(record: &Record) -> String {
     Record::RevisionProperties { revision, .. } => format!("revision {revision}'s properties"),
     Record::Revision(revision) => format!("revision {}", revision.head + 1),
     Record::Locks(_) => "lock entries".to_owned(),
-    Record::Deltified { .. } => "a text deltified".to_owned(),
   }
 }
 
@@ -340,10 +339,12 @@ fn handed_over(dump: &[u8], withheld: Option<u64>) -> (Vec<String>, Result<(), M
   let mut rest = dump;
   let mut names = Vec::new();
   loop {
-    let (consumed, record) = match importer.import(&mut repository, rest, true) {
+    let (consumed, record) = match repository.import(&mut importer, rest, true) {
       Ok(Importing::Commit { consumed, record }) => (consumed, *record),
       Ok(Importing::Done) => return (names, Ok(())),
-      Ok(Importing::NeedMore { .. }) => return (names, Err(MigrationRefusal::Corrupt)),
+      Ok(Importing::NeedMore { .. } | Importing::Base { .. }) => {
+        return (names, Err(MigrationRefusal::Corrupt));
+      }
       Err(refusal) => return (names, Err(refusal)),
     };
     rest = &rest[consumed..];

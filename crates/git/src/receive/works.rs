@@ -17,15 +17,16 @@
 //!   from, its work then empty ([`Greens::holding_head`], A-753); else at the version of a green its new
 //!   value's first parent heads, where one can still be branched from, else at the default branch's
 //!   head ([`Greens::base_of_create`]), and
-//!   its work states the whole difference against that version's tree, so the new green holds
+//!   its push states the whole difference against that version's tree, so the new green holds
 //!   exactly the client's tree; in a repository whose default branch is unborn, over an empty
-//!   green. A create of a ref that names a green is a ref that moved, as git's lock refuses a ref
-//!   that exists (A-654, main's ruling of 2026-11-19);
+//!   green. The push is not built here: the new green owes it, based at its own version 0, and is
+//!   made when first reached (P2, A-812, A-823). A create of a ref that names a green is a ref
+//!   that moved, as git's lock refuses a ref that exists (A-654, main's ruling of 2026-11-19);
 //! - a delete retires the green, its old value the green's head, or the ref moved.
 //!
 //! A ref's tree is its commit's, or the tree it names; a tag (a green too, §4.17.1 item 6) may name
-//! an annotated tag, whose tree is that of the commit or the tree it names. A tag of a tag, or a
-//! ref naming a blob, is refused typed (owed: git peels any chain of tags).
+//! an annotated tag, followed as git peels it to the end of a chain of tags. A ref may name any
+//! object (A-836): one naming a blob, or a tag of one, holds no files, its tree git's empty tree.
 //!
 //! **The append moves the ref** ([`Appends`], A-642; g261's per-green append implements it once it
 //! lands, with the store's commit of the push's objects, A-614's `Repository::commit`, beside it):
@@ -40,7 +41,9 @@
 //! refusal, with a band-2 line naming the path.
 
 use slates_merge::pace::{Pace, Slices};
-use slates_merge::push::{Building, Built, ObjectKey, Push, PushObjects, PushRefused, build};
+use slates_merge::push::{
+  Building, Built, DeferredPush, ObjectKey, Push, PushObjects, PushRefused, build,
+};
 use slates_merge::{ConflictWindow, Green, Increment};
 use std::cell::Cell;
 
@@ -76,10 +79,6 @@ pub const PAST_ROOM: &[u8] = b"push past its room";
 /// Slates' words: the reason a work naming bytes at a path the walk gave none is given (A-618's
 /// `Unplaced`).
 pub const UNPLACED: &[u8] = b"path without bytes";
-
-/// Slates' words: the reason a ref naming neither a commit nor a tree, nor an annotated tag of
-/// one, is given (a blob, or a tag of a tag).
-pub const NO_TREE: &[u8] = b"ref names no tree";
 
 /// A green as one push reads it.
 #[derive(Clone, Copy, Debug)]
@@ -153,8 +152,11 @@ pub enum Entry {
     name: Vec<u8>,
     /// The green and version it is made at ([`Greens::base_of_create`]); none to make it empty.
     from: Option<(u64, u64)>,
-    /// Its first work, built against that version, or over an empty green.
-    increment: Increment,
+    /// The push it owes as its first version, against that version or over an empty green, its work not built (P2,
+    /// main's ruling of 2026-11-21: a created ref's content is derived on first read, A-647; the push the eager create
+    /// built, so the green made when first reached is the one it made): git/git's 1,019 tags built their whole trees at
+    /// the push, refs times tree.
+    push: DeferredPush,
   },
   /// The green retired (§4.17.1: a deleted branch's chain kept for its retention), only while it
   /// is at `position`.
@@ -242,6 +244,15 @@ pub struct Preparing {
 }
 
 impl Preparing {
+  /// The largest chain entry its work can take (`slates_merge::chain_entry::entry_bound`), once built; none before:
+  /// what its judge makes the chains room for before the append, a green a turn (A-238, off the append's step).
+  pub fn entry_bound(&self) -> Option<usize> {
+    match &self.done {
+      Some(Ok(built)) => Some(slates_merge::chain_entry::entry_bound(&built.increment)),
+      _ => None,
+    }
+  }
+
   /// Its build's longest unit so far, nanoseconds on its owner's clock (A-752).
   pub fn longest_unit_ns(&self) -> u64 {
     self.building.pace().longest_unit_ns()
@@ -345,7 +356,13 @@ where
     (began, env): (u64, slates_pace::Env),
     slices: Slices,
   ) -> bool {
+    // A delete builds nothing, nor does a create, whose push its green owes until first reached (P2). A create reaches
+    // the greens its verdict will read, so the owner can make any that owes its own push before the verdict reads it.
     if command.is_delete() {
+      return true;
+    }
+    if command.is_create() {
+      self.reach_create(command, pushed);
       return true;
     }
     let ours = preparing.as_ref().is_some_and(|prepared| {
@@ -449,12 +466,32 @@ where
     })
   }
 
-  /// A create's work, against the version it is made at, or over an empty green (module docs).
+  /// Reaches the greens a create's verdict reads (`Verdicts::create`): the ref's own, then the one it would be made at.
+  fn reach_create(&self, command: &Command, pushed: &Pushed<'_>) {
+    if self.greens.read(&command.name, |_| ()).is_some() {
+      return;
+    }
+    if self.greens.holding_head(&command.new, |_, _| ()).is_none() {
+      let parent = self.first_parent(&command.new, pushed);
+      let _ = self.greens.base_of_create(parent.as_ref(), |_, _| ());
+    }
+  }
+
+  /// A create's push, against the version it is made at, or over an empty green (module docs), owed and not built (P2).
   fn create(&self, command: &Command, pushed: &Pushed<'_>) -> Result<Entry, Declined> {
+    // The new green holds the version it is made at as its own version 0, so its owed push is based there, as the
+    // eager create's work was (`repository::push`'s `plan_create`).
+    let owed = |green: &Green, base: Option<Version>| {
+      self.push_of(command, pushed, green, base).map(|push| {
+        let rebased = Push {
+          base_version: 0,
+          ..push
+        };
+        DeferredPush::of(&rebased, self.room)
+      })
+    };
     let at = |read: GreenRead<'_>, version: Version| {
-      self
-        .work(command, pushed, read.green, Some(version))
-        .map(|increment| (Some((read.id, version.number)), increment))
+      owed(read.green, Some(version)).map(|push| (Some((read.id, version.number)), push))
     };
     let made = match self.greens.holding_head(&command.new, at) {
       Some(made) => Some(made),
@@ -463,14 +500,14 @@ where
         self.greens.base_of_create(parent.as_ref(), at)
       }
     };
-    let (from, increment) = match made {
+    let (from, push) = match made {
       Some(made) => made?,
-      None => (None, self.work(command, pushed, &Green::new(), None)?),
+      None => (None, owed(&Green::new(), None)?),
     };
     Ok(Entry::Create {
       name: command.name.clone(),
       from,
-      increment,
+      push,
     })
   }
 
@@ -553,8 +590,10 @@ where
     })
   }
 
-  /// The tree the object `head` names: a commit's, or that of the commit or tree an annotated tag
-  /// names.
+  /// The tree the object `head` names, as git peels a ref (A-836: a ref may name any object): a commit's; a tree itself;
+  /// the end of a chain of annotated tags followed to its end (a tag of a tag: git/git's `v1.0rc1` to `v1.0rc6`); and
+  /// for a blob (git/git's `junio-gpg-pub`), the empty tree, so a ref naming no tree holds no files. The chain's tags are
+  /// distinct objects the push or the repository holds, each named by its content, so it ends.
   fn tree_of(
     &self,
     head: &ObjectId,
@@ -562,28 +601,22 @@ where
     name: &[u8],
   ) -> Result<ObjectId, Declined> {
     let format = head.format();
-    let (kind, content) = self.object(head, pushed).ok_or_else(|| missing(name))?;
     let mut scratch = Admission::new(u64::MAX);
-    let (kind, target) = match kind {
-      Kind::Tag => {
-        let tag = Tag::parse(&content, &mut scratch).map_err(|_| missing(name))?;
-        let target = tag.object(format).ok_or_else(|| missing(name))?;
-        (tag.kind(), target)
-      }
-      kind => (Some(kind), *head),
-    };
+    let mut target = *head;
+    let (mut kind, mut content) = self.object(head, pushed).ok_or_else(|| missing(name))?;
+    while kind == Kind::Tag {
+      let tag = Tag::parse(&content, &mut scratch).map_err(|_| missing(name))?;
+      target = tag.object(format).ok_or_else(|| missing(name))?;
+      (kind, content) = self.object(&target, pushed).ok_or_else(|| missing(name))?;
+    }
     match kind {
-      Some(Kind::Commit) => {
-        let (_, content) = self.object(&target, pushed).ok_or_else(|| missing(name))?;
+      Kind::Commit => {
         let commit = Commit::parse(&content, &mut scratch).map_err(|_| missing(name))?;
         commit.tree(format).ok_or_else(|| missing(name))
       }
-      Some(Kind::Tree) => Ok(target),
-      _ => Err(declined(
-        NO_TREE,
-        name,
-        b"names neither a commit nor a tree",
-      )),
+      Kind::Tree => Ok(target),
+      // A blob, or (never, the chain followed) a tag: no tree, so no files.
+      Kind::Blob | Kind::Tag => crate::object_name::empty_tree(format).ok_or_else(|| missing(name)),
     }
   }
 

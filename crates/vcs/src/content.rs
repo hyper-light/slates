@@ -286,6 +286,12 @@ enum Kept {
     /// The window's length.
     len: usize,
   },
+  /// Let go (A-724 piece 4, [`ContentStore::let_go`]): a window whose bytes a landed changeset on the node's store
+  /// holds, kept here no longer; a read of it finds nothing until [`ContentStore::bring_back`] or a put brings it back.
+  Away {
+    /// The window's length.
+    len: usize,
+  },
 }
 
 /// What the store has done, for the tests' non-vacuity checks and the owner's accounting.
@@ -301,6 +307,10 @@ pub struct ContentCounters {
   pub lists: u64,
   /// Derived nodes stored new ([`ContentStore::put_derived`]).
   pub derived: u64,
+  /// Windows let go to the node's store (A-724 piece 4, [`ContentStore::let_go`]).
+  pub let_go: u64,
+  /// Windows let go and brought back ([`ContentStore::bring_back`], or a put of the same bytes).
+  pub brought_back: u64,
 }
 
 /// What a put did: the content's identity, and whether its bytes were stored new or were held already.
@@ -318,6 +328,11 @@ struct Held {
   kept: Kept,
   form: Form,
   holders: u64,
+  /// Whether a landed changeset on the node's store holds its bytes ([`ContentStore::mark_landed`]): only such a
+  /// window may be let go.
+  landed: bool,
+  /// The store's read count at its last read ([`ContentStore::last_read`]): the coldest is let go first.
+  last_read: core::cell::Cell<u64>,
 }
 
 impl Held {
@@ -325,7 +340,7 @@ impl Held {
   fn here(&self) -> Option<&[u8]> {
     match &self.kept {
       Kept::Here(bytes) => Some(bytes),
-      Kept::Stored { .. } => None,
+      Kept::Stored { .. } | Kept::Away { .. } => None,
     }
   }
 
@@ -333,7 +348,7 @@ impl Held {
   fn len(&self) -> usize {
     match &self.kept {
       Kept::Here(bytes) => bytes.len(),
-      Kept::Stored { len, .. } => *len,
+      Kept::Stored { len, .. } | Kept::Away { len } => *len,
     }
   }
 }
@@ -382,6 +397,26 @@ pub struct ContentStore {
   /// The bytes structures beside the store charged to it.
   charged_bytes: u64,
   counters: ContentCounters,
+  /// The miss-ratio curve of the repository a step is lent to, while it is (A-724 piece 2d; `crate::mrc`): each read
+  /// noted in it ([`ContentStore::observe`]). A cell, since reads borrow the store shared; one shard's thread holds it.
+  observing: core::cell::RefCell<Option<crate::mrc::Curve>>,
+  /// Reads noted so far: the clock a content's last read is stamped by (A-724 piece 4).
+  reads: core::cell::Cell<u64>,
+}
+
+/// Why a window was not let go ([`ContentStore::let_go`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LetGoRefused {
+  /// The store holds no content of that identity.
+  NotHeld,
+  /// It is no window (a list, a table or a derived node: the store's own metadata, kept in memory).
+  NotAWindow,
+  /// No landed changeset holds its bytes yet ([`ContentStore::mark_landed`]): letting it go would lose it.
+  NotLanded,
+  /// More than one holder keeps it: content another repository holds is never let go for one past its grant.
+  Shared,
+  /// Already let go.
+  Away,
 }
 
 /// A byte count as the store keeps it.
@@ -500,7 +535,7 @@ impl<'b> Tree<'b> {
 fn held_window(held: &Held) -> Option<StoredWindow> {
   match held.kept {
     Kept::Stored { window, .. } => Some(window),
-    Kept::Here(_) => None,
+    Kept::Here(_) | Kept::Away { .. } => None,
   }
 }
 
@@ -534,6 +569,8 @@ impl ContentStore {
       content_bytes: 0,
       charged_bytes: 0,
       counters: ContentCounters::default(),
+      observing: core::cell::RefCell::new(None),
+      reads: core::cell::Cell::new(0),
     })
   }
 
@@ -596,6 +633,10 @@ impl ContentStore {
   fn keep(&mut self, form: Form, bytes: &[u8]) -> Result<Stored, ContentRefused> {
     let identity = ContentId::named(form, bytes);
     if self.entries.contains_key(&identity) {
+      // A window let go is brought back by its own bytes put again (A-724 piece 4).
+      if self.is_away(&identity) {
+        self.bring_back(&identity, bytes)?;
+      }
       self.hold(&identity)?;
       self.counters.deduplicated = self.counters.deduplicated.saturating_add(1);
       return Ok(Stored {
@@ -639,6 +680,8 @@ impl ContentStore {
         kept,
         form,
         holders: 1,
+        landed: false,
+        last_read: core::cell::Cell::new(0),
       },
     );
     self.content_bytes = content_bytes;
@@ -874,6 +917,10 @@ impl ContentStore {
   fn keep_admitted(&mut self, form: Form, bytes: &[u8]) -> Result<Stored, ContentRefused> {
     let identity = ContentId::named(form, bytes);
     if self.entries.contains_key(&identity) {
+      // A window let go is brought back by its own bytes put again (A-724 piece 4).
+      if self.is_away(&identity) {
+        self.bring_back(&identity, bytes)?;
+      }
       self.hold(&identity)?;
       self.counters.deduplicated = self.counters.deduplicated.saturating_add(1);
       return Ok(Stored {
@@ -1020,6 +1067,8 @@ impl ContentStore {
     self.counters.freed = self.counters.freed.saturating_add(1);
     let bytes = match freed.kept {
       Kept::Here(bytes) => bytes,
+      // Its bytes are the node's store's: nothing kept here to free or to give back.
+      Kept::Away { .. } => Box::default(),
       Kept::Stored { window, .. } => {
         let bytes = self
           .storage
@@ -1039,7 +1088,127 @@ impl ContentStore {
   /// chunk of the shard's arena is copied out to be read).
   pub fn get(&self, identity: &ContentId) -> Option<&[u8]> {
     let identity = &self.resolve(identity);
-    self.entries.get(identity).and_then(Held::here)
+    let held = self.entries.get(identity)?;
+    self.note(identity, held);
+    held.here()
+  }
+
+  /// Lends `curve` to the store, every read noted in it until the next call, and gives back the curve it held: what a
+  /// repository's step reads is that repository's working set (A-724 piece 2d, §4.17.5 "Learned demand"). The caller
+  /// brackets a step with it, putting back what it took, so a step inside a step restores its outer curve.
+  pub fn observe(&self, curve: Option<crate::mrc::Curve>) -> Option<crate::mrc::Curve> {
+    match self.observing.try_borrow_mut() {
+      Ok(mut slot) => core::mem::replace(&mut *slot, curve),
+      // Borrowed only inside a read's note, which never calls this: the curve goes back to its caller unlent.
+      Err(_) => curve,
+    }
+  }
+
+  /// Marks the window `identity` names as held by a landed changeset on the node's store (A-724 piece 4): its owner
+  /// calls this once the changeset carrying it is durable there, after which the window may be let go
+  /// ([`ContentStore::let_go`]). Whether the store holds such a window.
+  pub fn mark_landed(&mut self, identity: &ContentId) -> bool {
+    let identity = self.resolve(identity);
+    match self.entries.get_mut(&identity) {
+      Some(held) if held.form == Form::Window => {
+        held.landed = true;
+        true
+      }
+      _ => false,
+    }
+  }
+
+  /// Lets go the bytes of the window `identity` names, past its repository's memory grant (A-724 piece 4, §4.17.5
+  /// "The cold trigger"): only a window a landed changeset holds ([`ContentStore::mark_landed`]) and one holder alone
+  /// keeps, so content another repository holds is never let go here. Its entry stays (its holders, form and length),
+  /// its bytes leave the window storage, and a read of it finds nothing until it is brought back
+  /// ([`ContentStore::bring_back`], or a put of the same bytes). The bytes freed.
+  ///
+  /// # Errors
+  /// [`LetGoRefused`] by kind, the store unchanged.
+  pub fn let_go(&mut self, identity: &ContentId) -> Result<u64, LetGoRefused> {
+    let identity = self.resolve(identity);
+    let held = self
+      .entries
+      .get_mut(&identity)
+      .ok_or(LetGoRefused::NotHeld)?;
+    let (window, len) = match held.kept {
+      Kept::Stored { window, len } if held.form == Form::Window => (window, len),
+      Kept::Away { .. } => return Err(LetGoRefused::Away),
+      _ => return Err(LetGoRefused::NotAWindow),
+    };
+    if !held.landed {
+      return Err(LetGoRefused::NotLanded);
+    }
+    if held.holders > 1 {
+      return Err(LetGoRefused::Shared);
+    }
+    held.kept = Kept::Away { len };
+    self.storage.release(window);
+    let freed = u64::try_from(len).unwrap_or(u64::MAX);
+    self.content_bytes = self.content_bytes.saturating_sub(freed);
+    self.counters.let_go = self.counters.let_go.saturating_add(1);
+    Ok(freed)
+  }
+
+  /// Brings back a window let go, from `bytes` its reader read from the node's store (A-724 piece 4; the tools'
+  /// read-through, w-git's and w-hg's): they must be the window's own, by its identity and length, and fit the budget.
+  ///
+  /// # Errors
+  /// `NotHeld` for a window not let go here or for bytes that are not its own (by identity or length); the budget's
+  /// refusal past it, as a put's.
+  pub fn bring_back(&mut self, identity: &ContentId, bytes: &[u8]) -> Result<(), ContentRefused> {
+    let identity = self.resolve(identity);
+    let len = match self.entries.get(&identity).map(|held| &held.kept) {
+      Some(Kept::Away { len }) => *len,
+      _ => return Err(ContentRefused::NotHeld),
+    };
+    if bytes.len() != len || ContentId::named(Form::Window, bytes) != identity {
+      return Err(ContentRefused::NotHeld);
+    }
+    let need = width(len)?;
+    self.admit(need, 0)?;
+    let window = self.storage.put(bytes)?;
+    self.storage.named(window, &identity);
+    if let Some(held) = self.entries.get_mut(&identity) {
+      held.kept = Kept::Stored { window, len };
+    }
+    self.content_bytes = self.content_bytes.saturating_add(need);
+    self.counters.brought_back = self.counters.brought_back.saturating_add(1);
+    Ok(())
+  }
+
+  /// Whether the window `identity` names was let go ([`ContentStore::let_go`]) and not brought back.
+  pub fn is_away(&self, identity: &ContentId) -> bool {
+    let identity = self.resolve(identity);
+    matches!(
+      self.entries.get(&identity).map(|held| &held.kept),
+      Some(Kept::Away { .. })
+    )
+  }
+
+  /// The store's read count at the last read of the content `identity` names (0 for none since it was kept): the
+  /// coldest of a repository's windows is the one with the least ([`ContentStore::let_go`]'s caller orders by it).
+  pub fn last_read(&self, identity: &ContentId) -> Option<u64> {
+    let identity = self.resolve(identity);
+    self.entries.get(&identity).map(|held| held.last_read.get())
+  }
+
+  /// One read of `held`, named `identity`, noted in the curve lent ([`ContentStore::observe`]): its key the identity's
+  /// first eight bytes (uniform, BLAKE3's), its length the content's.
+  fn note(&self, identity: &ContentId, held: &Held) {
+    let tick = self.reads.get().saturating_add(1);
+    self.reads.set(tick);
+    held.last_read.set(tick);
+    if let Ok(mut slot) = self.observing.try_borrow_mut()
+      && let Some(curve) = slot.as_mut()
+      && let Some(key) = identity.0.first_chunk::<{ size_of::<u64>() }>()
+    {
+      curve.read(
+        u64::from_le_bytes(*key),
+        u64::try_from(held.len()).unwrap_or(u64::MAX),
+      );
+    }
   }
 
   /// The bytes of the content `identity` names, whatever its form: a window's from the window storage (borrowed where
@@ -1047,9 +1216,11 @@ impl ContentStore {
   pub fn bytes_of(&self, identity: &ContentId) -> Option<Cow<'_, [u8]>> {
     let identity = &self.resolve(identity);
     let held = self.entries.get(identity)?;
+    self.note(identity, held);
     match &held.kept {
       Kept::Here(bytes) => Some(Cow::Borrowed(bytes)),
       Kept::Stored { window, .. } => self.storage.read(*window),
+      Kept::Away { .. } => None,
     }
   }
 
@@ -1089,6 +1260,8 @@ impl ContentStore {
           kept: Kept::Stored { window: kept, len },
           form: Form::Window,
           holders: 0,
+          landed: false,
+          last_read: core::cell::Cell::new(0),
         },
       );
     }
@@ -1196,6 +1369,8 @@ impl ContentStore {
           kept: Kept::Here(bytes.into_boxed_slice()),
           form: Form::List,
           holders: 0,
+          landed: false,
+          last_read: core::cell::Cell::new(0),
         },
       );
       kept.push(identity);
@@ -1329,6 +1504,7 @@ impl ContentStore {
       .entries
       .get(&identity)
       .filter(|held| held.form == Form::Window)?;
+    self.note(&identity, held);
     match held_window(held) {
       Some(stored) => self.storage.read_range_in(stored, (offset, into), kept_in),
       None => {
@@ -1360,6 +1536,7 @@ impl ContentStore {
       .entries
       .get(&identity)
       .filter(|held| held.form == Form::Window)?;
+    self.note(&identity, held);
     match held_window(held) {
       Some(window) => self.storage.read_in(window, kept_in),
       None => held.here().map(Cow::Borrowed),
@@ -1579,6 +1756,7 @@ impl<'s> Iterator for Windows<'s> {
         return match &held.kept {
           Kept::Here(bytes) => Some(Cow::Borrowed(bytes)),
           Kept::Stored { window, .. } => self.store.storage.read(*window),
+          Kept::Away { .. } => None,
         };
       }
       self.stack.push((held.here()?, 0));
@@ -2214,5 +2392,67 @@ mod tests {
       "the restored nodes answer the put"
     );
     assert_eq!(after.holders(&one), 1);
+  }
+
+  /// A-724 piece 4 (§4.17.5 "The cold trigger": a window past its repository's grant let go to the node's store). Do:
+  /// put a window, try to let it go before it is marked landed, mark it, let it go, read it, bring it back with other
+  /// bytes and then with its own. Expect: refused `NotLanded` first; then freed (its bytes leave the store's count, its
+  /// length stays), read as nothing, counted; other bytes refused; its own bytes bring it back, read whole, counted.
+  #[test]
+  fn a_landed_window_is_let_go_and_brought_back_by_its_own_bytes() {
+    let mut store = ContentStore::new(1 << 20, 4096).unwrap();
+    let bytes = vec![7u8; 1000];
+    let id = store.put(&bytes).unwrap();
+    assert_eq!(store.let_go(&id), Err(LetGoRefused::NotLanded));
+    assert!(store.mark_landed(&id));
+    let before = store.content_bytes;
+    assert_eq!(store.let_go(&id), Ok(1000));
+    assert_eq!(store.content_bytes, before - 1000);
+    assert!(store.is_away(&id));
+    assert_eq!(store.bytes_of(&id), None);
+    assert_eq!(store.len_of(&id), Some(1000));
+    assert_eq!(store.let_go(&id), Err(LetGoRefused::Away));
+    assert_eq!(store.counters.let_go, 1);
+    assert_eq!(
+      store.bring_back(&id, &vec![8u8; 1000]),
+      Err(ContentRefused::NotHeld)
+    );
+    store.bring_back(&id, &bytes).unwrap();
+    assert!(!store.is_away(&id));
+    assert_eq!(store.bytes_of(&id).as_deref(), Some(bytes.as_slice()));
+    assert_eq!(store.counters.brought_back, 1);
+    assert_eq!(store.content_bytes, before);
+  }
+
+  /// A-724 piece 4. Do: let go a landed window, then put the same bytes again (a new push bringing them). Expect: the put
+  /// brings the window back (read whole, counted) and holds it once more.
+  #[test]
+  fn a_put_of_a_let_go_windows_bytes_brings_it_back() {
+    let mut store = ContentStore::new(1 << 20, 4096).unwrap();
+    let bytes = vec![3u8; 500];
+    let id = store.put(&bytes).unwrap();
+    store.mark_landed(&id);
+    store.let_go(&id).unwrap();
+    assert_eq!(store.put(&bytes).unwrap(), id);
+    assert_eq!(store.bytes_of(&id).as_deref(), Some(bytes.as_slice()));
+    assert_eq!(store.counters.brought_back, 1);
+  }
+
+  /// A-724 piece 4 ("never windows another repository's grant keeps"). Do: put a window twice (two holders), mark it
+  /// landed, let it go; put a list and try to let it go. Expect: refused `Shared`, then `NotAWindow`, nothing freed.
+  #[test]
+  fn content_two_hold_or_no_window_is_never_let_go() {
+    let mut store = ContentStore::new(1 << 20, 4096).unwrap();
+    let bytes = vec![5u8; 300];
+    let id = store.put(&bytes).unwrap();
+    store.put(&bytes).unwrap();
+    store.mark_landed(&id);
+    assert_eq!(store.let_go(&id), Err(LetGoRefused::Shared));
+    let big = vec![9u8; 4096 * 3];
+    let object = store.put_object(&big).unwrap();
+    let root = store.resolve(&object);
+    assert!(!store.mark_landed(&root));
+    assert_eq!(store.let_go(&root), Err(LetGoRefused::NotAWindow));
+    assert_eq!(store.counters.let_go, 0);
   }
 }

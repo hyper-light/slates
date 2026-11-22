@@ -16,6 +16,7 @@ use slates_git::upload::Asked;
 use slates_ipc::protocol::WorkOp;
 use slates_vfs::clock::{Clock, HostClock};
 
+use super::{KILL_BEFORE_MADE_COMMIT, MAP_TURNS, TEST_MAP_BUDGET};
 use super::{MADE, UNMADE};
 use crate::state::ShardState;
 use crate::vcs_store::green_key;
@@ -271,13 +272,25 @@ fn tree_counters(state: &ShardState, repository: RepositoryId) -> TreeCounters {
 }
 
 /// Each record of `repository`'s register past the first `skip`: its moves, and its objects' types in order.
-fn recorded(state: &ShardState, repository: RepositoryId, skip: usize) -> Vec<RecordFacts> {
+fn recorded(state: &mut ShardState, repository: RepositoryId, skip: usize) -> Vec<RecordFacts> {
   records(state, repository)
     .iter()
     .skip(skip)
     .map(|bytes| {
       let record = Record::decode(bytes, FORMAT).expect("a record");
-      let kinds = record.names.iter().map(|name| name.0).collect();
+      // Version 5 keeps its names as a content (C5): read from the shard's content store.
+      let kinds = record
+        .named
+        .and_then(|(identity, count)| {
+          // Read with the shard's chunk store lent, where the names' windows are kept.
+          let lent = crate::vcs_store::Lent::new(&mut state.store, &mut state.vcs_stores);
+          let content = lent.stores.content()?;
+          crate::vcs_store::record_names::names_from_content(content, &identity, count).ok()
+        })
+        .unwrap_or_default()
+        .iter()
+        .map(|name| name.0)
+        .collect();
       (record.moves, kinds)
     })
     .collect()
@@ -478,54 +491,86 @@ fn t_a664_live_a_pushs_whole_map_is_built_in_slices_after_its_answer() {
 /// A-664's live whole builds (a submit parked behind one). Do: push a commit of three files to a git repository's root
 /// green, its map left to its build; submit a work appending to `README` (an append, so the edit is no whole-file
 /// rewrite, which would park the resumed submit again behind its refinement, A-787 part 2) while the build is under
-/// way; drive the build to its end. Expect: the submit parked, the green still at the pushed version; once the build
-/// ends the submit runs again, the green at its version and its commit made over the map the build kept, its tree
-/// another than the pushed one.
+/// way; drive the build to its end; then wait for the made commit's one step (C5 2b piece 3: the resumed submit's commit
+/// is landed on the node's store by a task before its version commits). Expect: the submit parked, the green still at
+/// the pushed version; once the build ends the submit runs again, and once its commit landed the green is at its
+/// version and its commit made over the map the build kept, its tree another than the pushed one; a stock clone of `main`
+/// reads exactly the pushed files with the edit made (the map stepped over the held verdict's preview names the change:
+/// red before the preview's numbering was taken as its own, the commit holding the pushed tree).
 #[test]
 fn t_a664_live_a_submit_waits_parked_for_its_greens_whole_build() {
-  let seen = crate::test_store::audit_on_stored_shard("vcs_store-commits", |state| {
-    let (repository, green) = git_repository(state, "parked");
-    let root = to_db_volume(green);
-    let key = green_key(root);
-    let pushed = pushed_three(state, (repository, root));
-    let head = |state: &ShardState| state.greens.get(&root).map(|engine| engine.head());
-    let ask = crate::vcs_store::paths::tests::ask;
-    let made = ask(
-      state,
-      slates_ipc::protocol::RequestBody::CreateWork {
-        green,
-        name: "work-parked".to_owned(),
-      },
-    );
-    let slates_ipc::protocol::ReplyBody::WorkCreated { id: work, .. } = made else {
-      return (None, None, None, false, 0);
-    };
-    ask(
-      state,
-      slates_ipc::protocol::RequestBody::Edit {
-        work,
-        path: "/README".to_owned(),
-        at: 4,
-        delete_len: 0,
-        bytes: b"two\n".to_vec(),
-      },
-    );
-    recorded_submit(state, crate::identities::authored(work, "edit the readme"));
-    let parked = count(state, crate::vcs_store::paths::whole_build::PARKED);
-    let during = head(state);
-    crate::vcs_store::paths::whole_build::settle(state);
-    let after = head(state);
-    let tree = kept_tree(state, repository, key);
-    (
-      during,
-      after,
-      tree.filter(|tree| *tree != pushed),
-      parked == 1,
-      counts(state).0,
-    )
-  });
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let seen = crate::test_store::run_on_first(
+    &daemon,
+    || async move {
+      let head = |state: &ShardState, root| state.greens.get(&root).map(|engine| engine.head());
+      let begun = crate::state::with_state(|state| {
+        let (repository, green) = git_repository(state, "parked");
+        let root = to_db_volume(green);
+        let pushed = pushed_three(state, (repository, root));
+        let ask = crate::vcs_store::paths::tests::ask;
+        let made = ask(
+          state,
+          slates_ipc::protocol::RequestBody::CreateWork {
+            green,
+            name: "work-parked".to_owned(),
+          },
+        );
+        let slates_ipc::protocol::ReplyBody::WorkCreated { id: work, .. } = made else {
+          return None;
+        };
+        ask(
+          state,
+          slates_ipc::protocol::RequestBody::Edit {
+            work,
+            path: "/README".to_owned(),
+            at: 4,
+            delete_len: 0,
+            bytes: b"two\n".to_vec(),
+          },
+        );
+        recorded_submit(state, crate::identities::authored(work, "edit the readme"));
+        let parked = count(state, crate::vcs_store::paths::whole_build::PARKED);
+        let during = head(state, root);
+        crate::vcs_store::paths::whole_build::settle(state);
+        Some((repository, root, pushed, parked == 1, during))
+      })
+      .flatten();
+      let Some((repository, root, pushed, parked, during)) = begun else {
+        return (None, None, false, false, 0, None);
+      };
+      let deadline = slates_rt::futures::now_ns()
+        .saturating_add(u64::try_from(MADE_PATIENCE.as_nanos()).unwrap_or(u64::MAX));
+      while crate::state::with_state(|state| head(state, root) != Some(2)).unwrap_or(false)
+        && slates_rt::futures::now_ns() < deadline
+      {
+        slates_rt::futures::yield_now().await;
+      }
+      crate::state::with_state(|state| {
+        let tree = kept_tree(state, repository, green_key(root));
+        (
+          during,
+          head(state, root),
+          tree.is_some_and(|tree| tree != pushed),
+          parked,
+          counts(state).0,
+          Some(cloned(state, repository, "main").files),
+        )
+      })
+      .unwrap_or((None, None, false, false, 0, None))
+    },
+    MADE_PATIENCE,
+  );
+  daemon.stop();
+  // The oracle: the commit made over the preview's map holds the edit, as a stock clone reads it.
+  let expected = listing(&[
+    ("README", Mode::File, b"one\ntwo\n"),
+    ("a", Mode::File, b"alpha\n"),
+    ("b", Mode::File, b"beta\n"),
+  ]);
+  assert_eq!(seen.5, Some(expected), "the made commit's tree, cloned");
   assert_eq!(
-    (seen.0, seen.1, seen.2.is_some(), seen.3, seen.4),
+    (seen.0, seen.1, seen.2, seen.3, seen.4),
     (Some(1), Some(2), true, true, 1)
   );
 }
@@ -752,4 +797,339 @@ fn t_a664_live_a_parked_submit_waits_at_most_its_bound() {
     )
   });
   assert_eq!(seen, (1, 0, 1, Some(1)));
+}
+
+/// Shape: how long a made commit's landing may take before a test gives up on it.
+const MADE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Whether request `id` of `origin` is completed: answered, its answer recorded.
+fn completed(state: &ShardState, origin: u64, id: slates_wire::request::RequestId) -> bool {
+  matches!(
+    state
+      .db
+      .partition()
+      .completion(origin, id.client, id.sequence),
+    slates_wire::request::Seen::Completed(_)
+  )
+}
+
+/// C5 part 2b piece 3 (A-767; A-804's deferred-submit hook adopted for git: main's landing order, check, the store's
+/// land, the register's commit, the answer). Do: on a store-backed daemon, submit a work making `/README` to a git
+/// repository's root green as a client's recorded request; read, in the verb's own step, its completion, the green's
+/// durable head and the store versions of its key; then wait for its completion. Expect: in the verb's step nothing
+/// answered or durable (the durable head 0, no store version); then answered, the durable head 1, the green's key at its
+/// first store version, the made commit's record v5 (its changeset landed on the node's store). Red before the change:
+/// the commit made, recorded version 2 inline, and the submit answered, in the verb's own step.
+#[test]
+fn t_c5b_p3_a_git_made_commit_is_answered_only_once_its_changeset_landed_and_committed() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let seen = crate::test_store::run_on_first(
+    &daemon,
+    || async move {
+      let id = slates_wire::request::RequestId {
+        client: 7,
+        sequence: 1,
+      };
+      let (repository, root, in_the_verb) = crate::state::with_state(|state| {
+        let (repository, green) = git_repository(state, "deferred");
+        let root = to_db_volume(green);
+        let made = crate::vcs_store::paths::tests::ask(
+          state,
+          slates_ipc::protocol::RequestBody::CreateWork {
+            green,
+            name: "work-deferred".to_owned(),
+          },
+        );
+        let slates_ipc::protocol::ReplyBody::WorkCreated { id: work, .. } = made else {
+          panic!("no work: {made:?}");
+        };
+        crate::vcs_store::paths::tests::ask(
+          state,
+          slates_ipc::protocol::RequestBody::Edit {
+            work,
+            path: "/README".to_owned(),
+            at: 0,
+            delete_len: 0,
+            bytes: b"made\n".to_vec(),
+          },
+        );
+        crate::verbs::run_recorded_for_test(
+          state,
+          (7, id),
+          &owner(),
+          crate::identities::authored(work, "made"),
+        );
+        let versions = state
+          .vcs_stores
+          .git_ref(repository)
+          .map_or(0, |(_, git)| git.versions(green_key(root)).len());
+        (
+          repository,
+          root,
+          (
+            completed(state, 7, id),
+            state.db.partition().green_head(root),
+            versions,
+          ),
+        )
+      })
+      .expect("the shard's state");
+      let deadline = slates_rt::futures::now_ns()
+        .saturating_add(u64::try_from(MADE_PATIENCE.as_nanos()).unwrap_or(u64::MAX));
+      while !crate::state::with_state(|state| completed(state, 7, id)).unwrap_or(false)
+        && slates_rt::futures::now_ns() < deadline
+      {
+        slates_rt::futures::yield_now().await;
+      }
+      let after = crate::state::with_state(|state| {
+        let versions = state
+          .vcs_stores
+          .git_ref(repository)
+          .map_or(0, |(_, git)| git.versions(green_key(root)).len());
+        let newest = records(state, repository)
+          .last()
+          .and_then(|bytes| bytes.get(4..8).map(<[u8]>::to_vec));
+        (
+          completed(state, 7, id),
+          state.db.partition().green_head(root),
+          versions,
+          newest,
+        )
+      })
+      .expect("the shard's state");
+      (in_the_verb, after)
+    },
+    MADE_PATIENCE,
+  );
+  daemon.stop();
+  assert_eq!(
+    seen.0,
+    (false, 0, 0),
+    "nothing answered or durable before the made commit landed"
+  );
+  assert_eq!(
+    seen.1,
+    (true, 1, 1, Some(5u32.to_le_bytes().to_vec())),
+    "answered once its changeset landed and both committed, recorded v5"
+  );
+}
+
+/// C5 part 2b piece 3, its crash case (main's landing order). Do: on a store-backed daemon, submit a work making `/README`
+/// to a git repository's root green as a client's recorded request, the made commit's task killed after its changeset
+/// landed and before its step commits (as a `kill -9` there leaves it); make the store again from what is durable, as a
+/// restart does; then run the same request again. Expect: after the kill, the state before (the durable head 0, no store
+/// version of the green, the register's records as before the submit, the request not answered); the retry lands once
+/// (one record more than before the submit, version 5), the request answered, the durable head 1, the green at its
+/// first store version. Before the hook the version and its commit were durable in the verb's step, landed nowhere.
+#[test]
+fn t_c5b_p3_a_kill_between_a_made_commits_landing_and_its_step_recovers_to_before_and_the_retry_lands_once()
+ {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let seen = crate::test_store::run_on_first(
+    &daemon,
+    || async move {
+      let id = slates_wire::request::RequestId {
+        client: 7,
+        sequence: 1,
+      };
+      let (repository, root, work, held) = crate::state::with_state(|state| {
+        let (repository, green) = git_repository(state, "killed");
+        let ask = crate::vcs_store::paths::tests::ask;
+        let made = ask(
+          state,
+          slates_ipc::protocol::RequestBody::CreateWork {
+            green,
+            name: "work-killed".to_owned(),
+          },
+        );
+        let slates_ipc::protocol::ReplyBody::WorkCreated { id: work, .. } = made else {
+          panic!("no work: {made:?}");
+        };
+        ask(
+          state,
+          slates_ipc::protocol::RequestBody::Edit {
+            work,
+            path: "/README".to_owned(),
+            at: 0,
+            delete_len: 0,
+            bytes: b"made\n".to_vec(),
+          },
+        );
+        (
+          repository,
+          to_db_volume(green),
+          work,
+          records(state, repository).len(),
+        )
+      })
+      .expect("the shard's state");
+      let submit = move |state: &mut ShardState| {
+        crate::verbs::run_recorded_for_test(
+          state,
+          (7, id),
+          &owner(),
+          crate::identities::authored(work, "made"),
+        );
+      };
+      let read = move |state: &ShardState| {
+        let versions = state
+          .vcs_stores
+          .git_ref(repository)
+          .map_or(0, |(_, git)| git.versions(green_key(root)).len());
+        (
+          state.db.partition().green_head(root),
+          versions,
+          records(state, repository).len(),
+          completed(state, 7, id),
+        )
+      };
+      let deadline = slates_rt::futures::now_ns()
+        .saturating_add(u64::try_from(MADE_PATIENCE.as_nanos()).unwrap_or(u64::MAX));
+      KILL_BEFORE_MADE_COMMIT.with(|kill| kill.set(true));
+      crate::state::with_state(submit).expect("the shard's state");
+      // The killed task: its changeset lands, then the kill fires (clearing itself) where the step would commit.
+      while KILL_BEFORE_MADE_COMMIT.with(std::cell::Cell::get) {
+        assert!(
+          slates_rt::futures::now_ns() < deadline,
+          "the kill never fired"
+        );
+        slates_rt::futures::yield_now().await;
+      }
+      // A restart: what memory held past the durable state is made again from it.
+      crate::state::with_state(|state| {
+        crate::verbs::reconcile_unpublished_effects(state);
+        crate::vcs_store::rebuild(state, repository);
+      })
+      .expect("the shard's state");
+      crate::vcs_store::rebuilt(repository).await;
+      let after_kill = crate::state::with_state(|state| read(state)).expect("the shard's state");
+      crate::state::with_state(submit).expect("the shard's state");
+      while !crate::state::with_state(|state| completed(state, 7, id)).unwrap_or(false)
+        && slates_rt::futures::now_ns() < deadline
+      {
+        slates_rt::futures::yield_now().await;
+      }
+      let after_retry = crate::state::with_state(|state| {
+        let newest = records(state, repository)
+          .last()
+          .and_then(|bytes| bytes.get(4..8).map(<[u8]>::to_vec));
+        (read(state), newest)
+      })
+      .expect("the shard's state");
+      (held, after_kill, after_retry)
+    },
+    MADE_PATIENCE,
+  );
+  daemon.stop();
+  let (held, after_kill, (after_retry, newest)) = seen;
+  assert_eq!(
+    after_kill,
+    (0, 0, held, false),
+    "the state before the submit"
+  );
+  assert_eq!(
+    (after_retry, newest),
+    ((1, 1, held + 1, true), Some(5u32.to_le_bytes().to_vec())),
+    "the retry landed once, recorded version 5, and answered"
+  );
+}
+
+/// Shape: the files each version of [`t_a824_a_made_commits_map_is_put_a_slice_a_turn_over_the_preview`] makes or
+/// changes: enough that a version put whole in one turn is told from one put a path a turn.
+const SLICED_FILES: usize = 8;
+
+/// A-824's owed piece (main's order of 2026-11-21: the change step over the preview, sliced). Do: on a store-backed
+/// daemon, each made commit's map turn given no budget (one path a turn, whatever the machine's load), submit as a
+/// client's recorded requests a root's first version making [`SLICED_FILES`] files, then a version changing every one
+/// of them; wait for each to be answered; clone `main`. Expect: each version's map put in at least as many turns as it
+/// has files (the root's first whole, the second over its change), and the clone holding every file with the second
+/// version's bytes. Before, each version's map was stepped over the preview in one turn, whatever its size.
+#[test]
+fn t_a824_a_made_commits_map_is_put_a_slice_a_turn_over_the_preview() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let seen = crate::test_store::run_on_first(
+    &daemon,
+    || async move {
+      TEST_MAP_BUDGET.with(|budget| budget.set(Some(0)));
+      let (repository, green) =
+        crate::state::with_state(|state| git_repository(state, "sliced-made")).expect("the state");
+      let mut turns = Vec::new();
+      for (sequence, word) in [(1u32, "one"), (2, "two")] {
+        let id = slates_wire::request::RequestId {
+          client: 7,
+          sequence,
+        };
+        let before = crate::state::with_state(|state| {
+          let ask = crate::vcs_store::paths::tests::ask;
+          let made = ask(
+            state,
+            slates_ipc::protocol::RequestBody::CreateWork {
+              green,
+              name: format!("work-{word}"),
+            },
+          );
+          let slates_ipc::protocol::ReplyBody::WorkCreated { id: work, .. } = made else {
+            panic!("no work: {made:?}");
+          };
+          for at in 0..SLICED_FILES {
+            let path = format!("/f{at}");
+            let old_len = if sequence == 1 {
+              0
+            } else {
+              "one\n".len() as u64
+            };
+            ask(
+              state,
+              slates_ipc::protocol::RequestBody::Edit {
+                work,
+                path,
+                at: 0,
+                delete_len: old_len,
+                bytes: format!("{word}\n").into_bytes(),
+              },
+            );
+          }
+          let before = count(state, MAP_TURNS);
+          crate::verbs::run_recorded_for_test(
+            state,
+            (7, id),
+            &owner(),
+            crate::identities::authored(work, word),
+          );
+          before
+        })
+        .expect("the state");
+        let deadline = slates_rt::futures::now_ns()
+          .saturating_add(u64::try_from(MADE_PATIENCE.as_nanos()).unwrap_or(u64::MAX));
+        while !crate::state::with_state(|state| completed(state, 7, id)).unwrap_or(false)
+          && slates_rt::futures::now_ns() < deadline
+        {
+          slates_rt::futures::yield_now().await;
+        }
+        turns.push(crate::state::with_state(|state| count(state, MAP_TURNS) - before).unwrap_or(0));
+      }
+      let files = crate::state::with_state(|state| cloned(state, repository, "main").files)
+        .expect("the state");
+      (turns, files)
+    },
+    MADE_PATIENCE,
+  );
+  daemon.stop();
+  let (turns, files) = seen;
+  assert!(
+    turns.iter().all(|turns| *turns >= SLICED_FILES as u64),
+    "each version's map put a path a turn: {turns:?}"
+  );
+  let expected: Vec<(String, Mode, Vec<u8>)> = (0..SLICED_FILES)
+    .map(|at| (format!("f{at}"), Mode::File, b"two\n".to_vec()))
+    .collect();
+  let expected: Vec<(&str, Mode, &[u8])> = expected
+    .iter()
+    .map(|(path, mode, bytes)| (path.as_str(), *mode, bytes.as_slice()))
+    .collect();
+  assert_eq!(
+    files,
+    listing(&expected),
+    "the clone holds the second version"
+  );
 }

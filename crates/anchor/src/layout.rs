@@ -18,16 +18,22 @@ pub const MAGIC: u32 = 0x4E41_4C53;
 /// 13 the copies' section and the sum each behind a presence byte, written beside a copy's record alone (checkpoint
 /// version 5, A-626 part 3, continued (1), 2026-11-19), 14 a work's logged journal may hold a copy (`LoggedOp::Copy`,
 /// A-626 part 4, 2026-11-19), 15 a token's credential record keeps its CRAM-MD5 keyed contexts beside its hash
-/// (`CredentialKind::HttpToken`'s field, A-692, 2026-11-19). An older segment is refused, never misread.
+/// (`CredentialKind::HttpToken`'s field, A-692, 2026-11-19), 16 a green's checkpoint is named, not carried: its record and
+/// a snapshot hold the identity and length its encoding is held under in the owner shard's content store (A-579's last
+/// step, on chain entry format 6's rule, 2026-11-21), 17 a slice's pool extents a run doubling from one unit before the
+/// rest's binary parts, so an extent id names another range of the content object (A-848, 2026-11-21), 18 the pool
+/// region a want word a partition after its owner words (A-853, 2026-11-21). An older segment is refused, never
+/// misread.
 /// Format: this layout's number in the history above.
-pub const LAYOUT_VERSION: u32 = 15;
+pub const LAYOUT_VERSION: u32 = 18;
 /// Format: the layout before A-237's host-scoped principals, refused with what to do about it.
 pub const LAYOUT_BEFORE_HOST_SCOPED_PRINCIPALS: u32 = 4;
 /// Format: one content-pool extent's owner word (A-98): 0 while the extent is free, else its owning partition plus
 /// one, so partition 0 is distinct from "free".
 pub const POOL_WORD_BYTES: usize = 8;
-/// Format: the pool extents a partition's slice may hold (A-98): its arena range is cut into power-of-two parts, at
-/// most one per bit of its length in units, which a 64-bit count bounds. Extent `partition × this + part`.
+/// Format: the pool extents a partition's slice may hold (A-98): its arena range is cut into power-of-two parts (since
+/// A-848 a run doubling from one unit, then the rest's binary parts: about two per bit of its length in units, cut
+/// off at this many). Extent `partition × this + part`.
 pub const POOL_EXTENTS_PER_PARTITION: usize = 64;
 /// Format: the snapshot slots a partition holds (the committed one and the one being written).
 const SNAPSHOT_SLOTS: usize = 2;
@@ -392,10 +398,15 @@ impl Geometry {
       .saturating_add(self.snapshot_bytes)
   }
 
-  /// The pool region's bytes (A-98): [`POOL_EXTENTS_PER_PARTITION`] owner words a partition.
+  /// The pool region's bytes (A-98): [`POOL_EXTENTS_PER_PARTITION`] owner words a partition, then one want word a
+  /// partition (A-853: the room a partition was refused, posted for the others to give back toward).
   fn pool_bytes(&self) -> u64 {
     u64::from(self.partitions)
-      .saturating_mul(u64::try_from(POOL_EXTENTS_PER_PARTITION).unwrap_or(u64::MAX))
+      .saturating_mul(
+        u64::try_from(POOL_EXTENTS_PER_PARTITION)
+          .unwrap_or(u64::MAX)
+          .saturating_add(1),
+      )
       .saturating_mul(u64::try_from(POOL_WORD_BYTES).unwrap_or(u64::MAX))
   }
 

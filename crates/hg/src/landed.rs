@@ -21,7 +21,7 @@ use std::borrow::Cow;
 use slates_vcs::{ContentStore, IndexRefused};
 
 use crate::changegroup::Version;
-use crate::import::record::{self, Refused as RecordRefused, Replay, Replayed};
+use crate::import::record::{self, Progress, Refused as RecordRefused, Replay, Replayed};
 use crate::index::HgIndex;
 
 /// A changeset's section, as Mercurial's history uses the changeset log's (slates-store's `SectionKind`).
@@ -141,8 +141,7 @@ impl Replaying {
         return Ok(Stepped::Done);
       };
       let record = section(log, sequence, Section::Record)?;
-      let payload = section(log, sequence, Section::Payload)?;
-      let replay = Replay::begin_sectioned(&record, &payload, index, store)
+      let replay = Replay::begin_sectioned(&record)
         .map_err(|refused| Refused::Record { sequence, refused })?;
       self.under_way = Some((sequence, replay));
       return Ok(Stepped::More);
@@ -151,12 +150,40 @@ impl Replaying {
       Ok(payload) => payload,
       Err(refused) => return Err(given_back(sequence, replay, store, refused)),
     };
-    match replay.step(&payload, store) {
-      Ok(true) => {
+    match replay.step_sectioned(payload.as_ref(), index, store) {
+      Ok(Progress::More) => {
         self.under_way = Some((sequence, replay));
         Ok(Stepped::More)
       }
-      Ok(false) => {
+      // A test's log keeps no store: the fork's own texts stand in for it.
+      #[cfg(test)]
+      Ok(Progress::Store) => {
+        replay.answer_from_fork(store);
+        self.under_way = Some((sequence, replay));
+        Ok(Stepped::More)
+      }
+      // This seam lends sections and answers no store want: a base landed before is read only by a replay that waits.
+      #[cfg(not(test))]
+      Ok(Progress::Store) => Err(given_back(
+        sequence,
+        replay,
+        store,
+        Refused::Record {
+          sequence,
+          refused: RecordRefused::StoreWanted,
+        },
+      )),
+      // The log lends a section whole: a want names bytes past its end.
+      Ok(Progress::Wanted(_)) => Err(given_back(
+        sequence,
+        replay,
+        store,
+        Refused::Record {
+          sequence,
+          refused: RecordRefused::Truncated,
+        },
+      )),
+      Ok(Progress::Done) => {
         let replayed = replay
           .finish(index, store)
           .map_err(|refused| Refused::Record { sequence, refused })?;

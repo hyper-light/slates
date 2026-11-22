@@ -4040,6 +4040,20 @@ impl Client {
     }
   }
 
+  /// Destroys repository `repository` whole, its owner asking (A-843; `slates repository destroy`): its record, its
+  /// namespace and logs, every green of its lineage and its store. Refused typed (`NotFound`, `Forbidden` for a
+  /// principal but the owner).
+  pub fn destroy_repository(&mut self, repository: &str) -> Result<(), ClientError> {
+    match self.call(&RequestBody::DestroyRepository {
+      repository: repository.to_owned(),
+    })? {
+      ReplyBody::Destroyed => Ok(()),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "destroy_repository",
+      }),
+    }
+  }
+
   /// Reads repository `repository`'s policy whole, its owner asking (A-622; `slates repository policy`): its version and
   /// every part. Refused typed (`NotFound`, `Forbidden` for a principal but the owner).
   pub fn describe_repository_policy(
@@ -4794,6 +4808,23 @@ impl Client {
     self
       .verdict_of(stamp.work, VerdictKind::Rebase, reply)?
       .rebased()
+  }
+
+  /// Resolves a conflict in one ask (A-840): retires the work's operations in the windows `over` names, rebases the
+  /// rest onto the head as it is and applies `replacement` there, restating the work at the head. A conflict when what
+  /// is kept still overlaps the head, every window read; never stale, since nothing was judged at an older head.
+  pub fn resolve_conflict(
+    &mut self,
+    work: VolumeId,
+    over: Vec<slates_ipc::protocol::MergeWindow>,
+    replacement: Vec<slates_ipc::protocol::WorkChange>,
+  ) -> Result<Rebased, ClientError> {
+    let reply = self.call(&RequestBody::ResolveConflict {
+      work,
+      over,
+      replacement,
+    })?;
+    self.verdict_of(work, VerdictKind::Rebase, reply)?.rebased()
   }
 
   /// Clones a snapshot into a new volume; the clone's id.

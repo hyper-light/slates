@@ -791,6 +791,9 @@ pub struct ShardState {
   /// repository with an event, dropped with the repository ([`crate::vcs_store::free`]), so bounded by the partition's
   /// repositories.
   pub(crate) vcs_usage: slates_vcs::Ledger<slates_db::catalog::RepositoryId, Principal>,
+  /// Each repository's memory share on this shard, divided by marginal utility at the learning cadence and kept whole
+  /// between divisions (A-724 piece 2d, [`crate::vcs_share::grants`]): one entry a repository with a usage row.
+  pub(crate) vcs_grants: crate::vcs_share::grants::Grants,
   /// The learned times of the hooks of this shard's repositories (A-622's table, `crate::vcs_hooks::HookTimesTable`):
   /// bounded by the hooks their policies configure. Unix alone, where hooks run.
   #[cfg(unix)]
@@ -891,6 +894,13 @@ pub struct ShardState {
   pub(crate) work_home: crate::work_home::WorkHome,
   /// The shard's refinements of works' whole-file rewrites, a slice a turn (A-787 part 2, `crate::refining`).
   pub(crate) refining: crate::refining::Refining,
+  /// The shard's server-made commits waiting on their landing (the deferred-submit hook, `crate::made_commit`).
+  pub(crate) made_commits: crate::made_commit::MadeCommits,
+  /// The shard's greens being made from the push they owe, and the requests parked on them (P2, `crate::green_ready`).
+  pub(crate) materializations: crate::green_ready::Materializations,
+  /// The shard's reads of Mercurial repositories' `.hgtags` for an owner's verb, and the requests parked on them
+  /// (A-767 C1, `crate::vcs_store::hg_tags`).
+  pub(crate) hg_tags: crate::vcs_store::hg_tags::HgTags,
   /// The `ring.request` spans of requests this shard forwarded to another shard, or scattered, by request
   /// word (§4.14): opened at the slot read, ended when the reply comes back through `deliver` and is
   /// written, so a forwarded reply's ring span is timed from read to reply like a local one. Bounded by
@@ -908,6 +918,12 @@ pub struct ShardState {
   /// `await_placed`) consults this — a head with a stored quorum placement is region-placed; without one it
   /// is the local append (`f = 0`, or not yet replicated). Empty on a laptop (no fleet loop runs).
   pub placed_heads: BTreeMap<ObjectId, crate::head::PlacedHead>,
+  /// The placements of the objects this shard asks about, one computation a configuration
+  /// ([`crate::placement_cache`]): read through [`ShardState::with_placement`].
+  pub(crate) placement_cache: std::cell::RefCell<crate::placement_cache::PlacementCache>,
+  /// Each live volume's sealing keys, unwrapped once and kept while their records stand (`crate::seal_keys::BodyKeys`;
+  /// g228, 85a: five unwraps a publication before).
+  pub(crate) body_keys: crate::seal_keys::BodyKeys,
   /// The state logs' records of the repositories this shard owns that some candidate still lacks (A-636 part 2b): each
   /// a part of its log's register, shipped by the record plane in position order and let go once every candidate holds
   /// it. Bounded by the partition's merge budget (`crate::state_log::bound`); empty on a laptop.
@@ -1299,6 +1315,10 @@ pub struct ShardState {
   /// a takeover successor materializes a taken-over volume from, and what a reader fetches by identity.
   /// Empty on a laptop (no fleet loop runs).
   pub held_content: slates_cluster::content::ContentHold,
+  /// Whether the running transaction holds an entry naming an increment the content store holds but its committed image
+  /// may not yet (chain entry format 6): set by `verbs::publish_held_increments` in a transaction, settled by
+  /// `verbs::commit_settled` before the transaction's record is appended.
+  pub(crate) held_publication_owed: bool,
   /// The seals in progress for volumes this node owns (§4.10), by object: each walks the volume's newest
   /// snapshot into its archive in bounded slices, puts the archive to the content candidates until
   /// `f + 1` hold it, and is dropped once the head naming it places and the snapshot is recorded placed.
@@ -1513,6 +1533,20 @@ impl std::fmt::Debug for PendingForward {
 }
 
 impl ShardState {
+  /// Runs `with` on `object`'s placement under the configuration in force, computed once a configuration
+  /// ([`crate::placement_cache`]); computed afresh only while the cache is already borrowed (a nested ask).
+  pub(crate) fn with_placement<R>(
+    &self,
+    object: slates_db::register::ObjectId,
+    with: impl FnOnce(&slates_db::register::Placement) -> R,
+  ) -> R {
+    let configuration = self.fleet.configuration();
+    match self.placement_cache.try_borrow_mut() {
+      Ok(mut cache) => cache.with(configuration, object, self.placed_heads.len(), with),
+      Err(_) => with(&configuration.place(object)),
+    }
+  }
+
   /// Adds `by` to the count of refusal or event `kind`, saturating (a count never wraps to a small number). Adding zero
   /// changes nothing: an entry stands in the status report's counter map only once something happened (2026-10-10: a
   /// boot's zero restores and an idle tick's zero purges stood there as events, and a formation check that reads the
@@ -1523,6 +1557,16 @@ impl ShardState {
     }
     let count = self.refusals.entry(kind).or_insert(0);
     *count = count.saturating_add(by);
+  }
+
+  /// Raises the count of `kind` to `value` when it is larger: a counter that reads the most a figure reached (a longest
+  /// step), in the same report as the sums. Zero changes nothing, as [`ShardState::count`]'s does.
+  pub(crate) fn count_max(&mut self, kind: &'static str, value: u64) {
+    if value == 0 {
+      return;
+    }
+    let count = self.refusals.entry(kind).or_insert(0);
+    *count = (*count).max(value);
   }
 }
 

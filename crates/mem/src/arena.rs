@@ -100,7 +100,9 @@ fn scrub(region: &mut Region, offset: usize, len: usize) {
 /// to one arena at a time under a stable id.
 pub trait ExtentSource: Send {
   /// One more extent for this arena, with the id its blocks are named by, or `None` when the pool has none free.
-  fn claim(&mut self) -> Option<(u16, Region)>;
+  /// `want` is the bytes the arena still lacks (A-848): a source holding extents of several lengths hands out the
+  /// smallest that covers it, else its largest, so an arena grows by what its admissions need.
+  fn claim(&mut self, want: usize) -> Option<(u16, Region)>;
   /// Returns extent `id`, wholly free, to the pool.
   fn release(&mut self, id: u16, region: Region);
   /// Claims the pool took but could not hand out (the OS refused to map the extent), so far: a claim refused this
@@ -113,6 +115,10 @@ pub trait ExtentSource: Send {
   /// admission.md §5.5: a takeover's recovery runs past the hold, which never revokes a committed claim). A source
   /// with no hold has nothing to open.
   fn open_hold(&mut self, _open: bool) {}
+  /// Posts the bytes this arena was refused for want of free extents, 0 once it grew by what it lacked (A-853, the
+  /// share cap): a source shared with other arenas tells them, so one holding more than its demand gives back. A
+  /// source with no other arena has no one to tell.
+  fn want(&mut self, _bytes: usize) {}
 }
 
 /// The arena.
@@ -328,7 +334,8 @@ impl ChunkArena {
   pub fn grow(&mut self, bytes: usize) -> usize {
     let mut added = 0usize;
     while added < bytes {
-      let Some((id, region)) = self.source.as_mut().and_then(|source| source.claim()) else {
+      let want = bytes.saturating_sub(added);
+      let Some((id, region)) = self.source.as_mut().and_then(|source| source.claim(want)) else {
         break;
       };
       let before = self.capacity();
@@ -363,7 +370,9 @@ impl ChunkArena {
     // Growing from the pool takes on the pressure debt the daemon's sampler left for the next shard to grow (§4.2,
     // `budget::Pressure`): the arena grows by it too, and the budget holds it once grown.
     let needed = deficit.saturating_add(budget.debt());
+    let needed_bytes = usize::try_from(needed).unwrap_or(usize::MAX);
     if u64::try_from(self.claimable()).unwrap_or(u64::MAX) < needed {
+      self.post_want(needed_bytes);
       return 0;
     }
     let before = self.capacity();
@@ -373,11 +382,20 @@ impl ChunkArena {
       // The claims just taken hold no block, so they are wholly free and go back first (the newest regions are
       // returned first), down to the capacity the arena had before.
       self.shrink(before);
+      self.post_want(needed_bytes);
       return 0;
     }
+    self.post_want(0);
     budget.extend(added);
     budget.absorb_debt();
     added
+  }
+
+  /// Posts `bytes` as this arena's want to its source ([`ExtentSource::want`]); nothing without a source.
+  fn post_want(&mut self, bytes: usize) {
+    if let Some(source) = self.source.as_mut() {
+      source.want(bytes);
+    }
   }
 
   /// Returns every held region that is wholly free (no live or deferred block) to the source, keeping
@@ -1073,6 +1091,26 @@ impl ChunkArena {
       .get_mut(extent.offset()..extent.offset().checked_add(extent.len())?)
   }
 
+  /// The bytes the arena's allocations hold, region by region, as `(region id, offset, len)` runs in address order,
+  /// adjacent blocks joined into one run: the only bytes of a region whose pages an allocation keeps (A-744's split, the
+  /// memory report's arenas; main's ruling of 2026-11-20 on w-sizing's option (a)). A freed block's pages stay resident
+  /// until the idle purge gives them back ([`ChunkArena::resident_free_bytes`]); these runs leave them out. A cold path:
+  /// a walk of the block heads ([`Buddy::allocated`]), costing the blocks and free blocks, not the granules inside them.
+  pub fn held_runs(&self) -> Vec<(u16, usize, usize)> {
+    let mut runs: Vec<(u16, usize, usize)> = Vec::new();
+    for slot in self.held() {
+      for (offset, len) in slot.buddy.allocated() {
+        match runs.last_mut() {
+          Some((id, start, run)) if *id == slot.id && start.saturating_add(*run) == offset => {
+            *run = run.saturating_add(len);
+          }
+          _ => runs.push((slot.id, offset, len)),
+        }
+      }
+    }
+    runs
+  }
+
   /// A region, read-only.
   pub fn region(&self, index: u16) -> Option<&Region> {
     self.slot(index).map(|s| &s.region)
@@ -1132,6 +1170,55 @@ mod tests {
         return given;
       }
     }
+  }
+
+  /// A-744's split by held extents (main's ruling on w-sizing's option (a), 2026-11-21). Do: in two regions of four
+  /// pages, allocate three one-page blocks in the first and one in the second, then free the middle one of the first's.
+  /// Expect the held runs to be each allocation's bytes only, by region, adjacent blocks joined: the first region's
+  /// first block alone (its neighbour freed), its third, and the second region's one; no run for the free pages.
+  #[test]
+  fn the_held_runs_are_the_allocated_blocks_by_region_joined_where_adjacent() {
+    let p = page();
+    let mut arena = two_regions(p);
+    let first = arena.alloc(p).unwrap();
+    let middle = arena.alloc(p).unwrap();
+    let third = arena.alloc(p).unwrap();
+    let fourth = arena.alloc(p).unwrap();
+    let held = |extent: Extent| (extent.region, extent.offset(), extent.len());
+    let mut before = vec![held(first), held(middle), held(third), held(fourth)];
+    before.sort_unstable();
+    let joined = arena.held_runs();
+    assert_eq!(
+      joined.iter().map(|run| run.2).sum::<usize>(),
+      4 * p,
+      "every allocated byte held: {joined:?} from {before:?}"
+    );
+    assert!(
+      joined.len() < before.len(),
+      "adjacent blocks joined: {joined:?} from {before:?}"
+    );
+    arena.free(middle).unwrap();
+    let runs = arena.held_runs();
+    assert_eq!(
+      runs.iter().map(|run| run.2).sum::<usize>(),
+      3 * p,
+      "the freed block's bytes left out: {runs:?}"
+    );
+    for extent in [first, third, fourth] {
+      assert!(
+        runs.iter().any(|(id, offset, len)| *id == extent.region
+          && *offset <= extent.offset()
+          && extent.offset() + extent.len() <= offset + len),
+        "{:?} within a run: {runs:?}",
+        held(extent)
+      );
+    }
+    assert!(
+      !runs.iter().any(|(id, offset, len)| *id == middle.region
+        && *offset <= middle.offset()
+        && middle.offset() < offset + len),
+      "no run over the freed block: {runs:?}"
+    );
   }
 
   /// Whether every byte of the `len` bytes at `at` of `bytes` is `value`.
@@ -1459,7 +1546,7 @@ mod tests {
   }
 
   impl ExtentSource for TestPool {
-    fn claim(&mut self) -> Option<(u16, Region)> {
+    fn claim(&mut self, _want: usize) -> Option<(u16, Region)> {
       self.free.pop()
     }
     fn release(&mut self, id: u16, region: Region) {
@@ -1542,8 +1629,8 @@ mod tests {
   }
 
   impl ExtentSource for RacedPool {
-    fn claim(&mut self) -> Option<(u16, Region)> {
-      self.pool.claim()
+    fn claim(&mut self, want: usize) -> Option<(u16, Region)> {
+      self.pool.claim(want)
     }
     fn release(&mut self, id: u16, region: Region) {
       self.pool.release(id, region);

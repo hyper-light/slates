@@ -545,8 +545,8 @@ fn worked_example() -> (SimHost, Store, Volume, slates_vfs::ids::InodeNo) {
   );
   assert_eq!(
     host.open_handles(),
-    3,
-    "the root, src, and the file's descriptor"
+    2,
+    "the root and src: a read no handle holds open keeps no descriptor"
   );
   let lib = vol
     .with_host(&mut host)
@@ -590,11 +590,11 @@ fn the_overlay_worked_example_copies_up_with_a_witness_equal_to_the_disk() {
   assert_eq!(diverged[0].kind, Divergence::Witnessed);
 }
 
-/// A reclaimed base file's descriptor is closed (2026-10-07). Do: read `/src/main.rs` through the overlay (its
-/// descriptor is held, so the host holds the root, `src` and the file open), unlink it through the overlay (no
-/// reference holds it, so it is reclaimed at once), then drain the host's hints. Expect: the host holds the two
-/// directories and nothing else. Before, the reclaim took the descriptor out of the plane's table and dropped it
-/// without closing it: on a real disk, a file descriptor leaked per unlinked base file.
+/// A reclaimed base file's descriptor is closed (2026-10-07). Do: read `/src/main.rs` through the overlay (no handle
+/// holds it open, so its descriptor is closed when the read's borrow ends: the host holds the root and `src`), unlink it
+/// through the overlay (no reference holds it, so it is reclaimed at once), then drain the host's hints. Expect: the
+/// host holds the two directories and nothing else. Before 2026-10-07, the reclaim took the descriptor out of the
+/// plane's table and dropped it without closing it: on a real disk, a file descriptor leaked per unlinked base file.
 #[test]
 fn an_unlinked_base_files_descriptor_is_closed() {
   let mut host = SimHost::new();
@@ -609,8 +609,8 @@ fn an_unlinked_base_files_descriptor_is_closed() {
   );
   assert_eq!(
     host.open_handles(),
-    3,
-    "the root, src, and the file's descriptor"
+    2,
+    "the root and src: a read no handle holds open keeps no descriptor"
   );
   let src = match vol
     .with_host(&mut host)
@@ -630,6 +630,164 @@ fn an_unlinked_base_files_descriptor_is_closed() {
     host.open_handles(),
     2,
     "the root and src, the file's descriptor closed"
+  );
+}
+
+/// Reading base files holds no descriptor once the reads are done (2026-11-21). Do: read 500 base files in 5
+/// directories through the overlay, as a tool walking a tree does, with no handle open on any of them. Expect: the host
+/// holds the root and the 5 directories open and nothing else, and every file read back its bytes. Before, every base
+/// file ever read kept a descriptor until the daemon ended: kiln's daemon on adacachy reached 1,048,575 of its
+/// 1,048,576 descriptors and every later open failed `EMFILE`.
+#[test]
+fn reading_base_files_keeps_no_descriptor_after_the_reads() {
+  let mut host = SimHost::new();
+  populate(&mut host, 5, 500);
+  host.advance_ns(2);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  for f in 0..500 {
+    let path = format!("/d{}/f{f}", f % 5);
+    assert_eq!(
+      read_all(&mut vol, &mut host, &mut store, &path).unwrap(),
+      format!("file {f}").as_bytes(),
+      "{path}"
+    );
+  }
+  assert_eq!(
+    host.open_handles(),
+    6,
+    "the root and the 5 directories; no file read through the overlay kept its descriptor"
+  );
+}
+
+/// An open base file keeps its descriptor until its last close, and serves the file it opened meanwhile (A-151, POSIX)
+/// (2026-11-21). Do: open `/src/main.rs` as a mount's `OPEN` does (reference, `open_base`, then `open_for`), run another
+/// verb, replace the disk's file with other bytes, read through the open, then close it and run one more verb. Expect:
+/// the descriptor is held while the file is open (root, `src` and the file), the read returns the bytes opened, and
+/// after the close the host holds the two directories alone.
+#[test]
+fn an_open_base_file_keeps_its_descriptor_until_its_last_close() {
+  use slates_vfs::ids::RefOwner;
+  let owner = RefOwner::Attachment(1);
+  let mut host = SimHost::new();
+  host.mkdir("/src");
+  host.replace_file("/src/main.rs", b"fn main() {}");
+  host.advance_ns(2);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  let no = vol
+    .with_host(&mut host)
+    .resolve(&mut store, "/src/main.rs")
+    .unwrap()
+    .inode;
+  vol.reference_for(&store, no, owner).unwrap();
+  vol.with_host(&mut host).open_base(&mut store, no).unwrap();
+  vol.open_for(no, owner);
+  vol
+    .with_host(&mut host)
+    .resolve(&mut store, "/src")
+    .unwrap();
+  assert_eq!(
+    host.open_handles(),
+    3,
+    "root, src and the open file's descriptor"
+  );
+  host.replace_file("/src/main.rs", b"replaced by an outsider");
+  let mut bytes = vec![0u8; 12];
+  let n = vol
+    .with_host(&mut host)
+    .read(&mut store, no, 0, &mut bytes)
+    .unwrap();
+  assert_eq!(
+    &bytes[..n],
+    b"fn main() {}",
+    "the open serves the file it opened"
+  );
+  vol.close_for(no, owner);
+  vol
+    .with_host(&mut host)
+    .resolve(&mut store, "/src")
+    .unwrap();
+  assert_eq!(
+    host.open_handles(),
+    2,
+    "root and src: the last close closed the descriptor"
+  );
+}
+
+/// An idle base directory's descriptor is closed by the idle sweep and reopened at its next use (A-838, 2026-11-21). Do:
+/// read one file in each of 20 base directories (the root and the 20 held), run the sweep's look twice, then read a
+/// file in one directory again. Expect: the first look keeps all 20 (each used since) and the second closes all 20 (the
+/// root alone held); the read gets its bytes, reopening that one directory alone. Before, every listed directory kept
+/// its descriptor for the volume's life: kiln's restarted daemon on adacachy held 79,038 two minutes after its start.
+#[test]
+fn an_idle_base_directory_closes_its_descriptor_and_reopens_at_its_next_use() {
+  let mut host = SimHost::new();
+  populate(&mut host, 20, 20);
+  host.advance_ns(2);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  for f in 0..20 {
+    read_all(&mut vol, &mut host, &mut store, &format!("/d{f}/f{f}")).unwrap();
+  }
+  assert_eq!(host.open_handles(), 21, "the root and 20 used directories");
+  assert!(
+    store.base_dirs_owed.get(),
+    "a used directory owes the sweep a look"
+  );
+  let first = vol
+    .with_host(&mut host)
+    .close_idle_directories(u64::MAX)
+    .unwrap();
+  assert_eq!((first.closed, first.held, first.more), (0, 20, false));
+  assert_eq!(host.open_handles(), 21, "each was used since the last look");
+  let second = vol
+    .with_host(&mut host)
+    .close_idle_directories(u64::MAX)
+    .unwrap();
+  assert_eq!((second.closed, second.held, second.more), (20, 0, false));
+  assert_eq!(
+    host.open_handles(),
+    1,
+    "the root alone: no directory is in use"
+  );
+  assert_eq!(
+    read_all(&mut vol, &mut host, &mut store, "/d7/f7").unwrap(),
+    b"file 7"
+  );
+  assert_eq!(
+    host.open_handles(),
+    2,
+    "the root and the one directory used again"
+  );
+}
+
+/// A directory an outsider changes while its descriptor is closed shows the change at its next use (A-838, A-153).
+/// Do: list a base directory, close it by two looks of the idle sweep, add a file to it on the disk, then look the new
+/// file up. Expect the new file's bytes: the directory is reacquired as the same object, and its listing is read again
+/// because its fingerprint moved.
+#[test]
+fn a_closed_directory_shows_an_outsiders_change_at_its_next_use() {
+  let mut host = SimHost::new();
+  host.mkdir("/src");
+  host.replace_file("/src/main.rs", b"fn main() {}");
+  host.advance_ns(2);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  read_all(&mut vol, &mut host, &mut store, "/src/main.rs").unwrap();
+  for _ in 0..2 {
+    vol
+      .with_host(&mut host)
+      .close_idle_directories(u64::MAX)
+      .unwrap();
+  }
+  assert_eq!(host.open_handles(), 1, "src closed");
+  host.advance_ns(10);
+  host.replace_file("/src/lib.rs", b"pub fn lib() {}");
+  host.advance_ns(10);
+  assert_eq!(
+    read_all(&mut vol, &mut host, &mut store, "/src/lib.rs").unwrap(),
+    b"pub fn lib() {}"
   );
 }
 

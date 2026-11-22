@@ -247,7 +247,14 @@
 #   by BLAKE3.
 
 [budget]
-slates-machine = 97
+slates-machine = 104
+# 2026-11-21 (+3, A-837 part 2, one a platform): `descriptors.rs`, the learned descriptor ceiling counted without a
+#   descriptor: macOS `proc_pidinfo(PROC_PIDLISTFDS)` sized with no buffer, Windows `GetProcessHandleCount`, and Linux
+#   the close of the spare descriptor its count gives up (an `OwnedFd` remade from the raw one the module alone holds).
+# 2026-11-21 (+4, A-831, macOS only; 97 -> 101): `time_constraint.rs`, Mach's THREAD_TIME_CONSTRAINT_POLICY, which no
+#   crate the workspace takes wraps: the `unsafe extern` block (mach_timebase_info, thread_policy_set/get), the
+#   `thread_policy_set` call in `set_current`, the `thread_policy_get` call in `holds`, and `mach_timebase_info` in
+#   `ticks`. Linux and Windows: none (`set_current` is `false`, `holds` `None`).
 # 2026-11-19 (+11, A-570; 86 -> 97): the host's memory-pressure reports (`memory_pressure.rs`), the kernel's own event
 #   in place of the reap loop's once-a-window sample. macOS (+7): libdispatch's memory-pressure source, which no crate
 #   the workspace takes wraps: the `unsafe extern` block, the global queue, the source's creation, the block that sets
@@ -449,7 +456,13 @@ slates-mem = 88
 #   duplicate made for its process: `share_listener`'s `WSADuplicateSocketW` (1), and `adopt_share`'s `WSASocketW` over
 #   the protocol record (`FROM_PROTOCOL_INFO`, 1). Winsock has no safe wrapper for either; the record itself crosses as
 #   bytes encoded and decoded field by field, with no unsafe view of it.
-slates-rt = 109
+slates-rt = 120
+# 2026-11-21 (+11, A-828 / 84a, compiled only for Windows; 109 -> 120): the IOCP driver's high-resolution timed wait
+#   (`iocp.rs`, 98e150baf), which no crate the workspace takes wraps: ntdll's wait-completion-packet calls bound at run
+#   time (the lookup, `NtCreateWaitCompletionPacket`, `NtAssociateWaitCompletionPacket`, `NtCancelWaitCompletionPacket`
+#   at the re-arm and at the first wait), `CreateWaitableTimerExW` and its `CloseHandle` on a refusal,
+#   `SetWaitableTimer`, the port's untimed `GetQueuedCompletionStatusEx` with its zeroed entries, and the test's own
+#   200 us arm.
 # 2026-11-06 (+1, compiled only for Windows): a datagram socket's `WSAIoctl` turning off `SIO_UDP_CONNRESET` and
 #   `SIO_UDP_NETRESET` (`netsys::ignore_earlier_datagrams_errors`), which has no safe wrapper; without it one send to a
 #   closed port failed the socket's next `recvfrom` 10054 and ended a fleet node's receive loop (run 42150662467).
@@ -476,7 +489,12 @@ slates-vfs = 0
 #   safe wrapper: the volume's word on sharing clusters (`GetVolumeInformationByHandleW`, 1), its cluster
 #   (`NtQueryVolumeInformationFile(FileFsSizeInformation)`, 1), a file's end set (`FileEndOfFileInfo`, 1) and a region
 #   cloned (`DeviceIoControl(FSCTL_DUPLICATE_EXTENTS_TO_FILE)`, 1).
-slates-land = 33
+# 2026-11-21 (+2, the version-control store's Windows lane, `os_windows.rs` only; 33 -> 35): the store root's directory
+#   identity read by handle (`GetFileInformationByHandleEx(FileIdInfo)`: the volume's serial and the 128-bit file id,
+#   which no safe wrapper reads, 1) and its volume's free bytes for this caller
+#   (`NtQueryVolumeInformationFile(FileFsFullSizeInformation)`, 1). Its creates, opens and flushes reuse the writer's
+#   budgeted `NtCreateFile` and `FlushFileBuffers` sites.
+slates-land = 35
 # 2026-11-02, A-198: retire the six supervisor job/assignment sites in favor of IPC's existing creation-time job
 # attribute. The hold transport has ten Win32 ownership/I/O sites: last-error read, event create/adopt, read/write,
 # event wait, cancellation and join on timeout or failed wait, and adoption of a duplicated handle. No unsafe sharing.

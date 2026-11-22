@@ -621,6 +621,11 @@ pub(crate) enum Verb {
     /// The green.
     green: slates_client::VolumeId,
   },
+  /// Destroy a repository whole, its greens and its store with it (`repository destroy NAME`, A-843).
+  RepositoryDestroy {
+    /// The repository's name.
+    repository: String,
+  },
   /// Retire a branch (`repository branch retire REPO NAME`, A-575).
   BranchRetire {
     /// The repository's name.
@@ -1657,6 +1662,18 @@ const FORMAT_NAMES: [(&str, ObjectFormat); 3] = [
 fn parse_repository(taken: &Taken, words: &[&str]) -> Result<Option<Command>, ParseError> {
   match words {
     ["repository", "create", name] => repository_create(taken, name).map(Some),
+    ["repository", "destroy", name] => {
+      taken.only(&Spec {
+        values: &[],
+        switches: &[],
+      })?;
+      Ok(Some(client(
+        taken,
+        Verb::RepositoryDestroy {
+          repository: (*name).to_owned(),
+        },
+      )))
+    }
     ["repository", "import", name, path] => repository_import(taken, name, path).map(Some),
     ["repository", "policy", name] => repository_policy(taken, name).map(Some),
     ["repository", "branch", "create", repository, name] => {
@@ -1684,9 +1701,9 @@ fn parse_repository(taken: &Taken, words: &[&str]) -> Result<Option<Command>, Pa
 }
 
 /// The repository verbs' forms, named by a usage error.
-const REPOSITORY_FORMS: &str = "repository create NAME --tool git|hg|svn | repository import NAME PATH | repository \
-  policy NAME [--hook POINT=PROGRAM]... | repository branch create REPO NAME --from BRANCH [--version N] | repository \
-  branch bind REPO NAME GREEN | repository branch retire REPO NAME";
+const REPOSITORY_FORMS: &str = "repository create NAME --tool git|hg|svn | repository destroy NAME | repository \
+  import NAME PATH | repository policy NAME [--hook POINT=PROGRAM]... | repository branch create REPO NAME --from \
+  BRANCH [--version N] | repository branch bind REPO NAME GREEN | repository branch retire REPO NAME";
 
 /// `repository import NAME PATH` (A-710): the daemon reads PATH, so it must be absolute, since the daemon's working
 /// directory is not the caller's; a relative one is a usage error before the daemon is asked.
@@ -3477,17 +3494,28 @@ mod tests {
         replace: true,
       }
     );
+    the_merge_verbs_after_an_edit_parse(id, vid);
+  }
+
+  /// The merge grammar's submit, rebase, check and resolve, of the volume `id` (`vid`).
+  fn the_merge_verbs_after_an_edit_parse(id: &str, vid: slates_client::VolumeId) {
     assert_eq!(
-      verb(&format!("submit {id}")),
+      client_verb(&format!("submit {id}")),
       Verb::Submit {
         work: vid,
         evidence: Vec::new(),
       }
     );
-    assert_eq!(verb(&format!("rebase {id}")), Verb::Rebase { work: vid });
-    assert_eq!(verb(&format!("check {id}")), Verb::CheckMerge { work: vid });
     assert_eq!(
-      verb("resolve {}"),
+      client_verb(&format!("rebase {id}")),
+      Verb::Rebase { work: vid }
+    );
+    assert_eq!(
+      client_verb(&format!("check {id}")),
+      Verb::CheckMerge { work: vid }
+    );
+    assert_eq!(
+      client_verb("resolve {}"),
       Verb::ResolveMerge {
         resolution: "{}".into(),
       }

@@ -427,10 +427,11 @@ pub(crate) fn supervise(options: &ProcessOptions, daemon_args: &[String]) -> Res
     })
     .map_err(|error| failed("hold channel", error))?;
   // The anchor holds a duplicate of every device and connection it is sent, so it needs the descriptors its bounds
-  // name: raise its soft limit to the hard one, as the daemon does (no privilege needed).
-  if let Some((was, now)) = slates_server::daemon::raise_descriptor_limit() {
-    slates_machine::log_line!("slates anchor: descriptor limit raised from {was} to {now}");
-  }
+  // name: raise its soft limit to the most the platform allows, as the daemon does (no privilege needed; A-837).
+  slates_server::daemon::log_descriptor_raise(
+    "slates anchor",
+    slates_machine::facts::raise_descriptor_limit(),
+  );
   supervisor.hold_environment(
     slates_ipc::rendezvous::ENV_RENDEZVOUS,
     rendezvous.adoption().env_value().to_owned(),

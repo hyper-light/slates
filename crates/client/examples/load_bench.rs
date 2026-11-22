@@ -14,11 +14,13 @@
 //! so a conflict window, the client's range and the intervening range coincide, and the oracle below states the
 //! design's rule exactly.
 //!
-//! **Conflict handling, as a client must do it.** On `Conflict { windows }` the client reads the green's head bytes
-//! of each window's file, writes those bytes into its own work over the window (its edit there now equals the
-//! green's, which pass two accepts as identical), rebases, writes its own bytes over the window again on the new
-//! base, and submits again — at most `MAX_RESOLUTIONS` times a round; a client that runs out is counted as starved,
-//! never hidden.
+//! **Conflict handling, as a client must do it.** On `Conflict { windows }` the client resolves in one ask
+//! (`ResolveConflict`, A-840): it gives up the windows and writes its own slots in them again at the head as it is, so
+//! the work is based at that head, and submits again. A kept slot a later write met answers its windows, resolved the
+//! same way. `--resolve rebase` keeps the corrective loop it replaced, for the comparison: read the green's head bytes
+//! of each window, write them into the work over the window (its edit there then equals the green's, which pass two
+//! accepts as identical), rebase, write its own bytes over the window again on the new base, and submit. Either way at
+//! most `MAX_RESOLUTIONS` times a round; a client that runs out is counted as starved, never hidden.
 //!
 //! **The oracle (offline, after the run; `support/load_oracle.rs` states it exactly).** Every submit is recorded with
 //! its base, its send and reply instants, its slots and its outcome. The accepted versions must be exactly `1..=V`,
@@ -216,8 +218,17 @@ enum Step {
   ResolveEdit(usize),
   Rebase,
   Reedit(usize),
+  /// A conflict resolved in one ask (A-840, the default; `--resolve rebase` keeps the read-and-rebase loop above): the
+  /// conflict's windows given up, the round's own slots in them written again at the head as it is.
+  ResolveConflict,
   Destroy,
   Done,
+}
+
+/// Whether a conflict is resolved in one ask (A-840), the default, or by reading the head's bytes into the windows and
+/// rebasing (`--resolve rebase`), kept for the comparison.
+fn resolves_in_one_ask() -> bool {
+  arg("--resolve").as_deref() != Some("rebase")
 }
 
 /// One logical client and its script: its own work volume, its own rounds, merges and conflicts, one request in
@@ -706,6 +717,34 @@ impl Agent {
         )
       }
       Step::Rebase => (RequestBody::Rebase { work: work? }, Kind::Rebase),
+      Step::ResolveConflict => {
+        // Every own slot a window meets, written again: the window's other bytes are the head's once it is given up.
+        let replacement = self
+          .slots()
+          .iter()
+          .filter(|slot| {
+            self.windows.iter().any(|window| {
+              window.path == slot.path
+                && slot.at < window.at.saturating_add(window.len.max(1))
+                && window.at < slot.at.saturating_add(SLOT_BYTES)
+            })
+          })
+          .map(|slot| slates_ipc::protocol::WorkChange::Edit {
+            path: slot.path.clone(),
+            at: slot.at,
+            delete_len: SLOT_BYTES,
+            bytes: slot.bytes.clone(),
+          })
+          .collect();
+        (
+          RequestBody::ResolveConflict {
+            work: work?,
+            over: self.windows.clone(),
+            replacement,
+          },
+          Kind::Rebase,
+        )
+      }
       Step::Destroy => (RequestBody::Destroy { volume: work? }, Kind::Destroy),
       Step::Done => return None,
     })
@@ -816,6 +855,37 @@ impl Agent {
       ) => {
         record_split(tally, kind, elapsed, harness);
         self.rebased(version, conflicts, tally);
+      }
+      (
+        Step::ResolveConflict,
+        ReplyBody::Rebased {
+          version, conflicts, ..
+        },
+      ) => {
+        record_split(tally, kind, elapsed, harness);
+        match version {
+          // At the head, the round's own slots in the windows written again by the resolution: it submits.
+          Some(v) => {
+            self.base = v;
+            self.step = Step::Submit;
+          }
+          // A kept slot met a later write: the resolution changed nothing and named only what it kept, so the next
+          // gives up those windows as well as the ones already given up, within the same bound.
+          None => {
+            tally.rebase_conflicts += 1;
+            self.resolutions += 1;
+            if self.resolutions > MAX_RESOLUTIONS || conflicts.is_empty() {
+              tally.starved += 1;
+              self.step = Step::Destroy;
+              return;
+            }
+            for window in conflicts {
+              if !self.windows.contains(&window) {
+                self.windows.push(window);
+              }
+            }
+          }
+        }
       }
       (Step::Reedit(n), ReplyBody::Edited) => {
         record_split(tally, kind, elapsed, harness);
@@ -954,7 +1024,11 @@ impl Agent {
   /// head version, then each window's bytes at that version (a version never changes, so no submit landing meanwhile
   /// can tear the read), each written over its window in the work; then the rebase.
   fn resolve(&mut self) {
-    self.step = Step::ResolveVersion;
+    self.step = if resolves_in_one_ask() {
+      Step::ResolveConflict
+    } else {
+      Step::ResolveVersion
+    };
   }
 
   fn rebased(&mut self, version: Option<u64>, conflicts: Vec<MergeWindow>, tally: &mut Tally) {
@@ -2403,13 +2477,231 @@ fn report_losses(client: &mut Client) {
   }
 }
 
-fn main() {
-  let tree = arg("--tree").unwrap_or_default();
-  let levels: Vec<usize> = arg("--clients")
+/// Format: the bytes each scale injection writes into a file's slot (A-802), a load slot's length.
+const INJECT_SLOT_BYTES: usize = 64;
+/// Format: where the preload writes in a file (its first slot) and where a lagged work writes (a slot the preload never
+/// touches, two strides on), so a lagged submit meets the preload's versions without overlapping them.
+const PRELOAD_AT: u64 = 0;
+/// See [`PRELOAD_AT`].
+const LAGGED_AT: u64 = 2 * SLOT_STRIDE;
+
+/// `--idle-works M` (A-802, injection c): M works made at the green's head before the run and kept idle through it, so
+/// the floor stays where they were made while the run's versions pile up above it. Their ids, for the lagged submits
+/// and the end's destroy.
+fn inject_idle_works(setup: &mut Client, green: VolumeId) -> Vec<VolumeId> {
+  let count: usize = arg("--idle-works").map_or(0, |m| m.parse().expect("--idle-works n"));
+  let started = Instant::now();
+  let works: Vec<VolumeId> = (0..count)
+    .map(|n| {
+      retried(|| setup.create_work(green, &format!("idle-{n}")))
+        .unwrap()
+        .0
+    })
+    .collect();
+  println!(
+    "inject	idle_works	{count}	ns	{}",
+    started.elapsed().as_nanos()
+  );
+  works
+}
+
+/// `--preload V` (A-802, injection b): V versions committed before the run, each one slot of one file, the files taken
+/// in turn, through one work (an accepted submit resets it to the new head). Folded as the run goes unless idle works
+/// hold the floor. Prints the time of each tenth, so a cost that grows with the history shows in the preload itself.
+fn inject_preload(setup: &mut Client, green: VolumeId, files: &[(String, u64)]) {
+  let versions: usize = arg("--preload").map_or(0, |v| v.parse().expect("--preload n"));
+  if versions == 0 {
+    return;
+  }
+  let eligible: Vec<&String> = files
+    .iter()
+    .filter(|(_, len)| *len >= LAGGED_AT + SLOT_STRIDE)
+    .map(|(path, _)| path)
+    .collect();
+  let (work, _) = retried(|| setup.create_work(green, "preload")).unwrap();
+  let tenth = (versions / 10).max(1);
+  let mut since = Instant::now();
+  for version in 0..versions {
+    let Some(path) = eligible.get(version % eligible.len().max(1)) else {
+      break;
+    };
+    let bytes = format!("{version:064}").into_bytes();
+    let bytes = &bytes[bytes.len() - INJECT_SLOT_BYTES..];
+    retried(|| {
+      setup.edit(
+        work,
+        path,
+        PRELOAD_AT,
+        u64::try_from(INJECT_SLOT_BYTES).unwrap(),
+        bytes,
+      )
+    })
+    .unwrap();
+    retried(|| setup.submit(work)).unwrap();
+    if (version + 1) % tenth == 0 {
+      println!(
+        "inject	preload	through	{}	ns_per_version	{}",
+        version + 1,
+        since.elapsed().as_nanos() / u128::try_from(tenth).unwrap()
+      );
+      since = Instant::now();
+    }
+  }
+  let _ = setup.destroy(work);
+}
+
+/// `--lagged-submit` (A-802, injection a): after the run, each idle work edits one slot no version touched and submits,
+/// its base the whole preload and run behind the head. Prints each submit's time (p50, p99, max) and the head it met.
+fn lagged_submits(setup: &mut Client, works: &[VolumeId], files: &[(String, u64)]) {
+  let eligible: Vec<&String> = files
+    .iter()
+    .filter(|(_, len)| *len >= LAGGED_AT + SLOT_STRIDE)
+    .map(|(path, _)| path)
+    .collect();
+  let mut times = Vec::with_capacity(works.len());
+  let mut head = 0;
+  for (n, work) in works.iter().enumerate() {
+    let Some(path) = eligible.get(n % eligible.len().max(1)) else {
+      break;
+    };
+    let bytes = vec![b'L'; INJECT_SLOT_BYTES];
+    let started = Instant::now();
+    retried(|| {
+      setup.edit(
+        *work,
+        path,
+        LAGGED_AT,
+        u64::try_from(INJECT_SLOT_BYTES).unwrap(),
+        &bytes,
+      )
+    })
+    .unwrap();
+    if let Ok(slates_client::Submitted::Accepted(version)) = retried(|| setup.submit(*work)) {
+      head = version;
+    }
+    times.push(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+  }
+  times.sort_unstable();
+  println!(
+    "inject	lagged_submit	{}	head	{head}	p50_ns	{}	p99_ns	{}	max_ns	{}",
+    times.len(),
+    percentile(&times, 500),
+    percentile(&times, 990),
+    times.last().copied().unwrap_or(0)
+  );
+}
+
+/// Runs `verb` again while the daemon answers retryable (`Overloaded`), as a client must: the setup's own calls.
+fn retried<T>(mut verb: impl FnMut() -> Result<T, ClientError>) -> Result<T, ClientError> {
+  loop {
+    match verb() {
+      Err(ClientError::Refused(Refusal::Overloaded { .. })) => std::thread::yield_now(),
+      other => return other,
+    }
+  }
+}
+
+/// Prints the owner's per-kind ask and answer counters as they stand (`phase\t<label>\t<counter>\t<count>`, A-802), so
+/// each injection's phase is read as the difference from the one before.
+fn print_owner_counters(setup: &mut Client, label: &str) {
+  let Ok(report) = setup.daemon_status() else {
+    println!("phase\t{label}\tunreadable");
+    return;
+  };
+  let mut moved = std::collections::BTreeMap::<&str, u64>::new();
+  for refusal in report.shards.iter().flat_map(|shard| shard.refusals.iter()) {
+    if refusal.kind.starts_with("merge.work.answered")
+      || refusal.kind.starts_with("merge.work.asked_owner")
+      || refusal.kind.starts_with("merge.submit.")
+      || refusal.kind.starts_with("merge.reanchor.")
+      || refusal.kind.starts_with("merge.work.log_peak")
+      || refusal.kind.starts_with("merge.work.base_ask")
+      || refusal.kind.starts_with("merge.work.base_missing")
+    {
+      let total = moved.entry(refusal.kind.as_str()).or_default();
+      // A peak is the most over the shards (A-806), any other counter their sum.
+      *total = if refusal.kind.contains("_peak") {
+        (*total).max(refusal.count)
+      } else {
+        total.saturating_add(refusal.count)
+      };
+    }
+  }
+  for (name, count) in moved {
+    println!("phase\t{label}\t{name}\t{count}");
+  }
+}
+
+/// The server nodes' own merge counters (A-801): where a green's owner spends its time is on the primary, which the
+/// client node's report does not show. `--report-instances` names them (the load_scale test passes its servers).
+fn report_server_counters() {
+  for instance in arg("--report-instances")
+    .unwrap_or_default()
+    .split(',')
+    .filter(|name| !name.is_empty())
+  {
+    match connect(instance).and_then(|mut client| client.daemon_status()) {
+      Ok(report) => {
+        let mut moved = std::collections::BTreeMap::<&str, u64>::new();
+        for refusal in report.shards.iter().flat_map(|shard| shard.refusals.iter()) {
+          if refusal.kind.starts_with("merge.") || refusal.kind.starts_with("xshard.reply") {
+            let total = moved.entry(refusal.kind.as_str()).or_default();
+            *total = total.saturating_add(refusal.count);
+          }
+        }
+        for (name, count) in moved.into_iter().filter(|(_, count)| *count > 0) {
+          println!("server_counter\t{instance}\t{name}\t{count}");
+        }
+      }
+      Err(error) => println!("server_counter\t{instance}\tunreachable\t{error:?}"),
+    }
+  }
+}
+
+/// `--clients n[,n…]`: the client counts to drive, ten by default.
+fn levels_arg() -> Vec<usize> {
+  arg("--clients")
     .unwrap_or_else(|| "10".to_owned())
     .split(',')
     .map(|n| n.parse().expect("--clients n[,n…]"))
-    .collect();
+    .collect()
+}
+
+/// The count `name` gives, or `default` without it.
+fn count_arg(name: &str, default: usize) -> usize {
+  arg(name).map_or(default, |n| n.parse().expect(name))
+}
+
+/// The daemon the bench drives: none when `external` (daemons running under their own anchors), else one started
+/// in-process under `instance` and bootstrapped.
+fn started_daemon(profile: &MachineProfile, instance: &str, external: bool) -> Option<Daemon> {
+  let cpus = profile.facts.cpus_at_once();
+  if external {
+    println!("daemon\texternal\t{instance}\tcpus\t{cpus}");
+    return None;
+  }
+  let config = DaemonConfig::derive(profile, instance, None);
+  println!(
+    "daemon\tshards\t{}\tclients_per_shard\t{}\tcpus\t{cpus}",
+    config.runtime.shards, config.clients_per_shard
+  );
+  let daemon = Daemon::start(
+    profile,
+    config,
+    SegmentSource::Create {
+      name: format!("slates-seg-{instance}"),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  Some(daemon)
+}
+
+fn main() {
+  let tree = arg("--tree").unwrap_or_default();
+  let levels = levels_arg();
   let profile = MachineProfile::measure_patiently(&ProfileOptions {
     budget_per_probe: ProfileOptions::default().budget_per_probe,
     codecs: false,
@@ -2417,39 +2709,16 @@ fn main() {
   })
   .expect("the machine profile measures");
   let cpus = profile.facts.cpus_at_once();
-  let workers: usize =
-    arg("--workers").map_or((cpus / 4).max(1), |w| w.parse().expect("--workers n"));
-  let rounds: usize = arg("--rounds").map_or(ROUNDS, |r| r.parse().expect("--rounds n"));
-  let hot_files: usize =
-    arg("--hot-files").map_or(HOT_FILES, |h| h.parse().expect("--hot-files n"));
+  let workers = count_arg("--workers", (cpus / 4).max(1));
+  let rounds = count_arg("--rounds", ROUNDS);
+  let hot_files = count_arg("--hot-files", HOT_FILES);
   // `--instance <name>[,<name>…]` drives daemons already running under their own anchors (`slates --instance <name> anchor`), so a
   // chaos script can kill the daemon process mid-run and the anchor restart it; without it the daemon is in-process.
   let external = arg("--instance");
   let instance = external
     .clone()
     .unwrap_or_else(|| format!("load-bench-{}", std::process::id()));
-  let daemon = if external.is_some() {
-    println!("daemon\texternal\t{instance}\tcpus\t{cpus}");
-    None
-  } else {
-    let config = DaemonConfig::derive(&profile, &instance, None);
-    println!(
-      "daemon\tshards\t{}\tclients_per_shard\t{}\tcpus\t{cpus}",
-      config.runtime.shards, config.clients_per_shard
-    );
-    let daemon = Daemon::start(
-      &profile,
-      config,
-      SegmentSource::Create {
-        name: format!("slates-seg-{instance}"),
-      },
-    )
-    .unwrap();
-    daemon
-      .bootstrap(true)
-      .expect("the fixture explicitly creates its local consensus group");
-    Some(daemon)
-  };
+  let daemon = started_daemon(&profile, &instance, external.is_some());
   let mut setup = connect(first_instance(&instance)).unwrap();
   // `--green <32 hex>` drives a green that already exists, on this node or another node of its fleet (the client
   // node forwards every verb to the green's owner, A-201's filesystem server); without it the harness seeds its own
@@ -2466,6 +2735,12 @@ fn main() {
     step.elapsed().as_nanos(),
     files.len()
   );
+  // The scale injections (A-802; main's order 01:41 PST): each grows one thing a 100,000-client run grows, so the owner's
+  // per-kind answer times show which cost grows with it. Off unless asked.
+  let idle_works = inject_idle_works(&mut setup, green);
+  print_owner_counters(&mut setup, "after_idle_works");
+  inject_preload(&mut setup, green, &files);
+  print_owner_counters(&mut setup, "after_preload");
   let mut failures = 0;
   for n in levels {
     failures += level(
@@ -2476,7 +2751,16 @@ fn main() {
       workers.min(n),
     );
   }
+  print_owner_counters(&mut setup, "after_run");
+  if std::env::args().any(|flag| flag == "--lagged-submit") {
+    lagged_submits(&mut setup, &idle_works, &files);
+    print_owner_counters(&mut setup, "after_lagged");
+  }
+  for work in idle_works {
+    let _ = setup.destroy(work);
+  }
   report_losses(&mut setup);
+  report_server_counters();
   drop(setup);
   if let Some(daemon) = daemon {
     daemon.stop();
@@ -2706,7 +2990,8 @@ mod tests {
   }
 
   /// AC-9.1: a round that meets a conflict and resolves it is every request of it, the resolution's too, and none of
-  /// the pauses: the cycle ends at the first verdict (four requests), the round at the accept (eleven).
+  /// the pauses: the cycle ends at the first verdict (four requests), the round at the accept (six: the resolution is
+  /// one ask, A-840).
   #[test]
   fn a_round_through_a_conflict_counts_its_resolution_and_none_of_its_pauses() {
     const LATENCY_NS: u64 = 100_000;
@@ -2733,23 +3018,13 @@ mod tests {
     );
     assert_eq!(only(&tally, Kind::Cycle), vec![4 * LATENCY_NS]);
     assert!(only(&tally, Kind::Round).is_empty(), "the round is open");
-    let window_bytes = vec![b'g'; usize::try_from(SLOT_BYTES).unwrap()];
+    assert_eq!(agent.step, Step::ResolveConflict, "resolved in one ask");
     exchange(
       &mut agent,
       &mut tally,
       now + PAUSE_NS,
       (LATENCY_NS, PAUSE_NS),
       vec![
-        (ReplyBody::Versions { head: 1 }, Kind::ReadHead),
-        (
-          ReplyBody::ReadPage {
-            bytes: window_bytes,
-            total: SLOT_BYTES,
-            stamp: 0,
-          },
-          Kind::ReadHead,
-        ),
-        (ReplyBody::Edited, Kind::Edit),
         (
           ReplyBody::Rebased {
             version: Some(1),
@@ -2759,13 +3034,11 @@ mod tests {
           },
           Kind::Rebase,
         ),
-        (ReplyBody::Edited, Kind::Edit),
-        (ReplyBody::Edited, Kind::Edit),
         verdict(Some(2), Vec::new()),
       ],
     );
     assert_eq!(only(&tally, Kind::Cycle), vec![4 * LATENCY_NS], "one cycle");
-    assert_eq!(only(&tally, Kind::Round), vec![11 * LATENCY_NS]);
+    assert_eq!(only(&tally, Kind::Round), vec![6 * LATENCY_NS]);
   }
 
   /// AC-9.1: the cycle starts at its first edit's first send, so a refusal for now of that edit and the client's

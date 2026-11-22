@@ -133,6 +133,7 @@ ImportFault 6 PastRoom
 ImportFault 7 RemovedPending
 ImportFault 8 Abandoned
 ImportFault 9 Subversion
+ImportFault 10 SubversionLanded
 Intent 0 Read
 Intent 1 Write
 IpcNodeKind 0 Fifo
@@ -310,6 +311,7 @@ Refusal 79 CopyRefused
 Refusal 80 CredentialUnreplicated
 Refusal 81 LandingSuperseded
 Refusal 82 StaleMergeView
+Refusal 83 StoreRefused
 ReplyBody 0 Created
 ReplyBody 1 Snapshotted
 ReplyBody 2 SnapshotDestroyed

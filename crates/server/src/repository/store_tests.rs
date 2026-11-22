@@ -101,6 +101,111 @@ fn a_created_repository_is_landed_into_the_store_and_recovered() {
   creation_recovered(&dir);
 }
 
+/// The store's Windows lane (main's order of 2026-11-21: every git, hg and svn repository was unusable on Windows, its
+/// daemon refusing `--vcs-store` at its start). Do: start a daemon holding a store, and create one repository of each
+/// tool through the verb, each with request numbers of its own. Expect: each create answered once landed and recorded,
+/// each creation landed on its name's partition, none refused by the store. On Unix and Windows alike.
+#[test]
+fn each_tool_creates_a_repository_into_the_store() {
+  let store = TestStore::start("each-tool");
+  let profile = crate::daemon::test_profile();
+  let instance = format!("vcs-store-each-{}", std::process::id());
+  let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(SHARDS));
+  config.vcs_disk = Some(store.handle());
+  let daemon = Daemon::start(&profile, config, SegmentSource::Create { name: instance }).unwrap();
+  daemon.bootstrap(true).unwrap();
+  let mut landed_on = std::collections::BTreeMap::<usize, u64>::new();
+  for (request, (name, tool)) in [
+    ("each-git", VcsTool::Git),
+    ("each-hg", VcsTool::Mercurial),
+    ("each-svn", VcsTool::Subversion),
+  ]
+  .into_iter()
+  .enumerate()
+  {
+    let partition = usize::from(crate::verbs::owner_of_name(name, usize::from(SHARDS)));
+    let asked = (name, tool, ObjectFormat::Sha1, "main");
+    let request = u64::try_from(request).unwrap() + 1;
+    let created = crate::daemon::observe_at(&daemon, partition, move |state| {
+      routed_create(state, (&owner(), request), asked)
+    });
+    assert!(
+      matches!(created, ReplyBody::Acknowledged),
+      "{tool:?}: answered once landed and recorded: {created:?}"
+    );
+    let landed = landed_on.entry(partition).or_insert(0);
+    *landed += 1;
+    wait_for(&daemon, partition, super::CREATION_LANDED, *landed);
+  }
+  for &partition in landed_on.keys() {
+    let unlanded = crate::daemon::observe_at(&daemon, partition, |state| {
+      state
+        .refusals
+        .get(super::CREATION_UNLANDED)
+        .copied()
+        .unwrap_or(0)
+    });
+    assert_eq!(
+      unlanded, 0,
+      "the store refused a creation on partition {partition}"
+    );
+  }
+  daemon.stop();
+}
+
+/// Goal 93, jupiter's red (w-k90-win, 2026-11-21: the store's owner ended with no word and every `repository create`
+/// answered `Overloaded { shard: 0 }`, hiding the store's own reason). Do: start a daemon holding a store whose owner
+/// cannot open it (a sizing the engine refuses), create a git repository through the verb, and read the answer its
+/// request was completed with. Expect: the store's own refusal, saying it could not be opened, never `Overloaded`; no
+/// repository recorded.
+#[test]
+fn a_creation_the_store_refuses_answers_the_stores_reason() {
+  let store = TestStore::start_sized(
+    "refused",
+    slates_store::store::Sizing {
+      memory: 0,
+      disk: 0,
+      extent_bytes: 128 << 10,
+      fanout: 8,
+    },
+  );
+  let profile = crate::daemon::test_profile();
+  let instance = format!("vcs-store-refused-{}", std::process::id());
+  let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(SHARDS));
+  config.vcs_disk = Some(store.handle());
+  let daemon = Daemon::start(&profile, config, SegmentSource::Create { name: instance }).unwrap();
+  daemon.bootstrap(true).unwrap();
+  let name = "refused-git";
+  let partition = usize::from(crate::verbs::owner_of_name(name, usize::from(SHARDS)));
+  let asked = (name, VcsTool::Git, ObjectFormat::Sha1, "main");
+  let request = 1u64;
+  let created = crate::daemon::observe_at(&daemon, partition, move |state| {
+    routed_create(state, (&owner(), request), asked)
+  });
+  assert!(matches!(created, ReplyBody::Acknowledged), "{created:?}");
+  wait_for(&daemon, partition, super::CREATION_UNLANDED, 1);
+  let id = slates_wire::request::RequestId::from_word(request);
+  let answered = crate::daemon::observe_at(&daemon, partition, move |state| {
+    match state.db.partition().completion(1, id.client, id.sequence) {
+      slates_wire::request::Seen::Completed(bytes) => {
+        <ReplyBody as slates_wire::Wire>::from_bytes(&bytes).ok()
+      }
+      _ => None,
+    }
+  });
+  let Some(ReplyBody::Refused { refusal }) = answered else {
+    panic!("the creation's request answered a refusal: {answered:?}");
+  };
+  match &refusal {
+    slates_ipc::protocol::Refusal::StoreRefused { reason } => assert!(
+      reason.contains("could not be opened"),
+      "the store's own reason: {reason}"
+    ),
+    other => panic!("the store's own refusal, not {other:?}"),
+  }
+  daemon.stop();
+}
+
 /// A-767 C6 (svn onto the changeset store; main's order of 2026-11-20 19:50: "a push's landing as a changeset append,
 /// and its replay", red first on the real store). Do: start a daemon holding a store, create a Subversion repository,
 /// land a client's accepted work adding `/trunk` through the commit's landing (`svn_commit::land_work`), wait for its
@@ -560,27 +665,6 @@ fn svn_seen(
   )
 }
 
-/// Waits until `daemon`'s deltify job has kept `count` superseded texts as deltas, each landed as a changeset and named
-/// by the register (`vcs_store::svn_deltify`): a revision changing a file hands the job its old text, and its landing
-/// runs as a task of its own.
-fn deltified(daemon: &Daemon, count: u64) {
-  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-  while crate::daemon::observe_first(daemon, |state| {
-    state
-      .refusals
-      .get(crate::vcs_store::svn_deltify::DELTIFIED)
-      .copied()
-      .unwrap_or(0)
-  }) < count
-  {
-    assert!(
-      std::time::Instant::now() < deadline,
-      "the deltify job never landed"
-    );
-    std::thread::sleep(std::time::Duration::from_millis(5));
-  }
-}
-
 /// The text `bytes` as a session reads it from the recovered repository (by its identity), and `/trunk/a.txt` as the
 /// green holds it.
 fn read_back(
@@ -604,15 +688,59 @@ fn read_back(
   })
 }
 
+/// Revision 1's changeset carries the text it put (C2 stage B): its payload `alpha\n`, the `Texts` entry naming it there,
+/// then its record.
+fn carries_its_text(
+  log: &ChangesetLog<hyper_block::file::DeviceFile>,
+  located: &slates_store::log::Located,
+) {
+  let sections = log.sections(located).unwrap();
+  let kinds: Vec<SectionKind> = sections.iter().map(|section| section.kind).collect();
+  assert_eq!(
+    kinds,
+    vec![
+      SectionKind::Payload,
+      SectionKind::Texts,
+      SectionKind::Record
+    ]
+  );
+  let read = |section: &slates_store::log::Section| {
+    let mut bytes = vec![0u8; usize::try_from(section.len).unwrap()];
+    log.read_at(&mut bytes, section.offset).unwrap();
+    bytes
+  };
+  let payload = read(&sections[0]);
+  let entries = slates_store::texts::decode(&read(&sections[1])).unwrap();
+  assert_eq!(payload, b"alpha\n");
+  let entry = &entries[0];
+  assert_eq!(
+    (
+      entries.len(),
+      entry.path.as_slice(),
+      entry.text,
+      entry.len,
+      entry.base
+    ),
+    (
+      1,
+      b"/trunk/a.txt".as_slice(),
+      *blake3::hash(b"alpha\n").as_bytes(),
+      6,
+      None
+    )
+  );
+  assert_eq!(entry.place.payload, *blake3::hash(&payload).as_bytes());
+}
+
 /// C2's arbiter (main's ruling of 2026-11-20 20:30, item 4: "the state before the kill must equal the state recovered
 /// from the store"). Do: on a daemon holding a store, create a Subversion repository, land revision 1 (`/trunk` and a
-/// file), a revision's properties set whole, and revision 2 changing the file, whose old text the deltify job keeps as
-/// a delta; stop the daemon (a stop publishes nothing, so what survives is what was made durable) and the store's
-/// owner; start both again over the same segment and store. Expect: the recovered repository equal to the one before
-/// the stop (records whole, youngest 2, the green at version 2), with nothing refused; its register five references
-/// naming sequences 0 to 4 (the creation, the two revisions, the properties and the deltified text), no record's bytes;
-/// the store's log holding those five changesets, revision 1's carrying its text (C2 stage B: its payload, the `Texts`
-/// entry naming it there, then its record); and the file read back at revision 2.
+/// file), a revision's properties set whole, and revision 2 changing the file; stop the daemon (a stop publishes
+/// nothing, so what survives is what was made durable) and the store's owner; start both again over the same segment
+/// and store. Expect: the recovered repository equal to the one before the stop (records whole, youngest 2, the green
+/// at version 2), with nothing refused; its register four references naming sequences 0 to 3 (the creation, the two
+/// revisions and the properties), no record's bytes; the store's log holding those four changesets, revision 1's
+/// carrying its text (C2 stage B: its payload, the `Texts` entry naming it there, then its record); and the file read
+/// back at revision 2.
 #[test]
 fn a_restarted_daemon_recovers_subversion_from_the_store_as_it_stood() {
   let instance = format!("vcs-store-svn-arbiter-{}", std::process::id());
@@ -660,11 +788,10 @@ fn a_restarted_daemon_recovers_subversion_from_the_store_as_it_stood() {
     ),
     Ok(2)
   );
-  deltified(&daemon, 1);
   let before = crate::daemon::observe_first(&daemon, move |state| svn_seen(state, repository));
   assert_eq!(before.1, Some(2));
   assert_eq!(before.2, Some(2));
-  assert_eq!(before.3, vec![Some(0), Some(1), Some(2), Some(3), Some(4)]);
+  assert_eq!(before.3, vec![Some(0), Some(1), Some(2), Some(3)]);
   daemon.stop();
   store.restart_owner();
 
@@ -693,45 +820,8 @@ fn a_restarted_daemon_recovers_subversion_from_the_store_as_it_stood() {
     .copied()
     .collect();
   let sequences: Vec<u64> = ours.iter().map(|located| located.header.sequence).collect();
-  assert_eq!(sequences, vec![0, 1, 2, 3, 4]);
-  // Revision 1's changeset carries the text it put (C2 stage B): its payload, the `Texts` entry naming it there, then
-  // its record.
-  let sections = log.sections(&ours[1]).unwrap();
-  let kinds: Vec<SectionKind> = sections.iter().map(|section| section.kind).collect();
-  assert_eq!(
-    kinds,
-    vec![
-      SectionKind::Payload,
-      SectionKind::Texts,
-      SectionKind::Record
-    ]
-  );
-  let read = |section: &slates_store::log::Section| {
-    let mut bytes = vec![0u8; usize::try_from(section.len).unwrap()];
-    log.read_at(&mut bytes, section.offset).unwrap();
-    bytes
-  };
-  let payload = read(&sections[0]);
-  let entries = slates_store::texts::decode(&read(&sections[1])).unwrap();
-  assert_eq!(payload, b"alpha\n");
-  let entry = &entries[0];
-  assert_eq!(
-    (
-      entries.len(),
-      entry.path.as_slice(),
-      entry.text,
-      entry.len,
-      entry.base
-    ),
-    (
-      1,
-      b"/trunk/a.txt".as_slice(),
-      *blake3::hash(b"alpha\n").as_bytes(),
-      6,
-      None
-    )
-  );
-  assert_eq!(entry.place.payload, *blake3::hash(&payload).as_bytes());
+  assert_eq!(sequences, vec![0, 1, 2, 3]);
+  carries_its_text(&log, &ours[1]);
 }
 
 /// C2's crash between the store's landing and the register's commit (main's rulings of 2026-11-20 20:30 item 5 and
@@ -740,9 +830,8 @@ fn a_restarted_daemon_recovers_subversion_from_the_store_as_it_stood() {
 /// 2's changeset on the store at the next sequence, as a landing does, and stop the daemon before any register entry
 /// names it (the crash); start the daemon and the store again; then commit revision 2 again, as the unanswered client
 /// retries it. Expect: the recovered repository as it stood before the landing (youngest 1, its register naming
-/// sequences 0 and 1 alone); the retry answered revision 2, committed once (youngest 2, the register naming 0 to 2, and
-/// 3 the deltify job's keeping revision 1's text as a delta); and a second restart recovering that, revision 2's text
-/// the retry's.
+/// sequences 0 and 1 alone); the retry answered revision 2, committed once (youngest 2, the register naming 0 to 2);
+/// and a second restart recovering that, revision 2's text the retry's.
 #[test]
 fn a_changeset_landed_and_never_named_is_dropped_at_recovery_and_its_retry_lands_once() {
   let instance = format!("vcs-store-svn-crash-{}", std::process::id());
@@ -795,10 +884,9 @@ fn a_changeset_landed_and_never_named_is_dropped_at_recovery_and_its_retry_lands
     ),
     Ok(2)
   );
-  deltified(&daemon, 1);
   let retried = crate::daemon::observe_first(&daemon, move |state| svn_seen(state, repository));
   assert_eq!(retried.1, Some(2));
-  assert_eq!(retried.3, vec![Some(0), Some(1), Some(2), Some(3)]);
+  assert_eq!(retried.3, vec![Some(0), Some(1), Some(2)]);
   daemon.stop();
   store.restart_owner();
 
@@ -811,4 +899,129 @@ fn a_changeset_landed_and_never_named_is_dropped_at_recovery_and_its_retry_lands
     (Some(two.clone()), Some(two))
   );
   daemon.stop();
+}
+
+/// The folded history of `repository`'s green: the version below which it keeps none, and its head.
+fn green_folded(daemon: &Daemon, repository: RepositoryId) -> Option<(u64, u64)> {
+  crate::daemon::observe_first(daemon, move |state| {
+    let green = super::svn_commit::green_of(state, repository).ok()?;
+    let engine = state.greens.get(&green)?;
+    Some((engine.folded_below(), engine.head()))
+  })
+}
+
+/// P7's finding (2) from main's attribution of 2026-11-21 (the restarted daemon's green kept every version its chain
+/// replay made: 434 MB under `GreenReplay` for git-2000). Do: on a daemon holding a store, land revision 1 adding
+/// `/trunk/a.txt` and revisions 2 and 3 changing it; stop the daemon and the store's owner; start both again over the
+/// same segment and store. Expect: the green folded to its head after each landing (A-820), and folded to its head again
+/// once the recovery replayed its chain: it keeps no version no reader names. (A chain checkpointed at each landing
+/// restores folded already; a replay past the checkpoint, the batch a kill cut short, is held by the sliced commit's
+/// crash test.)
+#[test]
+fn a_recovered_subversion_green_keeps_no_version_its_readers_do_not_name() {
+  let instance = format!("vcs-store-svn-folded-{}", std::process::id());
+  let mut store = TestStore::start("svn-folded");
+  let anchor = anchor_of(&instance);
+  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  daemon.bootstrap(true).unwrap();
+  let repository = created_subversion(&daemon, "folded");
+  let texts = [&b"one\n"[..], b"one two\n", b"one two three\n"];
+  for (head, bytes) in texts.iter().enumerate() {
+    let head = u64::try_from(head).unwrap();
+    let action = if head == 0 {
+      slates_svn::index::Action::Add
+    } else {
+      slates_svn::index::Action::Modify
+    };
+    assert_eq!(
+      landed_work(&daemon, repository, head, (action, bytes.to_vec())),
+      Ok(head + 1)
+    );
+  }
+  let before = green_folded(&daemon, repository);
+  daemon.stop();
+  store.restart_owner();
+  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  let after = green_folded(&daemon, repository);
+  daemon.stop();
+  assert_eq!(before, Some((3, 3)), "folded after each landing");
+  assert_eq!(
+    after,
+    Some((3, 3)),
+    "folded once the recovery replayed the chain"
+  );
+}
+
+/// C2 stage C's sliced commit, main's ruling of 2026-11-21 12:43 (a batch's versions applied a slice a turn after its
+/// durable record; a kill between slices recovers from the record). Do: for each slice boundary of `full.dump`'s
+/// import (13 revisions in one batch, its apply three versions a slice: five slices), on a fresh daemon holding a store,
+/// kill the batch's landing there (`staging::KILL_AT_COMMIT_SLICE`); stop the daemon and the store's owner, start both
+/// again, import `full.dump` again. Expect, at every boundary: the recovered green at revision 13 and folded to it (the
+/// replay past its checkpoint keeps no version, P7's finding (2)); the import resuming with nothing to land; the history
+/// `full.dump` byte for byte. Before the fold at recovery, the recovered green kept every version the replay made.
+#[test]
+fn a_batch_killed_between_its_commits_slices_recovers_and_resumes_to_the_same_history() {
+  use crate::vcs_store::svn_import::tests::{FULL, FULL_LAST, history, imported};
+  /// Shape: the versions a slice of the recorded apply takes here, so `full.dump`'s 13 make five slices.
+  const SLICE_VERSIONS: usize = 3;
+  let slices = FULL_LAST.div_ceil(u64::try_from(SLICE_VERSIONS).unwrap());
+  for kill_at in 0..usize::try_from(slices).unwrap() {
+    let instance = format!("vcs-store-svn-killed-{}-{kill_at}", std::process::id());
+    let mut store = TestStore::start(&format!("svn-killed-{kill_at}"));
+    let anchor = anchor_of(&instance);
+    let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+    daemon.bootstrap(true).unwrap();
+    let repository = created_subversion(&daemon, "killed");
+    crate::daemon::observe_first(&daemon, move |_state| {
+      crate::repository::push::SLICE_VERSIONS.with(|most| most.set(Some(SLICE_VERSIONS)));
+      super::svn_commit::staging::KILL_AT_COMMIT_SLICE.with(|kill| kill.set(Some(kill_at)));
+      let task = slates_rt::futures::spawn(async move {
+        let _ = imported(repository, FULL).await;
+      })
+      .expect("the import's task");
+      slates_rt::futures::detach(task).expect("detached");
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while crate::daemon::observe_first(&daemon, |_state| {
+      super::svn_commit::staging::KILL_AT_COMMIT_SLICE
+        .with(std::cell::Cell::get)
+        .is_some()
+    }) {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the kill at {kill_at} never fired"
+      );
+      std::thread::yield_now();
+    }
+    daemon.stop();
+    store.restart_owner();
+    let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+    let folded = green_folded(&daemon, repository);
+    let resumed = crate::test_store::run_on_first(
+      &daemon,
+      move || async move {
+        imported(repository, FULL)
+          .await
+          .0
+          .map(|loaded| (loaded.revisions, loaded.youngest))
+      },
+      std::time::Duration::from_secs(60),
+    );
+    let exported = crate::test_store::run_on_first(
+      &daemon,
+      move || history(repository),
+      std::time::Duration::from_secs(60),
+    );
+    daemon.stop();
+    assert_eq!(
+      folded,
+      Some((FULL_LAST, FULL_LAST)),
+      "killed at {kill_at}: recovered and folded"
+    );
+    assert_eq!(resumed, Ok((0, FULL_LAST)), "killed at {kill_at}: resumed");
+    assert!(
+      exported == Some((FULL_LAST, FULL.to_vec())),
+      "killed at {kill_at}: full.dump"
+    );
+  }
 }

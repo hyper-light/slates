@@ -191,14 +191,6 @@ impl Repository for Empty {
   ) -> Result<Option<Node>, slates_hg::serve::Refusal> {
     Ok(None)
   }
-
-  fn tags_text(
-    &self,
-    _node: &Node,
-    _admission: &mut slates_hg::Admission,
-  ) -> Result<Vec<u8>, slates_hg::serve::Refusal> {
-    Err(slates_hg::serve::Refusal::Store { what: "tags" })
-  }
 }
 
 impl Store for Empty {
@@ -218,13 +210,12 @@ impl Store for Empty {
     Ok(None)
   }
 
-  fn file(
+  fn file_entry(
     &self,
     _path: &[u8],
     _node: &Node,
-    _room: &mut slates_hg::Admission,
-  ) -> Result<Option<Logged<'_>>, slates_hg::PastAdmission> {
-    Ok(None)
+  ) -> Option<slates_hg::serve::getbundle::FileEntry> {
+    None
   }
 
   fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
@@ -884,14 +875,6 @@ impl Repository for Charging {
     admission.charge(TAG_READ)?;
     Ok(None)
   }
-
-  fn tags_text(
-    &self,
-    _node: &Node,
-    _admission: &mut slates_hg::Admission,
-  ) -> Result<Vec<u8>, slates_hg::serve::Refusal> {
-    Err(slates_hg::serve::Refusal::Store { what: "tags" })
-  }
 }
 
 impl Store for Charging {
@@ -911,13 +894,12 @@ impl Store for Charging {
     Ok(None)
   }
 
-  fn file(
+  fn file_entry(
     &self,
     _path: &[u8],
     _node: &Node,
-    _room: &mut slates_hg::Admission,
-  ) -> Result<Option<Logged<'_>>, slates_hg::PastAdmission> {
-    Ok(None)
+  ) -> Option<slates_hg::serve::getbundle::FileEntry> {
+    None
   }
 
   fn markers(&self) -> impl Iterator<Item = Marker<'_>> {

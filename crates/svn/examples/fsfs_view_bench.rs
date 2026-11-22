@@ -4,9 +4,10 @@
 //! read's wall time. Peak memory is the process's, read by the caller (`/usr/bin/time -l`); a third argument
 //! `baseline` stops after the import, so a run's peak less its baseline's is the view's own.
 //!
-//! Run (release): `cargo run --release -p slates-svn --example fsfs_view_bench -- REVISIONS SIZE`. The same source
-//! builds against P1's view (format 6, every text whole) and P3's (format 8, every text its stored delta), which is the
-//! A/B: run the two binaries interleaved.
+//! Run (release): `cargo run --release -p slates-svn --example fsfs_view_bench -- REVISIONS SIZE`. P3's A/B (P1's view,
+//! every text whole, against P3's, every text its stored delta) was measured on records keeping their texts as deltas;
+//! since the KeptText move the records stand alone with their texts apart, as a daemon's do, and the view writes every
+//! text `PLAIN`, read through its source, as the presenter's view does.
 #![allow(
   clippy::unwrap_used,
   clippy::expect_used,
@@ -18,7 +19,7 @@ use std::time::Instant;
 
 use slates_svn::dump::{Admission, Uuid};
 use slates_svn::fsfs::{Advance, View};
-use slates_svn::migration::{Importer, Importing, Repository, Room};
+use slates_svn::migration::{Importer, Importing, Repository, Room, Standalone};
 
 /// Shape: a room no bench history comes near.
 const ROOMY: Room = Room {
@@ -71,16 +72,19 @@ fn dump(revisions: u64, size: usize) -> Vec<u8> {
   out.into_bytes()
 }
 
-/// The repository `dump` makes.
-fn imported(dump: &[u8]) -> Repository {
+/// The repository `dump` makes, standing alone: its texts held apart, as a daemon's are on the node's store.
+fn imported(dump: &[u8]) -> Standalone {
   let uuid = Uuid::parse(b"00000000-0000-4000-8000-0000000064a5").unwrap();
-  let mut repository = Repository::new(uuid, b"2026-11-20T00:00:00.000000Z", ROOMY).unwrap();
+  let mut repository =
+    Standalone::new(Repository::new(uuid, b"2026-11-20T00:00:00.000000Z", ROOMY).unwrap());
   let mut importer = Importer::new(ADMISSION);
   let mut rest = dump;
   loop {
-    match importer.import(&mut repository, rest, true).unwrap() {
+    match repository.import(&mut importer, rest, true).unwrap() {
       Importing::Done => return repository,
       Importing::NeedMore { .. } => panic!("the whole dump was given"),
+      // `Standalone::import` supplies every base from the texts it holds.
+      Importing::Base { .. } => panic!("a whole dump's import asked for a base"),
       Importing::Commit { consumed, record } => {
         rest = rest.get(consumed..).unwrap_or_default();
         repository.commit_record(*record).unwrap();
