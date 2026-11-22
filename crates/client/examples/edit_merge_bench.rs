@@ -78,6 +78,8 @@ static PAUSE: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
 
 /// Whether a loaded form's p99 passed the required bound on a platform that gates it (84a): the run then exits 1.
 static LOADED_OVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Format: a million, the unit the load's throughput is printed in.
+const MILLION_TURNS: f64 = 1e6;
 /// Format: the percentiles reported, in parts per thousand.
 const PERCENTILES: &[(&str, u64)] = &[("p50", 500), ("p99", 990), ("p999", 999)];
 /// Format: parts per thousand.
@@ -991,17 +993,30 @@ fn main() {
     let stop = AtomicBool::new(false);
     let spinners = cores.saturating_mul(selection.spinners_per_core);
     println!("loaded: {spinners} spinning threads on {cores} cores");
+    // The load's own throughput, its spinners' turns a second: what the daemon took from its time-share neighbours
+    // (84a: a shard in a real-time class runs ahead of them, and must not starve them).
+    let turns = std::sync::atomic::AtomicU64::new(0);
+    let started = Instant::now();
     std::thread::scope(|scope| {
       for _ in 0..spinners {
         scope.spawn(|| {
+          let mut mine = 0_u64;
           while !stop.load(Ordering::Relaxed) {
             std::hint::spin_loop();
+            mine = mine.wrapping_add(1);
           }
+          turns.fetch_add(mine, Ordering::Relaxed);
         });
       }
       sweep(&instance, "loaded", &selection);
       stop.store(true, Ordering::Relaxed);
     });
+    let seconds = started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
+    #[allow(clippy::cast_precision_loss)]
+    let rate = turns.load(Ordering::Relaxed) as f64 / seconds / MILLION_TURNS;
+    println!(
+      "load throughput: {rate:.1} million spinner turns a second over {seconds:.1} s ({spinners} spinners)"
+    );
   }
   // Each shard's pulse as the runtime holds it (§4.14): its longest step tells a request held behind a long task from
   // one whose shard was woken late; its overrun says how late its timed waits ran.
