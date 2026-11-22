@@ -435,3 +435,9 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
   - The rest is routed to main for the other owners: content store, engine, push, store owner.
 - Local only: the attribution probe in svn_import/tests.rs (a test-only global allocator), not landed.
 - Waiting: main's routing, git-2000 rerun, and HTTPv2 rerun.
+
+## 2026-11-22 ~01:25 PST: SlicedLanding::part's copies cut (main's routing of 00:57)
+- 2a8dbcd99: the owner gives each part's buffer back; the svn landing fills one buffer a landing. Red first.
+- Store owner tests 5/5. Server svn tests 113/114: a DAV hook test flaked on a WouldBlock read at load 74, 3/3 alone.
+- Checked first: w-hg holds no unlanded store work.
+- Waiting: main's r18 git-2000 attribution, and the HTTPv2 rerun at 0de4c75ea or later.
