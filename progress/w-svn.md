@@ -478,3 +478,15 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - Item 2 (the daemon breakdown) is on hold: w-shared's `slates status --memory` gauges come first, then
   an_import_measured prints them.
 - Waiting on main: r12's git-2000 number; the macOS run 45018545878 and the clippy run 45018575168.
+
+## 2026-11-22 ~04:35 PST: the refused put's leak and the status red (main's rulings of 03:55)
+- macOS proof (main's CI 45018545878, at 00844de07): the propset hang is gone (33.57 s, against 120 s before), and
+  the guard left 0 views mounted.
+- 7c53d589c: a text refused part-way through its put leaves the store as it was. The writer now stays in `Storing`
+  until finished, the fix by construction. Red: 8 entries, 2 MiB left held. svn 113 → 114/114.
+- 738b4e0af: the status red was the test's. Stock svn reports a directory's children in hash order;
+  `entries_in_order` compares a status's entries in text order. Red first. Checked against the run's own outputs:
+  equal once compared.
+- The diag branch merged up to 738b4e0af locally (272513fe4, ~/slates-work/w-svn-diag), unpushed. It's main's to
+  push.
+- Waiting on main: the macOS rerun; r12's git-2000 number; w-shared's gauge names for item 2.
