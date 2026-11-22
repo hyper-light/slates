@@ -1,0 +1,40 @@
+name: diag measurer
+# g220's 84a Linux probe (main 01a20182's ruling, 2026-11-21): what do CI's Linux runners grant an unprivileged process
+# toward wake-up preemption? (a) the account's RLIMIT_RTPRIO and SCHED_RR; (b) rtkit's MakeThreadRealtime. Run only from
+# `diag-measurer-*` branches, never main.
+on:
+  push:
+    branches: ["diag-measurer-*"]
+jobs:
+  probe:
+    name: real-time routes (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: As the runner's account is
+        run: |
+          uname -a; nproc; id
+          echo "rtprio soft $(ulimit -r) hard $(ulimit -Hr); rttime soft $(ulimit -S -R) hard $(ulimit -H -R)"
+          cat /proc/sys/kernel/sched_rt_runtime_us /proc/sys/kernel/sched_rt_period_us
+          chrt -r 1 true && echo "chrt -r 1: granted" || echo "chrt -r 1: refused"
+          busctl --system list | grep -i realtime || echo "RealtimeKit: not on the system bus"
+      - name: rtkit installed once (route b)
+        run: |
+          sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq rtkit > /dev/null
+          sudo systemctl start rtkit-daemon || true
+          systemctl status rtkit-daemon --no-pager | head -5 || true
+          busctl --system list | grep -i realtime || echo "RealtimeKit: still not on the system bus"
+          python3 .github/g220/rtkit_probe.py
+      - name: An administrator's rtprio grant (route a, as pam_limits or LimitRTPRIO= give it)
+        run: |
+          sudo prlimit --pid $$ --rtprio=1:1
+          echo "rtprio now soft $(ulimit -r) hard $(ulimit -Hr)"
+          chrt -r 1 true && echo "chrt -r 1 after the grant: granted" || echo "chrt -r 1 after the grant: refused"
