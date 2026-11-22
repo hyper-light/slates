@@ -946,7 +946,8 @@ fn holds_a_timestamp(line: &str) -> bool {
 /// `<date>` element whose value is on it, left out; `author` (the leg's one committer) written `AUTHOR`; `url` (the
 /// leg's repository URL) written `URL`. Nothing else is changed.
 fn comparable(output: &str, author: &str, url: &str) -> String {
-  output
+  let ordered = attributes_in_order(output);
+  ordered
     .lines()
     .filter(|line| !holds_a_timestamp(line))
     .map(|line| line.replace(url, "URL").replace(author, "AUTHOR"))
@@ -955,6 +956,90 @@ fn comparable(output: &str, author: &str, url: &str) -> String {
       text.push('\n');
       text
     })
+}
+
+/// `output` with each XML start tag's attributes in name order, where `output` is XML (its first line `<?xml`); any
+/// other output as it is. Stock `svn`'s XML writer (`svn_xml_make_open_tag`) takes a tag's attributes through an APR hash
+/// whose seed APR draws afresh for every hash, so it writes them in a different order run to run, against `svnserve` as
+/// against slates (main 01a20182's run r13: 8 of `svn log --xml --verbose`'s 23 `path` elements over `svnserve` alone
+/// in an order other than the most common): XML's own rule, that attribute order is no part of a document (XML 1.0
+/// §3.1), is what is compared. The client writes each attribute on a line of its own beneath its tag, three spaces in,
+/// the tag's close after the last; so are they kept, sorted, the close moved to the new last.
+fn attributes_in_order(output: &str) -> String {
+  if !output.starts_with("<?xml") {
+    return output.to_owned();
+  }
+  let mut out = String::with_capacity(output.len());
+  let mut group: Vec<(String, String)> = Vec::new();
+  let flush = |group: &mut Vec<(String, String)>, out: &mut String| {
+    let close = group
+      .last()
+      .map(|(_, rest)| rest.clone())
+      .unwrap_or_default();
+    group.sort_by(|a, b| a.0.cmp(&b.0));
+    let last = group.len().saturating_sub(1);
+    for (at, (attribute, _)) in group.iter().enumerate() {
+      out.push_str("   ");
+      out.push_str(attribute);
+      if at == last {
+        out.push_str(&close);
+      }
+      out.push('\n');
+    }
+    group.clear();
+  };
+  for line in output.lines() {
+    match attribute_line(line) {
+      Some(parts) => group.push(parts),
+      None => {
+        flush(&mut group, &mut out);
+        out.push_str(line);
+        out.push('\n');
+      }
+    }
+  }
+  flush(&mut group, &mut out);
+  out
+}
+
+/// A line of one attribute as stock `svn`'s XML writer lays it out (`   name="value"`, the tag's close after it on the
+/// last): the attribute and what follows its closing quote; none for any other line.
+fn attribute_line(line: &str) -> Option<(String, String)> {
+  let rest = line.strip_prefix("   ")?;
+  let (name, value) = rest.split_once("=\"")?;
+  if name.is_empty()
+    || !name
+      .chars()
+      .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == ':')
+  {
+    return None;
+  }
+  let end = value.find('"')?;
+  let attribute = format!("{name}=\"{}\"", value.get(..end)?);
+  Some((attribute, value.get(end + 1..)?.to_owned()))
+}
+
+/// main 01a20182's run r13 (big Studio, stock svn 1.15): `svn log --xml --verbose` over HTTPv2 and against `svnserve`
+/// differed only in the order of each `path` element's attributes, which stock `svn` writes in a hash's order
+/// ([`attributes_in_order`]). Do: compare the same log entry with its attributes in two orders, then with one value
+/// changed, and a text output whose lines look like attributes. Expect: the first two the same once compared, the third
+/// still different, the text output unchanged.
+#[test]
+fn the_comparison_leaves_xml_attribute_order_out_and_nothing_else() {
+  let one = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<log>\n<path\n   text-mods=\"false\"\n   kind=\"dir\"\n   \
+             action=\"A\"\n   prop-mods=\"false\">/imported</path>\n</log>\n";
+  let two = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<log>\n<path\n   action=\"A\"\n   prop-mods=\"false\"\n   \
+             text-mods=\"false\"\n   kind=\"dir\">/imported</path>\n</log>\n";
+  let changed = two.replace("action=\"A\"", "action=\"M\"");
+  let text = "   b=\"2\"\n   a=\"1\"\n";
+  assert_eq!(
+    (
+      comparable(one, "alice", "URL") == comparable(two, "alice", "URL"),
+      comparable(&changed, "alice", "URL") == comparable(two, "alice", "URL"),
+      attributes_in_order(text),
+    ),
+    (true, false, text.to_owned())
+  );
 }
 
 /// The HTTPv2 session (A-681 part C, by use), run as `svn` against `url`, a fresh repository whose `pre-revprop-change`
