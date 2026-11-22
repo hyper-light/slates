@@ -1329,7 +1329,7 @@ impl Taker {
     };
     match self.cutting.as_mut() {
       Some(cutting) => {
-        let rev = u32::try_from(self.fork.len(store, log).saturating_sub(1)).unwrap_or(u32::MAX);
+        let rev = self.fork.len(store, log).saturating_sub(1);
         let charged = to_u64(size_of::<KeptText>()).saturating_add(to_u64(path.len()));
         cutting.kept(log_of(log), rev, kept, charged);
       }

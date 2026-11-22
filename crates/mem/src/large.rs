@@ -28,7 +28,8 @@
 //!
 //! **What is live (the memory status's gauges, main's ruling of 2026-11-22 03:46).** Two more figures tell what the
 //! process holds from what the allocators kept: [`heap`]'s live bytes on the system allocator's path, summed from
-//! per-thread slots (one relaxed add a block, on a line its thread alone writes in the common case), and the resident
+//! per-thread slots (one relaxed add a block, on a line its thread alone writes in the common case) with the bytes it ever
+//! allocated beside them (its churn), and the resident
 //! pages of the mapped blocks live now, read from a table of them ([`TRACKED`] at most; past it, counted untracked) only
 //! when the status asks. A resident set past the live bytes and the mapped blocks' resident pages is what the system
 //! allocator kept of freed blocks.
@@ -54,12 +55,12 @@ static REFUSED: AtomicU64 = AtomicU64::new(0);
 /// Shape: the slots the system path's live bytes are summed in, each its own cache line: threads past this many share.
 const SLOTS: usize = 64;
 
-/// One slot of the system path's live bytes, alone on its cache line.
+/// One slot of the system path's figures, alone on its cache line: its live bytes, and the bytes it ever allocated.
 #[repr(align(128))]
-struct Slot(AtomicI64);
+struct Slot(AtomicI64, AtomicU64);
 
-/// The system path's live bytes, a slot a thread (module docs, "What is live").
-static LIVE: [Slot; SLOTS] = [const { Slot(AtomicI64::new(0)) }; SLOTS];
+/// The system path's figures, a slot a thread (module docs, "What is live").
+static LIVE: [Slot; SLOTS] = [const { Slot(AtomicI64::new(0), AtomicU64::new(0)) }; SLOTS];
 
 /// The next slot handed to a thread.
 static NEXT_SLOT: AtomicUsize = AtomicUsize::new(0);
@@ -80,8 +81,11 @@ fn live(delta: i64) {
       slot.get()
     })
     .unwrap_or(0);
-  if let Some(Slot(bytes)) = LIVE.get(slot) {
+  if let Some(Slot(bytes, allocated)) = LIVE.get(slot) {
     bytes.fetch_add(delta, Ordering::Relaxed);
+    if let Ok(grown) = u64::try_from(delta) {
+      allocated.fetch_add(grown, Ordering::Relaxed);
+    }
   }
 }
 
@@ -132,6 +136,9 @@ fn untrack(block: *mut u8) {
 pub struct Heap {
   /// Bytes the system allocator's path holds in live blocks (requested sizes, not its rounding).
   pub system_live: u64,
+  /// Bytes the system allocator's path has allocated since the process began (a reallocation's growth counted): its
+  /// churn, read as the difference between two readings.
+  pub system_allocated: u64,
   /// The mapped blocks live now that the table keeps.
   pub mapped_blocks: u64,
   /// Of their pages, the bytes resident now.
@@ -145,10 +152,15 @@ pub struct Heap {
 pub fn heap() -> Heap {
   let system_live = LIVE
     .iter()
-    .map(|Slot(bytes)| bytes.load(Ordering::Relaxed))
+    .map(|Slot(bytes, _)| bytes.load(Ordering::Relaxed))
     .fold(0i64, i64::saturating_add);
+  let system_allocated = LIVE
+    .iter()
+    .map(|Slot(_, allocated)| allocated.load(Ordering::Relaxed))
+    .fold(0u64, u64::saturating_add);
   let mut found = Heap {
     system_live: u64::try_from(system_live).unwrap_or(0),
+    system_allocated,
     untracked: UNTRACKED.load(Ordering::Relaxed),
     ..Heap::default()
   };

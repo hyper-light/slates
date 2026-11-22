@@ -725,3 +725,27 @@ fn a745_a_fetch_answers_from_the_generation_it_began_on_whatever_lands_meanwhile
     "lent the objects alone, an answer's later steps lose its refs"
   );
 }
+
+/// A-859 (main 01a20182's order of 2026-11-22 04:53: the whole-repository round must say which path a clone's objects
+/// took). Do: push one commit to a git repository's `main` and fetch it, its stream's own counters read at its end.
+/// Expect: the shard counts each of the stream's paths ([`super::STREAM_COUNTED`]) as the stream counted it, so the
+/// daemon's status says which path a clone's objects took, and the fetch took one (its objects sent fresh, so the
+/// counts are not all zero).
+#[test]
+fn t_a859_a_fetchs_stream_counts_each_path_its_objects_took_on_its_shard() {
+  let (stream, counted) = crate::test_store::audit_on_stored_shard("vcs_store-upload", |state| {
+    let (id, _, head) = pushed_repository(state, "counted", &[]);
+    let (_, stream) = fetched_with_counters(state, (id, &owner()), &fetch(&[head], &[]));
+    let counted: Vec<u64> = super::STREAM_COUNTED
+      .iter()
+      .map(|(name, _)| state.refusals.get(*name).copied().unwrap_or(0))
+      .collect();
+    (stream, counted)
+  });
+  let expected: Vec<u64> = super::STREAM_COUNTED
+    .iter()
+    .map(|(_, of)| of(&stream))
+    .collect();
+  assert_eq!(counted, expected, "{stream:?}");
+  assert!(counted.iter().any(|count| *count > 0), "{stream:?}");
+}

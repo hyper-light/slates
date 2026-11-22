@@ -87,7 +87,12 @@
 > them the index tables 23.5); the repository's windows 61.3 in shard 0's arena and the pushed pack 53.9 on shard 1;
 > the 14 startup mapped blocks 13.8 resident; the rest, about 550-600 MB, is freed memory the system allocator kept
 > after the push's 971 MiB peak (its temporaries under the 1 MiB mapped floor). After the clone the git Repository's
-> objects read lately hold 53.9 more. Owed, in main's order: (1) the push's temporaries cut at their source (w-shared);
+> objects read lately hold 53.9 more. The source of (1), measured: v2.0.0's 164,488 objects inflate to 2,301 MB, none
+> of 1 MiB or more, each kept as its own buffer by the push's objects read lately (`packed::Recent`, budget the pack's
+> length) and freed oldest first. (1) LANDED A-861: those objects lie in chunks of the mapped floor, given back whole;
+> red, 20,000 objects of 4 KiB kept grew the system path's live bytes by 6,582,872, green under a tenth of the budget, and
+> a third round's churn under a hundredth (`crates/git/tests/recent_ring.rs`); main's RSS round owed (run-requests).
+> Owed, in main's order: (1) the push's temporaries cut at their source (w-shared);
 > (2) landed windows and the pack let go once durable (w-shared, with w-git); (3) the recent-objects cache given back
 > after a fetch (w-git); (4) the index tables, decided after.
 

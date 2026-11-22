@@ -60780,3 +60780,37 @@ Applied in the same change to: `crates/git/src/store/packed.rs` (`Recent::let_go
   kept for the reads after; counted with the rest in `vcs_store.git_encode.given_back_idle`.
 - **Tests.** `slates-server` `vcs_store::git_encode::tests::t_a860_a_repository_gone_idle_lets_go_of_the_objects_its_reads_keep`
   (the encoding's reads kept 417 bytes here; once the fetch ended, back to the 32 before; red before: 417 held).
+
+### A-861 — Objects read lately lie in chunks given back whole, never on the system heap (2026-11-22, w-shared; main 01a20182's rulings of 04:24 and 04:56 PST, goal 93; A-742, A-860)
+Applied in the same change to: `crates/git/src/store/packed.rs` (`Recent`: chunks, a hash index, one order queue;
+`let_go` gives back every chunk; `true_up`, `release`), `crates/git/src/store/push.rs`, `repository.rs` and
+`encoding.rs` (the charge's owners), `crates/server/src/vcs_store.rs` and `git_encode.rs`, `crates/git/Cargo.toml`
+(`slates-mem`), `crates/mem/src/large.rs`
+(`Heap::system_allocated`), `crates/server/src/memory_gauges.rs` (`mem.gauge.process.system_allocated_bytes`),
+`crates/git/tests/recent_ring.rs`, GAPS.
+
+Status: built 2026-11-22, macOS arm64 (focused tests); main's RSS round owed.
+- Why: a landed push of git/git v2.0.0 kept 772-787 MiB for a 56 MB pack. The memory status's gauges put 550-600 MB of
+  it in freed memory the system allocator kept. The push inflates its 164,488 objects to 2,301 MB, none of them 1 MiB,
+  and kept each, as read lately, as its own buffer, freed oldest first as newer came: a stream of blocks under
+  A-742's mapped floor, each held for seconds, which the allocator does not give back.
+- Rule: `Recent` lays each object's bytes end to end in chunks one mapped floor long (or its budget, when that is shorter),
+  each reserved once and never grown, and gives back the oldest chunk whole when the budget would be passed. An object a
+  chunk long or longer is taken whole as a chunk of its own (the large path), and one past the budget is not kept. A
+  growing budget (a push's, as its pack arrives) adds chunks, never a copy.
+- Safety: an object is found by its chunk's number and range; every chunk ever laid takes the next number, so an
+  object whose chunk has gone is a miss, never another object's bytes. Its bytes are lent as a slice of `&self`, so none
+  outlives the read. No `unsafe`. The chunks are the push's or the repository's, so they go when it does (landed,
+  refused, abandoned, or a dropped future), and `let_go` (A-860) gives back every one.
+- Index: a hash table, which allocates nothing once grown to the budget's objects (a B-tree split and gave back a node
+  every few: 142 bytes an object), and one order queue.
+- Charged (main 01a20182's ruling of 05:17: an uncharged holder makes the admission's numbers lie): `Recent::true_up`
+  charges the owner's content store for the chunks held, trued up where the owner holds the store mutably (a push after
+  each admission turn, a repository after each encoding unit, since a clone's reads fill it), and where the store's room
+  cannot take it the oldest chunks go until it can. `Recent::release` gives back the chunks and the charge: a push's
+  when it is committed or abandoned, a repository's when it goes idle (A-860's give-back). A read between two true-ups
+  only lays chunks the next one charges.
+- Evidence: `a_push_keeps_its_objects_read_lately_off_the_system_heap` (its own binary, `LargeMapped` global): red, the
+  system path's live bytes grew 6,582,872 bytes keeping 8 MiB; green, under a tenth of the budget, and a third round's churn
+  past the objects handed over under a hundredth. `recent_tests`: a gone chunk's object a miss, a large object a chunk
+  of its own, one past the budget not kept, `let_go` holding nothing.
