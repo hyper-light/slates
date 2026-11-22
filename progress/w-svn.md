@@ -513,3 +513,15 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - Tests: svn lib 585/585, the svn import tests 7/7, server svn 114/114 (on the merged tree too), store_tests 10/10.
 - Filed: main's gauged an_import_measured over git-2000 (run-requests.md).
 - Next, per main: the next-largest per-text churner given a buffer the import owns, reused.
+
+## 2026-11-22 ~07:40 PST: r16 read; the post-state cut (main's 06:01 routing, 06:28 request)
+- 73e46f842: the batch's admission charges a revision's texts once. Since A-862 they're already in the content store.
+- bb0802fb8: an increment's post-state is sized once by its texts. Red first: 6,000 bytes held for 5,000, now 5,000.
+  The due_before unit red is folded in: 22,220 under the old charge against 11,220.
+- In-process sampled attribution (500 files, 300 revisions, 11.65 MB dump): 168.9 MB allocated at 2bb00e1cc,
+  156.6 MB with A-862, 142.3 MB with bb0802fb8.
+- r16's daemon doubling isn't reproduced in-process. main queued the daemon A/B (2bb00e1cc vs 73e46f842, interleaved)
+  as r18.
+- Tests: server svn 116/116 on the merged tree; slates-vcs content 20/20.
+- Next: r18's verdict, then the next churner. Mine left: the sink's window buffer, one a text, to be reused by the
+  import. The rest are the engine's and the content store's.
