@@ -85,6 +85,9 @@ const ENTRY_OVERHEAD_BYTES: usize = 4
   + HASH_BYTES
   + SIGNATURE_BYTES
   + HASH_BYTES;
+/// Format: an entry's bytes before its carried increment and its effects: magic, version, the inputs' identity and
+/// length, the carried marker, then (after the carried bytes) the effect count.
+const HEADER_BYTES: usize = 4 + 4 + HASH_BYTES + 8 + 1 + WORD_BYTES;
 /// Format: an effect's largest fixed part: its tag and three length prefixes or counts.
 const EFFECT_OVERHEAD_BYTES: usize = 1 + 3 * 4;
 /// Format: the smallest an effect can encode to: its tag and one length prefix.
@@ -544,9 +547,17 @@ pub fn encode_carrying(
   identity: Option<[u8; 32]>,
   signature: Option<Signature>,
 ) -> Vec<u8> {
-  // Reserved at the entry's bound once, never grown (A-742).
-  let mut out =
-    Vec::with_capacity(entry_bound(increment).saturating_add(carried.map_or(0, <[u8]>::len)));
+  let declared = Declared::of(increment);
+  // Reserved at the entry's exact length once, never grown (A-742) and never over: the admission's bound counts the whole
+  // post-state, which a text's splice names by reference, so reserving it cost every text an allocation of its size
+  // (goal 93, svn finding (2): 26.2 MB for 25.6 MB of imported text), then kept as the chain entry's capacity.
+  let exact = entry_bytes(
+    carried.map_or(0, <[u8]>::len),
+    &declared,
+    applied,
+    (completion, identity, signature),
+  );
+  let mut out = Vec::with_capacity(exact);
   out.extend_from_slice(&MAGIC.to_le_bytes());
   out.extend_from_slice(&VERSION.to_le_bytes());
   out.extend_from_slice(&inputs.identity);
@@ -560,7 +571,6 @@ pub fn encode_carrying(
     None => out.push(ABSENT),
   }
   put_count(&mut out, applied.len());
-  let declared = Declared::of(increment);
   for effect in applied {
     put_applied(&mut out, &declared, effect);
   }
@@ -590,7 +600,87 @@ pub fn encode_carrying(
   put_signature(&mut out, signature);
   let digest = *blake3::hash(&out).as_bytes();
   out.extend_from_slice(&digest);
+  debug_assert_eq!(
+    out.len(),
+    exact,
+    "an entry's length is what entry_bytes sizes"
+  );
   out
+}
+
+/// The bytes [`encode_carrying`] writes for an entry carrying `carried` bytes of its increment's encoding, with `applied`'s
+/// effects and its trailers, without writing them: the entry's exact length, which its buffer is reserved at.
+fn entry_bytes(
+  carried: usize,
+  declared: &Declared<'_>,
+  applied: &[Applied],
+  (completion, identity, signature): (Option<Completion>, Option<[u8; 32]>, Option<Signature>),
+) -> usize {
+  let effects = applied
+    .iter()
+    .map(|effect| applied_bytes(declared, effect))
+    .fold(0usize, usize::saturating_add);
+  // A completion's marker, and its key with the work's marker, and the work's id where it names one.
+  let completion = completion.map_or(1, |key| {
+    let without_work = 1usize.saturating_add(COMPLETION_BYTES.saturating_sub(WORK_BYTES));
+    key
+      .work
+      .map_or(without_work, |_| without_work.saturating_add(WORK_BYTES))
+  });
+  let identity = identity.map_or(1, |_| 1usize.saturating_add(HASH_BYTES));
+  let signature = signature.map_or(1, |_| SIGNATURE_BYTES);
+  HEADER_BYTES
+    .saturating_add(carried)
+    .saturating_add(effects)
+    .saturating_add(completion)
+    .saturating_add(identity)
+    .saturating_add(signature)
+    .saturating_add(HASH_BYTES)
+}
+
+/// The bytes [`put_applied`] writes for `applied`, without writing them.
+fn applied_bytes(declared: &Declared<'_>, applied: &Applied) -> usize {
+  let tagged = |paths: &[&str]| {
+    paths
+      .iter()
+      .map(|path| string_len(path.as_bytes()))
+      .fold(1usize, usize::saturating_add)
+  };
+  let ops = |ops: &[Op]| WORD_BYTES.saturating_add(ops.len().saturating_mul(OP_BYTES));
+  match applied {
+    Applied::Special(path, node) => {
+      tagged(&[path]).saturating_add(WORD_BYTES.saturating_add(node.encoded_len()))
+    }
+    Applied::Spliced(path, applied) if applied.as_slice() == declared.ops_for(path) => {
+      tagged(&[path])
+    }
+    Applied::Spliced(path, applied) | Applied::Created(path, applied) => {
+      tagged(&[path]).saturating_add(ops(applied))
+    }
+    Applied::Copied {
+      dst,
+      from,
+      ops: applied,
+    } if applied.is_empty() => tagged(&[dst, from]),
+    Applied::Copied {
+      dst,
+      from,
+      ops: applied,
+    } => tagged(&[dst, from]).saturating_add(ops(applied)),
+    Applied::RemoveSpecial(path)
+    | Applied::RemoveContent(path)
+    | Applied::MakeDir(path)
+    | Applied::RemoveDir(path)
+    | Applied::RemoveSymlink(path)
+    | Applied::RemoveHardlink(path) => tagged(&[path]),
+    Applied::Mode(path, _) => tagged(&[path]).saturating_add(WORD_BYTES),
+    Applied::Symlink(path, target) | Applied::Hardlink(path, target) => tagged(&[path, target]),
+    Applied::SetXattr(path, name, value) => tagged(&[path, name]).saturating_add(string_len(value)),
+    Applied::RemoveXattr(path, name) => tagged(&[path, name]),
+    Applied::CopyTree { dst, from, fix, .. } => {
+      tagged(&[dst, from]).saturating_add(fix.as_deref().map_or(0, fix_bytes))
+    }
+  }
 }
 
 /// Appends a signature's verdict (module docs): a present marker and the verdict, or an absent marker alone.

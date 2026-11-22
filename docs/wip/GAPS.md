@@ -80,6 +80,21 @@
 > before an entry's append (A-825 "Cost owed"), measured by the lane's release bench; since A-854 paid only by an
 > increment over 1 MiB, the smaller carried in its entry.
 
+> **FIXED (w-shared, 2026-11-22; goal 93, svn finding (2), main 01a20182 00:19 PST): a chain entry's buffer was reserved at
+> the admission's bound,** which counts the increment's whole post-state, though a text's splice names it by reference:
+> every imported text cost an allocation of its own size (26.2 MB for 25.6 MB of text in w-svn's attribution,
+> `chain_entry::encode_carrying` <- `push::append_versions`), kept as the chain entry's capacity. Now reserved at the
+> entry's exact length (`entry_bytes`, checked against what is written). Red: a 193-byte entry for 256 KiB of text
+> reserved 262,395 bytes; green: capacity equals length, for held, carrying and every-effect entries
+> (`an_entrys_buffer_is_reserved_at_its_length_not_its_texts`). The finding's other copies are their owners'
+> (`inbox/main-from-w-svn-finding2-sites.md`).
+
+> **Open (found by w-shared, 2026-11-22): `repository::tests::each_verb_moves_the_names_log_and_each_members_version_its_own_log`
+> fails on main,** before A-854 too (b00ed749a, a3e673efc plus a test; macOS arm64, debug): "the doubling rule's inputs
+> say fold, yet no checkpoint was taken: FoldInputs { floor: 2, to_fold: 532, held_bytes: 0 }". Not bisected further; a
+> likely cause is 2d078e4fa (A-579's last step: the checkpoint held a chunk a paced quantum, so it may end after the
+> step that asked for it, where the test's `write_until_folded` reads the floor at once). Main's to route.
+
 > **FIXED (w-fed-faults, 2026-11-21): a whole-file rewrite outside a recorded request was refused `Overloaded`**
 > (A-787 part 2's park, 2a498b90f). 10 server lib tests (repository, vcs_store paths and commits) failed from that
 > commit on, bisected against its parent 81d8baea5; such a verb now composes unrefined and is answered (6459374).
