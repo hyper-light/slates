@@ -28,3 +28,11 @@ Clone: ~/slates-work/w-multirepo; target ~/.cache/w-multirepo-target.noindex; st
 - w-hg: admission leak fixed 687cd98b1 (521fe3689; index_upkeep lent the whole admittable to a merge step). Hold on
   vcs_share::room / push_room lifted. Siblings lending whole admittable rooms (GAPS, main routes): git restage_turn
   (stage_room), SealingPush::turn (self.room), git_hooks seal. Still parked on main's A-724 split.
+- RULINGS: main 17:22 (final): mine = piece 2's rest (rates/curves on owner shard, partition via published snapshot,
+  CPU) + piece 7, slates_vcs::usage mine; w-balance keeps piece 3's rest (backpressure, svn admission, hg/svn words,
+  hg fetch claim). Tell w-balance BEFORE replacing vcs_share::room's per-request division. CPU: equal-weight DRR first;
+  piece 7 A/Bs equal vs learned weights (and w-balance's turn-weights branch 7d4d938bc); data decides.
+- LANDED 4f5bbb238 (main f705487f9): one learned demand: Rates replaced usage::Learned (bytes_per_work at a size
+  horizon chosen by squared error). Reported inbox/main-from-w-multirepo-one-demand.md.
+- NEXT 2d: (1) principals' Decayed on usage slots; (2) curves fed from a repository's object reads on the owner shard;
+  (3) partition at the learning cadence -> immutable per-shard snapshot -> room reads grants (tell w-balance first).
