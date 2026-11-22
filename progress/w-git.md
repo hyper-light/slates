@@ -471,3 +471,17 @@
       admission (no search); v5 refused typed (Retired like v1/v2? or Version). Recovery test replaying the base.
   Runs (negotiation/one_round) start after a common version >= 0, so D(0) never enters a run: no plan change needed
   for runs; fragments of v0 shrink to the tag object.
+- 2026-11-21 ~23:59 PST: A-850 LANDED a34a40909 (merge b099adee4). Main 01a20182's 22:40 ruling taken whole: a
+  create's or a rewrite's admission finds its base (A-753's, through the commit its tags peel to, else the search back
+  by generation to the nearest commit a committed version peels to: the peeled map, a commit a unit, counted
+  base_searched); D(0) relative to it (base less its own tags); record v6 names each move's base, v5 refused typed
+  `Version`, replay takes it (`Repository::based`, `StoreRefused::Base`); a push without atomic decided oldest commit
+  first (`receive::Judge::rank`, outcomes in the order sent). Red r16 shape t_a850_r16_… (1,012 commits, main + 506
+  tags sent by ref name, empty repo, one push): 3,542 brought = objects, each once; encoding 517 turns; fetch whole.
+  Red with ranking off: 9,557. Recovery: t_a850_a_recovery_replays_each_moves_base_from_its_record.
+  Focused: slates-git store (163+), receive/negotiation/upload 170/170; slates-server vcs_store/git_push/vcs_http::git/
+  daemon_edge/repository/git_hooks/git_protect/daemon t_a767 all pass but 3 not in git's path (repository::tests::
+  each_verb_moves_the_names_log…: "doubling rule's inputs say fold, yet no checkpoint was taken"; vcs_http daemon_edge
+  a_mercurial_push_larger… and a_mercurial_stream_clone_larger…), failing before and after merging main.
+  Left (GAPS): atomic pushes' moves meet no base among each other; a fetch's plan does not follow a base. NEXT: bug (1)
+  (a fetch cut short while the encoding runs), after the file split with w-balance in writing.
