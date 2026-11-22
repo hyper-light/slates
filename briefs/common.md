@@ -38,6 +38,14 @@ Ada: "Goal 93 is where we need to focus our efforts now. Complete the servers, e
 - A failure found by use goes to the server's owner as a red test (inbox/<owner>-from-<you>-<topic>.md). It is fixed
   by the owner, or by you if the owner says so in writing; never two agents in one file at once.
 
+## OTHER PLATFORMS ARE NEVER "CAN'T" (ADA 2026-11-21 ~14:33: "It should be able to use reach." "Or Zig.")
+- A Linux, macOS or Windows check you can't run on your own machine runs through kiln's reach on a runner of that
+  platform (`run` with needs "linux/amd64", "linux/arm64", "macos" or "windows", unpinned).
+- Or cross-check it the way kiln's release builds do: `cargo zigbuild check --target x86_64-unknown-linux-gnu` (or
+  aarch64). zig supplies the Linux libc that C dependencies (aws-lc-sys, zstd-sys) need. The MacBook
+  (adas-macbook-pro-2.local) has zig 0.16 and cargo-zigbuild; reach it if your machine lacks them.
+- Never report a platform as uncheckable.
+
 ## FAST LANDING LOOP (ADA 2026-11-19 ~20:40 PST: "it should literally not take two hours to land a feature --
 ## implement, light unit testing, merge"). This OVERRIDES any heavier step above or in older briefs/progress files.
 Target: under 30 minutes per piece.

@@ -277,3 +277,17 @@ Red: a focused server test landing a large named text: no step past the quantum,
   its oracle (copy + identity histories, red-checked) offered to main as a patch.
 - NEXT: (b) subtract a key's old entry at first change; slice the checkpoint's last step (~43 ms) and big single keys;
   A/B.
+- 2026-11-21 ~14:30: A-805 preview oracle landed 8f73b6928 (A-815 row; report sent to main by `kiln agents send`).
+  A-579 (b) + the mid-fold sum_at fix landed 596500613 (fast rule: fmt check, focused tests by name, local target;
+  merged with main 1a35ab091 fetched through the MacBook, this Mac's DNS can't reach github.com). NEXT (05:00 order):
+  slice the checkpoint's ~43 ms last step and the 13.4 ms single-key folds; (b)'s A/B owed.
+- 2026-11-21 ~15:30: A-579 key slices landed d4c7e1f42 (fold_identity_slice; the paced unit a BLAKE3 slice). Asked
+  main the durable-format question for the checkpoint's last ~43 ms step (record by identity in the content store, as
+  A-760/A-825; rides format 6?). Running the A/B 585b89299 vs d4c7e1f42 (Z 50/20, 5 rounds,
+  ~/.cache/w-engine-p3-runs/ab-final.txt).
+- 2026-11-21 later: key slices REVERTED ed4661d40 (fold in turns 47.6-52.6 s at 1,000 clients against 1-3 s, every
+  past-deadline turn at the 100 ms ceiling). Found main's own load_bench regression (not A-579's): SubmitAccepted server
+  p50 0.29 ms at 4d0ad1674 against 184 ms at 1a35ab091 (Z=50, macOS arm64, this Mac); window c1449f629..b3f674640 and
+  merges 946b60b2d, 99729edef; bisect stopped unfinished on main's 14:33 order (goal 93's reserve: start no runs).
+- LANDED 8da724578 (GAPS): A-579's last ~43 ms step and 13.4 ms key folds deferred past goal 93 with plans; (b)'s A/B
+  put in run-requests.md for main (blocked by the regression). Now in goal 93's reserve: no runs.

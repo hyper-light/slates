@@ -165,3 +165,33 @@ Plan: a section per pool extent, closed when wholly free; the anchor holds each 
 - 2026-11-21 ~11:00: w-lint found the A-789 Windows CLI tests compiled out (cli.rs is cfg(unix)). Moved to crates/cli/tests/content_extents_windows.rs, LANDED acff9a6e8 (merge d3f2810e0); xwin check clean; run-requests entry updated; --list on jupiter = kiln r1 (queued). Slip: r1 detached a fresh scratch clone on jupiter with git checkout (rule: worktree add); no other tree touched.
 - 2026-11-21 11:09: main put me in goal 93 RESERVE for memory (svn import heap attribution, git client RSS red when main sends them). Start no runs meanwhile; r1 (--list on jupiter) finishes on its own.
 - 11:21: r1 stopped (main). No runs of mine in flight.
+
+## 2026-11-21: BRIEF AUDIT (the person: "Examine all of your assigned goal. If you have not completed it, you are not done.")
+- 1 segment/prefault: DONE (A-777, A-778, A-789 macOS+Windows).
+- 2 sweep: list DONE (GAPS MEMORY SIZING); CONVERSIONS NOT DONE. Largest first: (a) the content object's per-slice
+  address space from reserve_per_shard (write log R/4, image slots 2R, delta log R, arena R; arena R is unused on
+  macOS/Windows since A-789); (b) the segment's log ring (table_bytes) and snapshot slots (2 x table_bytes); (c) the
+  tables (bounds only); (d) the client/fleet/NFS shares.
+- 3 device-pressure seam: NOT DONE.
+- 4 zero-alloc: idle purge DONE (2dc414a84); NFS reply path (results Vec + framed record Vec per request) NOT DONE.
+- Resuming 2 -> 3 -> 4, each red first, landed within ~30 min a piece.
+- A-839 LANDED b5249f883 (merge 6a6483574): macOS content slice without the arena range; one-shard content object 139,264 -> 106,496 MiB (big Studio, red then green). Slip: my A-number claim loop ran `git reset --hard` on my clean state clone (banned; nothing lost); removed from my scripts.
+- NEXT in item 2: image slots (2R), delta log (R), write log (R/4) need growable objects (recovery format) -- design first; then item 3 (pressure seam), item 4 (NFSv3 in-place framing).
+
+## 2026-11-21: brief audit
+- Done: item 1 (segment and its prefault); item 2's GAPS list; A-839 (b5249f883), macOS content slices no longer reserve
+  their arena (one-shard daemon, big Studio: reserved 139,264 -> 106,496 MiB).
+- Open, with plans sent to main (inbox/main-from-w-sizing-brief-remaining.md): 2b, growable image slots, delta log and
+  write log (changes the recovery format); 3, the device-pressure seam; 4, NFSv3 in-place reply framing.
+- Holding for main's go/not now on each: the 11:09 reserve ruling says start no runs, and every red needs a kiln build.
+  The NFS worktree is removed and its branch deleted (nothing was edited in it).
+- 14:55 main: 2b and 3 deferred until after goal 93. Both plans are in GAPS under the MEMORY SIZING sweep (37592d80b,
+  corrected 9ab8a0602). I stay in goal 93's reserve. Item 4 (NFSv3 in-place replies) is still unruled.
+- Found: ~/slates-work/w-sizing-main's working tree has been empty since 10:24 (7,770 staged deletions, .git intact,
+  HEAD 356b28d96). Not mine to repair under the no-reset rule; I work from fresh worktrees.
+- 14:58 main: item 4 deferred too; its GAPS line landed as c829bcdde. All three plans wait for goal 93 to end.
+- w-sizing-main cause: not a truncation. Its .git was made by a fresh `git clone` at 10:24:59-10:25:15 (the reflog's
+  only entry; on Studio-4's hostname), with no checkout after it: no index, and an empty tree. This fits a clone whose
+  checkout failed when this Mac's disk was full. It was the clone, not a worktree, so `git worktree remove` didn't
+  apply. I removed its two landed worktrees (a839, gaps4), checked that agents/w-sizing-arena's change equals main's
+  b5249f883, and deleted the folder by its exact path. The next piece starts from a fresh clone.

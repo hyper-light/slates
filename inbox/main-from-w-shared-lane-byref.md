@@ -215,3 +215,11 @@ identity) and the slicing, re-measured at these five sizes x 10.
 512 MiB is now a watchdog kill: a correctness failure (the daemon dies), so the step slicing moves up from
 performance. kiln r33 reruns 512 MiB x 3 capturing the watchdog's "spinning ... in task spawned at" line to name the
 step, then I slice that step under a derived bound (with the before/after for 320 and 512).
+
+## 12:45 PST: the 512 MiB exit 4 is the LOCAL submit's one step (w-work-cow's slicing), not A-826's holder route
+kiln r33 (main with A-826, big Studio, 512 MiB): the holder submit passed (2.33 s wall, owner step 622 ms, append 257
+ms, place 302 ms); then the bench's local submit (served in the owner shard's serve loop, daemon.rs:5243) spun 1193 ms
+of CPU against a 1025 ms window and the watchdog exited 4. That is w-work-cow's large-single-submit slicing; told it
+(inbox/w-work-cow-from-w-shared-320mib.md). The holder route still shows near misses on the control shard (polls 454,
+538, 883 ms against the 1025 ms window): the owner's step, append and placement in one piece. Slicing those, under a
+derived bound, is my next piece (no C/R failure open on the holder route now).

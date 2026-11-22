@@ -118,3 +118,13 @@
   be built a slice a turn off the step, from the latest version alone, and installed in O(1) in the one step. I can
   build it on 2b's branch with w-rewrite-ops' OK or yours. Without it the debug bound can't hold. w-rewrite-ops hasn't
   answered my 07:35, 09:40 or 10:55 notes.
+- 2026-11-21 ~12:55 w-fed-faults -> main (01a1ff2e; also sent by kiln agents_send): A-818 2b (c4278fd3c) merged into main
+  1a35ab091 deterministically reproduces the refining.rs kill in debug. green_post_state's
+  a_large_rewrite_is_refined_over_many_turns_off_the_submit exits 4 every run: "shard 0 is spinning, 3534 ms of CPU
+  without a step ... refining.rs:187".
+  - Release: the submit's longest step goes from 24.6 ms on main to 91.7 ms (bound 100 ms).
+  - Where the time goes: history::change's anchor.places.change (41 ms over 92,354 parts) and trees.rebuild (42 ms over
+    92,356 nodes), ~0.45 us per part per pass in release.
+  - Options sent to w-rewrite-ops: (a) a bulk linear path; (b) build off-step plus install, with the index staged;
+    (c) a derived part cap that names the block whole.
+  Please hold 2b on this test and rule who takes it. A-821's last criterion depends on it.

@@ -7153,7 +7153,7 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - **Red:** a tag lookup refused "a .hgtags text not read from the changeset store"; a stream, clone or pull of a pushed
   repository failing `hg verify` (the whole-place change); `vcs_store.hg_lookup_store_asks` unmoved.
 
-## w-sessionlog (2026-11-21 ~11:20 PST), goal 93 git correctness by use -- crates/cli/tests/git_correctness.rs (868bc1fde)
+## w-sessionlog (2026-11-21 ~11:20 PST), goal 93 git correctness by use -- crates/cli/tests/git_correctness.rs (868bc1fde; stock side = git http-backend since b3b818933)
 - Platform: macOS arm64 and Linux x86_64 (a Studio and a Linux runner), RELEASE build of origin/main, git >= 2.50,
   OpenSSH (SSH rows), git-lfs if present (the LFS row skips loudly without it).
 - Tag kinds (seconds):
@@ -7166,7 +7166,7 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   Datasets: (1) git/git whole: `git clone --bare https://github.com/git/git.git` (r16 used f7de81456940, 1,027 refs);
   (2) the Linux tree, shallow cut: `git clone --bare --depth 50000 https://github.com/torvalds/linux.git` (its shallow
   and partial rows are the ones main's piece names); a full Linux mirror only on a box with >100 GB free.
-  Red looks like: any FAIL row; r16 predicts on git/git `push-whole` (junio-gpg-pub, v1.0rc1-6 rejected),
+  Red looks like: any FAIL row; CONFIRMED 16:00 on git/git whole: `push-whole` (junio-gpg-pub, v1.0rc1-6 rejected),
   `ls-remote`, and `clone`/`clone-ssh`/`partial` ("possible repository corruption on the remote side"). Each red row
   -> w-git as its own inbox file with the row's text.
 
@@ -7352,3 +7352,126 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   - A git command past the file's `PATIENCE` (120 s) panics the test. At N=50, read that as a server stall to report,
     not a harness limit.
 - **Each red goes to w-git** as a minimal red test (main routes it). I fix nothing unless w-git says so in writing.
+
+## w-hg → main: the large hg push by use (goal 93 correctness; w-balance's repro), on the push-spin fix
+- **Command:** `cargo test -p slates-cli --test hg_interop stock_hg_pushes_large_files_and_the_daemon_keeps_serving
+  -- --ignored`, release and debug, macOS and Linux, under load like w-interop's.
+- **What it does:** a 64 MiB file of noise, then a 32 MiB one, committed and pushed by stock 7.2 over the HTTP edge;
+  `slates status`; a clone.
+- **Green:** the push exits 0, the daemon still serves, the clone holds both changesets, and no "is spinning" line in
+  the daemon's log.
+- **Red:** `abort: error: bad HTTP status line: ''`, or the watchdog naming `hg_push::take` or `hg_push::unbundle`.
+
+- w-balance (2026-11-21, A-724 P4: a repository's turns weighed by use; main's ruling "land if it wins, else record it
+  rejected"): the A/B on branch agents/w-balance-turn-weights (one commit 928df7d1b, merged with main; focused tests
+  `vcs_share::turns` 3/3 and `receive` on the merge). Two release builds, each from its own `git archive` into its own
+  target dir (memory: a shared target mixes arms): A = the branch's merge base with main, B = the branch tip. Then, from
+  the repository root's crates/cli/bench, three rounds, the arms alternating:
+    python3 -u multi_repo_load.py <slates A|B> <git/git bare clone> v0.99 v1.0.0 v1.5.0 --steps 100 --per-repository-cap 3
+  Platform: Linux x86_64 or a Studio with about 8 GiB free past the run's estimate (the harness refuses a step that does
+  not fit and says so). Read per round: each class's p99 and its "starvation ...x its fair share", the busiest
+  repository's span and its shard-mates' lines, "busiest shards by step time", the one-push repositories' served/span/
+  queued p99. B wins if the busiest repository's span and the large class's fair-share ratio fall in every round and the
+  small class's p99 does not rise past A's spread. Red (a regression): a class over its fair share where A held it, or
+  a refused step or a dead daemon. Run 31's numbers (A, cap 3, Studio-2): r1 spanned 41.30 s, shard 4 ran 23.19 s, class
+  2 1.31x fair, class 0 1.74x, class 1 1.89x. Send the result to w-balance (lands or records rejected).
+
+- w-balance (2026-11-21, goals 89a/86a "1,000 clients under 1 ms", main's ruling (c) of 2026-11-20): load_bench at
+  1,000 clients, current main against main before A-400 (57ff29e53, the parent of 496533e52), release, quiet box
+  (24+ idle cores), interleaved, three rounds, order alternating by round:
+    load_bench --tree <linux v7.4-rc1 (6628e7d4c)>/fs --clients 1000 --hot-files 800 --per-connection 32 --rounds 20
+      --reply-patience 60 --think-us Z      (Z = 50000 and 20000)
+  The same harness in both arms (perf's handoff, agents/perf-handoff-g257): copy main's
+  crates/client/examples/load_bench.rs into the pre-A-400 tree before its build; if it does not compile there, say so and
+  run each arm's own. Keep every run's `bound`, `offered`, `noise` and `latency_server` rows; check the arms' verdicts a
+  second match. Met for 89a: a 1,000-client level reads `met yes` at 10^3 verdicts a second or more. If not met, the
+  piece main ruled next is (a): a work whose client sits on its green's owner shard placed on another shard so the owner
+  runs verdicts alone; send it back to w-balance with the rows and I build (a) red first.
+
+## 2026-11-21, w-k90-a520: svn correctness by use on every route (goal 93; extends w-reaper's entry above; landed 013c0f0b, origin/main cec41123)
+- **What's new:** `SLATES_SVN_USE_ROUTE=svn|http|http-v1|ssh` on `a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve`
+  (svn by default). The control stays stock `svnserve -t` over FSFS. The slates leg is served on the named route:
+  - `svn`: the svn:// listener;
+  - `http`: the HTTP edge, HTTPv2;
+  - `http-v1`: the same edge, its clients (svn, svnrdump, svnsync) told to speak HTTPv1 with
+    `SVN_I_LIKE_LATENCY_SO_IGNORE_HTTPV2=1`;
+  - `ssh`: the SSH edge as svn+ssh with an enrolled ed25519 key (skips loudly without OpenSSH or ssh-keygen).
+- **Command** (release, repository root, stock svn 1.15 first on the PATH):
+  `PATH=/opt/homebrew/bin:$PATH SLATES_SVN_USE_ROUTE=<route> SLATES_SVN_USE_DUMP=<dump> cargo test --release -p slates-cli --test svn_interop -- --ignored a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve --nocapture`
+  Once per route (4) for each dump (2): 8 runs. Every verb is the default; add `SLATES_SVN_USE_REVISIONS=N` to cut
+  git-2000 down if a round must be shorter.
+- **Datasets:**
+  - `reads.dump`: `dump()` of crates/svn/fixtures/reads/make-fixtures.py (11 revisions, 24,865 B);
+    `python3 -I -c 'import importlib.util as u,sys; s=u.spec_from_file_location("m","crates/svn/fixtures/reads/make-fixtures.py"); m=u.module_from_spec(s); s.loader.exec_module(m); open(sys.argv[1],"wb").write(m.dump())' reads.dump`
+  - `git-2000.dump`: `crates/cli/bench/git_to_svn_dump.py <bare clone of git/git> master 2000` (458,114,318 B, as BENCHMARKS);
+    also at adas-macbook-pro-2 ~/.cache/w-svn-gitgit/git-2000.dump.
+- **Platforms:**
+  - macOS arm64: the big Studio (adas-mac-studio.local-2), the only fleet machine with stock svn 1.15
+    (/opt/homebrew/bin).
+  - Linux x86_64: the test asks for the 1.15 line, and Debian bookworm ships 1.14. It skips loudly there
+    ("no stock Subversion 1.15") unless a 1.15 svn, svnadmin, svnserve, svnrdump and svnsync are on the PATH.
+- **Check first:** no `skipping` line in the output (a skip passes the test).
+- **Owed first, main's focused case (main runs it; a red goes back to w-k90-a520):** the big Studio
+  (adas-mac-studio.local-2, stock svn 1.15 in /opt/homebrew/bin), reads.dump, verbs `log,diff`, each route once:
+  `for r in svn http http-v1 ssh; do PATH=/opt/homebrew/bin:$PATH SLATES_SVN_USE_ROUTE=$r SLATES_SVN_USE_DUMP=$PWD/reads.dump SLATES_SVN_USE_VERBS=log,diff cargo test --release -p slates-cli --test svn_interop -- --ignored a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve --nocapture; done`
+  Green: four passes with no `skipping` line. Landed on compile and fmt alone (main's call (c), 14:19): the Studio
+  didn't answer runs (r44, r2, r3); merged tree 83511fad: fmt clean and `--no-run` built on adacachy (r9).
+- **Red looks like:** `differences:`, then one entry per verb and revision: its first differing line and three lines of
+  each side (stock, then `slates over <route>`). Also a panic naming a step (import, policy, credential key, a
+  daemon edge's port). Each red goes to w-svn as a minimal red test, `inbox/w-svn-from-<runner>-<topic>.md`. Known
+  by reading, from clients' A-681 entry above: `propset --revprop` over HTTPv2 may be refused (no PROPPATCH on
+  !svn/rev/N).
+
+## w-bugs (A-837, descriptor backstop parts 1-2, landed 9fefaa054): Linux and Windows rounds
+- **Commands:** `cargo test -p slates-machine --lib a837` and `cargo test -p slates-machine --lib descriptors` (every
+  platform); `cargo test -p slates-machine --test descriptor_raise` (Linux: a child lowered to 64 raised to
+  min(hard, fs.nr_open)). Then a daemon's boot log: `grep descriptor_limit` shows `refused: false` and `after` raised.
+- **Platforms:** Linux (adacachy or fedora, ideally one under systemd's LimitNOFILE), Windows (jupiter).
+- **Green:** all pass; Windows' descriptor_limit line shows before = after = 16,777,216, nothing refused. **Red:** the
+  Linux child refused (setrlimit past fs.nr_open) or not raised; send it to w-bugs.
+
+## w-engine (A-579 (b), landed 596500613): (b)'s A/B against main without A-579 at Z = 20 ms
+- **Command:** two release `load_bench` binaries (`cargo build --release --locked -p slates-client --example load_bench`):
+  A = main with A-579 reverted (before 5d3733d2c's fold in turns), B = main. Alternate A B / B A, 5 rounds each, Z = 20
+  and 50 ms: `load_bench --tree <linux-v7.4-rc1/fs> --clients 1000 --hot-files 800 --per-connection 32 --rounds 20
+  --reply-patience 60 --think-us 20000|50000`; read the `latency_server` rows (SubmitAccepted, ReadHead p50/p99/p999/max).
+  The script w-engine used: `~/.cache/w-engine-scratch/p3-ab.sh <rounds> <Z...>` (this Mac).
+- **Platform:** macOS arm64 (the Studio), quiesced.
+- **Precondition:** main's own regression fixed first: SubmitAccepted server p50 0.29 ms at 4d0ad1674 against 184 ms at
+  1a35ab091 (Z = 50 ms), in the vcs_store C5 2b piece 3 window c1449f629..b3f674640 or its merges (946b60b2d,
+  99729edef, 1a35ab091's second parent); bisect logs `~/.cache/w-engine-p3-runs/bis-*.log`.
+- **Green:** B's Z = 20 ms SubmitAccepted p99 at or under A's (main's before A-579 measured 2.48-4.47 ms), p999/max no
+  worse, Z = 50 ms every kind's p99 under 1 ms. **Red:** B's Z = 20 p99 above A's in most rounds; send it to w-engine.
+
+## 2026-11-21 w-lint: the VCS suites lane on Linux didn't run (second failure, reported per the drop rule)
+- r30 (sync from Studio-2 onto adacachy2) sat at "starting" for over an hour; stopped.
+- r32 (sync false, fresh https clone into ~/w-lint-vcs on adacachy2) ran 1h 6m and ended with "the kiln runner closed
+  the connection". The clone never finished: ~/w-lint-vcs is broken ("your current branch appears to be broken") and no
+  log was written. No test ran.
+- Owner: the runner path (kiln / adacachy2's link), not a slates test. What I need: a working clone on a Linux x86_64
+  runner, or sync that completes. Next try: next round, from a fetch into a fixed path, with --depth 1.
+- Windows r31 dropped before it started (jupiter stopped answering); I resubmitted it once as r33, which is queued.
+- Windows, second failure: r33 (the one resubmit of r31) ended with "f766f09294f2... no longer has this run (its runner
+  restarted)". jupiter has no vcs-windows.log, and ~/w-lint-win is still at 02874580e, so the run died before its
+  fetch finished. No test ran. Owner: jupiter's runner link (the R2 tunnel), not a slates test. Next try is next round.
+
+## w-shared, the lane's proof, holder route (main's round, §8; main 2026-11-21 14:56): 320 and 512 MiB x 10, release
+- Tree: origin/main at or after 2f3147b50. Needs: macos, disk=20g (release target measured 758 MB), a Studio (it is
+  a benchmark; not this MacBook). Command (sync:false, log on the machine):
+  `src=$HOME/.cache/lane-proof-src; rm -rf "$src"; git clone -q --depth 2 https://github.com/hyper-light/slates.git "$src" && cd "$src";
+  export CARGO_TARGET_DIR=$HOME/.cache/lane-proof-target CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=8;
+  cargo test --release -p slates-server --test fleet bench_a697 --no-run;
+  for run in $(seq 1 10); do for mib in 320 512; do r=$(SLATES_A697_BENCH_FRESH=1 SLATES_A697_BENCH_MIB=$mib SLATES_A697_BENCH_RUNS=1
+  cargo test --release -p slates-server --test fleet bench_a697 -- --ignored --nocapture --test-threads=1 2>&1);
+  echo "run=$run mib=$mib $(echo "$r" | grep -a 'kind=holder' | grep -oE 'wall_ms=[0-9.]+|owner_step=[0-9.]+ms|beat_late=[0-9.]+ms/[0-9]+|forward=[0-9.]+ms' | tr '\n' ' ')
+  $(echo "$r" | grep -aoE 'shard [0-9]+ is spinning, [0-9]+ ms of CPU' | head -1)"; done; done`
+- Pass for the holder route: a `kind=holder` line every run at both sizes (the holder submit accepted) with
+  beat_late 0. The same run's local submit (the bench's second half) still exits 4 at 512 MiB until w-work-cow's
+  slicing lands: that is the local route's proof, a separate entry after it lands, not this one.
+- Last measured (kiln r2, Mac Studio-3, load 2-4, 5 rounds): holder 5/5 at 320 and 512, beat_late none.
+- 2026-11-21 (round at ed4661d40), Linux VCS lane failed again: r36 dropped (adacachy didn't answer in 15 s); its
+  resubmit r38 on adacachy2 ran 34 min and "the kiln runner closed the connection". ~/w-lint-vcs-shallow is broken (a
+  `git clone --depth 1` over https that never finished) and there's no log. Three tries this afternoon (sync, full clone,
+  shallow clone) have all died while the code was being brought to adacachy2. Owner: the runner path (adacachy2's
+  GitHub reach or kiln's link), not a slates test. What would unblock it: a working slates checkout on a Linux x86_64
+  runner that I may fetch into.

@@ -96,3 +96,37 @@ see inbox/main-from-w-shared-lane.md.
 (takeover_round.rs:259: the zero-budget round's slices [1, 1, ...] where it expects [2, 1, ...]) and
 a_kernel_that_cannot_bump_its_epoch_still_gets_every_inode_and_is_counted (:294: 41 slices, expects 40). The same on
 family three's branch, so not family three's. GAPS updated on main. Needs an owner; not on my list.
+
+## 14:15 PST CLOSED: the content-plane-vs-lane A/B (close-list "93 shared"), measured by A-826's interleaved A/B
+- The question was whether a holder's increment should cross the forward lane or the content plane. A-826 moved it to
+  the content plane; kiln r32 measured both on one machine, interleaved (65133486d lane vs 156007d content plane,
+  release, holder route, 2 full rounds before the runner restarted): wall 64 MiB 410-466 vs 319-408 ms, 128 MiB 810-863
+  vs 601-613 ms, 256 MiB 2.41-2.52 vs 1.25-1.29 s, 320 MiB 3.52-3.61 vs 1.51-1.53 s; 512 MiB refused Overloaded on the
+  lane, completed on the content plane (2.4 s). The content plane wins at every size; the lane no longer carries it.
+
+## 14:15 PST goal 93 "shared" status (every close-list item)
+- CLOSED: sleep-and-look families 1, 2, 3 (c5051eb51); exit 4 at 64 MiB; inputs held at B; A-697 f; content-plane A/B.
+- OPEN, mine, in order: the lane's proof (main's ruling: 320 and 512 MiB 10 of 10 on the release bench). The holder route
+  passes 320 and completes 512; the bench's LOCAL 512 MiB submit is killed by the watchdog (w-work-cow's slicing); the
+  holder route still nears the window (polls to 883 ms). Remaining steps from your 23:50 ruling: slicing what remains
+  (agents/w-shared-slice: first cut ec245f32e, kiln r1), then datagram batching, then the 10 x 5 proof.
+- BLOCKED: A-658 3c waits for the repository's store on the holders (A-767's "holders' changesets", owed by w-store).
+
+## 14:54 PST LANDED: the holder route's owner step halved, every late beat gone (main 2f3147b50; A-826 status lines)
+The owner no longer re-encodes/re-hashes an increment it holds by identity, and the fetched increment reaches the owner
+shard a chunk a call. Holder fleet tests 39/39. Release A/B, Mac Studio-3, load 2-4, 5 rounds (kiln r2, 1a35ab0 vs
+0deb19a), before -> after:
+| MiB | owner step | late beat | wall |
+|---|---|---|---|
+| 256 | 256-267 -> 136-144 ms | none both | 1.03-1.07 -> 0.79-0.87 s |
+| 320 | 327-353 -> 168-203 ms | 0.52-0.57 s in 5/5 -> none | 1.21-1.33 -> 0.93-1.01 s |
+| 512 | 502-594 -> 270-299 ms | 0.74-0.85 s in 5/5 -> none | 1.98-2.06 -> 1.46-1.57 s |
+The holder route completed 5/5 at every size both ways. The bench's whole-run pass at 512 MiB (2/5 before, 3/5 after)
+fails only on the LOCAL 512 MiB submit's one step (1.05-1.09 s of CPU, shard 0): w-work-cow's slicing.
+Remaining for the lane's proof (320/512 10/10): w-work-cow's local-submit slicing, then the 64-512 MiB x 10 proof
+run; datagram batching after, measured. Post-landing check: kiln r3.
+
+## 14:56 PST CLOSED: the lane's ~200 MB/s (close-list "93 shared"), per main 14:56
+A holder's increment crosses on the content plane (A-826) at about 800 MB/s (512 MiB: forward incl. the owner's fetch
+0.58-0.67 s, kiln r2, Mac Studio). Datagram batching dropped (main: not needed). The 10x10 proof is main's round:
+the holder route's entry is in run-requests.md; the local route's follows w-work-cow's slicing.

@@ -71,3 +71,26 @@ Brief: briefs/w-realtools.md. Clone: ~/slates-work/w-realtools (object store), w
   filed in run-requests.md. Stopped. Notes: kiln's sync to adas-mac-studio.local-2 failed 3x (r16, r17, r19), so r20 ran
   with sync:false, cloning a pushed branch (agents/w-realtools-93, deleted after landing). Shallow checkout
   ~/slates-work/w-realtools-93 is kept for a fix if the jupiter round finds my test at fault.
+- 2026-11-21 ~12:20 PST, re-examining my brief: two of its lines were short.
+  1. "#pragma once with clang AND gcc where present": the test ran only `cc`. Fixed in 1d14aa65: one C file and one
+     FIFO gate per compiler on the PATH (clang, gcc, cc).
+  2. "update the design section, its status line and GAPS": my test landings updated GAPS only. 69a06d89 adds a status
+     line under A-781 naming the acceptance flows.
+  Both are on branch agents/w-realtools-93. Not on main yet: the focused macOS run (the pragma test with
+  SLATES_TEST_CLI=1) hasn't run, because kiln can't reach Studio-2 or adas-mac-studio.local-2 at all right now (r1, r2
+  and two one-line probes: "did not answer in 15s").
+- 13:30 PST: FINDING by use (inbox/main-from-w-realtools-nfs-opendir.md): a fresh slates NFS mount stalls its first
+  opendir on Studio-2 (2/2) and Studio-4; the client sends FSSTAT over and over and never READDIR or CREATE. Added the
+  300 s bounds (7acdf392), so the test now fails in 305 s naming the stall instead of hanging. Branch
+  agents/w-realtools-93 (1d14aa65, 69a06d89, 7acdf392) waits for one green run on a Mac where mounts work (asked main
+  about adas-macbook-pro-2). r14 (the same test at 9793d9218 on Studio-2, to tell a regression from the host) is lost
+  while Studio-2 doesn't answer; I check for and clean any mount it left.
+- 16:05 PST: LANDED 7acdf392 (+ 1d14aa65, 69a06d89) and GAPS 7e1657ac7; green on adas-macbook-pro-2 in 29.32 s.
+  Branch agents/w-realtools-93 deleted. Studio-2 checked clean (r14 left nothing). The Studio stall is g224's.
+  Nothing of my brief, close list or goal-93 piece is left open on my side; the Linux, Windows and jupiter runs are
+  main's (run-requests.md).
+- 15:52 PST (main): recorded. I'm in goal 93's reserve: start no runs. Linux/Windows rounds are main's; jupiter goes
+  through w-k90-win. Leftovers (not deleted, since that needs a kiln run): ~/.cache/w-realtools-93 and
+  ~/.cache/w-realtools-93-target.noindex on adas-macbook-pro-2, Adas-Mac-Studio-2 and adas-mac-studio.local-2 (debug
+  targets, delete freely); ~/.cache/w-realtools-clone on adas-macbook-pro-2; on Studio-4 the shallow checkout
+  ~/slates-work/w-realtools-93 (210 MB) and this state folder.
