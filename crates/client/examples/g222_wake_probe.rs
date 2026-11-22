@@ -98,15 +98,15 @@ fn main() {
     )
   };
   assert!(base != libc::MAP_FAILED, "mmap");
+  let base = base as usize;
   let word = |i: usize| -> &'static AtomicU32 {
     // SAFETY: inside the mapping, aligned, zeroed, live for the process.
-    unsafe { &*(base.cast::<u8>().add(i * 2 * page).cast::<AtomicU32>()) }
+    unsafe { &*((base as *mut u8).add(i * 2 * page).cast::<AtomicU32>()) }
   };
   let ack = |i: usize| -> &'static AtomicU32 {
     // SAFETY: as above, the second page of the pair.
     unsafe {
-      &*(base
-        .cast::<u8>()
+      &*((base as *mut u8)
         .add((i * 2 + 1) * page)
         .cast::<AtomicU32>())
     }
