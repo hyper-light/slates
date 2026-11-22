@@ -208,6 +208,14 @@ impl<T: crate::migration::TextSource + ?Sized> TextDeltas for crate::migration::
   }
 }
 
+/// Records standing alone hold their texts apart, as a daemon's do ([`crate::migration::Standalone`]): no delta the view
+/// can name, every text `PLAIN`.
+impl TextDeltas for crate::migration::Standalone {
+  fn text_delta(&self, _identity: &ContentIdentity) -> Option<StoredDelta<'_>> {
+    None
+  }
+}
+
 impl TextDeltas for crate::migration::Repository {
   fn text_delta(&self, identity: &ContentIdentity) -> Option<StoredDelta<'_>> {
     let (base, bytes) = crate::migration::Repository::text_delta(self, identity)?;

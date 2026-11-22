@@ -25,9 +25,9 @@
 //! is deltified again later. Property lists are kept whole and read in place ([`Repository::content`]). Records a
 //! daemon keeps hold no text: since C2 stage B part 2 (b) every text there is named stored, its bytes its changeset's on
 //! the node's store, and the daemon refuses a log that carries texts inline. Records standing alone hold theirs apart
-//! the same way ([`super::Standalone`], the KeptText move's first piece: the migration tests); what still commits into
-//! bare records (the tests of this keeping, the crate's integration tests and examples, some server tests) keeps them
-//! here until the move's second piece, and the third removes this keeping.
+//! the same way ([`super::Standalone`], the KeptText move; the crate's tests, integration tests and benches, and the
+//! server's tests); only the tests of this keeping and the changeset A/B example still commit into bare records, and
+//! the move's third piece removes this keeping.
 //!
 //! A repository is also the drive's [`Green`] (A-617): it reads the texts and property lists it holds and names new
 //! ones as it keeps them, so a client's drive and its commit run over one set of records.

@@ -510,6 +510,9 @@ fn landed(
     revision.author().map(str::to_owned),
   );
   let mut next = records.clone();
+  let mut revision = revision;
+  // A text the work carries whole held apart too, as the owner's landing stores it (the KeptText move).
+  stored.borrow_mut().extend(next.take_texts(&mut revision));
   let checked = next
     .check_work(revision, &locks, now)
     .map_err(Unlanded::Step)?;
@@ -580,6 +583,15 @@ impl SvnStores for Lends {
       return None;
     }
     let mut next = self.created.current.get().clone();
+    // Its texts held apart, as the owner's landing puts them on the node's store (the KeptText move).
+    let record = match record {
+      slates_svn::commit::record::Record::Revision(mut revision) => {
+        let taken = next.take_texts(&mut revision);
+        self.created.stored.borrow_mut().extend(taken);
+        slates_svn::commit::record::Record::Revision(revision)
+      }
+      other => other,
+    };
     Some(match next.commit_record(record) {
       Ok(()) => {
         self.created.current.set(Box::leak(Box::new(next)));

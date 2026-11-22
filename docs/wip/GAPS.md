@@ -3086,8 +3086,11 @@
 > (`a_log_holding_a_retired_record_or_inline_texts_is_refused_typed_at_rebuild`); `KeptText` stays for records
 > standing alone, which a daemon's no longer reach (the KeptText move, main's 10:35 item 3, three pieces: (1) BUILT
 > 2026-11-21, `migration::Standalone` holds standing-alone records' texts apart, named stored, as a daemon's are, and
-> the migration tests run on it (`Repository::take_texts`, shared with the server's landing); (2) owed: the crate's
-> integration tests and examples, `vcs_ssh`'s, the presenter's and `vcs_store`'s tests that commit into bare records;
+> the migration tests run on it (`Repository::take_texts`, shared with the server's landing); (2) BUILT 2026-11-21:
+> `fsfs_view` and `propfind_allocations`, `replay_bench` and `fsfs_view_bench`, `vcs_ssh`'s svn tests (a landed
+> revision's texts held apart) and the presenter's (its texts in a content store, as a node's are); the FSFS view over
+> them writes every text `PLAIN`, as the presenter's does (the stock `svnadmin` reading of it is main's run: no svn on
+> the Mac); `changeset_ab` reads the records' own deltas and waits on main's call (retire, or derive its deltas);
 > (3) owed: `KeptText`, its delta chains and window reads removed from the records, with the 7 step tests of them).
 > Stage C,
 > an import as one sliced changeset (today a changeset a record). A submitted version's revision (`svn_made`) takes the
