@@ -372,7 +372,9 @@ impl SpawnedChild {
   }
 }
 
-#[cfg(test)]
+// macOS alone: the race the test holds open (a descriptor between `pipe` and its `fcntl`) is macOS's, so the whole
+// module, its imports with it, is gated as its one test is.
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
   use std::io::Read;
   use std::os::fd::AsFd;
@@ -385,10 +387,8 @@ mod tests {
   /// pipe, to list the descriptors it holds. Expect: none but its standard streams (and the one its listing opens),
   /// never the held pipe's; and it exits 0.
   /// Shape: the descriptor number the held pipe's end is moved to, far past what the test process and `ls` open.
-  #[cfg(target_os = "macos")]
   const HELD_AT: i32 = 77;
 
-  #[cfg(target_os = "macos")]
   #[test]
   fn a_child_holds_only_the_streams_its_spawn_names() {
     let (_held_read, pipe_write) = std::io::pipe().unwrap();

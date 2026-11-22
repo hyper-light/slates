@@ -644,6 +644,11 @@ impl Repository {
     self.depth.limit()
   }
 
+  /// The longest object its packs hold (A-859): what reading a stored entry's data is held to.
+  pub(super) fn largest_object(&self) -> u64 {
+    self.largest
+  }
+
   fn count(&self, change: impl FnOnce(&mut StoreCounters)) {
     let mut counters = self.counters.get();
     change(&mut counters);
@@ -737,6 +742,26 @@ impl Repository {
       map_entries: u64::try_from(entries).unwrap_or(u64::MAX),
       charged: self.charged,
     }
+  }
+
+  /// The object the entry at `place` of a held pack resolves to, whatever its length (A-859: a stored delta's base, read
+  /// to name it and to check the delta against it): its type and bytes; none where it is not read.
+  pub(super) fn read_entry(&self, store: &ContentStore, place: InPack) -> Option<(Kind, Vec<u8>)> {
+    let bases = IndexBases {
+      repository: self,
+      store,
+    };
+    let mut out = Vec::new();
+    let mut reading = self.reading.borrow_mut();
+    let kind = packed::read(
+      store,
+      (place, self.format),
+      &bases,
+      (&mut *reading, self.largest),
+      &mut out,
+    )
+    .ok()?;
+    Some((kind, out))
   }
 
   /// The bytes of the indexed object whose row is `row`, naming `content` ([`Repository::read_stored`]).
