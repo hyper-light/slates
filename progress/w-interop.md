@@ -485,3 +485,14 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   (red: "960 turns for 8081 quanta", 1 in 3 alone at load ~40) replaced by: units >= files, turns > 1, more_quanta moved,
   ceiling and budget bounds, and a fetch of the head holding every object both pushes brought. Load 41-47: t_a752 4/4
   alone; git_push:: vcs_store:: 153/153 twice; check --tests clean on the merged main.
+- LEDGER UPDATE (2026-11-22 ~11:00 PST, main's reads at 10:41):
+  - hg whole history: CI 45035748539 (b61a5934f) 17/24, push-all PastAdmission at Manifests; CI 45037561866 (89d75e30b,
+    w-hg's manifest fix) 20/24 on all three legs, push-all PASS (515 s arm, 797/764 s x86), peak RSS 5.8 GB; the spin
+    is back with the whole history (4 spins and kills a leg, vcs_http.rs:850 and vcs_ssh::hg::streamed_turn), red
+    clone-rev/stream-clone/ssh-clone: w-hg's next piece. ssh-push's red was the harness's.
+  - LANDED f3d43a944 (main ed6d6efc2): hg-matrix.sh ssh-push from its own working copy (`a` cloned on disk into `f`),
+    never ssh-clone's `e`. Focused: debug slates, hg 7.2, 60 changesets: 24/24; ssh-clone forced red: old row FAIL
+    "cd: e" at 0 s, new PASS.
+  - git/git verbs at 2acbba249 (main's r17): 25/25 (2,847 s). git/git whole still red (mirror clone killed past 120 s;
+    w-git's CRC32 reuse).
+  - svn: an old kiln r3 (binary 1a35ab091, pre-d843d2325) red revprop-http, stale; ledger 33/33 stands.
