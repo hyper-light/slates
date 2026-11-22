@@ -35,4 +35,4 @@ jobs:
         run: cargo test --locked -p slates-cli --no-run
       - name: the FUSE test whose mount HeldMount::unmount unmounts
         timeout-minutes: 30
-        run: cargo test --locked -p slates-cli --test cli -- --exact a_closed_files_writes_survive_a_kill_from_the_write_log_alone --nocapture 2>&1 | grep -E '^test |test result|skipping|panicked' ; exit ${PIPESTATUS[0]}
+        run: SLATES_TEST_CLI=1 cargo test --locked -p slates-cli --test cli -- --exact a_closed_files_writes_survive_a_kill_from_the_write_log_alone a_fuse_mount_survives_its_daemons_kill_with_its_open_files_usable --nocapture 2>&1 | grep -E '^test |test result|skipping|panicked|assert' ; exit ${PIPESTATUS[0]}
