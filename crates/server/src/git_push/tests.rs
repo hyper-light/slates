@@ -3090,3 +3090,167 @@ fn t_a767_c5b_a_push_whose_homing_no_edge_takes_is_refused() {
     );
   });
 }
+
+/// A pack as stock git's client sends a history: `objects` in order, each whole but the blobs after the first, each a
+/// REF_DELTA against the blob before it (`slates_git::store::delta_of`), every entry's data in stored zlib blocks.
+fn deltified_pack(objects: &[(slates_git::object_name::Kind, Vec<u8>)]) -> Vec<u8> {
+  use slates_git::entry::{self, Header, Representation};
+  use slates_git::object_name::Kind;
+  let mut pack = Vec::new();
+  let count = u32::try_from(objects.len()).unwrap();
+  let mut writer = slates_git::pack::Writer::new(ObjectFormat::Sha1, count, &mut pack);
+  let mut at = entry::PACK_HEADER_LEN;
+  let mut previous: Option<&Vec<u8>> = None;
+  for (kind, content) in objects {
+    let delta = match (kind, previous) {
+      (Kind::Blob, Some(base)) => slates_git::store::delta_of(base, content).map(|delta| {
+        let base = slates_git::object_name::name_of(ObjectFormat::Sha1, Kind::Blob, base).unwrap();
+        (base, delta)
+      }),
+      _ => None,
+    };
+    let (header, data) = match delta {
+      Some((base, delta)) => (
+        Header {
+          representation: Representation::RefDelta { base },
+          size: u64::try_from(delta.len()).unwrap(),
+        },
+        stored_zlib(&delta),
+      ),
+      None => (
+        Header {
+          representation: Representation::Whole(*kind),
+          size: u64::try_from(content.len()).unwrap(),
+        },
+        stored_zlib(content),
+      ),
+    };
+    if *kind == Kind::Blob {
+      previous = Some(content);
+    }
+    entry::write(header, at, &mut writer).unwrap();
+    slates_git::out::Out::put(&mut writer, &data);
+    at += entry::written_len(header, at).unwrap() + u64::try_from(data.len()).unwrap();
+  }
+  writer.finish().unwrap();
+  pack
+}
+
+/// Format: what an entry may carry past the pushed one's bytes when it is sent on (A-859): its header written again,
+/// at most a type-and-size's varint and an offset's (ten bytes each for a 64-bit value), and a reference delta's base
+/// named by its id in place of an offset (twenty bytes, SHA-1).
+const REUSED_ENTRY_SLACK: usize = 10 + 10 + 20;
+
+/// A-859 (main's ruling of 2026-11-22 03:38; found by use: a git/git clone from slates moved 4-5 GiB where stock git's pack
+/// is about 300 MB, every object sent whole and uncompressed: 160 of 160 whole at unit scale). Do: push a line of
+/// [`TAGGED_LINE`] commits of a growing file and a tag of each, its pack as stock git sends one (each blob after the first
+/// a delta against the one before); clone every ref whole before any version is encoded (the stream's loose stage), then
+/// encode its versions and clone again (from the kept fragments). Expect: each clone's pack at most the pushed pack's
+/// bytes plus [`REUSED_ENTRY_SLACK`] an object (each pushed entry sent on as it lies), printing both; the stream and the
+/// encoding each counting entries reused whole and deltas reused, none refused; each clone whole, every object once. Red
+/// before: every object whole and uncompressed, the clone near the objects' raw size.
+#[test]
+fn t_a859_a_clone_of_a_deltified_push_sends_its_entries_as_they_lie() {
+  use slates_git::object_name::Kind;
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
+    let repository = git_repository(state, "reused");
+    let mut objects = Vec::new();
+    let mut commits = Vec::new();
+    let mut parent = None;
+    for at in 0..TAGGED_LINE {
+      let (commit, made) = growing_commit(at, parent);
+      objects.extend(made);
+      commits.push(commit);
+      parent = Some(commit);
+    }
+    let mut named: Vec<(ObjectId, Vec<u8>)> =
+      vec![(*commits.last().unwrap(), b"refs/heads/main".to_vec())];
+    for (at, commit) in commits.iter().enumerate() {
+      let name = format!("v{at}");
+      let (tag, bytes) = tag_object(&name, (*commit, "commit"));
+      objects.push((Kind::Tag, bytes));
+      named.push((tag, format!("refs/tags/{name}").into_bytes()));
+    }
+    named.sort_by(|one, other| one.1.cmp(&other.1));
+    let pack = deltified_pack(&objects);
+    let ids: Vec<String> = named.iter().map(|(id, _)| id.to_string()).collect();
+    let commands: Vec<(&str, &str, &[u8])> = named
+      .iter()
+      .zip(&ids)
+      .map(|((_, name), id)| ("", id.as_str(), name.as_slice()))
+      .collect();
+    let received = pushed(state, repository, &request(&commands, CAPABILITIES, &pack));
+    assert!(
+      reasons(&received).iter().all(|reason| reason == b"ok"),
+      "{:?}",
+      received.outcomes
+    );
+    while crate::vcs_store::git_derive::turn(state, repository)
+      != crate::vcs_store::git_derive::Turned::Idle
+    {}
+    let wants: Vec<ObjectId> = named.iter().map(|(id, _)| *id).collect();
+    let fetch = crate::vcs_store::upload::tests::fetch(&wants, &[]);
+    let bound = pack.len() + objects.len() * REUSED_ENTRY_SLACK;
+    // Cloned before any version is encoded: every object from the stream's loose stage.
+    let (streamed, counted_streamed) =
+      crate::vcs_store::upload::tests::fetched_with_counters(state, (repository, &owner()), &fetch);
+    let streamed = crate::vcs_store::upload::tests::pack_of(&streamed);
+    eprintln!(
+      "A-859 before encoding: pushed pack {} bytes, clone pack {} bytes; {counted_streamed:?}",
+      pack.len(),
+      streamed.len()
+    );
+    assert!(
+      streamed.len() <= bound,
+      "the streamed clone's pack {} past {bound}",
+      streamed.len()
+    );
+    assert!(
+      counted_streamed.reused_whole > 0
+        && counted_streamed.reused_deltas > 0
+        && counted_streamed.reuse_refused == 0,
+      "{counted_streamed:?}"
+    );
+    assert_whole_clone(&streamed, objects.len());
+    while crate::vcs_store::git_encode::turn(state, repository)
+      != crate::vcs_store::git_encode::Turned::Idle
+    {}
+    let (answer, counted) =
+      crate::vcs_store::upload::tests::fetched_with_counters(state, (repository, &owner()), &fetch);
+    let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+    let reused = (
+      count(crate::vcs_store::git_encode::REUSED_WHOLE),
+      count(crate::vcs_store::git_encode::REUSED_DELTAS),
+      count(crate::vcs_store::git_encode::REUSE_REFUSED),
+    );
+    let raw: usize = objects.iter().map(|(_, bytes)| bytes.len()).sum();
+    let clone = crate::vcs_store::upload::tests::pack_of(&answer);
+    eprintln!(
+      "A-859: pushed pack {} bytes, clone pack {} bytes, objects' raw {raw}; reused (whole, deltas, refused) {reused:?}; {counted:?}",
+      pack.len(),
+      clone.len()
+    );
+    assert!(
+      clone.len() <= bound,
+      "the clone's pack {} past {bound}",
+      clone.len()
+    );
+    assert!(reused.0 > 0 && reused.1 > 0 && reused.2 == 0, "{reused:?}");
+    assert_whole_clone(&clone, objects.len());
+  });
+}
+
+/// `pack` is a whole pack of `objects` objects, each once, every delta resolved to its object (read as `index-pack`
+/// reads one).
+fn assert_whole_clone(pack: &[u8], objects: usize) {
+  let unpacked = slates_git::unpack::read_whole(
+    pack,
+    ObjectFormat::Sha1,
+    &slates_git::unpack::NoIndex,
+    &mut slates_git::Admission::new(u64::MAX),
+  )
+  .expect("a whole pack");
+  let fetched: std::collections::BTreeSet<ObjectId> =
+    unpacked.objects.iter().map(|object| object.id).collect();
+  assert_eq!((unpacked.objects.len(), fetched.len()), (objects, objects));
+}

@@ -252,6 +252,18 @@ impl Scratch {
     &mut self.recent
   }
 
+  /// What it holds now (the memory status's gauges): its buffers' room, and the bytes of the objects read lately.
+  pub fn held(&self) -> (u64, u64) {
+    let room = [&self.built, &self.next, &self.delta, &self.header]
+      .iter()
+      .map(|buffer| buffer.capacity())
+      .fold(0usize, usize::saturating_add);
+    (
+      u64::try_from(room).unwrap_or(u64::MAX),
+      u64::try_from(self.recent.bytes).unwrap_or(u64::MAX),
+    )
+  }
+
   /// Gives back every buffer's room past `keep` bytes: the work's working set, learned by its caller (MEMORY SIZING:
   /// nothing stays resident because a past object was large).
   pub fn shrink(&mut self, keep: usize) {
@@ -398,13 +410,13 @@ fn each_window_from(
   Ok(())
 }
 
-/// Inflates `link`'s data into `out`, exactly its size.
+/// Inflates `link`'s data into `out`, exactly its size: where its compressed data ends in the pack.
 fn inflate_into(
   store: &dyn PackSource,
   link: Link,
   room: u64,
   out: &mut Vec<u8>,
-) -> Result<(), PackedRefused> {
+) -> Result<u64, PackedRefused> {
   if link.size > room {
     return Err(PackedRefused::PastRoom { size: link.size });
   }
@@ -461,5 +473,48 @@ fn inflate_into(
   if !ended || filled != size {
     return Err(PackedRefused::Size { at });
   }
-  Ok(())
+  Ok(link.data.saturating_add(inflater.total_in()))
+}
+
+/// An entry of a held pack as it lies there (A-859, git's pack reuse): how it holds its object, the size its header
+/// names, where its compressed data begins and where it ends, so the entry's data can be sent on as it was received.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawEntry {
+  /// How it holds its object: whole of a type, or a delta against its base (an OFS_DELTA's base where that entry
+  /// begins in the same pack, a REF_DELTA's by its name).
+  pub representation: Representation,
+  /// The size its header names: the object's, or the delta's.
+  pub size: u64,
+  /// Where its compressed data begins in the pack, past its header.
+  pub data: u64,
+  /// Where its compressed data ends: the next byte past it.
+  pub end: u64,
+}
+
+/// The entry at `place` in a held pack as it lies there ([`RawEntry`], A-859): its header read, and its data inflated
+/// once into `scratch` (its size, held to `room` first) to find where it ends and that it inflates whole to its header's
+/// size. Refused as [`read`] refuses an entry it cannot take.
+pub fn raw_entry(
+  store: &dyn PackSource,
+  (place, format): (InPack, ObjectFormat),
+  (scratch, room): (&mut Vec<u8>, u64),
+) -> Result<RawEntry, PackedRefused> {
+  let mut header = Vec::new();
+  let (found, data) = header_at(store, place, format, (&mut header, room))?;
+  let end = inflate_into(
+    store,
+    Link {
+      entry: place,
+      data,
+      size: found.size,
+    },
+    room,
+    scratch,
+  )?;
+  Ok(RawEntry {
+    representation: found.representation,
+    size: found.size,
+    data,
+    end,
+  })
 }

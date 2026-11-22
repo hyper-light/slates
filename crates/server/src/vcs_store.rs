@@ -603,6 +603,59 @@ impl VcsStores {
     self.content.as_ref()
   }
 
+  /// The memory status's gauges for the repositories' stores (main's ruling of 2026-11-22 03:46): the content store's
+  /// census (`ContentStore::census`), and over every git repository its read scratch, the objects it read lately, its
+  /// maps' entries and the heads of its greens' maps. A walk of the content store's entries, so only a memory status
+  /// asks.
+  pub(crate) fn memory_rows(&self) -> Vec<(&'static str, u64)> {
+    let mut rows = Vec::new();
+    if let Some(content) = &self.content {
+      let census = content.census();
+      rows.extend([
+        ("mem.gauge.vcs_content.stored", census.stored),
+        ("mem.gauge.vcs_content.stored_bytes", census.stored_bytes),
+        ("mem.gauge.vcs_content.away", census.away),
+        ("mem.gauge.vcs_content.away_bytes", census.away_bytes),
+        ("mem.gauge.vcs_content.here_windows", census.here_windows),
+        (
+          "mem.gauge.vcs_content.here_window_bytes",
+          census.here_window_bytes,
+        ),
+        ("mem.gauge.vcs_content.lists", census.lists),
+        ("mem.gauge.vcs_content.list_bytes", census.list_bytes),
+        ("mem.gauge.vcs_content.tables", census.tables),
+        ("mem.gauge.vcs_content.table_bytes", census.table_bytes),
+        ("mem.gauge.vcs_content.derived", census.derived),
+        ("mem.gauge.vcs_content.derived_bytes", census.derived_bytes),
+        ("mem.gauge.vcs_content.objects", census.objects),
+        ("mem.gauge.vcs_content.used_bytes", census.used),
+        ("mem.gauge.vcs_content.charged_bytes", census.charged),
+      ]);
+    }
+    let mut git = slates_git::store::RepositoryHeld::default();
+    let (mut repositories, mut heads) = (0u64, 0u64);
+    for store in self.entries.values() {
+      if let RepositoryStore::Git(store) = store {
+        let held = store.repository.held();
+        git.scratch = git.scratch.saturating_add(held.scratch);
+        git.recent = git.recent.saturating_add(held.recent);
+        git.map_entries = git.map_entries.saturating_add(held.map_entries);
+        git.charged = git.charged.saturating_add(held.charged);
+        repositories = repositories.saturating_add(1);
+        heads = heads.saturating_add(u64::try_from(store.heads.len()).unwrap_or(u64::MAX));
+      }
+    }
+    rows.extend([
+      ("mem.gauge.git.repositories", repositories),
+      ("mem.gauge.git.scratch_bytes", git.scratch),
+      ("mem.gauge.git.recent_bytes", git.recent),
+      ("mem.gauge.git.map_entries", git.map_entries),
+      ("mem.gauge.git.charged_bytes", git.charged),
+      ("mem.gauge.git.green_heads", heads),
+    ]);
+    rows
+  }
+
   /// The content store, lent for one step that gives back what something beside a repository's
   /// store holds in it: a hook's view, whose holds outlive no repository entry
   /// (`crate::git_hooks`, A-665 part 2).
