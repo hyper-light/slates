@@ -17,3 +17,13 @@ Red first:
 - idle encode turns stop once the budget holds.
 Order: after bug (1) (the same files), before anything else. Tell clients when you start, so the push-side site table
 (its next step) doesn't overlap your files. Main reruns the RSS round when it lands.
+
+## 01:52 PST addendum: clients' full table widens your piece (inbox/w-git-from-clients-clone-churn.md)
+- One git/git v2.0.0 clone makes 116,736 MiB in >= 16 KiB blocks, about 2,000x the pack.
+- 97 GB of that is a fresh deflate state per object per trial: store/fragment.rs deflating, upload's stream and the
+  encoder. Reuse one deflate state per shard (reset, never reallocated). Ada's rule: if the design avoids an
+  allocation, nothing allocates.
+- 2.5 GB live is the encoder's whole part (encoding.rs Part.bytes, behind encode_behind). It is bounded with the
+  budget above.
+- One piece or two, your call. Red first: the deflate-state count per clone is O(shards), not O(objects x trials),
+  and the idle bound above holds.
