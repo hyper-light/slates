@@ -401,8 +401,10 @@ mod tests {
   #[cfg(target_os = "linux")]
   const CLOSE_SEEN_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
 
-  /// Waits until `socket` reads its peer's close (a peek answers zero bytes), within [`CLOSE_SEEN_WITHIN`]; answers
-  /// the last peek.
+  /// Waits until `socket` reads its peer's close (a peek answers zero bytes), within [`CLOSE_SEEN_WITHIN`]: each look
+  /// that finds it open waits on the socket's own readiness (a close makes it readable) for the rest of the bound, so
+  /// the wait ends as the close lands, never on a timer of its own. Answers the last peek; one that finds the socket
+  /// still open at the bound, or holding bytes (no close then), is the caller's failure.
   #[cfg(target_os = "linux")]
   fn peer_close_seen(socket: std::os::fd::BorrowedFd<'_>) -> rustix::io::Result<(usize, usize)> {
     let deadline = Instant::now() + CLOSE_SEEN_WITHIN;
@@ -413,10 +415,17 @@ mod tests {
         &mut byte,
         rustix::net::RecvFlags::PEEK | rustix::net::RecvFlags::DONTWAIT,
       );
-      if matches!(read, Ok((0, _))) || Instant::now() >= deadline {
+      let left = deadline.saturating_duration_since(Instant::now());
+      if !matches!(read, Err(rustix::io::Errno::AGAIN)) || left.is_zero() {
         return read;
       }
-      std::thread::sleep(std::time::Duration::from_millis(1));
+      let mut interest = [rustix::event::PollFd::new(
+        &socket,
+        rustix::event::PollFlags::IN | rustix::event::PollFlags::RDHUP,
+      )];
+      let timeout = rustix::event::Timespec::try_from(left).ok();
+      // Readable, timed out or interrupted: the next look decides; an error here only shortens the wait.
+      let _ = rustix::event::poll(&mut interest, timeout.as_ref());
     }
   }
 
