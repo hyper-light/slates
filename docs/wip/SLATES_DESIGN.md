@@ -16570,7 +16570,12 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > class's fetch p50 and p99 against its fetch alone. The harnesses' daemons get their own `--vcs-store` (push_load's
 > `Daemon`), without which no git repository could be made since A-767 C5. Proved locally (debug, M-series Mac): a
 > push alone 2.3 s and a fetch alone 10.3 s of git/git v0.99 (4,507 objects), both whole; the steps are main's rounds.
-> Owed: Mercurial and Subversion repositories in the mix.
+> Mercurial and Subversion (main's ruling of 21:35, option (a)): `crates/cli/bench/multi_repo_stock.py SLATES hg|svn`,
+> the stock clients driving the same classes (each a git/git revision's tree): every repository seeded by its own
+> working copy, then Zipf-skewed pushes of one small changeset each from that copy, one after another, beside
+> Zipf-skewed fresh clones or checkouts; its bounds derived from the alone runs (a clone's bytes against the scratch
+> disk's free bytes, a client's peak resident set against free memory). Proved for hg locally (debug, M-series Mac,
+> R = 1 and 2: every push and fetch whole, 1.0x to 1.2x alone); svn runs on the big Studio, main's round.
 
 > **Status (2026-11-21, CPU: the open decision; main's ruling of 17:22).** A shard's CPU is divided among its
 > repositories by equal-weight deficit round robin (`vcs_share::turns`, A-724 piece 3c: one turn a repository a round,
