@@ -140,7 +140,7 @@ fn recovered(
   };
   for bytes in &durable.chain {
     let entry = durable.decode(bytes);
-    let version = green.apply_recorded(&entry.increment, &entry.applied);
+    let version = green.apply_recorded(&mut entry.increment.clone(), &entry.applied);
     assert_eq!(
       entry.completion,
       completion_for(version),

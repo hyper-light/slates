@@ -456,7 +456,10 @@ impl Pair {
       .owner
       .commit_judged(held)
       .map_err(|moved| TestCaseError::fail(format!("{moved:?}")))?;
-    prop_assert_eq!(self.copy.apply_recorded(inc, &applied), version);
+    prop_assert_eq!(
+      self.copy.apply_recorded(&mut inc.clone(), &applied),
+      version
+    );
     prop_assert_eq!(
       seen(&mut self.copy),
       seen(&mut self.owner),
@@ -882,7 +885,7 @@ impl Concurrent {
           "the chain ends before the owner's head",
         ));
       };
-      let version = self.copy.apply_recorded(inc, applied);
+      let version = self.copy.apply_recorded(&mut inc.clone(), applied);
       prop_assert_eq!(
         version,
         self.copy.head(),
