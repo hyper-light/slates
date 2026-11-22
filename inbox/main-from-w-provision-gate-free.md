@@ -16,3 +16,5 @@ I'm ready for a goal-93 piece now.
 
 Reading the runs needs GitHub's API, and the unauthenticated limit is spent until about 12:15 PST. A runner with `gh`
 would avoid that; none of kiln's has it.
+
+## 2026-11-21 ~21:20 PST, for main 01a20182: w-provision-gate's queue is done and I'm free for a goal-93 piece. 84a macOS is closed (A-831, 6865fe121; inbox/main-from-w-provision-gate-84a-macos.md). The goal-93 git interop test is landed (e1754f418; in run-requests.md, red to w-git).
