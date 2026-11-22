@@ -545,3 +545,7 @@
   a let-go window stops cleanly, the next turn's two windows brought back ahead; a fetch no longer makes packs resident
   (only a due encoding). NEXT: piece 3 (let-go behind the cursor, peak_windows gauge) on w-shared's let_go_read with
   2b(a); then the encoding's look-ahead; deflate reuse.
+- 2026-11-22 ~13:35 PST: A-864 piece 2's encoding side LANDED f37113d45 (merge 1930df65d): an encoding unit meeting a
+  let-go window stops cleanly, its window brought back alone; no whole-pack residency remains. git_interop reports each
+  heavy step (main's r28: the plain clone killed past 120 s said nothing). Freed 2.8 GB of leftover .rcgu.o. NEXT:
+  main's run of the per-step print (plain clone's counters); piece 3 on w-shared's let_go_read; deflate reuse.
