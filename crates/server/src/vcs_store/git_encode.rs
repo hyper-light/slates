@@ -522,6 +522,18 @@ fn encode_behind(state: &mut ShardState, id: RepositoryId) {
   }
 }
 
+/// The units repository `id`'s encoding under way has done (none when none is under way): a test's sign that its turns
+/// progress (`vcs_store::upload::tests`'s judge of a drive).
+#[cfg(test)]
+pub(crate) fn units_done(state: &ShardState, id: RepositoryId) -> Option<u64> {
+  state
+    .vcs_stores
+    .encodings
+    .0
+    .get(&id)
+    .map(|(encoding, _)| encoding.counters().units)
+}
+
 #[cfg(test)]
 #[path = "git_encode/tests.rs"]
 mod tests;
