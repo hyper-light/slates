@@ -127,7 +127,7 @@ impl Curve {
 
   /// The sampling rate now: the fraction of keys sampled.
   pub fn sampling_rate(&self) -> f64 {
-    self.threshold as f64 / 2f64.powi(64)
+    self.threshold as f64 / f64::from(u64::BITS).exp2()
   }
 
   /// One read of the object whose uniform hash is `key` and whose length is `bytes`.

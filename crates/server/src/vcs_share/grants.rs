@@ -157,7 +157,7 @@ mod tests {
       .vcs_usage
       .take_curve(&repository, (1 << 16, window), from);
     for read in 0..reads {
-      let object = u64::from(repository.bytes[0]) << 32 | read % objects;
+      let object = (u64::from(repository.bytes[0]) << 32) | (read % objects);
       let key = u64::from_le_bytes(
         blake3::hash(&object.to_le_bytes()).as_bytes()[..8]
           .try_into()

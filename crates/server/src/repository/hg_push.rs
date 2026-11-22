@@ -1530,7 +1530,7 @@ async fn landed_after_rebases(
       // The landing's plan named a work not built: the view moved between the plan and the landing. Built again while
       // the plan changes; the same plan missing twice is refused, typed, never looped on.
       Ok(Landing::Unbuilt(back)) => {
-        forked = back;
+        forked = *back;
         if last_plan.as_ref() == Some(&plan) {
           give_back(forked);
           return Some(PushOutcome::refused(&abort(UNBUILT.to_vec())));
@@ -2542,7 +2542,7 @@ fn landing(
   };
   // A work the landing's plan names was not built before it: the fork goes back to the driver, which builds again.
   if matches!(works, Works::Built { missed: true, .. }) {
-    return Landing::Unbuilt(forked);
+    return Landing::Unbuilt(Box::new(forked));
   }
   let mut prepared = match judged {
     Some(Ok(prepared)) => prepared,
@@ -2575,7 +2575,7 @@ enum Landing {
   /// Its outcome; none when no view could be made.
   Done(Option<PushOutcome>),
   /// A work its plan names was not built before it ([`Works::Built`]): its fork, for its driver to build again.
-  Unbuilt(Option<Forked>),
+  Unbuilt(Box<Option<Forked>>),
 }
 
 /// The landing's judging, in 7.2's order (module docs, "The driver"): over the served view as it is at landing, the
