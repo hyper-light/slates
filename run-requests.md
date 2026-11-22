@@ -7510,3 +7510,7 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   in all three rounds without costing the large classes more than it gains (else rejected, recorded in BENCHMARKS).
   Proved locally (debug, M-series Mac, R=0): push alone 2.3 s, fetch alone 10.3 s, both whole; the steps stopped on this
   Mac's memory pressure guard (8.9 GB free), as they should.
+- 2026-11-21 (round at 3a00d432d), Linux VCS lane: r46 and its resubmit r51 both ended with "00aad8daff2f... (adacachy2) did not
+  answer the sync in 60s". No test ran. The balancer places every linux/amd64 ask on adacachy2 (adacachy is loaded),
+  and every try today has died bringing the code there: sync, full clone, shallow clone. Owner: adacachy2's kiln link.
+  Need: a Linux x86_64 runner that takes a sync, or that one restored.

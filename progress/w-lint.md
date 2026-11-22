@@ -453,3 +453,4 @@
 - Focused local: vcs --lib 125, server hg_push|vcs_share 36. Fmt, structural, unsafe and the six cross targets were clean.
 - VCS lane: Linux r46 dropped (adacachy2 didn't answer the sync), so I resubmitted it once as r51. Windows: the counts
   from the last round stand (crates green); the server's are blocked on w-bugs' watchdog exit.
+- VCS lane, Linux: r46 and r51 both failed adacachy2's sync; in run-requests.md. No Linux count today.
