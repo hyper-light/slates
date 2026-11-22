@@ -60814,3 +60814,40 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's RSS round owed.
   system path's live bytes grew 6,582,872 bytes keeping 8 MiB; green, under a tenth of the budget, and a third round's churn
   past the objects handed over under a hundredth. `recent_tests`: a gone chunk's object a miss, a large object a chunk
   of its own, one past the budget not kept, `let_go` holding nothing.
+
+### A-862 — A Subversion import holds no text: each goes into its caller's sink a piece at a time as the dump is read (2026-11-22, w-svn; main 01a20182's order of 05:28 PST, goal 93, P7 finding (2); A-628, A-716, A-842, C2 stage C)
+Applied in the same change to:
+- `crates/svn/src/migration/import.rs`: `Importer::import` takes a `commit::drive::TextSink`, the seam a client's
+  commit's drive writes through. A text is staged with its header's length where it has one. Each piece of a whole
+  text, and each applied window of a delta, is named (BLAKE3), digested (MD5, SHA-1) and put into the sink as it
+  passes, then sealed at its end. A delta whose base the same revision made reads the base back from the sink. The
+  room no longer charges a text's bytes; the sink's room refuses them (`MigrationRefusal::Room`).
+- `crates/svn/src/migration/records.rs`: `Transaction::set_text` takes the text named, not its bytes; the transaction
+  names its texts stored by length, and `revision_of` hands them over in `Revision::stored`.
+- `crates/svn/src/migration/standalone.rs`: records standing alone keep an import's texts in a `HeldTexts` sink, held
+  apart once their revision commits and given up where the import is refused; `Standalone::importing` lends the
+  records with the sink to a caller that drives the import itself.
+- `crates/svn/src/commit/drive/texts.rs`: `TextSink::stage` takes the text's length where its writer knows it.
+  `HeldTexts` reserves that length once, refused rather than aborted where memory cannot hold it.
+- `crates/server/src/vcs_store/svn_import/texts.rs` (new): the daemon's sink, the shard's content store. A text begins
+  with its length (`begin_object_of_length`), is kept a window at a time within the call's lent budget, and is sealed
+  under the identity the import named it by, which must be the store's. Each sealed text holds one count until its
+  revision's landing takes it; an import that ends otherwise gives all of them back.
+- `crates/server/src/vcs_store/svn_import.rs`, `crates/server/src/repository/svn_commit.rs` (`stage_texts`,
+  `hand_over`), `crates/server/src/repository/svn_commit/staging.rs` (`Staging::stage`; `due_before` counts a revision's
+  stored texts twice, as it counted its contents), `crates/server/src/vcs_store.rs`
+  (`VcsStores::subversion_with_content`).
+- `crates/svn/tests/import_heap.rs` (new; `slates-mem` a dev-dependency of slates-svn), the room refusal test
+  (`an_import_past_the_room_is_refused`: the text's room is the sink's), GAPS.
+
+Status: built 2026-11-22, macOS arm64 (focused tests); main's gauged `an_import_measured` over git-2000 owed.
+- **Why.** P7 finding (2): an import's footprint stays after it ends, the system allocator keeping its freed
+  temporaries. In w-svn's attribution each text was copied about ten times on the heap below the mapped floor. The
+  first copy was the importer's: `node_record` read each text into a buffer of its header's length, and the revision
+  carried it to its landing, which put it into the content store from there.
+- **What.** The import writes each text where it will live as the dump is read, through the seam a client's commit
+  already uses. The revision names its texts stored, and the landing takes the sink's holds as the texts it put.
+- **Evidence.** `an_import_holds_no_text_whole_on_the_system_heap`: 8 revisions rewriting one file of 524,288 bytes
+  (half the mapped floor), handed to the import 64 KiB at a time. At 2bb00e1cc, through `Standalone::import`, the
+  system allocator's path allocated 4,299,277 bytes and held 4,216,626 live after. Now it allocates 92,309 bytes and
+  holds 21,680 live after.

@@ -485,7 +485,7 @@ pub(crate) fn a_text_only_the_store_holds(
     move || async move {
       let text = slates_svn::commit::drive::text_of(&committed).unwrap();
       let texts = slates_svn::commit::drive::HeldTexts::new();
-      let staged = texts.stage().unwrap();
+      let staged = texts.stage(None).unwrap();
       texts.append(staged, &committed).unwrap();
       texts.seal(staged, text.identity).unwrap();
       let row = |path: &str, kind, text| slates_svn::index::ChangedPath {

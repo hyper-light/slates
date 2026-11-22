@@ -2122,7 +2122,8 @@ impl Drive {
         .into(),
       );
     }
-    let staged = world.texts.stage().map_err(DriveRefusal::from)?;
+    // A delta's result: its length is known only once its last window is applied.
+    let staged = world.texts.stage(None).map_err(DriveRefusal::from)?;
     let delta = Delta {
       decoder: Decoder::new(),
       pending: Vec::new(),

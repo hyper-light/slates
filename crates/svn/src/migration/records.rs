@@ -22,7 +22,9 @@
 //! holds them: a daemon's on the node's changeset store and its shard's content store, records standing alone in
 //! [`super::Standalone`]. A caller takes a revision's texts out before its step ([`Repository::take_texts`]), and the
 //! step refuses a text that arrives inline (`Corrupt`). Property lists are kept whole and read in place
-//! ([`Repository::content`]); a text whose bytes a property list holds too is read as that list's bytes. Before, records
+//! ([`Repository::content`]); a text whose bytes a property list holds too is read as that list's bytes. An import's
+//! revision arrives with its texts named stored already: its [`Transaction`] holds none, each put into the import's
+//! sink as the dump was read (A-862). Before, records
 //! kept every text as an svndiff of version 2 against its node's skip-delta predecessor (S4 slice 2 c2, A-727 (c)): a
 //! second text path a daemon no longer took after C2 stage B, removed with its delta chains and window reads.
 //!
@@ -39,7 +41,7 @@ use crate::commit::drive::Green;
 use crate::commit::record::Record;
 use crate::commit::revision::{Revision as RevisionToCommit, StepRefusal};
 use crate::commit::{CommitRefusal, verdict};
-use crate::dump::{Md5, Sha1, Uuid};
+use crate::dump::Uuid;
 use crate::index::{
   Action, ChangedPath, ContentIdentity, CopySource, Index, NodeKind, Planned, PropertyList,
   Revision, RevisionRecord, Text,
@@ -395,6 +397,7 @@ impl Repository {
       changes: BTreeMap::new(),
       pending: BTreeMap::new(),
       pending_bytes: 0,
+      stored: BTreeMap::new(),
     })
   }
 
@@ -408,6 +411,7 @@ impl Repository {
   ) -> Result<RevisionToCommit, MigrationRefusal> {
     let changes = transaction.rows(self)?;
     let fresh = transaction.take_fresh_contents(self, &changes)?;
+    let stored = transaction.stored_named(self, &changes);
     Ok(RevisionToCommit {
       head: transaction.base,
       record: RevisionRecord {
@@ -416,9 +420,8 @@ impl Repository {
       },
       properties,
       contents: fresh.into_iter().collect(),
-      // An import's texts arrive whole, among the contents: its caller takes them out and stores them before the
-      // step (`Repository::take_texts`), which keeps none.
-      stored: BTreeMap::new(),
+      // An import's texts are its sink's, named stored here by their lengths (the import's module docs, "Texts").
+      stored,
       lock_entries: Vec::new(),
     })
   }
@@ -1201,10 +1204,13 @@ pub(super) struct Transaction {
   base: Revision,
   /// What it did at each absolute path.
   changes: BTreeMap<String, Change>,
-  /// The texts and property lists it made that the repository does not hold, by content identity.
+  /// The property lists it made that the repository does not hold, by content identity.
   pending: BTreeMap<ContentIdentity, Vec<u8>>,
   /// Their bytes.
   pending_bytes: u64,
+  /// The texts it set, each with its length: named stored, their bytes in the import's sink, never here (the import's
+  /// module docs, "Texts").
+  stored: BTreeMap<ContentIdentity, u64>,
 }
 
 impl Transaction {
@@ -1341,29 +1347,24 @@ impl Transaction {
     Ok(())
   }
 
-  /// Sets the text of the file at `path` to `bytes`, whose digests are `digests`.
+  /// Sets the text of the file at `path` to `text`, whose bytes the import's sink holds: named stored by its length
+  /// where the repository does not hold it already.
   pub(super) fn set_text(
     &mut self,
     repository: &Repository,
     path: &str,
-    bytes: Vec<u8>,
-    digests: (Md5, Sha1),
+    text: Text,
   ) -> Result<(), MigrationRefusal> {
-    let size = u64::try_from(bytes.len()).map_err(|_| MigrationRefusal::Corrupt)?;
-    let identity = self.store(repository, bytes)?;
-    let (md5, sha1) = digests;
     let change = self
       .changes
       .get_mut(path)
       .ok_or(MigrationRefusal::Corrupt)?;
     let now = change.now.as_mut().ok_or(MigrationRefusal::Corrupt)?;
-    now.text = Some(Text {
-      identity,
-      md5,
-      sha1,
-      size,
-    });
+    now.text = Some(text);
     change.text_set = true;
+    if !repository.holds(&text.identity) {
+      self.stored.insert(text.identity, text.size);
+    }
     Ok(())
   }
 
@@ -1388,7 +1389,8 @@ impl Transaction {
     self.pending.contains_key(identity) || repository.holds(identity)
   }
 
-  /// Holds `bytes` under their content identity, once; refused when the repository's room cannot take them.
+  /// Holds a property list's `bytes` under their content identity, once; refused when the repository's room cannot take
+  /// them. A text's bytes are never held here ([`Transaction::set_text`]).
   fn store(
     &mut self,
     repository: &Repository,
@@ -1481,7 +1483,10 @@ impl Transaction {
   ) -> Result<Vec<(ContentIdentity, Vec<u8>)>, MigrationRefusal> {
     let mut fresh = Vec::new();
     for (identity, as_text) in named_as(changes) {
-      if !repository.holds_as(&identity, as_text)
+      // A text the transaction set is named stored ([`Transaction::stored_named`]), its bytes the sink's.
+      let stored = as_text && self.stored.contains_key(&identity);
+      if !stored
+        && !repository.holds_as(&identity, as_text)
         && !fresh.iter().any(|(held, _)| *held == identity)
       {
         let bytes = match self.pending.remove(&identity) {
@@ -1495,6 +1500,24 @@ impl Transaction {
       }
     }
     Ok(fresh)
+  }
+
+  /// The texts the transaction set that `changes` name and the repository does not hold, each with its length: what
+  /// its revision names stored.
+  fn stored_named(
+    &self,
+    repository: &Repository,
+    changes: &[ChangedPath],
+  ) -> BTreeMap<ContentIdentity, u64> {
+    changes
+      .iter()
+      .filter_map(|change| change.text)
+      .filter(|text| !repository.holds(&text.identity))
+      .filter_map(|text| {
+        let len = self.stored.get(&text.identity)?;
+        Some((text.identity, *len))
+      })
+      .collect()
   }
 }
 
