@@ -923,3 +923,84 @@ fn t_a859_an_answer_slow_for_its_own_making_teaches_its_link_price_nothing() {
   assert_eq!(learned.ns / learned.bytes, 0, "under a nanosecond a byte");
   assert_eq!(learned.ns * (1 << 20) / learned.bytes, 1_000_000);
 }
+
+/// Goal 93 item 2a (main 01a20182's ruling of 2026-11-22 05:45; w-git's driver hook: a fetch's and an encoding's packs
+/// made resident before they read). Do: on a store-backed daemon, put a pack of three windows and a part in the shard's
+/// content store, land its bytes on the node's store as a changeset's `Payload`, mark every window landed and let it
+/// go; list what [`super::away_in`] finds of it, bring that back ([`super::brought_back_all`]), list again, and read the
+/// pack whole. Expect: its four windows found let go, all brought back (their bytes the pack's), none found after, and
+/// the pack read whole as it was put. Failing first: nothing made a repository's packs resident, so a clone's read of a
+/// let-go window refused `Unread`.
+#[test]
+fn t_goal93_a_repositorys_let_go_pack_is_made_resident_before_it_is_read() {
+  use slates_vcs::ContentId;
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (sent, got) = std::sync::mpsc::channel();
+  crate::daemon::observe_first(&daemon, move |state| {
+    let _ = crate::git_push::tests::git_repository(state, "resident");
+    let window = state
+      .vcs_stores
+      .content()
+      .map_or(1 << 18, slates_vcs::ContentStore::window);
+    let bytes: Vec<u8> = (0..3 * window + 100)
+      .map(|at| u8::try_from(at % 251).unwrap())
+      .collect();
+    let len = u64::try_from(bytes.len()).unwrap();
+    let root = crate::vcs_store::within_budget(state, len, |stores| {
+      stores.content_mut().unwrap().put_object(&bytes).unwrap()
+    });
+    let header = slates_store::log::Header {
+      tool: slates_store::log::Tool::Git,
+      repository: 1,
+      sequence: 0,
+      judged_over: 0,
+      grant: 0,
+      work: 0,
+      time_ns: slates_rt::futures::now_ns(),
+      sections: 0,
+    };
+    let parts = vec![(slates_store::log::SectionKind::Payload, bytes.clone())];
+    assert!(crate::test_store::land_blocking(
+      state.vcs_disk.clone().unwrap(),
+      header,
+      parts
+    ));
+    let _ = crate::vcs_store::within_budget(state, 0, |stores| {
+      let content = stores.content_mut().unwrap();
+      let ids: Vec<ContentId> = bytes.chunks(window).map(ContentId::of).collect();
+      for id in &ids {
+        assert!(content.mark_landed(id) && content.let_go(id).is_ok());
+      }
+    });
+    let away = super::away_in(
+      state.vcs_stores.content().unwrap(),
+      [(root, len)].into_iter(),
+    );
+    let task = slates_rt::futures::spawn(async move {
+      let found = away.len();
+      let brought = super::brought_back_all(away).await;
+      let after = crate::state::with_state(|state| {
+        super::away_in(
+          state.vcs_stores.content().unwrap(),
+          [(root, len)].into_iter(),
+        )
+        .len()
+      });
+      let read = crate::state::with_state(|state| {
+        crate::vcs_store::lent_to_read((&mut state.store, &mut state.vcs_stores), |stores| {
+          stores
+            .content()
+            .and_then(|content| content.object_bytes(&root, len))
+        })
+      })
+      .flatten();
+      let _ = sent.send((found, brought, after, read == Some(bytes)));
+    })
+    .unwrap();
+    slates_rt::futures::detach(task).unwrap();
+  });
+  let (found, brought, after, whole) = got.recv().expect("made resident");
+  daemon.stop();
+  assert_eq!((found, after, whole), (4, Some(0), true));
+  assert!(brought > 0, "{brought}");
+}
