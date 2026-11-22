@@ -1059,15 +1059,19 @@ impl<S: Site> Parts<S> {
     }
   }
 
-  /// Writes what the engine has to send, within the phase's wait.
+  /// Writes what the engine has to send, within the phase's wait: its output lent, written, then handed back, so the
+  /// connection's buffer is kept for the next turn and a long reply makes no allocation a run (A-830).
   async fn write(&mut self, connection: &mut Connection) -> Flow {
     let phase = connection.phase();
-    let bytes = connection.take_output();
     let Ok((deadline_ns, overdue)) = self.armed(phase) else {
       return Flow::End(Why::Failed);
     };
     let marker = self.marker(overdue);
-    let waited = self.socket.write(&bytes, deadline_ns, marker).await;
+    let waited = self
+      .socket
+      .write(connection.output(), deadline_ns, marker)
+      .await;
+    connection.written();
     match self.settle(phase, waited) {
       Ok(()) => Flow::Go,
       Err(why) => Flow::End(why),

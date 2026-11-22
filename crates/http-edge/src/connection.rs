@@ -535,9 +535,16 @@ impl Connection {
     self.input.drain(..count.min(self.input.len()));
   }
 
-  /// The bytes to write to the socket, taken.
-  pub fn take_output(&mut self) -> Vec<u8> {
-    std::mem::take(&mut self.output)
+  /// The bytes to write to the socket, lent: the caller writes them out, then says so ([`Connection::written`]), so the
+  /// connection keeps its buffer for the next (Ada's MEMORY SIZING ruling, A-830: a reply writes no allocation a run).
+  pub fn output(&self) -> &[u8] {
+    &self.output
+  }
+
+  /// The bytes [`Connection::output`] lent were written out: they are cleared and the buffer kept, its capacity what one
+  /// turn's output held at most (a reply's run framed, within the request's room), freed with the connection.
+  pub fn written(&mut self) {
+    self.output.clear();
   }
 
   /// Bytes the socket delivered: deciphered first on a TLS connection, ignored once the connection is draining.
@@ -827,18 +834,14 @@ impl Connection {
     if data.is_empty() || !reply.started || reply.head_only || reply.mode != StatusMode::AtHead {
       return;
     }
-    let mut bytes = Vec::new();
-    match request.version {
-      Version::Http11 => reply::chunk(data, &mut bytes),
-      Version::Http10 => bytes.extend_from_slice(data),
-    }
-    self.send(&bytes);
+    let version = request.version;
+    self.send_run(version, data);
   }
 
   /// The service's next bytes of its reply: the head before the first, each run chunked (HTTP/1.1) or as it is
   /// (HTTP/1.0); nothing past the head of a `HEAD`'s reply.
   pub fn reply(&mut self, data: &[u8]) {
-    let (request, head_only, mut bytes) = match self.begin_reply() {
+    let (request, head_only, head) = match self.begin_reply() {
       None => return,
       Some(Ok(begun)) => begun,
       Some(Err(_)) => {
@@ -846,13 +849,30 @@ impl Connection {
         return;
       }
     };
-    if !head_only {
-      match request.version {
-        Version::Http11 => reply::chunk(data, &mut bytes),
-        Version::Http10 => bytes.extend_from_slice(data),
-      }
+    if !head.is_empty() {
+      self.send(&head);
     }
-    self.send(&bytes);
+    if !head_only {
+      self.send_run(request.version, data);
+    }
+  }
+
+  /// Sends one run of the reply's body as `version` frames it, each piece handed on as it is so the run is never
+  /// copied to be framed (A-830): HTTP/1.1's chunk, its size line from a buffer on the stack, the run and CRLF (nothing
+  /// for no data, since a chunk of size zero would end the body); HTTP/1.0's bytes as they are.
+  fn send_run(&mut self, version: Version, data: &[u8]) {
+    if data.is_empty() {
+      return;
+    }
+    match version {
+      Version::Http11 => {
+        let mut line = [0; reply::CHUNK_SIZE_LINE_BYTES];
+        self.send(reply::chunk_size_line(data.len(), &mut line));
+        self.send(data);
+        self.send(slates_http::CRLF);
+      }
+      Version::Http10 => self.send(data),
+    }
   }
 
   /// The service's reply has ended: the head if none of the reply was sent, the last chunk (HTTP/1.1), then the next

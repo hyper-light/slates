@@ -2714,6 +2714,17 @@
 > Since A-713 (fetch admission) the v1.0.0 cut passes 26 of 27 (clone, deepen and partial clone among them; the 27th
 > the script's tag row, since fixed); cut at v2.0.0 (56 MB) the push still spins shard 0 and the daemon is killed
 > (main 168ddfa, debug, Mac Studio). hg after A-711 and A-696: 17 of 24, its pushes of hg's history spinning alike.
+> **A-830, the clone's memory by site (clients, 2026-11-22):** main's r6 at a3e673efc (git/git v2.0.0, release, big
+> Studio) is red: a 55,871,063-byte pack peaks at 965 MiB in the push, holds 712 MiB after it and 2,113 MiB after the
+> clone. Attributed with a local live-block and churn recorder (never landed): after the clone, A-718's encode_behind
+> holds each part whole (`slates_git::store::encoding` `Part.bytes`, 2.5 GB live in 4 blocks), and the run makes
+> 116,736 MiB in blocks of 16 KiB or more, 97 GB of it a fresh deflate state per object per trial (`store/fragment.rs`
+> `deflating`, upload's stream and the encoder), which malloc keeps dirty: w-git's files (inbox
+> clients-clone-churn). Fixed here: the HTTP edge's per-run copy, 4,145 MiB in 33,170 blocks over the clone; each run
+> is framed straight into the connection's kept output (`Connection::output` and `written`; the size line from the
+> stack, `reply::chunk_size_line`), `crates/http-edge/tests/reply_allocations.rs` 256 allocations over 64 runs before,
+> 0 after (macOS arm64, this Mac, local). Owed: w-git's encoder and stream (one deflate state a part, parts streamed
+> into the content store), then main's r6 again.
 > **A-830, the git server's memory held to the change (clients, 2026-11-21; Ada's MEMORY SIZING ruling):**
 > `the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the_history` (`crates/cli/tests/
 > git_interop.rs`) holds the daemon's resident set at its peak and settled after a push and a clone to the warm-up's
