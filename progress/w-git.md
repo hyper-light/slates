@@ -497,3 +497,11 @@
   slates-server vcs_http/vcs_ssh/vcs_store::upload 166 pass + the 3 hg daemon_edge tests failing before this change too.
   Left (GAPS): SSH edge's wait (gives up at once); a refusal after the pack began still cuts. NEXT (main 00:31 ruling):
   encode_behind's memory (2.1 GB with no client), red first.
+- 2026-11-22 ~03:10 PST: LANDED (merge 0209973f7): 14974cfd3 (clippy: Sections::Died boxed, reach.rs's useless
+  conversion; GIT_CONFIG_COUNT=0 in git_correctness Git::run + CGI, winfsp_semantics, make-lfs-exchange.sh) and A-856
+  53f717ae7 (encoding parts charged; encode_behind only with a fetch live and within the learned grant; idle give-back).
+  Grant = slates_vcs::partition: min(room/repositories, curve usable) + marginal-utility lookahead; curve counts content
+  windows read (262,144 B here), so 262,144 = one window read, 786,432 = three: learned. Focused: slates-git store+upload
+  186, upload+reach 95; slates-server vcs_store/vcs_share/git_push/vcs_http::git 191, git_encode 3/3.
+  NEXT: item 1 (deferred build PastRoom regression + master lock, red: one-commit branch push), one wait mechanism with
+  w-hg (shared piece in vcs_share); then the clone pack-size gap (4 GiB vs ~300 MB); deflate reuse.
