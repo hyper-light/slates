@@ -116,21 +116,49 @@ pub mod g222_parks {
   pub const CAP: usize = 600_000;
   pub static ROWS: [[AtomicU64; 5]; CAP] = [const { [const { AtomicU64::new(0) }; 5] }; CAP];
   pub static N: AtomicUsize = AtomicUsize::new(0);
+  /// Shape: shards a diagnostic run keeps a last park for.
+  pub const SHARDS: usize = 64;
+  /// w-perf 84a: each shard's last park, host monotonic ns: when it began, the kick's stamp (0: none), when it returned.
+  pub static LAST: [[AtomicU64; 3]; SHARDS] = [const { [const { AtomicU64::new(0) }; 3] }; SHARDS];
+  /// Shard `shard`'s last park.
+  pub fn last(shard: u16) -> [u64; 3] {
+    LAST.get(usize::from(shard)).map_or([0; 3], |slot| {
+      [
+        slot[0].load(Relaxed),
+        slot[1].load(Relaxed),
+        slot[2].load(Relaxed),
+      ]
+    })
+  }
   /// A zero-timeout harvest's duration, binned by log2 of its microseconds (bin 0: under 1 us).
   pub static HARVEST: [AtomicU64; 24] = [const { AtomicU64::new(0) }; 24];
   pub fn harvested(ns: u64) {
     let us = ns / 1000;
-    let bin = if us == 0 { 0 } else { (64 - us.leading_zeros()) as usize };
+    let bin = if us == 0 {
+      0
+    } else {
+      (64 - us.leading_zeros()) as usize
+    };
     HARVEST[bin.min(23)].fetch_add(1, Relaxed);
   }
   pub fn dump(path: &str) {
     use std::io::Write;
     let n = N.load(Relaxed).min(CAP);
-    let bins: Vec<String> = HARVEST.iter().map(|b| b.swap(0, Relaxed).to_string()).collect();
+    let bins: Vec<String> = HARVEST
+      .iter()
+      .map(|b| b.swap(0, Relaxed).to_string())
+      .collect();
     let mut out = format!("# harvest_us_log2 {}\n", bins.join(" "));
     out.push_str("timeout\twaited\tended\tkick_after\twake_after\n");
     for row in ROWS.iter().take(n) {
-      out.push_str(&format!("{}\t{}\t{}\t{}\t{}\n", row[0].load(Relaxed), row[1].load(Relaxed), row[2].load(Relaxed), row[3].load(Relaxed), row[4].load(Relaxed)));
+      out.push_str(&format!(
+        "{}\t{}\t{}\t{}\t{}\n",
+        row[0].load(Relaxed),
+        row[1].load(Relaxed),
+        row[2].load(Relaxed),
+        row[3].load(Relaxed),
+        row[4].load(Relaxed)
+      ));
     }
     if let Ok(mut f) = std::fs::File::create(path) {
       let _ = f.write_all(out.as_bytes());
@@ -155,7 +183,13 @@ pub(crate) fn g222_park(timeout: u64, waited: u64, ended: u64, kick: (u64, u64))
 /// Diagnostic only (g222, never main): asks the calling thread for the EEVDF slice `G222_SLICE_NS` (A-224's
 /// `sched_runtime` for a `SCHED_OTHER` thread, its policy and nice kept, no privilege), and counts the answer.
 #[cfg(target_os = "linux")]
-#[allow(unsafe_code, clippy::all, clippy::pedantic, clippy::restriction, clippy::disallowed_methods)]
+#[allow(
+  unsafe_code,
+  clippy::all,
+  clippy::pedantic,
+  clippy::restriction,
+  clippy::disallowed_methods
+)]
 pub(crate) fn g222_slice() {
   #[repr(C)]
   #[derive(Clone, Copy, Default)]
@@ -171,7 +205,10 @@ pub(crate) fn g222_slice() {
     util_min: u32,
     util_max: u32,
   }
-  let Some(slice) = std::env::var("G222_SLICE_NS").ok().and_then(|v| v.parse::<u64>().ok()) else {
+  let Some(slice) = std::env::var("G222_SLICE_NS")
+    .ok()
+    .and_then(|v| v.parse::<u64>().ok())
+  else {
     return;
   };
   let mut attr = SchedAttr::default();
@@ -179,7 +216,10 @@ pub(crate) fn g222_slice() {
   // SAFETY: diagnostic; pid 0 is the calling thread, `attr` is a repr(C) sched_attr of `size` bytes.
   let got = unsafe { libc::syscall(libc::SYS_sched_getattr, 0, &raw mut attr, size, 0) };
   if got != 0 {
-    eprintln!("g222 slice: sched_getattr refused: {}", std::io::Error::last_os_error());
+    eprintln!(
+      "g222 slice: sched_getattr refused: {}",
+      std::io::Error::last_os_error()
+    );
     return;
   }
   attr.size = size;
@@ -188,6 +228,9 @@ pub(crate) fn g222_slice() {
   // SAFETY: as above; the kernel reads `size` bytes.
   let set = unsafe { libc::syscall(libc::SYS_sched_setattr, 0, &raw const attr, 0) };
   if set != 0 {
-    eprintln!("g222 slice: sched_setattr({slice}) refused: {}", std::io::Error::last_os_error());
+    eprintln!(
+      "g222 slice: sched_setattr({slice}) refused: {}",
+      std::io::Error::last_os_error()
+    );
   }
 }

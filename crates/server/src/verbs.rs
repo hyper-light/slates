@@ -18901,7 +18901,10 @@ fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, 
     }
     let g222_taken = slates_machine::clock::monotonic_ns();
     let g222_landed = slates_ipc::slot::landed_ns(
-      u32::try_from(slates_ipc::endpoint::G222_LAST_STAMP.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0),
+      u32::try_from(
+        slates_ipc::endpoint::G222_LAST_STAMP.load(std::sync::atomic::Ordering::Relaxed),
+      )
+      .unwrap_or(0),
       g222_taken,
     );
     if let Some(landed) = g222_landed {

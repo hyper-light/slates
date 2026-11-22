@@ -2514,7 +2514,8 @@ fn answer_ask(state: &mut ShardState, item: AskItem) -> Outcome {
       policy,
     } => {
       crate::g222_diag::stamp(crate::g222_diag::OWNER_IN);
-      let judged = crate::verbs::owner_judge(state, (origin, id), (*sealed, evidence, policy), back);
+      let judged =
+        crate::verbs::owner_judge(state, (origin, id), (*sealed, evidence, policy), back);
       crate::g222_diag::stamp(crate::g222_diag::OWNER_OUT);
       match judged {
         Some(reply) => Outcome::Answered(Answered::Verdict(reply)),

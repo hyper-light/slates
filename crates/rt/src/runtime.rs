@@ -420,7 +420,11 @@ fn run_worker(
   crate::g222_slice();
   // Diagnostic only (g222, never main): G222_NO_PIN leaves the shard thread unpinned.
   #[allow(clippy::disallowed_methods)]
-  let core = if std::env::var_os("G222_NO_PIN").is_some() { None } else { core };
+  let core = if std::env::var_os("G222_NO_PIN").is_some() {
+    None
+  } else {
+    core
+  };
   let pinned = core.map(|core| (core, slates_machine::probes::pin_current_thread(core)));
   let ctx = match ShardContext::build(seed) {
     Ok(ctx) => ctx,

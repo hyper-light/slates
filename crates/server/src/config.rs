@@ -1251,7 +1251,11 @@ impl DaemonConfig {
       instance: instance.to_owned(),
       // Diagnostic only (g222, never main): G222_NO_HOLD holds no shard for a closed loop.
       #[allow(clippy::disallowed_methods)]
-      closed_loop_hold_ns: if std::env::var_os("G222_NO_HOLD").is_some() { 0 } else { loop_hold.get() },
+      closed_loop_hold_ns: if std::env::var_os("G222_NO_HOLD").is_some() {
+        0
+      } else {
+        loop_hold.get()
+      },
       // Unstated by default: the scatter width stays at the candidate floor until a deployment states its
       // re-replication bandwidth (or the deferred network-empirical measurement supplies it).
       rereplication_bytes_per_second: 0,
