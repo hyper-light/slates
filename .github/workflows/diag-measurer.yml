@@ -1,0 +1,50 @@
+name: diag-measurer
+
+# w-k90-win, main's goal-93 Windows round 2 (never main): w-realtools' Windows-paths test and the git/git session over
+# the HTTP edge, release, at origin/main 40d816c29 (jupiter's store owner dies there, inbox/w-work-mount-from-w-k90-win-store-jupiter.md).
+
+on:
+  push:
+    branches: ["diag-measurer-w-k90-win-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  round-2:
+    name: 93 round 2 (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: ilammy/setup-nasm@v1.5.2
+      - name: git/git, bare
+        run: git --version && git clone -q --bare https://github.com/git/git.git "$RUNNER_TEMP/git-git.git" && git -C "$RUNNER_TEMP/git-git.git" rev-list --all --count
+      - name: The two tests
+        env:
+          AWS_LC_SYS_PREBUILT_NASM: "0"
+        run: |
+          set +e
+          cargo test --release --locked -p slates-cli --test git_interop -- --ignored --exact stock_git_carries_windows_paths_byte_identically --nocapture > paths.log 2>&1; p=$?
+          SLATES_TEST_GIT_DATASET="$(cygpath -w "$RUNNER_TEMP/git-git.git")" SLATES_TEST_GIT_EDGES=http timeout 9000 cargo test --release --locked -p slates-cli --test git_interop -- --ignored --exact stock_git_carries_a_whole_repository_over_each_edge --nocapture > gitgit.log 2>&1; g=$?
+          ps=$(grep -E "^test |test result|skipping|panicked" paths.log | tr '\n' ' ' | cut -c1-600)
+          gs=$(grep -E "^test |test result|skipping|panicked" gitgit.log | tr '\n' ' ' | cut -c1-600)
+          echo "::notice title=round 2::windows-paths exit=$p: $ps%0Agit/git exit=$g: $gs"
+          if [ $p -ne 0 ]; then echo "::error title=windows-paths failure::$(grep -E -A15 'panicked|^---- ' paths.log | head -40 | sed 's/%/%25/g' | awk 'BEGIN{ORS="%0A"}{print}')"; fi
+          if [ $g -ne 0 ]; then echo "::error title=git/git failure::$(grep -E -A15 'panicked|^---- ' gitgit.log | head -40 | sed 's/%/%25/g' | awk 'BEGIN{ORS="%0A"}{print}')"; fi
+          [ $p -eq 0 ] && [ $g -eq 0 ]
+      - name: Keep the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: round-2-logs
+          path: |
+            paths.log
+            gitgit.log
+          if-no-files-found: warn
