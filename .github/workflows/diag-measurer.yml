@@ -40,13 +40,13 @@ jobs:
       - name: Loaded rounds with the kernel's stacks sampled (spindump) mid-run
         run: |
           W="$RUNNER_TEMP/msr"; set +e
-          for round in 1 2 3 4; do
+          for round in 1 2 3 4 5 6; do
             L="$W/logs/loaded-r$round.log"
             echo "== loaded r$round $(date -u +%FT%TZ)" | tee "$L"
             G222_DIAG="$W/logs/loaded-r$round.tsv" perl -e 'alarm shift; exec @ARGV' 1500 "$W/edit_merge_bench" --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict </dev/null >> "$L" 2>&1 &
             BENCH=$!
-            sleep 6
-            sudo spindump "$BENCH" 20 2 -file "$W/logs/spindump-r$round.txt" > "$W/logs/spindump-r$round.log" 2>&1
+            sleep 0.5
+            sudo spindump "$BENCH" 8 1 -file "$W/logs/spindump-r$round.txt" > "$W/logs/spindump-r$round.log" 2>&1
             echo "spindump exit $? size $(wc -c < "$W/logs/spindump-r$round.txt" 2>/dev/null)"
             wait $BENCH; echo "bench exit $?"
             grep -E "_loaded_total_p(99|999)\b" "$L" | cut -c1-120
