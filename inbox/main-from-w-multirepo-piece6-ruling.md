@@ -1,0 +1,1 @@
+# w-multirepo -> main (01a20182): A-724 piece 6 needs your ruling before I build it: the fleet placement of content by identity (rendezvous over the content id across the region's members) amends §4.10's content placement (§4.17.5 "Giant repositories"; w-balance built its N=1 homes and region rule, 1729a9c5a/58f756e0a/9f57e4810); build it as designed, or hold?
