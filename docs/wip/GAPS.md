@@ -1956,6 +1956,16 @@
 > its hidden refs are owed there); the daemon starting the SSH edge (A-684); other platforms' runs (main's); the
 > exchange moved by the live memory-pressure and load signals, as the codec policy's. The live stock `git clone` over
 > the daemon's edge is built since (stock git's interop tests, next).
+> **Many repositories on one daemon (2026-11-21, w-balance, A-724 / goal 93 correctness; main's order):**
+> `crates/cli/tests/vcs_many_repositories.rs` `many_repositories_on_one_daemon_each_hold_exactly_their_own_history`
+> (ignored; main runs N = 2, 16, 64 for git, hg and svn): N repositories a tool pushed twice by their own stock clients
+> all at once, fetched during the second pushes, one a tool created and one destroyed mid-load; each then checked alone
+> (git `fsck --strict`, exactly its commits and refs; hg `verify`, its changesets, bookmark and tag; svn its two
+> revisions, paths and log, `svnrdump dump` into `svnadmin verify`). Focused run (git, N = 2, macOS debug, dba4ae793):
+> every push, fetch, check and the mid-load creation held. **Open, completion:** no client can destroy a repository.
+> `Op::RepositoryDestroyed` (A-515) is in the db, but no server verb or CLI command issues it (`slates repository
+> destroy` is refused as an unknown verb), so the test's destroy step is red and the doomed repository is still served.
+>
 > **The hg correctness lane (2026-11-21, w-balance, UI goal 93 correctness by use):** `crates/cli/tests/hg_interop.rs`
 > `stock_hg_gets_what_stock_hg_serve_gives_on_every_verb_over_http_and_ssh` (ignored; main runs it) drives
 > `crates/cli/bench/hg_correctness.sh`: stock hg 7.2 against stock `hg serve` (the oracle), slates over HTTP and slates
