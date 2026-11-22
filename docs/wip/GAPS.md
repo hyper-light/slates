@@ -94,7 +94,10 @@
 > a third round's churn under a hundredth (`crates/git/tests/recent_ring.rs`); main's RSS round owed (run-requests).
 > Main's r15 at abcadd753 (A-861 and its charge): peak 531.2, after the push 327.4, after the clone 365.9 MiB, against
 > 815.2, 667.5 and 737.8 at f577268d3; still past the bound 177.7. (2a) LANDED A-863: a read of a let-go window brings it
-> back from the node's store; the RSS test now prints the memory gauges at each reading. (2b), the let-go after a landing,
+> back from the node's store; the RSS test now prints the memory gauges at each reading. git's driver hook (w-git): a
+> fetch's and an encoding's packs made resident before they read (`vcs_store::upload::resident`), and a window an
+> encoding turn met let go brought back before the next; a let-go must wait for no fetch live and no encoding under way,
+> since a pack's answer cannot be taken again mid-pack byte for byte. (2b), the let-go after a landing,
 > next: a landed pack's windows have several holders, which `let_go` refuses (`Shared`).
 > Owed, in main's order: (1) the push's temporaries cut at their source (w-shared);
 > (2) landed windows and the pack let go once durable (w-shared, with w-git); (3) the recent-objects cache given back
@@ -3747,7 +3750,10 @@
 > (`an_increments_post_state_is_sized_once_by_its_texts`: 6,000 bytes held for 5,000, now 5,000), the largest of the
 > import's sites in w-svn's sampled in-process attribution (500 files, 300 revisions, 11.65 MB: 168.9 MB allocated at
 > 2bb00e1cc, 156.6 MB with A-862, 142.3 MB with this). r16 (main's daemon, 73e46f842: 51.35 GB against r14's 33.41 GB)
-> is not reproduced in-process; a back-to-back daemon A/B is asked.
+> was the machine (main's r18, interleaved at one load: 73e46f842 3-5% below 2bb00e1cc, both about 560-600 MB not given
+> back). Then the import's sink keeps one window buffer for all its texts (`ContentStore::begin_object_reusing`,
+> `objects_begun_in_turn_on_one_buffer_never_make_another`): 142.3 MB to 130.7 MB sampled. Next, largest first: the
+> engine's `push_slice` (two sites), `Increment::encode`, `judge_held`; the content store's `release_one` (w-shared's).
 > Still to measure: the A-742 floor's A/B only if the
 > footprint still stays (main's ruling). A local 64 KiB floor gave 47 MB of footprint at 2 s idle, against 363 MB, at
 > 19.4 s against 12.0 s (debug).

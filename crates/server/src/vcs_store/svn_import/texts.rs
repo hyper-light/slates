@@ -2,8 +2,9 @@
 //! order of 2026-11-22 05:28): the daemon's [`TextSink`] for `slates_svn`'s import, whose module docs ("Texts") state
 //! the seam.
 //!
-//! **What.** The import stages each text with its header's length where it has one, so the content store reserves its
-//! window's buffer once (`ContentStore::begin_object_of_length`, 840daa24d); every piece is kept a window at a time as it
+//! **What.** The import stages each text with its header's length where it has one, on the one window buffer the
+//! import owns and hands from text to text (`ContentStore::begin_object_reusing`; main 01a20182's routing of 2026-11-22
+//! 07:38: a buffer a text was among the import's churners), grown once to the window over the import; every piece is kept a window at a time as it
 //! arrives (`ContentStore::put_window`), within the budget the call is lent (`crate::vcs_store::within_budget`); a text
 //! is sealed under the identity the import named it by, which must be the store's own. So no text is held whole on the
 //! heap: before, the importer read each into a buffer of its header's length (26.2 MB of churn for 26.2 MB of text in
@@ -30,6 +31,8 @@ pub(crate) struct ImportTexts {
   staged: Option<(StagedText, Writing, u64)>,
   /// The texts sealed since the open revision began, each with its length.
   sealed: Vec<(ContentIdentity, u64)>,
+  /// The window buffer the import owns, handed from each text to the next (module docs).
+  spare: Vec<u8>,
   /// The next text's number.
   next: u64,
 }
@@ -46,7 +49,8 @@ impl ImportTexts {
 
   /// Gives back every text staged and sealed: an import that ended without handing its revision over.
   pub(crate) fn give_back(&mut self, store: &mut ContentStore) {
-    if let Some((_, writing, _)) = self.staged.take() {
+    if let Some((_, mut writing, _)) = self.staged.take() {
+      self.spare = writing.take_buffer();
       store.abandon_object(writing);
     }
     for (identity, _) in std::mem::take(&mut self.sealed) {
@@ -83,7 +87,7 @@ fn refused(refused: &ContentRefused) -> TextRefused {
 }
 
 impl TextSink for InStore<'_> {
-  /// Begins the text's object, its window's buffer sized once by its length where it has one; one text at a time.
+  /// Begins the text's object on the import's one window buffer (module docs); one text at a time.
   fn stage(&self, len: Option<u64>) -> Result<StagedText, TextRefused> {
     let mut texts = self.texts.borrow_mut();
     if texts.staged.is_some() {
@@ -91,11 +95,8 @@ impl TextSink for InStore<'_> {
     }
     let number = StagedText(texts.next);
     texts.next = texts.next.checked_add(1).ok_or(TextRefused::Held)?;
-    let store = self.store.borrow();
-    let writing = match len {
-      Some(len) => store.begin_object_of_length(len),
-      None => store.begin_object(),
-    };
+    let spare = std::mem::take(&mut texts.spare);
+    let writing = self.store.borrow().begin_object_reusing(len, spare);
     texts.staged = Some((number, writing, 0));
     Ok(number)
   }
@@ -121,7 +122,9 @@ impl TextSink for InStore<'_> {
     match texts.staged.take() {
       Some((number, mut writing, put)) if number == staged => {
         let mut store = self.store.borrow_mut();
-        let made = match store.finish_object(&mut writing) {
+        let made = store.finish_object(&mut writing);
+        texts.spare = writing.take_buffer();
+        let made = match made {
           Ok(made) => made,
           Err(refusal) => {
             store.abandon_object(writing);
