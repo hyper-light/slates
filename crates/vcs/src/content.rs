@@ -464,6 +464,11 @@ pub enum LetGoRefused {
   Shared,
   /// Already let go.
   Away,
+  /// A holder of it cannot bring it back by its own read path ([`ContentStore::let_go_landed`]): it stays.
+  Pinned {
+    /// The holder that pins it.
+    by: &'static str,
+  },
 }
 
 /// A byte count as the store keeps it.
@@ -1229,13 +1234,85 @@ impl ContentStore {
     if held.holders > 1 {
       return Err(LetGoRefused::Shared);
     }
-    held.kept = Kept::Away { len };
+    Ok(self.released_away(identity, window, len))
+  }
+
+  /// Lets go of the window `identity` names, marked landed ([`ContentStore::mark_landed`]: a landed changeset on the
+  /// node's store holds its bytes), whatever its holders count, unless `pinned_by` names a holder of it that cannot bring
+  /// it back by its own read path (main 01a20182's ruling of 2026-11-22 06:58: a landed window may go only where every
+  /// holder of it can). What [`ContentStore::let_go`] refuses `Shared` this lets go: the holders are a landed push's own
+  /// (its staged pack, its repository's pack), each a reader that brings the window back by its pack's identity. The
+  /// store keeps no holder's kind, so its owner names the pinning one (a home, read by the window's identity alone, by
+  /// where the identity's home is: `slates-server`'s homes), which holds across a restart. The bytes freed.
+  ///
+  /// # Errors
+  /// `NotHeld`, `NotAWindow`, `Away` and `NotLanded` as [`ContentStore::let_go`]; `Pinned` naming the holder.
+  pub fn let_go_landed(
+    &mut self,
+    identity: &ContentId,
+    pinned_by: Option<&'static str>,
+  ) -> Result<u64, LetGoRefused> {
+    let identity = self.resolve(identity);
+    let held = self
+      .entries
+      .get_mut(&identity)
+      .ok_or(LetGoRefused::NotHeld)?;
+    let (window, len) = match held.kept {
+      Kept::Stored { window, len } if held.form == Form::Window => (window, len),
+      Kept::Away { .. } => return Err(LetGoRefused::Away),
+      _ => return Err(LetGoRefused::NotAWindow),
+    };
+    if !held.landed {
+      return Err(LetGoRefused::NotLanded);
+    }
+    if let Some(by) = pinned_by {
+      return Err(LetGoRefused::Pinned { by });
+    }
+    Ok(self.released_away(identity, window, len))
+  }
+
+  /// Every window of the object `identity` names marked landed and let go ([`ContentStore::let_go_landed`]), each but
+  /// those `pinned_by` names a pinning holder of: the bytes freed and the windows kept pinned.
+  pub fn let_go_object_landed(
+    &mut self,
+    identity: &ContentId,
+    pinned_by: &dyn Fn(&ContentId) -> Option<&'static str>,
+  ) -> (u64, u64) {
+    let (mut freed, mut pinned) = (0u64, 0u64);
+    for window in self.object_windows(identity) {
+      if !self.mark_landed(&window) {
+        continue;
+      }
+      match self.let_go_landed(&window, pinned_by(&window)) {
+        Ok(bytes) => freed = freed.saturating_add(bytes),
+        Err(LetGoRefused::Pinned { .. }) => pinned = pinned.saturating_add(1),
+        Err(_) => {}
+      }
+    }
+    (freed, pinned)
+  }
+
+  /// The windows of the object `identity` names, in order: itself where it is one window.
+  fn object_windows(&self, identity: &ContentId) -> Vec<ContentId> {
+    let mut windows = Vec::new();
+    let mut walk = self.windows(identity);
+    while let Some(window) = walk.next_window() {
+      windows.push(window);
+    }
+    windows
+  }
+
+  /// Marks the window `identity` (kept as `window`, `len` bytes) let go, its storage given back: the bytes freed.
+  fn released_away(&mut self, identity: ContentId, window: StoredWindow, len: usize) -> u64 {
+    if let Some(held) = self.entries.get_mut(&identity) {
+      held.kept = Kept::Away { len };
+    }
     self.away_changed.insert(identity);
     self.storage.release(window);
     let freed = u64::try_from(len).unwrap_or(u64::MAX);
     self.content_bytes = self.content_bytes.saturating_sub(freed);
     self.counters.let_go = self.counters.let_go.saturating_add(1);
-    Ok(freed)
+    freed
   }
 
   /// Brings back a window let go, from `bytes` its reader read from the node's store (A-724 piece 4; the tools'
@@ -1801,6 +1878,17 @@ impl ContentStore {
       bytes.extend_from_slice(&window);
     }
     (u64::try_from(bytes.len()).ok()? == len).then_some(bytes)
+  }
+
+  /// Whether the store holds the object `identity` names whole in memory: held, and none of its windows let go
+  /// ([`ContentStore::let_go`]). A reader that needs its bytes and finds it not whole reads it again from where it was
+  /// landed, and its put brings the windows let go back.
+  pub fn holds_whole(&self, identity: &ContentId) -> bool {
+    self.contains(identity)
+      && self
+        .object_windows(identity)
+        .iter()
+        .all(|window| !self.is_away(window))
   }
 
   /// Whether the store holds the content `identity` names.
@@ -2893,6 +2981,50 @@ mod tests {
       "a window another holds stays"
     );
     assert!(!store.is_away(&shared));
+    assert_eq!(store.bring_back_object(&object, &bytes), Ok(4));
+    assert_eq!(
+      store.object_bytes(&object, u64::try_from(bytes.len()).unwrap()),
+      Some(bytes)
+    );
+  }
+
+  /// Goal 93 item 2b (main 01a20182's ruling of 2026-11-22 06:58: a landed window may go whatever its holders count, but
+  /// only where every holder of it can bring it back). Do: put an object of three windows and a part, hold each window
+  /// twice more (a landed push's holders: its staged pack, its repository's), then let it go landed with the second window named
+  /// pinned by a home; then let it go landed with none pinned; bring every window back by the object's bytes. Expect:
+  /// `let_go` refuses each `Shared`; the first landed let-go frees every window but the pinned one, which is refused
+  /// `Pinned { by: "homes" }` and stays; the second frees that one too; the object read whole once brought back.
+  #[test]
+  fn a_landed_window_goes_whatever_its_holders_unless_a_holder_pins_it() {
+    let window = 4096usize;
+    let mut store = ContentStore::new(1 << 22, window).unwrap();
+    let bytes = patterned(window * 3 + 100);
+    let object = store.put_object(&bytes).unwrap();
+    let windows: Vec<ContentId> = bytes.chunks(window).map(ContentId::of).collect();
+    for id in &windows {
+      store.hold(id).unwrap();
+      store.hold(id).unwrap();
+      assert!(store.mark_landed(id));
+      assert_eq!(store.let_go(id), Err(LetGoRefused::Shared));
+    }
+    let pinned = windows[1];
+    assert_eq!(
+      store.let_go_landed(&pinned, Some("homes")),
+      Err(LetGoRefused::Pinned { by: "homes" })
+    );
+    let (freed, kept) =
+      store.let_go_object_landed(&object, &|id| (*id == pinned).then_some("homes"));
+    assert_eq!(kept, 1, "the pinned window kept");
+    assert_eq!(freed, u64::try_from(bytes.len() - window).unwrap());
+    assert!(!store.is_away(&pinned));
+    assert!(
+      windows
+        .iter()
+        .filter(|id| **id != pinned)
+        .all(|id| store.is_away(id))
+    );
+    let (freed, kept) = store.let_go_object_landed(&object, &|_| None);
+    assert_eq!((freed, kept), (u64::try_from(window).unwrap(), 0));
     assert_eq!(store.bring_back_object(&object, &bytes), Ok(4));
     assert_eq!(
       store.object_bytes(&object, u64::try_from(bytes.len()).unwrap()),

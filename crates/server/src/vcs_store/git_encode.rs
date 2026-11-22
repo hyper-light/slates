@@ -152,8 +152,17 @@ impl super::VcsStores {
 pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Turned {
   // A-614 amended: a version's D(k), which its fragments are encoded from, derived first where it is not known, so an
   // encoding turned by any path (a fetch's wait, the task behind it) never meets a version left for its first reader.
-  if super::git_derive::turn(state, id) == super::git_derive::Turned::More {
-    return Turned::More;
+  match super::git_derive::turn(state, id) {
+    super::git_derive::Turned::More => return Turned::More,
+    // A derivation's read met a window let go: kept on the repository for the encoding's driver to bring back
+    // (`Repository::waiting`, `read_through::bring_back`), the turn answered not done.
+    super::git_derive::Turned::Waiting(waited) => {
+      if let Some((_, store)) = state.vcs_stores.git_ref(id) {
+        store.repository.wait_for(waited);
+      }
+      return Turned::More;
+    }
+    super::git_derive::Turned::Idle => {}
   }
   let began = slates_rt::futures::now_ns();
   let (turned, kept) = turn_uncounted(state, id);
@@ -462,6 +471,8 @@ fn ahead_allowed(state: &mut ShardState, id: RepositoryId) -> bool {
 /// fragments past its learned grant given back by §4.11's cost model ([`relieve`]); counted [`GIVEN_BACK_IDLE`]. A
 /// repository with no grant learned yet keeps its fragments: nothing tells what they are worth.
 pub(crate) fn give_back_idle(state: &mut ShardState, id: RepositoryId) {
+  // Goal 93 item 2b: the landed packs it owes a let-go, now that no fetch of it is answered (`vcs_store::let_go_owed`).
+  super::let_go_owed(state, id);
   let under_way = state
     .vcs_stores
     .encodings

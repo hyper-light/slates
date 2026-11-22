@@ -97,8 +97,10 @@
 > back from the node's store; the RSS test now prints the memory gauges at each reading. git's driver hook (w-git): a
 > fetch's and an encoding's packs made resident before they read (`vcs_store::upload::resident`), and a window an
 > encoding turn met let go brought back before the next; a let-go must wait for no fetch live and no encoding under way,
-> since a pack's answer cannot be taken again mid-pack byte for byte. (2b), the let-go after a landing,
-> next: a landed pack's windows have several holders, which `let_go` refuses (`Shared`).
+> since a pack's answer cannot be taken again mid-pack byte for byte. (2b)(a) LANDED (w-shared): a landed push's staged
+> pack let go once no fetch is answered and no encoding runs (else owed to the idle give-back), whatever its windows'
+> holders (`ContentStore::let_go_landed`), every window a home holds here kept (`vcs_store::landed_pin`; a one-shard
+> daemon lets nothing go until (2b)(b), homes' own read-through, next).
 > Owed, in main's order: (1) the push's temporaries cut at their source (w-shared);
 > (2) landed windows and the pack let go once durable (w-shared, with w-git); (3) the recent-objects cache given back
 > after a fetch (w-git); (4) the index tables, decided after.
@@ -3793,7 +3795,10 @@
 > after a refused append is impossible by construction: `append` takes its changes by value and a refusal gives none
 > back (`a_refused_named_append_is_retried_only_with_a_work_built_again`). Owed: main's daemon A/B; piece (c), the
 > batch's commit adopting the scratch member's files. Not A-865's: `recovery.rs`'s `an_overlay_whose_base_directory_was_removed_serves_its_own_files_after_a_restart`
-> fails at origin/main 7ced987e6 as well (LOOKUP status, `tests/common/nfs.rs:238`).
+> failed at origin/main 7ced987e6 as well (LOOKUP status, `tests/common/nfs.rs:238`). **Closed (w-interop, 2026-11-22):**
+> A-833's lazy reopen made a gone base directory's first use, its attributes, refuse the directory itself; it now
+> answers from the volume's node, and a reopen that meets the descriptor limit no longer records a live directory gone
+> (`docs/bugs/2026-11-22-overlay-gone-base-directory-first-use.md`).
 > Still to measure: the A-742 floor's A/B only if the
 > footprint still stays (main's ruling). A local 64 KiB floor gave 47 MB of footprint at 2 s idle, against 363 MB, at
 > 19.4 s against 12.0 s (debug).
