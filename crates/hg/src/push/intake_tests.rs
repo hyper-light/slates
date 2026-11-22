@@ -1296,3 +1296,161 @@ fn an_intakes_widest_full_text_is_the_least_room_a_step_of_it_takes() {
   );
   fork.release(&mut store).unwrap();
 }
+
+/// Main 01a20182's ruling (b1) of 2026-11-22 04:44 (a push's segment changeset's `Record`: record v8, its rows by
+/// identity, as an import's segment's). Do: take stock 7.2's changegroup into an empty index cut at [`SEGMENT_BYTES`],
+/// writing each segment's record as it is cut and the rest's once every unit is taken; replay the records in order into
+/// another empty index over the same content store. Expect more than one record, each a push's; and the replayed
+/// index the intake's fork row for row.
+#[test]
+fn a_pushs_segment_records_replay_in_order_to_its_forks_rows() {
+  let part = stock();
+  let mut store = store();
+  let mut index = HgIndex::new();
+  let mut admission = room();
+  let mut taking = Intake::begin(
+    (part.version, &part.payload),
+    &mut index,
+    &mut store,
+    &mut admission,
+  )
+  .unwrap()
+  .cutting(SEGMENT_BYTES);
+  let mut records = Vec::new();
+  let mut recorded = |taking: &mut Intake, store: &ContentStore| {
+    while let Some(segment) = taking.take_segment() {
+      records.push(taking.segment_record(&segment, 1 << 20, store).unwrap());
+    }
+  };
+  loop {
+    let stepped = taking
+      .step(&part.payload, &mut store, &mut admission)
+      .unwrap();
+    recorded(&mut taking, &store);
+    match stepped {
+      Stepped::Store => taking.answer_from_fork(&store),
+      stepped if more(&stepped) => {}
+      _ => break,
+    }
+  }
+  taking.cut_rest();
+  recorded(&mut taking, &store);
+  let (mut fork, _) = finished(taking);
+  assert!(records.len() > 1, "{} records", records.len());
+  let mut replayed = HgIndex::new();
+  for bytes in &records {
+    crate::import::record::replay(bytes, &mut replayed, &mut store).unwrap();
+  }
+  assert_eq!(rows(&mut replayed, &store), rows(&mut fork, &store));
+  replayed.release(&mut store).unwrap();
+  fork.release(&mut store).unwrap();
+}
+
+/// A changegroup 03 of a line of `n` changesets, the `k`th adding file `f{k}`, its manifest listing every file so far
+/// and sent whole against the null base (a full snapshot each), as a whole-history push of a revlog storing snapshots
+/// sends them; every revision whole.
+fn snapshots_push(n: usize) -> Vec<u8> {
+  use crate::changegroup::{self as cg, Revision, Version};
+  use crate::{NULL_NODE, node};
+  let hex = |node: &Node| {
+    let mut out = Vec::new();
+    crate::pushkey::encode_hex(node, &mut out);
+    out
+  };
+  let whole = |(node, p1, link): (Node, Node, Node), text: &[u8], out: &mut Vec<u8>| {
+    let revision = Revision {
+      node,
+      p1,
+      p2: NULL_NODE,
+      base: NULL_NODE,
+      link,
+      flags: 0,
+      info: None,
+      protocol_flags: 0,
+      data: text,
+      sidedata: None,
+    };
+    cg::put_revision_whole(&revision, Version::V03, out).unwrap();
+  };
+  let (mut changeset, mut manifest) = (NULL_NODE, NULL_NODE);
+  let (mut changesets, mut manifests, mut files) = (Vec::new(), Vec::new(), Vec::new());
+  let mut lines = Vec::new();
+  for k in 0..n {
+    let path = format!("f{k:03}").into_bytes();
+    let text = format!("file {k}\n").into_bytes();
+    let file = node::compute(&NULL_NODE, &NULL_NODE, &text).unwrap();
+    lines.push([&path[..], b"\0", &hex(&file), b"\n"].concat());
+    let manifest_text = lines.concat();
+    let manifest_node = node::compute(&manifest, &NULL_NODE, &manifest_text).unwrap();
+    let changeset_text = [
+      &hex(&manifest_node)[..],
+      b"\ntest\n0 0\n",
+      &path,
+      b"\n\nchange",
+    ]
+    .concat();
+    let changeset_node = node::compute(&changeset, &NULL_NODE, &changeset_text).unwrap();
+    changesets.push((changeset_node, changeset, changeset_text));
+    manifests.push((manifest_node, manifest, manifest_text, changeset_node));
+    files.push((path, file, text, changeset_node));
+    (changeset, manifest) = (changeset_node, manifest_node);
+  }
+  let mut out = Vec::new();
+  for (node, p1, text) in &changesets {
+    whole((*node, *p1, *node), text, &mut out);
+  }
+  cg::put_end(&mut out);
+  for (node, p1, text, link) in &manifests {
+    whole((*node, *p1, *link), text, &mut out);
+  }
+  cg::put_end(&mut out);
+  cg::put_end(&mut out);
+  for (path, node, text, link) in &files {
+    cg::put_name(path, &mut out).unwrap();
+    whole((*node, NULL_NODE, *link), text, &mut out);
+    cg::put_end(&mut out);
+  }
+  cg::put_end(&mut out);
+  out
+}
+
+/// What taking `payload` (a changegroup 03) whole into an empty index kept charged to its admission past its begin, and
+/// what its bookkeeping told at the begin.
+fn kept_and_told(payload: &[u8]) -> (u64, u64) {
+  let mut store = store();
+  let mut index = HgIndex::new();
+  let mut admission = room();
+  let mut intake = Intake::begin(
+    (crate::changegroup::Version::V03, payload),
+    &mut index,
+    &mut store,
+    &mut admission,
+  )
+  .unwrap();
+  let (after_begin, told) = (admission.left(), intake.bookkeeping());
+  while more(&intake.step(payload, &mut store, &mut admission).unwrap()) {}
+  let (fork, _) = finished(intake);
+  fork.release(&mut store).unwrap();
+  (after_begin - admission.left(), told)
+}
+
+/// Main 01a20182's order of 2026-11-22 05:13 (w-interop's whole-history push of hg: 1.37 GB held, the bulk each whole or
+/// null-base manifest's every line, kept for the files' check once a snapshot). Do: take a line of 60 changesets whose
+/// manifests are each a full snapshot, then of 120. Expect what the intake kept, and what its bookkeeping told, to grow
+/// with the changesets (twice the line, less than three times the keeping): each manifest's (path, node) kept once
+/// across the push, never a copy a snapshot (which grows with their square, four times); and the bookkeeping covering
+/// the keeping. Red before: a snapshot's every line kept.
+#[test]
+fn a_push_of_many_whole_manifest_snapshots_keeps_one_copy_of_their_entries() {
+  let (short_kept, short_told) = kept_and_told(&snapshots_push(60));
+  let (long_kept, long_told) = kept_and_told(&snapshots_push(120));
+  println!("kept {short_kept} then {long_kept}, told {short_told} then {long_told}");
+  assert!(
+    long_kept <= long_told,
+    "kept {long_kept} of {long_told} told"
+  );
+  assert!(
+    long_kept * 2 < short_kept * 5 && long_told * 2 < short_told * 5,
+    "kept {short_kept} then {long_kept}, told {short_told} then {long_told}: past linear in the changesets"
+  );
+}
