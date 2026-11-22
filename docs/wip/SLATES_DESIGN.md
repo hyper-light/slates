@@ -16478,6 +16478,15 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > and Subversion's words for a share (the seam proposed to w-git); Mercurial's and Subversion's intakes counted live;
 > backpressure before refusal; a fetch's room as a claim of its own.
 
+> **Status (2026-11-21, A-843: a repository destroyed whole, its neighbours untouched).** The correctness proof of many
+> repositories on one daemon (`crates/cli/tests/vcs_many_repositories.rs`, w-balance) destroys one repository a tool
+> mid-load. `DestroyRepository` (`slates repository destroy NAME`, its owner's verb, `crate::repository::
+> destroy_repository`) does it on the owner shard as one verb, everything judged before its first record: the record,
+> namespace and logs (`Op::RepositoryDestroyed`), every member green leaves first (each its own destroy), the holds its
+> git records kept, its tool store and its usage row (`vcs_store::free`). A content another repository holds keeps that
+> hold. Owed: the landed changesets of a destroyed repository on the node's store (A-767), which only a landing may
+> remove (R1).
+
 **Role.** One slates server serves many repositories at once, from toys to monorepos the size of Google's or Meta's,
 several of those at once, and divides its memory, its CPU, its admission and its placement among them by what their
 agents and clients actually do (Ada, 2026-11-20). No repository has a fixed share: every share is a stated formula

@@ -4040,6 +4040,20 @@ impl Client {
     }
   }
 
+  /// Destroys repository `repository` whole, its owner asking (A-843; `slates repository destroy`): its record, its
+  /// namespace and logs, every green of its lineage and its store. Refused typed (`NotFound`, `Forbidden` for a
+  /// principal but the owner).
+  pub fn destroy_repository(&mut self, repository: &str) -> Result<(), ClientError> {
+    match self.call(&RequestBody::DestroyRepository {
+      repository: repository.to_owned(),
+    })? {
+      ReplyBody::Destroyed => Ok(()),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "destroy_repository",
+      }),
+    }
+  }
+
   /// Reads repository `repository`'s policy whole, its owner asking (A-622; `slates repository policy`): its version and
   /// every part. Refused typed (`NotFound`, `Forbidden` for a principal but the owner).
   pub fn describe_repository_policy(

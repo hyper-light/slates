@@ -499,6 +499,13 @@
 > a time through `StorePacks` rather than whole; the push's pack held twice in RAM until it lands (its own
 > buffer and the content store's windows); a node whose store lacks a record's changeset reading its names from their
 > region homes, held by a test of its own (the rebuild test now reads the node's store).
+> OPEN (goal 93, w-git; w-sessionlog's reduction 2026-11-21): a whole clone of git/git with 506 tags or more is aborted
+> "possible repository corruption on the remote side". The repository's encoding never finishes (its first version,
+> master's whole history, begun and never kept; each tag's first version is encoded over everything it reaches, so the
+> work grows with tags times history), and a fetch that stops waiting for it is answered with the pack unfinished. Not
+> reproduced at a unit's scale (`t_goal93_a_whole_clone_…`, `t_goal93_a_clone_answered_while_…`: 40 tags of a delta-heavy
+> line, fetched before, during and after the encoding, whole). The HTTP edge now counts a refused answer
+> (`vcs_http.git.upload_refused`) and logs its typed refusal, so w-sessionlog's repro names the cause; then red and fix.
 > A-836 BUILT (2026-11-21, w-git; w-interop r16): a ref may name any object. A tag chain is peeled to its end and a ref
 > naming a blob holds no files (its green at git's empty tree), so git/git's `junio-gpg-pub` and `v1.0rc1`..`rc6` are
 > taken and served (`t_a836_…`). Owed: w-interop's rerun of git/git's push and clones over it.
@@ -1968,9 +1975,11 @@
 > all at once, fetched during the second pushes, one a tool created and one destroyed mid-load; each then checked alone
 > (git `fsck --strict`, exactly its commits and refs; hg `verify`, its changesets, bookmark and tag; svn its two
 > revisions, paths and log, `svnrdump dump` into `svnadmin verify`). Focused run (git, N = 2, macOS debug, dba4ae793):
-> every push, fetch, check and the mid-load creation held. **Open, completion:** no client can destroy a repository.
-> `Op::RepositoryDestroyed` (A-515) is in the db, but no server verb or CLI command issues it (`slates repository
-> destroy` is refused as an unknown verb), so the test's destroy step is red and the doomed repository is still served.
+> every push, fetch, check and the mid-load creation held. The mid-load destroy is closed by A-843 (2026-11-21,
+> w-multirepo): `slates repository destroy NAME` (`DestroyRepository`) destroys a repository whole on its owner shard;
+> focused run (git, N = 2, macOS arm64 debug, this Mac): `MANY N=2 tools [Git]: 0 failures`, the destroyed repository
+> refused a fetch and every other held. **Open:** a destroyed repository's landed changesets stay in the node's
+> append-only store log (A-767), which only a landing may compact (R1); hg and svn at N = 2, 16, 64 are main's rounds.
 >
 > **The hg correctness lane (2026-11-21, w-balance, UI goal 93 correctness by use):** `crates/cli/tests/hg_interop.rs`
 > `stock_hg_gets_what_stock_hg_serve_gives_on_every_verb_over_http_and_ssh` (ignored; main runs it) drives

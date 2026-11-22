@@ -2318,6 +2318,100 @@ fn t_goal93_a_whole_clone_of_a_line_with_an_annotated_tag_of_every_commit_is_who
   });
 }
 
+/// Goal 93's whole-clone abort (w-sessionlog's reduction, 2026-11-21 16:15: a clone of git/git with 506 tags or more
+/// stops waiting for the repository's encoding, `encode_for_fetch`'s bounded wait, and is answered while the encoding is
+/// under way; its pack ends `aborting due to possible repository corruption on the remote side`, every clone after it
+/// too). Do: push the tagged line of [`t_goal93_a_whole_clone_of_a_line_with_an_annotated_tag_of_every_commit_is_whole`];
+/// turn its encoding a few turns at a time, and between each few fetch every ref's object, as a clone that stopped
+/// waiting does, until the encoding is idle. Expect: every fetch answered with no refusal, its pack whole and holding
+/// every object pushed, each once, whatever the encoding had kept so far. Not red at this scale, even fetched after every
+/// turn (the abort needs git/git's: objects past a window and a first version that never finishes encoding); kept as the
+/// guard of a fetch answered mid-encoding, and the HTTP edge now counts and logs a refused answer's cause.
+#[test]
+fn t_goal93_a_clone_answered_while_the_encoding_is_under_way_is_whole() {
+  use slates_git::object_name::Kind;
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let mut objects = Vec::new();
+  let mut commits = Vec::new();
+  let mut parent = None;
+  for at in 0..TAGGED_LINE {
+    let (commit, made) = growing_commit(at, parent);
+    objects.extend(made);
+    commits.push(commit);
+    parent = Some(commit);
+  }
+  let mut named: Vec<(ObjectId, Vec<u8>)> =
+    vec![(*commits.last().unwrap(), b"refs/heads/main".to_vec())];
+  for (at, commit) in commits.iter().enumerate() {
+    let name = format!("v{at}");
+    let (tag, bytes) = tag_object(&name, (*commit, "commit"));
+    objects.push((Kind::Tag, bytes));
+    named.push((tag, format!("refs/tags/{name}").into_bytes()));
+  }
+  let ids: Vec<String> = named.iter().map(|(id, _)| id.to_string()).collect();
+  let commands: Vec<(&str, &str, &[u8])> = named
+    .iter()
+    .zip(&ids)
+    .map(|((_, name), id)| ("", id.as_str(), name.as_slice()))
+    .collect();
+  let pushing = request(&commands, CAPABILITIES, &pack_of_objects(&objects));
+  // The push a poll of its own, as each round below is: the shard steps between them, as a daemon's does.
+  let (repository, reasons_pushed) = crate::daemon::observe_first(&daemon, move |state| {
+    let repository = git_repository(state, "encoding-under-way");
+    (repository, reasons(&pushed(state, repository, &pushing)))
+  });
+  assert!(
+    reasons_pushed.iter().all(|reason| reason == b"ok"),
+    "{reasons_pushed:?}"
+  );
+  let pushed_ids: std::collections::BTreeSet<ObjectId> = objects
+    .iter()
+    .map(|(kind, bytes)| {
+      slates_git::object_name::name_of(ObjectFormat::Sha1, *kind, bytes).unwrap()
+    })
+    .collect();
+  let wants: Vec<ObjectId> = named.iter().map(|(id, _)| *id).collect();
+  let mut fetches = 0usize;
+  let mut rounds = 0usize;
+  loop {
+    let wanting = wants.clone();
+    // A round: a few turns of the encoding, then a fetch of every ref's object as a clone that stopped waiting asks.
+    let (fetched, idle) = crate::daemon::observe_first(&daemon, move |state| {
+      let mut idle = false;
+      for _ in 0..ENCODING_TURNS_BETWEEN_FETCHES {
+        if crate::vcs_store::git_encode::turn(state, repository)
+          == crate::vcs_store::git_encode::Turned::Idle
+        {
+          idle = true;
+          break;
+        }
+      }
+      (fetched_ids(state, repository, &wanting), idle)
+    });
+    fetches += 1;
+    rounds += 1;
+    let set: std::collections::BTreeSet<ObjectId> = fetched.iter().copied().collect();
+    assert_eq!(
+      (fetched.len(), &set),
+      (pushed_ids.len(), &pushed_ids),
+      "fetch {fetches}: every object pushed, each once"
+    );
+    if idle {
+      break;
+    }
+    assert!(rounds < ENCODE_TURNS_BOUND, "an encoding that never ended");
+  }
+  daemon.stop();
+  assert!(
+    fetches > 1,
+    "fetched only once: the encoding was never under way"
+  );
+}
+
+/// Shape: the encoding's turns between two fetches of [`t_goal93_a_clone_answered_while_the_encoding_is_under_way_is_whole`]:
+/// few enough that many fetches meet a version's encoding under way.
+const ENCODING_TURNS_BETWEEN_FETCHES: usize = 1;
+
 /// `repository`'s tags as `ls-refs` with `peel` lists them to its owner, a line each.
 fn tags_listed_peeled(state: &mut ShardState, repository: RepositoryId) -> Vec<String> {
   use crate::vcs_store::upload::tests::{answered, lines_of, request as upload_request};
