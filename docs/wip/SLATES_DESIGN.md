@@ -60965,5 +60965,17 @@ owed.
   entries it reuses, an offset delta's base always before it, each window wanted once. Counted `backward_reads`.
   `git_push::tests::t_a859_a_clone_of_a_deltified_push_sends_its_entries_as_they_lie`: 0 backward reads (88 in position
   order), its streamed clone 17,299 bytes, the pushed pack's own, in 175 turns where 403 went before.
-- **Owed.** main's git/git whole round: the clone within PATIENCE, the encoding's `reuse_unread` 0. Pieces 2 and 3: a
-  turn's windows brought back ahead of it and let go behind it, residency at its peak a turn's windows.
+- **Piece 2, a fetch's look-ahead** (main 01a20182's ruling of 2026-11-22: residency bounded by a turn's windows). A
+  unit of the stream whose pushed entry lies in a let-go window, or a copy under way that reaches one, stops before it
+  writes or keeps anything; the turn ends there, the window named (`Upload::waiting`), and the unit is taken again on
+  the next turn, so a turn's sideband framing is a turn's as ever. Before each turn, off it, the fetch's driver (both
+  edges) brings back the window the last turn stopped at and the `LOOK_AHEAD_WINDOWS` (two) the next turn reads first
+  (`Upload::reading_next`: a pack is read front to back, piece 1). A fetch no longer makes its repository's packs
+  resident; an encoding does, where one is due (`git_encode::encoding_due`). Counted `ahead_brought` and
+  `stopped_brought`. Tests: `slates-git` `a864_a_turn_that_meets_a_let_go_window_stops_cleanly_and_the_clone_is_byte_identical`
+  (every window of a landed pack let go: stopped and brought back, the clone byte for byte; red: refused);
+  `slates-server` `t_a864_a_fetchs_look_ahead_brings_back_a_turns_windows_never_its_pack` (two of four windows).
+- **Owed.** main's git/git whole round: the clone within PATIENCE, the encoding's `reuse_unread` 0. Piece 3: the windows
+  a fetch brought back let go behind its cursor (w-shared's `let_go_read`, with 2b(a)), so residency at its peak is a
+  turn's windows, gauged; and the end-to-end red over a real pushed pack, which needs 2b(a)'s let-go of `Shared`
+  windows. The encoding's own look-ahead: it still makes a due version's packs resident whole.

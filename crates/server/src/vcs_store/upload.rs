@@ -121,6 +121,15 @@ impl StoreLender for ShardStores {
     }
   }
 
+  fn pack_reads(pack: &Streamed) -> crate::vcs_http::git::upload::PackReads {
+    let (next, stopped) = pack.pack_reads();
+    crate::vcs_http::git::upload::PackReads { next, stopped }
+  }
+
+  async fn read_ahead(&mut self, reads: crate::vcs_http::git::upload::PackReads) {
+    read_ahead(reads).await;
+  }
+
   fn paced(&mut self, taught: (u64, u64)) {
     let _ = crate::state::with_state_counted(|state| learn_link(state, taught));
   }
@@ -131,8 +140,8 @@ impl StoreLender for ShardStores {
   /// amended), every version admitted with no walk has its sets derived, a turn at a time ([`super::git_derive`]), waited
   /// for whole: the answer is made from them.
   async fn encode(&mut self, id: RepositoryId) {
-    // Goal 93 item 2a: the packs the answer reads made resident first, so no read of it meets a let-go window.
-    resident(id).await;
+    // A-864 piece 2: the answer's own reads are brought back a turn ahead (`read_ahead`); its encoding's packs, where
+    // one is due, by the encoding (`git_encode::encode_within`).
     // A-614 amended: the sets of versions admitted with no walk derived first, which the answer and the encoding read.
     super::git_derive::derive_for_read(id).await;
     super::git_encode::encode_for_fetch(id).await;
@@ -191,6 +200,52 @@ pub(crate) async fn brought_back_all(away: Vec<slates_git::store::packed::Waited
     }
   }
   brought
+}
+
+/// Format: the windows a fetch's look-ahead brings back ahead of its next turn (A-864 piece 2): the one it begins to read
+/// in and the next, so a turn reading on into the next window finds it held; one reading past them stops cleanly there.
+const LOOK_AHEAD_WINDOWS: u64 = 2;
+
+/// Counter: windows a fetch's look-ahead brought back ahead of its turn (A-864 piece 2). Format: a counter name.
+pub(crate) const AHEAD_BROUGHT: &str = "vcs_store.git_resident.ahead_brought";
+/// Counter: windows a fetch's turn stopped at, let go, and brought back before its next (A-864 piece 2). Format: a
+/// counter name.
+pub(crate) const STOPPED_BROUGHT: &str = "vcs_store.git_resident.stopped_brought";
+
+/// A fetch's look-ahead (A-864 piece 2; main 01a20182's ruling of 2026-11-22): before its next turn, off the turn, the
+/// let-go window its last turn stopped at, and those of the [`LOOK_AHEAD_WINDOWS`] its next turn reads first, brought
+/// back from the node's store; the turn then reads on without meeting one, and one reading past them stops cleanly at a
+/// unit's boundary, nothing of it written (`slates_git::store::Upload::waiting`).
+pub(crate) async fn read_ahead(reads: crate::vcs_http::git::upload::PackReads) {
+  if let Some(stopped) = reads.stopped
+    && super::read_through::bring_back(stopped)
+      .await
+      .is_ok_and(|bytes| bytes > 0)
+  {
+    let _ = crate::state::with_state_counted(|state| state.count(STOPPED_BROUGHT, 1));
+  }
+  let Some(next) = reads.next else {
+    return;
+  };
+  let away = crate::state::with_state(|state| {
+    let content = state.vcs_stores.content()?;
+    let window = to_u64(content.window()).max(1);
+    let first = next.offset / window;
+    Some(
+      (first..first.saturating_add(LOOK_AHEAD_WINDOWS))
+        .map(|index| index.saturating_mul(window).max(next.offset))
+        .filter(|offset| *offset < next.len)
+        .filter(|offset| content.away_window(&next.pack, next.len, *offset).is_some())
+        .map(|offset| slates_git::store::packed::Waited { offset, ..next })
+        .collect::<Vec<_>>(),
+    )
+  })
+  .flatten()
+  .unwrap_or_default();
+  let windows = to_u64(away.len());
+  if brought_back_all(away).await > 0 {
+    let _ = crate::state::with_state_counted(|state| state.count(AHEAD_BROUGHT, windows));
+  }
 }
 
 /// Brings back the let-go window a read of git repository `id` met and noted (`Repository::waiting`), where one did;
