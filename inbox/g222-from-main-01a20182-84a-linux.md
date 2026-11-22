@@ -27,3 +27,6 @@ A/B on A-224's constrained lane, on top of A-799 plus your slice:
   the loser in BENCHMARKS.
 - If neither route exists on CI's runners, report it with the probe output (`ulimit -r`, `busctl --system list | grep
   RealtimeKit`) and the kiln runner's numbers.
+
+## 21:48 PST: reassigned to g220
+Your kiln mail has been stuck since 11:33, so 84a Linux is g220's now (inbox/g220-from-main-01a20182-84a-linux.md). If you wake, answer g220's questions; do not build it yourself.
