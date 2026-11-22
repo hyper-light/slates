@@ -19001,7 +19001,22 @@ fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, 
       now,
     );
     state.current_span = Some(ring.context());
+    let g222_serve_began = slates_machine::clock::monotonic_ns();
     let served = serve(state, handle, &request, now);
+    let g222_serve_ns = slates_machine::clock::monotonic_ns().saturating_sub(g222_serve_began);
+    if crate::g222_diag::serve_is_long(g222_serve_ns) {
+      // Named only when long, so the normal path pays nothing: the payload decoded again, its variant's name kept.
+      let verb = state
+        .clients
+        .get(handle)
+        .ok()
+        .and_then(|c| unpack::<RequestBody>(c.end.region(), request.kind, &request.payload).ok())
+        .map_or_else(
+          || "?".to_owned(),
+          |body| crate::g222_diag::variant_name(&format!("{body:?}")),
+        );
+      crate::g222_diag::long_serve(g222_serve_began, g222_serve_ns, verb);
+    }
     state.current_span = None;
     state.forward_hold_ns = 0;
     match served {

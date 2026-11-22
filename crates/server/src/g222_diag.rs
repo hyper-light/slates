@@ -595,6 +595,49 @@ pub fn dump_ring(path: &str) {
 
 pub fn dump_polls(path: &str) {
   slates_rt::g222_polls::dump(path);
+  dump_serves(&format!("{path}.serves"));
+}
+
+/// w-perf 84a: a serve this long (or longer) is recorded with its verb: past every quantum the shards derive here.
+const LONG_SERVE_NS: u64 = 200_000;
+/// Shape: long serves kept.
+const SERVES_CAP: usize = 100_000;
+/// Every long serve: shard, start (monotonic ns), length, verb.
+static SERVES: std::sync::Mutex<Vec<(u16, u64, u64, String)>> = std::sync::Mutex::new(Vec::new());
+
+pub fn serve_is_long(ns: u64) -> bool {
+  ns >= LONG_SERVE_NS
+}
+
+/// The variant's name at the head of a `Debug` rendering.
+pub fn variant_name(debug: &str) -> String {
+  debug
+    .split(|c: char| c == ' ' || c == '{' || c == '(')
+    .next()
+    .unwrap_or("?")
+    .to_owned()
+}
+
+pub fn long_serve(began: u64, ns: u64, verb: String) {
+  let shard = slates_rt::registry::current_shard().unwrap_or(u16::MAX);
+  if let Ok(mut serves) = SERVES.lock() {
+    if serves.len() < SERVES_CAP {
+      serves.push((shard, began, ns, verb));
+    }
+  }
+}
+
+fn dump_serves(path: &str) {
+  use std::io::Write;
+  let mut out = String::from("shard\tstart\tlength\tverb\n");
+  if let Ok(mut serves) = SERVES.lock() {
+    for (shard, start, length, verb) in serves.drain(..) {
+      out.push_str(&format!("{shard}\t{start}\t{length}\t{verb}\n"));
+    }
+  }
+  if let Ok(mut f) = std::fs::File::create(path) {
+    let _ = f.write_all(out.as_bytes());
+  }
 }
 
 pub fn dump_parks(path: &str) {

@@ -53,7 +53,15 @@ for row in rows(base + ".parks"):
     if len(row) >= 7:
         waited, ended, wake_after, shard, began = row[1], row[2], row[4], row[5], row[6]
         by_shard_parks.setdefault(shard, []).append((began, began + waited, ended, wake_after))
-for table in (by_shard_polls, by_shard_parks):
+by_shard_serves = {}
+try:
+    for line in open(base + ".polls.serves"):
+        if line[:1].isdigit():
+            shard, start, length, verb = line.rstrip("\n").split("\t", 3)
+            by_shard_serves.setdefault(int(shard), []).append((int(start), int(start) + int(length), int(length), verb))
+except OSError:
+    pass
+for table in (by_shard_polls, by_shard_parks, by_shard_serves):
     for shard in table:
         table[shard].sort()
 
@@ -87,6 +95,14 @@ def split(r, window):
 
 total = sorted(ring, key=lambda r: r[0] + r[1])
 n = len(total)
+all_serves = [serve for serves in by_shard_serves.values() for serve in serves]
+serve_verbs = {}
+for serve in all_serves:
+    count, total = serve_verbs.get(serve[3], (0, 0))
+    serve_verbs[serve[3]] = (count + 1, total + serve[2])
+print("long serves (>= 200 us) by verb: " + "; ".join(f"{verb} n {count} total {us(total)} us max "
+      f"{us(max(s[2] for s in all_serves if s[3] == verb))} us" for verb, (count, total) in
+      sorted(serve_verbs.items(), key=lambda item: -item[1][1])[:8]))
 print(f"tailjoin: requests n {n}; long polls {sum(len(v) for v in by_shard_polls.values())}; "
       f"parks {sum(len(v) for v in by_shard_parks.values())}")
 for label, low in (("p99 tail", .99), ("p999 tail", .999)):
@@ -113,3 +129,12 @@ for label, low in (("p99 tail", .99), ("p999 tail", .999)):
               f"in parks {us(med([p[2] for p in parts]))}, short work {us(med([p[3] for p in parts]))}")
         for cause, count in sorted(causes.items(), key=lambda item: -item[1])[:6]:
             print(f"     {count:4} {cause}")
+        verbs = {}
+        for r in tail:
+            queued, served, landed, written, shard = r[0], r[1], r[2], r[3], r[-1]
+            lo, hi = (landed, landed + queued) if window == "queued" else (landed + queued, written)
+            for part, serve in overlap(by_shard_serves.get(shard, []), lo, hi):
+                verbs[serve[3]] = verbs.get(serve[3], 0) + part
+        if verbs:
+            print("     long serves overlapping, by time: " + "; ".join(
+                f"{verb} {us(ns)} us" for verb, ns in sorted(verbs.items(), key=lambda item: -item[1])[:6]))
