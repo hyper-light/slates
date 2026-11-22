@@ -9,3 +9,14 @@
   fails and the repository stays served. In GAPS. QUESTION: whose is it? I can build `repository destroy NAME` (the
   verb, the CLI, the server's teardown of its state logs, holds and homes, red test first) if you say so.
 - Meanwhile I am on (2): A-724 piece 2, the learned demand and the shares.
+
+## 2026-11-21 ~18:40 PST: A-724 pieces landed since, each red first, focused tests green
+- 6cbbe5ee2 piece 2a: a repository's claim on the room is its learned demand (`slates_vcs::Learned`, a mean of its
+  intakes' bytes decayed by its own rhythm), not its lifetime mean. Red: a monorepo grown 64-fold left a toy 99.93%.
+- 6372a0b89 piece 3b: a git push past its share is refused typed (`PushFailed::PastShare`, `PastSnapshot`) and
+  retryable (503, words naming the share), where before it read as too large for the server (413).
+- de3fd468a piece 3c: a Mercurial push is live among the shard's intakes and counted and learned on its usage row.
+- c7b9f66d1 piece 3c: a Subversion commit likewise, at `land_work`.
+- FOUND (GAPS): no Subversion commit is admitted against the room at all; its texts arrive into the conversation's sink
+  unadmitted. That admission touches the svn commit drive (w-svn's files): say whether I build it with w-svn's leave.
+- Next, mine: a fetch's room as a claim of its own, then backpressure before refusal.
