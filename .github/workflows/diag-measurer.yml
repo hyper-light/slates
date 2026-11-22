@@ -1,0 +1,57 @@
+name: diag measurer
+# w-interop (2026-11-22, main 01a20182's ask): the Windows half of the wall. ci.yml's own `windows-lint` ("native clippy
+# + tests (windows)") clippy steps and `windows-arm64`'s clippy step, as written there, each kept going past a red so
+# one run lists every Windows-only break. Run only from `diag-measurer-*` branches, never main.
+
+on:
+  push:
+    branches: ["diag-measurer-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  windows-lint:
+    name: native clippy (windows-latest)
+    runs-on: windows-latest
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Clippy the Windows-buildable crates (native Windows)
+        continue-on-error: true
+        run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-bridge-virtiofs -p slates-sdk-node -p slates-sdk-python -p slates-anchor -p slates-mcp -p slates-cluster -p slates-land --all-targets -- -D warnings
+      - name: Clippy the shipped Windows binary and every other slates-cli target
+        continue-on-error: true
+        run: cargo clippy -p slates-cli --all-targets -- -D warnings
+      - name: Clippy the WinFsp CLI tests (native Windows)
+        continue-on-error: true
+        run: cargo clippy -p slates-cli --test winfsp --test winfsp_semantics -- -D warnings
+      - name: Clippy the Shards hand-off CLI test (native Windows)
+        continue-on-error: true
+        run: cargo clippy -p slates-cli --test shards -- -D warnings
+      - name: Clippy the start-judgment CLI test (native Windows)
+        continue-on-error: true
+        run: cargo clippy -p slates-cli --test start_judgment --test held_rendezvous -- -D warnings
+  windows-arm64:
+    name: native clippy (windows-11-arm)
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy natively on arm64 Windows
+        continue-on-error: true
+        run: >-
+          cargo clippy -p slates-wire -p slates-mem -p slates-rt -p slates-ipc -p slates-machine
+          --all-targets -- -D warnings
