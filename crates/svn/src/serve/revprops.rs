@@ -65,18 +65,21 @@ pub(super) fn is_revision_property_change(name: &str) -> bool {
   matches!(name, CHANGE_REV_PROP | CHANGE_REV_PROP2)
 }
 
-/// A change read from its item.
-struct Change {
+/// A revision property change as a client asks it (`svn_repos_fs_change_rev_prop4`'s arguments): ra_svn's
+/// `change-rev-prop` and `change-rev-prop2` (read here), and the HTTP edge's PROPPATCH of a revision resource
+/// (`crate::dav::revprops`), each judged by the same steps: [`revision_property_refused`] before the hooks,
+/// [`pre_revprop_change`] for pre-revprop-change's call, [`changed_properties`] once it allowed the change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevisionPropertyChange {
   /// The revision.
-  revision: Revision,
+  pub revision: Revision,
   /// The property's name.
-  name: Vec<u8>,
+  pub name: Vec<u8>,
   /// The new value; none deletes it.
-  value: Option<Vec<u8>>,
-  /// The value the client expects the property to hold, none for absent (`change-rev-prop2` without `dont-care`).
-  expected: Option<Option<Vec<u8>>>,
-  /// Whether it named both `dont-care` and a previous value.
-  both: bool,
+  pub value: Option<Vec<u8>>,
+  /// The value the client expects the property to hold, none for absent; none where it names no expectation
+  /// (`change-rev-prop`, `change-rev-prop2` with `dont-care`, a PROPPATCH without `V:old-value`).
+  pub expected: Option<Option<Vec<u8>>>,
 }
 
 /// What the change's answer leads to.
@@ -100,8 +103,8 @@ impl Connection {
     authenticated_now: bool,
     out: &mut Vec<u8>,
   ) -> Result<Changed, Refused> {
-    let change = read(name, params).ok_or(Refused::Malformed)?;
-    if change.both {
+    let (change, both) = read(name, params).ok_or(Refused::Malformed)?;
+    if both {
       write_failure(&[(INCORRECT_PARAMS, BOTH_WORDS.to_owned())], out)?;
       return Ok(Changed::Answered);
     }
@@ -150,26 +153,11 @@ impl Connection {
       trivial_auth(out)?;
     }
     let rules = established.compiled_read_rules(&sources.policy);
-    if let Some(refusal) = judged(sources.index, rules, &change) {
+    if let Some(refusal) = revision_property_refused(sources.index, rules, &change) {
       write_failure(&refusal, out)?;
       return Ok(Changed::Answered);
     }
-    let old = match &change.expected {
-      Some(expected) => expected.clone(),
-      None => held_value(sources.repository, change.revision, &change.name),
-    };
-    let action = match (&change.value, &old) {
-      (None, _) => RevisionPropertyAction::Deleted,
-      (Some(_), None) => RevisionPropertyAction::Added,
-      (Some(_), Some(_)) => RevisionPropertyAction::Modified,
-    };
-    let call = RevisionPropertyCall {
-      revision: change.revision,
-      user: author,
-      name: String::from_utf8_lossy(&change.name).into_owned(),
-      action,
-      value: change.value.clone().unwrap_or_default(),
-    };
+    let (old, call) = pre_revprop_change(sources.repository, &change, author);
     Ok(Changed::Hooking(Box::new(Pending {
       change,
       old,
@@ -320,7 +308,7 @@ enum Stage {
 /// A change past its checks (module documentation).
 pub(super) struct Pending {
   /// The change.
-  change: Change,
+  change: RevisionPropertyChange,
   /// The value its hooks are told the property held: the one expected, else the one held when it was asked.
   old: Option<Vec<u8>>,
   /// Its pre-revprop-change call.
@@ -356,11 +344,41 @@ fn held_value<R: reads::Repository + ?Sized>(
     .map(|(_, value)| value.to_vec())
 }
 
+/// The value `change`'s hooks are told the property held (the one the client expects, else the one `repository` holds
+/// now), and pre-revprop-change's call for `user`, the action read against that value (`svn_repos_fs_change_rev_prop4`:
+/// `D` with no new value, else `A` with no old one, else `M`).
+pub fn pre_revprop_change<R: reads::Repository + ?Sized>(
+  repository: &R,
+  change: &RevisionPropertyChange,
+  user: String,
+) -> (Option<Vec<u8>>, RevisionPropertyCall) {
+  let old = match &change.expected {
+    Some(expected) => expected.clone(),
+    None => held_value(repository, change.revision, &change.name),
+  };
+  let action = match (&change.value, &old) {
+    (None, _) => RevisionPropertyAction::Deleted,
+    (Some(_), None) => RevisionPropertyAction::Added,
+    (Some(_), Some(_)) => RevisionPropertyAction::Modified,
+  };
+  let call = RevisionPropertyCall {
+    revision: change.revision,
+    user,
+    name: String::from_utf8_lossy(&change.name).into_owned(),
+    action,
+    value: change.value.clone().unwrap_or_default(),
+  };
+  (old, call)
+}
+
 /// `change`'s revision's properties once it is made (FSFS's `change_rev_prop`), or its refusal: a revision `repository`
 /// does not hold, or a held value other than the one expected.
-fn changed_properties<R: reads::Repository + ?Sized>(
+///
+/// # Errors
+/// The refusal's chain: "No such revision N" (160006), or the held value not the one expected (160049).
+pub fn changed_properties<R: reads::Repository + ?Sized>(
   repository: &R,
-  change: &Change,
+  change: &RevisionPropertyChange,
 ) -> Result<Properties, Vec<(u32, String)>> {
   let revision = change.revision;
   let held = repository
@@ -386,12 +404,12 @@ fn changed_properties<R: reads::Repository + ?Sized>(
   Ok(properties)
 }
 
-/// What the change is refused with before its hooks (module documentation): the first check it fails, none where it
-/// passes them all.
-fn judged(
+/// What `change` is refused with before its hooks (module documentation), for a principal whose read rules are `rules`:
+/// the first check it fails, none where it passes them all.
+pub fn revision_property_refused(
   index: &crate::index::Index,
   rules: Option<&crate::authz::PrincipalRules>,
-  change: &Change,
+  change: &RevisionPropertyChange,
 ) -> Option<Vec<(u32, String)>> {
   let revision = change.revision;
   match crate::reads::revision_wholly_readable(index, rules, revision) {
@@ -416,9 +434,10 @@ fn judged(
   None
 }
 
-/// The change `name` asks with `params` (module documentation); none where a parameter is not what its prototype
+/// The change `name` asks with `params` (module documentation), and whether it named both `dont-care` and a previous
+/// value; none where a parameter is not what its prototype
 /// names (`rc?s`, `rc(?s)(b?s)`), which `svnserve` reads as malformed.
-fn read(name: &str, params: &[Value<'_>]) -> Option<Change> {
+fn read(name: &str, params: &[Value<'_>]) -> Option<(RevisionPropertyChange, bool)> {
   match (name, params) {
     (CHANGE_REV_PROP, [Value::Number(revision), Value::String(property), rest @ ..]) => {
       let value = match rest {
@@ -426,13 +445,15 @@ fn read(name: &str, params: &[Value<'_>]) -> Option<Change> {
         [Value::String(value), ..] => Some(value.to_vec()),
         _ => return None,
       };
-      Some(Change {
-        revision: *revision,
-        name: property.to_vec(),
-        value,
-        expected: None,
-        both: false,
-      })
+      Some((
+        RevisionPropertyChange {
+          revision: *revision,
+          name: property.to_vec(),
+          value,
+          expected: None,
+        },
+        false,
+      ))
     }
     (
       CHANGE_REV_PROP2,
@@ -454,13 +475,16 @@ fn read(name: &str, params: &[Value<'_>]) -> Option<Change> {
         [Value::Word(word), Value::String(previous)] => (boolean(word)?, Some(previous.to_vec())),
         _ => return None,
       };
-      Some(Change {
-        revision: *revision,
-        name: property.to_vec(),
-        value,
-        both: dont_care && previous.is_some(),
-        expected: (!dont_care).then_some(previous),
-      })
+      let both = dont_care && previous.is_some();
+      Some((
+        RevisionPropertyChange {
+          revision: *revision,
+          name: property.to_vec(),
+          value,
+          expected: (!dont_care).then_some(previous),
+        },
+        both,
+      ))
     }
     _ => None,
   }

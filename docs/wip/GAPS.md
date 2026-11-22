@@ -2727,7 +2727,16 @@
 > properties set and deleted, an import, the log, list, cat, proplist, blame, diff and status) over HTTPv2 and against
 > stock svnserve over FSFS, comparing each command's output with timestamps left out. Not yet run (no svn on this Mac):
 > main's run on a Studio with svn 1.15 (run-requests.md). By reading, the edge serves no PROPPATCH on `!svn/rev/N`, so
-> `svn propset --revprop` over HTTP is expected red (w-svn's, if so).
+> `svn propset --revprop` over HTTP is expected red (w-svn's, if so). RED in main 01a20182's run r6 (2026-11-21, big
+> Studio, a3e673efc: E200007 at the first `svn propset --revprop`); BUILT the same night (w-svn): the edge serves a
+> PROPPATCH of a revision resource (HTTPv2's `!svn/rev/N`, DeltaV v1's `!svn/bln/N`; `slates_svn::dav::revprops`,
+> `deadprops.c` `save_value`), each property judged as `svnserve` judges ra_svn's change (the shared
+> `slates_svn::serve::RevisionPropertyChange`), pre-revprop-change run, landed through the owner's step under the
+> landing turn, post-revprop-change with the old value, `207` with each property's `200`; ra_serf's atomic old value
+> (`V:old-value`, `V:old-value-absent`) checked against the held value. Owed: main's rerun of the differential test;
+> a refusal is answered as one `mod_dav_svn` error (the first of its chain), where `mod_dav` answers a PROPPATCH that
+> fails with a `207` whose failing property is `500` and the rest `424` (the client's words for it unchecked); HTTP
+> applies no authz write rules to a revision property change, as it applies none to a commit (`Setup::rules` none).
 > **svn replay by stock clients (w-interop, 2026-11-20; A-703):** `svn-matrix.sh` gains `svnrdump dump` and
 > `svnsync initialize/synchronize` over svn://, each compared with the dump stock svnserve 1.15.0 made of the same history
 > (`crates/svn/fixtures/replay`, `EXPECT_RDUMP`, `EXPECT_SYNC`): over the reads fixtures' repository both are

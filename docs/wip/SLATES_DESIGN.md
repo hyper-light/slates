@@ -16037,7 +16037,9 @@ version (item 3.5). A change (`change-rev-prop`, `change-rev-prop2`, or PROPPATC
 repository's register (§4.17.1), ordered with the versions and replicated with them: validated as a commit's are; gated
 by pre-revprop-change, whose absence refuses every change (`E165006`, Subversion's default, notes §7); compared with
 the old value the client sent (`atomic-revprops`, `E160049` on a difference); then applied; post-revprop-change
-observes. A read sees the newest entry.
+observes. A read sees the newest entry. (Status 2026-11-21: built over ra_svn by A-702; over HTTP the same night,
+w-svn, after main's r6 red: the edge's PROPPATCH of `!svn/rev/N` or `!svn/bln/N`, `slates_svn::dav::revprops`, judged by
+the one `serve::RevisionPropertyChange` path both edges share.)
 
 *7. Locks.* Each lock is an entry of the repository's register: the path, a token (`opaquelocktoken:` and a UUID, drawn
 on the owner before the append so every holder replays the same token), the owner (the principal), a comment, and its

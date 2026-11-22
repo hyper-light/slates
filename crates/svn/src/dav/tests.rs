@@ -948,3 +948,60 @@ fn a_response_past_its_room_is_refused() {
     )
   );
 }
+
+/// A PROPPATCH of a revision resource's body: `inner`, the `D:propertyupdate`'s children, with ra_serf's namespaces.
+fn revision_patch(inner: &str) -> Vec<u8> {
+  format!(
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?><D:propertyupdate xmlns:D=\"DAV:\" \
+     xmlns:V=\"http://subversion.tigris.org/xmlns/dav/\" xmlns:C=\"http://subversion.tigris.org/xmlns/custom/\" \
+     xmlns:S=\"http://subversion.tigris.org/xmlns/svn/\">{inner}</D:propertyupdate>"
+  )
+  .into_bytes()
+}
+
+/// main 01a20182's red of 2026-11-21 23:24, the body's half (`deadprops.c` `db_store` and `decode_property_value`, as
+/// ra_serf's `write_prop_xml` writes it). Do: read PROPPATCH bodies of `!svn/rev/3`: a set of `svn:log` with no
+/// expectation; a custom property set in base64 expecting it absent; ra_serf's atomic delete (`V:old-value-absent` on
+/// the value, the old value beside it); a `D:remove`; then a value marked absent with no expectation, an unknown
+/// encoding, and a property outside Subversion's namespaces. Expect: the four read in order, each its revision, value
+/// and expectation; the last three refused as malformed, as `mod_dav_svn` refuses each.
+#[test]
+fn a_revision_proppatch_body_reads_each_change_as_mod_dav_svn_reads_it() {
+  use super::revprops::revision_property_changes;
+  use crate::serve::RevisionPropertyChange;
+  let change =
+    |name: &[u8], value: Option<&[u8]>, expected: Option<Option<&[u8]>>| RevisionPropertyChange {
+      revision: 3,
+      name: name.to_vec(),
+      value: value.map(<[u8]>::to_vec),
+      expected: expected.map(|expected| expected.map(<[u8]>::to_vec)),
+    };
+  let body = revision_patch(
+    "<D:set><D:prop><S:log>an edit</S:log>\
+     <C:bin V:encoding=\"base64\"><V:old-value V:old-value-absent=\"1\"></V:old-value>/wA=</C:bin>\
+     <S:custom V:old-value-absent=\"1\"><V:old-value>was here</V:old-value></S:custom></D:prop></D:set>\
+     <D:remove><D:prop><C:gone/></D:prop></D:remove>",
+  );
+  assert_eq!(
+    revision_property_changes(3, &body, &ROOMY),
+    Ok(vec![
+      change(b"svn:log", Some(b"an edit"), None),
+      change(b"bin", Some(&[0xff, 0x00]), Some(None)),
+      change(b"svn:custom", None, Some(Some(b"was here"))),
+      change(b"gone", None, None),
+    ])
+  );
+  for refused in [
+    "<D:set><D:prop><S:log V:old-value-absent=\"1\"/></D:prop></D:set>",
+    "<D:set><D:prop><S:log V:encoding=\"rot13\">nb</S:log></D:prop></D:set>",
+    "<D:set><D:prop><X:log xmlns:X=\"urn:other\">an edit</X:log></D:prop></D:set>",
+  ] {
+    assert!(
+      matches!(
+        revision_property_changes(3, &revision_patch(refused), &ROOMY),
+        Err(DavRefusal::Malformed { .. })
+      ),
+      "{refused}"
+    );
+  }
+}
