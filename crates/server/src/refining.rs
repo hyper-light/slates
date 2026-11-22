@@ -518,7 +518,7 @@ impl JobTurns {
       counts: (0, [0; PAST_MULTIPLES.len()]),
       longest: 0,
       units: 0,
-      step: crate::vcs_store::paced_turn(step_quantum_ns(), began),
+      step: quantum_turn(step_quantum_ns(), began),
       began,
       costs: crate::vcs_store::TurnCosts::default(),
     }
@@ -534,7 +534,7 @@ impl JobTurns {
       turn(&mut self.counts, &mut self.longest, self.began);
       slates_rt::futures::yield_now().await;
       self.began = slates_rt::futures::now_ns();
-      self.step = crate::vcs_store::paced_turn(step_quantum_ns(), self.began);
+      self.step = quantum_turn(step_quantum_ns(), self.began);
       // A turn's first unit always runs; this marks it begun, so its cost is measured at the next ask.
       let _ = self
         .step
@@ -548,6 +548,22 @@ impl JobTurns {
     turn(&mut self.counts, &mut self.longest, self.began);
     (self.counts, self.longest, self.units)
   }
+}
+
+/// A job's turn begun at `began`: A-783's paced step (`crate::vcs_store::paced_turn`'s terms) whose ceiling is its own
+/// quantum, so it takes the next unit while the quantum has room for the unit's measured cost and yields at the
+/// quantum's end whoever waits. A turn that went on to the shard's ceiling while no one waited (100 to 166 ms in a debug
+/// test) made the quiet edit and merge slower on CI macos-latest under TB (run 45006705328, BENCHMARKS), where a thread
+/// that runs past its time-constraint computation is demoted.
+fn quantum_turn(quantum_ns: u64, began: u64) -> slates_pace::Step {
+  let env = slates_pace::Env {
+    clock: slates_rt::futures::now_ns,
+    waiting: slates_rt::futures::others_waiting,
+    quantum_ns,
+    ceiling_ns: quantum_ns,
+    target_ppm: crate::git_push::target_ppm(slates_rt::futures::scheduler_overrun_ns(), quantum_ns),
+  };
+  slates_pace::Step::begin(env, began)
 }
 
 /// The shard's step quantum now, the unit a paced turn runs to while someone waits.
