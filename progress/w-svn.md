@@ -468,3 +468,13 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
   - finding (2)'s routed copies (w-multirepo, w-engine, w-shared), then the git-2000 re-measure.
 - Red on run 45018545878 would be a new piece for me: the propset hang still there (its sample shows the wait), the
   guard test failing, or a view left mounted.
+
+## 2026-11-22 ~04:15 PST: put_window's churn cut (main's routing of 03:46)
+- 840daa24d: `ContentStore::begin_object_of_length` reserves a text's window buffer once; svn's `store_step_from` and
+  `bring_whole` use it. Red first.
+- Local attribution: 97.5 MB in 400 allocations → 26.2 MB in 100; the band's churn fell from 10.7 to 8.0 times the text.
+- Tests: slates-vcs content 20/20; slates-server --lib svn 113/113.
+- Noted for w-multirepo in `inbox/w-multirepo-from-w-svn-begin-of-length.md`.
+- Item 2 (the daemon breakdown) is on hold: w-shared's `slates status --memory` gauges come first, then
+  an_import_measured prints them.
+- Waiting on main: r12's git-2000 number; the macOS run 45018545878 and the clippy run 45018575168.
