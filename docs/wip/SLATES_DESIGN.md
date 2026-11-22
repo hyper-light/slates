@@ -60731,3 +60731,39 @@ Applied in the same change to:
     not held by the child (macOS).
   - `a_failing_test_lets_its_hook_view_go_before_its_daemon` (CI only): the guard's order under a deliberate failure.
 
+### A-859 — A git object received in a pack is sent on as its entry lies there: git's pack reuse (bug, 2026-11-22, w-git for UI goal 93; main 01a20182's ruling of 03:38 PST; part B; §4.17.2 items 4 and "A fetch", A-639, A-718, A-722)
+Applied in the same change to:
+- `crates/git/src/store/packed.rs`: `raw_entry`, an entry as it lies (its representation, its size, where its data
+  begins and ends), its data inflated once to find its end; `inflate_into` answers where the data ended.
+- `crates/git/src/store/encoding.rs`: `Encoding::reused`, `Current::Copy` (a pushed entry's data copied into a part a
+  window a unit), the pack places of the encoding's objects (`offsets`), counters `reused_whole`, `reused_deltas`,
+  `reuse_refused`; `crates/git/src/store/fragment.rs`: `Encoder::remember` shared with a reused entry.
+- `crates/git/src/store/upload.rs`: the loose stage's `reused` (a whole entry or a delta whose base precedes it, sent as
+  an offset delta where the client said `ofs-delta`), `loose_at`, the same three counters on `UploadCounters`.
+- `crates/git/src/store/repository.rs`: `read_entry`, `largest_object`.
+- `crates/server/src/vcs_store/git_encode.rs`: counters `vcs_store.git_encode.reused_whole`, `reused_deltas`,
+  `reuse_refused`.
+- GAPS (§4.17).
+
+- **Found by use.** Main's git/git whole-repository round: a mirror clone over HTTP ran past its 120 s patience; the
+  SSH edge rekeyed four times at about 1 GiB each for one clone of a 334 MB repository, 12 to 15 times stock's pack.
+- **Cause, measured.** Every object went whole and uncompressed: a line of 40 commits of a growing file and 40 tags,
+  160 objects, 87,282 bytes raw, cloned in 89,439 bytes before encoding (`loose_whole: 160, loose_deltas: 0`) and from
+  kept fragments alike (stored zlib alone is 89,042). The fragments' encoder prices a saved byte at the owner's
+  exchange, a byte's memcpy cost (7.4 GB a second here, 0.14 ns a byte), so no deflate level and no delta trial ever
+  paid; and nothing reused what the client's pack already held compressed and deltified.
+- **Change (part B).** An object pushed in a pack is sent on as its entry lies there, as git's `pack-objects` reuses a
+  packed entry before it searches, both where fragments are made and in the stream's loose stage; each entry checked
+  first against the object's name (a delta through its base), a corrupt one refused and the object encoded instead;
+  a delta reused only where its base precedes it in the pack the client reads; a whole entry reused only where the
+  encoder would try no delta for the object (git's order: a packed delta reused, else a search, else the whole entry's
+  data copied), the reused object kept as a later one's candidate base. Part A (owed next): a fetched byte
+  priced at the network, so what no pushed entry holds deflates and deltas within the learned budget.
+- **Tests.** `slates-server` `git_push::tests::t_a859_a_clone_of_a_deltified_push_sends_its_entries_as_they_lie` (the
+  line above pushed as stock git sends it, 17,299 bytes: cloned before encoding in 20,916 (121 whole, 20 deltas reused,
+  none refused) and from kept fragments in 20,858 (121 whole, 39 deltas), each within the pushed pack plus 40 bytes an
+  object, and whole; red before: 89,439, every object whole and uncompressed).
+- **Left** (GAPS): part A; `fsck --strict` over a stock clone (main's git/git rounds); a delta whose base this pack
+  places later is encoded, not reordered; the loose stage's table of where each object begins is charged once to the
+  request (a word pair an object, A-745 rule 1), `an_object_past_a_window_gets_a_delta_exactly_when_its_search_fits_the_admission`
+  sizing its room with it.

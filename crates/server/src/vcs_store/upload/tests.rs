@@ -110,7 +110,7 @@ pub(crate) fn answered(
 }
 
 /// [`answered`] for a `fetch`, with what the pack's stream did: its bytes, and its counters (A-718).
-fn fetched_with_counters(
+pub(crate) fn fetched_with_counters(
   state: &mut ShardState,
   (id, reader): (RepositoryId, &Principal),
   wants: &[u8],
@@ -556,7 +556,8 @@ fn t_a682_an_ssh_session_fetches_through_the_daemons_lender() {
 /// A-718 (§4.17.2 "A push" item 8: a pushed version encoded once, off the answer's path, so a fetch copies its kept
 /// fragments rather than searching its objects for deltas again). Do: push one commit to a git repository's `main`
 /// through A-635's append on the owner shard and fetch it; then turn the repository's encoding until it is idle, turn it
-/// again, and fetch the commit again. Expect: the first fetch encodes its three objects afresh and copies no kept part;
+/// again, and fetch the commit again. Expect: the first fetch sends its three objects from the stream's loose stage
+/// (each sent on as its pushed entry lies, A-859, or encoded afresh) and copies no kept part;
 /// the encoding keeps the version's fragments once (counted encoded once, and a second encoding idle at once, nothing
 /// encoded again); the second fetch copies kept parts and encodes nothing afresh; both packs hold exactly the commit,
 /// its tree and its blob, read as index-pack reads one.
@@ -577,8 +578,9 @@ fn t_a718_a_pushed_version_is_encoded_once_and_fetched_from_its_kept_fragments()
       (before, after, encoded_count, again, objects)
     });
   assert_eq!((encoded_count, again), (Some(1), 0));
-  let fresh =
-    |counters: &slates_git::store::UploadCounters| counters.loose_whole + counters.loose_deltas;
+  let fresh = |counters: &slates_git::store::UploadCounters| {
+    counters.loose_whole + counters.loose_deltas + counters.reused_whole + counters.reused_deltas
+  };
   assert_eq!(
     (before.1.parts_copied, fresh(&before.1) > 0),
     (0, true),
