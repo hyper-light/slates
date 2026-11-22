@@ -52,3 +52,5 @@ Clone: ~/slates-work/w-multirepo; target ~/.cache/w-multirepo-target.noindex; st
   worktree myself with git worktree remove once the branch is settled).
 - LANDED 40d816c29: room reads published grants (w-balance YES + 2 conditions met). Reported. Piece 2 now complete
   except curve feeding by push/hg/svn reads (seam routed via main).
+- 21:16 MAIN CHANGED: now kiln agent 01a201824d307ecc9e135c64ae3cb848 ("Slates", adas-macbook-pro-2). 01a1ff2e gone.
+  It reads every inbox/main-from-* since 15:00. Asked for the piece 6 ruling (inbox/main-from-w-multirepo-piece6-ruling.md).
