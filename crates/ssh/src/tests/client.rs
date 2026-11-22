@@ -225,6 +225,11 @@ impl Client {
     core::mem::take(&mut self.output)
   }
 
+  /// The key exchanges completed so far, the first included.
+  pub(crate) fn exchanges(&self) -> usize {
+    self.exchanges
+  }
+
   /// Starts a key exchange of the client's own.
   pub(crate) fn start_rekey(&mut self) {
     self.send_kexinit();
