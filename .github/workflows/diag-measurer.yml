@@ -61,6 +61,7 @@ jobs:
             python3 .github/g222/fwdsplit.py "$W/logs/quiet-r$round.tsv"
           done
           [ "$(uname)" = Darwin ] && python3 .github/g222/timers.py idle-end
+          true
       - name: Keep the logs
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4

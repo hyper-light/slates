@@ -1050,6 +1050,8 @@ fn main() {
     );
   }
   daemon.stop();
+  // Diagnostic (w-perf 84a): the stamps are written before the gate's exit, which skips every drop.
+  drop(_g222);
   if LOADED_OVER.load(std::sync::atomic::Ordering::Relaxed) {
     eprintln!(
       "edit_merge_bench: a loaded full edit and merge passed the required 1 ms at its p99 (84a)"
