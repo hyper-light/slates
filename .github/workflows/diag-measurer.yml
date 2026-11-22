@@ -28,7 +28,7 @@ jobs:
       - name: Sources and stock clients
         run: |
           python -m pip install --quiet uv
-          git clone -q https://github.com/git/git.git "$RUNNER_TEMP/git-src"
+          true
           mkdir -p "$RUNNER_TEMP/bin"
           printf '%s\n' '#!/bin/sh' 'exec uvx --quiet --from mercurial==7.2.4 hg "$@"' > "$RUNNER_TEMP/bin/hg"; chmod +x "$RUNNER_TEMP/bin/hg"
           "$RUNNER_TEMP/bin/hg" --version | head -1
@@ -42,7 +42,7 @@ jobs:
           set +e
           T="$(cygpath -u "$RUNNER_TEMP")"
           S="$(cygpath -w "$PWD/target/release/slates.exe")"
-          PUSH_REFS='v2.0.0^{commit}:refs/heads/master' timeout 7200 bash ci/interop/git-matrix.sh "$S" "$T/git-src" "$T/mx-git" > gitmx.txt 2>&1; g=$?
+          true || PUSH_REFS='v2.0.0^{commit}:refs/heads/master' timeout 7200 bash ci/interop/git-matrix.sh "$S" "$T/git-src" "$T/mx-git" > gitmx.txt 2>&1; g=$?
           rows=$(grep -E "^(PASS|FAIL)" gitmx.txt | awk '{printf "%s %s %s; ", $1, $2, $3}')
           restarts=$(grep -c "restarted as pid" "$T/mx-git/anchor.log" 2>/dev/null); kills=$(grep -c -i "killed\|stuck" "$T/mx-git/anchor.log" 2>/dev/null)
           echo "::notice title=git anchor restarts and kills::$(grep -i -E 'restarted as pid|killed|stuck|spun|watchdog ended' "$T/mx-git/anchor.log" | grep -v 'the watchdog beats every' | cut -c1-500 | head -8 | sed 's/%/%25/g' | awk 'BEGIN{ORS="%0A"}{print}')"
@@ -51,7 +51,9 @@ jobs:
             HG="$T/bin/hg" timeout 7200 bash ci/interop/hg-matrix.sh "$S" "$T/hg-src" "$T/mx-hg" > hgmx.txt 2>&1; h=$?
             rows=$(grep -E "^(PASS|FAIL)" hgmx.txt | awk '{printf "%s %s %s; ", $1, $2, $3}')
             restarts=$(grep -c "restarted as pid" "$T/mx-hg/anchor.log" 2>/dev/null)
-            echo "::notice title=hg matrix::exit=$h restarts=$restarts%0A$rows%0A$(tail -3 hgmx.txt | tr '\n' ' ')"
+            echo "::notice title=hg matrix::exit=$h restarts=$restarts%0A$rows"
+            echo "::error title=hg failing rows::$(grep -E '^FAIL' hgmx.txt | cut -c1-600 | sed 's/%/%25/g' | awk 'BEGIN{ORS="%0A"}{print}')"
+            echo "::notice title=hg push-all log::$(tail -25 "$T/mx-hg/logs/push-all.log" 2>/dev/null | cut -c1-300 | sed 's/%/%25/g' | awk 'BEGIN{ORS="%0A"}{print}')"
           fi
           for f in "$RUNNER_TEMP"/mx-git/*.log "$RUNNER_TEMP"/mx-hg/*.log; do :; done
           mkdir -p logs; cp gitmx.txt hgmx.txt logs/ 2>/dev/null; cp -r "$T/mx-git" logs/mx-git 2>/dev/null; cp -r "$T/mx-hg" logs/mx-hg 2>/dev/null
