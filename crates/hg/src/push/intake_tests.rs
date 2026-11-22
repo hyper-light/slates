@@ -6,7 +6,7 @@ use std::borrow::Cow;
 
 use slates_vcs::ContentStore;
 
-use super::{Intake, Intaken, KeptText, Refused, Stepped};
+use super::{Intake, Intaken, KeptText, PushSegment, Refused, Stepped};
 use crate::bundle2::Bundle2;
 use crate::fixtures::CG03;
 use crate::index::{HgIndex, Log};
@@ -1162,6 +1162,23 @@ fn an_intake_cuts_its_kept_texts_into_segments() {
   let mut whole_store = store();
   let mut empty = HgIndex::new();
   let (_, whole, _) = intake(&part, &mut empty, &mut whole_store, &mut room()).unwrap();
+  let (segments, cut) = cut_take(&part, SEGMENT_BYTES);
+  assert!(segments.len() > 1, "{} segments", segments.len());
+  assert!(
+    cut.texts.is_empty(),
+    "the cut take holds no texts of its own"
+  );
+  assert_eq!(
+    segments_texts(&segments),
+    whole.texts,
+    "the segments' texts the uncut take's"
+  );
+  assert_each_revision_once(&segments);
+}
+
+/// `part` taken whole into an empty index, cut at `bound`: each segment taken as it is cut, the rest once every unit is
+/// taken; the segments and what the take brought.
+fn cut_take(part: &ChangegroupPart, bound: u64) -> (Vec<PushSegment>, Intaken) {
   let mut store = store();
   let mut index = HgIndex::new();
   let mut admission = room();
@@ -1172,15 +1189,13 @@ fn an_intake_cuts_its_kept_texts_into_segments() {
     &mut admission,
   )
   .unwrap()
-  .cutting(SEGMENT_BYTES);
+  .cutting(bound);
   let mut segments = Vec::new();
   loop {
     let stepped = taking
       .step(&part.payload, &mut store, &mut admission)
       .unwrap();
-    while let Some(segment) = taking.take_segment() {
-      segments.push(segment);
-    }
+    segments.extend(std::iter::from_fn(|| taking.take_segment()));
     match stepped {
       Stepped::Store => taking.answer_from_fork(&store),
       stepped if more(&stepped) => {}
@@ -1188,18 +1203,16 @@ fn an_intake_cuts_its_kept_texts_into_segments() {
     }
   }
   taking.cut_rest();
-  while let Some(segment) = taking.take_segment() {
-    segments.push(segment);
-  }
+  segments.extend(std::iter::from_fn(|| taking.take_segment()));
   let (_, cut) = finished(taking);
-  assert!(segments.len() > 1, "{} segments", segments.len());
-  assert!(
-    cut.texts.is_empty(),
-    "the cut take holds no texts of its own"
-  );
+  (segments, cut)
+}
+
+/// The texts of `segments`, in order, each place moved back by its slice's start; each segment charged more than
+/// nothing, and each place within its slice.
+fn segments_texts(segments: &[PushSegment]) -> Vec<KeptText> {
   let mut texts = Vec::new();
-  let mut covered: std::collections::BTreeMap<String, Vec<u32>> = std::collections::BTreeMap::new();
-  for segment in &segments {
+  for segment in segments {
     assert!(segment.charged > 0);
     let len = segment.slice.end - segment.slice.start;
     for kept in &segment.texts {
@@ -1209,14 +1222,19 @@ fn an_intake_cuts_its_kept_texts_into_segments() {
         kept.place.start + segment.slice.start..kept.place.end + segment.slice.start;
       texts.push(whole_place);
     }
-    for (log, first, end) in &segment.ranges {
-      covered
-        .entry(format!("{log:?}"))
-        .or_default()
-        .extend(*first..*end);
-    }
   }
-  assert_eq!(texts, whole.texts, "the segments' texts the uncut take's");
+  texts
+}
+
+/// Every log's kept revisions covered by `segments`' ranges, each once and in order.
+fn assert_each_revision_once(segments: &[PushSegment]) {
+  let mut covered: std::collections::BTreeMap<String, Vec<u32>> = std::collections::BTreeMap::new();
+  for (log, first, end) in segments.iter().flat_map(|segment| &segment.ranges) {
+    covered
+      .entry(format!("{log:?}"))
+      .or_default()
+      .extend(*first..*end);
+  }
   for (log, revisions) in covered {
     let mut sorted = revisions.clone();
     sorted.sort_unstable();
