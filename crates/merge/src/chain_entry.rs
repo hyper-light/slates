@@ -1313,6 +1313,130 @@ mod tests {
     assert_eq!(super::inputs(&damaged), Err(DocDecodeError::Truncated));
   }
 
+  /// Goal 93, svn finding (2) (main 01a20182, 2026-11-22 00:19 PST; Ada's rule: what the design can avoid, it does not
+  /// allocate). Do: encode the held entry of a one-file version whose file is 256 KiB, spliced as declared, with a
+  /// completion, a head identity and a signature; then the same version's entry carrying an increment's encoding, and an
+  /// entry of every effect kind. Expect: each entry's buffer reserved at exactly its encoded length, never grown and
+  /// never over: the held one a few hundred bytes for 256 KiB of text. Failing first: the encoder reserved the
+  /// admission's bound, which counts the whole post-state (a by-value effect may take its bytes from it), so every text
+  /// of an import cost an allocation of its own size: 26.2 MB for 25.6 MB of text in w-svn's attribution
+  /// (`push::append_versions`), the buffer then kept as the chain entry's capacity.
+  #[test]
+  fn an_entrys_buffer_is_reserved_at_its_length_not_its_texts() {
+    let body = vec![b'x'; 256 << 10];
+    let increment = one_file(&body);
+    let applied = vec![Applied::Spliced("f".to_owned(), increment.doc.ops.clone())];
+    let completion = Completion {
+      origin: 1,
+      client: 2,
+      sequence: 3,
+      work: Some([4; WORK_BYTES]),
+    };
+    let signature = Signature {
+      kind: 1,
+      detail: 2,
+      fingerprint: [5; 32],
+    };
+    let held = encode(
+      Inputs {
+        identity: [0xab; 32],
+        len: 300,
+      },
+      &increment,
+      &applied,
+      Some(completion),
+      Some([6; 32]),
+      Some(signature),
+    );
+    assert!(held.len() < 4096, "a held entry is small: {}", held.len());
+    assert_eq!(
+      held.capacity(),
+      held.len(),
+      "the held entry's buffer for 256 KiB of text"
+    );
+    let small = one_file(b"abc");
+    let small_bytes = small.encode();
+    let small_applied = vec![Applied::Spliced("f".to_owned(), small.doc.ops.clone())];
+    let carrying = encode_carrying(
+      (held_for_tests(&small_bytes), Some(&small_bytes)),
+      &small,
+      &small_applied,
+      None,
+      None,
+      None,
+    );
+    assert_eq!(
+      carrying.capacity(),
+      carrying.len(),
+      "a carrying entry's buffer"
+    );
+    let every = every_kind_applied(&small);
+    let entry = encode(
+      held_for_tests(&small_bytes),
+      &small,
+      &every,
+      Some(completion),
+      None,
+      Some(signature),
+    );
+    assert_eq!(
+      entry.capacity(),
+      entry.len(),
+      "an entry of every effect kind"
+    );
+  }
+
+  /// One effect of every kind [`put_applied`] writes, each of its encodings: a splice as declared and one mapped, a copy
+  /// with and without edits, a tree copy with and without its fix.
+  fn every_kind_applied(increment: &Increment) -> Vec<Applied> {
+    let op = increment.doc.ops.clone();
+    let node = SpecialNode {
+      kind: crate::special::SpecialKind::Fifo,
+      uid: 1,
+      gid: 2,
+      atime: 3,
+      mtime: 4,
+      ctime: 5,
+      btime: 6,
+    };
+    let tree = |fix| Applied::CopyTree {
+      dst: "t".to_owned(),
+      from: "s".to_owned(),
+      version: 1,
+      replace: false,
+      fix,
+    };
+    vec![
+      Applied::Special("p".to_owned(), node),
+      Applied::RemoveSpecial("p".to_owned()),
+      Applied::Spliced("f".to_owned(), op.clone()),
+      Applied::Spliced("g".to_owned(), op.clone()),
+      Applied::Created("h".to_owned(), op.clone()),
+      Applied::Copied {
+        dst: "i".to_owned(),
+        from: "f".to_owned(),
+        ops: Vec::new(),
+      },
+      Applied::Copied {
+        dst: "j".to_owned(),
+        from: "f".to_owned(),
+        ops: op,
+      },
+      Applied::RemoveContent("k".to_owned()),
+      Applied::MakeDir("d".to_owned()),
+      Applied::RemoveDir("e".to_owned()),
+      Applied::Mode("f".to_owned(), 0o755),
+      Applied::Symlink("l".to_owned(), "f".to_owned()),
+      Applied::RemoveSymlink("m".to_owned()),
+      Applied::Hardlink("n".to_owned(), "f".to_owned()),
+      Applied::RemoveHardlink("o".to_owned()),
+      Applied::SetXattr("f".to_owned(), "user.a".to_owned(), b"value".to_vec()),
+      Applied::RemoveXattr("f".to_owned(), "user.b".to_owned()),
+      tree(None),
+      tree(Some(Box::new(every_kind_fix()))),
+    ]
+  }
+
   thread_local! {
     /// The increment's ops an entry's index visited on this thread ([`Declared::of`]).
     static VISITS: Cell<u64> = const { Cell::new(0) };
