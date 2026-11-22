@@ -382,6 +382,9 @@ pub struct ContentStore {
   /// The bytes structures beside the store charged to it.
   charged_bytes: u64,
   counters: ContentCounters,
+  /// The miss-ratio curve of the repository a step is lent to, while it is (A-724 piece 2d; `crate::mrc`): each read
+  /// noted in it ([`ContentStore::observe`]). A cell, since reads borrow the store shared; one shard's thread holds it.
+  observing: core::cell::RefCell<Option<crate::mrc::Curve>>,
 }
 
 /// A byte count as the store keeps it.
@@ -534,6 +537,7 @@ impl ContentStore {
       content_bytes: 0,
       charged_bytes: 0,
       counters: ContentCounters::default(),
+      observing: core::cell::RefCell::new(None),
     })
   }
 
@@ -1039,7 +1043,34 @@ impl ContentStore {
   /// chunk of the shard's arena is copied out to be read).
   pub fn get(&self, identity: &ContentId) -> Option<&[u8]> {
     let identity = &self.resolve(identity);
-    self.entries.get(identity).and_then(Held::here)
+    let held = self.entries.get(identity)?;
+    self.note(identity, held);
+    held.here()
+  }
+
+  /// Lends `curve` to the store, every read noted in it until the next call, and gives back the curve it held: what a
+  /// repository's step reads is that repository's working set (A-724 piece 2d, §4.17.5 "Learned demand"). The caller
+  /// brackets a step with it, putting back what it took, so a step inside a step restores its outer curve.
+  pub fn observe(&self, curve: Option<crate::mrc::Curve>) -> Option<crate::mrc::Curve> {
+    match self.observing.try_borrow_mut() {
+      Ok(mut slot) => core::mem::replace(&mut *slot, curve),
+      // Borrowed only inside a read's note, which never calls this: the curve goes back to its caller unlent.
+      Err(_) => curve,
+    }
+  }
+
+  /// One read of `held`, named `identity`, noted in the curve lent ([`ContentStore::observe`]): its key the identity's
+  /// first eight bytes (uniform, BLAKE3's), its length the content's.
+  fn note(&self, identity: &ContentId, held: &Held) {
+    if let Ok(mut slot) = self.observing.try_borrow_mut()
+      && let Some(curve) = slot.as_mut()
+      && let Some(key) = identity.0.first_chunk::<8>()
+    {
+      curve.read(
+        u64::from_le_bytes(*key),
+        u64::try_from(held.len()).unwrap_or(u64::MAX),
+      );
+    }
   }
 
   /// The bytes of the content `identity` names, whatever its form: a window's from the window storage (borrowed where
@@ -1047,6 +1078,7 @@ impl ContentStore {
   pub fn bytes_of(&self, identity: &ContentId) -> Option<Cow<'_, [u8]>> {
     let identity = &self.resolve(identity);
     let held = self.entries.get(identity)?;
+    self.note(identity, held);
     match &held.kept {
       Kept::Here(bytes) => Some(Cow::Borrowed(bytes)),
       Kept::Stored { window, .. } => self.storage.read(*window),
@@ -1329,6 +1361,7 @@ impl ContentStore {
       .entries
       .get(&identity)
       .filter(|held| held.form == Form::Window)?;
+    self.note(&identity, held);
     match held_window(held) {
       Some(stored) => self.storage.read_range_in(stored, (offset, into), kept_in),
       None => {
@@ -1360,6 +1393,7 @@ impl ContentStore {
       .entries
       .get(&identity)
       .filter(|held| held.form == Form::Window)?;
+    self.note(&identity, held);
     match held_window(held) {
       Some(window) => self.storage.read_in(window, kept_in),
       None => held.here().map(Cow::Borrowed),

@@ -16531,8 +16531,16 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > range seen, a new size from its first work, a work after a silence outweighing the past; noisy sizes read as their
 > mean. Each principal's slot in a usage row keeps a `Decayed` a kind, read as the repository's rate times its share
 > of the slots' decayed counts (a slot's count read alone at today's horizon read 793 a second for 1,000, the horizon
-> having moved); a rate is read over its count's filled share, `1 - e^{-age/τ}`. Owed: the curves fed on the owner
-> shard.
+> having moved); a rate is read over its count's filled share, `1 - e^{-age/τ}`.
+
+> **Status (2026-11-21, A-844 part 2: the curves fed on the owner shard).** Each usage row keeps its repository's
+> curve, lent to the shard's content store for each of its steps (`vcs_store::observed`; `ContentStore::observe`):
+> every content the step reads (`get`, `bytes_of`, a window's read) is noted in it, keyed by its identity's first
+> eight bytes, a step inside a step restoring the outer curve. Its capacity is the content windows the repository's
+> floor holds, `room / (repositories served × window)` (`vcs_store::curve_keys`): a working set that fits the floor is
+> sampled whole. Fed today by git's fetches (both lends of `vcs_store::upload`). Owed: pushes' and Mercurial's and
+> Subversion's reads (their steps' lends), the curves aged at the horizon and divided by `slates_vcs::partition` at the
+> learning cadence, published as an immutable snapshot the room reads.
 
 > **Status (2026-11-21, A-846: piece 2's memory share by marginal utility).** `slates_vcs::partition`: a shard's room
 > divided among its repositories, each first guaranteed the lesser of A-188's floor (the room over the repositories

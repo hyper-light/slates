@@ -328,6 +328,43 @@ fn t_a682_a_pushed_branch_is_listed_and_fetched_whole_from_the_store() {
   assert_eq!(ids_in(&pack_of(&fetched.0)), ids_of(&objects));
 }
 
+/// A-724 piece 2d (§4.17.5 "Learned demand": a repository's working set as its miss-ratio curve). Do: push one commit
+/// to each of two git repositories; fetch the first's commit twice through the lender, the second's never. Expect: the
+/// first's usage row holds a curve that noted the fetches' reads, and its second fetch found them again: its miss ratio
+/// at a cache of its last bin edge (all it read is under one window) below its ratio with no cache. The second's row
+/// holds no curve: a step's reads are noted in its own repository's alone.
+#[test]
+fn t_a724_a_fetchs_reads_are_noted_in_its_own_repositorys_curve() {
+  let (read, kept, cold, other) =
+    crate::test_store::audit_on_stored_shard("vcs_store-upload", |state| {
+      let (id, _, head) = pushed_repository(state, "curved", &[]);
+      let (quiet, _, _) = pushed_repository(state, "quiet", &[]);
+      let wants = fetch(&[head], &[]);
+      for _ in 0..2 {
+        let fetched = answered(state, (id, &owner()), Asked::Request(&wants));
+        assert_eq!(fetched.1, None);
+      }
+      let row = state
+        .vcs_usage
+        .usage(&id)
+        .expect("the fetched repository's row");
+      let curve = row.curve().expect("its curve");
+      let other = state
+        .vcs_usage
+        .usage(&quiet)
+        .is_some_and(|row| row.curve().is_some());
+      (
+        curve.reads(),
+        curve.miss_ratio(curve.edges().last().unwrap_or(0)),
+        curve.miss_ratio(0),
+        other,
+      )
+    });
+  assert!(read > 0.0, "no read noted");
+  assert!(kept < cold, "kept {kept} vs cold {cold}");
+  assert!(!other, "a read noted in another repository's curve");
+}
+
 /// A-682 (§4.17.1 "Policy": a ref lent only to a reader its rule lets read it, a ref no rule speaks to its owner's
 /// alone). Do: on a repository whose one rule lets `READER` read `refs/heads/main`, push a commit to `main` and make
 /// `topic` at it; ask `ls-refs` as the owner and as the reader; then, as the reader, fetch `refs/heads/topic` by name.
