@@ -16548,9 +16548,15 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > every content the step reads (`get`, `bytes_of`, a window's read) is noted in it, keyed by its identity's first
 > eight bytes, a step inside a step restoring the outer curve. Its capacity is the content windows the repository's
 > floor holds, `room / (repositories served × window)` (`vcs_store::curve_keys`): a working set that fits the floor is
-> sampled whole. Fed today by git's fetches (both lends of `vcs_store::upload`). Owed: pushes' and Mercurial's and
-> Subversion's reads (their steps' lends), the curves aged at the horizon and divided by `slates_vcs::partition` at the
-> learning cadence, published as an immutable snapshot the room reads.
+> sampled whole. Fed today by git's fetches (both lends of `vcs_store::upload`).
+
+> **Status (2026-11-21, A-846 part 2: the grants, divided at the learning cadence).** `crate::vcs_share::grants`: each
+> shard keeps one `Grants` value, replaced whole: every row's curve aged to now at its read horizon
+> (`Ledger::age_curves`), its misses a second its counts over that horizon, the shard's admittable room divided by
+> `slates_vcs::partition`. It is divided again once the shortest read horizon among the repositories served has passed,
+> or at once when that set changes, and read in between (`current_at`; counted `vcs_share.grants_divided`). Owed: the
+> room's admission reading it (a repository admitted against its grant, else the spare; agreed with A-724 piece 3's
+> side first), and pushes', Mercurial's and Subversion's reads feeding the curves.
 
 > **Status (2026-11-21, A-846: piece 2's memory share by marginal utility).** `slates_vcs::partition`: a shard's room
 > divided among its repositories, each first guaranteed the lesser of A-188's floor (the room over the repositories
