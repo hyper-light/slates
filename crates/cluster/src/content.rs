@@ -2063,6 +2063,30 @@ impl ContentHold {
     self.stage_chunk(space, object, manifest, chunk)
   }
 
+  /// Keeps one raw piece of bytes the caller holds in `object`'s stage of `manifest`, copied once into its block, with
+  /// no chunk built around it: [`hold_lent`](Self::hold_lent) a piece at a time, so a large hold is spread over a
+  /// shard's turns (a green's checkpoint, A-579: a 1 GiB checkpoint is about 1,000 pieces of 1 MiB). The stage is opened
+  /// by [`stage_fetched`](Self::stage_fetched) and completed by [`complete_stage`](Self::complete_stage). `identity` is
+  /// the BLAKE3 of `piece`, which the caller hashed in making `manifest` from the same bytes: it is not hashed again, so
+  /// only the owner of the bytes may call this, never a path a peer's bytes reach (a peer's chunk is verified,
+  /// [`stage_piece`](Self::stage_piece)). Returns how many chunks the stage still lacks.
+  pub fn stage_lent_piece(
+    &mut self,
+    space: &mut HoldSpace<'_>,
+    object: ObjectId,
+    manifest: &[u8; 32],
+    identity: [u8; 32],
+    piece: &[u8],
+  ) -> Result<u64, ContentRefusal> {
+    self.stage_view(
+      space,
+      object,
+      manifest,
+      ChunkView::raw(identity, piece),
+      None,
+    )
+  }
+
   /// Completes `object`'s stage into a held manifest once its closure is whole; `Incomplete` while chunks
   /// are still owed (the stage stays for the next fetch).
   pub fn complete_stage(
@@ -4085,6 +4109,89 @@ mod tests {
     .encode();
     fetch.push(0);
     assert_eq!(ContentMessage::decode(&fetch), Err(ContentError::BadLength));
+  }
+
+  /// A-579's last step: a lent hold made a piece at a time holds what the one call holds. Do: hold a two-chunk archive's
+  /// bytes in one `hold_lent` call; on a second hold, open the stage of the same manifest, stage one piece, read the
+  /// stage's progress, stage the other, and complete it. Expect: the same identity, the manifest held, every chunk read
+  /// back byte for byte, and the same charge; before the last piece the manifest is not held and its stage has one
+  /// chunk; a piece the manifest does not reference is refused `Unreferenced`, nothing stored.
+  #[test]
+  fn a_lent_hold_made_a_piece_at_a_time_holds_what_the_one_call_holds() {
+    let archive = two_chunk_archive();
+    let manifest = with_chunks(&archive, Vec::new());
+    let pieces: Vec<&[u8]> = archive
+      .chunks
+      .iter()
+      .map(|chunk| &chunk.payload[..])
+      .collect();
+    let mut whole = ContentHold::new();
+    let mut whole_room = TestSpace::new();
+    let identity = whole
+      .hold_lent(
+        &mut whole_room.space(),
+        OBJECT,
+        Placed::default(),
+        &manifest,
+        pieces.iter().copied(),
+      )
+      .unwrap();
+
+    let mut sliced = ContentHold::new();
+    let mut room = TestSpace::new();
+    let lacking = sliced
+      .stage_fetched(&mut room.space(), OBJECT, Placed::default(), &manifest)
+      .unwrap();
+    assert_eq!(lacking.map(|missing| missing.len()), Some(2));
+    let stray = b"not in the manifest";
+    assert_eq!(
+      sliced.stage_lent_piece(
+        &mut room.space(),
+        OBJECT,
+        &identity,
+        *blake3::hash(stray).as_bytes(),
+        stray,
+      ),
+      Err(ContentRefusal::Unreferenced)
+    );
+    let first = &archive.chunks[0];
+    assert_eq!(
+      sliced.stage_lent_piece(
+        &mut room.space(),
+        OBJECT,
+        &identity,
+        first.identity,
+        &first.payload
+      ),
+      Ok(1)
+    );
+    assert_eq!(sliced.staged_of(OBJECT, &identity), Some(1));
+    assert!(!sliced.holds_manifest(OBJECT, &identity));
+    let second = &archive.chunks[1];
+    assert_eq!(
+      sliced.stage_lent_piece(
+        &mut room.space(),
+        OBJECT,
+        &identity,
+        second.identity,
+        &second.payload
+      ),
+      Ok(0)
+    );
+    assert_eq!(
+      sliced.complete_stage(&mut room.space(), OBJECT),
+      Ok(identity)
+    );
+    assert!(sliced.holds_manifest(OBJECT, &identity));
+    assert_eq!(sliced.stage_count(), 0);
+    for chunk in &archive.chunks {
+      assert_eq!(
+        sliced.held_raw(&room.arena, OBJECT, &identity, &chunk.identity),
+        Some(&chunk.payload[..])
+      );
+    }
+    assert_eq!(sliced.charged_bytes(), whole.charged_bytes());
+    assert_eq!(sliced.chunk_count(), whole.chunk_count());
   }
 
   /// §4.10 placement closure: a hold refuses an archive whose manifest references a chunk neither

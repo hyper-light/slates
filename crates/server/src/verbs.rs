@@ -19185,6 +19185,8 @@ pub(crate) async fn rebuild_recovered(
   for green in greens {
     let floor = state.db.partition().green_floor(green);
     crate::merge_service::release_unnamed_increments(state, green, floor, None);
+    // So does a checkpoint's stage a stop left part-way, or one held before a kill kept its record (A-579).
+    crate::merge_service::release_unnamed_checkpoints(state, green);
   }
   slices.unit_done().await;
   // The objects the anchor held are taken back first, at the handles their backings had and dormant through the
@@ -19693,7 +19695,7 @@ fn reconcile_clone_pins(state: &mut ShardState) -> usize {
 /// good version, logged, rather than presenting a wrong later state. The tests' form of
 /// [`rebuild_green_sliced`], in one call: a recovery runs the sliced one, and since A-333 a takeover replays nothing.
 #[cfg(test)]
-fn rebuild_green(
+pub(crate) fn rebuild_green(
   state: &mut ShardState,
   record: &VolumeRecord,
 ) -> Vec<crate::merge_service::ReplayedVersion> {
@@ -20393,8 +20395,16 @@ fn chain_phase_or_back(
   let partition = state.db.partition();
   let adopted = partition.green_adoption(id).is_some();
   let (mut green, held, head_check) = match partition.green_checkpoint(id) {
-    Some((held, bytes)) => {
-      let Some(checkpoint) = slates_merge::checkpoint::Checkpoint::decode(bytes)
+    Some((held, named)) => {
+      // Its encoding is the content store's, named by the record (A-579's last step, chain entry format 6's rule): a
+      // store that lacks it fences the green as a missing increment does.
+      let Some(bytes) = crate::merge_service::checkpoint_bytes(state, id, &named) else {
+        return Err((
+          GreenFence::ContentMissing { version: held },
+          Box::new(seeded),
+        ));
+      };
+      let Some(checkpoint) = slates_merge::checkpoint::Checkpoint::decode(&bytes)
         .ok()
         .filter(|checkpoint| checkpoint.version == held)
       else {
@@ -24574,11 +24584,13 @@ mod tests {
     super::to_db_volume(id)
   }
 
-  /// W3, AUD-29-18: do: submit one version of a green whose only work is reset to it (so the service checkpoints
-  /// it) and rebuild the green; then, on a second green whose floor a work holds at version 0, record a checkpoint at
-  /// version 1 whose bytes do not decode, and rebuild it. Expect: the first green's chain is empty, its checkpoint at
-  /// version 1, and the rebuild restores the acknowledged head exactly (version 1, the same identity); the second is
-  /// fenced `CheckpointCorrupt` rather than served from bytes the replay cannot read.
+  /// W3, AUD-29-18, A-579's last step: do: submit one version of a green whose only work is reset to it (so the service
+  /// checkpoints it) and rebuild the green; then, on a second green whose floor a work holds at version 0, hold bytes
+  /// that do not decode under its checkpoint object, record a checkpoint at version 1 naming them, and rebuild it; and on
+  /// a third, record one naming content the store does not hold, and rebuild it. Expect: the first green's chain is
+  /// empty, its checkpoint at version 1 held in the content store, and the rebuild restores the acknowledged head exactly
+  /// (version 1, the same identity); the second is fenced `CheckpointCorrupt` rather than served from bytes the replay
+  /// cannot read; the third `ContentMissing` at version 1.
   #[test]
   fn a_green_replays_from_its_checkpoint_and_a_corrupt_one_is_fenced() {
     crate::daemon::audit_on_shard(|state| {
@@ -24592,6 +24604,11 @@ mod tests {
         Some(1)
       );
       assert!(state.db.partition().green_chain(green).is_empty());
+      let (_, named) = state.db.partition().green_checkpoint(green).unwrap();
+      assert!(
+        crate::merge_service::checkpoint_bytes(state, green, &named).is_some(),
+        "the checkpoint the partition names is held in the content store"
+      );
       let before = state
         .greens
         .get_mut(&green)
@@ -24613,10 +24630,25 @@ mod tests {
         None,
         "the floor held at 0 folds nothing"
       );
+      let garbage = [0xff; 16];
+      let archive = crate::merge_origin::inputs_manifest_archive(&garbage, 0, 4096);
+      let identity = state
+        .held_content
+        .hold_lent(
+          &mut crate::content_holder::hold_space(&mut state.store),
+          crate::merge_service::checkpoint_object(held),
+          slates_cluster::content::Placed { sequence: 1 },
+          &archive,
+          [&garbage[..]],
+        )
+        .unwrap();
       let corrupt = super::Op::GreenCheckpointed {
         green: held,
         version: 1,
-        checkpoint: vec![0xff; 16],
+        checkpoint: slates_db::partition::CheckpointRef {
+          identity,
+          len: garbage.len() as u64,
+        },
       };
       state.db.mutate(&mut state.segment, &corrupt, 0).unwrap();
       let record = state.db.partition().volume(held).cloned().unwrap();
@@ -24625,6 +24657,24 @@ mod tests {
       assert_eq!(
         state.fenced_greens.get(&held),
         Some(&crate::merge_service::GreenFence::CheckpointCorrupt)
+      );
+
+      let missing = green_at_version_one(state, "missing", true);
+      let unheld = super::Op::GreenCheckpointed {
+        green: missing,
+        version: 1,
+        checkpoint: slates_db::partition::CheckpointRef {
+          identity: [0x5a; 32],
+          len: 64,
+        },
+      };
+      state.db.mutate(&mut state.segment, &unheld, 0).unwrap();
+      let record = state.db.partition().volume(missing).cloned().unwrap();
+      super::rebuild_green(state, &record);
+      assert!(!state.greens.contains_key(&missing));
+      assert_eq!(
+        state.fenced_greens.get(&missing),
+        Some(&crate::merge_service::GreenFence::ContentMissing { version: 1 })
       );
     });
   }

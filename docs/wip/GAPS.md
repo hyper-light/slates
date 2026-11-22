@@ -25042,9 +25042,11 @@ in what lands. Branch tips as of 2026-11-10:
 > the fold hashes current bytes only, no history reads), with a fix to a checkpoint's sum taken mid-fold. OWED: (b)'s A/B
 > (does Z = 20 ms p99 return to main's?; main's run, `run-requests.md`, blocked while main's own regression stands:
 > SubmitAccepted server p50 0.29 ms at 4d0ad1674 against 184 ms at 1a35ab091, Z = 50 ms, macOS arm64, not A-579's,
-> window c1449f629..b3f674640 unbisected). DEFERRED past goal 93 (goal 89b's): the checkpoint's last step, ~43 ms
-> (build 5.7, encode 9.5, record 24.4 of 49 MB), plan: slice build and encode under the paced turn budget now, and record
-> by identity in the content store only inside w-shared's chain format 6 (main's 02:06 ruling); and single key folds of
+> window c1449f629..b3f674640 unbisected). The checkpoint's record LANDED by name
+> (goal 93's, main's 15:00: a 1 GiB green's was 650-1,063 ms in one step, record 527 ms): held in the owner's content
+> store a chunk a quantum, published, recorded as `CheckpointRef` (layout 16). OWED, piece 2: its build and encoding
+> are still one step (52 + 71 ms at 1 GiB; 5.7 + 9.5 ms at load_bench's 49 MB), inside the watchdog's 1 s window.
+> DEFERRED past goal 93 (goal 89b's): single key folds of
 > up to 13.4 ms, plan: a slice that keeps a hot file's partial short with a guaranteed past-deadline share derived from
 > the latency budget (main's 23:50 ruling), since slicing inside a key landed and was reverted the same day (a fold of
 > 47.6-52.6 s, every past-deadline turn at the 100 ms ceiling; ed4661d40, design amendment A-579).

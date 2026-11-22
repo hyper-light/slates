@@ -3093,8 +3093,9 @@ impl Daemon {
         let held = partition.green_floor(volume);
         let mut identities: Vec<(u64, [u8; 32])> = partition
           .green_checkpoint(volume)
-          .map(|(_, bytes)| {
-            slates_merge::checkpoint::Checkpoint::decode(bytes)
+          .and_then(|(_, named)| crate::merge_service::checkpoint_bytes(s, volume, &named))
+          .map(|bytes| {
+            slates_merge::checkpoint::Checkpoint::decode(&bytes)
               .map(|checkpoint| checkpoint.accepted)
               .unwrap_or_default()
               .into_iter()

@@ -347,8 +347,6 @@ fn a_fresh_partitions_longest_tail_replays_within_its_recovery_budget() {
 /// Shape: the large records of the mix test: one green increment of 64 KiB, folded at once by a small checkpoint, so
 /// the partition stays small and its snapshot's size (the doubling floor) stays far below the budget's log.
 const LARGE_RECORD_BYTES: usize = 64 << 10;
-/// Shape: the checkpoint that folds each large increment: a few bytes, so the partition does not grow.
-const FOLDING_CHECKPOINT_BYTES: usize = 8;
 /// Shape: the small records appended before the first timed recovery of the mix test, which measures their replay.
 const FIRST_SMALL_RECORDS: u64 = 64;
 /// Shape: the replay each later chunk of small records adds, as a share of the budget: an eighth, so the checks step
@@ -372,7 +370,11 @@ fn advance_and_fold(db: &mut slates_db::replay::Db, seg: &mut AnchorSegment, id:
   )
   .unwrap();
   let version = db.partition().green_head(id);
-  let checkpoint = vec![0u8; FOLDING_CHECKPOINT_BYTES];
+  // The checkpoint that folds it, by its name (A-579): a few bytes, so the partition does not grow.
+  let checkpoint = slates_db::partition::CheckpointRef {
+    identity: [0; 32],
+    len: 8,
+  };
   db.mutate(
     seg,
     &Op::GreenCheckpointed {
