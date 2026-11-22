@@ -1122,6 +1122,24 @@
 > through it (clone over HTTP and SSH, round trips, forced heads). Owed: file revisions, which the store keeps whole,
 > go the same way once the changeset shape keeps them as Mercurial's deltas. And the clone's time against stock's
 > 283 s, measured again, release.
+> **Three hg pushes and clones through the daemon's HTTP edge red on main, and a rekey flake (2026-11-22, w-hg; main
+> 01a20182's order of 00:26, found by w-git at b099adee4). FIXED.**
+> - `vcs_http::daemon_edge` `a_mercurial_push_larger_than_one_ring_region_lands_through_the_daemons_edge` (and the
+>   clone and stream clone that read it): the push answered `push refused: its works were built for another plan than
+>   its landing's`. My c34fee871 built each work once before the landing (`Works::Built`), and the landing took a work
+>   out of the built set at its first use; a push whose line and the bookmark made at it share one work (one key, two
+>   changes) found it gone at its second. Now `Works::Built` counts each work's uses from the plan (`uses_of`): every use
+>   but the last is lent a copy, the last takes it.
+> - `vcs_ssh::tests::hg::a_rekey_during_a_blocked_write_sends_no_byte_twice` failed about 1 run in 8 under the
+>   parallel suite, the session refused `Transport(Unexpected { number: 93 })`: the test client sent a channel's
+>   window adjust between its own KEXINIT and its NEWKEYS, which RFC 4253 §7.1 forbids and the server refuses, rightly.
+>   The test client (`crates/ssh/src/tests/client.rs`) now holds upper-layer messages over that span, as OpenSSH does
+>   (0 of 12 runs after). Beside it, the edge polls the session's due timer in every pass (`Link::pass`), so a session
+>   whose writes never block still replaces its keys on time, and the test's reads are patient (the bytes, not the
+>   latency, are its subject).
+> - Not mine, reported: `git_push::tests::t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time` fails its
+>   "turns go on while no one waits" ratio alone at load 40 on this Mac (1,505 turns for 7,046 quanta); its own comment
+>   records the same assertion's load sensitivity.
 > **An SSH clone of a large revision spun its shard past the watchdog (2026-11-21, w-hg; main 01a20182's fixture round
 > at a3e673efc: 91 of 92, `ssh clone-after` cut, "stream ended unexpectedly (got 8113614 bytes, expected 16777334)").
 > FIXED.** Reproduced by a reduced lane (fixture; SSH push, push-head, -f, -B, a draft and tag, then clone; debug):
