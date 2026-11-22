@@ -1,9 +1,8 @@
 name: diag measurer
-# main 01a20182's confirming round for 84a on macOS (2026-11-21 ~23:50 PST): origin/main as it is, with A-831's TB (the
-# shards under THREAD_TIME_CONSTRAINT_POLICY), no stamps or diagnostic code. Five loaded rounds (the harness's spinners,
-# two a core) and three quiet ones inside one job on one runner, so runner variance is out of the comparison. 84a's bar:
-# loaded p99 and p999 of the f10 accept and conflict forms under 1 ms in every round. Run only from `diag-measurer-*`
-# branches, never main; every log is an artifact.
+# main 01a20182 (2026-11-22 ~01:45 PST): did tonight's landings regress 84a on macOS, or is it runner variance? An
+# interleaved A/B inside one job on one runner: A = 946e39c22 (round 1: loaded p99 < 1 ms 5/5), B = origin/main at this
+# branch's base (round 2 on 5870e50: p99 over 1 ms in 4/5). Loaded rounds A B, B A, A B, B A, A B; then quiet A, B.
+# Run only from `diag-measurer-*` branches, never main; every log is an artifact.
 
 on:
   push:
@@ -11,50 +10,56 @@ on:
 
 env:
   CARGO_TERM_COLOR: never
-  LOADED_ROUNDS: "5"
-  QUIET_ROUNDS: "3"
+  A_REV: 946e39c22
 
 jobs:
-  confirm:
-    name: 84a macOS confirm (${{ matrix.os }})
+  ab:
+    name: 84a macOS A/B (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os: [macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 240
+    timeout-minutes: 300
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
-      - name: Build
+      - name: Build A and B
         run: |
-          W="$RUNNER_TEMP/msr"; mkdir -p "$W/logs"
-          cargo build --release --locked -p slates-client --example edit_merge_bench > "$W/logs/build.log" 2>&1 || { tail -30 "$W/logs/build.log"; exit 1; }
-          cp target/release/examples/edit_merge_bench "$W/bench"; shasum -a 256 "$W/bench"
-          echo "base $(git rev-parse --short HEAD); runner cpus $(sysctl -n hw.ncpu) memory $(($(sysctl -n hw.memsize) / 1073741824)) GiB"
-          uname -a; sw_vers
-      - name: Rounds, loaded then quiet
-        run: |
-          W="$RUNNER_TEMP/msr"; B="$W/bench"; set +e +o pipefail
-          for round in $(seq 1 "$LOADED_ROUNDS"); do
-            L="$W/logs/loaded-r$round.log"; echo "== loaded round $round $(date -u +%FT%TZ) load: $(uptime)" | tee "$L"
-            perl -e 'alarm shift; exec @ARGV' 1500 "$B" --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict </dev/null >> "$L" 2>&1
-            echo "exit $?" >> "$L"; grep -E "f10_loaded_total_p(50|99|999)\b|exit" "$L" | cut -c1-200
+          W="$RUNNER_TEMP/ab"; mkdir -p "$W/logs"
+          B_REV=$(git rev-parse HEAD^1); echo "A $A_REV B $B_REV (this branch's base)"
+          for arm in A B; do
+            rev=$A_REV; [ $arm = B ] && rev=$B_REV
+            git worktree add -q --detach "$W/src-$arm" "$rev"
+            (cd "$W/src-$arm" && CARGO_TARGET_DIR="$W/target-$arm" cargo build --release --locked -p slates-client --example edit_merge_bench > "$W/logs/build-$arm.log" 2>&1) || { tail -30 "$W/logs/build-$arm.log"; exit 1; }
+            cp "$W/target-$arm/release/examples/edit_merge_bench" "$W/bench-$arm"
           done
-          for round in $(seq 1 "$QUIET_ROUNDS"); do
-            L="$W/logs/quiet-r$round.log"; echo "== quiet round $round $(date -u +%FT%TZ) load: $(uptime)" | tee "$L"
-            perl -e 'alarm shift; exec @ARGV' 1200 "$B" --quiet-only --files 10 --form accept --form conflict </dev/null >> "$L" 2>&1
-            echo "exit $?" >> "$L"; grep -E "f10_quiet_total_p(50|99|999)\b|exit" "$L" | cut -c1-200
+          echo "runner cpus $(sysctl -n hw.ncpu) memory $(($(sysctl -n hw.memsize) / 1073741824)) GiB"; sw_vers
+      - name: Interleaved rounds
+        run: |
+          W="$RUNNER_TEMP/ab"; set +e +o pipefail
+          i=0
+          for arm in A B B A A B B A A B; do
+            i=$((i+1)); L="$W/logs/loaded-$i-$arm.log"; echo "== loaded run $i arm $arm $(date -u +%FT%TZ) load: $(uptime)" | tee "$L"
+            perl -e 'alarm shift; exec @ARGV' 1500 "$W/bench-$arm" --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict </dev/null >> "$L" 2>&1
+            echo "exit $?" >> "$L"; grep -E "f10_loaded_total_p(50|99|999)\b|exit" "$L" | sed "s/^/[$arm] /" | cut -c1-200
+          done
+          for arm in A B; do
+            L="$W/logs/quiet-$arm.log"; echo "== quiet arm $arm" | tee "$L"
+            perl -e 'alarm shift; exec @ARGV' 1200 "$W/bench-$arm" --quiet-only --files 10 --form accept --form conflict </dev/null >> "$L" 2>&1
+            echo "exit $?" >> "$L"; grep -E "f10_quiet_total_p(50|99|999)\b|exit" "$L" | sed "s/^/[$arm] /" | cut -c1-200
           done
       - name: Keep the logs
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
-          name: confirm-84a-macos-logs
-          path: ${{ runner.temp }}/msr/logs
+          name: ab-84a-macos-logs
+          path: ${{ runner.temp }}/ab/logs
           if-no-files-found: warn
