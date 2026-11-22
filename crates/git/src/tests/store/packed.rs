@@ -677,3 +677,59 @@ fn a864_a_turn_that_meets_a_let_go_window_stops_cleanly_and_the_clone_is_byte_id
     whole.len()
   );
 }
+
+/// A-864 piece 2's encoding side (main 01a20182's ruling of 2026-11-22: a due version's packs never made resident whole).
+/// Do: land the `create` push twice in stores of 256-byte windows; encode one's version as it lies; let every window of
+/// the other's pack go and encode its version a turn at a time, bringing back the window each turn stopped at
+/// (`Encoding::waiting`) before the next; then clone both. Expect: the second encoding stopped at least once, every
+/// object sent on as its entry lies in both, and the two clones byte for byte the same. Red before: a unit meeting a
+/// let-go window refused the encoding.
+#[test]
+fn a864_an_encoding_that_meets_a_let_go_window_stops_cleanly_and_keeps_the_same_fragments() {
+  use crate::store::{Encoding, Progress, Turn};
+  let encoded = |let_go: bool| {
+    let (mut repository, mut store, objects, pack) = landed_create_in(PIECE2_WINDOW);
+    if let_go {
+      for window in pack.chunks(PIECE2_WINDOW).map(ContentId::of) {
+        assert!(store.mark_landed(&window));
+        store.let_go(&window).unwrap();
+      }
+    }
+    let mut encoding = Encoding::fragments(&repository, &store, 1, 0).unwrap();
+    let mut clock = super::Ticks(0);
+    let mut stops = 0;
+    for _ in 0..100_000 {
+      let turn = Turn {
+        clock: &mut clock,
+        exchange: super::EXCHANGE,
+        quantum_ns: u64::MAX,
+      };
+      if encoding.advance(&mut repository, &mut store, turn).unwrap() == Progress::Done {
+        break;
+      }
+      if let Some(waited) = encoding.waiting() {
+        stops += 1;
+        let (window, start, len) = store
+          .away_window(&waited.pack, waited.len, waited.offset)
+          .expect("the window met is let go");
+        let from = usize::try_from(start).unwrap();
+        let to = from + usize::try_from(len).unwrap();
+        store.bring_back(&window, &pack[from..to]).unwrap();
+      }
+    }
+    let counted = encoding.counters();
+    let clone = super::Answer::objects(&super::reached_now(&repository, &store, 1));
+    let (cloned, _) = super::streamed(&repository, &store, clone, u64::MAX);
+    (
+      stops,
+      counted.reused_whole + counted.reused_deltas,
+      crate::to_u64(objects.len()),
+      cloned,
+    )
+  };
+  let (_, reused, objects, kept) = encoded(false);
+  let (stops, reused_again, _, kept_again) = encoded(true);
+  assert!(stops > 0, "a let-go window met");
+  assert_eq!((reused, reused_again), (objects, objects));
+  assert!(kept_again == kept, "the same clone of the same fragments");
+}

@@ -2146,9 +2146,11 @@ fn edge_advertisement(port: u16, token: &str) -> Option<Vec<u8>> {
 
 /// Format: the daemon's counters of the paths a clone's objects took (main 01a20182's order of 2026-11-22 04:53): the
 /// fetch stream's (`vcs_store::upload::STREAM_COUNTED`) and the encoding made ahead's (`vcs_store::git_encode`'s).
-const CLONE_PATHS: [&str; 22] = [
+const CLONE_PATHS: [&str; 24] = [
   "vcs_store.git_upload.written_bytes",
   "vcs_store.git_upload.parts_copied",
+  "vcs_store.git_upload.parts_by_entry",
+  "vcs_store.git_upload.entries_judged",
   "vcs_store.git_upload.entries_copied",
   "vcs_store.git_upload.headers_rewritten",
   "vcs_store.git_upload.made_whole",
@@ -2221,9 +2223,12 @@ fn pack_file_bytes(dir: &str) -> u64 {
 /// when dropped, so a clone killed past [`PATIENCE`] says it too, before its daemon goes: the time, the pack bytes slates
 /// sent beside stock's, and each of [`CLONE_PATHS`]'s counts the clone added.
 struct CloneReport<'a> {
+  /// The step (main 01a20182's r28: each heavy step of the session says what it did, a killed one too).
+  step: &'static str,
   /// The edge's daemon's instance.
   instance: &'a str,
-  /// The mirror the clone makes.
+  /// The repository the step makes or fills: its pack directory is `objects/pack` beneath it (`.git/objects/pack` for
+  /// a work tree's).
   mirror: &'a str,
   /// The bytes of stock git's own clone of the source ([`stock_clone_bytes`]).
   stock: u64,
@@ -2245,13 +2250,30 @@ impl Drop for CloneReport<'_> {
       _ => vec!["(the daemon's status could not be read)".to_owned()],
     };
     eprintln!(
-      "whole-repository mirror clone over {}: {:?}; pack bytes slates {} stock {}; {}",
+      "whole-repository {} over {}: {:?}; pack bytes slates {} stock {}; {}",
+      self.step,
       self.instance,
       self.began.elapsed(),
       pack_file_bytes(self.mirror),
       self.stock,
       paths.join(" ")
     );
+  }
+}
+
+/// A report of `step` ([`CloneReport`]) on the daemon of `instance`, filling the repository at `dir`, beside stock's
+/// `stock` bytes of a whole clone, begun now.
+fn reported<'a>(
+  step: &'static str,
+  (instance, dir, stock): (&'a str, &'a str, u64),
+) -> CloneReport<'a> {
+  CloneReport {
+    step,
+    instance,
+    mirror: dir,
+    stock,
+    before: counters_of(instance, &CLONE_PATHS),
+    began: Instant::now(),
   }
 }
 
@@ -2299,6 +2321,7 @@ fn whole_session(git: &Git, source: &str, (url, instance, stock): (&str, &str, u
   let mirror = git.copy("mirror.git");
   {
     let _report = CloneReport {
+      step: "mirror clone",
       instance,
       mirror: &mirror,
       stock,
@@ -2314,7 +2337,11 @@ fn whole_session(git: &Git, source: &str, (url, instance, stock): (&str, &str, u
     "the mirror clone's refs are the source's"
   );
   let work = git.copy("work");
-  git.ok(&git.scratch, &["clone", "-q", url, &work]);
+  let work_git = format!("{work}/.git");
+  {
+    let _report = reported("work clone", (instance, &work_git, stock));
+    git.ok(&git.scratch, &["clone", "-q", url, &work]);
+  }
   let branch = git
     .ok(&work, &["symbolic-ref", "--short", "HEAD"])
     .trim()
@@ -2332,7 +2359,10 @@ fn whole_session(git: &Git, source: &str, (url, instance, stock): (&str, &str, u
       "HEAD:refs/heads/slates-topic",
     ],
   );
-  git.ok(&mirror, &["fetch", "-q", "--prune", "origin"]);
+  {
+    let _report = reported("mirror fetch", (instance, &mirror, stock));
+    git.ok(&mirror, &["fetch", "-q", "--prune", "origin"]);
+  }
   let listed = git.ok(&git.scratch, &["ls-remote", url]);
   let mirrored = git.ok(&git.scratch, &["ls-remote", &mirror]);
   assert_eq!(
@@ -2342,10 +2372,14 @@ fn whole_session(git: &Git, source: &str, (url, instance, stock): (&str, &str, u
   );
   git.ok(&mirror, &["fsck", "--full", "--strict", "--no-progress"]);
   let shallow = git.copy("shallow");
-  git.ok(
-    &git.scratch,
-    &["clone", "-q", "--depth", "1", url, &shallow],
-  );
+  let shallow_git = format!("{shallow}/.git");
+  {
+    let _report = reported("shallow clone", (instance, &shallow_git, stock));
+    git.ok(
+      &git.scratch,
+      &["clone", "-q", "--depth", "1", url, &shallow],
+    );
+  }
   assert_eq!(
     git.ok(&shallow, &["rev-list", "--count", "HEAD"]).trim(),
     "1",
@@ -2359,10 +2393,14 @@ fn whole_session(git: &Git, source: &str, (url, instance, stock): (&str, &str, u
     "deepened by one"
   );
   let partial = git.copy("partial");
-  git.ok(
-    &git.scratch,
-    &["clone", "-q", "--filter=blob:none", url, &partial],
-  );
+  let partial_git = format!("{partial}/.git");
+  {
+    let _report = reported("partial clone", (instance, &partial_git, stock));
+    git.ok(
+      &git.scratch,
+      &["clone", "-q", "--filter=blob:none", url, &partial],
+    );
+  }
   git.ok(&partial, &["fsck", "--no-progress"]);
   let tip = git.commit_of(&partial, "HEAD");
   let ours = archive(git, &partial, &tip, &git.copy("partial.tar"));

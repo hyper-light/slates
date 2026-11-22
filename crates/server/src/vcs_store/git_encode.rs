@@ -134,20 +134,18 @@ pub(crate) enum Turned {
 }
 
 /// One turn of repository `id`'s encoding (the module doc), within the shard's quantum on its clock.
-/// Whether repository `id` has an encoding under way or a version not yet encoded (A-864 piece 2: what its packs are
-/// made resident for, so a fetch of a repository encoded whole brings back nothing but its own look-ahead).
-pub(crate) fn encoding_due(state: &mut ShardState, id: RepositoryId) -> bool {
-  state.vcs_stores.encodings.0.contains_key(&id)
-    || state
-      .vcs_stores
-      .git(id)
-      .is_some_and(|(_, store)| store.repository.first_unencoded().is_some())
-}
-
-/// Makes repository `id`'s packs resident where an encoding is due ([`encoding_due`]).
-async fn resident_if_due(id: RepositoryId) {
-  if crate::state::with_state(|state| encoding_due(state, id)).unwrap_or(false) {
-    super::upload::resident(id).await;
+impl super::VcsStores {
+  /// The let-go window repository `id`'s encoding last stopped at, taken (A-864 piece 2's encoding side): what its
+  /// driver brings back before the next turn.
+  pub(crate) fn stopped_encoding(
+    &self,
+    id: RepositoryId,
+  ) -> Option<slates_git::store::packed::Waited> {
+    self
+      .encodings
+      .0
+      .get(&id)
+      .and_then(|(encoding, _)| encoding.waiting())
   }
 }
 
@@ -241,6 +239,8 @@ fn turn_lent(
             quantum_ns,
           },
         ) {
+          // A-864 piece 2: a unit stopped at a let-go window ends the turn; its driver brings the window back.
+          Ok(Progress::More) if encoding.stopped() => break Ok(Progress::More),
           Ok(Progress::More) => {}
           other => break other,
         }
@@ -496,8 +496,6 @@ pub(crate) fn ahead_under_way(state: &ShardState, id: RepositoryId) -> bool {
 /// counted [`AHEAD_STOPPED`], and its repository has no fetch answered now, what it holds is given back
 /// ([`give_back_idle`]). Returns at once where the shard's state is not lent.
 async fn encode_ahead(id: RepositoryId) {
-  // Goal 93 item 2a: the packs the encoding reads made resident first, where it has any to encode.
-  resident_if_due(id).await;
   loop {
     let turned = crate::state::with_state_counted(|state| {
       if !ahead_allowed(state, id) {
@@ -530,8 +528,6 @@ pub(crate) async fn encode_for_fetch(id: RepositoryId) {
 /// [`encode_for_fetch`] with the wait `wait_ns` long: whether the encoding was idle when it returned.
 pub(crate) async fn encode_within(id: RepositoryId, wait_ns: u64) -> bool {
   let began = slates_rt::futures::now_ns();
-  // Goal 93 item 2a: the packs the encoding reads made resident first, where it has any to encode.
-  resident_if_due(id).await;
   loop {
     match crate::state::with_state_counted(|state| turn(state, id)) {
       Some(Turned::More) if slates_rt::futures::now_ns().saturating_sub(began) >= wait_ns => {
