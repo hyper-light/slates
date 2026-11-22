@@ -130,3 +130,8 @@ run; datagram batching after, measured. Post-landing check: kiln r3.
 A holder's increment crosses on the content plane (A-826) at about 800 MB/s (512 MiB: forward incl. the owner's fetch
 0.58-0.67 s, kiln r2, Mac Studio). Datagram batching dropped (main: not needed). The 10x10 proof is main's round:
 the holder route's entry is in run-requests.md; the local route's follows w-work-cow's slicing.
+
+## 21:37 PST CLOSED (main's ruling 21:35): the lane's ~200 MB/s, at ~800 MB/s on the content plane
+Numbers and commands in BENCHMARKS ("The holder route's lane, closed at ~800 MB/s on the content plane"), on
+agents/w-shared-onepub with the regression fix, landing together on its green. Datagram batching dropped. The proof
+counts the holder route (5/5 at 320 and 512 MiB, r2); the whole 64-512 MiB x10 is yours after w-work-cow's A-841.
