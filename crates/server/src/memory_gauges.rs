@@ -6,6 +6,9 @@
 //! - `vcs_content.*`: the repositories' content store, its entries by where their bytes are (windows the window storage
 //!   keeps, windows let go, windows, lists, tables and derived nodes in its own memory), the objects it names, and its
 //!   budget's use and charges (`VcsStores::memory_rows`).
+//! - `homes.*`: what the shard's homes hold beside the content store (`vcs_store::homes::held`): its region holds, the
+//!   windows of the objects they name (each a landed window's pin), its landed records and their bytes as the image
+//!   keeps them.
 //! - `git.*`: over the git repositories, each one's read scratch's room, the objects it read lately, its maps' entries,
 //!   its charge on the content store, and its greens' map heads.
 //! - `greens.*`: over the shard's greens, the merge engine's retained bytes ([`slates_merge::engine::RetainedBytes`]):
@@ -188,5 +191,64 @@ mod tests {
       "{with:?}"
     );
     assert!(without.is_empty(), "{without:?}");
+  }
+
+  /// Goal 93 item 2b(b) (main 01a20182's ruling of 2026-11-22 20:20: hg's whole-history bar, about 410 MiB against
+  /// 4.1 GB, is planned term by term, homes' records and region holds among the content store's terms). Do: on one
+  /// shard, hold a two-window object for the region and note a landed record for a window; read the shard's report with
+  /// memory. Expect: homes' rows name one region hold, its two windows, one landed record and its bytes in the image's
+  /// form. Failing first: no homes row, those maps never gauged.
+  #[test]
+  fn a_memory_status_names_homes_records_and_region_holds() {
+    let rows = crate::daemon::audit_on_shard(|state| {
+      let window = state.store.content.chunk_bytes();
+      let bytes: Vec<u8> = (0..window + 5)
+        .map(|at| u8::try_from(at % 233).unwrap())
+        .collect();
+      let (object, _) = crate::vcs_store::homes::keep_for_region(state, &bytes).unwrap();
+      let first = state
+        .vcs_stores
+        .content()
+        .unwrap()
+        .object_layout(&object)
+        .first()
+        .map(|(window, _)| *window)
+        .unwrap();
+      crate::vcs_store::homes::note_landed(
+        first,
+        crate::vcs_store::homes::Landed::Hg(crate::vcs_store::homes::HgLanded {
+          repository: slates_db::catalog::RepositoryId { bytes: [1; 16] },
+          path: b"gauged".to_vec(),
+          node: [2; 20],
+        }),
+      );
+      super::rows(state, true)
+    });
+    let rows: std::collections::BTreeMap<&str, u64> = rows
+      .iter()
+      .filter(|row| row.kind.starts_with("mem.gauge.homes."))
+      .map(|row| (row.kind.as_str(), row.count))
+      .collect();
+    assert_eq!(
+      rows.get("mem.gauge.homes.region_holds"),
+      Some(&1),
+      "{rows:?}"
+    );
+    assert_eq!(
+      rows.get("mem.gauge.homes.region_windows"),
+      Some(&2),
+      "{rows:?}"
+    );
+    assert_eq!(
+      rows.get("mem.gauge.homes.landed_records"),
+      Some(&1),
+      "{rows:?}"
+    );
+    // The record's bytes as the image keeps it: the window's identity, the repository, the node and the path.
+    assert_eq!(
+      rows.get("mem.gauge.homes.landed_record_bytes"),
+      Some(&(32 + 16 + 20 + 6)),
+      "{rows:?}"
+    );
   }
 }

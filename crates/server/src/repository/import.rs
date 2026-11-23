@@ -259,31 +259,47 @@ async fn answer_at_end(id: RepositoryId, imports: Imports) {
     Imports::Mercurial => Outcome::Mercurial(hg_import::run(id).await),
     Imports::Subversion => Outcome::Subversion(svn_import::run(id).await),
   };
-  let answered = crate::state::with_state_counted(|state| answer(state, id, outcome)).flatten();
+  let answered = crate::state::with_state_counted(|state| answer(state, id, outcome));
+  let Some((answered, landed)) = answered else {
+    return;
+  };
   if let Some((route, reply, here)) = answered {
     crate::told::deliver_to(route, reply, here);
+  }
+  // Landed and durable, its file revisions are noted for a home and let go a turn at a time: a whole history's are
+  // hundreds of thousands, never one poll's work (goal 93; CI 45110563116's spin).
+  if !landed.is_empty() {
+    hg_import::let_go_landed_import(id, landed).await;
   }
 }
 
 /// Answers the request held for repository `id`'s import with its `outcome` (the module doc): a done import landed and
 /// the request's completion recorded in one transaction, and its reply with the route it goes by and this shard, for
-/// the caller to send. `None` when no request is held; a done import still lands, alone in its transaction.
+/// the caller to send. `None` when no request is held; a done import still lands, alone in its transaction. With it, a
+/// Mercurial import's file revisions once it landed and its transaction is durable, for the caller to let go.
 fn answer(
   state: &mut ShardState,
   id: RepositoryId,
   outcome: Outcome,
-) -> Option<(ReplyRoute, ReplyBody, u16)> {
+) -> (
+  Option<(ReplyRoute, ReplyBody, u16)>,
+  Vec<slates_hg::filerev::FileContents>,
+) {
   state.db.begin();
+  let mut contents = Vec::new();
   let outcome = match outcome {
     Outcome::Mercurial(Some(Ok(finished))) => {
-      Outcome::Mercurial(Some(hg_import::land(state, id).map(|()| finished)))
+      Outcome::Mercurial(Some(hg_import::land(state, id).map(|landed| {
+        contents = landed;
+        finished
+      })))
     }
     other => other,
   };
   let landed = matches!(outcome, Outcome::Mercurial(Some(Ok(_))));
   let Some(held) = state.vcs_stores.take_answer(id) else {
-    committed(state, (id, landed), ReplyBody::Acknowledged);
-    return None;
+    let (_, durable) = committed(state, (id, landed), ReplyBody::Acknowledged);
+    return (None, if durable { contents } else { Vec::new() });
   };
   let room = hg_import::room_of(state);
   let reply = match outcome {
@@ -291,28 +307,31 @@ fn answer(
     Outcome::Subversion(outcome) => svn_reply_of(&held.path, room, outcome),
   };
   let reply = crate::verbs::record_completion(state, held.origin, held.id, reply);
-  let reply = committed(state, (id, landed), reply);
+  let (reply, durable) = committed(state, (id, landed), reply);
   state.count(ANSWERED, 1);
-  Some((held.route, reply, state.shard))
+  (
+    Some((held.route, reply, state.shard)),
+    if durable { contents } else { Vec::new() },
+  )
 }
 
 /// `reply` once the transaction holding the landing and the completion is durable; the database's refusal when it
 /// cannot be, the partition then rolled back, the shard's effects reconciled with the log and, when the import landed,
-/// its store made again from the log (the module doc).
+/// its store made again from the log (the module doc). With it, whether the transaction is durable.
 fn committed(
   state: &mut ShardState,
   (id, landed): (RepositoryId, bool),
   reply: ReplyBody,
-) -> ReplyBody {
+) -> (ReplyBody, bool) {
   match state.db.commit(&mut state.segment) {
-    Ok(_) => reply,
+    Ok(_) => (reply, true),
     Err(error) => {
       state.count(UNRECORDED, 1);
       crate::verbs::reconcile_unpublished_effects(state);
       if landed {
         crate::vcs_store::rebuild(state, id);
       }
-      refused(crate::error::refusal_of_db(&error))
+      (refused(crate::error::refusal_of_db(&error)), false)
     }
   }
 }

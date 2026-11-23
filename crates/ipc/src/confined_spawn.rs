@@ -383,6 +383,10 @@ impl SpawnedChild {
 // module, its imports with it, is gated as its one test is.
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
+  // The test harness's allow, as `exit_watch`'s tests carry it: its helpers (`leader_of`, `exited_unreaped`) are no
+  // `#[test]`, so clippy's test allowance does not reach them (the lint wall at dc549ba48 on macOS).
+  #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
   use std::io::Read;
   use std::os::fd::AsFd;
 
