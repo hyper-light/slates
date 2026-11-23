@@ -611,3 +611,10 @@
   made load-proof 4fc1cea9d (merge 0ffbdb5ef): judged by the shard's own SliceTrace, not the test's wall time; red 1/6
   under 16 spinners before, 6/6 after. Reran on w-shared's A-870 piece 2 (a9c4e7190): 426 green. NEXT: main's r222
   (git/git whole A/B on the lift, then verbs) and the restart read-back row (w-shared votes read-through).
+
+- 2026-11-23: r227 SSH REGRESSION FIXED 56fbf0381 (merge 78ba9b117): with the re-lift, an upload answer held for a
+  let-go window its pack choice read (Answer::held_away, sections written) was dropped by the SSH edge's write_answer
+  (HTTP makes it again); now kept and made again via read_through_held. Session red: git_interop whole over SSH on a
+  made history 3/3 failed before, every step held after. Post-merge rerun 368 green. OWED: unit red at the SSH edge
+  (single-shard tests reach no held answer; two-push shallow test kept as guard); SSH wait for room (A-855). Disk:
+  freed 2.3 GiB of rcgu.o from my target. Pushed once after a merge before rerunning (rerun green after).
