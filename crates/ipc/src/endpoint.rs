@@ -108,6 +108,11 @@ pub struct ClientEnd {
   parks: u64,
   /// Its synchronous reply wait's parks under an asked EEVDF slice, and those it skipped ([`SlicedParks`], 84a's arm E).
   sliced_parks: SlicedParks,
+  /// How long its replies take to come, from the wait's start (84a's Linux arm G): the online mean a reply is expected
+  /// within, which the client's naps follow ([`Self::nap_ns`]).
+  reply_waits: WakeEstimate,
+  /// Its naps while a reply is due, their thread CPU and their wall time ([`ClientNaps`]).
+  naps: ClientNaps,
   /// Replies taken.
   replies: u64,
   /// Parks a wake ended with no reply in the ring — a spurious return from the OS wait, or a previous
@@ -184,6 +189,8 @@ impl ClientEnd {
   pub fn new(region: ClientRegion) -> ClientEnd {
     let wake = WakeEstimate::new(u64::from(region.spin_ns()), region.spin_shift());
     ClientEnd {
+      reply_waits: wake,
+      naps: ClientNaps::default(),
       wake,
       wake_samples: 0,
       unsettled: [None; REPLY_STAMP_SLOTS],
@@ -722,7 +729,11 @@ impl ClientEnd {
     {
       self.looks = Looks::default();
     }
+    let started = Instant::now();
     let waited = self.wait_ending(Ends::Departure);
+    if let Ok(Waited::Reply(_)) = &waited {
+      self.reply_waits.record(elapsed_ns(started));
+    }
     #[cfg(target_os = "linux")]
     self.give_back_bridge_level();
     waited
@@ -780,28 +791,24 @@ impl ClientEnd {
     }
     self.parks = self.parks.saturating_add(1);
     real_time_once(u64::from(self.region.spin_ns()));
-    let sliced = self.slice_for_park();
+    self.count_sliced_park();
     let switches_before = slates_machine::switches::switches_now();
     let waiting_ns = slates_machine::clock::monotonic_ns();
-    let parked = match ends {
-      Ends::At(deadline_ns) => {
+    // A departure park naps while the client expects its reply (84a's Linux arm G), unless a look at the daemon's life
+    // times it already (macOS, Windows).
+    let nap_ns = match ends {
+      Ends::Departure if look_timeout_ns.is_none() => self.nap_ns(started),
+      Ends::At(_) | Ends::Departure => None,
+    };
+    let parked = match (ends, nap_ns) {
+      (Ends::At(deadline_ns), _) => {
         let remaining = deadline_ns.map(|deadline| deadline.saturating_sub(elapsed_ns(started)));
         self.park_until(expected, remaining)
       }
-      Ends::Departure => self.park_until_departure(expected, look_timeout_ns),
+      (Ends::Departure, Some(nap_ns)) => self.nap(expected, nap_ns),
+      (Ends::Departure, None) => self.park_until_departure(expected, look_timeout_ns),
     };
     let returned_ns = slates_machine::clock::monotonic_ns();
-    // The thread's own scheduling back before anything else, whatever the park answered.
-    if let Some(slice) = sliced
-      && let Err(code) = slice.restore()
-    {
-      self.sliced_parks.restore_failed = self.sliced_parks.restore_failed.saturating_add(1);
-      self.region.client_parked()?.store(0, Ordering::Release);
-      return Err(IpcError::OsRefused {
-        call: "sched_setattr (a sliced park's restore)",
-        code: Some(code),
-      });
-    }
     let parked = parked?;
     let teaches = wait_may_teach(
       parked.waker_confirms,
@@ -814,7 +821,14 @@ impl ClientEnd {
       returned_ns,
       waker_confirms: parked.waker_confirms,
     });
-    self.after_park(ends, slot, parked, woke, look_timeout_ns.is_some())
+    let timed = if look_timeout_ns.is_some() {
+      Timed::ForALook
+    } else if nap_ns.is_some() {
+      Timed::ForANap
+    } else {
+      Timed::No
+    };
+    self.after_park(ends, slot, parked, woke, timed)
   }
 
   /// Arms a park (§4.7; `crate::park`): the flag first, then the wake word's value, both before the caller's re-check
@@ -856,7 +870,7 @@ impl ClientEnd {
     slot: usize,
     parked: Parked,
     woke: Option<Unsettled>,
-    timed_for_a_look: bool,
+    timed: Timed,
   ) -> Result<Option<Waited>, IpcError> {
     if parked.woken
       && let Some(reply) = self.after_wake(slot, woke)?
@@ -872,8 +886,12 @@ impl ClientEnd {
     }
     match ends {
       Ends::At(Some(_)) => self.after_deadline().map(Some),
-      Ends::Departure if timed_for_a_look => {
+      Ends::Departure if timed == Timed::ForALook => {
         self.parks_ended_by_looks = self.parks_ended_by_looks.saturating_add(1);
+        Ok(None)
+      }
+      Ends::Departure if timed == Timed::ForANap => {
+        self.naps.timed_out = self.naps.timed_out.saturating_add(1);
         Ok(None)
       }
       Ends::At(None) | Ends::Departure => Ok(None),
@@ -976,7 +994,7 @@ impl ClientEnd {
   fn park_until_departure(
     &mut self,
     _expected: u32,
-    _timeout_ns: Option<u64>,
+    timeout_ns: Option<u64>,
   ) -> Result<Parked, IpcError> {
     use rustix::event::{PollFd, PollFlags, poll};
     let (woken, departed) = {
@@ -997,7 +1015,11 @@ impl ClientEnd {
         PollFd::new(&level, PollFlags::IN),
         PollFd::new(&watch, PollFlags::RDHUP),
       ];
-      match poll(&mut interest, None) {
+      let timeout = timeout_ns.map(|ns| rustix::time::Timespec {
+        tv_sec: i64::try_from(ns / NS_PER_S).unwrap_or(i64::MAX),
+        tv_nsec: i64::try_from(ns % NS_PER_S).unwrap_or(0),
+      });
+      match poll(&mut interest, timeout.as_ref()) {
         Ok(_) => {}
         // A signal: the caller looks at the ring, then parks again.
         Err(rustix::io::Errno::INTR) => return Ok(Parked::INTERRUPTED),
@@ -1728,19 +1750,21 @@ mod departure {
     let (parks, replies) = rings.client.park_ratio();
     let unanswered = rings.client.unanswered_wakes();
     let at_looks = rings.client.parks_ended_by_looks();
+    let at_naps = rings.client.naps().timed_out;
     let looks = rings.client.liveness_looks();
     let taught = rings.client.wake_samples() - samples_before;
     println!(
       "a reply held {LATE_NS} ns: {parks} parks, {replies} replies, {unanswered} unanswered, {at_looks} ended by \
-       looks, {looks} looks, {taught} taught the estimate"
+       looks, {at_naps} ended by naps' timers, {looks} looks, {taught} taught the estimate"
     );
     assert!(
       matches!(waited, Waited::Reply(_)),
       "the wait ended {waited:?} with its daemon alive"
     );
     assert!(
-      parks <= replies + unanswered + at_looks,
-      "every park is counted: {parks} parks, {replies} replies, {unanswered} unanswered, {at_looks} ended by looks"
+      parks <= replies + unanswered + at_looks + at_naps,
+      "every park is counted: {parks} parks, {replies} replies, {unanswered} unanswered, {at_looks} ended by looks, \
+       {at_naps} by naps' timers"
     );
     if cfg!(any(target_os = "macos", windows)) {
       assert!(
@@ -1754,8 +1778,8 @@ mod departure {
       );
     }
     assert!(
-      taught <= parks - at_looks,
-      "{taught} samples taught from {parks} parks, {at_looks} of them ended by looks"
+      taught <= parks - at_looks - at_naps,
+      "{taught} samples taught from {parks} parks, {at_looks} of them ended by looks, {at_naps} by naps' timers"
     );
   }
 
@@ -2297,45 +2321,149 @@ mod tests {
   }
 }
 
+/// What timed a departure park's wait, so a park that ended at its timeout with nothing come is counted as its own kind:
+/// a look at the daemon's life (macOS, Windows; A-506) or a nap's own timer (Linux, 84a's arm G).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Timed {
+  /// Nothing: the park waited for its reply, its departure or its deadline.
+  No,
+  /// The next look at the daemon's life.
+  ForALook,
+  /// The nap's own timer.
+  ForANap,
+}
+
 /// A client's synchronous reply wait's parks under an asked EEVDF slice (84a's arm E, `slates_machine::fair_slice`), and
-/// those it skipped. Elsewhere than Linux every park is skipped.
+/// those that kept the thread's own. Elsewhere than Linux every park keeps its own.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SlicedParks {
-  /// Parks under the asked slice, the thread's own scheduling put back after each.
+  /// Parks on a thread that holds the asked slice.
   pub taken: u64,
-  /// Parks that kept the thread's own slice (not Linux, not the plain fair class, or refused).
+  /// Parks on a thread that keeps its own slice (not Linux, not the plain fair class, or refused).
   pub skipped: u64,
-  /// Restores the kernel refused, each the call's typed refusal. Expected none.
-  pub restore_failed: u64,
 }
 
 impl ClientEnd {
-  /// Asks EEVDF for the daemon's published window (R9's floor) as this thread's slice for the coming park, so its
-  /// reply's wake may preempt busy fair neighbours (84a's arm E: woken by its reply, the client waited out their
-  /// 2.1 ms slices on CI's runners, run 45020845000). Counted either way; the first skip on a thread is logged.
-  fn slice_for_park(&mut self) -> Option<slates_machine::fair_slice::ParkSlice> {
-    let window_ns = u64::from(self.region.spin_ns());
-    match slates_machine::fair_slice::raise_for_park(window_ns) {
-      Ok(slice) => {
-        self.sliced_parks.taken = self.sliced_parks.taken.saturating_add(1);
-        Some(slice)
-      }
-      Err(skipped) => {
-        self.sliced_parks.skipped = self.sliced_parks.skipped.saturating_add(1);
-        if cfg!(target_os = "linux") && !SLICE_SKIP_LOGGED.with(|logged| logged.replace(true)) {
-          slates_machine::log_line!(
-            "slates-ipc: a reply wait parks with its own slice: {skipped:?}"
-          );
-        }
-        None
-      }
+  /// Counts a park under the slice its thread holds, asking for it on the thread's first park ([`slice_once`]).
+  fn count_sliced_park(&mut self) {
+    if slice_once(u64::from(self.region.spin_ns())) {
+      self.sliced_parks.taken = self.sliced_parks.taken.saturating_add(1);
+    } else {
+      self.sliced_parks.skipped = self.sliced_parks.skipped.saturating_add(1);
     }
   }
 }
 
+/// Asks EEVDF for the daemon's published window (R9's floor) as the calling thread's slice, once per thread, as
+/// [`real_time_once`] asks macOS's real-time band; true while the thread holds it (84a's arm E). Woken by its reply
+/// behind busy fair neighbours, a default-slice client waited out their 2.1 ms slices on CI's runners (run
+/// 45020845000); a shorter slice cancels the running task's protection (`PREEMPT_SHORT`). The slice stays in the fair
+/// class with the thread's weight unchanged, so the thread takes no larger share. It is asked once, not around each
+/// park: arm E's ask and restore cost three `sched_*attr` calls a park, and a reply wait that naps (84a's arm G) parks
+/// every R9 floor. The first refusal on a thread is logged.
+fn slice_once(window_ns: u64) -> bool {
+  if !cfg!(target_os = "linux") {
+    return false;
+  }
+  SLICE_HELD.with(|held| {
+    if let Some(holds) = held.get() {
+      return holds;
+    }
+    let holds = match slates_machine::fair_slice::set_current(window_ns) {
+      Ok(_) => true,
+      Err(skipped) => {
+        slates_machine::log_line!("slates-ipc: a reply wait parks with its own slice: {skipped:?}");
+        false
+      }
+    };
+    held.set(Some(holds));
+    holds
+  })
+}
+
+/// A client's naps while its reply is due (84a's Linux arm G, `slates_machine::nap`): each a departure park whose wait
+/// ends at R9's floor if no reply came first. Elsewhere than Linux none is taken.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClientNaps {
+  /// Naps taken: the non-vacuity count.
+  pub naps: u64,
+  /// The thread's CPU time in them, nanoseconds: their cost.
+  pub cpu_ns: u64,
+  /// Their wall time, nanoseconds: the time the client spent expecting its reply in them.
+  pub wall_ns: u64,
+  /// Naps their own timer ended with no reply, wake or departure first: a park's kind of its own, which teaches the wake
+  /// estimate nothing.
+  pub timed_out: u64,
+}
+
+/// Format: nanoseconds a second, for a nap's poll timeout and a thread CPU clock reading.
+#[cfg(target_os = "linux")]
+const NS_PER_S: u64 = 1_000_000_000;
+
+impl ClientEnd {
+  /// How long the next park naps, when the client expects its reply now (84a's Linux arm G): R9's floor (the daemon's
+  /// published window), no longer than the expectation of its measured reply waits from `started` has left. `None`
+  /// past it, or off Linux: the park waits for the reply or the departure, as before.
+  fn nap_ns(&self, started: Instant) -> Option<u64> {
+    if !cfg!(target_os = "linux") {
+      return None;
+    }
+    let expected = slates_machine::nap::expectation_ns(self.reply_waits.mean_ns());
+    let left = expected
+      .checked_sub(elapsed_ns(started))
+      .filter(|left| *left > 0)?;
+    Some(u64::from(self.region.spin_ns()).min(left).max(1))
+  }
+
+  /// One nap: a departure park whose wait ends after `nap_ns` if nothing came first, its thread CPU and wall time
+  /// counted; the thread's timer slack lowered once, so the nap ends at its deadline.
+  fn nap(&mut self, expected: u32, nap_ns: u64) -> Result<Parked, IpcError> {
+    if !NAP_SLACK_SET.with(|set| set.replace(true))
+      && let Err(errno) = slates_machine::nap::set_least_timer_slack()
+    {
+      slates_machine::log_line!("slates-ipc: a client's naps keep its timer slack (errno {errno})");
+    }
+    let (cpu_before, wall_before) = (thread_cpu_ns(), slates_machine::clock::monotonic_ns());
+    let parked = self.park_until_departure(expected, Some(nap_ns));
+    self.naps.naps = self.naps.naps.saturating_add(1);
+    self.naps.cpu_ns = self
+      .naps
+      .cpu_ns
+      .saturating_add(thread_cpu_ns().saturating_sub(cpu_before));
+    self.naps.wall_ns = self
+      .naps
+      .wall_ns
+      .saturating_add(slates_machine::clock::monotonic_ns().saturating_sub(wall_before));
+    parked
+  }
+
+  /// The client's naps while a reply was due ([`ClientNaps`]).
+  pub fn naps(&self) -> ClientNaps {
+    self.naps
+  }
+}
+
+/// The calling thread's CPU time, nanoseconds (0 where the clock cannot be read).
+fn thread_cpu_ns() -> u64 {
+  #[cfg(target_os = "linux")]
+  {
+    let reading = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
+    u64::try_from(reading.tv_sec)
+      .unwrap_or(0)
+      .saturating_mul(NS_PER_S)
+      .saturating_add(u64::try_from(reading.tv_nsec).unwrap_or(0))
+  }
+  #[cfg(not(target_os = "linux"))]
+  {
+    0
+  }
+}
+
 thread_local! {
-  /// Whether this thread has logged its reply wait's first skipped sliced park ([`ClientEnd::slice_for_park`]).
-  static SLICE_SKIP_LOGGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+  /// Whether this thread holds the asked slice, once it has asked ([`slice_once`]).
+  static SLICE_HELD: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+  /// Whether this thread has lowered its timer slack for its naps ([`ClientEnd::nap`]).
+  static NAP_SLACK_SET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
   /// Whether this thread has asked for the time-constraint policy ([`real_time_once`]).
   static REAL_TIME_ASKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }

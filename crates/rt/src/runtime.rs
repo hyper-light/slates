@@ -598,6 +598,13 @@ impl Runtime {
               ),
             }
           }
+          // 84a's Linux arm G: a tracking shard's naps end at their deadline, not up to the default 50 µs late
+          // (`slates_machine::nap`). No privilege.
+          if real_time_window_ns.is_some()
+            && let Err(errno) = slates_machine::nap::set_least_timer_slack()
+          {
+            slates_machine::log_line!("slates-rt: shard {id} keeps its timer slack (errno {errno})");
+          }
           run_worker(seed, core, ready)
         });
       match spawned {

@@ -683,6 +683,11 @@ fn measure(
       form.key(),
       fixture.client.sliced_parks()
     );
+    println!(
+      "client naps\t{}_f{files}_{load}: {:?}",
+      form.key(),
+      fixture.client.naps()
+    );
     fixture.client.destroy(fixture.leader).unwrap();
     fixture.client.destroy(fixture.follower).unwrap();
     fixture.client.destroy(fixture.green).unwrap();
@@ -1036,6 +1041,12 @@ fn main() {
       pulse.wake_cost_ns,
       pulse.kicks_skipped
     );
+  }
+  // 84a's Linux arm G: each shard's naps while it expected work, and what they cost it.
+  if let Ok(naps) = daemon.shard_naps() {
+    for (shard, (count, cpu_ns, wall_ns)) in naps.into_iter().enumerate() {
+      println!("shard naps\tshard {shard}: naps {count}, cpu {cpu_ns} ns, wall {wall_ns} ns");
+    }
   }
   daemon.stop();
   if LOADED_OVER.load(std::sync::atomic::Ordering::Relaxed) {

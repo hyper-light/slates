@@ -1696,6 +1696,12 @@ impl Client {
     self.end.sliced_parks()
   }
 
+  /// The synchronous reply wait's naps while its reply was due, their CPU and wall time (84a's Linux arm G;
+  /// `ClientEnd::naps`).
+  pub fn naps(&self) -> slates_ipc::endpoint::ClientNaps {
+    self.end.naps()
+  }
+
   /// Sends `body` as the next request and returns the reply body, refusals typed.
   pub fn call(&mut self, body: &RequestBody) -> Result<ReplyBody, ClientError> {
     // Every `ack_every` requests, the client acknowledges them first (one request), so the daemon's retained records

@@ -2534,6 +2534,22 @@ impl Daemon {
       .collect()
   }
 
+  /// Each shard's naps since boot, their thread CPU and their wall time, in shard order (84a's Linux arm G;
+  /// `slates_rt::shard::Counters::naps`): asked as a one-shot task on each shard, as [`Self::idle_spins`] is. An
+  /// observation the daemon could not make is its typed refusal.
+  pub fn shard_naps(&self) -> Result<Vec<(u64, u64, u64)>, ObserveError> {
+    self
+      .shards
+      .iter()
+      .map(|shard| {
+        self.observe_shard(Some(*shard), |ctx| {
+          let counters = ctx.counters();
+          (counters.naps, counters.nap_cpu_ns, counters.nap_wall_ns)
+        })
+      })
+      .collect()
+  }
+
   /// Whether this daemon admits a write that changes its shard image — a `Create`, a `Snapshot` — or refuses it
   /// `ConsensusNotInitialized` (§4.8): its control shard has imported both groups it belongs to, the root and its
   /// region's council, and is a member of the council's configuration. A fleet test's settled fleet waits for it on

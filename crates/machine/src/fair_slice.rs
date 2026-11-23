@@ -111,8 +111,8 @@ fn with_slice(slice_ns: u64) -> Result<(SchedAttr, SchedAttr), SliceSkipped> {
   Ok((prior, asked))
 }
 
-/// Asks the kernel for `slice_ns` as the calling thread's slice (a shard's, for good): the slice it reports back, which
-/// it may have raised to its least.
+/// Asks the kernel for `slice_ns` as the calling thread's slice, for good: a shard's at its start, a client's reply
+/// wait's thread at its first park. The slice it reports back, which it may have raised to its least.
 #[cfg(target_os = "linux")]
 pub fn set_current(slice_ns: u64) -> Result<u64, SliceSkipped> {
   let (_, asked) = with_slice(slice_ns)?;
@@ -120,49 +120,9 @@ pub fn set_current(slice_ns: u64) -> Result<u64, SliceSkipped> {
   Ok(read()?.sched_runtime)
 }
 
-/// A thread's own scheduling, read before a park whose slice was asked, put back exactly by [`ParkSlice::restore`].
-/// `sched_getattr` reports a fair thread's slice whether or not it was asked, so the restore asks the slice the thread
-/// had: the same slice, from then on held by the thread itself.
-#[derive(Debug)]
-pub struct ParkSlice {
-  /// The thread's whole scheduling before the park.
-  #[cfg(target_os = "linux")]
-  prior: SchedAttr,
-}
-
-/// Asks `slice_ns` as the calling thread's slice for one park (a client's synchronous reply wait, 84a's arm E), its whole
-/// scheduling read first to be put back after ([`ParkSlice::restore`]).
-#[cfg(target_os = "linux")]
-pub fn raise_for_park(slice_ns: u64) -> Result<ParkSlice, SliceSkipped> {
-  let (prior, asked) = with_slice(slice_ns)?;
-  write(&asked).map_err(|errno| SliceSkipped::Refused { errno })?;
-  Ok(ParkSlice { prior })
-}
-
-impl ParkSlice {
-  /// Puts the thread's own scheduling back as [`raise_for_park`] read it; a refusal is the `errno` (no privilege is
-  /// needed to put back a fair thread's own slice and nice).
-  #[cfg(target_os = "linux")]
-  pub fn restore(self) -> Result<(), i32> {
-    write(&self.prior)
-  }
-
-  /// Off Linux nothing was asked.
-  #[cfg(not(target_os = "linux"))]
-  pub fn restore(self) -> Result<(), i32> {
-    Ok(())
-  }
-}
-
 /// Off Linux: no slice to ask.
 #[cfg(not(target_os = "linux"))]
 pub fn set_current(_slice_ns: u64) -> Result<u64, SliceSkipped> {
-  Err(SliceSkipped::Unsupported)
-}
-
-/// Off Linux: no slice to ask.
-#[cfg(not(target_os = "linux"))]
-pub fn raise_for_park(_slice_ns: u64) -> Result<ParkSlice, SliceSkipped> {
   Err(SliceSkipped::Unsupported)
 }
 

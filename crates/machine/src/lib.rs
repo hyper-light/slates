@@ -64,6 +64,7 @@ pub mod fair_slice;
 pub mod log;
 pub mod memory_pressure;
 pub mod memory_stall;
+pub mod nap;
 pub mod placement;
 pub mod probes;
 pub mod process_clock;
