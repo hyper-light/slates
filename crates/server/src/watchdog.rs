@@ -416,9 +416,8 @@ const PERCENT: usize = 100;
 ///
 /// It allocates nothing after it is made (goal 93's "no allocation by design"): the readings are a ring of fixed size,
 /// written in place, and the p99 sorts a copy on the stack. Until 2026-11-23 the readings were a growable queue and each
-/// p99 collected and sorted a fresh vector, every watchdog beat and every anchor wait: 14.4% of the bytes a Mercurial
-/// push's daemon sampled (`tests/hg_push_heap.rs`, main 9c8e4a95e), and with the beat's own vectors about 10-15 MB a
-/// second on a two-shard daemon (`tests/watchdog_allocations.rs` holds it at none).
+/// p99 collected and sorted a fresh vector, every watchdog beat and every anchor wait: with the beat's own vectors, 4
+/// allocations a beat, about 1 KB by their types (`tests/watchdog_allocations.rs` holds the beat at none).
 #[derive(Clone, Debug)]
 pub struct LatenessTail {
   /// The kept readings: the first `kept` slots, in no order the p99 needs; `next` is where the newest goes, over the

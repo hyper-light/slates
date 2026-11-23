@@ -513,6 +513,41 @@ impl Encoding {
     true
   }
 
+  /// Whether the encoding stands at an object's read where it lies in its pack, nothing of it read yet: the state a
+  /// test lets the object's windows go in before the read (r165, main 01a20182's item 2).
+  #[cfg(test)]
+  pub(crate) fn reading_unread_in_pack(&self) -> bool {
+    let Stage::Encode {
+      current: Some(current),
+      ..
+    } = &self.stage
+    else {
+      return false;
+    };
+    matches!(&**current, Current::Read { object, .. }
+      if object.bytes.is_empty() && matches!(object.stored, StoredAt::InPack(_)))
+  }
+
+  /// The encoding after a unit whose read was `refused`: stopped at the let-go window the read met, the unit
+  /// (`current`, of `part`) kept to be taken again once it is brought back; `refused` where the read met none, or the
+  /// same window again (r165).
+  fn stopped_unit(
+    &mut self,
+    repository: &Repository,
+    store: &ContentStore,
+    refused: StoreRefused,
+    (blobs, part, current): (bool, Part, Box<Current>),
+  ) -> Result<Stage, StoreRefused> {
+    match repository.waiting() {
+      Some(waited) if self.stop_at(store, waited) => Ok(Stage::Encode {
+        blobs,
+        part: Box::new(part),
+        current: Some(current),
+      }),
+      _ => Err(refused),
+    }
+  }
+
   /// Whether a unit stopped at a let-go window ([`Encoding::waiting`]) not yet taken: its driver ends the turn there.
   pub fn stopped(&self) -> bool {
     let waiting = self.waiting.take();
@@ -690,12 +725,25 @@ impl Encoding {
         ref mut object,
         ref mut named,
       } => {
+        // r165: a read of an object where it lies that met a let-go window stops the encoding there, its unit kept to
+        // be taken again once the window is brought back (as a header's read stops it); refused otherwise.
+        let _ = repository.waiting();
         let before = object.bytes.len();
-        let mut read = object.read_window(repository, store)?;
+        let mut read = match object.read_window(repository, store) {
+          Ok(read) => read,
+          Err(refused) => {
+            return self.stopped_unit(repository, store, refused, (blobs, part, current));
+          }
+        };
         let mut taken = object.bytes.len().saturating_sub(before);
         if !read && let Some(named) = named.as_mut() {
           let before = named.bytes.len();
-          read = named.read_window(repository, store)?;
+          read = match named.read_window(repository, store) {
+            Ok(read) => read,
+            Err(refused) => {
+              return self.stopped_unit(repository, store, refused, (blobs, part, current));
+            }
+          };
           taken = named.bytes.len().saturating_sub(before);
         }
         self.counters.most_bytes_a_unit = self.counters.most_bytes_a_unit.max(to_u64(taken));
@@ -708,7 +756,18 @@ impl Encoding {
           let at = PACK_HEADER_LEN.saturating_add(to_u64(part.bytes.len()));
           // A-859: an object pushed in a pack is sent on as its entry lies there, where its check holds and its base
           // the client reads (main 01a20182's ruling of 2026-11-22 05:38: whenever it has one); otherwise it is encoded.
-          if let Some((header, copying)) = self.reused(repository, store, (&part, &object, at)) {
+          let reused = match self.reused(repository, store, (&part, &object, at)) {
+            Ok(reused) => reused,
+            // r165: its entry's or its base's read met a let-go window; its read kept, it is judged again next.
+            Err(Stopped) => {
+              return Ok(Stage::Encode {
+                blobs,
+                part: Box::new(part),
+                current: Some(Box::new(Current::Read { object, named })),
+              });
+            }
+          };
+          if let Some((header, copying)) = reused {
             part.bytes.extend_from_slice(&header);
             return Ok(Stage::Encode {
               blobs,
@@ -830,39 +889,54 @@ impl Encoding {
     repository: &Repository,
     store: &ContentStore,
     (part, object, at): (&Part, &Reading, u64),
-  ) -> Option<(Vec<u8>, Copying)> {
+  ) -> Result<Option<(Vec<u8>, Copying)>, Stopped> {
     let StoredAt::InPack(place) = object.stored else {
       self.counters.reuse_no_entry = self.counters.reuse_no_entry.saturating_add(1);
-      return None;
+      return Ok(None);
     };
     let mut scratch = Vec::new();
-    let Ok(raw) = packed::raw_entry(
+    let raw = match packed::raw_entry(
       store,
       (place, repository.format()),
       (&mut scratch, repository.largest_object().max(object.len)),
-    ) else {
-      self.counters.reuse_unread = self.counters.reuse_unread.saturating_add(1);
-      return None;
+    ) {
+      Ok(raw) => raw,
+      // r165: a let-go window stops the encoding rather than sending the object encoded afresh.
+      Err(refused) => {
+        self.stopped_by(store, &refused)?;
+        self.counters.reuse_unread = self.counters.reuse_unread.saturating_add(1);
+        return Ok(None);
+      }
     };
     let base_id = match raw.representation {
       Representation::Whole(_) => None,
       Representation::OfsDelta { base } => {
         let Some(base) = self.offsets.get(&(place.pack, base)) else {
           self.counters.reuse_unread = self.counters.reuse_unread.saturating_add(1);
-          return None;
+          return Ok(None);
         };
         Some(*base)
       }
       Representation::RefDelta { base } => Some(base),
     };
-    let (representation, depth, stored, base) =
-      self.placement(repository, store, (part, object.kind, base_id))?;
+    let Some((representation, depth, stored, base)) =
+      self.placement(repository, store, (part, object.kind, base_id))
+    else {
+      return Ok(None);
+    };
+    // A check whose base's read met a let-go window stops the encoding there (r165), its note this read's own.
+    let _ = repository.waiting();
     if !entry_checked(repository, store, (object, &raw, &scratch, base_id)) {
+      if let Some(waited) = repository.waiting()
+        && self.stop_at(store, waited)
+      {
+        return Err(Stopped);
+      }
       self.counters.reuse_refused = self.counters.reuse_refused.saturating_add(1);
-      return None;
+      return Ok(None);
     }
     let mut header = Vec::new();
-    entry::write(
+    let header_written = entry::write(
       entry::Header {
         representation,
         size: raw.size,
@@ -870,14 +944,17 @@ impl Encoding {
       at,
       &mut header,
     )
-    .ok()?;
+    .ok();
+    let Some(()) = header_written else {
+      return Ok(None);
+    };
     if stored == Stored::Whole {
       self.counters.reused_whole = self.counters.reused_whole.saturating_add(1);
     } else {
       self.counters.reused_deltas = self.counters.reused_deltas.saturating_add(1);
     }
     let copying = copying_of(object, (place, &raw), (at, depth, stored, base), &header);
-    Some((header, copying))
+    Ok(Some((header, copying)))
   }
 
   /// `id`'s pushed entry sent on as it lies by what its row keeps of it (A-864, `rows::PackedRow`; git's
@@ -1086,7 +1163,11 @@ impl Encoding {
       });
     }
     // A-864: an entry its row keeps is sent on by its CRC32, its object never read.
-    if let Some(packed) = row.pack {
+    #[cfg(test)]
+    let row_pack = row.pack.filter(|_| !NO_REUSE.with(core::cell::Cell::get));
+    #[cfg(not(test))]
+    let row_pack = row.pack;
+    if let Some(packed) = row_pack {
       let at = PACK_HEADER_LEN.saturating_add(to_u64(part.bytes.len()));
       let place = repository.stored_of(&row, content);
       if let StoredAt::InPack(place) = place {
@@ -1257,3 +1338,11 @@ impl Encoding {
 
 /// An encoding unit stopped at a let-go window (A-864 piece 2, [`Encoding::waiting`]).
 struct Stopped;
+
+// The tests' switch, kept on the thread that encodes.
+#[cfg(test)]
+thread_local! {
+  /// Whether no pushed entry is sent on as it lies (true: every object read where it lies and encoded): a test's way to
+  /// stand an encoding at an object's read of its pack (r165's red, `Reading::read_window`).
+  pub(crate) static NO_REUSE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}

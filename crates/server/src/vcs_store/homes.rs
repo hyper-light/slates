@@ -441,7 +441,7 @@ impl LandedAt {
       return None;
     }
     let (pack, rest) = bytes.split_at_checked(slates_vcs::content::IDENTITY_BYTES)?;
-    let (len, offset) = rest.split_at_checked(8)?;
+    let (len, offset) = rest.split_at_checked(size_of::<u64>())?;
     Some(LandedAt {
       pack: ContentId::from_slice(pack)?,
       len: u64::from_le_bytes(len.try_into().ok()?),

@@ -20,21 +20,29 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-/// A family of a shard image's paged entries: each keeps its own pages.
+/// A family of a shard image's paged entries: each keeps its own pages. Its discriminant is its byte in a page piece's
+/// key ([`Family::byte`]), part of the image's format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
 pub(crate) enum Family {
   /// The repository windows kept as chunks, by handle.
-  Windows,
+  /// Format: its byte in a page piece's key.
+  Windows = 1,
   /// The content store's lists, by identity.
-  Lists,
+  /// Format: its byte in a page piece's key.
+  Lists = 2,
   /// The content store's names, by identity.
-  Names,
+  /// Format: its byte in a page piece's key.
+  Names = 3,
   /// The content store's windows let go, by identity.
-  Aways,
+  /// Format: its byte in a page piece's key.
+  Aways = 4,
   /// The objects this shard holds for the region, by identity.
-  RegionHolds,
+  /// Format: its byte in a page piece's key.
+  RegionHolds = 5,
   /// Homes' landed records, by identity.
-  Landed,
+  /// Format: its byte in a page piece's key.
+  Landed = 6,
 }
 
 impl Family {
@@ -48,16 +56,9 @@ impl Family {
     Family::Landed,
   ];
 
-  /// Format: its byte in a page piece's key.
+  /// Its byte in a page piece's key: its discriminant.
   pub(crate) fn byte(self) -> u8 {
-    match self {
-      Family::Windows => 1,
-      Family::Lists => 2,
-      Family::Names => 3,
-      Family::Aways => 4,
-      Family::RegionHolds => 5,
-      Family::Landed => 6,
-    }
+    self as u8
   }
 
   /// The family a page piece's key names by its byte.
