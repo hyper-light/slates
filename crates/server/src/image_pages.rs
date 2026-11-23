@@ -185,6 +185,17 @@ fn plan_into(
 /// Format: the version of a page piece's bytes.
 const PAGE_VERSION: u8 = 1;
 
+std::thread_local! {
+  /// The bytes this shard's thread has encoded into page pieces ([`encode_page`]), ever: what a step's encoding is read
+  /// by (A-870 piece 2: a publication's step encodes at most a slice).
+  static ENCODED: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// The bytes this shard's thread has encoded into page pieces, ever ([`ENCODED`]).
+pub(crate) fn encoded_bytes() -> u64 {
+  ENCODED.with(core::cell::Cell::get)
+}
+
 /// A page piece's bytes: its version, its entries' count, then each entry's key, length and bytes.
 pub(crate) fn encode_page(entries: &[Entry]) -> Vec<u8> {
   let mut out = Vec::with_capacity(
@@ -203,6 +214,13 @@ pub(crate) fn encode_page(entries: &[Entry]) -> Vec<u8> {
     out.extend_from_slice(&u32::try_from(bytes.len()).unwrap_or(u32::MAX).to_le_bytes());
     out.extend_from_slice(bytes);
   }
+  ENCODED.with(|encoded| {
+    encoded.set(
+      encoded
+        .get()
+        .saturating_add(u64::try_from(out.len()).unwrap_or(u64::MAX)),
+    );
+  });
   out
 }
 
@@ -585,6 +603,45 @@ mod tests {
     assert!(
       deltas[1] > deltas[0],
       "the mass delta split pages: {deltas:?}"
+    );
+  }
+
+  /// A-870 piece 2 (main 01a20182's ruling of 2026-11-23: the encoding moves off the publication's step, the image a cut
+  /// of one moment). Do: on a shard whose pages are small ([`crate::content_holder::TEST_PAGE_BYTES`]), let many objects
+  /// go and note them, publish (`verbs::publish_shard`), then let as many more go and publish again and again, reading
+  /// the bytes each publication encodes in its own step ([`encoded_bytes`]); then read the shard's committed image back
+  /// as a restart would. Expect: no publication's step encodes past three page sizes (a turn's slice and the one page
+  /// that crosses it), and within a bounded number of publications the committed image equals the shard's own, entry by
+  /// entry. Failing first: the publication after the mass let-go encoded every dirty page in its one step.
+  #[test]
+  fn a_publication_encodes_at_most_a_slice_in_its_step_and_its_cuts_catch_up() {
+    const PAGE: usize = 4096;
+    let (longest, caught_up) = crate::daemon::audit_on_shard(|state| {
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(PAGE));
+      let _ = let_go_and_note(state, (0, ENTRIES));
+      let _ = crate::verbs::publish_shard(state);
+      let _ = let_go_and_note(state, (ENTRIES, ENTRIES));
+      let mut longest = 0u64;
+      let mut caught_up = None;
+      for at in 0..(4 * ENTRIES) {
+        let before = encoded_bytes();
+        let _ = crate::verbs::publish_shard(state);
+        longest = longest.max(encoded_bytes().saturating_sub(before));
+        if crate::verbs::committed_held_agrees(state) {
+          caught_up = Some(at);
+          break;
+        }
+      }
+      crate::content_holder::TEST_PAGE_BYTES.with(|bytes| bytes.set(0));
+      (longest, caught_up)
+    });
+    assert!(
+      longest <= u64::try_from(3 * PAGE).unwrap(),
+      "a publication's step encoded {longest} bytes at a {PAGE}-byte page"
+    );
+    assert!(
+      caught_up.is_some(),
+      "the committed image caught up with the shard"
     );
   }
 }
