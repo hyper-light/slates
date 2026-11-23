@@ -343,7 +343,9 @@
 >   class held the loaded p99 under 1 ms in 11 of 11 rounds and the p999 in 20 of 22 checks, where main held the p999
 >   in 2 of 8. Its cost: R9's spinning median 12-20 -> 17-27 µs (a real-time shard parks at once), its p99 better.
 >   Grant or skip: an account that grants no real-time priority (CI's) keeps the fair class and its tails. The client's
->   reply wait in the class (D', D'') was measured and not taken. Owed: main's confirming round on main.
+>   reply wait in the class (D', D'') was measured and not taken. **Confirmed on main** (ca98b72c4, main 01a20182,
+>   2026-11-23 03:42, adacachy2 in a user scope at CPUWeight 100): 6 loaded rounds, p99 241-440 µs and p999 325-697 µs,
+>   12 of 12 under 1 ms; quiet p99 76-103 µs; R9 spinning p99 45.6 / 54.6 / 56.2 µs (main before: 57-145).
 > - Windows (CI, run 44857045148): no 1 ms band (queued p99 5–49 µs); accept p99 0.13–0.31 ms, conflict 0.11–0.29 ms;
 >   p999 0.2–62 ms. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–7).
 >
