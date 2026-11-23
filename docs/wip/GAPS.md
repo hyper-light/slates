@@ -117,7 +117,13 @@
 > and every clone (stock_git_verbs 1 of 8). Lifted when w-git's fetch-side readers (A-855's held answer, brought back and
 > made again) and the push decision's reads bring a let-go window back, with w-shared's red: annotated tags pushed, the
 > push ended, idle, then ls-remote and a clone byte-identical to stock.
-> **LIFTED (w-git, 2026-11-22, on main 01a20182's word):** `vcs_store::commit` lets a landed push's pack go again, or
+> **PUT BACK (w-git, 2026-11-23, main 01a20182's r165):** the lift below broke git/git's mirror clone after the push:
+> refused `Pack(Store(Unreadable { id: sha1:e11e53618242d5dbeeab1ff15707c7ec88c907cc }))` 16,270,345 bytes in
+> (`parts_copied=2`, `entries_judged=3712`), stock git's "possible repository corruption on the remote side": a fetch
+> path still reads a let-go window without bringing it back. `vcs_store::commit` lets nothing go again; the harness of
+> the lift (`KEEP_LANDED`, `keep_landed`, `homed_drive`'s bring-back) stays. Lifted again with a red that clones after a
+> multi-window pack's let-go, the needed object's window let go, not only the pack's first.
+> **LIFTED (w-git, 2026-11-22, on main 01a20182's word; put back above):** `vcs_store::commit` lets a landed push's pack go again, or
 > owes it to the push's end or the repository's idle give-back, with each gate on main: w-git's fetch-side readers
 > (A-864) and a push's readers, (b) its thin bases through `IndexedObjects::away` and (c) its policy and signature reads;
 > w-shared's three codex-review gates (7663054bb, a74f939c5); w-hg's hg half of 2b(b) (6b36e0269); w-git's upload

@@ -2398,10 +2398,6 @@ fn based_moves(
 /// hold its moves alone. Refused, nothing of the store changed and the push still holds its objects.
 pub(crate) fn commit(state: &mut ShardState, sealed: &mut SealedPush) -> Result<(), GitRefused> {
   let repository = sealed.repository;
-  // The pack the staging put in the content store, where its changeset landed on the node's store (A-767 C5).
-  let landed_pack = (sealed.landed > 0)
-    .then(|| sealed.push.stored_pack())
-    .flatten();
   let unkept = within_budget(state, 0, |stores| {
     let (content, store) = stores.git(repository).ok_or(GitRefused::NoStore)?;
     commit_moves(
@@ -2413,29 +2409,14 @@ pub(crate) fn commit(state: &mut ShardState, sealed: &mut SealedPush) -> Result<
   })?;
   sealed.objects = RecordWriter::default();
   state.count(VALUE_UNKEPT, unkept);
-  // A synchronous audit shard's history can bring nothing back (a bring-back awaits the node's store), so its landed
-  // packs stay resident ([`KEEP_LANDED`]); a daemon's edges and tasks, and every let-go test, let them go.
-  #[cfg(test)]
-  let landed_pack = landed_pack.filter(|_| !KEEP_LANDED.with(core::cell::Cell::get));
-  if let Some((pack, _)) = landed_pack {
-    // Never under a fetch's answer or an encoding, nor under a push still deciding its refs (a non-atomic push's later
-    // refs, each an entry of its own, read its objects): owed until the push ends or the repository goes idle. Every git
-    // read brings a let-go window back, so its pack may go once landed: the fetch side's (A-864: the stream's stops and
-    // look-ahead, the encoding's stops, an answer held before its pack and made again once the window is back), a
-    // push's thin bases and its policy and signature reads (w-git), the deferred green build (w-shared), w-shared's
-    // codex-review gates and w-hg's half of 2b(b). The guard r52 put here (c9bb36dc5) lifted on main 01a20182's word of
-    // 2026-11-22 (GAPS, goal 93 item 2b).
-    if landed_let_go_may(state, repository, 0) {
-      let_go_landed_pack(state, &pack);
-    } else {
-      state
-        .vcs_stores
-        .landed_owed
-        .entry(repository)
-        .or_default()
-        .push(pack);
-    }
-  }
+  // A landed push's pack stays resident: its let-go (goal 93 item 2b) is safe only once every git read of the
+  // repository brings a let-go window back, and some do not yet. Run r52 (2026-11-22, the big Studio, main 6f6e87d82):
+  // once git/git's push ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's
+  // tag peel among the reads). Lifted at 76d8804c3 and put back (main 01a20182's r165, 2026-11-23: git/git's mirror
+  // clone after the push refused `Pack(Store(Unreadable { id: sha1:e11e5361… }))` 16,270,345 bytes in, stock git's
+  // "possible repository corruption"): a fetch path still reads a let-go window without bringing it back. So no landed
+  // pack is let go or owed here; the let-go itself (`let_go_landed_pack`, `let_go_owed`) is unchanged and tested
+  // directly (read_through's tests). GAPS: goal 93 item 2b.
   Ok(())
 }
 
