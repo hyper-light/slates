@@ -61,15 +61,21 @@ impl Arena {
 
 impl WindowStorage for Arena {
   fn put(&mut self, bytes: &[u8]) -> Result<StoredWindow, ContentRefused> {
-    assert!(
-      self.bytes.len() + bytes.len() <= self.bytes.capacity()
-        && self.places.len() < self.places.capacity(),
-      "the test's arena holds every window"
-    );
+    // The test's arena is reserved once to hold every window, so a put past it is a refusal the test then fails on,
+    // never a reallocation charged to the push.
+    let room = self.bytes.capacity().saturating_sub(self.bytes.len());
+    if bytes.len() > room || self.places.len() >= self.places.capacity() {
+      return Err(ContentRefused::OverBudget {
+        need: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        room: u64::try_from(room).unwrap_or(u64::MAX),
+      });
+    }
     let at = self.bytes.len();
     self.bytes.extend_from_slice(bytes);
     self.places.push((at, bytes.len()));
-    Ok(StoredWindow(u64::try_from(self.places.len() - 1).unwrap()))
+    let window = u64::try_from(self.places.len().saturating_sub(1))
+      .map_err(|_| ContentRefused::CountExhausted)?;
+    Ok(StoredWindow(window))
   }
 
   fn read(&self, window: StoredWindow) -> Option<Cow<'_, [u8]>> {
@@ -128,6 +134,9 @@ fn hex(node: &Node) -> String {
   node.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// A file's revision as the history builds it: its node, its first parent, its text and its link changeset.
+type FileRevision = (Node, Node, Vec<u8>, usize);
+
 /// A history of a first changeset adding `files` files of `size` bytes, then `edits` changesets each rewriting one,
 /// its changegroup (version 03, each log's first revision whole and each later one its delta against the one before, as
 /// a client sends them) encoded, and its manifest text's length.
@@ -139,8 +148,8 @@ fn history(files: usize, size: usize, edits: usize) -> (Vec<u8>, usize) {
     let line = format!("file {file} generation {generation} ");
     line.bytes().cycle().take(size).collect()
   };
-  // Each file's revisions: (node, p1, text, link changeset).
-  let mut file_revisions: Vec<Vec<(Node, Node, Vec<u8>, usize)>> = vec![Vec::new(); files];
+  // Each file's revisions.
+  let mut file_revisions: Vec<Vec<FileRevision>> = vec![Vec::new(); files];
   let mut current: Vec<Node> = vec![NULL_NODE; files];
   let mut changesets: Vec<(Node, Node, Vec<u8>)> = Vec::new();
   let mut manifests: Vec<(Node, Node, Vec<u8>)> = Vec::new();

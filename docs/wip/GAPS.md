@@ -121,7 +121,17 @@
 > and every clone (stock_git_verbs 1 of 8). Lifted when w-git's fetch-side readers (A-855's held answer, brought back and
 > made again) and the push decision's reads bring a let-go window back, with w-shared's red: annotated tags pushed, the
 > push ended, idle, then ls-remote and a clone byte-identical to stock.
-> **PUT BACK (w-git, 2026-11-23, main 01a20182's r165):** the lift below broke git/git's mirror clone after the push:
+> **LIFTED AGAIN (w-git, 2026-11-23, main 01a20182's order after r165):** `vcs_store::LANDED_LET_GO` on, one switch for
+> a commit's let-go and a recovery's or rebuild's (w-shared's `put_changeset`): the commit owes its pack and the push's
+> end or the repository's idle give-back lets it go a slice a turn (3e1588a54, the quantum alone ending a slice), every
+> read of a let-go window stopping at a unit boundary and brought back (0c3f42cea, 7f7793c58). Red over the edge:
+> `a_pushed_pack_is_let_go_by_its_commit_in_slices_and_a_clone_after_is_whole` (two shards, a 3 MiB file's pack of many
+> windows, nothing let go by hand: bytes let go in slices, the clone and a clone one commit deep each pushed object's
+> bytes, `ls-refs` `HEAD` at the commit; 0 bytes let go with the switch off) and over SSH (r165's `clone-ssh` and
+> `shallow` rows): `a_pushed_pack_let_go_by_its_commit_is_cloned_whole_and_shallow_over_ssh`, the client giving its
+> window back as OpenSSH's does (a 3 MiB answer past its 1 MiB window). Owed: main's git/git whole A/B (push no slower than the guard, clones
+> whole and byte-identical, `let_go_past_quantum` in release); an `Unreadable` or a refused fetch puts it back.
+> **PUT BACK (w-git, 2026-11-23, main 01a20182's r165; lifted again above):** the lift below broke git/git's mirror clone after the push:
 > refused `Pack(Store(Unreadable { id: sha1:e11e53618242d5dbeeab1ff15707c7ec88c907cc }))` 16,270,345 bytes in
 > (`parts_copied=2`, `entries_judged=3712`), stock git's "possible repository corruption on the remote side": a fetch
 > path still reads a let-go window without bringing it back. `vcs_store::commit` lets nothing go again; the harness of
@@ -235,8 +245,14 @@
 >   level (245-492 replies a loaded round taken over 1 ms late; loaded conflict p999 2.8-6.5 ms in every round). A-871:
 >   the OS places every Windows shard, and a client's reply wait stands one level above normal. Every round after it,
 >   quiet and loaded: p99 under 1 ms and p999 135-359 µs, both forms. Measured outside kiln's agent job, which fixes
->   every thread's level (inside it the first round starved past 1,200 s). Open: the runtime's long polls on Windows
->   carry no attribution (`NoClock`).
+>   every thread's level (inside it the first round starved past 1,200 s). The runtime's long polls on Windows carried
+>   no attribution (`NoClock`, 206 a quiet round): ATTRIBUTED (w-perf, 2026-11-23). A Windows thread's account is its
+>   cycle count at a rate measured once a process (`slates_machine::own_cpu`; 3.14 GHz on jupiter), and a wait in a call
+>   is a profiling read whose switches' wait reasons name more than a preemption, a quantum's end or a yield
+>   (`slates_machine::switches::voluntary_waits_now`). Held on jupiter by
+>   `the_platform_reads_a_kernel_sleep_blocked_and_a_spin_long` (`slates-rt`: a 5 ms kernel sleep `Blocked`, a 5 ms
+>   spin `Long`; red `NoClock` with main's account) at 291 ns a read, taken only at a long poll's end and while armed.
+>   Owed: a round on jupiter that names its long polls' holders.
 > - **The client's share:** `edit_merge_bench`'s client spins for its reply at default priority beside the load, so
 >   accept's p99/p999 beyond the daemon's part (macOS 0.8–2.6 / 7–9 ms with the nap fixed) is the harness's own
 >   thread waiting for a CPU.
@@ -768,7 +784,20 @@
 >   thread's first backtrace loading the binary's symbols, were once charged to the next allocation, which put a
 >   one-entry `push::phase_heads` and the watchdog among the top): push 362,278 B a changeset, 86% two sites of the
 >   greens' lend (`Green::default`'s `SetHash`, 2 KiB a lend, 167,321; `Greens::lend`'s closure, 145,472); clone 14,632
->   and stream clone 20,645, the store's `texts_by_tools`, the index's `iter_from` and row scans. OPEN: the cuts by size, then bounds in this test.
+>   and stream clone 20,645, the store's `texts_by_tools`, the index's `iter_from` and row scans. Then the lend cut
+>   (main's order): a lineage member's lend allocates nothing. `merge::identity::SetHash` makes its 2 KiB of lanes at
+>   its first change, so an empty engine (a lend's restore leaves one) is free; and `engine::branch::Lent` keeps the
+>   member's engine in the lineage's slot for the one out (`Lineage::lent`), the guard only the lineage and a handle,
+>   so `GreenRef`/`GreenMut` box nothing. Push: 362,278 B a changeset now 49,909, the lend's 300,292 B (red) now none.
+>   OPEN: the cuts by size, then bounds in this test.
+> - A node prefix's `lookup` read by node BUILT (2026-11-23, w-hg; main's order on CI arena-7: the last `begin` over
+>   10 ms of CPU, `cmd=lookup`, 91 ms wall / 30 ms CPU on x86, `lookup::prefixed` hex-encoding every node). The index's
+>   node rows are keyed by node first, so `HgIndex::changesets_prefixed` walks them from the prefix's bytes (and an odd
+>   digit's high four bits) to where it ends, passing other logs' rows over, two served matches settling it
+>   (`Repository::changesets_prefixed`; a view that cannot is walked, as before). Held by
+>   `a_node_prefixs_lookup_read_by_node_is_the_walks` (prefixes of one to twelve digits, the null node's zeros, one
+>   nothing has: the same answers, ambiguous ones among them) and
+>   `a_node_prefixs_lookup_reads_its_matches_not_the_history` (at most 8 reads, where the walk reads every revision).
 > - Branch heads kept as changesets land BUILT (2026-11-23, w-hg; main's ruling (b) on CI 45127535742: a `lookup` of a
 >   branch name ran one 348 ms step on x86, wrote 43 bytes, `branch_tip` scanning every revision's branch and then
 >   `branch_head_revs` walking the whole history, as `branchmap` whole did, 155-161 ms CPU a call). `HgIndex` keeps

@@ -30,7 +30,18 @@
 /// elsewhere, where kernel32 lacks the profiling calls, or when the OS refuses the read.
 #[cfg(windows)]
 pub fn switches_now() -> Option<u64> {
-  windows::PROFILING.with(|profiling| profiling.as_ref().and_then(windows::Profiling::switches))
+  windows::dispatch().map(|dispatch| dispatch.switches)
+}
+
+/// Windows: how many of the calling thread's profiling reads found it had waited in a call since the read before, a
+/// count only its differences mean (§4.3's long-poll attribution, A-31). A read finds that when the wait reasons of its
+/// switches (`PERFORMANCE_DATA::WaitReasonBitMap`, the reasons since the last read [B: Microsoft Learn,
+/// "PERFORMANCE_DATA"]) name any wait but the scheduler's own: a preemption, a quantum's end, a deferred preemption or
+/// a yield, which Linux too counts as involuntary. Every read of the thread's profiling ([`switches_now`] too) folds its
+/// reasons in, so no read loses another's. `None` where kernel32 lacks the profiling calls or the OS refuses the read.
+#[cfg(windows)]
+pub fn voluntary_waits_now() -> Option<u64> {
+  windows::dispatch().map(|dispatch| dispatch.voluntary_reads)
 }
 
 /// The calling thread's voluntary context switches (Linux: `getrusage(RUSAGE_THREAD)`'s `ru_nvcsw`; see the module
@@ -81,6 +92,35 @@ mod windows {
   const PERFORMANCE_DATA_VERSION: u8 = 1;
   /// Format: `ERROR_SUCCESS`, what both calls answer when they succeed (they return a Win32 error code).
   const ERROR_SUCCESS: u32 = 0;
+  /// Format: the `KWAIT_REASON` values (wdm.h; windows-sys `Wdk::System::SystemServices`) a thread is switched out for
+  /// by the scheduler rather than by a wait of its own: `WrQuantumEnd` 30, `WrDispatchInt` 31, `WrPreempted` 32,
+  /// `WrYieldExecution` 33 and `WrDeferredPreempt` 38, each its bit in `PERFORMANCE_DATA::WaitReasonBitMap`.
+  const SCHEDULER_WAITS: u64 = (1 << 30) | (1 << 31) | (1 << 32) | (1 << 33) | (1 << 38);
+
+  /// One read of the calling thread's dispatch data.
+  #[derive(Clone, Copy)]
+  pub(super) struct Dispatch {
+    /// The thread's context switches since profiling was enabled.
+    pub(super) switches: u64,
+    /// The reads so far that found a wait of the thread's own since the read before ([`super::voluntary_waits_now`]).
+    pub(super) voluntary_reads: u64,
+  }
+
+  /// Reads the calling thread's dispatch data, folding the read's wait reasons into its count of own waits.
+  pub(super) fn dispatch() -> Option<Dispatch> {
+    let (switches, reasons) =
+      PROFILING.with(|profiling| profiling.as_ref().and_then(Profiling::read))?;
+    let voluntary_reads = VOLUNTARY_READS.with(|reads| {
+      if reasons & !SCHEDULER_WAITS != 0 {
+        reads.set(reads.get().saturating_add(1));
+      }
+      reads.get()
+    });
+    Some(Dispatch {
+      switches,
+      voluntary_reads,
+    })
+  }
 
   /// The three profiling calls as kernel32 exports them, found at run time (see the module doc).
   struct Calls {
@@ -151,8 +191,9 @@ mod windows {
       })
     }
 
-    /// The thread's context switches since profiling was enabled.
-    pub(super) fn switches(&self) -> Option<u64> {
+    /// The thread's context switches since profiling was enabled, and the wait reasons of its switches since the last
+    /// read.
+    fn read(&self) -> Option<(u64, u64)> {
       let mut data = PERFORMANCE_DATA {
         Size: u16::try_from(std::mem::size_of::<PERFORMANCE_DATA>()).ok()?,
         Version: PERFORMANCE_DATA_VERSION,
@@ -168,7 +209,8 @@ mod windows {
           &mut data,
         )
       };
-      (answer == ERROR_SUCCESS).then_some(u64::from(data.ContextSwitchCount))
+      (answer == ERROR_SUCCESS)
+        .then_some((u64::from(data.ContextSwitchCount), data.WaitReasonBitMap))
     }
   }
 
@@ -182,7 +224,9 @@ mod windows {
 
   thread_local! {
     /// The calling thread's profiling, enabled on its first read.
-    pub(super) static PROFILING: Option<Profiling> = Profiling::enable();
+    static PROFILING: Option<Profiling> = Profiling::enable();
+    /// The calling thread's reads that found a wait of its own ([`dispatch`]).
+    static VOLUNTARY_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
   }
 }
 

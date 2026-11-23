@@ -1855,6 +1855,8 @@ struct ReadCounted<'v> {
   view: &'v Indexed<'v>,
   /// The reads.
   reads: core::cell::Cell<u64>,
+  /// Whether a node prefix is read by node through the view (`Repository::changesets_prefixed`), else walked.
+  by_node: bool,
 }
 
 impl ReadCounted<'_> {
@@ -1889,6 +1891,13 @@ impl Repository for ReadCounted<'_> {
   }
   fn maintained_branch_heads(&self) -> Option<Vec<Rev>> {
     self.view.maintained_branch_heads()
+  }
+  fn changesets_prefixed(&self, prefix: (&[u8], Option<u8>), most: usize) -> Option<Vec<Node>> {
+    if self.by_node {
+      self.view.changesets_prefixed(prefix, most)
+    } else {
+      None
+    }
   }
   fn phase(&self, rev: Rev) -> Phase {
     self.view.phase(rev)
@@ -1938,6 +1947,7 @@ fn a_lookup_of_a_branch_name_reads_its_heads_not_the_history() {
   let counted = ReadCounted {
     view: &view,
     reads: core::cell::Cell::new(0),
+    by_node: true,
   };
   let answered = built.index.branch_heads().answered();
   let mut out = Vec::new();
@@ -1966,6 +1976,7 @@ fn branchmap_over_a_long_line_reads_its_heads_not_the_history() {
   let counted = ReadCounted {
     view: &view,
     reads: core::cell::Cell::new(0),
+    by_node: true,
   };
   let answered = built.index.branch_heads().answered();
   let mut out = Vec::new();
@@ -1983,5 +1994,71 @@ fn branchmap_over_a_long_line_reads_its_heads_not_the_history() {
   assert!(
     built.index.branch_heads().answered() > answered,
     "the kept heads answered"
+  );
+}
+
+/// `key`'s `lookup` answer over `view`, its node prefixes read by node (`by_node`) or walked, and the reads it made.
+fn looked_up(view: &Indexed<'_>, key: &[u8], by_node: bool) -> (Vec<u8>, u64) {
+  let tags = super::super::lookup::TagsRead::now(view, &mut room()).unwrap();
+  let counted = ReadCounted {
+    view,
+    reads: core::cell::Cell::new(0),
+    by_node,
+  };
+  let mut out = Vec::new();
+  super::super::lookup::lookup(&counted, Some(&tags), key, &mut room(), &mut out).unwrap();
+  (out, counted.reads.get())
+}
+
+/// Shape: the longest node prefix [`a_node_prefixs_lookup_read_by_node_is_the_walks`] asks, in hexadecimal digits.
+const PREFIX_DIGITS: usize = 12;
+
+/// Goal 93 (main's order on CI arena-7: a `lookup`'s scan of every node, 91 ms wall of a begin on x86). Do: over a
+/// long line, look up a prefix of every length from one to [`PREFIX_DIGITS`] digits of several nodes, the null node's
+/// zeros, and a prefix nothing has, each read by node (`Repository::changesets_prefixed`) and walked. Expect the two
+/// answers byte for byte the same, ambiguous ones among them.
+#[test]
+fn a_node_prefixs_lookup_read_by_node_is_the_walks() {
+  let built = a_long_line();
+  let view = view_of(&built, true);
+  let mut keys: Vec<Vec<u8>> = vec![b"0".to_vec(), b"000".to_vec(), b"fffffffffff".to_vec()];
+  for rev in (0..view.count()).step_by(17) {
+    let node = hex(&view.node(rev).unwrap());
+    for digits in 1..=PREFIX_DIGITS {
+      keys.push(node.as_bytes()[..digits].to_vec());
+    }
+  }
+  let mut ambiguous = 0;
+  for key in &keys {
+    let (by_node, _) = looked_up(&view, key, true);
+    let (walked, _) = looked_up(&view, key, false);
+    assert_eq!(by_node, walked, "lookup {}", String::from_utf8_lossy(key));
+    ambiguous +=
+      usize::from(walked.starts_with(b"0") && walked.windows(9).any(|w| w == b"ambiguous"));
+  }
+  assert!(ambiguous > 0, "some prefix was ambiguous");
+}
+
+/// Goal 93 (same). Do: over a long line, look up a twelve-digit prefix of its last node, read by node, then walked,
+/// counting the view's reads of the history. Expect the same answer, the node; at most [`READS_A_HEAD`] reads by node;
+/// and the walk reading every revision (the red before: `prefixed` walked every node).
+#[test]
+fn a_node_prefixs_lookup_reads_its_matches_not_the_history() {
+  let built = a_long_line();
+  let view = view_of(&built, true);
+  let last = view.node(view.count() - 1).unwrap();
+  let key = hex(&last).get(..PREFIX_DIGITS).unwrap().to_owned();
+  let (by_node, reads) = looked_up(&view, key.as_bytes(), true);
+  let (walked, walked_reads) = looked_up(&view, key.as_bytes(), false);
+  assert_eq!(by_node, format!("1 {}\n", hex(&last)).into_bytes());
+  assert_eq!(by_node, walked);
+  assert!(
+    reads <= READS_A_HEAD,
+    "{reads} reads by node of a {}-changeset line",
+    view.count()
+  );
+  assert!(
+    walked_reads >= u64::from(view.count()),
+    "the walk read every revision: {walked_reads}"
   );
 }

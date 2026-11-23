@@ -484,6 +484,27 @@ impl crate::named::Objects for Plane {
 /// files, of 0, 10 and 100 bytes, 7 bytes a step from a plane holding them, after a first try at a plane holding none.
 /// Expect: the try refused `ObjectMissing`, keeping nothing; then every file read in order, no read past 7 bytes, the
 /// steps those the bytes take (a file a step at least); and the files taken with their bytes, once, then unread again.
+/// The plane holding each of `texts` under its BLAKE3 identity.
+fn plane_of(texts: &[&[u8]]) -> Plane {
+  let mut plane = Plane::default();
+  for bytes in texts {
+    plane
+      .objects
+      .insert(*blake3::hash(bytes).as_bytes(), bytes.to_vec());
+  }
+  plane
+}
+
+/// Reads `checkpoint`'s named files from `plane`, `slice` bytes a step, until they are read: the steps taken, the last
+/// one (which finds nothing left) included.
+fn steps_to_read(checkpoint: &mut Checkpoint, plane: &Plane, slice: u64) -> usize {
+  let mut steps = 1;
+  while !checkpoint.read_step(plane, slice).unwrap() {
+    steps += 1;
+  }
+  steps
+}
+
 #[test]
 fn a_checkpoints_named_files_are_read_a_slice_a_step() {
   let texts: [&[u8]; 3] = [b"", b"ten bytes!", &[7; 100]];
@@ -510,18 +531,9 @@ fn a_checkpoints_named_files_are_read_a_slice_a_step() {
     checkpoint.unread().map(|file| file.key.as_str()),
     Some("f1")
   );
-  let mut plane = Plane::default();
-  for bytes in texts {
-    plane
-      .objects
-      .insert(*blake3::hash(bytes).as_bytes(), bytes.to_vec());
-  }
-  let mut steps = 0;
-  while !checkpoint.read_step(&plane, 7).unwrap() {
-    steps += 1;
-  }
+  let plane = plane_of(&texts);
   assert_eq!(
-    steps + 1,
+    steps_to_read(&mut checkpoint, &plane, 7),
     2 + 15,
     "f1's 10 bytes in 2 steps, f2's 100 in 15"
   );
