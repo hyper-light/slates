@@ -339,10 +339,12 @@ impl ClientEnd {
         let eventfd = self.completion.as_ref().ok_or(IpcError::Unsupported {
           feature: "async completion fd (the rendezvous passed no completion descriptor)",
         })?;
-        let eventfd_dup = rustix::io::dup(eventfd).map_err(|error| IpcError::OsRefused {
-          call: "dup",
-          code: Some(error.raw_os_error()),
-        })?;
+        // Close-on-exec, as every descriptor here: a plain `dup` made one without it, which any child inherited.
+        let eventfd_dup =
+          rustix::io::fcntl_dupfd_cloexec(eventfd, 0).map_err(|error| IpcError::OsRefused {
+            call: "fcntl(F_DUPFD_CLOEXEC)",
+            code: Some(error.raw_os_error()),
+          })?;
         self.bridge = Some(crate::completion::CompletionBridge::start_from_eventfd(
           eventfd_dup,
         )?);
@@ -367,9 +369,9 @@ impl ClientEnd {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     match &self.completion {
       Some(fd) => Ok(
-        rustix::io::dup(fd)
+        rustix::io::fcntl_dupfd_cloexec(fd, 0)
           .map_err(|error| IpcError::OsRefused {
-            call: "dup",
+            call: "fcntl(F_DUPFD_CLOEXEC)",
             code: Some(error.raw_os_error()),
           })?
           .into_raw_fd(),

@@ -59,12 +59,27 @@
 > a spawn. Now the region owns the received descriptor (`ClientRegion::from_descriptor`). Red on main: 8 connects
 > left 8 descriptors. Green: 0 (`a_client_that_connects_and_leaves_holds_no_descriptor_of_its_region`;
 > docs/bugs/2026-11-23-every-linux-client-connect-left-its-regions-descriptor-open.md).
-> **Open, found by its sweep, by reading:**
-> (1) `AnchorSegment::handoff_env` makes inheritable duplicates of the segment and content objects and keeps only their
-> numbers. So the anchor keeps two more descriptors at every daemon start, and each later child inherits them all. A
-> daemon keeps 2 × (shards + 1), inheritable by anything it spawns.
-> (2) The daemon's side of a Linux claim adopts its region duplicate only after the kick's `dup` or `eventfd`, so a
-> failure of either, exhaustion among them, leaks the duplicate.
+> **Closed (w-chaos, 2026-11-23, A-878): its sweep's two finds, and what a Linux daemon's children inherited.**
+> - **What leaked.** A hand-off made an inheritable duplicate that nothing owned. So the anchor kept two descriptors per
+>   daemon start, and each child inherited every earlier one. A daemon kept 2 × (shards + 1) of them, and a claim
+>   refused for want of a descriptor leaked its region's duplicate.
+> - **Who held it.** Linux's spawn hands a child everything not close-on-exec. A hook held 17 descriptors past its
+>   streams: the anchor's segment four times (it holds the issuer secret), the content object four times, a listener, a
+>   client's completion eventfd, and seven `perf_event` descriptors a runner had leaked.
+> - **The fix.**
+>   - A hand-off names the object's own descriptor.
+>   - The anchor clears close-on-exec in its daemon's spawn alone, and records a start before the spawn.
+>   - The daemon's first step makes everything it inherited close-on-exec, and its copies are `fcntl_dupfd_cloexec`.
+> - **Red then green.**
+>   - `a_hook_holds_no_descriptor_of_its_daemon`: 17 descriptors, then none.
+>   - `an_anchor_started_again_and_again_hands_each_daemon_its_objects_once`: `[8, 8]` after 7 starts, then `[1, 1]`.
+>   - `a_claim_refused_for_want_of_a_descriptor_leaves_none_of_its_region`: `remaining=1`, then 0.
+>   - Doc: docs/bugs/2026-11-23-a-hand-off-left-an-inheritable-duplicate-at-every-call.md.
+> **Open (Windows, recorded, not changed):** a map reply whose operation was abandoned is dropped on arrival
+> (`Client::buffer`'s `unawaited_dropped` branch), so the section handle the daemon duplicated into the client stays in
+> its table, and the daemon keeps the copy for the client until its release or reap. Closing the handle there is one
+> line (`handle_route::adopt_section`, dropped). Giving the copy back needs a release from that path, and both can be
+> exercised only on Windows.
 
 > **Open (w-shared, 2026-11-21, found landing family three): `slates-bridge-fuse --test takeover_round` fails 2 of 2 on
 > Linux** (`a_kernel_that_cannot_bump_its_epoch_still_gets_every_inode_and_is_counted`,

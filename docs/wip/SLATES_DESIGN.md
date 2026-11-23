@@ -61815,3 +61815,45 @@ name whatever their `cfg`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sdk_async.t
   export (two exports of two walks each: 15 fetches of a bound of 16).
 - **Applied in the same change to** `crates/server` (`vcs_store/svn_view`, `vcs_store/svn_texts`'s `Pieces` doc,
   `vcs_svn`, `vcs_ssh/svn`, `vcs_http/svn`, and the tests named above), GAPS, amendments.tsv.
+
+### A-878 — A Linux daemon's children inherit nothing of the daemon's; a hand-off names the object's own descriptor (2026-11-23, w-chaos for main 01a20182, its ruling of 2026-11-23 on the descriptor sweep; A-858, §2.6, §4.7, §4.13)
+
+- **Why.** A-858 holds that every child the daemon spawns is handed only its three streams. That held on macOS, whose
+  spawn closes what it does not name. On Linux the spawn hands a child every descriptor not marked close-on-exec, and
+  the daemon held many:
+  - the anchor's segment and content object, inherited at the daemon's start, and duplicates of both, one per shard and
+    one for the control loop: a Linux hand-off was a duplicate made inheritable, which nothing owned;
+  - the anchor's listeners and its hold table, inherited at the start;
+  - a plain `dup` of each client's completion eventfd.
+  A start-commit hook listed 17 such descriptors. The segment holds the issuer secret, the authority under which the
+  issuer's verbs prove a human's grant. The content object holds every volume's bytes.
+  The same duplicates grew the anchor by two descriptors per daemon start (8 of each object after 7 starts), and a
+  claim refused for want of a descriptor leaked its region's duplicate.
+- **The rule.**
+  - A descriptor is close-on-exec everywhere except in the one exec that needs it.
+  - A hand-off names the object's own descriptor. An open duplicates it and owns the duplicate. A spawn that hands it to
+    a child clears close-on-exec in that child alone: the anchor's `hand_on_in_child`, between the fork and the exec.
+  - The daemon's first step at its start makes every descriptor it inherited close-on-exec
+    (`confined_spawn::close_inherited_on_exec`); a daemon that cannot does not start.
+  - Its own copies are made with `fcntl_dupfd_cloexec`, never a plain `dup`.
+  - The anchor records a start before the spawn and its pid after. Recorded after, the record could wipe a quick
+    daemon's first beat and serving mark, and show it the last start's restart count.
+- **Tests** (adacachy2; red on main, green with the change):
+  - `a_hook_holds_no_descriptor_of_its_daemon` (`crates/cli/tests/svn_interop.rs`, a real anchor, daemon and hook):
+    17 descriptors past the streams, then none.
+  - `an_anchor_started_again_and_again_hands_each_daemon_its_objects_once` (`crates/anchor/tests/anchor.rs`): `[8, 8]`
+    and children holding 2, 4, … 12; then `[1, 1]` and 2 each.
+  - `a_claim_refused_for_want_of_a_descriptor_leaves_none_of_its_region` (`crates/ipc/tests/rendezvous.rs`, the descriptor
+    limit capped as the claim is prepared): `remaining=1`, then 0.
+  - The anchor's test file: 5 of 6 runs on main, 2 of 6 with the forked spawn alone, 6 of 6 with the record's order.
+- **Applied in the same change to:**
+  - `crates/mem/src/shared.rs`: `handoff`, `Handoff`'s doc.
+  - `crates/anchor`: `segment.rs` (`handed_descriptors`, `record_pid`, `record_start`'s doc) and `supervise.rs`
+    (`hand_on_in_child`, the start's order).
+  - `crates/api/src/role/daemon.rs`: the start's first step.
+  - `crates/ipc`: `confined_spawn.rs` (`close_inherited_on_exec`, the module doc), `rendezvous.rs` (the claim's
+    borrowed send, the kick, `completion_dup`), `completion.rs` and `endpoint.rs` (the client's copies).
+  - The three tests above.
+  - `unsafe-budget.toml`: anchor +1, ipc ±0.
+  - GAPS.
+  - docs/bugs/2026-11-23-a-hand-off-left-an-inheritable-duplicate-at-every-call.md.
