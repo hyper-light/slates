@@ -674,3 +674,23 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
   Files::{get->Content, len_of, insert_named(path, identity), remove->Taken, hydrate, take_holds}.
 - Next: fix ~45 engine compile sites (lengths -> len_of; bytes -> Content handling; judge base -> ContentUnread +
   hydrate step), history Source::Block byteless -> ContentAt::Named, reanchor identity, then server drains.
+- 2026-11-23 later: ENGINE HALF DONE (slates-merge all green: lib 280 + integration). Local WIP commit d0ccc5933 on
+  agents/w-svn-c2 (not pushed, not for landing as is). Engine: lend/let_named_bytes_go by identity index; holds tracked
+  by owner (track_name_holds; give_back_name_holds; dropped_with_name_holds bug counter, no thread-local queue per
+  main's (5)); crate::unlent scope refuses any verdict/rebase/commit-read over an unlent named block
+  (ContentUnread, nothing cached); unlent_reads / recorded_unlent / commit_unlent name them all; apply_recorded and
+  commit_judged/make_step refuse (CommitRefused::Unlent); checkpoint read path removed (restore by name, infallible);
+  ReanchorRefused::Named; Revert::Named; copy fixes by digest. Oracle: lend loops + holds in step + census
+  judges_lent/replays_lent > 0 + dropped_with_name_holds unchanged.
+- Server so far (compiles): Restoring phase + remake kept bytes removed; replica restores by name; Greens::take_name_holds
+  + given_back on remove/insert/retain/lineage end; vcs_store::name_holds::freeing = the one free decision (Takes then
+  Gives, then release_texts / release_unheld_windows) per main's (4); replay lend_step (sliced); verdict_of,
+  push judged_lent/commit_judged_lent, apply_accepted/apply_slice apply_recorded_lent, import_batch judge_staged.
+- Main approved the bridge map with changes: (1) exact bring-back of the windows covering the parked request's range,
+  held until terminal step, no retry counts, re-serve Away = counted bug + transport I/O error; (2) a parked table per
+  bridge bounded by its in-flight bound, typed refusal at the bound; (3) fix refining copy_step's swallowed error;
+  virtio-fs left (no lend today). Land engine + server halves together; send main the hash.
+- NEXT: run server focused tests; sync readers through PlaneObjects + typed Away (green_tree, read_green_range,
+  work_files, owner_files/page, checkout, refining, landing, mounted_work, git/hg/svn_made); async bring-back at each
+  caller; bridges NFS/FUSE/WinFsp park tables; reds (mount read + work read after text left the green, with window let
+  go; work editing named file).
