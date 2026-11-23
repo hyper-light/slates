@@ -235,6 +235,10 @@
 >   (none on bare metal). The semaphore took reply wakes over 1 ms from 3,001 to 36 in 8 rounds, and the loaded p99
 >   median from 1,766 to 976 µs (accept) and from 4,301 to 1,363 µs (conflict). The p999 stays over 1 ms on that runner,
 >   held by long verbs (codex-review's list).
+>   A shard's start, sliced by its pieces (w-perf, 2026-11-22; BENCHMARKS "84a: a shard's start held in one slice"):
+>   LANDED. Its setup after the catalog's replay ran as one unit, 12 to 21 ms on CI's macOS runner and 59 to 68 ms on
+>   the Studio. Now each piece is its own unit, a segment attach opens its object once, and a whole reusable-mark set is
+>   written a word at a time. The start's heaviest piece is a 100 GB segment's map, named in its report.
 >   The refining job's turns paced (A-783's turn, to the ceiling or to its own quantum), measured and rejected (w-perf,
 >   2026-11-22; BENCHMARKS "84a on macOS: the refining job's turns paced"): dead even with main on one runner's
 >   interleaved rounds. Stamped under TB, the loaded tail's deferred replies are submits parked behind their refinement
@@ -664,7 +668,13 @@
 >   but the 71 a home pins; the clone carries them). OPEN, main's: the pin keeps every window whose home by identity
 >   is this shard (`homes::read_here` serves any identity homed here and cannot bring one back), so about one shard's
 >   share of the texts stays, and on a one-shard node all of them; a home that brings an away window back, or a pin of
->   only what homes keep, would let them go.
+>   only what homes keep, would let them go. 2b(b)'s hg half, part 1 BUILT (w-hg, w-shared's seam 1, main's ruling of
+>   18:43): a landed file revision is brought back whole by its (path, node) (`hg_push::bring_back`: its row read, its
+>   text asked of the changeset store off the step through the work builder's own ask, `slates_hg::push::held::TextAsk`,
+>   then put back within its lent room), counted `vcs.hg.landed_texts_brought_back`. Held by
+>   `a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and_node` (49 of 120 let go, each back
+>   whole, counted once). Left: the let-go's `homes::note_landed` record and homes' `Landed::Hg` arm calling it, once
+>   w-shared's types land; then the pin goes.
 > - The whole history's clones spun (main 01a20182's order of 2026-11-22 10:40; CI 45037561866: 4 spins, kills and
 >   restarts a leg, at `vcs_http.rs:850` polls 1-16 and `vcs_ssh::hg::streamed_turn` polls ~11,000). Measured over the
 >   served view of a pushed 57,054-changeset line (debug, MacBook arm64, each call the unit one step takes): a clone of
@@ -25533,6 +25543,12 @@ before; 3 queued, none refused after); this fleet test passes again (fleet `a_li
 > GiB of freed large blocks macOS's allocator keeps): it now measures the pool by its own pages (the content object and
 > the arenas' held extents). A separate daemon's heap held resident (main's r41, about 1.3 GB against 31 to 60 MB
 > live) is its own piece, the idle heap give-back.
+>
+> **Mixed-size extent sources, closed 2026-11-22.** With three pages of headroom and free mappings of
+> three and four pages, the arena kept all 16 idle pages. It now keeps four and returns 12. Growth uses
+> the same buddy rounding and leaves unusable offers available in the pool. Four focused regressions
+> cover the allocator contract. See `docs/bugs/2026-11-22-extent-claims-use-buddy-capacity.md`.
+
 `cargo test -p slates-server --test recovery a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone` (A-789,
 362bd8c39, red -> green on adas-macbook-pro-2 quiet: 1,622 -> 123 MiB) fails on main's own code on Adas-Mac-Studio-2,
 three runs of three on the merge 287055d5b: 41-42 MiB before the burst, 1,341-1,342 MiB after its volume was destroyed, for a

@@ -95,6 +95,88 @@ impl Held for IndexHeld<'_> {
   }
 }
 
+/// A file revision the repository holds whose text a reader waits for, asked of the node's changeset store (A-767 C1: a
+/// text an import or a push let go): its row, then its whole text within `most` bytes. A push's work asks it between its
+/// turns (`crate::push::tree::WorkBuild::ask_waited`), and a home brings a let-go revision back by it (goal 93 item
+/// 2b(b)); its owner answers it ([`crate::render::StoreWants`]), then takes the text ([`TextAsk::taken`]).
+pub struct TextAsk {
+  /// The file's path.
+  path: Vec<u8>,
+  /// The revision's node.
+  node: Node,
+  /// What is asked next.
+  want: Option<crate::render::Want>,
+  /// The most bytes its text may hold.
+  most: u64,
+  /// Its text, once given.
+  text: Option<Vec<u8>>,
+}
+
+impl TextAsk {
+  /// The ask of the text of the revision `node` of `path`'s file log, within `most` bytes: its row first.
+  pub fn new(path: Vec<u8>, node: Node, most: u64) -> Self {
+    TextAsk {
+      want: Some(crate::render::Want::Rows {
+        logs: vec![(path.clone(), vec![node])],
+      }),
+      path,
+      node,
+      most,
+      text: None,
+    }
+  }
+
+  /// The text the store gave, with its path and node; none where the store kept no such revision or gave no text.
+  pub fn taken(self) -> Option<(Vec<u8>, Node, Vec<u8>)> {
+    let text = self.text?;
+    Some((self.path, self.node, text))
+  }
+}
+
+impl crate::render::StoreWants for TextAsk {
+  fn wants(&self) -> Option<&crate::render::Want> {
+    self.want.as_ref()
+  }
+
+  fn give_rows(&mut self, rows: Vec<Vec<Option<crate::render::StoredRevision>>>) {
+    self.want = rows
+      .into_iter()
+      .next()
+      .and_then(|log| log.into_iter().next())
+      .flatten()
+      .map(|row| crate::render::Want::Texts {
+        texts: vec![row.text],
+        most: self.most,
+      });
+  }
+
+  fn give_chunks(&mut self, _chunks: Vec<Vec<u8>>) {
+    self.want = None;
+  }
+
+  fn give_texts(&mut self, texts: Vec<Vec<u8>>) {
+    self.want = None;
+    self.text = texts.into_iter().next();
+  }
+}
+
+/// The length of the text of the revision `node` of `path`'s file log that `index` holds, and whether `store` holds its
+/// metadata block and its bytes whole ([`ContentStore::holds_whole`]): what a home reads before it brings a let-go
+/// revision back (goal 93 item 2b(b)). None where the index holds no such revision.
+pub fn file_text_held(
+  (index, store): (&HgIndex, &ContentStore),
+  (path, node): (&[u8], &Node),
+) -> Option<(u64, bool)> {
+  let log = Log::File(path);
+  let row = index
+    .rev(store, log, node)
+    .and_then(|rev| index.revision(store, log, rev))
+    .filter(|row| row.node == *node)?;
+  let whole =
+    store.holds_whole(&row.bytes) && row.block.is_none_or(|block| store.holds_whole(&block));
+  Some((row.len, whole))
+}
+
 /// Brings back into `store` the text of the revision `node` of `path`'s file log that `index` holds, from `text`, the
 /// whole text its reader read from the node's changeset store (A-767 C1: a push's work reading a text an import let go):
 /// its metadata block and its bytes, each by the identity its row names, each window let go brought back.

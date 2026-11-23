@@ -144,6 +144,22 @@ fn a_segment_is_created_attached_and_read_through_the_seqlock() {
   assert_eq!(words[2].load(Ordering::Acquire), 65_536 - 64);
 }
 
+/// 84a (boot): do create a segment and attach it. Expect the attach to open the object once (the thread's count of
+/// sparse opens moves by one): it reads its header and then declares the full layout on the same object. Before, it
+/// opened it twice, once for the header, and every open maps the whole object and on macOS marks it whole.
+#[test]
+fn an_attach_opens_its_segment_once() {
+  let id = identity();
+  let created =
+    AnchorSegment::create(&unique_name("slates-anchor-test-once"), &id, geometry()).unwrap();
+  let (handoff, len) = handoff_of(&created);
+  let before = slates_mem::SparseObject::opens_on_this_thread();
+  let attached = AnchorSegment::attach(&handoff, len, &id).unwrap();
+  let opens = slates_mem::SparseObject::opens_on_this_thread() - before;
+  assert_eq!(attached.geometry(), geometry());
+  assert_eq!(opens, 1, "the attach opened its segment {opens} times");
+}
+
 /// A-92: do create a segment and read its sealing root, then lock its page, publish a root through one attachment
 /// and read it through a later one (a restarted daemon re-attaching the anchor's segment); expect no root on the
 /// fresh segment, the page locked, and the later attachment adopting the very id and key the first published.
