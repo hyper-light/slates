@@ -2579,7 +2579,13 @@ fn queue_let_go(state: &mut ShardState, pack: slates_vcs::ContentId, (home, owne
   }
   state.vcs_stores.letting_go.1 = true;
   let turns = async {
-    while crate::state::with_state_counted(let_go_turn) == Some(true) {
+    loop {
+      // Each slice waits while a publication of the shard's image is owed past its bound (A-870 piece 2, main's
+      // progress rule), woken by the publication that carries it up.
+      crate::content_holder::image_resumed().await;
+      if crate::state::with_state_counted(let_go_turn) != Some(true) {
+        break;
+      }
       slates_rt::futures::yield_now().await;
     }
     let _ = crate::state::with_state_counted(|state| state.vcs_stores.letting_go.1 = false);

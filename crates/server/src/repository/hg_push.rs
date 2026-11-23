@@ -2172,7 +2172,13 @@ fn landed_segment(
   // entries kept, each brought back by the read that meets it (`hg_run`, "Let go"). What the push held just before,
   // its admission and its texts resident, is its high-water's sample.
   let kept = super::hg_run::contents_bytes(state, &segment.contents);
-  let freed = super::hg_run::let_go_landed(state, None, &segment.contents);
+  // An elective change: none while a publication of the shard's image is owed past its bound (A-870 piece 2, main's
+  // progress rule); the texts then stay until the run commits, whose let-go waits for the pause to end.
+  let freed = if crate::content_holder::image_paused(state) {
+    0
+  } else {
+    super::hg_run::let_go_landed(state, None, &segment.contents)
+  };
   let (held, texts) = run.texts_landed((kept, freed));
   state.count_max(PUSH_HELD_HIGH_BYTES, held);
   state.count_max(PUSH_TEXTS_HIGH_BYTES, texts);

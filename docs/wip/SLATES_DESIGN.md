@@ -61309,7 +61309,7 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
   constant. A checkpoint plans every family afresh (`content_holder::paged_image`); a delta re-encodes only the pages
   its changes lie in, read back from the source maps by range (`ContentStore::{lists_in, names_in, aways_in}`,
   `ChunkWindows::pieces_in`, `homes::{region_held_in, landed_in}`), and the directories it leaves are adopted at its
-  commit (`content_holder::pages_committed`). A recovered image's page keys are its directory; a coordinate in no page
+  commit (since piece 2, the encoder's committed cut, `content_holder::image_committed`). A recovered image's page keys are its directory; a coordinate in no page
   takes the largest aligned page its neighbours leave. An image from before A-870, which kept an entry a piece, has
   those keys removed by the next delta, once. The publication oracle (`verbs::committed_held_agrees`) compares images
   entry by entry (`content_holder::expanded`), since pages differ by the history that made them.
@@ -61321,6 +61321,47 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
   image equals the shard's entry by entry. `pages_cover_their_coordinates_and_hold_at_most_the_page_size` (200
   generated plans) and `a_page_piece_reads_back_its_entries_and_refuses_what_no_page_wrote` (every cut, a count past the
   bytes, another version). The pieces' encode is still one call per publication: piece 2 bounds it.
+- **Piece 2, the encoder (BUILT; main 01a20182's ruling of 2026-11-23, options (a)-(d)).** `image_pages::Encoder` keeps
+  the last committed cut (each page's bytes), the working directories, the pages re-encoded since, and the dirty pages.
+  A publication first takes the changes since into dirty pages (`content_holder::image_drain`, the encoder their one
+  reader) and runs one turn (`image_turn`: dirty pages re-encoded from the source maps until the copy slice is spent,
+  at least one page). Where nothing is dirty after it, the publication carries the re-encoded pages, and they and the
+  committed ones are the shard's entries at that moment exactly (`content_holder::image_cut`). Otherwise it carries the
+  committed cut again, so an image is always one moment's cut, never a mix of two. It is then counted skipped
+  (`vcs_store.image.publications_skipped`), every block the arena would free at its commit is kept
+  (`capture_deferred`, A-64: the cut may name it; kept whole, a selective keep only if the counters show deferred
+  frees matter), and the publication is owed: a task encodes a turn a yield (`image_catch_up`) and publishes once
+  caught up. Homes tickets count durable only at a publication that carried the encoder's cut (`image_committed`).
+  **The progress rule.** An owed publication's bound is twice the pages dirty when it was owed, plus one, in turns
+  (`Encoder::skipped`). Past it, elective changes pause (`content_holder::image_paused`, counted
+  `vcs_store.image.pauses`): git's landed-pack let-go queue a slice at a time, hg's committed let-go a turn at a time,
+  and hg's per-segment let-go in a push (skipped; the run's committed let-go covers those texts). A paused task waits
+  on `content_holder::image_resumed`, which the publication carrying the cut wakes (`Encoder::committed`), never a
+  timer, so no queued pack is stranded. Not paused: a fetch look-ahead's let-go of a window its own read brought back
+  (`vcs_store::let_go_read`), and puts and bring-backs, which are not elective. An hg push's reply awaits its committed
+  let-go, so a paused shard delays it until the catch-up publication. Counters: `vcs_store.image.{publications_skipped,
+  longest_lag_turns, pauses, encode_turns, encoded_bytes, longest_turn_bytes, catch_up_refused}`, and the progress
+  rule's assumption measured (main's addition of 2026-11-23): `paused_turns`, `paused_encoded_bytes` and
+  `paused_imposed_bytes`, the last the bytes of pages the never-paused changes first dirtied in a pause
+  (`Encoder::dirtied_paused`), so a round reads the encoder's bytes a turn against theirs.
+- **Evidence (piece 2).** `image_pages::tests::a_publication_encodes_at_most_a_slice_in_its_step_and_its_cuts_catch_up`:
+  at a 4,096-byte page, red before the encoder (one publication's step encoded 1,068,980 bytes), now at most three page
+  sizes a step, and the committed image catches up with the shard. The oracle,
+  `generated_histories_restore_one_committed_cut_reuse_no_named_block_and_keep_their_lag_bound`: six generated
+  histories of puts, let-gos, bring-backs, turns, publications and crashes (a restart's read of the committed journal),
+  the first continuous (a change, a turn and a publication every step). At every publication and crash a restart reads
+  the shard's entries at the last publication that carried the cut, entry for entry; no window that image names has its
+  block held by another window now; the owed lag stays within its allowance; once the changes stop, the cut catches up.
+  Some history pauses, and the images name windows (neither check vacuous); the paused counters move and the
+  never-paused changes' bytes stay within those encoded. `a_paused_encoder_wakes_its_waiting_tasks_at_the_publication_that_carries_its_cut`:
+  a task's waker kept once, untouched by a publication of the older cut, woken once by the one that carries the
+  encoder's (w-git's catch: a let-go task that ended while packs were queued stranded them). Ported: piece 1's delta test runs the
+  encoder's turns before each publication; `homes::tests::a_committed_publication_publishes_the_tickets_of_windows_kept_before_it`
+  shows a publication of an older cut leaving the ticket unpublished.
+- **Limit (piece 2, GAPS).** The bound is kept only while the encoder outpaces the changes that never pause (puts,
+  bring-backs): each turn encodes at least one page, so the lag past the bound is at most the pages dirty when the
+  pause began plus those such changes dirty since, plus two (the oracle's allowance). A shard runs a turn each yield, many
+  a publication, so a put stream that outpaces it is a measurement owed, not seen.
 
 ### A-871 — On Windows the OS places every shard, and a client waits for its reply one level above normal (2026-11-23, main 01a20182; goal 84a; A-361, A-834, A-831, A-41, A-208)
 

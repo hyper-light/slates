@@ -21204,14 +21204,22 @@ fn read_journal(
 /// (A-870 piece 1), each delta's pieces folded over its
 /// checkpoint. Read after a publication commits, a missed change mark is a difference here before it is a lost record.
 pub(crate) fn committed_held_agrees(state: &ShardState) -> bool {
-  let committed = match read_journal(state) {
-    Some(Ok((Some(shard), _))) => shard.held,
-    Some(Ok((None, _))) | None => Vec::new(),
-    Some(Err(_)) => return false,
+  let Some(committed) = committed_held(state) else {
+    return false;
   };
   // Compared entry by entry: a paged family's pages differ by the history that made them (A-870 piece 1).
   crate::content_holder::expanded(&committed)
     == crate::content_holder::expanded(&crate::content_holder::held_image(state))
+}
+
+/// The held pieces a restart would read from this shard's committed journal, each delta's folded over its checkpoint
+/// (none committed, none); none where the journal does not read ([`committed_held_agrees`]'s, and A-870's oracle's).
+pub(crate) fn committed_held(state: &ShardState) -> Option<Vec<slates_vfs::recover::HeldPiece>> {
+  match read_journal(state) {
+    Some(Ok((Some(shard), _))) => Some(shard.held),
+    Some(Ok((None, _))) | None => Some(Vec::new()),
+    Some(Err(_)) => None,
+  }
 }
 
 /// The shard's recovery images from its slice of the anchor content object (§4.8), by volume id, and the

@@ -144,7 +144,9 @@ mod tests {
   fn a_live_allocation_shows_in_the_heaps_bytes_in_use_and_reserved() {
     const HELD: usize = 1 << 20;
     let before = stats();
-    let held = vec![1u8; HELD];
+    // Kept live through the reading: in release the optimizer removed a block nothing read, and the reading then missed
+    // it (main 01a20182, adacachy2, 2026-11-23).
+    let held = std::hint::black_box(vec![1u8; HELD]);
     let after = stats();
     assert!(after.in_use <= after.reserved, "{after:?}");
     // The test binary's allocator is the system's, not the large path, so the box shows only where the system allocator

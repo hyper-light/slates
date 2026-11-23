@@ -424,12 +424,14 @@ pub(crate) fn held_image_paged(state: &ShardState) -> (Vec<slates_vfs::recover::
   // records (goal 93 item 2b(b)).
   // A-870 piece 2: copied from the encoder, the shard's now where every change is encoded, else the last committed cut.
   let (pages, carried) = state.image_encoder.whole();
-  pieces.extend(pages.into_iter().map(|((family, page), bytes)| {
-    slates_vfs::recover::HeldPiece {
-      key: page_key(family, page),
-      bytes: bytes.to_vec(),
-    }
-  }));
+  pieces.extend(
+    pages
+      .into_iter()
+      .map(|((family, page), bytes)| slates_vfs::recover::HeldPiece {
+        key: page_key(family, page),
+        bytes: bytes.to_vec(),
+      }),
+  );
   (pieces, carried)
 }
 
@@ -582,18 +584,6 @@ fn changed_coordinates(state: &ShardState, family: crate::image_pages::Family) -
       .iter()
       .map(|(identity, _, _)| coordinate_of(identity))
       .collect(),
-  }
-}
-
-/// `family`'s page `page` holding `entries`, as a held piece.
-fn page_piece(
-  family: crate::image_pages::Family,
-  page: crate::image_pages::Page,
-  entries: &[crate::image_pages::Entry],
-) -> slates_vfs::recover::HeldPiece {
-  slates_vfs::recover::HeldPiece {
-    key: page_key(family, page),
-    bytes: crate::image_pages::encode_page(entries),
   }
 }
 
@@ -993,6 +983,13 @@ pub(crate) const IMAGE_TURNS: &str = "vcs_store.image.encode_turns";
 pub(crate) const IMAGE_ENCODED_BYTES: &str = "vcs_store.image.encoded_bytes";
 /// Format: the status counter of the most bytes one encoder turn encoded.
 pub(crate) const IMAGE_LONGEST_TURN_BYTES: &str = "vcs_store.image.longest_turn_bytes";
+/// Format: the status counter of the encoder's turns while paused.
+pub(crate) const IMAGE_PAUSED_TURNS: &str = "vcs_store.image.paused_turns";
+/// Format: the status counter of the bytes the encoder's turns encoded while paused.
+pub(crate) const IMAGE_PAUSED_ENCODED_BYTES: &str = "vcs_store.image.paused_encoded_bytes";
+/// Format: the status counter of the bytes, of those, of pages the never-paused changes first dirtied in the pause
+/// (puts, bring-backs): under [`IMAGE_PAUSED_ENCODED_BYTES`] by a margin while the encoder outpaces them.
+pub(crate) const IMAGE_PAUSED_IMPOSED_BYTES: &str = "vcs_store.image.paused_imposed_bytes";
 /// Format: the status counter of catch-up tasks the runtime refused to start (the next publication tries again).
 pub(crate) const IMAGE_CATCH_UP_REFUSED: &str = "vcs_store.image.catch_up_refused";
 
@@ -1026,6 +1023,13 @@ pub(crate) fn image_turn(state: &mut ShardState) -> crate::image_pages::Turned {
   state.count(IMAGE_TURNS, 1);
   state.count(IMAGE_ENCODED_BYTES, turned.bytes);
   state.count_max(IMAGE_LONGEST_TURN_BYTES, turned.bytes);
+  if turned.paused {
+    // The progress rule's assumption, measured (main 01a20182, 2026-11-23): while paused, the encoder's bytes a turn
+    // against the never-paused changes' bytes it encoded (the pages they first dirtied in the pause).
+    state.count(IMAGE_PAUSED_TURNS, 1);
+    state.count(IMAGE_PAUSED_ENCODED_BYTES, turned.bytes);
+    state.count(IMAGE_PAUSED_IMPOSED_BYTES, turned.imposed);
+  }
   turned
 }
 
@@ -1037,6 +1041,26 @@ pub(crate) fn image_paused(state: &mut ShardState) -> bool {
     state.count(IMAGE_PAUSES, 1);
   }
   paused
+}
+
+/// Waits while the content store's elective changes pause ([`image_paused`]), ready at once where they do not: woken by
+/// the publication that carries the encoder's cut (`Encoder::committed`), never by a timer. Ready where the shard's state
+/// is gone, so a task waiting ends with it.
+pub(crate) fn image_resumed() -> impl core::future::Future<Output = ()> {
+  core::future::poll_fn(|cx| {
+    let waits = crate::state::with_state_counted(|state| {
+      let paused = image_paused(state);
+      if paused {
+        state.image_encoder.wait(cx.waker());
+      }
+      paused
+    });
+    if waits == Some(true) {
+      core::task::Poll::Pending
+    } else {
+      core::task::Poll::Ready(())
+    }
+  })
 }
 
 /// What a delta carries of the paged families (A-870 piece 2): the encoder's cut, each page re-encoded since the last
@@ -1073,7 +1097,6 @@ pub(crate) fn image_encoder_of(
       .collect(),
   )
 }
-
 
 /// Adopts what a committed publication carried of the held pieces (A-270): `whole` as the published whole pieces, each
 /// live copy's slots as published (every copy's after a checkpoint, `everything`; the marked ones' after a delta), the
@@ -1297,6 +1320,47 @@ impl From<slates_wire::WireError> for HeldRefused {
   fn from(error: slates_wire::WireError) -> Self {
     HeldRefused::Wire(error)
   }
+}
+
+/// Test support (A-870 piece 2's oracle): every paged family's entries the shard holds now, read from its maps (never
+/// the encoder), each as (key, bytes), in key order.
+#[cfg(test)]
+pub(crate) fn paged_entries_now(state: &ShardState) -> Vec<(PieceKey, Vec<u8>)> {
+  let mut entries: Vec<(PieceKey, Vec<u8>)> = crate::image_pages::Family::ALL
+    .into_iter()
+    .flat_map(|family| family_entries(state, family, (0, u64::MAX)))
+    .map(|(_, key, bytes)| (key, bytes))
+    .collect();
+  entries.sort();
+  entries
+}
+
+/// Test support (A-870 piece 2's oracle): the paged families' entries an image's `pieces` carry, each as (key, bytes),
+/// in key order; none from a page that does not decode, which a comparison then sees missing.
+#[cfg(test)]
+pub(crate) fn paged_entries_of(
+  pieces: &[slates_vfs::recover::HeldPiece],
+) -> Vec<(PieceKey, Vec<u8>)> {
+  let mut entries: Vec<(PieceKey, Vec<u8>)> = pieces
+    .iter()
+    .filter(|piece| split_key(&piece.key).0 == KIND_VCS_PAGE)
+    .filter_map(|piece| crate::image_pages::decode_page(&piece.bytes))
+    .flatten()
+    .collect();
+  entries.sort();
+  entries
+}
+
+/// Test support (A-870 piece 2's oracle): the windows among `entries` and the blocks their chunks lie in.
+#[cfg(test)]
+pub(crate) fn window_blocks(
+  entries: &[(PieceKey, Vec<u8>)],
+) -> Vec<(slates_vcs::ContentId, u16, u64, u64)> {
+  entries
+    .iter()
+    .filter(|(key, _)| split_key(key).0 == KIND_VCS_WINDOW)
+    .filter_map(|(_, bytes)| crate::vcs_store::arena_windows::piece_block(bytes))
+    .collect()
 }
 
 /// A content hold's pieces by kind (A-376): its chunks', its manifests' and its stages' bytes.
