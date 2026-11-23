@@ -747,13 +747,18 @@ impl<K> Answer<K> {
   /// head, the head `head_before` long before the unit) kept, as [`Answer::written`] tells it. Its caller brings the
   /// window back and makes the answer again, passing over what this one wrote, the same answer byte for byte under the
   /// same generation (A-855's rule), or gives up ([`Answer::give_up`]), which answers the refusal as it was made.
-  fn hold_away(&mut self, waited: crate::store::packed::Waited, (head_before, written_before): (usize, usize)) {
+  fn hold_away(
+    &mut self,
+    waited: crate::store::packed::Waited,
+    (head_before, written_before): (usize, usize),
+  ) {
     let Some(refusal) = self.refusal.take() else {
       return;
     };
     // A refusal answered before anything was written keeps its words, as one past its room does; one after keeps the
     // head as written, its band-3 words, if any, dropped.
-    let words = (written_before == 0 && self.head_written == 0).then(|| core::mem::take(&mut self.head));
+    let words =
+      (written_before == 0 && self.head_written == 0).then(|| core::mem::take(&mut self.head));
     if words.is_none() {
       self.head.truncate(head_before.max(written_before));
       self.head_written = written_before;
