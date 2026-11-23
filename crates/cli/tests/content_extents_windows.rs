@@ -58,13 +58,19 @@ fn run_with_stdin(instance: &str, args: &[&str], input: &[u8]) -> (i32, Vec<u8>,
     .stderr(Stdio::piped())
     .spawn()
     .unwrap();
-  child.stdin.take().unwrap().write_all(input).unwrap();
-  let output = child.wait_with_output().unwrap();
-  (
-    output.status.code().unwrap_or(-1),
-    output.stdout,
-    String::from_utf8_lossy(&output.stderr).into_owned(),
-  )
+  // Fed beside the wait, and a feed the command cut short by ending first is part of its outcome, not the test's panic:
+  // a held write that fails ends before it reads (A-879), and its stderr says why.
+  let mut stdin = child.stdin.take().unwrap();
+  let (fed, output) = std::thread::scope(|scope| {
+    let feeder = scope.spawn(move || stdin.write_all(input));
+    let output = child.wait_with_output().unwrap();
+    (feeder.join().unwrap(), output)
+  });
+  let mut err = String::from_utf8_lossy(&output.stderr).into_owned();
+  if let Err(error) = fed {
+    err.push_str(&format!("\n(the input was not all read: {error})"));
+  }
+  (output.status.code().unwrap_or(-1), output.stdout, err)
 }
 
 /// The value of the `key: value` line in `text`.

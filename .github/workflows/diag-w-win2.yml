@@ -1,0 +1,65 @@
+name: diag-w-win2
+
+# w-win2 for main 01a20182 (2026-11-23), A-879, run 10. A diagnostics lane run only from `diag-measurer-w-win2-*`
+# branches, never main. Run 9 had a tiny, a 64 MiB write and `attach --hold` succeed by hand on a one-shard anchor, where
+# run 7's 256 MiB write in the extents file (a two-shard anchor) ended before its input was fed. This run: the flow by
+# hand on a two-shard anchor with a 256 MiB write, and the extents file's commit give-back test with A-879's named hold
+# refusal and a test feed that keeps the command's stderr, its whole output printed.
+
+on:
+  push:
+    branches: ["diag-measurer-w-win2-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  flow:
+    name: A-879 by hand and the commit test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+      SLATES_TEST_CLI: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: NASM (x86_64 Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64 Windows)
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Build the CLI
+        run: |
+          cargo build -p slates-cli 2>&1 | grep -v '^\s*Compiling \|^warning: aws-lc-sys'
+      - name: "A-879 by hand on two shards: the writes and the hold, each one's stderr whole"
+        timeout-minutes: 20
+        run: |
+          set +e
+          .github/diag-w-win2/a879-flow.sh "$(pwd)/target/debug/slates.exe"
+      - name: "A-879: the commit give-back test, its whole output"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        run: |
+          set +e
+          cargo test -p slates-cli --test content_extents_windows -- --test-threads=1 --nocapture a_freed_content_extent_gives_its_commit_back_on_windows > "$RUNNER_TEMP/commit.log" 2>&1
+          code=$?
+          grep -av '^slates daemon: \|^slates anchor: \|^\s*Compiling \|^warning: aws-lc-sys' "$RUNNER_TEMP/commit.log" | tail -60
+          echo "commit test exit $code"
