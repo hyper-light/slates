@@ -10950,7 +10950,12 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >       single 782 MiB claim (76 % of the runner's 1 GiB shard) is no longer admitted again at a takeover: the successor
 >       takes its candidate claim over. The same room is now met at live-ship, typed when it is not (SLATES_DESIGN A-401,
 >       "The live chaos flows, in numbers"). The runner's case, six bounded claims on one fleet, is its own flow now:
->       `a_bounded_claim_is_served_by_its_successor_or_refused_before_it_ships` (run request filed 2026-11-18). **Owed:** a
+>       `a_bounded_claim_is_served_by_its_successor_or_refused_before_it_ships` (run request filed 2026-11-18). Until
+>       2026-11-23 it sized its claims from the status's `reserve=`, the capacity a shard has claimed from the pool so far
+>       (0 on a Linux daemon that has admitted nothing), so on Linux every claim was 0 MiB and the flow never shipped (CI
+>       nightly from 2026-11-20); it reads the shard's slice through the daemon's own derivation now
+>       (`slates_server::config::reserve_per_shard`;
+>       `docs/bugs/2026-11-23-the-bounded-claim-flow-sized-its-claims-from-capacity-claimed-so-far.md`). **Owed:** a
 >       candidate that joins the placement later and cannot admit refuses its first entry `NoRoom`, but the configuration
 >       may still name it a successor. And the control shard's view of its claims can name one its partition released (a
 >       claim admitted for a message the copy then refused is released at the next reconciliation, since only copies
