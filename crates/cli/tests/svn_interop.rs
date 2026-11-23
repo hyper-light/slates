@@ -64,6 +64,22 @@ const REPOSITORY: &str = "project";
 /// Format: the file each session commits, at the repository's root.
 const FILE: &str = "file";
 
+/// Format: the UUID each leg's `svnsync` mirror is given before its `init`, as `ci/interop/svn-matrix.sh` gives its own
+/// (`MIRROR_UUID`). Stock `svnsync` never sets a mirror's UUID (Subversion 1.15.1 `svnsync.c` `do_initialize`: "the RA
+/// layer doesn't have a way to set a UUID"), so `svnadmin create` leaves each mirror a random one, which the mirrors'
+/// dumps would otherwise differ by on every run whatever the server.
+const MIRROR_UUID: &str = "00000000-0000-4000-8000-00000000a703";
+
+/// Format: the revision properties `svnsync` keeps on a mirror's revision 0 once a sync has ended (Subversion 1.15.1
+/// `svn_props.h`: `SVNSYNC_PROP_FROM_URL`, `SVNSYNC_PROP_FROM_UUID`, `SVNSYNC_PROP_LAST_MERGED_REV`; its lock and
+/// `currently-copying` are gone by then). Each names the mirror's source, a URL every leg has its own of, so the
+/// comparison deletes them before the dump.
+const MIRROR_SYNC_PROPERTIES: [&str; 3] = [
+  "svn:sync-from-url",
+  "svn:sync-from-uuid",
+  "svn:sync-last-merged-rev",
+];
+
 /// Shape: the shards of each test's daemon, as `tests/cli.rs` starts one.
 const SHARDS: &str = "2";
 
@@ -2987,11 +3003,15 @@ fn rdump_of(leg: &UseLeg, scratch: &str) -> String {
   }
 }
 
-/// An `svnsync` mirror of `leg`'s repository made under `root`, as `svnadmin dump` reads it (its own sync properties
-/// left out), or the step that failed.
+/// An `svnsync` mirror of `leg`'s repository made under `root`, given [`MIRROR_UUID`], as `svnadmin dump` reads it once
+/// its own sync properties ([`MIRROR_SYNC_PROPERTIES`]) are deleted, or the step that failed.
 fn mirror_dump_of(leg: &UseLeg, (scratch, root): (&str, &str)) -> String {
   let mirror = format!("{root}/mirror-of-{}", leg.svn.session);
   tool("svnadmin", scratch, &["create", &mirror]);
+  let (code, out, err) = tool("svnadmin", scratch, &["setuuid", &mirror, MIRROR_UUID]);
+  if code != 0 {
+    return format!("setuuid exit {code}: {out}{err}");
+  }
   let hook = format!("{mirror}/hooks/pre-revprop-change");
   allowing_hook(&hook);
   let mirror_url = format!("file://{mirror}");
@@ -3015,13 +3035,23 @@ fn mirror_dump_of(leg: &UseLeg, (scratch, root): (&str, &str)) -> String {
   if code != 0 {
     return format!("sync exit {code}: {}", leg.plain(&err));
   }
-  // The mirror's own sync properties name its source: left out, as each names its own server.
-  let (_, out, _) = tool("svnadmin", scratch, &["dump", "-q", &mirror]);
+  // The mirror's own sync properties name its source, each leg its own server: deleted from the mirror, so its dump
+  // is what it mirrors, its length headers too (a line filter left revision 0's lengths counting them).
+  for name in MIRROR_SYNC_PROPERTIES {
+    let (code, out, err) = tool(
+      "svnadmin",
+      scratch,
+      &["delrevprop", &mirror, "-r", "0", name],
+    );
+    if code != 0 {
+      return format!("delrevprop {name} exit {code}: {out}{err}");
+    }
+  }
+  let (code, out, err) = tool("svnadmin", scratch, &["dump", "-q", &mirror]);
+  if code != 0 {
+    return format!("dump exit {code}: {out}{err}");
+  }
   out
-    .lines()
-    .filter(|line| !line.contains("svn:sync-"))
-    .collect::<Vec<_>>()
-    .join("\n")
 }
 
 /// The writing verbs `writes` as one session of edits on `leg`, then its last four revisions' log with the server's own
@@ -3265,6 +3295,61 @@ fn an_xml_tags_attribute_order_is_no_part_of_an_answer() {
   assert_eq!(
     canonical_tags("x <e b=\"two words\" a=\"1\"/> y"),
     "x <e a=\"1\" b=\"two words\"/> y"
+  );
+}
+
+/// The comparison's rule for an `svnsync` mirror ([`mirror_dump_of`]). Do: mirror one stock repository (the reads
+/// fixtures' `crates/svn/fixtures/dump/full.dump`, loaded) from two stock servers on two URLs, `svnserve` through the
+/// control's tunnel and `file://`, as the use test mirrors stock `svnserve` and slates. Expect the two mirrors' dumps
+/// equal, length headers and all: the URL each mirror records of its source (`svn:sync-from-url`, revision 0's) is no
+/// part of what it mirrors. Found by main's round (B) at 112e694e7 (2026-11-23): revision 0's `Prop-content-length`
+/// 221 against 220, a source URL a byte longer. Skips loudly without stock Subversion 1.15.
+#[test]
+fn a_mirrors_dump_is_the_same_whatever_url_it_was_synced_from() {
+  if !use_tools_here() {
+    eprintln!(
+      "skipping the mirror comparison's rule: no stock Subversion 1.15 here (svn, svnadmin, svnserve, svnrdump, svnsync)"
+    );
+    return;
+  }
+  let scratch = Scratch::new("svn-mirror-rule");
+  let root = format!("{}/repositories", scratch.path);
+  made_directory(&root);
+  let dump = format!(
+    "{}/../svn/fixtures/dump/full.dump",
+    env!("CARGO_MANIFEST_DIR")
+  );
+  use_control_loaded(&scratch.path, &root, &dump);
+  let tunnel = UseLeg {
+    name: "stock svnserve",
+    svn: Svn::new(
+      &scratch,
+      "tunnel",
+      vec![
+        "--config-option".to_owned(),
+        format!(
+          "config:tunnels:{CONTROL_TUNNEL}=sh -c 'exec svnserve -t -r {root} --tunnel-user={TUNNEL_USER}'"
+        ),
+      ],
+    ),
+    url: format!("svn+{CONTROL_TUNNEL}://localhost/{REPOSITORY}"),
+  };
+  let local = UseLeg {
+    name: "stock file://",
+    svn: Svn::new(&scratch, "local", Vec::new()),
+    url: format!("file://{root}/{REPOSITORY}"),
+  };
+  let [over_tunnel, over_file] =
+    [&tunnel, &local].map(|leg| mirror_dump_of(leg, (&scratch.path, &root)));
+  assert!(
+    over_tunnel.contains("Revision-number: 13"),
+    "the mirror over {} reached the fixture's youngest: {over_tunnel}",
+    tunnel.name
+  );
+  assert_eq!(
+    over_tunnel, over_file,
+    "the mirror over {} (left) and over {} (right)",
+    tunnel.name, local.name
   );
 }
 
