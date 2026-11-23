@@ -1565,6 +1565,14 @@
 > turns, calling `make_step` between judge and commit (w-svn); items 3-7 (the green's block naming the plane's object,
 > no copy; w-engine's queue).
 >
+> **A-866 (2026-11-22, w-svn; main 01a20182's order of 17:00, items 3-7 while w-engine is paused):** items 3-7 cut into
+> four pieces (`inbox/main-from-w-svn-a760b-plan.md` on the fan-out ledger). Piece 1 BUILT: a block made of the whole of
+> one named run spanning its object keeps that object's identity (`Green::name_of`), through a judged commit, `make_step`
+> and `apply_recorded` alike; any other making leaves the block unnamed. No memory change yet. Oracle:
+> `a_file_made_whole_of_a_named_object_is_named_for_it_until_changed`. OWED: piece 2, a checkpoint naming a named file
+> instead of carrying its bytes (a restored green names nothing until then); piece 3, the history keeping a named
+> version by its name; piece 4, the current block holding no bytes, read through the plane.
+>
 > **Finding, 2026-11-20 (w-engine, not chased under the close order):** `cargo test -p slates-merge --test checkpoint`
 > failed once in 10 runs (`a_green_restored_from_its_checkpoint_answers_as_the_green_it_was`, a proptest, unseeded) on
 > the big Studio at load ~20; its failing case was not kept. The test names no runs, so A-760's commit order does not
@@ -3888,6 +3896,14 @@
 > Still to measure: the A-742 floor's A/B only if the
 > footprint still stays (main's ruling). A local 64 KiB floor gave 47 MB of footprint at 2 s idle, against 363 MB, at
 > 19.4 s against 12.0 s (debug).
+> **An idle heap give-back measured and rejected (w-interop, 2026-11-22; main's ruling; BENCHMARKS "An idle heap
+> give-back for the import's freed small blocks"):** `malloc_zone_pressure_relief` releases 0 bytes at every block size;
+> `MallocSpaceEfficient=1` takes 515 MB of freed blocks down to 3 MB but makes 64 B to 64 KiB alloc-and-free pairs 5 to
+> 8 times slower. The pages are libmalloc's cache, reused by the next work.
+> **OPEN, upstream (main's ruling of 2026-11-22): the import churns about 500 MB of small blocks it frees again**, a
+> working set that grows with the dump (owed: a bounded working set per push). main's r80 (big Studio, git-2000.dump at
+> b79b54350, idle 30 s, a shared box): RSS 1.14 GB, footprint 670 MB; `MALLOC_SMALL (empty)` 512 MB virtual, 507.7 MB
+> resident, 235.0 MB dirty in 128 regions; `MALLOC_SMALL` 452 MB virtual, 415 MB resident, 334.5 MB dirty.
 > **A-822's commit held the shard past its watchdog; A-835 slices it (2026-11-21, w-svn; main's ruling of 12:43).**
 > Main's git-2000 run over A-822 had the watchdog kill the anchor twice: the batch's 2,000 versions applied in one step.
 > A-835 applies a recorded batch a slice a turn and folds a recovered Subversion green to its readers (the 434 MB under

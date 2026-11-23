@@ -1689,7 +1689,7 @@ impl Green {
       )
       .collect();
     for effect in removals {
-      self.apply_effect(effect, version, &mut staged);
+      self.apply_effect(effect, version, &mut staged, None);
     }
     // Every mode and attribute left in the tree goes with it, whatever stands at its path (A-618's `drop_metadata`).
     for path in tree.metadata_paths() {
