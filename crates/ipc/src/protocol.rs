@@ -4763,10 +4763,15 @@ pub enum Refusal {
   /// by (`slates_bridge_core::durable_bound`), the operator's bound on how long an object may go unserved before a
   /// takeover serves it, past which a write not yet held is past what the fleet promises (A-354). Through a shorter
   /// silence the reply still waits, never a false success. The verb's effects stay committed on the owner and nothing
-  /// claims them durable; this is the request's recorded outcome (§4.9), so a retry under the same id meets it, and the
-  /// verb runs again only under a new id. Until 2026-11-18 such a reply was held for good when what it waited for could
-  /// not happen. A consensus operation (a bootstrap, a recovery) answers it too when it ran on the control shard but
-  /// a shard of the daemon did not apply its publication within that shard's own time (A-566). Appended.
+  /// claims them durable: its outcome is in doubt, and this refusal of a held write or destroy is recorded nowhere. A
+  /// retry under the same id joins the request's wait on the owner, never running the verb again, and is answered its
+  /// outcome once decided (the verb's own reply once durable, a refusal once the owner is fenced or yields the volume),
+  /// or this again while it is still in doubt; the verb runs again only under a new id. From 2026-11-20 to 2026-11-23
+  /// the verb's own reply was recorded at the refusal, so a retry was answered a success no quorum held. Until
+  /// 2026-11-18 such a reply was held for good when what it waited for could not happen. A consensus operation (a
+  /// bootstrap, a recovery) answers it too when it ran on the control shard but a shard of the daemon did not apply its
+  /// publication within that shard's own time (A-566): there it is the request's recorded outcome, since the operation
+  /// stands in its group. Appended.
   DurabilityPending {
     /// How long the reply was held before it was told this, nanoseconds.
     held_ns: u64,
