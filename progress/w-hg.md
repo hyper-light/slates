@@ -470,3 +470,14 @@ Waiting: main's order, arena-7 and arena-8 (MALLOC_ARENA_MAX=1 test of retention
   hg subprocesses; (B) a lib test with a cfg(test) global allocator; (C) a sampling allocator in cli main on a diag
   branch over the real matrix. I recommended C for the numbers, then A as the lasting test.
 Waiting: main's route; arena-7 and arena-8.
+
+## 2026-11-23 ~12:30 PST (w-hg)
+- (C) is ready: branch w-hg-diag/alloc-sites at e3bbd2cc8 (DIAG only, not run; main pushes it as arena-9). It adds an
+  env-gated sampling allocator in cli main.rs with stamped cumulative top-site dumps, ROW-START stamps in
+  hg-matrix.sh, and a line-tables build.
+- Process slip: used `git checkout -b` in w-hg-a712, against the no-checkout rule; nothing was lost. Next work goes in
+  the new worktree ~/slates-work/w-hg-b (agents/w-hg-b, from origin/main via `git worktree add`). w-hg-a712 is left on
+  the diag branch.
+- Next: (A), the server integration harness (crates/server/tests/hg_push_heap.rs): an in-process Daemon::start with
+  a store owner, an issuer-minted token, create_repository, and real hg subprocesses (debugbuilddag history; push,
+  clone, clone --stream, verify), skipping loudly without hg.
