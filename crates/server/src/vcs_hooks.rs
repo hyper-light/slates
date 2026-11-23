@@ -56,7 +56,12 @@
 //! answer says ([`Step`]): wait, with the timer at the learned deadline; kill the hook and what it started; or take the
 //! [`Outcome`]: accepted, refused with the hook's words and exit, timed out at its learned bound, abandoned when its
 //! client left, or unstartable with the cause. A hook that exits while something it started still holds its output is
-//! judged by its own exit, and that leftover is ended at the deadline or when the client leaves. A run never outlives
+//! judged by its own exit, and that leftover is ended at the deadline or when the client leaves. Its words end once
+//! nothing of the hook's can write them (main 01a20182's ruling of 2026-11-22 ~17:30): the hook has exited and its group
+//! holds nothing but it (`slates_ipc::group_holders`), whatever still holds the stream. That holder is a process the
+//! hook never started (on macOS, another spawner's child that inherited the pipe in the window between it and its
+//! close-on-exec) or one that left the hook's group with `setsid`: from outside the two are the same, the group's kill
+//! never reached either, and waiting for them only delayed the verdict. A run never outlives
 //! its client (§2 ban 9: no task without an owner); git lets a `post-receive` run on after its client has gone, and a
 //! notification that must outlive its push belongs to a repository's own queue (§4.17.3's observing hooks), not here.
 
