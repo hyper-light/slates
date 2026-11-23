@@ -1748,6 +1748,7 @@ dependencies = [
  "lz4_flex",
  "proptest",
  "sha1-checked",
+ "slates-mem",
  "slates-merge",
  "slates-test-seeds",
  "slates-vcs",

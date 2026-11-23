@@ -1452,6 +1452,7 @@ fn t_a665_a_push_whose_pre_receive_hook_refuses_gets_gits_words_and_moves_nothin
 #[test]
 fn t_a665_a_push_whose_hooks_accept_lands_and_post_receive_runs_after_the_update() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  crate::test_store::keep_landed(&daemon);
   let pre = script(
     HookPointName::GitPreReceive,
     "pre-receive",
@@ -1935,6 +1936,8 @@ pub(crate) async fn homed_drive(
       Answering::Answered(received) => return Ok(*received),
       Answering::Turned => {
         slates_rt::futures::yield_now().await;
+        // As the edges do (goal 93 item 2b(b), push reader (b)): the window a step met let go, brought back.
+        crate::vcs_store::upload::brought_back_waited(repository).await;
         if let Some(asked) = push.take_homing() {
           let (origin, shards) =
             with_state(|state| (state.shard, state.shards.clone())).ok_or("no state")?;
@@ -2867,6 +2870,7 @@ async fn stepped(repository: RepositoryId, request: &[u8]) -> Stepped {
 #[test]
 fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  crate::test_store::keep_landed(&daemon);
   let repository = crate::daemon::observe_first(&daemon, |state| git_repository(state, "flat"));
   let (first, first_objects) = flat_commit(FLAT_FILES, "first", None);
   let create = request(
@@ -2943,6 +2947,7 @@ fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
 #[test]
 fn t_a724_a_pushs_record_names_its_names_once_they_are_homed_in_the_region() {
   let (_store, daemon) = crate::test_store::audit_daemon_of_stored(1);
+  crate::test_store::keep_landed(&daemon);
   let (sent, got) = std::sync::mpsc::channel();
   crate::daemon::observe_first(&daemon, move |state| {
     let repository = git_repository(state, "homed");

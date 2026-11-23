@@ -244,19 +244,23 @@ pub fn encode_full_text(text: &[u8], out: &mut Vec<u8>) -> Result<(), Refusal> {
 /// applying the delta to `base` gives `text` for any two texts; over two manifests, sorted by path, the walk is one pass
 /// and each hunk one stretch of changed paths.
 pub fn encode_lines(base: &[u8], text: &[u8], out: &mut Vec<u8>) -> Result<(), Refusal> {
-  let (old, new) = (lines_of(base), lines_of(text));
-  let (mut at_old, mut at_new) = (0_usize, 0_usize);
+  // Each text's lines walked by a cursor, none listed (goal 93: listing both a manifest's lines was about one copy of it
+  // a changeset on the push's path).
+  let (mut old, mut new) = (lines_of(base).peekable(), lines_of(text).peekable());
   let mut open: Option<(usize, usize)> = None;
-  while at_old < old.len() || at_new < new.len() {
-    let (left, right) = (old.get(at_old).copied(), new.get(at_new).copied());
+  loop {
+    let (left, right) = (old.peek().copied(), new.peek().copied());
+    if left.is_none() && right.is_none() {
+      break;
+    }
     if let (Some((kept, line)), Some((put, same))) = (left, right)
       && line == same
     {
       if let Some(run) = open.take() {
         hunk_of(run, (kept, put), text, out)?;
       }
-      at_old = at_old.saturating_add(1);
-      at_new = at_new.saturating_add(1);
+      old.next();
+      new.next();
       continue;
     }
     let from_base = left.map_or(base.len(), |(at, _)| at);
@@ -264,15 +268,23 @@ pub fn encode_lines(base: &[u8], text: &[u8], out: &mut Vec<u8>) -> Result<(), R
     open.get_or_insert((from_base, from_text));
     match (left, right) {
       (Some((_, line)), Some((_, other))) => match key(line).cmp(key(other)) {
-        core::cmp::Ordering::Less => at_old = at_old.saturating_add(1),
-        core::cmp::Ordering::Greater => at_new = at_new.saturating_add(1),
+        core::cmp::Ordering::Less => {
+          old.next();
+        }
+        core::cmp::Ordering::Greater => {
+          new.next();
+        }
         core::cmp::Ordering::Equal => {
-          at_old = at_old.saturating_add(1);
-          at_new = at_new.saturating_add(1);
+          old.next();
+          new.next();
         }
       },
-      (Some(_), None) => at_old = at_old.saturating_add(1),
-      _ => at_new = at_new.saturating_add(1),
+      (Some(_), None) => {
+        old.next();
+      }
+      _ => {
+        new.next();
+      }
     }
   }
   match open {
@@ -281,15 +293,15 @@ pub fn encode_lines(base: &[u8], text: &[u8], out: &mut Vec<u8>) -> Result<(), R
   }
 }
 
-/// Each line of `text` and where it begins, its end of line included.
-fn lines_of(text: &[u8]) -> Vec<(usize, &[u8])> {
-  let mut lines = Vec::new();
-  let mut at = 0_usize;
-  for line in text.split_inclusive(|byte| *byte == b'\n') {
-    lines.push((at, line));
-    at = at.saturating_add(line.len());
-  }
-  lines
+/// Each line of `text` and where it begins, its end of line included, walked in order.
+fn lines_of(text: &[u8]) -> impl Iterator<Item = (usize, &[u8])> + Clone {
+  text
+    .split_inclusive(|byte| *byte == b'\n')
+    .scan(0_usize, |at, line| {
+      let begins = *at;
+      *at = at.saturating_add(line.len());
+      Some((begins, line))
+    })
 }
 
 /// A line's key: its bytes up to a NUL, or the whole line.

@@ -64,6 +64,15 @@ pub fn put(store: &mut ContentStore, bytes: &[u8]) -> Result<ContentId, RowsRefu
   store.put_object(bytes).map_err(RowsRefused::Content)
 }
 
+/// [`put`], each of its windows the store holds let go brought back from `bytes` (`ContentStore::put_object_whole`):
+/// what a recovery that read the rows from the node's store puts, so they read whole by their identity.
+///
+/// # Errors
+/// As [`put`].
+pub fn put_whole(store: &mut ContentStore, bytes: &[u8]) -> Result<ContentId, RowsRefused> {
+  store.put_object_whole(bytes).map_err(RowsRefused::Content)
+}
+
 /// The `count` rows of `width` in `bytes`, in order, after checking the length is exactly `count × width` (module docs).
 pub fn rows_of(bytes: &[u8], count: u64, width: usize) -> Result<Vec<&[u8]>, RowsRefused> {
   let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);

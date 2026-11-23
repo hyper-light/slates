@@ -142,7 +142,12 @@ pub(crate) fn keep_one(
       let files = matches!(log, Log::File(_));
       revisions(store, (one, kept), &mut puts, admission, files).and_then(|group| {
         fork
-          .append_revisions_after(store, log, &group, previous)
+          .append_revisions_after(
+            store,
+            log,
+            &group,
+            (previous, &[(arrived.node, arrived.text.as_slice())]),
+          )
           .map(drop)
           .map_err(Unindexed::from)
       })

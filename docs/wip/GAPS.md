@@ -103,6 +103,13 @@
 > daemon lets nothing go until (2b)(b), homes' own read-through, next). (2b)(b) BUILT (w-shared, A-724 piece 8c): the
 > pack's home records where each of its windows lies on the node's store (`homes::LandedAt`), lets it go and brings it
 > back on a read; the records ride the shard image, so a window with one is not pinned.
+> **A-870 (w-shared; main 01a20182's rulings of 2026-11-22 ~22:10 and ~22:30): a shard image's content-store families
+> published and restored over turns.** Piece 1 BUILT: the families paged (`crate::image_pages`): 3,000 windows let go
+> and 3,000 landed records rode 6,000 pieces, now 17 (534,085 bytes at a 43,912-byte page), restored whole. OWED: piece 2
+> (pages encoded ahead a slice a turn, a chunk freed under an unpublished page released at that page's commit, an
+> oracle of let-go, publish and crash; first, whether windows let go and records code as a range per object), piece 3
+> (pages restored a page a turn, reads waiting), and a 100k-file volume's longest image step measured against the step
+> budget (the volumes' images paged too only if past it).
 > **HELD (main 01a20182, 2026-11-22 15:40):** no landed pack is let go or owed from a push's commit (`vcs_store::commit`),
 > since r52 (the big Studio, main 6f6e87d82) found readers that do not bring a let-go window back: once git/git's push
 > ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's tag peel through
@@ -110,6 +117,18 @@
 > and every clone (stock_git_verbs 1 of 8). Lifted when w-git's fetch-side readers (A-855's held answer, brought back and
 > made again) and the push decision's reads bring a let-go window back, with w-shared's red: annotated tags pushed, the
 > push ended, idle, then ls-remote and a clone byte-identical to stock.
+> **LIFTED (w-git, 2026-11-22, on main 01a20182's word):** `vcs_store::commit` lets a landed push's pack go again, or
+> owes it to the push's end or the repository's idle give-back, with each gate on main: w-git's fetch-side readers
+> (A-864) and a push's readers, (b) its thin bases through `IndexedObjects::away` and (c) its policy and signature reads;
+> w-shared's three codex-review gates (7663054bb, a74f939c5); w-hg's hg half of 2b(b) (6b36e0269); w-git's upload
+> double-charge fix (28f9ead8d). Red: `a_pushed_pack_is_let_go_once_its_push_ends_and_a_clone_after_is_whole` (0 bytes
+> let go with the guard; now the push's pack goes as it ends and a clone and `ls-refs` after it are whole). The 30 lib
+> tests the lift turned red read through the store's own synchronous calls (a fetch answered in one step, a rebuild
+> settled, a green made now, a view's `work::build`), each a test driver with no bring-back where production's has one
+> (the edges, the green build, `rebuild_turns`' changeset read): a synchronous audit history keeps its landed packs
+> (`vcs_store::KEEP_LANDED`, cfg(test); `test_store::keep_landed` for six audit daemons' observations), and the push
+> tests' edge driver (`homed_drive`) brings back as the edges do. Main's next round runs git/git whole and the verbs at
+> the lift; an `Unreadable` or a refused fetch puts the guard back the same hour.
 > Owed, in main's order: (1) the push's temporaries cut at their source (w-shared);
 > (2) landed windows and the pack let go once durable (w-shared, with w-git); (3) the recent-objects cache given back
 > after a fetch (w-git); (4) the index tables, decided after.
@@ -694,6 +713,21 @@
 >   The test-only one-call landing builds a push's works as the driver does, planned and then built over the
 >   store's read-through (`works_whole`); `Works::Whole` and the one-call `tree::work` arm are gone, and `prepare` takes
 >   the view alone. The store-made-texts oracle compares a file by the identities its row names.
+> - A push's churn a manifest copy a changeset BUILT (2026-11-23, w-hg; main's orders on CI 45127535742: 57.3 GB through
+>   the allocator over the hg matrix, which breeds the 1.26 GB it keeps after push-all). Named by a counting allocator
+>   (`crates/hg/tests/push_heap.rs`, its store's windows in an arena as a daemon's are): an edit changeset allocated
+>   3.20 copies of its manifest. `delta::apply` is the one needed; `index::kept_as` read the text it was just handed
+>   back from the store, now given it by `keep_one` (`HgIndex::append_revisions_after`'s `given`); `delta::encode_lines`
+>   listed both texts' lines, now walks them by cursors. Held by
+>   `a_pushs_churn_per_changeset_is_one_manifest_and_one_file` (1,600 files: red 291,519 B an edit at a 91,200 B
+>   manifest, now 102,015 B, 1.12 copies; 16 KiB files within one manifest and one file copy and 16 KiB of slack).
+> - A push's held high-water gauged BUILT (2026-11-23, w-hg; main's ruling: the 410 MiB bar's push-all peak first):
+>   `vcs.hg.push_held_high_bytes`, the push's admission held plus its file texts still in the content store, sampled as
+>   each segment lands before its let-go; `..._texts_high_bytes` its texts' share; `vcs.hg.push_rows_bytes` its fork's
+>   index (`HgIndex::held_bytes`, tables and tail). Held by `a_pushs_texts_high_water_is_a_segments_whatever_its_history`
+>   (60 and 240 changesets of 8 KiB files at 32 KiB segments: texts 32,768 both; rows 35,860 and 143,780). OPEN, the
+>   next piece: the admission held grows about 843 bytes a changeset (56,809 and 208,768 in debug), the push's
+>   per-revision bookkeeping kept to its end; bounded by the segment, the held high-waters are equal within a segment.
 > - A fetch's file section asks a step's rows at a time BUILT (2026-11-23, w-hg; main's ruling on CI 45117277400: on
 >   arm64 one step of a clone's streamed answer ran 2,019,916 us wall, 670,641 us CPU, writing nothing). Both of
 >   getbundle's file sections sized a batch by the turn's room alone, the repository's whole share: a clone's link walk
@@ -887,9 +921,10 @@
 > A-864's readers BUILT (2026-11-22, w-git; main's r52): every git read before a fetch's pack (the advertisement's
 > and ls-refs' peel, the negotiation, the cuts) holds a refusal that met a let-go window and is made again once it is
 > brought back; a fetch lets the windows it brought back go behind its cursor (piece 3); bring-backs bounded. The landed
-> pack's let-go in `vcs_store::commit` stays guarded (main 01a20182, 2026-11-22: lifted at 01ae9fc26, put back) until
-> the readers still synchronous are covered: (a) the deferred green build through views.rs (w-shared), (b) a push's thin
-> bases through `IndexedObjects::object` and (c) its policy and signature reads (w-git). Owed too: the git/git mirror
+> pack's let-go in `vcs_store::commit` was guarded (main 01a20182, 2026-11-22: lifted at 01ae9fc26, put back) until
+> the readers still synchronous were covered: (a) the deferred green build through views.rs (w-shared), (b) a push's thin
+> bases through `IndexedObjects::object` and (c) its policy and signature reads (w-git); all three covered, the guard
+> LIFTED (the HELD paragraph above). Owed too: the git/git mirror
 > clone's stall at 183,511 bytes (main's sample), before the pack.
 > A-868 BUILT (2026-11-22, w-git; main's queue item 4): every deflate made its own zlib state, an object or a level
 > sampled (72 for a 42-object clone); now it takes its shard thread's kept state, reset and set to its level, given back
