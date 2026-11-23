@@ -60,6 +60,7 @@ pub mod locking;
 mod report_file_revs;
 mod report_locations;
 mod report_mergeinfo;
+mod report_replay;
 pub mod request;
 pub mod response;
 pub mod revprops;
