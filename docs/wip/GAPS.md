@@ -103,6 +103,10 @@
 > daemon lets nothing go until (2b)(b), homes' own read-through, next). (2b)(b) BUILT (w-shared, A-724 piece 8c): the
 > pack's home records where each of its windows lies on the node's store (`homes::LandedAt`), lets it go and brings it
 > back on a read; the records ride the shard image, so a window with one is not pinned.
+> The kept memory, measured on Linux (main 01a20182, 2026-11-23): with glibc, the gauges carry glibc's own figures over
+> every arena (`mem.gauge.process.malloc_free_bytes`, its arenas' free bytes, fastbins among them; `malloc_mapped_bytes`;
+> `malloc_arena_bytes`), so the remainder above is read there, not inferred; macOS and musl still infer it. OWED: main's
+> Linux RSS round reading them.
 > **A-870 (w-shared; main 01a20182's rulings of 2026-11-22 ~22:10 and ~22:30): a shard image's content-store families
 > published and restored over turns.** Piece 1 BUILT: the families paged (`crate::image_pages`): 3,000 windows let go
 > and 3,000 landed records rode 6,000 pieces, now 17 (534,085 bytes at a 43,912-byte page), restored whole. OWED: piece 2
@@ -117,7 +121,17 @@
 > and every clone (stock_git_verbs 1 of 8). Lifted when w-git's fetch-side readers (A-855's held answer, brought back and
 > made again) and the push decision's reads bring a let-go window back, with w-shared's red: annotated tags pushed, the
 > push ended, idle, then ls-remote and a clone byte-identical to stock.
-> **PUT BACK (w-git, 2026-11-23, main 01a20182's r165):** the lift below broke git/git's mirror clone after the push:
+> **LIFTED AGAIN (w-git, 2026-11-23, main 01a20182's order after r165):** `vcs_store::LANDED_LET_GO` on, one switch for
+> a commit's let-go and a recovery's or rebuild's (w-shared's `put_changeset`): the commit owes its pack and the push's
+> end or the repository's idle give-back lets it go a slice a turn (3e1588a54, the quantum alone ending a slice), every
+> read of a let-go window stopping at a unit boundary and brought back (0c3f42cea, 7f7793c58). Red over the edge:
+> `a_pushed_pack_is_let_go_by_its_commit_in_slices_and_a_clone_after_is_whole` (two shards, a 3 MiB file's pack of many
+> windows, nothing let go by hand: bytes let go in slices, the clone and a clone one commit deep each pushed object's
+> bytes, `ls-refs` `HEAD` at the commit; 0 bytes let go with the switch off) and over SSH (r165's `clone-ssh` and
+> `shallow` rows): `a_pushed_pack_let_go_by_its_commit_is_cloned_whole_and_shallow_over_ssh`, the client giving its
+> window back as OpenSSH's does (a 3 MiB answer past its 1 MiB window). Owed: main's git/git whole A/B (push no slower than the guard, clones
+> whole and byte-identical, `let_go_past_quantum` in release); an `Unreadable` or a refused fetch puts it back.
+> **PUT BACK (w-git, 2026-11-23, main 01a20182's r165; lifted again above):** the lift below broke git/git's mirror clone after the push:
 > refused `Pack(Store(Unreadable { id: sha1:e11e53618242d5dbeeab1ff15707c7ec88c907cc }))` 16,270,345 bytes in
 > (`parts_copied=2`, `entries_judged=3712`), stock git's "possible repository corruption on the remote side": a fetch
 > path still reads a let-go window without bringing it back. `vcs_store::commit` lets nothing go again; the harness of
@@ -776,6 +790,14 @@
 >   member's engine in the lineage's slot for the one out (`Lineage::lent`), the guard only the lineage and a handle,
 >   so `GreenRef`/`GreenMut` box nothing. Push: 362,278 B a changeset now 49,909, the lend's 300,292 B (red) now none.
 >   OPEN: the cuts by size, then bounds in this test.
+> - A node prefix's `lookup` read by node BUILT (2026-11-23, w-hg; main's order on CI arena-7: the last `begin` over
+>   10 ms of CPU, `cmd=lookup`, 91 ms wall / 30 ms CPU on x86, `lookup::prefixed` hex-encoding every node). The index's
+>   node rows are keyed by node first, so `HgIndex::changesets_prefixed` walks them from the prefix's bytes (and an odd
+>   digit's high four bits) to where it ends, passing other logs' rows over, two served matches settling it
+>   (`Repository::changesets_prefixed`; a view that cannot is walked, as before). Held by
+>   `a_node_prefixs_lookup_read_by_node_is_the_walks` (prefixes of one to twelve digits, the null node's zeros, one
+>   nothing has: the same answers, ambiguous ones among them) and
+>   `a_node_prefixs_lookup_reads_its_matches_not_the_history` (at most 8 reads, where the walk reads every revision).
 > - Branch heads kept as changesets land BUILT (2026-11-23, w-hg; main's ruling (b) on CI 45127535742: a `lookup` of a
 >   branch name ran one 348 ms step on x86, wrote 43 bytes, `branch_tip` scanning every revision's branch and then
 >   `branch_head_revs` walking the whole history, as `branchmap` whole did, 155-161 ms CPU a call). `HgIndex` keeps

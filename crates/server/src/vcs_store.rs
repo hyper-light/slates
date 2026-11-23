@@ -2401,6 +2401,10 @@ fn based_moves(
 /// hold its moves alone. Refused, nothing of the store changed and the push still holds its objects.
 pub(crate) fn commit(state: &mut ShardState, sealed: &mut SealedPush) -> Result<(), GitRefused> {
   let repository = sealed.repository;
+  // The pack the staging put in the content store, where its changeset landed on the node's store (A-767 C5).
+  let landed_pack = (sealed.landed > 0)
+    .then(|| sealed.push.stored_pack())
+    .flatten();
   let unkept = within_budget(state, 0, |stores| {
     let (content, store) = stores.git(repository).ok_or(GitRefused::NoStore)?;
     commit_moves(
@@ -2412,14 +2416,28 @@ pub(crate) fn commit(state: &mut ShardState, sealed: &mut SealedPush) -> Result<
   })?;
   sealed.objects = RecordWriter::default();
   state.count(VALUE_UNKEPT, unkept);
-  // A landed push's pack stays resident: its let-go (goal 93 item 2b) is safe only once every git read of the
-  // repository brings a let-go window back, and some do not yet. Run r52 (2026-11-22, the big Studio, main 6f6e87d82):
-  // once git/git's push ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's
-  // tag peel among the reads). Lifted at 76d8804c3 and put back (main 01a20182's r165, 2026-11-23: git/git's mirror
-  // clone after the push refused `Pack(Store(Unreadable { id: sha1:e11e5361… }))` 16,270,345 bytes in, stock git's
-  // "possible repository corruption"): a fetch path still reads a let-go window without bringing it back. So no landed
-  // pack is let go or owed here; the let-go itself (`let_go_sliced`, `let_go_owed`) is unchanged and tested
-  // directly (read_through's tests). GAPS: goal 93 item 2b.
+  // A synchronous audit shard's history can bring nothing back (a bring-back awaits the node's store), so its landed
+  // packs stay resident ([`KEEP_LANDED`]); a daemon's edges and tasks, and every let-go test, let them go.
+  #[cfg(test)]
+  let landed_pack = landed_pack.filter(|_| !KEEP_LANDED.with(core::cell::Cell::get));
+  // Goal 93 item 2b, lifted again (main 01a20182's order of 2026-11-23, after r165): every read of a let-go window
+  // stops at a unit boundary and is brought back (w-git's 0c3f42cea and 7f7793c58: the fetch stream's and the
+  // encoding's reads where an object lies, besides A-864's readers), and the let-go is sliced off the owing step
+  // (3e1588a54). Never under a fetch's answer or an encoding, nor under a push still deciding its refs (a non-atomic
+  // push's later refs read its objects): owed until the push ends or the repository goes idle, then let go a slice a
+  // turn ([`let_go_sliced`]).
+  if LANDED_LET_GO && let Some((pack, _)) = landed_pack {
+    if landed_let_go_may(state, repository, 0) {
+      let_go_sliced(state, pack);
+    } else {
+      state
+        .vcs_stores
+        .landed_owed
+        .entry(repository)
+        .or_default()
+        .push(pack);
+    }
+  }
   Ok(())
 }
 
@@ -3607,12 +3625,11 @@ async fn payload_bytes(
   (bytes.len() == whole).then_some(bytes)
 }
 
-/// Whether a landed push's pack may be let go once landed (goal 93 item 2b): held now (main 01a20182's r165,
-/// 2026-11-22, the guard put back in 5d9e81984: git/git's mirror clone after the push read a let-go window it did not
-/// bring back, `Pack(Store(Unreadable))`). One switch for every path that lets a landed pack go: a commit's (removed
-/// while held) and a recovery's or a rebuild's of the pack it read whole ([`put_changeset`]); the re-lift turns them on
-/// together, with w-git's red of a clone after a multi-window pack's let-go.
-pub(crate) const LANDED_LET_GO: bool = false;
+/// Whether a landed push's pack may be let go once landed (goal 93 item 2b): on again (main 01a20182's order of
+/// 2026-11-23, after r165's `Pack(Store(Unreadable))` put the guard back in 5d9e81984; every read of a let-go window
+/// now stops and is brought back, and the let-go is sliced). One switch for every path that lets a landed pack go: a
+/// commit's ([`commit`]) and a recovery's or a rebuild's of the pack it read whole ([`put_changeset`]).
+pub(crate) const LANDED_LET_GO: bool = true;
 
 /// Puts what [`read_changeset`] read into the shard's content store, each checked against the record's identity and
 /// held by its put as one fetched from the region is, and notes the changeset's sequence as landed, so the next push

@@ -735,7 +735,7 @@ fn git_name(kind: slates_git::object_name::Kind, content: &[u8]) -> ObjectId {
 
 /// Stock git's request creating `main` at a root commit whose one file is `bytes` long, and that commit: the file's
 /// bytes counted out by a 64-bit LCG (Knuth's MMIX constants), so no two windows of it repeat.
-fn large_create(bytes: usize) -> (Vec<u8>, ObjectId) {
+pub(crate) fn large_create(bytes: usize) -> (Vec<u8>, ObjectId) {
   use slates_git::object_name::Kind;
   let mut state = 0x9e37_79b9_7f4a_7c15u64;
   let blob: Vec<u8> = (0..bytes)
@@ -1148,6 +1148,34 @@ pub(crate) fn fetch_of(want: ObjectId) -> Vec<u8> {
   request
 }
 
+/// A v2 `fetch` of `want` one commit deep, as `git clone --depth 1` asks: `want` it, `deepen 1`, `done`.
+pub(crate) fn shallow_fetch_of(want: ObjectId) -> Vec<u8> {
+  let mut request = Vec::new();
+  pktline::write(Packet::Data(b"command=fetch\n"), &mut request).expect("the command");
+  pktline::write(Packet::Delim, &mut request).expect("the delimiter");
+  for argument in [
+    format!("want {want}\n"),
+    "deepen 1\n".to_owned(),
+    "no-progress\n".to_owned(),
+    "done\n".to_owned(),
+  ] {
+    pktline::write(Packet::Data(argument.as_bytes()), &mut request).expect("an argument");
+  }
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request
+}
+
+/// The pack a protocol v2 `fetch` answer carries after whatever sections come before it (a shallow fetch's
+/// `shallow-info`): [`fetched_pack`] from its `packfile` section on.
+pub(crate) fn fetched_pack_after(answer: &[u8]) -> Vec<u8> {
+  let section = b"000dpackfile\n";
+  let at = answer
+    .windows(section.len())
+    .position(|window| window == section)
+    .expect("a packfile section");
+  fetched_pack(&answer[at..])
+}
+
 /// Shape: the commits of [`a_long_pushs_answer_is_kept_alive_with_gits_keepalive_until_its_report`]'s push: enough
 /// that its answer takes many turns.
 pub(crate) const KEPT_ALIVE_HISTORY: usize = 300;
@@ -1299,6 +1327,18 @@ pub(crate) fn ids_in(pack: &[u8]) -> Vec<String> {
     .collect();
   ids.sort();
   ids
+}
+
+/// The objects `pack` holds, read whole as git's index-pack reads one: each id with its bytes.
+pub(crate) fn objects_of(pack: &[u8]) -> std::collections::BTreeMap<String, Vec<u8>> {
+  let mut admission = Admission::new(PACK_ROOM);
+  let unpacked = unpack::read_whole(pack, GitFormat::Sha1, &NoIndex, &mut admission);
+  unpacked
+    .expect("a whole pack")
+    .objects
+    .into_iter()
+    .map(|object| (object.id.to_string(), object.content))
+    .collect()
 }
 
 /// The pack a protocol v2 `fetch` answer carries: its `packfile` section's band-1 data, joined.
@@ -3925,7 +3965,7 @@ fn a_long_push_stale_twice_is_re_based_once_holding_the_turn_and_lands() {
 
 /// Shape: the bytes of [`a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows`]'s one file: windows
 /// enough that a clone holding its whole pack would hold many more than a turn's look-ahead.
-const LET_GO_FILE: usize = 3 << 20;
+pub(crate) const LET_GO_FILE: usize = 3 << 20;
 
 /// A-864 piece 3 (main 01a20182's ruling of 2026-11-22: a clone of a let-go pack is whole and holds at most a turn's
 /// windows, never its pack's). Do: start a two-shard store-backed daemon with its edge; push a create of `main` at a
@@ -4020,6 +4060,75 @@ fn a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows() {
     peak <= 3,
     "at most a turn's windows held: {observed:?} of {}",
     windows.len()
+  );
+}
+
+/// Goal 93 item 2b, lifted again (main 01a20182's order of 2026-11-23, after r165's `Pack(Store(Unreadable))`): a landed
+/// push's pack let go by its own commit, sliced off the owing step, and a whole clone after it. Do: start a two-shard
+/// store-backed daemon with its edge; push a create of `main` at a commit whose one file is [`LET_GO_FILE`] bytes, a
+/// pack of many windows; with nothing let go by hand, wait until the repository's shard counts landed bytes let go (by
+/// the commit's own let-go, or first by the pack's home there); then clone `main` over the edge, clone it one commit
+/// deep (r165: the shallow row failed too), and list `HEAD`. Expect: the push `200`; bytes let go, in more than one
+/// slice (`vcs_store.landed.let_go_slices`); both clones `200`, each pack the push's three objects, each the pushed
+/// bytes; and the listing naming `HEAD` at the commit. Red with the guard
+/// (`LANDED_LET_GO` false): nothing let go.
+#[test]
+fn a_pushed_pack_is_let_go_by_its_commit_in_slices_and_a_clone_after_is_whole() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, commit) = large_create(LET_GO_FILE);
+  let created = pushed(edge, &name, &request);
+  // Let go a slice a turn by a task of the repository's shard once the push ends: by the owner's let-go, or first by the
+  // pack's home where that is the repository's shard, which ranks by the pack's identity.
+  let let_go_bytes = || {
+    counted_on(&daemon, REPOSITORY, crate::vcs_store::LANDED_LET_GO_BYTES)
+      + counted_on(
+        &daemon,
+        REPOSITORY,
+        crate::vcs_store::homes::LANDED_HOME_LET_GO_BYTES,
+      )
+  };
+  let waited = std::time::Instant::now();
+  while let_go_bytes() == 0 && waited.elapsed() < Duration::from_secs(10) {
+    std::thread::sleep(Duration::from_millis(20));
+  }
+  let let_go = let_go_bytes();
+  let slices = counted_on(&daemon, REPOSITORY, crate::vcs_store::LET_GO_SLICES);
+  let fetched = uploaded(edge, &name, &fetch_of(commit));
+  let shallow = uploaded(edge, &name, &shallow_fetch_of(commit));
+  let listed = uploaded(edge, &name, LS_REFS_HEAD);
+  daemon.stop();
+  assert_eq!(created.0, 200, "{}", String::from_utf8_lossy(&created.1));
+  assert!(
+    let_go > 0,
+    "the push's commit let its landed pack go: {let_go} bytes"
+  );
+  assert!(slices > 1, "let go in slices: {slices}");
+  assert_eq!(shallow.0, 200);
+  let (_, commands_end) = packets_from(&request, 0);
+  let pushed_objects = objects_of(request.get(commands_end..).expect("the push's pack"));
+  assert_eq!(
+    objects_of(&fetched_pack_after(&shallow.1)),
+    pushed_objects,
+    "the shallow clone whole, its one commit's objects the pushed bytes"
+  );
+  assert_eq!(fetched.0, 200);
+  assert_eq!(
+    objects_of(&fetched_pack(&fetched.1)),
+    pushed_objects,
+    "the clone whole, each object the pushed bytes"
+  );
+  assert_eq!(listed.0, 200);
+  assert!(
+    String::from_utf8_lossy(&listed.1)
+      .contains(&format!("{commit} HEAD symref-target:refs/heads/main")),
+    "{}",
+    String::from_utf8_lossy(&listed.1)
   );
 }
 

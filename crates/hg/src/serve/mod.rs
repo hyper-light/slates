@@ -72,6 +72,13 @@ pub trait Repository {
     None
   }
 
+  /// The served changesets whose node begins with `bytes` and then, where given, the high four bits `nibble`, at most
+  /// `most`, where the view finds them by node (`crate::index::HgIndex::changesets_prefixed`, goal 93): what a
+  /// `lookup` of a node prefix reads in place of its walk of every node. None for a view that cannot, which is walked.
+  fn changesets_prefixed(&self, _prefix: (&[u8], Option<u8>), _most: usize) -> Option<Vec<Node>> {
+    None
+  }
+
   /// A revision's phase: public or draft, in a served view.
   fn phase(&self, rev: Rev) -> Phase;
 
