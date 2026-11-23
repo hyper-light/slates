@@ -534,3 +534,7 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   Note docs/bugs/2026-11-22-each-partition-reserved-a-lease-timer-for-every-volume-it-could-hold.md.
 - Open for main: r74's ~120 MB footprint past live (heap reserved 612 MB vs 111.7 MB in use); I sent the
   top/vmmap/lldb malloc_zone_pressure_relief check; a give-back is a piece only if it releases ~100 MB.
+- LANDED b267fe9fe (2026-11-22 ~18:00 PST): BENCHMARKS measured-and-rejected, an idle heap give-back (relief
+  releases 0 at every size; MallocSpaceEfficient 515 -> 3 MB at 5-8x churn cost; main's ruling (3)); GAPS under w-svn's
+  import: the rejection, and OPEN upstream: the import churns ~500 MB of small blocks (r80: MALLOC_SMALL (empty)
+  235.0 MB dirty), owed a bounded working set per push (w-svn's).
