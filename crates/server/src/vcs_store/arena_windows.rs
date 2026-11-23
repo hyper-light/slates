@@ -277,7 +277,12 @@ fn read_piece(bytes: &[u8]) -> Result<PieceRead, PieceRefused> {
     Some(0) => None,
     Some(1) => {
       let end = u64::from(at).saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
-      if len == 0 || end > u64::from(used) || u64::from(used) > block {
+      // A chunk of its own may name a head shorter than its bytes: the seal trims its block to its length (A-118), and
+      // its other pieces follow from that length, as a recovery claims them (`ChunkStore::claim_chunk_blocks`). Only the
+      // window's slot is held to the chunk's bytes. Until 2026-11-23 a used length past the head was refused here, and
+      // every window of a granule or more was lost at a restart
+      // (docs/bugs/2026-11-23-a-restart-lost-every-repository-window-whose-chunk-the-seal-trimmed.md).
+      if len == 0 || end > u64::from(used) {
         return Err(PieceRefused::Malformed);
       }
       Some(PieceChunk {
@@ -347,7 +352,7 @@ impl ChunkWindows {
     // fill a 4 KiB granule three at a time and a 16 KiB one fourteen. A window of a granule or more shares nothing.
     let granule = self.chunks.block_bytes(1);
     let shares = bytes.len() < granule;
-    if shares && let Some(placed) = self.into_filling(bytes)? {
+    if shares && let Some(placed) = self.fill_next_slot(bytes)? {
       return Ok(Some(placed));
     }
     let want = if shares { granule } else { bytes.len() };
@@ -368,8 +373,10 @@ impl ChunkWindows {
         freed: (0, 0),
       },
     );
-    self.reask(key);
     if shares {
+      // A slab's block was taken asking its whole granule; it asks its window's bytes. A chunk of its own asked its
+      // window's length already, and its head may be trimmed shorter than that, which `reask` would cap it at.
+      self.reask(key);
       // The slab with the more room left fills on: a window that did not fit the last leaves it filling where its own
       // slab has less room.
       let end = usize::try_from(placed.used).unwrap_or(0);
@@ -385,7 +392,7 @@ impl ChunkWindows {
   }
 
   /// `bytes` written into the filling slab's next slot, or none when there is no filling slab or they do not fit.
-  fn into_filling(&mut self, bytes: &[u8]) -> Result<Option<Placed>, ContentRefused> {
+  fn fill_next_slot(&mut self, bytes: &[u8]) -> Result<Option<Placed>, ContentRefused> {
     let Some((key, cursor, end)) = self.filling else {
       return Ok(None);
     };
@@ -639,7 +646,11 @@ impl ChunkWindows {
       .iter()
       .map(|slot| slot.2)
       .fold(0usize, usize::saturating_add);
-    chunks.arena_mut().reask(claimed, asked);
+    // The claim asked the chunk's bytes; a slab asks its windows' bytes alone. A chunk of its own, perhaps trimmed to a
+    // head shorter than its bytes (A-118), keeps what the claim asked.
+    if usize::try_from(first.used).ok() != Some(asked) {
+      chunks.arena_mut().reask(claimed, asked);
+    }
     for (handle, identity, len, piece) in slots {
       let placed = Placed {
         extent: Extent {

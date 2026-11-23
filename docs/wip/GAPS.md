@@ -1053,7 +1053,10 @@
 >   `a_windows_ask_is_its_own_length_and_its_hold_the_page_it_takes` (red: asked 16,384 of 16,384 held for four windows
 >   of 100 bytes; now 400). The rounding's fix, A-877, is BUILT: windows shorter than a granule share slabs of one granule,
 >   slots never written twice, a slab freed with its last window through A-64's deferred free (red: 3,276,800 bytes held
->   for 200 windows of 1,151 bytes at a 16 KiB granule; now at most 245,760). Owed: main's arena-17.
+>   for 200 windows of 1,151 bytes at a 16 KiB granule; now at most 245,760). arena-17 met its bar (CI 45255642995: RSS
+>   826 MB from 1,261 MB on x86, vcs_windows 154 MB held for 121 MB asked). Its piece reader lost every window in a
+>   trimmed chunk of its own at a restart; FIXED the same day (w-win2's Windows run 45269168513;
+>   `docs/bugs/2026-11-23-a-restart-lost-every-repository-window-whose-chunk-the-seal-trimmed.md`).
 > - A Mercurial index's tail sealed by every append REVERTED (2026-11-23, w-perf; 0cd8ef36a reverted after main's
 >   arena-14, CI 45208924823: push-all's shard 0 spun past 1 s of CPU in `hg_push::segment` on all three legs and the
 >   watchdog killed the daemon). Each seal writes a run, and a push's fork never merges its runs (only the repository's
