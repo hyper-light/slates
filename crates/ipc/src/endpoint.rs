@@ -1776,6 +1776,27 @@ mod departure {
       GetCurrentProcess, GetCurrentThread, GetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
       THREAD_PRIORITY_NORMAL,
     };
+    // A job that fixes its processes' priority class keeps every thread's level where it was, and `SetThreadPriority`
+    // answers success there (kiln's agent job on jupiter, 2026-11-23): the raise is a no-op by design, so the test skips
+    // loudly where a fresh thread cannot rise.
+    let may_rise = std::thread::spawn(|| {
+      // SAFETY: the calling thread's pseudo-handle; a thread sets and reads its own level.
+      unsafe {
+        windows_sys::Win32::System::Threading::SetThreadPriority(
+          GetCurrentThread(),
+          THREAD_PRIORITY_ABOVE_NORMAL,
+        ) != 0
+          && GetThreadPriority(GetCurrentThread()) == THREAD_PRIORITY_ABOVE_NORMAL
+      }
+    })
+    .join()
+    .unwrap_or(false);
+    if !may_rise {
+      println!(
+        "skipped: a thread of this process cannot rise a level (its job fixes its threads' levels)"
+      );
+      return;
+    }
     let _gate = crate::descriptor_test_gate();
     let instance = unique_name("slates-endpoint-raised-wait-daemon");
     let _rendezvous = published(&instance).unwrap();
