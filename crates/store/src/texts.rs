@@ -367,10 +367,18 @@ pub struct TextRow {
   pub place: Place,
 }
 
-/// Whole texts made from their chains, by identity, oldest out first, bounded in bytes: the bound a caller starts it
-/// with, grown to the bytes of the longest chain a read has had to make (a learned size, Ada's sizing rule: a read makes
-/// its chain's texts at once, and the next read of the path finds them); and what the reads did, the red test's
-/// non-vacuity counters.
+/// Whole texts made from their chains, by identity, the least lately read out first, bounded in bytes; and what the
+/// reads did, the red tests' non-vacuity counters.
+///
+/// **The bound, from the work (goal 93; main 01a20182's ruling of 2026-11-23).** A read needs one text: the one it
+/// lends, walked a piece a request ([`crate::store::PIECE_BYTES`]) by a caller that holds one walk at a time, and the
+/// next version of the same path, which a clone streams in order, finds the version before it, where its chain walk
+/// stops. So a cache made for `reads` callers at once ([`TextCache::for_reads`], the owner's room for waiting requests)
+/// holds the distinct texts its last `reads` reads lent, and a chunk's room besides. Until 2026-11-23 the bound grew to
+/// the longest chain a read had made, since a chain was made from the texts the cache held: on a push of Mercurial's own
+/// history it held 360 MB at the push's end. A chain is made through the cache's own two buffers now, so it needs none
+/// held, and a text past the bound is lent from the buffer it was made into. A cache made with a fixed bound
+/// ([`TextCache::new`]) keeps it.
 ///
 /// The texts lie in chunks of the mapped allocation's floor, laid end to end, the oldest chunk given back whole (goal 93;
 /// A-861's rule for git's objects read lately, applied to the store's texts). Kept as a buffer each, the texts a push of
@@ -396,14 +404,26 @@ pub struct TextCache {
   bytes: u64,
   /// The bytes the chunks hold reserved, what the bound is held to.
   reserved: u64,
-  /// The most bytes the chunks may hold.
+  /// The most bytes the chunks may hold: fixed, or (with `reads`) derived from the last reads.
   bound: u64,
+  /// The reads at once the bound is derived for; zero for a fixed bound.
+  reads: usize,
+  /// The texts the last `reads` reads lent, oldest first, with their lengths.
+  recent: std::collections::VecDeque<(Identity, u64)>,
+  /// How many of `recent` name each text.
+  recent_counts: std::collections::HashMap<Identity, u32>,
+  /// The bytes of the distinct texts in `recent`.
+  recent_bytes: u64,
+  /// The text the last chain made, which `base` holds until the next is made.
+  last_made: Option<Identity>,
   /// The base the chain's next edit is applied to, while a chain is made.
   base: Vec<u8>,
   /// The text the edit makes, while a chain is made.
   next: Vec<u8>,
   /// Texts made from their chains.
   pub made: u64,
+  /// Texts let go at the bound: what shows a cache that filled and gave texts back (the bound's non-vacuity count).
+  pub let_go: u64,
   /// Edits applied.
   pub edits: u64,
   /// Places read from the log or the staging.
@@ -443,9 +463,15 @@ impl TextCache {
       bytes: 0,
       reserved: 0,
       bound,
+      reads: 0,
+      recent: std::collections::VecDeque::new(),
+      recent_counts: std::collections::HashMap::new(),
+      recent_bytes: 0,
+      last_made: None,
       base: Vec::new(),
       next: Vec::new(),
       made: 0,
+      let_go: 0,
       edits: 0,
       places: 0,
       changesets: std::collections::BTreeSet::new(),
@@ -457,6 +483,27 @@ impl TextCache {
     self.bytes
   }
 
+  /// A cache for the reads of `reads` callers at once (the owner's room for waiting requests), its bound derived from
+  /// them (the type's doc).
+  ///
+  /// Derived: bound = the bytes of the distinct texts the last `reads` reads lent + one chunk (the mapped floor), the
+  /// newest chunk's room not yet laid.
+  pub fn for_reads(reads: usize) -> Self {
+    let mut cache = Self::new(to_u64(slates_mem::large::floor()));
+    cache.reads = reads;
+    cache
+  }
+
+  /// The bytes the cache holds reserved for its texts.
+  pub fn reserved_bytes(&self) -> u64 {
+    self.reserved
+  }
+
+  /// The most bytes the cache may hold now.
+  pub fn bound(&self) -> u64 {
+    self.bound
+  }
+
   /// The text held under `identity`, if it is.
   pub fn get(&self, identity: &Identity) -> Option<&[u8]> {
     let lent = self.texts.get(identity)?;
@@ -466,6 +513,68 @@ impl TextCache {
       .get(index)?
       .bytes
       .get(lent.at..lent.at.checked_add(lent.len)?)
+  }
+
+  /// The text `identity` as a read lends it: from the cache, or from the buffer the last chain was made into where the
+  /// bound could not hold it.
+  fn lent(&self, identity: &Identity) -> Option<&[u8]> {
+    self
+      .get(identity)
+      .or_else(|| (self.last_made == Some(*identity)).then_some(self.base.as_slice()))
+  }
+
+  /// Records a read lending `identity` (`len` bytes): the bound derived again from the last reads, the text moved to the
+  /// newest chunk where it lies in an older one, so the least lately read go first, and the chunks past the bound given
+  /// back.
+  fn read(&mut self, identity: Identity, len: u64) {
+    if self.reads > 0 {
+      self.recent.push_back((identity, len));
+      let count = self.recent_counts.entry(identity).or_insert(0);
+      *count = count.saturating_add(1);
+      if *count == 1 {
+        self.recent_bytes = self.recent_bytes.saturating_add(len);
+      }
+      while self.recent.len() > self.reads {
+        let Some((gone, gone_len)) = self.recent.pop_front() else {
+          break;
+        };
+        if let Some(count) = self.recent_counts.get_mut(&gone) {
+          *count = count.saturating_sub(1);
+          if *count == 0 {
+            self.recent_counts.remove(&gone);
+            self.recent_bytes = self.recent_bytes.saturating_sub(gone_len);
+          }
+        }
+      }
+      self.bound = self
+        .recent_bytes
+        .saturating_add(to_u64(slates_mem::large::floor()));
+    }
+    self.refresh(identity);
+    self.make_room(0);
+  }
+
+  /// Moves `identity`'s text to the newest chunk where it lies in an older one and is shorter than a chunk.
+  fn refresh(&mut self, identity: Identity) {
+    let newest = self
+      .first
+      .saturating_add(to_u64(self.chunks.len()))
+      .saturating_sub(1);
+    let Some(lent) = self.texts.get(&identity).copied() else {
+      return;
+    };
+    if lent.chunk == newest || lent.len >= self.chunk_len() {
+      return;
+    }
+    let mut moved = std::mem::take(&mut self.next);
+    moved.clear();
+    if let Some(bytes) = self.get(&identity) {
+      moved.extend_from_slice(bytes);
+    }
+    self.texts.remove(&identity);
+    self.bytes = self.bytes.saturating_sub(to_u64(lent.len));
+    self.keep(identity, &moved);
+    self.next = moved;
   }
 
   /// A chunk's length: the mapped allocation's floor, so each is given back whole when it goes (`slates_mem::large`), or
@@ -555,13 +664,15 @@ impl TextCache {
         {
           self.bytes = self.bytes.saturating_sub(to_u64(lent.len));
           self.texts.remove(&identity);
+          self.let_go = self.let_go.saturating_add(1);
         }
       }
     }
   }
 
-  /// Gives back a chain buffer that took the mapped path (a text a floor long or longer made it so), so a cache does not
-  /// hold a large text's pages past the read that made it; one under the floor is kept for the next chain.
+  /// Gives back a chain buffer that took the mapped path (a text a floor long or longer made it so), before the next
+  /// chain is made, so a cache does not hold a large text's pages past the read that lent it; one under the floor is
+  /// kept for the next chain.
   fn shrink_buffers(&mut self) {
     let floor = slates_mem::large::floor();
     for buffer in [&mut self.base, &mut self.next] {
@@ -926,8 +1037,13 @@ impl Store {
     if cache.get(text).is_none() && !self.make(staging, repository, text, cache)? {
       return Ok(None);
     }
-    // The cache's bound grew to the chain, so the text made, kept last, is held.
-    let Some(whole) = cache.get(text) else {
+    let len = cache
+      .lent(text)
+      .map(<[u8]>::len)
+      .ok_or(StoreError::BadRow)?;
+    cache.read(*text, to_u64(len));
+    // Held, or in the buffer the chain was made into where the bound could not hold it.
+    let Some(whole) = cache.lent(text) else {
       return Err(StoreError::BadRow);
     };
     let start = usize::try_from(offset).map_err(|_| StoreError::BadRow)?;
@@ -1142,21 +1258,19 @@ impl Store {
         None => break,
       }
     }
-    // The chain's texts are kept as they are made, so the next read of the path finds them: the cache's bound grows to
-    // them where it is short.
-    let need = chain
-      .iter()
-      .fold(0u64, |need, (_, row)| need.saturating_add(row.len));
-    cache.bound = cache.bound.max(need);
-    // The chain is made through the cache's two buffers, taken out while it is made and put back after, so a chunk the
-    // cache gives back meanwhile loses nothing the next edit needs.
+    // The chain's texts are kept as they are made, within the bound, so the next read of the path finds them. The chain is
+    // made through the cache's two buffers, taken out while it is made and put back after, so a chunk the cache gives
+    // back meanwhile loses nothing the next edit needs; the last text made stays in `base` for the read to lend.
+    cache.shrink_buffers();
+    cache.last_made = None;
     let mut base = std::mem::take(&mut cache.base);
     let mut next = std::mem::take(&mut cache.next);
     let made = self.make_chain(staging, chain, cache, &mut base, &mut next);
     cache.base = base;
     cache.next = next;
-    cache.shrink_buffers();
-    made.map(|()| true)
+    made?;
+    cache.last_made = Some(*text);
+    Ok(true)
   }
 
   /// Makes the texts of `chain` (newest first, its oldest a whole or an edit of a text the cache holds), oldest first,

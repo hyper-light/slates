@@ -913,6 +913,12 @@
 >   bytes grown holding 6,553,600, now 90,424 holding 6,029,312). The hg intake's whole texts (`intake::rebuilt`,
 >   `HgIndex::revision_text`, `Taker::file_base`; 3.52 GB of the [128 KiB, 256 KiB) band's churn with the cache's
 >   share) are w-hg's, in C1. Owed: main's arena round for RSS.
+>   Its bound from the work BUILT (main's ruling, 2026-11-23): the chain no longer needs its texts held, so the cache holds
+>   the distinct texts its last `waiting` reads lent (one a waiting request, the owner's room) and a chunk's room
+>   (`TextCache::for_reads`), the least lately read out first; a text past it is lent from the buffer it was made into.
+>   Grown to the longest chain before, it held 360 MB of chunks at the end of Mercurial's push. Held by
+>   `the_store_holds_the_texts_its_last_reads_lent_and_no_more` (red: bound 6,553,600 after a 400-version chain's read;
+>   now 1,064,960 for 4 reads, 384 texts let go, the latest found again unmade).
 > - The watchdog's beat allocates nothing BUILT (2026-11-23, w-perf; main's order). A beat made 4 allocations, about
 >   1 KB by their types (estimated, not measured). `hg_push_heap`'s first read had charged the watchdog 24% of a push's
 >   sampled bytes, about 10-15 MB a second; that was its sampler's artifact (a thread's first symbol load charged to its
