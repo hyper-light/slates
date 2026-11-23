@@ -3597,6 +3597,13 @@ async fn payload_bytes(
   (bytes.len() == whole).then_some(bytes)
 }
 
+/// Whether a landed push's pack may be let go once landed (goal 93 item 2b): held now (main 01a20182's r165,
+/// 2026-11-22, the guard put back in 5d9e81984: git/git's mirror clone after the push read a let-go window it did not
+/// bring back, `Pack(Store(Unreadable))`). One switch for every path that lets a landed pack go: a commit's (removed
+/// while held) and a recovery's or a rebuild's of the pack it read whole ([`put_changeset`]); the re-lift turns them on
+/// together, with w-git's red of a clone after a multi-window pack's let-go.
+pub(crate) const LANDED_LET_GO: bool = false;
+
 /// Puts what [`read_changeset`] read into the shard's content store, each checked against the record's identity and
 /// held by its put as one fetched from the region is, and notes the changeset's sequence as landed, so the next push
 /// lands at the last one named + 1 (main's ruling of 2026-11-20: a changeset landed past the register's head is
@@ -3615,12 +3622,13 @@ fn put_changeset(
       return Err(ReplayRefused::Unlanded);
     }
   }
-  // The pack read whole for the replay is a landed push's, as its commit let it go (goal 93 item 2b): owed its let-go
+  // The pack read whole for the replay is a landed push's, as its commit lets it go (goal 93 item 2b): owed its let-go
   // again, run once a recovery ends (`recover_repository`), so a warm restart leaves out of RAM what its predecessor let
-  // go; a live rebuild's owes it to the repository's idle give-back, as a live commit under a push does.
+  // go; a live rebuild's owes it to the repository's idle give-back, as a live commit under a push does. Never while the
+  // landed let-go is held ([`LANDED_LET_GO`]): this is the same let-go a commit's is.
   #[cfg(test)]
   let pack_read = pack_read && !KEEP_LANDED.with(core::cell::Cell::get);
-  if pack_read {
+  if pack_read && LANDED_LET_GO {
     state
       .vcs_stores
       .landed_owed
