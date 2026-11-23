@@ -9847,7 +9847,10 @@
 >   `a_call_to_a_killed_unanchored_daemon_ends_daemon_gone_at_once`). Since 2026-11-23 (w-win) an anchor's going clears
 >   its mark from the header: a client's doorbell keeps a Windows object past the hold, so an anchor that let go inside a
 >   live process had read as the holder for good (`an_anchor_that_lets_go_is_no_holder_though_a_client_maps_the_object`;
->   `docs/bugs/2026-11-23-a-windows-anchor-that-let-go-still-read-as-the-rendezvous-holder.md`). `reconnect_ns` still
+>   `docs/bugs/2026-11-23-a-windows-anchor-that-let-go-still-read-as-the-rendezvous-holder.md`). A claim already
+>   waiting there ends at that going too since 2026-11-23 (w-win2): it looks for the anchor's mark on A-443's doubling
+>   (`a_waiting_claim_under_an_anchor_ends_at_its_going_inside_a_live_process`;
+>   `docs/bugs/2026-11-23-a-windows-claim-waiting-under-an-anchor-that-let-go-waited-on-its-process.md`). `reconnect_ns` still
 >   bounds the waits on a fleet owner's takeover (a request refused for now held for its resend, the pause between resends,
 >   `Client::call_through_transient`), owed to the failover delay the daemon reports. The server's reclaim of a
 >   taken-back map no holder claims (`held_copy::reconnect_budget_ns`, "The holder claims it") mirrored the old
@@ -10111,6 +10114,25 @@
 >   8,798 cases passed both ways (0 failed, 28 todo), `compare` 0 differing, every live log durable and held. The two NFS
 >   limits the lane's pjdfstest list held pass over FUSE, so the list is empty. Commands and counts:
 >   `docs/wip/conformance.md` (the live-shipped pair).
+
+> **The live-shipped fsstress over FUSE fell behind its candidates, shipping the volume whole after every credit refusal
+> (2026-11-23, A-377, AC-8.9; FIXED, w-fleet).** CI's conformance lane failed it intermittently on `ubuntu-latest`: nightly
+> 45176536354 and run 45163517212 failed, runs 45177206583 and 45181584785 passed. In 45163517212 the owner's log ended
+> at head 1809, durable 1808, with both candidates at 1808 after the 40 s fleet wait. It had appended 174 whole entries
+> of 1.89 GB from 16 refusals for credit, with 135 installs. A delta refused for credit behind a build left the volume
+> owing a whole state, and the whole state queued for it did not pay the debt, so every later publication in that build
+> was captured whole and queued too. A queued whole state now pays it, and the deltas behind it are counted from it
+> (§4.10, A-377's amendment of 2026-11-23). The lane passed 5 of 5 on adacachy2 with the fix, 22 to 24 whole entries of
+> 9.8 to 31.4 MB a run, one more than its refusals; main made 104 of 300 MB from 5 there. Test:
+> `a_delta_refused_behind_a_build_owes_one_whole_state_and_the_writes_after_it_queue_as_changes`. Record:
+> `docs/bugs/2026-11-23-a-whole-state-queued-behind-a-build-left-the-volume-owing-one.md`.
+> - Not a defect: the candidates' `durable=none` in the record. Every held copy reports no durable position, and the
+>   harness reads only the candidates' heads.
+> - **Open (the harness's):** a live run's record says "the daemon answered `volume list` after the run: false" and "the
+>   daemon stopped answering during the run" whenever the log did not catch up, because `Session::alive_and_shipped`
+>   returns the two answers as one flag. The daemon answered `status` throughout.
+> - **Owed (measurement):** the live-shipped pair's cost recorded on 2026-11-18 above (fsx on the Studio, 407 whole states
+>   past the live credit, `refused.no_credit` 411) may share this cause; to be measured again.
 
 > **The many-client load test over the network (loadtest; 2026-11-05).** The harness
 > (`crates/client/examples/load_bench.rs`, `--green` to drive a green on another node) and its launcher

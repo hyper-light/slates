@@ -41,3 +41,5 @@ the case CI showed. It also kept both Windows test lanes red, hiding later Windo
 - A claim already waiting under the anchor (`Ends::WithAnchor`, begun before the anchor let go) waits on the anchor's
   process with no timeout. If the anchor lets go inside a live process while such a claim waits, the claim waits until
   a daemon answers it or that process exits. No test reaches this case; the driver test's claims begin after the let go.
+  Fixed the same day:
+  `docs/bugs/2026-11-23-a-windows-claim-waiting-under-an-anchor-that-let-go-waited-on-its-process.md`.

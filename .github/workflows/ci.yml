@@ -790,6 +790,13 @@ jobs:
         if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-rt --test overrun
+      # A spinning task's label read from another thread (A-740), so a watchdog's report names the task, not the shard
+      # alone. The label's file is held to `file!()` whole, which a Windows build writes with backslashes: until
+      # 2026-11-23 the test held a `/`-separated suffix, which never matched here, and no lane ran it here.
+      - name: Test a spinning task's label read from another thread (native Windows)
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
+        timeout-minutes: 15
+        run: cargo test -p slates-rt --test spin_label
       # A shard's CPU clock read from another thread (§4.14, A-65): `GetThreadTimes` for the time it ran and
       # `QueryThreadCycleTime` for whether it ran; then the observations that count their budget in it — a starved
       # shard answered past the wall budget, a wedged one ended in one budget
@@ -1200,6 +1207,8 @@ jobs:
         run: cargo test -p slates-rt --test tcp
       - name: Test a shard's lateness after a park (native arm64 Windows)
         run: cargo test -p slates-rt --test overrun
+      - name: Test a spinning task's label read from another thread (native arm64 Windows)
+        run: cargo test -p slates-rt --test spin_label
       - name: Test the shard CPU clock (native arm64 Windows)
         run: 'cargo test -p slates-rt --lib thread_clock::'
       - name: Test the wire codec and its CRC32C on arm64 hardware
