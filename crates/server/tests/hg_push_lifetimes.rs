@@ -269,7 +269,7 @@ fn table(title: &str, sites: &[(String, Classes)], size_classes: &[usize], lives
     .map(|(site, classes)| (site, sum(classes), classes))
     .filter(|(_, bytes, _)| *bytes > 0)
     .collect();
-  ranked.sort_by(|left, right| right.1.cmp(&left.1));
+  ranked.sort_by_key(|(_, bytes, _)| std::cmp::Reverse(*bytes));
   let total: u64 = ranked.iter().map(|(_, bytes, _)| bytes).sum();
   println!("hg_push_lifetimes: == {title}: {total} B sampled");
   for (site, bytes, classes) in ranked.iter().take(LISTED) {

@@ -103,6 +103,8 @@ pub(crate) fn serve(name: &str, extra: &str) -> Served {
   let scratch = target_dir();
   let base = scratch.path.clone();
   let store_dir = format!("{base}/store");
+  // The store's directory inside the fixture's own, in the build output (`common::target`).
+  #[allow(clippy::disallowed_methods)]
   std::fs::create_dir_all(&store_dir).unwrap();
   let store_dir = std::fs::canonicalize(&store_dir).unwrap();
   let grant = StoreGrant {
@@ -153,13 +155,13 @@ pub(crate) fn serve(name: &str, extra: &str) -> Served {
     .enroll_credential(principal, material, None, proof)
     .unwrap();
   let hgrc = format!("{base}/hgrc");
-  std::fs::write(
-    &hgrc,
+  scratch.seed(
+    "hgrc",
     format!(
       "[auth]\nslates.prefix = http://127.0.0.1:{port}/\nslates.username = slates\nslates.password = {token}\n{extra}"
-    ),
-  )
-  .unwrap();
+    )
+    .as_bytes(),
+  );
   Served {
     daemon: Some(daemon),
     anchor: Some(anchor),

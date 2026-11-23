@@ -33,6 +33,24 @@ fn ran(what: &str, output: Output) -> Output {
   output
 }
 
+/// Checks a clone's changesets, the hidden ones too (`served_nodes`, a node a line): each `kept` node, by name, is
+/// among them, and no `rewritten` one is.
+fn assert_served_and_never_served(
+  served_nodes: &str,
+  kept: &[(&str, &str)],
+  rewritten: &[(&str, &str)],
+) {
+  for (name, kept) in kept {
+    assert!(served_nodes.contains(kept), "{name} served: {served_nodes}");
+  }
+  for (name, rewritten) in rewritten {
+    assert!(
+      !served_nodes.contains(rewritten),
+      "the rewritten {name} never served: {served_nodes}"
+    );
+  }
+}
+
 /// Goal 93's next completeness item (main's ruling of 2026-11-23). Do: with an evolution-enabled client, commit and push
 /// `a`; commit `b`, amend it, and push; commit `c` on `a`, rebase it onto the amended `b`, and push; clone the repository
 /// with evolution and list its markers and changesets. Expect each push to land; the clone to hold the amend's and the
@@ -186,22 +204,15 @@ fn an_evolution_clients_amend_and_rebase_land_with_their_markers() {
       .any(|line| line.starts_with(&old_c) && line.contains(&new_c)),
     "the rebase's marker: {markers}"
   );
-  for (name, kept) in [
-    ("a", &public_a),
-    ("b amended", &new_b),
-    ("c rebased", &new_c),
-  ] {
-    assert!(
-      served_nodes.contains(kept.as_str()),
-      "{name} served: {served_nodes}"
-    );
-  }
-  for (name, rewritten) in [("b", &old_b), ("c", &old_c)] {
-    assert!(
-      !served_nodes.contains(rewritten.as_str()),
-      "the rewritten {name} never served: {served_nodes}"
-    );
-  }
+  assert_served_and_never_served(
+    &served_nodes,
+    &[
+      ("a", &public_a),
+      ("b amended", &new_b),
+      ("c rebased", &new_c),
+    ],
+    &[("b", &old_b), ("c", &old_c)],
+  );
   let words = String::from_utf8_lossy(&pruned.stderr).into_owned() + &stdout(&pruned);
   assert!(
     !pruned.status.success(),
