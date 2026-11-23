@@ -21200,7 +21200,8 @@ fn read_journal(
 }
 
 /// Test support (A-270's oracle): whether the held pieces a restart would read from this shard's committed journal are
-/// exactly the ones it holds now ([`crate::content_holder::held_image`]), each delta's pieces folded over its
+/// exactly the ones it holds now ([`crate::content_holder::held_image`]), each paged family's pages read as their entries
+/// (A-870 piece 1), each delta's pieces folded over its
 /// checkpoint. Read after a publication commits, a missed change mark is a difference here before it is a lost record.
 pub(crate) fn committed_held_agrees(state: &ShardState) -> bool {
   let committed = match read_journal(state) {
@@ -21208,9 +21209,9 @@ pub(crate) fn committed_held_agrees(state: &ShardState) -> bool {
     Some(Ok((None, _))) | None => Vec::new(),
     Some(Err(_)) => return false,
   };
-  let mut held = crate::content_holder::held_image(state);
-  held.sort_by_key(|piece| piece.key);
-  committed == held
+  // Compared entry by entry: a paged family's pages differ by the history that made them (A-870 piece 1).
+  crate::content_holder::expanded(&committed)
+    == crate::content_holder::expanded(&crate::content_holder::held_image(state))
 }
 
 /// The shard's recovery images from its slice of the anchor content object (§4.8), by volume id, and the
@@ -21513,7 +21514,7 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
   }
   // The replicas this shard holds for other owners ride the same image (AUD-29-59): a holder acknowledges a
   // content put only once a publish carrying it commits.
-  let mut held = crate::content_holder::held_image(state);
+  let (mut held, pages) = crate::content_holder::held_image_paged(state);
   let whole = crate::content_holder::whole_of(&held);
   let owned = crate::content_holder::owned_of(&held);
   let mut replies = pending_replies(state);
@@ -21587,6 +21588,7 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
     .map(|id| id.bytes)
     .collect();
   crate::content_holder::held_committed(state, whole, true);
+  crate::content_holder::pages_committed(state, pages);
   crate::live_ship::owned_committed(state, owned, true);
   call_records_published(state);
   // Every volume captured: this image holds every logged write, so the write log empties, stamped with this
@@ -21979,6 +21981,7 @@ fn publish_delta_into(
     state.count(DELTA_HELD_BYTES, u64::try_from(carried).unwrap_or(u64::MAX));
   }
   crate::content_holder::held_committed(state, held.whole, false);
+  crate::content_holder::pages_committed(state, held.pages);
   crate::live_ship::owned_committed(state, held.owned, false);
   call_records_published(state);
   settle_write_log(state, &published.skipped, state.journal.generation());

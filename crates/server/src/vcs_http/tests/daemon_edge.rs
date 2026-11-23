@@ -4027,7 +4027,8 @@ fn a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows() {
 /// again, every reader bringing a let-go window back). Do: start a two-shard store-backed daemon with its edge; push a
 /// create of `main` at a commit whose one file is [`LET_GO_FILE`] bytes; then, with nothing let go by hand, clone `main`
 /// over the edge and list `HEAD` ([`LS_REFS_HEAD`]). Expect: the push `200`; the repository's shard counting landed bytes let go
-/// (`vcs_store.landed.let_go_bytes`) once the push ended, by its commit's own let-go; the clone `200`, its pack the
+/// once the push ended (`vcs_store.landed.let_go_bytes` by its commit's own let-go, or
+/// `vcs_store.homes.landed_let_go_bytes` where the pack's home there let it go first); the clone `200`, its pack the
 /// push's three objects; and the listing naming `HEAD` at the commit, `main` its target. Red with the guard (c9bb36dc5): nothing let go.
 #[test]
 fn a_pushed_pack_is_let_go_once_its_push_ends_and_a_clone_after_is_whole() {
@@ -4040,7 +4041,22 @@ fn a_pushed_pack_is_let_go_once_its_push_ends_and_a_clone_after_is_whole() {
   let edge = (port, &certificate);
   let (request, commit) = large_create(LET_GO_FILE);
   let created = pushed(edge, &name, &request);
-  let let_go = counted_on(&daemon, REPOSITORY, crate::vcs_store::LANDED_LET_GO_BYTES);
+  // Let go by the push's end, as the edge finishes its answer: by the owner's own let-go, or first by the pack's home
+  // where that is the repository's shard (`homes::landed_pack_here`, which records the windows and lets them go, so the
+  // owner finds them gone already). Which shard the pack's identity ranks varies run to run, so both count.
+  let let_go_bytes = || {
+    counted_on(&daemon, REPOSITORY, crate::vcs_store::LANDED_LET_GO_BYTES)
+      + counted_on(
+        &daemon,
+        REPOSITORY,
+        crate::vcs_store::homes::LANDED_HOME_LET_GO_BYTES,
+      )
+  };
+  let waited = std::time::Instant::now();
+  while let_go_bytes() == 0 && waited.elapsed() < Duration::from_secs(3) {
+    std::thread::sleep(Duration::from_millis(20));
+  }
+  let let_go = let_go_bytes();
   let fetched = uploaded(edge, &name, &fetch_of(commit));
   let listed = uploaded(edge, &name, LS_REFS_HEAD);
   daemon.stop();

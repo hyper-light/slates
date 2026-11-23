@@ -226,6 +226,62 @@ const KIND_VCS_LANDED_AT: u8 = 16;
 /// then the record's (the repository, the node, the path).
 const KIND_VCS_LANDED_HG: u8 = 17;
 
+/// Format: the piece kind of a page of one of the repository content store's or homes' paged families (A-870 piece 1,
+/// `crate::image_pages`): keyed by its family's byte and its depth, then its first coordinate; its bytes its entries,
+/// each as the piece of its own kind it would be alone (windows, lists, names, windows let go, region holds, landed
+/// records), which a restore expands and reads as before.
+const KIND_VCS_PAGE: u8 = 18;
+
+/// The key of `family`'s `page`.
+fn page_key(family: crate::image_pages::Family, page: crate::image_pages::Page) -> PieceKey {
+  let object: [u8; 16] = core::array::from_fn(|at| match at {
+    0 => family.byte(),
+    1 => page.depth,
+    _ => 0,
+  });
+  piece_key(KIND_VCS_PAGE, object, page.start)
+}
+
+/// The family and page a page piece's key names, none for a key of another kind or of no family.
+fn page_of_key(key: &PieceKey) -> Option<(crate::image_pages::Family, crate::image_pages::Page)> {
+  let (kind, object, start) = split_key(key);
+  (kind == KIND_VCS_PAGE).then_some(())?;
+  let family = crate::image_pages::Family::of_byte(*object.first()?)?;
+  let depth = *object.get(1)?;
+  Some((family, crate::image_pages::Page { depth, start }))
+}
+
+/// The paged family whose page a piece's key names, none for a piece of no page (A-870 piece 1): what a test sorts a
+/// delta's pieces by.
+#[cfg(test)]
+pub(crate) fn page_family(key: &PieceKey) -> Option<crate::image_pages::Family> {
+  page_of_key(key).map(|(family, _)| family)
+}
+
+/// Whether a piece of `kind` is an entry of a paged family (A-870): what a page carries, and what an image before
+/// A-870 carried one piece each.
+fn is_paged_entry_kind(kind: u8) -> bool {
+  matches!(
+    kind,
+    KIND_VCS_WINDOW
+      | KIND_VCS_LIST
+      | KIND_VCS_NAME
+      | KIND_VCS_REGION_HOLD
+      | KIND_VCS_AWAY
+      | KIND_VCS_LANDED_AT
+      | KIND_VCS_LANDED_HG
+  )
+}
+
+/// A content identity's coordinate in a paged family: its first eight bytes, big-endian, so coordinate order is identity
+/// order.
+fn coordinate_of(identity: &slates_vcs::ContentId) -> u64 {
+  identity
+    .0
+    .first_chunk::<8>()
+    .map_or(0, |bytes| u64::from_be_bytes(*bytes))
+}
+
 /// The key of a repository content store's piece of `kind` for `identity`: its first 24 bytes, as a held chunk's is.
 fn vcs_node_key(kind: u8, identity: &slates_vcs::ContentId) -> PieceKey {
   let object: [u8; 16] = identity.0[..16].try_into().unwrap_or_default();
@@ -322,6 +378,17 @@ fn split_key(key: &PieceKey) -> (u8, [u8; 16], u64) {
 /// of it must survive one: an acknowledged record a restarted holder no longer had would let its takeover promise count
 /// toward `f + 1` without it (Vertical Paxos II's acceptor; Raft, Figure 2: persistent state before responding).
 pub(crate) fn held_image(state: &ShardState) -> Vec<slates_vfs::recover::HeldPiece> {
+  held_image_paged(state).0
+}
+
+/// [`held_image`], and the paged families' directories its pages make (A-870 piece 1), adopted once the checkpoint
+/// carrying it commits ([`pages_committed`]).
+pub(crate) fn held_image_paged(
+  state: &ShardState,
+) -> (
+  Vec<slates_vfs::recover::HeldPiece>,
+  crate::image_pages::Directories,
+) {
   let mut pieces: Vec<slates_vfs::recover::HeldPiece> = whole_pieces(state)
     .into_iter()
     .map(|(key, bytes)| slates_vfs::recover::HeldPiece { key, bytes })
@@ -357,39 +424,12 @@ pub(crate) fn held_image(state: &ShardState) -> Vec<slates_vfs::recover::HeldPie
   for (object, held) in &state.merge.checkpoints {
     pieces.push(checkpoint_piece(*object, held));
   }
-  // Every repository window kept as a chunk of the shard's chunk store, its block named (A-727 slice a3).
-  if let Some(windows) = crate::vcs_store::chunk_windows(&state.vcs_stores) {
-    pieces.extend(windows.pieces().into_iter().map(|(handle, bytes)| {
-      slates_vfs::recover::HeldPiece {
-        key: piece_key(KIND_VCS_WINDOW, [0; 16], handle),
-        bytes,
-      }
-    }));
-  }
-  // The repository content store's lists, names and objects let go, so an object past a window is whole after a restart
-  // (a3b).
-  vcs_content_pieces(state, &mut pieces);
-  // What this shard keeps as a home: its region holds and its landed records, so they survive its restart.
-  vcs_home_pieces(&mut pieces);
-  pieces
-}
-
-/// The windows and objects this shard holds for the region (A-724 piece 8c) and where the windows landed packs carried
-/// lie on the node's store (goal 93 item 2b(b)), as held pieces, for [`held_image`].
-fn vcs_home_pieces(pieces: &mut Vec<slates_vfs::recover::HeldPiece>) {
-  for identity in crate::vcs_store::homes::region_held_here() {
-    pieces.push(slates_vfs::recover::HeldPiece {
-      key: vcs_node_key(KIND_VCS_REGION_HOLD, &identity),
-      bytes: identity.0.to_vec(),
-    });
-  }
-  for (identity, landed) in crate::vcs_store::homes::landed_here() {
-    let (kind, bytes) = landed_kind(&identity, &landed);
-    pieces.push(slates_vfs::recover::HeldPiece {
-      key: vcs_node_key(kind, &identity),
-      bytes,
-    });
-  }
+  // The repository content store's and homes' entries, a page a range of each family (A-870 piece 1): its windows
+  // kept as chunks (A-727 slice a3), lists, names and windows let go (a3b), region holds (A-724 piece 8c) and landed
+  // records (goal 93 item 2b(b)).
+  let (paged, directories) = paged_image(state);
+  pieces.extend(paged);
+  (pieces, directories)
 }
 
 /// The kind of the piece a landed record of the window `identity` is kept under, and its bytes: the identity, then the
@@ -406,29 +446,215 @@ fn landed_kind(
   (kind, [identity.0.as_slice(), &record].concat())
 }
 
-/// The repository content store's lists, names and objects let go as held pieces (a3b; A-851's windows let go), for
-/// [`held_image`].
-fn vcs_content_pieces(state: &ShardState, pieces: &mut Vec<slates_vfs::recover::HeldPiece>) {
-  if let Some(content) = state.vcs_stores.content() {
-    for (identity, bytes) in content.lists() {
-      pieces.push(slates_vfs::recover::HeldPiece {
-        key: vcs_node_key(KIND_VCS_LIST, &identity),
-        bytes: vcs_list_bytes(&identity, bytes),
-      });
-    }
-    for (identity, root) in content.names() {
-      pieces.push(slates_vfs::recover::HeldPiece {
-        key: vcs_node_key(KIND_VCS_NAME, &identity),
-        bytes: vcs_name_bytes(&identity, &root),
-      });
-    }
-    for (identity, len) in content.aways() {
-      pieces.push(slates_vfs::recover::HeldPiece {
-        key: vcs_node_key(KIND_VCS_AWAY, &identity),
-        bytes: vcs_away_bytes(&identity, len),
-      });
+/// The bytes a page of a paged family holds at most before it splits in two (A-870 piece 1, `crate::image_pages`): the
+/// shard's copy slice (the measured memcpy rate times a slice of the step quantum), or a test's on this shard's thread.
+fn page_bytes(state: &ShardState) -> usize {
+  #[cfg(test)]
+  {
+    let test = TEST_PAGE_BYTES.with(std::cell::Cell::get);
+    if test > 0 {
+      return test;
     }
   }
+  usize::try_from(state.config.copy_slice_bytes()).unwrap_or(usize::MAX)
+}
+
+#[cfg(test)]
+thread_local! {
+  /// A test's page size for the paged families on this shard's thread, in place of [`page_bytes`]'s where more than none.
+  pub(crate) static TEST_PAGE_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `family`'s entries whose coordinates lie in `lo..=hi`, in coordinate order, each as the piece it would be alone
+/// (A-870 piece 1).
+fn family_entries(
+  state: &ShardState,
+  family: crate::image_pages::Family,
+  (lo, hi): (u64, u64),
+) -> Vec<crate::image_pages::Entry> {
+  use crate::image_pages::Family;
+  let content = state.vcs_stores.content();
+  match family {
+    Family::Windows => crate::vcs_store::chunk_windows(&state.vcs_stores)
+      .map(|windows| windows.pieces_in(lo, hi))
+      .unwrap_or_default()
+      .into_iter()
+      .map(|(handle, bytes)| (handle, piece_key(KIND_VCS_WINDOW, [0; 16], handle), bytes))
+      .collect(),
+    Family::Lists => content.map_or_else(Vec::new, |content| {
+      content
+        .lists_in(lo, hi)
+        .map(|(identity, bytes)| {
+          (
+            coordinate_of(&identity),
+            vcs_node_key(KIND_VCS_LIST, &identity),
+            vcs_list_bytes(&identity, bytes),
+          )
+        })
+        .collect()
+    }),
+    Family::Names => content.map_or_else(Vec::new, |content| {
+      content
+        .names_in(lo, hi)
+        .map(|(identity, root)| {
+          (
+            coordinate_of(&identity),
+            vcs_node_key(KIND_VCS_NAME, &identity),
+            vcs_name_bytes(&identity, &root),
+          )
+        })
+        .collect()
+    }),
+    Family::Aways => content.map_or_else(Vec::new, |content| {
+      content
+        .aways_in(lo, hi)
+        .map(|(identity, len)| {
+          (
+            coordinate_of(&identity),
+            vcs_node_key(KIND_VCS_AWAY, &identity),
+            vcs_away_bytes(&identity, len),
+          )
+        })
+        .collect()
+    }),
+    Family::RegionHolds => crate::vcs_store::homes::region_held_in(lo, hi)
+      .into_iter()
+      .map(|identity| {
+        (
+          coordinate_of(&identity),
+          vcs_node_key(KIND_VCS_REGION_HOLD, &identity),
+          identity.0.to_vec(),
+        )
+      })
+      .collect(),
+    Family::Landed => crate::vcs_store::homes::landed_in(lo, hi)
+      .into_iter()
+      .map(|(identity, landed)| {
+        let (kind, bytes) = landed_kind(&identity, &landed);
+        (
+          coordinate_of(&identity),
+          vcs_node_key(kind, &identity),
+          bytes,
+        )
+      })
+      .collect(),
+  }
+}
+
+/// The coordinates of `family`'s entries kept or let go since the last committed publication: the pages a delta
+/// re-encodes lie there (A-870 piece 1).
+fn changed_coordinates(state: &ShardState, family: crate::image_pages::Family) -> Vec<u64> {
+  use crate::image_pages::Family;
+  let content = state.vcs_stores.content();
+  match family {
+    Family::Windows => crate::vcs_store::chunk_windows(&state.vcs_stores)
+      .map(|windows| windows.changed_handles())
+      .unwrap_or_default(),
+    Family::Lists => content.map_or_else(Vec::new, |content| {
+      content
+        .changes()
+        .0
+        .iter()
+        .map(|(identity, _)| coordinate_of(identity))
+        .collect()
+    }),
+    Family::Names => content.map_or_else(Vec::new, |content| {
+      content
+        .changes()
+        .1
+        .iter()
+        .map(|(identity, _)| coordinate_of(identity))
+        .collect()
+    }),
+    Family::Aways => content.map_or_else(Vec::new, |content| {
+      content
+        .away_changes()
+        .iter()
+        .map(|(identity, _)| coordinate_of(identity))
+        .collect()
+    }),
+    Family::RegionHolds => crate::vcs_store::homes::region_changes()
+      .iter()
+      .map(|(identity, _)| coordinate_of(identity))
+      .collect(),
+    Family::Landed => crate::vcs_store::homes::landed_changes()
+      .iter()
+      .map(|(identity, _, _)| coordinate_of(identity))
+      .collect(),
+  }
+}
+
+/// `family`'s page `page` holding `entries`, as a held piece.
+fn page_piece(
+  family: crate::image_pages::Family,
+  page: crate::image_pages::Page,
+  entries: &[crate::image_pages::Entry],
+) -> slates_vfs::recover::HeldPiece {
+  slates_vfs::recover::HeldPiece {
+    key: page_key(family, page),
+    bytes: crate::image_pages::encode_page(entries),
+  }
+}
+
+/// Every paged family planned afresh into pages (A-870 piece 1), as a checkpoint carries them: the page pieces, and
+/// the directories they make, adopted once the checkpoint commits.
+pub(crate) fn paged_image(
+  state: &ShardState,
+) -> (
+  Vec<slates_vfs::recover::HeldPiece>,
+  crate::image_pages::Directories,
+) {
+  let limit = page_bytes(state);
+  let mut pieces = Vec::new();
+  let mut directories = crate::image_pages::Directories::default();
+  for family in crate::image_pages::Family::ALL {
+    let entries = family_entries(state, family, (0, u64::MAX));
+    let planned = crate::image_pages::plan(&entries, crate::image_pages::Page::WHOLE, limit);
+    for (page, range) in &planned {
+      if let Some(held) = entries.get(range.clone()).filter(|held| !held.is_empty()) {
+        pieces.push(page_piece(family, *page, held));
+      }
+    }
+    directories.families.insert(
+      family,
+      crate::image_pages::Directory::of(planned.into_iter().map(|(page, _)| page)),
+    );
+  }
+  (pieces, directories)
+}
+
+/// What a delta carries of the paged families (A-870 piece 1): each page a change since the last committed publication
+/// lies in, re-encoded whole from what the shard holds now (put, or removed once empty), one past twice the page size
+/// split into the pages it now fills (its own key removed); and the pieces an image before A-870 kept one an entry,
+/// removed once. The directories as they now are, adopted once the delta commits.
+fn paged_changes(
+  state: &ShardState,
+  (put, removed): (&mut Vec<slates_vfs::recover::HeldPiece>, &mut Vec<PieceKey>),
+) -> crate::image_pages::Directories {
+  let limit = page_bytes(state);
+  let mut directories = state.published_held.pages.clone();
+  for family in crate::image_pages::Family::ALL {
+    let mut directory = directories.of(family);
+    for page in directory.plan_dirty(changed_coordinates(state, family)) {
+      let entries = family_entries(state, family, (page.start, page.last()));
+      let planned = if crate::image_pages::entries_bytes(&entries) > limit.saturating_mul(2) {
+        removed.push(page_key(family, page));
+        crate::image_pages::plan(&entries, page, limit)
+      } else {
+        vec![(page, 0..entries.len())]
+      };
+      for (into, range) in &planned {
+        match entries.get(range.clone()).filter(|held| !held.is_empty()) {
+          Some(held) => put.push(page_piece(family, *into, held)),
+          None => removed.push(page_key(family, *into)),
+        }
+      }
+      directory.replace(page, planned.into_iter().map(|(page, _)| page));
+    }
+    directories.families.insert(family, directory);
+  }
+  removed.extend(state.published_held.legacy.iter().copied());
+  directories
 }
 
 /// A held checkpoint's piece (A-404), keyed by its green.
@@ -529,6 +755,10 @@ pub(crate) struct PublishedHeld {
   whole: BTreeMap<PieceKey, Vec<u8>>,
   live: BTreeMap<ObjectId, (u64, u64)>,
   registers: BTreeMap<ObjectId, std::collections::BTreeSet<(ObjectId, u64)>>,
+  /// The paged families' pages as published (A-870 piece 1).
+  pages: crate::image_pages::Directories,
+  /// The entries an image before A-870 kept a piece each: removed by the next delta, which carries them in pages.
+  legacy: Vec<PieceKey>,
 }
 
 /// The held pieces a delta carries (A-270): those put and those removed since the last committed publication, and the
@@ -542,6 +772,8 @@ pub(crate) struct HeldChanges {
   pub(crate) whole: BTreeMap<PieceKey, Vec<u8>>,
   /// The kept pieces of owned live logs it changes (A-344), kept once it commits (`live_ship::owned_committed`).
   pub(crate) owned: Vec<([u8; 16], Option<crate::live_ship::OwnedLive>)>,
+  /// The paged families' directories as they now are, adopted once the delta commits (A-870 piece 1).
+  pub(crate) pages: crate::image_pages::Directories,
 }
 
 /// What a delta carries of held register `object` (A-367): its head, and the positions its acceptor names written (put
@@ -687,97 +919,6 @@ fn checkpoint_changes(
   }
 }
 
-/// The repository windows kept or let go since the last committed publication (A-727 slice a3): each kept put, each
-/// let go removed.
-fn vcs_window_changes(
-  state: &ShardState,
-  (put, removed): (&mut Vec<slates_vfs::recover::HeldPiece>, &mut Vec<PieceKey>),
-) {
-  if let Some(windows) = crate::vcs_store::chunk_windows(&state.vcs_stores) {
-    for (handle, piece) in windows.changes() {
-      let key = piece_key(KIND_VCS_WINDOW, [0; 16], handle);
-      match piece {
-        Some(bytes) => put.push(slates_vfs::recover::HeldPiece { key, bytes }),
-        None => removed.push(key),
-      }
-    }
-  }
-}
-
-/// The repository content store's lists and names kept or let go since then (a3b): each kept put, each let go removed.
-fn vcs_node_changes(
-  state: &ShardState,
-  (put, removed): (&mut Vec<slates_vfs::recover::HeldPiece>, &mut Vec<PieceKey>),
-) {
-  if let Some(content) = state.vcs_stores.content() {
-    let (lists, names) = content.changes();
-    for (identity, bytes) in lists {
-      let key = vcs_node_key(KIND_VCS_LIST, &identity);
-      match bytes {
-        Some(bytes) => put.push(slates_vfs::recover::HeldPiece {
-          key,
-          bytes: vcs_list_bytes(&identity, bytes),
-        }),
-        None => removed.push(key),
-      }
-    }
-    for (identity, root) in names {
-      let key = vcs_node_key(KIND_VCS_NAME, &identity);
-      match root {
-        Some(root) => put.push(slates_vfs::recover::HeldPiece {
-          key,
-          bytes: vcs_name_bytes(&identity, &root),
-        }),
-        None => removed.push(key),
-      }
-    }
-    for (identity, away) in content.away_changes() {
-      let key = vcs_node_key(KIND_VCS_AWAY, &identity);
-      match away {
-        Some(len) => put.push(slates_vfs::recover::HeldPiece {
-          key,
-          bytes: vcs_away_bytes(&identity, len),
-        }),
-        None => removed.push(key),
-      }
-    }
-  }
-}
-
-/// The landed records made or dropped since the last committed publication (goal 93 item 2b(b)): each made put, each
-/// dropped removed.
-fn vcs_landed_changes(
-  (put, removed): (&mut Vec<slates_vfs::recover::HeldPiece>, &mut Vec<PieceKey>),
-) {
-  for (identity, landed, made) in crate::vcs_store::homes::landed_changes() {
-    let (kind, bytes) = landed_kind(&identity, &landed);
-    let key = vcs_node_key(kind, &identity);
-    if made {
-      put.push(slates_vfs::recover::HeldPiece { key, bytes });
-    } else {
-      removed.push(key);
-    }
-  }
-}
-
-/// The region holds kept or let go since the last committed publication (A-724 piece 8c): each kept put, each let go
-/// removed.
-fn vcs_region_changes(
-  (put, removed): (&mut Vec<slates_vfs::recover::HeldPiece>, &mut Vec<PieceKey>),
-) {
-  for (identity, held) in crate::vcs_store::homes::region_changes() {
-    let key = vcs_node_key(KIND_VCS_REGION_HOLD, &identity);
-    if held {
-      put.push(slates_vfs::recover::HeldPiece {
-        key,
-        bytes: identity.0.to_vec(),
-      });
-    } else {
-      removed.push(key);
-    }
-  }
-}
-
 /// What a delta carries of the held pieces since the last committed publication (A-270): a whole piece whose bytes
 /// differ; of every register its tracked map marked, its head and the positions its acceptor accepted or dropped since
 /// (A-367), or, dropped whole, the head and every position published; and of a live copy, its head, the entries in slots
@@ -815,13 +956,10 @@ pub(crate) fn held_changes(state: &ShardState) -> HeldChanges {
   // The replica checkpoints this holder changed since the last committed publication (A-404): each kept now put, each
   // dropped removed.
   checkpoint_changes(state, (&mut put, &mut removed));
-  // The repository windows kept or let go since the last committed publication (A-727 slice a3).
-  vcs_window_changes(state, (&mut put, &mut removed));
-  // The repository content store's lists and names kept or let go since then (a3b).
-  vcs_node_changes(state, (&mut put, &mut removed));
-  // The region holds kept or let go since then (A-724 piece 8c), and the landed records made or dropped (2b(b)).
-  vcs_region_changes((&mut put, &mut removed));
-  vcs_landed_changes((&mut put, &mut removed));
+  // The repository content store's and homes' entries kept or let go since then, a page each change lies in (A-870
+  // piece 1): windows (A-727 slice a3), lists, names and windows let go (a3b), region holds (A-724 piece 8c) and landed
+  // records (goal 93 item 2b(b)).
+  let pages = paged_changes(state, (&mut put, &mut removed));
   // The live logs this shard ships whose kept piece this publication changes (A-344): each captured one at the position
   // its coming entry takes, and each marked; a log let go has its piece removed.
   let owned = crate::live_ship::owned_changes(state);
@@ -836,6 +974,7 @@ pub(crate) fn held_changes(state: &ShardState) -> HeldChanges {
     removed,
     whole,
     owned,
+    pages,
   }
 }
 
@@ -853,6 +992,14 @@ pub(crate) fn owned_of(
       Some((volume, Some(owned)))
     })
     .collect()
+}
+
+/// Adopts the paged families' directories a committed publication carried (A-870 piece 1): a checkpoint's planned afresh
+/// ([`held_image_paged`]), a delta's as its re-encoded pages left them ([`HeldChanges`]'s `pages`); the pieces an image
+/// before A-870 kept one an entry are gone once either commits.
+pub(crate) fn pages_committed(state: &mut ShardState, pages: crate::image_pages::Directories) {
+  state.published_held.pages = pages;
+  state.published_held.legacy.clear();
 }
 
 /// Adopts what a committed publication carried of the held pieces (A-270): `whole` as the published whole pieces, each
@@ -994,10 +1141,26 @@ pub(crate) fn published_from(pieces: &[slates_vfs::recover::HeldPiece]) -> Publi
         .insert((ObjectId(object), slot));
     }
   }
+  let mut pages: BTreeMap<crate::image_pages::Family, Vec<crate::image_pages::Page>> =
+    BTreeMap::new();
+  for (family, page) in pieces.iter().filter_map(|piece| page_of_key(&piece.key)) {
+    pages.entry(family).or_default().push(page);
+  }
   PublishedHeld {
     whole: whole_of(pieces),
     live,
     registers,
+    pages: crate::image_pages::Directories {
+      families: pages
+        .into_iter()
+        .map(|(family, pages)| (family, crate::image_pages::Directory::of(pages)))
+        .collect(),
+    },
+    legacy: pieces
+      .iter()
+      .filter(|piece| is_paged_entry_kind(split_key(&piece.key).0))
+      .map(|piece| piece.key)
+      .collect(),
   }
 }
 
@@ -1085,6 +1248,99 @@ impl From<slates_wire::WireError> for HeldRefused {
 /// A content hold's pieces by kind (A-376): its chunks', its manifests' and its stages' bytes.
 type PiecesByKind = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>);
 
+/// `pieces` with each paged family's page replaced by its entries, each the piece it would be alone, in key order (A-870
+/// piece 1): what an image holds whatever pages carry it, as a test compares one image with another. A page that does
+/// not decode is kept as it is, so a comparison sees it differ.
+pub(crate) fn expanded(
+  pieces: &[slates_vfs::recover::HeldPiece],
+) -> Vec<slates_vfs::recover::HeldPiece> {
+  let mut out: Vec<slates_vfs::recover::HeldPiece> = Vec::new();
+  for piece in pieces {
+    match (
+      split_key(&piece.key).0,
+      crate::image_pages::decode_page(&piece.bytes),
+    ) {
+      (KIND_VCS_PAGE, Some(entries)) => out.extend(
+        entries
+          .into_iter()
+          .map(|(key, bytes)| slates_vfs::recover::HeldPiece { key, bytes }),
+      ),
+      _ => out.push(piece.clone()),
+    }
+  }
+  out.sort_by_key(|piece| piece.key);
+  out
+}
+
+/// Reads one entry of a paged family (A-870 piece 1), a piece of `kind` at `slot` with `bytes`, into `held`: alone, as
+/// an image before A-870 carried it, or from a page. False for a kind of no paged family.
+fn absorb_paged_entry(
+  held: &mut RecoveredHeld,
+  (kind, slot): (u8, u64),
+  bytes: &[u8],
+) -> Result<bool, HeldRefused> {
+  match kind {
+    KIND_VCS_WINDOW => held.windows.push((slot, bytes.to_vec())),
+    KIND_VCS_LIST => {
+      let (identity, bytes) = bytes
+        .split_at_checked(slates_vcs::content::IDENTITY_BYTES)
+        .ok_or(HeldRefused::UnknownKind(kind))?;
+      let identity =
+        slates_vcs::ContentId::from_slice(identity).ok_or(HeldRefused::UnknownKind(kind))?;
+      held.lists.push((identity, bytes.to_vec()));
+    }
+    KIND_VCS_NAME => {
+      let (identity, root) = bytes
+        .split_at_checked(slates_vcs::content::IDENTITY_BYTES)
+        .ok_or(HeldRefused::UnknownKind(kind))?;
+      let identity =
+        slates_vcs::ContentId::from_slice(identity).ok_or(HeldRefused::UnknownKind(kind))?;
+      let root = slates_vcs::ContentId::from_slice(root).ok_or(HeldRefused::UnknownKind(kind))?;
+      held.names.push((identity, root));
+    }
+    KIND_VCS_LANDED_AT => {
+      let (identity, at) = bytes
+        .split_at_checked(slates_vcs::content::IDENTITY_BYTES)
+        .ok_or(HeldRefused::UnknownKind(kind))?;
+      let identity =
+        slates_vcs::ContentId::from_slice(identity).ok_or(HeldRefused::UnknownKind(kind))?;
+      let at =
+        crate::vcs_store::homes::LandedAt::from_bytes(at).ok_or(HeldRefused::UnknownKind(kind))?;
+      held
+        .landed
+        .push((identity, crate::vcs_store::homes::Landed::Pack(at)));
+    }
+    KIND_VCS_LANDED_HG => {
+      let (identity, hg) = bytes
+        .split_at_checked(slates_vcs::content::IDENTITY_BYTES)
+        .ok_or(HeldRefused::UnknownKind(kind))?;
+      let identity =
+        slates_vcs::ContentId::from_slice(identity).ok_or(HeldRefused::UnknownKind(kind))?;
+      let hg =
+        crate::vcs_store::homes::HgLanded::from_bytes(hg).ok_or(HeldRefused::UnknownKind(kind))?;
+      held
+        .landed
+        .push((identity, crate::vcs_store::homes::Landed::Hg(hg)));
+    }
+    KIND_VCS_REGION_HOLD => {
+      let identity =
+        slates_vcs::ContentId::from_slice(bytes).ok_or(HeldRefused::UnknownKind(kind))?;
+      held.region_holds.push(identity);
+    }
+    KIND_VCS_AWAY => {
+      let (identity, len) = bytes
+        .split_at_checked(slates_vcs::content::IDENTITY_BYTES)
+        .ok_or(HeldRefused::UnknownKind(kind))?;
+      let identity =
+        slates_vcs::ContentId::from_slice(identity).ok_or(HeldRefused::UnknownKind(kind))?;
+      let len = <[u8; 8]>::try_from(len).map_err(|_| HeldRefused::UnknownKind(kind))?;
+      held.aways.push((identity, u64::from_le_bytes(len)));
+    }
+    _ => return Ok(false),
+  }
+  Ok(true)
+}
+
 /// Splits a recovered image's held pieces (A-270), each live copy joined from its head and its entries in slot order.
 /// No pieces hold nothing; pieces that do not decode, or that leave a copy's entries short, are refused.
 pub(crate) fn split_held(
@@ -1149,66 +1405,19 @@ pub(crate) fn split_held(
         crate::merge_service::HeldCheckpoint::from_piece(&piece.bytes)
           .ok_or(HeldRefused::Checkpoint(object))?,
       )),
-      KIND_VCS_WINDOW => held.windows.push((slot, piece.bytes.clone())),
-      KIND_VCS_LIST => {
-        let (identity, bytes) = piece
-          .bytes
-          .split_at_checked(slates_vcs::content::IDENTITY_BYTES)
-          .ok_or(HeldRefused::UnknownKind(kind))?;
-        let identity =
-          slates_vcs::ContentId::from_slice(identity).ok_or(HeldRefused::UnknownKind(kind))?;
-        held.lists.push((identity, bytes.to_vec()));
+      // A paged family's page (A-870 piece 1): each entry read as the piece of its own kind it would be alone.
+      KIND_VCS_PAGE => {
+        let entries =
+          crate::image_pages::decode_page(&piece.bytes).ok_or(HeldRefused::UnknownKind(kind))?;
+        for (key, bytes) in entries {
+          let (kind, _, slot) = split_key(&key);
+          if !absorb_paged_entry(&mut held, (kind, slot), &bytes)? {
+            return Err(HeldRefused::UnknownKind(kind));
+          }
+        }
       }
-      KIND_VCS_NAME => {
-        let (identity, root) = piece
-          .bytes
-          .split_at_checked(slates_vcs::content::IDENTITY_BYTES)
-          .ok_or(HeldRefused::UnknownKind(kind))?;
-        let identity =
-          slates_vcs::ContentId::from_slice(identity).ok_or(HeldRefused::UnknownKind(kind))?;
-        let root = slates_vcs::ContentId::from_slice(root).ok_or(HeldRefused::UnknownKind(kind))?;
-        held.names.push((identity, root));
-      }
-      KIND_VCS_LANDED_AT => {
-        let (identity, at) = piece
-          .bytes
-          .split_at_checked(slates_vcs::content::IDENTITY_BYTES)
-          .ok_or(HeldRefused::UnknownKind(kind))?;
-        let identity =
-          slates_vcs::ContentId::from_slice(identity).ok_or(HeldRefused::UnknownKind(kind))?;
-        let at = crate::vcs_store::homes::LandedAt::from_bytes(at)
-          .ok_or(HeldRefused::UnknownKind(kind))?;
-        held
-          .landed
-          .push((identity, crate::vcs_store::homes::Landed::Pack(at)));
-      }
-      KIND_VCS_LANDED_HG => {
-        let (identity, hg) = piece
-          .bytes
-          .split_at_checked(slates_vcs::content::IDENTITY_BYTES)
-          .ok_or(HeldRefused::UnknownKind(kind))?;
-        let identity =
-          slates_vcs::ContentId::from_slice(identity).ok_or(HeldRefused::UnknownKind(kind))?;
-        let hg = crate::vcs_store::homes::HgLanded::from_bytes(hg)
-          .ok_or(HeldRefused::UnknownKind(kind))?;
-        held
-          .landed
-          .push((identity, crate::vcs_store::homes::Landed::Hg(hg)));
-      }
-      KIND_VCS_REGION_HOLD => {
-        let identity =
-          slates_vcs::ContentId::from_slice(&piece.bytes).ok_or(HeldRefused::UnknownKind(kind))?;
-        held.region_holds.push(identity);
-      }
-      KIND_VCS_AWAY => {
-        let (identity, len) = piece
-          .bytes
-          .split_at_checked(slates_vcs::content::IDENTITY_BYTES)
-          .ok_or(HeldRefused::UnknownKind(kind))?;
-        let identity =
-          slates_vcs::ContentId::from_slice(identity).ok_or(HeldRefused::UnknownKind(kind))?;
-        let len = <[u8; 8]>::try_from(len).map_err(|_| HeldRefused::UnknownKind(kind))?;
-        held.aways.push((identity, u64::from_le_bytes(len)));
+      kind if is_paged_entry_kind(kind) => {
+        absorb_paged_entry(&mut held, (kind, slot), &piece.bytes)?;
       }
       other => return Err(HeldRefused::UnknownKind(other)),
     }

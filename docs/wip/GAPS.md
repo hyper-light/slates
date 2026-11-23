@@ -103,6 +103,13 @@
 > daemon lets nothing go until (2b)(b), homes' own read-through, next). (2b)(b) BUILT (w-shared, A-724 piece 8c): the
 > pack's home records where each of its windows lies on the node's store (`homes::LandedAt`), lets it go and brings it
 > back on a read; the records ride the shard image, so a window with one is not pinned.
+> **A-870 (w-shared; main 01a20182's rulings of 2026-11-22 ~22:10 and ~22:30): a shard image's content-store families
+> published and restored over turns.** Piece 1 BUILT: the families paged (`crate::image_pages`): 3,000 windows let go
+> and 3,000 landed records rode 6,000 pieces, now 17 (534,085 bytes at a 43,912-byte page), restored whole. OWED: piece 2
+> (pages encoded ahead a slice a turn, a chunk freed under an unpublished page released at that page's commit, an
+> oracle of let-go, publish and crash; first, whether windows let go and records code as a range per object), piece 3
+> (pages restored a page a turn, reads waiting), and a 100k-file volume's longest image step measured against the step
+> budget (the volumes' images paged too only if past it).
 > **HELD (main 01a20182, 2026-11-22 15:40):** no landed pack is let go or owed from a push's commit (`vcs_store::commit`),
 > since r52 (the big Studio, main 6f6e87d82) found readers that do not bring a let-go window back: once git/git's push
 > ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's tag peel through

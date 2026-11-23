@@ -61271,3 +61271,42 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
 - **Applied in the same change to** `crates/merge` (`checkpoint`, `engine`, `engine/copy_checkpoint`, `history`, every
   restore's caller), `crates/server` (`verbs`, `merge_origin`, `vcs_store/svn_texts`, `repository/store_tests`), GAPS,
   amendments.tsv.
+
+### A-870 — A shard image's paged families, published and restored over turns (2026-11-22, w-shared; main 01a20182's rulings of ~22:10 and ~22:30 PST, goal 93; A-727 a3, A-724 piece 8c, A-767 C1 step 2b, A-64)
+
+- **Why.** The repository content store's and homes' entries rode the shard image one piece each: a window kept as a
+  chunk, a window let go, a list, a name, a region hold, a landed record. After a whole-history push that is hundreds
+  of thousands of pieces (arena-4 and arena-5, 2026-11-22: 138,989 windows let go, one piece each), each built and parsed
+  in the one call a publication or a restore makes. CI's x86 shard spun 1,040 ms in one poll publishing them, and the
+  watchdog ended the daemon (run 45110563116, after arena-3's restart). Bounded work is the rule whatever the volume.
+- **Three pieces, each red first** (main's ruling of ~22:30): (1) the families paged; (2) the pages encoded ahead of a
+  publication a slice a turn, the publication copying cached bytes, a chunk freed under a page not yet published
+  released only at that page's commit (A-64's rule, "a chunk is released only when no committed image names it", the
+  deferred list a page's bounded by its own entries, held by an oracle of let-go, publish and crash histories); (3) the
+  pages restored a page a turn, the content store's reads waiting until done. Before (2): whether windows let go and
+  landed records can be coded as a range per object, which cuts the count where whole objects go. Also owed: a volume
+  of about 100k files published and restored, its longest image step reported against the step budget, to decide
+  whether the volumes' images take the same pages.
+- **Piece 1, the pages (BUILT).** `crate::image_pages`: each family's entries are grouped into pages over their
+  coordinates (a content identity's first eight bytes, big-endian; a window's handle). A page is the aligned range whose
+  first `depth` bits are its start's, and its piece (`KIND_VCS_PAGE`, keyed by family, depth and start) carries every
+  entry of the family in that range, each as the piece of its own kind it would be alone (key and bytes), so a restore
+  expands a page and reads each entry through the parse it always had (`content_holder::absorb_paged_entry`). A page
+  past twice the page size splits into its halves; a page of no entry has no piece. The page size is the shard's copy
+  slice (`ServerConfig::copy_slice_bytes`: the measured memcpy rate times a slice of the step quantum), never a
+  constant. A checkpoint plans every family afresh (`content_holder::paged_image`); a delta re-encodes only the pages
+  its changes lie in, read back from the source maps by range (`ContentStore::{lists_in, names_in, aways_in}`,
+  `ChunkWindows::pieces_in`, `homes::{region_held_in, landed_in}`), and the directories it leaves are adopted at its
+  commit (`content_holder::pages_committed`). A recovered image's page keys are its directory; a coordinate in no page
+  takes the largest aligned page its neighbours leave. An image from before A-870, which kept an entry a piece, has
+  those keys removed by the next delta, once. The publication oracle (`verbs::committed_held_agrees`) compares images
+  entry by entry (`content_holder::expanded`), since pages differ by the history that made them.
+- **Evidence (piece 1).** `image_pages::tests::a_checkpoint_carries_many_entries_in_few_pieces_and_restores_them_whole`:
+  3,000 windows let go and 3,000 landed records. At main 86975794d the image was 6,000 pieces (red); with the pages it is
+  17 pieces, 534,085 bytes, at the test build's derived page size of 43,912 bytes (the Studio, 2026-11-23), every entry
+  read back. `a_delta_re_encodes_only_its_changes_pages_and_folds_to_the_shards_image`: at a 4,096-byte page, a delta of
+  one change carries a handful of pages, a mass let-go splits pages, each within twice the page size, and the folded
+  image equals the shard's entry by entry. `pages_cover_their_coordinates_and_hold_at_most_the_page_size` (200
+  generated plans) and `a_page_piece_reads_back_its_entries_and_refuses_what_no_page_wrote` (every cut, a count past the
+  bytes, another version). The pieces' encode is still one call per publication: piece 2 bounds it.
+

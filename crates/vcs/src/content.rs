@@ -791,24 +791,40 @@ impl ContentStore {
   /// Keeps an object's raw bytes as its windows and the lists naming them (module docs), every node the store holds
   /// already held once more instead of stored again; the root, held once more by the caller. The whole tree is admitted
   /// before any of it is kept: refused, nothing changed.
+  ///
+  /// A window the store holds let go stays let go: a put under a root or list held already holds it once more and
+  /// keeps nothing below it, so a record's replay after a warm restart takes its holds and leaves the windows the image
+  /// let go out of RAM (A-767 C1 step 2b). A put that must read whole is [`ContentStore::put_object_whole`].
   pub fn put_object(&mut self, bytes: &[u8]) -> Result<ContentId, ContentRefused> {
-    let root = self.put_object_root(bytes)?;
+    let root = self.put_object_root(bytes, false)?;
     Ok(self.named_object(ContentId::of(bytes), root))
   }
 
-  /// [`ContentStore::put_object`]'s tree: its root.
-  fn put_object_root(&mut self, bytes: &[u8]) -> Result<ContentId, ContentRefused> {
+  /// [`ContentStore::put_object`], and each of its windows the store holds let go brought back from `bytes`, which are
+  /// its own (codex-review, 2026-11-22): what a recovery that read a payload from the node's store puts, so the payload
+  /// reads whole by its identity, as a put that answers its identity promises. The windows are brought back first, so a
+  /// refusal takes no hold.
+  pub fn put_object_whole(&mut self, bytes: &[u8]) -> Result<ContentId, ContentRefused> {
+    let root = self.put_object_root(bytes, true)?;
+    Ok(self.named_object(ContentId::of(bytes), root))
+  }
+
+  /// [`ContentStore::put_object`]'s tree: its root; `whole`, each of its windows held let go brought back from `bytes`
+  /// ([`ContentStore::put_object_whole`]).
+  fn put_object_root(&mut self, bytes: &[u8], whole: bool) -> Result<ContentId, ContentRefused> {
     if bytes.len() <= self.window.get() {
       return self.put(bytes);
     }
     let tree = Tree::plan(bytes, self.window, self.fanout);
     let top = tree.levels.len().saturating_sub(1);
     let root = tree.root().ok_or(ContentRefused::NotHeld)?.identity;
-    // A window the store holds let go comes back from these bytes, which are its own: a put under a root or list held
-    // already holds it once more and keeps nothing below it, so without this a payload read from disk after a recovery
-    // put back only its new windows and read none of the rest (codex-review, 2026-11-22). First, so a refusal here
-    // leaves no hold taken.
-    self.bring_back_planned(&tree)?;
+    // A window the store holds let go comes back from these bytes, which are its own, where the put must read whole: a
+    // put under a root or list held already holds it once more and keeps nothing below it, so a payload read from disk
+    // after a recovery put back only its new windows and read none of the rest (codex-review, 2026-11-22). First, so a
+    // refusal here leaves no hold taken.
+    if whole {
+      self.bring_back_planned(&tree)?;
+    }
     let need = self.new_bytes(&tree, top)?;
     self.admit(need, 0)?;
     self.keep_tree(&tree, top)?;
@@ -1544,6 +1560,44 @@ impl ContentStore {
       let _ = self.release(&identity);
     }
     self.counters.freed.saturating_sub(freed_before)
+  }
+
+  /// The identities whose first eight bytes, read big-endian, lie in `lo..=hi`: one page of a shard image's paged
+  /// families (A-870), in identity order.
+  fn identities_in(lo: u64, hi: u64) -> core::ops::RangeInclusive<ContentId> {
+    let mut first = [0u8; IDENTITY_BYTES];
+    let mut last = [u8::MAX; IDENTITY_BYTES];
+    first[..8].copy_from_slice(&lo.to_be_bytes());
+    last[..8].copy_from_slice(&hi.to_be_bytes());
+    ContentId(first)..=ContentId(last)
+  }
+
+  /// [`ContentStore::lists`] whose identities' first eight bytes lie in `lo..=hi` (A-870: one page of the shard image).
+  pub fn lists_in(&self, lo: u64, hi: u64) -> impl Iterator<Item = (ContentId, &[u8])> + '_ {
+    self
+      .entries
+      .range(Self::identities_in(lo, hi))
+      .filter(|(_, held)| held.form == Form::List)
+      .filter_map(|(identity, held)| Some((*identity, held.here()?)))
+  }
+
+  /// [`ContentStore::names`] whose identities' first eight bytes lie in `lo..=hi` (A-870).
+  pub fn names_in(&self, lo: u64, hi: u64) -> impl Iterator<Item = (ContentId, ContentId)> + '_ {
+    self
+      .objects
+      .range(Self::identities_in(lo, hi))
+      .map(|(identity, root)| (*identity, *root))
+  }
+
+  /// [`ContentStore::aways`] whose identities' first eight bytes lie in `lo..=hi` (A-870).
+  pub fn aways_in(&self, lo: u64, hi: u64) -> impl Iterator<Item = (ContentId, u64)> + '_ {
+    self
+      .entries
+      .range(Self::identities_in(lo, hi))
+      .filter_map(|(identity, held)| match held.kept {
+        Kept::Away { len } => Some((*identity, u64::try_from(len).unwrap_or(u64::MAX))),
+        _ => None,
+      })
   }
 
   /// The lists the store keeps, each with its bytes (A-727 slice a3b): what the shard image carries whole beside the
@@ -3036,8 +3090,9 @@ mod tests {
   }
 
   /// A-767 C5 and A-863. A recovery has a pack's lists and the lengths of its released
-  /// windows. Put the bytes read from disk through the same rows API as Git replay, then read
-  /// the pack by identity. Both the one-window pack and the two-window pack must read whole.
+  /// windows. Put the bytes read from disk as Git's replay of a changeset read from the node's store puts them
+  /// (`rows::put_whole`), then read the pack by identity. Both the one-window pack and the two-window pack must read
+  /// whole.
   #[test]
   fn putting_a_payload_read_from_disk_restores_every_window_after_recovery() {
     for len in [NARROW, NARROW + 1] {
@@ -3057,7 +3112,7 @@ mod tests {
         .collect();
       assert_eq!(after.restore_nodes(lists, before.names().collect()), 0);
       assert!(after.object_bytes(&object, byte_count).is_none());
-      let put = crate::rows::put(&mut after, &bytes).unwrap();
+      let put = crate::rows::put_whole(&mut after, &bytes).unwrap();
       assert_eq!(put, object);
       assert_eq!(
         after
