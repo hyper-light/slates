@@ -157,6 +157,16 @@
 > and every clone (stock_git_verbs 1 of 8). Lifted when w-git's fetch-side readers (A-855's held answer, brought back and
 > made again) and the push decision's reads bring a let-go window back, with w-shared's red: annotated tags pushed, the
 > push ended, idle, then ls-remote and a clone byte-identical to stock.
+> **LIFT WITHDRAWN (w-git, 2026-11-23, main 01a20182's order after r18):** `vcs_store::LANDED_LET_GO` false again, every
+> landed let-go held (a commit's, a recovery's and a rebuild's). The lift surfaced a reader on main four times: the fetch
+> stream's choice and object reads (fixed, 0c3f42cea, 7f7793c58), the SSH edge's held answer (fixed, 56fbf0381), the
+> push's tag peel (`receive::works::tree_of` at works.rs:715: a tag of a let-go tag declined "an object it names cannot
+> be read", r18's verbs push-tag-of-a-tag and delete-tags), and a shallow fetch over HTTP refused
+> `Pack(Store(Unreadable { id: sha1:2a3c9b98… }))` (r18's verbs shallow), its path not yet found; and r18's HTTP mirror
+> clone stalled 120 s with 0 pack bytes, between 4c8b391ec and 09797375e (main's bisect cleared c20133168). Owed behind
+> the guard, red first: the tag peel bringing its window back; the shallow fetch's path; a sweep of every read of a
+> stored object in receive and upload for the same refusal; the stall. Re-lifting waits on git/git whole and verbs both
+> passing with it on. The re-lift's reds stay, ignored while it is withdrawn.
 > **r227's SSH regression FIXED (w-git, 2026-11-23):** with the lift, stock git's fetch over SSH ended mid-answer
 > (`unexpected disconnect while reading sideband packet`; on a made history, the shallow clone right after its
 > `packfile` header): an answer whose pack's choice read a let-go window is held for it (`Answer::held_away`) with its
@@ -969,9 +979,14 @@
 >   on (`Frame::based_later`, one bit a revision told when the framing is made), and every text the intake lets go is
 >   a later rebuild's buffer (`Spares`, at most four and the cache's bound). `push_heap`'s
 >   `a_pushs_churn_per_changeset_is_its_file_alone`, red at 28,855 B an edit of a 16 KiB file (1.76 copies), 177,497 B
->   of a 160 KiB one (1.08) with the buffer reused alone; now 12,047 B and 13,674 B (0.74, 0.08), no copy. Owed:
->   `HgIndex::revision_text`'s buffers and `object_bytes`, then `Taker::file_base`; the 57k push's reading
->   (`hg_push_lifetimes`, w-perf's) after them.
+>   of a 160 KiB one (1.08) with the buffer reused alone; now 12,047 B and 13,674 B (0.74, 0.08), no copy.
+>   `HgIndex::revision_text`'s rebuilds cut BUILT (2026-11-23, w-hg; C1 cut 2): each read rebuilt a chain into a text, a
+>   next text and a delta of its own, the whole it began from copied out by `object_bytes` grown from empty (w-perf:
+>   2.57 GB freed within a second under `push::held`, 1.24 GB in the band, `object_bytes` 0.62 GB). The index keeps its
+>   own next text and delta (`TextBuffers`), and a whole is read at its length (`object_text`), so a read allocates the
+>   text it hands out alone. `push_heap`'s `a_views_manifest_read_is_one_text`: red 194,487 B a read of a 91,200 B
+>   manifest (2.13 copies), now 105,500 B (1.16). Owed: `Taker::file_base`; the 57k push's reading (`hg_push_lifetimes`,
+>   w-perf's) after it.
 >   Its bound from the work BUILT (main's ruling, 2026-11-23): the chain no longer needs its texts held, so the cache holds
 >   the distinct texts its last `waiting` reads lent (one a waiting request, the owner's room) and a chunk's room
 >   (`TextCache::for_reads`), the least lately read out first; a text past it is lent from the buffer it was made into.
@@ -995,7 +1010,11 @@
 >   `every_block_has_an_owner_and_the_owners_sum_to_what_is_allocated` (`slates-mem`: 2,000 seeded steps of
 >   allocations, frees, trims and deferred frees against a model) and the memory status's test (the sum after a green's
 >   file is accepted). The greens' content is not in the arena (the merge engine's own heap), so arena-13's named part
->   was 184 MB, not 260. Owed: main's arena-15 to name the rest.
+>   was 184 MB, not 260. arena-15 (CI 45224166925) named it: 556,367,872 bytes held for repository windows of
+>   131,425,429. Since then the chunk store asks the arena for the caller's own length, not its page-rounded block
+>   (`ChunkArena::alloc_asking`), so a window owner's asked bytes against its held name the page rounding; held by
+>   `a_windows_ask_is_its_own_length_and_its_hold_the_page_it_takes` (red: asked 16,384 of 16,384 held for four windows
+>   of 100 bytes; now 400). The rounding's fix is the small-window slab (next piece).
 > - A Mercurial index's tail sealed by every append REVERTED (2026-11-23, w-perf; 0cd8ef36a reverted after main's
 >   arena-14, CI 45208924823: push-all's shard 0 spun past 1 s of CPU in `hg_push::segment` on all three legs and the
 >   watchdog killed the daemon). Each seal writes a run, and a push's fork never merges its runs (only the repository's
@@ -6206,6 +6225,20 @@
 > Beyond the goal's clauses, owed from this entry: the async form for the remaining verbs, the MCP list tools answering
 > a page at a time, and a merge's versions typed on the wire.
 
+> **The Node SDK's completion on Windows (2026-11-23, w-interop; A-875; found by CI run 45176536354's Windows legs):**
+> `async lifecycle over a live daemon` died with `CompletionLost { reason: "Unsupported fd type: UNKNOWN" }`. Node
+> adopts no Windows socket by descriptor (libuv's `uv_guess_handle`), and the SDK was handed the bridge's loopback
+> socket. **Built:** the Windows bridge signals the Node SDK through a named pipe that `async.mjs` opens by name
+> (`net.connect`), admitting only a reader of this process (`crates/ipc/src/completion_pipe.rs`). Python keeps the
+> socket. **Proven (windows-latest, main's diag runs):**
+> - Red at main (run 45225292920): "Unsupported fd type: UNKNOWN".
+> - With the change (run 45230459274, 20cd9025e): `slates-ipc`'s Windows completion and pipe tests pass, 8 of 8, with
+>   the other-process reader's. The addon builds, and "Unsupported fd type" is gone: the async lifecycle gets past its
+>   completion pipe to the daemon's first create.
+>
+> **Not yet green:** the Node suites on Windows. 4 of 8 pass. The 4 that fail, sync and async alike, are refused
+> `BudgetExceeded { available: 5722144768 }` at their first create. That is the Windows daemon's own sizing (w-win's
+> leftover item 3, now w-win2's), not this change. **Owed:** the SDK lane rerun once that lands, then windows-11-arm.
 > **The Node SDK suites on Windows (2026-11-18, §4.7 status "the Node SDK suites end on Windows"; goal 88).** The three
 > Node suites had never run on Windows: CI's `sdk` job ran on `ubuntu-latest` and `macos-latest` alone. Main's diag run
 > 44384411115 (main da697d886) ran them on both Windows runners, and the step went past 70 minutes until cancelled, with

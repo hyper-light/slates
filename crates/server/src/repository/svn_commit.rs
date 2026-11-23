@@ -1693,10 +1693,7 @@ impl<'b> Building<'b> {
       .beneath(from)
       .into_iter()
       .map(|(found, directory)| {
-        let len = self
-          .engine
-          .content(&found)
-          .map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        let len = self.engine.content(&found).map_or(0, |bytes| bytes.len());
         let stood = Stood {
           directory,
           len,

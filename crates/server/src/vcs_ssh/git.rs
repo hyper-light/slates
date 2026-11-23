@@ -126,6 +126,8 @@ pub(crate) struct UploadCommand<L: StoreLender> {
   last_away: Option<slates_git::store::packed::Waited>,
   /// What its answers have learned of the link (A-859 part A): nothing until a write of an answer waits for the client.
   pacing: crate::vcs_store::upload::Pacing,
+  /// When its answer began to wait for room (A-855), until the room grows or its patience runs out.
+  held_since: Option<u64>,
 }
 
 impl<L: StoreLender> UploadCommand<L> {
@@ -158,6 +160,7 @@ impl<L: StoreLender> UploadCommand<L> {
       admitted: 0,
       last_away: None,
       pacing: crate::vcs_store::upload::Pacing::default(),
+      held_since: None,
     }
   }
 
@@ -226,6 +229,70 @@ impl<L: StoreLender> UploadCommand<L> {
     Ok(())
   }
 
+  /// A turn of an answer held past its room (A-855; the HTTP edge's `Upload::wait_for_room`): where its repository's shard
+  /// now gives more room than it was admitted, the request answered again within it over the same generation, passing
+  /// over what it wrote ([`Answer::skip_written`]), counted `vcs_http.git.answered_again`; else a wait of a keepalive's
+  /// interval at most, until [`crate::vcs_share::wait::PATIENCE_NS`] has passed, when it gives up and its refusal is
+  /// answered as it was before.
+  async fn wait_for_room(&mut self) -> Result<(), Refused> {
+    let Self {
+      lender,
+      repository,
+      version,
+      admission,
+      request,
+      answer,
+      generation,
+      keepalive_ns,
+      admitted,
+      held_since,
+      ..
+    } = self;
+    let Some(made) = answer.as_mut() else {
+      return Ok(());
+    };
+    let now = slates_rt::futures::now_ns();
+    let room = lender.room(*repository).unwrap_or(0);
+    if room > *admitted
+      && let Some(held) = generation.as_ref()
+    {
+      let skip = made.written();
+      let mut wider = Admission::new(room);
+      let again = lender
+        .lend_held(held, |served, packs| {
+          upload::serve_in_turns(
+            served,
+            *version,
+            Asked::Request(request.as_slice()),
+            packs,
+            &mut wider,
+          )
+          .holding()
+          .skip_written(skip)
+        })
+        .ok_or_else(unheld)?;
+      *made = again;
+      *admission = wider;
+      *admitted = room;
+      *held_since = None;
+      let _ = crate::state::with_state_counted(|state| {
+        state.count(crate::vcs_http::git::upload::ANSWERED_AGAIN, 1);
+      });
+      return Ok(());
+    }
+    let patience_ns = crate::vcs_share::wait::PATIENCE_NS;
+    let since = *held_since.get_or_insert(now);
+    let waited = now.saturating_sub(since);
+    if waited >= patience_ns {
+      made.give_up();
+      return Ok(());
+    }
+    // A sleep the runtime refuses (no timer here) ends the wait early: the next turn asks again.
+    let _ =
+      slates_rt::futures::sleep((*keepalive_ns).min(patience_ns.saturating_sub(waited))).await;
+    Ok(())
+  }
+
   /// Answers `asked` once over the lent store (the module doc): the let-go window a read of its refused answer met, if
   /// one did.
   fn serve_once(
@@ -252,6 +319,11 @@ impl<L: StoreLender> UploadCommand<L> {
     *admitted = shard;
     let answered = |served: &Served<'_>, packs: &mut L::Packs, admission: &mut Admission| {
       let made = upload::serve_in_turns(served, *version, asked, packs, admission);
+      // A-855: a fetch's negotiation run past its room is held, not answered, until the room grows (`wait_for_room`).
+      let made = match asked {
+        Asked::Request(_) => made.holding(),
+        Asked::Advertise => made,
+      };
       let away = made.refusal().and(served.repository.waiting());
       (made, away)
     };
@@ -323,7 +395,8 @@ impl<L: StoreLender> UploadCommand<L> {
     // A-864's readers (main 01a20182's r227: the re-lift's SSH fetch of git/git ended mid-answer): an answer held for a
     // let-go window its pack's choice met, its sections written, is kept, not dropped as written; the next step brings
     // the window back and makes it again past what it wrote (`read_through_held`), as the HTTP edge does.
-    if written == Written::More || made.held_away().is_some() {
+    // A-855: an answer held for room, its keepalive written meanwhile, is kept for `wait_for_room`.
+    if written == Written::More || made.held_away().is_some() || made.held().is_some() {
       return Ok(Next::More);
     }
     // A refusal is the answer's to say, as it is made or as it is written (a pack's choice refused midway): its session
@@ -412,6 +485,15 @@ impl<L: StoreLender> Command for UploadCommand<L> {
         consumed: 0,
         next: Next::More,
       });
+    }
+    // A-855: an answer held for room waits for it, a keepalive's interval at a time, then writes (git's keepalive while
+    // it waits; its answer once made again within the wider room, or its refusal once its patience runs out).
+    if self
+      .answer
+      .as_ref()
+      .is_some_and(|made| made.held().is_some())
+    {
+      self.wait_for_room().await?;
     }
     if self.answer.is_some() {
       // A-864 piece 2: the windows the next turn reads brought back first, off the turn.

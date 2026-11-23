@@ -302,10 +302,13 @@ test('a synchronous call beside the async completion signal is woken by its repl
     });
     assert.equal(bootstrap.status, 0, bootstrap.stderr);
     const volume = client.create('sdk-node-beside', VOLUME_BYTES);
-    // The descriptor is a copy the caller owns (a net.Socket would adopt and close it); the signal keeps running. A
-    // Windows copy is a socket handle, which fs cannot close, so it is left to the process's end there.
-    const completion = client.completionFd();
-    if (process.platform !== 'win32') closeSync(completion);
+    // The signal starts and keeps running: on Unix a descriptor the caller owns (a net.Socket would adopt and close
+    // it), on Windows the name of the completion pipe `async.mjs` opens (A-875), which nothing here opens.
+    if (process.platform === 'win32') {
+      client.completionPipe();
+    } else {
+      closeSync(client.completionFd());
+    }
     client.spinFor(0);
     const [parksBefore] = client.parkRatio();
     const deadlineNs = BigInt(REPLY_NS);
