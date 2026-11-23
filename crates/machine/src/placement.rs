@@ -37,14 +37,14 @@
 //!
 //! **On Windows the OS places every shard (A-871, 84a).** Fixed to one CPU, a thread is readied onto that CPU alone,
 //! and Windows parks cores, puts idle ones in deep states and runs deferred procedure calls on them by its own power
-//! and interrupt policy, which a process does not own. On jupiter (a 16-core, 32-thread Ryzen desktop, Windows 11's
-//! Balanced plan, core parking's floor at half the cores; 2026-11-23) a daemon whose fifteen shards were fixed to the
-//! even logical CPUs had 399-446 of a quiet round's parked-shard wakes run over a millisecond after their kick, 27 of
-//! them over 16 ms, and the quiet edit-and-merge p999 reached 3.4-6.7 ms. Placed by the OS, the same daemon had 9-21
-//! such wakes and a p999 of 145-337 µs quiet and loaded; naming each shard's core as its ideal processor instead was
-//! even with that (135-359 µs), so the simpler rule stands. Which of the three held a fixed shard was not separated.
-//! Linux keeps the fixing above, and macOS takes it as the hint it always was: no measurement there has shown a fixed
-//! shard's wake held for its one CPU.
+//! and interrupt policy, which a process does not own. On jupiter (an AMD Ryzen AI Max+ 395, 16 cores and 32 threads,
+//! Windows 11's Balanced plan, core parking's floor at half the cores; 2026-11-23) a daemon whose fifteen shards were
+//! fixed to the even logical CPUs had 399-446 of a quiet round's parked-shard wakes run over a millisecond after their
+//! kick, 27 of them over 16 ms, and the quiet edit-and-merge p999 reached 3.4-6.7 ms. Placed by the OS, the same daemon
+//! had 9-21 such wakes and a p999 of 145-337 µs quiet and loaded; naming each shard's core as its ideal processor
+//! instead was even with that (135-359 µs), so the simpler rule stands. Which of the three held a fixed shard was not
+//! separated. Linux keeps the fixing above, and macOS takes it as the hint it always was: no measurement there has
+//! shown a fixed shard's wake held for its one CPU.
 //!
 //! Two daemons given one cpuset with no quota between them still share its cores. That is the one shape
 //! the facts cannot show, and it is an operator's to avoid: one daemon per machine, or a cpuset or a quota

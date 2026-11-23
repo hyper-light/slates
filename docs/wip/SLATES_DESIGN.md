@@ -1540,7 +1540,9 @@ that bought showed a 13% p50 win confined to the parked wake path against a loss
 kept behind a flag: the rule is replace, do not layer. macOS: kqueue with `EVFILT_USER` kicks and non-blocking socket I/O for the NFS
 server. Windows: IOCP with `PostQueuedCompletionStatus` kicks, a blocked wait raised one priority level for as long as it
 blocks (A-361: a completion port's waiter gets none of the wake boost an event's waiter gets, so a kicked shard waited
-out its neighbours' turns); WinFsp requests arrive on WinFsp's threads and are routed to the owning shard by handle. Simulation: a driver that replaces time,
+out its neighbours' turns), and a client's reply wait one level above normal for the wait (A-871: woken by its Event at
+the shards' own level, a client queued behind them); WinFsp requests arrive on WinFsp's threads and are routed to the
+owning shard by handle. Simulation: a driver that replaces time,
 randomness, sockets, rings, and the bridge with seeded in-process simulations for the whole
 cluster.
 
@@ -1776,9 +1778,18 @@ static CPU manager gives a Guaranteed pod with integer CPUs [B: Kubernetes, "Con
 Policies on the Node"]. A quota below the cpuset is a share of time on a pool other tenants share. There
 the OS places the shards, because fixed cores would stack every such daemon on the same CPUs. Seastar draws
 the same line with an operator's `overprovisioned` flag [C: seastar reactor_config.hh]; slates derives it
-from the facts. A refused pin is counted per shard and logged once where the OS pins. Two daemons given one
-cpuset with no quota between them still share its cores, which the facts cannot show: give each daemon its
+from the facts. A refused pin is counted per shard and logged once where the OS pins. On Windows the OS places every
+shard (A-871): a thread fixed to one CPU is readied onto that CPU alone, and Windows parks, deep-idles and interrupts
+its CPUs by a power and interrupt policy the process does not own (`slates_machine::placement::Fixing`). Two daemons
+given one cpuset with no quota between them still share its cores, which the facts cannot show: give each daemon its
 own machine, cpuset or quota.
+
+> **Status (2026-11-23, A-871: on Windows the OS places every shard).** On jupiter (Ryzen AI Max+ 395, 32 threads,
+> Windows 11 Balanced with core parking, 64 spinners in the bench's process) shards fixed to the even logical CPUs had
+> 399-446 parked-shard wakes over a millisecond after their kick a quiet round, 27 over 16 ms, and quiet p999s up to
+> 6.7 ms; placed by the OS, 9-21 such wakes and p999 145-337 µs quiet and loaded (with the client's raise, §4.7).
+> Naming each shard's core as its ideal processor was even with that, so the simpler rule landed. The wake probe
+> follows the same rule, so it measures the placement production runs. BENCHMARKS "84a on Windows bare metal".
 
 > **Status (2026-09-29, A-41: shards are fixed only to cores the process owns).** The facts listed a Linux
 > process's cores as `0..available_parallelism()`, a count a CPU quota lowers and that names no core. Every

@@ -22,18 +22,18 @@
 //! second), and asked the daemon's liveness there, so a call whose daemon died waited up to that second to learn it.
 //! [`ClientEnd::wait`] keeps its caller's deadline and asks nothing of the daemon.
 //!
-//! **A Windows client waits for its reply one priority level above normal (A-871, 84a).** Windows wakes the waiter of an
-//! Event one level above its base, so a normal-level client woke at the level of the shards that answer it (one above
-//! normal since A-361 and A-834), and Windows lets neither of two threads at one level take the other's CPU. A woken
-//! client queued behind whatever thread at its level held the CPU it was readied on, a shard still serving or load of
-//! its own level, until that one stopped or a quantum ended elsewhere. On a 32-thread Ryzen desktop (jupiter, Windows 11,
-//! 64 spinning threads in the bench's own process, 2026-11-23) 245-492 replies a round were taken over a millisecond
-//! after their publication, up to 70.8 ms, and the loaded edit-and-merge p999 was 5.5-6.5 ms. Waiting one level above
-//! normal, the woken client stands one above the shards: 2 such replies a round, loaded p999 192-293 µs, p99 132-182
-//! µs (interleaved, BENCHMARKS "84a on Windows bare metal"). The level is the waiting thread's own, raised as the wait
-//! begins and put back when it ends, so the caller's thread runs its own work at the level it had; a thread at any
-//! other level is left as it is, and a job that fixes its threads' levels leaves the call a no-op. No privilege is asked
-//! (R10).
+//! **A Windows client waits for its reply one priority level above normal (A-871, 84a).** Windows wakes the waiter of
+//! an Event one level above its base, so a normal-level client woke at the level of the shards that answer it (one
+//! above normal since A-361 and A-834), and Windows lets neither of two threads at one level take the other's CPU. A
+//! woken client queued behind whatever thread at its level held the CPU it was readied on, a shard still serving or
+//! load of its own level, until that one stopped or a quantum ended elsewhere. On jupiter (an AMD Ryzen AI Max+ 395, 32
+//! threads, Windows 11, 64 spinning threads in the bench's own process, 2026-11-23) 245-492 replies a round were taken
+//! over a millisecond after their publication, up to 70.8 ms, and the loaded edit-and-merge p999 was 5.5-6.5 ms.
+//! Waiting one level above normal, the woken client stands one above the shards: 2 such replies a round, loaded p999
+//! 192-293 µs, p99 132-182 µs (interleaved, BENCHMARKS "84a on Windows bare metal"). The level is the waiting thread's
+//! own, raised as the wait begins and put back when it ends, so the caller's thread runs its own work at the level it
+//! had; a thread at any other level is left as it is, and a job that fixes its threads' levels leaves the call a no-op.
+//! No privilege is asked (R10).
 
 #[cfg(target_os = "linux")]
 use std::os::fd::AsFd;
@@ -1811,7 +1811,12 @@ mod departure {
         }
         std::thread::yield_now();
       };
-      while daemon.region().client_parked()?.load(Ordering::Acquire) == 0 {
+      while daemon
+        .region()
+        .client_parked()?
+        .load(std::sync::atomic::Ordering::Acquire)
+        == 0
+      {
         std::thread::yield_now();
       }
       // SAFETY: the waiting thread's real handle, live until it is closed just below.
