@@ -370,3 +370,23 @@ Landed 6b36e0269. Two pieces, each red-first:
   - Focused: server 77/77, hg 133/133.
 Next: main reruns the arena lane (the pin is gone), then the changelog/manifest move (replay and intake first).
 Main's heavier asks: CI hg matrix plus the arena diag at 6b36e0269 (push-all arena and RSS; landed_texts_brought_back).
+
+## 2026-11-22 ~22:00 PST: plan to the bar (Ada via main): peak RSS ~410 MiB on the 57,054-changeset matrix
+Numbers are from CI 45101827617 (before 2b(b); arm64, after push-all) unless marked "est." (my estimate, to be
+replaced by arena-3's read at 6b36e0269). Each term is held at the peak; the budget share is what it must fit.
+Ordered by bytes now:
+| # | Term | Now | Share of 410 MiB | Piece |
+|---|------|-----|------------------|-------|
+| 1 | Content arena, shard 0 (file texts pinned, plus index rows, changelog, manifests) | 2,535 MiB allocated | <=120 MiB | 2b(b) landed: pinned texts go after commit. Remainder = rows + changelog + manifests (terms 4-6) |
+| 2 | Allocator slack: heap freed but resident, arena mappings reserved | heap 1.0 GB reserved / 435 MB used (~600 MB slack); 41 arena mappings 2.89 GB reserved; idle RSS 3,742 MiB | <=40 MiB | Give pages back when a push, clone or import ends (the allocator's purge / decommit of empty arena runs). Needs main's read of resident vs allocated per mapping |
+| 3 | Heap in use, unattributed | 435 MB | <=80 MiB | Attribute first (main's heap profile at the peak and after push-all), then cut whatever dominates |
+| 4 | Intake per-push structures, whole push (Run.contents FileContents ~112 B + path per file revision; Taker brought/awaited/positions/manifest_of; Intaken changesets/logs) | est. ~100+ MB in push-all | <=30 MiB, bounded by a segment | Bound per segment, not history: no FileContents list (walk the fork's file rows at commit to note); awaited checked a window a step against the fork; brought/positions shed as segments land |
+| 5 | Manifests in the content store | est. 50-300 MB | <=60 MiB | Changelog/manifest move off the content store (replay, then intake, then works/made/verify, then getbundle, then kept_as/Rebase), only if arena-3 shows they dominate term 1's remainder |
+| 6 | Index rows and runs (all logs' rows in content store windows) | est. ~60 MB (~150 B a row) | <=60 MiB | Measure; if over, page cold rows out to the store, as texts are |
+| 7 | Changelog texts | est. ~25 MB | in 5's share | With 5 |
+| 8 | Segment working set (payload slice + its texts) | one segment_bytes, est. a few MB | <=10 MiB | Already bounded by segment_bytes |
+| 9 | Clone encoding (getbundle Named a unit a step; stream rows_a_step) | est. <10 MB | <=10 MiB | Already bounded a step; confirm the peak during clone rows |
+Order of work: arena-3 read -> 2 (slack, the largest lever after 2b(b)) and 3 (attribution), with main's measurements -> 4 (push bounded by its work) -> 5/7 if they dominate -> 6.
+Flake (main's 22:00): a_cleanly_restarted_import_brings_back_no_named_text. checkpoint_green defers to a
+checkpoint_in_turns task under load and the test stops first, so the pre-pass rightly brings back 13. A test/doc fix;
+sent to main and w-svn.
