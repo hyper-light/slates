@@ -227,6 +227,9 @@ pub struct Verdicts<'w, G: ?Sized, R: ?Sized, O> {
   room: u64,
   /// A command's work built over the turns before its verdict ([`Verdicts::prepare`]), which its verdict takes.
   prepared: Cell<Option<Preparing>>,
+  /// Where in its pack the let-go window a command's peel last stopped for lies ([`Verdicts::peel_away`]), kept by the
+  /// push across its turns: the same window met again, not brought back, lets the command go on to its refusal.
+  away_seen: Cell<Option<u64>>,
 }
 
 /// A command's work built a unit at a time over the turns before its verdict (A-752; §4.3's step budget): a push over
@@ -333,7 +336,19 @@ where
       name,
       room,
       prepared: Cell::new(None),
+      away_seen: Cell::new(None),
     }
+  }
+
+  /// These verdicts, the let-go window a peel last stopped for `away_seen` ([`Verdicts::away_seen`]).
+  pub fn peeled(self, away_seen: Option<u64>) -> Self {
+    self.away_seen.set(away_seen);
+    self
+  }
+
+  /// Where the let-go window a peel stopped for lies, for the push to keep across its turns ([`Verdicts::peeled`]).
+  pub fn away_seen(&self) -> Option<u64> {
+    self.away_seen.get()
   }
 
   /// These verdicts, taking the work `prepared` built for its command, where it is done and still that command's.
@@ -360,6 +375,12 @@ where
     // the greens its verdict will read, so the owner can make any that owes its own push before the verdict reads it.
     if command.is_delete() {
       return true;
+    }
+    // A-864's push readers (main 01a20182's r18: a push of a tag of a tag declined "an object it names cannot be read",
+    // the tag it names read from a pack let go): a peel of the new value whose read met a let-go window is not ready, so
+    // the push's driver brings the window back (`brought_back_waited`) and the command is prepared again, never declined.
+    if self.peel_away(command, pushed) {
+      return false;
     }
     if command.is_create() {
       self.reach_create(command, pushed);
@@ -588,6 +609,25 @@ where
       tree: key(&tree, &command.name)?,
       head: Some(command.new.as_bytes()),
     })
+  }
+
+  /// Whether `command`'s new value cannot yet be peeled to its tree because a read of the chain met a let-go window (the
+  /// repository names where, [`Repository::away`]): the window is to be brought back, not the ref declined.
+  /// The same window met again with nothing brought back between is not waited for: the command goes on to its refusal,
+  /// so a window that cannot be brought back ends the push typed, never holds it.
+  fn peel_away(&self, command: &Command, pushed: &Pushed<'_>) -> bool {
+    if self.tree_of(&command.new, pushed, &command.name).is_ok() {
+      self.away_seen.set(None);
+      return false;
+    }
+    let Some(at) = self.repository.away() else {
+      return false;
+    };
+    if self.away_seen.get() == Some(at) {
+      return false;
+    }
+    self.away_seen.set(Some(at));
+    true
   }
 
   /// The tree the object `head` names, as git peels a ref (A-836: a ref may name any object): a commit's; a tree itself;

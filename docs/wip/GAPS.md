@@ -178,9 +178,16 @@
 > be read", r18's verbs push-tag-of-a-tag and delete-tags), and a shallow fetch over HTTP refused
 > `Pack(Store(Unreadable { id: sha1:2a3c9b98… }))` (r18's verbs shallow), its path not yet found; and r18's HTTP mirror
 > clone stalled 120 s with 0 pack bytes, between 4c8b391ec and 09797375e (main's bisect cleared c20133168). Owed behind
-> the guard, red first: the tag peel bringing its window back; the shallow fetch's path; a sweep of every read of a
-> stored object in receive and upload for the same refusal; the stall. Re-lifting waits on git/git whole and verbs both
-> passing with it on. The re-lift's reds stay, ignored while it is withdrawn.
+> the guard, red first: the shallow fetch's path (main's r130: verbs over git/git with the lift on, inbox
+> main-from-w-git-shallow-lift.md); a sweep of every read of a stored object in receive and upload for the same refusal;
+> the stall (r89: at the guard too, git/git's HTTP push past its patience, so not the lift; main's r108 bisects
+> 4c8b391ec..09797375e). Re-lifting waits on git/git whole and verbs both passing with it on. The re-lift's reds stay,
+> ignored while it is withdrawn. The tag peel FIXED (6eae9f8bb): `Verdicts::prepare` answers not ready where the new
+> value's peel fails and the repository names a let-go window (`Repository::away`), the push's driver bringing it back;
+> the same window twice ends in the typed refusal. Red at the session: git_correctness's verbs on a six-commit dataset
+> with the lift on locally failed push-tag-of-a-tag, delete-tags and both refs rows; all pass after; at the guard r89's
+> verbs over git/git pass all 26. Owed: its unit red at the edge (a push of a tag of a tag over a pack let go by hand
+> did not reach the miss).
 > **r227's SSH regression FIXED (w-git, 2026-11-23):** with the lift, stock git's fetch over SSH ended mid-answer
 > (`unexpected disconnect while reading sideband packet`; on a made history, the shallow clone right after its
 > `packfile` header): an answer whose pack's choice read a let-go window is held for it (`Answer::held_away`) with its
@@ -999,8 +1006,15 @@
 >   2.57 GB freed within a second under `push::held`, 1.24 GB in the band, `object_bytes` 0.62 GB). The index keeps its
 >   own next text and delta (`TextBuffers`), and a whole is read at its length (`object_text`), so a read allocates the
 >   text it hands out alone. `push_heap`'s `a_views_manifest_read_is_one_text`: red 194,487 B a read of a 91,200 B
->   manifest (2.13 copies), now 105,500 B (1.16). Owed: `Taker::file_base`; the 57k push's reading (`hg_push_lifetimes`,
->   w-perf's) after it.
+>   manifest (2.13 copies), now 105,500 B (1.16).
+>   `Taker::file_base`'s cached bases cut BUILT (2026-11-23, w-hg; C1 cut 3): a base the push's cache held was copied
+>   out whole for the step that read it, and the cache kept it to its group's end, though no delta after its last user
+>   asked for it, so no buffer came back and every rebuild allocated. Now the step reads a cached base where it lies
+>   (`Based::Cached`, `Taker::base_text`), and the cache lets a base go once the last delta of its group resting on it
+>   is taken (`Frame::last_on_base`, a second bit a revision told with the first), its buffer a later rebuild's.
+>   `push_heap`'s `a_cached_file_base_is_read_where_it_lies` (one 160 KiB file on two interleaved lines, each delta on
+>   the revision two back): red 176,689 B a revision (1.08 copies), now 12,887 B (0.08). Owed: the 57k push's reading
+>   after the three cuts (`hg_push_lifetimes`, w-perf's).
 >   Its bound from the work BUILT (main's ruling, 2026-11-23): the chain no longer needs its texts held, so the cache holds
 >   the distinct texts its last `waiting` reads lent (one a waiting request, the owner's room) and a chunk's room
 >   (`TextCache::for_reads`), the least lately read out first; a text past it is lent from the buffer it was made into.
