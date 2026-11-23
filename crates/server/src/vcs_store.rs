@@ -693,6 +693,17 @@ impl VcsStores {
     self.entries.get(&id)
   }
 
+  /// The repositories whose git store this shard holds: a test's way to its repository's id from the shard.
+  #[cfg(test)]
+  pub(crate) fn git_repositories(&self) -> Vec<RepositoryId> {
+    self
+      .entries
+      .iter()
+      .filter(|(_, store)| matches!(store, RepositoryStore::Git(_)))
+      .map(|(id, _)| *id)
+      .collect()
+  }
+
   /// Repository `id`'s git store with the content store, lent for one step.
   pub(crate) fn git(&mut self, id: RepositoryId) -> Option<(&mut ContentStore, &mut GitStore)> {
     if self.rebuild_turns.contains_key(&id) {

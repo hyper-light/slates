@@ -196,6 +196,15 @@ fn tls_client(
   port: u16,
   certificate: &CertificateDer<'static>,
 ) -> StreamOwned<ClientConnection, ClientStream> {
+  tls_client_within(port, certificate, Duration::from_nanos(PATIENCE_NS))
+}
+
+/// [`tls_client`], its reads waiting at most `patience` for an answer.
+fn tls_client_within(
+  port: u16,
+  certificate: &CertificateDer<'static>,
+  patience: Duration,
+) -> StreamOwned<ClientConnection, ClientStream> {
   let mut roots = RootCertStore::empty();
   roots
     .add(certificate.clone())
@@ -214,7 +223,7 @@ fn tls_client(
   let socket = ClientStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
     .expect("the edge's listener takes the connection");
   socket
-    .set_read_timeout(Some(Duration::from_nanos(PATIENCE_NS)))
+    .set_read_timeout(Some(patience))
     .expect("a read timeout");
   StreamOwned::new(connection, socket)
 }
@@ -460,7 +469,22 @@ fn typed_exchange(
   certificate: &CertificateDer<'static>,
   request: &[u8],
 ) -> (u16, String, Vec<u8>) {
-  let mut stream = tls_client(port, certificate);
+  typed_exchange_within(
+    port,
+    certificate,
+    request,
+    Duration::from_nanos(PATIENCE_NS),
+  )
+}
+
+/// [`typed_exchange`], waiting at most `patience` for each read of its answer.
+fn typed_exchange_within(
+  port: u16,
+  certificate: &CertificateDer<'static>,
+  request: &[u8],
+  patience: Duration,
+) -> (u16, String, Vec<u8>) {
+  let mut stream = tls_client_within(port, certificate, patience);
   stream.write_all(request).expect("the request is sent");
   let mut head = Vec::new();
   while !head.ends_with(b"\r\n\r\n") {
@@ -939,6 +963,166 @@ fn a_fetch_whose_let_go_window_the_store_never_answers_fails_cleanly_within_its_
     "no whole pack answered from windows the store never gave back"
   );
   assert!(unanswered > 0, "each refusal counted");
+}
+
+/// Shape: the annotated tags [`a_push_of_annotated_tags_is_listed_and_fetched_whole_once_its_pack_is_landed`] pushes,
+/// each after a file of [`TAGGED_FILE_BYTES`] in its pack, so each lies in a window of its own.
+const TAGS: usize = 4;
+/// Shape: the bytes of each file before a tag in that test's pack: past a window of the content store (256 KiB).
+const TAGGED_FILE_BYTES: usize = 400 * 1024;
+
+/// Stock git's request creating `main` at a root commit of [`TAGS`] files and an annotated tag `refs/tags/t<k>` of it
+/// for each, the pack laid out commit, tree, then each file followed by its tag; the commit, and each tag's name.
+fn tagged_create() -> (Vec<u8>, ObjectId, Vec<ObjectId>) {
+  use slates_git::object_name::Kind;
+  let mut state = 0x2545_f491_4f6c_dd1du64;
+  let files: Vec<Vec<u8>> = (0..TAGS)
+    .map(|_| {
+      (0..TAGGED_FILE_BYTES)
+        .map(|_| {
+          state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+          state.to_be_bytes()[0]
+        })
+        .collect()
+    })
+    .collect();
+  let mut tree = Vec::new();
+  for (at, file) in files.iter().enumerate() {
+    tree.extend_from_slice(format!("100644 f{at}\0").as_bytes());
+    tree.extend_from_slice(git_name(Kind::Blob, file).as_bytes());
+  }
+  let tree_id = git_name(Kind::Tree, &tree);
+  let commit = format!(
+    "tree {tree_id}\nauthor A <a@example.com> 1700000000 +0000\n\
+     committer A <a@example.com> 1700000000 +0000\n\ntagged\n"
+  )
+  .into_bytes();
+  let commit_id = git_name(Kind::Commit, &commit);
+  let tags: Vec<Vec<u8>> = (0..TAGS)
+    .map(|at| {
+      format!(
+        "object {commit_id}\ntype commit\ntag t{at}\ntagger A <a@example.com> 1700000000 +0000\n\ntag {at}\n"
+      )
+      .into_bytes()
+    })
+    .collect();
+  let tag_ids: Vec<ObjectId> = tags.iter().map(|tag| git_name(Kind::Tag, tag)).collect();
+  let mut objects: Vec<(Kind, &[u8])> = vec![(Kind::Commit, &commit), (Kind::Tree, &tree)];
+  for (file, tag) in files.iter().zip(&tags) {
+    objects.push((Kind::Blob, file));
+    objects.push((Kind::Tag, tag));
+  }
+  let mut request = Vec::new();
+  let line = format!("{ZERO} {commit_id} refs/heads/main\0 report-status");
+  pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("the command");
+  for (at, tag) in tag_ids.iter().enumerate() {
+    let line = format!("{ZERO} {tag} refs/tags/t{at}");
+    pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("a command");
+  }
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request.extend_from_slice(&stored_pack(&objects));
+  (request, commit_id, tag_ids)
+}
+
+/// Goal 93 item 2b(a) (main 01a20182's r52, 2026-11-22: once git/git's push ended its landed pack was let go, and every
+/// fetch of it failed, ls-remote and clone alike, "aborting due to possible repository corruption on the remote side":
+/// the advertisement's tag peel read a window let go, `Unreadable`, where no read brings it back). Do: on a two-shard
+/// daemon with its edge, push as stock git posts it a commit of [`TAGS`] files and an annotated tag of it for each, each
+/// tag in a window of its own; wait for the push's end to run its landed let-go (counted, or 3 s), and let the
+/// repository go idle (`git_encode::give_back_idle`: the objects its reads keep given back); then, as `git ls-remote`
+/// and `git clone` ask at protocol v2, list every ref with its peel and fetch the commit and every tag.
+/// Expect: the push `200`, every ref `ok`; the listing exactly `main` and each tag peeled to the commit; the fetch `200`,
+/// its pack every object pushed. Failing first: the tags' windows let go, the listing refused.
+#[test]
+fn a_push_of_annotated_tags_is_listed_and_fetched_whole_once_its_pack_is_landed() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, commit, tags) = tagged_create();
+  let created = pushed(edge, &name, &request);
+  // The push's end runs its landed let-go (its `ReceivePack` dropped) as the edge finishes its answer.
+  let waited = std::time::Instant::now();
+  while counted_on(&daemon, REPOSITORY, crate::vcs_store::LANDED_LET_GO_BYTES) == 0
+    && waited.elapsed() < Duration::from_secs(3)
+  {
+    std::thread::sleep(Duration::from_millis(20));
+  }
+  // Then the repository goes idle, as it does once no fetch of it is answered: what its reads keep of the objects read
+  // lately (`packed::Recent`, which the push's decision filled with the tags) given back, so the listing reads them from
+  // their windows, as git/git's tags, far past that cache, were read.
+  let let_go = crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
+    for id in state.vcs_stores.git_repositories() {
+      crate::vcs_store::git_encode::give_back_idle(state, id);
+    }
+    let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+    (
+      count(crate::vcs_store::LANDED_LET_GO_BYTES),
+      count(crate::vcs_store::LANDED_PINNED),
+    )
+  });
+  let mut ls_refs = Vec::new();
+  for line in [b"command=ls-refs\n".as_slice()] {
+    pktline::write(Packet::Data(line), &mut ls_refs).expect("the command");
+  }
+  pktline::write(Packet::Delim, &mut ls_refs).expect("the delimiter");
+  for argument in [b"peel\n".as_slice(), b"ref-prefix refs/\n"] {
+    pktline::write(Packet::Data(argument), &mut ls_refs).expect("an argument");
+  }
+  pktline::write(Packet::Flush, &mut ls_refs).expect("the flush");
+  let listed = uploaded(edge, &name, &ls_refs);
+  let mut fetch = Vec::new();
+  pktline::write(Packet::Data(b"command=fetch\n"), &mut fetch).expect("the command");
+  pktline::write(Packet::Delim, &mut fetch).expect("the delimiter");
+  let mut arguments = vec![format!("want {commit}\n")];
+  arguments.extend(tags.iter().map(|tag| format!("want {tag}\n")));
+  arguments.extend(["no-progress\n".to_owned(), "done\n".to_owned()]);
+  for argument in &arguments {
+    pktline::write(Packet::Data(argument.as_bytes()), &mut fetch).expect("an argument");
+  }
+  pktline::write(Packet::Flush, &mut fetch).expect("the flush");
+  let fetched = uploaded(edge, &name, &fetch);
+  daemon.stop();
+  eprintln!("landed let-go bytes and windows pinned before the listing: {let_go:?}");
+  let report = String::from_utf8_lossy(&created.1).into_owned();
+  assert_eq!(
+    (created.0, report.matches("ok refs/").count()),
+    (200, TAGS + 1),
+    "{report}"
+  );
+  let mut expected = Vec::new();
+  let main = format!("{commit} refs/heads/main\n");
+  pktline::write(Packet::Data(main.as_bytes()), &mut expected).expect("a line");
+  for (at, tag) in tags.iter().enumerate() {
+    let line = format!("{tag} refs/tags/t{at} peeled:{commit}\n");
+    pktline::write(Packet::Data(line.as_bytes()), &mut expected).expect("a line");
+  }
+  pktline::write(Packet::Flush, &mut expected).expect("the flush");
+  assert_eq!(
+    (listed.0, String::from_utf8_lossy(&listed.1)),
+    (200, String::from_utf8_lossy(&expected)),
+    "every ref listed, each tag peeled"
+  );
+  assert_eq!(fetched.0, 200);
+  let answer = String::from_utf8_lossy(
+    fetched
+      .1
+      .get(..fetched.1.len().min(400))
+      .unwrap_or_default(),
+  )
+  .into_owned();
+  assert!(answer.starts_with("000dpackfile\n"), "{answer}");
+  let (_, commands_end) = packets_from(&request, 0);
+  let pushed_pack = request.get(commands_end..).expect("the push's pack");
+  assert_eq!(
+    ids_in(&fetched_pack(&fetched.1)).len(),
+    ids_in(pushed_pack).len()
+  );
 }
 
 /// A v2 `fetch` of `want` with `done` and no progress, as `git clone` asks for a branch's commit.
@@ -1923,6 +2107,16 @@ fn hg_unbundle(
   name: &str,
   bundle: &[u8],
 ) -> (u16, String, Vec<u8>) {
+  hg_unbundle_within(edge, name, bundle, Duration::from_nanos(PATIENCE_NS))
+}
+
+/// [`hg_unbundle`], its client waiting at most `patience` for each read of the answer.
+fn hg_unbundle_within(
+  edge: (u16, &CertificateDer<'static>),
+  name: &str,
+  bundle: &[u8],
+  patience: Duration,
+) -> (u16, String, Vec<u8>) {
   let (port, certificate) = edge;
   let mut sent = format!(
     "POST /{name}?cmd=unbundle HTTP/1.1\r\nHost: localhost\r\n{}\r\n{HG_PUSH_FIELDS}\
@@ -1932,7 +2126,7 @@ fn hg_unbundle(
   )
   .into_bytes();
   sent.extend_from_slice(bundle);
-  typed_exchange(port, certificate, &sent)
+  typed_exchange_within(port, certificate, &sent, patience)
 }
 
 /// A bundle2 part's parameters: each its name and value.
@@ -3399,6 +3593,15 @@ fn a_mercurial_push_parks_for_its_repositorys_landing_turn_and_no_other_waits() 
     );
     std::thread::spawn(move || hg_unbundle((port, &certificate), &first, &bundle))
   };
+  // Seen parked, then held [`TURN_HELD`] more: the push's wait runs from before it was seen to past the release, whatever
+  // its intake took on a busy machine before it parked.
+  let deadline = std::time::Instant::now() + Duration::from_nanos(PATIENCE_NS);
+  while counted(crate::repository::hg_run::TURN_WAITS) == 0 && std::time::Instant::now() < deadline
+  {
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(Duration::from_millis(5));
+  }
+  let seen_parked = std::time::Instant::now();
   // The test holds the landing turn while the parked push waits for it; the daemon under test waits on its drivers.
   #[allow(clippy::disallowed_methods)]
   std::thread::sleep(TURN_HELD);
@@ -3407,6 +3610,7 @@ fn a_mercurial_push_parks_for_its_repositorys_landing_turn_and_no_other_waits() 
     parked.is_finished(),
   );
   give_back_turn(&daemon);
+  let held_after_park = seen_parked.elapsed();
   let parked = parked.join().expect("the parked push answered");
   let waited_ns = counted(crate::repository::hg_run::TURN_WAITED_NS);
   let heads = hg_command((port, &certificate), &first, "heads");
@@ -3424,8 +3628,8 @@ fn a_mercurial_push_parks_for_its_repositorys_landing_turn_and_no_other_waits() 
   let tip = crate::verbs::hex_of(&made[0].node);
   assert_eq!(heads, (200, format!("{tip}\n").into_bytes()));
   assert!(
-    u128::from(waited_ns) >= TURN_HELD.as_nanos(),
-    "waited {waited_ns} ns"
+    u128::from(waited_ns) >= held_after_park.as_nanos(),
+    "waited {waited_ns} ns, parked {held_after_park:?} before the release at least"
   );
   let words = crate::repository::hg_run::TURN_PAST_PATIENCE;
   assert!(
@@ -3459,9 +3663,10 @@ fn a_long_push_parked(
     crate::repository::hg_run::TEST_RELEASE.with(|release| release.set(false));
   });
   let (made, bundle) = a_line_of(FRESH_CHANGESETS);
+  let patience = long_push_patience(&bundle);
   let long = {
     let (certificate, name) = (certificate.clone(), name.to_owned());
-    std::thread::spawn(move || hg_unbundle((port, &certificate), &name, &bundle))
+    std::thread::spawn(move || hg_unbundle_within((port, &certificate), &name, &bundle, patience))
   };
   while counted_on(
     daemon,
@@ -3476,6 +3681,21 @@ fn a_long_push_parked(
     std::thread::sleep(Duration::from_millis(5));
   }
   (made[FRESH_CHANGESETS - 1].node, long)
+}
+
+/// Derived: how long a test's client waits for a long push's answer ([`a_long_push_parked`]): a client's patience
+/// ([`PATIENCE_NS`]) and one of the daemon's liveness budgets for each segment the push lands at
+/// [`LONG_SEGMENT_BYTES`], each a durable write of the store's that a busy machine draws out, and one more for its
+/// entry's commit (main 01a20182's order of 2026-11-22 16:30: a busy machine is the norm, so a bound from the push's
+/// own size, never a constant).
+fn long_push_patience(bundle: &[u8]) -> Duration {
+  let segments = u64::try_from(bundle.len())
+    .unwrap_or(u64::MAX)
+    .div_ceil(LONG_SEGMENT_BYTES)
+    .saturating_add(1);
+  Duration::from_nanos(
+    PATIENCE_NS.saturating_add(segments.saturating_mul(crate::daemon::LIVENESS_BUDGET_NS)),
+  )
 }
 
 /// Lets a long push parked by [`a_long_push_parked`] go on.

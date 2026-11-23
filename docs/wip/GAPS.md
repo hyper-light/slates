@@ -1557,6 +1557,14 @@
 > turns, calling `make_step` between judge and commit (w-svn); items 3-7 (the green's block naming the plane's object,
 > no copy; w-engine's queue).
 >
+> **A-866 (2026-11-22, w-svn; main 01a20182's order of 17:00, items 3-7 while w-engine is paused):** items 3-7 cut into
+> four pieces (`inbox/main-from-w-svn-a760b-plan.md` on the fan-out ledger). Piece 1 BUILT: a block made of the whole of
+> one named run spanning its object keeps that object's identity (`Green::name_of`), through a judged commit, `make_step`
+> and `apply_recorded` alike; any other making leaves the block unnamed. No memory change yet. Oracle:
+> `a_file_made_whole_of_a_named_object_is_named_for_it_until_changed`. OWED: piece 2, a checkpoint naming a named file
+> instead of carrying its bytes (a restored green names nothing until then); piece 3, the history keeping a named
+> version by its name; piece 4, the current block holding no bytes, read through the plane.
+>
 > **Finding, 2026-11-20 (w-engine, not chased under the close order):** `cargo test -p slates-merge --test checkpoint`
 > failed once in 10 runs (`a_green_restored_from_its_checkpoint_answers_as_the_green_it_was`, a proptest, unseeded) on
 > the big Studio at load ~20; its failing case was not kept. The test names no runs, so A-760's commit order does not
@@ -3058,6 +3066,30 @@
 > session passes 1 of 1 in 33.54 s, byte for byte against `svnserve`, and the guard leaves 0 views mounted. Owed:
 > w-lint's Linux and Windows cross-target round. Windows spawns no hooks yet (A-622's Windows
 > part), so it has no seam to change.
+> **The hook drain held by a foreign holder (2026-11-22, w-svn; main 01a20182's rulings of ~17:20 and ~17:30): FIXED.**
+> `daemon_edge`'s `a_dav_proppatch_of_a_revision_changes_its_property_through_its_revprop_hooks` failed once in w-git's
+> batch at load ~40 (its reader, "the answer ended inside a line"): a stock client the test binary spawned with
+> `std::process::Command`, not confined, inherited a hook's words pipe in the macOS window between `pipe()` and its
+> close-on-exec (std makes a pipe so on macOS, `library/std/src/sys/pipe/unix.rs`), and the hook's first run, with no
+> deadline, waited until its client gave up. Now a run's words end once nothing of the hook's can write them: the hook
+> has exited and its group holds nothing but it (`slates_ipc::group_holders`, `proc_listpgrppids` on macOS; Linux's
+> `pipe2(O_CLOEXEC)` and Windows' non-inheritable `CreatePipe` handles leave nothing foreign to hold one), whatever
+> still holds the stream; a child that left the group with `setsid` is told the same, as the group's kill never reached
+> it. Red: `a_hooks_run_ends_at_its_exit_whatever_another_spawner_holds` took 4,151,291,875 ns, held by a plain std
+> child; now it ends at the hook's exit with its words.
+> **OPEN (w-svn, noted for main 2026-11-22): a hook's first run has no deadline but its client's connection.** Before
+> any run of a hook has finished, `HookTimes::bound_ns` answers none (the module docs: "a run has no deadline but its
+> client's connection"), so a hook that never exits on its first run holds that run, and the client's request, for the
+> client's lifetime. The learned bound starts only from a finished run; a bound the design may owe.
+> **OPEN (w-svn, the sibling sweep for main, 2026-11-22): every descriptor the daemon makes on macOS is marked
+> close-on-exec a call after it is made,** since Apple has no `pipe2`, `accept4` or `SOCK_CLOEXEC`: a foreign spawner in
+> the same process (a test binary's stock client, an embedder) inherits it in that window. Pipes: `hook_driver.rs`
+> 224-227 (std), `ipc` `completion.rs` 293 (std), `delivery.rs` 392 (its doc says so). Socket pairs: `ipc` `stream.rs`
+> 32 and 62, `endpoint.rs` 1528 and 2024, `rendezvous.rs` 2377, server `reap.rs` 575, `hangup.rs` 437 and 590,
+> `fuse.rs` 1908. Sockets and accepts: `rt` `netsys.rs` (the listeners every edge binds through `slates_rt::tcp`, and
+> its `accept`, 568), `ipc` `route.rs` 473, `completion.rs` 577-580 (std). A connection inherited so stays half open
+> after the daemon closes it, its peer seeing no end while the holder lives. `kqueue` descriptors are not inherited by
+> a child. Not fixed here.
 > **svn replay by stock clients (w-interop, 2026-11-20; A-703):** `svn-matrix.sh` gains `svnrdump dump` and
 > `svnsync initialize/synchronize` over svn://, each compared with the dump stock svnserve 1.15.0 made of the same history
 > (`crates/svn/fixtures/replay`, `EXPECT_RDUMP`, `EXPECT_SYNC`): over the reads fixtures' repository both are
@@ -3856,6 +3888,14 @@
 > Still to measure: the A-742 floor's A/B only if the
 > footprint still stays (main's ruling). A local 64 KiB floor gave 47 MB of footprint at 2 s idle, against 363 MB, at
 > 19.4 s against 12.0 s (debug).
+> **An idle heap give-back measured and rejected (w-interop, 2026-11-22; main's ruling; BENCHMARKS "An idle heap
+> give-back for the import's freed small blocks"):** `malloc_zone_pressure_relief` releases 0 bytes at every block size;
+> `MallocSpaceEfficient=1` takes 515 MB of freed blocks down to 3 MB but makes 64 B to 64 KiB alloc-and-free pairs 5 to
+> 8 times slower. The pages are libmalloc's cache, reused by the next work.
+> **OPEN, upstream (main's ruling of 2026-11-22): the import churns about 500 MB of small blocks it frees again**, a
+> working set that grows with the dump (owed: a bounded working set per push). main's r80 (big Studio, git-2000.dump at
+> b79b54350, idle 30 s, a shared box): RSS 1.14 GB, footprint 670 MB; `MALLOC_SMALL (empty)` 512 MB virtual, 507.7 MB
+> resident, 235.0 MB dirty in 128 regions; `MALLOC_SMALL` 452 MB virtual, 415 MB resident, 334.5 MB dirty.
 > **A-822's commit held the shard past its watchdog; A-835 slices it (2026-11-21, w-svn; main's ruling of 12:43).**
 > Main's git-2000 run over A-822 had the watchdog kill the anchor twice: the batch's 2,000 versions applied in one step.
 > A-835 applies a recorded batch a slice a turn and folds a recovered Subversion green to its readers (the 434 MB under

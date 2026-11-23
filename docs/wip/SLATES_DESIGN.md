@@ -61054,3 +61054,39 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
   - w-svn's byte-sampled in-process attribution (500 files of 8 KiB, then 300 revisions of 3 changed, 11.65 MB):
     130.8 MB allocated before, 108.0 MB after. `Increment::encode`, the post-state and the scratch member's `apply`
     leave the sites; `read_step` stands twice, for the scratch member and for the real green.
+
+### A-866 — A green's block made whole of a named object keeps the object's name (2026-11-22, w-svn; main 01a20182's order of 17:00 PST, goal 93; A-760 (b) items 3-7, piece 1 of 4; A-760, A-865)
+
+- **Why.** Since A-865 a Subversion version names its texts, and its entry records the names, not the bytes. But the
+  green still holds each text whole on the heap beside the content store, and so do its checkpoint and its history.
+  Items 3-7 (A-760's owed line) take those copies away by holding a file by its content-plane object. That needs the
+  block to know which object it is. The identity space is the content store's object root (w-perf's addendum of
+  2026-11-20 to the block seam), the identity a named run already carries, so no chunk reference enters the engine.
+- **The pieces** (main's ruling: one a piece, smallest first, each with its oracle against `apply_recorded` on
+  generated histories):
+  1. The block keeps its name (this entry).
+  2. A checkpoint names a named file instead of carrying its bytes.
+  3. The history keeps a named version by its name.
+  4. The current block holds no bytes, and every read goes through the plane.
+- **The rule.** A version that makes a file of exactly one named run, which is its object whole (from its first byte,
+  the object's length), names the file's block for that object: `dims::Blocks`' slot carries the identity,
+  `Green::name_of` reads it. A name says what the bytes are, not where they came from. So a file named is named whether
+  its run's buffer moved into it or two files of one run each took a copy. Anything that keeps the block keeps the
+  name: a version that leaves the file alone, a copy's tree grafted by reference, a hold. Every other making gives a
+  new block with no name: a part of an object, carried bytes, a splice, a hard link's hand-over, a copy's fix (a file
+  its source changed since the copied version), a revert, a restore. Appending to a staged block clears any name.
+  Copies, hand-overs and reverts are outside the oracle's histories; the rule holds there by construction, since each
+  makes its block with `Files::insert`, which names nothing.
+- **Where.** `Green::sole_runs` finds each file made of one run. `alone` keeps those whose buffer moves; `named_files`
+  keeps those named. Both are found together, so a verdict made a slice a step (`Making::names`) and its commit agree.
+  The commit hands each effect's name to its staged file (`StagedFile::name`), and `Files::insert_named` makes the
+  block. A judged verdict carries its work's runs (`Judged::runs`).
+- **Oracle.** `engine::named_tests::a_file_made_whole_of_a_named_object_is_named_for_it_until_changed`. A fixed history
+  runs first, then 64 generated histories of up to nine versions over three paths and four objects, each version
+  judged and committed on one green (some made a slice a step first) and applied as its entry records it on another.
+  After every version, both greens' bytes and names must equal a model kept by the rule, and the two heads must be one.
+  Census of one run: 355 files named and moved, 20 named and sharing a run, 143 changed away from a name, 87 kept
+  across a later version, 210 versions made in steps. Failing first: the commit named no block (`left: None`).
+- **Not yet.** No memory moves in this piece. A checkpoint carries bytes, so a restored green names nothing (piece 2).
+- **Applied in the same change to** `crates/merge` (`dims`, `engine`, `engine/copy`, `engine/named_tests`), GAPS,
+  amendments.tsv.
