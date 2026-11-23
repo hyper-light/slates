@@ -1557,6 +1557,14 @@
 > turns, calling `make_step` between judge and commit (w-svn); items 3-7 (the green's block naming the plane's object,
 > no copy; w-engine's queue).
 >
+> **A-866 (2026-11-22, w-svn; main 01a20182's order of 17:00, items 3-7 while w-engine is paused):** items 3-7 cut into
+> four pieces (`inbox/main-from-w-svn-a760b-plan.md` on the fan-out ledger). Piece 1 BUILT: a block made of the whole of
+> one named run spanning its object keeps that object's identity (`Green::name_of`), through a judged commit, `make_step`
+> and `apply_recorded` alike; any other making leaves the block unnamed. No memory change yet. Oracle:
+> `a_file_made_whole_of_a_named_object_is_named_for_it_until_changed`. OWED: piece 2, a checkpoint naming a named file
+> instead of carrying its bytes (a restored green names nothing until then); piece 3, the history keeping a named
+> version by its name; piece 4, the current block holding no bytes, read through the plane.
+>
 > **Finding, 2026-11-20 (w-engine, not chased under the close order):** `cargo test -p slates-merge --test checkpoint`
 > failed once in 10 runs (`a_green_restored_from_its_checkpoint_answers_as_the_green_it_was`, a proptest, unseeded) on
 > the big Studio at load ~20; its failing case was not kept. The test names no runs, so A-760's commit order does not
