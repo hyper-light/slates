@@ -94,7 +94,7 @@ use crate::state::ShardState;
 #[cfg(unix)]
 use crate::vcs_hooks::{self, CommittedView, ExitStatus, HookInput, Lesson, Outcome, PendingView};
 use crate::vcs_policy::{self, Asked, Name, Namespace, PushRefusal, Right};
-use crate::vcs_store::hg_view::{self, PUBLISHING};
+use crate::vcs_store::hg_view;
 use crate::vcs_store::{self, VcsStores};
 use crate::verbs::hex_of;
 
@@ -3364,7 +3364,7 @@ fn judged_over(
   hg_view::with_view_over(state, repository, over, room, |view, _, content, room| {
     let (brought, held_changesets) =
       brought_of(forked, content, room).map_err(|refused| PushOutcome::refused(&refused))?;
-    let terms = (PUBLISHING, name, room.left());
+    let terms = (view.publishing(), name, room.left());
     let prepared = prepare(
       state,
       repository,

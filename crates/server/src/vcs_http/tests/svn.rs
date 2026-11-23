@@ -131,6 +131,7 @@ impl Repositories for Held {
         hooks: Vec::new(),
         hooks_env: Vec::new(),
         signers: Vec::new(),
+        hg_publishing: true,
       },
     })
   }

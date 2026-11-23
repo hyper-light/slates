@@ -565,6 +565,7 @@ fn set_svn_hooks(
           .collect(),
         hooks_env: Vec::new(),
         signers: Vec::new(),
+        hg_publishing: true,
       },
     )
   });

@@ -312,6 +312,7 @@ fn protecting() -> RepositoryRecord {
       hooks: Vec::new(),
       hooks_env: Vec::new(),
       signers: vec![key(TRUSTED_PUB).wire().to_vec()],
+      hg_publishing: true,
     },
   }
 }
