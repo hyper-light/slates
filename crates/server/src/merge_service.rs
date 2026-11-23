@@ -1962,7 +1962,7 @@ pub(crate) fn status_merge_volume(
   let (bytes, head) = match role {
     MergeRole::Green { .. } => state.greens.get(&id).map_or((0, 0), |engine| {
       (
-        engine.files().map(|(_, bytes)| bytes.len() as u64).sum(),
+        engine.files().map(|(_, bytes)| bytes.len()).sum(),
         engine.head(),
       )
     }),
