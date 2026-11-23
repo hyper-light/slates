@@ -2190,7 +2190,8 @@ fn an_import_measured() {
 struct MemorySample {
   /// Physical footprint, bytes.
   footprint: Option<u64>,
-  /// The heap's bytes in live allocations (`memory: heap ... resident_bytes`, `slates_mem::heap::stats().in_use`).
+  /// The heap's bytes in live allocations: the system allocator's (`memory: heap ... resident_bytes`) and the large
+  /// blocks' written pages (`memory: large ... resident_bytes`, since 2026-11-22 a row of their own).
   heap_in_use: u64,
   /// Every shard's arena bytes allocated (`content_range.arena.allocated`).
   arena: u64,
@@ -2296,11 +2297,16 @@ fn memory_sample(instance: &str, label: &str) -> MemorySample {
   };
   MemorySample {
     footprint: footprint.map(|kib| kib.saturating_mul(1024)),
-    heap_in_use: lines
+    heap_in_use: ["memory: heap ", "memory: large "]
       .iter()
-      .filter(|line| line.contains("memory: heap "))
-      .find_map(|line| figure(line, "resident_bytes="))
-      .unwrap_or(0),
+      .map(|row| {
+        lines
+          .iter()
+          .filter(|line| line.contains(row))
+          .find_map(|line| figure(line, "resident_bytes="))
+          .unwrap_or(0)
+      })
+      .fold(0u64, u64::saturating_add),
     arena,
   }
 }

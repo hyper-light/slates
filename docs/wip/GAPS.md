@@ -101,6 +101,13 @@
 > pack let go once no fetch is answered and no encoding runs (else owed to the idle give-back), whatever its windows'
 > holders (`ContentStore::let_go_landed`), every window a home holds here kept (`vcs_store::landed_pin`; a one-shard
 > daemon lets nothing go until (2b)(b), homes' own read-through, next).
+> **HELD (main 01a20182, 2026-11-22 15:40):** no landed pack is let go or owed from a push's commit (`vcs_store::commit`),
+> since r52 (the big Studio, main 6f6e87d82) found readers that do not bring a let-go window back: once git/git's push
+> ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's tag peel through
+> `StoreGraph::named`, shallow and filter tree walks), and stock git read "possible repository corruption" on ls-remote
+> and every clone (stock_git_verbs 1 of 8). Lifted when w-git's fetch-side readers (A-855's held answer, brought back and
+> made again) and the push decision's reads bring a let-go window back, with w-shared's red: annotated tags pushed, the
+> push ended, idle, then ls-remote and a clone byte-identical to stock.
 > Owed, in main's order: (1) the push's temporaries cut at their source (w-shared);
 > (2) landed windows and the pack let go once durable (w-shared, with w-git); (3) the recent-objects cache given back
 > after a fetch (w-git); (4) the index tables, decided after.
@@ -284,7 +291,9 @@
 > object and 1,362 MiB resident before, 0 and 123 MiB after. Open: the arena's address-space range in the content
 > object, a held extent's free pages. **Windows' section per extent written (A-789, main 18:40):** the anchor holds
 > each extent's section across a restart (`WHAT_CONTENT_EXTENT`); its build and tests are owed to w-lint on jupiter
-> (run-requests; red: commit kept after a destroyed volume's burst). **Open (R2, found 2026-11-20 19:45):** the macOS give-back
+> (run-requests; red: commit kept after a destroyed volume's burst). **Closed 2026-11-22 (w-interop):** the burst test's
+> red below was a shard keeping its burst's 1 GiB extent for 10 MiB of headroom, and the test measuring process RSS;
+> `docs/bugs/2026-11-22-a-shard-kept-a-1-gib-extent-for-10-mib-of-headroom.md`. **Open (R2, found 2026-11-20 19:45):** the macOS give-back
 > depends on the machine: recovery's `a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone` passed on a quiet
 > adas-macbook-pro-2 (1,648 -> 123 MiB) but kept 1,366 MiB there later and 335-336 MiB on the big Studio at 5,433 free
 > pages, at A-789's own commit too. Not the pressure hold: with the test's own pressure readings injected (none, and a
@@ -294,7 +303,11 @@
 > daemon held 6,193 MiB: arenas 5,166 MiB (the stored content, w-hg's holdings; to w-store's disk store under
 > STORAGE), segment 229, content object 2, the rest ~796 (~90 of it an idle daemon's). **Found:** `slates status`'s
 > heap row counts allocated, not resident, bytes: ~920-960 MiB on an idle daemon whose RSS is 35-87 MiB (1, 4 and 23
-> shards), about 900 MB allocated and never touched, constant across shard counts (not yet traced). > **The status memory report's residency FIXED (g226, 2026-11-21, w-sizing's option (a)):** on macOS a memory status
+> shards), about 900 MB allocated and never touched, constant across shard counts (not yet traced). **The row FIXED
+> (w-interop, 2026-11-22, main's (b1); `docs/bugs/2026-11-22-the-heap-row-counted-large-blocks-spans-as-resident.md`):**
+> the row's resident added the large path's live mappings' whole spans; `heap` is now the system allocator alone and
+> `large` the mapped blocks, resident by their pages in RAM. The ~900 MB never touched is those spans (main's r41: 12
+> blocks, 1.27 GB mapped, 13.7 MB written); naming and sizing them from the work is (b2), open. > **The status memory report's residency FIXED (g226, 2026-11-21, w-sizing's option (a)):** on macOS a memory status
 > read the arenas 0 MiB after a 256 MiB burst, so R3's split came back empty: the sweep walked every range of each
 > shard's slice whole (4 GiB arena region, ~28 GiB of content object and segment a shard on the test daemon) and the
 > arenas' figure waited for it to complete. Now the sweep walks only what can hold pages (the arena's held runs, the
@@ -3812,7 +3825,12 @@
 > scratch member numbers its own versions; a fast-forward would be w-engine's, paused); option 2 instead: a recorded
 > version's whole-run file takes the run's read buffer with no copy (`Green::apply_recorded` takes its work mutably and
 > moves whole runs as `commit_held` does; `a_recorded_versions_whole_run_becomes_the_file_with_no_copy`), sampled
-> 108.0 MB to 96.2 MB. Owed: the content store's `release_one` copy (w-shared's), the two `read_step`s. Not A-865's: `recovery.rs`'s `an_overlay_whose_base_directory_was_removed_serves_its_own_files_after_a_restart`
+> 108.0 MB to 96.2 MB. The content store's release no longer reads a freed window back (w-svn, main's routing of ~14:20,
+> w-shared told first): `ContentStore::release` answers `Freed` (held, gone, or a freed table's bytes, which the index
+> gives back the rows of), and `release_one` reads a stored entry only where its form names what is given back next (a
+> list, a derived node, a table) (`a_released_objects_windows_are_freed_without_being_read_back`: 5 windows read back,
+> now 0); sampled 96.2 MB to 84.3 MB. Owed: the two `read_step`s (the batch's re-read goes with w-engine's paused
+> fast-forward). Not A-865's: `recovery.rs`'s `an_overlay_whose_base_directory_was_removed_serves_its_own_files_after_a_restart`
 > failed at origin/main 7ced987e6 as well (LOOKUP status, `tests/common/nfs.rs:238`). **Closed (w-interop, 2026-11-22):**
 > A-833's lazy reopen made a gone base directory's first use, its attributes, refuse the directory itself; it now
 > answers from the volume's node, and a reopen that meets the descriptor limit no longer records a live directory gone
@@ -25425,7 +25443,14 @@ after every takeover (Goal 85b C3: 5 of 5 replays stalled at `live_chaos.rs:2465
 `live_ship::tests::the_publications_behind_a_whole_capture_are_held_to_the_credit_its_body_takes` (2 queued, 1 refused
 before; 3 queued, none refused after); this fleet test passes again (fleet `a_live_` 11/11).
 
-### 2026-11-20: a destroyed burst's extents not given back on Adas-Mac-Studio-2 — open (w-lint's finding, not worked: Ada's close order)
+### 2026-11-20: a destroyed burst's extents not given back on Adas-Mac-Studio-2 — closed 2026-11-22 (w-interop; `docs/bugs/2026-11-22-a-shard-kept-a-1-gib-extent-for-10-mib-of-headroom.md`)
+> **Closed:** the shard kept its burst's 1 GiB extent whole for its 10 MiB of operation headroom
+> (`ChunkArena::shrink` skips a region whose return leaves capacity under what it keeps); an idle give-back now trades
+> it for the smallest extent that keeps the headroom (`ChunkArena::shrink_trading`, 1,024 MiB held to 16 MiB after the
+> destroy). The test measured process RSS, which in its one process counts the test's own payload and its copies (1.0
+> GiB of freed large blocks macOS's allocator keeps): it now measures the pool by its own pages (the content object and
+> the arenas' held extents). A separate daemon's heap held resident (main's r41, about 1.3 GB against 31 to 60 MB
+> live) is its own piece, the idle heap give-back.
 `cargo test -p slates-server --test recovery a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone` (A-789,
 362bd8c39, red -> green on adas-macbook-pro-2 quiet: 1,622 -> 123 MiB) fails on main's own code on Adas-Mac-Studio-2,
 three runs of three on the merge 287055d5b: 41-42 MiB before the burst, 1,341-1,342 MiB after its volume was destroyed, for a
