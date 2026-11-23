@@ -4260,7 +4260,6 @@ fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
   // Each file's window: whether its shard's content store reads its bytes (none for one let go), whether a home pins it
   // there, and whether its entry stays.
   let windows = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
-    let (shard, shards) = (state.shard, state.shards.clone());
     crate::vcs_store::lent_state(state, |state| {
       let content = state.vcs_stores.content()?;
       Some(
@@ -4578,7 +4577,6 @@ fn an_imported_repositorys_file_texts_leave_the_content_store_once_its_segments_
   let looked = {
     let name = name.clone();
     crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
-      let (shard, shards) = (state.shard, state.shards.clone());
       let id = state
         .db
         .partition()
