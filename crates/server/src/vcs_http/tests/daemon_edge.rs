@@ -3861,3 +3861,83 @@ fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
     "the clone carries the last file's bytes"
   );
 }
+
+/// Main 01a20182's ruling of 2026-11-22 02:52 (C1 2b, an import keeping no file text once its segments are durable) and
+/// order of 14:00 (the arena a landed history left held). Do: start a two-shard daemon over loopback TLS; import the
+/// `states` repository into a Mercurial repository and land it; look at each of its file revisions' windows in its
+/// shard's content store; clone it whole (`getbundle`). Expect every file revision's window let go of the content store,
+/// its entry kept, but those a home pins on this shard (`vcs_store::landed_pin`); some let go and counted; and the clone
+/// `200` with a changegroup, its file texts brought back from the changeset store. Red before: the import kept every text.
+#[test]
+fn an_imported_repositorys_file_texts_leave_the_content_store_once_its_segments_land() {
+  let (identity, certificate) = identity();
+  let (daemon, _instance) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  create_hg_from_states(&daemon, &name);
+  let looked = {
+    let name = name.clone();
+    crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+      let (shard, shards) = (state.shard, state.shards.clone());
+      let id = state
+        .db
+        .partition()
+        .repositories()
+        .repository_named(&name)?
+        .id;
+      crate::vcs_store::lent_state(state, |state| {
+        let (content, store) = state.vcs_stores.mercurial_ref(id)?;
+        let mut seen = Vec::new();
+        let mut at = (Vec::new(), 0_u32);
+        while let Some((path, rev, row)) = store.index.file_revision_from(content, (&at.0, at.1)) {
+          let pinned = crate::vcs_store::landed_pin(shard, &shards, &row.bytes).is_some();
+          let len = content.len_of(&row.bytes);
+          let here = len.is_some_and(|len| content.object_bytes(&row.bytes, len).is_some());
+          seen.push((here, pinned, len.is_some()));
+          at = (path, rev.saturating_add(1));
+        }
+        Some(seen)
+      })
+    })
+  }
+  .expect("the imported repository's store");
+  let let_go = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::vcs_store::hg_import::FILE_TEXT_BYTES_LET_GO,
+  );
+  let heads = hg_command((port, &certificate), &name, "heads");
+  let tip = String::from_utf8_lossy(&heads.1)
+    .split_whitespace()
+    .next()
+    .unwrap_or_default()
+    .to_owned();
+  let cloned = hg_getbundle((port, &certificate), &name, &tip);
+  daemon.stop();
+  let gone = looked.iter().filter(|(here, ..)| !here).count();
+  println!(
+    "an import's file texts: {gone} of {} windows let go, {let_go} bytes",
+    looked.len()
+  );
+  assert!(!looked.is_empty(), "the import keeps file revisions");
+  for (at, (here, pinned, entry)) in looked.iter().enumerate() {
+    assert!(entry, "file revision {at}'s entry kept");
+    assert_eq!(
+      here, pinned,
+      "file revision {at}'s window at hand only where a home pins it"
+    );
+  }
+  assert!(
+    gone > 0 && let_go > 0,
+    "some window let go: {gone}, {let_go} bytes"
+  );
+  assert_eq!(cloned.0, 200);
+  assert!(
+    cloned
+      .2
+      .windows(b"CHANGEGROUP".len())
+      .any(|window| window.eq_ignore_ascii_case(b"CHANGEGROUP")),
+    "the clone carries a changegroup"
+  );
+}

@@ -637,6 +637,14 @@
 >   `a_long_push_stale_twice_is_re_based_once_holding_the_turn_and_lands`,
 >   `a_dropped_run_is_forgotten_and_the_next_push_lands_past_it`, and the crash oracle killed with an unnamed run's rows
 >   present (`t_b1_a_crash_at_any_segment_boundary_leaves_a_push_whole_or_absent`).
+> - An import's file texts let go BUILT (2026-11-22, w-hg; C1 2b, main 01a20182's ruling of 02:52): each segment carries
+>   its file revisions' contents (`import::emit::Segment::contents`); once the segment is durable its windows are let
+>   go through the push's one path (`hg_run::let_go_windows`, pin-guarded by `vcs_store::landed_pin`), and once more when
+>   the import lands, since its bookmark works (2b (1), 609c1f03c) bring back what they read. A test's one-call landing
+>   builds the works over the same read-through (`built_works_whole`, each want answered on a thread of its own).
+>   Counted `vcs_store.hg_import.file_text_bytes_let_go`, `..._file_texts_pinned`. Held by
+>   `an_imported_repositorys_file_texts_leave_the_content_store_once_its_segments_land` (`states`: 4 of 5 windows let
+>   go, the fifth pinned; the clone served). The pin's open question below holds for it too.
 > - A landed push's file texts let go BUILT (2026-11-22, w-hg; main 01a20182's order of 14:00, CI 45065911852: 4.7 GB
 >   of arena held on the repository's shard after Mercurial's history landed, the content store keeping every text).
 >   Each segment carries its file revisions' content identities (`PushSegment::contents`, counted in the bound); once
