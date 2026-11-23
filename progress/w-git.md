@@ -568,3 +568,9 @@
   is not charged again); LFS 482f51fb0 (PUT routed to git's site, not svn's WebDAV; a download admitted the shard's
   room); work-clone quadratic 9bf74aff4 (Kept::runs counted once; kept_fragments O(versions)). Guard stays until main
   says (codex-review's two w-shared readers). NEXT: main's Studio rerun of the lfs row and git/git whole.
+
+- 2026-11-22: A-868 deflate reuse LANDED bdf54c675 (one deflate state a shard thread, reset + set_level, given back
+  on drop, MOST_KEPT 8, let go idle; red 72 made for 42 objects -> 1 made 71 reused; server red 10 -> 1/9). Guard lift
+  attempted on main's word: 30 server lib tests red (test harness readers read let-go windows directly since 2b(b)
+  unpinned audit shards); patch parked ~/.cache/w-git-guard-lift.patch. NEXT (main's order): deepen-by-one bug
+  (git_interop.rs:2400), lfs_row test fix (lfs filter config on the clone), then the lift with harness bring-back.
