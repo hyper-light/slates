@@ -3503,6 +3503,38 @@ fn a_mirrors_dump_is_the_same_whatever_url_it_was_synced_from() {
   );
 }
 
+/// The comparison's reading of a working copy ([`tree_of`]): a symbolic link is held as the link it is, never read
+/// through. Found by main's round r202 (2026-11-23, git-2000 over HTTP): git/git's history holds symbolic links, which
+/// stock `svn` checks out as links (`svn:special`), and one naming a directory was read as a file (`IsADirectory`, the
+/// harness's panic at `tree_of`). Do: in a scratch directory, make a directory, a file in it, a link to the directory
+/// and a link to the file, and read the tree. Expect the file once under its own path and each link as its target,
+/// with nothing read through either.
+#[cfg(unix)]
+#[test]
+#[allow(clippy::disallowed_methods)] // test code: its own scratch directory
+fn a_working_copys_symbolic_links_are_held_as_links() {
+  let scratch = Scratch::new("tree-links");
+  made_directory(&format!("{}/dir", scratch.path));
+  std::fs::write(format!("{}/dir/file", scratch.path), "bytes\n").unwrap();
+  std::os::unix::fs::symlink("dir", format!("{}/to-dir", scratch.path)).unwrap();
+  std::os::unix::fs::symlink("dir/file", format!("{}/to-file", scratch.path)).unwrap();
+  let tree = tree_of(&scratch.path);
+  let paths: Vec<&str> = tree.keys().map(String::as_str).collect();
+  assert_eq!(paths, ["dir/file", "to-dir", "to-file"]);
+  assert_eq!(
+    tree.get("dir/file").map(Vec::as_slice),
+    Some(&b"bytes\n"[..])
+  );
+  assert_eq!(
+    tree.get("to-dir").map(Vec::as_slice),
+    Some(&b"link dir"[..])
+  );
+  assert_eq!(
+    tree.get("to-file").map(Vec::as_slice),
+    Some(&b"link dir/file"[..])
+  );
+}
+
 /// The comparison's rule for a diff ([`canonical_diff`]). Do: put stock `svnserve`'s and slates' answers to `svn diff
 /// -c 4` over the golden repository (main's round of 2026-11-21), the same three deleted paths in two orders, through
 /// it, and an answer whose blocks differ. Expect the first two one text, and the third still different from them.
