@@ -417,3 +417,12 @@ Waiting: arena-4 (1baba966b) rows from main, then the 410 MiB plan.
   the same high-water within a segment's slack.
 - Next piece: that gauge, then bound the push's per-history structures (FileContents list, Taker brought/awaited/
   positions/manifest_of, Intaken changesets/logs) by the segment.
+
+## 2026-11-23 ~02:40 PST (w-hg)
+Landed a71609a9f:
+- e21e594c9: store keepers_of reads by checked chunks (lint wall 8e5ea5489, texts.rs:576).
+- e4d95bcf9: push gauges vcs.hg.push_held_high_bytes / _texts_high_bytes / push_rows_bytes. Two-history test (60 vs 240
+  changesets): texts 32,768 both, rows 35,860 vs 143,780, held 89,577 vs 241,536. The admission grows ~843 B a
+  changeset (bookkeeping kept to the push's end): the next piece's red ("held equal within a segment").
+Waiting: arena-5 VmHWM. If the bookkeeping is next: bound it by the segment (FileContents list, awaited, brought,
+positions, manifest_of, Intaken), so held is equal within a segment.
