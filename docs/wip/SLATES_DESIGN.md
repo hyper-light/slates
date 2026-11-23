@@ -61399,3 +61399,11 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
 - **Applied in the same change to:** `crates/machine/src/round_robin.rs` (new), `crates/rt/src/runtime.rs` and
   `crates/rt/src/shard.rs` (the shard's class and `parks_at_once`), `unsafe-budget.toml` (slates-machine 105 -> 108),
   §4.3 (the drivers paragraph), GAPS (84a, Linux), BENCHMARKS ("84a on Linux bare metal").
+- **Through the kernel's own calls (main 01a20182, 2026-11-23).** The class is set and read with
+  `SYS_sched_setscheduler` and `SYS_sched_getscheduler`, and the parameter is the kernel's one-priority
+  `struct sched_param`. musl's `sched_setscheduler` and `sched_getscheduler` answer `ENOSYS` without asking the kernel
+  (musl `src/sched/sched_setscheduler.c` and `sched_getscheduler.c`, read 2026-11-23). The release ships static musl
+  binaries for Linux, so through the C library no shard there could take the class. libc 0.2.189's musl
+  `sched_param` also no longer builds from its one public field, which is what CI's musl cross lint refused (run
+  45176536354). Held by the same test, now passing for x86_64 glibc and musl on adacachy2 (`RLIMIT_RTPRIO` 99).
+  Applied in the same change to: `crates/machine/src/round_robin.rs`, GAPS (84a, Linux).

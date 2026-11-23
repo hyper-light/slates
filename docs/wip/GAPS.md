@@ -346,6 +346,9 @@
 >   reply wait in the class (D', D'') was measured and not taken. **Confirmed on main** (ca98b72c4, main 01a20182,
 >   2026-11-23 03:42, adacachy2 in a user scope at CPUWeight 100): 6 loaded rounds, p99 241-440 µs and p999 325-697 µs,
 >   12 of 12 under 1 ms; quiet p99 76-103 µs; R9 spinning p99 45.6 / 54.6 / 56.2 µs (main before: 57-145).
+>   The class is set through the kernel's own calls since 2026-11-23 (main 01a20182): musl's `sched_setscheduler`
+>   answers `ENOSYS`, so the static musl release binaries had never taken it; the test passes for glibc and musl on
+>   adacachy2.
 >   **The desktop route, PARKED (main 01a20182's ruling, 2026-11-23; w-perf's readings).** Most desktop Linux grants no
 >   `RLIMIT_RTPRIO` but ships RealtimeKit (`org.freedesktop.RealtimeKit1` on the system bus, which PipeWire uses), an
 >   OS-shipped broker R10 allows. An account with `RLIMIT_RTPRIO` 0 would ask it per shard thread
