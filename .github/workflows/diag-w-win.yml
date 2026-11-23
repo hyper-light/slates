@@ -17,82 +17,6 @@ env:
   RED: 064674a8d0a7b9b934a30f54ad4aef10dc7bccbd
 
 jobs:
-  red:
-    name: red arm (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, windows-11-arm]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.98.1
-      - name: "Red: item 3's rendezvous test on the commit before its fix"
-        run: |
-          red="$(cygpath -u "$RUNNER_TEMP")/red"; mkdir -p "$red"
-          git archive --format=tar "$RED" | tar -x -f - -C "$red"
-          cd "$red"
-          set +e
-          CARGO_TARGET_DIR="$RUNNER_TEMP/red-target" cargo test -p slates-ipc --lib an_anchor_that_lets_go 2>&1 | grep -v '^\s*Compiling '
-          code=${PIPESTATUS[0]}
-          echo "red arm exit $code"
-          if [ "$code" -eq 0 ]; then echo "UNEXPECTED: the test passed without its fix"; exit 1; fi
-
-  driver-ab:
-    name: client driver A/B (windows-latest)
-    runs-on: windows-latest
-    timeout-minutes: 120
-    defaults:
-      run:
-        shell: bash
-    env:
-      AWS_LC_SYS_PREBUILT_NASM: "0"
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.98.1
-      - uses: ilammy/setup-nasm@v1.5.2
-      - name: Build both arms (the fix, and the commit before it)
-        run: |
-          root="$(cygpath -u "$RUNNER_TEMP")"
-          mkdir -p "$root/before"
-          git archive --format=tar "$RED" | tar -x -f - -C "$root/before"
-          cargo test -p slates-client --test driver --no-run 2>&1 | grep -v '^\s*Compiling '
-          (cd "$root/before" && CARGO_TARGET_DIR="$RUNNER_TEMP/before-target" cargo test -p slates-client --test driver --no-run 2>&1 | grep -v '^\s*Compiling ')
-      - name: "Run each test alone, each arm, three rounds, each run bounded at 60 s"
-        run: |
-          root="$(cygpath -u "$RUNNER_TEMP")"
-          fixed=$(cargo test -p slates-client --test driver --no-run 2>&1 | sed -n 's/.*Executable .*(\(.*\.exe\)).*/\1/p' | tail -1 | tr '\\' '/')
-          before=$(cd "$root/before" && CARGO_TARGET_DIR="$RUNNER_TEMP/before-target" cargo test -p slates-client --test driver --no-run 2>&1 | sed -n 's/.*Executable .*(\(.*\.exe\)).*/\1/p' | tail -1 | tr '\\' '/')
-          case "$before" in /*|[A-Za-z]:*) ;; *) before="$root/before/$before";; esac
-          echo "fixed=$fixed before=$before"
-          tests="a_call_whose_daemon_is_gone_ends_before_the_old_reply_deadline a_chained_call_is_reported_at_each_step_until_it_ends a_held_daemons_calls_are_waited_for_and_answered_and_a_cancel_releases_at_once a_ready_call_is_reported_once_until_it_is_finished every_call_ends_and_the_loop_is_never_held_across_restart_and_death"
-          for round in 1 2 3; do
-            for arm in fixed before; do
-              exe=$fixed; [ "$arm" = before ] && exe=$before
-              for name in $tests; do
-                log="$root/driver-$arm-$round-$name.log"
-                started=$(date +%s)
-                timeout 60 "$exe" --exact "$name" --test-threads=1 > "$log" 2>&1; code=$?
-                echo "=== round $round $arm $name: exit $code after $(( $(date +%s) - started )) s"
-                if [ "$code" -ne 0 ]; then
-                  grep -E 'panicked at|after the daemon|DaemonGone|answered after|refused at once|non-vacuous|^  left|^ right|has been running' "$log" | head -12
-                fi
-              done
-            done
-          done
-
   shards-hang:
     name: shards hang (windows-latest)
     runs-on: windows-latest
@@ -126,11 +50,22 @@ jobs:
             while kill -0 "$bg" 2>/dev/null && [ "$waited" -lt 90 ]; do sleep 1; waited=$((waited + 1)); done
             if kill -0 "$bg" 2>/dev/null; then
               echo "=== iteration $i HUNG past ${waited} s"
-              instance=$(sed -n 's/.*instance \(cr[0-9]*\) up.*/\1/p' "$log" | head -1)
-              echo "--- the resync test's instance: $instance"
-              "$slates" --instance "$instance" status 2>&1 | grep -i 'shards\|holder\|resync\|pid\|attach' || true
               echo "--- processes, with their parents and command lines"
               pwsh -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { \$_.Name -match 'slates|shards' } | ForEach-Object { '{0} parent {1} started {2}: {3}' -f \$_.ProcessId, \$_.ParentProcessId, \$_.CreationDate, \$_.CommandLine }" || true
+              cdb="/c/Program Files (x86)/Windows Kits/10/Debuggers/x64/cdb.exe"
+              if [ -x "$cdb" ]; then
+                for pid in $(pwsh -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { \$_.Name -match 'slates|shards' } | ForEach-Object { \$_.ProcessId }"); do
+                  pid=$(echo "$pid" | tr -d '\r')
+                  echo "--- every thread's stack of process $pid"
+                  timeout 120 "$cdb" -pv -p "$pid" -y "$(pwd -W)\\target\\debug;$(pwd -W)\\target\\debug\\deps" -c "~*k 30; qd" 2>&1 | grep -v '^\*\*\*\|Symbol search path\|Executable search path\|^ModLoad\|^$' | head -400 || true
+                done
+              else
+                echo "--- no cdb on this image at $cdb"
+              fi
+              for instance in $(sed -n 's/.*instance \(c[a-z][0-9]*\) up.*/\1/p' "$log" | sort -u); do
+                echo "--- status of $instance, bounded at 20 s"
+                timeout 20 "$slates" --instance "$instance" status 2>&1 | head -12 || echo "(status gave no answer in 20 s)"
+              done
               echo "--- the run's log whole, derived values alone left out"
               grep -v 'slates daemon: [a-z_0-9]* = ' "$log"
               winpid=$(cat "/proc/$bg/winpid" 2>/dev/null || echo "")
