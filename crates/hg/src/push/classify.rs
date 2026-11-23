@@ -40,8 +40,8 @@
 //!
 //! **Markers** (§4.17.3 decision 4; 7.2's `handleobsmarker`, `obsstore.mergemarkers`). An `obsmarkers` part's
 //! markers are kept, each alone in the part's format, in the order they arrived, less every one the repository holds
-//! already or the push carried before (7.2 compares markers whole: a marker and the same marker in the other format
-//! are two); its `reply:obsmarkers` counts the new ones, and where there are any an `output` part in reply to it says
+//! already or the push carried before, each compared as 7.2 compares its in-memory tuples ([`crate::marker_tuple`]:
+//! a marker and the same marker in the other format are one); its `reply:obsmarkers` counts the new ones, and where there are any an `output` part in reply to it says
 //! so in 7.2's words (`%i new obsolescence markers`, which 7.2's handler prints and its part processing captures,
 //! after the handler's reply). Stricter than 7.2, on purpose: a marker whose predecessor is
 //! a changeset public as the part is taken (held public, or made public by this push's earlier parts) refuses the
@@ -63,7 +63,8 @@ use super::reply::{Refused, Replied, heads_changed};
 use super::verify::Arrived;
 use super::{Asks, BookmarkAt, PushkeyAsk, Unbundle};
 use crate::bookmarks::divergent;
-use crate::obsmarkers::{self, Marker};
+use crate::marker_tuple::Tuple;
+use crate::obsmarkers;
 use crate::phases::{Phase, PhaseHead};
 use crate::read::to_u64;
 use crate::serve::{Repository, Rev};
@@ -737,8 +738,9 @@ pub fn classify(
   Ok(plan)
 }
 
-/// A marker an `obsmarkers` part carries: the part's id, the marker, and its encoding alone in the part's format.
-type Carried<'u> = (u32, Marker<'u>, Vec<u8>);
+/// A marker an `obsmarkers` part carries: the part's id, 7.2's tuple of it, and its encoding alone in the part's
+/// format.
+type Carried<'u> = (u32, Tuple<'u>, Vec<u8>);
 
 /// Takes an `obsmarkers` part's markers (`id`, `payload`) into `carried` (module docs, "Markers"): refused where the
 /// payload is unreadable or a marker's predecessor is public now.
@@ -765,14 +767,15 @@ fn take_markers<'u, V: Repository>(
     let mut alone = Vec::with_capacity(usize::try_from(len).unwrap_or_default());
     obsmarkers::encode(format, &[marker], &mut alone)
       .map_err(|_| Unclassified::UnreadableMarkers)?;
-    carried.push((id, marker, alone));
+    let tuple = Tuple::of(&marker).map_err(|_| Unclassified::UnreadableMarkers)?;
+    carried.push((id, tuple, alone));
   }
   Ok(())
 }
 
 /// Keeps the `carried` markers neither `view` holds nor an earlier one of the push carried, in their order, into
 /// `plan`, each part's `reply:obsmarkers` counting its own (module docs, "Markers"): one pass over the held markers,
-/// each looked up by its predecessor among the carried.
+/// each looked up by its predecessor among the carried, and each compared as 7.2 compares its tuples.
 fn kept_markers<V: Repository>(
   view: &V,
   carried: Vec<Carried<'_>>,
@@ -796,20 +799,29 @@ fn kept_markers<V: Repository>(
     for index in by_predecessor.get(held.predecessor).into_iter().flatten() {
       if carried
         .get(*index)
-        .is_some_and(|(_, marker, _)| *marker == held)
+        .is_some_and(|(_, marker, _)| Tuple::of(&held).is_ok_and(|held| marker.same(&held)))
         && let Some(slot) = dropped.get_mut(*index)
       {
         *slot = true;
       }
     }
   }
-  let mut seen: BTreeSet<&[u8]> = BTreeSet::new();
   let mut kept = 0_usize;
-  for (index, (id, _, alone)) in carried.iter().enumerate() {
+  for (index, (id, tuple, _)) in carried.iter().enumerate() {
+    let again = by_predecessor
+      .get(tuple.predecessor)
+      .into_iter()
+      .flatten()
+      .take_while(|earlier| **earlier < index)
+      .any(|earlier| {
+        carried
+          .get(*earlier)
+          .is_some_and(|(_, other, _)| tuple.same(other))
+      });
     let Some(slot) = dropped.get_mut(index) else {
       continue;
     };
-    if *slot || !seen.insert(alone.as_slice()) {
+    if *slot || again {
       *slot = true;
       continue;
     }
@@ -822,7 +834,6 @@ fn kept_markers<V: Repository>(
       }
     }
   }
-  drop(seen);
   said(&mut plan.replied, admission)?;
   admission.charge_items::<Vec<u8>>(kept)?;
   plan.markers.extend(

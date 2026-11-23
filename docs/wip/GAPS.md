@@ -822,6 +822,14 @@
 >   public and a rewrite of a pushed changeset is refused by the client), decision 3's rewrite admission, the
 >   `obsolete` pushkey namespace, and the reply's `N new obsolescence markers` output. The kept heads for a view with
 >   left-out changesets: BUILT (piece 2, below).
+>   Markers as 7.2 holds them BUILT (2026-11-23, w-hg): a repository holding a format 0 marker (an old obsstore's
+>   import, an old client's push) refused every clone that asked for markers, the format 1 encoder unable to write it
+>   (`markers_held_in_format_0_are_sent_in_format_1`, red: `Unencodable`). `marker_tuple` makes 7.2's in-memory tuple of
+>   either format and writes either from it, as `_fm0encodeonemarker` and `_fm1encodeonemarker` do: seven golden
+>   vectors from 7.2's own writers byte for byte; Python's `repr` of a float held to CPython over 400,014 floats, ties
+>   included, and its `float()` and `int()` over 525,750 strings. `getbundle` reads the tuples for relevance (a format 0
+>   marker's parents are in its metadata) and order; a push's markers are compared as tuples, so the same marker in the
+>   other format is not kept twice (`a_held_marker_in_the_other_format_is_not_kept_again`, red).
 > - A daemon's allocation by site under stock Mercurial measured BUILT (2026-11-23, w-hg; main's order (A)):
 >   `crates/server/tests/hg_push_heap.rs`, its own binary (`LargeMapped` with a byte sampler on while a row runs), an
 >   in-process daemon with a store and the cleartext HTTP edge, real `hg` subprocesses pushing a 400-changeset
