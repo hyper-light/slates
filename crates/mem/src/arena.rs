@@ -868,9 +868,46 @@ impl ChunkArena {
 
   /// Allocates at least `len` bytes from the first region that can serve it.
   pub fn alloc(&mut self, len: usize, owner: Owner) -> Result<Extent, MemError> {
+    self.alloc_asking(len, len, owner)
+  }
+
+  /// [`ChunkArena::alloc`] of a block of `len` bytes for a caller that needs only `asked` of them (a window of 1 KB in a
+  /// page-rounded block): the owner's asked bytes count `asked`, so its asked against its held names the rounding.
+  pub fn alloc_asking(
+    &mut self,
+    len: usize,
+    asked: usize,
+    owner: Owner,
+  ) -> Result<Extent, MemError> {
     let extent = self.alloc_block(len)?;
-    self.record(extent, owner, extent.len(), len);
+    self.record(extent, owner, extent.len(), asked.min(extent.len()));
     Ok(extent)
+  }
+
+  /// Sets the bytes the block whose head is `head` is asked for to `asked`, at most the head's length, and its owner's
+  /// asked bytes with it: a block several callers share (a slab of repository windows, goal 93) asks what its live
+  /// callers need, so its owner's asked against its held names the slots let go as well as the rounding. A head no
+  /// owner holds changes nothing.
+  pub fn reask(&mut self, head: Extent, asked: usize) {
+    let granule = self.granule.max(1);
+    let asked = u32::try_from(asked.min(head.len())).unwrap_or(u32::MAX);
+    let Some(slot) = self.slot_mut(head.region) else {
+      return;
+    };
+    let at = head.offset().checked_div(granule).unwrap_or(0);
+    let Some(owner) = slot.heads.get(at).copied().and_then(Owner::of_code) else {
+      return;
+    };
+    let Some(kept) = slot.asked.get_mut(at) else {
+      return;
+    };
+    let was = core::mem::replace(kept, asked);
+    if let Some(total) = self.owned.get_mut(owner.index()) {
+      total.asked = total
+        .asked
+        .saturating_sub(u64::from(was))
+        .saturating_add(u64::from(asked));
+    }
   }
 
   /// [`ChunkArena::alloc`] before the block is recorded as its owner's.
@@ -929,7 +966,17 @@ impl ChunkArena {
   /// [`ChunkArena::alloc`], locked in RAM before it is handed out (a strict volume's new content). One the OS will not
   /// lock goes back, and the refusal is the lock's.
   pub fn alloc_locked(&mut self, len: usize, owner: Owner) -> Result<Extent, MemError> {
-    let extent = self.alloc(len, owner)?;
+    self.alloc_locked_asking(len, len, owner)
+  }
+
+  /// [`ChunkArena::alloc_locked`] asking for `asked` of the block's bytes, as [`ChunkArena::alloc_asking`].
+  pub fn alloc_locked_asking(
+    &mut self,
+    len: usize,
+    asked: usize,
+    owner: Owner,
+  ) -> Result<Extent, MemError> {
+    let extent = self.alloc_asking(len, asked, owner)?;
     if let Err(e) = self.lock_extent(extent) {
       self.free(extent)?;
       return Err(e);
