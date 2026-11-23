@@ -321,7 +321,7 @@ fn t_a824_a_log_meeting_a_retired_record_version_is_refused_typed_and_a_version_
 fn let_go_region_holds_since(state: &mut ShardState, kept: &[ContentId]) {
   for identity in super::homes::region_held_here() {
     if !kept.contains(&identity) {
-      let _ = super::homes::let_go_for_region(state, &identity);
+      let _ = super::homes::let_go_for_region(state, &identity, None);
     }
   }
   super::settle(state);

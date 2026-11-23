@@ -251,7 +251,8 @@ fn a_base_symlink_pointing_outside_is_never_followed_to_the_host() {
 }
 
 /// AC-1.9 on a real tree: an overlay over `crates/` costs one directory open and one node; a
-/// path resolution opens only the directories on it, and a read returns the disk's bytes.
+/// path resolution opens only the directories on it, and a read returns the disk's bytes. A read
+/// with no handle holding the file open keeps no descriptor once its borrow ends (A-832).
 #[test]
 fn an_overlay_over_the_workspace_tree_costs_one_open_and_reads_the_disk() {
   let (mut host, root) = OsHost::open_root(&crates_dir()).unwrap();
@@ -287,8 +288,8 @@ fn an_overlay_over_the_workspace_tree_costs_one_open_and_reads_the_disk() {
   }
   assert_eq!(
     host.open_handles(),
-    4,
-    "root, vfs, src, and the file's descriptor"
+    3,
+    "root, vfs and src: no handle held the file open, so the read's descriptor closed with its borrow (A-832)"
   );
   assert!(vol.diverged(&store).is_empty());
   assert_eq!(

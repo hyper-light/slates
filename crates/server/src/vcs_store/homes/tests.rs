@@ -50,7 +50,13 @@ fn windows_are_homed_read_and_let_go_at_their_identitys_shard() {
       let mut homes = std::collections::BTreeSet::new();
       for index in 0..WINDOWS {
         let bytes = window(index);
-        let homed = keep_region_at_home(origin, &shards, bytes.clone(), budget).await;
+        let homed = keep_region_at_home(
+          origin,
+          &shards,
+          (bytes.clone(), vec![super::TEST_OWNER]),
+          budget,
+        )
+        .await;
         let Ok((identity, _)) = homed else {
           outcome.push(format!("window {index} not homed: {homed:?}"));
           continue;
@@ -65,10 +71,16 @@ fn windows_are_homed_read_and_let_go_at_their_identitys_shard() {
       }
       let twice = window(0);
       let identity = ContentId::of(&twice);
-      let _ = keep_region_at_home(origin, &shards, twice.clone(), budget).await;
+      let _ = keep_region_at_home(
+        origin,
+        &shards,
+        (twice.clone(), vec![super::TEST_OWNER]),
+        budget,
+      )
+      .await;
       for index in 0..WINDOWS {
         let identity = ContentId::of(&window(index));
-        if let_go_region_at_home(origin, &shards, identity, budget)
+        if let_go_region_at_home(origin, &shards, identity, Some(super::TEST_OWNER), budget)
           .await
           .is_err()
         {
@@ -78,7 +90,7 @@ fn windows_are_homed_read_and_let_go_at_their_identitys_shard() {
       if read(origin, &shards, identity, budget).await.is_some() {
         outcome.push("a window kept twice for the region outlived its one let-go".to_owned());
       }
-      if let_go_region_at_home(origin, &shards, identity, budget)
+      if let_go_region_at_home(origin, &shards, identity, Some(super::TEST_OWNER), budget)
         .await
         .is_ok()
       {
@@ -100,13 +112,13 @@ fn windows_are_homed_read_and_let_go_at_their_identitys_shard() {
       // An object past a window is homed whole under the BLAKE3 of its bytes (the identity rule), each home cutting its
       // own windows; let go again, as the windows were.
       let identity = ContentId::of(&past);
-      match keep_region_at_home(origin, &shards, past, budget).await {
+      match keep_region_at_home(origin, &shards, (past, vec![super::TEST_OWNER]), budget).await {
         Ok((homed, _)) if homed == identity => {}
         other => outcome.push(format!(
           "an object past a window not homed by its BLAKE3: {other:?}"
         )),
       }
-      if let_go_region_at_home(origin, &shards, identity, budget)
+      if let_go_region_at_home(origin, &shards, identity, Some(super::TEST_OWNER), budget)
         .await
         .is_err()
       {
@@ -170,9 +182,10 @@ fn a_homed_windows_ticket_is_published_only_once_its_homes_image_is() {
         .map(window)
         .find(|bytes| home_of(&shards, &ContentId::of(bytes)) == Some(other))
         .unwrap();
-      let (_, ticket) = keep_region_at_home(origin, &shards, bytes, budget)
-        .await
-        .unwrap();
+      let (_, ticket) =
+        keep_region_at_home(origin, &shards, (bytes, vec![super::TEST_OWNER]), budget)
+          .await
+          .unwrap();
       if ticket.shard != other {
         outcome.push(format!(
           "the ticket names {} not the home {other}",
@@ -259,6 +272,7 @@ fn a_put_from_the_region_is_kept_on_its_home_shard_and_acknowledged_only_once_it
       let identity = ContentId::of(&bytes).0;
       let home = home_of(&shards, &ContentId(identity)).unwrap();
       let put = HomeMessage::Put {
+        owners: vec![super::TEST_OWNER],
         identity,
         bytes: bytes.clone(),
       }
@@ -312,7 +326,16 @@ fn a_put_from_the_region_is_kept_on_its_home_shard_and_acknowledged_only_once_it
       // The region holds a window once however often it was put (the healer's offers are idempotent): one let-go
       // frees it, and a second finds it no longer held for the region.
       let answer = HomeMessage::decode(
-        &serve_remote(origin, &HomeMessage::LetGo { identity }.encode(), budget).await,
+        &serve_remote(
+          origin,
+          &HomeMessage::LetGo {
+            identity,
+            owner: Some(super::TEST_OWNER),
+          }
+          .encode(),
+          budget,
+        )
+        .await,
       );
       if !matches!(
         answer,
@@ -324,7 +347,16 @@ fn a_put_from_the_region_is_kept_on_its_home_shard_and_acknowledged_only_once_it
         outcome.push(format!("not let go: {answer:?}"));
       }
       let again = HomeMessage::decode(
-        &serve_remote(origin, &HomeMessage::LetGo { identity }.encode(), budget).await,
+        &serve_remote(
+          origin,
+          &HomeMessage::LetGo {
+            identity,
+            owner: Some(super::TEST_OWNER),
+          }
+          .encode(),
+          budget,
+        )
+        .await,
       );
       if !matches!(
         again,
@@ -346,6 +378,7 @@ fn a_put_from_the_region_is_kept_on_its_home_shard_and_acknowledged_only_once_it
         outcome.push(format!("read after its last let-go: {gone:?}"));
       }
       let misnamed = HomeMessage::Put {
+        owners: vec![super::TEST_OWNER],
         identity,
         bytes: b"other bytes".to_vec(),
       }
@@ -395,8 +428,8 @@ fn the_healer_on_a_lone_node_moves_nothing_and_region_offers_are_idempotent() {
           origin,
           home,
           move |state| {
-            let first = keep_for_region(state, &bytes).is_ok();
-            let second = keep_for_region(state, &bytes).is_ok();
+            let first = keep_for_region(state, &bytes, &[super::TEST_OWNER]).is_ok();
+            let second = keep_for_region(state, &bytes, &[super::TEST_OWNER]).is_ok();
             let identity = ContentId::of(&bytes);
             let holders = state
               .vcs_stores
@@ -431,7 +464,7 @@ fn the_healer_on_a_lone_node_moves_nothing_and_region_offers_are_idempotent() {
           origin,
           home,
           move |state| {
-            let first = let_go_for_region(state, &identity).is_ok();
+            let first = let_go_for_region(state, &identity, Some(super::TEST_OWNER)).is_ok();
             let gone = !state
               .vcs_stores
               .content
@@ -516,7 +549,7 @@ fn an_object_is_homed_in_the_region_only_once_its_homes_image_is_published() {
       let short = slates_cluster::CommitBudget::hard(budget / 50, (budget / 500).max(1));
       // Homed only once its home has published an image holding it: the wait publishes the home itself where nothing
       // else has, counted.
-      if home_in_region(origin, &shards, bytes.clone(), short)
+      if home_in_region(origin, &shards, (bytes.clone(), super::TEST_OWNER), short)
         .await
         .outcome
         .is_ok()
@@ -546,7 +579,10 @@ fn an_object_is_homed_in_the_region_only_once_its_homes_image_is_published() {
       .unwrap();
       slates_rt::futures::detach(publisher).unwrap();
       let full = slates_cluster::CommitBudget::hard(budget, (budget / 100).max(1));
-      match home_in_region(origin, &shards, bytes, full).await.outcome {
+      match home_in_region(origin, &shards, (bytes, super::TEST_OWNER), full)
+        .await
+        .outcome
+      {
         Ok(homed) if homed == identity => {}
         other => outcome.push(format!("not homed after the publication: {other:?}")),
       }
@@ -603,7 +639,7 @@ fn an_object_longer_than_a_window_is_homed_and_read_back_by_its_blake3() {
         .map(|at| u8::try_from(at % 251).unwrap_or(0))
         .collect();
       let identity = ContentId::of(&bytes);
-      match home_in_region(origin, &shards, bytes.clone(), full)
+      match home_in_region(origin, &shards, (bytes.clone(), super::TEST_OWNER), full)
         .await
         .outcome
       {
@@ -653,7 +689,7 @@ fn a_region_object_remains_readable_when_a_landed_file_shares_its_first_window()
     .find(|text| home_of(&shards, &ContentId::of(text)) == Some(shared_home))
     .expect("an independent file whose window may leave this shard");
   let (before, after, freed) = crate::daemon::observe_at(&daemon, partition, move |state| {
-    let (object, _) = super::keep_for_region(state, &bytes).unwrap();
+    let (object, _) = super::keep_for_region(state, &bytes, &[super::TEST_OWNER]).unwrap();
     let before = super::read_here(state, &object).as_deref() == Some(bytes.as_slice());
     let files =
       crate::vcs_store::within_budget(state, (window + independent.len()) as u64, |stores| {
@@ -716,7 +752,7 @@ fn a_segments_texts_that_rank_on_their_shard_are_let_go_at_its_durability() {
     .collect();
   let region_object = b"an object the region holds here".to_vec();
   let (gone, pinned, freed, read) = crate::daemon::observe_at(&daemon, 0, move |state| {
-    let (object, _) = super::keep_for_region(state, &region_object).unwrap();
+    let (object, _) = super::keep_for_region(state, &region_object, &[super::TEST_OWNER]).unwrap();
     let need: u64 = texts.iter().map(|text| text.len() as u64).sum();
     let ids: Vec<ContentId> = crate::vcs_store::within_budget(state, need, |stores| {
       let content = stores.content_mut().unwrap();
@@ -760,4 +796,171 @@ fn a_segments_texts_that_rank_on_their_shard_are_let_go_at_its_durability() {
     Some(b"an object the region holds here".as_slice()),
     "the region's object still read whole from its home"
   );
+}
+
+/// A-727 (d1a), owners (main 01a20182's rulings of 2026-11-23). Do: on one shard, keep an object for an attempt, again
+/// for the same attempt, then for another repository's records; move the attempt's hold to its records; let each owner
+/// go in turn. Expect: one content-store hold whatever the owners (retries flat); the owners each once; a move naming the
+/// records, the attempt's let-go after it finding nothing; the object held until its last owner goes, then given back,
+/// the store's holders as before the first keep.
+#[test]
+fn a_region_hold_is_kept_once_per_owner_and_goes_with_its_last_owner() {
+  use slates_cluster::homes::HomeOwner;
+  let outcome = crate::daemon::audit_on_shard(|state| {
+    let attempt = HomeOwner::Attempt {
+      repository: [1; 16],
+      node: slates_db::HostId(1),
+      process: 7,
+      attempt: 1,
+    };
+    let records = HomeOwner::Record {
+      repository: [1; 16],
+    };
+    let other = HomeOwner::Record {
+      repository: [2; 16],
+    };
+    let bytes = b"an object two repositories home in the region".to_vec();
+    let holders = |state: &crate::state::ShardState, identity| {
+      state
+        .vcs_stores
+        .content()
+        .map_or(0, |content| content.holders(identity))
+    };
+    let (identity, _) = super::keep_for_region(state, &bytes, &[attempt]).unwrap();
+    let once = holders(state, &identity);
+    let _ = super::keep_for_region(state, &bytes, &[attempt]).unwrap();
+    let _ = super::keep_for_region(state, &bytes, &[other]).unwrap();
+    let flat = holders(state, &identity) == once;
+    let owners = super::region_owners(&identity);
+    let moved = super::move_region_owner(&identity, (attempt, records)).is_ok();
+    let after_move = super::region_owners(&identity);
+    let stale = super::let_go_for_region(state, &identity, Some(attempt));
+    let first = super::let_go_for_region(state, &identity, Some(records)).is_ok();
+    let kept = super::region_holds_here(&identity);
+    let last = super::let_go_for_region(state, &identity, Some(other)).is_ok();
+    let gone = super::region_holds_here(&identity);
+    (
+      (once, flat),
+      (owners, moved, after_move),
+      (stale, first, kept, last, gone),
+    )
+  });
+  let ((once, flat), (owners, moved, after_move), (stale, first, kept, last, gone)) = outcome;
+  assert_eq!(once, 1, "one hold of the store's for the region");
+  assert!(flat, "a retry and a second owner take no further hold");
+  assert_eq!(owners.len(), 2, "two owners, each once: {owners:?}");
+  assert!(moved, "the attempt's hold moved to its records");
+  assert_eq!(
+    after_move,
+    vec![
+      HomeOwner::Record {
+        repository: [1; 16]
+      },
+      HomeOwner::Record {
+        repository: [2; 16]
+      },
+    ],
+    "the attempt's hold now its records'"
+  );
+  assert_eq!(
+    stale,
+    Err(super::HomeRefused::NotHeld),
+    "the attempt holds nothing once moved"
+  );
+  assert!(first && kept == 1, "held while another owner remains");
+  assert!(last && gone == 0, "given back with its last owner");
+}
+
+/// A-727 (d1a), the image. Do: on one shard, keep an object for two owners, take the shard's held image and read it
+/// back as a restore does; then read an image holding a region hold of the retired ownerless kind. Expect: the hold and
+/// both its owners read back; the retired kind refused typed (`HeldRefused::Retired`), never read as a hold of no owner.
+#[test]
+fn a_region_holds_owners_ride_the_image_and_the_ownerless_kind_is_refused() {
+  use slates_cluster::homes::HomeOwner;
+  let owners = [
+    HomeOwner::Record {
+      repository: [3; 16],
+    },
+    HomeOwner::Attempt {
+      repository: [4; 16],
+      node: slates_db::HostId(9),
+      process: 11,
+      attempt: 2,
+    },
+  ];
+  let (identity, held, retired) = crate::daemon::audit_on_shard(move |state| {
+    let (identity, _) =
+      super::keep_for_region(state, b"an object held for two owners", &owners).unwrap();
+    // The paged families copy the encoder's cut (A-870 piece 2): turned to its end first.
+    crate::content_holder::image_drain(state);
+    while !crate::content_holder::image_turn(state).caught_up {}
+    let image = crate::content_holder::held_image(state);
+    let held = crate::content_holder::split_held(&image).map(|held| held.region_holds);
+    let retired =
+      crate::content_holder::split_held(&[crate::content_holder::retired_region_hold_piece(
+        &identity,
+      )])
+      .err();
+    (identity, held, retired)
+  });
+  let mut expected = owners.to_vec();
+  expected.sort();
+  let held = held.expect("the image read back");
+  let found = held
+    .iter()
+    .find(|(held, _)| *held == identity)
+    .map(|(_, owners)| {
+      let mut owners = owners.clone();
+      owners.sort();
+      owners
+    });
+  assert_eq!(found, Some(expected), "the hold and its owners read back");
+  assert!(
+    matches!(
+      retired,
+      Some(crate::content_holder::HeldRefused::Retired(14))
+    ),
+    "the ownerless kind refused typed: {retired:?}"
+  );
+}
+
+/// A-727 (d1a), no mixed-version homing (main 01a20182's ruling of 2026-11-23: refused at once and typed, never left to
+/// its sender's deadline). Do: serve a version-1 put (its kind byte first, no owner) from the region. Expect: answered at
+/// once with a typed refusal of its version (`HomeRefusal::Version`), counted, nothing kept: its sender fails its homing
+/// at once (a version-1 sender reads no version-2 answer, which fails its exchange as at once).
+#[test]
+fn a_home_message_of_another_version_is_refused_at_once_and_typed() {
+  use slates_cluster::homes::{HomeMessage, HomeOutcome, HomeRefusal};
+  let (answer, refused, held) = crate::test_store::run_on_first(
+    &crate::daemon::audit_daemon(),
+    || async {
+      let mut first = vec![1u8];
+      first.extend_from_slice(&[5; 32]);
+      first.extend_from_slice(&3u32.to_le_bytes());
+      first.extend_from_slice(b"abc");
+      let origin = crate::state::with_state(|state| state.shard).unwrap();
+      let answer = super::serve_remote(origin, &first, crate::daemon::LIVENESS_BUDGET_NS).await;
+      let refused = crate::state::with_state(|state| {
+        state
+          .refusals
+          .get(super::VERSION_REFUSED)
+          .copied()
+          .unwrap_or(0)
+      });
+      (answer, refused, super::region_held_here().len())
+    },
+    std::time::Duration::from_secs(60),
+  );
+  assert!(
+    matches!(
+      HomeMessage::decode(&answer),
+      Ok(HomeMessage::Answer {
+        outcome: HomeOutcome::Refused(HomeRefusal::Version),
+        ..
+      })
+    ),
+    "{answer:?}"
+  );
+  assert_eq!(refused, Some(1), "counted");
+  assert_eq!(held, 0, "nothing kept");
 }

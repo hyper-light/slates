@@ -55770,6 +55770,41 @@ Applied in the same change to: GAPS (§4.17). Status: designed; slices (a1) to (
   same bytes by its identity).
 
 
+- **Slice (d), a holder's replica reads named content (2026-11-23, w-shared; main 01a20182's rulings of 2026-11-23).**
+  A Subversion green could not be taken over: its checkpoint (A-869) and chain (A-760) name their texts, and a holder's
+  replica read none (`merge.replica.checkpoint_unread`). A holder's texts come from **the region's homes**, the one path
+  for version-control content (rejected: shipping changesets to the holders' node stores, a second replication path;
+  the checkpoint carrying the texts again, what A-869 took out). Built as (d1a) the homes' owners, (d1b) Subversion's
+  homing on them, (d2) one read stage before every replica apply, (d3) the live recompute and the takeover.
+  - **(d1a) A region hold names its owners** (`slates_cluster::homes::HomeOwner`, main's rulings (b) and (ii)): the
+    attempt in flight that homed it (its repository, the member and process running it: since SWIM's
+    incarnation starts over at each start and a warm restart keeps the boot nonce, the process's nonce; and its number
+    there, `homes::attempt_owner`), then its repository's
+    records once the attempt's entry commits. `homes::REGION_HELD` keeps each object's owners: one content-store hold
+    however many, a keep idempotent per (object, owner) so a retry stays flat, the bytes given back with the last owner.
+    An attempt's end is settled by one task a shard off the step (`homes::settle_later`): its record committed moves
+    each of its holds to the records at every home (`HomeMessage::Moved`); refused, it lets them go (`LetGo` naming the
+    owner), so another repository's hold of the same object is untouched. git's push and the server's made commits
+    take an attempt at their homing's first ask (`SealedPush::home_owner`), move at `vcs_store::commit`, release at every
+    refusal after homing (`release_homed`, `release_unhomed`); the healer re-offers an object for every owner its hold
+    has. Derived bound: an object's owners are at most the attempts in flight on the repositories that home it (one each,
+    a repository's landing turn admitting one) and those repositories' records. **No old form is read:** the image
+    carries a region hold as kind 20, its owners after its identity; the ownerless kind 14 is refused at a restore,
+    typed (`HeldRefused::Retired`); the home wire leads every message with a version byte (`homes::VERSION`, version 2),
+    and a message of another version, version 1 included, is refused at once and typed: a home answers it
+    `HomeRefusal::Version` (counted `vcs_store.homes.version_refused`), and a sender drops a reply refusing its version
+    or one it cannot read (counted `reply_other_version`), so its homing fails at once, never at its deadline (every
+    request on a record session is answered, `fleet`'s stream dispatch; a version-1 peer's answer to a version-2 message
+    is empty, read as failed at once too). **So a region whose nodes run different home-wire versions homes nothing, and its commits are refused typed
+    until its nodes match: there is no mixed-version homing.** Owed in (d1a-3): an attempt a crash left between the
+    two is resolved from the homes' side once its process has ended (its member dead, or announcing another process nonce),
+    asking the repository's current owner whether a record names the object (`HomeMessage::Resolve`), never on a timer;
+    until then its hold stays, the safe side. Tests: `homes::tests::a_region_hold_is_kept_once_per_owner_and_goes_with_its_last_owner`,
+    `a_region_holds_owners_ride_the_image_and_the_ownerless_kind_is_refused`, `a_home_message_of_another_version_is_refused_at_once_and_typed`,
+    `git_push::tests::t_a727_d1a_a_push_refused_after_its_names_were_homed_leaves_no_hold_in_the_region` (red first: the
+    names' hold stayed for the home's life), `t_a727_d1a_a_refused_push_leaves_another_repositorys_hold_of_the_same_object`,
+    and slates-cluster `homes::tests::a_home_message_of_another_version_or_without_an_owner_is_refused_typed`.
+
 ### A-664 Subversion objects — A version a work submits to a Subversion repository's green becomes the revision the server makes of it (bug, 2026-11-20, w-shared for UI goal 93)
 - **What was there.** A submitted version moved a Subversion repository's one green and made no revision, so the
   green passed its records' youngest revision: every later `svn commit` was refused (its step lands only while the

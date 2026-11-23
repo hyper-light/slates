@@ -16,7 +16,10 @@
 > its overlay borrow ends, and an open's descriptor closes at its last close. A later read reopens through the home and
 > proves the file the inode was made from (A-151). Witnessed large copies keep theirs (their witness reads through it).
 > Red on main: 500 reads left 506 handles open against 6; green: 6 (`reading_base_files_keeps_no_descriptor_after_the_reads`,
-> `an_open_base_file_keeps_its_descriptor_until_its_last_close`).
+> `an_open_base_file_keeps_its_descriptor_until_its_last_close`). The real-disk counterpart
+> (`crates/base/tests/host.rs`, `an_overlay_over_the_workspace_tree_costs_one_open_and_reads_the_disk`) kept the old
+> count, the read's descriptor held after its borrow (3 != 4 on Windows in CI run 45176536354 and on macOS); since
+> 2026-11-23 (w-win) it holds the rule on the disk: root, `vfs` and `src` alone.
 > **Closed (main, 2026-11-21, A-833): a recovery reopened every base directory the image recorded, in one step.** kiln's
 > daemon on adacachy recorded about 192,000, overran the 1 s liveness window and was killed a second into every restart.
 > Now a recovery reopens the root alone; each other directory is reacquired at its first use (`Overlay::reacquire`:
@@ -123,6 +126,16 @@
 > `content.purge_kept_short_bytes` (red-first by use: `slates-mem`
 > `arena::tests::a_free_run_under_the_discard_size_stays_resident_and_is_counted_kept_short`). OWED: arena-13's reading
 > after push-all and again after an idle pass, and the cut it names.
+> **OPEN (A-727 (d1a), w-shared; main 01a20182's rulings of 2026-11-23): region holds name their owners; what is owed.**
+> BUILT: an attempt's holds move to its records at its commit and are let go at its refusal (`homes::settle_later`), so
+> a refused push holds nothing and another repository's hold of the same object stays; the image and the home wire carry
+> owners, version 2, refusing the old forms typed. OWED (d1a-3): an attempt a crash left between homing and its end
+> (or whose settle a home did not answer, counted `vcs_store.homes.settle_unanswered`) keeps its holds until it is
+> resolved from the homes' side once its process ended, by `HomeMessage::Resolve` to its repository's current owner;
+> bounded meanwhile by the attempts a crash or a lost answer left, each one's homed objects. OWED (fleet memory, one item
+> for all three tools): a remote home keeps what it homes in RAM for the history's life, and assembles an object sent
+> in parts whole before keeping it (`homes::stage_part`: a git pack, and Subversion texts once homed): a remote home
+> should land what it keeps on its own node's store, streamed, and let it go, as this node's home does by its record.
 > **A-870 (w-shared; main 01a20182's rulings of 2026-11-22 ~22:10 and ~22:30): a shard image's content-store families
 > published and restored over turns.** Piece 1 BUILT: the families paged (`crate::image_pages`): 3,000 windows let go
 > and 3,000 landed records rode 6,000 pieces, now 17 (534,085 bytes at a 43,912-byte page), restored whole. Piece 2
