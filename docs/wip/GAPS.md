@@ -103,6 +103,10 @@
 > daemon lets nothing go until (2b)(b), homes' own read-through, next). (2b)(b) BUILT (w-shared, A-724 piece 8c): the
 > pack's home records where each of its windows lies on the node's store (`homes::LandedAt`), lets it go and brings it
 > back on a read; the records ride the shard image, so a window with one is not pinned.
+> The kept memory, measured on Linux (main 01a20182, 2026-11-23): with glibc, the gauges carry glibc's own figures over
+> every arena (`mem.gauge.process.malloc_free_bytes`, its arenas' free bytes, fastbins among them; `malloc_mapped_bytes`;
+> `malloc_arena_bytes`), so the remainder above is read there, not inferred; macOS and musl still infer it. OWED: main's
+> Linux RSS round reading them.
 > **A-870 (w-shared; main 01a20182's rulings of 2026-11-22 ~22:10 and ~22:30): a shard image's content-store families
 > published and restored over turns.** Piece 1 BUILT: the families paged (`crate::image_pages`): 3,000 windows let go
 > and 3,000 landed records rode 6,000 pieces, now 17 (534,085 bytes at a 43,912-byte page), restored whole. OWED: piece 2
