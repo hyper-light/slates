@@ -710,3 +710,7 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
   the whole Lineage by value (~10k memmove samples / 30 s push): borrow instead; (ii) each lend makes and drops one
   Green::default (Lent::new over the slot, previous Lent's Drop mem::take). Reds: counters of lends taken vs borrowed,
   and Greens dropped per lend, asserted after the fix.
+- OWED after 4c/4d (main's FYI, r270 vs r70, w-svnperf done so these are mine): piece_fetched 14.7/revision on svnsync
+  (A-876's bar <10; fetch_wait 1.86 ms vs ~1 ms expected); per-piece StoreHandle::ask room round trip on shard 0
+  (vcs_svn::converse -> follow -> svn_texts::fetch_piece -> Room::drop, 418 samples / 60 s): batch a conversation's
+  piece asks, or keep one room per conversation. Profile ~/.cache/main-rounds/svnsync-confirm/sample-svn.txt.
