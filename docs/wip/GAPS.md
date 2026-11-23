@@ -836,7 +836,11 @@
 >   them; a public predecessor refuses (decision 4). The entry appends `StateChange::MarkerAdded` and checks the phases
 >   and markers logs; the served view reads the register's markers after the index's rows (`State::markers`), so a
 >   clone takes them and the filter hides what they obsolete. `markers` moved from `getbundle::Store` to `Repository`.
->   Still owed: decision 3's rewrite admission and the `obsolete` pushkey namespace. BUILT since: the reply's `N new
+>   Still owed: decision 3's rewrite admission. Not to be built: the `obsolete` pushkey namespace (2026-11-23, read in
+>   7.2's `exchange.py`): stock 7.2 pushes and pulls markers by it only where the server's bundle2 capabilities share
+>   no `obsmarkers` version (`_pushb2obsmarkers` and the pull's bundle2 prepare mark the step done otherwise, so
+>   `_pushobsolete` and `_pullobsolete` return), and this server advertises `obsmarkers=V0,V1`; only `hg debugpushkey`
+>   names it. BUILT since: the reply's `N new
 >   obsolescence markers` output; the kept heads for a view with left-out changesets (piece 2, below); a
 >   non-publishing repository and its hidden view (piece 3, below).
 >   Markers as 7.2 holds them BUILT (2026-11-23, w-hg): a repository holding a format 0 marker (an old obsstore's
@@ -929,6 +933,16 @@
 >   bytes grown holding 6,553,600, now 90,424 holding 6,029,312). The hg intake's whole texts (`intake::rebuilt`,
 >   `HgIndex::revision_text`, `Taker::file_base`; 3.52 GB of the [128 KiB, 256 KiB) band's churn with the cache's
 >   share) are w-hg's, in C1. Owed: main's arena round for RSS.
+>   The intake's rebuilt file texts cut BUILT (2026-11-23, w-hg; main's order, C1 first by bytes): a file revision was
+>   rebuilt into a buffer of its own and every text of its group kept in the push's cache until the group ended, so a
+>   push allocated each file text it brought once (`intake::rebuilt`, 3.76 GB freed within a second over Mercurial's
+>   own push, 1.07 GB in the [128 KiB, 256 KiB) band). Now the cache keeps only a text a delta past the next one rests
+>   on (`Frame::based_later`, one bit a revision told when the framing is made), and every text the intake lets go is
+>   a later rebuild's buffer (`Spares`, at most four and the cache's bound). `push_heap`'s
+>   `a_pushs_churn_per_changeset_is_its_file_alone`, red at 28,855 B an edit of a 16 KiB file (1.76 copies), 177,497 B
+>   of a 160 KiB one (1.08) with the buffer reused alone; now 12,047 B and 13,674 B (0.74, 0.08), no copy. Owed:
+>   `HgIndex::revision_text`'s buffers and `object_bytes`, then `Taker::file_base`; the 57k push's reading
+>   (`hg_push_lifetimes`, w-perf's) after them.
 >   Its bound from the work BUILT (main's ruling, 2026-11-23): the chain no longer needs its texts held, so the cache holds
 >   the distinct texts its last `waiting` reads lent (one a waiting request, the owner's room) and a chunk's room
 >   (`TextCache::for_reads`), the least lately read out first; a text past it is lent from the buffer it was made into.
