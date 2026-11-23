@@ -538,3 +538,7 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   releases 0 at every size; MallocSpaceEfficient 515 -> 3 MB at 5-8x churn cost; main's ruling (3)); GAPS under w-svn's
   import: the rejection, and OPEN upstream: the import churns ~500 MB of small blocks (r80: MALLOC_SMALL (empty)
   235.0 MB dirty), owed a bounded working set per push (w-svn's).
+- LANDED (2026-11-22 ~20:30 PST), main's lint wall at 6b36e0269, one commit a crate, fixed by reading (no clippy run
+  here, §8): vcs cfe2ffebe (content.rs test split, complexity 12/10), hg 3abcd0096 (render.rs rows_a_step checked_div),
+  mem 5cf62a3a4 (arena.rs grow saturating_sub; the deny is crate-wide, no Windows-only cfg found). Earlier: every error
+  in nightly 45017186325 and the ee1c9005b jobs already fixed at 96e6f2170. main reruns the wall after w-svn's seven.
