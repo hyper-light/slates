@@ -4485,7 +4485,12 @@ fn a_thin_push_whose_base_was_let_go_lands() {
   let created = pushed(edge, &name, &request);
   let ids: Vec<slates_vcs::ContentId> =
     pack.chunks(window).map(slates_vcs::ContentId::of).collect();
+  let pack_identity = slates_vcs::ContentId::of(&pack);
   let gone: Vec<bool> = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    // The pack's home here, where it holds the pack for the region, records its windows and lets them go first, as a
+    // landed pack's let-go tells it (A-724 piece 8c, goal 93 item 2b(b)): a window of an object the region holds is
+    // pinned until then (`vcs_store::landed_pin`).
+    crate::vcs_store::homes::landed_pack_here(state, pack_identity);
     crate::vcs_store::within_budget(state, 0, |stores| {
       let content = stores.content_mut().expect("the content store");
       for id in &ids {
@@ -4625,12 +4630,17 @@ fn a_create_at_a_commit_let_go_lands() {
   let created = pushed(edge, &name, &request);
   let ids: Vec<slates_vcs::ContentId> =
     pack.chunks(window).map(slates_vcs::ContentId::of).collect();
+  let pack_identity = slates_vcs::ContentId::of(&pack);
   let gone: Vec<bool> = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
     // The repository goes idle first: the objects its reads keep lately, the line's commits among them, given back, so
     // the create's verdict reads its commit from its window.
     for id in state.vcs_stores.git_repositories() {
       crate::vcs_store::git_encode::give_back_idle(state, id);
     }
+    // The pack's home here, where it holds the pack for the region, records its windows and lets them go first, as a
+    // landed pack's let-go tells it (A-724 piece 8c, goal 93 item 2b(b)): a window of an object the region holds is
+    // pinned until then (`vcs_store::landed_pin`).
+    crate::vcs_store::homes::landed_pack_here(state, pack_identity);
     crate::vcs_store::within_budget(state, 0, |stores| {
       let content = stores.content_mut().expect("the content store");
       for id in &ids {
