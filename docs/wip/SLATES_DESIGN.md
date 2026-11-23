@@ -61679,3 +61679,37 @@ retirement; `landing.rs`: `abandon_presentations` removed, `forget_presentations
   then another client grants and lands; refused `NotFound` before), `a_presentation_goes_with_its_volume` (one
   awaiting after a destroy before, none after), `another_clients_presentation_still_replaces_and_the_bound_still_refuses`,
   and the CLI's session-grant test, red before and green after.
+
+### A-876 — A reader of a stored text holds the piece it fetched while it reads on in it (2026-11-23, w-svnperf for main 01a20182; goal 93: svnsync over svn:// and HTTP, svn:// update; C2 stage B part 2; A-749, A-751)
+
+- **Why.** Since C2 stage B part 2 (b) no RAM keeps a committed text once its revision stands: a reader reads it back
+  a piece (`slates_store::store::PIECE_BYTES`, 64 KiB) at a time through `svn_texts::fetch_piece`, one round trip to
+  the store's owner thread a piece. Each reader let its piece go after the one call that waited for it. But a call runs
+  the drive for one shard quantum (A-751), and each window step reads at most `STEP_WORK` (1,024) bytes, so a call read
+  a few KiB of the piece, and the next call fetched it again from where the drive stood. Main's r70 (the big Studio,
+  quiet, main 33b5fe7b1, `an_svnsync_measured` over git-2000): svnsync fetched 28.4 pieces a revision over svn:// and
+  28.1 over HTTP, and over svn:// waited 3.42 ms a revision on them, of a 146.1 ms revision that svnsync's own mirror
+  commits bound (`vcs_svn.write_wait_ns`, 125.9 ms).
+- **The rule.** A reader holds the one piece it fetched while it reads on in it. It lets it go when it waits for
+  another piece, when its read's answer ends (`Connection::fetching`), before its conversation moves to another
+  shard, or by its drop. Still one piece a reader, the bound `svn_texts::Pieces` counts.
+- **Where.** `svn_view::FetchedPiece`, beside `SvnHold`: fetched through `fetch_piece`, given back through `let_go` by
+  its drop, on the shard whose pieces hold it, so a reader dropped mid-read (a reaped connection) leaks nothing; it is
+  made only once the fetch succeeds, so a failed fetch gives back no other reader's hold. The two `SvnStores` traits'
+  `fetch` return it, and their `let_go` is gone. The svn:// listener (`vcs_svn`), the SSH tunnel (`vcs_ssh::svn`) and
+  DAV's report (`vcs_http::svn`: its first slices hold the piece in the exchange, so its later slices read on in it)
+  follow the rule. DAV's GET and the export's walk (`TextSource::read_step`) read a fetched piece whole in one call, so
+  they let it go after it, as before.
+- **A leak fixed with it.** DAV's first slices kept their piece in a local: a wait met with output already pending
+  returned the report and dropped the local without letting the piece go, so its hold stayed in `Pieces` for good.
+- **Tests** (debug, this MacBook, load 30 to 65). Each holds the pieces fetched to one a piece of the text read,
+  `len.div_ceil(PIECE_BYTES)`, and that no piece is kept after. Red before, green after:
+  `vcs_svn::tests::a_replay_fetches_each_piece_of_a_stored_text_once` (a 300 KiB text no longer the head's, replayed
+  over svn:// as svnsync asks a revision: 28 fetches, now at most 5);
+  `vcs_ssh::svn::tests::a_checkout_reads_a_text_ram_does_not_hold_through_the_store` and
+  `a_get_file_revs_reads_a_text_ram_does_not_hold_through_the_store` (200 KiB: 12, now at most 4). New after the fix,
+  its before r70's 28.1 a revision: `vcs_http::svn::tests::a_replay_report_fetches_each_piece_of_a_stored_text_once`.
+  Guards that held before and after: DAV's GET, the tunnel's get-file, both hook views, a commit's whole bring, and the
+  export (two exports of two walks each: 15 fetches of a bound of 16).
+- **Applied in the same change to** `crates/server` (`vcs_store/svn_view`, `vcs_store/svn_texts`'s `Pieces` doc,
+  `vcs_svn`, `vcs_ssh/svn`, `vcs_http/svn`, and the tests named above), GAPS, amendments.tsv.

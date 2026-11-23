@@ -755,6 +755,84 @@ fn a_get_reads_a_text_ram_does_not_hold_through_the_store() {
     bytes.len()
   );
   assert!(fetched >= 1, "no piece read through the store");
+  let pieces = u64::try_from(bytes.len().div_ceil(slates_store::store::PIECE_BYTES)).unwrap();
+  assert!(
+    fetched <= pieces,
+    "{fetched} pieces fetched through the store for a text of {pieces}"
+  );
+  assert_eq!(left, 0, "a fetched piece was kept");
+}
+
+/// Format: a `replay-report` in the 1.8 syntax, as ra_serf's `svnsync synchronize` sends it to `!svn/rev/REV`: the
+/// root, every revision since 0, with deltas (`crates/svn/src/dav/fixtures/replay-report.xml`).
+const REPLAY_1_8: &[u8] = b"<S:replay-report xmlns:S=\"svn:\"><S:include-path></S:include-path>\
+<S:low-water-mark>0</S:low-water-mark><S:send-deltas>1</S:send-deltas></S:replay-report>";
+
+/// Goal 93's svnsync over HTTP (A-876; 28.1 pieces fetched a revision in main's r70): a replay report reads a stored
+/// text through the node's store a piece at a time, each piece fetched once. Do: on a daemon whose repository `stored`
+/// has a revision 1 adding `/trunk/a.bin`, every hold RAM has on its text let go
+/// (`crate::test_store::a_text_only_the_store_holds`), REPORT [`REPLAY_1_8`] at `/stored/!svn/rev/1`, as ra_serf's
+/// `svnsync synchronize` sends it, as its owner through the daemon's own lender and finder, on its shard. Expect `200`
+/// and the report whole (its `editor-report` closed), the text read through the store
+/// (`vcs_store.svn_texts.piece_fetched` at least once) at most once a piece, and every fetched piece let go after.
+#[test]
+fn a_replay_report_fetches_each_piece_of_a_stored_text_once() {
+  let bytes = crate::test_store::noise(200 << 10);
+  let (_store, daemon, _) =
+    crate::test_store::a_text_only_the_store_holds(&principal(OWNER), "stored", &bytes);
+  let (status, reply) = crate::test_store::run_on_first(
+    &daemon,
+    || async {
+      let mut site = SvnSite::new(
+        REALM.to_owned(),
+        ROOM,
+        Tokens,
+        super::super::daemon_edge::ShardRepositories,
+        ServedRecords,
+      );
+      let owner = basic("alice", OWNER_TOKEN);
+      let asked = request("REPORT", "/stored/!svn/rev/1", &[owner.as_str()]);
+      let Answer::Serve { mut exchange, .. } = site.answer(&head(&asked)).await.answer else {
+        panic!("the REPORT not served");
+      };
+      exchange.body(REPLAY_1_8).await.unwrap();
+      exchange.body_end(ClientGone::never()).await.unwrap();
+      let status = exchange.reply_status().code;
+      let mut reply = Vec::new();
+      while exchange
+        .reply(&mut reply, ClientGone::never())
+        .await
+        .unwrap()
+      {}
+      (status, reply)
+    },
+    std::time::Duration::from_secs(60),
+  );
+  let (fetched, left) = crate::daemon::observe_first(&daemon, |state| {
+    (
+      state
+        .refusals
+        .get(crate::vcs_store::svn_texts::PIECE_FETCHED)
+        .copied()
+        .unwrap_or(0),
+      state.vcs_stores.svn_pieces_held(),
+    )
+  });
+  daemon.stop();
+  let tail = String::from_utf8_lossy(
+    reply
+      .get(reply.len().saturating_sub(300)..)
+      .unwrap_or_default(),
+  )
+  .into_owned();
+  assert_eq!(status, 200, "{tail}");
+  assert!(reply.ends_with(b"</S:editor-report>\n"), "{tail}");
+  assert!(fetched >= 1, "no piece read through the store");
+  let pieces = u64::try_from(bytes.len().div_ceil(slates_store::store::PIECE_BYTES)).unwrap();
+  assert!(
+    fetched <= pieces,
+    "{fetched} pieces fetched through the store for a text of {pieces}"
+  );
   assert_eq!(left, 0, "a fetched piece was kept");
 }
 
