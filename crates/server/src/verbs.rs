@@ -21227,6 +21227,7 @@ fn recover_images(state: &mut ShardState) -> RecoveredImages {
       state.journal = journal;
       state.published_keys = shard.volumes.iter().map(|keyed| keyed.key).collect();
       state.published_held = crate::content_holder::published_from(&shard.held);
+      state.image_encoder = crate::content_holder::image_encoder_of(&shard.held);
       RecoveredImages {
         volumes: shard
           .volumes
@@ -21514,7 +21515,10 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
   }
   // The replicas this shard holds for other owners ride the same image (AUD-29-59): a holder acknowledges a
   // content put only once a publish carrying it commits.
-  let (mut held, pages) = crate::content_holder::held_image_paged(state);
+  // A-870 piece 2: the paged families' changes taken and a turn of their encoding run, at most a slice.
+  crate::content_holder::image_drain(state);
+  let _ = crate::content_holder::image_turn(state);
+  let (mut held, image_carried) = crate::content_holder::held_image_paged(state);
   let whole = crate::content_holder::whole_of(&held);
   let owned = crate::content_holder::owned_of(&held);
   let mut replies = pending_replies(state);
@@ -21588,7 +21592,7 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
     .map(|id| id.bytes)
     .collect();
   crate::content_holder::held_committed(state, whole, true);
-  crate::content_holder::pages_committed(state, pages);
+  crate::content_holder::image_committed(state, image_carried);
   crate::live_ship::owned_committed(state, owned, true);
   call_records_published(state);
   // Every volume captured: this image holds every logged write, so the write log empties, stamped with this
@@ -21917,6 +21921,9 @@ fn publish_delta_into(
     .filter(|key| !present.contains(*key))
     .copied()
     .collect();
+  // A-870 piece 2: the paged families' changes taken and a turn of their encoding run, at most a slice.
+  crate::content_holder::image_drain(state);
+  let _ = crate::content_holder::image_turn(state);
   let mut held = crate::content_holder::held_changes(state);
   let (mut calls, mut calls_removed) = call_records_delta(state);
   let mut nfs_replies = held_nfs_replies_changed(state).then(|| held_nfs_replies(state));
@@ -21981,7 +21988,7 @@ fn publish_delta_into(
     state.count(DELTA_HELD_BYTES, u64::try_from(carried).unwrap_or(u64::MAX));
   }
   crate::content_holder::held_committed(state, held.whole, false);
-  crate::content_holder::pages_committed(state, held.pages);
+  crate::content_holder::image_committed(state, held.image_carried);
   crate::live_ship::owned_committed(state, held.owned, false);
   call_records_published(state);
   settle_write_log(state, &published.skipped, state.journal.generation());

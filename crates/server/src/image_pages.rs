@@ -335,6 +335,207 @@ impl Directories {
   }
 }
 
+/// What a shard's image encoder holds (A-870 piece 2; main 01a20182's ruling of 2026-11-23: the encoding moves off the
+/// publication's step, the image a cut of one moment). The pages of the last committed cut, as their bytes, so a
+/// checkpoint copies them; the pages re-encoded since, a slice a turn ([`Encoder::turn`]), and the directories they
+/// make; the pages a change since lies in and no turn has re-encoded yet. A publication carries the re-encoded pages
+/// only where none is dirty ([`Encoder::cut`]): then they and the committed ones are the shard's entries at that
+/// moment exactly. Otherwise it carries the committed cut again, and the arena keeps every block that cut names.
+#[derive(Debug, Default)]
+pub(crate) struct Encoder {
+  /// Each page's bytes in the last committed cut.
+  committed: BTreeMap<(Family, Page), Vec<u8>>,
+  /// The directories as the pages re-encoded since leave them.
+  working: Directories,
+  /// The pages re-encoded since the last committed cut: each one's bytes, none for a page now of no entry (its piece
+  /// removed).
+  pending: BTreeMap<(Family, Page), Option<Vec<u8>>>,
+  /// The pages a change since lies in, not yet re-encoded.
+  dirty: BTreeSet<(Family, Page)>,
+  /// Owed since a publication found the pages dirty: the turn it began at and how many turns it may take
+  /// ([`Encoder::skipped`]).
+  owed: Option<(u64, u64)>,
+  /// The turns the encoder has run.
+  turns: u64,
+  /// Whether a task is encoding on to publish once caught up (`content_holder::image_catch_up`).
+  catching_up: bool,
+}
+
+/// What a turn of the encoder did: the bytes it encoded, and whether no page is dirty after it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Turned {
+  /// The bytes encoded.
+  pub(crate) bytes: u64,
+  /// Whether every change is encoded.
+  pub(crate) caught_up: bool,
+}
+
+impl Encoder {
+  /// The encoder of a recovered image's `pages` (each family's page and its piece's bytes): its committed cut.
+  pub(crate) fn restored(pages: Vec<((Family, Page), Vec<u8>)>) -> Encoder {
+    let mut by_family: BTreeMap<Family, Vec<Page>> = BTreeMap::new();
+    for ((family, page), _) in &pages {
+      by_family.entry(*family).or_default().push(*page);
+    }
+    let directories = Directories {
+      families: by_family
+        .into_iter()
+        .map(|(family, pages)| (family, Directory::of(pages)))
+        .collect(),
+    };
+    Encoder {
+      committed: pages.into_iter().collect(),
+      working: directories,
+      ..Encoder::default()
+    }
+  }
+
+  /// Notes the coordinates of `family`'s entries changed since: the pages they lie in are dirty.
+  pub(crate) fn mark(&mut self, family: Family, coordinates: impl IntoIterator<Item = u64>) {
+    let directory = self.working.of(family);
+    for page in directory.plan_dirty(coordinates) {
+      self.dirty.insert((family, page));
+    }
+  }
+
+  /// Whether a change is not yet encoded.
+  pub(crate) fn is_dirty(&self) -> bool {
+    !self.dirty.is_empty()
+  }
+
+  /// Re-encodes dirty pages until `limit` bytes are spent (at least one page), each from what the shard holds now
+  /// (`entries` of a family over a range of coordinates), one past twice `page` bytes split into the pages it now fills.
+  pub(crate) fn turn(
+    &mut self,
+    (limit, page_bytes): (usize, usize),
+    entries: &dyn Fn(Family, (u64, u64)) -> Vec<Entry>,
+  ) -> Turned {
+    self.turns = self.turns.saturating_add(1);
+    let mut spent = 0usize;
+    while spent < limit {
+      let Some((family, page)) = self.dirty.pop_first() else {
+        break;
+      };
+      let held = entries(family, (page.start, page.last()));
+      let planned = if bytes_of(&held) > page_bytes.saturating_mul(2) {
+        // Its own piece removed, its halves put.
+        self.pending.insert((family, page), None);
+        plan(&held, page, page_bytes)
+      } else {
+        vec![(page, 0..held.len())]
+      };
+      for (into, range) in &planned {
+        let bytes = held
+          .get(range.clone())
+          .filter(|held| !held.is_empty())
+          .map(encode_page);
+        spent = spent.saturating_add(bytes.as_ref().map_or(0, Vec::len));
+        self.pending.insert((family, *into), bytes);
+      }
+      let mut directory = self.working.of(family);
+      directory.replace(page, planned.into_iter().map(|(page, _)| page));
+      self.working.families.insert(family, directory);
+    }
+    Turned {
+      bytes: u64::try_from(spent).unwrap_or(u64::MAX),
+      caught_up: self.dirty.is_empty(),
+    }
+  }
+
+  /// The pages a publication carries, where no change is left to encode: each page re-encoded since the last committed
+  /// cut, its bytes or none to remove its piece. None while a page is dirty: the publication carries no page then.
+  pub(crate) fn cut(&self) -> Option<impl Iterator<Item = ((Family, Page), Option<&[u8]>)> + '_> {
+    (!self.is_dirty()).then(|| {
+      self
+        .pending
+        .iter()
+        .map(|(page, bytes)| (*page, bytes.as_deref()))
+    })
+  }
+
+  /// Every page a checkpoint carries with its bytes: the shard's now, where no change is left to encode (the committed
+  /// cut with the re-encoded pages over it), else the committed cut alone; and whether it is the shard's now.
+  pub(crate) fn whole(&self) -> (Vec<((Family, Page), &[u8])>, bool) {
+    if self.is_dirty() {
+      let pages = self
+        .committed
+        .iter()
+        .map(|(page, bytes)| (*page, bytes.as_slice()))
+        .collect();
+      return (pages, false);
+    }
+    let mut pages: BTreeMap<(Family, Page), &[u8]> = self
+      .committed
+      .iter()
+      .map(|(page, bytes)| (*page, bytes.as_slice()))
+      .collect();
+    for (page, bytes) in &self.pending {
+      match bytes {
+        Some(bytes) => {
+          pages.insert(*page, bytes.as_slice());
+        }
+        None => {
+          pages.remove(page);
+        }
+      }
+    }
+    (pages.into_iter().collect(), true)
+  }
+
+  /// A publication committed: where it carried the encoder's cut (`carried`), the re-encoded pages are the committed
+  /// cut now and nothing is owed; else nothing changes.
+  pub(crate) fn committed(&mut self, carried: bool) {
+    if !carried {
+      return;
+    }
+    for (page, bytes) in core::mem::take(&mut self.pending) {
+      match bytes {
+        Some(bytes) => {
+          self.committed.insert(page, bytes);
+        }
+        None => {
+          self.committed.remove(&page);
+        }
+      }
+    }
+    self.owed = None;
+  }
+
+  /// A publication found the pages dirty and carried none: owed from this turn, within a bound of turns derived from
+  /// what is dirty (each dirty page is at most twice the page size and a turn encodes at least the page size, so twice
+  /// the dirty pages and one more). The turns it has been owed, none where it was not.
+  pub(crate) fn skipped(&mut self) -> u64 {
+    let dirty = u64::try_from(self.dirty.len()).unwrap_or(u64::MAX);
+    let turns = self.turns;
+    let (since, _) = *self
+      .owed
+      .get_or_insert((turns, dirty.saturating_mul(2).saturating_add(1)));
+    turns.saturating_sub(since)
+  }
+
+  /// Whether the elective changes pause (main's progress rule): a publication owed past its bound of turns.
+  pub(crate) fn paused(&self) -> bool {
+    self
+      .owed
+      .is_some_and(|(since, bound)| self.turns.saturating_sub(since) > bound)
+  }
+
+  /// Whether a publication is owed.
+  pub(crate) fn owed(&self) -> bool {
+    self.owed.is_some()
+  }
+
+  /// Notes a task encoding on, where none is: whether this one is to start it.
+  pub(crate) fn start_catching_up(&mut self) -> bool {
+    !core::mem::replace(&mut self.catching_up, true)
+  }
+
+  /// Notes the catching-up task ended.
+  pub(crate) fn stop_catching_up(&mut self) {
+    self.catching_up = false;
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;

@@ -1321,6 +1321,9 @@ pub struct ShardState {
   /// may not yet (chain entry format 6): set by `verbs::publish_held_increments` in a transaction, settled by
   /// `verbs::commit_settled` before the transaction's record is appended.
   pub(crate) held_publication_owed: bool,
+  /// The shard image's encoder of the content store's and homes' paged families (A-870 piece 2): their committed cut,
+  /// the pages re-encoded since a slice a turn, and what is still to encode.
+  pub(crate) image_encoder: crate::image_pages::Encoder,
   /// The seals in progress for volumes this node owns (§4.10), by object: each walks the volume's newest
   /// snapshot into its archive in bounded slices, puts the archive to the content candidates until
   /// `f + 1` hold it, and is dropped once the head naming it places and the snapshot is recorded placed.
