@@ -40,6 +40,11 @@ const NO_DATE: &[u8] = b"0 0";
 const PARENT_KEYS: [&[u8]; 3] = [b"p0", b"p1", b"p2"];
 /// Format: hexadecimal, radix 16 (`node.hex`).
 const HEX_RADIX: u32 = 16;
+/// Format: decimal's base, `int()`'s when none is named.
+const RADIX: i64 = 10;
+/// Format: the date `_fm0readmarkers` gives a format 0 date it cannot read, `(0.0, 0)`: the float's bits and the
+/// timezone.
+const UNREAD_DATE: (u64, i64) = (0.0_f64.to_bits(), 0);
 
 /// Format: format 0's separators: between entries, and between an entry's key and value.
 const ENTRY_SEPARATOR: u8 = 0;
@@ -359,18 +364,18 @@ fn put<'e>(entries: &mut Vec<(&'e [u8], Cow<'e, [u8]>)>, key: &'e [u8], value: C
 fn read_date(date: &[u8]) -> Result<(u64, i64), Unread> {
   let mut halves = date.split(|byte| *byte == b' ');
   let (Some(when), Some(offset), None) = (halves.next(), halves.next(), halves.next()) else {
-    return Ok((0.0_f64.to_bits(), 0));
+    return Ok(UNREAD_DATE);
   };
   match (python_float(when), python_int(offset)) {
     (Some(seconds), Some(Ok(offset))) => Ok((seconds.to_bits(), offset)),
     (Some(_), Some(Err(Unread))) => Err(Unread),
-    _ => Ok((0.0_f64.to_bits(), 0)),
+    _ => Ok(UNREAD_DATE),
   }
 }
 
 /// Whether `byte` is whitespace to CPython's `float()` and `int()` of bytes (`Py_ISSPACE`).
 fn python_space(byte: u8) -> bool {
-  matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+  matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c')
 }
 
 /// `text` without the whitespace around it.
@@ -436,7 +441,7 @@ fn python_int(text: &[u8]) -> Option<Result<i64, Unread>> {
   let mut value: i64 = 0;
   for digit in plain {
     let next = value
-      .checked_mul(10)
+      .checked_mul(RADIX)
       .and_then(|value| value.checked_add(i64::from(digit.saturating_sub(b'0'))));
     match next {
       Some(next) => value = next,

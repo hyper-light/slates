@@ -195,7 +195,7 @@ fn the_store_holds_the_texts_its_last_reads_lent_and_no_more() {
   let staging = Staging::new(0);
   let mut cache = TextCache::for_reads(READS);
   let latest = *identities.last().unwrap();
-  let mut read = |store: &mut Store, cache: &mut TextCache, identity: &[u8; 32]| {
+  let read = |store: &mut Store, cache: &mut TextCache, identity: &[u8; 32]| {
     let bytes = store
       .text_at(&staging, 1, identity, 0, cache)
       .unwrap()
