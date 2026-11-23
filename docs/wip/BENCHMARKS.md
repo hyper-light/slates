@@ -17423,6 +17423,87 @@ loaded rounds. Each cell is a round's median of its 3 runs, µs, rounds in order
   - `exit_to_user_mode_loop` (kernel/entry/common.c) honours `_TIF_NEED_RESCHED_LAZY` on any return to user mode.
   - So a woken shard on a CPU whose spinner never enters the kernel runs at that CPU's next tick, whatever its slice.
 
+## 84a on Linux: naps on a thread's own timer (arms G+E and H), measured and rejected; no RealtimeKit on CI's runners (w-perf for main 01a20182; 2026-11-22)
+
+**The arms** (main's, on `origin/main01a20182/84a-ge`, never main; A is 1ce8a383a, main at the time):
+- **G+E** (a02dc972a): after its idle spin a shard naps on its own timer while it expects work, and a client whose
+  reply is due naps while within its reply waits' expectation. Each nap is R9's floor with the timer slack at 1 ns. The
+  shards, and a client's reply-wait thread once, ask EEVDF for R9's floor as their slice. The idea: under
+  `PREEMPT_LAZY` a wake onto a CPU running a fair neighbour's user code is taken only at that CPU's tick, so a thread
+  that wakes itself from its own timer enters the kernel without waiting for one.
+- **H** (374b3c47c): G+E's client half alone. The shards keep main's spin-then-park and their default slice.
+
+**The runs.** Run 45104143760 (G+E) and run 45108777338 (H), CI's ubuntu-24.04-arm and ubuntu-latest (4 vCPUs,
+kernel 7.0, two spinners a CPU). Each interleaved 5 loaded rounds and 3 quiet rounds of `edit_merge_bench`, A against
+the arm. Loaded cells are a round's pooled goal line (3 × 1,000 samples), µs, rounds in order. "client" and "ops" are
+the median band's medians of the client's total and of the shard ops (§4.14 spans). Steps and waits are per shard,
+from the pulse lines, the range over the three shards.
+
+| G+E, run 45104143760 | A | G+E |
+|---|---|---|
+| arm64 loaded accept p50 | 234 · 239 · 243 · 235 · 237 | 616 · 815 · 690 · 594 · 334 |
+| arm64 loaded accept p99 | 335 · 331 · 341 · 335 · 2987 | 2403 · 2148 · 2154 · 2083 · 2124 |
+| arm64 loaded accept p999 | 4002 · 1335 · 1094 · 349 · 5992 | 3118 · 2715 · 3119 · 4063 · 4127 |
+| arm64 loaded conflict p99 | 4000 · 3999 · 321 · 4000 · 3000 | 1938 · 1975 · 1988 · 1925 · 1997 |
+| arm64 loaded conflict p999 | 5999 · 6000 · 1769 · 5266 · 5000 | 2520 · 2489 · 2920 · 2439 · 3112 |
+| arm64 median client / ops | 235-241 / 31-37 | 341-807 / 41-181 |
+| arm64 shard steps, waits | 3.10-3.23M, 32-33k | 0.96-1.28M, 136-163k |
+| arm64 quiet accept p50/p99 | 120/174 · 117/159 · 114/166 | 109/145 · 107/143 · 112/191 |
+| x86_64 loaded accept p50 | 289 · 174 · 218 · 232 · 193 | 1314 · 918 · 379 · 841 · 1317 |
+| x86_64 loaded accept p99 | 3581 · 3997 · 3264 · 3997 · 3997 | 2552 · 2843 · 3020 · 2944 · 2650 |
+| x86_64 loaded accept p999 | 6081 · 4084 · 6029 · 5995 · 5997 | 2756 · 3852 · 4027 · 4029 · 3458 |
+| x86_64 loaded conflict p99 | 5751 · 4000 · 3233 · 4001 · 3362 | 2410 · 2745 · 2748 · 2823 · 2978 |
+| x86_64 median client / ops | 181-290 / 30-33 | 173-1236 / 32-181 |
+| x86_64 quiet accept p50/p99 | 148/181 · 127/190 · 120/177 | 124/184 · 129/227 · 128/211 |
+
+| H, run 45108777338 | A | H |
+|---|---|---|
+| arm64 loaded accept p50 | 241 · 241 · 235 · 241 · 238 | 387 · 291 · 409 · 360 · 334 |
+| arm64 loaded accept p99 | 345 · 3994 · 340 · 338 · 2244 | 2336 · 3996 · 2276 · 1441 · 2112 |
+| arm64 loaded accept p999 | 2081 · 5992 · 1157 · 372 · 5239 | 3137 · 5997 · 3494 · 2861 · 4696 |
+| arm64 loaded conflict p99 | 313 · 370 · 899 · 772 · 314 | 1862 · 443 · 2164 · 1859 · 1741 |
+| arm64 loaded conflict p999 | 1872 · 979 · 1826 · 2869 · 1812 | 3075 · 1019 · 3250 · 2220 · 2792 |
+| arm64 median client / ops | 238-242 / 32-39 | 302-412 / 83-112 |
+| arm64 shard steps, waits | 3.12-3.23M, 32-33k | 0.35-1.14M, 14-19k |
+| arm64 quiet accept p50/p99 | 115/158 · 121/161 · 117/159 | 111/153 · 104/140 · 104/146 |
+| x86_64 loaded accept p50 | 100 · 99 · 101 · 103 · 99 | 286 · 296 · 293 · 284 · 295 |
+| x86_64 loaded accept p99 | 2864 · 2861 · 2913 · 3021 · 2601 | 2850 · 2698 · 1635 · 2830 · 2483 |
+| x86_64 loaded accept p999 | 5814 · 3133 · 4236 · 5397 · 2848 | 4450 · 3270 · 3316 · 3372 · 3299 |
+| x86_64 loaded conflict p99 | 2997 · 3098 · 3001 · 2980 · 3247 | 6000 · 1369 · 1459 · 1410 · 1445 |
+| x86_64 median client / ops | 99-103 / 22 | 283-291 / 71-76 |
+| x86_64 shard steps, waits | 0.69-0.79M, 13-15k | 0.39-0.45M, 4-7k |
+| x86_64 quiet accept p50/p99 | 122/155 · 98/152 · 87/117 | 140/185 · 91/173 · 95/153 |
+
+**Rejected, both.** The loaded bar is p99 under 1 ms with quiet no worse.
+- G+E: loaded p99 is over 1 ms in every round on both runners, 2.1-2.4 ms on arm64 against A's 0.33 ms accept in 4 of
+  5 rounds. The loaded p50 rises 1.4-3.4x on arm64 and 1.7-6.8x on x86_64. x86_64's p99 and p999 fall from A's 3.2-6.1
+  ms to 2.4-4.0 ms, but still miss the bar, and x86_64's quiet p99 is worse in all 3 rounds (184-227 against 177-190).
+- H: accept p99 is over 1 ms in 5 of 5 rounds on arm64, against A's 2 of 5. Conflict misses in 4 of 5, against none.
+  The loaded p50 rises 20-75% on arm64 and 2.8-3.0x on x86_64. Quiet is even on both runners.
+- The client half alone carries most of G+E's loaded regression. In H the shards keep main's code, yet their ops take
+  longer (83-112 µs against 32-39 on arm64), and they run a ninth to a third of A's steps while parking less (waits 14-19k
+  against 32-33k). So they are not parking more; they get less CPU, or are preempted inside an op, once the client
+  stops spinning on its own core. That is a reading, not a measurement: per-shard run delay
+  (`/proc/<tid>/schedstat`) in both arms would test it.
+- The client's naps mostly end at their own timer, not at the reply's wake: about 95% on arm64 (140,339 of 147,775 in
+  H's round 1) and about 80% on x86_64.
+- G+E's shard naps add parks: 136-163k waits a shard against A's 32-33k on arm64.
+- The bench's ring-and-outside split is not used here. In the median band the ring (the server's slot-read-to-reply
+  spans, summed over a sample's two requests) exceeds the client's whole total: H arm64 466 against 387 µs, G+E 827
+  against 710, and x86_64's A 252 against 104. Spans nested in the client's time cannot add to more than it, so
+  "outside the ring 0" is the subtraction's floor, not a measured zero. The fix is owed (w-perf, next piece).
+- The two runs' x86_64 A legs differ (loaded accept p50 174-289 against 99-103 µs), so x86_64 is compared only within
+  a run.
+
+**No RealtimeKit on CI's runners** (run 45115263387, `diag-measurer-main-rtkit-probe`, both runners, 2026-11-23 UTC).
+The real-time class is closed to an unprivileged daemon on CI, through the session broker too:
+- ubuntu-24.04-arm is Ubuntu 24.04.5 on kernel 7.0.0-1017-azure. ubuntu-latest is now Ubuntu 26.04.1 on kernel
+  7.0.0-1020-azure.
+- On both: no `rtkit` package, no `rtkit-daemon` binary or unit, no `org.freedesktop.RealtimeKit1` on the system bus
+  and no D-Bus activation file for it. Every call to it is refused ("not provided by any .service files").
+- `RLIMIT_RTPRIO` is 0 and `RLIMIT_RTTIME` unlimited; the shell stays `SCHED_OTHER` at priority 0. On 26.04 `chrt`
+  reports a runtime parameter of 2,100,000 ns, the fair class's base slice at 4 CPUs.
+
 ## 84a on macOS: the doorbell thread under the time-constraint policy, measured, not landed (w-perf; 2026-11-22)
 
 **What was measured first.** The diagnostic branch is `diag-measurer-w-perf-84a-mac-tail` (never main; CI
