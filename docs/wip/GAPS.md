@@ -2764,8 +2764,14 @@
 > identities read through the store's seam (zero bytes copied over a view of 64 texts), held by its volume until
 > released, `EROFS` to every change; the server's seam over `ContentStore`. A-645 (a) BUILT (2026-11-20): a hook's
 > REPOS-PATH is its repository's view, presented on the owner shard and mounted read-only under the store's standing
-> grant (`<--vcs-store>/<repository>.svn`); a daemon with no store directory refuses a configured hook typed. Owed: the
-> by-use run with stock svn 1.15 (run-requests.md); a revision property change's own signal, since each hook refreshes
+> grant (`<--vcs-store>/<repository>.svn`); a daemon with no store directory refuses a configured hook typed. **By use
+> with stock svn 1.15 (main 01a20182, big Studio, 2026-11-23):** `a_repository_policys_hook_lets_stock_svn_change_a_revision_property`,
+> `a_hooks_repos_path_is_the_repositorys_view_mounted_in_the_store_directory` and
+> `a_revision_property_change_without_a_hook_is_refused_as_svnserve_refuses_it` pass (r202, 2e375de89).
+> `a_hooks_first_view_of_a_long_history_is_waited_for_while_it_is_laid_out` passes 3 of 3 alone (r351, 23850ce74), red
+> 3 of 3 at 2e375de89 (r269, the import refused `BudgetExceeded { available: 0 }`); main's bisect of the 79 commits
+> between (r378) names the fix. The svn matrix's revprop rows pass with the store (r202, 66 of 66 over svn:// and
+> HTTP). Owed: a revision property change's own signal, since each hook refreshes
 > every revision's properties file now (linear in the history, a revision a turn); the view unmounted with its
 > repository. Owed before: P3 (the presenter under
 > SLATES_ROOT, after A-727 a2), P4, the root mount's publication; until P3, REPOS stays `/<name>`.
