@@ -3987,6 +3987,8 @@ fn an_advertisement_over_a_let_go_pack_is_the_one_over_it_held() {
     ids_in(&fetched_pack(&fetched.1)).len(),
     2 + LET_GO_TAGS,
     "the clone of main whole: its commit, tree and files"
+  );
+}
 
 /// Format: the changesets and the bytes of each one's file in
 /// [`a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land`]: a history whose file texts are many
