@@ -493,9 +493,12 @@ impl ChunkStore {
     plain.extend_from_slice(self.arena.bytes(block)?.get(..len)?);
     // The copy replaces the block in its volume: locked if the block was.
     let copy = if self.arena.is_locked(block) {
-      self.arena.alloc_locked(block.len(), owner).ok()?
+      self
+        .arena
+        .alloc_locked_asking(block.len(), len, owner)
+        .ok()?
     } else {
-      self.arena.alloc(block.len(), owner).ok()?
+      self.arena.alloc_asking(block.len(), len, owner).ok()?
     };
     match self
       .arena
@@ -734,11 +737,18 @@ impl ChunkStore {
   /// Allocates a block of at least `len` bytes. An arena that is out of room while freed blocks wait for a
   /// publication (A-64: the committed recovery image may name them) refuses [`VfsError::PublishNeeded`], not a
   /// memory refusal: the room exists, and the shard's next publication releases it.
-  fn alloc(&mut self, len: usize, locked: bool, owner: Owner) -> Result<Block, VfsError> {
+  /// Allocates a block of `len` bytes, `asked` of which its caller needs (the rest the block's rounding to pages): the
+  /// owner's asked bytes count `asked` (goal 93, so the arena's rows name the rounding).
+  fn alloc(
+    &mut self,
+    (len, asked): (usize, usize),
+    locked: bool,
+    owner: Owner,
+  ) -> Result<Block, VfsError> {
     let taken = if locked {
-      self.arena.alloc_locked(len, owner)
+      self.arena.alloc_locked_asking(len, asked, owner)
     } else {
-      self.arena.alloc(len, owner)
+      self.arena.alloc_asking(len, asked, owner)
     };
     match taken {
       Ok(block) => Ok(block),
@@ -760,7 +770,7 @@ impl ChunkStore {
     (locked, owner): (bool, Owner),
   ) -> Result<OpenExtent, VfsError> {
     let want = want.clamp(1, self.chunk_bytes);
-    let block = self.alloc(want.next_multiple_of(self.granule), locked, owner)?;
+    let block = self.alloc((want.next_multiple_of(self.granule), want), locked, owner)?;
     Ok(OpenExtent {
       off,
       len: 0,
@@ -782,7 +792,7 @@ impl ChunkStore {
     locked: bool,
   ) -> Result<OpenExtent, VfsError> {
     let len = usize::try_from(open.len).map_err(|_| VfsError::Invalid)?;
-    let block = self.alloc(self.block_bytes(len), locked, open.owner)?;
+    let block = self.alloc((self.block_bytes(len), len), locked, open.owner)?;
     let carried = self
       .arena
       .bytes(open.block)
@@ -827,7 +837,11 @@ impl ChunkStore {
     }
     // The grown block holds the same extent: locked if the block it replaces was.
     let locked = self.arena.is_locked(open.block);
-    let block = self.alloc(need.next_multiple_of(self.granule), locked, open.owner)?;
+    let block = self.alloc(
+      (need.next_multiple_of(self.granule), need),
+      locked,
+      open.owner,
+    )?;
     let used = usize::try_from(open.len).unwrap_or(0);
     self.move_into(open, block, used)
   }
@@ -934,7 +948,7 @@ impl ChunkStore {
     // A smaller block is an economy, never a requirement: when the arena cannot give it now, the extent keeps its
     // block, whose length its charge follows (`volume::content_by_epoch`).
     let locked = self.arena.is_locked(open.block);
-    let Ok(block) = self.alloc(want, locked, open.owner) else {
+    let Ok(block) = self.alloc((want, keep), locked, open.owner) else {
       return Ok(());
     };
     self.move_into(open, block, keep)
@@ -1445,6 +1459,28 @@ mod tests {
       .add_region(Region::map(page * 256, page, false).unwrap())
       .unwrap();
     ChunkStore::new(arena, page, 1024)
+  }
+
+  /// Goal 93 (main 01a20182's arena-15: 556 MB of repository windows held in the arena for 131 MB of window bytes). Do:
+  /// open, write and seal four windows of 100 bytes as a repository's window storage does (`Owner::VcsWindows`). Expect:
+  /// the arena's owner row holding a page a window, and asked the windows' own 400 bytes, so asked against held names the
+  /// page rounding. Failing first: asked was the page-rounded length the chunk store passed, equal to held.
+  #[test]
+  fn a_windows_ask_is_its_own_length_and_its_hold_the_page_it_takes() {
+    let mut s = store();
+    for n in 0..4u8 {
+      let mut open = s
+        .open(0, 100, Epoch(0), (false, Owner::VcsWindows))
+        .unwrap();
+      s.write_open(&mut open, 0, &[n; 100]).unwrap();
+      s.seal(open, None).unwrap();
+    }
+    let owned = s.arena().owned(Owner::VcsWindows);
+    assert_eq!(
+      (owned.asked, owned.held),
+      (400, 4 * 4096),
+      "the windows' bytes asked, a page each held"
+    );
   }
 
   #[test]

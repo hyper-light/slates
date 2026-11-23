@@ -868,8 +868,19 @@ impl ChunkArena {
 
   /// Allocates at least `len` bytes from the first region that can serve it.
   pub fn alloc(&mut self, len: usize, owner: Owner) -> Result<Extent, MemError> {
+    self.alloc_asking(len, len, owner)
+  }
+
+  /// [`ChunkArena::alloc`] of a block of `len` bytes for a caller that needs only `asked` of them (a window of 1 KB in a
+  /// page-rounded block): the owner's asked bytes count `asked`, so its asked against its held names the rounding.
+  pub fn alloc_asking(
+    &mut self,
+    len: usize,
+    asked: usize,
+    owner: Owner,
+  ) -> Result<Extent, MemError> {
     let extent = self.alloc_block(len)?;
-    self.record(extent, owner, extent.len(), len);
+    self.record(extent, owner, extent.len(), asked.min(extent.len()));
     Ok(extent)
   }
 
@@ -929,7 +940,17 @@ impl ChunkArena {
   /// [`ChunkArena::alloc`], locked in RAM before it is handed out (a strict volume's new content). One the OS will not
   /// lock goes back, and the refusal is the lock's.
   pub fn alloc_locked(&mut self, len: usize, owner: Owner) -> Result<Extent, MemError> {
-    let extent = self.alloc(len, owner)?;
+    self.alloc_locked_asking(len, len, owner)
+  }
+
+  /// [`ChunkArena::alloc_locked`] asking for `asked` of the block's bytes, as [`ChunkArena::alloc_asking`].
+  pub fn alloc_locked_asking(
+    &mut self,
+    len: usize,
+    asked: usize,
+    owner: Owner,
+  ) -> Result<Extent, MemError> {
+    let extent = self.alloc_asking(len, asked, owner)?;
     if let Err(e) = self.lock_extent(extent) {
       self.free(extent)?;
       return Err(e);

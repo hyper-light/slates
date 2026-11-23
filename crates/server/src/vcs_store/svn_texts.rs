@@ -42,8 +42,8 @@ const ENTRY_BYTES: u64 =
 
 /// Text pieces read through the node's changeset store for drives waiting on them (C2 stage B part 2; module docs,
 /// "Reading"): each piece by its text and the offset it starts at, with how many waiting readers hold it. Bounded by
-/// the readers waiting on the shard: a reader puts the piece it waited for ([`fetch_piece`]) and lets it go once its
-/// next step has read it ([`let_go`]).
+/// the readers waiting on the shard: a reader puts the piece it waited for ([`fetch_piece`]) and lets it go
+/// ([`let_go`]) once it moves on from it: it waits for another, or its read ends (`svn_view::FetchedPiece`, A-876).
 #[derive(Debug, Default)]
 pub(crate) struct Pieces(std::collections::BTreeMap<(ContentIdentity, u64), (Vec<u8>, usize)>);
 

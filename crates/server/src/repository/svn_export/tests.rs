@@ -217,6 +217,13 @@ fn an_export_reads_a_text_ram_does_not_hold_through_the_store() {
     "format 3; {lengths:?}; {counted:?}"
   );
   assert!(fetched >= 1, "no piece read through the store");
+  // Two exports, each walking the range twice (the walk that measures it, then the one that writes it), each walk
+  // reading the text once, a piece a fetch.
+  let pieces = 4 * u64::try_from(bytes.len().div_ceil(slates_store::store::PIECE_BYTES)).unwrap();
+  assert!(
+    fetched <= pieces,
+    "{fetched} pieces fetched through the store for four reads of {pieces} in all"
+  );
   assert_eq!(left, 0, "a fetched piece was kept");
 }
 
