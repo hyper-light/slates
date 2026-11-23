@@ -343,9 +343,9 @@ struct HeldAttachment {
 }
 
 /// Creates volume `name` of `bounded` bytes on `instance` and attaches it for writing with `slates attach --hold`,
-/// whose stdout names the attachment; its stderr is echoed as it comes, so it never blocks.
+/// whose stdout names the attachment; both of its outputs are drained as they come, so it never blocks or meets a
+/// closed pipe, its stderr echoed.
 fn held_writable_volume(instance: &str, name: &str, bounded: &str) -> HeldAttachment {
-  use std::io::BufRead;
   let (code, out, err) = run(instance, &["volume", "create", name, "--bounded", bounded]);
   assert_eq!(code, 0, "create {name}: {err}");
   let id = value_of(&out, "id");
@@ -363,15 +363,18 @@ fn held_writable_volume(instance: &str, name: &str, bounded: &str) -> HeldAttach
       line.clear();
     }
   });
+  let (lines, said) = std::sync::mpsc::channel::<String>();
   let mut stdout = std::io::BufReader::new(holder.stdout.take().unwrap());
-  let mut line = String::new();
+  std::thread::spawn(move || {
+    let mut line = String::new();
+    while stdout.read_line(&mut line).is_ok_and(|read| read > 0) {
+      let _ = lines.send(std::mem::take(&mut line));
+    }
+  });
   let attachment = loop {
-    line.clear();
-    let read = stdout.read_line(&mut line).unwrap();
-    assert!(
-      read > 0,
-      "attach --hold for {name} ended before it named its attachment"
-    );
+    let line = said.recv_timeout(START_BOUND).unwrap_or_else(|_| {
+      panic!("attach --hold for {name} named no attachment within {START_BOUND:?}")
+    });
     if let Some(attachment) = line.trim_end().strip_prefix("attachment: ") {
       break attachment.to_owned();
     }
@@ -398,7 +401,7 @@ fn write_over_held(
   path: &str,
   input: &[u8],
 ) -> (i32, Vec<u8>, String) {
-  use std::io::{BufRead, Read, Write};
+  use std::io::{Read, Write};
   let HeldAttachment {
     mut holder,
     id,
@@ -422,7 +425,8 @@ fn write_over_held(
   let hold_line = write_hold_line(&attachment);
   let mut err = String::new();
   while let Ok(line) = seen.recv_timeout(START_BOUND) {
-    let held_now = line.starts_with(&hold_line);
+    // Anywhere in the line: a log line may carry a prefix of its own.
+    let held_now = line.contains(&hold_line);
     err.push_str(&line);
     if held_now {
       break;
