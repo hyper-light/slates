@@ -679,7 +679,9 @@ fn a_tiered_merge_keeps_an_indexs_runs_within_a_logarithm_of_its_rows() {
         while index.merge_step(&mut store, &mut merge).unwrap() == MergeStep::More {}
       }
       let sealed_rows = index.rows().saturating_sub(index.tail_len() as u64);
-      let bound = (sealed_rows as f64 / fewest.max(1) as f64).log(3.0).floor() as usize + 1;
+      // In integers: f64's log₃ of a power of three can fall just short of it (243 gives 4.999999999999999).
+      let tiers = (sealed_rows / fewest.max(1)).checked_ilog(3).unwrap_or(0);
+      let bound = usize::try_from(tiers).unwrap() + 1;
       assert!(
         index.own_runs() <= bound,
         "{} own runs past the bound {bound} at {sealed_rows} sealed rows after {seals} seals",
