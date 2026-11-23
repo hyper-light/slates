@@ -139,6 +139,74 @@ fn a_presentation_past_the_bound_is_refused_and_changes_nothing() {
   daemon.stop();
 }
 
+/// The bound is untouched by the presentation's longer life (main 01a20182's ruling of 2026-11-23: dropping one rule
+/// must not loosen the bound; banned item 8). Do: with the bound at one, present volume A into a target through client
+/// one, then A into the same target through client two, then volume B. Expect: client two's presentation replaces
+/// client one's (one awaiting; client one's id refused `LandingSuperseded` naming client two's, A-779), and B refused
+/// `LandingsAwaitingFull`, typed. (The presentation outliving its client's reap is held across real processes, where a
+/// client's exit is a process's: `crates/client/tests/presentation.rs`.)
+#[test]
+fn another_clients_presentation_still_replaces_and_the_bound_still_refuses() {
+  let (daemon, instance) = daemon("replaces", Some(1));
+  let target = target_dir();
+  let mut two = connect(&instance);
+  let a = two.create(&scratch("replaces-a")).unwrap();
+  let b = two.create(&scratch("replaces-b")).unwrap();
+  let mut one = connect(&instance);
+  let Ok(Landing::GrantRequired {
+    landing: first,
+    manifest: first_manifest,
+    ..
+  }) = present(&mut one, a, None, &target.path)
+  else {
+    panic!("A was not presented by client one");
+  };
+  let Ok(Landing::GrantRequired { landing: newer, .. }) = present(&mut two, a, None, &target.path)
+  else {
+    panic!("A was not presented by client two");
+  };
+  assert_eq!(
+    awaiting(&mut two),
+    1,
+    "client two's presentation replaced client one's"
+  );
+  superseded_refused(&daemon, &mut two, (first, first_manifest), newer);
+  let refusal = present(&mut two, b, None, &target.path);
+  assert!(
+    matches!(
+      refusal,
+      Err(ClientError::Refused(Refusal::LandingsAwaitingFull))
+    ),
+    "the bound still refuses, typed: {refusal:?}"
+  );
+  drop(two);
+  daemon.stop();
+}
+
+/// A-874 (main 01a20182's ruling of 2026-11-23: a presentation lives until it is landed, superseded, or its volume goes).
+/// Do: present a volume's landing, then destroy the volume. Expect one presentation awaiting before the destroy and none
+/// after it: the presentation went with its volume, so a destroyed volume's never holds a place in the bound. Red
+/// before: it stayed awaiting, once its client no longer took it away.
+#[test]
+fn a_presentation_goes_with_its_volume() {
+  let (daemon, instance) = daemon("volume-goes", None);
+  let target = target_dir();
+  let mut client = connect(&instance);
+  let volume = client.create(&scratch("volume-goes")).unwrap();
+  let Ok(Landing::GrantRequired { .. }) = present(&mut client, volume, None, &target.path) else {
+    panic!("the landing was not presented");
+  };
+  assert_eq!(awaiting(&mut client), 1);
+  client.destroy(volume).unwrap();
+  assert_eq!(
+    awaiting(&mut client),
+    0,
+    "the presentation went with its volume"
+  );
+  drop(client);
+  daemon.stop();
+}
+
 /// A grant of landing `first` (of `manifest`), replaced by `newer`, under the issuer's proof: refused as superseded by
 /// kind, naming the newer (A-779).
 fn superseded_refused(

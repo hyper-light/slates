@@ -207,9 +207,15 @@ const KIND_VCS_LIST: u8 = 12;
 /// rule), keyed by the identity's first 24 bytes; its bytes the identity (BLAKE3 of the object), then the root.
 const KIND_VCS_NAME: u8 = 13;
 
-/// Format: the piece kind of a region hold of the shard's repository content store (A-724 piece 8c: a home's holds for
-/// the region survive its restart), keyed by the identity's first 24 bytes; its bytes the identity.
-const KIND_VCS_REGION_HOLD: u8 = 14;
+/// Format: the retired piece kind of a region hold without its owners (A-724 piece 8c, before A-727 (d1a)): refused typed
+/// at a restore ([`HeldRefused::Retired`]), never read as a hold of no owner (main 01a20182's ruling of 2026-11-23).
+const KIND_VCS_REGION_HOLD_RETIRED: u8 = 14;
+
+/// Format: the piece kind of a region hold of the shard's repository content store and its owners (A-724 piece 8c: a
+/// home's holds for the region survive its restart; A-727 (d1a): each names who it is for), keyed by the identity's
+/// first 24 bytes; its bytes the identity, then each owner (`slates_cluster::homes::HomeOwner::encode_into`), at least
+/// one.
+const KIND_VCS_REGION_HOLD: u8 = 20;
 
 /// Format: the piece kind of a window let go of the shard's repository content store (A-767 C1 step 2b, main's ruling
 /// (a) of 2026-11-22 02:52: the image records it, so a restart keeps it let go, never absent), keyed by the identity's
@@ -522,11 +528,15 @@ fn family_entries(
     }),
     Family::RegionHolds => crate::vcs_store::homes::region_held_in(lo, hi)
       .into_iter()
-      .map(|identity| {
+      .map(|(identity, owners)| {
+        let mut bytes = identity.0.to_vec();
+        for owner in &owners {
+          owner.encode_into(&mut bytes);
+        }
         (
           coordinate_of(&identity),
           vcs_node_key(KIND_VCS_REGION_HOLD, &identity),
-          identity.0.to_vec(),
+          bytes,
         )
       })
       .collect(),
@@ -1259,7 +1269,7 @@ pub(crate) struct RecoveredHeld {
   /// The repository content store's names: an object's identity, then its root (a3b).
   pub(crate) names: Vec<(slates_vcs::ContentId, slates_vcs::ContentId)>,
   /// The windows and objects the shard held for the region (A-724 piece 8c).
-  pub(crate) region_holds: Vec<slates_vcs::ContentId>,
+  pub(crate) region_holds: Vec<(slates_vcs::ContentId, Vec<slates_cluster::homes::HomeOwner>)>,
   /// The repository content store's windows let go, each with its length (A-767 C1 step 2b).
   pub(crate) aways: Vec<(slates_vcs::ContentId, u64)>,
   /// Where the windows landed packs carried lie on the node's store, as this shard's homes recorded (goal 93 item 2b(b)).
@@ -1284,6 +1294,8 @@ pub(crate) enum HeldRefused {
   Content(slates_cluster::content::HoldImageError),
   /// A replica checkpoint's piece did not decode (A-404).
   Checkpoint([u8; 16]),
+  /// A piece of a kind this build retired and reads no more (A-727 (d1a): a region hold without its owners).
+  Retired(u8),
 }
 
 impl std::fmt::Display for HeldRefused {
@@ -1312,6 +1324,11 @@ impl std::fmt::Display for HeldRefused {
       HeldRefused::Checkpoint(object) => {
         write!(f, "the replica checkpoint of {object:02x?} did not decode")
       }
+      HeldRefused::Retired(kind) => write!(
+        f,
+        "a held piece of retired kind {kind} (a region hold without its owners, before A-727 (d1a)): this build reads \
+         it no more"
+      ),
     }
   }
 }
@@ -1319,6 +1336,18 @@ impl std::fmt::Display for HeldRefused {
 impl From<slates_wire::WireError> for HeldRefused {
   fn from(error: slates_wire::WireError) -> Self {
     HeldRefused::Wire(error)
+  }
+}
+
+/// Test support (A-727 (d1a)): a region hold of `identity` in the retired ownerless kind, as an image before A-727 (d1a)
+/// kept it.
+#[cfg(test)]
+pub(crate) fn retired_region_hold_piece(
+  identity: &slates_vcs::ContentId,
+) -> slates_vfs::recover::HeldPiece {
+  slates_vfs::recover::HeldPiece {
+    key: vcs_node_key(KIND_VCS_REGION_HOLD_RETIRED, identity),
+    bytes: identity.0.to_vec(),
   }
 }
 
@@ -1441,10 +1470,24 @@ fn absorb_paged_entry(
         .push((identity, crate::vcs_store::homes::Landed::Hg(hg)));
     }
     KIND_VCS_REGION_HOLD => {
+      let (identity, mut rest) = bytes
+        .split_at_checked(slates_vcs::content::IDENTITY_BYTES)
+        .ok_or(HeldRefused::UnknownKind(kind))?;
       let identity =
-        slates_vcs::ContentId::from_slice(bytes).ok_or(HeldRefused::UnknownKind(kind))?;
-      held.region_holds.push(identity);
+        slates_vcs::ContentId::from_slice(identity).ok_or(HeldRefused::UnknownKind(kind))?;
+      let mut owners = Vec::new();
+      while !rest.is_empty() {
+        let (owner, after) = slates_cluster::homes::HomeOwner::decode_from(rest)
+          .map_err(|_| HeldRefused::UnknownKind(kind))?;
+        owners.push(owner);
+        rest = after;
+      }
+      if owners.is_empty() {
+        return Err(HeldRefused::UnknownKind(kind));
+      }
+      held.region_holds.push((identity, owners));
     }
+    KIND_VCS_REGION_HOLD_RETIRED => return Err(HeldRefused::Retired(kind)),
     KIND_VCS_AWAY => {
       let (identity, len) = bytes
         .split_at_checked(slates_vcs::content::IDENTITY_BYTES)
@@ -1535,6 +1578,8 @@ pub(crate) fn split_held(
           }
         }
       }
+      // A region hold without its owners, retired by A-727 (d1a): refused typed, never read as a hold of no owner.
+      KIND_VCS_REGION_HOLD_RETIRED => return Err(HeldRefused::Retired(kind)),
       kind if is_paged_entry_kind(kind) => {
         absorb_paged_entry(&mut held, (kind, slot), &piece.bytes)?;
       }

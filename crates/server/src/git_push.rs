@@ -418,8 +418,8 @@ impl Landing {
 /// What a push asks its edge to carry off the shard's step ([`ReceivePack::take_homing`]).
 #[derive(Debug)]
 pub(crate) enum Carry {
-  /// Content to home in the region (its names, then its pack).
-  Home(Vec<u8>),
+  /// Content to home in the region (its names, then its pack), held there for the push's attempt (A-727 (d1a)).
+  Home(Vec<u8>, slates_cluster::homes::HomeOwner),
   /// Its changeset to land on the node's store.
   Land(Box<Landing>),
 }
@@ -438,9 +438,14 @@ pub(crate) enum Carried {
 /// way every edge (HTTP, SSH, the tests' driver) runs a push's homing.
 pub(crate) async fn carry(origin: u16, shards: &[u16], carry: Carry) -> Carried {
   match carry {
-    Carry::Home(bytes) => Carried::Homed(
-      crate::vcs_store::homes::home_in_region(origin, shards, bytes, crate::fleet::live_budget())
-        .await,
+    Carry::Home(bytes, owner) => Carried::Homed(
+      crate::vcs_store::homes::home_in_region(
+        origin,
+        shards,
+        (bytes, owner),
+        crate::fleet::live_budget(),
+      )
+      .await,
     ),
     Carry::Land(landing) => {
       let Landing {
@@ -953,6 +958,8 @@ impl<P> ReceivePack<P> {
         let Some(identity) = crate::vcs_store::put_names(state, &bytes) else {
           return Err(PushFailed::Unlanded);
         };
+        // The attempt its holds in the region are for until its record commits (A-727 (d1a)).
+        let _ = decision.sealed.home_owner(state);
         decision.homing = Homing::Asked(bytes, (identity, count));
         Ok(false)
       }
@@ -960,7 +967,7 @@ impl<P> ReceivePack<P> {
       // back and the push refused (C5 part 2b), never a decision waiting for a homing nobody runs, nor a record naming
       // its objects inline.
       Homing::Asked(_, (identity, _)) | Homing::PackAsked(_, (identity, _), _) => {
-        crate::vcs_store::release_names(state, &identity);
+        decision.sealed.release_unhomed(state, &identity);
         crate::vcs_store::homes::count_untaken(state);
         decision.sealed.release_homed(state);
         Err(PushFailed::Unlanded)
@@ -1007,12 +1014,14 @@ impl<P> ReceivePack<P> {
     };
     match core::mem::replace(&mut decision.homing, Homing::Done) {
       Homing::Asked(bytes, named) => {
+        let owner = decision.sealed.owner_now()?;
         decision.homing = Homing::Waiting(named);
-        Some(Carry::Home(bytes))
+        Some(Carry::Home(bytes, owner))
       }
       Homing::PackAsked(bytes, packed, names) => {
+        let owner = decision.sealed.owner_now()?;
         decision.homing = Homing::PackWaiting(packed, names);
-        Some(Carry::Home(bytes))
+        Some(Carry::Home(bytes, owner))
       }
       Homing::LandAsked(landing) => {
         decision.homing = Homing::LandWaiting(landing.header.sequence);
@@ -1045,12 +1054,12 @@ impl<P> ReceivePack<P> {
           decision.homing = Homing::PackDue(homed.bytes);
           return;
         }
-        crate::vcs_store::release_names(state, &identity);
+        decision.sealed.release_unhomed(state, &identity);
         decision.homing = Homing::Unlanded;
       }
       (Homing::PackWaiting((identity, len), names), Carried::Homed(homed)) => {
         if !homed.outcome.as_ref().is_ok_and(|homed| *homed == identity) {
-          crate::vcs_store::release_names(state, &identity);
+          decision.sealed.release_unhomed(state, &identity);
           decision.homing = Homing::Unlanded;
           return;
         }

@@ -1951,9 +1951,12 @@ jobs:
           failed=0
           for flow in $("$bin" --list --format terse 2>/dev/null | sed -n 's/: test$//p'); do
             echo "=== ${flow}"
-            if ! timeout "${cap_s}" "$bin" --exact "${flow}" --test-threads=1 --nocapture > "target/chaos/${flow}.log" 2>&1; then
+            # An artifact's file names hold no colon (actions/upload-artifact), and the binary's support tests are named
+            # `relay::…` and `process_wait::…`: one such name lost all 43 logs of run 45176536354 (2026-11-23).
+            log="target/chaos/${flow//::/__}.log"
+            if ! timeout "${cap_s}" "$bin" --exact "${flow}" --test-threads=1 --nocapture > "${log}" 2>&1; then
               echo "FAILED (or past ${cap_s} s): ${flow}"
-              tail -60 "target/chaos/${flow}.log"
+              tail -60 "${log}"
               failed=$((failed + 1))
             fi
           done

@@ -953,9 +953,12 @@ impl Command for SaysWhere {
 /// what a loopback socket's buffers take at once, so a client that reads late leaves the edge's writes waiting.
 const STREAMED: usize = (1 << 20) - (64 << 10);
 
-/// Each write [`Streams`] heard of, as the connection reported it (`Command::paced`).
-static PACED: std::sync::Mutex<Vec<crate::vcs_store::upload::Sent>> =
-  std::sync::Mutex::new(Vec::new());
+thread_local! {
+  /// Each write [`Streams`] heard of, as the connection reported it (`Command::paced`), on this thread: an edge runs on
+  /// the test's own thread ([`served_keyed`] runs its runtime there), so each test reads only its own command's writes.
+  static PACED: std::cell::RefCell<Vec<crate::vcs_store::upload::Sent>> =
+    const { std::cell::RefCell::new(Vec::new()) };
+}
 
 /// A command that writes [`STREAMED`] bytes and exits 0, keeping every write of the connection it hears of in [`PACED`].
 #[derive(Default)]
@@ -976,7 +979,9 @@ impl Command for Streams {
   async fn step(&mut self, _gone: ClientGone<'_>) -> Result<Stepped, Refused> {
     if !self.wrote {
       self.wrote = true;
-      self.out = (0..STREAMED).map(|at| (at % 251) as u8).collect();
+      self.out = (0..STREAMED)
+        .map(|at| u8::try_from(at % 251).unwrap())
+        .collect();
     }
     Ok(Stepped {
       consumed: 0,
@@ -993,7 +998,7 @@ impl Command for Streams {
   }
 
   fn paced(&mut self, sent: crate::vcs_store::upload::Sent) {
-    PACED.lock().expect("the log").push(sent);
+    PACED.with_borrow_mut(|paced| paced.push(sent));
   }
 }
 
@@ -1034,7 +1039,7 @@ impl SshSite for StreamsSite {
 /// fetch's pacing learns from them, the bytes from that first wait on, past 256 KiB. Red before: nothing heard.
 #[test]
 fn a859_an_ssh_commands_writes_to_a_client_that_reads_late_are_heard_with_their_waits() {
-  PACED.lock().expect("the log").clear();
+  PACED.with_borrow_mut(Vec::clear);
   let (transcript, _) = served_by(
     ONE_SEAT,
     || StreamsSite,
@@ -1049,7 +1054,7 @@ fn a859_an_ssh_commands_writes_to_a_client_that_reads_late_are_heard_with_their_
     },
   );
   let transcript = transcript.expect("the session");
-  let paced = PACED.lock().expect("the log").clone();
+  let paced = PACED.with_borrow(Vec::clone);
   let written: u64 = paced.iter().map(|sent| sent.bytes).sum();
   let mut pacing = crate::vcs_store::upload::Pacing::default();
   let learned: u64 = paced
@@ -1085,7 +1090,7 @@ fn a859_a_write_heard_by_the_svn_sites_command_reaches_the_git_command_it_wraps(
     super::svn::EitherCommand::Other(Streams::default());
   wrapped.paced(sent);
   assert!(
-    PACED.lock().expect("the log").contains(&sent),
+    PACED.with_borrow(|paced| paced.contains(&sent)),
     "the write reached the command the wrapper carries"
   );
 }

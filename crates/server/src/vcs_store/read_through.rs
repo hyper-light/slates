@@ -321,7 +321,12 @@ mod tests {
       // An object the region holds here, sharing the pack's first window: that window is the one a home pins.
       let mut region_object = bytes.get(..window).unwrap().to_vec();
       region_object.extend_from_slice(b"held for the region");
-      crate::vcs_store::homes::keep_for_region(state, &region_object).unwrap();
+      crate::vcs_store::homes::keep_for_region(
+        state,
+        &region_object,
+        &[crate::vcs_store::homes::TEST_OWNER],
+      )
+      .unwrap();
       let pinned: Vec<ContentId> = ids.iter().copied().take(1).collect();
       crate::vcs_store::let_go_landed_pack_among(state, &root, &[here]);
       let (kept, refused, gone) = crate::vcs_store::within_budget(state, 0, |stores| {
@@ -419,7 +424,12 @@ mod tests {
           .bring_back(&id, &bytes)
           .unwrap();
       });
-      crate::vcs_store::homes::keep_for_region(state, &bytes).unwrap();
+      crate::vcs_store::homes::keep_for_region(
+        state,
+        &bytes,
+        &[crate::vcs_store::homes::TEST_OWNER],
+      )
+      .unwrap();
       let pinned = crate::vcs_store::let_go_read(state, &id);
       (again, away, pinned)
     });
@@ -445,7 +455,12 @@ mod tests {
           let window = state.store.content.chunk_bytes();
           state.vcs_stores.content_made(window).unwrap();
           let bytes = vec![b'x'; window * 2];
-          let (object, _) = crate::vcs_store::homes::keep_for_region(state, &bytes).unwrap();
+          let (object, _) = crate::vcs_store::homes::keep_for_region(
+            state,
+            &bytes,
+            &[crate::vcs_store::homes::TEST_OWNER],
+          )
+          .unwrap();
           let header = slates_store::log::Header {
             tool: slates_store::log::Tool::Git,
             repository: 3,
@@ -521,7 +536,12 @@ mod tests {
         .map(|at| u8::try_from(at % 251).unwrap())
         .collect();
       let len = u64::try_from(bytes.len()).unwrap();
-      let (pack, _) = crate::vcs_store::homes::keep_for_region(state, &bytes).unwrap();
+      let (pack, _) = crate::vcs_store::homes::keep_for_region(
+        state,
+        &bytes,
+        &[crate::vcs_store::homes::TEST_OWNER],
+      )
+      .unwrap();
       let header = slates_store::log::Header {
         tool: slates_store::log::Tool::Git,
         repository: 3,

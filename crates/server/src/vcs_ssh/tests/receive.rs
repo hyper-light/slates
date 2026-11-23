@@ -454,6 +454,8 @@ fn a_pushed_pack_let_go_by_its_commit_is_cloned_whole_and_shallow_over_ssh() {
   };
   let waited = std::time::Instant::now();
   while let_go_bytes() == 0 && waited.elapsed() < std::time::Duration::from_secs(10) {
+    // The harness paces its looks; the daemon under test waits on its wheel.
+    #[allow(clippy::disallowed_methods)]
     std::thread::sleep(std::time::Duration::from_millis(20));
   }
   let let_go = let_go_bytes();
@@ -500,6 +502,13 @@ fn fetched_adjusting(address: SocketAddrV4, request: &[u8]) -> Option<Transcript
     send_data(&mut peer, piece);
   }
   send_data(&mut peer, b"0000");
+  Some(transcript_giving_the_window_back(&mut peer))
+}
+
+/// Reads the session as OpenSSH's client does, at the wire's pace: each data message's bytes counted, the window given
+/// back (`SSH_MSG_CHANNEL_WINDOW_ADJUST`) once half of it is read, until the server closes the session; everything it
+/// gave.
+fn transcript_giving_the_window_back(peer: &mut Peer) -> Transcript {
   let mut transcript = Transcript::default();
   let mut unadjusted: u32 = 0;
   while let Some(message) = peer.next(&[94, 95, 96, 97, 98]) {
@@ -544,7 +553,7 @@ fn fetched_adjusting(address: SocketAddrV4, request: &[u8]) -> Option<Transcript
       _ => {}
     }
   }
-  Some(transcript)
+  transcript
 }
 
 /// [`pushed_over_ssh`] at protocol v0, its client patient: it waits for the push's answer while the session is open,
