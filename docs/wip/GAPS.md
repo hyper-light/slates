@@ -954,6 +954,13 @@
 >   Grown to the longest chain before, it held 360 MB of chunks at the end of Mercurial's push. Held by
 >   `the_store_holds_the_texts_its_last_reads_lent_and_no_more` (red: bound 6,553,600 after a 400-version chain's read;
 >   now 1,064,960 for 4 reads, 384 texts let go, the latest found again unmade).
+> - A Mercurial index's tail sealed by every append BUILT (2026-11-23, w-perf; w-hg's three conditions). Only an import
+>   sealed (`import::settle`), so a push's, a replay's and a made changeset's tail grew for the whole push: 56 MB of tail
+>   rows, two buffers each, still held at the end of Mercurial's push (`Index::admit` 34 MB, `table::encode_body` 22 MB).
+>   Every append's rows now go in through `HgIndex::insert`, which seals when due; import's own seal is gone. A seal the
+>   store refuses leaves the append standing and is counted (`HgIndex::seals_refused`). Held by
+>   `every_append_seals_the_tail_when_due_and_a_released_fork_gives_its_seals_back` (`crates/hg/src/tests/index.rs`: red
+>   due after group 26 of 200; now never due, the fork sealed, and its release gives its seals back).
 > - The watchdog's beat allocates nothing BUILT (2026-11-23, w-perf; main's order). A beat made 4 allocations, about
 >   1 KB by their types (estimated, not measured). `hg_push_heap`'s first read had charged the watchdog 24% of a push's
 >   sampled bytes, about 10-15 MB a second; that was its sampler's artifact (a thread's first symbol load charged to its
