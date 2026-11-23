@@ -116,6 +116,14 @@ row push-all "${HG[@]}" -R "$SOURCE" push "${PUSH[@]}" "$URL"
 # push-all, before any later row can spin and restart it.
 s status --json --memory >"$WORK/status-after-push.json" 2>"$WORK/status-after-push.err" ||
   echo "DIAG status after push failed: $(head -3 "$WORK/status-after-push.err")"
+# DIAG (diag branch only; main 01a20182 arena-12): the daemon's resident memory by mapping right after push-all, its
+# smaps_rollup and the mappings holding the most, summed by name ([anon] for a nameless one), to name what no gauge counts.
+DPID=$(ps -axo pid=,command= 2>/dev/null | grep -F -- "--instance $INSTANCE daemon" | grep -v grep | awk '{print $1}' | head -1)
+if [ -n "$DPID" ] && [ -r "/proc/$DPID/smaps" ]; then
+  echo "DIAG smaps_rollup after push-all (pid $DPID): $(tr -s ' ' < "/proc/$DPID/smaps_rollup" | tr '\n' ';' | cut -c1-900)"
+  awk '/^[0-9a-f]+-[0-9a-f]+ / {name = (NF >= 6 ? $6 : "[anon]")} /^Rss:/ {rss[name] += $2} END {for (n in rss) print rss[n], n}' \
+    "/proc/$DPID/smaps" | sort -rn | head -15 | while read -r kib name; do echo "DIAG resident after push-all: $kib KiB $name"; done
+fi
 # DIAG (diag branch only): stop here when asked, so the read after push-all doesn't wait on rows that still spin.
 if [ "${DIAG_STOP_AFTER_PUSH:-0}" = 1 ]; then
   printf '%s\n' "---- stopped after push-all (DIAG_STOP_AFTER_PUSH)" "${ROWS[@]}"
