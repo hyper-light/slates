@@ -733,6 +733,11 @@
 >   `a_lookup_of_a_branch_name_reads_its_heads_not_the_history` and `branchmap_over_a_long_line_reads_its_heads_not_the_history`
 >   (a 170-changeset line: red 512 and 511 reads, now at most 8; `BranchHeads::answered` the non-vacuity count). A
 >   view that leaves a changeset out (secret, hidden) still walks: OPEN, rare in a publishing repository.
+>   An append's walk through other branches is one append's work: counted (`BranchHeads::longest_walk`, the status
+>   counter `vcs.hg.branch_heads_longest_walk`, read from each index a landing puts in place) and held by
+>   `a_branch_taken_again_after_a_long_line_counts_its_walk` (a `stable` revision on a 400-revision `default` line:
+>   the walk counted at the line's length). OPEN: sliced, its branch's heads pending until it ends, if the arena shows
+>   walks past a step's worth.
 > - A push's churn a manifest copy a changeset BUILT (2026-11-23, w-hg; main's orders on CI 45127535742: 57.3 GB through
 >   the allocator over the hg matrix, which breeds the 1.26 GB it keeps after push-all). Named by a counting allocator
 >   (`crates/hg/tests/push_heap.rs`, its store's windows in an arena as a daemon's are): an edit changeset allocated

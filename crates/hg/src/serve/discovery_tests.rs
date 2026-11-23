@@ -257,6 +257,45 @@ proptest! {
   }
 }
 
+/// Shape: the `default` line [`a_branch_taken_again_after_a_long_line_counts_its_walk`] runs between its two
+/// `stable` revisions.
+const LONG_LINE: usize = 400;
+
+/// Goal 93 (main's order of 2026-11-23: count the walk an append makes through other branches). Do: append `stable`'s
+/// first revision, then a line of [`LONG_LINE`] `default` revisions from it, then a `stable` revision on the line's tip,
+/// as segments land. Expect the kept heads the walk's and the rule's (`default`'s tip, the new `stable` one, the old
+/// ended through the line); and the longest walk counted at the line's length, one append's work.
+#[test]
+fn a_branch_taken_again_after_a_long_line_counts_its_walk() {
+  let mut made: Vec<Made<'_>> = vec![([None, None], b"default"), ([Some(0), None], b"stable")];
+  for at in 0..LONG_LINE {
+    made.push(([Some(Rev::try_from(at + 1).unwrap()), None], b"default"));
+  }
+  made.push((
+    [Some(Rev::try_from(LONG_LINE + 1).unwrap()), None],
+    b"stable",
+  ));
+  let history = history_of(&made);
+  let (index, after_each) = indexed_in_groups(&history, &[2, LONG_LINE, 1]);
+  let (_, kept) = after_each.last().unwrap();
+  assert_eq!(kept, &heads(&history));
+  assert_eq!(kept, &naive(&history));
+  let last = Rev::try_from(LONG_LINE + 2).unwrap();
+  assert_eq!(
+    kept,
+    &[last - 1, last],
+    "default's tip and the new stable head"
+  );
+  let walked = index.branch_heads().longest_walk();
+  println!(
+    "a stable revision on a {LONG_LINE}-revision default line walked {walked} revisions in one append"
+  );
+  assert!(
+    walked >= u64::try_from(LONG_LINE).unwrap(),
+    "the walk counted: {walked}"
+  );
+}
+
 /// `history`'s changesets appended to a new index in groups of `sizes` (the last taking what is left): the index, and
 /// after each group the changesets it holds and its kept heads.
 fn indexed_in_groups(history: &History, sizes: &[usize]) -> (HgIndex, Vec<(usize, Vec<Rev>)>) {
