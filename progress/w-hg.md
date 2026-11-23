@@ -524,3 +524,14 @@ Waiting: main's route; arena-7 and arena-8.
   prunes and rewrites) equals the walk; it was red before. Also a 9,000-changeset test past sealed chunks.
 - Next: non-publishing repositories (phases.publish from the record), so the hidden view is exercised end to end
   with real hg. Then decision 3's rewrite admission.
+- Landed ec92899f5: the Arc fix (R2). BranchHeads' endings are now sealed into index rows ('E' keys); a fork shares
+  them by table identity and copies only the open chunk (512 endings or fewer). note's walk is split out (lint :469).
+- Marker tuple piece committed (c3d3c18f2) and landing: a format 0 marker made every clone fail; golden vectors from
+  7.2's writers; markers compared as 7.2's tuples.
+- hg_publishing in progress (w-hg-arc): RepositoryPolicy field (manual Default true), DatabaseRefusal 14
+  PolicyPublishingNotMercurial (show main the wire_order diff before landing), CLI --hg-publish, view/push read it.
+  Red: hg_evolution a_non_publishing_repository_keeps_drafts_and_hides_a_rewritten_one.
+- Agreed split with w-perf for glibc's term. w-perf takes the store's TextCache. I take intake::rebuilt,
+  HgIndex::revision_text (with object_bytes) and Taker::file_base. Repro: SLATES_HG_PUSH_SOURCE=$HOME/.cache/w-perf/hg-src
+  CARGO_PROFILE_DEV_OPT_LEVEL=2 CARGO_INCREMENTAL=0 cargo test -p slates-server --test hg_push_lifetimes -- --ignored
+  --nocapture (test a_pushs_allocation_by_site_size_and_life_under_stock_mercurial).
