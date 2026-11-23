@@ -4851,6 +4851,7 @@ pub fn shard_report(state: &mut ShardState, memory: bool) -> ShardReport {
           ),
         ]
         .into_iter()
+        .chain(crate::vcs_store::content_figures(&state.vcs_stores))
         .filter(|(_, count)| *count > 0)
         .map(|(kind, count)| RefusalCount {
           kind: kind.to_owned(),
