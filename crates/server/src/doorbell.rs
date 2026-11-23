@@ -107,6 +107,18 @@ fn run(
       return;
     }
   };
+  // A ring that landed before that read (a claim made between the daemon's publishing its rendezvous and this thread's
+  // start, or into an anchor's object while no daemon ran) moved the word already, so no wait shows it: its marks are
+  // taken now, once. A ring sets its mark before it moves the word, so a later one shows in the first wait.
+  match waiter.take_pending() {
+    Ok(pending) => kick_pending(&pending, kicks, rang_flag),
+    Err(error) => {
+      slates_machine::log_line!(
+        "slates-server: the doorbell thread stopped: its rings' marks could not be read: {error}"
+      );
+      return;
+    }
+  }
   while !stopped(stop) {
     // A refused wait ends the thread by name rather than retrying it in a loop that would spin:
     // the refusals left are the OS's own (a bad address), never a timeout or an interruption.

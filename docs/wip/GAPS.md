@@ -8808,7 +8808,10 @@
 >     - **Closed: the doorbell's herd (A-381, 2026-11-18).** On macOS and Windows each client's ring kicked every shard;
 >       now it marks the shard its region names and the doorbell thread kicks only the shards marked. Each shard's
 >       parks fell 59% and the shards' CPU 20 to 34% at 1,000 clients; the latencies moved with the box's load (14 to 52)
->       more than with the change, so no latency is claimed for it (BENCHMARKS, 2026-11-18).
+>       more than with the change, so no latency is claimed for it (BENCHMARKS, 2026-11-18). Since 2026-11-23 (w-win) the
+>       thread also takes the marks rung before its first look, which it had left for good: a claim made as a daemon
+>       started, or while an anchor restarted one, waited with no bound (the Windows Shards CLI step's 20-minute hang,
+>       `docs/bugs/2026-11-23-a-claim-rung-before-the-doorbell-thread-looked-was-never-answered.md`).
 >     - **Closed: an ask waiting out the batch before it (A-388, 2026-11-18).** One batch of asks was out to an owner at
 >       a time, and the wait for it was about half of an ask's way to the owner (p99 1.6 to 2.1 ms for submits and
 >       rebases at 50 ms); a shard now keeps two out.
