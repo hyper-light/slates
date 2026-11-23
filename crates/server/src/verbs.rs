@@ -18841,13 +18841,12 @@ fn retry_deferred(state: &mut ShardState) -> bool {
         _ => reply,
       }
     };
-    if send_reply(state, client_index, request, &mut reply) {
+    if let Some(written_ns) = send_reply(state, client_index, request, &mut reply).answered(state) {
       any = true;
       state.loop_io = true;
       // The `ring.request` span (§4.14) for a reply that was deferred (its ring was full, or it came
       // back from another shard) and is now written: from the slot read to the reply written.
       if let Some(ring) = ring {
-        let written_ns = state.clock.monotonic_ns();
         let label = u32::from(state.partition);
         crate::telemetry::emit(state, ring.end(label, written_ns));
       }
@@ -18966,20 +18965,24 @@ fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, 
         continue;
       }
     };
+    // The slot read's own time, for the request's `ring.request` span. Until 2026-11-22 the span opened at `now`, the
+    // round's one clock read, taken as a small over-estimate within a batch; but a request a round takes after the
+    // shard lost its CPU (at a reply's wake, under load) was then stamped before its client had published it, and the
+    // edit-and-merge bench's ring exceeded the client's whole wait (`a_requests_ring_span_lies_within_its_clients_own_time`
+    // in `tests/daemon.rs`: 165 µs early on an idle Mac). `now` still marks the round for the reap's silence clock.
+    let read_ns = state.clock.monotonic_ns();
     any = true;
     // A slot the gate ended is gone, and the next take finds it so.
     if !to_serve(state, index, handle, &request) {
       continue;
     }
     // The `ring.request` span (§4.14) opens the request's trace as a root at the slot read: the client
-    // is the entry point, its request id the replay identity. `now` (this round's single clock read,
-    // §4.7) stands for the read time — a small, conservative over-estimate within one batch, not a
-    // per-request clock read on the hot path. Everything the request causes on this shard opens within
-    // this context; a forward carries it to the owner.
+    // is the entry point, its request id the replay identity. Everything the request causes on this shard opens
+    // within this context; a forward carries it to the owner.
     let ring = state.tracer.open_root(
       RequestId::from_word(request.request),
       Chokepoint::RingRequest,
-      now,
+      read_ns,
     );
     state.current_span = Some(ring.context());
     let served = serve(state, handle, &request, now);
@@ -18987,9 +18990,10 @@ fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, 
     state.forward_hold_ns = 0;
     match served {
       Served::Reply(mut reply) => {
-        if send_reply(state, index, request.request, &mut reply) {
+        if let Some(written_ns) =
+          send_reply(state, index, request.request, &mut reply).answered(state)
+        {
           // Written synchronously: the span ends at the reply written.
-          let written_ns = state.clock.monotonic_ns();
           let label = u32::from(state.partition);
           crate::telemetry::emit(state, ring.end(label, written_ns));
         } else {
@@ -19030,27 +19034,50 @@ fn remember_forwarded_ring(
   state.forwarded_rings.insert(request, ring);
 }
 
-/// Writes a reply into the client's completion ring; false when the ring is full (the reply
-/// is kept and retried; never dropped).
+/// What became of a reply [`send_reply`] was given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Sent {
+  /// Written into the client's completion ring, published at this reading of the host's monotonic clock
+  /// (`slates_ipc::DaemonEnd::reply`), before the client's wake.
+  Written(u64),
+  /// Nobody can take it (the client's slot is gone, retiring or another client's): done with, as answered.
+  Dropped,
+  /// The ring was full: the caller keeps the reply and retries it; never dropped.
+  Full,
+}
+
+impl Sent {
+  /// When the reply was done with (written, or dropped at once: then the shard's clock now), or `None` for a full ring.
+  pub(crate) fn answered(self, state: &mut ShardState) -> Option<u64> {
+    match self {
+      Sent::Written(at) => Some(at),
+      Sent::Dropped => Some(state.clock.monotonic_ns()),
+      Sent::Full => None,
+    }
+  }
+}
+
+/// Writes a reply into the client's completion ring: when it was published, or that it was dropped for a gone client,
+/// or that the ring is full (the reply is kept and retried; never dropped).
 pub(crate) fn send_reply(
   state: &mut ShardState,
   client_index: u32,
   request: u64,
   reply: &mut ReplyBody,
-) -> bool {
+) -> Sent {
   // A stream end owed for this request goes first, over the client's control socket, so the client finds it waiting
   // when it reads the reply (A-161); on Windows it is duplicated into the client's process and its value written into
   // the reply (A-179). It is taken out here whatever becomes of the reply.
   crate::shards::deliver_handoff(state, client_index, request, reply);
   let Some(generation) = state.clients.generation_at(client_index) else {
-    return true;
+    return Sent::Dropped;
   };
   let handle = Handle::from_raw(client_index, generation);
   let Ok(client) = state.clients.get_mut(handle) else {
-    return true;
+    return Sent::Dropped;
   };
   if client.retiring || client.client_id != RequestId::from_word(request).client {
-    return true;
+    return Sent::Dropped;
   }
   let mut held_until = None;
   if matches!(reply, ReplyBody::DaemonStatus { .. }) {
@@ -19084,23 +19111,24 @@ pub(crate) fn send_reply(
     crate::deadlines::capture_set(state, handle, at);
   }
   let Ok(client) = state.clients.get_mut(handle) else {
-    return true;
+    return Sent::Dropped;
   };
   // Room first, then the body (`DaemonEnd::reply_message`): a reply packed before a full ring refused it was written
   // over the bulk body of the oldest reply the client had not taken.
   match client.end.reply_message(request, reply) {
-    Ok(()) => true,
-    Err(IpcError::RingFull) => false,
+    Ok(at) => Sent::Written(at),
+    Err(IpcError::RingFull) => Sent::Full,
     Err(_) => {
       let fallback = ReplyBody::Refused {
         refusal: Refusal::BadRequest {
           reason: "reply too large for the bulk area".to_owned(),
         },
       };
-      !matches!(
-        client.end.reply_message(request, &fallback),
-        Err(IpcError::RingFull)
-      )
+      match client.end.reply_message(request, &fallback) {
+        Ok(at) => Sent::Written(at),
+        Err(IpcError::RingFull) => Sent::Full,
+        Err(_) => Sent::Dropped,
+      }
     }
   }
 }

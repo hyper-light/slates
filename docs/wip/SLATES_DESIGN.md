@@ -9919,7 +9919,8 @@ it uses content addressing. The RAM-only trust boundary and any allowed sharing 
 > a bounded per-shard `SpanSink` (thread-local, no lock — R2; sized to one client ring's depth), and
 > emits `shard.op` (the whole verb) and `log.append` (the durable `Db::commit` within it) for every
 > verb in `run_recorded`, `ring.request` (ring read → reply written) for a synchronously-served reply
-> in `serve_client`/`retry_deferred`, `merge.verdict` (one increment judged) in the submit handler,
+> in `serve_client`/`retry_deferred` (since 2026-11-22 opened at the slot read's own clock reading and ended at the
+> reply's publication, before the client's wake: `docs/bugs/2026-11-22-a-ring-span-outlasted-its-clients-wait.md`), `merge.verdict` (one increment judged) in the submit handler,
 > `bridge.request` (one NFS bridge call from arrival to reply) around `serve_local` in `crate::nfs`, and
 > `land.entry` (one landing entry) through a **cross-crate span seam**: the land engine's `Observer`
 > trait gained an `after_entry(start, end)` callback taking primitives (so `slates-land` stays

@@ -1348,12 +1348,13 @@ impl DaemonEnd {
   /// Replies `message` to request `request`: packed for the next completion-ring position and written, waking the client
   /// if it parked; `RingFull` when the client has not taken the slot the ring wraps onto. Room is checked before
   /// anything is packed, as [`ClientEnd::send_message`] checks it: the position's bulk chunk holds the oldest reply the
-  /// client has not taken until it does. The only way a reply is packed.
+  /// client has not taken until it does. The only way a reply is packed. Returns when the reply was published, as
+  /// [`DaemonEnd::reply`] does.
   pub fn reply_message<M: slates_wire::Wire>(
     &mut self,
     request: u64,
     message: &M,
-  ) -> Result<(), IpcError> {
+  ) -> Result<u64, IpcError> {
     let index = self.next_reply;
     if !self.region.cpl().can_push(self.region.object(), index)? {
       return Err(IpcError::RingFull);
@@ -1368,14 +1369,18 @@ impl DaemonEnd {
     self.reply(&slot)
   }
 
-  /// Writes a reply and wakes the client if it parked.
-  pub fn reply(&mut self, slot: &Slot) -> Result<(), IpcError> {
+  /// Writes a reply and wakes the client if it parked. Returns the host's monotonic clock read just before the reply was
+  /// published, the reading its slot's stamp carries: the reply's span ends there (§4.14 `ring.request`, read to reply
+  /// written), not after the wake. A wake is a system call a loaded host may deschedule the shard at, and a span that
+  /// ended after it outlasted the client's own wait (the bench's ring exceeded the client's total, 2026-11-22).
+  pub fn reply(&mut self, slot: &Slot) -> Result<u64, IpcError> {
     let cpl = self.region.cpl();
+    let published_ns = slates_machine::clock::monotonic_ns();
     cpl.push(
       self.region.object_mut(),
       self.next_reply,
       slot,
-      crate::slot::stamp_now(),
+      crate::slot::stamp_at(published_ns),
     )?;
     self.next_reply = self.next_reply.wrapping_add(1);
     let word = self.region.wake_word()?;
@@ -1436,7 +1441,7 @@ impl DaemonEnd {
       #[cfg(unix)]
       self.nudge_completion();
     }
-    Ok(())
+    Ok(published_ns)
   }
 
   /// Makes the completion fd readable (a write of `COMPLETION_NUDGE`), best-effort. A short write, a
@@ -1736,7 +1741,8 @@ mod departure {
       #[allow(clippy::disallowed_methods)]
       // the daemon holds its answer on purpose: the hold is what is tested.
       std::thread::sleep(Duration::from_nanos(LATE_NS));
-      daemon.reply(&Slot::inline(request.request, b"late")?)
+      daemon.reply(&Slot::inline(request.request, b"late")?)?;
+      Ok(())
     })
   }
 
