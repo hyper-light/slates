@@ -1060,9 +1060,11 @@
 > lies there, checked against its name first, its delta reused where its base precedes it (`t_a859_…`: 20,916 bytes
 > against the pushed 17,299, where 89,439 went before); a stored entry reused whenever one exists, a delta's wanted
 > base placed first (3fa634049). Part A BUILT: a fetched byte priced at its link, learned per shard from the HTTP
-> edge's writes that waited for the peer, cold at deflate's measured break-even at git's level 6 (§4.11). Owed: the
-> SSH edge's writes heard (SSH fetches price cold), a price per client, not per shard; main's git/git whole round and
-> `fsck --strict`.
+> edge's writes that waited for the peer, cold at deflate's measured break-even at git's level 6 (§4.11). The SSH
+> edge's writes heard too (2026-11-23, w-git; the forward through svn.rs's `EitherCommand` agreed with w-svn): each socket write of a connection, its time and whether it found the
+> socket full, told the command it carries (`site::Command::paced`), and a git fetch's answer learns from them as the
+> HTTP edge's does (`a859_an_ssh_commands_writes_to_a_client_that_reads_late_are_heard_with_their_waits`: none heard
+> before). Owed: a price per client, not per shard; main's git/git whole round and `fsck --strict`.
 > A-864's readers BUILT (2026-11-22, w-git; main's r52): every git read before a fetch's pack (the advertisement's
 > and ls-refs' peel, the negotiation, the cuts) holds a refusal that met a let-go window and is made again once it is
 > brought back; a fetch lets the windows it brought back go behind its cursor (piece 3); bring-backs bounded. The landed
