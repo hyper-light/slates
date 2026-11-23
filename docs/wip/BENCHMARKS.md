@@ -17298,6 +17298,55 @@ ubuntu-24.04-arm:
 - In the fair class on these kernels, 84a's 1 ms loaded bar is below the tick: unreachable by any arm that keeps the
   daemon and the client fair.
 
+## 84a on Linux: a client's request pinned to its shard's CPU (arm F, on E), measured and rejected (w-perf; 2026-11-22)
+
+**The arm** (F b44f0904f on E 0b568ac91, branch `agents/w-perf-84a-arm-f`, never main; stamped F_diag 9ad9d4cc9 against
+E_diag 58f792741). It rested on one idea: under `PREEMPT_LAZY`, a fair wakeup waits for the tick only because its waker
+keeps running. A client that writes its request and blocks on its shard's own CPU would hand that CPU to the shard at
+the block, and the shard's park would hand it back.
+- `slates_machine::request_pin` pins the calling thread to one CPU of its own mask and puts the exact mask back after.
+- The client region gains the shard's CPU word (layout version 5), which `DaemonEnd::reply` publishes.
+- `Client::round_trip` pins each synchronous request. E's short slices stay on the shards and the client's park.
+- Red first: F's test failed against E's tree (exit 101) and passed on F. Every request was pinned (8,587 and 12,854 a
+  run; 1 skipped each; 0 refused restores).
+
+**The run.** Run 45087231374 (`diag-measurer-w-perf-84a-f-ab`), CI's ubuntu-24.04-arm and ubuntu-latest (4 vCPUs,
+kernel 7.0, two spinners a CPU). It interleaved 5 loaded rounds, 3 quiet rounds with `provision_bench`, and 3 stamped
+loaded rounds. Each cell is a round's median of its 3 runs, µs, rounds in order.
+
+| | E | F |
+|---|---|---|
+| arm64 loaded accept p99 | 342 · 342 · 341 · 343 · 2997 | 360 · 352 · 354 · 362 · 366 |
+| arm64 loaded conflict p99 | 4000 · 3000 · 327 · 340 · 326 | 356 · 356 · 880 · 755 · 825 |
+| arm64 loaded accept p999 | 605 · 1138 · 801 · 362 · 5993 | 1048 · 364 · 1116 · 398 · 1074 |
+| arm64 loaded conflict p999 | 6000 · 5000 · 1185 · 904 · 896 | 1827 · 937 · 1684 · 1800 · 912 |
+| arm64 kick -> run p99 (stamped) | 998 · 998 · 998 | 998 · 998 · 997 |
+| arm64 quiet accept p50 | 126 · 126 · 127 | 158 · 157 · 159 |
+| arm64 quiet accept p99 | 176 · 169 · 168 | 222 · 231 · 232 |
+| arm64 R9 spinning p99 | 98 · 97 · 93 | 281 · 283 · 283 |
+| x86_64 loaded accept p99 | 1751 · 1254 · 1740 · 1765 · 1391 | 2201 · 2042 · 1750 · 1729 · 1838 |
+| x86_64 loaded accept p999 | 1962 · 1874 · 1991 · 2201 · 1851 | 3254 · 3130 · 1992 · 1909 · 3027 |
+| x86_64 loaded conflict p999 | 1844 · 2073 · 3996 · 1808 · 1855 | 2919 · 3103 · 3039 · 1931 · 3125 |
+| x86_64 quiet accept p99 | 147 · 148 · 147 | 205 · 216 · 197 |
+| x86_64 R9 spinning p99 | 48 · 70 · 72 | 259 · 255 · 253 |
+
+**Rejected.** It fails all three parts of its test.
+- arm64's kick -> run p99 stays at the tick (998 µs). Those kicks are shard to shard (a forward's owner kick,
+  `registry::kick_if_parked`), and F moves only the client's hop.
+- x86_64's loaded p99 and p999 are worse. Its tail is not the tick (kick -> run p99 15-621 µs in both arms): the p999
+  tail's client wake (written -> seen) has a median of 2.7-2.8 ms under F, against 0.07-0.98 ms under E.
+- Quiet is worse on both: accept p50 +25-30%, p99 +25-40%.
+- R9's single spinning client goes from 48-98 µs to 253-283 µs, because a client spinning for its reply on its
+  shard's CPU competes with that shard.
+- Why a direct wake waits for the tick (kernel v7.0 source, read 2026-11-22):
+  - `wakeup_preempt_fair` (kernel/sched/fair.c) reschedules a preempting wakeup with `resched_curr_lazy` only. Its
+    `PREEMPT_SHORT` path cancels the current task's slice protection when the wakee's slice is shorter
+    (`cancel_protect_slice`).
+  - `__resched_curr` (kernel/sched/core.c) sends no IPI for the lazy bit, and `sched_tick` upgrades a pending lazy bit
+    to a full one.
+  - `exit_to_user_mode_loop` (kernel/entry/common.c) honours `_TIF_NEED_RESCHED_LAZY` on any return to user mode.
+  - So a woken shard on a CPU whose spinner never enters the kernel runs at that CPU's next tick, whatever its slice.
+
 ## 84a on macOS: the doorbell thread under the time-constraint policy, measured, not landed (w-perf; 2026-11-22)
 
 **What was measured first.** The diagnostic branch is `diag-measurer-w-perf-84a-mac-tail` (never main; CI

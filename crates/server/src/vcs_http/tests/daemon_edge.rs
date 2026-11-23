@@ -3681,3 +3681,123 @@ fn a_long_push_stale_twice_is_re_based_once_holding_the_turn_and_lands() {
     assert!(after.contains(&tip), "{after}");
   }
 }
+
+/// Format: the changesets and the bytes of each one's file in
+/// [`a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land`]: a history whose file texts are many
+/// segments' worth.
+const TEXTS_CHANGESETS: usize = 120;
+/// Format: the bytes of each file of that history.
+const TEXT_BYTES: usize = 8 * 1024;
+
+/// Main 01a20182's order of 2026-11-22 14:00 (CI 45065911852: 4.7 GB of arena held on the repository's shard after
+/// Mercurial's whole history landed, the content store keeping every revision's text). Do: start a two-shard daemon over
+/// loopback TLS; create a Mercurial repository; push a line of [`TEXTS_CHANGESETS`] changesets each adding a file of its
+/// own [`TEXT_BYTES`], cut at [`LONG_SEGMENT_BYTES`]; look at each file's window in its shard's content store; clone it
+/// whole (`getbundle`). Expect the push `200`; every file's window let go of the content store, its entry kept, but
+/// those a home pins on this shard (`vcs_store::landed_pin`, as a landed git pack's); the bytes let go counted; and the
+/// clone carrying the last file's bytes, brought back from the changeset store. Red before: the store held every text.
+#[test]
+fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
+  let (identity, certificate) = identity();
+  let (daemon, _instance) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  create_empty_hg(&daemon, &name);
+  let edge = (port, &certificate);
+  crate::daemon::observe_at(&daemon, REPOSITORY, |_| {
+    crate::repository::hg_run::TEST_SEGMENT_BYTES.with(|bound| bound.set(LONG_SEGMENT_BYTES));
+  });
+  let paths: &'static [String] = Box::leak(
+    (0..TEXTS_CHANGESETS)
+      .map(|at| format!("file-{at}"))
+      .collect::<Vec<_>>()
+      .into_boxed_slice(),
+  );
+  // Each file's text its own, so the store keeps every one (a content the store holds once, by its bytes).
+  let texts: &'static [Vec<u8>] = Box::leak(
+    (0..TEXTS_CHANGESETS)
+      .map(|at| {
+        let mut text = Vec::with_capacity(TEXT_BYTES);
+        let mut line = 0usize;
+        while text.len() < TEXT_BYTES {
+          text.extend_from_slice(format!("file {at} line {line}\n").as_bytes());
+          line += 1;
+        }
+        text.truncate(TEXT_BYTES);
+        text
+      })
+      .collect::<Vec<_>>()
+      .into_boxed_slice(),
+  );
+  let commits: Vec<Commit> = (0..TEXTS_CHANGESETS)
+    .map(|at| {
+      (
+        paths[at].as_str(),
+        paths[at].as_str(),
+        texts[at].as_slice(),
+        at.checked_sub(1),
+        "default",
+      )
+    })
+    .collect();
+  let made = history_of(&commits);
+  let revs: Vec<usize> = (0..TEXTS_CHANGESETS).collect();
+  let pushed = hg_unbundle(edge, &name, &history_bundle(&made, &revs));
+  // Each file's window: whether its shard's content store reads its bytes (none for one let go), whether a home pins it
+  // there, and whether its entry stays.
+  let windows = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    let (shard, shards) = (state.shard, state.shards.clone());
+    crate::vcs_store::lent_state(state, |state| {
+      let content = state.vcs_stores.content()?;
+      Some(
+        texts
+          .iter()
+          .map(|text| {
+            let window = slates_vcs::ContentId::of(text);
+            let pinned = crate::vcs_store::landed_pin(shard, &shards, &window).is_some();
+            (
+              content
+                .object_bytes(&window, u64::try_from(text.len()).unwrap())
+                .is_some(),
+              pinned,
+              content.len_of(&window).is_some(),
+            )
+          })
+          .collect::<Vec<_>>(),
+      )
+    })
+  })
+  .expect("the repository's content store");
+  let let_go = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::repository::hg_run::TEXT_BYTES_LET_GO,
+  );
+  let tip = crate::verbs::hex_of(&made[TEXTS_CHANGESETS - 1].node);
+  let cloned = hg_getbundle(edge, &name, &tip);
+  daemon.stop();
+  let gone = windows.iter().filter(|(here, ..)| !here).count();
+  println!(
+    "let go: {let_go} bytes; {gone} of {TEXTS_CHANGESETS} files' windows gone, the rest pinned by a home"
+  );
+  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
+  for (at, (here, pinned, entry)) in windows.iter().enumerate() {
+    assert!(entry, "file {at}'s entry kept");
+    assert_eq!(
+      here, pinned,
+      "file {at}'s window at hand only where a home pins it"
+    );
+  }
+  assert!(gone > 0, "some window let go");
+  assert!(
+    let_go >= u64::try_from(gone * TEXT_BYTES).unwrap(),
+    "{let_go} bytes let go"
+  );
+  assert_eq!(cloned.0, 200);
+  let last = &texts[TEXTS_CHANGESETS - 1];
+  assert!(
+    cloned.2.windows(64).any(|window| window == &last[..64]),
+    "the clone carries the last file's bytes"
+  );
+}

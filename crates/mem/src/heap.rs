@@ -21,6 +21,13 @@ pub struct HeapStats {
   pub in_use: u64,
   /// The large path's live mappings: one per live large allocation.
   pub large_mappings: u64,
+  /// The system allocator's part of [`HeapStats::reserved`]: its allocated size, what it holds from the OS.
+  pub system_reserved: u64,
+  /// The system allocator's part of [`HeapStats::in_use`]: its size in use, what its live blocks hold.
+  pub system_in_use: u64,
+  /// The large path's part of both: its live mappings' spans, whole pages. Address space, not RAM: a mapping's pages are
+  /// in RAM only once written (`crate::large::heap`'s `mapped_resident` reads them).
+  pub mapped_bytes: u64,
   /// Whether the system allocator was read here (macOS, glibc); where it is not, the figures are the large path's alone.
   pub system_read: bool,
 }
@@ -37,6 +44,9 @@ pub fn stats() -> HeapStats {
     reserved: system.0.saturating_add(large.mapped_bytes),
     in_use: system.1.saturating_add(large.mapped_bytes),
     large_mappings,
+    system_reserved: system.0,
+    system_in_use: system.1,
+    mapped_bytes: large.mapped_bytes,
     system_read,
   }
 }

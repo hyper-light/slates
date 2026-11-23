@@ -71,6 +71,25 @@ impl Wheel {
     }
   }
 
+  /// [`Wheel::new`] whose room grows with the timers armed, `segment_slots` at a time, up to `max_timers`: an empty
+  /// wheel holds no slot. For a wheel off the hot path, armed by a cold operation that may allocate (a partition's lease
+  /// expiry, armed by a lease's grant): `Wheel::new` reserves the whole bound at once so an insertion never allocates,
+  /// which the runtime's own wheel needs, and which sized a two-shard daemon's two lease wheels from the volume bound,
+  /// 595 MiB of address space each at idle (main 01a20182's (b2) of 2026-11-22).
+  pub fn growing(tick_ns: u64, segment_slots: usize, max_timers: usize, now_ns: u64) -> Self {
+    let tick_ns = tick_ns.max(1);
+    Self {
+      tick_ns,
+      now_tick: now_ns.checked_div(tick_ns).unwrap_or(0),
+      entries: Slab::new(segment_slots, max_timers),
+      heads: vec![NONE; SLOTS_PER_LEVEL * LEVELS],
+      armed: 0,
+      earliest: None,
+      earliest_exact: true,
+      visits: 0,
+    }
+  }
+
   /// Ticks examined so far — what `advance` cost, in the unit its work is done in.
   pub const fn visits(&self) -> u64 {
     self.visits
