@@ -92,7 +92,7 @@ use std::io::{Read, Write};
 #[cfg(windows)]
 use std::net::{TcpListener, TcpStream};
 #[cfg(windows)]
-use std::os::windows::io::{AsRawSocket, IntoRawSocket, RawSocket};
+use std::os::windows::io::{AsRawSocket, RawSocket};
 
 /// Shape: the bridge's wait upper bound in nanoseconds — a second, far above any reply cadence, so a
 /// stop is seen within it with no spurious wakeup. Only the wake-word (macOS) and Event (Windows)
@@ -442,14 +442,14 @@ fn run(eventfd: OwnedFd, write: OwnedFd, stop: OwnedFd) {
 // -------------------------------------------------------------- Windows: loopback socket over Event
 
 /// The client-side completion bridge on Windows, whose rendezvous passes no completion fd. Owns the
-/// loopback socket the async SDK polls and the thread that feeds it. The two ends of a connected
-/// loopback pair: the thread writes `write` (moved into it), the SDK polls `read` — writing one end
-/// makes the other readable.
+/// signal the async SDK polls and the thread that feeds it: a loopback socket pair for an SDK that polls a `SOCKET`
+/// (Python's selector), whose read end it holds and whose write end the thread nudges; or, for Node, which adopts no
+/// Windows socket by descriptor, a named pipe the SDK opens by name, whose server end the thread holds and nudges
+/// (`crate::completion_pipe`, A-875).
 #[cfg(windows)]
 pub struct CompletionBridge {
-  /// The read end of the loopback pair: the socket an async SDK event loop polls (`uv_poll` / a
-  /// selector). Held so [`Self::drain`] can clear its readiness and [`Self::dup_socket`] clone it.
-  read: TcpStream,
+  /// What the SDK polls (see [`Signal`]).
+  signal: Signal,
   /// The stop channel's sender, whose receiver the thread holds: dropped on drop to stop it (see the module doc).
   stop: Option<Sender<()>>,
   /// The bridge thread, joined on drop.
@@ -457,6 +457,17 @@ pub struct CompletionBridge {
   /// A second mapping of the region, so [`Self::stop`] can signal the named Event the thread parks
   /// on and unpark it for the join.
   waker: ClientRegion,
+}
+
+/// What a Windows bridge's SDK polls.
+#[cfg(windows)]
+#[derive(Debug)]
+enum Signal {
+  /// The read end of the loopback pair (`uv_poll` / a selector), held so [`CompletionBridge::drain`] can clear its
+  /// readiness.
+  Socket(TcpStream),
+  /// The name of the completion pipe the SDK opens (`net.connect`), whose server end the thread holds.
+  Pipe(String),
 }
 
 #[cfg(windows)]
@@ -474,53 +485,86 @@ impl CompletionBridge {
     region: &ClientRegion,
     spawn: Spawn,
   ) -> Result<CompletionBridge, IpcError> {
-    let (handoff, len) = region.handoff()?;
-    // Two independent second mappings of the one shared region: the thread waits on the Event
-    // through one, the owner signals it through the other to stop the thread (the doorbell pattern).
-    let waiter = ClientRegion::open(&handoff, len)?;
-    let waker = ClientRegion::open(&handoff, len)?;
+    let (waiter, waker) = Self::mappings(region)?;
     let (read, write) = loopback_pair()?;
     // The stop is a channel the two ends own and free: the thread takes the receiver, the owner keeps the sender. No
     // `Arc` (R2), and nothing kept past the bridge.
     let (stop, stopped) = std::sync::mpsc::channel::<()>();
     let handle = bridge_thread(spawn, Box::new(move || run(waiter, write, stopped)))?;
     Ok(CompletionBridge {
-      read,
+      signal: Signal::Socket(read),
       stop: Some(stop),
       handle: Some(handle),
       waker,
     })
   }
 
-  /// The socket the async SDK polls (`uv_poll` / a Python selector). A Windows `SOCKET`, exposed as
-  /// the platform `RawSocket` the SDK layers register.
-  pub fn completion_socket(&self) -> RawSocket {
-    self.read.as_raw_socket()
+  /// Starts the bridge over `region` with a completion pipe for an SDK that opens its signal by name (Node, A-875):
+  /// the thread listens on the pipe, admits a reader only when it is this process, and nudges it on an armed reply
+  /// (`crate::completion_pipe`). Refused typed when the pipe, its listener or the thread cannot be made; the listener
+  /// is made on the thread, which says so before the start returns.
+  pub fn start_pipe(region: &ClientRegion) -> Result<CompletionBridge, IpcError> {
+    let (waiter, waker) = Self::mappings(region)?;
+    let pipe = crate::completion_pipe::CompletionPipe::new()?;
+    let (stop, stopped) = std::sync::mpsc::channel::<()>();
+    let (ready, listening) = std::sync::mpsc::sync_channel::<Result<(), IpcError>>(1);
+    let server = pipe.server;
+    let mut bridge = CompletionBridge {
+      signal: Signal::Pipe(pipe.name),
+      stop: Some(stop),
+      handle: None,
+      waker,
+    };
+    bridge.handle = Some(bridge_thread(
+      os_spawn,
+      Box::new(move || run_pipe(waiter, server, stopped, ready)),
+    )?);
+    match listening.recv() {
+      Ok(Ok(())) => Ok(bridge),
+      Ok(Err(refused)) => Err(refused),
+      Err(_) => Err(IpcError::Unsupported {
+        feature: "a completion pipe (its bridge's thread ended before it listened)",
+      }),
+    }
   }
 
-  /// A dup of the read end, owned by the caller — for an SDK whose event loop closes the socket it
-  /// polls (Node's `net.Socket` does). `try_clone` duplicates the underlying `SOCKET` (a real handle
-  /// dup), and `into_raw_socket` hands ownership of that duplicate to the caller, so closing it
-  /// leaves this bridge's read end intact. A safe dup: no raw-handle construction.
-  pub fn dup_socket(&self) -> Result<RawSocket, IpcError> {
-    Ok(
-      self
-        .read
-        .try_clone()
-        .map_err(|e| IpcError::OsRefused {
-          call: "try_clone",
-          code: e.raw_os_error(),
-        })?
-        .into_raw_socket(),
-    )
+  /// Two independent second mappings of `region`'s shared region: the thread waits on the Event through the first,
+  /// the owner signals it through the second to stop the thread (the doorbell pattern).
+  fn mappings(region: &ClientRegion) -> Result<(ClientRegion, ClientRegion), IpcError> {
+    let (handoff, len) = region.handoff()?;
+    Ok((
+      ClientRegion::open(&handoff, len)?,
+      ClientRegion::open(&handoff, len)?,
+    ))
+  }
+
+  /// The socket the async SDK polls (`uv_poll` / a Python selector), for a bridge started with [`Self::start`]: a
+  /// Windows `SOCKET`, exposed as the platform `RawSocket` the SDK layers register. `None` for a pipe's bridge.
+  pub fn completion_socket(&self) -> Option<RawSocket> {
+    match &self.signal {
+      Signal::Socket(read) => Some(read.as_raw_socket()),
+      Signal::Pipe(_) => None,
+    }
+  }
+
+  /// The name of the completion pipe the SDK opens, for a bridge started with [`Self::start_pipe`]; `None` for a
+  /// socket's bridge.
+  pub fn pipe_name(&self) -> Option<&str> {
+    match &self.signal {
+      Signal::Pipe(name) => Some(name),
+      Signal::Socket(_) => None,
+    }
   }
 
   /// Clears the socket's readiness after the loop reports it readable: a non-blocking read that
   /// takes whatever nudges are buffered. The read end is non-blocking, so an empty socket is a
-  /// no-op (`&TcpStream` reads without a `&mut`, and returns `WouldBlock` when drained).
+  /// no-op (`&TcpStream` reads without a `&mut`, and returns `WouldBlock` when drained). A pipe's reader reads its
+  /// own nudges (Node's stream does), so there is nothing here to clear for it.
   pub fn drain(&self) {
-    let mut scratch = [0u8; 64];
-    let _ = (&self.read).read(&mut scratch);
+    if let Signal::Socket(read) = &self.signal {
+      let mut scratch = [0u8; 64];
+      let _ = (&*read).read(&mut scratch);
+    }
   }
 
   /// Stops the thread and joins it: drop the stop channel's sender, then signal the named Event so a parked thread
@@ -530,6 +574,66 @@ impl CompletionBridge {
     let _ = self.waker.wake_signal();
     if let Some(handle) = self.handle.take() {
       let _ = handle.join();
+    }
+  }
+}
+
+/// The Windows pipe bridge's thread (A-875): make the listener here, where its pending connect's record stays, and say
+/// so on `ready`; then, as [`run`] does, park on the region's named Event and after every return nudge while the
+/// client is armed and a reply waits, once a reader of this process is admitted. Until one is, the wait is beside the
+/// listener's connect, so a reply that landed before the SDK connected is signalled as it connects. A refusal the
+/// thread cannot get past (a connect or a nudge the OS refuses for no reader's sake) ends the thread: its pipe closes,
+/// and the SDK's reader meets the end of its stream, then its next open of the name is refused, typed.
+#[cfg(windows)]
+fn run_pipe(
+  region: ClientRegion,
+  server: std::os::windows::io::OwnedHandle,
+  stop: Receiver<()>,
+  ready: std::sync::mpsc::SyncSender<Result<(), IpcError>>,
+) {
+  use crate::completion_pipe::{Listener, Nudged};
+  use crate::wake::EventOrExit;
+  let mut listener = match Listener::new(server) {
+    Ok(listener) => listener,
+    Err(refused) => {
+      let _ = ready.send(Err(refused));
+      return;
+    }
+  };
+  if ready.send(Ok(())).is_err() {
+    return;
+  }
+  while !stopped(&stop) {
+    let signaled = if listener.admitted() {
+      region.wake_wait(Some(POLL_NS)).unwrap_or(false)
+    } else {
+      matches!(
+        region.wake_wait_or_exit(listener.event(), Some(POLL_NS)),
+        Ok(EventOrExit::Signaled)
+      )
+    };
+    if stopped(&stop) {
+      break;
+    }
+    if signaled && synchronous_park_waiting(&region) {
+      let _ = region.wake_signal();
+    }
+    match listener.settle() {
+      Ok(true) => {}
+      Ok(false) => continue,
+      Err(_) => break,
+    }
+    if armed_with_reply_waiting(&region) {
+      match listener.nudge(&NUDGE) {
+        Ok(Nudged::Readable) => {}
+        // The reader went (its stream destroyed): listen for the next at once.
+        Ok(Nudged::ReaderGone) => {
+          if listener.settle().is_err() {
+            break;
+          }
+        }
+        Err(_) => break,
+      }
     }
   }
 }

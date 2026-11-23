@@ -6150,6 +6150,13 @@
 > Beyond the goal's clauses, owed from this entry: the async form for the remaining verbs, the MCP list tools answering
 > a page at a time, and a merge's versions typed on the wire.
 
+> **The Node SDK's completion on Windows (2026-11-23, w-interop; A-875; found by CI run 45176536354's Windows legs):**
+> `async lifecycle over a live daemon` died with `CompletionLost { reason: "Unsupported fd type: UNKNOWN" }`. Node
+> adopts no Windows socket by descriptor (libuv's `uv_guess_handle`), and the SDK was handed the bridge's loopback
+> socket. **Built:** the Windows bridge signals the Node SDK through a named pipe that `async.mjs` opens by name
+> (`net.connect`), admitting only a reader of this process (`crates/ipc/src/completion_pipe.rs`). Python keeps the
+> socket. **Owed:** main's diag run on windows-latest (red at main, green with the change, with `slates-ipc`'s two new
+> Windows tests), then windows-11-arm; a test of a reader from another process being refused.
 > **The Node SDK suites on Windows (2026-11-18, §4.7 status "the Node SDK suites end on Windows"; goal 88).** The three
 > Node suites had never run on Windows: CI's `sdk` job ran on `ubuntu-latest` and `macos-latest` alone. Main's diag run
 > 44384411115 (main da697d886) ran them on both Windows runners, and the step went past 70 minutes until cancelled, with

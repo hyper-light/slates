@@ -983,25 +983,23 @@ impl Client {
 
   /// The completion fd an async event loop polls (`uv_poll`), starting the completion channel on first
   /// call (§4.7, D-19). A **dup** the JS side owns: Node's `net.Socket` adopts and closes the fd it
-  /// wraps, so it must be given its own descriptor — closing it leaves the client's intact. On Unix
-  /// this is a real fd; on Windows the completion channel is a loopback socket (D-10), whose handle
-  /// [`Self::completion_fd`] returns as a JS-safe integer that `net.Socket({ fd })` adopts too — Node
-  /// and libuv accept a `SOCKET` there, so the same `async.mjs` reader serves both platforms.
+  /// wraps, so it must be given its own descriptor — closing it leaves the client's intact. Unix only: on Windows
+  /// Node adopts no socket by descriptor, and `async.mjs` opens [`Self::completion_pipe`] by name instead.
   #[cfg(unix)]
   #[napi]
   pub fn completion_fd(&mut self) -> Result<i32> {
     self.inner.enable_async_completion_dup().map_err(refusal)
   }
 
-  /// The Windows completion socket handle (a `SOCKET`) the async event loop polls — the analogue of
-  /// the Unix [`Self::completion_fd`]. A `SOCKET` is a kernel handle-table value that fits in a JS-safe
-  /// integer, returned as `i64` so `net.Socket({ fd })` can adopt it (a dup the JS side owns/closes).
+  /// The name of the Windows completion pipe `async.mjs` opens with `net.connect` (§4.7, D-19; A-875), starting the
+  /// completion channel on first call: the Windows counterpart of the Unix [`Self::completion_fd`]. A name, not a
+  /// descriptor, because Node's `net.Socket({ fd })` takes a C runtime descriptor and adopts only a pipe, a console or
+  /// a file through it (libuv's `uv_guess_handle`): the loopback socket this returned before A-875 failed every slow
+  /// call with "Unsupported fd type: UNKNOWN". The bridge admits only a reader of this process.
   #[cfg(windows)]
   #[napi]
-  pub fn completion_fd(&mut self) -> Result<i64> {
-    let socket = self.inner.enable_async_completion_dup().map_err(refusal)?;
-    // A socket handle fits in i64 (it is well under 2^63); the try_from is exact, not a truncating cast.
-    i64::try_from(socket).map_err(|_| Error::from_reason("completion socket handle out of range"))
+  pub fn completion_pipe(&mut self) -> Result<String> {
+    self.inner.enable_async_completion_pipe().map_err(refusal)
   }
 
   /// Drains every landed reply and admits waiting calls: the events for `async.mjs` to settle (the

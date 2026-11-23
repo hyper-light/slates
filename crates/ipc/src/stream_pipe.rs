@@ -87,13 +87,13 @@ pub const OWNER_ONLY_SDDL: &str = "D:P(A;;GA;;;OW)";
 const NAME_INFO_WORDS: usize = (std::mem::size_of::<u32>() + 2 * 32_767).div_ceil(4);
 
 /// This thread's last error code, read before any other call.
-fn last_error() -> u32 {
+pub(crate) fn last_error() -> u32 {
   // SAFETY: reads this thread's last error; no memory is touched.
   unsafe { GetLastError() }
 }
 
 /// The OS refused `call`: its error code, read before any other call.
-fn os(call: &'static str) -> IpcError {
+pub(crate) fn os(call: &'static str) -> IpcError {
   IpcError::OsRefused {
     call,
     code: i32::try_from(last_error()).ok(),
@@ -143,7 +143,7 @@ fn pair_in(
   let buffer = u32::try_from(frame_bytes).map_err(|_| IpcError::Layout {
     reason: "a pipe buffer past what CreateNamedPipeW takes",
   })?;
-  let name = fresh_name()?;
+  let name = fresh_name(NAME_PREFIX)?;
   let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
   let descriptor = OwnerOnly::new()?;
   let attributes = SECURITY_ATTRIBUTES {
@@ -192,8 +192,9 @@ fn pair_in(
   Ok((server, client))
 }
 
-/// A fresh pipe name: [`NAME_PREFIX`] and [`NAME_RANDOM_BYTES`] from the OS's random source, in hex.
-fn fresh_name() -> Result<String, IpcError> {
+/// A fresh pipe name: `prefix` (a Shards stream's [`NAME_PREFIX`], a completion pipe's
+/// `crate::completion_pipe::NAME_PREFIX`) and [`NAME_RANDOM_BYTES`] from the OS's random source, in hex.
+pub(crate) fn fresh_name(prefix: &str) -> Result<String, IpcError> {
   let mut bytes = [0u8; NAME_RANDOM_BYTES];
   let length = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
   // SAFETY: no algorithm handle with the system's preferred generator, and a buffer of `length` bytes.
@@ -211,8 +212,8 @@ fn fresh_name() -> Result<String, IpcError> {
       code: Some(status),
     });
   }
-  let mut name = String::with_capacity(NAME_PREFIX.len().saturating_add(2 * NAME_RANDOM_BYTES));
-  name.push_str(NAME_PREFIX);
+  let mut name = String::with_capacity(prefix.len().saturating_add(2 * NAME_RANDOM_BYTES));
+  name.push_str(prefix);
   for byte in bytes {
     use std::fmt::Write as _;
     let _infallible = write!(name, "{byte:02x}");
@@ -220,11 +221,11 @@ fn fresh_name() -> Result<String, IpcError> {
   Ok(name)
 }
 
-/// The owner-only descriptor, freed on drop.
-struct OwnerOnly(PSECURITY_DESCRIPTOR);
+/// The owner-only descriptor ([`OWNER_ONLY_SDDL`]), freed on drop; a Shards stream's and a completion pipe's.
+pub(crate) struct OwnerOnly(pub(crate) PSECURITY_DESCRIPTOR);
 
 impl OwnerOnly {
-  fn new() -> Result<OwnerOnly, IpcError> {
+  pub(crate) fn new() -> Result<OwnerOnly, IpcError> {
     let text: Vec<u16> = OWNER_ONLY_SDDL
       .encode_utf16()
       .chain(std::iter::once(0))

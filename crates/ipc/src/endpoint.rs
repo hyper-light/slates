@@ -175,10 +175,11 @@ pub struct ClientEnd {
   /// whose `net.Socket` refuses an eventfd) starts one, to convert the eventfd to a pollable pipe.
   #[cfg(any(target_os = "macos", target_os = "linux"))]
   bridge: Option<crate::completion::CompletionBridge>,
-  /// The Windows completion bridge (a loopback socket fed by a thread parking on the region's named
-  /// Event), started on demand by [`Self::enable_async_completion`]; `None` for a sync client and
-  /// until the first async use. Windows passes no shared completion fd (Mach and named sockets are
-  /// refused, D-10), so the async SDK polls this bridge's socket, exactly as macOS polls its pipe.
+  /// The Windows completion bridge (a thread parking on the region's named Event, feeding a loopback socket for
+  /// Python's selector or a named pipe the Node SDK opens by name, A-875), started on demand by
+  /// [`Self::enable_async_completion`] or [`Self::enable_async_completion_pipe`]; `None` for a sync client and until
+  /// the first async use. Windows passes no shared completion fd (Mach and named sockets are refused, D-10), so the
+  /// async SDK polls what this bridge signals, as macOS polls its pipe.
   #[cfg(windows)]
   bridge: Option<crate::completion::CompletionBridge>,
 }
@@ -379,21 +380,23 @@ impl ClientEnd {
     }
   }
 
-  /// The completion socket for an async SDK event loop to poll (`uv_poll` / a Python selector, D-19),
-  /// or `None` for a sync client or until [`Self::enable_async_completion`] starts the bridge. The
-  /// loop waits for it to become readable, drains it ([`Self::drain_completion`]), then takes the
-  /// reply with [`Self::try_take`]. The Windows analogue of `Self::completion_fd`, which is the Unix arm and so never exists where this one does.
+  /// The completion socket for an async SDK event loop to poll (a Python selector, D-19), or `None` for a sync client,
+  /// until [`Self::enable_async_completion`] starts the bridge, or while the bridge signals a pipe
+  /// ([`Self::enable_async_completion_pipe`]). The loop waits for it to become readable, drains it
+  /// ([`Self::drain_completion`]), then takes the reply with [`Self::try_take`]. The Windows analogue of
+  /// `Self::completion_fd`, which is the Unix arm and so never exists where this one does.
   #[cfg(windows)]
   pub fn completion_socket(&self) -> Option<RawSocket> {
     self
       .bridge
       .as_ref()
-      .map(crate::completion::CompletionBridge::completion_socket)
+      .and_then(crate::completion::CompletionBridge::completion_socket)
   }
 
   /// Clears the completion socket's readiness after the event loop reports it readable, so the next
   /// wait blocks again rather than seeing a stale nudge. Best-effort — a non-blocking read of the
-  /// buffered nudges; a no-op before the bridge starts or when the socket is already drained.
+  /// buffered nudges; a no-op before the bridge starts, when the socket is already drained, or for a pipe, whose
+  /// reader reads its own nudges.
   #[cfg(windows)]
   pub fn drain_completion(&self) {
     if let Some(bridge) = &self.bridge {
@@ -401,37 +404,50 @@ impl ClientEnd {
     }
   }
 
-  /// Enables the async completion channel and returns the socket an event loop polls (`uv_poll` / a
-  /// selector, D-19). Idempotent — the same socket each call. Windows passes no shared completion fd
-  /// (Mach and named sockets are refused, D-10), so this starts the completion bridge (a loopback
-  /// socket fed by a thread parking on the region's named Event) on first use, exactly as macOS
-  /// starts its self-pipe bridge. The SDK registers the socket once, arms the parked flag with
-  /// [`Self::arm_async`] before it yields, re-checks [`Self::try_take`] to close the race, and drains
-  /// the socket with [`Self::drain_completion`] when the loop reports it readable.
+  /// Enables the async completion channel and returns the socket an event loop polls (a Python selector, D-19).
+  /// Idempotent — the same socket each call. Windows passes no shared completion fd (Mach and named sockets are
+  /// refused, D-10), so this starts the completion bridge (a loopback socket fed by a thread parking on the region's
+  /// named Event) on first use, exactly as macOS starts its self-pipe bridge. The SDK registers the socket once, arms
+  /// the parked flag with [`Self::arm_async`] before it yields, re-checks [`Self::try_take`] to close the race, and
+  /// drains the socket with [`Self::drain_completion`] when the loop reports it readable. Refused `Unsupported` while
+  /// the bridge signals a pipe: one client serves one SDK's loop.
   #[cfg(windows)]
   pub fn enable_async_completion(&mut self) -> Result<RawSocket, IpcError> {
     if let Some(bridge) = &self.bridge {
-      return Ok(bridge.completion_socket());
+      return bridge.completion_socket().ok_or(IpcError::Unsupported {
+        feature: "a completion socket beside the completion pipe this client signals (A-875)",
+      });
     }
     let bridge = crate::completion::CompletionBridge::start(&self.region)?;
     let socket = bridge.completion_socket();
     self.bridge = Some(bridge);
-    Ok(socket)
+    socket.ok_or(IpcError::Unsupported {
+      feature: "a completion socket (the bridge started without one)",
+    })
   }
 
-  /// Like [`Self::enable_async_completion`] but returns a **dup** the caller owns and must close — for
-  /// an SDK whose event loop closes the socket it polls (Node's `net.Socket` adopts and closes it;
-  /// asyncio only polls it, so it uses `enable_async_completion`). The dup and the client's own socket
-  /// refer to the same loopback endpoint, so closing the dup leaves the client's intact.
+  /// Enables the async completion channel for an SDK that opens its signal by name, and returns the name: Node's,
+  /// whose `net.Socket` adopts no Windows socket by descriptor (libuv's `uv_guess_handle` takes a C runtime descriptor
+  /// and never answers a socket), so the bridge signals a named pipe its `net.connect` opens (A-875;
+  /// `crate::completion_pipe`). Idempotent — the same name each call, while its one reader stays connected; once that
+  /// reader goes, the pipe listens again. Refused `Unsupported` while the bridge signals a socket
+  /// ([`Self::enable_async_completion`]). Replaces the Windows `enable_async_completion_dup`, a duplicate of the
+  /// loopback socket that Node refused as "Unsupported fd type: UNKNOWN".
   #[cfg(windows)]
-  pub fn enable_async_completion_dup(&mut self) -> Result<RawSocket, IpcError> {
-    self.enable_async_completion()?;
-    match &self.bridge {
-      Some(bridge) => bridge.dup_socket(),
-      None => Err(IpcError::Unsupported {
-        feature: "async completion socket (the bridge did not start)",
-      }),
+  pub fn enable_async_completion_pipe(&mut self) -> Result<String, IpcError> {
+    if self.bridge.is_none() {
+      self.bridge = Some(crate::completion::CompletionBridge::start_pipe(
+        &self.region,
+      )?);
     }
+    self
+      .bridge
+      .as_ref()
+      .and_then(crate::completion::CompletionBridge::pipe_name)
+      .map(str::to_owned)
+      .ok_or(IpcError::Unsupported {
+        feature: "a completion pipe beside the completion socket this client signals (A-875)",
+      })
   }
 
   /// Arms the completion signal before the SDK yields to its event loop: the daemon wakes a parked
@@ -2523,4 +2539,197 @@ fn real_time_once(window_ns: u64) {
       let _ = slates_machine::time_constraint::set_current_from(window_ns);
     }
   });
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+  use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
+  use std::time::{Duration, Instant};
+
+  use windows_sys::Win32::Foundation::{
+    ERROR_PIPE_BUSY, GENERIC_READ, GENERIC_WRITE, GetLastError, INVALID_HANDLE_VALUE,
+  };
+  use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING};
+  use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+  use super::{ClientEnd, DaemonEnd};
+  use crate::region::{ClientRegion, RegionGeometry};
+  use crate::slot::Slot;
+
+  /// Shape: how long a nudge the test expects may take to arrive: far above the bridge's wake, which is the region's
+  /// Event and needs no timer.
+  const ARRIVES_WITHIN: Duration = Duration::from_secs(2);
+
+  /// Shape: how long the test watches for a nudge it expects never to come.
+  const QUIET_FOR: Duration = Duration::from_millis(100);
+
+  /// Shape: the pause between the test's looks at the pipe.
+  const LOOK_EVERY: Duration = Duration::from_millis(1);
+
+  /// Shape: half the bridge's timed look (a second, `crate::completion`'s `POLL_NS`): a nudge that came only at that
+  /// look would take longer than this.
+  const SOONER_THAN_THE_TIMED_LOOK: Duration = Duration::from_millis(500);
+
+  fn geometry() -> RegionGeometry {
+    RegionGeometry {
+      slots: 8,
+      spin_ns: 200_000,
+      spin_shift: 4,
+      bulk_bytes: 4096,
+      page: 4096,
+    }
+  }
+
+  /// Opens the pipe `name` as libuv's `uv_pipe_connect` first opens one (read and write, overlapped): the reader, or
+  /// the refusal's code.
+  fn open_as_node_does(name: &str) -> Result<OwnedHandle, u32> {
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: a NUL-terminated name; the handle returned is checked and owned.
+    let handle = unsafe {
+      CreateFileW(
+        wide.as_ptr(),
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        std::ptr::null(),
+        OPEN_EXISTING,
+        FILE_FLAG_OVERLAPPED,
+        std::ptr::null_mut(),
+      )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+      // SAFETY: reads this thread's last error.
+      return Err(unsafe { GetLastError() });
+    }
+    // SAFETY: the handle just opened, owned by the test.
+    Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
+  }
+
+  /// The bytes waiting in `reader`, read without taking them.
+  fn waiting(reader: &OwnedHandle) -> u32 {
+    let mut available = 0u32;
+    // SAFETY: a live pipe handle and an out-pointer to a local; no buffer is read.
+    unsafe {
+      PeekNamedPipe(
+        reader.as_raw_handle(),
+        std::ptr::null_mut(),
+        0,
+        std::ptr::null_mut(),
+        &mut available,
+        std::ptr::null_mut(),
+      )
+    };
+    available
+  }
+
+  /// Whether a byte waits in `reader` within `bound`.
+  fn readable_within(reader: &OwnedHandle, bound: Duration) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < bound {
+      if waiting(reader) > 0 {
+        return true;
+      }
+      // Test pacing between looks at a pipe; shipped code waits on its driver (D-9).
+      #[allow(clippy::disallowed_methods)]
+      std::thread::sleep(LOOK_EVERY);
+    }
+    waiting(reader) > 0
+  }
+
+  /// A-875 (§4.7, D-19): the Windows completion signal the Node SDK opens by name. Do: enable the client's completion
+  /// pipe, open its name as Node's `net.connect` does, open it a second time; reply to a disarmed client (the fast
+  /// path), then to an armed one (the slow path). Expect: the name under the completion prefix, the same name asked
+  /// again, no socket beside it, the second reader refused `ERROR_PIPE_BUSY`; the pipe quiet for the disarmed reply and
+  /// holding a nudge for the armed one; both replies in the ring; and the client's drop joining the bridge's thread
+  /// (the test returns). Before A-875 the Node SDK was handed a duplicate of the loopback socket, which Node refuses
+  /// ("Unsupported fd type: UNKNOWN").
+  #[test]
+  fn the_windows_completion_pipe_is_opened_by_name_and_signals_only_an_armed_reply() {
+    let name = format!("slates-endpoint-windows-pipe-{}", std::process::id());
+    let region = ClientRegion::create(&name, 7, 0, geometry()).unwrap();
+    let (handoff, len) = region.handoff().unwrap();
+    let mut client = ClientEnd::new(ClientRegion::open(&handoff, len).unwrap());
+    let mut daemon = DaemonEnd::new(region);
+
+    let pipe = client.enable_async_completion_pipe().unwrap();
+    assert!(
+      pipe.starts_with(crate::completion_pipe::NAME_PREFIX),
+      "{pipe}"
+    );
+    assert_eq!(client.enable_async_completion_pipe().unwrap(), pipe);
+    assert!(
+      client.enable_async_completion().is_err(),
+      "no completion socket beside the pipe"
+    );
+    let reader = open_as_node_does(&pipe).unwrap();
+    assert_eq!(
+      open_as_node_does(&pipe).err(),
+      Some(ERROR_PIPE_BUSY),
+      "a second reader is refused while the first is connected"
+    );
+
+    // Fast path: the client is not armed, so nothing is signalled.
+    client.send(&Slot::inline(1, b"hi").unwrap()).unwrap();
+    let request = daemon.try_take().unwrap().unwrap();
+    daemon
+      .reply(&Slot::inline(request.request, b"one").unwrap())
+      .unwrap();
+    assert!(
+      !readable_within(&reader, QUIET_FOR),
+      "a disarmed (fast-path) reply does not wake the event loop"
+    );
+    assert_eq!(client.try_take().unwrap().unwrap().payload, b"one");
+
+    // Slow path: the client arms before it would yield, and the bridge nudges the pipe.
+    client.arm_async().unwrap();
+    client.send(&Slot::inline(2, b"hi").unwrap()).unwrap();
+    let request = daemon.try_take().unwrap().unwrap();
+    daemon
+      .reply(&Slot::inline(request.request, b"two").unwrap())
+      .unwrap();
+    assert!(
+      readable_within(&reader, ARRIVES_WITHIN),
+      "an armed (slow-path) reply makes the completion pipe readable"
+    );
+    let mut nudge = [0u8; 8];
+    assert!(crate::stream::read_waiting(reader.as_handle(), &mut nudge).unwrap() > 0);
+    client.disarm_async().unwrap();
+    assert_eq!(client.try_take().unwrap().unwrap().payload, b"two");
+
+    drop(reader);
+    drop(client);
+  }
+
+  /// A-875: a reply that lands before the Node SDK has connected is signalled as it connects. Do: enable the pipe, arm
+  /// the client, reply, and only then open the name. Expect a nudge waiting within [`ARRIVES_WITHIN`], well under the
+  /// bridge's timed look (a second), since the bridge waits beside the pipe's connect until a reader is admitted.
+  #[test]
+  fn a_reply_that_landed_before_the_reader_connected_is_signalled_as_it_connects() {
+    let name = format!("slates-endpoint-windows-pipe-late-{}", std::process::id());
+    let region = ClientRegion::create(&name, 7, 0, geometry()).unwrap();
+    let (handoff, len) = region.handoff().unwrap();
+    let mut client = ClientEnd::new(ClientRegion::open(&handoff, len).unwrap());
+    let mut daemon = DaemonEnd::new(region);
+    let pipe = client.enable_async_completion_pipe().unwrap();
+    client.arm_async().unwrap();
+    client.send(&Slot::inline(1, b"hi").unwrap()).unwrap();
+    let request = daemon.try_take().unwrap().unwrap();
+    daemon
+      .reply(&Slot::inline(request.request, b"early").unwrap())
+      .unwrap();
+    let started = Instant::now();
+    let reader = open_as_node_does(&pipe).unwrap();
+    assert!(
+      readable_within(&reader, ARRIVES_WITHIN),
+      "the early reply is signalled once the reader connects"
+    );
+    let took = started.elapsed();
+    assert!(
+      took < SOONER_THAN_THE_TIMED_LOOK,
+      "signalled {took:?} after the connect: the bridge waited for its timed look"
+    );
+    client.disarm_async().unwrap();
+    assert_eq!(client.try_take().unwrap().unwrap().payload, b"early");
+    drop(reader);
+    drop(client);
+  }
 }

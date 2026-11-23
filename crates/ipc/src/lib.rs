@@ -92,6 +92,9 @@ pub mod stream;
 #[cfg(windows)]
 #[path = "stream_pipe.rs"]
 pub mod stream;
+// The completion signal the Node SDK opens by name on Windows (A-875): Node adopts no Windows socket by descriptor.
+#[cfg(windows)]
+pub mod completion_pipe;
 pub mod wake;
 // Starting a child that inherits exactly the handles named for it (the delivery's read end, a Shards stream's end, the
 // anchor's held handles, A-198).
