@@ -2406,7 +2406,7 @@ pub(crate) fn let_go_read(
   state: &mut ShardState,
   window: &slates_vcs::ContentId,
 ) -> Result<u64, slates_vcs::LetGoRefused> {
-  let pin = landed_pin(state.shard, &state.shards, window);
+  let pin = landed_pin(window);
   let freed = within_budget(state, 0, |stores| {
     stores
       .content_mut()
@@ -2464,7 +2464,8 @@ fn let_go_landed_pack(state: &mut ShardState, pack: &slates_vcs::ContentId) {
   let_go_landed_pack_among(state, pack, &shards);
 }
 
-/// [`let_go_landed_pack`] with the node's shards `shards`, which rank each window's home ([`landed_pin`]). The pack's
+/// [`let_go_landed_pack`] with the node's shards `shards`, which rank the pack's home, each window kept where this shard
+/// holds it for the region ([`landed_pin`]). The pack's
 /// home on the node told first (goal 93 item 2b(b), [`homes::landed_pack_here`]): where it holds the pack for the region,
 /// it records where each window lies in the pack and lets its copy go, brought back by the record on a read; on this
 /// shard before the let-go, so those windows need no pin, on another by a task of its own, whose answer nothing waits on.
@@ -2499,7 +2500,7 @@ pub(crate) fn let_go_landed_pack_among(
   }
   let (freed, pinned) = within_budget(state, 0, |stores| {
     stores.content_mut().map_or((0, 0), |content| {
-      content.let_go_object_landed(pack, &|window| landed_pin(shard, shards, window))
+      content.let_go_object_landed(pack, &landed_pin)
     })
   });
   if freed > 0 {
@@ -2510,24 +2511,20 @@ pub(crate) fn let_go_landed_pack_among(
   }
 }
 
-/// The holder of `window` on shard `shard` (of the node's `shards`) that pins it once landed: a home, which reads it by
-/// its identity alone and cannot bring it back (`homes::read_here`, the region's serve and the healer; main 01a20182's
-/// ruling of 2026-11-22 07:00 (ii)), where the window's home is this shard or the shard holds it for the region. Read by
-/// where the identity's home is, so it holds across a restart, whatever was held before it. None for any other window.
-pub(crate) fn landed_pin(
-  shard: u16,
-  shards: &[u16],
-  window: &slates_vcs::ContentId,
-) -> Option<&'static str> {
+/// The holder of `window` on this shard that pins it once landed: a home, which reads by identity alone what it holds
+/// for the region and cannot bring a window back without a record (`homes::read_here`, the region's serve and the
+/// healer; main 01a20182's rulings of 2026-11-22 07:00 (ii) and 21:15), where this shard holds the window for the region,
+/// itself or as a window of an object the region holds here. Read from the region holds, which the shard image carries,
+/// so it holds across a restart. None for a window whose home recorded what brings it back, and for any other window:
+/// where an identity ranks pins nothing, since nothing is homed by that rank but what the region holds.
+pub(crate) fn landed_pin(window: &slates_vcs::ContentId) -> Option<&'static str> {
   // A window whose home recorded what brings it back (its place in a landed pack, or its Mercurial file revision) is
   // brought back by that record (goal 93 item 2b(b)).
   if homes::landed(window).is_some() {
     return None;
   }
-  let homed_here = homes::home_of(shards, window) == Some(shard);
   // Held for the region here, itself or as a window of an object the region holds (a region hold names its object).
-  let region = homes::region_holds_here(window) > 0 || homes::region_holds_window(window);
-  (homed_here || region).then_some("homes")
+  (homes::region_holds_here(window) > 0 || homes::region_holds_window(window)).then_some("homes")
 }
 
 /// Format: the status counter of the bytes of landed pushes' packs let go from the shard's content store (goal 93 item

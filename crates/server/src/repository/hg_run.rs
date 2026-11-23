@@ -238,9 +238,8 @@ fn abandoned(state: &mut ShardState, repository: RepositoryId, ranges: Vec<(u64,
 /// Counter: the bytes of pushes' file texts let go of the content store once the segment carrying them was durable
 /// (module docs, "Let go"). Format: a counter name in the status report.
 pub(crate) const TEXT_BYTES_LET_GO: &str = "vcs.hg.push_text_bytes_let_go";
-/// Counter: a landed segment's window kept because a home holds it here (`vcs_store::landed_pin`: one whose home by
-/// identity is this shard, which a home reads by identity alone), until its entry commits and notes it. Format: a
-/// counter name.
+/// Counter: a landed segment's window kept because a home holds it here (`vcs_store::landed_pin`: one this shard holds
+/// for the region, which a home reads by identity alone), until its entry commits and notes it. Format: a counter name.
 pub(crate) const TEXTS_PINNED: &str = "vcs.hg.push_texts_pinned";
 
 /// Lets go of `contents`, a landed segment's file revisions' windows (module docs, "Let go"), each noted for a home as
@@ -284,7 +283,6 @@ fn let_go_windows_until(
   contents: &[FileContents],
   deadline_ns: u64,
 ) -> (u64, u64, usize) {
-  let (shard, shards) = (state.shard, state.shards.clone());
   // The repository's windows are the shard's chunk store's, lent to its content store for the step.
   crate::vcs_store::lent_state(state, |state| {
     crate::vcs_store::within_budget(state, 0, |stores| {
@@ -297,9 +295,7 @@ fn let_go_windows_until(
           if let Some(repository) = noting {
             note_windows(content, repository, revision, identity);
           }
-          let (more, kept) = content.let_go_object_landed(identity, &|window| {
-            crate::vcs_store::landed_pin(shard, &shards, window)
-          });
+          let (more, kept) = content.let_go_object_landed(identity, &crate::vcs_store::landed_pin);
           freed = freed.saturating_add(more);
           pinned = pinned.saturating_add(kept);
         }

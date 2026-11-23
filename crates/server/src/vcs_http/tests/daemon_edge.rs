@@ -4267,7 +4267,7 @@ fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
           .iter()
           .map(|text| {
             let window = slates_vcs::ContentId::of(text);
-            let pinned = crate::vcs_store::landed_pin(shard, &shards, &window).is_some();
+            let pinned = crate::vcs_store::landed_pin(&window).is_some();
             let noted = crate::vcs_store::homes::landed(&window).is_some();
             (
               content
@@ -4593,7 +4593,7 @@ fn an_imported_repositorys_file_texts_leave_the_content_store_once_its_segments_
             .object_layout(&row.bytes)
             .iter()
             .all(|(window, _)| crate::vcs_store::homes::landed(window).is_some());
-          let pinned = crate::vcs_store::landed_pin(shard, &shards, &row.bytes).is_some();
+          let pinned = crate::vcs_store::landed_pin(&row.bytes).is_some();
           let len = content.len_of(&row.bytes);
           let here = len.is_some_and(|len| content.object_bytes(&row.bytes, len).is_some());
           seen.push((here, (noted, pinned), len.is_some()));
