@@ -931,8 +931,9 @@ fn tagged_create() -> (Vec<u8>, ObjectId, Vec<ObjectId>) {
 /// fetch of it failed, ls-remote and clone alike, "aborting due to possible repository corruption on the remote side":
 /// the advertisement's tag peel read a window let go, `Unreadable`, where no read brings it back). Do: on a two-shard
 /// daemon with its edge, push as stock git posts it a commit of [`TAGS`] files and an annotated tag of it for each, each
-/// tag in a window of its own; wait for the push's end to run its landed let-go (counted, or 3 s); then, as `git
-/// ls-remote` and `git clone` ask at protocol v2, list every ref with its peel and fetch the commit and every tag.
+/// tag in a window of its own; wait for the push's end to run its landed let-go (counted, or 3 s), and let the
+/// repository go idle (`git_encode::give_back_idle`: the objects its reads keep given back); then, as `git ls-remote`
+/// and `git clone` ask at protocol v2, list every ref with its peel and fetch the commit and every tag.
 /// Expect: the push `200`, every ref `ok`; the listing exactly `main` and each tag peeled to the commit; the fetch `200`,
 /// its pack every object pushed. Failing first: the tags' windows let go, the listing refused.
 #[test]
@@ -953,6 +954,19 @@ fn a_push_of_annotated_tags_is_listed_and_fetched_whole_once_its_pack_is_landed(
   {
     std::thread::sleep(Duration::from_millis(20));
   }
+  // Then the repository goes idle, as it does once no fetch of it is answered: what its reads keep of the objects read
+  // lately (`packed::Recent`, which the push's decision filled with the tags) given back, so the listing reads them from
+  // their windows, as git/git's tags, far past that cache, were read.
+  let let_go = crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
+    for id in state.vcs_stores.git_repositories() {
+      crate::vcs_store::git_encode::give_back_idle(state, id);
+    }
+    let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+    (
+      count(crate::vcs_store::LANDED_LET_GO_BYTES),
+      count(crate::vcs_store::LANDED_PINNED),
+    )
+  });
   let mut ls_refs = Vec::new();
   for line in [b"command=ls-refs\n".as_slice()] {
     pktline::write(Packet::Data(line), &mut ls_refs).expect("the command");
@@ -975,6 +989,7 @@ fn a_push_of_annotated_tags_is_listed_and_fetched_whole_once_its_pack_is_landed(
   pktline::write(Packet::Flush, &mut fetch).expect("the flush");
   let fetched = uploaded(edge, &name, &fetch);
   daemon.stop();
+  eprintln!("landed let-go bytes and windows pinned before the listing: {let_go:?}");
   let report = String::from_utf8_lossy(&created.1).into_owned();
   assert_eq!(
     (created.0, report.matches("ok refs/").count()),
