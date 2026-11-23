@@ -4752,9 +4752,12 @@
 >   routed it to no owner, so the guard passed it and it answered five acknowledged writes `NotFound` (ReadSafety, 2 of
 >   4 replays on adacachy2; a diagnostic build named both sides). Now a node without the record answers only as the
 >   volume's creator that no routing sends elsewhere and that did not lose it to a successor; anywhere else a forwarded
->   read, write or work creation is refused `Overloaded`, recorded nowhere, counted
->   `fleet.forward.refused.not_owner_here`. Test:
->   `a_forwarded_read_at_a_node_neither_holding_nor_owning_its_volume_is_refused_retryably` (red: `NotFound`).
+>   read, write or work creation is refused, recorded nowhere, counted `fleet.forward.refused.not_owner_here`: first
+>   `Overloaded` (6b2952f4d), then, by main's ruling the same day, its own kind, `Refusal::NotOwnerHere { owner }` (wire
+>   tag 84, contract 60), the owner the refusing node's routing names kept as the client's route. A landing's
+>   `Present` and `Land` from a node another host's volume is not on, which answered `NotFound`, meet it too. Test:
+>   `a_node_neither_holding_nor_owning_a_volume_answers_not_owner_here_and_its_creator_not_found` (red on the
+>   `Overloaded` stand-in and the landing's `NotFound`).
 >   Record: `docs/bugs/2026-11-23-a-forwarded-read-at-a-node-that-neither-held-nor-owned-the-volume-answered-not-found.md`.
 
 > **A volume whose owner shard refused its state read as absent: fixed (2026-11-19, A-564, §4.8 "Lookup"; g225; found by

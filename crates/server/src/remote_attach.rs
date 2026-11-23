@@ -54,7 +54,7 @@ pub(crate) fn foreign_form(form: &AttachRequest) -> Option<Refusal> {
 
 /// Whether `volume` is, as far as this node can tell without asking, another host's: created by another host, in a
 /// fleet with another member, and not owned here after a takeover (§4.8 "Lookup": the creator is the id's high half).
-fn elsewhere(state: &ShardState, volume: slates_ipc::protocol::VolumeId) -> bool {
+pub(crate) fn elsewhere(state: &ShardState, volume: slates_ipc::protocol::VolumeId) -> bool {
   let local = state.fleet.host();
   let object = slates_db::register::ObjectId(volume.bytes);
   object.creator() != local
