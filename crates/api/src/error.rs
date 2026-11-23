@@ -131,7 +131,7 @@ pub enum Missing {
     /// The snapshot.
     snapshot: SnapshotId,
   },
-  /// A presentation awaiting approval: it was replaced, landed, or its client went away (A-46). Present it again.
+  /// A presentation awaiting approval: it was replaced, landed, or its volume went (A-46, A-874). Present it again.
   Presentation {
     /// The presentation's id.
     id: u64,
@@ -419,9 +419,11 @@ pub enum RetryCause {
   /// A stream's holder record has not reached its shard yet (A-181).
   HolderPending,
   /// The verb ran on its owner, but what its reply waits for (a live volume's log on `f` candidates, a destroy's
-  /// tombstone placed at `f + 1`) was not held within the failover SLO from the hold (A-354): it took effect once and
-  /// recorded its own reply, which the client asks for again under the request's id itself (since 2026-11-20), so this
-  /// reaches a caller only where that resend found no room. Asked again under a new id it runs again: a new request.
+  /// tombstone placed at `f + 1`) was not held within the failover SLO from the hold (A-354): it took effect once there,
+  /// and whether it is durable is in doubt. The client asks again under the request's id itself, once, and is answered
+  /// the outcome if it was decided meanwhile (the verb's own reply once durable), so this reaches a caller while it is
+  /// still in doubt: never a success, and never owed to a reader. Asked again under the same id later, it is answered
+  /// the outcome once decided; under a new id it runs again: a new request.
   DurabilityPending {
     /// How long the reply was held, nanoseconds.
     held_ns: u64,
@@ -1227,7 +1229,7 @@ impl fmt::Display for Missing {
       ),
       Self::Presentation { id } => write!(
         f,
-        "presentation {id} (replaced, landed, or its client went away: present it again)"
+        "presentation {id} (replaced, landed, or its volume went: present it again)"
       ),
       Self::Attachment { attachment } => write!(f, "attachment {attachment}"),
       Self::Entry { volume, path } => {

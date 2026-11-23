@@ -1,136 +1,141 @@
-//! AUD-29-07 (§4.15 step 3; D-16): a landing presented and never landed expires with the client that presented it — the
-//! reaper, retiring a dead client on every owner shard, drops its presentations there. The test binary re-invoked is
-//! the presenter (an environment variable selects the role), so the death is a real kill of a real process (`SIGKILL`;
-//! `TerminateProcess` on Windows): an in-process client never reads as gone, because the reaper retires only a silent
-//! client whose process or control socket has gone. Its own binary, so no other test's reaping moves the daemon's
-//! process-wide counters under it. On every platform since the Windows writer (A-185): until then a Windows daemon
-//! refused the verb `Unsupported { feature: "landing" }`, so there was nothing to present there.
+//! A-874: R10's three-step flow across real processes (§4.15 steps 1-3; main 01a20182's ruling of 2026-11-23;
+//! `docs/bugs/2026-11-23-a-landings-presentation-went-with-its-presenting-client.md`): a landing is presented by one
+//! process, which then exits, and granted and landed by another, as the CLI runs `slates land`, `slates grant` and
+//! `slates land --grant`. The test binary re-invoked is the presenter (an environment variable selects the role), so
+//! its exit is a real process's, which the daemon reclaims at its hang-up (076746072): the end of its control socket's
+//! stream on Linux, its process's exit on macOS. Until 2026-11-23 this file held AUD-29-07's opposite rule, a killed
+//! presenter's landing abandoned with it (`a_killed_clients_presented_landing_is_abandoned_with_it`), which A-874
+//! reverses.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::io::{BufRead, BufReader};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use slates_client::{Client, Deadlines, Filter, Landing, NamePolicy, SizeClass};
+use slates_client::{
+  Client, CreateSpec, Deadlines, Filter, Landing, NamePolicy, SizeClass, SnapshotId, VolumeId,
+};
+use slates_ipc::protocol::{GrantScope, Intent};
 use slates_machine::{MachineProfile, ProfileOptions};
-use slates_server::daemon::LIVENESS_BUDGET_NS;
+use slates_server::daemon::{LIVENESS_BUDGET_NS, OBSERVE_BUDGET_NS};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
-/// Format: the environment variable selecting the presenter role, and the ones carrying its instance and its
-/// landing target.
+/// Format: the variable that makes the re-invoked binary the presenter, and the ones that tell it what to present.
 const ROLE: &str = "SLATES_PRESENTATION_TEST_ROLE";
 const ROLE_INSTANCE: &str = "SLATES_PRESENTATION_TEST_INSTANCE";
+const ROLE_VOLUME: &str = "SLATES_PRESENTATION_TEST_VOLUME";
+const ROLE_SNAPSHOT: &str = "SLATES_PRESENTATION_TEST_SNAPSHOT";
 const ROLE_TARGET: &str = "SLATES_PRESENTATION_TEST_TARGET";
-/// Shape: the probe budget of the quick profile (milliseconds).
+/// Format: the tag of the presenter's report line, found anywhere in a line (libtest's banner precedes it).
+const TAG: &str = "PRESENTED";
+/// Shape: the machine profile's probe budget, as the client's other daemon tests take it.
 const PROBE_MS: u64 = 5;
-/// Shape: how long to wait for the reaper: five liveness budgets (it retires a client silent for one budget
-/// at its next sweep, one budget later).
-const WAIT: Duration = Duration::from_nanos(5 * LIVENESS_BUDGET_NS);
-/// Shape: the pause between polls.
-const POLL_MS: u64 = 20;
+/// Shape: the grant's validity, far past the test's run.
+const GRANT_TERM_NS: u64 = 600_000_000_000;
+/// Shape: the bytes the volume's file holds, and then the target's.
+const BYTES: &[u8] = b"landed after its presenter left";
 
 fn deadlines() -> Deadlines {
   Deadlines::derive(LIVENESS_BUDGET_NS, slates_db::replay::RECOVERY_BUDGET_NS).get()
 }
 
-fn pause() {
-  // The harness paces its polls; shipped code parks on its driver (D-9).
-  #[allow(clippy::disallowed_methods)]
-  std::thread::sleep(Duration::from_millis(POLL_MS));
+fn hex(bytes: &[u8]) -> String {
+  bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// The presenter: connects, creates a volume, presents its landing into the target (no grant, so nothing is
-/// written), prints the landing id, and waits to be killed.
+fn unhex<const N: usize>(text: &str) -> [u8; N] {
+  let mut bytes = [0u8; N];
+  for (at, byte) in bytes.iter_mut().enumerate() {
+    *byte = u8::from_str_radix(&text[at * 2..at * 2 + 2], 16).unwrap();
+  }
+  bytes
+}
+
+/// The presenter: connects, presents the named snapshot's landing into the target, prints its id and manifest, and
+/// exits, its client never retired by a verb.
 fn presenter() {
   let instance = std::env::var(ROLE_INSTANCE).unwrap();
+  let volume = VolumeId {
+    bytes: unhex(&std::env::var(ROLE_VOLUME).unwrap()),
+  };
+  let snapshot = SnapshotId {
+    value: std::env::var(ROLE_SNAPSHOT).unwrap().parse().unwrap(),
+  };
   let target = std::env::var(ROLE_TARGET).unwrap();
   let mut client = Client::connect(&instance, deadlines()).unwrap();
-  let volume = client
-    .create(&slates_client::CreateSpec {
-      name: "presented".to_owned(),
-      size: SizeClass::Bounded { limit: 1 << 20 },
-      names: NamePolicy::Exact,
-      require_locked: false,
-      base: None,
-    })
-    .unwrap();
-  let presented = client
-    .land(volume, None, &target, Filter::default(), None)
-    .unwrap();
-  let Landing::GrantRequired { landing, .. } = presented else {
-    panic!("the landing was not presented: {presented:?}");
+  let Ok(Landing::GrantRequired {
+    landing, manifest, ..
+  }) = client.land(volume, Some(snapshot), &target, Filter::default(), None)
+  else {
+    panic!("the landing was not presented");
   };
-  println!("presented: {landing}");
-  loop {
-    std::thread::park();
-  }
+  println!("{TAG} {landing} {}", hex(&manifest));
 }
 
-/// Own the presenter through every assertion, including failures before the deliberate kill.
-struct Presenter(Child);
-
-impl Drop for Presenter {
-  fn drop(&mut self) {
-    if self
-      .0
-      .try_wait()
-      .expect("inspect the owned presenter")
-      .is_none()
-    {
-      self.0.kill().expect("kill the owned presenter");
-      self.0.wait().expect("reap the owned presenter");
-    }
-  }
-}
-
-/// Spawns the presenter and reads the landing id it presented.
-fn start_presenter(instance: &str, target: &str) -> (Presenter, u64) {
-  let mut child = Presenter(
-    Command::new(std::env::current_exe().unwrap())
-      .args([
-        "--exact",
-        "a_killed_clients_presented_landing_is_abandoned_with_it",
-        "--nocapture",
-      ])
-      .env(ROLE, "presenter")
-      .env(ROLE_INSTANCE, instance)
-      .env(ROLE_TARGET, target)
-      .stdout(Stdio::piped())
-      .spawn()
-      .unwrap(),
-  );
-  // The harness prints its own banner first; the presenter's line is tagged.
-  let landing = BufReader::new(child.0.stdout.take().unwrap())
+/// The presenter run to its exit: the landing it presented and its manifest.
+fn presented_by_another_process(
+  instance: &str,
+  volume: VolumeId,
+  snapshot: SnapshotId,
+  target: &str,
+) -> (u64, [u8; 32]) {
+  let mut child = Command::new(std::env::current_exe().unwrap())
+    .args([
+      "--exact",
+      "a_presentation_outlives_the_process_that_presented_it",
+      "--nocapture",
+    ])
+    .env(ROLE, "presenter")
+    .env(ROLE_INSTANCE, instance)
+    .env(ROLE_VOLUME, hex(&volume.bytes))
+    .env(ROLE_SNAPSHOT, snapshot.value.to_string())
+    .env(ROLE_TARGET, target)
+    .stdout(Stdio::piped())
+    .spawn()
+    .unwrap();
+  // Read to its end, so the child's later output (libtest's) never meets a closed pipe.
+  let lines: Vec<String> = BufReader::new(child.stdout.take().unwrap())
     .lines()
     .map(|line| line.expect("read the presenter's report"))
+    .collect();
+  let reported = lines
+    .into_iter()
     .find_map(|line| {
-      line
-        .strip_prefix("presented: ")
-        .map(|number| number.trim().parse().unwrap())
+      let (_, rest) = line.split_once(&format!("{TAG} "))?;
+      let (landing, manifest) = rest.trim().split_once(' ')?;
+      Some((landing.parse().unwrap(), unhex(manifest)))
     })
-    .expect("the presenter printed its landing");
-  (child, landing)
+    .expect("the presenter reported its landing");
+  assert!(
+    child.wait().unwrap().success(),
+    "the presenter exited cleanly"
+  );
+  reported
 }
 
-/// The landings the daemon holds awaiting a grant, over every shard.
-fn landings_awaiting(observer: &mut Client) -> u64 {
-  observer
-    .daemon_status()
-    .unwrap()
-    .shards
-    .iter()
-    .map(|shard| shard.landings_awaiting)
-    .sum()
+/// Waits until the daemon has reaped a client more than `before` (its status's `clients_reaped`), within the
+/// observation budget.
+fn reaped_past(client: &mut Client, before: u64) {
+  let began = Instant::now();
+  while client.daemon_status().unwrap().clients_reaped <= before {
+    assert!(
+      began.elapsed() < Duration::from_nanos(OBSERVE_BUDGET_NS),
+      "the presenter's client was reaped within the observation budget"
+    );
+    std::thread::yield_now();
+  }
 }
 
-/// AUD-29-07 (§4.15 step 3): a landing presented and never landed expires with the client that presented
-/// it. Do: a child process presents a landing (into this crate's directory, opened read-only: nothing is
-/// granted, so nothing is written) and is killed. Expect: the daemon counts the presentation awaiting a grant
-/// while the child lives, and none once the reaper has retired the child — within the reclaim bound. Before
-/// 2026-09-29 a presentation outlived its client, and every landing, for good.
+/// R10's flow (main 01a20182's ruling of 2026-11-23). Do: write a file into a volume and snapshot it through this
+/// process's client; present the snapshot's landing from a second process, which exits; wait until the daemon has
+/// reaped that process's client; then grant the manifest and land under the grant through this process's client.
+/// Expect the grant taken, the landing `Landed` and the file's bytes on disk: a presentation describes a volume's changes
+/// against a target, not the process that asked. Red before: the grant refused `NotFound` ("presentation 1 (replaced,
+/// landed, or its client went away)"), the presentation abandoned with its client at its reap (AUD-29-07, met by
+/// 076746072's reclaim at hang-up).
 #[test]
-fn a_killed_clients_presented_landing_is_abandoned_with_it() {
+fn a_presentation_outlives_the_process_that_presented_it() {
   if std::env::var_os(ROLE).is_some() {
     presenter();
     return;
@@ -141,36 +146,77 @@ fn a_killed_clients_presented_landing_is_abandoned_with_it() {
     core_matrix: false,
   })
   .expect("the machine profile measures");
-  let instance = format!("cl-present-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance, Some(2));
+  let instance = format!("cl-presented-{}", std::process::id());
   let daemon = Daemon::start(
     &profile,
-    config,
+    DaemonConfig::derive(&profile, &instance, Some(1)),
     SegmentSource::Create {
-      name: format!("slates-seg-cl-present-{}", std::process::id()),
+      name: format!("slates-seg-cl-presented-{}", std::process::id()),
     },
   )
   .unwrap();
   daemon
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
-  let mut observer = Client::connect(&instance, deadlines()).unwrap();
-  let (mut child, _landing) = start_presenter(&instance, env!("CARGO_MANIFEST_DIR"));
-  assert_eq!(
-    landings_awaiting(&mut observer),
-    1,
-    "the presentation waits while its client lives"
+  // A-50: the landing's target is a real host directory in the build output (`CARGO_TARGET_TMPDIR`), never `/tmp`.
+  let target = format!(
+    "{}/slates-presented-{}",
+    env!("CARGO_TARGET_TMPDIR"),
+    std::process::id()
   );
-  child.0.kill().unwrap();
-  child.0.wait().unwrap();
-  let started = Instant::now();
-  while landings_awaiting(&mut observer) != 0 {
-    assert!(
-      started.elapsed() < WAIT,
-      "the killed client's presentation outlived it by {WAIT:?}"
-    );
-    pause();
-  }
-  drop(observer);
-  drop(daemon);
+  let made = Command::new("mkdir")
+    .args(["-p", &target])
+    .output()
+    .unwrap();
+  assert!(made.status.success(), "mkdir -p {target}");
+  let mut owner = Client::connect(&instance, deadlines()).unwrap();
+  let volume = owner
+    .create(&CreateSpec {
+      name: "presented".to_owned(),
+      size: SizeClass::Bounded { limit: 1 << 20 },
+      names: NamePolicy::Exact,
+      require_locked: false,
+      base: None,
+    })
+    .unwrap();
+  let attachment = owner
+    .attach(volume, None, Intent::Write)
+    .unwrap()
+    .attachment;
+  owner
+    .fs_write((volume, attachment), "a.txt", BYTES, 0o644)
+    .unwrap();
+  let snapshot = owner.snapshot(volume).unwrap();
+  let before = owner.daemon_status().unwrap().clients_reaped;
+  let (landing, manifest) = presented_by_another_process(&instance, volume, snapshot, &target);
+  reaped_past(&mut owner, before);
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let proof = slates_server::landing::grant_proof(
+    &secret,
+    landing,
+    &manifest,
+    GrantScope::Once,
+    GRANT_TERM_NS,
+  );
+  let grant = owner
+    .grant(landing, manifest, GrantScope::Once, GRANT_TERM_NS, proof)
+    .expect("the presentation outlived the process that presented it and is granted");
+  let landed = owner
+    .land(
+      volume,
+      Some(snapshot),
+      &target,
+      Filter::default(),
+      Some(grant),
+    )
+    .unwrap();
+  assert!(matches!(landed, Landing::Landed(_)), "{landed:?}");
+  let read = Command::new("cat")
+    .arg(format!("{target}/a.txt"))
+    .output()
+    .unwrap();
+  assert_eq!(read.stdout, BYTES, "the file landed");
+  let _ = Command::new("rm").args(["-rf", &target]).output();
+  drop(owner);
+  daemon.stop();
 }

@@ -1118,9 +1118,13 @@ fn a_region_held_window_is_restored_beside_the_named_texts_brought_back() {
   daemon.bootstrap(true).unwrap();
   let repository = created_subversion(&daemon, "region");
   let window = crate::daemon::observe_first(&daemon, |state| {
-    crate::vcs_store::homes::keep_for_region(state, b"a window the region homes on this shard")
-      .expect("kept for the region")
-      .0
+    crate::vcs_store::homes::keep_for_region(
+      state,
+      b"a window the region homes on this shard",
+      &[crate::vcs_store::homes::TEST_OWNER],
+    )
+    .expect("kept for the region")
+    .0
   });
   crate::daemon::observe_first(&daemon, move |_state| {
     super::svn_commit::staging::KILL_AT_COMMIT_SLICE.with(|kill| kill.set(Some(0)));

@@ -118,8 +118,8 @@ fn page_room() -> usize {
 
 /// `LandingEntries` (§4.15 step 2): one page of presented landing `landing`'s entry list from `from`, as many bytes of
 /// their encodings as one reply chunk holds. Answered to the principal the landing was presented to; to anyone else,
-/// and for a presentation consumed by its landing, replaced by its client's next or abandoned with its client, as a
-/// landing that isn't there (`NotFound`). A read: nothing changes.
+/// and for a presentation consumed by its landing, superseded by a newer one of its volume and target (A-779) or gone
+/// with its volume (A-874), as a landing that isn't there (`NotFound`). A read: nothing changes.
 pub(crate) fn landing_entries_verb(
   state: &ShardState,
   principal: &Principal,

@@ -330,10 +330,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// [`container_engine::MountsFrom`], the host's kernel or Docker Desktop's VM) or an [`EngineFault`]; the re-exported
 /// [`container_engine::ProfileRefusal`] gains `RootlessCannotMount` (appended): an embedder matching it exhaustively
 /// gains the variant (2026-11-20).
-/// 58 (A-795): the S3 base removed (Ada, 2026-11-20: never asked for): `S3Base`, `S3Style`, `S3Scheme`, `S3Credentials` and
+/// 58: the S3 base removed (A-795; Ada, 2026-11-20: never asked for): `S3Base`, `S3Style`, `S3Scheme`, `S3Credentials` and
 /// their refusals (`NameRefused`, `EndpointFault`, `BucketFault`, `PrefixFault`), contract 46's, are gone, as are the
 /// wire's `CreateOverS3` and an import's `Pending` (their tags reserved: `RemovedCreateOverS3`, `RemovedPending`).
-/// 59 (C2 stage C): an import lands a Subversion dump's revisions a batch at a time, a batch atomic: the re-exported
+/// 59: an import lands a Subversion dump's revisions a batch at a time, a batch atomic (C2 stage C): the re-exported
 /// [`ImportFault`] gains `SubversionLanded` (appended), the refusal naming the last revision that landed, which the
 /// daemon sends in place of `Subversion`; the same dump imported again resumes after it (2026-11-21).
 ///

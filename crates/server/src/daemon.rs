@@ -7819,6 +7819,7 @@ mod tests {
           let mut answers = Vec::new();
           for (at, chunk) in put.chunks(part).enumerate() {
             let request = HomeMessage::PutPart {
+              owners: vec![crate::vcs_store::homes::TEST_OWNER],
               identity,
               total,
               offset: u64::try_from(at * part).unwrap(),
@@ -8085,7 +8086,12 @@ mod tests {
     let kept_bytes = bytes.clone();
     let identity = first
       .observe(shard, move |state| {
-        let (identity, _) = crate::vcs_store::homes::keep_for_region(state, &kept_bytes).unwrap();
+        let (identity, _) = crate::vcs_store::homes::keep_for_region(
+          state,
+          &kept_bytes,
+          &[crate::vcs_store::homes::TEST_OWNER],
+        )
+        .unwrap();
         crate::verbs::publish_shard(state).unwrap();
         identity
       })
@@ -8192,7 +8198,12 @@ mod tests {
         let bytes: Vec<u8> = (0..3 * window + 41)
           .map(|at| u8::try_from(at % 241).unwrap())
           .collect();
-        let (pack, _) = crate::vcs_store::homes::keep_for_region(state, &bytes).unwrap();
+        let (pack, _) = crate::vcs_store::homes::keep_for_region(
+          state,
+          &bytes,
+          &[crate::vcs_store::homes::TEST_OWNER],
+        )
+        .unwrap();
         let header = slates_store::log::Header {
           tool: slates_store::log::Tool::Git,
           repository: 4,

@@ -1873,9 +1873,9 @@ pub(crate) fn carry_blocking<P>(state: &mut ShardState, push: &mut ReceivePack<P
 /// carried by in a test's synchronous driver too (`crate::vcs_store::commits::made_after_now`).
 pub(crate) fn carried_blocking(state: &mut ShardState, carry: super::Carry) -> super::Carried {
   match carry {
-    super::Carry::Home(bytes) => {
-      let outcome =
-        crate::vcs_store::homes::keep_for_region(state, &bytes).map(|(identity, _)| identity);
+    super::Carry::Home(bytes, owner) => {
+      let outcome = crate::vcs_store::homes::keep_for_region(state, &bytes, &[owner])
+        .map(|(identity, _)| identity);
       super::Carried::Homed(crate::vcs_store::homes::Homed { outcome, bytes })
     }
     super::Carry::Land(landing) => {
@@ -2020,7 +2020,7 @@ async fn short_homing_drive(repository: RepositoryId, request: &[u8]) -> Result<
       Answering::Answered(_) => return Ok(answer),
       Answering::Turned => {
         slates_rt::futures::yield_now().await;
-        if let Some(crate::git_push::Carry::Home(bytes)) = push.take_homing() {
+        if let Some(crate::git_push::Carry::Home(bytes, _)) = push.take_homing() {
           let fallen = crate::git_push::Carried::Homed(crate::vcs_store::homes::Homed {
             outcome: Err(crate::vcs_store::homes::HomeRefused::Unanswered),
             bytes,
@@ -3491,4 +3491,178 @@ fn assert_whole_clone(pack: &[u8], objects: usize) {
   let fetched: std::collections::BTreeSet<ObjectId> =
     unpacked.objects.iter().map(|object| object.id).collect();
   assert_eq!((unpacked.objects.len(), fetched.len()), (objects, objects));
+}
+
+/// [`short_homing_drive`] whose names' homing is carried as an edge carries it and only the pack's is handed back fallen
+/// short (A-727 (d1a)): the push refused after a homing kept its names in the region.
+async fn half_homed_drive(repository: RepositoryId, request: &[u8]) -> Result<Vec<u8>, String> {
+  use crate::state::with_state;
+  let mut push = with_state(|state| {
+    ReceivePack::start(
+      state,
+      (&owner(), repository),
+      false,
+      &mut Vec::new(),
+      Unpresented,
+    )
+  })
+  .ok_or("no state")?
+  .map_err(|failed| format!("{failed:?}"))?;
+  with_state(|state| push.input(state, request))
+    .ok_or("no state")?
+    .map_err(|failed| format!("{failed:?}"))?;
+  with_state(|state| push.end(state))
+    .ok_or("no state")?
+    .map_err(|failed| format!("{failed:?}"))?;
+  let mut answer = Vec::new();
+  let mut homings = 0usize;
+  loop {
+    let step = with_state(|state| push.answer_step(state, &mut answer))
+      .ok_or("no state")?
+      .map_err(|failed| format!("{failed:?}"))?;
+    match step {
+      Answering::Answered(_) => return Ok(answer),
+      Answering::Turned => {
+        slates_rt::futures::yield_now().await;
+        let Some(asked) = push.take_homing() else {
+          continue;
+        };
+        homings += 1;
+        let carried = match asked {
+          crate::git_push::Carry::Home(bytes, _) if homings > 1 => {
+            crate::git_push::Carried::Homed(crate::vcs_store::homes::Homed {
+              outcome: Err(crate::vcs_store::homes::HomeRefused::Unanswered),
+              bytes,
+            })
+          }
+          asked => {
+            let (origin, shards) =
+              with_state(|state| (state.shard, state.shards.clone())).ok_or("no state")?;
+            crate::git_push::carry(origin, &shards, asked).await
+          }
+        };
+        with_state(|state| push.homed(state, carried)).ok_or("no state")?;
+      }
+      #[cfg(unix)]
+      step @ Answering::Hook(_) => return Err(format!("no hook runs here: {step:?}")),
+    }
+  }
+}
+
+/// Shape: the turns a test waits for the shard's settle task (A-727 (d1a)) to settle what a push's end owed: a turn a
+/// settle, a handful owed, room to spare.
+const SETTLE_TURNS: usize = 1_000;
+
+/// Waits a turn at a time, at most [`SETTLE_TURNS`], until the shard's settle task has settled `settles` (counted either
+/// way): whether it had.
+async fn settled(settles: u64) -> bool {
+  for _ in 0..SETTLE_TURNS {
+    let done = crate::state::with_state(|state| {
+      let counted = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      counted(crate::vcs_store::homes::SETTLED)
+        + counted(crate::vcs_store::homes::SETTLE_UNANSWERED)
+    })
+    .unwrap_or(0);
+    if done >= settles {
+      return true;
+    }
+    slates_rt::futures::yield_now().await;
+  }
+  false
+}
+
+/// A-727 (d1a) (main 01a20182's rulings of 2026-11-23: a region hold names its owner, and a refused attempt releases its
+/// own). Do: on a store-backed shard, push stock git's `create`, its names homed in the region and its pack's homing
+/// handed back fallen short. Expect: the push refused `Unlanded`, its attempt's release settled, and nothing held for the
+/// region. Failing first: the names' region hold stayed, no record naming them, for the life of the home.
+#[test]
+fn t_a727_d1a_a_push_refused_after_its_names_were_homed_leaves_no_hold_in_the_region() {
+  let (_store, daemon) = crate::test_store::audit_daemon_of_stored(1);
+  let (sent, got) = std::sync::mpsc::channel();
+  crate::daemon::observe_first(&daemon, move |state| {
+    let repository = git_repository(state, "half-homed");
+    let request = chain()
+      .into_iter()
+      .next()
+      .map(|(scenario, _)| scenario.request.to_vec())
+      .expect("create");
+    let task = slates_rt::futures::spawn(async move {
+      let outcome = half_homed_drive(repository, &request).await;
+      // Two releases: the names' (homed) and the pack's (its homing fallen).
+      let settled = settled(2).await;
+      let held = crate::vcs_store::homes::region_held_here();
+      let unanswered = crate::state::with_state(|state| {
+        state
+          .refusals
+          .get(crate::vcs_store::homes::SETTLE_UNANSWERED)
+          .copied()
+          .unwrap_or(0)
+      });
+      let _ = sent.send((outcome, settled, held, unanswered));
+    })
+    .expect("the push's task");
+    slates_rt::futures::detach(task).expect("detached");
+  });
+  let (outcome, settled, held, unanswered) = got.recv().expect("the push ended");
+  assert_eq!(outcome, Err("Unlanded".to_owned()));
+  assert!(settled, "the attempt's release settled");
+  assert_eq!(unanswered, Some(0), "every home answered it");
+  assert!(held.is_empty(), "nothing held for the region: {held:?}");
+}
+
+/// A-727 (d1a), two repositories on one identity (main's ruling: a refused attempt's release leaves another repository's
+/// hold of the same object untouched). Do: on a store-backed shard, push stock git's `create` to repository `a` whole,
+/// its holds settled to its records; then the same push to repository `b`, its names homed (the same object as `a`'s)
+/// and its pack's homing fallen short. Expect: `a`'s push answered, `b`'s refused `Unlanded`; afterwards every object
+/// held for the region held for `a`'s records alone, as many as after `a`'s push: `b`'s release took nothing of `a`'s.
+#[test]
+fn t_a727_d1a_a_refused_push_leaves_another_repositorys_hold_of_the_same_object() {
+  let (_store, daemon) = crate::test_store::audit_daemon_of_stored(1);
+  let (sent, got) = std::sync::mpsc::channel();
+  crate::daemon::observe_first(&daemon, move |state| {
+    let first = git_repository(state, "a");
+    let second = git_repository(state, "b");
+    let request = chain()
+      .into_iter()
+      .next()
+      .map(|(scenario, _)| scenario.request.to_vec())
+      .expect("create");
+    let task = slates_rt::futures::spawn(async move {
+      let answered = homed_drive(first, &request).await.is_ok();
+      // Two moves: the names' and the pack's; then b's two releases.
+      let moved = settled(2).await;
+      let after_first = crate::vcs_store::homes::region_held_here();
+      let refused = half_homed_drive(second, &request).await;
+      let released = settled(4).await;
+      let held = crate::vcs_store::homes::region_held_here();
+      let owners: Vec<Vec<slates_cluster::homes::HomeOwner>> = held
+        .iter()
+        .map(crate::vcs_store::homes::region_owners)
+        .collect();
+      let _ = sent.send((
+        (answered, moved, after_first.len()),
+        (refused, released, held.len(), owners),
+        first,
+      ));
+    })
+    .expect("the pushes' task");
+    slates_rt::futures::detach(task).expect("detached");
+  });
+  let ((answered, moved, before), (refused, released, after, owners), first) =
+    got.recv().expect("the pushes ended");
+  assert!(
+    answered && moved,
+    "a's push answered, its holds moved to its records"
+  );
+  assert!(before > 0, "a's push held something for the region");
+  assert_eq!(refused, Err("Unlanded".to_owned()));
+  assert!(released, "b's release settled");
+  assert_eq!(after, before, "nothing of a's let go");
+  let records = slates_cluster::homes::HomeOwner::Record {
+    repository: first.bytes,
+  };
+  assert!(
+    owners.iter().all(|owners| owners == &vec![records]),
+    "every hold a's records' alone: {owners:?}"
+  );
 }
