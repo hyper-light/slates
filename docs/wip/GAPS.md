@@ -346,6 +346,32 @@
 >   reply wait in the class (D', D'') was measured and not taken. **Confirmed on main** (ca98b72c4, main 01a20182,
 >   2026-11-23 03:42, adacachy2 in a user scope at CPUWeight 100): 6 loaded rounds, p99 241-440 µs and p999 325-697 µs,
 >   12 of 12 under 1 ms; quiet p99 76-103 µs; R9 spinning p99 45.6 / 54.6 / 56.2 µs (main before: 57-145).
+>   **The desktop route, PARKED (main 01a20182's ruling, 2026-11-23; w-perf's readings).** Most desktop Linux grants no
+>   `RLIMIT_RTPRIO` but ships RealtimeKit (`org.freedesktop.RealtimeKit1` on the system bus, which PipeWire uses), an
+>   OS-shipped broker R10 allows. An account with `RLIMIT_RTPRIO` 0 would ask it per shard thread
+>   (`MakeThreadRealtimeWithPID` at the class's lowest priority, under its `MaxRealtimePriority`). Readings:
+>   - No host here runs it. adacachy (7.2.9) and adacachy2 (7.3.3): not on the bus and not activatable, no
+>     `rtkit-daemon` unit, no polkit action (`busctl`, `systemctl`, `pkaction`); CI's runners neither (run
+>     45115263387). Both adacachy hosts grant `RLIMIT_RTPRIO` 99, so A-872's limit path covers them.
+>   - No D-Bus without C or an executor: the lockfile has no D-Bus crate; zbus runs on an async executor (D-9 bans it)
+>     and the `dbus` crate binds libdbus. A hand-rolled client over the system bus socket would be a new parser of
+>     external bytes that no host can run against the real daemon.
+>   - RealtimeKit refuses a process whose `RLIMIT_RTTIME` hard limit exceeds its `RTTimeUSecMax` (200,000 µs by
+>     default, from memory; read the property). The kernel counts a real-time task's CPU a tick at a time and resets
+>     the count only when a wakeup enqueues it (7.3.3 `kernel/sched/rt.c`: `watchdog`, `enqueue_task_rt` with
+>     `ENQUEUE_WAKEUP`), so a shard with work, which never parks, is signalled `SIGXCPU` past the soft limit and
+>     killed past the hard one. A-872's limit path needs `RLIMIT_RTTIME` unlimited for that reason.
+>   Rulings for whoever builds it:
+>   - A shard holding the class by RealtimeKit sleeps at least once every half of the soft limit it set: a real
+>     block that a timer ends, since only a wakeup's enqueue resets the count (an `epoll_wait` that finds events
+>     ready does not, nor a yield). Not self-demotion: at `RLIMIT_RTPRIO` 0 a demoted thread cannot climb back by
+>     itself, and every return is another RealtimeKit call against its burst limit and a threads-per-user cap it
+>     shares with PipeWire.
+>   - A partial grant is kept, counted per thread by source (limit, rtkit, none), the first refusal of each source
+>     logged with its typed reason: the limit path's grant or skip, a thread at a time. All-or-none would take one
+>     thread's grant away for another's refusal.
+>   Unparked by: a host running `rtkit-daemon`, which is Ada's to install. Arm E stays settled on bare metal too
+>   (main's adacachy2 round, 2026-11-23 02:51: p99 705-817 µs, p999 0.88-1.14 ms, p50 2-4x worse).
 > - Windows (CI, run 44857045148): no 1 ms band (queued p99 5–49 µs); accept p99 0.13–0.31 ms, conflict 0.11–0.29 ms;
 >   p999 0.2–62 ms. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–7).
 >
@@ -832,8 +858,9 @@
 >   `a_lookup_of_a_branch_name_reads_its_heads_not_the_history` and `branchmap_over_a_long_line_reads_its_heads_not_the_history`
 >   (a 170-changeset line: red 512 and 511 reads, now at most 8; `BranchHeads::answered` the non-vacuity count). A
 >   view that leaves a changeset out (secret, hidden) answers from them too (BUILT 2026-11-23, w-hg, evolution piece
->   2): `BranchHeads` keeps each append's endings in order (`Endings`, sealed 4,096-ending `Arc` chunks a fork shares,
->   8 bytes an ending, about one a changeset), so `BranchHeads::served` reads the heads back to the view's first
+>   2): `BranchHeads` keeps each append's endings in order (`Endings`: each full chunk of 512 sealed into a row of
+>   the index, which a fork shares by the tables' identity as it shares every row, and the open chunk a fork copies; 8
+>   bytes an ending, about one a changeset; once `Arc` chunks, banned by R2, replaced 2026-11-23), so `BranchHeads::served` reads the heads back to the view's first
 >   changeset that is not public (today's below it, and those an append from it on ended) and appends the served tail
 >   alone: the tail's endings and appends, no walk of the history. Held by
 >   `a_views_kept_branch_heads_are_the_walks_whatever_it_leaves_out` (generated histories on three branches, every
