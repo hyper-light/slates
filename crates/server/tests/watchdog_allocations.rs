@@ -1,8 +1,10 @@
 //! The watchdog's beat allocates nothing once it runs (§4.14 `daemon.alive`, A-228; goal 93's "no allocation by
 //! design"). The watchdog is an owned thread that looks at every shard each beat, a tenth of a second, for the daemon's
-//! whole life, so whatever one beat allocates the allocator churns all day. A Mercurial push's daemon sampled 24% of its
-//! bytes there (`watchdog::LatenessTail::p99_ns` 14.4%, `watchdog::run` 9.5%; `tests/hg_push_heap.rs`, main 9c8e4a95e),
-//! about 10-15 MB a second on a two-shard daemon.
+//! whole life, so whatever one beat allocates the allocator churns all day. Before 2026-11-23 a beat made 4 allocations
+//! (82 over 20 beats idle, 81 under 71,073 requests), about 1 KB a beat by their types (estimated, not measured): the
+//! lateness p99's sorted copy and the looks, windows and verdicts. A Mercurial push's first heap read had put 24% of its
+//! bytes there, about 10-15 MB a second; that was its sampler charging a thread's first symbol load to its next
+//! allocation (`tests/hg_push_heap.rs`, fixed in f14ea81bb), not the watchdog.
 //!
 //! This binary's global allocator counts the allocations made on the watchdog's own thread, found by its name
 //! (`slates-watchdog`), so the shards, the client and the test count nothing. A daemon runs idle and then under a
