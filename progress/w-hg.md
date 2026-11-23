@@ -518,3 +518,9 @@ Waiting: main's route; arena-7 and arena-8.
   tests/common/hg.rs. Flaky under a parallel run: t_goal93 landed-pack let-go (git; passed 3/3 alone).
 - Next: kept branch heads for a view that leaves changesets out. Still owed: non-publishing repos and the hidden
   view, rewrite admission, the obsolete pushkey namespace, the "N new" output.
+- Landed b36b2e9c9 (evolution piece 2, cd7b1b569): a view that leaves changesets out gets its branch heads from the
+  kept ones, with no walk. BranchHeads logs each append's endings in shared Arc chunks (8 B an ending), and
+  BranchHeads::served reads back to `first`, then replays the served tail. A property test (3 branches, every phase,
+  prunes and rewrites) equals the walk; it was red before. Also a 9,000-changeset test past sealed chunks.
+- Next: non-publishing repositories (phases.publish from the record), so the hidden view is exercised end to end
+  with real hg. Then decision 3's rewrite admission.
