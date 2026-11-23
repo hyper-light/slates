@@ -313,6 +313,7 @@ Refusal 80 CredentialUnreplicated
 Refusal 81 LandingSuperseded
 Refusal 82 StaleMergeView
 Refusal 83 StoreRefused
+Refusal 84 NotOwnerHere
 ReplyBody 0 Created
 ReplyBody 1 Snapshotted
 ReplyBody 2 SnapshotDestroyed

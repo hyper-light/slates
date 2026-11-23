@@ -6881,10 +6881,14 @@ version.
 > current owner and is authoritative", so a node whose catalog holds no record of a volume answers a verb forwarded to
 > it only where it is that owner by the rule a local client's verb is routed by (`verbs::owned_by_another_host`): the
 > volume's creator, which no routing on it sends elsewhere and which did not lose it to a successor. There a volume it
-> never made or destroyed is `NotFound`. Anywhere else the verb is refused `Overloaded`, retryable and recorded nowhere,
-> so the origin, which drops its route at a refusal, locates the owner again on the resend
-> (`verbs::refusal_of_unheld_forward`, counted `fleet.forward.refused.not_owner_here`; a successor before it has made
-> the volume, A-394, `fleet.forward.refused.before_made`). Until then a node whose routing named another owner, or
+> never made or destroyed is `NotFound`. Anywhere else the verb is refused `Refusal::NotOwnerHere { owner }`, retryable
+> and recorded nowhere, `owner` the owner its routing names as a hint (`verbs::refusal_of_unheld_forward`, counted
+> `fleet.forward.refused.not_owner_here`; a successor before it has made the volume stays `Overloaded`, A-394,
+> `fleet.forward.refused.before_made`). The origin keeps the hinted owner as the client's route, or drops its route,
+> and the client's resend goes there (`slates_client` resends a read so, within its reconnect budget). A verb that is
+> not forwarded, a landing's `Present` or `Land`, meets the same refusal from a node another host's volume is not on
+> (`verbs::absent`, judged as an attach form refused by kind is, `remote_attach::elsewhere`). Until then a node whose
+> routing named another owner, or
 > none, served such a verb, found no volume and answered `NotFound`. At seed 8173581894251929445 the chaos nemesis had
 > an origin at configuration 7 forward reads to the successor its routing named, which at configuration 8 routed the
 > volume to no owner, and five acknowledged writes read as missing while the last owner served them all (ReadSafety;
@@ -35639,13 +35643,30 @@ served the forward and answered `NotFound`. Measured on adacachy2 with a diagnos
 configuration 7 forwarded reads to the successor its routing named, and that node, already at configuration 8, held no
 record of the volume and routed it to no owner, so five acknowledged writes read as missing through the origin while
 the last owner served them all (ReadSafety; 2 of 4 replays of the seed, and 1 of 5 runs of main 05e9bb698 with item 1's
-fix). The guard is now `refusal_of_unheld_forward` (it was `refusal_of_unheld_forward`; its callers `serve_forwarded_read`,
+fix). The guard is now `refusal_of_unheld_forward` (it was `forwarded_before_made`; its callers `serve_forwarded_read`,
 `forwarded_write` and `forward_placement`): a node without the record answers only as the volume's creator that no
 routing on it sends elsewhere and that did not lose the volume to a successor, the rule `owned_by_another_host` routes a
 local client's verb by, and refuses `Overloaded` anywhere else, counted `fleet.forward.refused.not_owner_here`. Applied
 in the same change to: §4.8 "Lookup"'s status, GAPS (A-394's entry), `crates/server/src/verbs.rs`, the test
 `a_forwarded_read_at_a_node_neither_holding_nor_owning_its_volume_is_refused_retryably` (red first: `NotFound`),
 and `docs/bugs/2026-11-23-a-forwarded-read-at-a-node-that-neither-held-nor-owned-the-volume-answered-not-found.md`.
+
+**Amended again 2026-11-23 (main's ruling on the wire): one condition, one refusal.** `Overloaded` says a shard is busy,
+so a refusal of a node that is not the owner filed under it was a refusal of the wrong kind (CLAUDE.md §3: an
+uncategorized refusal is a bug). It is now its own: `Refusal::NotOwnerHere { owner }` (appended, wire tag 84), `owner`
+the owner the refusing node's routing names, where it names one, kept as the client's route by the origin
+(`verbs::route_after`, counted `fleet.owner_location.route_hinted`); the API's `RetryCause::NotOwnerHere` (contract
+60); `slates_client` resends a read so within its reconnect budget (`call_through_transient`) and holds the id for an
+async caller (`note_reply`). The CLI, MCP and both SDKs render refusals by their `Debug` form, so they carry it by
+name. The same refusal closes the gap the sweep named: a verb that is not forwarded, a landing's `Present` or `Land`,
+sent to a node another host's volume is not on, answered `NotFound` from `verbs::absent`; it is now `NotOwnerHere`,
+judged by `remote_attach::elsewhere`, as an attach form refused by kind is, or by a loss to a successor. A creator still
+answers its own destroyed volume `NotFound`. The successor before it made the volume keeps `Overloaded` (A-394's
+case: it owns the volume and will serve it). Test:
+`a_node_neither_holding_nor_owning_a_volume_answers_not_owner_here_and_its_creator_not_found` (`crates/server/src/verbs.rs`,
+which replaces the test above). Applied in the same change to: §4.8 "Lookup"'s status, `crates/ipc/src/protocol.rs`,
+`crates/ipc/tests/wire_order.txt`, `crates/api/src/error.rs` and `lib.rs`, `crates/client/src/client.rs`,
+`crates/server/src/verbs.rs` and `remote_attach.rs`, GAPS, and the bug record.
 
 ### A-399 — A Shards stream's close publishes nothing its write log holds, as a FUSE mount's does (2026-11-18, goal g268; a sibling A-339 recorded in GAPS)
 Applied in the same change to:
