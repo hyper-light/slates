@@ -347,6 +347,8 @@ struct DecidingPush {
   restaging: Option<slates_git::store::Staging>,
   /// The command under way's work, built a unit at a time over the turns before its verdict (A-752).
   preparing: Option<slates_git::receive::works::Preparing>,
+  /// Where the let-go window the command under way's peel last stopped for lies (A-864's push readers, r18).
+  peel_away: Option<u64>,
   /// The repository's member greens still to checkpoint, a green a turn, to make the chains room for the command under
   /// way's entry before its append (A-238 moved off the append's step); none while the chains have room.
   making_room: Option<Vec<DbVolumeId>>,
@@ -869,6 +871,7 @@ impl<P> ReceivePack<P> {
       admitting: None,
       restaging: None,
       preparing: None,
+      peel_away: None,
       making_room: None,
       door: None,
       homing: Homing::Due,
@@ -900,6 +903,7 @@ impl<P> ReceivePack<P> {
         admitting,
         restaging,
         preparing,
+        peel_away,
         making_room,
         door,
         ..
@@ -914,6 +918,7 @@ impl<P> ReceivePack<P> {
         admitting,
         restaging,
         preparing,
+        peel_away,
         making_room,
         door,
       };
@@ -1964,6 +1969,8 @@ struct ServerJudge<'j> {
   restaging: &'j mut Option<slates_git::store::Staging>,
   /// The command under way's work, built a unit at a time before its verdict (A-752).
   preparing: &'j mut Option<slates_git::receive::works::Preparing>,
+  /// Where the let-go window the command under way's peel last stopped for lies (A-864's push readers, r18).
+  peel_away: &'j mut Option<u64>,
   /// The member greens still to checkpoint before the command under way's append ([`DecidingPush::making_room`]).
   making_room: &'j mut Option<Vec<DbVolumeId>>,
   /// The green owing its push that the command under way waits at the door for (P2).
@@ -2199,6 +2206,7 @@ impl ServerJudge<'_> {
       record,
       name,
       preparing,
+      peel_away,
       ..
     } = self;
     let quantum = state.config.step_quantum_ns();
@@ -2226,13 +2234,9 @@ impl ServerJudge<'_> {
         indexed: &indexed,
         owing: std::cell::Cell::new(None),
       };
-      let built = Verdicts::new(&greens, &indexed, &objects, *name, room).prepare(
-        command,
-        pushed,
-        preparing,
-        (began, env),
-        slices,
-      );
+      let verdicts = Verdicts::new(&greens, &indexed, &objects, *name, room).peeled(**peel_away);
+      let built = verdicts.prepare(command, pushed, preparing, (began, env), slices);
+      **peel_away = verdicts.away_seen();
       Ok((built, greens.owing.get()))
     })
     .unwrap_or((true, None));
