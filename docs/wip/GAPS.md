@@ -788,8 +788,10 @@
 >   or a manifest into the buffer of the one kept before the last (`Taker::spare`; `delta::apply_into` keeps its
 >   capacity), which no later delta rests on, so a manifest's rebuild allocates nothing past the first. The test now
 >   `a_pushs_churn_per_changeset_is_its_file_alone`: red 102,045 B an edit, now 10,766 B (0.12 manifests).
-> - The watchdog's beat allocates nothing BUILT (2026-11-23, w-perf; main's order on `hg_push_heap`'s first read: the
->   watchdog's lateness p99 and its beat, 24% of a push's sampled bytes, about 10-15 MB a second on two shards).
+> - The watchdog's beat allocates nothing BUILT (2026-11-23, w-perf; main's order). A beat made 4 allocations, about
+>   1 KB by their types (estimated, not measured). `hg_push_heap`'s first read had charged the watchdog 24% of a push's
+>   sampled bytes, about 10-15 MB a second; that was its sampler's artifact (a thread's first symbol load charged to its
+>   next allocation, fixed in f14ea81bb), not the watchdog's.
 >   `watchdog::LatenessTail` keeps A-474's hundred readings in a fixed ring, its p99 a stack copy sorted, and the beat
 >   refills its looks, windows and verdicts in place. Held by `the_watchdogs_beat_allocates_nothing_once_it_runs`
 >   (`crates/server/tests/watchdog_allocations.rs`: a counting allocator on the thread named `slates-watchdog`; red 82
