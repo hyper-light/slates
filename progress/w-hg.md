@@ -462,3 +462,11 @@ Waiting: arena-6 and arena-7.
   rows. Proposed to main: a server-level counting binary (crates/server/tests/hg_push_heap.rs) to name it, then the
   cuts by size, including the manifest buffer reuse (apply into the previous manifest's Vec, swap).
 Waiting: main's order, arena-7 and arena-8 (MALLOC_ARENA_MAX=1 test of retention).
+
+## 2026-11-23 ~11:30 PST (w-hg)
+- Landed a4debd938 (merge df71a0ed5): the intake rebuilds a manifest into the previous one's buffer (Taker::spare).
+  push_heap: 102,045 down to 10,766 B an edit at 1,600 files.
+- Server heap binary: asked main to choose a route. (A) an integration test with an anchor/issuer/store harness and real
+  hg subprocesses; (B) a lib test with a cfg(test) global allocator; (C) a sampling allocator in cli main on a diag
+  branch over the real matrix. I recommended C for the numbers, then A as the lasting test.
+Waiting: main's route; arena-7 and arena-8.
