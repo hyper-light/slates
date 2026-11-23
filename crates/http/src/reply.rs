@@ -271,16 +271,23 @@ pub const CHUNK_SIZE_LINE_BYTES: usize = size_of::<usize>() * 2 + CRLF.len();
 pub fn chunk_size_line(len: usize, line: &mut [u8; CHUNK_SIZE_LINE_BYTES]) -> &[u8] {
   /// Format: the hexadecimal digits, lowercase.
   const DIGITS: &[u8; 16] = b"0123456789abcdef";
-  let digits = usize::try_from(usize::BITS.saturating_sub(len.leading_zeros()).div_ceil(4))
-    .unwrap_or(0)
-    .max(1);
+  /// Format: the bits one hexadecimal digit carries.
+  const BITS_PER_DIGIT: u32 = 4;
+  /// Format: one hexadecimal digit's bits, the low four.
+  const DIGIT_MASK: usize = 0xf;
+  let digits = usize::try_from(
+    usize::BITS
+      .saturating_sub(len.leading_zeros())
+      .div_ceil(BITS_PER_DIGIT),
+  )
+  .unwrap_or(0)
+  .max(1);
   let mut written = 0;
   for (at, slot) in line.iter_mut().take(digits).enumerate() {
-    let shift = (digits.saturating_sub(at).saturating_sub(1)).saturating_mul(4);
-    let nibble = len
-      .checked_shr(u32::try_from(shift).unwrap_or(u32::MAX))
-      .unwrap_or(0)
-      & 0xf;
+    let shift = u32::try_from(digits.saturating_sub(at).saturating_sub(1))
+      .unwrap_or(u32::MAX)
+      .saturating_mul(BITS_PER_DIGIT);
+    let nibble = len.checked_shr(shift).unwrap_or(0) & DIGIT_MASK;
     *slot = DIGITS.get(nibble).copied().unwrap_or(b'0');
     written = at.saturating_add(1);
   }

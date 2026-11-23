@@ -410,15 +410,18 @@ fn prefixed(repo: &impl Repository, prefix: &[u8]) -> Result<Resolved, Refusal> 
   let lowered = prefix.to_ascii_lowercase();
   // Read by node where the view can (goal 93): the prefix's whole bytes and its odd digit's high four bits, two
   // matches at most (two settle it as ambiguous), the null node beside them.
+  /// Format: a hexadecimal digit's radix.
+  const HEX_RADIX: u32 = 16;
   let digit = |byte: u8| {
     char::from(byte)
-      .to_digit(16)
+      .to_digit(HEX_RADIX)
       .and_then(|value| u8::try_from(value).ok())
   };
-  let pairs = lowered.chunks_exact(2);
-  let nibble = pairs.remainder().first().copied().and_then(digit);
+  let (pairs, odd) = lowered.as_chunks::<2>();
+  let nibble = odd.first().copied().and_then(digit);
   let bytes: Option<Vec<u8>> = pairs
-    .map(|pair| Some(digit(*pair.first()?)? << 4 | digit(*pair.get(1)?)?))
+    .iter()
+    .map(|[high, low]| Some(digit(*high)? << 4 | digit(*low)?))
     .collect();
   if let Some(bytes) = bytes
     && let Some(nodes) = repo.changesets_prefixed((&bytes, nibble), 2)

@@ -2047,7 +2047,7 @@ fn a_node_prefixs_lookup_reads_its_matches_not_the_history() {
   let built = a_long_line();
   let view = view_of(&built, true);
   let last = view.node(view.count() - 1).unwrap();
-  let key = hex(&last)[..PREFIX_DIGITS].to_owned();
+  let key = hex(&last).get(..PREFIX_DIGITS).unwrap().to_owned();
   let (by_node, reads) = looked_up(&view, key.as_bytes(), true);
   let (walked, walked_reads) = looked_up(&view, key.as_bytes(), false);
   assert_eq!(by_node, format!("1 {}\n", hex(&last)).into_bytes());
