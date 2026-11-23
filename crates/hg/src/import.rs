@@ -1949,7 +1949,7 @@ fn append_changeset<R>(
     branch: &changeset.branch,
   };
   let numbers = index.append_changesets(store, &[new])?;
-  settle(index, store, CHANGELOG, rev, &numbers)
+  settle(CHANGELOG, rev, &numbers)
 }
 
 /// Appends one manifest or file revision, which must be numbered `rev`, its revlog's own.
@@ -1961,26 +1961,18 @@ fn append_revision<R>(
   revision: &NewRevision,
 ) -> Result<(), ImportRefused<R>> {
   let numbers = index.append_revisions(store, reading.log, &[*revision])?;
-  settle(index, store, reading.radix, rev, &numbers)
+  settle(reading.radix, rev, &numbers)
 }
 
 /// Holds an append's numbers to its revlog's own from `first` (the index passes over a node a log holds already, and
-/// would number what follows otherwise than 7.2), then seals the index's tail when it is due.
-fn settle<R>(
-  index: &mut HgIndex,
-  store: &mut ContentStore,
-  radix: &[u8],
-  first: u32,
-  numbers: &[u32],
-) -> Result<(), ImportRefused<R>> {
+/// would number what follows otherwise than 7.2). The index's tail is sealed by the append itself when due
+/// (`HgIndex::insert`), as every append's is.
+fn settle<R>(radix: &[u8], first: u32, numbers: &[u32]) -> Result<(), ImportRefused<R>> {
   if let Some((rev, _)) = (first..).zip(numbers).find(|&(rev, &number)| rev != number) {
     return Err(ImportRefused::Duplicate {
       revlog: Box::from(radix),
       rev,
     });
-  }
-  if index.rows().seal_due(store) {
-    index.rows().seal(store).map_err(index::Refused::from)?;
   }
   Ok(())
 }

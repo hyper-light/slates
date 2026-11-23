@@ -31,7 +31,7 @@ use core::ops::Range;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use slates_vcs::{ContentId, ContentStore, IndexRefused};
+use slates_vcs::{ContentId, ContentStore, IndexRefused, Merge, MergeStep};
 
 use super::classify::ReadChangeset;
 use super::commit::{Unindexed, keep_one};
@@ -127,6 +127,11 @@ pub struct Intaken {
   pub longest_step_bytes: u64,
   /// The revisions taken over more than one step, a window a step ([`Pending`]).
   pub spread: u64,
+  /// The fork's runs merged by the size-tiered rule as the push sealed them ([`Taker::merge_step`]).
+  pub tiered_merges: u64,
+  /// The most runs only the fork held after any step: what a lookup of a new row walked past its parent's runs, held
+  /// within [`slates_vcs::Index::tiered_due`]'s logarithm of its rows.
+  pub most_own_runs: u64,
 }
 
 /// Format: the path a `Texts` entry gives the changelog's revisions: no tracked path holds a NUL (7.2's
@@ -457,6 +462,9 @@ struct Taker {
   asked: Option<StoreAsk>,
   /// A revision longer than one window, being taken a window a step.
   pending: Option<Box<Pending>>,
+  /// The merge of the fork's newest runs the size-tiered rule named, a table a step until it ends
+  /// ([`Taker::merge_step`]).
+  merging: Option<Merge>,
   /// The segments its kept texts are cut into as they are taken, where its driver asks for them ([`Intake::cutting`]).
   cutting: Option<Cutting>,
 }
@@ -997,6 +1005,7 @@ impl Intake {
         cache: BaseCache::within(room),
         asked: None,
         pending: None,
+        merging: None,
         cutting: None,
       },
     })
@@ -1046,6 +1055,9 @@ impl Intake {
     let Intake { frame, taker } = self;
     if taker.pending.is_some() {
       return taker.advance_pending(store, admission);
+    }
+    if let Some(stepped) = taker.merge_step(store)? {
+      return Ok(stepped);
     }
     match taker.stage {
       Stage::Changelog(at) => {
@@ -1295,6 +1307,42 @@ impl Taker {
       self.intaken.held_changesets.push(node);
     }
     Ok(true)
+  }
+
+  /// A step of the fork's merge (goal 93, the index seal's reland): a table of the merge the size-tiered rule named
+  /// ([`slates_vcs::Index::tiered_due`]), or its begin, between revisions; none where none is due. Every append seals
+  /// the fork's tail when due (`HgIndex::insert`), each seal a run, and a lookup walks every run: unmerged, a push's
+  /// runs grew a seal at a time and each new row's lookup with them (arena-14: shard 0 spun past 1 s in a segment step).
+  /// Merged so, the fork's own runs stay within the rule's logarithm of its rows, a table's work a step. A push refused
+  /// or given back drops its merge with the fork: nothing changes until the merge's last step.
+  fn merge_step(&mut self, store: &mut ContentStore) -> Result<Option<Stepped>, Refused> {
+    let as_refused = |refused: IndexRefused| {
+      Refused::Unindexed(Unindexed::Index(crate::index::Refused::Index(refused)))
+    };
+    if let Some(mut merge) = self.merging.take() {
+      match self
+        .fork
+        .rows()
+        .merge_step(store, &mut merge)
+        .map_err(as_refused)?
+      {
+        MergeStep::More => self.merging = Some(merge),
+        MergeStep::Done(_) => {
+          self.intaken.tiered_merges = self.intaken.tiered_merges.saturating_add(1)
+        }
+        MergeStep::GivenUp => {}
+      }
+      return Ok(Some(Stepped::More));
+    }
+    let own = to_u64(self.fork.rows().own_runs());
+    self.intaken.most_own_runs = self.intaken.most_own_runs.max(own);
+    let Some(runs) = self.fork.rows().tiered_due() else {
+      return Ok(None);
+    };
+    Ok(self.fork.rows().merge_begin(store, runs).map(|merge| {
+      self.merging = Some(merge);
+      Stepped::More
+    }))
   }
 
   /// Takes one revision of `log` (module docs): passed over, or checked, rebuilt and kept.
