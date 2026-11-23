@@ -3012,6 +3012,105 @@ fn a_shallow_clone_of_a_merge_heavy_history_is_deepened_over_the_daemons_edge() 
   );
 }
 
+/// The v2 `fetch` stock git 2.50's `git fetch --deepen <depth>` sends from a shallow clone of `tip` (its
+/// `GIT_TRACE_PACKET` against slates, read): its choices with `sideband-all`, the tip its `shallow` line, `deepen <depth>`
+/// and `deepen-relative`, `want-ref` its branch (slates advertises `ref-in-want`), `have` the tip, and no `done`, so its
+/// first round is a negotiation's.
+fn stock_deepen_of(tip: ObjectId, depth: usize) -> Vec<u8> {
+  let mut request = Vec::new();
+  pktline::write(Packet::Data(b"command=fetch\n"), &mut request).expect("the command");
+  pktline::write(Packet::Delim, &mut request).expect("the delimiter");
+  for argument in [
+    "thin-pack\n".to_owned(),
+    "no-progress\n".to_owned(),
+    "include-tag\n".to_owned(),
+    "ofs-delta\n".to_owned(),
+    "sideband-all\n".to_owned(),
+    format!("shallow {tip}\n"),
+    format!("deepen {depth}\n"),
+    "deepen-relative\n".to_owned(),
+    "want-ref refs/heads/main\n".to_owned(),
+    format!("have {tip}\n"),
+  ] {
+    pktline::write(Packet::Data(argument.as_bytes()), &mut request).expect("an argument");
+  }
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request
+}
+
+/// Goal 93 (main 01a20182's r115 on git/git, `git_interop.rs` "deepened by one": after a `--depth 1` clone, `git fetch
+/// --deepen=1` left the history one commit deep). The server's half, held: the session's repository kept the verb's
+/// default branch, `main`, where git/git's is `master`, so its work clone began unborn and its commit was a root (the
+/// session now makes the repository on the source's default branch). This guards the answer stock git's own request
+/// gets. Do: push [`merge_history`] through the daemon's edge, then a commit over its tip and two tags (at the first
+/// push's tip and at its tree) in a second push; then fetch at protocol v2 exactly as `git fetch --deepen 1` asks from
+/// a shallow clone of the new tip ([`stock_deepen_of`]). Expect: `200`; a `shallow-info` section that unshallows the
+/// tip (`unshallow <tip>`), never names it shallow again, and names its parent shallow, the new boundary; and a
+/// packfile section after it, as `upload-pack.c`'s `deepen` with `deepen_relative` answers.
+#[test]
+fn a_shallow_clone_deepened_by_one_unshallows_its_tip_over_the_daemons_edge() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, base) = merge_history();
+  let created = pushed(edge, &name, &request);
+  // A second push, a commit over the first's tip, as the work clone's pushes came after the mirror's.
+  let (on_top, tip) = {
+    use slates_git::object_name::Kind;
+    let blob = b"one\n".to_vec();
+    let mut tree = b"100644 file\0".to_vec();
+    tree.extend_from_slice(git_name(Kind::Blob, &blob).as_bytes());
+    let tree_id = git_name(Kind::Tree, &tree);
+    let commit = format!(
+      "tree {tree_id}\nparent {base}\nauthor A <a@example.com> 1700000001 +0000\n\
+       committer A <a@example.com> 1700000001 +0000\n\non top\n"
+    )
+    .into_bytes();
+    let tip = git_name(Kind::Commit, &commit);
+    let mut request = Vec::new();
+    let line = format!("{base} {tip} refs/heads/main\0{CAPABILITIES}");
+    pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("the command");
+    // A tag at the first push's tip and one at its tree, as the dataset's tags name its tip and tree.
+    for (name, at) in [("refs/tags/at-base", base), ("refs/tags/at-tree", tree_id)] {
+      let line = format!("{ZERO} {at} {name}");
+      pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("a tag's command");
+    }
+    pktline::write(Packet::Flush, &mut request).expect("the flush");
+    request.extend_from_slice(&stored_pack(&[(Kind::Commit, commit.as_slice())]));
+    (request, tip)
+  };
+  let moved = pushed(edge, &name, &on_top);
+  let deepened = uploaded(edge, &name, &stock_deepen_of(tip, 1));
+  daemon.stop();
+  assert_eq!(created.0, 200, "{}", String::from_utf8_lossy(&created.1));
+  assert_eq!(moved.0, 200, "{}", String::from_utf8_lossy(&moved.1));
+  let whole = String::from_utf8_lossy(&deepened.1).into_owned();
+  let info = whole
+    .split("packfile")
+    .next()
+    .unwrap_or_default()
+    .to_owned();
+  assert_eq!(deepened.0, 200, "{info}");
+  assert!(info.contains("shallow-info"), "{info}");
+  assert!(
+    info.contains(&format!("unshallow {tip}")),
+    "the tip unshallowed: {info}"
+  );
+  assert!(
+    !info.contains(&format!("\u{1}shallow {tip}")),
+    "the tip not shallow again: {info}"
+  );
+  assert!(
+    info.contains(&format!("shallow {base}")),
+    "its parent the new boundary: {info}"
+  );
+  assert!(whole.contains("packfile"), "{info}");
+}
+
 /// A-766 part 2 (DeltaV v1, ra_serf 1.14's `open_root` without HTTPv2; `mod_dav_svn` 1.14.x `activity.c`, `version.c`,
 /// `mod_dav.c`). Do: on a daemon's HTTP edge, commit a file as a client without HTTPv2 does: MKACTIVITY of an activity;
 /// CHECKOUT of the VCC into it (`apply-to-version`); PROPPATCH of the working baseline the CHECKOUT named, setting
