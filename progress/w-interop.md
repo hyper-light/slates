@@ -563,3 +563,8 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   sets a mirror UUID, so mirror_dump_of now sets MIRROR_UUID, as svn-matrix.sh does. The import and the HTTP edge were
   checked and report the dump's UUID. Owed to main: rerun (B) svnsync over http, and the http-v1 revprops row.
 - Waiting: main's tracer CI diagnostic for fix (2).
+- LANDED 71c2f07a7 (red 3bb5e53b1), 2026-11-23: (B)'s rerun r12 left revision 0's Prop-content-length 221 against
+  220. The line filter on svn:sync-* had kept the length headers, and the source URL differs per leg. The mirror's sync
+  revprops are now deleted (svnadmin delrevprop) before its dump, which is compared whole.
+  a_mirrors_dump_is_the_same_whatever_url_it_was_synced_from: two stock URLs, one repository. Owed to main: its red
+  and green (no svn on the MacBook), then (B).
