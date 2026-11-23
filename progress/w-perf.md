@@ -421,3 +421,13 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   - For main: clippy and the cross-lint for slates-ipc and slates-server (DaemonEnd::reply now returns u64). The
     attribution's ring/outside split is good only for runs built after a744fc668.
   - Queue empty.
+- 2026-11-23 ~05:00 PST: LANDED 0227ad029 (merge 0bc10f567), goal 93: the watchdog's beat allocates nothing.
+  - LatenessTail is a fixed ring of A-474's hundred readings, its p99 a sorted stack copy; the beat refills its looks,
+    windows and verdicts in place.
+  - Red first: the_watchdogs_beat_allocates_nothing_once_it_runs (server/tests/watchdog_allocations.rs, a counting
+    allocator on the thread named slates-watchdog): 82 idle and 81 under 71,073 requests over 20 beats on HEAD; now 0
+    and 0, again after main's merge.
+  - The ring's oracle against the old queue (watchdog lib tests 30/30). GAPS line under goal 93's memory entries.
+  - My cargo fmt also dropped a stray blank line in vcs_store.rs that main carried.
+  - For main: clippy for slates-server and slates-api (anchor.rs uses LatenessTail); hg_push_heap before and after.
+  - Queue empty.
