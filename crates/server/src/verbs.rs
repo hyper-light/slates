@@ -14717,8 +14717,10 @@ pub(crate) fn termed_expiry(state: &mut ShardState) -> u64 {
 /// The `Renew` verb (A-384): a holder's renewal of its CLI attachment's term, and nothing else. Renewed by
 /// [`use_attachment`] as any verb naming it is, and answered the term now in force and the cadence the holder renews at
 /// ([`renewal_cadence`]). Refused as any use is (`AttachmentExpired` past its term, `NotFound` for no such attachment);
-/// another principal's is `Forbidden`, its use having renewed nothing; and an attachment with no term (a mount's,
-/// which renews through its own activity) is a bad request.
+/// another principal's is `Forbidden`, its use having renewed nothing. An attachment with no term (a mount's, which
+/// lives by its own activity; an SDK client's, which lives with its client) is answered `NoTerm`, a state rather than a
+/// fault, so a process naming an attachment another made learns from the answer whether to hold it (A-879). Until
+/// 2026-11-23 it was a `BadRequest`, an uncategorized refusal for a valid state.
 fn renew(state: &mut ShardState, principal: &Principal, attachment: u64) -> ReplyBody {
   if let Err(refusal) = use_attachment(state, principal, attachment) {
     return refused(refusal);
@@ -14733,11 +14735,7 @@ fn renew(state: &mut ShardState, principal: &Principal, attachment: u64) -> Repl
     expires_ns: current,
   } = record.consumer
   else {
-    return refused(Refusal::BadRequest {
-      reason:
-        "only a CLI attachment has a term to renew; a mount's renews through its own activity"
-          .to_owned(),
-    });
+    return ReplyBody::NoTerm;
   };
   // A renewal asked for is made: its holder's next is a third of the term away, so the expiry is a whole term from now,
   // whatever an ordinary use's half-term rule left it at (`use_attachment`).

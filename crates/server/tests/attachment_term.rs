@@ -8,7 +8,7 @@
 
 use std::time::{Duration, Instant};
 
-use slates_client::{AttachRequest, ClientError, Intent, Refusal};
+use slates_client::{AttachRequest, ClientError, Intent, Refusal, Renewal};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
@@ -164,6 +164,58 @@ fn a_cli_attachment_is_renewed_by_its_own_principals_use_alone() {
   );
 }
 
+/// A-879. Do: on a daemon whose failover delay is held at [`TERM`], attach one volume for write in the SDK's form (its
+/// life is its client's, not a term) and another in the CLI's form; `Renew` each; wait out two terms; write under each.
+/// Expect the SDK attachment's renewal answered `NoTerm` and the CLI attachment's `Renewed` with a term no longer than
+/// the ceiling; and, two terms on, the SDK attachment's write accepted (it never had a term to lapse) and the CLI one's
+/// refused `AttachmentExpired` (its renewal was a renewal, not a hold). Until 2026-11-23 the first renewal was refused
+/// `BadRequest`, an uncategorized refusal for a valid state, which no caller could tell from a malformed request.
+#[test]
+fn a_renewal_answers_no_term_for_an_attachment_with_none_and_renews_a_termed_one() {
+  let profile = common::machine_profile();
+  let (daemon, instance) = term_daemon(&profile, "term-none", TERM);
+  let mut client = connect(&instance);
+  let sdk_volume = client.create(&scratch("no-term")).unwrap();
+  let sdk = client
+    .attach_with(sdk_volume, None, Intent::Write, AttachRequest::Root)
+    .unwrap()
+    .attachment;
+  let cli_volume = client.create(&scratch("termed-renewal")).unwrap();
+  let cli = client
+    .attach_with(cli_volume, None, Intent::Write, AttachRequest::Termed)
+    .unwrap()
+    .attachment;
+  let sdk_renewal = client.renew(sdk);
+  let cli_renewal = client.renew(cli);
+  #[allow(clippy::disallowed_methods)] // two terms with no use of either attachment
+  std::thread::sleep(TERM.saturating_mul(2));
+  let sdk_write = client.fs_write((sdk_volume, sdk), "sdk.txt", b"sdk", 0o644);
+  let cli_write = client.fs_write((cli_volume, cli), "cli.txt", b"cli", 0o644);
+  drop(client);
+  daemon.stop();
+  assert_eq!(
+    sdk_renewal,
+    Ok(Renewal::NoTerm),
+    "an attachment with no term: nothing to renew"
+  );
+  let ceiling_ns = u64::try_from(TERM.as_nanos()).unwrap();
+  assert!(
+    matches!(cli_renewal, Ok(Renewal::Renewed { term_ns, .. }) if term_ns <= ceiling_ns),
+    "a CLI attachment renewed, its term within the ceiling: {cli_renewal:?}"
+  );
+  assert!(
+    sdk_write.is_ok(),
+    "the SDK attachment had no term to lapse: {sdk_write:?}"
+  );
+  assert!(
+    matches!(
+      cli_write,
+      Err(ClientError::Refused(Refusal::AttachmentExpired { attachment: named })) if named == cli
+    ),
+    "the CLI attachment lapsed two terms after its renewal: {cli_write:?}"
+  );
+}
+
 /// A one-shard daemon of its own segment, bootstrapped, whose failover delay is held at `ceiling` (A-384: injected, since
 /// nothing sets the estimate), and its instance.
 fn term_daemon(
@@ -216,13 +268,16 @@ fn a_held_attachment_lives_while_its_holder_renews_and_lapses_at_its_own_pace() 
   let mut refused = None;
   while began.elapsed() < HELD_CEILING.saturating_mul(2) {
     match holder.renew(attachment) {
-      Ok((term_ns, renew_every_ns)) => {
+      Ok(Renewal::Renewed {
+        term_ns,
+        renew_every_ns,
+      }) => {
         terms.push(term_ns);
         #[allow(clippy::disallowed_methods)] // the holder's pace: the cadence the reply named
         std::thread::sleep(Duration::from_nanos(renew_every_ns));
       }
-      Err(error) => {
-        refused = Some(error);
+      other => {
+        refused = Some(other);
         break;
       }
     }
@@ -292,7 +347,7 @@ fn a_restart_gives_a_cli_attachment_a_fresh_term() {
   drop(user);
   second.stop();
   assert!(
-    renewed.is_ok(),
+    matches!(renewed, Ok(Renewal::Renewed { .. })),
     "the restart gave the attachment a fresh term: {renewed:?}"
   );
   assert!(

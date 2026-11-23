@@ -3767,8 +3767,9 @@ fn a_hold_keeps_an_idle_cli_attachment_and_its_drop_lets_it_lapse() {
     )
     .unwrap()
     .attachment;
-  let hold =
-    slates_client::Hold::new(&instance, deadlines(), attachment).expect("the attachment is held");
+  let hold = slates_client::Hold::new(&instance, deadlines(), attachment)
+    .expect("the attachment is renewed")
+    .expect("a CLI attachment has a term to hold");
   #[allow(clippy::disallowed_methods)] // three ceilings with no verb but the hold's renewals
   std::thread::sleep(HOLD_CEILING.saturating_mul(3));
   let held_write = client.fs_write((volume, attachment), "held.txt", b"held", 0o644);
@@ -3788,5 +3789,68 @@ fn a_hold_keeps_an_idle_cli_attachment_and_its_drop_lets_it_lapse() {
       Err(ClientError::Refused(Refusal::AttachmentExpired { attachment: named })) if named == attachment
     ),
     "the dropped hold let the attachment lapse: {late:?}"
+  );
+}
+
+/// Shape: how often the ended-hold test looks for its hold's renewals to have met their refusal: a small part of a
+/// renewal's cadence, which is a third of the term at most.
+const HOLD_LOOK: Duration = Duration::from_millis(20);
+
+/// A-879, the library's holder of an attachment with no term, and a hold's end. Do: on a one-shard daemon whose
+/// failover delay is held at [`HOLD_CEILING`], attach a volume for write in the SDK's form and ask a `Hold` of it;
+/// attach another in the CLI's form, hold it, detach it from the attaching client, wait (within ten ceilings) for the
+/// hold's renewals to meet the detach, and end the hold. Expect no hold of the SDK attachment (`Ok(None)`: it has no
+/// term, and nothing was spawned to outlive the call), and the ended hold returning the refusal that ended its
+/// renewals (`NotFound`, the attachment gone), which a drop would have discarded.
+#[test]
+fn a_hold_of_an_attachment_with_no_term_is_none_and_an_ended_hold_returns_its_refusal() {
+  let (daemon, mut client, instance) = one_shard_daemon("hold-end");
+  daemon
+    .inject_failover(Some(u64::try_from(HOLD_CEILING.as_nanos()).unwrap()))
+    .expect("the failover delay is held");
+  let sdk_volume = client.create(&room_for("sdk-held", 64)).unwrap();
+  let sdk = client
+    .attach_with(
+      sdk_volume,
+      None,
+      Intent::Write,
+      slates_client::AttachRequest::Root,
+    )
+    .unwrap()
+    .attachment;
+  let sdk_hold = slates_client::Hold::new(&instance, deadlines(), sdk);
+  let volume = client.create(&room_for("ended", 64)).unwrap();
+  let attachment = client
+    .attach_with(
+      volume,
+      None,
+      Intent::Write,
+      slates_client::AttachRequest::Termed,
+    )
+    .unwrap()
+    .attachment;
+  let mut hold = slates_client::Hold::new(&instance, deadlines(), attachment)
+    .expect("the attachment is renewed")
+    .expect("a CLI attachment has a term to hold");
+  let detached = client.detach(attachment);
+  let began = Instant::now();
+  while hold.lost().is_none() && began.elapsed() < HOLD_CEILING.saturating_mul(10) {
+    #[allow(clippy::disallowed_methods)] // the test paces its looks at the hold
+    std::thread::sleep(HOLD_LOOK);
+  }
+  let ended = hold.end();
+  drop(client);
+  daemon.stop();
+  assert!(
+    matches!(sdk_hold, Ok(None)),
+    "an attachment with no term is not held: {sdk_hold:?}"
+  );
+  assert!(
+    detached.is_ok(),
+    "the held attachment detached: {detached:?}"
+  );
+  assert!(
+    matches!(ended, Some(ClientError::Refused(Refusal::NotFound))),
+    "the ended hold returned the refusal its renewals met: {ended:?}"
   );
 }

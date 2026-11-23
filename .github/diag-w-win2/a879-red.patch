@@ -1,0 +1,14 @@
+--- a/crates/cli/src/verbs.rs
++++ b/crates/cli/src/verbs.rs
+@@ -1660,6 +1660,11 @@
+       held.term_ns() / NANOS_PER_MILLISECOND
+     );
+   }
++  // DIAG RED (never merged): the write's hold ended at once, its line kept, as a write that holds nothing.
++  let held: Option<slates_client::Hold> = held.and_then(|held| {
++    drop(held);
++    None
++  });
+   let written = write_stdin(client, (volume, attachment), path, mode);
+   if let Some(lost) = held.and_then(slates_client::Hold::end) {
+     slates_machine::log_line!(

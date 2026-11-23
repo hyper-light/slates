@@ -35137,7 +35137,7 @@ Applied in the same change to: A-309's holder rule (above), GAPS (the unasked ho
 - **The verb.** `RequestBody::Renew { attachment }` answered `ReplyBody::Renewed { term_ns, renew_every_ns }` (both appended and published:
   `RequestBody` 77, `ReplyBody` 68, after A-267's `Drifted` and `Conflicts`), served on the attachment's owner shard: a renewal asked for is made durable, a whole
   term from now; refused as any use is (`AttachmentExpired` past its term), and `BadRequest` for an attachment with no
-  term. `Client::renew`.
+  term (since A-879 answered `NoTerm`, a state rather than a refusal). `Client::renew`.
 - **Lifeguard's rule** (Dadgar et al. 2018: a member does not condemn others for its own unavailability): at a shard's
   start, before its serve loop answers anything, every CLI attachment of its partition gets a fresh term, `F` from then,
   and its pace starts again (`verbs::renew_termed_at_start`), so a restart longer than a term never ends an attachment
@@ -61956,3 +61956,44 @@ name whatever their `cfg`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sdk_async.t
   - `unsafe-budget.toml`: anchor +1, ipc ±0.
   - GAPS.
   - docs/bugs/2026-11-23-a-hand-off-left-an-inheritable-duplicate-at-every-call.md.
+
+### A-879 — A CLI write holds its attachment while it reads and stages its input, and a renewal answers an attachment with no term `NoTerm` (2026-11-23, w-win2 for main 01a20182, its rulings of 2026-11-23; opened in GAPS as A-878 and renumbered; A-230, A-384)
+
+- **What was there.** `slates write` read all of stdin, staged it in pages when it was larger than one request
+  (`StageBegin`, `StagePut`, neither of which names the attachment), and then sent the first verb that names the
+  attachment. A CLI attachment made by another `slates attach` process is renewed only by verbs that name it (A-230) or
+  by a holder (A-384), so an input slower than the term to arrive, or a large one slower than the term to stage, met a
+  lapsed attachment: `AttachmentExpired` on both Windows runners for a 256 MiB write (diag run 45260798132) and on macOS
+  for a 16 MiB input that arrived after an 8 s pause. `Renew`, the only verb that reports a term, refused an attachment
+  with no term as a `BadRequest`, so no caller could ask whether an attachment needs holding without reading an error
+  as a fact.
+- **The rule** (main's ruling): a process that names an attachment another made, and may take longer than a term
+  before its verb reaches the daemon, holds the attachment for that time. Whether there is a term to hold is decided by
+  the daemon's own answer about that attachment, never by a refusal.
+- **The verb.** `Renew` answers an attachment with no term (a mount's, which lives by its own activity; an SDK
+  client's, which lives with its client) with `ReplyBody::NoTerm` (appended, tag 85, published), and renews nothing.
+  `Client::renew` returns a `Renewal`: `Renewed { term_ns, renew_every_ns }` or `NoTerm`. `Hold::new` returns `None`
+  for `NoTerm`, its renewer already ended. A renewal answered `NoTerm` after one answered a term is a protocol break,
+  since an attachment's kind never changes: the renewals end on it, typed (`UnexpectedReply`). `Hold::end` stops and
+  joins the renewer and returns the refusal that ended its renewals, which a drop discards. Contract 61.
+- **The write** (`crates/cli/src/verbs.rs`, `emit_write`): `slates write` holds the attachment it names
+  (`slates_client::Hold`, its own client and thread, renewed at the cadence the daemon names) from before it reads
+  stdin until its write is answered, then ends the hold. A refusal that ended the hold's renewals is logged and never
+  dropped, and the write's own outcome is the command's. The hold's first renewal fails fast for an attachment already
+  lapsed or not the caller's, before any input is read: the command then names the hold's refusal on stderr and exits
+  with that refusal's code (main's ruling: a failed hold reads itself). A hold taken says so on stderr before any input
+  is read, the signal a caller that held the attachment itself waits for before it lets go (the Windows extents tests
+  hand their attachment from `slates attach --hold` to the write so).
+- **Not changed, owed (the next piece, main's ruling).** The CLI still holds the input whole, up to the largest
+  shard's metadata ledger, while the daemon's staging buffer holds a second copy for the time of the write. A stage
+  opened without a length, reserved put by put within the ledger and bound to the attachment, will take the input as
+  it arrives. Today a staging buffer expires one failover delay after its last put, which no hold renews, so the
+  length-less stage is bound to the attachment the hold keeps.
+- **Evidence.** RED_AND_GREEN_PLACEHOLDER
+
+Applied in the same change to: §4.7's A-384 record (the verb's answer for an attachment with no term), GAPS (A-879,
+and A-789's note on the extents file), `docs/cli.md`, `docs/bugs/2026-11-23-a-long-cli-write-let-its-attachment-lapse.md`,
+`crates/ipc/src/protocol.rs`, `crates/ipc/tests/wire_order.txt`, `crates/server/src/verbs.rs`,
+`crates/client/src/{client,hold,lib}.rs`, `crates/cli/src/verbs.rs`, `crates/api/src/lib.rs`,
+`crates/server/tests/attachment_term.rs`, `crates/client/tests/client.rs`, `crates/cli/tests/cli.rs`,
+`.github/workflows/ci.yml`.
