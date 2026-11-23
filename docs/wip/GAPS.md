@@ -1863,6 +1863,14 @@
 > (`merge.replica.checkpoint_unread`, A-727 (d) owes its reads). Oracle: the A-866 oracle with restores, at earlier
 > versions too, caught up by recorded entries. Red first: a restored green named nothing. Not yet measured: the
 > register's checkpoint bytes before and after (main's). OWED: a copied tree's keys are carried still.
+> Fixed since (2026-11-23, w-svn): a refused publication's remake read none of the checkpoint's named texts the content
+> store does not keep after landing (cf1529f1d, the remake reads them from the engine it replaces), and a takeover's
+> re-adoption brings them back first, as a recovery's pre-pass does, on one planner (`svn_texts::to_bring`, its two
+> bringers `bring_whole_in` and `bring_whole`; `green_adopt::readopt_with`;
+> `a_readopted_green_brings_back_the_texts_its_checkpoint_names_first`). End to end the re-adoption stays UNREACHABLE
+> for a Subversion green until A-727 (d): the engine a re-adoption is handed is the holder's replica, which reads no
+> named content, so an svn takeover fails today at the replica's build (`merge.replica.checkpoint_unread`). The
+> takeover's end-to-end red belongs to (d)'s landing (w-shared's, main's queue).
 >
 > **Finding, 2026-11-20 (w-engine, not chased under the close order):** `cargo test -p slates-merge --test checkpoint`
 > failed once in 10 runs (`a_green_restored_from_its_checkpoint_answers_as_the_green_it_was`, a proptest, unseeded) on
