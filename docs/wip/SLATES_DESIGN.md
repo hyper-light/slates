@@ -58010,6 +58010,13 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > and 4/4 integration, the seam's own: a 300,001-byte pack read the same staged (borrowed), landed (RAM 0 after its
 > release) and recovered with and without a checkpoint.
 >
+> **2026-11-22, shared payloads.** The `P` lookup names one live payload section. Each additional copy has its log
+> offset appended to the key. Forgetting or replacing the section that supplies reads selects one surviving copy,
+> even across repositories. The last removal drops the lookup. Reads take one point lookup. On its first open with
+> this index, an existing checkpoint rebuilds the places from the changeset rows it still holds. The rebuilt index
+> and its marker commit at the same offset. Subsequent opens replay the tail as before.
+> `forgetting_a_duplicate_payload_keeps_the_surviving_changesets_bytes` exercises both orders of removal.
+>
 > **Status (2026-11-20, piece C3 step 4: the A/B's derived per-path arm, decided).** Main's bar: changesets plus a derived
 > per-path form must meet the per-file arm's old read (91 µs p50) and clone file section (0.27 s). Arm C of
 > `crates/hg/examples/changeset_ab.rs` (BENCHMARKS, "Mercurial's history as changesets with a derived per-file form"):
@@ -58238,7 +58245,8 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > rows by node over the index as it stands then. The repository's landing turn (Subversion's, which Mercurial's made
 > changesets hold too) is taken for the entry's commit alone: a fork another landing made stale is re-based by node
 > first, off the turn, and once more holding it at most. Readers see only what an entry names. A run no entry names
-> is forgotten as it ends, its rows dropped from the store. A made changeset stays one changeset (record v7).
+> is forgotten as it ends. The store drops its rows and retains every payload another changeset still holds (C3).
+> A made changeset stays one changeset (record v7).
 > `repository::hg_run`, `hg_push::rebase`; crash oracle `t_b1_a_crash_at_any_segment_boundary_leaves_a_push_whole_or_absent`.
 
 > **Status (2026-11-21, C1: made changesets on the changeset store; main's ruling of 09:00).** A changeset the server

@@ -340,3 +340,127 @@ fn a_store_lent_more_memory_than_a_memtable_addresses_lands_and_reads() {
     [landed]
   );
 }
+
+/// A-767 C3. Land identical payloads in two repositories, including two occurrences in one
+/// changeset. Forget either repository first. The other still serves the bytes after a restart.
+#[test]
+fn forgetting_a_duplicate_payload_keeps_the_surviving_changesets_bytes() {
+  use slates_store::staging::Staging;
+  use slates_store::store::Contents;
+
+  let payload = b"the bytes of both changesets";
+  let identity = *blake3::hash(payload).as_bytes();
+  let len = u64::try_from(payload.len()).unwrap();
+  let staging = Staging::new(0);
+  for (forgotten, survivor) in [(2, 1), (1, 2)] {
+    let dir = scratch(&format!("shared-payload-{forgotten}"));
+    let mut store = open(&dir);
+    land(&mut store, 1, 1, payload);
+    store
+      .land(
+        Header {
+          tool: Tool::Mercurial,
+          repository: 2,
+          sequence: 1,
+          judged_over: 0,
+          grant: 1,
+          work: 7,
+          time_ns: 0,
+          sections: 2,
+        },
+        &[
+          (SectionKind::Payload, Contents::Bytes(payload)),
+          (SectionKind::Payload, Contents::Bytes(payload)),
+        ],
+        &staging,
+      )
+      .unwrap();
+    assert_eq!(
+      store.piece(&staging, &identity, len, 0).unwrap().as_deref(),
+      Some(payload.as_slice())
+    );
+    assert!(store.forget(forgotten, 1).unwrap() > 0);
+    drop(store);
+    let mut store = open(&dir);
+    assert_eq!(store.changesets(survivor, 1, 1).unwrap().len(), 1);
+    assert!(store.changesets(forgotten, 1, 1).unwrap().is_empty());
+    assert_eq!(
+      store.piece(&staging, &identity, len, 0).unwrap().as_deref(),
+      Some(payload.as_slice()),
+      "the surviving repository still names this payload"
+    );
+    let place = slates_store::texts::Place {
+      payload: identity,
+      offset: 0,
+      len,
+    };
+    assert_eq!(
+      store.places_bytes(&staging, &[place]).unwrap(),
+      vec![payload.to_vec()]
+    );
+    assert_eq!(store.forget(forgotten, 1).unwrap(), 0);
+    assert!(store.forget(survivor, 1).unwrap() > 0);
+    drop(store);
+    assert!(
+      open(&dir)
+        .piece(&staging, &identity, len, 0)
+        .unwrap()
+        .is_none()
+    );
+  }
+}
+
+/// A-767 C3. Replay two copies and a replacement for one at the same sequence. Forget the
+/// other copy. Only the replacement's new payload remains readable after the next checkpoint.
+#[test]
+fn a_replaced_sequence_releases_its_duplicate_payload_during_replay() {
+  use slates_store::staging::Staging;
+
+  let dir = scratch("replaced-payload");
+  let shared = b"also in the other repository";
+  let new = b"replacement";
+  let staging = Staging::new(0);
+  {
+    let mut store = open(&dir);
+    let header = Header {
+      tool: Tool::Git,
+      repository: 1,
+      sequence: 1,
+      judged_over: 0,
+      grant: 1,
+      work: 1,
+      time_ns: 1,
+      sections: 1,
+    };
+    let mut appending = store.begin(header).unwrap();
+    appending
+      .section(SectionKind::Payload, shared.len() as u64)
+      .unwrap();
+    appending.piece(shared).unwrap();
+    let original = appending.commit().unwrap();
+    store.applied(&original).unwrap();
+    land(&mut store, 2, 1, shared);
+    store.checkpoint().unwrap();
+    let newest = land(&mut store, 1, 1, new);
+    store.applied(&original).unwrap();
+    assert_eq!(store.changesets(1, 1, 1).unwrap()[0].identity, newest);
+  }
+  let read = |store: &mut Store, bytes: &[u8]| {
+    store
+      .piece(
+        &staging,
+        blake3::hash(bytes).as_bytes(),
+        bytes.len() as u64,
+        0,
+      )
+      .unwrap()
+      .map(|piece| piece.into_owned())
+  };
+  let mut store = open(&dir);
+  assert_eq!(read(&mut store, shared).as_deref(), Some(shared.as_slice()));
+  assert!(store.forget(2, 1).unwrap() > 0);
+  drop(store);
+  let mut store = open(&dir);
+  assert_eq!(read(&mut store, shared), None);
+  assert_eq!(read(&mut store, new).as_deref(), Some(new.as_slice()));
+}

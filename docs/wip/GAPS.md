@@ -893,7 +893,9 @@
 > sequence)` row is the newest landing at it, the only one the register can name). The orphan's log bytes stay until
 > the cleaner of unnamed log space (owed). Its rows can be forgotten now (2026-11-22, w-hg; main 01a20182's ruling of
 > 12:00, for an abandoned push's run): `Store::forget` / `StoreHandle::forget` drops an unnamed changeset's `C`, `H`
-> and `K` rows and its `P` rows where they name its bytes, and moves each `T` and `I` row it owned to the next
+> and `K` rows. Forgetting or replacing a changeset removes its payload places. The `P` lookup moves to a surviving
+> copy even across repositories (2026-11-22, `forgetting_a_duplicate_payload_keeps_the_surviving_changesets_bytes`).
+> Checkpoints written before this fix rebuild payload places once from their live changesets. Each `T` and `I` row moves to the next
 > changeset that kept the same text (the new `K` keeper rows, by text), the engine checkpointed after so a replay
 > never puts them back (`a_forgotten_changesets_rows_go_and_a_text_another_kept_moves_to_it`,
 > `a_changeset_forgotten_through_the_owner_stays_forgotten_across_a_restart`); its log bytes stay this cleaner's.
