@@ -36,7 +36,7 @@ jobs:
         run: |
           cargo build -p slates-cli
           cargo test -p xtask --bin xtask --no-run
-      - name: xtask's conformance:: module, 20 runs, in the lane's order
+      - name: xtask's conformance module, 20 runs, in the lane's order
         run: |
           set +e
           export SLATES_TEST_BINARY="$GITHUB_WORKSPACE/target/debug/slates"
