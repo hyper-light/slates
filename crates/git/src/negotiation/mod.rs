@@ -820,8 +820,8 @@ pub fn ready<S: Graph>(
   }
 }
 
-/// [`ready`] asked a unit at a time (A-745 item 3: protocol v0's acknowledgments in turns): the wants and the common
-/// haves looked up as it begins (what the request names), then the search below each want a parent a unit.
+/// [`ready`](fn@ready) asked a unit at a time (A-745 item 3: protocol v0's acknowledgments in turns): the wants and the
+/// common haves looked up as it begins (what the request names), then the search below each want a parent a unit.
 pub struct Ready<N> {
   /// The wants.
   wants: Vec<N>,

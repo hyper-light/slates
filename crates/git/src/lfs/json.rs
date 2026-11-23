@@ -1,4 +1,4 @@
-//! The JSON that Git LFS's APIs speak, read within bounds and written compactly (A-610; RFC 8259 [B]).
+//! The JSON that Git LFS's APIs speak, read within bounds and written compactly (A-610; RFC 8259 \[B\]).
 //!
 //! **Reading is two steps.** [`validate`] checks that the input is one JSON value and nothing else: the grammar of
 //! RFC 8259 §2 to §7, strings in UTF-8 (§8.1) with every escape well formed and every UTF-16 surrogate paired (§7), and

@@ -40,7 +40,7 @@ const SYMREFS: &[u8] = b"symrefs";
 /// Format: the argument asking for `HEAD` when it names an unborn branch [gitprotocol-v2 "ls-refs"].
 const UNBORN: &[u8] = b"unborn";
 
-/// Format: the argument naming a prefix, and the space after its word [gitprotocol-v2: `ref-prefix <prefix>`].
+/// Format: the argument naming a prefix, and the space after its word \[gitprotocol-v2: `ref-prefix <prefix>`\].
 const REF_PREFIX: &[u8] = b"ref-prefix ";
 
 /// Format: the word an answer line holds in place of an id for an unborn ref [gitprotocol-v2: `obj-id-or-unborn`].
