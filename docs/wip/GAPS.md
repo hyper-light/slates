@@ -682,8 +682,9 @@
 >   then put back within its lent room), counted `vcs.hg.landed_texts_brought_back`. Held by
 >   `a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and_node` (49 of 120 let go, each back
 >   whole, counted once). Part 2 BUILT (w-hg, over w-shared's fc42f581c and 7663054bb): once a push's entry commits
->   (`hg_run::Run::settle`) or an import lands, each file revision's windows are noted with its (repository, path,
->   node) on the shard (`homes::note_landed`, `Landed::Hg`; `slates_hg::filerev::FileContents` carries them in each
+>   (`hg_run::Run::settle`) or an import lands, each file revision's windows a home holds (held for the region,
+>   `landed_pin`; since w-shared's 1ecb57cf4 no other, so a history notes about none, the two let-go tests asserting no
+>   note) are noted with its (repository, path, node) on the shard (`homes::note_landed`, `Landed::Hg`; `slates_hg::filerev::FileContents` carries them in each
 >   segment, counted in the intake's bound) and let go, pinned by nothing; a window noted already keeps its note.
 >   The let-go at segment durability notes nothing, since `bring_back` reads the committed index, so a home's window
 >   stays pinned until the commit. `homes::bring_back_landed` brings an object's hg-noted windows back by
