@@ -390,3 +390,14 @@ Order of work: arena-3 read -> 2 (slack, the largest lever after 2b(b)) and 3 (a
 Flake (main's 22:00): a_cleanly_restarted_import_brings_back_no_named_text. checkpoint_green defers to a
 checkpoint_in_turns task under load and the test stops first, so the pre-pass rightly brings back 13. A test/doc fix;
 sent to main and w-svn.
+
+## 2026-11-22 ~23:30 PST (w-hg, main's URGENT on arena-3 run 45110563116)
+- Landed c01aac8f8 (merge 18983677e): the commit-time noting and let-go is taken a turn at a time
+  (hg_run::let_go_committed, half the step quantum, a revision its unit). Push: after its entry commits. Import: after
+  its landing is durable. Red: 1 turn of 642,500 ns, now 120. Caveat: one revision (40-63 us debug) exceeds the 6 us
+  quantum, so a turn is half the quantum plus one revision.
+- Landed 29561c25e: store keeper_key by checked splits; EntriesOf alias (lint wall at dc549ba48).
+- Open (sent to main and w-shared): the restart spin (serve_loop poll 2, 1,040 ms). Lead: vcs_home_pieces and
+  restore_landed are O(notes) in one call.
+- Next: the memory plan when arena-4 lands (w-shared's terms: the push peak is the rendezvous pin until commit, and
+  ~1.3 GB stored after the push is unexplained).
