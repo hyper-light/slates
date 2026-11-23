@@ -8136,6 +8136,135 @@ mod tests {
     assert!(read == Some(bytes), "the pack read whole after the restart");
   }
 
+  /// Goal 93 item 2b(b), Mercurial's half of the seam (w-hg's note of 2026-11-22, main 01a20182's ruling of 18:43: an hg
+  /// window let go is brought back by its repository, path and node, never by its identity alone, so the shard keeps
+  /// that for each, and it rides the image as a pack's record does). Do: on a store-backed daemon, put a file revision's
+  /// text of several windows in the shard's content store; note each window's revision (`homes::note_landed`,
+  /// `Landed::Hg`), as hg's let-go will, and let each go landed under its pin; publish the shard's image; stop the daemon
+  /// and start its successor over the same segment. Expect: no window pinned once noted, every one let go; after the
+  /// restart, each note taken back as it was (its repository, path and node), still no window pinned, each still let go.
+  /// Failing first: a restore that dropped the notes left the windows let go with nothing to find their revision by.
+  #[test]
+  fn t_goal93_an_hg_windows_revision_is_kept_across_a_restart_and_unpins_it() {
+    use slates_anchor::AnchorSegment;
+    let store = crate::test_store::TestStore::start("landed-hg");
+    let profile = test_profile();
+    let instance = format!("landed-hg-{}", std::process::id());
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    config.vcs_disk = Some(store.handle());
+    let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
+      .unwrap()
+      .with_content(&super::content_name_of(&instance), config.content_bytes())
+      .unwrap();
+    let rendezvous = slates_ipc::HeldRendezvous::hold(&instance).unwrap();
+    let source = || {
+      let (handoff, len) = segment.handoff().unwrap();
+      super::SegmentSource::Handoff {
+        handoff,
+        len,
+        content: segment.content_handoff().unwrap(),
+        rendezvous: rendezvous.adoption(),
+      }
+    };
+    let key = crate::vcs_store::homes::HgLanded {
+      repository: slates_db::catalog::RepositoryId { bytes: [7; 16] },
+      path: b"src/a file.txt".to_vec(),
+      node: [9; 20],
+    };
+    let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
+    first.bootstrap(true).unwrap();
+    let shard = first.shards.first().copied();
+    let noted = key.clone();
+    let (windows, before) = first
+      .observe(shard, move |state| {
+        let window = state.store.content.chunk_bytes();
+        state.vcs_stores.content_made(window).unwrap();
+        let window = state
+          .vcs_stores
+          .content()
+          .map_or(1 << 18, slates_vcs::ContentStore::window);
+        let text: Vec<u8> = (0..2 * window + 9)
+          .map(|at| u8::try_from(at % 239).unwrap())
+          .collect();
+        let len = u64::try_from(text.len()).unwrap();
+        let here = state.shard;
+        let identity = crate::vcs_store::within_budget(state, len, |stores| {
+          stores.content_mut().unwrap().put_object(&text).unwrap()
+        });
+        let windows: Vec<slates_vcs::ContentId> = state
+          .vcs_stores
+          .content()
+          .unwrap()
+          .object_layout(&identity)
+          .into_iter()
+          .map(|(window, _)| window)
+          .collect();
+        for window in &windows {
+          crate::vcs_store::homes::note_landed(
+            *window,
+            crate::vcs_store::homes::Landed::Hg(noted.clone()),
+          );
+        }
+        let let_go: Vec<Result<u64, slates_vcs::LetGoRefused>> =
+          crate::vcs_store::within_budget(state, 0, |stores| {
+            let content = stores.content_mut().unwrap();
+            windows
+              .iter()
+              .map(|window| {
+                content.mark_landed(window);
+                content.let_go_landed(window, crate::vcs_store::landed_pin(here, &[here], window))
+              })
+              .collect()
+          });
+        crate::verbs::publish_shard(state).unwrap();
+        (windows, let_go)
+      })
+      .unwrap();
+    first.stop();
+    let second = super::Daemon::start(&profile, config, source()).unwrap();
+    let shard = second.shards.first().copied();
+    let read_windows = windows.clone();
+    let after = second
+      .observe(shard, move |state| {
+        let window = state.store.content.chunk_bytes();
+        state.vcs_stores.content_made(window).unwrap();
+        let here = state.shard;
+        let restored: Vec<Option<crate::vcs_store::homes::Landed>> = read_windows
+          .iter()
+          .map(crate::vcs_store::homes::landed)
+          .collect();
+        let pinned = read_windows
+          .iter()
+          .filter(|window| crate::vcs_store::landed_pin(here, &[here], window).is_some())
+          .count();
+        let away = state.vcs_stores.content().map_or(0, |content| {
+          read_windows
+            .iter()
+            .filter(|window| content.is_away(window))
+            .count()
+        });
+        (restored, pinned, away)
+      })
+      .unwrap();
+    second.stop();
+    assert!(windows.len() > 1, "a text of several windows");
+    assert!(
+      before.iter().all(Result::is_ok),
+      "every noted window let go, none pinned: {before:?}"
+    );
+    let (restored, pinned, away) = after;
+    let expected: Vec<Option<crate::vcs_store::homes::Landed>> = windows
+      .iter()
+      .map(|_| Some(crate::vcs_store::homes::Landed::Hg(key.clone())))
+      .collect();
+    assert_eq!(
+      restored, expected,
+      "each window's revision taken back as it was"
+    );
+    assert_eq!(pinned, 0, "no noted window pinned after the restart");
+    assert_eq!(away, windows.len(), "each still let go");
+  }
+
   /// A-767 C5 (git onto the changeset store; main's order of 2026-11-20 ~21:20: "red first: a stock git push lands as
   /// one changeset, and a daemon restarted with kill -9 replays it"). Do: on a daemon over a retained anchor segment
   /// holding a store (the one shared test store), create a git repository and push the fixtures' `create` as stock git
