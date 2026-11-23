@@ -434,3 +434,13 @@ crates/hg/tests/push_heap.rs (LargeMapped plus an arena storage like the daemon'
 Gotchas for the next person: heap() allocates a residency buffer for every mapped block; HeapWindows puts windows on the
 system heap, the daemon's arena does not.
 Next: the x86 348 ms single step (wrote=43); branchmap whole 155 ms cpu (x86) later.
+
+## 2026-11-23 ~07:30 PST (w-hg)
+- The x86 348 ms step (wrote=43) was a `lookup` of a branch name: branch_tip scanned every revision's branch, then
+  branch_head_revs walked the whole history (= branchmap whole, 155-161 ms on x86).
+- Landed fa14530ba (main's ruling (b)): HgIndex keeps branch heads (index::BranchHeads), updated in
+  append_changesets. Views serving the whole changelog answer from them; others walk (walked_branch_head_revs is the
+  oracle). Tests: proptest oracle over grouped appends; lookup and branchmap on a long line read ≤ 8 (red: 512/511).
+- Open: views with left-out changesets still walk; a cross-branch merge's uncertain walk is bounded only by the
+  branch's lowest head.
+Waiting: arena-6 (churn) and arena-7 (lookup/branchmap times) from main.
