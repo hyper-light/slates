@@ -500,6 +500,9 @@ pub struct Lineage {
   out: Option<LineageGreen>,
   /// Keys every branch set back.
   reverted: u64,
+  /// The engine of the member a [`Lent`] has out (`out`), held here while the guard reads it; an empty engine
+  /// otherwise.
+  lent: Green,
 }
 
 /// A retired green's holds on its lineage's nodes, given back a node a step ([`Lineage::release_step`]), so a release
@@ -525,18 +528,16 @@ impl Release {
 pub struct Lent<L: DerefMut<Target = Lineage>> {
   lineage: L,
   handle: LineageGreen,
-  green: Green,
 }
 
 impl<L: DerefMut<Target = Lineage>> Lent<L> {
   /// `handle`'s engine, lent out of `lineage`.
   pub fn new(mut lineage: L, handle: LineageGreen) -> Result<Lent<L>, LineageRefused> {
-    let green = lineage.take(handle)?;
-    Ok(Lent {
-      lineage,
-      handle,
-      green,
-    })
+    // The member's engine moves into the lineage's slot for the one member out, where the guard reads it: the guard is
+    // the lineage and a handle, nothing boxed or made for it (goal 93: a boxed guard and a default engine a lend were
+    // the push's 86% of churn, `hg_push_heap`).
+    lineage.lent = lineage.take(handle)?;
+    Ok(Lent { lineage, handle })
   }
 }
 
@@ -544,19 +545,20 @@ impl<L: DerefMut<Target = Lineage>> Deref for Lent<L> {
   type Target = Green;
 
   fn deref(&self) -> &Green {
-    &self.green
+    &self.lineage.lent
   }
 }
 
 impl<L: DerefMut<Target = Lineage>> DerefMut for Lent<L> {
   fn deref_mut(&mut self) -> &mut Green {
-    &mut self.green
+    &mut self.lineage.lent
   }
 }
 
 impl<L: DerefMut<Target = Lineage>> Drop for Lent<L> {
   fn drop(&mut self) {
-    let green = std::mem::take(&mut self.green);
+    // An empty engine left in the slot allocates nothing (its set hash makes its lanes at its first change).
+    let green = std::mem::take(&mut self.lineage.lent);
     self.lineage.restore(self.handle, green);
   }
 }

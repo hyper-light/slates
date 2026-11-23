@@ -27,19 +27,24 @@ const LANE_BYTES: usize = size_of::<u16>();
 /// 3, `crate::checkpoint`).
 pub(crate) const SUM_BYTES: usize = LANES * LANE_BYTES;
 
-/// The running sum of a green's entry vectors.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The running sum of a green's entry vectors: its lanes made only at its first change, so an empty sum (a green's
+/// default, which every lend of a lineage's member makes once in its restore, `engine::branch::Lent`) allocates nothing
+/// (goal 93: 2 KiB a lend, the push's 46%, `hg_push_heap`). None reads as every lane zero.
+#[derive(Clone, Debug, Default)]
 pub(crate) struct SetHash {
-  lanes: Box<[u16; LANES]>,
+  lanes: Option<Box<[u16; LANES]>>,
 }
 
-impl Default for SetHash {
-  fn default() -> Self {
-    SetHash {
-      lanes: Box::new([0; LANES]),
-    }
+/// Every lane zero: what an empty sum reads as.
+static ZERO: [u16; LANES] = [0; LANES];
+
+impl PartialEq for SetHash {
+  fn eq(&self, other: &SetHash) -> bool {
+    self.lanes() == other.lanes()
   }
 }
+
+impl Eq for SetHash {}
 
 /// One entry being encoded: fed field by field, then expanded.
 pub(crate) struct Entry {
@@ -80,23 +85,33 @@ impl Entry {
 }
 
 impl SetHash {
+  /// The sum's lanes, every one zero for an empty sum.
+  fn lanes(&self) -> &[u16; LANES] {
+    self.lanes.as_deref().unwrap_or(&ZERO)
+  }
+
+  /// The sum's lanes to change, made at the first change.
+  fn lanes_mut(&mut self) -> &mut [u16; LANES] {
+    self.lanes.get_or_insert_with(|| Box::new([0; LANES]))
+  }
+
   /// Adds `entry` to the set.
   pub(crate) fn add(&mut self, entry: &Entry) {
-    for (sum, lane) in self.lanes.iter_mut().zip(entry.lanes().iter()) {
+    for (sum, lane) in self.lanes_mut().iter_mut().zip(entry.lanes().iter()) {
       *sum = sum.wrapping_add(*lane);
     }
   }
 
   /// Removes `entry` from the set (it must have been added).
   pub(crate) fn remove(&mut self, entry: &Entry) {
-    for (sum, lane) in self.lanes.iter_mut().zip(entry.lanes().iter()) {
+    for (sum, lane) in self.lanes_mut().iter_mut().zip(entry.lanes().iter()) {
       *sum = sum.wrapping_sub(*lane);
     }
   }
 
   /// Adds every entry of `other` to the set, lane by lane.
   pub(crate) fn add_sum(&mut self, other: &SetHash) {
-    for (sum, lane) in self.lanes.iter_mut().zip(other.lanes.iter()) {
+    for (sum, lane) in self.lanes_mut().iter_mut().zip(other.lanes().iter()) {
       *sum = sum.wrapping_add(*lane);
     }
   }
@@ -104,7 +119,7 @@ impl SetHash {
   /// The set with every entry of `other` taken out, lane by lane: what this set holds beyond it.
   pub(crate) fn less(&self, other: &SetHash) -> SetHash {
     let mut difference = self.clone();
-    for (sum, lane) in difference.lanes.iter_mut().zip(other.lanes.iter()) {
+    for (sum, lane) in difference.lanes_mut().iter_mut().zip(other.lanes().iter()) {
       *sum = sum.wrapping_sub(*lane);
     }
     difference
@@ -112,7 +127,7 @@ impl SetHash {
 
   /// Whether the set holds nothing: every lane zero.
   pub(crate) fn is_empty(&self) -> bool {
-    self.lanes.iter().all(|lane| *lane == 0)
+    self.lanes().iter().all(|lane| *lane == 0)
   }
 
   /// The sum's bytes, its lanes little-endian in order ([`SUM_BYTES`]).
@@ -122,7 +137,7 @@ impl SetHash {
       .as_chunks_mut::<LANE_BYTES>()
       .0
       .iter_mut()
-      .zip(self.lanes.iter())
+      .zip(self.lanes().iter())
     {
       *pair = lane.to_le_bytes();
     }
@@ -135,7 +150,7 @@ impl SetHash {
     for (lane, pair) in lanes.iter_mut().zip(bytes.as_chunks::<LANE_BYTES>().0) {
       *lane = u16::from_le_bytes(*pair);
     }
-    SetHash { lanes }
+    SetHash { lanes: Some(lanes) }
   }
 
   /// The 32-byte identity of the set.
@@ -145,7 +160,7 @@ impl SetHash {
       .as_chunks_mut::<LANE_BYTES>()
       .0
       .iter_mut()
-      .zip(self.lanes.iter())
+      .zip(self.lanes().iter())
     {
       *pair = lane.to_le_bytes();
     }
