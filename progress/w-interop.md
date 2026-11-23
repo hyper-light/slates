@@ -557,3 +557,9 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
 - READY for main (§8): diag-measurer-w-interop-tracer at c676b6e37 (unpushed): the tracer unit test 20x on ubuntu as
   the lane runs it. Then fix (2) from what the diagnostic names.
 - Seen, not mine: slates-api contract_history test red on main (versions 58/59 written "58 (A-795): ").
+- LANDED 414925522: svnsync over HTTP (a Label on the VCC names its baseline; replay-report at the session URL and
+  !svn/rev/REV through dav::report_replay::ReplayWalk). Reds named in GAPS.
+- LANDED 112e694e7 (2026-11-23): (B)'s one difference (the mirrors' UUID line) was the harness's. Stock svnsync never
+  sets a mirror UUID, so mirror_dump_of now sets MIRROR_UUID, as svn-matrix.sh does. The import and the HTTP edge were
+  checked and report the dump's UUID. Owed to main: rerun (B) svnsync over http, and the http-v1 revprops row.
+- Waiting: main's tracer CI diagnostic for fix (2).
