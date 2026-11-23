@@ -2097,7 +2097,7 @@ fn rebuilt(
   })?;
   room.charge(to_u64(base.len()))?;
   // Into `into`'s buffer, its capacity kept: `apply_into` clears it and reserves only what it lacks.
-  delta::apply_into(&base, revision.data, &mut into, room).map_err(|fault| Unverified::Delta {
+  delta::apply_into(base, revision.data, &mut into, room).map_err(|fault| Unverified::Delta {
     log: log_of(log),
     node: revision.node,
     fault,
