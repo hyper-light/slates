@@ -12,13 +12,21 @@
 //! daemon's death; the handoff table hands them back and [`install`] places them before any shard claims.
 //!
 //! **Made ahead of need, never on the provisioning path (condition (a)).** [`install`] makes every extent the layout
-//! names that the anchor did not hand back, before the shards serve, and each shard's start asks the anchor to hold its
-//! slice's ([`hold_slice`]). A claim takes only an extent that is made and held ([`ready`]), so data never lands in a
-//! section a daemon's death would lose; it duplicates the handle and maps it ([`section`]).
+//! names that the anchor did not hand back, before the shards serve, and the control shard, which holds the anchor's
+//! channel and answers every claim, has the anchor hold every one before it answers its first ([`hold_every_slice`]).
+//! A claim takes only an extent that is made and held ([`ready`]), so data never lands in a section a daemon's death
+//! would lose; it duplicates the handle and maps it ([`section`]). Until 2026-11-23 each shard's start spawned its
+//! slice's holds as a task of its own and served at once, so a create sent the moment a daemon served met its extents
+//! made but not yet held, one anchor exchange each, and was refused `BudgetExceeded` with the whole pool counted as
+//! room: every Node SDK suite's first create on CI's Windows runners, 2 of 25 extents held on windows-latest and 1 of
+//! 22 on windows-11-arm, where the holds took 117.5 ms and 141.9 ms (diag run 45238179939).
 //!
-//! **Given back whole.** A release closes this process's handle ([`take`]) and a task of the shard has the anchor let
-//! its duplicate go, which closes the section and returns its commit, then makes the extent again and has it held
-//! ([`remake`]). Until then the extent is not ready, and a claim passes it over.
+//! **Given back whole.** A release closes this process's handle and marks the extent being made again
+//! ([`take_for_remake`]), and a task of the shard has the anchor let its duplicate go, which closes the section and
+//! returns its commit, then makes the extent again and has it held ([`remake`]). Until then the extent is not ready: a
+//! claim passes it over, the pool counts it pending rather than free (`crate::content_pool`), and an admission whose
+//! room only such extents would make waits for their remakes, bounded by their exchanges ([`remake_bound_ns`]), and is
+//! woken as each ends (`crate::room_wait`).
 //!
 //! **One table a process, no lock.** A shard may claim another partition's extent, so the handles live in one table
 //! for the process: a word for each extent's handle value and a flag for whether the anchor holds it, each written only
@@ -40,11 +48,16 @@ const EXTENT_HOLD_MARK: u64 = 0xFFFE_0000_0000_0000;
 /// Format: a held extent's record: its id, two little-endian bytes.
 const RECORD_BYTES: usize = size_of::<u16>();
 
-/// One extent's slot: its section's handle value in this process (zero for none) and whether the anchor holds it.
+/// One extent's slot: its section's handle value in this process (zero for none), whether the anchor holds it, and
+/// whether it is being made again after a release ([`take_for_remake`] to the end of [`remake`]).
 struct Slot {
   handle: AtomicU64,
   held: AtomicBool,
+  remaking: AtomicBool,
 }
+
+/// Shape: a remake's exchanges with the anchor: the release of the old section's duplicate, then the hold of the new.
+const REMAKE_EXCHANGES: u64 = 2;
 
 /// The process's extents, one slot per id the layout can name ([`install`]).
 static SLOTS: OnceLock<Box<[Slot]>> = OnceLock::new();
@@ -98,6 +111,7 @@ pub(crate) fn install(config: &DaemonConfig, handed: Vec<HandedExtent>) {
     .map(|_| Slot {
       handle: AtomicU64::new(0),
       held: AtomicBool::new(false),
+      remaking: AtomicBool::new(false),
     })
     .collect();
   for extent in handed {
@@ -108,8 +122,7 @@ pub(crate) fn install(config: &DaemonConfig, handed: Vec<HandedExtent>) {
           .store(value_of(extent.section), Ordering::Release);
         slot.held.store(true, Ordering::Release);
       }
-      // An id the layout has no slot for, or one handed twice: its section closes here, and the anchor's duplicate goes
-      // when the slice's holds are made again (`hold_slice` releases before it holds).
+      // An id the layout has no slot for, or one handed twice: its section closes here.
       _ => drop(extent.section),
     }
   }
@@ -155,22 +168,6 @@ pub(crate) fn install_if_anchored(
   }
 }
 
-/// Has the anchor hold `partition`'s slice of extents ([`hold_slice`]) as a task of the calling shard, once the table is
-/// installed. A task the runtime refuses leaves the slice's extents unready, said in the log.
-pub(crate) fn spawn_slice_holds(config: &DaemonConfig, partition: u16) {
-  if !installed() {
-    return;
-  }
-  if slates_rt::futures::spawn(hold_slice(config.clone(), partition))
-    .and_then(slates_rt::futures::detach)
-    .is_err()
-  {
-    slates_machine::log_line!(
-      "slates-server: shard {partition}: the content extents' hold task was refused; its extents stay unready"
-    );
-  }
-}
-
 /// Whether extent `id` may be claimed: made, and held by the anchor.
 pub(crate) fn ready(id: u16) -> bool {
   SLOTS
@@ -199,32 +196,104 @@ pub(crate) fn section(id: u16) -> Option<OwnedHandle> {
   borrowed.try_clone_to_owned().ok()
 }
 
-/// Takes extent `id`'s section out of the table, unready: the caller closes it (a release gives its commit back once
-/// the anchor's duplicate goes too).
-pub(crate) fn take(id: u16) -> Option<OwnedHandle> {
+/// Takes extent `id`'s section out of the table for its remake ([`remake`]), unready and marked being made again: the
+/// caller closes it (a release gives its commit back once the anchor's duplicate goes too) and starts the remake, or
+/// says it could not ([`end_remake`]).
+pub(crate) fn take_for_remake(id: u16) -> Option<OwnedHandle> {
   let slot = SLOTS.get()?.get(usize::from(id))?;
   slot.held.store(false, Ordering::Release);
+  slot.remaking.store(true, Ordering::Release);
   let value = slot.handle.swap(0, Ordering::AcqRel);
   owned(value)
 }
 
-/// Has the anchor hold every made, unheld extent of `partition`'s slice: a task of the shard's, at its start.
-pub(crate) async fn hold_slice(config: DaemonConfig, partition: u16) {
-  let first = usize::from(partition).saturating_mul(POOL_EXTENTS_PER_PARTITION);
-  for index in first..first.saturating_add(POOL_EXTENTS_PER_PARTITION) {
+/// Extent `id` is no longer being made again: its remake ended, ready unless the OS or the anchor refused it, or could
+/// not start (the shard's task arena refused it), when it stays unready until a release makes it.
+pub(crate) fn end_remake(id: u16) {
+  if let Some(slot) = SLOTS.get().and_then(|slots| slots.get(usize::from(id))) {
+    slot.remaking.store(false, Ordering::Release);
+  }
+}
+
+/// Whether extent `id` is being made again after a release: unready now, ready once its remake ends unless the OS or
+/// the anchor refuses it.
+pub(crate) fn remaking(id: u16) -> bool {
+  SLOTS
+    .get()
+    .and_then(|slots| slots.get(usize::from(id)))
+    .is_some_and(|slot| slot.remaking.load(Ordering::Acquire))
+}
+
+/// The extents being made again now, over the whole process.
+pub(crate) fn remakes_in_flight() -> usize {
+  SLOTS.get().map_or(0, |slots| {
+    slots
+      .iter()
+      .filter(|slot| slot.remaking.load(Ordering::Acquire))
+      .count()
+  })
+}
+
+/// Derived: the longest one remake may take, nanoseconds: its [`REMAKE_EXCHANGES`] exchanges with the anchor, each given
+/// up at the answer bound the hold channel has learned (`crate::anchor_hold::answer_bound_ns`, A-552).
+pub(crate) fn remake_bound_ns() -> u64 {
+  crate::anchor_hold::answer_bound_ns().saturating_mul(REMAKE_EXCHANGES)
+}
+
+/// [`hold_every_slice`] once the extents are sections of their own ([`installed`]: the daemon runs under an anchor that
+/// holds handles, its channel installed on the control shard, whose control loop calls this before it answers a claim);
+/// nothing for a daemon no anchor holds handles for.
+pub(crate) async fn hold_before_serving(config: &DaemonConfig) {
+  if installed() {
+    hold_every_slice(config).await;
+  }
+}
+
+/// Has the anchor hold every made, unheld extent the layout names, every partition's: run by the control shard, which
+/// holds the anchor's channel, once that channel is installed and before it answers its first claim, so no admission
+/// meets an extent made but not yet held. One exchange an extent, each within the learned answer bound (A-552); a
+/// refusal is counted ([`EXTENT_REFUSED`]) and its extent stays unready. Logged once: how many the anchor holds of those
+/// made, and how long the holds took.
+pub(crate) async fn hold_every_slice(config: &DaemonConfig) {
+  let begun = slates_machine::clock::monotonic_ns();
+  for index in 0..config.held_extent_bound() {
     let Ok(id) = u16::try_from(index) else {
       continue;
     };
-    if extent_len(&config, id).is_none() {
+    if extent_len(config, id).is_none() {
       continue;
     }
     hold(id).await;
   }
+  let took =
+    std::time::Duration::from_nanos(slates_machine::clock::monotonic_ns().saturating_sub(begun));
+  let (made, held) = SLOTS.get().map_or((0, 0), |slots| {
+    let made = slots
+      .iter()
+      .filter(|slot| slot.handle.load(Ordering::Acquire) != 0)
+      .count();
+    let held = slots
+      .iter()
+      .filter(|slot| slot.held.load(Ordering::Acquire))
+      .count();
+    (made, held)
+  });
+  slates_machine::log_line!(
+    "slates-server: the anchor holds {held} of the {made} content extents made, held in {took:?}, before the control shard answers a claim"
+  );
 }
 
 /// Lets the anchor's duplicate of released extent `id` go, which closes its section and returns its commit, then makes
-/// the extent again, `len` bytes, and has the anchor hold it: a task of the releasing shard's.
+/// the extent again, `len` bytes, and has the anchor hold it: a task of the releasing shard's. However it ends, the
+/// extent is no longer being made again, and every admission waiting for room looks again (`crate::room_wait`).
 pub(crate) async fn remake(id: u16, len: usize) {
+  made_again(id, len).await;
+  end_remake(id);
+  crate::room_wait::remade();
+}
+
+/// [`remake`]'s exchanges and the new section.
+async fn made_again(id: u16, len: usize) {
   if crate::anchor_hold::release_extent(hold_id(id))
     .await
     .is_err()

@@ -1,0 +1,875 @@
+diff --git a/crates/mem/src/arena.rs b/crates/mem/src/arena.rs
+index 8f8f84ef7..9643dde2d 100644
+--- a/crates/mem/src/arena.rs
++++ b/crates/mem/src/arena.rs
+@@ -124,6 +124,13 @@ pub trait ExtentSource: Send {
+   /// share cap): a source shared with other arenas tells them, so one holding more than its demand gives back. A
+   /// source with no other arena has no one to tell.
+   fn want(&mut self, _bytes: usize) {}
++  /// The bytes of free extents this source cannot hand out yet but will once work already under way ends: an extent
++  /// given back and being made again (A-789, Windows: its section closed so its commit returns, then made and held
++  /// again by the anchor). Not in [`ExtentSource::available`]; an admission short of room that these would cover
++  /// waits for them rather than being refused. A source whose extents are always ready has none.
++  fn pending(&self) -> usize {
++    0
++  }
+ }
+ 
+ /// Who holds an arena's block (goal 93; main 01a20182's order of 2026-11-23 on arena-13: 373 MB of the content arena
+@@ -650,6 +657,12 @@ impl ChunkArena {
+     self.source.as_ref().map_or(0, |source| source.available())
+   }
+ 
++  /// The bytes its source will be able to hand out once the work under way on its extents ends
++  /// ([`ExtentSource::pending`]); zero without a source.
++  pub fn pending_claimable(&self) -> usize {
++    self.source.as_ref().map_or(0, |source| source.pending())
++  }
++
+   /// Opens or closes the source's pressure hold to this arena's growth ([`ExtentSource::open_hold`]); nothing without a
+   /// source.
+   pub fn open_hold(&mut self, open: bool) {
+diff --git a/crates/server/src/anchor_hold_windows.rs b/crates/server/src/anchor_hold_windows.rs
+index dded0c64f..bde748420 100644
+--- a/crates/server/src/anchor_hold_windows.rs
++++ b/crates/server/src/anchor_hold_windows.rs
+@@ -48,8 +48,8 @@ const UNPUBLISHED: u64 = 0;
+ 
+ /// The bound the next exchange waits for the anchor's answer within: the one the owner shard published last, or before
+ /// any, the estimator's own, a liveness window plus nothing measured (no exchange has backed it off, so the ceiling
+-/// does not bear on it).
+-fn answer_bound_ns() -> u64 {
++/// does not bear on it). An extent's remake is bounded by two of them (`crate::content_extents::remake_bound_ns`).
++pub(crate) fn answer_bound_ns() -> u64 {
+   match ANSWER_BOUND_NS.load(Ordering::Relaxed) {
+     UNPUBLISHED => crate::anchor_answers::AnchorAnswers::default().bound_ns(u64::MAX),
+     published => published,
+diff --git a/crates/server/src/content_extents_windows.rs b/crates/server/src/content_extents_windows.rs
+index fbc6b23ee..bd0015659 100644
+--- a/crates/server/src/content_extents_windows.rs
++++ b/crates/server/src/content_extents_windows.rs
+@@ -12,13 +12,21 @@
+ //! daemon's death; the handoff table hands them back and [`install`] places them before any shard claims.
+ //!
+ //! **Made ahead of need, never on the provisioning path (condition (a)).** [`install`] makes every extent the layout
+-//! names that the anchor did not hand back, before the shards serve, and each shard's start asks the anchor to hold its
+-//! slice's ([`hold_slice`]). A claim takes only an extent that is made and held ([`ready`]), so data never lands in a
+-//! section a daemon's death would lose; it duplicates the handle and maps it ([`section`]).
++//! names that the anchor did not hand back, before the shards serve, and the control shard, which holds the anchor's
++//! channel and answers every claim, has the anchor hold every one before it answers its first ([`hold_every_slice`]).
++//! A claim takes only an extent that is made and held ([`ready`]), so data never lands in a section a daemon's death
++//! would lose; it duplicates the handle and maps it ([`section`]). Until 2026-11-23 each shard's start spawned its
++//! slice's holds as a task of its own and served at once, so a create sent the moment a daemon served met its extents
++//! made but not yet held, one anchor exchange each, and was refused `BudgetExceeded` with the whole pool counted as
++//! room: every Node SDK suite's first create on CI's Windows runners, 2 of 25 extents held on windows-latest and 1 of
++//! 22 on windows-11-arm, where the holds took 117.5 ms and 141.9 ms (diag run 45238179939).
+ //!
+-//! **Given back whole.** A release closes this process's handle ([`take`]) and a task of the shard has the anchor let
+-//! its duplicate go, which closes the section and returns its commit, then makes the extent again and has it held
+-//! ([`remake`]). Until then the extent is not ready, and a claim passes it over.
++//! **Given back whole.** A release closes this process's handle and marks the extent being made again
++//! ([`take_for_remake`]), and a task of the shard has the anchor let its duplicate go, which closes the section and
++//! returns its commit, then makes the extent again and has it held ([`remake`]). Until then the extent is not ready: a
++//! claim passes it over, the pool counts it pending rather than free (`crate::content_pool`), and an admission whose
++//! room only such extents would make waits for their remakes, bounded by their exchanges ([`remake_bound_ns`]), and is
++//! woken as each ends (`crate::room_wait`).
+ //!
+ //! **One table a process, no lock.** A shard may claim another partition's extent, so the handles live in one table
+ //! for the process: a word for each extent's handle value and a flag for whether the anchor holds it, each written only
+@@ -40,12 +48,17 @@ const EXTENT_HOLD_MARK: u64 = 0xFFFE_0000_0000_0000;
+ /// Format: a held extent's record: its id, two little-endian bytes.
+ const RECORD_BYTES: usize = size_of::<u16>();
+ 
+-/// One extent's slot: its section's handle value in this process (zero for none) and whether the anchor holds it.
++/// One extent's slot: its section's handle value in this process (zero for none), whether the anchor holds it, and
++/// whether it is being made again after a release ([`take_for_remake`] to the end of [`remake`]).
+ struct Slot {
+   handle: AtomicU64,
+   held: AtomicBool,
++  remaking: AtomicBool,
+ }
+ 
++/// Shape: a remake's exchanges with the anchor: the release of the old section's duplicate, then the hold of the new.
++const REMAKE_EXCHANGES: u64 = 2;
++
+ /// The process's extents, one slot per id the layout can name ([`install`]).
+ static SLOTS: OnceLock<Box<[Slot]>> = OnceLock::new();
+ 
+@@ -98,6 +111,7 @@ pub(crate) fn install(config: &DaemonConfig, handed: Vec<HandedExtent>) {
+     .map(|_| Slot {
+       handle: AtomicU64::new(0),
+       held: AtomicBool::new(false),
++      remaking: AtomicBool::new(false),
+     })
+     .collect();
+   for extent in handed {
+@@ -108,8 +122,7 @@ pub(crate) fn install(config: &DaemonConfig, handed: Vec<HandedExtent>) {
+           .store(value_of(extent.section), Ordering::Release);
+         slot.held.store(true, Ordering::Release);
+       }
+-      // An id the layout has no slot for, or one handed twice: its section closes here, and the anchor's duplicate goes
+-      // when the slice's holds are made again (`hold_slice` releases before it holds).
++      // An id the layout has no slot for, or one handed twice: its section closes here.
+       _ => drop(extent.section),
+     }
+   }
+@@ -155,22 +168,6 @@ pub(crate) fn install_if_anchored(
+   }
+ }
+ 
+-/// Has the anchor hold `partition`'s slice of extents ([`hold_slice`]) as a task of the calling shard, once the table is
+-/// installed. A task the runtime refuses leaves the slice's extents unready, said in the log.
+-pub(crate) fn spawn_slice_holds(config: &DaemonConfig, partition: u16) {
+-  if !installed() {
+-    return;
+-  }
+-  if slates_rt::futures::spawn(hold_slice(config.clone(), partition))
+-    .and_then(slates_rt::futures::detach)
+-    .is_err()
+-  {
+-    slates_machine::log_line!(
+-      "slates-server: shard {partition}: the content extents' hold task was refused; its extents stay unready"
+-    );
+-  }
+-}
+-
+ /// Whether extent `id` may be claimed: made, and held by the anchor.
+ pub(crate) fn ready(id: u16) -> bool {
+   SLOTS
+@@ -199,32 +196,104 @@ pub(crate) fn section(id: u16) -> Option<OwnedHandle> {
+   borrowed.try_clone_to_owned().ok()
+ }
+ 
+-/// Takes extent `id`'s section out of the table, unready: the caller closes it (a release gives its commit back once
+-/// the anchor's duplicate goes too).
+-pub(crate) fn take(id: u16) -> Option<OwnedHandle> {
++/// Takes extent `id`'s section out of the table for its remake ([`remake`]), unready and marked being made again: the
++/// caller closes it (a release gives its commit back once the anchor's duplicate goes too) and starts the remake, or
++/// says it could not ([`end_remake`]).
++pub(crate) fn take_for_remake(id: u16) -> Option<OwnedHandle> {
+   let slot = SLOTS.get()?.get(usize::from(id))?;
+   slot.held.store(false, Ordering::Release);
++  slot.remaking.store(true, Ordering::Release);
+   let value = slot.handle.swap(0, Ordering::AcqRel);
+   owned(value)
+ }
+ 
+-/// Has the anchor hold every made, unheld extent of `partition`'s slice: a task of the shard's, at its start.
+-pub(crate) async fn hold_slice(config: DaemonConfig, partition: u16) {
+-  let first = usize::from(partition).saturating_mul(POOL_EXTENTS_PER_PARTITION);
+-  for index in first..first.saturating_add(POOL_EXTENTS_PER_PARTITION) {
++/// Extent `id` is no longer being made again: its remake ended, ready unless the OS or the anchor refused it, or could
++/// not start (the shard's task arena refused it), when it stays unready until a release makes it.
++pub(crate) fn end_remake(id: u16) {
++  if let Some(slot) = SLOTS.get().and_then(|slots| slots.get(usize::from(id))) {
++    slot.remaking.store(false, Ordering::Release);
++  }
++}
++
++/// Whether extent `id` is being made again after a release: unready now, ready once its remake ends unless the OS or
++/// the anchor refuses it.
++pub(crate) fn remaking(id: u16) -> bool {
++  SLOTS
++    .get()
++    .and_then(|slots| slots.get(usize::from(id)))
++    .is_some_and(|slot| slot.remaking.load(Ordering::Acquire))
++}
++
++/// The extents being made again now, over the whole process.
++pub(crate) fn remakes_in_flight() -> usize {
++  SLOTS.get().map_or(0, |slots| {
++    slots
++      .iter()
++      .filter(|slot| slot.remaking.load(Ordering::Acquire))
++      .count()
++  })
++}
++
++/// Derived: the longest one remake may take, nanoseconds: its [`REMAKE_EXCHANGES`] exchanges with the anchor, each given
++/// up at the answer bound the hold channel has learned (`crate::anchor_hold::answer_bound_ns`, A-552).
++pub(crate) fn remake_bound_ns() -> u64 {
++  crate::anchor_hold::answer_bound_ns().saturating_mul(REMAKE_EXCHANGES)
++}
++
++/// [`hold_every_slice`] once the extents are sections of their own ([`installed`]: the daemon runs under an anchor that
++/// holds handles, its channel installed on the control shard, whose control loop calls this before it answers a claim);
++/// nothing for a daemon no anchor holds handles for.
++pub(crate) async fn hold_before_serving(config: &DaemonConfig) {
++  if installed() {
++    hold_every_slice(config).await;
++  }
++}
++
++/// Has the anchor hold every made, unheld extent the layout names, every partition's: run by the control shard, which
++/// holds the anchor's channel, once that channel is installed and before it answers its first claim, so no admission
++/// meets an extent made but not yet held. One exchange an extent, each within the learned answer bound (A-552); a
++/// refusal is counted ([`EXTENT_REFUSED`]) and its extent stays unready. Logged once: how many the anchor holds of those
++/// made, and how long the holds took.
++pub(crate) async fn hold_every_slice(config: &DaemonConfig) {
++  let begun = slates_machine::clock::monotonic_ns();
++  for index in 0..config.held_extent_bound() {
+     let Ok(id) = u16::try_from(index) else {
+       continue;
+     };
+-    if extent_len(&config, id).is_none() {
++    if extent_len(config, id).is_none() {
+       continue;
+     }
+     hold(id).await;
+   }
++  let took =
++    std::time::Duration::from_nanos(slates_machine::clock::monotonic_ns().saturating_sub(begun));
++  let (made, held) = SLOTS.get().map_or((0, 0), |slots| {
++    let made = slots
++      .iter()
++      .filter(|slot| slot.handle.load(Ordering::Acquire) != 0)
++      .count();
++    let held = slots
++      .iter()
++      .filter(|slot| slot.held.load(Ordering::Acquire))
++      .count();
++    (made, held)
++  });
++  slates_machine::log_line!(
++    "slates-server: the anchor holds {held} of the {made} content extents made, held in {took:?}, before the control shard answers a claim"
++  );
+ }
+ 
+ /// Lets the anchor's duplicate of released extent `id` go, which closes its section and returns its commit, then makes
+-/// the extent again, `len` bytes, and has the anchor hold it: a task of the releasing shard's.
++/// the extent again, `len` bytes, and has the anchor hold it: a task of the releasing shard's. However it ends, the
++/// extent is no longer being made again, and every admission waiting for room looks again (`crate::room_wait`).
+ pub(crate) async fn remake(id: u16, len: usize) {
++  made_again(id, len).await;
++  end_remake(id);
++  crate::room_wait::remade();
++}
++
++/// [`remake`]'s exchanges and the new section.
++async fn made_again(id: u16, len: usize) {
+   if crate::anchor_hold::release_extent(hold_id(id))
+     .await
+     .is_err()
+diff --git a/crates/server/src/content_pool.rs b/crates/server/src/content_pool.rs
+index 815129063..95a9a31bf 100644
+--- a/crates/server/src/content_pool.rs
++++ b/crates/server/src/content_pool.rs
+@@ -402,8 +402,7 @@ impl ContentPool {
+     for (order, id) in self.candidates().enumerate() {
+       // An extent whose section is not made, or not yet held by the anchor, is passed over (A-789, Windows): data never
+       // lands where a daemon's death would lose it.
+-      #[cfg(windows)]
+-      if crate::content_extents::installed() && !crate::content_extents::ready(id) {
++      if !claimable_now(id) {
+         continue;
+       }
+       if !matches!(self.segment.pool_owner(usize::from(id)), Ok(None)) {
+@@ -459,6 +458,22 @@ impl ContentPool {
+   }
+ }
+ 
++/// Whether extent `id` may be claimed now: on Windows, where each extent is a section of its own (A-789), only once it
++/// is made and held by the anchor; elsewhere always, as is a Windows daemon's with no anchor holding its extents. What
++/// the pool counts as free room ([`ExtentSource::available`]) and what a claim takes agree on this, so a refusal never
++/// names room no claim could take: until 2026-11-23 the count took every free extent, and a create refused while the
++/// holds were under way named the whole pool as available (5,722,144,768 bytes, diag run 45238179939).
++#[cfg(windows)]
++fn claimable_now(id: u16) -> bool {
++  !crate::content_extents::installed() || crate::content_extents::ready(id)
++}
++
++/// [`claimable_now`] off Windows: an extent of the pool is always claimable once free.
++#[cfg(not(windows))]
++fn claimable_now(_id: u16) -> bool {
++  true
++}
++
+ impl ContentPool {
+   /// Gives a released extent's memory back to the system where it is an object of its own (macOS): its name removed,
+   /// so the object and every page in it go with the mapping just dropped, then made again, empty, for its next claim
+@@ -469,14 +484,16 @@ impl ContentPool {
+     // section and returns its commit, then makes the extent again and has it held. Until then the extent is not ready.
+     #[cfg(windows)]
+     if crate::content_extents::installed() {
+-      drop(crate::content_extents::take(id));
++      drop(crate::content_extents::take_for_remake(id));
+       let Some((_, (_, len))) = self.part(id) else {
++        crate::content_extents::end_remake(id);
+         return;
+       };
+       if slates_rt::futures::spawn(crate::content_extents::remake(id, len))
+         .and_then(slates_rt::futures::detach)
+         .is_err()
+       {
++        crate::content_extents::end_remake(id);
+         self.refused = self.refused.saturating_add(1);
+       }
+       return;
+@@ -564,6 +581,7 @@ impl ExtentSource for ContentPool {
+     let hold_open = self.hold_open;
+     self
+       .candidates()
++      .filter(|id| claimable_now(*id))
+       .filter(|id| match self.segment.pool_owner(usize::from(*id)) {
+         Ok(None) => true,
+         Ok(Some(POOL_HOLD_OWNER)) => hold_open,
+@@ -572,6 +590,16 @@ impl ExtentSource for ContentPool {
+       .filter_map(|id| self.part(id).map(|(_, (_, len))| len))
+       .sum()
+   }
++
++  #[cfg(windows)]
++  fn pending(&self) -> usize {
++    self
++      .candidates()
++      .filter(|id| crate::content_extents::remaking(*id))
++      .filter(|id| matches!(self.segment.pool_owner(usize::from(*id)), Ok(None)))
++      .filter_map(|id| self.part(id).map(|(_, (_, len))| len))
++      .sum()
++  }
+ }
+ 
+ /// Counter: wants this shard answered by giving back what its demand does not need (A-853): a publication, after which
+diff --git a/crates/server/src/lease_wait.rs b/crates/server/src/lease_wait.rs
+index f019799b4..afe453ff2 100644
+--- a/crates/server/src/lease_wait.rs
++++ b/crates/server/src/lease_wait.rs
+@@ -83,8 +83,9 @@ fn key(origin: u64, id: RequestId) -> (u64, u32, u32) {
+   (origin, id.client, id.sequence)
+ }
+ 
+-/// The most verbs a shard parks: its client credit (`clients_per_shard × slots`).
+-fn bound(state: &ShardState) -> usize {
++/// The most verbs a shard parks: its client credit (`clients_per_shard × slots`). `crate::room_wait` parks its creates
++/// under the same bound.
++pub(crate) fn bound(state: &ShardState) -> usize {
+   state
+     .config
+     .clients_per_shard
+diff --git a/crates/server/src/lib.rs b/crates/server/src/lib.rs
+index 5f7d914d1..a4e936e29 100644
+--- a/crates/server/src/lib.rs
++++ b/crates/server/src/lib.rs
+@@ -120,6 +120,8 @@ mod moves;
+ mod readmission;
+ mod refining;
+ mod remote_attach;
++// Creates parked for the room an extent's remake owes them (A-789, Windows).
++mod room_wait;
+ mod work_home;
+ // The writes acknowledged since the last publication, kept in anchor RAM (A-63): a FUSE mount's (Linux) and a Shards
+ // stream's (every platform; A-316, A-339, A-402).
+diff --git a/crates/server/src/room_wait.rs b/crates/server/src/room_wait.rs
+new file mode 100644
+index 000000000..092a7dac5
+--- /dev/null
++++ b/crates/server/src/room_wait.rs
+@@ -0,0 +1,349 @@
++//! Admissions wait for the room an extent's remake owes them (A-789, Windows; main 01a20182's ruling of 2026-11-23).
++//! A released extent's section is closed, so that its commit returns, then made again and held by the anchor
++//! (`crate::content_extents::remake`): two anchor exchanges, while the extent is free but no claim can take it, and the
++//! pool counts it pending rather than free (`crate::content_pool`). A create whose room only such extents would make is
++//! **parked**, not refused: it runs again as each remake ends, and is refused with the room there is only once the
++//! bound of the remakes in flight when it parked has passed and it still does not fit. A create that would not fit even
++//! once every remake in flight ends is refused at once ([`verdict`]).
++//!
++//! **Why wait.** A destroy publishes, and a committed publication gives its volume's wholly free extents back to the
++//! pool (A-98), so their remakes begin before the destroy answers. A create sent the moment it answered met them
++//! unready and was refused `BudgetExceeded`, though its room was a remake away. The daemon holds the wait, not each
++//! client: it learns the moment a remake ends, and its client sees one answer.
++//!
++//! **The bound.** One remake takes at most its two exchanges, each given up at the hold channel's learned answer bound
++//! (`crate::content_extents::remake_bound_ns`, A-552), and the remakes in flight take turns on that one channel; so a
++//! parked create waits at most that bound once for each remake in flight when it parked, the deadline it keeps however
++//! often it runs again.
++//!
++//! **What holds.** As `crate::lease_wait` holds a parked verb: nothing of it runs and nothing is recorded until it is
++//! resolved; it carries its completion key, principal and body, and runs through `verbs::dispatch` under its key
++//! (`crate::lease_wait::run_resumed`). A retry of a parked request joins it ([`join`]). The list is bounded by the
++//! shard's client credit (`crate::lease_wait::bound`); a create past it is refused at once, counted. A remake that ends
++//! on one shard tells every other shard while any admission waits anywhere ([`remade`]).
++
++use std::collections::BTreeSet;
++use std::sync::atomic::{AtomicUsize, Ordering};
++
++use slates_db::catalog::Principal;
++use slates_ipc::protocol::{RequestBody, SizeClass};
++use slates_wire::request::RequestId;
++
++use crate::merge_service::ReplyRoute;
++use crate::state::{self, ShardState};
++
++/// The status refusal count of a create parked for the room a remake owes it (the non-vacuity count of the wait).
++const PARKED: &str = "room.wait.parked";
++/// The status refusal count of a parked create run again because a remake ended or its deadline passed.
++const RESUMED: &str = "room.wait.resumed";
++/// The status refusal count of a create refused at its deadline, the remakes it waited for over and its room short.
++const EXPIRED: &str = "room.wait.expired";
++/// The status refusal count of a create refused at once because the waiter list was full.
++const FULL: &str = "room.wait.full";
++/// The status refusal count of a deadline timer the shard's arena refused (waiters are still run at the next remake's
++/// end).
++const TIMER_REFUSED: &str = "room.wait.timer_refused";
++/// The status refusal count of a remake's end another shard could not be told of (that shard gone, or this shard's
++/// carrier at its bound): its waiters run at their deadline.
++#[cfg(windows)]
++const UNTOLD: &str = "room.wait.untold";
++
++/// The creates parked on every shard of this process: a remake that ends tells the other shards only while one waits.
++static PARKED_ANYWHERE: AtomicUsize = AtomicUsize::new(0);
++
++/// One parked create.
++struct RoomWaiter {
++  route: Option<ReplyRoute>,
++  origin: u64,
++  id: RequestId,
++  client_id: u32,
++  principal: Principal,
++  body: RequestBody,
++  deadline_ns: u64,
++}
++
++/// A shard's parked creates.
++#[derive(Default)]
++pub(crate) struct RoomWaiters {
++  waiting: Vec<RoomWaiter>,
++  /// The completion keys parked, so a retry joins rather than parks twice.
++  by_request: BTreeSet<(u64, u32, u32)>,
++  /// Whether this shard's deadline timer task is running.
++  timer_armed: bool,
++  /// Set by an admission refused for room the remakes in flight would make ([`note_refusal`]), taken by the verb's
++  /// dispatch, which parks it ([`park_if_owed`]).
++  owed: bool,
++  /// The deadline of the waiter being run again ([`resolve`]): a create refused again for room still owed parks under
++  /// it, never under a later one.
++  resuming: Option<u64>,
++}
++
++/// What an admission refused for room does (A-789).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum RoomVerdict {
++  /// The remakes in flight would make the room: wait for them.
++  Wait,
++  /// No remake in flight, or not room enough even once each ends: refused now, with the room there is.
++  Refuse,
++}
++
++/// The verdict on an admission of `requested` bytes refused with `admittable` bytes of room, while `pending` bytes of
++/// the pool's extents are being made again: wait while those would make the room, else refuse at once.
++pub(crate) fn verdict(requested: u64, admittable: u64, pending: u64) -> RoomVerdict {
++  if pending > 0 && requested <= admittable.saturating_add(pending) {
++    RoomVerdict::Wait
++  } else {
++    RoomVerdict::Refuse
++  }
++}
++
++/// Notes the running verb's bounded admission of `requested` bytes refused for room: owed a wait when the remakes in
++/// flight would make that room ([`verdict`]). Whether it is.
++pub(crate) fn note_refusal(state: &mut ShardState, requested: u64) -> bool {
++  let owed = verdict(
++    requested,
++    state.store.admittable(),
++    state.store.pending_room(),
++  ) == RoomVerdict::Wait;
++  state.room_waiters.owed = owed;
++  owed
++}
++
++/// Whether `body` is a verb that may park for room: a create of a bounded volume, whose admission reserves its bytes
++/// whole and refuses with nothing changed, so running it again later is running it once.
++pub(crate) fn parkable(body: &RequestBody) -> bool {
++  matches!(
++    body,
++    RequestBody::Create {
++      size: SizeClass::Bounded { .. },
++      ..
++    }
++  )
++}
++
++/// Clears what a verb before this one may have noted, so only this verb's own admission decides ([`park_if_owed`]).
++pub(crate) fn begin(state: &mut ShardState) {
++  state.room_waiters.owed = false;
++}
++
++fn key(origin: u64, id: RequestId) -> (u64, u32, u32) {
++  (origin, id.client, id.sequence)
++}
++
++/// Parks the running verb (`body` from `client_id` as `principal`) when its admission was refused for room a remake
++/// owes it ([`note_refusal`]), marking it deferred so `run_recorded` records nothing and writes no reply. `false` when it
++/// is not owed a wait, no recorded request is running, the list is full, or its deadline has passed: the caller answers
++/// the refusal it has.
++pub(crate) fn park_if_owed(
++  state: &mut ShardState,
++  client_id: u32,
++  principal: &Principal,
++  body: RequestBody,
++) -> bool {
++  if !std::mem::take(&mut state.room_waiters.owed) {
++    return false;
++  }
++  let Some((origin, id)) = state.current_request else {
++    return false;
++  };
++  if state.room_waiters.waiting.len() >= crate::lease_wait::bound(state) {
++    state.count(FULL, 1);
++    return false;
++  }
++  let now = slates_machine::clock::monotonic_ns();
++  let deadline_ns = state
++    .room_waiters
++    .resuming
++    .unwrap_or_else(|| now.saturating_add(remake_window_ns()));
++  if now >= deadline_ns {
++    state.count(EXPIRED, 1);
++    return false;
++  }
++  let route = state.reply_route.take();
++  state.room_waiters.waiting.push(RoomWaiter {
++    route,
++    origin,
++    id,
++    client_id,
++    principal: principal.clone(),
++    body,
++    deadline_ns,
++  });
++  state.room_waiters.by_request.insert(key(origin, id));
++  state.acceptance_deferred = true;
++  state.count(PARKED, 1);
++  PARKED_ANYWHERE.fetch_add(1, Ordering::AcqRel);
++  arm_timer(state);
++  true
++}
++
++/// A retry of a parked request joins it: it is answered when the parked create runs again and is answered. Returns
++/// whether the request was parked.
++pub(crate) fn join(state: &mut ShardState, origin: u64, id: RequestId) -> bool {
++  if !state.room_waiters.by_request.contains(&key(origin, id)) {
++    return false;
++  }
++  // The newest route wins: a retry on a reconnected client is answered where it now waits.
++  if let Some(route) = state.reply_route.take()
++    && let Some(waiter) = state
++      .room_waiters
++      .waiting
++      .iter_mut()
++      .find(|waiter| waiter.origin == origin && waiter.id == id)
++  {
++    waiter.route = Some(route);
++  }
++  true
++}
++
++/// Runs every parked create again: one that fits now is admitted, one still owed room a remake will make parks again
++/// under its own deadline, and one past its deadline is refused with the room there is. Called when a remake ends and at
++/// each deadline.
++pub(crate) fn resolve(state: &mut ShardState) {
++  if state.room_waiters.waiting.is_empty() {
++    return;
++  }
++  let waiting = std::mem::take(&mut state.room_waiters.waiting);
++  for waiter in waiting {
++    state
++      .room_waiters
++      .by_request
++      .remove(&key(waiter.origin, waiter.id));
++    let _ = PARKED_ANYWHERE.fetch_update(Ordering::AcqRel, Ordering::Acquire, |parked| {
++      parked.checked_sub(1)
++    });
++    run(state, waiter);
++  }
++}
++
++/// Runs one parked create again under its completion key, its deadline kept for a park it meets again.
++fn run(state: &mut ShardState, waiter: RoomWaiter) {
++  let RoomWaiter {
++    route,
++    origin,
++    id,
++    client_id,
++    principal,
++    body,
++    deadline_ns,
++  } = waiter;
++  state.count(RESUMED, 1);
++  state.room_waiters.resuming = Some(deadline_ns);
++  crate::lease_wait::run_resumed(
++    state,
++    crate::lease_wait::ResumedVerb {
++      route,
++      origin,
++      id,
++      client_id,
++      principal,
++      body,
++    },
++    None,
++    None,
++  );
++  state.room_waiters.resuming = None;
++}
++
++/// An extent's remake ended (A-789): this shard's parked creates run again, and every other shard's, told while any
++/// create waits anywhere. Called by the remake's task on the shard that released the extent; only Windows remakes one.
++#[cfg(windows)]
++pub(crate) fn remade() {
++  let Some((origin, shards)) = state::with_state_counted(|s| {
++    resolve(s);
++    (s.shard, s.shards.clone())
++  }) else {
++    return;
++  };
++  if PARKED_ANYWHERE.load(Ordering::Acquire) == 0 {
++    return;
++  }
++  for shard in shards.into_iter().filter(|shard| *shard != origin) {
++    crate::xshard::run_on_waiting(origin, shard, resolve, UNTOLD);
++  }
++}
++
++/// Derived: how long a create parked now may wait, nanoseconds: one remake's bound
++/// (`crate::content_extents::remake_bound_ns`) for each remake in flight, at least one, since they take turns on the
++/// anchor's one hold channel.
++#[cfg(windows)]
++fn remake_window_ns() -> u64 {
++  let remakes = u64::try_from(crate::content_extents::remakes_in_flight())
++    .unwrap_or(u64::MAX)
++    .max(1);
++  crate::content_extents::remake_bound_ns().saturating_mul(remakes)
++}
++
++/// [`remake_window_ns`] where no extent is ever made again (Linux and macOS give a released extent back at once): no
++/// wait, and no admission is owed one ([`verdict`] waits only on pending room, which is none there).
++#[cfg(not(windows))]
++fn remake_window_ns() -> u64 {
++  0
++}
++
++/// Arms this shard's deadline timer if it is not running: one task that sleeps until the earliest deadline, runs the
++/// parked creates again, and goes on while any is parked (one per shard, so bounded).
++fn arm_timer(state: &mut ShardState) {
++  if state.room_waiters.timer_armed {
++    return;
++  }
++  match slates_rt::futures::spawn(deadline_timer()) {
++    Ok(task) => {
++      let _ = slates_rt::futures::detach(task);
++      state.room_waiters.timer_armed = true;
++    }
++    Err(_) => {
++      state.count(TIMER_REFUSED, 1);
++    }
++  }
++}
++
++async fn deadline_timer() {
++  loop {
++    let wait = state::with_state(|s| {
++      let now = slates_machine::clock::monotonic_ns();
++      let earliest = s
++        .room_waiters
++        .waiting
++        .iter()
++        .map(|waiter| waiter.deadline_ns)
++        .min();
++      match earliest {
++        Some(deadline) => Some(deadline.saturating_sub(now)),
++        None => {
++          s.room_waiters.timer_armed = false;
++          None
++        }
++      }
++    })
++    .flatten();
++    let Some(wait) = wait else {
++      return;
++    };
++    // A refused sleep (the timer wheel full) still runs the creates now; the next turn sleeps again.
++    let _ = slates_rt::futures::sleep(wait.max(1)).await;
++    let _ = state::with_state_counted(resolve);
++  }
++}
++
++#[cfg(test)]
++mod tests {
++  use super::{RoomVerdict, verdict};
++
++  /// A-789, main 01a20182's ruling of 2026-11-23. Do: judge admissions refused for room with remakes in flight and
++  /// without, the room short by less than they would make, by exactly it, and by more. Expect: a wait only while remakes
++  /// are in flight and would make the room; with none in flight, or not enough even once each ends, a refusal at once.
++  #[test]
++  fn an_admission_waits_only_for_room_the_remakes_in_flight_would_make() {
++    let (room, pending) = (4u64 << 30, 2u64 << 30);
++    assert_eq!(verdict(room + 1, room, pending), RoomVerdict::Wait);
++    assert_eq!(verdict(room + pending, room, pending), RoomVerdict::Wait);
++    assert_eq!(
++      verdict(room + pending + 1, room, pending),
++      RoomVerdict::Refuse
++    );
++    assert_eq!(verdict(room + 1, room, 0), RoomVerdict::Refuse);
++    assert_eq!(verdict(u64::MAX, u64::MAX, u64::MAX), RoomVerdict::Wait);
++    assert_eq!(verdict(1, 0, 0), RoomVerdict::Refuse);
++  }
++}
+diff --git a/crates/server/src/state.rs b/crates/server/src/state.rs
+index 0639d7a3e..048352525 100644
+--- a/crates/server/src/state.rs
++++ b/crates/server/src/state.rs
+@@ -892,6 +892,9 @@ pub struct ShardState {
+   /// Verbs serving an object's latest state parked until its owner lease confirms (`crate::lease_wait`; §4.8
+   /// "Leases and reads"), bounded by the shard's client credit.
+   pub(crate) lease_waiters: crate::lease_wait::LeaseWaiters,
++  /// Creates parked until a remake of the pool's extents makes their room (`crate::room_wait`; A-789, Windows), bounded
++  /// by the shard's client credit.
++  pub(crate) room_waiters: crate::room_wait::RoomWaiters,
+   /// A shard's parked work verbs and the answer for the one now running (A-247; `crate::work_home`).
+   pub(crate) work_home: crate::work_home::WorkHome,
+   /// The shard's refinements of works' whole-file rewrites, a slice a turn (A-787 part 2, `crate::refining`).
+diff --git a/crates/server/src/verbs.rs b/crates/server/src/verbs.rs
+index 8fa673b67..f111ca06f 100644
+--- a/crates/server/src/verbs.rs
++++ b/crates/server/src/verbs.rs
+@@ -2953,6 +2953,7 @@ pub fn serve(
+         || crate::image::join_in_flight(state, origin, id)
+         || crate::direct_map::join_in_flight(state, origin, id)
+         || crate::lease_wait::join(state, origin, id)
++        || crate::room_wait::join(state, origin, id)
+         || crate::work_home::join(state, origin, id)
+       {
+         return Served::Forwarded;
+@@ -3511,6 +3512,7 @@ fn run_forwarded(
+         || crate::image::join_in_flight(state, origin, id)
+         || crate::direct_map::join_in_flight(state, origin, id)
+         || crate::lease_wait::join(state, origin, id)
++        || crate::room_wait::join(state, origin, id)
+         || crate::work_home::join(state, origin, id)
+       {
+         return None;
+@@ -5643,7 +5645,16 @@ pub(crate) fn dispatch(
+     Ok(fenced) => fenced,
+     Err(refusal) => return refused(refusal),
+   };
++  // A bounded create refused for room that a remake of the pool's extents owes it waits for the remake (A-789,
++  // `crate::room_wait`): parked with its body, it runs again as each remake ends, and is answered then.
++  let parkable = crate::room_wait::parkable(&body).then(|| body.clone());
++  crate::room_wait::begin(state);
+   let reply = dispatch_inner(state, client_id, principal, body);
++  if let Some(body) = parkable
++    && crate::room_wait::park_if_owed(state, client_id, principal, body)
++  {
++    return crate::lease_wait::parked_reply();
++  }
+   if let Some(volume) = fenced
+     && matches!(reply, ReplyBody::Destroyed)
+   {
+@@ -7433,7 +7444,11 @@ pub(crate) fn admit_over(
+     SizeClass::Bounded { limit } => match state.store.reserve(limit) {
+       Ok(r) => Some(r),
+       Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
+-        report_first_budget_refusal(state, "bytes", limit, available);
++        // Room the remakes of the pool's extents in flight would make is waited for (`crate::room_wait`, A-789), so
++        // only a refusal that waits for nothing is the shard's first to report.
++        if !crate::room_wait::note_refusal(state, limit) {
++          report_first_budget_refusal(state, "bytes", limit, available);
++        }
+         return Err(Box::new(refused(Refusal::BudgetExceeded { available })));
+       }
+       Err(e) => {
+diff --git a/crates/vfs/src/volume.rs b/crates/vfs/src/volume.rs
+index bc5b3ff60..63179846f 100644
+--- a/crates/vfs/src/volume.rs
++++ b/crates/vfs/src/volume.rs
+@@ -279,6 +279,13 @@ impl Store {
+       .saturating_sub(self.budget.hold())
+   }
+ 
++  /// The bytes an admission could take once the work under way on the pool's extents ends, beyond
++  /// [`Store::admittable`]: free extents being made again (A-789, Windows), which no claim takes yet. An admission
++  /// short of room that these would cover waits for them (the server's `room_wait`); zero where every extent is ready.
++  pub fn pending_room(&self) -> u64 {
++    u64::try_from(self.content.arena().pending_claimable()).unwrap_or(u64::MAX)
++  }
++
+   /// Reserves `bytes` for a bounded volume against the shard budget, growing the arena from its pool first when the
+   /// budget lacks the capacity (A-98). A refusal names what an admission could take now, the pool's free extents
+   /// included ([`Store::admittable`]): the arena claims nothing for a commitment the pool cannot cover, so the budget
+--- a/crates/server/src/daemon.rs
++++ b/crates/server/src/daemon.rs
+@@ -4820,9 +4820,6 @@
+   slices
+     .piece_done("the pool's segment and its content regions")
+     .await;
+-  // The anchor holds this slice's content extents (Windows, A-789): a task of the shard, so a claim finds them held.
+-  #[cfg(windows)]
+-  crate::content_extents::spawn_slice_holds(config, partition);
+   let headroom = operation_headroom(config, slice_capacity);
+   // The store owns the shard budget (§4.2): it is over what the arena can actually hand out (its
+   // buddy-allocatable capacity), not the region's mapping length, so admission never promises quota
+@@ -5094,6 +5091,7 @@
+     volume_ids_minted: 0,
+     acceptance_deferred: false,
+     lease_waiters: crate::lease_wait::LeaseWaiters::default(),
++    room_waiters: crate::room_wait::RoomWaiters::default(),
+     work_home: crate::work_home::WorkHome::default(),
+     refining: crate::refining::Refining::default(),
+     made_commits: crate::made_commit::MadeCommits::default(),
+@@ -6526,6 +6524,25 @@
+     Some(Ok(fresh)) => Ok(fresh),
+     _ => Err(unavailable("client identity reservation was not published")),
+   }
++}
++
++/// The boot's steps the control loop takes before it answers a claim, every shard recovered and no client admitted
++/// yet: the client ids every shard retained restored into `listener` ([`restore_client_ids`]), then each partition's
++/// greens and works brought whole. Whether the boot may go on; a refused restore stops it.
++async fn boot_before_claims(listener: &mut Listener, control: u16, shards: &[ShardId]) -> bool {
++  if !restore_client_ids(listener, control, shards).await {
++    return false;
++  }
++  // Every shard has recovered and no client is admitted yet, so no clone is between its steps: the names' aliases are
++  // reconciled with the clones they name (A-236).
++  // Every green a partition holds by its takeover's adoption is rebuilt from this node's ledger first (A-333), so no
++  // client meets one half built and every work over one is replayed after it.
++  crate::green_adopt::readopt_at_boot(control, shards).await;
++  // Likewise no work is between its steps: a work whose green lives on another partition is replayed through that
++  // green's owner, and only then is every floor compared with the work it holds for (A-247).
++  recover_works_across_partitions(control, shards).await;
++  ask_again_for_unbuilt_works(control, shards);
++  true
+ }
+ 
+ /// The control shard's loop: the rendezvous, the heartbeat, and a client handed to its shard
+@@ -6567,21 +6584,20 @@
+   if futures::spawn_child(heartbeat_loop(segment, control_life)).is_err() {
+     crate::fleet::count_refusal(LOOP_SPAWN_REFUSED);
+   }
+-  if !restore_client_ids(&mut listener, control, &shards).await {
++  if !boot_before_claims(&mut listener, control, &shards).await {
+     slates_machine::log_line!(
+       "slates-server: the boot is refused; the heartbeat stops so the anchor restarts this daemon"
+     );
+     return;
+   }
+-  // Every shard has recovered and no client is admitted yet, so no clone is between its steps: the names' aliases are
+-  // reconciled with the clones they name (A-236).
+-  // Every green a partition holds by its takeover's adoption is rebuilt from this node's ledger first (A-333), so no
+-  // client meets one half built and every work over one is replayed after it.
+-  crate::green_adopt::readopt_at_boot(control, &shards).await;
+-  // Likewise no work is between its steps: a work whose green lives on another partition is replayed through that
+-  // green's owner, and only then is every floor compared with the work it holds for (A-247).
+-  recover_works_across_partitions(control, &shards).await;
+-  ask_again_for_unbuilt_works(control, &shards);
++  // The anchor holds every content extent before the first claim is answered (Windows, A-789): a claim takes only a held
++  // extent, and this loop answers every claim, so no admission meets an extent made but not yet held. Here, a task of
++  // the control shard's that runs beside its others, the holds' exchanges can run: awaited inside the shard's start,
++  // which runs alone, they never did and the daemon never served (diag run 45251289894). Each hold is one exchange
++  // within the learned answer bound (A-552). Until 2026-11-23 each shard's start spawned its slice's holds and the
++  // daemon served at once, so a create the moment it served was refused.
++  #[cfg(windows)]
++  crate::content_extents::hold_before_serving(&config).await;
+   // Clients this daemon handed out, so a wanted id that is live is not given twice; bounded
+   // by the daemon's client capacity, refused typed beyond it (AC-2.6). A client's shard is
+   // its id's residue, so a client reconnecting under its old id after a restart lands on the

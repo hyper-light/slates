@@ -1,0 +1,191 @@
+name: diag-w-win2
+
+# w-win2 for main 01a20182 (2026-11-23), main's remaining Windows reds, run 3. A diagnostics lane run only from
+# `diag-measurer-w-win2-*` branches, never main. Every test's output goes to a file, printed after it and again in an
+# `always()` step, and each new CLI test is bounded with its own watchdog (main's ask after run 2's hang).
+# - lint: clippy of items 2 and 3's crates and the Windows extents CLI test, init_shard's holds moved to the control loop.
+# - item2: the idle sweep's two tests red with item 2's fix reversed, then green with the give-back step tests.
+# - item3: the first-create and remake-window CLI tests red with item 3's fix reversed, then the Windows extents file
+#   and the Node SDK suites green.
+
+on:
+  push:
+    branches: ["diag-measurer-w-win2-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  lint:
+    name: items 2 and 3, clippy on Windows (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - name: NASM (x86_64 Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64 Windows)
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Clippy the changed crates on Windows, each alone
+        run: cargo clippy -p slates-server -p slates-vfs -p slates-mem --no-deps --lib --tests -- -D warnings 2>&1 | grep -v '^\s*Checking \|^\s*Compiling '
+      - name: Clippy the Windows extents CLI test
+        if: ${{ !cancelled() }}
+        run: cargo clippy -p slates-cli --no-deps --test content_extents_windows -- -D warnings 2>&1 | grep -v '^\s*Checking \|^\s*Compiling '
+
+  item2:
+    name: item 2, the idle sweep (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: NASM (x86_64 Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64 Windows)
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: "Item 2, red: the idle sweep's two tests with the fix reversed"
+        timeout-minutes: 45
+        run: |
+          git apply -R .github/diag-w-win2/item2-fix.patch
+          set +e
+          cargo test -p slates-server --lib -- --test-threads=1 idle_sweep::tests::an_idle_shard_runs_no_sweep_pass idle_sweep::tests::a_write_on_a_settled_shard_arms_a_pass > "$RUNNER_TEMP/item2-red.log" 2>&1
+          code=$?
+          set -e
+          git apply .github/diag-w-win2/item2-fix.patch
+          grep -v '^\s*Compiling \|^slates daemon: \|^slates-server: ' "$RUNNER_TEMP/item2-red.log" | tail -60
+          echo "red arm exit $code"
+          if [ "$code" -eq 0 ]; then echo "UNEXPECTED: the idle sweep's tests passed without the fix"; exit 1; fi
+      - name: "Item 2, green: the idle sweep's tests and the give-back step tests"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 45
+        run: |
+          set +e
+          cargo test -p slates-server --lib -- --test-threads=1 idle_sweep::tests daemon::tests::a_give_back_step > "$RUNNER_TEMP/item2-green.log" 2>&1
+          code=$?
+          grep -v '^\s*Compiling \|^slates daemon: \|^slates-server: ' "$RUNNER_TEMP/item2-green.log" | tail -60
+          exit $code
+      - name: "Item 2: the test logs, whatever happened"
+        if: always()
+        run: for f in "$RUNNER_TEMP"/item2-*.log; do echo "=== $f"; grep -v '^\s*Compiling ' "$f" | tail -120; done
+
+  item3:
+    name: item 3, the first create (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+      NAPI_CLI_VERSION: 3.7.2
+      SLATES_TEST_CLI: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: NASM (x86_64 Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64 Windows)
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: "Item 3, red: the first-create and remake-window tests with the fix reversed"
+        timeout-minutes: 50
+        run: |
+          git apply -R .github/diag-w-win2/item3-fix.patch
+          set +e
+          cargo test -p slates-cli --test content_extents_windows -- --test-threads=1 --nocapture a_create_the_moment_the_daemon_serves_is_admitted_on_windows a_create_during_the_released_extents_remakes_waits_for_them_on_windows > "$RUNNER_TEMP/item3-red.log" 2>&1
+          code=$?
+          set -e
+          git apply .github/diag-w-win2/item3-fix.patch
+          grep -v '^\s*Compiling \|^slates daemon: [a-z_0-9]* = \|^slates anchor: ' "$RUNNER_TEMP/item3-red.log" | tail -150
+          echo "red arm exit $code"
+          if [ "$code" -eq 0 ]; then echo "UNEXPECTED: the tests passed without the fix"; exit 1; fi
+      - name: "Item 3, green: the Windows extents tests"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 50
+        run: |
+          set +e
+          cargo test -p slates-cli --test content_extents_windows -- --test-threads=1 --nocapture > "$RUNNER_TEMP/item3-green.log" 2>&1
+          code=$?
+          grep -v '^\s*Compiling \|^slates daemon: [a-z_0-9]* = \|^slates anchor: ' "$RUNNER_TEMP/item3-green.log" | tail -300
+          exit $code
+      - name: The daemon the Node suites spawn
+        if: ${{ !cancelled() }}
+        run: cargo build -p slates-cli 2>&1 | grep -v '^\s*Compiling '
+      - name: "Item 3, green: build the napi addon and run the Node suites (sync and async) over a live daemon"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        run: |
+          set +e
+          npm install -g @napi-rs/cli@${{ env.NAPI_CLI_VERSION }} > "$RUNNER_TEMP/item3-node.log" 2>&1
+          (cd crates/sdk-node && npm run build) >> "$RUNNER_TEMP/item3-node.log" 2>&1
+          root=$(pwd -W 2>/dev/null || pwd)
+          daemon="$root/target/debug/slates.exe"
+          addon=$(ls crates/sdk-node/slates.*.node)
+          SLATES_NODE_ADDON="$root/$addon" SLATES_DAEMON="$daemon" \
+            node --test crates/sdk-node/tests/sdk.test.mjs crates/sdk-node/tests/sdk_async.test.mjs >> "$RUNNER_TEMP/item3-node.log" 2>&1
+          code=$?
+          grep -v '^\s*Compiling ' "$RUNNER_TEMP/item3-node.log" | tail -80
+          exit $code
+      - name: "Item 3: the test logs, whatever happened"
+        if: always()
+        run: |
+          for f in "$RUNNER_TEMP"/item3-*.log; do echo "=== $f"; grep -v '^\s*Compiling \|^slates daemon: [a-z_0-9]* = \|^slates anchor: ' "$f" | tail -200; done
