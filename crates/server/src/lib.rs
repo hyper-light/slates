@@ -258,6 +258,7 @@ mod reader_patience;
 // Whether Windows Error Reporting writes this daemon full crash dumps (A-239): read, logged once and reported.
 pub mod local_dumps;
 mod recovery_slices;
+pub use recovery_slices::StartReport;
 pub mod seal_keys;
 // A client's session key (GAP-A9-9's threat model): what a client resuming under its id proves before its seat is served.
 pub mod session_key;

@@ -21523,7 +21523,7 @@ Status: built on macOS 2026-10-06; Linux built 2026-11-19 by A-550 (its unit tes
 - The rule: a restart is a slow reply, never a dropped connection.
   1. The daemon hands the anchor a duplicate of each accepted connection before reading its first request, over the
      hold channel A-61 made for FUSE devices (now Unix-wide: a sequenced-packet pair on Linux, a datagram pair on
-     macOS). The anchor hands what it holds to every daemon it spawns (`ENV_CONNECTIONS`). A connection that ends is
+     macOS, whose send into a full channel waits for room rather than failing `ENOBUFS`, 2026-11-22). The anchor hands what it holds to every daemon it spawns (`ENV_CONNECTIONS`). A connection that ends is
      shut down before its hold is released.
   2. A request leaves the kernel only once its reply is in it: records are peeked, served, their replies sent, then
      consumed. The receive low-water mark wakes a connection only when a whole record is queued. A successor finds
@@ -55496,6 +55496,29 @@ Applied in the same change to:
   `vcs_store::homes::tests` 6 of 6 (region offers idempotent; a lone node's healer moves nothing; the region put
   acknowledged only after its image) and `fleet::` 33 of 33. A region home answers `Kept` only once A-727 a3 drives its
   image barrier, so until then the healer offers and keeps its own copy (no release without every home's `Kept`).
+- **Piece 8c, a home's landed windows read through (2026-11-22, w-shared; goal 93 item 2b(b), main 01a20182's ruling:
+  homes keep window → (payload identity, offset) for the windows homed as part of a landed pack, and a home's read of a
+  window let go brings it back through that record).** A push's pack is homed whole in the region before it lands
+  (`home_in_region`): on this node the shard `home_of(shards, pack)` holds it for the region, cut at the store's
+  windows. Once the pack's changeset lands and its record commits, the pack's owner tells that home
+  (`vcs_store::let_go_landed_pack_among`: on its own shard before its own let-go, else by a task of its own whose answer
+  nothing waits on). The home, where it holds the pack for the region (`homes::landed_pack_here`), records each window
+  where it lies on the node's store (`homes::LandedAt`: the pack's identity, the plain BLAKE3 the store's `Payload` is
+  keyed by, its length, the window's offset in it, from `ContentStore::object_layout`), marks it landed and lets it go
+  (`homes::record_landed_here`, counted `vcs_store.homes.landed_let_go_bytes`). A home's read that finds an object or
+  window not whole (`homes::read`, and so `read_part`, `serve_remote`'s `Read` and `read_many`'s misses) brings each of
+  its let-go windows back by its record (`homes::bring_back_landed`: read a piece at a time from the node's store off
+  the shard's step, then put back by its identity within the step's lent room, counted
+  `vcs_store.homes.landed_brought_back`), then reads again. A window with a record needs no pin (`landed_pin` answers
+  none for it), so the owner lets its own copy go too. A record is dropped when its window is freed (`let_go_here`), and
+  the records ride the shard image as their own piece kind (`KIND_VCS_LANDED_AT`, whole at a checkpoint, made and
+  dropped in each delta), taken back at recovery (`homes::restore_landed`) beside the windows let go
+  (`KIND_VCS_AWAY`). Evidence: `vcs_store::read_through::tests::a_landed_pack_its_home_holds_is_let_go_and_read_back_through_its_record`
+  (each window recorded at its offset, all let go, none pinned, the pack read whole through `homes::read`, each window
+  brought back by its record) and `daemon::tests::t_goal93_a_homes_landed_records_survive_a_restart_and_bring_its_windows_back`
+  (the records taken back as they were across a stop and start over the same segment and store, and the pack read
+  whole). A pack's home on another node keeps its copy as before: its records would need that node's store to hold the
+  pack, which only its own landing gives it.
 - **Piece 9b, the cut in the record and look-ups routed by it (2026-11-20).** `RepositoryRecord::index_bits` (appended,
   zero at creation, the whole index on the owner) moves one bit at a time by `Op::RepositoryIndexCut` (appended, `Op`
   102), its guard refusing any other step or a cut past 32 bits `DbError::IndexCutStep { current }` (the wire's
@@ -60583,6 +60606,12 @@ Status: built 2026-11-21, every platform (the cut and the claim are platform-fre
   is told what the arena still lacks and takes the smallest free part that covers it, else the largest; equal lengths
   go to the claimer's own slice first. An arena so grows by its need rounded up to a power of two of units, and
   doubles while claims keep coming.
+- A-848 clarification (2026-11-22, §4.2). An arena asks for enough mapped bytes to provide its
+  missing usable capacity. One region supplies a power-of-two number of whole granules. Growth
+  can accumulate several smaller regions and gives back an offer below one granule. An idle trade
+  replaces a region only when a smaller one can supply all the headroom it would take away.
+  The four mixed-size pool regressions are recorded in
+  `docs/bugs/2026-11-22-extent-claims-use-buddy-capacity.md`.
 - An extent id now names another range of the content object, so the layout version is 17 and an older segment is
   refused, never misread. A slice holds about two parts per bit of its length in units, at most
   `POOL_EXTENTS_PER_PARTITION` (64).
@@ -60955,7 +60984,20 @@ owed.
   taken at the first settle after the content store is made, which may be any step after the recovery. Evidence:
   `t_goal93_a_region_held_window_stays_pinned_across_a_restart` (a region hold, a stop and start over the same segment,
   the let-go refused `Pinned { by: "homes" }`).
-- Open: 2b(b), homes' read-through (window -> payload identity and offset), which lifts the homes' pin.
+- 2b(b) BUILT (A-724 piece 8c, "a home's landed windows read through"): a home records where each window of a landed
+  pack it holds for the region lies on the node's store and lets it go; its reads bring it back by that record, so a
+  window with a record is not pinned.
+  A Mercurial file revision's windows are read back by its (path, node) rather than a pack's offset
+  (`repository::hg_push::bring_back`, w-hg): the repository's index names its row, the node's changeset store gives its
+  whole text off the shard's step (`slates_hg::push::held::TextAsk`, the one ask a push's work uses for a text an
+  import let go), and its block and bytes are put back by the identities the row names within the room they take; true
+  where both are held whole after. Evidence: `a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and_node`.
+  Each window is noted with its revision (`homes::note_landed`, `Landed::Hg`) by the let-go that follows its push's
+  entry commit or its import's landing, and so pinned by nothing; the let-go as each segment lands notes nothing,
+  since the revision is not yet in the index the bring-back reads, and leaves a window a home holds pinned
+  (`vcs_store::landed_pin`, every window of an object held for the region since 7663054bb). A home's read of an object
+  with an away window noted for hg brings it back through the repository's reader, once a revision
+  (`homes::bring_back_landed`). Evidence: `a_region_object_sharing_a_landed_files_window_is_read_whole_from_its_home`.
 
 
 ### A-864 — A pushed entry is checked by the CRC32 its row keeps, and sent on with no object read (2026-11-22, w-git; main 01a20182's r17 of 07:08 and ruling of 07:31 PST, goal 93; A-859, A-722 record v4)

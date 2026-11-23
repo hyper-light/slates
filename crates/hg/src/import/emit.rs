@@ -38,9 +38,10 @@ pub struct Segment {
   pub texts: Vec<KeptText>,
   /// Its record: the index rows of those revisions, by identity, and the markers in the last segment.
   pub record: Vec<u8>,
-  /// The content store's identities of its file revisions' bytes and metadata blocks (A-767 C1 step 2b): what its owner
-  /// lets go of the content store once the segment is durable on the node's changeset store, which then serves them.
-  pub contents: Vec<slates_vcs::ContentId>,
+  /// Its file revisions as the content store keeps them, each by its path and node (A-767 C1 step 2b): what its owner
+  /// lets go of the content store once the segment is durable on the node's changeset store, which then serves them,
+  /// and notes for a home's read once the import lands (goal 93 item 2b(b)).
+  pub contents: Vec<crate::filerev::FileContents>,
 }
 
 /// Why a revision could not be written.
@@ -108,8 +109,8 @@ pub struct Emitter {
   ranges: Vec<(Logged, u32, u32)>,
   /// The bytes of the segments cut so far.
   cut: u64,
-  /// The content identities of the file revisions the segment being written holds ([`Segment::contents`]).
-  contents: Vec<slates_vcs::ContentId>,
+  /// The file revisions the segment being written holds, as the content store keeps them ([`Segment::contents`]).
+  contents: Vec<crate::filerev::FileContents>,
 }
 
 impl Emitter {
@@ -128,14 +129,9 @@ impl Emitter {
     }
   }
 
-  /// Notes the content identities a file revision of the segment being written was kept as ([`Segment::contents`]).
-  pub(crate) fn note_contents(
-    &mut self,
-    bytes: slates_vcs::ContentId,
-    block: Option<slates_vcs::ContentId>,
-  ) {
-    self.contents.push(bytes);
-    self.contents.extend(block);
+  /// Notes a file revision of the segment being written as the content store keeps it ([`Segment::contents`]).
+  pub(crate) fn note_contents(&mut self, contents: crate::filerev::FileContents) {
+    self.contents.push(contents);
   }
 
   /// A log opened: what the last one kept let go.

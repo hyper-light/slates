@@ -3864,9 +3864,13 @@ fn a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows() {
   let windows: Vec<slates_vcs::ContentId> =
     pack.chunks(window).map(slates_vcs::ContentId::of).collect();
   // Each window marked landed, as the landed pack's let-go marks it, and let go where no home holds it here (a two-shard
-  // daemon pins about half to their home).
+  // daemon pins about half to their home). The pack's home here, where it holds the pack for the region, records its
+  // windows and lets them go first, as a landed pack's let-go tells it (A-724 piece 8c, goal 93 item 2b(b)): a window of
+  // an object the region holds is pinned until then (`vcs_store::landed_pin`).
   let ids = windows.clone();
+  let pack_identity = slates_vcs::ContentId::of(&pack);
   let (let_go, refused) = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    crate::vcs_store::homes::landed_pack_here(state, pack_identity);
     crate::vcs_store::within_budget(state, 0, |stores| {
       let content = stores.content_mut().expect("the content store");
       for id in &ids {
@@ -3992,8 +3996,9 @@ fn upload_advertised(edge: (u16, &CertificateDer<'static>), name: &str) -> (u16,
 /// A-864's readers (main 01a20182's r52: after git/git's push landed and its pack's windows were let go, every fetch and
 /// ls-remote answered "possible repository corruption", the advertisement's tag peel reading a let-go window). Do: push
 /// a create of `main` and [`LET_GO_TAGS`] annotated tags, each tag's entry between two MiB files in the pack; read the
-/// upload-pack advertisement; mark every window of the pack landed and let go those no home holds on the repository's
-/// shard; read the advertisement again; clone `main`. Expect: the second advertisement the first, byte for byte, its tags
+/// upload-pack advertisement; let the pack's home on the repository's shard record its windows and let them go, as a
+/// landed pack's let-go tells it, then mark every window of the pack landed and let go those no home holds there; read
+/// the advertisement again; clone `main`. Expect: the second advertisement the first, byte for byte, its tags
 /// peeled; windows brought back from the node's store to answer it; the clone whole. Red before: refused.
 #[test]
 fn an_advertisement_over_a_let_go_pack_is_the_one_over_it_held() {
@@ -4027,7 +4032,12 @@ fn an_advertisement_over_a_let_go_pack_is_the_one_over_it_held() {
   .expect("the repository's content store");
   let ids: Vec<slates_vcs::ContentId> =
     pack.chunks(window).map(slates_vcs::ContentId::of).collect();
+  let pack_identity = slates_vcs::ContentId::of(&pack);
   let let_go = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    // The pack's home here, where it holds the pack for the region, records where each window lies on the node's store
+    // and lets it go first (A-724 piece 8c, goal 93 item 2b(b)), as a landed pack's let-go tells it: a window of an
+    // object the region holds is pinned until then (`vcs_store::landed_pin`).
+    crate::vcs_store::homes::landed_pack_here(state, pack_identity);
     crate::vcs_store::within_budget(state, 0, |stores| {
       let content = stores.content_mut().expect("the content store");
       for id in &ids {
@@ -4079,23 +4089,15 @@ const TEXTS_CHANGESETS: usize = 120;
 /// Format: the bytes of each file of that history.
 const TEXT_BYTES: usize = 8 * 1024;
 
-/// Main 01a20182's order of 2026-11-22 14:00 (CI 45065911852: 4.7 GB of arena held on the repository's shard after
-/// Mercurial's whole history landed, the content store keeping every revision's text). Do: start a two-shard daemon over
-/// loopback TLS; create a Mercurial repository; push a line of [`TEXTS_CHANGESETS`] changesets each adding a file of its
-/// own [`TEXT_BYTES`], cut at [`LONG_SEGMENT_BYTES`]; look at each file's window in its shard's content store; clone it
-/// whole (`getbundle`). Expect the push `200`; every file's window let go of the content store, its entry kept, but
-/// those a home pins on this shard (`vcs_store::landed_pin`, as a landed git pack's); the bytes let go counted; and the
-/// clone carrying the last file's bytes, brought back from the changeset store. Red before: the store held every text.
-#[test]
-fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
-  let (identity, certificate) = identity();
-  let (daemon, _instance) = daemon_named(Some(identity));
-  let port = daemon.vcs_http_port().expect("the edge started");
-  let name = hg_name_on_the_repositorys_partition();
-  enroll(&daemon, OWNER_TOKEN, OWNER, None);
-  create_empty_hg(&daemon, &name);
-  let edge = (port, &certificate);
-  crate::daemon::observe_at(&daemon, REPOSITORY, |_| {
+/// Pushes into `name`, through `edge`, a line of [`TEXTS_CHANGESETS`] changesets each adding a file of its own
+/// [`TEXT_BYTES`] (each text its own, so the store keeps every one), cut at [`LONG_SEGMENT_BYTES`]: the changesets, the
+/// files' texts, and the push's answer.
+fn a_long_push_of_own_texts(
+  daemon: &Daemon,
+  edge: (u16, &CertificateDer<'static>),
+  name: &str,
+) -> (Vec<Made>, &'static [Vec<u8>], (u16, String, Vec<u8>)) {
+  crate::daemon::observe_at(daemon, REPOSITORY, |_| {
     crate::repository::hg_run::TEST_SEGMENT_BYTES.with(|bound| bound.set(LONG_SEGMENT_BYTES));
   });
   let paths: &'static [String] = Box::leak(
@@ -4133,7 +4135,28 @@ fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
     .collect();
   let made = history_of(&commits);
   let revs: Vec<usize> = (0..TEXTS_CHANGESETS).collect();
-  let pushed = hg_unbundle(edge, &name, &history_bundle(&made, &revs));
+  let pushed = hg_unbundle(edge, name, &history_bundle(&made, &revs));
+  (made, texts, pushed)
+}
+
+/// Main 01a20182's order of 2026-11-22 14:00 (CI 45065911852: 4.7 GB of arena held on the repository's shard after
+/// Mercurial's whole history landed, the content store keeping every revision's text). Do: start a two-shard daemon over
+/// loopback TLS; create a Mercurial repository; push a line of [`TEXTS_CHANGESETS`] changesets each adding a file of its
+/// own [`TEXT_BYTES`], cut at [`LONG_SEGMENT_BYTES`]; look at each file's window in its shard's content store; clone it
+/// whole (`getbundle`). Expect the push `200`; every file's window let go of the content store, its entry kept, each
+/// noted with its revision for a home and none pinned (goal 93 item 2b(b): before, the 71 a home held here were
+/// pinned); the bytes let go counted; and the clone carrying the last file's bytes, brought back from the changeset
+/// store. Red before: the store held every text.
+#[test]
+fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
+  let (identity, certificate) = identity();
+  let (daemon, _instance) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  create_empty_hg(&daemon, &name);
+  let edge = (port, &certificate);
+  let (made, texts, pushed) = a_long_push_of_own_texts(&daemon, edge, &name);
   // Each file's window: whether its shard's content store reads its bytes (none for one let go), whether a home pins it
   // there, and whether its entry stays.
   let windows = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
@@ -4146,11 +4169,12 @@ fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
           .map(|text| {
             let window = slates_vcs::ContentId::of(text);
             let pinned = crate::vcs_store::landed_pin(shard, &shards, &window).is_some();
+            let noted = crate::vcs_store::homes::landed(&window).is_some();
             (
               content
                 .object_bytes(&window, u64::try_from(text.len()).unwrap())
                 .is_some(),
-              pinned,
+              (noted, pinned),
               content.len_of(&window).is_some(),
             )
           })
@@ -4168,15 +4192,14 @@ fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
   let cloned = hg_getbundle(edge, &name, &tip);
   daemon.stop();
   let gone = windows.iter().filter(|(here, ..)| !here).count();
-  println!(
-    "let go: {let_go} bytes; {gone} of {TEXTS_CHANGESETS} files' windows gone, the rest pinned by a home"
-  );
+  println!("let go: {let_go} bytes; {gone} of {TEXTS_CHANGESETS} files' windows gone");
   assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
-  for (at, (here, pinned, entry)) in windows.iter().enumerate() {
+  for (at, (here, (noted, pinned), entry)) in windows.iter().enumerate() {
     assert!(entry, "file {at}'s entry kept");
-    assert_eq!(
-      here, pinned,
-      "file {at}'s window at hand only where a home pins it"
+    assert!(!here, "file {at}'s window let go");
+    assert!(
+      *noted && !*pinned,
+      "file {at}'s window noted for a home, not pinned"
     );
   }
   assert!(gone > 0, "some window let go");
@@ -4192,12 +4215,206 @@ fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
   );
 }
 
+/// codex-review's region-object pin (2026-11-22, main's order to w-hg) through a real push, and goal 93 item 2b(b). Do:
+/// start a two-shard daemon over loopback TLS; on the repository's shard, keep for the region an object one byte longer
+/// than a window, its first window ranking on the other shard (so no hold here names it); push one changeset whose file
+/// is exactly that first window; once landed, look at the window, then read the object from its home
+/// (`homes::read`). Expect the push `200`; the shared window let go of the content store; the home's read the whole
+/// object, brought back by the file revision noted with it (`vcs.hg.landed_texts_brought_back` 1). Red before: the
+/// window was let go unnoted and the home read none.
+#[test]
+fn a_region_object_sharing_a_landed_files_window_is_read_whole_from_its_home() {
+  let (identity, certificate) = identity();
+  let (daemon, _instance) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  create_empty_hg(&daemon, &name);
+  let (shards, here, window) = crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
+    (
+      state.shards.clone(),
+      state.shard,
+      state.store.content.chunk_bytes(),
+    )
+  });
+  let home_of = |bytes: &[u8]| {
+    crate::vcs_store::homes::home_of(&shards, &slates_vcs::ContentId::of(bytes)).unwrap()
+  };
+  // The file: a window of lines, its last line chosen so the window ranks on the other shard.
+  let mut file = Vec::with_capacity(window);
+  let mut line = 0usize;
+  while file.len() < window {
+    file.extend_from_slice(format!("shared line {line}\n").as_bytes());
+    line += 1;
+  }
+  file.truncate(window);
+  let last = window - 1;
+  file[last] = (b'a'..=b'z')
+    .find(|tail| {
+      file[last] = *tail;
+      home_of(&file) != here
+    })
+    .expect("a window ranking on the other shard");
+  // The object: the window and one byte more, homed on the repository's shard.
+  let mut object = file.clone();
+  object.push(0);
+  object[window] = (u8::MIN..=u8::MAX)
+    .find(|tail| {
+      object[window] = *tail;
+      home_of(&object) == here
+    })
+    .expect("an object homed on the repository's shard");
+  let object_id = slates_vcs::ContentId::of(&object);
+  let held = object.clone();
+  let kept = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    crate::vcs_store::homes::keep_for_region(state, &held).map(|(identity, _)| identity)
+  });
+  assert_eq!(
+    kept.ok(),
+    Some(object_id),
+    "the region's object kept on its home"
+  );
+  let text: &'static [u8] = Box::leak(file.clone().into_boxed_slice());
+  let made = history_of(&[("shared", "shared", text, None, "default")]);
+  let pushed = hg_unbundle((port, &certificate), &name, &history_bundle(&made, &[0]));
+  let window_held = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    crate::vcs_store::lent_state(state, |state| {
+      state.vcs_stores.content().map(|content| {
+        content
+          .object_bytes(
+            &slates_vcs::ContentId::of(text),
+            u64::try_from(text.len()).unwrap(),
+          )
+          .is_some()
+      })
+    })
+  });
+  let reading = shards.clone();
+  let read = crate::test_store::run_at(
+    &daemon,
+    LISTENER,
+    move || async move {
+      let origin = reading.first().copied().unwrap();
+      crate::vcs_store::homes::read(origin, &reading, object_id, u64::MAX).await
+    },
+    Duration::from_secs(60),
+  );
+  let brought = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::repository::hg_push::LANDED_TEXTS_BROUGHT_BACK,
+  );
+  daemon.stop();
+  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
+  assert_eq!(
+    window_held,
+    Some(false),
+    "the shared window let go once landed"
+  );
+  assert_eq!(
+    read.map(|bytes| bytes == object),
+    Some(true),
+    "the home reads its object whole"
+  );
+  assert_eq!(
+    brought, 1,
+    "brought back by the file revision noted with it"
+  );
+}
+
+/// w-shared's seam 1 of goal 93 item 2b(b) (main's ruling of 2026-11-22 18:43): a home reads a landed file revision by
+/// its (path, node). Do: start a two-shard daemon over loopback TLS; push [`a_long_push_of_own_texts`]'s line; on the
+/// repository's shard, bring each file revision back by its path and node (`hg_push::bring_back`), then look at its
+/// window again. Expect the push `200`; some window let go; every bring-back true; every window held whole after, each let
+/// go read from the changeset store and counted once. Red before: none could be brought back by its (path, node).
+#[test]
+fn a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and_node() {
+  let (identity, certificate) = identity();
+  let (daemon, _instance) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  create_empty_hg(&daemon, &name);
+  let (made, texts, pushed) = a_long_push_of_own_texts(&daemon, (port, &certificate), &name);
+  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
+  let named = name.clone();
+  let repository = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    state
+      .db
+      .partition()
+      .repositories()
+      .repository_named(&named)
+      .map(|record| record.id)
+  })
+  .expect("the repository's record");
+  let before = windows_held(&daemon, texts);
+  let files: Vec<(Vec<u8>, slates_hg::Node)> = made
+    .iter()
+    .map(|made| (made.file.0.clone(), made.file.1))
+    .collect();
+  let brought = crate::test_store::run_at(
+    &daemon,
+    REPOSITORY,
+    move || async move {
+      let mut brought = Vec::with_capacity(files.len());
+      for file in files {
+        brought.push(crate::repository::hg_push::bring_back(repository, file).await);
+      }
+      brought
+    },
+    Duration::from_secs(60),
+  );
+  let after = windows_held(&daemon, texts);
+  let counted = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::repository::hg_push::LANDED_TEXTS_BROUGHT_BACK,
+  );
+  daemon.stop();
+  let gone = before.iter().filter(|here| !**here).count();
+  println!("{gone} of {TEXTS_CHANGESETS} files' windows let go before; {counted} brought back");
+  assert!(gone > 0, "some window let go");
+  for (at, (brought, here)) in brought.iter().zip(&after).enumerate() {
+    assert!(brought, "file {at} brought back");
+    assert!(here, "file {at}'s window held whole after");
+  }
+  assert_eq!(
+    counted,
+    u64::try_from(gone).unwrap(),
+    "each let go brought back once"
+  );
+}
+
+/// Whether the repository's shard's content store reads each of `texts`' windows (none for one let go).
+fn windows_held(daemon: &Daemon, texts: &'static [Vec<u8>]) -> Vec<bool> {
+  crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
+    crate::vcs_store::lent_state(state, |state| {
+      let content = state.vcs_stores.content()?;
+      Some(
+        texts
+          .iter()
+          .map(|text| {
+            content
+              .object_bytes(
+                &slates_vcs::ContentId::of(text),
+                u64::try_from(text.len()).unwrap(),
+              )
+              .is_some()
+          })
+          .collect::<Vec<_>>(),
+      )
+    })
+  })
+  .expect("the repository's content store")
+}
+
 /// Main 01a20182's ruling of 2026-11-22 02:52 (C1 2b, an import keeping no file text once its segments are durable) and
 /// order of 14:00 (the arena a landed history left held). Do: start a two-shard daemon over loopback TLS; import the
 /// `states` repository into a Mercurial repository and land it; look at each of its file revisions' windows in its
 /// shard's content store; clone it whole (`getbundle`). Expect every file revision's window let go of the content store,
-/// its entry kept, but those a home pins on this shard (`vcs_store::landed_pin`); some let go and counted; and the clone
-/// `200` with a changegroup, its file texts brought back from the changeset store. Red before: the import kept every text.
+/// its entry kept, each window noted with its revision for a home and none pinned (goal 93 item 2b(b): before, those a
+/// home held here were pinned, 1 of 5); counted; and the clone `200` with a changegroup, its file texts brought back
+/// from the changeset store. Red before: the import kept every text.
 #[test]
 fn an_imported_repositorys_file_texts_leave_the_content_store_once_its_segments_land() {
   let (identity, certificate) = identity();
@@ -4221,10 +4438,14 @@ fn an_imported_repositorys_file_texts_leave_the_content_store_once_its_segments_
         let mut seen = Vec::new();
         let mut at = (Vec::new(), 0_u32);
         while let Some((path, rev, row)) = store.index.file_revision_from(content, (&at.0, at.1)) {
+          let noted = content
+            .object_layout(&row.bytes)
+            .iter()
+            .all(|(window, _)| crate::vcs_store::homes::landed(window).is_some());
           let pinned = crate::vcs_store::landed_pin(shard, &shards, &row.bytes).is_some();
           let len = content.len_of(&row.bytes);
           let here = len.is_some_and(|len| content.object_bytes(&row.bytes, len).is_some());
-          seen.push((here, pinned, len.is_some()));
+          seen.push((here, (noted, pinned), len.is_some()));
           at = (path, rev.saturating_add(1));
         }
         Some(seen)
@@ -4251,11 +4472,12 @@ fn an_imported_repositorys_file_texts_leave_the_content_store_once_its_segments_
     looked.len()
   );
   assert!(!looked.is_empty(), "the import keeps file revisions");
-  for (at, (here, pinned, entry)) in looked.iter().enumerate() {
+  for (at, (here, (noted, pinned), entry)) in looked.iter().enumerate() {
     assert!(entry, "file revision {at}'s entry kept");
-    assert_eq!(
-      here, pinned,
-      "file revision {at}'s window at hand only where a home pins it"
+    assert!(!here, "file revision {at}'s window let go");
+    assert!(
+      *noted && !*pinned,
+      "file revision {at}'s windows noted for a home, none pinned"
     );
   }
   assert!(
@@ -4270,4 +4492,313 @@ fn an_imported_repositorys_file_texts_leave_the_content_store_once_its_segments_
       .any(|window| window.eq_ignore_ascii_case(b"CHANGEGROUP")),
     "the clone carries a changegroup"
   );
+}
+
+/// Shape: the files of [`a_thin_push_whose_base_was_let_go_lands`]'s first commit, each about a content window long so
+/// each lies in windows of its own.
+const THIN_BASES: usize = 8;
+
+/// A pack of `objects`, each whole but the deltas `deltas` names, each `(index, base, delta)` a REF_DELTA against
+/// `base`, and where each object's entry begins.
+fn pack_with_offsets(
+  objects: &[(slates_git::object_name::Kind, &[u8])],
+  deltas: &[(usize, ObjectId, Vec<u8>)],
+) -> (Vec<u8>, Vec<u64>) {
+  use slates_git::entry::{self, Header, Representation};
+  let mut out = Vec::new();
+  let count = u32::try_from(objects.len()).expect("a count");
+  let mut writer = slates_git::pack::Writer::new(GitFormat::Sha1, count, &mut out);
+  let mut at = entry::PACK_HEADER_LEN;
+  let mut offsets = Vec::new();
+  for (index, (kind, content)) in objects.iter().enumerate() {
+    offsets.push(at);
+    let (header, data) = match deltas.iter().find(|(delta, _, _)| *delta == index) {
+      Some((_, base, delta)) => (
+        Header {
+          representation: Representation::RefDelta { base: *base },
+          size: u64::try_from(delta.len()).expect("a size"),
+        },
+        stored_zlib(delta),
+      ),
+      None => (
+        Header {
+          representation: Representation::Whole(*kind),
+          size: u64::try_from(content.len()).expect("a size"),
+        },
+        stored_zlib(content),
+      ),
+    };
+    entry::write(header, at, &mut writer).expect("the entry's header");
+    slates_git::out::Out::put(&mut writer, &data);
+    at += entry::written_len(header, at).expect("the header's length")
+      + u64::try_from(data.len()).expect("a length");
+  }
+  writer.finish().expect("the trailer");
+  (out, offsets)
+}
+
+/// A-864's push readers (main 01a20182's ruling of 2026-11-22, reader (b)): a thin push's REF_DELTA base read from a
+/// let-go window. Do: push a create of `main` at a commit of [`THIN_BASES`] files, each a window long; mark every window
+/// of its pack landed and let go those no home holds on the repository's shard; push, as stock git sends a thin pack, a
+/// commit over `main` changing one file whose window was let go, its new version a REF_DELTA against the old. Expect:
+/// both pushes `200` with every ref `ok`, the second's base brought back from the node's store. Red before: the second
+/// declined, its base unread ("an object it names cannot be read").
+#[test]
+fn a_thin_push_whose_base_was_let_go_lands() {
+  use slates_git::object_name::Kind;
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let window = crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
+    state
+      .vcs_stores
+      .content()
+      .map(slates_vcs::ContentStore::window)
+  })
+  .unwrap_or(1 << 18);
+  let mut state = 0x9e37_79b9_7f4a_7c15u64;
+  let files: Vec<Vec<u8>> = (0..THIN_BASES)
+    .map(|_| {
+      (0..window)
+        .map(|_| {
+          state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+          state.to_be_bytes()[0]
+        })
+        .collect()
+    })
+    .collect();
+  let tree_of = |files: &[Vec<u8>]| {
+    let mut tree = Vec::new();
+    for (at, file) in files.iter().enumerate() {
+      tree.extend_from_slice(format!("100644 f{at}\0").as_bytes());
+      tree.extend_from_slice(git_name(Kind::Blob, file).as_bytes());
+    }
+    tree
+  };
+  let tree = tree_of(&files);
+  let first = format!(
+    "tree {}\nauthor A <a@example.com> 1700000000 +0000\ncommitter A <a@example.com> 1700000000 +0000\n\nfirst\n",
+    git_name(Kind::Tree, &tree)
+  )
+  .into_bytes();
+  let first_id = git_name(Kind::Commit, &first);
+  let mut objects: Vec<(Kind, &[u8])> = vec![(Kind::Commit, &first), (Kind::Tree, &tree)];
+  objects.extend(files.iter().map(|file| (Kind::Blob, file.as_slice())));
+  let (pack, offsets) = pack_with_offsets(&objects, &[]);
+  let mut request = Vec::new();
+  let line = format!("{ZERO} {first_id} refs/heads/main\0 report-status");
+  pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("the command");
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request.extend_from_slice(&pack);
+  let created = pushed(edge, &name, &request);
+  let ids: Vec<slates_vcs::ContentId> =
+    pack.chunks(window).map(slates_vcs::ContentId::of).collect();
+  let pack_identity = slates_vcs::ContentId::of(&pack);
+  let gone: Vec<bool> = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    // The pack's home here, where it holds the pack for the region, records its windows and lets them go first, as a
+    // landed pack's let-go tells it (A-724 piece 8c, goal 93 item 2b(b)): a window of an object the region holds is
+    // pinned until then (`vcs_store::landed_pin`).
+    crate::vcs_store::homes::landed_pack_here(state, pack_identity);
+    crate::vcs_store::within_budget(state, 0, |stores| {
+      let content = stores.content_mut().expect("the content store");
+      for id in &ids {
+        content.mark_landed(id);
+      }
+    });
+    ids
+      .iter()
+      .map(|id| {
+        matches!(
+          crate::vcs_store::let_go_read(state, id),
+          Ok(_) | Err(slates_vcs::LetGoRefused::Away)
+        )
+      })
+      .collect()
+  });
+  // A file whose entry begins in a window let go: the thin push's base.
+  let window_u64 = u64::try_from(window).expect("a window");
+  let changed = (0..THIN_BASES).find(|file| {
+    let at = usize::try_from(offsets[2 + file] / window_u64).expect("an index");
+    gone.get(at).copied().unwrap_or(false)
+  });
+  let Some(changed) = changed else {
+    daemon.stop();
+    panic!("no file's window let go: {gone:?}");
+  };
+  let mut next = files.clone();
+  next[changed].extend_from_slice(b"one line more\n");
+  let next_tree = tree_of(&next);
+  let second = format!(
+    "tree {}\nparent {first_id}\nauthor A <a@example.com> 1700000001 +0000\ncommitter A <a@example.com> 1700000001 +0000\n\nsecond\n",
+    git_name(Kind::Tree, &next_tree)
+  )
+  .into_bytes();
+  let second_id = git_name(Kind::Commit, &second);
+  let delta = slates_git::store::delta_of(&files[changed], &next[changed]).expect("a delta");
+  let base = git_name(Kind::Blob, &files[changed]);
+  let thin: Vec<(Kind, &[u8])> = vec![
+    (Kind::Commit, &second),
+    (Kind::Tree, &next_tree),
+    (Kind::Blob, &next[changed]),
+  ];
+  let (thin_pack, _) = pack_with_offsets(&thin, &[(2, base, delta)]);
+  let mut request = Vec::new();
+  let line = format!("{first_id} {second_id} refs/heads/main\0 report-status");
+  pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("the command");
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request.extend_from_slice(&thin_pack);
+  let updated = pushed(edge, &name, &request);
+  let brought = counted_on(&daemon, REPOSITORY, "vcs_store.read_through.brought_back");
+  eprintln!(
+    "thin push: brought {brought}, refused {}, past patience {}",
+    counted_on(&daemon, REPOSITORY, "vcs_store.git_resident.refused"),
+    counted_on(
+      &daemon,
+      REPOSITORY,
+      "vcs_store.git_resident.bring_back_past_patience"
+    )
+  );
+  daemon.stop();
+  for (what, answer) in [("the create", &created), ("the thin push", &updated)] {
+    let report = String::from_utf8_lossy(&answer.1).into_owned();
+    assert_eq!(
+      (answer.0, report.contains("ok refs/heads/main")),
+      (200, true),
+      "{what}: {report}"
+    );
+  }
+  assert!(brought > 0, "the thin push's base brought back");
+}
+
+/// A-864's push readers (main 01a20182's ruling of 2026-11-22, reader (c)): a verdict's read of an object the repository
+/// holds in a let-go window. Do: push a line of [`THIN_BASES`] commits, each adding a file a content window long; mark
+/// every window of the pack landed and let go those no home holds on the repository's shard; then create `refs/heads/other`
+/// at a commit of the line whose entry lies in a window let go, as stock git does with an empty pack. Expect: both
+/// pushes `200` with their refs `ok`, the commit's window brought back. The create's work is built before its verdict
+/// (A-752), through the green build's read-through (reader (a), w-shared's), which brings the commit back, so the
+/// verdict reads it held: this holds (c) covered by (a) and (b).
+#[test]
+fn a_create_at_a_commit_let_go_lands() {
+  use slates_git::object_name::Kind;
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let window = crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
+    state
+      .vcs_stores
+      .content()
+      .map(slates_vcs::ContentStore::window)
+  })
+  .unwrap_or(1 << 18);
+  let mut state = 0x6a09_e667_f3bc_c908u64;
+  let mut owned: Vec<(Kind, Vec<u8>)> = Vec::new();
+  let mut commits = Vec::new();
+  let mut parent: Option<ObjectId> = None;
+  for at in 0..THIN_BASES {
+    let file: Vec<u8> = (0..window)
+      .map(|_| {
+        state = state
+          .wrapping_mul(6_364_136_223_846_793_005)
+          .wrapping_add(1_442_695_040_888_963_407);
+        state.to_be_bytes()[0]
+      })
+      .collect();
+    let mut tree = format!("100644 f{at}\0").into_bytes();
+    tree.extend_from_slice(git_name(Kind::Blob, &file).as_bytes());
+    let parent_line = parent
+      .map(|parent| format!("parent {parent}\n"))
+      .unwrap_or_default();
+    let commit = format!(
+      "tree {}\n{parent_line}author A <a@example.com> 1700000000 +0000\ncommitter A <a@example.com> 1700000000 +0000\n\nc{at}\n",
+      git_name(Kind::Tree, &tree)
+    )
+    .into_bytes();
+    let id = git_name(Kind::Commit, &commit);
+    commits.push((owned.len(), id));
+    owned.push((Kind::Commit, commit));
+    owned.push((Kind::Tree, tree));
+    owned.push((Kind::Blob, file));
+    parent = Some(id);
+  }
+  let objects: Vec<(Kind, &[u8])> = owned
+    .iter()
+    .map(|(kind, bytes)| (*kind, bytes.as_slice()))
+    .collect();
+  let (pack, offsets) = pack_with_offsets(&objects, &[]);
+  let head = parent.expect("a head");
+  let mut request = Vec::new();
+  let line = format!("{ZERO} {head} refs/heads/main\0 report-status");
+  pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("the command");
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request.extend_from_slice(&pack);
+  let created = pushed(edge, &name, &request);
+  let ids: Vec<slates_vcs::ContentId> =
+    pack.chunks(window).map(slates_vcs::ContentId::of).collect();
+  let pack_identity = slates_vcs::ContentId::of(&pack);
+  let gone: Vec<bool> = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    // The repository goes idle first: the objects its reads keep lately, the line's commits among them, given back, so
+    // the create's verdict reads its commit from its window.
+    for id in state.vcs_stores.git_repositories() {
+      crate::vcs_store::git_encode::give_back_idle(state, id);
+    }
+    // The pack's home here, where it holds the pack for the region, records its windows and lets them go first, as a
+    // landed pack's let-go tells it (A-724 piece 8c, goal 93 item 2b(b)): a window of an object the region holds is
+    // pinned until then (`vcs_store::landed_pin`).
+    crate::vcs_store::homes::landed_pack_here(state, pack_identity);
+    crate::vcs_store::within_budget(state, 0, |stores| {
+      let content = stores.content_mut().expect("the content store");
+      for id in &ids {
+        content.mark_landed(id);
+      }
+    });
+    ids
+      .iter()
+      .map(|id| {
+        matches!(
+          crate::vcs_store::let_go_read(state, id),
+          Ok(_) | Err(slates_vcs::LetGoRefused::Away)
+        )
+      })
+      .collect()
+  });
+  let window_u64 = u64::try_from(window).expect("a window");
+  let target = commits.iter().find(|(index, _)| {
+    let at = usize::try_from(offsets[*index] / window_u64).expect("an index");
+    gone.get(at).copied().unwrap_or(false)
+  });
+  let Some((_, target)) = target.copied() else {
+    daemon.stop();
+    panic!("no commit's window let go: {gone:?}");
+  };
+  let (empty, _) = pack_with_offsets(&[], &[]);
+  let mut request = Vec::new();
+  let line = format!("{ZERO} {target} refs/heads/other\0 report-status");
+  pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("the command");
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request.extend_from_slice(&empty);
+  let branched = pushed(edge, &name, &request);
+  let brought = counted_on(&daemon, REPOSITORY, "vcs_store.read_through.brought_back");
+  daemon.stop();
+  for (what, answer, line) in [
+    ("the line", &created, "ok refs/heads/main"),
+    ("the create", &branched, "ok refs/heads/other"),
+  ] {
+    let report = String::from_utf8_lossy(&answer.1).into_owned();
+    assert_eq!(
+      (answer.0, report.contains(line)),
+      (200, true),
+      "{what}: {report}"
+    );
+  }
+  assert!(brought > 0, "the commit's window brought back");
 }

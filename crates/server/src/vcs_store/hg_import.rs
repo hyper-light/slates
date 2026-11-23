@@ -98,10 +98,10 @@ pub(crate) struct Importing {
   segments: std::collections::VecDeque<slates_hg::import::emit::Segment>,
   /// Each segment handed to the store to land and not yet landed, oldest first: its file revisions' contents, let go of
   /// the content store once it is durable (A-767 C1 step 2b, [`segment_landed`]).
-  landing: std::collections::VecDeque<Vec<slates_vcs::ContentId>>,
+  landing: std::collections::VecDeque<Vec<slates_hg::filerev::FileContents>>,
   /// The file revisions' contents of every segment landed so far, let go once more once the import lands: its works
   /// bring back what they read between (A-767 C1 step 2b, as a push's run, `hg_run`).
-  landed_contents: Vec<slates_vcs::ContentId>,
+  landed_contents: Vec<slates_hg::filerev::FileContents>,
   /// The run of segment changesets landed so far: the first's sequence and the last's.
   run: Option<(u64, u64)>,
   /// The last changeset the register named when the import began: what the repository's next sequence is counted from
@@ -470,7 +470,7 @@ pub(crate) fn segment_landed(
   // entries kept, so the rows still name them by identity (A-767 C1 step 2b): every window but those a home pins, as a
   // push's (`hg_run::let_go_windows`). Kept for the second let-go once it lands, since its works bring back what they
   // read in between.
-  let (freed, pinned) = crate::repository::hg_run::let_go_windows(state, &contents);
+  let (freed, pinned) = crate::repository::hg_run::let_go_windows(state, None, &contents);
   state.count(FILE_TEXT_BYTES_LET_GO, freed);
   state.count(FILE_TEXTS_PINNED, pinned);
   if let Some(importing) = state.vcs_stores.imports.get_mut(&id) {
@@ -835,8 +835,10 @@ pub(crate) fn land(state: &mut ShardState, id: RepositoryId) -> Result<(), Impor
   match appended {
     Ok(_) => {
       state.count(LANDED, 1);
-      // Landed, its texts let go once more: its works brought back what they read (A-767 C1 step 2b).
-      let (freed, pinned) = crate::repository::hg_run::let_go_windows(state, &landed_contents);
+      // Landed, its texts noted for a home and let go once more: its works brought back what they read (A-767 C1 step
+      // 2b), and its index now holds them, by which a home's read brings one back (goal 93 item 2b(b)).
+      let (freed, pinned) =
+        crate::repository::hg_run::let_go_windows(state, Some(id), &landed_contents);
       state.count(FILE_TEXT_BYTES_LET_GO, freed);
       state.count(FILE_TEXTS_PINNED, pinned);
       Ok(())

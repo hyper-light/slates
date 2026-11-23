@@ -311,15 +311,30 @@ pub(crate) fn let_go_here(state: &mut ShardState, identity: &ContentId) -> Resul
     return Err(HomeRefused::NotHeld);
   }
   super::lend(&mut state.store, &mut state.vcs_stores, 0);
-  let released = {
+  let (released, freed) = {
     let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
     lent
       .stores
       .content
       .as_mut()
-      .map(|content| content.release(identity))
+      .map_or((None, Vec::new()), |content| {
+        let layout = content.object_layout(identity);
+        let released = content.release(identity);
+        // The landed records of the windows freed with it dropped (goal 93 item 2b(b)): no read here names them again.
+        let freed: Vec<ContentId> = layout
+          .into_iter()
+          .map(|(window, _)| window)
+          .filter(|window| !content.contains(window))
+          .collect();
+        (Some(released), freed)
+      })
   };
   super::settle(state);
+  for window in freed {
+    if landed(&window).is_some() {
+      landed_changed(window, None);
+    }
+  }
   match released {
     Some(Ok(_)) => {
       state.count(LET_GO, 1);
@@ -364,14 +379,36 @@ pub(crate) async fn read(
   budget_ns: u64,
 ) -> Option<Vec<u8>> {
   let target = home_of(shards, &identity)?;
-  let bytes = crate::xshard::call_in_shard_time(
+  let mut bytes = crate::xshard::call_in_shard_time(
     origin,
     target,
     move |state| read_here(state, &identity),
     budget_ns,
   )
   .await
-  .flatten()?;
+  .flatten();
+  // A window let go where a landed pack carried it: brought back on its home from the node's store by its record, then
+  // read again (goal 93 item 2b(b)).
+  if bytes.is_none()
+    && crate::xshard::task_in_shard_time(
+      origin,
+      target,
+      move || bring_back_landed(identity),
+      budget_ns,
+    )
+    .await
+    .unwrap_or(false)
+  {
+    bytes = crate::xshard::call_in_shard_time(
+      origin,
+      target,
+      move |state| read_here(state, &identity),
+      budget_ns,
+    )
+    .await
+    .flatten();
+  }
+  let bytes = bytes?;
   // A home answers the bytes it keeps under the identity, which its store named by their hash; checked again here, so a
   // window read across shards is never other bytes than its name (§4.17.1 item 5's rule on arrival, kept on reading).
   (ContentId::of(&bytes) == identity).then_some(bytes)
@@ -510,7 +547,8 @@ pub(crate) async fn home_many(
 }
 
 /// Reads every window of `identities` from its home, from shard `origin` (module docs, "In batches"): each one's bytes,
-/// in order, checked against its name, or none.
+/// in order, checked against its name, or none. One its home let go once landed is read again alone ([`read`]), which
+/// brings it back by its record.
 pub(crate) async fn read_many(
   origin: u16,
   shards: &[u16],
@@ -518,16 +556,16 @@ pub(crate) async fn read_many(
   budget_ns: u64,
 ) -> Vec<Option<Vec<u8>>> {
   let items: Vec<(ContentId, ())> = identities.iter().map(|identity| (*identity, ())).collect();
-  per_home(origin, shards, items, budget_ns, read_item)
-    .await
-    .into_iter()
-    .zip(identities)
-    .map(|(answer, identity)| {
-      answer
-        .flatten()
-        .filter(|bytes| ContentId::of(bytes) == *identity)
-    })
-    .collect()
+  let answers = per_home(origin, shards, items, budget_ns, read_item).await;
+  let mut read_back = Vec::with_capacity(answers.len());
+  for (answer, identity) in answers.into_iter().zip(identities) {
+    let bytes = match answer.flatten() {
+      Some(bytes) => Some(bytes),
+      None => read(origin, shards, *identity, budget_ns).await,
+    };
+    read_back.push(bytes.filter(|bytes| ContentId::of(bytes) == *identity));
+  }
+  read_back
 }
 
 /// Lets go one holder of every window of `identities` at its home, from shard `origin` (module docs, "In batches"):
@@ -552,10 +590,375 @@ std::thread_local! {
   /// windows its content store holds.
   static REGION_HELD: std::cell::RefCell<std::collections::BTreeSet<ContentId>> =
     const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+  /// The windows of the objects this shard holds for the region, each with how many of them it lies in: what pins a
+  /// window once landed (`vcs_store::landed_pin`), since a region hold names its object and an object longer than a
+  /// window is a list whose windows have identities of their own (codex-review, 2026-11-22: a Mercurial file sharing a
+  /// region object's first window let it go, and the home read the object as none). Bounded by those objects' windows.
+  static REGION_WINDOWS: std::cell::RefCell<std::collections::BTreeMap<ContentId, u32>> =
+    const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
   /// The region holds kept (true) or let go (false) since the shard's last committed publication: what a delta of the
   /// shard image carries ([`region_changes`]), so a home's holds survive its restart (A-724 piece 8c). Bounded by them.
   static REGION_CHANGES: std::cell::RefCell<std::collections::BTreeMap<ContentId, bool>> =
     const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+/// Where a window a home holds lies on the node's store, once a landed push's pack carried it (goal 93 item 2b(b); main
+/// 01a20182's ruling of 2026-11-22 06:58): the pack's identity (the plain BLAKE3 of its bytes, the key the node's store
+/// keeps its `Payload` under), its length, and the window's offset in it. With it a home lets its copy go once landed and
+/// brings it back by its identity on a read ([`bring_back_landed`]), so a home's reader reaches its bytes as a repository's
+/// does, and the window needs no pin ([`landed_at`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LandedAt {
+  /// The pack's identity on the node's store.
+  pub(crate) pack: ContentId,
+  /// The pack's length.
+  pub(crate) len: u64,
+  /// The window's offset in the pack.
+  pub(crate) offset: u64,
+}
+
+/// Format: a [`LandedAt`]'s bytes in the shard image: the pack's identity, its length and the window's offset, each
+/// little-endian after the identity.
+const LANDED_AT_BYTES: usize = slates_vcs::content::IDENTITY_BYTES + 8 + 8;
+
+impl LandedAt {
+  /// Its bytes in the shard image.
+  pub(crate) fn to_bytes(self) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(LANDED_AT_BYTES);
+    bytes.extend_from_slice(&self.pack.0);
+    bytes.extend_from_slice(&self.len.to_le_bytes());
+    bytes.extend_from_slice(&self.offset.to_le_bytes());
+    bytes
+  }
+
+  /// One read back from the shard image; none for bytes of another length.
+  pub(crate) fn from_bytes(bytes: &[u8]) -> Option<LandedAt> {
+    if bytes.len() != LANDED_AT_BYTES {
+      return None;
+    }
+    let (pack, rest) = bytes.split_at_checked(slates_vcs::content::IDENTITY_BYTES)?;
+    let (len, offset) = rest.split_at_checked(8)?;
+    Some(LandedAt {
+      pack: ContentId::from_slice(pack)?,
+      len: u64::from_le_bytes(len.try_into().ok()?),
+      offset: u64::from_le_bytes(offset.try_into().ok()?),
+    })
+  }
+}
+
+/// What brings back a window this shard let go once landed (goal 93 item 2b(b)): where a landed pack carried it, read by
+/// the pack's identity ([`LandedAt`], git), or the file revision it holds, read through its repository's own reader
+/// ([`HgLanded`], Mercurial: a revision's text after its metadata block is no store row's key, so it is found by its path
+/// and node; w-hg's note of 2026-11-22, main 01a20182's ruling of 18:43).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Landed {
+  /// A window of a landed git pack.
+  Pack(LandedAt),
+  /// A window of a Mercurial file revision.
+  Hg(HgLanded),
+}
+
+/// A Mercurial file revision a window let go holds ([`Landed::Hg`]): its repository, its path and its node, by which the
+/// repository's reader asks the node's store for its text (`StoreHandle::texts_by_tool`) and puts its windows back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HgLanded {
+  /// The repository.
+  pub(crate) repository: slates_db::catalog::RepositoryId,
+  /// The file's path in it.
+  pub(crate) path: Vec<u8>,
+  /// The revision's node.
+  pub(crate) node: [u8; 20],
+}
+
+/// Format: the fixed head of an [`HgLanded`]'s bytes in the shard image: the repository's 16 bytes, the node's 20; the
+/// path follows, to the piece's end.
+const HG_LANDED_HEAD: usize = 16 + 20;
+
+impl HgLanded {
+  /// Its bytes in the shard image.
+  pub(crate) fn to_bytes(&self) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(HG_LANDED_HEAD.saturating_add(self.path.len()));
+    bytes.extend_from_slice(&self.repository.bytes);
+    bytes.extend_from_slice(&self.node);
+    bytes.extend_from_slice(&self.path);
+    bytes
+  }
+
+  /// One read back from the shard image; none for bytes shorter than its head.
+  pub(crate) fn from_bytes(bytes: &[u8]) -> Option<HgLanded> {
+    let (repository, rest) = bytes.split_at_checked(16)?;
+    let (node, path) = rest.split_at_checked(20)?;
+    Some(HgLanded {
+      repository: slates_db::catalog::RepositoryId {
+        bytes: repository.try_into().ok()?,
+      },
+      path: path.to_vec(),
+      node: node.try_into().ok()?,
+    })
+  }
+}
+
+std::thread_local! {
+  /// What brings back each window this shard let go once landed ([`Landed`]); bounded by the windows it holds, each one
+  /// dropped when the window is freed.
+  static LANDED: std::cell::RefCell<std::collections::BTreeMap<ContentId, Landed>> =
+    const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+  /// The records made (`true`) or dropped (`false`) since this shard's last committed publication, each with what it
+  /// was, so the image names its kind: the image carries them.
+  static LANDED_CHANGES: std::cell::RefCell<std::collections::BTreeMap<ContentId, (Landed, bool)>> =
+    const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+/// What brings back the window `identity` this shard let go once landed, if anything does.
+pub(crate) fn landed(identity: &ContentId) -> Option<Landed> {
+  LANDED.with(|landed| landed.try_borrow().ok()?.get(identity).cloned())
+}
+
+/// Where the window `identity` this shard holds lies on the node's store, where a landed pack carried it.
+pub(crate) fn landed_at(identity: &ContentId) -> Option<LandedAt> {
+  match landed(identity)? {
+    Landed::Pack(at) => Some(at),
+    Landed::Hg(_) => None,
+  }
+}
+
+/// Notes what brings back the window `identity` once its owner lets it go landed (goal 93 item 2b(b)): a Mercurial file
+/// revision's, as its push or import lets its windows go (`repository::hg_run::let_go_windows`), on the shard that lets
+/// them go and before it does. A window noted is not pinned (`vcs_store::landed_pin`), since a home's read brings it back
+/// by its note ([`bring_back_landed`]).
+pub(crate) fn note_landed(identity: ContentId, landed: Landed) {
+  landed_changed(identity, Some(landed));
+}
+
+/// Notes `landed` for the window `identity`, or drops its record (`None`), and the change for the shard image.
+fn landed_changed(identity: ContentId, landed: Option<Landed>) {
+  let change = LANDED.with(|held| {
+    let mut held = held.try_borrow_mut().ok()?;
+    match landed {
+      Some(landed) => {
+        held.insert(identity, landed.clone());
+        Some((landed, true))
+      }
+      None => held.remove(&identity).map(|was| (was, false)),
+    }
+  });
+  if let Some(change) = change {
+    LANDED_CHANGES.with(|changes| {
+      if let Ok(mut changes) = changes.try_borrow_mut() {
+        changes.insert(identity, change);
+      }
+    });
+  }
+}
+
+/// The landed records made (`true`) or dropped (`false`) since this shard's last committed publication, each with what
+/// it was, for its delta.
+pub(crate) fn landed_changes() -> Vec<(ContentId, Landed, bool)> {
+  LANDED_CHANGES.with(|changes| {
+    changes
+      .try_borrow()
+      .map(|changes| {
+        changes
+          .iter()
+          .map(|(identity, (landed, made))| (*identity, landed.clone(), *made))
+          .collect()
+      })
+      .unwrap_or_default()
+  })
+}
+
+/// Every landed record this shard keeps, for its checkpoint's image.
+pub(crate) fn landed_here() -> Vec<(ContentId, Landed)> {
+  LANDED.with(|landed| {
+    landed
+      .try_borrow()
+      .map(|landed| {
+        landed
+          .iter()
+          .map(|(identity, landed)| (*identity, landed.clone()))
+          .collect()
+      })
+      .unwrap_or_default()
+  })
+}
+
+/// A publication of this shard committed: the landed records' changes it carried are forgotten.
+pub(crate) fn landed_changes_committed() {
+  LANDED_CHANGES.with(|changes| {
+    if let Ok(mut changes) = changes.try_borrow_mut() {
+      changes.clear();
+    }
+  });
+}
+
+/// The landed records a recovered shard image carried, taken back as they were: no store is read for them.
+pub(crate) fn restore_landed(records: &[(ContentId, Landed)]) {
+  LANDED.with(|landed| {
+    if let Ok(mut landed) = landed.try_borrow_mut() {
+      landed.extend(records.iter().cloned());
+    }
+  });
+}
+
+/// Records where each of `windows` lies on the node's store, on this shard, for the ones it holds, and lets each go once
+/// landed (goal 93 item 2b(b)): a home, which reads by identity, brings it back through the record
+/// ([`bring_back_landed`]), so nothing pins it. How many were let go, and their bytes. A window held here no more is
+/// passed over.
+pub(crate) fn record_landed_here(
+  state: &mut ShardState,
+  windows: &[(ContentId, LandedAt)],
+) -> (u64, u64) {
+  let mut recorded = Vec::new();
+  let freed = super::within_budget(state, 0, |stores| {
+    let Some(content) = stores.content_mut() else {
+      return (0, 0);
+    };
+    let (mut count, mut bytes) = (0u64, 0u64);
+    for (identity, at) in windows {
+      if !content.contains(identity) || !content.mark_landed(identity) {
+        continue;
+      }
+      recorded.push((*identity, *at));
+      if let Ok(freed) = content.let_go_landed(identity, None) {
+        count = count.saturating_add(1);
+        bytes = bytes.saturating_add(freed);
+      }
+    }
+    (count, bytes)
+  });
+  for (identity, at) in recorded {
+    landed_changed(identity, Some(Landed::Pack(at)));
+  }
+  if freed.1 > 0 {
+    state.count(LANDED_HOME_LET_GO_BYTES, freed.1);
+  }
+  freed
+}
+
+/// Format: the status counter of the bytes homes let go of windows a landed pack carried (goal 93 item 2b(b)).
+pub(crate) const LANDED_HOME_LET_GO_BYTES: &str = "vcs_store.homes.landed_let_go_bytes";
+/// Format: the status counter of windows a home brought back from the node's store by their record.
+pub(crate) const LANDED_BROUGHT_BACK: &str = "vcs_store.homes.landed_brought_back";
+
+/// Brings back the window or object `identity` this shard holds, each of its windows let go read where its record says
+/// it lies on the node's store ([`Landed`]): a landed pack's window ([`LandedAt`]) a piece at a time off the shard's
+/// step, then put back by its identity within the step's lent room; a Mercurial file revision's ([`HgLanded`]) by its
+/// repository's reader (`repository::hg_push::bring_back`), once for each revision however many of the object's windows
+/// it holds. True where it is held here whole after (brought back, or never let go).
+pub(crate) async fn bring_back_landed(identity: ContentId) -> bool {
+  let (disk, (away, revisions)) = crate::state::with_state(|state| {
+    let mut away: Vec<(ContentId, LandedAt, u64)> = Vec::new();
+    let mut revisions: Vec<HgLanded> = Vec::new();
+    if let Some(content) = state.vcs_stores.content() {
+      for (window, _) in content.object_layout(&identity) {
+        if !content.is_away(&window) {
+          continue;
+        }
+        match landed(&window) {
+          Some(Landed::Pack(at)) => {
+            if let Some(len) = content.len_of(&window) {
+              away.push((window, at, len));
+            }
+          }
+          Some(Landed::Hg(revision)) => {
+            if !revisions.contains(&revision) {
+              revisions.push(revision);
+            }
+          }
+          None => {}
+        }
+      }
+    }
+    (state.vcs_disk.clone(), (away, revisions))
+  })
+  .unwrap_or_default();
+  for revision in revisions {
+    let HgLanded {
+      repository,
+      path,
+      node,
+    } = revision;
+    if !crate::repository::hg_push::bring_back(repository, (path, node)).await {
+      return false;
+    }
+  }
+  if let Some(disk) = disk {
+    for (window, at, len) in away {
+      let Some(bytes) = landed_bytes(&disk, at, len).await else {
+        return false;
+      };
+      let back = crate::state::with_state(|state| {
+        let back = super::within_budget(state, len, |stores| {
+          stores
+            .content_mut()
+            .is_some_and(|content| content.bring_back(&window, &bytes).is_ok())
+        });
+        if back {
+          state.count(LANDED_BROUGHT_BACK, 1);
+        }
+        back
+      })
+      .unwrap_or(false);
+      if !back {
+        return false;
+      }
+    }
+  }
+  crate::state::with_state(|state| {
+    state
+      .vcs_stores
+      .content()
+      .is_some_and(|content| content.holds_whole(&identity))
+  })
+  .unwrap_or(false)
+}
+
+/// The `len` bytes of a window where `at` says it lies on the node's store `disk`, read a piece at a time; none where the
+/// store answers short or the room for them is refused.
+async fn landed_bytes(
+  disk: &slates_store::owner::StoreHandle,
+  at: LandedAt,
+  len: u64,
+) -> Option<Vec<u8>> {
+  let mut bytes = Vec::new();
+  bytes
+    .try_reserve_exact(usize::try_from(len).unwrap_or(usize::MAX))
+    .ok()?;
+  let end = at.offset.saturating_add(len);
+  let mut offset = at.offset;
+  while offset < end {
+    let piece = disk.piece(at.pack.0, at.len, offset).await.ok()??;
+    if piece.is_empty() {
+      return None;
+    }
+    let want = usize::try_from(end.saturating_sub(offset)).unwrap_or(usize::MAX);
+    let taken = piece.get(..want.min(piece.len())).unwrap_or_default();
+    bytes.extend_from_slice(taken);
+    offset = offset.saturating_add(u64::try_from(taken.len()).unwrap_or(u64::MAX));
+  }
+  Some(bytes)
+}
+
+/// The pack `pack` landed on the node's store (goal 93 item 2b(b)): where this shard holds it for the region, as its
+/// home, each of its windows recorded where it lies in the pack and let go ([`record_landed_here`]). How many were let
+/// go, and their bytes; nothing where the region's hold of it is not here.
+pub(crate) fn landed_pack_here(state: &mut ShardState, pack: ContentId) -> (u64, u64) {
+  if region_holds_here(&pack) == 0 {
+    return (0, 0);
+  }
+  let records: Vec<(ContentId, LandedAt)> =
+    state.vcs_stores.content().map_or_else(Vec::new, |content| {
+      let layout = content.object_layout(&pack);
+      // The pack's length, its windows' summed: its root names a list where it is longer than a window.
+      let len = layout.last().map_or(0, |(window, offset)| {
+        offset.saturating_add(content.len_of(window).unwrap_or(0))
+      });
+      layout
+        .into_iter()
+        .map(|(window, offset)| (window, LandedAt { pack, len, offset }))
+        .collect()
+    });
+  record_landed_here(state, &records)
 }
 
 /// Marks the region hold of `identity` kept or let go since the last committed publication ([`REGION_CHANGES`]).
@@ -617,6 +1020,7 @@ pub(crate) fn restore_region_holds(
     });
     if kept {
       held = held.saturating_add(1);
+      region_windows_changed(content, identity, true);
     } else {
       // Held in the store, but not named as the region's: given back, so the store's count and the set agree.
       let _ = content.release(identity);
@@ -644,13 +1048,48 @@ pub(crate) fn keep_for_region(
     return Ok((identity, ticket_here(state.shard)));
   }
   let kept = keep_here(state, bytes)?;
-  REGION_HELD.with(|held| {
-    if let Ok(mut held) = held.try_borrow_mut() {
-      held.insert(kept.0);
-    }
+  let inserted = REGION_HELD.with(|held| {
+    held
+      .try_borrow_mut()
+      .is_ok_and(|mut held| held.insert(kept.0))
   });
+  if inserted && let Some(content) = state.vcs_stores.content() {
+    region_windows_changed(content, &kept.0, true);
+  }
   region_changed(kept.0, true);
   Ok(kept)
+}
+
+/// Counts the windows of the object `identity` in `content` into ([`REGION_WINDOWS`]), as its region hold is taken
+/// (`held`), or out of it, as it is given back.
+fn region_windows_changed(content: &slates_vcs::ContentStore, identity: &ContentId, held: bool) {
+  let windows = content.object_layout(identity);
+  REGION_WINDOWS.with(|counted| {
+    let Ok(mut counted) = counted.try_borrow_mut() else {
+      return;
+    };
+    for (window, _) in windows {
+      if held {
+        let count = counted.entry(window).or_insert(0);
+        *count = count.saturating_add(1);
+      } else if let Some(count) = counted.get_mut(&window) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+          counted.remove(&window);
+        }
+      }
+    }
+  });
+}
+
+/// Whether the window `identity` lies in an object this shard holds for the region ([`REGION_WINDOWS`]): a landed
+/// window's pin (`vcs_store::landed_pin`).
+pub(crate) fn region_holds_window(identity: &ContentId) -> bool {
+  REGION_WINDOWS.with(|counted| {
+    counted
+      .try_borrow()
+      .is_ok_and(|counted| counted.contains_key(identity))
+  })
 }
 
 /// Lets go this shard's region hold of the window `identity` (module docs, "From the region"): `NotHeld` where the region
@@ -666,6 +1105,9 @@ pub(crate) fn let_go_for_region(
   });
   if !held {
     return Err(HomeRefused::NotHeld);
+  }
+  if let Some(content) = state.vcs_stores.content() {
+    region_windows_changed(content, identity, false);
   }
   region_changed(*identity, false);
   let_go_here(state, identity)

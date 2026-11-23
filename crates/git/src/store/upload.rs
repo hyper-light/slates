@@ -479,6 +479,9 @@ pub struct Upload<A> {
   last_stop: Option<(ContentId, u64)>,
   /// Whether the stream has stopped at a let-go window at all: its look-ahead begins then ([`Upload::reading_next`]).
   stopped_any: bool,
+  /// The loose stage's objects charged their placement and put back before they were placed, by a stop or their base
+  /// going first: retaken, none is charged again. At most the ahead stack's and the one stopped.
+  prepaid: BTreeSet<u64>,
   /// Where the loose stage last read a pushed entry: its pack and offset (counting [`UploadCounters::backward_reads`]).
   last_read: Option<(ContentId, u64)>,
   by_entry: Option<ByEntry>,
@@ -520,6 +523,7 @@ impl<A: Answered> Upload<A> {
       waiting: core::cell::Cell::new(None),
       last_stop: None,
       stopped_any: false,
+      prepaid: BTreeSet::new(),
       last_read: None,
       by_entry: None,
       pending: None,
@@ -1320,9 +1324,13 @@ impl<A: Answered> Upload<A> {
       }
     };
     let (id, row, stored) = cx.repository.stored_at(cx.store, position)?;
-    cx.admission
-      .charge_items::<(u64, u64)>(1)
-      .map_err(|_| StoreRefused::PackTooLarge)?;
+    // Its placement is charged once (codex-review, 2026-11-22: a retaken object charged again made the count of a
+    // released pack's stops decide whether a request fit): one charged before a stop or its base's turn keeps its charge.
+    if !self.prepaid.remove(&position) {
+      cx.admission
+        .charge_items::<(u64, u64)>(1)
+        .map_err(|_| StoreRefused::PackTooLarge)?;
+    }
     self.loose_at.insert(position, self.at);
     match self.reused(cx, (id, &row, stored, position), out)? {
       Reuse::Sent(pending) => {
@@ -1331,15 +1339,18 @@ impl<A: Answered> Upload<A> {
         return Ok(next);
       }
       Reuse::BaseFirst(base) => {
-        // Placed after its base, which goes first (its charge kept for its place on `ahead`).
+        // Placed after its base, which goes first (its charge kept for when it is placed).
         self.loose_at.remove(&position);
+        self.prepaid.insert(position);
         self.ahead.push(position);
         self.ahead.push(base);
         return Ok(Stage::Loose { from });
       }
       Reuse::Stopped => {
-        // A-864 piece 2: its entry's read met a let-go window; nothing of it written or kept, it is taken again next.
+        // A-864 piece 2: its entry's read met a let-go window; nothing of it written or kept, it is taken again next, its
+        // charge kept for it.
         self.loose_at.remove(&position);
+        self.prepaid.insert(position);
         if matches!(next, Stage::Loose { from: after } if after == from) {
           self.ahead.push(position);
         }

@@ -23,9 +23,13 @@
 //! **Let go.** Once a segment is durable on the node's changeset store, which serves its texts from then on, its file
 //! revisions' windows leave the shard's content store ([`let_go_landed`]), their entries kept, so the push's fork and
 //! the index it becomes still name them by identity, and a read that meets one brings it back from the store (the
-//! intake's base reads, the works' read-through, the served view's). A window a home holds stays, as a landed git
-//! pack's does (`vcs_store::landed_pin`). So a whole-history push leaves its rows held, never its history's texts (main
-//! 01a20182's order of 2026-11-22 14:00: 4.7 GB of arena held after Mercurial's history landed).
+//! intake's base reads, the works' read-through, the served view's). Until its entry commits, a window a home holds stays,
+//! as a landed git pack's does (`vcs_store::landed_pin`): a home reads by identity alone, and the revision is not yet in
+//! the index its read-through reads. Once it commits, each window is noted with its revision for the home
+//! (`homes::note_landed`, `Landed::Hg`; goal 93 item 2b(b), w-shared's seam 1) and let go, pinned by nothing: a home's
+//! read brings it back by its path and node (`hg_push::bring_back`). So a whole-history push leaves its rows held, never
+//! its history's texts (main 01a20182's order of 2026-11-22 14:00: 4.7 GB of arena held after Mercurial's history
+//! landed; 150,880 texts pinned on shard 0 after the first let-go, CI 45101827617).
 //!
 //! **Abandoned.** A run no entry names (the push refused, its connection ended, its task cancelled) is forgotten as it
 //! ends: each of its sequences' rows dropped from the store (`StoreHandle::forget`, counted), its log bytes the owed
@@ -34,6 +38,7 @@
 //! its row the newest landing there.
 
 use slates_db::catalog::RepositoryId;
+use slates_hg::filerev::FileContents;
 use slates_hg::import::record;
 use slates_hg::push::intake::{KeptText, PushSegment};
 use slates_store::log::{Header, SectionKind, Tool};
@@ -134,9 +139,9 @@ pub(crate) struct Run {
   repository: RepositoryId,
   /// The sequences landed, ascending and apart.
   ranges: Vec<(u64, u64)>,
-  /// The content identities of its landed segments' file revisions, let go again once its entry is committed (module
-  /// docs, "Let go": a push's works bring back the texts they read between its segments and its entry).
-  contents: Vec<slates_vcs::ContentId>,
+  /// Its landed segments' file revisions, let go again and noted once its entry is committed (module docs, "Let go": a
+  /// push's works bring back the texts they read between its segments and its entry).
+  contents: Vec<FileContents>,
   /// Whether it is settled.
   settled: bool,
 }
@@ -153,7 +158,7 @@ impl Run {
   }
 
   /// Notes segment changeset `sequence` landed, after every one before, its file revisions kept as `contents`.
-  pub(crate) fn landed(&mut self, sequence: u64, contents: &[slates_vcs::ContentId]) {
+  pub(crate) fn landed(&mut self, sequence: u64, contents: &[FileContents]) {
     self.contents.extend_from_slice(contents);
     match self.ranges.last_mut() {
       Some((_, last)) if last.checked_add(1) == Some(sequence) => *last = sequence,
@@ -175,12 +180,16 @@ impl Run {
     record::write_push_runs_reference(room, &self.ranges)
   }
 
-  /// Ends the run (module docs, "Abandoned", "Let go"): where an entry named it (`committed`), its file texts let go
-  /// once more, whatever its works brought back; else forgotten.
+  /// Ends the run (module docs, "Abandoned", "Let go"): where an entry named it (`committed`), its file texts noted for a
+  /// home and let go once more, whatever its works brought back; else forgotten.
   pub(crate) fn settle(mut self, state: &mut ShardState, committed: bool) {
     self.settled = true;
     if committed {
-      let_go_landed(state, &core::mem::take(&mut self.contents));
+      let_go_landed(
+        state,
+        Some(self.repository),
+        &core::mem::take(&mut self.contents),
+      );
     } else {
       abandoned(state, self.repository, core::mem::take(&mut self.ranges));
     }
@@ -226,13 +235,19 @@ fn abandoned(state: &mut ShardState, repository: RepositoryId, ranges: Vec<(u64,
 /// (module docs, "Let go"). Format: a counter name in the status report.
 pub(crate) const TEXT_BYTES_LET_GO: &str = "vcs.hg.push_text_bytes_let_go";
 /// Counter: a landed segment's window kept because a home holds it here (`vcs_store::landed_pin`: one whose home by
-/// identity is this shard, which a home reads by identity alone and cannot bring back). Format: a counter name.
+/// identity is this shard, which a home reads by identity alone), until its entry commits and notes it. Format: a
+/// counter name.
 pub(crate) const TEXTS_PINNED: &str = "vcs.hg.push_texts_pinned";
 
-/// Lets go of `contents`, a landed segment's file revisions' windows (module docs, "Let go"): every window but those a
-/// home holds here (`vcs_store::landed_pin`), counted with its bytes, and the windows kept pinned.
-pub(crate) fn let_go_landed(state: &mut ShardState, contents: &[slates_vcs::ContentId]) {
-  let (freed, pinned) = let_go_windows(state, contents);
+/// Lets go of `contents`, a landed segment's file revisions' windows (module docs, "Let go"), each noted for a home as
+/// [`let_go_windows`] notes it where `noting` names its committed repository; counted with its bytes, and the windows
+/// kept pinned.
+pub(crate) fn let_go_landed(
+  state: &mut ShardState,
+  noting: Option<RepositoryId>,
+  contents: &[FileContents],
+) {
+  let (freed, pinned) = let_go_windows(state, noting, contents);
   if freed > 0 {
     state.count(TEXT_BYTES_LET_GO, freed);
   }
@@ -242,11 +257,16 @@ pub(crate) fn let_go_landed(state: &mut ShardState, contents: &[slates_vcs::Cont
 }
 
 /// Lets go of `contents`' windows, each object's every window marked landed: all but those a home holds here
-/// (`vcs_store::landed_pin`, as a landed git pack's), within the chunk store's lend. The bytes freed and the windows
-/// kept pinned: a push's ([`let_go_landed`]) and an import's (`hg_import::segment_landed`) one path.
+/// (`vcs_store::landed_pin`, as a landed git pack's), within the chunk store's lend. Where `noting` names the
+/// repository whose index now holds them (its entry committed, or its import landed), each window is first noted with
+/// its revision on this shard (`homes::note_landed`, `Landed::Hg`), so no home pins it and a home's read brings it back
+/// by its path and node (`hg_push::bring_back`; goal 93 item 2b(b)); a window noted already (a landed pack's, another
+/// revision's of the same bytes) keeps its note, which brings back the same bytes. The bytes freed and the windows kept
+/// pinned: a push's ([`let_go_landed`]) and an import's (`hg_import::segment_landed`) one path.
 pub(crate) fn let_go_windows(
   state: &mut ShardState,
-  contents: &[slates_vcs::ContentId],
+  noting: Option<RepositoryId>,
+  contents: &[FileContents],
 ) -> (u64, u64) {
   let (shard, shards) = (state.shard, state.shards.clone());
   // The repository's windows are the shard's chunk store's, lent to its content store for the step.
@@ -255,7 +275,15 @@ pub(crate) fn let_go_windows(
       stores.content_mut().map_or((0, 0), |content| {
         contents
           .iter()
-          .fold((0_u64, 0_u64), |(freed, pinned), identity| {
+          .flat_map(|revision| {
+            revision
+              .identities()
+              .map(move |identity| (revision, identity))
+          })
+          .fold((0_u64, 0_u64), |(freed, pinned), (revision, identity)| {
+            if let Some(repository) = noting {
+              note_windows(content, repository, revision, identity);
+            }
             let (more, kept) = content.let_go_object_landed(identity, &|window| {
               crate::vcs_store::landed_pin(shard, &shards, window)
             });
@@ -264,6 +292,29 @@ pub(crate) fn let_go_windows(
       })
     })
   })
+}
+
+/// Notes each window of `identity`, one of `revision`'s objects in `repository`, with the revision for a home on this
+/// shard (`homes::note_landed`), but a window noted already.
+fn note_windows(
+  content: &slates_vcs::ContentStore,
+  repository: RepositoryId,
+  revision: &FileContents,
+  identity: &slates_vcs::ContentId,
+) {
+  use crate::vcs_store::homes::{self, HgLanded, Landed};
+  for (window, _) in content.object_layout(identity) {
+    if homes::landed(&window).is_none() {
+      homes::note_landed(
+        window,
+        Landed::Hg(HgLanded {
+          repository,
+          path: revision.path.clone(),
+          node: revision.node,
+        }),
+      );
+    }
+  }
 }
 
 /// `repository`'s landing turn for a push's entry's commit (module docs, "Apart from the turn"), parking for it where

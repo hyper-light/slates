@@ -379,7 +379,7 @@ async fn planned(
 }
 
 /// Brings back into the content store, whole, every text `changes` name that repository `repository`'s records keep
-/// stored and the content store lacks (C2 stage B part 2 (b)): the green's increment reads each whole in the commit's
+/// stored and the content store does not hold whole (lacks, or holds with windows let go) (C2 stage B part 2 (b)): the green's increment reads each whole in the commit's
 /// step (`Building::text_bytes`), a row naming one a copy or a revert. Each brought holds one count, which the caller
 /// gives back once the commit's step ran ([`release_texts`]). None where the shard's state is gone; refused `Unstored`
 /// where the node's store could not give one whole, and what was brought given back.
@@ -400,8 +400,11 @@ async fn bring_texts(
     let content = state.vcs_stores.content();
     let mut wanted: Vec<(ContentIdentity, u64)> = Vec::new();
     for text in texts {
+      // Not held whole is lacking: an object whose landed windows were let go keeps its entry, and the commit's step
+      // reads every byte (codex-review's cold copy of 2026-11-22: a copy from r1 refused `Unstored`).
       let lacking = records.is_some_and(|records| records.stored_len(&text.identity).is_some())
-        && !content.is_some_and(|content| content.contains(&slates_vcs::ContentId(text.identity)))
+        && !content
+          .is_some_and(|content| content.holds_whole(&slates_vcs::ContentId(text.identity)))
         && !wanted
           .iter()
           .any(|(identity, _)| *identity == text.identity);

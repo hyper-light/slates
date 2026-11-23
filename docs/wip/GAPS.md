@@ -100,7 +100,9 @@
 > since a pack's answer cannot be taken again mid-pack byte for byte. (2b)(a) LANDED (w-shared): a landed push's staged
 > pack let go once no fetch is answered and no encoding runs (else owed to the idle give-back), whatever its windows'
 > holders (`ContentStore::let_go_landed`), every window a home holds here kept (`vcs_store::landed_pin`; a one-shard
-> daemon lets nothing go until (2b)(b), homes' own read-through, next).
+> daemon lets nothing go until (2b)(b), homes' own read-through, next). (2b)(b) BUILT (w-shared, A-724 piece 8c): the
+> pack's home records where each of its windows lies on the node's store (`homes::LandedAt`), lets it go and brings it
+> back on a read; the records ride the shard image, so a window with one is not pinned.
 > **HELD (main 01a20182, 2026-11-22 15:40):** no landed pack is let go or owed from a push's commit (`vcs_store::commit`),
 > since r52 (the big Studio, main 6f6e87d82) found readers that do not bring a let-go window back: once git/git's push
 > ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's tag peel through
@@ -233,6 +235,14 @@
 >   (none on bare metal). The semaphore took reply wakes over 1 ms from 3,001 to 36 in 8 rounds, and the loaded p99
 >   median from 1,766 to 976 µs (accept) and from 4,301 to 1,363 µs (conflict). The p999 stays over 1 ms on that runner,
 >   held by long verbs (codex-review's list).
+>   A shard's start, sliced by its pieces (w-perf, 2026-11-22; BENCHMARKS "84a: a shard's start held in one slice"):
+>   LANDED. Its setup after the catalog's replay ran as one unit, 12 to 21 ms on CI's macOS runner and 59 to 68 ms on
+>   the Studio. Now each piece is its own unit, a segment attach opens its object once, and a whole reusable-mark set is
+>   written a word at a time. The start's heaviest piece is a 100 GB segment's map, named in its report.
+> - **A full macOS hold channel (w-perf, 2026-11-22): FIXED.** `a_table_past_the_old_exec_limit_reaches_the_successor_whole`
+>   failed at main on the MacBook: 13 of 7,792 devices held. The first daemon's 14th hold met `ENOBUFS`: macOS's Unix
+>   datagrams refuse a send into a full receive buffer rather than block. `held::send` now waits a full channel out
+>   within its caller's liveness budget (`docs/bugs/2026-11-22-a-full-macos-hold-channel-refused-holds-the-anchor-would-have-taken.md`).
 >   The refining job's turns paced (A-783's turn, to the ceiling or to its own quantum), measured and rejected (w-perf,
 >   2026-11-22; BENCHMARKS "84a on macOS: the refining job's turns paced"): dead even with main on one runner's
 >   interleaved rounds. Stamped under TB, the loaded tail's deferred replies are submits parked behind their refinement
@@ -662,7 +672,28 @@
 >   but the 71 a home pins; the clone carries them). OPEN, main's: the pin keeps every window whose home by identity
 >   is this shard (`homes::read_here` serves any identity homed here and cannot bring one back), so about one shard's
 >   share of the texts stays, and on a one-shard node all of them; a home that brings an away window back, or a pin of
->   only what homes keep, would let them go.
+>   only what homes keep, would let them go. 2b(b)'s hg half, part 1 BUILT (w-hg, w-shared's seam 1, main's ruling of
+>   18:43): a landed file revision is brought back whole by its (path, node) (`hg_push::bring_back`: its row read, its
+>   text asked of the changeset store off the step through the work builder's own ask, `slates_hg::push::held::TextAsk`,
+>   then put back within its lent room), counted `vcs.hg.landed_texts_brought_back`. Held by
+>   `a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and_node` (49 of 120 let go, each back
+>   whole, counted once). Part 2 BUILT (w-hg, over w-shared's fc42f581c and 7663054bb): once a push's entry commits
+>   (`hg_run::Run::settle`) or an import lands, each file revision's windows are noted with its (repository, path,
+>   node) on the shard (`homes::note_landed`, `Landed::Hg`; `slates_hg::filerev::FileContents` carries them in each
+>   segment, counted in the intake's bound) and let go, pinned by nothing; a window noted already keeps its note.
+>   The let-go at segment durability notes nothing, since `bring_back` reads the committed index, so a home's window
+>   stays pinned until the commit. `homes::bring_back_landed` brings an object's hg-noted windows back by
+>   `hg_push::bring_back`, once a revision. Held by `a_region_object_sharing_a_landed_files_window_is_read_whole_from_its_home`
+>   (codex-review's case through a real push: red, the home read none; now whole, one revision brought back), and the
+>   two let-go tests now asserting every window let go and noted (red with the noting off: the 71 and 1 of 5 pinned).
+>   The test-only one-call landing builds a push's works as the driver does, planned and then built over the
+>   store's read-through (`works_whole`); `Works::Whole` and the one-call `tree::work` arm are gone, and `prepare` takes
+>   the view alone. The store-made-texts oracle compares a file by the identities its row names.
+> - A refused finish's windows given back BUILT (2026-11-22, w-hg; main's routing of w-svn's sibling sweep): the
+>   intake's last step of a file text took its writer out of the intake, so a refused node check or `finish_object`
+>   dropped it with its whole windows held and nothing to read them; both now abandon it
+>   (`a_refused_finish_gives_its_written_windows_back`: red `(true, true, 2)`, now none held). The hg crate has no
+>   other `finish_object` caller.
 > - The whole history's clones spun (main 01a20182's order of 2026-11-22 10:40; CI 45037561866: 4 spins, kills and
 >   restarts a leg, at `vcs_http.rs:850` polls 1-16 and `vcs_ssh::hg::streamed_turn` polls ~11,000). Measured over the
 >   served view of a pushed 57,054-changeset line (debug, MacBook arm64, each call the unit one step takes): a clone of
@@ -25531,6 +25562,12 @@ before; 3 queued, none refused after); this fleet test passes again (fleet `a_li
 > GiB of freed large blocks macOS's allocator keeps): it now measures the pool by its own pages (the content object and
 > the arenas' held extents). A separate daemon's heap held resident (main's r41, about 1.3 GB against 31 to 60 MB
 > live) is its own piece, the idle heap give-back.
+>
+> **Mixed-size extent sources, closed 2026-11-22.** With three pages of headroom and free mappings of
+> three and four pages, the arena kept all 16 idle pages. It now keeps four and returns 12. Growth uses
+> the same buddy rounding and leaves unusable offers available in the pool. Four focused regressions
+> cover the allocator contract. See `docs/bugs/2026-11-22-extent-claims-use-buddy-capacity.md`.
+
 `cargo test -p slates-server --test recovery a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone` (A-789,
 362bd8c39, red -> green on adas-macbook-pro-2 quiet: 1,622 -> 123 MiB) fails on main's own code on Adas-Mac-Studio-2,
 three runs of three on the merge 287055d5b: 41-42 MiB before the burst, 1,341-1,342 MiB after its volume was destroyed, for a

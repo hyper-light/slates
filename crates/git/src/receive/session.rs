@@ -503,6 +503,10 @@ impl<S: Repository + ?Sized> Repository for Fscking<'_, S> {
   fn holds(&self, id: &ObjectId) -> bool {
     self.site.holds(id)
   }
+
+  fn away(&self) -> Option<u64> {
+    self.site.away()
+  }
 }
 
 impl<S: Contents + ?Sized> Contents for Fscking<'_, S> {

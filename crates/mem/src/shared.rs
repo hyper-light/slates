@@ -532,6 +532,11 @@ fn possibly_marked(len: usize, page: usize) -> crate::ranges::UnitSet {
   }
 }
 
+std::thread_local! {
+  /// The sparse objects this thread has opened ([`SparseObject::opens_on_this_thread`]).
+  static SPARSE_OPENS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl std::fmt::Debug for SparseObject {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("SparseObject")
@@ -614,6 +619,7 @@ impl SparseObject {
   /// Opens a sparse object another process created, from its handoff, expecting `len` bytes laid out
   /// with `words`.
   pub fn open(handoff: &Handoff, len: usize, words: Words) -> Result<SparseObject, MemError> {
+    SPARSE_OPENS.with(|opens| opens.set(opens.get().saturating_add(1)));
     let words = words.layout(len)?;
     let inner = platform::open(handoff, len)?;
     let commits = platform::Commits::new(len)?;
@@ -631,6 +637,21 @@ impl SparseObject {
   /// What to hand another process so it can [`SparseObject::open`] this object.
   pub fn handoff(&self) -> Result<Handoff, MemError> {
     self.inner.handoff()
+  }
+
+  /// This object with `words` declared: for an opener that learns the layout from a header it first read by copy (the
+  /// anchor's segment), so it opens the object once. By value, so no atomic view of the old layout can outlive the
+  /// change; the new layout is checked like a created one, so a hostile header that would overlap or misalign words is
+  /// refused. As [`SharedObject::declare`].
+  pub fn declare(self, words: Words) -> Result<SparseObject, MemError> {
+    let words = words.layout(self.len)?;
+    Ok(SparseObject { words, ..self })
+  }
+
+  /// The sparse objects this thread has opened ([`SparseObject::open`]): each open maps the object and, on macOS,
+  /// makes its whole reusable-mark set, so an opener holds itself to one open an object (84a, w-perf 2026-11-22).
+  pub fn opens_on_this_thread() -> u64 {
+    SPARSE_OPENS.with(std::cell::Cell::get)
   }
 
   /// The mapped length.
