@@ -1546,6 +1546,44 @@ impl ContentStore {
     self.counters.freed.saturating_sub(freed_before)
   }
 
+  /// The identities whose first eight bytes, read big-endian, lie in `lo..=hi`: one page of a shard image's paged
+  /// families (A-870), in identity order.
+  fn identities_in(lo: u64, hi: u64) -> core::ops::RangeInclusive<ContentId> {
+    let mut first = [0u8; IDENTITY_BYTES];
+    let mut last = [u8::MAX; IDENTITY_BYTES];
+    first[..8].copy_from_slice(&lo.to_be_bytes());
+    last[..8].copy_from_slice(&hi.to_be_bytes());
+    ContentId(first)..=ContentId(last)
+  }
+
+  /// [`ContentStore::lists`] whose identities' first eight bytes lie in `lo..=hi` (A-870: one page of the shard image).
+  pub fn lists_in(&self, lo: u64, hi: u64) -> impl Iterator<Item = (ContentId, &[u8])> + '_ {
+    self
+      .entries
+      .range(Self::identities_in(lo, hi))
+      .filter(|(_, held)| held.form == Form::List)
+      .filter_map(|(identity, held)| Some((*identity, held.here()?)))
+  }
+
+  /// [`ContentStore::names`] whose identities' first eight bytes lie in `lo..=hi` (A-870).
+  pub fn names_in(&self, lo: u64, hi: u64) -> impl Iterator<Item = (ContentId, ContentId)> + '_ {
+    self
+      .objects
+      .range(Self::identities_in(lo, hi))
+      .map(|(identity, root)| (*identity, *root))
+  }
+
+  /// [`ContentStore::aways`] whose identities' first eight bytes lie in `lo..=hi` (A-870).
+  pub fn aways_in(&self, lo: u64, hi: u64) -> impl Iterator<Item = (ContentId, u64)> + '_ {
+    self
+      .entries
+      .range(Self::identities_in(lo, hi))
+      .filter_map(|(identity, held)| match held.kept {
+        Kept::Away { len } => Some((*identity, u64::try_from(len).unwrap_or(u64::MAX))),
+        _ => None,
+      })
+  }
+
   /// The lists the store keeps, each with its bytes (A-727 slice a3b): what the shard image carries whole beside the
   /// windows, so an object longer than a window is whole again after a restart before any record is replayed.
   pub fn lists(&self) -> impl Iterator<Item = (ContentId, &[u8])> + '_ {

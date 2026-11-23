@@ -244,28 +244,18 @@ impl ChunkWindows {
     }))
   }
 
-  /// The piece of every window kept and named, by handle (A-727 slice a3): what a shard image carries whole.
-  pub(crate) fn pieces(&self) -> Vec<(u64, Vec<u8>)> {
-    self
-      .held
-      .iter()
-      .filter_map(|(window, kept)| Some((window.0, piece_of(kept.identity.as_ref()?, kept))))
-      .collect()
+  /// The handles of the windows kept or let go since the last committed publication (A-870: the pages a delta
+  /// re-encodes).
+  pub(crate) fn changed_handles(&self) -> Vec<u64> {
+    self.changed.iter().map(|window| window.0).collect()
   }
 
-  /// The windows kept or let go since the last committed publication: each kept one's piece, none for one let go (A-727
-  /// slice a3): what a delta carries.
-  pub(crate) fn changes(&self) -> Vec<(u64, Option<Vec<u8>>)> {
+  /// [`ChunkWindows::pieces`] of the windows whose handles lie in `lo..=hi` (A-870: one page of the shard image).
+  pub(crate) fn pieces_in(&self, lo: u64, hi: u64) -> Vec<(u64, Vec<u8>)> {
     self
-      .changed
-      .iter()
-      .map(|window| {
-        let piece = self
-          .held
-          .get(window)
-          .and_then(|kept| Some(piece_of(kept.identity.as_ref()?, kept)));
-        (window.0, piece)
-      })
+      .held
+      .range(StoredWindow(lo)..=StoredWindow(hi))
+      .filter_map(|(window, kept)| Some((window.0, piece_of(kept.identity.as_ref()?, kept))))
       .collect()
   }
 

@@ -987,6 +987,40 @@ pub(crate) fn region_holds_here(identity: &ContentId) -> u64 {
   REGION_HELD.with(|held| u64::from(held.try_borrow().is_ok_and(|held| held.contains(identity))))
 }
 
+/// The identities whose first eight bytes, read big-endian, lie in `lo..=hi`: one page of the shard image (A-870).
+fn identities_in(lo: u64, hi: u64) -> core::ops::RangeInclusive<ContentId> {
+  let mut first = [0u8; slates_vcs::content::IDENTITY_BYTES];
+  let mut last = [u8::MAX; slates_vcs::content::IDENTITY_BYTES];
+  first[..8].copy_from_slice(&lo.to_be_bytes());
+  last[..8].copy_from_slice(&hi.to_be_bytes());
+  ContentId(first)..=ContentId(last)
+}
+
+/// [`region_held_here`] whose identities' first eight bytes lie in `lo..=hi` (A-870).
+pub(crate) fn region_held_in(lo: u64, hi: u64) -> Vec<ContentId> {
+  REGION_HELD.with(|held| {
+    held
+      .try_borrow()
+      .map(|held| held.range(identities_in(lo, hi)).copied().collect())
+      .unwrap_or_default()
+  })
+}
+
+/// [`landed_here`] whose identities' first eight bytes lie in `lo..=hi` (A-870).
+pub(crate) fn landed_in(lo: u64, hi: u64) -> Vec<(ContentId, Landed)> {
+  LANDED.with(|landed| {
+    landed
+      .try_borrow()
+      .map(|landed| {
+        landed
+          .range(identities_in(lo, hi))
+          .map(|(identity, landed)| (*identity, landed.clone()))
+          .collect()
+      })
+      .unwrap_or_default()
+  })
+}
+
 /// The windows this shard holds for the region, in identity order: what the healer walks (module docs, "The healer").
 pub(crate) fn region_held_here() -> Vec<ContentId> {
   REGION_HELD.with(|held| {
