@@ -459,6 +459,17 @@
 > READDIR or CREATE, while the daemon answers every call. The same flows pass on adas-macbook-pro-2. The real-tools
 > test now fails in 305 s naming the stall instead of hanging.
 
+> **A-878 (OPEN, 2026-11-23, w-win2; main 01a20182's ruling): a long write through a separately attached client is
+> refused `AttachmentExpired`.** `a_freed_content_extent_gives_its_commit_back_on_windows`
+> (`crates/cli/tests/content_extents_windows.rs`), run by a lane for the first time, attaches a volume for writing with
+> `slates attach`, a process that then exits, and writes 256 MiB through that attachment with `slates write`, another.
+> The write is refused `AttachmentExpired { attachment: 281474976710657 }` on windows-latest and windows-11-arm (diag
+> run 45260798132), where the restart test's 16 MiB write through the same flow passes. Read so far, not measured: the
+> attachment's term runs out mid-write, with nothing renewing it once the process that attached has gone. The test is
+> skipped by name in CI's two extents steps, and is this entry's red. Next: whether it is Windows-only (a write that
+> outlasts the term through a separate attach process, on macOS), and if not, the term renewed while the attachment is
+> in use.
+
 > **MEMORY SIZING (Ada 2026-11-20: the daemon held 7.1 GB resident after an 84 MB Mercurial push; w-sizing).** Every
 > buffer, region, reserve and prefault is sized from the work, learned, decays and is given back; a machine total is
 > only a ceiling. **A-777 BUILT:** the idle prefault reserve (A-214) is removed: provisioning p99 unchanged, NFS peak
@@ -476,7 +487,21 @@
 > each extent's section across a restart (`WHAT_CONTENT_EXTENT`); its build and tests are owed to w-lint on jupiter
 > (run-requests; red: commit kept after a destroyed volume's burst). **Closed 2026-11-22 (w-interop):** the burst test's
 > red below was a shard keeping its burst's 1 GiB extent for 10 MiB of headroom, and the test measuring process RSS;
-> `docs/bugs/2026-11-22-a-shard-kept-a-1-gib-extent-for-10-mib-of-headroom.md`. **Open (R2, found 2026-11-20 19:45):** the macOS give-back
+> `docs/bugs/2026-11-22-a-shard-kept-a-1-gib-extent-for-10-mib-of-headroom.md`. **Fixed 2026-11-23 (w-win2): a Windows
+> daemon's first create met its extents made but not yet held.** Each shard's start spawned its slice's holds, one
+> anchor exchange each, and the daemon answered claims at once, so a create the moment it served was refused
+> `BudgetExceeded` with the whole pool named as room: every Node SDK sync suite on both Windows runners (diag run
+> 45238179939: 2 of 25 extents held and the holds 117.5 ms on windows-latest, 1 of 22 and 141.9 ms on windows-11-arm).
+> The control loop now has the anchor hold every extent before it answers a claim, the pool counts only extents a claim
+> can take, and a bounded create whose room only extents being made again would make waits for their remakes
+> (`slates_server`'s `room_wait`), each remake bounded by its two exchanges at the learned answer bound. Red with the fix
+> reversed and green with it on both runners (diag run 45260798132: the first create refused `{ available: 5722144768 }`
+> on windows-latest and the create during the remakes `{ available: 5713756160 }`, both admitted with the fix; the Node
+> SDK suites 8 of 8 on both; `docs/bugs/2026-11-23-a-windows-daemons-first-create-met-its-extents-unheld.md`). The
+> extents file runs on both Windows lanes now, its commit give-back test skipped there as A-878's red. **Owed
+> (item 3b, main's ruling):** a create sent at once after a destroy meets the teardown, which holds the volume's
+> reservation past the destroy's answer, and is refused `BudgetExceeded` on every platform (diag run 45251289894:
+> `{ available: 1430536192 }`, the room less the destroyed volume's). **Open (R2, found 2026-11-20 19:45):** the macOS give-back
 > depends on the machine: recovery's `a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone` passed on a quiet
 > adas-macbook-pro-2 (1,648 -> 123 MiB) but kept 1,366 MiB there later and 335-336 MiB on the big Studio at 5,433 free
 > pages, at A-789's own commit too. Not the pressure hold: with the test's own pressure readings injected (none, and a
