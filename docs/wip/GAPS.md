@@ -26334,7 +26334,16 @@ A plain debug build on adacachy2 (db3ddff02) sorted the reds:
   CI, 6 of 12.5 passed here. **Fixed:** judged against the shard's slice, read after a publication.
 - **One poll past the budget.** `git_push::tests::t_a850_r16_a_history_and_its_tags_pushed_whole_into_an_empty_repository_bring_each_object_once`
   held the control shard 1,540 ms in one poll here (the daemon's near-miss line); under TSan the watchdog ended the
-  library's test process at it (exit 4), so about 1,000 of its 1,247 tests never ran.
+  library's test process at it (exit 4), so about 1,000 of its 1,247 tests never ran. **Fixed:** the test drove the
+  whole push in one observation, where the edges take a step a poll (`vcs_ssh::receive`); it drives it so now
+  (`pushed_a_step_a_poll`).
+- **Measured, open: a push's steps against the quantum.** r16's push driven a step a poll, release, adacachy2 (load
+  12-21, 3 runs): the longest answer step 1.41, 1.20 and 1.11 ms, and the longest carry 3.91, 3.55 and 3.48 ms (an
+  await's wall time, which can span steps), against the shard's live quantum of 2.96, 4.26 and 2.75 µs and its step
+  ceiling of 100 ms. `rt.long_steps` rose 3,403 to 4,747 over each push of about 6,300 to 6,900 steps, and the push
+  took 166 to 186 ms. In debug: 16.7 and 7.5 ms against 8.9 µs. Tied to the push hot path w-git is rebuilding: once
+  w-git's index fix lands, main measures an edit's p99 on a shard during a concurrent git/git push, and the step
+  granularity is decided from that (84a's under-1 ms p99).
 - **TSan only (green here).** `content_ranges::tests::a_sweep_on_its_step_clock_settles_at_steps_its_fixed_cost_amortizes`
   (1 of 3 TSan runs) and `git_push::tests::t_a614a_a_long_historys_derivation_takes_turns_by_the_shards_pace_not_its_objects`
   (2 of 3; 1 turn in 21 ms here).
