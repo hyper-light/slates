@@ -518,3 +518,13 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   docs/bugs/2026-11-22-a-shard-kept-a-1-gib-extent-for-10-mib-of-headroom.md.
 - NEXT (main's assignment): (b) the idle heap give-back: main's r41 separate daemon held ~1.3 GB heap resident against
   31-60 MB live.
+- (b) DROPPED (main, after my report): r41's "1.3 GB heap resident" was the heap row counting 12 large blocks' spans
+  (1.27 GB mapped, 13.7 MB written); malloc held only 26.9 MB past its live blocks; pressure relief already rejected.
+  r15 (git/git v2.0.0 cut): 327.4 MiB after push, 365.9 after clone, bound 177.7. Ada's 2.1 GB = hg clone-row rss
+  2159 MiB (w-hg).
+- LANDED cf9a18a87 (2026-11-22 ~16:30 PST, main b79b54350), (b1): memory report `heap` = system allocator alone,
+  new `large` row = mapped blocks (spans reserved, written pages resident). Red: verbs::tests::
+  the_memory_report_counts_a_large_blocks_written_pages_never_its_span. Note
+  docs/bugs/2026-11-22-the-heap-row-counted-large-blocks-spans-as-resident.md.
+- NEXT (main's assignment): (b2) name the live large blocks by size from the tracked table, match them to their
+  with_capacity sites, size each from the work (Windows charges commit for them).
