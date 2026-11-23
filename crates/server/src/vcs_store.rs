@@ -3468,12 +3468,26 @@ fn put_changeset(
   wanted: &ChangesetWanted,
   read: ChangesetRead,
 ) -> Result<(), ReplayRefused> {
+  let pack_read = read.pack.is_some();
   for (bytes, identity) in [(read.names, wanted.named.0), (read.pack, wanted.packed.0)] {
     if let Some(bytes) = bytes
       && put_names_whole(state, &bytes) != Some(identity)
     {
       return Err(ReplayRefused::Unlanded);
     }
+  }
+  // The pack read whole for the replay is a landed push's, as its commit let it go (goal 93 item 2b): owed its let-go
+  // again, run once the repository's recovery or rebuild ends (`recover_repository`, [`rebuild_ended`]), so a warm
+  // restart leaves out of RAM what its predecessor let go.
+  #[cfg(test)]
+  let pack_read = pack_read && !KEEP_LANDED.with(core::cell::Cell::get);
+  if pack_read {
+    state
+      .vcs_stores
+      .landed_owed
+      .entry(id)
+      .or_default()
+      .push(wanted.packed.0);
   }
   state.vcs_stores.landed_changeset(id, wanted.sequence);
   state.count(CHANGESET_READ, 1);
@@ -4223,6 +4237,10 @@ async fn recover_repository(
     slices.unit_done().await;
   }
   remake_greens(state, record, slices).await;
+  // The landed packs its replay read whole from the node's store, let go again as their commits let them go
+  // ([`put_changeset`]), once its greens' maps are made again: a warm restart leaves out of RAM what its predecessor
+  // let go.
+  let_go_owed(state, record.id);
 }
 
 /// Each of `record`'s greens' map of its head made again as the live store holds it (A-664 part 3), and a Subversion
@@ -4665,11 +4683,16 @@ fn abandon_git_replay(state: &mut ShardState, id: RepositoryId) {
   }
 }
 
-/// A git or Subversion rebuild's end: the store lent again, then each git green's map made again in slices by its build
-/// (`paths::whole_build`), whose end makes any commit a submit owed of it.
+/// A git or Subversion rebuild's end: the store lent again, the landed packs its replay read whole let go again
+/// ([`put_changeset`]), then each git green's map made again in slices by its build (`paths::whole_build`), whose end
+/// makes any commit a submit owed of it.
 fn rebuild_ended(state: &mut ShardState, id: RepositoryId) {
   state.vcs_stores.rebuild_turns.remove(&id);
   state.vcs_stores.rebuilding.remove(&id);
+  // The landed packs its replay read whole from the node's store, let go again as their commits let them go: no fetch
+  // or encoding of a repository can run while it is rebuilt, and its greens' maps are made from the greens, not the
+  // pack.
+  let_go_owed(state, id);
   if !matches!(state.vcs_stores.store(id), Some(RepositoryStore::Git(_))) {
     return;
   }
