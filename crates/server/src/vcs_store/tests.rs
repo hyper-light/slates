@@ -2439,3 +2439,84 @@ fn t_identity_rule_a_record_naming_an_object_by_its_old_root_is_refused_typed() 
     assert_eq!(replayed(&altered), Err(super::ReplayRefused::Diverged));
   });
 }
+
+/// Goal 93 item 2b (main 01a20182's order of 2026-11-23: the let-go a push's end owes ran as one walk over its whole
+/// pack inside `ReceivePack`'s drop, git/git's ~600 MB at once, a bounded-work breach). Do: on an audit shard, put a
+/// landed pack of `2 × LET_GO_WINDOWS + 3` windows in a git repository's content store and owe its let-go, then go idle
+/// (`git_encode::give_back_idle`, as a push's end and an idle repository run it); then turn the shard's let-go queue a
+/// slice at a time (`let_go_turn`) to its end. Expect: going idle lets nothing go itself, only queues it; the let-go
+/// takes one slice to list the pack's windows and then at least three more, each freeing at most `LET_GO_WINDOWS`
+/// windows' bytes; every slice counted (`LET_GO_SLICES`); and at its end the whole pack let go. Red before: the
+/// pack's every window let go within the idle give-back's one step.
+#[test]
+fn t_goal93_a_large_landed_packs_let_go_is_sliced_a_window_set_a_turn_never_one_walk() {
+  use super::{LANDED_LET_GO_BYTES, LANDED_PINNED, LET_GO_SLICES, LET_GO_WINDOWS};
+  let seen = crate::test_store::audit_on_stored_shard("let-go-sliced", |state| {
+    let id = crate::git_push::tests::git_repository(state, "let-go-sliced");
+    let window = state
+      .vcs_stores
+      .content()
+      .map_or(1 << 18, ContentStore::window);
+    let windows = 2 * LET_GO_WINDOWS + 3;
+    let bytes: Vec<u8> = (0..windows * window)
+      .map(|at| u8::try_from((at / 7) % 251).unwrap())
+      .collect();
+    let len = u64::try_from(bytes.len()).unwrap();
+    let pack = super::within_budget(state, len, |stores| {
+      stores.content_mut().unwrap().put_object(&bytes).unwrap()
+    });
+    state
+      .vcs_stores
+      .landed_owed
+      .entry(id)
+      .or_default()
+      .push(pack);
+    let count =
+      |state: &crate::state::ShardState, name: &str| state.refusals.get(name).copied().unwrap_or(0);
+    let freed = |state: &crate::state::ShardState| count(state, LANDED_LET_GO_BYTES);
+    let before = (freed(state), count(state, LET_GO_SLICES));
+    super::git_encode::give_back_idle(state, id);
+    let in_the_step = freed(state) - before.0;
+    let mut slices_freed = Vec::new();
+    loop {
+      let was = freed(state);
+      let more = super::let_go_turn(state);
+      slices_freed.push(freed(state) - was);
+      if !more {
+        break;
+      }
+    }
+    let whole_after = state
+      .vcs_stores
+      .content()
+      .is_some_and(|content| content.holds_whole(&pack));
+    (
+      in_the_step,
+      slices_freed,
+      count(state, LET_GO_SLICES) - before.1,
+      (freed(state) - before.0, count(state, LANDED_PINNED), len),
+      whole_after,
+      u64::try_from(window).unwrap(),
+    )
+  });
+  let (in_the_step, slices_freed, slices, (freed, pinned, len), whole_after, window) = seen;
+  eprintln!(
+    "let-go: {slices} slices, freed {freed} of {len} bytes, {pinned} pinned, per slice {slices_freed:?}"
+  );
+  assert_eq!(
+    in_the_step, 0,
+    "nothing let go within the step that owes it"
+  );
+  assert!(
+    slices >= 4,
+    "the listing and three slices at least: {slices}"
+  );
+  assert_eq!(slices, u64::try_from(slices_freed.len()).unwrap());
+  let most = u64::try_from(LET_GO_WINDOWS).unwrap() * window;
+  assert!(
+    slices_freed.iter().all(|bytes| *bytes <= most),
+    "no slice past {LET_GO_WINDOWS} windows: {slices_freed:?}"
+  );
+  assert_eq!((freed, pinned), (len, 0), "the whole pack let go");
+  assert!(!whole_after, "the pack held whole no more");
+}
