@@ -454,3 +454,11 @@ Waiting: arena-6 and arena-7.
 - 83f1d4c00: GAPS records changeset evolution as the next completeness item: an evolution-enabled matrix row (amend
   and rebase pushed with markers), the hidden view served, its branch heads kept. It's next after arena-6 and arena-7,
   unless they name a memory or time item.
+
+## 2026-11-23 ~10:00 PST (w-hg, arena-6 CI 45136304371: churn 45.05 GB from 57.3; peak and floor unchanged)
+- Intake churn by site (throwaway sampling probe, 2,000-file manifest, 1,501 changesets): ~166 KB a changeset.
+  delta::apply 84% (the one manifest copy); index key building 5%; Placed growth 1.6%; Planner 1.6%; records 0.5%.
+- So the intake is ~6 GB of push-all at hg's sizes; most of the 45 GB is server-side or in the clone/stream/verify
+  rows. Proposed to main: a server-level counting binary (crates/server/tests/hg_push_heap.rs) to name it, then the
+  cuts by size, including the manifest buffer reuse (apply into the previous manifest's Vec, swap).
+Waiting: main's order, arena-7 and arena-8 (MALLOC_ARENA_MAX=1 test of retention).
