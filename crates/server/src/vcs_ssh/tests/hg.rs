@@ -286,6 +286,11 @@ impl Repository for Probed {
 }
 
 impl Store for Probed {
+  /// A test's store keeps no changeset store rows to batch: as many as the room holds.
+  fn rows_a_step(&self) -> u64 {
+    u64::MAX
+  }
+
   fn changeset_text(
     &self,
     _rev: Rev,
@@ -1482,6 +1487,11 @@ impl Repository for Grown {
 }
 
 impl Store for Grown {
+  /// A test's store keeps no changeset store rows to batch: as many as the room holds.
+  fn rows_a_step(&self) -> u64 {
+    u64::MAX
+  }
+
   /// The test's changeset store answered at once (A-767 C1): each file revision kept as its whole (every file holds
   /// [`Grown::bytes`]), its identity the plain BLAKE3 of the bytes, its chunk the bytes (a whole kept raw).
   fn stored_now(

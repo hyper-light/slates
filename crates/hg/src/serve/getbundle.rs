@@ -72,6 +72,12 @@ use std::collections::{BTreeMap, BTreeSet};
 /// 2). A text is lent (A-680): in place where the store holds it in one piece, else copied, the copy's bytes charged to
 /// the request's room before it is made, so nothing a store copies is held past the request's admission.
 pub trait Store: Repository {
+  /// Derived: the most rows one step of a fetch asks of the changeset store at once, one revision's at least: a content
+  /// window's worth of their stored form for the indexed view ([`crate::render::rows_a_step`]), the store's own unit of a
+  /// step, so no step decides or holds more however long the history (goal 93: a clone's file section asked the whole
+  /// history's rows in one batch and decided them in one 2 s step, CI 45117277400).
+  fn rows_a_step(&self) -> u64;
+
   /// A changeset's text; `None` past the view, or where the store does not hold it whole.
   fn changeset_text(
     &self,
@@ -1158,7 +1164,8 @@ impl Walk {
   }
 
   /// Asks the store for the rows of the file revisions from `from` on that a missing changeset links, as many as
-  /// `room` holds (one at least), each log's in turn.
+  /// `room` holds (one at least), each log's in turn, scanning a step's rows at most ([`Store::rows_a_step`]): a clone's
+  /// file section is the whole history's, never one step's scan or ask.
   fn ask_rows(&mut self, store: &impl Store, (path, position): (&[u8], u64), room: u64) {
     let most = usize::try_from(
       room
@@ -1169,11 +1176,13 @@ impl Walk {
     .max(1);
     let mut asked: AskedRows = Vec::new();
     let mut taken = 0_usize;
+    let (mut scanned, rows) = (0_u64, store.rows_a_step().max(1));
     let mut at = (path.to_vec(), position);
-    while taken < most {
+    while taken < most && scanned < rows {
       let Some((found, position, linked)) = store.file_linked_from((&at.0, at.1)) else {
         break;
       };
+      scanned = scanned.saturating_add(1);
       if linked.link.is_some_and(|link| self.missing.contains(link)) {
         match asked.last_mut() {
           Some((last, revisions)) if *last == found => revisions.push((position, linked.node)),
@@ -1405,7 +1414,7 @@ impl Pull {
     if self.batch.front().map(|batched| batched.at) != Some((group, index)) {
       self.batch.clear();
       self.rows.clear();
-      self.ask_rows(room.left());
+      self.ask_rows(room.left(), store.rows_a_step());
       return Ok(true);
     }
     if self.batch.iter().any(|batched| batched.send.is_none()) {
@@ -1481,8 +1490,9 @@ impl Pull {
     Ok(true)
   }
 
-  /// Asks the rows of as many planned revisions from `at` on as `room` holds (one at least), and their parents'.
-  fn ask_rows(&mut self, room: u64) {
+  /// Asks the rows of as many planned revisions from `at` on as `room` holds and as `rows` rows bound (theirs and their
+  /// parents', [`Store::rows_a_step`]), one revision at least.
+  fn ask_rows(&mut self, room: u64, rows: u64) {
     let most = usize::try_from(
       room
         .checked_div(to_u64(core::mem::size_of::<Batched>()).max(1))
@@ -1492,6 +1502,7 @@ impl Pull {
     .max(1);
     let (mut group, mut index) = self.at;
     let mut asked: Vec<(Vec<u8>, Vec<Node>)> = Vec::new();
+    let mut asked_rows = 0_u64;
     while self.batch.len() < most {
       let Some((path, revisions)) = self.plan.get(group) else {
         break;
@@ -1501,16 +1512,24 @@ impl Pull {
         index = 0;
         continue;
       };
-      let nodes = core::iter::once(planned.node).chain(
-        planned
-          .entry
-          .parents
-          .into_iter()
-          .filter(|parent| *parent != NULL_NODE),
-      );
+      let nodes: Vec<Node> = core::iter::once(planned.node)
+        .chain(
+          planned
+            .entry
+            .parents
+            .into_iter()
+            .filter(|parent| *parent != NULL_NODE),
+        )
+        .collect();
+      // Within the rows a step reads, one revision at least.
+      let these = to_u64(nodes.len());
+      if !self.batch.is_empty() && asked_rows.saturating_add(these) > rows {
+        break;
+      }
+      asked_rows = asked_rows.saturating_add(these);
       match asked.last_mut() {
         Some((last, wanted)) if last == path => wanted.extend(nodes),
-        _ => asked.push((path.clone(), nodes.collect())),
+        _ => asked.push((path.clone(), nodes)),
       }
       self.batch.push_back(Batched {
         at: (group, index),
