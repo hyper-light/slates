@@ -317,15 +317,10 @@ pub(crate) async fn remove_on_owners(
     )
     .await
     .ok_or(Refusal::Overloaded { shard })?;
-    // The client's presentations there are abandoned with it (AUD-29-07): nothing waits on them now.
-    crate::xshard::call_in_shard_time(
-      origin,
-      shard,
-      move |state| crate::landing::abandon_presentations(state, client),
-      budget_ns,
-    )
-    .await
-    .ok_or(Refusal::Overloaded { shard })?;
+    // The client's presentations there stay: a presentation describes a volume's changes against a target, granted and
+    // landed by whoever holds the grant, as R10's flow runs (present, a person's grant, land under it), each step its
+    // own process (main 01a20182's ruling of 2026-11-23; until then AUD-29-07 abandoned them here, which the reclaim at
+    // hang-up of 076746072 made the CLI's flow meet: docs/bugs/2026-11-23-a-landings-presentation-went-with-its-presenting-client.md).
     let attachments = crate::xshard::call_in_shard_time(
       origin,
       shard,

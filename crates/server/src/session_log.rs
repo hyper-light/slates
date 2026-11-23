@@ -99,8 +99,8 @@ fn work_lines<'a>(
 
 /// This shard's landings awaiting a grant past `after`, as lines, in (volume, landing) order, those whose volume the
 /// caller may read. Read from the presentations the shard holds now (`state.landing.awaiting`), which are exactly the
-/// grantable ones: a presentation its client abandoned (AUD-29-07) or a newer one superseded (A-779) is not there,
-/// though its durable record may still read `AwaitingGrant` (abandoned). Bounded by `landings_awaiting_per_shard`, so
+/// grantable ones: a presentation a newer one superseded (A-779) or whose volume went (A-874) is not there, though its
+/// durable record may still read `AwaitingGrant` (abandoned). Bounded by `landings_awaiting_per_shard`, so
 /// sorting them costs that bound, never the landing history.
 fn waiting_lines<'a>(
   state: &'a ShardState,

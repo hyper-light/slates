@@ -15446,6 +15446,8 @@ fn destroy(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> R
       return refused(refusal_of_db(&e));
     }
   }
+  // Its landings awaiting a grant go with it (A-874): no grant can land a volume that is going.
+  crate::landing::forget_presentations_of(state, record.id);
   // The volume's guest devices are revoked first (AUD-29-68): each ends at its next pass boundary, its terminal
   // step sweeping its references through its volume or view while they still exist. The teardown waits for
   // them (`step_destroys` starts it once none serves the volume); with none, it starts now.
