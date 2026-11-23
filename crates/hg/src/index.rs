@@ -608,7 +608,7 @@ impl Endings {
         .split_last_chunk::<ENDING_BYTES>()
         .ok_or(Refused::Unread { rev })?;
       let (by, _) = last
-        .split_first_chunk::<4>()
+        .split_first_chunk::<REV_BYTES>()
         .ok_or(Refused::Unread { rev })?;
       Ok(u32::from_le_bytes(*by))
     };
