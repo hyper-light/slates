@@ -174,7 +174,7 @@ impl Green {
     match key {
       IdentityKey::File(path) => {
         let bytes = self
-          .content_ref_at(path, at)
+          .content_ref_at_bytes(path, at)
           .map(|bytes| bytes.into_owned());
         put(&mut tables.files, (path.clone(), copy, bytes), recorded)
       }

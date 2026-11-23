@@ -24,7 +24,7 @@ type Files = BTreeMap<String, Vec<u8>>;
 /// The green's files at its head, owned.
 fn head_files(green: &Green) -> Files {
   green
-    .files()
+    .files_bytes()
     .map(|(path, bytes)| (path.to_owned(), bytes.to_vec()))
     .collect()
 }

@@ -144,7 +144,7 @@ type Answered = (Outcome, Option<Vec<crate::chain_entry::Applied>>);
 fn seen(green: &mut Green) -> Seen {
   let files = FILES
     .iter()
-    .map(|path| green.content(path).map(<[u8]>::to_vec))
+    .map(|path| green.content_bytes(path).map(<[u8]>::to_vec))
     .collect();
   let head = green.xattr(ROOT, HEAD_ATTRIBUTE).map(<[u8]>::to_vec);
   (green.head(), green.head_identity(), files, head)

@@ -2946,13 +2946,14 @@ impl Client {
     self.end.enable_async_completion().map_err(ClientError::Ipc)
   }
 
-  /// The Windows analogue of [`Self::enable_async_completion_dup`]: a dup of the completion socket the
-  /// caller owns and closes (Node's `net.Socket` adopts and closes it), leaving the client's intact.
+  /// The Windows signal for an SDK that opens its completion by name (Node's `net.connect`; A-875): the name of the
+  /// completion pipe the bridge nudges, since Node adopts no Windows socket by descriptor. Replaces the Windows arm of
+  /// `enable_async_completion_dup`, a duplicate of the loopback socket that Node refused.
   #[cfg(windows)]
-  pub fn enable_async_completion_dup(&mut self) -> Result<RawSocket, ClientError> {
+  pub fn enable_async_completion_pipe(&mut self) -> Result<String, ClientError> {
     self
       .end
-      .enable_async_completion_dup()
+      .enable_async_completion_pipe()
       .map_err(ClientError::Ipc)
   }
 

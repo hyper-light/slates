@@ -323,7 +323,7 @@ fn tally_of(arm: Arm, set: &[Pair]) -> Tally {
     let conflicted = matches!(two, Outcome::Conflict { .. });
     tally.pairs += 1;
     tally.conflicts += usize::from(conflicted);
-    let content = green.content(PATH).unwrap_or_default();
+    let content = green.content_bytes(PATH).unwrap_or_default();
     let expect: &[u8] = match (&pair.oracle, conflicted) {
       (Some(both), false) => both.as_bytes(),
       _ => f,

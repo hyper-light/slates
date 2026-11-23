@@ -60,6 +60,10 @@ pub(crate) const MADE: &str = "vcs.hg.changeset_made";
 /// Counter: a submitted version of a Mercurial repository's green of which no changeset was made (module docs).
 /// Format: a counter name in the daemon's status report.
 pub(crate) const UNMADE: &str = "vcs.hg.changeset_unmade";
+/// Counter: a version of which no changeset was made since a file of it is held by its content-plane object alone
+/// ([`Unmade::Named`]; A-760 (b) 4b; never met, since only a Subversion green holds a file so), beside [`UNMADE`].
+/// Format: a counter name in the daemon's status report.
+pub(crate) const NAMED_UNREAD: &str = "vcs.hg.named_unread";
 
 /// Format: nanoseconds in a second.
 const NANOS_PER_SECOND: i64 = 1_000_000_000;
@@ -84,6 +88,8 @@ enum Unmade {
   Unlanded,
   /// A client's push landed after the changeset was made: its fork is stale.
   Stale,
+  /// A file of the change is held by its content-plane object alone, which an hg green never holds (A-760 (b) 4b).
+  Named(super::named_objects::NamedUnread),
 }
 
 /// Written out rather than derived, as a derived `Debug` is all that reads the refusals and dead-code analysis ignores
@@ -98,6 +104,7 @@ impl std::fmt::Debug for Unmade {
       Unmade::Entry(refused) => formatter.debug_tuple("Entry").field(refused).finish(),
       Unmade::Unlanded => formatter.write_str("Unlanded"),
       Unmade::Stale => formatter.write_str("Stale"),
+      Unmade::Named(unread) => formatter.debug_tuple("Named").field(unread).finish(),
     }
   }
 }
@@ -137,6 +144,9 @@ fn unmade(state: &mut ShardState, why: &Unmade) {
     state.partition
   );
   state.count(UNMADE, 1);
+  if matches!(why, Unmade::Named(_)) {
+    state.count(NAMED_UNREAD, 1);
+  }
 }
 
 /// [`make`]'s task: the landing turn (`turn`, or awaited where the submit could not take it), then the changeset made
@@ -595,7 +605,7 @@ fn verified_of(
     .iter()
     .zip(&sources)
     .map(|(path, source)| change_of(engine, path, source.as_deref()))
-    .collect();
+    .collect::<Result<_, _>>()?;
   let (user, message, seconds) = &inputs.authored;
   let authored = Authored {
     user: user.as_bytes(),
@@ -637,26 +647,35 @@ fn copied_from(path: &str, copies: &[MadeCopy]) -> Option<String> {
   })
 }
 
-fn change_of<'g>(engine: &'g Green, path: &'g str, source: Option<&'g str>) -> Change<'g> {
+/// The change at `path`; refused [`Unmade::Named`] at a file held by its content-plane object alone (A-760 (b) 4b).
+fn change_of<'g>(
+  engine: &'g Green,
+  path: &'g str,
+  source: Option<&'g str>,
+) -> Result<Change<'g>, Unmade> {
   let after = match engine.symlink(path) {
     Some(target) => Some((target.as_bytes(), Flag::Link)),
-    None => engine.content(path).map(|bytes| {
-      let executable = engine.mode(path).is_some_and(|mode| mode & EXECUTABLE != 0);
-      (
-        bytes,
-        if executable {
-          Flag::Executable
-        } else {
-          Flag::Regular
-        },
-      )
-    }),
+    None => match engine.content(path) {
+      None => None,
+      Some(content) => {
+        let bytes = super::named_objects::lent_bytes_of(path, content).map_err(Unmade::Named)?;
+        let executable = engine.mode(path).is_some_and(|mode| mode & EXECUTABLE != 0);
+        Some((
+          bytes,
+          if executable {
+            Flag::Executable
+          } else {
+            Flag::Regular
+          },
+        ))
+      }
+    },
   };
-  Change {
+  Ok(Change {
     path: path.as_bytes(),
     after,
     copied_from: source.map(str::as_bytes),
-  }
+  })
 }
 
 /// The made changeset's branch: its parent's, or for a root its line's, else `default`.

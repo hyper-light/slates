@@ -276,6 +276,13 @@ mod tests {
         .is_some_and(|bytes| *bytes >= 4096),
       "{with:?}"
     );
+    assert_the_arenas_owners_sum_to_its_allocated(&with);
+    assert!(without.is_empty(), "{without:?}");
+  }
+
+  /// The content arena's owners in a memory status's gauges, `with`: their bytes and the deferred frees summing to what
+  /// the arena allocated, the content hold among them, and no owner asking past what it holds.
+  fn assert_the_arenas_owners_sum_to_its_allocated(with: &std::collections::BTreeMap<String, u64>) {
     // Goal 93 (main 01a20182's order on arena-13's unnamed 373 MB): the arena's owners and its deferred frees sum to
     // what it has allocated, its mapped bytes less its free ones; a missing owner would be a gap. The content hold's
     // checkpoint is one owner here, so the sum is not empty.
@@ -299,7 +306,6 @@ mod tests {
         "{owner} asked past what it holds: {with:?}"
       );
     }
-    assert!(without.is_empty(), "{without:?}");
   }
 
   /// Goal 93 item 2b(b) (main 01a20182's ruling of 2026-11-22 20:20: hg's whole-history bar, about 410 MiB against

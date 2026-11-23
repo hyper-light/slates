@@ -1988,8 +1988,15 @@
 > **A-873 (2026-11-23, w-svn; main 01a20182's ruling (I), A-760 (b) piece 4a):** a green's identity entry for a file
 > hashes its path, length and plain BLAKE3 digest, which each block keeps from when it was made, not its bytes. Golden
 > vectors are regenerated through `--ignored regenerate_the_identity_golden_vectors`, with a determinism gate. Anchor
-> layout 19 refuses a layout-18 segment typed. OWED: 4b (one read seam, `Bytes | Named`; w-git and w-hg told first),
-> 4c (the engine's named-base reads), 4d (a named block holds no bytes).
+> layout 19 refuses a layout-18 segment typed. 4b BUILT (2026-11-23): one read seam, `engine::Content` (a current
+> file's `Bytes | Named`) and `ContentAt` (at a version); the engine's own reads and its tests take the `*_bytes`
+> readers. svn's held texts fall through to the content store, and a rebase holds a named head file's change whole.
+> Every other site refuses typed: git's `StepRefused::Named` (`vcs_paths.named_unread`, logged with path and green),
+> hg's `Unmade::Named` (`vcs.hg.named_unread`), a mount's read `EAGAIN`/`ERROR_RETRY`, a work's base `BaseGone`, a
+> read page `Unsupported`, checkout `Unsupported`. No producer yet, so no red: the suites are its check. OWED: 4c+4d as
+> one piece (main's ruling of 2026-11-23): a named block's hold of the content store with its bytes dropped, history
+> reads through the plane, sync readers refusing typed and their async callers bringing back (never pinned),
+> `history::reanchor` checking a named replace by identity.
 >
 > **A-869 (2026-11-22, w-svn; main 01a20182's order of 19:28, A-760 (b) piece 2):** a green's checkpoint names a file
 > whose block is named for a content-plane object instead of carrying its bytes (`Checkpoint::named`, a section after
@@ -4405,6 +4412,17 @@
 >   (r21).
 > - `an_svnsync_measured` over HTTP (r254): 2,000 revisions in 301.8 s (150.9 ms a revision), mirror at r2000, daemon
 >   RSS 724 MB before and 994 MB at peak. The same round over svn:// took 510.4 s against P7's 270.7 s, sent to w-svn.
+> **OPEN, svnsync over svn:// at 255.2 ms a revision against 135 ms (w-svnperf for main 01a20182, 2026-11-23; goal
+> 93):** main's round of `an_svnsync_measured` on the big Studio (main 1d06ab306, release, git-2000, stock 1.15.0):
+> svn:// import 5.9 s, then svnsync 510.4 s, daemon RSS 854 MB before and 1,032 MB at peak; HTTP import 111.1 s, then
+> svnsync 301.8 s (150.9 ms a revision). The 2026-11-21 figure above was 270.7 s. To find where the time went, the
+> test now prints every counter the daemon's shards report after the import, and what the sync added to each, whole and
+> a revision. The daemon counts an svn:// conversation's answers and their nanoseconds (`vcs_svn.answers`,
+> `vcs_svn.answer_ns`) against its waits: for a piece through the node's store, for a write, for the client's bytes,
+> and for a poll after a yield (`vcs_svn.fetch_wait_ns`, `write_wait_ns`, `read_wait_ns`, `yield_wait_ns`). It counts
+> an import's turns, landing waits and yields (`vcs_store.svn_import.turn_ns`, `land_wait_ns`, `yield_wait_ns`), and
+> the content store's reads, stored, freed, let-go and brought-back figures (`vcs_store.content.*`). Owed: main's quiet
+> rerun with them.
 > **R4, recovery replays a revision record a turn at a time (2026-11-20, w-svn; Ada's close list; found by w-git's sweep):**
 > a Subversion revision's record was replayed whole in one recovery or rebuild turn (`replay_svn` -> `commit_record`),
 > every text it brought deltified in one step, so one large revision held its shard. Now `RevisionReplay`
@@ -6193,6 +6211,20 @@
 > Beyond the goal's clauses, owed from this entry: the async form for the remaining verbs, the MCP list tools answering
 > a page at a time, and a merge's versions typed on the wire.
 
+> **The Node SDK's completion on Windows (2026-11-23, w-interop; A-875; found by CI run 45176536354's Windows legs):**
+> `async lifecycle over a live daemon` died with `CompletionLost { reason: "Unsupported fd type: UNKNOWN" }`. Node
+> adopts no Windows socket by descriptor (libuv's `uv_guess_handle`), and the SDK was handed the bridge's loopback
+> socket. **Built:** the Windows bridge signals the Node SDK through a named pipe that `async.mjs` opens by name
+> (`net.connect`), admitting only a reader of this process (`crates/ipc/src/completion_pipe.rs`). Python keeps the
+> socket. **Proven (windows-latest, main's diag runs):**
+> - Red at main (run 45225292920): "Unsupported fd type: UNKNOWN".
+> - With the change (run 45230459274, 20cd9025e): `slates-ipc`'s Windows completion and pipe tests pass, 8 of 8, with
+>   the other-process reader's. The addon builds, and "Unsupported fd type" is gone: the async lifecycle gets past its
+>   completion pipe to the daemon's first create.
+>
+> **Not yet green:** the Node suites on Windows. 4 of 8 pass. The 4 that fail, sync and async alike, are refused
+> `BudgetExceeded { available: 5722144768 }` at their first create. That is the Windows daemon's own sizing (w-win's
+> leftover item 3, now w-win2's), not this change. **Owed:** the SDK lane rerun once that lands, then windows-11-arm.
 > **The Node SDK suites on Windows (2026-11-18, §4.7 status "the Node SDK suites end on Windows"; goal 88).** The three
 > Node suites had never run on Windows: CI's `sdk` job ran on `ubuntu-latest` and `macos-latest` alone. Main's diag run
 > 44384411115 (main da697d886) ran them on both Windows runners, and the step went past 70 minutes until cancelled, with

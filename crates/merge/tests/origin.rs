@@ -108,7 +108,7 @@ fn a_malformed_origin_is_refused_typed_at_every_cut() {
 fn a_green_seeded_from_an_origin_holds_it_at_version_zero() {
   let green = Green::with_origin(fixed_origin());
   assert_eq!(green.head(), 0, "the origin is not a delta");
-  assert_eq!(green.content("README"), Some(b"hello\n".as_slice()));
+  assert_eq!(green.content_bytes("README"), Some(b"hello\n".as_slice()));
   assert!(green.is_dir("src"));
   assert_eq!(green.mode("src/lib.rs"), Some(0o644));
   assert_eq!(green.symlink("link"), Some("README"));
@@ -131,7 +131,7 @@ fn an_origin_file_merges_on_the_fast_path_and_version_zero_reconstructs() {
     before + 1,
     "an origin file untouched since version 0 takes the fast path"
   );
-  assert_eq!(green.content("README"), Some(b"HELLO\n".as_slice()));
+  assert_eq!(green.content_bytes("README"), Some(b"HELLO\n".as_slice()));
   let base = green.base_at(0);
   assert!(
     base.files.contains(&("README".to_owned(), 6)),
@@ -139,7 +139,7 @@ fn an_origin_file_merges_on_the_fast_path_and_version_zero_reconstructs() {
     base.files
   );
   assert_eq!(
-    green.content_at("README", 0),
+    green.content_at_bytes("README", 0),
     Some(b"hello\n".to_vec()),
     "a version-0 read serves the origin bytes"
   );
@@ -442,8 +442,8 @@ fn a_green_seeded_in_shares_is_the_green_seeded_whole() {
     );
     for path in ["README", "src/lib.rs"] {
       assert_eq!(
-        green.content_at(path, 0),
-        whole.content_at(path, 0),
+        green.content_at_bytes(path, 0),
+        whole.content_at_bytes(path, 0),
         "{path}"
       );
     }

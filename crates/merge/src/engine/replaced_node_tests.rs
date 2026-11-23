@@ -369,7 +369,7 @@ impl History {
   /// Which of `NODES` stand in `green` now.
   fn stands(green: &Green) -> [bool; 4] {
     [
-      green.content(FILE).is_some(),
+      green.content_bytes(FILE).is_some(),
       green.symlink(SYMLINK).is_some(),
       green.hardlink(HARDLINK).is_some(),
       green.is_dir(DIR),
@@ -526,7 +526,7 @@ pub(super) enum Kind {
 /// Every node standing at `path` in `green`, by kind: one at most in a whole state.
 pub(super) fn kinds_at(green: &Green, path: &str) -> Vec<Kind> {
   [
-    (green.content(path).is_some(), Kind::File),
+    (green.content_bytes(path).is_some(), Kind::File),
     (green.symlink(path).is_some(), Kind::Symlink),
     (green.hardlink(path).is_some(), Kind::Hardlink),
     (green.is_dir(path), Kind::Dir),
@@ -606,7 +606,7 @@ fn a_link_renamed_over_a_file_the_same_work_renamed_away_takes_its_place() -> Re
     kinds_at(&green, "kept"),
     kinds_at(&green, FILE),
     kinds_at(&green, SYMLINK),
-    green.content("kept").map(<[u8]>::to_vec),
+    green.content_bytes("kept").map(<[u8]>::to_vec),
   );
   let expected = (
     vec![Kind::File],
@@ -634,7 +634,7 @@ fn a_hard_link_renamed_over_the_file_it_names_changes_nothing() -> Result<(), St
   )?;
   let found = (
     kinds_at(&green, TARGET),
-    green.content(TARGET).map(<[u8]>::to_vec),
+    green.content_bytes(TARGET).map(<[u8]>::to_vec),
     kinds_at(&green, HARDLINK),
     green.hardlink(HARDLINK),
   );
@@ -673,7 +673,7 @@ fn a_directory_made_again_after_a_works_base_is_not_removed() -> Result<(), Stri
 /// mode and `NAME`'s value.
 fn node_state(green: &Green, path: &str) -> (bool, Option<u32>, Option<Vec<u8>>) {
   (
-    green.content(path).is_some() || green.is_dir(path),
+    green.content_bytes(path).is_some() || green.is_dir(path),
     green.mode(path),
     green.xattr(path, NAME).map(<[u8]>::to_vec),
   )
@@ -818,7 +818,7 @@ type Names<'a> = (Vec<Kind>, Option<Vec<u8>>, Option<&'a str>, Option<&'a str>);
 fn names_of(green: &Green) -> Names<'_> {
   (
     kinds_at(green, TARGET),
-    green.content(TARGET).map(<[u8]>::to_vec),
+    green.content_bytes(TARGET).map(<[u8]>::to_vec),
     green.hardlink(HARDLINK),
     green.hardlink("second"),
   )
