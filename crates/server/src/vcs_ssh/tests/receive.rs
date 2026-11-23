@@ -592,6 +592,63 @@ fn a_shallow_clone_of_a_later_push_let_go_is_answered_whole_over_ssh() {
   );
 }
 
+/// A-855 on the SSH edge (main 01a20182's order of 2026-11-23: a fetch past its room waits for room and is answered,
+/// never refused while room may come; the HTTP edge's `Upload::wait_for_room` had no SSH twin). Do: on an audit daemon's
+/// shard, serve the SSH edge with the production site; push over SSH `vcs_http::daemon_edge_tests::tagged_history` of a
+/// few commits; make the next rooms the repository's shard gives a session a wide one for its advertisement, then the
+/// fetch request's own length for its fetch (room for its body, none for its answer), then the shard's own; fetch every
+/// ref whole over SSH. Expect: the session exits 0, its
+/// pack every object pushed, no abort. Red before: the fetch refused in its first room, git's die status.
+#[test]
+fn a_fetch_past_its_room_over_ssh_waits_for_more_and_is_answered_whole() {
+  use crate::vcs_http::daemon_edge_tests::{
+    TAGGED_FEW, fetched_pack_after, ids_in, packets_from, tagged_history, whole_fetch_of,
+  };
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (_, address, _) = observe_first(&daemon, |state| {
+    serving_within(state, ROOM, GIT_KEEPALIVE_NS)
+  });
+  let (request, wants, objects) = tagged_history(TAGGED_FEW);
+  let pushed = pushed_patiently(address, &request);
+  let fetch = whole_fetch_of(&wants);
+  let short = u64::try_from(fetch.len()).expect("a length");
+  // The session's advertisement is admitted first (a wide room), then its fetch the short one.
+  observe_first(&daemon, move |_| {
+    crate::vcs_store::upload::ROOMS.with(|rooms| {
+      let mut rooms = rooms.borrow_mut();
+      rooms.push_back(1 << 30);
+      rooms.push_back(short);
+    });
+  });
+  let fetched = fetched_adjusting(address, &fetch);
+  let again = observe_first(&daemon, |state| {
+    state
+      .refusals
+      .get(crate::vcs_http::git::upload::ANSWERED_AGAIN)
+      .copied()
+      .unwrap_or(0)
+  });
+  daemon.stop();
+  assert_eq!(pushed.map(|transcript| transcript.status), Some(Some(0)));
+  let fetched = fetched.expect("the fetch's session");
+  assert_eq!(
+    fetched.status,
+    Some(0),
+    "{}",
+    String::from_utf8_lossy(&fetched.err)
+  );
+  assert!(again >= 1, "the answer made again within the wider room");
+  let (_, advertised_end) = packets_from(&fetched.out, 0);
+  let answer = fetched.out.get(advertised_end..).unwrap_or_default();
+  assert!(
+    !answer
+      .windows(b"aborting".len())
+      .any(|window| window == b"aborting"),
+    "no abort"
+  );
+  assert_eq!(ids_in(&fetched_pack_after(answer)).len(), objects);
+}
+
 /// [`fetched_over_ssh`], read as OpenSSH's client reads: the channel's window given back
 /// (`SSH_MSG_CHANNEL_WINDOW_ADJUST`) once half of it is read, so an answer past [`CLIENT_WINDOW`] is read whole (as
 /// `vcs_ssh::tests::hg`'s `transcript_adjusting` reads).
