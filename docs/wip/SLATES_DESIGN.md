@@ -5374,7 +5374,8 @@ shard it woke needed on a busy machine; its wake estimate, seeded with `spin_ns`
 is still learned), then clear the reply stamp slot this park names (the two
 slots alternate park by park, A-199), set `parked` to that slot's value (1 or 2), fence
 (`SeqCst`; the park protocol, A-44), re-check the reply (to close the race), and wait on the wake word
-(futex / `os_sync_wait_on_address(SHARED)` / the Event). A call that waits while its daemon lives waits on the daemon's
+(futex / `os_sync_wait_on_address(SHARED)` / the Event), or, on macOS where the region came with its reply wake
+semaphore, on that semaphore, its flag saying so (4 or 5 for the slot; A-867). A call that waits while its daemon lives waits on the daemon's
 departure beside its reply (A-456): Linux polls the completion eventfd and the control socket instead of the futex,
 Windows waits on the Event and the daemon's process handle together, and macOS keeps the word; both look at the
 daemon's liveness (its exit watch and the instance's start stamp) on a doubling schedule, since a daemon restarted
@@ -58010,6 +58011,13 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > and 4/4 integration, the seam's own: a 300,001-byte pack read the same staged (borrowed), landed (RAM 0 after its
 > release) and recovered with and without a checkpoint.
 >
+> **2026-11-22, shared payloads.** The `P` lookup names one live payload section. Each additional copy has its log
+> offset appended to the key. Forgetting or replacing the section that supplies reads selects one surviving copy,
+> even across repositories. The last removal drops the lookup. Reads take one point lookup. On its first open with
+> this index, an existing checkpoint rebuilds the places from the changeset rows it still holds. The rebuilt index
+> and its marker commit at the same offset. Subsequent opens replay the tail as before.
+> `forgetting_a_duplicate_payload_keeps_the_surviving_changesets_bytes` exercises both orders of removal.
+>
 > **Status (2026-11-20, piece C3 step 4: the A/B's derived per-path arm, decided).** Main's bar: changesets plus a derived
 > per-path form must meet the per-file arm's old read (91 µs p50) and clone file section (0.27 s). Arm C of
 > `crates/hg/examples/changeset_ab.rs` (BENCHMARKS, "Mercurial's history as changesets with a derived per-file form"):
@@ -58238,7 +58246,8 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > rows by node over the index as it stands then. The repository's landing turn (Subversion's, which Mercurial's made
 > changesets hold too) is taken for the entry's commit alone: a fork another landing made stale is re-based by node
 > first, off the turn, and once more holding it at most. Readers see only what an entry names. A run no entry names
-> is forgotten as it ends, its rows dropped from the store. A made changeset stays one changeset (record v7).
+> is forgotten as it ends. The store drops its rows and retains every payload another changeset still holds (C3).
+> A made changeset stays one changeset (record v7).
 > `repository::hg_run`, `hg_push::rebase`; crash oracle `t_b1_a_crash_at_any_segment_boundary_leaves_a_push_whole_or_absent`.
 
 > **Status (2026-11-21, C1: made changesets on the changeset store; main's ruling of 09:00).** A changeset the server
@@ -61104,3 +61113,43 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
 - **Not yet.** No memory moves in this piece. A checkpoint carries bytes, so a restored green names nothing (piece 2).
 - **Applied in the same change to** `crates/merge` (`dims`, `engine`, `engine/copy`, `engine/named_tests`), GAPS,
   amendments.tsv.
+
+### A-867 — A macOS client's synchronous park waits on its region's Mach semaphore, sent with the region (2026-11-22, w-perf; main 01a20182's order of ~17:40 PST, goal 84a; A-831, A-799, A-44, GAP-A9-9)
+
+- **Why.** Under the time-constraint policy (A-831), a shard's reply wake of a parked client
+  (`os_sync_wake_by_address_any` on the region's shared wake word) cost the shard 1-33 ms of its own CPU in the kernel
+  about once in a hundred loaded requests on CI's macOS runner. Of 1,504 such wakes, 1,451 were on CPU for at least
+  90% of their time (run 45074388808). A spindump put 69 of the wake's 106 samples at one kernel instruction (run
+  45082342692).
+- **What it is.** A probe reproduced the spin where a wake meets its waiter entering its wait. It came in bursts and
+  showed even with no load at all (run 45086631612). That is a lock holder's vCPU descheduled by the VM's host: on
+  bare metal (a Mac Studio, 8 loaded runs) no wake ran 1 ms. The client parks at once (A-799), so its reply meets it
+  entering the wait on most requests. In the probe a Mach semaphore's signal did not spin so.
+- **The rule.** The daemon makes one semaphore with each client region. Its send right goes to the instance's owner
+  with the region's fileport, and the owner hands both to the claimant (`crate::mach_claim`: a keep and a delivery
+  each carry two descriptors).
+  - A synchronous park on a region that came with its semaphore raises a flag of its own, 4 or 5 for the stamp slot
+    (`region::PARKED_SEMAPHORE_SLOT_ZERO`, `_ONE`). It then fences, re-checks its ring as every park does (A-44), and
+    waits on the semaphore. The daemon signals the semaphore for such a flag instead of waking the word.
+  - A semaphore counts its signals, so a signal made before the wait is not lost. One made for a reply the re-check
+    already found ends the next park early, and the loop looks at its ring again.
+  - Every other park keeps the address wake: an async SDK's arm, which its completion bridge waits on, and any mapping
+    that came without the semaphore (a second mapping, a test's open by name).
+  - A semaphore found destroyed (its daemon's region dropped, as a restart does) is let go. That park, and the
+    mapping's later ones, wait on the word, where the look at the daemon's life ends them.
+  - The owner's keep refuses a stranger's keep as before. A message not of the keep's shape is destroyed with its
+    rights, and a right never handed over is given back with its delivery.
+- **Measured.** CI's macOS runner, 8 interleaved rounds against the address wake (run 45091701553):
+  - reply wakes over 1 ms: 3,001 against 36;
+  - the loaded edit and merge's p99, median of rounds: accept 1,766 against 976 µs, conflict 4,301 against 1,363 µs;
+  - quiet no worse.
+  - The p999 stays over 1 ms on that runner, bound by long verbs (BENCHMARKS).
+- **Tests.**
+  - `crates/ipc/tests/rendezvous.rs`
+    `a_parked_client_in_another_process_is_woken_by_its_regions_semaphore`: the client process's park, woken only by a
+    reply made after its flag rose, ends by its semaphore, counted (`ClientEnd::semaphore_wakes`). It failed first
+    with the semaphore named in the region's header (the A/B's arm), whose wait another task refuses
+    (`KERN_INVALID_NAME`).
+  - `mach_claim::tests::a_fetched_wake_right_signals_the_kept_regions_semaphore`.
+- **Applied in the same change to** `crates/ipc` (`mach_semaphore`, `mach_claim`, `region`, `endpoint`, `rendezvous`,
+  `tests/rendezvous.rs`), `unsafe-budget.toml`, GAPS, BENCHMARKS, amendments.tsv.

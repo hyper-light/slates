@@ -56,6 +56,11 @@ const MSG_SUCCESS: MsgReturn = 0;
 const RCV_TIMED_OUT: MsgReturn = 0x1000_4003;
 /// Format: `MACH_RCV_TOO_LARGE` (`<mach/message.h>`): a message larger than the buffer, which the kernel destroyed.
 const RCV_TOO_LARGE: MsgReturn = 0x1000_4004;
+/// Format: `MACH_SEND_TIMED_OUT` (`<mach/message.h>`): refused after the kernel had copied the message's rights in, so
+/// it hands the message back with them in this task.
+const SEND_TIMED_OUT: MsgReturn = 0x1000_0004;
+/// Format: `MACH_SEND_INTERRUPTED`: refused after the copy-in too, the message handed back the same way.
+const SEND_INTERRUPTED: MsgReturn = 0x1000_0007;
 /// Format: `MACH_PORT_NULL` (`<mach/port.h>`).
 const PORT_NULL: MachPort = 0;
 /// Format: `MACH_SEND_MSG` (`<mach/message.h>`).
@@ -131,23 +136,29 @@ struct PortDescriptor {
   kind: u8,
 }
 
-/// Format: a delivery: the header, `mach_msg_body_t` (the descriptor count), and the fileport's descriptor.
+/// Format: a delivery: the header, `mach_msg_body_t` (the descriptor count), the fileport's descriptor, and the
+/// region's reply wake semaphore's (`crate::mach_semaphore`).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct Delivered {
   header: Header,
   count: u32,
   port: PortDescriptor,
+  wake: PortDescriptor,
 }
 
-/// Format: a keep: the header, the descriptor count, the region's fileport, then the claim slot and the claimant's
-/// process id.
+/// Format: the descriptors a keep and a delivery carry: the region's fileport and its wake semaphore.
+const DESCRIPTORS: u32 = 2;
+
+/// Format: a keep: the header, the descriptor count, the region's fileport and its reply wake semaphore, then the claim
+/// slot and the claimant's process id.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct Keep {
   header: Header,
   count: u32,
   port: PortDescriptor,
+  wake: PortDescriptor,
   slot: u32,
   pid: u32,
 }
@@ -224,11 +235,30 @@ unsafe extern "C" {
   fn audit_token_to_pid(token: AuditToken) -> libc::pid_t;
 }
 
-/// A descriptor waiting for its claimant.
+/// A descriptor waiting for its claimant, with its region's wake semaphore's send right.
 struct Pending {
   pid: u32,
   fd: OwnedFd,
+  wake: WakeRight,
   since: std::time::Instant,
+}
+
+/// A send right to a region's wake semaphore held by the owner for its claimant: given back if never handed over.
+struct WakeRight(MachPort);
+
+impl WakeRight {
+  /// The right, handed on: this value gives nothing back.
+  fn take(mut self) -> MachPort {
+    std::mem::replace(&mut self.0, PORT_NULL)
+  }
+}
+
+impl Drop for WakeRight {
+  fn drop(&mut self) {
+    if self.0 != PORT_NULL {
+      deallocate(self.0);
+    }
+  }
 }
 
 /// The regions waiting for their claimants, one at most per claim slot, held by the instance's owner.
@@ -246,25 +276,27 @@ impl Deliveries {
     }
   }
 
-  /// Keeps `fd` for the claim in `slot`, made by process `pid`, in place of whatever the slot held: a later claim of
-  /// the slot is the only one that can still be fetched.
-  pub(crate) fn keep(&mut self, slot: usize, pid: u32, fd: OwnedFd) -> Result<(), IpcError> {
+  /// Keeps `fd` and its region's wake semaphore's send right `wake` for the claim in `slot`, made by process `pid`, in
+  /// place of whatever the slot held (whose right is given back): a later claim of the slot is the only one that can
+  /// still be fetched. A slot past the table is refused and `wake` given back.
+  fn keep(&mut self, slot: usize, pid: u32, fd: OwnedFd, wake: WakeRight) -> Result<(), IpcError> {
     let place = self.pending.get_mut(slot).ok_or(IpcError::Layout {
       reason: "a delivery for a claim slot past the bootstrap table",
     })?;
     *place = Some(Pending {
       pid,
       fd,
+      wake,
       since: std::time::Instant::now(),
     });
     Ok(())
   }
 
-  /// The descriptor kept for `slot` when process `pid` made its claim, taken out; `None` otherwise.
-  fn take(&mut self, slot: usize, pid: u32) -> Option<OwnedFd> {
+  /// The descriptor and wake right kept for `slot` when process `pid` made its claim, taken out; `None` otherwise.
+  fn take(&mut self, slot: usize, pid: u32) -> Option<(OwnedFd, WakeRight)> {
     let place = self.pending.get_mut(slot)?;
     if place.as_ref().is_some_and(|pending| pending.pid == pid) {
-      return place.take().map(|pending| pending.fd);
+      return place.take().map(|pending| (pending.fd, pending.wake));
     }
     None
   }
@@ -421,16 +453,21 @@ fn run(token: OwnerName, mut deliveries: Deliveries, wake_ms: u32) {
       KEEP_ID
         if complex
           && size == size_of::<Keep>()
-          && message.keep.count == 1
+          && message.keep.count == DESCRIPTORS
           && message.keep.port.kind == PORT_DESCRIPTOR
           && message.keep.port.disposition == PORT_SEND
+          && message.keep.wake.kind == PORT_DESCRIPTOR
+          && message.keep.wake.disposition == PORT_SEND
+          && message.keep.wake.name != PORT_NULL
           && sender.is_some_and(|pid| pid == own || parent_of(pid) == Some(own)) =>
       {
+        // The wake right is held from here: given back with the delivery if it is never handed over.
+        let wake = WakeRight(message.keep.wake.name);
         let fileport = message.keep.port.name;
         let kept = descriptor_of(fileport).ok().and_then(|fd| {
           usize::try_from(message.keep.slot)
             .ok()
-            .and_then(|slot| deliveries.keep(slot, message.keep.pid, fd).ok())
+            .and_then(|slot| deliveries.keep(slot, message.keep.pid, fd, wake).ok())
         });
         let _ = kept;
       }
@@ -504,13 +541,15 @@ fn descriptor_of(fileport: MachPort) -> Result<OwnedFd, IpcError> {
   Ok(fd)
 }
 
-/// Sends the region behind `region` to the owner of the token `owner_name`, kept for claim slot `slot`, claimed by
-/// process `claimant`; the owner takes it only from its own process or a child of it (the daemon its anchor spawned).
+/// Sends the region behind `region`, with a send right copied from its reply wake semaphore `wake`
+/// (`crate::mach_semaphore`), to the owner of the token `owner_name`, kept for claim slot `slot`, claimed by process
+/// `claimant`; the owner takes them only from its own process or a child of it (the daemon its anchor spawned).
 pub(crate) fn keep(
   owner_name: &str,
   slot: usize,
   claimant: u32,
   region: BorrowedFd<'_>,
+  wake: MachPort,
 ) -> Result<(), IpcError> {
   let owner = look_up(owner_name)?.ok_or(IpcError::Layout {
     reason: "no process holds the instance's token to keep the region",
@@ -534,7 +573,7 @@ pub(crate) fn keep(
       voucher: PORT_NULL,
       id: KEEP_ID,
     },
-    count: 1,
+    count: DESCRIPTORS,
     port: PortDescriptor {
       name: fileport,
       pad1: 0,
@@ -542,11 +581,19 @@ pub(crate) fn keep(
       disposition: u8::try_from(MOVE_SEND).unwrap_or(0),
       kind: PORT_DESCRIPTOR,
     },
+    wake: PortDescriptor {
+      name: wake,
+      pad1: 0,
+      pad2: 0,
+      disposition: u8::try_from(COPY_SEND).unwrap_or(0),
+      kind: PORT_DESCRIPTOR,
+    },
     slot: u32::try_from(slot).unwrap_or(u32::MAX),
     pid: claimant,
   };
-  // SAFETY: `message` is a live complex message to a send right this process was given (copied), whose one descriptor
-  // moves the send right to the fileport just made; the send waits at most `CONTROL_WAIT_MS`.
+  // SAFETY: `message` is a live complex message to a send right this process was given (copied), whose descriptors move
+  // the send right to the fileport just made and copy one from the region's semaphore, which the region keeps; the send
+  // waits at most `CONTROL_WAIT_MS`.
   let sent = unsafe {
     mach_msg(
       &mut message.header,
@@ -559,8 +606,16 @@ pub(crate) fn keep(
     )
   };
   if sent != MSG_SUCCESS {
-    // SAFETY: `message` is the message just refused, still naming the rights it was given; destroyed once.
-    unsafe { mach_msg_destroy(&mut message.header) };
+    if sent == SEND_TIMED_OUT || sent == SEND_INTERRUPTED {
+      // Handed back after the copy-in: the fileport's right and a copy of the semaphore's are this task's again, and
+      // destroying the message gives back both, the region keeping its own right to the semaphore.
+      // SAFETY: `message` is the message the kernel handed back, naming the rights it copied in; destroyed once.
+      unsafe { mach_msg_destroy(&mut message.header) };
+    } else {
+      // Refused before the copy-in: no copy of the semaphore's right was made, so only the fileport is given back;
+      // destroying the message would give back the region's own right to its semaphore.
+      deallocate(fileport);
+    }
     return Err(IpcError::OsRefused {
       call: "mach_msg (keep the region)",
       code: Some(sent),
@@ -569,10 +624,11 @@ pub(crate) fn keep(
   Ok(())
 }
 
-/// Sends the answer to a fetch on its reply right: the region as a fileport when `found`, else the refusal. Whether
-/// the region was sent. A claimant gone before its answer leaves the send refused, and the fileport is given back.
-fn answer(reply: MachPort, found: Option<OwnedFd>) -> bool {
-  let Some(fd) = found else {
+/// Sends the answer to a fetch on its reply right: the region as a fileport with its wake right when `found`, else the
+/// refusal. Whether the region was sent. A claimant gone before its answer leaves the send refused, and both rights are
+/// given back.
+fn answer(reply: MachPort, found: Option<(OwnedFd, WakeRight)>) -> bool {
+  let Some((fd, wake)) = found else {
     let mut refusal = Header {
       bits: MOVE_SEND_ONCE,
       size: u32::try_from(size_of::<Header>()).unwrap_or(0),
@@ -608,6 +664,7 @@ fn answer(reply: MachPort, found: Option<OwnedFd>) -> bool {
   if made != 0 || fileport == PORT_NULL {
     return answer(reply, None);
   }
+  let wake = wake.take();
   let mut delivered = Delivered {
     header: Header {
       bits: MOVE_SEND_ONCE | BITS_COMPLEX,
@@ -617,7 +674,7 @@ fn answer(reply: MachPort, found: Option<OwnedFd>) -> bool {
       voucher: PORT_NULL,
       id: DELIVERED_ID,
     },
-    count: 1,
+    count: DESCRIPTORS,
     port: PortDescriptor {
       name: fileport,
       pad1: 0,
@@ -625,9 +682,17 @@ fn answer(reply: MachPort, found: Option<OwnedFd>) -> bool {
       disposition: u8::try_from(MOVE_SEND).unwrap_or(0),
       kind: PORT_DESCRIPTOR,
     },
+    wake: PortDescriptor {
+      name: wake,
+      pad1: 0,
+      pad2: 0,
+      disposition: u8::try_from(MOVE_SEND).unwrap_or(0),
+      kind: PORT_DESCRIPTOR,
+    },
   };
-  // SAFETY: `delivered` is a live complex message: its remote port is the fetch's send-once right and its one
-  // descriptor moves the send right to the fileport just made, each moved here once; a zero timeout never blocks.
+  // SAFETY: `delivered` is a live complex message: its remote port is the fetch's send-once right and its descriptors
+  // move the send rights to the fileport just made and to the region's semaphore the owner held, each moved here once;
+  // a zero timeout never blocks.
   let sent = unsafe {
     mach_msg(
       &mut delivered.header,
@@ -640,8 +705,8 @@ fn answer(reply: MachPort, found: Option<OwnedFd>) -> bool {
     )
   };
   if sent != MSG_SUCCESS {
-    // A refused send leaves its rights with this process, the fileport's among them: destroyed here, so no capability
-    // for the region outlives the refusal.
+    // A refused send leaves its rights with this process, the fileport's and the semaphore's among them: destroyed here,
+    // so no capability for the region outlives the refusal.
     // SAFETY: `delivered` is the message just refused, still naming the rights it was given; destroyed once.
     unsafe { mach_msg_destroy(&mut delivered.header) };
     return false;
@@ -649,14 +714,19 @@ fn answer(reply: MachPort, found: Option<OwnedFd>) -> bool {
   true
 }
 
-/// Fetches the region kept for claim slot `slot` from the owner of the token `owner_name`; the region's descriptor.
+/// Fetches the region kept for claim slot `slot` from the owner of the token `owner_name`; the region's descriptor and a
+/// send right to its reply wake semaphore (`crate::mach_semaphore`).
 /// Waits while the owner lives, never by a clock (A-452; R3's class C, as a claim waits, A-443): the send waits for room
 /// in the owner's queue until its port dies, and the receive for the owner's answer until the kernel's send-once
 /// notification says the owner went away holding the fetch, or with it still queued. Refused `DaemonUnavailable` when no
 /// owner holds the token, the owner went away before answering, or it keeps nothing for this claim. It waited a fixed
 /// second for each, so an owner alive and slow to answer (its thread descheduled on a busy machine) was reported gone,
 /// and an owner that went away was reported as keeping nothing.
-pub(crate) fn fetch(instance: &str, owner_name: &str, slot: usize) -> Result<OwnedFd, IpcError> {
+pub(crate) fn fetch(
+  instance: &str,
+  owner_name: &str,
+  slot: usize,
+) -> Result<(OwnedFd, crate::mach_semaphore::Semaphore), IpcError> {
   let unavailable = |why: &'static str| IpcError::DaemonUnavailable {
     endpoint: instance.to_owned(),
     why,
@@ -727,9 +797,11 @@ pub(crate) fn fetch(instance: &str, owner_name: &str, slot: usize) -> Result<Own
   let well_formed = delivered.header.id == DELIVERED_ID
     && delivered.header.bits & BITS_COMPLEX != 0
     && usize::try_from(delivered.header.size).ok() == Some(size_of::<Delivered>())
-    && delivered.count == 1
+    && delivered.count == DESCRIPTORS
     && delivered.port.kind == PORT_DESCRIPTOR
-    && delivered.port.name != PORT_NULL;
+    && delivered.port.name != PORT_NULL
+    && delivered.wake.kind == PORT_DESCRIPTOR
+    && delivered.wake.name != PORT_NULL;
   if !well_formed {
     // SAFETY: `answer` holds a message the kernel just delivered whole into this buffer; destroying it gives back
     // every right it carried, once.
@@ -738,7 +810,9 @@ pub(crate) fn fetch(instance: &str, owner_name: &str, slot: usize) -> Result<Own
       "the instance's owner keeps no region for this claim",
     ));
   }
-  descriptor_of(delivered.port.name)
+  // The wake right is this task's from here, given back when its region is dropped, even if the fileport fails.
+  let wake = crate::mach_semaphore::Semaphore::received(delivered.wake.name);
+  descriptor_of(delivered.port.name).map(|fd| (fd, wake))
 }
 
 /// A receive right for one answer, given back when dropped.
@@ -782,6 +856,7 @@ fn deallocate(port: MachPort) {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::mach_semaphore::Semaphore;
   use slates_mem::{SharedObject, Words};
 
   /// Format: the variable that runs this test binary as a stranger: the owner token's name it plants a region under.
@@ -824,8 +899,9 @@ mod tests {
   fn a_kept_region_is_fetched_once_by_its_claimant() {
     let (name, _service) = token("once");
     let kept = region("once", 7);
-    keep(&name, 1, std::process::id(), kept.as_fd()).unwrap();
-    let fd = fetch("test", &name, 1).unwrap();
+    let wake = Semaphore::create().unwrap();
+    keep(&name, 1, std::process::id(), kept.as_fd(), wake.port()).unwrap();
+    let (fd, _right) = fetch("test", &name, 1).unwrap();
     let fetched = SharedObject::from_descriptor(fd, REGION_BYTES, Words::new()).unwrap();
     let mut first = [0u8; 16];
     fetched.read(0, &mut first).unwrap();
@@ -836,13 +912,32 @@ mod tests {
     );
   }
 
+  /// 84a (`crate::mach_semaphore`). Do: keep a region for slot 3 with its reply wake semaphore, fetch slot 3, and signal
+  /// the semaphore through the right the fetch received. Expect: a wait on the kept semaphore ends signaled, not at its
+  /// timeout: the right the claimant holds names the region's own semaphore.
+  #[test]
+  fn a_fetched_wake_right_signals_the_kept_regions_semaphore() {
+    let (name, _service) = token("wake");
+    let kept = region("wake", 3);
+    let wake = Semaphore::create().unwrap();
+    keep(&name, 3, std::process::id(), kept.as_fd(), wake.port()).unwrap();
+    let (_fd, right) = fetch("test", &name, 3).unwrap();
+    right.signal().unwrap();
+    assert_eq!(
+      wake.wait(Some(STALE_NS)).unwrap(),
+      Some(true),
+      "the fetched right signaled the region's semaphore"
+    );
+  }
+
   /// GAP-A9-9. Do: keep a region for slot 2 claimed by another process (this pid plus one), and fetch slot 2 as this
   /// process. Expect: nothing: a region goes only to the process that claimed it, by the kernel's audit token.
   #[test]
   fn a_region_kept_for_another_process_is_refused_to_this_one() {
     let (name, _service) = token("other");
     let kept = region("other", 9);
-    keep(&name, 2, std::process::id() + 1, kept.as_fd()).unwrap();
+    let wake = Semaphore::create().unwrap();
+    keep(&name, 2, std::process::id() + 1, kept.as_fd(), wake.port()).unwrap();
     assert!(fetch("test", &name, 2).is_err());
   }
 
@@ -895,11 +990,12 @@ mod tests {
       .unwrap()
       .expect("the test's token is free");
     let kept = region("late", 9);
-    keep(&name, 1, std::process::id(), kept.as_fd()).unwrap();
+    let wake = Semaphore::create().unwrap();
+    keep(&name, 1, std::process::id(), kept.as_fd(), wake.port()).unwrap();
     let fetching = name.clone();
     let started = std::time::Instant::now();
     let fetcher = std::thread::spawn(move || {
-      let fetched = fetch("test", &fetching, 1).map(|fd| {
+      let fetched = fetch("test", &fetching, 1).map(|(fd, _right)| {
         let fetched = SharedObject::from_descriptor(fd, REGION_BYTES, Words::new()).unwrap();
         let mut bytes = [0u8; 16];
         fetched.read(0, &mut bytes).unwrap();
@@ -949,6 +1045,14 @@ mod tests {
       return;
     };
     let planted = region("planted", PLANTED);
-    keep(&name, 0, victim.parse().unwrap(), planted.as_fd()).unwrap();
+    let wake = Semaphore::create().unwrap();
+    keep(
+      &name,
+      0,
+      victim.parse().unwrap(),
+      planted.as_fd(),
+      wake.port(),
+    )
+    .unwrap();
   }
 }
