@@ -106,6 +106,11 @@ pub struct ClientEnd {
   request_stamp: u32,
   /// Wakes the client had to park for (the spin-to-park ratio's numerator).
   parks: u64,
+  /// How long its replies take to come, from the wait's start (84a's Linux arm G): the online mean a reply is expected
+  /// within, which the client's naps follow ([`Self::nap_ns`]).
+  reply_waits: WakeEstimate,
+  /// Its naps while a reply is due, their thread CPU and their wall time ([`ClientNaps`]).
+  naps: ClientNaps,
   /// Replies taken.
   replies: u64,
   /// Parks a wake ended with no reply in the ring — a spurious return from the OS wait, or a previous
@@ -182,6 +187,8 @@ impl ClientEnd {
   pub fn new(region: ClientRegion) -> ClientEnd {
     let wake = WakeEstimate::new(u64::from(region.spin_ns()), region.spin_shift());
     ClientEnd {
+      reply_waits: wake,
+      naps: ClientNaps::default(),
       wake,
       wake_samples: 0,
       unsettled: [None; REPLY_STAMP_SLOTS],
@@ -714,7 +721,11 @@ impl ClientEnd {
     {
       self.looks = Looks::default();
     }
+    let started = Instant::now();
     let waited = self.wait_ending(Ends::Departure);
+    if let Ok(Waited::Reply(_)) = &waited {
+      self.reply_waits.record(elapsed_ns(started));
+    }
     #[cfg(target_os = "linux")]
     self.give_back_bridge_level();
     waited
@@ -779,7 +790,10 @@ impl ClientEnd {
         let remaining = deadline_ns.map(|deadline| deadline.saturating_sub(elapsed_ns(started)));
         self.park_until(expected, remaining)?
       }
-      Ends::Departure => self.park_until_departure(expected, look_timeout_ns)?,
+      Ends::Departure => match self.nap_ns(started) {
+        Some(nap_ns) if look_timeout_ns.is_none() => self.nap(expected, nap_ns)?,
+        _ => self.park_until_departure(expected, look_timeout_ns)?,
+      },
     };
     let returned_ns = slates_machine::clock::monotonic_ns();
     let teaches = wait_may_teach(
@@ -955,7 +969,7 @@ impl ClientEnd {
   fn park_until_departure(
     &mut self,
     _expected: u32,
-    _timeout_ns: Option<u64>,
+    timeout_ns: Option<u64>,
   ) -> Result<Parked, IpcError> {
     use rustix::event::{PollFd, PollFlags, poll};
     let (woken, departed) = {
@@ -976,7 +990,11 @@ impl ClientEnd {
         PollFd::new(&level, PollFlags::IN),
         PollFd::new(&watch, PollFlags::RDHUP),
       ];
-      match poll(&mut interest, None) {
+      let timeout = timeout_ns.map(|ns| rustix::time::Timespec {
+        tv_sec: i64::try_from(ns / NS_PER_S).unwrap_or(i64::MAX),
+        tv_nsec: i64::try_from(ns % NS_PER_S).unwrap_or(0),
+      });
+      match poll(&mut interest, timeout.as_ref()) {
         Ok(_) => {}
         // A signal: the caller looks at the ring, then parks again.
         Err(rustix::io::Errno::INTR) => return Ok(Parked::INTERRUPTED),
@@ -2276,7 +2294,84 @@ mod tests {
   }
 }
 
+/// A client's naps while its reply is due (84a's Linux arm G, `slates_machine::nap`): each a departure park whose wait
+/// ends at R9's floor if no reply came first. Elsewhere than Linux none is taken.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClientNaps {
+  /// Naps taken: the non-vacuity count.
+  pub naps: u64,
+  /// The thread's CPU time in them, nanoseconds: their cost.
+  pub cpu_ns: u64,
+  /// Their wall time, nanoseconds: the time the client spent expecting its reply in them.
+  pub wall_ns: u64,
+}
+
+/// Format: nanoseconds a second, for a nap's poll timeout and a thread CPU clock reading.
+#[cfg(target_os = "linux")]
+const NS_PER_S: u64 = 1_000_000_000;
+
+impl ClientEnd {
+  /// How long the next park naps, when the client expects its reply now (84a's Linux arm G): R9's floor (the daemon's
+  /// published window), no longer than the expectation of its measured reply waits from `started` has left. `None`
+  /// past it, or off Linux: the park waits for the reply or the departure, as before.
+  fn nap_ns(&self, started: Instant) -> Option<u64> {
+    if !cfg!(target_os = "linux") {
+      return None;
+    }
+    let expected = slates_machine::nap::expectation_ns(self.reply_waits.mean_ns());
+    let left = expected
+      .checked_sub(elapsed_ns(started))
+      .filter(|left| *left > 0)?;
+    Some(u64::from(self.region.spin_ns()).min(left).max(1))
+  }
+
+  /// One nap: a departure park whose wait ends after `nap_ns` if nothing came first, its thread CPU and wall time
+  /// counted; the thread's timer slack lowered once, so the nap ends at its deadline.
+  fn nap(&mut self, expected: u32, nap_ns: u64) -> Result<Parked, IpcError> {
+    if !NAP_SLACK_SET.with(|set| set.replace(true))
+      && let Err(errno) = slates_machine::nap::set_least_timer_slack()
+    {
+      slates_machine::log_line!("slates-ipc: a client's naps keep its timer slack (errno {errno})");
+    }
+    let (cpu_before, wall_before) = (thread_cpu_ns(), slates_machine::clock::monotonic_ns());
+    let parked = self.park_until_departure(expected, Some(nap_ns));
+    self.naps.naps = self.naps.naps.saturating_add(1);
+    self.naps.cpu_ns = self
+      .naps
+      .cpu_ns
+      .saturating_add(thread_cpu_ns().saturating_sub(cpu_before));
+    self.naps.wall_ns = self
+      .naps
+      .wall_ns
+      .saturating_add(slates_machine::clock::monotonic_ns().saturating_sub(wall_before));
+    parked
+  }
+
+  /// The client's naps while a reply was due ([`ClientNaps`]).
+  pub fn naps(&self) -> ClientNaps {
+    self.naps
+  }
+}
+
+/// The calling thread's CPU time, nanoseconds (0 where the clock cannot be read).
+fn thread_cpu_ns() -> u64 {
+  #[cfg(target_os = "linux")]
+  {
+    let reading = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
+    u64::try_from(reading.tv_sec)
+      .unwrap_or(0)
+      .saturating_mul(NS_PER_S)
+      .saturating_add(u64::try_from(reading.tv_nsec).unwrap_or(0))
+  }
+  #[cfg(not(target_os = "linux"))]
+  {
+    0
+  }
+}
+
 thread_local! {
+  /// Whether this thread has lowered its timer slack for its naps ([`ClientEnd::nap`]).
+  static NAP_SLACK_SET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
   /// Whether this thread has asked for the time-constraint policy ([`real_time_once`]).
   static REAL_TIME_ASKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
