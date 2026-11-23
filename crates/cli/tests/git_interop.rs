@@ -598,11 +598,16 @@ fn http_edge_port(lines: &[String]) -> u16 {
 /// Makes git repository [`REPOSITORY`] through the CLI, in A-685's words: its object format SHA-1 and its default
 /// branch [`BRANCH`], the verb's defaults.
 fn create_repository(instance: &str) {
-  let (code, out, err) = slates(
-    instance,
-    &[],
-    &["repository", "create", REPOSITORY, "--tool", "git"],
-  );
+  create_repository_with(instance, None);
+}
+
+/// [`create_repository`] with its default branch `branch` where one is given (`--default-branch`), else the verb's.
+fn create_repository_with(instance: &str, branch: Option<&str>) {
+  let mut args = vec!["repository", "create", REPOSITORY, "--tool", "git"];
+  if let Some(branch) = branch {
+    args.extend(["--default-branch", branch]);
+  }
+  let (code, out, err) = slates(instance, &[], &args);
   assert_eq!(code, 0, "repository create: {out}{err}");
 }
 
@@ -637,11 +642,16 @@ struct HttpLeg {
 /// [`REPOSITORY`] made, and a token minted; `None` where this platform names no issuer surface, which [`issuer_of`]
 /// says.
 fn http_leg(session: &str) -> Option<HttpLeg> {
+  http_leg_with(session, None)
+}
+
+/// [`http_leg`] with the repository's default branch `branch` where one is given ([`create_repository_with`]).
+fn http_leg_with(session: &str, branch: Option<&str>) -> Option<HttpLeg> {
   let instance = format!("git-http-{session}-{}", std::process::id());
   let started = start_anchor(&instance, &["--vcs-http", "127.0.0.1:0"]);
   let port = http_edge_port(&started.lines);
   let issuer = issuer_of(&started, "the HTTP leg")?;
-  create_repository(&instance);
+  create_repository_with(&instance, branch);
   let token = minted_token(&instance, &issuer);
   Some(HttpLeg {
     _anchor: started.anchor,
@@ -2356,6 +2366,15 @@ fn whole_session(git: &Git, source: &str, (url, instance, stock): (&str, &str, u
     .ok(&work, &["symbolic-ref", "--short", "HEAD"])
     .trim()
     .to_owned();
+  // The work clone checks out the source's default branch, its history (r115: a repository left at the verb's default
+  // branch, `main`, while git/git's is `master`, cloned unborn, so its commit was a root and the shallow clone of it
+  // one commit deep at any depth).
+  let (_, checked_out, _) = git.run(&work, &["rev-parse", "--verify", "-q", "HEAD"]);
+  assert_eq!(
+    checked_out.trim(),
+    git.commit_of(source, "HEAD"),
+    "the work clone checks out the source's tip on {branch}"
+  );
   put(&work, "carried\n");
   git.ok(&work, &["add", FILE]);
   git.ok(&work, &["commit", "-q", "-m", "carried"]);
@@ -2449,8 +2468,14 @@ fn stock_git_carries_a_whole_repository_over_each_edge() {
   let source = format!("{}/source.git", scratch.path);
   tagged_source(&plain, &dataset, &source);
   let stock = stock_clone_bytes(&plain, &source);
+  // The repository's default branch the source's, as a stock bare repository's HEAD names its own: the work clone and
+  // the shallow clone are of that branch's history.
+  let default_branch = plain
+    .ok(&source, &["symbolic-ref", "--short", "HEAD"])
+    .trim()
+    .to_owned();
   if edges.split(',').any(|edge| edge == "http") {
-    let Some(leg) = http_leg("whole") else {
+    let Some(leg) = http_leg_with("whole", Some(&default_branch)) else {
       return;
     };
     let header = format!("http.extraHeader=Authorization: Bearer {}", leg.token);
@@ -2500,7 +2525,7 @@ fn stock_git_carries_a_whole_repository_over_each_edge() {
       return;
     };
     let known_hosts = known_hosts(&scratch, port, &fingerprint);
-    create_repository(&instance);
+    create_repository_with(&instance, Some(&default_branch));
     let (code, out, err) = slates(&instance, &issuer, &["credential", "key", &public]);
     assert_eq!(code, 0, "credential key: {out}{err}");
     let ssh = format!(
