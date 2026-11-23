@@ -1217,7 +1217,7 @@ impl<A: Answered> Upload<A> {
   /// refuses typed, as one of a window that cannot be read does, so a stop always makes progress or ends.
   fn stop_at(&mut self, store: &ContentStore, waited: packed::Waited) -> bool {
     let window = to_u64(store.window()).max(1);
-    let at = (waited.pack, waited.offset / window);
+    let at = (waited.pack, waited.offset.checked_div(window).unwrap_or(0));
     if self.last_stop == Some(at) {
       return false;
     }
