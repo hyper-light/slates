@@ -481,3 +481,12 @@ Waiting: main's route; arena-7 and arena-8.
 - Next: (A), the server integration harness (crates/server/tests/hg_push_heap.rs): an in-process Daemon::start with
   a store owner, an issuer-minted token, create_repository, and real hg subprocesses (debugbuilddag history; push,
   clone, clone --stream, verify), skipping loudly without hg.
+
+## 2026-11-23 ~14:00 PST (w-hg, worktree ~/slates-work/w-hg-b)
+- Landed 9c8e4a95e: crates/server/tests/hg_push_heap.rs, an in-process daemon under real hg subprocesses (push, clone,
+  stream, verify) with a byte sampler, top sites per row.
+- First read: push 702 KB a changeset (HgExchange 21.7%, watchdog p99 14.4% plus its beat 9.5%, phase_heads 8.8%,
+  ChunkWindows::put 4.6%); clone and stream about 26 KB a changeset.
+- Flagged to main: the watchdog's per-beat allocation (several GB over a push-all); push::phase_heads collected per
+  step; the HTTP exchange's buffering.
+- Next (unless main routes otherwise): phase_heads and the HTTP exchange site.
