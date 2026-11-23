@@ -34,18 +34,19 @@
 //! node and no shared-ownership pointer (CLAUDE.md R2).
 //!
 //! **A tree is copied by reference (A-542, Copy's maps).** A path's tree is its own key and the keys that start with it
-//! and `/`. [`Dim::copy_tree`] holds the source's keys beneath it as one subtree, grafts them beneath the destination
-//! ([`crate::ptrie::Ptrie::graft`]) and sets the destination's own key to the source's value: two descents, two counts
-//! and the copies of the nodes on the destination's path, O(the paths' lengths) whatever the tree holds, and no walk
+//! and `/`. [`Dim::hold_tree`] holds the source's keys beneath it as one subtree, [`Dim::graft_tree`] grafts them
+//! beneath the destination ([`crate::ptrie::Ptrie::graft`]) and sets the destination's own key to the source's value
+//! (the engine holds every source of a commit before it grafts any, A-626): two descents, two counts and the copies of
+//! the nodes on the destination's path, O(the paths' lengths) whatever the tree holds, and no walk
 //! ([`crate::ptrie::Nodes::visited`] does not move). A file's copy is one more holder of its block, never its bytes.
-//! An attribute's tree is two prefixes, the path's own attributes and its descendants' ([`Xattrs::copy_tree`]). The
-//! destination must be absent with nothing beneath it, as Subversion's copy needs (§4.17.4 item 3.2), and the subtree
-//! is held before anything is grafted, so a copy into the source's own subtree sees the source as it was. The root's
-//! tree is every key (A-586: a stock client copies `^/` into a child of itself): the whole map is held and grafted
-//! beneath the destination, and the root's own key, which came with it, is moved to the destination's own key (for
-//! attributes, its own prefix is cut away from beneath the destination, [`crate::ptrie::Ptrie::cut`]). The root is never
-//! a destination: it is always present. A tree is taken away again by [`Dim::cut_tree`], a copy's inverse, which a green
-//! made at a version before a copy runs.
+//! An attribute's tree is two prefixes, the path's own attributes and its descendants' ([`Xattrs::hold_tree`],
+//! [`Xattrs::graft_tree`]). The destination must be absent with nothing beneath it, as Subversion's copy needs
+//! (§4.17.4 item 3.2), and the subtree is held before anything is grafted, so a copy into the source's own subtree sees
+//! the source as it was. The root's tree is every key (A-586: a stock client copies `^/` into a child of itself): the
+//! whole map is held and grafted beneath the destination, and the root's own key, which came with it, is moved to the
+//! destination's own key (for attributes, its own prefix is cut away from beneath the destination,
+//! [`crate::ptrie::Ptrie::cut`]). The root is never a destination: it is always present. A tree is taken away again by
+//! [`Dim::cut_tree`], a copy's inverse, which a green made at a version before a copy runs.
 
 use std::collections::BTreeSet;
 

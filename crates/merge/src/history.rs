@@ -754,7 +754,7 @@ impl Value {
     self.pieces.len().saturating_mul(PIECE_BYTES)
   }
 
-  /// What [`Value::whole`] of `len` bytes holds, without making it: its bytes and its one piece's list entry (nothing
+  /// What [`Value::owned`] of `len` bytes holds, without making it: its bytes and its one piece's list entry (nothing
   /// for no bytes), as the engine counts a current value (A-534: what a path's first change records whole).
   pub(crate) fn whole_cost(len: usize) -> usize {
     if len == 0 {
