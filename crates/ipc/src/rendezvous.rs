@@ -4879,11 +4879,20 @@ pub mod platform {
       assert_eq!(connected.region.client_id(), accepted.client_id);
     }
 
-    /// A-468. Do: hold the instance's rendezvous as an anchor does, open a daemon end over it and begin a claim; stop the
-    /// daemon end, then let the anchor go too, its owner's name with it, and poll the claim. Expect: refused
-    /// `DaemonUnavailable` for a rendezvous with no live owner, within the claim wait of the anchor's going. Before A-468
-    /// the claim waited out its client's restart bound, two seconds, after its anchor was gone.
+    /// Format: what a claim's refusal names when the anchor it waited under let go of the rendezvous inside its live
+    /// process: macOS finds the owner's bootstrap name gone with the hold, Windows the anchor's mark cleared from the
+    /// header.
     #[cfg(target_os = "macos")]
+    const ANCHOR_WENT: &str = "no live owner";
+    /// Format: as above, Windows.
+    #[cfg(windows)]
+    const ANCHOR_WENT: &str = "let go of it";
+
+    /// A-468. Do: hold the instance's rendezvous as an anchor does, open a daemon end over it and begin a claim; stop the
+    /// daemon end, then let the anchor go too, inside this live process, and poll the claim. Expect: refused
+    /// `DaemonUnavailable` for the anchor's going (its owner's name gone on macOS, its mark cleared on Windows), within
+    /// the claim wait of it. Before A-468 the claim waited out its client's restart bound, two seconds, after its anchor
+    /// was gone; on Windows until 2026-11-23 it waited until the anchor's process exited, which here is never.
     #[test]
     fn a_claim_under_an_anchor_ends_at_the_anchors_going() {
       let name = instance("anchor-gone");
@@ -4903,16 +4912,62 @@ pub mod platform {
           Ok(Some(_)) => panic!("a claim with no daemon was answered"),
           Err(refusal) => break refusal,
         }
+        assert!(
+          gone.elapsed() < std::time::Duration::from_nanos(CLAIM_WAIT_NS),
+          "the claim outlived its anchor's going by a claim wait"
+        );
       };
       let waited = gone.elapsed();
       println!("a claim whose anchor went: {refusal:?} after {waited:?}");
       assert!(
-        matches!(&refusal, IpcError::DaemonUnavailable { why, .. } if why.contains("no live owner")),
+        matches!(&refusal, IpcError::DaemonUnavailable { why, .. } if why.contains(ANCHOR_WENT)),
         "{refusal:?}"
       );
+    }
+
+    /// A-468, the synchronous facade's wait. Do: hold the instance's rendezvous as an anchor does and open a daemon end
+    /// over it; on another thread begin a claim and wait for its answer (`Claim::wait`, which `connect` runs); stop the
+    /// daemon end, and once the claim has waited a tenth of the claim wait let the anchor go inside this live process.
+    /// Expect: the wait ends `DaemonUnavailable` for the anchor's going, within the claim wait of it. Until 2026-11-23 a
+    /// Windows claim waited beside the anchor's process with no timeout, so its wait ended only with that process.
+    #[test]
+    // The test thread lets the claimant's wait begin before the anchor goes, as a client already waiting would be.
+    #[allow(clippy::disallowed_methods)]
+    fn a_waiting_claim_under_an_anchor_ends_at_its_going_inside_a_live_process() {
+      let name = instance("anchor-let-go-wait");
+      let anchor = Held::hold(&name).unwrap();
+      let first = Listener::open(&name, Some("held")).unwrap();
+      let (begun_sender, begun) = std::sync::mpsc::channel();
+      let (ended_sender, ended) = std::sync::mpsc::channel();
+      let claimant = {
+        let name = name.clone();
+        std::thread::spawn(move || match begin(&name, 0) {
+          Ok(claim) => {
+            let _ = begun_sender.send(true);
+            let _ = ended_sender.send(claim.wait().map(|_| ()));
+          }
+          Err(_) => {
+            let _ = begun_sender.send(false);
+          }
+        })
+      };
+      assert!(begun.recv().unwrap(), "the claim began under the anchor");
+      drop(first);
+      std::thread::sleep(std::time::Duration::from_nanos(CLAIM_WAIT_NS / 10));
+      let gone = std::time::Instant::now();
+      drop(anchor);
+      let refusal = match ended.recv_timeout(std::time::Duration::from_nanos(CLAIM_WAIT_NS)) {
+        Ok(Err(refusal)) => refusal,
+        Ok(Ok(())) => panic!("a claim with no daemon was answered"),
+        // The claimant is left waiting: joining it would wait with it.
+        Err(_) => panic!("the waiting claim outlived its anchor's going by a claim wait"),
+      };
+      let waited = gone.elapsed();
+      claimant.join().unwrap();
+      println!("a waiting claim whose anchor let go: {refusal:?} after {waited:?}");
       assert!(
-        waited < std::time::Duration::from_nanos(CLAIM_WAIT_NS),
-        "the claim ended {waited:?} after its anchor went, not at its going"
+        matches!(&refusal, IpcError::DaemonUnavailable { why, .. } if why.contains(ANCHOR_WENT)),
+        "{refusal:?}"
       );
     }
 
