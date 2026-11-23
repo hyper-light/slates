@@ -4861,6 +4861,15 @@
 > - **Owed: a copy made afresh takes the first member's record at the current generation as its owner's,** as a new
 >   candidate's does. A node that knows it lost a volume (yielded or fenced) ships it no record; a stale owner that
 >   does not know yet was retired, so it is no member until its re-admission yields.
+> - **FIXED 2026-11-23 (w-chaos; A-382's amendment, the creator's side): a re-admitted creator refused its
+>   successor's log as not the acting owner.** The let-go leaves the creator no copy of its volume's head until the
+>   head next changes, while the successor's next catalog record makes the catalog's copy afresh, and
+>   `fleet::content_authority` fell back from the head's copy to the creator, itself: it refused every live entry
+>   `not_the_acting_owner` (64 and more in one run, 8,826 in another), so its copy never caught up and the nemesis
+>   failed its convergence wait (seeds 14946995733817154046 and 8173581894251929445 on adacachy2). Now a holder with no
+>   copy of the head takes the owner its catalog copy names. Test:
+>   `a_holder_with_only_a_volumes_catalog_copy_takes_the_owner_the_catalog_names` (red: the successor refused). Record:
+>   `docs/bugs/2026-11-23-a-readmitted-creator-refused-its-successors-log-as-not-the-acting-owner.md`.
 
 > **Partly closed (g262, 2026-11-18): every wire enum of the protocol and of the records is held to its published
 > tags by a test.** Two guards read each wire enum's schema, which names its variants in tag order:
