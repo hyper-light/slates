@@ -6877,6 +6877,24 @@ version.
 > (`a_verb_for_a_volume_whose_owner_is_fenced_is_refused_by_the_fence_never_not_found`;
 > `docs/bugs/2026-11-19-a-volume-on-a-fenced-owner-read-as-absent.md`).
 
+> **Status (2026-11-23, A-394's amendment: only the owner says a volume does not exist).** "The answer comes from the
+> current owner and is authoritative", so a node whose catalog holds no record of a volume answers a verb forwarded to
+> it only where it is that owner by the rule a local client's verb is routed by (`verbs::owned_by_another_host`): the
+> volume's creator, which no routing on it sends elsewhere and which did not lose it to a successor. There a volume it
+> never made or destroyed is `NotFound`. Anywhere else the verb is refused `Refusal::NotOwnerHere { owner }`, retryable
+> and recorded nowhere, `owner` the owner its routing names as a hint (`verbs::refusal_of_unheld_forward`, counted
+> `fleet.forward.refused.not_owner_here`; a successor before it has made the volume stays `Overloaded`, A-394,
+> `fleet.forward.refused.before_made`). The origin keeps the hinted owner as the client's route, or drops its route,
+> and the client's resend goes there (`slates_client` resends a read so, within its reconnect budget). A verb that is
+> not forwarded, a landing's `Present` or `Land`, meets the same refusal from a node another host's volume is not on
+> (`verbs::absent`, judged as an attach form refused by kind is, `remote_attach::elsewhere`). Until then a node whose
+> routing named another owner, or
+> none, served such a verb, found no volume and answered `NotFound`. At seed 8173581894251929445 the chaos nemesis had
+> an origin at configuration 7 forward reads to the successor its routing named, which at configuration 8 routed the
+> volume to no owner, and five acknowledged writes read as missing while the last owner served them all (ReadSafety;
+> `a_forwarded_read_at_a_node_neither_holding_nor_owning_its_volume_is_refused_retryably`;
+> `docs/bugs/2026-11-23-a-forwarded-read-at-a-node-that-neither-held-nor-owned-the-volume-answered-not-found.md`).
+
 > **Status (2026-11-18, A-317: the location budget is the membership horizon, ended by a look begun after it).** A
 > forward that does not know its volume's owner repeats the read-only location round (the direct route first, and
 > again after the round) every poll interval for the membership horizon (`lease::horizon_ns`, the window in which a
@@ -35007,6 +35025,16 @@ shard), `crates/server/src/doorbell.rs` (the thread kicks what the rings marked,
   parks fell by 59% at both loads (4.71 to 1.92 million a level at 50 ms, 2.74 to 1.13 million at 20 ms) and the shards'
   CPU by 34% and 20%. The latencies swung ten- to twentyfold with the box's load (14 to 52) within each arm, so those
   pairs cannot tell the arms' latencies apart; the 1,000-client rung's record run is the supervisor's.
+- **A ring before the thread's first look (w-win for main 01a20182, 2026-11-23).** The doorbell thread took the marks
+  only when a wait returned a word other than the one it read as it started, so a claim rung before that read (in the
+  window between the daemon's publishing its rendezvous, `Listener::open`, and its doorbell thread's start, or into an
+  anchor's object while a killed daemon restarted) was never taken, and its claimant waited for good under the anchor
+  (A-468). The thread now takes the marks once after its first read, before its first wait. Found as the Windows
+  Shards CLI step's 20-minute hang (CI run 45163517212): every thread's stack at a reproduced hang showed the client in
+  its claim's wait, the daemon's shards parked and its doorbell thread waiting for a ring. Held by
+  `doorbell::tests::a_claim_rung_before_the_doorbell_thread_starts_is_taken` (macOS and Windows). Applied in the same
+  change to: `crates/server/src/doorbell.rs`, GAPS (A-381's closure),
+  `docs/bugs/2026-11-23-a-claim-rung-before-the-doorbell-thread-looked-was-never-answered.md`.
 
 ### A-341 — A holder the takeover never asked lets its copy go where the kept retirement shows the object recovered within tolerance (2026-11-18, kiln goal g250; §4.8 "Promotion and takeover"; A-309's owed rule, its safe part; A-335)
 Applied in the same change to: A-309's holder rule (above), GAPS (the unasked holder's entry), `crates/db/src/register.rs`
@@ -35599,7 +35627,7 @@ owner's measurements), and `docs/bugs/2026-11-18-a-held-macos-shard-napped-inste
 
 ### A-394 — A verb forwarded to a takeover's successor before it has made the volume is refused retryably, never answered `NotFound` (2026-11-18, kiln goal g250; §4.8 "Lookup"; ReadSafety; the chaos nemesis, seed 6876545201569229162)
 Applied in the same change to: GAPS (the entry at its head) and `crates/server/src/verbs.rs` (`serve_forward`,
-`serve_forwarded_read`, `forwarded_before_made`, `fleet.forward.refused.before_made`).
+`serve_forwarded_read`, `refusal_of_unheld_forward`, `fleet.forward.refused.before_made`).
 - **What was there.** A node serves a verb another node forwarded to it as the volume's owner without asking whether it
   holds the volume: the sender found it the owner, and a forward is one hop. A takeover's install moves the volume's
   route to its successor on every holder before the successor has made it, so in that window a holder forwards a
@@ -35618,6 +35646,37 @@ Applied in the same change to: GAPS (the entry at its head) and `crates/server/s
   counted, a volume made here answered; without the guard the read answered `NotFound`). The chaos nemesis at seed
   6876545201569229162 on the Mac Studio (kiln r264, 2026-11-18, debug build): 2 of 2 runs passed with every invariant
   held, 91.9 s and 63.5 s, where main bf58691 failed ReadSafety in 3 of 3 (r212).
+
+**Amended 2026-11-23 (w-chaos, the nemesis at seed 8173581894251929445): the rule by authority.** The guard refused only
+where the receiver's own routing named itself the owner, so a node whose routing named another member, or none, still
+served the forward and answered `NotFound`. Measured on adacachy2 with a diagnostic build (2026-11-23): an origin at
+configuration 7 forwarded reads to the successor its routing named, and that node, already at configuration 8, held no
+record of the volume and routed it to no owner, so five acknowledged writes read as missing through the origin while
+the last owner served them all (ReadSafety; 2 of 4 replays of the seed, and 1 of 5 runs of main 05e9bb698 with item 1's
+fix). The guard is now `refusal_of_unheld_forward` (it was `forwarded_before_made`; its callers `serve_forwarded_read`,
+`forwarded_write` and `forward_placement`): a node without the record answers only as the volume's creator that no
+routing on it sends elsewhere and that did not lose the volume to a successor, the rule `owned_by_another_host` routes a
+local client's verb by, and refuses `Overloaded` anywhere else, counted `fleet.forward.refused.not_owner_here`. Applied
+in the same change to: §4.8 "Lookup"'s status, GAPS (A-394's entry), `crates/server/src/verbs.rs`, the test
+`a_forwarded_read_at_a_node_neither_holding_nor_owning_its_volume_is_refused_retryably` (red first: `NotFound`),
+and `docs/bugs/2026-11-23-a-forwarded-read-at-a-node-that-neither-held-nor-owned-the-volume-answered-not-found.md`.
+
+**Amended again 2026-11-23 (main's ruling on the wire): one condition, one refusal.** `Overloaded` says a shard is busy,
+so a refusal of a node that is not the owner filed under it was a refusal of the wrong kind (CLAUDE.md §3: an
+uncategorized refusal is a bug). It is now its own: `Refusal::NotOwnerHere { owner }` (appended, wire tag 84), `owner`
+the owner the refusing node's routing names, where it names one, kept as the client's route by the origin
+(`verbs::route_after`, counted `fleet.owner_location.route_hinted`); the API's `RetryCause::NotOwnerHere` (contract
+60); `slates_client` resends a read so within its reconnect budget (`call_through_transient`) and holds the id for an
+async caller (`note_reply`). The CLI, MCP and both SDKs render refusals by their `Debug` form, so they carry it by
+name. The same refusal closes the gap the sweep named: a verb that is not forwarded, a landing's `Present` or `Land`,
+sent to a node another host's volume is not on, answered `NotFound` from `verbs::absent`; it is now `NotOwnerHere`,
+judged by `remote_attach::elsewhere`, as an attach form refused by kind is, or by a loss to a successor. A creator still
+answers its own destroyed volume `NotFound`. The successor before it made the volume keeps `Overloaded` (A-394's
+case: it owns the volume and will serve it). Test:
+`a_node_neither_holding_nor_owning_a_volume_answers_not_owner_here_and_its_creator_not_found` (`crates/server/src/verbs.rs`,
+which replaces the test above). Applied in the same change to: §4.8 "Lookup"'s status, `crates/ipc/src/protocol.rs`,
+`crates/ipc/tests/wire_order.txt`, `crates/api/src/error.rs` and `lib.rs`, `crates/client/src/client.rs`,
+`crates/server/src/verbs.rs` and `remote_attach.rs`, GAPS, and the bug record.
 
 ### A-399 — A Shards stream's close publishes nothing its write log holds, as a FUSE mount's does (2026-11-18, goal g268; a sibling A-339 recorded in GAPS)
 Applied in the same change to:
@@ -59159,7 +59218,7 @@ Applied in the same change to: §4.16 "Commit" (inputs past a shipment's bound),
   answered `Overloaded` otherwise, so the origin's resend under the id met the completion.
 - **Change.** `crates/server/src/verbs.rs` `serve_forward`: a forwarded `CreateWork` runs on the shard its name hashes
   to, as a create is placed; whether the green is made yet is still asked of the green's shard first
-  (`forwarded_before_made`, so a forward racing the green's creation answers retryable, nothing recorded);
+  (`refusal_of_unheld_forward`, so a forward racing the green's creation answers retryable, nothing recorded);
   `forwarded_write` takes the volume to check as an option. `crates/server/src/work_home.rs`: `attach_forwarded` keeps
   a forward's waiter beside its parked verb, and the resume answers it from the verb's completion, or attaches it to
   the verb's next wait (parked again, or its acceptance deferred to a fleet commit), else `Overloaded`

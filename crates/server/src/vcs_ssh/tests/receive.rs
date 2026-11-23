@@ -524,6 +524,8 @@ fn a_shallow_clone_of_a_later_push_let_go_is_answered_whole_over_ssh() {
   let let_go_past = |past: u64| {
     let waited = std::time::Instant::now();
     while let_go_bytes() <= past && waited.elapsed() < std::time::Duration::from_secs(10) {
+      // The harness paces its looks; the daemon under test waits on its wheel.
+      #[allow(clippy::disallowed_methods)]
       std::thread::sleep(std::time::Duration::from_millis(20));
     }
     let_go_bytes()

@@ -42,9 +42,9 @@ fn refusal(arena: &mut ChunkArena, extent: Extent) -> ExtentRefusal {
 #[test]
 fn a_copy_kept_past_its_free_and_the_reuse_is_refused_and_the_new_owner_keeps_its_block() {
   let mut arena = arena();
-  let first = arena.alloc(REGION).unwrap();
+  let first = arena.alloc(REGION, slates_mem::Owner::Volume).unwrap();
   arena.free(first).unwrap();
-  let second = arena.alloc(REGION).unwrap();
+  let second = arena.alloc(REGION, slates_mem::Owner::Volume).unwrap();
   assert_eq!(second.offset(), first.offset(), "the place was reused");
   arena.bytes_mut(second).unwrap()[0] = 7;
   assert_eq!(refusal(&mut arena, first), ExtentRefusal::Stale);
@@ -55,7 +55,13 @@ fn a_copy_kept_past_its_free_and_the_reuse_is_refused_and_the_new_owner_keeps_it
   );
   arena.free(second).unwrap();
   assert_eq!(refusal(&mut arena, second), ExtentRefusal::NotAllocated);
-  assert_eq!(arena.alloc(REGION).unwrap().len(), REGION);
+  assert_eq!(
+    arena
+      .alloc(REGION, slates_mem::Owner::Volume)
+      .unwrap()
+      .len(),
+    REGION
+  );
 }
 
 /// AUD-29-10. Do: allocate from one arena and free the extent into a second arena of identical geometry
@@ -65,8 +71,8 @@ fn a_copy_kept_past_its_free_and_the_reuse_is_refused_and_the_new_owner_keeps_it
 fn an_extent_freed_into_another_arena_is_refused() {
   let mut issuing = arena();
   let mut other = arena();
-  let theirs = issuing.alloc(PAGE).unwrap();
-  let ours = other.alloc(PAGE).unwrap();
+  let theirs = issuing.alloc(PAGE, slates_mem::Owner::Volume).unwrap();
+  let ours = other.alloc(PAGE, slates_mem::Owner::Volume).unwrap();
   assert_eq!(
     (theirs.region(), theirs.offset()),
     (ours.region(), ours.offset())

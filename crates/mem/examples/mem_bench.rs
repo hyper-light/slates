@@ -121,7 +121,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
       name,
       measure(
         || {
-          if let Ok(extent) = arena.alloc(block) {
+          if let Ok(extent) = arena.alloc(block, slates_mem::Owner::Volume) {
             if let Some(bytes) = arena.bytes_mut(extent) {
               for at in (0..bytes.len()).step_by(page) {
                 if let Some(byte) = bytes.get_mut(at) {

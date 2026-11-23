@@ -42,7 +42,7 @@ fn a_budget_over_usable_capacity_never_over_promises_what_the_arena_can_back() {
     .reserve(u64::try_from(mapping).unwrap())
     .expect("a mapping-sized budget wrongly admits the whole mapping");
   assert!(
-    arena.alloc(mapping).is_err(),
+    arena.alloc(mapping, slates_mem::Owner::Volume).is_err(),
     "the arena cannot back what the mapping-sized budget admitted (the over-promise)"
   );
 
@@ -60,7 +60,7 @@ fn a_budget_over_usable_capacity_never_over_promises_what_the_arena_can_back() {
     .reserve(u64::try_from(capacity).unwrap())
     .expect("the usable capacity is admissible");
   let extent = arena
-    .alloc(capacity)
+    .alloc(capacity, slates_mem::Owner::Volume)
     .expect("what the budget admitted, the arena backs");
   assert_eq!(extent.len(), capacity);
   arena.free(extent).unwrap();
@@ -86,7 +86,7 @@ fn locked_or_skipped(
   arena: &mut ChunkArena,
   len: usize,
 ) -> Result<Option<slates_mem::Extent>, MemError> {
-  match arena.alloc_locked(len) {
+  match arena.alloc_locked(len, slates_mem::Owner::Volume) {
     Ok(extent) => Ok(Some(extent)),
     Err(MemError::LockRefused { .. }) => {
       assert_eq!(
@@ -132,7 +132,7 @@ fn the_arena_locks_the_blocks_asked_never_the_region_or_their_neighbours() {
   arena
     .add_region(Region::map(region, PAGE, false).unwrap())
     .unwrap();
-  let plain = arena.alloc(2 * PAGE).unwrap();
+  let plain = arena.alloc(2 * PAGE, slates_mem::Owner::Volume).unwrap();
   let kernel_before = kernel_locked();
   let Some(strict) = locked_or_skipped(&mut arena, 4 * PAGE).unwrap() else {
     return;
@@ -167,7 +167,7 @@ fn the_arena_locks_the_blocks_asked_never_the_region_or_their_neighbours() {
     arena.locked_bytes() < region,
     "the region's other pages are never locked"
   );
-  let again = arena.alloc(4 * PAGE).unwrap();
+  let again = arena.alloc(4 * PAGE, slates_mem::Owner::Volume).unwrap();
   assert!(
     !arena.is_locked(again),
     "a block reusing a freed locked block's space starts unlocked"
