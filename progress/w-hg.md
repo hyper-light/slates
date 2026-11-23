@@ -500,3 +500,11 @@ Waiting: main's route; arena-7 and arena-8.
 - Told main arena-9's diag sampler shares the guard flaw; it's minor at full scale.
 - Asked main whether I take the greens lend cut or route it. Next: (c) the HgExchange site (likely also an artifact),
   then lookup's `prefixed` 91 ms begin.
+
+## 2026-11-23 ~17:00 PST (w-hg, worktree w-hg-b)
+- Landed 1af2b501d (merge 38001e7dc): a lineage member's lend allocates nothing (lazy SetHash lanes; Lent in a
+  Lineage::lent slot, no Box). hg_push_heap's push went from 362,278 to 49,909 B a changeset; the test asserts lend
+  bytes are 0.
+- Pre-existing failure on main (w-svn's), reported to main: svn_commit
+  a_revision_refused_at_publication_leaves_the_green_where_the_log_is_and_the_next_lands.
+- Next: lookup's 91 ms `prefixed` begin (a node-prefix index, or the lookup's own slices).
