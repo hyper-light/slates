@@ -268,7 +268,6 @@ pub(crate) fn let_go_windows(
   noting: Option<RepositoryId>,
   contents: &[FileContents],
 ) -> (u64, u64) {
-  let (shard, shards) = (state.shard, state.shards.clone());
   // The repository's windows are the shard's chunk store's, lent to its content store for the step.
   crate::vcs_store::lent_state(state, |state| {
     crate::vcs_store::within_budget(state, 0, |stores| {
@@ -284,9 +283,8 @@ pub(crate) fn let_go_windows(
             if let Some(repository) = noting {
               note_windows(content, repository, revision, identity);
             }
-            let (more, kept) = content.let_go_object_landed(identity, &|window| {
-              crate::vcs_store::landed_pin(shard, &shards, window)
-            });
+            let (more, kept) =
+              content.let_go_object_landed(identity, &crate::vcs_store::landed_pin);
             (freed.saturating_add(more), pinned.saturating_add(kept))
           })
       })
