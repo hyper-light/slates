@@ -34,11 +34,11 @@
 //!
 //! **Takeover** (§4.8 "Promotion and takeover"; [`crate::takeover`]): when the council retires a host, every
 //! holder resolves each object it holds to the successor the committed configuration's lineage names
-//! ([`crate::takeover::resolve_held_objects`]) and brings its acceptor's authority into step
-//! ([`reconcile_held_authority`]); each survivor that owes a confirmation runs one phase-one round for the
-//! retired host across its recovery neighbourhoods — holders answering in pages, a holder that holds nothing
-//! answering too — adopts each object once its cohorts have promised, re-commits it under its own placement at
-//! the round's epoch, and confirms its share to the council. The serve loop answers a page from the same
+//! ([`crate::takeover::resolve_held_object`]) and brings its acceptor's authority into step
+//! ([`reconcile_held_copy`]), a copy a turn ([`install_on_copy`], A-398); each survivor that owes a confirmation runs
+//! one phase-one round for the retired host across its recovery neighbourhoods — holders answering in pages, a holder
+//! that holds nothing answering too — adopts each object once its cohorts have promised, re-commits it under its own
+//! placement at the round's epoch, and confirms its share to the council. The serve loop answers a page from the same
 //! durable holds ([`crate::takeover::serve_host_prepare`]).
 //!
 //! **Content replication and serve** (§4.10 "Content replication"; §4.8 mechanism 1): each owned volume's
@@ -2060,9 +2060,11 @@ fn retired_hosts(state: &ShardState) -> std::collections::BTreeSet<HostId> {
     .collect()
 }
 
-/// [`reconcile_held_authority`] for one held copy, `object`'s: its authority moved to the owner this node's routing
-/// names, at `generation`. A move away from a retired owner is recorded with the copy (A-251): once the authority names
-/// the successor, only that record says the copy was the retired owner's, which a takeover round's listing needs.
+/// One held copy's authority brought into step, `object`'s, as an install's walk does it a copy a turn
+/// ([`install_on_copy`]; `reconcile_held_authority`, the unit tests' oracle, does it to every copy at once): moved to
+/// the owner this node's routing names, at `generation`. A move away from a retired owner is recorded with the copy
+/// (A-251): once the authority names the successor, only that record says the copy was the retired owner's, which a
+/// takeover round's listing needs.
 fn reconcile_held_copy(
   state: &mut ShardState,
   object: ObjectId,

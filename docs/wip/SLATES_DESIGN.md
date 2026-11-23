@@ -5452,6 +5452,12 @@ drops.
 > (`diag-liveness-client-4`). So the mean on main stayed a sleeper's: the parked bench form's client estimate read
 > 17–33 µs on both Windows runners before and after (`Client::wake_estimate`, provision_bench's `client wake` line),
 > against a published window of 8.8–9.9 µs (`diag-liveness-client-1`, `-2`).
+> **Linux too (2026-11-23).** The daemon's confirmation was not enough there: `futex_wake` counts a waiter that queued
+> itself and was set running again before it blocked, so the same test on adacachy2 found 5,341 of 16,384 racing parks
+> that never switched out, and 4 of them taught 560 to 9,286 ns. A Linux park now teaches only if the client's own
+> voluntary switch count rose across it and the daemon confirmed. The client already read the count around every
+> wait, so no call is added. macOS, which gives no per-thread count, keeps the confirmation alone. Record:
+> `docs/bugs/2026-11-23-a-linux-client-learned-a-wake-from-a-park-that-never-slept.md`.
 
 > **Status (2026-09-29, A-42: the idle spin is opened by client activity and ends with its window).** The
 > daemon set a shard "active" at its first client's handoff and nothing cleared it, so from then on every
@@ -58697,7 +58703,10 @@ GAPS.
 
 Status: built 2026-11-20, macOS; Windows written the same day (main's ruling of 18:40), its build and tests owed to
 w-lint on jupiter (run-requests). Linux keeps one memfd with holes punched (g226: the anchor's punch frees the pages
-with a peer still mapping them; BENCHMARKS "Content give-back per platform").
+with a peer still mapping them; BENCHMARKS "Content give-back per platform"). A release punches its extent's hole
+through the extent's own mapping before the unmap since 2026-11-23 (`ContentPool::punch`, `MADV_REMOVE`). Before, it
+only unmapped, a memfd's pages outlive every mapping, and a 64 MiB burst's destroyed volume left the object at 69 MiB
+on Linux: `docs/bugs/2026-11-23-a-released-pool-extent-kept-its-pages-in-the-linux-content-object.md`.
 - Windows: each extent is a reserved, unnamed section of its own (`slates_mem::make_extent_section`), since only
   closing a section returns its commit (g226: decommitting a view is refused, error 87). The anchor holds a duplicate
   of each under a new hold kind, `WHAT_CONTENT_EXTENT` (one handle, the extent's id as its record), bounded in a class of
@@ -61644,6 +61653,16 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
   encoder's (w-git's catch: a let-go task that ended while packs were queued stranded them). Ported: piece 1's delta test runs the
   encoder's turns before each publication; `homes::tests::a_committed_publication_publishes_the_tickets_of_windows_kept_before_it`
   shows a publication of an older cut leaving the ticket unpublished.
+- **A refused catch-up publication is never dropped (2026-11-23; main 01a20182's ruling, banned item 9).** The
+  catch-up's publication (`content_holder::image_catch_up`) dropped `publish_shard`'s error, so a refused one left the
+  publication owed with no task to make it, and a homing waiting on its ticket (`homes::published_within`, bounded by
+  the home shard's own CPU time) waited on an idle shard without end: the HTTP push stall's strongest candidate. Now a
+  refused catch-up publication is counted (`vcs_store.image.catch_up_publish_refused`) and stays owed; an owed
+  publication no catch-up makes (refused, or its task unspawned, `catch_up_refused`) arms the shard's sweep
+  (`idle_sweep::after_borrow`), whose pass begins it again first (`content_holder::image_retry_owed`, counted
+  `catch_up_retried`) and does not settle the shard while it is owed. Test
+  `vcs_store::durable::tests::a_tickets_wait_is_answered_after_its_catch_ups_publication_was_refused` (red first, the
+  retry cut out: the wait unanswered after six sweep intervals; green: answered, the refusal and the retry counted).
 - **Limit (piece 2, GAPS).** The bound is kept only while the encoder outpaces the changes that never pause (puts,
   bring-backs): each turn encodes at least one page, so the lag past the bound is at most the pages dirty when the
   pause began plus those such changes dirty since, plus two (the oracle's allowance). A shard runs a turn each yield, many
@@ -61909,6 +61928,48 @@ name whatever their `cfg`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sdk_async.t
   below arena-16's. When the shard's cipher comes to repository windows (A-99), a slab can no longer be filled in
   place: its chunk carries no seal today (`ChunkStore::seal` with no key), and its later slots are written into the
   sealed chunk's unused bytes. So that work seals a slab when it closes, or each slot alone (w-shared's review).
+
+### A-878 — A Linux daemon's children inherit nothing of the daemon's; a hand-off names the object's own descriptor (2026-11-23, w-chaos for main 01a20182, its ruling of 2026-11-23 on the descriptor sweep; A-858, §2.6, §4.7, §4.13)
+
+- **Why.** A-858 holds that every child the daemon spawns is handed only its three streams. That held on macOS, whose
+  spawn closes what it does not name. On Linux the spawn hands a child every descriptor not marked close-on-exec, and
+  the daemon held many:
+  - the anchor's segment and content object, inherited at the daemon's start, and duplicates of both, one per shard and
+    one for the control loop: a Linux hand-off was a duplicate made inheritable, which nothing owned;
+  - the anchor's listeners and its hold table, inherited at the start;
+  - a plain `dup` of each client's completion eventfd.
+  A start-commit hook listed 17 such descriptors. The segment holds the issuer secret, the authority under which the
+  issuer's verbs prove a human's grant. The content object holds every volume's bytes.
+  The same duplicates grew the anchor by two descriptors per daemon start (8 of each object after 7 starts), and a
+  claim refused for want of a descriptor leaked its region's duplicate.
+- **The rule.**
+  - A descriptor is close-on-exec everywhere except in the one exec that needs it.
+  - A hand-off names the object's own descriptor. An open duplicates it and owns the duplicate. A spawn that hands it to
+    a child clears close-on-exec in that child alone: the anchor's `hand_on_in_child`, between the fork and the exec.
+  - The daemon's first step at its start makes every descriptor it inherited close-on-exec
+    (`confined_spawn::close_inherited_on_exec`); a daemon that cannot does not start.
+  - Its own copies are made with `fcntl_dupfd_cloexec`, never a plain `dup`.
+  - The anchor records a start before the spawn and its pid after. Recorded after, the record could wipe a quick
+    daemon's first beat and serving mark, and show it the last start's restart count.
+- **Tests** (adacachy2; red on main, green with the change):
+  - `a_hook_holds_no_descriptor_of_its_daemon` (`crates/cli/tests/svn_interop.rs`, a real anchor, daemon and hook):
+    17 descriptors past the streams, then none.
+  - `an_anchor_started_again_and_again_hands_each_daemon_its_objects_once` (`crates/anchor/tests/anchor.rs`): `[8, 8]`
+    and children holding 2, 4, … 12; then `[1, 1]` and 2 each.
+  - `a_claim_refused_for_want_of_a_descriptor_leaves_none_of_its_region` (`crates/ipc/tests/rendezvous.rs`, the descriptor
+    limit capped as the claim is prepared): `remaining=1`, then 0.
+  - The anchor's test file: 5 of 6 runs on main, 2 of 6 with the forked spawn alone, 6 of 6 with the record's order.
+- **Applied in the same change to:**
+  - `crates/mem/src/shared.rs`: `handoff`, `Handoff`'s doc.
+  - `crates/anchor`: `segment.rs` (`handed_descriptors`, `record_pid`, `record_start`'s doc) and `supervise.rs`
+    (`hand_on_in_child`, the start's order).
+  - `crates/api/src/role/daemon.rs`: the start's first step.
+  - `crates/ipc`: `confined_spawn.rs` (`close_inherited_on_exec`, the module doc), `rendezvous.rs` (the claim's
+    borrowed send, the kick, `completion_dup`), `completion.rs` and `endpoint.rs` (the client's copies).
+  - The three tests above.
+  - `unsafe-budget.toml`: anchor +1, ipc ±0.
+  - GAPS.
+  - docs/bugs/2026-11-23-a-hand-off-left-an-inheritable-duplicate-at-every-call.md.
 
 ### A-881 — An interrupted idle give-back resumes at the shard's next idle point, not a sweep's interval on (2026-11-23, w-win2 for main 01a20182, its ruling (c) of 2026-11-23 on item 2; A-226, A-715, A-491)
 

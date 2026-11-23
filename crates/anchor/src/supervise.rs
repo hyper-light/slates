@@ -806,12 +806,24 @@ impl Supervisor {
     if let Some(profile) = &self.profile {
       self.segment.publish(RegionKind::Profile, profile)?;
     }
-    let child = self.spawn_child(env)?;
+    // The start is recorded before the spawn and its pid after it, so the record never overwrites what its daemon wrote.
+    // A daemon beats, marks that it serves and reads its restart count once it runs, which can come before the spawn
+    // returns here. Recorded after the spawn, the record wiped a quick daemon's first beat and serving mark, and showed
+    // it the last start's count. That failed the anchor's tests in 1 run of 6 on main, and in 4 of 6 once the spawn
+    // forked to clear close-on-exec in its child (2026-11-23, adacachy2).
     let restart = self.segment.supervision()?.generation() > 0;
+    self.segment.supervision()?.record_start(0, now_ns, restart);
+    let child = match self.spawn_child(env) {
+      Ok(child) => child,
+      Err(refusal) => {
+        self.segment.supervision()?.record_exit(false);
+        return Err(refusal);
+      }
+    };
     self
       .segment
       .supervision()?
-      .record_start(u64::from(child.id()), now_ns, restart);
+      .record_pid(u64::from(child.id()));
     self.child = Some(child);
     Ok(())
   }
@@ -819,13 +831,13 @@ impl Supervisor {
   /// Unix retains its descriptor-based spawn and the existing executable-identity check (A-145).
   #[cfg(unix)]
   fn spawn_child(&mut self, env: Vec<(String, String)>) -> Result<Child, AnchorError> {
-    let child = own_image::command(&self.program, self.image)?
-      .args(&self.args)
-      .envs(env)
-      .spawn()
-      .map_err(|error| AnchorError::Spawn {
-        code: error.raw_os_error(),
-      })?;
+    let mut command = own_image::command(&self.program, self.image)?;
+    command.args(&self.args).envs(env);
+    #[cfg(target_os = "linux")]
+    hand_on_in_child(&mut command, self.segment.handed_descriptors()?);
+    let child = command.spawn().map_err(|error| AnchorError::Spawn {
+      code: error.raw_os_error(),
+    })?;
     self.lifetime.tie(&child)?;
     Ok(child)
   }
@@ -1217,6 +1229,36 @@ mod lifetime {
     pub(super) fn tie(&mut self, _child: &Child) -> Result<(), AnchorError> {
       Ok(())
     }
+  }
+}
+
+/// Clears close-on-exec on `numbers` in the spawned child alone, between its fork and its exec: the segment's and the
+/// content object's descriptors are close-on-exec in the anchor, so no other child it starts inherits them, and the
+/// daemon inherits each at the number its environment names ([`AnchorSegment::handed_descriptors`]). Until 2026-11-23
+/// every start made an inheritable duplicate of both and never closed it: an anchor started 7 times held 8 descriptors
+/// of each, and its seventh daemon inherited 7 of each
+/// (docs/bugs/2026-11-23-a-hand-off-left-an-inheritable-duplicate-at-every-call.md).
+#[cfg(target_os = "linux")]
+fn hand_on_in_child(command: &mut std::process::Command, numbers: Vec<i32>) {
+  use std::os::unix::process::CommandExt;
+  if numbers.is_empty() {
+    return;
+  }
+  // SAFETY: the closure runs in the child between its fork and its exec and makes one `fcntl(F_SETFD)` per number in
+  // `numbers`, which was moved in and allocated before the fork, returning the error it reads: no allocation, no lock
+  // and no other state, which is what `pre_exec` asks. Each number is open in the child for its one call, since the
+  // fork copied this process's descriptor table, in which the segment holds both objects open through the spawn; the
+  // flag cleared is the child's table's own, so this process's descriptors stay close-on-exec.
+  unsafe {
+    command.pre_exec(move || {
+      for &number in &numbers {
+        rustix::io::fcntl_setfd(
+          std::os::fd::BorrowedFd::borrow_raw(number),
+          rustix::io::FdFlags::empty(),
+        )?;
+      }
+      Ok(())
+    });
   }
 }
 

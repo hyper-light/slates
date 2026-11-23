@@ -501,7 +501,7 @@ pub enum MethodRefusal {
     /// The path.
     path: String,
   },
-  /// An anonymous UNLOCK that does not break the lock (403, "User \"[none]\" submitted a locktoken created by user
+  /// An anonymous UNLOCK that does not break the lock (403, "User \"\[none\]\" submitted a locktoken created by user
   /// \"%s\".").
   AnonymousUnlock {
     /// The lock's owner.

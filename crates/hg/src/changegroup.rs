@@ -626,7 +626,8 @@ pub(crate) fn put_end(out: &mut Vec<u8>) {
   out.put(&EMPTY.to_be_bytes());
 }
 
-/// Writes a sidedata chunk: the empty chunk for none, as [`chunk`] reads it back.
+/// Writes a sidedata chunk: the empty chunk for none, as [`Framing::length`](crate::framing::Framing::length) reads it
+/// back.
 fn put_sidedata(out: &mut impl Out, sidedata: &[u8]) -> Result<(), EncodeRefusal> {
   if sidedata.is_empty() {
     out.put(&EMPTY.to_be_bytes());

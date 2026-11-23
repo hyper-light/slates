@@ -931,6 +931,36 @@ impl Index {
     }
   }
 
+  /// The merge the size-tiered rule says is due now (goal 93: a push's fork seals as it appends and never had its runs
+  /// merged, so each new row's lookup walked every run it sealed; arena-14's segment steps grew past the watchdog): the
+  /// number of the newest runs only this index holds to merge, the newest taken while their rows together are at least
+  /// half the next older one's; `None` below two. Asked after every seal and merged to its end each time, it keeps each
+  /// run holding more than twice the rows of all the runs newer than it together, so the rows to a run grow more than
+  /// threefold a run.
+  ///
+  /// Derived: an index's own runs number at most ⌊log₃(its own rows ÷ the fewest rows a seal writes)⌋ + 1, so a
+  /// lookup walks that many of them at most beside the runs it shares (its parent's, merged by the parent's own rule).
+  /// Read from the runs as they are marked (a shared run is passed over), with no look at the store: cheap after any
+  /// seal. Beside [`Index::compaction_due`]'s rent-or-buy, which weighs measured lookups an index answers for long.
+  pub fn tiered_due(&self) -> Option<usize> {
+    let mut own = self.runs.iter().rev().filter(|run| !run.shared);
+    let mut merged = own.next()?.rows;
+    let mut runs = 1_usize;
+    for older in own {
+      if merged.saturating_mul(2) < older.rows {
+        break;
+      }
+      merged = merged.saturating_add(older.rows);
+      runs = runs.saturating_add(1);
+    }
+    (runs >= 2).then_some(runs)
+  }
+
+  /// How many runs only this index holds: the runs [`Index::tiered_due`] and [`Index::compaction_due`] may merge.
+  pub fn own_runs(&self) -> usize {
+    self.runs.iter().filter(|run| !run.shared).count()
+  }
+
   /// The merge the rule says is due now, as the number of newest runs only this index holds to merge, or `None`.
   pub fn compaction_due(&mut self, store: &ContentStore) -> Option<usize> {
     self.relearn(store);

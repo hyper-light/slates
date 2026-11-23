@@ -79,7 +79,7 @@ pub(crate) async fn sweeper() {
       return;
     }
     let mut ended = crate::daemon::seal_idle_content().await;
-    while let PassEnd::GiveBackLeft { directories_idle } = ended {
+    while let PassEnd::GiveBackLeft { owed_besides } = ended {
       if state::with_state(|s| s.give_back_waits_idle = true).is_none() {
         return;
       }
@@ -89,7 +89,7 @@ pub(crate) async fn sweeper() {
       if state::with_state(|s| s.give_back_waits_idle = false).is_none() {
         return;
       }
-      ended = crate::daemon::resume_give_back(directories_idle).await;
+      ended = crate::daemon::resume_give_back(owed_besides).await;
     }
     if state::with_state(|s| finish(s, ended == PassEnd::Settled)).is_none() {
       return;
@@ -178,6 +178,9 @@ pub(crate) fn after_borrow(s: &mut ShardState) {
     || directories
     || arena_seen(s) != s.idle_sweep_seen
     || s.store.content.arena().deferred_bytes() > 0
+    // An image publication owed with no catch-up making it (its publication refused, its task unspawned): the pass
+    // begins it again (`content_holder::image_retry_owed`, A-870 piece 2).
+    || s.image_encoder.owed_unattended()
   {
     arm(s);
   }

@@ -2095,6 +2095,24 @@ impl Daemon {
     })
   }
 
+  /// What the membership plane's detector recorded of condemning `host` by its own probes (A-67 H-2,
+  /// [`slates_cluster::member_plane::Condemnation`]): how many times, how long after `host`'s last answer, and the bound
+  /// the detector stated for it. A one-shot control-shard question ([`Self::observation`]). Exposed so a fleet test
+  /// holds a detection to the bound its detector promised, whichever verdict judged the pair: before a member's pool
+  /// has a verdict, its own retransmission timer's, which took 7.2 s where an estimator's took under one
+  /// (`a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again`, adacachy2, 2026-11-23).
+  pub fn fleet_condemnation(
+    &self,
+    host: slates_db::HostId,
+  ) -> Result<Option<slates_cluster::member_plane::Condemnation>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.plane
+        .plane
+        .as_ref()
+        .and_then(|plane| plane.condemnation(host))
+    })
+  }
+
   /// The bound one record-plane exchange runs under on the control shard now (`fleet::record_exchange_budget_ns`):
   /// derived from the slowest measured path tail, so it grows with load. A test that waits for an exchange to end at
   /// its deadline reads it, rather than assuming its own wait outlasts it (2026-10-10: an interrupted discovery
@@ -5413,9 +5431,13 @@ async fn rebuild_and_report(
 /// cooperative slices of `archive_slice_bytes` (the bytes a slice hashes in the shard's step quantum; AES-256-GCM seals
 /// at a rate of the same order, measured 6.9–7.7 GB/s against BLAKE3's 9–10 here), yielding between slices so the shard
 /// keeps serving, until none is left. How the pass ended ([`PassEnd`]): settled, when it reached an idle purge that
-/// finished and no volume owes another pass; its give-back left for the shard's next idle point, when other work ran
-/// across one of its steps ([`purge_if_idle`]); otherwise owing the next pass a sweep's interval on.
+/// finished, no volume owes another pass and no image publication is owed; its give-back left for the shard's next idle
+/// point, when other work ran across one of its steps ([`purge_if_idle`]); otherwise owing the next pass a sweep's
+/// interval on.
 pub(crate) async fn seal_idle_content() -> PassEnd {
+  // An image publication owed is begun again where no catch-up makes it, first of all (A-870 piece 2: a refused catch-up
+  // publication is never dropped), and the shard is not settled while it is owed.
+  let image_owed = state::with_state(crate::content_holder::image_retry_owed).unwrap_or(false);
   let aged = state::with_state(|s| {
     for (_, slot) in s.volumes.iter_mut_all() {
       slot.volume.age_writes();
@@ -5478,7 +5500,7 @@ pub(crate) async fn seal_idle_content() -> PassEnd {
     });
     return PassEnd::Owed;
   }
-  pass_end(purge_if_idle().await, directories_idle)
+  pass_end(purge_if_idle().await, image_owed || !directories_idle)
 }
 
 /// How a sweep pass ended (A-715; `crate::idle_sweep`).
@@ -5487,21 +5509,21 @@ pub(crate) enum PassEnd {
   /// Nothing owes another pass: none is armed after it, and an idle shard is never woken for the sweep.
   Settled,
   /// Something owes the next pass a sweep's interval on: a file written but not yet aged, a seal or a deferred free that
-  /// published, a busy arena, an idle base directory kept.
+  /// published, a busy arena, an idle base directory kept, an image publication owed.
   Owed,
   /// The pass's give-back left the rest because other work ran across one of its steps (A-226): the rest is idle-time
   /// work, resumed at the shard's next idle point ([`resume_give_back`]), and the pass is under way until it ends.
-  /// `directories_idle` is what the pass found of its base directories, for its end.
   GiveBackLeft {
-    /// Whether every base directory the pass looked at was idle (A-838).
-    directories_idle: bool,
+    /// Whether the pass owes the next one for something besides its give-back: a base directory it kept (A-838), or an
+    /// image publication owed (A-870 piece 2).
+    owed_besides: bool,
   },
 }
 
-/// The end of a pass whose give-back ended as `give_back`, its base directories found idle or not.
-fn pass_end(give_back: GiveBack, directories_idle: bool) -> PassEnd {
+/// The end of a pass whose give-back ended as `give_back`, owing the next pass besides it or not.
+fn pass_end(give_back: GiveBack, owed_besides: bool) -> PassEnd {
   match give_back {
-    GiveBack::Interrupted => PassEnd::GiveBackLeft { directories_idle },
+    GiveBack::Interrupted => PassEnd::GiveBackLeft { owed_besides },
     GiveBack::Busy => PassEnd::Owed,
     GiveBack::Settled => {
       let owes = state::with_state(|s| {
@@ -5510,7 +5532,7 @@ fn pass_end(give_back: GiveBack, directories_idle: bool) -> PassEnd {
           .any(|(_, slot)| slot.volume.sweep_owes())
       })
       .unwrap_or(false);
-      if owes || !directories_idle {
+      if owes || owed_besides {
         PassEnd::Owed
       } else {
         PassEnd::Settled
@@ -5521,8 +5543,8 @@ fn pass_end(give_back: GiveBack, directories_idle: bool) -> PassEnd {
 
 /// The rest of a pass's give-back, resumed at the shard's idle point after other work interrupted it
 /// ([`PassEnd::GiveBackLeft`]): the purge again, from where it stopped, and how the pass ends now.
-pub(crate) async fn resume_give_back(directories_idle: bool) -> PassEnd {
-  pass_end(purge_if_idle().await, directories_idle)
+pub(crate) async fn resume_give_back(owed_besides: bool) -> PassEnd {
+  pass_end(purge_if_idle().await, owed_besides)
 }
 
 /// The idle shard's emptied write log, its pages given back (`crate::write_log::WriteLog::purge`).

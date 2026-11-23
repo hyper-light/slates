@@ -199,8 +199,9 @@ impl CompletionBridge {
   /// dup refers to the same pipe, so closing it leaves this bridge's read end intact. A safe dup: the
   /// read end is an owned fd, not a raw one.
   pub fn dup_fd(&self) -> Result<OwnedFd, IpcError> {
-    rustix::io::dup(&self.read).map_err(|error| IpcError::OsRefused {
-      call: "dup",
+    // Close-on-exec, so no child the caller's process starts inherits the pipe (a plain `dup` made one without it).
+    rustix::io::fcntl_dupfd_cloexec(&self.read, 0).map_err(|error| IpcError::OsRefused {
+      call: "fcntl(F_DUPFD_CLOEXEC)",
       code: Some(error.raw_os_error()),
     })
   }
@@ -378,8 +379,9 @@ impl CompletionBridge {
   /// A dup of the read end the caller owns and closes (Node's `net.Socket` adopts and closes the fd it
   /// wraps); the dup refers to the same pipe, so closing it leaves this bridge's read end intact.
   pub fn dup_fd(&self) -> Result<OwnedFd, IpcError> {
-    rustix::io::dup(&self.read).map_err(|error| IpcError::OsRefused {
-      call: "dup",
+    // Close-on-exec, so no child the caller's process starts inherits the pipe (a plain `dup` made one without it).
+    rustix::io::fcntl_dupfd_cloexec(&self.read, 0).map_err(|error| IpcError::OsRefused {
+      call: "fcntl(F_DUPFD_CLOEXEC)",
       code: Some(error.raw_os_error()),
     })
   }
