@@ -4437,6 +4437,14 @@
 > (A-117, A-226), which an svn read leaves idle, not memory the sync used. Owed: main's rerun after A-876, expected
 > to show under 10 pieces a revision and about 1 ms of fetch waits; and naming the 94k polls of 65 to 131 µs on the
 > svn:// leg (about 8.5 s of the shard's CPU, more than its answers' 1.08 s).
+> **svn:// update (P6), recorded (w-svnperf, 2026-11-23):** goal 93's "svn:// update 5.6 s against run 8's 2.7 s"
+> is w-bugs' run 13 (`diag-w-bugs-svnfetch-13`, base 2d3f218cb, GitHub's macOS runner, git-1000) against run 8 (base
+> 1d7a60e1d), one run each. Run 13 spent 1.71 s of its update in 142,705 window units, which w-perf's per-reader
+> `WindowCache` (b51f908f2) took back the same day. Since cc55404fa (2026-11-21) an update's older texts come through
+> the node's store, the fetch path A-876 fixed. `an_svn_update_measured` (`crates/cli/tests/svn_interop.rs`) now runs
+> P6's harness with stock svn: it checks `trunk` out at the youngest, updates back 500 revisions, then forward again,
+> each timed, and prints the counters each update added. Owed: main's A/B on the big Studio of 33b5fe7b1 (before
+> A-876) against e41c1ca06 (after), interleaved.
 > **R4, recovery replays a revision record a turn at a time (2026-11-20, w-svn; Ada's close list; found by w-git's sweep):**
 > a Subversion revision's record was replayed whole in one recovery or rebuild turn (`replay_svn` -> `commit_record`),
 > every text it brought deltified in one step, so one large revision held its shard. Now `RevisionReplay`
