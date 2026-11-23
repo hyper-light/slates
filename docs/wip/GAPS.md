@@ -664,7 +664,13 @@
 >   but the 71 a home pins; the clone carries them). OPEN, main's: the pin keeps every window whose home by identity
 >   is this shard (`homes::read_here` serves any identity homed here and cannot bring one back), so about one shard's
 >   share of the texts stays, and on a one-shard node all of them; a home that brings an away window back, or a pin of
->   only what homes keep, would let them go.
+>   only what homes keep, would let them go. 2b(b)'s hg half, part 1 BUILT (w-hg, w-shared's seam 1, main's ruling of
+>   18:43): a landed file revision is brought back whole by its (path, node) (`hg_push::bring_back`: its row read, its
+>   text asked of the changeset store off the step through the work builder's own ask, `slates_hg::push::held::TextAsk`,
+>   then put back within its lent room), counted `vcs.hg.landed_texts_brought_back`. Held by
+>   `a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and_node` (49 of 120 let go, each back
+>   whole, counted once). Left: the let-go's `homes::note_landed` record and homes' `Landed::Hg` arm calling it, once
+>   w-shared's types land; then the pin goes.
 > - The whole history's clones spun (main 01a20182's order of 2026-11-22 10:40; CI 45037561866: 4 spins, kills and
 >   restarts a leg, at `vcs_http.rs:850` polls 1-16 and `vcs_ssh::hg::streamed_turn` polls ~11,000). Measured over the
 >   served view of a pushed 57,054-changeset line (debug, MacBook arm64, each call the unit one step takes): a clone of
