@@ -122,7 +122,15 @@
 > (`parts_copied=2`, `entries_judged=3712`), stock git's "possible repository corruption on the remote side": a fetch
 > path still reads a let-go window without bringing it back. `vcs_store::commit` lets nothing go again; the harness of
 > the lift (`KEEP_LANDED`, `keep_landed`, `homed_drive`'s bring-back) stays. Lifted again with a red that clones after a
-> multi-window pack's let-go, the needed object's window let go, not only the pack's first.
+> multi-window pack's let-go, the needed object's window let go, not only the pack's first. Its cause FIXED (w-git,
+> 2026-11-23): the fetch stream stopped cleanly only where it reused a pushed entry or copied a kept window; every read
+> of an object where it lies (`read_stored`: an entry of a kept part made whole, r165's path, an object encoded afresh,
+> a delta's check, a search's read) turned a let-go window into `Unreadable` mid-pack. Each now stops the turn at the
+> window and retakes its unit (`Upload::read_or_stop`). Reds over stock git's offset-delta pack, every window let go:
+> `r165_an_entry_made_whole_from_a_let_go_window_stops_and_the_answer_is_byte_identical` (`Unreadable` at 0 stops
+> before) and `r165_an_object_encoded_afresh_…` (after 5). Owed: the encoding's object read (`Reading::read_window`)
+> refuses the same way where its header reads have not brought the window back first (no red yet); main's round, the
+> guard still in, before a re-lift.
 > **LIFTED (w-git, 2026-11-22, on main 01a20182's word; put back above):** `vcs_store::commit` lets a landed push's pack go again, or
 > owes it to the push's end or the repository's idle give-back, with each gate on main: w-git's fetch-side readers
 > (A-864) and a push's readers, (b) its thin bases through `IndexedObjects::away` and (c) its policy and signature reads;
