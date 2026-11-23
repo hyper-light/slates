@@ -90,6 +90,9 @@ pub(crate) const BUILT: &str = "vcs_paths.built";
 pub(crate) const REMADE: &str = "vcs_paths.remade";
 /// The status count of the steps refused (module docs).
 pub(crate) const REFUSED: &str = "vcs_paths.refused";
+/// Counter: a git green's file held by its content-plane object alone, which git's map does not read (A-760 (b) 4b;
+/// never met, since only a Subversion green holds a file so). Format: a counter name in the status report.
+pub(crate) const NAMED_UNREAD: &str = "vcs_paths.named_unread";
 
 /// Format: the bit of a regular file's mode that lets its owner execute it, the one permission bit git keeps (module
 /// docs).
@@ -182,6 +185,9 @@ enum StepRefused {
   Trees(TreesRefused),
   /// The content store's own.
   Content(ContentRefused),
+  /// A file the green holds by its content-plane object alone (A-760 (b) 4b), which a git green never holds: refused,
+  /// counted [`NAMED_UNREAD`] and logged with its path and green.
+  Named(super::named_objects::NamedUnread),
 }
 
 /// Makes `green`'s map of `version`, just committed on the owner (module docs); nothing for a green of no git
@@ -191,7 +197,7 @@ pub(crate) fn advance(state: &mut ShardState, green: DbVolumeId, version: u64) {
     return;
   }
   if let Some(answer) = step(state, green, version, false) {
-    count(state, answer, BUILT);
+    count(state, (green, answer), BUILT);
   }
 }
 
@@ -291,7 +297,7 @@ pub(crate) fn remake_green(state: &mut ShardState, green: DbVolumeId) {
     return;
   }
   if let Some(answer) = step(state, green, version, true) {
-    count(state, answer, REMADE);
+    count(state, (green, answer), REMADE);
   }
 }
 
@@ -322,7 +328,14 @@ pub(crate) async fn remake_green_sliced(
     if version == 0 {
       return;
     }
-    let whole = Plan::Whole(whole_head(&engine));
+    let whole = match whole_head(&engine) {
+      Ok(files) => Plan::Whole(files),
+      Err(refused) => {
+        drop(engine);
+        count(state, (green, Err(refused)), REMADE);
+        return;
+      }
+    };
     super::lend(store, vcs_stores, plan_bytes(&whole));
     let Plan::Whole(files) = whole else {
       return;
@@ -348,7 +361,7 @@ pub(crate) async fn remake_green_sliced(
   if !charged_whole {
     state.count(super::CHARGE_SHORT, 1);
   }
-  count(state, answer, REMADE);
+  count(state, (green, answer), REMADE);
 }
 
 /// Puts each of `files` in `repository`'s content store, a recovery's unit each, noting each hold.
@@ -396,11 +409,23 @@ pub(crate) fn release_head(content: &mut ContentStore, head: &Head) -> bool {
 }
 
 /// Counts a step's answer, a build under `built`.
-fn count(state: &mut ShardState, answer: Result<Stepped, StepRefused>, built: &'static str) {
+fn count(
+  state: &mut ShardState,
+  (green, answer): (DbVolumeId, Result<Stepped, StepRefused>),
+  built: &'static str,
+) {
   match answer {
     Ok(Stepped::Derived) => state.count(DERIVED, 1),
     Ok(Stepped::Built) => state.count(built, 1),
     Ok(Stepped::Kept) => {}
+    Err(StepRefused::Named(unread)) => {
+      state.count(REFUSED, 1);
+      state.count(NAMED_UNREAD, 1);
+      slates_machine::log_line!(
+        "slates-server: git map of green {}: {unread}",
+        crate::verbs::hex_of(&green.bytes)
+      );
+    }
     Err(_) => state.count(REFUSED, 1),
   }
 }
@@ -630,17 +655,17 @@ fn plan<'g>(
     .filter(|head| !whole && head.version.checked_add(1) == Some(version))
     .or_else(|| branch_before(git, held, (whole, version), source));
   let Some(before) = before else {
-    return Ok(Plan::Whole(whole_head(engine)));
+    return Ok(Plan::Whole(whole_head(engine)?));
   };
   let changed = changed(
     engine,
     (content, paths, before.root),
     (before.version, version),
   )?;
-  Ok(changed.map_or_else(
-    || Plan::Whole(whole_head(engine)),
-    |files| Plan::Change(before, files),
-  ))
+  Ok(match changed {
+    Some(files) => Plan::Change(before, files),
+    None => Plan::Whole(whole_head(engine)?),
+  })
 }
 
 /// The source's head standing for a branch's version 0 (see [`plan`]): for the branch's first version, with no map of
@@ -678,7 +703,7 @@ fn changed<'g>(
     if name.is_empty() {
       continue;
     }
-    if let Some(file) = git_file(engine, &path) {
+    if let Some(file) = git_file(engine, &path)? {
       files.push((name.to_vec(), Some(file)));
     } else if held_before(content, paths, before, name)? {
       files.push((name.to_vec(), None));
@@ -717,7 +742,7 @@ fn held_before(
 }
 
 /// Every file git holds at the head, by its map's path (module docs).
-fn whole_head(engine: &Green) -> Vec<(Vec<u8>, GitFile<'_>)> {
+fn whole_head(engine: &Green) -> Result<Vec<(Vec<u8>, GitFile<'_>)>, StepRefused> {
   let names = engine
     .files()
     .map(|(path, _)| path)
@@ -730,11 +755,11 @@ fn whole_head(engine: &Green) -> Vec<(Vec<u8>, GitFile<'_>)> {
     if name.is_empty() {
       continue;
     }
-    if let Some(file) = git_file(engine, &path) {
+    if let Some(file) = git_file(engine, &path)? {
       files.insert(name.to_vec(), file);
     }
   }
-  files.into_iter().collect()
+  Ok(files.into_iter().collect())
 }
 
 /// The map's path of a green's path: its names, without the root's separator.
@@ -742,20 +767,33 @@ fn map_path(path: &str) -> &[u8] {
   path.trim_start_matches(ROOT).as_bytes()
 }
 
-/// The file git holds at the head's `path` (module docs): `None` for a directory, a name the green does not hold, or a
-/// node git holds no file of.
-fn git_file<'g>(engine: &'g Green, path: &str) -> Option<GitFile<'g>> {
+/// Whether git holds a file at the head's `path` ([`git_file`] without its bytes): what a build lists paths by.
+fn git_holds(engine: &Green, path: &str) -> bool {
   if let Some(node) = engine.special(path) {
-    return gitlink(node.kind);
+    return gitlink(node.kind).is_some();
+  }
+  let primary = engine.hardlink(path).unwrap_or(path);
+  engine.symlink(primary).is_some() || engine.content(primary).is_some()
+}
+
+/// The file git holds at the head's `path` (module docs): `None` for a directory, a name the green does not hold, or a
+/// node git holds no file of; refused [`StepRefused::Named`] for a file the green holds by its object alone (A-760 (b)
+/// 4b).
+fn git_file<'g>(engine: &'g Green, path: &str) -> Result<Option<GitFile<'g>>, StepRefused> {
+  if let Some(node) = engine.special(path) {
+    return Ok(gitlink(node.kind));
   }
   let primary = engine.hardlink(path).unwrap_or(path);
   if let Some(target) = engine.symlink(primary) {
-    return Some(GitFile {
+    return Ok(Some(GitFile {
       class: FileClass::Symlink,
       bytes: Cow::Borrowed(target.as_bytes()),
-    });
+    }));
   }
-  let bytes = engine.content(primary)?;
+  let Some(content) = engine.content(primary) else {
+    return Ok(None);
+  };
+  let bytes = super::named_objects::bytes_of(primary, content).map_err(StepRefused::Named)?;
   let executable = engine
     .mode(primary)
     .is_some_and(|mode| mode & OWNER_EXECUTE != 0);
@@ -764,10 +802,7 @@ fn git_file<'g>(engine: &'g Green, path: &str) -> Option<GitFile<'g>> {
   } else {
     FileClass::File
   };
-  Some(GitFile {
-    class,
-    bytes: Cow::Borrowed(bytes),
-  })
+  Ok(Some(GitFile { class, bytes }))
 }
 
 /// A submodule's link as git holds it; nothing for another special node (module docs).

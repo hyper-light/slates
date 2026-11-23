@@ -97,7 +97,7 @@ use slates_svn::commit::revision::StepRefusal;
 use slates_svn::dav::commit::DavCommit;
 use slates_svn::index::Index as SvnIndex;
 use slates_svn::migration::{Repository as SvnRecords, Room as SvnRoom};
-use slates_vcs::{Admitted, ContentRefused, ContentStore, Derivations, Mode};
+use slates_vcs::{Admitted, ContentCounters, ContentRefused, ContentStore, Derivations, Mode};
 use slates_vfs::volume::Store;
 
 use crate::state::ShardState;
@@ -159,6 +159,38 @@ pub(crate) const VALUE_UNKEPT: &str = "vcs_store.value_unkept";
 /// Counter: a record replayed into its store by a recovery or a rebuild: the replay's non-vacuity counter. Format: a
 /// counter name.
 pub(crate) const REPLAYED: &str = "vcs_store.replayed";
+/// Figure: the reads the shard's content store has served by identity (`ContentStore::reads`), a let-go window's among
+/// them: with [`CONTENT_LET_GO`] and `svn_texts::PIECE_FETCHED`, how many of a session's reads the store lent and how
+/// many went to the node's store. Format: a counter name in the status report.
+pub(crate) const CONTENT_READS: &str = "vcs_store.content.reads";
+/// Figure: contents the shard's content store stored new (`ContentCounters::stored`). Format: a counter name.
+pub(crate) const CONTENT_STORED: &str = "vcs_store.content.stored";
+/// Figure: contents the shard's content store freed with their last holder (`ContentCounters::freed`). Format: a counter
+/// name.
+pub(crate) const CONTENT_FREED: &str = "vcs_store.content.freed";
+/// Figure: windows the shard's content store let go to the node's store (`ContentCounters::let_go`): what a later read
+/// finds no bytes of. Format: a counter name.
+pub(crate) const CONTENT_LET_GO: &str = "vcs_store.content.let_go";
+/// Figure: let-go windows the shard's content store brought back (`ContentCounters::brought_back`). Format: a counter
+/// name.
+pub(crate) const CONTENT_BROUGHT_BACK: &str = "vcs_store.content.brought_back";
+
+/// The shard's content store's figures for its status report, each named ([`CONTENT_READS`] and the four after it); none
+/// where the shard made no content store.
+pub(crate) fn content_figures(stores: &VcsStores) -> [(&'static str, u64); 5] {
+  let (reads, counters) = stores
+    .content()
+    .map_or((0, ContentCounters::default()), |content| {
+      (content.reads(), content.counters())
+    });
+  [
+    (CONTENT_READS, reads),
+    (CONTENT_STORED, counters.stored),
+    (CONTENT_FREED, counters.freed),
+    (CONTENT_LET_GO, counters.let_go),
+    (CONTENT_BROUGHT_BACK, counters.brought_back),
+  ]
+}
 /// Counter (A-727 slice a3): repository windows a recovery took back from the shard image, their chunks claimed.
 pub(crate) const WINDOWS_RESTORED: &str = "vcs_store.windows_restored";
 /// Counter (A-727 slice a3): window pieces of the shard image a recovery could not take back (put again by replay).

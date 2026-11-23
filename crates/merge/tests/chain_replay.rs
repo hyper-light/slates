@@ -223,8 +223,8 @@ fn assert_same_content(live: &Green, other: &Green, from: u64, fresh: &[String])
     let alphabet = (0..PATH_INDICES).map(|index| path(index).to_owned());
     for name in alphabet.chain(fresh.iter().cloned()) {
       assert_eq!(
-        live.content_at(&name, version),
-        other.content_at(&name, version),
+        live.content_at_bytes(&name, version),
+        other.content_at_bytes(&name, version),
         "{name} at version {version}"
       );
     }

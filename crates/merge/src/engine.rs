@@ -417,6 +417,85 @@ pub struct Judged {
   making: Making,
 }
 
+/// A file's current content as a reader outside the engine takes it (A-760 (b) 4b, main 01a20182's ruling of
+/// 2026-11-23): its bytes, lent, or, for a file the green holds by its content-plane object alone (piece 4d), that
+/// object's name, which the reader reads through its own plane. Only a Subversion green holds a file so; a reader of a
+/// green of another tool refuses a named file typed ([`Content::bytes`] names it). A file at a version is a
+/// [`ContentAt`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Content<'a> {
+  /// The file's bytes, lent.
+  Bytes(&'a [u8]),
+  /// The object the file's bytes are the whole of, whose bytes the green does not hold.
+  Named(crate::named::Identity),
+}
+
+impl<'a> Content<'a> {
+  /// The file's length, read off its bytes or its name.
+  pub fn len(&self) -> u64 {
+    match self {
+      Content::Bytes(bytes) => u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+      Content::Named(identity) => identity.len,
+    }
+  }
+
+  /// Whether the file is empty.
+  pub fn is_empty(&self) -> bool {
+    self.len() == 0
+  }
+
+  /// The file's bytes, or the object it is held by when the green holds none: what a reader with no plane refuses.
+  pub fn bytes(self) -> Result<&'a [u8], crate::named::Identity> {
+    match self {
+      Content::Bytes(bytes) => Ok(bytes),
+      Content::Named(identity) => Err(identity),
+    }
+  }
+}
+
+/// A file's content at a version ([`Content`]'s, read off the history where the file changed since): its bytes, lent
+/// from the head or copied, or the object's name for a file held by it alone (A-760 (b) 4b), a page's range of it for a
+/// page ([`Green::content_page_at`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContentAt<'a> {
+  /// The file's bytes, lent or copied.
+  Bytes(Cow<'a, [u8]>),
+  /// The object the file's bytes are the whole of, whose bytes the green does not hold.
+  Named(crate::named::Identity),
+}
+
+impl<'a> ContentAt<'a> {
+  /// The file's length, read off its bytes or its name (a page's: the page's bytes).
+  pub fn len(&self) -> u64 {
+    match self {
+      ContentAt::Bytes(bytes) => u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+      ContentAt::Named(identity) => identity.len,
+    }
+  }
+
+  /// Whether it is empty.
+  pub fn is_empty(&self) -> bool {
+    self.len() == 0
+  }
+
+  /// The bytes, or the object they are held by when the green holds none ([`Content::bytes`]).
+  pub fn into_bytes(self) -> Result<Cow<'a, [u8]>, crate::named::Identity> {
+    match self {
+      ContentAt::Bytes(bytes) => Ok(bytes),
+      ContentAt::Named(identity) => Err(identity),
+    }
+  }
+}
+
+impl<'a> From<Content<'a>> for ContentAt<'a> {
+  fn from(content: Content<'a>) -> ContentAt<'a> {
+    match content {
+      Content::Bytes(bytes) => ContentAt::Bytes(Cow::Borrowed(bytes)),
+      Content::Named(identity) => ContentAt::Named(identity),
+    }
+  }
+}
+
 /// A checkpoint refused by a restore while a file it names is unread (A-869, [`Green::with_checkpoint`]): the object
 /// not read yet, and the green as it was before the restore, which its caller takes back (a lineage member's engine
 /// holds its lineage's arenas).
@@ -2153,8 +2232,14 @@ impl Green {
     Ok(())
   }
 
-  /// The bytes held under `identity`, if held.
-  pub fn held(&self, identity: &crate::held::Identity) -> Option<&[u8]> {
+  /// The text held under `identity`, if held ([`Content`], A-760 (b) 4b).
+  pub fn held(&self, identity: &crate::held::Identity) -> Option<Content<'_>> {
+    self.held_bytes(identity).map(Content::Bytes)
+  }
+
+  /// The bytes held under `identity`, if held, for a reader that holds no content plane (the engine's own and its
+  /// tests'): none for a text the green holds by name alone.
+  pub fn held_bytes(&self, identity: &crate::held::Identity) -> Option<&[u8]> {
     self
       .held
       .entries
@@ -2562,7 +2647,7 @@ impl Green {
     match key {
       IdentityKey::File(path) => (
         self
-          .content_ref_at(path, since)
+          .content_ref_at_bytes(path, since)
           .map(|bytes| file_entry_of(path, &bytes)),
         self
           .content
@@ -3017,8 +3102,15 @@ impl Green {
       .copied()
   }
 
-  /// A file's current bytes, or `None` when it is absent.
-  pub fn content(&self, path: &str) -> Option<&[u8]> {
+  /// A file's current content ([`Content`], A-760 (b) 4b), or `None` when it is absent: what every reader outside the
+  /// engine takes, so a file held by its content-plane object alone is read through the reader's plane.
+  pub fn content(&self, path: &str) -> Option<Content<'_>> {
+    self.content_bytes(path).map(Content::Bytes)
+  }
+
+  /// A file's current bytes, or `None` when it is absent, for a reader that holds no content plane (the engine's own
+  /// reads and its tests): none for a file the green holds by its object's name alone.
+  pub fn content_bytes(&self, path: &str) -> Option<&[u8]> {
     self.content.get(path)
   }
 
@@ -3045,7 +3137,14 @@ impl Green {
   /// Every file the green currently holds, with its bytes — so a new work volume can be seeded with
   /// the base content it inherits and edits splice against it. Each path is assembled by the walk (a persistent map's
   /// keys are its edges, [`crate::dims`]), so it is owned.
-  pub fn files(&self) -> impl Iterator<Item = (String, &[u8])> {
+  pub fn files(&self) -> impl Iterator<Item = (String, Content<'_>)> {
+    self
+      .files_bytes()
+      .map(|(path, bytes)| (path, Content::Bytes(bytes)))
+  }
+
+  /// [`Green::files`]' bytes, for a reader that holds no content plane ([`Green::content_bytes`]).
+  pub fn files_bytes(&self) -> impl Iterator<Item = (String, &[u8])> {
     self.content.iter()
   }
 
@@ -3471,24 +3570,42 @@ impl Green {
   /// A file's bytes at `version`, reconstructed from its history — the value in effect at `version`, or `None` when
   /// the file was absent then. What a version-pinned attachment reads (§4.16 "Attachments and versions": a reader's
   /// view moves only by `advance`).
-  pub fn content_at(&self, path: &str, version: u64) -> Option<Vec<u8>> {
-    self.content_ref_at(path, version).map(Cow::into_owned)
+  pub fn content_at(&self, path: &str, version: u64) -> Option<ContentAt<'static>> {
+    self
+      .content_at_bytes(path, version)
+      .map(|bytes| ContentAt::Bytes(Cow::Owned(bytes)))
+  }
+
+  /// [`Green::content_at`]'s bytes, for a reader that holds no content plane ([`Green::content_bytes`]).
+  pub fn content_at_bytes(&self, path: &str, version: u64) -> Option<Vec<u8>> {
+    self
+      .content_ref_at_bytes(path, version)
+      .map(Cow::into_owned)
   }
 
   /// Every file at `version` with its bytes in path order: the head's files, or each path's value at an earlier
   /// version. What a work based at `version` lists (its untouched files are the green's there). Borrowed where a
   /// file is unchanged since `version`, copied out of the history where it changed after ([`Green::content_ref_at`]).
   /// The paths are owned, as [`Green::files`]'s are.
-  pub fn files_at(&self, version: u64) -> Vec<(String, Cow<'_, [u8]>)> {
+  pub fn files_at(&self, version: u64) -> Vec<(String, ContentAt<'_>)> {
+    self
+      .files_at_bytes(version)
+      .into_iter()
+      .map(|(path, bytes)| (path, ContentAt::Bytes(bytes)))
+      .collect()
+  }
+
+  /// [`Green::files_at`]'s bytes, for a reader that holds no content plane ([`Green::content_bytes`]).
+  pub fn files_at_bytes(&self, version: u64) -> Vec<(String, Cow<'_, [u8]>)> {
     if version >= self.head() {
       return self
-        .files()
+        .files_bytes()
         .map(|(path, bytes)| (path, Cow::Borrowed(bytes)))
         .collect();
     }
     union_keys(self.content.keys(), self.content_history.keys().cloned())
       .filter_map(|path| {
-        let bytes = self.content_ref_at(&path, version)?;
+        let bytes = self.content_ref_at_bytes(&path, version)?;
         Some((path, bytes))
       })
       .collect()
@@ -3498,7 +3615,14 @@ impl Green {
   /// the file is unchanged since `version` (its value then is the current one), copied out of the history's chunks
   /// when it changed after (W2: the history holds what each version changed, not a whole copy of the file to lend).
   /// A file with no history has held its current bytes since version 0 (the one history rule, A-534).
-  pub fn content_ref_at(&self, path: &str, version: u64) -> Option<Cow<'_, [u8]>> {
+  pub fn content_ref_at(&self, path: &str, version: u64) -> Option<ContentAt<'_>> {
+    self
+      .content_ref_at_bytes(path, version)
+      .map(ContentAt::Bytes)
+  }
+
+  /// [`Green::content_ref_at`]'s bytes, for a reader that holds no content plane ([`Green::content_bytes`]).
+  pub fn content_ref_at_bytes(&self, path: &str, version: u64) -> Option<Cow<'_, [u8]>> {
     match self.content_read(path, version) {
       ContentRead::Head => self.content.get(path).map(Cow::Borrowed),
       ContentRead::Value(value) => Some(Cow::Owned(
@@ -3541,7 +3665,22 @@ impl Green {
   /// A page of a file at `version`: its bytes in `[offset, offset + want)` (clamped to its length) and its length, or
   /// `None` when it was absent then. Sliced from the head when the file is unchanged since `version`, and copied out of
   /// only the history's pieces that hold the page when it changed after: a paged read never copies the whole file.
+  ///
+  /// A page of a file held by its object's name alone answers that name, the reader reading the
+  /// same range of the object through its plane ([`ContentAt::Named`]).
   pub fn content_page_at(
+    &self,
+    path: &str,
+    version: u64,
+    range: (u64, u64),
+  ) -> Option<(ContentAt<'static>, u64)> {
+    self
+      .content_page_at_bytes(path, version, range)
+      .map(|(page, total)| (ContentAt::Bytes(Cow::Owned(page)), total))
+  }
+
+  /// [`Green::content_page_at`]'s bytes, for a reader that holds no content plane ([`Green::content_bytes`]).
+  pub fn content_page_at_bytes(
     &self,
     path: &str,
     version: u64,
@@ -3578,7 +3717,7 @@ impl Green {
   pub fn file_lens_at(&self, version: u64) -> Vec<(String, usize)> {
     if version >= self.head() {
       return self
-        .files()
+        .files_bytes()
         .map(|(path, bytes)| (path, bytes.len()))
         .collect();
     }
@@ -3825,7 +3964,7 @@ impl Green {
       // No history, or a copy's value (A-586), whose history's last value is no head's: the bytes at the base against
       // the head's (at the base they are the head's, unless a copy since replaced them).
       let head = self.content.get(path).unwrap_or_default();
-      let at_base = self.content_ref_at(path, base).unwrap_or_default();
+      let at_base = self.content_ref_at_bytes(path, base).unwrap_or_default();
       let (ops, post_state) = ops_and_post;
       return apply(&at_base, ops, post_state) == head;
     };
@@ -7526,11 +7665,15 @@ mod tests {
     let (outcome, applied) = green.submit_resolved(&edited);
     assert_eq!(outcome, Outcome::Accepted { version: 2 });
     assert_eq!(
-      green.content("b"),
+      green.content_bytes("b"),
       Some(b"0123456789XY".as_slice()),
       "the edit after the rename is lost"
     );
-    assert_eq!(green.content("a"), None, "the rename's source is gone");
+    assert_eq!(
+      green.content_bytes("a"),
+      None,
+      "the rename's source is gone"
+    );
     let applied = applied.expect("an accepted version's effects");
     let increment_bytes = edited.encode();
     let entry = crate::chain_entry::encode(
@@ -7551,7 +7694,7 @@ mod tests {
       2
     );
     assert_eq!(
-      replayed.content("b"),
+      replayed.content_bytes("b"),
       Some(b"0123456789XY".as_slice()),
       "the replayed version lost the edit"
     );

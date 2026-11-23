@@ -412,10 +412,22 @@ pub(crate) struct HeadTexts<'a> {
   pub(crate) pieces: Option<&'a Pieces>,
 }
 
+/// The bytes of the text `green` holds under `identity` (A-716's table), where it holds its bytes: a text it holds by
+/// its content-plane object alone (A-760 (b) 4b) is read where the records keep it stored, the content store, by the
+/// same identity, as any text the green does not hold is.
+fn held_bytes<'g>(
+  green: &'g slates_merge::engine::Green,
+  identity: &ContentIdentity,
+) -> Option<&'g [u8]> {
+  green
+    .held(identity)
+    .and_then(|content| content.bytes().ok())
+}
+
 impl TextSource for HeadTexts<'_> {
   /// The head's text from the green; any other from where the records keep it (module docs, "Reading").
   fn text(&self, identity: &ContentIdentity) -> Option<Cow<'_, [u8]>> {
-    if let Some(bytes) = self.green.and_then(|green| green.held(identity)) {
+    if let Some(bytes) = self.green.and_then(|green| held_bytes(green, identity)) {
       return Some(Cow::Borrowed(bytes));
     }
     match self.records.stored_len(identity) {
@@ -432,7 +444,7 @@ impl TextSource for HeadTexts<'_> {
   /// borrowed to the text's end; else the content store's window holding `offset`; else the records' own bytes from it.
   /// Nothing is made whole.
   fn text_at(&self, identity: &ContentIdentity, offset: u64) -> Option<Cow<'_, [u8]>> {
-    if let Some(bytes) = self.green.and_then(|green| green.held(identity)) {
+    if let Some(bytes) = self.green.and_then(|green| held_bytes(green, identity)) {
       return bytes
         .get(usize::try_from(offset).ok()?..)
         .map(Cow::Borrowed);
@@ -472,7 +484,10 @@ impl TextSource for HeadTexts<'_> {
     cache: &'a mut slates_svn::reads::WindowCache,
   ) -> Option<Cow<'a, [u8]>> {
     let kept_by_records = self.records.stored_len(identity).is_none()
-      && self.green.and_then(|green| green.held(identity)).is_none();
+      && self
+        .green
+        .and_then(|green| held_bytes(green, identity))
+        .is_none();
     if kept_by_records {
       return self.records.text_in(identity, offset, cache);
     }
@@ -483,7 +498,7 @@ impl TextSource for HeadTexts<'_> {
   /// store read (`ContentStore::window_at`, from the window the bytes read so far reach), the records' own bytes a
   /// window's room copied.
   fn read_step(&self, identity: &ContentIdentity, reading: &mut TextReading) -> Option<bool> {
-    if let Some(bytes) = self.green.and_then(|green| green.held(identity)) {
+    if let Some(bytes) = self.green.and_then(|green| held_bytes(green, identity)) {
       return Some(reading.copy_step(bytes));
     }
     let Some(len) = self.records.stored_len(identity) else {

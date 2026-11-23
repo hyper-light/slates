@@ -1046,6 +1046,55 @@ fn pipelined_commands_are_answered_one_turn_a_shard_poll() {
   assert_eq!(unyielded, vec![0, 0]);
 }
 
+/// Goal 93's attribution of a slower svnsync: a conversation's time is counted by phase. Do: sign in, then send 64
+/// `get-latest-rev` commands in one write and read their 128 answers. Expect: at least one answer a command
+/// (`vcs_svn.answers`), nanoseconds spent answering (`vcs_svn.answer_ns`) and waiting for the client's bytes
+/// (`vcs_svn.read_wait_ns`), the shards' counts together, wherever the conversation ran.
+#[test]
+fn a_conversations_answers_and_its_waits_for_the_client_are_counted() {
+  const COMMANDS: usize = 64;
+  let daemon = daemon(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+  let port = daemon.vcs_svn_port().expect("the listener started");
+  enrolled(&daemon);
+  let refusal_at = NO_ACCESS_SERVER
+    .windows(REFUSAL_START.len())
+    .position(|window| window == REFUSAL_START)
+    .expect("the recorded server refused");
+  let greeting = replaced(&NO_ACCESS_SERVER[..refusal_at], SVNDIFF1, "");
+  let name = name_on("svn-phases-", OTHER);
+  create_svn(&daemon, OTHER, &name);
+  let mut signed = sign_in(port, &greeting, &format!("svn://127.0.0.1:{port}/{name}"));
+  let answers = asked(
+    &mut signed.stream,
+    &b"( get-latest-rev ( ) ) ".repeat(COMMANDS),
+    2 * COMMANDS,
+  );
+  assert_eq!(
+    answers,
+    "( success ( ( ) 0: ) ) ( success ( 0 ) ) ".repeat(COMMANDS)
+  );
+  let counted = |kind: &'static str| -> u64 {
+    [LISTENER, OTHER]
+      .into_iter()
+      .map(|partition| {
+        crate::daemon::observe_at(&daemon, partition, |state| {
+          state.refusals.get(kind).copied().unwrap_or(0)
+        })
+      })
+      .sum()
+  };
+  let answered = counted(super::ANSWERS);
+  assert!(
+    answered >= u64::try_from(COMMANDS).unwrap(),
+    "{answered} answers counted for {COMMANDS} commands"
+  );
+  assert!(counted(super::ANSWER_NS) > 0, "no time counted answering");
+  assert!(
+    counted(super::READ_WAIT_NS) > 0,
+    "no time counted waiting for the client"
+  );
+}
+
 /// A-702 part 2 (`fs-wrap.c` `svn_repos_fs_change_rev_prop4`; `hooks.c` `svn_repos__hooks_pre_revprop_change`,
 /// `_post_revprop_change`). Do: commit a file with log `file`; configure a pre-revprop-change hook that records its
 /// arguments and standard input and allows, and a post-revprop-change hook that records its standard input; change

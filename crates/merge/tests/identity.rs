@@ -94,7 +94,7 @@ const PROPS: &str = "slates.svn.props";
 
 fn reads_at(green: &Green, path: &str, since: u64) -> Reads {
   (
-    green.content(path).map(<[u8]>::to_vec),
+    green.content_bytes(path).map(<[u8]>::to_vec),
     green.xattr(path, PROPS).map(<[u8]>::to_vec),
     green.is_dir(path),
     green.symlink(path).map(str::to_owned),
@@ -107,7 +107,7 @@ fn reads_at(green: &Green, path: &str, since: u64) -> Reads {
 /// Every file the green holds and every directory above one.
 fn paths_of(green: &Green) -> std::collections::BTreeSet<String> {
   let mut paths = std::collections::BTreeSet::new();
-  for (path, _) in green.files() {
+  for (path, _) in green.files_bytes() {
     let mut at = path.as_str();
     while let Some(cut) = at.rfind('/') {
       at = at.get(..cut).unwrap();
