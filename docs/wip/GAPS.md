@@ -51,6 +51,20 @@
 > `ENFILE` or Windows handle exhaustion met by a host open, counted without a descriptor (macOS `proc_pidinfo`, Windows
 > `GetProcessHandleCount`, Linux through a spare held from the start); `ceiling()` the lower of it and the rlimit.
 > **Open:** (3) every host open, accept and memfd meeting exhaustion a typed refusal with a counter, and noting it.
+> **Closed (w-chaos, 2026-11-23): every Linux client connect left its region's descriptor open.** `decode_handoff`
+> passed the received region descriptor as a bare number to an open that duplicates a handed-off number
+> (docs/bugs/2026-09-14-segment-handoff-descriptor-owned-twice.md's rule) and closes only the duplicate. So a client
+> process kept one descriptor, and the region's memory with it, for every connect it ever made. The chaos nemesis's test
+> process held up to 18,950 unmapped `/memfd:slates-cr-*` descriptors on adacachy2, and 2 runs in 10 met `EMFILE` at
+> a spawn. Now the region owns the received descriptor (`ClientRegion::from_descriptor`). Red on main: 8 connects
+> left 8 descriptors. Green: 0 (`a_client_that_connects_and_leaves_holds_no_descriptor_of_its_region`;
+> docs/bugs/2026-11-23-every-linux-client-connect-left-its-regions-descriptor-open.md).
+> **Open, found by its sweep, by reading:**
+> (1) `AnchorSegment::handoff_env` makes inheritable duplicates of the segment and content objects and keeps only their
+> numbers. So the anchor keeps two more descriptors at every daemon start, and each later child inherits them all. A
+> daemon keeps 2 × (shards + 1), inheritable by anything it spawns.
+> (2) The daemon's side of a Linux claim adopts its region duplicate only after the kick's `dup` or `eventfd`, so a
+> failure of either, exhaustion among them, leaks the duplicate.
 
 > **Open (w-shared, 2026-11-21, found landing family three): `slates-bridge-fuse --test takeover_round` fails 2 of 2 on
 > Linux** (`a_kernel_that_cannot_bump_its_epoch_still_gets_every_inode_and_is_counted`,
