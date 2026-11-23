@@ -409,6 +409,13 @@ pub enum RetryCause {
     /// The region searched.
     region: u64,
   },
+  /// The node the verb reached holds no record of the volume and is not its owner by its own routing (§4.8 "Lookup",
+  /// the rule by authority): nothing ran; the owner is located again, `owner` the hint where that node's routing named
+  /// one (2026-11-23).
+  NotOwnerHere {
+    /// The owner's member id as that node's routing names it, where it names one.
+    owner: Option<u64>,
+  },
   /// A merge's inputs are not held where its verdict must run yet (§4.16).
   ContentUnavailable,
   /// A file changed while it was read or digested: nothing stale is returned.
@@ -960,6 +967,7 @@ impl Error {
       Refusal::OwnerUnreachable { region } => {
         retry(RetryCause::OwnerUnreachable { region }, pause_ns)
       }
+      Refusal::NotOwnerHere { owner } => retry(RetryCause::NotOwnerHere { owner }, pause_ns),
       Refusal::ContentUnavailable => retry(RetryCause::ContentUnavailable, pause_ns),
       Refusal::DigestUnverified => retry(RetryCause::ChangedWhileRead { path: None }, pause_ns),
       Refusal::HolderPending => retry(RetryCause::HolderPending, pause_ns),
@@ -2009,6 +2017,22 @@ mod tests {
       rights.contains("Forbidden") && rights.contains("status"),
       "{rights}"
     );
+  }
+
+  /// The rule by authority (§4.8 "Lookup", 2026-11-23): do type the refusal of a node that holds no record of a volume
+  /// and is not its owner, with and without the owner its routing names. Expect a retry carrying the hint as it came,
+  /// after the pause: never the "does not exist" a `NotFound` is typed into.
+  #[test]
+  fn a_node_that_is_not_the_volumes_owner_is_a_retry_naming_the_owner_it_knows() {
+    for owner in [Some(7), None] {
+      assert_eq!(
+        Error::of_refusal(Refusal::NotOwnerHere { owner }, None, PAUSE_NS),
+        Error::Retry {
+          cause: RetryCause::NotOwnerHere { owner },
+          pause_ns: PAUSE_NS,
+        }
+      );
+    }
   }
 
   /// A-354 (2026-11-18): do type the daemon's refusal of a reply held past the failover SLO for durability. Expect a

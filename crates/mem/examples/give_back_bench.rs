@@ -30,7 +30,7 @@ fn write_chunks(arena: &mut ChunkArena) -> Result<(f64, Vec<Extent>), slates_mem
   let began = Instant::now();
   let mut chunks = Vec::with_capacity(REGION / CHUNK);
   for _ in 0..REGION / CHUNK {
-    let chunk = arena.alloc(CHUNK)?;
+    let chunk = arena.alloc(CHUNK, slates_mem::Owner::Volume)?;
     if let Some(bytes) = arena.bytes_mut(chunk) {
       bytes.fill(0xAB);
     }

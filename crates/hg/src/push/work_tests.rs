@@ -174,7 +174,7 @@ fn land(
 /// Holds `green` to exactly the files `hg cat` recorded at `rev`, and its head to that revision's node.
 fn holds_checkout(green: &Green, rev: u32) {
   let files: BTreeMap<String, Vec<u8>> = green
-    .files()
+    .files_bytes()
     .map(|(path, bytes)| (path, bytes.to_vec()))
     .collect();
   assert_eq!(files, checked_out(rev), "revision {rev}");
@@ -649,7 +649,7 @@ fn a_flat_manifest_is_laid_out_so_unchanged_directories_are_never_read() {
   );
   assert_eq!((built.reads.trees, built.reads.skipped), (4, 2));
   let files: BTreeMap<String, Vec<u8>> = green
-    .files()
+    .files_bytes()
     .map(|(path, bytes)| (path, bytes.to_vec()))
     .collect();
   assert_eq!(

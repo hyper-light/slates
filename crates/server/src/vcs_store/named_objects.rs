@@ -18,6 +18,52 @@ pub(crate) struct PlaneObjects<'a> {
   pub(crate) kept_in: &'a dyn std::any::Any,
 }
 
+/// A file a green holds by its content-plane object alone, met by a reader that reads no plane (A-760 (b) 4b, main
+/// 01a20182's ruling of 2026-11-23): the file's path and the object. Only a Subversion green holds a file so, and only
+/// once piece 4d drops a named block's bytes; until then no green answers one, so a reader's refusal of it is never
+/// met. Piece 4d gives the readers that serve a Subversion green the plane's read, a sync reader the typed refusal its
+/// async caller brings the object back on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NamedUnread {
+  /// The file.
+  pub(crate) path: String,
+  /// The object it is held by.
+  pub(crate) identity: Identity,
+}
+
+impl std::fmt::Display for NamedUnread {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "{} is held by its content-plane object ({} bytes) alone, which this reader does not read",
+      self.path, self.identity.len
+    )
+  }
+}
+
+/// A green's file content at a version (`slates_merge::engine::ContentAt`, or a current file's `Content`) as the bytes
+/// a reader with no plane takes, or the typed refusal naming the file and its object ([`NamedUnread`]).
+pub(crate) fn bytes_of<'a>(
+  path: &str,
+  content: impl Into<slates_merge::engine::ContentAt<'a>>,
+) -> Result<std::borrow::Cow<'a, [u8]>, NamedUnread> {
+  content.into().into_bytes().map_err(|identity| NamedUnread {
+    path: path.to_owned(),
+    identity,
+  })
+}
+
+/// [`bytes_of`] for a current file (`slates_merge::engine::Content`), its bytes lent.
+pub(crate) fn lent_bytes_of<'a>(
+  path: &str,
+  content: slates_merge::engine::Content<'a>,
+) -> Result<&'a [u8], NamedUnread> {
+  content.bytes().map_err(|identity| NamedUnread {
+    path: path.to_owned(),
+    identity,
+  })
+}
+
 /// A replay's named objects (A-866, A-869): the content plane first, then the bytes kept for it (a refused publication's
 /// remake keeps, from the engine it replaces, the named texts the plane does not hold whole: `verbs::remake_green`),
 /// sorted by identity, each an object's whole bytes.
@@ -194,7 +240,7 @@ mod tests {
         panic!("not accepted");
       };
       green.commit_judged(judged).unwrap();
-      let file = green.content("big").unwrap();
+      let file = green.content_bytes("big").unwrap();
       let replayed = {
         let mut again = named_create("big", object);
         let objects = PlaneObjects {

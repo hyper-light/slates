@@ -123,7 +123,7 @@ proptest! {
     prop_assert_eq!(restored.head_identity(), green.head_identity());
     prop_assert_eq!(restored.head_identity(), restored.head_identity_from_scratch());
     for version in at..=head {
-      prop_assert_eq!(restored.files_at(version), green.files_at(version), "files at {}", version);
+      prop_assert_eq!(restored.files_at_bytes(version), green.files_at_bytes(version), "files at {}", version);
     }
     // What changed between two versions, read from the change index (`changed_between`, what `advance` invalidates by,
     // and `changed_since`), is what the model walking the histories finds (A-264): in the green and its restoration,
@@ -185,7 +185,7 @@ proptest! {
     prop_assert_eq!(in_shares.head(), whole.head());
     prop_assert_eq!(in_shares.head_identity(), whole.head_identity());
     for version in at..=head {
-      prop_assert_eq!(in_shares.files_at(version), whole.files_at(version), "files at {}", version);
+      prop_assert_eq!(in_shares.files_at_bytes(version), whole.files_at_bytes(version), "files at {}", version);
     }
     let further = increment_of(&extra).with_id(id(0, 0xD0), head);
     prop_assert_eq!(in_shares.submit(&further), whole.submit(&further));

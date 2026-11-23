@@ -625,24 +625,26 @@ mod tests {
   use slates_db::identity_homes::homes;
   use slates_db::register::HostId;
 
-  /// Any message, each kind alike. The union is built as `prop_oneof!` builds one of more than ten arms, from boxed
-  /// strategies: its shorter forms hold their arms in `Arc`s (R2).
-  /// Any owner (A-727 (d1a)).
+  /// Any owner (A-727 (d1a)), each kind alike, its union built from boxed strategies as [`message`]'s is.
   fn owner() -> impl Strategy<Value = HomeOwner> {
     let repository = proptest::array::uniform16(any::<u8>());
-    prop_oneof![
-      (repository, any::<u64>(), any::<u64>(), any::<u64>()).prop_map(
-        |(repository, node, process, attempt)| HomeOwner::Attempt {
+    proptest::strategy::Union::new([
+      (repository, any::<u64>(), any::<u64>(), any::<u64>())
+        .prop_map(|(repository, node, process, attempt)| HomeOwner::Attempt {
           repository,
           node: HostId(node),
           process,
           attempt,
-        }
-      ),
-      repository.prop_map(|repository| HomeOwner::Record { repository }),
-    ]
+        })
+        .boxed(),
+      repository
+        .prop_map(|repository| HomeOwner::Record { repository })
+        .boxed(),
+    ])
   }
 
+  /// Any message, each kind alike. The union is built as `prop_oneof!` builds one of more than ten arms, from boxed
+  /// strategies: its shorter forms hold their arms in `Arc`s (R2).
   fn message() -> impl Strategy<Value = HomeMessage> {
     let identity = proptest::array::uniform32(any::<u8>());
     let bytes = proptest::collection::vec(any::<u8>(), 0..2048);

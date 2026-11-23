@@ -947,9 +947,12 @@ fn join_owners(identity: &ContentId, owners: &[HomeOwner]) {
   let joined = REGION_HELD.with(|held| {
     held.try_borrow_mut().is_ok_and(|mut held| {
       held.get_mut(identity).is_some_and(|held| {
-        owners
-          .iter()
-          .fold(false, |joined, owner| held.insert(*owner) || joined)
+        // Every owner is inserted, so no short circuit: `any` would stop at the first new one.
+        let mut joined = false;
+        for owner in owners {
+          joined |= held.insert(*owner);
+        }
+        joined
       })
     })
   });
@@ -1327,88 +1330,107 @@ pub(crate) async fn serve_remote(origin: u16, request: &[u8], budget_ns: u64) ->
   }) else {
     return Vec::new();
   };
-  let (identity, outcome) =
-    match message {
-      HomeMessage::Put {
-        identity,
-        owners,
-        bytes,
-      } => (
-        identity,
-        keep_put(
-          origin,
-          &shards,
-          (local, &members, f),
-          (identity, owners, bytes),
-          budget_ns,
-        )
-        .await,
-      ),
-      HomeMessage::PutPart {
-        identity,
-        owners,
-        total,
-        offset,
-        bytes,
-      } => {
-        let staged = stage_part((local, &members, f), (identity, total, offset), bytes);
-        let outcome = match staged {
-          Staged::Refused(refusal) => HomeOutcome::Refused(refusal),
-          Staged::Taken(received) => HomeOutcome::Taken { received },
-          Staged::Whole(bytes) => {
-            keep_put(
-              origin,
-              &shards,
-              (local, &members, f),
-              (identity, owners, bytes),
-              budget_ns,
-            )
-            .await
-          }
-        };
-        (identity, outcome)
-      }
-      HomeMessage::ReadPart { identity, offset } => (
-        identity,
-        read_part(origin, &shards, ContentId(identity), offset, budget_ns).await,
-      ),
-      HomeMessage::Read { identity } => {
-        let outcome = match read(origin, &shards, ContentId(identity), budget_ns).await {
-          Some(bytes) => HomeOutcome::Bytes(bytes),
-          None => HomeOutcome::Refused(HomeRefusal::NotHeld),
-        };
-        (identity, outcome)
-      }
-      HomeMessage::LetGo { identity, owner } => {
-        let outcome =
-          match let_go_region_at_home(origin, &shards, ContentId(identity), owner, budget_ns).await
-          {
-            Ok(()) => HomeOutcome::LetGo,
-            Err(HomeRefused::NotHeld) => HomeOutcome::Refused(HomeRefusal::NotHeld),
-            Err(_) => HomeOutcome::Refused(HomeRefusal::Unanswered),
-          };
-        (identity, outcome)
-      }
-      HomeMessage::Moved { identity, from, to } => {
-        let outcome =
-          match move_region_at_home(origin, &shards, ContentId(identity), (from, to), budget_ns)
-            .await
-          {
-            Ok(ticket) if published(origin, ticket, budget_ns).await => HomeOutcome::Moved,
-            Ok(_) => HomeOutcome::Refused(HomeRefusal::Unanswered),
-            Err(HomeRefused::NotHeld) => HomeOutcome::Refused(HomeRefusal::NotHeld),
-            Err(_) => HomeOutcome::Refused(HomeRefusal::Unanswered),
-          };
-        (identity, outcome)
-      }
-      // Resolved by the repository's current owner from its records (A-727 (d1a-3)): until that lands this node answers
-      // none, and the asking home keeps the attempt's hold, the safe side.
-      HomeMessage::Resolve { identity, .. } => {
-        (identity, HomeOutcome::Refused(HomeRefusal::Unanswered))
-      }
-      HomeMessage::Answer { .. } => return Vec::new(),
-    };
+  let (identity, outcome) = match message {
+    HomeMessage::Put {
+      identity,
+      owners,
+      bytes,
+    } => (
+      identity,
+      keep_put(
+        origin,
+        &shards,
+        (local, &members, f),
+        (identity, owners, bytes),
+        budget_ns,
+      )
+      .await,
+    ),
+    HomeMessage::PutPart {
+      identity,
+      owners,
+      total,
+      offset,
+      bytes,
+    } => {
+      let staged = stage_part((local, &members, f), (identity, total, offset), bytes);
+      let outcome = match staged {
+        Staged::Refused(refusal) => HomeOutcome::Refused(refusal),
+        Staged::Taken(received) => HomeOutcome::Taken { received },
+        Staged::Whole(bytes) => {
+          keep_put(
+            origin,
+            &shards,
+            (local, &members, f),
+            (identity, owners, bytes),
+            budget_ns,
+          )
+          .await
+        }
+      };
+      (identity, outcome)
+    }
+    HomeMessage::ReadPart { identity, offset } => (
+      identity,
+      read_part(origin, &shards, ContentId(identity), offset, budget_ns).await,
+    ),
+    HomeMessage::Read { identity } => {
+      let outcome = match read(origin, &shards, ContentId(identity), budget_ns).await {
+        Some(bytes) => HomeOutcome::Bytes(bytes),
+        None => HomeOutcome::Refused(HomeRefusal::NotHeld),
+      };
+      (identity, outcome)
+    }
+    HomeMessage::LetGo { identity, owner } => (
+      identity,
+      let_go_answer(origin, &shards, (identity, owner), budget_ns).await,
+    ),
+    HomeMessage::Moved { identity, from, to } => (
+      identity,
+      moved_answer(origin, &shards, (identity, (from, to)), budget_ns).await,
+    ),
+    // Resolved by the repository's current owner from its records (A-727 (d1a-3)): until that lands this node answers
+    // none, and the asking home keeps the attempt's hold, the safe side.
+    HomeMessage::Resolve { identity, .. } => {
+      (identity, HomeOutcome::Refused(HomeRefusal::Unanswered))
+    }
+    HomeMessage::Answer { .. } => return Vec::new(),
+  };
   HomeMessage::Answer { identity, outcome }.encode()
+}
+
+/// [`serve_remote`]'s answer to a let-go of `identity` for `owner` (every owner where none), from its home among
+/// `shards`, asked from shard `origin`: `LetGo` once its holder is let go.
+async fn let_go_answer(
+  origin: u16,
+  shards: &[u16],
+  (identity, owner): ([u8; 32], Option<HomeOwner>),
+  budget_ns: u64,
+) -> slates_cluster::homes::HomeOutcome {
+  use slates_cluster::homes::{HomeOutcome, HomeRefusal};
+  match let_go_region_at_home(origin, shards, ContentId(identity), owner, budget_ns).await {
+    Ok(()) => HomeOutcome::LetGo,
+    Err(HomeRefused::NotHeld) => HomeOutcome::Refused(HomeRefusal::NotHeld),
+    Err(_) => HomeOutcome::Refused(HomeRefusal::Unanswered),
+  }
+}
+
+/// [`serve_remote`]'s answer to a move of `identity`'s hold between `owners` (from, to), from its home among `shards`,
+/// asked from shard `origin`: `Moved` only once that home's image holding the move is published ([`published`], A-727's
+/// barrier).
+async fn moved_answer(
+  origin: u16,
+  shards: &[u16],
+  (identity, owners): ([u8; 32], (HomeOwner, HomeOwner)),
+  budget_ns: u64,
+) -> slates_cluster::homes::HomeOutcome {
+  use slates_cluster::homes::{HomeOutcome, HomeRefusal};
+  match move_region_at_home(origin, shards, ContentId(identity), owners, budget_ns).await {
+    Ok(ticket) if published(origin, ticket, budget_ns).await => HomeOutcome::Moved,
+    Ok(_) => HomeOutcome::Refused(HomeRefusal::Unanswered),
+    Err(HomeRefused::NotHeld) => HomeOutcome::Refused(HomeRefusal::NotHeld),
+    Err(_) => HomeOutcome::Refused(HomeRefusal::Unanswered),
+  }
 }
 
 /// [`keep_for_region`] on the home shard among `shards` of the window `bytes`, asked from shard `origin`.
@@ -2133,7 +2155,6 @@ async fn heal_one(
   identity: ContentId,
   budget: slates_cluster::CommitBudget,
 ) {
-  use slates_cluster::homes::{HOME_STREAM, HomeMessage, HomeOutcome};
   let homes = slates_db::identity_homes::homes(&identity.0, members, f);
   let others: Vec<slates_db::HostId> = homes
     .iter()
@@ -2168,45 +2189,58 @@ async fn heal_one(
       release_if_healed(origin, shards, (local, members, f), identity, budget, &held).await;
       return;
     }
-    let request = HomeMessage::Put {
-      identity: identity.0,
-      owners,
-      bytes,
-    }
-    .encode();
-    let sessions =
-      crate::fleet::take_sessions("vcs_store.homes.heal", |host| others.contains(&host));
-    let outgoing: Vec<(
-      slates_db::HostId,
-      Vec<u8>,
-      slates_transport::endpoint::Endpoint,
-    )> = sessions
-      .into_iter()
-      .map(|(host, endpoint)| (host, request.clone(), endpoint))
-      .collect();
-    let (replied, _stragglers) = slates_cluster::broadcast(
-      outgoing,
-      HOME_STREAM,
-      slates_transport::connection::Priority::Bulk,
-      budget,
-    )
-    .await;
-    let mut returned = Vec::with_capacity(replied.len());
-    for (host, reply, endpoint) in replied {
-      if let Ok(HomeMessage::Answer {
-        identity: answered,
-        outcome: HomeOutcome::Kept { .. },
-      }) = HomeMessage::decode(&reply.bytes)
-        && answered == identity.0
-      {
-        held.insert(host);
-      }
-      returned.push((host, endpoint));
-    }
-    crate::fleet::return_sessions(returned);
+    held.extend(put_whole(&others, (identity, owners), bytes, budget).await);
     crate::state::with_state(|state| state.count(HEAL_OFFERED, 1));
   }
   release_if_healed(origin, shards, (local, members, f), identity, budget, &held).await;
+}
+
+/// Offers the window `identity` whole to `others` for `owners`, one message each over the sessions the fleet has free,
+/// within `budget` ([`heal_one`]): the homes that answered `Kept`.
+async fn put_whole(
+  others: &[slates_db::HostId],
+  (identity, owners): (ContentId, Vec<HomeOwner>),
+  bytes: Vec<u8>,
+  budget: slates_cluster::CommitBudget,
+) -> Vec<slates_db::HostId> {
+  use slates_cluster::homes::{HOME_STREAM, HomeMessage, HomeOutcome};
+  let request = HomeMessage::Put {
+    identity: identity.0,
+    owners,
+    bytes,
+  }
+  .encode();
+  let sessions = crate::fleet::take_sessions("vcs_store.homes.heal", |host| others.contains(&host));
+  let outgoing: Vec<(
+    slates_db::HostId,
+    Vec<u8>,
+    slates_transport::endpoint::Endpoint,
+  )> = sessions
+    .into_iter()
+    .map(|(host, endpoint)| (host, request.clone(), endpoint))
+    .collect();
+  let (replied, _stragglers) = slates_cluster::broadcast(
+    outgoing,
+    HOME_STREAM,
+    slates_transport::connection::Priority::Bulk,
+    budget,
+  )
+  .await;
+  let mut kept = Vec::new();
+  let mut returned = Vec::with_capacity(replied.len());
+  for (host, reply, endpoint) in replied {
+    if let Ok(HomeMessage::Answer {
+      identity: answered,
+      outcome: HomeOutcome::Kept { .. },
+    }) = HomeMessage::decode(&reply.bytes)
+      && answered == identity.0
+    {
+      kept.push(host);
+    }
+    returned.push((host, endpoint));
+  }
+  crate::fleet::return_sessions(returned);
+  kept
 }
 
 #[cfg(test)]

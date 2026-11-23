@@ -542,8 +542,8 @@ impl TextCache {
           self.walk_bytes = self.walk_bytes.saturating_sub(walked);
           self.walk_order.retain(|walking| *walking != identity);
         }
-      } else if !self.walks.contains_key(&identity) {
-        self.walks.insert(identity, len);
+      } else if let std::collections::hash_map::Entry::Vacant(walk) = self.walks.entry(identity) {
+        walk.insert(len);
         self.walk_order.push_back(identity);
         self.walk_bytes = self.walk_bytes.saturating_add(len);
         while self.walk_order.len() > self.reads {

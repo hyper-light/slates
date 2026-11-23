@@ -33,7 +33,7 @@ fn an_arena_over_a_shared_region_allocates_and_serves_bytes() {
   let object = unsafe { ExclusiveObject::new(object) };
   arena.add_region(Region::shared(object, PAGE)).unwrap();
 
-  let extent = arena.alloc(PAGE).unwrap();
+  let extent = arena.alloc(PAGE, slates_mem::Owner::Volume).unwrap();
   let payload = b"content in a shared region";
   arena.bytes_mut(extent).unwrap()[..payload.len()].copy_from_slice(payload);
   assert_eq!(
@@ -102,7 +102,7 @@ fn a_range_of_a_sparse_object_mapped_alone_keeps_its_bytes_across_a_remap() {
   let mapped = unsafe { ExclusiveObject::open_range(&handoff, at, range) }.unwrap();
   let mut arena = ChunkArena::new(PAGE);
   arena.add_region(Region::shared(mapped, PAGE)).unwrap();
-  let block = arena.alloc(PAGE).unwrap();
+  let block = arena.alloc(PAGE, slates_mem::Owner::Volume).unwrap();
   let content = b"a chunk written once, in anchor RAM";
   arena.bytes_mut(block).unwrap()[..content.len()].copy_from_slice(content);
   let offset = block.offset();

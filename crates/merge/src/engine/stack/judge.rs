@@ -347,7 +347,7 @@ impl Green {
           length,
         ))),
         Mapped::Overlaps => {
-          let base = file.get_or_insert_with(|| self.content_ref_at(frame, against.at));
+          let base = file.get_or_insert_with(|| self.content_ref_at_bytes(frame, against.at));
           if !identical(op, (&edits, base.as_deref()), work.post()) {
             windows.range(path, touched_range(op));
           }

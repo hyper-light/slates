@@ -2310,8 +2310,8 @@ impl Client {
   /// Notes what `word`'s reply means for the retryable set: an `Unpublished` refusal keeps the id
   /// retryable (bounded, the oldest forgotten and counted past the ring's slots); any other answer
   /// to a retried id releases it. On the async path (`by_word`: a caller holding the id's word, which
-  /// [`Self::begin_again`] resends) an `Overloaded`, `OwnerUnreachable` or `DurabilityPending` (A-354) refusal is
-  /// held as well, within the reconnect budget (`retry_held`).
+  /// [`Self::begin_again`] resends) an `Overloaded`, `OwnerUnreachable`, `NotOwnerHere` or `DurabilityPending` (A-354)
+  /// refusal is held as well, within the reconnect budget (`retry_held`).
   fn note_reply(&mut self, word: u64, body: &ReplyBody, by_word: bool) {
     let sequence = RequestId::from_word(word).sequence;
     let held_for_retry = by_word
@@ -2320,6 +2320,7 @@ impl Client {
         ReplyBody::Refused {
           refusal: slates_ipc::protocol::Refusal::Overloaded { .. }
             | slates_ipc::protocol::Refusal::OwnerUnreachable { .. }
+            | slates_ipc::protocol::Refusal::NotOwnerHere { .. }
             | slates_ipc::protocol::Refusal::DurabilityPending { .. }
         }
       );
@@ -2530,11 +2531,11 @@ impl Client {
   }
 
   /// Sends `body` again under `word`, an id the caller already used and was answered with a refusal the protocol
-  /// marks retryable under the same id (`Overloaded`, `OwnerUnreachable`, `Unpublished`, `DurabilityPending`): the
-  /// daemon answers from the verb's completion record once it is durable (a `DurabilityPending` verb's own reply, A-354),
-  /// or runs it if it never ran. The acknowledgement names such an id owed from its refusal until this resend (within
-  /// the reconnect budget for `Overloaded`, `OwnerUnreachable` and `DurabilityPending`;
-  /// [`Self::release_retryable`] releases one the caller gives up). The word is
+  /// marks retryable under the same id (`Overloaded`, `OwnerUnreachable`, `NotOwnerHere`, `Unpublished`,
+  /// `DurabilityPending`): the daemon answers from the verb's completion record once it is durable (a
+  /// `DurabilityPending` verb's own reply, A-354), or runs it if it never ran. The acknowledgement names such an id owed
+  /// from its refusal until this resend (within the reconnect budget for `Overloaded`, `OwnerUnreachable`,
+  /// `NotOwnerHere` and `DurabilityPending`; [`Self::release_retryable`] releases one the caller gives up). The word is
   /// awaited again, so its reply is taken as a [`Self::begin`]'s is, within the same in-flight bound. `Ok(false)` when
   /// the ring has no slot (nothing was sent).
   pub fn begin_again(&mut self, word: u64, body: &RequestBody) -> Result<bool, ClientError> {
@@ -3780,7 +3781,9 @@ impl Client {
 
   /// One read-only page request (`ReadRange`, `ReadDir`), or a `ShardsHolder`, sent again while the daemon refuses it
   /// with a transient refusal: no owner answered within the takeover bound (`OwnerUnreachable`, a successor serves once
-  /// a takeover installs it), the owner's lease is not confirmed yet (`LeaseUnconfirmed`), or a stream's attach has not
+  /// a takeover installs it), the node the read reached is not the volume's owner and holds no record of it
+  /// (`NotOwnerHere`, its configuration not yet the sender's; the daemon routes the resend to the owner it named), the
+  /// owner's lease is not confirmed yet (`LeaseUnconfirmed`), or a stream's attach has not
   /// yet recorded its holder (`HolderPending`, A-181). A page changes nothing, and a refused `ShardsHolder` recorded
   /// nothing, so a resend under a fresh id is safe. The resends back off as a reconnect does and stop at the reconnect budget (the restart's
   /// recovery budget plus one reply deadline, `Deadlines::derive`), after which the last refusal is the caller's. Until
@@ -3795,6 +3798,7 @@ impl Client {
       match self.call(body) {
         Err(ClientError::Refused(
           slates_ipc::protocol::Refusal::OwnerUnreachable { .. }
+          | slates_ipc::protocol::Refusal::NotOwnerHere { .. }
           | slates_ipc::protocol::Refusal::LeaseUnconfirmed { .. }
           | slates_ipc::protocol::Refusal::HolderPending,
         )) if elapsed_ns(*refused_since.get_or_insert_with(Instant::now)) < budget => {

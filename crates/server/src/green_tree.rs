@@ -51,6 +51,21 @@ fn beneath<'p>(path: &'p str, prefix: &str) -> Option<&'p str> {
   path.strip_prefix(prefix).filter(|rest| !rest.is_empty())
 }
 
+/// A read of a file the green holds by its content-plane object alone (A-760 (b) 4b), refused as a host's try-again
+/// answer ([`TRY_AGAIN`]): the mount's reader tries again, as piece 4d's bring-back will have it.
+fn named_unread() -> HostError {
+  HostError::Unavailable(TRY_AGAIN)
+}
+
+/// Format: the host's try-again answer, typed by its numbering (A-539): `EAGAIN`, an errno.
+#[cfg(unix)]
+const TRY_AGAIN: slates_vfs::host::OsCode =
+  slates_vfs::host::OsCode::Errno(rustix::io::Errno::AGAIN.raw_os_error());
+/// Format: see the Unix arm; Windows' own, `ERROR_RETRY`, a Win32 error code.
+#[cfg(windows)]
+const TRY_AGAIN: slates_vfs::host::OsCode =
+  slates_vfs::host::OsCode::Win32(windows_sys::Win32::Foundation::ERROR_RETRY);
+
 impl TreeSource for GreenTree<'_> {
   fn entries(&self, dir: &str) -> Result<Vec<TreeEntry>, HostError> {
     if !self.is_dir(dir) {
@@ -128,7 +143,9 @@ impl TreeSource for GreenTree<'_> {
     let want = u64::try_from(into.len()).unwrap_or(u64::MAX);
     // Lent from the head at the head; a page of the file at the version otherwise.
     if self.at_head() {
-      let bytes = self.green.content(path).ok_or(HostError::NotFound)?;
+      let content = self.green.content(path).ok_or(HostError::NotFound)?;
+      let bytes = crate::vcs_store::named_objects::lent_bytes_of(path, content)
+        .map_err(|_| named_unread())?;
       let start = usize::try_from(offset)
         .unwrap_or(usize::MAX)
         .min(bytes.len());
@@ -144,6 +161,7 @@ impl TreeSource for GreenTree<'_> {
       .green
       .content_page_at(path, self.version, (offset, want))
       .ok_or(HostError::NotFound)?;
+    let page = crate::vcs_store::named_objects::bytes_of(path, page).map_err(|_| named_unread())?;
     let take = page.len().min(into.len());
     into
       .get_mut(..take)

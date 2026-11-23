@@ -100,7 +100,7 @@ fn read_after(m: u64) -> (u128, usize) {
       submit(&mut green, Change::Overwrite, 4096);
     }
     let started = Instant::now();
-    let bytes = green.content_ref_at(PATH, 1).unwrap();
+    let bytes = green.content_ref_at_bytes(PATH, 1).unwrap();
     best = best.min(started.elapsed().as_nanos());
     len = bytes.len();
   }
@@ -122,7 +122,7 @@ fn read_after_shifts(m: u64) -> u128 {
       submit(&mut green, change, (n * 97) % 8192);
     }
     let started = Instant::now();
-    let bytes = green.content_ref_at(PATH, 1).unwrap();
+    let bytes = green.content_ref_at_bytes(PATH, 1).unwrap();
     best = best.min(started.elapsed().as_nanos());
     assert!(!bytes.is_empty());
   }
