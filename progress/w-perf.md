@@ -373,3 +373,14 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     confirming rounds on the landed code.
   - Arm F rejected and recorded (6bab42576). Arm G handed to main (agents/w-perf-84a-arm-g 674c030f5).
   - Next mine: init_shard unit 3 (boot's 2-68 ms slice).
+- 2026-11-22 ~22:30 PST: LANDED 80412e446 (merge 794619d6a): a shard's start holds each heavy piece of its setup in a slice of
+  its own.
+  - The setup after the catalog's replay was one unit: 12-21 ms on CI macOS, 59-68 ms on the Studio.
+  - What changed: RecoverySlices::piece_done (eight named pieces) and StartReport via Daemon::shard_start_reports; an
+    attach opens its segment once (SparseObject::declare, opens_on_this_thread); UnitSet::whole fills words whole.
+  - Red to green: 8 -> 1 heavy pieces in one slice (heaviest 9.0 -> 1.9 ms, the pool's segment); 2 -> 1 opens an attach.
+  - For main: the CI boot lines on the landed code; clippy and the cross-lint for server, anchor and mem.
+  - Pre-existing on this Mac: anchor a_table_past_the_old_exec_limit_reaches_the_successor_whole fails at HEAD too.
+  - A-867's confirming rounds (main, 45104222730): no p99 difference on a fast runner; it stays landed on the slow
+    runner's evidence.
+  - Nothing left in my queue.
