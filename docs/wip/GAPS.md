@@ -117,7 +117,17 @@
 > and every clone (stock_git_verbs 1 of 8). Lifted when w-git's fetch-side readers (A-855's held answer, brought back and
 > made again) and the push decision's reads bring a let-go window back, with w-shared's red: annotated tags pushed, the
 > push ended, idle, then ls-remote and a clone byte-identical to stock.
-> **PUT BACK (w-git, 2026-11-23, main 01a20182's r165):** the lift below broke git/git's mirror clone after the push:
+> **LIFTED AGAIN (w-git, 2026-11-23, main 01a20182's order after r165):** `vcs_store::LANDED_LET_GO` on, one switch for
+> a commit's let-go and a recovery's or rebuild's (w-shared's `put_changeset`): the commit owes its pack and the push's
+> end or the repository's idle give-back lets it go a slice a turn (3e1588a54, the quantum alone ending a slice), every
+> read of a let-go window stopping at a unit boundary and brought back (0c3f42cea, 7f7793c58). Red over the edge:
+> `a_pushed_pack_is_let_go_by_its_commit_in_slices_and_a_clone_after_is_whole` (two shards, a 3 MiB file's pack of many
+> windows, nothing let go by hand: bytes let go in slices, the clone and a clone one commit deep each pushed object's
+> bytes, `ls-refs` `HEAD` at the commit; 0 bytes let go with the switch off) and over SSH (r165's `clone-ssh` and
+> `shallow` rows): `a_pushed_pack_let_go_by_its_commit_is_cloned_whole_and_shallow_over_ssh`, the client giving its
+> window back as OpenSSH's does (a 3 MiB answer past its 1 MiB window). Owed: main's git/git whole A/B (push no slower than the guard, clones
+> whole and byte-identical, `let_go_past_quantum` in release); an `Unreadable` or a refused fetch puts it back.
+> **PUT BACK (w-git, 2026-11-23, main 01a20182's r165; lifted again above):** the lift below broke git/git's mirror clone after the push:
 > refused `Pack(Store(Unreadable { id: sha1:e11e53618242d5dbeeab1ff15707c7ec88c907cc }))` 16,270,345 bytes in
 > (`parts_copied=2`, `entries_judged=3712`), stock git's "possible repository corruption on the remote side": a fetch
 > path still reads a let-go window without bringing it back. `vcs_store::commit` lets nothing go again; the harness of

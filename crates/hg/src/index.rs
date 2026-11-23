@@ -768,7 +768,7 @@ impl HgIndex {
     store: &mut ContentStore,
     log: Log<'_>,
     group: &[NewRevision],
-    (previous, given): (Option<(&Node, &'t [u8])>, &[(Node, &'t [u8])]),
+    (previous, given): (Option<(&Node, &'t [u8])>, GivenTexts<'_, 't>),
   ) -> Result<Vec<u32>, Refused> {
     let (revs, mut planned) = self.planned(store, log, group.iter())?;
     let previous = match (log, planned.first()) {
@@ -1085,11 +1085,17 @@ const WHOLE: Stored = (NONE, 0, 0);
 /// within the text's own length, so a text is rebuilt from at most its own length of deltas over the whole text it rests
 /// on (7.2's `deltas.py` refuses a delta longer than its text by the same bound). The puts' holds, for the caller to
 /// give back once the rows hold their contents.
+/// The texts a push already holds for a group's rows, by node, as the intake handed them (no copy read back).
+type GivenTexts<'g, 't> = &'g [(Node, &'t [u8])];
+
+/// The row a group's first delta applies to: its revision, its text, and its stored length.
+type KeptPrevious<'t> = Option<(u32, Cow<'t, [u8]>, u64)>;
+
 fn kept_as<'t>(
   store: &mut ContentStore,
   log: Log<'_>,
   planned: &mut [Planned],
-  (mut previous, given): (Option<(u32, Cow<'t, [u8]>, u64)>, &[(Node, &'t [u8])]),
+  (mut previous, given): (KeptPrevious<'t>, GivenTexts<'_, 't>),
 ) -> Result<Vec<ContentId>, Refused> {
   let mut puts = Vec::new();
   for row in planned.iter_mut() {
