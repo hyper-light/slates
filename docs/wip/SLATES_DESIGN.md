@@ -58685,10 +58685,11 @@ with a peer still mapping them; BENCHMARKS "Content give-back per platform").
   of each under a new hold kind, `WHAT_CONTENT_EXTENT` (one handle, the extent's id as its record), bounded in a class of
   its own (`HoldBounds::extents`, `DaemonConfig::held_extent_bound`, partitions × 64). The daemon keeps one table of
   section handles for the process (`crate::content_extents`, atomic words written only by the holder of an extent's
-  owner word), made at its start before any claim and held by each shard's start; a claim takes only a made and held
-  extent and maps a duplicate committed whole; a release closes the table's handle and has the anchor let its duplicate
-  go, which closes the section, then makes and holds the extent again. A successor places the extents the handoff
-  table hands back before any shard claims.
+  owner word), made at its start before any claim and held by the control loop before it answers a claim (since
+  2026-11-23; each shard's start held its own slice before, below); a claim takes only a made and held extent and maps a
+  duplicate committed whole; a release closes the table's handle and has the anchor let its duplicate go, which closes
+  the section, then makes and holds the extent again. A successor places the extents the handoff table hands back
+  before any shard claims.
 - Why: a released extent was a range of the anchor's one content object. Its pages stayed in the object: a page given
   back with `MADV_FREE_REUSABLE` only leaves the footprint, and stayed resident 10 s under pressure. A 256 MiB burst's
   volume destroyed left the object at 259 MiB and the process at 1,362 MiB (adas-macbook-pro-2).
@@ -58700,6 +58701,30 @@ with a peer still mapping them; BENCHMARKS "Content give-back per platform").
 - After: the same burst's volume destroyed left the object at 0 MiB and the process at 123 MiB.
 - Open: the content object still reserves each slice's arena range of address space; free pages inside a held extent
   still only leave the footprint.
+- **Held before the first claim, and the remake window (w-win2 for main 01a20182, 2026-11-23; main's rulings of the
+  day).** Each shard's start spawned its slice's holds as a task and the daemon answered claims at once, so a create
+  the moment it served met its extents made but not yet held, and was refused `BudgetExceeded` with the pool's count
+  of every free extent, held or not, as its room: every Node SDK sync suite on CI's Windows runners (diag run
+  45238179939: 2 of 25 extents held when the first create came, the holds taking 117.5 ms on windows-latest; 1 of 22
+  and 141.9 ms on windows-11-arm). Now:
+  - The control loop, which answers every claim, has the anchor hold every extent before its first
+    (`content_extents::hold_before_serving`, right after the loop's `boot_before_claims`), each hold one exchange
+    within the learned answer bound (A-552). Not in a shard's start: that runs alone (`spawn_alone`), so the
+    holds' exchanges, tasks of the same shard, could not run there, and the daemon never served (diag run
+    45251289894).
+  - The pool counts as free only the extents a claim can take (`content_pool::claimable_now`, the rule `best_fit`
+    keeps), and the free ones being made again after a release as pending (`ExtentSource::pending`).
+  - A bounded create refused for room that only those remakes would make is parked, not refused (`crate::room_wait`,
+    on `crate::lease_wait`'s pattern). It runs again as each remake ends, told across shards while any waits. Its
+    deadline is one remake's bound, its two exchanges at the learned answer bound, for each remake in flight when it
+    parked. A create that would not fit even then is refused at once with the room there is.
+  - Held by `a_create_the_moment_the_daemon_serves_is_admitted_on_windows` and
+    `a_create_during_the_released_extents_remakes_waits_for_them_on_windows`, on a real one-shard anchor; red with the
+    fix reversed and green with it on both runners (diag run 45260798132, the first create refused `BudgetExceeded { available: 5722144768 }` on windows-latest (5,720,506,368 on windows-11-arm) and the create during the remakes refused `{ available: 5713756160 }` (5,712,117,760) with the fix reversed, both admitted with it, and the Node SDK suites 8 of 8 on both). Applied in the same change to:
+    `crates/server/src/content_extents_windows.rs`, `content_pool.rs`, `room_wait.rs` (new), `daemon.rs`, `verbs.rs`,
+    `lease_wait.rs`, `state.rs`, `crates/mem/src/arena.rs`, `crates/vfs/src/volume.rs`, the CLI test, CI's Windows
+    lanes (the extents file run for the first time), GAPS (A-789),
+    `docs/bugs/2026-11-23-a-windows-daemons-first-create-met-its-extents-unheld.md`.
 
 ### A-839 — On macOS a shard's content slice reserves nothing for its arena (2026-11-21, w-sizing; the sweep's conversions, largest first; A-789)
 Applied in the same change to: `crates/server/src/config.rs` (`shard_content_layout`: the stride ends where the arena's

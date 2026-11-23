@@ -120,6 +120,8 @@ mod moves;
 mod readmission;
 mod refining;
 mod remote_attach;
+// Creates parked for the room an extent's remake owes them (A-789, Windows).
+mod room_wait;
 mod work_home;
 // The writes acknowledged since the last publication, kept in anchor RAM (A-63): a FUSE mount's (Linux) and a Shards
 // stream's (every platform; A-316, A-339, A-402).

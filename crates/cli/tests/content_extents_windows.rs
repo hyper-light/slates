@@ -102,42 +102,12 @@ impl Drop for AnchorProcess {
 /// Starts `slates anchor` for `instance`, waits for its daemon to serve and answer verbs steadily, and bootstraps the
 /// node; the anchor's stderr is echoed throughout, so it never blocks on a full pipe.
 fn start_anchor(instance: &str) -> AnchorProcess {
-  let mut child = slates()
-    .args([
-      "--instance",
-      instance,
-      "anchor",
-      "--quick",
-      "--shards",
-      SHARDS,
-    ])
-    .stdout(Stdio::null())
-    .stderr(Stdio::piped())
-    .spawn()
-    .unwrap();
-  let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
-  let serving = format!("{SERVING_LINE}{instance} serving on ");
-  let mut line = String::new();
-  loop {
-    line.clear();
-    let read = stderr.read_line(&mut line).unwrap();
-    assert!(read > 0, "the anchor ended before its daemon served");
-    eprint!("{line}");
-    if line.starts_with(&serving) {
-      break;
-    }
-  }
-  let drain = std::thread::spawn(move || {
-    let mut line = String::new();
-    while stderr.read_line(&mut line).is_ok_and(|read| read > 0) {
-      eprint!("{line}");
-      line.clear();
-    }
-  });
-  let anchor = AnchorProcess {
-    child,
-    drain: Some(drain),
-  };
+  start_anchor_of(instance, SHARDS)
+}
+
+/// [`start_anchor`] with `shards` shards.
+fn start_anchor_of(instance: &str, shards: &str) -> AnchorProcess {
+  let anchor = spawn_anchor(instance, shards);
   let started = Instant::now();
   let mut streak = 0u32;
   while streak < STABLE_STREAK {
@@ -155,6 +125,154 @@ fn start_anchor(instance: &str) -> AnchorProcess {
   let (code, _, err) = run(instance, &["bootstrap", "root"]);
   assert_eq!(code, 0, "bootstrap: {err}");
   anchor
+}
+
+/// Starts `slates anchor` for `instance` with `shards` shards and returns the moment its daemon's serving line is read,
+/// within [`START_BOUND`]; the anchor's stderr is echoed throughout, so it never blocks on a full pipe, and a daemon
+/// that never serves fails the test at the bound with its stderr above it.
+fn spawn_anchor(instance: &str, shards: &str) -> AnchorProcess {
+  let mut child = slates()
+    .args([
+      "--instance",
+      instance,
+      "anchor",
+      "--quick",
+      "--shards",
+      shards,
+    ])
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+  let serving = format!("{SERVING_LINE}{instance} serving on ");
+  let (served, serves) = std::sync::mpsc::channel::<()>();
+  let drain = std::thread::spawn(move || {
+    let mut line = String::new();
+    while stderr.read_line(&mut line).is_ok_and(|read| read > 0) {
+      eprint!("{line}");
+      if line.starts_with(&serving) {
+        let _ = served.send(());
+      }
+      line.clear();
+    }
+  });
+  let anchor = AnchorProcess {
+    child,
+    drain: Some(drain),
+  };
+  assert!(
+    serves.recv_timeout(START_BOUND).is_ok(),
+    "{instance}'s daemon served within {START_BOUND:?} (the anchor's and daemon's stderr is above)"
+  );
+  anchor
+}
+
+/// Shape: the bound on one test's whole run under its anchor, past any healthy run: a start ([`START_BOUND`]) and as
+/// long again for its verbs.
+const TEST_BOUND: Duration = Duration::from_secs(2 * START_BOUND.as_secs());
+
+/// A test's bound (main 01a20182's ask of 2026-11-23): past [`TEST_BOUND`] the anchor is killed, which ends its daemon
+/// through its job, so a step blocked on the daemon (a claim waits while its holder lives) returns and the test fails
+/// at that step, named, rather than holding the run; the anchor's and daemon's stderr is echoed above. Dropped at the
+/// test's end, it lets the anchor be.
+struct Bounded {
+  done: Option<std::sync::mpsc::Sender<()>>,
+  watcher: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Bounded {
+  /// Watches `anchor` for the test named `test`.
+  fn over(anchor: &AnchorProcess, test: &'static str) -> Bounded {
+    let pid = anchor.child.id();
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    let watcher = std::thread::spawn(move || {
+      if matches!(
+        finished.recv_timeout(TEST_BOUND),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+      ) {
+        eprintln!(
+          "{test} passed its bound of {TEST_BOUND:?}: its anchor (pid {pid}) is killed, and its daemon with it"
+        );
+        end_quietly(pid);
+      }
+    });
+    Bounded {
+      done: Some(done),
+      watcher: Some(watcher),
+    }
+  }
+}
+
+impl Drop for Bounded {
+  fn drop(&mut self) {
+    drop(self.done.take());
+    if let Some(watcher) = self.watcher.take() {
+      let _ = watcher.join();
+    }
+  }
+}
+
+/// Terminates process `pid` if it still runs: nothing when it has gone already.
+fn end_quietly(pid: u32) {
+  use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+  use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+  // SAFETY: only termination is asked for, nothing inherited; a pid already gone opens nothing.
+  let process = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+  if process.is_null() {
+    return;
+  }
+  // SAFETY: the unique owned handle OpenProcess just returned.
+  let process = unsafe { OwnedHandle::from_raw_handle(process) };
+  // SAFETY: `process` stays owned for the call; a refusal (the process ending meanwhile) leaves nothing to do.
+  let _ = unsafe { TerminateProcess(process.as_raw_handle(), 1) };
+}
+
+/// A client of `instance`'s daemon, connected under the deadlines a client derives.
+fn client_of(instance: &str) -> slates_client::Client {
+  let deadlines = slates_client::Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get();
+  slates_client::Client::connect(instance, deadlines).unwrap()
+}
+
+/// Bootstraps the node `client` reaches as its root, as `slates bootstrap root` does.
+fn bootstrap_root(client: &mut slates_client::Client) {
+  let member = client.daemon_status().unwrap().fleet.host;
+  let reply = client
+    .call(&slates_ipc::protocol::RequestBody::Bootstrap { root: true, member })
+    .unwrap();
+  assert_eq!(
+    reply,
+    slates_ipc::protocol::ReplyBody::Acknowledged,
+    "bootstrap"
+  );
+}
+
+/// A bounded scratch volume named `name` of `limit` bytes.
+fn bounded(name: &str, limit: u64) -> slates_client::CreateSpec {
+  slates_client::CreateSpec {
+    name: name.to_owned(),
+    size: slates_client::SizeClass::Bounded { limit },
+    names: slates_client::NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  }
+}
+
+/// The count of `kind` over every shard of the daemon `client` reaches.
+fn refusal_count(client: &mut slates_client::Client, kind: &str) -> u64 {
+  client
+    .daemon_status()
+    .unwrap()
+    .shards
+    .iter()
+    .flat_map(|shard| shard.refusals.iter())
+    .filter(|counted| counted.kind == kind)
+    .map(|counted| counted.count)
+    .sum()
 }
 
 /// The system's commit charge, bytes: what Windows has promised backing for (`GlobalMemoryStatusEx`: the page file's
@@ -315,5 +433,91 @@ fn a_content_extent_outlives_a_killed_daemon_on_windows() {
   assert!(
     read == bytes,
     "the file reads back byte for byte after the daemon's death"
+  );
+}
+
+/// Shape: the bounded volume the first-create test makes, the size the Node SDK suites' first create asks for.
+const FIRST_CREATE: u64 = 8 << 20;
+
+/// A-789 on Windows. Do: start a real anchor of one shard, as the Node SDK suites do, and the moment its daemon's
+/// serving line is read connect a client, bootstrap the node and create a bounded volume. Expect: created. Until
+/// 2026-11-23 the daemon served while the anchor was still taking its extents' holds, one exchange each, and a claim
+/// takes only a held extent, so the create was refused `BudgetExceeded`, its `available` naming the whole pool
+/// (5,722,144,768 bytes on CI's windows-latest, with 2 of 25 extents held; diag run 45238179939).
+#[test]
+fn a_create_the_moment_the_daemon_serves_is_admitted_on_windows() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!("skipping the Windows first-create flow: set SLATES_TEST_CLI=1 to run it");
+    return;
+  }
+  let instance = format!("cli-extent-first-{}", std::process::id());
+  let anchor = spawn_anchor(&instance, "1");
+  let bounded_run = Bounded::over(&anchor, "the first-create test");
+  let mut client = client_of(&instance);
+  bootstrap_root(&mut client);
+  let created = client.create(&bounded("first", FIRST_CREATE));
+  drop(client);
+  drop(bounded_run);
+  drop(anchor);
+  assert!(created.is_ok(), "the first create: {created:?}");
+}
+
+/// Shape: the share of the daemon's room the released volume takes, in quarters: three, so its extents hold more room
+/// than the pool keeps ready while they are made again.
+const RELEASED_QUARTERS: u64 = 3;
+
+/// A-789 on Windows, the remake window (main 01a20182's ruling of 2026-11-23). Do: under a real anchor of one shard,
+/// steady, learn the daemon's room from a create past it; create a volume of three quarters of that room and destroy
+/// it; once its teardown has ended (the volume gone from the list), create a small volume, whose publication gives the
+/// destroyed volume's extents back to the pool, each then closed and made again through two anchor exchanges; and at
+/// once create the large size again. Expect: the large create admitted, having waited for the remakes
+/// (`room.wait.parked`). Until 2026-11-23 the pool counted an extent being made again as free though no claim could
+/// take it, and the create was refused `BudgetExceeded`. (A create sent at once after the destroy meets its teardown,
+/// which holds the volume's reservation past the destroy's answer: item 3b's case, on every platform.)
+#[test]
+fn a_create_during_the_released_extents_remakes_waits_for_them_on_windows() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!("skipping the Windows remake-window flow: set SLATES_TEST_CLI=1 to run it");
+    return;
+  }
+  let instance = format!("cli-extent-remake-{}", std::process::id());
+  let anchor = start_anchor_of(&instance, "1");
+  let bounded_run = Bounded::over(&anchor, "the remake-window test");
+  let mut client = client_of(&instance);
+  let room = match client.create(&bounded("past-the-room", u64::MAX >> 1)) {
+    Err(slates_client::ClientError::Refused(slates_client::Refusal::BudgetExceeded {
+      available,
+    })) => available,
+    other => panic!("a create past the daemon's room is refused BudgetExceeded: {other:?}"),
+  };
+  let size = room / 4 * RELEASED_QUARTERS;
+  let released = client.create(&bounded("released", size)).unwrap();
+  client.destroy(released).unwrap();
+  let destroyed = Instant::now();
+  while client
+    .list()
+    .unwrap()
+    .iter()
+    .any(|volume| volume.name == "released")
+  {
+    assert!(
+      destroyed.elapsed() < START_BOUND,
+      "the destroyed volume's teardown ended within {START_BOUND:?}"
+    );
+    pause();
+  }
+  client.create(&bounded("publishes", FIRST_CREATE)).unwrap();
+  let again = client.create(&bounded("again", size));
+  let parked = refusal_count(&mut client, "room.wait.parked");
+  drop(client);
+  drop(bounded_run);
+  drop(anchor);
+  assert!(
+    again.is_ok(),
+    "a create of {size} bytes while the destroyed volume's extents are made again ({room} bytes of room): {again:?}"
+  );
+  assert!(
+    parked > 0,
+    "the create waited for the released extents' remakes (room.wait.parked {parked})"
   );
 }

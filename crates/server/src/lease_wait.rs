@@ -83,8 +83,9 @@ fn key(origin: u64, id: RequestId) -> (u64, u32, u32) {
   (origin, id.client, id.sequence)
 }
 
-/// The most verbs a shard parks: its client credit (`clients_per_shard × slots`).
-fn bound(state: &ShardState) -> usize {
+/// The most verbs a shard parks: its client credit (`clients_per_shard × slots`). `crate::room_wait` parks its creates
+/// under the same bound.
+pub(crate) fn bound(state: &ShardState) -> usize {
   state
     .config
     .clients_per_shard
