@@ -1383,3 +1383,51 @@ fn assert_a_merge_retires_a_line(unbundle: &Unbundle) {
     }]
   );
 }
+
+/// Goal 93 (changeset evolution; 7.2's `obsstore.add` compares the tuples its readers make, whatever format a marker
+/// came in). Do: over a view holding a marker in format 1, push the same marker as 7.2 writes it in format 0, twice
+/// over, once in each format. Expect nothing kept and the reply 0: it is the marker the repository holds. Red before:
+/// a marker was compared as its format's fields, so the format 0 copy was kept as a second marker.
+#[test]
+fn a_held_marker_in_the_other_format_is_not_kept_again() {
+  let held = marker_payload(&[2; 20], &[3; 20]);
+  let decoded = obsmarkers::decode(&held).unwrap();
+  let mut as_v0 = Vec::new();
+  crate::marker_tuple::Tuple::of(&decoded.iter().next().unwrap())
+    .unwrap()
+    .encode(Format::V0, &mut as_v0)
+    .unwrap();
+  let view = View {
+    markers: vec![held.clone()],
+    ..two()
+  };
+  let unbundle = Unbundle {
+    parts: vec![
+      part(0, Asks::Obsmarkers(as_v0)),
+      part(1, Asks::Obsmarkers(held)),
+    ],
+  };
+  let plan = classify(
+    &unbundle,
+    (&[] as &[Arrived], &[]),
+    &view,
+    (&line_at_b(), &[]),
+    false,
+    &mut room(),
+  )
+  .unwrap();
+  assert!(plan.markers.is_empty(), "{:?}", plan.markers);
+  assert_eq!(
+    plan.replied,
+    vec![
+      Replied::Obsmarkers {
+        in_reply_to: 0,
+        new: 0
+      },
+      Replied::Obsmarkers {
+        in_reply_to: 1,
+        new: 0
+      },
+    ]
+  );
+}

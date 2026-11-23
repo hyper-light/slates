@@ -9,7 +9,9 @@ use slates_land::store_root::StoreRoot;
 use slates_store::log::{ChangesetLog, SectionKind, Tool};
 use slates_store::store::{LOG_FILE, Store};
 
-use crate::test_store::{SIZING, TestStore, root, routed_create};
+use crate::test_store::{
+  SIZING, TestStore, created_subversion, file_work, landed_work, root, routed_create,
+};
 
 use crate::{Daemon, SegmentSource};
 
@@ -556,87 +558,6 @@ fn anchor_of(instance: &str) -> (slates_anchor::AnchorSegment, slates_ipc::HeldR
   .with_content(&format!("{instance}-con"), config.content_bytes())
   .unwrap();
   (segment, slates_ipc::HeldRendezvous::hold(instance).unwrap())
-}
-
-/// Creates Subversion repository `name` on `daemon`'s one shard through a client's request, waiting for its creation to
-/// land on the store and be recorded (A-767 item 7's one order).
-fn created_subversion(daemon: &Daemon, name: &str) -> RepositoryId {
-  let asked = (name, VcsTool::Subversion, ObjectFormat::Revisions, "trunk");
-  crate::test_store::create_on(daemon, 0, &owner(), asked).0
-}
-
-/// A client's work on revision `head` setting `/trunk/a.txt` to `bytes` (`action`: add or modify), `/trunk` added with
-/// it at revision 0, with its text held as a commit's sink holds it.
-fn file_work(
-  head: u64,
-  action: slates_svn::index::Action,
-  bytes: &[u8],
-) -> (
-  slates_svn::commit::drive::Work,
-  slates_svn::commit::drive::HeldTexts,
-) {
-  use slates_svn::commit::drive::TextSink;
-  use slates_svn::index::{Action, ChangedPath, NodeKind};
-  let text = slates_svn::commit::drive::text_of(bytes).unwrap();
-  let texts = slates_svn::commit::drive::HeldTexts::new();
-  let staged = texts.stage(None).unwrap();
-  texts.append(staged, bytes).unwrap();
-  texts.seal(staged, text.identity).unwrap();
-  let mut changes = Vec::new();
-  if head == 0 {
-    changes.push(ChangedPath {
-      path: "/trunk".to_owned(),
-      action: Action::Add,
-      kind: NodeKind::Directory,
-      copy_from: None,
-      text: None,
-      properties: None,
-      mergeinfo_modified: false,
-    });
-  }
-  changes.push(ChangedPath {
-    path: "/trunk/a.txt".to_owned(),
-    action,
-    kind: NodeKind::File,
-    copy_from: None,
-    text: Some(text),
-    properties: None,
-    mergeinfo_modified: false,
-  });
-  let work = slates_svn::commit::drive::Work {
-    head,
-    record: slates_svn::index::RevisionRecord {
-      transaction: format!("{head}-1"),
-      changes,
-    },
-    lock_entries: Vec::new(),
-    revision_properties: vec![(b"svn:log".to_vec(), format!("r{}", head + 1).into_bytes())],
-    texts: std::iter::once(text.identity).collect(),
-    property_lists: std::collections::BTreeMap::new(),
-    locks: slates_svn::lock::CommitLocks::default(),
-  };
-  (work, texts)
-}
-
-/// Lands `work` on `repository` through the client's commit landing (`svn_commit::land_work`), as a task on `daemon`'s
-/// shard: the revision it committed, or why not.
-fn landed_work(
-  daemon: &Daemon,
-  repository: RepositoryId,
-  head: u64,
-  (action, bytes): (slates_svn::index::Action, Vec<u8>),
-) -> Result<u64, super::svn_commit::Uncommitted> {
-  crate::test_store::run_on_first(
-    daemon,
-    move || async move {
-      let (work, texts) = file_work(head, action, &bytes);
-      super::svn_commit::land_work((&owner(), repository), work, &texts)
-        .await
-        .unwrap()
-        .map(|committed| committed.revision)
-    },
-    std::time::Duration::from_secs(60),
-  )
 }
 
 /// Everything recovery must make again of `repository`: its records whole as they print, their youngest revision, its

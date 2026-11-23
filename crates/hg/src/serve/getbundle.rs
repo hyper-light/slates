@@ -57,14 +57,14 @@ use super::{Refusal, Repository, Rev, RevSet, node_of, parents_of};
 use crate::bundle2::{Bundle2, Event, Param, Part};
 use crate::capabilities::{self, Bundle2Capabilities};
 use crate::changegroup::{self, Revision, Version};
-use crate::obsmarkers::{self, Format, Marker};
+use crate::marker_tuple::Tuple;
+use crate::obsmarkers::{self, Format};
 use crate::out::{Measure, Out};
 use crate::read::to_u64;
 use crate::{
   Admission, NULL_NODE, Node, PastAdmission, bookmarks, changeset, delta, manifest, phases,
   pushkey, quote,
 };
-use core::cmp::Ordering;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -550,8 +550,8 @@ fn phases_part(
   })
 }
 
-/// The `OBSMARKERS` part: the markers relevant to the heads' ancestors in the newest format both read; none where
-/// there are none.
+/// The `OBSMARKERS` part: the markers relevant to the heads' ancestors in the newest format both read, each written
+/// from 7.2's tuple of it, whatever format it was received in (`encodemarkers`); none where there are none.
 fn markers_part(
   store: &impl Store,
   heads: &[Rev],
@@ -569,10 +569,22 @@ fn markers_part(
     .ok_or(Refusal::NoCommonExchange {
       what: "obsolescence marker format",
     })?;
-  let len = obsmarkers::encoded_len(format, &markers).map_err(|_| unencodable("a marker"))?;
+  let mut len = 1_u64;
+  for marker in &markers {
+    len = len.saturating_add(
+      marker
+        .marker_len(format)
+        .map_err(|_| unencodable("a marker"))?,
+    );
+  }
   admission.charge(len)?;
-  let mut payload = Vec::new();
-  obsmarkers::encode(format, &markers, &mut payload).map_err(|_| unencodable("a marker"))?;
+  let mut payload = Vec::with_capacity(usize::try_from(len).unwrap_or_default());
+  payload.push(obsmarkers::header(format));
+  for marker in &markers {
+    marker
+      .encode_marker(format, &mut payload)
+      .map_err(|_| unencodable("a marker"))?;
+  }
   Ok(Some(Built {
     kind: b"OBSMARKERS",
     mandatory: Vec::new(),
@@ -1895,14 +1907,19 @@ fn no_manifest() -> Refusal {
   }
 }
 
-/// The markers relevant to the ancestors of `heads` (`obsstore.relevantmarkers`), sorted.
+/// The markers relevant to the ancestors of `heads` (`obsstore.relevantmarkers`), sorted, each as 7.2 holds it (a
+/// format 0 marker's parents are in its metadata; [`Tuple`]).
 fn relevant_markers<'s>(
   store: &'s impl Store,
   heads: &[Rev],
   admission: &mut Admission,
-) -> Result<Vec<Marker<'s>>, Refusal> {
-  let all: Vec<Marker<'s>> = store.markers().collect();
-  admission.charge_items::<Marker<'_>>(all.len())?;
+) -> Result<Vec<Tuple<'s>>, Refusal> {
+  admission.charge_items::<Tuple<'_>>(store.markers().count())?;
+  let all: Vec<Tuple<'s>> = store
+    .markers()
+    .map(|marker| Tuple::of(&marker))
+    .collect::<Result<_, _>>()
+    .map_err(|_| unencodable("a marker whose timezone is past 64 bits"))?;
   if all.is_empty() {
     return Ok(Vec::new());
   }
@@ -1940,41 +1957,15 @@ fn relevant_markers<'s>(
     seen_nodes.extend(pending.iter().copied());
     found.extend(direct);
   }
-  let mut markers: Vec<Marker<'s>> = found
-    .into_iter()
-    .filter_map(|marker| all.get(marker).copied())
-    .collect();
-  markers.sort_by(marker_order);
-  Ok(markers)
-}
-
-/// 7.2's order of two markers (`obsutil.sortedmarkers`): Python's order of their tuples, field after field, a node
-/// list compared node by node, a date by its seconds (a NaN, which Python never orders, as equal) and then its
-/// timezone, and a marker without parent data as one with none.
-fn marker_order(left: &Marker<'_>, right: &Marker<'_>) -> Ordering {
-  left
-    .predecessor
-    .cmp(right.predecessor)
-    .then_with(|| left.successor_nodes().cmp(right.successor_nodes()))
-    .then_with(|| left.flags.cmp(&right.flags))
-    .then_with(|| left.entries().cmp(right.entries()))
-    .then_with(|| date_order(left, right))
-    .then_with(|| {
-      let right_parents = right.parent_nodes().into_iter().flatten();
-      left.parent_nodes().into_iter().flatten().cmp(right_parents)
-    })
-}
-
-/// Two markers' dates in 7.2's order: seconds, then timezone; a marker that keeps none (format 0) first.
-fn date_order(left: &Marker<'_>, right: &Marker<'_>) -> Ordering {
-  match (left.date, right.date) {
-    (Some(left), Some(right)) => left
-      .seconds()
-      .partial_cmp(&right.seconds())
-      .unwrap_or(Ordering::Equal)
-      .then_with(|| left.offset_minutes.cmp(&right.offset_minutes)),
-    (left, right) => left.is_some().cmp(&right.is_some()),
+  let mut markers: Vec<Tuple<'s>> = Vec::with_capacity(found.len());
+  let mut all: Vec<Option<Tuple<'s>>> = all.into_iter().map(Some).collect();
+  for at in found {
+    if let Some(marker) = all.get_mut(at).and_then(Option::take) {
+      markers.push(marker);
+    }
   }
+  markers.sort_by(Tuple::order);
+  Ok(markers)
 }
 
 /// The markers by the nodes that make them relevant: a successor; a prune's predecessor; a prune's parent.
@@ -1989,7 +1980,7 @@ struct MarkerIndex<'m> {
 
 impl<'m> MarkerIndex<'m> {
   /// Indexes `markers`.
-  fn new(markers: &[Marker<'m>]) -> Self {
+  fn new(markers: &'m [Tuple<'_>]) -> Self {
     let mut index = Self {
       by_successor: BTreeMap::new(),
       prunes_of: BTreeMap::new(),

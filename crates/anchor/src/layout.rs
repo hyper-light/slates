@@ -22,10 +22,13 @@ pub const MAGIC: u32 = 0x4E41_4C53;
 /// a snapshot hold the identity and length its encoding is held under in the owner shard's content store (A-579's last
 /// step, on chain entry format 6's rule, 2026-11-21), 17 a slice's pool extents a run doubling from one unit before the
 /// rest's binary parts, so an extent id names another range of the content object (A-848, 2026-11-21), 18 the pool
-/// region a want word a partition after its owner words (A-853, 2026-11-21). An older segment is refused, never
-/// misread.
+/// region a want word a partition after its owner words (A-853, 2026-11-21), 19 a green's head identity hashes each
+/// file's path, length and plain BLAKE3, not its bytes (A-873, A-760 (b) piece 4a, 2026-11-23): every identity a
+/// segment of 18 records (chain entries, checkpoints' head checks, merge records, the ledger) was made under the other
+/// rule, and would fence the green it names as diverged, so the segment is refused at adoption. An older segment is
+/// refused, never misread.
 /// Format: this layout's number in the history above.
-pub const LAYOUT_VERSION: u32 = 18;
+pub const LAYOUT_VERSION: u32 = 19;
 /// Format: the layout before A-237's host-scoped principals, refused with what to do about it.
 pub const LAYOUT_BEFORE_HOST_SCOPED_PRINCIPALS: u32 = 4;
 /// Format: one content-pool extent's owner word (A-98): 0 while the extent is free, else its owning partition plus

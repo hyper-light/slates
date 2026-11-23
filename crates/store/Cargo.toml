@@ -21,6 +21,8 @@ slates-land = { workspace = true }
 slates-rt = { workspace = true }
 # The owner's one line when its store cannot open or its checkpoint fails, so the reason is never lost (goal 93).
 slates-machine = { workspace = true }
+# The mapped allocation's floor, the length of the chunks the text cache lays its texts in (`texts.rs`, goal 93).
+slates-mem = { workspace = true }
 
 [dev-dependencies]
 # The per-path read form's example reads Mercurial's own history through slates-hg's revlog reader.
