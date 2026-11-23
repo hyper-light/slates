@@ -100,8 +100,8 @@ fn scrub(region: &mut Region, offset: usize, len: usize) {
 /// to one arena at a time under a stable id.
 pub trait ExtentSource: Send {
   /// One more extent for this arena, with the id its blocks are named by, or `None` when the pool has none free.
-  /// `want` is the bytes the arena still lacks (A-848): a source holding extents of several lengths hands out the
-  /// smallest that covers it, else its largest, so an arena grows by what its admissions need.
+  /// `want` is the mapping size that can supply the arena's missing capacity in one buddy region (A-848).
+  /// A source with several sizes hands out the smallest mapping that covers it, or its largest available.
   fn claim(&mut self, want: usize) -> Option<(u16, Region)>;
   /// Returns extent `id`, wholly free, to the pool.
   fn release(&mut self, id: u16, region: Region);
@@ -329,19 +329,28 @@ impl ChunkArena {
     self.source = Some(source);
   }
 
-  /// Draws extents from the source until at least `bytes` of capacity were added or the source has none: the
-  /// capacity added (A-98). Zero without a source.
+  /// Draws extents until the arena has added `bytes` of usable capacity or the source runs out of
+  /// usable regions. Returns the capacity added (A-98). Several smaller regions can supply one growth.
   pub fn grow(&mut self, bytes: usize) -> usize {
+    if !self.granule.is_power_of_two() {
+      return 0;
+    }
     let mut added = 0usize;
     while added < bytes {
-      let want = bytes.saturating_sub(added);
-      let Some((id, region)) = self.source.as_mut().and_then(|source| source.claim(want)) else {
+      let want = self.block_len(bytes - added).unwrap_or(usize::MAX);
+      let Some(source) = self.source.as_mut() else {
         break;
       };
+      let Some((id, region)) = source.claim(want) else {
+        break;
+      };
+      if region.len() < self.granule {
+        source.release(id, region);
+        break;
+      }
       let before = self.capacity();
       if self.add_region_at(id, region).is_err() {
-        // A source that hands out an id this arena holds, or a region under a granule, is refused; the claim is
-        // not the arena's to keep, and the pool sees no release for it, so stop rather than spin.
+        // A source that reissues a held id has broken exclusive ownership. Releasing that id would free a live region.
         break;
       }
       // A new region holds no block, so nothing of it is locked until a block is allocated there.
@@ -434,13 +443,13 @@ impl ChunkArena {
     returned
   }
 
-  /// [`ChunkArena::shrink`], and then each wholly free region it kept only for `keep_bytes` traded for the smallest
-  /// extent its source holds that covers the shortfall returning it leaves (A-848's best fit): the smaller extent claimed
-  /// first, the region returned after, so the capacity never falls under `keep_bytes`. The capacity returned, net of what
-  /// was claimed. A region the source has no smaller extent for is kept. Main's ruling of 2026-11-22: a shard whose 256
-  /// MiB burst grew its arena by a 1 GiB extent kept that extent whole after the volume was destroyed, for 10 MiB of
-  /// operation headroom (`a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone`). Only the idle give-back
-  /// trades: a refused growth's rollback ([`ChunkArena::make_room`]) claims nothing.
+  /// After [`ChunkArena::shrink`], trades each wholly free region kept only for `keep_bytes` for the smallest extent
+  /// whose usable buddy capacity covers the shortfall (A-848). It claims that extent before returning the old region
+  /// so capacity stays at or above `keep_bytes`. Returns the net capacity given back.
+  ///
+  /// A 256 MiB burst left the shard holding a whole 1 GiB extent for 10 MiB of operation headroom after destroy
+  /// (2026-11-22, `a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone`). Only the idle give-back trades.
+  /// A refused growth's rollback uses [`ChunkArena::shrink`].
   pub fn shrink_trading(&mut self, keep_bytes: usize) -> usize {
     let mut returned = self.shrink(keep_bytes);
     let idle: Vec<u16> = self
@@ -486,14 +495,16 @@ impl ChunkArena {
     returned
   }
 
-  /// Claims from the source an extent that covers `want` and is smaller than `than`, and holds it: its id and the
-  /// capacity it added, or `None` (an extent no smaller is given straight back, unused).
+  /// Claims a smaller extent whose buddy can supply `want` bytes and returns its id and usable capacity.
   fn claim_smaller(&mut self, want: usize, than: usize) -> Option<(u16, usize)> {
-    let (id, region) = self.source.as_mut()?.claim(want)?;
-    if region.len() >= than || region.len() < want {
-      if let Some(source) = self.source.as_mut() {
-        source.release(id, region);
-      }
+    let minimum = self.block_len(want)?;
+    if minimum >= than {
+      return None;
+    }
+    let source = self.source.as_mut()?;
+    let (id, region) = source.claim(minimum)?;
+    if region.len() >= than || region.len() < minimum {
+      source.release(id, region);
       return None;
     }
     let before = self.capacity();
@@ -1723,6 +1734,81 @@ mod tests {
     fn available(&self) -> usize {
       self.free.iter().map(|(_, region)| region.len()).sum()
     }
+  }
+
+  /// A best-fit pool whose granule and mapping lengths are expressed in host pages.
+  fn arena_over_mapped_pages(
+    page: usize,
+    granule_pages: usize,
+    mapping_pages: &[usize],
+  ) -> ChunkArena {
+    let mut arena = ChunkArena::new(page * granule_pages);
+    let free = mapping_pages
+      .iter()
+      .enumerate()
+      .map(|(index, pages)| {
+        let id = u16::try_from(index).unwrap();
+        (id, Region::map(page * pages, page, false).unwrap())
+      })
+      .collect();
+    arena.set_source(Box::new(FittingPool { free }));
+    arena
+  }
+
+  /// A-848, §4.2. Three granules of headroom need four usable granules in one buddy region.
+  /// A three-granule mapping can supply only two. The idle trade takes the four-granule mapping.
+  #[test]
+  fn a_pool_claim_for_idle_headroom_uses_the_smallest_usable_extent() {
+    let page = page();
+    let mut arena = arena_over_mapped_pages(page, 1, &[3, 4, 16]);
+    assert_eq!(arena.grow(page * 16), page * 16);
+    let returned = arena.shrink_trading(page * 3);
+    let headroom = arena.alloc(page * 3).unwrap();
+    arena.free(headroom).unwrap();
+    assert_eq!(
+      (returned, arena.capacity()),
+      (page * 12, page * 4),
+      "the four-granule extent serves the allocation and returns the rest"
+    );
+  }
+
+  /// A-98, §4.2. A one-byte request in a two-page-granule arena needs a two-page mapping.
+  /// A further claim offered only a single page leaves that mapping available in the pool.
+  #[test]
+  fn a_pool_claim_for_growth_keeps_a_subgranule_mapping_available() {
+    let page = page();
+    let mut arena = arena_over_mapped_pages(page, 2, &[1, 2]);
+    let first = arena.grow(1);
+    let next = arena.grow(1);
+    assert_eq!(
+      (first, next, arena.claimable()),
+      (page * 2, 0, page),
+      "the first claim supplies one granule and the smaller mapping returns to the pool"
+    );
+    let block = arena.alloc(1).unwrap();
+    arena.free(block).unwrap();
+  }
+
+  /// A-848, §4.2. Grow by three pages when one mapping can serve them. The other mapping
+  /// stays available to another arena, including its tail outside the buddy's usable capacity.
+  #[test]
+  fn a_pool_claim_for_growth_uses_one_extent_when_it_covers_the_request() {
+    let page = page();
+    let mut arena = arena_over_mapped_pages(page, 1, &[3, 4]);
+    let added = arena.grow(page * 3);
+    let block = arena.alloc(page * 3).unwrap();
+    arena.free(block).unwrap();
+    assert_eq!((added, arena.claimable()), (page * 4, page * 3));
+  }
+
+  /// A-98, §4.2. A buddy arena with an invalid granule refuses growth. The pool can still
+  /// supply the mapping it offered to another arena.
+  #[test]
+  fn a_pool_claim_for_an_invalid_granule_preserves_the_pool() {
+    let page = page();
+    let mut arena = arena_over_mapped_pages(page, 3, &[4]);
+    assert_eq!(arena.grow(1), 0);
+    assert_eq!(arena.claimable(), page * 4);
   }
 
   /// Main's ruling of 2026-11-22 (`a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone`: a 1 GiB extent kept
