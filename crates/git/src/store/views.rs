@@ -72,6 +72,8 @@ pub struct IndexedObjects<'a> {
   kept: Kept,
   /// What the view has lent.
   counters: Cell<ViewCounters>,
+  /// Where in its pack the last object asked met a window let go, its repository noting it (A-864's push readers).
+  away: Cell<Option<u64>>,
 }
 
 impl<'a> IndexedObjects<'a> {
@@ -85,6 +87,7 @@ impl<'a> IndexedObjects<'a> {
       refused: Cell::new(None),
       kept: Kept::default(),
       counters: Cell::new(ViewCounters::default()),
+      away: Cell::new(None),
     }
   }
 
@@ -123,6 +126,7 @@ impl receive::Repository for IndexedObjects<'_> {
       count(&self.counters, |counters| &mut counters.lent_again);
       return Some(kept);
     }
+    self.away.set(None);
     let (row, content) = self.repository.indexed(self.store, id)?;
     // A window the store lends is lent again with no copy; one it copies out, or one read where it lies in its pack,
     // is kept below, as an assembled object is.
@@ -136,16 +140,24 @@ impl receive::Repository for IndexedObjects<'_> {
     if !self.charge(row.len.saturating_add(kept_overhead())) {
       return None;
     }
-    let bytes = self
-      .repository
-      .read_stored(self.store, &stored, row.len)?
-      .into_owned();
+    let Some(read) = self.repository.read_stored(self.store, &stored, row.len) else {
+      // A read of a let-go window is noted on the repository, for the push's driver to bring it back.
+      self
+        .away
+        .set(self.repository.peek_waiting().map(|waited| waited.offset));
+      return None;
+    };
+    let bytes = read.into_owned();
     count(&self.counters, |counters| &mut counters.assembled);
     self.kept.keep(*id, row.kind, bytes)
   }
 
   fn holds(&self, id: &ObjectId) -> bool {
     self.repository.object(self.store, id).is_some()
+  }
+
+  fn away(&self) -> Option<u64> {
+    self.away.get()
   }
 }
 

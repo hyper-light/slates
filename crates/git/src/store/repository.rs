@@ -808,6 +808,13 @@ impl Repository {
     self.waiting.take()
   }
 
+  /// The let-go window a read has met and not yet taken ([`Repository::waiting`]), left as it is.
+  pub fn peek_waiting(&self) -> Option<packed::Waited> {
+    let waiting = self.waiting.take();
+    self.waiting.set(waiting);
+    waiting
+  }
+
   /// Notes `waited` as what a step waits for, where none is noted yet ([`Repository::waiting`]): what a caller that took
   /// a step's miss to act on it gives back when another step of its turn is the one its driver brings it back for.
   pub fn wait_for(&self, waited: packed::Waited) {
