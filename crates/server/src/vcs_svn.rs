@@ -85,7 +85,7 @@ use crate::vcs_hooks::{self, CommittedView, HookPoint, LockToken, PendingView};
 use crate::vcs_http::svn::Lent;
 use crate::vcs_http::waits::first_rto_ns;
 use crate::vcs_http::{Bounds, awaited};
-use crate::vcs_store::svn_view::{SvnHold, hold_in, lend_held_in, lend_in};
+use crate::vcs_store::svn_view::{FetchedPiece, SvnHold, hold_in, lend_held_in, lend_in};
 
 /// Counter: a listener the control shard could not keep the state of, or whose task its arena refused.
 const NOT_STARTED: &str = "vcs_svn.not_started";
@@ -741,9 +741,10 @@ struct Conversation {
   /// ([`Connection::fetching`]; A-749, §4.17.1 "A fetch's answer" rule 4): given back as it ends, and before the
   /// conversation moves to another shard.
   held: Option<SvnHold>,
-  /// The text piece a drive waited for and the conversation fetched (C2 stage B part 2), held until the next call has
-  /// read it.
-  fetched: Option<slates_svn::reads::Wanted>,
+  /// The text piece a drive waited for and the conversation fetched (C2 stage B part 2), held while the drive reads on in
+  /// it: given back when the drive waits for another, when the read's answer ends, before the conversation moves to
+  /// another shard, or with the conversation.
+  fetched: Option<FetchedPiece>,
 }
 
 /// The repository a conversation opened: its id and name on the owner shard.
@@ -820,10 +821,7 @@ async fn go_on(stream: TcpStream, mut conversation: Conversation, seat: Seat) {
       Stepped::Elsewhere(found, located) => {
         // A hold is given back on the shard that holds its records, and so is a fetched piece.
         conversation.held = None;
-        if let Some(wanted) = conversation.fetched.take() {
-          let _ =
-            crate::state::with_state(|state| crate::vcs_store::svn_texts::let_go(state, wanted));
-        }
+        conversation.fetched = None;
         migrate(Moving {
           stream: stream.into_owned(),
           conversation,
@@ -853,9 +851,10 @@ async fn step(
   };
   count_since(ANSWER_NS, answering);
   let _ = crate::state::with_state(|state| state.count(ANSWERS, 1));
-  // The piece the last wait fetched was read by this call (C2 stage B part 2).
-  if let Some(wanted) = conversation.fetched.take() {
-    let _ = crate::state::with_state(|state| crate::vcs_store::svn_texts::let_go(state, wanted));
+  // The piece the last wait fetched stays held while the read goes on, since a call reads only a quantum of the
+  // drive's steps in it (goal 93); its answer ended, the piece goes.
+  if !conversation.connection.fetching() {
+    conversation.fetched = None;
   }
   if !out.is_empty() && !written_timed(stream, out).await {
     return Stepped::End;
@@ -895,14 +894,16 @@ async fn follow(
       let Some(repository) = conversation.opened.as_ref().map(|opened| opened.id) else {
         return Stepped::End;
       };
-      // A piece the node's store cannot give ends the conversation: the drive would wait for it again.
+      // The drive moved on from the piece held to another.
+      conversation.fetched = None;
       let fetching = now_ns();
-      let fetched = crate::vcs_store::svn_texts::fetch_piece(repository, wanted).await;
+      let fetched = FetchedPiece::fetch(repository, wanted).await;
       count_since(FETCH_WAIT_NS, fetching);
-      if !fetched {
+      // A piece the node's store cannot give ends the conversation: the drive would wait for it again.
+      let Some(piece) = fetched else {
         return Stepped::End;
-      }
-      conversation.fetched = Some(wanted);
+      };
+      conversation.fetched = Some(piece);
       return Stepped::Go;
     }
     Next::End => return Stepped::End,

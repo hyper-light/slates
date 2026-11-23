@@ -349,6 +349,26 @@ impl<L: StoreLender> UploadCommand<L> {
     Ok(away)
   }
 
+  /// A turn of the answer being written ([`Command::step`]): the windows its next write reads brought back first, then
+  /// one step of the answer ([`UploadCommand::write_answer`]), and, once it is written, every window it brought back
+  /// let go.
+  async fn answer_turn(&mut self) -> Result<Stepped, Refused> {
+    // A-864 piece 2: the windows the next turn reads brought back first, off the turn.
+    if let Some(pack) = self.answer.as_ref().and_then(|made| made.pack_source()) {
+      let reads = L::pack_reads(pack);
+      self.lender.read_ahead(reads, &mut self.resident).await;
+      if reads.next.is_some() {
+        self.lender.let_go_behind(&mut self.resident, reads.next);
+      }
+    }
+    let next = self.write_answer()?;
+    // A-864 piece 3: an answer written lets go every window it brought back.
+    if self.answer.is_none() {
+      self.lender.let_go_behind(&mut self.resident, None);
+    }
+    Ok(Stepped { consumed: 0, next })
+  }
+
   /// Writes one step of the answer, a whole pkt-line's room at most; what follows once it has ended.
   fn write_answer(&mut self) -> Result<Next, Refused> {
     let Self {
@@ -496,20 +516,7 @@ impl<L: StoreLender> Command for UploadCommand<L> {
       self.wait_for_room().await?;
     }
     if self.answer.is_some() {
-      // A-864 piece 2: the windows the next turn reads brought back first, off the turn.
-      if let Some(pack) = self.answer.as_ref().and_then(|made| made.pack_source()) {
-        let reads = L::pack_reads(pack);
-        self.lender.read_ahead(reads, &mut self.resident).await;
-        if reads.next.is_some() {
-          self.lender.let_go_behind(&mut self.resident, reads.next);
-        }
-      }
-      let next = self.write_answer()?;
-      // A-864 piece 3: an answer written lets go every window it brought back.
-      if self.answer.is_none() {
-        self.lender.let_go_behind(&mut self.resident, None);
-      }
-      return Ok(Stepped { consumed: 0, next });
+      return self.answer_turn().await;
     }
     if !self.advertised {
       self.advertised = true;

@@ -29,6 +29,9 @@ static ALLOCATOR: LargeMapped = LargeMapped;
 
 /// Held by each test while it reads the heap's figures: the figures are the process's, so two tests reading at once
 /// would read each other's allocations.
+// D-8 test harness: a lock held in turn by its two owners, `a_pushs_churn_per_changeset_is_its_file_alone` and
+// `a_views_manifest_read_is_one_text`, poison recovered.
+#[allow(clippy::disallowed_types)]
 static ALONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Shape: the changesets after the first, each rewriting one file, in the shorter history; the longer has twice as many,
