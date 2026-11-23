@@ -9818,7 +9818,10 @@
 >   `a_call_to_a_killed_unanchored_daemon_ends_daemon_gone_at_once`). Since 2026-11-23 (w-win) an anchor's going clears
 >   its mark from the header: a client's doorbell keeps a Windows object past the hold, so an anchor that let go inside a
 >   live process had read as the holder for good (`an_anchor_that_lets_go_is_no_holder_though_a_client_maps_the_object`;
->   `docs/bugs/2026-11-23-a-windows-anchor-that-let-go-still-read-as-the-rendezvous-holder.md`). `reconnect_ns` still
+>   `docs/bugs/2026-11-23-a-windows-anchor-that-let-go-still-read-as-the-rendezvous-holder.md`). A claim already
+>   waiting there ends at that going too since 2026-11-23 (w-win2): it looks for the anchor's mark on A-443's doubling
+>   (`a_waiting_claim_under_an_anchor_ends_at_its_going_inside_a_live_process`;
+>   `docs/bugs/2026-11-23-a-windows-claim-waiting-under-an-anchor-that-let-go-waited-on-its-process.md`). `reconnect_ns` still
 >   bounds the waits on a fleet owner's takeover (a request refused for now held for its resend, the pause between resends,
 >   `Client::call_through_transient`), owed to the failover delay the daemon reports. The server's reclaim of a
 >   taken-back map no holder claims (`held_copy::reconnect_budget_ns`, "The holder claims it") mirrored the old

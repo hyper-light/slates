@@ -452,10 +452,11 @@ pub fn connect_as(instance: &str, wanted: u32) -> Result<Connected, IpcError> {
 /// owner's bootstrap name, which the anchor holds when it holds the rendezvous and launchd takes back at its holder's
 /// death (`crate::owner_name`), looked up at twice the time waited each time, so the looks cost the logarithm of the
 /// wait. On Windows it is the anchor's process when a live one holds the rendezvous, judged by the pid and creation
-/// time it wrote into the header (A-468), else the daemon's (A-447) and the start stamp it published, which it takes
-/// back when it stops inside its process; either is waited on beside the claim's Event. Until A-468 a claim under a live
-/// anchor waited at most its caller's restart bound (a client's reconnect budget, the recovery budget plus a liveness
-/// window), so a restart slower than that failed its clients while the anchor still restarted the daemon.
+/// time it wrote into the header (A-468), which it clears when it lets go inside its process, else the daemon's
+/// (A-447) and the start stamp it published, which it takes back when it stops inside its process; either process is
+/// waited on beside the claim's Event, and the mark or the stamp is looked at on the same doubling. Until A-468 a claim
+/// under a live anchor waited at most its caller's restart bound (a client's reconnect budget, the recovery budget plus
+/// a liveness window), so a restart slower than that failed its clients while the anchor still restarted the daemon.
 pub fn begin_connect_as(instance: &str, wanted: u32) -> Result<Claim, IpcError> {
   Ok(Claim {
     inner: platform::begin(instance, wanted)?,
@@ -3018,8 +3019,8 @@ pub mod platform {
   const AT_GENERATION: usize = 16;
   /// Format: the holding anchor's process id's offset in the header (A-114): written when the anchor creates the
   /// object, zero in an object a daemon made for itself, and zeroed when the anchor lets go of it. A Windows claim made
-  /// while this process lives waits while it lives, judged with its creation time (A-468); a macOS claim judges the
-  /// owner's name the anchor holds.
+  /// while this process lives waits while it lives and its mark stays, judged with its creation time (A-468); a macOS
+  /// claim judges the owner's name the anchor holds.
   const AT_ANCHOR_PID: usize = 28;
   /// Format: the holding anchor's creation time's offset in the header (A-468), as the daemon's is at
   /// `AT_DAEMON_CREATED`: written when a Windows anchor creates the object, zero elsewhere.
@@ -4212,10 +4213,16 @@ pub mod platform {
     /// stamp. No live anchor holds the rendezvous.
     #[cfg(windows)]
     WithDaemon(crate::exit_watch::ExitWatch),
-    /// When the anchor that holds the rendezvous exits (Windows, A-468), opened by its mark as the daemon's is: its
-    /// daemon may restart any number of times meanwhile, and the next one answers the claim (A-114).
+    /// When the anchor that holds the rendezvous goes (Windows, A-468): its process exits, opened by its mark as the
+    /// daemon's is, or it lets go inside its live process, which clears its mark from the header. Its daemon may restart
+    /// any number of times meanwhile, and the next one answers the claim (A-114).
     #[cfg(windows)]
-    WithAnchor(crate::exit_watch::ExitWatch),
+    WithAnchor {
+      /// The anchor's process.
+      watch: crate::exit_watch::ExitWatch,
+      /// The anchor's mark as the claim read it: while the header holds it, the anchor holds the rendezvous.
+      mark: ProcessMark,
+    },
   }
 
   /// How a claim on macOS ends unanswered: with the rendezvous's owner, whose bootstrap name launchd takes back at its
@@ -4236,7 +4243,10 @@ pub mod platform {
     if let Some(anchor) = ProcessMark::anchor_of(&header) {
       let watch = crate::exit_watch::ExitWatch::on_created(anchor.pid, anchor.created)?;
       if !watch.exited() {
-        return Ok(Ends::WithAnchor(watch));
+        return Ok(Ends::WithAnchor {
+          watch,
+          mark: anchor,
+        });
       }
     }
     let mark = ProcessMark::daemon_of(&header).ok_or(IpcError::Layout {
@@ -4394,10 +4404,14 @@ pub mod platform {
           }
         }
         #[cfg(windows)]
-        Ends::WithAnchor(anchor) => {
-          if anchor.exited() {
+        Ends::WithAnchor { watch, mark } => {
+          if watch.exited() {
             self.daemon_went(
               "the anchor that holds the rendezvous exited before the claim was answered",
+            )
+          } else if ProcessMark::anchor_of(&marks_image(&self.object)?) != Some(*mark) {
+            self.daemon_went(
+              "the anchor that held the rendezvous let go of it before the claim was answered",
             )
           } else {
             Ok(None)
@@ -4407,7 +4421,8 @@ pub mod platform {
     }
 
     /// The claim's holder went with the claim unanswered (Windows, A-447, A-468): the daemon's process exited, or it
-    /// stopped inside the process and took back its start stamp, or the anchor that holds the rendezvous exited. The
+    /// stopped inside the process and took back its start stamp, or the anchor that holds the rendezvous exited or let
+    /// go of it inside its process. The
     /// claim is taken back if the daemon never took it (one that took it went mid-answer, its slot left to a successor's
     /// stale reclaim) and reported unavailable, saying `why`.
     #[cfg(windows)]
@@ -4499,18 +4514,22 @@ pub mod platform {
       }
     }
 
-    /// One wait for the answer's Event beside the holder's process (Windows). Beside the daemon's, or as long again as
-    /// the claim has waited, when the poll reads the start stamp, which a daemon stopped inside its own process takes
-    /// back (A-443's doubling, so the looks cost the logarithm of the wait). Beside the anchor's with no timeout: its
-    /// daemon's restarts change nothing the claim waits on. A process already gone is read at the poll.
+    /// One wait for the answer's Event beside the holder's process (Windows), the daemon's or the anchor's, or as long
+    /// again as the claim has waited, when the poll looks at what a holder stopping inside its own process leaves: the
+    /// daemon takes back its start stamp, the anchor clears its mark (A-443's doubling, so the looks cost the logarithm
+    /// of the wait). The anchor's daemon's restarts change nothing the claim waits on. Until 2026-11-23 the wait beside
+    /// the anchor's process had no timeout, so a claim waiting there when the anchor let go inside its live process
+    /// waited until that process exited. A process already gone is read at the poll.
     #[cfg(windows)]
     fn wait_on_holder(&self, elapsed: u64) -> Result<(), IpcError> {
-      let (process, timeout_ns) = match &self.ends {
-        Ends::WithDaemon(daemon) => (daemon.handle(), Some(elapsed.max(1))),
-        Ends::WithAnchor(anchor) => (anchor.handle(), None),
+      let process = match &self.ends {
+        Ends::WithDaemon(daemon) => daemon.handle(),
+        Ends::WithAnchor { watch, .. } => watch.handle(),
       };
       if let Some(process) = process {
-        self.ready_event.wait_or_exit(process, timeout_ns)?;
+        self
+          .ready_event
+          .wait_or_exit(process, Some(elapsed.max(1)))?;
       }
       Ok(())
     }

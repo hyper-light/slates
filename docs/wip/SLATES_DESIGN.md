@@ -5555,6 +5555,8 @@ drops.
 > while it holds the rendezvous; on Windows the anchor's process, named in the bootstrap header by its process id and
 > creation time (the layout `SLB4`) while it holds the rendezvous and cleared when it lets go (since 2026-11-23: the
 > header outlives the hold while a client's doorbell maps the object), else the daemon's (A-447) with its start stamp.
+> A claim already waiting under the anchor ends at its going too: it looks for the anchor's mark on A-443's doubling,
+> as a claim on a daemon looks for the start stamp a daemon stopped inside its process takes back (since 2026-11-23).
 > A claim refused for now (no claim slot free, the restarted daemon not yet published, the daemon gone mid-answer) asks
 > `slates_ipc::holder_lives`: with a
 > holder the client claims again, paced as an async connect polls (doubling, at most a tenth of the claim wait); with
@@ -38714,6 +38716,16 @@ and `crates/server/src/direct_map.rs` (the offers' callers), `crates/server/test
   `an_anchor_that_lets_go_is_no_holder_though_a_client_maps_the_object` (macOS and Windows). Applied in the same change
   to: `crates/ipc/src/rendezvous.rs`, §4.7's A-468 status, GAPS (A-468),
   `docs/bugs/2026-11-23-a-windows-anchor-that-let-go-still-read-as-the-rendezvous-holder.md`.
+- **A waiting claim at an anchor's going (w-win2 for main 01a20182, 2026-11-23).** A Windows claim begun while an
+  anchor held the rendezvous (`Ends::WithAnchor`) judged the anchor by its process alone, and waited beside it with no
+  timeout. So an anchor that let go inside its live process left the claim waiting until that process exited or a
+  daemon answered. The claim now keeps the anchor's mark and ends `DaemonUnavailable` once the header no longer holds
+  it, and its wait looks again on A-443's doubling, as a claim on a daemon looks for the stamp a daemon stopped inside
+  its process takes back. Held by `a_claim_under_an_anchor_ends_at_the_anchors_going` (now run on Windows too, its poll
+  bounded by the claim wait) and `a_waiting_claim_under_an_anchor_ends_at_its_going_inside_a_live_process` (macOS and
+  Windows): both failed on both Windows runners with the fix reversed and passed with it (diag run 45238179939).
+  Applied in the same change to: `crates/ipc/src/rendezvous.rs`, §4.7's A-468 status, GAPS (A-468),
+  `docs/bugs/2026-11-23-a-windows-claim-waiting-under-an-anchor-that-let-go-waited-on-its-process.md`.
 
 ### A-497 — Version-control servers over greens and works: the shared mapping (2026-11-18, g261 for UI goal 91; new §4.17 and D-28; §4.8, §4.16)
 - **What it adds.** §4.17's frame and its shared part, §4.17.1: how a stock git, Mercurial or Subversion client's
