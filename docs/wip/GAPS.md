@@ -5253,15 +5253,34 @@
 > **A verb's reply held for durability had no time bound: refused at the failover SLO (2026-11-18, A-354, §4.10 "Live
 > shipping"; g230).** `live_ship::defer` and `defer_destroy` held a reply until its log was durable, its owner fenced or
 > its volume destroyed, so a log that could never be held (A-353's catalog refused for good) kept its writer waiting 21
-> minutes. A hold now ends at the failover SLO, refused `DurabilityPending` and recorded as the request's outcome; the
-> writer still waits through a shorter silence. Test:
-> `a_verb_held_past_the_failover_delay_took_effect_once_and_its_resend_is_answered_its_own_reply`.
+> minutes. A hold now ends at the failover SLO, refused `DurabilityPending`; the writer still waits through a shorter
+> silence. Test: `a_verb_held_past_the_failover_delay_is_in_doubt_not_done_until_durable_and_runs_once`.
 > - **CLOSED 2026-11-20 (g226; main's ruling): the given-up verb never takes effect twice.** The refusal was recorded as
 >   the request's completion, so a consumer told to make the call again ran the verb a second time over its own effect
->   (an append twice, a directory's second making refused `AlreadyExists`). The verb's own reply is now the recorded
->   completion and the refusal goes unrecorded; `slates_client` sends the request again under its id once, so its caller
->   is handed the verb's own reply. A yield's waiters (A-409) still record the refusal: their write never took effect on
->   the successor.
+>   (an append twice, a directory's second making refused `AlreadyExists`). The verb's own reply was made the recorded
+>   completion and the refusal went unrecorded; `slates_client` sends the request again under its id once. A yield's
+>   waiters (A-409) still record the refusal: their write never took effect on the successor.
+> - **FIXED 2026-11-23 (w-chaos; A-354's second amendment): that recorded reply was a success no quorum held.** An owner
+>   cut off from its peers recorded `FsDone` for each write it gave up at the failover SLO, and the client's resend was
+>   handed it: nine writes acknowledged while the owner's log stayed durable at 163, and the successor, which took over
+>   from the holders' 163, served none of them (StaleNeverCommits and NoLoss broken in the cut-off, deafened and muted
+>   flows every CI night from 2026-11-21; the nemesis's NoLoss on 2026-11-21; the unheard-destroy flows' "exited 0" on
+>   2026-11-21 and 2026-11-22). The refusal is now recorded nowhere and the request keeps its place, told, so a resend
+>   joins the wait (never run twice) and is answered the outcome once decided (its own reply only once durable); a reply
+>   held on a yielded log is decided at the bound. Record:
+>   `docs/bugs/2026-11-23-a-held-write-given-up-at-the-failover-slo-was-recorded-done.md`.
+> - **Owed (w-chaos's finding, 2026-11-23):** a told request's place, like every held reply, lives in the owner shard's
+>   memory, so a daemon restart forgets it and a resend under its id afterwards runs the verb again (a held reply's
+>   restart has had this gap since A-200). And `live_ship::join` (and its destroy half) copies the first waiter at the
+>   key's position, which may be another request's when two wait on one position, so a retry can be answered with that
+>   request's reply; found by reading, not yet by a test.
+> - **Open (w-chaos, 2026-11-23): a write held past the held-write bound, one cut-off run in ten on adacachy2.** In
+>   `an_owner_cut_off_while_running_is_superseded_and_serves_nothing_stale` at load 69, a write sent 0.18 ms before the
+>   relay isolated its owner was held 20.86 s, until the heal, and refused `StaleEpoch { current: 2 }` (the flow's bound
+>   5.71 s), and no give-up was logged in the run: the write never waited where `live_ship::judge_held` judges it, so it
+>   was held before its verb ran, or its owner's failover estimate rose past the partition. Every invariant held in that
+>   run; the other nine passed, and CI's 19 judgements of the bound held. Owed: what held it, from a run that catches it
+>   with the owner's status read throughout.
 > - **Owed (the integrator's):** live_chaos and live_fleet flows that keep a writer waiting past the failover SLO (10 s)
 >   now meet `DurabilityPending` where they waited; each flow's stops are a few liveness budgets, under it, but a flow
 >   that stops every candidate longer must treat the refusal as its write's outcome (not acknowledged, so never owed to
