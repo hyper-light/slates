@@ -440,6 +440,7 @@ mod tests {
   /// the same).
   #[cfg(any(target_os = "macos", target_os = "linux"))]
   #[test]
+  #[cfg_attr(miri, ignore)] // Miri models no shared memory or mincore
   fn a_mapping_read_whole_agrees_with_its_page_walk() {
     let page = rustix::param::page_size();
     let name = format!("slates-mem-mapping-{}", std::process::id());
@@ -465,6 +466,7 @@ mod tests {
   /// its untouched half. Expect: the whole map's bytes are its length; at least the 16 written pages are resident (and,
   /// on macOS, modified); the untouched half has no modified page; nothing exceeds the range.
   #[test]
+  #[cfg_attr(miri, ignore)] // Miri models no mincore
   fn written_pages_are_resident_and_modified_and_untouched_ones_are_not_modified() {
     let page = rustix::param::page_size();
     let mut region = crate::region::Region::map(64 * page, page, false).unwrap();

@@ -614,7 +614,7 @@ impl Endings {
     };
     let (mut low, mut high) = (0_u32, self.sealed);
     while low < high {
-      let middle = low + (high - low) / 2;
+      let middle = low.midpoint(high);
       let last = last_by(middle)?;
       if last < rev {
         low = middle.saturating_add(1);
@@ -632,7 +632,7 @@ impl Endings {
 
   /// The full open chunks of `chunk` endings, taken out to be sealed, each with its number; the count of sealed chunks
   /// moved past them.
-  fn to_seal(&mut self, chunk: usize) -> Vec<(u32, Vec<u8>)> {
+  fn take_full_chunks(&mut self, chunk: usize) -> Vec<(u32, Vec<u8>)> {
     let mut sealing = Vec::new();
     while self.open.len() >= chunk {
       let rest = self.open.split_off(chunk);
@@ -953,7 +953,7 @@ impl HgIndex {
         .ok_or(Refused::Unread { rev: written.rev })?;
       heads.add((self, store), (written.rev, row.branch, [row.p1, row.p2]))
     });
-    let sealing = heads.endings.to_seal(endings_a_chunk(store));
+    let sealing = heads.endings.take_full_chunks(endings_a_chunk(store));
     self.branch_heads = heads;
     noted?;
     // Each full chunk of the endings sealed into a row of its own (`Endings`).

@@ -929,6 +929,12 @@
 >   bytes grown holding 6,553,600, now 90,424 holding 6,029,312). The hg intake's whole texts (`intake::rebuilt`,
 >   `HgIndex::revision_text`, `Taker::file_base`; 3.52 GB of the [128 KiB, 256 KiB) band's churn with the cache's
 >   share) are w-hg's, in C1. Owed: main's arena round for RSS.
+>   Its bound from the work BUILT (main's ruling, 2026-11-23): the chain no longer needs its texts held, so the cache holds
+>   the distinct texts its last `waiting` reads lent (one a waiting request, the owner's room) and a chunk's room
+>   (`TextCache::for_reads`), the least lately read out first; a text past it is lent from the buffer it was made into.
+>   Grown to the longest chain before, it held 360 MB of chunks at the end of Mercurial's push. Held by
+>   `the_store_holds_the_texts_its_last_reads_lent_and_no_more` (red: bound 6,553,600 after a 400-version chain's read;
+>   now 1,064,960 for 4 reads, 384 texts let go, the latest found again unmade).
 > - The watchdog's beat allocates nothing BUILT (2026-11-23, w-perf; main's order). A beat made 4 allocations, about
 >   1 KB by their types (estimated, not measured). `hg_push_heap`'s first read had charged the watchdog 24% of a push's
 >   sampled bytes, about 10-15 MB a second; that was its sampler's artifact (a thread's first symbol load charged to its
@@ -1898,6 +1904,12 @@
 > and `apply_recorded` alike; any other making leaves the block unnamed. No memory change yet. Oracle:
 > `a_file_made_whole_of_a_named_object_is_named_for_it_until_changed`. Piece 2 BUILT as A-869 (below). OWED: piece 3,
 > the history keeping a named version by its name; piece 4, the current block holding no bytes, read through the plane.
+>
+> **A-873 (2026-11-23, w-svn; main 01a20182's ruling (I), A-760 (b) piece 4a):** a green's identity entry for a file
+> hashes its path, length and plain BLAKE3 digest, which each block keeps from when it was made, not its bytes. Golden
+> vectors are regenerated through `--ignored regenerate_the_identity_golden_vectors`, with a determinism gate. Anchor
+> layout 19 refuses a layout-18 segment typed. OWED: 4b (one read seam, `Bytes | Named`; w-git and w-hg told first),
+> 4c (the engine's named-base reads), 4d (a named block holds no bytes).
 >
 > **A-869 (2026-11-22, w-svn; main 01a20182's order of 19:28, A-760 (b) piece 2):** a green's checkpoint names a file
 > whose block is named for a content-plane object instead of carrying its bytes (`Checkpoint::named`, a section after

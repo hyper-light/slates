@@ -28,8 +28,10 @@ static ALLOCATOR: LargeMapped = LargeMapped;
 /// Shape: a text's length, under every host's mapped floor (256 KiB on x86_64, 1 MiB on Apple silicon), as most of a
 /// history's files are.
 const TEXT: usize = 16 << 10;
-/// Shape: the versions of the one path, each an edit of the one before: a chain whose texts a read holds at once.
+/// Shape: the versions of the one path, each an edit of the one before.
 const VERSIONS: u64 = 400;
+/// Shape: the off-heap test's fixed bound, 8 MiB: past the chain's 6.4 MB, so the cache holds it all.
+const CHAIN_BOUND: u64 = 8 << 20;
 
 fn scratch(name: &str) -> PathBuf {
   let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
@@ -125,7 +127,7 @@ fn land_chain(store: &mut Store) -> Vec<[u8; 32]> {
 }
 
 /// Goal 93's memory bar (main 01a20182, 2026-11-23). Do: land a chain of [`VERSIONS`] versions of one path, 16 KiB
-/// each; read the latest on a cold cache (its whole chain made and kept at once, the cache's bound grown to it), then
+/// each; on a cache bounded past the chain's bytes, read the latest on a cold cache (its whole chain made and kept), then
 /// read every version in order, twice, reading the system allocator's figures before and after. Expect: every version's
 /// bytes as landed; the cache holding the chain; and the system path's live bytes grown by less than a tenth of what the
 /// cache holds, since its texts lie in chunks the mapped path serves, given back whole. Failing first: each text its own
@@ -138,7 +140,7 @@ fn the_store_keeps_the_texts_it_made_off_the_system_heap() {
   let mut store = open(&dir);
   let identities = land_chain(&mut store);
   let staging = Staging::new(0);
-  let mut cache = TextCache::new(0);
+  let mut cache = TextCache::new(CHAIN_BOUND);
   let before = heap();
   let latest = *identities.last().unwrap();
   let len = store
@@ -173,5 +175,65 @@ fn the_store_keeps_the_texts_it_made_off_the_system_heap() {
   assert!(
     grown < held / 10,
     "the system path's live bytes grew by {grown} with the cache holding {held} bytes of texts"
+  );
+}
+
+/// Shape: the reads at once the bound test's cache is made for: a few seats' walks.
+const READS: usize = 4;
+
+/// Goal 93 (main 01a20182's ruling of 2026-11-23: the bound from the work). Do: land the chain; on a cache made for
+/// [`READS`] reads at once, read the latest version on a cold cache (its whole chain made), then [`READS`] - 1 other
+/// versions, then the latest again. Expect: the cache's reserved bytes never past its bound, and that bound no more than
+/// [`READS`] texts and one chunk; texts let go at it (so the cache filled); the latest found again without being made,
+/// since it was among the last reads; every version's bytes as landed. Failing first: the bound grown to the chain's
+/// bytes, 6.4 MB held after one read.
+#[test]
+fn the_store_holds_the_texts_its_last_reads_lent_and_no_more() {
+  let dir = scratch("bound");
+  let mut store = open(&dir);
+  let identities = land_chain(&mut store);
+  let staging = Staging::new(0);
+  let mut cache = TextCache::for_reads(READS);
+  let latest = *identities.last().unwrap();
+  let mut read = |store: &mut Store, cache: &mut TextCache, identity: &[u8; 32]| {
+    let bytes = store
+      .text_at(&staging, 1, identity, 0, cache)
+      .unwrap()
+      .unwrap();
+    assert_eq!(
+      *blake3::hash(bytes).as_bytes(),
+      *identity,
+      "a version's bytes as landed"
+    );
+    assert!(
+      cache.reserved_bytes() <= cache.bound(),
+      "reserved {} past the bound {}",
+      cache.reserved_bytes(),
+      cache.bound()
+    );
+  };
+  read(&mut store, &mut cache, &latest);
+  let chunk = slates_mem::large::floor() as u64;
+  let most = READS as u64 * TEXT as u64 + chunk;
+  println!(
+    "text_cache_heap: after the chain's read, bound {} reserved {} let go {} (at most {most})",
+    cache.bound(),
+    cache.reserved_bytes(),
+    cache.let_go
+  );
+  assert!(
+    cache.bound() <= most,
+    "the bound {} past {READS} texts and a chunk",
+    cache.bound()
+  );
+  assert!(cache.let_go > 0, "texts let go at the bound");
+  for identity in identities.iter().rev().skip(1).take(READS - 1) {
+    read(&mut store, &mut cache, identity);
+  }
+  let made = cache.made;
+  read(&mut store, &mut cache, &latest);
+  assert_eq!(
+    cache.made, made,
+    "the latest, among the last reads, found without being made"
   );
 }

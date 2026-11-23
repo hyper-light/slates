@@ -4714,6 +4714,74 @@ async fn replay_catalog(
   Ok((db, recovered, most))
 }
 
+/// This start's member id, the per-start nonce it is made from (the retained record's where a predecessor's state is
+/// retained, else a fresh one) and its regional council (§4.8, AUD-07): a learner, uninitialized on every boot, at the
+/// fleet's quorum (the laptop's `f = 0` without one) and its scatter.
+fn member_and_council(
+  config: &DaemonConfig,
+  origin_anchor: slates_db::HostId,
+  issuer_secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+  retained: Option<&crate::retention::Retained>,
+) -> (
+  slates_db::HostId,
+  u64,
+  slates_cluster::config_group::RegionalCouncil,
+) {
+  let incarnation = retained.map_or_else(|| boot_incarnation(issuer_secret), |record| record.nonce);
+  let host = crate::deploy::member_id(origin_anchor, incarnation);
+  let quorum = config
+    .fleet
+    .as_ref()
+    .map_or(slates_db::register::Quorum { f: 0 }, |fleet| fleet.quorum);
+  let scatter = retained.map_or_else(|| config.derived_scatter(quorum), |record| record.scatter());
+  let council =
+    slates_cluster::config_group::RegionalCouncil::learner(host, quorum, scatter, false);
+  (host, incarnation, council)
+}
+
+/// The shard's fleet node (§4.8): a member of the fleet the configuration names, else solo; with the committed
+/// regional configuration installed where the council holds one for `host`, and the boot's durability shortfall then,
+/// counted where `counts` (the first configured shard).
+fn fleet_node(
+  config: &DaemonConfig,
+  host: slates_db::HostId,
+  council: &slates_cluster::config_group::RegionalCouncil,
+  counts: bool,
+) -> (
+  slates_cluster::fleet::FleetNode,
+  Option<crate::config::DurabilityShortfall>,
+) {
+  let mut fleet = match &config.fleet {
+    Some(membership) => {
+      slates_cluster::fleet::FleetNode::new(host, membership.quorum, &membership.peers)
+    }
+    None => slates_cluster::fleet::FleetNode::solo(host),
+  };
+  let council_members = council.configuration().members.clone();
+  let mut durability_shortfall = None;
+  if let Some(configuration) = council.configuration().configuration_for(host) {
+    durability_shortfall = boot_durability(config, &configuration, counts);
+    fleet.install_configuration(configuration, &council_members);
+  }
+  (fleet, durability_shortfall)
+}
+
+/// The node's ML-KEM recipient (A-92 piece 4a), opened under the root or made and recorded now; `None`, logged, where
+/// sealing is unavailable (status reports it).
+fn node_seal_recipient(
+  state: &mut crate::state::ShardState,
+) -> Option<hyper_seal::recipient::Recipient> {
+  match crate::seal_keys::recipient(state) {
+    Ok(recipient) => Some(recipient),
+    Err(e) => {
+      slates_machine::log_line!(
+        "slates-server: the node's sealing recipient is unavailable: {e:?}"
+      );
+      None
+    }
+  }
+}
+
 async fn init_shard(
   config: &DaemonConfig,
   env: &[(String, String)],
@@ -4807,10 +4875,8 @@ async fn init_shard(
   // Idle content is sealed in the arena under keys derived from the root (A-99), before recovery adopts any chunk,
   // so a chunk the last daemon sealed opens. No root (sealing unavailable) keeps content in the clear.
   install_content_cipher(&mut store, seal_root.as_ref());
-  let incarnation = retained
-    .as_ref()
-    .map_or_else(|| boot_incarnation(&issuer_secret), |record| record.nonce);
-  let host = crate::deploy::member_id(origin_anchor, incarnation);
+  let (host, incarnation, council) =
+    member_and_council(config, origin_anchor, &issuer_secret, retained.as_ref());
   // The owner runtime this node takes part in a region as (§4.8, boot step 6): membership + the
   // configuration group + the owner's acceptor, composed by `slates-cluster`. Built from the configured
   // fleet membership (its quorum and peers) when the operator deploys a fleet, or the laptop `f = 0`
@@ -4821,33 +4887,14 @@ async fn init_shard(
   // The regional council starts uninitialized on every daemon boot (§4.8, AUD-07). Neither
   // a deployment roster nor retained volume bytes restore a term, vote or log. An explicit
   // first-time bootstrap or a validated join initializes it; writes wait for admission.
-  let quorum = config
-    .fleet
-    .as_ref()
-    .map_or(slates_db::register::Quorum { f: 0 }, |fleet| fleet.quorum);
-  let council = slates_cluster::config_group::RegionalCouncil::learner(
-    host,
-    quorum,
-    retained
-      .as_ref()
-      .map_or_else(|| config.derived_scatter(quorum), |record| record.scatter()),
-    false,
-  );
   // The discovery view holds manifest placeholders until authenticated contact. Placement
   // becomes usable only after this fresh member has joined its committed regional group.
-  let mut fleet = match &config.fleet {
-    Some(membership) => {
-      slates_cluster::fleet::FleetNode::new(host, membership.quorum, &membership.peers)
-    }
-    None => slates_cluster::fleet::FleetNode::solo(host),
-  };
-  let council_members = council.configuration().members.clone();
-  let mut durability_shortfall = None;
-  if let Some(configuration) = council.configuration().configuration_for(host) {
-    let counts = config_shards.first() == Some(&shard);
-    durability_shortfall = boot_durability(config, &configuration, counts);
-    fleet.install_configuration(configuration, &council_members);
-  }
+  let (fleet, durability_shortfall) = fleet_node(
+    config,
+    host,
+    &council,
+    config_shards.first() == Some(&shard),
+  );
   // The root group across regions (§4.8, D-14): the regions the fleet spans and the representative host of
   // each (the root voters), driven over the transport by the control shard's config plane
   // (`crate::fleet::drive_root_group`), exactly as the regional council is.
@@ -4857,10 +4904,7 @@ async fn init_shard(
     .await;
   // The anchor-owned content object that survives a restart (§4.8), if the anchor provides one.
   // Shards share the one object, partitioned by index: this shard owns the slice `[start, end)`.
-  let mut content = match AnchorSegment::open_content(env) {
-    Some(result) => Some(result?),
-    None => None,
-  };
+  let mut content = AnchorSegment::open_content(env).transpose()?;
   let (content_range, write_log, recovered_writes) =
     content_slice(config, partition, content.as_mut());
   // The DAX range table (A-365; Windows' sections, A-448), with what the previous daemon recorded in it.
@@ -5239,27 +5283,7 @@ async fn init_shard(
   slices
     .piece_done("the kept mounts, grants and owed looks")
     .await;
-  if let Some(retained) = retained {
-    retained.restore(&mut state)?;
-  }
-  crate::retention::retain(&mut state)?;
-  crate::retention::derive_log_budgets(&mut state);
-  slices.piece_done("retention").await;
-  // The node's ML-KEM recipient (A-92 piece 4a), on the control shard, whose partition holds its sealed record: opened
-  // under the root, or made and recorded now. Unavailable sealing leaves it `None`, reported in status.
-  if partition == 0 {
-    state.seal_recipient = match crate::seal_keys::recipient(&mut state) {
-      Ok(recipient) => Some(recipient),
-      Err(e) => {
-        slates_machine::log_line!(
-          "slates-server: the node's sealing recipient is unavailable: {e:?}"
-        );
-        None
-      }
-    };
-  }
-  slices.piece_done("the node's sealing recipient").await;
-  rebuild_and_report(&mut state, shard, &mut slices).await;
+  retain_seal_and_rebuild(&mut state, retained, (partition, shard), &mut slices).await?;
   #[cfg(windows)]
   crate::anchor_hold::install(
     windows_channel,
@@ -5312,6 +5336,31 @@ async fn init_shard(
 
 /// Rebuilds what the shard recovered into live state (`verbs::rebuild_recovered`, in `slices`) and says what it did in
 /// the boot log: only what happened, never more.
+/// A starting shard's last pieces before it serves: the retained consensus restored (where a predecessor's is retained)
+/// and retained again, the log budgets derived; the node's ML-KEM recipient on the control shard, partition 0, whose
+/// partition holds its sealed record (A-92 piece 4a: opened under the root, or made and recorded now, `None` where
+/// sealing is unavailable, reported in status); then the recovered volumes rebuilt and reported. Each a slice of its
+/// own.
+async fn retain_seal_and_rebuild(
+  state: &mut ShardState,
+  retained: Option<crate::retention::Retained>,
+  (partition, shard): (u16, u16),
+  slices: &mut crate::recovery_slices::RecoverySlices,
+) -> Result<(), ServerError> {
+  if let Some(retained) = retained {
+    retained.restore(state)?;
+  }
+  crate::retention::retain(state)?;
+  crate::retention::derive_log_budgets(state);
+  slices.piece_done("retention").await;
+  if partition == 0 {
+    state.seal_recipient = node_seal_recipient(state);
+  }
+  slices.piece_done("the node's sealing recipient").await;
+  rebuild_and_report(state, shard, slices).await;
+  Ok(())
+}
+
 async fn rebuild_and_report(
   state: &mut ShardState,
   shard: u16,

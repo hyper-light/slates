@@ -716,12 +716,8 @@ pub(crate) async fn bring_back_landed(identity: ContentId) -> bool {
               away.push((window, at, len));
             }
           }
-          Some(Landed::Hg(revision)) => {
-            if !revisions.contains(&revision) {
-              revisions.push(revision);
-            }
-          }
-          None => {}
+          Some(Landed::Hg(revision)) if !revisions.contains(&revision) => revisions.push(revision),
+          Some(Landed::Hg(_)) | None => {}
         }
       }
     }

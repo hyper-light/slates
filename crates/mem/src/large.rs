@@ -473,6 +473,7 @@ mod tests {
   /// resident; once freed, the block gone from the table. Other tests share the counters, so each reading is held to this
   /// test's own blocks alone.
   #[test]
+  #[cfg_attr(miri, ignore)] // Miri models no mincore
   fn the_live_figures_follow_the_blocks_held() {
     let allocator = LargeMapped;
     let floor = floor();

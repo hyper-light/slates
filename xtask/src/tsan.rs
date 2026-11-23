@@ -119,6 +119,8 @@ const RACE_REPORT: &str = "WARNING: ThreadSanitizer: data race";
 /// Format: the instrumentation flags, for code and for the rebuilt standard library.
 ///
 /// `--cfg=rustix_use_libc` is not instrumentation; it is what makes the instrumentation able to see slates.
+/// `--cfg=slates_tsan` tells the few tests that read the C library's allocator or time a call that this build is
+/// instrumented: ThreadSanitizer's allocator replaces glibc's, and its checks slow every access.
 /// ThreadSanitizer learns about memory by intercepting libc, and rustix's default backend on Linux is
 /// `linux_raw`, which issues syscalls by inline assembly and never enters libc at all. So every `mmap` and
 /// `munmap` slates makes — `crates/mem/src/shared.rs` — is invisible to it, and the shadow memory for an
@@ -135,7 +137,7 @@ const RACE_REPORT: &str = "WARNING: ThreadSanitizer: data race";
 /// The cost is that the lane exercises rustix's libc backend rather than its raw one, which is a deviation
 /// from the shipped build — but a smaller one than `-Zbuild-std` already is, and the alternative is a lane
 /// whose reports cannot be trusted and whose real races would be lost among them.
-const SANITIZER_FLAGS: &str = "-Zsanitizer=thread --cfg=rustix_use_libc";
+const SANITIZER_FLAGS: &str = "-Zsanitizer=thread --cfg=rustix_use_libc --cfg=slates_tsan";
 /// Format: report every race in a binary rather than stop at the first, so one run names them all.
 const TSAN_OPTIONS: &str = "halt_on_error=0";
 

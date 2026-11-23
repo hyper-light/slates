@@ -106,7 +106,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::{
   ConflictWindow, ContentSource, Effect, Green, IDENTITY_TAG_HARDLINK, IDENTITY_TAG_SYMLINK,
   IdentityKey, Increment, Resolved, SPECIAL_NODE_BYTES, apply, change_bytes, copy_entry, dir_entry,
-  file_entry, insert_whole, link_entry, mode_entry, record, special_entry, union_keys, xattr_entry,
+  file_entry_of, insert_whole, link_entry, mode_entry, record, special_entry, union_keys,
+  xattr_entry,
 };
 use crate::chain_entry::{Applied, CopyFix};
 use crate::dims::{Block, Held, HeldAttributes};
@@ -168,7 +169,7 @@ fn fixed_entry(key: &IdentityKey, rel: &str, fix: &CopyFix) -> Option<Option<Ent
     IdentityKey::File(path) => fix
       .files
       .get(rel)
-      .map(|bytes| bytes.as_deref().map(|bytes| file_entry(path, bytes))),
+      .map(|bytes| bytes.as_deref().map(|bytes| file_entry_of(path, bytes))),
     IdentityKey::Special(path) => fix
       .specials
       .get(rel)
@@ -1882,7 +1883,7 @@ impl Green {
     match key {
       IdentityKey::File(path) => self
         .content_ref_at(from, version)
-        .map(|bytes| file_entry(path, &bytes)),
+        .map(|bytes| file_entry_of(path, &bytes)),
       IdentityKey::Special(path) => self
         .special_at(from, version)
         .map(|node| special_entry(path, &node)),

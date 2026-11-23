@@ -761,8 +761,9 @@ impl ContentStore {
     Ok(())
   }
 
-  /// The root identity an object of `bytes` is held under: the plain BLAKE3 of an object of at most one window, else
-  /// its top list's (module docs). Nothing is stored.
+  /// The identity an object of `bytes` is named by: the plain BLAKE3 of its bytes, whatever their length or the store's
+  /// window (module docs, "The identity rule"); the root it is held under is the store's own ([`ContentStore::root_of`]).
+  /// Nothing is stored.
   pub fn object_id(&self, bytes: &[u8]) -> ContentId {
     ContentId::of(bytes)
   }

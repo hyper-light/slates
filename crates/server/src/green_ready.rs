@@ -523,7 +523,7 @@ fn turn(state: &mut ShardState, green: DbVolumeId) -> Turned {
       // A unit that met a window let go: the window its read noted on the repository, brought back before the next turn.
       let waited = building
         .waiting()
-        .and_then(|_| repository)
+        .and(repository)
         .and_then(|repository| state.vcs_stores.git(repository))
         .and_then(|(_, store)| store.repository.waiting());
       state.materializations.building.insert(green, building);
