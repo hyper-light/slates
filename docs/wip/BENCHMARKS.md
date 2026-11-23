@@ -17764,7 +17764,24 @@ Quiet p99 was 70-107 µs in every arm of the second run. D'' counted right: `Rea
   (`__setparam_fair`, kernel 7.3.3 `kernel/sched/fair.c`), and E's p50 was 2-4x main's.
 
 **The cost.** B's park at once (a real-time shard never spins idle) raised R9's spinning median, 12-20 µs in A against
-17-27 µs in B, while its p99 improved (145 / 57 / 104 against 71 / 50 / 54 µs). Owed: main's confirming round on main.
+17-27 µs in B, while its p99 improved (145 / 57 / 104 against 71 / 50 / 54 µs).
+
+**The confirming round on main** (ca98b72c4, A-872 landed; 2026-11-23 03:42-03:43; adacachy2, the same scope and
+command, `RLIMIT_RTPRIO` 99; 6 loaded and 2 quiet rounds, then `provision_bench`):
+
+| round | accept p99 / p999 µs | conflict p99 / p999 µs |
+|---|---|---|
+| loaded 1 | 346 / 535 | 312 / 697 |
+| loaded 2 | 440 / 504 | 262 / 565 |
+| loaded 3 | 327 / 496 | 241 / 436 |
+| loaded 4 | 308 / 474 | 254 / 622 |
+| loaded 5 | 391 / 659 | 285 / 586 |
+| loaded 6 | 310 / 512 | 271 / 325 |
+| quiet 1 | 103 / 187 | 76 / 100 |
+| quiet 2 | 103 / 161 | 77 / 206 |
+
+Every loaded p99 and p999 under 1 ms (12 of 12); R9 spinning p99 56,195 / 45,625 / 54,562 ns (main before A-872:
+145 / 57 / 104 µs). 84a's Linux x86_64 bare-metal bar met where the account grants real-time priority.
 
 ## 84a Linux: the per-thread fair slice on top of A-799, measured, not taken (g222; 2026-11-21)
 
