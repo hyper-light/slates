@@ -54,6 +54,8 @@ pub mod looks;
 #[cfg(target_os = "macos")]
 mod mach_claim;
 #[cfg(target_os = "macos")]
+mod mach_semaphore;
+#[cfg(target_os = "macos")]
 mod owner_name;
 pub mod park;
 /// A Unix socket peer's credentials on Linux, read soundly (`SO_PEERCRED`; a peer whose process the reader cannot see

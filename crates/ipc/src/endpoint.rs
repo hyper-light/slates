@@ -1129,9 +1129,28 @@ impl ClientEnd {
     })
   }
 
-  /// A deadline's park (and macOS's departure park between its looks): the wake word's wait, whose wake confirms a
-  /// sleeper found (Linux's futex, macOS's ulock), up to `timeout_ns` (`None`: until woken).
-  #[cfg(not(windows))]
+  /// A deadline's park on macOS (and its departure park between looks), 84a's arm: the region's wake semaphore, which
+  /// cannot say whether its signal met a sleeper, so the client judges its own sleep; the wake word's wait where the
+  /// region has no semaphore. Up to `timeout_ns` (`None`: until woken).
+  #[cfg(target_os = "macos")]
+  fn park_until(&self, expected: u32, timeout_ns: Option<u64>) -> Result<Parked, IpcError> {
+    if let Some(woken) = self.region.semaphore_wait(timeout_ns)? {
+      return Ok(Parked {
+        woken,
+        departed: false,
+        waker_confirms: false,
+      });
+    }
+    Ok(Parked {
+      woken: wake::wait(self.region.wake_word()?, expected, timeout_ns)?,
+      departed: false,
+      waker_confirms: true,
+    })
+  }
+
+  /// A deadline's park: the wake word's wait, whose wake confirms a sleeper found (Linux's futex), up to `timeout_ns`
+  /// (`None`: until woken).
+  #[cfg(not(any(windows, target_os = "macos")))]
   fn park_until(&self, expected: u32, timeout_ns: Option<u64>) -> Result<Parked, IpcError> {
     Ok(Parked {
       woken: wake::wait(self.region.wake_word()?, expected, timeout_ns)?,
@@ -1571,8 +1590,15 @@ impl DaemonEnd {
       #[cfg(windows)]
       self.region.wake_signal()?;
       let g222_wake_began = (g222_now(), g222_cpu());
+      // 84a's macOS arm (`crate::mach_semaphore`): a client parked synchronously is woken by its region's semaphore,
+      // which no wake meeting the waiter mid-entry spins on; an async SDK's park keeps the address wake its completion
+      // bridge waits on. The semaphore cannot say whether it met a sleeper, so nothing is confirmed.
+      #[cfg(target_os = "macos")]
+      let by_semaphore = armed != crate::region::PARKED_ASYNC && self.region.semaphore_signal()?;
+      #[cfg(not(target_os = "macos"))]
+      let by_semaphore = false;
       #[cfg(not(windows))]
-      let g222_woke = wake::wake_one(word)?;
+      let g222_woke = !by_semaphore && wake::wake_one(word)?;
       g222_wake.0 = g222_wake_began.0;
       g222_wake.1 = g222_now().saturating_sub(g222_wake_began.0);
       g222_wake.2 = g222_cpu().saturating_sub(g222_wake_began.1);

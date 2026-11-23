@@ -45,6 +45,10 @@ const AT_BULK: usize = 40;
 const AT_BULK_LEN: usize = 48;
 /// Format: the spin estimate's shift's offset.
 const AT_SPIN_SHIFT: usize = 56;
+/// Format: the reply wake semaphore's port name, in the daemon's task (macOS; 84a's diagnostic arm,
+/// `crate::mach_semaphore`): in the fixed header's last four bytes, zero for none.
+#[cfg(target_os = "macos")]
+const AT_WAKE_SEMAPHORE: usize = 60;
 /// Format: the header's fields the daemon writes once, at creation: every one before the session key.
 const FIXED_HEADER_BYTES: usize = 64;
 /// The client's session key (`slates_server::session_key`): what proves the client is the one its id was issued to.
@@ -218,6 +222,10 @@ pub struct ClientRegion {
   /// Event instead. Absent on Linux/macOS, where the futex / `os_sync` wake word crosses processes.
   #[cfg(windows)]
   wake_event: crate::wake::Event,
+  /// The reply wake on macOS (84a's arm, `crate::mach_semaphore`): made by the daemon with the region; the client's
+  /// synchronous park waits on it and the daemon signals it for such a park.
+  #[cfg(target_os = "macos")]
+  wake_semaphore: Option<crate::mach_semaphore::Semaphore>,
 }
 
 impl std::fmt::Debug for ClientRegion {
@@ -269,6 +277,8 @@ impl ClientRegion {
       geometry.bulk_offset(),
       usize::try_from(geometry.bulk_bytes).unwrap_or(0),
     );
+    #[cfg(target_os = "macos")]
+    let wake_semaphore = crate::mach_semaphore::Semaphore::create()?;
     {
       let mut header = [0u8; HEADER_BYTES];
       let bytes = &mut header[..];
@@ -299,6 +309,12 @@ impl ClientRegion {
       );
       put(bytes, AT_BULK_LEN, &geometry.bulk_bytes.to_le_bytes());
       put(bytes, AT_SPIN_SHIFT, &geometry.spin_shift.to_le_bytes());
+      #[cfg(target_os = "macos")]
+      put(
+        bytes,
+        AT_WAKE_SEMAPHORE,
+        &wake_semaphore.port().to_le_bytes(),
+      );
       // The fixed fields only: the session key is its own racy span, written by `set_session_key`, all zero until.
       object.write(0, header.get(..FIXED_HEADER_BYTES).unwrap_or(&[]))?;
     }
@@ -326,6 +342,8 @@ impl ClientRegion {
       bulk,
       #[cfg(windows)]
       wake_event,
+      #[cfg(target_os = "macos")]
+      wake_semaphore: Some(wake_semaphore),
     })
   }
 
@@ -421,6 +439,9 @@ impl ClientRegion {
     let shard = u16::from_le_bytes(field(bytes, AT_SHARD));
     let spin_ns = read_u32(bytes, AT_SPIN);
     let spin_shift = read_u32(bytes, AT_SPIN_SHIFT);
+    #[cfg(target_os = "macos")]
+    let wake_semaphore =
+      crate::mach_semaphore::Semaphore::named(read_u32(bytes, AT_WAKE_SEMAPHORE));
     #[cfg(windows)]
     let wake_event = windows_wake_event(&object)?;
     Ok(ClientRegion {
@@ -435,6 +456,8 @@ impl ClientRegion {
       bulk: (bulk_at, bulk_len),
       #[cfg(windows)]
       wake_event,
+      #[cfg(target_os = "macos")]
+      wake_semaphore,
     })
   }
 
@@ -527,6 +550,26 @@ impl ClientRegion {
   #[cfg(windows)]
   pub fn wake_signal(&self) -> Result<(), IpcError> {
     self.wake_event.signal()
+  }
+
+  /// Waits on the reply wake semaphore up to `timeout_ns` (macOS, 84a's arm; `crate::mach_semaphore`): `None` when the
+  /// region has none, else whether it was signaled. The caller has published its parked flag and re-checked its ring.
+  #[cfg(target_os = "macos")]
+  pub fn semaphore_wait(&self, timeout_ns: Option<u64>) -> Result<Option<bool>, IpcError> {
+    self
+      .wake_semaphore
+      .as_ref()
+      .map(|semaphore| semaphore.wait(timeout_ns))
+      .transpose()
+  }
+
+  /// Signals the reply wake semaphore (macOS, 84a's arm): whether the region has one to signal.
+  #[cfg(target_os = "macos")]
+  pub fn semaphore_signal(&self) -> Result<bool, IpcError> {
+    match &self.wake_semaphore {
+      Some(semaphore) => semaphore.signal().map(|()| true),
+      None => Ok(false),
+    }
   }
 
   /// The wake word.
