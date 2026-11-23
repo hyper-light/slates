@@ -1,0 +1,97 @@
+name: diag-w-win
+
+# w-win for main 01a20182 (2026-11-23), main's Windows reds, item 5. A diagnostics lane run only from
+# `diag-measurer-w-win-*` branches, never main.
+# - windows: on both Windows runners, the doorbell's early-claim test (item 5).
+# - shards-hang: item 5, the Shards hand-off through the CLI, run as CI runs it, at most 40 times, each bounded at 90 s;
+#   with the fix, no run should hang.
+
+on:
+  push:
+    branches: ["diag-measurer-w-win-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  windows:
+    name: doorbell (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      NAPI_CLI_VERSION: 3.7.2
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: NASM (x86_64 Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64 Windows)
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: "Item 5: a claim rung before the doorbell thread starts"
+        run: cargo test -p slates-server --lib doorbell::tests -- --test-threads=1
+
+  shards-hang:
+    name: shards hang with the fix (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: ilammy/setup-nasm@v1.5.2
+      - name: Build the Shards CLI tests
+        env:
+          AWS_LC_SYS_PREBUILT_NASM: "0"
+        run: cargo test -p slates-cli --test shards --no-run 2>&1 | grep -v '^\s*Compiling '
+      - name: Run the file 40 times, each bounded at 90 s
+        env:
+          AWS_LC_SYS_PREBUILT_NASM: "0"
+          SLATES_TEST_CLI: "1"
+        run: |
+          exe=$(cargo test -p slates-cli --test shards --no-run 2>&1 | sed -n 's/.*Executable .*(\(.*\.exe\)).*/\1/p' | tail -1 | tr '\\' '/')
+          echo "exe=$exe"
+          hung=0
+          for i in $(seq 1 40); do
+            log="$RUNNER_TEMP/shards-$i.log"
+            "$exe" --nocapture > "$log" 2>&1 &
+            bg=$!
+            waited=0
+            while kill -0 "$bg" 2>/dev/null && [ "$waited" -lt 90 ]; do sleep 1; waited=$((waited + 1)); done
+            if kill -0 "$bg" 2>/dev/null; then
+              echo "=== iteration $i HUNG past ${waited} s"
+              pwsh -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { \$_.Name -match 'slates|shards' } | ForEach-Object { '{0} parent {1}: {2}' -f \$_.ProcessId, \$_.ParentProcessId, \$_.CommandLine }" || true
+              grep -v 'slates daemon: [a-z_0-9]* = ' "$log" | tail -60
+              winpid=$(cat "/proc/$bg/winpid" 2>/dev/null || echo "")
+              [ -n "$winpid" ] && taskkill //T //F //PID "$winpid" || true
+              hung=1
+              break
+            fi
+            set +e; wait "$bg"; code=$?; set -e
+            echo "iteration $i exit $code after ${waited} s"
+            if [ "$code" -ne 0 ]; then grep -E 'panicked|FAILED|test result' "$log" | head -20; fi
+          done
+          [ "$hung" -eq 0 ] && echo "no hang in 40 runs"
+          exit "$hung"
