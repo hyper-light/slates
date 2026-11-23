@@ -1886,7 +1886,9 @@
 > svn 1,000-revision import 2.4-2.6 GB -> 1.43-1.50 GB at once, same time. A-744 closed the record's growth, the retry
 > clone and the split (the 581 MiB is the owner partition's segment log ring and snapshot slots; the content object
 > 2.3 MiB). The log's decode-after-encode stays (main's
-> call: A-420's measure and guard). OWED: Windows' residency (`QueryWorkingSetEx`).
+> call: A-420's measure and guard). Windows' residency BUILT (2026-11-23, w-win for main 01a20182): `QueryWorkingSetEx`,
+> a page of entries a call, a page in RAM when it is in the working set, no written bit; it had been a typed refusal, so
+> `large::heap`'s `mapped_resident` read 0 there (CI run 45176536354, both Windows lanes).
 >
 > **A-746 (2026-11-20, w-engine):** the register split by kind: chain entries + checkpoints 270.5 MiB lead repository
 > records 222.4 MiB after the svn import. OWED: items 3-7 (a green's bytes named, on A-727's seam, agreed with w-perf);
