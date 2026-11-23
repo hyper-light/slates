@@ -1,0 +1,108 @@
+name: diag-w-win2
+
+# w-win2 for main 01a20182 (2026-11-23), item 2, run 11. A diagnostics lane run only from `diag-measurer-w-win2-*`
+# branches, never main. Item 2 merged with main (90f17f664, on 0d9cc659c: both of A-877's fixes): the cycle clock's own red, the_give_back_clock_reads_a_
+# step_of_microseconds, with the clock reverted on both Windows runners, then green; the idle sweep's tests three
+# rounds; the server's unit suite as CI runs it; and the server's clippy on Windows and Linux.
+
+on:
+  push:
+    branches: ["diag-measurer-w-win2-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  windows:
+    name: item 2 merged (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - name: NASM (x86_64 Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64 Windows)
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: "Item 2, red: the give-back clock test with the thread's charged time as the clock"
+        timeout-minutes: 45
+        run: |
+          git apply .github/diag-w-win2/a491-red.patch
+          set +e
+          cargo test -p slates-server --lib -- --test-threads=1 the_give_back_clock_reads_a_step_of_microseconds > "$RUNNER_TEMP/item2-red-clock.log" 2>&1
+          code=$?
+          set -e
+          git apply -R .github/diag-w-win2/a491-red.patch
+          grep -a '^test \|test result\|panicked at\|read [0-9]* ns' "$RUNNER_TEMP/item2-red-clock.log"
+          echo "red arm exit $code"
+          if [ "$code" -eq 0 ]; then echo "UNEXPECTED: the clock test passed on the charged time"; exit 1; fi
+      - name: "Item 2, green: the clock test and the idle sweep's tests, three rounds"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 45
+        run: |
+          set +e
+          failed=0
+          for round in 1 2 3; do
+            cargo test -p slates-server --lib -- --test-threads=1 the_give_back_clock_reads_a_step_of_microseconds idle_sweep::tests:: > "$RUNNER_TEMP/item2-green-$round.log" 2>&1
+            code=$?
+            echo "round $round: exit $code, $(grep -a 'test result' "$RUNNER_TEMP/item2-green-$round.log" | tail -1)"
+            if [ "$code" -ne 0 ]; then failed=1; fi
+          done
+          exit $failed
+      - name: "Item 2, green: the server's unit tests, one test at a time, as CI runs them"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 60
+        run: |
+          set +e
+          cargo test -p slates-server --lib -- --test-threads=1 > "$RUNNER_TEMP/item2-suite.log" 2>&1
+          code=$?
+          grep -a 'test result\|^failures:\|^    [a-z_:]*$\|panicked at' "$RUNNER_TEMP/item2-suite.log" | tail -40
+          exit $code
+      - name: Clippy the server on Windows, alone
+        if: ${{ !cancelled() }}
+        run: |
+          cargo clippy -p slates-server --no-deps --lib --tests -- -D warnings 2>&1 | grep -v '^\s*Checking \|^\s*Compiling \|^warning: aws-lc-sys'
+      - name: "Item 2: the test logs, whatever happened"
+        if: always()
+        run: |
+          for f in "$RUNNER_TEMP"/item2-*.log; do echo "=== $f"; grep -a '^test \|panicked at\|test result\|^thread \|assert\|read [0-9]* ns' "$f" | sed 's/slates daemon: descriptor_limit.*$//' | tail -40; done
+
+  linux:
+    name: item 2 merged (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - name: "Item 2, green: the clock test and the idle sweep's tests"
+        timeout-minutes: 45
+        run: |
+          cargo test -p slates-server --lib -- --test-threads=1 the_give_back_clock_reads_a_step_of_microseconds idle_sweep::tests:: 2>&1 | grep -a '^test \|test result\|panicked at\|read [0-9]* ns'
+      - name: Clippy the server on Linux
+        if: ${{ !cancelled() }}
+        run: |
+          cargo clippy -p slates-server --no-deps --lib --tests -- -D warnings 2>&1 | grep -v '^\s*Checking \|^\s*Compiling '
