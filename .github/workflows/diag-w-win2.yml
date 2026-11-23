@@ -1,11 +1,10 @@
 name: diag-w-win2
 
-# w-win2 for main 01a20182 (2026-11-23), A-879, run 7. A diagnostics lane run only from `diag-measurer-w-win2-*`
-# branches, never main. A-879: `slates write` holds the attachment it names from before it reads stdin until its write
-# is answered, and `Renew` answers an attachment with no term `NoTerm`. On both Windows runners: the extents file's
-# commit give-back test (256 MiB through a separately attached CLI attachment) red with the hold turned off, then the
-# whole extents file green, the attachment-term and hold tests, and clippy. On Linux: the cross-platform CLI test whose
-# input outlasts the term, red then green, and the CLI's term and write flows.
+# w-win2 for main 01a20182 (2026-11-23), A-879, run 9. A diagnostics lane run only from `diag-measurer-w-win2-*`
+# branches, never main. Run 7 found the 256 MiB commit give-back write, with the hold, ending before the test fed it
+# its input (BrokenPipe at the feed, content_extents_windows.rs:61) on both Windows runners. This run drives the flow by
+# hand with a real anchor and prints each command's exit code and stderr whole: a tiny write, a 64 MiB write, and
+# `slates attach --hold`.
 
 on:
   push:
@@ -15,17 +14,16 @@ env:
   CARGO_TERM_COLOR: never
 
 jobs:
-  windows:
-    name: A-879 on ${{ matrix.os }}
+  flow:
+    name: A-879 by hand (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os: [windows-latest, windows-11-arm]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 150
+    timeout-minutes: 90
     env:
       AWS_LC_SYS_PREBUILT_NASM: "0"
-      SLATES_TEST_CLI: "1"
     defaults:
       run:
         shell: bash
@@ -34,7 +32,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
-          components: clippy
       - name: NASM (x86_64 Windows)
         if: matrix.os == 'windows-latest'
         uses: ilammy/setup-nasm@v1.5.2
@@ -48,92 +45,11 @@ jobs:
           (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-      - name: "A-879, red: the commit give-back test with the write's hold turned off"
-        timeout-minutes: 45
+      - name: Build the CLI
         run: |
-          git apply .github/diag-w-win2/a879-red.patch
-          set +e
-          cargo test -p slates-cli --test content_extents_windows -- --test-threads=1 --nocapture a_freed_content_extent_gives_its_commit_back_on_windows > "$RUNNER_TEMP/a879-red.log" 2>&1
-          code=$?
-          set -e
-          git apply -R .github/diag-w-win2/a879-red.patch
-          grep -a '^test \|test result\|panicked at\|AttachmentExpired\|write: ' "$RUNNER_TEMP/a879-red.log" | grep -v '^slates daemon: \|^slates anchor: ' | tail -20
-          echo "red arm exit $code"
-          if [ "$code" -eq 0 ]; then echo "UNEXPECTED: the commit give-back test passed with the hold off"; exit 1; fi
-      - name: "A-879, green: the Windows extents tests"
-        if: ${{ !cancelled() }}
-        timeout-minutes: 45
+          cargo build -p slates-cli 2>&1 | grep -v '^\s*Compiling \|^warning: aws-lc-sys'
+      - name: "A-879 by hand: the writes and the hold, each one's stderr whole"
+        timeout-minutes: 20
         run: |
           set +e
-          cargo test -p slates-cli --test content_extents_windows -- --test-threads=1 --nocapture > "$RUNNER_TEMP/a879-extents.log" 2>&1
-          code=$?
-          grep -a '^test \|test result\|panicked at\|a [0-9]* MiB burst' "$RUNNER_TEMP/a879-extents.log" | grep -v '^slates daemon: \|^slates anchor: ' | tail -30
-          exit $code
-      - name: "A-879, green: the attachment-term tests and the library's holds"
-        if: ${{ !cancelled() }}
-        timeout-minutes: 30
-        run: |
-          set +e
-          cargo test -p slates-server --test attachment_term -- --test-threads=1 > "$RUNNER_TEMP/a879-term.log" 2>&1
-          term=$?
-          cargo test -p slates-client --test client -- --test-threads=1 a_hold > "$RUNNER_TEMP/a879-hold.log" 2>&1
-          hold=$?
-          grep -a '^test \|test result\|panicked at' "$RUNNER_TEMP/a879-term.log" "$RUNNER_TEMP/a879-hold.log"
-          [ "$term" -eq 0 ] && [ "$hold" -eq 0 ]
-      - name: Clippy the changed crates on Windows, each alone
-        if: ${{ !cancelled() }}
-        run: |
-          cargo clippy -p slates-ipc -p slates-client -p slates-api --no-deps --lib --tests -- -D warnings 2>&1 | grep -v '^\s*Checking \|^\s*Compiling \|^warning: aws-lc-sys'
-          cargo clippy -p slates-cli --no-deps --bins --test content_extents_windows -- -D warnings 2>&1 | grep -v '^\s*Checking \|^\s*Compiling \|^warning: aws-lc-sys'
-      - name: Clippy the server on Windows (A-877's own errors are expected there)
-        if: ${{ !cancelled() }}
-        run: |
-          cargo clippy -p slates-server --no-deps --lib --tests -- -D warnings 2>&1 | grep -v '^\s*Checking \|^\s*Compiling \|^warning: aws-lc-sys'
-      - name: "A-879: the test logs, whatever happened"
-        if: always()
-        run: |
-          for f in "$RUNNER_TEMP"/a879-*.log; do echo "=== $f"; grep -a '^test \|panicked at\|test result\|AttachmentExpired\|assert' "$f" | grep -v '^slates daemon: \|^slates anchor: ' | tail -40; done
-
-  linux:
-    name: A-879 on ubuntu-latest
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    env:
-      SLATES_TEST_CLI: "1"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.98.1
-      - name: "A-879, red: the CLI write whose input outlasts its attachment's term, with the hold turned off"
-        timeout-minutes: 45
-        run: |
-          git apply .github/diag-w-win2/a879-red.patch
-          set +e
-          cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture --exact a_write_whose_input_outlasts_its_attachments_term_holds_it > "$RUNNER_TEMP/a879-red.log" 2>&1
-          code=$?
-          set -e
-          git apply -R .github/diag-w-win2/a879-red.patch
-          grep -a '^test \|test result\|panicked at\|AttachmentExpired' "$RUNNER_TEMP/a879-red.log" | tail -20
-          echo "red arm exit $code"
-          if [ "$code" -eq 0 ]; then echo "UNEXPECTED: the late-input write passed with the hold off"; exit 1; fi
-      - name: "A-879, green: the late-input write and the CLI's term, hold and write flows"
-        if: ${{ !cancelled() }}
-        timeout-minutes: 45
-        run: |
-          set +e
-          cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture --exact a_write_whose_input_outlasts_its_attachments_term_holds_it a_cli_attachment_outlives_the_process_that_made_it attach_hold_keeps_a_cli_attachment_alive_until_its_process_ends the_anchor_supervises_a_daemon_the_verbs_answer_and_the_daemon_leaves_with_the_anchor > "$RUNNER_TEMP/a879-cli.log" 2>&1
-          code=$?
-          grep -a '^test \|test result\|panicked at' "$RUNNER_TEMP/a879-cli.log" | tail -20
-          exit $code
-      - name: "A-879, green: the attachment-term tests and the library's holds"
-        if: ${{ !cancelled() }}
-        timeout-minutes: 30
-        run: |
-          set +e
-          cargo test -p slates-server --test attachment_term -- --test-threads=1 > "$RUNNER_TEMP/a879-term.log" 2>&1
-          term=$?
-          cargo test -p slates-client --test client -- --test-threads=1 a_hold > "$RUNNER_TEMP/a879-hold.log" 2>&1
-          hold=$?
-          grep -a '^test \|test result\|panicked at' "$RUNNER_TEMP/a879-term.log" "$RUNNER_TEMP/a879-hold.log"
-          [ "$term" -eq 0 ] && [ "$hold" -eq 0 ]
+          .github/diag-w-win2/a879-flow.sh "$(pwd)/target/debug/slates.exe"
