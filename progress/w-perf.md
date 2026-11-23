@@ -485,3 +485,12 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   - Sent: w-shared inbox (image pages 22 MB); w-hg the revision_text frames (push::held::IndexHeld).
   - Owed: main's arena-14 on CI. Next per main: the content store's tables (3)(4); one rerun after w-hg's cut 3.
   - Worktree w-perf-rr removed (D'' on origin). Target dir was deleted by the disk cleanup.
+- 2026-11-23 ~14:00 PST (session restarted; now slates-work-b9):
+  - arena-14 (CI 45208924823) push-all killed the daemon on all legs: shard 0 spun >1 s in hg_push::segment. Cause:
+    my seal 0cd8ef36a -- each seal a run, a push's fork never merges, so every new row's lookup walked every run.
+  - LANDED 45de607e7: revert 2662ca69f; arena owner tags 79f9ae578 (mem.gauge.content.arena_<owner>_bytes/_asked);
+    sampler container tags b582df491. Sent w-shared ChunkWindows numbers (216fbf7fa).
+  - Next (main's ruling (a)): reland the seal with the push's runs merged a step at a time through index_upkeep's
+    merge_step, size-tiered, run count bound in a Derived: line; red: runs walked per lookup under the bound over a
+    long push, and one segment step within the quantum. Tell w-hg before touching crates/hg/src/index.rs.
+  - Waiting: arena-15 (main) on 45de607e7.
