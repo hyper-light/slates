@@ -384,3 +384,11 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   - A-867's confirming rounds (main, 45104222730): no p99 difference on a fast runner; it stays landed on the slow
     runner's evidence.
   - Nothing left in my queue.
+- 2026-11-22 ~23:30 PST: LANDED b1654ef67 (merge 8883ebfd1). A send into a full macOS hold channel waits for room within the
+  caller's liveness budget; before, it failed ENOBUFS.
+  - a_table_past_the_old_exec_limit (13 of 7,792 held) is green, anchor 33/33.
+  - Added held unit tests 44/44.
+  - Bug record docs/bugs/2026-11-22-a-full-macos-hold-channel-refused-holds-the-anchor-would-have-taken.md.
+  - Siblings: none (every other pair is a stream or Linux seqpacket).
+  - For main: clippy and the cross-lint for slates-anchor and slates-server, a Linux run of anchor and held.
+  - Queue empty.
