@@ -762,6 +762,10 @@
 >   listed both texts' lines, now walks them by cursors. Held by
 >   `a_pushs_churn_per_changeset_is_one_manifest_and_one_file` (1,600 files: red 291,519 B an edit at a 91,200 B
 >   manifest, now 102,015 B, 1.12 copies; 16 KiB files within one manifest and one file copy and 16 KiB of slack).
+>   Then no manifest copy at all (main's order of 2026-11-23, no allocation by design): the intake rebuilds a changeset
+>   or a manifest into the buffer of the one kept before the last (`Taker::spare`; `delta::apply_into` keeps its
+>   capacity), which no later delta rests on, so a manifest's rebuild allocates nothing past the first. The test now
+>   `a_pushs_churn_per_changeset_is_its_file_alone`: red 102,045 B an edit, now 10,766 B (0.12 manifests).
 > - A push's held high-water gauged BUILT (2026-11-23, w-hg; main's ruling: the 410 MiB bar's push-all peak first):
 >   `vcs.hg.push_held_high_bytes`, the push's admission held plus its file texts still in the content store, sampled as
 >   each segment lands before its let-go; `..._texts_high_bytes` its texts' share; `vcs.hg.push_rows_bytes` its fork's
