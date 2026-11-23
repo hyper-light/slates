@@ -94,7 +94,7 @@ jobs:
           for h in walk(json.load(open(sys.argv[1]))):
               totals[h["kind"]] = totals.get(h["kind"], 0) + (h.get("count") or h.get("value") or 0)
           for kind in sorted(totals): print(kind, totals[kind])' $RUNNER_TEMP/matrix-hg/status-after-push.json || true
-          echo "== peak RSS (compare arena-4 1baba966b: push-all 4115 x86, 4134 arm64 MiB)"; grep -E "daemon peak RSS|^(PASS|FAIL) (push-all|clone|clone-rev|stream-clone) " $RUNNER_TEMP/matrix-hg.out | sort -u | cut -c1-200 || true
+          echo "== peak RSS (compare arena-5 6dd799bf0: push-all 2188 x86, 2133 arm64 MiB; floor 1734)"; grep -E "daemon peak RSS|^(PASS|FAIL) (push-all|clone|clone-rev|stream-clone) " $RUNNER_TEMP/matrix-hg.out | sort -u | cut -c1-200 || true
           echo "== DIAG turns, by cpu"; grep 'DIAG hg-http turn' $A | sed 's/.*turn //' | awk '{for(i=1;i<=NF;i++) if($i ~ /^cpu_us=/){split($i,a,"="); print a[2] "\t" $0}}' | sort -k1,1nr | head -20 | cut -f2- || true
           echo "== DIAG begins over 10 ms cpu"; grep 'DIAG hg-http begin' $A | awk '{for(i=1;i<=NF;i++) if($i ~ /^cpu_us=/){split($i,a,"="); if (a[2] > 10000) print}}' | cut -c1-260 || true
           exit $rc
