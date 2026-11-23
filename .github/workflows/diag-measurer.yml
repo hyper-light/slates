@@ -1,0 +1,94 @@
+name: diag-measurer
+
+# main 01a20182 (2026-11-22, Ada: "finish your implementation work"): 84a Linux, arms G and E together. A = main
+# (1ce8a383a) against B = G+E on it, interleaved: 5 loaded rounds (two spinners a CPU, accept and conflict on 10 files),
+# then 3 quiet rounds with R9's provisioning bench. G: after its idle spin a shard naps on its own timer while it expects
+# work, and so does a client whose reply is due, so a wake has a kernel entry on its own CPU under PREEMPT_LAZY instead
+# of waiting for that CPU's tick. E: shards, and a client's reply-wait thread once, ask EEVDF for R9's floor as their
+# slice (no privilege), so the napper's wake may preempt a busy fair neighbour (PREEMPT_SHORT). Diagnostics only:
+# never main.
+
+on:
+  push:
+    branches: ["diag-measurer-main-84a-ge"]
+
+env:
+  CARGO_TERM_COLOR: never
+  PLAIN: "1ce8a383a36e8198607c168b3c6a16fa7c0ceebf a02dc972aaeebcecb0992e925e3f6f7b06c27a13"
+
+jobs:
+  ge-ab:
+    name: G+E A/B (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: The machine
+        run: |
+          echo "runner cpus $(nproc) kernel $(uname -r) limits: rtprio $(ulimit -r)"
+          echo "preempt: $(sudo cat /sys/kernel/debug/sched/preempt 2>/dev/null || echo unreadable)"
+          echo "sched features: $(sudo cat /sys/kernel/debug/sched/features 2>/dev/null || echo unreadable)"
+          echo "base slice ns: $(sudo cat /sys/kernel/debug/sched/base_slice_ns 2>/dev/null || echo unreadable)"
+          true
+      - name: Build both arms; B's focused tests
+        run: |
+          W="$RUNNER_TEMP/msr"; mkdir -p "$W/logs"
+          B="${PLAIN##* }"
+          for arm in $PLAIN; do
+            s="${arm:0:9}"; mkdir -p "$W/src-$s" "$W/bin-$s"
+            git archive --format=tar "$arm" | tar -xmf - -C "$W/src-$s"
+            ( cd "$W/src-$s" && CARGO_TARGET_DIR="$W/target-$s" cargo build --release --locked -p slates-client --example edit_merge_bench --example provision_bench ) > "$W/logs/build-$s.log" 2>&1 \
+              || { tail -40 "$W/logs/build-$s.log"; exit 1; }
+            cp "$W/target-$s/release/examples/edit_merge_bench" "$W/target-$s/release/examples/provision_bench" "$W/bin-$s/"
+          done
+          s="${B:0:9}"
+          for t in "slates-machine --test fair_slice" "slates-machine --lib nap" "slates-rt --test naps"; do
+            if ( cd "$W/src-$s" && CARGO_TARGET_DIR="$W/target-$s" cargo test --release --locked -p $t -- --nocapture ) > "$W/logs/test-$s-${t// /_}.log" 2>&1; then rc=0; else rc=$?; fi
+            echo "arm $s test [$t] exit $rc: $(grep -E '^test result' "$W/logs/test-$s-${t// /_}.log" | tail -1)"
+            [ $rc = 0 ] || { tail -30 "$W/logs/test-$s-${t// /_}.log"; exit 1; }
+          done
+      - name: Interleaved rounds, loaded then quiet
+        run: |
+          W="$RUNNER_TEMP/msr"
+          order() { if [ $(( $1 % 2 )) = 1 ]; then echo $PLAIN; else echo $PLAIN | awk '{print $2, $1}'; fi; }
+          set +e
+          for round in $(seq 1 5); do
+            for arm in $(order $round); do
+              s="${arm:0:9}"; L="$W/logs/loaded-$s-r$round.log"
+              echo "== loaded round $round arm $s $(date -u +%FT%TZ) load: $(uptime)" | tee "$L"
+              /usr/bin/time -f "loaded cpu: user %U s, sys %S s, wall %e s" perl -e 'alarm shift; exec @ARGV' 1200 "$W/bin-$s/edit_merge_bench" --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict </dev/null >> "$L" 2>&1
+              echo "exit $?" >> "$L"
+              grep -E "loaded cpu|shard naps|client naps|sliced parks|load throughput|_loaded_total_p(50|99|999)\b|^exit" "$L" | sort -u | cut -c1-220
+            done
+          done
+          for round in $(seq 1 3); do
+            for arm in $(order $round); do
+              s="${arm:0:9}"; L="$W/logs/quiet-$s-r$round.log"
+              echo "== quiet round $round arm $s" | tee "$L"
+              /usr/bin/time -f "quiet cpu: user %U s, sys %S s, wall %e s" perl -e 'alarm shift; exec @ARGV' 1200 "$W/bin-$s/edit_merge_bench" --quiet-only --files 10 --form accept --form conflict </dev/null >> "$L" 2>&1
+              echo "exit $?" >> "$L"; grep -E "quiet cpu|_quiet_total_p(50|99|999)\b|^exit" "$L" | cut -c1-200
+              PL="$W/logs/provision-$s-r$round.log"
+              perl -e 'alarm shift; exec @ARGV' 1200 "$W/bin-$s/provision_bench" </dev/null > "$PL" 2>&1; echo "exit $?" >> "$PL"
+              grep -E "spinning_1_p(50|99|999):|^exit" "$PL" | cut -c1-200
+            done
+          done
+          true
+      - name: Keep the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ge-ab-logs-${{ matrix.os }}
+          path: ${{ runner.temp }}/msr/logs
+          if-no-files-found: warn
