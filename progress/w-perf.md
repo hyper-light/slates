@@ -352,3 +352,14 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     bounded-work bug, red first (a poll stays within its quantum under that load). Then Acknowledge, CreateWork,
     Destroy. Then retry the bell arm and re-measure Linux's p999. Watch item: a client descheduled 13 ms between push
     and announcement read (once).
+- 2026-11-22 ~16:30 PST: 84a, two threads open, nothing landed since 185217879.
+  - macOS p999: the serve_loop holds are the reply write's wake_one, 1-33 ms of on-CPU kernel time
+    (os_sync_wake_by_address_any, SHARED). Runs 45072617323, 45072811313, 45074388808.
+    - spindump (45082342692): 69 of 106 samples sit at one kernel PC, a spin. It's unsymbolicated (needs the 25G332 KDK).
+    - Read: the VM's lock-holder preemption on the shared ulock. Probes 45078071137 and 45079961886 don't reproduce it.
+    - Race probe 45086631612 is running. Main runs the bare-metal check from fffa0046d (diag-measurer-w-perf-84a-mac-tail).
+    - The §3 long verbs went to codex-review (main, 2026-11-22).
+  - Linux arm F (Ada: "fix it"): agents/w-perf-84a-arm-f b44f0904f on E. The client pins to its shard's CPU for each
+    synchronous request; the region gains the shard's CPU word (layout version 5).
+    - F_diag 9ad9d4cc9. The A/B is 45087231374 on diag-measurer-w-perf-84a-f-ab.
+  - Worktrees: w-perf-diag and w-perf-armf. w-perf-land was removed (clean) to make room; re-add it to land.
