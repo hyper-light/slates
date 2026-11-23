@@ -117,7 +117,13 @@
 > and every clone (stock_git_verbs 1 of 8). Lifted when w-git's fetch-side readers (A-855's held answer, brought back and
 > made again) and the push decision's reads bring a let-go window back, with w-shared's red: annotated tags pushed, the
 > push ended, idle, then ls-remote and a clone byte-identical to stock.
-> **LIFTED (w-git, 2026-11-22, on main 01a20182's word):** `vcs_store::commit` lets a landed push's pack go again, or
+> **PUT BACK (w-git, 2026-11-23, main 01a20182's r165):** the lift below broke git/git's mirror clone after the push:
+> refused `Pack(Store(Unreadable { id: sha1:e11e53618242d5dbeeab1ff15707c7ec88c907cc }))` 16,270,345 bytes in
+> (`parts_copied=2`, `entries_judged=3712`), stock git's "possible repository corruption on the remote side": a fetch
+> path still reads a let-go window without bringing it back. `vcs_store::commit` lets nothing go again; the harness of
+> the lift (`KEEP_LANDED`, `keep_landed`, `homed_drive`'s bring-back) stays. Lifted again with a red that clones after a
+> multi-window pack's let-go, the needed object's window let go, not only the pack's first.
+> **LIFTED (w-git, 2026-11-22, on main 01a20182's word; put back above):** `vcs_store::commit` lets a landed push's pack go again, or
 > owes it to the push's end or the repository's idle give-back, with each gate on main: w-git's fetch-side readers
 > (A-864) and a push's readers, (b) its thin bases through `IndexedObjects::away` and (c) its policy and signature reads;
 > w-shared's three codex-review gates (7663054bb, a74f939c5); w-hg's hg half of 2b(b) (6b36e0269); w-git's upload
@@ -713,6 +719,20 @@
 >   The test-only one-call landing builds a push's works as the driver does, planned and then built over the
 >   store's read-through (`works_whole`); `Works::Whole` and the one-call `tree::work` arm are gone, and `prepare` takes
 >   the view alone. The store-made-texts oracle compares a file by the identities its row names.
+> - Branch heads kept as changesets land BUILT (2026-11-23, w-hg; main's ruling (b) on CI 45127535742: a `lookup` of a
+>   branch name ran one 348 ms step on x86, wrote 43 bytes, `branch_tip` scanning every revision's branch and then
+>   `branch_head_revs` walking the whole history, as `branchmap` whole did, 155-161 ms CPU a call). `HgIndex` keeps
+>   every branch's heads by 7.2's rule (`index::BranchHeads`), each changeset noted as `append_changesets` writes it (a
+>   parent on its branch ended; heads it descends from through other branches ended by a walk down to the branch's
+>   lowest head; then it), so the intake, an import, a re-base, a replay and a made changeset keep them a revision a
+>   step; a fork copies them, a commit's swap takes them. A view serving its whole changelog answers
+>   `branch_head_revs` from them (`Repository::maintained_branch_heads`), else walks
+>   (`discovery::walked_branch_head_revs`, the oracle); `branch_tip` tells a branch's name by its heads, no scan.
+>   Held by `kept_branch_heads_are_the_walks_after_every_group` (generated histories with merges, closes and branches
+>   taken again, appended in groups as segments land, equal to the walk and the rule after every group),
+>   `a_lookup_of_a_branch_name_reads_its_heads_not_the_history` and `branchmap_over_a_long_line_reads_its_heads_not_the_history`
+>   (a 170-changeset line: red 512 and 511 reads, now at most 8; `BranchHeads::answered` the non-vacuity count). A
+>   view that leaves a changeset out (secret, hidden) still walks: OPEN, rare in a publishing repository.
 > - A push's churn a manifest copy a changeset BUILT (2026-11-23, w-hg; main's orders on CI 45127535742: 57.3 GB through
 >   the allocator over the hg matrix, which breeds the 1.26 GB it keeps after push-all). Named by a counting allocator
 >   (`crates/hg/tests/push_heap.rs`, its store's windows in an arena as a daemon's are): an edit changeset allocated
