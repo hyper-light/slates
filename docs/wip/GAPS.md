@@ -962,6 +962,14 @@
 >   Grown to the longest chain before, it held 360 MB of chunks at the end of Mercurial's push. Held by
 >   `the_store_holds_the_texts_its_last_reads_lent_and_no_more` (red: bound 6,553,600 after a 400-version chain's read;
 >   now 1,064,960 for 4 reads, 384 texts let go, the latest found again unmade).
+>   REGRESSED on CI, then FIXED (2026-11-23, main's arena-13, CI 45193998198 at 85569cf25): that bound was the distinct
+>   texts of the last `clients_per_shard` x shards reads, hundreds on CI's runner, so mapped blocks resident after
+>   push-all rose from 68,661,248 to 646,410,240 bytes and stayed after idle (RSS 1,865 -> 2,235 MB on x86). The bound is
+>   now the walks in flight: the texts whose pieces are still being read, in whole chunks, and the larger of one chunk
+>   and the text a read lends, so a cache whose reads have ended holds one chunk; a walked text in a chunk given back is
+>   laid again in the newest. Held by `the_store_holds_the_walks_in_flight_not_the_reads_that_could_be_waiting` (red
+>   7,340,032 bytes reserved with room for 1,000 reads and no walk in flight; now 1,048,576) and
+>   `a_walk_in_flight_keeps_its_text_through_other_reads`. Owed: main's arena-14 on CI's runner.
 > - A Mercurial index's tail sealed by every append BUILT (2026-11-23, w-perf; w-hg's three conditions). Only an import
 >   sealed (`import::settle`), so a push's, a replay's and a made changeset's tail grew for the whole push: 56 MB of tail
 >   rows, two buffers each, still held at the end of Mercurial's push (`Index::admit` 34 MB, `table::encode_body` 22 MB).
@@ -5297,15 +5305,34 @@
 > **A verb's reply held for durability had no time bound: refused at the failover SLO (2026-11-18, A-354, §4.10 "Live
 > shipping"; g230).** `live_ship::defer` and `defer_destroy` held a reply until its log was durable, its owner fenced or
 > its volume destroyed, so a log that could never be held (A-353's catalog refused for good) kept its writer waiting 21
-> minutes. A hold now ends at the failover SLO, refused `DurabilityPending` and recorded as the request's outcome; the
-> writer still waits through a shorter silence. Test:
-> `a_verb_held_past_the_failover_delay_took_effect_once_and_its_resend_is_answered_its_own_reply`.
+> minutes. A hold now ends at the failover SLO, refused `DurabilityPending`; the writer still waits through a shorter
+> silence. Test: `a_verb_held_past_the_failover_delay_is_in_doubt_not_done_until_durable_and_runs_once`.
 > - **CLOSED 2026-11-20 (g226; main's ruling): the given-up verb never takes effect twice.** The refusal was recorded as
 >   the request's completion, so a consumer told to make the call again ran the verb a second time over its own effect
->   (an append twice, a directory's second making refused `AlreadyExists`). The verb's own reply is now the recorded
->   completion and the refusal goes unrecorded; `slates_client` sends the request again under its id once, so its caller
->   is handed the verb's own reply. A yield's waiters (A-409) still record the refusal: their write never took effect on
->   the successor.
+>   (an append twice, a directory's second making refused `AlreadyExists`). The verb's own reply was made the recorded
+>   completion and the refusal went unrecorded; `slates_client` sends the request again under its id once. A yield's
+>   waiters (A-409) still record the refusal: their write never took effect on the successor.
+> - **FIXED 2026-11-23 (w-chaos; A-354's second amendment): that recorded reply was a success no quorum held.** An owner
+>   cut off from its peers recorded `FsDone` for each write it gave up at the failover SLO, and the client's resend was
+>   handed it: nine writes acknowledged while the owner's log stayed durable at 163, and the successor, which took over
+>   from the holders' 163, served none of them (StaleNeverCommits and NoLoss broken in the cut-off, deafened and muted
+>   flows every CI night from 2026-11-21; the nemesis's NoLoss on 2026-11-21; the unheard-destroy flows' "exited 0" on
+>   2026-11-21 and 2026-11-22). The refusal is now recorded nowhere and the request keeps its place, told, so a resend
+>   joins the wait (never run twice) and is answered the outcome once decided (its own reply only once durable); a reply
+>   held on a yielded log is decided at the bound. Record:
+>   `docs/bugs/2026-11-23-a-held-write-given-up-at-the-failover-slo-was-recorded-done.md`.
+> - **Owed (w-chaos's finding, 2026-11-23):** a told request's place, like every held reply, lives in the owner shard's
+>   memory, so a daemon restart forgets it and a resend under its id afterwards runs the verb again (a held reply's
+>   restart has had this gap since A-200). And `live_ship::join` (and its destroy half) copies the first waiter at the
+>   key's position, which may be another request's when two wait on one position, so a retry can be answered with that
+>   request's reply; found by reading, not yet by a test.
+> - **Open (w-chaos, 2026-11-23): a write held past the held-write bound, one cut-off run in ten on adacachy2.** In
+>   `an_owner_cut_off_while_running_is_superseded_and_serves_nothing_stale` at load 69, a write sent 0.18 ms before the
+>   relay isolated its owner was held 20.86 s, until the heal, and refused `StaleEpoch { current: 2 }` (the flow's bound
+>   5.71 s), and no give-up was logged in the run: the write never waited where `live_ship::judge_held` judges it, so it
+>   was held before its verb ran, or its owner's failover estimate rose past the partition. Every invariant held in that
+>   run; the other nine passed, and CI's 19 judgements of the bound held. Owed: what held it, from a run that catches it
+>   with the owner's status read throughout.
 > - **Owed (the integrator's):** live_chaos and live_fleet flows that keep a writer waiting past the failover SLO (10 s)
 >   now meet `DurabilityPending` where they waited; each flow's stops are a few liveness budgets, under it, but a flow
 >   that stops every candidate longer must treat the refusal as its write's outcome (not acknowledged, so never owed to
@@ -10936,7 +10963,12 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >       single 782 MiB claim (76 % of the runner's 1 GiB shard) is no longer admitted again at a takeover: the successor
 >       takes its candidate claim over. The same room is now met at live-ship, typed when it is not (SLATES_DESIGN A-401,
 >       "The live chaos flows, in numbers"). The runner's case, six bounded claims on one fleet, is its own flow now:
->       `a_bounded_claim_is_served_by_its_successor_or_refused_before_it_ships` (run request filed 2026-11-18). **Owed:** a
+>       `a_bounded_claim_is_served_by_its_successor_or_refused_before_it_ships` (run request filed 2026-11-18). Until
+>       2026-11-23 it sized its claims from the status's `reserve=`, the capacity a shard has claimed from the pool so far
+>       (0 on a Linux daemon that has admitted nothing), so on Linux every claim was 0 MiB and the flow never shipped (CI
+>       nightly from 2026-11-20); it reads the shard's slice through the daemon's own derivation now
+>       (`slates_server::config::reserve_per_shard`;
+>       `docs/bugs/2026-11-23-the-bounded-claim-flow-sized-its-claims-from-capacity-claimed-so-far.md`). **Owed:** a
 >       candidate that joins the placement later and cannot admit refuses its first entry `NoRoom`, but the configuration
 >       may still name it a successor. And the control shard's view of its claims can name one its partition released (a
 >       claim admitted for a message the copy then refused is released at the next reconciliation, since only copies

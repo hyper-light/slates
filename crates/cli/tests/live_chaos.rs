@@ -5661,21 +5661,17 @@ fn kill_at_ack(
   AckRound::Judged
 }
 
-/// The bytes the first shard of `instance`'s daemon reserves for content, as `status` reports it (`reserve=`).
-fn shard_reserve(instance: &str) -> u64 {
-  let out = run_ready(instance, &["status"]);
-  out
-    .lines()
-    .find_map(|line| {
-      line
-        .trim_start()
-        .strip_prefix("shard 0:")?
-        .split_whitespace()
-        .find_map(|field| field.strip_prefix("reserve="))?
-        .parse()
-        .ok()
-    })
-    .unwrap_or_else(|| panic!("shard 0's reserve in {out:?}"))
+/// The bytes one shard of a fleet daemon here may claim for content: its slice of the content pool (A-98), the
+/// `reserve_per_shard` a daemon of [`SHARDS`] shards derives from this machine's memory, read through the daemon's own
+/// derivation (`slates_server::config::reserve_per_shard`) over the memory facts its daemons see. Not the status's
+/// `reserve=`, which is the capacity a shard has claimed from the pool so far: 0 on a Linux daemon before its first
+/// admission (A-853), so until 2026-11-23 every claim of this flow was 0 MiB there and refused `NoSpace` at its first
+/// write (CI nightly from 2026-11-20, both Linux runners; on adacachy2 `reserve=0` beside `reserve_per_shard =
+/// 21997586432`).
+fn shard_content_ceiling() -> u64 {
+  let memory = slates_machine::facts::Facts::query().memory;
+  let effective = slates_server::config::effective_capacity(&memory).get();
+  slates_server::config::reserve_per_shard(effective, SHARDS.parse().unwrap()).get()
 }
 
 /// Whether a refusal on stderr is the typed one a fleet with no room for a claim answers (§4.2, A-401).
@@ -5685,9 +5681,10 @@ fn refused_for_room(err: &str) -> bool {
 
 /// A-401 (§4.2: "a remote holder makes the same admission against its own machine before acknowledging placement")
 /// across real processes: the kill-at-acknowledgement flow with bounded claims that bind. Do, `ITERATIONS` times on one
-/// fleet, create a bounded volume of three quarters of a shard's content reserve on the owner (the share the stream
-/// bound's 782 MiB took of CI's 7 GB macOS runner's 1 GiB shards, so a daemon's two shards hold two such claims and
-/// refuse a third, on any machine), live-ship it, then run the kill-at-acknowledgement iteration on it. Expect each
+/// fleet, create a bounded volume of three quarters of a shard's content reserve on the owner (its slice of the content
+/// pool, [`shard_content_ceiling`]; the share the stream bound's 782 MiB took of CI's 7 GB macOS runner's 1 GiB shards,
+/// so a daemon's two shards hold two such claims and refuse a third, on any machine), live-ship it, then run the
+/// kill-at-acknowledgement iteration on it. Expect each
 /// iteration either refused typed (`BudgetExceeded`) at its create or its live-ship, before anything ships, or its probe
 /// and every file before it served by a survivor after the owner's death; and at least one iteration served. Before
 /// A-401 the live-ship was answered whatever the candidates could hold, and a successor without room gave a shipped
@@ -5707,7 +5704,7 @@ fn a_bounded_claim_is_served_by_its_successor_or_refused_before_it_ships() {
   let mut verdict =
     Verdict::new("a bounded claim served by its successor or refused before it ships");
   let owner_index = fleet.owner_index();
-  let claim_mib = shard_reserve(&fleet.instances[owner_index])
+  let claim_mib = shard_content_ceiling()
     .saturating_mul(CLAIM_SHARE.0)
     .checked_div(CLAIM_SHARE.1)
     .unwrap_or(0)

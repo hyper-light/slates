@@ -370,13 +370,15 @@ pub struct TextRow {
 /// Whole texts made from their chains, by identity, the least lately read out first, bounded in bytes; and what the
 /// reads did, the red tests' non-vacuity counters.
 ///
-/// **The bound, from the work (goal 93; main 01a20182's ruling of 2026-11-23).** A read needs one text: the one it
-/// lends, walked a piece a request ([`crate::store::PIECE_BYTES`]) by a caller that holds one walk at a time, and the
-/// next version of the same path, which a clone streams in order, finds the version before it, where its chain walk
-/// stops. So a cache made for `reads` callers at once ([`TextCache::for_reads`], the owner's room for waiting requests)
-/// holds the distinct texts its last `reads` reads lent, and a chunk's room besides. Until 2026-11-23 the bound grew to
-/// the longest chain a read had made, since a chain was made from the texts the cache held: on a push of Mercurial's own
-/// history it held 360 MB at the push's end. A chain is made through the cache's own two buffers now, so it needs none
+/// **The bound, from the work (goal 93; main 01a20182's rulings of 2026-11-23).** A read needs one text: the one it
+/// lends, walked a piece a request ([`crate::store::PIECE_BYTES`]) until a piece reaches its end. So a cache made for
+/// `reads` callers ([`TextCache::for_reads`], the owner's room for waiting requests) holds the texts whose walks are in
+/// flight (at most `reads` of them), and besides them the larger of one chunk and the text the read lends: the finished
+/// texts the newest chunk still holds, which is where the next version of a path a clone streams in order finds the one
+/// before, its chain walk's stop. With no walk in flight it holds at most that chunk, so a cache whose reads have ended
+/// holds no more than one. Until 2026-11-23 the bound grew to the longest chain a read had made (360 MB of chunks at the
+/// end of a push of Mercurial's history), and then to the distinct texts the last `reads` reads lent, which on CI's
+/// runner is hundreds: 646 MB of chunks resident after push-all and after idle (arena-13, CI 45193998198). A chain is made through the cache's own two buffers now, so it needs none
 /// held, and a text past the bound is lent from the buffer it was made into. A cache made with a fixed bound
 /// ([`TextCache::new`]) keeps it.
 ///
@@ -406,14 +408,17 @@ pub struct TextCache {
   reserved: u64,
   /// The most bytes the chunks may hold: fixed, or (with `reads`) derived from the last reads.
   bound: u64,
-  /// The reads at once the bound is derived for; zero for a fixed bound.
+  /// The walks in flight the bound may hold, the owner's room for waiting requests; zero for a fixed bound.
   reads: usize,
-  /// The texts the last `reads` reads lent, oldest first, with their lengths.
-  recent: std::collections::VecDeque<(Identity, u64)>,
-  /// How many of `recent` name each text.
-  recent_counts: std::collections::HashMap<Identity, u32>,
-  /// The bytes of the distinct texts in `recent`.
-  recent_bytes: u64,
+  /// The texts whose walks are in flight, by identity, with their lengths: a piece read and its end not reached.
+  walks: std::collections::HashMap<Identity, u64>,
+  /// Those walks, oldest begun first, so a walk past `reads` (a caller gone mid-walk) is the one let go.
+  walk_order: std::collections::VecDeque<Identity>,
+  /// The bytes of the texts walked.
+  walk_bytes: u64,
+  /// Set while a walked text is laid again from a chunk being given back, so that laying gives back without laying
+  /// again.
+  relaying: bool,
   /// The text the last chain made, which `base` holds until the next is made.
   last_made: Option<Identity>,
   /// The base the chain's next edit is applied to, while a chain is made.
@@ -464,9 +469,10 @@ impl TextCache {
       reserved: 0,
       bound,
       reads: 0,
-      recent: std::collections::VecDeque::new(),
-      recent_counts: std::collections::HashMap::new(),
-      recent_bytes: 0,
+      walks: std::collections::HashMap::new(),
+      walk_order: std::collections::VecDeque::new(),
+      walk_bytes: 0,
+      relaying: false,
       last_made: None,
       base: Vec::new(),
       next: Vec::new(),
@@ -486,8 +492,9 @@ impl TextCache {
   /// A cache for the reads of `reads` callers at once (the owner's room for waiting requests), its bound derived from
   /// them (the type's doc).
   ///
-  /// Derived: bound = the bytes of the distinct texts the last `reads` reads lent + one chunk (the mapped floor), the
-  /// newest chunk's room not yet laid.
+  /// Derived: bound = the bytes of the texts walked now (at most `reads` walks), rounded up to whole chunks (the mapped
+  /// floor) + the larger of one chunk and the text the read lends: a walk holds its text until a piece reaches its end, and the newest chunk keeps
+  /// the texts lately finished.
   pub fn for_reads(reads: usize) -> Self {
     let mut cache = Self::new(to_u64(slates_mem::large::floor()));
     cache.reads = reads;
@@ -523,32 +530,36 @@ impl TextCache {
       .or_else(|| (self.last_made == Some(*identity)).then_some(self.base.as_slice()))
   }
 
-  /// Records a read lending `identity` (`len` bytes): the bound derived again from the last reads, the text moved to the
-  /// newest chunk where it lies in an older one, so the least lately read go first, and the chunks past the bound given
-  /// back.
-  fn read(&mut self, identity: Identity, len: u64) {
+  /// Records a read lending `identity` (`len` bytes) from `offset`, as the owner serves it a piece
+  /// ([`crate::store::PIECE_BYTES`]) at a time: its walk in flight until a piece reaches the end, the bound derived again,
+  /// the text moved to the newest chunk where it lies in an older one (so the least lately read go first), and the chunks
+  /// past the bound given back.
+  fn read(&mut self, identity: Identity, len: u64, offset: u64) {
     if self.reads > 0 {
-      self.recent.push_back((identity, len));
-      let count = self.recent_counts.entry(identity).or_insert(0);
-      *count = count.saturating_add(1);
-      if *count == 1 {
-        self.recent_bytes = self.recent_bytes.saturating_add(len);
-      }
-      while self.recent.len() > self.reads {
-        let Some((gone, gone_len)) = self.recent.pop_front() else {
-          break;
-        };
-        if let Some(count) = self.recent_counts.get_mut(&gone) {
-          *count = count.saturating_sub(1);
-          if *count == 0 {
-            self.recent_counts.remove(&gone);
-            self.recent_bytes = self.recent_bytes.saturating_sub(gone_len);
+      let finished = offset.saturating_add(to_u64(crate::store::PIECE_BYTES)) >= len;
+      if finished {
+        if let Some(walked) = self.walks.remove(&identity) {
+          self.walk_bytes = self.walk_bytes.saturating_sub(walked);
+          self.walk_order.retain(|walking| *walking != identity);
+        }
+      } else if !self.walks.contains_key(&identity) {
+        self.walks.insert(identity, len);
+        self.walk_order.push_back(identity);
+        self.walk_bytes = self.walk_bytes.saturating_add(len);
+        while self.walk_order.len() > self.reads {
+          let Some(gone) = self.walk_order.pop_front() else {
+            break;
+          };
+          if let Some(walked) = self.walks.remove(&gone) {
+            self.walk_bytes = self.walk_bytes.saturating_sub(walked);
           }
         }
       }
-      self.bound = self
-        .recent_bytes
-        .saturating_add(to_u64(slates_mem::large::floor()));
+      // The walked texts in whole chunks (a text shorter than a chunk holds a chunk while it is walked), and the larger
+      // of a chunk and the text lent.
+      let chunk = to_u64(slates_mem::large::floor()).max(1);
+      let walked = self.walk_bytes.div_ceil(chunk).saturating_mul(chunk);
+      self.bound = walked.saturating_add(len.max(chunk));
     }
     self.refresh(identity);
     self.make_room(0);
@@ -644,9 +655,15 @@ impl TextCache {
     self.chunks.push_back(Chunk { bytes, whole });
   }
 
-  /// Gives back the oldest chunks, whole, until `len` bytes more fit the bound, forgetting the texts laid in them.
+  /// Gives back the oldest chunks, whole, until `len` bytes more fit the bound, forgetting the texts laid in them; a text
+  /// whose walk is in flight is laid again in the newest chunk first, so the walk finds it at its next piece (the bound
+  /// counts it).
   fn make_room(&mut self, len: usize) {
-    while self.reserved.saturating_add(to_u64(len)) > self.bound && !self.chunks.is_empty() {
+    // At most every chunk held now is given back: a walked text laid again lies in a chunk laid after them, so a bound
+    // that cannot hold the walks ends here, never in a loop.
+    let mut passes = self.chunks.len();
+    while self.reserved.saturating_add(to_u64(len)) > self.bound && passes > 0 {
+      passes = passes.saturating_sub(1);
       let Some(oldest) = self.chunks.pop_front() else {
         return;
       };
@@ -655,17 +672,36 @@ impl TextCache {
       self.reserved = self
         .reserved
         .saturating_sub(to_u64(oldest.bytes.capacity()));
+      let mut walked: Vec<(Identity, Lent)> = Vec::new();
       while let Some(&(identity, chunk)) = self.order.front()
         && chunk == number
       {
         self.order.pop_front();
-        if let Some(lent) = self.texts.get(&identity)
+        if let Some(lent) = self.texts.get(&identity).copied()
           && lent.chunk == number
         {
           self.bytes = self.bytes.saturating_sub(to_u64(lent.len));
           self.texts.remove(&identity);
-          self.let_go = self.let_go.saturating_add(1);
+          if !self.relaying && self.walks.contains_key(&identity) {
+            walked.push((identity, lent));
+          } else {
+            self.let_go = self.let_go.saturating_add(1);
+          }
         }
+      }
+      if !walked.is_empty() {
+        self.relaying = true;
+        for (identity, lent) in walked {
+          match lent
+            .at
+            .checked_add(lent.len)
+            .and_then(|end| oldest.bytes.get(lent.at..end))
+          {
+            Some(bytes) => self.keep(identity, bytes),
+            None => self.let_go = self.let_go.saturating_add(1),
+          }
+        }
+        self.relaying = false;
       }
     }
   }
@@ -1041,7 +1077,7 @@ impl Store {
       .lent(text)
       .map(<[u8]>::len)
       .ok_or(StoreError::BadRow)?;
-    cache.read(*text, to_u64(len));
+    cache.read(*text, to_u64(len), offset);
     // Held, or in the buffer the chain was made into where the bound could not hold it.
     let Some(whole) = cache.lent(text) else {
       return Err(StoreError::BadRow);
