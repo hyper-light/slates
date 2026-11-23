@@ -144,6 +144,22 @@ fn a_segment_is_created_attached_and_read_through_the_seqlock() {
   assert_eq!(words[2].load(Ordering::Acquire), 65_536 - 64);
 }
 
+/// 84a (boot): do create a segment and attach it. Expect the attach to open the object once (the thread's count of
+/// sparse opens moves by one): it reads its header and then declares the full layout on the same object. Before, it
+/// opened it twice, once for the header, and every open maps the whole object and on macOS marks it whole.
+#[test]
+fn an_attach_opens_its_segment_once() {
+  let id = identity();
+  let created =
+    AnchorSegment::create(&unique_name("slates-anchor-test-once"), &id, geometry()).unwrap();
+  let (handoff, len) = handoff_of(&created);
+  let before = slates_mem::SparseObject::opens_on_this_thread();
+  let attached = AnchorSegment::attach(&handoff, len, &id).unwrap();
+  let opens = slates_mem::SparseObject::opens_on_this_thread() - before;
+  assert_eq!(attached.geometry(), geometry());
+  assert_eq!(opens, 1, "the attach opened its segment {opens} times");
+}
+
 /// A-92: do create a segment and read its sealing root, then lock its page, publish a root through one attachment
 /// and read it through a later one (a restarted daemon re-attaching the anchor's segment); expect no root on the
 /// fresh segment, the page locked, and the later attachment adopting the very id and key the first published.
@@ -1664,6 +1680,7 @@ fn device_child() {
         attachment: DEVICE_ATTACHMENT,
         device: reader.as_fd(),
       },
+      SEND_WAIT_NS,
     )
     .unwrap();
     slates_anchor::held::send(
@@ -1672,6 +1689,7 @@ fn device_child() {
         attachment: DEVICE_ATTACHMENT,
         session: &DEVICE_SESSION,
       },
+      SEND_WAIT_NS,
     )
     .unwrap();
     std::process::exit(SENDER_EXIT);
@@ -1934,6 +1952,10 @@ const FULL_SLACK: u64 = 256;
 /// pair the anchor drains a step at a time, on a loaded runner.
 #[cfg(unix)]
 const FULL_WAIT_MS: u64 = 120_000;
+/// Shape: how long a test daemon's send may wait for room in the hold channel (nanoseconds): the full-table test's own
+/// wait, since the harness drains the anchor's end a poll at a time.
+#[cfg(unix)]
+const SEND_WAIT_NS: u64 = FULL_WAIT_MS * 1_000_000;
 
 /// Derived: the bytes past which the old handoff failed its exec here: Linux's limit on one string, `MAX_ARG_STRLEN`,
 /// `PAGE_SIZE * 32` ("the limit per string is 32 pages": `execve(2)`; `include/uapi/linux/binfmts.h`).
@@ -1998,6 +2020,7 @@ fn full_table_child() {
           attachment: attachment(index),
           device: reader.as_fd(),
         },
+        SEND_WAIT_NS,
       )
       .unwrap();
       held::send(
@@ -2006,6 +2029,7 @@ fn full_table_child() {
           attachment: attachment(index),
           session: &session(index),
         },
+        SEND_WAIT_NS,
       )
       .unwrap();
     }

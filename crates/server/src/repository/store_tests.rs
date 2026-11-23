@@ -1194,3 +1194,85 @@ fn a_region_held_window_is_restored_beside_the_named_texts_brought_back() {
   assert_eq!(region, (1, true), "the region's window after the restart");
   assert_eq!(folded, Some((FULL_LAST, FULL_LAST)), "recovered and folded");
 }
+
+/// A-865. Copy a directory from an older revision after the shared plane has released its source
+/// file's landed window. The durable text is still readable and the copy must land with those bytes.
+#[test]
+fn a_subversion_copy_from_a_stored_revision_reads_a_window_that_was_let_go() {
+  use slates_svn::index::{Action, CopySource, NodeKind};
+  let (_store, daemon) = crate::test_store::audit_daemon_stored_configured(|_| {});
+  let repository = created_subversion(&daemon, "cold-copy");
+  let first = b"source revision one";
+  let identity = slates_vcs::ContentId(*blake3::hash(first).as_bytes());
+  assert_eq!(
+    landed_work(&daemon, repository, 0, (Action::Add, first.to_vec())),
+    Ok(1)
+  );
+  crate::daemon::observe_first(&daemon, move |state| {
+    crate::vcs_store::within_budget(state, first.len() as u64, |stores| {
+      assert_eq!(
+        stores.content_mut().unwrap().put_object(first).unwrap(),
+        identity
+      );
+    });
+  });
+  assert_eq!(
+    landed_work(
+      &daemon,
+      repository,
+      1,
+      (Action::Modify, b"source revision two".to_vec())
+    ),
+    Ok(2)
+  );
+  let (released, durable, committed, copied) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let (released, disk) = crate::state::with_state(|state| {
+        let released = crate::vcs_store::within_budget(state, 0, |stores| {
+          stores
+            .content_mut()
+            .unwrap()
+            .let_go_object_landed(&identity, &|_| None)
+        });
+        (released, state.vcs_disk.clone().unwrap())
+      })
+      .unwrap();
+      let durable = disk
+        .text(u128::from_be_bytes(repository.bytes), identity.0, 0)
+        .await
+        .unwrap();
+      let (mut work, _) = file_work(2, Action::Add, b"");
+      let copy = work.record.changes.last_mut().unwrap();
+      copy.path = "/copy".to_owned();
+      copy.kind = NodeKind::Directory;
+      copy.text = None;
+      copy.copy_from = Some(CopySource {
+        path: "/trunk".to_owned(),
+        revision: 1,
+      });
+      work.texts.clear();
+      let texts = slates_svn::commit::drive::HeldTexts::new();
+      let committed = super::svn_commit::land_work((&owner(), repository), work, &texts)
+        .await
+        .unwrap()
+        .map(|landed| landed.revision);
+      let copied = crate::state::with_state(|state| {
+        let green = super::svn_commit::green_of(state, repository).ok()?;
+        state
+          .greens
+          .get(&green)?
+          .content("copy/a.txt")
+          .map(<[u8]>::to_vec)
+      })
+      .flatten();
+      (released, durable, committed, copied)
+    },
+    std::time::Duration::from_secs(60),
+  );
+  daemon.stop();
+  assert_eq!(released, (first.len() as u64, 0));
+  assert_eq!(durable.as_deref(), Some(first.as_slice()));
+  assert_eq!(committed, Ok(3));
+  assert_eq!(copied.as_deref(), Some(first.as_slice()));
+}

@@ -21523,7 +21523,7 @@ Status: built on macOS 2026-10-06; Linux built 2026-11-19 by A-550 (its unit tes
 - The rule: a restart is a slow reply, never a dropped connection.
   1. The daemon hands the anchor a duplicate of each accepted connection before reading its first request, over the
      hold channel A-61 made for FUSE devices (now Unix-wide: a sequenced-packet pair on Linux, a datagram pair on
-     macOS). The anchor hands what it holds to every daemon it spawns (`ENV_CONNECTIONS`). A connection that ends is
+     macOS, whose send into a full channel waits for room rather than failing `ENOBUFS`, 2026-11-22). The anchor hands what it holds to every daemon it spawns (`ENV_CONNECTIONS`). A connection that ends is
      shut down before its hold is released.
   2. A request leaves the kernel only once its reply is in it: records are peeked, served, their replies sent, then
      consumed. The receive low-water mark wakes a connection only when a whole record is queued. A successor finds
@@ -60606,6 +60606,12 @@ Status: built 2026-11-21, every platform (the cut and the claim are platform-fre
   is told what the arena still lacks and takes the smallest free part that covers it, else the largest; equal lengths
   go to the claimer's own slice first. An arena so grows by its need rounded up to a power of two of units, and
   doubles while claims keep coming.
+- A-848 clarification (2026-11-22, §4.2). An arena asks for enough mapped bytes to provide its
+  missing usable capacity. One region supplies a power-of-two number of whole granules. Growth
+  can accumulate several smaller regions and gives back an offer below one granule. An idle trade
+  replaces a region only when a smaller one can supply all the headroom it would take away.
+  The four mixed-size pool regressions are recorded in
+  `docs/bugs/2026-11-22-extent-claims-use-buddy-capacity.md`.
 - An extent id now names another range of the content object, so the layout version is 17 and an older segment is
   refused, never misread. A slice holds about two parts per bit of its length in units, at most
   `POOL_EXTENTS_PER_PARTITION` (64).

@@ -33,10 +33,22 @@ impl UnitSet {
     }
   }
 
-  /// Every unit of `len` bytes recorded.
+  /// Every unit of `len` bytes recorded, its words written whole: each full word all ones and the last word's units
+  /// alone. Every macOS open of a sparse object makes one over the whole object (its pages that may carry the reusable
+  /// mark, A-110), and a daemon's segment is about 100 GB of 16 KiB pages, 786 KB of words. Marked a span at a time, it
+  /// took 2.4 to 5.3 ms an open on a debug build, three opens a shard's start (84a, w-perf 2026-11-22).
   pub(crate) fn whole(len: usize, unit: usize) -> UnitSet {
     let mut set = UnitSet::new(len, unit);
-    set.mark(0, len);
+    let full = set.units.checked_div(WORD_BITS).unwrap_or(0);
+    let tail = set.units.checked_rem(WORD_BITS).unwrap_or(0);
+    for (at, word) in set.words.iter_mut().enumerate() {
+      *word = if at < full {
+        u64::MAX
+      } else {
+        span_mask(0, tail)
+      };
+    }
+    set.recorded = set.units;
     set
   }
 
@@ -173,6 +185,28 @@ mod tests {
   enum Step {
     Mark(usize, usize),
     Take(usize, usize),
+  }
+
+  /// 84a (boot). Do: make the whole set over every length from none to five words of units and a few more, at units of
+  /// 1, 3, 64 and 16,384 bytes, at once and by marking it from its first byte to its last. Expect the two equal, words,
+  /// units and the recorded count alike.
+  #[test]
+  fn a_whole_set_made_at_once_equals_one_marked_over_its_length() {
+    for unit in [1usize, 3, 64, 16_384] {
+      let longest = unit
+        .saturating_mul(WORD_BITS)
+        .saturating_mul(5)
+        .saturating_add(unit);
+      let step = (longest / 97).max(1);
+      let lens = (0..=longest)
+        .step_by(step)
+        .chain([1, unit, unit + 1, longest]);
+      for len in lens {
+        let mut marked = UnitSet::new(len, unit);
+        marked.mark(0, len);
+        assert_eq!(UnitSet::whole(len, unit), marked, "len {len}, unit {unit}");
+      }
+    }
   }
 
   proptest! {

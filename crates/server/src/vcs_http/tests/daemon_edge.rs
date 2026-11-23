@@ -3864,9 +3864,13 @@ fn a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows() {
   let windows: Vec<slates_vcs::ContentId> =
     pack.chunks(window).map(slates_vcs::ContentId::of).collect();
   // Each window marked landed, as the landed pack's let-go marks it, and let go where no home holds it here (a two-shard
-  // daemon pins about half to their home).
+  // daemon pins about half to their home). The pack's home here, where it holds the pack for the region, records its
+  // windows and lets them go first, as a landed pack's let-go tells it (A-724 piece 8c, goal 93 item 2b(b)): a window of
+  // an object the region holds is pinned until then (`vcs_store::landed_pin`).
   let ids = windows.clone();
+  let pack_identity = slates_vcs::ContentId::of(&pack);
   let (let_go, refused) = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    crate::vcs_store::homes::landed_pack_here(state, pack_identity);
     crate::vcs_store::within_budget(state, 0, |stores| {
       let content = stores.content_mut().expect("the content store");
       for id in &ids {
@@ -3992,8 +3996,9 @@ fn upload_advertised(edge: (u16, &CertificateDer<'static>), name: &str) -> (u16,
 /// A-864's readers (main 01a20182's r52: after git/git's push landed and its pack's windows were let go, every fetch and
 /// ls-remote answered "possible repository corruption", the advertisement's tag peel reading a let-go window). Do: push
 /// a create of `main` and [`LET_GO_TAGS`] annotated tags, each tag's entry between two MiB files in the pack; read the
-/// upload-pack advertisement; mark every window of the pack landed and let go those no home holds on the repository's
-/// shard; read the advertisement again; clone `main`. Expect: the second advertisement the first, byte for byte, its tags
+/// upload-pack advertisement; let the pack's home on the repository's shard record its windows and let them go, as a
+/// landed pack's let-go tells it, then mark every window of the pack landed and let go those no home holds there; read
+/// the advertisement again; clone `main`. Expect: the second advertisement the first, byte for byte, its tags
 /// peeled; windows brought back from the node's store to answer it; the clone whole. Red before: refused.
 #[test]
 fn an_advertisement_over_a_let_go_pack_is_the_one_over_it_held() {
@@ -4027,7 +4032,12 @@ fn an_advertisement_over_a_let_go_pack_is_the_one_over_it_held() {
   .expect("the repository's content store");
   let ids: Vec<slates_vcs::ContentId> =
     pack.chunks(window).map(slates_vcs::ContentId::of).collect();
+  let pack_identity = slates_vcs::ContentId::of(&pack);
   let let_go = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    // The pack's home here, where it holds the pack for the region, records where each window lies on the node's store
+    // and lets it go first (A-724 piece 8c, goal 93 item 2b(b)), as a landed pack's let-go tells it: a window of an
+    // object the region holds is pinned until then (`vcs_store::landed_pin`).
+    crate::vcs_store::homes::landed_pack_here(state, pack_identity);
     crate::vcs_store::within_budget(state, 0, |stores| {
       let content = stores.content_mut().expect("the content store");
       for id in &ids {
@@ -4589,7 +4599,12 @@ fn a_thin_push_whose_base_was_let_go_lands() {
   let created = pushed(edge, &name, &request);
   let ids: Vec<slates_vcs::ContentId> =
     pack.chunks(window).map(slates_vcs::ContentId::of).collect();
+  let pack_identity = slates_vcs::ContentId::of(&pack);
   let gone: Vec<bool> = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    // The pack's home here, where it holds the pack for the region, records its windows and lets them go first, as a
+    // landed pack's let-go tells it (A-724 piece 8c, goal 93 item 2b(b)): a window of an object the region holds is
+    // pinned until then (`vcs_store::landed_pin`).
+    crate::vcs_store::homes::landed_pack_here(state, pack_identity);
     crate::vcs_store::within_budget(state, 0, |stores| {
       let content = stores.content_mut().expect("the content store");
       for id in &ids {
@@ -4659,4 +4674,131 @@ fn a_thin_push_whose_base_was_let_go_lands() {
     );
   }
   assert!(brought > 0, "the thin push's base brought back");
+}
+
+/// A-864's push readers (main 01a20182's ruling of 2026-11-22, reader (c)): a verdict's read of an object the repository
+/// holds in a let-go window. Do: push a line of [`THIN_BASES`] commits, each adding a file a content window long; mark
+/// every window of the pack landed and let go those no home holds on the repository's shard; then create `refs/heads/other`
+/// at a commit of the line whose entry lies in a window let go, as stock git does with an empty pack. Expect: both
+/// pushes `200` with their refs `ok`, the commit's window brought back. The create's work is built before its verdict
+/// (A-752), through the green build's read-through (reader (a), w-shared's), which brings the commit back, so the
+/// verdict reads it held: this holds (c) covered by (a) and (b).
+#[test]
+fn a_create_at_a_commit_let_go_lands() {
+  use slates_git::object_name::Kind;
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let window = crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
+    state
+      .vcs_stores
+      .content()
+      .map(slates_vcs::ContentStore::window)
+  })
+  .unwrap_or(1 << 18);
+  let mut state = 0x6a09_e667_f3bc_c908u64;
+  let mut owned: Vec<(Kind, Vec<u8>)> = Vec::new();
+  let mut commits = Vec::new();
+  let mut parent: Option<ObjectId> = None;
+  for at in 0..THIN_BASES {
+    let file: Vec<u8> = (0..window)
+      .map(|_| {
+        state = state
+          .wrapping_mul(6_364_136_223_846_793_005)
+          .wrapping_add(1_442_695_040_888_963_407);
+        state.to_be_bytes()[0]
+      })
+      .collect();
+    let mut tree = format!("100644 f{at}\0").into_bytes();
+    tree.extend_from_slice(git_name(Kind::Blob, &file).as_bytes());
+    let parent_line = parent
+      .map(|parent| format!("parent {parent}\n"))
+      .unwrap_or_default();
+    let commit = format!(
+      "tree {}\n{parent_line}author A <a@example.com> 1700000000 +0000\ncommitter A <a@example.com> 1700000000 +0000\n\nc{at}\n",
+      git_name(Kind::Tree, &tree)
+    )
+    .into_bytes();
+    let id = git_name(Kind::Commit, &commit);
+    commits.push((owned.len(), id));
+    owned.push((Kind::Commit, commit));
+    owned.push((Kind::Tree, tree));
+    owned.push((Kind::Blob, file));
+    parent = Some(id);
+  }
+  let objects: Vec<(Kind, &[u8])> = owned
+    .iter()
+    .map(|(kind, bytes)| (*kind, bytes.as_slice()))
+    .collect();
+  let (pack, offsets) = pack_with_offsets(&objects, &[]);
+  let head = parent.expect("a head");
+  let mut request = Vec::new();
+  let line = format!("{ZERO} {head} refs/heads/main\0 report-status");
+  pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("the command");
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request.extend_from_slice(&pack);
+  let created = pushed(edge, &name, &request);
+  let ids: Vec<slates_vcs::ContentId> =
+    pack.chunks(window).map(slates_vcs::ContentId::of).collect();
+  let pack_identity = slates_vcs::ContentId::of(&pack);
+  let gone: Vec<bool> = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    // The repository goes idle first: the objects its reads keep lately, the line's commits among them, given back, so
+    // the create's verdict reads its commit from its window.
+    for id in state.vcs_stores.git_repositories() {
+      crate::vcs_store::git_encode::give_back_idle(state, id);
+    }
+    // The pack's home here, where it holds the pack for the region, records its windows and lets them go first, as a
+    // landed pack's let-go tells it (A-724 piece 8c, goal 93 item 2b(b)): a window of an object the region holds is
+    // pinned until then (`vcs_store::landed_pin`).
+    crate::vcs_store::homes::landed_pack_here(state, pack_identity);
+    crate::vcs_store::within_budget(state, 0, |stores| {
+      let content = stores.content_mut().expect("the content store");
+      for id in &ids {
+        content.mark_landed(id);
+      }
+    });
+    ids
+      .iter()
+      .map(|id| {
+        matches!(
+          crate::vcs_store::let_go_read(state, id),
+          Ok(_) | Err(slates_vcs::LetGoRefused::Away)
+        )
+      })
+      .collect()
+  });
+  let window_u64 = u64::try_from(window).expect("a window");
+  let target = commits.iter().find(|(index, _)| {
+    let at = usize::try_from(offsets[*index] / window_u64).expect("an index");
+    gone.get(at).copied().unwrap_or(false)
+  });
+  let Some((_, target)) = target.copied() else {
+    daemon.stop();
+    panic!("no commit's window let go: {gone:?}");
+  };
+  let (empty, _) = pack_with_offsets(&[], &[]);
+  let mut request = Vec::new();
+  let line = format!("{ZERO} {target} refs/heads/other\0 report-status");
+  pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("the command");
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request.extend_from_slice(&empty);
+  let branched = pushed(edge, &name, &request);
+  let brought = counted_on(&daemon, REPOSITORY, "vcs_store.read_through.brought_back");
+  daemon.stop();
+  for (what, answer, line) in [
+    ("the line", &created, "ok refs/heads/main"),
+    ("the create", &branched, "ok refs/heads/other"),
+  ] {
+    let report = String::from_utf8_lossy(&answer.1).into_owned();
+    assert_eq!(
+      (answer.0, report.contains(line)),
+      (200, true),
+      "{what}: {report}"
+    );
+  }
+  assert!(brought > 0, "the commit's window brought back");
 }

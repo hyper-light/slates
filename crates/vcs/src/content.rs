@@ -804,10 +804,26 @@ impl ContentStore {
     let tree = Tree::plan(bytes, self.window, self.fanout);
     let top = tree.levels.len().saturating_sub(1);
     let root = tree.root().ok_or(ContentRefused::NotHeld)?.identity;
+    // A window the store holds let go comes back from these bytes, which are its own: a put under a root or list held
+    // already holds it once more and keeps nothing below it, so without this a payload read from disk after a recovery
+    // put back only its new windows and read none of the rest (codex-review, 2026-11-22). First, so a refusal here
+    // leaves no hold taken.
+    self.bring_back_planned(&tree)?;
     let need = self.new_bytes(&tree, top)?;
     self.admit(need, 0)?;
     self.keep_tree(&tree, top)?;
     Ok(root)
+  }
+
+  /// Brings back each of `tree`'s windows the store holds let go ([`ContentStore::bring_back`]), from the planned bytes,
+  /// whose identities the plan has named already: no window is hashed again.
+  fn bring_back_planned(&mut self, tree: &Tree<'_>) -> Result<(), ContentRefused> {
+    for node in tree.levels.first().into_iter().flatten() {
+      if self.is_away(&node.identity) {
+        self.bring_back(&node.identity, node.bytes())?;
+      }
+    }
+    Ok(())
   }
 
   /// Starts an object put a window at a time ([`ContentStore::put_window`], [`ContentStore::finish_object`]): what an
@@ -3017,6 +3033,40 @@ mod tests {
       "nothing brought back by other bytes"
     );
     brought_back_whole(&mut store, (&object, &bytes), (&windows, window), before);
+  }
+
+  /// A-767 C5 and A-863. A recovery has a pack's lists and the lengths of its released
+  /// windows. Put the bytes read from disk through the same rows API as Git replay, then read
+  /// the pack by identity. Both the one-window pack and the two-window pack must read whole.
+  #[test]
+  fn putting_a_payload_read_from_disk_restores_every_window_after_recovery() {
+    for len in [NARROW, NARROW + 1] {
+      let bytes = patterned(len);
+      let mut before = ContentStore::new(u64::MAX, NARROW).unwrap();
+      let object = crate::rows::put(&mut before, &bytes).unwrap();
+      let byte_count = u64::try_from(len).unwrap();
+      assert_eq!(
+        before.let_go_object_landed(&object, &|_| None),
+        (byte_count, 0)
+      );
+      let mut after = ContentStore::new(u64::MAX, NARROW).unwrap();
+      assert_eq!(after.restore_away(before.aways().collect()), 0);
+      let lists = before
+        .lists()
+        .map(|(id, list)| (id, list.to_vec()))
+        .collect();
+      assert_eq!(after.restore_nodes(lists, before.names().collect()), 0);
+      assert!(after.object_bytes(&object, byte_count).is_none());
+      let put = crate::rows::put(&mut after, &bytes).unwrap();
+      assert_eq!(put, object);
+      assert_eq!(
+        after
+          .object_bytes(&put, byte_count)
+          .map(|read| read == bytes),
+        Some(true),
+        "a successful put must return a readable {len}-byte payload"
+      );
+    }
   }
 
   /// Each of `windows` marked landed and let go.

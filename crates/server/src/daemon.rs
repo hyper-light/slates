@@ -1972,6 +1972,16 @@ impl Daemon {
       .collect()
   }
 
+  /// What each shard's start did, in shard order (`crate::StartReport`): how it was sliced and its heaviest piece. A
+  /// shard whose start has not ended answers `None`; an observation the daemon could not make is its typed refusal.
+  pub fn shard_start_reports(&self) -> Result<Vec<Option<crate::StartReport>>, ObserveError> {
+    self
+      .shards
+      .iter()
+      .map(|shard| self.observe(Some(*shard), |s| s.start_report.clone()))
+      .collect()
+  }
+
   /// Every shard's forward-progress pulse ([`ShardPulse`], §4.14), read **directly** from the runtime's
   /// registry with no shard round-trip — the discipline of [`Self::fleet_progress`] — so it is reported even
   /// when a shard is too starved, or too wedged, to answer a query. In shard order; a shard whose registry
@@ -4550,6 +4560,9 @@ async fn start_shard(
   )
   .await;
   let took_us = started.elapsed().as_micros();
+  if let Ok(sliced) = &outcome {
+    let _ = state::with_state(|s| s.start_report = Some(crate::StartReport::from(sliced)));
+  }
   match outcome {
     Ok(sliced) => slates_machine::log_line!(
       "slates-server: shard {partition} initialized in {took_us} µs, {} µs of its CPU, in {} slices of {} units; the longest slice {} µs, the most CPU in one {} µs, ending at unit {} (a slice's floor {} µs, {} µs yielding)",
@@ -4729,6 +4742,9 @@ async fn init_shard(
   let (db, recovered, _catalog_most) =
     replay_catalog(&mut segment, (partition, config.caps, now), &mut slices).await?;
   let (arena, slice_capacity) = shard_arena(config, partition, env, identity)?;
+  slices
+    .piece_done("the pool's segment and its content regions")
+    .await;
   // The anchor holds this slice's content extents (Windows, A-789): a task of the shard, so a claim finds them held.
   #[cfg(windows)]
   crate::content_extents::spawn_slice_holds(config, partition);
@@ -4772,6 +4788,7 @@ async fn init_shard(
       config.region.bulk_bytes,
     ))
     .map_err(ServerError::Memory)?;
+  slices.piece_done("the store").await;
   let shard = registry::current_shard().unwrap_or(partition);
   // The stable anchor keys TLS authentication and completion origins (§4.8). A random
   // per-start nonce derives the member id used for voting and ownership. The anchor's
@@ -4828,6 +4845,9 @@ async fn init_shard(
   // each (the root voters), driven over the transport by the control shard's config plane
   // (`crate::fleet::drive_root_group`), exactly as the regional council is.
   let (root, node_regions, region_mirrors) = build_root_group(config, host);
+  slices
+    .piece_done("the council, the fleet and the root group")
+    .await;
   // The anchor-owned content object that survives a restart (§4.8), if the anchor provides one.
   // Shards share the one object, partitioned by index: this shard owns the slice `[start, end)`.
   let mut content = match AnchorSegment::open_content(env) {
@@ -4838,6 +4858,9 @@ async fn init_shard(
     content_slice(config, partition, content.as_mut());
   // The DAX range table (A-365; Windows' sections, A-448), with what the previous daemon recorded in it.
   let dax_ranges = dax_range_table(config, partition, content_range, content.as_mut());
+  slices
+    .piece_done("the content object, its write log and DAX table")
+    .await;
   // The telemetry sink keeps the most recent spans up to one client ring's depth (§4.14): a shard
   // processes at most a ring of in-flight requests, so a ring's depth of recent spans covers the
   // current activity window; older spans are shed (and counted), telemetry being the shed-first class.
@@ -4980,6 +5003,7 @@ async fn init_shard(
     refusals: std::collections::BTreeMap::new(),
     deferred: Vec::new(),
     server_task: None,
+    start_report: None,
     dead_clients: std::collections::VecDeque::new(),
     reaper_task: None,
     capture_deadlines: crate::deadlines::CaptureDeadlines::new(),
@@ -5178,6 +5202,9 @@ async fn init_shard(
     pending_green_materializations: std::collections::BTreeMap::new(),
     pending_repositories: std::collections::BTreeMap::new(),
   };
+  slices
+    .piece_done("the secrets, failover and the shard's state")
+    .await;
   // The mounts a predecessor kept that this partition's catalog names, recorded as this daemon's own before anything
   // below reacquires a base or resumes a landing (A-227); then this shard's learning ends, and the process's crossing
   // checks, which wait for every shard's, go on.
@@ -5201,11 +5228,15 @@ async fn init_shard(
   crate::landing::arm_owed_audit_look(&mut state, started_ns);
   // The NFSv4 purges a predecessor journaled and its owners never took go out at once (A-570).
   crate::nfs::arm_purges_at_start(&mut state, started_ns);
+  slices
+    .piece_done("the kept mounts, grants and owed looks")
+    .await;
   if let Some(retained) = retained {
     retained.restore(&mut state)?;
   }
   crate::retention::retain(&mut state)?;
   crate::retention::derive_log_budgets(&mut state);
+  slices.piece_done("retention").await;
   // The node's ML-KEM recipient (A-92 piece 4a), on the control shard, whose partition holds its sealed record: opened
   // under the root, or made and recorded now. Unavailable sealing leaves it `None`, reported in status.
   if partition == 0 {
@@ -5219,7 +5250,7 @@ async fn init_shard(
       }
     };
   }
-  slices.unit_done().await;
+  slices.piece_done("the node's sealing recipient").await;
   rebuild_and_report(&mut state, shard, &mut slices).await;
   #[cfg(windows)]
   crate::anchor_hold::install(

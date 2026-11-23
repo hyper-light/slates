@@ -2514,7 +2514,9 @@ pub(crate) fn landed_pin(
     return None;
   }
   let homed_here = homes::home_of(shards, window) == Some(shard);
-  (homed_here || homes::region_holds_here(window) > 0).then_some("homes")
+  // Held for the region here, itself or as a window of an object the region holds (a region hold names its object).
+  let region = homes::region_holds_here(window) > 0 || homes::region_holds_window(window);
+  (homed_here || region).then_some("homes")
 }
 
 /// Format: the status counter of the bytes of landed pushes' packs let go from the shard's content store (goal 93 item
