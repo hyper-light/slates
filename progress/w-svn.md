@@ -633,3 +633,12 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
   a_hook_view_brings_back_a_stored_text_whose_windows_were_let_go (test_store::a_text_whose_windows_are_away).
 - shuttle_green ContentUnread arm (E0004 in the nightly lane): 3241ae61e; compiles under --cfg shuttle.
 - NEXT: A-760 (b) piece 2 (patch at ~/.cache/w-svn-wip/a760b-piece2.patch).
+- named_tests lint fix (7 errors): aca97583a. confined_spawn macOS test allow: cb2a660bf. svn copy test message: e9b2797f3.
+## A-869 LANDED c14f88038 (merge bb4551eff): A-760 (b) piece 2, checkpoints name files
+- Checkpoint::named section (version 5 kept, old ones read as before); read_step a slice a step; restore refuses unread
+  typed (Unrestored). Recovery: GreenReplayPhase::Restoring; pre-pass brings back checkpoint names; replicas refuse
+  (merge.replica.checkpoint_unread). Clean-restart test waits for the deferred checkpoint (w-hg's flake).
+- Oracle with restores: 113 restores / 148 caught up / 131 by name; red first. Codec golden + hostile + read tests.
+- Run request for main: the register split (A-746's row: checkpoints MiB) on the 1,000-revision svn import, before
+  (c14f88038^) and after; clippy wall over merge + server.
+- NEXT (main starts it): piece 3, the history keeps a named version by name. OWED: copied tables still carried.
