@@ -8136,7 +8136,8 @@ mod tests {
   /// Main 01a20182's order of 2026-11-23: a wedged shard's verdict named `crates/rt/src/runtime.rs:38` for every
   /// observation's task, the submit's own line, so no culprit. Do: from a test, observe the first shard of an audit
   /// daemon (`observe_first`), reading inside the question what the shard's pulse says it is polling. Expect: the task
-  /// labelled with this file at the line that asked.
+  /// labelled with this file at the line that asked. The file is compared with `file!()` whole: a Windows build names
+  /// it `crates\server\src\daemon.rs`, which a `/`-separated suffix never matches (CI run 45176536354, both lanes).
   #[test]
   fn an_observations_task_is_labelled_where_its_asker_asked() {
     let daemon = audit_daemon();
@@ -8148,7 +8149,7 @@ mod tests {
     let seen = seen.expect("the shard's pulse");
     assert!(
       matches!(seen.label, Some(slates_rt::label::TaskLabel::Site(site))
-        if site.file().ends_with("src/daemon.rs") && site.line() == line),
+        if site.file() == file!() && site.line() == line),
       "{seen}"
     );
   }
@@ -8504,6 +8505,8 @@ mod tests {
         seen = looked;
         break;
       }
+      // The harness paces its looks; the daemon under test waits on its wheel.
+      #[allow(clippy::disallowed_methods)]
       std::thread::sleep(std::time::Duration::from_millis(20));
     }
     second.stop();
