@@ -106,6 +106,7 @@ mod tests {
       method: "REPORT",
       path,
       depth: None,
+      label: None,
       body,
     };
     let Answer::Whole(answered) = answer(&served, &request, &BOUNDS, 1 << 20) else {

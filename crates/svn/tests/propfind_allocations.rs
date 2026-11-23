@@ -144,6 +144,7 @@ fn counted(repository: &Standalone, locks: &LockTable, body: &[u8]) -> (usize, u
     method: "PROPFIND",
     path: "/trunk",
     depth: Some("1"),
+    label: None,
     body,
   };
   let before = CALLS.get();

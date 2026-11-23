@@ -604,6 +604,7 @@ fn read_through_the_lender(id: RepositoryId) -> (bool, bool, Vec<u8>, Vec<u8>, V
       method,
       path,
       depth,
+      label: None,
       body,
     };
     stores
