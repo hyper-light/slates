@@ -5572,6 +5572,11 @@ pub struct GiveBackSteps {
 /// Counter: content bytes an idle shard gave back to the OS (A-105).
 pub const CONTENT_PURGED: &str = "content.purged_bytes";
 
+/// Counter: content bytes an idle shard's purge left resident, free runs shorter than the discard size
+/// (`slates_mem::Purged::kept_short`; main 01a20182's ruling of 2026-11-23 on arena-12's content object). Format: a
+/// counter name in the status report.
+pub const CONTENT_PURGE_KEPT_SHORT: &str = "content.purge_kept_short_bytes";
+
 /// Counter: recovery memory an idle shard gave back because no restart reads it (A-117).
 pub const RECOVERY_RETURNED: &str = "recovery.returned_bytes";
 
@@ -5674,6 +5679,10 @@ async fn purge_if_idle() -> bool {
       };
       let bytes = purged.bytes.saturating_add(log);
       s.count(CONTENT_PURGED, u64::try_from(bytes).unwrap_or(u64::MAX));
+      s.count(
+        CONTENT_PURGE_KEPT_SHORT,
+        u64::try_from(purged.kept_short).unwrap_or(u64::MAX),
+      );
       // While any give-back is left, the next turn gives back another (A-226).
       Some(purged.more || recovery_left)
     })

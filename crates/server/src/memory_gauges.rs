@@ -15,6 +15,11 @@
 //!   current files, history, change index, rejected results.
 //! - `held.*`: the shard's content hold's charge and objects (inputs, checkpoints, replicas), and its chains' entries and
 //!   bytes.
+//! - `content.*`: the shard's chunk arena over the content object: the bytes its regions map, their free bytes, the
+//!   freed bytes zeroed in place an idle purge would give back, the frees held for a committed image (A-64), and the
+//!   regions' pages in RAM (`ChunkArena::residency`). Beside them the counter `content.purge_kept_short_bytes`: free
+//!   runs a purge left resident for being shorter than the discard size. A content object resident past what the arena
+//!   holds is told apart by them: frees not yet purged (an idle pass not yet run), short runs kept, or frees deferred.
 //! - `process.*` (the control shard alone, the process's figures once): the system allocator's live bytes and the bytes
 //!   it ever allocated (its churn), and the
 //!   mapped blocks live and their resident bytes (`slates_mem::large::heap`). A resident set past the live bytes and
@@ -36,6 +41,7 @@ pub(crate) fn rows(state: &ShardState, memory: bool) -> Vec<RefusalCount> {
   let mut rows = state.vcs_stores.memory_rows();
   rows.extend(green_rows(state));
   rows.extend(held_rows(state));
+  rows.extend(content_rows(state));
   if crate::verbs::is_control_shard(state) {
     let heap = slates_mem::large::heap();
     rows.extend([
@@ -69,6 +75,37 @@ pub(crate) fn rows(state: &ShardState, memory: bool) -> Vec<RefusalCount> {
       count,
     })
     .collect()
+}
+
+/// The shard's chunk arena over the content object (main 01a20182's ruling of 2026-11-23: arena-12 found the content
+/// object 753 MiB resident against 183 MB the content store used): the regions it maps, their free bytes, the freed
+/// bytes zeroed in place that an idle purge would give back, the frees held for a committed image (A-64), and the
+/// regions' pages in RAM, read from the page table as the large path's `mapped_resident` is.
+fn content_rows(state: &ShardState) -> [(&'static str, u64); 5] {
+  let arena = state.store.content.arena();
+  let bytes = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+  [
+    (
+      "mem.gauge.content.arena_mapped_bytes",
+      bytes(arena.mapped_bytes()),
+    ),
+    (
+      "mem.gauge.content.arena_free_bytes",
+      bytes(arena.free_bytes()),
+    ),
+    (
+      "mem.gauge.content.arena_resident_free_bytes",
+      bytes(arena.resident_free_bytes()),
+    ),
+    (
+      "mem.gauge.content.arena_deferred_bytes",
+      bytes(arena.deferred_bytes()),
+    ),
+    (
+      "mem.gauge.content.object_resident_bytes",
+      arena.residency().resident,
+    ),
+  ]
 }
 
 /// The greens' retained bytes, summed over the shard's greens.
@@ -124,7 +161,8 @@ fn held_rows(state: &ShardState) -> Vec<(&'static str, u64)> {
 mod tests {
   /// The memory status's gauges (main 01a20182, 2026-11-22 03:46). Do: on one shard, make a green with one file written
   /// and accepted, then read the shard's report with and without memory. Expect: with memory, the greens' rows (one green,
-  /// its current file bytes) and the content hold's (its checkpoint, the version folded); without, no gauge row at all (a plain status does no residency work).
+  /// its current file bytes), the content hold's (its checkpoint, the version folded) and the content arena's (its
+  /// regions mapped and in RAM past the file's bytes); without, no gauge row at all (a plain status does no residency work).
   #[test]
   fn a_memory_status_names_its_holders_and_a_plain_one_none() {
     let (with, without) = crate::daemon::audit_on_shard(|state| {
@@ -203,6 +241,19 @@ mod tests {
     );
     assert!(
       with.contains_key("mem.gauge.held.content_manifests"),
+      "{with:?}"
+    );
+    // The content arena's rows (main 01a20182, 2026-11-23): the file's bytes lie in a region it maps, in RAM.
+    assert!(
+      with
+        .get("mem.gauge.content.arena_mapped_bytes")
+        .is_some_and(|bytes| *bytes >= 4096),
+      "{with:?}"
+    );
+    assert!(
+      with
+        .get("mem.gauge.content.object_resident_bytes")
+        .is_some_and(|bytes| *bytes >= 4096),
       "{with:?}"
     );
     assert!(without.is_empty(), "{without:?}");
