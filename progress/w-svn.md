@@ -648,3 +648,7 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - Sibling reported: takeover adoption replay has no pre-pass (latent since A-865).
 - Reaper: freed 3.4 GiB (target objects + test executables 2.76 GiB, old logs/dumps 639 MiB).
 - NEXT: piece 4 under main's ruling (I): 4a identity digest + named::Identity plain BLAKE3 + goldens + layout bump.
+- Re-adoption bridge (main's (a)): 9a868c263 (merge 5fc5c9ed5). One planner svn_texts::to_bring; bringers bring_whole_in
+  (recovery) and bring_whole (bring_back_named_live); green_adopt::readopt_with. Red: a_readopted_green_brings_back_...
+  End to end unreachable until A-727 (d) (w-shared's; told the entry points).
+- NEXT: piece 4a (identity digest), under main's ruling (I).
