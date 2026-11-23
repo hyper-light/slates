@@ -2652,7 +2652,6 @@ fn let_go_window(
   }
 }
 
-
 /// A landed pack let go whole in one call with the node's shards `shards`, which rank the pack's home, each window kept where this shard
 /// holds it for the region ([`landed_pin`]). The pack's
 /// home on the node told first (goal 93 item 2b(b), [`homes::landed_pack_here`]): where it holds the pack for the region,
