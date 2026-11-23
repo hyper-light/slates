@@ -445,6 +445,36 @@ pub fn encode(
   Ok(())
 }
 
+/// A payload's version byte for `format`: what comes before its markers ([`encode_markers`]).
+pub fn header(format: Format) -> u8 {
+  match format {
+    Format::V0 => VERSION_0,
+    Format::V1 => VERSION_1,
+  }
+}
+
+/// Appends `markers` in `format` with no version byte, a payload's markers after its [`header`], checked as [`encode`]
+/// checks them; nothing is written on a refusal.
+pub fn encode_markers(
+  format: Format,
+  markers: &[Marker<'_>],
+  out: &mut Vec<u8>,
+) -> Result<(), EncodeRefusal> {
+  check(format, markers)?;
+  for marker in markers {
+    match format {
+      Format::V0 => write_v0(marker, out),
+      Format::V1 => write_v1(marker, out),
+    }
+  }
+  Ok(())
+}
+
+/// The length of [`encode_markers`]' bytes for `markers` in `format`, refused as it refuses.
+pub fn markers_len(format: Format, markers: &[Marker<'_>]) -> Result<u64, EncodeRefusal> {
+  encoded_len(format, markers).map(|len| len.saturating_sub(1))
+}
+
 /// Refuses the first marker `format` cannot carry, naming it.
 fn check(format: Format, markers: &[Marker<'_>]) -> Result<(), EncodeRefusal> {
   for (index, marker) in markers.iter().enumerate() {
@@ -462,11 +492,7 @@ fn check(format: Format, markers: &[Marker<'_>]) -> Result<(), EncodeRefusal> {
 
 /// Writes the version byte and markers [`check`] passed.
 fn write(format: Format, markers: &[Marker<'_>], out: &mut impl Out) {
-  let version = match format {
-    Format::V0 => VERSION_0,
-    Format::V1 => VERSION_1,
-  };
-  out.put(&[version]);
+  out.put(&[header(format)]);
   for marker in markers {
     match format {
       Format::V0 => write_v0(marker, out),
