@@ -743,7 +743,15 @@ impl Building {
     let stage = core::mem::replace(&mut self.stage, Stage::Done);
     self.stage = match stage {
       Stage::Begin => self.begin(green)?,
-      Stage::Walk(walk) => self.walked(walk, objects)?,
+      Stage::Walk(walk) => match self.walked(walk, objects) {
+        Ok(stage) => stage,
+        // A tree not at hand: the walk put back, to be taken again once it is ([`Unavailable::NotYet`]).
+        Err(Unwalked::Waiting(refused, walk)) => {
+          self.stage = Stage::Walk(*walk);
+          return Err(refused);
+        }
+        Err(Unwalked::Refused(refused)) => return Err(refused),
+      },
       Stage::Named { walk, at, named } => named_unit(walk, at, named),
       Stage::Entries {
         walk,
@@ -876,18 +884,28 @@ impl Building {
   }
 
   /// A unit of the walk; once it is done, the head's operation and the naming begun.
-  fn walked<O: PushObjects + ?Sized>(&self, walk: Walk, objects: &O) -> Result<Stage, PushRefused> {
+  fn walked<O: PushObjects + ?Sized>(&self, walk: Walk, objects: &O) -> Result<Stage, Unwalked> {
     let mut walker = Walker { objects, walk };
-    if walker.unit()? {
-      return Ok(Stage::Walk(walker.walk));
+    match walker.unit() {
+      Ok(true) => return Ok(Stage::Walk(walker.walk)),
+      Ok(false) => {}
+      Err(
+        refused @ PushRefused::Object {
+          why: Unavailable::NotYet,
+          ..
+        },
+      ) => return Err(Unwalked::Waiting(refused, Box::new(walker.walk))),
+      Err(refused) => return Err(Unwalked::Refused(refused)),
     }
     let mut walk = walker.walk;
     if let Some(head) = &self.push.head {
-      walk.emit(VolumeOp::SetXattr {
-        path: ROOT.to_owned(),
-        name: HEAD_ATTRIBUTE.to_owned(),
-        value: head.clone(),
-      })?;
+      walk
+        .emit(VolumeOp::SetXattr {
+          path: ROOT.to_owned(),
+          name: HEAD_ATTRIBUTE.to_owned(),
+          value: head.clone(),
+        })
+        .map_err(Unwalked::Refused)?;
     }
     Ok(Stage::Named {
       walk,
@@ -1052,6 +1070,14 @@ impl<O: ?Sized> core::ops::Deref for Walker<'_, O> {
   }
 }
 
+/// Why a unit of the walk did not move it ([`Building`]'s `walked`).
+enum Unwalked {
+  /// A tree not at hand ([`Unavailable::NotYet`]): the walk, put back, to be taken again once it is.
+  Waiting(PushRefused, Box<Walk>),
+  /// Refused: the build is.
+  Refused(PushRefused),
+}
+
 impl<O: ?Sized> core::ops::DerefMut for Walker<'_, O> {
   fn deref_mut(&mut self) -> &mut Walk {
     &mut self.walk
@@ -1062,8 +1088,24 @@ impl<O: PushObjects + ?Sized> Walker<'_, O> {
   /// One unit of the walk: an entry of the trees being compared, or the next step. Whether units remain.
   fn unit(&mut self) -> Result<bool, PushRefused> {
     if let Some(mut comparing) = self.walk.comparing.take() {
-      if self.compare_unit(&mut comparing)? {
-        self.walk.comparing = Some(comparing);
+      match self.compare_unit(&mut comparing) {
+        Ok(more) => {
+          if more {
+            self.walk.comparing = Some(comparing);
+          }
+        }
+        // A tree not at hand ([`Unavailable::NotYet`]), read before the comparison moved: put back, to be read again
+        // once it is.
+        Err(
+          refused @ PushRefused::Object {
+            why: Unavailable::NotYet,
+            ..
+          },
+        ) if matches!(comparing.side, Side::ReadBase | Side::ReadPushed) => {
+          self.walk.comparing = Some(comparing);
+          return Err(refused);
+        }
+        Err(refused) => return Err(refused),
       }
       return Ok(true);
     }
@@ -1160,12 +1202,17 @@ impl<O: PushObjects + ?Sized> Walker<'_, O> {
     let Some(id) = id else {
       return Ok(Listing::of(Vec::new()));
     };
+    let listed = self
+      .objects
+      .listing(id)
+      .map_err(|why| PushRefused::Object {
+        path: path.to_owned(),
+        id,
+        why,
+      })?;
+    // Counted once read, as a blob is: a tree not at hand, read again, is one read.
     self.reads.trees = self.reads.trees.saturating_add(1);
-    self.objects.listing(id).map_err(|why| PushRefused::Object {
-      path: path.to_owned(),
-      id,
-      why,
-    })
+    Ok(listed)
   }
 
   /// The operations for one path: what the base held there and what the push holds.

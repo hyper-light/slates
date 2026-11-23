@@ -18,7 +18,9 @@
 //! ([`Entry::canonical_mode`](crate::objects::tree::Entry::canonical_mode)), so a legacy `100664` is a plain file and
 //! a mode of no known type a submodule's link. A tree is parsed and its entries listed within the store's room, as the
 //! store parses one; a blob of one window is lent as kept, and a longer one assembled for the caller, which charged its
-//! length to the work's room before asking (A-618).
+//! length to the work's room before asking (A-618). A read that meets a window let go answers `NotYet`, the window
+//! noted on the repository (`Repository::waiting`), so its owner brings it back from the node's store and the build
+//! takes the unit again (goal 93 item 2b).
 //!
 //! **Counters** ([`ViewCounters`]): the objects lent as kept, assembled, and lent again. The tests read them, so a dead
 //! path that lends without a copy, or a dead reuse, cannot pass for a working one.
@@ -214,6 +216,19 @@ impl<'a> PushedObjects<'a> {
     Ok((kind, at, held.len))
   }
 
+  /// Why a stored read of the repository's answered none: `NotYet` where it met a window let go (goal 93 item 2b,
+  /// `Repository::waiting`, noted again so the build's owner finds it and brings it back before the unit is taken
+  /// again); else `Malformed`, bytes that are not the object.
+  fn unread(&self) -> Unavailable {
+    match self.repository.waiting() {
+      Some(waited) => {
+        self.repository.wait_for(waited);
+        Unavailable::NotYet
+      }
+      None => Unavailable::Malformed,
+    }
+  }
+
   /// An object's bytes: in the store as kept when they are one window, otherwise assembled from their windows; or read
   /// where they lie in the push's pack (`Push::bytes`).
   fn bytes(&self, at: &At, len: u64) -> Result<Cow<'a, [u8]>, Unavailable> {
@@ -225,7 +240,7 @@ impl<'a> PushedObjects<'a> {
         return self
           .repository
           .read_stored(self.store, stored, len)
-          .ok_or(Unavailable::Malformed);
+          .ok_or_else(|| self.unread());
       }
       At::Pushed(id) => {
         let outside = IndexBases {
