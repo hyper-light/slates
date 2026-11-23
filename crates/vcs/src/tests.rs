@@ -649,6 +649,51 @@ fn a_merge_made_a_table_a_step_reads_the_same_rows_throughout_and_ends_as_one_ru
   assert_empty(&store);
 }
 
+/// Shape: the rows the tiered test appends, a seal due every few rows under the tests' window: hundreds of seals.
+const TIERED_ROWS: u16 = 2_000;
+
+/// Goal 93 (the index seal's reland, main's ruling of 2026-11-23: a push's fork seals as it appends, its runs bounded by
+/// a size-tiered merge so a lookup walks O(log rows) of them; arena-14's segment steps grew with the push, the fork's
+/// runs never merged). Do: append [`TIERED_ROWS`] rows to an index under the tests' window, sealing whenever due; after
+/// each seal, merge whatever [`Index::tiered_due`] names, a table at a time, until none is due. Expect, after every
+/// append: the own runs within the rule's bound (⌊log₃(rows ÷ the fewest rows a seal writes)⌋ + 1); merges made (the
+/// counter, so the bound is not met by sealing nothing); every row read back at the end. Red before: no tiered rule, so
+/// the runs grew a seal at a time, one past the bound within a few dozen seals.
+#[test]
+fn a_tiered_merge_keeps_an_indexs_runs_within_a_logarithm_of_its_rows() {
+  let mut store = ContentStore::new(1 << 26, WINDOW).unwrap();
+  let mut index = Index::new();
+  let mut fewest = u64::MAX;
+  let mut seals = 0_u64;
+  for at in 0..TIERED_ROWS {
+    let key = at.to_be_bytes();
+    index
+      .insert(&mut store, row(&key, &[], b"payload"))
+      .unwrap();
+    if index.seal_due(&store) {
+      let sealed = index.seal(&mut store).unwrap();
+      seals += 1;
+      fewest = fewest.min(sealed.max(1));
+      while let Some(runs) = index.tiered_due() {
+        let mut merge = index.merge_begin(&store, runs).unwrap();
+        while index.merge_step(&mut store, &mut merge).unwrap() == MergeStep::More {}
+      }
+      let sealed_rows = index.rows().saturating_sub(index.tail_len() as u64);
+      let bound = (sealed_rows as f64 / fewest.max(1) as f64).log(3.0).floor() as usize + 1;
+      assert!(
+        index.own_runs() <= bound,
+        "{} own runs past the bound {bound} at {sealed_rows} sealed rows after {seals} seals",
+        index.own_runs()
+      );
+    }
+  }
+  assert!(seals > 50, "seals made: {seals}");
+  assert!(index.counters().compactions > 0, "the tiered rule merged");
+  let read_back = read(&index, &store);
+  assert_eq!(read_back.len(), usize::from(TIERED_ROWS));
+  index.release(&mut store).unwrap();
+}
+
 /// `index`'s runs merged a step at a time: one table cut a step, every row read back as `before` and `runs` runs left
 /// until the last step. The rows merged and the steps taken.
 fn merged_a_table_a_step(

@@ -68,12 +68,27 @@
 > a spawn. Now the region owns the received descriptor (`ClientRegion::from_descriptor`). Red on main: 8 connects
 > left 8 descriptors. Green: 0 (`a_client_that_connects_and_leaves_holds_no_descriptor_of_its_region`;
 > docs/bugs/2026-11-23-every-linux-client-connect-left-its-regions-descriptor-open.md).
-> **Open, found by its sweep, by reading:**
-> (1) `AnchorSegment::handoff_env` makes inheritable duplicates of the segment and content objects and keeps only their
-> numbers. So the anchor keeps two more descriptors at every daemon start, and each later child inherits them all. A
-> daemon keeps 2 × (shards + 1), inheritable by anything it spawns.
-> (2) The daemon's side of a Linux claim adopts its region duplicate only after the kick's `dup` or `eventfd`, so a
-> failure of either, exhaustion among them, leaks the duplicate.
+> **Closed (w-chaos, 2026-11-23, A-878): its sweep's two finds, and what a Linux daemon's children inherited.**
+> - **What leaked.** A hand-off made an inheritable duplicate that nothing owned. So the anchor kept two descriptors per
+>   daemon start, and each child inherited every earlier one. A daemon kept 2 × (shards + 1) of them, and a claim
+>   refused for want of a descriptor leaked its region's duplicate.
+> - **Who held it.** Linux's spawn hands a child everything not close-on-exec. A hook held 17 descriptors past its
+>   streams: the anchor's segment four times (it holds the issuer secret), the content object four times, a listener, a
+>   client's completion eventfd, and seven `perf_event` descriptors a runner had leaked.
+> - **The fix.**
+>   - A hand-off names the object's own descriptor.
+>   - The anchor clears close-on-exec in its daemon's spawn alone, and records a start before the spawn.
+>   - The daemon's first step makes everything it inherited close-on-exec, and its copies are `fcntl_dupfd_cloexec`.
+> - **Red then green.**
+>   - `a_hook_holds_no_descriptor_of_its_daemon`: 17 descriptors, then none.
+>   - `an_anchor_started_again_and_again_hands_each_daemon_its_objects_once`: `[8, 8]` after 7 starts, then `[1, 1]`.
+>   - `a_claim_refused_for_want_of_a_descriptor_leaves_none_of_its_region`: `remaining=1`, then 0.
+>   - Doc: docs/bugs/2026-11-23-a-hand-off-left-an-inheritable-duplicate-at-every-call.md.
+> **Open (Windows, recorded, not changed):** a map reply whose operation was abandoned is dropped on arrival
+> (`Client::buffer`'s `unawaited_dropped` branch), so the section handle the daemon duplicated into the client stays in
+> its table, and the daemon keeps the copy for the client until its release or reap. Closing the handle there is one
+> line (`handle_route::adopt_section`, dropped). Giving the copy back needs a release from that path, and both can be
+> exercised only on Windows.
 
 > **Open (w-shared, 2026-11-21, found landing family three): `slates-bridge-fuse --test takeover_round` fails 2 of 2 on
 > Linux** (`a_kernel_that_cannot_bump_its_epoch_still_gets_every_inode_and_is_counted`,
@@ -489,6 +504,17 @@
 > READDIR or CREATE, while the daemon answers every call. The same flows pass on adas-macbook-pro-2. The real-tools
 > test now fails in 305 s naming the stall instead of hanging.
 
+> **A-878 (OPEN, 2026-11-23, w-win2; main 01a20182's ruling): a long write through a separately attached client is
+> refused `AttachmentExpired`.** `a_freed_content_extent_gives_its_commit_back_on_windows`
+> (`crates/cli/tests/content_extents_windows.rs`), run by a lane for the first time, attaches a volume for writing with
+> `slates attach`, a process that then exits, and writes 256 MiB through that attachment with `slates write`, another.
+> The write is refused `AttachmentExpired { attachment: 281474976710657 }` on windows-latest and windows-11-arm (diag
+> run 45260798132), where the restart test's 16 MiB write through the same flow passes. Read so far, not measured: the
+> attachment's term runs out mid-write, with nothing renewing it once the process that attached has gone. The test is
+> skipped by name in CI's two extents steps, and is this entry's red. Next: whether it is Windows-only (a write that
+> outlasts the term through a separate attach process, on macOS), and if not, the term renewed while the attachment is
+> in use.
+
 > **MEMORY SIZING (Ada 2026-11-20: the daemon held 7.1 GB resident after an 84 MB Mercurial push; w-sizing).** Every
 > buffer, region, reserve and prefault is sized from the work, learned, decays and is given back; a machine total is
 > only a ceiling. **A-777 BUILT:** the idle prefault reserve (A-214) is removed: provisioning p99 unchanged, NFS peak
@@ -506,7 +532,21 @@
 > each extent's section across a restart (`WHAT_CONTENT_EXTENT`); its build and tests are owed to w-lint on jupiter
 > (run-requests; red: commit kept after a destroyed volume's burst). **Closed 2026-11-22 (w-interop):** the burst test's
 > red below was a shard keeping its burst's 1 GiB extent for 10 MiB of headroom, and the test measuring process RSS;
-> `docs/bugs/2026-11-22-a-shard-kept-a-1-gib-extent-for-10-mib-of-headroom.md`. **Open (R2, found 2026-11-20 19:45):** the macOS give-back
+> `docs/bugs/2026-11-22-a-shard-kept-a-1-gib-extent-for-10-mib-of-headroom.md`. **Fixed 2026-11-23 (w-win2): a Windows
+> daemon's first create met its extents made but not yet held.** Each shard's start spawned its slice's holds, one
+> anchor exchange each, and the daemon answered claims at once, so a create the moment it served was refused
+> `BudgetExceeded` with the whole pool named as room: every Node SDK sync suite on both Windows runners (diag run
+> 45238179939: 2 of 25 extents held and the holds 117.5 ms on windows-latest, 1 of 22 and 141.9 ms on windows-11-arm).
+> The control loop now has the anchor hold every extent before it answers a claim, the pool counts only extents a claim
+> can take, and a bounded create whose room only extents being made again would make waits for their remakes
+> (`slates_server`'s `room_wait`), each remake bounded by its two exchanges at the learned answer bound. Red with the fix
+> reversed and green with it on both runners (diag run 45260798132: the first create refused `{ available: 5722144768 }`
+> on windows-latest and the create during the remakes `{ available: 5713756160 }`, both admitted with the fix; the Node
+> SDK suites 8 of 8 on both; `docs/bugs/2026-11-23-a-windows-daemons-first-create-met-its-extents-unheld.md`). The
+> extents file runs on both Windows lanes now, its commit give-back test skipped there as A-878's red. **Owed
+> (item 3b, main's ruling):** a create sent at once after a destroy meets the teardown, which holds the volume's
+> reservation past the destroy's answer, and is refused `BudgetExceeded` on every platform (diag run 45251289894:
+> `{ available: 1430536192 }`, the room less the destroyed volume's). **Open (R2, found 2026-11-20 19:45):** the macOS give-back
 > depends on the machine: recovery's `a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone` passed on a quiet
 > adas-macbook-pro-2 (1,648 -> 123 MiB) but kept 1,366 MiB there later and 335-336 MiB on the big Studio at 5,433 free
 > pages, at A-789's own commit too. Not the pressure hold: with the test's own pressure readings injected (none, and a
@@ -1024,6 +1064,20 @@
 >   `push_heap`'s `a_cached_file_base_is_read_where_it_lies` (one 160 KiB file on two interleaved lines, each delta on
 >   the revision two back): red 176,689 B a revision (1.08 copies), now 12,887 B (0.08). Owed: the 57k push's reading
 >   after the three cuts (`hg_push_lifetimes`, w-perf's).
+>   The index tail sealed as a push appends, its runs size-tiered BUILT (2026-11-23, w-hg; main's ruling, the reland of
+>   w-perf's 0cd8ef36a, reverted in 2662ca69f): a push held its tail's rows to its end (56 MB of Mercurial's push: each
+>   row two buffers), since only an import sealed; sealed at every append alone (0cd8ef36a), each seal a run its fork
+>   never merged, so each new row's lookup walked them all and a segment step grew with the push (arena-14: shard 0 past
+>   1 s in `hg_push::segment`, the daemon killed). Now every append seals when due through one insert
+>   (`HgIndex::insert`, import's own seal gone), and the fork's runs are merged by a size-tiered rule as it goes
+>   (`slates_vcs::Index::tiered_due`: the newest merged while their rows together are at least half the next older's;
+>   Derived: at most ⌊log₃(own rows ÷ the fewest a seal writes)⌋ + 1 own runs), a table a step between revisions
+>   (`Taker::merge_step`, `Intaken::tiered_merges`, `most_own_runs`). Held by
+>   `a_tiered_merge_keeps_an_indexs_runs_within_a_logarithm_of_its_rows` (slates-vcs, 2,000 rows: red 2 runs past the
+>   bound after 2 seals) and push_heap's
+>   `a_long_pushs_fork_keeps_its_runs_within_a_logarithm_of_its_rows` (1,500 edits under a 4 KiB window, 186 seals: red
+>   186 own runs against a bound of 9, the push 210 s in debug; now at most 4, 102 merges, 43 s). Owed: the 56 MB tail's
+>   reading at full scale (arena-17).
 >   Its bound from the work BUILT (main's ruling, 2026-11-23): the chain no longer needs its texts held, so the cache holds
 >   the distinct texts its last `waiting` reads lent (one a waiting request, the owner's room) and a chunk's room
 >   (`TextCache::for_reads`), the least lately read out first; a text past it is lent from the buffer it was made into.
@@ -5498,11 +5552,26 @@
 >   contention, 40 of 40 with the fix where main failed 4 of 40: the first held write given up at 3.8 to 4.7 s, the
 >   bound its owner judged by never past 5.6 s. Record:
 >   `docs/bugs/2026-11-23-a-cut-off-owners-failover-delay-grew-with-its-detectors-backed-off-probes.md`.
->   - **Open (a sibling, measured 2026-11-23):** A-351's
+>   - **FIXED 2026-11-23 (w-fleet; the sibling of the entry above, a defect of the test's wait):** A-351's
 >     `a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again` timed out its wait for the
->     successor's give-up in 2 of 6 runs on main under four-CPU contention, and once in 10 with this fix, in a loaded
->     run of eight fleet tests. Its budget reads the largest failover delay across the nodes, and the round it waits on
->     restarted 4 times in the failed run.
+>     successor's give-up in 7 of 40 runs on adacachy2, the test alone on two or four CPUs (`taskset`). Logged once a
+>     second from the cut: each failure came where both survivors judged the cut-off leader by their pair's own
+>     retransmission timer at the cut, which comes 0.9 s into the test, before either survivor's pool had a verdict. The
+>     leader was condemned 7.2 s after its last answer, where an estimator took under one second. No failover estimate
+>     counts that timer, and the wait's one budget was three failover delays from the cut. The wait is now judged in two
+>     parts by the fleet's own measures. The detection is held to the bound each survivor's detector stated
+>     (`Daemon::fleet_condemnation`). The give-up, from the death held, is held to the departure's confirmation and the
+>     round's promise wait. With it, 40 of 40 passed under the same contention. Sixteen of those runs met a detection
+>     of 7.2 to 15.3 s, and the give-up then came 53 to 89 periods after the death was held, against a budget of about
+>     144 to 177. Record:
+>     `docs/bugs/2026-11-23-the-readmission-tests-wait-missed-a-detection-judged-by-the-timer.md`.
+>   - **Open (found with it, measured 2026-11-23):** the failover delay's detection term (A-363) leaves out a detection
+>     the timer judges. While a member's pool has no verdict, its timer-judged pairs take about 7 s to condemn in a
+>     three-node fleet, where its delay said 2.2 to 5.1 s, so every wait that reads the delay reads the smaller figure
+>     for those seconds. A fix would count a crashed peer's two unanswered probes at the run the detector bounds them by
+>     now (hyper-swim's `longest_unanswered`), which falls back once the pool has a verdict. That is an amendment of A-363
+>     and of each consumer. In the same regime `lease::horizon_ns`'s doc ("the longest a peer can go unanswered before
+>     this node's detector declares it dead", 0.9 s) is untrue, though the lease's safety rests on answers, not on it.
 > - **Owed (the integrator's):** live_chaos and live_fleet flows that keep a writer waiting past the failover SLO (10 s)
 >   now meet `DurabilityPending` where they waited; each flow's stops are a few liveness budgets, under it, but a flow
 >   that stops every candidate longer must treat the refusal as its write's outcome (not acknowledged, so never owed to
@@ -26306,3 +26375,26 @@ itself was whole on every node. Not worked by w-forming (Ada's close order); whe
   1256052866610850298, 5939796479076166087, 10263252121351842258, 17757241901296347647, 8389754676365715562 and two fresh
   draws is kiln run r19 (`SEEDS=... NEMESIS_RUNS=2 NEMESIS_ONLY=1 bash .git/w-forming-ab/c3.sh`). Seed
   10263252121351842258's forwarding stall is the separate entry above.
+
+### 2026-11-23: the TSan lane's server reds were mostly plain-Linux reds — open (w-tsan, main 01a20182's order)
+CI's ThreadSanitizer lane failed on main with no race reported (run 45235122249 at 62d22aefe, job 137905802399; and
+45228216366, 45217887083, 45210822121, 45203217471). CI's `gates` job stopped at fmt or clippy in every main run checked
+back to 11-22 14:31 (22 runs), so the TSan lane was the only Linux lane that ran the server's daemon and recovery suites.
+A plain debug build on adacachy2 (db3ddff02) sorted the reds:
+- **Plain-Linux reds.** recovery's `a_shard_is_refused_while_another_holds_the_pool_and_admitted_once_it_returns` (the
+  test's fixed 1.25-slice volume left room since A-848's best-fit claims; **fixed**, sized by the refusal's own
+  `available`), `a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone` (a released extent kept its pages in
+  Linux's memfd; **fixed**, `docs/bugs/2026-11-23-a-released-pool-extent-kept-its-pages-in-the-linux-content-object.md`),
+  `a_burst_leaves_nothing_resident_behind_it_but_its_data` (no sweep completed within the test's 10 s), and
+  `a_shards_start_holds_each_heavy_piece_in_a_slice_of_its_own` (8 heavy pieces in one slice); ipc's
+  `a_reply_sent_before_the_client_blocked_teaches_its_wake_nothing` (4 of 5,341 parks that never switched out taught a
+  wake: Linux trusts `futex_wake`'s count, which counts a waiter woken before it blocked).
+- **Timing-dependent on Linux.** daemon's `a_metadata_class_bounds_the_volume_records_a_shard_admits` judged the bytes
+  left against the claimed capacity, which a publication's give-back trims to the demand (A-853): 6 of 10.5 MiB failed on
+  CI, 6 of 12.5 passed here. **Fixed:** judged against the shard's slice, read after a publication.
+- **One poll past the budget.** `git_push::tests::t_a850_r16_a_history_and_its_tags_pushed_whole_into_an_empty_repository_bring_each_object_once`
+  held the control shard 1,540 ms in one poll here (the daemon's near-miss line); under TSan the watchdog ended the
+  library's test process at it (exit 4), so about 1,000 of its 1,247 tests never ran.
+- **TSan only (green here).** `content_ranges::tests::a_sweep_on_its_step_clock_settles_at_steps_its_fixed_cost_amortizes`
+  (1 of 3 TSan runs) and `git_push::tests::t_a614a_a_long_historys_derivation_takes_turns_by_the_shards_pace_not_its_objects`
+  (2 of 3; 1 turn in 21 ms here).

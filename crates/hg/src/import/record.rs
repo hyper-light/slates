@@ -2053,7 +2053,7 @@ impl Revisions {
       Keeping::Again => self.kept_again(store, log, (row, delta_len), base),
     }
     .map_err(ImportRefused::<Infallible>::Index)?;
-    settle::<Infallible>(&mut self.fork, store, radix, rev, &numbers)?;
+    settle::<Infallible>(radix, rev, &numbers)?;
     Ok(())
   }
 
@@ -2272,7 +2272,7 @@ fn replay_revision(
         block,
       };
       let numbers = index.append_revisions(store, log, &[row])?;
-      settle(index, store, radix, rev, &numbers)
+      settle(radix, rev, &numbers)
     });
   Ok(held.give_back(store, outcome)?)
 }

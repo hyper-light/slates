@@ -228,6 +228,21 @@ pub struct PlaneCounts {
   pub renewals_exhausted: u64,
 }
 
+/// What a node's detector recorded of condemning one peer by its own probes ([`MemberPlane::condemnation`], hyper-swim's
+/// `PeerReport`): the detection it took and the bound it promised for it, both on the member's own clock.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Condemnation {
+  /// Times the detector condemned the peer by its own probes; a death it learned from another member's gossip is not
+  /// one.
+  pub count: u64,
+  /// From the peer's last answer to the latest of them.
+  pub after: Option<std::time::Duration>,
+  /// The detection bound the detector stated when it condemned: its `detection_bound`, which counts a period whose
+  /// probe goes unanswered at the span of the verdict judging it (a pair's own retransmission timer's before any
+  /// estimator judges it), and the wait it measured for another member's answer (Lifeguard's).
+  pub within: Option<std::time::Duration>,
+}
+
 /// A node's failure detector and the datagram plane its probes ride.
 pub struct MemberPlane {
   local: HostId,
@@ -521,6 +536,19 @@ impl MemberPlane {
   /// The detector's belief about `peer`, if it holds one.
   pub fn belief(&self, peer: HostId) -> Option<MemberState> {
     self.detector.membership().state(hyper_swim::HostId(peer.0))
+  }
+
+  /// What the detector recorded of condemning `peer` by its own probes ([`Condemnation`]), if it holds a report of it:
+  /// what a caller holds a detection to, the bound the detector promised, whichever verdict judged it.
+  pub fn condemnation(&self, peer: HostId) -> Option<Condemnation> {
+    self
+      .detector
+      .report(hyper_swim::HostId(peer.0))
+      .map(|report| Condemnation {
+        count: report.condemnations,
+        after: report.condemned_after,
+        within: report.condemned_within,
+      })
   }
 
   /// What the detector holds of `peer`, for an operator or a test diagnosing why a member was or was not judged: its
