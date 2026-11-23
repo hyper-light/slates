@@ -1257,6 +1257,8 @@ pub enum RequestBody {
     /// (`ssh-ed25519` or `sk-ssh-ed25519@openssh.com`, A-321): a commit a rule requires signed verifies under one of
     /// them. A git repository's alone. Appended.
     signers: Vec<Vec<u8>>,
+    /// Whether a Mercurial repository publishes (7.2's `phases.publish`): true for every other tool's. Appended.
+    hg_publishing: bool,
   },
   /// Enroll a version-control credential for `principal` (§4.13: the human surface, proving issuer authority as an
   /// enrollment does; §4.17.2 "Access"; A-625 part 3): an SSH user key by its blob, or a token by its SHA-256 and its
@@ -5116,6 +5118,9 @@ pub enum DatabaseRefusal {
     /// The cut's bits now.
     current: u8,
   },
+  /// A repository policy that does not publish, for a repository that is not Mercurial's (`phases.publish` is
+  /// Mercurial's alone). Appended.
+  PolicyPublishingNotMercurial,
 }
 
 /// What the volume core refused, where the refusals before [`Refusal::Volume`] name nothing closer (A-299): each the
@@ -5921,6 +5926,8 @@ pub enum ReplyBody {
     hooks_env: Vec<HooksEnvSection>,
     /// A git repository's keys trusted to sign its commits.
     signers: Vec<Vec<u8>>,
+    /// Whether a Mercurial repository publishes (7.2's `phases.publish`). Appended.
+    hg_publishing: bool,
   },
   /// A Subversion repository's range of revisions exported as a dump into a new volume (`ExportDump`, A-652 part 3):
   /// the volume, which holds it as [`DUMP_FILE`], and the dump's length in bytes. Appended.

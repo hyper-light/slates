@@ -1397,7 +1397,8 @@ pressure, fragmentation, restart and open/close behavior, not assertions on quot
 > with its bytes, the bytes in RAM and the bytes written where the OS says (`slates_mem::resident`, the kernel's page
 > table), swept in bounded steps a status request. After a 1,000-revision Subversion import, 584.7 MiB of the anchor's
 > written pages are the owner partition's segment log ring (355.2 MiB) and snapshot slots (225.8 MiB); the content
-> object holds 2.3 MiB (BENCHMARKS.md).
+> object holds 2.3 MiB (BENCHMARKS.md). On Windows the bytes in RAM are the pages in the process's working set
+> (`QueryWorkingSetEx`, since 2026-11-23), and no bytes written are reported.
 
 > **Status (2026-11-20, A-746: the register by record kind).** `content_ranges` adds `register_log` (the log since the
 > last snapshot) and `register_snapshot` (the last snapshot), each by repository records, green chain entries,
@@ -57028,6 +57029,16 @@ at its exact length); `crates/mcp` (a shard's `content_ranges`); §4.2's status;
   `vcs_store::svn_import`; `slates-svn --lib commit::record` (every shape reserved at its exact length);
   `slates-mcp --test mcp` (each shard's content ranges, none past its bytes); `cargo xtask unsafe` ok (slates-mem
   80 of 80); fmt clean.
+- **Windows answered (w-win for main 01a20182, 2026-11-23).** Windows asks `QueryWorkingSetEx` where Unix asks
+  `mincore`, a page of entries a call (256 pages a call on 4 KiB pages), and counts a page in RAM when its `Valid` bit
+  says it is in the process's working set. A page the memory manager trimmed to its standby or modified list is in RAM
+  but counts as out. The query's attribute bits hold no written bit, so `modified` is `None` there, as on Linux.
+  Before, the Windows answer was a typed refusal, which `large::heap` skips, so the memory status's `mapped_resident`
+  read 0 and `large::tests::the_live_figures_follow_the_blocks_held` failed on both Windows lanes (CI run
+  45176536354: `mapped_blocks: 1, mapped_resident: 0`). Held by that test: red, then green, on jupiter (Windows 11
+  x86_64), with `slates-mem --lib` 106 of 106 there. Applied in the same change to: `crates/mem/src/resident.rs`
+  (module doc, the Windows `os` arm, the per-platform entry), `unsafe-budget.toml` (slates-mem 88 -> 89), the A-744
+  status above, GAPS (A-742's owed line).
 
 ### A-626 part 4, the work verb on every surface — `copy` on the CLI, both SDKs and MCP, each held to the wire's operations by an exhaustive match (2026-11-20, w-shared for UI goal 93; main's ruling)
 - **Why.** A verb is done when every surface has it (R10: a copy is no grant verb, so the SDKs and MCP carry it too).

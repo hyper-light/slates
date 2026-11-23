@@ -195,7 +195,7 @@ fn the_store_holds_the_texts_its_last_reads_lent_and_no_more() {
   let staging = Staging::new(0);
   let mut cache = TextCache::for_reads(READS);
   let latest = *identities.last().unwrap();
-  let mut read = |store: &mut Store, cache: &mut TextCache, identity: &[u8; 32]| {
+  let read = |store: &mut Store, cache: &mut TextCache, identity: &[u8; 32]| {
     let bytes = store
       .text_at(&staging, 1, identity, 0, cache)
       .unwrap()
@@ -235,5 +235,39 @@ fn the_store_holds_the_texts_its_last_reads_lent_and_no_more() {
   assert_eq!(
     cache.made, made,
     "the latest, among the last reads, found without being made"
+  );
+}
+
+/// Shape: the chunks the cost measurement makes and rewrites.
+const MEASURED_CHUNKS: u32 = 2_000;
+
+/// Goal 93 (main 01a20182's ruling of 2026-11-23: measure a spare chunk before keeping one). Do: make a chunk of the
+/// mapped floor, fill it and give it back, [`MEASURED_CHUNKS`] times, as the text cache's churn does; then fill one
+/// kept chunk as many times. Print each's nanoseconds a chunk, for the push's count of chunks. `#[ignore]`d: a
+/// measurement, run by name.
+#[test]
+#[ignore = "a measurement: a fresh chunk's cost against a kept one's"]
+fn a_fresh_chunk_against_a_kept_one() {
+  let floor = slates_mem::large::floor();
+  let fill = |chunk: &mut Vec<u8>| {
+    chunk.clear();
+    chunk.resize(floor, 7);
+    std::hint::black_box(chunk.as_slice());
+  };
+  let began = std::time::Instant::now();
+  for _ in 0..MEASURED_CHUNKS {
+    let mut chunk = Vec::with_capacity(floor);
+    fill(&mut chunk);
+    drop(chunk);
+  }
+  let fresh = began.elapsed() / MEASURED_CHUNKS;
+  let mut kept = Vec::with_capacity(floor);
+  let began = std::time::Instant::now();
+  for _ in 0..MEASURED_CHUNKS {
+    fill(&mut kept);
+  }
+  let reused = began.elapsed() / MEASURED_CHUNKS;
+  println!(
+    "text_cache_heap: a chunk of {floor} B: fresh (mapped, filled, unmapped) {fresh:?}, kept and refilled {reused:?}"
   );
 }

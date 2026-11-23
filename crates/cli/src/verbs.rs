@@ -1075,15 +1075,21 @@ fn emit_branch(repository: &str, name: &str, green: Option<VolumeId>, json: bool
 }
 
 /// `repository policy` (A-622): the policy read, each named point's hooks replaced by the ones given for it (an empty
-/// program clearing it), every other part kept, then set from the version read; the version it is at now, and its hooks,
-/// as text (`name: value` lines) or one JSON object.
+/// program clearing it) and publishing set where asked, every other part kept, then set from the version read; the
+/// version it is at now, its hooks and whether it publishes, as text (`name: value` lines) or one JSON object.
 fn emit_repository_policy(
   client: &mut Client,
   repository: &str,
-  given: &[(slates_ipc::protocol::HookPointName, String, String)],
+  (given, publishing): (
+    &[(slates_ipc::protocol::HookPointName, String, String)],
+    Option<bool>,
+  ),
   json: bool,
 ) -> Result<(), ClientError> {
   let mut policy = client.describe_repository_policy(repository)?;
+  if let Some(publishing) = publishing {
+    policy.hg_publishing = publishing;
+  }
   let named: Vec<(slates_ipc::protocol::HookPointName, &str)> = given
     .iter()
     .map(|(point, name, _)| (*point, name.as_str()))
@@ -1115,6 +1121,7 @@ fn emit_repository_policy(
       "repository": repository,
       "version": version,
       "hooks": hooks,
+      "hg_publishing": policy.hg_publishing,
     });
     slates_machine::out_line!("{fields}");
   } else {
@@ -1123,6 +1130,7 @@ fn emit_repository_policy(
     for hook in &hooks {
       slates_machine::out_line!("hook: {hook}");
     }
+    slates_machine::out_line!("hg_publishing: {}", policy.hg_publishing);
   }
   Ok(())
 }
@@ -1812,8 +1820,12 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     Verb::RepositoryImport { repository, path } => {
       emit_repository_imported(client, repository, path, json)?;
     }
-    Verb::RepositoryPolicy { repository, hooks } => {
-      emit_repository_policy(client, repository, hooks, json)?;
+    Verb::RepositoryPolicy {
+      repository,
+      hooks,
+      publishing,
+    } => {
+      emit_repository_policy(client, repository, (hooks, *publishing), json)?;
     }
     Verb::BranchCreate {
       repository,

@@ -4072,12 +4072,14 @@ impl Client {
         hooks,
         hooks_env,
         signers,
+        hg_publishing,
       } => Ok(RepositoryPolicy {
         version,
         rules,
         hooks,
         hooks_env,
         signers,
+        hg_publishing,
       }),
       _ => Err(ClientError::UnexpectedReply {
         verb: "describe_repository_policy",
@@ -4100,6 +4102,7 @@ impl Client {
       hooks: policy.hooks.clone(),
       hooks_env: policy.hooks_env.clone(),
       signers: policy.signers.clone(),
+      hg_publishing: policy.hg_publishing,
     })? {
       ReplyBody::Acknowledged => Ok(()),
       _ => Err(ClientError::UnexpectedReply {
@@ -5901,6 +5904,8 @@ pub struct RepositoryPolicy {
   pub hooks_env: Vec<slates_ipc::protocol::HooksEnvSection>,
   /// A git repository's keys trusted to sign its commits.
   pub signers: Vec<Vec<u8>>,
+  /// Whether a Mercurial repository publishes (7.2's `phases.publish`); true for every other tool's.
+  pub hg_publishing: bool,
 }
 
 /// What a repository's import took ([`Client::import_repository`], A-710).
