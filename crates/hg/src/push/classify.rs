@@ -41,7 +41,9 @@
 //! **Markers** (§4.17.3 decision 4; 7.2's `handleobsmarker`, `obsstore.mergemarkers`). An `obsmarkers` part's
 //! markers are kept, each alone in the part's format, in the order they arrived, less every one the repository holds
 //! already or the push carried before (7.2 compares markers whole: a marker and the same marker in the other format
-//! are two); its `reply:obsmarkers` counts the new ones. Stricter than 7.2, on purpose: a marker whose predecessor is
+//! are two); its `reply:obsmarkers` counts the new ones, and where there are any an `output` part in reply to it says
+//! so in 7.2's words (`%i new obsolescence markers`, which 7.2's handler prints and its part processing captures,
+//! after the handler's reply). Stricter than 7.2, on purpose: a marker whose predecessor is
 //! a changeset public as the part is taken (held public, or made public by this push's earlier parts) refuses the
 //! push in the words 7.2's `createmarkers` refuses making one with, where 7.2's server keeps it; a predecessor the
 //! repository does not hold (a draft rewritten before it was pushed) is kept, as 7.2 keeps it.
@@ -87,6 +89,8 @@ const UNKNOWN_AFTER: &[u8] = b"'";
 const PUBLIC_OBSOLETED: &[u8] = b"cannot obsolete public changeset: ";
 /// Format: see [`PUBLIC_OBSOLETED`].
 const PUBLIC_OBSOLETED_HINT: &[u8] = b"see 'hg help phases' for details";
+/// Format: 7.2's words after the count of an `obsmarkers` part's new markers (`handleobsmarker`).
+const NEW_MARKERS: &[u8] = b" new obsolescence markers\n";
 /// Format: the hexadecimal digits of a short node (7.2's `short`).
 const SHORT_DIGITS: usize = 12;
 /// Format: slates' words for an `obsmarkers` part whose payload 7.2's reader refuses, and for a repository with no
@@ -207,8 +211,8 @@ pub struct Plan {
   pub bookmarks: Vec<BookmarkMove>,
   /// The draft roots' changes: every removal, then every addition, each in node order.
   pub roots: Vec<RootChange>,
-  /// The reply's parts for the parts it handled, in stream order: `reply:changegroup`, `reply:pushkey` and
-  /// `reply:obsmarkers`.
+  /// The reply's parts for the parts it handled, in stream order: `reply:changegroup`, `reply:pushkey`, and
+  /// `reply:obsmarkers` with the `output` saying how many markers were new.
   pub replied: Vec<Replied>,
   /// The obsolescence markers it keeps (module docs, "Markers"), each alone in its part's format, in arrival order.
   pub markers: Vec<Vec<u8>>,
@@ -819,6 +823,7 @@ fn kept_markers<V: Repository>(
     }
   }
   drop(seen);
+  said(&mut plan.replied, admission)?;
   admission.charge_items::<Vec<u8>>(kept)?;
   plan.markers.extend(
     carried
@@ -826,6 +831,40 @@ fn kept_markers<V: Repository>(
       .zip(dropped)
       .filter_map(|((_, _, alone), dropped)| (!dropped).then_some(alone)),
   );
+  Ok(())
+}
+
+/// Puts an `output` part saying how many markers were new after each `reply:obsmarkers` that counts any (module docs,
+/// "Markers").
+fn said(replied: &mut Vec<Replied>, admission: &mut Admission) -> Result<(), PastAdmission> {
+  let counted = replied
+    .iter()
+    .filter(|replied| matches!(replied, Replied::Obsmarkers { new, .. } if *new > 0))
+    .count();
+  if counted == 0 {
+    return Ok(());
+  }
+  admission.charge_items::<Replied>(replied.len().saturating_add(counted))?;
+  let mut with = Vec::with_capacity(replied.len().saturating_add(counted));
+  for part in replied.drain(..) {
+    let words = match &part {
+      Replied::Obsmarkers { in_reply_to, new } if *new > 0 => {
+        let mut words = new.to_string().into_bytes();
+        words.extend_from_slice(NEW_MARKERS);
+        admission.charge(to_u64(words.len()))?;
+        Some((*in_reply_to, words))
+      }
+      _ => None,
+    };
+    with.push(part);
+    if let Some((in_reply_to, words)) = words {
+      with.push(Replied::Output {
+        in_reply_to: Some(in_reply_to),
+        words,
+      });
+    }
+  }
+  *replied = with;
   Ok(())
 }
 

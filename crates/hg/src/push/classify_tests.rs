@@ -245,12 +245,21 @@ fn a_stock_history_lands_on_an_empty_repository_as_7_2_lists_it() {
     .collect();
   assert!(!alone.is_empty(), "the fixture carries a marker");
   assert_eq!(plan.markers, alone);
+  let new = u64::try_from(alone.len()).unwrap();
   assert_eq!(
-    plan.replied.last(),
-    Some(&Replied::Obsmarkers {
-      in_reply_to: id,
-      new: u64::try_from(alone.len()).unwrap(),
-    })
+    plan.replied.get(plan.replied.len() - 2..),
+    Some(
+      &[
+        Replied::Obsmarkers {
+          in_reply_to: id,
+          new,
+        },
+        Replied::Output {
+          in_reply_to: Some(id),
+          words: format!("{new} new obsolescence markers\n").into_bytes(),
+        },
+      ][..]
+    )
   );
   let holding = View {
     markers: vec![payload],
@@ -303,9 +312,9 @@ fn marker_payload(predecessor: &Node, successor: &Node) -> Vec<u8> {
 
 /// §4.17.3 decision 4 (goal 93, changeset evolution). Do: over `a` (public) and `b` (draft), push an `obsmarkers` part
 /// obsoleting `b` and one the repository does not hold, the first marker twice, in a second part too; then a part
-/// obsoleting `a`. Expect: the two markers kept once each, in arrival order, the first part's reply counting 2 and the
-/// second's 0; the marker obsoleting public `a` refuses the push in 7.2's `createmarkers` words, `a`'s short hex and
-/// its hint.
+/// obsoleting `a`. Expect: the two markers kept once each, in arrival order, the first part's reply counting 2 with an
+/// `output` part saying so in 7.2's words, and the second's 0 with none; the marker obsoleting public `a` refuses the
+/// push in 7.2's `createmarkers` words, `a`'s short hex and its hint.
 #[test]
 fn markers_are_kept_once_and_refused_on_a_public_predecessor() {
   let view = two();
@@ -336,6 +345,10 @@ fn markers_are_kept_once_and_refused_on_a_public_predecessor() {
       Replied::Obsmarkers {
         in_reply_to: 0,
         new: 2
+      },
+      Replied::Output {
+        in_reply_to: Some(0),
+        words: b"2 new obsolescence markers\n".to_vec(),
       },
       Replied::Obsmarkers {
         in_reply_to: 1,

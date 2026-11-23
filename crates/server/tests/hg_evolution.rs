@@ -36,7 +36,8 @@ fn ran(what: &str, output: Output) -> Output {
 /// Goal 93's next completeness item (main's ruling of 2026-11-23). Do: with an evolution-enabled client, commit and push
 /// `a`; commit `b`, amend it, and push; commit `c` on `a`, rebase it onto the amended `b`, and push; clone the repository
 /// with evolution and list its markers and changesets. Expect each push to land; the clone to hold the amend's and the
-/// rebase's markers (2) and the successors, none of the rewritten drafts. Then make a marker pruning the public `a` and
+/// rebase's markers (2) and the successors, none of the rewritten drafts; the amend's push told `remote: 1 new
+/// obsolescence markers`, as 7.2's server tells it. Then make a marker pruning the public `a` and
 /// push it: expect it refused, its words naming the public changeset (decision 4). Red before: every push carrying a
 /// marker was refused "obsolescence markers are not accepted by this server".
 #[test]
@@ -95,7 +96,15 @@ fn an_evolution_clients_amend_and_rebase_land_with_their_markers() {
       .unwrap(),
   );
   let new_b = node(".");
-  ran("push the amend", push());
+  let amended = ran(
+    "push the amend",
+    served
+      .hg("source")
+      .args(["push", "--new-branch", &url])
+      .output()
+      .unwrap(),
+  );
+  let told = stdout(&amended) + &String::from_utf8_lossy(&amended.stderr);
   ran(
     "update to a",
     served
@@ -155,6 +164,10 @@ fn an_evolution_clients_amend_and_rebase_land_with_their_markers() {
     .output()
     .unwrap();
   served.stop();
+  assert!(
+    told.contains("remote: 1 new obsolescence markers"),
+    "the amend's push told its marker new, in 7.2's words: {told}"
+  );
   let lines: Vec<&str> = markers.lines().collect();
   assert_eq!(
     lines.len(),
