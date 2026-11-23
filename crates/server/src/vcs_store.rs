@@ -2491,8 +2491,9 @@ fn let_go_owed_now(state: &mut ShardState, id: RepositoryId) {
 }
 
 /// A landed pack's let-go under way on this shard (goal 93 item 2b; main 01a20182's order of 2026-11-23: one walk over
-/// a 600 MB pack inside a push's step is a bounded-work breach): its windows listed on its first slice, then let go
-/// [`LET_GO_WINDOWS`] at most a turn, within the shard's step quantum.
+/// a 600 MB pack inside a push's step is a bounded-work breach): its windows listed on its first slice, then let go a
+/// slice a turn within the shard's step quantum (main's ruling of 2026-11-23: the quantum alone ends a slice, never a
+/// fixed count, R3).
 #[derive(Debug)]
 pub(crate) struct LettingGo {
   /// The pack.
@@ -2509,12 +2510,12 @@ pub(crate) struct LettingGo {
   next: usize,
 }
 
-/// Shape: the most windows a slice of a landed pack's let-go takes ([`LettingGo`]), whatever the quantum left.
-pub(crate) const LET_GO_WINDOWS: usize = 64;
-
 /// Counter: slices of landed packs' let-go run ([`let_go_turn`]): its non-vacuity, a large pack taking many. Format: a
 /// counter name.
 pub(crate) const LET_GO_SLICES: &str = "vcs_store.landed.let_go_slices";
+/// Counter: slices of landed packs' let-go that ran past the shard's step quantum ([`let_go_turn`]): each one window,
+/// the unit a slice takes at least, whose let-go alone outlasted the quantum. Format: a counter name.
+pub(crate) const LET_GO_PAST_QUANTUM: &str = "vcs_store.landed.let_go_past_quantum";
 
 /// Queues `pack`'s let-go on this shard as its repository's owner, and on its home in the region as that ([`LettingGo`]):
 /// the home here queued with it, another shard's told to queue its own. The task that turns them is started where none
@@ -2574,14 +2575,25 @@ fn queue_let_go(state: &mut ShardState, pack: slates_vcs::ContentId, (home, owne
   }
 }
 
-/// One slice of the landed packs' let-go queued here ([`LettingGo`]): the first pack's windows listed, or up to
-/// [`LET_GO_WINDOWS`] of them let go within the shard's step quantum, at least one; counted [`LET_GO_SLICES`]. Whether
-/// more is queued.
+/// One slice of the landed packs' let-go queued here ([`LettingGo`]): the first pack's windows listed, or its windows let
+/// go while the next, at the longest a window of the slice took, still ends within the shard's step quantum, at least
+/// one; counted [`LET_GO_SLICES`], and [`LET_GO_PAST_QUANTUM`] where it ran past. Whether more is queued.
 pub(crate) fn let_go_turn(state: &mut ShardState) -> bool {
-  let Some(mut letting) = state.vcs_stores.letting_go.0.pop_front() else {
+  let quantum_ns = state.config.step_quantum_ns();
+  let started_ns = slates_rt::futures::now_ns();
+  let Some(more) = let_go_slice(state, (started_ns, quantum_ns)) else {
     return false;
   };
   state.count(LET_GO_SLICES, 1);
+  if slates_rt::futures::now_ns().saturating_sub(started_ns) > quantum_ns {
+    state.count(LET_GO_PAST_QUANTUM, 1);
+  }
+  more
+}
+
+/// [`let_go_turn`]'s slice, begun at `started_ns` within `quantum_ns`: none where nothing is queued, else whether more is.
+fn let_go_slice(state: &mut ShardState, (started_ns, quantum_ns): (u64, u64)) -> Option<bool> {
+  let mut letting = state.vcs_stores.letting_go.0.pop_front()?;
   let Some((layout, len)) = letting.layout.take() else {
     // The listing is a slice of its own: the pack's windows, read from its root, no window let go.
     let layout = state
@@ -2595,18 +2607,17 @@ pub(crate) fn let_go_turn(state: &mut ShardState) -> bool {
     });
     letting.layout = Some((layout, len));
     state.vcs_stores.letting_go.0.push_front(letting);
-    return true;
+    return Some(true);
   };
-  let quantum_ns = state.config.step_quantum_ns();
-  let started_ns = slates_rt::futures::now_ns();
-  let mut taken = 0;
+  let mut longest_ns = 0;
   while let Some((window, offset)) = layout.get(letting.next).copied() {
+    let before_ns = slates_rt::futures::now_ns();
     let_go_window(state, &letting, (window, offset, len));
     letting.next = letting.next.saturating_add(1);
-    taken += 1;
-    if taken >= LET_GO_WINDOWS
-      || slates_rt::futures::now_ns().saturating_sub(started_ns) >= quantum_ns
-    {
+    let now_ns = slates_rt::futures::now_ns();
+    longest_ns = longest_ns.max(now_ns.saturating_sub(before_ns));
+    // The next window taken only where it ends within the quantum, at the slice's longest so far.
+    if now_ns.saturating_sub(started_ns).saturating_add(longest_ns) > quantum_ns {
       break;
     }
   }
@@ -2614,7 +2625,7 @@ pub(crate) fn let_go_turn(state: &mut ShardState) -> bool {
     letting.layout = Some((layout, len));
     state.vcs_stores.letting_go.0.push_front(letting);
   }
-  !state.vcs_stores.letting_go.0.is_empty()
+  Some(!state.vcs_stores.letting_go.0.is_empty())
 }
 
 /// Lets go of `window`, at `offset` in `letting`'s pack of `len` bytes: recorded and let go as its home, then let go as
@@ -2651,7 +2662,6 @@ fn let_go_window(
     _ => {}
   }
 }
-
 
 /// A landed pack let go whole in one call with the node's shards `shards`, which rank the pack's home, each window kept where this shard
 /// holds it for the region ([`landed_pin`]). The pack's

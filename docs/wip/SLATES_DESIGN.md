@@ -61209,7 +61209,8 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
   runtime is thread-per-core, so what a thread keeps is its shard's), reset when given back and set to its level
   (`flate2::Compress::set_level` on a reset stream: a fresh stream's output byte for byte), or one made when none is
   kept. Its drop gives it back, so an object ended, a stream dropped part way and a sample all give back. A thread
-  keeps at most `MOST_KEPT` (8); states made are O(the deflates under way at once on a shard). A repository gone idle
+  keeps every state given back, at most the deflates it had under way at once since it last let them go (no count to
+  tune, R3); states made are O(the deflates under way at once on a shard). A repository gone idle
   (`git_encode::give_back_idle`) lets the kept states go.
 - **Counted.** `vcs_store.git_deflate.states_made`, `states_reused`, `states_dropped`, counted on the shard at each
   fetch step and at idle give-back from the thread's counts (`deflaters::take_counts`).

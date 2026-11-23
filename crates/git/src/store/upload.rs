@@ -235,6 +235,8 @@ enum DeltaReuse {
   BaseFirst(u64),
   /// Not as it lies: encoded instead.
   No,
+  /// Its object's read to check it met a let-go window, and the turn stopped (r165): taken again.
+  Stopped,
 }
 
 /// Where the stream is (module docs).
@@ -1471,6 +1473,10 @@ impl<A: Answered> Upload<A> {
       self.counters.reuse_no_entry = self.counters.reuse_no_entry.saturating_add(1);
       return Ok(Reuse::Encode);
     };
+    #[cfg(test)]
+    if REUSE_OFF.with(core::cell::Cell::get) {
+      return Ok(Reuse::Encode);
+    }
     if self
       .last_read
       .is_some_and(|(pack, offset)| pack == place.pack && place.offset < offset)
@@ -1478,7 +1484,11 @@ impl<A: Answered> Upload<A> {
       self.counters.backward_reads = self.counters.backward_reads.saturating_add(1);
     }
     self.last_read = Some((place.pack, place.offset));
-    if let Some(packed) = row.pack
+    #[cfg(test)]
+    let row_pack = row.pack.filter(|_| !KEPT_OFF.with(core::cell::Cell::get));
+    #[cfg(not(test))]
+    let row_pack = row.pack;
+    if let Some(packed) = row_pack
       && let Some(reuse) = self.reused_as_kept(cx, (row, place, packed), out)?
     {
       return Ok(reuse);
@@ -1487,9 +1497,14 @@ impl<A: Answered> Upload<A> {
     self.counters.reuse_rebuilt = self.counters.reuse_rebuilt.saturating_add(1);
     let mut scratch = Vec::new();
     let room = cx.repository.largest_object().max(row.len);
-    let Ok(raw) = packed::raw_entry(cx.store, (place, self.format), (&mut scratch, room)) else {
-      self.counters.reuse_unread = self.counters.reuse_unread.saturating_add(1);
-      return Ok(Reuse::Encode);
+    let raw = match packed::raw_entry(cx.store, (place, self.format), (&mut scratch, room)) {
+      Ok(raw) => raw,
+      // r165: a let-go window stops the turn rather than sending the object encoded afresh.
+      Err(refused) if self.stopped_by(cx.store, &refused) => return Ok(Reuse::Stopped),
+      Err(_) => {
+        self.counters.reuse_unread = self.counters.reuse_unread.saturating_add(1);
+        return Ok(Reuse::Encode);
+      }
     };
     let representation = match raw.representation {
       Representation::Whole(kind) => {
@@ -1503,7 +1518,14 @@ impl<A: Answered> Upload<A> {
         Representation::Whole(kind)
       }
       delta => {
+        // Its base's read's note this read's own: a let-go window stops the turn (r165).
+        let _ = cx.repository.waiting();
         let Some((base, base_bytes)) = self.base_of(cx, (place, delta)) else {
+          if let Some(waited) = cx.repository.waiting()
+            && self.stop_at(cx.store, waited)
+          {
+            return Ok(Reuse::Stopped);
+          }
           self.counters.reuse_unread = self.counters.reuse_unread.saturating_add(1);
           return Ok(Reuse::Encode);
         };
@@ -1511,6 +1533,7 @@ impl<A: Answered> Upload<A> {
           DeltaReuse::As(representation) => representation,
           DeltaReuse::BaseFirst(base) => return Ok(Reuse::BaseFirst(base)),
           DeltaReuse::No => return Ok(Reuse::Encode),
+          DeltaReuse::Stopped => return Ok(Reuse::Stopped),
         }
       }
     };
@@ -1700,10 +1723,9 @@ impl<A: Answered> Upload<A> {
         DeltaReuse::No
       });
     }
-    let object = cx
-      .repository
-      .read_stored(cx.store, &stored, row.len)
-      .ok_or(StoreRefused::Unreadable { id })?;
+    let Some(object) = self.read_or_stop(cx, &stored, (id, row.len))? else {
+      return Ok(DeltaReuse::Stopped);
+    };
     let mut built = Vec::new();
     let checked = crate::object_name::name_of(self.format, row.kind, &object)
       .is_ok_and(|named| named == id)
@@ -1804,14 +1826,14 @@ impl<A: Answered> Upload<A> {
   ) -> Result<Option<Pending>, StoreRefused> {
     let (id, row, stored) = &searching.target;
     let target = (*id, row.len, *stored);
-    if read_window(cx, target, &mut searching.target_bytes)? {
+    if self.read_window(cx, target, &mut searching.target_bytes)? {
       return Ok(Some(Pending::Search(searching)));
     }
     let Some(candidate) = searching.candidates.get(searching.trying).copied() else {
       return self.searched(cx, *searching, out).map(Some);
     };
     let base = (candidate.id, candidate.len, candidate.stored);
-    let step = if read_window(cx, base, &mut searching.base_bytes)? {
+    let step = if self.read_window(cx, base, &mut searching.base_bytes)? {
       SearchStep::More
     } else {
       let Searching {
@@ -2379,4 +2401,15 @@ fn entry_refused(refusal: entry::Refusal) -> StoreRefused {
 
 fn to_u64(len: usize) -> u64 {
   u64::try_from(len).unwrap_or(u64::MAX)
+}
+
+// The tests' switches, kept on the thread that streams.
+#[cfg(test)]
+thread_local! {
+  /// Whether no pushed entry is sent on as it lies (true: every object encoded afresh): a test's way to stand a stream at
+  /// an object's encode, search and whole send reads of its pack (r165's reds).
+  pub(crate) static REUSE_OFF: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+  /// Whether no pushed entry is sent on by its kept CRC32 (true: each rebuilt to be checked, its raw entry, base and
+  /// object read): a test's way to stand a stream at the check's reads (r165's reds).
+  pub(crate) static KEPT_OFF: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
