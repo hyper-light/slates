@@ -728,6 +728,7 @@ pub(crate) fn place_imported(
   let Some(taken) = index.take() else {
     return Err(Refusal::ContentUnavailable);
   };
+  super::hg_view::walks_noted(state, &taken);
   match place(&mut state.vcs_stores, id, taken) {
     Ok(whole) => {
       if !whole {
