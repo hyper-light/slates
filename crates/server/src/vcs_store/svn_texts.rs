@@ -216,7 +216,13 @@ fn finish_brought(
         let _ = content.release(&made);
         false
       }
-      Err(_) => false,
+      // A refused finish leaves what was kept held by the writer, for its caller to abandon (`finish_object`'s
+      // errors): dropped, its windows stayed charged and readable (codex-review, 2026-11-22: 262,144 bytes of one
+      // refused text).
+      Err(_) => {
+        content.abandon_object(writing);
+        false
+      }
     }
   });
   if !made {
@@ -615,6 +621,42 @@ pub(crate) fn rehold_head(state: &mut ShardState, id: RepositoryId, green: DbVol
 mod tests {
   use super::*;
   use slates_svn::migration::Room;
+
+  /// A-865. Withhold admission between reading a landed text and finishing its object. Finishing
+  /// refuses, and the first completed window must no longer consume room or answer a read.
+  #[test]
+  fn a_refused_subversion_text_bring_returns_its_completed_windows() {
+    let daemon = crate::daemon::audit_daemon_configured(|_| {});
+    let (finished, before, after, still_readable, window) =
+      crate::daemon::observe_first(&daemon, |state| {
+        let window = state.store.content.chunk_bytes();
+        state.vcs_stores.content_made(window).unwrap();
+        let before = state.vcs_stores.content().unwrap().used();
+        let mut text = vec![b'x'; window];
+        let leaf = slates_vcs::ContentId::of(&text);
+        text.push(b'y');
+        let len = text.len() as u64;
+        let mut writing = None;
+        assert!(put_brought(state, (&mut writing, len), &text));
+        let hold = state.store.budget.hold();
+        let room = state.store.admittable();
+        state.store.budget.set_hold(hold.saturating_add(room));
+        let finished = finish_brought(state, writing, (len, len), *blake3::hash(&text).as_bytes());
+        state.store.budget.set_hold(hold);
+        let (after, still_readable) = crate::vcs_store::within_budget(state, 0, |stores| {
+          let content = stores.content().unwrap();
+          (content.used(), content.bytes_of(&leaf).is_some())
+        });
+        (finished, before, after, still_readable, window)
+      });
+    daemon.stop();
+    assert!(!finished, "the final byte exceeded admission");
+    assert_eq!(
+      (after, still_readable),
+      (before, false),
+      "one refused text with a {window}-byte window"
+    );
+  }
 
   /// A-761 with main's item 2 of 2026-11-20 (a text read a bounded step at a time). Do: put a 10,000-byte text into a
   /// content store of 4,096-byte windows; land revision 1 with `/trunk/a.txt` naming that text as stored (the records
