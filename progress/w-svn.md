@@ -602,3 +602,10 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
   - A first-run hook has no deadline, so its drain waits until the client leaves.
 - Proposed to main: (b) end the drain when the hook's process group is empty, red first with a plain std child
   holding the pipe; or (d) confine the tests' spawns. Awaiting the ruling.
+- f974b5b13 landed: a hook's words end once nothing of the hook's can write them. The check is
+  `slates_ipc::group_holders` (`proc_listpgrppids` on macOS; Linux and Windows' atomic pipes answer that others may
+  hold it). A setsid child counts as a foreign holder. Red: 4.15 s held, now ends at the hook's exit. The DAV flake is
+  closed.
+  - GAPS, OPEN: a first run's missing deadline. The macOS close-on-exec sweep, by file and line, is reported, not
+    fixed.
+- Next: A-760 (b), items 3-7 (the green's block names the plane's object). Tell w-perf when starting.
