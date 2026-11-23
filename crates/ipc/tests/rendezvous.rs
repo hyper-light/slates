@@ -237,6 +237,112 @@ fn a_client_process_connects_and_completes_a_round_trip() {
   assert_eq!(listener.refused(), 0);
 }
 
+/// Format: the environment variable that turns this binary into the macOS client whose synchronous park must be woken
+/// by its region's wake semaphore.
+const CHILD_SEMAPHORE_ROLE: &str = "SLATES_RENDEZVOUS_SEMAPHORE_CHILD";
+/// Shape: how long the semaphore test's client waits for its reply before it fails (nanoseconds), far past the daemon
+/// side's wait for the client's park.
+const SEMAPHORE_REPLY_WAIT_NS: u64 = 10_000_000_000;
+
+/// The client of `a_parked_client_in_another_process_is_woken_by_its_regions_semaphore`: connects, sends one request,
+/// waits for it, and exits 0 only when the reply came and a semaphore signal ended one of its parks. Passes trivially
+/// when not the child.
+#[test]
+fn rendezvous_semaphore_client() {
+  toy_seal::install();
+  let Ok(instance) = std::env::var(CHILD_SEMAPHORE_ROLE) else {
+    return;
+  };
+  let connected = connect(&instance).unwrap();
+  let mut client = ClientEnd::connected(connected);
+  client
+    .send(&Slot::inline(0x0009_0000_0000_0001, b"wake").unwrap())
+    .unwrap();
+  let reply = client.wait(Some(SEMAPHORE_REPLY_WAIT_NS)).unwrap();
+  assert_eq!(reply.payload, b"ekaw");
+  assert!(
+    client.semaphore_wakes() > 0,
+    "the reply came without a semaphore's wake: {} unanswered wakes",
+    client.unanswered_wakes()
+  );
+  std::process::exit(0);
+}
+
+/// 84a (macOS; `slates_ipc::mach_semaphore`). Do: a client in another process connects through the rendezvous, sends a
+/// request and parks for its reply; the daemon side waits until the client's parked flag is up, then replies. Expect:
+/// the client takes the reply, and a semaphore signal ended its park (its count, the non-vacuity check), so the
+/// semaphore's right crossed into the client's task with its region. Off macOS the region has no semaphore.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_parked_client_in_another_process_is_woken_by_its_regions_semaphore() {
+  toy_seal::install();
+  let instance = format!("test-sem-{}", std::process::id());
+  let mut listener = Listener::open(&instance, None).unwrap();
+  let exe = std::env::current_exe().unwrap();
+  let mut child = Command::new(exe)
+    .args(["--exact", "rendezvous_semaphore_client", "--nocapture"])
+    .env(CHILD_SEMAPHORE_ROLE, &instance)
+    .spawn()
+    .unwrap();
+  let started = Instant::now();
+  let mut ends: Vec<DaemonEnd> = Vec::new();
+  let mut taken = None;
+  let pid = std::process::id();
+  while started.elapsed() < Duration::from_millis(SERVE_MS) && taken.is_none() {
+    let round = listener.accept_pending(
+      &|_| false,
+      &mut |client_id| {
+        Ok(Prepared {
+          region: ClientRegion::create(
+            &format!("slates-cs-{pid}-{client_id}"),
+            client_id,
+            0,
+            geometry(),
+          )?,
+          kick_fd: None,
+        })
+      },
+      &mut |refusal| panic!("the one client is served: {refusal}"),
+    );
+    assert!(round.ended.is_none(), "{:?}", round.ended);
+    for a in round.accepted {
+      ends.push(DaemonEnd::new(a.region));
+    }
+    for (at, end) in ends.iter_mut().enumerate() {
+      if let Some(request) = end.try_take().unwrap() {
+        taken = Some((at, request));
+      }
+    }
+    std::hint::spin_loop();
+  }
+  let (at, request) = taken.expect("the client's request arrived");
+  let end = ends.get_mut(at).unwrap();
+  // The reply waits for the client's park, so only a wake can bring it the reply.
+  while end
+    .region()
+    .client_parked()
+    .unwrap()
+    .load(std::sync::atomic::Ordering::Acquire)
+    == 0
+  {
+    assert!(
+      started.elapsed() < Duration::from_millis(SERVE_MS),
+      "the client never parked"
+    );
+    std::hint::spin_loop();
+  }
+  let mut reply = request.payload.clone();
+  reply.reverse();
+  end
+    .reply(&Slot::inline(request.request, &reply).unwrap())
+    .unwrap();
+  let status = child.wait().unwrap();
+  assert!(
+    status.success(),
+    "the client's park was woken by its semaphore: {status:?}"
+  );
+}
+
 /// No daemon: the connect is refused with the endpoint named, quickly, and nothing is left
 /// behind.
 #[test]
