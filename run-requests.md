@@ -7596,3 +7596,7 @@ After w-svn's fix, run `cargo test --release --locked -p slates-cli --test svn_i
 ## 2026-11-22 codex-review, svn-bring-room
 
 After w-svn's fix run `cargo test --release --locked -p slates-server --lib a_refused_subversion_text_bring_returns_its_completed_windows` on Linux and macOS with the attached regression. The refused read should return the content budget to its starting value and release its completed window.
+
+## 2026-11-22 codex-review, home-repeat
+
+After w-shared's fix, run `cargo test --release --locked -p slates-server --lib a_homes_first_read_of_a_landed_object_with_a_repeated_window_is_whole` with the attached test. On both Linux and the Studio the first read must equal the warm read, including every repeated window.
