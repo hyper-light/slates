@@ -664,3 +664,13 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
   BaseGone, page/checkout Unsupported, svn_made Unreadable; svn held texts fall through to the store.
 - No producer, so no red (main's ruling). svnsync counters + slowdowns handed to w-svnperf (inbox patch).
 - NEXT: 4c+4d (holds + dropped bytes + history through the plane + refuse-and-bring-back + reanchor by identity).
+## 4c+4d IN PROGRESS (uncommitted in ~/slates-work/w-svn-c2), 2026-11-23 ~10:30
+- Main's rulings: byteless named blocks; holds drained where a green changes; old restore read path replaced; sync
+  readers through PlaneObjects, Away typed, async bring-back bounded+counted; splice base read through Objects as runs
+  are (refuse only on Away); every bridge (NFS/FUSE/virtio-fs/WinFsp) retries inside its task, never EAGAIN/EIO to
+  the kernel; send main the bridge map BEFORE building that part; reanchor checks named replace by identity.
+- Done so far: red (oracle holds_model asserts named_bytes_held()==0; was 80). dims: Slot.bytes Option + len,
+  NameHold Take/Give, Taken, Blocks::{add_named, content, len, hydrate, let_named_bytes_go, take_holds},
+  Files::{get->Content, len_of, insert_named(path, identity), remove->Taken, hydrate, take_holds}.
+- Next: fix ~45 engine compile sites (lengths -> len_of; bytes -> Content handling; judge base -> ContentUnread +
+  hydrate step), history Source::Block byteless -> ContentAt::Named, reanchor identity, then server drains.
