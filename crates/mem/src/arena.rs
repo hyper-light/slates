@@ -304,7 +304,7 @@ impl ChunkArena {
   fn record(&mut self, extent: Extent, owner: Owner, held: usize, asked: usize) {
     let granule = self.granule.max(1);
     if let Some(slot) = self.slot_mut(extent.region) {
-      let at = extent.offset() / granule;
+      let at = extent.offset().checked_div(granule).unwrap_or(0);
       if let Some(code) = slot.heads.get_mut(at) {
         *code = owner.code();
       }
@@ -328,7 +328,7 @@ impl ChunkArena {
     let Some(slot) = self.slot_mut(region) else {
       return;
     };
-    let at = offset / granule;
+    let at = offset.checked_div(granule).unwrap_or(0);
     let owner = slot
       .heads
       .get_mut(at)
@@ -1068,7 +1068,7 @@ impl ChunkArena {
     }
     slot.dirty.mark(tail_from, end);
     // The head's owner, and what of its ask the trim cut: the kept prefix is all it holds now.
-    let at = extent.offset() / granule;
+    let at = extent.offset().checked_div(granule).unwrap_or(0);
     let owner = slot.heads.get(at).copied().and_then(Owner::of_code);
     let trimmed_asked = slot.asked.get_mut(at).map_or(0, |asked| {
       let before = *asked;
@@ -1437,6 +1437,131 @@ mod tests {
       .saturating_add(u64::try_from(arena.deferred_bytes()).unwrap())
   }
 
+  /// The model [`every_block_has_an_owner_and_the_owners_sum_to_what_is_allocated`] keeps: each live block with its
+  /// owner and its held bytes, and how many frees were deferred and blocks trimmed.
+  #[derive(Default)]
+  struct OwnersModel {
+    /// Each live block, its owner and its held bytes.
+    live: Vec<(Extent, Owner, usize)>,
+    /// The frees a capture deferred.
+    deferred_seen: u32,
+    /// The blocks trimmed to their first page.
+    trimmed: u32,
+  }
+
+  /// One step of the owners' mix at `step`, drawn from `pick` over blocks of `page_bytes` pages: allocate one to five
+  /// pages for one of the owners, free a block, trim one to its first page, or free one under a capture.
+  fn owners_step(
+    arena: &mut ChunkArena,
+    model: &mut OwnersModel,
+    (pick, page_bytes, step): (u64, usize, u32),
+  ) {
+    match pick % 5 {
+      0 | 1 => {
+        let owner = Owner::ALL[usize::try_from(pick / 5 % 3).unwrap()];
+        let len = page_bytes * usize::try_from(1 + pick / 15 % 5).unwrap();
+        if let Ok(extent) = arena.alloc(len, owner) {
+          model.live.push((extent, owner, extent.len()));
+        }
+      }
+      2 if !model.live.is_empty() => {
+        let (extent, _, _) = model
+          .live
+          .swap_remove(usize::try_from(pick / 5).unwrap() % model.live.len());
+        arena.free(extent).unwrap();
+      }
+      3 if !model.live.is_empty() => trim_one_to_a_page(arena, model, (pick, page_bytes, step)),
+      4 if !model.live.is_empty() => free_one_under_a_capture(arena, model, (pick, step)),
+      _ => {}
+    }
+  }
+
+  /// The mix's trim ([`owners_step`]): a live block of more than a page that was never trimmed is trimmed to its first
+  /// page, its owner then holding its other blocks and that page, and the block is freed whole by its head.
+  fn trim_one_to_a_page(
+    arena: &mut ChunkArena,
+    model: &mut OwnersModel,
+    (pick, page_bytes, step): (u64, usize, u32),
+  ) {
+    let live = &mut model.live;
+    let at = usize::try_from(pick / 5).unwrap() % live.len();
+    let (extent, owner, held) = live[at];
+    if held > page_bytes
+      && extent.len() == held
+      && let Some(head) = arena.trim(extent, page_bytes, extent.len()).unwrap()
+    {
+      // A trimmed block is named by its head and freed whole by `free_trimmed`; the model keeps its prefix.
+      let others: usize = live
+        .iter()
+        .enumerate()
+        .filter(|(i, (_, o, _))| *i != at && *o == owner)
+        .map(|(_, (_, _, held))| held)
+        .sum();
+      assert_eq!(
+        arena.owned(owner).held,
+        u64::try_from(others + page_bytes).unwrap(),
+        "step {step}: {owner:?}'s held after a trim to a page"
+      );
+      arena.free_trimmed(head, page_bytes).unwrap();
+      live.swap_remove(at);
+      model.trimmed += 1;
+    }
+  }
+
+  /// The mix's deferred free ([`owners_step`]): a live block freed under a capture, the owners and the deferred then
+  /// summing to the allocated, and the capture committed.
+  fn free_one_under_a_capture(
+    arena: &mut ChunkArena,
+    model: &mut OwnersModel,
+    (pick, step): (u64, u32),
+  ) {
+    arena.capture();
+    let (extent, _, _) = model
+      .live
+      .swap_remove(usize::try_from(pick / 5).unwrap() % model.live.len());
+    arena.free(extent).unwrap();
+    if arena.deferred_bytes() > 0 {
+      model.deferred_seen += 1;
+    }
+    assert_eq!(
+      owners_balance(arena),
+      u64::try_from(arena.allocated_bytes()).unwrap(),
+      "step {step}: deferred"
+    );
+    arena.commit_capture();
+  }
+
+  /// The checks after each step of the mix: each owner's held bytes those of its `live` blocks, its asked bytes never
+  /// past them, and the owners' held bytes and the deferred bytes summing to the arena's allocated bytes.
+  fn assert_the_owners_match_the_model(
+    arena: &ChunkArena,
+    live: &[(Extent, Owner, usize)],
+    step: u32,
+  ) {
+    for owner in Owner::ALL {
+      let model: usize = live
+        .iter()
+        .filter(|(_, o, _)| *o == owner)
+        .map(|(_, _, held)| held)
+        .sum();
+      let owned = arena.owned(owner);
+      assert_eq!(
+        owned.held,
+        u64::try_from(model).unwrap(),
+        "step {step}: {owner:?}'s held"
+      );
+      assert!(
+        owned.asked <= owned.held,
+        "step {step}: {owner:?} asked past its held"
+      );
+    }
+    assert_eq!(
+      owners_balance(arena),
+      u64::try_from(arena.allocated_bytes()).unwrap(),
+      "step {step}: the owners and the deferred against the allocated"
+    );
+  }
+
   /// Goal 93 (main 01a20182's order of 2026-11-23 on arena-13's unnamed 373 MB): every block has an owner by
   /// construction. Do: on an arena of two regions, take a seeded mix of steps: allocate a block for one of the three
   /// owners at one to five pages, free one, trim one to its first page, and, every so often, free under a capture (so
@@ -1454,8 +1579,7 @@ mod tests {
         .unwrap();
     }
     arena.published = true;
-    let mut live: Vec<(Extent, Owner, usize)> = Vec::new();
-    let (mut deferred_seen, mut trimmed) = (0u32, 0u32);
+    let mut model = OwnersModel::default();
     let mut state = 0x2545_f491_4f6c_dd1d_u64;
     let mut next = || {
       state ^= state << 13;
@@ -1464,82 +1588,14 @@ mod tests {
       state
     };
     for step in 0..2_000u32 {
-      let pick = next();
-      match pick % 5 {
-        0 | 1 => {
-          let owner = Owner::ALL[usize::try_from(pick / 5 % 3).unwrap()];
-          let len = p * usize::try_from(1 + pick / 15 % 5).unwrap();
-          if let Ok(extent) = arena.alloc(len, owner) {
-            live.push((extent, owner, extent.len()));
-          }
-        }
-        2 if !live.is_empty() => {
-          let (extent, _, _) = live.swap_remove(usize::try_from(pick / 5).unwrap() % live.len());
-          arena.free(extent).unwrap();
-        }
-        3 if !live.is_empty() => {
-          let at = usize::try_from(pick / 5).unwrap() % live.len();
-          let (extent, owner, held) = live[at];
-          if held > p
-            && extent.len() == held
-            && let Some(head) = arena.trim(extent, p, extent.len()).unwrap()
-          {
-            // A trimmed block is named by its head and freed whole by `free_trimmed`; the model keeps its prefix.
-            let others: usize = live
-              .iter()
-              .enumerate()
-              .filter(|(i, (_, o, _))| *i != at && *o == owner)
-              .map(|(_, (_, _, held))| held)
-              .sum();
-            assert_eq!(
-              arena.owned(owner).held,
-              u64::try_from(others + p).unwrap(),
-              "step {step}: {owner:?}'s held after a trim to a page"
-            );
-            arena.free_trimmed(head, p).unwrap();
-            live.swap_remove(at);
-            trimmed += 1;
-          }
-        }
-        4 if !live.is_empty() => {
-          arena.capture();
-          let (extent, _, _) = live.swap_remove(usize::try_from(pick / 5).unwrap() % live.len());
-          arena.free(extent).unwrap();
-          if arena.deferred_bytes() > 0 {
-            deferred_seen += 1;
-          }
-          assert_eq!(
-            owners_balance(&arena),
-            u64::try_from(arena.allocated_bytes()).unwrap(),
-            "step {step}: deferred"
-          );
-          arena.commit_capture();
-        }
-        _ => {}
-      }
-      for owner in Owner::ALL {
-        let model: usize = live
-          .iter()
-          .filter(|(_, o, _)| *o == owner)
-          .map(|(_, _, held)| held)
-          .sum();
-        let owned = arena.owned(owner);
-        assert_eq!(
-          owned.held,
-          u64::try_from(model).unwrap(),
-          "step {step}: {owner:?}'s held"
-        );
-        assert!(
-          owned.asked <= owned.held,
-          "step {step}: {owner:?} asked past its held"
-        );
-      }
-      assert_eq!(
-        owners_balance(&arena),
-        u64::try_from(arena.allocated_bytes()).unwrap(),
-        "step {step}: the owners and the deferred against the allocated"
-      );
+      owners_step(&mut arena, &mut model, (next(), p, step));
+      assert_the_owners_match_the_model(&arena, &model.live, step);
     }
+    let OwnersModel {
+      mut live,
+      deferred_seen,
+      trimmed,
+    } = model;
     assert!(
       deferred_seen > 0 && trimmed > 0,
       "the mix deferred frees ({deferred_seen}) and trimmed ({trimmed})"
