@@ -669,6 +669,9 @@ pub struct HgIndex {
   rows: Index,
   /// Every branch's heads in its changelog, kept as it grows.
   branch_heads: BranchHeads,
+  /// Seals the store refused after an append (its room): the append stood, its rows charged within the budget, and
+  /// the tail is sealed at the next append instead ([`HgIndex::insert`]). Expected none.
+  seals_refused: u64,
 }
 
 impl Default for HgIndex {
@@ -683,6 +686,7 @@ impl HgIndex {
     HgIndex {
       rows: Index::new(),
       branch_heads: BranchHeads::default(),
+      seals_refused: 0,
     }
   }
 
@@ -694,6 +698,28 @@ impl HgIndex {
   /// Every branch's heads in its changelog, kept as it grows ([`BranchHeads`]).
   pub fn branch_heads(&self) -> &BranchHeads {
     &self.branch_heads
+  }
+
+  /// Inserts `rows` as one batch and seals the tail where it is due: the one place every append's rows go in (an
+  /// intake's, a replay's, an import's, a made changeset's, the branch heads' endings, objects and markers), so the tail
+  /// is at most a window of rows past one batch's, and its sealed tables are content (`slates_vcs::index`, "The tail
+  /// and its seal"). Until 2026-11-23 only an import sealed (`import::settle`): a daemon's push of Mercurial's own
+  /// history held 56 MB of tail rows at its end, each row two buffers of its own on the system heap
+  /// (`crates/server/tests/hg_push_lifetimes.rs`). A seal is a step's work: the full tables of a tail one batch past a
+  /// window. A seal the store refuses leaves the batch standing (its rows were charged within the budget when
+  /// admitted, so "refused, nothing is written" still holds for every append) and is counted ([`HgIndex::seals_refused`]);
+  /// the next append seals instead. A fork's sealed runs are its own, given back by [`HgIndex::release`].
+  fn insert(&mut self, store: &mut ContentStore, rows: &[NewRow<'_>]) -> Result<Batch, Refused> {
+    let batch = self.rows.insert_all(store, rows)?;
+    if self.rows.seal_due(store) && self.rows.seal(store).is_err() {
+      self.seals_refused = self.seals_refused.saturating_add(1);
+    }
+    Ok(batch)
+  }
+
+  /// Seals the store refused after an append ([`HgIndex::insert`]): expected none.
+  pub fn seals_refused(&self) -> u64 {
+    self.seals_refused
   }
 
   /// The bytes its rows hold in `store` (`slates_vcs::Index::held_bytes`).
@@ -711,6 +737,7 @@ impl HgIndex {
         answered: core::cell::Cell::new(0),
         longest_walk: self.branch_heads.longest_walk,
       },
+      seals_refused: 0,
     })
   }
 
@@ -745,7 +772,7 @@ impl HgIndex {
         payload,
       })
       .collect();
-    let batch = self.rows.insert_all(store, &rows)?;
+    let batch = self.insert(store, &rows)?;
     quarantine
       .abandon(store)
       .map_err(|refused| Refused::Index(IndexRefused::Content(refused)))?;
@@ -784,7 +811,7 @@ impl HgIndex {
         payload: &[],
       })
       .collect();
-    self.rows.insert_all(store, &rows)?;
+    self.insert(store, &rows)?;
     Ok(numbers)
   }
 
@@ -971,7 +998,7 @@ impl HgIndex {
       })
       .collect();
     if !rows.is_empty() {
-      self.rows.insert_all(store, &rows)?;
+      self.insert(store, &rows)?;
     }
     Ok(revs)
   }
@@ -1172,7 +1199,7 @@ impl HgIndex {
         payload,
       })
       .collect();
-    self.rows.insert_all(store, &batch)?;
+    self.insert(store, &batch)?;
     Ok(())
   }
 }
