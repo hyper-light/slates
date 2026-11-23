@@ -352,3 +352,21 @@ region-object-pin note).
 arm in homes::bring_back_landed awaiting bring_back per distinct key. Drop the expect. The let-go reds flip to every
 window let go.
 (3) Then the changelog/manifest move off the content store; main reruns the arena lane after the pin goes.
+
+## 2026-11-22 ~21:30 PST (w-hg)
+Landed 6b36e0269. Two pieces, each red-first:
+- 139fc4e9f, the intake's refused finish (main's routing of w-svn's sweep). A refused node check or finish_object
+  dropped the writer with its windows held; both now abandon it. Red (true, true, 2), now none held.
+- a401e9c51 plus the WIP commit before it, seam part 2 (hg's half of 2b(b)).
+  - Segments carry FileContents (path, node, ids).
+  - The let-go after a push's entry commits or an import lands notes each window as Landed::Hg and lets it go,
+    pinned by nothing.
+  - The let-go at segment durability notes nothing: bring_back reads the committed index.
+  - homes::bring_back_landed has its Hg arm.
+  - Test-only: Works::Whole replaced by plan, then works_whole (blocking read-through), then Works::Built.
+    prepare takes the view alone.
+  - Red-first edge test: a region object sharing a landed file's window is read whole from its home.
+  - The let-go tests flip to every window let go (were 71/120 and 1/5 pinned).
+  - Focused: server 77/77, hg 133/133.
+Next: main reruns the arena lane (the pin is gone), then the changelog/manifest move (replay and intake first).
+Main's heavier asks: CI hg matrix plus the arena diag at 6b36e0269 (push-all arena and RSS; landed_texts_brought_back).
