@@ -575,3 +575,10 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   cde9c1261 (fix + workflow), windows-latest. The Windows code has never been compiled; the green run is its first
   build. On green: merge main, rerun focused tests, push. Owed: windows-11-arm; a test that a reader from another
   process is refused.
+- LANDED 62d22aefe (A-875), 2026-11-23: on Windows the Node SDK opens its completion signal by name, a named pipe the
+  bridge nudges, admitting only this process's reader. Red 45225292920 "Unsupported fd type: UNKNOWN"; with it,
+  45230459274: ipc 8 of 8 (intruder test included), the addon builds, and the async lifecycle gets past its pipe.
+  Node 4 of 8 pass; the other 4 are refused BudgetExceeded at their first create (the Windows daemon's sizing,
+  w-win2's). Owed: main's SDK lane rerun after that, then windows-11-arm.
+- LANDED 12a17cd37: GAPS records svnsync over HTTPv2 (r21, 0 differences over git-2000) and http-v1 revprops (r254)
+  as proven by use.
