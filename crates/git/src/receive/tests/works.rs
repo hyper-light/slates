@@ -334,7 +334,7 @@ fn only_increment(logs: &Logs) -> Option<&Increment> {
 
 /// Asserts that `green` holds `file` as `bytes` and names `head` as its head.
 fn assert_holds(green: &Green, bytes: &[u8], head: ObjectId) {
-  assert_eq!(green.content("file"), Some(bytes));
+  assert_eq!(green.content_bytes("file"), Some(bytes));
   assert_eq!(green.xattr(ROOT, HEAD_ATTRIBUTE), Some(head.as_bytes()));
 }
 
@@ -466,7 +466,7 @@ fn an_orphan_create_states_the_whole_difference_from_the_default_head() {
     "{verdict:?}"
   );
   assert_eq!(served.green.content("file"), None);
-  assert_eq!(served.green.content("other"), Some(&b"other\n"[..]));
+  assert_eq!(served.green.content_bytes("other"), Some(&b"other\n"[..]));
   assert_eq!(
     served.green.xattr(ROOT, HEAD_ATTRIBUTE),
     Some(orphan.as_bytes())

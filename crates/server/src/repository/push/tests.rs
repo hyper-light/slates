@@ -178,7 +178,7 @@ fn file(state: &ShardState, green: DbVolumeId, path: &str) -> Option<Vec<u8>> {
   state
     .greens
     .get(&green)
-    .and_then(|engine| engine.content(path).map(<[u8]>::to_vec))
+    .and_then(|engine| engine.content_bytes(path).map(<[u8]>::to_vec))
 }
 
 /// A green's head as its root's attribute holds it (§4.17.1 item 3).
@@ -1022,7 +1022,7 @@ fn a_deferred_create_is_made_when_first_reached_and_reads_as_the_eager_create() 
     let mut read = |green: DbVolumeId| {
       let mut engine = state.greens.get_mut(&green).expect("materialized");
       let files: Vec<(String, Vec<u8>)> = engine
-        .files()
+        .files_bytes()
         .map(|(path, bytes)| (path, bytes.to_vec()))
         .collect();
       (engine.head(), files, engine.head_identity())
@@ -1301,7 +1301,7 @@ fn a_holders_replica_owes_the_same_push_and_a_takeover_makes_it_the_eager_green(
     let mut engine = state.greens.get_mut(&eager).expect("the eager green");
     let files = |green: &slates_merge::engine::Green| -> Vec<(String, Vec<u8>)> {
       green
-        .files()
+        .files_bytes()
         .map(|(path, bytes)| (path, bytes.to_vec()))
         .collect()
     };
@@ -1447,7 +1447,7 @@ fn green_reads(state: &mut ShardState, green: DbVolumeId) -> GreenRead {
   let durable = state.db.partition().green_head(green);
   let mut engine = state.greens.get_mut(&green).expect("the green");
   let files = engine
-    .files()
+    .files_bytes()
     .map(|(path, bytes)| (path, bytes.to_vec()))
     .collect();
   (engine.head(), files, engine.head_identity(), durable)
@@ -1670,12 +1670,12 @@ fn a_held_verdicts_preview_lives_across_turns_until_its_one_step() {
       .with(|held| held.borrow_mut().take())
       .expect("the pending accept");
     let previewed = crate::made_commit::with_held_preview(state, &mut pending, |engine| {
-      engine.content("g").map(<[u8]>::to_vec)
+      engine.content_bytes("g").map(<[u8]>::to_vec)
     });
     let green = state
       .greens
       .get(&main)
-      .map(|engine| (engine.head(), engine.content("f").map(<[u8]>::to_vec)));
+      .map(|engine| (engine.head(), engine.content_bytes("f").map(<[u8]>::to_vec)));
     let counted = state
       .refusals
       .get(crate::made_commit::PREVIEW_HELD_ACROSS_TURNS)
@@ -1691,7 +1691,7 @@ fn a_held_verdicts_preview_lives_across_turns_until_its_one_step() {
     let green = state
       .greens
       .get(&main)
-      .map(|engine| (engine.head(), engine.content("g").map(<[u8]>::to_vec)));
+      .map(|engine| (engine.head(), engine.content_bytes("g").map(<[u8]>::to_vec)));
     (made, green, state.greens.lineage_len(repo))
   });
   daemon.stop();

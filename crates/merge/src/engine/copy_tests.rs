@@ -263,20 +263,23 @@ fn a_copy_shares_its_source_and_reads_as_its_copy() {
 
 /// The trunk's files, directories, modes and properties at `branches/x`'s place, and the trunk still its own.
 fn holds_the_trunk_at_branches_x(green: &Green) {
-  assert_eq!(green.content("branches/x/a"), Some(&b"alpha"[..]));
-  assert_eq!(green.content("branches/x/d/b"), Some(&b"beta"[..]));
+  assert_eq!(green.content_bytes("branches/x/a"), Some(&b"alpha"[..]));
+  assert_eq!(green.content_bytes("branches/x/d/b"), Some(&b"beta"[..]));
   assert!(green.is_dir("branches/x") && green.is_dir("branches/x/d"));
   assert_eq!(green.mode("branches/x"), Some(0o755));
   assert_eq!(green.mode("branches/x/a"), Some(0o644));
   assert_eq!(green.xattr("branches/x", PROPS), Some(&b"p1"[..]));
   assert_eq!(green.xattr("branches/x/d/b", PROPS), Some(&b"p2"[..]));
-  assert_eq!(green.content("trunk/a"), Some(&b"alpha"[..]));
+  assert_eq!(green.content_bytes("trunk/a"), Some(&b"alpha"[..]));
 }
 
 /// Nothing at `branches/x` at version 1; the copied tree there at version 2.
 fn holds_branches_x_from_version_2_only(green: &Green) {
-  assert_eq!(green.content_at("branches/x/a", 1), None);
-  assert_eq!(green.content_at("branches/x/a", 2), Some(b"alpha".to_vec()));
+  assert_eq!(green.content_at_bytes("branches/x/a", 1), None);
+  assert_eq!(
+    green.content_at_bytes("branches/x/a", 2),
+    Some(b"alpha".to_vec())
+  );
   assert_eq!(green.content_len_at("branches/x/d/b", 2), Some(4));
   let before = green.base_at(1);
   assert!(
@@ -314,10 +317,10 @@ fn a_copy_costs_its_paths_whatever_its_tree_holds() {
   assert_eq!(green.changes_bytes() - changes, grown);
   assert_eq!(green.changes_bytes(), green.changes_recounted());
   assert_eq!(
-    green.content("dst/7/4039"),
+    green.content_bytes("dst/7/4039"),
     Some(&4039u32.to_le_bytes()[..])
   );
-  assert_eq!(green.files().count(), 8192);
+  assert_eq!(green.files_bytes().count(), 8192);
 }
 
 /// A-586 (a key's first change after a copy records, at the copy's version, the value the copy gave it). Do: copy the
@@ -337,18 +340,18 @@ fn a_keys_first_change_after_a_copy_records_the_value_the_copy_gave_it() {
     3,
   );
   reads_b_a_by_version(&green);
-  assert_eq!(green.content("trunk/a"), Some(&b"alpha"[..]));
+  assert_eq!(green.content_bytes("trunk/a"), Some(&b"alpha"[..]));
   assert_eq!(green.head_identity(), green.head_identity_from_scratch());
   assert_eq!(green.changed_between(2, 3), ["b/a"]);
 }
 
 /// `b/a` absent at version 1, the copied bytes and mode at 2 (a page and a length read from them), the new ones at 3.
 fn reads_b_a_by_version(green: &Green) {
-  assert_eq!(green.content_at("b/a", 1), None);
-  assert_eq!(green.content_at("b/a", 2), Some(b"alpha".to_vec()));
-  assert_eq!(green.content_at("b/a", 3), Some(b"ALpha".to_vec()));
+  assert_eq!(green.content_at_bytes("b/a", 1), None);
+  assert_eq!(green.content_at_bytes("b/a", 2), Some(b"alpha".to_vec()));
+  assert_eq!(green.content_at_bytes("b/a", 3), Some(b"ALpha".to_vec()));
   assert_eq!(
-    green.content_page_at("b/a", 2, (1, 2)),
+    green.content_page_at_bytes("b/a", 2, (1, 2)),
     Some((b"lp".to_vec(), 5))
   );
   assert_eq!(green.content_len_at("b/a", 2), Some(5));
@@ -403,21 +406,21 @@ fn edits_beneath_a_copy_in_its_own_increment_land_on_what_it_brought() {
 
 /// The edits of the copy's own increment on what the copy brought at `b`, and the trunk untouched.
 fn edits_landed_on_the_copy(green: &mut Green) {
-  assert_eq!(green.content("b/a"), Some(&b"ALpha"[..]));
-  assert_eq!(green.content("b/new"), Some(&b"new"[..]));
-  assert_eq!(green.content("b/c"), None);
+  assert_eq!(green.content_bytes("b/a"), Some(&b"ALpha"[..]));
+  assert_eq!(green.content_bytes("b/new"), Some(&b"new"[..]));
+  assert_eq!(green.content_bytes("b/c"), None);
   assert_eq!(green.mode("b/d"), Some(0o700));
   assert_eq!(green.xattr("b/d/b", PROPS), Some(&b"q"[..]));
-  assert_eq!(green.content("trunk/a"), Some(&b"alpha"[..]));
-  assert_eq!(green.content("trunk/c"), Some(&b"gamma"[..]));
+  assert_eq!(green.content_bytes("trunk/a"), Some(&b"alpha"[..]));
+  assert_eq!(green.content_bytes("trunk/c"), Some(&b"gamma"[..]));
   edits_landed_at_their_version(green);
 }
 
 /// The copy's own increment's edits read at its version and not before it, and the identity equal to its recount.
 fn edits_landed_at_their_version(green: &mut Green) {
-  assert_eq!(green.content_at("b/a", 1), None);
-  assert_eq!(green.content_at("b/a", 2), Some(b"ALpha".to_vec()));
-  assert_eq!(green.content_at("b/c", 2), None);
+  assert_eq!(green.content_at_bytes("b/a", 1), None);
+  assert_eq!(green.content_at_bytes("b/a", 2), Some(b"ALpha".to_vec()));
+  assert_eq!(green.content_at_bytes("b/c", 2), None);
   assert_eq!(green.head_identity(), green.head_identity_from_scratch());
 }
 
@@ -425,7 +428,7 @@ fn edits_landed_at_their_version(green: &mut Green) {
 fn replica_reads_alike(replica: &mut Green, green: &mut Green) {
   assert_eq!(replica.head_identity(), green.head_identity());
   assert_eq!(replica.base_at(2), green.base_at(2));
-  assert_eq!(replica.content("b/a"), Some(&b"ALpha"[..]));
+  assert_eq!(replica.content_bytes("b/a"), Some(&b"ALpha"[..]));
 }
 
 /// A-586 (the root's copy: `svn copy ^/ ^/snap`, which a stock client sends). Do: give the root a property and copy it,
@@ -445,8 +448,8 @@ fn a_copy_of_the_root_brings_every_path_beneath_its_destination() {
   let walked = green.walked();
   accept(&mut green, Work::exclusive().copy("", "snap", 1), 2);
   assert_eq!(green.walked(), walked, "the root's copy walked a map");
-  assert_eq!(green.content("snap/a"), Some(&b"x"[..]));
-  assert_eq!(green.content("snap/d/f"), Some(&b"y"[..]));
+  assert_eq!(green.content_bytes("snap/a"), Some(&b"x"[..]));
+  assert_eq!(green.content_bytes("snap/d/f"), Some(&b"y"[..]));
   assert!(green.is_dir("snap") && green.is_dir("snap/d"));
   assert_eq!(green.xattr("snap", PROPS), Some(&b"root"[..]));
   assert_eq!(green.xattr("", PROPS), Some(&b"root"[..]));
@@ -602,10 +605,10 @@ fn an_edit_declared_before_a_copy_replaced_its_file_conflicts() {
   );
   let fresh = green.submit(&Work::default().overwrite("d/x", 0, b"E").at(11, 3));
   assert_eq!(fresh, Outcome::Accepted { version: 4 });
-  assert_eq!(green.content("d/x"), Some(&b"Eew!"[..]));
-  assert_eq!(green.content_at("d/x", 1), Some(b"old!".to_vec()));
-  assert_eq!(green.content_at("d/x", 2), None);
-  assert_eq!(green.content_at("d/x", 3), Some(b"new!".to_vec()));
+  assert_eq!(green.content_bytes("d/x"), Some(&b"Eew!"[..]));
+  assert_eq!(green.content_at_bytes("d/x", 1), Some(b"old!".to_vec()));
+  assert_eq!(green.content_at_bytes("d/x", 2), None);
+  assert_eq!(green.content_at_bytes("d/x", 3), Some(b"new!".to_vec()));
   assert_eq!(green.head_identity(), green.head_identity_from_scratch());
 }
 
@@ -655,7 +658,7 @@ fn a_branch_before_a_copy_holds_none_of_it_and_one_after_holds_it() {
   let reads: Vec<(Option<Vec<u8>>, bool)> = (1..=3)
     .map(|version| {
       (
-        green.content_at("b/a", version),
+        green.content_at_bytes("b/a", version),
         green.base_at(version).dirs.contains(&"b/d".to_owned()),
       )
     })
@@ -668,7 +671,7 @@ fn a_branch_before_a_copy_holds_none_of_it_and_one_after_holds_it() {
       .with(branch, |green| {
         (
           green.head_identity(),
-          green.content("b/a").map(<[u8]>::to_vec),
+          green.content_bytes("b/a").map(<[u8]>::to_vec),
           green.is_dir("b/d"),
         )
       })
@@ -677,7 +680,7 @@ fn a_branch_before_a_copy_holds_none_of_it_and_one_after_holds_it() {
     assert_eq!((read, made), (bytes, dir), "the reads at {version}");
     lineage
       .with(branch, |green| {
-        assert_eq!(green.content("trunk/a"), Some(&b"alpha"[..]));
+        assert_eq!(green.content_bytes("trunk/a"), Some(&b"alpha"[..]));
       })
       .expect("the branch");
   }
@@ -690,7 +693,7 @@ fn restored_reads(green: &mut Green) -> (u64, Base, Option<Vec<u8>>, [u8; 32], [
   (
     green.head(),
     green.base_at(green.head()),
-    green.content("b/a").map(<[u8]>::to_vec),
+    green.content_bytes("b/a").map(<[u8]>::to_vec),
     green.head_identity(),
     green.head_identity_from_scratch(),
   )
@@ -766,9 +769,9 @@ fn replace_copy(from: &str, to: &str, version: u64) -> Work {
 /// Asserts that `green` holds the trunk's tree of [`trunk`] at `at`.
 fn assert_holds_the_trunk_at(green: &Green, at: &str) {
   let path = |rel: &str| joined(at, rel);
-  assert_eq!(green.content(&path("a")), Some(&b"alpha"[..]));
-  assert_eq!(green.content(&path("c")), Some(&b"gamma"[..]));
-  assert_eq!(green.content(&path("d/b")), Some(&b"beta"[..]));
+  assert_eq!(green.content_bytes(&path("a")), Some(&b"alpha"[..]));
+  assert_eq!(green.content_bytes(&path("c")), Some(&b"gamma"[..]));
+  assert_eq!(green.content_bytes(&path("d/b")), Some(&b"beta"[..]));
   assert!(green.is_dir(at) && green.is_dir(&path("d")));
   assert_eq!(green.mode(at), Some(0o755));
   assert_eq!(green.mode(&path("a")), Some(0o644));
@@ -778,8 +781,8 @@ fn assert_holds_the_trunk_at(green: &Green, at: &str) {
 
 /// Asserts that `green` read at version 2 holds the branch `b` of [`trunk_and_branch`], byte for byte.
 fn assert_holds_the_branch_at_2(green: &Green) {
-  assert_eq!(green.content_at("b/a", 2), Some(b"mine".to_vec()));
-  assert_eq!(green.content_at("b/only", 2), Some(b"only".to_vec()));
+  assert_eq!(green.content_at_bytes("b/a", 2), Some(b"mine".to_vec()));
+  assert_eq!(green.content_at_bytes("b/only", 2), Some(b"only".to_vec()));
   let before = green.base_at(2);
   assert!(before.dirs.contains(&"b/sub".to_owned()));
   assert!(before.modes.contains(&("b/sub".to_owned(), 0o700)));
@@ -838,7 +841,7 @@ fn a_replace_takes_its_destination_away_and_copies_the_source_there() {
   let (outcome, applied) = green.submit_resolved(&increment);
   assert_eq!(outcome, Outcome::Accepted { version: 3 });
   assert_holds_the_trunk_at(&green, "b");
-  assert_eq!(green.content("b/only"), None);
+  assert_eq!(green.content_bytes("b/only"), None);
   assert!(!green.is_dir("b/sub"));
   assert_eq!(green.mode("b/sub"), None);
   assert_holds_the_branch_at_2(&green);
@@ -868,7 +871,7 @@ fn a_key_a_replace_took_away_reads_at_every_version_once_it_changes_again() {
     4,
   );
   let bytes: Vec<Option<Vec<u8>>> = (2..=4)
-    .map(|version| green.content_at("b/a", version))
+    .map(|version| green.content_at_bytes("b/a", version))
     .collect();
   assert_eq!(
     bytes,
@@ -913,8 +916,8 @@ fn trunk_and_t2() -> Green {
 /// Asserts that `green` holds `t2`'s tree of [`trunk_and_t2`] at `at`.
 fn assert_holds_t2_at(green: &Green, at: &str) {
   assert!(green.is_dir(at) && green.is_dir(&joined(at, "e")));
-  assert_eq!(green.content(&joined(at, "f")), Some(&b"f2"[..]));
-  assert_eq!(green.content(&joined(at, "e/g")), Some(&b"g2"[..]));
+  assert_eq!(green.content_bytes(&joined(at, "f")), Some(&b"f2"[..]));
+  assert_eq!(green.content_bytes(&joined(at, "e/g")), Some(&b"g2"[..]));
 }
 
 /// What the nested copies leave at `b`: `t2`'s tree at `b/new` and over `b/d`, `b/d/b` and its property gone, the
@@ -922,11 +925,11 @@ fn assert_holds_t2_at(green: &Green, at: &str) {
 fn b_holds_its_nested_copies(green: &Green) {
   assert_holds_t2_at(green, "b/new");
   assert_holds_t2_at(green, "b/d");
-  assert_eq!(green.content("b/d/b"), None);
+  assert_eq!(green.content_bytes("b/d/b"), None);
   assert_eq!(green.xattr("b/d/b", PROPS), None);
-  assert_eq!(green.content("b/moved"), Some(&b"alpha"[..]));
-  assert_eq!(green.content("b/a"), None);
-  assert_eq!(green.content("b/c"), Some(&b"gamma"[..]));
+  assert_eq!(green.content_bytes("b/moved"), Some(&b"alpha"[..]));
+  assert_eq!(green.content_bytes("b/a"), None);
+  assert_eq!(green.content_bytes("b/c"), Some(&b"gamma"[..]));
   assert_eq!(green.xattr("b", PROPS), Some(&b"p1"[..]));
 }
 
@@ -1265,7 +1268,7 @@ fn a_copy_from_an_older_version_brings_the_source_as_it_stood() {
     tree_moved(&green.base_at(1), "trunk", "b"),
     tree_moved(&green.base_at(4), "b", "b")
   );
-  assert_eq!(green.content("trunk/a"), Some(&b"ALpha"[..]));
+  assert_eq!(green.content_bytes("trunk/a"), Some(&b"ALpha"[..]));
   assert_eq!(green.changed_between(3, 4), ["b"]);
   assert_eq!(green.copies_refused(), 0);
   assert_eq!(green.head_identity(), green.head_identity_from_scratch());
@@ -1301,8 +1304,8 @@ fn copies_from_before_a_copy_inside_or_over_the_source_bring_it_as_it_stood() {
     tree_moved(&green.base_at(4), "trunk", "c"),
     tree_moved(&green.base_at(6), "c", "c")
   );
-  assert_eq!(green.content("c/t/f"), Some(&b"f2"[..]));
-  assert_eq!(green.content("b/t/f"), None);
+  assert_eq!(green.content_bytes("c/t/f"), Some(&b"f2"[..]));
+  assert_eq!(green.content_bytes("b/t/f"), None);
   assert_eq!(green.copies_refused(), 0);
   assert_eq!(green.head_identity(), green.head_identity_from_scratch());
   assert_replay_reads_alike(&mut green, trunk_and_t2(), &entries);
@@ -1321,7 +1324,7 @@ fn an_edit_beneath_a_copy_from_an_older_version_lands_on_the_bytes_it_brings() {
   let increment = work.at(4, 3);
   let (outcome, applied) = green.submit_resolved(&increment);
   assert_eq!(outcome, Outcome::Accepted { version: 4 });
-  assert_eq!(green.content("b/a"), Some(&b"alpHA"[..]));
+  assert_eq!(green.content_bytes("b/a"), Some(&b"alpHA"[..]));
   assert_eq!(green.head_identity(), green.head_identity_from_scratch());
   let applied = applied.expect("an accepted version's effects");
   assert_replays_alike(&mut green, trunk_changed_after_1(), &increment, &applied);
@@ -2222,7 +2225,7 @@ impl Oracle {
     );
     for (path, bytes) in &state.files {
       prop_assert_eq!(
-        green.content_at(path, version),
+        green.content_at_bytes(path, version),
         Some(bytes.clone()),
         "{} at {}",
         path,
@@ -2522,7 +2525,7 @@ fn a_copy_computed_before_the_green_moved_is_judged_again_by_position() {
   );
   assert_eq!(judged, (1, 2, own.applied()));
   owner.commit_judged(held).expect("committed at its head");
-  assert_eq!(owner.content("b/a"), Some(&b"alpha"[..]));
+  assert_eq!(owner.content_bytes("b/a"), Some(&b"alpha"[..]));
 }
 
 /// What a view answers (A-805, [`Oracle::view_of`]): the paths its version changed, and each path's reads.
@@ -2543,7 +2546,7 @@ type Reads = (
 /// `path`'s reads in `green`, a copy counted after `since` ([`Reads`]).
 fn reads_at(green: &Green, path: &str, since: u64) -> Reads {
   (
-    green.content(path).map(<[u8]>::to_vec),
+    green.content_bytes(path).map(<[u8]>::to_vec),
     green.xattr(path, PROPS).map(<[u8]>::to_vec),
     green.is_dir(path),
     green.symlink(path).map(str::to_owned),
@@ -2595,13 +2598,13 @@ type Linked = (
 fn linked_reads(green: &Green) -> Linked {
   let read = |path: &str| {
     green
-      .content(green.hardlink(path).unwrap_or(path))
+      .content_bytes(green.hardlink(path).unwrap_or(path))
       .map(<[u8]>::to_vec)
   };
   (
     green.hardlink("b/l").map(str::to_owned),
     green.hardlink("b/o").map(str::to_owned),
-    green.content("b/o").map(<[u8]>::to_vec),
+    green.content_bytes("b/o").map(<[u8]>::to_vec),
     green.mode("b/o"),
     read("b/l"),
     (

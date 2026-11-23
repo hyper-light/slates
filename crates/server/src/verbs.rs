@@ -12228,8 +12228,12 @@ fn rebase_answer(
       let changed = changed
         .into_iter()
         .map(|(path, bytes)| {
-          let parts = bytes
-            .map(|bytes| crate::work_files::parts_over_base(&path, engine.content(&path), bytes));
+          // A head file held by its content-plane object alone (A-760 (b) 4b) is no base here: the changed file is
+          // held whole, its bytes the same, sharing nothing with the head.
+          let base = engine
+            .content(&path)
+            .and_then(|content| content.bytes().ok());
+          let parts = bytes.map(|bytes| crate::work_files::parts_over_base(&path, base, bytes));
           (path, parts)
         })
         .collect();
@@ -12581,9 +12585,18 @@ pub(crate) fn owner_files(
     return fetched;
   };
   for path in paths {
-    let file = engine
-      .content_ref_at(path, version)
-      .map(std::borrow::Cow::into_owned);
+    let file = match engine.content_ref_at(path, version) {
+      None => None,
+      Some(content) => match crate::vcs_store::named_objects::bytes_of(path, content) {
+        Ok(bytes) => Some(bytes.into_owned()),
+        // A base file held by its content-plane object alone (A-760 (b) 4b): the base cannot be read from here, as a
+        // gone green's (the work answers `BaseGone`); piece 4d reads it.
+        Err(_) => {
+          fetched.gone = true;
+          return fetched;
+        }
+      },
+    };
     fetched.files.insert(path.clone(), file);
     // With the path's base entries, so the work composes its increment itself (A-247).
     fetched
@@ -12631,7 +12644,17 @@ pub(crate) fn owner_page(
     fetched.gone = true;
     return fetched;
   };
-  let page = engine.content_page_at(&path, version, (offset, want));
+  let page = match engine.content_page_at(&path, version, (offset, want)) {
+    None => None,
+    Some((content, total)) => match crate::vcs_store::named_objects::bytes_of(&path, content) {
+      Ok(bytes) => Some((bytes.into_owned(), total)),
+      // As the fetch of files above: a base page held by its object alone is not read from here (A-760 (b) 4b).
+      Err(_) => {
+        fetched.gone = true;
+        return fetched;
+      }
+    },
+  };
   fetched.page = Some(crate::work_files::FetchedPage {
     path,
     offset,

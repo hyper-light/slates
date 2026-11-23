@@ -61480,6 +61480,21 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
   so none changes shape; a segment of layout 18 is refused at adoption, typed (`AnchorError::Layout`, the anchor's
   layout 19, `a_segment_from_before_digest_identities_is_refused_at_start`), as A-626's checkpoint version 4 to 5 was.
 - **Not yet.** No byte is dropped in this piece (4b-4d).
+- **4b, the read seam (2026-11-23).** Every reader outside the engine takes a file's content as `engine::Content` (a
+  current file's: `Bytes(&[u8])` or `Named(Identity)`) or `engine::ContentAt` (a file at a version: `Bytes(Cow)` or
+  `Named`) from `Green::content`, `files`, `held`, `content_ref_at`, `content_at`, `files_at` and `content_page_at`.
+  The engine's own reads and its tests take the byte readers (`content_bytes` and its siblings). A probe marking the
+  old readers deprecated found 25 production sites in 13 files. Some need only a path or a length (`Content::len`).
+  svn's held texts fall through to the content store, which reads the same identity. A rebase holds a changed file
+  whole over a named head file (`parts_over_base` with no base: the same bytes, nothing shared). Every other reader
+  refuses a named file typed through the error it has (`vcs_store::named_objects::bytes_of`, `NamedUnread`): git's map
+  `StepRefused::Named` (counted `vcs_paths.named_unread`, logged with the path and the green), hg's made changeset
+  `Unmade::Named` (`vcs.hg.named_unread`), a mount's read the host's try-again (`EAGAIN`, `ERROR_RETRY`), a work's base
+  `BaseGone`, a read page and a checkout `Unsupported`, svn's made view `Unreadable`. Nothing makes a named file yet,
+  so 4b has no failing-first test; the existing suites are its check (main's ruling). 4c+4d land as one piece: a named
+  block's hold of the content store with its bytes dropped, history reads through the plane, sync readers refusing
+  typed with their async callers bringing the object back (never pinned), `history::reanchor` checking a named
+  replace by its identity.
 - **Applied in the same change to** `crates/merge` (`dims`, `engine`, `engine/{copy,branch,copy_checkpoint}`,
   `identity` docs, `tests/origin.rs`, `tests/identity.golden`), `crates/anchor` (`layout`, `tests/anchor.rs`),
   `crates/vcs` (`ContentStore::object_id`'s doc), GAPS, amendments.tsv.

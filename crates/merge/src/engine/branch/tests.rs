@@ -31,7 +31,7 @@ fn copy_at(green: &Green, version: u64) -> Origin {
   let base = green.base_at(version);
   Origin {
     files: green
-      .files_at(version)
+      .files_at_bytes(version)
       .into_iter()
       .map(|(path, bytes)| (path, bytes.into_owned()))
       .collect(),
@@ -308,7 +308,7 @@ fn view(green: &mut Green) -> View {
         version,
         base: green.base_at(version),
         files: green
-          .files_at(version)
+          .files_at_bytes(version)
           .into_iter()
           .map(|(path, bytes)| (path, bytes.into_owned()))
           .collect(),
@@ -321,7 +321,7 @@ fn view(green: &mut Green) -> View {
           .collect(),
         pages: PATHS
           .iter()
-          .map(|path| green.content_page_at(path, version, (1, 2)))
+          .map(|path| green.content_page_at_bytes(path, version, (1, 2)))
           .collect(),
       }
     })
@@ -332,7 +332,7 @@ fn view(green: &mut Green) -> View {
     floor,
     identity,
     files: green
-      .files()
+      .files_bytes()
       .map(|(path, bytes)| (path, bytes.to_vec()))
       .collect(),
     current: green.current_base(),
@@ -368,7 +368,7 @@ fn snapshot(green: &mut Green) -> Snapshot {
   Snapshot {
     base: green.current_base(),
     files: green
-      .files()
+      .files_bytes()
       .map(|(path, bytes)| (path, bytes.to_vec()))
       .collect(),
     identity: green.head_identity(),
@@ -825,7 +825,7 @@ fn changes_to_a_branch_and_its_source_never_cross() {
 /// The bytes `green` of `lineage` holds at `path`.
 fn read_member(lineage: &mut Lineage, green: LineageGreen, path: &str) -> Option<Vec<u8>> {
   lineage
-    .with(green, |green| green.content(path).map(<[u8]>::to_vec))
+    .with(green, |green| green.content_bytes(path).map(<[u8]>::to_vec))
     .unwrap()
 }
 
@@ -1082,7 +1082,7 @@ fn a_member_taken_out_holds_the_arenas_and_every_other_lend_waits_for_it() {
   let (mut lineage, root) = Lineage::new(Green::with_origin(origin));
   let other = lineage.branch(root, 0).unwrap();
   let out = lineage.take(root).unwrap();
-  assert_eq!(out.content("a"), Some(b"0123".as_slice()));
+  assert_eq!(out.content_bytes("a"), Some(b"0123".as_slice()));
   every_other_lend_waits(&mut lineage, other);
   lineage.put_back(root, out).unwrap();
   assert_eq!(
@@ -1165,13 +1165,13 @@ fn a_retired_branch_gives_back_a_node_a_step_and_frees_only_what_it_alone_held()
   let files: Vec<(String, Vec<u8>)> = lineage
     .with(root, |green| {
       green
-        .files()
+        .files_bytes()
         .map(|(path, bytes)| (path, bytes.to_vec()))
         .collect()
     })
     .unwrap();
   let expected: Vec<(String, Vec<u8>)> = alone
-    .files()
+    .files_bytes()
     .map(|(path, bytes)| (path, bytes.to_vec()))
     .collect();
   assert_eq!(files, expected);
@@ -1191,7 +1191,7 @@ fn an_empty_member_joins_with_nothing_and_holds_what_it_writes() {
   let empty = lineage.create();
   assert_eq!(
     lineage
-      .with(empty, |green| (green.head(), green.files().count()))
+      .with(empty, |green| (green.head(), green.files_bytes().count()))
       .unwrap(),
     (0, 0)
   );
@@ -1213,15 +1213,15 @@ fn an_empty_member_joins_with_nothing_and_holds_what_it_writes() {
   );
   assert_eq!(
     lineage
-      .with(empty, |green| green.content("b").map(<[u8]>::to_vec))
+      .with(empty, |green| green.content_bytes("b").map(<[u8]>::to_vec))
       .unwrap(),
     Some(b"new".to_vec())
   );
   assert_eq!(
     lineage
       .with(root, |green| (
-        green.content("b").map(<[u8]>::to_vec),
-        green.content("a").map(<[u8]>::to_vec)
+        green.content_bytes("b").map(<[u8]>::to_vec),
+        green.content_bytes("a").map(<[u8]>::to_vec)
       ))
       .unwrap(),
     (None, Some(b"root".to_vec()))
@@ -1252,20 +1252,20 @@ fn a_held_verdict_previewed_reads_as_its_commit_while_its_green_shows_nothing_of
   let applied = judged.applied().to_vec();
   let before = lineage
     .with(root, |green| {
-      (green.head(), green.content("a").map(<[u8]>::to_vec))
+      (green.head(), green.content_bytes("a").map(<[u8]>::to_vec))
     })
     .unwrap();
   let preview = lineage.preview(root, judged).unwrap();
   let shown = lineage
     .with(root, |green| {
-      (green.head(), green.content("a").map(<[u8]>::to_vec))
+      (green.head(), green.content_bytes("a").map(<[u8]>::to_vec))
     })
     .unwrap();
   assert_eq!(shown, before, "the green shows nothing of the held verdict");
   let previewed = lineage
     .with(preview, |green| {
       (
-        green.content("a").map(<[u8]>::to_vec),
+        green.content_bytes("a").map(<[u8]>::to_vec),
         green.head_identity(),
         green.changed_between(0, green.head()),
       )
@@ -1280,7 +1280,7 @@ fn a_held_verdict_previewed_reads_as_its_commit_while_its_green_shows_nothing_of
   let committed = lineage
     .with(root, |green| {
       (
-        green.content("a").map(<[u8]>::to_vec),
+        green.content_bytes("a").map(<[u8]>::to_vec),
         green.head_identity(),
         green.changed_between(3, 4),
       )

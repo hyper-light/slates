@@ -514,7 +514,7 @@ mod preview_tests {
 
   fn reads_at(green: &Green, path: &str, since: u64) -> Reads {
     (
-      green.content(path).map(<[u8]>::to_vec),
+      green.content_bytes(path).map(<[u8]>::to_vec),
       green.xattr(path, PROPS).map(<[u8]>::to_vec),
       green.is_dir(path),
       green.symlink(path).map(str::to_owned),

@@ -379,7 +379,7 @@ pub(crate) fn files(
   crate::green_ready::made_now(state, green);
   let engine = state.greens.get(&green).unwrap();
   engine
-    .files()
+    .files_bytes()
     .map(|(path, bytes)| (path, bytes.to_vec()))
     .collect()
 }
@@ -1125,7 +1125,7 @@ fn t_p2_a_created_branch_and_tag_owe_one_push_across_a_replay_and_are_made_as_th
       crate::green_ready::made_now(state, green);
       let engine = state.greens.get(&green).expect("made");
       let files: Vec<(String, Vec<u8>)> = engine
-        .files()
+        .files_bytes()
         .map(|(path, bytes)| (path, bytes.to_vec()))
         .collect();
       assert_eq!(

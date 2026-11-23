@@ -162,7 +162,7 @@ impl Work {
     let version = if *at_head { green.head() } else { 1 };
     let mut work = Work {
       files: green
-        .files_at(1)
+        .files_at_bytes(1)
         .into_iter()
         .map(|(p, b)| (p, b.into_owned()))
         .collect(),
@@ -176,7 +176,7 @@ impl Work {
       version,
       replace: false,
     });
-    for (path, bytes) in green.files_at(version) {
+    for (path, bytes) in green.files_at_bytes(version) {
       if let Some(rel) = super::copy::relative(&path, from) {
         let at = super::copy::joined(to, rel);
         work.copied.push(at.clone());
@@ -321,7 +321,7 @@ fn restate(work: &Work, census: &mut Census) -> Result<(), String> {
       Outcome::Accepted { .. } | Outcome::Identical { .. },
     ) if !work.refused => {
       let mut files: Files = rebasing
-        .files()
+        .files_bytes()
         .map(|(path, bytes)| (path, bytes.to_vec()))
         .collect();
       for (path, after) in changed {
@@ -337,7 +337,7 @@ fn restate(work: &Work, census: &mut Census) -> Result<(), String> {
         (
           green.base_at(green.head()),
           green
-            .files_at(green.head())
+            .files_at_bytes(green.head())
             .into_iter()
             .map(|(p, b)| (p, b.into_owned()))
             .collect::<Files>(),

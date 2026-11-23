@@ -245,7 +245,7 @@ proptest! {
       prop_assert!(matches!(outcome, Outcome::Accepted { .. } | Outcome::Identical { .. }), "{:?}", outcome);
     } else {
       prop_assert_eq!(outcome, Outcome::Accepted { version: 2 });
-      prop_assert_eq!(green.content("f"), Some(post.as_slice()));
+      prop_assert_eq!(green.content_bytes("f"), Some(post.as_slice()));
     }
   }
 

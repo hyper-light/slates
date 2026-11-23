@@ -604,7 +604,7 @@ fn read_back(
     let green = super::svn_commit::green_of(state, repository).ok();
     let file = green
       .and_then(|green| state.greens.get(&green))
-      .and_then(|engine| engine.content("trunk/a.txt").map(<[u8]>::to_vec));
+      .and_then(|engine| engine.content_bytes("trunk/a.txt").map(<[u8]>::to_vec));
     (held, file)
   })
 }
@@ -1224,7 +1224,7 @@ fn a_subversion_copy_from_a_stored_revision_reads_a_window_that_was_let_go() {
         state
           .greens
           .get(&green)?
-          .content("copy/a.txt")
+          .content_bytes("copy/a.txt")
           .map(<[u8]>::to_vec)
       })
       .flatten();
@@ -1477,7 +1477,7 @@ fn a_readopted_green_brings_back_the_texts_its_checkpoint_names_first() {
         state
           .greens
           .get(&green)
-          .and_then(|engine| engine.content("trunk/a.txt").map(<[u8]>::to_vec))
+          .and_then(|engine| engine.content_bytes("trunk/a.txt").map(<[u8]>::to_vec))
       })
       .flatten();
       (readopted, served)

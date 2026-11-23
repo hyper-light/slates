@@ -105,7 +105,7 @@ fn a_named_text_is_read_a_slice_a_step_then_lands_whole() {
   let encoded = work.encode();
   assert!(encoded.len() < 4096, "{} bytes encoded", encoded.len());
   assert_eq!(green.submit(&work), Outcome::Accepted { version: 1 });
-  assert_eq!(green.content("big"), Some(bytes.as_slice()));
+  assert_eq!(green.content_bytes("big"), Some(bytes.as_slice()));
   round_trips_by_name(&work, &encoded, object);
 }
 
@@ -195,7 +195,7 @@ fn a_named_texts_buffer_becomes_the_greens_file_with_no_copy() {
     green.commit_judged(judged).map(|(version, _)| version),
     Ok(1)
   );
-  let file = green.content("big").unwrap();
+  let file = green.content_bytes("big").unwrap();
   assert_eq!(file, bytes.as_slice());
   assert_eq!(file.as_ptr(), buffer, "the file is not the run's buffer");
 }
@@ -249,8 +249,8 @@ fn a_run_two_files_make_is_copied_never_moved_twice() {
     panic!("not accepted");
   };
   green.commit_judged(judged).unwrap();
-  assert_eq!(green.content("a"), Some(bytes.as_slice()));
-  assert_eq!(green.content("b"), Some(bytes.as_slice()));
+  assert_eq!(green.content_bytes("a"), Some(bytes.as_slice()));
+  assert_eq!(green.content_bytes("b"), Some(bytes.as_slice()));
 }
 
 /// A-760 part 2's bug, found 2026-11-20 closing A-760 (C1). Do: a work whose file `a` is the whole of named run 0 (its
@@ -314,8 +314,8 @@ fn a_run_moved_into_its_file_leaves_later_runs_where_they_were() {
     panic!("not accepted");
   };
   green.commit_judged(judged).unwrap();
-  assert_eq!(green.content("a"), Some(first.as_slice()));
-  assert_eq!(green.content("b"), second.get(..5));
+  assert_eq!(green.content_bytes("a"), Some(first.as_slice()));
+  assert_eq!(green.content_bytes("b"), second.get(..5));
 }
 
 /// A green at version 1 holding `base` as the file `big`.
@@ -460,10 +460,10 @@ fn spliced_and_created(
   let mut expected = base;
   expected[middle..middle + splice.len()].copy_from_slice(splice);
   assert!(
-    green.content("big") == Some(expected.as_slice()),
+    green.content_bytes("big") == Some(expected.as_slice()),
     "the spliced file differs"
   );
-  let created = green.content("new").unwrap();
+  let created = green.content_bytes("new").unwrap();
   assert_eq!(created, whole);
   assert_eq!(created.as_ptr(), whole_buffer, "the whole run was copied");
 }
@@ -496,7 +496,7 @@ fn a_recorded_versions_whole_run_becomes_the_file_with_no_copy() {
   let mut replaying = Green::new();
   assert_eq!(replaying.apply_recorded(&mut work, &applied), version);
   assert_eq!(replaying.head_identity(), judging.head_identity());
-  let file = replaying.content("big").unwrap();
+  let file = replaying.content_bytes("big").unwrap();
   assert_eq!(file, bytes.as_slice());
   assert_eq!(
     file.as_ptr(),
@@ -813,7 +813,7 @@ fn holds_model(green: &Green, model: &Model, which: &str) -> Result<(), TestCase
   for path in PATHS {
     let held = model.get(path);
     prop_assert_eq!(
-      green.content(path),
+      green.content_bytes(path),
       held.map(|(bytes, _)| bytes.as_slice()),
       "{}'s bytes at {}",
       which,

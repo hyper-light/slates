@@ -42,7 +42,7 @@ type Home = (Vec<Kind>, Option<Vec<u8>>, Option<u32>, Option<Vec<u8>>);
 fn home(green: &Green, path: &str) -> Home {
   (
     kinds_at(green, path),
-    green.content(path).map(<[u8]>::to_vec),
+    green.content_bytes(path).map(<[u8]>::to_vec),
     green.mode(path),
     green.xattr(path, NAME).map(<[u8]>::to_vec),
   )
@@ -87,8 +87,8 @@ fn a_file_made_again_where_a_node_was_is_another_node() -> Result<(), String> {
   accept(&mut green, Work::default().create(TARGET, b"<new>\n"), 5)?;
   let found = (
     green.hardlink(SECOND),
-    green.content(HARDLINK).map(<[u8]>::to_vec),
-    green.content(TARGET).map(<[u8]>::to_vec),
+    green.content_bytes(HARDLINK).map(<[u8]>::to_vec),
+    green.content_bytes(TARGET).map(<[u8]>::to_vec),
   );
   let expected = (
     Some(HARDLINK),
@@ -115,7 +115,7 @@ fn a_renamed_files_links_name_it_at_its_new_path() -> Result<(), String> {
   let found = (
     green.hardlink(HARDLINK),
     green.hardlink(SECOND),
-    green.content("moved").map(<[u8]>::to_vec),
+    green.content_bytes("moved").map(<[u8]>::to_vec),
   );
   if found != (Some("moved"), Some("moved"), Some(b"<g>\n".to_vec())) {
     return Err(format!("{found:?}"));
@@ -137,7 +137,7 @@ fn a_file_replaced_by_a_rename_leaves_its_node_to_its_links() -> Result<(), Stri
   let found = (
     home(&green, HARDLINK),
     green.hardlink(SECOND),
-    green.content(TARGET).map(<[u8]>::to_vec),
+    green.content_bytes(TARGET).map(<[u8]>::to_vec),
   );
   if found != (targets_node(), Some(HARDLINK), Some(b"<f>\n".to_vec())) {
     return Err(format!("{found:?}"));
@@ -310,7 +310,7 @@ fn a_replay_derives_the_same_node_moves() -> Result<(), String> {
       return Err(format!("version {id}: {identities:?}"));
     }
   }
-  let found = (live.hardlink(SECOND), live.content(HARDLINK));
+  let found = (live.hardlink(SECOND), live.content_bytes(HARDLINK));
   if found != (Some(HARDLINK), Some(&b"<g>\n"[..])) {
     return Err(format!("{found:?}"));
   }
@@ -355,8 +355,8 @@ fn a_link_to_a_node_the_work_does_not_make_is_refused() -> Result<(), String> {
 fn after_the_rename(green: &Green) -> (Option<&str>, Option<&[u8]>, Option<&[u8]>) {
   (
     green.hardlink("linked"),
-    green.content(HARDLINK),
-    green.content(TARGET),
+    green.content_bytes(HARDLINK),
+    green.content_bytes(TARGET),
   )
 }
 
@@ -398,7 +398,7 @@ type Files = BTreeMap<String, Vec<u8>>;
 /// `green`'s files at its head.
 fn files_of(green: &Green) -> Files {
   green
-    .files()
+    .files_bytes()
     .map(|(path, bytes)| (path, bytes.to_vec()))
     .collect()
 }

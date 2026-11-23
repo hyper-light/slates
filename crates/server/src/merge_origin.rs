@@ -2441,8 +2441,8 @@ mod tests {
           replica.reached(),
           replica.head_identity(),
           replica.folded_below(),
-          replica.content_at("f", 1),
-          replica.content_at("f", 2),
+          replica.content_at_bytes("f", 1),
+          replica.content_at_bytes("f", 2),
         )
       });
       (

@@ -1908,8 +1908,15 @@
 > **A-873 (2026-11-23, w-svn; main 01a20182's ruling (I), A-760 (b) piece 4a):** a green's identity entry for a file
 > hashes its path, length and plain BLAKE3 digest, which each block keeps from when it was made, not its bytes. Golden
 > vectors are regenerated through `--ignored regenerate_the_identity_golden_vectors`, with a determinism gate. Anchor
-> layout 19 refuses a layout-18 segment typed. OWED: 4b (one read seam, `Bytes | Named`; w-git and w-hg told first),
-> 4c (the engine's named-base reads), 4d (a named block holds no bytes).
+> layout 19 refuses a layout-18 segment typed. 4b BUILT (2026-11-23): one read seam, `engine::Content` (a current
+> file's `Bytes | Named`) and `ContentAt` (at a version); the engine's own reads and its tests take the `*_bytes`
+> readers. svn's held texts fall through to the content store, and a rebase holds a named head file's change whole.
+> Every other site refuses typed: git's `StepRefused::Named` (`vcs_paths.named_unread`, logged with path and green),
+> hg's `Unmade::Named` (`vcs.hg.named_unread`), a mount's read `EAGAIN`/`ERROR_RETRY`, a work's base `BaseGone`, a
+> read page `Unsupported`, checkout `Unsupported`. No producer yet, so no red: the suites are its check. OWED: 4c+4d as
+> one piece (main's ruling of 2026-11-23): a named block's hold of the content store with its bytes dropped, history
+> reads through the plane, sync readers refusing typed and their async callers bringing back (never pinned),
+> `history::reanchor` checking a named replace by identity.
 >
 > **A-869 (2026-11-22, w-svn; main 01a20182's order of 19:28, A-760 (b) piece 2):** a green's checkpoint names a file
 > whose block is named for a content-plane object instead of carrying its bytes (`Checkpoint::named`, a section after
