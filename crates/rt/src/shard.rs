@@ -188,13 +188,6 @@ pub struct Counters {
   /// Tasks woken because a shard they asked for room drained its control channel, or left its loop
   /// ([`crate::room`]): the room wake's non-vacuity count.
   pub room_wakes: u64,
-  /// Naps taken (84a's Linux arm G, [`ShardContext::nap_deadline`]): short parks while the shard expects work, each
-  /// ended by its own timer on its own CPU if nothing came first. The nap's non-vacuity count.
-  pub naps: u64,
-  /// The shard thread's CPU time spent in its naps, nanoseconds: the naps' cost.
-  pub nap_cpu_ns: u64,
-  /// The wall time spent in its naps, nanoseconds: the time the shard spent expecting, against which the cost is read.
-  pub nap_wall_ns: u64,
 }
 
 /// Shape: the exponential-forgetting shift of the measured scheduler overrun — a wait's overrun that
@@ -349,12 +342,6 @@ pub struct ShardContext {
   /// The end of the longest hold an activity asked for ([`ShardContext::hold_idle_window`]), shard clock: the idle
   /// window stays open at least until it, whatever its own length. 0 before the first hold.
   held_until_ns: Cell<u64>,
-  /// The shard's idle gaps (84a's Linux arm G): from one activity to the next where the gap outlasted the idle window,
-  /// learned as an online mean on the wake estimate's weighting; the window the shard naps in after its idle spin
-  /// follows it ([`Self::nap_deadline`]). `None` when the shard tracks no wake estimate.
-  idle_gap: Cell<Option<WakeEstimate>>,
-  /// Naps taken, their thread CPU and their wall time ([`Counters::naps`]).
-  naps: Cell<(u64, u64, u64)>,
   /// Holds kept ([`Counters::idle_holds`]).
   idle_holds: Cell<u64>,
   /// Holds declined ([`Counters::idle_holds_declined`]).
@@ -566,12 +553,6 @@ impl ShardContext {
       exited: Cell::new(false),
       activity_ns: Cell::new(None),
       held_until_ns: Cell::new(0),
-      idle_gap: Cell::new(
-        config
-          .wake_tracking
-          .map(|tracking| WakeEstimate::new(tracking.prior_ns, tracking.shift)),
-      ),
-      naps: Cell::new((0, 0, 0)),
       idle_holds: Cell::new(0),
       idle_holds_declined: Cell::new(0),
       held_turn: Cell::new(
@@ -707,58 +688,7 @@ impl ShardContext {
   /// within the measured idle window"): the shard spins out the idle window from now before it parks, so
   /// the client's next request within it costs no kernel wake. Called on the shard's own thread.
   pub fn note_activity(&self) {
-    self.record_activity(self.now_ns());
-  }
-
-  /// Records an activity at `now`: an idle gap that outlasted the idle window teaches the idle-gap estimate first (84a's
-  /// Linux arm G), so the shard naps for the gaps its work actually leaves, not the ones its spin already covers.
-  fn record_activity(&self, now: u64) {
-    if let (Some(previous), Some(mut gaps)) = (self.activity_ns.get(), self.idle_gap.get()) {
-      let gap = now.saturating_sub(previous);
-      if gap > self.idle_window_ns() {
-        gaps.record(gap);
-        self.idle_gap.set(Some(gaps));
-      }
-    }
-    self.activity_ns.set(Some(now));
-  }
-
-  /// Where a nap ends, when the shard expects work now (84a's Linux arm G), else `None` and it parks as before. Under
-  /// Linux's lazy preemption a kick to a shard whose CPU runs a fair neighbour's user code is honoured only when that CPU
-  /// next enters the kernel, at its tick (kernel 7.0: `wakeup_preempt_fair` reschedules lazily and `__resched_curr`
-  /// sends no IPI for it; measured kick -> run p99 998 µs, run 45087231374). A nap's timer fires on the shard's own CPU
-  /// (`get_nohz_timer_target` keeps a busy CPU's timer), and the interrupt's return to user mode reschedules
-  /// (`exit_to_user_mode_loop` honours the lazy bit), so a kick that landed during the nap runs within one nap.
-  ///
-  /// Derived (`slates_machine::nap`): the shard expects work from its last activity for the expectation of its idle
-  /// gaps; each nap lasts the idle window, R9's floor, and ends no later than the expectation or the shard's next timer.
-  fn nap_deadline(&self, next_deadline_ns: Option<u64>) -> Option<u64> {
-    if !cfg!(target_os = "linux") || !self.real_time {
-      return None;
-    }
-    let (activity, gaps) = (self.activity_ns.get()?, self.idle_gap.get()?);
-    let expected_until =
-      activity.saturating_add(slates_machine::nap::expectation_ns(gaps.mean_ns()));
-    let now = self.now_ns();
-    if now >= expected_until {
-      return None;
-    }
-    let nap_end = now
-      .saturating_add(self.idle_window_ns())
-      .min(expected_until);
-    Some(next_deadline_ns.map_or(nap_end, |deadline| deadline.min(nap_end)))
-  }
-
-  /// One nap ([`Self::nap_deadline`]): a park to `nap_end`, its thread CPU and wall time counted.
-  fn nap(&self, nap_end: u64) {
-    let (cpu_before, wall_before) = (thread_cpu_ns(), self.now_ns());
-    self.park(Some(nap_end));
-    let (naps, cpu, wall) = self.naps.get();
-    self.naps.set((
-      naps.saturating_add(1),
-      cpu.saturating_add(thread_cpu_ns().saturating_sub(cpu_before)),
-      wall.saturating_add(self.now_ns().saturating_sub(wall_before)),
-    ));
+    self.activity_ns.set(Some(self.now_ns()));
   }
 
   /// Notes client work as [`note_activity`](Self::note_activity) does, and holds the idle window open until at least
@@ -772,7 +702,7 @@ impl ShardContext {
   /// thread.
   pub fn hold_idle_window(&self, window_ns: u64) -> bool {
     let now = self.now_ns();
-    self.record_activity(now);
+    self.activity_ns.set(Some(now));
     let met_turn = self.held_turn.get().and_then(|turns| turns.met_ns());
     if !hold_pays(met_turn, self.wake_cost_ns()) {
       self
@@ -888,7 +818,6 @@ impl ShardContext {
     c.wake_cost_ns = self.wake_cost_ns();
     c.idle_window_ns = self.idle_window_ns();
     c.idle_holds = self.idle_holds.get();
-    (c.naps, c.nap_cpu_ns, c.nap_wall_ns) = self.naps.get();
     c.idle_holds_declined = self.idle_holds_declined.get();
     let held_turn = self.held_turn.get();
     c.held_turn_ns = held_turn.and_then(|turns| turns.met_ns()).unwrap_or(0);
@@ -1497,10 +1426,7 @@ impl ShardContext {
         let _ = self.harvest_io();
         continue;
       }
-      match self.nap_deadline(outcome.next_deadline_ns) {
-        Some(nap_end) => self.nap(nap_end),
-        None => self.park(outcome.next_deadline_ns),
-      }
+      self.park(outcome.next_deadline_ns);
       last_wait_ns = self.now_ns();
     }
     drop(entered);
@@ -2601,24 +2527,4 @@ fn unlink_child(arena: &mut Slab<TaskSlot>, parent: u32, child: u32) {
 /// Pins a boxed future for admission.
 pub fn boxed<F: std::future::Future<Output = ()> + 'static>(future: F) -> BoxedFuture {
   Box::pin(future) as Pin<Box<dyn std::future::Future<Output = ()>>>
-}
-
-/// Format: nanoseconds a second, for a thread CPU clock reading.
-#[cfg(unix)]
-const NS_PER_S: u64 = 1_000_000_000;
-
-/// The calling thread's CPU time, nanoseconds (0 where the clock cannot be read).
-fn thread_cpu_ns() -> u64 {
-  #[cfg(unix)]
-  {
-    let reading = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
-    u64::try_from(reading.tv_sec)
-      .unwrap_or(0)
-      .saturating_mul(NS_PER_S)
-      .saturating_add(u64::try_from(reading.tv_nsec).unwrap_or(0))
-  }
-  #[cfg(not(unix))]
-  {
-    0
-  }
 }
