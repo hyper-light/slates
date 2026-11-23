@@ -1,0 +1,65 @@
+name: diag measurer
+# w-interop (2026-11-23, main 01a20182's order (2)): xtask's tracer unit test,
+# `the_hermeticity_tracer_allows_startup_and_observes_writes`, failed intermittently on ubuntu (CI run 45176536354,
+# "the daemon did not come up ... last exit 3; anchor log:" empty). This runs it alone 20 times as the conformance lane
+# runs it (its tools, root's fuse grant, the slates binary it names), on main with 0352bbf2a's diagnostic, which names
+# the anchor's exit and its whole log, keeping each run's verdict and message. Runs only from `diag-measurer-*`
+# branches, never main.
+
+on:
+  push:
+    branches: ["diag-measurer-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  tracer-twenty:
+    name: the tracer unit test, 20 runs (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Suite tools (as the conformance lane installs them)
+        run: sudo apt-get update && sudo apt-get install -y strace nfs-common fuse3 inotify-tools ripgrep sqlite3 vim mercurial subversion
+      - name: Grant user_allow_other (as the conformance lane does)
+        run: grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+      - name: Build
+        run: |
+          cargo build -p slates-cli
+          cargo test -p xtask --bin xtask --no-run
+      - name: The tracer test, 20 runs
+        run: |
+          set +e
+          export SLATES_TEST_BINARY="$GITHUB_WORKSPACE/target/debug/slates"
+          echo "nproc $(nproc); load $(cat /proc/loadavg); ptrace_scope $(cat /proc/sys/kernel/yama/ptrace_scope); $(strace -V | head -1)"
+          fails=0
+          for run in $(seq 1 20); do
+            out="$RUNNER_TEMP/tracer-$run.log"
+            cargo test -q -p xtask --bin xtask conformance::slates::tests::the_hermeticity_tracer_allows_startup_and_observes_writes -- --test-threads=1 --nocapture > "$out" 2>&1
+            code=$?
+            if [ $code -ne 0 ]; then
+              fails=$((fails + 1))
+              echo "RUN $run FAIL (exit $code):"
+              grep -A12 "panicked at" "$out" | cut -c1-2000
+            else
+              echo "RUN $run PASS $(grep -c 'test result: ok. 1 passed' "$out")"
+            fi
+          done
+          echo "TRACER TEST: $fails of 20 failed"
+          exit 0
+      - name: Keep the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: tracer-twenty-logs
+          path: ${{ runner.temp }}/tracer-*.log
+          if-no-files-found: warn
