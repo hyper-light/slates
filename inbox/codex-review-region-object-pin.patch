@@ -1,0 +1,70 @@
+diff --git a/crates/server/src/vcs_store/homes/tests.rs b/crates/server/src/vcs_store/homes/tests.rs
+index ca8ae4e42..5520d055c 100644
+--- a/crates/server/src/vcs_store/homes/tests.rs
++++ b/crates/server/src/vcs_store/homes/tests.rs
+@@ -683,3 +683,65 @@ fn an_object_longer_than_a_window_is_homed_and_read_back_by_its_blake3() {
+   let outcome = answered.recv().unwrap();
+   assert!(outcome.is_empty(), "{outcome:?}");
+ }
++
++/// A-724 piece 8c and A-863, goal 93. Do: keep a two-window object for the region on its home
++/// shard. Land a Mercurial file with the same first window and a second, independent file.
++/// Expect: the independent file's window leaves RAM and the home still serves the whole object.
++#[test]
++fn a_region_object_remains_readable_when_a_landed_file_shares_its_first_window() {
++  let daemon = crate::daemon::audit_daemon_of(2);
++  let (shards, window) = crate::daemon::observe_first(&daemon, |state| {
++    (state.shards.clone(), state.store.content.chunk_bytes())
++  });
++  let mut bytes = vec![0; window + 1];
++  let shared_home = home_of(&shards, &ContentId::of(&bytes[..window])).unwrap();
++  // Select two different homes with the daemon's own shard IDs and placement rule.
++  let object_home = (u8::MIN..=u8::MAX)
++    .find_map(|tail| {
++      bytes[window] = tail;
++      home_of(&shards, &ContentId::of(&bytes)).filter(|home| *home != shared_home)
++    })
++    .expect("a two-window object whose first window ranks on the other shard");
++  let partition = shards
++    .iter()
++    .position(|shard| *shard == object_home)
++    .unwrap();
++  let independent = (u8::MIN..=u8::MAX)
++    .map(|byte| [byte, byte])
++    .find(|text| home_of(&shards, &ContentId::of(text)) == Some(shared_home))
++    .expect("an independent file whose window may leave this shard");
++  let (before, after, freed) = crate::daemon::observe_at(&daemon, partition, move |state| {
++    let (object, _) = super::keep_for_region(state, &bytes).unwrap();
++    let before = super::read_here(state, &object).as_deref() == Some(bytes.as_slice());
++    let files =
++      crate::vcs_store::within_budget(state, (window + independent.len()) as u64, |stores| {
++        let content = stores.content_mut().unwrap();
++        [
++          content.put_object(&bytes[..window]).unwrap(),
++          content.put_object(&independent).unwrap(),
++        ]
++      });
++    crate::repository::hg_run::let_go_landed(state, &files);
++    let after = super::read_here(state, &object).map(|read| read.len());
++    let freed = state
++      .refusals
++      .get(crate::repository::hg_run::TEXT_BYTES_LET_GO)
++      .copied()
++      .unwrap_or(0);
++    (before, after, freed)
++  });
++  daemon.stop();
++  assert!(
++    before,
++    "the home served the complete object before the two file windows were released"
++  );
++  assert!(
++    freed >= independent.len() as u64,
++    "Mercurial released the independent file"
++  );
++  assert_eq!(
++    after,
++    Some(window + 1),
++    "the region's object must remain readable after the release of a shared window; {freed} bytes left RAM"
++  );
++}
