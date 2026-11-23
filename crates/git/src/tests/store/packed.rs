@@ -981,6 +981,198 @@ fn r165_an_encoding_reading_a_delta_over_let_go_windows_stops_and_keeps_the_same
   assert!(kept_again == kept, "the same clone of the same fragments");
 }
 
+/// Main 01a20182's order of 2026-11-23 (item 2: the encoding's object read, a latent `Unreadable`, its red built
+/// directly): an encoding past an object's header reads, its windows then let go, then the read. Do: land stock git's
+/// offset-delta pack in a store of 256-byte windows, no pushed entry sent on as it lies (`encoding::NO_REUSE`, so each
+/// object is read where it lies), and encode its version a unit a turn (a quantum of a nanosecond),
+/// nothing let go, until it stands at an object's read where it lies in the pack, nothing of it read
+/// (`Encoding::reading_unread_in_pack`); then let every window of the pack go and take the next turn; then bring back
+/// each window a turn stops at and encode to the end; then clone. Expect: the turn of the read ends cleanly, stopped at
+/// a let-go window (`Encoding::waiting`); the clone is the one an encoding with nothing let go makes, byte for byte.
+/// Red before: the read refused the encoding `Unreadable`.
+#[test]
+fn r165_an_encodings_object_read_past_its_header_reads_stops_at_a_window_let_go_since() {
+  use crate::store::{Encoding, Progress, Turn};
+  let encoded = |let_go: bool| {
+    // No pushed entry sent on as it lies: every object read where it lies, the state the red needs.
+    crate::store::encoding::NO_REUSE.with(|off| off.set(true));
+    let (mut repository, mut store, _, pack) = landed_ofs_in(PIECE2_WINDOW);
+    let mut encoding = Encoding::fragments(&repository, &store, 1, 0).unwrap();
+    let mut clock = super::Ticks(0);
+    let mut stopped_at_the_read = None;
+    for _ in 0..100_000 {
+      if let_go && stopped_at_the_read.is_none() && encoding.reading_unread_in_pack() {
+        for window in pack.chunks(PIECE2_WINDOW).map(ContentId::of) {
+          if !store.is_away(&window) {
+            assert!(store.mark_landed(&window));
+            store.let_go(&window).unwrap();
+          }
+        }
+        stopped_at_the_read = Some(false);
+      }
+      let turn = Turn {
+        clock: &mut clock,
+        exchange: super::EXCHANGE,
+        quantum_ns: 1,
+      };
+      let progress = encoding
+        .advance(&mut repository, &mut store, turn)
+        .unwrap_or_else(|refused| panic!("the encoding's read refused: {refused:?}"));
+      if progress == Progress::Done {
+        break;
+      }
+      if let Some(waited) = encoding.waiting() {
+        if stopped_at_the_read == Some(false) {
+          stopped_at_the_read = Some(true);
+        }
+        let (window, start, len) = store
+          .away_window(&waited.pack, waited.len, waited.offset)
+          .expect("the window met is let go");
+        let from = usize::try_from(start).unwrap();
+        let to = from + usize::try_from(len).unwrap();
+        store.bring_back(&window, &pack[from..to]).unwrap();
+      }
+    }
+    for (at, window) in pack.chunks(PIECE2_WINDOW).enumerate() {
+      let id = ContentId::of(window);
+      if store.is_away(&id) {
+        store.bring_back(&id, window).unwrap();
+      }
+      let _ = at;
+    }
+    let clone = super::Answer::objects(&super::reached_now(&repository, &store, 1));
+    let (cloned, _) = super::streamed(&repository, &store, clone, u64::MAX);
+    (stopped_at_the_read, cloned)
+  };
+  let (_, kept) = encoded(false);
+  let (stopped, kept_again) = encoded(true);
+  assert_eq!(
+    stopped,
+    Some(true),
+    "the read's turn stopped at a let-go window"
+  );
+  assert!(kept_again == kept, "the same clone of the same fragments");
+}
+
+/// Lets go every window of `windows` the store holds and `brought` does not name: a let-go since a read last met it.
+fn let_go_since(
+  store: &mut ContentStore,
+  windows: &[ContentId],
+  brought: &std::collections::BTreeSet<ContentId>,
+) {
+  for window in windows {
+    if !brought.contains(window) && store.contains(window) && !store.is_away(window) {
+      assert!(store.mark_landed(window));
+      store.let_go(window).unwrap();
+    }
+  }
+}
+
+/// `answer` streamed from `repository` a unit a turn (a quantum of a nanosecond), every window of `pack` not brought back
+/// yet let go before each turn, each window a turn stopped at brought back (cut from `pack`): the pack streamed, the
+/// stops made, and the counters. A read in any unit meets a window let go since the last.
+fn streamed_letting_go(
+  repository: &Repository,
+  store: &mut ContentStore,
+  answer: super::Answer,
+  pack: &[u8],
+) -> (Vec<u8>, usize, crate::store::UploadCounters) {
+  use crate::store::{Progress, Turn, Upload};
+  let windows: Vec<ContentId> = pack.chunks(PIECE2_WINDOW).map(ContentId::of).collect();
+  let mut brought = std::collections::BTreeSet::new();
+  let mut upload = Upload::new(answer, repository);
+  let mut clock = super::Ticks(0);
+  let mut admission = Admission::new(u64::MAX);
+  let mut out = Vec::new();
+  let mut stops = 0;
+  for _ in 0..100_000 {
+    let_go_since(store, &windows, &brought);
+    let turn = Turn {
+      clock: &mut clock,
+      exchange: super::EXCHANGE,
+      quantum_ns: 1,
+    };
+    let progress = upload
+      .advance(repository, store, turn, &mut admission, &mut out)
+      .unwrap_or_else(|refused| panic!("the stream after {stops} stops: {refused:?}"));
+    if progress == Progress::Done {
+      break;
+    }
+    if let Some(waited) = upload.waiting() {
+      stops += 1;
+      let (window, start, len) = store
+        .away_window(&waited.pack, waited.len, waited.offset)
+        .expect("the window met is let go");
+      let from = usize::try_from(start).unwrap();
+      let to = from + usize::try_from(len).unwrap();
+      store.bring_back(&window, &pack[from..to]).unwrap();
+      brought.insert(window);
+    }
+  }
+  (out, stops, upload.counters())
+}
+
+/// The clone of stock git's offset-delta pack landed in 256-byte windows, streamed with nothing let go and then letting
+/// go before each turn every window not brought back ([`streamed_letting_go`]): the two packs, the stops, and the
+/// resident one's counters.
+fn clone_both_ways() -> (Vec<u8>, Vec<u8>, usize, crate::store::UploadCounters) {
+  let (repository, store, _, _) = landed_ofs_in(PIECE2_WINDOW);
+  let clone = super::Answer::objects(&super::reached_now(&repository, &store, 1));
+  let (whole, counters) = super::streamed(&repository, &store, clone, u64::MAX);
+  let (repository, mut store, _, pack) = landed_ofs_in(PIECE2_WINDOW);
+  let clone = super::Answer::objects(&super::reached_now(&repository, &store, 1));
+  let (out, stops, _) = streamed_letting_go(&repository, &mut store, clone, &pack);
+  (whole, out, stops, counters)
+}
+
+/// Main 01a20182's order of 2026-11-23 (item 2, the stream's delta check, its reds built directly): every pushed entry
+/// rebuilt to be checked (`upload::KEPT_OFF`: its raw entry, its base and its object read), the windows those reads need
+/// let go since the last turn. Do: clone stock git's offset-delta pack resident, then a unit a turn letting go before each
+/// every window not brought back ([`clone_both_ways`]). Expect: the resident clone rebuilt entries and sent deltas on as
+/// they lie; the other stopped at least once and is it byte for byte. Red before: a let-go base sent its delta encoded
+/// afresh, or the check's read refused `Unreadable`.
+#[test]
+fn r165_a_streams_entry_check_reads_stop_at_windows_let_go_since_and_the_clone_is_byte_identical() {
+  crate::store::upload::KEPT_OFF.with(|off| off.set(true));
+  let (whole, out, stops, counters) = clone_both_ways();
+  assert!(
+    counters.reuse_rebuilt >= 1 && counters.reused_deltas >= 1,
+    "entries rebuilt to be checked, deltas sent on: {counters:?}"
+  );
+  assert!(stops > 0, "a let-go window met");
+  assert!(
+    out == whole,
+    "the clone byte for byte, {} against {} bytes",
+    out.len(),
+    whole.len()
+  );
+}
+
+/// Main 01a20182's order of 2026-11-23 (item 2, the stream's encode and search reads, their reds built directly): no
+/// pushed entry sent on as it lies (`upload::REUSE_OFF`: each object read where it lies and encoded, one past a window
+/// searched against those before it), the windows those reads need let go since the last turn. Do: clone stock git's
+/// offset-delta pack resident, then a unit a turn letting go before each every window not brought back
+/// ([`clone_both_ways`]). Expect: the resident clone encoded objects afresh, a delta among them; the other stopped at least
+/// once and is it byte for byte. Red before: a read refused `Unreadable`.
+#[test]
+fn r165_a_streams_encode_and_search_reads_stop_at_windows_let_go_since_and_the_clone_is_byte_identical()
+ {
+  crate::store::upload::REUSE_OFF.with(|off| off.set(true));
+  let (whole, out, stops, counters) = clone_both_ways();
+  eprintln!("W-GIT-PROBE counters {counters:?}");
+  assert!(
+    counters.loose_whole + counters.loose_deltas >= 1,
+    "objects encoded afresh: {counters:?}"
+  );
+  assert!(stops > 0, "a let-go window met");
+  assert!(
+    out == whole,
+    "the clone byte for byte, {} against {} bytes",
+    out.len(),
+    whole.len()
+  );
+}
+
 /// A-864 piece 2's progress (main 01a20182's r29: git/git's clone stalled after 183 KB on 1930df65d, a stop that never
 /// went on). Do: land the `create` push in a store of 256-byte windows, let every window of its pack go, and stream its
 /// clone a turn at a time, never bringing a window back, for at most a turn a window and a few. Expect: the stream stops

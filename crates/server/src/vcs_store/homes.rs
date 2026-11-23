@@ -441,7 +441,7 @@ impl LandedAt {
       return None;
     }
     let (pack, rest) = bytes.split_at_checked(slates_vcs::content::IDENTITY_BYTES)?;
-    let (len, offset) = rest.split_at_checked(8)?;
+    let (len, offset) = rest.split_at_checked(size_of::<u64>())?;
     Some(LandedAt {
       pack: ContentId::from_slice(pack)?,
       len: u64::from_le_bytes(len.try_into().ok()?),
@@ -476,7 +476,11 @@ pub(crate) struct HgLanded {
 
 /// Format: the fixed head of an [`HgLanded`]'s bytes in the shard image: the repository's 16 bytes, the node's 20; the
 /// path follows, to the piece's end.
-const HG_LANDED_HEAD: usize = 16 + 20;
+const HG_LANDED_HEAD: usize = REPOSITORY_ID_BYTES + NODE_BYTES;
+/// Format: a repository id's bytes in an [`HgLanded`]'s head (`slates_db::catalog::RepositoryId`).
+const REPOSITORY_ID_BYTES: usize = 16;
+/// Format: a Mercurial node's bytes in an [`HgLanded`]'s head (SHA-1's twenty).
+const NODE_BYTES: usize = 20;
 
 impl HgLanded {
   /// Its bytes in the shard image.
@@ -490,8 +494,8 @@ impl HgLanded {
 
   /// One read back from the shard image; none for bytes shorter than its head.
   pub(crate) fn from_bytes(bytes: &[u8]) -> Option<HgLanded> {
-    let (repository, rest) = bytes.split_at_checked(16)?;
-    let (node, path) = rest.split_at_checked(20)?;
+    let (repository, rest) = bytes.split_at_checked(REPOSITORY_ID_BYTES)?;
+    let (node, path) = rest.split_at_checked(NODE_BYTES)?;
     Some(HgLanded {
       repository: slates_db::catalog::RepositoryId {
         bytes: repository.try_into().ok()?,

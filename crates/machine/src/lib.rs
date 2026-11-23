@@ -63,6 +63,8 @@ pub mod facts;
 pub mod log;
 pub mod memory_pressure;
 pub mod memory_stall;
+#[cfg(windows)]
+pub mod own_cpu;
 pub mod placement;
 pub mod probes;
 pub mod process_clock;

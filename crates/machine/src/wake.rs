@@ -993,31 +993,32 @@ mod tests {
   /// §4.1, D-10 (the placement production runs under): where the process owns its cores, the waker takes
   /// the fastest class's first core (the control core) and the waiter each other core of that class in
   /// turn (the shard cores), as the runtime places them; a one-core class shares its core; slower classes
-  /// are never used. Where the process shares its cores in time (a quota below its cpuset) production
-  /// fixes nothing, so neither does the probe; no facts, no pairs.
+  /// are never used. Where the process shares its cores in time (a quota below its cpuset), or where a fixed thread
+  /// waits for its CPU (Windows, A-871), production fixes nothing, so neither does the probe; no facts, no pairs.
   #[test]
   fn the_pairs_follow_the_runtimes_shard_placement() {
+    use crate::placement::Fixing;
+    let keeps = |cores: &[CoreFacts], budget| Placement::of_with(cores, budget, Fixing::Keeps);
     let mixed = [core(4, 1), core(2, 0), core(0, 0), core(5, 1), core(1, 0)];
+    assert_eq!(core_pairs(&keeps(&mixed, None)), vec![(0, 1), (0, 2)]);
     assert_eq!(
-      core_pairs(&Placement::of(&mixed, None)),
-      vec![(0, 1), (0, 2)]
+      core_pairs(&keeps(&[core(3, 0), core(1, 1)], None)),
+      vec![(3, 3)]
     );
     assert_eq!(
-      core_pairs(&Placement::of(&[core(3, 0), core(1, 1)], None)),
-      vec![(3, 3)]
+      core_pairs(&Placement::of_with(&mixed, None, Fixing::Waits)),
+      Vec::<(u32, u32)>::new(),
+      "where a fixed thread waits, the probe runs its pair where the OS places it, as production runs its shards"
     );
     let shared = CpuBudget {
       quota_us: 200_000,
       period_us: 100_000,
     };
     assert_eq!(
-      core_pairs(&Placement::of(&mixed, Some(shared))),
+      core_pairs(&keeps(&mixed, Some(shared))),
       Vec::<(u32, u32)>::new()
     );
-    assert_eq!(
-      core_pairs(&Placement::of(&[], None)),
-      Vec::<(u32, u32)>::new()
-    );
+    assert_eq!(core_pairs(&keeps(&[], None)), Vec::<(u32, u32)>::new());
   }
 
   /// The rounds' verdict by use: rounds drawn from one distribution agree; a round stuck in another mode

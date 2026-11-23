@@ -9,7 +9,9 @@
 //! thread-per-core, so what a thread keeps is its shard's), reset when given back and set to the level asked
 //! (`Compress::set_level` on a reset stream, a fresh stream's output byte for byte), or one made when none is kept.
 //! Dropping it gives it back, whether its object ended or its stream was dropped part way, so every path gives back.
-//! A thread keeps at most [`MOST_KEPT`]; states made are O(the deflates under way at once on a shard), never O(objects).
+//! A thread keeps every state given back, so what it keeps is at most the most deflates it had under way at once since
+//! it last let them go: states made are O(the deflates under way at once on a shard), never O(objects), with no count to
+//! tune (R3).
 //! [`let_go`] drops what is kept, for a shard gone idle.
 //!
 //! **Counted.** [`counts`]: states made, states taken again, and those let go, on this thread since its last
@@ -19,10 +21,6 @@ use std::cell::{Cell, RefCell};
 
 use flate2::{Compress, Compression};
 
-/// The most deflate states a shard thread keeps between deflates (the module doc): enough for the deflates under way
-/// at once on a shard (its streams' objects, a level's samples), few enough that what is kept is bounded.
-pub const MOST_KEPT: usize = 8;
-
 /// The deflate states a thread made, took again and let go (the module doc, "Counted").
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DeflaterCounts {
@@ -30,7 +28,7 @@ pub struct DeflaterCounts {
   pub made: u64,
   /// States taken again from those kept.
   pub reused: u64,
-  /// States given back past [`MOST_KEPT`], or let go idle ([`let_go`]), dropped.
+  /// States let go idle ([`let_go`]), or given back after the thread's keeping ended, dropped.
   pub dropped: u64,
 }
 
@@ -94,15 +92,13 @@ impl Drop for Deflater {
       return;
     };
     compress.reset();
+    // Kept whatever how many are: at most the deflates under way at once since the last let-go (the module doc).
     let kept = KEPT
       .try_with(|kept| {
-        let mut kept = kept.borrow_mut();
-        if kept.len() < MOST_KEPT {
-          kept.push(compress);
-          true
-        } else {
-          false
-        }
+        kept
+          .try_borrow_mut()
+          .map(|mut kept| kept.push(compress))
+          .is_ok()
       })
       .unwrap_or(false);
     if !kept {
