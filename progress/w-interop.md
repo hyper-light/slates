@@ -548,3 +548,12 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   Drive::replay, one path, sliced. Reds: deltav_v1_a_labelled_vcc_..., a_replay_report_answers_..., a_replay_report_is_
   refused_... (501 before). svn --lib dav:: 101/101; server vcs_http::svn::tests 8/8. OWED (main, stock svn): svn_interop
   use test http-v1 revprops and http svnsync vs svnserve; an_svnsync_measured DAV leg. w-svn told first (C2 untouched).
+- LANDED 6b1aab5da (2026-11-23, main 0566c9afa), A-874: a landing's presentation outlives its presenting client and
+  goes with its volume (main's ruling (1)); R10's three-step CLI grant flow had met "presentation 1 not found" since
+  076746072's reclaim at hang-up met AUD-29-07. Reds: client --test presentation (replaced the old-rule test), server
+  presentations a_presentation_goes_with_its_volume, cli session-grant; bound/A-779 held. Bug note + design + GAPS.
+- LANDED 0352bbf2a (main 75492a979): xtask Anchor::never_up names the anchor's exit and its whole log (the tracer red's
+  diagnostic, permanent). Red: a_start_that_never_comes_up_names_the_anchors_exit_and_its_whole_log.
+- READY for main (§8): diag-measurer-w-interop-tracer at c676b6e37 (unpushed): the tracer unit test 20x on ubuntu as
+  the lane runs it. Then fix (2) from what the diagnostic names.
+- Seen, not mine: slates-api contract_history test red on main (versions 58/59 written "58 (A-795): ").
