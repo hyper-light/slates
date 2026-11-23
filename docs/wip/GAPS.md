@@ -231,8 +231,14 @@
 >   level (245-492 replies a loaded round taken over 1 ms late; loaded conflict p999 2.8-6.5 ms in every round). A-871:
 >   the OS places every Windows shard, and a client's reply wait stands one level above normal. Every round after it,
 >   quiet and loaded: p99 under 1 ms and p999 135-359 µs, both forms. Measured outside kiln's agent job, which fixes
->   every thread's level (inside it the first round starved past 1,200 s). Open: the runtime's long polls on Windows
->   carry no attribution (`NoClock`).
+>   every thread's level (inside it the first round starved past 1,200 s). The runtime's long polls on Windows carried
+>   no attribution (`NoClock`, 206 a quiet round): ATTRIBUTED (w-perf, 2026-11-23). A Windows thread's account is its
+>   cycle count at a rate measured once a process (`slates_machine::own_cpu`; 3.14 GHz on jupiter), and a wait in a call
+>   is a profiling read whose switches' wait reasons name more than a preemption, a quantum's end or a yield
+>   (`slates_machine::switches::voluntary_waits_now`). Held on jupiter by
+>   `the_platform_reads_a_kernel_sleep_blocked_and_a_spin_long` (`slates-rt`: a 5 ms kernel sleep `Blocked`, a 5 ms
+>   spin `Long`; red `NoClock` with main's account) at 291 ns a read, taken only at a long poll's end and while armed.
+>   Owed: a round on jupiter that names its long polls' holders.
 > - **The client's share:** `edit_merge_bench`'s client spins for its reply at default priority beside the load, so
 >   accept's p99/p999 beyond the daemon's part (macOS 0.8–2.6 / 7–9 ms with the nap fixed) is the harness's own
 >   thread waiting for a CPU.
