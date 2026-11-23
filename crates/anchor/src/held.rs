@@ -43,7 +43,9 @@
 //! The channel is a sequenced-packet socketpair on Linux and a datagram socketpair on macOS, which has no
 //! sequenced-packet Unix sockets (`socketpair(AF_UNIX, SOCK_SEQPACKET)` is `EPROTONOSUPPORT`, checked 2026-10-06): a
 //! connected Unix datagram pair is reliable and ordered, keeps each message whole, and carries `SCM_RIGHTS`, which is
-//! everything the protocol uses. Linux sets close-on-exec at creation and at receipt; macOS sets it with `fcntl`
+//! everything the protocol uses. Where it differs is a full channel: Linux's sequenced packets block the sender, and
+//! macOS's datagrams refuse it `ENOBUFS` with no readiness to wait on, so [`send`] waits that out itself, within a
+//! bound its caller gives (`docs/bugs/2026-11-22-a-full-macos-hold-channel-refused-holds-the-anchor-would-have-taken.md`). Linux sets close-on-exec at creation and at receipt; macOS sets it with `fcntl`
 //! straight after, on the anchor's own thread, before it can spawn.
 
 use std::collections::BTreeMap;
@@ -119,6 +121,11 @@ pub enum HoldRefusal {
     /// Its errno.
     code: i32,
   },
+  /// The channel stayed full for the whole wait the sender allowed ([`send`]): the anchor, alive, drained nothing.
+  Full {
+    /// The nanoseconds the send waited for room.
+    waited_ns: u64,
+  },
 }
 
 impl std::fmt::Display for HoldRefusal {
@@ -127,6 +134,9 @@ impl std::fmt::Display for HoldRefusal {
       HoldRefusal::Malformed { reason } => write!(f, "malformed device message: {reason}"),
       HoldRefusal::Bound { bound } => write!(f, "the anchor already holds its {bound} devices"),
       HoldRefusal::Os { call, code } => write!(f, "{call} refused: errno {code}"),
+      HoldRefusal::Full { waited_ns } => {
+        write!(f, "the hold channel stayed full for {waited_ns} ns")
+      }
     }
   }
 }
@@ -330,33 +340,69 @@ fn encode(message: &Outgoing<'_>) -> Result<[u8; MESSAGE_BYTES], HoldRefusal> {
 }
 
 /// Sends `message` on the daemon's end `socket`. A hold carries its device by `SCM_RIGHTS`.
-pub fn send(socket: BorrowedFd<'_>, message: &Outgoing<'_>) -> Result<(), HoldRefusal> {
+///
+/// The channel blocks a sender while the anchor's end is full, as the daemon's callers rely on (a refusal means the
+/// anchor is gone): Linux's sequenced packets block in the kernel. macOS's Unix datagrams refuse instead, `ENOBUFS`,
+/// once the anchor's receive space (4 KiB by default, about 26 messages with their descriptors) is full, though the
+/// anchor lives and drains it, and give the sender no readiness to wait on. So a full channel is waited out here: the
+/// thread yields and sends again until the message goes, another refusal says the anchor's end is gone, or `wait_ns`
+/// has passed, the caller's own liveness budget, past which its beat has lapsed anyway; then it is refused [`Full`].
+/// Until 2026-11-22 the refusal went back to the caller, so a burst of holds lost every one past the first 13
+/// devices, and a refused release left the anchor holding what the daemon let go
+/// (`a_table_past_the_old_exec_limit_reaches_the_successor_whole`: 13 of 7,792 devices held).
+///
+/// [`Full`]: HoldRefusal::Full
+pub fn send(
+  socket: BorrowedFd<'_>,
+  message: &Outgoing<'_>,
+  wait_ns: u64,
+) -> Result<(), HoldRefusal> {
   let body = encode(message)?;
-  let mut space = [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(HOLD_FDS))];
-  let mut control = SendAncillaryBuffer::new(&mut space);
   let carried = match message {
     Outgoing::Hold { device, .. } => Some([*device]),
     Outgoing::HoldConnection { socket, .. } => Some([*socket]),
     Outgoing::HoldCopy { object, .. } => Some([*object]),
     _ => None,
   };
-  if let Some(carried) = carried.as_ref()
-    && !control.push(SendAncillaryMessage::ScmRights(carried))
-  {
-    return Err(malformed("the descriptor did not fit the control buffer"));
+  let started = std::time::Instant::now();
+  loop {
+    let mut space =
+      [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(HOLD_FDS))];
+    let mut control = SendAncillaryBuffer::new(&mut space);
+    if let Some(carried) = carried.as_ref()
+      && !control.push(SendAncillaryMessage::ScmRights(carried))
+    {
+      return Err(malformed("the descriptor did not fit the control buffer"));
+    }
+    match rustix::net::sendmsg(
+      socket,
+      &[IoSlice::new(&body)],
+      &mut control,
+      SendFlags::empty(),
+    ) {
+      Ok(sent) if sent == MESSAGE_BYTES => return Ok(()),
+      Ok(_) => return Err(malformed("a message was sent short")),
+      Err(rustix::io::Errno::NOBUFS) => {
+        let waited_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if waited_ns >= wait_ns {
+          return Err(HoldRefusal::Full { waited_ns });
+        }
+        FULL_WAITS.with(|waits| waits.set(waits.get().saturating_add(1)));
+        std::thread::yield_now();
+      }
+      Err(errno) => return Err(os("sendmsg")(errno)),
+    }
   }
-  let sent = rustix::net::sendmsg(
-    socket,
-    &[IoSlice::new(&body)],
-    &mut control,
-    SendFlags::empty(),
-  )
-  .map_err(os("sendmsg"))?;
-  if sent == MESSAGE_BYTES {
-    Ok(())
-  } else {
-    Err(malformed("a message was sent short"))
-  }
+}
+
+/// The sends this thread found the channel full and waited out ([`send`]): the wait's non-vacuity count.
+pub fn full_waits_on_this_thread() -> u64 {
+  FULL_WAITS.with(std::cell::Cell::get)
+}
+
+std::thread_local! {
+  /// The sends this thread found the channel full ([`full_waits_on_this_thread`]).
+  static FULL_WAITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Reads the attachment id and the session from a received body.
@@ -1109,6 +1155,78 @@ fn mem_refused(call: &'static str, error: &slates_mem::MemError) -> HoldRefusal 
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// Shape: how long a test's send may wait for room, a minute: far past any drain these tests make.
+  const TEST_WAIT_NS: u64 = 60_000_000_000;
+
+  /// [`super::send`] with the tests' wait.
+  fn send(socket: BorrowedFd<'_>, message: &Outgoing<'_>) -> Result<(), HoldRefusal> {
+    super::send(socket, message, TEST_WAIT_NS)
+  }
+
+  /// Shape: the releases the full-channel tests send, far past what the anchor's end holds on macOS (about 26
+  /// messages in its 4 KiB of receive space) and on Linux's default.
+  const BURST: u64 = 2_000;
+
+  /// 84a's sibling, a full hold channel. Do: send [`BURST`] releases over a fresh channel while another thread drains
+  /// the anchor's end only after a pause. Expect every one to arrive, in order, and on macOS the sender to have waited
+  /// for room (its count, the wait's non-vacuity check): a send into a full channel waits instead of failing `ENOBUFS`.
+  #[test]
+  // The drainer stands for an anchor slow to drain: it pauses before it reads.
+  #[allow(clippy::disallowed_methods)]
+  fn a_burst_into_a_full_channel_waits_for_room_and_arrives_whole() {
+    let (anchor, daemon) = channel().unwrap();
+    let drainer = std::thread::spawn(move || {
+      std::thread::sleep(std::time::Duration::from_millis(100));
+      let mut got = Vec::new();
+      while u64::try_from(got.len()).unwrap() < BURST {
+        match receive(anchor.as_fd()).unwrap() {
+          Some(Incoming::Release { attachment }) => got.push(attachment),
+          Some(_) => panic!("only releases were sent"),
+          None => std::thread::yield_now(),
+        }
+      }
+      got
+    });
+    let waits_before = full_waits_on_this_thread();
+    for attachment in 0..BURST {
+      send(daemon.as_fd(), &Outgoing::Release { attachment }).unwrap();
+    }
+    let waited = full_waits_on_this_thread() - waits_before;
+    let got = drainer.join().unwrap();
+    assert_eq!(
+      got,
+      (0..BURST).collect::<Vec<_>>(),
+      "every release, in order"
+    );
+    if cfg!(target_os = "macos") {
+      assert!(waited > 0, "the burst never found the channel full");
+    }
+  }
+
+  /// 84a's sibling (macOS, where a full channel refuses rather than blocks). Do: fill a fresh channel nobody drains, with
+  /// a wait of a millisecond. Expect the send that finds it full to be refused `Full` once its wait has passed, never
+  /// the `ENOBUFS` it met.
+  #[cfg(target_os = "macos")]
+  #[test]
+  fn a_send_into_a_channel_nobody_drains_is_refused_full_at_its_wait() {
+    /// Shape: the refused send's wait, a millisecond.
+    const SHORT_WAIT_NS: u64 = 1_000_000;
+    let (_anchor, daemon) = channel().unwrap();
+    let refused = (0..BURST)
+      .map(|attachment| {
+        super::send(
+          daemon.as_fd(),
+          &Outgoing::Release { attachment },
+          SHORT_WAIT_NS,
+        )
+      })
+      .find_map(Result::err);
+    assert!(
+      matches!(refused, Some(HoldRefusal::Full { waited_ns }) if waited_ns >= SHORT_WAIT_NS),
+      "{refused:?}"
+    );
+  }
 
   fn pipe_end() -> OwnedFd {
     let (reader, _writer) = rustix::pipe::pipe().unwrap();

@@ -239,6 +239,10 @@
 >   LANDED. Its setup after the catalog's replay ran as one unit, 12 to 21 ms on CI's macOS runner and 59 to 68 ms on
 >   the Studio. Now each piece is its own unit, a segment attach opens its object once, and a whole reusable-mark set is
 >   written a word at a time. The start's heaviest piece is a 100 GB segment's map, named in its report.
+> - **A full macOS hold channel (w-perf, 2026-11-22): FIXED.** `a_table_past_the_old_exec_limit_reaches_the_successor_whole`
+>   failed at main on the MacBook: 13 of 7,792 devices held. The first daemon's 14th hold met `ENOBUFS`: macOS's Unix
+>   datagrams refuse a send into a full receive buffer rather than block. `held::send` now waits a full channel out
+>   within its caller's liveness budget (`docs/bugs/2026-11-22-a-full-macos-hold-channel-refused-holds-the-anchor-would-have-taken.md`).
 >   The refining job's turns paced (A-783's turn, to the ceiling or to its own quantum), measured and rejected (w-perf,
 >   2026-11-22; BENCHMARKS "84a on macOS: the refining job's turns paced"): dead even with main on one runner's
 >   interleaved rounds. Stamped under TB, the loaded tail's deferred replies are submits parked behind their refinement
