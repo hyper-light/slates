@@ -952,6 +952,7 @@ mod imp {
     /// it; let the peer read them all and read it again. Expect 0, then 1,000, then 1,000: the bytes move from the
     /// queue to the acknowledged count, and their sum stays.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri's isolation has no sockets; plain lanes run it")]
     fn an_accepted_connection_counts_every_byte_written_and_no_syn() {
       let (accepted, dialler) = pair();
       let socket = Socket { fd: accepted };

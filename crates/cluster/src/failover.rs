@@ -11,7 +11,11 @@
 //! - **Detection `D`**, from a peer's last answer to this node's detector condemning it ([`detection`]): SWIM's count of
 //!   `2(2m − 1) + 1` periods (round-robin probing, Das, Gupta & Motivala, DSN 2002, §4.3), each at the running tail of
 //!   the detector's own measured period, so a starved or far member's `D` grows with its periods and falls back as they
-//!   recover. Each pair is Chen, Toueg and Aguilera's NFD-E (IEEE Transactions on Computers 51(5), 2002) over the probe
+//!   recover. A period is timed only when its probe was answered (`MemberPlane::period_probed`): one whose probe went
+//!   unanswered ends at the probe's timer, which doubles at each expiry (RFC 6298 §5.5), so it measures the timer, not
+//!   the period (Karn's rule), and a member no peer answers keeps the term it measured while they did. Folded, those
+//!   periods grew a cut-off owner's `D` from 2.4 s to 95.6 s in 19 s (2026-11-23). Each pair is Chen, Toueg and
+//!   Aguilera's NFD-E (IEEE Transactions on Computers 51(5), 2002) over the probe
 //!   stream, with Lifeguard's local health (Dadgar, Phillips & Currey, DSN 2018): a member condemns only once another
 //!   member has answered it since, and its own wake lateness floors every margin, so both stretch the periods `D` counts.
 //!

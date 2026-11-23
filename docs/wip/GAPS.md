@@ -1,5 +1,14 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Closed (w-interop, 2026-11-23): a start's wait gave up on its own running anchor when no process search named
+> it.** The hermeticity tracer's start test (xtask, conformance lane, ubuntu-latest) was refused about 40 ms after its
+> spawn in CI runs 45176536354 and 45235122249: "(None; last exit 3); the anchor is still running". The wait counted the
+> instance's processes by command line alone (`pgrep -f`), found none, and took that for them having left, while its own
+> strace ran. Now the wait counts its anchor while it runs (`InstanceWait::look_owning`), and a refused start names what
+> the search answered and what ran (`process_wait::instance_listing`)
+> (`docs/bugs/2026-11-23-a-starts-wait-gave-up-on-its-own-running-anchor.md`;
+> `a_start_waits_on_its_own_anchor_while_no_process_search_finds_it`). Why `pgrep` missed the strace is not known yet;
+> the next such miss will say. Owed: the conformance lane on CI.
 > **Closed (w-interop, 2026-11-23, A-874): a landing's presentation went with its presenting client, so R10's
 > three-step grant flow could not run.** CI's hermeticity suite (Linux and macOS) and the CLI's session-grant test met
 > "not found: presentation 1 (replaced, landed, or its client went away)": `slates land` presents and exits, and since
@@ -1057,7 +1066,9 @@
 >   131,425,429. Since then the chunk store asks the arena for the caller's own length, not its page-rounded block
 >   (`ChunkArena::alloc_asking`), so a window owner's asked bytes against its held name the page rounding; held by
 >   `a_windows_ask_is_its_own_length_and_its_hold_the_page_it_takes` (red: asked 16,384 of 16,384 held for four windows
->   of 100 bytes; now 400). The rounding's fix is the small-window slab (next piece).
+>   of 100 bytes; now 400). The rounding's fix, A-877, is BUILT: windows shorter than a granule share slabs of one granule,
+>   slots never written twice, a slab freed with its last window through A-64's deferred free (red: 3,276,800 bytes held
+>   for 200 windows of 1,151 bytes at a 16 KiB granule; now at most 245,760). Owed: main's arena-17.
 > - A Mercurial index's tail sealed by every append REVERTED (2026-11-23, w-perf; 0cd8ef36a reverted after main's
 >   arena-14, CI 45208924823: push-all's shard 0 spun past 1 s of CPU in `hg_push::segment` on all three legs and the
 >   watchdog killed the daemon). Each seal writes a run, and a push's fork never merges its runs (only the repository's
@@ -5485,13 +5496,28 @@
 >   restart has had this gap since A-200). And `live_ship::join` (and its destroy half) copies the first waiter at the
 >   key's position, which may be another request's when two wait on one position, so a retry can be answered with that
 >   request's reply; found by reading, not yet by a test.
-> - **Open (w-chaos, 2026-11-23): a write held past the held-write bound, one cut-off run in ten on adacachy2.** In
->   `an_owner_cut_off_while_running_is_superseded_and_serves_nothing_stale` at load 69, a write sent 0.18 ms before the
->   relay isolated its owner was held 20.86 s, until the heal, and refused `StaleEpoch { current: 2 }` (the flow's bound
->   5.71 s), and no give-up was logged in the run: the write never waited where `live_ship::judge_held` judges it, so it
->   was held before its verb ran, or its owner's failover estimate rose past the partition. Every invariant held in that
->   run; the other nine passed, and CI's 19 judgements of the bound held. Owed: what held it, from a run that catches it
->   with the owner's status read throughout.
+> - **FIXED 2026-11-23 (w-fleet; found by w-chaos): a write held past the held-write bound, one cut-off run in ten on
+>   adacachy2.** In `an_owner_cut_off_while_running_is_superseded_and_serves_nothing_stale` at load 69, a write sent
+>   0.18 ms before the relay isolated its owner was held 20.86 s, until the heal, and refused `StaleEpoch { current: 2 }`
+>   (the flow's bound 5.71 s), and no give-up was logged in the run. Reproduced in 4 of 40 runs with the flow confined to
+>   two or four CPUs (`taskset`), the owner's status and its `judge_held` read throughout. The write did wait where
+>   `judge_held` judges it, and no coordinator step stalled. The bound it was judged by, the owner's own failover delay,
+>   grew faster than the hold: 14.2 s at 3 s held, 23.1 s at 5 s, 52.8 s at 10 s, 97.8 s at 20 s. Its detection term
+>   counted each period of the cut-off owner's detector, and with every probe unanswered each period lasted the probe's
+>   retransmission timer, which doubles at each expiry. The term rose from 2.4 s to 95.6 s in 19 s, in steps 1.2, 2.5,
+>   4.5 and 9.5 s apart. Now a period is timed only when its probe was answered, so a cut-off node keeps the term it
+>   measured before the cut (A-363's amendment of 2026-11-23). No invariant was at risk: every invariant held in each
+>   failing run, and the write was refused, never acknowledged. Tests:
+>   `a_member_cut_off_keeps_the_detection_term_it_measured_before_the_cut` (`crates/cluster/tests/member_plane.rs`: on
+>   main 14.7 ms before the cut, 124.2 s after 40 s of it; unchanged with the fix) and the cut-off flow under the same
+>   contention, 40 of 40 with the fix where main failed 4 of 40: the first held write given up at 3.8 to 4.7 s, the
+>   bound its owner judged by never past 5.6 s. Record:
+>   `docs/bugs/2026-11-23-a-cut-off-owners-failover-delay-grew-with-its-detectors-backed-off-probes.md`.
+>   - **Open (a sibling, measured 2026-11-23):** A-351's
+>     `a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again` timed out its wait for the
+>     successor's give-up in 2 of 6 runs on main under four-CPU contention, and once in 10 with this fix, in a loaded
+>     run of eight fleet tests. Its budget reads the largest failover delay across the nodes, and the round it waits on
+>     restarted 4 times in the failed run.
 > - **Owed (the integrator's):** live_chaos and live_fleet flows that keep a writer waiting past the failover SLO (10 s)
 >   now meet `DurabilityPending` where they waited; each flow's stops are a few liveness budgets, under it, but a flow
 >   that stops every candidate longer must treat the refusal as its write's outcome (not acknowledged, so never owed to

@@ -134,3 +134,262 @@ fn a_run_of_an_object_kept_as_chunks_is_lent_in_place_and_its_length_checked() {
   );
   assert!(store.hand_back(&mut chunks));
 }
+
+/// Shape: arena-15's mean window (CI 45224166925: 131,425,429 bytes over 114,200 windows).
+const MEAN_WINDOW: usize = 1_151;
+
+/// The bytes of a window numbered `n` of `len` bytes, distinct for every `n`.
+fn window_bytes(n: u64, len: usize) -> Vec<u8> {
+  let mut bytes: Vec<u8> = (0..len)
+    .map(|at| u8::try_from((at as u64 * 31 + n * 7) % 251).unwrap())
+    .collect();
+  let tag = n.to_le_bytes();
+  let tagged = tag.len().min(len);
+  bytes[..tagged].copy_from_slice(&tag[..tagged]);
+  bytes
+}
+
+/// The arena's row of repository windows: its held and asked bytes.
+fn windows_row(chunks: &ChunkStore) -> (u64, u64) {
+  let owned = chunks.arena().owned(slates_mem::Owner::VcsWindows);
+  (owned.held, owned.asked)
+}
+
+/// Goal 93 (main 01a20182's arena-15: 556,367,872 bytes of the arena held for 114,200 repository windows of 131,425,429
+/// bytes, a page a window). Do: lend a shard chunk store to a content store and put 200 windows of arena-15's mean
+/// length, 1,151 bytes, then read each back. Expect: every window read back lent in place and equal to its bytes; the
+/// arena's repository windows row asked the windows' own bytes and holding at most a granule for each granule's worth of
+/// whole windows (`PAGE / 1,151` a granule), not a granule a window. Failing first: 200 granules held.
+#[test]
+fn small_windows_share_slabs_and_hold_at_most_their_bytes_rounded_a_slab() {
+  let mut chunks = shard_chunks(256);
+  let mut store = content();
+  assert!(store.lend_in(&mut chunks));
+  let count = 200u64;
+  let mut kept = Vec::new();
+  for n in 0..count {
+    let bytes = window_bytes(n, MEAN_WINDOW);
+    kept.push((store.put(&bytes).unwrap(), bytes));
+  }
+  for (identity, bytes) in &kept {
+    let read = store.bytes_of(identity).unwrap();
+    assert!(matches!(read, Cow::Borrowed(_)), "lent in place");
+    assert_eq!(&read[..], &bytes[..]);
+  }
+  assert!(store.hand_back(&mut chunks));
+  let (held, asked) = windows_row(&chunks);
+  let per_slab = u64::try_from(PAGE / MEAN_WINDOW).unwrap();
+  let bound = count.div_ceil(per_slab) * u64::try_from(PAGE).unwrap();
+  assert_eq!(
+    asked,
+    count * u64::try_from(MEAN_WINDOW).unwrap(),
+    "asked the windows' bytes"
+  );
+  assert!(
+    held <= bound,
+    "{count} windows of {MEAN_WINDOW} bytes held {held} bytes, past {bound}"
+  );
+}
+
+/// A seeded step source (xorshift), so a failure names its step.
+struct Steps(u64);
+
+impl Steps {
+  fn next(&mut self) -> u64 {
+    self.0 ^= self.0 << 13;
+    self.0 ^= self.0 >> 7;
+    self.0 ^= self.0 << 17;
+    self.0
+  }
+}
+
+/// Goal 93's slabs (main 01a20182's and w-shared's conditions). Do: on a content store lent a shard chunk store, take
+/// 3,000 seeded steps: put a window of one byte to a whole window (most shorter than a granule), release one, let one
+/// go (landed) and bring one back by its bytes, and every so often hand the chunk store back, release a window outside
+/// the lend, purge the arena's freed bytes (A-105) and lend it again. After each step compare with a model of the
+/// windows kept and let go. Expect: every window kept reads back byte for byte and every window let go reads nothing;
+/// the arena's repository windows row asked exactly the kept windows' bytes and held at least that; slabs shared (fewer
+/// chunks than windows, and windows let go from slabs still held); and, once every window is released, no chunk and
+/// nothing held.
+#[test]
+fn slab_windows_read_back_byte_for_byte_through_let_go_bring_back_and_purge() {
+  let mut chunks = shard_chunks(1024);
+  let mut store = content();
+  assert!(store.lend_in(&mut chunks));
+  let mut steps = Steps(0x9e37_79b9_7f4a_7c15);
+  let mut kept: std::collections::BTreeMap<slates_vcs::ContentId, (Vec<u8>, bool)> =
+    std::collections::BTreeMap::new();
+  let (mut shared_seen, mut freed_kept_seen) = (false, false);
+  for step in 0..3_000u64 {
+    let pick =
+      |steps: &mut Steps, kept: &std::collections::BTreeMap<_, (Vec<u8>, bool)>, away: bool| {
+        let named: Vec<slates_vcs::ContentId> = kept
+          .iter()
+          .filter(|(_, (_, is_away))| *is_away == away)
+          .map(|(identity, _)| *identity)
+          .collect();
+        (!named.is_empty()).then(|| named[usize::try_from(steps.next()).unwrap() % named.len()])
+      };
+    match steps.next() % 16 {
+      0..=7 => {
+        let len = if steps.next() % 8 == 0 {
+          1 + usize::try_from(steps.next()).unwrap() % WINDOW
+        } else {
+          1 + usize::try_from(steps.next()).unwrap() % (2 * MEAN_WINDOW)
+        };
+        let bytes = window_bytes(step, len);
+        let identity = store.put(&bytes).unwrap();
+        kept.insert(identity, (bytes, false));
+      }
+      8..=10 => {
+        if let Some(identity) = pick(&mut steps, &kept, false) {
+          store.release(&identity).unwrap();
+          kept.remove(&identity);
+        }
+      }
+      11 | 12 => {
+        if let Some(identity) = pick(&mut steps, &kept, false) {
+          assert!(store.mark_landed(&identity));
+          store.let_go(&identity).unwrap();
+          kept.get_mut(&identity).unwrap().1 = true;
+        }
+      }
+      13 | 14 => {
+        if let Some(identity) = pick(&mut steps, &kept, true) {
+          let bytes = kept[&identity].0.clone();
+          store.bring_back(&identity, &bytes).unwrap();
+          kept.get_mut(&identity).unwrap().1 = false;
+        }
+      }
+      _ => {
+        assert!(store.hand_back(&mut chunks));
+        if let Some(identity) = pick(&mut steps, &kept, false) {
+          store.release(&identity).unwrap();
+          kept.remove(&identity);
+        }
+        while chunks.arena_mut().purge(usize::MAX).more {}
+        assert!(store.lend_in(&mut chunks));
+      }
+    }
+    let mut asked = 0u64;
+    for (identity, (bytes, away)) in &kept {
+      let read = store.bytes_of(identity);
+      if *away {
+        assert_eq!(read, None, "step {step}: a window let go reads nothing");
+      } else {
+        assert_eq!(
+          read.as_deref(),
+          Some(&bytes[..]),
+          "step {step}: a window kept reads back"
+        );
+        asked += u64::try_from(bytes.len()).unwrap();
+      }
+    }
+    assert!(store.hand_back(&mut chunks));
+    let (held, row_asked) = windows_row(&chunks);
+    let census = super::chunk_windows_census(&store);
+    let windows = kept.values().filter(|(_, away)| !away).count();
+    shared_seen |= census.slabs < u64::try_from(windows).unwrap();
+    freed_kept_seen |= census.freed_kept > 0;
+    assert_eq!(
+      row_asked, asked,
+      "step {step}: asked the kept windows' bytes"
+    );
+    assert!(
+      held >= asked,
+      "step {step}: held {held} under asked {asked}"
+    );
+    assert!(store.lend_in(&mut chunks));
+  }
+  assert!(
+    shared_seen && freed_kept_seen,
+    "slabs shared ({shared_seen}) and kept freed slots ({freed_kept_seen})"
+  );
+  for (identity, (_, away)) in std::mem::take(&mut kept) {
+    if !away {
+      store.release(&identity).unwrap();
+    }
+  }
+  assert!(store.hand_back(&mut chunks));
+  assert_eq!(chunks.chunks(), 0, "every slab freed with its last window");
+  assert_eq!(windows_row(&chunks), (0, 0), "nothing held");
+}
+
+/// Goal 93's slabs across a restart (w-shared's condition (c)). Do: lend a shard chunk store, put 40 windows of
+/// arena-15's mean length and one of a whole window, take the shard image's window pieces, then restore them into a
+/// fresh arena over a region of the same layout, copy the arena's bytes across as the anchor's content object carries
+/// them, and read every window back; restore also a piece of the version before the slabs. Expect: each slab's block
+/// claimed once (as many chunks as the first store held, fewer than the windows), every window read back byte for byte
+/// in its slot, the restored row asking the windows' bytes, and the old piece refused typed (`OldVersion(1)`), counted.
+#[test]
+fn a_restart_claims_each_slab_once_and_reads_its_windows_in_their_slots() {
+  use slates_vcs::WindowStorage;
+  let mut chunks = shard_chunks(64);
+  let mut windows = ChunkWindows::new(PAGE);
+  assert!(windows.lend_in(&mut chunks));
+  let mut put = Vec::new();
+  for n in 0..41u64 {
+    let len = if n == 40 { WINDOW } else { MEAN_WINDOW };
+    let bytes = window_bytes(n, len);
+    let window = windows.put(&bytes).unwrap();
+    let identity = slates_vcs::ContentId([u8::try_from(n).unwrap(); 32]);
+    windows.named(window, &identity);
+    put.push((window, bytes));
+  }
+  assert!(windows.hand_back(&mut chunks));
+  let held_chunks = chunks.chunks();
+  assert!(
+    held_chunks < put.len(),
+    "{held_chunks} chunks for {} windows",
+    put.len()
+  );
+  let mut pieces = windows.pieces_in(0, u64::MAX);
+  let mut old = pieces[0].1.clone();
+  old[0] = 1;
+  pieces.push((u64::MAX - 1, old.clone()));
+  let mut successor = shard_chunks(64);
+  let (mut restored, refused) = ChunkWindows::restore(PAGE, &pieces, &mut successor);
+  assert_eq!(refused, 1, "the old piece alone refused");
+  assert_eq!(
+    super::read_piece(&old),
+    Err(super::PieceRefused::OldVersion(1))
+  );
+  assert_eq!(
+    successor.chunks(),
+    held_chunks,
+    "each slab's block claimed once"
+  );
+  for (window, _) in &put {
+    let block_of = |held: &ChunkWindows, store: &ChunkStore| {
+      let (chunk, _) = held.held[window].placed.unwrap().slot().unwrap();
+      store.chunk(chunk).unwrap().block
+    };
+    let from = chunks
+      .arena()
+      .bytes(block_of(&windows, &chunks))
+      .unwrap()
+      .to_vec();
+    let into = block_of(&restored, &successor);
+    successor
+      .arena_mut()
+      .bytes_mut(into)
+      .unwrap()
+      .copy_from_slice(&from);
+  }
+  assert!(restored.lend_in(&mut successor));
+  for (window, bytes) in &put {
+    let read = restored.read(*window).unwrap();
+    assert_eq!(
+      &read[..],
+      &bytes[..],
+      "window {window:?} read back in its slot"
+    );
+  }
+  assert!(restored.hand_back(&mut successor));
+  let asked: usize = put.iter().map(|(_, bytes)| bytes.len()).sum();
+  assert_eq!(
+    windows_row(&successor).1,
+    u64::try_from(asked).unwrap(),
+    "the restored row asks the windows' bytes"
+  );
+}
