@@ -36,7 +36,7 @@ jobs:
         run: |
           cargo build -p slates-cli
           cargo test -p xtask --bin xtask --no-run
-      - name: The tracer test, 20 runs
+      - name: xtask's conformance:: module, 20 runs, in the lane's order
         run: |
           set +e
           export SLATES_TEST_BINARY="$GITHUB_WORKSPACE/target/debug/slates"
@@ -44,14 +44,14 @@ jobs:
           fails=0
           for run in $(seq 1 20); do
             out="$RUNNER_TEMP/tracer-$run.log"
-            cargo test -q -p xtask --bin xtask conformance::slates::tests::the_hermeticity_tracer_allows_startup_and_observes_writes -- --test-threads=1 --nocapture > "$out" 2>&1
+            cargo test -p xtask conformance:: -- --test-threads=1 --nocapture > "$out" 2>&1
             code=$?
             if [ $code -ne 0 ]; then
               fails=$((fails + 1))
               echo "RUN $run FAIL (exit $code):"
               grep -A12 "panicked at" "$out" | cut -c1-2000
             else
-              echo "RUN $run PASS $(grep -c 'test result: ok. 1 passed' "$out")"
+              echo "RUN $run PASS $(grep -E '^test result' "$out" | tail -1 | cut -c1-80)"
             fi
           done
           echo "TRACER TEST: $fails of 20 failed"
