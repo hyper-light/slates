@@ -235,6 +235,20 @@ pub fn branch_head_revs(
   repo: &impl Repository,
   admission: &mut Admission,
 ) -> Result<Vec<Rev>, Refusal> {
+  // Kept as its changesets landed, where the view keeps them (goal 93): O(branches), never the walk below.
+  if let Some(heads) = repo.maintained_branch_heads() {
+    admission.charge_items::<Rev>(heads.len())?;
+    return Ok(heads);
+  }
+  walked_branch_head_revs(repo, admission)
+}
+
+/// [`branch_head_revs`] by its walk of the whole served view: the rule's own reading, which a view that keeps no heads
+/// takes, and the oracle the kept heads are held to.
+pub(crate) fn walked_branch_head_revs(
+  repo: &impl Repository,
+  admission: &mut Admission,
+) -> Result<Vec<Rev>, Refusal> {
   let count = repo.count();
   let edges = Edges::of(repo, admission)?;
   let suspected = (0..count).filter(|rev| edges.suspect(*rev));

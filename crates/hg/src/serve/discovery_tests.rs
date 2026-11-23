@@ -9,6 +9,7 @@ use proptest::prelude::*;
 use super::super::tests::{Changeset, History, ancestors, joined, node_for, room};
 use super::super::{Repository, Rev};
 use super::{branch_head_revs, branchmap};
+use crate::index::{HgIndex, NewChangeset};
 use crate::phases::Phase;
 use crate::quote::{self, PATH_SAFE};
 
@@ -233,4 +234,69 @@ proptest! {
   ) {
     prop_assert_eq!(heads(&history), naive(&history));
   }
+
+  /// Goal 93 (main's ruling of 2026-11-23: branch heads kept as changesets land). Do: append each generated history's
+  /// changesets to an index (`HgIndex::append_changesets`) in groups of one to five, as segments land, a merge, a close
+  /// or a branch left and taken again among them. Expect the index's kept heads (`HgIndex::branch_heads`) the walk's
+  /// over the same history (`branch_head_revs`) and the rule's, oldest first, after every group.
+  #[test]
+  fn kept_branch_heads_are_the_walks_after_every_group(
+    history in interleaved_history(),
+    sizes in proptest::collection::vec(1usize..=5, 0..REVISIONS),
+  ) {
+    let (index, after_each) = indexed_in_groups(&history, &sizes);
+    for (count, kept) in after_each {
+      let prefix = History {
+        revs: history.revs[..count].to_vec(),
+        ..History::default()
+      };
+      prop_assert_eq!(&kept, &heads(&prefix));
+      prop_assert_eq!(&kept, &naive(&prefix));
+    }
+    prop_assert!(index.branch_heads().answered() > 0 || history.revs.is_empty());
+  }
+}
+
+/// `history`'s changesets appended to a new index in groups of `sizes` (the last taking what is left): the index, and
+/// after each group the changesets it holds and its kept heads.
+fn indexed_in_groups(history: &History, sizes: &[usize]) -> (HgIndex, Vec<(usize, Vec<Rev>)>) {
+  let mut store = slates_vcs::ContentStore::new(u64::MAX, 1 << 12).unwrap();
+  let mut index = HgIndex::new();
+  let texts: Vec<slates_vcs::ContentId> = (0..history.revs.len())
+    .map(|rev| {
+      store
+        .put_object(format!("changeset {rev}").as_bytes())
+        .unwrap()
+    })
+    .collect();
+  let node =
+    |parent: Option<Rev>| parent.map_or(crate::NULL_NODE, |rev| history.revs[rev as usize].node);
+  let mut after_each = Vec::new();
+  let mut at = 0;
+  let mut sizes = sizes.iter().copied().chain(core::iter::repeat(usize::MAX));
+  while at < history.revs.len() {
+    let end = history
+      .revs
+      .len()
+      .min(at.saturating_add(sizes.next().unwrap_or(usize::MAX)));
+    let group: Vec<NewChangeset<'_>> = history.revs[at..end]
+      .iter()
+      .zip(&texts[at..end])
+      .map(|(changeset, text)| NewChangeset {
+        node: changeset.node,
+        p1: node(changeset.parents[0]),
+        p2: node(changeset.parents[1]),
+        flags: 0,
+        len: 1,
+        text: *text,
+        manifest: crate::NULL_NODE,
+        closed: changeset.closes,
+        branch: &changeset.branch,
+      })
+      .collect();
+    index.append_changesets(&mut store, &group).unwrap();
+    at = end;
+    after_each.push((end, index.branch_heads().answer()));
+  }
+  (index, after_each)
 }
