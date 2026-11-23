@@ -8,6 +8,7 @@
 //! journal record. A refusal leaves nothing changed (T-1.1, T-1.9). The executable model in the
 //! tests is the specification this file must equal on every generated history.
 
+use slates_mem::Owner;
 use std::collections::{BTreeMap, BTreeSet};
 use std::task::Waker;
 
@@ -6942,7 +6943,7 @@ impl Volume {
           0,
           usize::try_from(window_zero).unwrap_or(0),
           epoch,
-          self.locked,
+          (self.locked, Owner::Volume),
         ) {
           Ok(open) => open,
           Err(refusal) => return refused(Body::Inline(v), refusal),
@@ -7051,16 +7052,22 @@ impl Volume {
     let window_start = window_start_of(cursor, chunk);
     // The sealed extents are ascending by offset: the window's is found by binary search, not a walk of the file.
     let Some(pos) = sealed.binary_search_by_key(&window_start, |e| e.off).ok() else {
-      return store.content.open(window_start, want, epoch, self.locked);
+      return store
+        .content
+        .open(window_start, want, epoch, (self.locked, Owner::Volume));
     };
     let e = sealed.remove(pos);
     // A write from the window's start at least as long as the sealed extent overwrites every byte of it: the
     // window opens fresh, and the old bytes are never read (`ChunkStore::replace`).
     let covers = cursor == window_start && u64::try_from(want).is_ok_and(|want| want >= e.len);
     let opened = if covers {
-      store.content.replace(&e, want, epoch, self.locked)
+      store
+        .content
+        .replace(&e, want, epoch, (self.locked, Owner::Volume))
     } else {
-      store.content.reopen(&e, epoch, self.locked)
+      store
+        .content
+        .reopen(&e, epoch, (self.locked, Owner::Volume))
     };
     let open = match opened {
       Ok(open) => open,
@@ -7984,7 +7991,10 @@ fn rebuilt_if_smaller(
   }
   // The smaller block is an economy, never a requirement: when the arena or the chunk slab cannot give it now, the
   // clipped extent keeps its block, and its charge follows that block (`content_by_epoch`).
-  let Ok(open) = store.content.reopen(&clipped, epoch, locked) else {
+  let Ok(open) = store
+    .content
+    .reopen(&clipped, epoch, (locked, Owner::Volume))
+  else {
     return Ok(clipped);
   };
   let rebuilt = match store.content.seal(open, key) {

@@ -107,6 +107,18 @@ fn run(
       return;
     }
   };
+  // A ring that landed before that read (a claim made between the daemon's publishing its rendezvous and this thread's
+  // start, or into an anchor's object while no daemon ran) moved the word already, so no wait shows it: its marks are
+  // taken now, once. A ring sets its mark before it moves the word, so a later one shows in the first wait.
+  match waiter.take_pending() {
+    Ok(pending) => kick_pending(&pending, kicks, rang_flag),
+    Err(error) => {
+      slates_machine::log_line!(
+        "slates-server: the doorbell thread stopped: its rings' marks could not be read: {error}"
+      );
+      return;
+    }
+  }
   while !stopped(stop) {
     // A refused wait ends the thread by name rather than retrying it in a loop that would spin:
     // the refusals left are the OS's own (a bad address), never a timeout or an interruption.
@@ -160,4 +172,42 @@ fn kick_pending(pending: &Pending, kicks: &[(u16, Kick)], rang_flag: &'static At
 mod platform {
   /// Shape: the doorbell wait's upper bound, so a stop is seen even if the stop's own ring fails.
   pub(super) const POLL_NS: u64 = 1_000_000_000;
+}
+
+#[cfg(all(test, any(target_os = "macos", windows)))]
+mod tests {
+  #![allow(clippy::unwrap_used)]
+
+  use super::*;
+
+  /// §4.7 (A-381's claim mark). Do: open a daemon's rendezvous, make a client's claim (which marks the control shard
+  /// and rings the doorbell), and only then start the doorbell thread. Expect: the thread takes the claim's mark within
+  /// its wait's bound, setting the claim poller's flag, so the claim is answered.
+  #[test]
+  #[cfg_attr(miri, ignore)] // Miri models no shared memory object or OS wake
+  fn a_claim_rung_before_the_doorbell_thread_starts_is_taken() {
+    let instance = format!("doorbell-early-{}", std::process::id());
+    let listener = slates_ipc::rendezvous::Listener::open(&instance, None).unwrap();
+    let claim = slates_ipc::begin_connect_as(&instance, 0).unwrap();
+    let rang: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+    let mut thread = DoorbellThread::start(
+      listener.doorbell_waiter().unwrap().unwrap(),
+      listener.doorbell_waiter().unwrap().unwrap(),
+      Vec::new(),
+      rang,
+    )
+    .unwrap();
+    let began = std::time::Instant::now();
+    while !rang.load(Ordering::Acquire)
+      && began.elapsed() < std::time::Duration::from_nanos(2 * platform::POLL_NS)
+    {
+      std::thread::yield_now();
+    }
+    thread.stop();
+    drop(claim);
+    assert!(
+      rang.load(Ordering::Acquire),
+      "the claim rung before the doorbell thread started was taken"
+    );
+  }
 }

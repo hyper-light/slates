@@ -66,10 +66,10 @@ fn a_purged_arena_leaves_the_working_set_and_reads_zeros_on_reuse(what: &str, re
   let page = page();
   let mut arena = ChunkArena::new(page).discarding_from(page);
   arena.add_region(region).unwrap();
-  let live = arena.alloc(CHUNK).unwrap();
+  let live = arena.alloc(CHUNK, slates_mem::Owner::Volume).unwrap();
   arena.bytes_mut(live).unwrap().fill(0x5A);
   let chunks: Vec<Extent> = (0..FREED / CHUNK)
-    .map(|_| arena.alloc(CHUNK).unwrap())
+    .map(|_| arena.alloc(CHUNK, slates_mem::Owner::Volume).unwrap())
     .collect();
   for chunk in &chunks {
     arena.bytes_mut(*chunk).unwrap().fill(0xAB);
@@ -97,7 +97,7 @@ fn a_purged_arena_leaves_the_working_set_and_reads_zeros_on_reuse(what: &str, re
 fn reuse_reads_zeros_and_keeps_what_is_written(what: &str, arena: &mut ChunkArena, purged: u64) {
   let reused_before = arena.reused_bytes();
   let again: Vec<Extent> = (0..FREED / CHUNK)
-    .map(|_| arena.alloc(CHUNK).unwrap())
+    .map(|_| arena.alloc(CHUNK, slates_mem::Owner::Volume).unwrap())
     .collect();
   assert!(
     arena.reused_bytes() - reused_before >= u64::try_from(FREED).unwrap(),

@@ -986,13 +986,23 @@
 >   laid again in the newest. Held by `the_store_holds_the_walks_in_flight_not_the_reads_that_could_be_waiting` (red
 >   7,340,032 bytes reserved with room for 1,000 reads and no walk in flight; now 1,048,576) and
 >   `a_walk_in_flight_keeps_its_text_through_other_reads`. Owed: main's arena-14 on CI's runner.
-> - A Mercurial index's tail sealed by every append BUILT (2026-11-23, w-perf; w-hg's three conditions). Only an import
->   sealed (`import::settle`), so a push's, a replay's and a made changeset's tail grew for the whole push: 56 MB of tail
->   rows, two buffers each, still held at the end of Mercurial's push (`Index::admit` 34 MB, `table::encode_body` 22 MB).
->   Every append's rows now go in through `HgIndex::insert`, which seals when due; import's own seal is gone. A seal the
->   store refuses leaves the append standing and is counted (`HgIndex::seals_refused`). Held by
->   `every_append_seals_the_tail_when_due_and_a_released_fork_gives_its_seals_back` (`crates/hg/src/tests/index.rs`: red
->   due after group 26 of 200; now never due, the fork sealed, and its release gives its seals back).
+> - The content arena's allocations by owner BUILT (2026-11-23, w-perf; main 01a20182's order on arena-13, CI
+>   45193998198: 634 MB allocated, 373 MB of it named by no gauge). Every `ChunkArena` allocation and claim names its
+>   owner (`slates_mem::Owner`: a volume's file content, a repository's windows, the content hold), recorded at the
+>   block's head in a table each region makes when it is added, so the arena's hot path still allocates nothing.
+>   `mem.gauge.content.arena_<owner>_bytes` and `..._asked_bytes` (the asked bytes short of the held being the buddy's
+>   rounding) sum, with the deferred bytes, to mapped less free. Held by
+>   `every_block_has_an_owner_and_the_owners_sum_to_what_is_allocated` (`slates-mem`: 2,000 seeded steps of
+>   allocations, frees, trims and deferred frees against a model) and the memory status's test (the sum after a green's
+>   file is accepted). The greens' content is not in the arena (the merge engine's own heap), so arena-13's named part
+>   was 184 MB, not 260. Owed: main's arena-15 to name the rest.
+> - A Mercurial index's tail sealed by every append REVERTED (2026-11-23, w-perf; 0cd8ef36a reverted after main's
+>   arena-14, CI 45208924823: push-all's shard 0 spun past 1 s of CPU in `hg_push::segment` on all three legs and the
+>   watchdog killed the daemon). Each seal writes a run, and a push's fork never merges its runs (only the repository's
+>   own index is merged, `vcs_store::index_upkeep`), so a push sealing at every append piled up runs, and every new row's
+>   plan looks its key up through all of them, a table opened a run. The 56 MB of tail rows a push of Mercurial's history
+>   held at its end stay owed: reland the seal with the push's runs merged a step at a time (or the tail kept in an arena
+>   of its own), red first that a segment step over a long history stays within the step quantum.
 > - The watchdog's beat allocates nothing BUILT (2026-11-23, w-perf; main's order). A beat made 4 allocations, about
 >   1 KB by their types (estimated, not measured). `hg_push_heap`'s first read had charged the watchdog 24% of a push's
 >   sampled bytes, about 10-15 MB a second; that was its sampler's artifact (a thread's first symbol load charged to its
@@ -4374,7 +4384,17 @@
 > (`docs/bugs/2026-11-23-the-svnsync-use-row-compared-two-random-mirror-uuids.md`). The rerun (r12, 112e694e7) left
 > one more of the harness's: revision 0's lengths still counted the `svn:sync-*` lines the comparison dropped, and the
 > source URL differs by leg. The mirror's sync properties are now deleted before the dump, which is compared whole
-> (`a_mirrors_dump_is_the_same_whatever_url_it_was_synced_from`). Owed: main's red and green of that test, and (B).
+> (`a_mirrors_dump_is_the_same_whatever_url_it_was_synced_from`).
+> **Done, proven by use (main 01a20182's rounds on the big Studio, stock Subversion 1.15, 2026-11-23):**
+> - (A), DeltaV v1's revision properties over the HTTP edge: `SLATES_SVN_USE_ROUTE=http-v1`,
+>   `SLATES_SVN_USE_VERBS=revprops`, 0 differences from svnserve at 17 revisions (kiln run r254, after 414925522).
+> - (B), `svnsync` over HTTPv2: git-2000's 2,000 revisions mirrored from slates with 0 differences from stock
+>   svnserve's mirror (`SLATES_SVN_USE_VERBS=svnsync` over `http`, 1 passed; kiln run r21 at main 71c2f07a7).
+> - The harness's rule: `a_mirrors_dump_is_the_same_whatever_url_it_was_synced_from` red at 3bb5e53b1
+>   (`svn_interop.rs:3329`, the mirror over stock svnserve against the one over `file://`) and green at 71c2f07a7
+>   (r21).
+> - `an_svnsync_measured` over HTTP (r254): 2,000 revisions in 301.8 s (150.9 ms a revision), mirror at r2000, daemon
+>   RSS 724 MB before and 994 MB at peak. The same round over svn:// took 510.4 s against P7's 270.7 s, sent to w-svn.
 > **R4, recovery replays a revision record a turn at a time (2026-11-20, w-svn; Ada's close list; found by w-git's sweep):**
 > a Subversion revision's record was replayed whole in one recovery or rebuild turn (`replay_svn` -> `commit_record`),
 > every text it brought deltified in one step, so one large revision held its shard. Now `RevisionReplay`
@@ -8811,7 +8831,10 @@
 >     - **Closed: the doorbell's herd (A-381, 2026-11-18).** On macOS and Windows each client's ring kicked every shard;
 >       now it marks the shard its region names and the doorbell thread kicks only the shards marked. Each shard's
 >       parks fell 59% and the shards' CPU 20 to 34% at 1,000 clients; the latencies moved with the box's load (14 to 52)
->       more than with the change, so no latency is claimed for it (BENCHMARKS, 2026-11-18).
+>       more than with the change, so no latency is claimed for it (BENCHMARKS, 2026-11-18). Since 2026-11-23 (w-win) the
+>       thread also takes the marks rung before its first look, which it had left for good: a claim made as a daemon
+>       started, or while an anchor restarted one, waited with no bound (the Windows Shards CLI step's 20-minute hang,
+>       `docs/bugs/2026-11-23-a-claim-rung-before-the-doorbell-thread-looked-was-never-answered.md`).
 >     - **Closed: an ask waiting out the batch before it (A-388, 2026-11-18).** One batch of asks was out to an owner at
 >       a time, and the wait for it was about half of an ask's way to the owner (p99 1.6 to 2.1 ms for submits and
 >       rebases at 50 ms); a shard now keeps two out.

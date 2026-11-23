@@ -70,6 +70,11 @@ struct Slot {
   /// purge drains the set. So it holds only free bytes, the purge touches only what was freed, and a block given back
   /// unscrubbed (a recovery's, whose bytes may be claimed again) is never in it.
   dirty: crate::ranges::UnitSet,
+  /// Each block's owner by its head's granule ([`Owner::code`], zero where no block begins), made with the region so a
+  /// block's allocation and free make no system allocation (the arena's hot path makes none).
+  heads: Vec<u8>,
+  /// The bytes each block's owner asked for, by its head's granule.
+  asked: Vec<u32>,
 }
 
 /// Zeroes the `len` bytes at `offset` of a block just returned to the free lists (A-99: zero on free, as Linux's
@@ -121,6 +126,64 @@ pub trait ExtentSource: Send {
   fn want(&mut self, _bytes: usize) {}
 }
 
+/// Who holds an arena's block (goal 93; main 01a20182's order of 2026-11-23 on arena-13: 373 MB of the content arena
+/// allocated with no gauge naming its owner). Every allocation names one, so the owners' held bytes and the deferred
+/// bytes sum to the arena's allocated bytes by construction ([`ChunkArena::owned`]): an owner missing from the gauges
+/// shows as a gap, never as a wrong figure. The arena's callers, all of them: a volume's file content and a
+/// repository's windows through `slates_vfs`'s chunk store, and the content hold's bytes (`slates_cluster`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Owner {
+  /// A volume's file content (`slates_vfs::content::ChunkStore`, a volume's extents).
+  Volume,
+  /// A repository's windows (the server's `vcs_store::arena_windows`, through the same chunk store).
+  VcsWindows,
+  /// The content hold's bytes: inputs, replica checkpoints and manifests (`slates_cluster::content`).
+  ContentHold,
+}
+
+impl Owner {
+  /// Every owner, in the order [`ChunkArena::owned`] reports them.
+  pub const ALL: [Owner; 3] = [Owner::Volume, Owner::VcsWindows, Owner::ContentHold];
+
+  /// The owner's name in a gauge.
+  pub fn name(self) -> &'static str {
+    match self {
+      Owner::Volume => "volume",
+      Owner::VcsWindows => "vcs_windows",
+      Owner::ContentHold => "content_hold",
+    }
+  }
+
+  /// Its place in [`Owner::ALL`].
+  fn index(self) -> usize {
+    match self {
+      Owner::Volume => 0,
+      Owner::VcsWindows => 1,
+      Owner::ContentHold => 2,
+    }
+  }
+
+  /// Its code in a region's table of heads: its place plus one, zero meaning no block begins there.
+  fn code(self) -> u8 {
+    u8::try_from(self.index().saturating_add(1)).unwrap_or(u8::MAX)
+  }
+
+  /// The owner a code names.
+  fn of_code(code: u8) -> Option<Owner> {
+    Owner::ALL.get(usize::from(code).checked_sub(1)?).copied()
+  }
+}
+
+/// What an owner holds in the arena: the bytes of its blocks, and the bytes it asked for, whose difference is what the
+/// buddy's rounding to a power of two (and a trim's to a granule) costs it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Owned {
+  /// The bytes of the blocks it holds.
+  pub held: u64,
+  /// The bytes it asked for.
+  pub asked: u64,
+}
+
 /// The arena.
 pub struct ChunkArena {
   /// This arena's identity, or `None` when the process has spent them (it then refuses every allocation).
@@ -153,6 +216,8 @@ pub struct ChunkArena {
   /// Whether recovery publications name this arena's blocks ([`ChunkArena::published`]): each region it adds then keeps
   /// its live heads from the start ([`Buddy::new_imaged`]), so no publication scans a region's state.
   published: bool,
+  /// What each owner holds, in [`Owner::ALL`]'s order; each block's owner is in its region's table of heads.
+  owned: [Owned; 3],
 }
 
 /// What one [`ChunkArena::purge`] call did.
@@ -225,6 +290,57 @@ impl ChunkArena {
       allocations: 0,
       reused: 0,
       published: false,
+      owned: [Owned::default(); 3],
+    }
+  }
+
+  /// What `owner` holds now ([`Owner`]): its blocks' bytes and the bytes it asked for. The owners' held bytes and
+  /// [`ChunkArena::deferred_bytes`] sum to [`ChunkArena::allocated_bytes`].
+  pub fn owned(&self, owner: Owner) -> Owned {
+    self.owned.get(owner.index()).copied().unwrap_or_default()
+  }
+
+  /// Records the block at `extent`'s head as `owner`'s, holding `held` bytes, asked for `asked`.
+  fn record(&mut self, extent: Extent, owner: Owner, held: usize, asked: usize) {
+    let granule = self.granule.max(1);
+    if let Some(slot) = self.slot_mut(extent.region) {
+      let at = extent.offset() / granule;
+      if let Some(code) = slot.heads.get_mut(at) {
+        *code = owner.code();
+      }
+      if let Some(kept) = slot.asked.get_mut(at) {
+        *kept = u32::try_from(asked).unwrap_or(u32::MAX);
+      }
+    }
+    if let Some(total) = self.owned.get_mut(owner.index()) {
+      total.held = total
+        .held
+        .saturating_add(u64::try_from(held).unwrap_or(u64::MAX));
+      total.asked = total
+        .asked
+        .saturating_add(u64::try_from(asked).unwrap_or(u64::MAX));
+    }
+  }
+
+  /// Takes the block whose head is at `offset` in `region`, `held` bytes, off its owner: freed or given back.
+  fn forget(&mut self, region: u16, offset: usize, held: usize) {
+    let granule = self.granule.max(1);
+    let Some(slot) = self.slot_mut(region) else {
+      return;
+    };
+    let at = offset / granule;
+    let owner = slot
+      .heads
+      .get_mut(at)
+      .and_then(|code| Owner::of_code(core::mem::take(code)));
+    let asked = slot.asked.get_mut(at).map_or(0, core::mem::take);
+    if let Some(owner) = owner
+      && let Some(total) = self.owned.get_mut(owner.index())
+    {
+      total.held = total
+        .held
+        .saturating_sub(u64::try_from(held).unwrap_or(u64::MAX));
+      total.asked = total.asked.saturating_sub(u64::from(asked));
     }
   }
 
@@ -605,6 +721,8 @@ impl ChunkArena {
     let slot = Slot {
       id,
       dirty: crate::ranges::UnitSet::new(region.len(), self.granule),
+      heads: vec![0; granules],
+      asked: vec![0; granules],
       region,
       buddy: if self.published {
         Buddy::new_imaged(self.granule, max_order)?
@@ -749,7 +867,14 @@ impl ChunkArena {
   }
 
   /// Allocates at least `len` bytes from the first region that can serve it.
-  pub fn alloc(&mut self, len: usize) -> Result<Extent, MemError> {
+  pub fn alloc(&mut self, len: usize, owner: Owner) -> Result<Extent, MemError> {
+    let extent = self.alloc_block(len)?;
+    self.record(extent, owner, extent.len(), len);
+    Ok(extent)
+  }
+
+  /// [`ChunkArena::alloc`] before the block is recorded as its owner's.
+  fn alloc_block(&mut self, len: usize) -> Result<Extent, MemError> {
     self.allocations = self.allocations.saturating_add(1);
     let arena = self
       .identity
@@ -803,8 +928,8 @@ impl ChunkArena {
 
   /// [`ChunkArena::alloc`], locked in RAM before it is handed out (a strict volume's new content). One the OS will not
   /// lock goes back, and the refusal is the lock's.
-  pub fn alloc_locked(&mut self, len: usize) -> Result<Extent, MemError> {
-    let extent = self.alloc(len)?;
+  pub fn alloc_locked(&mut self, len: usize, owner: Owner) -> Result<Extent, MemError> {
+    let extent = self.alloc(len, owner)?;
     if let Err(e) = self.lock_extent(extent) {
       self.free(extent)?;
       return Err(e);
@@ -874,6 +999,7 @@ impl ChunkArena {
     let released = slot.buddy.free_bytes().saturating_sub(before);
     self.allocated_bytes = self.allocated_bytes.saturating_sub(released);
     self.resident_free = self.resident_free.saturating_add(self_resident);
+    self.forget(extent.region, extent.offset(), extent.len());
     Ok(())
   }
 
@@ -896,6 +1022,7 @@ impl ChunkArena {
         reason: ExtentRefusal::OtherArena,
       });
     }
+    let granule = self.granule.max(1);
     let Some(slot) = self.slot_mut(extent.region) else {
       return Err(MemError::ForeignExtent {
         offset: extent.offset(),
@@ -919,9 +1046,25 @@ impl ChunkArena {
       );
     }
     slot.dirty.mark(tail_from, end);
+    // The head's owner, and what of its ask the trim cut: the kept prefix is all it holds now.
+    let at = extent.offset() / granule;
+    let owner = slot.heads.get(at).copied().and_then(Owner::of_code);
+    let trimmed_asked = slot.asked.get_mut(at).map_or(0, |asked| {
+      let before = *asked;
+      *asked = before.min(u32::try_from(kept).unwrap_or(u32::MAX));
+      before.saturating_sub(*asked)
+    });
     let released = slot.buddy.free_bytes().saturating_sub(before);
     self.allocated_bytes = self.allocated_bytes.saturating_sub(released);
     self.resident_free = self.resident_free.saturating_add(released);
+    if let Some(owner) = owner
+      && let Some(total) = self.owned.get_mut(owner.index())
+    {
+      total.held = total
+        .held
+        .saturating_sub(u64::try_from(released).unwrap_or(u64::MAX));
+      total.asked = total.asked.saturating_sub(u64::from(trimmed_asked));
+    }
     Ok(pieces.first().map(|head| Extent {
       arena: extent.arena,
       region: extent.region,
@@ -968,6 +1111,7 @@ impl ChunkArena {
     let released = slot.buddy.free_bytes().saturating_sub(before);
     self.allocated_bytes = self.allocated_bytes.saturating_sub(released);
     self.resident_free = self.resident_free.saturating_add(self_resident);
+    self.forget(head.region, head.offset(), span);
     Ok(())
   }
 
@@ -997,6 +1141,7 @@ impl ChunkArena {
     region: u16,
     offset: usize,
     keep: usize,
+    owner: Owner,
   ) -> Result<Extent, MemError> {
     let granule = self.granule;
     let granules = keep.max(1).div_ceil(granule);
@@ -1008,7 +1153,7 @@ impl ChunkArena {
         continue;
       }
       let len = piece.saturating_mul(granule);
-      match self.claim(region, at, len) {
+      match self.claim_block(region, at, len) {
         Ok(extent) => claimed.push(extent),
         Err(refusal) => {
           // A piece just claimed always goes back; should one not, that refusal is the one reported.
@@ -1020,16 +1165,32 @@ impl ChunkArena {
       }
       at = at.saturating_add(len);
     }
-    claimed.first().copied().ok_or(MemError::ForeignExtent {
+    let head = claimed.first().copied().ok_or(MemError::ForeignExtent {
       offset,
       len: keep,
       reason: ExtentRefusal::WrongLength,
-    })
+    })?;
+    let held = claimed.iter().map(Extent::len).sum();
+    self.record(head, owner, held, keep);
+    Ok(head)
   }
 
   /// Allocates exactly the block of `len` bytes at `offset` in region `region` (A-64: a recovery rebuilding  /// Allocates exactly the block of `len` bytes at `offset` in region `region` (A-64: a recovery rebuilding
   /// the blocks its image names). Refused as [`crate::buddy::Buddy::claim`] refuses, or `NoSuchRegion`.
-  pub fn claim(&mut self, region: u16, offset: usize, len: usize) -> Result<Extent, MemError> {
+  pub fn claim(
+    &mut self,
+    region: u16,
+    offset: usize,
+    len: usize,
+    owner: Owner,
+  ) -> Result<Extent, MemError> {
+    let extent = self.claim_block(region, offset, len)?;
+    self.record(extent, owner, extent.len(), len);
+    Ok(extent)
+  }
+
+  /// [`ChunkArena::claim`] before the block is recorded as its owner's.
+  fn claim_block(&mut self, region: u16, offset: usize, len: usize) -> Result<Extent, MemError> {
     let arena = self
       .identity
       .ok_or(MemError::GenerationExhausted { index: u32::MAX })?;
@@ -1246,6 +1407,130 @@ mod tests {
     usize::try_from(slates_machine::facts::Facts::query().page.base).unwrap()
   }
 
+  /// The owners' sum the model keeps: each owner's live blocks' bytes, and whether a capture defers frees.
+  fn owners_balance(arena: &ChunkArena) -> u64 {
+    Owner::ALL
+      .iter()
+      .map(|owner| arena.owned(*owner).held)
+      .sum::<u64>()
+      .saturating_add(u64::try_from(arena.deferred_bytes()).unwrap())
+  }
+
+  /// Goal 93 (main 01a20182's order of 2026-11-23 on arena-13's unnamed 373 MB): every block has an owner by
+  /// construction. Do: on an arena of two regions, take a seeded mix of steps: allocate a block for one of the three
+  /// owners at one to five pages, free one, trim one to its first page, and, every so often, free under a capture (so
+  /// the free is deferred) and commit it. After each step, compare with a model: each owner's live blocks and their
+  /// lengths. Expect: each owner's held bytes equal to the model's; the owners' held bytes and the deferred bytes equal
+  /// to the arena's allocated bytes; the asked bytes never past the held; and, at the end, every block freed, every owner
+  /// at zero.
+  #[test]
+  fn every_block_has_an_owner_and_the_owners_sum_to_what_is_allocated() {
+    let p = page();
+    let mut arena = ChunkArena::new(p);
+    for _ in 0..2 {
+      arena
+        .add_region(Region::map(p * 64, p, false).unwrap())
+        .unwrap();
+    }
+    arena.published = true;
+    let mut live: Vec<(Extent, Owner, usize)> = Vec::new();
+    let (mut deferred_seen, mut trimmed) = (0u32, 0u32);
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut next = || {
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      state
+    };
+    for step in 0..2_000u32 {
+      let pick = next();
+      match pick % 5 {
+        0 | 1 => {
+          let owner = Owner::ALL[usize::try_from(pick / 5 % 3).unwrap()];
+          let len = p * usize::try_from(1 + pick / 15 % 5).unwrap();
+          if let Ok(extent) = arena.alloc(len, owner) {
+            live.push((extent, owner, extent.len()));
+          }
+        }
+        2 if !live.is_empty() => {
+          let (extent, _, _) = live.swap_remove(usize::try_from(pick / 5).unwrap() % live.len());
+          arena.free(extent).unwrap();
+        }
+        3 if !live.is_empty() => {
+          let at = usize::try_from(pick / 5).unwrap() % live.len();
+          let (extent, owner, held) = live[at];
+          if held > p
+            && extent.len() == held
+            && let Some(head) = arena.trim(extent, p, extent.len()).unwrap()
+          {
+            // A trimmed block is named by its head and freed whole by `free_trimmed`; the model keeps its prefix.
+            let others: usize = live
+              .iter()
+              .enumerate()
+              .filter(|(i, (_, o, _))| *i != at && *o == owner)
+              .map(|(_, (_, _, held))| held)
+              .sum();
+            assert_eq!(
+              arena.owned(owner).held,
+              u64::try_from(others + p).unwrap(),
+              "step {step}: {owner:?}'s held after a trim to a page"
+            );
+            arena.free_trimmed(head, p).unwrap();
+            live.swap_remove(at);
+            trimmed += 1;
+          }
+        }
+        4 if !live.is_empty() => {
+          arena.capture();
+          let (extent, _, _) = live.swap_remove(usize::try_from(pick / 5).unwrap() % live.len());
+          arena.free(extent).unwrap();
+          if arena.deferred_bytes() > 0 {
+            deferred_seen += 1;
+          }
+          assert_eq!(
+            owners_balance(&arena),
+            u64::try_from(arena.allocated_bytes()).unwrap(),
+            "step {step}: deferred"
+          );
+          arena.commit_capture();
+        }
+        _ => {}
+      }
+      for owner in Owner::ALL {
+        let model: usize = live
+          .iter()
+          .filter(|(_, o, _)| *o == owner)
+          .map(|(_, _, held)| held)
+          .sum();
+        let owned = arena.owned(owner);
+        assert_eq!(
+          owned.held,
+          u64::try_from(model).unwrap(),
+          "step {step}: {owner:?}'s held"
+        );
+        assert!(
+          owned.asked <= owned.held,
+          "step {step}: {owner:?} asked past its held"
+        );
+      }
+      assert_eq!(
+        owners_balance(&arena),
+        u64::try_from(arena.allocated_bytes()).unwrap(),
+        "step {step}: the owners and the deferred against the allocated"
+      );
+    }
+    assert!(
+      deferred_seen > 0 && trimmed > 0,
+      "the mix deferred frees ({deferred_seen}) and trimmed ({trimmed})"
+    );
+    for (extent, _, _) in live.drain(..) {
+      arena.free(extent).unwrap();
+    }
+    for owner in Owner::ALL {
+      assert_eq!(arena.owned(owner), Owned::default(), "{owner:?} at zero");
+    }
+  }
+
   fn two_regions(p: usize) -> ChunkArena {
     let mut arena = ChunkArena::new(p);
     arena
@@ -1292,10 +1577,10 @@ mod tests {
   fn the_held_runs_are_the_allocated_blocks_by_region_joined_where_adjacent() {
     let p = page();
     let mut arena = two_regions(p);
-    let first = arena.alloc(p).unwrap();
-    let middle = arena.alloc(p).unwrap();
-    let third = arena.alloc(p).unwrap();
-    let fourth = arena.alloc(p).unwrap();
+    let first = arena.alloc(p, Owner::Volume).unwrap();
+    let middle = arena.alloc(p, Owner::Volume).unwrap();
+    let third = arena.alloc(p, Owner::Volume).unwrap();
+    let fourth = arena.alloc(p, Owner::Volume).unwrap();
     let held = |extent: Extent| (extent.region, extent.offset(), extent.len());
     let mut before = vec![held(first), held(middle), held(third), held(fourth)];
     before.sort_unstable();
@@ -1355,7 +1640,7 @@ mod tests {
     arena
       .add_region(Region::map(BLOCK, p, false).unwrap())
       .unwrap();
-    let block = arena.alloc(BLOCK).unwrap();
+    let block = arena.alloc(BLOCK, Owner::Volume).unwrap();
     arena.bytes_mut(block).unwrap().fill(0xAB);
     arena.free(block).unwrap();
     let footprint = crate::test_serial::footprint;
@@ -1367,7 +1652,7 @@ mod tests {
       "the purge gave the block back: {before} -> {purged}"
     );
     let reused_before = arena.reused_bytes();
-    let again = arena.alloc(BLOCK).unwrap();
+    let again = arena.alloc(BLOCK, Owner::Volume).unwrap();
     assert!(
       arena.reused_bytes() - reused_before >= BLOCK as u64,
       "the allocation cleared the block's mark"
@@ -1394,7 +1679,9 @@ mod tests {
     arena
       .add_region(Region::map(p * 4, p, false).unwrap())
       .unwrap();
-    let blocks: Vec<Extent> = (0..3).map(|_| arena.alloc(p).unwrap()).collect();
+    let blocks: Vec<Extent> = (0..3)
+      .map(|_| arena.alloc(p, Owner::Volume).unwrap())
+      .collect();
     for block in &blocks {
       arena.bytes_mut(*block).unwrap().fill(0xAB);
     }
@@ -1426,7 +1713,9 @@ mod tests {
     arena
       .add_region(Region::map(p * 4, p, false).unwrap())
       .unwrap();
-    let blocks: Vec<Extent> = (0..4).map(|_| arena.alloc(p).unwrap()).collect();
+    let blocks: Vec<Extent> = (0..4)
+      .map(|_| arena.alloc(p, Owner::Volume).unwrap())
+      .collect();
     for (index, block) in blocks.iter().enumerate() {
       let value = u8::try_from(index + 1).unwrap();
       arena.bytes_mut(*block).unwrap().fill(value);
@@ -1464,7 +1753,9 @@ mod tests {
     arena
       .add_region(Region::map(p * 8, p, false).unwrap())
       .unwrap();
-    let blocks: Vec<Extent> = (0..4).map(|_| arena.alloc(p).unwrap()).collect();
+    let blocks: Vec<Extent> = (0..4)
+      .map(|_| arena.alloc(p, Owner::Volume).unwrap())
+      .collect();
     for block in &blocks {
       arena.bytes_mut(*block).unwrap().fill(7);
     }
@@ -1499,7 +1790,7 @@ mod tests {
   /// extent back; then allocate the same size again. Expect: every byte reads zero after the free, and the pages
   /// handed to the next tenant are zero too.
   ///
-  /// Both existing scrub assertions allocate exactly one page (`arena.alloc(p)`), so a scrub that covered only the
+  /// Both existing scrub assertions allocate exactly one page (`arena.alloc(p, Owner::Volume)`), so a scrub that covered only the
   /// first page of a multi-page extent passed the whole suite. A content chunk is sixteen pages, and a freed chunk
   /// reallocated to another volume is precisely the path this zeroing exists to close, so one page of coverage was
   /// the wrong page count to stop at. Red-checked by capping the scrub at one page: this fails from two pages up.
@@ -1512,7 +1803,7 @@ mod tests {
       arena
         .add_region(Region::map(p * 16, p, false).unwrap())
         .unwrap();
-      let a = arena.alloc(p * pages).unwrap();
+      let a = arena.alloc(p * pages, Owner::Volume).unwrap();
       arena.bytes_mut(a).unwrap().fill(SECRET);
       arena.free(a).unwrap();
 
@@ -1528,7 +1819,7 @@ mod tests {
         after.and_then(|b| b.iter().position(|&x| x != 0))
       );
 
-      let again = arena.alloc(p * pages).unwrap();
+      let again = arena.alloc(p * pages, Owner::Volume).unwrap();
       assert!(
         arena
           .bytes(again)
@@ -1549,7 +1840,7 @@ mod tests {
     arena
       .add_region(Region::map(p * 16, p, false).unwrap())
       .unwrap();
-    let block = arena.alloc(p * 16).unwrap();
+    let block = arena.alloc(p * 16, Owner::Volume).unwrap();
     let used = p * 5 + 1;
     arena.bytes_mut(block).unwrap()[..used].fill(7);
     // Two bytes past the kept prefix were written too: the trim must scrub them out of the freed tail.
@@ -1566,7 +1857,7 @@ mod tests {
     );
     assert_eq!(arena.allocated_bytes(), p * 6);
     assert_eq!(arena.free_bytes(), p * 10);
-    let tail = arena.alloc(p * 8).unwrap();
+    let tail = arena.alloc(p * 8, Owner::Volume).unwrap();
     assert_eq!(tail.offset(), p * 8, "the freed tail is allocatable");
     let bytes = arena.slot(head.region).unwrap().region.bytes();
     assert!(
@@ -1578,7 +1869,10 @@ mod tests {
     assert_eq!(arena.allocated_bytes(), 0);
     let bytes = arena.slot(head.region).unwrap().region.bytes();
     assert!(all_are(bytes, 0, p * 16, 0), "the kept bytes were scrubbed");
-    assert!(arena.alloc(p * 16).is_ok(), "the region is one block again");
+    assert!(
+      arena.alloc(p * 16, Owner::Volume).is_ok(),
+      "the region is one block again"
+    );
   }
 
   /// §4.2 allocator rounding: do: allocate every length from one byte to four granules; expect each block to
@@ -1593,7 +1887,7 @@ mod tests {
     // every residue class the rounding can distinguish.
     let step = if cfg!(miri) { 61 } else { 1 };
     for len in (1..=p * 4).step_by(step) {
-      let extent = arena.alloc(len).unwrap();
+      let extent = arena.alloc(len, Owner::Volume).unwrap();
       assert_eq!(Some(extent.len()), arena.block_len(len), "len {len}");
       arena.free(extent).unwrap();
     }
@@ -1604,9 +1898,9 @@ mod tests {
     let p = page();
     let mut arena = two_regions(p);
     assert_eq!(arena.regions(), 2);
-    let a = arena.alloc(p * 3).unwrap();
+    let a = arena.alloc(p * 3, Owner::Volume).unwrap();
     assert_eq!((a.region(), a.offset(), a.len()), (0, 0, p * 4));
-    let b = arena.alloc(p).unwrap();
+    let b = arena.alloc(p, Owner::Volume).unwrap();
     assert_eq!(b.region(), 1);
     assert_eq!(arena.allocated_bytes(), p * 5);
     arena.bytes_mut(b).unwrap()[0] = 9;
@@ -1622,14 +1916,17 @@ mod tests {
   fn exhaustion_names_the_largest_free_extent_and_oversize_is_too_large() {
     let p = page();
     let mut arena = two_regions(p);
-    let _a = arena.alloc(p * 4).unwrap();
-    let _b = arena.alloc(p).unwrap();
-    let refused = arena.alloc(p * 4);
+    let _a = arena.alloc(p * 4, Owner::Volume).unwrap();
+    let _b = arena.alloc(p, Owner::Volume).unwrap();
+    let refused = arena.alloc(p * 4, Owner::Volume);
     assert!(
       matches!(refused, Err(MemError::ArenaExhausted { largest_free, .. }) if largest_free == p * 2),
       "{refused:?}"
     );
-    assert!(matches!(arena.alloc(p * 8), Err(MemError::TooLarge { .. })));
+    assert!(matches!(
+      arena.alloc(p * 8, Owner::Volume),
+      Err(MemError::TooLarge { .. })
+    ));
   }
 
   #[test]
@@ -1641,7 +1938,7 @@ mod tests {
       Err(MemError::TooLarge { .. })
     ));
     assert!(matches!(
-      arena.alloc(1),
+      arena.alloc(1, Owner::Volume),
       Err(MemError::ArenaExhausted {
         largest_free: 0,
         ..
@@ -1657,8 +1954,8 @@ mod tests {
   fn a_deferred_free_stays_allocated_until_the_commit_and_a_claim_lands_where_named() {
     let p = page();
     let mut arena = two_regions(p);
-    let _fill = arena.alloc(p * 4).unwrap();
-    let block = arena.alloc(p).unwrap();
+    let _fill = arena.alloc(p * 4, Owner::Volume).unwrap();
+    let block = arena.alloc(p, Owner::Volume).unwrap();
     assert_eq!(block.region(), 1);
     arena.capture();
     arena.commit_capture();
@@ -1675,14 +1972,14 @@ mod tests {
     assert_eq!(arena.allocated_bytes(), p * 4);
 
     let mut rebuilt = two_regions(p);
-    let claimed = rebuilt.claim(1, p * 2, p * 2).unwrap();
+    let claimed = rebuilt.claim(1, p * 2, p * 2, Owner::Volume).unwrap();
     assert_eq!(
       (claimed.region(), claimed.offset(), claimed.len()),
       (1, p * 2, p * 2)
     );
     assert_eq!(rebuilt.allocated_bytes(), p * 2);
     assert!(matches!(
-      rebuilt.claim(2, 0, p),
+      rebuilt.claim(2, 0, p, Owner::Volume),
       Err(MemError::ForeignExtent {
         reason: ExtentRefusal::NoSuchRegion,
         ..
@@ -1733,8 +2030,8 @@ mod tests {
     assert_eq!(arena.grow(p * 5), p * 8, "two whole regions");
     assert_eq!(arena.region_ids(), [7, 40]);
     assert_eq!(arena.grow(p), 0, "the pool is empty");
-    let first = arena.alloc(p * 4).unwrap();
-    let second = arena.alloc(p).unwrap();
+    let first = arena.alloc(p * 4, Owner::Volume).unwrap();
+    let second = arena.alloc(p, Owner::Volume).unwrap();
     assert_eq!((first.region(), second.region()), (7, 40));
     assert!(matches!(
       arena.remove_region(40),
@@ -1833,7 +2130,7 @@ mod tests {
     let mut arena = arena_over_mapped_pages(page, 1, &[3, 4, 16]);
     assert_eq!(arena.grow(page * 16), page * 16);
     let returned = arena.shrink_trading(page * 3);
-    let headroom = arena.alloc(page * 3).unwrap();
+    let headroom = arena.alloc(page * 3, Owner::Volume).unwrap();
     arena.free(headroom).unwrap();
     assert_eq!(
       (returned, arena.capacity()),
@@ -1855,7 +2152,7 @@ mod tests {
       (page * 2, 0, page),
       "the first claim supplies one granule and the smaller mapping returns to the pool"
     );
-    let block = arena.alloc(1).unwrap();
+    let block = arena.alloc(1, Owner::Volume).unwrap();
     arena.free(block).unwrap();
   }
 
@@ -1866,7 +2163,7 @@ mod tests {
     let page = page();
     let mut arena = arena_over_mapped_pages(page, 1, &[3, 4]);
     let added = arena.grow(page * 3);
-    let block = arena.alloc(page * 3).unwrap();
+    let block = arena.alloc(page * 3, Owner::Volume).unwrap();
     arena.free(block).unwrap();
     assert_eq!((added, arena.claimable()), (page * 4, page * 3));
   }
@@ -1903,7 +2200,7 @@ mod tests {
       "the burst's need takes the large region"
     );
     assert_eq!(arena.region_ids(), [9]);
-    let block = arena.alloc(p).unwrap();
+    let block = arena.alloc(p, Owner::Volume).unwrap();
     arena.free(block).unwrap();
     assert_eq!(
       arena.shrink(p),
@@ -2016,7 +2313,7 @@ mod tests {
     arena
       .add_region_at(300, Region::map(p * 4, p, false).unwrap())
       .unwrap();
-    let claimed = arena.claim(300, p * 2, p).unwrap();
+    let claimed = arena.claim(300, p * 2, p, Owner::Volume).unwrap();
     assert_eq!((claimed.region(), claimed.offset()), (300, p * 2));
     assert!(arena.holds(claimed));
     arena.free(claimed).unwrap();
@@ -2069,7 +2366,12 @@ mod tests {
   fn compare_captures(scanning: &mut ChunkArena, published: &mut ChunkArena, p: usize) {
     let mut held: Vec<(Extent, Extent)> = [p, 2 * p, p, 4 * p]
       .into_iter()
-      .map(|len| (scanning.alloc(len).unwrap(), published.alloc(len).unwrap()))
+      .map(|len| {
+        (
+          scanning.alloc(len, Owner::Volume).unwrap(),
+          published.alloc(len, Owner::Volume).unwrap(),
+        )
+      })
       .collect();
     let (gone_a, gone_b) = held.remove(1);
     scanning.free(gone_a).unwrap();
@@ -2078,7 +2380,10 @@ mod tests {
       arena.capture();
       arena.commit_capture();
     }
-    held.push((scanning.alloc(p).unwrap(), published.alloc(p).unwrap()));
+    held.push((
+      scanning.alloc(p, Owner::Volume).unwrap(),
+      published.alloc(p, Owner::Volume).unwrap(),
+    ));
     scanning.capture();
     published.capture();
     for (a, b) in &held {
@@ -2098,7 +2403,7 @@ mod tests {
     let id = arena
       .add_region(Region::map(p * PAGES, p, false).unwrap())
       .unwrap();
-    let claimed = arena.claim(id, 2 * p, 2 * p).unwrap();
+    let claimed = arena.claim(id, 2 * p, 2 * p, Owner::Volume).unwrap();
     arena.capture();
     claimed
   }

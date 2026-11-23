@@ -11,7 +11,7 @@
 //! chunks (`volume::release_dead`); a destroy or a recovery rebuild lists them itself.
 
 use slates_machine::{Derived, derived};
-use slates_mem::arena::{ChunkArena, Extent as Block};
+use slates_mem::arena::{ChunkArena, Extent as Block, Owner};
 use slates_mem::{Handle, Slab};
 
 use crate::error::VfsError;
@@ -210,6 +210,9 @@ pub struct OpenExtent {
   /// after a truncate kept the block or after a restart (writes made after the image). Every byte past it is zero, so
   /// a seal that trims the block scrubs only up to it and never touches a tail page nothing wrote.
   pub dirty_to: u64,
+  /// Who holds the block in the arena (`slates_mem::Owner`): a volume's, or a repository's windows. Every block the
+  /// extent takes (grown, shrunk, sealed, copied) is the same owner's.
+  pub owner: Owner,
 }
 
 /// Copies the overlap of `bytes`, which sit at file offset `base`, with a buffer `out` for file offset `off`, into
@@ -465,11 +468,16 @@ impl ChunkStore {
   /// extent still reads as plaintext after a crash before the next publication (A-64 shadow paging, as ZFS and WAFL
   /// never overwrite a block a committed tree names). The block the chunk now lives in, and its seal; with no room
   /// for the copy, the bytes stay in the clear where they are, counted as a refused seal.
-  fn seal_where_safe(&mut self, block: Block, len: usize, key: u32) -> (Block, Option<ChunkSeal>) {
+  fn seal_where_safe(
+    &mut self,
+    (block, owner): (Block, Owner),
+    len: usize,
+    key: u32,
+  ) -> (Block, Option<ChunkSeal>) {
     if !self.arena.imaged(block) {
       return (block, self.seal_block(block, len, key));
     }
-    let Some(copy) = self.copied_out_of_image(block, len) else {
+    let Some(copy) = self.copied_out_of_image(block, len, owner) else {
       self.seal_refusals = self.seal_refusals.saturating_add(1);
       return (block, None);
     };
@@ -479,15 +487,15 @@ impl ChunkStore {
   }
 
   /// A new block holding the first `len` bytes of `block`, or `None` when the arena or the allocator has no room.
-  fn copied_out_of_image(&mut self, block: Block, len: usize) -> Option<Block> {
+  fn copied_out_of_image(&mut self, block: Block, len: usize, owner: Owner) -> Option<Block> {
     let mut plain = Vec::new();
     plain.try_reserve_exact(len).ok()?;
     plain.extend_from_slice(self.arena.bytes(block)?.get(..len)?);
     // The copy replaces the block in its volume: locked if the block was.
     let copy = if self.arena.is_locked(block) {
-      self.arena.alloc_locked(block.len()).ok()?
+      self.arena.alloc_locked(block.len(), owner).ok()?
     } else {
-      self.arena.alloc(block.len()).ok()?
+      self.arena.alloc(block.len(), owner).ok()?
     };
     match self
       .arena
@@ -726,11 +734,11 @@ impl ChunkStore {
   /// Allocates a block of at least `len` bytes. An arena that is out of room while freed blocks wait for a
   /// publication (A-64: the committed recovery image may name them) refuses [`VfsError::PublishNeeded`], not a
   /// memory refusal: the room exists, and the shard's next publication releases it.
-  fn alloc(&mut self, len: usize, locked: bool) -> Result<Block, VfsError> {
+  fn alloc(&mut self, len: usize, locked: bool, owner: Owner) -> Result<Block, VfsError> {
     let taken = if locked {
-      self.arena.alloc_locked(len)
+      self.arena.alloc_locked(len, owner)
     } else {
-      self.arena.alloc(len)
+      self.arena.alloc(len, owner)
     };
     match taken {
       Ok(block) => Ok(block),
@@ -742,22 +750,24 @@ impl ChunkStore {
   }
 
   /// Opens a new extent at `off` with room for at least `want` bytes (page-multiple, at most a
-  /// chunk), its block locked in RAM when `locked` (a strict volume's content, §4.2 D-12).
+  /// chunk), its block locked in RAM when `locked` (a strict volume's content, §4.2 D-12), held in the arena as
+  /// `owner`'s.
   pub fn open(
     &mut self,
     off: u64,
     want: usize,
     born: Epoch,
-    locked: bool,
+    (locked, owner): (bool, Owner),
   ) -> Result<OpenExtent, VfsError> {
     let want = want.clamp(1, self.chunk_bytes);
-    let block = self.alloc(want.next_multiple_of(self.granule), locked)?;
+    let block = self.alloc(want.next_multiple_of(self.granule), locked, owner)?;
     Ok(OpenExtent {
       off,
       len: 0,
       block,
       born,
       dirty_to: 0,
+      owner,
     })
   }
 
@@ -772,7 +782,7 @@ impl ChunkStore {
     locked: bool,
   ) -> Result<OpenExtent, VfsError> {
     let len = usize::try_from(open.len).map_err(|_| VfsError::Invalid)?;
-    let block = self.alloc(self.block_bytes(len), locked)?;
+    let block = self.alloc(self.block_bytes(len), locked, open.owner)?;
     let carried = self
       .arena
       .bytes(open.block)
@@ -802,6 +812,7 @@ impl ChunkStore {
       // Only the copied bytes were written: the rest of the block reads zero, as the arena zeroes every block it frees
       // (A-99).
       dirty_to: open.len,
+      owner: open.owner,
     })
   }
 
@@ -816,7 +827,7 @@ impl ChunkStore {
     }
     // The grown block holds the same extent: locked if the block it replaces was.
     let locked = self.arena.is_locked(open.block);
-    let block = self.alloc(need.next_multiple_of(self.granule), locked)?;
+    let block = self.alloc(need.next_multiple_of(self.granule), locked, open.owner)?;
     let used = usize::try_from(open.len).unwrap_or(0);
     self.move_into(open, block, used)
   }
@@ -923,7 +934,7 @@ impl ChunkStore {
     // A smaller block is an economy, never a requirement: when the arena cannot give it now, the extent keeps its
     // block, whose length its charge follows (`volume::content_by_epoch`).
     let locked = self.arena.is_locked(open.block);
-    let Ok(block) = self.alloc(want, locked) else {
+    let Ok(block) = self.alloc(want, locked, open.owner) else {
       return Ok(());
     };
     self.move_into(open, block, keep)
@@ -938,7 +949,7 @@ impl ChunkStore {
     }
     let len = usize::try_from(open.len).map_err(|_| VfsError::Invalid)?;
     let (block, seal) = match (key, self.cipher.is_some()) {
-      (Some(key), true) => self.seal_where_safe(open.block, len, key),
+      (Some(key), true) => self.seal_where_safe((open.block, open.owner), len, key),
       _ => (open.block, None),
     };
     // A block the seal copied into holds the ciphertext alone; one sealed in place keeps whatever was written there.
@@ -1087,9 +1098,9 @@ impl ChunkStore {
     extent: &Extent,
     want: usize,
     born: Epoch,
-    locked: bool,
+    held: (bool, Owner),
   ) -> Result<OpenExtent, VfsError> {
-    let open = self.open(extent.off, want, born, locked)?;
+    let open = self.open(extent.off, want, born, held)?;
     self.replaced_unread = self.replaced_unread.saturating_add(1);
     Ok(open)
   }
@@ -1101,12 +1112,12 @@ impl ChunkStore {
     &mut self,
     extent: &Extent,
     born: Epoch,
-    locked: bool,
+    held: (bool, Owner),
   ) -> Result<OpenExtent, VfsError> {
     let len = usize::try_from(extent.len).unwrap_or(usize::MAX);
     let mut bytes = vec![0u8; len];
     self.read_extent_into(extent, extent.off, &mut bytes)?;
-    let mut open = self.open(extent.off, len, born, locked)?;
+    let mut open = self.open(extent.off, len, born, held)?;
     if let Err(refusal) = self.write_open(&mut open, 0, &bytes) {
       // Refused whole: the block taken for the copy goes back.
       self.arena.free(open.block)?;
@@ -1259,12 +1270,17 @@ impl ChunkStore {
 
   /// Claims exactly the arena block a recovered image names (A-64); refused `RecoveryIncomplete` when no
   /// allocation could have made it or another claim already holds any of it.
-  pub fn claim_block(&mut self, region: u16, offset: u64, len: u64) -> Result<Block, VfsError> {
+  pub fn claim_block(
+    &mut self,
+    region: u16,
+    (offset, len): (u64, u64),
+    owner: Owner,
+  ) -> Result<Block, VfsError> {
     let offset = usize::try_from(offset).map_err(|_| VfsError::RecoveryIncomplete)?;
     let len = usize::try_from(len).map_err(|_| VfsError::RecoveryIncomplete)?;
     self
       .arena
-      .claim(region, offset, len)
+      .claim(region, offset, len, owner)
       .map_err(|_| VfsError::RecoveryIncomplete)
   }
 
@@ -1275,16 +1291,21 @@ impl ChunkStore {
     &mut self,
     region: u16,
     (offset, len): (u64, u64),
-    used: u32,
+    (used, owner): (u32, Owner),
   ) -> Result<Block, VfsError> {
     let len_bytes = usize::try_from(len).map_err(|_| VfsError::RecoveryIncomplete)?;
     if self.granule_round(used) <= len_bytes {
-      return self.claim_block(region, offset, len);
+      return self.claim_block(region, (offset, len), owner);
     }
     let offset = usize::try_from(offset).map_err(|_| VfsError::RecoveryIncomplete)?;
     let head = self
       .arena
-      .claim_trimmed(region, offset, usize::try_from(used).unwrap_or(usize::MAX))
+      .claim_trimmed(
+        region,
+        offset,
+        usize::try_from(used).unwrap_or(usize::MAX),
+        owner,
+      )
       .map_err(|_| VfsError::RecoveryIncomplete)?;
     if head.len() != len_bytes {
       // The image's head is not the head the length decomposes into: give the pieces back, refuse.
@@ -1429,7 +1450,7 @@ mod tests {
   #[test]
   fn an_open_extent_grows_by_pages_and_zero_fills_gaps() {
     let mut s = store();
-    let mut open = s.open(0, 10, Epoch(0), false).unwrap();
+    let mut open = s.open(0, 10, Epoch(0), (false, Owner::Volume)).unwrap();
     assert_eq!(open.block.len(), 4096);
     s.write_open(&mut open, 0, b"hello").unwrap();
     s.write_open(&mut open, 5000, b"far").unwrap();
@@ -1446,7 +1467,7 @@ mod tests {
   #[test]
   fn sealing_makes_a_chunk_that_reads_back_and_releases_by_the_epoch_rule() {
     let mut s = store();
-    let mut open = s.open(0, 10, Epoch(0), false).unwrap();
+    let mut open = s.open(0, 10, Epoch(0), (false, Owner::Volume)).unwrap();
     s.write_open(&mut open, 5000, b"far").unwrap();
     let extent = s.seal(open, None).unwrap().unwrap();
     assert_eq!(extent.len, 5003);
@@ -1475,14 +1496,14 @@ mod tests {
   #[test]
   fn writes_past_a_chunk_are_refused_and_reopen_copies_the_bytes() {
     let mut s = store();
-    let mut open = s.open(0, 1, Epoch(0), false).unwrap();
+    let mut open = s.open(0, 1, Epoch(0), (false, Owner::Volume)).unwrap();
     assert!(matches!(
       s.write_open(&mut open, s.chunk_bytes(), b"x"),
       Err(VfsError::FileTooLarge)
     ));
     s.write_open(&mut open, 0, b"abc").unwrap();
     let extent = s.seal(open, None).unwrap().unwrap();
-    let copy = s.reopen(&extent, Epoch(1), false).unwrap();
+    let copy = s.reopen(&extent, Epoch(1), (false, Owner::Volume)).unwrap();
     assert_eq!(s.open_bytes(&copy), b"abc");
     assert_eq!(copy.born, Epoch(1));
   }
@@ -1628,7 +1649,9 @@ mod tests {
     let plain: Vec<u8> = (0..SEALED_LEN)
       .map(|at| u8::try_from(at % 251).unwrap())
       .collect();
-    let mut open = s.open(100, SEALED_LEN, Epoch(0), false).unwrap();
+    let mut open = s
+      .open(100, SEALED_LEN, Epoch(0), (false, Owner::Volume))
+      .unwrap();
     s.write_open(&mut open, 0, &plain).unwrap();
     let extent = s.seal(open, Some(KEY)).unwrap().unwrap();
     let ExtentSrc::Chunk { chunk, .. } = extent.src else {
@@ -1655,7 +1678,9 @@ mod tests {
     let plain: Vec<u8> = (0..SEALED_LEN)
       .map(|at| u8::try_from(at % 251).unwrap())
       .collect();
-    let mut open = s.open(100, SEALED_LEN, Epoch(0), false).unwrap();
+    let mut open = s
+      .open(100, SEALED_LEN, Epoch(0), (false, Owner::Volume))
+      .unwrap();
     s.write_open(&mut open, 0, &plain).unwrap();
     let extent = s.seal(open, Some(KEY)).unwrap().unwrap();
     (s, extent, plain)
@@ -1702,7 +1727,7 @@ mod tests {
         "span at {from}"
       );
     }
-    let copied = s.reopen(&extent, Epoch(1), false).unwrap();
+    let copied = s.reopen(&extent, Epoch(1), (false, Owner::Volume)).unwrap();
     assert_eq!(&s.open_bytes(&copied)[..SEALED_LEN], &plain[..]);
     s.release_open(copied).unwrap();
   }
@@ -1759,7 +1784,7 @@ mod tests {
         let plain: Vec<u8> = (0..len)
           .map(|at| u8::try_from((at + round) % 251).unwrap())
           .collect();
-        let mut open = s.open(0, len, Epoch(0), false).unwrap();
+        let mut open = s.open(0, len, Epoch(0), (false, Owner::Volume)).unwrap();
         s.write_open(&mut open, 0, &plain).unwrap();
         let extent = s.seal(open, Some(KEY)).unwrap().unwrap();
         let mut back = vec![0u8; len];

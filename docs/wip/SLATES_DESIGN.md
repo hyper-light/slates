@@ -35025,6 +35025,16 @@ shard), `crates/server/src/doorbell.rs` (the thread kicks what the rings marked,
   parks fell by 59% at both loads (4.71 to 1.92 million a level at 50 ms, 2.74 to 1.13 million at 20 ms) and the shards'
   CPU by 34% and 20%. The latencies swung ten- to twentyfold with the box's load (14 to 52) within each arm, so those
   pairs cannot tell the arms' latencies apart; the 1,000-client rung's record run is the supervisor's.
+- **A ring before the thread's first look (w-win for main 01a20182, 2026-11-23).** The doorbell thread took the marks
+  only when a wait returned a word other than the one it read as it started, so a claim rung before that read (in the
+  window between the daemon's publishing its rendezvous, `Listener::open`, and its doorbell thread's start, or into an
+  anchor's object while a killed daemon restarted) was never taken, and its claimant waited for good under the anchor
+  (A-468). The thread now takes the marks once after its first read, before its first wait. Found as the Windows
+  Shards CLI step's 20-minute hang (CI run 45163517212): every thread's stack at a reproduced hang showed the client in
+  its claim's wait, the daemon's shards parked and its doorbell thread waiting for a ring. Held by
+  `doorbell::tests::a_claim_rung_before_the_doorbell_thread_starts_is_taken` (macOS and Windows). Applied in the same
+  change to: `crates/server/src/doorbell.rs`, GAPS (A-381's closure),
+  `docs/bugs/2026-11-23-a-claim-rung-before-the-doorbell-thread-looked-was-never-answered.md`.
 
 ### A-341 — A holder the takeover never asked lets its copy go where the kept retirement shows the object recovered within tolerance (2026-11-18, kiln goal g250; §4.8 "Promotion and takeover"; A-309's owed rule, its safe part; A-335)
 Applied in the same change to: A-309's holder rule (above), GAPS (the unasked holder's entry), `crates/db/src/register.rs`
