@@ -271,3 +271,143 @@ fn a_fresh_chunk_against_a_kept_one() {
     "text_cache_heap: a chunk of {floor} B: fresh (mapped, filled, unmapped) {fresh:?}, kept and refilled {reused:?}"
   );
 }
+
+/// Shape: the reads at once a CI runner's owner derives room for (`clients_per_shard` x shards): far more than are ever
+/// reading at once.
+const MANY_READS: usize = 1_000;
+
+/// Goal 93 (main 01a20182's arena-13, CI 45193998198: 646,410,240 bytes of mapped blocks resident after push-all and
+/// after idle, against 68,661,248 before; the bound was the distinct texts of the last `waiting` reads, and on a CI
+/// runner that is hundreds). Do: on a cache made for [`MANY_READS`] reads at once, read every version of the chain on a
+/// cold cache, each a walk of one piece finished by its read, as a push's reads of its bases are. Expect: the cache's
+/// reserved bytes never past one chunk and a text, since no walk stays in flight; the reads lending every version's
+/// bytes as landed. Failing first: the bound grown with every distinct text read, the whole chain's 6.4 MB.
+#[test]
+fn the_store_holds_the_walks_in_flight_not_the_reads_that_could_be_waiting() {
+  let dir = scratch("walks");
+  let mut store = open(&dir);
+  let identities = land_chain(&mut store);
+  let staging = Staging::new(0);
+  let mut cache = TextCache::for_reads(MANY_READS);
+  let most = slates_mem::large::floor() as u64 + TEXT as u64;
+  let mut largest = 0;
+  for identity in &identities {
+    let bytes = store
+      .text_at(&staging, 1, identity, 0, &mut cache)
+      .unwrap()
+      .unwrap();
+    assert_eq!(
+      *blake3::hash(bytes).as_bytes(),
+      *identity,
+      "a version's bytes as landed"
+    );
+    largest = largest.max(cache.reserved_bytes());
+  }
+  println!(
+    "text_cache_heap: {MANY_READS} reads' room, every version read: reserved at most {largest} (bound {most})"
+  );
+  assert!(
+    largest <= most,
+    "reserved {largest} past one chunk and a text, {most}, with no walk in flight"
+  );
+}
+
+/// Shape: a text walked in several pieces: past three of the owner's pieces.
+const BIG_TEXT: usize = 3 * slates_store::store::PIECE_BYTES + 1_000;
+
+/// Lands one more changeset of repository 1 at `sequence`, a whole text of [`BIG_TEXT`] bytes on its own path: its
+/// identity.
+fn land_big(store: &mut Store, sequence: u64) -> [u8; 32] {
+  let staging = Staging::new(1 << 20);
+  let text: Vec<u8> = (0..BIG_TEXT).map(|at| (at % 241) as u8).collect();
+  let identity = *blake3::hash(&text).as_bytes();
+  let section = texts::encode(&[TextEntry {
+    path: b"big.bin".to_vec(),
+    tool_id: Vec::new(),
+    text: identity,
+    len: text.len() as u64,
+    base: None,
+    place: Place {
+      payload: *blake3::hash(&text).as_bytes(),
+      offset: 0,
+      len: text.len() as u64,
+    },
+  }]);
+  store
+    .land(
+      Header {
+        tool: Tool::Mercurial,
+        repository: 1,
+        sequence,
+        judged_over: sequence - 1,
+        grant: 1,
+        work: sequence,
+        time_ns: sequence,
+        sections: 0,
+      },
+      &[
+        (SectionKind::Record, Contents::Bytes(b"heads")),
+        (SectionKind::Payload, Contents::Bytes(&text)),
+        (SectionKind::Texts, Contents::Bytes(&section)),
+      ],
+      &staging,
+    )
+    .unwrap();
+  identity
+}
+
+/// Goal 93 (the walks-in-flight bound). Do: land the chain and a text of several pieces; begin the big text's walk at
+/// its first piece, read every version of the chain between, then read the big text's next pieces and its last. Expect:
+/// the big text found at each later piece without being made again (its walk held it through the other reads), every
+/// piece's bytes the text's; and once its last piece is read, the cache back within one chunk and a text.
+#[test]
+fn a_walk_in_flight_keeps_its_text_through_other_reads() {
+  let dir = scratch("walk");
+  let mut store = open(&dir);
+  let identities = land_chain(&mut store);
+  let big = land_big(&mut store, VERSIONS + 1);
+  let staging = Staging::new(0);
+  let mut cache = TextCache::for_reads(MANY_READS);
+  let piece = slates_store::store::PIECE_BYTES as u64;
+  let first = store
+    .text_at(&staging, 1, &big, 0, &mut cache)
+    .unwrap()
+    .unwrap()
+    .len();
+  assert_eq!(first, BIG_TEXT);
+  for identity in &identities {
+    store
+      .text_at(&staging, 1, identity, 0, &mut cache)
+      .unwrap()
+      .unwrap();
+  }
+  let made = cache.made;
+  let mut offset = piece;
+  while offset < BIG_TEXT as u64 {
+    let rest = store
+      .text_at(&staging, 1, &big, offset, &mut cache)
+      .unwrap()
+      .unwrap();
+    assert_eq!(
+      rest.len() as u64,
+      BIG_TEXT as u64 - offset,
+      "the walk's piece from {offset}"
+    );
+    assert_eq!(
+      rest[0],
+      (offset % 241) as u8,
+      "the walk's bytes at {offset}"
+    );
+    offset += piece;
+  }
+  assert_eq!(
+    cache.made, made,
+    "the big text, walked, found without being made again"
+  );
+  let most = slates_mem::large::floor() as u64 + BIG_TEXT as u64;
+  assert!(
+    cache.reserved_bytes() <= most,
+    "reserved {} past one chunk and a text, {most}, once the walk ended",
+    cache.reserved_bytes()
+  );
+}

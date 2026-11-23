@@ -957,6 +957,14 @@
 >   Grown to the longest chain before, it held 360 MB of chunks at the end of Mercurial's push. Held by
 >   `the_store_holds_the_texts_its_last_reads_lent_and_no_more` (red: bound 6,553,600 after a 400-version chain's read;
 >   now 1,064,960 for 4 reads, 384 texts let go, the latest found again unmade).
+>   REGRESSED on CI, then FIXED (2026-11-23, main's arena-13, CI 45193998198 at 85569cf25): that bound was the distinct
+>   texts of the last `clients_per_shard` x shards reads, hundreds on CI's runner, so mapped blocks resident after
+>   push-all rose from 68,661,248 to 646,410,240 bytes and stayed after idle (RSS 1,865 -> 2,235 MB on x86). The bound is
+>   now the walks in flight: the texts whose pieces are still being read, in whole chunks, and the larger of one chunk
+>   and the text a read lends, so a cache whose reads have ended holds one chunk; a walked text in a chunk given back is
+>   laid again in the newest. Held by `the_store_holds_the_walks_in_flight_not_the_reads_that_could_be_waiting` (red
+>   7,340,032 bytes reserved with room for 1,000 reads and no walk in flight; now 1,048,576) and
+>   `a_walk_in_flight_keeps_its_text_through_other_reads`. Owed: main's arena-14 on CI's runner.
 > - A Mercurial index's tail sealed by every append BUILT (2026-11-23, w-perf; w-hg's three conditions). Only an import
 >   sealed (`import::settle`), so a push's, a replay's and a made changeset's tail grew for the whole push: 56 MB of tail
 >   rows, two buffers each, still held at the end of Mercurial's push (`Index::admit` 34 MB, `table::encode_body` 22 MB).
@@ -10950,7 +10958,12 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >       single 782 MiB claim (76 % of the runner's 1 GiB shard) is no longer admitted again at a takeover: the successor
 >       takes its candidate claim over. The same room is now met at live-ship, typed when it is not (SLATES_DESIGN A-401,
 >       "The live chaos flows, in numbers"). The runner's case, six bounded claims on one fleet, is its own flow now:
->       `a_bounded_claim_is_served_by_its_successor_or_refused_before_it_ships` (run request filed 2026-11-18). **Owed:** a
+>       `a_bounded_claim_is_served_by_its_successor_or_refused_before_it_ships` (run request filed 2026-11-18). Until
+>       2026-11-23 it sized its claims from the status's `reserve=`, the capacity a shard has claimed from the pool so far
+>       (0 on a Linux daemon that has admitted nothing), so on Linux every claim was 0 MiB and the flow never shipped (CI
+>       nightly from 2026-11-20); it reads the shard's slice through the daemon's own derivation now
+>       (`slates_server::config::reserve_per_shard`;
+>       `docs/bugs/2026-11-23-the-bounded-claim-flow-sized-its-claims-from-capacity-claimed-so-far.md`). **Owed:** a
 >       candidate that joins the placement later and cannot admit refuses its first entry `NoRoom`, but the configuration
 >       may still name it a successor. And the control shard's view of its claims can name one its partition released (a
 >       claim admitted for a message the copy then refused is released at the next reconciliation, since only copies
