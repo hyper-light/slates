@@ -13114,6 +13114,14 @@ same summary. Eleven more modules still carry both kinds and do not fail today: 
 comments needs their text moved in), `xtask/src/kind.rs`'s three `kind_*`, and five test-only modules no docs build
 renders.
 
+**The Windows docs lane, run from the Mac** (`cargo xwin doc` over `windows-lint`'s crate list; every one of its 13
+crates builds here, aws-lc-sys and zstd-sys through clang-cl), found 11 more, each a link from docs every platform
+builds to an item Windows does not have: `crates/server/src/shards/resync.rs`'s seven (`establish`, `Resync::end`,
+`give_up` three times, `tell_session`, `send_resync`, all `cfg(unix)`), `Events::acknowledge` twice (macOS and Linux
+alone), `svn_presenter::repos_for_hook` and `Answering::Hook`. Plain code now, the rule for a cfg-gated item. CI's
+Windows lane had stopped at an earlier step (run 45251228315, `svn_interop`'s `UPDATE_SPAN`), so its docs step never
+ran on them.
+
 ### 8a-fdscan. A descriptor probe counted every parallel test's objects as its own (2026-10-20, closed)
 
 The same push turned the `gates (ubuntu-latest)` lane red on

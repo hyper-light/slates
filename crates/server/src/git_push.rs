@@ -10,9 +10,8 @@
 //! a turn at a time (A-719: every object checked as git checks a push, then the connectivity walk, each turn the shard's
 //! step quantum), decides the checked push and writes git's report to the edge's bytes, a step at a time while its
 //! hooks run (A-665 part 3): [`Answering::Turned`] after each turn of the checks or of a hook's view's sealing, and
-//! [`Answering::Hook`] for a hook the edge
-//! runs off the shard's step and hands back through `ReceivePack::hook_ran` (`hooks`, Unix, where the hook driver
-//! runs). Each call is one step on the owner shard; between steps the driver holds only its push's sealed quarantine
+//! `Answering::Hook` for a hook the edge runs off the shard's step and hands back through `ReceivePack::hook_ran`
+//! (`hooks`, Unix, where the hook driver runs). Each call is one step on the owner shard; between steps the driver holds only its push's sealed quarantine
 //! and a hook's view, which a push dropped between them gives back, so an edge's task keeps the driver across its own
 //! awaits. Every read of the store is lent the
 //! room the shard can admit now (`vcs_store::with_room`), since A-614's store parses within its content store's room
