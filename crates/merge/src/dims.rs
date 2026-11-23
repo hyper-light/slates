@@ -20,6 +20,9 @@
 //! on a path costs a count, never the file's bytes; a block is freed with its last holder. The other holders are the
 //! green's identity table ([`crate::held`], A-716) and its content history ([`crate::history`], A-728), whose latest
 //! value of a file is the file's block, so a changed file's bytes are held once.
+//! A block made of the whole of a content-plane object (one named run, A-760) keeps that object's identity
+//! ([`Blocks::name`]), and a block made any other way has none, so the green can later hold such a file by its name in
+//! place of its bytes (A-760 (b)).
 //!
 //! **Attributes keep their order.** An attribute's key is its path with every NUL escaped ([`NUL_ESCAPED`]), then
 //! [`PATH_END`], then its name: escaping keeps byte order, and the path's end sorts before any continuation of it, so a
@@ -166,26 +169,40 @@ impl<V: Clone> Dim<V> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Block(usize);
 
+/// One block: its bytes, its holders, and the content-plane object its bytes are whole, if it was made so (A-760 (b),
+/// [`Blocks::name`]).
+#[derive(Debug)]
+struct Slot {
+  bytes: Vec<u8>,
+  holders: u64,
+  name: Option<crate::named::Identity>,
+}
+
 /// The bytes of current files, each block with the count of the map nodes naming it (module docs, "Files hold
 /// blocks").
 #[derive(Debug, Default)]
 pub(crate) struct Blocks {
-  /// Each block's bytes and holders; `None` once freed.
-  slots: Vec<Option<(Vec<u8>, u64)>>,
+  /// Each block's slot; `None` once freed.
+  slots: Vec<Option<Slot>>,
   /// Freed slots, reused before the arena grows.
   free: Vec<usize>,
 }
 
 impl Blocks {
-  /// A new block holding `bytes`, with one holder.
-  fn add(&mut self, bytes: Vec<u8>) -> Block {
-    if let Some(slot) = self.free.pop()
-      && let Some(place) = self.slots.get_mut(slot)
+  /// A new block holding `bytes`, with one holder and named `name` (A-760 (b)).
+  fn add(&mut self, bytes: Vec<u8>, name: Option<crate::named::Identity>) -> Block {
+    let slot = Slot {
+      bytes,
+      holders: 1,
+      name,
+    };
+    if let Some(at) = self.free.pop()
+      && let Some(place) = self.slots.get_mut(at)
     {
-      *place = Some((bytes, 1));
-      return Block(slot);
+      *place = Some(slot);
+      return Block(at);
     }
-    self.slots.push(Some((bytes, 1)));
+    self.slots.push(Some(slot));
     Block(self.slots.len().saturating_sub(1))
   }
 
@@ -195,30 +212,42 @@ impl Blocks {
       .slots
       .get(block.0)
       .and_then(Option::as_ref)
-      .map(|(bytes, _)| bytes.as_slice())
+      .map(|slot| slot.bytes.as_slice())
       .unwrap_or_default()
+  }
+
+  /// The content-plane object `block`'s bytes are the whole of, when it was made of one ([`Files::insert_named`]):
+  /// the name a later piece of A-760 (b) holds the block by in place of its bytes. None for any other block.
+  pub(crate) fn name(&self, block: Block) -> Option<crate::named::Identity> {
+    self
+      .slots
+      .get(block.0)
+      .and_then(Option::as_ref)
+      .and_then(|slot| slot.name)
   }
 
   /// One more holder of `block`.
   pub(crate) fn hold(&mut self, block: Block) {
-    if let Some(Some((_, holders))) = self.slots.get_mut(block.0) {
-      *holders = holders.saturating_add(1);
+    if let Some(Some(slot)) = self.slots.get_mut(block.0) {
+      slot.holders = slot.holders.saturating_add(1);
     }
   }
 
   /// How many hold `block`: map nodes, the identity table and the content history (zero for a block that is gone).
   pub(crate) fn holders(&self, block: Block) -> u64 {
     match self.slots.get(block.0) {
-      Some(Some((_, holders))) => *holders,
+      Some(Some(slot)) => slot.holders,
       _ => 0,
     }
   }
 
   /// Appends `bytes` to `block`'s bytes: a staged text's next piece (A-716, [`crate::held::Staged`]), whose block no
-  /// other holder shares while it is staged.
+  /// other holder shares while it is staged. A staged block is named by nothing, and its bytes change, so it keeps no
+  /// name.
   pub(crate) fn append(&mut self, block: Block, bytes: &[u8]) {
-    if let Some(Some((held, _))) = self.slots.get_mut(block.0) {
-      held.extend_from_slice(bytes);
+    if let Some(Some(slot)) = self.slots.get_mut(block.0) {
+      slot.bytes.extend_from_slice(bytes);
+      slot.name = None;
     }
   }
 
@@ -227,10 +256,10 @@ impl Blocks {
     let Some(place) = self.slots.get_mut(block.0) else {
       return;
     };
-    if let Some((_, holders)) = place.as_mut()
-      && *holders > 1
+    if let Some(slot) = place.as_mut()
+      && slot.holders > 1
     {
-      *holders = holders.saturating_sub(1);
+      slot.holders = slot.holders.saturating_sub(1);
       return;
     }
     if place.take().is_some() {
@@ -243,16 +272,16 @@ impl Blocks {
     let Some(place) = self.slots.get_mut(block.0) else {
       return Vec::new();
     };
-    if let Some((bytes, holders)) = place.as_mut()
-      && *holders > 1
+    if let Some(slot) = place.as_mut()
+      && slot.holders > 1
     {
-      *holders = holders.saturating_sub(1);
-      return bytes.clone();
+      slot.holders = slot.holders.saturating_sub(1);
+      return slot.bytes.clone();
     }
     match place.take() {
-      Some((bytes, _)) => {
+      Some(slot) => {
         self.free.push(block.0);
-        bytes
+        slot.bytes
       }
       None => Vec::new(),
     }
@@ -295,7 +324,18 @@ impl Files {
 
   /// Sets `path`'s bytes; the bytes it replaced are let go.
   pub(crate) fn insert(&mut self, path: impl AsRef<[u8]>, bytes: Vec<u8>) {
-    let block = self.blocks.add(bytes);
+    self.insert_named(path, bytes, None);
+  }
+
+  /// Sets `path`'s bytes, which are the whole of the content-plane object `name` when one is given (A-760 (b): a file
+  /// made whole of one named run); the bytes it replaced are let go.
+  pub(crate) fn insert_named(
+    &mut self,
+    path: impl AsRef<[u8]>,
+    bytes: Vec<u8>,
+    name: Option<crate::named::Identity>,
+  ) {
+    let block = self.blocks.add(bytes, name);
     let replaced =
       self
         .map
@@ -341,6 +381,14 @@ impl Files {
       .map(|(path, block)| (path, self.blocks.bytes(*block)))
   }
 
+  /// The content-plane object `path`'s file is the whole of, when its block was made of one ([`Blocks::name`]).
+  pub(crate) fn name_of(&self, path: impl AsRef<[u8]>) -> Option<crate::named::Identity> {
+    self
+      .map
+      .get(path)
+      .and_then(|block| self.blocks.name(*block))
+  }
+
   /// The block `path`'s file holds, with no holder added: what a reader that holds it later names (A-728).
   pub(crate) fn block_of(&self, path: impl AsRef<[u8]>) -> Option<Block> {
     self.map.get(path).copied()
@@ -356,7 +404,7 @@ impl Files {
 
   /// A new block holding `bytes`, with one holder and named by no path (A-716: a text held before any file names it).
   pub(crate) fn add_unnamed_block(&mut self, bytes: Vec<u8>) -> Block {
-    self.blocks.add(bytes)
+    self.blocks.add(bytes, None)
   }
 
   /// Appends `bytes` to a staged text's block (A-716, [`crate::held::Staged`]).

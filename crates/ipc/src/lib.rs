@@ -44,6 +44,7 @@ pub mod doorbell;
 pub mod endpoint;
 pub mod error;
 pub mod exit_watch;
+pub mod group_holders;
 #[cfg(windows)]
 pub mod handle_route;
 #[cfg(target_os = "linux")]
