@@ -122,3 +122,41 @@ jobs:
       - name: "Item 2 and the rest: the server's unit tests, one test at a time, as CI runs them"
         timeout-minutes: 60
         run: cargo test -p slates-server --lib -- --test-threads=1 2>&1 | grep -v '^\s*Compiling \|descriptor_limit = \|the watchdog beats every\|the start beat [0-9]* times\|initialized in [0-9]* µs'
+
+  lint:
+    name: items 2 and 3, clippy on Windows (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - name: NASM (x86_64 Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64 Windows)
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Clippy the changed crates on Windows, each alone
+        run: cargo clippy -p slates-server -p slates-vfs -p slates-mem --no-deps --lib --tests -- -D warnings 2>&1 | grep -v '^\s*Checking \|^\s*Compiling '
+      - name: Clippy the Windows extents CLI test
+        if: ${{ !cancelled() }}
+        run: cargo clippy -p slates-cli --no-deps --test content_extents_windows -- -D warnings 2>&1 | grep -v '^\s*Checking \|^\s*Compiling '
