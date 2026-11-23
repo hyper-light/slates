@@ -8493,6 +8493,8 @@ mod tests {
         seen = looked;
         break;
       }
+      // The harness paces its looks; the daemon under test waits on its wheel.
+      #[allow(clippy::disallowed_methods)]
       std::thread::sleep(std::time::Duration::from_millis(20));
     }
     second.stop();

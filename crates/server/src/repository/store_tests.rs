@@ -1032,6 +1032,8 @@ fn checkpoint_named(daemon: &Daemon, repository: RepositoryId, head: u64) -> u64
     if named.is_some() || std::time::Instant::now() >= deadline {
       return named.unwrap_or(0);
     }
+    // The harness paces its looks; the daemon under test waits on its wheel.
+    #[allow(clippy::disallowed_methods)]
     std::thread::sleep(std::time::Duration::from_millis(10));
   }
 }

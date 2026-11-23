@@ -67,6 +67,28 @@ thread_local! {
   pub(crate) static KILL_AT_COMMIT_SLICE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
+/// The kill [`KILL_BEFORE_ENTRY`] sets, at its point in [`Staging::land`]: where set, it clears itself and never
+/// returns.
+#[cfg(test)]
+async fn kill_before_entry_where_set() {
+  if KILL_BEFORE_ENTRY.with(std::cell::Cell::get) {
+    KILL_BEFORE_ENTRY.with(|kill| kill.set(false));
+    // A kill: nothing after it runs, as after a `kill -9` between the changeset and its entry.
+    std::future::pending::<()>().await;
+  }
+}
+
+/// The kill [`KILL_AT_COMMIT_SLICE`] sets, at its point in [`Staging::land`] after `slices` slices of the recorded
+/// apply: at that count, it clears itself and never returns.
+#[cfg(test)]
+async fn kill_at_commit_slice_where_set(slices: usize) {
+  if KILL_AT_COMMIT_SLICE.with(|kill| kill.get() == Some(slices)) {
+    KILL_AT_COMMIT_SLICE.with(|kill| kill.set(None));
+    // A kill: nothing after it runs, as after a `kill -9` between two slices.
+    std::future::pending::<()>().await;
+  }
+}
+
 /// Why a batch lands now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Flush {
@@ -378,11 +400,7 @@ impl Staging {
     let landed =
       landing::land_changeset(&disk, (repository, sequence), records, &self.carried).await;
     #[cfg(test)]
-    if KILL_BEFORE_ENTRY.with(std::cell::Cell::get) {
-      KILL_BEFORE_ENTRY.with(|kill| kill.set(false));
-      // A kill: nothing after it runs, as after a `kill -9` between the changeset and its entry.
-      std::future::pending::<()>().await;
-    }
+    kill_before_entry_where_set().await;
     let recorded = crate::state::with_state(|state| {
       landed.and_then(|()| {
         if landing::next_sequence(state, repository) != sequence {
@@ -414,11 +432,7 @@ impl Staging {
     let mut slices = 0usize;
     loop {
       #[cfg(test)]
-      if KILL_AT_COMMIT_SLICE.with(|kill| kill.get() == Some(slices)) {
-        KILL_AT_COMMIT_SLICE.with(|kill| kill.set(None));
-        // A kill: nothing after it runs, as after a `kill -9` between two slices.
-        std::future::pending::<()>().await;
-      }
+      kill_at_commit_slice_where_set(slices).await;
       if crate::state::with_state(|state| recorded.apply_slice(state))?.is_some() {
         break;
       }
