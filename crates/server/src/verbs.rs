@@ -19363,6 +19363,8 @@ fn restore_held_image(
       &held.windows,
       (&held.lists, &held.names, &held.region_holds, &held.aways),
     );
+    // Where the windows landed packs carried lie on the node's store, as its homes recorded (goal 93 item 2b(b)).
+    crate::vcs_store::homes::restore_landed(&held.landed);
   }
   state.store.content.arena_mut().commit_live();
   let recovered_hold = held_claims.and_then(|claimed| {

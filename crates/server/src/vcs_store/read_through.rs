@@ -447,6 +447,99 @@ mod tests {
     );
   }
 
+  /// Goal 93 item 2b(b) (main 01a20182's ruling: homes keep window → (payload identity, offset) for the windows a landed
+  /// pack carried, and a home's read of a window let go brings it back through that record). Do: on a store-backed
+  /// daemon, hold a pack of several windows for the region on this shard (`homes::keep_for_region`), land its bytes as a
+  /// changeset's `Payload`, then let the landed pack go among this shard alone, its home; read the pack through
+  /// `homes::read`. Expect: each window recorded where it lies in the pack, by its offset; every window let go, its bytes
+  /// counted, none pinned; the read answers the pack whole, each window brought back by its record. Failing first: the
+  /// home's windows pinned, held in RAM for good, or let go with nothing to bring them back by.
+  #[test]
+  fn a_landed_pack_its_home_holds_is_let_go_and_read_back_through_its_record() {
+    let (_store, daemon) = crate::test_store::audit_daemon_stored();
+    let (sent, got) = std::sync::mpsc::channel();
+    crate::daemon::observe_first(&daemon, move |state| {
+      let window = state.store.content.chunk_bytes();
+      state.vcs_stores.content_made(window).unwrap();
+      let window = state
+        .vcs_stores
+        .content()
+        .map_or(1 << 18, slates_vcs::ContentStore::window);
+      let bytes: Vec<u8> = (0..3 * window + 77)
+        .map(|at| u8::try_from(at % 251).unwrap())
+        .collect();
+      let len = u64::try_from(bytes.len()).unwrap();
+      let (pack, _) = crate::vcs_store::homes::keep_for_region(state, &bytes).unwrap();
+      let header = slates_store::log::Header {
+        tool: slates_store::log::Tool::Git,
+        repository: 3,
+        sequence: 0,
+        judged_over: 0,
+        grant: 0,
+        work: 0,
+        time_ns: slates_rt::futures::now_ns(),
+        sections: 0,
+      };
+      let parts = vec![(slates_store::log::SectionKind::Payload, bytes.clone())];
+      assert!(crate::test_store::land_blocking(
+        state.vcs_disk.clone().unwrap(),
+        header,
+        parts
+      ));
+      let here = state.shard;
+      crate::vcs_store::let_go_landed_pack_among(state, &pack, &[here]);
+      let ids: Vec<ContentId> = bytes.chunks(window).map(ContentId::of).collect();
+      let offsets: Vec<Option<u64>> = ids
+        .iter()
+        .map(|id| crate::vcs_store::homes::landed_at(id).map(|at| at.offset))
+        .collect();
+      let gone = state.vcs_stores.content().map_or(0, |content| {
+        ids.iter().filter(|id| content.is_away(id)).count()
+      });
+      let counted = |state: &crate::state::ShardState, name: &str| {
+        state.refusals.get(name).copied().unwrap_or(0)
+      };
+      let let_go_bytes = counted(state, crate::vcs_store::homes::LANDED_HOME_LET_GO_BYTES);
+      let pinned = counted(state, crate::vcs_store::LANDED_PINNED);
+      let windows = ids.len();
+      let budget_ns = crate::fleet::live_budget().max_deadline_ns();
+      let task = slates_rt::futures::spawn(async move {
+        let read = crate::vcs_store::homes::read(here, &[here], pack, budget_ns).await;
+        let brought = crate::state::with_state(|state| {
+          counted(state, crate::vcs_store::homes::LANDED_BROUGHT_BACK)
+        })
+        .unwrap_or(0);
+        let _ = sent.send((
+          (offsets, window),
+          (gone, windows),
+          (let_go_bytes, len, pinned),
+          (read == Some(bytes), brought),
+        ));
+      })
+      .unwrap();
+      slates_rt::futures::detach(task).unwrap();
+    });
+    let ((offsets, window), (gone, windows), (let_go_bytes, len, pinned), (whole, brought)) =
+      got.recv().expect("the read answered");
+    daemon.stop();
+    let expected: Vec<Option<u64>> = (0..windows)
+      .map(|index| Some(u64::try_from(index * window).unwrap()))
+      .collect();
+    assert_eq!(
+      offsets, expected,
+      "each window recorded at its offset in the pack"
+    );
+    assert_eq!(gone, windows, "every window the home held let go");
+    assert_eq!(let_go_bytes, len, "the pack's bytes counted let go");
+    assert_eq!(pinned, 0, "no window pinned: the record brings it back");
+    assert!(whole, "the home's read answers the pack whole");
+    assert_eq!(
+      brought,
+      u64::try_from(windows).unwrap(),
+      "each window brought back by its record"
+    );
+  }
+
   /// Goal 93 item 2b(a)'s window (main 01a20182, 2026-11-22: a fetch that starts while a push of the same repository is
   /// still deciding its refs reads every object). Do: on a store-backed daemon, put a landed pack of several windows in a
   /// git repository's content store and owe its let-go (the commit of a push's first entry deferred it), with a push of
