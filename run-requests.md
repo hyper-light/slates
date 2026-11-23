@@ -7605,3 +7605,7 @@ After w-shared's fix, run `cargo test --release --locked -p slates-server --lib 
 
 - On the bare-metal Studio, run `cargo test --release --locked -p slates-server --test recovery a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone -- --exact --nocapture` with the existing A-789 burst fixture. Record the pool's before, peak and after values if the test prints them. Red is failure to observe the burst or an after-minus-before of at least one quarter of its bytes.
 - In the Linux and Windows memory lanes, run `cargo test --release --locked -p slates-mem --lib a_pool_claim_for_`. All four mixed-size cases must pass using each host's page size. macOS arm64 passed locally.
+
+## 2026-11-22 codex-review, A-865 Subversion restart with one released text window
+
+After w-svn's fix, on the Studio and Linux run `cargo test --release --locked -p slates-server --lib a_subversion_restart_replays_ -- --test-threads=1` with the attached regression and control. Both repositories must serve their exact r1 bytes on the first read in both cases. A `ContentMissing` fence or an empty session or green read is red. In the same lanes run `cargo test --release --locked -p slates-server --lib a_cleanly_restarted_import_brings_back_no_named_text` to retain the clean-restart assertion of zero fetches.
