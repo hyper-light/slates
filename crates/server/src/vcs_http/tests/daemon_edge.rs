@@ -896,7 +896,8 @@ const UNANSWERED_PATIENCE_NS: u64 = 200_000_000;
 
 /// Goal 93's read-through bound (main 01a20182's ruling of 2026-11-22 17:00: an await without a bound is a defect on
 /// its own, banned items 8 and 9). Do: on a two-shard daemon with its edge, push a commit whose one file spans several
-/// of the content store's windows; on the repository's shard, let every window of its staged pack go as landed, and
+/// of the content store's windows; on the repository's shard, let every window of its staged pack go as landed (those
+/// the push's own let-go has not), and
 /// make the node's store never answer a bring-back's read (`read_through::TEST_UNANSWERED`), each waited for
 /// [`UNANSWERED_PATIENCE_NS`]; then fetch the commit as `git clone` asks, from a thread the test waits on. Expect: the
 /// fetch answered, not hung (well inside a minute); its answer no whole pack of every object pushed, so the client fails
@@ -930,7 +931,13 @@ fn a_fetch_whose_let_go_window_the_store_never_answers_fails_cleanly_within_its_
       pack
         .chunks(window)
         .map(slates_vcs::ContentId::of)
-        .filter(|id| content.mark_landed(id) && content.let_go_landed(id, None).is_ok())
+        // Let go here, or by the push's own landed let-go already (its windows no home pins).
+        .filter(|id| {
+          if content.mark_landed(id) {
+            let _ = content.let_go_landed(id, None);
+          }
+          content.is_away(id)
+        })
         .count()
     })
   });
