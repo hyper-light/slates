@@ -15,6 +15,13 @@
 //! its chain one entry at a time, and each work's log replay. Only where a poll ends moves: no unit is reordered or
 //! split, and nothing else on the shard runs until the start ends, since the shard runs it alone.
 //!
+//! A start's own setup between the catalog's replay and the rebuild is named pieces, each a unit
+//! ([`RecoverySlices::piece_done`]): the pool's segment and content regions, the store, the council and fleet, the
+//! content object, the shard's state, the kept mounts, retention and the node's sealing recipient. The report keeps the
+//! most pieces of at least a slice's floor that one slice held (1, every such piece a slice of its own) and the
+//! heaviest piece by name, so a piece no slicing divides (a map of a 100 GB object) shows by name rather than hiding in
+//! a slice. Until 2026-11-22 they ran as one unit, 12 to 21 ms of CPU in one slice on CI's macOS runner (84a).
+//!
 //! Before 2026-11-07 the whole start was one poll. Measured on this Mac (`crates/server/tests/recovery_slicing.rs`, the
 //! recovery test): 1,024 merge units recovered in 5.52 s of CPU in one poll, and the beat went 9.3 s without
 //! advancing; the anchor would kill such a daemon at every restart.
@@ -65,6 +72,14 @@ pub(crate) struct RecoverySlices {
   longest_cpu_ns: u64,
   /// The units done when the slice that took the most CPU ended, naming where it was.
   longest_cpu_ended_at: u64,
+  /// When the current named piece began, on the shard's clock ([`Self::piece_done`]).
+  piece_began_ns: u64,
+  /// The pieces of at least a slice's floor the current slice has held.
+  heavy_pieces_in_slice: u64,
+  /// The most such pieces one slice held.
+  heavy_pieces_in_one_slice: u64,
+  /// The piece that took longest, with its time, by the shard's clock.
+  heaviest_piece: Option<(&'static str, u64)>,
 }
 
 /// What a recovery's slicing did, for the boot log.
@@ -86,6 +101,40 @@ pub(crate) struct SliceReport {
   pub(crate) longest_cpu_ns: u64,
   /// The units done when that slice ended: 1 when it was the first unit, the catalog's replay.
   pub(crate) longest_cpu_ended_at: u64,
+  /// The most pieces of at least a slice's floor one slice held ([`RecoverySlices::piece_done`]): 1 when every such
+  /// piece is a slice of its own, as a start's must be.
+  pub(crate) heavy_pieces_in_one_slice: u64,
+  /// The piece that took longest, named, with its time by the shard's clock: a piece no slicing divides (a map of the
+  /// whole object) shows here by name.
+  pub(crate) heaviest_piece: Option<(&'static str, u64)>,
+}
+
+/// What a shard's start did, as a test or an operator asks for it ([`crate::daemon::Daemon::shard_start_reports`]): the
+/// slicing's shape, and the pieces that decide it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StartReport {
+  /// The slices the start ran in.
+  pub slices: u64,
+  /// The units it did.
+  pub units: u64,
+  /// The most pieces of at least a slice's floor one slice held: 1 when every such piece of the start is a slice of its
+  /// own.
+  pub heavy_pieces_in_one_slice: u64,
+  /// The piece that took longest, by name, and its nanoseconds by the shard's clock.
+  pub heaviest_piece: Option<(String, u64)>,
+}
+
+impl From<&SliceReport> for StartReport {
+  fn from(report: &SliceReport) -> StartReport {
+    StartReport {
+      slices: report.slices,
+      units: report.units,
+      heavy_pieces_in_one_slice: report.heavy_pieces_in_one_slice,
+      heaviest_piece: report
+        .heaviest_piece
+        .map(|(name, took)| (name.to_owned(), took)),
+    }
+  }
 }
 
 impl RecoverySlices {
@@ -105,6 +154,37 @@ impl RecoverySlices {
       slice_cpu_began_ns: cpu,
       longest_cpu_ns: 0,
       longest_cpu_ended_at: 0,
+      piece_began_ns: began_ns,
+      heavy_pieces_in_slice: 0,
+      heavy_pieces_in_one_slice: 0,
+      heaviest_piece: None,
+    }
+  }
+
+  /// A named piece of a start done, `name` saying what it was: timed from the last piece's end (or the last slice's
+  /// start), counted against the slice it ran in when it took at least a slice's floor, and the heaviest kept by name.
+  /// Then the piece is a unit ([`Self::unit_done`]), so a slice the piece spent ends with it.
+  pub(crate) async fn piece_done(&mut self, name: &'static str) {
+    self.note_piece(name);
+    self.unit_done().await;
+  }
+
+  /// Counts the piece `name` just done (see [`Self::piece_done`]).
+  fn note_piece(&mut self, name: &'static str) {
+    let now = slates_rt::futures::now_ns();
+    let took = now.saturating_sub(self.piece_began_ns.max(self.began_ns));
+    self.piece_began_ns = now;
+    if took >= self.budget_ns {
+      self.heavy_pieces_in_slice = self.heavy_pieces_in_slice.saturating_add(1);
+      self.heavy_pieces_in_one_slice = self
+        .heavy_pieces_in_one_slice
+        .max(self.heavy_pieces_in_slice);
+    }
+    if self
+      .heaviest_piece
+      .is_none_or(|(_, longest)| took > longest)
+    {
+      self.heaviest_piece = Some((name, took));
     }
   }
 
@@ -147,6 +227,8 @@ impl RecoverySlices {
         .map(|(now, began)| now.saturating_sub(began)),
       longest_cpu_ns: self.longest_cpu_ns,
       longest_cpu_ended_at: self.longest_cpu_ended_at,
+      heavy_pieces_in_one_slice: self.heavy_pieces_in_one_slice,
+      heaviest_piece: self.heaviest_piece,
     }
   }
 
@@ -155,6 +237,7 @@ impl RecoverySlices {
   /// shard spent without a step.
   fn end_slice(&mut self, now: u64) -> Option<u64> {
     self.slices = self.slices.saturating_add(1);
+    self.heavy_pieces_in_slice = 0;
     self.longest_ns = self.longest_ns.max(now.saturating_sub(self.began_ns));
     let cpu = thread_cpu_ns();
     if let (Some(now_cpu), Some(began)) = (cpu, self.slice_cpu_began_ns) {

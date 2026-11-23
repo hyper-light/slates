@@ -3470,6 +3470,39 @@ fn a_give_back_returns_only_recovery_memory_written_since_the_last() {
   drop(anchor);
 }
 
+/// 84a (boot), a shard's start holds each of its heavy pieces in a slice of its own: do start a one-shard daemon over a
+/// fresh anchor and read its start report. Expect no slice to have held more than one piece that took at least a
+/// slice's floor, and the heaviest piece named (the non-vacuity check: the pieces were counted). Before, the pool's
+/// segment attach, the content object's open, the council and the shard's state ran in one slice of 12 to 21 ms on CI's
+/// macOS runner, 15 ms here, with no unit between them; the report says which piece is now the longest, a map of a
+/// 100 GB object that no slicing divides.
+#[test]
+fn a_shards_start_holds_each_heavy_piece_in_a_slice_of_its_own() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-start-pieces-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let anchor = held_anchor("start-pieces", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  let reports = daemon.shard_start_reports().unwrap();
+  daemon.stop();
+  drop(anchor);
+  let report = reports
+    .first()
+    .cloned()
+    .flatten()
+    .expect("the shard's start ended and reported");
+  println!("the shard's start: {report:?}");
+  assert!(
+    report.heaviest_piece.is_some(),
+    "the start's pieces were counted: {report:?}"
+  );
+  assert!(
+    report.heavy_pieces_in_one_slice <= 1,
+    "a slice held {} heavy pieces of the start: {report:?}",
+    report.heavy_pieces_in_one_slice
+  );
+}
+
 /// A-226, a give-back holds its shard no longer than a slice: do start a one-shard daemon over a fresh anchor (its
 /// journal has seen none of its recovery memory written, so its first idle ticks give back both checkpoint slots and
 /// the whole log, 18 GB a shard on a 128 GiB Mac), probe the shard with a volume's status while those ticks run, leave

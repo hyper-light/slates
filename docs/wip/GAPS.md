@@ -235,6 +235,10 @@
 >   (none on bare metal). The semaphore took reply wakes over 1 ms from 3,001 to 36 in 8 rounds, and the loaded p99
 >   median from 1,766 to 976 µs (accept) and from 4,301 to 1,363 µs (conflict). The p999 stays over 1 ms on that runner,
 >   held by long verbs (codex-review's list).
+>   A shard's start, sliced by its pieces (w-perf, 2026-11-22; BENCHMARKS "84a: a shard's start held in one slice"):
+>   LANDED. Its setup after the catalog's replay ran as one unit, 12 to 21 ms on CI's macOS runner and 59 to 68 ms on
+>   the Studio. Now each piece is its own unit, a segment attach opens its object once, and a whole reusable-mark set is
+>   written a word at a time. The start's heaviest piece is a 100 GB segment's map, named in its report.
 >   The refining job's turns paced (A-783's turn, to the ceiling or to its own quantum), measured and rejected (w-perf,
 >   2026-11-22; BENCHMARKS "84a on macOS: the refining job's turns paced"): dead even with main on one runner's
 >   interleaved rounds. Stamped under TB, the loaded tail's deferred replies are submits parked behind their refinement
@@ -25539,6 +25543,12 @@ before; 3 queued, none refused after); this fleet test passes again (fleet `a_li
 > GiB of freed large blocks macOS's allocator keeps): it now measures the pool by its own pages (the content object and
 > the arenas' held extents). A separate daemon's heap held resident (main's r41, about 1.3 GB against 31 to 60 MB
 > live) is its own piece, the idle heap give-back.
+>
+> **Mixed-size extent sources, closed 2026-11-22.** With three pages of headroom and free mappings of
+> three and four pages, the arena kept all 16 idle pages. It now keeps four and returns 12. Growth uses
+> the same buddy rounding and leaves unusable offers available in the pool. Four focused regressions
+> cover the allocator contract. See `docs/bugs/2026-11-22-extent-claims-use-buddy-capacity.md`.
+
 `cargo test -p slates-server --test recovery a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone` (A-789,
 362bd8c39, red -> green on adas-macbook-pro-2 quiet: 1,622 -> 123 MiB) fails on main's own code on Adas-Mac-Studio-2,
 three runs of three on the merge 287055d5b: 41-42 MiB before the burst, 1,341-1,342 MiB after its volume was destroyed, for a
