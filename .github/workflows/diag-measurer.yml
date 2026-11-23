@@ -12,56 +12,63 @@ on:
 
 env:
   CARGO_TERM_COLOR: never
+  ARMS: "0ce3b100d58d6cae3106ed27007e40e13636ddf0 947239f7de51634e8b4b75c1ce90e80aff5fc7bb"
   ROUNDS: "8"
 
 jobs:
   mac-tail:
-    name: mac tail (${{ matrix.os }})
+    name: mac semaphore A/B (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os: [macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 240
+    timeout-minutes: 300
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
-      - name: Build
+      - name: Build both arms (A the address wake, B the semaphore)
         run: |
           W="$RUNNER_TEMP/msr"; mkdir -p "$W/logs"
-          cargo build --release --locked -p slates-client --example edit_merge_bench --example g222_floor --example g222_wake_probe > "$W/logs/build.log" 2>&1 || { tail -30 "$W/logs/build.log"; exit 1; }
-          cp target/release/examples/edit_merge_bench target/release/examples/g222_floor target/release/examples/g222_wake_probe "$W/"
           echo "runner cpus $(sysctl -n hw.ncpu)"; sw_vers 2>/dev/null || true
-      - name: The wake probe with the race, every variant, three passes in rotating order
+          for arm in $ARMS; do
+            s="${arm:0:9}"; mkdir -p "$W/src-$s" "$W/bin-$s"
+            git archive --format=tar "$arm" | tar -xmf - -C "$W/src-$s"
+            ( cd "$W/src-$s" && CARGO_TARGET_DIR="$W/target-$s" cargo build --release --locked -p slates-client --example edit_merge_bench --example g222_floor ) > "$W/logs/build-$s.log" 2>&1 \
+              || { tail -40 "$W/logs/build-$s.log"; exit 1; }
+            cp "$W/target-$s/release/examples/edit_merge_bench" "$W/target-$s/release/examples/g222_floor" "$W/bin-$s/"
+            rm -rf "$W/target-$s"
+          done
+      - name: Rounds, arms alternating, each a quiet run and a stamped loaded run with the control beside it
         run: |
           W="$RUNNER_TEMP/msr"; set +e
-          T="PROBE_WAKER_TB=1 PROBE_WAITER_TB=1 PROBE_SHARED=1"
-          V=(
-            "PROBE_MECH=ulock $T|2"
-            "PROBE_MECH=ulock $T PROBE_SETTLE_NS=0|2"
-            "PROBE_MECH=ulock $T PROBE_JITTER_NS=20000|2"
-            "PROBE_MECH=ulock $T PROBE_SETTLE_NS=0 PROBE_WAKERS=1|2"
-            "PROBE_MECH=ulock $T PROBE_SETTLE_NS=0|0"
-            "PROBE_MECH=ulock $T PROBE_JITTER_NS=20000 PROBE_SHM=1 PROBE_WRITE_KB=64|2"
-            "PROBE_MECH=sem $T PROBE_SETTLE_NS=0|2"
-            "PROBE_MECH=sem $T PROBE_JITTER_NS=20000|2"
-            "PROBE_MECH=pipe $T PROBE_SETTLE_NS=0|2"
-            "PROBE_MECH=pipe $T PROBE_JITTER_NS=20000|2"
-          )
-          for pass in 1 2 3; do
-            n=${#V[@]}
-            for k in $(seq 0 $((n - 1))); do
-              v="${V[$(( (k + pass * 3) % n ))]}"; envs="${v%|*}"; spin="${v#*|}"
-              echo "== pass $pass: $envs spinners $spin"
-              env $envs perl -e 'alarm shift; exec @ARGV' 300 "$W/g222_wake_probe" 10000 "$spin" 2>&1 | tail -2 | tee -a "$W/logs/probe.log"
+          for round in $(seq 1 "$ROUNDS"); do
+            if [ $((round % 2)) -eq 1 ]; then ORDER="$ARMS"; else ORDER="$(echo $ARMS | awk '{print $2, $1}')"; fi
+            for arm in $ORDER; do
+              s="${arm:0:9}"
+              Q="$W/logs/quiet-$s-r$round.log"
+              perl -e 'alarm shift; exec @ARGV' 900 "$W/bin-$s/edit_merge_bench" --quiet-only --files 10 --form accept --form conflict </dev/null > "$Q" 2>&1
+              echo "== quiet $s r$round exit $?"; grep -E "^goal" "$Q" | cut -c1-200
+              L="$W/logs/loaded-$s-r$round.log"; F="$W/logs/floor-$s-r$round.log"
+              echo "== loaded $s r$round $(date -u +%FT%TZ) load: $(uptime)" | tee "$L"
+              ( while [ ! -e "$W/logs/done-$s-r$round" ]; do G222_FLOOR_TB=50000 "$W/bin-$s/g222_floor" 20000 0; done ) > "$F" 2>&1 &
+              CONTROL=$!
+              G222_DIAG="$W/logs/loaded-$s-r$round.tsv" perl -e 'alarm shift; exec @ARGV' 1500 "$W/bin-$s/edit_merge_bench" --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict </dev/null >> "$L" 2>&1
+              echo "exit $?" >> "$L"; touch "$W/logs/done-$s-r$round"; wait $CONTROL
+              grep -E "^goal|exit" "$L" | cut -c1-200
+              echo "control: p999 us $(sed -nE 's/.*p999 ([0-9.]+) us.*/\1/p' "$F" | sort -n | tr '\n' ' ' | cut -c1-160); max us $(sed -nE 's/.*max ([0-9.]+) us.*/\1/p' "$F" | sort -n | tail -1)"
+              echo "reply wakes >= 1 ms: $(awk -F'\t' '$4 ~ /^ipc:wake_one/ && $3 >= 1000000' "$W/logs/loaded-$s-r$round.tsv.polls.serves" | wc -l)"
+              python3 .github/g222/tailjoin.py "$W/logs/loaded-$s-r$round.tsv" | grep -E "timed requests|p999 tail: n|wake hops|landed -> rung" | cut -c1-260
             done
           done
-          echo "######## summary"; sort "$W/logs/probe.log" | grep "^probe"
+          true
       - name: Keep the logs
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
