@@ -677,8 +677,23 @@
 >   text asked of the changeset store off the step through the work builder's own ask, `slates_hg::push::held::TextAsk`,
 >   then put back within its lent room), counted `vcs.hg.landed_texts_brought_back`. Held by
 >   `a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and_node` (49 of 120 let go, each back
->   whole, counted once). Left: the let-go's `homes::note_landed` record and homes' `Landed::Hg` arm calling it, once
->   w-shared's types land; then the pin goes.
+>   whole, counted once). Part 2 BUILT (w-hg, over w-shared's fc42f581c and 7663054bb): once a push's entry commits
+>   (`hg_run::Run::settle`) or an import lands, each file revision's windows are noted with its (repository, path,
+>   node) on the shard (`homes::note_landed`, `Landed::Hg`; `slates_hg::filerev::FileContents` carries them in each
+>   segment, counted in the intake's bound) and let go, pinned by nothing; a window noted already keeps its note.
+>   The let-go at segment durability notes nothing, since `bring_back` reads the committed index, so a home's window
+>   stays pinned until the commit. `homes::bring_back_landed` brings an object's hg-noted windows back by
+>   `hg_push::bring_back`, once a revision. Held by `a_region_object_sharing_a_landed_files_window_is_read_whole_from_its_home`
+>   (codex-review's case through a real push: red, the home read none; now whole, one revision brought back), and the
+>   two let-go tests now asserting every window let go and noted (red with the noting off: the 71 and 1 of 5 pinned).
+>   The test-only one-call landing builds a push's works as the driver does, planned and then built over the
+>   store's read-through (`works_whole`); `Works::Whole` and the one-call `tree::work` arm are gone, and `prepare` takes
+>   the view alone. The store-made-texts oracle compares a file by the identities its row names.
+> - A refused finish's windows given back BUILT (2026-11-22, w-hg; main's routing of w-svn's sibling sweep): the
+>   intake's last step of a file text took its writer out of the intake, so a refused node check or `finish_object`
+>   dropped it with its whole windows held and nothing to read them; both now abandon it
+>   (`a_refused_finish_gives_its_written_windows_back`: red `(true, true, 2)`, now none held). The hg crate has no
+>   other `finish_object` caller.
 > - The whole history's clones spun (main 01a20182's order of 2026-11-22 10:40; CI 45037561866: 4 spins, kills and
 >   restarts a leg, at `vcs_http.rs:850` polls 1-16 and `vcs_ssh::hg::streamed_turn` polls ~11,000). Measured over the
 >   served view of a pushed 57,054-changeset line (debug, MacBook arm64, each call the unit one step takes): a clone of

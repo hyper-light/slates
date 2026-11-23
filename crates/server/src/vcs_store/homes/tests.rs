@@ -721,7 +721,14 @@ fn a_region_object_remains_readable_when_a_landed_file_shares_its_first_window()
           content.put_object(&independent).unwrap(),
         ]
       });
-    crate::repository::hg_run::let_go_landed(state, &files);
+    // As a segment lands, before its entry commits: no revision noted, so the pin is what keeps a shared window.
+    let files = files.map(|bytes| slates_hg::filerev::FileContents {
+      path: b"file".to_vec(),
+      node: [0; 20],
+      bytes,
+      block: None,
+    });
+    crate::repository::hg_run::let_go_landed(state, None, &files);
     let after = super::read_here(state, &object).map(|read| read.len());
     let freed = state
       .refusals
