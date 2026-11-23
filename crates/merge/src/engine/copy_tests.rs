@@ -2294,7 +2294,10 @@ impl Oracle {
     checkpoint: &Checkpoint,
     identities: &[[u8; 32]],
   ) -> Result<Green, TestCaseError> {
-    let mut restored = Green::restore(Origin::default(), &mut checkpoint.clone()).unwrap();
+    let mut restored =
+      Green::restore(Origin::default(), &mut checkpoint.clone()).map_err(|unrestored| {
+        TestCaseError::fail(format!("the checkpoint restores: {unrestored:?}"))
+      })?;
     let at = usize::try_from(checkpoint.version).unwrap_or(usize::MAX);
     let expected = |version: usize| identities.get(version).copied();
     prop_assert_eq!(
