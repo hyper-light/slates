@@ -605,3 +605,9 @@
   with the switch off. Full server lib 1236/1238 (content_ranges timing, svn_commit NotHeld: pre-existing).
   NEXT: main's git/git whole + verbs A/B on the lift; SSH link price parked (~/.cache/w-git-ssh-paced.patch) pending
   w-svn's yes on svn.rs EitherCommand::paced.
+
+- 2026-11-23: SSH link price LANDED 78477663c (merge df307829b; svn.rs EitherCommand::paced forward agreed with w-svn);
+  reds: late-reading client's writes heard (0 before), the svn wrapper forwards (lost before). Sliced let-go test
+  made load-proof 4fc1cea9d (merge 0ffbdb5ef): judged by the shard's own SliceTrace, not the test's wall time; red 1/6
+  under 16 spinners before, 6/6 after. Reran on w-shared's A-870 piece 2 (a9c4e7190): 426 green. NEXT: main's r222
+  (git/git whole A/B on the lift, then verbs) and the restart read-back row (w-shared votes read-through).
