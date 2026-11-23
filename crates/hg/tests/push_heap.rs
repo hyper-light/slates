@@ -321,25 +321,34 @@ fn churned(payload: &[u8]) -> u64 {
     .saturating_sub(reading)
 }
 
-/// Shape: what an edit changeset may allocate past one copy of its file's text: its rows, its bookkeeping and its share
-/// of its segment's record (measured at 10,751 B to 12,514 B over the four histories, debug, before the manifest's
-/// rebuild reused its buffer).
+/// Shape: what an edit changeset may allocate: its rows, its bookkeeping and its share of its segment's record, no copy
+/// of its file's text nor of its manifest's (measured at 10,284 B to 13,674 B over the five histories, debug, once the
+/// file's rebuild reused a buffer the push let go).
 const SLACK_BYTES: u64 = 16 << 10;
 
 /// Goal 93 (main's orders on CI 45127535742 and of 2026-11-23: name the top allocators per changeset, then cut by reuse;
-/// no allocation by design). Do: take a history of a first changeset adding a number of files, then [`EDITS`] changesets
-/// each rewriting one, sent as a client sends them (each revision a delta against the one before), into an empty index
-/// through the intake, its windows in an arena as a daemon's store keeps them, cut at [`SEGMENT`], each segment's record
-/// written; again with twice the edits; at three manifest sizes and two file sizes. Read the system path's churn per edit
-/// changeset (the two histories' difference over [`EDITS`]). Expect, at the largest manifest and the largest file, at
-/// most one copy of the file's text with [`SLACK_BYTES`], and none of the manifest's: its rebuild reuses the buffer of
-/// the manifest before the one it rests on. And at the largest file, at least the file's bytes an edit (the counter
-/// counts: a file revision is still rebuilt into its own text). Red before (2026-11-23, MacBook arm64, debug): 291,519 B
-/// an edit at a 91,200 B manifest, 3.20 copies; then 102,015 B, 1.12, a manifest rebuilt into a new buffer each edit;
-/// now 10,766 B, 0.12.
+/// no allocation by design; w-perf's attribution of Mercurial's own push, 3.76 GB of `intake::rebuilt` freed within a
+/// second, 1.07 GB of it in the [128 KiB, 256 KiB) band glibc keeps). Do: take a history of a first changeset adding a
+/// number of files, then [`EDITS`] changesets each rewriting one, sent as a client sends them (each revision a delta
+/// against the one before), into an empty index through the intake, its windows in an arena as a daemon's store keeps
+/// them, cut at [`SEGMENT`], each segment's record written; again with twice the edits; at three manifest sizes and two
+/// file sizes, one of them in that band. Read the system path's churn per edit changeset (the two histories'
+/// difference over [`EDITS`]). Expect, at the largest manifest and at each large file, at most [`SLACK_BYTES`] and less
+/// than one copy of the file's text: neither the manifest's rebuild nor the file's allocates, each reusing a buffer the
+/// push let go. Red before (2026-11-23, MacBook arm64, debug): 291,519 B an edit at a 91,200 B manifest, 3.20 copies;
+/// then 102,015 B, 1.12, a manifest rebuilt into a new buffer each edit; then a file revision rebuilt into its own text:
+/// 28,855 B an edit at a 16 KiB file (1.76 copies), and 177,497 B at a 160 KiB one (1.08) with its rebuild's buffer
+/// reused but every text of its group kept in the push's cache; now 10,284 B at the largest manifest, 12,047 B at the
+/// 16 KiB file (0.74) and 13,674 B at the 160 KiB one (0.08): the cache keeps only a text a later delta rests on.
 #[test]
 fn a_pushs_churn_per_changeset_is_its_file_alone() {
-  for (files, size) in [(100, 64), (400, 64), (1_600, 64), (100, 16 << 10)] {
+  for (files, size) in [
+    (100, 64),
+    (400, 64),
+    (1_600, 64),
+    (100, 16 << 10),
+    (4, 160 << 10),
+  ] {
     let (short_payload, manifest) = history(files, size, EDITS);
     let short = churned(&short_payload);
     let long = churned(&history(files, size, 2 * EDITS).0);
@@ -348,22 +357,22 @@ fn a_pushs_churn_per_changeset_is_its_file_alone() {
       u64::try_from(manifest).unwrap(),
       u64::try_from(size).unwrap(),
     );
-    let bound = file + SLACK_BYTES;
     println!(
       "push_heap: {files} files of {size} B, a {manifest} B manifest: an edit changeset allocates {per_edit} B \
-       ({:.2} manifests), its bound {bound} B",
-      per_edit as f64 / manifest as f64
+       ({:.2} manifests, {:.2} files)",
+      per_edit as f64 / manifest as f64,
+      per_edit as f64 / file as f64
     );
-    if size == 16 << 10 {
+    if size >= 16 << 10 {
       assert!(
-        per_edit >= file,
-        "the allocator counted an edit's file text: {per_edit} B"
+        per_edit < file,
+        "an edit changeset allocated {per_edit} B, a copy of its {file} B file's text"
       );
     }
-    if files == 1_600 || size == 16 << 10 {
+    if files == 1_600 || size >= 16 << 10 {
       assert!(
-        per_edit <= bound,
-        "an edit changeset allocated {per_edit} B, past one {file} B file and {SLACK_BYTES} B (its manifest {manifest} B)"
+        per_edit <= SLACK_BYTES,
+        "an edit changeset allocated {per_edit} B, past {SLACK_BYTES} B (its file {file} B, its manifest {manifest} B)"
       );
     }
   }

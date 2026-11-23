@@ -1,5 +1,13 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Closed (w-interop, 2026-11-23, A-874): a landing's presentation went with its presenting client, so R10's
+> three-step grant flow could not run.** CI's hermeticity suite (Linux and macOS) and the CLI's session-grant test met
+> "not found: presentation 1 (replaced, landed, or its client went away)": `slates land` presents and exits, and since
+> 076746072 its client is retired at that exit, where A-46 abandoned its presentations. Now a presentation lives until it
+> is landed, superseded (A-779) or its volume goes; the bound is unchanged
+> (`docs/bugs/2026-11-23-a-landings-presentation-went-with-its-presenting-client.md`;
+> `a_presentation_outlives_the_process_that_presented_it`, `a_presentation_goes_with_its_volume`,
+> `another_clients_presentation_still_replaces_and_the_bound_still_refuses`). Owed: the hermeticity suite rerun on CI.
 > **Closed (main, 2026-11-21, A-832): a daemon kept one file descriptor per base file it had ever read, and never closed
 > it.** kiln's daemon on adacachy reached 1,048,575 of its 1,048,576 descriptors over ~/Projects/kiln (731 worktrees)
 > and refused every open (`EMFILE`); this MacBook's held 4,574 (3,995 regular files of ~/Projects/slates). Now an
@@ -118,6 +126,16 @@
 > `content.purge_kept_short_bytes` (red-first by use: `slates-mem`
 > `arena::tests::a_free_run_under_the_discard_size_stays_resident_and_is_counted_kept_short`). OWED: arena-13's reading
 > after push-all and again after an idle pass, and the cut it names.
+> **OPEN (A-727 (d1a), w-shared; main 01a20182's rulings of 2026-11-23): region holds name their owners; what is owed.**
+> BUILT: an attempt's holds move to its records at its commit and are let go at its refusal (`homes::settle_later`), so
+> a refused push holds nothing and another repository's hold of the same object stays; the image and the home wire carry
+> owners, version 2, refusing the old forms typed. OWED (d1a-3): an attempt a crash left between homing and its end
+> (or whose settle a home did not answer, counted `vcs_store.homes.settle_unanswered`) keeps its holds until it is
+> resolved from the homes' side once its process ended, by `HomeMessage::Resolve` to its repository's current owner;
+> bounded meanwhile by the attempts a crash or a lost answer left, each one's homed objects. OWED (fleet memory, one item
+> for all three tools): a remote home keeps what it homes in RAM for the history's life, and assembles an object sent
+> in parts whole before keeping it (`homes::stage_part`: a git pack, and Subversion texts once homed): a remote home
+> should land what it keeps on its own node's store, streamed, and let it go, as this node's home does by its record.
 > **A-870 (w-shared; main 01a20182's rulings of 2026-11-22 ~22:10 and ~22:30): a shard image's content-store families
 > published and restored over turns.** Piece 1 BUILT: the families paged (`crate::image_pages`): 3,000 windows let go
 > and 3,000 landed records rode 6,000 pieces, now 17 (534,085 bytes at a 43,912-byte page), restored whole. Piece 2
@@ -839,7 +857,11 @@
 >   them; a public predecessor refuses (decision 4). The entry appends `StateChange::MarkerAdded` and checks the phases
 >   and markers logs; the served view reads the register's markers after the index's rows (`State::markers`), so a
 >   clone takes them and the filter hides what they obsolete. `markers` moved from `getbundle::Store` to `Repository`.
->   Still owed: decision 3's rewrite admission and the `obsolete` pushkey namespace. BUILT since: the reply's `N new
+>   Still owed: decision 3's rewrite admission. Not to be built: the `obsolete` pushkey namespace (2026-11-23, read in
+>   7.2's `exchange.py`): stock 7.2 pushes and pulls markers by it only where the server's bundle2 capabilities share
+>   no `obsmarkers` version (`_pushb2obsmarkers` and the pull's bundle2 prepare mark the step done otherwise, so
+>   `_pushobsolete` and `_pullobsolete` return), and this server advertises `obsmarkers=V0,V1`; only `hg debugpushkey`
+>   names it. BUILT since: the reply's `N new
 >   obsolescence markers` output; the kept heads for a view with left-out changesets (piece 2, below); a
 >   non-publishing repository and its hidden view (piece 3, below).
 >   Markers as 7.2 holds them BUILT (2026-11-23, w-hg): a repository holding a format 0 marker (an old obsstore's
@@ -932,12 +954,37 @@
 >   bytes grown holding 6,553,600, now 90,424 holding 6,029,312). The hg intake's whole texts (`intake::rebuilt`,
 >   `HgIndex::revision_text`, `Taker::file_base`; 3.52 GB of the [128 KiB, 256 KiB) band's churn with the cache's
 >   share) are w-hg's, in C1. Owed: main's arena round for RSS.
+>   The intake's rebuilt file texts cut BUILT (2026-11-23, w-hg; main's order, C1 first by bytes): a file revision was
+>   rebuilt into a buffer of its own and every text of its group kept in the push's cache until the group ended, so a
+>   push allocated each file text it brought once (`intake::rebuilt`, 3.76 GB freed within a second over Mercurial's
+>   own push, 1.07 GB in the [128 KiB, 256 KiB) band). Now the cache keeps only a text a delta past the next one rests
+>   on (`Frame::based_later`, one bit a revision told when the framing is made), and every text the intake lets go is
+>   a later rebuild's buffer (`Spares`, at most four and the cache's bound). `push_heap`'s
+>   `a_pushs_churn_per_changeset_is_its_file_alone`, red at 28,855 B an edit of a 16 KiB file (1.76 copies), 177,497 B
+>   of a 160 KiB one (1.08) with the buffer reused alone; now 12,047 B and 13,674 B (0.74, 0.08), no copy. Owed:
+>   `HgIndex::revision_text`'s buffers and `object_bytes`, then `Taker::file_base`; the 57k push's reading
+>   (`hg_push_lifetimes`, w-perf's) after them.
 >   Its bound from the work BUILT (main's ruling, 2026-11-23): the chain no longer needs its texts held, so the cache holds
 >   the distinct texts its last `waiting` reads lent (one a waiting request, the owner's room) and a chunk's room
 >   (`TextCache::for_reads`), the least lately read out first; a text past it is lent from the buffer it was made into.
 >   Grown to the longest chain before, it held 360 MB of chunks at the end of Mercurial's push. Held by
 >   `the_store_holds_the_texts_its_last_reads_lent_and_no_more` (red: bound 6,553,600 after a 400-version chain's read;
 >   now 1,064,960 for 4 reads, 384 texts let go, the latest found again unmade).
+>   REGRESSED on CI, then FIXED (2026-11-23, main's arena-13, CI 45193998198 at 85569cf25): that bound was the distinct
+>   texts of the last `clients_per_shard` x shards reads, hundreds on CI's runner, so mapped blocks resident after
+>   push-all rose from 68,661,248 to 646,410,240 bytes and stayed after idle (RSS 1,865 -> 2,235 MB on x86). The bound is
+>   now the walks in flight: the texts whose pieces are still being read, in whole chunks, and the larger of one chunk
+>   and the text a read lends, so a cache whose reads have ended holds one chunk; a walked text in a chunk given back is
+>   laid again in the newest. Held by `the_store_holds_the_walks_in_flight_not_the_reads_that_could_be_waiting` (red
+>   7,340,032 bytes reserved with room for 1,000 reads and no walk in flight; now 1,048,576) and
+>   `a_walk_in_flight_keeps_its_text_through_other_reads`. Owed: main's arena-14 on CI's runner.
+> - A Mercurial index's tail sealed by every append BUILT (2026-11-23, w-perf; w-hg's three conditions). Only an import
+>   sealed (`import::settle`), so a push's, a replay's and a made changeset's tail grew for the whole push: 56 MB of tail
+>   rows, two buffers each, still held at the end of Mercurial's push (`Index::admit` 34 MB, `table::encode_body` 22 MB).
+>   Every append's rows now go in through `HgIndex::insert`, which seals when due; import's own seal is gone. A seal the
+>   store refuses leaves the append standing and is counted (`HgIndex::seals_refused`). Held by
+>   `every_append_seals_the_tail_when_due_and_a_released_fork_gives_its_seals_back` (`crates/hg/src/tests/index.rs`: red
+>   due after group 26 of 200; now never due, the fork sealed, and its release gives its seals back).
 > - The watchdog's beat allocates nothing BUILT (2026-11-23, w-perf; main's order). A beat made 4 allocations, about
 >   1 KB by their types (estimated, not measured). `hg_push_heap`'s first read had charged the watchdog 24% of a push's
 >   sampled bytes, about 10-15 MB a second; that was its sampler's artifact (a thread's first symbol load charged to its
@@ -5266,15 +5313,34 @@
 > **A verb's reply held for durability had no time bound: refused at the failover SLO (2026-11-18, A-354, §4.10 "Live
 > shipping"; g230).** `live_ship::defer` and `defer_destroy` held a reply until its log was durable, its owner fenced or
 > its volume destroyed, so a log that could never be held (A-353's catalog refused for good) kept its writer waiting 21
-> minutes. A hold now ends at the failover SLO, refused `DurabilityPending` and recorded as the request's outcome; the
-> writer still waits through a shorter silence. Test:
-> `a_verb_held_past_the_failover_delay_took_effect_once_and_its_resend_is_answered_its_own_reply`.
+> minutes. A hold now ends at the failover SLO, refused `DurabilityPending`; the writer still waits through a shorter
+> silence. Test: `a_verb_held_past_the_failover_delay_is_in_doubt_not_done_until_durable_and_runs_once`.
 > - **CLOSED 2026-11-20 (g226; main's ruling): the given-up verb never takes effect twice.** The refusal was recorded as
 >   the request's completion, so a consumer told to make the call again ran the verb a second time over its own effect
->   (an append twice, a directory's second making refused `AlreadyExists`). The verb's own reply is now the recorded
->   completion and the refusal goes unrecorded; `slates_client` sends the request again under its id once, so its caller
->   is handed the verb's own reply. A yield's waiters (A-409) still record the refusal: their write never took effect on
->   the successor.
+>   (an append twice, a directory's second making refused `AlreadyExists`). The verb's own reply was made the recorded
+>   completion and the refusal went unrecorded; `slates_client` sends the request again under its id once. A yield's
+>   waiters (A-409) still record the refusal: their write never took effect on the successor.
+> - **FIXED 2026-11-23 (w-chaos; A-354's second amendment): that recorded reply was a success no quorum held.** An owner
+>   cut off from its peers recorded `FsDone` for each write it gave up at the failover SLO, and the client's resend was
+>   handed it: nine writes acknowledged while the owner's log stayed durable at 163, and the successor, which took over
+>   from the holders' 163, served none of them (StaleNeverCommits and NoLoss broken in the cut-off, deafened and muted
+>   flows every CI night from 2026-11-21; the nemesis's NoLoss on 2026-11-21; the unheard-destroy flows' "exited 0" on
+>   2026-11-21 and 2026-11-22). The refusal is now recorded nowhere and the request keeps its place, told, so a resend
+>   joins the wait (never run twice) and is answered the outcome once decided (its own reply only once durable); a reply
+>   held on a yielded log is decided at the bound. Record:
+>   `docs/bugs/2026-11-23-a-held-write-given-up-at-the-failover-slo-was-recorded-done.md`.
+> - **Owed (w-chaos's finding, 2026-11-23):** a told request's place, like every held reply, lives in the owner shard's
+>   memory, so a daemon restart forgets it and a resend under its id afterwards runs the verb again (a held reply's
+>   restart has had this gap since A-200). And `live_ship::join` (and its destroy half) copies the first waiter at the
+>   key's position, which may be another request's when two wait on one position, so a retry can be answered with that
+>   request's reply; found by reading, not yet by a test.
+> - **Open (w-chaos, 2026-11-23): a write held past the held-write bound, one cut-off run in ten on adacachy2.** In
+>   `an_owner_cut_off_while_running_is_superseded_and_serves_nothing_stale` at load 69, a write sent 0.18 ms before the
+>   relay isolated its owner was held 20.86 s, until the heal, and refused `StaleEpoch { current: 2 }` (the flow's bound
+>   5.71 s), and no give-up was logged in the run: the write never waited where `live_ship::judge_held` judges it, so it
+>   was held before its verb ran, or its owner's failover estimate rose past the partition. Every invariant held in that
+>   run; the other nine passed, and CI's 19 judgements of the bound held. Owed: what held it, from a run that catches it
+>   with the owner's status read throughout.
 > - **Owed (the integrator's):** live_chaos and live_fleet flows that keep a writer waiting past the failover SLO (10 s)
 >   now meet `DurabilityPending` where they waited; each flow's stops are a few liveness budgets, under it, but a flow
 >   that stops every candidate longer must treat the refusal as its write's outcome (not acknowledged, so never owed to
@@ -10905,7 +10971,12 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >       single 782 MiB claim (76 % of the runner's 1 GiB shard) is no longer admitted again at a takeover: the successor
 >       takes its candidate claim over. The same room is now met at live-ship, typed when it is not (SLATES_DESIGN A-401,
 >       "The live chaos flows, in numbers"). The runner's case, six bounded claims on one fleet, is its own flow now:
->       `a_bounded_claim_is_served_by_its_successor_or_refused_before_it_ships` (run request filed 2026-11-18). **Owed:** a
+>       `a_bounded_claim_is_served_by_its_successor_or_refused_before_it_ships` (run request filed 2026-11-18). Until
+>       2026-11-23 it sized its claims from the status's `reserve=`, the capacity a shard has claimed from the pool so far
+>       (0 on a Linux daemon that has admitted nothing), so on Linux every claim was 0 MiB and the flow never shipped (CI
+>       nightly from 2026-11-20); it reads the shard's slice through the daemon's own derivation now
+>       (`slates_server::config::reserve_per_shard`;
+>       `docs/bugs/2026-11-23-the-bounded-claim-flow-sized-its-claims-from-capacity-claimed-so-far.md`). **Owed:** a
 >       candidate that joins the placement later and cannot admit refuses its first entry `NoRoom`, but the configuration
 >       may still name it a successor. And the control shard's view of its claims can name one its partition released (a
 >       claim admitted for a message the copy then refused is released at the next reconciliation, since only copies

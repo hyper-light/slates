@@ -1193,6 +1193,12 @@ struct Awaiting {
   /// When the reply was held, on the shard's clock: past the failover SLO from then the verb is refused
   /// ([`judge_held`], A-354), and how long it was held is told with it.
   held_since_ns: u64,
+  /// Whether its client was told `DurabilityPending` at the failover SLO ([`tell_given_up`]): the verb's outcome is in
+  /// doubt, so the entry stays only to keep the request's place (a resend under its id joins it, [`join`], and never
+  /// runs the verb again) until the outcome is decided and recorded: its own reply once durable ([`resolve`]), the
+  /// fence's refusal ([`refuse_awaiting`]), the yield's ([`yielded`]) or the destroy's ([`forget`]). It delivers
+  /// nothing more and is never told again.
+  told: bool,
 }
 
 impl Awaiting {
@@ -1204,7 +1210,13 @@ impl Awaiting {
       id,
       reply,
       held_since_ns: now_ns,
+      told: false,
     }
+  }
+
+  /// The completion key of its request (§4.9): its origin and request id.
+  fn request(&self) -> (u64, u32, u32) {
+    (self.origin, self.id.client, self.id.sequence)
   }
 }
 
@@ -1703,17 +1715,25 @@ fn take_awaiting(state: &mut ShardState, volume: [u8; 16]) -> Vec<Awaiting> {
     .collect()
 }
 
-/// Answers each verb whose reply `volume`'s log has held past the failover SLO [`Refusal::DurabilityPending`] (A-354):
-/// the total bound of the rule every transport judges a held reply by (`slates_bridge_core::durable_bound`), the
-/// operator's bound on how long an object may go unserved before a takeover serves it, past which a write not yet held
-/// is past what the fleet promises. Through a shorter silence the reply still waits, as the 2026-11-05 sweep chose for
-/// the slates protocol (a writer waits, never a false success; a transport answers its own failure earlier). The
-/// verb's own reply is recorded as its completion and the refusal delivered unrecorded ([`answer_given_up`]): the verb
-/// took effect once on the owner, so its resend under the same id is answered its own reply (§4.9) and never runs it
-/// again. Until 2026-11-20 the refusal was the recorded completion and a consumer told to run the verb again under a new
-/// id ran it twice: an append landed twice (g226; main's ruling). Judged at the period's visit to the volume ([`period_volume`]). Until 2026-11-18 a held
-/// reply ended only durable, fenced or destroyed, so a log that could never be held (its holders' catalog refused for
-/// good, A-353's case) kept its writer waiting without end.
+/// Tells each verb whose reply `volume`'s log has held past the failover SLO [`Refusal::DurabilityPending`] (A-354): the
+/// total bound of the rule every transport judges a held reply by (`slates_bridge_core::durable_bound`), the operator's
+/// bound on how long an object may go unserved before a takeover serves it, past which a write not yet held is past what
+/// the fleet promises. Through a shorter silence the reply still waits, as the 2026-11-05 sweep chose for the slates
+/// protocol (a writer waits, never a false success; a transport answers its own failure earlier). The refusal is
+/// delivered and recorded nowhere, and the request keeps its place ([`tell_given_up`]): the verb took effect once on the
+/// owner, but whether it is durable is not known yet, so a resend under its id joins the wait and never runs the verb
+/// again, and its completion is recorded once its outcome is decided. A log this node yielded (A-409, [`lost`]) never
+/// becomes durable here, so a reply held on it is decided now and recorded as [`yielded`] records one. Judged at the
+/// period's visit to the volume ([`period_volume`]).
+///
+/// From 2026-11-20 to 2026-11-23 the verb's own reply was recorded here as its completion (main's ruling on g226), so
+/// the client's resend under the id was handed `FsDone` for a write no quorum held: an owner cut off from its peers
+/// answered nine writes `FsDone` after 2.2 s each while its log stayed durable at 163, and its successor, which took
+/// the volume over from the holders' 163, never had them (`live_chaos`'s partition flows, CI nightly from 2026-11-21;
+/// `docs/bugs/2026-11-23-a-held-write-given-up-at-the-failover-slo-was-recorded-done.md`). Before that the refusal was
+/// the recorded completion, and a consumer told to run the verb again under a new id ran it twice (g226). Until
+/// 2026-11-18 a held reply ended only durable, fenced or destroyed, so a log that could never be held (its holders'
+/// catalog refused for good, A-353's case) kept its writer waiting without end.
 ///
 /// [`Refusal::DurabilityPending`]: slates_ipc::protocol::Refusal::DurabilityPending
 fn judge_held(state: &mut ShardState, volume: [u8; 16]) {
@@ -1722,6 +1742,7 @@ fn judge_held(state: &mut ShardState, volume: [u8; 16]) {
   // The rule's own total ([`durable_spans`]): the failover delay, so a held verb is bounded as the transports' held
   // replies are and follows the failover estimate wherever it is published, never a number of its own.
   let bound_ns = durable_spans(state).total_ns;
+  let decided = lost(state, volume);
   let keys: Vec<([u8; 16], u64)> = state
     .live
     .awaiting
@@ -1732,27 +1753,51 @@ fn judge_held(state: &mut ShardState, volume: [u8; 16]) {
     let Some(waiting) = state.live.awaiting.remove(&key) else {
       continue;
     };
-    let (past, kept) = held_past(waiting, now, bound_ns);
+    let (past, mut kept) = held_past(waiting, now, bound_ns);
+    for (entry, held_ns) in past {
+      if !entry.told {
+        slates_machine::log_line!(
+          "slates-server: a held reply was refused after {} ms, the failover SLO (shard {}), {}: {}",
+          held_ns / NS_PER_MS,
+          state.shard,
+          outcome_word(decided),
+          durability_report(state, id, key.1)
+        );
+        state.count(LIVE_HELD_GAVE_UP, 1);
+      }
+      if decided {
+        answer(state, entry, durability_pending(held_ns));
+      } else if entry.told {
+        kept.push(entry);
+      } else {
+        let place = tell_given_up(state, entry, held_ns, &kept);
+        kept.extend(place);
+      }
+    }
     if !kept.is_empty() {
       state.live.awaiting.insert(key, kept);
-    }
-    for (entry, held_ns) in past {
-      slates_machine::log_line!(
-        "slates-server: a held reply was refused after {} ms, the failover SLO (shard {}): {}",
-        held_ns / NS_PER_MS,
-        state.shard,
-        durability_report(state, id, key.1)
-      );
-      state.count(LIVE_HELD_GAVE_UP, 1);
-      answer_given_up(state, entry, held_ns);
     }
   }
 }
 
-/// Answers each destroy this shard has held past the failover SLO for its tombstone's placement
-/// [`Refusal::DurabilityPending`] (A-354), as [`judge_held`] answers a write: the same bound, the same refusal, and the
-/// destroy's own reply recorded as its completion, so its resend is answered `Destroyed`. Judged once a record period on each shard ([`period`]); bounded by the shard's held
-/// replies ([`awaiting_bound`]).
+/// How a reply given up at the failover SLO stands, for its log line: decided when its log never becomes durable here
+/// (a yield, [`lost`]), else in doubt.
+fn outcome_word(decided: bool) -> &'static str {
+  if decided {
+    "decided: its log was yielded"
+  } else {
+    "its outcome in doubt"
+  }
+}
+
+/// Tells each destroy this shard has held past the failover SLO for its tombstone's placement
+/// [`Refusal::DurabilityPending`] (A-354), as [`judge_held`] tells a write: the same bound, the same refusal recorded
+/// nowhere, and the request's place kept, so its resend joins the wait and its completion is recorded once decided:
+/// `Destroyed` once the tombstone places ([`resolve_destroys`]), a refusal at a fence or a yield. A destroy on a log this
+/// node yielded is decided now, as [`judge_held`] decides a write. Judged once a record period on each shard
+/// ([`period`]); bounded by the shard's held replies ([`awaiting_bound`]). From 2026-11-20 to 2026-11-23 the destroy's
+/// own reply was recorded here, so its resend was answered `Destroyed` for a tombstone no quorum held (`live_chaos`'s
+/// unheard-destroy flows, CI nightly 2026-11-21 and 2026-11-22: "the unheard destroy exited 0").
 ///
 /// [`Refusal::DurabilityPending`]: slates_ipc::protocol::Refusal::DurabilityPending
 fn judge_held_destroys(state: &mut ShardState) {
@@ -1764,21 +1809,32 @@ fn judge_held_destroys(state: &mut ShardState) {
     let Some((sequence, waiting)) = state.live.destroys.remove(&volume) else {
       continue;
     };
-    let (past, kept) = held_past(waiting, now, bound_ns);
+    let decided = lost(state, volume);
+    let (past, mut kept) = held_past(waiting, now, bound_ns);
+    for (entry, held_ns) in past {
+      if !entry.told {
+        slates_machine::log_line!(
+          "slates-server: a held destroy was refused after {} ms, the failover SLO (shard {}), {}: volume {}'s \
+           tombstone at sequence {} not placed at f + 1",
+          held_ns / NS_PER_MS,
+          state.shard,
+          outcome_word(decided),
+          crate::verbs::hex_of(&volume),
+          sequence
+        );
+        state.count(DESTROY_HELD_GAVE_UP, 1);
+      }
+      if decided {
+        answer(state, entry, durability_pending(held_ns));
+      } else if entry.told {
+        kept.push(entry);
+      } else {
+        let place = tell_given_up(state, entry, held_ns, &kept);
+        kept.extend(place);
+      }
+    }
     if !kept.is_empty() {
       state.live.destroys.insert(volume, (sequence, kept));
-    }
-    for (entry, held_ns) in past {
-      slates_machine::log_line!(
-        "slates-server: a held destroy was refused after {} ms, the failover SLO (shard {}): volume {}'s tombstone at \
-         sequence {} not placed at f + 1",
-        held_ns / NS_PER_MS,
-        state.shard,
-        crate::verbs::hex_of(&volume),
-        sequence
-      );
-      state.count(DESTROY_HELD_GAVE_UP, 1);
-      answer_given_up(state, entry, held_ns);
     }
   }
 }
@@ -1794,7 +1850,7 @@ fn held_past(
   let mut first: BTreeMap<(u64, u32, u32), u64> = BTreeMap::new();
   for entry in &waiting {
     first
-      .entry((entry.origin, entry.id.client, entry.id.sequence))
+      .entry(entry.request())
       .and_modify(|since| *since = (*since).min(entry.held_since_ns))
       .or_insert(entry.held_since_ns);
   }
@@ -1802,7 +1858,7 @@ fn held_past(
   let mut kept = Vec::new();
   for entry in waiting {
     let held_ns = first
-      .get(&(entry.origin, entry.id.client, entry.id.sequence))
+      .get(&entry.request())
       .map_or(0, |since| now_ns.saturating_sub(*since));
     if held_ns >= bound_ns {
       past.push((entry, held_ns));
@@ -1990,55 +2046,56 @@ const LIVE_FENCE_UNPUBLISHED: &str = "fleet.live.fence_unpublished";
 /// Counter: a write refused `StaleEpoch` because its owner here was superseded.
 const LIVE_FENCED: &str = "fleet.live.fenced";
 
-/// Answers one waiting verb with `reply`: its completion recorded on this partition (one durable step, so a retry after
-/// meets it) and the reply delivered to its client's shard.
+/// Answers one waiting verb with `reply`, its decided outcome: its completion recorded on this partition (one durable
+/// step, so a retry after meets it) and the reply delivered to its client's shard.
 fn answer(state: &mut ShardState, entry: Awaiting, reply: slates_ipc::protocol::ReplyBody) {
-  answer_recording(state, entry, None, reply);
-}
-
-/// Answers one waiting verb past the failover SLO (A-354): its own reply recorded as its completion, so a resend under
-/// its id is answered that reply and never runs the verb again, and `DurabilityPending` delivered now, recorded nowhere,
-/// since the durability its reply claims was not reached. The verb took effect once on the owner; what was not reached
-/// is only the claim (main's ruling, 2026-11-20).
-fn answer_given_up(state: &mut ShardState, entry: Awaiting, held_ns: u64) {
-  let own = entry.reply.clone();
-  answer_recording(state, entry, Some(own), durability_pending(held_ns));
-}
-
-/// Answers one waiting verb: `recorded` (or `reply` itself when `None`) recorded as its completion on this partition, in
-/// one durable step, and `reply` delivered to its client's shard.
-fn answer_recording(
-  state: &mut ShardState,
-  entry: Awaiting,
-  recorded: Option<slates_ipc::protocol::ReplyBody>,
-  reply: slates_ipc::protocol::ReplyBody,
-) {
-  state
-    .live
-    .awaiting_by_request
-    .remove(&(entry.origin, entry.id.client, entry.id.sequence));
-  state
-    .live
-    .destroys_by_request
-    .remove(&(entry.origin, entry.id.client, entry.id.sequence));
+  let request = entry.request();
+  state.live.awaiting_by_request.remove(&request);
+  state.live.destroys_by_request.remove(&request);
   state.db.begin();
-  let recorded = match recorded {
-    Some(own) => {
-      let _ = crate::verbs::record_completion(state, entry.origin, entry.id, own);
-      reply
-    }
-    None => crate::verbs::record_completion(state, entry.origin, entry.id, reply),
-  };
+  let recorded = crate::verbs::record_completion(state, entry.origin, entry.id, reply);
   if state.db.commit(&mut state.segment).is_err() {
     state.count(LIVE_UNRECORDED, 1);
     return;
   }
   state.count(LIVE_RESOLVED, 1);
-  let Some(route) = entry.route else {
-    return;
-  };
+  if let Some(route) = entry.route {
+    hand_home(state, route, recorded);
+  }
+}
+
+/// Tells one waiting verb held past the failover SLO `DurabilityPending { held_ns }` (A-354), recorded nowhere: its
+/// effect stands on this owner, but it is not known durable, and only a durable outcome may be its completion (an owner
+/// cut off from its holders cannot tell whether a successor will ever hold its write). The entry stays as the request's
+/// place, told ([`Awaiting::told`]), so a resend under the id joins the wait ([`join`]) rather than running the verb
+/// again or reading a completion that claims what no quorum held; returned unless `kept` holds the request's place
+/// already (a retry that joined it is told and dropped).
+fn tell_given_up(
+  state: &mut ShardState,
+  mut entry: Awaiting,
+  held_ns: u64,
+  kept: &[Awaiting],
+) -> Option<Awaiting> {
+  if let Some(route) = entry.route.take() {
+    hand_home(state, route, durability_pending(held_ns));
+  }
+  let placed = kept
+    .iter()
+    .any(|other| other.told && other.request() == entry.request());
+  entry.told = true;
+  (!placed).then_some(entry)
+}
+
+/// Hands `reply` to its client's shard along `route`, counted [`LIVE_UNDELIVERED`] when the hand-off fails. It goes as
+/// recorded, so the client's shard records nothing of it (`verbs::retry_deferred`): a decided reply is recorded here
+/// already, and a told one must stay unrecorded everywhere, so its resend reaches this wait.
+fn hand_home(
+  state: &mut ShardState,
+  route: crate::merge_service::ReplyRoute,
+  reply: slates_ipc::protocol::ReplyBody,
+) {
   if crate::xshard::hand_reply_home(route.shard, move || {
-    crate::state::deliver(route.client_index, route.request, recorded, true);
+    crate::state::deliver(route.client_index, route.request, reply, true);
   })
   .is_err()
   {

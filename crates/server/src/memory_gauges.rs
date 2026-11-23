@@ -271,7 +271,12 @@ mod tests {
       let bytes: Vec<u8> = (0..window + 5)
         .map(|at| u8::try_from(at % 233).unwrap())
         .collect();
-      let (object, _) = crate::vcs_store::homes::keep_for_region(state, &bytes).unwrap();
+      let (object, _) = crate::vcs_store::homes::keep_for_region(
+        state,
+        &bytes,
+        &[crate::vcs_store::homes::TEST_OWNER],
+      )
+      .unwrap();
       let first = state
         .vcs_stores
         .content()

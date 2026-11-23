@@ -101,7 +101,7 @@ fn now_ns() -> u64 {
   u64::try_from(origin.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// A backtrace's site: its innermost three frames outside the allocator, the standard library and this test.
+/// A backtrace's site: its innermost four frames outside the allocator, the standard library and this test.
 fn site(trace: &str) -> String {
   let skip = |name: &str| {
     [
@@ -119,7 +119,11 @@ fn site(trace: &str) -> String {
       .any(|part| name.contains(part))
   };
   let short = |name: &str| {
-    let name = name.rsplit_once("::h").map_or(name, |(head, _)| head);
+    // A symbol's hash suffix is `::h` and 16 hex digits; a module named `::h…` (held, hg) is not one.
+    let name = match name.rsplit_once("::h") {
+      Some((head, hash)) if hash.len() == 16 && hash.chars().all(|c| c.is_ascii_hexdigit()) => head,
+      _ => name,
+    };
     name.chars().take(160).collect::<String>()
   };
   let frames: Vec<String> = trace
@@ -130,7 +134,7 @@ fn site(trace: &str) -> String {
       number.chars().all(|c| c.is_ascii_digit()).then_some(name)
     })
     .filter(|name| !skip(name))
-    .take(3)
+    .take(4)
     .map(short)
     .collect();
   if frames.is_empty() {
@@ -269,7 +273,7 @@ fn table(title: &str, sites: &[(String, Classes)], size_classes: &[usize], lives
     .map(|(site, classes)| (site, sum(classes), classes))
     .filter(|(_, bytes, _)| *bytes > 0)
     .collect();
-  ranked.sort_by(|left, right| right.1.cmp(&left.1));
+  ranked.sort_by_key(|(_, bytes, _)| std::cmp::Reverse(*bytes));
   let total: u64 = ranked.iter().map(|(_, bytes, _)| bytes).sum();
   println!("hg_push_lifetimes: == {title}: {total} B sampled");
   for (site, bytes, classes) in ranked.iter().take(LISTED) {

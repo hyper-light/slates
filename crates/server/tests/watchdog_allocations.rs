@@ -129,6 +129,8 @@ fn wait_beats(daemon: &Daemon, from: u64, beats: u64) -> u64 {
       "the watchdog looked {} times in {bound:?}, not {beats}",
       now - from
     );
+    // The harness paces its looks; the daemon under test waits on its wheel.
+    #[allow(clippy::disallowed_methods)]
     std::thread::sleep(Duration::from_nanos(HEARTBEAT_NS / 4));
   }
 }

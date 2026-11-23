@@ -8105,17 +8105,29 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > (`live_ship::judge_held_destroys`), answered `Refusal::DurabilityPending { held_ns }` and counted
 > `fleet.live.held_gave_up` (`fleet.destroy.held_gave_up`), with what durability lacked logged. Through a shorter
 > silence the writer still waits, as the 2026-11-05 sweep chose (a writer waits, never a false success), so a candidate
-> stopped for a few liveness budgets still answers the write when it resumes. Since 2026-11-20 (main's ruling, A-354's
-> amendment) the verb's own reply is recorded as the request's completion and the refusal is delivered unrecorded
-> (`live_ship::answer_given_up`): the verb took effect once on the owner, so its resend under the same id is answered its
-> own reply (§4.9) and a verb never takes effect twice. The client sends a `DurabilityPending` request again under its id
-> itself, once, on the sync and the async path (`slates_client::Client`), so a caller is handed that reply. A retry that
-> joined a request's wait is answered with it, judged by the request's first hold. Held by
-> `a_verb_held_past_the_failover_delay_took_effect_once_and_its_resend_is_answered_its_own_reply`
+> stopped for a few liveness budgets still answers the write when it resumes. Since 2026-11-23 (A-354's second
+> amendment) the refusal is recorded nowhere and the request keeps its place, told (`live_ship::tell_given_up`,
+> `Awaiting::told`): the verb took effect once on the owner, but whether it is durable is in doubt, and a reply may claim
+> only what `f + 1` hold (§4.8 "The three mechanisms"). A resend under the same id joins the wait, so the verb never runs
+> twice (§4.9), and is answered the outcome once it is decided and recorded: the verb's own reply once the log is
+> durable (`live_ship::resolve`), `StaleEpoch` at a fence, `DurabilityPending` at a yield, `NotFound` at a destroy; while
+> it is still in doubt, a joined retry is told `DurabilityPending` again at the next judging, judged by the request's
+> first hold. A reply held on a log its node yielded (A-409) is decided at the bound, recorded as the yield records one.
+> The client sends a `DurabilityPending` request again under its id itself, once, on the sync and the async path
+> (`slates_client::Client`), so a caller is handed the outcome if it was decided meanwhile, and `DurabilityPending`
+> while it is not. The places a told request keeps count among the shard's held replies (`awaiting_bound`). Held by
+> `a_verb_held_past_the_failover_delay_is_in_doubt_not_done_until_durable_and_runs_once`
 > (`crates/server/tests/fleet.rs`: both survivors refuse the owner's register records, so a new live volume's head never
-> places; a directory made through the raw ring is refused at the failover delay, and its resend answered `FsDone`; one
-> made through `slates_client` is answered `FsDone`; each listed once). Until then the refusal was the recorded
-> completion and a consumer told to make the call again ran the verb a second time (g226).
+> places; a directory made through the raw ring is refused at the failover delay, and its resend refused
+> `DurabilityPending` too; one made through `slates_client` is refused `DurabilityPending`; once the refusals lift, the
+> first one's resend is answered `FsDone`; each listed once) and by `crates/cli/tests/live_chaos.rs`'s partition flows
+> across real processes. From 2026-11-20 to 2026-11-23 (main's ruling on g226) the verb's own reply was recorded as the
+> request's completion at the give-up, so the client's resend was handed `FsDone` for writes no quorum held: an owner cut
+> off from its peers answered nine writes done after 2.2 s each while its log stayed durable at position 163, and its
+> successor, which adopted 163 from the holders, never had them (StaleNeverCommits and NoLoss broken in every partition
+> flow, CI nightly from 2026-11-21; `docs/bugs/2026-11-23-a-held-write-given-up-at-the-failover-slo-was-recorded-done.md`).
+> Before 2026-11-20 the refusal was the recorded completion, and a consumer told to make the call again ran the verb a
+> second time (g226).
 >
 > **Every other durability claim (2026-11-05, the sibling sweep of FUSE `fsync`).** Each place a client is told data is
 > durable on a live volume now waits for the position its barrier published, and the same failing test holds each to
@@ -10924,6 +10936,11 @@ stays in the overlay.
 > dropped by the reaper (`crates/client/tests/presentation.rs`; it outlived the client before), and a
 > presentation past the bound is refused with nothing allocated or recorded. Record:
 > `docs/bugs/2026-09-29-landing-presentations-were-never-consumed-or-bounded.md`.
+>
+> **Corrected 2026-11-23 (A-874).** A presentation is no longer abandoned with its client: it lives until it is
+> landed, superseded (A-779) or its volume goes. "Abandoned with its client" broke R10's own three-step flow (present,
+> a person's grant, land under it, each its own CLI process) once a client was reclaimed at its hang-up (076746072);
+> the bound is unchanged.
 >
 > **Reconciled 2026-11-06 (VFS plan Step 15).** The shard-step percentile lane is built (b111244e; AUD-29-25 closed).
 
@@ -19326,6 +19343,8 @@ state change; `config.rs`: `landings_awaiting_per_shard`; `reap.rs`: abandonment
   audit log and the id counter unchanged.
 - What it does not change: the grant's own lifecycle (its states, its term) and the grant verb; durable
   presentation records written before this change; the unpruned grant table (its own gap).
+- **Corrected by A-874 (2026-11-23):** the rule "retiring a client abandons its presentations on every owner shard" is
+  withdrawn; a presentation outlives its client, and goes with its volume instead.
 
 ### A-47 — One host target has one landing lease, owned by the control partition and fenced by its term (2026-09-29)
 Applied in the same change to: §4.15 (the data model, "Ownership facts", step 4, the failure matrix, its
@@ -33598,6 +33617,29 @@ the test (renamed `a_verb_held_past_the_failover_delay_took_effect_once_and_its_
 - **The rule.** A held reply waits through a silence and is refused at the total bound of the durable-wait rule, the
   failover SLO from its hold: the operator's bound on how long an object may go unserved before a takeover serves it,
   past which a write not yet held is past what the fleet promises. The refusal is the request's recorded outcome.
+
+**Amended again 2026-11-23 (w-chaos, the live_chaos nightly reds): nothing is recorded done before it is durable.** The
+2026-11-20 amendment broke StaleNeverCommits and NoLoss. At the failover delay an owner cannot tell whether its held
+write will ever be held at `f + 1`: one cut off from its peers never learns that a successor took the volume over from
+the holders' head. Recording the verb's own reply then, the client's resend was handed `FsDone` for writes no quorum
+held. Measured on adacachy2 (2026-11-23, `an_owner_cut_off_while_running_is_superseded_and_serves_nothing_stale`, the
+release build of main 05e9bb698): the cut-off owner gave up nine held replies at 2,204–2,678 ms, each logged with its
+log durable at 163, both holders at 163 and no fence, and its clients were told all nine writes succeeded; the
+successor took the volume over at 1.98 s from 163 and answered each `NotFound`. The same flow failed on CI's two Linux
+runners every night from 2026-11-21, as did its deafened and muted siblings, the nemesis once (NoLoss, 2026-11-21) and
+the unheard-destroy flows twice ("the unheard destroy exited 0": a destroy's resend was answered `Destroyed` for a
+tombstone no quorum held). Now the refusal is recorded nowhere and the request keeps its place, told
+(`live_ship::tell_given_up`, `Awaiting::told`), so a resend joins the wait and never runs the verb again (g226's finding
+stays fixed), and the completion is recorded only once decided: the verb's own reply at durability, `StaleEpoch` at a
+fence, `DurabilityPending` at a yield, `NotFound` at a destroy. A reply held on a log its node yielded is decided at the
+bound. The told places count among the shard's held replies, so they are bounded by `awaiting_bound`, refused
+`Overloaded` at it. Owed: a told place lives in memory, as every held reply does, so a daemon's restart forgets it and
+a resend after the restart runs the verb again (GAPS). Applied in the same change to: §4.10's status,
+`crates/server/src/live_ship.rs` (`answer_given_up` and its recording override removed), `crates/client/src/client.rs`,
+`crates/api/src/error.rs`, `crates/ipc/src/protocol.rs` (the docs of `DurabilityPending`), the test (renamed
+`a_verb_held_past_the_failover_delay_is_in_doubt_not_done_until_durable_and_runs_once`, red first: its
+resend answered `FsDone` while nothing was durable), GAPS, and
+`docs/bugs/2026-11-23-a-held-write-given-up-at-the-failover-slo-was-recorded-done.md`.
 
 
 ### A-361 — Windows' own window: a blocked completion-port wait raised a level, R9's floor on every platform, and every idle spin under the watchdog's window (2026-11-18, goal g234; A-223's open item (C); the regression of g258's now-x86 lane; the supervisor's guard "an idle shard polling for work is not a wedged shard")
@@ -55728,6 +55770,41 @@ Applied in the same change to: GAPS (§4.17). Status: designed; slices (a1) to (
   same bytes by its identity).
 
 
+- **Slice (d), a holder's replica reads named content (2026-11-23, w-shared; main 01a20182's rulings of 2026-11-23).**
+  A Subversion green could not be taken over: its checkpoint (A-869) and chain (A-760) name their texts, and a holder's
+  replica read none (`merge.replica.checkpoint_unread`). A holder's texts come from **the region's homes**, the one path
+  for version-control content (rejected: shipping changesets to the holders' node stores, a second replication path;
+  the checkpoint carrying the texts again, what A-869 took out). Built as (d1a) the homes' owners, (d1b) Subversion's
+  homing on them, (d2) one read stage before every replica apply, (d3) the live recompute and the takeover.
+  - **(d1a) A region hold names its owners** (`slates_cluster::homes::HomeOwner`, main's rulings (b) and (ii)): the
+    attempt in flight that homed it (its repository, the member and process running it: since SWIM's
+    incarnation starts over at each start and a warm restart keeps the boot nonce, the process's nonce; and its number
+    there, `homes::attempt_owner`), then its repository's
+    records once the attempt's entry commits. `homes::REGION_HELD` keeps each object's owners: one content-store hold
+    however many, a keep idempotent per (object, owner) so a retry stays flat, the bytes given back with the last owner.
+    An attempt's end is settled by one task a shard off the step (`homes::settle_later`): its record committed moves
+    each of its holds to the records at every home (`HomeMessage::Moved`); refused, it lets them go (`LetGo` naming the
+    owner), so another repository's hold of the same object is untouched. git's push and the server's made commits
+    take an attempt at their homing's first ask (`SealedPush::home_owner`), move at `vcs_store::commit`, release at every
+    refusal after homing (`release_homed`, `release_unhomed`); the healer re-offers an object for every owner its hold
+    has. Derived bound: an object's owners are at most the attempts in flight on the repositories that home it (one each,
+    a repository's landing turn admitting one) and those repositories' records. **No old form is read:** the image
+    carries a region hold as kind 20, its owners after its identity; the ownerless kind 14 is refused at a restore,
+    typed (`HeldRefused::Retired`); the home wire leads every message with a version byte (`homes::VERSION`, version 2),
+    and a message of another version, version 1 included, is refused at once and typed: a home answers it
+    `HomeRefusal::Version` (counted `vcs_store.homes.version_refused`), and a sender drops a reply refusing its version
+    or one it cannot read (counted `reply_other_version`), so its homing fails at once, never at its deadline (every
+    request on a record session is answered, `fleet`'s stream dispatch; a version-1 peer's answer to a version-2 message
+    is empty, read as failed at once too). **So a region whose nodes run different home-wire versions homes nothing, and its commits are refused typed
+    until its nodes match: there is no mixed-version homing.** Owed in (d1a-3): an attempt a crash left between the
+    two is resolved from the homes' side once its process has ended (its member dead, or announcing another process nonce),
+    asking the repository's current owner whether a record names the object (`HomeMessage::Resolve`), never on a timer;
+    until then its hold stays, the safe side. Tests: `homes::tests::a_region_hold_is_kept_once_per_owner_and_goes_with_its_last_owner`,
+    `a_region_holds_owners_ride_the_image_and_the_ownerless_kind_is_refused`, `a_home_message_of_another_version_is_refused_at_once_and_typed`,
+    `git_push::tests::t_a727_d1a_a_push_refused_after_its_names_were_homed_leaves_no_hold_in_the_region` (red first: the
+    names' hold stayed for the home's life), `t_a727_d1a_a_refused_push_leaves_another_repositorys_hold_of_the_same_object`,
+    and slates-cluster `homes::tests::a_home_message_of_another_version_or_without_an_owner_is_refused_typed`.
+
 ### A-664 Subversion objects — A version a work submits to a Subversion repository's green becomes the revision the server makes of it (bug, 2026-11-20, w-shared for UI goal 93)
 - **What was there.** A submitted version moved a Subversion repository's one green and made no revision, so the
   green passed its records' youngest revision: every later `svn commit` was refused (its step lands only while the
@@ -61494,3 +61571,25 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
 - **Applied in the same change to** `crates/merge` (`dims`, `engine`, `engine/{copy,branch,copy_checkpoint}`,
   `identity` docs, `tests/origin.rs`, `tests/identity.golden`), `crates/anchor` (`layout`, `tests/anchor.rs`),
   `crates/vcs` (`ContentStore::object_id`'s doc), GAPS, amendments.tsv.
+
+### A-874 — A landing's presentation outlives the client that presented it, and goes with its volume (2026-11-23, w-interop; main 01a20182's ruling of 2026-11-23; corrects A-46 and AUD-29-07; A-779)
+Applied in the same change to: §4.15 (step 3's status), `slates-server` (`reap.rs`: no abandonment at a client's
+retirement; `landing.rs`: `abandon_presentations` removed, `forget_presentations_of`, `Awaiting`'s docs; `verbs.rs`'s
+`destroy`; `landing_entries.rs` and `session_log.rs`' docs), `slates-api` (`Missing::Presentation`'s words), the tests
+(`crates/client/tests/presentation.rs` replaced; `crates/server/tests/presentations.rs`), and GAPS.
+- Why: R10's documented flow is three processes: `slates land` presents and exits, a person runs `slates grant
+  LANDING MANIFEST`, and `slates land --grant` lands. A-46 abandoned a client's presentations at its retirement, and
+  since 076746072 (2026-11-18) a client is retired at its hang-up, the moment its process exits. So the grant always
+  found the presentation gone ("not found: presentation 1 (replaced, landed, or its client went away)"): CI's
+  hermeticity lane on Linux and macOS, and the CLI's own `a_session_grant_auto_approves_the_next_landing_and_stops_at_its_target`
+  (`docs/bugs/2026-11-23-a-landings-presentation-went-with-its-presenting-client.md`). Before 076746072 a dead CLI
+  client lingered until a lapse, which hid it.
+- The rule: a presentation describes a volume's changes against a target, not the process that asked. It lives until
+  it is landed (consumed, A-46), superseded by any client's presentation of the same volume and target (A-779), or its
+  volume is destroyed; nothing time-based ends it (an expiry could drop it while a person reviews it).
+- The bound is unchanged (banned item 8): one presentation per volume and target, and `LandingsAwaitingFull`, typed,
+  at the derived `landings_awaiting_per_shard`.
+- Evidence: `a_presentation_outlives_the_process_that_presented_it` (a real presenter process exits and is reaped,
+  then another client grants and lands; refused `NotFound` before), `a_presentation_goes_with_its_volume` (one
+  awaiting after a destroy before, none after), `another_clients_presentation_still_replaces_and_the_bound_still_refuses`,
+  and the CLI's session-grant test, red before and green after.
