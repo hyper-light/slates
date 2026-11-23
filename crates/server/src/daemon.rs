@@ -5509,11 +5509,25 @@ fn give_back_slice(s: &ShardState) -> usize {
   s.give_back_rate.slice_bytes.max(page)
 }
 
-/// The shard thread's own CPU clock now, nanoseconds (`slates_rt::registry::calling_thread_cpu`, the clock the
-/// watchdog reads): what a give-back step is timed by, since a loaded host stretches the wall time a step takes and
-/// not the CPU it spends. `None` where the platform reads none.
+/// The shard thread's own CPU time now, nanoseconds, to the nanosecond: what a give-back step is timed by, since a
+/// loaded host stretches the wall time a step takes and not the CPU it spends (A-491). Linux and macOS: the thread's
+/// CPU clock (`slates_rt::registry::calling_thread_cpu`, the clock the watchdog reads). `None` where the platform reads
+/// none.
+#[cfg(not(windows))]
 fn shard_thread_cpu_ns() -> Option<u64> {
   registry::calling_thread_cpu().map(|reading| reading.spent_ns)
+}
+
+/// [`shard_thread_cpu_ns`] on Windows: the thread's cycles at the rate measured once a process, before any shard runs
+/// (`slates_machine::own_cpu`, the clock the long-poll attribution reads, A-871). The thread time Windows keeps
+/// (`GetThreadTimes`) is charged a scheduler tick at a time, about 15.6 ms, so a give-back step of a few microseconds
+/// read no CPU unless a tick fell inside it, and taught nothing ([`GiveBackRate::fold`]): until 2026-11-23 the slice
+/// stayed a page, and an idle shard's give-back of its emptied write log, opened over the whole area a predecessor may
+/// have written, never ended while its passes were cut short (CI's windows-latest, diag run 45238179939: 332 one-page
+/// steps in the first pass, then one a pass).
+#[cfg(windows)]
+fn shard_thread_cpu_ns() -> Option<u64> {
+  slates_machine::own_cpu::own_cpu_ns()
 }
 
 /// The CPU a step spent between the readings `started` and `ended`, `None` unless both were read.
@@ -5550,9 +5564,9 @@ pub(crate) struct GiveBackRate {
 impl GiveBackRate {
   /// Folds one step that walked `walked` bytes and spent `spent` nanoseconds of its shard thread's CPU (`None` where
   /// the thread's clock reads nothing), learning the slice, the bytes one `quantum_ns` of that CPU walks, once the
-  /// steps folded since the last have spent CPU the clock shows. A clock coarser than a step (Windows charges thread
-  /// time a scheduler tick at a time) shows most steps' CPU as none and one step's as a whole tick, so the steps are
-  /// folded until one shows any: their bytes over the CPU shown.
+  /// steps folded since the last have spent CPU the clock shows. A clock coarser than a step shows most steps' CPU as
+  /// none and one step's as a whole tick, so the steps are folded until one shows any: their bytes over the CPU shown.
+  /// Every platform's clock is finer than a step now ([`shard_thread_cpu_ns`]; Windows' since 2026-11-23).
   pub(crate) fn fold(&mut self, walked: usize, spent: Option<u64>, quantum_ns: u64) {
     let Some(spent) = spent.filter(|_| walked > 0) else {
       return;
