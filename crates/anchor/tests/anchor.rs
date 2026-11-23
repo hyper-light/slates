@@ -2345,3 +2345,37 @@ fn a_daemon_killed_mid_publication_leaves_its_successor_the_anchors_profile() {
      not {REFUSED})"
   );
 }
+
+/// A-873 (A-760 (b) piece 4a; the anchor's layout 19; main 01a20182's ruling (I): replace, do not layer). Do: create a
+/// segment, write layout 18 into its header's version word, and attach to it. Expect: the attach refused as a wrong
+/// layout version, typed, never a panic. Layout 19's head identity hashes each file's digest where layout 18's hashed its
+/// bytes, so every identity a layout-18 segment records (chain entries, checkpoints' head checks, merge records, the
+/// ledger) would fence the green it names as diverged; the layout refuses the whole segment once, before anything is
+/// served. Before the change layout 18 was the current one, and the attach succeeded.
+#[test]
+fn a_segment_from_before_digest_identities_is_refused_at_start() {
+  use slates_anchor::layout::AT_VERSION;
+  /// Format: the layout before a file's identity entry hashed its digest.
+  const BEFORE_DIGEST_IDENTITIES: u32 = 18;
+  let name = format!("slates-anchor-byte-identities-{}", std::process::id());
+  let segment = AnchorSegment::create(&name, &identity(), geometry()).unwrap();
+  let (handoff, len) = handoff_of(&segment);
+  let header = slates_mem::Words::new().with(slates_mem::WordRun::one(
+    slates_anchor::layout::AT_GENERATION,
+    slates_mem::Width::U64,
+  ));
+  let mut mapping = slates_mem::SparseObject::open(&handoff, len, header).unwrap();
+  mapping
+    .write(AT_VERSION, &BEFORE_DIGEST_IDENTITIES.to_le_bytes())
+    .unwrap();
+  let result = AnchorSegment::attach(&handoff, len, &identity());
+  assert!(
+    matches!(
+      result,
+      Err(AnchorError::Layout {
+        reason: "wrong layout version"
+      })
+    ),
+    "a segment from before digest identities is refused at start: {result:?}"
+  );
+}

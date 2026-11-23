@@ -127,7 +127,7 @@ fn strip(name: &[u8]) -> &[u8] {
 }
 
 /// `hex` decoded as Python's `binascii.unhexlify` decodes it: an even number of hexadecimal digits in either case.
-fn unhexlify(hex: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn unhexlify(hex: &[u8]) -> Option<Vec<u8>> {
   let (pairs, []) = hex.as_chunks::<2>() else {
     return None;
   };

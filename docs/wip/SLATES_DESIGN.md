@@ -8972,9 +8972,10 @@ entry is sent on as it lies (A-859 part B).
 
 > **Status (2026-11-22, A-859 part A).** A git fetch priced a byte at memcpy's 0.14 ns, so nothing
 > it encoded deflated or deltified: git/git's clone went 3-4 GiB where stock's pack is ~300 MB. Now a
-> fetched byte is priced at its link as above, cold at deflate's measured break-even. Owed (GAPS):
-> the SSH edge's link (its writes are not yet heard, so SSH fetches price cold), a price per client
-> rather than per shard, and the archive's own question below.
+> fetched byte is priced at its link as above, cold at deflate's measured break-even, learned from
+> the HTTP edge's writes and the SSH edge's alike (each socket write's time and whether it waited,
+> told the git command the connection carries). Owed (GAPS): a price per client rather than per
+> shard, and the archive's own question below.
 
 > **Status (2026-10-20).** The cost model above ran with no inputs in some builds and not
 > others until this date. The boot profile's codec probe was compiled out wherever
@@ -61312,7 +61313,7 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
   constant. A checkpoint plans every family afresh (`content_holder::paged_image`); a delta re-encodes only the pages
   its changes lie in, read back from the source maps by range (`ContentStore::{lists_in, names_in, aways_in}`,
   `ChunkWindows::pieces_in`, `homes::{region_held_in, landed_in}`), and the directories it leaves are adopted at its
-  commit (`content_holder::pages_committed`). A recovered image's page keys are its directory; a coordinate in no page
+  commit (since piece 2, the encoder's committed cut, `content_holder::image_committed`). A recovered image's page keys are its directory; a coordinate in no page
   takes the largest aligned page its neighbours leave. An image from before A-870, which kept an entry a piece, has
   those keys removed by the next delta, once. The publication oracle (`verbs::committed_held_agrees`) compares images
   entry by entry (`content_holder::expanded`), since pages differ by the history that made them.
@@ -61324,6 +61325,47 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
   image equals the shard's entry by entry. `pages_cover_their_coordinates_and_hold_at_most_the_page_size` (200
   generated plans) and `a_page_piece_reads_back_its_entries_and_refuses_what_no_page_wrote` (every cut, a count past the
   bytes, another version). The pieces' encode is still one call per publication: piece 2 bounds it.
+- **Piece 2, the encoder (BUILT; main 01a20182's ruling of 2026-11-23, options (a)-(d)).** `image_pages::Encoder` keeps
+  the last committed cut (each page's bytes), the working directories, the pages re-encoded since, and the dirty pages.
+  A publication first takes the changes since into dirty pages (`content_holder::image_drain`, the encoder their one
+  reader) and runs one turn (`image_turn`: dirty pages re-encoded from the source maps until the copy slice is spent,
+  at least one page). Where nothing is dirty after it, the publication carries the re-encoded pages, and they and the
+  committed ones are the shard's entries at that moment exactly (`content_holder::image_cut`). Otherwise it carries the
+  committed cut again, so an image is always one moment's cut, never a mix of two. It is then counted skipped
+  (`vcs_store.image.publications_skipped`), every block the arena would free at its commit is kept
+  (`capture_deferred`, A-64: the cut may name it; kept whole, a selective keep only if the counters show deferred
+  frees matter), and the publication is owed: a task encodes a turn a yield (`image_catch_up`) and publishes once
+  caught up. Homes tickets count durable only at a publication that carried the encoder's cut (`image_committed`).
+  **The progress rule.** An owed publication's bound is twice the pages dirty when it was owed, plus one, in turns
+  (`Encoder::skipped`). Past it, elective changes pause (`content_holder::image_paused`, counted
+  `vcs_store.image.pauses`): git's landed-pack let-go queue a slice at a time, hg's committed let-go a turn at a time,
+  and hg's per-segment let-go in a push (skipped; the run's committed let-go covers those texts). A paused task waits
+  on `content_holder::image_resumed`, which the publication carrying the cut wakes (`Encoder::committed`), never a
+  timer, so no queued pack is stranded. Not paused: a fetch look-ahead's let-go of a window its own read brought back
+  (`vcs_store::let_go_read`), and puts and bring-backs, which are not elective. An hg push's reply awaits its committed
+  let-go, so a paused shard delays it until the catch-up publication. Counters: `vcs_store.image.{publications_skipped,
+  longest_lag_turns, pauses, encode_turns, encoded_bytes, longest_turn_bytes, catch_up_refused}`, and the progress
+  rule's assumption measured (main's addition of 2026-11-23): `paused_turns`, `paused_encoded_bytes` and
+  `paused_imposed_bytes`, the last the bytes of pages the never-paused changes first dirtied in a pause
+  (`Encoder::dirtied_paused`), so a round reads the encoder's bytes a turn against theirs.
+- **Evidence (piece 2).** `image_pages::tests::a_publication_encodes_at_most_a_slice_in_its_step_and_its_cuts_catch_up`:
+  at a 4,096-byte page, red before the encoder (one publication's step encoded 1,068,980 bytes), now at most three page
+  sizes a step, and the committed image catches up with the shard. The oracle,
+  `generated_histories_restore_one_committed_cut_reuse_no_named_block_and_keep_their_lag_bound`: six generated
+  histories of puts, let-gos, bring-backs, turns, publications and crashes (a restart's read of the committed journal),
+  the first continuous (a change, a turn and a publication every step). At every publication and crash a restart reads
+  the shard's entries at the last publication that carried the cut, entry for entry; no window that image names has its
+  block held by another window now; the owed lag stays within its allowance; once the changes stop, the cut catches up.
+  Some history pauses, and the images name windows (neither check vacuous); the paused counters move and the
+  never-paused changes' bytes stay within those encoded. `a_paused_encoder_wakes_its_waiting_tasks_at_the_publication_that_carries_its_cut`:
+  a task's waker kept once, untouched by a publication of the older cut, woken once by the one that carries the
+  encoder's (w-git's catch: a let-go task that ended while packs were queued stranded them). Ported: piece 1's delta test runs the
+  encoder's turns before each publication; `homes::tests::a_committed_publication_publishes_the_tickets_of_windows_kept_before_it`
+  shows a publication of an older cut leaving the ticket unpublished.
+- **Limit (piece 2, GAPS).** The bound is kept only while the encoder outpaces the changes that never pause (puts,
+  bring-backs): each turn encodes at least one page, so the lag past the bound is at most the pages dirty when the
+  pause began plus those such changes dirty since, plus two (the oracle's allowance). A shard runs a turn each yield, many
+  a publication, so a put stream that outpaces it is a measurement owed, not seen.
 
 ### A-871 — On Windows the OS places every shard, and a client waits for its reply one level above normal (2026-11-23, main 01a20182; goal 84a; A-361, A-834, A-831, A-41, A-208)
 
@@ -61398,3 +61440,46 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
 - **Applied in the same change to:** `crates/machine/src/round_robin.rs` (new), `crates/rt/src/runtime.rs` and
   `crates/rt/src/shard.rs` (the shard's class and `parks_at_once`), `unsafe-budget.toml` (slates-machine 105 -> 108),
   §4.3 (the drivers paragraph), GAPS (84a, Linux), BENCHMARKS ("84a on Linux bare metal").
+- **Through the kernel's own calls (main 01a20182, 2026-11-23).** The class is set and read with
+  `SYS_sched_setscheduler` and `SYS_sched_getscheduler`, and the parameter is the kernel's one-priority
+  `struct sched_param`. musl's `sched_setscheduler` and `sched_getscheduler` answer `ENOSYS` without asking the kernel
+  (musl `src/sched/sched_setscheduler.c` and `sched_getscheduler.c`, read 2026-11-23). The release ships static musl
+  binaries for Linux, so through the C library no shard there could take the class. libc 0.2.189's musl
+  `sched_param` also no longer builds from its one public field, which is what CI's musl cross lint refused (run
+  45176536354). Held by the same test, now passing for x86_64 glibc and musl on adacachy2 (`RLIMIT_RTPRIO` 99).
+  Applied in the same change to: `crates/machine/src/round_robin.rs`, GAPS (84a, Linux).
+
+### A-873 — A green's identity entry for a file hashes its digest, not its bytes (2026-11-23, w-svn; main 01a20182's ruling (I) of 2026-11-22, goal 93; A-760 (b) piece 4a of 4; A-202, A-866, A-869)
+
+- **Why.** Piece 4 makes a file held by a content-plane object hold no bytes of its own. The head identity (A-202,
+  LtHash16) took each file's entry over its path and its whole bytes (`engine::file_entry`), and the lazy fold read an
+  older version's bytes from the history, so a block without bytes could neither add nor remove its entry. Of the three
+  ways out (`inbox/main-from-w-svn-a760b-piece4-design.md` on the fan-out ledger), main ruled (I): the entry hashes a
+  digest each block keeps. No identity step reads a file's bytes, a file's bytes are hashed once where they were hashed
+  at every add and remove, and before release a stored format may break: replace, do not layer.
+- **The entry.** A file's identity entry is its tag, its path (length-prefixed), its length (eight bytes, little-endian)
+  and the plain BLAKE3 of its bytes (32 bytes). Each block keeps that digest (`dims::Blocks::digest`), made once with
+  it. A block named for an object takes the object's identity hash, which is the plain BLAKE3 of its bytes
+  (`named::Identity`; `ContentStore::object_id` names every object by its plain BLAKE3 whatever its length or the
+  store's window, so the same bytes are one identity on every machine: R8). A staged block whose bytes grow keeps
+  none, and is hashed when asked.
+- **Where each entry comes from.** A current file's entry comes from its block's digest: an origin's seeding, a commit's
+  mark, the fold's head side, a restore's placement, a removal (the digest read before the file is taken away). An
+  older version's bytes read from the history, a copy's fix and a branch's revert are hashed as read
+  (`engine::file_entry_of`). The from-scratch oracle (`Green::head_identity_from_scratch`) hashes every file's bytes
+  itself, never a block's digest, so a digest made wrong shows as a difference; `crates/merge/tests/identity.rs` holds
+  the incremental sum to it after every step of generated histories.
+- **Goldens and determinism.** The golden head identities moved to `crates/merge/tests/identity.golden`, written by an
+  ignored writer (`--ignored regenerate_the_identity_golden_vectors`) and read by
+  `the_head_identity_is_deterministic_and_matches_its_golden_vector`. That test builds every vector twice and compares
+  them byte for byte before the golden. The vectors are the fixed origin (`a1517630…`, was `d6caa322…` under A-202's
+  entry), the same after an overwrite, and a green holding one file made of a named run, whose identity must equal a
+  green's holding the same bytes carried.
+- **The format break.** Every green's identity changed, and with it every identity recorded before: chain entries,
+  checkpoints' head checks, merge records, the ledger's values. These records store an identity as the engine made it,
+  so none changes shape; a segment of layout 18 is refused at adoption, typed (`AnchorError::Layout`, the anchor's
+  layout 19, `a_segment_from_before_digest_identities_is_refused_at_start`), as A-626's checkpoint version 4 to 5 was.
+- **Not yet.** No byte is dropped in this piece (4b-4d).
+- **Applied in the same change to** `crates/merge` (`dims`, `engine`, `engine/{copy,branch,copy_checkpoint}`,
+  `identity` docs, `tests/origin.rs`, `tests/identity.golden`), `crates/anchor` (`layout`, `tests/anchor.rs`),
+  `crates/vcs` (`ContentStore::object_id`'s doc), GAPS, amendments.tsv.

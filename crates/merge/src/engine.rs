@@ -825,10 +825,24 @@ fn special_entry(path: &str, node: &SpecialNode) -> crate::identity::Entry {
 }
 
 /// A file's identity entry: its tag, path and bytes.
-fn file_entry(path: &str, bytes: &[u8]) -> crate::identity::Entry {
+fn file_entry(path: &str, (len, digest): (u64, [u8; 32])) -> crate::identity::Entry {
   crate::identity::Entry::new(IDENTITY_TAG_FILE)
     .field(path.as_bytes())
-    .field(bytes)
+    .fixed(&len.to_le_bytes())
+    .fixed(&digest)
+}
+
+/// [`file_entry`] of a file holding `bytes`: their length and plain BLAKE3, hashed now (an older version's bytes read from
+/// the history, an origin's, a copy's fix, the from-scratch oracle). A current file's comes from its block
+/// (`dims::Files::digest_of`), made once with it.
+fn file_entry_of(path: &str, bytes: &[u8]) -> crate::identity::Entry {
+  file_entry(
+    path,
+    (
+      u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+      *blake3::hash(bytes).as_bytes(),
+    ),
+  )
 }
 
 /// A directory's identity entry: its tag and path.
@@ -906,8 +920,11 @@ impl OriginLoad {
     let origin = &mut self.origin;
     if let Some((path, bytes)) = origin.files.pop() {
       let moved = path.len().saturating_add(bytes.len());
-      green.identity.add(&file_entry(&path, &bytes));
       green.content.insert(&path, bytes);
+      // The block's digest, made as it was inserted: the origin's bytes are hashed once.
+      if let Some(digest) = green.content.digest_of(&path) {
+        green.identity.add(&file_entry(&path, digest));
+      }
       return Some(moved);
     }
     if let Some((path, node)) = origin.specials.pop() {
@@ -2481,8 +2498,8 @@ impl Green {
     if let IdentityKey::File(path) = &key
       && self.copies.is_empty()
     {
-      if let Some(bytes) = self.content.get(path) {
-        self.identity.remove(&file_entry(path, bytes));
+      if let Some(digest) = self.content.digest_of(path) {
+        self.identity.remove(&file_entry(path, digest));
       }
       self.identity_out.insert(key.clone());
       self
@@ -2497,8 +2514,8 @@ impl Green {
     match key {
       IdentityKey::File(path) => self
         .content
-        .get(path)
-        .map(|bytes| file_entry(path, bytes))
+        .digest_of(path)
+        .map(|digest| file_entry(path, digest))
         .into_iter()
         .collect(),
       _ => self.entries_of(key, self.head()).1.into_iter().collect(),
@@ -2546,8 +2563,11 @@ impl Green {
       IdentityKey::File(path) => (
         self
           .content_ref_at(path, since)
-          .map(|bytes| file_entry(path, &bytes)),
-        self.content.get(path).map(|bytes| file_entry(path, bytes)),
+          .map(|bytes| file_entry_of(path, &bytes)),
+        self
+          .content
+          .digest_of(path)
+          .map(|digest| file_entry(path, digest)),
       ),
       IdentityKey::Special(path) => (
         self
@@ -2738,8 +2758,9 @@ impl Green {
     for (path, node) in self.specials.iter() {
       set.add(&special_entry(&path, node));
     }
+    // The oracle hashes every file's bytes itself, never a block's digest, so a digest made wrong is a difference here.
     for (path, bytes) in self.content.iter() {
-      set.add(&file_entry(&path, bytes));
+      set.add(&file_entry_of(&path, bytes));
     }
     for path in self.dirs.keys() {
       set.add(&dir_entry(&path));
@@ -3008,6 +3029,17 @@ impl Green {
   /// the files it restored (owed: item 3's second piece, a checkpoint naming them).
   pub fn name_of(&self, path: &str) -> Option<crate::named::Identity> {
     self.content.name_of(path)
+  }
+
+  /// The bytes of every object `wanted` names that a live block of this green is named for (A-866): its current files'
+  /// and its history's alike, copied. What a refused publication's remake reads its checkpoint's and chain's named
+  /// files from when the content store does not hold them whole, before this engine is let go (the server's
+  /// `verbs::remake_green`).
+  pub fn bytes_named(
+    &self,
+    wanted: &std::collections::BTreeSet<crate::named::Identity>,
+  ) -> Vec<(crate::named::Identity, Vec<u8>)> {
+    self.content.blocks().named_bytes(wanted)
   }
 
   /// Every file the green currently holds, with its bytes — so a new work volume can be seeded with

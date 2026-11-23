@@ -2579,7 +2579,13 @@ fn queue_let_go(state: &mut ShardState, pack: slates_vcs::ContentId, (home, owne
   }
   state.vcs_stores.letting_go.1 = true;
   let turns = async {
-    while crate::state::with_state_counted(let_go_turn) == Some(true) {
+    loop {
+      // Each slice waits while a publication of the shard's image is owed past its bound (A-870 piece 2, main's
+      // progress rule), woken by the publication that carries it up.
+      crate::content_holder::image_resumed().await;
+      if crate::state::with_state_counted(let_go_turn) != Some(true) {
+        break;
+      }
       slates_rt::futures::yield_now().await;
     }
     let _ = crate::state::with_state_counted(|state| state.vcs_stores.letting_go.1 = false);
@@ -2599,14 +2605,51 @@ fn queue_let_go(state: &mut ShardState, pack: slates_vcs::ContentId, (home, owne
 pub(crate) fn let_go_turn(state: &mut ShardState) -> bool {
   let quantum_ns = state.config.step_quantum_ns();
   let started_ns = slates_rt::futures::now_ns();
+  #[cfg(test)]
+  LET_GO_TRACE.with(|trace| {
+    trace.borrow_mut().push(SliceTrace {
+      quantum_ns,
+      windows: Vec::new(),
+      past: false,
+    });
+  });
   let Some(more) = let_go_slice(state, (started_ns, quantum_ns)) else {
+    #[cfg(test)]
+    LET_GO_TRACE.with(|trace| trace.borrow_mut().pop());
     return false;
   };
   state.count(LET_GO_SLICES, 1);
-  if slates_rt::futures::now_ns().saturating_sub(started_ns) > quantum_ns {
+  let past = slates_rt::futures::now_ns().saturating_sub(started_ns) > quantum_ns;
+  if past {
     state.count(LET_GO_PAST_QUANTUM, 1);
   }
+  #[cfg(test)]
+  LET_GO_TRACE.with(|trace| {
+    if let Some(slice) = trace.borrow_mut().last_mut() {
+      slice.past = past;
+    }
+  });
   more
+}
+
+/// What a slice of the let-go measured and judged by its own clock ([`let_go_turn`]): the tests' record, so a slice is
+/// judged by the shard's own measures, never a test's wall time around it.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct SliceTrace {
+  /// The step quantum the slice read.
+  pub(crate) quantum_ns: u64,
+  /// Each window it let go: when it began and ended, from the slice's start.
+  pub(crate) windows: Vec<(u64, u64)>,
+  /// Whether it judged itself past the quantum (counted [`LET_GO_PAST_QUANTUM`]).
+  pub(crate) past: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+  /// Every slice of the let-go this thread ran ([`SliceTrace`]).
+  pub(crate) static LET_GO_TRACE: core::cell::RefCell<Vec<SliceTrace>> =
+    const { core::cell::RefCell::new(Vec::new()) };
 }
 
 /// [`let_go_turn`]'s slice, begun at `started_ns` within `quantum_ns`: none where nothing is queued, else whether more is.
@@ -2634,6 +2677,15 @@ fn let_go_slice(state: &mut ShardState, (started_ns, quantum_ns): (u64, u64)) ->
     letting.next = letting.next.saturating_add(1);
     let now_ns = slates_rt::futures::now_ns();
     longest_ns = longest_ns.max(now_ns.saturating_sub(before_ns));
+    #[cfg(test)]
+    LET_GO_TRACE.with(|trace| {
+      if let Some(slice) = trace.borrow_mut().last_mut() {
+        slice.windows.push((
+          before_ns.saturating_sub(started_ns),
+          now_ns.saturating_sub(started_ns),
+        ));
+      }
+    });
     // The next window taken only where it ends within the quantum, at the slice's longest so far.
     if now_ns.saturating_sub(started_ns).saturating_add(longest_ns) > quantum_ns {
       break;

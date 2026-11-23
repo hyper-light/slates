@@ -2442,16 +2442,22 @@ fn t_identity_rule_a_record_naming_an_object_by_its_old_root_is_refused_typed() 
 
 /// Goal 93 item 2b (main 01a20182's orders of 2026-11-23: the let-go a push's end owed ran as one walk over its whole
 /// pack inside `ReceivePack`'s drop, git/git's ~600 MB at once, a bounded-work breach; the shard's step quantum alone
-/// ends a slice). Do: on an audit shard, put a landed pack of 131 windows in a git repository's content store and owe its
-/// let-go, then go idle (`git_encode::give_back_idle`, as a push's end and an idle repository run it); then turn the
-/// shard's let-go queue a slice at a time (`let_go_turn`) to its end, timing each against the step quantum. Expect: going
-/// idle lets nothing go itself, only queues it; the let-go takes a slice to list the pack's windows and then more, every
-/// slice counted (`LET_GO_SLICES`); no slice takes a second window once the quantum would be passed, so a slice past the
-/// quantum is one window, the unit, and each such is counted (`LET_GO_PAST_QUANTUM`); and at its end the whole pack let
-/// go. Red before: the pack's every window let go within the idle give-back's one step.
+/// ends a slice; each slice judged by the shard's own measures, never a test's wall time, so load cannot fail it). Do: on
+/// an audit shard, put a landed pack of 131 windows in a git repository's content store and owe its let-go, then go idle
+/// (`git_encode::give_back_idle`, as a push's end and an idle repository run it); then turn the shard's let-go queue a
+/// slice at a time (`let_go_turn`) to its end, each slice's own record kept (`SliceTrace`: the quantum it read, each
+/// window's span by its clock, its own past-the-quantum judgement). Expect: going idle lets nothing go itself, only
+/// queues it; the let-go takes a slice to list the pack's windows and then more, every slice counted (`LET_GO_SLICES`)
+/// and recorded; within a slice, each window after the first was taken only where the slice's elapsed and its longest
+/// window so far still fit its quantum; the slices judged past the quantum each counted (`LET_GO_PAST_QUANTUM`); and at
+/// its end the whole pack let go. Red before: the pack's every window let go within the idle give-back's one step; and,
+/// with a test's wall time judging the slices, a spinning machine failed it (123 of 128 slices past by the shard's
+/// counter, 128 by the test's clock).
 #[test]
 fn t_goal93_a_large_landed_packs_let_go_is_sliced_within_the_step_quantum_never_one_walk() {
-  use super::{LANDED_LET_GO_BYTES, LANDED_PINNED, LET_GO_PAST_QUANTUM, LET_GO_SLICES};
+  use super::{
+    LANDED_LET_GO_BYTES, LANDED_PINNED, LET_GO_PAST_QUANTUM, LET_GO_SLICES, LET_GO_TRACE,
+  };
   let seen = crate::test_store::audit_on_stored_shard("let-go-sliced", |state| {
     let id = crate::git_push::tests::git_repository(state, "let-go-sliced");
     let window = state
@@ -2480,58 +2486,57 @@ fn t_goal93_a_large_landed_packs_let_go_is_sliced_within_the_step_quantum_never_
       count(state, LET_GO_SLICES),
       count(state, LET_GO_PAST_QUANTUM),
     );
+    LET_GO_TRACE.with(|trace| trace.borrow_mut().clear());
     super::git_encode::give_back_idle(state, id);
     let in_the_step = freed(state) - before.0;
-    let mut slices = Vec::new();
-    loop {
-      let was = freed(state);
-      let started = slates_rt::futures::now_ns();
-      let more = super::let_go_turn(state);
-      let ns = slates_rt::futures::now_ns() - started;
-      slices.push((ns, freed(state) - was, state.config.step_quantum_ns()));
-      if !more {
-        break;
-      }
-    }
+    while super::let_go_turn(state) {}
+    let trace = LET_GO_TRACE.with(|trace| trace.borrow().clone());
     let whole_after = state
       .vcs_stores
       .content()
       .is_some_and(|content| content.holds_whole(&pack));
     (
       in_the_step,
-      slices,
+      trace,
       (
         count(state, LET_GO_SLICES) - before.1,
         count(state, LET_GO_PAST_QUANTUM) - before.2,
       ),
       (freed(state) - before.0, count(state, LANDED_PINNED), len),
       whole_after,
-      u64::try_from(window).unwrap(),
     )
   });
-  let (in_the_step, slices, (counted, past), (freed, pinned, len), whole_after, window) = seen;
-  let past_quantum: Vec<&(u64, u64, u64)> = slices
-    .iter()
-    .filter(|(ns, _, quantum)| ns > quantum)
-    .collect();
+  let (in_the_step, trace, (counted, past), (freed, pinned, len), whole_after) = seen;
+  let windows: usize = trace.iter().map(|slice| slice.windows.len()).sum();
   eprintln!(
-    "let-go: {counted} slices, {past} past the quantum, freed {freed} of {len} bytes; the most a slice freed {}",
-    slices.iter().map(|(_, bytes, _)| *bytes).max().unwrap_or(0)
+    "let-go: {counted} slices, {past} past the quantum, {windows} windows, freed {freed} of {len} bytes"
   );
   assert_eq!(
     in_the_step, 0,
     "nothing let go within the step that owes it"
   );
   assert!(counted >= 4, "the listing and many slices: {counted}");
-  assert_eq!(counted, u64::try_from(slices.len()).unwrap());
-  assert!(
-    past_quantum.iter().all(|(_, bytes, _)| *bytes <= window),
-    "a slice past the quantum is one window at most: {past_quantum:?}"
+  assert_eq!(
+    counted,
+    u64::try_from(trace.len()).unwrap(),
+    "every slice recorded"
   );
-  assert!(
-    past >= u64::try_from(past_quantum.len()).unwrap(),
-    "each slice past the quantum counted: {past} of {}",
-    past_quantum.len()
+  for slice in &trace {
+    let mut longest = 0;
+    for pair in slice.windows.windows(2) {
+      let (begun, ended) = pair[0];
+      longest = longest.max(ended - begun);
+      assert!(
+        ended + longest <= slice.quantum_ns,
+        "a window taken past the quantum by the slice's own measure: {slice:?}"
+      );
+    }
+  }
+  let judged_past = trace.iter().filter(|slice| slice.past).count();
+  assert_eq!(
+    past,
+    u64::try_from(judged_past).unwrap(),
+    "each slice judged past the quantum counted"
   );
   assert_eq!((freed, pinned), (len, 0), "the whole pack let go");
   assert!(!whole_after, "the pack held whole no more");

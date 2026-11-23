@@ -144,7 +144,9 @@ mod tests {
   fn a_live_allocation_shows_in_the_heaps_bytes_in_use_and_reserved() {
     const HELD: usize = 1 << 20;
     let before = stats();
-    let held = vec![1u8; HELD];
+    // Kept live through the reading: in release the optimizer removed a block nothing read, and the reading then missed
+    // it (main 01a20182, adacachy2, 2026-11-23).
+    let held = std::hint::black_box(vec![1u8; HELD]);
     let after = stats();
     assert!(after.in_use <= after.reserved, "{after:?}");
     // The test binary's allocator is the system's, not the large path, so the box shows only where the system allocator
@@ -163,6 +165,7 @@ mod tests {
   /// present (the main arena's top at least), the mapped bytes up by the block while it is held and down by it once freed.
   #[cfg(all(target_os = "linux", target_env = "gnu", not(miri)))]
   #[test]
+  #[cfg_attr(slates_tsan, ignore)] // ThreadSanitizer's allocator replaces glibc's: glibc's figures hold no block of ours
   fn glibcs_mapped_bytes_follow_a_block_it_maps_until_it_is_freed() {
     /// Derived: twice glibc's largest mmap threshold on 64-bit (`DEFAULT_MMAP_THRESHOLD_MAX`, 4 MiB times
     /// `sizeof (long)`, 32 MiB), so glibc maps the block on its own however far the threshold has risen.

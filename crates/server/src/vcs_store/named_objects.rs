@@ -18,6 +18,39 @@ pub(crate) struct PlaneObjects<'a> {
   pub(crate) kept_in: &'a dyn std::any::Any,
 }
 
+/// A replay's named objects (A-866, A-869): the content plane first, then the bytes kept for it (a refused publication's
+/// remake keeps, from the engine it replaces, the named texts the plane does not hold whole: `verbs::remake_green`),
+/// sorted by identity, each an object's whole bytes.
+pub(crate) struct ReplayObjects<'a> {
+  /// The plane, where the shard holds a content store.
+  pub(crate) plane: Option<PlaneObjects<'a>>,
+  /// The bytes kept, sorted by identity.
+  pub(crate) kept: &'a [(Identity, Vec<u8>)],
+}
+
+impl Objects for ReplayObjects<'_> {
+  fn read(&self, identity: &Identity, at: u64, into: &mut [u8]) -> Result<(), ObjectMissing> {
+    if let Some(plane) = &self.plane
+      && plane.read(identity, at, into).is_ok()
+    {
+      return Ok(());
+    }
+    let missing = ObjectMissing {
+      identity: *identity,
+    };
+    let kept = self
+      .kept
+      .binary_search_by(|(kept, _)| kept.cmp(identity))
+      .ok()
+      .and_then(|at| self.kept.get(at))
+      .ok_or(missing)?;
+    let from = usize::try_from(at).map_err(|_| missing)?;
+    let to = from.checked_add(into.len()).ok_or(missing)?;
+    into.copy_from_slice(kept.1.get(from..to).ok_or(missing)?);
+    Ok(())
+  }
+}
+
 impl Objects for PlaneObjects<'_> {
   fn read(&self, identity: &Identity, at: u64, into: &mut [u8]) -> Result<(), ObjectMissing> {
     let missing = ObjectMissing {

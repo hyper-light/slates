@@ -722,3 +722,100 @@ pub(crate) fn answer_wants_blocking(
   }
   true
 }
+
+/// The principal the Subversion helpers below act as: uid 1234 on host 0, as the store tests' owner.
+pub(crate) fn svn_owner() -> slates_db::catalog::Principal {
+  slates_db::catalog::Principal::Uid {
+    host: slates_db::HostId(0),
+    uid: 1234,
+  }
+}
+
+/// Creates Subversion repository `name` on `daemon`'s one shard through a client's request, waiting for its creation to
+/// land on the store and be recorded (A-767 item 7's one order).
+pub(crate) fn created_subversion(
+  daemon: &crate::Daemon,
+  name: &str,
+) -> slates_db::catalog::RepositoryId {
+  let asked = (
+    name,
+    slates_ipc::protocol::VcsTool::Subversion,
+    slates_ipc::protocol::ObjectFormat::Revisions,
+    "trunk",
+  );
+  create_on(daemon, 0, &svn_owner(), asked).0
+}
+
+/// A client's work on revision `head` setting `/trunk/a.txt` to `bytes` (`action`: add or modify), `/trunk` added with
+/// it at revision 0, with its text held as a commit's sink holds it.
+pub(crate) fn file_work(
+  head: u64,
+  action: slates_svn::index::Action,
+  bytes: &[u8],
+) -> (
+  slates_svn::commit::drive::Work,
+  slates_svn::commit::drive::HeldTexts,
+) {
+  use slates_svn::commit::drive::TextSink;
+  use slates_svn::index::{Action, ChangedPath, NodeKind};
+  let text = slates_svn::commit::drive::text_of(bytes).unwrap();
+  let texts = slates_svn::commit::drive::HeldTexts::new();
+  let staged = texts.stage(None).unwrap();
+  texts.append(staged, bytes).unwrap();
+  texts.seal(staged, text.identity).unwrap();
+  let mut changes = Vec::new();
+  if head == 0 {
+    changes.push(ChangedPath {
+      path: "/trunk".to_owned(),
+      action: Action::Add,
+      kind: NodeKind::Directory,
+      copy_from: None,
+      text: None,
+      properties: None,
+      mergeinfo_modified: false,
+    });
+  }
+  changes.push(ChangedPath {
+    path: "/trunk/a.txt".to_owned(),
+    action,
+    kind: NodeKind::File,
+    copy_from: None,
+    text: Some(text),
+    properties: None,
+    mergeinfo_modified: false,
+  });
+  let work = slates_svn::commit::drive::Work {
+    head,
+    record: slates_svn::index::RevisionRecord {
+      transaction: format!("{head}-1"),
+      changes,
+    },
+    lock_entries: Vec::new(),
+    revision_properties: vec![(b"svn:log".to_vec(), format!("r{}", head + 1).into_bytes())],
+    texts: std::iter::once(text.identity).collect(),
+    property_lists: std::collections::BTreeMap::new(),
+    locks: slates_svn::lock::CommitLocks::default(),
+  };
+  (work, texts)
+}
+
+/// Lands `work` on `repository` through the client's commit landing (`svn_commit::land_work`), as a task on `daemon`'s
+/// shard: the revision it committed, or why not.
+pub(crate) fn landed_work(
+  daemon: &crate::Daemon,
+  repository: slates_db::catalog::RepositoryId,
+  head: u64,
+  (action, bytes): (slates_svn::index::Action, Vec<u8>),
+) -> Result<u64, crate::repository::svn_commit::Uncommitted> {
+  run_on_first(
+    daemon,
+    move || async move {
+      let (work, texts) = file_work(head, action, &bytes);
+      crate::repository::svn_commit::land_work((&svn_owner(), repository), work, &texts)
+        .await
+        .unwrap()
+        .map(|committed| committed.revision)
+    },
+    std::time::Duration::from_secs(60),
+  )
+}

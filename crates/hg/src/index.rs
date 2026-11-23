@@ -46,7 +46,6 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 
 use slates_vcs::{
   Batch, ContentId, ContentStore, Index, IndexRefused, Naming, NewRow, Quarantine, RowRef,
@@ -79,6 +78,10 @@ const OBJECT_ROW: u8 = b'O';
 
 /// Format: the first byte of a marker row's key, which the marker's number follows, big-endian.
 const MARKER_ROW: u8 = b'M';
+
+/// Format: the first byte of a sealed chunk of the branch heads' endings' row key, which the chunk's number follows,
+/// big-endian ([`Endings`]); before every log row, so no walk of a log's rows meets one.
+const ENDINGS_ROW: u8 = b'E';
 
 /// Format: the changelog's log key.
 const CHANGELOG_KEY: u8 = b'c';
@@ -371,7 +374,8 @@ struct Planned {
 /// Those revisions' heads are today's heads below `first` and every head a revision at or after `first` ended, since a
 /// head ended once is never one again: each append's endings are kept in the order they happen ([`Endings`]), so they
 /// are read back from `first` on alone. The served answer then costs the tail's endings and the served tail's appends,
-/// never a walk of the history.
+/// never a walk of the history. A full chunk of endings is sealed into a row of the index ([`Endings`]), so a fork
+/// shares the sealed ones as it shares every row, by the tables' identity, and copies only the open chunk.
 #[derive(Clone, Debug, Default)]
 pub struct BranchHeads {
   /// Each branch's heads, by number.
@@ -439,7 +443,7 @@ impl BranchHeads {
         heads.insert(branch.clone(), below);
       }
     }
-    for (_, ended) in self.endings.from(first) {
+    for (_, ended) in self.endings.from((index, store), first)? {
       if ended >= first {
         continue;
       }
@@ -472,7 +476,7 @@ fn note(
   (rev, branch, parents): (u32, &[u8], [u32; 2]),
   mut ended: impl FnMut(u32),
 ) -> Result<u64, Refused> {
-  let mut walked = 0_u64;
+  let mut walked = 0;
   let heads = by_branch.entry(branch.to_vec()).or_default();
   let mut others: Vec<u32> = Vec::new();
   for parent in parents.into_iter().filter(|parent| *parent != NONE) {
@@ -488,52 +492,73 @@ fn note(
     }
   }
   if let Some(&floor) = heads.first().filter(|_| !others.is_empty()) {
-    // The ancestors of the parents from other branches, down to the branch's lowest head, each walked once from the
-    // highest: every head among them has `rev` for a descendant on its branch.
-    let mut reach: BTreeSet<u32> = others
-      .iter()
-      .copied()
-      .filter(|parent| *parent >= floor)
-      .collect();
-    while let Some(at) = reach.pop_last() {
-      if at < floor {
-        break;
-      }
-      walked = walked.saturating_add(1);
-      if heads.remove(&at) {
-        ended(at);
-      }
-      let row = index
-        .changeset(store, at)
-        .ok_or(Refused::Unread { rev: at })?;
-      for parent in [row.p1, row.p2] {
-        if parent != NONE && parent >= floor {
-          reach.insert(parent);
-        }
-      }
-      if heads.is_empty() {
-        break;
-      }
-    }
+    walked = walk_ended(heads, (index, store), (&others, floor), &mut ended)?;
   }
   heads.insert(rev);
   Ok(walked)
 }
 
-/// Shape: the endings a sealed chunk of [`Endings`] holds: a fork copies a chunk's handle, not its endings.
-const ENDINGS_CHUNK: usize = 4096;
+/// Ends each of a branch's `heads` that an ancestor of a parent from another branch (`others`) is, walking those
+/// ancestors down to the branch's lowest head `floor`, each once from the highest (every head among them has the
+/// appended revision for a descendant on its branch), each head ended handed to `ended`: how many revisions it read.
+fn walk_ended(
+  heads: &mut BTreeSet<u32>,
+  (index, store): (&HgIndex, &ContentStore),
+  (others, floor): (&[u32], u32),
+  ended: &mut impl FnMut(u32),
+) -> Result<u64, Refused> {
+  let mut walked = 0_u64;
+  let mut reach: BTreeSet<u32> = others
+    .iter()
+    .copied()
+    .filter(|parent| *parent >= floor)
+    .collect();
+  while let Some(at) = reach.pop_last() {
+    if at < floor {
+      break;
+    }
+    walked = walked.saturating_add(1);
+    if heads.remove(&at) {
+      ended(at);
+    }
+    let row = index
+      .changeset(store, at)
+      .ok_or(Refused::Unread { rev: at })?;
+    reach.extend(
+      [row.p1, row.p2]
+        .into_iter()
+        .filter(|parent| *parent != NONE && *parent >= floor),
+    );
+    if heads.is_empty() {
+      break;
+    }
+  }
+  Ok(walked)
+}
+
+/// Shape: the most endings a sealed chunk of [`Endings`] holds: what a fork copies of them at most, 4 KiB. Fewer where
+/// the store's window is smaller, since a row is at most a window's table ([`endings_a_chunk`]).
+const ENDINGS_CHUNK: usize = 512;
+
+/// Shape: a bound on a sealed chunk's row beyond its endings: a table's frame, the row's offset, its key's length, its
+/// key and its body's count (42 bytes, `slates_vcs`'s table encoding), rounded up.
+const ENDINGS_ROW_FRAME: usize = 64;
+
+/// Format: the bytes of one ending in a sealed chunk's row: the appended revision, then the head, each little-endian.
+const ENDING_BYTES: usize = 8;
 
 /// One head an append ended: the appended revision, and the head.
 type Ending = (u32, u32);
 
 /// Every head the changelog's appends ended, in append order, so by appended revision ([`BranchHeads`], "A view that
-/// leaves changesets out"): sealed chunks shared with every fork, and the open chunk, which a fork copies (at most
-/// [`ENDINGS_CHUNK`] of them). One ending a revision or fewer, mostly: an append ends its parent on its branch at most,
-/// and a walk's ending is a merge's.
+/// leaves changesets out"): each full chunk of [`ENDINGS_CHUNK`] sealed into a row of the index (its key
+/// [`ENDINGS_ROW`] and the chunk's number), immutable once written, so the index owns it once and a fork shares it by
+/// the tables' identity; and the open chunk, which a fork copies. About one ending a changeset: an append ends its
+/// parent on its branch at most, and a walk's ending is a merge's.
 #[derive(Clone, Debug, Default)]
 struct Endings {
-  /// The full chunks, oldest first.
-  sealed: Vec<Arc<[Ending]>>,
+  /// How many chunks are sealed: their rows are numbered from 0.
+  sealed: u32,
   /// The endings after them.
   open: Vec<Ending>,
 }
@@ -542,44 +567,99 @@ impl Endings {
   /// Keeps `ending`, after every one before it.
   fn push(&mut self, ending: Ending) {
     self.open.push(ending);
-    if self.open.len() >= ENDINGS_CHUNK {
-      self.sealed.push(Arc::from(core::mem::take(&mut self.open)));
-    }
   }
 
-  /// The endings by revisions at or after `rev`, in their order.
-  fn from(&self, rev: u32) -> impl Iterator<Item = Ending> + '_ {
-    let chunk = self
-      .sealed
-      .partition_point(|chunk| chunk.last().is_some_and(|(by, _)| *by < rev));
-    let sealed = self.sealed.get(chunk..).unwrap_or_default();
-    let start = sealed
-      .first()
-      .map_or(0, |first| first.partition_point(|(by, _)| *by < rev));
-    let open_start = if sealed.is_empty() {
-      self.open.partition_point(|(by, _)| *by < rev)
-    } else {
-      0
-    };
-    sealed
-      .iter()
-      .enumerate()
-      .flat_map(move |(at, chunk)| {
-        chunk
-          .get(if at == 0 { start } else { 0 }..)
-          .unwrap_or_default()
+  /// The endings by revisions at or after `rev` that `index` holds, in their order: the sealed chunks from the first
+  /// whose last ending is by `rev` or after (found by a search of the chunks' rows), then the open chunk. Refused for a
+  /// sealed chunk's row `index` does not hold whole.
+  fn from(
+    &self,
+    (index, store): (&HgIndex, &ContentStore),
+    rev: u32,
+  ) -> Result<Vec<Ending>, Refused> {
+    let chunk = |number: u32| -> Result<Vec<Ending>, Refused> {
+      let row = index
+        .rows
+        .get(store, &endings_key(number))
+        .ok_or(Refused::Unread { rev })?;
+      let (pairs, rest) = row.payload().as_chunks::<ENDING_BYTES>();
+      if !rest.is_empty() || pairs.is_empty() {
+        return Err(Refused::Unread { rev });
+      }
+      Ok(
+        pairs
           .iter()
-          .copied()
-      })
-      .chain(
-        self
-          .open
-          .get(open_start..)
-          .unwrap_or_default()
-          .iter()
-          .copied(),
+          .map(|pair| {
+            let (by, ended) = pair.split_at(ENDING_BYTES / 2);
+            let word = |bytes: &[u8]| <[u8; 4]>::try_from(bytes).map_or(NONE, u32::from_le_bytes);
+            (word(by), word(ended))
+          })
+          .collect(),
       )
+    };
+    // The first sealed chunk whose last ending is by `rev` or after, each probe reading that ending alone.
+    let last_by = |number: u32| -> Result<u32, Refused> {
+      let row = index
+        .rows
+        .get(store, &endings_key(number))
+        .ok_or(Refused::Unread { rev })?;
+      let (_, last) = row
+        .payload()
+        .split_last_chunk::<ENDING_BYTES>()
+        .ok_or(Refused::Unread { rev })?;
+      let (by, _) = last
+        .split_first_chunk::<REV_BYTES>()
+        .ok_or(Refused::Unread { rev })?;
+      Ok(u32::from_le_bytes(*by))
+    };
+    let (mut low, mut high) = (0_u32, self.sealed);
+    while low < high {
+      let middle = low.midpoint(high);
+      let last = last_by(middle)?;
+      if last < rev {
+        low = middle.saturating_add(1);
+      } else {
+        high = middle;
+      }
+    }
+    let mut endings = Vec::new();
+    for number in low..self.sealed {
+      endings.extend(chunk(number)?.into_iter().filter(|(by, _)| *by >= rev));
+    }
+    endings.extend(self.open.iter().copied().filter(|(by, _)| *by >= rev));
+    Ok(endings)
   }
+
+  /// The full open chunks of `chunk` endings, taken out to be sealed, each with its number; the count of sealed chunks
+  /// moved past them.
+  fn take_full_chunks(&mut self, chunk: usize) -> Vec<(u32, Vec<u8>)> {
+    let mut sealing = Vec::new();
+    while self.open.len() >= chunk {
+      let rest = self.open.split_off(chunk);
+      let full = core::mem::replace(&mut self.open, rest);
+      let mut payload = Vec::with_capacity(chunk.saturating_mul(ENDING_BYTES));
+      for (by, ended) in full {
+        payload.extend_from_slice(&by.to_le_bytes());
+        payload.extend_from_slice(&ended.to_le_bytes());
+      }
+      sealing.push((self.sealed, payload));
+      self.sealed = self.sealed.saturating_add(1);
+    }
+    sealing
+  }
+}
+
+/// The endings a sealed chunk holds in `store`: [`ENDINGS_CHUNK`], or as many as a window's table holds, one at least.
+fn endings_a_chunk(store: &ContentStore) -> usize {
+  (store.window().saturating_sub(ENDINGS_ROW_FRAME) / ENDING_BYTES).clamp(1, ENDINGS_CHUNK)
+}
+
+/// The key of the sealed chunk of endings numbered `number`.
+fn endings_key(number: u32) -> Vec<u8> {
+  let mut key = Vec::with_capacity(core::mem::size_of::<u32>().saturating_add(1));
+  key.push(ENDINGS_ROW);
+  key.extend_from_slice(&number.to_be_bytes());
+  key
 }
 
 /// A repository's revlog-shaped index, every row in one shared [`Index`].
@@ -873,8 +953,26 @@ impl HgIndex {
         .ok_or(Refused::Unread { rev: written.rev })?;
       heads.add((self, store), (written.rev, row.branch, [row.p1, row.p2]))
     });
+    let sealing = heads.endings.take_full_chunks(endings_a_chunk(store));
     self.branch_heads = heads;
     noted?;
+    // Each full chunk of the endings sealed into a row of its own (`Endings`).
+    let keys: Vec<Vec<u8>> = sealing
+      .iter()
+      .map(|(number, _)| endings_key(*number))
+      .collect();
+    let rows: Vec<NewRow<'_>> = keys
+      .iter()
+      .zip(&sealing)
+      .map(|(key, (_, payload))| NewRow {
+        key,
+        contents: &[],
+        payload,
+      })
+      .collect();
+    if !rows.is_empty() {
+      self.rows.insert_all(store, &rows)?;
+    }
     Ok(revs)
   }
 

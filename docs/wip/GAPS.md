@@ -105,15 +105,30 @@
 > back on a read; the records ride the shard image, so a window with one is not pinned.
 > The kept memory, measured on Linux (main 01a20182, 2026-11-23): with glibc, the gauges carry glibc's own figures over
 > every arena (`mem.gauge.process.malloc_free_bytes`, its arenas' free bytes, fastbins among them; `malloc_mapped_bytes`;
-> `malloc_arena_bytes`), so the remainder above is read there, not inferred; macOS and musl still infer it. OWED: main's
-> Linux RSS round reading them.
+> `malloc_arena_bytes`), so the remainder above is read there, not inferred; macOS and musl still infer it. Read by
+> arena-11/12 (hg's full push, CI 45174893883): glibc kept 588 MB free of 1,008.7 MB; the content object
+> (`/memfd:slates-con-*`) 753 MiB resident against 183 MB the content store used. Not pre-faulted whole (the arena grows
+> from the pool; A-214's reserve gone): freed blocks are zeroed in place and given back only by an idle purge, and only
+> runs of the discard size or more (A-105), never frees still deferred for a committed image (A-64). The content
+> gauges tell those apart (main 01a20182, 2026-11-23): `mem.gauge.content.{arena_mapped_bytes, arena_free_bytes,
+> arena_resident_free_bytes, arena_deferred_bytes, object_resident_bytes}` and the counter
+> `content.purge_kept_short_bytes` (red-first by use: `slates-mem`
+> `arena::tests::a_free_run_under_the_discard_size_stays_resident_and_is_counted_kept_short`). OWED: arena-13's reading
+> after push-all and again after an idle pass, and the cut it names.
 > **A-870 (w-shared; main 01a20182's rulings of 2026-11-22 ~22:10 and ~22:30): a shard image's content-store families
 > published and restored over turns.** Piece 1 BUILT: the families paged (`crate::image_pages`): 3,000 windows let go
-> and 3,000 landed records rode 6,000 pieces, now 17 (534,085 bytes at a 43,912-byte page), restored whole. OWED: piece 2
-> (pages encoded ahead a slice a turn, a chunk freed under an unpublished page released at that page's commit, an
-> oracle of let-go, publish and crash; first, whether windows let go and records code as a range per object), piece 3
-> (pages restored a page a turn, reads waiting), and a 100k-file volume's longest image step measured against the step
-> budget (the volumes' images paged too only if past it).
+> and 3,000 landed records rode 6,000 pieces, now 17 (534,085 bytes at a 43,912-byte page), restored whole. Piece 2
+> BUILT (main's ruling of 2026-11-23, options (a)-(d)): the pages encoded a slice a turn (`image_pages::Encoder`), a
+> publication carrying them only when none is dirty, else the committed cut again with every deferred block kept
+> (`capture_deferred` whole) and the publication owed; past its bound elective let-gos pause, woken by the publication
+> that carries the cut; red 1,068,980 bytes encoded in one publication's step at a 4,096-byte page, now at most three
+> pages; held by an oracle of generated let-go, put, publish and crash histories, one continuous (A-870 "Evidence (piece
+> 2)"). OPEN: the lag bound holds only while the encoder outpaces the changes that never pause (puts, bring-backs);
+> a put stream that outpaces a turn a yield is unmeasured until arena-12 reads it: `vcs_store.image.paused_encoded_bytes`
+> against `paused_imposed_bytes` over `paused_turns`, and `longest_lag_turns` (main's addition of 2026-11-23). Counters
+> for main's rounds: `vcs_store.image.*` (skipped, longest lag, pauses, the longest turn's bytes). Ranges per object rejected on arena-5's numbers (main agreed). OWED:
+> piece 3 (pages restored a page a turn, reads waiting), and a 100k-file volume's longest image step measured against
+> the step budget (the volumes' images paged too only if past it).
 > **HELD (main 01a20182, 2026-11-22 15:40):** no landed pack is let go or owed from a push's commit (`vcs_store::commit`),
 > since r52 (the big Studio, main 6f6e87d82) found readers that do not bring a let-go window back: once git/git's push
 > ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's tag peel through
@@ -346,6 +361,35 @@
 >   reply wait in the class (D', D'') was measured and not taken. **Confirmed on main** (ca98b72c4, main 01a20182,
 >   2026-11-23 03:42, adacachy2 in a user scope at CPUWeight 100): 6 loaded rounds, p99 241-440 µs and p999 325-697 µs,
 >   12 of 12 under 1 ms; quiet p99 76-103 µs; R9 spinning p99 45.6 / 54.6 / 56.2 µs (main before: 57-145).
+>   The class is set through the kernel's own calls since 2026-11-23 (main 01a20182): musl's `sched_setscheduler`
+>   answers `ENOSYS`, so the static musl release binaries had never taken it; the test passes for glibc and musl on
+>   adacachy2.
+>   **The desktop route, PARKED (main 01a20182's ruling, 2026-11-23; w-perf's readings).** Most desktop Linux grants no
+>   `RLIMIT_RTPRIO` but ships RealtimeKit (`org.freedesktop.RealtimeKit1` on the system bus, which PipeWire uses), an
+>   OS-shipped broker R10 allows. An account with `RLIMIT_RTPRIO` 0 would ask it per shard thread
+>   (`MakeThreadRealtimeWithPID` at the class's lowest priority, under its `MaxRealtimePriority`). Readings:
+>   - No host here runs it. adacachy (7.2.9) and adacachy2 (7.3.3): not on the bus and not activatable, no
+>     `rtkit-daemon` unit, no polkit action (`busctl`, `systemctl`, `pkaction`); CI's runners neither (run
+>     45115263387). Both adacachy hosts grant `RLIMIT_RTPRIO` 99, so A-872's limit path covers them.
+>   - No D-Bus without C or an executor: the lockfile has no D-Bus crate; zbus runs on an async executor (D-9 bans it)
+>     and the `dbus` crate binds libdbus. A hand-rolled client over the system bus socket would be a new parser of
+>     external bytes that no host can run against the real daemon.
+>   - RealtimeKit refuses a process whose `RLIMIT_RTTIME` hard limit exceeds its `RTTimeUSecMax` (200,000 µs by
+>     default, from memory; read the property). The kernel counts a real-time task's CPU a tick at a time and resets
+>     the count only when a wakeup enqueues it (7.3.3 `kernel/sched/rt.c`: `watchdog`, `enqueue_task_rt` with
+>     `ENQUEUE_WAKEUP`), so a shard with work, which never parks, is signalled `SIGXCPU` past the soft limit and
+>     killed past the hard one. A-872's limit path needs `RLIMIT_RTTIME` unlimited for that reason.
+>   Rulings for whoever builds it:
+>   - A shard holding the class by RealtimeKit sleeps at least once every half of the soft limit it set: a real
+>     block that a timer ends, since only a wakeup's enqueue resets the count (an `epoll_wait` that finds events
+>     ready does not, nor a yield). Not self-demotion: at `RLIMIT_RTPRIO` 0 a demoted thread cannot climb back by
+>     itself, and every return is another RealtimeKit call against its burst limit and a threads-per-user cap it
+>     shares with PipeWire.
+>   - A partial grant is kept, counted per thread by source (limit, rtkit, none), the first refusal of each source
+>     logged with its typed reason: the limit path's grant or skip, a thread at a time. All-or-none would take one
+>     thread's grant away for another's refusal.
+>   Unparked by: a host running `rtkit-daemon`, which is Ada's to install. Arm E stays settled on bare metal too
+>   (main's adacachy2 round, 2026-11-23 02:51: p99 705-817 µs, p999 0.88-1.14 ms, p50 2-4x worse).
 > - Windows (CI, run 44857045148): no 1 ms band (queued p99 5–49 µs); accept p99 0.13–0.31 ms, conflict 0.11–0.29 ms;
 >   p999 0.2–62 ms. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–7).
 >
@@ -796,6 +840,14 @@
 >   public and a rewrite of a pushed changeset is refused by the client), decision 3's rewrite admission, the
 >   `obsolete` pushkey namespace, and the reply's `N new obsolescence markers` output. The kept heads for a view with
 >   left-out changesets: BUILT (piece 2, below).
+>   Markers as 7.2 holds them BUILT (2026-11-23, w-hg): a repository holding a format 0 marker (an old obsstore's
+>   import, an old client's push) refused every clone that asked for markers, the format 1 encoder unable to write it
+>   (`markers_held_in_format_0_are_sent_in_format_1`, red: `Unencodable`). `marker_tuple` makes 7.2's in-memory tuple of
+>   either format and writes either from it, as `_fm0encodeonemarker` and `_fm1encodeonemarker` do: seven golden
+>   vectors from 7.2's own writers byte for byte; Python's `repr` of a float held to CPython over 400,014 floats, ties
+>   included, and its `float()` and `int()` over 525,750 strings. `getbundle` reads the tuples for relevance (a format 0
+>   marker's parents are in its metadata) and order; a push's markers are compared as tuples, so the same marker in the
+>   other format is not kept twice (`a_held_marker_in_the_other_format_is_not_kept_again`, red).
 > - A daemon's allocation by site under stock Mercurial measured BUILT (2026-11-23, w-hg; main's order (A)):
 >   `crates/server/tests/hg_push_heap.rs`, its own binary (`LargeMapped` with a byte sampler on while a row runs), an
 >   in-process daemon with a store and the cleartext HTTP edge, real `hg` subprocesses pushing a 400-changeset
@@ -832,8 +884,9 @@
 >   `a_lookup_of_a_branch_name_reads_its_heads_not_the_history` and `branchmap_over_a_long_line_reads_its_heads_not_the_history`
 >   (a 170-changeset line: red 512 and 511 reads, now at most 8; `BranchHeads::answered` the non-vacuity count). A
 >   view that leaves a changeset out (secret, hidden) answers from them too (BUILT 2026-11-23, w-hg, evolution piece
->   2): `BranchHeads` keeps each append's endings in order (`Endings`, sealed 4,096-ending `Arc` chunks a fork shares,
->   8 bytes an ending, about one a changeset), so `BranchHeads::served` reads the heads back to the view's first
+>   2): `BranchHeads` keeps each append's endings in order (`Endings`: each full chunk of 512 sealed into a row of
+>   the index, which a fork shares by the tables' identity as it shares every row, and the open chunk a fork copies; 8
+>   bytes an ending, about one a changeset; once `Arc` chunks, banned by R2, replaced 2026-11-23), so `BranchHeads::served` reads the heads back to the view's first
 >   changeset that is not public (today's below it, and those an append from it on ended) and appends the served tail
 >   alone: the tail's endings and appends, no walk of the history. Held by
 >   `a_views_kept_branch_heads_are_the_walks_whatever_it_leaves_out` (generated histories on three branches, every
@@ -857,6 +910,23 @@
 >   or a manifest into the buffer of the one kept before the last (`Taker::spare`; `delta::apply_into` keeps its
 >   capacity), which no later delta rests on, so a manifest's rebuild allocates nothing past the first. The test now
 >   `a_pushs_churn_per_changeset_is_its_file_alone`: red 102,045 B an edit, now 10,766 B (0.12 manifests).
+> - The store's texts made from their chains off the system heap BUILT (2026-11-23, w-perf; main's order on arena-11/12,
+>   the split agreed with w-hg). A daemon's push of Mercurial's own history, sampled by site, size and life
+>   (`crates/server/tests/hg_push_lifetimes.rs`, `#[ignore]`d, `SLATES_HG_PUSH_SOURCE`; MacBook, 57,036 changesets,
+>   17.5 GB allocated in 152 s), put 83% of its bytes under x86_64's 256 KiB floor that lived a second or more in the
+>   store owner's `TextCache` (3.47 GB sampled, 195 MB still held at the push's end), each text its own buffer.
+>   `TextCache` now lays its texts in chunks of the mapped floor and gives the oldest back whole (A-861's rule), and
+>   `Store::make` makes a chain through two buffers it reuses; `text_at` still lends a slice. Held by
+>   `the_store_keeps_the_texts_it_made_off_the_system_heap` (`crates/store/tests/text_cache_heap.rs`: red 6,606,904 live
+>   bytes grown holding 6,553,600, now 90,424 holding 6,029,312). The hg intake's whole texts (`intake::rebuilt`,
+>   `HgIndex::revision_text`, `Taker::file_base`; 3.52 GB of the [128 KiB, 256 KiB) band's churn with the cache's
+>   share) are w-hg's, in C1. Owed: main's arena round for RSS.
+>   Its bound from the work BUILT (main's ruling, 2026-11-23): the chain no longer needs its texts held, so the cache holds
+>   the distinct texts its last `waiting` reads lent (one a waiting request, the owner's room) and a chunk's room
+>   (`TextCache::for_reads`), the least lately read out first; a text past it is lent from the buffer it was made into.
+>   Grown to the longest chain before, it held 360 MB of chunks at the end of Mercurial's push. Held by
+>   `the_store_holds_the_texts_its_last_reads_lent_and_no_more` (red: bound 6,553,600 after a 400-version chain's read;
+>   now 1,064,960 for 4 reads, 384 texts let go, the latest found again unmade).
 > - The watchdog's beat allocates nothing BUILT (2026-11-23, w-perf; main's order). A beat made 4 allocations, about
 >   1 KB by their types (estimated, not measured). `hg_push_heap`'s first read had charged the watchdog 24% of a push's
 >   sampled bytes, about 10-15 MB a second; that was its sampler's artifact (a thread's first symbol load charged to its
@@ -1060,9 +1130,11 @@
 > lies there, checked against its name first, its delta reused where its base precedes it (`t_a859_…`: 20,916 bytes
 > against the pushed 17,299, where 89,439 went before); a stored entry reused whenever one exists, a delta's wanted
 > base placed first (3fa634049). Part A BUILT: a fetched byte priced at its link, learned per shard from the HTTP
-> edge's writes that waited for the peer, cold at deflate's measured break-even at git's level 6 (§4.11). Owed: the
-> SSH edge's writes heard (SSH fetches price cold), a price per client, not per shard; main's git/git whole round and
-> `fsck --strict`.
+> edge's writes that waited for the peer, cold at deflate's measured break-even at git's level 6 (§4.11). The SSH
+> edge's writes heard too (2026-11-23, w-git; the forward through svn.rs's `EitherCommand` agreed with w-svn): each socket write of a connection, its time and whether it found the
+> socket full, told the command it carries (`site::Command::paced`), and a git fetch's answer learns from them as the
+> HTTP edge's does (`a859_an_ssh_commands_writes_to_a_client_that_reads_late_are_heard_with_their_waits`: none heard
+> before). Owed: a price per client, not per shard; main's git/git whole round and `fsck --strict`.
 > A-864's readers BUILT (2026-11-22, w-git; main's r52): every git read before a fetch's pack (the advertisement's
 > and ls-refs' peel, the negotiation, the cuts) holds a refusal that met a let-go window and is made again once it is
 > brought back; a fetch lets the windows it brought back go behind its cursor (piece 3); bring-backs bounded. The landed
@@ -1825,6 +1897,12 @@
 > `a_file_made_whole_of_a_named_object_is_named_for_it_until_changed`. Piece 2 BUILT as A-869 (below). OWED: piece 3,
 > the history keeping a named version by its name; piece 4, the current block holding no bytes, read through the plane.
 >
+> **A-873 (2026-11-23, w-svn; main 01a20182's ruling (I), A-760 (b) piece 4a):** a green's identity entry for a file
+> hashes its path, length and plain BLAKE3 digest, which each block keeps from when it was made, not its bytes. Golden
+> vectors are regenerated through `--ignored regenerate_the_identity_golden_vectors`, with a determinism gate. Anchor
+> layout 19 refuses a layout-18 segment typed. OWED: 4b (one read seam, `Bytes | Named`; w-git and w-hg told first),
+> 4c (the engine's named-base reads), 4d (a named block holds no bytes).
+>
 > **A-869 (2026-11-22, w-svn; main 01a20182's order of 19:28, A-760 (b) piece 2):** a green's checkpoint names a file
 > whose block is named for a content-plane object instead of carrying its bytes (`Checkpoint::named`, a section after
 > the head check written only when a file is named; version 5 kept, so every checkpoint before decodes as it did). A
@@ -1834,6 +1912,14 @@
 > (`merge.replica.checkpoint_unread`, A-727 (d) owes its reads). Oracle: the A-866 oracle with restores, at earlier
 > versions too, caught up by recorded entries. Red first: a restored green named nothing. Not yet measured: the
 > register's checkpoint bytes before and after (main's). OWED: a copied tree's keys are carried still.
+> Fixed since (2026-11-23, w-svn): a refused publication's remake read none of the checkpoint's named texts the content
+> store does not keep after landing (cf1529f1d, the remake reads them from the engine it replaces), and a takeover's
+> re-adoption brings them back first, as a recovery's pre-pass does, on one planner (`svn_texts::to_bring`, its two
+> bringers `bring_whole_in` and `bring_whole`; `green_adopt::readopt_with`;
+> `a_readopted_green_brings_back_the_texts_its_checkpoint_names_first`). End to end the re-adoption stays UNREACHABLE
+> for a Subversion green until A-727 (d): the engine a re-adoption is handed is the holder's replica, which reads no
+> named content, so an svn takeover fails today at the replica's build (`merge.replica.checkpoint_unread`). The
+> takeover's end-to-end red belongs to (d)'s landing (w-shared's, main's queue).
 >
 > **Finding, 2026-11-20 (w-engine, not chased under the close order):** `cargo test -p slates-merge --test checkpoint`
 > failed once in 10 runs (`a_green_restored_from_its_checkpoint_answers_as_the_green_it_was`, a proptest, unseeded) on
@@ -4202,6 +4288,17 @@
 > at `!svn/rev/REV`, which the site advertises with `replay-rev-resource`), so `svnsync synchronize` from slates over
 > HTTP cannot run; and DeltaV v1's revision properties (a PROPFIND of the VCC with a `Label`) answer the youngest's.
 > svnsync over svn:// mirrors git-2000 in 270.7 s (135 ms a revision; w-interop's 1,068 s before).
+> **Both built (w-interop, 2026-11-23, main 01a20182's order; w-svn told first, its C2 untouched):** (A) a `Label` on
+> the VCC names that revision's baseline (`dav::site` `labelled`; the server passes the header), so DeltaV v1's
+> `rev_proplist` reads the labelled revision's properties (`deltav_v1_a_labelled_vcc_answers_the_labelled_revisions_properties`);
+> (B) `replay-report` is served at the session URL (old syntax) and at `!svn/rev/REV` (1.8 syntax) by
+> `dav::report_replay::ReplayWalk`, the svn:// site's own `Replay` a call at a time into the DAV drive's replay answer,
+> one path, streamed a slice at a time under the step budget
+> (`a_replay_report_answers_the_svn_sites_replay_of_its_revision_a_slice_at_a_time`,
+> `a_replay_report_is_refused_as_replay_c_refuses_it`). Owed, main's runs (no stock Subversion on the MacBook):
+> stock 1.15 over `SLATES_SVN_USE_ROUTE=http-v1` with `SLATES_SVN_USE_VERBS=revprops` against svnserve; and
+> `svnsync synchronize` over HTTP, the mirror against svnserve's byte for byte (`an_svnsync_measured`'s DAV leg,
+> `SLATES_SVN_USE_VERBS=svnsync` over `http`).
 > **R4, recovery replays a revision record a turn at a time (2026-11-20, w-svn; Ada's close list; found by w-git's sweep):**
 > a Subversion revision's record was replayed whole in one recovery or rebuild turn (`replay_svn` -> `commit_record`),
 > every text it brought deltified in one step, so one large revision held its shard. Now `RevisionReplay`

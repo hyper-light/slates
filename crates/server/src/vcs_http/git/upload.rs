@@ -388,15 +388,7 @@ impl<L: StoreLender> Exchange for Upload<L> {
     let Some(made) = answer.as_mut() else {
       return Err(Failed(Status::INTERNAL_SERVER_ERROR));
     };
-    // A-864 pieces 2 and 3: the windows the next turn reads brought back first, off the turn, so it never meets one let
-    // go; those its cursor has passed let go again.
-    if let Some(pack) = made.pack_source() {
-      let reads = L::pack_reads(pack);
-      lender.read_ahead(reads, resident).await;
-      if reads.next.is_some() {
-        lender.let_go_behind(resident, reads.next);
-      }
-    }
+    read_ahead_of(lender, made, resident).await;
     let before = out.len();
     let step = |served: &Served<'_>, packs: &mut L::Packs| {
       let mut spent = packs.turn();
@@ -444,6 +436,22 @@ impl<L: StoreLender> Exchange for Upload<L> {
       }
     }
     Ok(written == Written::More)
+  }
+}
+
+/// Before an answer's next turn (A-864 pieces 2 and 3): the windows its pack reads next brought back first, off the
+/// turn, so the turn never meets one let go; those its cursor has passed let go again.
+async fn read_ahead_of<L: StoreLender>(
+  lender: &mut L,
+  made: &Answer<<L::Packs as PackSource>::Pack>,
+  resident: &mut Resident,
+) {
+  if let Some(pack) = made.pack_source() {
+    let reads = L::pack_reads(pack);
+    lender.read_ahead(reads, resident).await;
+    if reads.next.is_some() {
+      lender.let_go_behind(resident, reads.next);
+    }
   }
 }
 

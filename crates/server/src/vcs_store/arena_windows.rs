@@ -195,6 +195,15 @@ fn read_piece(bytes: &[u8]) -> Result<PieceRead, PieceRefused> {
   Ok((ContentId(identity), len, placed))
 }
 
+/// Test support (A-870 piece 2's oracle): a window piece's identity and the block its chunk lies in (region, offset,
+/// length), none for one of no chunk or not a window piece.
+#[cfg(test)]
+pub(crate) fn piece_block(bytes: &[u8]) -> Option<(ContentId, u16, u64, u64)> {
+  let (identity, _, placed) = read_piece(bytes).ok()?;
+  let (region, offset, block, _, _) = placed?;
+  Some((identity, region, offset, block))
+}
+
 impl ChunkWindows {
   /// Windows kept as chunks of a chunk store lent to them a step at a time; `page` the placeholder's page.
   pub(crate) fn new(page: usize) -> ChunkWindows {

@@ -169,13 +169,16 @@ impl<V: Clone> Dim<V> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Block(usize);
 
-/// One block: its bytes, its holders, and the content-plane object its bytes are whole, if it was made so (A-760 (b),
-/// [`Blocks::name`]).
+/// One block: its bytes, its holders, the content-plane object its bytes are whole, if it was made so (A-760 (b),
+/// [`Blocks::name`]), and the plain BLAKE3 of its bytes, made once with the block ([`Blocks::digest`], A-760 (b) 4a):
+/// what the green's identity entry for a file holds in place of its bytes. `None` only once a staged text's piece is
+/// appended, until it is read again.
 #[derive(Debug)]
 struct Slot {
   bytes: Vec<u8>,
   holders: u64,
   name: Option<crate::named::Identity>,
+  digest: Option<[u8; 32]>,
 }
 
 /// The bytes of current files, each block with the count of the map nodes naming it (module docs, "Files hold
@@ -191,10 +194,14 @@ pub(crate) struct Blocks {
 impl Blocks {
   /// A new block holding `bytes`, with one holder and named `name` (A-760 (b)).
   fn add(&mut self, bytes: Vec<u8>, name: Option<crate::named::Identity>) -> Block {
+    // A named block's object is named by the plain BLAKE3 of its bytes (`crate::named::Identity`), which is its digest:
+    // only an unnamed block's bytes are hashed.
+    let digest = name.map_or_else(|| *blake3::hash(&bytes).as_bytes(), |name| name.hash);
     let slot = Slot {
       bytes,
       holders: 1,
       name,
+      digest: Some(digest),
     };
     if let Some(at) = self.free.pop()
       && let Some(place) = self.slots.get_mut(at)
@@ -226,6 +233,36 @@ impl Blocks {
       .and_then(|slot| slot.name)
   }
 
+  /// The bytes of the live blocks named for each object `wanted` holds (A-866), one each, in one pass over the blocks: a
+  /// block named for an object holds that object's bytes, whichever file or version holds it.
+  pub(crate) fn named_bytes(
+    &self,
+    wanted: &std::collections::BTreeSet<crate::named::Identity>,
+  ) -> Vec<(crate::named::Identity, Vec<u8>)> {
+    let mut found: std::collections::BTreeMap<crate::named::Identity, Vec<u8>> =
+      std::collections::BTreeMap::new();
+    for slot in self.slots.iter().flatten() {
+      if let Some(name) = slot.name
+        && wanted.contains(&name)
+        && !found.contains_key(&name)
+      {
+        found.insert(name, slot.bytes.clone());
+      }
+    }
+    found.into_iter().collect()
+  }
+
+  /// A block's length and the plain BLAKE3 of its bytes (A-760 (b) 4a): its digest made with it, or its bytes hashed now
+  /// for a staged block a piece was appended to. None for a block that is gone.
+  pub(crate) fn digest(&self, block: Block) -> Option<(u64, [u8; 32])> {
+    let slot = self.slots.get(block.0).and_then(Option::as_ref)?;
+    let len = u64::try_from(slot.bytes.len()).unwrap_or(u64::MAX);
+    let digest = slot
+      .digest
+      .unwrap_or_else(|| *blake3::hash(&slot.bytes).as_bytes());
+    Some((len, digest))
+  }
+
   /// One more holder of `block`.
   pub(crate) fn hold(&mut self, block: Block) {
     if let Some(Some(slot)) = self.slots.get_mut(block.0) {
@@ -248,6 +285,7 @@ impl Blocks {
     if let Some(Some(slot)) = self.slots.get_mut(block.0) {
       slot.bytes.extend_from_slice(bytes);
       slot.name = None;
+      slot.digest = None;
     }
   }
 
@@ -379,6 +417,14 @@ impl Files {
       .map
       .prefix(prefix)
       .map(|(path, block)| (path, self.blocks.bytes(*block)))
+  }
+
+  /// `path`'s file's length and the plain BLAKE3 of its bytes ([`Blocks::digest`]): what its identity entry holds.
+  pub(crate) fn digest_of(&self, path: impl AsRef<[u8]>) -> Option<(u64, [u8; 32])> {
+    self
+      .map
+      .get(path)
+      .and_then(|block| self.blocks.digest(*block))
   }
 
   /// The content-plane object `path`'s file is the whole of, when its block was made of one ([`Blocks::name`]).

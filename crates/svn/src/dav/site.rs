@@ -244,6 +244,9 @@ pub struct Request<'a> {
   pub path: &'a str,
   /// The `Depth` header's value, if one was sent.
   pub depth: Option<&'a str>,
+  /// The `Label` header's value, if one was sent: DeltaV's name for a version of a version-controlled resource (RFC
+  /// 3253 §8.3), which `mod_dav_svn` reads as a revision number ([`labelled`]).
+  pub label: Option<&'a str>,
   /// The body, whole.
   pub body: &'a [u8],
 }
@@ -284,6 +287,8 @@ enum Walk {
   Log(Box<DavLog>),
   /// A `file-revs-report`'s (`svn blame`; A-726), boxed beside the update.
   FileRevs(Box<super::report_file_revs::FileRevsWalk>),
+  /// A `replay-report`'s (`svnsync synchronize`; [`super::report_replay`]).
+  Replay(Box<super::report_replay::ReplayWalk>),
   /// An `update-report`'s ([`super::update`]).
   Update(Box<UpdateWalk>),
 }
@@ -324,6 +329,7 @@ impl Report {
     let log = match &mut self.walk {
       Walk::Log(log) => log,
       Walk::FileRevs(revisions) => return revisions.resume(served, out, budget),
+      Walk::Replay(replay) => return replay.resume(served, out, budget),
       Walk::Update(walk) => {
         let walked = Walked {
           index: served.index,
@@ -401,7 +407,9 @@ pub fn answer<R: Repository + ?Sized>(
   bounds: &Bounds,
   room: usize,
 ) -> Answer {
-  let resource = match resolve(served, request.path) {
+  let resource = match resolve(served, request.path)
+    .and_then(|resource| labelled(served, resource, request.label))
+  {
     Ok(resource) => resource,
     Err(refused) => return Answer::Whole(refused),
   };
@@ -412,6 +420,33 @@ pub fn answer<R: Repository + ?Sized>(
     "REPORT" => report(served, &resource, request, bounds, room),
     method => Answer::Whole(unserved_method(method)),
   }
+}
+
+/// `resource` as a `Label` header names its version: the VCC labelled is that revision's baseline (`mod_dav_svn` reads a
+/// label as a revision number), as DeltaV v1's ra_serf asks for a revision's properties (`rev_proplist`: a PROPFIND of
+/// the VCC with the revision as its label), answered as `!svn/bln/REV` is and refused as it is past the youngest (`404`);
+/// a label that is no revision number is refused `400`. Any other resource is as it was named. Until 2026-11-22 the label
+/// was not read, and the VCC answered the youngest revision's properties whatever revision was asked (w-svn's GAPS
+/// entry "svnsync from slates over the HTTP edge").
+fn labelled<R: ?Sized>(
+  served: &Served<'_, R>,
+  resource: Resource,
+  label: Option<&str>,
+) -> Result<Resource, HttpAnswer> {
+  let (Resource::Vcc, Some(label)) = (&resource, label) else {
+    return Ok(resource);
+  };
+  let revision = decimal(label.trim()).ok_or_else(|| bare(HTTP_BAD_REQUEST))?;
+  if revision > served.index.youngest() {
+    let message = format!("No such revision {revision}");
+    return Err(error_answer(
+      HTTP_NOT_FOUND,
+      true,
+      SVN_ERR_FS_NO_SUCH_REVISION,
+      &message,
+    ));
+  }
+  Ok(Resource::Baseline(revision, BASELINE))
 }
 
 /// What `path` names, read as `parse_uri` reads it; refused for a path with a `.` or `..` name (`400`), a malformed
@@ -637,6 +672,51 @@ fn get<R: Repository + ?Sized>(served: &Served<'_, R>, resource: &Resource) -> A
   }
 }
 
+/// An `update-report`'s answer: HTTPv2's at `me`, DeltaV v1's at the VCC or a node (`update.c`, `session->vcc_url`;
+/// its checked-in hrefs name version resources), streamed; anywhere else `501`.
+fn update_report<R: Repository + ?Sized>(
+  served: &Served<'_, R>,
+  resource: &Resource,
+  update: &super::request::UpdateReport,
+  room: usize,
+) -> Answer {
+  let v2 = match resource {
+    Resource::Me => true,
+    Resource::Node(_) | Resource::Vcc => false,
+    Resource::Baseline(..) | Resource::Unserved => {
+      return Answer::Whole(unserved_method("REPORT"));
+    }
+  };
+  let youngest = served.index.youngest();
+  match UpdateWalk::new(update, served.root, youngest, served.uuid, v2, room) {
+    Ok(walk) => Answer::Report(Report {
+      walk: Walk::Update(Box::new(walk)),
+    }),
+    Err(refused) => Answer::Whole(refused),
+  }
+}
+
+/// A `replay-report`'s answer, streamed (`replay.c`): the 1.8 syntax names its revision by the `!svn/rev/REV` resource
+/// it is sent to, the old one by `S:revision` at the session's URL, whose repository path is the replay's base;
+/// anywhere else `501`.
+fn replay_report(
+  resource: &Resource,
+  replay: &super::request::ReplayReport,
+  room: usize,
+) -> Answer {
+  let (named, base) = match resource {
+    Resource::Baseline(revision, named) if *named == REVISION_STUB => (Some(*revision), "/"),
+    Resource::Node(place) => (None, place.path.as_str()),
+    _ => return Answer::Whole(unserved_method("REPORT")),
+  };
+  match super::report_replay::ReplayWalk::new(replay, named, base, room) {
+    Ok(walk) => Answer::Report(Report {
+      walk: Walk::Replay(Box::new(walk)),
+    }),
+    Err(refused) => Answer::Whole(refused),
+  }
+}
+
 /// The REPORT answer (the module doc): the body read first, then the resource's node; a `log-report` streamed, any
 /// other report `501`.
 fn report<R: Repository + ?Sized>(
@@ -657,22 +737,10 @@ fn report<R: Repository + ?Sized>(
     Err(refused) => return Answer::Whole(refused_body(&refused)),
   };
   if let Asked::Update(update) = &asked {
-    let v2 = match resource {
-      Resource::Me => true,
-      // DeltaV v1's client sends its update-report to the VCC (`update.c`, `session->vcc_url`); its checked-in
-      // hrefs name version resources.
-      Resource::Node(_) | Resource::Vcc => false,
-      Resource::Baseline(..) | Resource::Unserved => {
-        return Answer::Whole(unserved_method("REPORT"));
-      }
-    };
-    let youngest = served.index.youngest();
-    return match UpdateWalk::new(update, served.root, youngest, served.uuid, v2, room) {
-      Ok(walk) => Answer::Report(Report {
-        walk: Walk::Update(Box::new(walk)),
-      }),
-      Err(refused) => Answer::Whole(refused),
-    };
+    return update_report(served, resource, update, room);
+  }
+  if let Asked::Replay(replay) = &asked {
+    return replay_report(resource, replay, room);
   }
   let Resource::Node(place) = resource else {
     return Answer::Whole(unserved_method("REPORT"));

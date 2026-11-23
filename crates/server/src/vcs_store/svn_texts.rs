@@ -260,19 +260,9 @@ pub(crate) async fn bring_back_named(
   green: slates_db::catalog::VolumeId,
   slices: &mut crate::recovery_slices::RecoverySlices,
 ) -> Vec<ContentIdentity> {
-  let Some(repository) = subversion_of(state, green) else {
+  let Some((repository, wanted)) = to_bring(state, green) else {
     return Vec::new();
   };
-  let wanted = named_lacking(state, green);
-  if wanted.is_empty() {
-    return Vec::new();
-  }
-  // Made as a first repository makes it; the image's windows and holds it takes in were set before the replays
-  // (`verbs::restore_held_image`, which runs before the records are rebuilt).
-  let window = state.store.content.chunk_bytes();
-  if state.vcs_stores.content_made(window).is_err() {
-    return Vec::new();
-  }
   let mut brought = Vec::with_capacity(wanted.len());
   for (identity, len) in wanted {
     if bring_whole_in(state, repository, identity, len).await {
@@ -280,6 +270,51 @@ pub(crate) async fn bring_back_named(
       brought.push(identity);
     }
     slices.unit_done().await;
+  }
+  brought
+}
+
+/// What a replay of green `green` needs brought back first ([`bring_back_named`], [`bring_back_named_live`]): its
+/// Subversion repository and the named texts its checkpoint and chain name that the content store does not hold whole
+/// ([`named_lacking`]), the content store made where it is not yet. Made as a first repository makes it: at a recovery,
+/// the image's windows and holds it takes in were set before the replays (`verbs::restore_held_image`, which runs
+/// before the records are rebuilt). None with nothing to bring, for a green of no Subversion repository, or with no
+/// store to bring into.
+fn to_bring(
+  state: &mut ShardState,
+  green: slates_db::catalog::VolumeId,
+) -> Option<(
+  slates_db::catalog::RepositoryId,
+  Vec<(ContentIdentity, u64)>,
+)> {
+  let repository = subversion_of(state, green)?;
+  let wanted = named_lacking(state, green);
+  if wanted.is_empty() {
+    return None;
+  }
+  let window = state.store.content.chunk_bytes();
+  state.vcs_stores.content_made(window).ok()?;
+  Some((repository, wanted))
+}
+
+/// [`bring_back_named`] on a live shard: a takeover's re-adoption, which replays a green's own checkpoint and chain
+/// onto the engine it is handed (`green_adopt::readopt_with`). The same plan ([`to_bring`]), each text brought whole
+/// through the node's changeset store with the shard's state taken a piece at a time ([`bring_whole`]), so it runs as a
+/// task of the owner shard between its other work. What it brought, each holding one count of the content store, for
+/// the caller to give back once the green is installed or fenced.
+pub(crate) async fn bring_back_named_live(
+  green: slates_db::catalog::VolumeId,
+) -> Vec<ContentIdentity> {
+  let Some(Some((repository, wanted))) = crate::state::with_state(|state| to_bring(state, green))
+  else {
+    return Vec::new();
+  };
+  let mut brought = Vec::with_capacity(wanted.len());
+  for (identity, len) in wanted {
+    if bring_whole(repository, identity, len).await {
+      let _ = crate::state::with_state(|state| state.count(NAMED_BROUGHT_BACK, 1));
+      brought.push(identity);
+    }
   }
   brought
 }
@@ -297,7 +332,7 @@ fn subversion_of(
 
 /// The texts green `green`'s checkpoint (A-869) and chain entries name that the content store does not hold whole
 /// (lacks, or holds with a window let go), each once, with its length.
-fn named_lacking(
+pub(crate) fn named_lacking(
   state: &ShardState,
   green: slates_db::catalog::VolumeId,
 ) -> Vec<(ContentIdentity, u64)> {

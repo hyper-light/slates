@@ -398,6 +398,9 @@ pub(crate) async fn let_go_committed(
 ) {
   let mut at = 0_usize;
   while let Some(rest) = contents.get(at..).filter(|rest| !rest.is_empty()) {
+    // Each turn waits while a publication of the shard's image is owed past its bound (A-870 piece 2, main's progress
+    // rule), woken by the publication that carries it up.
+    crate::content_holder::image_resumed().await;
     let taken = crate::state::with_state(|state| {
       let began = slates_rt::futures::now_ns();
       let deadline = began.saturating_add(let_go_turn_ns(state));

@@ -1988,6 +1988,7 @@ dependencies = [
  "slates-hg",
  "slates-land",
  "slates-machine",
+ "slates-mem",
  "slates-rt",
 ]
 

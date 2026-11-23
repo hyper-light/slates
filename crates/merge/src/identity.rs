@@ -1,7 +1,11 @@
 //! A green's head identity as a set hash over its entries (§4.16 "Apply on holders": every holder recomputes the
-//! identity and compares it with the merge record's; A-202). Each entry of the green's state (a file and its bytes, a
-//! directory, a mode, a symlink, a hard link, an extended attribute, a FIFO/socket inode) is encoded as it always was
-//! (its kind's tag, then every field length-prefixed) and expanded by BLAKE3's extendable output into [`LANES`]
+//! identity and compares it with the merge record's; A-202). Each entry of the green's state (a file, a directory, a
+//! mode, a symlink, a hard link, an extended attribute, a FIFO/socket inode) is encoded as its kind's tag, then every
+//! field length-prefixed. A file's fields are its path, its length and the plain BLAKE3 of its bytes, not the bytes
+//! (A-873, A-760 (b) piece 4a, main 01a20182's ruling (I)): each file's block keeps that digest, made once with it, so
+//! no identity step reads a file's bytes, a block that holds none (a file held by its content-plane object) takes part
+//! as one that does, and a file's bytes are hashed once where they were hashed at every add and remove. The entry is
+//! expanded by BLAKE3's extendable output into [`LANES`]
 //! sixteen-bit lanes; the green's sum is those vectors added lane by lane modulo 2^16, and the identity is the BLAKE3
 //! of the sum. This is LtHash16 (Lewi, Kim, Maykov and Weis, "Securing Update Propagation with Homomorphic Hashing",
 //! IACR ePrint 2019/227, tier A; Bellare and Micciancio's incremental hashing, EUROCRYPT 1997): addition is

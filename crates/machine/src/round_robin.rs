@@ -14,9 +14,23 @@
 //! `SIGXCPU` to a real-time thread that runs past it without blocking, and that signal ends the process. Anywhere else
 //! the thread stays time-share, and [`take_current`] says why.
 //!
+//! **The kernel's own calls, never the C library's.** The class is set and read through `SYS_sched_setscheduler` and
+//! `SYS_sched_getscheduler`. musl's `sched_setscheduler` and `sched_getscheduler` answer `ENOSYS` without asking the
+//! kernel (musl `src/sched/sched_setscheduler.c`, read 2026-11-23), because POSIX gives those calls the process and
+//! Linux's name a thread. The release ships static musl binaries for Linux, so through the C library no shard there
+//! would ever take the class. The parameter passed is the kernel's `struct sched_param`, one priority
+//! (`include/uapi/linux/sched/types.h`); the C libraries' own structs may be larger (musl's carries reserved fields).
+//!
 //! **Never spin at real-time priority.** A shard that holds the class parks when it has no work: its idle window and
 //! its closed-loop holds are off (`slates_rt`'s shard). A spinning real-time thread would take its CPU from every
 //! time-share task, and the kernel's real-time throttling would then stall it.
+
+/// The kernel's `struct sched_param` (`include/uapi/linux/sched/types.h`): one priority, which is all the kernel reads.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct KernelSchedParam {
+  sched_priority: libc::c_int,
+}
 
 /// Why a thread did not take the round-robin class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,14 +70,16 @@ pub fn take_current() -> Result<i32, Declined> {
   if lowest < 0 || granted.is_some_and(|limit| limit < lowest_u64) {
     return Err(Declined::NoPriorityGranted { limit: granted });
   }
-  let param = libc::sched_param {
+  let param = KernelSchedParam {
     sched_priority: lowest,
   };
-  // SAFETY: pid 0 is the calling thread; `param` is a valid `sched_param` on this frame, read for the call only.
+  // SAFETY: the kernel's call with pid 0 (the calling thread), a policy constant, and a pointer to `param`, a
+  // `struct sched_param` as the kernel defines it, live on this frame and read for the call only.
   let rc = unsafe {
-    libc::sched_setscheduler(
-      0,
-      libc::SCHED_RR | libc::SCHED_RESET_ON_FORK,
+    libc::syscall(
+      libc::SYS_sched_setscheduler,
+      libc::c_long::from(0_i32),
+      libc::c_long::from(libc::SCHED_RR | libc::SCHED_RESET_ON_FORK),
       &raw const param,
     )
   };
@@ -79,9 +95,10 @@ pub fn take_current() -> Result<i32, Declined> {
 /// Whether the calling thread is in `SCHED_RR` now; `None` where it cannot be read (off Linux).
 #[cfg(target_os = "linux")]
 pub fn holds() -> Option<bool> {
-  // SAFETY: pid 0 is the calling thread; the call reads no memory of ours.
-  let policy = unsafe { libc::sched_getscheduler(0) };
-  (policy >= 0).then_some(policy & !libc::SCHED_RESET_ON_FORK == libc::SCHED_RR)
+  // SAFETY: the kernel's call with pid 0, the calling thread; it reads no memory of ours.
+  let policy = unsafe { libc::syscall(libc::SYS_sched_getscheduler, libc::c_long::from(0_i32)) };
+  let reset_on_fork = libc::c_long::from(libc::SCHED_RESET_ON_FORK);
+  (policy >= 0).then_some(policy & !reset_on_fork == libc::c_long::from(libc::SCHED_RR))
 }
 
 /// Off Linux: not taken.
