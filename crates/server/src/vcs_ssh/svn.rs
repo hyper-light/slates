@@ -84,6 +84,7 @@ use crate::repository::svn_commit::{self, Committed};
 use crate::vcs_hooks::{self, CommittedView, HookPoint, LockToken, PendingView};
 use crate::vcs_http::git::Repositories;
 use crate::vcs_policy::{self, Right};
+use crate::vcs_store::svn_view::FetchedPiece;
 use crate::vcs_svn::{
   HookSite, Hooked, MERGEINFO, post_lock_hook, pre_lock_hooks, revision_property_hook, run_hook,
 };
@@ -174,15 +175,15 @@ pub(crate) trait SvnStores {
   /// record's landing.
   type Turn;
   /// Reads the text piece `wanted` of repository `id` through the node's changeset store, where the repository's
-  /// sources read it until [`SvnStores::let_go`] (C2 stage B part 2): whether it did; none to read where the sources
-  /// hold every text in memory (the default).
-  async fn fetch(&mut self, id: RepositoryId, wanted: slates_svn::reads::Wanted) -> bool {
+  /// sources read it while the piece is held (C2 stage B part 2; `FetchedPiece`, given back by its drop); none where the
+  /// store could not give it, or to read where the sources hold every text in memory (the default).
+  async fn fetch(
+    &mut self,
+    id: RepositoryId,
+    wanted: slates_svn::reads::Wanted,
+  ) -> Option<FetchedPiece> {
     let _ = (id, wanted);
-    false
-  }
-  /// Lets go a piece [`SvnStores::fetch`] read, once the call that waited for it has read it.
-  fn let_go(&mut self, wanted: slates_svn::reads::Wanted) {
-    let _ = wanted;
+    None
   }
   /// Repository `id`'s landing turn, once no other landing holds it; none when its store is not held here.
   async fn turn(&mut self, id: RepositoryId) -> Option<Self::Turn>;
@@ -325,9 +326,9 @@ pub(crate) struct SvnCommand<R, V> {
   repositories: R,
   /// Where their stores are lent.
   stores: V,
-  /// The text piece a drive waited for and the session fetched (C2 stage B part 2), held until the next call has read
-  /// it.
-  fetched: Option<slates_svn::reads::Wanted>,
+  /// The text piece a drive waited for and the session fetched (C2 stage B part 2), held while the drive reads on in it:
+  /// given back when the drive waits for another, when the read's answer ends, or with the session.
+  fetched: Option<FetchedPiece>,
   /// The principal the client's key proved, which the repository's policy judges.
   principal: Principal,
   /// Its name, the tunnel's user.
@@ -471,27 +472,29 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
   /// bytes it took given back.
   async fn stepped(&mut self, gone: ClientGone<'_>) -> Stepped {
     if let Some(status) = self.exit {
+      self.fetched = None;
       return exited(status);
     }
-    let previous = self.fetched.take();
     let received = self.received();
-    // The piece the last wait fetched was read by this call (C2 stage B part 2).
-    if let Some(wanted) = previous {
-      self.stores.let_go(wanted);
+    // The piece the last wait fetched stays held while the read goes on, since a call reads only a quantum of the
+    // drive's steps in it (goal 93); its answer ended, the piece goes.
+    if !self.connection.fetching() {
+      self.fetched = None;
     }
     let consumed = match received {
       Received::NeedMore => return self.wait_or_end(),
       Received::Wrote => 0,
       Received::Waiting(wanted) => {
+        // The drive moved on from the piece held to another.
+        self.fetched = None;
         let Some(id) = self.opened.as_ref().map(|record| record.id) else {
           self.not_held();
           return self.consumed(0);
         };
         // A piece the node's store cannot give ends the session: the drive would wait for it again.
-        if self.stores.fetch(id, wanted).await {
-          self.fetched = Some(wanted);
-        } else {
-          self.not_held();
+        match self.stores.fetch(id, wanted).await {
+          Some(piece) => self.fetched = Some(piece),
+          None => self.not_held(),
         }
         0
       }

@@ -2498,7 +2498,8 @@ struct WholeBuild {
   appended: bool,
   /// The publications made while it seals, each captured in its own turn, in order.
   queued: VecDeque<Queued>,
-  /// The bytes of the deltas in `queued`: held to the credit, as their entries would be.
+  /// The bytes of the deltas in `queued` behind its newest whole state, or behind the build itself while it holds none
+  /// (each one [`Queued::counted`]): held to the credit, as their entries would be.
   queued_bytes: usize,
   /// The bytes sealed so far and the clock time their seals took, the rate the next piece is sized by
   /// ([`piece_bytes`]).
@@ -2531,10 +2532,15 @@ impl std::fmt::Debug for WholeBuild {
   }
 }
 
-/// A publication captured while a whole entry seals ([`WholeBuild::queued`]): whether it ships whole, and its plain body.
+/// A publication captured while a whole entry seals ([`WholeBuild::queued`]): whether it ships whole, its plain body, and
+/// whether its bytes count in [`WholeBuild::queued_bytes`].
 struct Queued {
   whole: bool,
   body: Vec<u8>,
+  /// A delta behind the newest whole state in the queue, or behind the build while the queue holds none: held to the
+  /// credit that whole state (or the build) sets. A delta ahead of a queued whole state is not, since that whole state
+  /// carries its changes.
+  counted: bool,
 }
 
 /// Where one turn of a [`WholeBuild`] left it.
@@ -2762,11 +2768,17 @@ fn advance_capture(
         .and_then(|live| live.building.as_mut())
       {
         build.appended = true;
-        if !whole {
-          // Held to the credit as a queued delta is ([`queue_behind_build`]).
+        // Held to the credit as a queued delta is ([`queue_behind_build`]): ahead of every publication queued meanwhile, so
+        // counted only while no whole state is queued behind it.
+        let counted = !whole && !build.queued.iter().any(|queued| queued.whole);
+        if counted {
           build.queued_bytes = build.queued_bytes.saturating_add(body.len());
         }
-        build.queued.push_front(Queued { whole, body });
+        build.queued.push_front(Queued {
+          whole,
+          body,
+          counted,
+        });
       }
       append_build(state, id);
       Advance::Done
@@ -3566,7 +3578,7 @@ fn append_ready(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> boo
       live.building = None;
       return appended_any;
     };
-    if !next.whole {
+    if next.counted {
       build.queued_bytes = build.queued_bytes.saturating_sub(next.body.len());
     }
     if built_in_turns(state, next.whole, &next.body) {
@@ -3598,7 +3610,7 @@ fn append_ready(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> boo
           .get_mut(&id.bytes)
           .and_then(|live| live.building.as_mut())
         {
-          if !next.whole {
+          if next.counted {
             build.queued_bytes = build.queued_bytes.saturating_add(next.body.len());
           }
           build.queued.push_front(next);
@@ -3686,9 +3698,15 @@ fn fold_waiting_onto(state: &mut ShardState, volume: [u8; 16], position: u64) {
 
 /// Captures a publication of `id` made while a whole entry seals, or while the queue behind one waits, and queues it
 /// last (A-377): its record, the volume's whole image when it ships whole, and its content runs read now, as they stand.
-/// A delta is queued while the deltas queued stay within the credit the whole entry ahead of them sets (its own size,
-/// `Bounds::of_whole`, or the shipper's credit if that is greater), as their entries will be held to it; past it,
-/// refused for credit, it follows in a whole state the volume owes.
+/// A delta is queued while the deltas queued since the newest whole state stay within the credit the whole entry ahead
+/// of them sets (its own size, `Bounds::of_whole`, or the shipper's credit if that is greater), as their entries will be
+/// held to it; past it, refused for credit, it follows in a whole state the volume owes. A whole state queued is that
+/// state: it carries every change up to its publication, the refused delta's among them, so the volume owes no other and
+/// the deltas behind it are counted from it. Until 2026-11-23 the debt stayed owed while the whole state waited in the
+/// queue, so every publication after a refusal was captured whole and queued too, each a copy of the volume: the
+/// conformance lane's live fsstress made 80 to 202 whole entries from 3 to 16 refusals, 1.9 GB of them in CI's run
+/// 45163517212, whose candidates were still an entry behind the owner 40 s after the run
+/// (`docs/bugs/2026-11-23-a-whole-state-queued-behind-a-build-left-the-volume-owing-one.md`).
 fn queue_behind_build(
   state: &mut ShardState,
   id: slates_db::catalog::VolumeId,
@@ -3729,10 +3747,23 @@ fn queue_behind_build(
     refuse(state, id, "fleet.live.refused.no_credit");
     return;
   }
-  if !whole {
+  if whole {
+    // The deltas ahead of it are carried by it, so none counts against the deltas behind it.
+    for queued in &mut build.queued {
+      queued.counted = false;
+    }
+    build.queued_bytes = 0;
+  } else {
     build.queued_bytes = build.queued_bytes.saturating_add(body.len());
   }
-  build.queued.push_back(Queued { whole, body });
+  build.queued.push_back(Queued {
+    whole,
+    body,
+    counted: !whole,
+  });
+  if whole {
+    live.owes_whole = false;
+  }
   state.count(LIVE_QUEUED, 1);
 }
 
@@ -9052,6 +9083,15 @@ mod tests {
 
   /// A live-shipped volume named `name` made on `state`'s shard through the verbs (`Create`, then `LiveShip`).
   fn live_volume_here(state: &mut ShardState, name: &str) -> Option<slates_db::catalog::VolumeId> {
+    live_volume_here_of(state, name, 1 << 20)
+  }
+
+  /// [`live_volume_here`] of `max` bytes at most.
+  fn live_volume_here_of(
+    state: &mut ShardState,
+    name: &str,
+    max: u64,
+  ) -> Option<slates_db::catalog::VolumeId> {
     let principal = slates_db::catalog::Principal::Uid {
       host: HostId(0),
       uid: 1234,
@@ -9062,7 +9102,7 @@ mod tests {
       &principal,
       slates_ipc::protocol::RequestBody::Create {
         name: name.to_owned(),
-        size: slates_ipc::protocol::SizeClass::Dynamic { max: 1 << 20 },
+        size: slates_ipc::protocol::SizeClass::Dynamic { max },
         names: slates_ipc::protocol::NamePolicy::Exact,
         require_locked: false,
         base: None,
@@ -10207,6 +10247,162 @@ mod tests {
       "no delta behind the capture was refused for credit"
     );
     assert_eq!(queued, 3, "every delta queued behind the capture");
+  }
+
+  /// Shape: the bytes each page write behind a refusal writes: enough that the three after the whole state the refusal
+  /// owed, counted with the rewrite queued ahead of it (512 KiB), pass the queue's credit (the capture's 1 MiB), so a
+  /// queue that counted them so would refuse again.
+  const PAGE_WRITE_BYTES: usize = 192 << 10;
+  /// Shape: the page writes made after the refusal.
+  const PAGE_WRITES: u64 = 4;
+  /// Shape: a bound on the rewrites made before a refusal, far past the two that pass the capture's credit.
+  const REWRITE_LIMIT: u64 = 8;
+  /// Shape: the bound of the volume written behind a build: far past what its log keeps here, so its size never makes a
+  /// publication whole ([`kept_reaches_size`]).
+  const OWED_ONCE_VOLUME_BYTES: u64 = 16 << 20;
+  /// Format: the counter of a delta refused for credit.
+  const LIVE_NO_CREDIT: &str = "fleet.live.refused.no_credit";
+
+  /// `name`'s count on `state`'s shard.
+  fn live_count(state: &ShardState, name: &str) -> u64 {
+    state.refusals.get(name).copied().unwrap_or(0)
+  }
+
+  /// Every holder of `id`'s log answers that it holds the owner's head, as each holder's acknowledgement would, and the
+  /// owner appends what its build now admits ([`append_build`]).
+  fn acknowledged_at_head(
+    state: &mut ShardState,
+    id: slates_db::catalog::VolumeId,
+    holders: &[HostId],
+  ) {
+    if let Some(live) = state.live.shipping.get_mut(&id.bytes)
+      && let Some(head) = live.shipper.head()
+    {
+      for holder in holders {
+        live.shipper.on_reply(*holder, Ok(Some(head)));
+      }
+    }
+    append_build(state, id);
+  }
+
+  /// Rewrites one of `id`'s two files whole and publishes, the two in turn, until a delta is refused for credit or
+  /// [`REWRITE_LIMIT`] rewrites are made: the rewrites made.
+  fn rewritten_until_refused(
+    state: &mut ShardState,
+    id: slates_db::catalog::VolumeId,
+  ) -> Option<u64> {
+    let mut rewrites = 0u64;
+    while live_count(state, LIVE_NO_CREDIT) == 0 && rewrites < REWRITE_LIMIT {
+      rewrites += 1;
+      let file = if rewrites.is_multiple_of(2) {
+        "second"
+      } else {
+        "first"
+      };
+      write_captured(state, id, file, &rewrites.to_le_bytes())?;
+      let _ = crate::verbs::publish_shard(state);
+    }
+    Some(rewrites)
+  }
+
+  /// Writes [`PAGE_WRITE_BYTES`] into `id`'s first file a page after another and publishes each, [`PAGE_WRITES`] times.
+  fn pages_written(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> Option<()> {
+    for page in 0..PAGE_WRITES {
+      let handle = *state.by_id.get(&id)?;
+      let ShardState { store, volumes, .. } = &mut *state;
+      let slot = volumes.get_mut(handle).ok()?;
+      let root = slot.volume.root_inode(store).ok()?;
+      let file = slot.volume.lookup_no(store, root, "first").ok()?.inode;
+      let at = page.saturating_mul(u64::try_from(PAGE_WRITE_BYTES).ok()?);
+      let fill = u8::try_from(page).ok()?;
+      slot
+        .volume
+        .write(store, file, at, &vec![fill; PAGE_WRITE_BYTES])
+        .ok()?;
+      let _ = crate::verbs::publish_shard(state);
+    }
+    Some(())
+  }
+
+  /// Runs `id`'s build's turns and acknowledges every entry from `holders` until nothing is queued, within
+  /// [`CAPTURE_TURN_LIMIT`] rounds.
+  fn appended_to_the_end(
+    state: &mut ShardState,
+    id: slates_db::catalog::VolumeId,
+    holders: &[HostId],
+  ) {
+    let mut rounds = 0u64;
+    while building(state, id.bytes) && rounds < CAPTURE_TURN_LIMIT {
+      rounds += 1;
+      run_build(state, id);
+      acknowledged_at_head(state, id, holders);
+    }
+  }
+
+  /// A-377 (§4.10 "Live shipping"): a delta refused for credit behind a build "follows in a whole state the volume owes",
+  /// one whole state, and the deltas queued behind that whole state are held to the credit from it. Do: on a live volume
+  /// of 16 MiB with no whole entry yet, write two 512 KiB files and publish at a quantum of zero (its whole state,
+  /// captured in turns); behind the capture rewrite a file whole and publish until a delta is refused for credit; then
+  /// write 192 KiB into the first file and publish, four times; then run the build's turns and acknowledge every entry
+  /// from both holders until nothing is queued. Expect one refusal, two whole entries on the log (the first and the one
+  /// the refusal owed), and every publication but the refused one an entry of its own. Before, the debt stayed owed
+  /// while the whole state waited in the queue, so each publication after the refusal was captured whole and queued
+  /// too: five whole entries here, and in the conformance lane's live fsstress 80 to 202 from 3 to 16 refusals (1.9 GB
+  /// of whole states in CI's run 45163517212). With the debt paid but the deltas behind the whole state counted with the
+  /// rewrite ahead of it, the last page write was refused again.
+  #[test]
+  fn a_delta_refused_behind_a_build_owes_one_whole_state_and_the_writes_after_it_queue_as_changes()
+  {
+    let measured = crate::daemon::audit_on_shard(|state| {
+      let id = live_volume_here_of(state, "owed-once", OWED_ONCE_VOLUME_BYTES)?;
+      write_captured(state, id, "first", b"owed once: the first file")?;
+      write_captured(state, id, "second", b"owed once: the second file")?;
+      let local = state.fleet.configuration().owner;
+      let holders = [
+        HostId(local.0.wrapping_add(1)),
+        HostId(local.0.wrapping_add(2)),
+      ];
+      owe_first_whole(state, id, &holders);
+      state.seal_walk_quantum_ns = Some(0);
+      let _ = crate::verbs::publish_shard(state);
+      if !building(state, id.bytes) {
+        return None;
+      }
+      let rewrites = rewritten_until_refused(state, id)?;
+      pages_written(state, id)?;
+      appended_to_the_end(state, id, &holders);
+      Some((
+        rewrites,
+        live_count(state, LIVE_NO_CREDIT),
+        live_count(state, LIVE_WHOLE),
+        live_count(state, LIVE_APPENDED),
+        building(state, id.bytes),
+      ))
+    });
+    let (rewrites, refused, whole, appended, still_building) =
+      measured.expect("the scene was made");
+    println!(
+      "behind a build: {rewrites} rewrites, {refused} refused for credit, then {PAGE_WRITES} page writes; {whole} whole \
+       entries of {appended} appended; still building {still_building}"
+    );
+    assert_eq!(
+      refused, 1,
+      "one delta behind the capture was refused for credit"
+    );
+    assert!(
+      !still_building,
+      "the build and its queue were appended to the end"
+    );
+    assert_eq!(
+      whole, 2,
+      "two whole entries: the first and the one the refusal owed, every publication after it a change"
+    );
+    assert_eq!(
+      appended,
+      1 + rewrites - 1 + PAGE_WRITES,
+      "every publication but the refused one an entry of its own: the first whole state, the rewrites queued, and the \
+       page writes (the first of them the whole state owed)"
+    );
   }
 
   /// A-768, A-827: a whole capture in turns reads the head it began on. Do: write two 512 KiB files to a live volume and

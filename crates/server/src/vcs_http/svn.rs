@@ -59,6 +59,7 @@
 use crate::repository::svn_commit::{Committed, Uncommitted};
 use crate::vcs_hooks::{self, CommittedView, HookPoint, LockToken, PendingView};
 use crate::vcs_store::svn_texts::SvnView;
+use crate::vcs_store::svn_view::FetchedPiece;
 use crate::vcs_svn::{HookSite, Hooked, MERGEINFO, run_hook};
 use slates_db::catalog::{Principal, RepositoryId, RepositoryRecord, VcsTool};
 use slates_http::Admission;
@@ -255,16 +256,15 @@ pub(crate) trait SvnStores {
   }
 
   /// Reads the text piece `wanted` of repository `id` through the node's changeset store, where the repository's
-  /// sources read it until [`SvnStores::let_go`] (C2 stage B part 2): whether it did; none to read where the sources
-  /// hold every text in memory (the default).
-  async fn fetch(&mut self, id: RepositoryId, wanted: slates_svn::reads::Wanted) -> bool {
+  /// sources read it while the piece is held (C2 stage B part 2; `FetchedPiece`, given back by its drop); none where the
+  /// store could not give it, or to read where the sources hold every text in memory (the default).
+  async fn fetch(
+    &mut self,
+    id: RepositoryId,
+    wanted: slates_svn::reads::Wanted,
+  ) -> Option<FetchedPiece> {
     let _ = (id, wanted);
-    false
-  }
-
-  /// Lets go a piece [`SvnStores::fetch`] read, once the slice that waited for it has read it.
-  fn let_go(&mut self, wanted: slates_svn::reads::Wanted) {
-    let _ = wanted;
+    None
   }
 
   /// Lands an accepted `work` on repository `id`'s logs by `principal` through the owner's commit step
@@ -557,18 +557,18 @@ fn served_of<'a, R: ?Sized>(lent: &'a Lent<'a, R>, root: &'a str) -> Served<'a, 
 }
 
 /// Steps `report` until its first bytes or its end, the records `hold` holds lent for each slice of `room` and the task yielding
-/// between them (§4.3): what they come to decides the status the reply begins with, as `dav_method_report` answers a
+/// between them (§4.3), a piece its walk waited for held in `fetched` (the exchange's, so the later slices read on in
+/// it): what they come to decides the status the reply begins with, as `dav_method_report` answers a
 /// report's error only while it has sent nothing. A refusal after its first bytes, within these slices, fails the
 /// request `500` before any of it is sent, where `mod_dav` would have sent the bytes and ended the connection.
 async fn first_slices<S: SvnStores>(
   stores: &mut S,
   asker: (&S::Hold, &Principal, &str, RepositoryId),
   mut report: Report,
-  room: usize,
+  (room, fetched): (usize, &mut Option<FetchedPiece>),
 ) -> Result<Answered, Failed> {
   let (hold, principal, root, repository) = asker;
   let mut pending = Vec::new();
-  let mut fetched = None;
   loop {
     let budget = slice_budget(room, stores.fetch_quantum());
     let progress = stores
@@ -576,17 +576,17 @@ async fn first_slices<S: SvnStores>(
         report.resume(&served_of(lent, root), &mut pending, budget)
       })
       .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
-    // The piece the last wait fetched was read by this slice (C2 stage B part 2).
-    if let Some(wanted) = fetched.take() {
-      stores.let_go(wanted);
-    }
+    // The piece the last wait fetched stays held while the walk reads on in it, since a slice reads only a quantum of
+    // the walk's steps (goal 93): the exchange's, so the later slices read on in it too, until the walk waits for
+    // another or ends.
     let done = match progress {
       ReportProgress::Waiting(wanted) => {
+        *fetched = None;
         // A piece the node's store cannot give fails the request: the walk would wait for it again.
-        if !stores.fetch(repository, wanted).await {
+        let Some(piece) = stores.fetch(repository, wanted).await else {
           return Err(Failed(Status::SERVICE_UNAVAILABLE));
-        }
-        fetched = Some(wanted);
+        };
+        *fetched = Some(piece);
         if pending.is_empty() {
           continue;
         }
@@ -597,7 +597,10 @@ async fn first_slices<S: SvnStores>(
         continue;
       }
       ReportProgress::More => false,
-      ReportProgress::Done => true,
+      ReportProgress::Done => {
+        *fetched = None;
+        true
+      }
       ReportProgress::Refused(answer) => {
         return Ok(Answered::Whole {
           status: status_of(answer.status),
@@ -647,9 +650,10 @@ pub(crate) struct SvnExchange<S: SvnStores> {
   request_room: u64,
   /// The answer, once made.
   answered: Option<Answered>,
-  /// The text piece a report's walk or a GET's read waited for and the exchange fetched (C2 stage B part 2), held until
-  /// the next slice has read it.
-  fetched: Option<slates_svn::reads::Wanted>,
+  /// The text piece a report's walk or a GET's read waited for and the exchange fetched (C2 stage B part 2): a GET's
+  /// until the next call has read it, which reads it whole; a walk's while it reads on in it, until it waits for another
+  /// or ends; and with the exchange.
+  fetched: Option<FetchedPiece>,
   /// The repository's name, the green's name a commit's messages name.
   name: String,
   /// The HTTPv2 commit headers the request sent ([`CommitHeaders`]).
@@ -2123,7 +2127,7 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
           &mut self.stores,
           (held, &self.principal, root, self.repository),
           report,
-          room,
+          (room, &mut self.fetched),
         )
         .await?
       }
@@ -2178,10 +2182,8 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
             }
           })
           .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
-        // The piece the last wait fetched was read by this call (C2 stage B part 2).
-        if let Some(wanted) = self.fetched.take() {
-          self.stores.let_go(wanted);
-        }
+        // The piece the last wait fetched was read whole by this call (C2 stage B part 2).
+        self.fetched = None;
         let piece = match read {
           TextRead::Piece(piece) => piece,
           TextRead::Waiting => {
@@ -2190,10 +2192,10 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
               offset: at,
             };
             // A piece the node's store cannot give ends the answer: the read would wait for it again.
-            if !self.stores.fetch(self.repository, wanted).await {
+            let Some(piece) = self.stores.fetch(self.repository, wanted).await else {
               return Err(Failed(Status::INTERNAL_SERVER_ERROR));
-            }
-            self.fetched = Some(wanted);
+            };
+            self.fetched = Some(piece);
             return Ok(true);
           }
           TextRead::Missing => return Err(Failed(Status::SERVICE_UNAVAILABLE)),
@@ -2224,21 +2226,21 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
             report.resume(&served_of(lent, root), out, budget)
           })
           .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
-        // The piece the last wait fetched was read by this slice (C2 stage B part 2).
-        if let Some(wanted) = self.fetched.take() {
-          self.stores.let_go(wanted);
-        }
+        // The piece the last wait fetched stays held while the walk reads on in it, since a slice reads only a quantum
+        // of the walk's steps (goal 93), and goes when the walk waits for another or is done.
         match progress {
           ReportProgress::More => Ok(true),
           ReportProgress::Waiting(wanted) => {
+            self.fetched = None;
             // A piece the node's store cannot give ends the answer: the walk would wait for it again.
-            if !self.stores.fetch(self.repository, wanted).await {
+            let Some(piece) = self.stores.fetch(self.repository, wanted).await else {
               return Err(Failed(Status::INTERNAL_SERVER_ERROR));
-            }
-            self.fetched = Some(wanted);
+            };
+            self.fetched = Some(piece);
             Ok(true)
           }
           ReportProgress::Done => {
+            self.fetched = None;
             *done = true;
             Ok(false)
           }
