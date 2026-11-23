@@ -755,7 +755,6 @@ pub mod platform {
     AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
     SendAncillaryMessage, SendFlags, SocketAddrUnix, SocketFlags, SocketType,
   };
-  use slates_mem::Handoff;
 
   use super::{Accepted, Connected, Doorbell, Prepared, Served, rendezvous_name};
   use crate::error::{IpcError, RouteRefusal};
@@ -949,9 +948,10 @@ pub mod platform {
   impl Control {
     /// A dup of the completion eventfd, for the daemon's end to nudge — the original stays here for the
     /// liveness socket's owner. Dup'ing shares the eventfd object, so a nudge on the dup increments the
-    /// counter the client's own dup reads.
+    /// counter the client's own dup reads. Close-on-exec: a plain `dup` made one without it, and every hook the daemon
+    /// spawned held a duplicate of each connected client's eventfd (2026-11-23).
     pub fn completion_dup(&self) -> Option<OwnedFd> {
-      rustix::io::dup(&self.completion).ok()
+      rustix::io::fcntl_dupfd_cloexec(&self.completion, 0).ok()
     }
 
     /// Sends a direct-map delivery to the client over the control socket (§4.6, A-171): the descriptor of
@@ -1710,26 +1710,26 @@ pub mod platform {
       client_id,
       cause: Box::new(cause),
     };
-    let (handoff, len) = region.handoff().map_err(lost)?;
-    let Handoff::Descriptor(raw) = handoff else {
-      return Err(lost(IpcError::Layout {
-        reason: "a Linux region hands off a descriptor",
-      }));
-    };
+    // The region's own descriptor is sent, borrowed: the kernel installs the client's copy, so the daemon makes none,
+    // and a refusal on the way leaves nothing of the region behind. Until 2026-11-23 a duplicate was made first and
+    // owned only once the kick was made, so a kick refused for want of a descriptor returned before it and the
+    // duplicate stayed open for the daemon's life
+    // (docs/bugs/2026-11-23-a-hand-off-left-an-inheritable-duplicate-at-every-call.md).
+    let len = region.object().len();
     let kick = match kick_fd {
-      Some(fd) => rustix::io::dup(
+      // Close-on-exec, as every descriptor of the daemon's: a plain `dup` makes one without it, which a hook spawned
+      // meanwhile inherits.
+      Some(fd) => rustix::io::fcntl_dupfd_cloexec(
         // SAFETY: the caller's control shard is completing this handoff. The runtime
         // keeps every shard's kick descriptor until all its shard threads have joined,
         // so the eventfd stays open throughout this duplicate.
         unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) },
+        0,
       )
       .map_err(|e| lost(refused("dup", e)))?,
       None => rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)
         .map_err(|e| lost(refused("eventfd", e)))?,
     };
-    // SAFETY: the number is the duplicate `handoff` created for a child to inherit; this
-    // process owns it and closes it after the send.
-    let region_fd = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw) };
     let completion = rustix::event::eventfd(
       0,
       rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK,
@@ -1738,19 +1738,21 @@ pub mod platform {
     let mut body = [0u8; HANDOFF_BYTES];
     body[HANDOFF_AT_CLIENT..HANDOFF_AT_LEN].copy_from_slice(&client_id.to_le_bytes());
     body[HANDOFF_AT_LEN..].copy_from_slice(&u64::try_from(len).unwrap_or(u64::MAX).to_le_bytes());
-    let fds = [region_fd.as_fd(), completion.as_fd(), kick.as_fd()];
-    let mut space =
-      [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(HANDOFF_FDS))];
-    let mut control = SendAncillaryBuffer::new(&mut space);
-    control.push(SendAncillaryMessage::ScmRights(&fds));
-    let sealed = channel.seal(Class::Handoff, &body).map_err(lost)?;
-    rustix::net::sendmsg(
-      &peer,
-      &[IoSlice::new(&sealed)],
-      &mut control,
-      SendFlags::NOSIGNAL,
-    )
-    .map_err(|e| lost(refused("sendmsg", e)))?;
+    {
+      let fds = [region.object().as_fd(), completion.as_fd(), kick.as_fd()];
+      let mut space =
+        [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(HANDOFF_FDS))];
+      let mut control = SendAncillaryBuffer::new(&mut space);
+      control.push(SendAncillaryMessage::ScmRights(&fds));
+      let sealed = channel.seal(Class::Handoff, &body).map_err(lost)?;
+      rustix::net::sendmsg(
+        &peer,
+        &[IoSlice::new(&sealed)],
+        &mut control,
+        SendFlags::NOSIGNAL,
+      )
+      .map_err(|e| lost(refused("sendmsg", e)))?;
+    }
     Ok(Accepted {
       client_id,
       uid,

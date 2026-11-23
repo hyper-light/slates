@@ -47,7 +47,8 @@ pub(crate) use platform::{RangeView, ReadView};
 /// How an object is handed to another process.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Handoff {
-  /// A descriptor number the child inherits (Linux).
+  /// A descriptor number (Linux): the object's own, opened in its process by duplicating it, or inherited at that number
+  /// by a child whose spawn cleared its close-on-exec (the anchor's daemon).
   Descriptor(i32),
   /// A name the other process opens (macOS, Windows).
   Name(String),
@@ -257,9 +258,9 @@ impl SharedObject {
     platform::handoff_for_name(name)
   }
 
-  /// What to hand a child process so it can [`SharedObject::open`] this object. On Linux the
-  /// descriptor is duplicated without `CLOEXEC` so a spawned child inherits it; the caller
-  /// closes nothing (the duplicate lives in the child).
+  /// What to hand another process, or this one, so it can [`SharedObject::open`] this object. On Linux the number of
+  /// the object's own descriptor, close-on-exec and open while this object lives: an open duplicates it, and a spawn
+  /// that hands it to a child clears close-on-exec in that child alone, so no other child inherits it.
   pub fn handoff(&self) -> Result<Handoff, MemError> {
     self.inner.handoff()
   }
@@ -634,7 +635,7 @@ impl SparseObject {
     })
   }
 
-  /// What to hand another process so it can [`SparseObject::open`] this object.
+  /// What to hand another process so it can [`SparseObject::open`] this object, as [`SharedObject::handoff`] says.
   pub fn handoff(&self) -> Result<Handoff, MemError> {
     self.inner.handoff()
   }
@@ -1605,14 +1606,15 @@ mod platform {
       })
     }
 
+    /// The object's own descriptor's number: close-on-exec, open while this object lives, and owned by nothing the
+    /// number reaches. An open of it duplicates it, and a spawn that hands it on clears close-on-exec in its child alone
+    /// (`slates_anchor`'s supervisor). Until 2026-11-23 this made a duplicate without close-on-exec that nothing owned:
+    /// every call left one open, an anchor two more at each daemon start, and every child of the daemon inherited them
+    /// (docs/bugs/2026-11-23-a-hand-off-left-an-inheritable-duplicate-at-every-call.md).
     #[cfg(target_os = "linux")]
     pub(super) fn handoff(&self) -> Result<Handoff, MemError> {
-      use std::os::fd::{AsFd, IntoRawFd};
-      // A duplicate without CLOEXEC, for a child to inherit; the number is what it receives.
-      let dup = rustix::io::dup(self.fd.as_fd()).map_err(|e| refused("dup", e))?;
-      rustix::io::fcntl_setfd(&dup, rustix::io::FdFlags::empty())
-        .map_err(|e| refused("fcntl", e))?;
-      Ok(Handoff::Descriptor(dup.into_raw_fd()))
+      use std::os::fd::AsRawFd;
+      Ok(Handoff::Descriptor(self.fd.as_raw_fd()))
     }
 
     #[cfg(target_os = "macos")]
