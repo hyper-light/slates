@@ -609,3 +609,12 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
   - GAPS, OPEN: a first run's missing deadline. The macOS close-on-exec sweep, by file and line, is reported, not
     fixed.
 - Next: A-760 (b), items 3-7 (the green's block names the plane's object). Tell w-perf when starting.
+
+## A-866 LANDED d386763ba (merge 275183739), 2026-11-22: A-760 (b) piece 1 of 4
+- A block made whole of one named run spanning its object keeps the object identity (`Green::name_of`), through
+  judge_named + make_step + commit and apply_recorded alike. No memory change.
+- Oracle `engine::named_tests::a_file_made_whole_of_a_named_object_is_named_for_it_until_changed`: red first
+  (`left: None`); census moved 355, shared 20, changed away 143, kept 87, stepped 210. slates-merge --lib 276 passed.
+- Plan: inbox/main-from-w-svn-a760b-plan.md. w-perf told: inbox/w-perf-from-w-svn-a760-items.md.
+- NEXT (main starts it): piece 2, a checkpoint naming a named file instead of its bytes.
+- Run request for main: clippy -p slates-merge --all-targets (the lib change and the new test).
