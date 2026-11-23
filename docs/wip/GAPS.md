@@ -7440,7 +7440,21 @@
 > "replicated here" replaces the test hook, so production routing serves a green's works on every node that replicates
 > it; the green's successor takes a holder work's asks after a takeover.
 > A forwarded write's deferred acceptance is answered by its commit since 2026-11-20 (it was polled a heartbeat at a
-> time). A borrower waiting for a lent record session is woken by its return since 2026-11-20 (it slept a
+> time).
+> **Closed (w-chaos, 2026-11-23): that change answered a forwarded write held for its live volume's durability
+> `Overloaded` at once, every time.** The exchange attached only to a deferred acceptance. The write ran and became
+> durable, but no forwarded live write was answered at durability: a superseded owner's clients met `Overloaded` on
+> every write (the fleet's A-338 and A-349 tests, red 2 of 2), and a client resending under a fresh id applied the
+> write twice.
+> - **The fix.** The exchange attaches wherever the reply is held: the completion, the acceptance, a work's gate, or
+>   the live hold (`live_ship::await_forwarded`, writes and destroys), answered wherever the hold ends. Where the verb
+>   ran but its outcome is unknown, it is answered the in-doubt `DurabilityPending`, recorded nowhere, never
+>   `Overloaded` (main's ruling: `Overloaded` only where the request was never admitted).
+> - **Also found and fixed.** A regression of w-chaos's own 6b2952f4d and 0a4dcc51b: the unheld-forward guard ran before
+>   a request's recorded completion and ignored A-255's authority, so four takeover-resend tests met `NotOwnerHere` for
+>   good.
+> - **Notes.** docs/bugs/2026-11-23-a-forwarded-write-held-for-its-live-volumes-durability-was-answered-overloaded.md
+>   and docs/bugs/2026-11-23-a-takeover-resend-met-the-unheld-forward-guard-before-its-completion.md. A borrower waiting for a lent record session is woken by its return since 2026-11-20 (it slept a
 > pace between looks). A dispatch's stragglers are waited for by their reports' wakes since 2026-11-20 (a tick or a poll
 > interval at a time before). Owed from that sweep: a FUSE mount helper's exit (`fuse.rs`), awaited by its `ExitWatch`; the forward lane's throughput (about 1.1 GB/s on loopback on a quiet Mac, BENCHMARKS 2026-11-20; "200 MB/s" was a loaded machine's; 1.3 GB/s median after the sender's and receiver's per-packet copies were removed, BENCHMARKS 2026-11-20; owed: one syscall a datagram, the profile's top, and a datagram's copy out of the shard's receive buffer); and the shared-green
 > bench run's exit 4 at 64 MiB under memory pressure. Exit 4 is the watchdog's (`watchdog.rs`, `FAILED_EXIT_CODE`): a

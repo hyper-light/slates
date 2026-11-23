@@ -61933,3 +61933,42 @@ name whatever their `cfg`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sdk_async.t
   - `unsafe-budget.toml`: anchor +1, ipc ±0.
   - GAPS.
   - docs/bugs/2026-11-23-a-hand-off-left-an-inheritable-duplicate-at-every-call.md.
+
+### AUD-11 amended again — A forwarded verb that ran and deferred its reply is answered where the reply is held, or in doubt; never `Overloaded` (2026-11-23, w-chaos for main 01a20182, its rulings of 2026-11-23 on the forward's answer; A-200, A-255, A-354, A-794, §4.8 "Lookup", §4.9)
+
+- **Why.** AUD-11's first amendment (2026-11-20) attached a forward's exchange only to a deferred acceptance. A write or
+  destroy the live log held for durability or its tombstone's placement (A-200, AUD-29-43) met `Gone` and was answered
+  `Overloaded` at once, every time, though it ran and became durable. A superseded owner's clients met that on every
+  write (the fleet's A-338 and A-349 tests). `Overloaded` says a verb was not applied, so a client resending under a
+  fresh id applies a committed write twice.
+- **The rule.** A forwarded verb that ran on its owner and deferred its reply is answered as follows:
+  - the reply recorded already;
+  - else by whatever holds the reply: a deferred acceptance's commit, a work's gate (A-794), or the live hold
+    (`live_ship::await_forwarded`, answered at the hold's every ending: its own reply, `DurabilityPending` at the
+    failover SLO, or the fence's, the yield's or the destroy's refusal);
+  - else, and past the exchange's liveness budget, and where the owner's shard cannot be asked, the in-doubt
+    `DurabilityPending`, recorded nowhere, so a resend under the id meets the outcome. `Overloaded` is answered only
+    where a request provably was never admitted.
+- **The guard's order.** The unheld-forward guard (6b2952f4d, 0a4dcc51b) applies only to a request new on the
+  partition: one the partition knows is answered by what it recorded, whoever holds its volume now. For a work no
+  member owns, the owner of the green its catalog record names answers for it (A-255). Both were missed when the guard
+  landed. A takeover's resend met `NotOwnerHere` for good in four fleet tests.
+- **Tests** (adacachy2; red on main, green with the change):
+  - the two superseded-owner tests;
+  - `a_write_through_a_node_that_does_not_own_its_live_volume_is_answered_at_durability` (11,007 `Overloaded` before);
+  - `a_forwarded_write_recorded_before_its_exchange_asks_is_answered_its_outcome` (`Daemon::inject_forward_answer_delay`,
+    its count `fleet.forward.deferred_completed`);
+  - the four takeover-resend tests.
+  Two forwarded-submit tests now expect `DurabilityPending` (or their origin's `OwnerUnreachable`) where they expected
+  `Overloaded`.
+- **Applied in the same change to:**
+  - `crates/server/src/verbs.rs`: `await_deferred_completion`, `attach_deferred_forward`, `deferred_in_doubt`, the
+    guard's order and A-255's authority in `forwarded_write` and `refusal_of_unheld_forward`, the test delay.
+  - `crates/server/src/live_ship.rs`: `Awaiting::forwarded`, `await_forwarded`, the answers in `answer` and
+    `tell_given_up`.
+  - `crates/server/src/work_home.rs`: `answer_forwarded`.
+  - `crates/server/src/state.rs` and `daemon.rs`: the test delay.
+  - `crates/server/tests/fleet.rs`.
+  - GAPS.
+  - docs/bugs/2026-11-23-a-forwarded-write-held-for-its-live-volumes-durability-was-answered-overloaded.md and
+    docs/bugs/2026-11-23-a-takeover-resend-met-the-unheld-forward-guard-before-its-completion.md.
