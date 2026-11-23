@@ -10,3 +10,5 @@ The rule revisions and first three leads are in inbox/main-from-codex-review-sta
 | Forgetting a duplicate payload broke another repository's reads | The 28-byte cross-repository read returned None after restart. Six focused tests and the original damaged checkpoint passed with the fix. | Fixed in f99b60b87, landed via aba34339c. See inbox/main-from-codex-review-shared-payload.md and run-requests.md. |
 
 Main acknowledged and routed all four findings at 19:25 PST. The single-serve investigation is closed (run 45091701553, VM ping-pong 3.8–34.7 ms, bare-metal Studio Destroy 0.42 ms and client round 0.60 ms). The A-865 review is in progress. Its historical-copy refusal went to w-svn through main with the focused red in inbox/main-from-codex-review-svn-cold-copy.md.
+
+A refused Subversion whole-text read kept 262,144 bytes. Reproduced on e7269dae4 and reported to w-svn through main in inbox/main-from-codex-review-svn-bring-room.md.

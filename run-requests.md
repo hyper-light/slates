@@ -7592,3 +7592,7 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 ## 2026-11-22 codex-review, A-865 historical copy with an away source, e7269dae4
 
 After w-svn's fix, run `cargo test --release --locked -p slates-cli --test svn_interop stock_svn_copies_a_directory_from_an_older_revision_over_svn_protocol -- --exact --nocapture` with the pinned stock client on the Studio and Linux. A historical copy refusing or returning different source bytes is red. The attached focused server test in inbox/main-from-codex-review-svn-cold-copy.md also forces its source window cold.
+
+## 2026-11-22 codex-review, svn-bring-room
+
+After w-svn's fix run `cargo test --release --locked -p slates-server --lib a_refused_subversion_text_bring_returns_its_completed_windows` on Linux and macOS with the attached regression. The refused read should return the content budget to its starting value and release its completed window.
