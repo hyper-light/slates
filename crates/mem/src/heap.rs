@@ -65,17 +65,60 @@ fn system() -> Option<(u64, u64)> {
   ))
 }
 
-/// The system allocator's (allocated, in use) bytes (glibc): its main and other arenas' bytes from the OS (`arena`) and
-/// its own large mappings (`hblkhd`), against the bytes in use in the arenas (`uordblks`) and those mappings.
+/// The system allocator's (allocated, in use) bytes (glibc): its arenas' bytes from the OS (`arena`) and its own large
+/// mappings (`hblkhd`), against the bytes in use in the arenas (`uordblks`) and those mappings.
 #[cfg(all(target_os = "linux", target_env = "gnu", not(miri)))]
 fn system() -> Option<(u64, u64)> {
+  let malloc = malloc();
+  Some((
+    malloc.arena.saturating_add(malloc.mapped),
+    malloc.in_use.saturating_add(malloc.mapped),
+  ))
+}
+
+/// glibc's own figures for the system allocator, the memory status's `process.malloc_*` gauges (main 01a20182's ruling
+/// of 2026-11-23): what it holds from the OS, what of that is free, and what it mapped for blocks of their own.
+///
+/// **What they cover**, read in glibc 2.39's `malloc/malloc.c` (the version the CI runners carry), not from its man
+/// page: `__libc_mallinfo2` walks every arena, from `main_arena` round its `next` ring, taking each arena's lock in turn,
+/// and `int_mallinfo` adds that arena's figures into one record. So the sums are over every arena (the main one and each
+/// thread's), each arena read consistently but the arenas one after another, not at one instant.
+/// - `arena`: each arena's `system_mem` summed, the bytes it holds from the OS (`brk` for the main arena, its own heaps
+///   for the others), its mapped blocks apart.
+/// - `free` (`fordblks`): each arena's free bytes summed: its top chunk, its fastbin chunks and the chunks in its bins.
+///   The fastbins' bytes (`fsmblks`) are already in it (`avail += fastavail` before `fordblks += avail`), so they are not
+///   added again. These are freed bytes the allocator keeps: it gives them back only by trimming the top past
+///   `M_TRIM_THRESHOLD` or by `malloc_trim`.
+/// - `mapped` (`hblkhd`): `mp_.mmapped_mem`, process-wide (set once, at the main arena): the bytes of blocks glibc
+///   mapped each on its own, past its mmap threshold (128 KiB, rising with the blocks freed up to 32 MiB on 64-bit), and
+///   unmapped when freed. In the `slates` binary a block of [`crate::large::floor`] or more never reaches glibc, so this
+///   is the blocks between glibc's threshold and that floor.
+/// - `in_use` (`uordblks`): each arena's `system_mem` less its free bytes, summed: the arenas' bytes live blocks hold.
+#[cfg(all(target_os = "linux", target_env = "gnu", not(miri)))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Malloc {
+  /// The arenas' bytes from the OS (`arena`).
+  pub arena: u64,
+  /// The arenas' free bytes, fastbins with them (`fordblks`).
+  pub free: u64,
+  /// The bytes glibc mapped for blocks of their own (`hblkhd`).
+  pub mapped: u64,
+  /// The arenas' bytes in live blocks (`uordblks`).
+  pub in_use: u64,
+}
+
+/// glibc's figures now ([`Malloc`]); a read takes each arena's lock in turn, so only a memory status asks.
+#[cfg(all(target_os = "linux", target_env = "gnu", not(miri)))]
+pub fn malloc() -> Malloc {
   // SAFETY: `mallinfo2` takes nothing and returns its record by value [B: man 3 mallinfo2].
   let info = unsafe { libc::mallinfo2() };
   let bytes = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
-  Some((
-    bytes(info.arena).saturating_add(bytes(info.hblkhd)),
-    bytes(info.uordblks).saturating_add(bytes(info.hblkhd)),
-  ))
+  Malloc {
+    arena: bytes(info.arena),
+    free: bytes(info.fordblks),
+    mapped: bytes(info.hblkhd),
+    in_use: bytes(info.uordblks),
+  }
 }
 
 /// No system allocator read here (module docs): none is, or Miri runs the program, which models its own allocations and
@@ -113,5 +156,31 @@ mod tests {
       );
     }
     drop(held);
+  }
+
+  /// The memory status's `process.malloc_*` gauges (main 01a20182, 2026-11-23). Do: read glibc's figures, hold a block
+  /// past glibc's largest mmap threshold, read them, free it, read them again. Expect the arenas' bytes and free bytes
+  /// present (the main arena's top at least), the mapped bytes up by the block while it is held and down by it once freed.
+  #[cfg(all(target_os = "linux", target_env = "gnu", not(miri)))]
+  #[test]
+  fn glibcs_mapped_bytes_follow_a_block_it_maps_until_it_is_freed() {
+    /// Derived: twice glibc's largest mmap threshold on 64-bit (`DEFAULT_MMAP_THRESHOLD_MAX`, 4 MiB times
+    /// `sizeof (long)`, 32 MiB), so glibc maps the block on its own however far the threshold has risen.
+    const HELD: usize = 64 << 20;
+    let before = malloc();
+    let mut held = Vec::<u8>::with_capacity(HELD);
+    std::hint::black_box(&mut held);
+    let during = malloc();
+    drop(held);
+    let after = malloc();
+    assert!(before.arena > 0 && before.free > 0, "{before:?}");
+    assert!(
+      during.mapped >= before.mapped.saturating_add(HELD as u64 / 2),
+      "the block held shows in the mapped bytes: {before:?} then {during:?}"
+    );
+    assert!(
+      after.mapped.saturating_add(HELD as u64 / 2) <= during.mapped,
+      "the block freed leaves the mapped bytes: {during:?} then {after:?}"
+    );
   }
 }

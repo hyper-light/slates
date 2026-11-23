@@ -61,15 +61,21 @@ impl Arena {
 
 impl WindowStorage for Arena {
   fn put(&mut self, bytes: &[u8]) -> Result<StoredWindow, ContentRefused> {
-    assert!(
-      self.bytes.len() + bytes.len() <= self.bytes.capacity()
-        && self.places.len() < self.places.capacity(),
-      "the test's arena holds every window"
-    );
+    // The test's arena is reserved once to hold every window, so a put past it is a refusal the test then fails on,
+    // never a reallocation charged to the push.
+    let room = self.bytes.capacity().saturating_sub(self.bytes.len());
+    if bytes.len() > room || self.places.len() >= self.places.capacity() {
+      return Err(ContentRefused::OverBudget {
+        need: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        room: u64::try_from(room).unwrap_or(u64::MAX),
+      });
+    }
     let at = self.bytes.len();
     self.bytes.extend_from_slice(bytes);
     self.places.push((at, bytes.len()));
-    Ok(StoredWindow(u64::try_from(self.places.len() - 1).unwrap()))
+    let window = u64::try_from(self.places.len().saturating_sub(1))
+      .map_err(|_| ContentRefused::CountExhausted)?;
+    Ok(StoredWindow(window))
   }
 
   fn read(&self, window: StoredWindow) -> Option<Cow<'_, [u8]>> {
@@ -128,6 +134,9 @@ fn hex(node: &Node) -> String {
   node.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// A file's revision as the history builds it: its node, its first parent, its text and its link changeset.
+type FileRevision = (Node, Node, Vec<u8>, usize);
+
 /// A history of a first changeset adding `files` files of `size` bytes, then `edits` changesets each rewriting one,
 /// its changegroup (version 03, each log's first revision whole and each later one its delta against the one before, as
 /// a client sends them) encoded, and its manifest text's length.
@@ -139,8 +148,8 @@ fn history(files: usize, size: usize, edits: usize) -> (Vec<u8>, usize) {
     let line = format!("file {file} generation {generation} ");
     line.bytes().cycle().take(size).collect()
   };
-  // Each file's revisions: (node, p1, text, link changeset).
-  let mut file_revisions: Vec<Vec<(Node, Node, Vec<u8>, usize)>> = vec![Vec::new(); files];
+  // Each file's revisions.
+  let mut file_revisions: Vec<Vec<FileRevision>> = vec![Vec::new(); files];
   let mut current: Vec<Node> = vec![NULL_NODE; files];
   let mut changesets: Vec<(Node, Node, Vec<u8>)> = Vec::new();
   let mut manifests: Vec<(Node, Node, Vec<u8>)> = Vec::new();
@@ -312,22 +321,24 @@ fn churned(payload: &[u8]) -> u64 {
     .saturating_sub(reading)
 }
 
-/// Shape: what an edit changeset may allocate past one copy of its manifest text and one of its file's: its rows, its
-/// bookkeeping and its share of its segment's record (measured at 10,751 B to 12,514 B over the four histories, debug).
+/// Shape: what an edit changeset may allocate past one copy of its file's text: its rows, its bookkeeping and its share
+/// of its segment's record (measured at 10,751 B to 12,514 B over the four histories, debug, before the manifest's
+/// rebuild reused its buffer).
 const SLACK_BYTES: u64 = 16 << 10;
 
-/// Goal 93 (main's orders on CI 45127535742: name the top allocators per changeset, then cut by reuse; one manifest copy
-/// a changeset, not two). Do: take a history of a first changeset adding a number of files, then [`EDITS`] changesets
+/// Goal 93 (main's orders on CI 45127535742 and of 2026-11-23: name the top allocators per changeset, then cut by reuse;
+/// no allocation by design). Do: take a history of a first changeset adding a number of files, then [`EDITS`] changesets
 /// each rewriting one, sent as a client sends them (each revision a delta against the one before), into an empty index
 /// through the intake, its windows in an arena as a daemon's store keeps them, cut at [`SEGMENT`], each segment's record
 /// written; again with twice the edits; at three manifest sizes and two file sizes. Read the system path's churn per edit
-/// changeset (the two histories' difference over [`EDITS`]). Expect at least one manifest's bytes an edit (the counter
-/// counts), and within one copy of its manifest text and one of its file's, with [`SLACK_BYTES`], at the largest
-/// manifest and the largest file. Red before (2026-11-23, MacBook arm64, debug): 291,519 B an edit at a 91,200 B
-/// manifest, 3.20 copies, `kept_as` reading the text it was handed back from the store and `encode_lines` listing both
-/// texts' lines; now 102,015 B, 1.12.
+/// changeset (the two histories' difference over [`EDITS`]). Expect, at the largest manifest and the largest file, at
+/// most one copy of the file's text with [`SLACK_BYTES`], and none of the manifest's: its rebuild reuses the buffer of
+/// the manifest before the one it rests on. And at the largest file, at least the file's bytes an edit (the counter
+/// counts: a file revision is still rebuilt into its own text). Red before (2026-11-23, MacBook arm64, debug): 291,519 B
+/// an edit at a 91,200 B manifest, 3.20 copies; then 102,015 B, 1.12, a manifest rebuilt into a new buffer each edit;
+/// now 10,766 B, 0.12.
 #[test]
-fn a_pushs_churn_per_changeset_is_one_manifest_and_one_file() {
+fn a_pushs_churn_per_changeset_is_its_file_alone() {
   for (files, size) in [(100, 64), (400, 64), (1_600, 64), (100, 16 << 10)] {
     let (short_payload, manifest) = history(files, size, EDITS);
     let short = churned(&short_payload);
@@ -337,20 +348,22 @@ fn a_pushs_churn_per_changeset_is_one_manifest_and_one_file() {
       u64::try_from(manifest).unwrap(),
       u64::try_from(size).unwrap(),
     );
-    let bound = manifest + file + SLACK_BYTES;
+    let bound = file + SLACK_BYTES;
     println!(
       "push_heap: {files} files of {size} B, a {manifest} B manifest: an edit changeset allocates {per_edit} B \
        ({:.2} manifests), its bound {bound} B",
       per_edit as f64 / manifest as f64
     );
-    assert!(
-      per_edit >= manifest,
-      "the allocator counted an edit's manifest: {per_edit} B"
-    );
+    if size == 16 << 10 {
+      assert!(
+        per_edit >= file,
+        "the allocator counted an edit's file text: {per_edit} B"
+      );
+    }
     if files == 1_600 || size == 16 << 10 {
       assert!(
         per_edit <= bound,
-        "an edit changeset allocated {per_edit} B, past one {manifest} B manifest, one {file} B file and {SLACK_BYTES} B"
+        "an edit changeset allocated {per_edit} B, past one {file} B file and {SLACK_BYTES} B (its manifest {manifest} B)"
       );
     }
   }

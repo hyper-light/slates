@@ -103,6 +103,10 @@
 > daemon lets nothing go until (2b)(b), homes' own read-through, next). (2b)(b) BUILT (w-shared, A-724 piece 8c): the
 > pack's home records where each of its windows lies on the node's store (`homes::LandedAt`), lets it go and brings it
 > back on a read; the records ride the shard image, so a window with one is not pinned.
+> The kept memory, measured on Linux (main 01a20182, 2026-11-23): with glibc, the gauges carry glibc's own figures over
+> every arena (`mem.gauge.process.malloc_free_bytes`, its arenas' free bytes, fastbins among them; `malloc_mapped_bytes`;
+> `malloc_arena_bytes`), so the remainder above is read there, not inferred; macOS and musl still infer it. OWED: main's
+> Linux RSS round reading them.
 > **A-870 (w-shared; main 01a20182's rulings of 2026-11-22 ~22:10 and ~22:30): a shard image's content-store families
 > published and restored over turns.** Piece 1 BUILT: the families paged (`crate::image_pages`): 3,000 windows let go
 > and 3,000 landed records rode 6,000 pieces, now 17 (534,085 bytes at a 43,912-byte page), restored whole. OWED: piece 2
@@ -117,7 +121,17 @@
 > and every clone (stock_git_verbs 1 of 8). Lifted when w-git's fetch-side readers (A-855's held answer, brought back and
 > made again) and the push decision's reads bring a let-go window back, with w-shared's red: annotated tags pushed, the
 > push ended, idle, then ls-remote and a clone byte-identical to stock.
-> **PUT BACK (w-git, 2026-11-23, main 01a20182's r165):** the lift below broke git/git's mirror clone after the push:
+> **LIFTED AGAIN (w-git, 2026-11-23, main 01a20182's order after r165):** `vcs_store::LANDED_LET_GO` on, one switch for
+> a commit's let-go and a recovery's or rebuild's (w-shared's `put_changeset`): the commit owes its pack and the push's
+> end or the repository's idle give-back lets it go a slice a turn (3e1588a54, the quantum alone ending a slice), every
+> read of a let-go window stopping at a unit boundary and brought back (0c3f42cea, 7f7793c58). Red over the edge:
+> `a_pushed_pack_is_let_go_by_its_commit_in_slices_and_a_clone_after_is_whole` (two shards, a 3 MiB file's pack of many
+> windows, nothing let go by hand: bytes let go in slices, the clone and a clone one commit deep each pushed object's
+> bytes, `ls-refs` `HEAD` at the commit; 0 bytes let go with the switch off) and over SSH (r165's `clone-ssh` and
+> `shallow` rows): `a_pushed_pack_let_go_by_its_commit_is_cloned_whole_and_shallow_over_ssh`, the client giving its
+> window back as OpenSSH's does (a 3 MiB answer past its 1 MiB window). Owed: main's git/git whole A/B (push no slower than the guard, clones
+> whole and byte-identical, `let_go_past_quantum` in release); an `Unreadable` or a refused fetch puts it back.
+> **PUT BACK (w-git, 2026-11-23, main 01a20182's r165; lifted again above):** the lift below broke git/git's mirror clone after the push:
 > refused `Pack(Store(Unreadable { id: sha1:e11e53618242d5dbeeab1ff15707c7ec88c907cc }))` 16,270,345 bytes in
 > (`parts_copied=2`, `entries_judged=3712`), stock git's "possible repository corruption on the remote side": a fetch
 > path still reads a let-go window without bringing it back. `vcs_store::commit` lets nothing go again; the harness of
@@ -128,9 +142,22 @@
 > a delta's check, a search's read) turned a let-go window into `Unreadable` mid-pack. Each now stops the turn at the
 > window and retakes its unit (`Upload::read_or_stop`). Reds over stock git's offset-delta pack, every window let go:
 > `r165_an_entry_made_whole_from_a_let_go_window_stops_and_the_answer_is_byte_identical` (`Unreadable` at 0 stops
-> before) and `r165_an_object_encoded_afresh_…` (after 5). Owed: the encoding's object read (`Reading::read_window`)
-> refuses the same way where its header reads have not brought the window back first (no red yet); main's round, the
-> guard still in, before a re-lift.
+> before) and `r165_an_object_encoded_afresh_…` (after 5). Item 2 (2026-11-23, main's order, reds built directly by
+> test switches: `upload::REUSE_OFF`, `upload::KEPT_OFF`, `encoding::NO_REUSE`, and every window not brought back let go
+> before each one-unit turn): the stream's delta check (`DeltaReuse::Stopped`), its raw-entry and base reads before it
+> (were `reuse_unread`, the object then encoded afresh), and a search's reads stop too; the encoding's object read
+> (`Reading::read_window`) and its reuse check's reads stop and keep their unit. Reds: `r165_a_streams_entry_check_…`
+> and `r165_a_streams_encode_and_search_…` (`Unreadable` at 0 stops before), `r165_an_encodings_object_read_…`
+> (`Unreadable` before; with the reuse check falling back, its fragments 1,274 bytes against 1,302 resident, now the
+> same). Owed: main's round, the guard still in, before a re-lift. The let-go a push's end or an idle repository owes is
+> no longer one walk over the whole pack within that step (main 01a20182, 2026-11-23: git/git's ~600 MB in
+> `ReceivePack`'s drop): it is queued (`vcs_store::LettingGo`) and let go by a task of the shard's a slice a turn, the
+> step quantum alone ending a slice (a window taken only where it would end within it, at least one), a home's share on
+> its own shard alike, counted `vcs_store.landed.let_go_slices` and `let_go_past_quantum`
+> (`t_goal93_a_large_landed_packs_let_go_is_sliced_within_the_step_quantum_never_one_walk`: 131 windows in 132 slices,
+> none within the owing step, each slice past the quantum one window, counted; before, all 34 MB in the step). On a
+> debug audit shard one window's let-go (about 25 µs) outlasts the 8 µs quantum, so every slice there is one window
+> past it.
 > **LIFTED (w-git, 2026-11-22, on main 01a20182's word; put back above):** `vcs_store::commit` lets a landed push's pack go again, or
 > owes it to the push's end or the repository's idle give-back, with each gate on main: w-git's fetch-side readers
 > (A-864) and a push's readers, (b) its thin bases through `IndexedObjects::away` and (c) its policy and signature reads;
@@ -212,6 +239,20 @@
 >   and a runnable shard lost a 31.6 ms quantum to normal-priority load (stamps: 12-22 requests a round queued over
 >   10 ms, 16-22 over 10 ms mid-service). Loaded p999 18-85 ms -> 304-699 µs, p99 174-319 µs, quiet unchanged, on
 >   windows-latest and windows-11-arm, 3 interleaved rounds each (diag run 44948887874; BENCHMARKS).
+>   **Bare metal met too, with A-871 (main 01a20182, 2026-11-23; BENCHMARKS "84a on Windows bare metal").** On jupiter
+>   (Ryzen AI Max+ 395, 32 threads, Windows 11 Balanced, 64 spinners) CI's verdict did not hold: shards fixed to their
+>   cores had 399-446 parked-shard wakes over 1 ms a quiet round, and a woken client queued behind shards at its own
+>   level (245-492 replies a loaded round taken over 1 ms late; loaded conflict p999 2.8-6.5 ms in every round). A-871:
+>   the OS places every Windows shard, and a client's reply wait stands one level above normal. Every round after it,
+>   quiet and loaded: p99 under 1 ms and p999 135-359 µs, both forms. Measured outside kiln's agent job, which fixes
+>   every thread's level (inside it the first round starved past 1,200 s). The runtime's long polls on Windows carried
+>   no attribution (`NoClock`, 206 a quiet round): ATTRIBUTED (w-perf, 2026-11-23). A Windows thread's account is its
+>   cycle count at a rate measured once a process (`slates_machine::own_cpu`; 3.14 GHz on jupiter), and a wait in a call
+>   is a profiling read whose switches' wait reasons name more than a preemption, a quantum's end or a yield
+>   (`slates_machine::switches::voluntary_waits_now`). Held on jupiter by
+>   `the_platform_reads_a_kernel_sleep_blocked_and_a_spin_long` (`slates-rt`: a 5 ms kernel sleep `Blocked`, a 5 ms
+>   spin `Long`; red `NoClock` with main's account) at 291 ns a read, taken only at a long poll's end and while armed.
+>   Owed: a round on jupiter that names its long polls' holders.
 > - **The client's share:** `edit_merge_bench`'s client spins for its reply at default priority beside the load, so
 >   accept's p99/p999 beyond the daemon's part (macOS 0.8–2.6 / 7–9 ms with the nap fixed) is the harness's own
 >   thread waiting for a CPU.
@@ -735,6 +776,28 @@
 >   markers obsolete left out), and the branch heads of such a view kept rather than walked
 >   (`discovery::walked_branch_head_revs`, the one view the kept heads do not answer for, below). After arena-6's and
 >   arena-7's reads, unless they name a memory or time item first.
+> - A daemon's allocation by site under stock Mercurial measured BUILT (2026-11-23, w-hg; main's order (A)):
+>   `crates/server/tests/hg_push_heap.rs`, its own binary (`LargeMapped` with a byte sampler on while a row runs), an
+>   in-process daemon with a store and the cleartext HTTP edge, real `hg` subprocesses pushing a 400-changeset
+>   `debugbuilddag` history, then a clone, a stream clone and a verify; each row's top sites printed by bytes a
+>   changeset; skips loudly without `hg`. Corrected read (MacBook arm64, debug; the sampler's own allocations, a
+>   thread's first backtrace loading the binary's symbols, were once charged to the next allocation, which put a
+>   one-entry `push::phase_heads` and the watchdog among the top): push 362,278 B a changeset, 86% two sites of the
+>   greens' lend (`Green::default`'s `SetHash`, 2 KiB a lend, 167,321; `Greens::lend`'s closure, 145,472); clone 14,632
+>   and stream clone 20,645, the store's `texts_by_tools`, the index's `iter_from` and row scans. Then the lend cut
+>   (main's order): a lineage member's lend allocates nothing. `merge::identity::SetHash` makes its 2 KiB of lanes at
+>   its first change, so an empty engine (a lend's restore leaves one) is free; and `engine::branch::Lent` keeps the
+>   member's engine in the lineage's slot for the one out (`Lineage::lent`), the guard only the lineage and a handle,
+>   so `GreenRef`/`GreenMut` box nothing. Push: 362,278 B a changeset now 49,909, the lend's 300,292 B (red) now none.
+>   OPEN: the cuts by size, then bounds in this test.
+> - A node prefix's `lookup` read by node BUILT (2026-11-23, w-hg; main's order on CI arena-7: the last `begin` over
+>   10 ms of CPU, `cmd=lookup`, 91 ms wall / 30 ms CPU on x86, `lookup::prefixed` hex-encoding every node). The index's
+>   node rows are keyed by node first, so `HgIndex::changesets_prefixed` walks them from the prefix's bytes (and an odd
+>   digit's high four bits) to where it ends, passing other logs' rows over, two served matches settling it
+>   (`Repository::changesets_prefixed`; a view that cannot is walked, as before). Held by
+>   `a_node_prefixs_lookup_read_by_node_is_the_walks` (prefixes of one to twelve digits, the null node's zeros, one
+>   nothing has: the same answers, ambiguous ones among them) and
+>   `a_node_prefixs_lookup_reads_its_matches_not_the_history` (at most 8 reads, where the walk reads every revision).
 > - Branch heads kept as changesets land BUILT (2026-11-23, w-hg; main's ruling (b) on CI 45127535742: a `lookup` of a
 >   branch name ran one 348 ms step on x86, wrote 43 bytes, `branch_tip` scanning every revision's branch and then
 >   `branch_head_revs` walking the whole history, as `branchmap` whole did, 155-161 ms CPU a call). `HgIndex` keeps
@@ -762,6 +825,19 @@
 >   listed both texts' lines, now walks them by cursors. Held by
 >   `a_pushs_churn_per_changeset_is_one_manifest_and_one_file` (1,600 files: red 291,519 B an edit at a 91,200 B
 >   manifest, now 102,015 B, 1.12 copies; 16 KiB files within one manifest and one file copy and 16 KiB of slack).
+>   Then no manifest copy at all (main's order of 2026-11-23, no allocation by design): the intake rebuilds a changeset
+>   or a manifest into the buffer of the one kept before the last (`Taker::spare`; `delta::apply_into` keeps its
+>   capacity), which no later delta rests on, so a manifest's rebuild allocates nothing past the first. The test now
+>   `a_pushs_churn_per_changeset_is_its_file_alone`: red 102,045 B an edit, now 10,766 B (0.12 manifests).
+> - The watchdog's beat allocates nothing BUILT (2026-11-23, w-perf; main's order). A beat made 4 allocations, about
+>   1 KB by their types (estimated, not measured). `hg_push_heap`'s first read had charged the watchdog 24% of a push's
+>   sampled bytes, about 10-15 MB a second; that was its sampler's artifact (a thread's first symbol load charged to its
+>   next allocation, fixed in f14ea81bb), not the watchdog's.
+>   `watchdog::LatenessTail` keeps A-474's hundred readings in a fixed ring, its p99 a stack copy sorted, and the beat
+>   refills its looks, windows and verdicts in place. Held by `the_watchdogs_beat_allocates_nothing_once_it_runs`
+>   (`crates/server/tests/watchdog_allocations.rs`: a counting allocator on the thread named `slates-watchdog`; red 82
+>   idle and 81 under 71,073 requests over 20 beats, now 0 and 0) and the ring's oracle against the old queue.
+>   A suspected shard's scheduler read (`read_runs`) still collects its few indices, off the steady state.
 > - A push's held high-water gauged BUILT (2026-11-23, w-hg; main's ruling: the 410 MiB bar's push-all peak first):
 >   `vcs.hg.push_held_high_bytes`, the push's admission held plus its file texts still in the content store, sampled as
 >   each segment lands before its let-go; `..._texts_high_bytes` its texts' share; `vcs.hg.push_rows_bytes` its fork's

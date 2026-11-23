@@ -1364,6 +1364,7 @@ impl Daemon {
   /// registration, so a slot reused by a later daemon refuses it rather than answering for a stranger.
   /// `question` is `Clone` because each admission attempt builds a fresh task (a refused request's
   /// future is dropped by the runtime).
+  #[track_caller]
   pub fn observation<T, Q>(
     &self,
     target: Option<ShardId>,
@@ -1396,6 +1397,7 @@ impl Daemon {
   /// not"; docs/bugs/2026-09-13-consensus-voters-outside-record-neighbourhood.md). A capacity refusal is
   /// retried, paced, inside the one budget. The calling thread parks while it waits (it does not spin),
   /// so it steals no CPU from the shard it waits on.
+  #[track_caller]
   fn observe<T, Q>(&self, target: Option<ShardId>, question: Q) -> Result<T, ObserveError>
   where
     T: Send + 'static,
@@ -1422,6 +1424,7 @@ impl Daemon {
 
   /// Like [`Self::observe`] for a question of the shard's runtime context rather than of its state (a
   /// task count), answered the same way.
+  #[track_caller]
   fn observe_shard<T, Q>(&self, target: Option<ShardId>, question: Q) -> Result<T, ObserveError>
   where
     T: Send + 'static,
@@ -1438,6 +1441,7 @@ impl Daemon {
   /// ([`Self::observation`]): the form a test drives directly to prove what an observation reports at
   /// each stage — a full control channel, a full arena, a shard held past the budget, a daemon stopped
   /// while the question is pending.
+  #[track_caller]
   pub fn observe_control<T, Q>(&self, budget_ns: u64, question: Q) -> Result<T, ObserveError>
   where
     T: Send + 'static,
@@ -1450,6 +1454,7 @@ impl Daemon {
 
   /// The pending form of [`Self::observe_control`]: nothing is submitted until the returned observation
   /// is run, which may happen on another thread, and after this daemon has stopped.
+  #[track_caller]
   pub fn observation_on_control<T, Q>(
     &self,
     budget_ns: u64,
@@ -1470,6 +1475,7 @@ impl Daemon {
   /// decidable before a submission decided here.
   /// The observation of `question` at `target` that waits while the shard lives (`Observation::patient`), looking every
   /// liveness window: the default observations' form ([`Self::observe`]).
+  #[track_caller]
   fn pending_patient<T, Q>(
     &self,
     target: Option<ShardId>,
@@ -1488,6 +1494,7 @@ impl Daemon {
     Ok(Observation::patient(holder, LIVENESS_BUDGET_NS, question))
   }
 
+  #[track_caller]
   fn pending<T, Q>(
     &self,
     target: Option<ShardId>,
@@ -7356,6 +7363,7 @@ mod tests {
 
   /// Runs an audit history on the daemon's real owning shard (§4.8, §4.16). The daemon owns and
   /// joins every task; only the result crosses back to the test thread.
+  #[track_caller]
   pub(crate) fn audit_on_shard<T: Send + 'static>(
     history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
   ) -> T {
@@ -7364,6 +7372,7 @@ mod tests {
 
   /// A bounded audit fixture may reduce a geometry before mapping it, so a capacity test
   /// fills a few pages rather than the machine's measured production-sized reserve.
+  #[track_caller]
   pub(crate) fn audit_on_shard_configured<T: Send + 'static>(
     history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
     configure: impl FnOnce(&mut crate::DaemonConfig),
@@ -7460,6 +7469,7 @@ mod tests {
 
   /// Runs `history` on `daemon`'s first shard (an [`audit_daemon`]'s one), as [`audit_on_shard`] does, leaving the
   /// daemon running.
+  #[track_caller]
   pub(crate) fn observe_first<T: Send + 'static>(
     daemon: &super::Daemon,
     history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
@@ -7470,6 +7480,7 @@ mod tests {
   }
 
   /// [`observe_first`] on the shard of partition `partition`: a test's look at a shard other than the first.
+  #[track_caller]
   pub(crate) fn observe_at<T: Send + 'static>(
     daemon: &super::Daemon,
     partition: usize,
@@ -8058,6 +8069,26 @@ mod tests {
     );
   }
 
+  /// Main 01a20182's order of 2026-11-23: a wedged shard's verdict named `crates/rt/src/runtime.rs:38` for every
+  /// observation's task, the submit's own line, so no culprit. Do: from a test, observe the first shard of an audit
+  /// daemon (`observe_first`), reading inside the question what the shard's pulse says it is polling. Expect: the task
+  /// labelled with this file at the line that asked.
+  #[test]
+  fn an_observations_task_is_labelled_where_its_asker_asked() {
+    let daemon = audit_daemon();
+    let line = line!() + 1;
+    let seen = observe_first(&daemon, |state| {
+      slates_rt::registry::with_entry(state.shard, |entry| entry.pulse.polling())
+    });
+    daemon.stop();
+    let seen = seen.expect("the shard's pulse");
+    assert!(
+      matches!(seen.label, Some(slates_rt::label::TaskLabel::Site(site))
+        if site.file().ends_with("src/daemon.rs") && site.line() == line),
+      "{seen}"
+    );
+  }
+
   /// Goal 93 item 2b(b) (main 01a20182's ruling: homes keep window → (payload identity, offset) for the windows a landed
   /// pack carried, and a home's read of a window let go brings it back through that record; the record must survive the
   /// home's restart, or its windows let go are lost to the region's readers). Do: on a store-backed daemon, hold a pack
@@ -8293,8 +8324,9 @@ mod tests {
   /// path while `vcs_store::LANDED_LET_GO` holds, a recovery's re-let-go too). Do: on a daemon over a retained anchor
   /// segment and content object, commit `main`'s one file in a work (its server-made commit lands a pack); let that pack
   /// go by hand, publish, stop and start a successor, and wait for its recovery. Expect: the pack held whole after the
-  /// recovery (read whole from the node's store to replay), and nothing let go by the successor. Failing first: a
-  /// recovery's re-let-go (9d9f1e7b9) let the pack go again while commits keep theirs.
+  /// recovery (read whole from the node's store to replay), and nothing let go by the successor, while the switch holds;
+  /// with it lifted, the recovery's re-let-go (its queue turned) lets the pack go again, counted. Failing first: a
+  /// recovery's re-let-go (9d9f1e7b9) let the pack go again while commits kept theirs.
   #[test]
   fn t_goal93_a_recovery_keeps_a_landed_pack_while_the_landed_let_go_is_held() {
     use slates_anchor::AnchorSegment;
@@ -8383,6 +8415,10 @@ mod tests {
             && !state.vcs_stores.rebuilding(repository)
             && state.vcs_stores.holds(repository);
           recovered.then_some(())?;
+          // Lifted, the recovery's re-let-go is queued a slice a turn (`vcs_store::let_go_turn`): turned to its end.
+          if crate::vcs_store::LANDED_LET_GO {
+            while crate::vcs_store::let_go_turn(state) {}
+          }
           let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
           let whole = state
             .vcs_stores
@@ -8403,8 +8439,15 @@ mod tests {
     }
     second.stop();
     let (whole, let_go) = seen.expect("the successor recovered the repository");
-    assert!(whole, "the landed pack held whole after the recovery");
-    assert_eq!(let_go, 0, "nothing let go while the landed let-go is held");
+    if crate::vcs_store::LANDED_LET_GO {
+      // Lifted (main 01a20182's item 3 of 2026-11-23): the recovery's replay read the pack whole and its re-let-go
+      // lets it go again, as the commit's does.
+      assert!(!whole, "the landed pack let go again after the recovery");
+      assert!(let_go > 0, "the recovery's re-let-go counted");
+    } else {
+      assert!(whole, "the landed pack held whole after the recovery");
+      assert_eq!(let_go, 0, "nothing let go while the landed let-go is held");
+    }
   }
 
   /// A-767 C5 (git onto the changeset store; main's order of 2026-11-20 ~21:20: "red first: a stock git push lands as
@@ -8845,6 +8888,9 @@ mod tests {
               .wrapping_add(1_442_695_040_888_963_407);
             picked >> 62 == 0
           };
+          // A landed push's pack is let go a slice a turn by a task of the shard's (`vcs_store::let_go_turn`, goal 93
+          // item 2b): turned to its end here, so the store published is the one observed.
+          while crate::vcs_store::let_go_turn(state) {}
           let_go_picked(state, &windows, &mut pick);
           store_whole(state)
         })
@@ -8856,6 +8902,9 @@ mod tests {
       let shard = daemon.shards.first().copied();
       let seen = daemon
         .observe(shard, |state| {
+          // The recovery's replay read the landed pack whole and owes its let-go again (`vcs_store::put_changeset`),
+          // queued a slice a turn: turned to its end before the store is compared.
+          while crate::vcs_store::let_go_turn(state) {}
           let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
           (
             store_whole(state),

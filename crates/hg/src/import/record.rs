@@ -103,12 +103,14 @@ const SEGMENT_VERSION: u32 = 8;
 /// revision's whole, and a delta resting on the log's last revision, kept as stored; any other manifest (a whole, or a
 /// delta on an earlier revision, read over its base by node) kept again against the revision before it, as the index
 /// keeps a manifest (A-729): the same row a stale fork's re-base keeps, whether or not another push landed between.
+/// Format: its number, 10.
 const PUSH_SEGMENT_VERSION: u32 = 10;
 /// Format: the version of an import's or a push's record in the repository's register once its revisions are on the
 /// changeset log as a run of segments (A-767 C1 step 3; a push's, main 01a20182's ruling (b1) of 2026-11-22 04:44): the
 /// head, its source an import's or a push's, then the first and the last sequence of the run of segment changesets it
 /// landed ([`write_run_reference`], [`run_of`]). The register holds this reference; the segments' records and payloads
 /// are the log's.
+/// Format: its number, 9.
 const RUN_VERSION: u32 = 9;
 
 /// Format: the version of a push's record in the repository's register once its segments are on the changeset log at
@@ -116,6 +118,7 @@ const RUN_VERSION: u32 = 9;
 /// segments apart from its repository's landing turn, which it takes only for its entry's commit): the head, a push's
 /// source, then the count of ranges and each range's first and last sequence, ascending and apart
 /// ([`write_push_runs_reference`], [`run_of`]). Bound: at most one range a segment, so never past the push's segments.
+/// Format: its number, 11.
 const RUNS_VERSION: u32 = 11;
 
 /// An import's or a push's run of segment changesets on the changeset log, as its register record names it: the

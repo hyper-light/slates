@@ -23,8 +23,12 @@
 //! guest may count time its virtual CPU was stolen while the thread ran as the thread's CPU; such a poll
 //! then reads as a long run and is the task's by this rule (the macOS CI runner, run 36289513559,
 //! 2026-09-27: a poll that slept 3 ms took 23 ms and read past a 1 ms quantum on the thread clock). Windows keeps
-//! per-thread times at the scheduler tick (about 15.6 ms), so no account is read there and every long
-//! poll is unattributed.
+//! per-thread times at the scheduler tick (about 15.6 ms), so its account is read from elsewhere
+//! (2026-11-23; until then none was read, and jupiter left 206 long polls a quiet round unattributed,
+//! A-871's diagnostic): the CPU from the thread's cycle count at a rate measured once a process
+//! (`slates_machine::own_cpu`), and a wait inside a call from the wait reasons of its switches, which name
+//! a preemption, a quantum's end and a yield apart from a wait of the thread's own
+//! (`slates_machine::switches::voluntary_waits_now`).
 //!
 //! [`attribute`] and [`Tracker`] are cfg-free and unit-tested on every host; the readings are paired
 //! `#[cfg]` functions.
@@ -111,8 +115,18 @@ pub(crate) fn thread_account() -> Option<ThreadAccount> {
   })
 }
 
-/// No fine per-thread clock here (Windows' thread times tick at about 15.6 ms), and none under Miri.
-#[cfg(any(miri, not(any(target_os = "linux", target_os = "macos"))))]
+/// Windows: the thread's CPU from its cycle count, and its waits of its own from its switches' wait reasons (the
+/// module doc). Measured on jupiter: see `the_platform_reads_a_kernel_sleep_blocked_and_a_spin_long`.
+#[cfg(all(windows, not(miri)))]
+pub(crate) fn thread_account() -> Option<ThreadAccount> {
+  Some(ThreadAccount {
+    cpu_ns: slates_machine::own_cpu::own_cpu_ns()?,
+    voluntary_switches: slates_machine::switches::voluntary_waits_now(),
+  })
+}
+
+/// No per-thread clock here, and none under Miri.
+#[cfg(any(miri, not(any(target_os = "linux", target_os = "macos", windows))))]
 pub(crate) fn thread_account() -> Option<ThreadAccount> {
   None
 }
@@ -135,7 +149,7 @@ pub(crate) enum Attribution {
   OffCpu,
   /// Unattributed: no window was open (the first long poll, or the first after a wait while unarmed).
   NoWindow,
-  /// Unattributed: no per-thread clock here.
+  /// Unattributed: no per-thread clock here (Miri; Windows until 2026-11-23).
   NoClock,
 }
 
@@ -298,6 +312,61 @@ impl Tracker {
 
 #[cfg(test)]
 mod tests {
+
+  /// Shape: the quantum the platform test judges by, 200 µs: past a read's cost and a wake's, far under the test's
+  /// sleep and spin.
+  #[cfg(all(any(target_os = "linux", windows), not(miri)))]
+  const PLATFORM_QUANTUM_NS: u64 = 200_000;
+  /// Shape: how long the platform test's poll sleeps or spins, 5 ms: past the quantum twenty-five times over.
+  #[cfg(all(any(target_os = "linux", windows), not(miri)))]
+  const PLATFORM_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+  /// Shape: the reads the platform test times, for a read's cost against the quantum.
+  #[cfg(all(any(target_os = "linux", windows), not(miri)))]
+  const TIMED_READS: u32 = 10_000;
+
+  /// Runs `poll` as a long poll in an open window and attributes it with the platform's own readings.
+  #[cfg(all(any(target_os = "linux", windows), not(miri)))]
+  fn attribute_real_poll(poll: impl FnOnce()) -> Attribution {
+    let clock = std::time::Instant::now();
+    let now = || u64::try_from(clock.elapsed().as_nanos()).unwrap();
+    let mut tracker = Tracker::default();
+    // The first long poll finds no window and opens one at its end, as the shard's does.
+    let opened = now();
+    assert_eq!(
+      tracker.long_poll(opened, opened, thread_account(), PLATFORM_QUANTUM_NS),
+      Attribution::NoWindow
+    );
+    let started = now();
+    poll();
+    tracker.long_poll(started, now(), thread_account(), PLATFORM_QUANTUM_NS)
+  }
+
+  /// §4.3 A-31 on the platform's own readings (Linux, and Windows since 2026-11-23, where every long poll read
+  /// `NoClock`). Do: attribute a poll that sleeps in the kernel for 5 ms, and one that spins 5 ms, at a 200 µs quantum;
+  /// time the account's read. Expect the sleep `Blocked` and the spin `Long`, and a read far under the quantum.
+  #[test]
+  #[cfg(all(any(target_os = "linux", windows), not(miri)))]
+  #[allow(clippy::disallowed_methods)] // the poll blocks the thread on purpose: the block is what is attributed.
+  fn the_platform_reads_a_kernel_sleep_blocked_and_a_spin_long() {
+    let slept = attribute_real_poll(|| std::thread::sleep(PLATFORM_POLL));
+    let spun = attribute_real_poll(|| {
+      let began = std::time::Instant::now();
+      while began.elapsed() < PLATFORM_POLL {
+        std::hint::spin_loop();
+      }
+    });
+    let began = std::time::Instant::now();
+    for _ in 0..TIMED_READS {
+      std::hint::black_box(thread_account());
+    }
+    let read_ns = u64::try_from((began.elapsed() / TIMED_READS).as_nanos()).unwrap();
+    println!("attribution: slept {slept:?}, spun {spun:?}; an account read {read_ns} ns");
+    assert_eq!((slept, spun), (Attribution::Blocked, Attribution::Long));
+    assert!(
+      read_ns < PLATFORM_QUANTUM_NS / 100,
+      "an account read took {read_ns} ns against a {PLATFORM_QUANTUM_NS} ns quantum"
+    );
+  }
   use super::*;
 
   /// Shape: a quantum of ten microseconds, the order of a virtual machine's mean wake.

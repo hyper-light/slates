@@ -71,8 +71,8 @@ pub enum ReleaseProgress {
 pub enum GreenRef<'a> {
   /// A lone engine.
   Alone(&'a Green),
-  /// A member lent out of its lineage, boxed: the engine it carries is far larger than a reference.
-  Member(Box<Lent<RefMut<'a, Lineage>>>),
+  /// A member lent out of its lineage: the guard is the lineage and a handle, its engine in the lineage's slot.
+  Member(Lent<RefMut<'a, Lineage>>),
 }
 
 impl Deref for GreenRef<'_> {
@@ -90,8 +90,8 @@ impl Deref for GreenRef<'_> {
 pub enum GreenMut<'a> {
   /// A lone engine.
   Alone(&'a mut Green),
-  /// A member lent out of its lineage, boxed: the engine it carries is far larger than a reference.
-  Member(Box<Lent<&'a mut Lineage>>),
+  /// A member lent out of its lineage: the guard is the lineage and a handle, its engine in the lineage's slot.
+  Member(Lent<&'a mut Lineage>),
 }
 
 impl Deref for GreenMut<'_> {
@@ -181,7 +181,7 @@ impl Greens {
     if lent.is_none() {
       self.busy.set(self.busy.get().saturating_add(1));
     }
-    lent.map(|lent| GreenRef::Member(Box::new(lent)))
+    lent.map(GreenRef::Member)
   }
 
   /// `id`'s engine, lent for a write whether or not it owes a push: the materializer's, a replay's and a create's (P2).
@@ -198,7 +198,7 @@ impl Greens {
     if lent.is_none() {
       self.busy.set(self.busy.get().saturating_add(1));
     }
-    lent.map(|lent| GreenMut::Member(Box::new(lent)))
+    lent.map(GreenMut::Member)
   }
 
   /// Whether `id` has an engine here.

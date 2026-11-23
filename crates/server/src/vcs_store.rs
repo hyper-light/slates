@@ -277,6 +277,9 @@ pub(crate) struct VcsStores {
   /// its encoding was under way, let go once it goes idle ([`let_go_owed`]); bounded by the repository's landed pushes
   /// since then.
   landed_owed: BTreeMap<RepositoryId, Vec<slates_vcs::ContentId>>,
+  /// Landed packs being let go a slice of windows a turn ([`LettingGo`]), and whether the task that turns them runs:
+  /// bounded by the packs owed a let-go.
+  letting_go: (std::collections::VecDeque<LettingGo>, bool),
   /// Each git repository's version being encoded as its fragments, between its turns ([`git_encode`], A-718): one a
   /// repository, so bounded by the partition's repositories.
   encodings: git_encode::Encodings,
@@ -2398,6 +2401,10 @@ fn based_moves(
 /// hold its moves alone. Refused, nothing of the store changed and the push still holds its objects.
 pub(crate) fn commit(state: &mut ShardState, sealed: &mut SealedPush) -> Result<(), GitRefused> {
   let repository = sealed.repository;
+  // The pack the staging put in the content store, where its changeset landed on the node's store (A-767 C5).
+  let landed_pack = (sealed.landed > 0)
+    .then(|| sealed.push.stored_pack())
+    .flatten();
   let unkept = within_budget(state, 0, |stores| {
     let (content, store) = stores.git(repository).ok_or(GitRefused::NoStore)?;
     commit_moves(
@@ -2409,14 +2416,28 @@ pub(crate) fn commit(state: &mut ShardState, sealed: &mut SealedPush) -> Result<
   })?;
   sealed.objects = RecordWriter::default();
   state.count(VALUE_UNKEPT, unkept);
-  // A landed push's pack stays resident: its let-go (goal 93 item 2b) is safe only once every git read of the
-  // repository brings a let-go window back, and some do not yet. Run r52 (2026-11-22, the big Studio, main 6f6e87d82):
-  // once git/git's push ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's
-  // tag peel among the reads). Lifted at 76d8804c3 and put back (main 01a20182's r165, 2026-11-23: git/git's mirror
-  // clone after the push refused `Pack(Store(Unreadable { id: sha1:e11e5361… }))` 16,270,345 bytes in, stock git's
-  // "possible repository corruption"): a fetch path still reads a let-go window without bringing it back. So no landed
-  // pack is let go or owed here; the let-go itself (`let_go_landed_pack`, `let_go_owed`) is unchanged and tested
-  // directly (read_through's tests). GAPS: goal 93 item 2b.
+  // A synchronous audit shard's history can bring nothing back (a bring-back awaits the node's store), so its landed
+  // packs stay resident ([`KEEP_LANDED`]); a daemon's edges and tasks, and every let-go test, let them go.
+  #[cfg(test)]
+  let landed_pack = landed_pack.filter(|_| !KEEP_LANDED.with(core::cell::Cell::get));
+  // Goal 93 item 2b, lifted again (main 01a20182's order of 2026-11-23, after r165): every read of a let-go window
+  // stops at a unit boundary and is brought back (w-git's 0c3f42cea and 7f7793c58: the fetch stream's and the
+  // encoding's reads where an object lies, besides A-864's readers), and the let-go is sliced off the owing step
+  // (3e1588a54). Never under a fetch's answer or an encoding, nor under a push still deciding its refs (a non-atomic
+  // push's later refs read its objects): owed until the push ends or the repository goes idle, then let go a slice a
+  // turn ([`let_go_sliced`]).
+  if LANDED_LET_GO && let Some((pack, _)) = landed_pack {
+    if landed_let_go_may(state, repository, 0) {
+      let_go_sliced(state, pack);
+    } else {
+      state
+        .vcs_stores
+        .landed_owed
+        .entry(repository)
+        .or_default()
+        .push(pack);
+    }
+  }
   Ok(())
 }
 
@@ -2478,24 +2499,189 @@ pub(crate) fn let_go_owed_as_push_ends(state: &mut ShardState, id: RepositoryId)
   }
 }
 
-/// [`let_go_owed`]'s let-go, its conditions met.
+/// [`let_go_owed`]'s let-go, its conditions met: each pack queued to be let go a slice a turn ([`let_go_sliced`]), never
+/// walked whole within the step that owes it (a push's drop, a repository's idle give-back).
 fn let_go_owed_now(state: &mut ShardState, id: RepositoryId) {
   let owed = state.vcs_stores.landed_owed.remove(&id).unwrap_or_default();
   for pack in owed {
-    let_go_landed_pack(state, &pack);
+    let_go_sliced(state, pack);
   }
 }
 
-/// Lets go of the windows of `pack`, a landed push's pack as its staging put it in the shard's content store, now that
-/// the node's store holds it as the push's changeset (goal 93 item 2b; main 01a20182's rulings of 2026-11-22 05:45 and
-/// 06:58): every window but those a home holds here ([`landed_pin`]), each brought back by its pack's identity when a
-/// read meets it ([`read_through::bring_back`]). Counted with its bytes, and the windows kept pinned.
-fn let_go_landed_pack(state: &mut ShardState, pack: &slates_vcs::ContentId) {
-  let shards = state.shards.clone();
-  let_go_landed_pack_among(state, pack, &shards);
+/// A landed pack's let-go under way on this shard (goal 93 item 2b; main 01a20182's order of 2026-11-23: one walk over
+/// a 600 MB pack inside a push's step is a bounded-work breach): its windows listed on its first slice, then let go a
+/// slice a turn within the shard's step quantum (main's ruling of 2026-11-23: the quantum alone ends a slice, never a
+/// fixed count, R3).
+#[derive(Debug)]
+pub(crate) struct LettingGo {
+  /// The pack.
+  pack: slates_vcs::ContentId,
+  /// Whether this shard is the pack's home in the region: each window recorded where it lies on the node's store and
+  /// let go unpinned (`homes::record_landed_here`), as `homes::landed_pack_here` does whole.
+  home: bool,
+  /// Whether this shard holds the pack for its repository: each window let go unless a home holds it here
+  /// ([`landed_pin`]).
+  owner: bool,
+  /// The pack's windows, each with its offset, and the pack's length: listed on the first slice.
+  layout: Option<(Vec<(slates_vcs::ContentId, u64)>, u64)>,
+  /// The next window to let go.
+  next: usize,
 }
 
-/// [`let_go_landed_pack`] with the node's shards `shards`, which rank the pack's home, each window kept where this shard
+/// Counter: slices of landed packs' let-go run ([`let_go_turn`]): its non-vacuity, a large pack taking many. Format: a
+/// counter name.
+pub(crate) const LET_GO_SLICES: &str = "vcs_store.landed.let_go_slices";
+/// Counter: slices of landed packs' let-go that ran past the shard's step quantum ([`let_go_turn`]): each one window,
+/// the unit a slice takes at least, whose let-go alone outlasted the quantum. Format: a counter name.
+pub(crate) const LET_GO_PAST_QUANTUM: &str = "vcs_store.landed.let_go_past_quantum";
+
+/// Queues `pack`'s let-go on this shard as its repository's owner, and on its home in the region as that ([`LettingGo`]):
+/// the home here queued with it, another shard's told to queue its own. The task that turns them is started where none
+/// runs.
+fn let_go_sliced(state: &mut ShardState, pack: slates_vcs::ContentId) {
+  let shard = state.shard;
+  let home = homes::home_of(&state.shards, &pack);
+  if let Some(other) = home.filter(|home| *home != shard) {
+    let budget_ns = crate::fleet::live_budget().max_deadline_ns();
+    let told = slates_rt::futures::spawn(async move {
+      let _ = crate::xshard::call_in_shard_time(
+        shard,
+        other,
+        move |state| queue_let_go(state, pack, (true, false)),
+        budget_ns,
+      )
+      .await;
+    })
+    .and_then(slates_rt::futures::detach);
+    if told.is_err() {
+      state.count(LANDED_HOME_UNTOLD, 1);
+    }
+  }
+  queue_let_go(state, pack, (home == Some(shard), true));
+}
+
+/// Queues `pack`'s let-go here, as its home and as its owner where each is true, and starts the task that turns the
+/// queue where none runs. A home's share is queued only where the region holds the pack here.
+fn queue_let_go(state: &mut ShardState, pack: slates_vcs::ContentId, (home, owner): (bool, bool)) {
+  let home = home && homes::region_holds_here(&pack) > 0;
+  if !home && !owner {
+    return;
+  }
+  state.vcs_stores.letting_go.0.push_back(LettingGo {
+    pack,
+    home,
+    owner,
+    layout: None,
+    next: 0,
+  });
+  if state.vcs_stores.letting_go.1 {
+    return;
+  }
+  state.vcs_stores.letting_go.1 = true;
+  let turns = async {
+    while crate::state::with_state_counted(let_go_turn) == Some(true) {
+      slates_rt::futures::yield_now().await;
+    }
+    let _ = crate::state::with_state_counted(|state| state.vcs_stores.letting_go.1 = false);
+  };
+  match slates_rt::futures::spawn(turns) {
+    Ok(task) => {
+      let _ = slates_rt::futures::detach(task);
+    }
+    // No task to spare: the queue is turned by the next let-go that starts one.
+    Err(_) => state.vcs_stores.letting_go.1 = false,
+  }
+}
+
+/// One slice of the landed packs' let-go queued here ([`LettingGo`]): the first pack's windows listed, or its windows let
+/// go while the next, at the longest a window of the slice took, still ends within the shard's step quantum, at least
+/// one; counted [`LET_GO_SLICES`], and [`LET_GO_PAST_QUANTUM`] where it ran past. Whether more is queued.
+pub(crate) fn let_go_turn(state: &mut ShardState) -> bool {
+  let quantum_ns = state.config.step_quantum_ns();
+  let started_ns = slates_rt::futures::now_ns();
+  let Some(more) = let_go_slice(state, (started_ns, quantum_ns)) else {
+    return false;
+  };
+  state.count(LET_GO_SLICES, 1);
+  if slates_rt::futures::now_ns().saturating_sub(started_ns) > quantum_ns {
+    state.count(LET_GO_PAST_QUANTUM, 1);
+  }
+  more
+}
+
+/// [`let_go_turn`]'s slice, begun at `started_ns` within `quantum_ns`: none where nothing is queued, else whether more is.
+fn let_go_slice(state: &mut ShardState, (started_ns, quantum_ns): (u64, u64)) -> Option<bool> {
+  let mut letting = state.vcs_stores.letting_go.0.pop_front()?;
+  let Some((layout, len)) = letting.layout.take() else {
+    // The listing is a slice of its own: the pack's windows, read from its root, no window let go.
+    let layout = state
+      .vcs_stores
+      .content()
+      .map_or_else(Vec::new, |content| content.object_layout(&letting.pack));
+    let len = state.vcs_stores.content().map_or(0, |content| {
+      layout.last().map_or(0, |(window, offset)| {
+        offset.saturating_add(content.len_of(window).unwrap_or(0))
+      })
+    });
+    letting.layout = Some((layout, len));
+    state.vcs_stores.letting_go.0.push_front(letting);
+    return Some(true);
+  };
+  let mut longest_ns = 0;
+  while let Some((window, offset)) = layout.get(letting.next).copied() {
+    let before_ns = slates_rt::futures::now_ns();
+    let_go_window(state, &letting, (window, offset, len));
+    letting.next = letting.next.saturating_add(1);
+    let now_ns = slates_rt::futures::now_ns();
+    longest_ns = longest_ns.max(now_ns.saturating_sub(before_ns));
+    // The next window taken only where it ends within the quantum, at the slice's longest so far.
+    if now_ns.saturating_sub(started_ns).saturating_add(longest_ns) > quantum_ns {
+      break;
+    }
+  }
+  if letting.next < layout.len() {
+    letting.layout = Some((layout, len));
+    state.vcs_stores.letting_go.0.push_front(letting);
+  }
+  Some(!state.vcs_stores.letting_go.0.is_empty())
+}
+
+/// Lets go of `window`, at `offset` in `letting`'s pack of `len` bytes: recorded and let go as its home, then let go as
+/// its owner where no home holds it here; counted as [`let_go_landed_pack_among`] counts its windows.
+fn let_go_window(
+  state: &mut ShardState,
+  letting: &LettingGo,
+  (window, offset, len): (slates_vcs::ContentId, u64, u64),
+) {
+  if letting.home {
+    let at = homes::LandedAt {
+      pack: letting.pack,
+      len,
+      offset,
+    };
+    homes::record_landed_here(state, &[(window, at)]);
+  }
+  if !letting.owner {
+    return;
+  }
+  let pin = landed_pin(&window);
+  let freed = within_budget(state, 0, |stores| {
+    let Some(content) = stores.content_mut() else {
+      return Err(slates_vcs::LetGoRefused::NotHeld);
+    };
+    if !content.mark_landed(&window) {
+      return Err(slates_vcs::LetGoRefused::NotHeld);
+    }
+    content.let_go_landed(&window, pin)
+  });
+  match freed {
+    Ok(bytes) if bytes > 0 => state.count(LANDED_LET_GO_BYTES, bytes),
+    Err(slates_vcs::LetGoRefused::Pinned { .. }) => state.count(LANDED_PINNED, 1),
+    _ => {}
+  }
+}
+
+/// A landed pack let go whole in one call with the node's shards `shards`, which rank the pack's home, each window kept where this shard
 /// holds it for the region ([`landed_pin`]). The pack's
 /// home on the node told first (goal 93 item 2b(b), [`homes::landed_pack_here`]): where it holds the pack for the region,
 /// it records where each window lies in the pack and lets its copy go, brought back by the record on a read; on this
@@ -3439,12 +3625,11 @@ async fn payload_bytes(
   (bytes.len() == whole).then_some(bytes)
 }
 
-/// Whether a landed push's pack may be let go once landed (goal 93 item 2b): held now (main 01a20182's r165,
-/// 2026-11-22, the guard put back in 5d9e81984: git/git's mirror clone after the push read a let-go window it did not
-/// bring back, `Pack(Store(Unreadable))`). One switch for every path that lets a landed pack go: a commit's (removed
-/// while held) and a recovery's or a rebuild's of the pack it read whole ([`put_changeset`]); the re-lift turns them on
-/// together, with w-git's red of a clone after a multi-window pack's let-go.
-pub(crate) const LANDED_LET_GO: bool = false;
+/// Whether a landed push's pack may be let go once landed (goal 93 item 2b): on again (main 01a20182's order of
+/// 2026-11-23, after r165's `Pack(Store(Unreadable))` put the guard back in 5d9e81984; every read of a let-go window
+/// now stops and is brought back, and the let-go is sliced). One switch for every path that lets a landed pack go: a
+/// commit's ([`commit`]) and a recovery's or a rebuild's of the pack it read whole ([`put_changeset`]).
+pub(crate) const LANDED_LET_GO: bool = true;
 
 /// Puts what [`read_changeset`] read into the shard's content store, each checked against the record's identity and
 /// held by its put as one fetched from the region is, and notes the changeset's sequence as landed, so the next push

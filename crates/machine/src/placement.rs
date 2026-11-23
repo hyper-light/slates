@@ -35,6 +35,17 @@
 //! [C: seastar include/seastar/core/reactor_config.hh, fetched 2026-09-29]. slates derives the line from
 //! the facts instead: no switch, no hand-set value (R3, R8).
 //!
+//! **On Windows the OS places every shard (A-871, 84a).** Fixed to one CPU, a thread is readied onto that CPU alone,
+//! and Windows parks cores, puts idle ones in deep states and runs deferred procedure calls on them by its own power
+//! and interrupt policy, which a process does not own. On jupiter (an AMD Ryzen AI Max+ 395, 16 cores and 32 threads,
+//! Windows 11's Balanced plan, core parking's floor at half the cores; 2026-11-23) a daemon whose fifteen shards were
+//! fixed to the even logical CPUs had 399-446 of a quiet round's parked-shard wakes run over a millisecond after their
+//! kick, 27 of them over 16 ms, and the quiet edit-and-merge p999 reached 3.4-6.7 ms. Placed by the OS, the same daemon
+//! had 9-21 such wakes and a p999 of 145-337 µs quiet and loaded; naming each shard's core as its ideal processor
+//! instead was even with that (135-359 µs), so the simpler rule stands. Which of the three held a fixed shard was not
+//! separated. Linux keeps the fixing above, and macOS takes it as the hint it always was: no measurement there has
+//! shown a fixed shard's wake held for its one CPU.
+//!
 //! Two daemons given one cpuset with no quota between them still share its cores. That is the one shape
 //! the facts cannot show, and it is an operator's to avoid: one daemon per machine, or a cpuset or a quota
 //! per daemon.
@@ -44,6 +55,26 @@ use crate::derived::Derived;
 use crate::facts::{CoreFacts, CpuBudget};
 
 use std::collections::BTreeSet;
+
+/// Whether fixing a thread to one CPU keeps its wake prompt on this platform (A-871, the module doc): the input that
+/// makes the placement rule one rule, tested on every host for both kinds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fixing {
+  /// A fixed thread is woken on its own core at once (Linux; macOS takes affinity as a hint).
+  Keeps,
+  /// A thread fixed to one CPU waits for that CPU, parked, deep idle or in a deferred procedure call, while others
+  /// idle (Windows): the OS places the shards.
+  Waits,
+}
+
+impl Fixing {
+  /// This platform's.
+  pub const HERE: Fixing = if cfg!(windows) {
+    Fixing::Waits
+  } else {
+    Fixing::Keeps
+  };
+}
 
 /// Where a process's shards run.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,8 +97,13 @@ pub struct FixedCores {
 
 impl Placement {
   /// The placement for a process that may run on `cores` under `budget` (the machine facts'
-  /// [`crate::facts::Facts::cores`] and [`crate::facts::Facts::cpu_budget`]).
+  /// [`crate::facts::Facts::cores`] and [`crate::facts::Facts::cpu_budget`]), on this platform ([`Fixing::HERE`]).
   pub fn of(cores: &[CoreFacts], budget: Option<CpuBudget>) -> Placement {
+    Placement::of_with(cores, budget, Fixing::HERE)
+  }
+
+  /// The placement for `cores` under `budget` where fixing a thread does what `fixing` says.
+  pub fn of_with(cores: &[CoreFacts], budget: Option<CpuBudget>, fixing: Fixing) -> Placement {
     let best = cores.iter().map(|core| core.level).min();
     let mut threads: Vec<&CoreFacts> = cores
       .iter()
@@ -94,7 +130,9 @@ impl Placement {
       ["cores.class", "cores.level", "cores.physical", "cpu_budget"]
     );
     let owned = budget.is_none_or(|budget| budget.covers(cores.len()));
-    let fixed = owned.then(|| fixed_cores(&class)).flatten();
+    let fixed = (owned && fixing == Fixing::Keeps)
+      .then(|| fixed_cores(&class))
+      .flatten();
     Placement { shards, fixed }
   }
 }
@@ -130,6 +168,11 @@ mod tests {
     }
   }
 
+  /// The placement where a fixed thread keeps its wake: the rule the fixing tests below state on every host.
+  fn keeps(cores: &[CoreFacts], budget: Option<CpuBudget>) -> Placement {
+    Placement::of_with(cores, budget, Fixing::Keeps)
+  }
+
   fn same_class(ids: impl IntoIterator<Item = u32>) -> Vec<CoreFacts> {
     ids.into_iter().map(|id| core(id, 0)).collect()
   }
@@ -148,7 +191,7 @@ mod tests {
   fn a_machine_with_no_quota_fixes_a_shard_to_each_fastest_core_but_one() {
     let mut cores: Vec<CoreFacts> = (0..6).map(|id| core(id, 0)).collect();
     cores.extend((6..18).map(|id| core(id, 1)));
-    let placement = Placement::of(&cores, None);
+    let placement = keeps(&cores, None);
     assert_eq!(placement.shards.get(), 5);
     assert_eq!(
       placement.fixed,
@@ -172,7 +215,7 @@ mod tests {
         ..core(id, 0)
       })
       .collect();
-    let placement = Placement::of(&cores, None);
+    let placement = keeps(&cores, None);
     assert_eq!(placement.shards.get(), 15);
     assert_eq!(
       placement.fixed,
@@ -189,7 +232,7 @@ mod tests {
         ..core(id, 0)
       })
       .collect();
-    let placement = Placement::of(&linux, None);
+    let placement = keeps(&linux, None);
     assert_eq!(placement.shards.get(), 15);
     assert_eq!(
       placement.fixed,
@@ -204,10 +247,10 @@ mod tests {
   /// and fixes it nowhere — the pool is shared in time, so the scheduler places it.
   #[test]
   fn a_quota_below_the_cpuset_runs_what_it_buys_and_fixes_nothing() {
-    let placement = Placement::of(&same_class(0..18), budget(2));
+    let placement = keeps(&same_class(0..18), budget(2));
     assert_eq!(placement.shards.get(), 1);
     assert_eq!(placement.fixed, None);
-    let wider = Placement::of(&same_class(0..18), budget(8));
+    let wider = keeps(&same_class(0..18), budget(8));
     assert_eq!(wider.shards.get(), 7);
     assert_eq!(wider.fixed, None);
   }
@@ -216,7 +259,7 @@ mod tests {
   /// to its cores by their ids, which need not begin at 0.
   #[test]
   fn an_owned_cpuset_fixes_shards_to_its_own_ids() {
-    let placement = Placement::of(&same_class([2, 3]), budget(2));
+    let placement = keeps(&same_class([2, 3]), budget(2));
     assert_eq!(placement.shards.get(), 1);
     assert_eq!(
       placement.fixed,
@@ -225,7 +268,7 @@ mod tests {
         shards: vec![3]
       })
     );
-    let unbounded = Placement::of(&same_class([9, 4, 7]), None);
+    let unbounded = keeps(&same_class([9, 4, 7]), None);
     assert_eq!(
       unbounded.fixed,
       Some(FixedCores {
@@ -239,7 +282,7 @@ mod tests {
   /// runs one shard the OS places.
   #[test]
   fn one_core_is_shared_and_no_core_fixes_nothing() {
-    let one = Placement::of(&same_class([5]), None);
+    let one = keeps(&same_class([5]), None);
     assert_eq!(one.shards.get(), 1);
     assert_eq!(
       one.fixed,
@@ -248,7 +291,7 @@ mod tests {
         shards: vec![5]
       })
     );
-    let none = Placement::of(&[], None);
+    let none = keeps(&[], None);
     assert_eq!(none.shards.get(), 1);
     assert_eq!(none.fixed, None);
   }
@@ -261,19 +304,19 @@ mod tests {
       quota_us: 250_000,
       period_us: 100_000,
     });
-    let placement = Placement::of(&same_class(0..8), fraction);
+    let placement = keeps(&same_class(0..8), fraction);
     assert_eq!(placement.shards.get(), 1);
     assert_eq!(placement.fixed, None);
     let tiny = Some(CpuBudget {
       quota_us: 50_000,
       period_us: 100_000,
     });
-    assert_eq!(Placement::of(&same_class(0..4), tiny).shards.get(), 1);
+    assert_eq!(keeps(&same_class(0..4), tiny).shards.get(), 1);
     // Four fast cores and four slow ones under a four-CPU quota: the quota buys the fast class but not
     // the cpuset, so the pool is shared and nothing is fixed.
     let mut mixed: Vec<CoreFacts> = (0..4).map(|id| core(id, 0)).collect();
     mixed.extend((4..8).map(|id| core(id, 1)));
-    let shared = Placement::of(&mixed, budget(4));
+    let shared = keeps(&mixed, budget(4));
     assert_eq!(shared.shards.get(), 3);
     assert_eq!(shared.fixed, None);
   }
@@ -317,7 +360,7 @@ mod tests {
 
   /// One shape of the oracle: the design's count, and cores fixed only on an owned set.
   fn check_placement(cores: &[CoreFacts], quota: Option<CpuBudget>) {
-    let placement = Placement::of(cores, quota);
+    let placement = keeps(cores, quota);
     let shards = usize::from(placement.shards.get());
     let best = cores.iter().map(|c| c.level).min();
     let class = cores
@@ -394,5 +437,47 @@ mod tests {
       "{fixed:?}"
     );
     assert_eq!(fixed.shards.len(), shards, "{fixed:?}");
+  }
+
+  /// A-871 (84a). Do: place a machine's sixteen two-thread cores, owned whole, where a fixed thread waits for its CPU
+  /// (Windows), and where it keeps its wake. Expect: the same fifteen shards either way, none fixed where it waits, and
+  /// each fixed to a core's first thread where it keeps; this platform's own rule is the one `Placement::of` applies.
+  #[test]
+  fn where_a_fixed_thread_waits_for_its_cpu_the_os_places_every_shard() {
+    let cores: Vec<CoreFacts> = (0..32)
+      .map(|id| CoreFacts {
+        physical: id / 2,
+        ..core(id, 0)
+      })
+      .collect();
+    let waits = Placement::of_with(&cores, None, Fixing::Waits);
+    let fixed = Placement::of_with(&cores, None, Fixing::Keeps);
+    assert_eq!(waits.shards.get(), 15, "sixteen cores less one for control");
+    assert_eq!(
+      waits.shards.get(),
+      fixed.shards.get(),
+      "the count does not depend on fixing"
+    );
+    assert_eq!(
+      waits.fixed, None,
+      "where a fixed thread waits, the OS places every shard"
+    );
+    let kept = fixed
+      .fixed
+      .expect("where a fixed thread keeps its wake, owned cores are fixed");
+    assert_eq!(kept.control, 0);
+    assert_eq!(
+      kept.shards,
+      (1..16).map(|core| core * 2).collect::<Vec<u32>>()
+    );
+    assert_eq!(
+      Placement::of(&cores, None),
+      Placement::of_with(&cores, None, Fixing::HERE)
+    );
+    assert_eq!(
+      Fixing::HERE == Fixing::Waits,
+      cfg!(windows),
+      "Windows waits; Linux and macOS keep"
+    );
   }
 }

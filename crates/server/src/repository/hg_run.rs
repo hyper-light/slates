@@ -104,8 +104,10 @@ std::thread_local! {
   /// A test's crash point on this shard's thread where more than none: a push parks once its run has landed this many
   /// segments, as a push the daemon's crash stops there, until [`TEST_RELEASE`] is set.
   pub(crate) static TEST_PARK_AFTER_SEGMENTS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
-  /// Set by a test on this shard's thread: a push parked at [`TEST_PARK_AFTER_SEGMENTS`] goes on.
+  /// Set by a test on this shard's thread ([`release_parked`]): a push parked at [`TEST_PARK_AFTER_SEGMENTS`] goes on.
   pub(crate) static TEST_RELEASE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+  /// The parked push's task, woken when the test releases it ([`release_parked`]).
+  static TEST_PARKED: core::cell::RefCell<Option<core::task::Waker>> = const { core::cell::RefCell::new(None) };
   /// Set by a test on this shard's thread: once, after a push's fork is re-based off the landing turn, its repository's
   /// index is counted changed, as another push's landing between the re-base and the turn would change it.
   pub(crate) static TEST_STALE_AFTER_REBASE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
@@ -117,9 +119,25 @@ std::thread_local! {
 pub(crate) async fn parked_for_a_crash(run: &Run) {
   let at = TEST_PARK_AFTER_SEGMENTS.with(core::cell::Cell::get);
   if at > 0 && run.segments() == at {
-    while !TEST_RELEASE.with(core::cell::Cell::get) {
-      let _ = slates_rt::futures::sleep(1_000_000).await;
-    }
+    // Woken by the release itself, no timed poll (R3): the task keeps its waker where the release finds it.
+    core::future::poll_fn(|context| {
+      if TEST_RELEASE.with(core::cell::Cell::get) {
+        return core::task::Poll::Ready(());
+      }
+      TEST_PARKED.with(|parked| *parked.borrow_mut() = Some(context.waker().clone()));
+      core::task::Poll::Pending
+    })
+    .await;
+  }
+}
+
+/// Releases a push parked at a test's crash point on this shard's thread ([`parked_for_a_crash`]): its flag set and its
+/// task woken.
+#[cfg(test)]
+pub(crate) fn release_parked() {
+  TEST_RELEASE.with(|release| release.set(true));
+  if let Some(waker) = TEST_PARKED.with(|parked| parked.borrow_mut().take()) {
+    waker.wake();
   }
 }
 

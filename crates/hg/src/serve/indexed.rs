@@ -402,6 +402,19 @@ impl Repository for Indexed<'_> {
   /// The index's branch heads ([`crate::index::BranchHeads`]) where the view serves its whole changelog, numbered as
   /// the changelog numbers it: nothing left out by the filter. A view that leaves a changeset out (secret, hidden) is
   /// walked, its heads not the changelog's.
+  /// The index's changelog node rows from the prefix on, the revisions the view leaves out passed over.
+  fn changesets_prefixed(&self, prefix: (&[u8], Option<u8>), most: usize) -> Option<Vec<Node>> {
+    let served = |rev: u32| self.served_rev(rev).is_some();
+    Some(
+      self
+        .index
+        .changesets_prefixed(self.store, prefix, (most, &served))
+        .into_iter()
+        .map(|(node, _)| node)
+        .collect(),
+    )
+  }
+
   fn maintained_branch_heads(&self) -> Option<Vec<Rev>> {
     (self.left_out.is_empty() && self.count() == self.index.len(self.store, Log::Changelog))
       .then(|| self.index.branch_heads().answer())
