@@ -1364,6 +1364,7 @@ impl Daemon {
   /// registration, so a slot reused by a later daemon refuses it rather than answering for a stranger.
   /// `question` is `Clone` because each admission attempt builds a fresh task (a refused request's
   /// future is dropped by the runtime).
+  #[track_caller]
   pub fn observation<T, Q>(
     &self,
     target: Option<ShardId>,
@@ -1396,6 +1397,7 @@ impl Daemon {
   /// not"; docs/bugs/2026-09-13-consensus-voters-outside-record-neighbourhood.md). A capacity refusal is
   /// retried, paced, inside the one budget. The calling thread parks while it waits (it does not spin),
   /// so it steals no CPU from the shard it waits on.
+  #[track_caller]
   fn observe<T, Q>(&self, target: Option<ShardId>, question: Q) -> Result<T, ObserveError>
   where
     T: Send + 'static,
@@ -1422,6 +1424,7 @@ impl Daemon {
 
   /// Like [`Self::observe`] for a question of the shard's runtime context rather than of its state (a
   /// task count), answered the same way.
+  #[track_caller]
   fn observe_shard<T, Q>(&self, target: Option<ShardId>, question: Q) -> Result<T, ObserveError>
   where
     T: Send + 'static,
@@ -1438,6 +1441,7 @@ impl Daemon {
   /// ([`Self::observation`]): the form a test drives directly to prove what an observation reports at
   /// each stage — a full control channel, a full arena, a shard held past the budget, a daemon stopped
   /// while the question is pending.
+  #[track_caller]
   pub fn observe_control<T, Q>(&self, budget_ns: u64, question: Q) -> Result<T, ObserveError>
   where
     T: Send + 'static,
@@ -1450,6 +1454,7 @@ impl Daemon {
 
   /// The pending form of [`Self::observe_control`]: nothing is submitted until the returned observation
   /// is run, which may happen on another thread, and after this daemon has stopped.
+  #[track_caller]
   pub fn observation_on_control<T, Q>(
     &self,
     budget_ns: u64,
@@ -1470,6 +1475,7 @@ impl Daemon {
   /// decidable before a submission decided here.
   /// The observation of `question` at `target` that waits while the shard lives (`Observation::patient`), looking every
   /// liveness window: the default observations' form ([`Self::observe`]).
+  #[track_caller]
   fn pending_patient<T, Q>(
     &self,
     target: Option<ShardId>,
@@ -1488,6 +1494,7 @@ impl Daemon {
     Ok(Observation::patient(holder, LIVENESS_BUDGET_NS, question))
   }
 
+  #[track_caller]
   fn pending<T, Q>(
     &self,
     target: Option<ShardId>,
@@ -7355,6 +7362,7 @@ mod tests {
 
   /// Runs an audit history on the daemon's real owning shard (§4.8, §4.16). The daemon owns and
   /// joins every task; only the result crosses back to the test thread.
+  #[track_caller]
   pub(crate) fn audit_on_shard<T: Send + 'static>(
     history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
   ) -> T {
@@ -7363,6 +7371,7 @@ mod tests {
 
   /// A bounded audit fixture may reduce a geometry before mapping it, so a capacity test
   /// fills a few pages rather than the machine's measured production-sized reserve.
+  #[track_caller]
   pub(crate) fn audit_on_shard_configured<T: Send + 'static>(
     history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
     configure: impl FnOnce(&mut crate::DaemonConfig),
@@ -7459,6 +7468,7 @@ mod tests {
 
   /// Runs `history` on `daemon`'s first shard (an [`audit_daemon`]'s one), as [`audit_on_shard`] does, leaving the
   /// daemon running.
+  #[track_caller]
   pub(crate) fn observe_first<T: Send + 'static>(
     daemon: &super::Daemon,
     history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
@@ -7469,6 +7479,7 @@ mod tests {
   }
 
   /// [`observe_first`] on the shard of partition `partition`: a test's look at a shard other than the first.
+  #[track_caller]
   pub(crate) fn observe_at<T: Send + 'static>(
     daemon: &super::Daemon,
     partition: usize,
@@ -8054,6 +8065,26 @@ mod tests {
       refused,
       Some((Err(slates_vcs::LetGoRefused::Pinned { by: "homes" }), false)),
       "the region-held window pinned after the restart"
+    );
+  }
+
+  /// Main 01a20182's order of 2026-11-23: a wedged shard's verdict named `crates/rt/src/runtime.rs:38` for every
+  /// observation's task, the submit's own line, so no culprit. Do: from a test, observe the first shard of an audit
+  /// daemon (`observe_first`), reading inside the question what the shard's pulse says it is polling. Expect: the task
+  /// labelled with this file at the line that asked.
+  #[test]
+  fn an_observations_task_is_labelled_where_its_asker_asked() {
+    let daemon = audit_daemon();
+    let line = line!() + 1;
+    let seen = observe_first(&daemon, |state| {
+      slates_rt::registry::with_entry(state.shard, |entry| entry.pulse.polling())
+    });
+    daemon.stop();
+    let seen = seen.expect("the shard's pulse");
+    assert!(
+      matches!(seen.label, Some(slates_rt::label::TaskLabel::Site(site))
+        if site.file().ends_with("src/daemon.rs") && site.line() == line),
+      "{seen}"
     );
   }
 

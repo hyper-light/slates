@@ -63,13 +63,24 @@ impl SpawnRequest {
     future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
     parent: Option<Encoded>,
   ) -> (Self, AdmissionReceipt) {
+    Self::with_receipt_at(future, parent, core::panic::Location::caller())
+  }
+
+  /// [`SpawnRequest::with_receipt`], labelled with `site`, where the work it carries was asked for: a task made on
+  /// another's behalf names its asker, not the helper that made it (main 01a20182, 2026-11-23: every observation's task
+  /// read `runtime.rs:38`, the submit's own line, so a wedged one named no culprit).
+  pub fn with_receipt_at(
+    future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+    parent: Option<Encoded>,
+    site: &'static core::panic::Location<'static>,
+  ) -> (Self, AdmissionReceipt) {
     let (slot, receipt) = receipt();
     (
       Self {
         future,
         parent,
         receipt: slot,
-        label: crate::label::caller(),
+        label: crate::label::at(site),
       },
       receipt,
     )
