@@ -521,6 +521,11 @@ fn text_key(repository: u128, text: &Identity) -> [u8; TEXT_KEY_BYTES] {
   key
 }
 
+/// What reads back a changeset's text entries by its sequence, over the store's rows: the store's own reader, lent to
+/// [`forget_rows`] and [`next_keeper`].
+pub(crate) type EntriesOf<'a, F> = dyn FnMut(&mut mantle_engine::shard_db::ShardDb<F>, u64) -> Result<Vec<TextEntry>, StoreError>
+  + 'a;
+
 /// A keeper row's key.
 fn keeper_key(
   repository: u128,
@@ -528,17 +533,22 @@ fn keeper_key(
   (sequence, ordinal): (u64, u32),
 ) -> [u8; KEEPER_KEY_BYTES] {
   let mut key = [0u8; KEEPER_KEY_BYTES];
-  if let Some(tag) = key.first_mut() {
-    *tag = KEEPERS;
+  let (repository, sequence, ordinal) = (
+    repository.to_be_bytes(),
+    sequence.to_be_bytes(),
+    ordinal.to_be_bytes(),
+  );
+  // Each field in turn, by checked splits: the key's length is the fields' sum (`KEEPER_KEY_BYTES`), so every split
+  // holds; none can run past the key.
+  let fields: [&[u8]; 5] = [&[KEEPERS], &repository, text, &sequence, &ordinal];
+  let mut rest: &mut [u8] = &mut key;
+  for field in fields {
+    let Some((head, tail)) = rest.split_at_mut_checked(field.len()) else {
+      break;
+    };
+    head.copy_from_slice(field);
+    rest = tail;
   }
-  let at = 1;
-  key[at..at + REPOSITORY].copy_from_slice(&repository.to_be_bytes());
-  let at = at + REPOSITORY;
-  key[at..at + IDENTITY].copy_from_slice(text);
-  let at = at + IDENTITY;
-  key[at..at + LONG].copy_from_slice(&sequence.to_be_bytes());
-  let at = at + LONG;
-  key[at..at + ORDINAL].copy_from_slice(&ordinal.to_be_bytes());
   key
 }
 
@@ -592,10 +602,7 @@ pub(crate) fn forget_rows<F: hyper_block::block::BlockFile>(
   rows: &mut mantle_engine::shard_db::ShardDb<F>,
   (repository, sequence): (u128, u64),
   entries: &[TextEntry],
-  entries_of: &mut dyn FnMut(
-    &mut mantle_engine::shard_db::ShardDb<F>,
-    u64,
-  ) -> Result<Vec<TextEntry>, StoreError>,
+  entries_of: &mut EntriesOf<'_, F>,
 ) -> Result<u64, StoreError> {
   let mut forgotten = 0_u64;
   let mut held = Vec::with_capacity(TEXT_VALUE_BYTES);
@@ -649,10 +656,7 @@ pub(crate) fn forget_rows<F: hyper_block::block::BlockFile>(
 fn next_keeper<F: hyper_block::block::BlockFile>(
   rows: &mut mantle_engine::shard_db::ShardDb<F>,
   keepers: &[(u64, u32)],
-  entries_of: &mut dyn FnMut(
-    &mut mantle_engine::shard_db::ShardDb<F>,
-    u64,
-  ) -> Result<Vec<TextEntry>, StoreError>,
+  entries_of: &mut EntriesOf<'_, F>,
   wanted: impl Fn(&TextEntry) -> bool,
 ) -> Result<Option<(u64, TextEntry)>, StoreError> {
   for (keeper, ordinal) in keepers {
