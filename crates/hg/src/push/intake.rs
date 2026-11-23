@@ -204,9 +204,9 @@ enum Stage {
 }
 
 /// The changegroup's framing as places in its bytes (`crate::framing::Framed`), so the intake borrows nothing between
-/// steps.
+/// steps; and which of its revisions a delta past the next one rests on ([`Frame::based_later`]).
 #[derive(Clone, Debug, Default)]
-struct Frame(Framed);
+struct Frame(Framed, Vec<u64>);
 
 impl Frame {
   /// The framing of `payload`, a whole changegroup of `version` in memory, each plain delta checked, within
@@ -246,7 +246,24 @@ impl Frame {
     if !framed.trees.is_empty() {
       return Err(Unverified::TreeManifests.into());
     }
-    Ok(Frame(framed))
+    let later = later_bases(&framed);
+    Ok(Frame(framed, later))
+  }
+
+  /// Whether a delta of `range` past the next one rests on its revision at `at` (goal 93: the push's cache keeps only the
+  /// texts such a delta will ask for; the next delta's base is the text kept last).
+  fn based_later(&self, range: &Range<usize>, at: usize) -> bool {
+    let Some(index) = range
+      .start
+      .checked_add(at)
+      .filter(|index| *index < range.end)
+    else {
+      return false;
+    };
+    self
+      .1
+      .get(index / BITS)
+      .is_some_and(|word| word & (1 << (index % BITS)) != 0)
   }
 
   /// The revision at `at` of `range`, its delta read from `payload`, with where its delta lies there (A-767 C4: the
@@ -267,6 +284,35 @@ impl Frame {
     };
     Ok(Some((found.revision(payload)?, found.data.clone())))
   }
+}
+
+/// Format: the bits a word of [`Frame`]'s later bases holds.
+const BITS: usize = u64::BITS as usize;
+
+/// Each revision of `framed` a delta past the next one in its group names as its base, one bit a revision in stream
+/// order (one word for each 64, beside the framing's own record a revision): a walk of each group, its nodes found by a
+/// map the walk drops as the group ends.
+fn later_bases(framed: &Framed) -> Vec<u64> {
+  let mut later = vec![0_u64; framed.revisions.len().div_ceil(BITS)];
+  let groups = [framed.changelog.clone(), framed.manifests.clone()]
+    .into_iter()
+    .chain(framed.files.iter().map(|(_, revisions)| revisions.clone()));
+  for group in groups {
+    let mut at: BTreeMap<Node, usize> = BTreeMap::new();
+    for index in group {
+      let Some(placed) = framed.revisions.get(index) else {
+        continue;
+      };
+      if let Some(base) = at.get(&placed.base).copied()
+        && base.saturating_add(1) != index
+        && let Some(word) = later.get_mut(base / BITS)
+      {
+        *word |= 1 << (base % BITS);
+      }
+      at.insert(placed.node, index);
+    }
+  }
+  later
 }
 
 /// A push's changegroup being taken into a fork of its repository's index (module docs): the changegroup's framing, as
@@ -349,10 +395,13 @@ impl Intake {
 struct Taker {
   /// The fork: the repository's revisions, and the push's as they are kept.
   fork: HgIndex,
-  /// The buffer the next revision's text is rebuilt into (goal 93, no allocation by design): a changeset's or a
-  /// manifest's text kept before the last, which no later delta rests on once another is kept, so a manifest's rebuild
-  /// reuses it and allocates nothing past the first.
-  spare: Vec<u8>,
+  /// The buffers a revision's text is rebuilt into ([`Spares`]; goal 93, no allocation by design).
+  spares: Spares,
+  /// Whether a delta past the next one rests on the revision being taken ([`Frame::based_later`]), told by its step.
+  taking_later: bool,
+  /// Whether a delta past the next one rests on the text kept last: only such a text is kept in the cache once another
+  /// is kept, every other handed to the spares.
+  last_later: bool,
   /// The unit next.
   stage: Stage,
   /// The nodes the push brought in the log being taken, to tell a revision brought earlier from one held.
@@ -571,10 +620,12 @@ impl PendingLog {
   }
 }
 
-/// The push's own file texts a later delta may name as its base (A-767 C1, main's ruling (b2)): the texts kept before
-/// the one kept last, oldest out first, at most the room the push was admitted (derived: what one step of the push may
-/// hold, so the intake's working set is at most twice its room), let go as each file group ends and with the push. A
-/// miss is rebuilt from the push's own deltas ((b1)), the one source; the cache only saves the rebuild.
+/// The push's own file texts a later delta names as its base (A-767 C1, main's ruling (b2)): of the texts kept before
+/// the one kept last, those a delta past the next one in their group rests on ([`Frame::based_later`]; goal 93: kept
+/// whole, every text a file's group brought was a buffer of its own, 1.08 copies an edit at a 160 KiB file), oldest out
+/// first, at most the room the push was admitted (derived: what one step of the push may hold, so the intake's working
+/// set is at most twice its room), let go as each file group ends and with the push, each text let go handed to the
+/// [`Spares`]. A miss is rebuilt from the push's own deltas ((b1)), the one source; the cache only saves the rebuild.
 #[derive(Debug, Default)]
 struct BaseCache {
   /// The texts, by node.
@@ -596,10 +647,12 @@ impl BaseCache {
     }
   }
 
-  /// Keeps `text` as `node`'s, letting the oldest go until it fits; a text past the bound alone is not kept.
-  fn put(&mut self, node: Node, text: Vec<u8>) {
+  /// Keeps `text` as `node`'s, letting the oldest go until it fits, each text let go handed to `spares`; a text past
+  /// the bound alone is not kept, and handed to them too.
+  fn put(&mut self, node: Node, text: Vec<u8>, spares: &mut Spares) {
     let len = to_u64(text.len());
     if len > self.bound || self.held.contains_key(&node) {
+      spares.give(text);
       return;
     }
     while self.bytes.saturating_add(len) > self.bound {
@@ -608,6 +661,7 @@ impl BaseCache {
       };
       if let Some(gone) = self.held.remove(&oldest) {
         self.bytes = self.bytes.saturating_sub(to_u64(gone.len()));
+        spares.give(gone);
       }
     }
     self.bytes = self.bytes.saturating_add(len);
@@ -615,11 +669,90 @@ impl BaseCache {
     self.held.insert(node, text);
   }
 
-  /// Lets every text go.
-  fn clear(&mut self) {
-    self.held.clear();
+  /// Lets every text go, each handed to `spares`.
+  fn clear(&mut self, spares: &mut Spares) {
+    for (_, text) in core::mem::take(&mut self.held) {
+      spares.give(text);
+    }
     self.order.clear();
     self.bytes = 0;
+  }
+}
+
+/// Shape: the most buffers [`Spares`] keeps: a step rebuilds one text, and a file group's end lets go of a few.
+const SPARES: usize = 4;
+
+/// The push's buffers a revision's text is rebuilt into (goal 93, no allocation by design; w-perf's attribution of
+/// Mercurial's own push: `intake::rebuilt` allocated 3.76 GB freed within a second, 1.07 GB of it in the band glibc
+/// keeps): every text the intake lets go (the cache's, as it evicts and as each file group ends; a changeset's or a
+/// manifest's text once the next is kept, since no later delta rests on it; a base read whole for one step), at most
+/// [`SPARES`] of them and the cache's bound in bytes, so the intake's working set stays its step's and twice its room. A
+/// rebuild takes the largest, so a text no longer than one let go allocates nothing.
+#[derive(Debug, Default)]
+struct Spares {
+  /// The buffers, each emptied.
+  held: Vec<Vec<u8>>,
+  /// Their capacities' sum.
+  bytes: u64,
+  /// The most bytes they may hold.
+  bound: u64,
+}
+
+impl Spares {
+  /// The spares of a push admitted `room` bytes.
+  fn within(room: u64) -> Spares {
+    Spares {
+      bound: room,
+      ..Spares::default()
+    }
+  }
+
+  /// The largest buffer held, emptied; a new one where none is.
+  fn take(&mut self) -> Vec<u8> {
+    let largest = self
+      .held
+      .iter()
+      .enumerate()
+      .max_by_key(|(_, buffer)| buffer.capacity())
+      .map(|(at, _)| at);
+    match largest {
+      Some(at) => {
+        let buffer = self.held.swap_remove(at);
+        self.bytes = self.bytes.saturating_sub(to_u64(buffer.capacity()));
+        buffer
+      }
+      None => Vec::new(),
+    }
+  }
+
+  /// Keeps `buffer` for a later rebuild where it fits beside the rest, in place of the smallest held where it is larger
+  /// and the count is full; else lets it go.
+  fn give(&mut self, mut buffer: Vec<u8>) {
+    let capacity = to_u64(buffer.capacity());
+    if capacity == 0 {
+      return;
+    }
+    if self.held.len() >= SPARES {
+      let smallest = self
+        .held
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, held)| held.capacity())
+        .map(|(at, held)| (at, held.capacity()));
+      match smallest {
+        Some((at, held)) if to_u64(held) < capacity => {
+          let gone = self.held.swap_remove(at);
+          self.bytes = self.bytes.saturating_sub(to_u64(gone.capacity()));
+        }
+        _ => return,
+      }
+    }
+    if self.bytes.saturating_add(capacity) > self.bound {
+      return;
+    }
+    buffer.clear();
+    self.bytes = self.bytes.saturating_add(capacity);
+    self.held.push(buffer);
   }
 }
 
@@ -819,7 +952,9 @@ impl Intake {
         awaited: BTreeSet::new(),
         bringing,
         last: None,
-        spare: Vec::new(),
+        spares: Spares::within(room),
+        taking_later: false,
+        last_later: false,
         last_identity: None,
         logged: false,
         path: None,
@@ -1039,6 +1174,7 @@ impl Taker {
       at: at.saturating_add(1),
     };
     let position = (!kept_before).then_some(at);
+    self.taking_later = frame.based_later(&revisions, at);
     let taken = self.take(
       Log::File(&path),
       (&revision, place),
@@ -1061,10 +1197,14 @@ impl Taker {
   fn enter(&mut self, stage: Stage) {
     self.path = None;
     self.positions.clear();
-    self.cache.clear();
+    self.cache.clear(&mut self.spares);
     self.asked = None;
     self.brought.clear();
-    self.last = None;
+    if let Some((_, text)) = self.last.take() {
+      self.spares.give(text);
+    }
+    self.taking_later = false;
+    self.last_later = false;
     self.last_identity = None;
     self.logged = false;
     self.stage = stage;
@@ -1132,7 +1272,7 @@ impl Taker {
     }
     self.check_known(log, revision, store)?;
     let mut room = *admission;
-    let into = core::mem::take(&mut self.spare);
+    let into = self.spares.take();
     let base_rebuilt = given.is_none() && revision.base != NULL_NODE;
     let base_text = match given {
       Some(text) => Some(Cow::Owned(text)),
@@ -1145,7 +1285,11 @@ impl Taker {
       (Some(text), _) => Some(*blake3::hash(text).as_bytes()),
       (None, _) => None,
     };
-    let text = rebuilt(base_text, revision, log, (&mut room, into))?;
+    let text = rebuilt(base_text.as_deref(), revision, log, (&mut room, into))?;
+    // A base read whole for this step alone is a later rebuild's buffer.
+    if let Some(Cow::Owned(base)) = base_text {
+      self.spares.give(base);
+    }
     if base_rebuilt {
       self.intaken.rebuilt = self.intaken.rebuilt.saturating_add(1);
     }
@@ -1416,11 +1560,15 @@ impl Taker {
     // The text kept before this one may be a later delta's base: the push's cache keeps a file's ((b2)). A changeset's or
     // a manifest's is no later delta's base once this one is kept (each rests on the one before), so its buffer is the
     // next rebuild's.
+    // Only a text a delta past the next one rests on is kept; the next delta rests on the text kept last.
     match (log, self.last.take()) {
-      (Log::File(_), Some((node, text))) => self.cache.put(node, text),
-      (_, Some((_, text))) => self.spare = text,
+      (Log::File(_), Some((node, text))) if self.last_later => {
+        self.cache.put(node, text, &mut self.spares);
+      }
+      (_, Some((_, text))) => self.spares.give(text),
       (_, None) => {}
     }
+    self.last_later = core::mem::take(&mut self.taking_later);
     self.last = Some((revision.node, arrived.text));
     Ok(())
   }
@@ -1546,7 +1694,9 @@ impl Taker {
         fault,
       })?;
       self.intaken.base_rebuilds = self.intaken.base_rebuilds.saturating_add(1);
-      self.cache.put(revision.node, text.clone());
+      self
+        .cache
+        .put(revision.node, text.clone(), &mut self.spares);
     }
     Ok(Based::Text(text))
   }
@@ -1935,7 +2085,7 @@ pub fn read_changesets(
 /// The step that rebuilds a revision's text: its delta applied to its base's text (module docs: the step a later
 /// storage removes from the keeping), charged to `room`.
 fn rebuilt(
-  base: Option<Cow<'_, [u8]>>,
+  base: Option<&[u8]>,
   revision: &Revision<'_>,
   log: Log<'_>,
   (room, mut into): (&mut Admission, Vec<u8>),

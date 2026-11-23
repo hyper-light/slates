@@ -469,9 +469,10 @@ pub struct Client {
   retry_held: std::collections::BTreeMap<u32, Instant>,
   /// Ids released from `retry_held` at its bound or released by their caller unanswered.
   retry_released: u64,
-  /// Outstanding words answered `DurabilityPending` and sent again under their own id (A-354): the verb ran and recorded
-  /// its own reply, so the resend is answered that reply. Once each, so a recorded `DurabilityPending` (a yield, A-409) is
-  /// the answer. A subset of `awaited`, removed with its word.
+  /// Outstanding words answered `DurabilityPending` and sent again under their own id (A-354): the verb ran on its owner,
+  /// its outcome in doubt, so the resend joins the owner's wait and is answered the outcome once decided (its own reply
+  /// once durable). Once each, so a second `DurabilityPending` (still in doubt, or a yield's recorded one, A-409) is the
+  /// answer. A subset of `awaited`, removed with its word.
   durability_resent: std::collections::BTreeSet<u64>,
   /// Replies drained from the completion ring while looking for another request's reply, held by
   /// their request-id word until their own [`Client::poll_reply`] takes them. The async path drains
@@ -1228,8 +1229,8 @@ pub enum MoveState {
   },
 }
 
-/// Whether `reply` is `DurabilityPending`: the verb ran and its own reply is recorded under its id, to be asked for again
-/// under that id (A-354).
+/// Whether `reply` is `DurabilityPending`: the verb ran on its owner and is not known durable, its outcome in doubt and
+/// recorded nowhere yet, to be asked for again under its id (A-354).
 fn durability_pending(reply: &ReplyBody) -> bool {
   matches!(
     reply,
@@ -2387,9 +2388,10 @@ impl Client {
   /// channel bound again to the consumer first, when the client holds one — and a resend under the
   /// same id.
   fn exchange(&mut self, id: RequestId, body: &RequestBody) -> Result<ReplyBody, ClientError> {
-    // A-354: a verb whose reply was held past the failover SLO ran once and recorded its own reply, answering
-    // `DurabilityPending` now; sent again under the same id it is answered that reply from its record, never run again.
-    // Once: a second `DurabilityPending` is a recorded one (its owner yielded the volume, A-409) and is the answer.
+    // A-354: a verb whose reply was held past the failover SLO ran once on its owner and is answered `DurabilityPending`,
+    // its outcome in doubt and recorded nowhere; sent again under the same id it joins the owner's wait, never run
+    // again, and is answered the outcome once decided (its own reply once durable). Once: a second `DurabilityPending`
+    // (still in doubt, or a yield's recorded one, A-409) is the answer, never a success no quorum held.
     let mut resent_pending = false;
     loop {
       self.rebind_if_needed()?;
@@ -2590,9 +2592,10 @@ impl Client {
   }
 
   /// Whether `reply`, drained for the outstanding `word`, was a first `DurabilityPending` this client answered by sending
-  /// the request again under `word` (A-354): the verb ran once and recorded its own reply, which the resend is answered,
-  /// so an async caller is handed that reply and never runs the verb again. `false` (the reply is the answer) for any other
-  /// reply, a word answered so before, one not outstanding, or a resend the ring had no room for or the channel refused.
+  /// the request again under `word` (A-354): the verb ran once on its owner, its outcome in doubt, so the resend joins the
+  /// owner's wait and is answered the outcome once decided, and the verb never runs again. `false` (the reply is the
+  /// answer) for any other reply, a word answered so before, one not outstanding, or a resend the ring had no room for or
+  /// the channel refused.
   fn resent_for_durability(&mut self, word: u64, reply: &ReplyBody) -> bool {
     if !durability_pending(reply) || self.durability_resent.contains(&word) {
       return false;
