@@ -890,6 +890,166 @@ fn a_push_of_a_long_history_and_many_branches_lands_every_ref_through_the_daemon
   assert_eq!((created.0, landed), (200, MANY_BRANCHES + 1), "{report}");
 }
 
+/// Shape: the annotated tags [`a_push_of_annotated_tags_is_listed_and_fetched_whole_once_its_pack_is_landed`] pushes,
+/// each after a file of [`TAGGED_FILE_BYTES`] in its pack, so each lies in a window of its own.
+const TAGS: usize = 4;
+/// Shape: the bytes of each file before a tag in that test's pack: past a window of the content store (256 KiB).
+const TAGGED_FILE_BYTES: usize = 400 * 1024;
+
+/// Stock git's request creating `main` at a root commit of [`TAGS`] files and an annotated tag `refs/tags/t<k>` of it
+/// for each, the pack laid out commit, tree, then each file followed by its tag; the commit, and each tag's name.
+fn tagged_create() -> (Vec<u8>, ObjectId, Vec<ObjectId>) {
+  use slates_git::object_name::Kind;
+  let mut state = 0x2545_f491_4f6c_dd1du64;
+  let files: Vec<Vec<u8>> = (0..TAGS)
+    .map(|_| {
+      (0..TAGGED_FILE_BYTES)
+        .map(|_| {
+          state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+          state.to_be_bytes()[0]
+        })
+        .collect()
+    })
+    .collect();
+  let mut tree = Vec::new();
+  for (at, file) in files.iter().enumerate() {
+    tree.extend_from_slice(format!("100644 f{at}\0").as_bytes());
+    tree.extend_from_slice(git_name(Kind::Blob, file).as_bytes());
+  }
+  let tree_id = git_name(Kind::Tree, &tree);
+  let commit = format!(
+    "tree {tree_id}\nauthor A <a@example.com> 1700000000 +0000\n\
+     committer A <a@example.com> 1700000000 +0000\n\ntagged\n"
+  )
+  .into_bytes();
+  let commit_id = git_name(Kind::Commit, &commit);
+  let tags: Vec<Vec<u8>> = (0..TAGS)
+    .map(|at| {
+      format!(
+        "object {commit_id}\ntype commit\ntag t{at}\ntagger A <a@example.com> 1700000000 +0000\n\ntag {at}\n"
+      )
+      .into_bytes()
+    })
+    .collect();
+  let tag_ids: Vec<ObjectId> = tags.iter().map(|tag| git_name(Kind::Tag, tag)).collect();
+  let mut objects: Vec<(Kind, &[u8])> = vec![(Kind::Commit, &commit), (Kind::Tree, &tree)];
+  for (file, tag) in files.iter().zip(&tags) {
+    objects.push((Kind::Blob, file));
+    objects.push((Kind::Tag, tag));
+  }
+  let mut request = Vec::new();
+  let line = format!("{ZERO} {commit_id} refs/heads/main\0 report-status");
+  pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("the command");
+  for (at, tag) in tag_ids.iter().enumerate() {
+    let line = format!("{ZERO} {tag} refs/tags/t{at}");
+    pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("a command");
+  }
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request.extend_from_slice(&stored_pack(&objects));
+  (request, commit_id, tag_ids)
+}
+
+/// Goal 93 item 2b(a) (main 01a20182's r52, 2026-11-22: once git/git's push ended its landed pack was let go, and every
+/// fetch of it failed, ls-remote and clone alike, "aborting due to possible repository corruption on the remote side":
+/// the advertisement's tag peel read a window let go, `Unreadable`, where no read brings it back). Do: on a two-shard
+/// daemon with its edge, push as stock git posts it a commit of [`TAGS`] files and an annotated tag of it for each, each
+/// tag in a window of its own; wait for the push's end to run its landed let-go (counted, or 3 s), and let the
+/// repository go idle (`git_encode::give_back_idle`: the objects its reads keep given back); then, as `git ls-remote`
+/// and `git clone` ask at protocol v2, list every ref with its peel and fetch the commit and every tag.
+/// Expect: the push `200`, every ref `ok`; the listing exactly `main` and each tag peeled to the commit; the fetch `200`,
+/// its pack every object pushed. Failing first: the tags' windows let go, the listing refused.
+#[test]
+fn a_push_of_annotated_tags_is_listed_and_fetched_whole_once_its_pack_is_landed() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, commit, tags) = tagged_create();
+  let created = pushed(edge, &name, &request);
+  // The push's end runs its landed let-go (its `ReceivePack` dropped) as the edge finishes its answer.
+  let waited = std::time::Instant::now();
+  while counted_on(&daemon, REPOSITORY, crate::vcs_store::LANDED_LET_GO_BYTES) == 0
+    && waited.elapsed() < Duration::from_secs(3)
+  {
+    std::thread::sleep(Duration::from_millis(20));
+  }
+  // Then the repository goes idle, as it does once no fetch of it is answered: what its reads keep of the objects read
+  // lately (`packed::Recent`, which the push's decision filled with the tags) given back, so the listing reads them from
+  // their windows, as git/git's tags, far past that cache, were read.
+  let let_go = crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
+    for id in state.vcs_stores.git_repositories() {
+      crate::vcs_store::git_encode::give_back_idle(state, id);
+    }
+    let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+    (
+      count(crate::vcs_store::LANDED_LET_GO_BYTES),
+      count(crate::vcs_store::LANDED_PINNED),
+    )
+  });
+  let mut ls_refs = Vec::new();
+  for line in [b"command=ls-refs\n".as_slice()] {
+    pktline::write(Packet::Data(line), &mut ls_refs).expect("the command");
+  }
+  pktline::write(Packet::Delim, &mut ls_refs).expect("the delimiter");
+  for argument in [b"peel\n".as_slice(), b"ref-prefix refs/\n"] {
+    pktline::write(Packet::Data(argument), &mut ls_refs).expect("an argument");
+  }
+  pktline::write(Packet::Flush, &mut ls_refs).expect("the flush");
+  let listed = uploaded(edge, &name, &ls_refs);
+  let mut fetch = Vec::new();
+  pktline::write(Packet::Data(b"command=fetch\n"), &mut fetch).expect("the command");
+  pktline::write(Packet::Delim, &mut fetch).expect("the delimiter");
+  let mut arguments = vec![format!("want {commit}\n")];
+  arguments.extend(tags.iter().map(|tag| format!("want {tag}\n")));
+  arguments.extend(["no-progress\n".to_owned(), "done\n".to_owned()]);
+  for argument in &arguments {
+    pktline::write(Packet::Data(argument.as_bytes()), &mut fetch).expect("an argument");
+  }
+  pktline::write(Packet::Flush, &mut fetch).expect("the flush");
+  let fetched = uploaded(edge, &name, &fetch);
+  daemon.stop();
+  eprintln!("landed let-go bytes and windows pinned before the listing: {let_go:?}");
+  let report = String::from_utf8_lossy(&created.1).into_owned();
+  assert_eq!(
+    (created.0, report.matches("ok refs/").count()),
+    (200, TAGS + 1),
+    "{report}"
+  );
+  let mut expected = Vec::new();
+  let main = format!("{commit} refs/heads/main\n");
+  pktline::write(Packet::Data(main.as_bytes()), &mut expected).expect("a line");
+  for (at, tag) in tags.iter().enumerate() {
+    let line = format!("{tag} refs/tags/t{at} peeled:{commit}\n");
+    pktline::write(Packet::Data(line.as_bytes()), &mut expected).expect("a line");
+  }
+  pktline::write(Packet::Flush, &mut expected).expect("the flush");
+  assert_eq!(
+    (listed.0, String::from_utf8_lossy(&listed.1)),
+    (200, String::from_utf8_lossy(&expected)),
+    "every ref listed, each tag peeled"
+  );
+  assert_eq!(fetched.0, 200);
+  let answer = String::from_utf8_lossy(
+    fetched
+      .1
+      .get(..fetched.1.len().min(400))
+      .unwrap_or_default(),
+  )
+  .into_owned();
+  assert!(answer.starts_with("000dpackfile\n"), "{answer}");
+  let (_, commands_end) = packets_from(&request, 0);
+  let pushed_pack = request.get(commands_end..).expect("the push's pack");
+  assert_eq!(
+    ids_in(&fetched_pack(&fetched.1)).len(),
+    ids_in(pushed_pack).len()
+  );
+}
+
 /// A v2 `fetch` of `want` with `done` and no progress, as `git clone` asks for a branch's commit.
 pub(crate) fn fetch_of(want: ObjectId) -> Vec<u8> {
   let mut request = Vec::new();
