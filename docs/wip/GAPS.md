@@ -26417,3 +26417,16 @@ A plain debug build on adacachy2 (db3ddff02) sorted the reds:
 - **TSan only (green here).** `content_ranges::tests::a_sweep_on_its_step_clock_settles_at_steps_its_fixed_cost_amortizes`
   (1 of 3 TSan runs) and `git_push::tests::t_a614a_a_long_historys_derivation_takes_turns_by_the_shards_pace_not_its_objects`
   (2 of 3; 1 turn in 21 ms here).
+
+### 2026-11-23: the Miri lane stalled in the runtime's cell table — fixed (w-tsan, main 01a20182's order; w-wall's finding)
+CI's Miri lane ("miri + loom (mem, rt, wire)") would next stall in slates-rt's
+`retirement::tests::a_group_is_adopted_retired_and_its_owner_joined`: w-wall's run went 37 minutes without finishing,
+every progress report inside `sync::cell::claim`'s look-up of the cell table, and a native sample of Miri put its time
+in the borrow tracker. The table was one static array of 262,144 `OnceLock<Box<Segment>>` slots (A-767 C2), and every
+claim and every handle's look-up borrowed all 4 MiB of it, which Stacked Borrows retags slot by slot. On this MacBook the
+cell test `a_cell_is_freed_by_its_last_handle_and_a_stale_handle_finds_it_closed` took 43.0 s of CPU under Stacked
+Borrows and 3.19 s with them off. **Fixed:** two levels, 512 directories of 512 segments' slots, so a look-up borrows
+two arrays of 512. The cell test then took 2.74 s of CPU, and the retirement test passed in 3.98 s; with CI's flags,
+`retirement::` and `sync::cell::` passed 4 of 4 in 158 s of CPU. The plain build pays about 2 ns a claim (12 to 14 ns,
+least against least, 8 interleaved rounds at load 79-103), which main accepted (BENCHMARKS). CI's Miri lane is the check
+of the whole crate.

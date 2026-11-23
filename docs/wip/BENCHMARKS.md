@@ -18829,3 +18829,47 @@ Every run: oracle failures 0, refusals 0, lost 0.
   once unless its caller names a spin, so 17,753 to 18,726 of its 20,000 trips parked and its zero-wakes assertion
   aborted every run. It now names its spin (`set_spin_ns(Some(u64::MAX))`). The parked row's "every trip woke the
   client" assertion aborted 1 run of the 12 above (round 2's A, under load): GAPS.
+
+## The runtime's cell table in two levels: Miri's borrow tracker off the claim path, about 2 ns a claim in the plain build (w-tsan; main 01a20182's ruling; 2026-11-23): accepted
+
+- **Why asked.** CI's Miri lane would next stall in `retirement::tests::a_group_is_adopted_retired_and_its_owner_joined`
+  (w-wall: 37 minutes, unfinished; every progress report in `sync::cell::claim`'s look-up; Miri's time in its borrow
+  tracker). `sync::cell`'s table was one static array of 262,144 `OnceLock<Box<Segment>>` slots, 4 MiB, borrowed whole
+  at every claim and every handle's look-up, and Miri's Stacked Borrows retags every slot a borrow covers.
+- **The change.** Two levels: 512 directories of 512 segments' slots, each directory allocated when its first segment
+  is needed. A look-up borrows two arrays of 512 slots. No `unsafe`.
+- **Machine.** This MacBook (Adas-MacBook-Pro-2.local, Apple silicon, macOS 26), 2026-11-23 14:41-15:16 PST, load
+  average 67 to 145 (shared, not quiesced). Miri is the installed nightly's: `cargo +nightly miri test -p slates-rt --lib
+  -- --exact <test>`, each timed after a `--no-run` build.
+
+| test | table | Stacked Borrows | CPU (user, s) | wall (s) |
+|---|---|---|---|---|
+| `sync::cell::tests::a_cell_is_freed_by_its_last_handle_and_a_stale_handle_finds_it_closed` | one level | on | 43.02 | 399.57 |
+| the same | one level | off | 3.19 | 81.63 |
+| the same | two levels | on | 2.74 | 17.88 |
+| the same | two levels | off | 2.39 | 15.94 |
+| `retirement::tests::a_group_is_adopted_retired_and_its_owner_joined` | one level | on | (w-wall: 37 min, unfinished) | |
+| the same | two levels | on | 3.98 | 34.06 |
+| `retirement::` and `sync::cell::`, 4 tests, CI's `-Zmiri-ignore-leaks` | two levels | on | 158.48 | 1,146.50 |
+
+- **Read.** The one-level table cost 39.8 s of Stacked Borrows CPU for two claims and a few look-ups; two levels cost
+  0.35 s. The cost was the borrow tracker's retag of the 4 MiB array.
+- **The plain build.** `cargo test --release -p slates-rt --lib -- --ignored --exact
+  sync::cell::tests::measure_claim_and_look_up --nocapture` (the mean of 1,000,000 each), from two trees, one level (A)
+  and two levels (B), in 8 interleaved rounds; each round's 1-, 5- and 15-minute load averages:
+
+| round | load | A claim, look-up and release (ns) | B | A look-up (ns) | B |
+|---|---|---|---|---|---|
+| 1 | 69 / 101 / 103 | 13 | 14 | 1 | 1 |
+| 2 | 82 / 94 / 100 | 14 | 19 | 1 | 4 |
+| 3 | 83 / 94 / 99 | 12 | 14 | 1 | 1 |
+| 4 | 83 / 94 / 99 | 14 | 14 | 1 | 1 |
+| 5 | 83 / 94 / 99 | 12 | 20 | 1 | 4 |
+| 6 | 83 / 94 / 99 | 15 | 47 | 1 | 2 |
+| 7 | 81 / 93 / 99 | 12 | 15 | 1 | 1 |
+| 8 | 79 / 93 / 99 | 12 | 15 | 1 | 2 |
+
+- **Accepted (main's ruling).** The second level costs about 2 ns a claim, least against least (12 to 14 ns), and the
+  look-up's least stays 1 ns. That is noise beside the standard channel each claim comes with. A Miri-only shape would
+  be a mode switch, and it would have Miri certify code that does not ship. Re-read the cost on a quiet box with the
+  command above.
