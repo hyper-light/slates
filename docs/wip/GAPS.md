@@ -105,8 +105,16 @@
 > back on a read; the records ride the shard image, so a window with one is not pinned.
 > The kept memory, measured on Linux (main 01a20182, 2026-11-23): with glibc, the gauges carry glibc's own figures over
 > every arena (`mem.gauge.process.malloc_free_bytes`, its arenas' free bytes, fastbins among them; `malloc_mapped_bytes`;
-> `malloc_arena_bytes`), so the remainder above is read there, not inferred; macOS and musl still infer it. OWED: main's
-> Linux RSS round reading them.
+> `malloc_arena_bytes`), so the remainder above is read there, not inferred; macOS and musl still infer it. Read by
+> arena-11/12 (hg's full push, CI 45174893883): glibc kept 588 MB free of 1,008.7 MB; the content object
+> (`/memfd:slates-con-*`) 753 MiB resident against 183 MB the content store used. Not pre-faulted whole (the arena grows
+> from the pool; A-214's reserve gone): freed blocks are zeroed in place and given back only by an idle purge, and only
+> runs of the discard size or more (A-105), never frees still deferred for a committed image (A-64). The content
+> gauges tell those apart (main 01a20182, 2026-11-23): `mem.gauge.content.{arena_mapped_bytes, arena_free_bytes,
+> arena_resident_free_bytes, arena_deferred_bytes, object_resident_bytes}` and the counter
+> `content.purge_kept_short_bytes` (red-first by use: `slates-mem`
+> `arena::tests::a_free_run_under_the_discard_size_stays_resident_and_is_counted_kept_short`). OWED: arena-13's reading
+> after push-all and again after an idle pass, and the cut it names.
 > **A-870 (w-shared; main 01a20182's rulings of 2026-11-22 ~22:10 and ~22:30): a shard image's content-store families
 > published and restored over turns.** Piece 1 BUILT: the families paged (`crate::image_pages`): 3,000 windows let go
 > and 3,000 landed records rode 6,000 pieces, now 17 (534,085 bytes at a 43,912-byte page), restored whole. Piece 2
