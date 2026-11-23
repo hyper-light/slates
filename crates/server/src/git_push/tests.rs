@@ -2030,6 +2030,88 @@ async fn short_homing_drive(repository: RepositoryId, request: &[u8]) -> Result<
   }
 }
 
+/// Shape: the files of [`t_goal93_a_greens_owed_push_is_built_from_its_packs_windows_let_go`]'s commit.
+const LET_GO_FILES: usize = 200;
+
+/// Goal 93 item 2b, reader (a) (main 01a20182 by w-git, 2026-11-22: once a push's windows were let go, its green's owed
+/// push was refused building `Object { path: "f0", .., why: Malformed }`, its parked requests `ContentUnavailable`: the
+/// build read its trees and blobs through `views`, whose stored read answers none on a let-go window). Do: push the
+/// unborn default branch `main` at a commit of a flat tree of [`LET_GO_FILES`] files, a step at a time; let every window
+/// of its staged pack go as landed; then reach its green through the door (`green_ready`) and wait for it to be made.
+/// Expect: the windows let go; the green made once, holding every file with its bytes, each window it read brought back
+/// from the node's store. Failing first: the build refused `Malformed`, the green never made.
+#[test]
+fn t_goal93_a_greens_owed_push_is_built_from_its_packs_windows_let_go() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (first, objects) = flat_commit(LET_GO_FILES, "away", None);
+  let (repository, green) = crate::daemon::observe_first(&daemon, |state| {
+    let repository = git_repository(state, "owed-away");
+    let green = state
+      .db
+      .partition()
+      .repositories()
+      .branch(repository, "main")
+      .unwrap();
+    (repository, green)
+  });
+  let pack = pack_of_objects(&objects);
+  let create = request(
+    &[("", &first.to_string(), b"refs/heads/main")],
+    CAPABILITIES,
+    &pack,
+  );
+  let (created, _) = pushed_in_steps(&daemon, repository, &create).unwrap();
+  let let_go = crate::daemon::observe_first(&daemon, move |state| {
+    crate::vcs_store::within_budget(state, 0, |stores| {
+      let Some(content) = stores.content_mut() else {
+        return 0;
+      };
+      let window = content.window();
+      pack
+        .chunks(window)
+        .map(slates_vcs::ContentId::of)
+        .filter(|id| {
+          if content.mark_landed(id) {
+            let _ = content.let_go_landed(id, None);
+          }
+          content.is_away(id)
+        })
+        .count()
+    })
+  });
+  crate::daemon::observe_first(&daemon, move |state| {
+    crate::green_ready::green_ready(state, green);
+  });
+  let began = std::time::Instant::now();
+  while crate::daemon::observe_first(&daemon, move |state| {
+    state.greens.is_owing(&green) && crate::green_ready::is_building(state, green)
+  }) && began.elapsed() < std::time::Duration::from_secs(120)
+  {}
+  let (materialized, owing) = crate::daemon::observe_first(&daemon, move |state| {
+    (
+      state
+        .refusals
+        .get(crate::green_ready::MATERIALIZED)
+        .copied()
+        .unwrap_or(0),
+      state.greens.is_owing(&green),
+    )
+  });
+  let read = crate::daemon::observe_first(&daemon, move |state| files(state, repository, "main"));
+  daemon.stop();
+  assert_eq!(reasons(&created), [b"ok"]);
+  assert!(let_go > 0, "the pack's windows let go");
+  assert_eq!(
+    (materialized, owing),
+    (1, false),
+    "made once from windows let go"
+  );
+  let expected: Vec<(String, Vec<u8>)> = (0..LET_GO_FILES)
+    .map(|at| (format!("f{at:05}"), format!("away {at}\n").into_bytes()))
+    .collect();
+  assert_eq!(read, expected, "every file with its bytes");
+}
+
 /// A pack of `objects`, each whole, as stock git writes one.
 fn pack_of_objects(objects: &[(slates_git::object_name::Kind, Vec<u8>)]) -> Vec<u8> {
   use slates_git::entry::{self, Header, Representation};

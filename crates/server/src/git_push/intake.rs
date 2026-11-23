@@ -45,6 +45,10 @@ impl Repository for Intake<'_> {
   fn holds(&self, id: &ObjectId) -> bool {
     self.indexed.holds(id)
   }
+
+  fn away(&self) -> Option<u64> {
+    Repository::away(&self.indexed)
+  }
 }
 
 impl Contents for Intake<'_> {

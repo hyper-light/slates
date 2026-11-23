@@ -100,7 +100,9 @@
 > since a pack's answer cannot be taken again mid-pack byte for byte. (2b)(a) LANDED (w-shared): a landed push's staged
 > pack let go once no fetch is answered and no encoding runs (else owed to the idle give-back), whatever its windows'
 > holders (`ContentStore::let_go_landed`), every window a home holds here kept (`vcs_store::landed_pin`; a one-shard
-> daemon lets nothing go until (2b)(b), homes' own read-through, next).
+> daemon lets nothing go until (2b)(b), homes' own read-through, next). (2b)(b) BUILT (w-shared, A-724 piece 8c): the
+> pack's home records where each of its windows lies on the node's store (`homes::LandedAt`), lets it go and brings it
+> back on a read; the records ride the shard image, so a window with one is not pinned.
 > **HELD (main 01a20182, 2026-11-22 15:40):** no landed pack is let go or owed from a push's commit (`vcs_store::commit`),
 > since r52 (the big Studio, main 6f6e87d82) found readers that do not bring a let-go window back: once git/git's push
 > ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's tag peel through
@@ -666,7 +668,13 @@
 >   but the 71 a home pins; the clone carries them). OPEN, main's: the pin keeps every window whose home by identity
 >   is this shard (`homes::read_here` serves any identity homed here and cannot bring one back), so about one shard's
 >   share of the texts stays, and on a one-shard node all of them; a home that brings an away window back, or a pin of
->   only what homes keep, would let them go.
+>   only what homes keep, would let them go. 2b(b)'s hg half, part 1 BUILT (w-hg, w-shared's seam 1, main's ruling of
+>   18:43): a landed file revision is brought back whole by its (path, node) (`hg_push::bring_back`: its row read, its
+>   text asked of the changeset store off the step through the work builder's own ask, `slates_hg::push::held::TextAsk`,
+>   then put back within its lent room), counted `vcs.hg.landed_texts_brought_back`. Held by
+>   `a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and_node` (49 of 120 let go, each back
+>   whole, counted once). Left: the let-go's `homes::note_landed` record and homes' `Landed::Hg` arm calling it, once
+>   w-shared's types land; then the pin goes.
 > - The whole history's clones spun (main 01a20182's order of 2026-11-22 10:40; CI 45037561866: 4 spins, kills and
 >   restarts a leg, at `vcs_http.rs:850` polls 1-16 and `vcs_ssh::hg::streamed_turn` polls ~11,000). Measured over the
 >   served view of a pushed 57,054-changeset line (debug, MacBook arm64, each call the unit one step takes): a clone of

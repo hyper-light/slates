@@ -1945,6 +1945,88 @@ fn brought_back(
   Some(())
 }
 
+/// Counter: a file revision's text brought back whole from the node's changeset store by its (path, node), its windows
+/// let go once its segment landed (goal 93 item 2b(b): a home reading a landed revision). Format: a counter name in the
+/// status report.
+#[cfg_attr(
+  not(test),
+  expect(
+    dead_code,
+    reason = "homes' `Landed::Hg` arm calls it (w-shared's seam 1); its types land next, and this goes with them"
+  )
+)]
+pub(crate) const LANDED_TEXTS_BROUGHT_BACK: &str = "vcs.hg.landed_texts_brought_back";
+
+/// Brings back the windows of the file revision `node` of `path` that repository `repository` holds (goal 93 item 2b(b);
+/// w-shared's seam 1, main's ruling of 2026-11-22 18:43): where any was let go once its segment landed
+/// ([`hg_run::let_go_windows`]), its whole text is read from the node's changeset store off the shard's step
+/// ([`hg_view::answer_store_wants`]), then put back by the identities the repository's index names, within the room its
+/// bytes take. True where its block and bytes are held whole after (brought back, or never let go); false where the
+/// repository holds no such revision here, the store gave no text, or the content store refused it.
+#[cfg_attr(
+  not(test),
+  expect(
+    dead_code,
+    reason = "homes' `Landed::Hg` arm calls it (w-shared's seam 1); its types land next, and this goes with them"
+  )
+)]
+pub(crate) async fn bring_back(repository: RepositoryId, (path, node): (Vec<u8>, Node)) -> bool {
+  let Some((len, whole)) =
+    crate::state::with_state(|state| held_whole(state, repository, (&path, &node))).flatten()
+  else {
+    return false;
+  };
+  if whole {
+    return true;
+  }
+  let mut ask = slates_hg::push::held::TextAsk::new(path, node, len);
+  if !hg_view::answer_store_wants(&mut ask, repository).await {
+    return false;
+  }
+  let Some((path, node, text)) = ask.taken() else {
+    return false;
+  };
+  crate::state::with_state(|state| {
+    let lend = u64::try_from(text.len()).unwrap_or(u64::MAX);
+    let back = vcs_store::lent_state(state, |state| {
+      vcs_store::within_budget(state, lend, |stores| {
+        let (content, store) = stores.mercurial(repository)?;
+        slates_hg::push::held::bring_back_file((&store.index, content), (&path, &node), &text)
+          .ok()?;
+        slates_hg::push::held::file_text_held((&store.index, content), (&path, &node))
+      })
+    });
+    let whole = back.is_some_and(|(_, whole)| whole);
+    if whole {
+      state.count(LANDED_TEXTS_BROUGHT_BACK, 1);
+    }
+    whole
+  })
+  .unwrap_or(false)
+}
+
+/// The length of the text of `path`'s revision `node` repository `id` holds, and whether its windows are held whole
+/// ([`slates_hg::push::held::file_text_held`]), read with the shard's chunks lent; none where it holds no such revision.
+#[cfg_attr(
+  not(test),
+  expect(
+    dead_code,
+    reason = "homes' `Landed::Hg` arm calls it (w-shared's seam 1); its types land next, and this goes with them"
+  )
+)]
+fn held_whole(
+  state: &mut ShardState,
+  id: RepositoryId,
+  (path, node): (&[u8], &Node),
+) -> Option<(u64, bool)> {
+  vcs_store::lent_state(state, |state| {
+    vcs_store::within_budget(state, 0, |stores| {
+      let (content, store) = stores.mercurial(id)?;
+      slates_hg::push::held::file_text_held((&store.index, content), (path, node))
+    })
+  })
+}
+
 /// What repository `id` holds as a push's works read it: through the push's fork where it has one, else the store's
 /// own index; none where the store is not held here.
 fn held_over<'s>(

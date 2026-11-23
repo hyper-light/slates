@@ -18,7 +18,9 @@
 //! ([`Entry::canonical_mode`](crate::objects::tree::Entry::canonical_mode)), so a legacy `100664` is a plain file and
 //! a mode of no known type a submodule's link. A tree is parsed and its entries listed within the store's room, as the
 //! store parses one; a blob of one window is lent as kept, and a longer one assembled for the caller, which charged its
-//! length to the work's room before asking (A-618).
+//! length to the work's room before asking (A-618). A read that meets a window let go answers `NotYet`, the window
+//! noted on the repository (`Repository::waiting`), so its owner brings it back from the node's store and the build
+//! takes the unit again (goal 93 item 2b).
 //!
 //! **Counters** ([`ViewCounters`]): the objects lent as kept, assembled, and lent again. The tests read them, so a dead
 //! path that lends without a copy, or a dead reuse, cannot pass for a working one.
@@ -70,6 +72,8 @@ pub struct IndexedObjects<'a> {
   kept: Kept,
   /// What the view has lent.
   counters: Cell<ViewCounters>,
+  /// Where in its pack the last object asked met a window let go, its repository noting it (A-864's push readers).
+  away: Cell<Option<u64>>,
 }
 
 impl<'a> IndexedObjects<'a> {
@@ -83,6 +87,7 @@ impl<'a> IndexedObjects<'a> {
       refused: Cell::new(None),
       kept: Kept::default(),
       counters: Cell::new(ViewCounters::default()),
+      away: Cell::new(None),
     }
   }
 
@@ -121,6 +126,7 @@ impl receive::Repository for IndexedObjects<'_> {
       count(&self.counters, |counters| &mut counters.lent_again);
       return Some(kept);
     }
+    self.away.set(None);
     let (row, content) = self.repository.indexed(self.store, id)?;
     // A window the store lends is lent again with no copy; one it copies out, or one read where it lies in its pack,
     // is kept below, as an assembled object is.
@@ -134,16 +140,24 @@ impl receive::Repository for IndexedObjects<'_> {
     if !self.charge(row.len.saturating_add(kept_overhead())) {
       return None;
     }
-    let bytes = self
-      .repository
-      .read_stored(self.store, &stored, row.len)?
-      .into_owned();
+    let Some(read) = self.repository.read_stored(self.store, &stored, row.len) else {
+      // A read of a let-go window is noted on the repository, for the push's driver to bring it back.
+      self
+        .away
+        .set(self.repository.peek_waiting().map(|waited| waited.offset));
+      return None;
+    };
+    let bytes = read.into_owned();
     count(&self.counters, |counters| &mut counters.assembled);
     self.kept.keep(*id, row.kind, bytes)
   }
 
   fn holds(&self, id: &ObjectId) -> bool {
     self.repository.object(self.store, id).is_some()
+  }
+
+  fn away(&self) -> Option<u64> {
+    self.away.get()
   }
 }
 
@@ -202,6 +216,19 @@ impl<'a> PushedObjects<'a> {
     Ok((kind, at, held.len))
   }
 
+  /// Why a stored read of the repository's answered none: `NotYet` where it met a window let go (goal 93 item 2b,
+  /// `Repository::waiting`, noted again so the build's owner finds it and brings it back before the unit is taken
+  /// again); else `Malformed`, bytes that are not the object.
+  fn unread(&self) -> Unavailable {
+    match self.repository.waiting() {
+      Some(waited) => {
+        self.repository.wait_for(waited);
+        Unavailable::NotYet
+      }
+      None => Unavailable::Malformed,
+    }
+  }
+
   /// An object's bytes: in the store as kept when they are one window, otherwise assembled from their windows; or read
   /// where they lie in the push's pack (`Push::bytes`).
   fn bytes(&self, at: &At, len: u64) -> Result<Cow<'a, [u8]>, Unavailable> {
@@ -213,7 +240,7 @@ impl<'a> PushedObjects<'a> {
         return self
           .repository
           .read_stored(self.store, stored, len)
-          .ok_or(Unavailable::Malformed);
+          .ok_or_else(|| self.unread());
       }
       At::Pushed(id) => {
         let outside = IndexBases {

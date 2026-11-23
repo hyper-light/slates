@@ -84,6 +84,13 @@ impl Locate for NoIndex {
 pub trait Outside {
   /// The object named `id`, its type and content, if it is held outside the pack.
   fn object(&self, id: &ObjectId) -> Option<(Kind, &[u8])>;
+
+  /// Where in its pack the last object asked was not read because it lies in a window let go, to be brought back before
+  /// it is asked again (A-864's push readers; main 01a20182's ruling of 2026-11-22): the resolution stops there and is
+  /// taken again on its next turn. None by default, for an outside that lets nothing go.
+  fn away(&self) -> Option<u64> {
+    None
+  }
 }
 
 /// Nothing outside the pack: every base must be one of its own objects.
@@ -225,6 +232,10 @@ struct Beside<'k, O: ?Sized> {
 impl<O: Outside + ?Sized> Outside for Beside<'_, O> {
   fn object(&self, id: &ObjectId) -> Option<(Kind, &[u8])> {
     self.outside.object(id)
+  }
+
+  fn away(&self) -> Option<u64> {
+    self.outside.away()
   }
 }
 
@@ -588,6 +599,11 @@ struct Resolving {
   next: usize,
   /// The next row of `waiting` looked at for a base outside the pack; its length once all are.
   outside: usize,
+  /// The row of `waiting` whose base, outside the pack, lay in a let-go window when the turn last stopped there, and
+  /// where in its pack, until a unit resolves after it (A-864's push readers): met so again at the same place with
+  /// nothing resolved between, it is refused as one not held, so a stop always makes progress or ends (an object across
+  /// several let-go windows stops at each in turn).
+  stopped: Option<(usize, u64)>,
 }
 
 impl<'index, L: Locate + ?Sized> Reader<'index, L> {
@@ -1135,6 +1151,7 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
           pending,
           next: 0,
           outside: 0,
+          stopped: None,
         }
       }
     };
@@ -1147,6 +1164,7 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
       units = units.saturating_add(1);
       if let Some((parent, child)) = resolving.pending.pop() {
         if self.resolve_child(parent, child, (admission, &mut *keep))? {
+          resolving.stopped = None;
           self.list_children(child, &resolving.waiting, &mut resolving.pending)?;
         }
         continue;
@@ -1158,9 +1176,19 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
         continue;
       }
       if let Some((key, child)) = resolving.waiting.get(resolving.outside).copied() {
+        let row = resolving.outside;
         resolving.outside = resolving.outside.saturating_add(1);
         if self.resolve_outside(key, child, (admission, &mut *keep))? {
+          resolving.stopped = None;
           self.list_children(child, &resolving.waiting, &mut resolving.pending)?;
+        } else if let Some(at) = keep.away()
+          && resolving.stopped != Some((row, at))
+        {
+          // Its base lies in a let-go window: the turn stops here, the base to be brought back, the row taken again.
+          resolving.outside = row;
+          resolving.stopped = Some((row, at));
+          self.resolving = Some(resolving);
+          return Ok(false);
         }
         continue;
       }

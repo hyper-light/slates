@@ -2453,13 +2453,39 @@ fn let_go_landed_pack(state: &mut ShardState, pack: &slates_vcs::ContentId) {
   let_go_landed_pack_among(state, pack, &shards);
 }
 
-/// [`let_go_landed_pack`] with the node's shards `shards`, which rank each window's home ([`landed_pin`]).
+/// [`let_go_landed_pack`] with the node's shards `shards`, which rank each window's home ([`landed_pin`]). The pack's
+/// home on the node told first (goal 93 item 2b(b), [`homes::landed_pack_here`]): where it holds the pack for the region,
+/// it records where each window lies in the pack and lets its copy go, brought back by the record on a read; on this
+/// shard before the let-go, so those windows need no pin, on another by a task of its own, whose answer nothing waits on.
 pub(crate) fn let_go_landed_pack_among(
   state: &mut ShardState,
   pack: &slates_vcs::ContentId,
   shards: &[u16],
 ) {
   let shard = state.shard;
+  match homes::home_of(shards, pack) {
+    Some(home) if home == shard => {
+      homes::landed_pack_here(state, *pack);
+    }
+    Some(home) => {
+      let pack = *pack;
+      let budget_ns = crate::fleet::live_budget().max_deadline_ns();
+      let told = slates_rt::futures::spawn(async move {
+        let _ = crate::xshard::call_in_shard_time(
+          shard,
+          home,
+          move |state| homes::landed_pack_here(state, pack),
+          budget_ns,
+        )
+        .await;
+      })
+      .and_then(slates_rt::futures::detach);
+      if told.is_err() {
+        state.count(LANDED_HOME_UNTOLD, 1);
+      }
+    }
+    None => {}
+  }
   let (freed, pinned) = within_budget(state, 0, |stores| {
     stores.content_mut().map_or((0, 0), |content| {
       content.let_go_object_landed(pack, &|window| landed_pin(shard, shards, window))
@@ -2482,6 +2508,11 @@ pub(crate) fn landed_pin(
   shards: &[u16],
   window: &slates_vcs::ContentId,
 ) -> Option<&'static str> {
+  // A window whose home recorded what brings it back (its place in a landed pack, or its Mercurial file revision) is
+  // brought back by that record (goal 93 item 2b(b)).
+  if homes::landed(window).is_some() {
+    return None;
+  }
   let homed_here = homes::home_of(shards, window) == Some(shard);
   (homed_here || homes::region_holds_here(window) > 0).then_some("homes")
 }
@@ -2489,6 +2520,9 @@ pub(crate) fn landed_pin(
 /// Format: the status counter of the bytes of landed pushes' packs let go from the shard's content store (goal 93 item
 /// 2b), each brought back by a read that meets it.
 pub(crate) const LANDED_LET_GO_BYTES: &str = "vcs_store.landed.let_go_bytes";
+/// Format: the status counter of landed packs whose home on another shard no task could be spawned to tell (goal 93
+/// item 2b(b)): its copy stays held.
+pub(crate) const LANDED_HOME_UNTOLD: &str = "vcs_store.landed.home_untold";
 /// Format: the status counter of landed packs' windows kept because a home holds them here ([`landed_pin`]).
 pub(crate) const LANDED_PINNED: &str = "vcs_store.landed.pinned";
 
