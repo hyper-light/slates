@@ -1294,6 +1294,18 @@
 > socket full, told the command it carries (`site::Command::paced`), and a git fetch's answer learns from them as the
 > HTTP edge's does (`a859_an_ssh_commands_writes_to_a_client_that_reads_late_are_heard_with_their_waits`: none heard
 > before). Owed: a price per client, not per shard; main's git/git whole round and `fsck --strict`.
+> Push hot path BUILT (2026-11-23, w-git; main 01a20182's order from git/git's push profile): a create's search for the
+> green holding its commit (`git_push::ShardGreens::holding`) lent every member green (`Greens::is_owing`, a take and
+> restore of the lineage) and read each one's versions through its head rows, once a decision: O(decisions x greens).
+> Now the git store keeps, for each commit a version's head names, each green with such a version and its newest one
+> (`Repository::holders`, charged with the chains), and the repository index finds a member by its key and the rank it
+> joined at (`Repositories::member_keyed`), so the search asks only the greens holding the commit, in the same order
+> (`t_goal93_a_pushs_search_…_is_flat_in_the_repositorys_greens`: 60 greens examined with 4 held and 156 with 16
+> before, the same in both after, `git_push.holding.examined`). `keyed`'s walk of the lineage went with it. Owed: a lend
+> that only reads a green's own fields (`is_owing`, `branch_version`) borrowing it rather than taking it out of its
+> lineage, and the empty engine each lend makes and drops (`Lent::new`), with w-svn's lend work; the commit's clone of
+> the whole head map and its footprint's walk of every chain (`Repository::plan`, `footprint`), O(greens) a push;
+> main's git/git push before and after on the Studio.
 > A-864's readers BUILT (2026-11-22, w-git; main's r52): every git read before a fetch's pack (the advertisement's
 > and ls-refs' peel, the negotiation, the cuts) holds a refusal that met a let-go window and is made again once it is
 > brought back; a fetch lets the windows it brought back go behind its cursor (piece 3); bring-backs bounded. The landed
