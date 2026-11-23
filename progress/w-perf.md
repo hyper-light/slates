@@ -400,3 +400,10 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     under Miri; TSan skips the heap test; wire_order publishes ResolveConflict (101) and DestroyRepository (102).
   - Routed: client lone_daemon (a timing bound under TSan) and merge shuttle_green (Outcome::ContentUnread, A-760 p1).
   - Queue empty.
+- 2026-11-23 ~01:30 PST: LANDED ea3240fd8: client lone_daemon's outstanding call is bounded by the driver's own look after
+  the exit (A-523's doubling), not a reply deadline.
+  - The bound predated A-523 by a day.
+  - Red without TSan here too (27.19 s vs 24.16 s); now 4/4.
+  - Design note to main: the async driver could watch Linux's departure socket.
+  - The nightly-gates commit is 9ff6e401a (I first sent main b57a2dbaf by mistake).
+  - Queue empty.
