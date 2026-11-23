@@ -3928,11 +3928,15 @@ fn a_burst_leaves_nothing_resident_behind_it_but_its_data() {
   );
 }
 
-/// The RAM the content pool holds for the daemon's volumes, wherever it lies: the pages of the anchor's content object
-/// in RAM (read through the anchor's own view, `mincore`, which on macOS answers for the object, measured on Studio-4
-/// 2026-11-20: a fresh view reports another mapping's pages, and keeps reporting them after that mapping is gone), plus
-/// the process's resident memory, which counts the pages the daemon maps (its arena's extents) while it maps them.
-fn pool_resident(anchor: &Anchor) -> u64 {
+/// The RAM the content pool holds for the daemon's volumes, by its own pages (main's ruling of 2026-11-22): the pages of
+/// the anchor's content object in RAM (read through the anchor's own view, `mincore`, which on macOS answers for the
+/// object, measured on Studio-4 2026-11-20: a fresh view reports another mapping's pages, and keeps reporting them after
+/// that mapping is gone), plus the extents the daemon's arenas hold (its memory report's `arenas` row, their bytes): a
+/// released extent is unmapped and unlinked, so a held extent's length bounds its pages and a released one holds none.
+/// Until 2026-11-22 the second term was the process's resident memory, which in this test's one process counts the test's
+/// own payload and the client's and the write path's copies of it: 1.0 GiB of freed large blocks macOS's allocator keeps
+/// (`MALLOC_LARGE (empty)` in vmmap), which no give-back of the pool could ever return.
+fn pool_resident(anchor: &Anchor, client: &mut Client) -> u64 {
   let content = anchor
     .segment
     .content()
@@ -3941,13 +3945,20 @@ fn pool_resident(anchor: &Anchor) -> u64 {
     .residency(0, content.len())
     .expect("the OS reports the object's residency")
     .resident;
-  let rss = slates_machine::facts::Facts::resident_now().expect("the OS reports resident memory");
+  let held = client
+    .daemon_status()
+    .expect("the daemon answers its status")
+    .memory
+    .iter()
+    .filter(|row| row.kind == "arenas")
+    .map(|row| row.reserved_bytes)
+    .sum::<u64>();
   eprintln!(
-    "pool_resident: the content object {} MiB in RAM, the process {} MiB",
+    "pool_resident: the content object {} MiB in RAM, the arenas' extents {} MiB held",
     in_object >> 20,
-    rss >> 20
+    held >> 20
   );
-  in_object + rss
+  in_object + held
 }
 
 /// MEMORY SIZING, content as extents made on demand (main's ruling of 2026-11-20 15:20; w-sizing). Do: on a one-shard
@@ -3981,7 +3992,7 @@ fn a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone() {
   let mut spec = scratch("extents-back");
   spec.size = SizeClass::Bounded { limit: file * 2 };
   daemon.publish_every_shard().unwrap();
-  let before = pool_resident(&anchor);
+  let before = pool_resident(&anchor, &mut client);
   let volume = client.create(&spec).unwrap();
   let attachment = client
     .attach(volume, None, slates_ipc::protocol::Intent::Write)
@@ -3996,16 +4007,16 @@ fn a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone() {
     )
     .unwrap();
   daemon.publish_every_shard().unwrap();
-  let with_burst = pool_resident(&anchor);
+  let with_burst = pool_resident(&anchor, &mut client);
   client.detach_of(volume, attachment).unwrap();
   client.destroy(volume).unwrap();
   daemon.publish_every_shard().unwrap();
   let started = Instant::now();
-  let mut after = pool_resident(&anchor);
+  let mut after = pool_resident(&anchor, &mut client);
   while after.saturating_sub(before) * 4 >= file && started.elapsed() < IDLE_WAIT {
     std::thread::yield_now();
     let _ = daemon.publish_every_shard();
-    after = pool_resident(&anchor);
+    after = pool_resident(&anchor, &mut client);
   }
   daemon.stop();
   drop(anchor);

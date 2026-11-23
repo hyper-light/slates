@@ -328,7 +328,8 @@ impl Store {
   }
 
   /// Returns the arena's wholly free extents to its pool, keeping the capacity every commitment, the operation
-  /// headroom and the pressure hold need (A-98): the bytes returned. Run after a committed publication, when no
+  /// headroom and the pressure hold need (A-98), a free extent kept only for that traded for the smallest that keeps it
+  /// (`ChunkArena::shrink_trading`): the bytes returned. Run after a committed publication, when no
   /// deferred free holds an extent the committed image might still name. The hold is kept because it is free room the
   /// daemon's sampler took from this shard (§4.2): returned to the pool, it would be claimable by any shard until the
   /// next refresh withheld it again.
@@ -337,7 +338,7 @@ impl Store {
     let returned = self
       .content
       .arena_mut()
-      .shrink(usize::try_from(keep).unwrap_or(usize::MAX));
+      .shrink_trading(usize::try_from(keep).unwrap_or(usize::MAX));
     let returned = u64::try_from(returned).unwrap_or(u64::MAX);
     // The arena kept `keep`, the floor `retract` checks, so the budget follows it down; were it ever refused, the
     // budget would promise bytes the arena no longer holds, so the capacity is resynchronised from the arena.

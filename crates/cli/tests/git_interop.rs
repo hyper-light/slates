@@ -790,8 +790,8 @@ fn stock_git_pushes_and_clones_tags_of_a_blob_a_tree_and_a_tag() {
 
 /// Format: the kinds of mapped memory `slates status --json` reports under `memory` (§4.14, A-232's gotcha): the anchor
 /// segment, the anchor content object (the shards' arenas among its bytes), the shards' arenas, the clients' ring
-/// regions, and the heap.
-const MEMORY_KINDS: [&str; 5] = ["segment", "content", "arenas", "regions", "heap"];
+/// regions, the heap (the system allocator), and the large blocks mapped on their own.
+const MEMORY_KINDS: [&str; 6] = ["segment", "content", "arenas", "regions", "heap", "large"];
 
 /// §4.14 and A-232's gotcha (the bug record of 2026-11-20, the anchor's kills of w-hg's daemon): the daemon reports its
 /// own memory by kind, read in process with nothing suspended, so no inspector need suspend it (`vmmap`, `heap`), which
@@ -2152,7 +2152,7 @@ fn edge_advertisement(port: u16, token: &str) -> Option<Vec<u8>> {
 
 /// Format: the daemon's counters of the paths a clone's objects took (main 01a20182's order of 2026-11-22 04:53): the
 /// fetch stream's (`vcs_store::upload::STREAM_COUNTED`) and the encoding made ahead's (`vcs_store::git_encode`'s).
-const CLONE_PATHS: [&str; 24] = [
+const CLONE_PATHS: [&str; 28] = [
   "vcs_store.git_upload.written_bytes",
   "vcs_store.git_upload.parts_copied",
   "vcs_store.git_upload.parts_by_entry",
@@ -2171,6 +2171,10 @@ const CLONE_PATHS: [&str; 24] = [
   "vcs_store.git_upload.reuse_crc_missed",
   "vcs_store.git_upload.reuse_rebuilt",
   "vcs_store.git_upload.backward_reads",
+  "vcs_store.git_upload.stops",
+  "vcs_store.git_resident.stopped_brought",
+  "vcs_store.git_resident.ahead_brought",
+  "vcs_store.git_resident.refused",
   "vcs_store.git_encode.reused_whole",
   "vcs_store.git_encode.reused_deltas",
   "vcs_store.git_encode.reuse_refused",

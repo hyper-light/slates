@@ -2355,10 +2355,6 @@ fn based_moves(
 /// hold its moves alone. Refused, nothing of the store changed and the push still holds its objects.
 pub(crate) fn commit(state: &mut ShardState, sealed: &mut SealedPush) -> Result<(), GitRefused> {
   let repository = sealed.repository;
-  // The pack the staging put in the content store, where its changeset landed on the node's store (A-767 C5).
-  let landed_pack = (sealed.landed > 0)
-    .then(|| sealed.push.stored_pack())
-    .flatten();
   let unkept = within_budget(state, 0, |stores| {
     let (content, store) = stores.git(repository).ok_or(GitRefused::NoStore)?;
     commit_moves(
@@ -2370,22 +2366,13 @@ pub(crate) fn commit(state: &mut ShardState, sealed: &mut SealedPush) -> Result<
   })?;
   sealed.objects = RecordWriter::default();
   state.count(VALUE_UNKEPT, unkept);
-  if let Some((pack, _)) = landed_pack {
-    // Never under a fetch's answer or an encoding (w-git's driver makes the packs resident before either, and no read
-    // of theirs meets a window let go mid-answer): owed until the repository goes idle.
-    if crate::vcs_share::fetches_live(repository) == 0
-      && !git_encode::ahead_under_way(state, repository)
-    {
-      let_go_landed_pack(state, &pack);
-    } else {
-      state
-        .vcs_stores
-        .landed_owed
-        .entry(repository)
-        .or_default()
-        .push(pack);
-    }
-  }
+  // A landed push's pack stays resident: its let-go (goal 93 item 2b) is safe only once every git read of the
+  // repository brings a let-go window back, and some do not yet. Run r52 (2026-11-22, the big Studio, main 6f6e87d82):
+  // once git/git's push ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's
+  // tag peel among the reads), so stock git read "possible repository corruption" on ls-remote and every clone. So no
+  // landed pack is let go or owed here until w-git's read-through covers every reader; the let-go itself
+  // (`let_go_landed_pack`, `let_go_owed`) is unchanged and tested directly (read_through's tests), and nothing reaches it
+  // from a push. GAPS: goal 93 item 2b.
   Ok(())
 }
 
@@ -2410,9 +2397,36 @@ pub(crate) fn let_go_read(
   freed
 }
 
+/// Whether repository `id`'s landed packs may be let go now (goal 93 item 2b): no fetch of it answered, no encoding of
+/// it under way, and no intake of it under way but `own` (a push's own, as it ends): a push still deciding its refs
+/// reads the objects its pack staged (w-git and main 01a20182, 2026-11-22: a non-atomic many-ref push's later refs).
+fn landed_let_go_may(state: &ShardState, id: RepositoryId, own: u64) -> bool {
+  crate::vcs_share::fetches_live(id) == 0
+    && !git_encode::ahead_under_way(state, id)
+    && crate::vcs_share::intakes_live(id) <= own
+}
+
 /// Lets go of the landed packs repository `id` owes a let-go ([`VcsStores`]'s `landed_owed`): what its going idle runs
-/// (`git_encode::give_back_idle`), no fetch of it answered and no encoding under way.
+/// (`git_encode::give_back_idle`), no fetch of it answered and no encoding under way. Kept owed while a push of it is
+/// under way, whose later refs read their objects: its end lets them go ([`let_go_owed_as_push_ends`]).
 pub(crate) fn let_go_owed(state: &mut ShardState, id: RepositoryId) {
+  if crate::vcs_share::intakes_live(id) > 0 {
+    return;
+  }
+  let_go_owed_now(state, id);
+}
+
+/// Lets go of the landed packs repository `id` owes a let-go as a push of it ends (its `ReceivePack` dropped, its own
+/// intake still counted): where no other intake, no fetch and no encoding of it is under way; else the last of them to
+/// end does, or its going idle.
+pub(crate) fn let_go_owed_as_push_ends(state: &mut ShardState, id: RepositoryId) {
+  if state.vcs_stores.landed_owed.contains_key(&id) && landed_let_go_may(state, id, 1) {
+    let_go_owed_now(state, id);
+  }
+}
+
+/// [`let_go_owed`]'s let-go, its conditions met.
+fn let_go_owed_now(state: &mut ShardState, id: RepositoryId) {
   let owed = state.vcs_stores.landed_owed.remove(&id).unwrap_or_default();
   for pack in owed {
     let_go_landed_pack(state, &pack);

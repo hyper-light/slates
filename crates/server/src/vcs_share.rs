@@ -159,6 +159,23 @@ impl Drop for Live {
   }
 }
 
+/// How many intakes of repository `repository` are under way on this shard now ([`Live::begin`]): a git push among
+/// them, still deciding its refs, reads the objects its pack staged (goal 93 item 2b: its landed pack is let go only
+/// once it ends).
+pub(crate) fn intakes_live(repository: RepositoryId) -> u64 {
+  LIVE.with(|live| {
+    live
+      .try_borrow()
+      .ok()
+      .and_then(|live| {
+        live
+          .get(&repository)
+          .and_then(|counts| counts.get(slot(Work::Intake)).copied())
+      })
+      .unwrap_or(0)
+  })
+}
+
 /// How many fetches of repository `repository` are answered on this shard now ([`Live::fetch`]): whether a client is
 /// there for its derived values to be made ahead for (A-856, main's ruling of 2026-11-22 00:30: nothing grows
 /// while no client is connected).

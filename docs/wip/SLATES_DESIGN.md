@@ -30088,8 +30088,10 @@ The steps' own records follow.
   what a wedged daemon shows: no beat, no CPU, nothing runnable, every thread in a wait (the suspend count is readable
   only through the task port). Past the anchor's window it kills the daemon as frozen, as this rule asks: w-hg's
   `vmmap -summary` of a daemon mapping ~220 GB took 2.42 s and lost the daemon at each look. Read the daemon's memory
-  from the daemon instead: `slates status` reports it by kind (segment, content, arenas, regions, heap), read in process
-  with nothing suspended (§4.14).
+  from the daemon instead: `slates status` reports it by kind (segment, content, arenas, regions, heap, large), read in
+  process with nothing suspended (§4.14). `heap` is the system allocator (reserved: what it holds from the OS; resident:
+  what its live blocks hold); `large` is the blocks mapped on their own (reserved: their spans; resident: their pages in
+  RAM). Until 2026-11-22 one `heap` row counted the large blocks' spans as resident (main 01a20182's (b1)).
 
 ### A-277 — A fleet node may bind elsewhere than it advertises (2026-11-17, built for goal g229, chaos across real processes)
 
