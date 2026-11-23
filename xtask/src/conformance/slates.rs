@@ -318,7 +318,10 @@ impl Anchor {
 
   /// Waits until the daemon answers [`STABLE_STREAK`] verbs in a row, while the instance's processes progress in their
   /// own CPU (`process_wait::InstanceWait`, the suites' judgment, b25a5b7a6): refused once they made none for the
-  /// observation budget, spent their CPU budget, or left. Until 2026-11-20 within the harness's 60 s `START_WAIT`.
+  /// observation budget, spent their CPU budget, or left. Until 2026-11-20 within the harness's 60 s `START_WAIT`. The
+  /// anchor, this wait's own child, counts among them while it runs (`InstanceWait::look_owning`): until 2026-11-23 only
+  /// a search by command line did, and CI run 45235122249's tracer start was refused about 40 ms after its spawn, the
+  /// search having found nothing while the anchor's strace ran.
   fn wait_ready(&mut self, binary: &SlatesBinary) -> Result<(), Failure> {
     let mut progress = process_wait::InstanceWait::new();
     let mut streak = 0u32;
@@ -332,7 +335,9 @@ impl Anchor {
       } else {
         streak = 0;
       }
-      if !progress.look(&self.instance) {
+      // The anchor is this wait's own child: counted while it runs, whatever a search by command line finds.
+      let owned = matches!(self.child.try_wait(), Ok(None)).then(|| self.child.id());
+      if !progress.look_owning(&self.instance, owned) {
         return Err(self.never_up(&progress, reply.code));
       }
       pause();
@@ -413,7 +418,9 @@ impl Anchor {
   /// drain is waited for (its pipe's end, every writer gone, within [`LEAVE_WAIT`]) before the log is read, since the
   /// drain copies it a thread away; the message says whether the log it carries is whole. Until 2026-11-23 the log was
   /// read at once, and CI run 45176536354's red carried an empty one and no exit status
-  /// (`the_hermeticity_tracer_allows_startup_and_observes_writes`, 12:40Z).
+  /// (`the_hermeticity_tracer_allows_startup_and_observes_writes`, 12:40Z). The message also carries what the search for
+  /// the instance's processes answered and what ran (`process_wait::instance_listing`), since CI run 45235122249's
+  /// red said only that the search had found nothing.
   fn never_up(&mut self, progress: &process_wait::InstanceWait, probe: i32) -> Failure {
     let exited = self.child.try_wait().ok().flatten();
     let whole = exited.is_some() && self.left_within(LEAVE_WAIT);
@@ -421,9 +428,10 @@ impl Anchor {
       Some(status) => format!("exited ({status})"),
       None => format!("is still running (pid {})", self.child.id()),
     };
+    let listing = process_wait::instance_listing(&self.instance, Some(self.child.id()));
     Failure(format!(
       "the daemon did not come up before its processes stalled, spent their CPU budget or left ({:?}; last exit \
-       {probe}); the anchor {anchor}; anchor log{}:\n{}",
+       {probe}); the anchor {anchor}; the instance's processes: {listing}; anchor log{}:\n{}",
       progress.seen,
       if whole {
         ", whole"
@@ -1363,6 +1371,40 @@ mod tests {
     assert!(
       message.contains("the tracer refused to start"),
       "the tracer's last words: {message}"
+    );
+  }
+
+  /// Main 01a20182's order of 2026-11-23 (CI run 45235122249, job 137905802468: the tracer test refused its start about
+  /// 40 ms after the spawn with "(None; last exit 3); the anchor is still running (pid 7376)", the wait having found no
+  /// process of the instance while its own anchor, the strace, ran). Do: start an anchor whose prefix replaces itself at
+  /// once with a program whose command line names no instance (`exec sh -c 'sleep 1; exit 7'`), the same process
+  /// running for a second, invisible to a search by command line, then exiting 7. Expect the wait to follow its own
+  /// anchor until it exits, and the refusal to name that exit (status 7). Red before: refused at the first look, "the
+  /// anchor is still running".
+  #[cfg(unix)]
+  #[test]
+  #[allow(clippy::unwrap_used)]
+  #[allow(clippy::disallowed_methods)] // the test's own scratch in the build output
+  fn a_start_waits_on_its_own_anchor_while_no_process_search_finds_it() {
+    let instance = format!("conf-unlisted-{}", std::process::id());
+    let scratch = crate::conformance::build_output(&instance).unwrap();
+    let binary = super::SlatesBinary {
+      path: std::path::PathBuf::from("false"),
+    };
+    let prefix = [
+      "sh".to_owned(),
+      "-c".to_owned(),
+      "exec sh -c 'sleep 1; exit 7'".to_owned(),
+      "sh".to_owned(),
+    ];
+    let refused = super::Anchor::start(&binary, &instance, &scratch, Some(&prefix));
+    let _ = std::fs::remove_dir_all(&scratch);
+    let Err(super::Failure(message)) = refused else {
+      panic!("a start whose anchor never serves came up");
+    };
+    assert!(
+      message.contains("the anchor exited") && message.contains('7'),
+      "the wait followed its own anchor to its exit: {message}"
     );
   }
 
