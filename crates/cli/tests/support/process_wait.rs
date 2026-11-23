@@ -180,11 +180,28 @@ impl InstanceWait {
 
   /// [`InstanceWait::look`] over every process of every one of `instances` (a fleet's nodes).
   pub(crate) fn look_all(&mut self, instances: &[impl AsRef<str>]) -> bool {
-    let mut pids: Vec<u32> = instances
+    let pids: Vec<u32> = instances
       .iter()
       .flat_map(|instance| instance_processes(instance.as_ref()))
       .collect();
+    self.look_at(pids, instances.len())
+  }
+
+  /// [`InstanceWait::look`], with `owned` counted among `instance`'s processes whatever a search by command line finds:
+  /// a process the waiter started and knows to be running (a start's anchor, or the tracer it runs under), its CPU
+  /// judged as the others' are. A search by command line can miss it: CI run 45235122249's tracer start found none of
+  /// the instance's processes about 40 ms after its spawn while its anchor, the strace, ran, and the wait judged them
+  /// gone (`xtask`'s `a_start_waits_on_its_own_anchor_while_no_process_search_finds_it`).
+  pub(crate) fn look_owning(&mut self, instance: &str, owned: Option<u32>) -> bool {
+    let mut pids = instance_processes(instance);
+    pids.extend(owned);
+    self.look_at(pids, 1)
+  }
+
+  /// One look at `pids`, the processes of `nodes` instances.
+  fn look_at(&mut self, mut pids: Vec<u32>, nodes: usize) -> bool {
     pids.sort_unstable();
+    pids.dedup();
     if pids.is_empty() {
       self.seen = None;
       return false;
@@ -213,13 +230,49 @@ impl InstanceWait {
       self.seen = now;
       self.moved_at = Instant::now();
     }
-    self.moved_at.elapsed() < STALL && !self.spent_its_budget(instances.len())
+    self.moved_at.elapsed() < STALL && !self.spent_its_budget(nodes)
   }
 
   /// Whether the processes of `nodes` instances spent [`CPU_BUDGET`] each since the wait began.
   fn spent_its_budget(&self, nodes: usize) -> bool {
     self.spent >= CPU_BUDGET.saturating_mul(u32::try_from(nodes).unwrap_or(u32::MAX))
   }
+}
+
+/// What a search for `instance`'s processes answered and what the host runs, for a red's message: `pgrep`'s own exit
+/// and its error words (which [`instance_processes`] cannot keep), then every process `ps` lists whose command line
+/// names the instance or whose parent is `parent` (a start's anchor). So a wait that found nothing says whether the
+/// search failed, or the processes ran under another command line, or none ran.
+pub(crate) fn instance_listing(instance: &str, parent: Option<u32>) -> String {
+  let searched = Command::new("pgrep")
+    .args(["-f", "--", &format!("--instance {instance} ")])
+    .output();
+  let search = match &searched {
+    Ok(out) => format!(
+      "pgrep {}: {:?}{}",
+      out.status,
+      String::from_utf8_lossy(&out.stdout).trim(),
+      String::from_utf8_lossy(&out.stderr).trim()
+    ),
+    Err(error) => format!("pgrep could not run: {error}"),
+  };
+  let listed = Command::new("ps")
+    .args(["-axo", "pid=,ppid=,stat=,args="])
+    .output()
+    .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+    .unwrap_or_default();
+  let parent = parent.map(|pid| pid.to_string());
+  let rows: Vec<&str> = listed
+    .lines()
+    .filter(|row| {
+      let mut fields = row.split_whitespace();
+      let pid = fields.next();
+      let ppid = fields.next();
+      row.contains(instance)
+        || parent.is_some() && (ppid == parent.as_deref() || pid == parent.as_deref())
+    })
+    .collect();
+  format!("{search}; ps: [{}]", rows.join(" | "))
 }
 
 /// The pids of `instance`'s processes: its anchor and its daemon run as `slates --instance NAME anchor|daemon …`. None

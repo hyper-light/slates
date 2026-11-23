@@ -1,5 +1,14 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Closed (w-interop, 2026-11-23): a start's wait gave up on its own running anchor when no process search named
+> it.** The hermeticity tracer's start test (xtask, conformance lane, ubuntu-latest) was refused about 40 ms after its
+> spawn in CI runs 45176536354 and 45235122249: "(None; last exit 3); the anchor is still running". The wait counted the
+> instance's processes by command line alone (`pgrep -f`), found none, and took that for them having left, while its own
+> strace ran. Now the wait counts its anchor while it runs (`InstanceWait::look_owning`), and a refused start names what
+> the search answered and what ran (`process_wait::instance_listing`)
+> (`docs/bugs/2026-11-23-a-starts-wait-gave-up-on-its-own-running-anchor.md`;
+> `a_start_waits_on_its_own_anchor_while_no_process_search_finds_it`). Why `pgrep` missed the strace is not known yet;
+> the next such miss will say. Owed: the conformance lane on CI.
 > **Closed (w-interop, 2026-11-23, A-874): a landing's presentation went with its presenting client, so R10's
 > three-step grant flow could not run.** CI's hermeticity suite (Linux and macOS) and the CLI's session-grant test met
 > "not found: presentation 1 (replaced, landed, or its client went away)": `slates land` presents and exits, and since

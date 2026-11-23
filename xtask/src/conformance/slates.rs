@@ -318,7 +318,10 @@ impl Anchor {
 
   /// Waits until the daemon answers [`STABLE_STREAK`] verbs in a row, while the instance's processes progress in their
   /// own CPU (`process_wait::InstanceWait`, the suites' judgment, b25a5b7a6): refused once they made none for the
-  /// observation budget, spent their CPU budget, or left. Until 2026-11-20 within the harness's 60 s `START_WAIT`.
+  /// observation budget, spent their CPU budget, or left. Until 2026-11-20 within the harness's 60 s `START_WAIT`. The
+  /// anchor, this wait's own child, counts among them while it runs (`InstanceWait::look_owning`): until 2026-11-23 only
+  /// a search by command line did, and CI run 45235122249's tracer start was refused about 40 ms after its spawn, the
+  /// search having found nothing while the anchor's strace ran.
   fn wait_ready(&mut self, binary: &SlatesBinary) -> Result<(), Failure> {
     let mut progress = process_wait::InstanceWait::new();
     let mut streak = 0u32;
@@ -332,7 +335,9 @@ impl Anchor {
       } else {
         streak = 0;
       }
-      if !progress.look(&self.instance) {
+      // The anchor is this wait's own child: counted while it runs, whatever a search by command line finds.
+      let owned = matches!(self.child.try_wait(), Ok(None)).then(|| self.child.id());
+      if !progress.look_owning(&self.instance, owned) {
         return Err(self.never_up(&progress, reply.code));
       }
       pause();
@@ -413,7 +418,9 @@ impl Anchor {
   /// drain is waited for (its pipe's end, every writer gone, within [`LEAVE_WAIT`]) before the log is read, since the
   /// drain copies it a thread away; the message says whether the log it carries is whole. Until 2026-11-23 the log was
   /// read at once, and CI run 45176536354's red carried an empty one and no exit status
-  /// (`the_hermeticity_tracer_allows_startup_and_observes_writes`, 12:40Z).
+  /// (`the_hermeticity_tracer_allows_startup_and_observes_writes`, 12:40Z). The message also carries what the search for
+  /// the instance's processes answered and what ran (`process_wait::instance_listing`), since CI run 45235122249's
+  /// red said only that the search had found nothing.
   fn never_up(&mut self, progress: &process_wait::InstanceWait, probe: i32) -> Failure {
     let exited = self.child.try_wait().ok().flatten();
     let whole = exited.is_some() && self.left_within(LEAVE_WAIT);
@@ -421,9 +428,10 @@ impl Anchor {
       Some(status) => format!("exited ({status})"),
       None => format!("is still running (pid {})", self.child.id()),
     };
+    let listing = process_wait::instance_listing(&self.instance, Some(self.child.id()));
     Failure(format!(
       "the daemon did not come up before its processes stalled, spent their CPU budget or left ({:?}; last exit \
-       {probe}); the anchor {anchor}; anchor log{}:\n{}",
+       {probe}); the anchor {anchor}; the instance's processes: {listing}; anchor log{}:\n{}",
       progress.seen,
       if whole {
         ", whole"
