@@ -2508,8 +2508,9 @@ pub(crate) fn landed_pin(
   shards: &[u16],
   window: &slates_vcs::ContentId,
 ) -> Option<&'static str> {
-  // A window its home recorded where it lies on the node's store is brought back by the record (goal 93 item 2b(b)).
-  if homes::landed_at(window).is_some() {
+  // A window whose home recorded what brings it back (its place in a landed pack, or its Mercurial file revision) is
+  // brought back by that record (goal 93 item 2b(b)).
+  if homes::landed(window).is_some() {
     return None;
   }
   let homed_here = homes::home_of(shards, window) == Some(shard);

@@ -507,8 +507,10 @@ impl AnchorSegment {
         reason: "the mapped length is not the geometry's",
       });
     }
-    // Reopened with the geometry's full layout: a header whose geometry overlaps words is refused here.
-    let object = SparseObject::open(handoff, len, segment_words(&geometry))?;
+    // The same object with the geometry's full layout declared: a header whose geometry overlaps words is refused here.
+    // Declared rather than opened again, since every open maps the whole object and on macOS marks it whole (84a: two
+    // opens an attach, 2.4-5.3 ms each on a debug build).
+    let object = object.declare(segment_words(&geometry))?;
     Ok(AnchorSegment {
       object,
       geometry,

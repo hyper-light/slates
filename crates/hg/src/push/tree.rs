@@ -435,22 +435,7 @@ pub struct WorkBuild {
   building: push::Building,
   /// The repository's file revision the build waits for, read from the node's changeset store between turns
   /// ([`WorkBuild::ask_waited`]).
-  asked: Option<TextAsk>,
-}
-
-/// A file revision the repository holds whose text the build waits for (A-767 C1: a text an import let go): its rows
-/// asked of the node's changeset store, then its whole text, within the room its turn had.
-struct TextAsk {
-  /// The file's path.
-  path: Vec<u8>,
-  /// The revision's node.
-  node: Node,
-  /// What is asked next.
-  want: Option<crate::render::Want>,
-  /// The most bytes its text may hold.
-  most: u64,
-  /// Its text, once given.
-  text: Option<Vec<u8>>,
+  asked: Option<super::held::TextAsk>,
 }
 
 /// Begins building the work of `moved` (as [`work`] builds it whole): its base's and its head's trees laid out within
@@ -508,24 +493,14 @@ impl WorkBuild {
     let Some(path) = self.layout.paths.get(&node).cloned() else {
       return false;
     };
-    self.asked = Some(TextAsk {
-      want: Some(crate::render::Want::Rows {
-        logs: vec![(path.clone(), vec![node])],
-      }),
-      path,
-      node,
-      most,
-      text: None,
-    });
+    self.asked = Some(super::held::TextAsk::new(path, node, most));
     true
   }
 
   /// The text the store gave for the revision asked ([`WorkBuild::ask_waited`]), taken with its path and node; none when
   /// the store kept no such revision or gave no text.
   pub fn take_given(&mut self) -> Option<(Vec<u8>, Node, Vec<u8>)> {
-    let asked = self.asked.take()?;
-    let text = asked.text?;
-    Some((asked.path, asked.node, text))
+    self.asked.take()?.taken()
   }
 
   /// The pace its turns run under: its owner begins each turn on it.
@@ -557,36 +532,25 @@ impl WorkBuild {
 
 impl crate::render::StoreWants for WorkBuild {
   fn wants(&self) -> Option<&crate::render::Want> {
-    self.asked.as_ref().and_then(|asked| asked.want.as_ref())
+    self.asked.as_ref()?.wants()
   }
 
   fn give_rows(&mut self, rows: Vec<Vec<Option<crate::render::StoredRevision>>>) {
-    let Some(asked) = self.asked.as_mut() else {
-      return;
-    };
-    asked.want = rows
-      .into_iter()
-      .next()
-      .and_then(|log| log.into_iter().next())
-      .flatten()
-      .map(|row| crate::render::Want::Texts {
-        texts: vec![row.text],
-        most: asked.most,
-      });
+    if let Some(asked) = self.asked.as_mut() {
+      asked.give_rows(rows);
+    }
   }
 
-  fn give_chunks(&mut self, _chunks: Vec<Vec<u8>>) {
+  fn give_chunks(&mut self, chunks: Vec<Vec<u8>>) {
     if let Some(asked) = self.asked.as_mut() {
-      asked.want = None;
+      asked.give_chunks(chunks);
     }
   }
 
   fn give_texts(&mut self, texts: Vec<Vec<u8>>) {
-    let Some(asked) = self.asked.as_mut() else {
-      return;
-    };
-    asked.want = None;
-    asked.text = texts.into_iter().next();
+    if let Some(asked) = self.asked.as_mut() {
+      asked.give_texts(texts);
+    }
   }
 
   fn reads_bases(&self) -> bool {

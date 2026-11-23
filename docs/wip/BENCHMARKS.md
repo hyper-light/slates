@@ -17298,6 +17298,40 @@ ubuntu-24.04-arm:
 - In the fair class on these kernels, 84a's 1 ms loaded bar is below the tick: unreachable by any arm that keeps the
   daemon and the client fair.
 
+## 84a: a shard's start held in one slice, now sliced by its pieces (w-perf; 2026-11-22)
+
+**What was measured first.** The boot log's slice line, CI macos-latest (run 45074388808): a shard's longest start slice
+was 1.7-21.1 ms, all CPU, ending at unit 3 in nearly every start. On the Studio (main's check, 32 cores) the longest
+step of every shard was boot's start, 45-68 ms. Unit 3 is the start's setup between the catalog's replay and the
+rebuild, with no unit inside it. Timed by its statements on this Mac (a debug build, the client restart test's
+daemons):
+- the pool's segment attach (`shard_arena`) 6.3-6.6 ms;
+- the content object's open 4.5 ms;
+- the council 0.75 ms; the node's sealing recipient 1.1 ms (shard 0); everything else under 0.7 ms each.
+
+Inside each attach and open, `SparseObject::open` cost the map 0.2-1.2 ms and the reusable-mark set 2.4-5.3 ms. On
+macOS every open makes that set whole over the object: about 6.3 million 16 KiB pages for a 103 GB segment, 786 KB,
+marked a span at a time. An attach opened its segment twice, once for the header.
+
+**The change.**
+- Each piece of the setup is a named unit (`RecoverySlices::piece_done`), so a slice ends after any piece that spent
+  it.
+- An attach opens its segment once and declares the full layout on the same object (`SparseObject::declare`).
+- A whole set is written a word at a time.
+
+**Red and green.**
+
+| | the start's longest piece | heavy pieces in one slice | segment opens an attach |
+|---|---|---|---|
+| before | the pool's segment, 9.0 ms (one slice of 8 pieces) | 8 | 2 |
+| after | the pool's segment, 1.9 ms | 1 | 1 |
+
+Tests: `a_shards_start_holds_each_heavy_piece_in_a_slice_of_its_own` (`crates/server/tests/recovery.rs`, through
+`Daemon::shard_start_reports`), `an_attach_opens_its_segment_once` (`crates/anchor/tests/anchor.rs`), and
+`a_whole_set_made_at_once_equals_one_marked_over_its_length` (`crates/mem/src/ranges.rs`, an equivalence guard, so
+not red before). The heaviest piece left is the segment's map itself, which no slicing divides. The CI boot lines on
+the landed code are main's.
+
 ## 84a on macOS: the reply wake on its region's Mach semaphore, landed (A-867; w-perf; 2026-11-22)
 
 **What was measured first.** The reply write was the serve loop's long hold, timed by parts (runs 45072617323,

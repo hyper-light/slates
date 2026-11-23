@@ -1972,6 +1972,16 @@ impl Daemon {
       .collect()
   }
 
+  /// What each shard's start did, in shard order (`crate::StartReport`): how it was sliced and its heaviest piece. A
+  /// shard whose start has not ended answers `None`; an observation the daemon could not make is its typed refusal.
+  pub fn shard_start_reports(&self) -> Result<Vec<Option<crate::StartReport>>, ObserveError> {
+    self
+      .shards
+      .iter()
+      .map(|shard| self.observe(Some(*shard), |s| s.start_report.clone()))
+      .collect()
+  }
+
   /// Every shard's forward-progress pulse ([`ShardPulse`], §4.14), read **directly** from the runtime's
   /// registry with no shard round-trip — the discipline of [`Self::fleet_progress`] — so it is reported even
   /// when a shard is too starved, or too wedged, to answer a query. In shard order; a shard whose registry
@@ -4550,6 +4560,9 @@ async fn start_shard(
   )
   .await;
   let took_us = started.elapsed().as_micros();
+  if let Ok(sliced) = &outcome {
+    let _ = state::with_state(|s| s.start_report = Some(crate::StartReport::from(sliced)));
+  }
   match outcome {
     Ok(sliced) => slates_machine::log_line!(
       "slates-server: shard {partition} initialized in {took_us} µs, {} µs of its CPU, in {} slices of {} units; the longest slice {} µs, the most CPU in one {} µs, ending at unit {} (a slice's floor {} µs, {} µs yielding)",
@@ -4729,6 +4742,9 @@ async fn init_shard(
   let (db, recovered, _catalog_most) =
     replay_catalog(&mut segment, (partition, config.caps, now), &mut slices).await?;
   let (arena, slice_capacity) = shard_arena(config, partition, env, identity)?;
+  slices
+    .piece_done("the pool's segment and its content regions")
+    .await;
   // The anchor holds this slice's content extents (Windows, A-789): a task of the shard, so a claim finds them held.
   #[cfg(windows)]
   crate::content_extents::spawn_slice_holds(config, partition);
@@ -4772,6 +4788,7 @@ async fn init_shard(
       config.region.bulk_bytes,
     ))
     .map_err(ServerError::Memory)?;
+  slices.piece_done("the store").await;
   let shard = registry::current_shard().unwrap_or(partition);
   // The stable anchor keys TLS authentication and completion origins (§4.8). A random
   // per-start nonce derives the member id used for voting and ownership. The anchor's
@@ -4828,6 +4845,9 @@ async fn init_shard(
   // each (the root voters), driven over the transport by the control shard's config plane
   // (`crate::fleet::drive_root_group`), exactly as the regional council is.
   let (root, node_regions, region_mirrors) = build_root_group(config, host);
+  slices
+    .piece_done("the council, the fleet and the root group")
+    .await;
   // The anchor-owned content object that survives a restart (§4.8), if the anchor provides one.
   // Shards share the one object, partitioned by index: this shard owns the slice `[start, end)`.
   let mut content = match AnchorSegment::open_content(env) {
@@ -4838,6 +4858,9 @@ async fn init_shard(
     content_slice(config, partition, content.as_mut());
   // The DAX range table (A-365; Windows' sections, A-448), with what the previous daemon recorded in it.
   let dax_ranges = dax_range_table(config, partition, content_range, content.as_mut());
+  slices
+    .piece_done("the content object, its write log and DAX table")
+    .await;
   // The telemetry sink keeps the most recent spans up to one client ring's depth (§4.14): a shard
   // processes at most a ring of in-flight requests, so a ring's depth of recent spans covers the
   // current activity window; older spans are shed (and counted), telemetry being the shed-first class.
@@ -4980,6 +5003,7 @@ async fn init_shard(
     refusals: std::collections::BTreeMap::new(),
     deferred: Vec::new(),
     server_task: None,
+    start_report: None,
     dead_clients: std::collections::VecDeque::new(),
     reaper_task: None,
     capture_deadlines: crate::deadlines::CaptureDeadlines::new(),
@@ -5178,6 +5202,9 @@ async fn init_shard(
     pending_green_materializations: std::collections::BTreeMap::new(),
     pending_repositories: std::collections::BTreeMap::new(),
   };
+  slices
+    .piece_done("the secrets, failover and the shard's state")
+    .await;
   // The mounts a predecessor kept that this partition's catalog names, recorded as this daemon's own before anything
   // below reacquires a base or resumes a landing (A-227); then this shard's learning ends, and the process's crossing
   // checks, which wait for every shard's, go on.
@@ -5201,11 +5228,15 @@ async fn init_shard(
   crate::landing::arm_owed_audit_look(&mut state, started_ns);
   // The NFSv4 purges a predecessor journaled and its owners never took go out at once (A-570).
   crate::nfs::arm_purges_at_start(&mut state, started_ns);
+  slices
+    .piece_done("the kept mounts, grants and owed looks")
+    .await;
   if let Some(retained) = retained {
     retained.restore(&mut state)?;
   }
   crate::retention::retain(&mut state)?;
   crate::retention::derive_log_budgets(&mut state);
+  slices.piece_done("retention").await;
   // The node's ML-KEM recipient (A-92 piece 4a), on the control shard, whose partition holds its sealed record: opened
   // under the root, or made and recorded now. Unavailable sealing leaves it `None`, reported in status.
   if partition == 0 {
@@ -5219,7 +5250,7 @@ async fn init_shard(
       }
     };
   }
-  slices.unit_done().await;
+  slices.piece_done("the node's sealing recipient").await;
   rebuild_and_report(&mut state, shard, &mut slices).await;
   #[cfg(windows)]
   crate::anchor_hold::install(
@@ -8134,6 +8165,135 @@ mod tests {
     assert_eq!(gone, records.len(), "every recorded window let go");
     assert_eq!(restored, records, "each record taken back as it was");
     assert!(read == Some(bytes), "the pack read whole after the restart");
+  }
+
+  /// Goal 93 item 2b(b), Mercurial's half of the seam (w-hg's note of 2026-11-22, main 01a20182's ruling of 18:43: an hg
+  /// window let go is brought back by its repository, path and node, never by its identity alone, so the shard keeps
+  /// that for each, and it rides the image as a pack's record does). Do: on a store-backed daemon, put a file revision's
+  /// text of several windows in the shard's content store; note each window's revision (`homes::note_landed`,
+  /// `Landed::Hg`), as hg's let-go will, and let each go landed under its pin; publish the shard's image; stop the daemon
+  /// and start its successor over the same segment. Expect: no window pinned once noted, every one let go; after the
+  /// restart, each note taken back as it was (its repository, path and node), still no window pinned, each still let go.
+  /// Failing first: a restore that dropped the notes left the windows let go with nothing to find their revision by.
+  #[test]
+  fn t_goal93_an_hg_windows_revision_is_kept_across_a_restart_and_unpins_it() {
+    use slates_anchor::AnchorSegment;
+    let store = crate::test_store::TestStore::start("landed-hg");
+    let profile = test_profile();
+    let instance = format!("landed-hg-{}", std::process::id());
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    config.vcs_disk = Some(store.handle());
+    let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
+      .unwrap()
+      .with_content(&super::content_name_of(&instance), config.content_bytes())
+      .unwrap();
+    let rendezvous = slates_ipc::HeldRendezvous::hold(&instance).unwrap();
+    let source = || {
+      let (handoff, len) = segment.handoff().unwrap();
+      super::SegmentSource::Handoff {
+        handoff,
+        len,
+        content: segment.content_handoff().unwrap(),
+        rendezvous: rendezvous.adoption(),
+      }
+    };
+    let key = crate::vcs_store::homes::HgLanded {
+      repository: slates_db::catalog::RepositoryId { bytes: [7; 16] },
+      path: b"src/a file.txt".to_vec(),
+      node: [9; 20],
+    };
+    let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
+    first.bootstrap(true).unwrap();
+    let shard = first.shards.first().copied();
+    let noted = key.clone();
+    let (windows, before) = first
+      .observe(shard, move |state| {
+        let window = state.store.content.chunk_bytes();
+        state.vcs_stores.content_made(window).unwrap();
+        let window = state
+          .vcs_stores
+          .content()
+          .map_or(1 << 18, slates_vcs::ContentStore::window);
+        let text: Vec<u8> = (0..2 * window + 9)
+          .map(|at| u8::try_from(at % 239).unwrap())
+          .collect();
+        let len = u64::try_from(text.len()).unwrap();
+        let here = state.shard;
+        let identity = crate::vcs_store::within_budget(state, len, |stores| {
+          stores.content_mut().unwrap().put_object(&text).unwrap()
+        });
+        let windows: Vec<slates_vcs::ContentId> = state
+          .vcs_stores
+          .content()
+          .unwrap()
+          .object_layout(&identity)
+          .into_iter()
+          .map(|(window, _)| window)
+          .collect();
+        for window in &windows {
+          crate::vcs_store::homes::note_landed(
+            *window,
+            crate::vcs_store::homes::Landed::Hg(noted.clone()),
+          );
+        }
+        let let_go: Vec<Result<u64, slates_vcs::LetGoRefused>> =
+          crate::vcs_store::within_budget(state, 0, |stores| {
+            let content = stores.content_mut().unwrap();
+            windows
+              .iter()
+              .map(|window| {
+                content.mark_landed(window);
+                content.let_go_landed(window, crate::vcs_store::landed_pin(here, &[here], window))
+              })
+              .collect()
+          });
+        crate::verbs::publish_shard(state).unwrap();
+        (windows, let_go)
+      })
+      .unwrap();
+    first.stop();
+    let second = super::Daemon::start(&profile, config, source()).unwrap();
+    let shard = second.shards.first().copied();
+    let read_windows = windows.clone();
+    let after = second
+      .observe(shard, move |state| {
+        let window = state.store.content.chunk_bytes();
+        state.vcs_stores.content_made(window).unwrap();
+        let here = state.shard;
+        let restored: Vec<Option<crate::vcs_store::homes::Landed>> = read_windows
+          .iter()
+          .map(crate::vcs_store::homes::landed)
+          .collect();
+        let pinned = read_windows
+          .iter()
+          .filter(|window| crate::vcs_store::landed_pin(here, &[here], window).is_some())
+          .count();
+        let away = state.vcs_stores.content().map_or(0, |content| {
+          read_windows
+            .iter()
+            .filter(|window| content.is_away(window))
+            .count()
+        });
+        (restored, pinned, away)
+      })
+      .unwrap();
+    second.stop();
+    assert!(windows.len() > 1, "a text of several windows");
+    assert!(
+      before.iter().all(Result::is_ok),
+      "every noted window let go, none pinned: {before:?}"
+    );
+    let (restored, pinned, away) = after;
+    let expected: Vec<Option<crate::vcs_store::homes::Landed>> = windows
+      .iter()
+      .map(|_| Some(crate::vcs_store::homes::Landed::Hg(key.clone())))
+      .collect();
+    assert_eq!(
+      restored, expected,
+      "each window's revision taken back as it was"
+    );
+    assert_eq!(pinned, 0, "no noted window pinned after the restart");
+    assert_eq!(away, windows.len(), "each still let go");
   }
 
   /// A-767 C5 (git onto the changeset store; main's order of 2026-11-20 ~21:20: "red first: a stock git push lands as

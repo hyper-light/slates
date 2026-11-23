@@ -60987,6 +60987,11 @@ owed.
 - 2b(b) BUILT (A-724 piece 8c, "a home's landed windows read through"): a home records where each window of a landed
   pack it holds for the region lies on the node's store and lets it go; its reads bring it back by that record, so a
   window with a record is not pinned.
+  A Mercurial file revision's windows are read back by its (path, node) rather than a pack's offset
+  (`repository::hg_push::bring_back`, w-hg): the repository's index names its row, the node's changeset store gives its
+  whole text off the shard's step (`slates_hg::push::held::TextAsk`, the one ask a push's work uses for a text an
+  import let go), and its block and bytes are put back by the identities the row names within the room they take; true
+  where both are held whole after. Evidence: `a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and_node`.
 
 
 ### A-864 — A pushed entry is checked by the CRC32 its row keeps, and sent on with no object read (2026-11-22, w-git; main 01a20182's r17 of 07:08 and ruling of 07:31 PST, goal 93; A-859, A-722 record v4)

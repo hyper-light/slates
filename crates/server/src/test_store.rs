@@ -142,8 +142,19 @@ pub(crate) fn run_on_first<T: Send + 'static, F: std::future::Future<Output = T>
   history: impl FnOnce() -> F + Clone + Send + 'static,
   patience: std::time::Duration,
 ) -> T {
+  run_at(daemon, 0, history, patience)
+}
+
+/// Runs `history` as a task on `daemon`'s shard of `partition` to its end and gives back its output, as
+/// [`run_on_first`] runs one on its first.
+pub(crate) fn run_at<T: Send + 'static, F: std::future::Future<Output = T> + 'static>(
+  daemon: &crate::Daemon,
+  partition: usize,
+  history: impl FnOnce() -> F + Clone + Send + 'static,
+  patience: std::time::Duration,
+) -> T {
   let (sent, got) = std::sync::mpsc::sync_channel(1);
-  crate::daemon::observe_first(daemon, move |_state| {
+  crate::daemon::observe_at(daemon, partition, move |_state| {
     let history = history.clone();
     let sent = sent.clone();
     let task = slates_rt::futures::spawn(async move {

@@ -331,7 +331,7 @@ pub(crate) fn let_go_here(state: &mut ShardState, identity: &ContentId) -> Resul
   };
   super::settle(state);
   for window in freed {
-    if landed_at(&window).is_some() {
+    if landed(&window).is_some() {
       landed_changed(window, None);
     }
   }
@@ -640,47 +640,121 @@ impl LandedAt {
   }
 }
 
+/// What brings back a window this shard let go once landed (goal 93 item 2b(b)): where a landed pack carried it, read by
+/// the pack's identity ([`LandedAt`], git), or the file revision it holds, read through its repository's own reader
+/// ([`HgLanded`], Mercurial: a revision's text after its metadata block is no store row's key, so it is found by its path
+/// and node; w-hg's note of 2026-11-22, main 01a20182's ruling of 18:43).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Landed {
+  /// A window of a landed git pack.
+  Pack(LandedAt),
+  /// A window of a Mercurial file revision.
+  Hg(HgLanded),
+}
+
+/// A Mercurial file revision a window let go holds ([`Landed::Hg`]): its repository, its path and its node, by which the
+/// repository's reader asks the node's store for its text (`StoreHandle::texts_by_tool`) and puts its windows back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HgLanded {
+  /// The repository.
+  pub(crate) repository: slates_db::catalog::RepositoryId,
+  /// The file's path in it.
+  pub(crate) path: Vec<u8>,
+  /// The revision's node.
+  pub(crate) node: [u8; 20],
+}
+
+/// Format: the fixed head of an [`HgLanded`]'s bytes in the shard image: the repository's 16 bytes, the node's 20; the
+/// path follows, to the piece's end.
+const HG_LANDED_HEAD: usize = 16 + 20;
+
+impl HgLanded {
+  /// Its bytes in the shard image.
+  pub(crate) fn to_bytes(&self) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(HG_LANDED_HEAD.saturating_add(self.path.len()));
+    bytes.extend_from_slice(&self.repository.bytes);
+    bytes.extend_from_slice(&self.node);
+    bytes.extend_from_slice(&self.path);
+    bytes
+  }
+
+  /// One read back from the shard image; none for bytes shorter than its head.
+  pub(crate) fn from_bytes(bytes: &[u8]) -> Option<HgLanded> {
+    let (repository, rest) = bytes.split_at_checked(16)?;
+    let (node, path) = rest.split_at_checked(20)?;
+    Some(HgLanded {
+      repository: slates_db::catalog::RepositoryId {
+        bytes: repository.try_into().ok()?,
+      },
+      path: path.to_vec(),
+      node: node.try_into().ok()?,
+    })
+  }
+}
+
 std::thread_local! {
-  /// Where each window this shard holds as a home lies on the node's store ([`LandedAt`]); bounded by the windows it
-  /// holds, each one dropped when the window is freed.
-  static LANDED: std::cell::RefCell<std::collections::BTreeMap<ContentId, LandedAt>> =
+  /// What brings back each window this shard let go once landed ([`Landed`]); bounded by the windows it holds, each one
+  /// dropped when the window is freed.
+  static LANDED: std::cell::RefCell<std::collections::BTreeMap<ContentId, Landed>> =
     const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
-  /// The records made or dropped since this shard's last committed publication: the image carries them.
-  static LANDED_CHANGES: std::cell::RefCell<std::collections::BTreeMap<ContentId, Option<LandedAt>>> =
+  /// The records made (`true`) or dropped (`false`) since this shard's last committed publication, each with what it
+  /// was, so the image names its kind: the image carries them.
+  static LANDED_CHANGES: std::cell::RefCell<std::collections::BTreeMap<ContentId, (Landed, bool)>> =
     const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+/// What brings back the window `identity` this shard let go once landed, if anything does.
+pub(crate) fn landed(identity: &ContentId) -> Option<Landed> {
+  LANDED.with(|landed| landed.try_borrow().ok()?.get(identity).cloned())
 }
 
 /// Where the window `identity` this shard holds lies on the node's store, where a landed pack carried it.
 pub(crate) fn landed_at(identity: &ContentId) -> Option<LandedAt> {
-  LANDED.with(|landed| landed.try_borrow().ok()?.get(identity).copied())
+  match landed(identity)? {
+    Landed::Pack(at) => Some(at),
+    Landed::Hg(_) => None,
+  }
 }
 
-/// Notes `at` for the window `identity`, or drops its record (`None`), and the change for the shard image.
-fn landed_changed(identity: ContentId, at: Option<LandedAt>) {
-  LANDED.with(|landed| {
-    if let Ok(mut landed) = landed.try_borrow_mut() {
-      match at {
-        Some(at) => landed.insert(identity, at),
-        None => landed.remove(&identity),
-      };
-    }
-  });
-  LANDED_CHANGES.with(|changes| {
-    if let Ok(mut changes) = changes.try_borrow_mut() {
-      changes.insert(identity, at);
-    }
-  });
+/// Notes what brings back the window `identity` once its owner lets it go landed (goal 93 item 2b(b)): a Mercurial file
+/// revision's, as its push or import lets its windows go (`repository::hg_run::let_go_windows`), on the shard that lets
+/// them go and before it does. A window noted is not pinned (`vcs_store::landed_pin`), since a home's read brings it back
+/// by its note ([`bring_back_landed`]).
+pub(crate) fn note_landed(identity: ContentId, landed: Landed) {
+  landed_changed(identity, Some(landed));
 }
 
-/// The landed records made (`Some`) or dropped (`None`) since this shard's last committed publication, for its delta.
-pub(crate) fn landed_changes() -> Vec<(ContentId, Option<LandedAt>)> {
+/// Notes `landed` for the window `identity`, or drops its record (`None`), and the change for the shard image.
+fn landed_changed(identity: ContentId, landed: Option<Landed>) {
+  let change = LANDED.with(|held| {
+    let mut held = held.try_borrow_mut().ok()?;
+    match landed {
+      Some(landed) => {
+        held.insert(identity, landed.clone());
+        Some((landed, true))
+      }
+      None => held.remove(&identity).map(|was| (was, false)),
+    }
+  });
+  if let Some(change) = change {
+    LANDED_CHANGES.with(|changes| {
+      if let Ok(mut changes) = changes.try_borrow_mut() {
+        changes.insert(identity, change);
+      }
+    });
+  }
+}
+
+/// The landed records made (`true`) or dropped (`false`) since this shard's last committed publication, each with what
+/// it was, for its delta.
+pub(crate) fn landed_changes() -> Vec<(ContentId, Landed, bool)> {
   LANDED_CHANGES.with(|changes| {
     changes
       .try_borrow()
       .map(|changes| {
         changes
           .iter()
-          .map(|(identity, at)| (*identity, *at))
+          .map(|(identity, (landed, made))| (*identity, landed.clone(), *made))
           .collect()
       })
       .unwrap_or_default()
@@ -688,14 +762,14 @@ pub(crate) fn landed_changes() -> Vec<(ContentId, Option<LandedAt>)> {
 }
 
 /// Every landed record this shard keeps, for its checkpoint's image.
-pub(crate) fn landed_here() -> Vec<(ContentId, LandedAt)> {
+pub(crate) fn landed_here() -> Vec<(ContentId, Landed)> {
   LANDED.with(|landed| {
     landed
       .try_borrow()
       .map(|landed| {
         landed
           .iter()
-          .map(|(identity, at)| (*identity, *at))
+          .map(|(identity, landed)| (*identity, landed.clone()))
           .collect()
       })
       .unwrap_or_default()
@@ -712,10 +786,10 @@ pub(crate) fn landed_changes_committed() {
 }
 
 /// The landed records a recovered shard image carried, taken back as they were: no store is read for them.
-pub(crate) fn restore_landed(records: &[(ContentId, LandedAt)]) {
+pub(crate) fn restore_landed(records: &[(ContentId, Landed)]) {
   LANDED.with(|landed| {
     if let Ok(mut landed) = landed.try_borrow_mut() {
-      landed.extend(records.iter().copied());
+      landed.extend(records.iter().cloned());
     }
   });
 }
@@ -747,7 +821,7 @@ pub(crate) fn record_landed_here(
     (count, bytes)
   });
   for (identity, at) in recorded {
-    landed_changed(identity, Some(at));
+    landed_changed(identity, Some(Landed::Pack(at)));
   }
   if freed.1 > 0 {
     state.count(LANDED_HOME_LET_GO_BYTES, freed.1);
