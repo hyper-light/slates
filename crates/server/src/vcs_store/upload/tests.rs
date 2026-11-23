@@ -1151,8 +1151,9 @@ fn t_a864_a_fetchs_look_ahead_brings_back_a_turns_windows_never_its_pack() {
 /// store-backed daemon, let a four-window pack go as the look-ahead test does; bring back what a fetch's next turn reads
 /// from its first byte; then let go behind a cursor in its third window. Expect: the first two windows held while the
 /// cursor reads them, the answer's resident set two; once the cursor has passed them, both handed to
-/// `vcs_store::let_go_read` and the resident set empty (a one-shard daemon's windows are pinned by their home, there,
-/// so they stay held, as 2b(a) rules, counted let go nowhere); the most held at once (`git_resident.peak_windows`) two.
+/// `vcs_store::let_go_read` and let go again, counted (no home pins a window its shard does not hold for the region:
+/// main 01a20182's ruling of 2026-11-22 21:15), the resident set empty; the most held at once
+/// (`git_resident.peak_windows`) two.
 #[test]
 fn t_a864_a_fetch_lets_go_again_the_windows_its_cursor_has_passed() {
   use slates_git::store::packed::Waited;
@@ -1233,6 +1234,9 @@ fn t_a864_a_fetch_lets_go_again_the_windows_its_cursor_has_passed() {
   let (held, after, left) = got.recv().expect("let go behind");
   daemon.stop();
   assert_eq!(held, (Some(vec![false, false, true, true]), 2));
-  assert_eq!(after, Some((vec![false, false, true, true], None, Some(2))));
+  assert_eq!(
+    after,
+    Some((vec![true, true, true, true], Some(2), Some(2)))
+  );
   assert_eq!(left, 0);
 }

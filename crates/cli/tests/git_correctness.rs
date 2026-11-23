@@ -1414,9 +1414,21 @@ fn lfs_row(rows: &mut Rows, git: &Git, scratch: &Scratch, http: &Server) {
   let committed = git.run(&copy, &[], &["commit", "-q", "-m", "lfs"]);
   let pushed = git.run(&copy, &http.config, &["push", "-q", &http.url, "HEAD"]);
   let back = format!("{}/lfs-back", scratch.path);
+  // The clone runs git-lfs as `git lfs install` sets it up (main 01a20182's r115: git's config is isolated here, so a
+  // plain clone has no LFS filter and checks the pointer out as committed, never asking the server for the object):
+  // the filter given on the command line, which git hands its filter process with the edge's credential.
+  let mut lfs_config = http.config.clone();
+  for filter in [
+    "filter.lfs.clean=git-lfs clean -- %f",
+    "filter.lfs.smudge=git-lfs smudge -- %f",
+    "filter.lfs.process=git-lfs filter-process",
+    "filter.lfs.required=true",
+  ] {
+    lfs_config.extend(["-c".to_owned(), filter.to_owned()]);
+  }
   let cloned = git.run(
     &scratch.path,
-    &http.config,
+    &lfs_config,
     &["clone", "-q", &http.url, &back],
   );
   let failure = steps
@@ -1427,9 +1439,15 @@ fn lfs_row(rows: &mut Rows, git: &Git, scratch: &Scratch, http: &Server) {
     .or_else(|| {
       let held = std::fs::read(format!("{back}/large.lfsbin")).unwrap_or_default();
       (held != bytes).then(|| {
+        let pointer = held.starts_with(b"version https://git-lfs.github.com/spec/v1");
         format!(
-          "the clone's file holds {} bytes, not the 1 MiB pushed",
-          held.len()
+          "the clone's file holds {} bytes, not the 1 MiB pushed{}",
+          held.len(),
+          if pointer {
+            " (the LFS pointer: no object downloaded)"
+          } else {
+            ""
+          }
         )
       })
     });

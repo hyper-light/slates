@@ -17491,7 +17491,9 @@ from the pulse lines, the range over the three shards.
 - The bench's ring-and-outside split is not used here. In the median band the ring (the server's slot-read-to-reply
   spans, summed over a sample's two requests) exceeds the client's whole total: H arm64 466 against 387 µs, G+E 827
   against 710, and x86_64's A 252 against 104. Spans nested in the client's time cannot add to more than it, so
-  "outside the ring 0" is the subtraction's floor, not a measured zero. The fix is owed (w-perf, next piece).
+  "outside the ring 0" is the subtraction's floor, not a measured zero. Fixed the same day: the span opened at the
+  round's clock read and closed after the client's wake
+  (`docs/bugs/2026-11-22-a-ring-span-outlasted-its-clients-wait.md`).
 - The two runs' x86_64 A legs differ (loaded accept p50 174-289 against 99-103 µs), so x86_64 is compared only within
   a run.
 

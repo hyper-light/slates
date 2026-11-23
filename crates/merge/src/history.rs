@@ -791,6 +791,22 @@ impl Value {
     self.own.map_or(0, |(_, len)| len)
   }
 
+  /// The file block the value is whole, named as its one chunk (A-728), if it is one: what a checkpoint names a file by
+  /// when that block is named for a content-plane object (A-866, A-869).
+  pub(crate) fn whole_block(&self, chunks: &Chunks) -> Option<Block> {
+    match self.pieces.as_slice() {
+      [piece] => match chunks.slots.get(piece.chunk) {
+        Some(Some((Source::Block { block, len }, _)))
+          if piece.at == 0 && piece.len == *len && self.len == *len =>
+        {
+          Some(*block)
+        }
+        _ => None,
+      },
+      _ => None,
+    }
+  }
+
   /// Whether the value is `block` whole, named as its one chunk (A-728).
   pub(crate) fn is_block(&self, chunks: &Chunks, block: Block) -> bool {
     match self.pieces.as_slice() {

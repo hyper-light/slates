@@ -3,7 +3,7 @@
 use slates_db::register::rendezvous_ranked_by_key;
 use slates_vcs::ContentId;
 
-use super::{HOMED, LET_GO, home, home_of, let_go, read};
+use super::{HOMED, LET_GO, home_of, keep_region_at_home, let_go_region_at_home, read};
 
 /// Shape: the windows the spread test homes: enough that every one of four shards is some window's home with
 /// overwhelming probability (each misses all with probability (3/4)^64, about 1e-8).
@@ -31,10 +31,12 @@ fn an_identitys_home_is_the_head_of_the_one_rendezvous_ranking_and_homes_spread(
   assert_eq!(home_of(&[], &ContentId::of(b"x")), None);
 }
 
-/// A-724 piece 5. Do: on a four-shard daemon, from the first shard, home many windows (one twice), read each back,
-/// let each go, and home bytes past a window. Expect: each window kept on its home and only there, the homes spread
-/// over the shards; each read back whole from its home; a window homed twice held twice, kept until its second
-/// let-go; every window freed after its last; past a window refused typed.
+/// A-724 piece 5, homed for the region (main 01a20182's ruling of 2026-11-22 21:15: what a home keeps it keeps for the
+/// region, the single-window homing gone). Do: on a four-shard daemon, from the first shard, keep many windows for the
+/// region at their homes (one twice), read each back, let each go, and keep an object past a window. Expect: each window
+/// kept on its home and only there, the homes spread over the shards; each read back whole from its home; a window
+/// kept twice for the region held once (the region's offers are idempotent), freed at its let-go and refused a second;
+/// every window freed after its let-go; the object past a window kept under its BLAKE3 and let go.
 #[test]
 fn windows_are_homed_read_and_let_go_at_their_identitys_shard() {
   let daemon = crate::daemon::audit_daemon_of(4);
@@ -48,7 +50,7 @@ fn windows_are_homed_read_and_let_go_at_their_identitys_shard() {
       let mut homes = std::collections::BTreeSet::new();
       for index in 0..WINDOWS {
         let bytes = window(index);
-        let homed = home(origin, &shards, bytes.clone(), budget).await;
+        let homed = keep_region_at_home(origin, &shards, bytes.clone(), budget).await;
         let Ok((identity, _)) = homed else {
           outcome.push(format!("window {index} not homed: {homed:?}"));
           continue;
@@ -63,18 +65,24 @@ fn windows_are_homed_read_and_let_go_at_their_identitys_shard() {
       }
       let twice = window(0);
       let identity = ContentId::of(&twice);
-      let _ = home(origin, &shards, twice.clone(), budget).await;
+      let _ = keep_region_at_home(origin, &shards, twice.clone(), budget).await;
       for index in 0..WINDOWS {
         let identity = ContentId::of(&window(index));
-        if let_go(origin, &shards, identity, budget).await.is_err() {
+        if let_go_region_at_home(origin, &shards, identity, budget)
+          .await
+          .is_err()
+        {
           outcome.push(format!("window {index} not let go"));
         }
       }
-      if read(origin, &shards, identity, budget).await != Some(twice) {
-        outcome.push("a window homed twice freed at its first let-go".to_owned());
+      if read(origin, &shards, identity, budget).await.is_some() {
+        outcome.push("a window kept twice for the region outlived its one let-go".to_owned());
       }
-      if let_go(origin, &shards, identity, budget).await.is_err() {
-        outcome.push("a window homed twice not let go a second time".to_owned());
+      if let_go_region_at_home(origin, &shards, identity, budget)
+        .await
+        .is_ok()
+      {
+        outcome.push("a window kept twice for the region let go a second time".to_owned());
       }
       for index in 0..WINDOWS {
         if read(origin, &shards, ContentId::of(&window(index)), budget)
@@ -92,13 +100,16 @@ fn windows_are_homed_read_and_let_go_at_their_identitys_shard() {
       // An object past a window is homed whole under the BLAKE3 of its bytes (the identity rule), each home cutting its
       // own windows; let go again, as the windows were.
       let identity = ContentId::of(&past);
-      match home(origin, &shards, past, budget).await {
+      match keep_region_at_home(origin, &shards, past, budget).await {
         Ok((homed, _)) if homed == identity => {}
         other => outcome.push(format!(
           "an object past a window not homed by its BLAKE3: {other:?}"
         )),
       }
-      if let_go(origin, &shards, identity, budget).await.is_err() {
+      if let_go_region_at_home(origin, &shards, identity, budget)
+        .await
+        .is_err()
+      {
         outcome.push("the object past a window not let go".to_owned());
       }
       let _ = sent.send(outcome);
@@ -126,8 +137,8 @@ fn windows_are_homed_read_and_let_go_at_their_identitys_shard() {
   assert!(outcome.is_empty(), "{outcome:#?}");
   assert_eq!(
     homed,
-    u64::try_from(WINDOWS + 2).unwrap(),
-    "every window kept at a home, one twice, and the object past a window once"
+    u64::try_from(WINDOWS + 1).unwrap(),
+    "every window kept at a home once (a second offer held nothing more), and the object past a window once"
   );
 }
 
@@ -159,7 +170,9 @@ fn a_homed_windows_ticket_is_published_only_once_its_homes_image_is() {
         .map(window)
         .find(|bytes| home_of(&shards, &ContentId::of(bytes)) == Some(other))
         .unwrap();
-      let (_, ticket) = home(origin, &shards, bytes, budget).await.unwrap();
+      let (_, ticket) = keep_region_at_home(origin, &shards, bytes, budget)
+        .await
+        .unwrap();
       if ticket.shard != other {
         outcome.push(format!(
           "the ticket names {} not the home {other}",
@@ -220,85 +233,6 @@ fn a_homed_windows_ticket_is_published_only_once_its_homes_image_is() {
   daemon.stop();
   let outcome = outcome.expect("the shards answered");
   assert!(outcome.is_empty(), "{outcome:#?}");
-}
-
-/// A-724 piece 6 (N = 1; the batch forms agreed with w-perf). Do: on a four-shard daemon, home 64 windows in one batch
-/// with one of them twice, read them all back in one batch, then let them all go in one batch. Expect: every window
-/// homed and read back whole in order; fewer calls than windows (one a home shard a batch while a home's quantum holds
-/// its items, the rest the next turn); the window sent twice kept until its second let-go; all freed after.
-#[test]
-fn a_batch_of_windows_goes_to_each_home_in_one_call_a_shard() {
-  use super::{BATCH_CALLS, home_many, let_go_many, read_many};
-  let daemon = crate::daemon::audit_daemon_of(4);
-  let (sent, answered) = std::sync::mpsc::sync_channel(1);
-  crate::daemon::observe_first(&daemon, move |state| {
-    let origin = state.shard;
-    let shards = state.shards.clone();
-    let task = slates_rt::futures::spawn(async move {
-      let budget = crate::daemon::LIVENESS_BUDGET_NS;
-      let mut outcome: Vec<String> = Vec::new();
-      let mut windows: Vec<Vec<u8>> = (0..WINDOWS).map(window).collect();
-      windows.push(window(0));
-      let homed = home_many(origin, &shards, windows.clone(), budget).await;
-      if homed.len() != windows.len() || homed.iter().any(Result::is_err) {
-        outcome.push(format!("not every window homed: {homed:?}"));
-      }
-      let identities: Vec<ContentId> = windows.iter().map(|bytes| ContentId::of(bytes)).collect();
-      let read_back = read_many(origin, &shards, &identities, budget).await;
-      for (at, (bytes, got)) in windows.iter().zip(&read_back).enumerate() {
-        if got.as_ref() != Some(bytes) {
-          outcome.push(format!("window {at} not read back in order"));
-        }
-      }
-      let once: Vec<ContentId> = identities.iter().take(WINDOWS).copied().collect();
-      if let_go_many(origin, &shards, &once, budget)
-        .await
-        .iter()
-        .any(Result::is_err)
-      {
-        outcome.push("not every window let go".to_owned());
-      }
-      if read(origin, &shards, identities[0], budget).await.is_none() {
-        outcome.push("the window sent twice was freed at its first let-go".to_owned());
-      }
-      if let_go_many(origin, &shards, &identities[..1], budget)
-        .await
-        .iter()
-        .any(Result::is_err)
-      {
-        outcome.push("the window sent twice was not let go again".to_owned());
-      }
-      if read_many(origin, &shards, &once, budget)
-        .await
-        .iter()
-        .any(Option::is_some)
-      {
-        outcome.push("a window outlived its last let-go".to_owned());
-      }
-      let _ = sent.send(outcome);
-    })
-    .unwrap();
-    slates_rt::futures::detach(task).unwrap();
-  });
-  let outcome = answered.recv();
-  let calls: u64 = (0..4)
-    .map(|partition| {
-      crate::daemon::observe_at(&daemon, partition, |state| {
-        state.refusals.get(BATCH_CALLS).copied().unwrap_or(0)
-      })
-    })
-    .sum();
-  daemon.stop();
-  let outcome = outcome.expect("the shards answered");
-  assert!(outcome.is_empty(), "{outcome:#?}");
-  // Five batches over 65 + 65 + 64 + 1 + 64 = 259 windows. A call works through its home's items until the home's step
-  // quantum is spent (at least one), so how many fit a call depends on the build's speed: fewer calls than windows is the
-  // property, one call a home shard a batch the case when the quantum holds them all.
-  println!("five batches of 259 windows over 4 homes: {calls} calls");
-  assert!(
-    calls < 259,
-    "a batch made a call a window or more: {calls} calls"
-  );
 }
 
 /// A-724 piece 6's region half (main's ruling: a home acknowledges only once its image holds the window). Do: on a
@@ -750,5 +684,72 @@ fn a_region_object_remains_readable_when_a_landed_file_shares_its_first_window()
     after,
     Some(window + 1),
     "the region's object must remain readable after the release of a shared window; {freed} bytes left RAM"
+  );
+}
+
+/// Goal 93's hg bar (main 01a20182's ruling of 2026-11-22 21:15: a window is pinned only where its shard holds it for the
+/// region, never where its identity ranks; arena-3's push peaked at 4,077 MiB with 75,440 texts pinned at their segments'
+/// durability, about half of them a two-shard daemon's own by rank). Do: on a two-shard daemon, on one shard, hold an
+/// object for the region and put a segment's file texts whose windows all rank on that shard; let them go as a segment
+/// lands, before its entry commits (no revision noted). Expect: every text's window let go and none pinned, the bytes
+/// counted; the region object still read whole from its home. Failing first: each text pinned by its rank, kept in RAM
+/// until the push's commit.
+#[test]
+fn a_segments_texts_that_rank_on_their_shard_are_let_go_at_its_durability() {
+  const TEXTS: u8 = 8;
+  let daemon = crate::daemon::audit_daemon_of(2);
+  let shards = crate::daemon::observe_first(&daemon, |state| state.shards.clone());
+  let here = shards[0];
+  // Texts that each rank on `here`, so the old rule pinned every one.
+  let texts: Vec<Vec<u8>> = (0u32..)
+    .map(|at| format!("a segment's text {at}\n").into_bytes())
+    .filter(|text| home_of(&shards, &ContentId::of(text)) == Some(here))
+    .take(usize::from(TEXTS))
+    .collect();
+  let region_object = b"an object the region holds here".to_vec();
+  let (gone, pinned, freed, read) = crate::daemon::observe_at(&daemon, 0, move |state| {
+    let (object, _) = super::keep_for_region(state, &region_object).unwrap();
+    let need: u64 = texts.iter().map(|text| text.len() as u64).sum();
+    let ids: Vec<ContentId> = crate::vcs_store::within_budget(state, need, |stores| {
+      let content = stores.content_mut().unwrap();
+      texts
+        .iter()
+        .map(|text| content.put_object(text).unwrap())
+        .collect()
+    });
+    let files: Vec<slates_hg::filerev::FileContents> = ids
+      .iter()
+      .enumerate()
+      .map(|(at, bytes)| slates_hg::filerev::FileContents {
+        path: format!("f{at}").into_bytes(),
+        node: [u8::try_from(at).unwrap(); 20],
+        bytes: *bytes,
+        block: None,
+      })
+      .collect();
+    crate::repository::hg_run::let_go_landed(state, None, &files);
+    let gone = state.vcs_stores.content().map_or(0, |content| {
+      ids.iter().filter(|id| content.is_away(id)).count()
+    });
+    let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+    (
+      gone,
+      count(crate::repository::hg_run::TEXTS_PINNED),
+      count(crate::repository::hg_run::TEXT_BYTES_LET_GO),
+      super::read_here(state, &object),
+    )
+  });
+  daemon.stop();
+  assert_eq!(
+    gone,
+    usize::from(TEXTS),
+    "every text's window let go at its segment's durability"
+  );
+  assert_eq!(pinned, 0, "none pinned by where its identity ranks");
+  assert!(freed > 0, "the bytes let go counted");
+  assert_eq!(
+    read.as_deref(),
+    Some(b"an object the region holds here".as_slice()),
+    "the region's object still read whole from its home"
   );
 }

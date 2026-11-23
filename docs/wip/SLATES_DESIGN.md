@@ -9919,7 +9919,8 @@ it uses content addressing. The RAM-only trust boundary and any allowed sharing 
 > a bounded per-shard `SpanSink` (thread-local, no lock — R2; sized to one client ring's depth), and
 > emits `shard.op` (the whole verb) and `log.append` (the durable `Db::commit` within it) for every
 > verb in `run_recorded`, `ring.request` (ring read → reply written) for a synchronously-served reply
-> in `serve_client`/`retry_deferred`, `merge.verdict` (one increment judged) in the submit handler,
+> in `serve_client`/`retry_deferred` (since 2026-11-22 opened at the slot read's own clock reading and ended at the
+> reply's publication, before the client's wake: `docs/bugs/2026-11-22-a-ring-span-outlasted-its-clients-wait.md`), `merge.verdict` (one increment judged) in the submit handler,
 > `bridge.request` (one NFS bridge call from arrival to reply) around `serve_local` in `crate::nfs`, and
 > `land.entry` (one landing entry) through a **cross-crate span seam**: the land engine's `Observer`
 > trait gained an `after_entry(start, end)` callback taking primitives (so `slates-land` stays
@@ -60992,8 +60993,10 @@ owed.
   whole text off the shard's step (`slates_hg::push::held::TextAsk`, the one ask a push's work uses for a text an
   import let go), and its block and bytes are put back by the identities the row names within the room they take; true
   where both are held whole after. Evidence: `a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and_node`.
-  Each window is noted with its revision (`homes::note_landed`, `Landed::Hg`) by the let-go that follows its push's
-  entry commit or its import's landing, and so pinned by nothing; the let-go as each segment lands notes nothing,
+  Each window a home holds (one the shard holds for the region, `vcs_store::landed_pin`) is noted with its revision
+  (`homes::note_landed`, `Landed::Hg`) by the let-go that follows its push's entry commit or its import's landing, and
+  so pinned by nothing; any other window needs no note, since only the repository's index reads it, so a history notes
+  about none (w-shared's 1ecb57cf4, the rendezvous pin gone); the let-go as each segment lands notes nothing,
   since the revision is not yet in the index the bring-back reads, and leaves a window a home holds pinned
   (`vcs_store::landed_pin`, every window of an object held for the region since 7663054bb). A home's read of an object
   with an away window noted for hg brings it back through the repository's reader, once a revision
@@ -61221,3 +61224,50 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
 - **Applied in the same change to** `crates/git` (`store/deflaters.rs`, `store/upload.rs`, `store/fragment.rs`,
   `tests/store/upload.rs`), `crates/server` (`vcs_store/upload.rs`, `vcs_store/git_encode.rs`,
   `vcs_store/upload/tests.rs`), GAPS, amendments.tsv.
+
+### A-869 — A green's checkpoint names a file held by a content-plane object, read back a slice a step (2026-11-22, w-svn; main 01a20182's order of 19:28 PST, goal 93; A-760 (b) piece 2 of 4; A-866, A-865, A-760)
+
+- **Why.** A checkpoint carried every changed file's bytes (`Tables::files`), and its encoding is itself held in the
+  shard's content (A-579's last step). So a Subversion green's head texts were held in the repository's content store
+  and again in its checkpoint. A-746 measured checkpoints at 137.4 MiB of the owner partition's register after the
+  1,000-revision import. Since A-866 the green's block knows the object it is the whole of, so the checkpoint can name
+  it.
+- **The format.** `Checkpoint::named`: per file its path, the version whose change is in effect, and the object's
+  identity (BLAKE3 and length), never a key the carried table holds. It is written after the head check, and only
+  when a file is named, so a checkpoint naming nothing keeps version 5's bytes (the golden vectors are unchanged) and
+  every checkpoint written before decodes as it did (main's rule: old checkpoints still read). The version word stays
+  5, since a decoder from before refuses the section as `TrailingBytes` and never reads it under another meaning, as
+  A-760's run table after an increment's evidence. Refused typed: a section of none (`BadKind`), a path named twice or
+  also carried (`DuplicatePath`), a count past the bytes left (`Truncated`), any cut of it.
+- **Taking one.** `Green::checkpoint` names a file whose value at the checkpoint's version is one block whole
+  (`history::Value::whole_block`) named for an object of that length (`Blocks::name`). Anything else is carried, as
+  before.
+- **Restoring one.** `Checkpoint::read_step` reads the named files a slice a step from the owner's `named::Objects`,
+  each into a buffer reserved once at its length, the files in order, found by the buffers' count, so no step reads
+  more than its slice and none scans the files before it. An empty object asks the plane for nothing.
+  `Green::with_checkpoint` and `Green::restore` now take the checkpoint mutably and answer
+  `Result<Green, Unrestored>`. Unread is refused, with the green handed back as it was seeded (a lineage member's engine
+  holds its lineage's arenas); read, each file takes its buffer with no copy and its block is named for its object
+  again.
+- **In the daemon.** Recovery reads the named files in a phase of their own (`GreenReplayPhase::Restoring`), a copy slice
+  a step through `PlaneObjects`, as a chain entry's runs are read; a missing object fences the green `ContentMissing`.
+  A-760's pre-pass (`svn_texts::bring_back_named`) also brings back the texts the checkpoint names that the store does
+  not hold whole. So a cold restart brings back the head's texts the checkpoint no longer carries, each a recovery
+  unit, and gives them back once the green is replayed
+  (`a_cleanly_restarted_import_brings_back_only_its_checkpoints_named_texts`). That test now waits for the batch's
+  checkpoint before it stops: the import answers before a deferred checkpoint commits (`checkpoint_in_turns`), and
+  w-hg and w-shared saw 1 run in 6 recover from the entries. A holder's replica refuses a held checkpoint naming files
+  (`merge.replica.checkpoint_unread`): replicas read no named content yet (A-727 (d)).
+- **Oracle.** A-866's, `a_file_made_whole_of_a_named_object_is_named_for_it_until_changed`, with restores. After some
+  versions, the judging green's checkpoint at an earlier committed version, or the head, is encoded and decoded (equal
+  to the checkpoint taken), its named files read 5 bytes a step, restored, and caught up by every later version as its
+  entry records it, then held to the model's bytes and names and the judging green's head. Census of one run: 113
+  restores, 148 versions caught up after one, 131 files restored by name. Failing first: the restored green named no
+  file. Codec: `a_named_file_is_written_after_the_layout_of_before_and_read_back` (an independent layout's golden bytes),
+  `a_named_files_section_is_refused_typed_when_hostile`, `a_checkpoints_named_files_are_read_a_slice_a_step`.
+- **Not yet.** Measuring the register's checkpoint bytes before and after is main's. A copied tree's keys are still
+  carried (`Checkpoint::copied`). The history still keeps a named version's bytes (piece 3), and the current block
+  still holds its bytes (piece 4).
+- **Applied in the same change to** `crates/merge` (`checkpoint`, `engine`, `engine/copy_checkpoint`, `history`, every
+  restore's caller), `crates/server` (`verbs`, `merge_origin`, `vcs_store/svn_texts`, `repository/store_tests`), GAPS,
+  amendments.tsv.

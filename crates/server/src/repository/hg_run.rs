@@ -25,9 +25,11 @@
 //! the index it becomes still name them by identity, and a read that meets one brings it back from the store (the
 //! intake's base reads, the works' read-through, the served view's). Until its entry commits, a window a home holds stays,
 //! as a landed git pack's does (`vcs_store::landed_pin`): a home reads by identity alone, and the revision is not yet in
-//! the index its read-through reads. Once it commits, each window is noted with its revision for the home
-//! (`homes::note_landed`, `Landed::Hg`; goal 93 item 2b(b), w-shared's seam 1) and let go, pinned by nothing: a home's
-//! read brings it back by its path and node (`hg_push::bring_back`). That noting is a whole push's file revisions, so the
+//! the index its read-through reads. Once it commits, each window a home holds (one the shard holds for the region) is
+//! noted with its revision for the home (`homes::note_landed`, `Landed::Hg`; goal 93 item 2b(b), w-shared's seam 1) and
+//! let go, pinned by nothing: a home's read brings it back by its path and node (`hg_push::bring_back`). A window no home
+//! holds needs no note, since only the index reads it (w-shared's 1ecb57cf4), so a history notes about none. That pass is a
+//! whole push's file revisions, so the
 //! push's task takes it a turn at a time within half the shard's step quantum, a revision its unit ([`let_go_committed`];
 //! in one poll it spun CI's x86 shard 0 for 1,045 ms, run 45110563116), as the import's answer does once its landing is
 //! durable. So a whole-history push leaves its rows held, never
@@ -238,9 +240,8 @@ fn abandoned(state: &mut ShardState, repository: RepositoryId, ranges: Vec<(u64,
 /// Counter: the bytes of pushes' file texts let go of the content store once the segment carrying them was durable
 /// (module docs, "Let go"). Format: a counter name in the status report.
 pub(crate) const TEXT_BYTES_LET_GO: &str = "vcs.hg.push_text_bytes_let_go";
-/// Counter: a landed segment's window kept because a home holds it here (`vcs_store::landed_pin`: one whose home by
-/// identity is this shard, which a home reads by identity alone), until its entry commits and notes it. Format: a
-/// counter name.
+/// Counter: a landed segment's window kept because a home holds it here (`vcs_store::landed_pin`: one this shard holds
+/// for the region, which a home reads by identity alone), until its entry commits and notes it. Format: a counter name.
 pub(crate) const TEXTS_PINNED: &str = "vcs.hg.push_texts_pinned";
 
 /// Lets go of `contents`, a landed segment's file revisions' windows (module docs, "Let go"), each noted for a home as
@@ -284,7 +285,6 @@ fn let_go_windows_until(
   contents: &[FileContents],
   deadline_ns: u64,
 ) -> (u64, u64, usize) {
-  let (shard, shards) = (state.shard, state.shards.clone());
   // The repository's windows are the shard's chunk store's, lent to its content store for the step.
   crate::vcs_store::lent_state(state, |state| {
     crate::vcs_store::within_budget(state, 0, |stores| {
@@ -297,9 +297,7 @@ fn let_go_windows_until(
           if let Some(repository) = noting {
             note_windows(content, repository, revision, identity);
           }
-          let (more, kept) = content.let_go_object_landed(identity, &|window| {
-            crate::vcs_store::landed_pin(shard, &shards, window)
-          });
+          let (more, kept) = content.let_go_object_landed(identity, &crate::vcs_store::landed_pin);
           freed = freed.saturating_add(more);
           pinned = pinned.saturating_add(kept);
         }
@@ -368,7 +366,10 @@ pub(crate) async fn let_go_committed(
 }
 
 /// Notes each window of `identity`, one of `revision`'s objects in `repository`, with the revision for a home on this
-/// shard (`homes::note_landed`), but a window noted already.
+/// shard (`homes::note_landed`) where a home would pin it (`vcs_store::landed_pin`: the shard holds it for the region,
+/// itself or as a window of an object), so the note brings it back in the pin's place (w-shared's 1ecb57cf4, main's
+/// ruling): a window no home holds is read only through the repository's index, which brings it back by itself, and needs
+/// none. A window noted already keeps its note.
 fn note_windows(
   content: &slates_vcs::ContentStore,
   repository: RepositoryId,
@@ -377,7 +378,7 @@ fn note_windows(
 ) {
   use crate::vcs_store::homes::{self, HgLanded, Landed};
   for (window, _) in content.object_layout(identity) {
-    if homes::landed(&window).is_none() {
+    if crate::vcs_store::landed_pin(&window).is_some() {
       homes::note_landed(
         window,
         Landed::Hg(HgLanded {

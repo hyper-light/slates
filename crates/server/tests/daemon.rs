@@ -78,6 +78,42 @@ impl Client {
     self.call_as(id, body)
   }
 
+  /// Publishes `body` as the next request without waiting for its reply: its id, and the host clock read just before
+  /// the publication.
+  fn publish(&mut self, body: &RequestBody) -> (RequestId, u64) {
+    self.sequence += 1;
+    let id = RequestId {
+      client: self.client,
+      sequence: self.sequence,
+    };
+    let index = self.end.next_request_index();
+    let slot = pack(
+      self.end.region_mut(),
+      Direction::Request,
+      index,
+      id.word(),
+      body,
+    )
+    .unwrap();
+    let published_ns = slates_machine::clock::monotonic_ns();
+    let roomed = self
+      .end
+      .send_when_room(|end| end.send(&slot))
+      .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(roomed, slates_ipc::room::Roomed::Sent, "the ring had room");
+    (id, published_ns)
+  }
+
+  /// Waits for the next reply: the request word it answers and its body.
+  fn take_reply(&mut self) -> (u64, ReplyBody) {
+    let reply = self
+      .end
+      .wait(Some(DEADLINE_NS))
+      .unwrap_or_else(|e| panic!("{e} waiting for a reply"));
+    let body = unpack(self.end.region(), reply.kind, &reply.payload).unwrap();
+    (reply.request, body)
+  }
+
   /// Sends `body` under `id` (a retry reuses an id) and waits for the reply.
   fn call_as(&mut self, id: RequestId, body: &RequestBody) -> ReplyBody {
     let index = self.end.next_request_index();
@@ -2681,6 +2717,137 @@ fn version_stats_scenario() {
     "a volume's slots are committed against the version slab: {after}"
   );
   daemon.stop();
+}
+
+/// Shape: the held test's ring slots, few, so its large chunks stay a small region.
+const HELD_SLOTS: u32 = 8;
+/// Shape: each held slot's bulk chunk, 8 MiB: a slot carries half of it each way.
+const HELD_CHUNK_BYTES: u64 = 8 << 20;
+/// Shape: the share of a slot's chunk the held edit fills, a quarter: half the request's half, so its frame and the
+/// edit's other fields fit beside it, and a 2 MiB splice holds the shard for its serve.
+const HELD_EDIT_SHARE: u64 = 4;
+
+/// A request's `ring.request` span (§4.14: the slot read to the reply written) lies inside its client's own time, which
+/// the edit-and-merge bench's attribution subtracts it from. Found 2026-11-22: under CI's load the bench's ring exceeded
+/// the client's whole total (median band, arm64 466 against 387 µs, run 45108777338), since a request taken later in a
+/// shard's round opened its span at the round's one clock read, and a written reply closed its span only after the
+/// client's wake. Do: on a one-shard daemon, publish a 2 MiB edit, so its serve holds the shard in its round, and once the shard has taken it publish a second request; take both replies; drain the shard's
+/// spans. Expect: each request has one ring span, starting no earlier than the client published it and ending no later
+/// than the client saw its reply.
+#[test]
+fn a_requests_ring_span_lies_within_its_clients_own_time() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-ringspan-{}", std::process::id());
+  let mut config = DaemonConfig::derive(&profile, &instance, Some(1));
+  config.region.slots = HELD_SLOTS;
+  config.region.bulk_bytes = u64::from(HELD_SLOTS) * HELD_CHUNK_BYTES;
+  let chunk = HELD_CHUNK_BYTES;
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: common::fixture_object("slates-seg", "ringspan"),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name: "ringspan".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    panic!("create the green");
+  };
+  let ReplyBody::WorkCreated { id: work, .. } = client.call(&RequestBody::CreateWork {
+    green,
+    name: "w".to_owned(),
+  }) else {
+    panic!("create the work");
+  };
+  // What the shard holds so far is not this test's.
+  drain_all(&mut client);
+  let held = RequestBody::Edit {
+    work,
+    path: "held".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: vec![0x5a; usize::try_from(chunk / HELD_EDIT_SHARE).unwrap()],
+  };
+  let resolution = slates_machine::clock::resolution_ns();
+  let (first, first_published) = client.publish(&held);
+  // Taken: the shard read the round's clock before it took the edit, and serves it now.
+  while client
+    .end
+    .region()
+    .cmd()
+    .depth(client.end.region().object())
+    .unwrap()
+    > 0
+  {
+    std::hint::spin_loop();
+  }
+  // Past the clock's own step, so a reading the shard took before the take cannot equal this publication's.
+  let taken_ns = slates_machine::clock::monotonic_ns();
+  while slates_machine::clock::monotonic_ns() <= taken_ns.saturating_add(resolution) {
+    std::hint::spin_loop();
+  }
+  let (second, second_published) = client.publish(&RequestBody::Versions { green });
+  let mut seen = Vec::new();
+  for _ in 0..2 {
+    let (request, reply) = client.take_reply();
+    seen.push((request, slates_machine::clock::monotonic_ns(), reply));
+  }
+  let batches = drain_all(&mut client);
+  for (id, published_ns) in [(first, first_published), (second, second_published)] {
+    let &(_, seen_ns, ref reply) = seen
+      .iter()
+      .find(|(request, _, _)| *request == id.word())
+      .unwrap_or_else(|| panic!("no reply to {id:?}"));
+    assert!(
+      !matches!(reply, ReplyBody::Refused { .. }),
+      "{id:?} was served: {reply:?}"
+    );
+    let rings: Vec<&SpanRecord> = spans_of(&batches, id)
+      .into_iter()
+      .filter(|(batch, span)| point_of(batch, span) == "ring.request")
+      .map(|(_, span)| span)
+      .collect();
+    assert_eq!(rings.len(), 1, "{id:?} has one ring span: {rings:?}");
+    let ring = rings[0];
+    println!(
+      "ringspan {id:?}: published {published_ns}, span {}..{}, seen {seen_ns} (edit {} bytes)",
+      ring.start_ns,
+      ring.end_ns,
+      chunk / HELD_EDIT_SHARE
+    );
+    assert!(
+      ring.start_ns >= published_ns,
+      "{id:?}'s ring span starts {} ns before the client published it",
+      published_ns - ring.start_ns
+    );
+    assert!(
+      ring.end_ns <= seen_ns,
+      "{id:?}'s ring span ends {} ns after the client saw its reply",
+      ring.end_ns - seen_ns
+    );
+  }
+  daemon.stop();
+}
+
+/// Every span the daemon's one shard holds, drained until it holds no more.
+fn drain_all(client: &mut Client) -> Vec<TelemetryReport> {
+  let mut batches = Vec::new();
+  loop {
+    let report = drain(client, 0);
+    let remaining = report.remaining;
+    batches.push(report);
+    if remaining == 0 {
+      return batches;
+    }
+  }
 }
 
 /// Shape: verbs between two acknowledgements in the overflow loop, so the completion records a client

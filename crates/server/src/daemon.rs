@@ -7982,8 +7982,8 @@ mod tests {
   /// Goal 93 item 2b(a) (main 01a20182's ruling of 2026-11-22 07:33: a region hold is a landed window's pin, and nothing
   /// tested it across a restart). Do: on a store-backed daemon, hold a window for the region on its shard
   /// (`homes::keep_for_region`) and publish the shard's image; stop the daemon and start its successor over the same
-  /// segment; on the shard, mark the window landed and ask to let it go landed, among this shard and a second whose
-  /// rendezvous ranks the window's home there (so only the restored region hold can pin it). Expect: the region hold
+  /// segment; on the shard, mark the window landed and ask to let it go landed (only the restored region hold can pin
+  /// it: where an identity ranks pins nothing, main 01a20182's ruling of 21:15). Expect: the region hold
   /// taken back (none refused), and the let-go refused `Pinned { by: "homes" }`, the window still held. Failing first:
   /// a restore that skipped the hold would leave the window unpinned, let go, its bytes lost to the region's readers.
   #[test]
@@ -8025,17 +8025,11 @@ mod tests {
     let shard = second.shards.first().copied();
     let answered = second
       .observe(shard, move |state| {
-        let here = state.shard;
-        // A second shard whose rendezvous ranks the window's home there: only the region hold can pin it.
-        let shards = (1..200u16)
-          .map(|other| vec![here, here.wrapping_add(other)])
-          .find(|shards| crate::vcs_store::homes::home_of(shards, &identity) != Some(here))
-          .unwrap();
         // The content store made by its first use, as a home's read makes it (`homes::read_here`): the restore of
         // the region holds the image carried runs there.
         let window = state.store.content.chunk_bytes();
         state.vcs_stores.content_made(window).unwrap();
-        let pin = crate::vcs_store::landed_pin(here, &shards, &identity);
+        let pin = crate::vcs_store::landed_pin(&identity);
         let refused = crate::vcs_store::within_budget(state, 0, |stores| {
           let content = stores.content_mut()?;
           content.mark_landed(&identity);
@@ -8218,7 +8212,6 @@ mod tests {
           .map(|at| u8::try_from(at % 239).unwrap())
           .collect();
         let len = u64::try_from(text.len()).unwrap();
-        let here = state.shard;
         let identity = crate::vcs_store::within_budget(state, len, |stores| {
           stores.content_mut().unwrap().put_object(&text).unwrap()
         });
@@ -8243,7 +8236,7 @@ mod tests {
               .iter()
               .map(|window| {
                 content.mark_landed(window);
-                content.let_go_landed(window, crate::vcs_store::landed_pin(here, &[here], window))
+                content.let_go_landed(window, crate::vcs_store::landed_pin(window))
               })
               .collect()
           });
@@ -8259,14 +8252,13 @@ mod tests {
       .observe(shard, move |state| {
         let window = state.store.content.chunk_bytes();
         state.vcs_stores.content_made(window).unwrap();
-        let here = state.shard;
         let restored: Vec<Option<crate::vcs_store::homes::Landed>> = read_windows
           .iter()
           .map(crate::vcs_store::homes::landed)
           .collect();
         let pinned = read_windows
           .iter()
-          .filter(|window| crate::vcs_store::landed_pin(here, &[here], window).is_some())
+          .filter(|window| crate::vcs_store::landed_pin(window).is_some())
           .count();
         let away = state.vcs_stores.content().map_or(0, |content| {
           read_windows

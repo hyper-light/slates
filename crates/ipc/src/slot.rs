@@ -137,8 +137,13 @@ impl Slot {
 /// The stamp a producer writes into the slot it pushes now (module docs, "The stamp"): the low 32 bits of the host's
 /// monotonic clock, with the lowest bit set.
 pub fn stamp_now() -> u32 {
-  u32::try_from(slates_machine::clock::monotonic_ns() & STAMP_BITS)
-    .map_or(u32::MAX, |low| low | STAMPED)
+  stamp_at(slates_machine::clock::monotonic_ns())
+}
+
+/// The stamp of a push at `ns` on the host's monotonic clock, for a producer that keeps that reading too
+/// ([`crate::DaemonEnd::reply`] returns it, so the reply's span ends where its slot says it landed).
+pub fn stamp_at(ns: u64) -> u32 {
+  u32::try_from(ns & STAMP_BITS).map_or(u32::MAX, |low| low | STAMPED)
 }
 
 /// When a slot stamped `stamp` landed, on the host's monotonic clock, given `by_ns`, a reading of that clock taken at
