@@ -558,3 +558,6 @@ Waiting: main's route; arena-7 and arena-8.
     within the quantum. Then measure the 56 MB tail's cut; main lands it with arena-16.
 - w-perf now takes the content arena's page rounding (a small-window slab; the 556 MB is 114,200 windows of about
   1,151 B, each on its own 4 KiB page).
+  - w-perf's two points: the Option<Merge> lives in the Intake beside Taker.fork, as a step kind run within
+    TakingIntake::slice's pacing (a refused or abandoned push drops it with the fork). I add the tiered rule in
+    crates/vcs/src/index.rs myself; w-perf stays in vfs/content.rs and arena_windows.rs.
