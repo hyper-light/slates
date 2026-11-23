@@ -336,7 +336,7 @@ fn changeset_of(manifest: &Node, files: &[&str], description: &str) -> Vec<u8> {
 
 /// A changegroup a test makes, in version 03: its changesets, manifests and file logs, each revision a full text.
 #[derive(Clone, Debug, Default)]
-struct Made3 {
+pub(super) struct Made3 {
   /// The changesets.
   changesets: Vec<Made>,
   /// The manifests.
@@ -349,7 +349,7 @@ struct Made3 {
 
 impl Made3 {
   /// One changeset on `parent` holding `files` (path, bytes, flag) whole, every file new or changed against nothing.
-  fn one(parent: &Node, files: &[(&str, &[u8], &str)]) -> (Made3, Node) {
+  pub(super) fn one(parent: &Node, files: &[(&str, &[u8], &str)]) -> (Made3, Node) {
     let mut made3 = Made3::default();
     let manifests: Vec<(&str, Node, &str)> = files
       .iter()
@@ -383,7 +383,7 @@ impl Made3 {
   }
 
   /// The changegroup's part, as a push carries it.
-  fn part(&self) -> ChangegroupPart {
+  pub(super) fn part(&self) -> ChangegroupPart {
     let data: Vec<Vec<u8>> = self.all().map(|made| full_text(&made.text)).collect();
     let mut revisions = Vec::new();
     let mut groups = Vec::new();
