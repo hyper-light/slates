@@ -96,7 +96,7 @@ fn filled(sealed: bool) -> Result<(ChunkStore, Vec<Extent>, u128), Box<dyn std::
   let mut sealing = 0u128;
   for index in 0..CONTENT / chunk {
     let off = u64::try_from(index.checked_mul(chunk).ok_or(VfsError::Invalid)?)?;
-    let mut open = store.open(off, chunk, Epoch(0), false)?;
+    let mut open = store.open(off, chunk, Epoch(0), (false, slates_mem::Owner::Volume))?;
     store.write_open(&mut open, 0, &plain)?;
     let started = Instant::now();
     let extent = store.seal(open, sealed.then_some(0))?;

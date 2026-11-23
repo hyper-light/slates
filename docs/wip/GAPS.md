@@ -975,6 +975,16 @@
 >   laid again in the newest. Held by `the_store_holds_the_walks_in_flight_not_the_reads_that_could_be_waiting` (red
 >   7,340,032 bytes reserved with room for 1,000 reads and no walk in flight; now 1,048,576) and
 >   `a_walk_in_flight_keeps_its_text_through_other_reads`. Owed: main's arena-14 on CI's runner.
+> - The content arena's allocations by owner BUILT (2026-11-23, w-perf; main 01a20182's order on arena-13, CI
+>   45193998198: 634 MB allocated, 373 MB of it named by no gauge). Every `ChunkArena` allocation and claim names its
+>   owner (`slates_mem::Owner`: a volume's file content, a repository's windows, the content hold), recorded at the
+>   block's head in a table each region makes when it is added, so the arena's hot path still allocates nothing.
+>   `mem.gauge.content.arena_<owner>_bytes` and `..._asked_bytes` (the asked bytes short of the held being the buddy's
+>   rounding) sum, with the deferred bytes, to mapped less free. Held by
+>   `every_block_has_an_owner_and_the_owners_sum_to_what_is_allocated` (`slates-mem`: 2,000 seeded steps of
+>   allocations, frees, trims and deferred frees against a model) and the memory status's test (the sum after a green's
+>   file is accepted). The greens' content is not in the arena (the merge engine's own heap), so arena-13's named part
+>   was 184 MB, not 260. Owed: main's arena-15 to name the rest.
 > - A Mercurial index's tail sealed by every append BUILT (2026-11-23, w-perf; w-hg's three conditions). Only an import
 >   sealed (`import::settle`), so a push's, a replay's and a made changeset's tail grew for the whole push: 56 MB of tail
 >   rows, two buffers each, still held at the end of Mercurial's push (`Index::admit` 34 MB, `table::encode_body` 22 MB).

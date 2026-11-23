@@ -220,13 +220,23 @@ impl ChunkWindows {
 
   /// `bytes` sealed as one chunk of the lent store: its extent and block.
   fn seal(&mut self, bytes: &[u8]) -> Result<Option<Placed>, slates_vfs::VfsError> {
-    let mut open = match self.chunks.open(0, bytes.len(), Epoch(0), false) {
+    let mut open = match self.chunks.open(
+      0,
+      bytes.len(),
+      Epoch(0),
+      (false, slates_mem::Owner::VcsWindows),
+    ) {
       Ok(open) => open,
       Err(_) => {
         // The arena holds no block for it: grown from its pool by the window, once; the lend's end extends the shard
         // budget by what was grown (`super::Lent`), as `Store::make_room` does.
         let _grown = self.chunks.arena_mut().grow(bytes.len());
-        self.chunks.open(0, bytes.len(), Epoch(0), false)?
+        self.chunks.open(
+          0,
+          bytes.len(),
+          Epoch(0),
+          (false, slates_mem::Owner::VcsWindows),
+        )?
       }
     };
     if let Err(refused) = self.chunks.write_open(&mut open, 0, bytes) {
@@ -314,7 +324,11 @@ impl ChunkWindows {
           return Err(PieceRefused::Malformed);
         }
         let claimed = chunks
-          .claim_chunk_blocks(region, (offset, block), used)
+          .claim_chunk_blocks(
+            region,
+            (offset, block),
+            (used, slates_mem::Owner::VcsWindows),
+          )
           .map_err(|_| PieceRefused::Unclaimable)?;
         let adopted = chunks.adopt_chunk(
           Chunk {
