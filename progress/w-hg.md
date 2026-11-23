@@ -426,3 +426,11 @@ Landed a71609a9f:
   changeset (bookkeeping kept to the push's end): the next piece's red ("held equal within a segment").
 Waiting: arena-5 VmHWM. If the bookkeeping is next: bound it by the segment (FileContents list, awaited, brought,
 positions, manifest_of, Intaken), so held is equal within a segment.
+
+## 2026-11-23 ~05:00 PST (w-hg, arena-5 CI 45127535742: peak 2.1 GB, floor 1.73 GB mostly allocator retention, 57 GB churn)
+Landed 4eeb99b67 (piece 1dc65ad07): a push's churn per changeset is one manifest copy (was 3.20 at a 91 KB manifest).
+kept_as is given the text (append_revisions_after's `given`); encode_lines walks by cursors. Test:
+crates/hg/tests/push_heap.rs (LargeMapped plus an arena storage like the daemon's; heap() readings' own cost taken off).
+Gotchas for the next person: heap() allocates a residency buffer for every mapped block; HeapWindows puts windows on the
+system heap, the daemon's arena does not.
+Next: the x86 348 ms single step (wrote=43); branchmap whole 155 ms cpu (x86) later.
