@@ -625,3 +625,10 @@
   Re-lift reds ignored. SSH room wait: red exit 128 -> 0, answered_again counted. NEXT behind the guard, red first:
   tree_of brings back; shallow fetch path (main sends the verbs request); sweep stored-object reads in receive/upload;
   the HTTP stall with the let-go on and a publication owed past its bound.
+
+- 2026-11-23: TAG PEEL FIXED 6eae9f8bb (merge 1d7fd0ec4): Verdicts::prepare answers not ready where the new value's
+  peel fails and the repository names a let-go window; the driver brings it back; the same window twice ends typed.
+  Red at the session: verbs on the six-commit dataset with the lift on locally failed push-tag-of-a-tag, delete-tags
+  and two refs rows; all pass after (118 s). Guard stays in. Unit red owed. Shallow fetch: request for main in
+  inbox/main-from-w-git-shallow-lift.md (verbs over git/git with the lift on in a round worktree). HTTP stall: held
+  until main's r108 bisect or w-shared's r8 names the commit.
