@@ -26324,7 +26324,9 @@ A plain debug build on adacachy2 (db3ddff02) sorted the reds:
   daemon's sweep walks its write log and journal whole, 47.5 million pages in 104 s on adacachy2; **fixed**, the test
   reads the arena's held runs from the memory report's kinds, which a sweep passed 5.2 ms after the first memory
   request), and
-  `a_shards_start_holds_each_heavy_piece_in_a_slice_of_its_own` (8 heavy pieces in one slice); ipc's
+  `a_shards_start_holds_each_heavy_piece_in_a_slice_of_its_own` (8 heavy pieces in one slice; **fixed**, a heavy
+  piece ends its slice whatever the yields have cost,
+  `docs/bugs/2026-11-23-a-starts-heavy-pieces-ran-in-one-slice-where-yields-cost-more.md`); ipc's
   `a_reply_sent_before_the_client_blocked_teaches_its_wake_nothing` (4 of 5,341 parks that never switched out taught a
   wake: Linux trusts `futex_wake`'s count, which counts a waiter woken before it blocked).
 - **Timing-dependent on Linux.** daemon's `a_metadata_class_bounds_the_volume_records_a_shard_admits` judged the bytes
