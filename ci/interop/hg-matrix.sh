@@ -114,13 +114,13 @@ else
 row push-all "${HG[@]}" -R "$SOURCE" push "${PUSH[@]}" "$URL"
 # DIAG (diag branch only; w-hg's ask, main 01a20182 2026-11-22 11:16): what holds the daemon's memory right after
 # push-all, before any later row can spin and restart it.
-s status --json >"$WORK/status-after-push.json" 2>"$WORK/status-after-push.err" ||
+s status --json --memory >"$WORK/status-after-push.json" 2>"$WORK/status-after-push.err" ||
   echo "DIAG status after push failed: $(head -3 "$WORK/status-after-push.err")"
 # DIAG (diag branch only): stop here when asked, so the read after push-all doesn't wait on rows that still spin.
 if [ "${DIAG_STOP_AFTER_PUSH:-0}" = 1 ]; then
   printf '%s\n' "---- stopped after push-all (DIAG_STOP_AFTER_PUSH)" "${ROWS[@]}"
   echo "daemon peak RSS over every row: $((RUN_PEAK_KIB / 1024)) MiB"
-  s status --json >"$WORK/status.json" 2>/dev/null || true
+  s status --json --memory >"$WORK/status.json" 2>/dev/null || true
   exit 0
 fi
 fi
@@ -157,7 +157,7 @@ row ssh-push bash -c "${HG[*]} clone -q a f && cd f && echo ssh >ssh.txt && ${HG
   && ${HG[*]} push -r . $SSHURL"
 
 # DIAG (diag branch only): the daemon's status, its shards' counters with it, while the anchor still runs.
-s status --json >"$WORK/status.json" 2>"$WORK/status.err" || echo "DIAG status failed: $(head -3 "$WORK/status.err")"
+s status --json --memory >"$WORK/status.json" 2>"$WORK/status.err" || echo "DIAG status failed: $(head -3 "$WORK/status.err")"
 echo "---- summary ($(printf '%s\n' "${ROWS[@]}" | grep -c '^PASS') of ${#ROWS[@]} passed)"
 echo "daemon peak RSS over every row: $((RUN_PEAK_KIB / 1024)) MiB"
 printf '%s\n' "${ROWS[@]}"
