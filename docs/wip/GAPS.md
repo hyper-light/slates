@@ -26324,3 +26324,26 @@ itself was whole on every node. Not worked by w-forming (Ada's close order); whe
   1256052866610850298, 5939796479076166087, 10263252121351842258, 17757241901296347647, 8389754676365715562 and two fresh
   draws is kiln run r19 (`SEEDS=... NEMESIS_RUNS=2 NEMESIS_ONLY=1 bash .git/w-forming-ab/c3.sh`). Seed
   10263252121351842258's forwarding stall is the separate entry above.
+
+### 2026-11-23: the TSan lane's server reds were mostly plain-Linux reds — open (w-tsan, main 01a20182's order)
+CI's ThreadSanitizer lane failed on main with no race reported (run 45235122249 at 62d22aefe, job 137905802399; and
+45228216366, 45217887083, 45210822121, 45203217471). CI's `gates` job stopped at fmt or clippy in every main run checked
+back to 11-22 14:31 (22 runs), so the TSan lane was the only Linux lane that ran the server's daemon and recovery suites.
+A plain debug build on adacachy2 (db3ddff02) sorted the reds:
+- **Plain-Linux reds.** recovery's `a_shard_is_refused_while_another_holds_the_pool_and_admitted_once_it_returns` (the
+  test's fixed 1.25-slice volume left room since A-848's best-fit claims; **fixed**, sized by the refusal's own
+  `available`), `a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone` (a released extent kept its pages in
+  Linux's memfd; **fixed**, `docs/bugs/2026-11-23-a-released-pool-extent-kept-its-pages-in-the-linux-content-object.md`),
+  `a_burst_leaves_nothing_resident_behind_it_but_its_data` (no sweep completed within the test's 10 s), and
+  `a_shards_start_holds_each_heavy_piece_in_a_slice_of_its_own` (8 heavy pieces in one slice); ipc's
+  `a_reply_sent_before_the_client_blocked_teaches_its_wake_nothing` (4 of 5,341 parks that never switched out taught a
+  wake: Linux trusts `futex_wake`'s count, which counts a waiter woken before it blocked).
+- **Timing-dependent on Linux.** daemon's `a_metadata_class_bounds_the_volume_records_a_shard_admits` judged the bytes
+  left against the claimed capacity, which a publication's give-back trims to the demand (A-853): 6 of 10.5 MiB failed on
+  CI, 6 of 12.5 passed here. **Fixed:** judged against the shard's slice, read after a publication.
+- **One poll past the budget.** `git_push::tests::t_a850_r16_a_history_and_its_tags_pushed_whole_into_an_empty_repository_bring_each_object_once`
+  held the control shard 1,540 ms in one poll here (the daemon's near-miss line); under TSan the watchdog ended the
+  library's test process at it (exit 4), so about 1,000 of its 1,247 tests never ran.
+- **TSan only (green here).** `content_ranges::tests::a_sweep_on_its_step_clock_settles_at_steps_its_fixed_cost_amortizes`
+  (1 of 3 TSan runs) and `git_push::tests::t_a614a_a_long_historys_derivation_takes_turns_by_the_shards_pace_not_its_objects`
+  (2 of 3; 1 turn in 21 ms here).
