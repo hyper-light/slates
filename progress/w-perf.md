@@ -494,3 +494,13 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     merge_step, size-tiered, run count bound in a Derived: line; red: runs walked per lookup under the bound over a
     long push, and one segment step within the quantum. Tell w-hg before touching crates/hg/src/index.rs.
   - Waiting: arena-15 (main) on 45de607e7.
+- 2026-11-23 ~16:30 PST:
+  - arena-15 (CI 45224166925): push-all OK; RSS 1,220 MB; vcs_windows 556,367,872 held for 131,425,429 window bytes
+    (114,200 windows: page rounding); content_hold 77.6 MB; deferred 11.4 MB.
+  - Seal reland moved to w-hg (design sent).
+  - LANDED bbd4693c2 (merge 4fc8b519c): ChunkArena::alloc_asking; the chunk store asks the caller's raw length, so
+    asked vs held names the rounding. Red: 16,384 asked of 16,384 for four 100-byte windows; now 400.
+  - The 57k tagged run finished (~/.cache/w-perf/hg-lifetimes-split.log), for (3).
+  - Next (main's order): (2) small-window slab in arena_windows.rs (w-shared's conditions a-f; main's: vcs only, a
+    Derived: class line, red on N small windows' held bytes, read-back oracle through let-go/bring-back/purge); then
+    (3) ContentStore::insert_new's 24 MB. Main runs arena-16 after (2).
