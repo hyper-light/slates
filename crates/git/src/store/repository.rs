@@ -288,6 +288,10 @@ pub(super) struct Kept {
   pub(super) references: Positions,
   pub(super) offsets: u64,
   pub(super) order: Vec<u32>,
+  /// The runs `positions` and `references` hold together, counted once as the part is kept: what its sets cost the
+  /// budget, read for every kept part each time a repository's holding is weighed (main 01a20182's r100: git/git's work
+  /// clone spent 85% of its shard counting them again, a set's runs walked whole each turn of its encoding ahead).
+  pub(super) runs: usize,
 }
 
 /// A version's two fragments, or a base pack's two parts: commits, trees and tags, then blobs.
@@ -326,11 +330,9 @@ impl Chain {
   /// What the chain charges the budget: its records and its kept parts' runs. Its versions' sets are their values'
   /// bytes, which the content store charges as it keeps them (A-647 part 3).
   fn footprint(&self) -> u64 {
-    let runs = self.kept().fold(0_usize, |runs, kept| {
-      runs
-        .saturating_add(kept.positions.runs())
-        .saturating_add(kept.references.runs())
-    });
+    let runs = self
+      .kept()
+      .fold(0_usize, |runs, kept| runs.saturating_add(kept.runs));
     let records = bytes(self.versions.len(), VERSION_BYTES).saturating_add(bytes(runs, RUN_BYTES));
     records.saturating_add(bytes(
       self.placed(),
@@ -2181,6 +2183,7 @@ fn keep(((bytes, placed), content): (fragment::Encoded, ContentId)) -> Result<Ke
     .iter()
     .filter(|entry| entry.stored == Stored::Offset)
     .count();
+  let runs = positions.runs().saturating_add(references.runs());
   Ok(Kept {
     content,
     len: to_u64(bytes.len()),
@@ -2189,6 +2192,7 @@ fn keep(((bytes, placed), content): (fragment::Encoded, ContentId)) -> Result<Ke
     references,
     offsets: to_u64(offsets),
     order,
+    runs,
   })
 }
 
@@ -2366,7 +2370,7 @@ impl Repository {
               .into_iter()
               .map(|kept| {
                 let content = store.len_of(&kept.content).unwrap_or(0);
-                let runs = kept.positions.runs().saturating_add(kept.references.runs());
+                let runs = kept.runs;
                 content
                   .saturating_add(bytes(
                     kept.placed.len(),

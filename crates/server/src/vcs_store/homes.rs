@@ -841,22 +841,47 @@ pub(crate) const LANDED_HOME_LET_GO_BYTES: &str = "vcs_store.homes.landed_let_go
 pub(crate) const LANDED_BROUGHT_BACK: &str = "vcs_store.homes.landed_brought_back";
 
 /// Brings back the window or object `identity` this shard holds, each of its windows let go read where its record says
-/// it lies on the node's store ([`LandedAt`]), a piece at a time off the shard's step, then put back by its identity within
-/// the step's lent room. True where it is held here whole after (brought back, or never let go).
+/// it lies on the node's store ([`Landed`]): a landed pack's window ([`LandedAt`]) a piece at a time off the shard's
+/// step, then put back by its identity within the step's lent room; a Mercurial file revision's ([`HgLanded`]) by its
+/// repository's reader (`repository::hg_push::bring_back`), once for each revision however many of the object's windows
+/// it holds. True where it is held here whole after (brought back, or never let go).
 pub(crate) async fn bring_back_landed(identity: ContentId) -> bool {
-  let (disk, away) = crate::state::with_state(|state| {
-    let away: Vec<(ContentId, LandedAt, u64)> =
-      state.vcs_stores.content().map_or_else(Vec::new, |content| {
-        content
-          .object_layout(&identity)
-          .into_iter()
-          .filter(|(window, _)| content.is_away(window))
-          .filter_map(|(window, _)| Some((window, landed_at(&window)?, content.len_of(&window)?)))
-          .collect()
-      });
-    (state.vcs_disk.clone(), away)
+  let (disk, (away, revisions)) = crate::state::with_state(|state| {
+    let mut away: Vec<(ContentId, LandedAt, u64)> = Vec::new();
+    let mut revisions: Vec<HgLanded> = Vec::new();
+    if let Some(content) = state.vcs_stores.content() {
+      for (window, _) in content.object_layout(&identity) {
+        if !content.is_away(&window) {
+          continue;
+        }
+        match landed(&window) {
+          Some(Landed::Pack(at)) => {
+            if let Some(len) = content.len_of(&window) {
+              away.push((window, at, len));
+            }
+          }
+          Some(Landed::Hg(revision)) => {
+            if !revisions.contains(&revision) {
+              revisions.push(revision);
+            }
+          }
+          None => {}
+        }
+      }
+    }
+    (state.vcs_disk.clone(), (away, revisions))
   })
   .unwrap_or_default();
+  for revision in revisions {
+    let HgLanded {
+      repository,
+      path,
+      node,
+    } = revision;
+    if !crate::repository::hg_push::bring_back(repository, (path, node)).await {
+      return false;
+    }
+  }
   if let Some(disk) = disk {
     for (window, at, len) in away {
       let Some(bytes) = landed_bytes(&disk, at, len).await else {

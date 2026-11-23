@@ -25,6 +25,29 @@ use crate::out::{Measure, Out};
 use crate::read::to_u64;
 use crate::{NULL_NODE, Node};
 
+/// A file revision as the content store keeps it (goal 93 item 2b(b)): its path and node, and the identities its bytes
+/// and its metadata block are kept as. What a push's or an import's segment carries for each file revision it holds
+/// (`crate::push::intake::PushSegment::contents`, `crate::import::emit::Segment::contents`), so its owner lets its
+/// windows go once landed and notes, for a home that reads one by its identity alone, the revision that brings it back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileContents {
+  /// The file's path.
+  pub path: Vec<u8>,
+  /// The revision's node.
+  pub node: Node,
+  /// The identity its bytes are kept as.
+  pub bytes: slates_vcs::ContentId,
+  /// The identity its metadata block is kept as, where it has one.
+  pub block: Option<slates_vcs::ContentId>,
+}
+
+impl FileContents {
+  /// The identities it is kept as: its bytes', then its block's.
+  pub fn identities(&self) -> impl Iterator<Item = &slates_vcs::ContentId> {
+    core::iter::once(&self.bytes).chain(self.block.as_ref())
+  }
+}
+
 /// Format: the bytes that open and close a metadata block (`\x01\n`).
 pub const MARKER: &[u8] = b"\x01\n";
 
