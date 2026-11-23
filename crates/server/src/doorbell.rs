@@ -5,8 +5,12 @@
 //! Shutdown wakes and joins it. Linux clients write eventfds directly, and the control shard
 //! awaits rendezvous readiness through its driver, so Linux starts no watcher thread.
 //!
-//! **Whether it runs in macOS's real-time band (A-868).** The thread reports, once at its start, whether it holds Mach's
-//! time-constraint policy ([`DoorbellThread::real_time`]), which the daemon exposes.
+//! **In macOS's real-time band (A-868).** A latency-tracking daemon's doorbell thread asks for Mach's time-constraint
+//! policy at its start, from the daemon's idle window, as its shards and a client's reply wait do (A-831,
+//! `slates_machine::time_constraint`). It is on the wake path of every request to a parked shard, and it ran time-share:
+//! beside two spinners a CPU on CI's macos-latest, "rung -> bell thread woke" measured 0.48-2.95 ms at the median of the
+//! p99 tail and 5.76-23.5 ms in the p999 tail, while every other hop took microseconds (run 45091701553, its stamped
+//! rounds). The thread reports whether it holds the policy ([`DoorbellThread::real_time`]), which the daemon exposes.
 //!
 //! **Only the shard rung is kicked (A-381).** Until 2026-11-18 each ring kicked every shard: at 1,000 clients over 23
 //! shards on a Mac Studio each shard parked and woke about 7,500 times a second whatever its own clients asked (a
@@ -45,18 +49,28 @@ impl std::fmt::Debug for DoorbellThread {
 impl DoorbellThread {
   /// Starts the thread: it waits on `waiter` and, each time the doorbell rings, kicks the shards the rings marked, each
   /// found in `kicks` by its id (the control shard first); a claim's ring sets `rang` and kicks the control shard.
-  /// `waker` is a second handle on the same doorbell, rung by [`Self::stop`].
+  /// `waker` is a second handle on the same doorbell, rung by [`Self::stop`]. A daemon that tracks its wake passes its idle
+  /// window as `real_time_window_ns`, and the thread asks macOS's real-time band from it (A-868); `None` asks nothing.
   pub fn start(
     waiter: DoorbellWaiter,
     waker: DoorbellWaiter,
     kicks: Vec<(u16, Kick)>,
     rang: &'static AtomicBool,
+    real_time_window_ns: Option<u64>,
   ) -> Result<DoorbellThread, slates_ipc::IpcError> {
     let (stop, stop_signal) = channel();
     let (held, held_signal) = std::sync::mpsc::sync_channel(1);
     let handle = std::thread::Builder::new()
       .name("slates-doorbell".to_owned())
       .spawn(move || {
+        if let Some(window_ns) = real_time_window_ns
+          && cfg!(target_os = "macos")
+          && slates_machine::time_constraint::set_current_from(window_ns).is_none()
+        {
+          slates_machine::log_line!(
+            "slates-server: the doorbell thread runs time-share: the kernel took no time-constraint policy from {window_ns} ns"
+          );
+        }
         if held.send(slates_machine::time_constraint::holds()).is_err() {
           slates_machine::log_line!(
             "slates-server: the doorbell thread's policy went unreported: its starter was gone"

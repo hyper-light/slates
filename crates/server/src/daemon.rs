@@ -1217,6 +1217,12 @@ impl Daemon {
         waker,
         kicks,
         doorbell_flag(shards.first().map_or(0, |shard| shard.0)),
+        // On a parked shard's wake path, so in the band its shards run in (A-868, A-831).
+        config
+          .runtime
+          .wake_tracking
+          .is_some()
+          .then_some(config.runtime.spin_ns),
       )?),
       _ => None,
     };
