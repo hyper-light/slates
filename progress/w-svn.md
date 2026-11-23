@@ -694,3 +694,15 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
   work_files, owner_files/page, checkout, refining, landing, mounted_work, git/hg/svn_made); async bring-back at each
   caller; bridges NFS/FUSE/WinFsp park tables; reds (mount read + work read after text left the green, with window let
   go; work editing named file).
+- 2026-11-23 evening: main ruled (B): a landed text's windows go once durable (let_go_landed_texts in every svn
+  landing + import batch), counted both sides; P3's test asserts "no window resident" + holders==1 + named_bytes_held==0
+  (contains() changed meaning; doc says why). Built: bring_back_range (svn texts by repository via disk.text, else
+  read_through), ReadPin pins honoured by landed_pin; call-scoped away notes (away_scope/note_if_away) at GreenTree,
+  page_of/whole_of, lend reads; NFS serve_local_parked (table nfs_parked, bound = held connections); FUSE park via
+  bridge-fuse dispatch_kept + Dispatched::into_request (one a mount); WinFsp park via Request::kept/refuse_io (one a
+  mount); verb-level park in run_recorded (reads + submit, unrecorded, resume_all over pins, bound = clients slots);
+  refining copy_step retries over brought-back windows (no lost error). Engine: keeps_base/apply_over (whole replace
+  needs base length only), digest fast paths in differing_spans/lands_on_head, copied_edit/effect_of.
+- FUSE (linux) and WinFsp (windows) compile unchecked locally (no cross C toolchain): main to run platform checks.
+- Server svn focused: down to 4 failures; reds written: a_work_over_a_subversion_green_reads_and_edits_a_named_text_
+  its_windows_let_go, a_mount_read_of_a_named_text_let_go_is_noted_brought_back_and_read_again.
