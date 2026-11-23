@@ -141,6 +141,11 @@ fn wake_due_tasks(state: &mut ShardState, now: u64) {
     if let Some(sweeper) = state.idle_sweeper {
       slates_rt::registry::wake(sweeper.0);
     }
+    // Test support: the idle sweep tests' poller, woken beside each pass (`idle_sweep::TEST_POLLER`).
+    #[cfg(test)]
+    if let Some(poller) = crate::idle_sweep::TEST_POLLER.with(std::cell::Cell::get) {
+      slates_rt::registry::wake(poller.0);
+    }
   }
   // A refused destroy record's retry: the serve loop steps destroys, so it is woken to (`verbs::step_destroys`).
   if state.destroy_retry_at.is_some_and(|at| at <= now) {
