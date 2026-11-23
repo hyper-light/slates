@@ -652,3 +652,9 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
   (recovery) and bring_whole (bring_back_named_live); green_adopt::readopt_with. Red: a_readopted_green_brings_back_...
   End to end unreachable until A-727 (d) (w-shared's; told the entry points).
 - NEXT: piece 4a (identity digest), under main's ruling (I).
+- Helpers lifted to test_store (for w-shared's A-727 (d) fleet reds): eaf17a862.
+## A-873 LANDED 75250d9c3 (merge 9dbc985dc): A-760 (b) piece 4a, identity entry hashes a file's digest
+- Block keeps plain BLAKE3 digest (named: identity hash); entries from blocks; history/old bytes hashed as read;
+  scratch oracle hashes bytes. Goldens: tests/identity.golden + ignored writer + determinism gate; named == carried.
+- Anchor layout 19 refuses 18 typed. Side finding withdrawn: object_id is plain BLAKE3 at every length (doc fixed).
+- NEXT: 4b (one read seam Bytes|Named), w-git and w-hg told first.
