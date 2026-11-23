@@ -727,6 +727,14 @@
 >   The test-only one-call landing builds a push's works as the driver does, planned and then built over the
 >   store's read-through (`works_whole`); `Works::Whole` and the one-call `tree::work` arm are gone, and `prepare` takes
 >   the view alone. The store-made-texts oracle compares a file by the identities its row names.
+> - Changeset evolution served OPEN, the next completeness item (2026-11-23, main's ruling: a complete hg server serves
+>   what a modern client sends, obsolescence markers among it). No matrix row reaches it today: `ci/interop/hg-matrix.sh`'s
+>   hgrc enables `rebase` alone, with no `experimental.evolution`, so `rebase-push` strips locally and pushes no marker;
+>   every push lands public; no row imports. Wanted: an evolution-enabled row (a client with `experimental.evolution`
+>   pushing an amend and a rebase, their markers exchanged), the hidden view served as 7.2 serves it (the changesets the
+>   markers obsolete left out), and the branch heads of such a view kept rather than walked
+>   (`discovery::walked_branch_head_revs`, the one view the kept heads do not answer for, below). After arena-6's and
+>   arena-7's reads, unless they name a memory or time item first.
 > - Branch heads kept as changesets land BUILT (2026-11-23, w-hg; main's ruling (b) on CI 45127535742: a `lookup` of a
 >   branch name ran one 348 ms step on x86, wrote 43 bytes, `branch_tip` scanning every revision's branch and then
 >   `branch_head_revs` walking the whole history, as `branchmap` whole did, 155-161 ms CPU a call). `HgIndex` keeps
