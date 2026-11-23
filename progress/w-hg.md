@@ -508,3 +508,7 @@ Waiting: main's route; arena-7 and arena-8.
 - Pre-existing failure on main (w-svn's), reported to main: svn_commit
   a_revision_refused_at_publication_leaves_the_green_where_the_log_is_and_the_next_lands.
 - Next: lookup's 91 ms `prefixed` begin (a node-prefix index, or the lookup's own slices).
+- Landed d55c060b3: a node prefix's lookup is read by node from the index (HgIndex::changesets_prefixed), with no
+  hex walk. Oracle against the walk; at most 8 reads.
+- Queue clear. Next: changeset evolution (an evolution row, the hidden view, its kept heads), unless arena-10 names a
+  memory item.
