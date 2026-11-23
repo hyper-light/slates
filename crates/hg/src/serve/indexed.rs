@@ -485,6 +485,10 @@ impl Indexed<'_> {
 }
 
 impl Store for Indexed<'_> {
+  fn rows_a_step(&self) -> u64 {
+    crate::render::rows_a_step(self.store)
+  }
+
   fn changeset_text(
     &self,
     rev: Rev,
