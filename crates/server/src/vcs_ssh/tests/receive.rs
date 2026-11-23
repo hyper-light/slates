@@ -425,6 +425,128 @@ fn a_long_fetchs_answer_over_ssh_is_kept_alive_with_gits_keepalive_while_its_pac
   );
 }
 
+/// Goal 93 item 2b, lifted again (main 01a20182's r165 on git/git with the first lift: `clone`, `clone-ssh` and
+/// `shallow` all read "possible repository corruption on the remote side", the `Unreadable` reaching the SSH edge and
+/// the shallow path). Do: on an audit daemon's shard, serve the SSH edge with the production site; push over SSH a
+/// create of `main` at a commit whose one file is `vcs_http::daemon_edge_tests::LET_GO_FILE` bytes, a pack of many
+/// windows; with nothing let go by hand, wait until the shard counts landed bytes let go (by the commit's own let-go, or
+/// first by the pack's home there); then clone `main` over SSH at protocol v2, whole and one commit deep. Expect: the
+/// push exits 0; bytes let go; both clones exit 0, each pack the push's three objects, each the pushed bytes. Red with the
+/// guard (`vcs_store::LANDED_LET_GO` false): nothing let go.
+#[test]
+fn a_pushed_pack_let_go_by_its_commit_is_cloned_whole_and_shallow_over_ssh() {
+  use crate::vcs_http::daemon_edge_tests::{
+    LET_GO_FILE, fetch_of, fetched_pack, fetched_pack_after, large_create, objects_of,
+    packets_from, shallow_fetch_of,
+  };
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (_, address, _) = observe_first(&daemon, |state| {
+    serving_within(state, ROOM, GIT_KEEPALIVE_NS)
+  });
+  let (request, commit) = large_create(LET_GO_FILE);
+  let pushed = pushed_patiently(address, &request);
+  let let_go_bytes = || {
+    observe_first(&daemon, |state| {
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      count(crate::vcs_store::LANDED_LET_GO_BYTES)
+        + count(crate::vcs_store::homes::LANDED_HOME_LET_GO_BYTES)
+    })
+  };
+  let waited = std::time::Instant::now();
+  while let_go_bytes() == 0 && waited.elapsed() < std::time::Duration::from_secs(10) {
+    std::thread::sleep(std::time::Duration::from_millis(20));
+  }
+  let let_go = let_go_bytes();
+  let cloned = fetched_adjusting(address, &fetch_of(commit));
+  let shallow = fetched_adjusting(address, &shallow_fetch_of(commit));
+  daemon.stop();
+  assert_eq!(pushed.map(|transcript| transcript.status), Some(Some(0)));
+  assert!(
+    let_go > 0,
+    "the push's commit let its landed pack go: {let_go} bytes"
+  );
+  let (_, commands_end) = packets_from(&request, 0);
+  let pushed_objects = objects_of(request.get(commands_end..).expect("the push's pack"));
+  for (what, fetched, pack_of) in [
+    ("clone", cloned, fetched_pack as fn(&[u8]) -> Vec<u8>),
+    ("shallow clone", shallow, fetched_pack_after),
+  ] {
+    let fetched = fetched.unwrap_or_else(|| panic!("the {what}'s session"));
+    assert_eq!(
+      fetched.status,
+      Some(0),
+      "the {what}: {}",
+      String::from_utf8_lossy(&fetched.err)
+    );
+    let (_, advertised_end) = packets_from(&fetched.out, 0);
+    let answer = fetched.out.get(advertised_end..).unwrap_or_default();
+    assert_eq!(
+      objects_of(&pack_of(answer)),
+      pushed_objects,
+      "the {what} whole, each object the pushed bytes"
+    );
+  }
+}
+
+/// [`fetched_over_ssh`], read as OpenSSH's client reads: the channel's window given back
+/// (`SSH_MSG_CHANNEL_WINDOW_ADJUST`) once half of it is read, so an answer past [`CLIENT_WINDOW`] is read whole (as
+/// `vcs_ssh::tests::hg`'s `transcript_adjusting` reads).
+fn fetched_adjusting(address: SocketAddrV4, request: &[u8]) -> Option<Transcript> {
+  let mut peer = Peer::connect_patient(address)?;
+  (query(&mut peer, &HELD_SEED)? == 60).then_some(())?;
+  (sign(&mut peer, &HELD_SEED)? == 52).then_some(())?;
+  exec_command(&mut peer, Some(b"version=2"), b"git-upload-pack '/pushed'").then_some(())?;
+  for piece in request.chunks(PIECE) {
+    send_data(&mut peer, piece);
+  }
+  send_data(&mut peer, b"0000");
+  let mut transcript = Transcript::default();
+  let mut unadjusted: u32 = 0;
+  while let Some(message) = peer.next(&[94, 95, 96, 97, 98]) {
+    let number = message[0];
+    if transcript.order.last() != Some(&number) {
+      transcript.order.push(number);
+    }
+    let string = |at: usize| {
+      let len = u32::from_be_bytes(message[at..at + 4].try_into().expect("a length")) as usize;
+      message[at + 4..at + 4 + len].to_vec()
+    };
+    match number {
+      94 | 95 => {
+        let data = if number == 94 { string(5) } else { string(9) };
+        if number == 94 {
+          transcript.out.extend_from_slice(&data);
+        } else {
+          transcript.err.extend_from_slice(&data);
+        }
+        unadjusted += u32::try_from(data.len()).unwrap();
+        if unadjusted >= CLIENT_WINDOW / 2 {
+          let mut adjust = vec![93];
+          adjust.extend_from_slice(&peer.channel.to_be_bytes());
+          adjust.extend_from_slice(&unadjusted.to_be_bytes());
+          peer.send(&adjust);
+          unadjusted = 0;
+        }
+      }
+      98 if string(5) == b"exit-status" => {
+        let at = 5 + 4 + b"exit-status".len() + 1;
+        transcript.status = Some(u32::from_be_bytes(
+          message[at..at + 4].try_into().expect("four bytes"),
+        ));
+      }
+      97 => {
+        let mut close = vec![97];
+        close.extend_from_slice(&peer.channel.to_be_bytes());
+        peer.send(&close);
+        transcript.ended = peer.ended();
+        break;
+      }
+      _ => {}
+    }
+  }
+  Some(transcript)
+}
+
 /// [`pushed_over_ssh`] at protocol v0, its client patient: it waits for the push's answer while the session is open,
 /// however long the push's work takes on a loaded machine (`Peer::connect_patient`).
 fn pushed_patiently(address: SocketAddrV4, request: &[u8]) -> Option<Transcript> {
