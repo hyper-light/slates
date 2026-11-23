@@ -586,3 +586,12 @@
   warm_restarts and svn_commit a_revision_refused_at_publication. Lint split packed.rs:628 50dd194b6.
   NEXT: main's r144 (lfs_row, verbs deepen row, git/git whole) and the lift's round; GAPS owed: SSH edge's link-price
   writes, a price per client.
+
+- 2026-11-23: LIFT REVERTED 5d9e81984 (main's r165: git/git mirror clone after the push refused
+  Pack(Store(Unreadable)) at 16,270,345 bytes, deterministic). CAUSE FIXED 0c3f42cea (merge 9ea044028): the fetch
+  stream's reads of an object where it lies (read_stored: made-whole entry, encoded afresh, delta check, search read)
+  refused a let-go window mid-pack; Upload::read_or_stop stops the turn and retakes the unit. Reds over the ofs fixture,
+  every window let go: made-whole (Unreadable at 0 stops before), encoded-afresh (after 5). Guard still in; re-lift is
+  main's call after a round. Owed: encoding's Reading::read_window (no red yet); the push-end let-go is one unsliced
+  step in ReceivePack's drop (r165 push 25-69% slower with the lift; main to time). SSH link price built, parked
+  (~/.cache/w-git-ssh-paced.patch) pending w-svn's yes on the svn.rs EitherCommand forward.
