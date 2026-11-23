@@ -108,6 +108,8 @@ pub struct ClientEnd {
   parks: u64,
   /// Its synchronous reply wait's parks under an asked EEVDF slice, and those it skipped ([`SlicedParks`], 84a's arm E).
   sliced_parks: SlicedParks,
+  /// Its synchronous requests pinned to the shard's CPU, and those skipped ([`PinnedRequests`], 84a's arm F).
+  pinned_requests: PinnedRequests,
   /// Replies taken.
   replies: u64,
   /// Parks a wake ended with no reply in the ring — a spurious return from the OS wait, or a previous
@@ -204,6 +206,7 @@ impl ClientEnd {
       request_stamp: 0,
       parks: 0,
       sliced_parks: SlicedParks::default(),
+      pinned_requests: PinnedRequests::default(),
       replies: 0,
       unanswered_wakes: 0,
       parks_ended_by_looks: 0,
@@ -1340,6 +1343,7 @@ impl DaemonEnd {
 
   /// Writes a reply and wakes the client if it parked.
   pub fn reply(&mut self, slot: &Slot) -> Result<(), IpcError> {
+    self.publish_shard_cpu()?;
     let cpl = self.region.cpl();
     cpl.push(
       self.region.object_mut(),
@@ -2297,6 +2301,92 @@ mod tests {
   }
 }
 
+impl DaemonEnd {
+  /// Publishes the CPU this reply is written on (plus one), so the client's next synchronous request waits on it (84a's
+  /// arm F, `slates_machine::request_pin`). Written only when it changed: a pinned shard writes it once.
+  fn publish_shard_cpu(&self) -> Result<(), IpcError> {
+    if let Some(cpu) = slates_machine::request_pin::current_cpu() {
+      let published = u32::try_from(cpu)
+        .ok()
+        .and_then(|cpu| cpu.checked_add(1))
+        .unwrap_or(0);
+      let word = self.region.shard_cpu()?;
+      if word.load(Ordering::Relaxed) != published {
+        word.store(published, Ordering::Relaxed);
+      }
+    }
+    Ok(())
+  }
+}
+
+/// A client's synchronous requests pinned to its shard's CPU, and those that were not (84a's arm F,
+/// `slates_machine::request_pin`). Elsewhere than Linux every request is skipped.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PinnedRequests {
+  /// Requests waited for on the shard's CPU, the thread's own mask put back after each.
+  pub pinned: u64,
+  /// Requests that kept the thread where it was (no CPU published yet, a CPU outside the thread's mask, a refusal, or
+  /// not Linux).
+  pub skipped: u64,
+  /// Restores the kernel refused, each the call's typed refusal. Expected none.
+  pub restore_failed: u64,
+}
+
+impl ClientEnd {
+  /// Pins this thread to its shard's CPU for one synchronous request (84a's arm F): the client writes the request and
+  /// blocks there, so its block hands the CPU to the shard, and the shard's park hands it back. `None` when the request
+  /// keeps the thread where it was; counted either way, the first skip on a thread logged.
+  pub fn pin_for_request(&mut self) -> Option<slates_machine::request_pin::RequestPin> {
+    let published = self
+      .region
+      .shard_cpu()
+      .map(|word| word.load(Ordering::Relaxed))
+      .unwrap_or(0);
+    let pinned = match published
+      .checked_sub(1)
+      .and_then(|cpu| usize::try_from(cpu).ok())
+    {
+      Some(cpu) => slates_machine::request_pin::pin_for_request(cpu),
+      None => Err(slates_machine::request_pin::PinSkipped::Unknown),
+    };
+    match pinned {
+      Ok(pin) => {
+        self.pinned_requests.pinned = self.pinned_requests.pinned.saturating_add(1);
+        Some(pin)
+      }
+      Err(skipped) => {
+        self.pinned_requests.skipped = self.pinned_requests.skipped.saturating_add(1);
+        if cfg!(target_os = "linux")
+          && skipped != slates_machine::request_pin::PinSkipped::Unknown
+          && !PIN_SKIP_LOGGED.with(|logged| logged.replace(true))
+        {
+          slates_machine::log_line!("slates-ipc: a request waits off its shard's CPU: {skipped:?}");
+        }
+        None
+      }
+    }
+  }
+
+  /// Puts back the thread's own mask after a pinned request; a refusal is counted and returned typed.
+  pub fn unpin_after_request(
+    &mut self,
+    pin: slates_machine::request_pin::RequestPin,
+  ) -> Result<(), IpcError> {
+    pin.restore().map_err(|code| {
+      self.pinned_requests.restore_failed = self.pinned_requests.restore_failed.saturating_add(1);
+      IpcError::OsRefused {
+        call: "sched_setaffinity (a pinned request's restore)",
+        code: Some(code),
+      }
+    })
+  }
+
+  /// The synchronous requests pinned to the shard's CPU, and those skipped (see [`PinnedRequests`]).
+  pub fn pinned_requests(&self) -> PinnedRequests {
+    self.pinned_requests
+  }
+}
+
 /// A client's synchronous reply wait's parks under an asked EEVDF slice (84a's arm E, `slates_machine::fair_slice`), and
 /// those it skipped. Elsewhere than Linux every park is skipped.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2334,6 +2424,8 @@ impl ClientEnd {
 }
 
 thread_local! {
+  /// Whether this thread has logged its first request that waited off its shard's CPU ([`ClientEnd::pin_for_request`]).
+  static PIN_SKIP_LOGGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
   /// Whether this thread has logged its reply wait's first skipped sliced park ([`ClientEnd::slice_for_park`]).
   static SLICE_SKIP_LOGGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
   /// Whether this thread has asked for the time-constraint policy ([`real_time_once`]).

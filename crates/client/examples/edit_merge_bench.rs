@@ -683,6 +683,11 @@ fn measure(
       form.key(),
       fixture.client.sliced_parks()
     );
+    println!(
+      "client pinned requests\t{}_f{files}_{load}: {:?}",
+      form.key(),
+      fixture.client.pinned_requests()
+    );
     fixture.client.destroy(fixture.leader).unwrap();
     fixture.client.destroy(fixture.follower).unwrap();
     fixture.client.destroy(fixture.green).unwrap();

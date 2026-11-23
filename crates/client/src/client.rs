@@ -1690,6 +1690,11 @@ impl Client {
     self.end.parks_ended_by_looks()
   }
 
+  /// The synchronous requests pinned to the shard's CPU, and those skipped (84a's arm F; `ClientEnd::pinned_requests`).
+  pub fn pinned_requests(&self) -> slates_ipc::endpoint::PinnedRequests {
+    self.end.pinned_requests()
+  }
+
   /// The synchronous reply wait's parks under an asked EEVDF slice, and those it skipped (84a's arm E;
   /// `ClientEnd::sliced_parks`).
   pub fn sliced_parks(&self) -> slates_ipc::endpoint::SlicedParks {
@@ -2470,6 +2475,25 @@ impl Client {
   /// the client reconnected instead (the caller binds and resends). The wait has no deadline: it ends at the reply or
   /// at the daemon's departure, which the end waits on beside the reply (A-456; the module doc's rule).
   fn round_trip(
+    &mut self,
+    id: RequestId,
+    body: &RequestBody,
+  ) -> Result<Option<ReplyBody>, ClientError> {
+    // 84a's arm F: the request is written and waited for on the shard's CPU, the thread's own mask put back before the
+    // caller's code runs, whatever the round trip answered.
+    let pin = self.end.pin_for_request();
+    let answered = self.round_trip_here(id, body);
+    if let Some(pin) = pin {
+      self
+        .end
+        .unpin_after_request(pin)
+        .map_err(ClientError::Ipc)?;
+    }
+    answered
+  }
+
+  /// [`Self::round_trip`] where the thread now runs.
+  fn round_trip_here(
     &mut self,
     id: RequestId,
     body: &RequestBody,

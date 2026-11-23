@@ -16,8 +16,9 @@ pub const MAGIC: u32 = 0x5243_4C53;
 /// Format: the layout version. Version 2 (2026-09-25) added the spin estimate's shift to the header and
 /// the reply stamp to the words block (§4.7, the client's online wake estimate). Version 3 (2026-11-04)
 /// made the reply stamp two, one per park parity, named by the client's parked flag's value. Version 4 (2026-11-07)
-/// added the client's session key to the header (`AT_SESSION_KEY`).
-pub const LAYOUT_VERSION: u32 = 4;
+/// added the client's session key to the header (`AT_SESSION_KEY`). Version 5 (2026-11-22) added the shard's CPU beside
+/// the daemon's parked flag (`AT_SHARD_CPU`, 84a's Linux arm F).
+pub const LAYOUT_VERSION: u32 = 5;
 /// Format: the header's size (two cache lines): magic (4), version (4), client id (4), shard
 /// (2), padding (2), slots per ring (4), spin ns (4), command ring offset (8), completion
 /// ring offset (8), bulk offset (8), bulk length (8), spin shift (4), padding to 64, then the client's session key (32)
@@ -67,6 +68,9 @@ const AT_WAKE: usize = WORDS_OFFSET;
 const AT_CLIENT_PARKED: usize = WORDS_OFFSET + 64;
 /// Format: the daemon parked flag's offset.
 const AT_DAEMON_PARKED: usize = WORDS_OFFSET + 128;
+/// Format: the shard's CPU's offset: the CPU its last reply was written on, plus one (zero: none yet), in the daemon's
+/// parked flag's cache line, which the daemon alone writes. A client waits for its reply on that CPU (84a's arm F).
+const AT_SHARD_CPU: usize = AT_DAEMON_PARKED + 4;
 /// Format: the doorbell's offset.
 const AT_DOORBELL: usize = WORDS_OFFSET + 192;
 /// Format: the reply stamps' offset: two `u64` slots, side by side in one cache line.
@@ -146,11 +150,12 @@ impl RegionGeometry {
 
 /// The region's own words: wake, the two parked flags and the doorbell, each a run of one, the run of reply stamps, and
 /// the session key, racy (the client may write it while the daemon copies it).
-const REGION_WORDS: [WordRun; 6] = [
+const REGION_WORDS: [WordRun; 7] = [
   WordRun::racy(AT_SESSION_KEY, SESSION_KEY_BYTES),
   WordRun::one(AT_WAKE, Width::U32),
   WordRun::one(AT_CLIENT_PARKED, Width::U32),
   WordRun::one(AT_DAEMON_PARKED, Width::U32),
+  WordRun::one(AT_SHARD_CPU, Width::U32),
   WordRun::one(AT_DOORBELL, Width::U32),
   WordRun::strided(
     AT_REPLY_STAMP,
@@ -167,6 +172,7 @@ struct RegionIds {
   wake: RunId,
   client_parked: RunId,
   daemon_parked: RunId,
+  shard_cpu: RunId,
   doorbell: RunId,
   reply_stamp: RunId,
 }
@@ -178,6 +184,7 @@ impl RegionIds {
       wake,
       client_parked,
       daemon_parked,
+      shard_cpu,
       doorbell,
       reply_stamp,
     ] = REGION_WORDS;
@@ -185,6 +192,7 @@ impl RegionIds {
       wake: object.resolve(&wake)?,
       client_parked: object.resolve(&client_parked)?,
       daemon_parked: object.resolve(&daemon_parked)?,
+      shard_cpu: object.resolve(&shard_cpu)?,
       doorbell: object.resolve(&doorbell)?,
       reply_stamp: object.resolve(&reply_stamp)?,
     })
@@ -304,7 +312,13 @@ impl ClientRegion {
     }
     cmd.init(&object)?;
     cpl.init(&object)?;
-    for id in [ids.wake, ids.client_parked, ids.daemon_parked, ids.doorbell] {
+    for id in [
+      ids.wake,
+      ids.client_parked,
+      ids.daemon_parked,
+      ids.shard_cpu,
+      ids.doorbell,
+    ] {
       object.run_u32(id, 0)?.store(0, Ordering::Release);
     }
     for slot in 0..REPLY_STAMP_SLOTS {
@@ -542,6 +556,12 @@ impl ClientRegion {
   /// The daemon's parked flag.
   pub fn daemon_parked(&self) -> Result<&AtomicU32, IpcError> {
     Ok(self.object.run_u32(self.ids.daemon_parked, 0)?)
+  }
+
+  /// The shard's CPU, plus one: the CPU the daemon wrote its last reply on (zero: none yet). The daemon writes it, the
+  /// client reads it for its request's pin (84a's arm F, `slates_machine::request_pin`).
+  pub fn shard_cpu(&self) -> Result<&AtomicU32, IpcError> {
+    Ok(self.object.run_u32(self.ids.shard_cpu, 0)?)
   }
 
   /// The doorbell the client rings when the daemon is parked.
