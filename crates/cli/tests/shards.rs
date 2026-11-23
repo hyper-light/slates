@@ -645,12 +645,15 @@ impl ShardsDevice {
     request[8..16].copy_from_slice(&self.unique.to_le_bytes());
     request[16..24].copy_from_slice(&node.to_le_bytes());
     request[IN_HEADER_LEN..].copy_from_slice(body);
+    let wire = opcode.to_wire();
+    eprintln!("diag-w-win: {} asks opcode {wire} unique {}", std::process::id(), self.unique);
     self.write_all(&length);
     self.write_all(&request);
     let mut word = [0u8; 4];
     self.read_exact(&mut word);
     let mut reply = vec![0u8; usize::try_from(u32::from_le_bytes(word)).unwrap()];
     self.read_exact(&mut reply);
+    eprintln!("diag-w-win: {} answered opcode {wire} unique {}", std::process::id(), self.unique);
     reply
   }
 
@@ -744,6 +747,7 @@ fn read_across_a_kill(
     .stdout(Stdio::piped())
     .spawn()
     .unwrap();
+  eprintln!("diag-w-win: harness {instance} spawned slates shards {}", child.id());
   let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
   let mut line = String::new();
   loop {
@@ -752,6 +756,7 @@ fn read_across_a_kill(
       out.read_line(&mut line).unwrap() > 0,
       "the probe ended before it was ready"
     );
+    eprintln!("diag-w-win: harness {instance} read {:?}", line.trim_end());
     if line.contains(READY_LINE) {
       break;
     }
@@ -792,14 +797,18 @@ fn resyncer() -> ! {
     .map(|value| value.parse().unwrap())
     .collect();
   let (resync, stream) = (values[0], values[1]);
+  eprintln!("diag-w-win: resyncer {} began", std::process::id());
   let channel = slates_ipc::handle_route::adopt_stream(resync).unwrap();
   let end = slates_ipc::handle_route::adopt_stream(stream).unwrap();
+  eprintln!("diag-w-win: resyncer {} adopted its ends", std::process::id());
   let mut message = [0u8; RESYNC_HANDLE_MESSAGE_BYTES];
   let read = slates_ipc::stream::read_waiting(channel.as_handle(), &mut message).unwrap();
   let attached = ResyncMessage::parse(&message[..read]).unwrap();
+  eprintln!("diag-w-win: resyncer {} read {:?}", std::process::id(), attached.kind);
   assert_eq!(attached.kind, ResyncKind::Attached);
   let mut device = ShardsDevice { end, unique: 0 };
   assert_eq!(device.mount_and_read("hello.txt"), SHARDS_FILE);
+  eprintln!("diag-w-win: resyncer {} read the file", std::process::id());
   println!("{READY_LINE}");
   std::io::stdout().flush().unwrap();
   let read = slates_ipc::stream::read_waiting(channel.as_handle(), &mut message).unwrap();

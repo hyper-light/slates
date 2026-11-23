@@ -1,0 +1,131 @@
+name: diag-w-win
+
+# w-win for main 01a20182 (2026-11-23), main's Windows reds. A diagnostics lane run only from `diag-measurer-w-win-*`
+# branches, never main.
+# - checks: on both Windows runners, item 3's new rendezvous test on the commit before its fix (red expected), then on
+#   the fixed tree the tests of items 1 to 4 (green expected).
+# - shards-hang: item 5, the Shards hand-off through the CLI that hung 20 minutes in run 45163517212. The test file is
+#   run as CI runs it, at most 40 times, each bounded at 90 s (a passing run takes about 2 s); at the first hang the
+#   instance's status, the process list and the markers this branch adds to the probe and its harness are printed.
+
+on:
+  push:
+    branches: ["diag-measurer-w-win-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+  RED: 064674a8d0a7b9b934a30f54ad4aef10dc7bccbd
+
+jobs:
+  checks:
+    name: checks (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: NASM (x86_64 Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64 Windows)
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: "Red: item 3's rendezvous test on the commit before its fix"
+        run: |
+          red="$RUNNER_TEMP/red"; mkdir -p "$red"
+          git archive "$RED" | tar -x -C "$red"
+          cd "$red"
+          set +e
+          CARGO_TARGET_DIR="$RUNNER_TEMP/red-target" cargo test -p slates-ipc --lib an_anchor_that_lets_go 2>&1 | grep -v '^\s*Compiling '
+          code=${PIPESTATUS[0]}
+          echo "red arm exit $code"
+          if [ "$code" -eq 0 ]; then echo "UNEXPECTED: the test passed without its fix"; exit 1; fi
+      - name: "Green, item 3: the rendezvous tests"
+        if: ${{ !cancelled() }}
+        run: cargo test -p slates-ipc --lib rendezvous::platform
+      - name: "Green, item 1: the large path's live figures"
+        if: ${{ !cancelled() }}
+        run: cargo test -p slates-mem --lib large::
+      - name: "Green, item 2: the base host over the disk"
+        if: ${{ !cancelled() }}
+        run: cargo test -p slates-base --test host
+      - name: "Green, item 3: the client driver across restart and death"
+        if: ${{ !cancelled() }}
+        env:
+          AWS_LC_SYS_PREBUILT_NASM: "0"
+        run: cargo test -p slates-client --test driver
+      - name: "Green, item 4: an observation's task label"
+        if: ${{ !cancelled() }}
+        env:
+          AWS_LC_SYS_PREBUILT_NASM: "0"
+        run: cargo test -p slates-server --lib daemon::tests::an_observations_task_is_labelled_where_its_asker_asked -- --test-threads=1
+
+  shards-hang:
+    name: shards hang (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: ilammy/setup-nasm@v1.5.2
+      - name: Build the Shards CLI tests
+        env:
+          AWS_LC_SYS_PREBUILT_NASM: "0"
+        run: cargo test -p slates-cli --test shards --no-run 2>&1 | grep -v '^\s*Compiling '
+      - name: Run the file until it hangs, at most 40 times
+        env:
+          AWS_LC_SYS_PREBUILT_NASM: "0"
+          SLATES_TEST_CLI: "1"
+        run: |
+          exe=$(cargo test -p slates-cli --test shards --no-run 2>&1 | sed -n 's/.*Executable .*(\(.*\.exe\)).*/\1/p' | tail -1 | tr '\\' '/')
+          echo "exe=$exe"
+          slates=target/debug/slates.exe
+          for i in $(seq 1 40); do
+            log="$RUNNER_TEMP/shards-$i.log"
+            "$exe" --nocapture > "$log" 2>&1 &
+            bg=$!
+            waited=0
+            while kill -0 "$bg" 2>/dev/null && [ "$waited" -lt 90 ]; do sleep 1; waited=$((waited + 1)); done
+            if kill -0 "$bg" 2>/dev/null; then
+              echo "=== iteration $i HUNG past ${waited} s"
+              instance=$(sed -n 's/.*instance \(cr[0-9]*\) up.*/\1/p' "$log" | head -1)
+              echo "--- the resync test's instance: $instance"
+              "$slates" --instance "$instance" status 2>&1 | grep -i 'shards\|holder\|resync\|pid\|attach' || true
+              echo "--- processes"
+              tasklist //v 2>&1 | grep -i 'slates\|shards' || true
+              echo "--- the run's log, derived values left out"
+              grep -v 'slates daemon: [a-z_0-9]* = \|slates anchor: a \|slates anchor: issuer' "$log"
+              winpid=$(cat "/proc/$bg/winpid" 2>/dev/null || echo "")
+              [ -n "$winpid" ] && taskkill //T //F //PID "$winpid" || true
+              exit 1
+            fi
+            wait "$bg"; code=$?
+            echo "iteration $i exit $code after ${waited} s"
+            if [ "$code" -ne 0 ]; then
+              grep -v 'slates daemon: [a-z_0-9]* = \|slates anchor: a \|slates anchor: issuer' "$log" | tail -80
+            fi
+          done
+          echo "no hang in 40 runs"
