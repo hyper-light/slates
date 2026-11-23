@@ -71,6 +71,10 @@ pub(crate) struct Served {
   stored_deltas: bool,
   /// Whether its changeset store keeps no row of a file revision while its logs still list each.
   rows_lost: bool,
+  /// The rows a fetch's step may ask at once ([`Store::rows_a_step`]); none: as many as the room holds.
+  rows_a_step: Option<u64>,
+  /// The rows each rows' ask named, in order: what the walk asked of its store.
+  rows_asked: std::cell::RefCell<Vec<usize>>,
 }
 
 impl Repository for Served {
@@ -126,6 +130,10 @@ impl Served {
 }
 
 impl Store for Served {
+  fn rows_a_step(&self) -> u64 {
+    self.rows_a_step.unwrap_or(u64::MAX)
+  }
+
   /// The test's changeset store answered at once (A-767 C1): each file revision kept as its whole, its identity the
   /// plain BLAKE3 of its text, its place named by that identity, its chunk its raw text (a whole) or its delta; none where its text is
   /// lost.
@@ -133,6 +141,10 @@ impl Store for Served {
     use crate::render::{StoredPlace, StoredRevision, Want};
     match want {
       Want::Rows { logs } => {
+        self
+          .rows_asked
+          .borrow_mut()
+          .push(logs.iter().map(|(_, nodes)| nodes.len()).sum());
         let mut rows = Vec::new();
         for (path, nodes) in logs {
           let mut log_rows = Vec::new();
@@ -1903,6 +1915,65 @@ fn pulled(served: &Served, heads: &[Rev], common: &[Rev]) -> (Vec<u8>, u64, u64)
   let mut out = Vec::new();
   while walk.step(served, &mut room(), &mut out).unwrap() {}
   (out, walk.whole_sent(), walk.stored_sent())
+}
+
+/// Shape: [`a_clones_file_section_asks_its_rows_a_steps_worth_at_a_time`]'s changesets, each editing the one file, and
+/// the rows its store lets a step ask: a log many times a step's rows.
+const BATCHED_LINE: u32 = 40;
+/// Shape: the rows a step may ask in that test.
+const BATCHED_ROWS: u64 = 6;
+
+/// Goal 93 (main's ruling on CI 45117277400: a clone's file section asked the whole history's rows in one batch, sized
+/// by the repository's share, and decided them in one 2 s step). Do: on a line of [`BATCHED_LINE`] changesets each
+/// editing one file, the store keeping each revision after the first as its delta, clone it whole with the store
+/// letting a step ask [`BATCHED_ROWS`] rows ([`Store::rows_a_step`]), then again unbounded; then pull it, the client
+/// holding the root, both ways. Expect every rows' ask within that many rows, more than one ask, and the changegroup the
+/// unbounded walk sends, byte for byte, for each. Red before: one ask named every revision's rows ([40]).
+#[test]
+fn a_clones_file_section_asks_its_rows_a_steps_worth_at_a_time() {
+  let parents: Vec<[Option<Rev>; 2]> = (0..BATCHED_LINE)
+    .map(|rev| [rev.checked_sub(1), None])
+    .collect();
+  let edits: Vec<Edit> = (0..BATCHED_LINE)
+    .map(|at| (vec![(0, u8::try_from(at).unwrap())], 0))
+    .collect();
+  let (mut served, _) = filled(shaped(&parents), &edits);
+  served.stored_deltas = true;
+  let last = BATCHED_LINE - 1;
+  let (unbounded, ..) = pulled(&served, &[last], &[]);
+  served.rows_asked.borrow_mut().clear();
+  served.rows_a_step = Some(BATCHED_ROWS);
+  let (bounded, ..) = pulled(&served, &[last], &[]);
+  let asks = served.rows_asked.borrow().clone();
+  assert!(
+    asks.len() > 1,
+    "the rows asked over more than one ask: {asks:?}"
+  );
+  assert!(
+    asks
+      .iter()
+      .all(|rows| u64::try_from(*rows).unwrap() <= BATCHED_ROWS),
+    "each ask within a step's rows: {asks:?}"
+  );
+  assert_eq!(bounded, unbounded, "the same changegroup");
+  // A pull walked by its changesets (the client holding the root) asks its file section's rows the same way.
+  served.rows_a_step = None;
+  let (unbounded, ..) = pulled(&served, &[last], &[0]);
+  served.rows_asked.borrow_mut().clear();
+  served.rows_a_step = Some(BATCHED_ROWS);
+  let (bounded, ..) = pulled(&served, &[last], &[0]);
+  let asks = served.rows_asked.borrow().clone();
+  assert!(
+    asks.len() > 1,
+    "the pull's rows asked over more than one ask: {asks:?}"
+  );
+  assert!(
+    asks
+      .iter()
+      .all(|rows| u64::try_from(*rows).unwrap() <= BATCHED_ROWS),
+    "each of the pull's asks within a step's rows: {asks:?}"
+  );
+  assert_eq!(bounded, unbounded, "the same pulled changegroup");
 }
 
 /// A-767 C1 step 1b (a pull's file revisions as the changeset store keeps them; main's ruling of 2026-11-21 08:45: a

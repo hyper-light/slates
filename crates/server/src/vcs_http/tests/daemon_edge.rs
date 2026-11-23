@@ -4243,8 +4243,9 @@ fn a_long_push_of_own_texts(
 /// loopback TLS; create a Mercurial repository; push a line of [`TEXTS_CHANGESETS`] changesets each adding a file of its
 /// own [`TEXT_BYTES`], cut at [`LONG_SEGMENT_BYTES`]; look at each file's window in its shard's content store; clone it
 /// whole (`getbundle`). Expect the push `200`; every file's window let go of the content store, its entry kept, each
-/// noted with its revision for a home and none pinned (goal 93 item 2b(b): before, the 71 a home held here were
-/// pinned); the bytes let go counted; and the clone carrying the last file's bytes, brought back from the changeset
+/// pinned by none, and noted for none, since no home holds any (goal 93 item 2b(b): before, the 71 a home held here
+/// were pinned; then every window was noted, hundreds of thousands in a whole history, w-shared's 1ecb57cf4); the bytes
+/// let go counted; and the clone carrying the last file's bytes, brought back from the changeset
 /// store. Red before: the store held every text.
 #[test]
 fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
@@ -4259,7 +4260,6 @@ fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
   // Each file's window: whether its shard's content store reads its bytes (none for one let go), whether a home pins it
   // there, and whether its entry stays.
   let windows = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
-    let (shard, shards) = (state.shard, state.shards.clone());
     crate::vcs_store::lent_state(state, |state| {
       let content = state.vcs_stores.content()?;
       Some(
@@ -4305,8 +4305,8 @@ fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
     assert!(entry, "file {at}'s entry kept");
     assert!(!here, "file {at}'s window let go");
     assert!(
-      *noted && !*pinned,
-      "file {at}'s window noted for a home, not pinned"
+      !*noted && !*pinned,
+      "file {at}'s window neither noted nor pinned: no home holds it"
     );
   }
   assert!(gone > 0, "some window let go");
@@ -4563,8 +4563,8 @@ fn windows_held(daemon: &Daemon, texts: &'static [Vec<u8>]) -> Vec<bool> {
 /// order of 14:00 (the arena a landed history left held). Do: start a two-shard daemon over loopback TLS; import the
 /// `states` repository into a Mercurial repository and land it; look at each of its file revisions' windows in its
 /// shard's content store; clone it whole (`getbundle`). Expect every file revision's window let go of the content store,
-/// its entry kept, each window noted with its revision for a home and none pinned (goal 93 item 2b(b): before, those a
-/// home held here were pinned, 1 of 5); counted; and the clone `200` with a changegroup, its file texts brought back
+/// its entry kept, none pinned and none noted, since no home holds any (goal 93 item 2b(b): before, those a home held
+/// here were pinned, 1 of 5; then every window was noted); counted; and the clone `200` with a changegroup, its file texts brought back
 /// from the changeset store. Red before: the import kept every text.
 #[test]
 fn an_imported_repositorys_file_texts_leave_the_content_store_once_its_segments_land() {
@@ -4577,7 +4577,6 @@ fn an_imported_repositorys_file_texts_leave_the_content_store_once_its_segments_
   let looked = {
     let name = name.clone();
     crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
-      let (shard, shards) = (state.shard, state.shards.clone());
       let id = state
         .db
         .partition()
@@ -4627,8 +4626,8 @@ fn an_imported_repositorys_file_texts_leave_the_content_store_once_its_segments_
     assert!(entry, "file revision {at}'s entry kept");
     assert!(!here, "file revision {at}'s window let go");
     assert!(
-      *noted && !*pinned,
-      "file revision {at}'s windows noted for a home, none pinned"
+      !*noted && !*pinned,
+      "file revision {at}'s windows neither noted nor pinned: no home holds them"
     );
   }
   assert!(

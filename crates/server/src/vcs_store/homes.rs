@@ -48,7 +48,7 @@
 //! before remove). Its inputs are the configuration and what the homes answered, never an owner's record (Q3).
 //!
 //! **Refused** ([`HomeRefused`]): bytes past a window; a home whose content store refused (its budget); a home that did
-//! not answer within the budget; an answer naming another identity than the bytes' (never in a correct home).
+//! not answer within the budget; content a home does not hold.
 
 use slates_db::register::rendezvous_ranked_by_key;
 use slates_vcs::{ContentId, ContentRefused};
@@ -71,8 +71,6 @@ pub(crate) enum HomeRefused {
   Content(ContentRefused),
   /// The home did not answer within the caller's budget.
   Unanswered,
-  /// The home named another identity than the bytes': never in a correct home.
-  Misnamed,
   /// The home holds no such content.
   NotHeld,
 }
@@ -1052,9 +1050,7 @@ async fn keep_put(
       generation: ticket.generation,
     },
     Ok(_) | Err(HomeRefused::Unanswered) => HomeOutcome::Refused(HomeRefusal::Unanswered),
-    Err(HomeRefused::Misnamed | HomeRefused::PastWindow) => {
-      HomeOutcome::Refused(HomeRefusal::Misnamed)
-    }
+    Err(HomeRefused::PastWindow) => HomeOutcome::Refused(HomeRefusal::Misnamed),
     Err(HomeRefused::Content(_)) => HomeOutcome::Refused(HomeRefusal::Room),
     Err(HomeRefused::NotHeld) => HomeOutcome::Refused(HomeRefusal::NotHeld),
   }

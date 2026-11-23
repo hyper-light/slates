@@ -194,6 +194,11 @@ impl Repository for Empty {
 }
 
 impl Store for Empty {
+  /// A test's store keeps no changeset store rows to batch: as many as the room holds.
+  fn rows_a_step(&self) -> u64 {
+    u64::MAX
+  }
+
   fn changeset_text(
     &self,
     _rev: Rev,
@@ -878,6 +883,11 @@ impl Repository for Charging {
 }
 
 impl Store for Charging {
+  /// A test's store keeps no changeset store rows to batch: as many as the room holds.
+  fn rows_a_step(&self) -> u64 {
+    u64::MAX
+  }
+
   fn changeset_text(
     &self,
     _rev: Rev,

@@ -682,8 +682,9 @@
 >   then put back within its lent room), counted `vcs.hg.landed_texts_brought_back`. Held by
 >   `a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and_node` (49 of 120 let go, each back
 >   whole, counted once). Part 2 BUILT (w-hg, over w-shared's fc42f581c and 7663054bb): once a push's entry commits
->   (`hg_run::Run::settle`) or an import lands, each file revision's windows are noted with its (repository, path,
->   node) on the shard (`homes::note_landed`, `Landed::Hg`; `slates_hg::filerev::FileContents` carries them in each
+>   (`hg_run::Run::settle`) or an import lands, each file revision's windows a home holds (held for the region,
+>   `landed_pin`; since w-shared's 1ecb57cf4 no other, so a history notes about none, the two let-go tests asserting no
+>   note) are noted with its (repository, path, node) on the shard (`homes::note_landed`, `Landed::Hg`; `slates_hg::filerev::FileContents` carries them in each
 >   segment, counted in the intake's bound) and let go, pinned by nothing; a window noted already keeps its note.
 >   The let-go at segment durability notes nothing, since `bring_back` reads the committed index, so a home's window
 >   stays pinned until the commit. `homes::bring_back_landed` brings an object's hg-noted windows back by
@@ -693,6 +694,15 @@
 >   The test-only one-call landing builds a push's works as the driver does, planned and then built over the
 >   store's read-through (`works_whole`); `Works::Whole` and the one-call `tree::work` arm are gone, and `prepare` takes
 >   the view alone. The store-made-texts oracle compares a file by the identities its row names.
+> - A fetch's file section asks a step's rows at a time BUILT (2026-11-23, w-hg; main's ruling on CI 45117277400: on
+>   arm64 one step of a clone's streamed answer ran 2,019,916 us wall, 670,641 us CPU, writing nothing). Both of
+>   getbundle's file sections sized a batch by the turn's room alone, the repository's whole share: a clone's link walk
+>   scanned and asked every file revision of the history in one step (`ask_rows`), and a pull's `Pull` decided a batch
+>   that size in one; the batch held their rows and texts too. Each now asks a step's rows at most
+>   (`getbundle::Store::rows_a_step`, `render::rows_a_step` for the indexed view, a content window of stored rows, as
+>   the stream's gather), the link walk counting rows scanned. Held by
+>   `a_clones_file_section_asks_its_rows_a_steps_worth_at_a_time` (a clone and a pull of 40 edits at 6 rows a step:
+>   red one ask of 40 and of 78 rows, now asks within 6 and the same changegroups byte for byte).
 > - The committed let-go bounded a turn at a time BUILT (2026-11-22, w-hg; main's order on CI 45110563116: on x86, push-all
 >   refused 503 after shard 0 spun 1,045 ms of CPU in one poll of `hg_push::unbundle`, the commit noting and letting go
 >   the whole push's file revisions in one step): `hg_run::let_go_committed` takes them a turn at a time within half
