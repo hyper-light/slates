@@ -949,6 +949,14 @@
 >   Grown to the longest chain before, it held 360 MB of chunks at the end of Mercurial's push. Held by
 >   `the_store_holds_the_texts_its_last_reads_lent_and_no_more` (red: bound 6,553,600 after a 400-version chain's read;
 >   now 1,064,960 for 4 reads, 384 texts let go, the latest found again unmade).
+>   REGRESSED on CI, then FIXED (2026-11-23, main's arena-13, CI 45193998198 at 85569cf25): that bound was the distinct
+>   texts of the last `clients_per_shard` x shards reads, hundreds on CI's runner, so mapped blocks resident after
+>   push-all rose from 68,661,248 to 646,410,240 bytes and stayed after idle (RSS 1,865 -> 2,235 MB on x86). The bound is
+>   now the walks in flight: the texts whose pieces are still being read, in whole chunks, and the larger of one chunk
+>   and the text a read lends, so a cache whose reads have ended holds one chunk; a walked text in a chunk given back is
+>   laid again in the newest. Held by `the_store_holds_the_walks_in_flight_not_the_reads_that_could_be_waiting` (red
+>   7,340,032 bytes reserved with room for 1,000 reads and no walk in flight; now 1,048,576) and
+>   `a_walk_in_flight_keeps_its_text_through_other_reads`. Owed: main's arena-14 on CI's runner.
 > - A Mercurial index's tail sealed by every append BUILT (2026-11-23, w-perf; w-hg's three conditions). Only an import
 >   sealed (`import::settle`), so a push's, a replay's and a made changeset's tail grew for the whole push: 56 MB of tail
 >   rows, two buffers each, still held at the end of Mercurial's push (`Index::admit` 34 MB, `table::encode_body` 22 MB).
