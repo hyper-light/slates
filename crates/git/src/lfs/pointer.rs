@@ -1,7 +1,7 @@
-//! The pointer file a version's tree holds in place of a large file (A-610; git-lfs v3.8.1 `docs/spec.md` [B]; its
-//! reader and writer, `lfs/pointer.go` and `lfs/scanner.go` [C]).
+//! The pointer file a version's tree holds in place of a large file (A-610; git-lfs v3.8.1 `docs/spec.md` \[B\]; its
+//! reader and writer, `lfs/pointer.go` and `lfs/scanner.go` \[C\]).
 //!
-//! **Written** ([`write`]) as the specification's one encoding, which is git-lfs's `Encoded`: `version
+//! **Written** ([`write`](fn@write)) as the specification's one encoding, which is git-lfs's `Encoded`: `version
 //! https://git-lfs.github.com/spec/v1`, the extensions by priority as `ext-{priority}-{name} sha256:{oid}`, then `oid
 //! sha256:{oid}` and `size {size}`, each line ending in a line feed; a pointer of size zero is the empty file ("An
 //! empty file is the pointer for an empty file").
@@ -22,10 +22,10 @@
 //!    leading zeros allowed) and not negative; each extension's oid as the pointer's; no two extensions of one priority
 //!    (one key given twice keeps its last value, as Go's map does).
 //!
-//! [`Read::canonical`] says whether the bytes are exactly what [`write`] makes of what was read, git-lfs's `Canonical`:
-//! a pointer read leniently (a carriage return, a missing last line feed, an older version URL, unsorted extensions) is
-//! still the same object, and the server can tell. Each refusal is a kind; [`Refusal::is_not_a_pointer`] separates
-//! "this blob is no pointer" from "this pointer is malformed", as git-lfs's `NotAPointerError` does.
+//! [`Read::canonical`] says whether the bytes are exactly what [`write`](fn@write) makes of what was read, git-lfs's
+//! `Canonical`: a pointer read leniently (a carriage return, a missing last line feed, an older version URL, unsorted
+//! extensions) is still the same object, and the server can tell. Each refusal is a kind; [`Refusal::is_not_a_pointer`]
+//! separates "this blob is no pointer" from "this pointer is malformed", as git-lfs's `NotAPointerError` does.
 
 use super::Oid;
 use crate::out::Out;
@@ -110,7 +110,7 @@ pub struct Read<'a> {
   pub pointer: Pointer<'a>,
   /// The version URL it named.
   pub version: Version,
-  /// Whether its bytes are exactly what [`write`] makes of it.
+  /// Whether its bytes are exactly what [`write`](fn@write) makes of it.
   pub canonical: bool,
 }
 

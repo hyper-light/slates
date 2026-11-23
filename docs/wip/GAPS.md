@@ -13155,6 +13155,42 @@ finding against the sweep's thirty candidates is the measure of how far a grep w
 right pointer needs someone who owns §4.8's SWIM wiring: `accept_probes`, `probe_peer`, `serve_peer_probes`,
 `fold_peer_state`, `ProbeTiming::budget`, all in `crates/server/src/fleet.rs`.
 
+**Red again, cleared 2026-11-23** (w-wall for main, at main b21dd5d5f). Fleet agents land without building docs
+(CLAUDE.md §8), so the gate went red unseen. CI run 45251228315 showed 51 errors in three crates, but cargo stops
+starting crates after the first failure, so that was a subset: `cargo doc --keep-going` with the gate's flags found
+**131 errors in 17 crates** on macOS and 131 on adacachy2's Linux, 132 distinct (the same set but for one each:
+`ProcessMark` is macOS and Windows only, `crates/server/src/held_copy.rs` Linux only). Each was repointed at what it
+means now, never deleted:
+
+| Kind | Count | Examples |
+|---|---|---|
+| A name renamed or removed | 19 | `Store::text_by_tool` (`Store::texts_by_tools`), `changeset_of` (folded into `changeset_landing`), `tell_owners` (`tell_session`), `Landing::chmod` (`Landing::set_meta`), `PendingMount` (`PendingHandshake`), `keylife::key_time_limit_ns` (RFC 4253 §9's hour, `RECOMMENDED_KEY_TIME_NS`) |
+| A `#[cfg(test)]` item named from a production doc | 22 | the takeover oracles `resolve_held_objects` and `reconcile_held_authority` (production walks `install_on_copy` a copy a turn), `Dim::copy_tree` (production holds with `hold_tree` and grafts with `graft_tree`), `Connection::poll_transmit` (`poll_transmit_into`) |
+| A module's own docs resolved in its parent's scope | 27 | `crates/server/src/moves.rs` (13), five `crates/git/src/store` children (10), `crates/vfs/src/host/tree.rs` (4) |
+| Prose read as a link | 21 | evidence tiers `[B]` and `[C]` (14), protocol grammar with `<placeholders>` in brackets (4), C source `name[entrylen]` |
+| Ambiguous between a function and a macro, module or primitive | 19 | `write` (12), `answer` (2), `ready`, `tuple`, `pointer`, `reference`, `slice` |
+| A real item by a path that does not reach it | 17 | `hg_run` from `hg_push.rs` (10), `HomeMessage` imported inside a function only |
+| A placeholder read as an unclosed HTML tag | 4 | git's messages quoting `<name>`, `<digits>`, `<blob-ish>`, `<id>` |
+| An item behind a platform cfg the build cannot see | 3 | `Holder` and `handle_session_bytes` (`cfg(any(windows, test))`), `ProcessMark` |
+
+**The trap behind the 27.** A module with an outer `///` doc on its `mod` line and its own `//!` docs gets one
+merged doc, which rustdoc 1.98.1 resolves in the *parent's* scope, so every inner link to the module's own items
+fails with "no item named ... in scope" beside the very item. Proved on a two-file crate: the inner link fails with
+the outer doc and resolves once the outer doc is a `//` comment. The outer lines became `//` comments, as
+`crates/server/src/lib.rs` already writes its other module notes; each module's own docs already opened with the
+same summary. Eleven more modules still carry both kinds and do not fail today: `crates/ipc/src/lib.rs`'s
+`completion`, `mach_claim` and `peer` (their outer docs say more than their first lines, so turning them into
+comments needs their text moved in), `xtask/src/kind.rs`'s three `kind_*`, and five test-only modules no docs build
+renders.
+
+**The Windows docs lane, run from the Mac** (`cargo xwin doc` over `windows-lint`'s crate list; every one of its 13
+crates builds here, aws-lc-sys and zstd-sys through clang-cl), found 11 more, each a link from docs every platform
+builds to an item Windows does not have: `crates/server/src/shards/resync.rs`'s seven (`establish`, `Resync::end`,
+`give_up` three times, `tell_session`, `send_resync`, all `cfg(unix)`), `Events::acknowledge` twice (macOS and Linux
+alone), `svn_presenter::repos_for_hook` and `Answering::Hook`. Plain code now, the rule for a cfg-gated item. CI's
+Windows lane had stopped at an earlier step (run 45251228315, `svn_interop`'s `UPDATE_SPAN`), so its docs step never
+ran on them.
+
 ### 8a-fdscan. A descriptor probe counted every parallel test's objects as its own (2026-10-20, closed)
 
 The same push turned the `gates (ubuntu-latest)` lane red on

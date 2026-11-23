@@ -16,9 +16,9 @@
 //!
 //! **git's refusals**, which `pack-objects` dies with as it begins, so the client meets them after the sections before
 //! the pack, on band 2 (the `answer` module): a name that names nothing, "unable to access sparse blob in
-//! '<blob-ish>'"; a relative path, "relative path syntax can't be used outside working tree"; an object that is no blob
+//! '\<blob-ish>'"; a relative path, "relative path syntax can't be used outside working tree"; an object that is no blob
 //! the store holds, or a blob past git's limit (after git's warning of it), "unable to parse sparse filter data in
-//! <id>". An answer that carries no pack never meets them, as git's never does.
+//! \<id>". An answer that carries no pack never meets them, as git's never does.
 //!
 //! **Not git's.** Protocol v2 reads the blob in every round its filter rides in, since the negotiation walks by its
 //! patterns in the round that sends the pack, so a blob past the request's admission is refused in a round git answers

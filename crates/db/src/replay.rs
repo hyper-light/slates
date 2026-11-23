@@ -930,7 +930,8 @@ impl Db {
       .saturating_add(entry_bytes)
   }
 
-  /// Whether recording `entry` could pass the snapshot slot ([`projected_snapshot_bytes`]).
+  /// Whether recording `entry` could pass the snapshot slot
+  /// ([`projected_snapshot_bytes`](Db::projected_snapshot_bytes)).
   fn past_snapshot_room(&self, segment: &AnchorSegment, entry: &LogEntry) -> bool {
     self.projected_snapshot_bytes(entry) > slot_bytes(segment)
   }
