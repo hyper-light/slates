@@ -89,7 +89,6 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::mem::size_of;
 
-use flate2::{Compress, Compression};
 use slates_vcs::{ContentId, ContentStore};
 
 use crate::entry::{self, Header, PACK_HEADER_LEN, Representation};
@@ -352,7 +351,7 @@ struct Deflating {
   len: u64,
   /// Its window to feed next.
   next: u64,
-  compress: Compress,
+  compress: super::deflaters::Deflater,
 }
 
 /// What a [`Deflating`] reads.
@@ -1014,7 +1013,7 @@ impl<A: Answered> Upload<A> {
       from,
       len: row.len,
       next: 0,
-      compress: Compress::new(Compression::new(level), true),
+      compress: super::deflaters::deflater(level),
     }))
   }
 
@@ -1110,7 +1109,10 @@ impl<A: Answered> Upload<A> {
       }
     };
     let last = deflating.next.saturating_add(1) >= windows;
-    let given = fragment::deflate_more(&mut deflating.compress, &bytes, last)
+    let given = deflating
+      .compress
+      .state()
+      .and_then(|state| fragment::deflate_more(state, &bytes, last))
       .map_err(StoreRefused::Encoding)?;
     self.emit(&given, out);
     if last {
@@ -1847,7 +1849,7 @@ impl<A: Answered> Upload<A> {
       len: to_u64(delta.len()),
       from: Deflated::Made { delta, hold },
       next: 0,
-      compress: Compress::new(Compression::new(level), true),
+      compress: super::deflaters::deflater(level),
     }))
   }
 

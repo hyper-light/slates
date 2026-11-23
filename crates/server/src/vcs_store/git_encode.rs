@@ -485,6 +485,9 @@ pub(crate) fn give_back_idle(state: &mut ShardState, id: RepositoryId) {
     store.repository.let_go_recent(content)
   });
   let mut given = under_way.saturating_add(recent);
+  // A-868: the deflate states the shard's thread keeps are let go too, and what it made and took again counted.
+  slates_git::store::deflaters::let_go();
+  super::upload::count_deflaters(state);
   if let Some(grant) = crate::vcs_share::budget(state, id) {
     let held = crate::vcs_share::held(state, id);
     if held > grant {

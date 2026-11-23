@@ -61195,3 +61195,29 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
   - `mach_claim::tests::a_fetched_wake_right_signals_the_kept_regions_semaphore`.
 - **Applied in the same change to** `crates/ipc` (`mach_semaphore`, `mach_claim`, `region`, `endpoint`, `rendezvous`,
   `tests/rendezvous.rs`), `unsafe-budget.toml`, GAPS, BENCHMARKS, amendments.tsv.
+
+### A-868 — A deflate takes its shard's kept state, never one made an object or a level (2026-11-22, w-git; main 01a20182's queue item 4, goal 93; A-639, A-718, A-859)
+
+- **Why.** Every deflate made its own zlib state: each object a fetch's stream deflated afresh (`Deflating`), each
+  object the encoding put (`PutStage::Deflate`), and each level a type's levels were learned on (ten a sample), the
+  corpus of `Rates::measure` too. A state is a few hundred KiB (its window, hash chains and pending buffer), allocated
+  and cleared each time: a clone's states were O(objects × trials), 72 for a 42-object clone.
+- **Change.** `slates_git::store::deflaters`: a deflate takes a `Deflater`, a state its shard's thread keeps (the
+  runtime is thread-per-core, so what a thread keeps is its shard's), reset when given back and set to its level
+  (`flate2::Compress::set_level` on a reset stream: a fresh stream's output byte for byte), or one made when none is
+  kept. Its drop gives it back, so an object ended, a stream dropped part way and a sample all give back. A thread
+  keeps at most `MOST_KEPT` (8); states made are O(the deflates under way at once on a shard). A repository gone idle
+  (`git_encode::give_back_idle`) lets the kept states go.
+- **Counted.** `vcs_store.git_deflate.states_made`, `states_reused`, `states_dropped`, counted on the shard at each
+  fetch step and at idle give-back from the thread's counts (`deflaters::take_counts`).
+- **Tests.**
+  - `store::tests::upload::a868_a_clones_deflates_take_the_shards_kept_state_never_one_an_object_or_a_trial`: a
+    42-object clone at the cold price, read back whole; states made 1, taken again 71. Red with nothing kept: 72 made.
+  - `store::tests::upload::a868_a_deflate_state_taken_again_deflates_byte_for_byte_as_a_fresh_one`: every level, down
+    then up, after a state given back part way through a stream: byte for byte a fresh `Compress`'s output, inflating
+    back to the text.
+  - `vcs_store::upload::tests::t_a868_a_shards_deflate_states_are_counted_one_made_and_let_go_idle`: `Rates::measure`
+    and a fetch on an audit shard count 1 made, 9 taken again, and 1 dropped idle. Red with nothing kept: 10 made.
+- **Applied in the same change to** `crates/git` (`store/deflaters.rs`, `store/upload.rs`, `store/fragment.rs`,
+  `tests/store/upload.rs`), `crates/server` (`vcs_store/upload.rs`, `vcs_store/git_encode.rs`,
+  `vcs_store/upload/tests.rs`), GAPS, amendments.tsv.

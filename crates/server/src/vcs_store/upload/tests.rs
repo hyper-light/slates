@@ -844,6 +844,52 @@ fn t_a859_a_fetchs_stream_counts_each_path_its_objects_took_on_its_shard() {
   assert!(counted.iter().any(|count| *count > 0), "{stream:?}");
 }
 
+/// A-868 (main 01a20182's queue item 4: deflate states O(shards), counted). Do: on an audit shard, measure the git
+/// rates on its thread (`Rates::measure`: the corpus deflated once at each of the ten levels), then fetch a pushed
+/// commit (its step counts on the shard), then give back what the repository holds idle. Expect: the shard counts the
+/// ten deflates' states, made or taken again; at most one made, the rest taken again; and what its thread kept let go
+/// idle, counted dropped. Red before: ten made, one a level.
+#[test]
+fn t_a868_a_shards_deflate_states_are_counted_one_made_and_let_go_idle() {
+  use super::{DEFLATE_STATES_DROPPED, DEFLATE_STATES_MADE, DEFLATE_STATES_REUSED};
+  struct Elapsed(std::time::Instant);
+  impl slates_git::store::learn::Clock for Elapsed {
+    fn now_ns(&mut self) -> u64 {
+      u64::try_from(self.0.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+  }
+  crate::test_store::audit_on_stored_shard("vcs_store-deflaters", |state| {
+    let (id, _, head) = pushed_repository(state, "deflated", &[]);
+    slates_git::store::deflaters::let_go();
+    super::count_deflaters(state);
+    let names = [
+      DEFLATE_STATES_MADE,
+      DEFLATE_STATES_REUSED,
+      DEFLATE_STATES_DROPPED,
+    ];
+    let counted =
+      |state: &ShardState| names.map(|name| state.refusals.get(name).copied().unwrap_or(0));
+    let before = counted(state);
+    slates_git::store::learn::Rates::measure(&mut Elapsed(std::time::Instant::now()));
+    fetched_with_counters(state, (id, &owner()), &fetch(&[head], &[]));
+    let fetched = counted(state);
+    crate::vcs_store::git_encode::give_back_idle(state, id);
+    let idle = counted(state);
+    let [made, reused, _] = [0, 1, 2].map(|at| fetched[at] - before[at]);
+    let dropped = idle[2] - fetched[2];
+    eprintln!("A-868: states made {made}, reused {reused}; dropped idle {dropped}");
+    assert!(
+      made + reused >= 10,
+      "each level's deflate took a state: made {made}, reused {reused}"
+    );
+    assert!(made <= 1, "one state made: made {made}, reused {reused}");
+    assert!(
+      dropped >= 1,
+      "the kept state let go idle: dropped {dropped}"
+    );
+  });
+}
+
 /// A-859 part A (main 01a20182's rulings of 2026-11-22 04:30 and 06:32: a fetched byte priced at its link, never at
 /// memcpy; cold, the price where deflate at git's default level just pays; learned from the writes that waited for the
 /// peer, from an answer's first wait on). Do: on an audit shard, read the fetch's exchange; teach the shard's pacing a

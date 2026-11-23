@@ -78,6 +78,7 @@
 //! are. A-614 part 3, the commit rows' changed-path Bloom filters, is superseded: a path's history and blame are
 //! A-666's derived types, and no walk here reads paths.
 
+pub mod deflaters;
 mod deltas;
 mod encoding;
 pub(crate) mod fragment;

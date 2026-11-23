@@ -1166,3 +1166,94 @@ fn a859_a_fetched_byte_is_priced_at_its_link_cold_at_deflates_break_even() {
   );
   repository.release(&mut store).unwrap();
 }
+
+/// A-868 (main 01a20182's queue item 4, deflate reuse: "deflate states are O(shards), not O(objects × trials)"). Do:
+/// push one commit over forty text files no pack brought (each kept as content, deflated afresh when fetched) and
+/// stream its clone at the cold price, on this test's thread (a shard's). Expect: read back, exactly the objects
+/// pushed; every object deflated and every level sampled took a deflate state (made or taken again at least once an
+/// object), yet the thread made at most one (the stream deflates one object at a time, its samples one level at a
+/// time). Red before: one state made an object and ten a sampled type, 72 here.
+#[test]
+fn a868_a_clones_deflates_take_the_shards_kept_state_never_one_an_object_or_a_trial() {
+  use crate::store::deflaters;
+  let format = ObjectFormat::Sha1;
+  let mut store = store();
+  let mut repository = Repository::new(format);
+  let files: Vec<Made> = (0..40)
+    .map(|file| blob(format, &text(20 + file, &[])))
+    .collect();
+  let names: Vec<String> = (0..files.len())
+    .map(|file| format!("file-{file:02}"))
+    .collect();
+  let entries: Vec<(Mode, &[u8], ObjectId)> = files
+    .iter()
+    .zip(&names)
+    .map(|(file, name)| (Mode::File, name.as_bytes(), file.id))
+    .collect();
+  let root = tree(format, &entries);
+  let head = commit(format, root.id, &[], 1);
+  let mut objects = vec![head.clone(), root];
+  objects.extend(files);
+  push_and_move(
+    &mut repository,
+    &mut store,
+    objects.clone(),
+    &[(1, Some(head.id))],
+  )
+  .unwrap();
+  let clone = Answer::objects(&reached_now(&repository, &store, 1));
+  deflaters::let_go();
+  let before = deflaters::take_counts();
+  let pack = streamed_at(
+    &repository,
+    &store,
+    clone,
+    crate::store::learn::Exchange::cold(MEASURED),
+  );
+  let counts = deflaters::counts();
+  eprintln!(
+    "A-868: {} objects; deflaters before {before:?}, during {counts:?}",
+    objects.len()
+  );
+  let read = read_back(format, &pack, &Held::none()).unwrap();
+  let pushed: BTreeSet<ObjectId> = objects.iter().map(|object| object.id).collect();
+  assert_eq!(once(&read), pushed);
+  assert!(
+    counts.made + counts.reused >= to_u64(objects.len()),
+    "every object deflated took a state: {counts:?}"
+  );
+  assert!(counts.made <= 1, "one state made for the clone: {counts:?}");
+  repository.release(&mut store).unwrap();
+}
+
+/// A-868 (a state taken again deflates as a fresh one). Do: on this thread, deflate a text at every level, each from
+/// a state taken again (reset and set to its level, `flate2::Compress::set_level`), one of them given back part way
+/// through a stream; and the same text at each level from a fresh `flate2::Compress`. Expect: byte for byte the same,
+/// every level, and each inflates back to the text.
+#[test]
+fn a868_a_deflate_state_taken_again_deflates_byte_for_byte_as_a_fresh_one() {
+  use crate::store::{deflaters, fragment};
+  let data = text(400, &[3, 120, 377]);
+  let mut part_way = deflaters::deflater(9);
+  fragment::deflate_more(part_way.state().unwrap(), &data[..1000], false).unwrap();
+  drop(part_way);
+  for level in (0..10).rev().chain(0..10) {
+    let mut fresh = flate2::Compress::new(flate2::Compression::new(level), true);
+    let expected = fragment::deflate_more(&mut fresh, &data, true).unwrap();
+    let mut taken = deflaters::deflater(level);
+    let got = fragment::deflate_more(taken.state().unwrap(), &data, true).unwrap();
+    assert_eq!(got, expected, "level {level}");
+    let mut back = Vec::new();
+    std::io::Read::read_to_end(
+      &mut flate2::read::ZlibDecoder::new(got.as_slice()),
+      &mut back,
+    )
+    .unwrap();
+    assert_eq!(back, data, "level {level}");
+  }
+  assert!(
+    deflaters::counts().reused >= 19,
+    "{:?}",
+    deflaters::counts()
+  );
+}
