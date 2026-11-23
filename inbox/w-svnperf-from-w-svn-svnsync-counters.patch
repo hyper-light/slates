@@ -1,0 +1,74 @@
+diff --git a/crates/cli/tests/svn_interop.rs b/crates/cli/tests/svn_interop.rs
+index 6160054e1..5aaae9320 100644
+--- a/crates/cli/tests/svn_interop.rs
++++ b/crates/cli/tests/svn_interop.rs
+@@ -2411,6 +2411,44 @@ fn footprint_kib(pid: u32) -> Option<u64> {
+   Some(kib as u64)
+ }
+ 
++/// The daemon's `vcs*` and `content*` counters (`status --json`, each shard's `refusals`), summed over its shards by
++/// name: what [`an_svnsync_measured`] prints after each leg, so a measurement reads where a revision's time went (the
++/// store's text reads, pieces fetched through the node's store, texts brought back).
++#[cfg(unix)]
++fn vcs_counters(instance: &str) -> std::collections::BTreeMap<String, u64> {
++  let (_, out, _) = slates(instance, &["status", "--json"]);
++  let status: serde_json::Value = serde_json::from_str(&out).unwrap_or_default();
++  let mut counters = std::collections::BTreeMap::new();
++  for report in status["shards"].as_array().into_iter().flatten() {
++    for counter in report["refusals"].as_array().into_iter().flatten() {
++      let (Some(kind), Some(count)) = (counter["kind"].as_str(), counter["count"].as_u64()) else {
++        continue;
++      };
++      if kind.starts_with("vcs") || kind.starts_with("content") {
++        *counters.entry(kind.to_owned()).or_insert(0) += count;
++      }
++    }
++  }
++  counters
++}
++
++/// What each counter of `after` gained over `before`, divided by `revisions`: a leg's counters a revision, those that
++/// moved alone.
++#[cfg(unix)]
++fn counters_added(
++  before: &std::collections::BTreeMap<String, u64>,
++  after: &std::collections::BTreeMap<String, u64>,
++  revisions: f64,
++) -> Vec<String> {
++  after
++    .iter()
++    .filter_map(|(kind, count)| {
++      let added = count.saturating_sub(before.get(kind).copied().unwrap_or(0));
++      (added > 0).then(|| format!("{kind}={:.2}", added as f64 / revisions))
++    })
++    .collect()
++}
++
+ /// The pid of instance `instance`'s daemon (not its anchor), as `ps` lists it.
+ fn daemon_pid(instance: &str) -> Option<u32> {
+   let listed = Command::new("ps")
+@@ -2458,6 +2496,7 @@ fn an_svnsync_measured() {
+     let (code, out, err) = slates(&instance, &["repository", "import", REPOSITORY, &dump]);
+     assert_eq!(code, 0, "repository import: {out}{err}");
+     let imported = importing.elapsed().as_secs_f64();
++    let after_import = vcs_counters(&instance);
+     let (id, token) = minted_token(&instance, &issuer);
+     let (user, url) = match scheme {
+       "svn" => (
+@@ -2524,11 +2563,14 @@ fn an_svnsync_measured() {
+       .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+       .unwrap_or_default();
+     let revisions = youngest.parse::<f64>().unwrap_or(0.0).max(1.0);
++    let after_sync = vcs_counters(&instance);
+     println!(
+       "an_svnsync_measured {scheme}: import {imported:.1} s; svnsync exit {code} in {seconds:.1} s, {:.1} ms a revision; \
+-       mirror at r{youngest}; daemon RSS {before} KiB before, peak {peak} KiB\n  svnsync: {}",
++       mirror at r{youngest}; daemon RSS {before} KiB before, peak {peak} KiB\n  svnsync: {}\n  counters after the \
++       import: {after_import:?}\n  counters the sync added, a revision: {:?}",
+       seconds * 1e3 / revisions,
+-      err.join().unwrap().trim()
++      err.join().unwrap().trim(),
++      counters_added(&after_import, &after_sync, revisions)
+     );
+   }
+ }
