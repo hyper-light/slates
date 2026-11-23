@@ -396,10 +396,10 @@ impl History {
       prop_assert_eq!(version, self.texts.len() as u64, "versions are dense");
       self
         .texts
-        .push(self.green.content(FILE).map(<[u8]>::to_vec));
+        .push(self.green.content_bytes(FILE).map(<[u8]>::to_vec));
       self
         .others
-        .push(self.green.content(OTHER).map(<[u8]>::to_vec));
+        .push(self.green.content_bytes(OTHER).map(<[u8]>::to_vec));
       self.replaced.push(replaces);
     }
     Ok(())
@@ -762,7 +762,7 @@ fn a_comment_moves_with_lines_added_above_it_and_is_outdated_by_a_change_inside_
     Ok(Reanchored::Moved(moved))
   );
   assert_eq!(
-    lines_of(&green.content_at(FILE, 2).unwrap(), moved),
+    lines_of(&green.content_at_bytes(FILE, 2).unwrap(), moved),
     Some((2, 3))
   );
   let inside = one(OpKind::Insert, FILE, 11, 1, b"x");

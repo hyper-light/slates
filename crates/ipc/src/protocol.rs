@@ -4853,6 +4853,16 @@ pub enum Refusal {
     /// The store's reason, in its words.
     reason: String,
   },
+  /// The node the verb reached holds no record of its volume and is not the volume's owner by its own routing (§4.8
+  /// "Lookup", the rule by authority: only the owner may say that a volume does not exist). A forward met a node whose
+  /// configuration differs from its sender's, or a verb that is not forwarded (a landing's) was sent to a node that is
+  /// not where another host's volume is. Nothing ran and nothing was recorded: retryable, the owner located again, with
+  /// `owner` as the hint where this node's routing names one. Until 2026-11-23 such a node answered `NotFound`, telling
+  /// a reader that acknowledged writes did not exist (the chaos nemesis at seed 8173581894251929445). Appended.
+  NotOwnerHere {
+    /// The volume's owner as this node's routing names it (a member id), where it names one.
+    owner: Option<u64>,
+  },
 }
 
 /// Why a copy was refused before any verdict ([`Refusal::CopyRefused`]): `slates_merge::engine::CopyRefusal` on the

@@ -1978,8 +1978,15 @@
 > **A-873 (2026-11-23, w-svn; main 01a20182's ruling (I), A-760 (b) piece 4a):** a green's identity entry for a file
 > hashes its path, length and plain BLAKE3 digest, which each block keeps from when it was made, not its bytes. Golden
 > vectors are regenerated through `--ignored regenerate_the_identity_golden_vectors`, with a determinism gate. Anchor
-> layout 19 refuses a layout-18 segment typed. OWED: 4b (one read seam, `Bytes | Named`; w-git and w-hg told first),
-> 4c (the engine's named-base reads), 4d (a named block holds no bytes).
+> layout 19 refuses a layout-18 segment typed. 4b BUILT (2026-11-23): one read seam, `engine::Content` (a current
+> file's `Bytes | Named`) and `ContentAt` (at a version); the engine's own reads and its tests take the `*_bytes`
+> readers. svn's held texts fall through to the content store, and a rebase holds a named head file's change whole.
+> Every other site refuses typed: git's `StepRefused::Named` (`vcs_paths.named_unread`, logged with path and green),
+> hg's `Unmade::Named` (`vcs.hg.named_unread`), a mount's read `EAGAIN`/`ERROR_RETRY`, a work's base `BaseGone`, a
+> read page `Unsupported`, checkout `Unsupported`. No producer yet, so no red: the suites are its check. OWED: 4c+4d as
+> one piece (main's ruling of 2026-11-23): a named block's hold of the content store with its bytes dropped, history
+> reads through the plane, sync readers refusing typed and their async callers bringing back (never pinned),
+> `history::reanchor` checking a named replace by identity.
 >
 > **A-869 (2026-11-22, w-svn; main 01a20182's order of 19:28, A-760 (b) piece 2):** a green's checkpoint names a file
 > whose block is named for a content-plane object instead of carrying its bytes (`Checkpoint::named`, a section after
@@ -4384,7 +4391,17 @@
 > (`docs/bugs/2026-11-23-the-svnsync-use-row-compared-two-random-mirror-uuids.md`). The rerun (r12, 112e694e7) left
 > one more of the harness's: revision 0's lengths still counted the `svn:sync-*` lines the comparison dropped, and the
 > source URL differs by leg. The mirror's sync properties are now deleted before the dump, which is compared whole
-> (`a_mirrors_dump_is_the_same_whatever_url_it_was_synced_from`). Owed: main's red and green of that test, and (B).
+> (`a_mirrors_dump_is_the_same_whatever_url_it_was_synced_from`).
+> **Done, proven by use (main 01a20182's rounds on the big Studio, stock Subversion 1.15, 2026-11-23):**
+> - (A), DeltaV v1's revision properties over the HTTP edge: `SLATES_SVN_USE_ROUTE=http-v1`,
+>   `SLATES_SVN_USE_VERBS=revprops`, 0 differences from svnserve at 17 revisions (kiln run r254, after 414925522).
+> - (B), `svnsync` over HTTPv2: git-2000's 2,000 revisions mirrored from slates with 0 differences from stock
+>   svnserve's mirror (`SLATES_SVN_USE_VERBS=svnsync` over `http`, 1 passed; kiln run r21 at main 71c2f07a7).
+> - The harness's rule: `a_mirrors_dump_is_the_same_whatever_url_it_was_synced_from` red at 3bb5e53b1
+>   (`svn_interop.rs:3329`, the mirror over stock svnserve against the one over `file://`) and green at 71c2f07a7
+>   (r21).
+> - `an_svnsync_measured` over HTTP (r254): 2,000 revisions in 301.8 s (150.9 ms a revision), mirror at r2000, daemon
+>   RSS 724 MB before and 994 MB at peak. The same round over svn:// took 510.4 s against P7's 270.7 s, sent to w-svn.
 > **R4, recovery replays a revision record a turn at a time (2026-11-20, w-svn; Ada's close list; found by w-git's sweep):**
 > a Subversion revision's record was replayed whole in one recovery or rebuild turn (`replay_svn` -> `commit_record`),
 > every text it brought deltified in one step, so one large revision held its shard. Now `RevisionReplay`
@@ -4742,9 +4759,12 @@
 >   routed it to no owner, so the guard passed it and it answered five acknowledged writes `NotFound` (ReadSafety, 2 of
 >   4 replays on adacachy2; a diagnostic build named both sides). Now a node without the record answers only as the
 >   volume's creator that no routing sends elsewhere and that did not lose it to a successor; anywhere else a forwarded
->   read, write or work creation is refused `Overloaded`, recorded nowhere, counted
->   `fleet.forward.refused.not_owner_here`. Test:
->   `a_forwarded_read_at_a_node_neither_holding_nor_owning_its_volume_is_refused_retryably` (red: `NotFound`).
+>   read, write or work creation is refused, recorded nowhere, counted `fleet.forward.refused.not_owner_here`: first
+>   `Overloaded` (6b2952f4d), then, by main's ruling the same day, its own kind, `Refusal::NotOwnerHere { owner }` (wire
+>   tag 84, contract 60), the owner the refusing node's routing names kept as the client's route. A landing's
+>   `Present` and `Land` from a node another host's volume is not on, which answered `NotFound`, meet it too. Test:
+>   `a_node_neither_holding_nor_owning_a_volume_answers_not_owner_here_and_its_creator_not_found` (red on the
+>   `Overloaded` stand-in and the landing's `NotFound`).
 >   Record: `docs/bugs/2026-11-23-a-forwarded-read-at-a-node-that-neither-held-nor-owned-the-volume-answered-not-found.md`.
 
 > **A volume whose owner shard refused its state read as absent: fixed (2026-11-19, A-564, §4.8 "Lookup"; g225; found by
@@ -8818,7 +8838,10 @@
 >     - **Closed: the doorbell's herd (A-381, 2026-11-18).** On macOS and Windows each client's ring kicked every shard;
 >       now it marks the shard its region names and the doorbell thread kicks only the shards marked. Each shard's
 >       parks fell 59% and the shards' CPU 20 to 34% at 1,000 clients; the latencies moved with the box's load (14 to 52)
->       more than with the change, so no latency is claimed for it (BENCHMARKS, 2026-11-18).
+>       more than with the change, so no latency is claimed for it (BENCHMARKS, 2026-11-18). Since 2026-11-23 (w-win) the
+>       thread also takes the marks rung before its first look, which it had left for good: a claim made as a daemon
+>       started, or while an anchor restarted one, waited with no bound (the Windows Shards CLI step's 20-minute hang,
+>       `docs/bugs/2026-11-23-a-claim-rung-before-the-doorbell-thread-looked-was-never-answered.md`).
 >     - **Closed: an ask waiting out the batch before it (A-388, 2026-11-18).** One batch of asks was out to an owner at
 >       a time, and the wait for it was about half of an ask's way to the owner (p99 1.6 to 2.1 ms for submits and
 >       rebases at 50 ms); a shard now keeps two out.
