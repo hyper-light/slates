@@ -325,3 +325,14 @@ changeset's entry at once).
 Then: staging pieces (bounded stale re-base; store staging key kind; forgetting an abandoned key's rows), and a push's
 texts let go once their segment lands (RSS 5.5 GB; asked main for content_range.*.resident after push-all).
 Held as patches still: ~/.cache/w-hg-2b-1-works.patch, ~/.cache/w-hg-2b-letgo.patch.
+
+## 2026-11-22 ~17:55 PST (w-hg, main 01a20182)
+Landed since 11:20: 7ced987e6 (clone spins: getbundle::Named a unit a step; stream ask gathered a window a step),
+e72a3d97f (stale re-base equals v10 replay), c2ef17856 (store: forget an unnamed changeset's rows, K keeper rows),
+37efbdab6 (staging: segments off the turn, v11 ranges, bounded re-base, abandoned runs forgotten), 62d01f9a8 (RSS:
+landed push's file texts let go, bring-back within budget; v9 push reader dropped), 50f62ead2 (two load-sensitive
+staging tests bounded by what they measure).
+CI 45065911852: 24/24 on three legs, clone spins gone. RSS: arena 4.7 GB held after push-all (texts); let-go landed,
+main reruns. Open for main's ruling: landed_pin keeps 1/shards of texts (all on a one-shard node).
+Next: 2b (1) (~/.cache/w-hg-2b-1-works.patch, owes the >1-turn non-vacuity test), then 2b let-go for the import, then
+changelog/manifest off the content store.
