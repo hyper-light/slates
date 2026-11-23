@@ -62,6 +62,14 @@ fn main() {
     .unwrap_or(4);
   let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
   let waiters = wakers * per;
+  let settle_ns: u64 = std::env::var("PROBE_SETTLE_NS")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(50_000);
+  let jitter_ns: u64 = std::env::var("PROBE_JITTER_NS")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(0);
   let mech = std::env::var("PROBE_MECH").unwrap_or_else(|_| "ulock".to_owned());
   let churn = flag("PROBE_CHURN");
   let sems: Vec<u32> = (0..waiters)
@@ -269,9 +277,15 @@ fn main() {
           for n in 0..wakes {
             let i = k * per + n % per;
             let next = wword(i).load(Ordering::Relaxed) + 1;
-            // Give the waiter time to sleep again, as a client parks between requests.
+            // Give the waiter time to sleep again, as a client parks between requests: `PROBE_SETTLE_NS` (default 50 µs),
+            // or with `PROBE_JITTER_NS` a spread of 0 to that, so wakes meet waiters entering their wait.
+            let wait_ns = if jitter_ns > 0 {
+              (n as u64).wrapping_mul(2_654_435_761) % jitter_ns
+            } else {
+              settle_ns
+            };
             let settle = mono();
-            while mono() - settle < 50_000 {
+            while mono() - settle < wait_ns {
               std::hint::spin_loop();
             }
             if shm && write_bytes > 0 {
@@ -329,7 +343,9 @@ fn main() {
   let long: Vec<&(u64, u64)> = rows.iter().flatten().filter(|r| r.0 >= 1_000_000).collect();
   let on_cpu = long.iter().filter(|r| r.1 * 10 >= r.0 * 9).count();
   println!(
-    "probe shm={} write_kb={} mech={} churn={} shared={} waker_tb={} waiter_tb={} wakers={} waiters={} spinners/core={}: wake wall p50 {:.1} p99 {:.1} p999 {:.1} max {:.1} us; >=1 ms {} ({} on CPU >=90%)",
+    "probe settle_ns={} jitter_ns={} shm={} write_kb={} mech={} churn={} shared={} waker_tb={} waiter_tb={} wakers={} waiters={} spinners/core={}: wake wall p50 {:.1} p99 {:.1} p999 {:.1} max {:.1} us; >=1 ms {} ({} on CPU >=90%)",
+    settle_ns,
+    jitter_ns,
     u8::from(shm),
     write_bytes >> 10,
     mech,

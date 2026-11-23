@@ -15,31 +15,7 @@ env:
   ROUNDS: "8"
 
 jobs:
-  kernel-syms:
-    name: the runner kernel's nearest exported symbols at the spindump's offsets
-    runs-on: macos-latest
-    steps:
-      - name: Symbolicate
-        run: |
-          sw_vers
-          K=/System/Library/Kernels/kernel.release.vmapple
-          ls -la /System/Library/Kernels/ | head -30
-          uname -a
-          base=$(otool -l "$K" | awk '/segname __TEXT$/{f=1} f&&/vmaddr/{print $2; exit}')
-          echo "text base $base"
-          nm -n "$K" 2>/dev/null | grep -E '^[0-9a-f]+ [TtSs] ' > "$RUNNER_TEMP/syms.txt"
-          wc -l "$RUNNER_TEMP/syms.txt"
-          python3 - "$RUNNER_TEMP/syms.txt" "$base" <<'PY'
-          import sys, bisect
-          rows=[l.split() for l in open(sys.argv[1])]
-          addrs=[int(r[0],16) for r in rows]; names=[r[2] for r in rows]
-          base=int(sys.argv[2],16)
-          for off in [32500,1893452,7673860,6448384,6449188,880848,1221672,1221736,1221772,1893268,6448820,6448920,6448740,6447160,6447272,754924,1311188,1309764,356068,1225812,1893808,1896860,5979160,67144]:
-              a=base+off; i=bisect.bisect_right(addrs,a)-1
-              print(f"+{off}: {names[i] if i>=0 else '?'} + {a-addrs[i] if i>=0 else 0:#x}")
-          PY
   mac-tail:
-    if: ${{ false }}
     name: mac tail (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -61,22 +37,31 @@ jobs:
           cargo build --release --locked -p slates-client --example edit_merge_bench --example g222_floor --example g222_wake_probe > "$W/logs/build.log" 2>&1 || { tail -30 "$W/logs/build.log"; exit 1; }
           cp target/release/examples/edit_merge_bench target/release/examples/g222_floor target/release/examples/g222_wake_probe "$W/"
           echo "runner cpus $(sysctl -n hw.ncpu)"; sw_vers 2>/dev/null || true
-      - name: Loaded rounds with the kernel's stacks sampled (spindump) mid-run
+      - name: The wake probe with the race, every variant, three passes in rotating order
         run: |
           W="$RUNNER_TEMP/msr"; set +e
-          for round in 1 2 3 4 5 6; do
-            L="$W/logs/loaded-r$round.log"
-            echo "== loaded r$round $(date -u +%FT%TZ)" | tee "$L"
-            G222_DIAG="$W/logs/loaded-r$round.tsv" perl -e 'alarm shift; exec @ARGV' 1500 "$W/edit_merge_bench" --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict </dev/null >> "$L" 2>&1 &
-            BENCH=$!
-            sleep 0.5
-            sudo spindump "$BENCH" 8 1 -file "$W/logs/spindump-r$round.txt" > "$W/logs/spindump-r$round.log" 2>&1
-            echo "spindump exit $? size $(wc -c < "$W/logs/spindump-r$round.txt" 2>/dev/null)"
-            wait $BENCH; echo "bench exit $?"
-            grep -E "_loaded_total_p(99|999)\b" "$L" | cut -c1-120
-            grep -c "wake_by_address" "$W/logs/spindump-r$round.txt" 2>/dev/null
+          T="PROBE_WAKER_TB=1 PROBE_WAITER_TB=1 PROBE_SHARED=1"
+          V=(
+            "PROBE_MECH=ulock $T|2"
+            "PROBE_MECH=ulock $T PROBE_SETTLE_NS=0|2"
+            "PROBE_MECH=ulock $T PROBE_JITTER_NS=20000|2"
+            "PROBE_MECH=ulock $T PROBE_SETTLE_NS=0 PROBE_WAKERS=1|2"
+            "PROBE_MECH=ulock $T PROBE_SETTLE_NS=0|0"
+            "PROBE_MECH=ulock $T PROBE_JITTER_NS=20000 PROBE_SHM=1 PROBE_WRITE_KB=64|2"
+            "PROBE_MECH=sem $T PROBE_SETTLE_NS=0|2"
+            "PROBE_MECH=sem $T PROBE_JITTER_NS=20000|2"
+            "PROBE_MECH=pipe $T PROBE_SETTLE_NS=0|2"
+            "PROBE_MECH=pipe $T PROBE_JITTER_NS=20000|2"
+          )
+          for pass in 1 2 3; do
+            n=${#V[@]}
+            for k in $(seq 0 $((n - 1))); do
+              v="${V[$(( (k + pass * 3) % n ))]}"; envs="${v%|*}"; spin="${v#*|}"
+              echo "== pass $pass: $envs spinners $spin"
+              env $envs perl -e 'alarm shift; exec @ARGV' 300 "$W/g222_wake_probe" 10000 "$spin" 2>&1 | tail -2 | tee -a "$W/logs/probe.log"
+            done
           done
-          true
+          echo "######## summary"; sort "$W/logs/probe.log" | grep "^probe"
       - name: Keep the logs
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
