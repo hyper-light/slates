@@ -491,7 +491,7 @@ fn file(state: &ShardState, green: DbVolumeId, path: &str) -> Option<Vec<u8>> {
   state
     .greens
     .get(&green)
-    .and_then(|engine| engine.content(path).map(<[u8]>::to_vec))
+    .and_then(|engine| engine.content_bytes(path).map(<[u8]>::to_vec))
 }
 
 /// Rebuilds the fixtures' repository in `hg` as one push to its empty first line: `base` and `second`, the changesets
@@ -1155,7 +1155,8 @@ fn set_policy(
   assert_eq!(reply, ReplyBody::Acknowledged);
 }
 
-/// Configures repository `name`'s policy, from its first version, to run the `pretxnchangegroup` hook `hook`.
+/// Configures repository `name`'s policy, from its first version, to run the `pretxnchangegroup` hook `hook`, its
+/// program the test binary, a path absolute on the test's host, as the guard asks (A-622).
 fn set_hook(state: &mut ShardState, name: &str, hook: &str) {
   let reply = dispatch(
     state,
@@ -1168,7 +1169,10 @@ fn set_hook(state: &mut ShardState, name: &str, hook: &str) {
       hooks: vec![slates_ipc::protocol::HookConfig {
         point: slates_ipc::protocol::HookPointName::HgPretxnchangegroup,
         name: hook.to_owned(),
-        program: "/usr/local/bin/check".to_owned(),
+        program: std::env::current_exe()
+          .unwrap()
+          .to_string_lossy()
+          .into_owned(),
       }],
       hooks_env: Vec::new(),
       signers: Vec::new(),

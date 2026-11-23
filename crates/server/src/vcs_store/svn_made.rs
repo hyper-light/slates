@@ -496,11 +496,17 @@ fn after<'g>(engine: &'g Green, records: &SvnRecords, path: &str) -> Result<Afte
     return Ok(Some((NodeKind::Directory, None, properties)));
   }
   let primary = engine.hardlink(path).unwrap_or(path);
-  Ok(
-    engine
-      .content(primary)
-      .map(|bytes| (NodeKind::File, Some(Cow::Borrowed(bytes)), properties)),
-  )
+  let Some(content) = engine.content(primary) else {
+    return Ok(None);
+  };
+  // A file held by its content-plane object alone (A-760 (b) 4b): not read here yet, refused typed (piece 4d reads it).
+  let bytes =
+    super::named_objects::lent_bytes_of(primary, content).map_err(|_| Unmade::Unreadable)?;
+  Ok(Some((
+    NodeKind::File,
+    Some(Cow::Borrowed(bytes)),
+    properties,
+  )))
 }
 
 /// Format: the text Subversion keeps a symbolic link as, before its target (`subr/subst.c` `create_special_file_from_stream`

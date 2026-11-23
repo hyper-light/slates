@@ -129,7 +129,7 @@ pub(super) fn green_of(files: &[(&str, &[u8])]) -> Green {
 
 /// `path`'s bytes at the head; none when it holds no file.
 pub(super) fn text(green: &Green, path: &str) -> Option<Vec<u8>> {
-  green.content(path).map(<[u8]>::to_vec)
+  green.content_bytes(path).map(<[u8]>::to_vec)
 }
 
 /// The version each work of a stack landed as; none for one that did not land.

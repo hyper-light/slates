@@ -538,7 +538,13 @@ slates-db = 0
 # SYNCHRONIZE and PROCESS_QUERY_LIMITED_INFORMATION (OpenProcess, the handle adopted), reads its creation time
 # (GetProcessTimes, also of the daemon's own pseudo-handle, GetCurrentProcess) to tell it from a process given its pid
 # after it, and waits on the claim's Event and the process at once (WaitForMultipleObjects); compiled only for Windows.
-slates-ipc = 169
+slates-ipc = 179
+# 2026-11-23 (+10, A-875, w-interop, compiled only for Windows): the Node SDK's completion pipe (`completion_pipe.rs`),
+#   since Node adopts no Windows socket by descriptor: the pipe made (`CreateNamedPipeW`, its handle adopted), its
+#   connect's manual-reset event made and adopted (`CreateEventW`) and reset before each connect (`ResetEvent`), the
+#   connect started and settled without waiting (`ConnectNamedPipe`, `GetOverlappedResult`), its reader judged this
+#   process (`GetNamedPipeClientProcessId`) or cut off (`DisconnectNamedPipe`), and a pending connect cancelled and
+#   awaited on drop (`CancelIoEx` with `GetOverlappedResult`, one block); windows-sys exposes no safe wrapper.
 # 2026-11-23 (+2, A-871, main 01a20182, compiled only for Windows): a client's reply wait raises its own thread one level
 #   above normal and puts it back (`endpoint.rs`, `RaisedForTheWait`): `GetThreadPriority` and `SetThreadPriority` on
 #   the thread's pseudo-handle as the wait begins, `SetThreadPriority` as it ends; windows-sys exposes no safe wrapper.

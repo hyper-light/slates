@@ -322,8 +322,8 @@ fn check_linearizable(setup: &Increment, head_after_setup: u64, log: &[Logged], 
   assert_eq!(replay.fast_path_hits(), green.fast_path_hits());
   for file in 0..FILES {
     assert_eq!(
-      replay.content(&file_name(file)),
-      green.content(&file_name(file))
+      replay.content_bytes(&file_name(file)),
+      green.content_bytes(&file_name(file))
     );
   }
 }
@@ -340,7 +340,7 @@ fn check_by_the_oracle(head_after_setup: u64, log: &[Logged], green: &Green) {
   );
   for (file, expected) in bytes.iter().enumerate() {
     assert_eq!(
-      green.content(&file_name(file)).unwrap(),
+      green.content_bytes(&file_name(file)).unwrap(),
       expected.as_slice(),
       "file {file}: no accepted operation lost, none invented"
     );

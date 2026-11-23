@@ -91,7 +91,7 @@ fn an_ipc_origin_preserves_metadata_and_changes_identity_with_kind_or_owner() {
   let decoded = Origin::decode(&origin.encode()).unwrap();
   let mut green = Green::with_origin(decoded.clone());
   assert_eq!(green.special("pipe"), Some(node(SpecialKind::Fifo)));
-  assert_eq!(green.content("pipe"), None);
+  assert_eq!(green.content_bytes("pipe"), None);
   assert_eq!(green.current_base().specials, origin.specials);
   for replacement in [
     node(SpecialKind::Socket),
@@ -253,7 +253,7 @@ fn declared_ipc_creations_replay_without_file_contents() {
   ] {
     assert_eq!(owner.special(path), Some(node(kind)));
     assert_eq!(owner.mode(path), Some(0o640));
-    assert_eq!(owner.content(path), None);
+    assert_eq!(owner.content_bytes(path), None);
   }
   let reverse = increment(
     &Base::default(),

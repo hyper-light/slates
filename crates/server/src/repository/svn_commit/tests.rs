@@ -150,7 +150,7 @@ fn answered(number: u64) -> Result<Committed, Uncommitted> {
 /// What the green holds at `path`: a file's bytes.
 fn green_file(state: &ShardState, green: DbVolumeId, path: &str) -> Option<Vec<u8>> {
   let engine = state.greens.get(&green)?;
-  engine.content(path).map(<[u8]>::to_vec)
+  engine.content_bytes(path).map(<[u8]>::to_vec)
 }
 
 /// Whether the green holds a directory at `path`.
@@ -1170,7 +1170,7 @@ fn t_s4_c1_the_heads_texts_are_held_by_the_green_and_read_through_it() {
       let texts: [&[u8]; 5] = [b"alpha\n", b"beta\n", b"alpha 2\n", b"gamma\n", b"never\n"];
       let each: Vec<bool> = texts
         .iter()
-        .map(|bytes| engine.held(&identity(bytes)) == Some(*bytes))
+        .map(|bytes| engine.held_bytes(&identity(bytes)) == Some(*bytes))
         .collect();
       (engine.held_count(), each)
     };
@@ -1233,7 +1233,7 @@ fn t_s4_c1_a_green_made_again_holds_its_heads_texts_again_in_one_order() {
       let engine = state.greens.get(&green).expect("the green");
       let held: Vec<bool> = texts
         .iter()
-        .map(|bytes| engine.held(&identity(bytes)) == Some(*bytes))
+        .map(|bytes| engine.held_bytes(&identity(bytes)) == Some(*bytes))
         .collect();
       (engine.held_count(), held)
     });
@@ -1362,6 +1362,11 @@ fn a_commit_naming_a_stored_text_ram_let_go_brings_it_back_for_the_greens_increm
     "the green's file is not the text"
   );
   assert!(fetched >= 1, "no piece read through the store");
+  let pieces = u64::try_from(bytes.len().div_ceil(slates_store::store::PIECE_BYTES)).unwrap();
+  assert!(
+    fetched <= pieces,
+    "{fetched} pieces fetched through the store for a text of {pieces}"
+  );
   assert!(!kept, "the content store kept what the commit brought");
 }
 
@@ -1725,7 +1730,10 @@ fn a_committed_text_is_let_go_by_the_content_store_and_read_through_the_store() 
 /// What a reader of `green`'s engine sees: its head and the bytes at `path` there.
 fn read_green(state: &ShardState, green: DbVolumeId, path: &str) -> Option<(u64, Option<Vec<u8>>)> {
   let engine = state.greens.get(&green)?;
-  Some((engine.head(), engine.content(path).map(<[u8]>::to_vec)))
+  Some((
+    engine.head(),
+    engine.content_bytes(path).map(<[u8]>::to_vec),
+  ))
 }
 
 /// A server-made commit's verdict is held with its landing, never shown before it commits (A-805; main 02:37, piece 1;
@@ -1997,7 +2005,7 @@ fn green_tree(state: &ShardState, green: DbVolumeId) -> GreenTree {
     .into_iter()
     .map(|(path, directory)| {
       let text = engine
-        .content(&path)
+        .content_bytes(&path)
         .map(<[u8]>::to_vec)
         .unwrap_or_default();
       let props = engine.xattr(&path, PROPS).map(<[u8]>::to_vec);

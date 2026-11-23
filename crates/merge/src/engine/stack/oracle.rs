@@ -234,7 +234,7 @@ fn work_over(
 /// Every file `green` holds at `version`, with its bytes.
 fn files_at(green: &Green, version: u64) -> BTreeMap<String, Vec<u8>> {
   green
-    .files_at(version)
+    .files_at_bytes(version)
     .into_iter()
     .map(|(path, bytes)| (path, bytes.into_owned()))
     .collect()

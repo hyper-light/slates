@@ -316,7 +316,7 @@ impl Green {
     if !self.content_history.contains_key(path) {
       return;
     }
-    let then = self.content_ref_at(path, version);
+    let then = self.content_ref_at_bytes(path, version);
     let now = self.content.get(path);
     if then.as_deref() != now {
       exchange(
