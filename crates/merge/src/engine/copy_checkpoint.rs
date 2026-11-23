@@ -343,13 +343,21 @@ impl Green {
 
   /// A file's current bytes set or taken away, the identity's entry moved with them; no history.
   pub(super) fn place_file(&mut self, path: &str, bytes: Option<&[u8]>) {
-    if let Some(old) = self.content.remove(path) {
-      self.identity.remove(&file_entry(path, &old));
-    }
+    self.take_file_entry(path);
     if let Some(bytes) = bytes {
-      self.identity.add(&file_entry(path, bytes));
       self.content.insert(path, bytes.to_vec());
+      if let Some(digest) = self.content.digest_of(path) {
+        self.identity.add(&file_entry(path, digest));
+      }
     }
+  }
+
+  /// The file at `path` taken away with its identity entry, read from its block's digest (A-760 (b) 4a).
+  fn take_file_entry(&mut self, path: &str) {
+    if let Some(digest) = self.content.digest_of(path) {
+      self.identity.remove(&file_entry(path, digest));
+    }
+    self.content.remove(path);
   }
 
   /// A named file of a checkpoint set (A-869): its bytes, the whole of `identity`'s object, taken without a copy and
@@ -360,11 +368,11 @@ impl Green {
     bytes: Vec<u8>,
     identity: crate::named::Identity,
   ) {
-    if let Some(old) = self.content.remove(path) {
-      self.identity.remove(&file_entry(path, &old));
-    }
-    self.identity.add(&file_entry(path, &bytes));
+    self.take_file_entry(path);
     self.content.insert_named(path, bytes, Some(identity));
+    if let Some(digest) = self.content.digest_of(path) {
+      self.identity.add(&file_entry(path, digest));
+    }
   }
 
   /// A directory set or taken away, the identity's entry moved with it; no history.

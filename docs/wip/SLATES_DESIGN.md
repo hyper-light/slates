@@ -61448,3 +61448,38 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
   `sched_param` also no longer builds from its one public field, which is what CI's musl cross lint refused (run
   45176536354). Held by the same test, now passing for x86_64 glibc and musl on adacachy2 (`RLIMIT_RTPRIO` 99).
   Applied in the same change to: `crates/machine/src/round_robin.rs`, GAPS (84a, Linux).
+
+### A-873 — A green's identity entry for a file hashes its digest, not its bytes (2026-11-23, w-svn; main 01a20182's ruling (I) of 2026-11-22, goal 93; A-760 (b) piece 4a of 4; A-202, A-866, A-869)
+
+- **Why.** Piece 4 makes a file held by a content-plane object hold no bytes of its own. The head identity (A-202,
+  LtHash16) took each file's entry over its path and its whole bytes (`engine::file_entry`), and the lazy fold read an
+  older version's bytes from the history, so a block without bytes could neither add nor remove its entry. Of the three
+  ways out (`inbox/main-from-w-svn-a760b-piece4-design.md` on the fan-out ledger), main ruled (I): the entry hashes a
+  digest each block keeps. No identity step reads a file's bytes, a file's bytes are hashed once where they were hashed
+  at every add and remove, and before release a stored format may break: replace, do not layer.
+- **The entry.** A file's identity entry is its tag, its path (length-prefixed), its length (eight bytes, little-endian)
+  and the plain BLAKE3 of its bytes (32 bytes). Each block keeps that digest (`dims::Blocks::digest`), made once with
+  it. A block named for an object takes the object's identity hash, which is the plain BLAKE3 of its bytes
+  (`named::Identity`; `ContentStore::object_id` names every object by its plain BLAKE3 whatever its length or the
+  store's window, so the same bytes are one identity on every machine: R8). A staged block whose bytes grow keeps
+  none, and is hashed when asked.
+- **Where each entry comes from.** A current file's entry comes from its block's digest: an origin's seeding, a commit's
+  mark, the fold's head side, a restore's placement, a removal (the digest read before the file is taken away). An
+  older version's bytes read from the history, a copy's fix and a branch's revert are hashed as read
+  (`engine::file_entry_of`). The from-scratch oracle (`Green::head_identity_from_scratch`) hashes every file's bytes
+  itself, never a block's digest, so a digest made wrong shows as a difference; `crates/merge/tests/identity.rs` holds
+  the incremental sum to it after every step of generated histories.
+- **Goldens and determinism.** The golden head identities moved to `crates/merge/tests/identity.golden`, written by an
+  ignored writer (`--ignored regenerate_the_identity_golden_vectors`) and read by
+  `the_head_identity_is_deterministic_and_matches_its_golden_vector`. That test builds every vector twice and compares
+  them byte for byte before the golden. The vectors are the fixed origin (`a1517630…`, was `d6caa322…` under A-202's
+  entry), the same after an overwrite, and a green holding one file made of a named run, whose identity must equal a
+  green's holding the same bytes carried.
+- **The format break.** Every green's identity changed, and with it every identity recorded before: chain entries,
+  checkpoints' head checks, merge records, the ledger's values. These records store an identity as the engine made it,
+  so none changes shape; a segment of layout 18 is refused at adoption, typed (`AnchorError::Layout`, the anchor's
+  layout 19, `a_segment_from_before_digest_identities_is_refused_at_start`), as A-626's checkpoint version 4 to 5 was.
+- **Not yet.** No byte is dropped in this piece (4b-4d).
+- **Applied in the same change to** `crates/merge` (`dims`, `engine`, `engine/{copy,branch,copy_checkpoint}`,
+  `identity` docs, `tests/origin.rs`, `tests/identity.golden`), `crates/anchor` (`layout`, `tests/anchor.rs`),
+  `crates/vcs` (`ContentStore::object_id`'s doc), GAPS, amendments.tsv.

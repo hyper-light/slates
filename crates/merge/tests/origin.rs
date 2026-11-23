@@ -145,20 +145,138 @@ fn an_origin_file_merges_on_the_fast_path_and_version_zero_reconstructs() {
   );
 }
 
+/// The golden head identities (A-760 (b) 4a): one `name hex` line each, written by
+/// [`regenerate_the_identity_golden_vectors`] and read here, so a change to the identity's encoding is caught across
+/// versions, not only within a run.
+const GOLDEN: &str = include_str!("identity.golden");
+
+/// Format: the golden vectors' file, which the ignored writer rewrites.
+const GOLDEN_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/identity.golden");
+
+/// A content plane of one object for the named vector: its bytes, read by identity.
+struct OneObject(Vec<u8>);
+
+impl slates_merge::named::Objects for OneObject {
+  fn read(
+    &self,
+    identity: &slates_merge::named::Identity,
+    at: u64,
+    into: &mut [u8],
+  ) -> Result<(), slates_merge::named::ObjectMissing> {
+    let missing = slates_merge::named::ObjectMissing {
+      identity: *identity,
+    };
+    let at = usize::try_from(at).map_err(|_| missing)?;
+    let to = at.checked_add(into.len()).ok_or(missing)?;
+    into.copy_from_slice(self.0.get(at..to).ok_or(missing)?);
+    Ok(())
+  }
+}
+
+/// The text of the named vector.
+const NAMED_TEXT: &[u8] = b"a text named by its object\n";
+
+/// A green holding `NAMED_TEXT` as the file `named`, made of a named run of its object (A-760) where `named`, else of
+/// its bytes carried in the post-state.
+fn green_with_text(named: bool) -> Green {
+  use slates_merge::increment::{Base, VolumeOp, compose_volume_planned};
+  let len = NAMED_TEXT.len() as u64;
+  let journal = vec![
+    VolumeOp::Create {
+      path: "named".to_owned(),
+    },
+    VolumeOp::Extend {
+      path: "named".to_owned(),
+      at: 0,
+      len,
+    },
+  ];
+  let (doc, _) = compose_volume_planned(&Base::of_files(Vec::new()), &journal).unwrap();
+  let mut work = Increment {
+    id: [0x4a; 32],
+    base: 0,
+    doc,
+    post_state: Vec::new(),
+    evidence: Vec::new(),
+    named: Default::default(),
+  };
+  if named {
+    let identity = slates_merge::named::Identity {
+      hash: *blake3::hash(NAMED_TEXT).as_bytes(),
+      len,
+    };
+    work.push_named(slates_merge::named::NamedRun {
+      identity,
+      offset: 0,
+      len,
+    });
+    let plane = OneObject(NAMED_TEXT.to_vec());
+    while !work.read_step(&plane, 7).unwrap() {}
+  } else {
+    work.post_state = NAMED_TEXT.to_vec();
+  }
+  let mut green = Green::new();
+  let slates_merge::engine::Judgment::Accepted(judged) = green.judge_named(&mut work) else {
+    panic!("the named vector's work is not accepted");
+  };
+  green.commit_judged(judged).unwrap();
+  green
+}
+
+/// Every golden vector by name, computed afresh: the fixed origin's head identity, the same after an overwrite, and a
+/// green holding one file made of a named run.
+fn identity_vectors() -> Vec<(&'static str, String)> {
+  let mut committed = Green::with_origin(fixed_origin());
+  assert_eq!(
+    committed.submit(&Build::new().overwrite("README", 0, b"HELLO").at(1, 0)),
+    Outcome::Accepted { version: 1 }
+  );
+  vec![
+    (
+      "origin",
+      hex(&Green::with_origin(fixed_origin()).head_identity()),
+    ),
+    ("committed", hex(&committed.head_identity())),
+    ("named", hex(&green_with_text(true).head_identity())),
+  ]
+}
+
+/// The golden vector named `name`.
+fn golden(name: &str) -> Option<&'static str> {
+  GOLDEN
+    .lines()
+    .filter_map(|line| line.split_once(' '))
+    .find(|(named, _)| *named == name)
+    .map(|(_, hex)| hex.trim())
+}
+
 /// The head identity is a pure function of the state — two greens that applied the same increments
 /// to the same origin agree, a differing byte anywhere disagrees, and each version has its own —
-/// and the identity of the fixed origin is pinned by a golden vector so a change to the canonical
-/// encoding is caught across versions, not only within a run.
+/// and its vectors are pinned by golden ones (`identity.golden`). Determinism gate: every vector is built twice and
+/// compared byte for byte before the golden. A-760 (b) 4a (main 01a20182's ruling (I), 2026-11-22): a file's entry
+/// hashes its path, its length and the plain BLAKE3 of its bytes, not the bytes, so a file made of a named run and the
+/// same bytes carried have one identity. The golden vectors were derived again then (`--ignored
+/// regenerate_the_identity_golden_vectors`); before, the entry hashed the bytes: the origin's was
+/// `d6caa3225c45d46abd0a0df26a956a59479af07bcabd8f6ce1cec61f293e4146` (A-202, 2026-11-05), and before A-202 the BLAKE3
+/// of the tables in order, `1fe971c080517dbe400bfbacca80db3df1fc451d8b4c934a9e947c7ed2ab50d8`.
 #[test]
 fn the_head_identity_is_deterministic_and_matches_its_golden_vector() {
-  let origin_identity = Green::with_origin(fixed_origin()).head_identity();
+  let first = identity_vectors();
+  assert_eq!(first, identity_vectors(), "the vectors built twice differ");
+  for (name, vector) in &first {
+    assert_eq!(
+      Some(vector.as_str()),
+      golden(name),
+      "the head identity `{name}` changed; regenerate the golden vectors only for a deliberate format change: \
+       `cargo test -p slates-merge --test origin -- --ignored regenerate_the_identity_golden_vectors`"
+    );
+  }
   assert_eq!(
-    hex(&origin_identity),
-    // A-202 (2026-11-05): the identity became a set hash over the green's entries; before it, the BLAKE3 of the
-    // tables in order, `1fe971c080517dbe400bfbacca80db3df1fc451d8b4c934a9e947c7ed2ab50d8`.
-    "d6caa3225c45d46abd0a0df26a956a59479af07bcabd8f6ce1cec61f293e4146",
-    "the head identity changed; regenerate the golden vector only for a deliberate format change"
+    green_with_text(true).head_identity(),
+    green_with_text(false).head_identity(),
+    "a file's identity is its bytes', named or carried"
   );
+  let origin_identity = Green::with_origin(fixed_origin()).head_identity();
   assert_eq!(
     Green::with_origin(fixed_origin_reversed()).head_identity(),
     origin_identity,
@@ -185,6 +303,21 @@ fn the_head_identity_is_deterministic_and_matches_its_golden_vector() {
     one.head_identity(),
     "one differing byte changes the identity"
   );
+}
+
+/// The deliberate writer of `identity.golden` (CLAUDE.md §4, the `--ignored regenerate` writers): every vector computed
+/// afresh, written one `name hex` line each. Ignored, so a normal run never mutates the tree; run it only for a
+/// deliberate format change, and review the diff.
+#[test]
+#[ignore = "rewrites tests/identity.golden from the engine; run deliberately with --ignored"]
+fn regenerate_the_identity_golden_vectors() {
+  let lines: String = identity_vectors()
+    .into_iter()
+    .map(|(name, vector)| format!("{name} {vector}\n"))
+    .collect();
+  // The design's `--ignored regenerate` writer rewriting a tracked file of the repository; shipped code never reaches it.
+  #[allow(clippy::disallowed_methods)]
+  std::fs::write(GOLDEN_FILE, lines).unwrap();
 }
 
 /// `changed_between(from, to)` names exactly the paths some dimension changed at a version in

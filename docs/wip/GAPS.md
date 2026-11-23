@@ -1872,6 +1872,12 @@
 > `a_file_made_whole_of_a_named_object_is_named_for_it_until_changed`. Piece 2 BUILT as A-869 (below). OWED: piece 3,
 > the history keeping a named version by its name; piece 4, the current block holding no bytes, read through the plane.
 >
+> **A-873 (2026-11-23, w-svn; main 01a20182's ruling (I), A-760 (b) piece 4a):** a green's identity entry for a file
+> hashes its path, length and plain BLAKE3 digest, which each block keeps from when it was made, not its bytes. Golden
+> vectors are regenerated through `--ignored regenerate_the_identity_golden_vectors`, with a determinism gate. Anchor
+> layout 19 refuses a layout-18 segment typed. OWED: 4b (one read seam, `Bytes | Named`; w-git and w-hg told first),
+> 4c (the engine's named-base reads), 4d (a named block holds no bytes).
+>
 > **A-869 (2026-11-22, w-svn; main 01a20182's order of 19:28, A-760 (b) piece 2):** a green's checkpoint names a file
 > whose block is named for a content-plane object instead of carrying its bytes (`Checkpoint::named`, a section after
 > the head check written only when a file is named; version 5 kept, so every checkpoint before decodes as it did). A

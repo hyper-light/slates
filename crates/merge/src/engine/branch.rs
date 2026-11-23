@@ -46,7 +46,7 @@ use std::borrow::Cow;
 use std::ops::{Deref, DerefMut};
 
 use super::{
-  Green, IDENTITY_TAG_HARDLINK, IDENTITY_TAG_SYMLINK, IdentityKey, dir_entry, file_entry,
+  Green, IDENTITY_TAG_HARDLINK, IDENTITY_TAG_SYMLINK, IdentityKey, dir_entry, file_entry_of,
   link_entry, mode_entry, relink, special_entry, xattr_entry,
 };
 use crate::dims::{Arenas, GreenRelease};
@@ -321,8 +321,8 @@ impl Green {
     if then.as_deref() != now {
       exchange(
         identity,
-        now.map(|bytes| file_entry(path, bytes)),
-        then.as_deref().map(|bytes| file_entry(path, bytes)),
+        now.map(|bytes| file_entry_of(path, bytes)),
+        then.as_deref().map(|bytes| file_entry_of(path, bytes)),
       );
     }
     if then.as_deref() != now.filter(|_| !cut) {
