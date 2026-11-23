@@ -566,6 +566,10 @@ impl Runtime {
     prepare: &mut dyn FnMut() -> Result<Prepared, RtError>,
     progress: &mut dyn FnMut(),
   ) -> Result<Runtime, RtError> {
+    // Windows' long-poll attribution reads a thread's CPU from its cycles at a rate measured once a process, about a
+    // millisecond of spinning (`slates_machine::own_cpu`): measured here, before any shard runs a step.
+    #[cfg(windows)]
+    let _ = slates_machine::own_cpu::cycle_rate_hz();
     let mut notes = Vec::new();
     let seeds = register_seeds(config, capacities, prepare, &mut notes, progress)?;
     let ids: Vec<ShardId> = seeds.iter().map(|s| ShardId(s.id)).collect();

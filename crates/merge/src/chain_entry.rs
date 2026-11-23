@@ -76,9 +76,9 @@ const SIGNATURE_BYTES: usize = 1 + 1 + 1 + HASH_BYTES;
 const ENTRY_OVERHEAD_BYTES: usize = 4
   + 4
   + HASH_BYTES
-  + 8
+  + size_of::<u64>()
   + 1
-  + 4
+  + size_of::<u32>()
   + 1
   + COMPLETION_BYTES
   + 1

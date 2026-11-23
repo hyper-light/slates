@@ -82,7 +82,7 @@ fn green_rows(state: &ShardState) -> [(&'static str, u64); 5] {
 }
 
 /// The content hold's charge and objects, and the chains' entries and bytes.
-fn held_rows(state: &ShardState) -> [(&'static str, u64); 4] {
+fn held_rows(state: &ShardState) -> Vec<(&'static str, u64)> {
   let partition = state.db.partition();
   let (mut entries, mut bytes) = (0u64, 0u64);
   for green in state.greens.keys() {
@@ -103,6 +103,7 @@ fn held_rows(state: &ShardState) -> [(&'static str, u64); 4] {
     ("mem.gauge.held.chain_entries", entries),
     ("mem.gauge.held.chain_bytes", bytes),
   ]
+  .to_vec()
 }
 
 #[cfg(test)]

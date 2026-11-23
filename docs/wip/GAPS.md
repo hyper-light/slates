@@ -241,8 +241,14 @@
 >   level (245-492 replies a loaded round taken over 1 ms late; loaded conflict p999 2.8-6.5 ms in every round). A-871:
 >   the OS places every Windows shard, and a client's reply wait stands one level above normal. Every round after it,
 >   quiet and loaded: p99 under 1 ms and p999 135-359 µs, both forms. Measured outside kiln's agent job, which fixes
->   every thread's level (inside it the first round starved past 1,200 s). Open: the runtime's long polls on Windows
->   carry no attribution (`NoClock`).
+>   every thread's level (inside it the first round starved past 1,200 s). The runtime's long polls on Windows carried
+>   no attribution (`NoClock`, 206 a quiet round): ATTRIBUTED (w-perf, 2026-11-23). A Windows thread's account is its
+>   cycle count at a rate measured once a process (`slates_machine::own_cpu`; 3.14 GHz on jupiter), and a wait in a call
+>   is a profiling read whose switches' wait reasons name more than a preemption, a quantum's end or a yield
+>   (`slates_machine::switches::voluntary_waits_now`). Held on jupiter by
+>   `the_platform_reads_a_kernel_sleep_blocked_and_a_spin_long` (`slates-rt`: a 5 ms kernel sleep `Blocked`, a 5 ms
+>   spin `Long`; red `NoClock` with main's account) at 291 ns a read, taken only at a long poll's end and while armed.
+>   Owed: a round on jupiter that names its long polls' holders.
 > - **The client's share:** `edit_merge_bench`'s client spins for its reply at default priority beside the load, so
 >   accept's p99/p999 beyond the daemon's part (macOS 0.8–2.6 / 7–9 ms with the nap fixed) is the harness's own
 >   thread waiting for a CPU.
@@ -774,7 +780,12 @@
 >   thread's first backtrace loading the binary's symbols, were once charged to the next allocation, which put a
 >   one-entry `push::phase_heads` and the watchdog among the top): push 362,278 B a changeset, 86% two sites of the
 >   greens' lend (`Green::default`'s `SetHash`, 2 KiB a lend, 167,321; `Greens::lend`'s closure, 145,472); clone 14,632
->   and stream clone 20,645, the store's `texts_by_tools`, the index's `iter_from` and row scans. OPEN: the cuts by size, then bounds in this test.
+>   and stream clone 20,645, the store's `texts_by_tools`, the index's `iter_from` and row scans. Then the lend cut
+>   (main's order): a lineage member's lend allocates nothing. `merge::identity::SetHash` makes its 2 KiB of lanes at
+>   its first change, so an empty engine (a lend's restore leaves one) is free; and `engine::branch::Lent` keeps the
+>   member's engine in the lineage's slot for the one out (`Lineage::lent`), the guard only the lineage and a handle,
+>   so `GreenRef`/`GreenMut` box nothing. Push: 362,278 B a changeset now 49,909, the lend's 300,292 B (red) now none.
+>   OPEN: the cuts by size, then bounds in this test.
 > - Branch heads kept as changesets land BUILT (2026-11-23, w-hg; main's ruling (b) on CI 45127535742: a `lookup` of a
 >   branch name ran one 348 ms step on x86, wrote 43 bytes, `branch_tip` scanning every revision's branch and then
 >   `branch_head_revs` walking the whole history, as `branchmap` whole did, 155-161 ms CPU a call). `HgIndex` keeps
@@ -806,8 +817,10 @@
 >   or a manifest into the buffer of the one kept before the last (`Taker::spare`; `delta::apply_into` keeps its
 >   capacity), which no later delta rests on, so a manifest's rebuild allocates nothing past the first. The test now
 >   `a_pushs_churn_per_changeset_is_its_file_alone`: red 102,045 B an edit, now 10,766 B (0.12 manifests).
-> - The watchdog's beat allocates nothing BUILT (2026-11-23, w-perf; main's order on `hg_push_heap`'s first read: the
->   watchdog's lateness p99 and its beat, 24% of a push's sampled bytes, about 10-15 MB a second on two shards).
+> - The watchdog's beat allocates nothing BUILT (2026-11-23, w-perf; main's order). A beat made 4 allocations, about
+>   1 KB by their types (estimated, not measured). `hg_push_heap`'s first read had charged the watchdog 24% of a push's
+>   sampled bytes, about 10-15 MB a second; that was its sampler's artifact (a thread's first symbol load charged to its
+>   next allocation, fixed in f14ea81bb), not the watchdog's.
 >   `watchdog::LatenessTail` keeps A-474's hundred readings in a fixed ring, its p99 a stack copy sorted, and the beat
 >   refills its looks, windows and verdicts in place. Held by `the_watchdogs_beat_allocates_nothing_once_it_runs`
 >   (`crates/server/tests/watchdog_allocations.rs`: a counting allocator on the thread named `slates-watchdog`; red 82

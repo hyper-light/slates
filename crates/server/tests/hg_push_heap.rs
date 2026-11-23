@@ -179,6 +179,9 @@ struct Row {
   total: u64,
   /// The top sites, most bytes first.
   sites: Vec<(String, u64)>,
+  /// The bytes sampled at a green's lend (`Greens::lend`, or the default `Green` a lend's restore made): none once a lend
+  /// allocates nothing.
+  lends: u64,
 }
 
 /// Runs `command` as row `name`, the sampler on for its length: its figures; panics where it fails.
@@ -203,12 +206,20 @@ fn row(name: &'static str, command: &mut Command) -> Row {
     .unwrap_or_default()
     .into_iter()
     .collect();
+  let lends = sites
+    .iter()
+    .filter(|(site, _)| {
+      site.contains("Greens>::lend") || site.contains("Green as core::default::Default")
+    })
+    .map(|(_, bytes)| *bytes)
+    .sum();
   sites.sort_by(|left, right| right.1.cmp(&left.1));
   sites.truncate(LISTED);
   Row {
     name,
     total: TOTAL.load(Ordering::Relaxed),
     sites,
+    lends,
   }
 }
 
@@ -374,6 +385,15 @@ fn a_daemons_allocation_by_site_under_stock_mercurial() {
       row.total > 0 && !row.sites.is_empty(),
       "{}: the sampler counted",
       row.name
+    );
+    // Main's order of 2026-11-23: a green's lend allocates nothing (no default `Green`, no box a lend). Red before:
+    // the push's 86%, 313 KB a changeset of `Green::default`'s set hash and `Greens::lend`'s box.
+    assert_eq!(
+      row.lends / CHANGESETS,
+      0,
+      "{}: a green's lend allocated {} B a changeset",
+      row.name,
+      row.lends / CHANGESETS
     );
   }
 }
