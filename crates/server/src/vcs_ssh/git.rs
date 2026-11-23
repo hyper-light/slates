@@ -320,7 +320,10 @@ impl<L: StoreLender> UploadCommand<L> {
     {
       *last_written_ns = now;
     }
-    if written == Written::More {
+    // A-864's readers (main 01a20182's r227: the re-lift's SSH fetch of git/git ended mid-answer): an answer held for a
+    // let-go window its pack's choice met, its sections written, is kept, not dropped as written; the next step brings
+    // the window back and makes it again past what it wrote (`read_through_held`), as the HTTP edge does.
+    if written == Written::More || made.held_away().is_some() {
       return Ok(Next::More);
     }
     // A refusal is the answer's to say, as it is made or as it is written (a pack's choice refused midway): its session

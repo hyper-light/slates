@@ -5553,8 +5553,10 @@ drops.
 > holds its own. On Linux the holder is the listening socket, which the anchor keeps across a restart and whose queued
 > claims the kernel resets when its last holder closes it; on macOS the owner's bootstrap name, which the anchor holds
 > while it holds the rendezvous; on Windows the anchor's process, named in the bootstrap header by its process id and
-> creation time (the layout `SLB4`), else the daemon's (A-447) with its start stamp. A claim refused for now (no claim
-> slot free, the restarted daemon not yet published, the daemon gone mid-answer) asks `slates_ipc::holder_lives`: with a
+> creation time (the layout `SLB4`) while it holds the rendezvous and cleared when it lets go (since 2026-11-23: the
+> header outlives the hold while a client's doorbell maps the object), else the daemon's (A-447) with its start stamp.
+> A claim refused for now (no claim slot free, the restarted daemon not yet published, the daemon gone mid-answer) asks
+> `slates_ipc::holder_lives`: with a
 > holder the client claims again, paced as an async connect polls (doubling, at most a tenth of the claim wait); with
 > none it fails `DaemonGone` at once. The synchronous reconnect and the async driver's recovery keep that one rule.
 > `Deadlines::reconnect_ns` remains only for the waits on a fleet owner's takeover (a request refused for now held for
@@ -38643,6 +38645,16 @@ and `crates/server/src/direct_map.rs` (the offers' callers), `crates/server/test
   `crates/client/tests/waits.rs` gone case is now `a_call_to_a_killed_unanchored_daemon_ends_daemon_gone_at_once`: a
   killed daemon that held its own rendezvous ends both calls `DaemonGone` before the old budget, where it asserted they
   took at least it.
+- **An anchor's going, written (w-win for main 01a20182, 2026-11-23).** `Held`'s drop clears the anchor's mark from
+  the bootstrap header (its pid, and on Windows its creation time), while its owner's token is still held. The header
+  outlives the hold while a client maps the object, as a connected client's doorbell does, and Windows keeps a named
+  object while any handle holds it (A-176). So an anchor that let go inside a live process read as the holder for good
+  there: `holder_lives` named that process, alive, and its daemon's clients claimed again for good. The client
+  driver's `every_call_ends_and_the_loop_is_never_held_across_restart_and_death` failed so on both Windows lanes (CI run
+  45176536354: `call 64 after the daemon's death ended DaemonGone: None`). Held by
+  `an_anchor_that_lets_go_is_no_holder_though_a_client_maps_the_object` (macOS and Windows). Applied in the same change
+  to: `crates/ipc/src/rendezvous.rs`, §4.7's A-468 status, GAPS (A-468),
+  `docs/bugs/2026-11-23-a-windows-anchor-that-let-go-still-read-as-the-rendezvous-holder.md`.
 
 ### A-497 — Version-control servers over greens and works: the shared mapping (2026-11-18, g261 for UI goal 91; new §4.17 and D-28; §4.8, §4.16)
 - **What it adds.** §4.17's frame and its shared part, §4.17.1: how a stock git, Mercurial or Subversion client's

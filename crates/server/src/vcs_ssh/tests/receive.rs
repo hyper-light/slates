@@ -454,6 +454,8 @@ fn a_pushed_pack_let_go_by_its_commit_is_cloned_whole_and_shallow_over_ssh() {
   };
   let waited = std::time::Instant::now();
   while let_go_bytes() == 0 && waited.elapsed() < std::time::Duration::from_secs(10) {
+    // The harness paces its looks; the daemon under test waits on its wheel.
+    #[allow(clippy::disallowed_methods)]
     std::thread::sleep(std::time::Duration::from_millis(20));
   }
   let let_go = let_go_bytes();
@@ -488,6 +490,108 @@ fn a_pushed_pack_let_go_by_its_commit_is_cloned_whole_and_shallow_over_ssh() {
   }
 }
 
+/// Main 01a20182's r227 (the re-lift on main, git/git over SSH: `fetch-pack: unexpected disconnect while reading
+/// sideband packet` 114 KiB into the mirror fetch; on a made history, a shallow clone right after its `packfile`
+/// header): an answer whose pack's choice reads an object in a let-go pack (here the shallow cut's reads of a later
+/// push's commit and tree) is held for its window (`Answer::held_away`) with its sections already written; the SSH edge
+/// dropped such an answer as written, so the session ended mid-answer, where the HTTP edge brings the window back and
+/// makes the answer again past what it wrote. Do: on an audit daemon's shard, serve the SSH edge with the production
+/// site; push over SSH `main` at a commit of one 256 KiB file, then a commit over it carrying a file and a tree of its
+/// own, a small pack; with nothing let go by hand, wait for both pushes' commits to let their packs go; then fetch over
+/// SSH as `git clone --depth 1` asks (`include-tag`, `deepen 1`, `want-ref refs/heads/main`, `done`). Expect: the session
+/// exits 0, its pack the later commit's objects, each the pushed bytes. A guard, green before and after the fix: this
+/// single-shard edge does not reach the held answer that stock git's own session reached (git_interop's whole session
+/// over SSH on a made history, red 3 of 3 before the fix: the shallow clone's answer held for a window of the work
+/// clone's 284-byte pack); the unit red at the edge is owed.
+#[test]
+fn a_shallow_clone_of_a_later_push_let_go_is_answered_whole_over_ssh() {
+  use crate::vcs_http::daemon_edge_tests::{
+    fetched_pack_after, git_name, large_create, objects_of, packets_from, stored_pack,
+  };
+  use slates_git::object_name::Kind;
+  use slates_git::pktline::{self, Packet};
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (_, address, _) = observe_first(&daemon, |state| {
+    serving_within(state, ROOM, GIT_KEEPALIVE_NS)
+  });
+  let let_go_bytes = || {
+    observe_first(&daemon, |state| {
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      count(crate::vcs_store::LANDED_LET_GO_BYTES)
+        + count(crate::vcs_store::homes::LANDED_HOME_LET_GO_BYTES)
+    })
+  };
+  let let_go_past = |past: u64| {
+    let waited = std::time::Instant::now();
+    while let_go_bytes() <= past && waited.elapsed() < std::time::Duration::from_secs(10) {
+      std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let_go_bytes()
+  };
+  let (base, base_commit) = large_create(1 << 18);
+  let first = pushed_patiently(address, &base);
+  let after_first = let_go_past(0);
+  let file = b"carried\n".to_vec();
+  let mut tree = b"100644 carried\0".to_vec();
+  tree.extend_from_slice(git_name(Kind::Blob, &file).as_bytes());
+  let tree_id = git_name(Kind::Tree, &tree);
+  let commit = format!(
+    "tree {tree_id}\nparent {base_commit}\nauthor A <a@example.com> 1700000001 +0000\n\
+     committer A <a@example.com> 1700000001 +0000\n\ncarried\n"
+  )
+  .into_bytes();
+  let commit_id = git_name(Kind::Commit, &commit);
+  let pack = stored_pack(&[
+    (Kind::Commit, commit.as_slice()),
+    (Kind::Tree, tree.as_slice()),
+    (Kind::Blob, file.as_slice()),
+  ]);
+  let mut on_top = Vec::new();
+  let line = format!("{base_commit} {commit_id} refs/heads/main\0 report-status");
+  pktline::write(Packet::Data(line.as_bytes()), &mut on_top).expect("the command");
+  pktline::write(Packet::Flush, &mut on_top).expect("the flush");
+  on_top.extend_from_slice(&pack);
+  let second = pushed_patiently(address, &on_top);
+  let after_second = let_go_past(after_first);
+  let mut fetch = Vec::new();
+  pktline::write(Packet::Data(b"command=fetch\n"), &mut fetch).expect("the command");
+  pktline::write(Packet::Delim, &mut fetch).expect("the delimiter");
+  for line in [
+    "thin-pack\n",
+    "no-progress\n",
+    "include-tag\n",
+    "ofs-delta\n",
+    "deepen 1\n",
+    "want-ref refs/heads/main\n",
+    "done\n",
+  ] {
+    pktline::write(Packet::Data(line.as_bytes()), &mut fetch).expect("an argument");
+  }
+  pktline::write(Packet::Flush, &mut fetch).expect("the flush");
+  let fetched = fetched_adjusting(address, &fetch);
+  daemon.stop();
+  assert_eq!(first.map(|transcript| transcript.status), Some(Some(0)));
+  assert_eq!(second.map(|transcript| transcript.status), Some(Some(0)));
+  assert!(
+    after_first > 0 && after_second > after_first,
+    "both pushes' packs let go: {after_first} then {after_second} bytes"
+  );
+  let fetched = fetched.expect("the fetch's session");
+  assert_eq!(
+    fetched.status,
+    Some(0),
+    "{}",
+    String::from_utf8_lossy(&fetched.err)
+  );
+  let (_, advertised_end) = packets_from(&fetched.out, 0);
+  let answer = fetched.out.get(advertised_end..).unwrap_or_default();
+  assert_eq!(
+    objects_of(&fetched_pack_after(answer)),
+    objects_of(&pack),
+    "the pack the later commit's objects, each the pushed bytes"
+  );
+}
+
 /// [`fetched_over_ssh`], read as OpenSSH's client reads: the channel's window given back
 /// (`SSH_MSG_CHANNEL_WINDOW_ADJUST`) once half of it is read, so an answer past [`CLIENT_WINDOW`] is read whole (as
 /// `vcs_ssh::tests::hg`'s `transcript_adjusting` reads).
@@ -500,6 +604,13 @@ fn fetched_adjusting(address: SocketAddrV4, request: &[u8]) -> Option<Transcript
     send_data(&mut peer, piece);
   }
   send_data(&mut peer, b"0000");
+  Some(transcript_giving_the_window_back(&mut peer))
+}
+
+/// Reads the session as OpenSSH's client does, at the wire's pace: each data message's bytes counted, the window given
+/// back (`SSH_MSG_CHANNEL_WINDOW_ADJUST`) once half of it is read, until the server closes the session; everything it
+/// gave.
+fn transcript_giving_the_window_back(peer: &mut Peer) -> Transcript {
   let mut transcript = Transcript::default();
   let mut unadjusted: u32 = 0;
   while let Some(message) = peer.next(&[94, 95, 96, 97, 98]) {
@@ -544,7 +655,7 @@ fn fetched_adjusting(address: SocketAddrV4, request: &[u8]) -> Option<Transcript
       _ => {}
     }
   }
-  Some(transcript)
+  transcript
 }
 
 /// [`pushed_over_ssh`] at protocol v0, its client patient: it waits for the push's answer while the session is open,

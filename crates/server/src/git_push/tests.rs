@@ -3328,33 +3328,7 @@ fn t_a859_a_clone_of_a_deltified_push_sends_its_entries_as_they_lie() {
       streamed.len()
     );
     let deltas = u64::try_from(TAGGED_LINE - 1).unwrap();
-    assert!(
-      counted_streamed.reused_whole > 0
-        && counted_streamed.reused_deltas == deltas
-        && counted_streamed.reuse_refused == 0,
-      "every one of the {deltas} pushed deltas reused: {counted_streamed:?}"
-    );
-    // main 01a20182's ruling of 2026-11-22 05:38: a stored entry is reused whenever one exists, so no pushed object is
-    // searched or encoded afresh.
-    assert_eq!(
-      (
-        counted_streamed.loose_whole + counted_streamed.loose_deltas,
-        counted_streamed.reused_whole + counted_streamed.reused_deltas,
-      ),
-      (0, u64::try_from(objects.len()).unwrap()),
-      "every pushed object sent as its entry lies, none encoded: {counted_streamed:?}"
-    );
-    // A-864: each sent on by its kept CRC32, none rebuilt to be checked; the pack read front to back (piece 1), no
-    // pushed entry read before the one read before it.
-    assert_eq!(
-      (
-        counted_streamed.reuse_rebuilt,
-        counted_streamed.reuse_crc_missed,
-        counted_streamed.backward_reads
-      ),
-      (0, 0, 0),
-      "{counted_streamed:?}"
-    );
+    assert_the_stream_sent_every_pushed_entry_as_it_lies(&counted_streamed, deltas, objects.len());
     assert_whole_clone(&streamed, objects.len());
     while crate::vcs_store::git_encode::turn(state, repository)
       != crate::vcs_store::git_encode::Turned::Idle
@@ -3390,6 +3364,40 @@ fn t_a859_a_clone_of_a_deltified_push_sends_its_entries_as_they_lie() {
     );
     assert_whole_clone(&clone, objects.len());
   });
+}
+
+/// The streamed clone's counters in [`t_a859_a_clone_of_a_deltified_push_sends_its_entries_as_they_lie`], `counted`:
+/// every one of the push's `deltas` reused and none refused, and every one of its `objects` sent as its entry lies.
+fn assert_the_stream_sent_every_pushed_entry_as_it_lies(
+  counted: &slates_git::store::UploadCounters,
+  deltas: u64,
+  objects: usize,
+) {
+  assert!(
+    counted.reused_whole > 0 && counted.reused_deltas == deltas && counted.reuse_refused == 0,
+    "every one of the {deltas} pushed deltas reused: {counted:?}"
+  );
+  // main 01a20182's ruling of 2026-11-22 05:38: a stored entry is reused whenever one exists, so no pushed object is
+  // searched or encoded afresh.
+  assert_eq!(
+    (
+      counted.loose_whole + counted.loose_deltas,
+      counted.reused_whole + counted.reused_deltas,
+    ),
+    (0, u64::try_from(objects).unwrap()),
+    "every pushed object sent as its entry lies, none encoded: {counted:?}"
+  );
+  // A-864: each sent on by its kept CRC32, none rebuilt to be checked; the pack read front to back (piece 1), no
+  // pushed entry read before the one read before it.
+  assert_eq!(
+    (
+      counted.reuse_rebuilt,
+      counted.reuse_crc_missed,
+      counted.backward_reads
+    ),
+    (0, 0, 0),
+    "{counted:?}"
+  );
 }
 
 /// Shape: the files of [`t_a859_an_encoding_places_a_pushed_deltas_base_before_it`]'s one commit, each a line longer

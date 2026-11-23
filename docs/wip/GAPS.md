@@ -16,7 +16,10 @@
 > its overlay borrow ends, and an open's descriptor closes at its last close. A later read reopens through the home and
 > proves the file the inode was made from (A-151). Witnessed large copies keep theirs (their witness reads through it).
 > Red on main: 500 reads left 506 handles open against 6; green: 6 (`reading_base_files_keeps_no_descriptor_after_the_reads`,
-> `an_open_base_file_keeps_its_descriptor_until_its_last_close`).
+> `an_open_base_file_keeps_its_descriptor_until_its_last_close`). The real-disk counterpart
+> (`crates/base/tests/host.rs`, `an_overlay_over_the_workspace_tree_costs_one_open_and_reads_the_disk`) kept the old
+> count, the read's descriptor held after its borrow (3 != 4 on Windows in CI run 45176536354 and on macOS); since
+> 2026-11-23 (w-win) it holds the rule on the disk: root, `vfs` and `src` alone.
 > **Closed (main, 2026-11-21, A-833): a recovery reopened every base directory the image recorded, in one step.** kiln's
 > daemon on adacachy recorded about 192,000, overran the 1 s liveness window and was killed a second into every restart.
 > Now a recovery reopens the root alone; each other directory is reacquired at its first use (`Overlay::reacquire`:
@@ -154,6 +157,14 @@
 > and every clone (stock_git_verbs 1 of 8). Lifted when w-git's fetch-side readers (A-855's held answer, brought back and
 > made again) and the push decision's reads bring a let-go window back, with w-shared's red: annotated tags pushed, the
 > push ended, idle, then ls-remote and a clone byte-identical to stock.
+> **r227's SSH regression FIXED (w-git, 2026-11-23):** with the lift, stock git's fetch over SSH ended mid-answer
+> (`unexpected disconnect while reading sideband packet`; on a made history, the shallow clone right after its
+> `packfile` header): an answer whose pack's choice read a let-go window is held for it (`Answer::held_away`) with its
+> sections written, and the SSH edge's `write_answer` dropped it as written, where the HTTP edge brings the window back
+> and makes it again past what it wrote. Now the SSH edge keeps it and its next step does the same (`read_through_held`).
+> Red at the session: git_interop's whole session over SSH on a made history failed 3 of 3, every step held after.
+> Owed: a unit red at the edge (the single-shard edge tests reach no held answer); the SSH edge's wait for room
+> (A-855: an answer held for room is dropped the same way; the HTTP edge's `wait_for_room` has no SSH twin).
 > **LIFTED AGAIN (w-git, 2026-11-23, main 01a20182's order after r165):** `vcs_store::LANDED_LET_GO` on, one switch for
 > a commit's let-go and a recovery's or rebuild's (w-shared's `put_changeset`): the commit owes its pack and the push's
 > end or the repository's idle give-back lets it go a slice a turn (3e1588a54, the quantum alone ending a slice), every
@@ -4366,6 +4377,11 @@
 > stock 1.15 over `SLATES_SVN_USE_ROUTE=http-v1` with `SLATES_SVN_USE_VERBS=revprops` against svnserve; and
 > `svnsync synchronize` over HTTP, the mirror against svnserve's byte for byte (`an_svnsync_measured`'s DAV leg,
 > `SLATES_SVN_USE_VERBS=svnsync` over `http`).
+> **(B)'s one difference was the harness's (w-interop, 2026-11-23):** main's round failed on the mirrors' `UUID:` line
+> alone. Stock `svnsync` never sets a mirror's UUID (`svnsync.c` `do_initialize`), so each `svnadmin create` mirror
+> held a random one. The HTTP edge reports the imported dump's UUID (OPTIONS and PROPFIND, checked). `mirror_dump_of`
+> now gives each mirror `MIRROR_UUID`, as `svn-matrix.sh` does
+> (`docs/bugs/2026-11-23-the-svnsync-use-row-compared-two-random-mirror-uuids.md`). Owed: main's rerun of (B).
 > **R4, recovery replays a revision record a turn at a time (2026-11-20, w-svn; Ada's close list; found by w-git's sweep):**
 > a Subversion revision's record was replayed whole in one recovery or rebuild turn (`replay_svn` -> `commit_record`),
 > every text it brought deltified in one step, so one large revision held its shard. Now `RevisionReplay`
@@ -9728,8 +9744,11 @@
 >   (`a_claim_under_a_live_anchor_waits_out_a_restart_slower_than_the_old_reconnect_budget`,
 >   `a_claim_under_an_anchor_ends_at_the_anchors_going`,
 >   `a_rendezvous_has_a_holder_while_its_anchor_or_its_own_daemon_lives`;
->   `a_call_to_a_killed_unanchored_daemon_ends_daemon_gone_at_once`). `reconnect_ns` still bounds the waits on a fleet
->   owner's takeover (a request refused for now held for its resend, the pause between resends,
+>   `a_call_to_a_killed_unanchored_daemon_ends_daemon_gone_at_once`). Since 2026-11-23 (w-win) an anchor's going clears
+>   its mark from the header: a client's doorbell keeps a Windows object past the hold, so an anchor that let go inside a
+>   live process had read as the holder for good (`an_anchor_that_lets_go_is_no_holder_though_a_client_maps_the_object`;
+>   `docs/bugs/2026-11-23-a-windows-anchor-that-let-go-still-read-as-the-rendezvous-holder.md`). `reconnect_ns` still
+>   bounds the waits on a fleet owner's takeover (a request refused for now held for its resend, the pause between resends,
 >   `Client::call_through_transient`), owed to the failover delay the daemon reports. The server's reclaim of a
 >   taken-back map no holder claims (`held_copy::reconnect_budget_ns`, "The holder claims it") mirrored the old
 >   reconnect budget, a fixed two seconds R3 forbids; since A-552 its claim is owed for the failover delay its shard
