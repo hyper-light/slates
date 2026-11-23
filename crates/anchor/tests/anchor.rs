@@ -975,6 +975,128 @@ fn a_daemon_killed_after_it_served_is_restarted_every_time() {
   );
 }
 
+/// Format: the variable that turns this binary into [`counting_child`].
+#[cfg(target_os = "linux")]
+const CHILD_COUNTS: &str = "SLATES_ANCHOR_TEST_COUNTS";
+/// Shape: the content object the descriptor test's anchor holds beside its segment: a few pages.
+#[cfg(target_os = "linux")]
+const COUNTED_CONTENT_BYTES: usize = 16 * 4096;
+
+/// How many of this process's descriptors name the memory object whose `/proc/self/fd` link reads `target`.
+#[cfg(target_os = "linux")]
+fn descriptors_naming(target: &str) -> u64 {
+  let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+    return 0;
+  };
+  let named = entries
+    .flatten()
+    .filter(|entry| std::fs::read_link(entry.path()).is_ok_and(|link| link.as_os_str() == target))
+    .count();
+  u64::try_from(named).unwrap_or(u64::MAX)
+}
+
+/// How many of this process's descriptors name the object the inherited descriptor numbered in `variable` names.
+#[cfg(target_os = "linux")]
+fn descriptors_like_the_inherited(variable: &str) -> u64 {
+  let number = std::env::var(variable).unwrap();
+  let link = std::fs::read_link(format!("/proc/self/fd/{number}")).unwrap();
+  descriptors_naming(&link.to_string_lossy())
+}
+
+/// The child [`an_anchor_started_again_and_again_hands_each_daemon_its_objects_once`] supervises: before it attaches, it
+/// counts its descriptors of the segment and of the content object, by what the numbers its environment names resolve
+/// to, beats the sum, marks that it serves, and serves on until it is killed. Ignored, and run by its parent with
+/// `--ignored --exact`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "the counting child; run by an_anchor_started_again_and_again_... with --ignored"]
+fn counting_child() {
+  if std::env::var_os(CHILD_COUNTS).is_none() {
+    return;
+  }
+  let held = descriptors_like_the_inherited(slates_anchor::segment::ENV_HANDOFF)
+    + descriptors_like_the_inherited(slates_anchor::segment::ENV_CONTENT);
+  let segment = AnchorSegment::attach_from_env(&identity()).unwrap();
+  let supervision = segment.supervision().unwrap();
+  supervision.beat(held);
+  supervision.mark_serving(held);
+  #[allow(clippy::disallowed_methods)]
+  std::thread::sleep(served_watch());
+  std::process::exit(EXIT);
+}
+
+/// main 01a20182's ruling of 2026-11-23 (the sweep in
+/// docs/bugs/2026-11-23-every-linux-client-connect-left-its-regions-descriptor-open.md): an anchor hands every daemon it
+/// starts one descriptor of each of its objects, and keeps none for a start. Do: with a segment and a content object,
+/// supervise [`counting_child`], killing each child once it has recovered, [`SERVED_KILLS`] times; count this
+/// process's descriptors of each object before the first start and after the last restart, and read each child's count
+/// of its own at its start (its beat). Expect: this process's counts unchanged, and every child holding two, one of
+/// each object. Before, each start made an inheritable duplicate of both objects and never closed it: the anchor kept
+/// two more descriptors per start, and each child inherited every duplicate made before it.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_anchor_started_again_and_again_hands_each_daemon_its_objects_once() {
+  let kills = usize::try_from(SERVED_KILLS).unwrap();
+  let name = unique_name("slates-anchor-test-fds");
+  let content_name = format!("slates-anc-fds-c-{}", std::process::id());
+  let segment = AnchorSegment::create(&name, &identity(), geometry())
+    .unwrap()
+    .with_content(&content_name, COUNTED_CONTENT_BYTES)
+    .unwrap();
+  let targets = [
+    format!("/memfd:{name} (deleted)"),
+    format!("/memfd:{content_name} (deleted)"),
+  ];
+  let count = || targets.each_ref().map(|target| descriptors_naming(target));
+  let args = vec![
+    "--ignored".to_owned(),
+    "--exact".to_owned(),
+    "counting_child".to_owned(),
+    "--nocapture".to_owned(),
+  ];
+  let mut supervisor = Supervisor::new(segment, &args, policy()).unwrap();
+  supervisor.hold_environment(CHILD_COUNTS, "1".to_owned());
+  let before = count();
+  let clock = Instant::now();
+  supervisor.start(now_ns(clock)).unwrap();
+  let deadline = served_watch();
+  let mut held = Vec::new();
+  let mut restarts = 0usize;
+  let mut refused = None;
+  while restarts < kills && clock.elapsed() < deadline {
+    match supervisor.step(now_ns(clock)).unwrap() {
+      Step::Running => {
+        // Each child is read and killed once, and only once its supervisor has published that it recovered.
+        if held.len() == restarts && supervisor.has_recovered().unwrap() {
+          held.push(supervisor.segment().supervision().unwrap().heartbeat_ns());
+          supervisor.kill().unwrap();
+        }
+        // The test harness paces the poll; shipped code parks on its driver (D-9).
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(Duration::from_micros(POLL_US));
+      }
+      Step::Restarted { .. } => restarts += 1,
+      other => {
+        refused = Some(format!("{other:?}"));
+        break;
+      }
+    }
+  }
+  supervisor.stop().ok();
+  let after = count();
+  assert_eq!(
+    (restarts, refused),
+    (kills, None),
+    "every killed child was restarted"
+  );
+  assert_eq!(
+    (after, held.as_slice()),
+    (before, vec![2u64; kills].as_slice()),
+    "this process's descriptors of the segment and the content object, before the first start and after the last \
+     restart (left), and each child's own at its start (right)"
+  );
+}
+
 /// A-119, A-311, supervision never gives up: do supervise a child that beats and exits, every start failing, each
 /// child's life a known span of the test's own clock. Expect the second failure reported as a crash loop backed off one
 /// life, the supervisor backing off with the segment saying `CrashLoop`, the daemon started again once the backoff

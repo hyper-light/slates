@@ -14,8 +14,13 @@
 //! the file actions do not name is closed in the child whatever its close-on-exec flag, so no window between a pipe's
 //! making and its marking reaches a child spawned here. On Linux the standard library makes pipes with `pipe2` and
 //! `O_CLOEXEC` (and sockets with `SOCK_CLOEXEC`), atomic, so no such window exists; the same spawn serves there, and the
-//! same test holds it. The child's signal mask is emptied and `SIGPIPE` set back to its default, as the standard
-//! library's spawn does (a Rust process ignores `SIGPIPE`, and an ignored signal survives `exec`).
+//! same test holds it. But Linux's spawn has no default to close, so there a child holds every descriptor of this
+//! process's not marked close-on-exec: the daemon marks what it inherited at its start ([`close_inherited_on_exec`]),
+//! and makes every descriptor of its own close-on-exec (`fcntl_dupfd_cloexec`, never a plain `dup`). Before 2026-11-23
+//! it did neither, and a hook on Linux held the anchor's segment (`crates/cli/tests/svn_interop.rs`,
+//! `a_hook_holds_no_descriptor_of_its_daemon`). The child's signal mask is emptied and `SIGPIPE` set back to its
+//! default, as the standard library's spawn does (a Rust process ignores `SIGPIPE`, and an ignored signal survives
+//! `exec`).
 //!
 //! **The child** ([`SpawnedChild`]): its pid, waited for and reaped by its owner (the hook driver's exit watch and
 //! reaper); never reaped behind its owner's back, so the pid names it until its owner lets it go.
@@ -377,6 +382,50 @@ impl SpawnedChild {
       let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
     }
   }
+}
+
+/// Format: where this process's open descriptors are listed, one entry a number: Linux's procfs.
+#[cfg(target_os = "linux")]
+const OPEN_DESCRIPTORS: &str = "/proc/self/fd";
+/// Format: where this process's open descriptors are listed, one entry a number: the fdesc filesystem.
+#[cfg(not(target_os = "linux"))]
+const OPEN_DESCRIPTORS: &str = "/dev/fd";
+/// Format: the highest standard stream's number; a child is handed its standard streams by its spawn's file actions.
+const LAST_STANDARD_STREAM: i32 = 2;
+
+/// Marks every descriptor this process holds past its standard streams close-on-exec, and answers how many it marked.
+/// The daemon makes this its first step at its start (`slates_api`'s daemon role). What the daemon inherited is then
+/// its own to adopt and never a child's to inherit: its anchor's segment and content object, the listeners and hold
+/// table the anchor kept for it, and whatever its own starter left open.
+///
+/// Linux's spawn hands a child every descriptor not so marked (the module doc). Until 2026-11-23 a hook on Linux held
+/// the anchor's segment, which holds the issuer secret, and its content object; the anchor's listeners; and descriptors
+/// a runner had leaked into the daemon's own environment
+/// (docs/bugs/2026-11-23-a-hand-off-left-an-inheritable-duplicate-at-every-call.md).
+///
+/// Refused where the listing cannot be read, or where a listed descriptor refuses the flag for any reason but having
+/// closed since it was listed. That is the listing's own descriptor, gone with its iterator.
+pub fn close_inherited_on_exec() -> io::Result<usize> {
+  let numbers: Vec<i32> = std::fs::read_dir(OPEN_DESCRIPTORS)?
+    .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<i32>().ok())
+    .filter(|number| *number > LAST_STANDARD_STREAM)
+    .collect();
+  let mut marked = 0usize;
+  for number in numbers {
+    // SAFETY: `fcntl(F_SETFD)` sets one flag of this process's descriptor table at `number` and touches no memory of
+    // this process's; a number that is not open answers `EBADF` and changes nothing. No Rust owner is formed for the
+    // number, so a descriptor another owner holds keeps its owner, and close-on-exec is the flag every descriptor of
+    // the daemon's carries.
+    if unsafe { libc::fcntl(number, libc::F_SETFD, libc::FD_CLOEXEC) } == 0 {
+      marked = marked.saturating_add(1);
+      continue;
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() != Some(libc::EBADF) {
+      return Err(error);
+    }
+  }
+  Ok(marked)
 }
 
 // macOS alone: the race the test holds open (a descriptor between `pipe` and its `fcntl`) is macOS's, so the whole

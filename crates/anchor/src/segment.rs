@@ -292,7 +292,9 @@ impl Supervision<'_> {
     Some(self.stop_by.load(Ordering::Acquire)).filter(|at| *at != 0)
   }
 
-  /// The anchor records a start. A new daemon starts with no stop requested or declared.
+  /// The anchor records a start. A new daemon starts with no stop requested or declared. The supervisor records it
+  /// before it spawns the daemon, with `pid` zero, and names the daemon after ([`Supervision::record_pid`]), so nothing
+  /// the daemon writes once it runs is overwritten.
   pub fn record_start(&self, pid: u64, now_ns: u64, restart: bool) {
     self.serving.store(0, Ordering::Release);
     self.looked.store(0, Ordering::Release);
@@ -307,6 +309,12 @@ impl Supervision<'_> {
       self.restarts.fetch_add(1, Ordering::AcqRel);
     }
     self.state.store(State::Running as u64, Ordering::Release);
+  }
+
+  /// The anchor names the daemon its start spawned ([`Supervision::record_start`] recorded the start before the spawn,
+  /// with no pid yet).
+  pub fn record_pid(&self, pid: u64) {
+    self.pid.store(pid, Ordering::Release);
   }
 
   /// The anchor publishes the messages its hold channel has refused over its life (`layout::SUP_HOLD_REFUSALS`).
@@ -552,7 +560,25 @@ impl AnchorSegment {
     Ok((self.object.handoff()?, self.object.len()))
   }
 
-  /// The environment a child needs to attach.
+  /// The descriptor numbers [`AnchorSegment::handoff_env`] names: on Linux the segment's own and the content object's,
+  /// each close-on-exec in this process, which a spawn that hands them on clears in its child alone
+  /// (`Supervisor::start`), so no other child inherits either; none where the objects are handed by name.
+  pub fn handed_descriptors(&self) -> Result<Vec<i32>, AnchorError> {
+    let mut numbers = Vec::new();
+    if let Handoff::Descriptor(number) = self.object.handoff()? {
+      numbers.push(number);
+    }
+    if let Some(content) = &self.content
+      && let Handoff::Descriptor(number) = content.handoff()?
+    {
+      numbers.push(number);
+    }
+    Ok(numbers)
+  }
+
+  /// The environment a child needs to attach. On Linux it names this process's own descriptors of the objects, which a
+  /// child holds only where its spawn clears close-on-exec on them ([`AnchorSegment::handed_descriptors`]); in this
+  /// process they open as they are.
   pub fn handoff_env(&self) -> Result<Vec<(String, String)>, AnchorError> {
     let handoff = match self.object.handoff()? {
       Handoff::Descriptor(fd) => fd.to_string(),
