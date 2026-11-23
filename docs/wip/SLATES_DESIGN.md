@@ -1542,7 +1542,10 @@ server. Windows: IOCP with `PostQueuedCompletionStatus` kicks, a blocked wait ra
 blocks (A-361: a completion port's waiter gets none of the wake boost an event's waiter gets, so a kicked shard waited
 out its neighbours' turns), and a client's reply wait one level above normal for the wait (A-871: woken by its Event at
 the shards' own level, a client queued behind them); WinFsp requests arrive on WinFsp's threads and are routed to the
-owning shard by handle. Simulation: a driver that replaces time,
+owning shard by handle. Linux: a latency-tracking runtime's shards in `SCHED_RR` at the class's lowest priority where
+the account's limits grant it (`RLIMIT_RTPRIO` at least that priority and `RLIMIT_RTTIME` unlimited; grant or skip,
+never a privilege, R10), parking at once when idle so none spins at real-time priority (A-872: on bare metal a woken
+shard otherwise waits out a time-share neighbour's protected run). Simulation: a driver that replaces time,
 randomness, sockets, rings, and the bridge with seeded in-process simulations for the whole
 cluster.
 
@@ -61368,3 +61371,30 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
   Windows test), `unsafe-budget.toml` (slates-ipc 167 -> 169), §4.3 (the placement paragraph and its status, the
   Windows driver sentence), GAPS (84a, Windows), BENCHMARKS ("84a on Windows bare metal").
 
+### A-872 — On Linux, where the account grants it, a latency-tracking runtime's shards run in SCHED_RR and park at once when idle (2026-11-23, w-perf for main 01a20182; goal 84a; A-799, A-831, A-871)
+
+- **Why.** 84a's 1 ms loaded bar is bare metal's (Ada, 2026-11-23). On adacachy2 (CachyOS 7.3.3, `CONFIG_PREEMPT=y`,
+  `HZ=1000`, `RLIMIT_RTPRIO` 99 by `limits.d/20-audio.conf`) main's loaded accept p99 was 551 µs-1.11 ms and p999
+  0.90-1.59 ms. In the fair class a woken shard waits out a time-share neighbour's protected run: `wakeup_preempt_fair`
+  picks with the running task's slice protected (kernel 7.3.3 `kernel/sched/fair.c`). EEVDF's requested slice (arm E)
+  is clamped to 100 µs (`__setparam_fair`) and cost the p50 2-4x. A thread in `SCHED_RR` runs ahead of every time-share
+  thread as soon as it is runnable. CI's rejection of these arms (2026-11-22) was its runners' `RLIMIT_RTPRIO` 0 and
+  lazy preemption, not the arms.
+- **The change.** Where `slates_machine::round_robin::take_current` is granted (the class's lowest priority, reset on
+  fork so a hook the daemon spawns starts time-share; `RLIMIT_RTTIME` unlimited, so no `SIGXCPU` can end the process),
+  a latency-tracking runtime's shard takes the class as it starts. It then parks at once when idle (`ShardContext`'s
+  `parks_at_once`: no idle window, closed-loop holds declined), since a spinning real-time thread would take its CPU
+  from every time-share task. Elsewhere it stays time-share and says why (`Declined`).
+- **Not taken.** The client's reply wait in the class, a park at a time (D') or held from its first park until it
+  returns (D''): on bare metal it added nothing over the shards' class (D'' p99 344-536 µs, p999 over twice) and would
+  put a user's thread in the real-time class (BENCHMARKS).
+- **Evidence** (BENCHMARKS "84a on Linux bare metal"): across main's two interleaved runs of 2026-11-23 the shards'
+  class held the loaded p99 under 1 ms in 11 of 11 rounds (104-431 µs) and the p999 in 20 of 22 checks, where main
+  held the p999 in 2 of 8. Its cost: R9's spinning median rose from 12-20 to 17-27 µs, while R9's p99 fell from
+  145 / 57 / 104 to 71 / 50 / 54 µs. Held by
+  `a_tracking_runtimes_shard_takes_the_round_robin_class_where_granted_and_parks_at_once` (`crates/rt/tests/round_robin.rs`:
+  where the account grants the class the tracking shard holds it with no idle window; where it grants none, as on CI,
+  the shard stays time-share with its window, said aloud; off Linux the test skips loudly).
+- **Applied in the same change to:** `crates/machine/src/round_robin.rs` (new), `crates/rt/src/runtime.rs` and
+  `crates/rt/src/shard.rs` (the shard's class and `parks_at_once`), `unsafe-budget.toml` (slates-machine 105 -> 108),
+  §4.3 (the drivers paragraph), GAPS (84a, Linux), BENCHMARKS ("84a on Linux bare metal").
