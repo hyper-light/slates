@@ -1549,7 +1549,8 @@ fn file_bytes<'o, O: PushObjects + ?Sized>(
   Ok(bytes)
 }
 
-/// The identity being hashed, a piece of the document or a hash slice of the post-state a unit ([`identity`]'s bytes).
+/// The identity being hashed, a piece of the document or a hash slice of the post-state a unit (the bytes the tests'
+/// `identity` hashes whole).
 struct Hashing {
   /// The hasher.
   hasher: blake3::Hasher,

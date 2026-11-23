@@ -2988,8 +2988,9 @@ pub mod platform {
   /// layout before it, `SLBT`, had no marks, and a client of it rings without naming its shard, so an object or a client
   /// of either layout is refused by the other as another layout, never served with its rings unheard.
   ///
-  /// `SLB3` (A-447) is that layout with the daemon's process mark in its header ([`ProcessMark`]): a Windows claimant of
-  /// it waits on the daemon's exit, and one of `SLB2` would read no mark, so each refuses the other as another layout.
+  /// `SLB3` (A-447) is that layout with the daemon's process mark in its header (`ProcessMark`, read on Windows alone): a
+  /// Windows claimant of it waits on the daemon's exit, and one of `SLB2` would read no mark, so each refuses the other
+  /// as another layout.
   /// `SLB4` (A-468) adds the holding anchor's creation time beside its process id: a Windows claimant under a live
   /// anchor waits on the anchor's exit, judged by both, and one of `SLB3` would read none, so each refuses the other.
   /// `SLB5` (A-522) adds the claimant's start to each claim slot (`AT_STARTED`): a daemon of it watches the client's

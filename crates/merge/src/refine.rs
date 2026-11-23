@@ -327,8 +327,8 @@ enum Class {
   Alone,
 }
 
-/// Every byte's class ([`classify`]), by the byte's value, looked up rather than branched on in the cut's scan (a
-/// table read is 1.1 to 1.3 times faster a save than the comparisons, A-787's A/B). Kept equal to [`classify`] by
+/// Every byte's class ([`Class`]), by the byte's value, looked up rather than branched on in the cut's scan (a table
+/// read is 1.1 to 1.3 times faster a save than the comparisons, A-787's A/B). Kept equal to the tests' `classify` by
 /// `the_class_table_is_classify_for_every_byte`.
 /// Format: one class a byte value, 256 of them, sixteen a row: `W` a word's, `B` a blank's, `A` alone.
 const CLASSES: [Class; 256] = {

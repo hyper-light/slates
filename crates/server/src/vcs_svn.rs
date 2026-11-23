@@ -1602,8 +1602,8 @@ pub(crate) struct HookAnswer {
 
 /// What a conversation's hooks need of its repository: its id and its name, and where this shard shows a hook its
 /// repository (`ShardState::hook_views`, A-645 (a)), read when the route that runs the hook began. REPOS is decided when
-/// the hook runs ([`crate::vcs_store::svn_presenter::repos_for_hook`]); where no view can be shown, a configured hook is
-/// refused, typed.
+/// the hook runs (`crate::vcs_store::svn_presenter::repos_for_hook`, unix alone); where no view can be shown, a
+/// configured hook is refused, typed.
 pub(crate) struct Hooked {
   /// The repository's id, which its hooks' learned times are kept under (unix alone, where hooks run).
   #[cfg(unix)]

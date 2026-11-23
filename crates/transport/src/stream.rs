@@ -150,7 +150,7 @@ impl StreamSender {
     })
   }
 
-  /// Whether [`next_frame`](StreamSender::next_frame) would return a frame now: bytes within the credit
+  /// Whether [`next_span`](StreamSender::next_span) would return a span now: bytes within the credit
   /// not yet framed, or the terminating `fin` due.
   pub fn has_sendable(&self) -> bool {
     let buffered = self.buffered.len() as u64;

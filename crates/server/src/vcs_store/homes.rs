@@ -1596,8 +1596,9 @@ async fn settle_owed() {
 }
 
 /// Settles `settle` at every home of its object (A-727 (d1a)): this node's home shard where this node is one, and each
-/// other home by its own message ([`HomeMessage::Moved`], [`HomeMessage::LetGo`]). Whether every home answered it (a
-/// home that holds nothing for the owner answers too: there is nothing to settle there).
+/// other home by its own message ([`HomeMessage::Moved`](slates_cluster::homes::HomeMessage::Moved),
+/// [`HomeMessage::LetGo`](slates_cluster::homes::HomeMessage::LetGo)). Whether every home answered it (a home that
+/// holds nothing for the owner answers too: there is nothing to settle there).
 async fn settle_in_region(
   (origin, shards): (u16, &[u16]),
   settle: Settle,

@@ -592,7 +592,7 @@ pub fn write(value: &Value<'_>, out: &mut Vec<u8>) -> Result<(), ItemError> {
 }
 
 /// Appends the head of a string item of `length` bytes, `length:`, for a caller that writes its bytes in pieces after it
-/// and the item's closing space ([`write`]'s `Value::String` as one string's three parts; A-751).
+/// and the item's closing space ([`write`](fn@write)'s `Value::String` as one string's three parts; A-751).
 pub fn write_string_head(length: u64, out: &mut Vec<u8>) {
   write_decimal(length, out);
   out.push(STRING_MARK);

@@ -24,33 +24,33 @@ use super::push::{Push, Staged, StoredAt, stored_bytes};
 use super::rows::{self, CommitRow, ObjectRow};
 use reach::Sets;
 
-/// Objects by an abbreviated name (A-640 part 4), a child of this module so it reads the index kept here.
+// Objects by an abbreviated name (A-640 part 4), a child of this module so it reads the index kept here.
 #[path = "abbrev.rs"]
 pub(super) mod abbrev;
 
-/// The store read as upload-pack's commit graph (A-640), a child of this module so it reads the rows and chains kept
-/// here.
+// The store read as upload-pack's commit graph (A-640), a child of this module so it reads the rows and chains kept
+// here.
 #[path = "graph.rs"]
 pub(super) mod graph;
 
-/// A protected branch's questions about a move (A-644): how it changes its ref and what it brings, a child of this
-/// module so it reads the walks and chains kept here.
+// A protected branch's questions about a move (A-644): how it changes its ref and what it brings, a child of this
+// module so it reads the walks and chains kept here.
 #[path = "protect.rs"]
 pub(super) mod protect;
 
-/// A-614's D(k) and reached sets as a type of derived data (A-647 part 2), a child of this module so its derivation
-/// walks the store as the admission does.
+// A-614's D(k) and reached sets as a type of derived data (A-647 part 2), a child of this module so its derivation
+// walks the store as the admission does.
 #[path = "reach.rs"]
 pub(super) mod reach;
-/// A push sealed and staged a unit at a time (A-722 part 4), a child of this module so it writes the rows kept here.
+// A push sealed and staged a unit at a time (A-722 part 4), a child of this module so it writes the rows kept here.
 #[path = "staging.rs"]
 pub(super) mod staging;
 
-/// A move admitted a unit at a time (A-722 part 4c), a child of this module so it walks the rows and chains kept here.
+// A move admitted a unit at a time (A-722 part 4c), a child of this module so it walks the rows and chains kept here.
 #[path = "admitting.rs"]
 pub(super) mod admitting;
-/// A version's sets derived on first read (A-614 amended, main's ruling (A) of 2026-11-21), a child of this module so it
-/// walks the rows and chains kept here.
+// A version's sets derived on first read (A-614 amended, main's ruling (A) of 2026-11-21), a child of this module so it
+// walks the rows and chains kept here.
 #[path = "deriving.rs"]
 pub(super) mod deriving;
 
