@@ -5410,6 +5410,9 @@ async fn rebuild_and_report(
 /// keeps serving, until none is left. Whether the pass settled the shard: it reached an idle purge that finished, and no
 /// volume owes another pass; otherwise the sweep arms its next.
 pub(crate) async fn seal_idle_content() -> bool {
+  // An image publication owed is begun again where no catch-up makes it, first of all (A-870 piece 2: a refused catch-up
+  // publication is never dropped), and the shard is not settled while it is owed.
+  let image_owed = state::with_state(crate::content_holder::image_retry_owed).unwrap_or(false);
   let aged = state::with_state(|s| {
     for (_, slot) in s.volumes.iter_mut_all() {
       slot.volume.age_writes();
@@ -5479,7 +5482,7 @@ pub(crate) async fn seal_idle_content() -> bool {
       .any(|(_, slot)| slot.volume.sweep_owes())
   })
   .unwrap_or(false);
-  purged && !owes && directories_idle
+  purged && !owes && !image_owed && directories_idle
 }
 
 /// The idle shard's emptied write log, its pages given back (`crate::write_log::WriteLog::purge`).

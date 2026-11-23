@@ -969,8 +969,11 @@ async fn image_catch_up() {
         return false;
       }
       state.image_encoder.stop_catching_up();
-      if state.image_encoder.owed() {
-        let _ = crate::verbs::publish_shard(state);
+      if state.image_encoder.owed() && catch_up_publication(state).is_err() {
+        // Refused (its room, a recovery not complete, …): the publication stays owed, never dropped, and the shard's
+        // sweep, which an owed publication with no catch-up arms (`idle_sweep::after_borrow`), begins it again
+        // (`image_retry_owed`); counted.
+        state.count(IMAGE_CATCH_UP_PUBLISH_REFUSED, 1);
       }
       true
     });
@@ -1000,8 +1003,52 @@ pub(crate) const IMAGE_PAUSED_ENCODED_BYTES: &str = "vcs_store.image.paused_enco
 /// Format: the status counter of the bytes, of those, of pages the never-paused changes first dirtied in the pause
 /// (puts, bring-backs): under [`IMAGE_PAUSED_ENCODED_BYTES`] by a margin while the encoder outpaces them.
 pub(crate) const IMAGE_PAUSED_IMPOSED_BYTES: &str = "vcs_store.image.paused_imposed_bytes";
-/// Format: the status counter of catch-up tasks the runtime refused to start (the next publication tries again).
+/// Format: the status counter of catch-up tasks the runtime refused to start (the shard's sweep begins one again).
 pub(crate) const IMAGE_CATCH_UP_REFUSED: &str = "vcs_store.image.catch_up_refused";
+/// Format: the status counter of catch-up publications refused, each left owed for the shard's sweep to begin again.
+pub(crate) const IMAGE_CATCH_UP_PUBLISH_REFUSED: &str = "vcs_store.image.catch_up_publish_refused";
+/// Format: the status counter of owed publications the shard's sweep began a catch-up for again.
+pub(crate) const IMAGE_CATCH_UP_RETRIED: &str = "vcs_store.image.catch_up_retried";
+
+/// A catch-up's publication ([`image_catch_up`]): the shard's, through `verbs::publish_shard`; under a test, refused
+/// first where [`CATCH_UP_REFUSALS`] says so.
+fn catch_up_publication(state: &mut ShardState) -> Result<(), slates_vfs::VfsError> {
+  #[cfg(test)]
+  if CATCH_UP_REFUSALS.with(|refusals| {
+    let left = refusals.get();
+    refusals.set(left.saturating_sub(1));
+    left > 0
+  }) {
+    return Err(slates_vfs::VfsError::RecoveryIncomplete);
+  }
+  crate::verbs::publish_shard(state).map(drop)
+}
+
+#[cfg(test)]
+thread_local! {
+  /// A test's count of catch-up publications to refuse on this shard's thread before the next goes through.
+  pub(crate) static CATCH_UP_REFUSALS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The shard's sweep's look at an owed publication (A-870 piece 2; main 01a20182's ruling of 2026-11-23, no swallowed
+/// error): where one is owed and no catch-up runs (its publication was refused, or its task could not be spawned), a
+/// catch-up begun again, counted; a spawn refused again is counted and left for the next sweep. Whether one is owed, so
+/// the sweep does not settle the shard while it is.
+pub(crate) fn image_retry_owed(state: &mut ShardState) -> bool {
+  if !state.image_encoder.owed() {
+    return false;
+  }
+  if state.image_encoder.start_catching_up() {
+    let started = slates_rt::futures::spawn(image_catch_up()).and_then(slates_rt::futures::detach);
+    if started.is_ok() {
+      state.count(IMAGE_CATCH_UP_RETRIED, 1);
+    } else {
+      state.image_encoder.stop_catching_up();
+      state.count(IMAGE_CATCH_UP_REFUSED, 1);
+    }
+  }
+  true
+}
 
 /// Takes every change since the encoder last looked into its dirty pages, and forgets them where they were kept (A-870
 /// piece 2): the encoder is their one reader. Their coordinates: windows' handles, the content store's lists, names
