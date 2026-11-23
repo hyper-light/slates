@@ -307,7 +307,12 @@
 > (w-interop, 2026-11-22, main's (b1); `docs/bugs/2026-11-22-the-heap-row-counted-large-blocks-spans-as-resident.md`):**
 > the row's resident added the large path's live mappings' whole spans; `heap` is now the system allocator alone and
 > `large` the mapped blocks, resident by their pages in RAM. The ~900 MB never touched is those spans (main's r41: 12
-> blocks, 1.27 GB mapped, 13.7 MB written); naming and sizing them from the work is (b2), open. > **The status memory report's residency FIXED (g226, 2026-11-21, w-sizing's option (a)):** on macOS a memory status
+> blocks, 1.27 GB mapped, 13.7 MB written); naming and sizing them from the work is (b2). **(b2) FIXED (w-interop,
+> 2026-11-22; `docs/bugs/2026-11-22-each-partition-reserved-a-lease-timer-for-every-volume-it-could-hold.md`):** two of
+> the 12 were the partitions' lease-expiry wheels, 595 MiB each, a slot for every volume a partition could hold; the
+> wheel now grows with its leases (`Wheel::growing`), and an idle two-shard daemon's `large` row fell from 1,298,595,840
+> to 12,353,536 bytes reserved. The rest (the runtime's wheels, 2 MiB each; 1 MiB mark sets and control channels) are
+> fixed or deliberately preallocated sizes. > **The status memory report's residency FIXED (g226, 2026-11-21, w-sizing's option (a)):** on macOS a memory status
 > read the arenas 0 MiB after a 256 MiB burst, so R3's split came back empty: the sweep walked every range of each
 > shard's slice whole (4 GiB arena region, ~28 GiB of content object and segment a shard on the test daemon) and the
 > arenas' figure waited for it to complete. Now the sweep walks only what can hold pages (the arena's held runs, the
