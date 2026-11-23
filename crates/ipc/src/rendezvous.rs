@@ -3017,8 +3017,9 @@ pub mod platform {
   /// stamp) from a slow one (the same stamp).
   const AT_GENERATION: usize = 16;
   /// Format: the holding anchor's process id's offset in the header (A-114): written when the anchor creates the
-  /// object, zero in an object a daemon made for itself. A Windows claim made while this process lives waits while it
-  /// lives, judged with its creation time (A-468); a macOS claim judges the owner's name the anchor holds.
+  /// object, zero in an object a daemon made for itself, and zeroed when the anchor lets go of it. A Windows claim made
+  /// while this process lives waits while it lives, judged with its creation time (A-468); a macOS claim judges the
+  /// owner's name the anchor holds.
   const AT_ANCHOR_PID: usize = 28;
   /// Format: the holding anchor's creation time's offset in the header (A-468), as the daemon's is at
   /// `AT_DAEMON_CREATED`: written when a Windows anchor creates the object, zero elsewhere.
@@ -3685,7 +3686,7 @@ pub mod platform {
   /// The bootstrap object the anchor holds (A-114): created once, kept for the anchor's life, so a client's claim made
   /// while a daemon restarts stays where the next daemon reads it; and with it the anchor's ownership (A-176).
   pub(super) struct Held {
-    _object: SharedObject,
+    object: SharedObject,
     _owner: Owner,
   }
 
@@ -3700,13 +3701,27 @@ pub mod platform {
         &crate::exit_watch::ExitWatch::own_creation()?.to_le_bytes(),
       )?;
       Ok(Held {
-        _object: object,
+        object,
         _owner: owner,
       })
     }
 
     pub(super) fn env_value(&self) -> String {
       "held".to_owned()
+    }
+  }
+
+  impl Drop for Held {
+    /// The anchor's going, written into the header: its mark is cleared, so a claimant and `holder_lives` read no anchor
+    /// once it has let go (A-468). The object outlives the hold while a client maps it (a connected client's doorbell
+    /// does; Windows keeps a named object while any handle holds it, A-176), and an anchor that let go inside a live
+    /// process read as the holder for good there, so its daemon's clients claimed again for good. The owner's token is
+    /// still held while this runs, so the mark cleared is this hold's own, never a successor's.
+    fn drop(&mut self) {
+      // Each write is at an offset `hold` wrote, so none is refused; a refusal would leave the mark as it was.
+      #[cfg(windows)]
+      let _ = self.object.write(AT_ANCHOR_CREATED, &0u64.to_le_bytes());
+      let _ = self.object.write(AT_ANCHOR_PID, &0u32.to_le_bytes());
     }
   }
 
@@ -4627,8 +4642,9 @@ pub mod platform {
 
     /// A-468 (the holder's going ends a reconnect at once). Do: hold the instance's rendezvous as an anchor does, map its
     /// bootstrap object as a connected client's doorbell does, ask `holder_lives`, then let the anchor go inside its own
-    /// live process and ask again. Expect: a holder while the anchor holds the rendezvous, and none once it has let go,
-    /// though the client's mapping keeps the object (Windows keeps a named object while any handle holds it, A-176).
+    /// live process and ask again within the claim wait. Expect: a holder while the anchor holds the rendezvous, and none
+    /// once it has let go, though the client's mapping keeps the object (Windows keeps a named object while any handle
+    /// holds it, A-176). Before 2026-11-23 a Windows header kept the anchor's mark past its hold, and read held for good.
     #[test]
     fn an_anchor_that_lets_go_is_no_holder_though_a_client_maps_the_object() {
       let name = instance("let-go");
@@ -4636,11 +4652,11 @@ pub mod platform {
       let client = client_mapping(&name);
       let held = holder_lives(&name).unwrap();
       drop(anchor);
-      let after = holder_lives(&name).unwrap();
+      let gone = holder_goes(&name);
       drop(client);
       assert!(held, "the anchor holds the rendezvous");
       assert!(
-        !after,
+        gone,
         "no holder once the anchor has let go, though a client still maps the object"
       );
     }

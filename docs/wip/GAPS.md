@@ -9655,8 +9655,11 @@
 >   (`a_claim_under_a_live_anchor_waits_out_a_restart_slower_than_the_old_reconnect_budget`,
 >   `a_claim_under_an_anchor_ends_at_the_anchors_going`,
 >   `a_rendezvous_has_a_holder_while_its_anchor_or_its_own_daemon_lives`;
->   `a_call_to_a_killed_unanchored_daemon_ends_daemon_gone_at_once`). `reconnect_ns` still bounds the waits on a fleet
->   owner's takeover (a request refused for now held for its resend, the pause between resends,
+>   `a_call_to_a_killed_unanchored_daemon_ends_daemon_gone_at_once`). Since 2026-11-23 (w-win) an anchor's going clears
+>   its mark from the header: a client's doorbell keeps a Windows object past the hold, so an anchor that let go inside a
+>   live process had read as the holder for good (`an_anchor_that_lets_go_is_no_holder_though_a_client_maps_the_object`;
+>   `docs/bugs/2026-11-23-a-windows-anchor-that-let-go-still-read-as-the-rendezvous-holder.md`). `reconnect_ns` still
+>   bounds the waits on a fleet owner's takeover (a request refused for now held for its resend, the pause between resends,
 >   `Client::call_through_transient`), owed to the failover delay the daemon reports. The server's reclaim of a
 >   taken-back map no holder claims (`held_copy::reconnect_budget_ns`, "The holder claims it") mirrored the old
 >   reconnect budget, a fixed two seconds R3 forbids; since A-552 its claim is owed for the failover delay its shard
