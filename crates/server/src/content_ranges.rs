@@ -797,6 +797,8 @@ mod tests {
       sweep.record_step(read_after - read_before, u64::try_from(pages).unwrap());
     }
     let average = sweep.pages / STEPS;
+    // DIAG-ONLY probe (w-tsan, never lands): the lane's tick and average, read by failing on purpose.
+    panic!("PROBE w-tsan step clock: {average} pages a step on average on a {tick_ns} ns tick");
     // Nine tenths: a reading on the tick rounds the fixed part down by up to a tick (492 of 500 on a 41 ns tick); the
     // microsecond tick's 333 stays below.
     assert!(

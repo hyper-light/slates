@@ -985,6 +985,11 @@ fn t_a614a_a_long_historys_derivation_takes_turns_by_the_shards_pace_not_its_obj
   let waits_found =
     || slates_rt::registry::with_current(|context| context.counters().waiting_found).unwrap_or(0);
   let found_before = crate::daemon::observe_first(&daemon, move |_| waits_found());
+  // DIAG-ONLY probe (w-tsan, never lands): the shard's polls and steps around the derivation, and its quantum.
+  let probe_quantum = crate::daemon::observe_first(&daemon, |state| state.config.step_quantum_ns());
+  let probe_before = crate::daemon::observe_first(&daemon, |_| {
+    slates_rt::registry::with_current(|context| context.counters()).map(|c| (c.polls, c.steps, c.long_steps, c.waiting_asked, c.waiting_found))
+  });
   let began = std::time::Instant::now();
   crate::daemon::observe_first(&daemon, move |_| {
     let task = slates_rt::futures::spawn(async move {
@@ -997,6 +1002,9 @@ fn t_a614a_a_long_historys_derivation_takes_turns_by_the_shards_pace_not_its_obj
   finished.recv().unwrap();
   let took_ns = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
   let found = crate::daemon::observe_first(&daemon, move |_| waits_found()) - found_before;
+  let probe_after = crate::daemon::observe_first(&daemon, |_| {
+    slates_rt::registry::with_current(|context| context.counters()).map(|c| (c.polls, c.steps, c.long_steps, c.waiting_asked, c.waiting_found))
+  });
   let after = crate::daemon::observe_first(&daemon, move |state| {
     (count(state, TURNS), count(state, DERIVED))
   });
@@ -1004,6 +1012,13 @@ fn t_a614a_a_long_historys_derivation_takes_turns_by_the_shards_pace_not_its_obj
   let (turns, derived) = (after.0 - before.0, after.1 - before.1);
   assert_eq!(derived, 1);
   let filled = took_ns.div_ceil(ceiling_ns.max(1));
+  panic!(
+    "PROBE w-tsan t_a614a: {turns} turns over {took_ns} ns at a {ceiling_ns} ns ceiling, filled {filled}, found {found}, \
+     quantum {probe_quantum} ns, the old bound held {}, the new bound held {}; the shard's (polls, steps, long steps, \
+     waiting asked, waiting found) before {probe_before:?} after {probe_after:?}",
+    turns <= PACED_TURNS + filled,
+    turns <= PACED_TURNS + filled + found
+  );
   assert!(
     turns <= PACED_TURNS + filled + found,
     "{turns} turns over {took_ns} ns at a {ceiling_ns} ns ceiling, the shard finding others waiting {found} times"

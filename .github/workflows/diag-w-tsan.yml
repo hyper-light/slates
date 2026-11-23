@@ -1,0 +1,40 @@
+name: diag w-tsan
+# w-tsan for main 01a20182 (2026-11-23): CI's TSan job, copied unchanged from .github/workflows/ci.yml, run on the
+# diag branch so the lane's reds can be read and its fixes checked before anything lands. Run only from
+# `diag-measurer-w-tsan-*` branches, never main.
+
+on:
+  push:
+    branches: ["diag-measurer-w-tsan-*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  tsan-nightly:
+    name: TSan (mem, rt, ipc, client; every push to main and nightly)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: TSan (the race canary must be reported; then the suites, any report fails)
+        env:
+          # ThreadSanitizer's 10-20x slowdown inflates the restart-detection publish window far past a native run, so
+          # the slow-restart client test needs a larger scale than the plain Test lane (same reason; the invariant
+          # publish << reply << recovery << reconnect holds at any scale). crates/client/tests/client.rs.
+          #
+          # Since 2026-10-20 this also scales START_WAIT, how long a client retries the rendezvous while a daemon
+          # starts. That budget was a flat five seconds and read this knob not at all, so the lane declared itself
+          # 25x slow and one of the two budgets that needed to hear it did not: run 39527867650 failed
+          # a_client_maps_files_across_shards_and_always_gets_the_bytes with "the daemon did not answer the claim
+          # within the claim wait" while that daemon was still starting (a shard took 15 753 us against 2 106 us
+          # unloaded).
+          SLATES_TEST_RESTART_SLOWDOWN: "25"
+        run: cargo xtask tsan
