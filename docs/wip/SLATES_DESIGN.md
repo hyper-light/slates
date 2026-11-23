@@ -6846,7 +6846,13 @@ creator plus these exceptions; this adds no global lookup catalog or per-write c
 > `every_copy_catches_up_once_the_third_node_takes_the_volume_from_the_adopter` and
 > `a_superseded_owner_restarted_warm_ships_no_record_of_the_volume_it_lost` (`crates/server/tests/fleet.rs`). The
 > let-go is published at once (A-415), so a warm restart does not restore the copies. Owed: the yield itself is
-> memory-only (`ShardState::yielded`), so a warm restart forgets it.
+> memory-only (`ShardState::yielded`), so a warm restart forgets it. Since 2026-11-23 (A-382's amendment, the
+> creator's side): the let-go leaves a re-admitted creator no copy of its volume's head until the head next changes,
+> while the successor's next catalog record makes the catalog's copy afresh, so a holder with no copy of the head takes
+> the acting owner from its catalog copy (`fleet::content_authority`). Before, it fell back to the creator, itself,
+> and refused its successor's every live entry `not_the_acting_owner`, and its copy of the log never caught up (the
+> nemesis's convergence: 64 and more refusals in one run, 8,826 in another;
+> `a_holder_with_only_a_volumes_catalog_copy_takes_the_owner_the_catalog_names`).
 
 > **Status (2026-11-18, A-409: a lost volume's log stops by itself, and a refusal names the fence).** A volume its
 > node yielded at its re-admission (A-334) ships nothing more and does no period work, as a fenced one does (A-349):
@@ -35180,6 +35186,26 @@ Applied in the same change to: §4.8 "Authority scope" (its status), GAPS (the e
   copies; the yield is memory-only (`ShardState::yielded`). A yielded volume's own live shipper still does period work
   and ships (A-349's rule covers a fenced one): in 2 of 12 runs of the third node's case the superseded adopter built
   119 and 1,714 installs for the creator, each refused `not_the_acting_owner`.
+
+**Amended 2026-11-23 (w-chaos, the nemesis's convergence on adacachy2): the creator's side.** The same stuck copy
+came back with the roles turned: the superseded owner admitted again was the volume's creator. A diagnostic build named
+each step (seed 14946995733817154046):
+- At the creator's re-admission it yielded the volume and let go both register copies naming itself ("let go 2 of 2
+  held").
+- The successor's next catalog record made the creator a catalog copy afresh, naming the successor. The head's record
+  comes only with the head's next change, so no copy of the head was made.
+- `fleet::content_authority` took the acting owner from the object's own copy and, with none, from the object's
+  creator, here the holder itself. So the creator refused every live entry its successor shipped,
+  `not_the_acting_owner`: "head copy owner None catalog copy owner Some(successor) creator itself", 64 and more
+  refusals in that run and 8,826 in one of seed 14946995733817154046's earlier runs. Its copy of the log never caught
+  up, and the fleet did not recover whole within the fleet wait.
+
+Now a holder with no copy of the object's own register takes the owner its catalog copy names, which the same owner
+writes; the creator is the owner only with neither copy, as content placed before its first record is (§4.16).
+Applied in the same change to: §4.8 "Authority scope"'s A-382 status, GAPS (A-382's entry),
+`crates/server/src/fleet.rs` (`content_authority`; the test
+`a_holder_with_only_a_volumes_catalog_copy_takes_the_owner_the_catalog_names`, red first: the successor refused), and
+`docs/bugs/2026-11-23-a-readmitted-creator-refused-its-successors-log-as-not-the-acting-owner.md`.
 
 ### A-383 — A holder reads a version's inputs extent by extent, charged to its shard's budget, never refused for good by a cap of distinct chunks (2026-11-18, goal g232: one primary and two replicas editing the Linux kernel tree; §4.16 "Apply on holders")
 
