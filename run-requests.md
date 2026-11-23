@@ -7582,3 +7582,9 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
      with a small `hg push` started while (1) runs (its wait, or its refusal past the patience). Debug, MacBook arm64:
      537 ms behind 200 changesets / 32 segments.
   3. The crash oracle is light (4.7 s debug) and runs in the suite: `t_b1_a_crash_at_any_segment_boundary_leaves_a_push_whole_or_absent`.
+
+## 2026-11-22 codex-review, A-767 C3 shared payloads, main aba34339c
+
+- macOS arm64, Linux and Windows in the normal store lane. Run `cargo test --release --locked -p slates-store`. A live changeset losing its shared bytes, an obsolete payload resurfacing, or an older checkpoint failing to reopen is red. The local run covered six specific tests only.
+- Big Studio and Linux, with the lane's pinned Mercurial 7.2 and 57,054-changeset source. Run `SLATES_TEST_HG_SOURCES="${HG_SRC:?path to the lane's hg history}" cargo test --release --locked -p slates-cli --test hg_interop stock_hg_gets_what_stock_hg_serve_gives_on_every_verb_over_http_and_ssh -- --ignored --exact --nocapture`. Compare the existing 24/24 checks, elapsed push time and peak RSS with 6692d6f24 on the same fixture. A missing payload, a content mismatch or a regression in time or memory needs investigation.
+- macOS arm64 restart through the real client. Run `cargo test --release --locked -p slates-cli --test hg_interop stock_hg_pushes_land_on_the_changeset_store_and_a_restarted_daemon_replays_them -- --exact --nocapture` with the pinned client. The clone after restart must see both landed changesets. The first-open cost of upgrading an older full history remains unmeasured.

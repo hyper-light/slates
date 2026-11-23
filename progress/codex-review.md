@@ -1,0 +1,12 @@
+# codex-review, 2026-11-22
+
+The rule revisions and first three leads are in inbox/main-from-codex-review-start.md (fanout 5bdfbe0). The following work ran serially on macOS arm64.
+
+| Finding | Evidence | State |
+|---|---|---|
+| Mercurial let-go removed a window needed by a region object | A 262,145-byte home read became None. The two-shard fixture preserved an independent release control. | Red sent to w-shared and w-hg through main. See inbox/main-from-codex-review-region-object-pin.md and its patch. |
+| Git's recovery put accepted bytes while leaving a child missing | A 64-byte payload read back. A 65-byte payload returned its ID and then None on read. | Red sent to w-shared through main. See inbox/main-from-codex-review-recovery-put.md and its patch. |
+| A stopped Git upload charged the same placement again | At the measured 120-byte budget the resident clone succeeded. One cold-window stop led to PackTooLarge. | Red sent to w-git through main. See inbox/main-from-codex-review-upload-admission.md and its patch. The r69 stall remains unverified. |
+| Forgetting a duplicate payload broke another repository's reads | The 28-byte cross-repository read returned None after restart. Six focused tests and the original damaged checkpoint passed with the fix. | Fixed in f99b60b87, landed via aba34339c. See inbox/main-from-codex-review-shared-payload.md and run-requests.md. |
+
+Next piece for main to start is the A-865 named-run and release review. Submit is first in the separate 84a verb queue. Main owns the performance rounds.
