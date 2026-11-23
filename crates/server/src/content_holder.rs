@@ -278,7 +278,7 @@ fn is_paged_entry_kind(kind: u8) -> bool {
 fn coordinate_of(identity: &slates_vcs::ContentId) -> u64 {
   identity
     .0
-    .first_chunk::<8>()
+    .first_chunk::<{ size_of::<u64>() }>()
     .map_or(0, |bytes| u64::from_be_bytes(*bytes))
 }
 
@@ -1333,7 +1333,8 @@ fn absorb_paged_entry(
         .ok_or(HeldRefused::UnknownKind(kind))?;
       let identity =
         slates_vcs::ContentId::from_slice(identity).ok_or(HeldRefused::UnknownKind(kind))?;
-      let len = <[u8; 8]>::try_from(len).map_err(|_| HeldRefused::UnknownKind(kind))?;
+      let len =
+        <[u8; size_of::<u64>()]>::try_from(len).map_err(|_| HeldRefused::UnknownKind(kind))?;
       held.aways.push((identity, u64::from_le_bytes(len)));
     }
     _ => return Ok(false),
