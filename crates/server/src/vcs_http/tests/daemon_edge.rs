@@ -196,6 +196,15 @@ fn tls_client(
   port: u16,
   certificate: &CertificateDer<'static>,
 ) -> StreamOwned<ClientConnection, ClientStream> {
+  tls_client_within(port, certificate, Duration::from_nanos(PATIENCE_NS))
+}
+
+/// [`tls_client`], its reads waiting at most `patience` for an answer.
+fn tls_client_within(
+  port: u16,
+  certificate: &CertificateDer<'static>,
+  patience: Duration,
+) -> StreamOwned<ClientConnection, ClientStream> {
   let mut roots = RootCertStore::empty();
   roots
     .add(certificate.clone())
@@ -214,7 +223,7 @@ fn tls_client(
   let socket = ClientStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
     .expect("the edge's listener takes the connection");
   socket
-    .set_read_timeout(Some(Duration::from_nanos(PATIENCE_NS)))
+    .set_read_timeout(Some(patience))
     .expect("a read timeout");
   StreamOwned::new(connection, socket)
 }
@@ -460,7 +469,22 @@ fn typed_exchange(
   certificate: &CertificateDer<'static>,
   request: &[u8],
 ) -> (u16, String, Vec<u8>) {
-  let mut stream = tls_client(port, certificate);
+  typed_exchange_within(
+    port,
+    certificate,
+    request,
+    Duration::from_nanos(PATIENCE_NS),
+  )
+}
+
+/// [`typed_exchange`], waiting at most `patience` for each read of its answer.
+fn typed_exchange_within(
+  port: u16,
+  certificate: &CertificateDer<'static>,
+  request: &[u8],
+  patience: Duration,
+) -> (u16, String, Vec<u8>) {
+  let mut stream = tls_client_within(port, certificate, patience);
   stream.write_all(request).expect("the request is sent");
   let mut head = Vec::new();
   while !head.ends_with(b"\r\n\r\n") {
@@ -1848,6 +1872,16 @@ fn hg_unbundle(
   name: &str,
   bundle: &[u8],
 ) -> (u16, String, Vec<u8>) {
+  hg_unbundle_within(edge, name, bundle, Duration::from_nanos(PATIENCE_NS))
+}
+
+/// [`hg_unbundle`], its client waiting at most `patience` for each read of the answer.
+fn hg_unbundle_within(
+  edge: (u16, &CertificateDer<'static>),
+  name: &str,
+  bundle: &[u8],
+  patience: Duration,
+) -> (u16, String, Vec<u8>) {
   let (port, certificate) = edge;
   let mut sent = format!(
     "POST /{name}?cmd=unbundle HTTP/1.1\r\nHost: localhost\r\n{}\r\n{HG_PUSH_FIELDS}\
@@ -1857,7 +1891,7 @@ fn hg_unbundle(
   )
   .into_bytes();
   sent.extend_from_slice(bundle);
-  typed_exchange(port, certificate, &sent)
+  typed_exchange_within(port, certificate, &sent, patience)
 }
 
 /// A bundle2 part's parameters: each its name and value.
@@ -3324,6 +3358,15 @@ fn a_mercurial_push_parks_for_its_repositorys_landing_turn_and_no_other_waits() 
     );
     std::thread::spawn(move || hg_unbundle((port, &certificate), &first, &bundle))
   };
+  // Seen parked, then held [`TURN_HELD`] more: the push's wait runs from before it was seen to past the release, whatever
+  // its intake took on a busy machine before it parked.
+  let deadline = std::time::Instant::now() + Duration::from_nanos(PATIENCE_NS);
+  while counted(crate::repository::hg_run::TURN_WAITS) == 0 && std::time::Instant::now() < deadline
+  {
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(Duration::from_millis(5));
+  }
+  let seen_parked = std::time::Instant::now();
   // The test holds the landing turn while the parked push waits for it; the daemon under test waits on its drivers.
   #[allow(clippy::disallowed_methods)]
   std::thread::sleep(TURN_HELD);
@@ -3332,6 +3375,7 @@ fn a_mercurial_push_parks_for_its_repositorys_landing_turn_and_no_other_waits() 
     parked.is_finished(),
   );
   give_back_turn(&daemon);
+  let held_after_park = seen_parked.elapsed();
   let parked = parked.join().expect("the parked push answered");
   let waited_ns = counted(crate::repository::hg_run::TURN_WAITED_NS);
   let heads = hg_command((port, &certificate), &first, "heads");
@@ -3349,8 +3393,8 @@ fn a_mercurial_push_parks_for_its_repositorys_landing_turn_and_no_other_waits() 
   let tip = crate::verbs::hex_of(&made[0].node);
   assert_eq!(heads, (200, format!("{tip}\n").into_bytes()));
   assert!(
-    u128::from(waited_ns) >= TURN_HELD.as_nanos(),
-    "waited {waited_ns} ns"
+    u128::from(waited_ns) >= held_after_park.as_nanos(),
+    "waited {waited_ns} ns, parked {held_after_park:?} before the release at least"
   );
   let words = crate::repository::hg_run::TURN_PAST_PATIENCE;
   assert!(
@@ -3384,9 +3428,10 @@ fn a_long_push_parked(
     crate::repository::hg_run::TEST_RELEASE.with(|release| release.set(false));
   });
   let (made, bundle) = a_line_of(FRESH_CHANGESETS);
+  let patience = long_push_patience(&bundle);
   let long = {
     let (certificate, name) = (certificate.clone(), name.to_owned());
-    std::thread::spawn(move || hg_unbundle((port, &certificate), &name, &bundle))
+    std::thread::spawn(move || hg_unbundle_within((port, &certificate), &name, &bundle, patience))
   };
   while counted_on(
     daemon,
@@ -3401,6 +3446,21 @@ fn a_long_push_parked(
     std::thread::sleep(Duration::from_millis(5));
   }
   (made[FRESH_CHANGESETS - 1].node, long)
+}
+
+/// Derived: how long a test's client waits for a long push's answer ([`a_long_push_parked`]): a client's patience
+/// ([`PATIENCE_NS`]) and one of the daemon's liveness budgets for each segment the push lands at
+/// [`LONG_SEGMENT_BYTES`], each a durable write of the store's that a busy machine draws out, and one more for its
+/// entry's commit (main 01a20182's order of 2026-11-22 16:30: a busy machine is the norm, so a bound from the push's
+/// own size, never a constant).
+fn long_push_patience(bundle: &[u8]) -> Duration {
+  let segments = u64::try_from(bundle.len())
+    .unwrap_or(u64::MAX)
+    .div_ceil(LONG_SEGMENT_BYTES)
+    .saturating_add(1);
+  Duration::from_nanos(
+    PATIENCE_NS.saturating_add(segments.saturating_mul(crate::daemon::LIVENESS_BUDGET_NS)),
+  )
 }
 
 /// Lets a long push parked by [`a_long_push_parked`] go on.
