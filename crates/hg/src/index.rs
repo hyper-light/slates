@@ -669,6 +669,21 @@ pub struct HgIndex {
   rows: Index,
   /// Every branch's heads in its changelog, kept as it grows.
   branch_heads: BranchHeads,
+  /// The buffers [`HgIndex::revision_text`] rebuilds a chain through ([`TextBuffers`]).
+  buffers: core::cell::RefCell<TextBuffers>,
+}
+
+/// The buffers a revision's text is rebuilt from its chain through (goal 93, C1; w-perf's attribution of Mercurial's
+/// own push: `revision_text`'s rebuilds allocated 2.57 GB freed within a second, 1.24 GB of it in the band glibc keeps,
+/// and `object_bytes`' copies of the whole each chain begins from 0.62 GB): the text before the delta applied last, and
+/// the delta read from the store's windows, each kept for the next read, so a read allocates the text it hands out
+/// alone.
+#[derive(Debug, Default)]
+struct TextBuffers {
+  /// The text a delta is applied into.
+  next: Vec<u8>,
+  /// The delta read.
+  delta: Vec<u8>,
 }
 
 impl Default for HgIndex {
@@ -683,6 +698,7 @@ impl HgIndex {
     HgIndex {
       rows: Index::new(),
       branch_heads: BranchHeads::default(),
+      buffers: core::cell::RefCell::new(TextBuffers::default()),
     }
   }
 
@@ -711,6 +727,7 @@ impl HgIndex {
         answered: core::cell::Cell::new(0),
         longest_walk: self.branch_heads.longest_walk,
       },
+      buffers: core::cell::RefCell::new(TextBuffers::default()),
     })
   }
 
@@ -1097,14 +1114,15 @@ impl HgIndex {
 
   /// The whole text of `log`'s revision `rev` (A-729): a manifest kept as a delta rebuilt from the whole text its chain
   /// rests on, each delta applied in turn; a file revision's metadata block and bytes between its markers; any other
-  /// revision's bytes. `None` where the index or the store does not hold it whole.
+  /// revision's bytes. `None` where the index or the store does not hold it whole. The text handed out is its one
+  /// allocation: a whole is read at its length, and a chain is rebuilt through the index's own buffers ([`TextBuffers`]).
   pub fn revision_text(&self, store: &ContentStore, log: Log<'_>, rev: u32) -> Option<Vec<u8>> {
     let row = self.revision(store, log, rev)?;
     if let Some(block) = row.block {
       return framed_text(store, (&block, &row.bytes), row.len);
     }
     if row.base == NONE {
-      return store.object_bytes(&row.bytes, row.len);
+      return object_text(store, &row.bytes, row.len);
     }
     let mut chain = vec![row];
     let mut at = row.base;
@@ -1124,21 +1142,28 @@ impl HgIndex {
     // windows (main's order of 2026-11-20, Ada's no-allocation rule): a chain costs the two longest texts and its
     // longest delta, never a text and a delta a link. A chain is up to its text's length of deltas, so a text a link
     // was its length squared in copies (`delta::apply_into`, w-perf's b568499fe, for the revlog reader's same shape).
-    let mut text = store.object_bytes(&whole.bytes, whole.len)?;
-    let mut next = Vec::new();
-    let mut delta = Vec::new();
+    // The buffers are the index's, kept from the read before (a read the index is already making, which none is, as no
+    // read calls another, would rebuild through buffers of its own); the text handed out leaves its buffer behind.
+    let mut held = self.buffers.try_borrow_mut().ok();
+    let mut own = TextBuffers::default();
+    let buffers = held.as_deref_mut().unwrap_or(&mut own);
+    let mut text = object_text(store, &whole.bytes, whole.len)?;
+    let mut next = core::mem::take(&mut buffers.next);
     let mut room = crate::Admission::new(u64::MAX);
-    for step in chain.iter().rev() {
-      delta.clear();
+    let rebuilt = chain.iter().rev().try_for_each(|step| {
+      buffers.delta.clear();
       for window in store.windows(&step.bytes) {
-        delta.extend_from_slice(&window);
+        buffers.delta.extend_from_slice(&window);
       }
-      if crate::read::to_u64(delta.len()) != step.stored {
+      if crate::read::to_u64(buffers.delta.len()) != step.stored {
         return None;
       }
-      crate::delta::apply_into(&text, &delta, &mut next, &mut room).ok()?;
+      crate::delta::apply_into(&text, &buffers.delta, &mut next, &mut room).ok()?;
       core::mem::swap(&mut text, &mut next);
-    }
+      Some(())
+    });
+    buffers.next = next;
+    rebuilt?;
     (crate::read::to_u64(text.len()) == row.len).then_some(text)
   }
 
@@ -1393,13 +1418,23 @@ fn framed_text(
     .collect();
   let markers = crate::read::to_u64(crate::filerev::MARKER.len()).checked_mul(2)?;
   let framing = crate::read::to_u64(block.len()).checked_add(markers)?;
-  let bytes = store.object_bytes(bytes, len.checked_sub(framing)?)?;
+  let bytes = object_text(store, bytes, len.checked_sub(framing)?)?;
   let mut text = Vec::with_capacity(usize::try_from(len).ok()?);
   text.extend_from_slice(crate::filerev::MARKER);
   text.extend_from_slice(&block);
   text.extend_from_slice(crate::filerev::MARKER);
   text.extend_from_slice(&bytes);
   Some(text)
+}
+
+/// The object `root` names, `len` bytes, read from its windows into a text of that length (no copy grown from empty);
+/// `None` where the store holds another length.
+fn object_text(store: &ContentStore, root: &ContentId, len: u64) -> Option<Vec<u8>> {
+  let mut text = Vec::with_capacity(usize::try_from(len).ok()?);
+  for window in store.windows(root) {
+    text.extend_from_slice(&window);
+  }
+  (crate::read::to_u64(text.len()) == len).then_some(text)
 }
 
 /// A payload's common part, read back: the node, the parents, the flags, the length, and what follows.

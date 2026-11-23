@@ -1810,6 +1810,11 @@ fn a_checkout_reads_a_text_ram_does_not_hold_through_the_store() {
   );
   assert!(carried, "the text's bytes are not in the edit");
   assert!(fetched >= 1, "no piece read through the store");
+  let pieces = u64::try_from(bytes.len().div_ceil(slates_store::store::PIECE_BYTES)).unwrap();
+  assert!(
+    fetched <= pieces,
+    "{fetched} pieces fetched through the store for a text of {pieces}"
+  );
   assert_eq!(left, 0, "a fetched piece was kept");
 }
 
@@ -1866,6 +1871,11 @@ fn a_get_file_revs_reads_a_text_ram_does_not_hold_through_the_store() {
     "the text's last KiB is not in the delta"
   );
   assert!(fetched >= 1, "no piece read through the store");
+  let pieces = u64::try_from(bytes.len().div_ceil(slates_store::store::PIECE_BYTES)).unwrap();
+  assert!(
+    fetched <= pieces,
+    "{fetched} pieces fetched through the store for a text of {pieces}"
+  );
   assert_eq!(left, 0, "a fetched piece was kept");
 }
 
@@ -1920,5 +1930,10 @@ fn a_get_file_reads_a_text_ram_does_not_hold_through_the_store() {
     String::from_utf8_lossy(out.get(out.len().saturating_sub(600)..).unwrap_or_default())
   );
   assert!(fetched >= 1, "no piece read through the store");
+  let pieces = u64::try_from(bytes.len().div_ceil(slates_store::store::PIECE_BYTES)).unwrap();
+  assert!(
+    fetched <= pieces,
+    "{fetched} pieces fetched through the store for a text of {pieces}"
+  );
   assert_eq!(left, 0, "a fetched piece was kept");
 }

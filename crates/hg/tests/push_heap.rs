@@ -13,9 +13,11 @@
 )]
 
 use slates_hg::changegroup::{Changegroup, Group, Revision, Version};
-use slates_hg::index::HgIndex;
+use slates_hg::index::{HgIndex, Log};
 use slates_hg::manifest::{self, Entry, Flag};
 use slates_hg::push::intake::{Intake, Stepped};
+use slates_hg::serve::getbundle::Store;
+use slates_hg::serve::indexed::{Indexed, State};
 use slates_hg::{Admission, NULL_NODE, Node, node};
 use slates_mem::large::{LargeMapped, heap};
 use std::borrow::Cow;
@@ -24,6 +26,13 @@ use slates_vcs::{ContentRefused, ContentStore, StoredWindow, WindowStorage};
 
 #[global_allocator]
 static ALLOCATOR: LargeMapped = LargeMapped;
+
+/// Held by each test while it reads the heap's figures: the figures are the process's, so two tests reading at once
+/// would read each other's allocations.
+// D-8 test harness: a lock held in turn by its two owners, `a_pushs_churn_per_changeset_is_its_file_alone` and
+// `a_views_manifest_read_is_one_text`, poison recovered.
+#[allow(clippy::disallowed_types)]
+static ALONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Shape: the changesets after the first, each rewriting one file, in the shorter history; the longer has twice as many,
 /// so their difference is what [`EDITS`] edit changesets allocate alone.
@@ -342,6 +351,9 @@ const SLACK_BYTES: u64 = 16 << 10;
 /// 16 KiB file (0.74) and 13,674 B at the 160 KiB one (0.08): the cache keeps only a text a later delta rests on.
 #[test]
 fn a_pushs_churn_per_changeset_is_its_file_alone() {
+  let _alone = ALONE
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner);
   for (files, size) in [
     (100, 64),
     (400, 64),
@@ -376,4 +388,79 @@ fn a_pushs_churn_per_changeset_is_its_file_alone() {
       );
     }
   }
+}
+
+/// `index` with `payload` taken into it whole: the fork the intake made, `index` given back.
+fn taken(mut index: HgIndex, payload: &[u8], store: &mut ContentStore) -> HgIndex {
+  let mut admission = Admission::new(u64::MAX);
+  let mut intake =
+    Intake::begin((Version::V03, payload), &mut index, store, &mut admission).unwrap();
+  loop {
+    match intake.step(payload, store, &mut admission).unwrap() {
+      Stepped::More => {}
+      Stepped::Done => break,
+      other => panic!("a whole changegroup in memory stepped {other:?}"),
+    }
+  }
+  let Ok((fork, _)) = intake.finish() else {
+    panic!("a whole changegroup taken");
+  };
+  index.release(store).unwrap();
+  fork
+}
+
+/// Goal 93 (main's order: C1's cuts, `HgIndex::revision_text` second by bytes; w-perf's attribution of Mercurial's own
+/// push, 2.57 GB of `revision_text`'s rebuilds freed within a second, 1.24 GB of them in the [128 KiB, 256 KiB) band):
+/// the served view reads a manifest kept as a delta (A-729) by rebuilding it from its chain, as the server reads each
+/// pushed changeset's manifest to build the push's works. Do: take a history of 1,600 files and twice [`EDITS`] edits
+/// into an index, view it, and read the first [`EDITS`] manifests, then all of them. Read the churn per manifest read
+/// (the two readings' difference over [`EDITS`]). Expect at most one copy of a manifest's text and [`SLACK_BYTES`]: the
+/// text read lent out, its chain rebuilt through buffers the view holds. Red before: each read rebuilt into a text, a
+/// next text and a delta of its own, the whole it began from grown from empty: 194,487 B a read of a 91,200 B manifest
+/// (2.13 copies, 2026-11-23, MacBook arm64, debug); now 105,500 B (1.16), the text the read hands out.
+#[test]
+fn a_views_manifest_read_is_one_text() {
+  let _alone = ALONE
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner);
+  let (payload, manifest) = history(1_600, 64, 2 * EDITS);
+  let mut store = ContentStore::with_storage(u64::MAX, WINDOW, Box::new(Arena::new())).unwrap();
+  let index = taken(HgIndex::new(), &payload, &mut store);
+  let reading = reading_cost();
+  let state = State {
+    roots: &[],
+    bookmarks: &[],
+    publishing: true,
+    markers: &[],
+  };
+  let view = Indexed::new(&index, &store, state, &mut Admission::new(u64::MAX)).unwrap();
+  let nodes: Vec<Node> = (0..index.len(&store, Log::Manifest))
+    .filter_map(|rev| {
+      index
+        .revision(&store, Log::Manifest, rev)
+        .map(|row| row.node)
+    })
+    .collect();
+  let churn = |count: usize| {
+    let mut room = Admission::new(u64::MAX);
+    let before = heap().system_allocated;
+    for node in &nodes[..count] {
+      let read = view.manifest(node, &mut room).unwrap();
+      assert!(read.is_some(), "the manifest read");
+    }
+    heap()
+      .system_allocated
+      .saturating_sub(before)
+      .saturating_sub(reading)
+  };
+  let per_read = churn(2 * EDITS).saturating_sub(churn(EDITS)) / u64::try_from(EDITS).unwrap();
+  let manifest = u64::try_from(manifest).unwrap();
+  println!(
+    "push_heap: a view's manifest read allocates {per_read} B ({:.2} manifests of {manifest} B)",
+    per_read as f64 / manifest as f64
+  );
+  assert!(
+    per_read <= manifest + SLACK_BYTES,
+    "a manifest read allocated {per_read} B, past one {manifest} B manifest and {SLACK_BYTES} B"
+  );
 }
