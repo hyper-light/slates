@@ -940,9 +940,14 @@
 >   on (`Frame::based_later`, one bit a revision told when the framing is made), and every text the intake lets go is
 >   a later rebuild's buffer (`Spares`, at most four and the cache's bound). `push_heap`'s
 >   `a_pushs_churn_per_changeset_is_its_file_alone`, red at 28,855 B an edit of a 16 KiB file (1.76 copies), 177,497 B
->   of a 160 KiB one (1.08) with the buffer reused alone; now 12,047 B and 13,674 B (0.74, 0.08), no copy. Owed:
->   `HgIndex::revision_text`'s buffers and `object_bytes`, then `Taker::file_base`; the 57k push's reading
->   (`hg_push_lifetimes`, w-perf's) after them.
+>   of a 160 KiB one (1.08) with the buffer reused alone; now 12,047 B and 13,674 B (0.74, 0.08), no copy.
+>   `HgIndex::revision_text`'s rebuilds cut BUILT (2026-11-23, w-hg; C1 cut 2): each read rebuilt a chain into a text, a
+>   next text and a delta of its own, the whole it began from copied out by `object_bytes` grown from empty (w-perf:
+>   2.57 GB freed within a second under `push::held`, 1.24 GB in the band, `object_bytes` 0.62 GB). The index keeps its
+>   own next text and delta (`TextBuffers`), and a whole is read at its length (`object_text`), so a read allocates the
+>   text it hands out alone. `push_heap`'s `a_views_manifest_read_is_one_text`: red 194,487 B a read of a 91,200 B
+>   manifest (2.13 copies), now 105,500 B (1.16). Owed: `Taker::file_base`; the 57k push's reading (`hg_push_lifetimes`,
+>   w-perf's) after it.
 >   Its bound from the work BUILT (main's ruling, 2026-11-23): the chain no longer needs its texts held, so the cache holds
 >   the distinct texts its last `waiting` reads lent (one a waiting request, the owner's room) and a chunk's room
 >   (`TextCache::for_reads`), the least lately read out first; a text past it is lent from the buffer it was made into.
