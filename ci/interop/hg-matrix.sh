@@ -124,6 +124,17 @@ if [ -n "$DPID" ] && [ -r "/proc/$DPID/smaps" ]; then
   awk '/^[0-9a-f]+-[0-9a-f]+ / {name = (NF >= 6 ? $6 : "[anon]")} /^Rss:/ {rss[name] += $2} END {for (n in rss) print rss[n], n}' \
     "/proc/$DPID/smaps" | sort -rn | head -15 | while read -r kib name; do echo "DIAG resident after push-all: $kib KiB $name"; done
 fi
+# DIAG (diag branch only; main 01a20182 arena-13): the same readings after the daemon sat idle past several sweep
+# passes (a pass runs a sweep's interval, the liveness budget of about 1 s, after what owes it), so a freed content page
+# not yet purged is told apart from one kept short or deferred (w-shared's three mechanisms, the content arena gauges).
+sleep 10
+s status --json --memory >"$WORK/status-after-idle.json" 2>"$WORK/status-after-idle.err" ||
+  echo "DIAG status after idle failed: $(head -3 "$WORK/status-after-idle.err")"
+if [ -n "$DPID" ] && [ -r "/proc/$DPID/smaps" ]; then
+  echo "DIAG smaps_rollup after idle (pid $DPID): $(tr -s ' ' < "/proc/$DPID/smaps_rollup" | tr '\n' ';' | cut -c1-900)"
+  awk '/^[0-9a-f]+-[0-9a-f]+ / {name = (NF >= 6 ? $6 : "[anon]")} /^Rss:/ {rss[name] += $2} END {for (n in rss) print rss[n], n}' \
+    "/proc/$DPID/smaps" | sort -rn | head -15 | while read -r kib name; do echo "DIAG resident after idle: $kib KiB $name"; done
+fi
 # DIAG (diag branch only): stop here when asked, so the read after push-all doesn't wait on rows that still spin.
 if [ "${DIAG_STOP_AFTER_PUSH:-0}" = 1 ]; then
   printf '%s\n' "---- stopped after push-all (DIAG_STOP_AFTER_PUSH)" "${ROWS[@]}"

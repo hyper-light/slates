@@ -101,7 +101,19 @@ jobs:
           for h in walk(json.load(open(sys.argv[1]))):
               totals[h["kind"]] = totals.get(h["kind"], 0) + (h.get("count") or h.get("value") or 0)
           for kind in sorted(totals): print(kind, totals[kind])' $RUNNER_TEMP/matrix-hg/status-after-push.json || true
-          echo "== peak RSS (compare arena-11 193757bdf: push-all 2212 x86, 2118 arm64 MiB; floor 1726-1740; glibc arena 1009 MB, free 588 MB)"; grep -E "daemon peak RSS|^(PASS|FAIL) (push-all|clone|clone-rev|stream-clone) " $RUNNER_TEMP/matrix-hg.out | sort -u | cut -c1-200 || true
+          echo "== DIAG what holds memory after idle (content_range.*, mem.gauge.*, content.purge*)"; python3 -c 'import json,sys
+          def walk(o):
+              if isinstance(o, dict):
+                  k = o.get("kind")
+                  if isinstance(k, str) and (k.startswith("content_range.") or k.startswith("mem.gauge.") or k.startswith("content.purge")): yield o
+                  for v in o.values(): yield from walk(v)
+              elif isinstance(o, list):
+                  for v in o: yield from walk(v)
+          totals = {}
+          for h in walk(json.load(open(sys.argv[1]))):
+              totals[h["kind"]] = totals.get(h["kind"], 0) + (h.get("count") or h.get("value") or 0)
+          for kind in sorted(totals): print(kind, totals[kind])' $RUNNER_TEMP/matrix-hg/status-after-idle.json || true
+          echo "== peak RSS (compare arena-12 047f639ca: push-all peak 2150 x86 default, 1926 x86 tunables, 2206 arm64 MiB; RSS after push-all 1,865 MB x86)"; grep -E "daemon peak RSS|^(PASS|FAIL) (push-all|clone|clone-rev|stream-clone) " $RUNNER_TEMP/matrix-hg.out | sort -u | cut -c1-200 || true
           echo "== DIAG turns, by cpu"; grep 'DIAG hg-http turn' $A | sed 's/.*turn //' | awk '{for(i=1;i<=NF;i++) if($i ~ /^cpu_us=/){split($i,a,"="); print a[2] "\t" $0}}' | sort -k1,1nr | head -20 | cut -f2- || true
           echo "== DIAG begins over 10 ms cpu"; grep 'DIAG hg-http begin' $A | awk '{for(i=1;i<=NF;i++) if($i ~ /^cpu_us=/){split($i,a,"="); if (a[2] > 10000) print}}' | cut -c1-260 || true
           exit $rc
