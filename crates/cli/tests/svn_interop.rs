@@ -2605,6 +2605,7 @@ fn an_svnsync_measured() {
 
 /// Shape: the revisions [`an_svn_update_measured`] updates across where `SLATES_SVN_UPDATE_SPAN` names none: the 500
 /// w-bugs' P6 runs updated back and forward over git-1000 (diag-w-bugs-svnfetch-8 and -13).
+#[cfg(unix)]
 const UPDATE_SPAN: u64 = 500;
 
 /// P6 of Ada's close list (goal 93: svn:// update 5.6 s at w-bugs' run 13 against 2.7 s at run 8, stock svn 1.15 on
