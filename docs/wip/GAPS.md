@@ -694,6 +694,13 @@
 >   The test-only one-call landing builds a push's works as the driver does, planned and then built over the
 >   store's read-through (`works_whole`); `Works::Whole` and the one-call `tree::work` arm are gone, and `prepare` takes
 >   the view alone. The store-made-texts oracle compares a file by the identities its row names.
+> - A push's held high-water gauged BUILT (2026-11-23, w-hg; main's ruling: the 410 MiB bar's push-all peak first):
+>   `vcs.hg.push_held_high_bytes`, the push's admission held plus its file texts still in the content store, sampled as
+>   each segment lands before its let-go; `..._texts_high_bytes` its texts' share; `vcs.hg.push_rows_bytes` its fork's
+>   index (`HgIndex::held_bytes`, tables and tail). Held by `a_pushs_texts_high_water_is_a_segments_whatever_its_history`
+>   (60 and 240 changesets of 8 KiB files at 32 KiB segments: texts 32,768 both; rows 35,860 and 143,780). OPEN, the
+>   next piece: the admission held grows about 843 bytes a changeset (56,809 and 208,768 in debug), the push's
+>   per-revision bookkeeping kept to its end; bounded by the segment, the held high-waters are equal within a segment.
 > - A fetch's file section asks a step's rows at a time BUILT (2026-11-23, w-hg; main's ruling on CI 45117277400: on
 >   arm64 one step of a clone's streamed answer ran 2,019,916 us wall, 670,641 us CPU, writing nothing). Both of
 >   getbundle's file sections sized a batch by the turn's room alone, the repository's whole share: a clone's link walk
