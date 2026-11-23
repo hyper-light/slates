@@ -123,6 +123,10 @@ pub(crate) const REPLICA_REBUILT_VERSIONS: &str = "merge.replica.rebuilt_version
 /// replica is installed, and the green's later records stay unacknowledged here (A-313).
 /// Format: a refusal name in the daemon's status report.
 pub(crate) const REPLICA_RECORDS_SHORT: &str = "merge.replica.records_short";
+/// Counted on a holder whose held checkpoint names a file by its content-plane object (A-869), which a holder's replica
+/// does not read (A-727 (d) owes it): no replica is installed from it.
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const REPLICA_CHECKPOINT_UNREAD: &str = "merge.replica.checkpoint_unread";
 /// Counted on a takeover successor each time it advanced its replica of a green from its head to the version it adopted
 /// (A-333): the non-vacuity counter of an adoption whose replica was one or more versions behind.
 /// Format: a refusal name in the daemon's status report.
@@ -1322,9 +1326,13 @@ impl ReplicaSeed {
     if let Some(held) = state.merge.checkpoints.get(&self.object).cloned()
       && held.at <= self.through
     {
-      let checkpoint = slates_merge::checkpoint::Checkpoint::decode(&held.bytes)
+      let mut checkpoint = slates_merge::checkpoint::Checkpoint::decode(&held.bytes)
         .map_err(|_| INPUTS_UNDECODABLE)?;
-      replica = replica.with_checkpoint(&checkpoint);
+      // A checkpoint naming its files (A-869) is restored only once they are read from a content plane, and a holder's
+      // replica reads none (A-727 (d) owes it, as for a chain entry's named runs): refused, counted.
+      replica = replica
+        .with_checkpoint(&mut checkpoint)
+        .map_err(|_| REPLICA_CHECKPOINT_UNREAD)?;
       let identity = ledger_value(state, self.object, held.at)
         .map(|value| value.identity)
         .ok_or(REPLICA_RECORDS_SHORT)?;
@@ -2550,7 +2558,10 @@ mod tests {
     assert_eq!(kept.at, 1, "at the committed floor the record names");
     let checkpoint = slates_merge::checkpoint::Checkpoint::decode(&kept.bytes).unwrap();
     assert_eq!(
-      Green::new().with_checkpoint(&checkpoint).head_identity(),
+      Green::new()
+        .with_checkpoint(&mut checkpoint.clone())
+        .unwrap()
+        .head_identity(),
       after_one,
       "the checkpoint holds the green at version 1"
     );

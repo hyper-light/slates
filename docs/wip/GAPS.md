@@ -1621,9 +1621,18 @@
 > four pieces (`inbox/main-from-w-svn-a760b-plan.md` on the fan-out ledger). Piece 1 BUILT: a block made of the whole of
 > one named run spanning its object keeps that object's identity (`Green::name_of`), through a judged commit, `make_step`
 > and `apply_recorded` alike; any other making leaves the block unnamed. No memory change yet. Oracle:
-> `a_file_made_whole_of_a_named_object_is_named_for_it_until_changed`. OWED: piece 2, a checkpoint naming a named file
-> instead of carrying its bytes (a restored green names nothing until then); piece 3, the history keeping a named
-> version by its name; piece 4, the current block holding no bytes, read through the plane.
+> `a_file_made_whole_of_a_named_object_is_named_for_it_until_changed`. Piece 2 BUILT as A-869 (below). OWED: piece 3,
+> the history keeping a named version by its name; piece 4, the current block holding no bytes, read through the plane.
+>
+> **A-869 (2026-11-22, w-svn; main 01a20182's order of 19:28, A-760 (b) piece 2):** a green's checkpoint names a file
+> whose block is named for a content-plane object instead of carrying its bytes (`Checkpoint::named`, a section after
+> the head check written only when a file is named; version 5 kept, so every checkpoint before decodes as it did). A
+> restore reads them a slice a step (`Checkpoint::read_step`) and refuses an unread one typed (`engine::Unrestored`). The
+> daemon's recovery reads them in its own phase (`verbs::GreenReplayPhase::Restoring`), and A-760's pre-pass brings back
+> the checkpoint's names its store does not hold whole. A holder's replica refuses a held checkpoint that names files
+> (`merge.replica.checkpoint_unread`, A-727 (d) owes its reads). Oracle: the A-866 oracle with restores, at earlier
+> versions too, caught up by recorded entries. Red first: a restored green named nothing. Not yet measured: the
+> register's checkpoint bytes before and after (main's). OWED: a copied tree's keys are carried still.
 >
 > **Finding, 2026-11-20 (w-engine, not chased under the close order):** `cargo test -p slates-merge --test checkpoint`
 > failed once in 10 runs (`a_green_restored_from_its_checkpoint_answers_as_the_green_it_was`, a proptest, unseeded) on

@@ -20175,6 +20175,13 @@ enum GreenReplayPhase {
   Decode(Box<slates_merge::origin::DecodeCursor>),
   /// Seeding the engine from the origin a share a step. Boxed: it holds the engine being seeded.
   Load(Box<slates_merge::engine::OriginLoad>),
+  /// Reading the files the green's checkpoint names from the content plane, a copy slice a step (A-869), before the
+  /// seeded engine is restored at it: the engine, the checkpoint being read, and its version.
+  Restoring {
+    seeded: Box<slates_merge::engine::Green>,
+    checkpoint: Box<slates_merge::checkpoint::Checkpoint>,
+    held: u64,
+  },
   /// Replaying the chain: the engine so far, the version its checkpoint holds (0 with none), the index of the next
   /// entry, the versions rebuilt so far, and the head and identity the checkpoint recorded (A-257).
   Chain {
@@ -20238,7 +20245,9 @@ impl GreenReplay {
   /// to its lineage (A-575).
   fn into_engine(self) -> Option<Box<slates_merge::engine::Green>> {
     match self.phase {
-      GreenReplayPhase::Chain { green, .. } => Some(green),
+      GreenReplayPhase::Chain { green, .. } | GreenReplayPhase::Restoring { seeded: green, .. } => {
+        Some(green)
+      }
       GreenReplayPhase::Origin(_) | GreenReplayPhase::Decode(_) | GreenReplayPhase::Load(_) => None,
     }
   }
@@ -20276,6 +20285,42 @@ impl GreenReplay {
           Some(seeded) => Some(seeded),
           None => return Ok(false),
         }
+      }
+      GreenReplayPhase::Restoring {
+        seeded,
+        checkpoint,
+        held,
+      } => {
+        let held = *held;
+        let store = state
+          .vcs_stores
+          .content()
+          .ok_or(GreenFence::ContentMissing { version: held })?;
+        let objects = crate::vcs_store::named_objects::PlaneObjects {
+          store,
+          kept_in: &state.store.content,
+        };
+        let read = checkpoint
+          .read_step(&objects, state.config.copy_slice_bytes().max(1))
+          .map_err(|_| GreenFence::ContentMissing { version: held })?;
+        if !read {
+          return Ok(false);
+        }
+        let seeded = std::mem::take(seeded);
+        let mut checkpoint = std::mem::take(checkpoint);
+        match restored_phase(state, id, seeded, (&mut checkpoint, held)) {
+          Ok(phase) => self.phase = phase,
+          // The engine stays with the replay, so a lineage member's refused replay gives it back (A-575).
+          Err((fence, seeded)) => {
+            self.phase = GreenReplayPhase::Restoring {
+              seeded,
+              checkpoint,
+              held,
+            };
+            return Err(fence);
+          }
+        }
+        return Ok(false);
       }
       GreenReplayPhase::Chain {
         green,
@@ -20346,7 +20391,10 @@ impl GreenReplay {
         green.set_rejected_budget(crate::merge_service::rejected_cache_budget(state));
         Ok((*green, replayed))
       }
-      GreenReplayPhase::Origin(_) | GreenReplayPhase::Decode(_) | GreenReplayPhase::Load(_) => {
+      GreenReplayPhase::Origin(_)
+      | GreenReplayPhase::Decode(_)
+      | GreenReplayPhase::Load(_)
+      | GreenReplayPhase::Restoring { .. } => {
         Err(crate::merge_service::GreenFence::OriginUnavailable)
       }
     }
@@ -20508,8 +20556,7 @@ fn chain_phase_or_back(
   // The engine seeded from the origin (the empty engine for a green with no origin, the branched one for a lineage's
   // branch), restored at its checkpoint if it has one, as `Green::restore` does in one call.
   let partition = state.db.partition();
-  let adopted = partition.green_adoption(id).is_some();
-  let (mut green, held, head_check) = match partition.green_checkpoint(id) {
+  match partition.green_checkpoint(id) {
     Some((held, named)) => {
       // Its encoding is the content store's, named by the record (A-579's last step, chain entry format 6's rule): a
       // store that lacks it fences the green as a missing increment does.
@@ -20519,22 +20566,70 @@ fn chain_phase_or_back(
           Box::new(seeded),
         ));
       };
-      let Some(checkpoint) = slates_merge::checkpoint::Checkpoint::decode(&bytes)
+      let Some(mut checkpoint) = slates_merge::checkpoint::Checkpoint::decode(&bytes)
         .ok()
         .filter(|checkpoint| checkpoint.version == held)
       else {
         return Err((GreenFence::CheckpointCorrupt, Box::new(seeded)));
       };
-      (
-        seeded.with_checkpoint(&checkpoint),
-        held,
-        checkpoint.head_check,
-      )
+      // The files it names (A-869) are read from the content plane first, a copy slice a step, so no step reads a
+      // large text whole ([`GreenReplayPhase::Restoring`]).
+      if checkpoint.unread().is_some() {
+        return Ok(GreenReplayPhase::Restoring {
+          seeded: Box::new(seeded),
+          checkpoint: Box::new(checkpoint),
+          held,
+        });
+      }
+      restored_phase(state, id, Box::new(seeded), (&mut checkpoint, held))
     }
     // With no checkpoint the chain begins after the green's floor: 0, or the version its takeover adopted it at, whose
     // engine the boot rebuilt from this node's ledger (A-333).
-    None => (seeded, partition.green_floor(id), None),
-  };
+    None => chain_from(state, id, seeded, (partition.green_floor(id), None)),
+  }
+}
+
+/// The chain's replay of green `id` over `seeded` restored at `checkpoint`, of version `held`, whose named files are
+/// read (A-869): the engine handed back with the fence when it cannot begin.
+fn restored_phase(
+  state: &ShardState,
+  id: DbVolumeId,
+  seeded: Box<slates_merge::engine::Green>,
+  (checkpoint, held): (&mut slates_merge::checkpoint::Checkpoint, u64),
+) -> Result<
+  GreenReplayPhase,
+  (
+    crate::merge_service::GreenFence,
+    Box<slates_merge::engine::Green>,
+  ),
+> {
+  use crate::merge_service::GreenFence;
+  let head_check = checkpoint.head_check;
+  match seeded.with_checkpoint(checkpoint) {
+    Ok(green) => chain_from(state, id, green, (held, head_check)),
+    Err(unrestored) => Err((
+      GreenFence::ContentMissing { version: held },
+      unrestored.green,
+    )),
+  }
+}
+
+/// The chain's replay of green `id` from `green`, at version `held` (its checkpoint's, or its floor with none), with
+/// the head and identity the checkpoint recorded (A-257): the engine handed back with the fence when it cannot begin.
+fn chain_from(
+  state: &ShardState,
+  id: DbVolumeId,
+  mut green: slates_merge::engine::Green,
+  (held, head_check): (u64, Option<(u64, [u8; 32])>),
+) -> Result<
+  GreenReplayPhase,
+  (
+    crate::merge_service::GreenFence,
+    Box<slates_merge::engine::Green>,
+  ),
+> {
+  use crate::merge_service::GreenFence;
+  let adopted = state.db.partition().green_adoption(id).is_some();
   // The identity the head had when the checkpoint was taken (A-257): compared once the replay reaches that version.
   if head_check
     .is_some_and(|(version, identity)| version == held && identity != green.head_identity())
