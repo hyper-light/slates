@@ -21,7 +21,6 @@ jobs:
       matrix:
         include:
           - { runner: ubuntu-latest, run: 1, malloc: default }
-          - { runner: ubuntu-latest, run: 1, malloc: arena1 }
           - { runner: ubuntu-24.04-arm, run: 1, malloc: default }
     timeout-minutes: 300
     defaults:
@@ -98,7 +97,7 @@ jobs:
           for h in walk(json.load(open(sys.argv[1]))):
               totals[h["kind"]] = totals.get(h["kind"], 0) + (h.get("count") or h.get("value") or 0)
           for kind in sorted(totals): print(kind, totals[kind])' $RUNNER_TEMP/matrix-hg/status-after-push.json || true
-          echo "== peak RSS (compare arena-6 a6eceece3: push-all 2186 x86, 2179 arm64 MiB; floor 1725-1735; allocated 45.05 GB)"; grep -E "daemon peak RSS|^(PASS|FAIL) (push-all|clone|clone-rev|stream-clone) " $RUNNER_TEMP/matrix-hg.out | sort -u | cut -c1-200 || true
+          echo "== peak RSS (compare arena-8 721657ce8: push-all 2194 x86, 2138 arm64 MiB; floor 1760 / 1739; allocated 45.1 GB)"; grep -E "daemon peak RSS|^(PASS|FAIL) (push-all|clone|clone-rev|stream-clone) " $RUNNER_TEMP/matrix-hg.out | sort -u | cut -c1-200 || true
           echo "== DIAG turns, by cpu"; grep 'DIAG hg-http turn' $A | sed 's/.*turn //' | awk '{for(i=1;i<=NF;i++) if($i ~ /^cpu_us=/){split($i,a,"="); print a[2] "\t" $0}}' | sort -k1,1nr | head -20 | cut -f2- || true
           echo "== DIAG begins over 10 ms cpu"; grep 'DIAG hg-http begin' $A | awk '{for(i=1;i<=NF;i++) if($i ~ /^cpu_us=/){split($i,a,"="); if (a[2] > 10000) print}}' | cut -c1-260 || true
           exit $rc
