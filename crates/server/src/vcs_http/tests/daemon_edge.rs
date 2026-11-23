@@ -4271,3 +4271,181 @@ fn an_imported_repositorys_file_texts_leave_the_content_store_once_its_segments_
     "the clone carries a changegroup"
   );
 }
+
+/// Shape: the files of [`a_thin_push_whose_base_was_let_go_lands`]'s first commit, each about a content window long so
+/// each lies in windows of its own.
+const THIN_BASES: usize = 8;
+
+/// A pack of `objects`, each whole but the deltas `deltas` names, each `(index, base, delta)` a REF_DELTA against
+/// `base`, and where each object's entry begins.
+fn pack_with_offsets(
+  objects: &[(slates_git::object_name::Kind, &[u8])],
+  deltas: &[(usize, ObjectId, Vec<u8>)],
+) -> (Vec<u8>, Vec<u64>) {
+  use slates_git::entry::{self, Header, Representation};
+  let mut out = Vec::new();
+  let count = u32::try_from(objects.len()).expect("a count");
+  let mut writer = slates_git::pack::Writer::new(GitFormat::Sha1, count, &mut out);
+  let mut at = entry::PACK_HEADER_LEN;
+  let mut offsets = Vec::new();
+  for (index, (kind, content)) in objects.iter().enumerate() {
+    offsets.push(at);
+    let (header, data) = match deltas.iter().find(|(delta, _, _)| *delta == index) {
+      Some((_, base, delta)) => (
+        Header {
+          representation: Representation::RefDelta { base: *base },
+          size: u64::try_from(delta.len()).expect("a size"),
+        },
+        stored_zlib(delta),
+      ),
+      None => (
+        Header {
+          representation: Representation::Whole(*kind),
+          size: u64::try_from(content.len()).expect("a size"),
+        },
+        stored_zlib(content),
+      ),
+    };
+    entry::write(header, at, &mut writer).expect("the entry's header");
+    slates_git::out::Out::put(&mut writer, &data);
+    at += entry::written_len(header, at).expect("the header's length")
+      + u64::try_from(data.len()).expect("a length");
+  }
+  writer.finish().expect("the trailer");
+  (out, offsets)
+}
+
+/// A-864's push readers (main 01a20182's ruling of 2026-11-22, reader (b)): a thin push's REF_DELTA base read from a
+/// let-go window. Do: push a create of `main` at a commit of [`THIN_BASES`] files, each a window long; mark every window
+/// of its pack landed and let go those no home holds on the repository's shard; push, as stock git sends a thin pack, a
+/// commit over `main` changing one file whose window was let go, its new version a REF_DELTA against the old. Expect:
+/// both pushes `200` with every ref `ok`, the second's base brought back from the node's store. Red before: the second
+/// declined, its base unread ("an object it names cannot be read").
+#[test]
+#[ignore = "waits on reader (a), w-shared's: the first commit's deferred green build reads its files from let-go windows (\"a green's owed push was refused building: Object { .., why: Malformed }\"), so the thin push's ref update fails after its pack unpacks"]
+fn a_thin_push_whose_base_was_let_go_lands() {
+  use slates_git::object_name::Kind;
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let window = crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
+    state
+      .vcs_stores
+      .content()
+      .map(slates_vcs::ContentStore::window)
+  })
+  .unwrap_or(1 << 18);
+  let mut state = 0x9e37_79b9_7f4a_7c15u64;
+  let files: Vec<Vec<u8>> = (0..THIN_BASES)
+    .map(|_| {
+      (0..window)
+        .map(|_| {
+          state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+          state.to_be_bytes()[0]
+        })
+        .collect()
+    })
+    .collect();
+  let tree_of = |files: &[Vec<u8>]| {
+    let mut tree = Vec::new();
+    for (at, file) in files.iter().enumerate() {
+      tree.extend_from_slice(format!("100644 f{at}\0").as_bytes());
+      tree.extend_from_slice(git_name(Kind::Blob, file).as_bytes());
+    }
+    tree
+  };
+  let tree = tree_of(&files);
+  let first = format!(
+    "tree {}\nauthor A <a@example.com> 1700000000 +0000\ncommitter A <a@example.com> 1700000000 +0000\n\nfirst\n",
+    git_name(Kind::Tree, &tree)
+  )
+  .into_bytes();
+  let first_id = git_name(Kind::Commit, &first);
+  let mut objects: Vec<(Kind, &[u8])> = vec![(Kind::Commit, &first), (Kind::Tree, &tree)];
+  objects.extend(files.iter().map(|file| (Kind::Blob, file.as_slice())));
+  let (pack, offsets) = pack_with_offsets(&objects, &[]);
+  let mut request = Vec::new();
+  let line = format!("{ZERO} {first_id} refs/heads/main\0 report-status");
+  pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("the command");
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request.extend_from_slice(&pack);
+  let created = pushed(edge, &name, &request);
+  let ids: Vec<slates_vcs::ContentId> =
+    pack.chunks(window).map(slates_vcs::ContentId::of).collect();
+  let gone: Vec<bool> = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    crate::vcs_store::within_budget(state, 0, |stores| {
+      let content = stores.content_mut().expect("the content store");
+      for id in &ids {
+        content.mark_landed(id);
+      }
+    });
+    ids
+      .iter()
+      .map(|id| {
+        matches!(
+          crate::vcs_store::let_go_read(state, id),
+          Ok(_) | Err(slates_vcs::LetGoRefused::Away)
+        )
+      })
+      .collect()
+  });
+  // A file whose entry begins in a window let go: the thin push's base.
+  let window_u64 = u64::try_from(window).expect("a window");
+  let changed = (0..THIN_BASES).find(|file| {
+    let at = usize::try_from(offsets[2 + file] / window_u64).expect("an index");
+    gone.get(at).copied().unwrap_or(false)
+  });
+  let Some(changed) = changed else {
+    daemon.stop();
+    panic!("no file's window let go: {gone:?}");
+  };
+  let mut next = files.clone();
+  next[changed].extend_from_slice(b"one line more\n");
+  let next_tree = tree_of(&next);
+  let second = format!(
+    "tree {}\nparent {first_id}\nauthor A <a@example.com> 1700000001 +0000\ncommitter A <a@example.com> 1700000001 +0000\n\nsecond\n",
+    git_name(Kind::Tree, &next_tree)
+  )
+  .into_bytes();
+  let second_id = git_name(Kind::Commit, &second);
+  let delta = slates_git::store::delta_of(&files[changed], &next[changed]).expect("a delta");
+  let base = git_name(Kind::Blob, &files[changed]);
+  let thin: Vec<(Kind, &[u8])> = vec![
+    (Kind::Commit, &second),
+    (Kind::Tree, &next_tree),
+    (Kind::Blob, &next[changed]),
+  ];
+  let (thin_pack, _) = pack_with_offsets(&thin, &[(2, base, delta)]);
+  let mut request = Vec::new();
+  let line = format!("{first_id} {second_id} refs/heads/main\0 report-status");
+  pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("the command");
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request.extend_from_slice(&thin_pack);
+  let updated = pushed(edge, &name, &request);
+  let brought = counted_on(&daemon, REPOSITORY, "vcs_store.read_through.brought_back");
+  eprintln!(
+    "thin push: brought {brought}, refused {}, past patience {}",
+    counted_on(&daemon, REPOSITORY, "vcs_store.git_resident.refused"),
+    counted_on(
+      &daemon,
+      REPOSITORY,
+      "vcs_store.git_resident.bring_back_past_patience"
+    )
+  );
+  daemon.stop();
+  for (what, answer) in [("the create", &created), ("the thin push", &updated)] {
+    let report = String::from_utf8_lossy(&answer.1).into_owned();
+    assert_eq!(
+      (answer.0, report.contains("ok refs/heads/main")),
+      (200, true),
+      "{what}: {report}"
+    );
+  }
+  assert!(brought > 0, "the thin push's base brought back");
+}

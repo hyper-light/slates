@@ -1180,3 +1180,90 @@ fn deltas_waiting_for_a_late_base_resolve_a_turn_at_a_time() {
     .unwrap();
   assert_eq!(kept.objects.len(), 65);
 }
+
+/// A thin pack's base outside it that lies in a window let go until its test brings it back (A-864's push readers):
+/// answered away, at `at`, while `away` holds, then held.
+struct LetGo {
+  /// The base.
+  base: (ObjectId, Vec<u8>),
+  /// Whether it is still let go.
+  away: std::cell::Cell<bool>,
+  /// Where in its pack it was met let go.
+  at: u64,
+}
+
+impl Outside for LetGo {
+  fn object(&self, id: &ObjectId) -> Option<(Kind, &[u8])> {
+    (!self.away.get() && *id == self.base.0).then_some((Kind::Blob, self.base.1.as_slice()))
+  }
+
+  fn away(&self) -> Option<u64> {
+    self.away.get().then_some(self.at)
+  }
+}
+
+/// A-864's push readers (main 01a20182's ruling of 2026-11-22, reader (b): a thin push's base read from a let-go window
+/// was refused "an object it names cannot be read"). Do: read a pack of one reference delta on a blob held outside it,
+/// that blob let go; resolve a turn; bring the blob back and resolve again; then the same pack with its blob let go and
+/// never brought back, resolved twice. Expect: the first turn stops, nothing resolved and nothing refused; the next
+/// resolves the delta to its object; never brought back, the second turn refuses it as a base found nowhere, so a stop
+/// always makes progress or ends. Red before: the first turn refused at once.
+#[test]
+fn a864_a_thin_packs_base_let_go_stops_the_resolution_until_it_is_brought_back() {
+  let format = ObjectFormat::Sha1;
+  let base = b"a base held outside the pack, let go\n".repeat(8);
+  let id = blob_id(format, &base);
+  let target = [base.as_slice(), b"one line more\n"].concat();
+  let mut builder = Builder::new(format);
+  builder.put(
+    Representation::RefDelta { base: id },
+    &delta_between(&base, &target),
+  );
+  let bytes = builder.finish();
+  let index = Placed(vec![]);
+  let turn = |reader: &mut Reader<'_, Placed>, outside: &LetGo, held: &mut super::Held| {
+    let mut clock = Ticking(0);
+    reader.resolve_turn(
+      &mut unbounded(),
+      &mut Beside { outside, held },
+      crate::store::hook_view::Quantum {
+        clock: &mut clock,
+        ns: u64::MAX,
+      },
+    )
+  };
+  let read = |held: &mut super::Held, outside: &LetGo| {
+    let mut reader = Reader::new(format, &index);
+    reader
+      .read_into(&bytes, &mut unbounded(), &mut Beside { outside, held })
+      .unwrap();
+    reader
+  };
+  let outside = LetGo {
+    base: (id, base.clone()),
+    away: std::cell::Cell::new(true),
+    at: 4096,
+  };
+  let mut held = super::Held::default();
+  let mut reader = read(&mut held, &outside);
+  let stopped = turn(&mut reader, &outside, &mut held);
+  let before = kept(&held);
+  outside.away.set(false);
+  let resolved = turn(&mut reader, &outside, &mut held);
+  let object = held.take(0).map(|object| object.content);
+  assert_eq!((stopped, before), (Ok(false), 0));
+  assert_eq!(resolved, Ok(true));
+  assert_eq!(object, Some(target));
+  let never = LetGo {
+    base: (id, base),
+    away: std::cell::Cell::new(true),
+    at: 4096,
+  };
+  let mut held = super::Held::default();
+  let mut reader = read(&mut held, &never);
+  assert_eq!(turn(&mut reader, &never, &mut held), Ok(false));
+  assert!(
+    turn(&mut reader, &never, &mut held).is_err(),
+    "refused once nothing came back"
+  );
+}

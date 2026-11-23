@@ -258,7 +258,11 @@ async fn answer_step<S: ShardLender>(
       }
       Ok((Next::Exited(0), None))
     }
-    Answering::Turned => Ok((Next::More, Some(turn))),
+    Answering::Turned => {
+      // A-864's push readers: a base or object a turn met in a let-go window is brought back before the next turn.
+      crate::vcs_store::upload::brought_back_waited(push.repository()).await;
+      Ok((Next::More, Some(turn)))
+    }
     #[cfg(unix)]
     Answering::Hook(call) => {
       drop(turn);

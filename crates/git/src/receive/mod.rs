@@ -105,6 +105,12 @@ pub trait Repository {
   fn holds(&self, id: &ObjectId) -> bool {
     self.object(id).is_some()
   }
+
+  /// Where in its pack the last object asked was not read because it lies in a window let go (A-864's push readers,
+  /// [`crate::unpack::Outside::away`]). None by default.
+  fn away(&self) -> Option<u64> {
+    None
+  }
 }
 
 /// The refs a deployment hides from a pusher, as git's `transfer.hideRefs` and `receive.hideRefs`
@@ -338,6 +344,10 @@ impl<R: Repository + ?Sized> Repository for InMemory<'_, R> {
   fn holds(&self, id: &ObjectId) -> bool {
     self.repository.holds(id)
   }
+
+  fn away(&self) -> Option<u64> {
+    self.repository.away()
+  }
 }
 
 impl<R: ?Sized> Contents for InMemory<'_, R> {
@@ -369,6 +379,10 @@ struct Thin<'s, S: ?Sized>(&'s mut S);
 impl<S: Repository + ?Sized> Outside for Thin<'_, S> {
   fn object(&self, id: &ObjectId) -> Option<(Kind, &[u8])> {
     Repository::object(&*self.0, id)
+  }
+
+  fn away(&self) -> Option<u64> {
+    Repository::away(&*self.0)
   }
 }
 
