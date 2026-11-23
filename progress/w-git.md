@@ -563,3 +563,8 @@
   synchronous readers read through: (a) green_ready via views (w-shared), (b) push thin bases via IndexedObjects and
   (c) policy/signature reads (mine, ~3 h). Fetch-side readers stay. NEXT: (b)+(c); LFS on main's trace; stall on
   main's sample.
+- 2026-11-22 ~22:30 PST: LANDED (merge 77b4cb33a): push reader (b) 17d27ced5 (thin bases in let-go windows stop and are
+  brought back; (c) covered by (a)+(b), test kept); codex-review's upload admission fix 28f9ead8d (a retaken loose object
+  is not charged again); LFS 482f51fb0 (PUT routed to git's site, not svn's WebDAV; a download admitted the shard's
+  room); work-clone quadratic 9bf74aff4 (Kept::runs counted once; kept_fragments O(versions)). Guard stays until main
+  says (codex-review's two w-shared readers). NEXT: main's Studio rerun of the lfs row and git/git whole.
