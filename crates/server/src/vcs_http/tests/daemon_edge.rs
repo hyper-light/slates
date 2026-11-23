@@ -4600,7 +4600,8 @@ fn a_region_object_sharing_a_landed_files_window_is_read_whole_from_its_home() {
   let object_id = slates_vcs::ContentId::of(&object);
   let held = object.clone();
   let kept = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
-    crate::vcs_store::homes::keep_for_region(state, &held).map(|(identity, _)| identity)
+    crate::vcs_store::homes::keep_for_region(state, &held, &[crate::vcs_store::homes::TEST_OWNER])
+      .map(|(identity, _)| identity)
   });
   assert_eq!(
     kept.ok(),

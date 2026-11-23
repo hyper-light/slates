@@ -269,7 +269,7 @@ pub(crate) struct VcsStores {
   /// What the content store took back of them: restored, refused (counted by the recovery).
   nodes_restored: (u64, u64),
   /// A recovery's region holds (A-724 piece 8c), held again when the content store is made over the restored windows.
-  restored_region: Vec<slates_vcs::ContentId>,
+  restored_region: Vec<(slates_vcs::ContentId, Vec<slates_cluster::homes::HomeOwner>)>,
   /// What the content store took back of them: held, and the ones it could not take (counted and logged by the
   /// recovery, [`REGION_HOLDS_UNRESTORED`]).
   region_restored: (u64, Vec<slates_vcs::ContentId>),
@@ -1725,6 +1725,9 @@ pub(crate) struct SealedPush {
   /// The sequence of the changeset the node's store landed the names and the pack as, before the record names it
   /// (A-767 C5); 0 for none.
   landed: u64,
+  /// Who its holds in the region are for until its record commits (A-727 (d1a)): this attempt, made at its homing's
+  /// first ask ([`SealedPush::home_owner`]); none before.
+  owner: Option<slates_cluster::homes::HomeOwner>,
 }
 
 /// Puts a push's names' rows `bytes` into the shard's content store as one content, held for its record (A-724 piece
@@ -1829,14 +1832,55 @@ impl SealedPush {
     self.landed = sequence;
   }
 
+  /// Gives back the hold the store took of `identity` for a record that will never name it (its homing fell short), and
+  /// the attempt's holds of it in the region, let go at every home that kept it (A-727 (d1a)).
+  pub(crate) fn release_unhomed(&self, state: &mut ShardState, identity: &slates_vcs::ContentId) {
+    release_names(state, identity);
+    if let Some(owner) = self.owner {
+      homes::settle_later(homes::Settle::Release {
+        identity: *identity,
+        owner,
+      });
+    }
+  }
+
+  /// The attempt its holds in the region are for, once its homing began ([`SealedPush::home_owner`]).
+  pub(crate) fn owner_now(&self) -> Option<slates_cluster::homes::HomeOwner> {
+    self.owner
+  }
+
+  /// Who the push's holds in the region are for while it is in flight (A-727 (d1a)): this attempt, made once.
+  pub(crate) fn home_owner(&mut self, state: &ShardState) -> slates_cluster::homes::HomeOwner {
+    *self
+      .owner
+      .get_or_insert_with(|| homes::attempt_owner(state, self.repository.bytes))
+  }
+
   /// Gives back the holds the homed names and pack took for a record that will never name them (a push refused after
-  /// its homing: its changeset unlanded).
+  /// its homing: its changeset unlanded), and the attempt's holds in the region (A-727 (d1a)), let go at every home.
   pub(crate) fn release_homed(&mut self, state: &mut ShardState) {
     for (identity, _) in [self.named.take(), self.packed.take()]
       .into_iter()
       .flatten()
     {
       release_names(state, &identity);
+      if let Some(owner) = self.owner {
+        homes::settle_later(homes::Settle::Release { identity, owner });
+      }
+    }
+  }
+
+  /// The push's record committed (A-727 (d1a)): its holds in the region moved from the attempt to the repository's
+  /// records, at every home.
+  fn homed_committed(&self) {
+    let Some(from) = self.owner else {
+      return;
+    };
+    let to = slates_cluster::homes::HomeOwner::Record {
+      repository: self.repository.bytes,
+    };
+    for (identity, _) in [self.named, self.packed].into_iter().flatten() {
+      homes::settle_later(homes::Settle::Move { identity, from, to });
     }
   }
 
@@ -2255,6 +2299,7 @@ impl SealingPush {
         named: None,
         packed: None,
         landed: 0,
+        owner: None,
       }))),
       Err(refused) => {
         self.abandon(state);
@@ -2416,6 +2461,7 @@ pub(crate) fn commit(state: &mut ShardState, sealed: &mut SealedPush) -> Result<
   })?;
   sealed.objects = RecordWriter::default();
   state.count(VALUE_UNKEPT, unkept);
+  sealed.homed_committed();
   // A synchronous audit shard's history can bring nothing back (a bring-back awaits the node's store), so its landed
   // packs stay resident ([`KEEP_LANDED`]); a daemon's edges and tasks, and every let-go test, let them go.
   #[cfg(test)]
@@ -4142,7 +4188,7 @@ pub(crate) fn chunk_windows_mut(
 pub(crate) type NodesToRestore<'a> = (
   &'a [(slates_vcs::ContentId, Vec<u8>)],
   &'a [(slates_vcs::ContentId, slates_vcs::ContentId)],
-  &'a [slates_vcs::ContentId],
+  &'a [(slates_vcs::ContentId, Vec<slates_cluster::homes::HomeOwner>)],
   &'a [(slates_vcs::ContentId, u64)],
 );
 
