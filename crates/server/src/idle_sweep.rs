@@ -316,23 +316,28 @@ mod tests {
   }
 
   /// The hostile poller: each time the keeper starts a pass it takes turns on the shard until the pass has taken a
-  /// give-back step or ended, so it runs across that step's yield and cuts the pass short there, whichever of the two
-  /// the shard polls first.
+  /// give-back step since the poller last looked, or is not running, so it runs across that step's yield and cuts the
+  /// pass short there, whichever of the two the shard polls first; then it waits for the next pass. It never waits for
+  /// a second step: a pass that waits for the shard's idle point after the cut would never get one while the poller
+  /// kept taking turns (the poller's first build did, and was itself the load that held the pass off, on macOS).
   async fn poller() {
+    let Some(mut seen) = super::state::with_state(give_back_steps) else {
+      return;
+    };
     loop {
       slates_rt::futures::idle().await;
-      let Some(before) = super::state::with_state(give_back_steps) else {
-        return;
-      };
       loop {
-        slates_rt::futures::yield_now().await;
         match super::state::with_state(|state| {
           (give_back_steps(state), state.idle_sweep_running)
         }) {
           None => return,
-          Some((steps, running)) if steps > before || !running => break,
+          Some((steps, running)) if steps > seen || !running => {
+            seen = steps;
+            break;
+          }
           Some(_) => {}
         }
+        slates_rt::futures::yield_now().await;
       }
     }
   }

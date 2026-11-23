@@ -1,6 +1,6 @@
 name: diag-w-win2
 
-# w-win2 for main 01a20182 (2026-11-23), item 2, run 6. A diagnostics lane run only from `diag-measurer-w-win2-*`
+# w-win2 for main 01a20182 (2026-11-23), item 2, run 8 (run 6 with its test poller fixed). A diagnostics lane run only from `diag-measurer-w-win2-*`
 # branches, never main. Item 2 now has two parts: the Windows give-back step timed by its cycles (A-491's follow-up) and
 # an interrupted give-back resumed at the shard's next idle point (A-881, main's ruling (c)). On both Windows runners:
 # the idle sweep's tests red with A-881 turned off, then with the cycle clock turned off, then five times green with
