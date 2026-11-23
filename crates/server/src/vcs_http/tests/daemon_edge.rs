@@ -708,7 +708,7 @@ fn stored_zlib(data: &[u8]) -> Vec<u8> {
 }
 
 /// A pack of `objects`, each stored whole in stored blocks.
-fn stored_pack(objects: &[(slates_git::object_name::Kind, &[u8])]) -> Vec<u8> {
+pub(crate) fn stored_pack(objects: &[(slates_git::object_name::Kind, &[u8])]) -> Vec<u8> {
   use slates_git::entry::{self, Header, Representation};
   let mut out = Vec::new();
   let count = u32::try_from(objects.len()).expect("a count");
@@ -730,7 +730,7 @@ fn stored_pack(objects: &[(slates_git::object_name::Kind, &[u8])]) -> Vec<u8> {
 }
 
 /// The name git gives an object of `kind` holding `content`.
-fn git_name(kind: slates_git::object_name::Kind, content: &[u8]) -> ObjectId {
+pub(crate) fn git_name(kind: slates_git::object_name::Kind, content: &[u8]) -> ObjectId {
   slates_git::object_name::name_of(GitFormat::Sha1, kind, content).expect("named")
 }
 

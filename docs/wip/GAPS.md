@@ -157,6 +157,14 @@
 > and every clone (stock_git_verbs 1 of 8). Lifted when w-git's fetch-side readers (A-855's held answer, brought back and
 > made again) and the push decision's reads bring a let-go window back, with w-shared's red: annotated tags pushed, the
 > push ended, idle, then ls-remote and a clone byte-identical to stock.
+> **r227's SSH regression FIXED (w-git, 2026-11-23):** with the lift, stock git's fetch over SSH ended mid-answer
+> (`unexpected disconnect while reading sideband packet`; on a made history, the shallow clone right after its
+> `packfile` header): an answer whose pack's choice read a let-go window is held for it (`Answer::held_away`) with its
+> sections written, and the SSH edge's `write_answer` dropped it as written, where the HTTP edge brings the window back
+> and makes it again past what it wrote. Now the SSH edge keeps it and its next step does the same (`read_through_held`).
+> Red at the session: git_interop's whole session over SSH on a made history failed 3 of 3, every step held after.
+> Owed: a unit red at the edge (the single-shard edge tests reach no held answer); the SSH edge's wait for room
+> (A-855: an answer held for room is dropped the same way; the HTTP edge's `wait_for_room` has no SSH twin).
 > **LIFTED AGAIN (w-git, 2026-11-23, main 01a20182's order after r165):** `vcs_store::LANDED_LET_GO` on, one switch for
 > a commit's let-go and a recovery's or rebuild's (w-shared's `put_changeset`): the commit owes its pack and the push's
 > end or the repository's idle give-back lets it go a slice a turn (3e1588a54, the quantum alone ending a slice), every
@@ -4359,6 +4367,14 @@
 > stock 1.15 over `SLATES_SVN_USE_ROUTE=http-v1` with `SLATES_SVN_USE_VERBS=revprops` against svnserve; and
 > `svnsync synchronize` over HTTP, the mirror against svnserve's byte for byte (`an_svnsync_measured`'s DAV leg,
 > `SLATES_SVN_USE_VERBS=svnsync` over `http`).
+> **(B)'s one difference was the harness's (w-interop, 2026-11-23):** main's round failed on the mirrors' `UUID:` line
+> alone. Stock `svnsync` never sets a mirror's UUID (`svnsync.c` `do_initialize`), so each `svnadmin create` mirror
+> held a random one. The HTTP edge reports the imported dump's UUID (OPTIONS and PROPFIND, checked). `mirror_dump_of`
+> now gives each mirror `MIRROR_UUID`, as `svn-matrix.sh` does
+> (`docs/bugs/2026-11-23-the-svnsync-use-row-compared-two-random-mirror-uuids.md`). The rerun (r12, 112e694e7) left
+> one more of the harness's: revision 0's lengths still counted the `svn:sync-*` lines the comparison dropped, and the
+> source URL differs by leg. The mirror's sync properties are now deleted before the dump, which is compared whole
+> (`a_mirrors_dump_is_the_same_whatever_url_it_was_synced_from`). Owed: main's red and green of that test, and (B).
 > **R4, recovery replays a revision record a turn at a time (2026-11-20, w-svn; Ada's close list; found by w-git's sweep):**
 > a Subversion revision's record was replayed whole in one recovery or rebuild turn (`replay_svn` -> `commit_record`),
 > every text it brought deltified in one step, so one large revision held its shard. Now `RevisionReplay`
@@ -4705,11 +4721,21 @@
 > catalog, served each as any forwarded verb is served, found no volume and answered `NotFound`: a claim that the file
 > did not exist. A forwarded write met the same `NotFound` and had it recorded as its completion. A local client's verb
 > there already met `owned_unmaterialized`'s retryable `Overloaded`; a forwarded one now meets the same
-> (`verbs::forwarded_before_made`, counted `fleet.forward.refused.before_made`), before any completion is recorded.
+> (`verbs::refusal_of_unheld_forward`, counted `fleet.forward.refused.before_made`), before any completion is recorded.
 > Test: `a_forwarded_read_of_a_volume_owned_here_but_not_made_is_refused_retryably` (`crates/server/src/verbs.rs`), red
 > without the guard (`NotFound`). The seed on the fix (kiln r264, Mac Studio, debug build): 2 of 2 runs pass, every
 > invariant held, 91.9 s and 63.5 s; on main bf58691 without it (r212), 3 of 3 failed ReadSafety alone, five reads each.
 > **Owed (the supervisor's):** the seed on both Linux arches on the fix.
+> - **FIXED 2026-11-23 (w-chaos; A-394's amendment, the rule by authority): the guard covered only a receiver whose own
+>   routing named itself.** At seed 8173581894251929445 (the owner deafened from 203 ms) an origin at configuration 7
+>   forwarded reads to the successor its routing named; that node, at configuration 8, held no record of the volume and
+>   routed it to no owner, so the guard passed it and it answered five acknowledged writes `NotFound` (ReadSafety, 2 of
+>   4 replays on adacachy2; a diagnostic build named both sides). Now a node without the record answers only as the
+>   volume's creator that no routing sends elsewhere and that did not lose it to a successor; anywhere else a forwarded
+>   read, write or work creation is refused `Overloaded`, recorded nowhere, counted
+>   `fleet.forward.refused.not_owner_here`. Test:
+>   `a_forwarded_read_at_a_node_neither_holding_nor_owning_its_volume_is_refused_retryably` (red: `NotFound`).
+>   Record: `docs/bugs/2026-11-23-a-forwarded-read-at-a-node-that-neither-held-nor-owned-the-volume-answered-not-found.md`.
 
 > **A volume whose owner shard refused its state read as absent: fixed (2026-11-19, A-564, §4.8 "Lookup"; g225; found by
 > A-557).** A verb forwarded to its volume's owner shard was answered `NotFound` whenever the owner did not run it:
