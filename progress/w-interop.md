@@ -542,3 +542,9 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   here, §8): vcs cfe2ffebe (content.rs test split, complexity 12/10), hg 3abcd0096 (render.rs rows_a_step checked_div),
   mem 5cf62a3a4 (arena.rs grow saturating_sub; the deny is crate-wide, no Windows-only cfg found). Earlier: every error
   in nightly 45017186325 and the ee1c9005b jobs already fixed at 96e6f2170. main reruns the wall after w-svn's seven.
+- LANDED 414925522 (2026-11-23, main eda405ddc): svnsync over svn's HTTP edge. (A) DeltaV v1's labelled VCC answers
+  the labelled revision's properties (site Request carries Label; `labelled`). (B) replay-report served (session URL
+  old syntax, !svn/rev/REV 1.8 syntax) by dav::report_replay::ReplayWalk: the svn:// Replay a call at a time into
+  Drive::replay, one path, sliced. Reds: deltav_v1_a_labelled_vcc_..., a_replay_report_answers_..., a_replay_report_is_
+  refused_... (501 before). svn --lib dav:: 101/101; server vcs_http::svn::tests 8/8. OWED (main, stock svn): svn_interop
+  use test http-v1 revprops and http svnsync vs svnserve; an_svnsync_measured DAV leg. w-svn told first (C2 untouched).
