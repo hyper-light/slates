@@ -833,7 +833,8 @@ fn client_checks(unbundle: &Unbundle, read: &Read, checks: &mut Vec<RepositoryCh
 }
 
 /// The entry's checks and state (module docs): the client's checks as positions, the names of every branch and
-/// bookmark the push changes, the phases log where it moves roots, and the roots' changes.
+/// bookmark the push changes, the phases log where it moves roots, the phases and markers logs where it keeps markers
+/// (a marker was judged against the phases and the markers held as read), and the roots' changes, then the markers.
 fn entry_parts(unbundle: &Unbundle, plan: &Plan, read: &Read) -> EntryParts {
   let mut checks = Vec::new();
   client_checks(unbundle, read, &mut checks);
@@ -846,13 +847,22 @@ fn entry_parts(unbundle: &Unbundle, plan: &Plan, read: &Read) -> EntryParts {
     | BookmarkMove::Deleted { name, .. }) = moved;
     check_once(&mut checks, read.mark_name(name));
   }
-  if !plan.roots.is_empty() {
-    let (phases, _) = read.logs;
+  let (phases, markers) = read.logs;
+  if !plan.roots.is_empty() || !plan.markers.is_empty() {
     check_once(
       &mut checks,
       RepositoryCheck::Log {
         log: StateLog::Phases,
         position: phases,
+      },
+    );
+  }
+  if !plan.markers.is_empty() {
+    check_once(
+      &mut checks,
+      RepositoryCheck::Log {
+        log: StateLog::Markers,
+        position: markers,
       },
     );
   }
@@ -869,6 +879,9 @@ fn entry_parts(unbundle: &Unbundle, plan: &Plan, read: &Read) -> EntryParts {
         node: node.to_vec(),
       },
     })
+    .chain(plan.markers.iter().map(|marker| StateChange::MarkerAdded {
+      marker: marker.clone(),
+    }))
     .collect();
   EntryParts {
     checks,

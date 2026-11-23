@@ -26,18 +26,7 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use slates_client::RepositorySpec;
-use slates_ipc::protocol::{CredentialMaterial, ObjectFormat, Principal, VcsTool};
-use slates_land::store_root::{StoreGrant, StoreRoot};
 use slates_mem::large::LargeMapped;
-use slates_server::config::VcsHttpConfig;
-use slates_server::{Daemon, DaemonConfig};
-use slates_store::owner::StoreOwner;
-use slates_store::store::Sizing;
-
-use common::anchor::{held_anchor, source_of};
-use common::client::connect;
-use common::target::target_dir;
 
 /// Shape: the changesets the pushed history holds, each a new file and the overwritten file rewritten: enough for the
 /// push's and the clones' per-changeset work to show above their fixed costs.
@@ -46,17 +35,6 @@ const CHANGESETS: u64 = 400;
 const SAMPLE: u64 = 256 << 10;
 /// Shape: the sites each row prints.
 const LISTED: usize = 5;
-/// Shape: the daemon's shards.
-const SHARDS: u16 = 2;
-/// Shape: the store's sizing, a test's (as `slates_server`'s own store tests size theirs).
-const SIZING: Sizing = Sizing {
-  memory: 8 << 20,
-  disk: 1 << 30,
-  extent_bytes: 128 << 10,
-  fanout: 8,
-};
-/// Shape: the store owner's waiting requests.
-const WAITING: usize = 64;
 
 /// Whether the sampler counts: only while a row runs.
 static ON: AtomicBool = AtomicBool::new(false);
@@ -241,17 +219,6 @@ fn print(row: &Row) {
   }
 }
 
-/// An `hg` command with this test's configuration (`HGRCPATH`), in `dir`.
-fn hg(hgrc: &str, dir: &str) -> Command {
-  let mut command = Command::new("hg");
-  command
-    .env("HGRCPATH", hgrc)
-    .env("HGPLAIN", "1")
-    .env("HGUSER", "slates-test")
-    .current_dir(dir);
-  command
-}
-
 /// Goal 93 (main's order of 2026-11-23, (A): the lasting regression test of a daemon's churn under stock Mercurial).
 /// Do: start a two-shard daemon holding a changeset store, its HTTP edge on loopback; create a Mercurial repository and
 /// enroll an HTTP token for this process's principal; build a history of [`CHANGESETS`] changesets with
@@ -261,84 +228,16 @@ fn hg(hgrc: &str, dir: &str) -> Command {
 /// where `hg` is not installed.
 #[test]
 fn a_daemons_allocation_by_site_under_stock_mercurial() {
-  if Command::new("hg")
-    .arg("version")
-    .arg("-q")
-    .output()
-    .is_err()
-  {
+  if !common::hg::has_hg() {
     eprintln!("SKIPPED a_daemons_allocation_by_site_under_stock_mercurial: no `hg` on PATH");
     return;
   }
-  let scratch = target_dir();
-  let base = scratch.path.clone();
-  // The changeset store, its owner started over its own directory.
-  let store_dir = format!("{base}/store");
-  std::fs::create_dir_all(&store_dir).unwrap();
-  let store_dir = std::fs::canonicalize(&store_dir).unwrap();
-  let grant = StoreGrant {
-    repository: 0,
-    target: StoreRoot::identify(&store_dir).unwrap(),
-    issued_ns: 0,
-  };
-  let owner = StoreOwner::start(
-    StoreRoot::open(&store_dir, &grant).unwrap(),
-    SIZING,
-    WAITING,
-  )
-  .unwrap();
-  // The daemon, its edge and its store.
-  let profile = common::machine_profile();
-  let instance = format!("hg-push-heap-{}", std::process::id());
-  let mut config = DaemonConfig::derive(&profile, &instance, Some(SHARDS));
-  config.vcs_http = Some(VcsHttpConfig {
-    address: std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0),
-    identity: None,
-  });
-  config.vcs_disk = Some(owner.handle());
-  let anchor = held_anchor(&instance, &profile, &config);
-  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
-  daemon.bootstrap(true).unwrap();
-  let port = daemon.vcs_http_port().expect("the edge listens");
-  // The repository, and a token for this process's principal.
-  let mut client = connect(&instance);
-  client
-    .create_repository(&RepositorySpec {
-      name: "project".to_owned(),
-      tool: VcsTool::Mercurial,
-      format: ObjectFormat::Sha1,
-      default_branch: "branch:default:0".to_owned(),
-      green: None,
-    })
-    .unwrap();
-  let token = format!("hg-push-heap-token-{}", std::process::id());
-  let principal = Principal::Uid {
-    host: client.daemon_status().unwrap().anchor,
-    uid: rustix::process::getuid().as_raw(),
-  };
-  let material = CredentialMaterial::HttpToken {
-    id: slates_server::credentials::token_id(token.as_bytes()),
-    cram_md5_contexts: slates_server::credentials::cram_md5_contexts(token.as_bytes()),
-  };
-  let secret = daemon.segment().issuer_secret().unwrap();
-  let proof = slates_server::credentials::enroll_proof(&secret, &principal, &material, None);
-  client
-    .enroll_credential(principal, material, None, proof)
-    .unwrap();
-  // Stock hg's configuration: the token as Basic's password, as the hg matrix gives it.
-  let url = format!("http://127.0.0.1:{port}/project");
-  let hgrc = format!("{base}/hgrc");
-  std::fs::write(
-    &hgrc,
-    format!(
-      "[auth]\nslates.prefix = http://127.0.0.1:{port}/\nslates.username = slates\nslates.password = {token}\n"
-    ),
-  )
-  .unwrap();
-  let source = format!("{base}/source");
-  let made = hg(&hgrc, &base).args(["init", &source]).output().unwrap();
+  let served = common::hg::serve("hg-push-heap", "");
+  let url = served.url.clone();
+  let made = served.hg(".").args(["init", "source"]).output().unwrap();
   assert!(made.status.success(), "hg init");
-  let built = hg(&hgrc, &source)
+  let built = served
+    .hg("source")
     .args([
       "debugbuilddag",
       "--new-file",
@@ -355,23 +254,22 @@ fn a_daemons_allocation_by_site_under_stock_mercurial() {
   // The rows, each sampled.
   let push = row(
     "push",
-    hg(&hgrc, &source).args(["push", "-q", "--new-branch", "-f", &url]),
+    served
+      .hg("source")
+      .args(["push", "-q", "--new-branch", "-f", &url]),
   );
   let clone = row(
     "clone",
-    hg(&hgrc, &base).args(["clone", "-q", &url, "cloned"]),
+    served.hg(".").args(["clone", "-q", &url, "cloned"]),
   );
   let stream = row(
     "stream-clone",
-    hg(&hgrc, &base).args(["clone", "-q", "--stream", &url, "streamed"]),
+    served
+      .hg(".")
+      .args(["clone", "-q", "--stream", &url, "streamed"]),
   );
-  let verified = hg(&hgrc, &format!("{base}/cloned"))
-    .args(["verify", "-q"])
-    .output()
-    .unwrap();
-  daemon.stop();
-  drop(anchor);
-  owner.stop().unwrap();
+  let verified = served.hg("cloned").args(["verify", "-q"]).output().unwrap();
+  served.stop();
   for row in [&push, &clone, &stream] {
     print(row);
   }

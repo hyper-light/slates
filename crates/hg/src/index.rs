@@ -46,6 +46,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use slates_vcs::{
   Batch, ContentId, ContentStore, Index, IndexRefused, Naming, NewRow, Quarantine, RowRef,
@@ -363,10 +364,20 @@ struct Planned {
 /// highest such parent to `floorrev`). A parent on `b` that was no head ends nothing: whatever it descends from on `b`
 /// had a descendant on `b` already. Then `r` is a head. No head is ever made by another branch's revision, and none comes
 /// back, so the heads after each append are the rule's over the changelog so far.
+///
+/// **A view that leaves changesets out** (goal 93, evolution: a hidden or secret changeset, every one at or after the
+/// view's first changeset that is not public, `first`). Every changeset below `first` is served, so the served heads
+/// are the rule's over the changelog's first `first` revisions with the served ones after appended ([`Self::served`]).
+/// Those revisions' heads are today's heads below `first` and every head a revision at or after `first` ended, since a
+/// head ended once is never one again: each append's endings are kept in the order they happen ([`Endings`]), so they
+/// are read back from `first` on alone. The served answer then costs the tail's endings and the served tail's appends,
+/// never a walk of the history.
 #[derive(Clone, Debug, Default)]
 pub struct BranchHeads {
   /// Each branch's heads, by number.
   heads: BTreeMap<Vec<u8>, BTreeSet<u32>>,
+  /// Every head an append ended, in append order.
+  endings: Endings,
   /// How many times they answered for a view (`crate::serve::Repository::maintained_branch_heads`): the non-vacuity
   /// count a test reads, so a fallback to the walk cannot pass silently.
   answered: core::cell::Cell<u64>,
@@ -401,49 +412,173 @@ impl BranchHeads {
     (index, store): (&HgIndex, &ContentStore),
     (rev, branch, parents): (u32, &[u8], [u32; 2]),
   ) -> Result<(), Refused> {
-    let heads = self.heads.entry(branch.to_vec()).or_default();
-    let mut others: Vec<u32> = Vec::new();
-    for parent in parents.into_iter().filter(|parent| *parent != NONE) {
-      let row = index
-        .changeset(store, parent)
-        .ok_or(Refused::Unread { rev: parent })?;
-      if row.branch == branch {
-        heads.remove(&parent);
-      } else {
-        others.push(parent);
-      }
-    }
-    if let Some(&floor) = heads.first().filter(|_| !others.is_empty()) {
-      // The ancestors of the parents from other branches, down to the branch's lowest head, each walked once from the
-      // highest: every head among them has `rev` for a descendant on its branch.
-      let mut reach: BTreeSet<u32> = others
-        .iter()
-        .copied()
-        .filter(|parent| *parent >= floor)
-        .collect();
-      let mut walked = 0_u64;
-      while let Some(at) = reach.pop_last() {
-        if at < floor {
-          break;
-        }
-        walked = walked.saturating_add(1);
-        heads.remove(&at);
-        let row = index
-          .changeset(store, at)
-          .ok_or(Refused::Unread { rev: at })?;
-        for parent in [row.p1, row.p2] {
-          if parent != NONE && parent >= floor {
-            reach.insert(parent);
-          }
-        }
-        if heads.is_empty() {
-          break;
-        }
-      }
-      self.longest_walk = self.longest_walk.max(walked);
-    }
-    self.heads.entry(branch.to_vec()).or_default().insert(rev);
+    let endings = &mut self.endings;
+    let walked = note(
+      &mut self.heads,
+      (index, store),
+      (rev, branch, parents),
+      |ended| endings.push((rev, ended)),
+    )?;
+    self.longest_walk = self.longest_walk.max(walked);
     Ok(())
+  }
+
+  /// The served view's heads where it serves every changeset below `first` and, from `first` on, the changelog's
+  /// revisions `served` alone, in order (module docs, "A view that leaves changesets out"), by changelog number, lowest
+  /// first; counted as an answer. Refused for a row `index` cannot read.
+  pub fn served(
+    &self,
+    (index, store): (&HgIndex, &ContentStore),
+    first: u32,
+    served: impl Iterator<Item = u32>,
+  ) -> Result<Vec<u32>, Refused> {
+    let mut heads: BTreeMap<Vec<u8>, BTreeSet<u32>> = BTreeMap::new();
+    for (branch, revs) in &self.heads {
+      let below: BTreeSet<u32> = revs.range(..first).copied().collect();
+      if !below.is_empty() {
+        heads.insert(branch.clone(), below);
+      }
+    }
+    for (_, ended) in self.endings.from(first) {
+      if ended >= first {
+        continue;
+      }
+      let row = index
+        .changeset(store, ended)
+        .ok_or(Refused::Unread { rev: ended })?;
+      heads.entry(row.branch.to_vec()).or_default().insert(ended);
+    }
+    for rev in served {
+      let row = index.changeset(store, rev).ok_or(Refused::Unread { rev })?;
+      note(
+        &mut heads,
+        (index, store),
+        (rev, row.branch, [row.p1, row.p2]),
+        |_| {},
+      )?;
+    }
+    self.answered.set(self.answered.get().saturating_add(1));
+    let mut revs: Vec<u32> = heads.values().flatten().copied().collect();
+    revs.sort_unstable();
+    Ok(revs)
+  }
+}
+
+/// Notes changeset `rev` on `branch` with parents `parents` appended to `by_branch`'s heads (module docs of
+/// [`BranchHeads`]), every head it ends handed to `ended`: how many revisions its walk through other branches read.
+fn note(
+  by_branch: &mut BTreeMap<Vec<u8>, BTreeSet<u32>>,
+  (index, store): (&HgIndex, &ContentStore),
+  (rev, branch, parents): (u32, &[u8], [u32; 2]),
+  mut ended: impl FnMut(u32),
+) -> Result<u64, Refused> {
+  let mut walked = 0_u64;
+  let heads = by_branch.entry(branch.to_vec()).or_default();
+  let mut others: Vec<u32> = Vec::new();
+  for parent in parents.into_iter().filter(|parent| *parent != NONE) {
+    let row = index
+      .changeset(store, parent)
+      .ok_or(Refused::Unread { rev: parent })?;
+    if row.branch == branch {
+      if heads.remove(&parent) {
+        ended(parent);
+      }
+    } else {
+      others.push(parent);
+    }
+  }
+  if let Some(&floor) = heads.first().filter(|_| !others.is_empty()) {
+    // The ancestors of the parents from other branches, down to the branch's lowest head, each walked once from the
+    // highest: every head among them has `rev` for a descendant on its branch.
+    let mut reach: BTreeSet<u32> = others
+      .iter()
+      .copied()
+      .filter(|parent| *parent >= floor)
+      .collect();
+    while let Some(at) = reach.pop_last() {
+      if at < floor {
+        break;
+      }
+      walked = walked.saturating_add(1);
+      if heads.remove(&at) {
+        ended(at);
+      }
+      let row = index
+        .changeset(store, at)
+        .ok_or(Refused::Unread { rev: at })?;
+      for parent in [row.p1, row.p2] {
+        if parent != NONE && parent >= floor {
+          reach.insert(parent);
+        }
+      }
+      if heads.is_empty() {
+        break;
+      }
+    }
+  }
+  heads.insert(rev);
+  Ok(walked)
+}
+
+/// Shape: the endings a sealed chunk of [`Endings`] holds: a fork copies a chunk's handle, not its endings.
+const ENDINGS_CHUNK: usize = 4096;
+
+/// One head an append ended: the appended revision, and the head.
+type Ending = (u32, u32);
+
+/// Every head the changelog's appends ended, in append order, so by appended revision ([`BranchHeads`], "A view that
+/// leaves changesets out"): sealed chunks shared with every fork, and the open chunk, which a fork copies (at most
+/// [`ENDINGS_CHUNK`] of them). One ending a revision or fewer, mostly: an append ends its parent on its branch at most,
+/// and a walk's ending is a merge's.
+#[derive(Clone, Debug, Default)]
+struct Endings {
+  /// The full chunks, oldest first.
+  sealed: Vec<Arc<[Ending]>>,
+  /// The endings after them.
+  open: Vec<Ending>,
+}
+
+impl Endings {
+  /// Keeps `ending`, after every one before it.
+  fn push(&mut self, ending: Ending) {
+    self.open.push(ending);
+    if self.open.len() >= ENDINGS_CHUNK {
+      self.sealed.push(Arc::from(core::mem::take(&mut self.open)));
+    }
+  }
+
+  /// The endings by revisions at or after `rev`, in their order.
+  fn from(&self, rev: u32) -> impl Iterator<Item = Ending> + '_ {
+    let chunk = self
+      .sealed
+      .partition_point(|chunk| chunk.last().is_some_and(|(by, _)| *by < rev));
+    let sealed = self.sealed.get(chunk..).unwrap_or_default();
+    let start = sealed
+      .first()
+      .map_or(0, |first| first.partition_point(|(by, _)| *by < rev));
+    let open_start = if sealed.is_empty() {
+      self.open.partition_point(|(by, _)| *by < rev)
+    } else {
+      0
+    };
+    sealed
+      .iter()
+      .enumerate()
+      .flat_map(move |(at, chunk)| {
+        chunk
+          .get(if at == 0 { start } else { 0 }..)
+          .unwrap_or_default()
+          .iter()
+          .copied()
+      })
+      .chain(
+        self
+          .open
+          .get(open_start..)
+          .unwrap_or_default()
+          .iter()
+          .copied(),
+      )
   }
 }
 
@@ -492,6 +627,7 @@ impl HgIndex {
       rows: self.rows.fork(store)?,
       branch_heads: BranchHeads {
         heads: self.branch_heads.heads.clone(),
+        endings: self.branch_heads.endings.clone(),
         answered: core::cell::Cell::new(0),
         longest_walk: self.branch_heads.longest_walk,
       },

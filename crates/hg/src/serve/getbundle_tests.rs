@@ -78,6 +78,15 @@ pub(crate) struct Served {
 }
 
 impl Repository for Served {
+  fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
+    self.markers.iter().flat_map(|payload| {
+      obsmarkers::decode(payload)
+        .ok()
+        .into_iter()
+        .flat_map(|markers| markers.iter())
+    })
+  }
+
   fn count(&self) -> Rev {
     self.history.count()
   }
@@ -243,14 +252,6 @@ impl Store for Served {
       parents: logged.parents,
       link: logged.link,
       flags: logged.flags,
-    })
-  }
-  fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
-    self.markers.iter().flat_map(|payload| {
-      obsmarkers::decode(payload)
-        .ok()
-        .into_iter()
-        .flat_map(|markers| markers.iter())
     })
   }
 

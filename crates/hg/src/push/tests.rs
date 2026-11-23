@@ -135,6 +135,10 @@ impl View {
 }
 
 impl Repository for View {
+  fn markers(&self) -> impl Iterator<Item = crate::obsmarkers::Marker<'_>> {
+    core::iter::empty()
+  }
+
   fn count(&self) -> Rev {
     Rev::try_from(self.changesets.len()).unwrap()
   }

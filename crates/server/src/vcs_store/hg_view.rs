@@ -356,7 +356,7 @@ pub(crate) fn held_here(state: &ShardState, id: RepositoryId) -> bool {
 }
 
 /// A fetch's hold on the generation of a repository's index it began on (A-745, §4.17.1 "A fetch's answer" rule 4): a
-/// fork of the index (its rows as they stood, their tables shared) and the register's phase roots and bookmarks as they
+/// fork of the index (its rows as they stood, their tables shared) and the register's roots, bookmarks and markers as they
 /// stood, so every turn of the fetch's answer reads the view its first turn read, whatever lands, is re-based or is
 /// rebuilt meanwhile. Given back by its drop, on the shard that holds its store; a refused release counted.
 pub(crate) struct Generation {
@@ -364,10 +364,8 @@ pub(crate) struct Generation {
   id: RepositoryId,
   /// The fork of its index, until it is given back.
   index: Option<HgIndex>,
-  /// The register's phase roots as they stood.
-  roots: Vec<PhaseHead>,
-  /// The register's bookmarks as they stood.
-  bookmarks: BookmarkHeads,
+  /// The register's phase roots, bookmarks and obsolescence markers as they stood.
+  register: Register,
   /// The fetch counted live while its streamed answer holds this generation (A-724 piece 3d: a fetch's room is a claim
   /// of its own).
   _fetching: crate::vcs_share::Live,
@@ -429,7 +427,7 @@ pub(crate) fn hold_in(
   if !held(state, id) {
     return None;
   }
-  let (roots, bookmarks) = register_of(state, id, room).ok()?;
+  let register = register_of(state, id, room).ok()?;
   let index = super::within_budget(state, 0, |stores| {
     let (content, store) = stores.mercurial(id)?;
     store.index.fork(content).ok()
@@ -437,8 +435,7 @@ pub(crate) fn hold_in(
   Some(Generation {
     id,
     index: Some(index),
-    roots,
-    bookmarks,
+    register,
     _fetching: crate::vcs_share::Live::fetch(id),
     written: core::cell::Cell::new(0),
   })
@@ -455,11 +452,7 @@ pub(crate) fn lend_held_in<R>(
   let index = generation.index.as_ref()?;
   let made = super::lent_state(state, |state| {
     let (content, _) = state.vcs_stores.mercurial_ref(generation.id)?;
-    let read = State {
-      roots: &generation.roots,
-      bookmarks: &generation.bookmarks,
-      publishing: PUBLISHING,
-    };
+    let read = generation.register.state();
     let view = Indexed::new(index, content, read, room).ok()?;
     Some(step(&view, room))
   });
@@ -537,12 +530,8 @@ pub(crate) fn with_view<R>(
   step: impl for<'s> FnOnce(&Indexed<'s>, IndexHeld<'s>, &mut Admission) -> R,
 ) -> Option<R> {
   let (content, store) = shard.vcs_stores.mercurial_ref(id)?;
-  let (roots, bookmarks) = register_of(shard, id, room).ok()?;
-  let read = State {
-    roots: &roots,
-    bookmarks: &bookmarks,
-    publishing: PUBLISHING,
-  };
+  let register = register_of(shard, id, room).ok()?;
+  let read = register.state();
   let view = Indexed::new(&store.index, content, read, room).ok()?;
   Some(step(&view, IndexHeld::new(&store.index, content), room))
 }
@@ -558,12 +547,8 @@ pub(crate) fn with_view_over<R>(
   step: impl for<'s> FnOnce(&Indexed<'s>, IndexHeld<'s>, &'s ContentStore, &mut Admission) -> R,
 ) -> Option<R> {
   let (content, store) = shard.vcs_stores.mercurial_ref(id)?;
-  let (roots, bookmarks) = register_of(shard, id, room).ok()?;
-  let read = State {
-    roots: &roots,
-    bookmarks: &bookmarks,
-    publishing: PUBLISHING,
-  };
+  let register = register_of(shard, id, room).ok()?;
+  let read = register.state();
   let view = Indexed::new(&store.index, content, read, room).ok()?;
   let held = IndexHeld::new(over.unwrap_or(&store.index), content);
   Some(step(&view, held, content, room))
@@ -579,14 +564,37 @@ fn charge_each<T>(room: &mut Admission, count: usize) -> Result<(), PastAdmissio
 /// Bookmarks: each its name and the node it names.
 type BookmarkHeads = Vec<(Vec<u8>, Node)>;
 
-/// The phase roots and bookmarks repository `id`'s register holds now, copied and charged to `room` (module docs): a
-/// root whose phase or node Mercurial does not have, a name under the bookmarks' tag that no bookmark's name is, and a
-/// bookmark whose green names no head are not read, since the register holds none of them for a push it took.
+/// What a repository's register holds that its served view reads, copied ([`register_of`]).
+struct Register {
+  /// The phase roots.
+  roots: Vec<PhaseHead>,
+  /// The bookmarks.
+  bookmarks: BookmarkHeads,
+  /// The obsolescence markers, each alone in its format, in the markers log's order.
+  markers: Vec<Vec<u8>>,
+}
+
+impl Register {
+  /// The served view's state over these copies.
+  fn state(&self) -> State<'_> {
+    State {
+      roots: &self.roots,
+      bookmarks: &self.bookmarks,
+      publishing: PUBLISHING,
+      markers: &self.markers,
+    }
+  }
+}
+
+/// The phase roots, bookmarks and obsolescence markers repository `id`'s register holds now, copied and charged to
+/// `room` (module docs): a root whose phase or node Mercurial does not have, a name under the bookmarks' tag that no
+/// bookmark's name is, and a bookmark whose green names no head are not read, since the register holds none of them
+/// for a push it took.
 fn register_of(
   state: &ShardState,
   id: RepositoryId,
   room: &mut Admission,
-) -> Result<(Vec<PhaseHead>, BookmarkHeads), PastAdmission> {
+) -> Result<Register, PastAdmission> {
   let repositories = state.db.partition().repositories();
   charge_each::<PhaseHead>(room, repositories.phase_roots(id).count())?;
   let roots = repositories
@@ -608,7 +616,17 @@ fn register_of(
     room.charge(u64::try_from(bookmark.len()).unwrap_or(u64::MAX))?;
     bookmarks.push((bookmark, head));
   }
-  Ok((roots, bookmarks))
+  charge_each::<Vec<u8>>(room, repositories.markers(id).count())?;
+  let mut markers = Vec::new();
+  for marker in repositories.markers(id) {
+    room.charge(u64::try_from(marker.len()).unwrap_or(u64::MAX))?;
+    markers.push(marker.to_vec());
+  }
+  Ok(Register {
+    roots,
+    bookmarks,
+    markers,
+  })
 }
 
 #[cfg(test)]
