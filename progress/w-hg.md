@@ -535,3 +535,9 @@ Waiting: main's route; arena-7 and arena-8.
   HgIndex::revision_text (with object_bytes) and Taker::file_base. Repro: SLATES_HG_PUSH_SOURCE=$HOME/.cache/w-perf/hg-src
   CARGO_PROFILE_DEV_OPT_LEVEL=2 CARGO_INCREMENTAL=0 cargo test -p slates-server --test hg_push_lifetimes -- --ignored
   --nocapture (test a_pushs_allocation_by_site_size_and_life_under_stock_mercurial).
+- Landed c3d3c18f2 (marker tuples; format 0 markers clone again) and bff41b98e (hg_publishing: RepositoryPolicy
+  field, DatabaseRefusal 14, CLI --hg-publish; real-hg non-publishing test, red under the const "cannot amend public
+  changesets"). Index-tail seal handed to w-perf (one site in HgIndex::write).
+- New rule from main: clippy -p <crate> --lib -D warnings on any new external-bytes parser before landing.
+- Evolution owed: decision 3's rewrite admission, the obsolete pushkey namespace (legacy). Next: the C1 cuts
+  (intake::rebuilt, revision_text with object_bytes, file_base), unless main reorders.
