@@ -17456,7 +17456,7 @@ package, examples in three languages.
 1. Python: the extension over the Rust client; `add_reader` completion (socket on Windows);
    buffer-protocol reads; the sync facade; stubs; maturin builds for the wheel matrix; free-
    threaded build with `gil_used = false` and thread-safe `#[pyclass]` state.
-2. TypeScript: the addon; `uv_poll` on the completion fd/socket; external buffers with copy
+2. TypeScript: the addon; `uv_poll` on the completion fd (Unix) or the completion pipe opened by name (Windows, A-875); external buffers with copy
    fallback; async iterators and `AbortSignal`; platform packages over the same typed client.
 3. MCP: the stateless protocol with dual-era support; tool catalog with annotations and
    structured content; resources and prompts for skills; `subscriptions/listen` for volume
@@ -61679,3 +61679,42 @@ retirement; `landing.rs`: `abandon_presentations` removed, `forget_presentations
   then another client grants and lands; refused `NotFound` before), `a_presentation_goes_with_its_volume` (one
   awaiting after a destroy before, none after), `another_clients_presentation_still_replaces_and_the_bound_still_refuses`,
   and the CLI's session-grant test, red before and green after.
+
+### A-875 — On Windows the Node SDK opens its completion signal by name, a named pipe the bridge nudges (2026-11-23, w-interop; main 01a20182's order, moved from the Windows worker's queue; §4.7, D-19, D-10, A-179)
+Applied in the same change to: Phase 5's TypeScript task, GAPS ("The Node SDK suites on Windows"), `unsafe-budget.toml`
+(`slates-ipc` 169 → 179), `crates/ipc` (`completion_pipe.rs`, new; `completion.rs`, the Windows bridge's `Signal`,
+`start_pipe`, `run_pipe`; `endpoint.rs`, `enable_async_completion_pipe` in place of the Windows
+`enable_async_completion_dup`, and two tests; `stream_pipe.rs`, the name, descriptor and error helpers shared;
+`lib.rs`), `crates/client` (`enable_async_completion_pipe`), `crates/sdk-node` (`src/lib.rs` `completionPipe` beside
+`completionFd`, each on every platform and refusing off its own, since napi-rs registers a `#[napi] impl`'s methods by
+name whatever their `cfg`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sdk_async.test.mjs`), and
+`docs/bugs/2026-11-23-the-node-sdk-could-not-adopt-the-windows-completion-socket.md`.
+- **What failed.** CI run 45176536354, `sdk` job, both Windows legs: `async lifecycle over a live daemon` died at
+  `AsyncClient.create` with `CompletionLost { reason: "Unsupported fd type: UNKNOWN" }`. The Windows bridge's signal
+  is a loopback socket, and `net.Socket({ fd })` was handed a duplicate of it.
+- **Why no descriptor can serve [B: libuv `src/win/handle.c` `uv_guess_handle`; Node `lib/net.js` `createHandle`].**
+  On Windows libuv reads the value as a C runtime file descriptor (`uv__get_osfhandle`) and names it a pipe, a console
+  or a file by `GetFileType`, never a socket; Node accepts a pipe or a TCP handle and throws `ERR_INVALID_FD_TYPE`
+  for anything else. A socket handle is no C runtime descriptor, so it is unknown. A descriptor the addon made with its
+  own C runtime would be no better, since each module's C runtime keeps its own descriptor table.
+- **The rule.** On Windows the Node SDK's signal is a named pipe that `async.mjs` opens with `net.connect(name)`,
+  libuv's own pipe client, as node-pty opens its ConPTY pipes [C: microsoft/node-pty]. The pipe keeps A-179's
+  protections: a fresh 128-bit name, first instance only, one instance, remote clients refused, the owner alone
+  admitted. Since the SDK connects after the pipe is made, the bridge admits a reader only once the kernel names it
+  this process (`GetNamedPipeClientProcessId`); any other is cut off and counted, and the pipe listens again at the
+  bridge's next turn, at most one connect a turn. The reader gets only the eight-byte nudge, never a reply. The pipe
+  buffers one nudge, since an unread nudge is the whole signal. Until a reader is admitted, the bridge's thread waits
+  on the region's Event and on the connect together, so a reply that landed before the SDK connected is signalled as
+  it connects. Python's selector keeps the loopback socket (`enable_async_completion`), and one client signals one
+  of the two (the other is refused `Unsupported`). Unix is unchanged.
+- **Proven (main's diag runs on windows-latest: red 45225292920 at main, "Unsupported fd type: UNKNOWN"; with the
+  change 45230459274 at 20cd9025e, `slates-ipc` 8 of 8, the addon built, the async lifecycle past its pipe):**
+  - `slates-ipc`'s `the_windows_completion_pipe_is_opened_by_name_and_signals_only_an_armed_reply`: a second reader is
+    refused `ERROR_PIPE_BUSY`, the pipe stays quiet for a fast-path reply and holds a nudge for an armed one.
+  - `a_reply_that_landed_before_the_reader_connected_is_signalled_as_it_connects`: within half a second of the
+    connect, under the bridge's one-second timed look.
+  - `a_reader_of_another_process_is_cut_off_and_this_processs_reader_is_admitted`: the test binary run again opens the
+    name first and is cut off with nothing read; this process's open is then admitted and nudged.
+  - The Node suites on windows-latest: the red at main; with this change, 4 of 8 pass, and the other 4 (sync and
+    async alike) are refused `BudgetExceeded { available: 5722144768 }` at their first create. That refusal is the
+    Windows daemon's own sizing (w-win2's), and the suites' full green waits on it.
