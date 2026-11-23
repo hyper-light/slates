@@ -422,12 +422,26 @@ pub(crate) fn audit_on_stored_shard_configured<T: Send + 'static>(
 ) -> T {
   let store = TestStore::start(name);
   let handle = store.handle();
-  let answer = crate::daemon::audit_on_shard_configured(history, move |config| {
+  // A synchronous history brings no let-go window back, so its landed packs stay resident (`vcs_store::KEEP_LANDED`).
+  let kept = move |state: &mut crate::state::ShardState| {
+    crate::vcs_store::KEEP_LANDED.with(|keep| keep.set(true));
+    history(state)
+  };
+  let answer = crate::daemon::audit_on_shard_configured(kept, move |config| {
     config.vcs_disk = Some(handle);
     configure(config);
   });
   drop(store);
   answer
+}
+
+/// Keeps a push's landed pack resident on `daemon`'s first shard (`vcs_store::KEEP_LANDED`): for a test whose history
+/// reads through the store's own synchronous calls in its observations (a fetch answered in one step, a rebuild settled,
+/// a green made now), which bring no let-go window back as the edges, the green build and the rebuild's task do.
+pub(crate) fn keep_landed(daemon: &crate::Daemon) {
+  crate::daemon::observe_first(daemon, |_| {
+    crate::vcs_store::KEEP_LANDED.with(|keep| keep.set(true));
+  });
 }
 
 /// [`crate::daemon::audit_daemon_of`] holding a fresh store: the store first, so a test binding both as
