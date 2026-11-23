@@ -1,0 +1,35 @@
+diff --git a/crates/git/src/tests/store/packed.rs b/crates/git/src/tests/store/packed.rs
+index 1b1b5665b..66426bbd7 100644
+--- a/crates/git/src/tests/store/packed.rs
++++ b/crates/git/src/tests/store/packed.rs
+@@ -629,7 +629,11 @@ fn a864_a_turn_that_meets_a_let_go_window_stops_cleanly_and_the_clone_is_byte_id
+   use crate::store::{Progress, Turn, Upload};
+   let (repository, mut store, _, pack) = landed_create_in(PIECE2_WINDOW);
+   let clone = super::Answer::objects(&super::reached_now(&repository, &store, 1));
+-  let (whole, _) = super::streamed(&repository, &store, clone.clone(), u64::MAX);
++  let mut measured = Admission::new(u64::MAX);
++  let (whole, _) = super::streamed_within(&repository, &store, clone.clone(), u64::MAX, &mut measured);
++  let room = u64::MAX - measured.left();
++  let (resident, _) = super::streamed_within(&repository, &store, clone.clone(), u64::MAX, &mut Admission::new(room));
++  assert_eq!(resident, whole, "the resident pack fits in {room} bytes of admission");
+   let root = repository.packs().next().unwrap();
+   for window in pack.chunks(PIECE2_WINDOW).map(ContentId::of) {
+     assert!(store.mark_landed(&window));
+@@ -637,7 +641,7 @@ fn a864_a_turn_that_meets_a_let_go_window_stops_cleanly_and_the_clone_is_byte_id
+   }
+   let mut upload = Upload::new(clone, &repository);
+   let mut clock = super::Ticks(0);
+-  let mut admission = Admission::new(u64::MAX);
++  let mut admission = Admission::new(room);
+   let mut out = Vec::new();
+   let mut stops = 0;
+   for _ in 0..10_000 {
+@@ -648,7 +652,7 @@ fn a864_a_turn_that_meets_a_let_go_window_stops_cleanly_and_the_clone_is_byte_id
+     };
+     if upload
+       .advance(&repository, &store, turn, &mut admission, &mut out)
+-      .unwrap()
++      .unwrap_or_else(|refused| panic!("the same clone within {room} bytes after {stops} window stops: {refused:?}"))
+       == Progress::Done
+     {
+       break;

@@ -86,3 +86,45 @@
   - No reply yet from w-rewrite-ops to my split (they own the re-anchor; I take composition, verdict and encode, held
     across turns via the off-owner verdict path: compose_paced, Green::compute, then submit_computed in the one step).
     Building that now.
+- 2026-11-21 w-fed-faults -> main, ruling (1): A-821 LANDED, slates 4b931fe (base a8ee99bf7).
+  - What it does: the refinement job now prepares the parked submit's increment a bounded slice a turn (post-state by
+    copy slice, identity by hash slice), then the document's encoding, the verdict (Green::compute) and the
+    increment's encoding a turn each. The submit takes them and its step judges by position (submit_computed) and
+    commits.
+  - Counted (2 MiB re-indent, Mac Studio): the submit's longest step went from 417.5 to 271.7-303.8 ms in debug and
+    from 34.5 to 24.6 ms in release, against the 100 ms bound (HEARTBEAT_NS). Prepare slices: 34-36k debug, 1.5k
+    release; all 3 parts taken. Versions and the head bytes are as on main; the identity is built by the same lay_ops
+    and identity_hasher, in the same order, as compose_increment.
+  - Not yet within the bound in debug (steps_past_ceiling 1): the step still holds the commit's history re-anchor
+    (~219 ms debug, A-818 piece 2b replaces it) and the chain's durable append of a ~5 MB entry (~60 ms debug,
+    3.6-4 ms release). After 2b I'll measure again; if the append alone still runs past, I'll take it next.
+  - On main, not mine: slates-hg's clippy (type_complexity at push/intake.rs:257) is red and blocks clippy of every
+    crate after it.
+  - Ledger: the ledger gave me A-821, but w-rewrite-ops' progress names "w-git's UpdateDeferred (A-821)". One of the
+    two needs renumbering; the ledger row is mine.
+- 2026-11-21 ~10:55 w-fed-faults -> main (01a1ff31), for A-818 2b's A/B (run-requests.md, w-rewrite-ops). I measured
+  2b's branch merged into main on the 2 MiB refined re-indent (green_post_state's large-rewrite test, 92,354 ops in one
+  version):
+  - The submit's judge phase: debug 230 ms -> 2,011 ms; release 21 ms -> 89 ms.
+  - Its longest step: release 24.6 ms -> 94.4 ms, 6 ms under the 100 ms bound; debug ~300 ms -> 2,124 ms.
+  The A/B's bench doesn't have this shape (one version, ~92k ops). Details are in w-rewrite-ops' inbox. A-821
+  (landed 4b931fe and 895b809) took composition, verdict and encode off the step. Its debug bound waited on 2b making
+  the commit cheaper; on this measure 2b makes it dearer.
+- 2026-11-21 ~11:45 w-fed-faults -> main (01a1ff31), ruling (1)'s last criterion. A-821 is on main (4b931fe, 895b809):
+  composition, verdict and encode are off the step, the slice counter moves, and the identity oracle passes. The step
+  that remains is the commit's history work: ~219 ms debug on main's re-anchor, and 2,011 ms debug / 89 ms release on
+  A-818 2b's branch (my 10:55 note).
+  Ask: rule who slices the commit. My proposal, sent to w-rewrite-ops: 2b's persistent trees let the commit's history
+  be built a slice a turn off the step, from the latest version alone, and installed in O(1) in the one step. I can
+  build it on 2b's branch with w-rewrite-ops' OK or yours. Without it the debug bound can't hold. w-rewrite-ops hasn't
+  answered my 07:35, 09:40 or 10:55 notes.
+- 2026-11-21 ~12:55 w-fed-faults -> main (01a1ff2e; also sent by kiln agents_send): A-818 2b (c4278fd3c) merged into main
+  1a35ab091 deterministically reproduces the refining.rs kill in debug. green_post_state's
+  a_large_rewrite_is_refined_over_many_turns_off_the_submit exits 4 every run: "shard 0 is spinning, 3534 ms of CPU
+  without a step ... refining.rs:187".
+  - Release: the submit's longest step goes from 24.6 ms on main to 91.7 ms (bound 100 ms).
+  - Where the time goes: history::change's anchor.places.change (41 ms over 92,354 parts) and trees.rebuild (42 ms over
+    92,356 nodes), ~0.45 us per part per pass in release.
+  - Options sent to w-rewrite-ops: (a) a bulk linear path; (b) build off-step plus install, with the index staged;
+    (c) a derived part cap that names the block whole.
+  Please hold 2b on this test and rule who takes it. A-821's last criterion depends on it.

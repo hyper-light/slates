@@ -140,6 +140,25 @@ the hypothesis (the fold's tail held the reply) is NOT confirmed; added median 2
   Proposed to main (inbox/main-from-g228-85a-item3-closed.md): an interval-only A/B, not started.
 - 85a open: Linux ~95-140 us added p50, macOS 156-163; macOS p999 < 1 ms quiet.
 
+## LANDED 2026-11-21 ~10:20 PST: origin/main 5e3ec5bc5, A-826 (busy harvest no more often than an empty ask costs)
+- r21 A/B (d1323898): quiet 5/5, loaded 5/5 (less CPU), -b and -b+loaded 4/5 medians; -b tail soft spot recorded.
+- 85a not closable on ubuntu-latest by daemon work: the bare transport's round trip (42-83 us) is at the 50 us goal.
+  Asked main (inbox/main-from-g228-85a-next.md): split the build next, and/or restate the goal as the daemon's share.
+
+## 2026-11-21 ~10:45 PST: main 01a1ff2e ruled (i): split the build. A-829 renumbered on main 8cb874d3f.
+- agents/g228-build-split 06f20620f: fleet.live.hop.build.{capture,seal,append,send} per-write histograms; fleet hop
+  test holds every step timed and the sum within the build (green, kiln, debug). Diag run 15 (ubuntu-latest, release,
+  5 rounds, transport bench beside each round) pending: report = daemon share + transport floor + base commit.
+
+## 2026-11-21 ~12:10 PST: landed 65133486d (build split + kept sealing keys); free for goal 93 (inbox/main-from-g228-free.md)
+- Seal probe, one 4.6 KB live piece: Apple silicon 9.65 us (2 BLAKE3 5.3, content_keyed 3.0); ubuntu-latest EPYC
+  11.78 us (content_keyed 6.09 = 2 derive_child x 2.71, 2 BLAKE3 4.1). Leads: derive the file id without the discarded
+  wrap (hyper-seal); blake3 neon on aarch64; hash a raw chunk once (seal.md §4 ruling).
+- Worktrees removed to free Studio-4 (~1.4 GB). Diag branches 10-19 and diag-results for main to delete.
+
+## 2026-11-21 12:42 PST: goal 93 reserve (main 01a1ff2e). The hg push spin stays with w-hg (its file); nothing written or
+run on it. No runs until main hands over the next red.
+
 ## For main to delete (diagnostics): remote branches diag-g228-live-1..13 once main has read their results.
 
 ## 85a STILL OPEN -- blocked on main's decision (sent): a plain status request arms a tens-of-GiB mincore sweep on every

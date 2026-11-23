@@ -171,3 +171,13 @@ Started 2026-11-19 ~21:40 PST. Reads: brief, common.md, relaunch notes, g088v, g
   w-k90-kvm (r51 g266 and r42 g90 on KVM, ran my 522ba54b3). My close-list is empty. Local target long gone (deleted
   before main's 15:45/16:31 notes; Studio-2's current writer isn't mine).
 - 2026-11-20 21:45: landed w-k90-whp A-791 (2da4c55e5) on slates main cc29bfc4c for main; inbox notes written.
+
+## 2026-11-21: final audit of my assigned goal (brief queue 1-3, close list 90d/90f + R2)
+- 1 (macOS drive green, A-587): closed (fa96bcc47; HVF 2/2 at 81174ac49). 2 (resync end): closed (kiln 522ba54b3, Shards
+  D288 on shards main b9006561b; KVM proof w-k90-kvm r42). 3 (engine on KVM/HVF/WHP): HVF mine, KVM w-k90-kvm (r51),
+  WHP done per close list. 90d/90f: closed by w-k90-kvm with my code. R2: closed (99f05c3d4, a6a65148c). 92b: withdrawn.
+- Checked on kiln main 8491937cf: vendor/patches/hex/0003 (mine) reverse-applies cleanly to vendor/hex, so the tree holds
+  it exactly; `vendor.py check shards` 0 differences (5 recorded changes, my 0002 among them).
+- GAP (not mine to fix, 90a's vendoring): kiln pins Hex at b4db7e69c, which no reachable remote has (GitHub hex:
+  "not our ref", 2026-11-21), so `vendor.py check hex` can't run anywhere; and kiln's Shards 0002 (D288) folds away only
+  when kiln and Hex re-vendor Shards together at or past b9006561b.

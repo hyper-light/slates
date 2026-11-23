@@ -46,3 +46,17 @@ All five items (C1 C2 R3 R4 P5) are closed on origin/main.
 - r4: the WinFsp test on the fix (705f4d7e5, the same change as 87721dbeb): GREEN,
   a_work_mounted_through_winfsp_saves_and_its_submit_lands_the_save ok in 2.04 s, no skip line.
 - Linux FUSE (r2): queued for adacachy; command in inbox/main-from-w-work-mount-fuse.md.
+
+## Goal 93: the version-control store on Windows — LANDED (2026-11-21 ~11:35 PST), by-use proof pending
+- On origin/main 2dc7363b5: bee6ecc94 (the tests run on Windows), 5db34aab0 (the Windows StoreRoot: NtCreateFile
+  relative to the granted directory's handle, FileIdInfo identity, FileFsFullSizeInformation, a create's name made
+  durable by flushing the directory), 62e64afc4 (unsafe budget 33 -> 35, GAPS). merge-base --is-ancestor: all three.
+- jupiter (windows/x86_64), RED on bee6ecc94: crates/land/tests/store_root.rs 0/5 (identify refused Unsupported);
+  repository::store_tests::each_tool_creates_a_repository_into_the_store FAILED (test_store.rs:107).
+- jupiter GREEN on 5db34aab0 (08:17-08:25 PST, logs ~/Projects/wmlogs/green-*.log there): store_root 5/5;
+  each_tool_creates ok (git, hg, svn repositories created into the store); cargo clippy -p slates-land -p slates-store
+  --all-targets -D warnings clean.
+- By-use (stock git and hg clone/push/pull against a Windows --vcs-store daemon): not yet run; jupiter's C: has 8.2 GB
+  free, and a cold build of slates-cli's interop tests needs more (my old 35 GB target there is gone).
+
+- By-use run r1 ENDED WITHOUT RUNNING (2026-11-21 ~14:55 PST): "the kiln runner closed the connection" while queued (jupiter "haven't answered"); no rows. Not resubmitted: main gave the store's by-use round to w-k90-win (14:31). Commands handed to main.

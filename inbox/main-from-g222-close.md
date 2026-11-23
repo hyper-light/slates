@@ -18,3 +18,15 @@
 own wake, written -> seen median 97 µs) is cited in its place.
 
 **For main:** g222's diag branches can go (diag-measurer-g222-20, -22; agents/g222-loaded-p99-p999-reply-wait-c).
+
+## 85a C/B/A: closed (g222, 2026-11-21, by 10:18 PST per date, origin/main 20c2bc961)
+- **C measured and rejected.** w-provision-gate recorded it on main (b88f93326, BENCHMARKS "The client's reply wait,
+  arm C"), every round of A/B/C on all five platforms shown. My own direct read of run 44884335146 matches. C gets A's
+  quiet p50 back, but loaded it is worse than B on ubuntu-latest (accept p99 5.7-5.9 against 2.9-3.1 ms) and on both
+  Windows runners (conflict p999 20-42 against 0.3-12 ms). B (A-799) stays.
+- **The macOS hop split (run 44888851325) is now read**, which replaces the "Not read" line above. It's on main in
+  fcd6a18a5 (BENCHMARKS "arm C", GAPS 84a):
+  - The client's loaded round-trip p99 is 6.8-8.1 ms, and its tail is in replies written after the taking step.
+  - The busy path's zero-timeout kevent takes at least 1 ms in 9-12% of its calls loaded.
+  - Runner timers: kevent and ulock are ~200 µs late at the median; nanosleep is 1.7-2.5 ms late.
+- **For main to delete:** agents/g222-loaded-p99-p999-reply-wait-c and diag-measurer-g222-20/-22, once you've read this.

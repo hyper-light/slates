@@ -1,0 +1,77 @@
+diff --git a/crates/server/src/vcs_store/read_through.rs b/crates/server/src/vcs_store/read_through.rs
+index b4eba5861..320c84515 100644
+--- a/crates/server/src/vcs_store/read_through.rs
++++ b/crates/server/src/vcs_store/read_through.rs
+@@ -447,6 +447,72 @@ mod tests {
+     );
+   }
+ 
++  /// Goal 93 item 2b(b). Read a landed object whose two logical windows share one identity.
++  /// The first cold read and the following warm read must both return the entire object.
++  #[test]
++  fn a_homes_first_read_of_a_landed_object_with_a_repeated_window_is_whole() {
++    let (_store, daemon) = crate::test_store::audit_daemon_stored();
++    let (cold, warm, expected) = crate::test_store::run_on_first(
++      &daemon,
++      || async {
++        let (here, object, expected, budget) = crate::state::with_state(|state| {
++          let window = state.store.content.chunk_bytes();
++          state.vcs_stores.content_made(window).unwrap();
++          let bytes = vec![b'x'; window * 2];
++          let (object, _) = crate::vcs_store::homes::keep_for_region(state, &bytes).unwrap();
++          let header = slates_store::log::Header {
++            tool: slates_store::log::Tool::Git,
++            repository: 3,
++            sequence: 0,
++            judged_over: 0,
++            grant: 0,
++            work: 0,
++            time_ns: slates_rt::futures::now_ns(),
++            sections: 0,
++          };
++          assert!(crate::test_store::land_blocking(
++            state.vcs_disk.clone().unwrap(),
++            header,
++            vec![(slates_store::log::SectionKind::Payload, bytes.clone())],
++          ));
++          let here = state.shard;
++          crate::vcs_store::let_go_landed_pack_among(state, &object, &[here]);
++          let content = state.vcs_stores.content().unwrap();
++          assert!(!content.holds_whole(&object));
++          assert_eq!(
++            state
++              .refusals
++              .get(crate::vcs_store::homes::LANDED_HOME_LET_GO_BYTES)
++              .copied(),
++            Some(window as u64)
++          );
++          (
++            here,
++            object,
++            bytes,
++            crate::fleet::live_budget().max_deadline_ns(),
++          )
++        })
++        .unwrap();
++        let cold = crate::vcs_store::homes::read(here, &[here], object, budget).await;
++        let warm = crate::vcs_store::homes::read(here, &[here], object, budget).await;
++        (
++          cold.map(|got| (got.len(), got == expected)),
++          warm.map(|got| (got.len(), got == expected)),
++          expected.len(),
++        )
++      },
++      std::time::Duration::from_secs(60),
++    );
++    daemon.stop();
++    assert_eq!(warm, Some((expected, true)), "the retry read every byte");
++    assert_eq!(
++      cold,
++      Some((expected, true)),
++      "the original cold read must also succeed"
++    );
++  }
++
+   /// Goal 93 item 2b(b) (main 01a20182's ruling: homes keep window → (payload identity, offset) for the windows a landed
+   /// pack carried, and a home's read of a window let go brings it back through that record). Do: on a store-backed
+   /// daemon, hold a pack of several windows for the region on this shard (`homes::keep_for_region`), land its bytes as a

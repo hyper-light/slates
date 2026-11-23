@@ -32,3 +32,15 @@ answer Identical (main's call); an Abandoned landing state for presentations who
 inbox/main-from-w-sessionlog-close.md written. Findings recorded, not worked: async SDK log forms (GAPS A-773 entry).
 Disk: deleted ~/.cache/w-sessionlog-target.noindex/debug/incremental (12 GB), 2026-11-20 16:30.
 SDK session-log tests run 16:40 (main's 16:18): Python 2 OK, Node 2 pass / 0 skipped, real daemon, this Mac. List done.
+
+2026-11-21: new main 01a1ff31 ruled (1) head own bytes -> Identical, (2) Abandoned state: both GAPS lines only, landed dec29e51b (merge 8de740fc2). Standing by.
+
+## Goal 93 git correctness by use (main 10:38, corrected 10:48)
+- Red to w-git: tag of a blob / tag of a tag rejected (inbox/w-git-from-w-sessionlog-tag-kinds.md).
+- LANDED 868bc1fde (merge 21f10f3e4): crates/cli/tests/git_correctness.rs, 2 ignored interop tests; local proof tag 0/6 red, dataset 20/25 on a tiny repo. Rounds are main's (run-requests.md). Stopped.
+
+## 2026-11-21 16:20: git piece done; main 16:18 put me in goal 93 reserve.
+- Reds with w-git: tag kinds (inbox/w-git-from-w-sessionlog-tag-kinds.md); clone corruption reduced to master + 506 tags, encode never finishing + encode_behind abort (inbox/w-git-from-w-sessionlog-clone-corruption.md). Answer w-git questions on the repro.
+- Test: crates/cli/tests/git_correctness.rs (868bc1fde; http-backend stock side b3b818933).
+- Linux-tree rows not run: no tree on Studio-2, GitHub fetch gave 0 bytes in 60 s here; main/w-interop own those rounds.
+- Kept for w-git: ~/.cache/w-sessionlog-git/{pushclone.sh,h0,h0-status/}.

@@ -1,3 +1,24 @@
+# 2026-11-21 17:18 (w-forming): hg concurrency GREEN (main: big Studio, de3fd468a with w-hg's 521fe3689, release,
+# N=10 50, 330 s); the PastAdmission red is closed. Both halves of vcs_concurrency now green. In reserve: no runs.
+
+# 2026-11-21 16:23 (w-forming): main ran vcs_concurrency (big Studio, b61cdf8d1, release, N=2,10,50): svn GREEN
+# (292 s); hg RED at N=10 -- the seed push refused PastAdmission { asked: 15, left: 0 }, an admission leak, now w-hg's
+# first item. Still in goal 93's reserve: no runs.
+
+# 2026-11-21 14:25 (w-forming): IN GOAL 93's RESERVE (main 14:21): no runs. main runs vcs_concurrency's focused case
+# (hg on its MacBook, svn on the big Studio) and 85b's C3/P4 rounds; a red comes back to w-forming. Studio-4 scratch
+# deleted (kept: ~/.cache/w-forming-runs/takeover-stall-pr15-run1.log, cited by A-775's bug record; the clone).
+
+# 2026-11-21 ~12:00 (w-forming): NOT DONE. Goal 93 piece: vcs_concurrency.rs LANDED 7f1e5a13e (compiles clean),
+# focused case NEVER RUN -- BLOCKED: no reachable machine has stock svn 1.15 / hg 7.2 (kiln runners: none; Studio-4
+# none; Studios .local/-2 at 2 GB / 80 MB free, not answering; d1323898 dead); installs need Ada. Asked main
+# (inbox/main-from-w-forming-blocked.md). 85b: C1, R2 closed; C3 and P4 open on rounds main runs (run-requests.md).
+
+# 2026-11-21 (w-forming), 85b: C1 CLOSED 95adf9632, R2 CLOSED c922a41d1. P4: A-827 (reader's hold on a volume's
+# head; whole captures imaged + read in turns) LANDED 4a0cbd7b7; debug 311 inodes: one-turn 598-849 us -> held longest
+# turn 36-66 us; release A/B kiln r3 queued (.git/w-forming-ab/p4.sh). Acted on 01a1ff31's P4 ruling (a) -- asked new
+# main 01a1ff2e to confirm. C3: replay r19 queued; forwarding stall GAPS ae598c833. Main is now 01a1ff2e.
+
 # 2026-11-20 ~21:40 (w-forming), 85b C3: replay r16 (114153f4a) stalled 5/5 at live_chaos.rs:2465 after takeovers
 # (no_credit -> owed whole -> whole builds, held_back.whole). Cause mine (A-768: a capture counted 0 bytes in the
 # queue's credit). FIXED 8e4da57ae (red test; fleet a_live_ 11/11 -- the GAPS 'fails on main' finding was this,

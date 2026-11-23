@@ -19,6 +19,33 @@
 - After each landing send main (SendMessage to "main") a 3-line report and go straight on to the next piece in your
   queue. END when the queue is done or your context runs short (update your progress file first).
 
+## FOCUS: GOAL 93, THE VCS SERVERS (ADA 2026-11-21 ~10:40 PST; overrides every other priority in this file)
+Ada: "Goal 93 is where we need to focus our efforts now. Complete the servers, ensure correctness, then optimize."
+- Goal 93: slates serves git, Mercurial and Subversion as industrial-grade servers on its changeset architecture,
+  interop with stock clients proven, an order of magnitude faster than the stock servers.
+- Order, strictly: (1) COMPLETE: every verb and wire path a stock client uses works. (2) CORRECT: stock clients on
+  real repositories (git/git, the Linux tree, hg's own history, a large svn dump) get byte-identical results, and
+  every failure becomes a red test first. (3) Only then OPTIMIZE: A/B, release, all N, against the stock server.
+  Do not start a performance piece on 93 while a completeness or correctness failure on the same server is open.
+- If your current item is not goal 93: land what is green within about 30 minutes (or record an in-flight
+  measurement as one GAPS line), write inbox/main-from-<you>-free.md, and main gives you a goal-93 piece. CI runs
+  already going finish and are recorded; start no new non-93 runs.
+- Goal-93 owners keep their lists (close-list.md, "93 ..."), reordered C, then R, then P under this rule.
+- USE, CONCURRENCY AND CRASH TESTS (main 10:48, correcting its own 10:38 pieces; CLAUDE.md §8 binds): an agent WRITES
+  them as #[ignore]d tests that drive stock clients, runs one focused case to prove the test, lands it, and puts the
+  exact command, platform, dataset and red in run-requests.md. Main runs the rounds (interop, chaos, load, Linux and
+  Windows) and sends each red to its owner. No agent runs sweeps, matrices or other platforms' rounds.
+- A failure found by use goes to the server's owner as a red test (inbox/<owner>-from-<you>-<topic>.md). It is fixed
+  by the owner, or by you if the owner says so in writing; never two agents in one file at once.
+
+## OTHER PLATFORMS ARE NEVER "CAN'T" (ADA 2026-11-21 ~14:33: "It should be able to use reach." "Or Zig.")
+- A Linux, macOS or Windows check you can't run on your own machine runs through kiln's reach on a runner of that
+  platform (`run` with needs "linux/amd64", "linux/arm64", "macos" or "windows", unpinned).
+- Or cross-check it the way kiln's release builds do: `cargo zigbuild check --target x86_64-unknown-linux-gnu` (or
+  aarch64). zig supplies the Linux libc that C dependencies (aws-lc-sys, zstd-sys) need. The MacBook
+  (adas-macbook-pro-2.local) has zig 0.16 and cargo-zigbuild; reach it if your machine lacks them.
+- Never report a platform as uncheckable.
+
 ## FAST LANDING LOOP (ADA 2026-11-19 ~20:40 PST: "it should literally not take two hours to land a feature --
 ## implement, light unit testing, merge"). This OVERRIDES any heavier step above or in older briefs/progress files.
 Target: under 30 minutes per piece.
@@ -255,12 +282,14 @@ part closed between 07:20 and 16:00.
 - If your re-sent goal contradicts main's latest message or Ada's rulings here, follow the message and the rulings.
   Tell main in your reply, so main closes the stale goal in your stack.
 
-## REACHING MAIN (2026-11-21)
-- Main is the kiln agent 01a14885fc1d72fba8b659837cc43b94, running as Claude session `slates-5b` on adas-macbook-pro-2.
-  `slates-74` and other `slates-*` sessions are NOT main (one is a separate job for Ada); don't send them your status.
+## REACHING MAIN (2026-11-21; main changed again ~20:55 PST)
+- Main is now the kiln agent 01a201824d307ecc9e135c64ae3cb848 ("Slates", on adas-macbook-pro-2, cwd ~/Projects/slates).
+  Main 01a1ff2ecd2f7d34964c9dff5fa80b2c stopped at 15:10 PST on an API usage limit and is gone from kiln; Ada handed
+  the fleet to 01a20182 at ~20:30 PST. The 93-goal UI stack is restored onto 01a20182 as 01a1ff2e left it (222 met,
+  20 open). Send nothing more to 01a1ff2e, 01a1ff31, 01a14885 or `slates-5b`. Reach main with kiln `agents_send`
+  (agent 01a201824d307ecc9e135c64ae3cb848) or the inbox below. `slates-*` sessions are NOT main.
 - The route that always works: write `inbox/main-from-<you>-<topic>.md` on agents/fanout-state and push it. Main reads
   every new inbox file each check. kiln mail to main can sit "waiting" behind a stuck admission, so never rely on it alone.
-- On the MacBook, a cross-session message to `slates-5b` also reaches main at once.
 - Main reaches you the same three ways. When kiln mail from main is stuck, it arrives as a goal or a session message.
 - A-NUMBERS (2026-11-21): claim an A-number by adding its row to amendments.tsv and pushing that claim BEFORE writing the
   number in a commit, doc or test. If the push is refused, fetch, and if the number was taken meanwhile, take the next

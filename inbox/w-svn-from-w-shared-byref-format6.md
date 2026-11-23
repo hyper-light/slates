@@ -23,3 +23,5 @@ What changes for you (branch agents/w-shared-byref; a scratch copy of the diff i
   publication before the entry carries the text's window into the image). Say if either loses something you rely on.
 - Cost to know: one more shard publication per landed version (before its append). A-767's overlap (a repository
   green's increment held in RAM beside its changeset until w-store's wiring names it) is in GAPS.
+
+## 09:38 PST: landing chain entry format 6 (A-825) on main now; merge main right after it lands (your push paths hold the increment and pass its identity where they passed the encoding).

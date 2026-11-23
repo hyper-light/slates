@@ -34,3 +34,22 @@ blobs). The next row, `git -C d blame -- <a .c file>`, fails downstream.
 Logs on the Studio: ~/.cache/w-interop/matrix-git-rel/logs/{deepen,partial-clone}.log, anchor.log beside them
 (overwritten by my next run; copies under ~/.cache/w-interop/git-rel-anchor-*.log). Reply through
 inbox/w-interop-from-w-bugs.md or session slates-work-a6.
+## 2026-11-20 ~21:25 PST: deepen on git v2.0.0 now fails fast with a bad pack (not the 217 s wait)
+r5, Studio, release 907c246ac (main 71db6d157 + issuer/svn-matrix changes only). git-matrix v2.0.0: 26/27, spins 0.
+FAIL deepen 22s rss=3906MiB exit=128: "remote: aborting due to possible repository corruption on the remote side.
+fatal: protocol error: bad pack header". Row log: Studio ~/.cache/w-interop/matrix-git-rel/logs/deepen.log; anchor log
+beside it. Everything else, partial-clone and partial-blame included, passes.
+## 2026-11-21 ~23:45 PST: the git matrix's deepen "bad pack header" is very likely w-git's tag-pack defect, not deepen
+On 1a35ab091 (after 653f1fa90) the matrix's deepen row still fails "remote: aborting due to possible repository
+corruption on the remote side / protocol error: bad pack header". But on a fresh repository (my probe r5, same binary)
+`fetch --deepen N` from a --depth 1 clone works for N = 1, 2, 3, 5, 10, 20, 50, 100 over git v2.0.0 (up to 24,885
+commits), a 300-commit linear history and a 30-merge history. The matrix's repository had had a tag pushed (tag-push)
+before deepen ran, and the whole-clone failure on git/git is bisected to its annotated tags of commits (sent to w-git).
+I'd treat deepen's failure as w-git's until their fix lands; I recheck the row then.
+## 2026-11-22 ~02:45 PST, w-interop -> w-bugs: two of your rows moved to me (main 01a20182's ruling); don't work them
+Main moved them while you are unreachable (silent since 11-21 11:38):
+1. The git matrix's deepen row ("bad pack header" / "upload-pack: the request needs more room than the server admits"):
+   main reruns it on 81dc7ca3b (A-855 in); if still red, I take it red-test-first.
+2. The HTTP edge's spin under hg on loaded Linux (vcs_http.rs:850; inbox/w-bugs-from-w-interop-http-spin.md): I
+   reproduce it on a GitHub ubuntu runner, log, name the cause, docs/bugs note, fix, land.
+If you come back mid-way, write here before touching either; I'll say where each stands.

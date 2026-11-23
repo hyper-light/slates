@@ -256,3 +256,68 @@ landing and its replay red first.
   short".
 - **Next (your order):** the other synchronous readers (lookup's `.hgtags`, the push intake's base text), then step 2
   after w-perf's intake change lands.
+
+## Whole place = raw text; lookup's .hgtags and --from through the store: LANDED on origin/main 8759f75b3 (2026-11-21; commit 2e3f99484, base 20c2bc961)
+- **Whole place (main's approval):**
+  - Both writers (push intake, import emitter) now record a whole's place as its raw text, past the trivial hunk.
+    Before, `StoreHandle::text` refused `BadRow` for every hg text.
+  - The stream sends a whole as it lies (`text_after_trivial_hunk` removed). Clone and pull write a whole with
+    `put_revision_whole`. A non-trivial delta against null is refused typed (`Unverified::NotWhole`).
+  - Old stores refuse `BadRow` until re-imported or re-pushed; no shim.
+- **Lookup, ruling (A):**
+  - `TagsRead` reads all heads' `.hgtags` rows in one want, then texts in one, under `Want::Texts`' `most`.
+  - `Producing::Lookup` over SSH and HTTP (0.1, uncompressed). `Batch` reads once via `BatchStep::Store`.
+  - The `--from` door (`vcs_store::hg_tags`) parks `CreateBranch` while a task reads.
+  - `Repository::tags_text` removed. Counted `vcs_store.hg_lookup_store_asks`.
+  - New `hidden-tag` fixture made by stock 7.2.
+- **Tests (on the merged tree):**
+  - slates-hg 401/401; server hg 71/71, including the red store test (red before the fix), the five-format two-writer
+    oracle, and `--from v1` through the door;
+  - daemon_edge 28/29, the one failure git's A-713 long-history push, which passes alone.
+- **For you to run:**
+  - hg_interop: the stock `pull -r <tag>` over SSH and HTTP, a batched `pull -r a -r b`, and the `--from` verb by use
+    (not yet written as interop tests; I can add them next if you want);
+  - the full hg_interop suite;
+  - clippy on slates-hg and slates-server.
+  - Red would be a tag lookup refused "a .hgtags text not read", or a stream or clone of a pushed repository failing
+    verify.
+- **Next:** the intake's base text, waiting on w-perf's answer about intake.rs. Then step 2.
+
+## The push intake's file delta bases through the store, main's (b2): LANDED on origin/main 8f7d388d3 (2026-11-21)
+- **What it does:** a file delta whose base isn't the text kept last no longer reads the content store's whole text.
+  It is found in this order:
+  - the push's own cache (bounded by its room, let go per file group);
+  - otherwise rebuilt from the push's own deltas;
+  - otherwise read from the store between steps for a revision landed before the push (`Stepped::Store`).
+- **Drivers:** the push's sliced intake, and the recovery's and rebuild's piece replays (`answer_wants_over`, over the
+  disk alone).
+- **Counted:** `vcs.hg.push_base_hits` / `_rebuilds` / `_store_reads` and `vcs_store.hg_intake_base_asks`.
+- **Tests:** slates-hg 402/402 and server hg 71/71 on the merged tree. The new red is
+  `a_file_delta_base_before_the_last_text_comes_from_the_cache_the_push_or_the_store`.
+- **The b1/b2 A/B** is deferred under goal 93's order (performance last).
+- **Note:** the final push included a second merge of main, touching `hg_push.rs`. Its re-test is running now; if it
+  goes red I fix it at once.
+- **Next:** `push/tree.rs`, which needs your ruling (inbox/main-from-w-hg-tree-through-store.md). Meanwhile
+  `push/made.rs`, `push/verify.rs`, `Indexed::file`.
+
+## Three more readers of whole file texts gone: LANDED on origin/main a6f4465ba (commit fe30843fc; 2026-11-21)
+- **`push/made.rs`:** whether a file keeps its parent's node is told by the texts' names (block and bytes identities,
+  `Held::file_names`); `IndexHeld` reads them from the row with no text read.
+- **`push/verify.rs`:** the presence check reads rows. The whole `verify` has no production caller and stays the
+  intake's test oracle.
+- **`getbundle::Store::file` and `Indexed::file` removed:** `file_entry` (the row) is the served view's one file read.
+- **Tests:** slates-hg 402/402 and server hg 71/71 on the merged tree. The last merge brought only git's `upload.rs`.
+- **Left before step 2:** `push/tree.rs`, after the push spin (your order).
+- **Now:** the push spin. Piece A, the intake a window a step, is written with its red test; it compiles in the retest
+  build and its own run is next.
+
+## The hg concurrency admission red: FIXED, landed on origin/main 687cd98b1 (commit 521fe3689; 2026-11-21)
+- **Cause:** `vcs_store::index_upkeep::slice` lent each merge step the shard's whole admittable room, and the lend's
+  `make_room` claimed the whole shared arena pool for one shard (28.6 GB). The other shard was left at capacity 0 and
+  admittable 0, and refused even capabilities.
+- **Fix:** a merge step is lent `Merge::cut_bytes`.
+- **Tests:**
+  - the index_upkeep merge tests, red before ("grown 11453071360 of 11453071360") and green after;
+  - by use, concurrency at N=2 and 10 passes (debug).
+- **Git siblings in GAPS:** restage, seal and `git_hooks`' seal lend whole rooms. w-multirepo told.
+- **Next:** the SSH truncation red, then the push spin, then tree.rs.

@@ -287,3 +287,201 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
 - OPEN (mine): background deltify job (supersede hook from w-svn), svn storage A/B (whole/skip-delta/FSFS, all N),
   c3 (drop records fallback), review w-svn's sliced exporter `load`, push_load/git_scale rerun (w-git A-722 p3).
 - w-lint red (content-once test) passes at bf10a773a; asked main for w-lint's base.
+
+## 2026-11-21 ~22:00 PST (main 01a20182's note, inbox/w-perf-from-main-01a20182-ssh-rekey.md)
+- Landed today: 70dd82623 (sha1_ab, paced intake slices 406fa7f35), 2ab402b95 (HTTP fetch keepalive), 1a8859a3f (SSH
+  fetch keepalive).
+- CLOSED by A-842 (w-svn cc55404fa): c3 (records keep no text; fallback gone) and the background deltify job. Under the
+  changeset ruling, svn deltas are derived, never stored.
+- e0d79f557: already landed in adapted form as 406fa7f35 (70dd82623); nothing more lands. Its checks_bytes part stays
+  with the held fan-out 2abe7cae3. The other held P commits stay held until goal 93's servers are complete and correct.
+- NOW: the SSH edge's rekey write duplication (goal 93 C). Waiting on w-hg's written go
+  (inbox/w-hg-from-w-perf-ssh-rekey-go.md); reading meanwhile.
+- ~22:45 PST: STOOD DOWN from the SSH rekey write duplication (main 01a20182; inbox/w-perf-from-main-01a20182-rekey-closed.md).
+  w-hg landed the fix as a3e673efc (`TcpStream::write_some`, red `vcs_ssh::tests::hg::a_rekey_during_a_blocked_write_sends_no_byte_twice`).
+  My uncommitted slates-rt `TcpStream::write` and its test were dropped unlanded; nothing of mine is in vcs_ssh.
+  Back on goal 93's reserve, no runs.
+
+## 2026-11-22 ~05:10 PST: 84a (macOS p999, then Linux), main 01a20182's piece; stopped at main's §8 correction
+- LANDED: 4a1686023 (docs only). The refining job's paced turns, two arms, were measured and rejected: dead even with
+  main on one runner's interleaved rounds. BENCHMARKS "84a on macOS: the refining job's turns paced" holds both runs'
+  tables (45006705328, 45010946191); GAPS 84a has a line.
+- macOS read, stamped under TB (diag-measurer-w-perf-84a, never main):
+  - No wait holds p999. Shard parks: 0-1 of ~16k a round waited >= 1 ms past their timeout. Client parks 0.9-1.2 ms:
+    3-10 of ~73k. The client's wake has a median of 4-12 µs in the tails.
+  - The slow classes:
+    - submits parked behind their refinement (the job's yields plus the resumed run, all CPU);
+    - lease_wait work-queue verbs (2.6% of requests, no single leg).
+  - Round-to-round variance dominates. The macOS close needs more rounds a run, main's call.
+- Linux read (runs 45017505026, 45018893846):
+  - Kernel 7.0 azure, HZ=1000, PREEMPT_LAZY, RUN_TO_PARITY, base slice 2.1 ms.
+  - A woken or runnable shard doesn't get its CPU against the spinners: arm kick -> run p50 920 µs; x86 queued 2.8-3.9 ms.
+  - RLIMIT_RTPRIO is 0:0 on the stock runner account.
+- Linux arm, under an administrator's RTPRIO 1:1 grant (sudo prlimit, both arms; the daemon asks nothing, R10):
+  - B 21179849c, the shards in SCHED_RR (grant or skip): kick -> run 921 -> 8 µs (stamped run 45020845000). The tail
+    moved to the client's time-share wake (2.5-3.0 ms). Plain A/B 45020495221: no starvation; the quiet path worse
+    (p50 +10-35%, arm R9 p99 82 -> 111 µs).
+  - D 69c483e8d: B plus the client's reply-wait park in RR (sched_getattr, exact restore, a typed refusal if refused,
+    counted).
+  - C 0a7e06c56: D with the shards spinning R9's floor alone at RR, floor spins counted.
+  - Four-arm A/B: run 45023871879 (branch diag-measurer-w-perf-84a-linux-ab, A d2c6635a2). Mine to read.
+- To LAND C (or D) if main's table says so: a clean branch from origin/main, cherry-picking d2c6635a2, 21179849c,
+  69c483e8d and 0a7e06c56 only (never the diag workflow commits on that branch). Then focused tests (slates-rt and
+  slates-machine round_robin, slates-ipc endpoint), fmt; design, GAPS and BENCHMARKS lines; claim an A-number.
+- Rule (main 05:06 PST, correcting its own 05:05): an arm's interleaved design A/B is the agent's own to run and read
+  (Ada, 2026-11-20: "make your agents do A|B testing"). Still main's: clippy, other platforms' lint checks, suites, a
+  landing's confirming rounds, and the wall.
+- ~08:30 PST: 84a Linux CLOSED as measured-and-rejected. LANDED 519fe5568 (docs only): BENCHMARKS "84a on Linux: the
+  round-robin real-time class...", with the stamped run, the kernel facts, RTPRIO 0:0, and the four-arm tables
+  (45036903025), plus a GAPS 84a line.
+  - None of B, C', D' meets 1 ms. C' is best on conflict p99 and holds quiet and R9, but its accept p99 is
+    0.94-2.6 ms and the spinners lose 20-27% of their throughput.
+  - The remaining tail is the client's own time-share code waiting whole 2.1 ms slices (structural). Open as main's
+    call: a less oversubscribed lane, or the bar re-stated for Linux.
+  - No code landed. The arms are on origin/diag-measurer-w-perf-84a-linux-ab and origin/agents/w-perf-84a-arm-d2.
+  - Lesson recorded: SCHED_RESET_ON_FORK can't be cleared unprivileged, so a temporary raise must not set it.
+- 2026-11-22 ~13:15 PST: 84a macOS p999 NAMED, the doorbell arm measured, NOT landed. LANDED 185217879 (docs only):
+  BENCHMARKS "84a on macOS: the doorbell thread under the time-constraint policy, measured, not landed".
+  - Timed-only join (45065854565): the p999 tail landed on parked shards whose parks ended early (late, not lost).
+  - Hop stamps (45067781801): the client rings within 2-8 µs, the doorbell thread wakes 0.15-12 ms later (max 17 ms),
+    and the kick and run take tens of µs. 0 lost wakes. Linux (45067930278) has no bell signature.
+  - Arm 6aa639211 (G222_BELL_TB, diag): rung -> woke is 4-8 µs, but p999 is under 1 ms in only 1 of 8 rounds in
+    both arms. The p999 is bound by serve_loop polls of 4-15 ms ("task (long)"). Quiet accept p99 was worse in 5 of 8.
+    Retry once the polls are bounded.
+  - Running: 45071270749, serve_round's parts stamped as long serves by name. Next piece (main): fix that
+    bounded-work bug, red first (a poll stays within its quantum under that load). Then Acknowledge, CreateWork,
+    Destroy. Then retry the bell arm and re-measure Linux's p999. Watch item: a client descheduled 13 ms between push
+    and announcement read (once).
+- 2026-11-22 ~16:30 PST: 84a, two threads open, nothing landed since 185217879.
+  - macOS p999: the serve_loop holds are the reply write's wake_one, 1-33 ms of on-CPU kernel time
+    (os_sync_wake_by_address_any, SHARED). Runs 45072617323, 45072811313, 45074388808.
+    - spindump (45082342692): 69 of 106 samples sit at one kernel PC, a spin. It's unsymbolicated (needs the 25G332 KDK).
+    - Read: the VM's lock-holder preemption on the shared ulock. Probes 45078071137 and 45079961886 don't reproduce it.
+    - Race probe 45086631612 is running. Main runs the bare-metal check from fffa0046d (diag-measurer-w-perf-84a-mac-tail).
+    - The §3 long verbs went to codex-review (main, 2026-11-22).
+  - Linux arm F (Ada: "fix it"): agents/w-perf-84a-arm-f b44f0904f on E. The client pins to its shard's CPU for each
+    synchronous request; the region gains the shard's CPU word (layout version 5).
+    - F_diag 9ad9d4cc9. The A/B is 45087231374 on diag-measurer-w-perf-84a-f-ab.
+  - Worktrees: w-perf-diag and w-perf-armf. w-perf-land was removed (clean) to make room; re-add it to land.
+- 2026-11-22 ~18:30 PST: LANDED A-867 (76bbf6ca8, merge 156e5ea30): a macOS client's synchronous park waits on its region's
+  Mach semaphore, its send right carried with the region's fileport through mach_claim's keep and fetch.
+  - A/B 45091701553: reply wakes >= 1 ms 3,001 -> 36; loaded p99 median accept 1,766 -> 976 µs, conflict 4,301 -> 1,363 µs.
+  - Bare metal (main's Studio check) has no slow wake: the address-wake spin is the CI VM's.
+  - Red first: the cross-process test failed while the semaphore was named in the header (KERN_INVALID_NAME).
+  - Focused tests on macOS: ipc lib 80/80, rendezvous 16/16, completion_memory, rings, client 39/39.
+  - Main's: clippy (macOS, Linux, Windows cross-lint for slates-ipc), xtask unsafe (slates-ipc 160 -> 167), and the
+    confirming rounds on the landed code.
+  - Arm F rejected and recorded (6bab42576). Arm G handed to main (agents/w-perf-84a-arm-g 674c030f5).
+  - Next mine: init_shard unit 3 (boot's 2-68 ms slice).
+- 2026-11-22 ~22:30 PST: LANDED 80412e446 (merge 794619d6a): a shard's start holds each heavy piece of its setup in a slice of
+  its own.
+  - The setup after the catalog's replay was one unit: 12-21 ms on CI macOS, 59-68 ms on the Studio.
+  - What changed: RecoverySlices::piece_done (eight named pieces) and StartReport via Daemon::shard_start_reports; an
+    attach opens its segment once (SparseObject::declare, opens_on_this_thread); UnitSet::whole fills words whole.
+  - Red to green: 8 -> 1 heavy pieces in one slice (heaviest 9.0 -> 1.9 ms, the pool's segment); 2 -> 1 opens an attach.
+  - For main: the CI boot lines on the landed code; clippy and the cross-lint for server, anchor and mem.
+  - Pre-existing on this Mac: anchor a_table_past_the_old_exec_limit_reaches_the_successor_whole fails at HEAD too.
+  - A-867's confirming rounds (main, 45104222730): no p99 difference on a fast runner; it stays landed on the slow
+    runner's evidence.
+  - Nothing left in my queue.
+- 2026-11-22 ~23:30 PST: LANDED b1654ef67 (merge 8883ebfd1). A send into a full macOS hold channel waits for room within the
+  caller's liveness budget; before, it failed ENOBUFS.
+  - a_table_past_the_old_exec_limit (13 of 7,792 held) is green, anchor 33/33.
+  - Added held unit tests 44/44.
+  - Bug record docs/bugs/2026-11-22-a-full-macos-hold-channel-refused-holds-the-anchor-would-have-taken.md.
+  - Siblings: none (every other pair is a stream or Linux seqpacket).
+  - For main: clippy and the cross-lint for slates-anchor and slates-server, a Linux run of anchor and held.
+  - Queue empty.
+- 2026-11-23 ~00:30 PST:
+  - ead8aee9a: the bug note says the full-table test never passed on macOS (A-462 ran lib tests only, no CI reached it).
+  - G+E's shard regression named for main: naps keep the shard's EEVDF negative lag, because DELAY_ZERO clips only
+    positive lag (kernel v7.0 fair.c).
+  - LANDED 9ff6e401a (merge e4fb444ab), the nightly 45017186325's gates in my crates: heap::system reads no allocator
+    under Miri; TSan skips the heap test; wire_order publishes ResolveConflict (101) and DestroyRepository (102).
+  - Routed: client lone_daemon (a timing bound under TSan) and merge shuttle_green (Outcome::ContentUnread, A-760 p1).
+  - Queue empty.
+- 2026-11-23 ~01:30 PST: LANDED ea3240fd8: client lone_daemon's outstanding call is bounded by the driver's own look after
+  the exit (A-523's doubling), not a reply deadline.
+  - The bound predated A-523 by a day.
+  - Red without TSan here too (27.19 s vs 24.16 s); now 4/4.
+  - Design note to main: the async driver could watch Linux's departure socket.
+  - The nightly-gates commit is 9ff6e401a (I first sent main b57a2dbaf by mistake).
+  - Queue empty.
+- 2026-11-23 ~03:00 PST:
+  - Arm H's A/B read (run 45108777338). H loses loaded on both legs and is even quiet. My prediction was wrong: the
+    client half alone carries most of G+E's regression.
+  - LANDED 78c5c5b1f (merge c760bfc1e): BENCHMARKS "84a on Linux: naps on a thread's own timer" (G+E and H rejected,
+    runs 45104143760 and 45108777338, main's arms) with the rtkit probe (run 45115263387: no RealtimeKit on either
+    runner); one GAPS line.
+  - LANDED 75a8e7df9 + 3d61fd9b3 (merge a744fc668): a request's ring.request span opens at its own slot read and ends
+    at its reply's publication, before the wake (DaemonEnd::reply returns the reading; send_reply returns Sent).
+    - Red first: a_requests_ring_span_lies_within_its_clients_own_time (server/tests/daemon.rs) failed on the Mac, a
+      span 165 us before its request's publication; green after, and again after main's merge.
+    - Bug record docs/bugs/2026-11-22-a-ring-span-outlasted-its-clients-wait.md.
+  - For main: clippy and the cross-lint for slates-ipc and slates-server (DaemonEnd::reply now returns u64). The
+    attribution's ring/outside split is good only for runs built after a744fc668.
+  - Queue empty.
+- 2026-11-23 ~05:00 PST: LANDED 0227ad029 (merge 0bc10f567), goal 93: the watchdog's beat allocates nothing.
+  - LatenessTail is a fixed ring of A-474's hundred readings, its p99 a sorted stack copy; the beat refills its looks,
+    windows and verdicts in place.
+  - Red first: the_watchdogs_beat_allocates_nothing_once_it_runs (server/tests/watchdog_allocations.rs, a counting
+    allocator on the thread named slates-watchdog): 82 idle and 81 under 71,073 requests over 20 beats on HEAD; now 0
+    and 0, again after main's merge.
+  - The ring's oracle against the old queue (watchdog lib tests 30/30). GAPS line under goal 93's memory entries.
+  - My cargo fmt also dropped a stray blank line in vcs_store.rs that main carried.
+  - For main: clippy for slates-server and slates-api (anchor.rs uses LatenessTail); hg_push_heap before and after.
+  - Queue empty.
+- 2026-11-23 ~07:00 PST:
+  - LANDED 27ee14b45 (merge ec7522621): the watchdog's allocation figures as measured (4 a beat, ~1 KB by types,
+    now 0); the 24% / 10-15 MB was hg_push_heap's sampler artifact (f14ea81bb). Main kept 0227ad029.
+  - LANDED d2c7a6ca5: Windows long polls attributed.
+    - slates_machine::own_cpu: QueryThreadCycleTime at a rate measured once a process (best of 8 spans of 1000 clock
+      steps; 3.14 GHz on jupiter), warmed in Runtime::start_with_sized.
+    - switches::voluntary_waits_now: every profiling read folds PERFORMANCE_DATA's WaitReasonBitMap into a count of
+      reads that saw a wait other than WrQuantumEnd/DispatchInt/Preempted/YieldExecution/DeferredPreempt.
+    - Red first on jupiter: the_platform_reads_a_kernel_sleep_blocked_and_a_spin_long read NoClock with main's
+      account; green: sleep Blocked, spin Long, 291 ns a read. Linux (CachyOS 7.2.9) green, 210 ns a read.
+    - Unsafe budget slates-machine 104 -> 105. GAPS: A-871's NoClock line closed.
+  - For main: clippy and the Windows cross-lint for slates-machine and slates-rt; a jupiter round naming its long
+    polls' holders.
+  - Queue empty.
+- 2026-11-23 ~10:30 PST: D'' for main's adacachy2 A/B, NOT landed: 71e7945fe on agents/w-perf-84a-linux-rr (on main's
+  933ec74f8; B = 374ce0e8e).
+  - A Linux client's reply wait holds SCHED_RR from its first park until it returns; restored once, exactly.
+  - Red on adacachy2: a_reply_wait_holds_the_real_time_class_from_its_first_park_until_it_returns, 2 raises per wait
+    with the per-park code, now 1, nice back exactly. machine and rt round_robin tests green there.
+  - A-872 claimed (19e433784). Worktree w-perf-diag retired (clean, HEAD on origin's mac-tail branch); w-perf-rr made.
+  - Also saved: Linux 7.3.3 fair.c reading in ~/.cache/w-perf/linux73-notes.md.
+  - Waiting on: main's A/B of A, B, D'' (R9 provisioning p99, load throughput). Queue otherwise empty.
+- 2026-11-23 ~11:30 PST: LANDED A-872, 015dd0f16 (arm B cherry-picked from main's 374ce0e8e) + 2e8ee75f7 (docs).
+  - main's ruling on the adacachy2 A/B: B alone; D'' (71e7945fe, agents/w-perf-84a-linux-rr) measured, not taken.
+  - rt round_robin test green where granted (adacachy2, adacachy), loud at RLIMIT_RTPRIO 0 (ulimit -r 0 on
+    adacachy2), skipped loudly on the Mac.
+  - Docs: §4.3 drivers, amendment A-872, GAPS (84a Linux: bare metal met), BENCHMARKS "84a on Linux bare metal" (A, B,
+    D', D'', E; R9 median cost 12-20 -> 17-27 us).
+  - Not run by me: clippy (Ada's §8; main's wall). Owed: main's confirming round on main.
+  - Queue empty.
+- 2026-11-23 ~15:00 PST (goal 93 memory term):
+  - LANDED a472a4ca4: GAPS, A-872's RealtimeKit route parked (main's rulings recorded).
+  - LANDED 5cc3f261b: crates/server/tests/hg_push_lifetimes.rs (#[ignore]d; sampled by site, x86_64 size class, life;
+    SLATES_HG_PUSH_SOURCE=~/.cache/w-perf/hg-src, CARGO_PROFILE_DEV_OPT_LEVEL=2).
+  - LANDED cf7c67662 (merge c9e130878): the store's TextCache in chunks of the mapped floor, the oldest given back
+    whole; Store::make through two reused buffers; text_at still lends. Red/green tests/text_cache_heap.rs: 6,606,904
+    live bytes grown -> 90,424. Push of Mercurial's history after: sub-floor >=1 s/live 4.18 GB -> 0.68 GB; live at end
+    under floor 366 -> 189 MB; [128K, floor) churn 3.52 -> 2.72 GB.
+  - Finding for main: the cache's bound still grows to the longest chain's bytes (no longer needed with the buffers):
+    360 MB of mapped chunks held at the push's end.
+  - Split with w-hg: intake::rebuilt, HgIndex::revision_text, Taker::file_base are w-hg's (C1).
+  - Pushed once before rerunning after a merge that brought crates/mem/src/arena.rs; reran the store tests after: green.
+- 2026-11-23 ~08:30 PST:
+  - LANDED 0cd8ef36a + d0183b7c1 (merge 121dbf6b5): every hg append seals the index's tail when due through one
+    HgIndex::insert; import's own seal gone (red: due after group 26 of 200; w-hg's three conditions). Plus the spare-
+    chunk measurement (#[ignore]d): Mac 1 MiB chunk 240 us fresh vs 85 us kept; x86 not measured (adacachy run timed out
+    building at 40 min).
+  - REGRESSION found by main's arena-13 (CI 45193998198): b04cdef7f's for_reads(waiting) bound kept the distinct texts
+    of hundreds of reads, 646 MB of chunks resident after push-all and idle.
+  - LANDED cc95e92c4 (merge 67d3d866d): the cache holds the walks in flight, in whole chunks, plus one chunk; red 7.3 MB
+    -> 1 MiB with room for 1,000 reads. Sampler strip fixed (::h + 16 hex, four frames).
+  - Sent: w-shared inbox (image pages 22 MB); w-hg the revision_text frames (push::held::IndexHeld).
+  - Owed: main's arena-14 on CI. Next per main: the content store's tables (3)(4); one rerun after w-hg's cut 3.
+  - Worktree w-perf-rr removed (D'' on origin). Target dir was deleted by the disk cleanup.

@@ -1,0 +1,1 @@
+g226 -> main 01a20182 (2026-11-21 21:20 PST): free since 11:45 PST, waiting for a goal-93 piece. The residency fix landed (27517bd04; BENCHMARKS 348a530d5, a5e5ce50; green on macOS and Linux). Details in inbox/main-from-g226-free.md, written before your 15:00 cutoff.

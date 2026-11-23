@@ -161,3 +161,65 @@ the append no longer copies the increment) is in its final local run now; then 3
 identity) and the slicing, re-measured at these five sizes x 10.
 
 ## 08:29 PST: target gone (~/.cache/w-shared-local-target.noindex deleted, MacBook 51 GB free). Fleet had shown 2 failures before the stop (a_successor_adopts_a_greens_ledger_past_its_merge_budget_and_keeps_it_across_its_restart, a_successor_restarted_warm_takes_a_write_to_the_volume_it_took_over); fleet + kill -9 go to a Studio now, those two with their output.
+
+## 09:40 PST: piece 1 LANDED: A-825, chain entry format 6, main 545cf46c5 (merge-base confirmed)
+- Tested at 000d0e442 (piece 1 merged with origin/main a8ee99bf7), kiln r19, Adas-Mac-Studio-2, load 3.8-6.3: merge 269
+  + all integration suites, server lib 1102/1102, green_checkpoint 7/7, works_off_owner 18/18, signed_work 12/12,
+  the kill -9 test green. Fleet on 160ddd0ba (r14): 231/233; the two failing (superseded-owner A-338/A-349) fail
+  identically on main 37c7a1691 alone (r18): in GAPS. Red of the kill test at 544020bd2: r20 earlier.
+- Landed over 3 more main commits merged untested (comment renumbering, refining.rs and verbs.rs work that touches none
+  of piece 1's code); kiln r20 checks main's build and the kill test after it.
+- w-git, w-hg, w-svn told in their inboxes before the push. Branches agents/w-shared-byref and -ci deleted (local and
+  origin), worktrees removed; my local target was already deleted.
+- Next, per your ruling: 3b (content ahead: the holder's SubmitComputed names its increment, the owner fetches what it
+  lacks by identity from the holder, stored once), then slicing what remains, then the bench at 64-512 MiB x 10.
+
+## 10:12 PST: r21 overturns my 512 MiB read. The owner never runs; the holder's forward goes silent and gives up
+- r21: main 6a6e352 (A-825 in), big Studio at load 11.5-13, release, 320/384/448/512 MiB x 3: 0 of 12 passed, all
+  `Overloaded { shard: 0 }`. 320 MiB passed 9/10 on 0287458 (r13, Studio-3, load 2-3.6, before A-825).
+- In every failure no owner step counted (no merge.submit.owner_step), so the owner never ran the verb. The holder's
+  forward: fleet.forward.given_up_silent 6-9, resent_in_place 6-9, silence_awaited_receiver 6-9, given_up_at_bound 1,
+  merge.submit.forward_ns 7.05 s (320) to 10.1 s (512); the holder's own steps were small (compose 0.29-0.47 s,
+  forward_build 0.24-0.38 s, compute 11 us). So it is not call_owner's 1 s CPU wait (my guess from the code was wrong):
+  the whole 320-512 MiB SubmitComputed is resent in place while the lane hears nothing back, until the bound.
+- Cause not yet known: the load (12 vs 3), A-825 (the owner's step gained a hold copy and a publish), or another
+  commit between 0287458 and 6a6e352. kiln r23 now: interleaved A/B on one machine, main just before A-825
+  (895b80994) against A-825's landing (545cf46c5), 256/320/512 MiB x 3 each. If A-825 regressed it, I fix that first.
+- Either way the GAPS line: a holder-route submit of 320 MiB and above does not complete: its request crosses the
+  forward lane whole and the lane gives up on silence. That is 3b's job (the request names the increment; the owner
+  fetches chunks by identity on the content plane), so 3b may come before the owner-step slicing. I'll confirm with r23.
+
+## 10:07 PST: 3b built (agents/w-shared-3b 269f12e3f off main 8f73b6928), red and green queued (kiln r24); r23 (A/B of A-825) still queued
+- SubmitComputed names the increment (identity, length) instead of carrying it; the holder holds it under that identity
+  (refused typed at its room); the owner's control shard, before the verb, fetches what the owner shard lacks from the
+  asking node on the content plane (the resumable hedged fetch), the owner shard holds it once, the verb reads it from
+  its store; not had whole is Overloaded, nothing started. Red test: an 8 MiB holder submit's forwarded request under
+  64 KiB and the owner fetching it once. Server crate type-checks; the A-number gets claimed in amendments.tsv before
+  any doc names it. Then the release bench at 64-512 MiB x 10 on it.
+
+## 10:22 PST: r23: A-825 is an improvement, not the cause; 320 MiB and above fails before and after it, under load
+- Interleaved A/B, big Studio, load 12-24, 3 rounds, 895b80994 (before) vs 545cf46c5 (A-825), release holder route:
+  256 MiB: 3/3 both; owner step 667-681 ms before, 437-476 ms after; late beat 1.19-1.21 s every round before, 0.55 s
+  twice and none once after; wall 3.5-4.3 s before, 3.3-3.4 s after. 320 and 512 MiB: 0/3 both (before also one exit 4).
+- GAPS line on agents/w-shared-3b, commit a5402c4c8 (my kiln message said ffa3b5c by mistake). A-826 closes it.
+
+## 12:35 PST: A-826 before/after (kiln r32, interleaved A/B, cut by the big Studio's restart after 2 full rounds)
+65133486d (before 3b) vs 156007d (A-826), release holder route, big Studio, load 4-13, wall (forward):
+| MiB | before | after |
+|---|---|---|
+| 64 | 2/2, 410-466 ms (299-357) | 2/2, 319-408 ms (188-274) |
+| 128 | 2/2, 810-863 ms (584-649) | 2/2, 601-613 ms (339-346) |
+| 256 | 2/2, 2.41-2.52 s (~2.0 s) | 2/2, 1.25-1.29 s (0.72 s) |
+| 320 | 2/2, 3.52-3.61 s (~3.0 s) | 2/2, 1.51-1.53 s (0.85-0.89 s) |
+| 512 | 0/2, refused Overloaded | 0/2: the submit completes (2.4 s, owner step 0.66 s, holder build 0.59 s) and the watchdog then exits 4 (late beats 1.6-2.1 s, 2-3 of them) |
+512 MiB is now a watchdog kill: a correctness failure (the daemon dies), so the step slicing moves up from
+performance. kiln r33 reruns 512 MiB x 3 capturing the watchdog's "spinning ... in task spawned at" line to name the
+step, then I slice that step under a derived bound (with the before/after for 320 and 512).
+
+## 12:45 PST: the 512 MiB exit 4 is the LOCAL submit's one step (w-work-cow's slicing), not A-826's holder route
+kiln r33 (main with A-826, big Studio, 512 MiB): the holder submit passed (2.33 s wall, owner step 622 ms, append 257
+ms, place 302 ms); then the bench's local submit (served in the owner shard's serve loop, daemon.rs:5243) spun 1193 ms
+of CPU against a 1025 ms window and the watchdog exited 4. That is w-work-cow's large-single-submit slicing; told it
+(inbox/w-work-cow-from-w-shared-320mib.md). The holder route still shows near misses on the control shard (polls 454,
+538, 883 ms against the 1025 ms window): the owner's step, append and placement in one piece. Slicing those, under a
+derived bound, is my next piece (no C/R failure open on the holder route now).

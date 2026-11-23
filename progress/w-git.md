@@ -442,3 +442,172 @@
     identity + finish_packed), hostile-record tests (move to v5 bytes), assert_a_head_nobody_sent (finish -> v5);
     then reader drops v1/v2 (record.rs decode; Record.objects/pack fields; replay_objects inline branch; git_replay
     pack_at; stepped()); then compile, focused tests, docs (A-822 + GAPS), land. Then the sliced change step.
+- 2026-11-21 evening: renumbered A-823 (P2 git half) / A-824 (piece 3) by main's ledger, LANDED 010fd1fd3. Part 2
+  LANDED 1a35ab091 (A-824): MadeAfter queue for committed versions' commits; v2 writer gone; v1/v2 refused
+  RecordRefused::Retired at replay (red t_a824_…); oracle on v5; queue turns forgotten on state drop (abort fix);
+  record holds kept through free (release_record_holds test-only until a destroy verb). Focused 557/557 + git 50/50.
+  Main is now kiln agent 01a1ff311fc972a8a0f720e354891538 (agents_send). NEXT (main's order): (1) refs to blobs and tag
+  objects refused (junio-gpg-pub, v1.0rc1..rc6), red first; (2) whole-clone "possible repository corruption"; (3) push
+  50-52 s vs 9.6-10.2 s, shallow clone 3.82 vs 0.90 s, A/B all rounds. Then the sliced change step (A-824 owed).
+- 2026-11-21 late: A-836 LANDED b61cdf8d1 (refs to any object: tag chains peeled, blob refs at the empty tree; t_a836).
+  A-824's sliced change step LANDED 9b46d364f (PreviewChange a slice a turn; t_a824_a_made_commits_map_…; counter
+  vcs_commits.made_map_turns). Piece 3 series DONE.
+  (2) whole-clone abort: w-sessionlog's red by use (inbox/w-git-from-w-sessionlog-clone-corruption.md): master + many
+  annotated tags of master commits aborts; master alone / + one tag clones. Not the refused refs. My unit red
+  t_goal93_a_whole_clone_of_a_line_with_an_annotated_tag_of_every_commit_is_whole (uncommitted, w-git-p2): 40 tags of a
+  line, encode to idle, fetch all: PASSES with flat blobs (41 versions in 5,191 turns: each tag's first version encodes
+  everything it reaches, O(tags x history) -- a perf/RSS finding to report); now trying delta-heavy content.
+- 2026-11-21 ~22:30 PST: main 01a20182 (session uds 23415.sock; kiln 01a201824d307ecc9e135c64ae3cb848) ruled bug (2)
+  YES as A-850 (claimed, pushed). Bug (1)'s cause (w-sessionlog rerun): Negotiation(PastAdmission{asked 7912, left 283})
+  -- the never-finished encoding holds the room. (1) after A-850; agree file split with w-balance (piece 3, resumable
+  admission) in writing first. Landed meanwhile: 39c36af9d, 03c0e2e14 (upload refusal counted+logged), 3e910809f.
+  A-850 RED written (uncommitted, w-git-p2): t_a850_tags_of_held_commits_bring_their_tag_objects_alone: 2,620 brought
+  vs 160 pushed. Design:
+  (a) store admitting.rs `unwalked`: `from` also found by peeling a tag chain (push or index bytes) to its target and
+      taking the green+version heading it.
+  (b) deriving.rs: a first version (!before) with a base brings indexed_alone(walk) (relative), reached = base u walk
+      (today brought = reached).
+  (c) record v6: each move carries its base (green key, version); SealedPush::record writes it; replay hands it to the
+      admission (no search); v5 refused typed (Retired like v1/v2? or Version). Recovery test replaying the base.
+  Runs (negotiation/one_round) start after a common version >= 0, so D(0) never enters a run: no plan change needed
+  for runs; fragments of v0 shrink to the tag object.
+- 2026-11-21 ~23:59 PST: A-850 LANDED a34a40909 (merge b099adee4). Main 01a20182's 22:40 ruling taken whole: a
+  create's or a rewrite's admission finds its base (A-753's, through the commit its tags peel to, else the search back
+  by generation to the nearest commit a committed version peels to: the peeled map, a commit a unit, counted
+  base_searched); D(0) relative to it (base less its own tags); record v6 names each move's base, v5 refused typed
+  `Version`, replay takes it (`Repository::based`, `StoreRefused::Base`); a push without atomic decided oldest commit
+  first (`receive::Judge::rank`, outcomes in the order sent). Red r16 shape t_a850_r16_… (1,012 commits, main + 506
+  tags sent by ref name, empty repo, one push): 3,542 brought = objects, each once; encoding 517 turns; fetch whole.
+  Red with ranking off: 9,557. Recovery: t_a850_a_recovery_replays_each_moves_base_from_its_record.
+  Focused: slates-git store (163+), receive/negotiation/upload 170/170; slates-server vcs_store/git_push/vcs_http::git/
+  daemon_edge/repository/git_hooks/git_protect/daemon t_a767 all pass but 3 not in git's path (repository::tests::
+  each_verb_moves_the_names_log…: "doubling rule's inputs say fold, yet no checkpoint was taken"; vcs_http daemon_edge
+  a_mercurial_push_larger… and a_mercurial_stream_clone_larger…), failing before and after merging main.
+  Left (GAPS): atomic pushes' moves meet no base among each other; a fetch's plan does not follow a base. NEXT: bug (1)
+  (a fetch cut short while the encoding runs), after the file split with w-balance in writing.
+- 2026-11-22 ~01:40 PST: A-855 (bug 1) LANDED 51e280aba (merge 81dc7ca3b). Cause measured: each edge admitted an
+  answer min(request room, shard room), the request room one client region = 32 slots x 2 x 4 KiB = 256 KiB (Studio-2
+  anchor log), shards with GiBs free; the walk's tables are ~148-165 KB for 506-1,019 tags of a line (unit probes), more
+  for git/git's history, so its clone outgrew 256 KiB -> PastAdmission after `packfile` -> abort. Fix: the answer is
+  admitted its repository's shard room (HTTP and SSH; the request body still the edge room); a refusal past it before
+  the pack begins is held (Answer::holding/held/written/skip_written/give_up), the HTTP edge makes it again in a wider
+  room passing over what it wrote (counted vcs_http.git.answered_again), gives up only past OBSERVE_BUDGET_NS.
+  Reds: daemon_edge a_clone_of_git_gits_many_refs… (quarter region, red: cut), a_fetch_past_its_room_waits… (red: ERR);
+  slates-git upload::tests::clone::a_clone_held_past_its_room…. Focused: slates-git upload+negotiation 120/120;
+  slates-server vcs_http/vcs_ssh/vcs_store::upload 166 pass + the 3 hg daemon_edge tests failing before this change too.
+  Left (GAPS): SSH edge's wait (gives up at once); a refusal after the pack began still cuts. NEXT (main 00:31 ruling):
+  encode_behind's memory (2.1 GB with no client), red first.
+- 2026-11-22 ~03:10 PST: LANDED (merge 0209973f7): 14974cfd3 (clippy: Sections::Died boxed, reach.rs's useless
+  conversion; GIT_CONFIG_COUNT=0 in git_correctness Git::run + CGI, winfsp_semantics, make-lfs-exchange.sh) and A-856
+  53f717ae7 (encoding parts charged; encode_behind only with a fetch live and within the learned grant; idle give-back).
+  Grant = slates_vcs::partition: min(room/repositories, curve usable) + marginal-utility lookahead; curve counts content
+  windows read (262,144 B here), so 262,144 = one window read, 786,432 = three: learned. Focused: slates-git store+upload
+  186, upload+reach 95; slates-server vcs_store/vcs_share/git_push/vcs_http::git 191, git_encode 3/3.
+  NEXT: item 1 (deferred build PastRoom regression + master lock, red: one-commit branch push), one wait mechanism with
+  w-hg (shared piece in vcs_share); then the clone pack-size gap (4 GiB vs ~300 MB); deflate reuse.
+- 2026-11-22 ~03:45 PST: LANDED 2d9626f25 (record version read from VERSION_LANDED in t_a727b/t_a767/t_c5b_p3/t_a724;
+  PushedHistory type alias) and A-857 61c15790b (DeferredPush keeps no room, record v2; a build runs within
+  vcs_share::room as built; past it waits via vcs_share::wait::RoomWait, shared with w-hg; red a_deferred_build_past_its_
+  room_waits_for_room_and_is_made). Focused: merge push 21, git receive 51, server repository/green_ready/vcs_share/
+  git_push 149, daemon t_a727b/t_a767 2. NEXT: main's matrix + git/git rerun (master "cannot lock ref" judged there);
+  then the clone pack-size gap (4-5 GiB vs ~300 MB); then deflate reuse; A-855's fetch wait onto vcs_share::wait owed.
+- 2026-11-22 ~04:35 PST: A-859 part B LANDED 6e795cf41 (merge 1721d8c52): pushed pack entries sent on as they lie
+  (fragments and the stream's loose stage), checked against the object's name first; deltified 17,299-byte push clones
+  in 20,858-20,916 (89,439 before). Also clone.rs A-855 test split (clippy). Focused: slates-git store+upload+
+  negotiation 217, slates-server vcs_store/git_push/vcs_http::git 171. NEXT: A-859 part A (a fetched byte priced at the
+  network, §4.11), then the recent-objects cache given back when idle (main 04:24), then deflate reuse.
+- 2026-11-22 ~05:05 PST: clippy splits LANDED f142f5853 (encoding.rs reused, upload.rs stream reused, clone.rs A-855
+  test); A-860 LANDED b51098de3 (merge 4af9997f8): an idle repository lets go of its recent-objects cache from
+  give_back_idle. Focused: git 217, server vcs_store/vcs_share/t_a859 143. NEXT (main 04:53): git_interop whole-repository
+  test prints each clone edge's pack bytes (slates, stock) and reuse counters; then the stored-pack order if it refuses
+  reuse; then A-859 part A; deflate reuse.
+- 2026-11-22 ~06:40 PST: A-859 stream counters LANDED 6ac1ee4be (vcs_store.git_upload.* on the shard; git_interop's
+  whole-repository round prints each edge's clone time, pack bytes beside stock's, and reuse counts, from a guard that
+  speaks on a killed clone too). A-859 order+reuse LANDED 3fa634049 (merge 2acbba249), per main's 05:38 sample/ruling:
+  a stored entry always reused (would_try gate removed); a delta's still-wanted base placed first (write_one) in the
+  stream and the encoding; the part's base lookup a map; Positions::next_from on a bit table from from's word (was a
+  scan from the table's start per loose object); reuse_no_entry and reuse_unread counted; StreamCount alias (clippy).
+  Reds: deltified clone 20/39 deltas then 117/160 encoded afresh -> 39/39, 0; encoding base-first 0/7 -> 7/7.
+  Focused: server 197, git 195. NEXT: main's git/git round reads the counters; A-859 part A; deflate reuse; the
+  upload/encoding hook for w-shared's read-through (Away windows).
+- 2026-11-22 ~08:20 PST: A-859 part A LANDED 52411acd9 (merge f2fdfa2a9): a fetched byte priced at its link (HTTP
+  writes that waited, per shard), cold at deflate's measured break-even p0 = d6/s6; written_bytes counted. Goal 93
+  item 2a driver hook LANDED 41b1e2b49 (merge c207cb0b1): packs made resident before a fetch and an encoding, a turn's
+  waiting window brought back; 2b(a)'s let-go must wait for no fetch live (told w-shared). NEXT: A-864 (claimed),
+  CRC32 reuse per main 07:31; then deflate reuse.
+- 2026-11-22 ~09:40 PST: A-864 LANDED 5f3ced8ea (merge 33797d4f7): rows keep each pushed entry's raw length, CRC32 and
+  base (git's pack index); reuse checks the CRC32 and copies, no object read; a miss rebuilt (reuse_crc_missed,
+  reuse_rebuilt). Reds: a864_a_clone_sends_each_... (3/3 rebuilt -> 0), a864_an_entry_whose_crc_misses_... Focused:
+  server 277, git 199. NEXT (main 07:31+): one-turn look-ahead residency in place of whole-pack resident, gauge of
+  peak resident windows; then deflate reuse.
+- 2026-11-22 ~11:30 PST: A-864 piece 1 LANDED 8dfa22349 (merge 03dfc4544): loose stage in pack order (88 backward reads
+  -> 0; clone = pushed pack's 17,299 B in 175 turns vs 403). Piece 2 LANDED 7a5ea782a (merge 27cae9bf7): a turn meeting
+  a let-go window stops cleanly, the next turn's two windows brought back ahead; a fetch no longer makes packs resident
+  (only a due encoding). NEXT: piece 3 (let-go behind the cursor, peak_windows gauge) on w-shared's let_go_read with
+  2b(a); then the encoding's look-ahead; deflate reuse.
+- 2026-11-22 ~13:35 PST: A-864 piece 2's encoding side LANDED f37113d45 (merge 1930df65d): an encoding unit meeting a
+  let-go window stops cleanly, its window brought back alone; no whole-pack residency remains. git_interop reports each
+  heavy step (main's r28: the plain clone killed past 120 s said nothing). Freed 2.8 GB of leftover .rcgu.o. NEXT:
+  main's run of the per-step print (plain clone's counters); piece 3 on w-shared's let_go_read; deflate reuse.
+- 2026-11-22 ~15:10 PST: A-864 piece 2 stall fix LANDED 06aa0e2ce and the LFS `.git` endpoint fix 985e378b5 (merge
+  8e2497cbf): stops are failure-driven and once a window (main's r29: git/git's clone stalled at 183 KB); git-lfs's
+  `<remote>.git/info/lfs` reaches the repository named without `.git` (main's r28 lfs row). The many-ref push red
+  (daemon_edge) is 2b(a)'s, settled by main (green at 7240125cf), w-shared fixing. NEXT: piece 3 on let_go_read
+  (646de255c), peak gauge; deflate reuse.
+- 2026-11-22 ~18:30 PST: A-864 readers + piece 3 + bring-back bound + guard lift LANDED 0fefc86e2 (merge 01ae9fc26):
+  answers before the pack held for a let-go window and made again once it is back (HTTP, SSH; creation too); windows
+  let go behind a fetch's cursor; vcs_store::commit lets the landed pack go again. w-shared's annotated-tags red green
+  (1,115,127 B let go). Focused: server 361, git 202. OPEN: git/git mirror stall at 183,511 B (before the pack, with
+  the guard in; main's sample pending); push decision reads; LFS object 404; mirror pack 554 vs 218 KB (made_whole).
+- 2026-11-22 ~19:10 PST: guard put back LANDED 6692d6f24 (main's ruling): commit lets no landed pack go until the
+  synchronous readers read through: (a) green_ready via views (w-shared), (b) push thin bases via IndexedObjects and
+  (c) policy/signature reads (mine, ~3 h). Fetch-side readers stay. NEXT: (b)+(c); LFS on main's trace; stall on
+  main's sample.
+- 2026-11-22 ~22:30 PST: LANDED (merge 77b4cb33a): push reader (b) 17d27ced5 (thin bases in let-go windows stop and are
+  brought back; (c) covered by (a)+(b), test kept); codex-review's upload admission fix 28f9ead8d (a retaken loose object
+  is not charged again); LFS 482f51fb0 (PUT routed to git's site, not svn's WebDAV; a download admitted the shard's
+  room); work-clone quadratic 9bf74aff4 (Kept::runs counted once; kept_fragments O(versions)). Guard stays until main
+  says (codex-review's two w-shared readers). NEXT: main's Studio rerun of the lfs row and git/git whole.
+
+- 2026-11-22: A-868 deflate reuse LANDED bdf54c675 (one deflate state a shard thread, reset + set_level, given back
+  on drop, MOST_KEPT 8, let go idle; red 72 made for 42 objects -> 1 made 71 reused; server red 10 -> 1/9). Guard lift
+  attempted on main's word: 30 server lib tests red (test harness readers read let-go windows directly since 2b(b)
+  unpinned audit shards); patch parked ~/.cache/w-git-guard-lift.patch. NEXT (main's order): deepen-by-one bug
+  (git_interop.rs:2400), lfs_row test fix (lfs filter config on the clone), then the lift with harness bring-back.
+
+- 2026-11-22: r115 deepen LANDED 80586ec3e (merge 9ca9598c5): the session's repository kept default branch main
+  against git/git's master, so the work clone began unborn and its commit was a root; repository now made with the
+  source's default branch, red "the work clone checks out the source's tip" (left ""), green HTTP+SSH on a small
+  dataset; server deepen guarded at the edge with stock git 2.50's exact request. Clippy checked_div d616218c8;
+  lfs_row filter config 4db1a5e4d (merge 8e5ea5489; no git-lfs here, main's r144 runs it). GUARD LIFTED 76d8804c3
+  (merge 814aa4bd3): red a_pushed_pack_is_let_go_once_its_push_ends_and_a_clone_after_is_whole (0 bytes with the
+  guard); 31 harness reds (sync store calls with no bring-back) fixed by homed_drive bringing back and
+  KEEP_LANDED (cfg(test)) for synchronous audit histories; pre-existing on main: daemon t_c1_windows_let_go_survive_
+  warm_restarts and svn_commit a_revision_refused_at_publication. Lint split packed.rs:628 50dd194b6.
+  NEXT: main's r144 (lfs_row, verbs deepen row, git/git whole) and the lift's round; GAPS owed: SSH edge's link-price
+  writes, a price per client.
+
+- 2026-11-23: LIFT REVERTED 5d9e81984 (main's r165: git/git mirror clone after the push refused
+  Pack(Store(Unreadable)) at 16,270,345 bytes, deterministic). CAUSE FIXED 0c3f42cea (merge 9ea044028): the fetch
+  stream's reads of an object where it lies (read_stored: made-whole entry, encoded afresh, delta check, search read)
+  refused a let-go window mid-pack; Upload::read_or_stop stops the turn and retakes the unit. Reds over the ofs fixture,
+  every window let go: made-whole (Unreadable at 0 stops before), encoded-afresh (after 5). Guard still in; re-lift is
+  main's call after a round. Owed: encoding's Reading::read_window (no red yet); the push-end let-go is one unsliced
+  step in ReceivePack's drop (r165 push 25-69% slower with the lift; main to time). SSH link price built, parked
+  (~/.cache/w-git-ssh-paced.patch) pending w-svn's yes on the svn.rs EitherCommand forward.
+
+- 2026-11-23: main's items 1-3 LANDED. (1) let-go sliced off the owing step 3e1588a54 (merge 96cf4a0a7). (2) every
+  read of a let-go window stops, the stream's delta/search/rebuild reads and the encoding's object read and reuse
+  check, under direct-state reds (REUSE_OFF/KEPT_OFF/NO_REUSE switches); slices ended by the quantum alone; R3
+  MOST_KEPT gone, REUSE_COUNTED named: 7f7793c58 (merge b846c8ded). Correction told main: 0c3f42cea's message named
+  the delta/search stops before they were saved. (3) RE-LIFT faafa5651 + test fixes c6dd9473d (merge 4c8b391ec):
+  LANDED_LET_GO on; reds over HTTP (whole + shallow) and SSH (whole + shallow, window-adjusting client), 0 bytes let go
+  with the switch off. Full server lib 1236/1238 (content_ranges timing, svn_commit NotHeld: pre-existing).
+  NEXT: main's git/git whole + verbs A/B on the lift; SSH link price parked (~/.cache/w-git-ssh-paced.patch) pending
+  w-svn's yes on svn.rs EitherCommand::paced.
+
+- 2026-11-23: SSH link price LANDED 78477663c (merge df307829b; svn.rs EitherCommand::paced forward agreed with w-svn);
+  reds: late-reading client's writes heard (0 before), the svn wrapper forwards (lost before). Sliced let-go test
+  made load-proof 4fc1cea9d (merge 0ffbdb5ef): judged by the shard's own SliceTrace, not the test's wall time; red 1/6
+  under 16 spinners before, 6/6 after. Reran on w-shared's A-870 piece 2 (a9c4e7190): 426 green. NEXT: main's r222
+  (git/git whole A/B on the lift, then verbs) and the restart read-back row (w-shared votes read-through).

@@ -357,3 +357,304 @@
   reference(seq)}); refusal: batch.abandon + vcs_store::rebuild + release storing; (4) svn readers refused while
   importing (as hg_view.rs:346). Tests: imports export byte for byte, register names few changesets, recovery equal,
   crash before commit leaves nothing.
+- 2026-11-21 ~10:40 (date clock): P7 (3) / C2 stage C records side LANDED as A-822 e2410cb8b: an import lands batches
+  (one changeset + one register entry each, bounded by the import's admission, counted by cause), atomic (differs from
+  svnadmin load: a refusal names the last landed revision, SubversionLanded, contract 59; the same dump resumes,
+  reading held revisions through), no svn session while importing, ImportBatch::stage renumbers Copy ops. Owed: main's
+  git-2000 re-measure (time, peak), the A/B for A-820, the heap attribution for (2). Then (2), then KeptText.
+  Seen under load ~30: vcs_svn hook tests flake in the full suite, pass alone (15/15 in 4.7 s).
+
+## 2026-11-21 ~14:40 PST — A-835 landed (e15e87490, merged to origin/main as c5e157467; base 8fb2e33db)
+(b) and (c) of main's 12:43 ruling on the A-822 watchdog kills. A recorded import batch is applied to its green a
+slice a turn under the shard's quantum (push::RecordedBatch::apply_slice, counted repository.import_batch.apply_slices),
+the landing turn and the import's read gate held to the last slice; a recovered Subversion green folds to its readers'
+floor (vcs_store::remake_greens). Crash test: kill at every slice boundary (0..4 of a 13-version batch, 3 a slice),
+recover, resume Ok((0, 13)), byte-identical export, green folded to (13, 13). Red checks run: without the fold at
+recovery it fails (folded (0, 13)); with the slice deadline taken out the 400-revision batch applies in 1 slice and
+fails. Focused tests 99/99 on the merged tree 10760328f. Still one step a batch: append_versions' pre-record loop
+(w-rewrite-ops', inbox/w-rewrite-ops-from-w-svn-a814-sliced-commit.md) and follow/fold/release after the last slice.
+Next: finding (2) re-measured on the merged tree; main runs git-2000.
+
+## 2026-11-21 evening PST: the KeptText move is done (main's 10:35 item 3, go at 14:52)
+- Piece 1: 41ce54f67 (merged 270df0d72). `migration::Standalone`, records standing alone with their texts held apart.
+  `Repository::take_texts` moved from the server. The migration tests run on it.
+- Piece 2: e465b0e0c (merged dba4ae793). Moved onto it: `fsfs_view`, `propfind_allocations`, `replay_bench`,
+  `fsfs_view_bench`, vcs_ssh's svn tests, and the presenter's tests (texts in a content store).
+- Piece 3, A-842: cc55404fa (merged 2ed0eec43). The records keep no text: `KeptText`, its delta chains and window
+  reads are gone. A text carried inline is refused `Corrupt`. A replay is two steps. `changeset_ab` is retired.
+- Tests: svn lib 584/584, `fsfs_view` 5/5, `propfind_allocations` 1/1, server `--lib svn` 113/113.
+- For main:
+  - Run request: the stock svnadmin/svnlook reading of the all-PLAIN FSFS view (`fsfs_view
+    stock_svnadmin_and_svnlook_read_the_view`, svn 1.15 host).
+  - Their call: the view's DELTA writer has no source now (remove it, or feed it derived deltas).
+  - The ignored git-2000 measurement's column is renamed `records_stored_text_bytes`.
+- Still waiting: main's r2 git-2000 re-measure of A-835, for finding (2).
+
+## 2026-11-21 ~22:30 PST: main 01a20182's 21:35 rulings done
+- The FSFS DELTA writer is removed: 792c62308, merged 235d62418.
+- w-balance has leave for A-724 piece 3 in my files (`inbox/w-balance-from-w-svn-admission.md`).
+- Main runs the stock fsfs_view leg (big Studio) and the git-2000 re-measure of A-835. Waiting on them for finding (2).
+
+## 2026-11-21 ~23:50 PST: finding (2), attribution under way
+- r10's lines: heap 1.49 GB in use after the import; segment and content kinds near zero.
+- But the daemon has 1.30 GB of heap allocated before any import (smoke, RSS 84 MB), so the heap figure is mostly its
+  startup allocation.
+- In-process probe (local, uncommitted, in svn_import/tests.rs): 400 rewrites of a 256 KiB file, a 105 MB dump.
+  - RSS 179 MB before, 867 MB after.
+  - Live owners afterwards hold almost nothing: the green its head, records 24 KB, content store empty, no volumes.
+  - The chunk arena holds 317 MB after the import, given back within 1 s of idle; RSS stays 789 MB.
+  - macOS RSS keeps MADV_FREE_REUSABLE pages, so the footprint is the true figure.
+- Landed: `an_import_measured` samples status --memory, RSS and footprint (via top) before, after, and 2 s and 30 s
+  into the hold. 4bc541ca5 and c74f35cc1, merged 78e584f18.
+- Waiting: main's git-2000 run of it. Then the red test, on footprint after an import and an idle tick.
+
+## 2026-11-22 ~00:35 PST: the HTTPv2 revprop red is fixed
+- d843d2325, merged 946e39c22: the edge serves PROPPATCH on !svn/rev/N and !svn/bln/N, judged by the shared
+  RevisionPropertyChange path, with both revprop hooks and the landing turn.
+- Main's r6: fsfs_view's stock leg GREEN.
+- Waiting: main's rerun of stock_svn_over_httpv2_answers_as_stock_svnserve_byte_for_byte, and r11's finding (2)
+  blocks. My finding (2) probe is still local, in svn_import/tests.rs.
+
+## 2026-11-22 ~01:20 PST: finding (2), cause found
+- Main's r11 (git-2000, release): physical footprint 43 MiB before, 527 MiB at 30 s idle, 484 MiB held.
+  - Live heap +104 MB; arena 51 MB.
+  - Malloc's freed-but-kept memory +846 MB, the bulk.
+- Reproduced in debug with a 100 MB dump: 363 MB held at 30 s.
+- With A-742's large-path floor lowered from 64 to 4 pages (experiment, reverted): 47 MB, at baseline. The import was
+  slower, 19.4 s against 12.0 s.
+- Asked main to rule: (1) rederive the floor, (2) cut the import's sub-1 MiB churn, or (3) both.
+- Filed: content.purged_bytes keeps climbing during idle.
+
+## 2026-11-22 ~03:45 PST
+- The HTTPv2 `svn log` red was the test's comparison: stock svn writes XML attributes in a random hash order, even
+  against svnserve. Sorted, the outputs are identical. Fixed in 0de4c75ea; main's rerun is requested. The hang after a
+  panic is not found (asked for a `sample` of the process if it recurs).
+- Finding (2): attributed by allocation site; about 15 copies of each text.
+  - b1efa8edc (merged 9c662576f): my three cuts, and the red. `an_import_measured` gates the idle footprint at 2x what
+    is still live; it is red.
+  - The rest is routed to main for the other owners: content store, engine, push, store owner.
+- Local only: the attribution probe in svn_import/tests.rs (a test-only global allocator), not landed.
+- Waiting: main's routing, git-2000 rerun, and HTTPv2 rerun.
+
+## 2026-11-22 ~01:25 PST: SlicedLanding::part's copies cut (main's routing of 00:57)
+- 2a8dbcd99: the owner gives each part's buffer back; the svn landing fills one buffer a landing. Red first.
+- Store owner tests 5/5. Server svn tests 113/114: a DAV hook test flaked on a WouldBlock read at load 74, 3/3 alone.
+- Checked first: w-hg holds no unlanded store work.
+- Waiting: main's r18 git-2000 attribution, and the HTTPv2 rerun at 0de4c75ea or later.
+
+## 2026-11-22 ~03:00 PST
+- f301b9f0d: the measurement's footprint read retries a miss, and its bound allows top's 1 MiB resolution.
+- 8db529eec (merged 059578d78): the revprop test's flake was the hook runner. A hook that exited on its own before its
+  kill was timed out with its own code 0; it is now judged by its own exit. The DAV refusal answers its chain's best
+  message.
+- A sibling flake remains: a first-run hook's words pipe inherited by a concurrent spawn. Asked main to rule:
+  (a) no inherited fds, (b) end the drain when the hook's group is empty, (c) both.
+- Waiting: that ruling; the HTTPv2 rerun at 0de4c75ea or later; finding (2)'s routed copies.
+
+## 2026-11-22 ~03:45 PST: A-858 landed; clippy findings fixed
+- A-858 (main's ruling (a) and the guard order of 03:22): bd94fed6f, merged as 9b1b4ccdf.
+  - Every child the daemon spawns goes through `slates_ipc::confined_spawn` (posix_spawn, CLOEXEC_DEFAULT on macOS).
+  - The hook driver rereads `waitid` after an exit note the kernel posted early.
+  - The svn_interop guard unmounts its views before it stops its daemon.
+  - Red first: 32 hooks at once, red 2 of 3 on the old driver; 20 of 20 green after.
+- Clippy findings: 2d65eefbf (the commit_side split) and 00844de07 (confined_spawn's records own themselves, no
+  mem::forget). The unsafe budget for slates-ipc is now 159.
+  - All 12 sites are posix_spawn FFI, which rustix does not wrap; the waits and the group kill already go through
+    rustix.
+- Main pushed the macOS proof, diag-measurer-w-svn-858 at afa560c26, as run 45018545878. Main's clippy rerun is
+  45018575168 at 16489f046.
+- Waiting on main for:
+  - those two results;
+  - finding (2)'s routed copies (w-multirepo, w-engine, w-shared), then the git-2000 re-measure.
+- Red on run 45018545878 would be a new piece for me: the propset hang still there (its sample shows the wait), the
+  guard test failing, or a view left mounted.
+
+## 2026-11-22 ~04:15 PST: put_window's churn cut (main's routing of 03:46)
+- 840daa24d: `ContentStore::begin_object_of_length` reserves a text's window buffer once; svn's `store_step_from` and
+  `bring_whole` use it. Red first.
+- Local attribution: 97.5 MB in 400 allocations → 26.2 MB in 100; the band's churn fell from 10.7 to 8.0 times the text.
+- Tests: slates-vcs content 20/20; slates-server --lib svn 113/113.
+- Noted for w-multirepo in `inbox/w-multirepo-from-w-svn-begin-of-length.md`.
+- Item 2 (the daemon breakdown) is on hold: w-shared's `slates status --memory` gauges come first, then
+  an_import_measured prints them.
+- Waiting on main: r12's git-2000 number; the macOS run 45018545878 and the clippy run 45018575168.
+
+## 2026-11-22 ~04:35 PST: the refused put's leak and the status red (main's rulings of 03:55)
+- macOS proof (main's CI 45018545878, at 00844de07): the propset hang is gone (33.57 s, against 120 s before), and
+  the guard left 0 views mounted.
+- 7c53d589c: a text refused part-way through its put leaves the store as it was. The writer now stays in `Storing`
+  until finished, the fix by construction. Red: 8 entries, 2 MiB left held. svn 113 → 114/114.
+- 738b4e0af: the status red was the test's. Stock svn reports a directory's children in hash order;
+  `entries_in_order` compares a status's entries in text order. Red first. Checked against the run's own outputs:
+  equal once compared.
+- The diag branch merged up to 738b4e0af locally (272513fe4, ~/slates-work/w-svn-diag), unpushed. It's main's to
+  push.
+- Waiting on main: the macOS rerun; r12's git-2000 number; w-shared's gauge names for item 2.
+
+## 2026-11-22 ~04:35 PST: svn over HTTPv2 closed by use
+- Main's CI 45021179639 (macos-latest, Homebrew svn 1.15.0, at 272513fe4 on 738b4e0af):
+  stock_svn_over_httpv2_answers_as_stock_svnserve_byte_for_byte 1/1 in 33.54 s; the guard left 0 views mounted.
+- Recorded in GAPS in 0235c0134.
+- Waiting on main: r12's finding (2) reading. Item 2 waits on w-shared's gauge names.
+
+## 2026-11-22 ~04:55 PST: r12 still red; item 2 landed
+- r12 (main, at 1721d8c52): 181,750,880 B not given back against 155,539,920 B live; r4 had 150,287,136.
+- 8df631d3c: `an_import_measured` prints w-shared's `mem.gauge.*` rows summed over the shards at every reading, and
+  the footprint past system live + mapped resident + arena. Red first; svn_interop `the_` tests 7/7.
+- Raised with main: the gate's "live" is the heap's in_use growth, which counts untouched bytes (1.30 GB at a 44 MB
+  footprint). The gauges will show whether it overstates live.
+- Waiting on main: r13's reading, then the node_record streaming cut if the holders point there.
+
+## 2026-11-22 ~06:30 PST: A-862, the import's texts streamed (main's order of 05:28)
+- f159578c3: `Importer::import` takes the commit drive's `TextSink`, and each text goes into it a piece at a time as
+  the dump is read, named stored. The daemon's sink is the content store; its holds go to the landing.
+- Red first: `an_import_holds_no_text_whole_on_the_system_heap`, 8 × 512 KiB. The system-path churn was 4,299,277 B at
+  2bb00e1cc and is 92,309 B now.
+- Tests: svn lib 585/585, the svn import tests 7/7, server svn 114/114 (on the merged tree too), store_tests 10/10.
+- Filed: main's gauged an_import_measured over git-2000 (run-requests.md).
+- Next, per main: the next-largest per-text churner given a buffer the import owns, reused.
+
+## 2026-11-22 ~07:40 PST: r16 read; the post-state cut (main's 06:01 routing, 06:28 request)
+- 73e46f842: the batch's admission charges a revision's texts once. Since A-862 they're already in the content store.
+- bb0802fb8: an increment's post-state is sized once by its texts. Red first: 6,000 bytes held for 5,000, now 5,000.
+  The due_before unit red is folded in: 22,220 under the old charge against 11,220.
+- In-process sampled attribution (500 files, 300 revisions, 11.65 MB dump): 168.9 MB allocated at 2bb00e1cc,
+  156.6 MB with A-862, 142.3 MB with bb0802fb8.
+- r16's daemon doubling isn't reproduced in-process. main queued the daemon A/B (2bb00e1cc vs 73e46f842, interleaved)
+  as r18.
+- Tests: server svn 116/116 on the merged tree; slates-vcs content 20/20.
+- Next: r18's verdict, then the next churner. Mine left: the sink's window buffer, one a text, to be reused by the
+  import. The rest are the engine's and the content store's.
+
+## 2026-11-22 ~11:00 PST: the sink's buffer reused; the splice cut held; A-760 proposed
+- 1a882f47d: the import's sink keeps one window buffer for all its texts (`ContentStore::begin_object_reusing`).
+  Red first. Sampled: 142.3 MB to 130.7 MB.
+- r18 (main): A-862 is innocent. r16's doubling was the machine; both bases leave about 560-600 MB not given back.
+  r12's base, 1721d8c52, is under r19.
+- Held uncommitted, awaiting main's ruling: `engine::apply` sized once (`made_len`). Red proven, but dead even
+  (130.7 to 130.8 MB): an import replaces files whole.
+- Proposed to main: the svn landing names its stored texts as A-760 named runs, removing the post-state, make_mapped
+  and encode copies, instead of shaving judge_held and encode one by one.
+
+## 2026-11-22 ~11:40 PST: A-760 named runs for the svn landing, (a)+(b) as one (main's rulings of 11:05 and ~11:35)
+- 91495a96a landed: the splice is sized once (`made_len`). Partial splices: 43,945,798 B to 21,594,432 B.
+- Ruling (i): a named svn run the content store lacks at replay is brought back from the node's changeset store
+  (A-863's Away wait, the owner's `svn_texts::bring_whole`). The bring-back stays on the cold path, counted, and is 0 in
+  a run with no crash.
+- Invariant to state in the module doc, with where it is enforced: an entry naming a text commits only once the
+  Payload holding that text is durable.
+- PLAN (consumers of a built svn increment):
+  1. `svn_commit::Building`: a stored text named as a `NamedRun` (`push_named`); op srcs patched after the inline bytes
+     are complete, before `doc.canonicalize()`. Red: a counter of stored-text bytes copied into the post-state reads 0.
+  2. Read the runs in the build step (`read_step` over `named_objects::PlaneObjects`), counted.
+  3. `ImportBatch::stage`: judge with `judge_named` (a new engine `submit_named`, `&mut`), so the buffers become files.
+  4. `RecordedBatch::apply_slice` (push.rs ~506): read the step's runs again before `apply_recorded`. The texts are
+     still held until the batch's release. Piece (c) would adopt the scratch member's files instead.
+  5. The client commit's `land` (svn_commit ~1286), via `version_of`, and `land_made`: read, then judge as they do.
+  6. `verbs.rs` ~20399, the replay: on ObjectMissing for a svn green's run, wait as Away; the owner brings the text back
+     with `bring_whole`, then reads on. Also check `verbs.rs` ~10715's `apply_recorded`.
+  7. Reds: the entry's size independent of its texts; crash oracle killed (1) between the texts' landing and the
+     entry's commit, and (2) between the entry's commit and its checkpoint; the bring-back count is 0 without a crash.
+  8. Sampled number on the tree dump, sent to main for the daemon A/B.
+- Rulings (main, ~11:50): take the pre-pass in the svn green's recovery. It brings back only the named runs of entries
+  past the checkpoint, sliced a text a step, its bound stated. The append's `judge_named` is its own landing after
+  (a)+(b): red = 0 cloned read bytes; tell w-git and w-hg first.
+- ORDER FOUND: `verbs::rebuild_recovered` replays the greens (`rebuild_records`, ~19259) BEFORE the repositories'
+  stores (`vcs_store::recover`, ~19300). `bring_whole` needs only `vcs_disk` and a content store, not the svn records,
+  so the pre-pass goes in `rebuild_record`'s Green arm for an svn green: make the content store, then bring back.
+  Verify `content_made` can run there.
+- 39c2b8b07 landed A-865, A-760's pieces (a)+(b) for the svn landing.
+  - Increments name their stored texts; entries record names.
+  - Recovery's pre-pass (`svn_texts::bring_back_named`) brings back what the content store lacks.
+  - Sampled 130.8 MB to 108.0 MB.
+  - Reds: 5,000 bytes inline before; the kill-between-slices successor fenced ContentMissing before; region holds are
+    kept on the early store.
+- r21 (main): 3c1c8b504 (w-shared's gauges) raised the footprint not given back. w-shared is fixing it.
+- Next: the append's `judge_named`, its own landing, with w-git and w-hg told first; then piece (c).
+- 43a6df642 landed: the shared append judges with `judge_named`. A named work's read buffers move into its verdict:
+  50,000 bytes cloned before, now 0. Reuse after a refused append is impossible by construction (append takes its
+  changes by value). w-git and w-hg checked and are clear.
+- Next: piece (c), the batch's commit adopting the scratch member's files instead of re-reading the runs.
+- r29 (main, big Studio): 43a6df642 passed the give-back check 2 of 2, at about 300 MB of footprint. main later found
+  the give-back reading bimodal on every arm (r39); two rounds aren't enough to judge.
+- Piece (c) as a swap was ruled out (w-engine's fast-forward, paused).
+- 4142eb60e landed option 2: `Green::apply_recorded` takes its work mutably and moves a whole run's re-read buffer
+  into the file. Red: the file was a copy. Sampled 108.0 MB to 96.2 MB.
+- Tests: slates-merge all 17 targets; svn 118/118 (three named runs; quiet runs twice stopped by the watchdog at load
+  42-82); git_push, hg_push, store_tests, made_commit green.
+- Left per text: two `read_step`s (the batch's re-read would go with w-engine's fast-forward); the content store's
+  `release_one` copy (w-shared's).
+- a5aa2d576 landed: `ContentStore::release` answers `Freed` (Held, Gone, or Table(bytes)). A freed window is never
+  read back out of its storage. Red: 5 windows read back, now 0. Sampled 96.2 MB to 84.3 MB. w-shared was told first.
+- Found: the afternoon's watchdog stops in the svn and vcs_store suites were my own uncommitted local probe
+  (`finding_2_probe_what_an_import_leaves_held` spawns `ps` blocking on the shard), not load. It's #[ignore]d locally.
+- Left per text in-process: the two `read_step`s (~11 MB each); the batch's re-read goes with w-engine's paused
+  fast-forward.
+- Main's 17:00 rulings:
+  1. The DAV flake is mine; neither sighting ran my probe.
+  2. Then A-760's items 3-7: the green's block names the plane's object. One item a piece, each with an oracle
+     against `apply_recorded`. The engine work is mine while w-engine is paused; tell w-perf when I start.
+- The DAV flake, diagnosed. w-git's line: `daemon_edge.rs:408:16` at ~27cae9bf7, the test reader `line_of`: the
+  client's read gave up waiting for the PROPPATCH answer.
+  - Cause: the hook's pipes are `std::io::pipe()` (`hook_driver.rs` 224-227); on macOS close-on-exec lands a call late.
+  - The in-process test binaries spawn stock clients with `std::process::Command`, not `confined_spawn`. One lands in
+    that window and inherits the hook's words write end.
+  - A first-run hook has no deadline, so its drain waits until the client leaves.
+- Proposed to main: (b) end the drain when the hook's process group is empty, red first with a plain std child
+  holding the pipe; or (d) confine the tests' spawns. Awaiting the ruling.
+- f974b5b13 landed: a hook's words end once nothing of the hook's can write them. The check is
+  `slates_ipc::group_holders` (`proc_listpgrppids` on macOS; Linux and Windows' atomic pipes answer that others may
+  hold it). A setsid child counts as a foreign holder. Red: 4.15 s held, now ends at the hook's exit. The DAV flake is
+  closed.
+  - GAPS, OPEN: a first run's missing deadline. The macOS close-on-exec sweep, by file and line, is reported, not
+    fixed.
+- Next: A-760 (b), items 3-7 (the green's block names the plane's object). Tell w-perf when starting.
+
+## A-866 LANDED d386763ba (merge 275183739), 2026-11-22: A-760 (b) piece 1 of 4
+- A block made whole of one named run spanning its object keeps the object identity (`Green::name_of`), through
+  judge_named + make_step + commit and apply_recorded alike. No memory change.
+- Oracle `engine::named_tests::a_file_made_whole_of_a_named_object_is_named_for_it_until_changed`: red first
+  (`left: None`); census moved 355, shared 20, changed away 143, kept 87, stepped 210. slates-merge --lib 276 passed.
+- Plan: inbox/main-from-w-svn-a760b-plan.md. w-perf told: inbox/w-perf-from-w-svn-a760-items.md.
+- NEXT (main starts it): piece 2, a checkpoint naming a named file instead of its bytes.
+- Run request for main: clippy -p slates-merge --all-targets (the lib change and the new test).
+
+## 2026-11-22 evening: main's reds, in its order
+- clippy large_enum_variant (A-866 grew Judged to 288 B): FileMaking boxed, Judged 224 B. Landed 8c9e71649 (merge
+  28ec7c89d). Rerun asked.
+- codex cold copy: bring_texts asks holds_whole, not contains. Red a_subversion_copy_from_a_stored_revision_reads_a_window_that_was_let_go
+  (Err(Unstored) -> Ok(3)). Landed (merge 1010c7e7e). Bug record docs/bugs/2026-11-22-a-subversion-copy-refused-...
+  Siblings NOT changed (reported): svn_texts::named_lacking (recovery pre-pass) and svn_presenter's bring-back, both `contains`.
+- codex bring room: finish_brought abandons its writer on a refused finish. Red a_refused_subversion_text_bring_returns_its_completed_windows
+  ((262144, true) -> (0, false)). Landed bc026ec5a (merge 96e6f2170). Sibling NOT changed: hg push/intake.rs:1276 (w-hg's).
+- A-760 (b) piece 2 WIP set aside as ~/.cache/w-svn-wip/a760b-piece2.patch (checkpoint named table, codec only); resumes next.
+- contains siblings fixed (main's order): named_lacking + svn_presenter ask holds_whole. e5cdfda3f (merge 35657c523).
+  Reds: codex a_subversion_restart_replays_a_named_text_with_one_released_window; mine
+  a_hook_view_brings_back_a_stored_text_whose_windows_were_let_go (test_store::a_text_whose_windows_are_away).
+- shuttle_green ContentUnread arm (E0004 in the nightly lane): 3241ae61e; compiles under --cfg shuttle.
+- NEXT: A-760 (b) piece 2 (patch at ~/.cache/w-svn-wip/a760b-piece2.patch).
+- named_tests lint fix (7 errors): aca97583a. confined_spawn macOS test allow: cb2a660bf. svn copy test message: e9b2797f3.
+## A-869 LANDED c14f88038 (merge bb4551eff): A-760 (b) piece 2, checkpoints name files
+- Checkpoint::named section (version 5 kept, old ones read as before); read_step a slice a step; restore refuses unread
+  typed (Unrestored). Recovery: GreenReplayPhase::Restoring; pre-pass brings back checkpoint names; replicas refuse
+  (merge.replica.checkpoint_unread). Clean-restart test waits for the deferred checkpoint (w-hg's flake).
+- Oracle with restores: 113 restores / 148 caught up / 131 by name; red first. Codec golden + hostile + read tests.
+- Run request for main: the register split (A-746's row: checkpoints MiB) on the 1,000-revision svn import, before
+  (c14f88038^) and after; clippy wall over merge + server.
+- NEXT (main starts it): piece 3, the history keeps a named version by name. OWED: copied tables still carried.
+## 2026-11-23: remake NotHeld red (from A-869) fixed: cf1529f1d (merge 08854f773)
+- remake_green keeps the named texts the plane lacks from the engine it replaces (Green::bytes_named); replay reads
+  plane then kept (ReplayObjects). Bug record docs/bugs/2026-11-23-a-refused-publications-remake-....
+- Sibling reported: takeover adoption replay has no pre-pass (latent since A-865).
+- Reaper: freed 3.4 GiB (target objects + test executables 2.76 GiB, old logs/dumps 639 MiB).
+- NEXT: piece 4 under main's ruling (I): 4a identity digest + named::Identity plain BLAKE3 + goldens + layout bump.
+- Re-adoption bridge (main's (a)): 9a868c263 (merge 5fc5c9ed5). One planner svn_texts::to_bring; bringers bring_whole_in
+  (recovery) and bring_whole (bring_back_named_live); green_adopt::readopt_with. Red: a_readopted_green_brings_back_...
+  End to end unreachable until A-727 (d) (w-shared's; told the entry points).
+- NEXT: piece 4a (identity digest), under main's ruling (I).
+- Helpers lifted to test_store (for w-shared's A-727 (d) fleet reds): eaf17a862.
+## A-873 LANDED 75250d9c3 (merge 9dbc985dc): A-760 (b) piece 4a, identity entry hashes a file's digest
+- Block keeps plain BLAKE3 digest (named: identity hash); entries from blocks; history/old bytes hashed as read;
+  scratch oracle hashes bytes. Goldens: tests/identity.golden + ignored writer + determinism gate; named == carried.
+- Anchor layout 19 refuses 18 typed. Side finding withdrawn: object_id is plain BLAKE3 at every length (doc fixed).
+- NEXT: 4b (one read seam Bytes|Named), w-git and w-hg told first.

@@ -1,0 +1,1 @@
+g222, 2026-11-21 22:36 PST: free for a goal-93 piece. Nothing of mine is unlanded or in flight. 84a Linux went to g220 at 21:48; I handed it my diag branch, scripts and traps (inbox/g220-from-g222-84a-linux.md), and I'll answer its questions.

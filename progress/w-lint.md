@@ -349,3 +349,130 @@
   then the server reds hg's had hidden: svn restore push_children, commits Before::Landed boxed, svn_commit tests
   GreenTree + get(). Tests: hg getbundle 20, git works 9, merge byte_places 2, server svn_commit 30, commits 12.
   Host, fmt, literals, structural, unsafe, the six cross targets clean. real_tools (r29) still queued for jupiter.
+
+## 2026-11-21 round at 6a6e35215 (landed dc5ab18f5, then the A-805 test fix; main a9a2393b8+)
+- server judged_submission split (increment_held, chain_room_admitted, retention_secured, verdict_span_emitted,
+  accepted_answer); hg ManifestWrites; merge chain_replay, server green_post_state, cli by-reference test splits; four
+  literals. Then A-805's merge tests (copy_tests view_of `?` with `failed`, identity.rs harness unwrap_used + get +
+  Viewed). Host, fmt, structural, literals, unsafe, the six cross targets clean. real_tools (r29) still queued.
+
+- 10:40 main (01a1ff2e): give_up stays annotated until w-git C5 2b piece 3 lands; re-check give_up on the first round after it. r29: report to main only if red. w-sizing and w-reaper told by main.
+
+## 2026-11-21 round at 67fa7f75a (landed 5216ce4e2, main 5216ce4e2)
+- Reds (host clippy): hg intake.rs take 11/10, intake_tests.rs kept-text test 11/10, vfs volume.rs destroy 11/10 (A-827),
+  then vfs tests/held_head.rs 19/10 + type_complexity. Split into note_logged, kept_bytes_are, kept_dead, imaged_as_held,
+  held_bytes; HeldFile alias. Focused local: hg push:: 60/60, vfs held_head 2/2, vfs destroy 8/8.
+- fmt, structural, literals, unsafe, six cross targets clean.
+- w-sizing moved A-789's _on_windows CLI tests into content_extents_windows.rs (#![cfg(windows)]), so that item is closed. Host clippy clean.
+- Windows-only (xwin, slates-cli's build): server verbs.rs:3020 run_recorded 11/10 -> w-hg; vcs_store/svn_import.rs:506
+  14/10 -> w-svn. Owners told in their inbox files; not edited (goal-93 files under active edits; not on the CI cross set).
+- Per the goal-93 focus I started no new Windows run. r29 still queued. I'm free for a goal-93 piece (inbox/main-from-w-lint-free.md).
+
+## 2026-11-21 round at 156007dff (landed 869791f94 and 754d530e6; main 754d530e6)
+- A lib error in slates-machine (A-831's division) stopped slates-server, so its own reds and every slates-cli test were
+  hidden. Last round's "Windows-only" server reds were host reds too; I corrected the w-hg/w-svn notes.
+- 869791f94: machine checked_div; unsafe-budget.toml slates-machine 97 -> 101 naming A-831's four macOS sites; rt test
+  .first(); db derive_partition returns its Partition (dead fields after 96df5abcd); hg sha1_ab Way alias; literals in
+  land os_windows (size_of::<u64>()) and server content_ranges (DAX_RANGES); server verbs serve_forward/run_recorded and
+  svn_import land_owed split; content_ranges/live_ship test helpers.
+- 754d530e6: svn_interop use test (22/10) in named steps; vcs_crash sweeps judge through Faults::add_each; vcs_concurrency
+  hg scenarios split; git_interop/hg_interop small ones; fleet build-steps assert helper; hg take's pass-over helper;
+  intake_tests PushedLine. Harness allows gained unwrap_in_result (the sanctioned crate-level form).
+- Focused local: db --lib 183; machine time_constraint 1; rt time_constraint 1; server lib 81 + import 31; fleet hop
+  test 1/1; hg push:: 61; cli five test targets build (61 listed).
+- After the merge, the whole wall is clean: host clippy, fmt, structural, literals, unsafe, and the six cross targets.
+- No new Windows run (goal-93 rule). r29 still queued.
+
+## 2026-11-21 round at 8fb2e33db (landed a9be85e7a, main a9be85e7a)
+- Reds: rt iocp.rs unformatted, and slates-rt unsafe 120/109, both from A-828's 98e150baf (Windows only). Fixed by
+  cargo fmt and by raising the budget to 120 with its sites named. server upload.rs if_same_then_else: one condition,
+  keeping the short-circuit.
+- Focused local: server --lib vcs_http::git 20/20. Literals, structural and the six cross targets were clean.
+- No new Windows run (goal-93 rule). r29 still queued.
+
+## 2026-11-21 round at 9adb32044 (nothing to land)
+- Clean: host clippy, fmt, structural, literals, unsafe, the six cross targets.
+- Earlier this hour, from main's list: wire_order was red for w-svn's ImportFault::SubversionLanded; I published it in
+  9adb32044. Server repository|vcs_store: 254/254 on macOS, so it doesn't reproduce.
+- VCS suites lane: r30 (Linux) sat "starting" for over an hour, so I stopped it and resubmitted it once as r32 (sync false,
+  its own clone ~/w-lint-vcs). r31 (Windows) is queued for jupiter. r29 is stopped on main's order; I'll re-queue it
+  after w-work-mount lands.
+- VCS suites per platform: none ended yet (Linux r32, Windows r31).
+
+## 2026-11-21 round at 1a35ab091 (landed 348af0b12)
+- Red: server vcs_store/commits.rs mem::forget (w-git's 926b951e6). Replaced with ManuallyDrop::new; vcs_store::commits|made
+  40/40. w-git told. The rest of the wall was clean.
+- VCS lane: Linux r32 running on adacachy2; Windows r31 queued, since jupiter's link is down. r29 waits for w-work-mount,
+  which hasn't landed yet.
+
+## 2026-11-21 round at d4c7e1f42 (landed 876f35ef0)
+- Reds:
+  - server store_tests.rs: A-835's sleep while waiting for the kill became a yield, still bounded by its deadline.
+  - server vcs_ssh/git.rs: A-722's identical keepalive branch is one condition.
+  - cli git_correctness.rs: read_chunked split out (12/10).
+  - cli svn_interop.rs: use_slates_leg split out (11/10), plus unwrap_in_result in the harness allow.
+- Focused local: server 72, git_correctness 2. Fmt, xtask and the six cross targets were clean.
+- VCS lane: Linux r32 still running (adacachy2); Windows r31 queued, jupiter's link down. r29 waits for w-work-mount.
+- VCS lane, round at d4c7e1f42: Linux didn't run (r30 sync stuck, r32 clone broke after 66 min; in run-requests.md).
+  Windows: r31 dropped, resubmitted as r33, queued. No platform has a pass/fail count yet.
+- VCS lane, Windows: r31 dropped and its resubmit r33 died when jupiter's runner restarted (in run-requests.md).
+  No platform has a pass/fail count this round.
+
+## 2026-11-21 round at ed4661d40
+- Red: server git_push t_a836 at 11/10, split into tags_listed_peeled and fetched_ids; git_push 30/30. The rest of the
+  wall was clean.
+- VCS lane: Linux r36 dropped (adacachy didn't answer in 15 s), so I resubmitted it once as r38 (shallow clone).
+  Windows r37 is queued for jupiter.
+- Disk: 33 GB free after the round (other workers' builds), so I deleted my own debug target (19 GB, literal path): 51 GB free.
+- VCS lane, Windows (jupiter, 19ad3d506): git/hg/svn/vcs didn't build (aws-lc-sys needs NASM, missing there; next try
+  AWS_LC_SYS_NO_ASM=1). Server vcs_/git_/hg_/svn_: the process died with exit 4 when the watchdog wedged a shard under
+  parallel load. The hg_push test it hit passes alone (r41), so it went to w-bugs. Linux: r38 still running.
+- VCS lane, Linux: r38 (the resubmit of r36) died with its clone broken after 34 min; in run-requests.md. No Linux count yet.
+
+## 2026-11-21 round at 39c36af9d
+- Red: server tests/merge_check.rs (A-840): casts became try_from, the conflict loop is now resolved_until_rebased,
+  and the harness allow gained unwrap_in_result. merge_check 11/11. The rest of the wall was clean.
+- VCS lane: kiln refused the first submits ("not connected to the kiln server"). Resubmitted as Windows r45
+  (AWS_LC_SYS_NO_ASM=1, server tests 4 at a time) and Linux r46 (synced from Studio-2).
+- Landed e97604cbb (merge_check) and 33e41f583:
+  - vcs mrc.rs: isolate_lowest_one.
+  - server repository.rs: A-843's destroy test split, 24/10.
+  - server idle_sweep.rs: A-838's test is cfg(unix), because it breaks slates-server's Windows lib test build.
+- VCS lane, Windows (jupiter, 6cbbe5ee2, AWS_LC_SYS_PREBUILT_NASM=1; NO_ASM wants CMake): slates-git 589/0 (4 ignored),
+  slates-hg 402/0, slates-svn 584/0 (3 ignored) + fsfs_view 5 + propfind_allocations 1, slates-vcs 110/0. Server
+  vcs_/git_/hg_/svn_ didn't compile on Windows (A-838's test); fixed in 33e41f583, rerun next. Linux: r46 running.
+- VCS lane, Windows server (33e41f583, 4 threads): the process died with exit 4 after 4 tests. The watchdog wedged
+  t_a767_c5's git push task; alone it passes in 0.81 s, so it's on w-bugs (concurrency in one process, not load).
+  No server count on Windows.
+
+## 2026-11-21 round at 3a00d432d
+- Reds:
+  - server hg_push Landing::Unbuilt: boxed (large_enum_variant).
+  - grants.rs and partition/tests.rs: precedence.
+  - vcs content.rs and mrc.rs: two literals derived (size_of::<u64>(), 2^u64::BITS).
+- Focused local: vcs --lib 125, server hg_push|vcs_share 36. Fmt, structural, unsafe and the six cross targets were clean.
+- VCS lane: Linux r46 dropped (adacachy2 didn't answer the sync), so I resubmitted it once as r51. Windows: the counts
+  from the last round stand (crates green); the server's are blocked on w-bugs' watchdog exit.
+- VCS lane, Linux: r46 and r51 both failed adacachy2's sync; in run-requests.md. No Linux count today.
+
+## 2026-11-21 round at 40d816c29 (nothing to land)
+- Clean: host clippy, fmt, structural, literals, unsafe, the six cross targets.
+- VCS lane: Windows r52 (crates at 40d816c29) and Linux r53 (synced) submitted.
+- VCS lane, Linux: r53 (adacachy2) and r55 (adacachy) both failed the sync; in run-requests.md.
+
+## 2026-11-21 round at 2d078e4fa (landed c3683ac19)
+- Reds, all from A-579's 2d078e4fa: the CHECKPOINT_KINDS literal (now CHUNK_STAGED + 1); the server checkpoint crash
+  test at 12/10 (staged_and_published); the cluster piece-at-a-time hold test at 14/10 (holds_as_the_whole_does).
+- Focused local: cluster content 18, server checkpoint 12. Fmt, structural, unsafe and the six cross targets were clean.
+- VCS lane: Windows r54 still queued (jupiter's link down). Linux: both runners refuse the sync (run-requests.md).
+
+## 2026-11-21 round at 6f47e4027 (nothing to land)
+- Clean: host clippy, fmt, structural, literals, unsafe, the six cross targets.
+- VCS lane: Windows r54 still queued (jupiter's link down). Linux: both runners refuse the sync (run-requests.md).
+
+## 2026-11-21 round at 1d42ec90f (landed 40148f1e7)
+- Red: server repository.rs type_complexity, fixed with a CreationLanded alias. Fmt, xtask and the six cross targets were clean.
+- Found: repository::tests::each_verb_moves_the_names_log... fails 3/3 on macOS, the checkpoint doubling rule asserting
+  ("held_bytes: 0"); sent to w-engine, since A-579 is theirs. repository:: otherwise 93/94.
+- VCS lane: Linux r56 (sync false, fetching the exact commit; main's ruling) — kiln didn't answer my status read.
+  Windows r54 is still queued.

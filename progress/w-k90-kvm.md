@@ -116,3 +116,19 @@ Started 2026-11-20 ~07:50 PST. Read: briefs/common.md, briefs/w-k90-kvm.md, prog
   ~/kiln-work/{w-k90-kvm-m620tree,w-k90-kvm-carry,w-k90-kvm-shards.git}, ~/.cache/w-k90-kvm-shards-stray-target{,-2,-3},
   ~/.cache/w-k90-kvm-shards-target.noindex, ~/.cache/w-k90-kvm-slates-target.noindex; kiln branch agents/w-k90-kvm-m620;
   jupiter ~/.cache/w-k90-kvm (kiln.git, m620/, target/, green.try3, logs).
+
+## 2026-11-21 ~10:00 PST: own scratch deleted, by exact path (main's last step)
+- kiln branch agents/w-k90-kvm-m620 deleted on GitHub (ls-remote: 0 refs). Its two scratch commits are not ancestors of main
+  (ported as a fresh commit), but all three files they changed are byte-identical on main (a82d027c0, in 64624e059).
+- big Studio (d1323898): worktrees removed with `git worktree remove`: ~/kiln-work/w-k90-kvm-acl 550M, ~/kiln-work/w-k90-kvm-m620 550M,
+  ~/kiln-work/w-k90-kvm-m620land 550M. Deleted: ~/kiln-work/w-k90-kvm 729M (clone; its one unlanded branch w-k90-kvm-g90 had an empty
+  diff to main, superseded by 22bb3fb9e), ~/kiln-work/w-k90-kvm-m620tree 70M, ~/kiln-work/w-k90-kvm-shards.git 13M,
+  ~/kiln-work/w-k90-kvm-scripts 8.7M, ~/.cache/w-k90-kvm-shards-stray-target 275M, -2 275M, -3 275M,
+  ~/.cache/w-k90-kvm-shards-target.noindex 4.3G, ~/.cache/w-k90-kvm-slates-target.noindex 586M, ~/.cache/w-k90-kvm-local-target.noindex 15G.
+  ~/kiln-work/w-k90-kvm-carry 352K deleted right after this push. Kept: this state folder ~/fanout-state-w-k90-kvm (the record).
+- jupiter: ~/.cache/w-k90-kvm 8.5G deleted (no process of mine on it, checked by command line).
+- adacachy: ~/.cache/w-k90-kvm 1.7G deleted (clone, wt, wt3, wt-main-c0f576eb3, logs, state.git, scripts); `git worktree prune` in
+  kiln's reach dir for this session removed those three stale entries. Left for kiln/main: the reach dirs
+  ~/.kiln/reach/d1323898…/w-k90-kvm-0afe6c0693 and w-k90-kvm-carry-58e13b5d95 (kiln's sync copies), and
+  ~/.cache/w-k90-microvm-target (handed over by w-k90-microvm, not made by me).
+- Total freed: about 33 GB. Done; ending.

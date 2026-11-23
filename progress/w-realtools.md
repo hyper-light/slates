@@ -55,3 +55,43 @@ Brief: briefs/w-realtools.md. Clone: ~/slates-work/w-realtools (object store), w
 - Main's order: deleted my Studio-4 scratch by exact path: ~/.cache/w-realtools-target.noindex and the clone
   ~/slates-work/w-realtools (free space 52 -> 58 GiB). Still kept: this state folder, and ~/.cache/w-realtools-clone on
   adas-macbook-pro-2 (it has 51 GB free; that's the place for a Windows-build fix).
+
+## Goal 93 piece (main 01a1ff2e, 2026-11-21 10:43, corrected 10:48 and 10:51 under §8)
+- Piece: stock git against slates' git server with --vcs-store, Windows names. I WRITE the test, prove ONE focused case
+  on macOS, land it, and put the jupiter round in run-requests.md. Main runs the rounds. hg is blocked: no Mercurial on
+  jupiter, and main is asking Ada about installing it. svn: no client on jupiter.
+- Stopped per the correction: r11 (a harness run on a Mac, never started) and r12 (a git/git download on jupiter,
+  stopped partway). Its partial folder ~/w-realtools-93 on jupiter is deleted; I ended its git processes by PID, and
+  the one git-remote-https.exe running was mine.
+- The harness w-realtools-tools/git_interop_by_use.sh on this branch is superseded by the test (kept for reference).
+- Test: crates/cli/tests/git_interop.rs `stock_git_carries_windows_paths_byte_identically` (#[ignore]d, beside the
+  existing whole-repository session over git/git). Checkout: ~/slates-work/w-realtools-93 (shallow, branch
+  w-realtools-93; I made it with `git checkout -b`, against the rule, on a fresh clone). Focused macOS run: r16.
+- 11:45 PST: LANDED c66f7160 (merge 8f44f7e2); focused macOS run green (r20, Studio-2, 14.87 s). The jupiter round is
+  filed in run-requests.md. Stopped. Notes: kiln's sync to adas-mac-studio.local-2 failed 3x (r16, r17, r19), so r20 ran
+  with sync:false, cloning a pushed branch (agents/w-realtools-93, deleted after landing). Shallow checkout
+  ~/slates-work/w-realtools-93 is kept for a fix if the jupiter round finds my test at fault.
+- 2026-11-21 ~12:20 PST, re-examining my brief: two of its lines were short.
+  1. "#pragma once with clang AND gcc where present": the test ran only `cc`. Fixed in 1d14aa65: one C file and one
+     FIFO gate per compiler on the PATH (clang, gcc, cc).
+  2. "update the design section, its status line and GAPS": my test landings updated GAPS only. 69a06d89 adds a status
+     line under A-781 naming the acceptance flows.
+  Both are on branch agents/w-realtools-93. Not on main yet: the focused macOS run (the pragma test with
+  SLATES_TEST_CLI=1) hasn't run, because kiln can't reach Studio-2 or adas-mac-studio.local-2 at all right now (r1, r2
+  and two one-line probes: "did not answer in 15s").
+- 13:30 PST: FINDING by use (inbox/main-from-w-realtools-nfs-opendir.md): a fresh slates NFS mount stalls its first
+  opendir on Studio-2 (2/2) and Studio-4; the client sends FSSTAT over and over and never READDIR or CREATE. Added the
+  300 s bounds (7acdf392), so the test now fails in 305 s naming the stall instead of hanging. Branch
+  agents/w-realtools-93 (1d14aa65, 69a06d89, 7acdf392) waits for one green run on a Mac where mounts work (asked main
+  about adas-macbook-pro-2). r14 (the same test at 9793d9218 on Studio-2, to tell a regression from the host) is lost
+  while Studio-2 doesn't answer; I check for and clean any mount it left.
+- 16:05 PST: LANDED 7acdf392 (+ 1d14aa65, 69a06d89) and GAPS 7e1657ac7; green on adas-macbook-pro-2 in 29.32 s.
+  Branch agents/w-realtools-93 deleted. Studio-2 checked clean (r14 left nothing). The Studio stall is g224's.
+  Nothing of my brief, close list or goal-93 piece is left open on my side; the Linux, Windows and jupiter runs are
+  main's (run-requests.md).
+- 15:52 PST (main): recorded. I'm in goal 93's reserve: start no runs. Linux/Windows rounds are main's; jupiter goes
+  through w-k90-win. Leftovers (not deleted, since that needs a kiln run): ~/.cache/w-realtools-93 and
+  ~/.cache/w-realtools-93-target.noindex on adas-macbook-pro-2, Adas-Mac-Studio-2 and adas-mac-studio.local-2 (debug
+  targets, delete freely); ~/.cache/w-realtools-clone on adas-macbook-pro-2; on Studio-4 the shallow checkout
+  ~/slates-work/w-realtools-93 (210 MB) and this state folder.
+- 21:16 PST: main is now kiln agent 01a201824d307ecc9e135c64ae3cb848 (01a1ff2e gone). Nothing waiting on main outside my inbox notes; still in goal 93's reserve, no runs.

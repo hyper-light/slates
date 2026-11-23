@@ -1,5 +1,65 @@
 # w-fed-move — progress (relaunched on the Mac Studio 2026-11-19 ~21:35 PST; supervisor slates-7a via kiln)
 
+## 2026-11-21 ~16:00 PST: GOAL MET -- A-840 landed (62907eeeb, merged 63437de47 on origin/main): a conflict resolved in one ask
+- The next largest owner-ask kind after A-817 was rebase (20.1 of 30.0 a client at 10 hot files). Cut by
+  `ResolveConflict { work, over, replacement }`: the windows given up, the rest resolved at the head as it is, one ask
+  with no gap (main's 10:37 ruling: take-head as one verb). Red first: `a_conflict_resolved_in_one_ask_keeps_what_its_windows_do_not_name`.
+- A/B (1,000 clients, release, kernel/, one round, --per-connection 32, three pairs each; oracle/own/starved 0 in 24):
+  | hot | owner asks: rebase arm | one ask | rebase-kind: rebase arm | one ask | verdict: rebase arm | one ask |
+  | 300 | 11.3, 11.3, 11.2 | 10.9, 11.0, 11.0 | 2.2, 2.1, 2.1 | 1.8, 1.9, 1.8 | 2.4 | 2.4 |
+  | 100 | 13.2, 13.3, 13.2 | 12.5, 12.5, 12.3 | 3.7, 3.7, 3.7 | 2.7, 2.7, 2.6 | 2.7-2.8 | 3.0 |
+  | 30  | 20.1, 19.7, 19.5 | 17.6, 17.5, 17.2 | 9.5, 9.1, 8.9 | 5.7, 5.6, 5.4 | 3.9 | 5.1-5.2 |
+  | 10  | 32.9, 33.2, 32.7 | 27.0, 26.8, 26.3 | 20.8, 20.9, 20.5 | 10.9, 10.7, 10.4 | 5.5-5.7 | 9.2-9.5 |
+- Found by the generated oracle and fixed in the same commit: a work off its green's shard laid ZEROS for base bytes it
+  did not hold when composing a rebased file held as A-806 parts (docs/bugs/2026-11-21-a-composition-laid-zeros-...);
+  and the owner's answer dropped the work's entries when it had composed (3.9 file asks a client) -- `composes_here`.
+- Next largest kind: verdict (9.2-9.5 a client at 10 hot files).
+- For main's queue: `work_edit_cow`'s `a_one_byte_edit_of_a_large_file_costs_the_byte_not_the_file` is ended by the
+  watchdog (debug build, load 14), on plain main too (checked with my diff taken out).
+
+## 2026-11-21 ~14:40 PST: a third rebase cut (window bytes in the conflicting reply) -- measured, even, rejected; record on main a457405da (756cad83f)
+- No ruling from main on inbox/main-from-w-fed-move-rebase-race.md; main had said not to wait, so I built it locally:
+  `Rebased` + appended `heads` (the head's bytes over each window, from the owner's engine), the daemon test red first
+  (`rebase_conflict_part`), and the harness writing them with no read (`--read-heads` the other arm).
+- A/B, three pairs at each of 300/100/30/10 hot files (1,000 clients, release, in-process, kernel/, one round,
+  `--per-connection 32`, main eef868f80, Studio at load 7-10). Oracle, own-file and starved all 0 in 24 runs.
+  Rebase-kind asks a client, read vs carried: 300: 1.9/2.0/1.9 vs 1.9/1.9/1.9; 100: 3.8/3.3/3.2 vs 3.7/3.3/3.1;
+  30: 9.0/8.5/8.7 vs 9.2/8.2/8.1; 10: 20.4/19.7/19.3 vs 19.8/20.5/20.1. Even. Window reads at 10: ~54 -> 13 a client
+  (not owner asks). Verdicts/s +17-26% at 10 and 30 hot files on the loaded box (not read as a result).
+- Why: a closed loop (529 in flight, ~9 ms a request); in either gap some 50-120 verdicts land, so a client's
+  unresolved slots are surely hit again. Only a gapless resolution moves the repeats (check+resolve: 16,035 -> 584
+  rebase conflicts, at two asks).
+- Patch: ~/slates-work/w-fed-move-rebase-heads-rejected.patch (279 lines). Tree clean.
+- GOAL NOT MET: no cut of the rebase-kind asks has landed. One unbuilt idea is left for main's ruling (a conflicting
+  reply carries the check's stamp, so `ResolveMerge` follows without `CheckMerge`: at most ~6.6 rebase-kind asks a
+  client at 10 hot files). Asked main in inbox/main-from-w-fed-move-rebase-heads.md: rule it, or clear the goal and give
+  me a goal-93 piece.
+
+## 2026-11-21 ~11:50 PST: owner asks after A-817 -- both cuts measured and rejected (records on main: 99dc2e932, eef868f80)
+- Push route fixed: ~/.local/bin/kiln is EMPTY (0 bytes); I push through ~/.cache/w-fed-move-target/release/kiln via the
+  MacBook (~/.cache/w-fed-move-publish-state.sh for the state branch, ~/.cache/w-fed-move-publish-main.sh for main),
+  each confirming the commit on origin.
+- Resolution at the head as it is (main's ruling 10:33), A/B at 300/100/30/10 hot files, all N, oracle clean:
+  asks a client 11.2/13.0/19.3/31.8 (read+rebase) vs 11.9/13.3/17.9/26.8 (check+resolve); rebase-kind asks
+  2.1/3.6/8.7/20.1 vs 2.9/3.9/7.2/13.2. Bar 19.8 -> ~4.6 not met: rejected. Patch:
+  ~/slates-work/w-fed-move-resolve-at-head-rejected.patch.
+- Option 3 (shard-level length cache): ceiling 10% (300 hot) to 18% (10 hot) of length asks: rejected unbuilt.
+- Asked main (inbox/main-from-w-fed-move-asks-done.md) whether to close the asks thread; waiting on r26's rows.
+
+## 2026-11-21 ~10:45 PST: main's rebase-drop ruling (03:46, resent 06:40 as a goal) -- SETTLED, not landed by main's 10:35 ruling
+- Main's 03:46 ruling (drop a journal op whose result became the head's) reached me only at 06:40; I had already built
+  it, measured it and reported it (inbox/main-from-w-fed-move-drop.md). Main, 10:35: "Don't land the drop ... A ruling
+  never overrides an even A/B; keep it as measured-and-rejected." It is recorded so in the design log under A-817.
+- A/B numbers of the drop (1,000-client stand-in, release, in-process, kernel/, one round, `--per-connection 32`):
+  ops dropped a client at 300 / 100 / 30 / 10 hot files: 0.00 / 0.00 / 0.01 / 0.03. Rebases' file asks a client with the
+  drop: 1.51 / 2.69 / 6.01 / 14.20, the same as without it. Asks a client 14.1 / 17.6 / 27.5 / 49.2 with or without it.
+  At 10 hot files a whole run dropped 31 ops, each an offset-0 overwrite whose file had become the head's while the
+  work's other files still differed (re-run 10:40; the engine's restatement leaves out every other kind).
+- The commit that did the work main expected of it: Slates b7fa83284 (A-817, on origin/main as 351c9e2a): a file's base
+  bytes asked only for a whole replacement of the file's length; file asks 17.2 -> 0 a client, asks 49.2 -> 30.0 at 10
+  hot files (300/100/30/10: 11.1 / 12.9 / 19.1 / 30.0 asks a client after).
+- Patch of the rejected drop: ~/slates-work/w-fed-move-a817-rejected-drop.patch.
+
 ## 2026-11-21 ~05:00 PST: A-817 LANDED 351c9e2a (base bytes only for true whole replacements)
 - Main's identical-op drop: built + oracle, fired 0.03/client, asks unchanged -> NOT landed (dead-even A/B); patch at
   ~/slates-work/w-fed-move-a817-rejected-drop.patch. Real cause: offset-0 overwrite misclassified as whole replacement.

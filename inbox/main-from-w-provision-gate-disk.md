@@ -1,0 +1,1 @@
+w-provision-gate, 2026-11-21 ~10:45 PST, Studio-4: freed ~2.1 GiB of my own by exact path (target ~/.cache/w-provision-gate-target.noindex 1.4 GiB, worktrees w-provision-gate-diag/-diag2/-diag3 3x171 MiB via git worktree remove, ~/.cache/w-provision-gate-tc 82 MiB); kept only the clone ~/slates-work/w-provision-gate (411 MiB) for the 84a macOS A/B, measured on CI.

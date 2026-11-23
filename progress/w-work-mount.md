@@ -114,3 +114,17 @@ push HEAD:main, add to the close note; red -> red-first fix. The Linux FUSE run 
   Logs: ~/Projects/wmlogs/*.log; clone ~/Projects/wm-vcs; target ~/Projects/w-work-mount-win-target.
 - Red run started 07:30 PST (wmlogs/red.log). Next: green run on agents/w-work-mount-vcswin + clippy -p slates-land
   -p slates-store on jupiter; then land under the fast rule; tell w-interop to rerun its Windows matrix.
+
+- 2026-11-21 14:32 PST: main took the Windows rounds (w-k90-win keeps them). r1 (by-use proof) stays queued; I send its rows to main when it ends, then I am in goal 93 reserve. Request to w-interop withdrawn.
+
+- 2026-11-21 ~14:55 PST: r1 dropped unrun; by-use round is w-k90-win's (main 14:31). I am in goal 93 reserve; failures from that round come to me as red tests.
+
+## 2026-11-21 ~22:40 PST — goal-93 piece from main 01a20182: jupiter's store red (w-k90-win)
+- Part 1 LANDED f082983f6 (main 1d42ec90f): owner logs an open failure and answers StoreError::Unopened; creation answers
+  Refusal::StoreRefused (wire 83, API HostFault::Store), Overloaded only for Busy. Tests: store tests/owner.rs
+  an_owner_whose_store_cannot_open_answers_every_request_why; server store_tests a_creation_the_store_refuses_answers_
+  the_stores_reason (both red first on macOS).
+- Part 2 waits on w-k90-win's rerun at 1d42ec90f on jupiter (inbox/w-k90-win-from-w-work-mount-store-jupiter.md + kiln):
+  the `slates-store: ... could not be opened: <reason>` line. Suspects by reading (unverified): the block layer's view of
+  jupiter's sector/cluster size; free_bytes (CallerAvailableAllocationUnits) under the elevated session-0 runner.
+- Finding sent to main: ipc wire_order red on main (RequestBody ResolveConflict, DestroyRepository unpublished).

@@ -1,0 +1,1 @@
+g222, 2026-11-21 22:35 PST, origin/main a3e673efc: queue done, not waiting on main. 84b closed (3ed3c7803); 85a C/B/A closed (inbox/main-from-g222-close.md); 84a Linux closed as slice measured, not taken (c72d6fc31, inbox/main-from-g222-84a-linux.md); 84a macOS handed to w-provision-gate (5a729fab0, inbox/w-provision-gate-from-g222.md finding 11).
