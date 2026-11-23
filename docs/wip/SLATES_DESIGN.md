@@ -61888,4 +61888,6 @@ name whatever their `cfg`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sdk_async.t
   - `a_restart_claims_each_slab_once_and_reads_its_windows_in_their_slots`.
   - `slates-vfs`'s `a_volumes_small_extents_each_keep_a_block_of_their_own`.
 - **Owed.** Main's arena-17, judged on the windows row's held approaching its asked, push-all still passing, and RSS
-  below arena-16's.
+  below arena-16's. When the shard's cipher comes to repository windows (A-99), a slab can no longer be filled in
+  place: its chunk carries no seal today (`ChunkStore::seal` with no key), and its later slots are written into the
+  sealed chunk's unused bytes. So that work seals a slab when it closes, or each slot alone (w-shared's review).
