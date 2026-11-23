@@ -618,3 +618,13 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - Plan: inbox/main-from-w-svn-a760b-plan.md. w-perf told: inbox/w-perf-from-w-svn-a760-items.md.
 - NEXT (main starts it): piece 2, a checkpoint naming a named file instead of its bytes.
 - Run request for main: clippy -p slates-merge --all-targets (the lib change and the new test).
+
+## 2026-11-22 evening: main's reds, in its order
+- clippy large_enum_variant (A-866 grew Judged to 288 B): FileMaking boxed, Judged 224 B. Landed 8c9e71649 (merge
+  28ec7c89d). Rerun asked.
+- codex cold copy: bring_texts asks holds_whole, not contains. Red a_subversion_copy_from_a_stored_revision_reads_a_window_that_was_let_go
+  (Err(Unstored) -> Ok(3)). Landed (merge 1010c7e7e). Bug record docs/bugs/2026-11-22-a-subversion-copy-refused-...
+  Siblings NOT changed (reported): svn_texts::named_lacking (recovery pre-pass) and svn_presenter's bring-back, both `contains`.
+- codex bring room: finish_brought abandons its writer on a refused finish. Red a_refused_subversion_text_bring_returns_its_completed_windows
+  ((262144, true) -> (0, false)). Landed bc026ec5a (merge 96e6f2170). Sibling NOT changed: hg push/intake.rs:1276 (w-hg's).
+- A-760 (b) piece 2 WIP set aside as ~/.cache/w-svn-wip/a760b-piece2.patch (checkpoint named table, codec only); resumes next.
