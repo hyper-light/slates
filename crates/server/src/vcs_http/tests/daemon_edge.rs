@@ -196,6 +196,15 @@ fn tls_client(
   port: u16,
   certificate: &CertificateDer<'static>,
 ) -> StreamOwned<ClientConnection, ClientStream> {
+  tls_client_within(port, certificate, Duration::from_nanos(PATIENCE_NS))
+}
+
+/// [`tls_client`], its reads waiting at most `patience` for an answer.
+fn tls_client_within(
+  port: u16,
+  certificate: &CertificateDer<'static>,
+  patience: Duration,
+) -> StreamOwned<ClientConnection, ClientStream> {
   let mut roots = RootCertStore::empty();
   roots
     .add(certificate.clone())
@@ -214,7 +223,7 @@ fn tls_client(
   let socket = ClientStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
     .expect("the edge's listener takes the connection");
   socket
-    .set_read_timeout(Some(Duration::from_nanos(PATIENCE_NS)))
+    .set_read_timeout(Some(patience))
     .expect("a read timeout");
   StreamOwned::new(connection, socket)
 }
@@ -460,7 +469,22 @@ fn typed_exchange(
   certificate: &CertificateDer<'static>,
   request: &[u8],
 ) -> (u16, String, Vec<u8>) {
-  let mut stream = tls_client(port, certificate);
+  typed_exchange_within(
+    port,
+    certificate,
+    request,
+    Duration::from_nanos(PATIENCE_NS),
+  )
+}
+
+/// [`typed_exchange`], waiting at most `patience` for each read of its answer.
+fn typed_exchange_within(
+  port: u16,
+  certificate: &CertificateDer<'static>,
+  request: &[u8],
+  patience: Duration,
+) -> (u16, String, Vec<u8>) {
+  let mut stream = tls_client_within(port, certificate, patience);
   stream.write_all(request).expect("the request is sent");
   let mut head = Vec::new();
   while !head.ends_with(b"\r\n\r\n") {
@@ -864,6 +888,248 @@ fn a_push_of_a_long_history_and_many_branches_lands_every_ref_through_the_daemon
   let report = String::from_utf8_lossy(&created.1).into_owned();
   let landed = report.matches("ok refs/heads/").count();
   assert_eq!((created.0, landed), (200, MANY_BRANCHES + 1), "{report}");
+}
+
+/// Shape: how long [`a_fetch_whose_let_go_window_the_store_never_answers_fails_cleanly_within_its_bound`]'s node store
+/// is waited for on each read: its stand-in for `read_through::PATIENCE_NS`, short so the test is.
+const UNANSWERED_PATIENCE_NS: u64 = 200_000_000;
+
+/// Goal 93's read-through bound (main 01a20182's ruling of 2026-11-22 17:00: an await without a bound is a defect on
+/// its own, banned items 8 and 9). Do: on a two-shard daemon with its edge, push a commit whose one file spans several
+/// of the content store's windows; on the repository's shard, let every window of its staged pack go as landed (those
+/// the push's own let-go has not), and
+/// make the node's store never answer a bring-back's read (`read_through::TEST_UNANSWERED`), each waited for
+/// [`UNANSWERED_PATIENCE_NS`]; then fetch the commit as `git clone` asks, from a thread the test waits on. Expect: the
+/// fetch answered, not hung (well inside a minute); its answer no whole pack of every object pushed, so the client fails
+/// cleanly; the refusals counted `vcs_store.read_through.unanswered`. Failing first: the bring-back awaited the store
+/// without end and the fetch never answered.
+#[test]
+fn a_fetch_whose_let_go_window_the_store_never_answers_fails_cleanly_within_its_bound() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let (request, commit) = large_create(1 << 20);
+  let created = pushed((port, &certificate), &name, &request);
+  assert_eq!(created.0, 200, "{}", String::from_utf8_lossy(&created.1));
+  let (_, commands_end) = packets_from(&request, 0);
+  let pack = request
+    .get(commands_end..)
+    .expect("the push's pack")
+    .to_vec();
+  let let_go = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    crate::vcs_store::read_through::TEST_UNANSWERED.with(|unanswered| unanswered.set(true));
+    crate::vcs_store::read_through::TEST_PATIENCE_NS
+      .with(|patience| patience.set(UNANSWERED_PATIENCE_NS));
+    crate::vcs_store::within_budget(state, 0, |stores| {
+      let Some(content) = stores.content_mut() else {
+        return 0;
+      };
+      let window = content.window();
+      pack
+        .chunks(window)
+        .map(slates_vcs::ContentId::of)
+        // Let go here, or by the push's own landed let-go already (its windows no home pins).
+        .filter(|id| {
+          if content.mark_landed(id) {
+            let _ = content.let_go_landed(id, None);
+          }
+          content.is_away(id)
+        })
+        .count()
+    })
+  });
+  assert!(let_go > 1, "the pack's windows let go: {let_go}");
+  let (sent, got) = std::sync::mpsc::channel();
+  let fetch = fetch_of(commit);
+  let asked = std::thread::spawn(move || {
+    let _ = sent.send(uploaded((port, &certificate), &name, &fetch));
+  });
+  let answered = got.recv_timeout(Duration::from_secs(60));
+  let unanswered = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::vcs_store::read_through::UNANSWERED,
+  );
+  let answered = answered.expect("the fetch answered within its bound, never hung");
+  let _ = asked.join();
+  daemon.stop();
+  let (status, body) = answered;
+  // A pack read whole holding every object pushed, or not: an answer cut short or ended on git's error band is not.
+  let pushed_objects = ids_in(&request[commands_end..]).len();
+  let whole = status == 200
+    && body.starts_with(b"000dpackfile\n")
+    && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      ids_in(&fetched_pack(&body)).len()
+    }))
+    .is_ok_and(|fetched| fetched == pushed_objects);
+  assert!(
+    !whole,
+    "no whole pack answered from windows the store never gave back"
+  );
+  assert!(unanswered > 0, "each refusal counted");
+}
+
+/// Shape: the annotated tags [`a_push_of_annotated_tags_is_listed_and_fetched_whole_once_its_pack_is_landed`] pushes,
+/// each after a file of [`TAGGED_FILE_BYTES`] in its pack, so each lies in a window of its own.
+const TAGS: usize = 4;
+/// Shape: the bytes of each file before a tag in that test's pack: past a window of the content store (256 KiB).
+const TAGGED_FILE_BYTES: usize = 400 * 1024;
+
+/// Stock git's request creating `main` at a root commit of [`TAGS`] files and an annotated tag `refs/tags/t<k>` of it
+/// for each, the pack laid out commit, tree, then each file followed by its tag; the commit, and each tag's name.
+fn tagged_create() -> (Vec<u8>, ObjectId, Vec<ObjectId>) {
+  use slates_git::object_name::Kind;
+  let mut state = 0x2545_f491_4f6c_dd1du64;
+  let files: Vec<Vec<u8>> = (0..TAGS)
+    .map(|_| {
+      (0..TAGGED_FILE_BYTES)
+        .map(|_| {
+          state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+          state.to_be_bytes()[0]
+        })
+        .collect()
+    })
+    .collect();
+  let mut tree = Vec::new();
+  for (at, file) in files.iter().enumerate() {
+    tree.extend_from_slice(format!("100644 f{at}\0").as_bytes());
+    tree.extend_from_slice(git_name(Kind::Blob, file).as_bytes());
+  }
+  let tree_id = git_name(Kind::Tree, &tree);
+  let commit = format!(
+    "tree {tree_id}\nauthor A <a@example.com> 1700000000 +0000\n\
+     committer A <a@example.com> 1700000000 +0000\n\ntagged\n"
+  )
+  .into_bytes();
+  let commit_id = git_name(Kind::Commit, &commit);
+  let tags: Vec<Vec<u8>> = (0..TAGS)
+    .map(|at| {
+      format!(
+        "object {commit_id}\ntype commit\ntag t{at}\ntagger A <a@example.com> 1700000000 +0000\n\ntag {at}\n"
+      )
+      .into_bytes()
+    })
+    .collect();
+  let tag_ids: Vec<ObjectId> = tags.iter().map(|tag| git_name(Kind::Tag, tag)).collect();
+  let mut objects: Vec<(Kind, &[u8])> = vec![(Kind::Commit, &commit), (Kind::Tree, &tree)];
+  for (file, tag) in files.iter().zip(&tags) {
+    objects.push((Kind::Blob, file));
+    objects.push((Kind::Tag, tag));
+  }
+  let mut request = Vec::new();
+  let line = format!("{ZERO} {commit_id} refs/heads/main\0 report-status");
+  pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("the command");
+  for (at, tag) in tag_ids.iter().enumerate() {
+    let line = format!("{ZERO} {tag} refs/tags/t{at}");
+    pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("a command");
+  }
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request.extend_from_slice(&stored_pack(&objects));
+  (request, commit_id, tag_ids)
+}
+
+/// Goal 93 item 2b(a) (main 01a20182's r52, 2026-11-22: once git/git's push ended its landed pack was let go, and every
+/// fetch of it failed, ls-remote and clone alike, "aborting due to possible repository corruption on the remote side":
+/// the advertisement's tag peel read a window let go, `Unreadable`, where no read brings it back). Do: on a two-shard
+/// daemon with its edge, push as stock git posts it a commit of [`TAGS`] files and an annotated tag of it for each, each
+/// tag in a window of its own; wait for the push's end to run its landed let-go (counted, or 3 s), and let the
+/// repository go idle (`git_encode::give_back_idle`: the objects its reads keep given back); then, as `git ls-remote`
+/// and `git clone` ask at protocol v2, list every ref with its peel and fetch the commit and every tag.
+/// Expect: the push `200`, every ref `ok`; the listing exactly `main` and each tag peeled to the commit; the fetch `200`,
+/// its pack every object pushed. Failing first: the tags' windows let go, the listing refused.
+#[test]
+fn a_push_of_annotated_tags_is_listed_and_fetched_whole_once_its_pack_is_landed() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, commit, tags) = tagged_create();
+  let created = pushed(edge, &name, &request);
+  // The push's end runs its landed let-go (its `ReceivePack` dropped) as the edge finishes its answer.
+  let waited = std::time::Instant::now();
+  while counted_on(&daemon, REPOSITORY, crate::vcs_store::LANDED_LET_GO_BYTES) == 0
+    && waited.elapsed() < Duration::from_secs(3)
+  {
+    std::thread::sleep(Duration::from_millis(20));
+  }
+  // Then the repository goes idle, as it does once no fetch of it is answered: what its reads keep of the objects read
+  // lately (`packed::Recent`, which the push's decision filled with the tags) given back, so the listing reads them from
+  // their windows, as git/git's tags, far past that cache, were read.
+  let let_go = crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
+    for id in state.vcs_stores.git_repositories() {
+      crate::vcs_store::git_encode::give_back_idle(state, id);
+    }
+    let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+    (
+      count(crate::vcs_store::LANDED_LET_GO_BYTES),
+      count(crate::vcs_store::LANDED_PINNED),
+    )
+  });
+  let mut ls_refs = Vec::new();
+  for line in [b"command=ls-refs\n".as_slice()] {
+    pktline::write(Packet::Data(line), &mut ls_refs).expect("the command");
+  }
+  pktline::write(Packet::Delim, &mut ls_refs).expect("the delimiter");
+  for argument in [b"peel\n".as_slice(), b"ref-prefix refs/\n"] {
+    pktline::write(Packet::Data(argument), &mut ls_refs).expect("an argument");
+  }
+  pktline::write(Packet::Flush, &mut ls_refs).expect("the flush");
+  let listed = uploaded(edge, &name, &ls_refs);
+  let mut fetch = Vec::new();
+  pktline::write(Packet::Data(b"command=fetch\n"), &mut fetch).expect("the command");
+  pktline::write(Packet::Delim, &mut fetch).expect("the delimiter");
+  let mut arguments = vec![format!("want {commit}\n")];
+  arguments.extend(tags.iter().map(|tag| format!("want {tag}\n")));
+  arguments.extend(["no-progress\n".to_owned(), "done\n".to_owned()]);
+  for argument in &arguments {
+    pktline::write(Packet::Data(argument.as_bytes()), &mut fetch).expect("an argument");
+  }
+  pktline::write(Packet::Flush, &mut fetch).expect("the flush");
+  let fetched = uploaded(edge, &name, &fetch);
+  daemon.stop();
+  eprintln!("landed let-go bytes and windows pinned before the listing: {let_go:?}");
+  let report = String::from_utf8_lossy(&created.1).into_owned();
+  assert_eq!(
+    (created.0, report.matches("ok refs/").count()),
+    (200, TAGS + 1),
+    "{report}"
+  );
+  let mut expected = Vec::new();
+  let main = format!("{commit} refs/heads/main\n");
+  pktline::write(Packet::Data(main.as_bytes()), &mut expected).expect("a line");
+  for (at, tag) in tags.iter().enumerate() {
+    let line = format!("{tag} refs/tags/t{at} peeled:{commit}\n");
+    pktline::write(Packet::Data(line.as_bytes()), &mut expected).expect("a line");
+  }
+  pktline::write(Packet::Flush, &mut expected).expect("the flush");
+  assert_eq!(
+    (listed.0, String::from_utf8_lossy(&listed.1)),
+    (200, String::from_utf8_lossy(&expected)),
+    "every ref listed, each tag peeled"
+  );
+  assert_eq!(fetched.0, 200);
+  let answer = String::from_utf8_lossy(
+    fetched
+      .1
+      .get(..fetched.1.len().min(400))
+      .unwrap_or_default(),
+  )
+  .into_owned();
+  assert!(answer.starts_with("000dpackfile\n"), "{answer}");
+  let (_, commands_end) = packets_from(&request, 0);
+  let pushed_pack = request.get(commands_end..).expect("the push's pack");
+  assert_eq!(
+    ids_in(&fetched_pack(&fetched.1)).len(),
+    ids_in(pushed_pack).len()
+  );
 }
 
 /// A v2 `fetch` of `want` with `done` and no progress, as `git clone` asks for a branch's commit.
@@ -1848,6 +2114,16 @@ fn hg_unbundle(
   name: &str,
   bundle: &[u8],
 ) -> (u16, String, Vec<u8>) {
+  hg_unbundle_within(edge, name, bundle, Duration::from_nanos(PATIENCE_NS))
+}
+
+/// [`hg_unbundle`], its client waiting at most `patience` for each read of the answer.
+fn hg_unbundle_within(
+  edge: (u16, &CertificateDer<'static>),
+  name: &str,
+  bundle: &[u8],
+  patience: Duration,
+) -> (u16, String, Vec<u8>) {
   let (port, certificate) = edge;
   let mut sent = format!(
     "POST /{name}?cmd=unbundle HTTP/1.1\r\nHost: localhost\r\n{}\r\n{HG_PUSH_FIELDS}\
@@ -1857,7 +2133,7 @@ fn hg_unbundle(
   )
   .into_bytes();
   sent.extend_from_slice(bundle);
-  typed_exchange(port, certificate, &sent)
+  typed_exchange_within(port, certificate, &sent, patience)
 }
 
 /// A bundle2 part's parameters: each its name and value.
@@ -3324,6 +3600,15 @@ fn a_mercurial_push_parks_for_its_repositorys_landing_turn_and_no_other_waits() 
     );
     std::thread::spawn(move || hg_unbundle((port, &certificate), &first, &bundle))
   };
+  // Seen parked, then held [`TURN_HELD`] more: the push's wait runs from before it was seen to past the release, whatever
+  // its intake took on a busy machine before it parked.
+  let deadline = std::time::Instant::now() + Duration::from_nanos(PATIENCE_NS);
+  while counted(crate::repository::hg_run::TURN_WAITS) == 0 && std::time::Instant::now() < deadline
+  {
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(Duration::from_millis(5));
+  }
+  let seen_parked = std::time::Instant::now();
   // The test holds the landing turn while the parked push waits for it; the daemon under test waits on its drivers.
   #[allow(clippy::disallowed_methods)]
   std::thread::sleep(TURN_HELD);
@@ -3332,6 +3617,7 @@ fn a_mercurial_push_parks_for_its_repositorys_landing_turn_and_no_other_waits() 
     parked.is_finished(),
   );
   give_back_turn(&daemon);
+  let held_after_park = seen_parked.elapsed();
   let parked = parked.join().expect("the parked push answered");
   let waited_ns = counted(crate::repository::hg_run::TURN_WAITED_NS);
   let heads = hg_command((port, &certificate), &first, "heads");
@@ -3349,8 +3635,8 @@ fn a_mercurial_push_parks_for_its_repositorys_landing_turn_and_no_other_waits() 
   let tip = crate::verbs::hex_of(&made[0].node);
   assert_eq!(heads, (200, format!("{tip}\n").into_bytes()));
   assert!(
-    u128::from(waited_ns) >= TURN_HELD.as_nanos(),
-    "waited {waited_ns} ns"
+    u128::from(waited_ns) >= held_after_park.as_nanos(),
+    "waited {waited_ns} ns, parked {held_after_park:?} before the release at least"
   );
   let words = crate::repository::hg_run::TURN_PAST_PATIENCE;
   assert!(
@@ -3362,82 +3648,626 @@ fn a_mercurial_push_parks_for_its_repositorys_landing_turn_and_no_other_waits() 
   assert_eq!(unmoved, heads, "the refused push moved nothing");
 }
 
-/// Format: the segment bound [`a_small_push_waits_behind_a_whole_history_push_for_its_landing_turn`]'s long push is cut
-/// at, so its run takes the turn at its first few changesets.
+/// Format: the segment bound a long push of [`a_one_changeset_push_lands_during_a_long_push_and_readers_see_only_named`]
+/// and [`a_long_push_stale_twice_is_re_based_once_holding_the_turn_and_lands`] is cut at, so its run lands segments
+/// from its first few changesets.
 const LONG_SEGMENT_BYTES: u64 = 32 * 1024;
 
-/// Format: the changesets of [`a_small_push_waits_behind_a_whole_history_push_for_its_landing_turn`]'s long push: a
-/// line long enough to land as tens of segments, short enough to answer within a client's patience in a debug build
-/// under a whole suite's load.
-const LONG_CHANGESETS: usize = 200;
+/// Starts a push of a line of [`FRESH_CHANGESETS`] changesets to `name` on a thread of its own, cut at
+/// [`LONG_SEGMENT_BYTES`] and parked once its run has landed two segments (`hg_run::TEST_PARK_AFTER_SEGMENTS`), its
+/// segments unnamed; returns the line's tip and the push's thread once it has parked.
+fn a_long_push_parked(
+  daemon: &Daemon,
+  (port, certificate): (u16, &CertificateDer<'static>),
+  name: &str,
+) -> (
+  slates_hg::Node,
+  std::thread::JoinHandle<(u16, String, Vec<u8>)>,
+) {
+  crate::daemon::observe_at(daemon, REPOSITORY, |_| {
+    crate::repository::hg_run::TEST_SEGMENT_BYTES.with(|bound| bound.set(LONG_SEGMENT_BYTES));
+    crate::repository::hg_run::TEST_PARK_AFTER_SEGMENTS.with(|park| park.set(2));
+    crate::repository::hg_run::TEST_RELEASE.with(|release| release.set(false));
+  });
+  let (made, bundle) = a_line_of(FRESH_CHANGESETS);
+  let patience = long_push_patience(&bundle);
+  let long = {
+    let (certificate, name) = (certificate.clone(), name.to_owned());
+    std::thread::spawn(move || hg_unbundle_within((port, &certificate), &name, &bundle, patience))
+  };
+  while counted_on(
+    daemon,
+    REPOSITORY,
+    crate::repository::hg_run::SEGMENTS_LANDED,
+  ) < 2
+  {
+    assert!(
+      !long.is_finished(),
+      "the long push answered before it parked"
+    );
+    std::thread::sleep(Duration::from_millis(5));
+  }
+  (made[FRESH_CHANGESETS - 1].node, long)
+}
 
-/// Main 01a20182's ruling (i) of 2026-11-22 04:44 ("measure how long a small push waits behind a whole-history push and
-/// record it in GAPS"). Do: start a two-shard daemon over loopback TLS; create a Mercurial repository; push a line of
-/// [`LONG_CHANGESETS`] changesets on a thread of its own, cut at [`LONG_SEGMENT_BYTES`]; once its run holds the
-/// repository's landing turn, push one unrelated changeset with no bookmark. Expect both `200`; the small push parked
-/// once, its wait counted; and the repository's heads both pushes' tips. Prints the small push's wait and the long
-/// push's span, for GAPS.
+/// Derived: how long a test's client waits for a long push's answer ([`a_long_push_parked`]): a client's patience
+/// ([`PATIENCE_NS`]) and one of the daemon's liveness budgets for each segment the push lands at
+/// [`LONG_SEGMENT_BYTES`], each a durable write of the store's that a busy machine draws out, and one more for its
+/// entry's commit (main 01a20182's order of 2026-11-22 16:30: a busy machine is the norm, so a bound from the push's
+/// own size, never a constant).
+fn long_push_patience(bundle: &[u8]) -> Duration {
+  let segments = u64::try_from(bundle.len())
+    .unwrap_or(u64::MAX)
+    .div_ceil(LONG_SEGMENT_BYTES)
+    .saturating_add(1);
+  Duration::from_nanos(
+    PATIENCE_NS.saturating_add(segments.saturating_mul(crate::daemon::LIVENESS_BUDGET_NS)),
+  )
+}
+
+/// Lets a long push parked by [`a_long_push_parked`] go on.
+fn release_long_push(daemon: &Daemon) {
+  crate::daemon::observe_at(daemon, REPOSITORY, |_| {
+    crate::repository::hg_run::TEST_RELEASE.with(|release| release.set(true));
+  });
+}
+
+/// Main 01a20182's rulings of 2026-11-22 07:32 and 12:00 (staging: a push lands its segments apart from its
+/// repository's landing turn, which it takes only for its entry's commit; readers see only named sequences). Do: start a
+/// two-shard daemon over loopback TLS; create a Mercurial repository; start a push of [`FRESH_CHANGESETS`] changesets
+/// and park it once two of its segments have landed; ask `heads`; push one unrelated changeset with no bookmark; ask
+/// `heads` and `lookup` the long push's tip; let the long push go on; ask `heads`. Expect the one-changeset push `200`
+/// with no wait for the landing turn (before: it waited out the long push's run, 69 to 80% of its span in release);
+/// `heads` the empty repository's, then the small push's tip alone, the long push's tip unknown, though its segments
+/// are on the store; the long push then `200`, its fork re-based over the small push's entry, and `heads` both tips.
 #[test]
-fn a_small_push_waits_behind_a_whole_history_push_for_its_landing_turn() {
+fn a_one_changeset_push_lands_during_a_long_push_and_readers_see_only_named() {
   let (identity, certificate) = identity();
   let (daemon, _instance) = daemon_named(Some(identity));
   let port = daemon.vcs_http_port().expect("the edge started");
   let name = hg_name_on_the_repositorys_partition();
   enroll(&daemon, OWNER_TOKEN, OWNER, None);
-  let (made, bundle) = a_line_of(LONG_CHANGESETS);
   create_empty_hg(&daemon, &name);
+  let edge = (port, &certificate);
+  let (long_tip, long) = a_long_push_parked(&daemon, edge, &name);
+  let empty = hg_command(edge, &name, "heads");
+  let small = history_of(&[("lonely", "lonely", b"a small push\n", None, "default")]);
+  let began = std::time::Instant::now();
+  let pushed = hg_unbundle(edge, &name, &bundle_of(&small, &[0], None));
+  let small_took = began.elapsed();
+  let waits = counted_on(&daemon, REPOSITORY, crate::repository::hg_run::TURN_WAITS);
+  let during = hg_command(edge, &name, "heads");
+  let unknown = hg_command(
+    edge,
+    &name,
+    &format!("lookup&key={}", crate::verbs::hex_of(&long_tip)),
+  );
+  release_long_push(&daemon);
+  let long = long.join().expect("the long push answered");
+  let rebased = counted_on(&daemon, REPOSITORY, crate::repository::hg_run::REBASED);
+  let after = hg_command(edge, &name, "heads");
+  daemon.stop();
+  println!(
+    "staging: a one-changeset push took {small_took:?} during a {FRESH_CHANGESETS}-changeset push"
+  );
+  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
+  assert_eq!(waits, 0, "the small push never waited for the landing turn");
+  assert_eq!(empty, (200, format!("{}\n", "0".repeat(40)).into_bytes()));
+  let small_tip = crate::verbs::hex_of(&small[0].node);
+  assert_eq!(
+    during,
+    (200, format!("{small_tip}\n").into_bytes()),
+    "only the named push"
+  );
+  assert!(
+    !String::from_utf8_lossy(&unknown.1).starts_with("1 "),
+    "the long push's tip unknown: {}",
+    String::from_utf8_lossy(&unknown.1)
+  );
+  assert_eq!(long.0, 200, "{}", String::from_utf8_lossy(&long.2));
+  assert_eq!(
+    rebased, 1,
+    "the long push's fork re-based over the small push's entry"
+  );
+  let after = String::from_utf8_lossy(&after.1).into_owned();
+  for tip in [crate::verbs::hex_of(&long_tip), small_tip] {
+    assert!(after.contains(&tip), "{after}");
+  }
+}
+
+/// Main 01a20182's ruling of 2026-11-22 07:32 (a stale fork's re-base bounded, banned item 8: after one re-base off the
+/// landing turn, the next is taken holding it, so another push can never extend the retry). Do: start a push of
+/// [`FRESH_CHANGESETS`] changesets and park it once two segments have landed; push one unrelated changeset; have the
+/// repository's index counted changed once more right after the long push's first re-base
+/// (`hg_run::TEST_STALE_AFTER_REBASE`, as another push landing then would); let the long push go on. Expect the long
+/// push `200`, re-based twice, the second holding the turn (`vcs.hg.push_rebased_in_turn` 1), and `heads` both tips.
+#[test]
+fn a_long_push_stale_twice_is_re_based_once_holding_the_turn_and_lands() {
+  let (identity, certificate) = identity();
+  let (daemon, _instance) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  create_empty_hg(&daemon, &name);
+  let edge = (port, &certificate);
+  let (long_tip, long) = a_long_push_parked(&daemon, edge, &name);
+  let small = history_of(&[("lonely", "lonely", b"a small push\n", None, "default")]);
+  let pushed = hg_unbundle(edge, &name, &bundle_of(&small, &[0], None));
+  crate::daemon::observe_at(&daemon, REPOSITORY, |_| {
+    crate::repository::hg_run::TEST_STALE_AFTER_REBASE.with(|stale| stale.set(true));
+  });
+  release_long_push(&daemon);
+  let long = long.join().expect("the long push answered");
+  let rebased = (
+    counted_on(&daemon, REPOSITORY, crate::repository::hg_run::REBASED),
+    counted_on(
+      &daemon,
+      REPOSITORY,
+      crate::repository::hg_run::REBASED_IN_TURN,
+    ),
+  );
+  let after = hg_command(edge, &name, "heads");
+  daemon.stop();
+  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
+  assert_eq!(long.0, 200, "{}", String::from_utf8_lossy(&long.2));
+  assert_eq!(
+    rebased,
+    (2, 1),
+    "re-based off the turn, then once holding it"
+  );
+  let after = String::from_utf8_lossy(&after.1).into_owned();
+  for tip in [
+    crate::verbs::hex_of(&long_tip),
+    crate::verbs::hex_of(&small[0].node),
+  ] {
+    assert!(after.contains(&tip), "{after}");
+  }
+}
+
+/// Shape: the bytes of [`a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows`]'s one file: windows
+/// enough that a clone holding its whole pack would hold many more than a turn's look-ahead.
+const LET_GO_FILE: usize = 3 << 20;
+
+/// A-864 piece 3 (main 01a20182's ruling of 2026-11-22: a clone of a let-go pack is whole and holds at most a turn's
+/// windows, never its pack's). Do: start a two-shard store-backed daemon with its edge; push a create of `main` at a
+/// commit whose one file is [`LET_GO_FILE`] bytes, stored whole in its pack; mark every window of the pushed pack landed
+/// and let go those no home holds on the repository's shard (`vcs_store::let_go_read`), four or more; then clone `main`
+/// over the edge. Expect: the
+/// clone `200`, its pack the push's three objects; the stream stopped at a let-go window and brought windows back, the
+/// most it held at once (`git_resident.peak_windows`) a turn's look-ahead and the window it stopped at, three, far
+/// fewer than the pack's windows; and windows let go again behind its cursor. Red before: the clone made no stop, the
+/// pack's windows unread.
+#[test]
+fn a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, commit) = large_create(LET_GO_FILE);
+  let created = pushed(edge, &name, &request);
+  assert_eq!(created.0, 200, "{}", String::from_utf8_lossy(&created.1));
+  let (_, commands_end) = packets_from(&request, 0);
+  let pack = request
+    .get(commands_end..)
+    .expect("the push's pack")
+    .to_vec();
+  let window = crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
+    state
+      .vcs_stores
+      .content()
+      .map(slates_vcs::ContentStore::window)
+  })
+  .expect("the repository's content store");
+  let windows: Vec<slates_vcs::ContentId> =
+    pack.chunks(window).map(slates_vcs::ContentId::of).collect();
+  // Each window marked landed, as the landed pack's let-go marks it, and let go where no home holds it here (a two-shard
+  // daemon pins about half to their home).
+  let ids = windows.clone();
+  let (let_go, refused) = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    crate::vcs_store::within_budget(state, 0, |stores| {
+      let content = stores.content_mut().expect("the content store");
+      for id in &ids {
+        content.mark_landed(id);
+      }
+    });
+    let outcomes: Vec<_> = ids
+      .iter()
+      .map(|id| crate::vcs_store::let_go_read(state, id))
+      .collect();
+    // A window let go already (`Away`) is as good as one let go now.
+    let gone = |outcome: &Result<u64, slates_vcs::LetGoRefused>| {
+      matches!(outcome, Ok(_) | Err(slates_vcs::LetGoRefused::Away))
+    };
+    let went = outcomes.iter().filter(|outcome| gone(outcome)).count();
+    let why: Vec<String> = outcomes
+      .iter()
+      .filter(|outcome| !gone(outcome))
+      .filter_map(|outcome| outcome.as_ref().err())
+      .map(|refused| format!("{refused:?}"))
+      .collect();
+    (went, why)
+  });
+  let fetched = uploaded(edge, &name, &fetch_of(commit));
+  let counted = |kind| counted_on(&daemon, REPOSITORY, kind);
+  let observed = (
+    counted("vcs_store.git_upload.stops"),
+    counted("vcs_store.git_resident.peak_windows"),
+    counted("vcs_store.git_resident.let_go_behind"),
+  );
+  daemon.stop();
+  assert!(
+    let_go >= 1,
+    "{let_go} of {} windows let go: {refused:?}",
+    windows.len()
+  );
+  assert_eq!(fetched.0, 200);
+  assert_eq!(
+    ids_in(&fetched_pack(&fetched.1)).len(),
+    3,
+    "the clone whole"
+  );
+  // The clone may copy the encoding's kept parts rather than read the let-go pack; where it reads the pack, at most a
+  // turn's windows are held at once (`t_a864_a_fetch_lets_go_again_the_windows_its_cursor_has_passed` holds the
+  // mechanism to it whatever the clone reads).
+  let (_, peak, _) = observed;
+  assert!(
+    peak <= 3,
+    "at most a turn's windows held: {observed:?} of {}",
+    windows.len()
+  );
+}
+
+/// Shape: the annotated tags of [`an_advertisement_over_a_let_go_pack_is_the_one_over_it_held`]'s push, each laid in its
+/// pack between two of its files, so their entries lie in windows of their own.
+const LET_GO_TAGS: usize = 6;
+
+/// Stock git's request creating `main` at a root commit of [`LET_GO_TAGS`] files of a MiB each and an annotated tag of
+/// that commit after each file in its pack, `refs/tags/v<n>`: the request, the commit and the tags' names.
+fn tagged_spread_create() -> (Vec<u8>, ObjectId) {
+  use slates_git::object_name::Kind;
+  let mut state = 0x2545_f491_4f6c_dd1du64;
+  let files: Vec<Vec<u8>> = (0..LET_GO_TAGS)
+    .map(|_| {
+      (0..1 << 20)
+        .map(|_| {
+          state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+          state.to_be_bytes()[0]
+        })
+        .collect()
+    })
+    .collect();
+  let mut tree = Vec::new();
+  for (at, file) in files.iter().enumerate() {
+    tree.extend_from_slice(format!("100644 f{at}\0").as_bytes());
+    tree.extend_from_slice(git_name(Kind::Blob, file).as_bytes());
+  }
+  let tree_id = git_name(Kind::Tree, &tree);
+  let commit = format!(
+    "tree {tree_id}\nauthor A <a@example.com> 1700000000 +0000\n\
+     committer A <a@example.com> 1700000000 +0000\n\ntagged\n"
+  )
+  .into_bytes();
+  let commit_id = git_name(Kind::Commit, &commit);
+  let tags: Vec<Vec<u8>> = (0..LET_GO_TAGS)
+    .map(|at| {
+      format!(
+        "object {commit_id}\ntype commit\ntag v{at}\ntagger A <a@example.com> 1700000000 +0000\n\nv{at}\n"
+      )
+      .into_bytes()
+    })
+    .collect();
+  let mut objects: Vec<(Kind, &[u8])> = vec![(Kind::Commit, &commit), (Kind::Tree, &tree)];
+  for (file, tag) in files.iter().zip(&tags) {
+    objects.push((Kind::Blob, file));
+    objects.push((Kind::Tag, tag));
+  }
+  let pack = stored_pack(&objects);
+  let mut request = Vec::new();
+  let line = format!("{ZERO} {commit_id} refs/heads/main\0 report-status");
+  pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("the command");
+  for (at, tag) in tags.iter().enumerate() {
+    let line = format!("{ZERO} {} refs/tags/v{at}", git_name(Kind::Tag, tag));
+    pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("a command");
+  }
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request.extend_from_slice(&pack);
+  (request, commit_id)
+}
+
+/// Repository `name`'s upload-pack advertisement, as stock git asks it for a v0 clone: its tags peeled.
+fn upload_advertised(edge: (u16, &CertificateDer<'static>), name: &str) -> (u16, Vec<u8>) {
+  let (port, certificate) = edge;
+  let request = format!(
+    "GET /{name}/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: localhost\r\n{}\r\n\r\n",
+    owner_bearer()
+  );
+  exchange(port, certificate, request.as_bytes())
+}
+
+/// A-864's readers (main 01a20182's r52: after git/git's push landed and its pack's windows were let go, every fetch and
+/// ls-remote answered "possible repository corruption", the advertisement's tag peel reading a let-go window). Do: push
+/// a create of `main` and [`LET_GO_TAGS`] annotated tags, each tag's entry between two MiB files in the pack; read the
+/// upload-pack advertisement; mark every window of the pack landed and let go those no home holds on the repository's
+/// shard; read the advertisement again; clone `main`. Expect: the second advertisement the first, byte for byte, its tags
+/// peeled; windows brought back from the node's store to answer it; the clone whole. Red before: refused.
+#[test]
+fn an_advertisement_over_a_let_go_pack_is_the_one_over_it_held() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, commit) = tagged_spread_create();
+  let created = pushed(edge, &name, &request);
+  let report = String::from_utf8_lossy(&created.1).into_owned();
+  assert_eq!(
+    (created.0, report.matches("ok refs/").count()),
+    (200, 1 + LET_GO_TAGS),
+    "{report}"
+  );
+  let held = upload_advertised(edge, &name);
+  let (_, commands_end) = packets_from(&request, 0);
+  let pack = request
+    .get(commands_end..)
+    .expect("the push's pack")
+    .to_vec();
+  let window = crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
+    state
+      .vcs_stores
+      .content()
+      .map(slates_vcs::ContentStore::window)
+  })
+  .expect("the repository's content store");
+  let ids: Vec<slates_vcs::ContentId> =
+    pack.chunks(window).map(slates_vcs::ContentId::of).collect();
+  let let_go = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    crate::vcs_store::within_budget(state, 0, |stores| {
+      let content = stores.content_mut().expect("the content store");
+      for id in &ids {
+        content.mark_landed(id);
+      }
+    });
+    ids
+      .iter()
+      .filter(|id| {
+        matches!(
+          crate::vcs_store::let_go_read(state, id),
+          Ok(_) | Err(slates_vcs::LetGoRefused::Away)
+        )
+      })
+      .count()
+  });
+  let let_go_ok = let_go > 0;
+  let again = upload_advertised(edge, &name);
+  let brought = counted_on(&daemon, REPOSITORY, "vcs_store.read_through.brought_back");
+  let fetched = uploaded(edge, &name, &fetch_of(commit));
+  daemon.stop();
+  assert!(let_go_ok, "windows let go");
+  assert_eq!(held.0, 200);
+  assert!(
+    again == held,
+    "the advertisement over the let-go pack: {}",
+    String::from_utf8_lossy(&again.1)
+  );
+  assert!(
+    String::from_utf8_lossy(&held.1).contains("^{}"),
+    "its tags peeled: {}",
+    String::from_utf8_lossy(&held.1)
+  );
+  // Whether its tags' windows were among those let go (the rest pinned by their home) decides whether any was brought
+  // back to answer it; either way it is the same answer.
+  eprintln!("windows brought back to answer the advertisement: {brought}");
+  assert_eq!(fetched.0, 200);
+  assert_eq!(
+    ids_in(&fetched_pack(&fetched.1)).len(),
+    2 + LET_GO_TAGS,
+    "the clone of main whole: its commit, tree and files"
+  );
+}
+
+/// Format: the changesets and the bytes of each one's file in
+/// [`a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land`]: a history whose file texts are many
+/// segments' worth.
+const TEXTS_CHANGESETS: usize = 120;
+/// Format: the bytes of each file of that history.
+const TEXT_BYTES: usize = 8 * 1024;
+
+/// Main 01a20182's order of 2026-11-22 14:00 (CI 45065911852: 4.7 GB of arena held on the repository's shard after
+/// Mercurial's whole history landed, the content store keeping every revision's text). Do: start a two-shard daemon over
+/// loopback TLS; create a Mercurial repository; push a line of [`TEXTS_CHANGESETS`] changesets each adding a file of its
+/// own [`TEXT_BYTES`], cut at [`LONG_SEGMENT_BYTES`]; look at each file's window in its shard's content store; clone it
+/// whole (`getbundle`). Expect the push `200`; every file's window let go of the content store, its entry kept, but
+/// those a home pins on this shard (`vcs_store::landed_pin`, as a landed git pack's); the bytes let go counted; and the
+/// clone carrying the last file's bytes, brought back from the changeset store. Red before: the store held every text.
+#[test]
+fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
+  let (identity, certificate) = identity();
+  let (daemon, _instance) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  create_empty_hg(&daemon, &name);
+  let edge = (port, &certificate);
   crate::daemon::observe_at(&daemon, REPOSITORY, |_| {
     crate::repository::hg_run::TEST_SEGMENT_BYTES.with(|bound| bound.set(LONG_SEGMENT_BYTES));
   });
-  let began = std::time::Instant::now();
-  let long = {
-    let (certificate, name) = (certificate.clone(), name.clone());
-    std::thread::spawn(move || hg_unbundle((port, &certificate), &name, &bundle))
-  };
-  let held = loop {
-    let held = crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
-      state
-        .refusals
-        .get(crate::repository::hg_run::SEGMENTS_LANDED)
-        .copied()
-        .unwrap_or(0)
-        > 0
-    });
-    if held || long.is_finished() {
-      break held;
-    }
-    // The harness paces its looks at the long push's turn; the daemon under test waits on its drivers.
-    #[allow(clippy::disallowed_methods)]
-    std::thread::sleep(Duration::from_millis(5));
-  };
-  let small = history_of(&[("lonely", "lonely", b"a small push\n", None, "default")]);
-  let pushed = hg_unbundle((port, &certificate), &name, &bundle_of(&small, &[0], None));
-  let long = long.join().expect("the long push answered");
-  let span = began.elapsed();
-  let counted = |name: &'static str| {
-    crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
-      state.refusals.get(name).copied().unwrap_or(0)
+  let paths: &'static [String] = Box::leak(
+    (0..TEXTS_CHANGESETS)
+      .map(|at| format!("file-{at}"))
+      .collect::<Vec<_>>()
+      .into_boxed_slice(),
+  );
+  // Each file's text its own, so the store keeps every one (a content the store holds once, by its bytes).
+  let texts: &'static [Vec<u8>] = Box::leak(
+    (0..TEXTS_CHANGESETS)
+      .map(|at| {
+        let mut text = Vec::with_capacity(TEXT_BYTES);
+        let mut line = 0usize;
+        while text.len() < TEXT_BYTES {
+          text.extend_from_slice(format!("file {at} line {line}\n").as_bytes());
+          line += 1;
+        }
+        text.truncate(TEXT_BYTES);
+        text
+      })
+      .collect::<Vec<_>>()
+      .into_boxed_slice(),
+  );
+  let commits: Vec<Commit> = (0..TEXTS_CHANGESETS)
+    .map(|at| {
+      (
+        paths[at].as_str(),
+        paths[at].as_str(),
+        texts[at].as_slice(),
+        at.checked_sub(1),
+        "default",
+      )
     })
-  };
-  let (waits, waited_ns, segments) = (
-    counted(crate::repository::hg_run::TURN_WAITS),
-    counted(crate::repository::hg_run::TURN_WAITED_NS),
-    counted(crate::repository::hg_run::SEGMENTS_LANDED),
+    .collect();
+  let made = history_of(&commits);
+  let revs: Vec<usize> = (0..TEXTS_CHANGESETS).collect();
+  let pushed = hg_unbundle(edge, &name, &history_bundle(&made, &revs));
+  // Each file's window: whether its shard's content store reads its bytes (none for one let go), whether a home pins it
+  // there, and whether its entry stays.
+  let windows = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    let (shard, shards) = (state.shard, state.shards.clone());
+    crate::vcs_store::lent_state(state, |state| {
+      let content = state.vcs_stores.content()?;
+      Some(
+        texts
+          .iter()
+          .map(|text| {
+            let window = slates_vcs::ContentId::of(text);
+            let pinned = crate::vcs_store::landed_pin(shard, &shards, &window).is_some();
+            (
+              content
+                .object_bytes(&window, u64::try_from(text.len()).unwrap())
+                .is_some(),
+              pinned,
+              content.len_of(&window).is_some(),
+            )
+          })
+          .collect::<Vec<_>>(),
+      )
+    })
+  })
+  .expect("the repository's content store");
+  let let_go = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::repository::hg_run::TEXT_BYTES_LET_GO,
+  );
+  let tip = crate::verbs::hex_of(&made[TEXTS_CHANGESETS - 1].node);
+  let cloned = hg_getbundle(edge, &name, &tip);
+  daemon.stop();
+  let gone = windows.iter().filter(|(here, ..)| !here).count();
+  println!(
+    "let go: {let_go} bytes; {gone} of {TEXTS_CHANGESETS} files' windows gone, the rest pinned by a home"
+  );
+  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
+  for (at, (here, pinned, entry)) in windows.iter().enumerate() {
+    assert!(entry, "file {at}'s entry kept");
+    assert_eq!(
+      here, pinned,
+      "file {at}'s window at hand only where a home pins it"
+    );
+  }
+  assert!(gone > 0, "some window let go");
+  assert!(
+    let_go >= u64::try_from(gone * TEXT_BYTES).unwrap(),
+    "{let_go} bytes let go"
+  );
+  assert_eq!(cloned.0, 200);
+  let last = &texts[TEXTS_CHANGESETS - 1];
+  assert!(
+    cloned.2.windows(64).any(|window| window == &last[..64]),
+    "the clone carries the last file's bytes"
+  );
+}
+
+/// Main 01a20182's ruling of 2026-11-22 02:52 (C1 2b, an import keeping no file text once its segments are durable) and
+/// order of 14:00 (the arena a landed history left held). Do: start a two-shard daemon over loopback TLS; import the
+/// `states` repository into a Mercurial repository and land it; look at each of its file revisions' windows in its
+/// shard's content store; clone it whole (`getbundle`). Expect every file revision's window let go of the content store,
+/// its entry kept, but those a home pins on this shard (`vcs_store::landed_pin`); some let go and counted; and the clone
+/// `200` with a changegroup, its file texts brought back from the changeset store. Red before: the import kept every text.
+#[test]
+fn an_imported_repositorys_file_texts_leave_the_content_store_once_its_segments_land() {
+  let (identity, certificate) = identity();
+  let (daemon, _instance) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  create_hg_from_states(&daemon, &name);
+  let looked = {
+    let name = name.clone();
+    crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+      let (shard, shards) = (state.shard, state.shards.clone());
+      let id = state
+        .db
+        .partition()
+        .repositories()
+        .repository_named(&name)?
+        .id;
+      crate::vcs_store::lent_state(state, |state| {
+        let (content, store) = state.vcs_stores.mercurial_ref(id)?;
+        let mut seen = Vec::new();
+        let mut at = (Vec::new(), 0_u32);
+        while let Some((path, rev, row)) = store.index.file_revision_from(content, (&at.0, at.1)) {
+          let pinned = crate::vcs_store::landed_pin(shard, &shards, &row.bytes).is_some();
+          let len = content.len_of(&row.bytes);
+          let here = len.is_some_and(|len| content.object_bytes(&row.bytes, len).is_some());
+          seen.push((here, pinned, len.is_some()));
+          at = (path, rev.saturating_add(1));
+        }
+        Some(seen)
+      })
+    })
+  }
+  .expect("the imported repository's store");
+  let let_go = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::vcs_store::hg_import::FILE_TEXT_BYTES_LET_GO,
   );
   let heads = hg_command((port, &certificate), &name, "heads");
+  let tip = String::from_utf8_lossy(&heads.1)
+    .split_whitespace()
+    .next()
+    .unwrap_or_default()
+    .to_owned();
+  let cloned = hg_getbundle((port, &certificate), &name, &tip);
   daemon.stop();
+  let gone = looked.iter().filter(|(here, ..)| !here).count();
   println!(
-    "(i) a small push waited {:.1} ms behind a {LONG_CHANGESETS}-changeset push of {segments} segments that took {:.1} ms",
-    waited_ns as f64 / 1e6,
-    span.as_secs_f64() * 1e3
+    "an import's file texts: {gone} of {} windows let go, {let_go} bytes",
+    looked.len()
   );
-  assert!(held, "the long push's run held the turn before it answered");
-  assert_eq!(long.0, 200, "{}", String::from_utf8_lossy(&long.2));
-  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
-  assert_eq!(waits, 1, "the small push parked once");
-  assert!(waited_ns > 0);
-  let heads = String::from_utf8_lossy(&heads.1).into_owned();
-  for tip in [&made[LONG_CHANGESETS - 1].node, &small[0].node] {
-    assert!(heads.contains(&crate::verbs::hex_of(tip)), "{heads}");
+  assert!(!looked.is_empty(), "the import keeps file revisions");
+  for (at, (here, pinned, entry)) in looked.iter().enumerate() {
+    assert!(entry, "file revision {at}'s entry kept");
+    assert_eq!(
+      here, pinned,
+      "file revision {at}'s window at hand only where a home pins it"
+    );
   }
+  assert!(
+    gone > 0 && let_go > 0,
+    "some window let go: {gone}, {let_go} bytes"
+  );
+  assert_eq!(cloned.0, 200);
+  assert!(
+    cloned
+      .2
+      .windows(b"CHANGEGROUP".len())
+      .any(|window| window.eq_ignore_ascii_case(b"CHANGEGROUP")),
+    "the clone carries a changegroup"
+  );
 }

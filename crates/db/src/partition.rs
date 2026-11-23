@@ -512,7 +512,9 @@ impl Partition {
       snapshot_index: Art::new(),
       lineage: Art::new(),
       leases_by_holder: Art::new(),
-      lease_expiry: Wheel::new(caps.tick_ns, caps.timers, now_ns),
+      // Grown with the leases granted, as the tables beside it are (`Wheel::growing`): reserved whole, an empty partition's
+      // wheel held a slot for every volume it could ever hold.
+      lease_expiry: Wheel::growing(caps.tick_ns, caps.segment_slots, caps.timers, now_ns),
       lease_timers: BTreeMap::new(),
       lease_noted: None,
       termed_by_expiry: BTreeSet::new(),

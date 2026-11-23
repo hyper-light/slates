@@ -44,6 +44,7 @@ pub mod doorbell;
 pub mod endpoint;
 pub mod error;
 pub mod exit_watch;
+pub mod group_holders;
 #[cfg(windows)]
 pub mod handle_route;
 #[cfg(target_os = "linux")]
@@ -55,6 +56,8 @@ pub mod looks;
 /// transport does not reach it.
 #[cfg(target_os = "macos")]
 mod mach_claim;
+#[cfg(target_os = "macos")]
+mod mach_semaphore;
 #[cfg(target_os = "macos")]
 mod owner_name;
 pub mod park;

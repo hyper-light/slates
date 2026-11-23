@@ -386,7 +386,7 @@ fn table_rows_held(store: &mut ContentStore, bytes: &[u8], hold: bool) -> Result
 
 /// Gives back this index's hold of a table; a table freed with it gives back its rows'.
 fn release_table(store: &mut ContentStore, table: &ContentId) -> Result<(), IndexRefused> {
-  let Some(freed) = store.release(table)? else {
+  let crate::content::Freed::Table(freed) = store.release(table)? else {
     return Ok(());
   };
   let view = TableView::open_known(&freed).map_err(|_| IndexRefused::LayerMissing)?;

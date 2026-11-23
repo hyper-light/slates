@@ -111,58 +111,111 @@ const PUSH_SEGMENT_VERSION: u32 = 10;
 /// are the log's.
 const RUN_VERSION: u32 = 9;
 
-/// An import's or a push's run of segment changesets on the changeset log, as its register record names it
-/// ([`RUN_VERSION`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Format: the version of a push's record in the repository's register once its segments are on the changeset log at
+/// sequences other landings may lie between (main 01a20182's rulings of 2026-11-22 07:32 and 12:00: a push lands its
+/// segments apart from its repository's landing turn, which it takes only for its entry's commit): the head, a push's
+/// source, then the count of ranges and each range's first and last sequence, ascending and apart
+/// ([`write_push_runs_reference`], [`run_of`]). Bound: at most one range a segment, so never past the push's segments.
+const RUNS_VERSION: u32 = 11;
+
+/// An import's or a push's run of segment changesets on the changeset log, as its register record names it: the
+/// sequences of its segments, as ranges ascending and apart, one for an import's ([`RUN_VERSION`]), as many as other
+/// landings cut it into for a push's ([`RUNS_VERSION`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Run {
   /// Whose run it is: an import's or a push's.
   pub source: Source,
-  /// The room the import ran within.
+  /// The room the import or the intake ran within.
   pub room: u64,
+  /// Its segments' sequences: each range's first and last, ascending and apart.
+  pub ranges: Vec<(u64, u64)>,
+}
+
+impl Run {
   /// The first segment's sequence.
-  pub first: u64,
+  pub fn first(&self) -> Option<u64> {
+    self.ranges.first().map(|(first, _)| *first)
+  }
+
   /// The last segment's sequence.
-  pub last: u64,
+  pub fn last(&self) -> Option<u64> {
+    self.ranges.last().map(|(_, last)| *last)
+  }
+
+  /// Every segment's sequence, in order.
+  pub fn sequences(&self) -> impl Iterator<Item = u64> + '_ {
+    self.ranges.iter().flat_map(|(first, last)| *first..=*last)
+  }
 }
 
 /// The register's record of an import landed as the segment changesets `first` to `last` ([`RUN_VERSION`]).
-pub fn write_run_reference(room: u64, run: (u64, u64)) -> Vec<u8> {
-  run_reference(Source::Import, room, run)
-}
-
-/// The register's record of a push landed as the segment changesets `first` to `last` ([`RUN_VERSION`]; main 01a20182's
-/// ruling (b1) of 2026-11-22 04:44). A made changeset lands as one changeset ([`write_made_reference`]).
-pub fn write_push_run_reference(room: u64, run: (u64, u64)) -> Vec<u8> {
-  run_reference(Source::Push, room, run)
-}
-
-/// [`RUN_VERSION`]'s record of `source`'s run.
-fn run_reference(source: Source, room: u64, (first, last): (u64, u64)) -> Vec<u8> {
+pub fn write_run_reference(room: u64, (first, last): (u64, u64)) -> Vec<u8> {
   let mut out = Vec::new();
   out.extend_from_slice(&MAGIC.to_le_bytes());
   out.extend_from_slice(&RUN_VERSION.to_le_bytes());
-  out.push(source.byte());
+  out.push(Source::Import.byte());
   out.extend_from_slice(&room.to_le_bytes());
   out.extend_from_slice(&first.to_le_bytes());
   out.extend_from_slice(&last.to_le_bytes());
   out
 }
 
-/// The run a register record names, where it is an import's or a push's run reference ([`RUN_VERSION`]); `None` for any
-/// other record, a run whose last precedes its first, and a reference that does not read whole.
+/// The register's record of a push landed as the segment changesets at `ranges`' sequences ([`RUNS_VERSION`]); none for
+/// no range, or ranges not ascending and apart. A made changeset lands as one changeset ([`write_made_reference`]).
+pub fn write_push_runs_reference(room: u64, ranges: &[(u64, u64)]) -> Option<Vec<u8>> {
+  if !apart(ranges) {
+    return None;
+  }
+  let mut out = Vec::new();
+  out.extend_from_slice(&MAGIC.to_le_bytes());
+  out.extend_from_slice(&RUNS_VERSION.to_le_bytes());
+  out.push(Source::Push.byte());
+  out.extend_from_slice(&room.to_le_bytes());
+  out.extend_from_slice(&to_u64(ranges.len()).to_le_bytes());
+  for (first, last) in ranges {
+    out.extend_from_slice(&first.to_le_bytes());
+    out.extend_from_slice(&last.to_le_bytes());
+  }
+  Some(out)
+}
+
+/// Whether `ranges` are one at least, each first no later than its last, and each past the one before.
+fn apart(ranges: &[(u64, u64)]) -> bool {
+  !ranges.is_empty()
+    && ranges.iter().all(|(first, last)| first <= last)
+    && ranges.windows(2).all(|pair| match pair {
+      [(_, before), (after, _)] => after > before,
+      _ => true,
+    })
+}
+
+/// The run a register record names, where it is an import's run reference ([`RUN_VERSION`]) or a push's
+/// ([`RUNS_VERSION`]); `None` for any other record (a push's [`RUN_VERSION`] among them: no push writes one), ranges
+/// not ascending and apart, and a reference that does not read whole.
 pub fn run_of(bytes: &[u8]) -> Option<Run> {
   let mut reader = Reader { rest: bytes };
   let (version, source, room) = head(&mut reader).ok()?;
-  if version != RUN_VERSION || !matches!(source, Source::Import | Source::Push) {
-    return None;
-  }
-  let first = reader.long().ok()?;
-  let last = reader.long().ok()?;
-  (reader.rest.is_empty() && first <= last).then_some(Run {
+  let ranges = match (version, source) {
+    (RUN_VERSION, Source::Import) => {
+      vec![(reader.long().ok()?, reader.long().ok()?)]
+    }
+    (RUNS_VERSION, Source::Push) => {
+      let count = usize::try_from(reader.long().ok()?).ok()?;
+      if count.checked_mul(LONG_BYTES.saturating_mul(2))? != reader.rest.len() {
+        return None;
+      }
+      let mut ranges = Vec::with_capacity(count);
+      for _ in 0..count {
+        ranges.push((reader.long().ok()?, reader.long().ok()?));
+      }
+      ranges
+    }
+    _ => return None,
+  };
+  (reader.rest.is_empty() && apart(&ranges)).then_some(Run {
     source,
     room: room.left(),
-    first,
-    last,
+    ranges,
   })
 }
 
@@ -2116,6 +2169,7 @@ fn head(reader: &mut Reader<'_>) -> Result<(u32, Source, Admission), Refused> {
     SEGMENT_VERSION,
     RUN_VERSION,
     PUSH_SEGMENT_VERSION,
+    RUNS_VERSION,
   ]
   .contains(&version)
   {

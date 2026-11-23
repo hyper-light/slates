@@ -17298,6 +17298,97 @@ ubuntu-24.04-arm:
 - In the fair class on these kernels, 84a's 1 ms loaded bar is below the tick: unreachable by any arm that keeps the
   daemon and the client fair.
 
+## 84a on macOS: the reply wake on its region's Mach semaphore, landed (A-867; w-perf; 2026-11-22)
+
+**What was measured first.** The reply write was the serve loop's long hold, timed by parts (runs 45072617323,
+45072811313, 45074388808). Of the reply write's wakes over 1 ms, 1,451 of 1,504 were on CPU for at least 90% of their
+wall time, inside `os_sync_wake_by_address_any`.
+- A spindump (run 45082342692): 69 of the wake's 106 samples sat at one kernel instruction.
+- Probes on the same runner (runs 45078071137, 45079961886, 45086631612):
+  - an address wake of an already-sleeping waiter: p999 15-72 µs;
+  - a wake that meets the waiter entering its wait: 13-24 wakes over 1 ms in one pass of three, up to 14 ms, mostly on
+    CPU, even with no spinners;
+  - a pipe: the same shape;
+  - a Mach semaphore: at most 2, worst 1.7 ms, mostly off CPU.
+- Bare metal (a Mac Studio, 32 cores, 64 spinners, 8 runs, main's check): no reply wake ran 1 ms. The loaded p99 was
+  0.16-0.19 ms. The spin is the VM's: a lock holder's vCPU descheduled.
+
+**The run.** Run 45091701553 (`diag-measurer-w-perf-84a-mac-tail`): A = 0ce3b100d (the address wake) against B =
+947239f7d (the semaphore, then named in the region's header, which only an in-process daemon could use). One
+macos-latest runner, 8 rounds, the arms alternating. Each arm had a quiet run and a stamped loaded run, with the
+time-constraint control beside it. Cells are the pooled goal lines (3 × 1,000 samples), µs, rounds in order.
+
+| | A | B |
+|---|---|---|
+| loaded accept p99 | 1082 · 1870 · 1662 · 1878 · 1314 · 3342 · 1596 · 2719 | 1094 · 1233 · 1317 · 894 · 633 · 1048 · 903 · 823 |
+| loaded conflict p99 | 944 · 4728 · 7450 · 7246 · 8496 · 3874 · 3541 · 529 | 1485 · 720 · 1585 · 1240 · 386 · 1486 · 2132 · 641 |
+| loaded accept p999 | 6671 · 6383 · 10188 · 8041 · 5817 · 12689 · 6396 · 8455 | 4132 · 7346 · 5555 · 6675 · 1331 · 2362 · 1796 · 2376 |
+| loaded conflict p999 | 5922 · 12391 · 13063 · 17737 · 20546 · 8297 · 9517 · 3049 | 11664 · 3635 · 17168 · 18291 · 1220 · 9610 · 7914 · 3997 |
+| quiet accept p50 | 284 · 234 · 295 · 281 · 274 · 386 · 380 · 245 | 295 · 287 · 300 · 303 · 219 · 176 · 198 · 374 |
+| quiet accept p99 | 1813 · 1216 · 918 · 502 · 541 · 1190 · 1556 · 966 | 535 · 793 · 606 · 1072 · 593 · 301 · 655 · 1079 |
+| reply wakes >= 1 ms | 194 · 373 · 636 · 599 · 409 · 305 · 383 · 102 | 4 · 13 · 3 · 6 · 0 · 7 · 2 · 1 |
+
+**Landed** (A-867), with the semaphore's send right carried to the client with its region's fileport.
+- The runner was slow: A's p99 ran 1-3 ms against 0.3-0.6 ms in earlier runs.
+- B took reply wakes over 1 ms from 3,001 to 36.
+- B won accept p99 in 7 of 8 rounds and conflict p99 in 6 of 8. Median p99: 1,766 against 976 µs (accept), 4,301
+  against 1,363 µs (conflict).
+- B won accept p999 in 7 of 8 rounds. Conflict p999 was mixed (3 of 8).
+- Quiet was no worse: p50 even, p99 better.
+- B's remaining tail is long verbs inside the serve loop (ReadRange 10-22 ms, Destroy 13.6 ms, CreateWork 12.6 ms,
+  Telemetry and Acknowledge about 11 ms), on codex-review's list. One semaphore signal also ran 27.7 ms: rarer, not
+  immune.
+- Confirming rounds run on the landed code (main).
+
+## 84a on Linux: a client's request pinned to its shard's CPU (arm F, on E), measured and rejected (w-perf; 2026-11-22)
+
+**The arm** (F b44f0904f on E 0b568ac91, branch `agents/w-perf-84a-arm-f`, never main; stamped F_diag 9ad9d4cc9 against
+E_diag 58f792741). It rested on one idea: under `PREEMPT_LAZY`, a fair wakeup waits for the tick only because its waker
+keeps running. A client that writes its request and blocks on its shard's own CPU would hand that CPU to the shard at
+the block, and the shard's park would hand it back.
+- `slates_machine::request_pin` pins the calling thread to one CPU of its own mask and puts the exact mask back after.
+- The client region gains the shard's CPU word (layout version 5), which `DaemonEnd::reply` publishes.
+- `Client::round_trip` pins each synchronous request. E's short slices stay on the shards and the client's park.
+- Red first: F's test failed against E's tree (exit 101) and passed on F. Every request was pinned (8,587 and 12,854 a
+  run; 1 skipped each; 0 refused restores).
+
+**The run.** Run 45087231374 (`diag-measurer-w-perf-84a-f-ab`), CI's ubuntu-24.04-arm and ubuntu-latest (4 vCPUs,
+kernel 7.0, two spinners a CPU). It interleaved 5 loaded rounds, 3 quiet rounds with `provision_bench`, and 3 stamped
+loaded rounds. Each cell is a round's median of its 3 runs, µs, rounds in order.
+
+| | E | F |
+|---|---|---|
+| arm64 loaded accept p99 | 342 · 342 · 341 · 343 · 2997 | 360 · 352 · 354 · 362 · 366 |
+| arm64 loaded conflict p99 | 4000 · 3000 · 327 · 340 · 326 | 356 · 356 · 880 · 755 · 825 |
+| arm64 loaded accept p999 | 605 · 1138 · 801 · 362 · 5993 | 1048 · 364 · 1116 · 398 · 1074 |
+| arm64 loaded conflict p999 | 6000 · 5000 · 1185 · 904 · 896 | 1827 · 937 · 1684 · 1800 · 912 |
+| arm64 kick -> run p99 (stamped) | 998 · 998 · 998 | 998 · 998 · 997 |
+| arm64 quiet accept p50 | 126 · 126 · 127 | 158 · 157 · 159 |
+| arm64 quiet accept p99 | 176 · 169 · 168 | 222 · 231 · 232 |
+| arm64 R9 spinning p99 | 98 · 97 · 93 | 281 · 283 · 283 |
+| x86_64 loaded accept p99 | 1751 · 1254 · 1740 · 1765 · 1391 | 2201 · 2042 · 1750 · 1729 · 1838 |
+| x86_64 loaded accept p999 | 1962 · 1874 · 1991 · 2201 · 1851 | 3254 · 3130 · 1992 · 1909 · 3027 |
+| x86_64 loaded conflict p999 | 1844 · 2073 · 3996 · 1808 · 1855 | 2919 · 3103 · 3039 · 1931 · 3125 |
+| x86_64 quiet accept p99 | 147 · 148 · 147 | 205 · 216 · 197 |
+| x86_64 R9 spinning p99 | 48 · 70 · 72 | 259 · 255 · 253 |
+
+**Rejected.** It fails all three parts of its test.
+- arm64's kick -> run p99 stays at the tick (998 µs). Those kicks are shard to shard (a forward's owner kick,
+  `registry::kick_if_parked`), and F moves only the client's hop.
+- x86_64's loaded p99 and p999 are worse. Its tail is not the tick (kick -> run p99 15-621 µs in both arms): the p999
+  tail's client wake (written -> seen) has a median of 2.7-2.8 ms under F, against 0.07-0.98 ms under E.
+- Quiet is worse on both: accept p50 +25-30%, p99 +25-40%.
+- R9's single spinning client goes from 48-98 µs to 253-283 µs, because a client spinning for its reply on its
+  shard's CPU competes with that shard.
+- Why a direct wake waits for the tick (kernel v7.0 source, read 2026-11-22):
+  - `wakeup_preempt_fair` (kernel/sched/fair.c) reschedules a preempting wakeup with `resched_curr_lazy` only. Its
+    `PREEMPT_SHORT` path cancels the current task's slice protection when the wakee's slice is shorter
+    (`cancel_protect_slice`).
+  - `__resched_curr` (kernel/sched/core.c) sends no IPI for the lazy bit, and `sched_tick` upgrades a pending lazy bit
+    to a full one.
+  - `exit_to_user_mode_loop` (kernel/entry/common.c) honours `_TIF_NEED_RESCHED_LAZY` on any return to user mode.
+  - So a woken shard on a CPU whose spinner never enters the kernel runs at that CPU's next tick, whatever its slice.
+
 ## 84a on macOS: the doorbell thread under the time-constraint policy, measured, not landed (w-perf; 2026-11-22)
 
 **What was measured first.** The diagnostic branch is `diag-measurer-w-perf-84a-mac-tail` (never main; CI
@@ -18411,3 +18502,45 @@ Every run: oracle failures 0, refusals 0, lost 0.
 - Beside it, the quiet reference: on the big Studio (M3 Ultra, 32 cores, 2026-11-21 23:03) A's SubmitAccepted p50 was
   0.38 to 0.45 ms. On the same hardware B at a3e673efc (format 6 with d44f0166a, before A-854) was 356 to 429 ms.
 - A-825 is closed by A-854 (GAPS).
+
+## An idle heap give-back for the import's freed small blocks: measured and rejected (w-interop; main 01a20182's ruling; 2026-11-22)
+
+- **Why asked.** main's r80 (the big Studio, an svn import of git-2000.dump at b79b54350, idle 30 s, another run on the
+  box): RSS 1.14 GB, footprint 670 MB. `vmmap -summary`: `MALLOC_SMALL` 452 MB virtual, 415 MB resident, 334.5 MB
+  dirty; `MALLOC_SMALL (empty)` 512 MB virtual, 507.7 MB resident, 235.0 MB dirty in 128 regions; `MALLOC_TINY`
+  128 KiB; `VM_ALLOCATE` 23.3 MB dirty. No mapped file. The 235 MB of empty small regions is freed blocks libmalloc
+  keeps dirty for reuse. (vmmap's suspend lost that daemon: the anchor's beat lapsed.)
+- **Machine and probe.** This MacBook (Adas-MacBook-Pro-2.local, macOS 26, Darwin 25.4), 2026-11-22 ~17:40 PST, load
+  average 43 to 65 (shared; not quiesced). A standalone C program (clang -O1) allocates 512 MiB in blocks of one
+  size, writes every byte, frees every block, sleeps 5 s, calls `malloc_zone_pressure_relief(NULL, 0)`, and reads its
+  own physical footprint (`proc_pid_rusage` `ri_phys_footprint`) at each step. No daemon was suspended.
+
+| block | held (MiB) | after free | 5 s idle | relief released | after relief |
+|---|---|---|---|---|---|
+| 512 B | 523 | 28 | 28 | 0 | 28 |
+| 2 KiB | 517 | 22 | 22 | 0 | 22 |
+| 8 KiB | 515 | 133 | 133 | 0 | 133 |
+| 64 KiB | 515 | 515 | 515 | 0 | 515 |
+| 8 KiB, `MallocAggressiveMadvise=1` | 515 | 133 | 133 | 0 | 133 |
+| 64 KiB, `MallocAggressiveMadvise=1` | 515 | 515 | 515 | 0 | 515 |
+| 8 KiB, `MallocSpaceEfficient=1` | 515 | 3 | 3 | 0 | 3 |
+| 64 KiB, `MallocSpaceEfficient=1` | 515 | 3 | 3 | 0 | 3 |
+
+- **Churn cost of `MallocSpaceEfficient=1`.** A second probe (clang -O2) keeps 4,096 live blocks and makes 4,000,000
+  random alloc-and-free pairs; three runs each, default first:
+
+| sizes | default (ns a pair) | `MallocSpaceEfficient=1` |
+|---|---|---|
+| 64 B to 64 KiB | 1,656 / 1,681 / 1,526 | 13,884 / 10,349 / 8,447 |
+| 16 B to 1 KiB | 155 / 236 / 246 | 273 / 206 / 180 |
+
+- **Rejected, each:**
+  - An idle `malloc_zone_pressure_relief`: it released 0 bytes at every size (as A-742 found for large blocks on
+    2026-11-20).
+  - `MallocSpaceEfficient=1`, set by the anchor for the daemon: it takes the freed 515 MB down to 3 MB, but makes
+    every 64 B to 64 KiB alloc-and-free pair 5 to 8 times slower. That is a hot-path cost paid to tidy an idle figure,
+    and a process-wide mode switch.
+  - A lower large-path floor (medium blocks mapped and unmapped on their own): a syscall and a zero-fill a block.
+    Not measured.
+- **Kept:** the pages are libmalloc's own cache, which the next work reuses; not a leak. The cause is upstream: the
+  import churns about 500 MB of small blocks it frees again (GAPS, w-svn's import, P7's finding (2)).

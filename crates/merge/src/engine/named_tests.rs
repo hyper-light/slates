@@ -3,6 +3,9 @@
 use std::cell::Cell;
 use std::collections::BTreeMap;
 
+use proptest::prelude::*;
+use proptest::test_runner::TestCaseError;
+
 use super::{Green, Increment, Outcome};
 use crate::increment::{Base, VolumeOp, compose_volume_planned};
 use crate::named::{Identity, NamedRun, ObjectMissing, Objects};
@@ -463,4 +466,411 @@ fn spliced_and_created(
   let created = green.content("new").unwrap();
   assert_eq!(created, whole);
   assert_eq!(created.as_ptr(), whole_buffer, "the whole run was copied");
+}
+
+/// Goal 93, A-760 for a recorded version (main 01a20182's ruling of 2026-11-22 ~13:35, the Subversion import's batch:
+/// its real green applies each version as its entry records it, after the scratch member judged it). Do: judge and
+/// commit a work creating `big` from a 4 MiB named run on one green; on a fresh green, apply the version as its entry
+/// records it (`Green::apply_recorded`) from the same work read again. Expect: the replayed file the text's bytes and
+/// the very buffer its run was read into (no copy), its head identity the judged green's. Failing first: the recorded
+/// apply made the file with `apply`, a copy of the run's bytes (the import's 12.3 MB `apply` ← `apply_recorded` site).
+#[test]
+fn a_recorded_versions_whole_run_becomes_the_file_with_no_copy() {
+  const TEXT: usize = 4 << 20;
+  let bytes: Vec<u8> = (0..TEXT)
+    .map(|at| u8::try_from(at % 239).unwrap())
+    .collect();
+  let mut plane = Plane::default();
+  let object = plane.put(bytes.clone());
+  let mut judged_work = named_create("big", object);
+  while !judged_work.read_step(&plane, 1 << 20).unwrap() {}
+  let mut judging = Green::new();
+  let judged = match judging.judge_named(&mut judged_work) {
+    super::Judgment::Accepted(judged) => judged,
+    other => panic!("not accepted: {other:?}"),
+  };
+  let (version, applied) = judging.commit_judged(judged).unwrap();
+  let mut work = named_create("big", object);
+  while !work.read_step(&plane, 1 << 20).unwrap() {}
+  let buffer = work.post().runs[0].as_ptr();
+  let mut replaying = Green::new();
+  assert_eq!(replaying.apply_recorded(&mut work, &applied), version);
+  assert_eq!(replaying.head_identity(), judging.head_identity());
+  let file = replaying.content("big").unwrap();
+  assert_eq!(file, bytes.as_slice());
+  assert_eq!(
+    file.as_ptr(),
+    buffer,
+    "the recorded file is a copy of its run"
+  );
+}
+
+/// Shape: the paths a generated history changes.
+const PATHS: [&str; 3] = ["a", "b", "c"];
+
+/// Shape: the objects a generated history's named runs come from.
+const OBJECTS: usize = 4;
+
+/// Object `k` of a generated history's plane: distinct bytes, at least two long, so a part of it is never the whole.
+fn object_bytes(k: usize) -> Vec<u8> {
+  format!("object {k}; ").repeat(k + 2).into_bytes()
+}
+
+/// What a generated version does to one path (A-760 (b), item 3's first piece).
+#[derive(Clone, Debug)]
+enum Change {
+  /// Leaves it alone.
+  Keep,
+  /// Makes it the whole of object `k`, named.
+  Whole(usize),
+  /// Makes it a part of object `k` (where and how long, as fractions of the object), named but never the whole.
+  Part(usize, u8, u8),
+  /// Makes it these bytes, carried.
+  Inline(Vec<u8>),
+  /// Overwrites these bytes into it at a fraction of its length, carried (`Inline` where no file stands).
+  Splice(u8, Vec<u8>),
+  /// Takes it away (nothing where no file stands).
+  Remove,
+}
+
+/// A generated version: a change for each of [`PATHS`]; whether the files made whole of one object share one run;
+/// whether its verdict's files are made a slice a step before its commit (`Green::make_step`).
+#[derive(Clone, Debug)]
+struct Version {
+  changes: Vec<Change>,
+  share: bool,
+  stepped: bool,
+}
+
+/// A version's bytes added to a path: carried, or a run of object `k` (offset, length).
+enum Adding {
+  Inline(Vec<u8>),
+  Run(usize, u64, u64),
+}
+
+/// What the model holds at a path: the file's bytes and the object it is the whole of, by the design's rule.
+type Model = BTreeMap<String, (Vec<u8>, Option<Identity>)>;
+
+/// What the oracle saw, so a history that checked nothing fails: files named and moved, named and sharing a run,
+/// named and then changed away from the name, named and kept across a later version, and versions made in steps.
+#[derive(Debug, Default)]
+struct NameCensus {
+  moved: u64,
+  shared: u64,
+  changed_away: u64,
+  kept: u64,
+  stepped: u64,
+}
+
+impl NameCensus {
+  fn met(&self) -> bool {
+    self.moved > 0 && self.shared > 0 && self.changed_away > 0 && self.kept > 0 && self.stepped > 0
+  }
+}
+
+/// The work `version` makes over `model` as increment `index`, judged at `base`, and the model after it; none when it
+/// changes nothing.
+fn version_work(
+  index: usize,
+  base: u64,
+  model: &Model,
+  version: &Version,
+  identities: &[Identity],
+) -> Option<(Increment, Model)> {
+  let mut journal = Vec::new();
+  let mut adds: Vec<(String, Adding)> = Vec::new();
+  let mut after = model.clone();
+  for (path, change) in PATHS.iter().zip(&version.changes) {
+    let path = (*path).to_owned();
+    let standing = model.get(&path).map(|(bytes, _)| bytes.clone());
+    let (made, name, adding) = match (change, &standing) {
+      (Change::Keep, _) | (Change::Remove, None) => continue,
+      (Change::Remove, Some(_)) => {
+        journal.push(VolumeOp::Unlink { path: path.clone() });
+        after.remove(&path);
+        continue;
+      }
+      (Change::Splice(at, bytes), Some(old)) if !old.is_empty() => {
+        let at = usize::from(*at) % old.len();
+        let len = bytes.len().min(old.len() - at);
+        let mut made = old.clone();
+        made[at..at + len].copy_from_slice(&bytes[..len]);
+        journal.push(VolumeOp::Overwrite {
+          path: path.clone(),
+          at: at as u64,
+          len: len as u64,
+        });
+        adds.push((path.clone(), Adding::Inline(bytes[..len].to_vec())));
+        after.insert(path, (made, None));
+        continue;
+      }
+      (Change::Whole(k), _) => {
+        let bytes = object_bytes(*k);
+        let len = bytes.len() as u64;
+        (bytes, Some(identities[*k]), Adding::Run(*k, 0, len))
+      }
+      (Change::Part(k, from, take), _) => {
+        let bytes = object_bytes(*k);
+        let offset = usize::from(*from) % bytes.len();
+        let mut len = 1 + usize::from(*take) % (bytes.len() - offset);
+        if offset == 0 && len == bytes.len() {
+          len -= 1;
+        }
+        let part = bytes[offset..offset + len].to_vec();
+        (part, None, Adding::Run(*k, offset as u64, len as u64))
+      }
+      (Change::Inline(bytes), _) | (Change::Splice(_, bytes), _) => {
+        (bytes.clone(), None, Adding::Inline(bytes.clone()))
+      }
+    };
+    match &standing {
+      None => journal.push(VolumeOp::Create { path: path.clone() }),
+      Some(old) if !old.is_empty() => journal.push(VolumeOp::Truncate {
+        path: path.clone(),
+        len: 0,
+      }),
+      Some(_) => {}
+    }
+    journal.push(VolumeOp::Extend {
+      path: path.clone(),
+      at: 0,
+      len: made.len() as u64,
+    });
+    adds.push((path.clone(), adding));
+    after.insert(path, (made, name));
+  }
+  if journal.is_empty() {
+    return None;
+  }
+  let files: Vec<(String, u64)> = model
+    .iter()
+    .map(|(path, (bytes, _))| (path.clone(), bytes.len() as u64))
+    .collect();
+  let (doc, _) = compose_volume_planned(&Base::of_files(files), &journal).unwrap();
+  let mut work = Increment {
+    id: *blake3::hash(&index.to_le_bytes()).as_bytes(),
+    base,
+    doc,
+    post_state: Vec::new(),
+    evidence: Vec::new(),
+    named: Default::default(),
+  };
+  // The post-state's one address space: the carried bytes first, then each run in order.
+  let mut srcs: BTreeMap<String, u64> = BTreeMap::new();
+  for (path, adding) in &adds {
+    if let Adding::Inline(bytes) = adding {
+      srcs.insert(path.clone(), work.post_state.len() as u64);
+      work.post_state.extend_from_slice(bytes);
+    }
+  }
+  let mut shared: BTreeMap<usize, u64> = BTreeMap::new();
+  for (path, adding) in &adds {
+    let Adding::Run(k, offset, len) = adding else {
+      continue;
+    };
+    let whole = *offset == 0 && *len == identities[*k].len;
+    let src = match shared.get(k) {
+      Some(src) if version.share && whole => *src,
+      _ => {
+        let src = work
+          .push_named(NamedRun {
+            identity: identities[*k],
+            offset: *offset,
+            len: *len,
+          })
+          .unwrap();
+        if version.share && whole {
+          shared.insert(*k, src);
+        }
+        src
+      }
+    };
+    srcs.insert(path.clone(), src);
+  }
+  let mut seen: BTreeMap<String, u32> = BTreeMap::new();
+  for op in &mut work.doc.ops {
+    if matches!(
+      op.kind,
+      crate::ops_doc::OpKind::Overwrite
+        | crate::ops_doc::OpKind::Insert
+        | crate::ops_doc::OpKind::Extend
+    ) {
+      let path = work.doc.paths.path(op.path).unwrap().to_owned();
+      op.src = srcs[&path];
+      *seen.entry(path).or_default() += 1;
+    }
+  }
+  assert!(
+    seen.values().all(|count| *count == 1),
+    "a path took two adding ops: {seen:?}"
+  );
+  Some((work, after))
+}
+
+/// `green`'s files and their names are `model`'s, for every one of [`PATHS`].
+fn holds_model(green: &Green, model: &Model, which: &str) -> Result<(), TestCaseError> {
+  for path in PATHS {
+    let held = model.get(path);
+    prop_assert_eq!(
+      green.content(path),
+      held.map(|(bytes, _)| bytes.as_slice()),
+      "{}'s bytes at {}",
+      which,
+      path
+    );
+    prop_assert_eq!(
+      green.name_of(path),
+      held.and_then(|(_, name)| *name),
+      "{}'s name at {}",
+      which,
+      path
+    );
+  }
+  Ok(())
+}
+
+/// Reads `work`'s runs from `plane` a few bytes a step, so a run is read over several steps.
+fn read_all(work: &mut Increment, plane: &Plane) {
+  while !work.read_step(plane, 7).unwrap() {}
+}
+
+/// Runs `versions` through a judging green and a green applying each as its entry records it, both against the model.
+fn run_names(versions: &[Version], census: &mut NameCensus) -> Result<(), TestCaseError> {
+  let mut plane = Plane::default();
+  let identities: Vec<Identity> = (0..OBJECTS).map(|k| plane.put(object_bytes(k))).collect();
+  let mut judging = Green::new();
+  let mut replaying = Green::new();
+  let mut model = Model::new();
+  for (index, version) in versions.iter().enumerate() {
+    let Some((mut work, after)) = version_work(index, judging.head(), &model, version, &identities)
+    else {
+      continue;
+    };
+    read_all(&mut work, &plane);
+    let super::Judgment::Accepted(mut judged) = judging.judge_named(&mut work) else {
+      return Err(TestCaseError::fail(format!("version {index} not accepted")));
+    };
+    if version.stepped {
+      while !judging.make_step(&mut judged, 5).unwrap().done {}
+      census.stepped += 1;
+    }
+    let (number, applied) = judging.commit_judged(judged).unwrap();
+    let (mut recorded, _) =
+      version_work(index, replaying.head(), &model, version, &identities).unwrap();
+    read_all(&mut recorded, &plane);
+    prop_assert_eq!(replaying.apply_recorded(&mut recorded, &applied), number);
+    count_names(&model, &after, version, census);
+    model = after;
+    holds_model(&judging, &model, "the judging green")?;
+    holds_model(&replaying, &model, "the replaying green")?;
+    prop_assert_eq!(replaying.head_identity(), judging.head_identity());
+  }
+  Ok(())
+}
+
+/// Counts what one version did to the names, from the model before and after it ([`NameCensus`]).
+fn count_names(before: &Model, after: &Model, version: &Version, census: &mut NameCensus) {
+  for (path, change) in PATHS.iter().zip(&version.changes) {
+    let was = before.get(*path).and_then(|(_, name)| *name);
+    let now = after.get(*path).and_then(|(_, name)| *name);
+    match change {
+      Change::Whole(k) => {
+        let sharing = version
+          .changes
+          .iter()
+          .filter(|other| matches!(other, Change::Whole(j) if j == k))
+          .count();
+        if version.share && sharing > 1 {
+          census.shared += 1;
+        } else {
+          census.moved += 1;
+        }
+      }
+      Change::Keep if was.is_some() => census.kept += 1,
+      _ if was.is_some() && now.is_none() && after.contains_key(*path) => census.changed_away += 1,
+      _ => {}
+    }
+  }
+}
+
+/// A generated version ([`Version`]).
+fn generated_version() -> impl Strategy<Value = Version> {
+  let change = prop_oneof![
+    2 => Just(Change::Keep),
+    3 => (0..OBJECTS).prop_map(Change::Whole),
+    1 => (0..OBJECTS, any::<u8>(), any::<u8>()).prop_map(|(k, from, take)| Change::Part(k, from, take)),
+    1 => prop::collection::vec(any::<u8>(), 1..8).prop_map(Change::Inline),
+    1 => (any::<u8>(), prop::collection::vec(any::<u8>(), 1..8))
+      .prop_map(|(at, bytes)| Change::Splice(at, bytes)),
+    1 => Just(Change::Remove),
+  ];
+  (
+    prop::collection::vec(change, PATHS.len()),
+    any::<bool>(),
+    any::<bool>(),
+  )
+    .prop_map(|(changes, share, stepped)| Version {
+      changes,
+      share,
+      stepped,
+    })
+}
+
+/// A-760 (b), item 3's first piece (main 01a20182's order of 2026-11-22 17:00: the green's block names the plane's
+/// object; each piece with its oracle against `apply_recorded` on generated histories). Do: run a fixed history, then
+/// generated ones, of versions that make files whole of a named object (alone, or two files sharing one run), of part of
+/// one, of carried bytes, splice carried bytes into them, leave them alone or take them away, judged and committed on
+/// one green (some made a slice a step first) and applied as their entries record them on another. Expect: after every
+/// version both greens hold the model's bytes and names: a file is named for the object exactly when the version that
+/// last changed it made it the whole of that object's run, and the two greens' heads are one. Failing first: no file was
+/// named (the commit made every block unnamed).
+#[test]
+fn a_file_made_whole_of_a_named_object_is_named_for_it_until_changed() {
+  let fixed = vec![
+    Version {
+      changes: vec![Change::Whole(0), Change::Whole(1), Change::Whole(1)],
+      share: true,
+      stepped: false,
+    },
+    Version {
+      changes: vec![
+        Change::Keep,
+        Change::Inline(b"carried".to_vec()),
+        Change::Part(2, 1, 3),
+      ],
+      share: false,
+      stepped: true,
+    },
+    Version {
+      changes: vec![
+        Change::Splice(1, b"xy".to_vec()),
+        Change::Whole(3),
+        Change::Remove,
+      ],
+      share: false,
+      stepped: false,
+    },
+  ];
+  let mut census = NameCensus::default();
+  if let Err(failure) = run_names(&fixed, &mut census) {
+    panic!("the fixed history: {failure}");
+  }
+  assert!(
+    census.met(),
+    "the fixed history checks too little: {census:?}"
+  );
+  let census = std::cell::RefCell::new(census);
+  let config = slates_test_seeds::unseeded(proptest::test_runner::Config {
+    cases: slates_test_seeds::cases(64),
+    ..proptest::test_runner::Config::default()
+  });
+  let mut runner = proptest::test_runner::TestRunner::new(config);
+  let result = runner.run(
+    &prop::collection::vec(generated_version(), 1..10),
+    |versions| run_names(&versions, &mut census.borrow_mut()),
+  );
+  if let Err(failure) = result {
+    panic!("{failure}");
+  }
+  eprintln!("name oracle census: {:?}", census.into_inner());
 }

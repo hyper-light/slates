@@ -733,3 +733,49 @@ fn a864_an_encoding_that_meets_a_let_go_window_stops_cleanly_and_keeps_the_same_
   assert_eq!((reused, reused_again), (objects, objects));
   assert!(kept_again == kept, "the same clone of the same fragments");
 }
+
+/// A-864 piece 2's progress (main 01a20182's r29: git/git's clone stalled after 183 KB on 1930df65d, a stop that never
+/// went on). Do: land the `create` push in a store of 256-byte windows, let every window of its pack go, and stream its
+/// clone a turn at a time, never bringing a window back, for at most a turn a window and a few. Expect: the stream stops
+/// once at the first window it meets, and on the next turn, that window still let go, refuses typed rather than
+/// stopping again: a stop always makes progress or ends. Red before: it stopped every turn, never ending.
+#[test]
+fn a864_a_window_never_brought_back_is_stopped_at_once_then_refused_never_waited_for_again() {
+  use crate::store::{Progress, Turn, Upload};
+  let (repository, mut store, _, pack) = landed_create_in(PIECE2_WINDOW);
+  for window in pack.chunks(PIECE2_WINDOW).map(ContentId::of) {
+    assert!(store.mark_landed(&window));
+    store.let_go(&window).unwrap();
+  }
+  let clone = super::Answer::objects(&super::reached_now(&repository, &store, 1));
+  let mut upload = Upload::new(clone, &repository);
+  let mut clock = super::Ticks(0);
+  let mut admission = Admission::new(u64::MAX);
+  let mut out = Vec::new();
+  let bound = pack.len() / PIECE2_WINDOW + 4;
+  let mut stops = 0;
+  let mut ended = None;
+  for _ in 0..bound {
+    let turn = Turn {
+      clock: &mut clock,
+      exchange: super::EXCHANGE,
+      quantum_ns: u64::MAX,
+    };
+    match upload.advance(&repository, &store, turn, &mut admission, &mut out) {
+      Ok(Progress::Done) => {
+        ended = Some(Ok(()));
+        break;
+      }
+      Ok(Progress::More) => stops += usize::from(upload.waiting().is_some()),
+      Err(refused) => {
+        ended = Some(Err(refused));
+        break;
+      }
+    }
+  }
+  assert_eq!(stops, 1, "stopped once at the first window met");
+  assert!(
+    matches!(ended, Some(Err(_))),
+    "then refused, not waited for: {ended:?}"
+  );
+}

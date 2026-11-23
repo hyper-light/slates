@@ -1815,7 +1815,7 @@ fn a_version_recorded_after_an_owed_push_is_applied_once_it_is_materialized() {
     Some(1)
   );
   assert_eq!(
-    twin.apply_recorded(&built2.increment, &applied.unwrap()),
+    twin.apply_recorded(&mut built2.increment.clone(), &applied.unwrap()),
     2,
     "the later version answered while owed"
   );
@@ -1864,7 +1864,10 @@ fn a_signature_recorded_on_a_version_in_the_owed_tail_is_kept() {
   assert!(eager.record_signature(2, verdict));
   let mut twin = Green::new();
   assert_eq!(twin.defer(DeferredPush::of(&push1)), Some(1));
-  assert_eq!(twin.apply_recorded(&built2.increment, &applied.unwrap()), 2);
+  assert_eq!(
+    twin.apply_recorded(&mut built2.increment.clone(), &applied.unwrap()),
+    2
+  );
   assert!(
     twin.record_signature(2, verdict),
     "the verdict of a version the owing green stands for is taken"

@@ -2197,12 +2197,13 @@ pub struct ShardReport {
 pub struct MemoryKindReport {
   /// The kind.
   pub kind: String,
-  /// Its mappings: one each for the segment and the content object, an arena's extents, a region per client, the large
-  /// allocations mapped on their own for the heap.
+  /// Its mappings: one each for the segment and the content object, an arena's extents, a region per client, and for
+  /// `large` the allocations mapped on their own (`heap`, the system allocator, reports none).
   pub mappings: u64,
-  /// The address space it reserves: the mappings' lengths, or for the heap what the allocators hold from the OS.
+  /// The address space it reserves: the mappings' lengths, or for `heap` what the system allocator holds from the OS.
   pub reserved_bytes: u64,
-  /// Its bytes in RAM, from the kernel's page table (or for the heap the bytes live allocations hold, now); 0 until
+  /// Its bytes in RAM, from the kernel's page table (for `heap` the bytes the system allocator's live blocks hold, now;
+  /// for `large` the mapped blocks' pages in RAM, never their spans, main 01a20182's (b1) of 2026-11-22); 0 until
   /// measured ([`MemoryKindReport::measured`]). For `arenas` and `regions`, the arenas' held runs and the clients' rings
   /// as the last sweep to pass them found them: a sweep walks them first, so they are read within one pass over what is
   /// held, not over the address space reserved (main's ruling of 2026-11-21 on w-sizing's option (a)); for `segment` and

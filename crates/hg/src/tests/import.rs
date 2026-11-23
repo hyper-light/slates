@@ -1542,42 +1542,59 @@ fn an_import_writes_the_changegroup_a_push_of_its_history_brings() {
   }
 }
 
-/// Main 01a20182's ruling (b1) of 2026-11-22 04:44 (a push lands as a run of segment changesets; its entry names the
-/// run, record v9). Do: write a push's run reference of segments 4 to 11 in a room of 1 MiB; read it back; write an
-/// import's of the same run. Expect the golden bytes (the magic, version 9, the push's source byte 1, the room, the first
-/// and the last sequence, each little-endian); the run read back whole as a push's; the import's the same bytes but its
-/// source byte, read back as an import's.
+/// Main 01a20182's rulings of 2026-11-22 07:32 and 12:00 (a push lands its segments apart from its repository's landing
+/// turn, at sequences other landings may lie between; its entry names them as ranges, record v11). Do: write a push's
+/// runs reference of segments 4 to 6 and 9 to 11 in a room of 1 MiB; read it back; cut it at every length, add a byte;
+/// write ranges overlapping, out of order, and none; read an import's v9 run. Expect the golden bytes (the magic,
+/// version 11, the push's source byte 1, the room, the count 2, then each range's first and last, each little-endian);
+/// the run read back whole, its sequences 4, 5, 6, 9, 10, 11; every damaged one read as no run; no reference for
+/// ranges not ascending and apart, nor for none; and the import's v9 run one range.
 #[test]
-fn a_pushs_run_reference_is_the_golden_bytes_and_reads_back_as_a_pushs() {
-  use crate::import::record::{Run, Source, run_of, write_push_run_reference, write_run_reference};
-  let written = write_push_run_reference(1 << 20, (4, 11));
+fn a_pushs_runs_reference_is_the_golden_bytes_and_reads_back_as_its_ranges() {
+  use crate::import::record::{
+    Run, Source, run_of, write_push_runs_reference, write_run_reference,
+  };
+  let written = write_push_runs_reference(1 << 20, &[(4, 6), (9, 11)]).unwrap();
   let golden: Vec<u8> = [
     &b"SHGR"[..],
-    &9u32.to_le_bytes(),
+    &11u32.to_le_bytes(),
     &[1],
     &(1u64 << 20).to_le_bytes(),
+    &2u64.to_le_bytes(),
     &4u64.to_le_bytes(),
+    &6u64.to_le_bytes(),
+    &9u64.to_le_bytes(),
     &11u64.to_le_bytes(),
   ]
   .concat();
   assert_eq!(written, golden);
+  let run = run_of(&written).unwrap();
   assert_eq!(
-    run_of(&written),
-    Some(Run {
+    run,
+    Run {
       source: Source::Push,
       room: 1 << 20,
-      first: 4,
-      last: 11
-    })
+      ranges: vec![(4, 6), (9, 11)]
+    }
   );
-  let imported = write_run_reference(1 << 20, (4, 11));
-  let source_at = 8;
-  assert_eq!(imported[source_at], 0);
-  assert_eq!(imported[..source_at], written[..source_at]);
-  assert_eq!(imported[source_at + 1..], written[source_at + 1..]);
+  assert_eq!(run.sequences().collect::<Vec<_>>(), [4, 5, 6, 9, 10, 11]);
+  for cut in 0..written.len() {
+    assert_eq!(run_of(&written[..cut]), None, "cut at {cut}");
+  }
+  let mut trailing = written.clone();
+  trailing.push(0);
+  assert_eq!(run_of(&trailing), None);
+  for ranges in [&[(4, 9), (9, 11)][..], &[(9, 11), (4, 6)], &[(6, 4)], &[]] {
+    assert_eq!(
+      write_push_runs_reference(1 << 20, ranges),
+      None,
+      "{ranges:?}"
+    );
+  }
+  let imported = run_of(&write_run_reference(1 << 20, (4, 11))).unwrap();
   assert_eq!(
-    run_of(&imported).map(|run| run.source),
-    Some(Source::Import)
+    (imported.source, imported.ranges),
+    (Source::Import, vec![(4, 11)])
   );
 }
 
@@ -1594,8 +1611,7 @@ fn an_imports_run_reference_reads_back_whole_or_not_at_all() {
     Some(Run {
       source: crate::import::record::Source::Import,
       room: 1 << 20,
-      first: 3,
-      last: 9
+      ranges: vec![(3, 9)]
     })
   );
   for cut in 0..written.len() {

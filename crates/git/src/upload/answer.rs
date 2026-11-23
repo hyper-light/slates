@@ -134,13 +134,23 @@ impl Framing {
 
 /// A refusal past an answer's room held for its caller (A-855, [`Answer::holding`]).
 struct Held {
-  /// The room it ran past.
-  past: PastAdmission,
+  /// Why it is held: the room it ran past, or the let-go window a read of it met.
+  cause: HeldFor,
   /// The refusal, answered as it was made if the caller gives up.
   refusal: Refusal,
   /// For one made before the sections the pack follows were written, the words it answers with, kept unwritten; none
   /// for one made after them, which ends the pack with git's band-3 words ([`Answer::abandon`]).
   words: Option<Vec<u8>>,
+}
+
+/// Why a refusal is held, not answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeldFor {
+  /// It ran past this room (A-855): the answer is made again in a wider one.
+  Room(PastAdmission),
+  /// A read of it met this let-go window (A-864's readers; main 01a20182's r52): the answer is made again once the
+  /// window is brought back.
+  Away(crate::store::packed::Waited),
 }
 
 /// The room a refusal ran past, where it is one an answer made again in a wider room could avoid (A-855): the answer's
@@ -419,9 +429,19 @@ impl<K> Answer<K> {
   ) {
     // A refusal answered in place of this answer keeps whether it is held, and what the client has (A-855).
     let (holds, already) = (self.holds, self.already);
+    let (head_before, written_before) = (self.head.len(), self.head_written);
     self.choose_unit(served, packs, admission, spent);
     self.holds = holds;
     self.already = already;
+    // A-864's readers: a refusal whose read met a let-go window is held for it, whatever it is, before the pack begins.
+    if self.held.is_none()
+      && self.pack.is_none()
+      && self.refusal.is_some()
+      && let Some(waited) = served.repository.waiting()
+    {
+      self.hold_away(waited, (head_before, written_before));
+      return;
+    }
     self.hold_refused();
   }
 
@@ -658,7 +678,7 @@ impl<K> Answer<K> {
       && let Some(past) = past_room(&refusal)
     {
       self.held = Some(Held {
-        past,
+        cause: HeldFor::Room(past),
         refusal,
         words: None,
       });
@@ -715,15 +735,56 @@ impl<K> Answer<K> {
       return;
     };
     self.held = Some(Held {
-      past,
+      cause: HeldFor::Room(past),
       refusal,
       words: Some(core::mem::take(&mut self.head)),
     });
   }
 
-  /// The room a held refusal ran past ([`Answer::holding`]), if one is held.
+  /// Holds the answer's refusal where a read of it met a let-go window (A-864's readers; main 01a20182's r52: git/git's
+  /// advertisement and every fetch refused once its pack's windows were let go): before the pack's source begins, the
+  /// refusal kept unwritten with the window it met, nothing more written; what the client has (`written_before` of the
+  /// head, the head `head_before` long before the unit) kept, as [`Answer::written`] tells it. Its caller brings the
+  /// window back and makes the answer again, passing over what this one wrote, the same answer byte for byte under the
+  /// same generation (A-855's rule), or gives up ([`Answer::give_up`]), which answers the refusal as it was made.
+  fn hold_away(
+    &mut self,
+    waited: crate::store::packed::Waited,
+    (head_before, written_before): (usize, usize),
+  ) {
+    let Some(refusal) = self.refusal.take() else {
+      return;
+    };
+    // A refusal answered before anything was written keeps its words, as one past its room does; one after keeps the
+    // head as written, its band-3 words, if any, dropped.
+    let words =
+      (written_before == 0 && self.head_written == 0).then(|| core::mem::take(&mut self.head));
+    if words.is_none() {
+      self.head.truncate(head_before.max(written_before));
+      self.head_written = written_before;
+    }
+    self.held = Some(Held {
+      cause: HeldFor::Away(waited),
+      refusal,
+      words,
+    });
+  }
+
+  /// The room a held refusal ran past ([`Answer::holding`]), if one is held for its room.
   pub fn held(&self) -> Option<&PastAdmission> {
-    self.held.as_ref().map(|held| &held.past)
+    self.held.as_ref().and_then(|held| match &held.cause {
+      HeldFor::Room(past) => Some(past),
+      HeldFor::Away(_) => None,
+    })
+  }
+
+  /// The let-go window a held refusal's read met (A-864's readers), if one is held for it: its caller brings it back and
+  /// makes the answer again ([`Answer::skip_written`]), or gives up.
+  pub fn held_away(&self) -> Option<crate::store::packed::Waited> {
+    self.held.as_ref().and_then(|held| match held.cause {
+      HeldFor::Away(waited) => Some(waited),
+      HeldFor::Room(_) => None,
+    })
   }
 
   /// How many bytes of the answer are written: what an answer made again to the same request passes over

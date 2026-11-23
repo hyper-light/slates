@@ -5374,7 +5374,8 @@ shard it woke needed on a busy machine; its wake estimate, seeded with `spin_ns`
 is still learned), then clear the reply stamp slot this park names (the two
 slots alternate park by park, A-199), set `parked` to that slot's value (1 or 2), fence
 (`SeqCst`; the park protocol, A-44), re-check the reply (to close the race), and wait on the wake word
-(futex / `os_sync_wait_on_address(SHARED)` / the Event). A call that waits while its daemon lives waits on the daemon's
+(futex / `os_sync_wait_on_address(SHARED)` / the Event), or, on macOS where the region came with its reply wake
+semaphore, on that semaphore, its flag saying so (4 or 5 for the slot; A-867). A call that waits while its daemon lives waits on the daemon's
 departure beside its reply (A-456): Linux polls the completion eventfd and the control socket instead of the futex,
 Windows waits on the Event and the daemon's process handle together, and macOS keeps the word; both look at the
 daemon's liveness (its exit watch and the instance's start stamp) on a doubling schedule, since a daemon restarted
@@ -30088,8 +30089,10 @@ The steps' own records follow.
   what a wedged daemon shows: no beat, no CPU, nothing runnable, every thread in a wait (the suspend count is readable
   only through the task port). Past the anchor's window it kills the daemon as frozen, as this rule asks: w-hg's
   `vmmap -summary` of a daemon mapping ~220 GB took 2.42 s and lost the daemon at each look. Read the daemon's memory
-  from the daemon instead: `slates status` reports it by kind (segment, content, arenas, regions, heap), read in process
-  with nothing suspended (§4.14).
+  from the daemon instead: `slates status` reports it by kind (segment, content, arenas, regions, heap, large), read in
+  process with nothing suspended (§4.14). `heap` is the system allocator (reserved: what it holds from the OS; resident:
+  what its live blocks hold); `large` is the blocks mapped on their own (reserved: their spans; resident: their pages in
+  RAM). Until 2026-11-22 one `heap` row counted the large blocks' spans as resident (main 01a20182's (b1)).
 
 ### A-277 — A fleet node may bind elsewhere than it advertises (2026-11-17, built for goal g229, chaos across real processes)
 
@@ -58008,6 +58011,13 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > and 4/4 integration, the seam's own: a 300,001-byte pack read the same staged (borrowed), landed (RAM 0 after its
 > release) and recovered with and without a checkpoint.
 >
+> **2026-11-22, shared payloads.** The `P` lookup names one live payload section. Each additional copy has its log
+> offset appended to the key. Forgetting or replacing the section that supplies reads selects one surviving copy,
+> even across repositories. The last removal drops the lookup. Reads take one point lookup. On its first open with
+> this index, an existing checkpoint rebuilds the places from the changeset rows it still holds. The rebuilt index
+> and its marker commit at the same offset. Subsequent opens replay the tail as before.
+> `forgetting_a_duplicate_payload_keeps_the_surviving_changesets_bytes` exercises both orders of removal.
+>
 > **Status (2026-11-20, piece C3 step 4: the A/B's derived per-path arm, decided).** Main's bar: changesets plus a derived
 > per-path form must meet the per-file arm's old read (91 µs p50) and clone file section (0.27 s). Arm C of
 > `crates/hg/examples/changeset_ab.rs` (BENCHMARKS, "Mercurial's history as changesets with a derived per-file form"):
@@ -58227,17 +58237,18 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > An import refused midway leaves an unnamed run that recovery passes over, and the next landing takes the last named
 > sequence plus one (decision 2).
 
-> **Status (2026-11-22, a push lands as a run of segment changesets; main 01a20182's rulings (b1) and (i) of 04:44).**
-> A push's intake cuts its kept texts into segments of an import's size and lands each as it is cut, between its
-> slices: `Record` the segment's rows by identity (record v8, the push's source), `Payload` its slice of the
-> changegroup, `Texts` its texts; what the texts charged the push's admission is given back once each lands. The
-> push's entry names the run (record v9, the push's source byte 1), and a restart replays it as an import's run, rows by
-> identity, no payload read. A run's rows are numbered after the index's, and a replay reads its sequences first to
-> last, so the repository's landing turn (Subversion's, which Mercurial's made changesets hold too) is held from the
-> run's first segment to the entry; a push of the same repository parks for it within the room wait's patience, and a
-> fork made stale before the turn is taken again inside it, never re-based. A run no entry names is abandoned: its
-> sequences are landed again by the next landing, each store row the newest landing at it. A made changeset stays one
-> changeset (record v7). `repository::hg_run`; crash oracle `t_b1_a_crash_at_any_segment_boundary_leaves_a_push_whole_or_absent`.
+> **Status (2026-11-22, a push lands as a run of segment changesets apart from the landing turn; main 01a20182's
+> rulings (b1) of 04:44, 07:32 and 12:00).** A push's intake cuts its kept texts into segments of an import's size and
+> lands each as it is cut, between its slices: `Record` the segment's rows by node and identity (record v10),
+> `Payload` its slice of the changegroup, `Texts` its texts; what the texts charged the push's admission is given back
+> once each lands. Segments land at the repository's next sequences, which its owner shard allocates, other landings
+> between them; the push's entry names them as ranges (record v11), and a restart replays exactly those, each record's
+> rows by node over the index as it stands then. The repository's landing turn (Subversion's, which Mercurial's made
+> changesets hold too) is taken for the entry's commit alone: a fork another landing made stale is re-based by node
+> first, off the turn, and once more holding it at most. Readers see only what an entry names. A run no entry names
+> is forgotten as it ends. The store drops its rows and retains every payload another changeset still holds (C3).
+> A made changeset stays one changeset (record v7).
+> `repository::hg_run`, `hg_push::rebase`; crash oracle `t_b1_a_crash_at_any_segment_boundary_leaves_a_push_whole_or_absent`.
 
 > **Status (2026-11-21, C1: made changesets on the changeset store; main's ruling of 09:00).** A changeset the server
 > makes of a submitted version is a changegroup the server builds, taken through the push's own intake and landed as
@@ -60995,6 +61006,20 @@ owed.
   a fetch brought back let go behind its cursor (w-shared's `let_go_read`, with 2b(a)), so residency at its peak is a
   turn's windows, gauged; and the end-to-end red over a real pushed pack, which needs 2b(a)'s let-go of `Shared`
   windows.
+- **Piece 3 and the readers off the stream** (main 01a20182's r52 and rulings of 2026-11-22). An answer keeps the
+  windows its read-through brought back (`vcs_http::git::upload::Resident`) and hands each to `vcs_store::let_go_read`
+  once its cursor has passed it (a window a home holds stays, `Pinned`), the most held at once gauged
+  (`git_resident.peak_windows`, `let_go_behind`). Before the pack, a refusal whose read met a let-go window (the
+  advertisement's and ls-refs' tag peel, the negotiation's walks, the shallow and filter cuts) is held
+  (`Answer::held_away`), and the edge's driver, both edges, brings the window back and makes the answer again over the
+  same generation within the same room, passing over what it wrote (A-855's rule, byte for byte); the answer's creation
+  is made again likewise, nothing of it written. The same window met twice with nothing written between gives up typed.
+  A stop now waits for the same window once with nothing done between (it may be met again once let go behind), and
+  every bring-back is bounded by `vcs_share::wait::PATIENCE_NS`. So `vcs_store::commit` lets a landed push's pack go
+  again (main's guard c9bb36dc5 lifted). Tests: w-shared's
+  `a_push_of_annotated_tags_is_listed_and_fetched_whole_once_its_pack_is_landed` (1,115,127 bytes let go before the
+  listing); `an_advertisement_over_a_let_go_pack_is_the_one_over_it_held`; `t_a864_a_fetch_lets_go_again_the_windows_its_cursor_has_passed`;
+  `a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows`.
 - **The encoding's side** (main 01a20182's note of 2026-11-22: the last whole-pack residency). An encoding unit whose
   pushed entry lies in a let-go window, or a copy reaching one, stops the same way (`Encoding::waiting`, `stopped`), its
   object put back first in line; its driver brings that window back before the next turn. Nothing makes a repository's
@@ -61052,3 +61077,79 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
   - w-svn's byte-sampled in-process attribution (500 files of 8 KiB, then 300 revisions of 3 changed, 11.65 MB):
     130.8 MB allocated before, 108.0 MB after. `Increment::encode`, the post-state and the scratch member's `apply`
     leave the sites; `read_step` stands twice, for the scratch member and for the real green.
+
+### A-866 — A green's block made whole of a named object keeps the object's name (2026-11-22, w-svn; main 01a20182's order of 17:00 PST, goal 93; A-760 (b) items 3-7, piece 1 of 4; A-760, A-865)
+
+- **Why.** Since A-865 a Subversion version names its texts, and its entry records the names, not the bytes. But the
+  green still holds each text whole on the heap beside the content store, and so do its checkpoint and its history.
+  Items 3-7 (A-760's owed line) take those copies away by holding a file by its content-plane object. That needs the
+  block to know which object it is. The identity space is the content store's object root (w-perf's addendum of
+  2026-11-20 to the block seam), the identity a named run already carries, so no chunk reference enters the engine.
+- **The pieces** (main's ruling: one a piece, smallest first, each with its oracle against `apply_recorded` on
+  generated histories):
+  1. The block keeps its name (this entry).
+  2. A checkpoint names a named file instead of carrying its bytes.
+  3. The history keeps a named version by its name.
+  4. The current block holds no bytes, and every read goes through the plane.
+- **The rule.** A version that makes a file of exactly one named run, which is its object whole (from its first byte,
+  the object's length), names the file's block for that object: `dims::Blocks`' slot carries the identity,
+  `Green::name_of` reads it. A name says what the bytes are, not where they came from. So a file named is named whether
+  its run's buffer moved into it or two files of one run each took a copy. Anything that keeps the block keeps the
+  name: a version that leaves the file alone, a copy's tree grafted by reference, a hold. Every other making gives a
+  new block with no name: a part of an object, carried bytes, a splice, a hard link's hand-over, a copy's fix (a file
+  its source changed since the copied version), a revert, a restore. Appending to a staged block clears any name.
+  Copies, hand-overs and reverts are outside the oracle's histories; the rule holds there by construction, since each
+  makes its block with `Files::insert`, which names nothing.
+- **Where.** `Green::sole_runs` finds each file made of one run. `alone` keeps those whose buffer moves; `named_files`
+  keeps those named. Both are found together, so a verdict made a slice a step (`Making::names`) and its commit agree.
+  The commit hands each effect's name to its staged file (`StagedFile::name`), and `Files::insert_named` makes the
+  block. A judged verdict carries its work's runs (`Judged::runs`).
+- **Oracle.** `engine::named_tests::a_file_made_whole_of_a_named_object_is_named_for_it_until_changed`. A fixed history
+  runs first, then 64 generated histories of up to nine versions over three paths and four objects, each version
+  judged and committed on one green (some made a slice a step first) and applied as its entry records it on another.
+  After every version, both greens' bytes and names must equal a model kept by the rule, and the two heads must be one.
+  Census of one run: 355 files named and moved, 20 named and sharing a run, 143 changed away from a name, 87 kept
+  across a later version, 210 versions made in steps. Failing first: the commit named no block (`left: None`).
+- **Not yet.** No memory moves in this piece. A checkpoint carries bytes, so a restored green names nothing (piece 2).
+- **Applied in the same change to** `crates/merge` (`dims`, `engine`, `engine/copy`, `engine/named_tests`), GAPS,
+  amendments.tsv.
+
+### A-867 — A macOS client's synchronous park waits on its region's Mach semaphore, sent with the region (2026-11-22, w-perf; main 01a20182's order of ~17:40 PST, goal 84a; A-831, A-799, A-44, GAP-A9-9)
+
+- **Why.** Under the time-constraint policy (A-831), a shard's reply wake of a parked client
+  (`os_sync_wake_by_address_any` on the region's shared wake word) cost the shard 1-33 ms of its own CPU in the kernel
+  about once in a hundred loaded requests on CI's macOS runner. Of 1,504 such wakes, 1,451 were on CPU for at least
+  90% of their time (run 45074388808). A spindump put 69 of the wake's 106 samples at one kernel instruction (run
+  45082342692).
+- **What it is.** A probe reproduced the spin where a wake meets its waiter entering its wait. It came in bursts and
+  showed even with no load at all (run 45086631612). That is a lock holder's vCPU descheduled by the VM's host: on
+  bare metal (a Mac Studio, 8 loaded runs) no wake ran 1 ms. The client parks at once (A-799), so its reply meets it
+  entering the wait on most requests. In the probe a Mach semaphore's signal did not spin so.
+- **The rule.** The daemon makes one semaphore with each client region. Its send right goes to the instance's owner
+  with the region's fileport, and the owner hands both to the claimant (`crate::mach_claim`: a keep and a delivery
+  each carry two descriptors).
+  - A synchronous park on a region that came with its semaphore raises a flag of its own, 4 or 5 for the stamp slot
+    (`region::PARKED_SEMAPHORE_SLOT_ZERO`, `_ONE`). It then fences, re-checks its ring as every park does (A-44), and
+    waits on the semaphore. The daemon signals the semaphore for such a flag instead of waking the word.
+  - A semaphore counts its signals, so a signal made before the wait is not lost. One made for a reply the re-check
+    already found ends the next park early, and the loop looks at its ring again.
+  - Every other park keeps the address wake: an async SDK's arm, which its completion bridge waits on, and any mapping
+    that came without the semaphore (a second mapping, a test's open by name).
+  - A semaphore found destroyed (its daemon's region dropped, as a restart does) is let go. That park, and the
+    mapping's later ones, wait on the word, where the look at the daemon's life ends them.
+  - The owner's keep refuses a stranger's keep as before. A message not of the keep's shape is destroyed with its
+    rights, and a right never handed over is given back with its delivery.
+- **Measured.** CI's macOS runner, 8 interleaved rounds against the address wake (run 45091701553):
+  - reply wakes over 1 ms: 3,001 against 36;
+  - the loaded edit and merge's p99, median of rounds: accept 1,766 against 976 µs, conflict 4,301 against 1,363 µs;
+  - quiet no worse.
+  - The p999 stays over 1 ms on that runner, bound by long verbs (BENCHMARKS).
+- **Tests.**
+  - `crates/ipc/tests/rendezvous.rs`
+    `a_parked_client_in_another_process_is_woken_by_its_regions_semaphore`: the client process's park, woken only by a
+    reply made after its flag rose, ends by its semaphore, counted (`ClientEnd::semaphore_wakes`). It failed first
+    with the semaphore named in the region's header (the A/B's arm), whose wait another task refuses
+    (`KERN_INVALID_NAME`).
+  - `mach_claim::tests::a_fetched_wake_right_signals_the_kept_regions_semaphore`.
+- **Applied in the same change to** `crates/ipc` (`mach_semaphore`, `mach_claim`, `region`, `endpoint`, `rendezvous`,
+  `tests/rendezvous.rs`), `unsafe-budget.toml`, GAPS, BENCHMARKS, amendments.tsv.

@@ -326,6 +326,9 @@ pub struct Encoding {
   /// The let-go window a unit met and stopped at, its work kept to be taken again once it is brought back (A-864 piece
   /// 2's encoding side): taken by [`Encoding::waiting`].
   waiting: core::cell::Cell<Option<packed::Waited>>,
+  /// The let-go windows the encoding has stopped at, each by its pack and index: one stop a window (A-864 piece 2's
+  /// progress).
+  stopped_at: BTreeSet<(ContentId, u64)>,
   /// The commits, trees and tags' part, once encoded.
   objects: Option<Encoded>,
   stage: Stage,
@@ -381,6 +384,7 @@ impl Encoding {
       blobs: BTreeSet::new(),
       ahead: Vec::new(),
       waiting: core::cell::Cell::new(None),
+      stopped_at: BTreeSet::new(),
       objects: None,
       stage,
       spent_ns: 0,
@@ -480,6 +484,33 @@ impl Encoding {
         return Ok(Progress::More);
       }
     }
+  }
+
+  /// Stops the turn where `refused`, a read's refusal, met a let-go window, the first time the encoding meets that window
+  /// ([`Encoding::waiting`]): `Err(Stopped)` then. A window met again after it was to be brought back is read on, its
+  /// read refusing as one that cannot be read does, so a stop always makes progress or ends (A-864 piece 2).
+  fn stopped_by(
+    &mut self,
+    store: &ContentStore,
+    refused: &packed::PackedRefused,
+  ) -> Result<(), Stopped> {
+    match refused.waited() {
+      Some(waited) if self.stop_at(store, waited) => Err(Stopped),
+      _ => Ok(()),
+    }
+  }
+
+  /// Notes `waited`'s window to be brought back, the first time it is met: whether the encoding stops for it.
+  fn stop_at(&mut self, store: &ContentStore, waited: packed::Waited) -> bool {
+    let window = to_u64(store.window()).max(1);
+    if !self
+      .stopped_at
+      .insert((waited.pack, waited.offset / window))
+    {
+      return false;
+    }
+    self.waiting.set(Some(waited));
+    true
   }
 
   /// Whether a unit stopped at a let-go window ([`Encoding::waiting`]) not yet taken: its driver ends the turn there.
@@ -704,12 +735,14 @@ impl Encoding {
       Current::Copy(ref mut copying) => {
         let Some(lent) = store.piece(&copying.place.pack, copying.place.len, copying.from) else {
           // A piece let go stops the unit, nothing copied, to be taken again once it is brought back.
-          if store.away(&copying.place.pack, copying.place.len, copying.from) {
-            self.waiting.set(Some(packed::Waited {
-              pack: copying.place.pack,
-              len: copying.place.len,
-              offset: copying.from,
-            }));
+          let waited = packed::Waited {
+            pack: copying.place.pack,
+            len: copying.place.len,
+            offset: copying.from,
+          };
+          if store.away(&copying.place.pack, copying.place.len, copying.from)
+            && self.stop_at(store, waited)
+          {
             return Ok(Stage::Encode {
               blobs,
               part: Box::new(part),
@@ -863,13 +896,48 @@ impl Encoding {
       rows::PackedRow,
     ),
     at: u64,
-  ) -> Option<(Vec<u8>, Copying)> {
+  ) -> Result<Option<(Vec<u8>, Copying)>, Stopped> {
     let room = repository.largest_object();
-    let (header, data) = packed::entry_header(store, (place, repository.format()), room).ok()?;
-    if packed::raw_crc(store, place, packed.len).ok() != Some(packed.crc) {
+    let (header, data) = match packed::entry_header(store, (place, repository.format()), room) {
+      Ok(found) => found,
+      Err(refused) => {
+        self.stopped_by(store, &refused)?;
+        return Ok(None);
+      }
+    };
+    let crc = match packed::raw_crc(store, place, packed.len) {
+      Ok(crc) => Some(crc),
+      Err(refused) => {
+        self.stopped_by(store, &refused)?;
+        None
+      }
+    };
+    if crc != Some(packed.crc) {
       self.counters.reuse_crc_missed = self.counters.reuse_crc_missed.saturating_add(1);
-      return None;
+      return Ok(None);
     }
+    Ok(self.kept_copy(
+      repository,
+      store,
+      (part, (id, position, kind), place, packed),
+      (header, data, at),
+    ))
+  }
+
+  /// [`Encoding::reused_as_kept`]'s entry, its header read and its CRC32 held: placed, its header written at `at`, and
+  /// its data to copy; none where its base is not placed.
+  fn kept_copy(
+    &mut self,
+    repository: &Repository,
+    store: &ContentStore,
+    (part, (id, position, kind), place, packed): (
+      &Part,
+      (ObjectId, u64, Kind),
+      InPack,
+      rows::PackedRow,
+    ),
+    (header, data, at): (entry::Header, u64, u64),
+  ) -> Option<(Vec<u8>, Copying)> {
     let base_id = match (header.representation, packed.base) {
       (Representation::Whole(whole), None) if whole == kind => None,
       (Representation::OfsDelta { .. } | Representation::RefDelta { .. }, Some(base)) => {
@@ -1021,33 +1089,33 @@ impl Encoding {
     if let Some(packed) = row.pack {
       let at = PACK_HEADER_LEN.saturating_add(to_u64(part.bytes.len()));
       let place = repository.stored_of(&row, content);
-      // One whose entry lies in a let-go window stops before anything of it is kept, to be taken again.
-      if let StoredAt::InPack(place) = place
-        && let Some(waited) = away_in_range(store, place, place.offset.saturating_add(packed.len))
-      {
-        self.ahead.push(key);
-        self.waiting.set(Some(waited));
-        return Ok(Stage::Encode {
-          blobs,
-          part: Box::new(part),
-          current: None,
-        });
-      }
-      if let StoredAt::InPack(place) = place
-        && let Some((header, copying)) = self.reused_as_kept(
+      if let StoredAt::InPack(place) = place {
+        match self.reused_as_kept(
           repository,
           store,
           (&part, (id, position, row.kind), place, packed),
           at,
-        )
-      {
-        let mut part = part;
-        part.bytes.extend_from_slice(&header);
-        return Ok(Stage::Encode {
-          blobs,
-          part: Box::new(part),
-          current: Some(Box::new(Current::Copy(Box::new(copying)))),
-        });
+        ) {
+          // One whose entry's read met a let-go window stops before anything of it is kept, to be taken again.
+          Err(Stopped) => {
+            self.ahead.push(key);
+            return Ok(Stage::Encode {
+              blobs,
+              part: Box::new(part),
+              current: None,
+            });
+          }
+          Ok(Some((header, copying))) => {
+            let mut part = part;
+            part.bytes.extend_from_slice(&header);
+            return Ok(Stage::Encode {
+              blobs,
+              part: Box::new(part),
+              current: Some(Box::new(Current::Copy(Box::new(copying)))),
+            });
+          }
+          Ok(None) => {}
+        }
       }
     }
     let object = Reading {
@@ -1187,18 +1255,5 @@ impl Encoding {
   }
 }
 
-/// The first let-go window of `place`'s pack that its bytes up to `to` lie in (A-864 piece 2's encoding side): what a
-/// unit reading them waits for; none where every window of them is held.
-fn away_in_range(store: &ContentStore, place: InPack, to: u64) -> Option<packed::Waited> {
-  let window = to_u64(store.window()).max(1);
-  let first = place.offset.checked_div(window)?;
-  let last = to.saturating_sub(1).max(place.offset).checked_div(window)?;
-  (first..=last)
-    .map(|index| index.saturating_mul(window).max(place.offset))
-    .find(|offset| store.away(&place.pack, place.len, *offset))
-    .map(|offset| packed::Waited {
-      pack: place.pack,
-      len: place.len,
-      offset,
-    })
-}
+/// An encoding unit stopped at a let-go window (A-864 piece 2, [`Encoding::waiting`]).
+struct Stopped;

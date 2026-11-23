@@ -201,6 +201,9 @@ pub struct UploadCounters {
   /// The loose stage's reads of a pushed entry that lay before the one read before it in the same pack (A-864's piece 1:
   /// none where the stage reads each pack front to back).
   pub backward_reads: u64,
+  /// Turns that stopped at a let-go window, each a window met the first time (A-864 piece 2): with
+  /// `vcs_store.git_resident.stopped_brought`, a stall shows as stops without windows brought back.
+  pub stops: u64,
   /// Objects no part covered whose pushed entry was rebuilt to be checked (inflated, a delta applied, named): those with
   /// a CRC32 miss or no kept entry (A-864: none, for a pushed pack's objects).
   pub reuse_rebuilt: u64,
@@ -220,6 +223,9 @@ enum Reuse {
   BaseFirst(u64),
   /// Encoded instead.
   Encode,
+  /// Its entry's read met a let-go window the stream had not stopped at before: the turn ends, the window to be brought
+  /// back, the object taken again (A-864 piece 2).
+  Stopped,
 }
 
 /// How a pushed delta goes on (A-859).
@@ -466,6 +472,13 @@ pub struct Upload<A> {
   /// The let-go window a unit met and stopped at, its work kept to be taken again once it is brought back (goal 93
   /// item 2a's look-ahead, A-864 piece 2): taken by [`Upload::waiting`].
   waiting: core::cell::Cell<Option<packed::Waited>>,
+  /// The let-go window the stream last stopped at, by its pack and index, until a unit is done after it: a stop at the
+  /// same window with nothing done between is read and refused rather than waited for again, so a stop always makes
+  /// progress or ends (A-864 piece 2's progress); a window let go again behind the stream (piece 3) may be stopped at
+  /// again once the stream has gone on.
+  last_stop: Option<(ContentId, u64)>,
+  /// Whether the stream has stopped at a let-go window at all: its look-ahead begins then ([`Upload::reading_next`]).
+  stopped_any: bool,
   /// Where the loose stage last read a pushed entry: its pack and offset (counting [`UploadCounters::backward_reads`]).
   last_read: Option<(ContentId, u64)>,
   by_entry: Option<ByEntry>,
@@ -505,6 +518,8 @@ impl<A: Answered> Upload<A> {
       packs: BTreeMap::new(),
       pack_lens: Vec::new(),
       waiting: core::cell::Cell::new(None),
+      last_stop: None,
+      stopped_any: false,
       last_read: None,
       by_entry: None,
       pending: None,
@@ -547,7 +562,8 @@ impl<A: Answered> Upload<A> {
         Ok(Progress::Done) => return Ok(Progress::Done),
         // A unit met a let-go window and stopped, nothing of it written: the turn ends, the window to be brought back.
         Ok(Progress::More) if self.is_waiting() => return Ok(Progress::More),
-        Ok(Progress::More) => {}
+        // A unit done: a later stop, at any window, is waited for again.
+        Ok(Progress::More) => self.last_stop = None,
         Err(refused) => {
           self.stage = Stage::Refused(refused);
           return Err(refused);
@@ -562,15 +578,6 @@ impl<A: Answered> Upload<A> {
   /// One unit of work: what is owed first, then a part's next entry, then the stage's next step.
   fn step(&mut self, cx: &mut Context<'_>, out: &mut impl Out) -> Result<Progress, StoreRefused> {
     if let Some(pending) = self.pending.take() {
-      if let Pending::Copy {
-        content, len, from, ..
-      } = pending
-        && let Some(waited) = away_from(cx.store, (content, len), (from, from.saturating_add(1)))
-      {
-        self.pending = Some(pending);
-        self.waiting.set(Some(waited));
-        return Ok(Progress::More);
-      }
       self.pending = self.owed(cx, pending, out)?;
       return Ok(Progress::More);
     }
@@ -1041,9 +1048,23 @@ impl<A: Answered> Upload<A> {
     let window = to_u64(store.window());
     let index = from.checked_div(window).unwrap_or(0);
     let start = index.saturating_mul(window);
-    let bytes = store
-      .window_at(&content, len, index)
-      .ok_or(StoreRefused::FragmentUnreadable)?;
+    let Some(bytes) = store.window_at(&content, len, index) else {
+      // A-864 piece 2: a window let go stops the copy where it is, nothing written, the first time it is met.
+      let waited = packed::Waited {
+        pack: content,
+        len,
+        offset: from,
+      };
+      if store.away_window(&content, len, from).is_some() && self.stop_at(store, waited) {
+        return Ok(Some(Pending::Copy {
+          content,
+          len,
+          from,
+          to,
+        }));
+      }
+      return Err(StoreRefused::FragmentUnreadable);
+    };
     let upto = to.min(start.saturating_add(to_u64(bytes.len())));
     let piece = within(
       &bytes,
@@ -1178,6 +1199,29 @@ impl<A: Answered> Upload<A> {
     })
   }
 
+  /// Whether `refused`, a read's refusal, met a let-go window the stream stops at ([`Upload::stop_at`]).
+  fn stopped_by(&mut self, store: &ContentStore, refused: &packed::PackedRefused) -> bool {
+    refused
+      .waited()
+      .is_some_and(|waited| self.stop_at(store, waited))
+  }
+
+  /// Stops the turn at `waited`'s let-go window, named for its driver to bring back ([`Upload::waiting`]); whether it
+  /// stopped. The same window met again with no unit done since it was to be brought back is not stopped at: the read
+  /// refuses typed, as one of a window that cannot be read does, so a stop always makes progress or ends.
+  fn stop_at(&mut self, store: &ContentStore, waited: packed::Waited) -> bool {
+    let window = to_u64(store.window()).max(1);
+    let at = (waited.pack, waited.offset / window);
+    if self.last_stop == Some(at) {
+      return false;
+    }
+    self.last_stop = Some(at);
+    self.stopped_any = true;
+    self.counters.stops = self.counters.stops.saturating_add(1);
+    self.waiting.set(Some(waited));
+    true
+  }
+
   /// Whether a unit stopped at a let-go window ([`Upload::waiting`]) not yet taken.
   fn is_waiting(&self) -> bool {
     let waiting = self.waiting.take();
@@ -1195,6 +1239,10 @@ impl<A: Answered> Upload<A> {
   /// it): the pack, its length and the offset, from the copy under way or the loose stage's next object in its order;
   /// the stage reads each pack front to back from there. None where it reads no pack next.
   pub fn reading_next(&self) -> Option<packed::Waited> {
+    // Only once the stream has met a let-go window: a pack held whole has nothing to bring back.
+    if !self.stopped_any {
+      return None;
+    }
     if let Some(Pending::Copy {
       content, len, from, ..
     }) = &self.pending
@@ -1272,20 +1320,6 @@ impl<A: Answered> Upload<A> {
       }
     };
     let (id, row, stored) = cx.repository.stored_at(cx.store, position)?;
-    // A unit whose pushed entry lies in a let-go window stops before it writes or keeps anything, to be taken again.
-    if let (StoredAt::InPack(place), Some(packed)) = (stored, row.pack)
-      && let Some(waited) = away_from(
-        cx.store,
-        (place.pack, place.len),
-        (place.offset, place.offset.saturating_add(packed.len)),
-      )
-    {
-      if matches!(next, Stage::Loose { from: after } if after == from) {
-        self.ahead.push(position);
-      }
-      self.waiting.set(Some(waited));
-      return Ok(Stage::Loose { from });
-    }
     cx.admission
       .charge_items::<(u64, u64)>(1)
       .map_err(|_| StoreRefused::PackTooLarge)?;
@@ -1301,6 +1335,14 @@ impl<A: Answered> Upload<A> {
         self.loose_at.remove(&position);
         self.ahead.push(position);
         self.ahead.push(base);
+        return Ok(Stage::Loose { from });
+      }
+      Reuse::Stopped => {
+        // A-864 piece 2: its entry's read met a let-go window; nothing of it written or kept, it is taken again next.
+        self.loose_at.remove(&position);
+        if matches!(next, Stage::Loose { from: after } if after == from) {
+          self.ahead.push(position);
+        }
         return Ok(Stage::Loose { from });
       }
       Reuse::Encode => {}
@@ -1463,10 +1505,22 @@ impl<A: Answered> Upload<A> {
     out: &mut impl Out,
   ) -> Result<Option<Reuse>, StoreRefused> {
     let room = cx.repository.largest_object().max(row.len);
-    let Ok((header, data)) = packed::entry_header(cx.store, (place, self.format), room) else {
-      return Ok(None);
+    let (header, data) = match packed::entry_header(cx.store, (place, self.format), room) {
+      Ok(found) => found,
+      Err(refused) => {
+        return Ok(
+          self
+            .stopped_by(cx.store, &refused)
+            .then_some(Reuse::Stopped),
+        );
+      }
     };
-    if packed::raw_crc(cx.store, place, packed.len).ok() != Some(packed.crc) {
+    let crc = match packed::raw_crc(cx.store, place, packed.len) {
+      Ok(crc) => Some(crc),
+      Err(refused) if self.stopped_by(cx.store, &refused) => return Ok(Some(Reuse::Stopped)),
+      Err(_) => None,
+    };
+    if crc != Some(packed.crc) {
       self.counters.reuse_crc_missed = self.counters.reuse_crc_missed.saturating_add(1);
       return Ok(None);
     }
@@ -2237,20 +2291,4 @@ fn entry_refused(refusal: entry::Refusal) -> StoreRefused {
 
 fn to_u64(len: usize) -> u64 {
   u64::try_from(len).unwrap_or(u64::MAX)
-}
-
-/// The first let-go window of the `len`-byte pack `pack` that bytes `from` to `to` lie in (goal 93 item 2a; A-864 piece
-/// 2): what a unit reading them waits for; none where every window of them is held.
-fn away_from(
-  store: &ContentStore,
-  (pack, len): (ContentId, u64),
-  (from, to): (u64, u64),
-) -> Option<packed::Waited> {
-  let window = to_u64(store.window()).max(1);
-  let first = from.checked_div(window)?;
-  let last = to.saturating_sub(1).max(from).checked_div(window)?;
-  (first..=last)
-    .map(|index| index.saturating_mul(window).max(from))
-    .find(|offset| store.away_window(&pack, len, *offset).is_some())
-    .map(|offset| packed::Waited { pack, len, offset })
 }
