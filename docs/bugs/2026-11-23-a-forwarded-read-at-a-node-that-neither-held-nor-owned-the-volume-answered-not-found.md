@@ -45,38 +45,55 @@ not made here yet.
   no record of the volume and the shard does not record it unrecovered, a forwarded verb is answered there only where
   this node is the volume's owner by the rule a local client's verb is routed by (`owned_by_another_host`): the
   volume's creator, which no routing on it sends elsewhere and which did not lose it to a successor. There `dispatch`
-  answers a volume never made or destroyed `NotFound`. Anywhere else the verb is refused `Overloaded`, retryable and
-  recorded nowhere:
-  - a successor before it has made the volume, counted `fleet.forward.refused.before_made` (A-394, unchanged);
-  - a node whose routing names another member, or no owner while it is not the creator, counted
-    `fleet.forward.refused.not_owner_here` (new).
-  
-  The origin drops its cached route at any refusal (`route_after`), so the resend locates the owner again.
+  answers a volume never made or destroyed `NotFound`. Anywhere else the verb is refused, retryable and recorded
+  nowhere:
+  - a successor before it has made the volume: `Overloaded`, counted `fleet.forward.refused.before_made` (A-394,
+    unchanged: it owns the volume and will serve it);
+  - a node whose routing names another member, or no owner while it is not the creator: `Refusal::NotOwnerHere {
+    owner }`, `owner` the owner its routing names, counted `fleet.forward.refused.not_owner_here`.
 - `forwarded_to`: where no shard of the node holds the partition the id names, `NotFound` only from the volume's creator,
-  and `Overloaded`, counted `fleet.forward.refused.not_owner_here`, from any other node.
-- The test `a_forwarded_read_at_a_node_neither_holding_nor_owning_its_volume_is_refused_retryably` (beside
-  A-394's). Red on main: `Refused { refusal: NotFound }` for the volume routed to no owner. Green with the fix: both
-  cases are refused `Overloaded`.
+  and `NotOwnerHere` from any other node.
+- `absent`: a verb that is not forwarded (a landing's `Present` or `Land`) on a node that holds no record or register
+  copy of a volume another host owns as far as it can tell (`remote_attach::elsewhere`, now crate-visible), or one it
+  lost to a successor, meets `NotOwnerHere` instead of `NotFound`.
+- `route_after`: a `NotOwnerHere` naming an owner keeps that owner as the client's route, counted
+  `fleet.owner_location.route_hinted`, and any other refusal drops the route, so the resend locates the owner again.
 
-Docs: §4.8 "Lookup"'s status (the rule), A-394's amendment, and GAPS (A-394's entry).
+The refusal is its own kind by main's ruling: a first cut (6b2952f4d) answered `Overloaded`, which says a shard is
+busy. The wire is `Refusal::NotOwnerHere { owner: Option<u64> }`, appended at tag 84 (`crates/ipc/tests/wire_order.txt`).
+The API has `RetryCause::NotOwnerHere` (contract 60). `slates_client` resends a read so within its reconnect budget
+(`call_through_transient`) and holds the id for an async caller (`note_reply`). The CLI, MCP and both SDKs render a
+refusal by its `Debug` form, so they carry it by name with no change.
+
+Tests:
+- `a_node_neither_holding_nor_owning_a_volume_answers_not_owner_here_and_its_creator_not_found` (`crates/server/src/verbs.rs`):
+  a forwarded read routed to no owner and then to the creator, the forwarded write's gate, a landing's `Present` and
+  `Land`, the creator's own volume mid-destroy (its `Destroying`) and an id it never made (`NotFound`). Red on
+  6b2952f4d's code with the variant in place: both reads and the write gate `Overloaded`, `Present` and `Land`
+  `NotFound`. Green with the fix.
+- `a_node_that_is_not_the_volumes_owner_is_a_retry_naming_the_owner_it_knows` (`crates/api/src/error.rs`).
+
+Docs: §4.8 "Lookup"'s status (the rule), A-394's two amendments, and GAPS (A-394's entry).
 
 ## Impact
 
 During any configuration change that the origin and the receiver of a forward had not both installed, a read through
 a non-owner could answer "missing" for acknowledged writes. A forwarded write met the same `NotFound`, recorded as its
 completion, so its resend under its id met it for good, and its client was told the volume did not exist. Changes of
-this kind are a takeover, a retirement undone by the host's refutation, a move, or a re-admission.
+this kind are a takeover, a retirement undone by the host's refutation, a move, or a re-admission. A landing sent to a
+node that is not where the volume is was told the volume did not exist.
 
-## Siblings (every forwarded entry point that can answer "absent")
+## Siblings (every entry point that can answer "absent" from a node that is not the owner)
 
 | Entry point | Before | Now |
 |---|---|---|
-| Forwarded reads (`serve_forwarded_read`): Status, Drifted, Conflicts, CheckMerge, ReadMergeCheck, Versions, MergeRecord, ChangedSince, ReadRange, ReadWindow, ReadDir, StageBegin, StagePut, MoveWorkFloor | `NotFound` from a non-owner without the record | refused `Overloaded`, retryable |
-| Forwarded writes (`forwarded_write`): every volume mutation, `Attach { form: Root }`, `DetachOf` | `NotFound`, recorded as the completion | refused `Overloaded`, nothing recorded |
-| A forwarded `CreateWork`'s green check (`forward_placement`) | dispatched | refused `Overloaded` |
-| `forwarded_to` with no shard for the id's partition | `NotFound` from any node | `NotFound` from the creator only, else `Overloaded` |
+| Forwarded reads (`serve_forwarded_read`): Status, Drifted, Conflicts, CheckMerge, ReadMergeCheck, Versions, MergeRecord, ChangedSince, ReadRange, ReadWindow, ReadDir, StageBegin, StagePut, MoveWorkFloor | `NotFound` from a non-owner without the record | `NotOwnerHere`, retryable |
+| Forwarded writes (`forwarded_write`): every volume mutation, `Attach { form: Root }`, `DetachOf` | `NotFound`, recorded as the completion | `NotOwnerHere`, nothing recorded |
+| A forwarded `CreateWork`'s green check (`forward_placement`) | dispatched | `NotOwnerHere` |
+| `forwarded_to` with no shard for the id's partition | `NotFound` from any node | `NotFound` from the creator only, else `NotOwnerHere` |
+| Landing verbs (`Present`, `Land`): never forwarded | `NotFound` from `find` on a node with no record and no register copy | `NotOwnerHere` |
 | A peer's reap of its dead client (`remote_attach::serve_unforwardable`) | `Detached` with nothing ended, never "absent" | unchanged |
 | `named_if_unshared` | rewrites `Forbidden` only | unchanged |
-| Attach forms other than the record form (mounts, exports, devices, streams): never forwarded | refused by kind, `AttachmentUnsupported { reason: OwnedByAnotherHost }` (`remote_attach::foreign_attach`, decided by creator and routing) | unchanged: already by authority |
+| Attach forms other than the record form (mounts, exports, devices, streams): never forwarded | refused by kind, `AttachmentUnsupported { reason: OwnedByAnotherHost }` (`remote_attach::foreign_attach`, by creator and routing) | unchanged: already by authority |
 | `volume list` | this node's catalog only, no verdict on a given volume | unchanged |
-| Landing verbs (`Present`, `Land`): never forwarded | `find` answers `NotFound` on a node with no record and no register copy, even where another host owns the volume | not changed: no refusal fits (`HomedElsewhere` names another region), so it is reported to main as owed |
+| A held copy not yet materialized (`absent`'s register copy) | `Overloaded`, the takeover settle window | unchanged |
