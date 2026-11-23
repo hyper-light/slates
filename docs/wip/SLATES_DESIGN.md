@@ -8427,7 +8427,8 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > superseded (its writers were refused) or its keys are refused; the volume then owes a whole state, and every writer
 > waiting past its position waits for it (`fold_waiting_onto`). While a build or its queue holds the chain the record
 > period appends what the credit admits and makes nothing beside it, judged before the candidates' keys; and only a
-> whole entry pays an owed whole state (`append_entry`), so a queued delta captured before a refusal cannot. Held by
+> whole state pays an owed whole state, appended (`append_entry`) or, since 2026-11-23, queued behind a build
+> (`queue_behind_build`, below), so a queued delta captured before a refusal cannot. Held by
 > `a_live_whole_entry_is_sealed_in_turns_and_writes_made_meanwhile_follow_it` (`crates/server/tests/fleet.rs`: a volume
 > of 3 MiB, its seal turns cut to a piece each, eight writers and one more write as it goes live): 8 of 8 answered at
 > durability, eight turns over two builds, eight publications queued, the log durable at its head 9 with nothing owed,
@@ -8435,6 +8436,19 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > (no build, no turn). Owed: an install image (`refresh_image`) is still made and sealed in one turn; a second whole
 > entry followed the first in every run of the test (twice the whole bytes), its trigger not yet read; and a
 > transport's barrier keeps the position it read across a dropped build, waiting for the log to pass it or its bound.
+>
+> **A whole state queued behind a build pays the refusal it follows (2026-11-23, A-377's rule; w-fleet).** A delta refused
+> for credit behind a build leaves the volume owing a whole state, which the next publication captures and queues. That
+> whole state carries every change up to its publication, the refused delta's among them. So once queued it clears the
+> debt, and the deltas queued behind it are held to the credit counted from it, not with the deltas ahead of it
+> (`live_ship::queue_behind_build`, `Queued::counted`). Until then the debt stayed owed while the whole state waited in
+> the queue, so every later publication in that build was captured whole too, each a copy of the volume taken in its
+> publication's turn. The conformance lane's live fsstress over FUSE on `ubuntu-latest` made 80 to 202 whole entries
+> from 3 to 16 refusals; in run 45163517212, 174 of 1.89 GB from 16, with its candidates still an entry behind the owner
+> at the end of the 40 s fleet wait. Held by `a_delta_refused_behind_a_build_owes_one_whole_state_and_the_writes_after_it_queue_as_changes`
+> (`live_ship`'s unit tests: 5 whole entries of 6 before, 2 after). On adacachy2 the lane passed 5 of 5 with 22 to 24
+> whole entries of 9.8 to 31.4 MB, one more than each run's refusals, where main made 104 of 300 MB from 5
+> (`docs/bugs/2026-11-23-a-whole-state-queued-behind-a-build-left-the-volume-owing-one.md`).
 >
 > **Chaos from outside the processes (2026-11-06).** `crates/cli/tests/live_chaos.rs` streams writes through the Rust
 > client while it partitions or kills processes. It ends every flow with Agreement, NoLoss, StaleNeverCommits and
@@ -35550,6 +35564,17 @@ item closed, install images owed), and the code below.
 - **Owed.** Install images (`refresh_image`) are still made and sealed in one turn. A second whole entry followed the
   first in every run of the test (twice the whole bytes); its trigger is not yet read. A transport's barrier keeps the
   position it read across a dropped build and waits for the log to pass it or its bound.
+
+**Amended 2026-11-23 (w-fleet; the conformance lane's live fsstress over FUSE): a whole state queued behind a build pays
+the debt.** "Only a whole entry pays an owed whole state" left the whole state queued for a refusal owing one, so every
+publication after the refusal was captured whole and queued too (174 whole entries of 1.89 GB from 16 refusals in CI run
+45163517212). A whole state now pays the debt as it is queued (`queue_behind_build`), since it carries every change up to
+its publication. A queued delta is held to the credit counted from the newest whole state ahead of it in the queue
+(`Queued::counted`), as "the credit the whole entry ahead of it sets" says; counted with the deltas ahead of that whole
+state, the next delta would be refused again. Applied in the same change to: §4.10's status, GAPS,
+`crates/server/src/live_ship.rs` and its unit test
+`a_delta_refused_behind_a_build_owes_one_whole_state_and_the_writes_after_it_queue_as_changes`, and
+`docs/bugs/2026-11-23-a-whole-state-queued-behind-a-build-left-the-volume-owing-one.md`.
 
 ### A-387 — An owner keeps a closed loop's hold only while its idle turns poll faster than it wakes: a held macOS shard naps in its driver poll (2026-11-18, goal g234; amends A-326; the macOS spinning-client regression the measurer found)
 Applied in the same change to: §4.3 (derived constants), §4.7 (derived constants and a status), A-326 (its last line),

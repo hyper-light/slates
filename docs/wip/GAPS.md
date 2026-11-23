@@ -10025,6 +10025,25 @@
 >   limits the lane's pjdfstest list held pass over FUSE, so the list is empty. Commands and counts:
 >   `docs/wip/conformance.md` (the live-shipped pair).
 
+> **The live-shipped fsstress over FUSE fell behind its candidates, shipping the volume whole after every credit refusal
+> (2026-11-23, A-377, AC-8.9; FIXED, w-fleet).** CI's conformance lane failed it intermittently on `ubuntu-latest`: nightly
+> 45176536354 and run 45163517212 failed, runs 45177206583 and 45181584785 passed. In 45163517212 the owner's log ended
+> at head 1809, durable 1808, with both candidates at 1808 after the 40 s fleet wait. It had appended 174 whole entries
+> of 1.89 GB from 16 refusals for credit, with 135 installs. A delta refused for credit behind a build left the volume
+> owing a whole state, and the whole state queued for it did not pay the debt, so every later publication in that build
+> was captured whole and queued too. A queued whole state now pays it, and the deltas behind it are counted from it
+> (§4.10, A-377's amendment of 2026-11-23). The lane passed 5 of 5 on adacachy2 with the fix, 22 to 24 whole entries of
+> 9.8 to 31.4 MB a run, one more than its refusals; main made 104 of 300 MB from 5 there. Test:
+> `a_delta_refused_behind_a_build_owes_one_whole_state_and_the_writes_after_it_queue_as_changes`. Record:
+> `docs/bugs/2026-11-23-a-whole-state-queued-behind-a-build-left-the-volume-owing-one.md`.
+> - Not a defect: the candidates' `durable=none` in the record. Every held copy reports no durable position, and the
+>   harness reads only the candidates' heads.
+> - **Open (the harness's):** a live run's record says "the daemon answered `volume list` after the run: false" and "the
+>   daemon stopped answering during the run" whenever the log did not catch up, because `Session::alive_and_shipped`
+>   returns the two answers as one flag. The daemon answered `status` throughout.
+> - **Owed (measurement):** the live-shipped pair's cost recorded on 2026-11-18 above (fsx on the Studio, 407 whole states
+>   past the live credit, `refused.no_credit` 411) may share this cause; to be measured again.
+
 > **The many-client load test over the network (loadtest; 2026-11-05).** The harness
 > (`crates/client/examples/load_bench.rs`, `--green` to drive a green on another node) and its launcher
 > (`crates/cli/tests/load_fleet.rs`, gated on `SLATES_LOADTEST_TREE` and `SLATES_LOADTEST_BENCH`).
