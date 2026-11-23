@@ -45,7 +45,7 @@
 //! reserved, so a log full at `u32::MAX` revisions refuses more ([`Refused::LogFull`]).
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use slates_vcs::{
   Batch, ContentId, ContentStore, Index, IndexRefused, Naming, NewRow, Quarantine, RowRef,
@@ -349,11 +349,111 @@ struct Planned {
   contents: Vec<ContentId>,
 }
 
+/// Every branch's heads in the changelog an index holds, by 7.2's rule (`crate::serve::discovery::branch_head_revs`:
+/// "a branchhead is a revision such that no descendant is on the same branch", closed heads kept), kept up to date as
+/// each changeset is appended (goal 93, main's ruling of 2026-11-23: `branchmap`, a `lookup` of a branch name and `heads`
+/// read them in O(branches), where each walked the whole history in one step: 155-161 ms of CPU on CI's x86 runner, a
+/// 348 ms step). Every changeset reaches an index through [`HgIndex::append_changesets`], a push's intake, an import, a
+/// re-base, a replay and a made changeset alike, a revision a step, so keeping them costs each append its own revision's
+/// work and no step of its own.
+///
+/// **Adding a revision** `r` on branch `b`: a parent on `b` that was a head is one no more (it has a child on `b`); a
+/// head of `b` that `r` descends from through other branches is one no more either, so from each parent on another
+/// branch its ancestors are walked down to `b`'s lowest head, the heads met ended (7.2's `uncertain` walk, from its
+/// highest such parent to `floorrev`). A parent on `b` that was no head ends nothing: whatever it descends from on `b`
+/// had a descendant on `b` already. Then `r` is a head. No head is ever made by another branch's revision, and none comes
+/// back, so the heads after each append are the rule's over the changelog so far.
+#[derive(Clone, Debug, Default)]
+pub struct BranchHeads {
+  /// Each branch's heads, by number.
+  heads: BTreeMap<Vec<u8>, BTreeSet<u32>>,
+  /// How many times they answered for a view (`crate::serve::Repository::maintained_branch_heads`): the non-vacuity
+  /// count a test reads, so a fallback to the walk cannot pass silently.
+  answered: core::cell::Cell<u64>,
+  /// The most revisions one append's walk through other branches read (main's order of 2026-11-23: a walk down to an
+  /// old head is one append's work, so it is counted, and sliced where it runs past a step's worth).
+  longest_walk: u64,
+}
+
+impl BranchHeads {
+  /// Every branch's heads, by number, lowest first, as `branch_head_revs` lists them; counted as an answer.
+  pub fn answer(&self) -> Vec<u32> {
+    self.answered.set(self.answered.get().saturating_add(1));
+    let mut revs: Vec<u32> = self.heads.values().flatten().copied().collect();
+    revs.sort_unstable();
+    revs
+  }
+
+  /// How many times they answered.
+  pub fn answered(&self) -> u64 {
+    self.answered.get()
+  }
+
+  /// The most revisions one append's walk through other branches read, over the index's life (its forks' included).
+  pub fn longest_walk(&self) -> u64 {
+    self.longest_walk
+  }
+
+  /// Notes changeset `rev` on `branch` with parents `p1` and `p2` (numbers, [`NONE`] for none) appended to `index`,
+  /// every changeset before it held already (module docs of [`BranchHeads`]).
+  fn add(
+    &mut self,
+    (index, store): (&HgIndex, &ContentStore),
+    (rev, branch, parents): (u32, &[u8], [u32; 2]),
+  ) -> Result<(), Refused> {
+    let heads = self.heads.entry(branch.to_vec()).or_default();
+    let mut others: Vec<u32> = Vec::new();
+    for parent in parents.into_iter().filter(|parent| *parent != NONE) {
+      let row = index
+        .changeset(store, parent)
+        .ok_or(Refused::Unread { rev: parent })?;
+      if row.branch == branch {
+        heads.remove(&parent);
+      } else {
+        others.push(parent);
+      }
+    }
+    if let Some(&floor) = heads.first().filter(|_| !others.is_empty()) {
+      // The ancestors of the parents from other branches, down to the branch's lowest head, each walked once from the
+      // highest: every head among them has `rev` for a descendant on its branch.
+      let mut reach: BTreeSet<u32> = others
+        .iter()
+        .copied()
+        .filter(|parent| *parent >= floor)
+        .collect();
+      let mut walked = 0_u64;
+      while let Some(at) = reach.pop_last() {
+        if at < floor {
+          break;
+        }
+        walked = walked.saturating_add(1);
+        heads.remove(&at);
+        let row = index
+          .changeset(store, at)
+          .ok_or(Refused::Unread { rev: at })?;
+        for parent in [row.p1, row.p2] {
+          if parent != NONE && parent >= floor {
+            reach.insert(parent);
+          }
+        }
+        if heads.is_empty() {
+          break;
+        }
+      }
+      self.longest_walk = self.longest_walk.max(walked);
+    }
+    self.heads.entry(branch.to_vec()).or_default().insert(rev);
+    Ok(())
+  }
+}
+
 /// A repository's revlog-shaped index, every row in one shared [`Index`].
 #[derive(Debug)]
 pub struct HgIndex {
   /// The rows.
   rows: Index,
+  /// Every branch's heads in its changelog, kept as it grows.
+  branch_heads: BranchHeads,
 }
 
 impl Default for HgIndex {
@@ -365,12 +465,20 @@ impl Default for HgIndex {
 impl HgIndex {
   /// An empty index.
   pub fn new() -> HgIndex {
-    HgIndex { rows: Index::new() }
+    HgIndex {
+      rows: Index::new(),
+      branch_heads: BranchHeads::default(),
+    }
   }
 
   /// The shared index holding the rows: for its seals, compactions, timings and counters.
   pub fn rows(&mut self) -> &mut Index {
     &mut self.rows
+  }
+
+  /// Every branch's heads in its changelog, kept as it grows ([`BranchHeads`]).
+  pub fn branch_heads(&self) -> &BranchHeads {
+    &self.branch_heads
   }
 
   /// The bytes its rows hold in `store` (`slates_vcs::Index::held_bytes`).
@@ -382,6 +490,11 @@ impl HgIndex {
   pub fn fork(&mut self, store: &mut ContentStore) -> Result<HgIndex, IndexRefused> {
     Ok(HgIndex {
       rows: self.rows.fork(store)?,
+      branch_heads: BranchHeads {
+        heads: self.branch_heads.heads.clone(),
+        answered: core::cell::Cell::new(0),
+        longest_walk: self.branch_heads.longest_walk,
+      },
     })
   }
 
@@ -565,6 +678,16 @@ impl HgIndex {
     }
     let (revs, planned) = (planner.revs, planner.planned);
     self.write(store, log, &planned)?;
+    // Each changeset written, oldest first, noted in the branch heads, its parents' rows read back from the index.
+    let mut heads = core::mem::take(&mut self.branch_heads);
+    let noted = planned.iter().try_for_each(|written| {
+      let row = self
+        .changeset(store, written.rev)
+        .ok_or(Refused::Unread { rev: written.rev })?;
+      heads.add((self, store), (written.rev, row.branch, [row.p1, row.p2]))
+    });
+    self.branch_heads = heads;
+    noted?;
     Ok(revs)
   }
 

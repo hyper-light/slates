@@ -65,6 +65,13 @@ pub trait Repository {
   /// Whether a revision closes its branch (`close` among its extras).
   fn closes(&self, rev: Rev) -> bool;
 
+  /// Every branch's heads, lowest first, where the view keeps them as its changesets landed
+  /// (`crate::index::BranchHeads`, goal 93): what `discovery::branch_head_revs` answers in O(branches) in place of its
+  /// walk of the whole history. None for a view that keeps none, which is walked.
+  fn maintained_branch_heads(&self) -> Option<Vec<Rev>> {
+    None
+  }
+
   /// A revision's phase: public or draft, in a served view.
   fn phase(&self, rev: Rev) -> Phase;
 

@@ -502,6 +502,7 @@ fn commit_made(
   }
   let (repository, green, version) = (made.repository, made.green, made.version);
   let fork = forked.fork;
+  super::hg_view::walks_noted(state, &fork);
   let released = super::within_budget(state, 0, |stores| {
     let replaced = match stores.mercurial(repository) {
       Some((content, store)) => {

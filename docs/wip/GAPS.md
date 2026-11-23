@@ -727,6 +727,25 @@
 >   The test-only one-call landing builds a push's works as the driver does, planned and then built over the
 >   store's read-through (`works_whole`); `Works::Whole` and the one-call `tree::work` arm are gone, and `prepare` takes
 >   the view alone. The store-made-texts oracle compares a file by the identities its row names.
+> - Branch heads kept as changesets land BUILT (2026-11-23, w-hg; main's ruling (b) on CI 45127535742: a `lookup` of a
+>   branch name ran one 348 ms step on x86, wrote 43 bytes, `branch_tip` scanning every revision's branch and then
+>   `branch_head_revs` walking the whole history, as `branchmap` whole did, 155-161 ms CPU a call). `HgIndex` keeps
+>   every branch's heads by 7.2's rule (`index::BranchHeads`), each changeset noted as `append_changesets` writes it (a
+>   parent on its branch ended; heads it descends from through other branches ended by a walk down to the branch's
+>   lowest head; then it), so the intake, an import, a re-base, a replay and a made changeset keep them a revision a
+>   step; a fork copies them, a commit's swap takes them. A view serving its whole changelog answers
+>   `branch_head_revs` from them (`Repository::maintained_branch_heads`), else walks
+>   (`discovery::walked_branch_head_revs`, the oracle); `branch_tip` tells a branch's name by its heads, no scan.
+>   Held by `kept_branch_heads_are_the_walks_after_every_group` (generated histories with merges, closes and branches
+>   taken again, appended in groups as segments land, equal to the walk and the rule after every group),
+>   `a_lookup_of_a_branch_name_reads_its_heads_not_the_history` and `branchmap_over_a_long_line_reads_its_heads_not_the_history`
+>   (a 170-changeset line: red 512 and 511 reads, now at most 8; `BranchHeads::answered` the non-vacuity count). A
+>   view that leaves a changeset out (secret, hidden) still walks: OPEN, rare in a publishing repository.
+>   An append's walk through other branches is one append's work: counted (`BranchHeads::longest_walk`, the status
+>   counter `vcs.hg.branch_heads_longest_walk`, read from each index a landing puts in place) and held by
+>   `a_branch_taken_again_after_a_long_line_counts_its_walk` (a `stable` revision on a 400-revision `default` line:
+>   the walk counted at the line's length). OPEN: sliced, its branch's heads pending until it ends, if the arena shows
+>   walks past a step's worth.
 > - A push's churn a manifest copy a changeset BUILT (2026-11-23, w-hg; main's orders on CI 45127535742: 57.3 GB through
 >   the allocator over the hg matrix, which breeds the 1.26 GB it keeps after push-all). Named by a counting allocator
 >   (`crates/hg/tests/push_heap.rs`, its store's windows in an arena as a daemon's are): an edit changeset allocated

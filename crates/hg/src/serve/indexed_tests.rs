@@ -1848,3 +1848,140 @@ fn a_pull_walked_by_its_changesets_lends_no_text_in_its_begin_and_two_at_most_a_
       .unwrap();
   assert_eq!(out, whole);
 }
+
+/// A view's reads of its history counted: each revision's node, parents, branch or close a step asked for.
+struct ReadCounted<'v> {
+  /// The view read.
+  view: &'v Indexed<'v>,
+  /// The reads.
+  reads: core::cell::Cell<u64>,
+}
+
+impl ReadCounted<'_> {
+  /// Counts one read.
+  fn read(&self) {
+    self.reads.set(self.reads.get() + 1);
+  }
+}
+
+impl Repository for ReadCounted<'_> {
+  fn count(&self) -> Rev {
+    self.view.count()
+  }
+  fn node(&self, rev: Rev) -> Option<Node> {
+    self.read();
+    self.view.node(rev)
+  }
+  fn rev(&self, node: &Node) -> Option<Rev> {
+    self.view.rev(node)
+  }
+  fn parents(&self, rev: Rev) -> [Option<Rev>; 2] {
+    self.read();
+    self.view.parents(rev)
+  }
+  fn branch(&self, rev: Rev) -> &[u8] {
+    self.read();
+    self.view.branch(rev)
+  }
+  fn closes(&self, rev: Rev) -> bool {
+    self.read();
+    self.view.closes(rev)
+  }
+  fn maintained_branch_heads(&self) -> Option<Vec<Rev>> {
+    self.view.maintained_branch_heads()
+  }
+  fn phase(&self, rev: Rev) -> Phase {
+    self.view.phase(rev)
+  }
+  fn publishing(&self) -> bool {
+    self.view.publishing()
+  }
+  fn bookmarks(&self) -> impl Iterator<Item = (&[u8], Node)> {
+    self.view.bookmarks()
+  }
+  fn draft_roots(&self) -> impl Iterator<Item = Node> {
+    self.view.draft_roots()
+  }
+  fn tags_file(&self, rev: Rev, admission: &mut Admission) -> Result<Option<Node>, Refusal> {
+    self.view.tags_file(rev, admission)
+  }
+}
+
+/// Shape: the reads of the history a branch-heads answer on one branch takes at most, whatever the history's length:
+/// a few for each head (its node, its branch, whether it closes it).
+const READS_A_HEAD: u64 = 8;
+
+/// A line of five times [`crate::render::rows_a_step`] public changesets on `default`, built into an index.
+fn a_long_line() -> Built {
+  let probe = build(&[], false);
+  let long = usize::try_from(crate::render::rows_a_step(&probe.store) * 5).unwrap();
+  let line: Vec<Made> = (0..long)
+    .map(|rev| Made {
+      parents: [rev.checked_sub(1), None],
+      root: None,
+      marker: None,
+      bookmark: false,
+    })
+    .collect();
+  build(&line, false)
+}
+
+/// Goal 93 (main's ruling of 2026-11-23, CI 45127535742: a `lookup` of a branch name ran one 348 ms step on x86, the
+/// whole history walked for its branch heads). Do: over a long line, look up `default`, counting the view's reads of
+/// the history. Expect the line's tip; at most [`READS_A_HEAD`] reads; the index's kept heads answering. Red before:
+/// `branch_tip` read every revision's branch, then walked every revision's parents.
+#[test]
+fn a_lookup_of_a_branch_name_reads_its_heads_not_the_history() {
+  let built = a_long_line();
+  let view = view_of(&built, true);
+  let tags = super::super::lookup::TagsRead::now(&view, &mut room()).unwrap();
+  let counted = ReadCounted {
+    view: &view,
+    reads: core::cell::Cell::new(0),
+  };
+  let answered = built.index.branch_heads().answered();
+  let mut out = Vec::new();
+  super::super::lookup::lookup(&counted, Some(&tags), b"default", &mut room(), &mut out).unwrap();
+  let tip = view.node(view.count() - 1).unwrap();
+  assert_eq!(out, format!("1 {}\n", hex(&tip)).into_bytes());
+  assert!(
+    counted.reads.get() <= READS_A_HEAD,
+    "{} reads of a {}-changeset line",
+    counted.reads.get(),
+    view.count()
+  );
+  assert!(
+    built.index.branch_heads().answered() > answered,
+    "the kept heads answered"
+  );
+}
+
+/// Goal 93 (main's ruling of 2026-11-23: `branchmap` whole took 155-161 ms of CPU a call on x86). Do: over a long line,
+/// answer `branchmap`, counting the view's reads of the history. Expect the answer the walk gives; at most
+/// [`READS_A_HEAD`] reads; the index's kept heads answering. Red before: every revision's parents and branch read.
+#[test]
+fn branchmap_over_a_long_line_reads_its_heads_not_the_history() {
+  let built = a_long_line();
+  let view = view_of(&built, true);
+  let counted = ReadCounted {
+    view: &view,
+    reads: core::cell::Cell::new(0),
+  };
+  let answered = built.index.branch_heads().answered();
+  let mut out = Vec::new();
+  discovery::branchmap(&counted, &mut room(), &mut out).unwrap();
+  let walked = discovery::walked_branch_head_revs(&view, &mut room()).unwrap();
+  assert_eq!(walked, vec![view.count() - 1], "the line's one head");
+  let tip = view.node(view.count() - 1).unwrap();
+  assert_eq!(out, format!("default {}", hex(&tip)).into_bytes());
+  assert!(
+    counted.reads.get() <= READS_A_HEAD,
+    "{} reads of a {}-changeset line",
+    counted.reads.get(),
+    view.count()
+  );
+  assert!(
+    built.index.branch_heads().answered() > answered,
+    "the kept heads answered"
+  );
+}
