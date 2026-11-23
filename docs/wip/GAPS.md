@@ -130,7 +130,12 @@
 > `r165_an_entry_made_whole_from_a_let_go_window_stops_and_the_answer_is_byte_identical` (`Unreadable` at 0 stops
 > before) and `r165_an_object_encoded_afresh_…` (after 5). Owed: the encoding's object read (`Reading::read_window`)
 > refuses the same way where its header reads have not brought the window back first (no red yet); main's round, the
-> guard still in, before a re-lift.
+> guard still in, before a re-lift. The let-go a push's end or an idle repository owes is no longer one walk over the
+> whole pack within that step (main 01a20182, 2026-11-23: git/git's ~600 MB in `ReceivePack`'s drop): it is queued
+> (`vcs_store::LettingGo`) and let go by a task of the shard's a slice a turn, `LET_GO_WINDOWS` windows at most within
+> the step quantum, a home's share on its own shard alike, counted `vcs_store.landed.let_go_slices`
+> (`t_goal93_a_large_landed_packs_let_go_is_sliced_a_window_set_a_turn_never_one_walk`: 131 windows in 132 slices,
+> none within the owing step; before, all 34 MB in it).
 > **LIFTED (w-git, 2026-11-22, on main 01a20182's word; put back above):** `vcs_store::commit` lets a landed push's pack go again, or
 > owes it to the push's end or the repository's idle give-back, with each gate on main: w-git's fetch-side readers
 > (A-864) and a push's readers, (b) its thin bases through `IndexedObjects::away` and (c) its policy and signature reads;
@@ -762,6 +767,10 @@
 >   listed both texts' lines, now walks them by cursors. Held by
 >   `a_pushs_churn_per_changeset_is_one_manifest_and_one_file` (1,600 files: red 291,519 B an edit at a 91,200 B
 >   manifest, now 102,015 B, 1.12 copies; 16 KiB files within one manifest and one file copy and 16 KiB of slack).
+>   Then no manifest copy at all (main's order of 2026-11-23, no allocation by design): the intake rebuilds a changeset
+>   or a manifest into the buffer of the one kept before the last (`Taker::spare`; `delta::apply_into` keeps its
+>   capacity), which no later delta rests on, so a manifest's rebuild allocates nothing past the first. The test now
+>   `a_pushs_churn_per_changeset_is_its_file_alone`: red 102,045 B an edit, now 10,766 B (0.12 manifests).
 > - A push's held high-water gauged BUILT (2026-11-23, w-hg; main's ruling: the 410 MiB bar's push-all peak first):
 >   `vcs.hg.push_held_high_bytes`, the push's admission held plus its file texts still in the content store, sampled as
 >   each segment lands before its let-go; `..._texts_high_bytes` its texts' share; `vcs.hg.push_rows_bytes` its fork's
