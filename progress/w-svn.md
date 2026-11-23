@@ -642,3 +642,9 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - Run request for main: the register split (A-746's row: checkpoints MiB) on the 1,000-revision svn import, before
   (c14f88038^) and after; clippy wall over merge + server.
 - NEXT (main starts it): piece 3, the history keeps a named version by name. OWED: copied tables still carried.
+## 2026-11-23: remake NotHeld red (from A-869) fixed: cf1529f1d (merge 08854f773)
+- remake_green keeps the named texts the plane lacks from the engine it replaces (Green::bytes_named); replay reads
+  plane then kept (ReplayObjects). Bug record docs/bugs/2026-11-23-a-refused-publications-remake-....
+- Sibling reported: takeover adoption replay has no pre-pass (latent since A-865).
+- Reaper: freed 3.4 GiB (target objects + test executables 2.76 GiB, old logs/dumps 639 MiB).
+- NEXT: piece 4 under main's ruling (I): 4a identity digest + named::Identity plain BLAKE3 + goldens + layout bump.
