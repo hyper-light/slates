@@ -352,7 +352,12 @@ slates-machine = 108
 # 2026-11-20 (+1, the same site, w-lint's count): the `unsafe extern "C"` block in `resident::mapping` (macOS) that
 # declares `mach_vm_region` and `mach_task_self_` counts as its own item beside the call; libc binds neither (and
 # deprecates its `mach_task_self`), so the declaration cannot be folded into an existing one.
-slates-mem = 88
+slates-mem = 89
+# 2026-11-23 (+1, A-744's Windows residency, w-win for main 01a20182; compiled only for Windows; `cargo xtask unsafe`
+#   89/89 ok): `resident.rs` Windows `os::query`, one `K32QueryWorkingSetEx(GetCurrentProcess(), ...)` over a page of
+#   entries laid out as `PSAPI_WORKING_SET_EX_INFORMATION` (the call reads each address and writes that page's
+#   attributes; windows-sys has no safe wrapper). The entries are this crate's own record of the same layout, so reading
+#   the `Valid` bit needs no union read and no second site.
 # 2026-11-20 (+3, A-789's Windows shape, main's ruling of 18:40: a content extent is a section of its own, closed when
 #   wholly free; compiled only for Windows; a `// SAFETY:` line directly above each):
 #   1. `shared.rs` Windows `make_section`: `CreateFileMappingW` of an unnamed `SEC_RESERVE` section (Win32 FFI, no safe
@@ -362,7 +367,8 @@ slates-mem = 88
 #   `ExclusiveObject::open_range` does).
 # 2026-11-20 (+1, A-744, a range's pages in RAM, main's ruling: every site named, `// SAFETY:` directly above):
 #   17. `resident.rs`, Unix `os::query`: `libc::mincore` over a page-aligned range into a vector of one byte a page (the
-#   kernel reads only the page table; rustix has no wrapper). Windows answers a typed refusal, no unsafe code.
+#   kernel reads only the page table; rustix has no wrapper). Windows answered a typed refusal then, no unsafe code
+#   (its working-set query since 2026-11-23, above).
 # 2026-11-20 (+16, A-742, freed memory returns to the OS; main's ruling: every site named, a `// SAFETY:` line directly
 #   above each; `cargo xtask unsafe` 79/79 ok): `crates/mem/src/large.rs`, the slates binary's global allocator, which
 #   holds no lock (a unit struct, `Sync`; its counters are atomics). No safe wrapper exists for any site.

@@ -50,6 +50,7 @@
 //! **Refused** ([`HomeRefused`]): bytes past a window; a home whose content store refused (its budget); a home that did
 //! not answer within the budget; content a home does not hold.
 
+use slates_cluster::homes::HomeOwner;
 use slates_db::register::rendezvous_ranked_by_key;
 use slates_vcs::{ContentId, ContentRefused};
 
@@ -389,11 +390,15 @@ pub(crate) async fn read(
 }
 
 std::thread_local! {
-  /// The windows this shard keeps for the region (module docs, "From the region"), one hold each however often the
-  /// region offers it: so the healer's offers, sent again at every configuration change, are idempotent. Bounded by the
-  /// windows its content store holds.
-  static REGION_HELD: std::cell::RefCell<std::collections::BTreeSet<ContentId>> =
-    const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+  /// The objects this shard keeps for the region (module docs, "From the region"), each with its owners (A-727 (d1a),
+  /// `slates_cluster::homes::HomeOwner`): one content-store hold an object however many owners it has and however often
+  /// the region offers it, given back once its last owner lets it go, so a keep is idempotent per (object, owner) and
+  /// the healer's offers, sent again at every configuration change, keep nothing twice. Bounded by the objects the
+  /// content store holds; Derived: an object's owners are at most the attempts in flight on the repositories that home
+  /// it (one each, a repository's landing turn admitting one) and those repositories' records.
+  static REGION_HELD: std::cell::RefCell<
+    std::collections::BTreeMap<ContentId, std::collections::BTreeSet<HomeOwner>>,
+  > = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
   /// The windows of the objects this shard holds for the region, each with how many of them it lies in: what pins a
   /// window once landed (`vcs_store::landed_pin`), since a region hold names its object and an object longer than a
   /// window is a list whose windows have identities of their own (codex-review, 2026-11-22: a Mercurial file sharing a
@@ -868,19 +873,19 @@ pub(crate) fn region_changes_committed() {
 /// 2026-11-22 07:33), so one lost is counted and logged by the recovery.
 pub(crate) fn restore_region_holds(
   content: &mut slates_vcs::ContentStore,
-  identities: &[ContentId],
+  holds: &[(ContentId, Vec<HomeOwner>)],
 ) -> (u64, Vec<ContentId>) {
   let mut held = 0u64;
   let mut refused = Vec::new();
-  for identity in identities {
-    if !content.contains(identity) || content.hold(identity).is_err() {
+  for (identity, owners) in holds {
+    if owners.is_empty() || !content.contains(identity) || content.hold(identity).is_err() {
       refused.push(*identity);
       continue;
     }
     let kept = REGION_HELD.with(|region| {
       region
         .try_borrow_mut()
-        .map(|mut region| region.insert(*identity))
+        .map(|mut region| region.insert(*identity, owners.iter().copied().collect()))
         .is_ok()
     });
     if kept {
@@ -895,14 +900,23 @@ pub(crate) fn restore_region_holds(
   (held, refused)
 }
 
-/// Keeps the window `bytes` on this shard for the region (module docs, "From the region"): a window held for the region
-/// already is held no more, only answered; its identity and ticket.
+/// Keeps the object `bytes` on this shard for the region, for `owners` (module docs, "From the region"; A-727 (d1a)): an
+/// object held for the region already is held no more, its owners joined (a keep is idempotent per object and owner);
+/// its identity and ticket.
 pub(crate) fn keep_for_region(
   state: &mut ShardState,
   bytes: &[u8],
+  owners: &[HomeOwner],
 ) -> Result<(ContentId, HomeTicket), HomeRefused> {
   let identity = ContentId::of(bytes);
-  let held = REGION_HELD.with(|held| held.try_borrow().is_ok_and(|held| held.contains(&identity)));
+  if owners.is_empty() {
+    return Err(HomeRefused::NotHeld);
+  }
+  let held = REGION_HELD.with(|held| {
+    held
+      .try_borrow()
+      .is_ok_and(|held| held.contains_key(&identity))
+  });
   if held
     && state
       .vcs_stores
@@ -910,19 +924,77 @@ pub(crate) fn keep_for_region(
       .as_ref()
       .is_some_and(|content| content.contains(&identity))
   {
+    join_owners(&identity, owners);
     return Ok((identity, ticket_here(state.shard)));
   }
   let kept = keep_here(state, bytes)?;
   let inserted = REGION_HELD.with(|held| {
-    held
-      .try_borrow_mut()
-      .is_ok_and(|mut held| held.insert(kept.0))
+    held.try_borrow_mut().is_ok_and(|mut held| {
+      held
+        .insert(kept.0, owners.iter().copied().collect())
+        .is_none()
+    })
   });
   if inserted && let Some(content) = state.vcs_stores.content() {
     region_windows_changed(content, &kept.0, true);
   }
   region_changed(kept.0, true);
   Ok(kept)
+}
+
+/// Joins `owners` to the region hold of `identity` this shard keeps, each once, the change marked for the shard image.
+fn join_owners(identity: &ContentId, owners: &[HomeOwner]) {
+  let joined = REGION_HELD.with(|held| {
+    held.try_borrow_mut().is_ok_and(|mut held| {
+      held.get_mut(identity).is_some_and(|held| {
+        owners
+          .iter()
+          .fold(false, |joined, owner| held.insert(*owner) || joined)
+      })
+    })
+  });
+  if joined {
+    region_changed(*identity, true);
+  }
+}
+
+/// Moves the region hold of `identity` this shard keeps from owner `from` to owner `to` (A-727 (d1a): an attempt's entry
+/// committed, its records now naming the object): `NotHeld` where `from` holds none of it here.
+pub(crate) fn move_region_owner(
+  identity: &ContentId,
+  (from, to): (HomeOwner, HomeOwner),
+) -> Result<(), HomeRefused> {
+  let moved = REGION_HELD.with(|held| {
+    held.try_borrow_mut().is_ok_and(|mut held| {
+      held.get_mut(identity).is_some_and(|held| {
+        let had = held.remove(&from);
+        if had {
+          held.insert(to);
+        }
+        had
+      })
+    })
+  });
+  if !moved {
+    return Err(HomeRefused::NotHeld);
+  }
+  region_changed(*identity, true);
+  Ok(())
+}
+
+/// The owners of the region hold of `identity` this shard keeps (A-727 (d1a)).
+pub(crate) fn region_owners(identity: &ContentId) -> Vec<HomeOwner> {
+  REGION_HELD.with(|held| {
+    held
+      .try_borrow()
+      .ok()
+      .and_then(|held| {
+        held
+          .get(identity)
+          .map(|owners| owners.iter().copied().collect())
+      })
+      .unwrap_or_default()
+  })
 }
 
 /// Counts the windows of the object `identity` in `content` into ([`REGION_WINDOWS`]), as its region hold is taken
@@ -957,19 +1029,41 @@ pub(crate) fn region_holds_window(identity: &ContentId) -> bool {
   })
 }
 
-/// Lets go this shard's region hold of the window `identity` (module docs, "From the region"): `NotHeld` where the region
-/// holds none here.
+/// Lets `owner`'s region hold of the object `identity` go on this shard, or every owner's (`None`: a holder that is no
+/// home, the healer's), and the object's hold with its last owner (module docs, "From the region"; A-727 (d1a)):
+/// `NotHeld` where that owner, or any, holds none of it here.
 pub(crate) fn let_go_for_region(
   state: &mut ShardState,
   identity: &ContentId,
+  owner: Option<HomeOwner>,
 ) -> Result<(), HomeRefused> {
-  let held = REGION_HELD.with(|held| {
-    held
-      .try_borrow_mut()
-      .is_ok_and(|mut held| held.remove(identity))
+  let (released, last) = REGION_HELD.with(|held| {
+    let Ok(mut held) = held.try_borrow_mut() else {
+      return (false, false);
+    };
+    let released = match (held.get_mut(identity), owner) {
+      (Some(owners), Some(owner)) => owners.remove(&owner),
+      (Some(owners), None) => {
+        owners.clear();
+        true
+      }
+      (None, _) => false,
+    };
+    let last = released
+      && held
+        .get(identity)
+        .is_some_and(std::collections::BTreeSet::is_empty);
+    if last {
+      held.remove(identity);
+    }
+    (released, last)
   });
-  if !held {
+  if !released {
     return Err(HomeRefused::NotHeld);
+  }
+  if !last {
+    region_changed(*identity, true);
+    return Ok(());
   }
   if let Some(content) = state.vcs_stores.content() {
     region_windows_changed(content, identity, false);
@@ -982,7 +1076,13 @@ pub(crate) fn let_go_for_region(
 /// replay counts it apart from its record's own hold (`super::replay_push`): a window restored with its region hold is
 /// held by the region, never yet by its record.
 pub(crate) fn region_holds_here(identity: &ContentId) -> u64 {
-  REGION_HELD.with(|held| u64::from(held.try_borrow().is_ok_and(|held| held.contains(identity))))
+  REGION_HELD.with(|held| {
+    u64::from(
+      held
+        .try_borrow()
+        .is_ok_and(|held| held.contains_key(identity)),
+    )
+  })
 }
 
 /// The identities whose first eight bytes, read big-endian, lie in `lo..=hi`: one page of the shard image (A-870).
@@ -994,12 +1094,17 @@ fn identities_in(lo: u64, hi: u64) -> core::ops::RangeInclusive<ContentId> {
   ContentId(first)..=ContentId(last)
 }
 
-/// [`region_held_here`] whose identities' first eight bytes lie in `lo..=hi` (A-870).
-pub(crate) fn region_held_in(lo: u64, hi: u64) -> Vec<ContentId> {
+/// The region holds whose identities' first eight bytes lie in `lo..=hi`, each with its owners (A-870; A-727 (d1a)).
+pub(crate) fn region_held_in(lo: u64, hi: u64) -> Vec<(ContentId, Vec<HomeOwner>)> {
   REGION_HELD.with(|held| {
     held
       .try_borrow()
-      .map(|held| held.range(identities_in(lo, hi)).copied().collect())
+      .map(|held| {
+        held
+          .range(identities_in(lo, hi))
+          .map(|(identity, owners)| (*identity, owners.iter().copied().collect()))
+          .collect()
+      })
       .unwrap_or_default()
   })
 }
@@ -1024,10 +1129,17 @@ pub(crate) fn region_held_here() -> Vec<ContentId> {
   REGION_HELD.with(|held| {
     held
       .try_borrow()
-      .map(|held| held.iter().copied().collect())
+      .map(|held| held.keys().copied().collect())
       .unwrap_or_default()
   })
 }
+
+/// Counter: a home message of another version this member refused at once, typed (A-727 (d1a): no mixed-version
+/// homing). Format: a counter name.
+pub(crate) const VERSION_REFUSED: &str = "vcs_store.homes.version_refused";
+/// Counter: a home's reply refusing this member's version, or one it could not read, its exchange failed at once
+/// (A-727 (d1a)). Format: a counter name.
+pub(crate) const REPLY_OTHER_VERSION: &str = "vcs_store.homes.reply_other_version";
 
 /// Counter: home exchanges a member served from the region (module docs, "From the region"). Format: a counter name.
 pub(crate) const REMOTE_SERVED: &str = "vcs_store.homes.remote_served";
@@ -1038,14 +1150,14 @@ async fn keep_put(
   origin: u16,
   shards: &[u16],
   (local, members, f): (slates_db::HostId, &[slates_db::HostId], usize),
-  (identity, bytes): ([u8; 32], Vec<u8>),
+  (identity, owners, bytes): ([u8; 32], Vec<HomeOwner>, Vec<u8>),
   budget_ns: u64,
 ) -> slates_cluster::homes::HomeOutcome {
   use slates_cluster::homes::{HomeOutcome, HomeRefusal, admits};
   if let Err(refusal) = admits(&identity, &bytes, (local, members, f)) {
     return HomeOutcome::Refused(refusal);
   }
-  match keep_region_at_home(origin, shards, bytes, budget_ns).await {
+  match keep_region_at_home(origin, shards, (bytes, owners), budget_ns).await {
     Ok((_, ticket)) if published(origin, ticket, budget_ns).await => HomeOutcome::Kept {
       generation: ticket.generation,
     },
@@ -1190,8 +1302,19 @@ async fn read_part(
 /// answer nothing, as the session's other streams do.
 pub(crate) async fn serve_remote(origin: u16, request: &[u8], budget_ns: u64) -> Vec<u8> {
   use slates_cluster::homes::{HomeMessage, HomeOutcome, HomeRefusal};
-  let Ok(message) = HomeMessage::decode(request) else {
-    return Vec::new();
+  let message = match HomeMessage::decode(request) {
+    Ok(message) => message,
+    // Another version's message (a peer of another build): refused at once and typed, so its sender's homing fails at
+    // once rather than at its deadline (A-727 (d1a); a version-1 peer reads no version-2 answer, and fails as at once).
+    Err(slates_cluster::homes::HomeWireError::Version { .. }) => {
+      let _ = crate::state::with_state(|state| state.count(VERSION_REFUSED, 1));
+      return HomeMessage::Answer {
+        identity: [0; 32],
+        outcome: HomeOutcome::Refused(HomeRefusal::Version),
+      }
+      .encode();
+    }
+    Err(_) => return Vec::new(),
   };
   let Some((local, members, f, shards)) = crate::state::with_state(|state| {
     state.count(REMOTE_SERVED, 1);
@@ -1204,63 +1327,87 @@ pub(crate) async fn serve_remote(origin: u16, request: &[u8], budget_ns: u64) ->
   }) else {
     return Vec::new();
   };
-  let (identity, outcome) = match message {
-    HomeMessage::Put { identity, bytes } => (
-      identity,
-      keep_put(
-        origin,
-        &shards,
-        (local, &members, f),
-        (identity, bytes),
-        budget_ns,
-      )
-      .await,
-    ),
-    HomeMessage::PutPart {
-      identity,
-      total,
-      offset,
-      bytes,
-    } => {
-      let staged = stage_part((local, &members, f), (identity, total, offset), bytes);
-      let outcome = match staged {
-        Staged::Refused(refusal) => HomeOutcome::Refused(refusal),
-        Staged::Taken(received) => HomeOutcome::Taken { received },
-        Staged::Whole(bytes) => {
-          keep_put(
-            origin,
-            &shards,
-            (local, &members, f),
-            (identity, bytes),
-            budget_ns,
-          )
-          .await
-        }
-      };
-      (identity, outcome)
-    }
-    HomeMessage::ReadPart { identity, offset } => (
-      identity,
-      read_part(origin, &shards, ContentId(identity), offset, budget_ns).await,
-    ),
-    HomeMessage::Read { identity } => {
-      let outcome = match read(origin, &shards, ContentId(identity), budget_ns).await {
-        Some(bytes) => HomeOutcome::Bytes(bytes),
-        None => HomeOutcome::Refused(HomeRefusal::NotHeld),
-      };
-      (identity, outcome)
-    }
-    HomeMessage::LetGo { identity } => {
-      let outcome =
-        match let_go_region_at_home(origin, &shards, ContentId(identity), budget_ns).await {
-          Ok(()) => HomeOutcome::LetGo,
-          Err(HomeRefused::NotHeld) => HomeOutcome::Refused(HomeRefusal::NotHeld),
-          Err(_) => HomeOutcome::Refused(HomeRefusal::Unanswered),
+  let (identity, outcome) =
+    match message {
+      HomeMessage::Put {
+        identity,
+        owners,
+        bytes,
+      } => (
+        identity,
+        keep_put(
+          origin,
+          &shards,
+          (local, &members, f),
+          (identity, owners, bytes),
+          budget_ns,
+        )
+        .await,
+      ),
+      HomeMessage::PutPart {
+        identity,
+        owners,
+        total,
+        offset,
+        bytes,
+      } => {
+        let staged = stage_part((local, &members, f), (identity, total, offset), bytes);
+        let outcome = match staged {
+          Staged::Refused(refusal) => HomeOutcome::Refused(refusal),
+          Staged::Taken(received) => HomeOutcome::Taken { received },
+          Staged::Whole(bytes) => {
+            keep_put(
+              origin,
+              &shards,
+              (local, &members, f),
+              (identity, owners, bytes),
+              budget_ns,
+            )
+            .await
+          }
         };
-      (identity, outcome)
-    }
-    HomeMessage::Answer { .. } => return Vec::new(),
-  };
+        (identity, outcome)
+      }
+      HomeMessage::ReadPart { identity, offset } => (
+        identity,
+        read_part(origin, &shards, ContentId(identity), offset, budget_ns).await,
+      ),
+      HomeMessage::Read { identity } => {
+        let outcome = match read(origin, &shards, ContentId(identity), budget_ns).await {
+          Some(bytes) => HomeOutcome::Bytes(bytes),
+          None => HomeOutcome::Refused(HomeRefusal::NotHeld),
+        };
+        (identity, outcome)
+      }
+      HomeMessage::LetGo { identity, owner } => {
+        let outcome =
+          match let_go_region_at_home(origin, &shards, ContentId(identity), owner, budget_ns).await
+          {
+            Ok(()) => HomeOutcome::LetGo,
+            Err(HomeRefused::NotHeld) => HomeOutcome::Refused(HomeRefusal::NotHeld),
+            Err(_) => HomeOutcome::Refused(HomeRefusal::Unanswered),
+          };
+        (identity, outcome)
+      }
+      HomeMessage::Moved { identity, from, to } => {
+        let outcome =
+          match move_region_at_home(origin, &shards, ContentId(identity), (from, to), budget_ns)
+            .await
+          {
+            Ok(ticket) if published(origin, ticket, budget_ns).await => HomeOutcome::Moved,
+            Ok(_) => HomeOutcome::Refused(HomeRefusal::Unanswered),
+            Err(HomeRefused::NotHeld) => HomeOutcome::Refused(HomeRefusal::NotHeld),
+            Err(_) => HomeOutcome::Refused(HomeRefusal::Unanswered),
+          };
+        (identity, outcome)
+      }
+      // Resolved by the repository's current owner from its records (A-727 (d1a-3)): until that lands this node answers
+      // none, and the asking home keeps the attempt's hold, the safe side.
+      HomeMessage::Resolve { identity, .. } => {
+        (identity, HomeOutcome::Refused(HomeRefusal::Unanswered))
+      }
+      HomeMessage::Answer { .. } => return Vec::new(),
+    };
   HomeMessage::Answer { identity, outcome }.encode()
 }
 
@@ -1268,7 +1415,7 @@ pub(crate) async fn serve_remote(origin: u16, request: &[u8], budget_ns: u64) ->
 async fn keep_region_at_home(
   origin: u16,
   shards: &[u16],
-  bytes: Vec<u8>,
+  (bytes, owners): (Vec<u8>, Vec<HomeOwner>),
   budget_ns: u64,
 ) -> Result<(ContentId, HomeTicket), HomeRefused> {
   let identity = ContentId::of(&bytes);
@@ -1276,7 +1423,7 @@ async fn keep_region_at_home(
   crate::xshard::call_in_shard_time(
     origin,
     target,
-    move |state| keep_for_region(state, &bytes),
+    move |state| keep_for_region(state, &bytes, &owners),
     budget_ns,
   )
   .await
@@ -1288,18 +1435,228 @@ async fn let_go_region_at_home(
   origin: u16,
   shards: &[u16],
   identity: ContentId,
+  owner: Option<HomeOwner>,
   budget_ns: u64,
 ) -> Result<(), HomeRefused> {
   let target = home_of(shards, &identity).ok_or(HomeRefused::Unanswered)?;
   crate::xshard::call_in_shard_time(
     origin,
     target,
-    move |state| let_go_for_region(state, &identity),
+    move |state| let_go_for_region(state, &identity, owner),
     budget_ns,
   )
   .await
   .ok_or(HomeRefused::Unanswered)?
 }
+
+/// [`move_region_owner`] on the home shard among `shards` of the object `identity`, asked from shard `origin`: the ticket
+/// of the image the move is first durable in.
+async fn move_region_at_home(
+  origin: u16,
+  shards: &[u16],
+  identity: ContentId,
+  owners: (HomeOwner, HomeOwner),
+  budget_ns: u64,
+) -> Result<HomeTicket, HomeRefused> {
+  let target = home_of(shards, &identity).ok_or(HomeRefused::Unanswered)?;
+  crate::xshard::call_in_shard_time(
+    origin,
+    target,
+    move |state| move_region_owner(&identity, owners).map(|()| ticket_here(state.shard)),
+    budget_ns,
+  )
+  .await
+  .ok_or(HomeRefused::Unanswered)?
+}
+
+std::thread_local! {
+  /// This shard's attempts numbered so far ([`attempt_owner`]).
+  static ATTEMPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+  /// The owners' moves and let-gos this shard owes the region (A-727 (d1a)): an attempt's entry committed (its holds
+  /// moved to its records) or refused (its holds let go), each made where the step is and settled off it by one task
+  /// ([`settle_owed`]) a turn at a time. Bounded by the holds its attempts in flight took.
+  static SETTLES: std::cell::RefCell<std::collections::VecDeque<Settle>> =
+    const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+  /// Whether the task settling [`SETTLES`] runs.
+  static SETTLING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Format: the bits an attempt's number keeps for its shard's count, below the shard's own number (a shard numbers its
+/// own attempts, so two shards of one boot never make the same one).
+const ATTEMPT_SHARD_SHIFT: u32 = 48;
+
+/// A fresh owner for an attempt of repository `repository` on this shard (A-727 (d1a)): this member, its process (the
+/// process's nonce, fresh at every start: a member's SWIM incarnation starts over at each start, and a warm restart keeps
+/// its boot nonce) and a number no other attempt of this process takes.
+pub(crate) fn attempt_owner(state: &ShardState, repository: [u8; 16]) -> HomeOwner {
+  let count = ATTEMPTS.with(|attempts| {
+    let count = attempts.get();
+    attempts.set(count.wrapping_add(1));
+    count
+  });
+  let shard = u64::from(state.shard)
+    .checked_shl(ATTEMPT_SHARD_SHIFT)
+    .unwrap_or(0);
+  HomeOwner::Attempt {
+    repository,
+    node: state.fleet.host(),
+    process: state.member_process_nonce,
+    attempt: shard | (count & ((1u64 << ATTEMPT_SHARD_SHIFT) - 1)),
+  }
+}
+
+/// What an attempt owes its holds' homes once it ends (A-727 (d1a)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Settle {
+  /// Its entry committed: the hold of `identity` moved from the attempt to the records naming it.
+  Move {
+    /// The object.
+    identity: ContentId,
+    /// The attempt.
+    from: HomeOwner,
+    /// The records.
+    to: HomeOwner,
+  },
+  /// It was refused: the attempt's hold of `identity` let go.
+  Release {
+    /// The object.
+    identity: ContentId,
+    /// The attempt.
+    owner: HomeOwner,
+  },
+}
+
+/// Counter: an attempt's move or let-go every home of its object answered (A-727 (d1a)). Format: a counter name.
+pub(crate) const SETTLED: &str = "vcs_store.homes.settled";
+/// Counter: one some home did not answer, its hold left to the resolution of the attempt (A-727 (d1a-3)). Format: a
+/// counter name.
+pub(crate) const SETTLE_UNANSWERED: &str = "vcs_store.homes.settle_unanswered";
+
+/// Owes `settle` to the region (A-727 (d1a)), and starts the task that settles what this shard owes where none runs.
+pub(crate) fn settle_later(settle: Settle) {
+  SETTLES.with(|settles| {
+    if let Ok(mut settles) = settles.try_borrow_mut() {
+      settles.push_back(settle);
+    }
+  });
+  if SETTLING.with(|settling| settling.replace(true)) {
+    return;
+  }
+  match slates_rt::futures::spawn(settle_owed()) {
+    Ok(task) => {
+      let _ = slates_rt::futures::detach(task);
+    }
+    // No task to spare: what is owed is settled by the next settle that starts one.
+    Err(_) => SETTLING.with(|settling| settling.set(false)),
+  }
+}
+
+/// The task settling what this shard owes the region ([`SETTLES`]), one a turn, counted; it ends once nothing is owed or
+/// the shard's state is gone.
+async fn settle_owed() {
+  loop {
+    let next = SETTLES.with(|settles| settles.try_borrow_mut().ok()?.pop_front());
+    let Some(settle) = next else {
+      break;
+    };
+    let Some((origin, shards)) =
+      crate::state::with_state(|state| (state.shard, state.shards.clone()))
+    else {
+      break;
+    };
+    let settled = settle_in_region((origin, &shards), settle, crate::fleet::live_budget()).await;
+    let _ = crate::state::with_state(|state| {
+      state.count(if settled { SETTLED } else { SETTLE_UNANSWERED }, 1);
+    });
+    slates_rt::futures::yield_now().await;
+  }
+  SETTLING.with(|settling| settling.set(false));
+}
+
+/// Settles `settle` at every home of its object (A-727 (d1a)): this node's home shard where this node is one, and each
+/// other home by its own message ([`HomeMessage::Moved`], [`HomeMessage::LetGo`]). Whether every home answered it (a
+/// home that holds nothing for the owner answers too: there is nothing to settle there).
+async fn settle_in_region(
+  (origin, shards): (u16, &[u16]),
+  settle: Settle,
+  budget: slates_cluster::CommitBudget,
+) -> bool {
+  use slates_cluster::homes::{HomeMessage, HomeOutcome, HomeRefusal};
+  let Some((local, members, f)) = crate::state::with_state(|state| {
+    (
+      state.fleet.host(),
+      state.fleet.members().to_vec(),
+      usize::try_from(state.fleet.configuration().quorum.f).unwrap_or(usize::MAX),
+    )
+  }) else {
+    return false;
+  };
+  let budget_ns = budget.max_deadline_ns();
+  let identity = match settle {
+    Settle::Move { identity, .. } | Settle::Release { identity, .. } => identity,
+  };
+  let homes = slates_db::identity_homes::homes(&identity.0, &members, f);
+  let mut answered = true;
+  if homes.contains(&local) {
+    let here = match settle {
+      Settle::Move { from, to, .. } => {
+        move_region_at_home(origin, shards, identity, (from, to), budget_ns)
+          .await
+          .map(drop)
+      }
+      Settle::Release { owner, .. } => {
+        let_go_region_at_home(origin, shards, identity, Some(owner), budget_ns).await
+      }
+    };
+    answered &= matches!(here, Ok(()) | Err(HomeRefused::NotHeld));
+  }
+  let others: Vec<slates_db::HostId> = homes.into_iter().filter(|home| *home != local).collect();
+  if others.is_empty() {
+    return answered;
+  }
+  let request = match settle {
+    Settle::Move { identity, from, to } => HomeMessage::Moved {
+      identity: identity.0,
+      from,
+      to,
+    },
+    Settle::Release { identity, owner } => HomeMessage::LetGo {
+      identity: identity.0,
+      owner: Some(owner),
+    },
+  }
+  .encode();
+  let control = shards.first().copied().unwrap_or(origin);
+  let count = others.len();
+  let replies = crate::xshard::task_in_shard_time(
+    origin,
+    control,
+    move || async move { exchange(&others, &request, budget).await },
+    budget_ns,
+  )
+  .await
+  .unwrap_or_default();
+  let settled = replies
+    .iter()
+    .filter(|(_, reply)| {
+      matches!(
+        HomeMessage::decode(reply),
+        Ok(HomeMessage::Answer {
+          identity: answered,
+          outcome: HomeOutcome::Moved | HomeOutcome::LetGo | HomeOutcome::Refused(HomeRefusal::NotHeld),
+        }) if answered == identity.0
+      )
+    })
+    .count();
+  answered && settled == count
+}
+
+/// Test support: the owner a test's region hold is kept for where no attempt or record of its own is about (A-727 (d1a)):
+/// a repository's records, the repository all zeros.
+#[cfg(test)]
+pub(crate) const TEST_OWNER: HomeOwner = HomeOwner::Record {
+  repository: [0; 16],
+};
 
 /// Counter: a push's names asked to be homed that no edge took by the next turn: the record written as version 2
 /// (A-724 piece 8c). Format: a counter name.
@@ -1328,10 +1685,11 @@ pub(crate) const HOMED_SHORT: &str = "vcs_store.homes.homed_short";
 async fn kept_here(
   origin: u16,
   shards: &[u16],
-  bytes: &[u8],
+  (bytes, owner): (&[u8], HomeOwner),
   budget_ns: u64,
 ) -> Result<usize, HomeRefused> {
-  let (_, ticket) = keep_region_at_home(origin, shards, bytes.to_vec(), budget_ns).await?;
+  let (_, ticket) =
+    keep_region_at_home(origin, shards, (bytes.to_vec(), vec![owner]), budget_ns).await?;
   let durable = super::durable::content_durable(origin, ticket, budget_ns)
     .await
     .is_ok();
@@ -1341,7 +1699,7 @@ async fn kept_here(
 pub(crate) async fn home_in_region(
   origin: u16,
   shards: &[u16],
-  bytes: Vec<u8>,
+  (bytes, owner): (Vec<u8>, HomeOwner),
   budget: slates_cluster::CommitBudget,
 ) -> Homed {
   let Some((local, members, f)) = crate::state::with_state(|state| {
@@ -1362,7 +1720,7 @@ pub(crate) async fn home_in_region(
   let mut kept = 0usize;
   let began = slates_rt::futures::now_ns();
   if homes.contains(&local) {
-    match kept_here(origin, shards, &bytes, budget_ns).await {
+    match kept_here(origin, shards, (&bytes, owner), budget_ns).await {
       Ok(here) => kept = here,
       Err(refused) => {
         return Homed {
@@ -1389,7 +1747,7 @@ pub(crate) async fn home_in_region(
     let (remote, back) = crate::xshard::task_in_shard_time(
       origin,
       control,
-      move || put_remote(others, identity, bytes, budget),
+      move || put_remote(others, identity, (vec![owner], bytes), budget),
       budget_ns,
     )
     .await
@@ -1500,7 +1858,21 @@ async fn exchange(
       let mut returned = Vec::with_capacity(replied.len());
       for (host, reply, endpoint) in replied {
         left.retain(|waiting| *waiting != host);
-        answers.push((host, reply.bytes));
+        // A reply this build cannot read (a peer of another version answers none it can) fails its exchange at once,
+        // counted: never a wait for the deadline (A-727 (d1a)).
+        if !matches!(
+          slates_cluster::homes::HomeMessage::decode(&reply.bytes),
+          Ok(slates_cluster::homes::HomeMessage::Answer {
+            outcome: slates_cluster::homes::HomeOutcome::Refused(
+              slates_cluster::homes::HomeRefusal::Version
+            ),
+            ..
+          }) | Err(_)
+        ) {
+          answers.push((host, reply.bytes));
+        } else {
+          let _ = crate::state::with_state(|state| state.count(REPLY_OTHER_VERSION, 1));
+        }
         returned.push((host, endpoint));
       }
       crate::fleet::return_sessions(returned);
@@ -1522,16 +1894,19 @@ async fn exchange(
 async fn put_remote(
   homes: Vec<slates_db::HostId>,
   identity: ContentId,
-  bytes: Vec<u8>,
+  (owners, bytes): (Vec<HomeOwner>, Vec<u8>),
   budget: slates_cluster::CommitBudget,
 ) -> (usize, Vec<u8>) {
   use slates_cluster::homes::{HomeMessage, HomeOutcome, PART_BYTES};
   if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > PART_BYTES {
-    let kept = put_in_parts(&homes, identity, &bytes, budget).await.len();
+    let kept = put_in_parts(&homes, (identity, &owners), &bytes, budget)
+      .await
+      .len();
     return (kept, bytes);
   }
   let message = HomeMessage::Put {
     identity: identity.0,
+    owners,
     bytes,
   };
   let request = message.encode();
@@ -1572,7 +1947,7 @@ async fn read_remote(
 /// the part taken: the homes that answered the last part kept (each only once its image holding it is published).
 async fn put_in_parts(
   homes: &[slates_db::HostId],
-  identity: ContentId,
+  (identity, owners): (ContentId, &[HomeOwner]),
   bytes: &[u8],
   budget: slates_cluster::CommitBudget,
 ) -> Vec<slates_db::HostId> {
@@ -1586,6 +1961,7 @@ async fn put_in_parts(
     let end = offset.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
     let request = HomeMessage::PutPart {
       identity: identity.0,
+      owners: owners.to_vec(),
       total,
       offset,
       bytes: chunk.to_vec(),
@@ -1740,7 +2116,7 @@ async fn release_if_healed(
 ) {
   let plan = slates_db::identity_homes::heal(&identity.0, members, f, held);
   if plan.release.contains(&local)
-    && let_go_region_at_home(origin, shards, identity, budget.max_deadline_ns())
+    && let_go_region_at_home(origin, shards, identity, None, budget.max_deadline_ns())
       .await
       .is_ok()
   {
@@ -1767,18 +2143,34 @@ async fn heal_one(
   let mut held: std::collections::BTreeSet<slates_db::HostId> = std::collections::BTreeSet::new();
   held.insert(local);
   if !others.is_empty() {
+    // Offered for every owner its hold has here (A-727 (d1a)), so a home it reaches holds it for the same reasons.
+    let owners = match home_of(shards, &identity) {
+      Some(home) => crate::xshard::call_in_shard_time(
+        origin,
+        home,
+        move |_| region_owners(&identity),
+        budget.max_deadline_ns(),
+      )
+      .await
+      .unwrap_or_default(),
+      None => Vec::new(),
+    };
+    if owners.is_empty() {
+      return;
+    }
     let Some(bytes) = read(origin, shards, identity, budget.max_deadline_ns()).await else {
       return;
     };
     // An object past one message is offered a part at a time (A-724 piece 8c), as `home_in_region` sends it.
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > slates_cluster::homes::PART_BYTES {
-      held.extend(put_in_parts(&others, identity, &bytes, budget).await);
+      held.extend(put_in_parts(&others, (identity, &owners), &bytes, budget).await);
       crate::state::with_state(|state| state.count(HEAL_OFFERED, 1));
       release_if_healed(origin, shards, (local, members, f), identity, budget, &held).await;
       return;
     }
     let request = HomeMessage::Put {
       identity: identity.0,
+      owners,
       bytes,
     }
     .encode();

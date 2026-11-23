@@ -670,6 +670,38 @@ pub fn content_granule(page: usize) -> usize {
   page.clamp(1, SMALLEST_TARGET_PAGE)
 }
 
+/// Derived: the machine's effective capacity, its total memory held to the tightest OS/job/cgroup bound on the process
+/// when one is set (§4.2 D-12 "honest degradation", "effective capacity"). The basis of the provisioning reserve is the
+/// shard's share of the machine's total RAM, not the OS lock LIMIT: a volume's arena is locked only when a client asks
+/// (`require_locked`, verbs.rs); by default it is a normal, usable — if unlocked — mapping (crate mem's lock sequence
+/// keeps an unlocked region "usable, unlocked, and counted"). Deriving the reserve from the mlock limit refused every
+/// volume where the OS grants little lockable RAM — the design's own failure case, "a locked-down CI container refuses
+/// mlock; lock capacity 0" (§4.2 boot order); a `require_locked` volume still respects the lock capacity best-effort.
+/// The basis is **total** memory, not free/available: the reserve is a boot-time admission *ceiling* (the arena is a
+/// lazy anonymous mapping — it costs no physical RAM until a volume stores bytes, so a virtual ceiling over total is
+/// honest), and total is stable, whereas free memory is a fluctuating snapshot that would make the ceiling — and whether
+/// the daemon can provision at all — depend on whatever else the machine is doing at boot (racy under a busy host or a
+/// parallel test suite). A container's `memory.max` or a finite `RLIMIT_AS` is a hard limit the OS enforces by killing
+/// or refusing, so admitting past it would be a promise the host cannot keep; like total, a configured bound is stable
+/// across the boot.
+pub fn effective_capacity(memory: &slates_machine::facts::MemoryFacts) -> Derived<u64> {
+  derived!(
+    slates_machine::facts::effective_capacity(memory.total, memory.limit),
+    "min(memory.total, the OS/job/cgroup bound when one is set)",
+    ["memory.total", "memory.limit"]
+  )
+}
+
+/// Derived: a shard's reserve, one memory class's share of one shard of the `effective` capacity
+/// ([`effective_capacity`]): what [`DaemonConfig::derive`] records as `reserve_per_shard`, each shard's slice of the
+/// content pool (A-98: its arena range, `DaemonConfig::shard_content_layout`). Public so a fleet test sizes a bounded
+/// claim by the room a shard can claim, from the daemon's own derivation (`crates/cli/tests/live_chaos.rs`): the
+/// status's `reserve=` is the capacity a shard has claimed from the pool so far, 0 on a daemon that has admitted
+/// nothing (A-98, A-853).
+pub fn reserve_per_shard(effective: u64, shards: u64) -> Derived<u64> {
+  region_bytes(effective, shards, MEMORY_CLASSES)
+}
+
 impl DaemonConfig {
   /// The unit this daemon allocates content in ([`content_granule`] of its page).
   pub fn content_granule(&self) -> usize {
@@ -832,32 +864,9 @@ impl DaemonConfig {
       runtime.cores.clear();
     }
     let shards = u64::from(runtime.shards.max(1));
-    // §4.2 D-12 "honest degradation": the default provisioning reserve is the shard's share of the
-    // machine's total RAM, not the OS lock LIMIT. A volume's arena is locked only when a client asks
-    // (`require_locked`, verbs.rs); by default it is a normal, usable — if unlocked — mapping (crate
-    // mem's lock sequence keeps an unlocked region "usable, unlocked, and counted"). Deriving the
-    // reserve from the mlock limit refused every volume where the OS grants little lockable RAM — the
-    // design's own failure case, "a locked-down CI container refuses mlock; lock capacity 0" (§4.2 boot
-    // order); a `require_locked` volume still respects the lock capacity best-effort. The basis is
-    // **total** memory, not free/available: the reserve is a boot-time admission *ceiling* (the arena
-    // is a lazy anonymous mapping — it costs no physical RAM until a volume stores bytes, so a virtual
-    // ceiling over total is honest), and total is stable, whereas free memory is a fluctuating snapshot
-    // that would make the ceiling — and whether the daemon can provision at all — depend on whatever
-    // else the machine is doing at boot (racy under a busy host or a parallel test suite). Total is
-    // clamped to the tightest OS/job/cgroup bound on the process when one is set (§4.2 "effective
-    // capacity"): a container's `memory.max` or a finite `RLIMIT_AS` is a hard limit the OS enforces
-    // by killing or refusing, so admitting past it would be a promise the host cannot keep; like
-    // total, a configured bound is stable across the boot.
-    let effective: Derived<u64> = derived!(
-      slates_machine::facts::effective_capacity(
-        profile.facts.memory.total,
-        profile.facts.memory.limit
-      ),
-      "min(memory.total, the OS/job/cgroup bound when one is set)",
-      ["memory.total", "memory.limit"]
-    );
+    let effective = effective_capacity(&profile.facts.memory);
     derivations.push(note("effective_capacity_bytes", &effective));
-    let reserve = region_bytes(effective.get(), shards, MEMORY_CLASSES);
+    let reserve = reserve_per_shard(effective.get(), shards);
     derivations.push(note("reserve_per_shard", &reserve));
     let lock_capacity: Derived<u64> = derived!(
       if profile.lock.confirmed {

@@ -610,7 +610,7 @@ impl Instance {
   /// any proof form the daemon accepts ([`GrantProof`]), whoever made it, and any client may issue a grant for a
   /// presentation another client made; the presenting client then lands under it. Refused [`crate::Denied::Unproven`]
   /// when the proof does not verify, [`crate::Stale::Approval`] when the manifest is not the presented one, and
-  /// [`Missing::Presentation`] when nothing awaits under the id (it was replaced, or its client went away).
+  /// [`Missing::Presentation`] when nothing awaits under the id (it was replaced, landed, or its volume went).
   pub fn grant(&mut self, claim: &GrantClaim, proof: &GrantProof) -> Result<u64, Error> {
     self
       .client

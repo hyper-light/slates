@@ -282,6 +282,13 @@ fn the_head_identity_is_deterministic_and_matches_its_golden_vector() {
     origin_identity,
     "declaration order does not reach the identity"
   );
+  assert_the_head_identity_is_a_pure_function_of_the_state(origin_identity);
+}
+
+/// The purity half of `the_head_identity_is_deterministic_and_matches_its_golden_vector`, from the fixed origin whose
+/// identity is `origin_identity`: two greens that applied the same increment agree, a version has its own identity,
+/// and one differing byte changes it.
+fn assert_the_head_identity_is_a_pure_function_of_the_state(origin_identity: [u8; 32]) {
   let mut one = Green::with_origin(fixed_origin());
   let mut two = Green::with_origin(fixed_origin());
   let increment = Build::new().overwrite("README", 0, b"HELLO").at(1, 0);

@@ -15254,22 +15254,28 @@ fn assert_each_made_once(listed: &ReplyBody, names: &[&str]) {
   }
 }
 
-/// A-354 (§4.10 "Live shipping"; CLAUDE.md §2 items 8 and 9) with main's ruling of 2026-11-20 (a verb never takes
-/// effect twice): a reply held for a live volume's durability is answered at the latest at the failover delay from its
-/// hold, `DurabilityPending`, and the verb's own reply is recorded as its completion, so its resend under the same id is
-/// answered that reply and never runs it again. Do: three nodes at `f = 1`; both survivors refuse every register record
-/// from a (`Daemon::inject_record_refusal`), so a new live volume's head and catalog never place and nothing written to it
-/// can be durable; on a, a live-shipped volume shared with the fleet; a directory made through the raw ring, its reply
+/// A-354 (§4.10 "Live shipping"; §4.8 "The three mechanisms": a live-shipped volume is acknowledged at `f + 1`;
+/// CLAUDE.md §2 items 8 and 9) with its amendment of 2026-11-23: a reply held for a live volume's durability is told
+/// `DurabilityPending` at the latest at the failover delay from its hold, its outcome in doubt and recorded nowhere, and
+/// a resend under the same id joins the wait, so the verb never runs twice and is never answered done before its log is
+/// durable. Do: three nodes at `f = 1`; both survivors refuse every register record from a
+/// (`Daemon::inject_record_refusal`), so a new live volume's head and catalog never place and nothing written to it can
+/// be durable; on a, a live-shipped volume shared with the fleet; a directory made through the raw ring, its reply
 /// awaited for at most the placement wait, then the same request again; a second directory made through
-/// `slates_client::Client`, which sends a `DurabilityPending` request again under its id itself; then lift the refusals
-/// and list the root. Expect the first answer `DurabilityPending` after the failover delay and within a liveness budget
-/// past it, counted `fleet.live.held_gave_up`; its resend answered `FsDone`, the verb's own reply; the client's call
-/// answered `FsDone`; and each directory listed once. Before, the refusal was the recorded completion: the resend was
-/// answered `DurabilityPending` again, and a consumer told to make the call again ran the verb a second time (a
-/// directory's second making refused `AlreadyExists`, an append landed twice; g226). Before 2026-11-18 a held reply ended
-/// only durable, fenced or destroyed, so its client waited as long as its daemon lived (A-353's hang).
+/// `slates_client::Client`, which sends a `DurabilityPending` request again under its id itself; then lift the refusals,
+/// send the first request again under its id until it is answered done, and list the root. Expect the first answer
+/// `DurabilityPending` after the failover delay and within a liveness budget past it, counted `fleet.live.held_gave_up`;
+/// its resend answered `DurabilityPending` too while nothing is durable, never `FsDone`; the client's call refused
+/// `DurabilityPending`; once the refusals lift, the first request's resend answered `FsDone`, its outcome decided; and
+/// each directory listed once. From 2026-11-20 to 2026-11-23 the verb's own reply was recorded at the give-up (main's
+/// ruling on g226), so the resend and the client's call were answered `FsDone` while nothing was durable: an owner cut
+/// off from its peers handed its clients nine successes its successor never had (`crates/cli/tests/live_chaos.rs`'s
+/// partition flows; `docs/bugs/2026-11-23-a-held-write-given-up-at-the-failover-slo-was-recorded-done.md`). Before
+/// 2026-11-20 the refusal was the recorded completion, and a consumer told to make the call again ran the verb a second
+/// time (a directory's second making refused `AlreadyExists`, an append landed twice; g226). Before 2026-11-18 a held
+/// reply ended only durable, fenced or destroyed, so its client waited as long as its daemon lived (A-353's hang).
 #[test]
-fn a_verb_held_past_the_failover_delay_took_effect_once_and_its_resend_is_answered_its_own_reply() {
+fn a_verb_held_past_the_failover_delay_is_in_doubt_not_done_until_durable_and_runs_once() {
   let _serial = serialize_fleet_tests();
   let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
   // a's failover delay held at its estimate now (A-363), so the hold's bound cannot move under the assertion; held from
@@ -15302,6 +15308,16 @@ fn a_verb_held_past_the_failover_delay_took_effect_once_and_its_resend_is_answer
   for daemon in &daemons[1..] {
     daemon.inject_record_refusal(&[]).unwrap();
   }
+  // Once the log can be held, the first request's outcome is decided: asked again under its id until answered done.
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let (mut asked, mut last) = (0u32, None);
+  let decided = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    let reply = client.try_retry(&mkdir("/raw"), deadline_ns);
+    let done = matches!(reply, Ok(ReplyBody::FsDone { .. }));
+    asked += 1;
+    last = Some(reply);
+    Ok(done)
+  });
   let listed = client.call(&RequestBody::ReadDir {
     volume: id,
     path: "/".to_owned(),
@@ -15314,17 +15330,32 @@ fn a_verb_held_past_the_failover_delay_took_effect_once_and_its_resend_is_answer
   }
   eprintln!(
     "held for good: the mkdir {first:?}, the same request {same_id:?}, through the client {through_client:?}, \
-     {gave_up} given up, the root {listed:?}"
+     {gave_up} given up; once held, asked {asked} times, last {last:?}; the root {listed:?}"
   );
   assert_refused_at_the_slo(&first, slo_ns);
   assert!(gave_up >= 1, "the owner counted the reply given up");
   assert!(
-    matches!(same_id, Ok(ReplyBody::FsDone { .. })),
-    "the same request was answered the verb's own reply, not run again: {same_id:?}"
+    matches!(
+      same_id,
+      Ok(ReplyBody::Refused {
+        refusal: Refusal::DurabilityPending { .. }
+      })
+    ),
+    "the same request, while nothing was durable, was told in doubt again, never done: {same_id:?}"
   );
   assert!(
-    matches!(through_client, Ok(ReplyBody::FsDone { .. })),
-    "the client asked again under the id and handed back the verb's own reply: {through_client:?}"
+    matches!(
+      through_client,
+      Err(slates_client::ClientError::Refused(
+        Refusal::DurabilityPending { .. }
+      ))
+    ),
+    "the client asked again under the id and was told in doubt, never done: {through_client:?}"
+  );
+  assert!(
+    decided,
+    "once the log could be held, the first request's resend under its id was answered done: {asked} asks, last \
+     {last:?}"
   );
   assert_each_made_once(&listed, &["raw", "client"]);
 }

@@ -64,6 +64,12 @@ const REPOSITORY: &str = "project";
 /// Format: the file each session commits, at the repository's root.
 const FILE: &str = "file";
 
+/// Format: the UUID each leg's `svnsync` mirror is given before its `init`, as `ci/interop/svn-matrix.sh` gives its own
+/// (`MIRROR_UUID`). Stock `svnsync` never sets a mirror's UUID (Subversion 1.15.1 `svnsync.c` `do_initialize`: "the RA
+/// layer doesn't have a way to set a UUID"), so `svnadmin create` leaves each mirror a random one, which the mirrors'
+/// dumps would otherwise differ by on every run whatever the server.
+const MIRROR_UUID: &str = "00000000-0000-4000-8000-00000000a703";
+
 /// Shape: the shards of each test's daemon, as `tests/cli.rs` starts one.
 const SHARDS: &str = "2";
 
@@ -2987,11 +2993,15 @@ fn rdump_of(leg: &UseLeg, scratch: &str) -> String {
   }
 }
 
-/// An `svnsync` mirror of `leg`'s repository made under `root`, as `svnadmin dump` reads it (its own sync properties
-/// left out), or the step that failed.
+/// An `svnsync` mirror of `leg`'s repository made under `root`, given [`MIRROR_UUID`], as `svnadmin dump` reads it (its
+/// own sync properties left out), or the step that failed.
 fn mirror_dump_of(leg: &UseLeg, (scratch, root): (&str, &str)) -> String {
   let mirror = format!("{root}/mirror-of-{}", leg.svn.session);
   tool("svnadmin", scratch, &["create", &mirror]);
+  let (code, out, err) = tool("svnadmin", scratch, &["setuuid", &mirror, MIRROR_UUID]);
+  if code != 0 {
+    return format!("setuuid exit {code}: {out}{err}");
+  }
   let hook = format!("{mirror}/hooks/pre-revprop-change");
   allowing_hook(&hook);
   let mirror_url = format!("file://{mirror}");
