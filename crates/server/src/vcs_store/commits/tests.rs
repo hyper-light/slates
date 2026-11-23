@@ -500,6 +500,7 @@ fn t_a664_live_a_pushs_whole_map_is_built_in_slices_after_its_answer() {
 #[test]
 fn t_a664_live_a_submit_waits_parked_for_its_greens_whole_build() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  crate::test_store::keep_landed(&daemon);
   let seen = crate::test_store::run_on_first(
     &daemon,
     || async move {
@@ -1063,6 +1064,7 @@ const SLICED_FILES: usize = 8;
 #[test]
 fn t_a824_a_made_commits_map_is_put_a_slice_a_turn_over_the_preview() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  crate::test_store::keep_landed(&daemon);
   let seen = crate::test_store::run_on_first(
     &daemon,
     || async move {

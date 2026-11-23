@@ -4023,6 +4023,47 @@ fn a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows() {
   );
 }
 
+/// Goal 93 item 2b, the guard lifted (main 01a20182, 2026-11-22: `vcs_store::commit` lets a landed push's pack go
+/// again, every reader bringing a let-go window back). Do: start a two-shard store-backed daemon with its edge; push a
+/// create of `main` at a commit whose one file is [`LET_GO_FILE`] bytes; then, with nothing let go by hand, clone `main`
+/// over the edge and list `HEAD` ([`LS_REFS_HEAD`]). Expect: the push `200`; the repository's shard counting landed bytes let go
+/// (`vcs_store.landed.let_go_bytes`) once the push ended, by its commit's own let-go; the clone `200`, its pack the
+/// push's three objects; and the listing naming `HEAD` at the commit, `main` its target. Red with the guard (c9bb36dc5): nothing let go.
+#[test]
+fn a_pushed_pack_is_let_go_once_its_push_ends_and_a_clone_after_is_whole() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, commit) = large_create(LET_GO_FILE);
+  let created = pushed(edge, &name, &request);
+  let let_go = counted_on(&daemon, REPOSITORY, crate::vcs_store::LANDED_LET_GO_BYTES);
+  let fetched = uploaded(edge, &name, &fetch_of(commit));
+  let listed = uploaded(edge, &name, LS_REFS_HEAD);
+  daemon.stop();
+  assert_eq!(created.0, 200, "{}", String::from_utf8_lossy(&created.1));
+  assert!(
+    let_go > 0,
+    "the push's commit let its landed pack go: {let_go} bytes"
+  );
+  assert_eq!(fetched.0, 200);
+  assert_eq!(
+    ids_in(&fetched_pack(&fetched.1)).len(),
+    3,
+    "the clone whole"
+  );
+  assert_eq!(listed.0, 200);
+  assert!(
+    String::from_utf8_lossy(&listed.1)
+      .contains(&format!("{commit} HEAD symref-target:refs/heads/main")),
+    "{}",
+    String::from_utf8_lossy(&listed.1)
+  );
+}
+
 /// Shape: the annotated tags of [`an_advertisement_over_a_let_go_pack_is_the_one_over_it_held`]'s push, each laid in its
 /// pack between two of its files, so their entries lie in windows of their own.
 const LET_GO_TAGS: usize = 6;
@@ -4196,18 +4237,27 @@ fn a_long_push_of_own_texts(
   edge: (u16, &CertificateDer<'static>),
   name: &str,
 ) -> (Vec<Made>, &'static [Vec<u8>], (u16, String, Vec<u8>)) {
+  a_push_of_own_texts(daemon, edge, (name, TEXTS_CHANGESETS))
+}
+
+/// [`a_long_push_of_own_texts`] of a line of `changesets`.
+fn a_push_of_own_texts(
+  daemon: &Daemon,
+  edge: (u16, &CertificateDer<'static>),
+  (name, changesets): (&str, usize),
+) -> (Vec<Made>, &'static [Vec<u8>], (u16, String, Vec<u8>)) {
   crate::daemon::observe_at(daemon, REPOSITORY, |_| {
     crate::repository::hg_run::TEST_SEGMENT_BYTES.with(|bound| bound.set(LONG_SEGMENT_BYTES));
   });
   let paths: &'static [String] = Box::leak(
-    (0..TEXTS_CHANGESETS)
+    (0..changesets)
       .map(|at| format!("file-{at}"))
       .collect::<Vec<_>>()
       .into_boxed_slice(),
   );
   // Each file's text its own, so the store keeps every one (a content the store holds once, by its bytes).
   let texts: &'static [Vec<u8>] = Box::leak(
-    (0..TEXTS_CHANGESETS)
+    (0..changesets)
       .map(|at| {
         let mut text = Vec::with_capacity(TEXT_BYTES);
         let mut line = 0usize;
@@ -4221,7 +4271,7 @@ fn a_long_push_of_own_texts(
       .collect::<Vec<_>>()
       .into_boxed_slice(),
   );
-  let commits: Vec<Commit> = (0..TEXTS_CHANGESETS)
+  let commits: Vec<Commit> = (0..changesets)
     .map(|at| {
       (
         paths[at].as_str(),
@@ -4233,9 +4283,71 @@ fn a_long_push_of_own_texts(
     })
     .collect();
   let made = history_of(&commits);
-  let revs: Vec<usize> = (0..TEXTS_CHANGESETS).collect();
+  let revs: Vec<usize> = (0..changesets).collect();
   let pushed = hg_unbundle(edge, name, &history_bundle(&made, &revs));
   (made, texts, pushed)
+}
+
+/// Shape: the two histories [`a_pushs_texts_high_water_is_a_segments_whatever_its_history`] pushes, changesets each.
+const HELD_SHORT_HISTORY: usize = 60;
+/// Shape: the longer of them.
+const HELD_LONG_HISTORY: usize = 240;
+
+/// What a daemon's push of a line of `changesets` own-text files held at most, its file texts' share of it, and its
+/// fork's rows' bytes ([`crate::repository::hg_push::PUSH_HELD_HIGH_BYTES`], `PUSH_TEXTS_HIGH_BYTES`, `PUSH_ROWS_BYTES`),
+/// on a fresh two-shard daemon over loopback TLS.
+fn held_and_rows_of(changesets: usize) -> (u64, u64, u64) {
+  let (identity, certificate) = identity();
+  let (daemon, _instance) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  create_empty_hg(&daemon, &name);
+  let (_, _, pushed) = a_push_of_own_texts(&daemon, (port, &certificate), (&name, changesets));
+  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
+  let held = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::repository::hg_push::PUSH_HELD_HIGH_BYTES,
+  );
+  let rows = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::repository::hg_push::PUSH_ROWS_BYTES,
+  );
+  let texts = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::repository::hg_push::PUSH_TEXTS_HIGH_BYTES,
+  );
+  daemon.stop();
+  println!("{changesets} changesets: held at most {held}, its texts {texts}, rows {rows}");
+  (held, texts, rows)
+}
+
+/// Goal 93, the 410 MiB bar (main's ruling of 2026-11-23: attack the push-all peak first, judged by its VmHWM, with
+/// `vcs.hg.push_held_high_bytes` as the non-vacuity gauge). Do: push a line of [`HELD_SHORT_HISTORY`] changesets each
+/// adding a file of its own [`TEXT_BYTES`], cut at [`LONG_SEGMENT_BYTES`], on a fresh daemon, then [`HELD_LONG_HISTORY`]
+/// on another; read each push's held high-water, its file texts' share, and its fork's rows. Expect each held above zero;
+/// the texts' share equal within a segment's slack whatever the history (each segment's texts let go as it lands); the
+/// rows growing with it (a row a revision of every log: 35,860 and 143,780 bytes in debug). Measured, not yet bounded:
+/// the rest of the held high-water, the push's admission, grows about 843 bytes a changeset (56,809 and 208,768), its
+/// bookkeeping kept to the end: the next piece's red.
+#[test]
+fn a_pushs_texts_high_water_is_a_segments_whatever_its_history() {
+  let (short_held, short_texts, short_rows) = held_and_rows_of(HELD_SHORT_HISTORY);
+  let (long_held, long_texts, long_rows) = held_and_rows_of(HELD_LONG_HISTORY);
+  let slack = LONG_SEGMENT_BYTES;
+  println!(
+    "held at most {short_held} of {HELD_SHORT_HISTORY} changesets and {long_held} of {HELD_LONG_HISTORY}; texts \
+     {short_texts} and {long_texts}; rows {short_rows} and {long_rows}; a segment {slack}"
+  );
+  assert!(short_held > 0 && long_held > 0, "the gauge moved");
+  assert!(
+    short_texts > 0 && long_texts.abs_diff(short_texts) <= slack,
+    "the texts held within a segment's slack: {short_texts} and {long_texts}"
+  );
+  assert!(long_rows > short_rows, "the rows grow with the history");
 }
 
 /// Main 01a20182's order of 2026-11-22 14:00 (CI 45065911852: 4.7 GB of arena held on the repository's shard after

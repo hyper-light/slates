@@ -345,6 +345,8 @@ const KEEPERS: u8 = b'K';
 /// Format: a keeper row's key: the tag, the repository, the text's identity, the sequence and the entry's place in its
 /// changeset's section (each big-endian, so a text's keepers are one range, oldest first). Its value is empty.
 const KEEPER_KEY_BYTES: usize = 1 + REPOSITORY + IDENTITY + LONG + ORDINAL;
+/// Format: where a keeper row's key holds its sequence: past its tag, its repository and its text's identity.
+const KEEPER_SEQUENCE_AT: usize = 1 + REPOSITORY + IDENTITY;
 /// Format: the tool id table's tag: a repository's version of a path by its tool's id (Mercurial's node), to the version
 /// as it landed: its text's identity and its own row (its base is a version of the same path, as a revlog's is).
 const TOOLS: u8 = b'I';
@@ -566,16 +568,15 @@ fn keepers_of<F: hyper_block::block::BlockFile>(
     let mut page = mantle_engine::rows::Rows::default();
     let more = rows.scan(&start, end.as_deref(), KEEPERS_A_SCAN, &mut page, &mut next)?;
     for (key, _) in page.iter() {
-      let at = 1 + REPOSITORY + IDENTITY;
-      let sequence = key
-        .get(at..at + LONG)
-        .and_then(|bytes| bytes.try_into().ok())
-        .map(u64::from_be_bytes)
-        .ok_or(StoreError::BadRow)?;
-      let ordinal = key
-        .get(at + LONG..at + LONG + ORDINAL)
-        .and_then(|bytes| bytes.try_into().ok())
-        .map(u32::from_be_bytes)
+      // The sequence, then the entry's place, read by checked chunks from where the text's identity ends: a key shorter
+      // than a keeper's is refused, never read past.
+      let (sequence, ordinal) = key
+        .get(KEEPER_SEQUENCE_AT..)
+        .and_then(|rest| rest.split_first_chunk::<LONG>())
+        .and_then(|(sequence, rest)| {
+          let ordinal = rest.first_chunk::<ORDINAL>()?;
+          Some((u64::from_be_bytes(*sequence), u32::from_be_bytes(*ordinal)))
+        })
         .ok_or(StoreError::BadRow)?;
       if sequence != forgotten {
         found.push((sequence, ordinal));

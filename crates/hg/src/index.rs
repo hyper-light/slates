@@ -373,6 +373,11 @@ impl HgIndex {
     &mut self.rows
   }
 
+  /// The bytes its rows hold in `store` (`slates_vcs::Index::held_bytes`).
+  pub fn held_bytes(&self, store: &ContentStore) -> u64 {
+    self.rows.held_bytes(store)
+  }
+
   /// A fork: the same rows, held once more, to which it adds only its own (A-581's `Index::fork`).
   pub fn fork(&mut self, store: &mut ContentStore) -> Result<HgIndex, IndexRefused> {
     Ok(HgIndex {

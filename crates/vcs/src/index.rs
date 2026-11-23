@@ -1231,6 +1231,15 @@ impl Index {
       .fold(tail, |rows, run| rows.saturating_add(run.rows))
   }
 
+  /// The bytes the index holds in `store`: each table's stored length and what its tail charged, shared tables counted
+  /// whole (a fork's are its parent's too): what a gauge of an index's size reads (goal 93's `vcs.hg.push_rows_bytes`).
+  pub fn held_bytes(&self, store: &ContentStore) -> u64 {
+    self
+      .tables()
+      .filter_map(|table| store.len_of(&table))
+      .fold(self.tail_charged, u64::saturating_add)
+  }
+
   /// The rows in the tail.
   pub fn tail_len(&self) -> usize {
     self.tail.len()

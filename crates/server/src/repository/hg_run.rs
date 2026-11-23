@@ -150,6 +150,11 @@ pub(crate) struct Run {
   /// Its landed segments' file revisions, let go again and noted once its entry is committed (module docs, "Let go": a
   /// push's works bring back the texts they read between its segments and its entry).
   contents: Vec<FileContents>,
+  /// The bytes of its landed segments' file texts still in the content store (kept, less what their let-go freed): what
+  /// `hg_push::PUSH_HELD_HIGH_BYTES` adds to the push's admission held.
+  texts_resident: u64,
+  /// The push's admission held as its latest segment landed (`hg_push::segments_landed`).
+  admission_held: u64,
   /// Whether it is settled.
   settled: bool,
 }
@@ -161,6 +166,8 @@ impl Run {
       repository,
       ranges: Vec::new(),
       contents: Vec::new(),
+      texts_resident: 0,
+      admission_held: 0,
       settled: false,
     }
   }
@@ -172,6 +179,21 @@ impl Run {
       Some((_, last)) if last.checked_add(1) == Some(sequence) => *last = sequence,
       _ => self.ranges.push((sequence, sequence)),
     }
+  }
+
+  /// Notes the push's admission held as its next segment lands: what the high-water its landing samples reads.
+  pub(crate) fn admission_held(&mut self, held: u64) {
+    self.admission_held = held;
+  }
+
+  /// A segment's file texts landed, `kept` bytes of them in the content store before their let-go and `freed` bytes let
+  /// go: what the push held then (its admission and its texts resident, these with them), and the texts resident after.
+  /// The two figures: all it held, and its texts resident alone.
+  pub(crate) fn texts_landed(&mut self, (kept, freed): (u64, u64)) -> (u64, u64) {
+    let texts = self.texts_resident.saturating_add(kept);
+    let held = self.admission_held.saturating_add(texts);
+    self.texts_resident = texts.saturating_sub(freed);
+    (held, texts)
   }
 
   /// The segments landed.
@@ -251,7 +273,7 @@ pub(crate) fn let_go_landed(
   state: &mut ShardState,
   noting: Option<RepositoryId>,
   contents: &[FileContents],
-) {
+) -> u64 {
   let (freed, pinned) = let_go_windows(state, noting, contents);
   if freed > 0 {
     state.count(TEXT_BYTES_LET_GO, freed);
@@ -259,6 +281,20 @@ pub(crate) fn let_go_landed(
   if pinned > 0 {
     state.count(TEXTS_PINNED, pinned);
   }
+  freed
+}
+
+/// The bytes `contents`' objects hold in the shard's content store, their windows let go or not.
+pub(crate) fn contents_bytes(state: &mut ShardState, contents: &[FileContents]) -> u64 {
+  crate::vcs_store::lent_state(state, |state| {
+    state.vcs_stores.content().map_or(0, |content| {
+      contents
+        .iter()
+        .flat_map(FileContents::identities)
+        .filter_map(|identity| content.len_of(identity))
+        .fold(0, u64::saturating_add)
+    })
+  })
 }
 
 /// Lets go of `contents`' windows, each object's every window marked landed: all but those a home holds here

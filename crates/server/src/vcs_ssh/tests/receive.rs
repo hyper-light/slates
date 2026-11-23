@@ -210,6 +210,7 @@ fn exited_cleanly(out: Vec<u8>) -> Transcript {
 #[test]
 fn t_a683_stock_gits_push_over_ssh_lands_through_the_driver() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  crate::test_store::keep_landed(&daemon);
   let (repository, address, advertised) = observe_first(&daemon, serving);
   let [(create, _), ..] = chain();
   let pushed = pushed_over_ssh(address, None, create.request);
