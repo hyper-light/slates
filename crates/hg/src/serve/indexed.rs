@@ -399,6 +399,14 @@ impl Repository for Indexed<'_> {
     self.first.saturating_add(tail)
   }
 
+  /// The index's branch heads ([`crate::index::BranchHeads`]) where the view serves its whole changelog, numbered as
+  /// the changelog numbers it: nothing left out by the filter. A view that leaves a changeset out (secret, hidden) is
+  /// walked, its heads not the changelog's.
+  fn maintained_branch_heads(&self) -> Option<Vec<Rev>> {
+    (self.left_out.is_empty() && self.count() == self.index.len(self.store, Log::Changelog))
+      .then(|| self.index.branch_heads().answer())
+  }
+
   fn node(&self, rev: Rev) -> Option<Node> {
     self.row(rev).map(|row| row.node)
   }

@@ -389,9 +389,8 @@ fn branch_tip(
   name: &[u8],
   admission: &mut Admission,
 ) -> Result<Option<Rev>, Refusal> {
-  if !(0..repo.count()).any(|rev| repo.branch(rev) == name) {
-    return Ok(None);
-  }
+  // A branch with a revision has a head (its highest revision has no descendant on it), so the heads alone tell a
+  // branch's name from another: no walk of the history asks whether it names one (goal 93).
   let heads: Vec<Rev> = branch_head_revs(repo, admission)?
     .into_iter()
     .filter(|rev| repo.branch(*rev) == name)

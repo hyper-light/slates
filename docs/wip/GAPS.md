@@ -122,7 +122,15 @@
 > (`parts_copied=2`, `entries_judged=3712`), stock git's "possible repository corruption on the remote side": a fetch
 > path still reads a let-go window without bringing it back. `vcs_store::commit` lets nothing go again; the harness of
 > the lift (`KEEP_LANDED`, `keep_landed`, `homed_drive`'s bring-back) stays. Lifted again with a red that clones after a
-> multi-window pack's let-go, the needed object's window let go, not only the pack's first.
+> multi-window pack's let-go, the needed object's window let go, not only the pack's first. Its cause FIXED (w-git,
+> 2026-11-23): the fetch stream stopped cleanly only where it reused a pushed entry or copied a kept window; every read
+> of an object where it lies (`read_stored`: an entry of a kept part made whole, r165's path, an object encoded afresh,
+> a delta's check, a search's read) turned a let-go window into `Unreadable` mid-pack. Each now stops the turn at the
+> window and retakes its unit (`Upload::read_or_stop`). Reds over stock git's offset-delta pack, every window let go:
+> `r165_an_entry_made_whole_from_a_let_go_window_stops_and_the_answer_is_byte_identical` (`Unreadable` at 0 stops
+> before) and `r165_an_object_encoded_afresh_…` (after 5). Owed: the encoding's object read (`Reading::read_window`)
+> refuses the same way where its header reads have not brought the window back first (no red yet); main's round, the
+> guard still in, before a re-lift.
 > **LIFTED (w-git, 2026-11-22, on main 01a20182's word; put back above):** `vcs_store::commit` lets a landed push's pack go again, or
 > owes it to the push's end or the repository's idle give-back, with each gate on main: w-git's fetch-side readers
 > (A-864) and a push's readers, (b) its thin bases through `IndexedObjects::away` and (c) its policy and signature reads;
@@ -719,6 +727,33 @@
 >   The test-only one-call landing builds a push's works as the driver does, planned and then built over the
 >   store's read-through (`works_whole`); `Works::Whole` and the one-call `tree::work` arm are gone, and `prepare` takes
 >   the view alone. The store-made-texts oracle compares a file by the identities its row names.
+> - Changeset evolution served OPEN, the next completeness item (2026-11-23, main's ruling: a complete hg server serves
+>   what a modern client sends, obsolescence markers among it). No matrix row reaches it today: `ci/interop/hg-matrix.sh`'s
+>   hgrc enables `rebase` alone, with no `experimental.evolution`, so `rebase-push` strips locally and pushes no marker;
+>   every push lands public; no row imports. Wanted: an evolution-enabled row (a client with `experimental.evolution`
+>   pushing an amend and a rebase, their markers exchanged), the hidden view served as 7.2 serves it (the changesets the
+>   markers obsolete left out), and the branch heads of such a view kept rather than walked
+>   (`discovery::walked_branch_head_revs`, the one view the kept heads do not answer for, below). After arena-6's and
+>   arena-7's reads, unless they name a memory or time item first.
+> - Branch heads kept as changesets land BUILT (2026-11-23, w-hg; main's ruling (b) on CI 45127535742: a `lookup` of a
+>   branch name ran one 348 ms step on x86, wrote 43 bytes, `branch_tip` scanning every revision's branch and then
+>   `branch_head_revs` walking the whole history, as `branchmap` whole did, 155-161 ms CPU a call). `HgIndex` keeps
+>   every branch's heads by 7.2's rule (`index::BranchHeads`), each changeset noted as `append_changesets` writes it (a
+>   parent on its branch ended; heads it descends from through other branches ended by a walk down to the branch's
+>   lowest head; then it), so the intake, an import, a re-base, a replay and a made changeset keep them a revision a
+>   step; a fork copies them, a commit's swap takes them. A view serving its whole changelog answers
+>   `branch_head_revs` from them (`Repository::maintained_branch_heads`), else walks
+>   (`discovery::walked_branch_head_revs`, the oracle); `branch_tip` tells a branch's name by its heads, no scan.
+>   Held by `kept_branch_heads_are_the_walks_after_every_group` (generated histories with merges, closes and branches
+>   taken again, appended in groups as segments land, equal to the walk and the rule after every group),
+>   `a_lookup_of_a_branch_name_reads_its_heads_not_the_history` and `branchmap_over_a_long_line_reads_its_heads_not_the_history`
+>   (a 170-changeset line: red 512 and 511 reads, now at most 8; `BranchHeads::answered` the non-vacuity count). A
+>   view that leaves a changeset out (secret, hidden) still walks: OPEN, rare in a publishing repository.
+>   An append's walk through other branches is one append's work: counted (`BranchHeads::longest_walk`, the status
+>   counter `vcs.hg.branch_heads_longest_walk`, read from each index a landing puts in place) and held by
+>   `a_branch_taken_again_after_a_long_line_counts_its_walk` (a `stable` revision on a 400-revision `default` line:
+>   the walk counted at the line's length). OPEN: sliced, its branch's heads pending until it ends, if the arena shows
+>   walks past a step's worth.
 > - A push's churn a manifest copy a changeset BUILT (2026-11-23, w-hg; main's orders on CI 45127535742: 57.3 GB through
 >   the allocator over the hg matrix, which breeds the 1.26 GB it keeps after push-all). Named by a counting allocator
 >   (`crates/hg/tests/push_heap.rs`, its store's windows in an arena as a daemon's are): an edit changeset allocated
