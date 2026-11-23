@@ -2899,7 +2899,10 @@ mod tests {
       let hook = HookConfig {
         point: HookPointName::GitPreReceive,
         name: "pre-receive".to_owned(),
-        program: "/srv/hooks/pre-receive".to_owned(),
+        program: std::env::current_exe()
+          .unwrap()
+          .to_string_lossy()
+          .into_owned(),
       };
       let set = |state: &mut ShardState, principal: &Principal, read: u64| {
         ask(

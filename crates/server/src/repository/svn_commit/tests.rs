@@ -1362,6 +1362,11 @@ fn a_commit_naming_a_stored_text_ram_let_go_brings_it_back_for_the_greens_increm
     "the green's file is not the text"
   );
   assert!(fetched >= 1, "no piece read through the store");
+  let pieces = u64::try_from(bytes.len().div_ceil(slates_store::store::PIECE_BYTES)).unwrap();
+  assert!(
+    fetched <= pieces,
+    "{fetched} pieces fetched through the store for a text of {pieces}"
+  );
   assert!(!kept, "the content store kept what the commit brought");
 }
 

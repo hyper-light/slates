@@ -39,7 +39,8 @@ fn polling(shard: u16) -> slates_rt::label::Polling {
 /// A-740. Do: spawn a task from another thread, let it yield twice, then spin without yielding: first under its spawn
 /// site's label, then inside `futures::doing("spin_label::spinner")`. Expect: read from this thread while it spins, the
 /// shard's pulse names the spawn site (this file) at the task's third poll, then the named work at the same poll; once
-/// the guard drops the site's label is back.
+/// the guard drops the site's label is back. The file is compared with `file!()` whole: a Windows build names it
+/// `crates\rt\tests\spin_label.rs`, which a `/`-separated suffix never matches.
 #[test]
 fn a_spinning_tasks_label_and_poll_count_are_read_from_another_thread() {
   let runtime = Runtime::start(&config()).unwrap();
@@ -78,7 +79,7 @@ fn a_spinning_tasks_label_and_poll_count_are_read_from_another_thread() {
   }
   let words: Vec<String> = seen.iter().map(ToString::to_string).collect();
   assert!(
-    matches!(seen[0].label, Some(TaskLabel::Site(site)) if site.file().ends_with("tests/spin_label.rs")),
+    matches!(seen[0].label, Some(TaskLabel::Site(site)) if site.file() == file!()),
     "{words:?}"
   );
   assert_eq!(seen[0].polls, 3, "{words:?}");
@@ -101,7 +102,8 @@ struct AtomicBoolPair {
 
 /// Main 01a20182's order of 2026-11-23: every task submitted from another thread read `runtime.rs:38`, the submit's own
 /// line, so a wedged shard named no culprit. Do: from this thread submit a task (`submit_to_holder`) that spins until
-/// told, and read the shard's pulse while it spins. Expect: its label this file at the submitting line.
+/// told, and read the shard's pulse while it spins. Expect: its label this file, `file!()` whole, at the submitting
+/// line.
 #[test]
 fn a_task_submitted_from_another_thread_is_labelled_with_its_submitters_line() {
   let runtime = Runtime::start(&config()).unwrap();
@@ -127,7 +129,7 @@ fn a_task_submitted_from_another_thread_is_labelled_with_its_submitters_line() {
   runtime.shutdown().unwrap();
   assert!(
     matches!(seen.label, Some(TaskLabel::Site(site))
-      if site.file().ends_with("tests/spin_label.rs") && site.line() == line),
+      if site.file() == file!() && site.line() == line),
     "{seen}"
   );
 }

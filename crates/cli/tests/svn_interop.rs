@@ -2603,6 +2603,96 @@ fn an_svnsync_measured() {
   }
 }
 
+/// Shape: the revisions [`an_svn_update_measured`] updates across where `SLATES_SVN_UPDATE_SPAN` names none: the 500
+/// w-bugs' P6 runs updated back and forward over git-1000 (diag-w-bugs-svnfetch-8 and -13).
+const UPDATE_SPAN: u64 = 500;
+
+/// P6 of Ada's close list (goal 93: svn:// update 5.6 s at w-bugs' run 13 against 2.7 s at run 8, stock svn 1.15 on
+/// GitHub's macOS runner over git-1000); a measurement, not a gate. Do: for svn:// and the HTTP edge in turn, start an
+/// anchor whose daemon holds a changeset store, create a Subversion repository and import the dump
+/// `SLATES_SVN_UPDATE_DUMP` names through the CLI; as stock `svn`, check `trunk` out at the youngest revision, update it
+/// back `SLATES_SVN_UPDATE_SPAN` revisions ([`UPDATE_SPAN`] by default), then forward to the youngest again, as w-bugs'
+/// runs did, each timed. Expect nothing: print each scheme's import, checkout and update seconds, and what each update
+/// added to the daemon's counters, whole and a revision (the svn:// conversation's phases, the pieces fetched through
+/// the node's store), so a slower round names where its time went. Skips loudly without stock Subversion 1.15 or the
+/// dump.
+#[test]
+#[cfg(unix)]
+#[ignore = "a measurement: SLATES_SVN_UPDATE_DUMP=... cargo test --release -p slates-cli --test svn_interop -- --ignored an_svn_update_measured --nocapture"]
+fn an_svn_update_measured() {
+  let Ok(dump) = std::env::var("SLATES_SVN_UPDATE_DUMP") else {
+    eprintln!("skipping svn update's measurement: SLATES_SVN_UPDATE_DUMP names no dump");
+    return;
+  };
+  if !stock_svn() {
+    eprintln!("skipping svn update's measurement: no stock Subversion 1.15 here (svn on the PATH)");
+    return;
+  }
+  let span = std::env::var("SLATES_SVN_UPDATE_SPAN")
+    .ok()
+    .and_then(|span| span.parse().ok())
+    .unwrap_or(UPDATE_SPAN);
+  for scheme in ["svn", "http"] {
+    let instance = format!("svn-update-{scheme}-{}", std::process::id());
+    let edge = format!("--vcs-{scheme}");
+    let (_anchor, lines, issuer) = start_anchor(&instance, &[&edge, "127.0.0.1:0"]);
+    let Some(issuer) = issuer_or_skip(issuer, "svn update's measurement") else {
+      return;
+    };
+    create_repository(&instance);
+    let importing = Instant::now();
+    let (code, out, err) = slates(&instance, &["repository", "import", REPOSITORY, &dump]);
+    assert_eq!(code, 0, "repository import: {out}{err}");
+    let imported = importing.elapsed().as_secs_f64();
+    let (id, token) = minted_token(&instance, &issuer);
+    let (user, url) = match scheme {
+      "svn" => (
+        id,
+        format!(
+          "svn://127.0.0.1:{}/{REPOSITORY}/trunk",
+          svn_listener_port(&lines)
+        ),
+      ),
+      _ => (
+        USER.to_owned(),
+        format!(
+          "http://127.0.0.1:{}/{REPOSITORY}/trunk",
+          http_edge_port(&lines)
+        ),
+      ),
+    };
+    let scratch = Scratch::new(&format!("svn-update-{scheme}"));
+    let svn = Svn::new(&scratch, "update", credentials(user, token));
+    let copy = svn.copy("trunk");
+    let checking_out = Instant::now();
+    svn.ok(&scratch.path, &["checkout", "-q", &url, &copy]);
+    let checked_out = checking_out.elapsed().as_secs_f64();
+    let youngest: u64 = svn
+      .ok(&copy, &["info", "--show-item", "revision"])
+      .trim()
+      .parse()
+      .unwrap();
+    let back = youngest.saturating_sub(span);
+    let before_back = daemon_counters(&instance);
+    let updating_back = Instant::now();
+    svn.ok(&copy, &["update", "-q", "-r", &back.to_string()]);
+    let updated_back = updating_back.elapsed().as_secs_f64();
+    let before_forward = daemon_counters(&instance);
+    let updating = Instant::now();
+    svn.ok(&copy, &["update", "-q"]);
+    let updated = updating.elapsed().as_secs_f64();
+    let after = daemon_counters(&instance);
+    let revisions = youngest.saturating_sub(back).max(1) as f64;
+    println!(
+      "an_svn_update_measured {scheme}: import {imported:.1} s; checkout r{youngest} {checked_out:.2} s; update \
+       r{youngest}..r{back} {updated_back:.2} s; update r{back}..r{youngest} {updated:.2} s\n  counters the update \
+       back added:{}\n  counters the update forward added:{}",
+      counters_added(&before_back, &before_forward, revisions),
+      counters_added(&before_forward, &after, revisions)
+    );
+  }
+}
+
 /// Format: the verbs [`a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve`] runs where
 /// `SLATES_SVN_USE_VERBS` names none: every stock client verb it compares (goal 93's correctness by use, main's lane of
 /// 2026-11-21).
