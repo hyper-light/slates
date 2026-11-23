@@ -86,9 +86,10 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   repository import NAME PATH [--json]               import a history into a new repository's empty store: PATH
             (absolute) is a Mercurial repository's directory (its .hg) for an hg repository or a
             Subversion dump file for an svn one; answered when the import ends, with what it took
-  repository policy NAME [--hook POINT=PROGRAM]... [--json]   change a repository's policy, its owner alone,
-            keeping every part not named: each POINT (pre-receive, changegroup.NAME, pre-revprop-change, ...) takes
-            the programs given for it, in order (absolute host paths), an empty PROGRAM clearing it
+  repository policy NAME [--hook POINT=PROGRAM]... [--hg-publish true|false] [--json]   change a repository's
+            policy, its owner alone, keeping every part not named: each POINT (pre-receive, changegroup.NAME,
+            pre-revprop-change, ...) takes the programs given for it, in order (absolute host paths), an empty PROGRAM
+            clearing it; --hg-publish sets whether a Mercurial repository publishes (phases.publish, true by default)
   repository branch create REPO NAME --from BRANCH [--version N] [--json]   make a branch at a version of another
             (its head when no version is named), sharing what is unchanged; prints the new branch's green id
   repository branch bind REPO NAME GREEN [--json]    bind a branch to a green of the repository's lineage (restores
@@ -633,14 +634,17 @@ pub(crate) enum Verb {
     /// The branch's name.
     name: String,
   },
-  /// Change a repository's policy, keeping every part not named (`repository policy NAME [--hook POINT=PROGRAM]...`,
-  /// A-622): each named hook point's hooks become the ones given for it, in order, an empty program clearing it.
+  /// Change a repository's policy, keeping every part not named (`repository policy NAME [--hook POINT=PROGRAM]...
+  /// [--hg-publish true|false]`, A-622): each named hook point's hooks become the ones given for it, in order, an empty
+  /// program clearing it; and a Mercurial repository publishes or not (7.2's `phases.publish`) where asked.
   RepositoryPolicy {
     /// The repository's name.
     repository: String,
     /// Each hook given: its point (a Mercurial point with a `.suffix` naming one of its hooks) and its program, empty
     /// to clear the point.
     hooks: Vec<(slates_ipc::protocol::HookPointName, String, String)>,
+    /// Whether it publishes, where `--hg-publish` is given.
+    publishing: Option<bool>,
   },
   /// Set a principal's rights on a volume (`share ID PRINCIPAL [--read] [--write] [--admin]`).
   Share {
@@ -892,6 +896,7 @@ const VALUES: &[&str] = &[
   "--root",
   "--hook",
   "--from",
+  "--hg-publish",
 ];
 /// Every switch, across the verbs.
 const SWITCHES: &[&str] = &[
@@ -1702,8 +1707,9 @@ fn parse_repository(taken: &Taken, words: &[&str]) -> Result<Option<Command>, Pa
 
 /// The repository verbs' forms, named by a usage error.
 const REPOSITORY_FORMS: &str = "repository create NAME --tool git|hg|svn | repository destroy NAME | repository \
-  import NAME PATH | repository policy NAME [--hook POINT=PROGRAM]... | repository branch create REPO NAME --from \
-  BRANCH [--version N] | repository branch bind REPO NAME GREEN | repository branch retire REPO NAME";
+  import NAME PATH | repository policy NAME [--hook POINT=PROGRAM]... [--hg-publish true|false] | repository branch \
+  create REPO NAME --from BRANCH [--version N] | repository branch bind REPO NAME GREEN | repository branch retire \
+  REPO NAME";
 
 /// `repository import NAME PATH` (A-710): the daemon reads PATH, so it must be absolute, since the daemon's working
 /// directory is not the caller's; a relative one is a usage error before the daemon is asked.
@@ -1778,13 +1784,14 @@ fn branch_bind(
   ))
 }
 
-/// `repository policy NAME [--hook POINT=PROGRAM]...` (A-622): each `--hook` a point by its tool's own word (git's
-/// `pre-receive`, Mercurial's `changegroup.NAME`, Subversion's `pre-revprop-change`), then `=` and the program, an
-/// absolute host path, or nothing to clear the point; an unknown point or a relative program is a usage error before the
-/// daemon is asked.
+/// `repository policy NAME [--hook POINT=PROGRAM]... [--hg-publish true|false]` (A-622): each `--hook` a point by its
+/// tool's own word (git's `pre-receive`, Mercurial's `changegroup.NAME`, Subversion's `pre-revprop-change`), then `=`
+/// and the program, an absolute host path, or nothing to clear the point; `--hg-publish` whether a Mercurial
+/// repository publishes (7.2's `phases.publish`). An unknown point, a relative program or a `--hg-publish` other than
+/// `true` or `false` is a usage error before the daemon is asked.
 fn repository_policy(taken: &Taken, name: &str) -> Result<Command, ParseError> {
   taken.only(&Spec {
-    values: &["--hook"],
+    values: &["--hook", "--hg-publish"],
     switches: &[],
   })?;
   let hooks = taken
@@ -1792,11 +1799,23 @@ fn repository_policy(taken: &Taken, name: &str) -> Result<Command, ParseError> {
     .iter()
     .map(|given| hook_of(given))
     .collect::<Result<Vec<_>, _>>()?;
+  let publishing = match taken.value("--hg-publish") {
+    None => None,
+    Some("true") => Some(true),
+    Some("false") => Some(false),
+    Some(other) => {
+      return Err(ParseError::BadValue {
+        what: "--hg-publish",
+        reason: format!("{other}: expected true or false"),
+      });
+    }
+  };
   Ok(client(
     taken,
     Verb::RepositoryPolicy {
       repository: name.to_owned(),
       hooks,
+      publishing,
     },
   ))
 }
@@ -3898,8 +3917,9 @@ mod tests {
   }
 
   /// A-622. Do: parse `repository policy` with a Subversion hook, a Mercurial hook named by its suffix, a point cleared
-  /// and `--json`; then an unknown point, a suffix on a point that takes none, and a relative program. Expect the hooks
-  /// taken in order with their points and names, and each bad one refused as a bad `--hook` before the daemon is asked.
+  /// and `--json`; then `--hg-publish false`; then an unknown point, a suffix on a point that takes none, a relative
+  /// program and `--hg-publish no`. Expect the hooks taken in order with their points and names, publishing asked off,
+  /// and each bad one refused as a bad value before the daemon is asked.
   #[test]
   fn the_grammar_parses_the_repository_policy_verb() {
     use slates_ipc::protocol::HookPointName as Point;
@@ -3927,8 +3947,24 @@ mod tests {
             String::new()
           ),
         ],
+        publishing: None,
       }
     );
+    assert_eq!(
+      client_verb("repository policy r --hg-publish false"),
+      Verb::RepositoryPolicy {
+        repository: "r".to_owned(),
+        hooks: Vec::new(),
+        publishing: Some(false),
+      }
+    );
+    assert!(matches!(
+      parse(&args("repository policy r --hg-publish no")),
+      Err(ParseError::BadValue {
+        what: "--hg-publish",
+        ..
+      })
+    ));
     let refused = |text: &str| {
       matches!(
         parse(&args(text)),

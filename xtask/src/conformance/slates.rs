@@ -286,7 +286,7 @@ impl Anchor {
         copied
       })
       .map_err(|e| Failure(format!("spawning the anchor log's drain: {e}")))?;
-    let anchor = Anchor {
+    let mut anchor = Anchor {
       child,
       log,
       instance: instance.to_owned(),
@@ -319,7 +319,7 @@ impl Anchor {
   /// Waits until the daemon answers [`STABLE_STREAK`] verbs in a row, while the instance's processes progress in their
   /// own CPU (`process_wait::InstanceWait`, the suites' judgment, b25a5b7a6): refused once they made none for the
   /// observation budget, spent their CPU budget, or left. Until 2026-11-20 within the harness's 60 s `START_WAIT`.
-  fn wait_ready(&self, binary: &SlatesBinary) -> Result<(), Failure> {
+  fn wait_ready(&mut self, binary: &SlatesBinary) -> Result<(), Failure> {
     let mut progress = process_wait::InstanceWait::new();
     let mut streak = 0u32;
     loop {
@@ -333,13 +333,7 @@ impl Anchor {
         streak = 0;
       }
       if !progress.look(&self.instance) {
-        return Err(Failure(format!(
-          "the daemon did not come up before its processes stalled, spent their CPU budget or left ({:?}; last exit \
-           {}); anchor log:\n{}",
-          progress.seen,
-          reply.code,
-          std::fs::read_to_string(&self.log).unwrap_or_default()
-        )));
+        return Err(self.never_up(&progress, reply.code));
       }
       pause();
     }
@@ -411,6 +405,33 @@ impl Anchor {
       let _ = drain.join();
     }
     true
+  }
+
+  /// Why a start never came up, as its red must name it (CLAUDE.md's debugging protocol): the wait's last look and the
+  /// readiness probe's last exit, the anchor's own process (its exit status where it has exited, reaped here; a tracer's
+  /// where it runs under one), and its log once every line its processes wrote is in it. Where the anchor has exited, the
+  /// drain is waited for (its pipe's end, every writer gone, within [`LEAVE_WAIT`]) before the log is read, since the
+  /// drain copies it a thread away; the message says whether the log it carries is whole. Until 2026-11-23 the log was
+  /// read at once, and CI run 45176536354's red carried an empty one and no exit status
+  /// (`the_hermeticity_tracer_allows_startup_and_observes_writes`, 12:40Z).
+  fn never_up(&mut self, progress: &process_wait::InstanceWait, probe: i32) -> Failure {
+    let exited = self.child.try_wait().ok().flatten();
+    let whole = exited.is_some() && self.left_within(LEAVE_WAIT);
+    let anchor = match exited {
+      Some(status) => format!("exited ({status})"),
+      None => format!("is still running (pid {})", self.child.id()),
+    };
+    Failure(format!(
+      "the daemon did not come up before its processes stalled, spent their CPU budget or left ({:?}; last exit \
+       {probe}); the anchor {anchor}; anchor log{}:\n{}",
+      progress.seen,
+      if whole {
+        ", whole"
+      } else {
+        ", as drained so far"
+      },
+      std::fs::read_to_string(&self.log).unwrap_or_default()
+    ))
   }
 
   /// Whether the log's pipe reached its end within `wait`: every process holding its write end has left.
@@ -1307,6 +1328,41 @@ mod tests {
     assert_eq!(
       available_of_refusal("slates: refused: BudgetExceeded { available: lots }"),
       None
+    );
+  }
+
+  /// Main 01a20182's order of 2026-11-23 (CI run 45176536354: the tracer test's red carried an empty anchor log and no
+  /// exit status). Do: start an anchor whose tracer prefix writes one line to its stderr and exits 7 at once, the slates
+  /// binary standing in as one whose every verb fails. Expect the start refused, its message naming the anchor's exit
+  /// (status 7), its log whole, and the tracer's line in it. Red before: "anchor log:" followed by nothing, the line
+  /// still in the drain, and no exit named.
+  #[cfg(unix)]
+  #[test]
+  #[allow(clippy::unwrap_used)]
+  #[allow(clippy::disallowed_methods)] // the test's own scratch in the build output
+  fn a_start_that_never_comes_up_names_the_anchors_exit_and_its_whole_log() {
+    let instance = format!("conf-never-up-{}", std::process::id());
+    let scratch = crate::conformance::build_output(&instance).unwrap();
+    let binary = super::SlatesBinary {
+      path: std::path::PathBuf::from("false"),
+    };
+    let prefix = [
+      "sh".to_owned(),
+      "-c".to_owned(),
+      "echo 'the tracer refused to start' >&2; exit 7".to_owned(),
+      "sh".to_owned(),
+    ];
+    let refused = super::Anchor::start(&binary, &instance, &scratch, Some(&prefix));
+    let _ = std::fs::remove_dir_all(&scratch);
+    let Err(super::Failure(message)) = refused else {
+      panic!("a start whose anchor exits at once came up");
+    };
+    assert!(message.contains("the anchor exited"), "{message}");
+    assert!(message.contains('7'), "its status: {message}");
+    assert!(message.contains("anchor log, whole"), "{message}");
+    assert!(
+      message.contains("the tracer refused to start"),
+      "the tracer's last words: {message}"
     );
   }
 

@@ -9,8 +9,11 @@
 //! **What it does.** [`of_range`] asks the kernel's page table (`mincore`) about every page of a mapped range, a bounded
 //! number of pages a call (one vector page's worth, so the scratch is one page however large the range), and counts
 //! the pages it holds in RAM and, where the kernel says (macOS's `MINCORE_MODIFIED`, the page dirty in this or another
-//! process), the pages written. Linux reports residency alone: there `modified` is `None`. Windows has no `mincore`;
-//! its working-set query is owed, and the answer is a typed refusal. It reads no byte of the range and changes nothing.
+//! process), the pages written. Linux reports residency alone: there `modified` is `None`. Windows has no `mincore`, so
+//! it asks the working-set query (`QueryWorkingSetEx`) the same way, a page of scratch a call, and counts a page in RAM
+//! when its `Valid` bit says it is in this process's working set: a page the memory manager trimmed to its standby or
+//! modified list is in RAM but no longer the process's, and counts as out. The query's attributes carry no written
+//! bit, so there `modified` is `None`, as on Linux. It reads no byte of the range and changes nothing.
 //!
 //! **A mapping whole, without a page walk** ([`of_mapping`]; main's ruling of 2026-11-20 on g228's finding). A walk
 //! costs a kernel call per vector page of pages, so the anchor's content object, tens of GiB of address space, cost tens
@@ -64,17 +67,21 @@ pub fn of_range(base: *const u8, len: usize, page: usize) -> Result<Residency, M
     resident: 0,
     modified: os::MODIFIED_KNOWN.then_some(0),
   };
-  // Derived: one page of vector entries a call, one entry a page, so the scratch is a page whatever the range.
-  let mut vector = vec![0u8; page];
+  // Derived: a page of entries a call, one entry a page (`mincore`'s byte, or the working-set query's address and its
+  // attributes), so the scratch is a page whatever the range.
+  let per_call = page
+    .checked_div(std::mem::size_of::<os::Entry>())
+    .unwrap_or(0)
+    .max(1);
+  let mut vector = vec![os::Entry::default(); per_call];
   let mut done = 0usize;
   while done < pages {
     let batch = pages.saturating_sub(done).min(vector.len());
     let at = start.saturating_add(done.saturating_mul(page));
-    let span = batch.saturating_mul(page);
     let Some(entries) = vector.get_mut(..batch) else {
       break;
     };
-    os::query(at, span, entries)?;
+    os::query(at, page, entries)?;
     let page_bytes = u64::try_from(page).unwrap_or(u64::MAX);
     for entry in entries.iter() {
       if os::is_resident(*entry) {
@@ -319,11 +326,15 @@ mod os {
   /// Whether the OS reports written pages (macOS does; Linux reports residency alone).
   pub(super) const MODIFIED_KNOWN: bool = cfg!(target_os = "macos");
 
-  /// The kernel's answer for `span` bytes at page-aligned `at`, one entry a page into `entries`.
-  pub(super) fn query(at: usize, span: usize, entries: &mut [u8]) -> Result<(), MemError> {
+  /// One page's answer: `mincore`'s byte.
+  pub(super) type Entry = u8;
+
+  /// The kernel's answer for `entries.len()` pages of `page` bytes from page-aligned `at`, one entry a page.
+  pub(super) fn query(at: usize, page: usize, entries: &mut [Entry]) -> Result<(), MemError> {
+    let span = entries.len().saturating_mul(page);
     // `mincore` reads only the page table for the addresses, and writes one byte a page into `entries`, which holds
-    // `span / page` bytes by the caller's arithmetic; it never dereferences the range.
-    // SAFETY: `entries` is a live, writable buffer of at least one byte per page of `span`, and `at` is page-aligned.
+    // `span / page` bytes; it never dereferences the range.
+    // SAFETY: `entries` is a live, writable buffer of one byte per page of `span`, and `at` is page-aligned.
     let answered = unsafe {
       libc::mincore(
         std::ptr::with_exposed_provenance_mut::<libc::c_void>(at),
@@ -342,20 +353,20 @@ mod os {
   }
 
   /// Whether a page's entry says it is in RAM.
-  pub(super) fn is_resident(entry: u8) -> bool {
+  pub(super) fn is_resident(entry: Entry) -> bool {
     entry & 1 != 0
   }
 
   /// Whether a page's entry says it was written (macOS: by this process or another).
   #[cfg(target_os = "macos")]
-  pub(super) fn is_modified(entry: u8) -> bool {
+  pub(super) fn is_modified(entry: Entry) -> bool {
     let modified = libc::MINCORE_MODIFIED | libc::MINCORE_MODIFIED_OTHER;
     i32::from(entry) & modified != 0
   }
 
   /// Linux reports no written bit.
   #[cfg(not(target_os = "macos"))]
-  pub(super) fn is_modified(_entry: u8) -> bool {
+  pub(super) fn is_modified(_entry: Entry) -> bool {
     false
   }
 }
@@ -363,25 +374,63 @@ mod os {
 #[cfg(windows)]
 mod os {
   use crate::error::MemError;
+  use windows_sys::Win32::System::ProcessStatus::K32QueryWorkingSetEx;
+  use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-  /// Windows reports neither through this path (owed: `QueryWorkingSetEx`).
+  /// Whether the OS reports written pages: the working-set query's attribute bits (`PSAPI_WORKING_SET_EX_BLOCK`,
+  /// `<psapi.h>`) hold no dirty bit, so Windows reports residency alone.
   pub(super) const MODIFIED_KNOWN: bool = false;
 
-  /// Refused: Windows has no `mincore` (owed: `QueryWorkingSetEx`).
-  pub(super) fn query(_at: usize, _span: usize, _entries: &mut [u8]) -> Result<(), MemError> {
-    Err(MemError::OsRefused {
-      call: "mincore (Windows: QueryWorkingSetEx owed)",
+  /// Format: the lowest attribute bit, `Valid` (`PSAPI_WORKING_SET_EX_BLOCK`, `<psapi.h>`): the page is in this
+  /// process's working set.
+  const VALID: usize = 1;
+
+  /// One page's answer, laid out as `PSAPI_WORKING_SET_EX_INFORMATION` (`<psapi.h>`): the page's address, which the
+  /// query reads, and its attribute bits as one word, which it writes. The binding's own record keeps the bits in a
+  /// union, which only an `unsafe` read can open.
+  #[repr(C)]
+  #[derive(Clone, Copy, Default)]
+  pub(super) struct Entry {
+    address: usize,
+    attributes: usize,
+  }
+
+  /// The working set's answer for `entries.len()` pages of `page` bytes from page-aligned `at`, one entry a page.
+  pub(super) fn query(at: usize, page: usize, entries: &mut [Entry]) -> Result<(), MemError> {
+    let mut address = at;
+    for entry in entries.iter_mut() {
+      *entry = Entry {
+        address,
+        attributes: 0,
+      };
+      address = address.saturating_add(page);
+    }
+    let bytes = u32::try_from(std::mem::size_of_val(entries)).map_err(|_| MemError::OsRefused {
+      call: "QueryWorkingSetEx (the call's entries past u32::MAX bytes)",
       code: None,
-    })
+    })?;
+    // The query reads each entry's address and writes that page's attributes into the entry; it reads only the
+    // process's page tables, never a page. The current process's pseudo-handle needs no closing.
+    // SAFETY: `entries` is a live, writable array of `bytes` bytes of records laid out as the call's.
+    let answered =
+      unsafe { K32QueryWorkingSetEx(GetCurrentProcess(), entries.as_mut_ptr().cast(), bytes) };
+    if answered != 0 {
+      Ok(())
+    } else {
+      Err(MemError::OsRefused {
+        call: "QueryWorkingSetEx",
+        code: std::io::Error::last_os_error().raw_os_error(),
+      })
+    }
   }
 
-  /// Never asked.
-  pub(super) fn is_resident(_entry: u8) -> bool {
-    false
+  /// Whether a page's entry says it is in RAM: in this process's working set.
+  pub(super) fn is_resident(entry: Entry) -> bool {
+    entry.attributes & VALID != 0
   }
 
-  /// Never asked.
-  pub(super) fn is_modified(_entry: u8) -> bool {
+  /// The working set reports no written bit.
+  pub(super) fn is_modified(_entry: Entry) -> bool {
     false
   }
 }

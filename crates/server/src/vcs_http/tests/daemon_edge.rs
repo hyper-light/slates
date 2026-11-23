@@ -628,6 +628,7 @@ fn deny_deletion(daemon: &Daemon, name: &str) {
         hooks: Vec::new(),
         hooks_env: Vec::new(),
         signers: Vec::new(),
+        hg_publishing: true,
       },
     )
   });
@@ -2496,6 +2497,7 @@ fn create_svn_hooked(
           .collect(),
         hooks_env: Vec::new(),
         signers: Vec::new(),
+        hg_publishing: true,
       },
     )
   });

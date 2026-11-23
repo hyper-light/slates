@@ -387,6 +387,7 @@ fn reader_reads_main(state: &mut ShardState, name: &str) {
       hooks: Vec::new(),
       hooks_env: Vec::new(),
       signers: Vec::new(),
+      hg_publishing: true,
     },
   );
   assert_eq!(reply, ReplyBody::Acknowledged);
