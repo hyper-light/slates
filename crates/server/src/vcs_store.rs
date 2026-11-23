@@ -3477,8 +3477,8 @@ fn put_changeset(
     }
   }
   // The pack read whole for the replay is a landed push's, as its commit let it go (goal 93 item 2b): owed its let-go
-  // again, run once the repository's recovery or rebuild ends (`recover_repository`, [`rebuild_ended`]), so a warm
-  // restart leaves out of RAM what its predecessor let go.
+  // again, run once a recovery ends (`recover_repository`), so a warm restart leaves out of RAM what its predecessor let
+  // go; a live rebuild's owes it to the repository's idle give-back, as a live commit under a push does.
   #[cfg(test)]
   let pack_read = pack_read && !KEEP_LANDED.with(core::cell::Cell::get);
   if pack_read {
@@ -4683,16 +4683,12 @@ fn abandon_git_replay(state: &mut ShardState, id: RepositoryId) {
   }
 }
 
-/// A git or Subversion rebuild's end: the store lent again, the landed packs its replay read whole let go again
-/// ([`put_changeset`]), then each git green's map made again in slices by its build (`paths::whole_build`), whose end
-/// makes any commit a submit owed of it.
+/// A git or Subversion rebuild's end: the store lent again (the landed packs its replay read whole owed their let-go,
+/// [`put_changeset`], as a live commit owes one, to the repository's idle give-back), then each git green's map made
+/// again in slices by its build (`paths::whole_build`), whose end makes any commit a submit owed of it.
 fn rebuild_ended(state: &mut ShardState, id: RepositoryId) {
   state.vcs_stores.rebuild_turns.remove(&id);
   state.vcs_stores.rebuilding.remove(&id);
-  // The landed packs its replay read whole from the node's store, let go again as their commits let them go: no fetch
-  // or encoding of a repository can run while it is rebuilt, and its greens' maps are made from the greens, not the
-  // pack.
-  let_go_owed(state, id);
   if !matches!(state.vcs_stores.store(id), Some(RepositoryStore::Git(_))) {
     return;
   }
