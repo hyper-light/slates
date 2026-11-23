@@ -444,3 +444,10 @@ Next: the x86 348 ms single step (wrote=43); branchmap whole 155 ms cpu (x86) la
 - Open: views with left-out changesets still walk; a cross-branch merge's uncertain walk is bounded only by the
   branch's lowest head.
 Waiting: arena-6 (churn) and arena-7 (lookup/branchmap times) from main.
+
+## 2026-11-23 ~08:30 PST (w-hg)
+- Landed 2b6c49e6b: BranchHeads::longest_walk plus vcs.hg.branch_heads_longest_walk (a high-water at each index swap).
+  Test: a 400-revision line taken across is walked in one append and counted. Slice it if the arena shows walks past
+  a step's worth.
+- The left-out view (secret or hidden) isn't reachable from the hg matrix: no evolution, pushes public, no import.
+Waiting: arena-6 and arena-7.
