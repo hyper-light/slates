@@ -6848,7 +6848,13 @@ creator plus these exceptions; this adds no global lookup catalog or per-write c
 > `every_copy_catches_up_once_the_third_node_takes_the_volume_from_the_adopter` and
 > `a_superseded_owner_restarted_warm_ships_no_record_of_the_volume_it_lost` (`crates/server/tests/fleet.rs`). The
 > let-go is published at once (A-415), so a warm restart does not restore the copies. Owed: the yield itself is
-> memory-only (`ShardState::yielded`), so a warm restart forgets it.
+> memory-only (`ShardState::yielded`), so a warm restart forgets it. Since 2026-11-23 (A-382's amendment, the
+> creator's side): the let-go leaves a re-admitted creator no copy of its volume's head until the head next changes,
+> while the successor's next catalog record makes the catalog's copy afresh, so a holder with no copy of the head takes
+> the acting owner from its catalog copy (`fleet::content_authority`). Before, it fell back to the creator, itself,
+> and refused its successor's every live entry `not_the_acting_owner`, and its copy of the log never caught up (the
+> nemesis's convergence: 64 and more refusals in one run, 8,826 in another;
+> `a_holder_with_only_a_volumes_catalog_copy_takes_the_owner_the_catalog_names`).
 
 > **Status (2026-11-18, A-409: a lost volume's log stops by itself, and a refusal names the fence).** A volume its
 > node yielded at its re-admission (A-334) ships nothing more and does no period work, as a fenced one does (A-349):
@@ -34181,6 +34187,23 @@ Applied in the same change to: §4.4 "Derived constants" (its status), §4.12 (t
 `crates/ipc/src/protocol.rs`, `crates/ipc/tests/status.rs`, `crates/server/tests/fleet.rs`, `crates/api/src/lib.rs`,
 `crates/cli/src/verbs.rs`, `crates/mcp/src/lib.rs`.
 
+**Amended 2026-11-23 (w-fleet; `live_chaos`'s cut-off owner): the detection term times only periods whose probe was
+answered.** The member plane took every period, from its probe to the next, as a sample of the detector's pace however
+it ended. A period whose probe went unanswered ends at the probe's retransmission timer, which doubles at each expiry
+(hyper-swim's `Rto`, RFC 6298 §5.5), so on a node cut off from every peer each period was twice the last and each was
+folded in. On adacachy2 a cut-off owner's `D` rose from 2.4 s before the cut to 95.6 s 19 s into it, and the failover
+delay with it, so a reply held for its log's durability, refused at that delay from its hold (A-354, A-375), was held
+until the heal, 20.8 s, in 4 of 40 runs under CPU contention (the flow's bound: the delay before the cut and a liveness
+budget, 5.2 to 5.7 s). Where the unanswered periods were short instead, the same fault took `D` down to 0.02 s. Now the
+plane folds a period only when an answer to its own probe came, directly or through a relay
+(`MemberPlane::period_probed`, `note_period_answered`): the timer's setting is not the period, Karn's rule, which
+`RunningDuration` leaves to its caller. A member no peer answers keeps the term it measured while they did, as
+Lifeguard has it condemn no one. Applied in the same change to: `crates/cluster/src/{member_plane,failover}.rs`,
+`crates/cluster/tests/member_plane.rs`
+(`a_member_cut_off_keeps_the_detection_term_it_measured_before_the_cut`: 14.7 ms before the cut and 124.2 s after
+40 s of it on main, unchanged with the fix), GAPS, and
+`docs/bugs/2026-11-23-a-cut-off-owners-failover-delay-grew-with-its-detectors-backed-off-probes.md`.
+
 ### A-365 — A Shards stream's DAX maps outlive its daemon: the anchor holds each object, the shard's DAX range table records each answered range, and a successor takes the objects back, ingests their guest's unsynced stores and answers the device with the same objects (2026-11-18, built for goal g268, what Shards needs from slates; A-316's and A-339's owed DAX item)
 Applied in the same change to:
 - §4.6, the Shards form: the resync channel's bullet and a status of this date. GAPS: A-281's entry, its restart item.
@@ -35196,6 +35219,26 @@ Applied in the same change to: §4.8 "Authority scope" (its status), GAPS (the e
   copies; the yield is memory-only (`ShardState::yielded`). A yielded volume's own live shipper still does period work
   and ships (A-349's rule covers a fenced one): in 2 of 12 runs of the third node's case the superseded adopter built
   119 and 1,714 installs for the creator, each refused `not_the_acting_owner`.
+
+**Amended 2026-11-23 (w-chaos, the nemesis's convergence on adacachy2): the creator's side.** The same stuck copy
+came back with the roles turned: the superseded owner admitted again was the volume's creator. A diagnostic build named
+each step (seed 14946995733817154046):
+- At the creator's re-admission it yielded the volume and let go both register copies naming itself ("let go 2 of 2
+  held").
+- The successor's next catalog record made the creator a catalog copy afresh, naming the successor. The head's record
+  comes only with the head's next change, so no copy of the head was made.
+- `fleet::content_authority` took the acting owner from the object's own copy and, with none, from the object's
+  creator, here the holder itself. So the creator refused every live entry its successor shipped,
+  `not_the_acting_owner`: "head copy owner None catalog copy owner Some(successor) creator itself", 64 and more
+  refusals in that run and 8,826 in one of seed 14946995733817154046's earlier runs. Its copy of the log never caught
+  up, and the fleet did not recover whole within the fleet wait.
+
+Now a holder with no copy of the object's own register takes the owner its catalog copy names, which the same owner
+writes; the creator is the owner only with neither copy, as content placed before its first record is (§4.16).
+Applied in the same change to: §4.8 "Authority scope"'s A-382 status, GAPS (A-382's entry),
+`crates/server/src/fleet.rs` (`content_authority`; the test
+`a_holder_with_only_a_volumes_catalog_copy_takes_the_owner_the_catalog_names`, red first: the successor refused), and
+`docs/bugs/2026-11-23-a-readmitted-creator-refused-its-successors-log-as-not-the-acting-owner.md`.
 
 ### A-383 — A holder reads a version's inputs extent by extent, charged to its shard's budget, never refused for good by a cap of distinct chunks (2026-11-18, goal g232: one primary and two replicas editing the Linux kernel tree; §4.16 "Apply on holders")
 
@@ -61814,3 +61857,35 @@ name whatever their `cfg`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sdk_async.t
   export (two exports of two walks each: 15 fetches of a bound of 16).
 - **Applied in the same change to** `crates/server` (`vcs_store/svn_view`, `vcs_store/svn_texts`'s `Pieces` doc,
   `vcs_svn`, `vcs_ssh/svn`, `vcs_http/svn`, and the tests named above), GAPS, amendments.tsv.
+
+### A-877 — A repository's windows shorter than a granule share slabs of one granule (2026-11-23, w-perf; main 01a20182's order on arena-15, goal 93; A-727 a2/a3, A-64, A-105, A-870)
+
+- **Why.** arena-15 (CI 45224166925) held 556,367,872 bytes of the arena for 114,200 repository windows of 131,425,429
+  bytes: one 4 KiB page for each window of about 1,151 bytes. The arena's rows had shown asked equal to held, since
+  the chunk store had passed the arena its page-rounded block as the asked length. Since bbd4693c2 a window asks its
+  own length (`ChunkArena::alloc_asking`).
+- **The rule.** `vcs_store::arena_windows::ChunkWindows` writes a window shorter than the arena's granule into a slab:
+  one chunk of one granule, sealed over its whole length, that windows fill end to end, each window holding a slot
+  (the chunk and its offset in it). The filling slab is whichever has more room left. A slab's slots are never
+  written twice: a window let go leaves its slot unused, and the slab's chunk is freed with its last window through
+  the chunk store's one free, which the arena defers while a committed image names the block (A-64). So:
+  - no committed image names a slot that holds another window's bytes (A-870's oracle, by slot);
+  - the idle purge (A-105) meets a slab only once all its slots are free;
+  - a slab that one live window keeps holds the granule that window held alone before, so the slabs never hold more
+    than a chunk a window did.
+  The slab's block asks its live windows' bytes (`ChunkArena::reask`), so the windows' row names, as held against
+  asked, the rounding and the slots let go. A window of a granule or more takes a chunk of its own, as before.
+  Volumes never share a block: a volume's chunks are the copies a guest maps (DAX).
+- **Across a restart.** A window piece (`KIND_VCS_WINDOW`) is version 2 and carries its slot's offset. A recovery
+  groups the pieces by block and claims each block once, refusing as `Malformed` a group whose pieces disagree on the
+  chunk or whose slots overlap. Version 1 is refused typed (`PieceRefused::OldVersion(1)`) and counted unrestored. Its
+  window is put again by the record replay that holds its bytes.
+- **Gauges.** `mem.gauge.vcs_content.slabs`, `slab_freed_kept` and `slab_freed_kept_bytes`.
+- **Proven** (`slates-server` lib, `vcs_store::arena_windows::tests`):
+  - `small_windows_share_slabs_and_hold_at_most_their_bytes_rounded_a_slab`: red 3,276,800 bytes held for 200 windows
+    of 1,151 bytes at a 16 KiB granule; now at most 245,760.
+  - `slab_windows_read_back_byte_for_byte_through_let_go_bring_back_and_purge`: 3,000 seeded steps against a model.
+  - `a_restart_claims_each_slab_once_and_reads_its_windows_in_their_slots`.
+  - `slates-vfs`'s `a_volumes_small_extents_each_keep_a_block_of_their_own`.
+- **Owed.** Main's arena-17, judged on the windows row's held approaching its asked, push-all still passing, and RSS
+  below arena-16's.

@@ -260,11 +260,17 @@ pub struct MemberPlane {
   holders: Vec<HostId>,
   due: Vec<Renewal>,
   counts: PlaneCounts,
-  /// The detector's protocol period as it runs, timed from each period's probe to the next ([`MemberPlane::step`]): the
-  /// failover estimate's detection term counts its tail ([`MemberPlane::detection`], A-363).
+  /// The detector's protocol period as it runs, timed from each period's probe to the next when that probe was answered
+  /// ([`MemberPlane::period_probed`]): the failover estimate's detection term counts its tail ([`MemberPlane::detection`],
+  /// A-363).
   periods: crate::failover::RunningDuration,
   /// When the detector last sent a period's probe, on the owner's clock.
   last_probe_ns: Option<u64>,
+  /// The nonce and target of the period's probe now out, and whether an answer to it came, directly or through a relay
+  /// ([`MemberPlane::note_period_answered`]).
+  period_probe: Option<(u64, u64)>,
+  /// See [`MemberPlane::period_probe`].
+  period_answered: bool,
 }
 
 impl std::fmt::Debug for MemberPlane {
@@ -337,6 +343,8 @@ impl MemberPlane {
       counts: PlaneCounts::default(),
       periods: crate::failover::RunningDuration::new(),
       last_probe_ns: None,
+      period_probe: None,
+      period_answered: false,
     };
     member.gossip_room = member.room_beside_ack();
     member.view_room = member.room_beside_sync();
@@ -486,14 +494,28 @@ impl MemberPlane {
   }
 
   /// The detector sent a period's probe at `now_ns`: the time since the last is the length of the period it ends, a
-  /// sample of the detector's period (A-363). A clock that read earlier is no sample.
+  /// sample of the detector's period (A-363) when that period's probe was answered, directly or through a relay. A period
+  /// whose probe went unanswered ended at the probe's timer, which doubles at each expiry (RFC 6298 §5.5), so its length
+  /// is the timer's setting, not the detector's pace, and no sample (Karn's rule, `failover::RunningDuration`'s). A
+  /// member cut off from its peers then keeps the term it measured while they answered: folded, each doubling grew it, a
+  /// cut-off owner's from 2.4 s to 95.6 s in 19 s, and with it the bound of every reply held for its log's durability
+  /// (`live_chaos`'s cut-off owner, adacachy2, 2026-11-23). A clock that read earlier is no sample.
   fn period_probed(&mut self, now_ns: u64) {
-    if let Some(last) = self.last_probe_ns
+    if self.period_answered
+      && let Some(last) = self.last_probe_ns
       && let Some(length) = now_ns.checked_sub(last)
     {
       self.periods.on_sample(length);
     }
     self.last_probe_ns = Some(now_ns);
+  }
+
+  /// An answer to probe `nonce` of `target` came, directly or through a relay: when it is the period's own probe, the
+  /// period it ends is a sample of the detector's period ([`MemberPlane::period_probed`]).
+  fn note_period_answered(&mut self, nonce: u64, target: u64) {
+    if self.period_probe == Some((nonce, target)) {
+      self.period_answered = true;
+    }
   }
 
   /// The detector's belief about `peer`, if it holds one.
@@ -627,6 +649,8 @@ impl MemberPlane {
         },
       );
       self.remember_sent(ping.nonce, ping.to.0, now_ns);
+      self.period_probe = Some((ping.nonce, ping.to.0));
+      self.period_answered = false;
       self
         .renewals
         .detector_probed(HostId(ping.to.0), ping.nonce, now_ns);
@@ -801,6 +825,7 @@ impl MemberPlane {
             self
               .detector
               .on_ack(hyper_swim::HostId(sender), nonce, stamp_ns, relay_within_ns);
+            self.note_period_answered(nonce, sender);
             let renewal = self.renewals.answered(from, nonce);
             if renewal.is_some() {
               self.counts.renewals_answered = self.counts.renewals_answered.saturating_add(1);
@@ -863,6 +888,7 @@ impl MemberPlane {
         }
         self.detector.apply_gossip(gossip);
         self.detector.on_indirect_ack(target, nonce, stamp_ns);
+        self.note_period_answered(nonce, target.0);
         self.counts.indirect_acked = self.counts.indirect_acked.saturating_add(1);
         events.push(PlaneEvent::Heard {
           from,

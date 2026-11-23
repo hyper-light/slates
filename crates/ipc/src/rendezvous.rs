@@ -2086,8 +2086,12 @@ pub mod platform {
       reason: "no region fd",
     })?;
     let len = usize::try_from(len_word).unwrap_or(0);
-    let raw = std::os::fd::IntoRawFd::into_raw_fd(region_fd);
-    let region = ClientRegion::open(&Handoff::Descriptor(raw), len)?;
+    // The received descriptor is this connection's own, so the region takes it and closes it with its mapping. Until
+    // 2026-11-23 it went on as a raw number to `ClientRegion::open`, whose Linux open duplicates a handed-off number (an
+    // inherited one is the process's: docs/bugs/2026-09-14-segment-handoff-descriptor-owned-twice.md) and closes only
+    // the duplicate, so every connection left the received descriptor open with its region's memory
+    // (docs/bugs/2026-11-23-every-linux-client-connect-left-its-regions-descriptor-open.md).
+    let region = ClientRegion::from_descriptor(region_fd, len)?;
     Ok(Connected {
       region,
       doorbell: Doorbell::Eventfd(kick),

@@ -1,5 +1,14 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Closed (w-interop, 2026-11-23): a start's wait gave up on its own running anchor when no process search named
+> it.** The hermeticity tracer's start test (xtask, conformance lane, ubuntu-latest) was refused about 40 ms after its
+> spawn in CI runs 45176536354 and 45235122249: "(None; last exit 3); the anchor is still running". The wait counted the
+> instance's processes by command line alone (`pgrep -f`), found none, and took that for them having left, while its own
+> strace ran. Now the wait counts its anchor while it runs (`InstanceWait::look_owning`), and a refused start names what
+> the search answered and what ran (`process_wait::instance_listing`)
+> (`docs/bugs/2026-11-23-a-starts-wait-gave-up-on-its-own-running-anchor.md`;
+> `a_start_waits_on_its_own_anchor_while_no_process_search_finds_it`). Why `pgrep` missed the strace is not known yet;
+> the next such miss will say. Owed: the conformance lane on CI.
 > **Closed (w-interop, 2026-11-23, A-874): a landing's presentation went with its presenting client, so R10's
 > three-step grant flow could not run.** CI's hermeticity suite (Linux and macOS) and the CLI's session-grant test met
 > "not found: presentation 1 (replaced, landed, or its client went away)": `slates land` presents and exits, and since
@@ -51,6 +60,20 @@
 > `ENFILE` or Windows handle exhaustion met by a host open, counted without a descriptor (macOS `proc_pidinfo`, Windows
 > `GetProcessHandleCount`, Linux through a spare held from the start); `ceiling()` the lower of it and the rlimit.
 > **Open:** (3) every host open, accept and memfd meeting exhaustion a typed refusal with a counter, and noting it.
+> **Closed (w-chaos, 2026-11-23): every Linux client connect left its region's descriptor open.** `decode_handoff`
+> passed the received region descriptor as a bare number to an open that duplicates a handed-off number
+> (docs/bugs/2026-09-14-segment-handoff-descriptor-owned-twice.md's rule) and closes only the duplicate. So a client
+> process kept one descriptor, and the region's memory with it, for every connect it ever made. The chaos nemesis's test
+> process held up to 18,950 unmapped `/memfd:slates-cr-*` descriptors on adacachy2, and 2 runs in 10 met `EMFILE` at
+> a spawn. Now the region owns the received descriptor (`ClientRegion::from_descriptor`). Red on main: 8 connects
+> left 8 descriptors. Green: 0 (`a_client_that_connects_and_leaves_holds_no_descriptor_of_its_region`;
+> docs/bugs/2026-11-23-every-linux-client-connect-left-its-regions-descriptor-open.md).
+> **Open, found by its sweep, by reading:**
+> (1) `AnchorSegment::handoff_env` makes inheritable duplicates of the segment and content objects and keeps only their
+> numbers. So the anchor keeps two more descriptors at every daemon start, and each later child inherits them all. A
+> daemon keeps 2 × (shards + 1), inheritable by anything it spawns.
+> (2) The daemon's side of a Linux claim adopts its region duplicate only after the kick's `dup` or `eventfd`, so a
+> failure of either, exhaustion among them, leaks the duplicate.
 
 > **Open (w-shared, 2026-11-21, found landing family three): `slates-bridge-fuse --test takeover_round` fails 2 of 2 on
 > Linux** (`a_kernel_that_cannot_bump_its_epoch_still_gets_every_inode_and_is_counted`,
@@ -164,9 +187,16 @@
 > be read", r18's verbs push-tag-of-a-tag and delete-tags), and a shallow fetch over HTTP refused
 > `Pack(Store(Unreadable { id: sha1:2a3c9b98… }))` (r18's verbs shallow), its path not yet found; and r18's HTTP mirror
 > clone stalled 120 s with 0 pack bytes, between 4c8b391ec and 09797375e (main's bisect cleared c20133168). Owed behind
-> the guard, red first: the tag peel bringing its window back; the shallow fetch's path; a sweep of every read of a
-> stored object in receive and upload for the same refusal; the stall. Re-lifting waits on git/git whole and verbs both
-> passing with it on. The re-lift's reds stay, ignored while it is withdrawn.
+> the guard, red first: the shallow fetch's path (main's r130: verbs over git/git with the lift on, inbox
+> main-from-w-git-shallow-lift.md); a sweep of every read of a stored object in receive and upload for the same refusal;
+> the stall (r89: at the guard too, git/git's HTTP push past its patience, so not the lift; main's r108 bisects
+> 4c8b391ec..09797375e). Re-lifting waits on git/git whole and verbs both passing with it on. The re-lift's reds stay,
+> ignored while it is withdrawn. The tag peel FIXED (6eae9f8bb): `Verdicts::prepare` answers not ready where the new
+> value's peel fails and the repository names a let-go window (`Repository::away`), the push's driver bringing it back;
+> the same window twice ends in the typed refusal. Red at the session: git_correctness's verbs on a six-commit dataset
+> with the lift on locally failed push-tag-of-a-tag, delete-tags and both refs rows; all pass after; at the guard r89's
+> verbs over git/git pass all 26. Owed: its unit red at the edge (a push of a tag of a tag over a pack let go by hand
+> did not reach the miss).
 > **r227's SSH regression FIXED (w-git, 2026-11-23):** with the lift, stock git's fetch over SSH ended mid-answer
 > (`unexpected disconnect while reading sideband packet`; on a made history, the shallow clone right after its
 > `packfile` header): an answer whose pack's choice read a let-go window is held for it (`Answer::held_away`) with its
@@ -1010,8 +1040,15 @@
 >   2.57 GB freed within a second under `push::held`, 1.24 GB in the band, `object_bytes` 0.62 GB). The index keeps its
 >   own next text and delta (`TextBuffers`), and a whole is read at its length (`object_text`), so a read allocates the
 >   text it hands out alone. `push_heap`'s `a_views_manifest_read_is_one_text`: red 194,487 B a read of a 91,200 B
->   manifest (2.13 copies), now 105,500 B (1.16). Owed: `Taker::file_base`; the 57k push's reading (`hg_push_lifetimes`,
->   w-perf's) after it.
+>   manifest (2.13 copies), now 105,500 B (1.16).
+>   `Taker::file_base`'s cached bases cut BUILT (2026-11-23, w-hg; C1 cut 3): a base the push's cache held was copied
+>   out whole for the step that read it, and the cache kept it to its group's end, though no delta after its last user
+>   asked for it, so no buffer came back and every rebuild allocated. Now the step reads a cached base where it lies
+>   (`Based::Cached`, `Taker::base_text`), and the cache lets a base go once the last delta of its group resting on it
+>   is taken (`Frame::last_on_base`, a second bit a revision told with the first), its buffer a later rebuild's.
+>   `push_heap`'s `a_cached_file_base_is_read_where_it_lies` (one 160 KiB file on two interleaved lines, each delta on
+>   the revision two back): red 176,689 B a revision (1.08 copies), now 12,887 B (0.08). Owed: the 57k push's reading
+>   after the three cuts (`hg_push_lifetimes`, w-perf's).
 >   Its bound from the work BUILT (main's ruling, 2026-11-23): the chain no longer needs its texts held, so the cache holds
 >   the distinct texts its last `waiting` reads lent (one a waiting request, the owner's room) and a chunk's room
 >   (`TextCache::for_reads`), the least lately read out first; a text past it is lent from the buffer it was made into.
@@ -1039,7 +1076,9 @@
 >   131,425,429. Since then the chunk store asks the arena for the caller's own length, not its page-rounded block
 >   (`ChunkArena::alloc_asking`), so a window owner's asked bytes against its held name the page rounding; held by
 >   `a_windows_ask_is_its_own_length_and_its_hold_the_page_it_takes` (red: asked 16,384 of 16,384 held for four windows
->   of 100 bytes; now 400). The rounding's fix is the small-window slab (next piece).
+>   of 100 bytes; now 400). The rounding's fix, A-877, is BUILT: windows shorter than a granule share slabs of one granule,
+>   slots never written twice, a slab freed with its last window through A-64's deferred free (red: 3,276,800 bytes held
+>   for 200 windows of 1,151 bytes at a 16 KiB granule; now at most 245,760). Owed: main's arena-17.
 > - A Mercurial index's tail sealed by every append REVERTED (2026-11-23, w-perf; 0cd8ef36a reverted after main's
 >   arena-14, CI 45208924823: push-all's shard 0 spun past 1 s of CPU in `hg_push::segment` on all three legs and the
 >   watchdog killed the daemon). Each seal writes a run, and a push's fork never merges its runs (only the repository's
@@ -4886,6 +4925,15 @@
 > - **Owed: a copy made afresh takes the first member's record at the current generation as its owner's,** as a new
 >   candidate's does. A node that knows it lost a volume (yielded or fenced) ships it no record; a stale owner that
 >   does not know yet was retired, so it is no member until its re-admission yields.
+> - **FIXED 2026-11-23 (w-chaos; A-382's amendment, the creator's side): a re-admitted creator refused its
+>   successor's log as not the acting owner.** The let-go leaves the creator no copy of its volume's head until the
+>   head next changes, while the successor's next catalog record makes the catalog's copy afresh, and
+>   `fleet::content_authority` fell back from the head's copy to the creator, itself: it refused every live entry
+>   `not_the_acting_owner` (64 and more in one run, 8,826 in another), so its copy never caught up and the nemesis
+>   failed its convergence wait (seeds 14946995733817154046 and 8173581894251929445 on adacachy2). Now a holder with no
+>   copy of the head takes the owner its catalog copy names. Test:
+>   `a_holder_with_only_a_volumes_catalog_copy_takes_the_owner_the_catalog_names` (red: the successor refused). Record:
+>   `docs/bugs/2026-11-23-a-readmitted-creator-refused-its-successors-log-as-not-the-acting-owner.md`.
 
 > **Partly closed (g262, 2026-11-18): every wire enum of the protocol and of the records is held to its published
 > tags by a test.** Two guards read each wire enum's schema, which names its variants in tag order:
@@ -5458,13 +5506,28 @@
 >   restart has had this gap since A-200). And `live_ship::join` (and its destroy half) copies the first waiter at the
 >   key's position, which may be another request's when two wait on one position, so a retry can be answered with that
 >   request's reply; found by reading, not yet by a test.
-> - **Open (w-chaos, 2026-11-23): a write held past the held-write bound, one cut-off run in ten on adacachy2.** In
->   `an_owner_cut_off_while_running_is_superseded_and_serves_nothing_stale` at load 69, a write sent 0.18 ms before the
->   relay isolated its owner was held 20.86 s, until the heal, and refused `StaleEpoch { current: 2 }` (the flow's bound
->   5.71 s), and no give-up was logged in the run: the write never waited where `live_ship::judge_held` judges it, so it
->   was held before its verb ran, or its owner's failover estimate rose past the partition. Every invariant held in that
->   run; the other nine passed, and CI's 19 judgements of the bound held. Owed: what held it, from a run that catches it
->   with the owner's status read throughout.
+> - **FIXED 2026-11-23 (w-fleet; found by w-chaos): a write held past the held-write bound, one cut-off run in ten on
+>   adacachy2.** In `an_owner_cut_off_while_running_is_superseded_and_serves_nothing_stale` at load 69, a write sent
+>   0.18 ms before the relay isolated its owner was held 20.86 s, until the heal, and refused `StaleEpoch { current: 2 }`
+>   (the flow's bound 5.71 s), and no give-up was logged in the run. Reproduced in 4 of 40 runs with the flow confined to
+>   two or four CPUs (`taskset`), the owner's status and its `judge_held` read throughout. The write did wait where
+>   `judge_held` judges it, and no coordinator step stalled. The bound it was judged by, the owner's own failover delay,
+>   grew faster than the hold: 14.2 s at 3 s held, 23.1 s at 5 s, 52.8 s at 10 s, 97.8 s at 20 s. Its detection term
+>   counted each period of the cut-off owner's detector, and with every probe unanswered each period lasted the probe's
+>   retransmission timer, which doubles at each expiry. The term rose from 2.4 s to 95.6 s in 19 s, in steps 1.2, 2.5,
+>   4.5 and 9.5 s apart. Now a period is timed only when its probe was answered, so a cut-off node keeps the term it
+>   measured before the cut (A-363's amendment of 2026-11-23). No invariant was at risk: every invariant held in each
+>   failing run, and the write was refused, never acknowledged. Tests:
+>   `a_member_cut_off_keeps_the_detection_term_it_measured_before_the_cut` (`crates/cluster/tests/member_plane.rs`: on
+>   main 14.7 ms before the cut, 124.2 s after 40 s of it; unchanged with the fix) and the cut-off flow under the same
+>   contention, 40 of 40 with the fix where main failed 4 of 40: the first held write given up at 3.8 to 4.7 s, the
+>   bound its owner judged by never past 5.6 s. Record:
+>   `docs/bugs/2026-11-23-a-cut-off-owners-failover-delay-grew-with-its-detectors-backed-off-probes.md`.
+>   - **Open (a sibling, measured 2026-11-23):** A-351's
+>     `a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again` timed out its wait for the
+>     successor's give-up in 2 of 6 runs on main under four-CPU contention, and once in 10 with this fix, in a loaded
+>     run of eight fleet tests. Its budget reads the largest failover delay across the nodes, and the round it waits on
+>     restarted 4 times in the failed run.
 > - **Owed (the integrator's):** live_chaos and live_fleet flows that keep a writer waiting past the failover SLO (10 s)
 >   now meet `DurabilityPending` where they waited; each flow's stops are a few liveness budgets, under it, but a flow
 >   that stops every candidate longer must treat the refusal as its write's outcome (not acknowledged, so never owed to
