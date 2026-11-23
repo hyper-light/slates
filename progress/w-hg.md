@@ -407,3 +407,13 @@ Landed 6b7a4982f: a landed hg window is noted only where landed_pin would pin it
 1ecb57cf4 (rendezvous pin gone) and main's ruling. Red: the let-go tests assert no notes (every window was noted).
 9f42d8942: unused test bindings dropped. w-shared told of its 3 warnings (daemon.rs:8215/8256, homes.rs:75).
 Waiting: arena-4 (1baba966b) rows from main, then the 410 MiB plan.
+
+## 2026-11-23 ~01:30 PST (w-hg, arena-4 CI 45117277400)
+- Landed d0fe61d57 (merge e7e0e4fa3): getbundle's file sections (clone link walk Files::ask_rows; pull Pull::ask_rows)
+  ask at most Store::rows_a_step rows a step; the link walk counts rows scanned. That was arm64's 2 s step. Red: one
+  ask of 40 and of 78 rows, now within 6, changegroups unchanged.
+- Plan order agreed with main: the push-all peak first, judged by the push-all row's VmHWM, with
+  vcs.hg.push_held_high_bytes as the non-vacuity gauge; a test drives two histories of different lengths and asserts
+  the same high-water within a segment's slack.
+- Next piece: that gauge, then bound the push's per-history structures (FileContents list, Taker brought/awaited/
+  positions/manifest_of, Intaken changesets/logs) by the segment.
