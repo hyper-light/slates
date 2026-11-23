@@ -431,3 +431,17 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   - My cargo fmt also dropped a stray blank line in vcs_store.rs that main carried.
   - For main: clippy for slates-server and slates-api (anchor.rs uses LatenessTail); hg_push_heap before and after.
   - Queue empty.
+- 2026-11-23 ~07:00 PST:
+  - LANDED 27ee14b45 (merge ec7522621): the watchdog's allocation figures as measured (4 a beat, ~1 KB by types,
+    now 0); the 24% / 10-15 MB was hg_push_heap's sampler artifact (f14ea81bb). Main kept 0227ad029.
+  - LANDED d2c7a6ca5: Windows long polls attributed.
+    - slates_machine::own_cpu: QueryThreadCycleTime at a rate measured once a process (best of 8 spans of 1000 clock
+      steps; 3.14 GHz on jupiter), warmed in Runtime::start_with_sized.
+    - switches::voluntary_waits_now: every profiling read folds PERFORMANCE_DATA's WaitReasonBitMap into a count of
+      reads that saw a wait other than WrQuantumEnd/DispatchInt/Preempted/YieldExecution/DeferredPreempt.
+    - Red first on jupiter: the_platform_reads_a_kernel_sleep_blocked_and_a_spin_long read NoClock with main's
+      account; green: sleep Blocked, spin Long, 291 ns a read. Linux (CachyOS 7.2.9) green, 210 ns a read.
+    - Unsafe budget slates-machine 104 -> 105. GAPS: A-871's NoClock line closed.
+  - For main: clippy and the Windows cross-lint for slates-machine and slates-rt; a jupiter round naming its long
+    polls' holders.
+  - Queue empty.
