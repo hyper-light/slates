@@ -399,19 +399,37 @@ struct Ended {
   exit: Option<(ExitStatus, Duration)>,
   /// When the client's liveness first answered the daemon gone, on the host's monotonic clock.
   gone_at_ns: Option<u64>,
+  /// When the call's next look at the daemon's life was due, from the hold, as the driver had scheduled it when the
+  /// exit was first seen (`Driver::next_wake_ns`; A-523's doubling looks): the look that finds the daemon gone.
+  look_after_exit: Option<Duration>,
 }
 
-/// The longest a call outstanding at its daemon's exit may take to end after it, by the client's own rule: its next reply
-/// deadline after the exit, past the reconnect budget, and one of the reconnect's paced attempts (`reconnect / 10`, the
-/// driver's pacing).
-fn call_after_exit() -> Duration {
+/// The longest a call may take to end after the look that finds its daemon gone, by the client's own rule: the reconnect
+/// budget and one of the reconnect's paced attempts (`reconnect / 10`, the driver's pacing). The look itself is the
+/// driver's (A-523): a call looks at its daemon's life at twice the time it had waited at its look before, so a
+/// departure is seen at the first look after it, which may come up to the time already waited after the exit. Until
+/// 2026-11-23 the bound counted a reply deadline after the exit instead, the driver's rule before A-523 (c9a87e1a2,
+/// a day after this bound): it held while the watchdog's window was about a second, and under ThreadSanitizer, whose
+/// build cost raises that window to 25 s, the look after a 26.3 s exit came at 35.0 s, twice its look before at 17.5 s,
+/// and the call ended 360 µs into its recovery, past a bound of 29.5 s (nightly 45017186325).
+fn recovery_after_look() -> Duration {
   let deadlines = deadlines();
-  Duration::from_nanos(deadlines.reply_ns + deadlines.reconnect_ns + deadlines.reconnect_ns / 10)
+  Duration::from_nanos(deadlines.reconnect_ns + deadlines.reconnect_ns / 10)
+}
+
+/// The longest the outstanding call may take after the hold to end: the driver's look after the exit (its own
+/// schedule, [`Ended::look_after_exit`]), or the exit itself had none been due, then its recovery.
+fn call_bound(ended: &Ended, exited_after: Duration) -> Duration {
+  ended
+    .look_after_exit
+    .unwrap_or(exited_after)
+    .max(exited_after)
+    + recovery_after_look()
 }
 
 /// Drives `driver` as an SDK's loop does until the call `ticket` ends or `give_up` passes from `held_at`, watching
 /// `daemon`'s process. Once the process has exited, the loop runs on until the call's own bound after the exit
-/// ([`call_after_exit`]) and a beat, past `give_up` if need be: a busy machine stretches the verdict's window of a spinning
+/// ([`call_bound`]) and a beat, past `give_up` if need be: a busy machine stretches the verdict's window of a spinning
 /// shard's CPU over many windows of wall time (8.49 s at loads 62 to 131 on a 15-CPU Mac, 2026-11-17), and a loop that
 /// ended at `give_up` read a call still within its bound as never ended.
 fn drive(
@@ -426,11 +444,12 @@ fn drive(
     call_after: None,
     exit: None,
     gone_at_ns: None,
+    look_after_exit: None,
   };
   let mut next_tick = Instant::now();
   let until = |ended: &Ended| {
     ended.exit.map_or(give_up, |(_, exited_after)| {
-      give_up.max(exited_after + call_after_exit() + BEAT)
+      give_up.max(call_bound(ended, exited_after) + BEAT)
     })
   };
   while ended.call.is_none() && held_at.elapsed() < until(&ended) {
@@ -463,7 +482,12 @@ fn drive(
     if ended.exit.is_none()
       && let Ok(Some(status)) = daemon.child.try_wait()
     {
-      ended.exit = Some((status, held_at.elapsed()));
+      let exited_after = held_at.elapsed();
+      ended.exit = Some((status, exited_after));
+      // The look the driver has due now is the one that finds the daemon gone; a call already ended has none.
+      ended.look_after_exit = driver
+        .next_wake_ns(client)
+        .map(|ns| exited_after + Duration::from_nanos(ns));
     }
     next_tick = Instant::now()
       + Duration::from_nanos(driver.next_wake_ns(client).unwrap_or(deadlines().reply_ns));
@@ -643,7 +667,7 @@ fn a_lone_daemons_stuck_shard_ends_it(name: &str, hold: Hold) {
   let line_after = Duration::from_nanos(line_read_ns.saturating_sub(t0_ns));
   let gone_after = Duration::from_nanos(gone_ns.saturating_sub(t0_ns));
   let end = Duration::from_nanos(gone_ns.saturating_sub(line_read_ns));
-  let call_bound = exited_after + call_after_exit();
+  let call_bound = call_bound(&ended, exited_after);
   let signed_ns = |after: Duration, bound: Duration| -> i128 {
     i128::try_from(after.as_nanos()).unwrap() - i128::try_from(bound.as_nanos()).unwrap()
   };
@@ -651,10 +675,12 @@ fn a_lone_daemons_stuck_shard_ends_it(name: &str, hold: Hold) {
     "A232-UNSUPERVISED {name}: W = {window:?}, B = {BEAT:?}, L = {late:?}, so W + B + L = {rule:?}; the verdict's line \
      read {line_after:?} after t0 (margin {} ns); end = {end:?}; DaemonGone (the client's liveness) {gone_after:?} \
      after t0: minus (W + B + L + end) = {} ns, minus (W + B + L) = {} ns; exit {status} seen {exited_after:?} after \
-     the hold was read; the call ended {:?} after {:?}, bound {call_bound:?}; the watchdog said: {line}",
+     the hold was read; the driver's look after it due {:?} after the hold; the call ended {:?} after {:?}, bound \
+     {call_bound:?}; the watchdog said: {line}",
     signed_ns(line_after, rule),
     signed_ns(gone_after, rule + end),
     signed_ns(gone_after, rule),
+    ended.look_after_exit,
     ended.call,
     ended.call_after
   );

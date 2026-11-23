@@ -498,6 +498,8 @@ RequestBody 97 RemovedCreateOverS3
 RequestBody 98 CheckMerge
 RequestBody 99 ReadMergeCheck
 RequestBody 100 ResolveMerge
+RequestBody 101 ResolveConflict
+RequestBody 102 DestroyRepository
 Residency 0 DaemonRam
 Residency 1 DaemonRamAndKernelCache
 Residency 2 DaemonRamKernelCacheAndRuntimeVm

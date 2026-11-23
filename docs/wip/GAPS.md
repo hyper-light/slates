@@ -677,8 +677,23 @@
 >   text asked of the changeset store off the step through the work builder's own ask, `slates_hg::push::held::TextAsk`,
 >   then put back within its lent room), counted `vcs.hg.landed_texts_brought_back`. Held by
 >   `a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and_node` (49 of 120 let go, each back
->   whole, counted once). Left: the let-go's `homes::note_landed` record and homes' `Landed::Hg` arm calling it, once
->   w-shared's types land; then the pin goes.
+>   whole, counted once). Part 2 BUILT (w-hg, over w-shared's fc42f581c and 7663054bb): once a push's entry commits
+>   (`hg_run::Run::settle`) or an import lands, each file revision's windows are noted with its (repository, path,
+>   node) on the shard (`homes::note_landed`, `Landed::Hg`; `slates_hg::filerev::FileContents` carries them in each
+>   segment, counted in the intake's bound) and let go, pinned by nothing; a window noted already keeps its note.
+>   The let-go at segment durability notes nothing, since `bring_back` reads the committed index, so a home's window
+>   stays pinned until the commit. `homes::bring_back_landed` brings an object's hg-noted windows back by
+>   `hg_push::bring_back`, once a revision. Held by `a_region_object_sharing_a_landed_files_window_is_read_whole_from_its_home`
+>   (codex-review's case through a real push: red, the home read none; now whole, one revision brought back), and the
+>   two let-go tests now asserting every window let go and noted (red with the noting off: the 71 and 1 of 5 pinned).
+>   The test-only one-call landing builds a push's works as the driver does, planned and then built over the
+>   store's read-through (`works_whole`); `Works::Whole` and the one-call `tree::work` arm are gone, and `prepare` takes
+>   the view alone. The store-made-texts oracle compares a file by the identities its row names.
+> - A refused finish's windows given back BUILT (2026-11-22, w-hg; main's routing of w-svn's sibling sweep): the
+>   intake's last step of a file text took its writer out of the intake, so a refused node check or `finish_object`
+>   dropped it with its whole windows held and nothing to read them; both now abandon it
+>   (`a_refused_finish_gives_its_written_windows_back`: red `(true, true, 2)`, now none held). The hg crate has no
+>   other `finish_object` caller.
 > - The whole history's clones spun (main 01a20182's order of 2026-11-22 10:40; CI 45037561866: 4 spins, kills and
 >   restarts a leg, at `vcs_http.rs:850` polls 1-16 and `vcs_ssh::hg::streamed_turn` polls ~11,000). Measured over the
 >   served view of a pushed 57,054-changeset line (debug, MacBook arm64, each call the unit one step takes): a clone of
@@ -9292,7 +9307,10 @@
 >   asks nothing (`a_call_looks_at_the_daemons_life_at_twice_its_wait_not_at_the_old_reply_deadline`; the driver
 >   suite's `a_call_whose_daemon_is_gone_ends_before_the_old_reply_deadline`, main's to run). Still owed for the async
 >   loops: the departure as an event (Linux's control socket, macOS's exit-watch kqueue and, on Windows, the bridge
->   thread waiting beside the process handle could each tell the loop at once). macOS's `MOUNT_CALL_DEADLINE` since A-517 (2026-11-18, g251b; C-b's third
+>   thread waiting beside the process handle could each tell the loop at once). What that costs now, measured (w-perf, 2026-11-23): a call outstanding at its daemon's exit ends at the doubling's next
+>   look, up to the time already waited after the exit: a look due at 35.0 s against an exit at 26.3 s under
+>   ThreadSanitizer (nightly 45017186325, window 25.2 s), 14.1 s against 7.2 s on plain macOS (`lone_daemon`, ea3240fd8).
+>   Not built (main's close order, 2026-11-23). macOS's `MOUNT_CALL_DEADLINE` since A-517 (2026-11-18, g251b; C-b's third
 >   part): the mount's MOUNT call for the root handle (`slates_bridge_nfs::client::exchange`) bounded each of its
 >   connect, send and receive by one liveness budget, so a live daemon that answered later failed the mount; it now
 >   waits while its connection lives, as the hard NFS mount it makes does (Apple's `mount_nfs(8)`), a daemon gone

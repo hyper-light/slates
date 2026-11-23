@@ -216,7 +216,13 @@ fn finish_brought(
         let _ = content.release(&made);
         false
       }
-      Err(_) => false,
+      // A refused finish leaves what was kept held by the writer, for its caller to abandon (`finish_object`'s
+      // errors): dropped, its windows stayed charged and readable (codex-review, 2026-11-22: 262,144 bytes of one
+      // refused text).
+      Err(_) => {
+        content.abandon_object(writing);
+        false
+      }
     }
   });
   if !made {
@@ -230,9 +236,9 @@ fn finish_brought(
 pub(crate) const NAMED_BROUGHT_BACK: &str = "vcs_store.svn_texts.named_brought_back";
 
 /// A-760's recovery pre-pass (main 01a20182's rulings of 2026-11-22 ~11:35 and ~11:50, (i)): the texts that the entries of
-/// green `green`'s chain name (A-760) and the content store lacks, brought back whole from the node's changeset store
-/// before the green's replay, a text a recovery unit, so the replay finds every name and its `ContentMissing` stays a
-/// true fence. What it brought, each holding one count of the content store, for the caller to give back once the green
+/// green `green`'s chain name (A-760) and the content store does not hold whole, brought back whole from the node's
+/// changeset store before the green's replay, a text a recovery unit, so the replay finds every name and its
+/// `ContentMissing` stays a true fence. What it brought, each holding one count of the content store, for the caller to give back once the green
 /// is replayed. Nothing but for a Subversion repository's member.
 ///
 /// **Bound.** The chain holds the entries past the green's checkpoint alone, and an import's batch checkpoints its green
@@ -283,7 +289,8 @@ fn subversion_of(
   (record.tool == slates_db::catalog::VcsTool::Subversion).then_some(member.repository)
 }
 
-/// The texts green `green`'s chain entries name that the content store does not hold, each once, with its length.
+/// The texts green `green`'s chain entries name that the content store does not hold whole (lacks, or holds with a
+/// window let go), each once, with its length.
 fn named_lacking(
   state: &ShardState,
   green: slates_db::catalog::VolumeId,
@@ -307,10 +314,12 @@ fn named_lacking(
       continue;
     };
     for run in &entry.increment.named.runs {
+      // Held whole, or brought: a restored store keeps the name of a text whose window was let go, and the replay
+      // reads every byte (codex-review's restart of 2026-11-22: r1 fenced `ContentMissing` for one six-byte window).
       let held = state
         .vcs_stores
         .content()
-        .is_some_and(|content| content.contains(&slates_vcs::ContentId(run.identity.hash)));
+        .is_some_and(|content| content.holds_whole(&slates_vcs::ContentId(run.identity.hash)));
       if !held
         && !wanted
           .iter()
@@ -615,6 +624,42 @@ pub(crate) fn rehold_head(state: &mut ShardState, id: RepositoryId, green: DbVol
 mod tests {
   use super::*;
   use slates_svn::migration::Room;
+
+  /// A-865. Withhold admission between reading a landed text and finishing its object. Finishing
+  /// refuses, and the first completed window must no longer consume room or answer a read.
+  #[test]
+  fn a_refused_subversion_text_bring_returns_its_completed_windows() {
+    let daemon = crate::daemon::audit_daemon_configured(|_| {});
+    let (finished, before, after, still_readable, window) =
+      crate::daemon::observe_first(&daemon, |state| {
+        let window = state.store.content.chunk_bytes();
+        state.vcs_stores.content_made(window).unwrap();
+        let before = state.vcs_stores.content().unwrap().used();
+        let mut text = vec![b'x'; window];
+        let leaf = slates_vcs::ContentId::of(&text);
+        text.push(b'y');
+        let len = text.len() as u64;
+        let mut writing = None;
+        assert!(put_brought(state, (&mut writing, len), &text));
+        let hold = state.store.budget.hold();
+        let room = state.store.admittable();
+        state.store.budget.set_hold(hold.saturating_add(room));
+        let finished = finish_brought(state, writing, (len, len), *blake3::hash(&text).as_bytes());
+        state.store.budget.set_hold(hold);
+        let (after, still_readable) = crate::vcs_store::within_budget(state, 0, |stores| {
+          let content = stores.content().unwrap();
+          (content.used(), content.bytes_of(&leaf).is_some())
+        });
+        (finished, before, after, still_readable, window)
+      });
+    daemon.stop();
+    assert!(!finished, "the final byte exceeded admission");
+    assert_eq!(
+      (after, still_readable),
+      (before, false),
+      "one refused text with a {window}-byte window"
+    );
+  }
 
   /// A-761 with main's item 2 of 2026-11-20 (a text read a bounded step at a time). Do: put a 10,000-byte text into a
   /// content store of 4,096-byte windows; land revision 1 with `/trunk/a.txt` naming that text as stored (the records

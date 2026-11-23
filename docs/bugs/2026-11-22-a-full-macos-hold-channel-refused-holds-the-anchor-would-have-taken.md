@@ -43,6 +43,16 @@ On macOS, any burst of holds faster than the anchor drains its end lost every ho
 - A daemon taking many attachments, connections or copies at once meets this, as the test does.
 - Linux is untouched.
 
+The test never passed on macOS; nothing differed on 2026-11-18.
+- The Studio's `net.local.dgram.recvspace` is 4,096 and its `maxdgram` 2,048, as here (main, 2026-11-22).
+- A-462's own evidence, at 7e06d565b and 4fcd591a5, is `slates-anchor handles:: held:: 34 of 34`: the lib tests by
+  filter, never `--test anchor`, where this test lives. "1,048,576 on the Mac Studio" in its doc is the `ARG_MAX` it
+  measures, not a run of the test.
+- No CI run on main since then reached the macOS `Test` step. Each of the 22 failed runs from 2026-11-18 23:00 UTC to
+  2026-11-23 stopped at clippy or earlier, the other 176 were cancelled, and the last success was 2026-11-08.
+- On Linux the channel's sequenced packets block, so the test's burst waits there and passes.
+- "The Studio passed it" (w-perf's question of 2026-11-22) read the `ARG_MAX` note as a pass.
+
 ## Exact edits
 - `crates/anchor/src/held.rs`:
   - `send` takes `wait_ns`. On `ENOBUFS` it yields and sends again, until the message goes, another refusal says the

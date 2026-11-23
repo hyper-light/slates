@@ -1276,3 +1276,177 @@ fn a_subversion_copy_from_a_stored_revision_reads_a_window_that_was_let_go() {
   assert_eq!(committed, Ok(3));
   assert_eq!(copied.as_deref(), Some(first.as_slice()));
 }
+
+/// A-865, §4.17.4. Stop each import after r1's entry and before its first apply slice.
+/// The shard's first green opens the shared content store and the next green reuses it.
+/// Even a named window recorded as away in the same image has durable bytes for replay.
+fn restart_with_two_named_texts(release_window: bool) {
+  use crate::vcs_store::svn_import::tests::{PART1, imported};
+  use std::time::{Duration, Instant};
+
+  let synced: &[u8] = include_bytes!("../../../svn/fixtures/replay/svnsync.dump");
+  let fixtures = [
+    (PART1, b"alpha\nbeta\ngamma\n".as_slice()),
+    (synced, b"alpha\n".as_slice()),
+  ];
+  let instance = format!("svn-named-replay-{}-{release_window}", std::process::id());
+  let mut store = TestStore::start("svn-named-replay");
+  let anchor = anchor_of(&instance);
+  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  daemon.bootstrap(true).unwrap();
+  let repositories = [
+    created_subversion(&daemon, "first"),
+    created_subversion(&daemon, "second"),
+  ];
+  // Both root greens have the same lineage rank. Recovery visits them in volume-id order.
+  let last = crate::daemon::observe_first(&daemon, move |state| {
+    repositories
+      .into_iter()
+      .max_by_key(|repository| {
+        super::svn_commit::green_of(state, *repository)
+          .unwrap()
+          .bytes
+      })
+      .unwrap()
+  });
+  let patience = Duration::from_secs(60);
+  for (repository, (dump, expected)) in repositories.into_iter().zip(fixtures) {
+    let next = b"Revision-number: 2\n";
+    let end = dump
+      .windows(next.len())
+      .position(|bytes| bytes == next)
+      .unwrap();
+    let first_revision = &dump[..end];
+    let release = release_window && repository == last;
+    let (completed, outcome) = std::sync::mpsc::sync_channel(1);
+    crate::daemon::observe_first(&daemon, move |_state| {
+      super::svn_commit::staging::KILL_AT_COMMIT_SLICE.with(|kill| kill.set(Some(0)));
+      let completed = completed.clone();
+      let task = slates_rt::futures::spawn(async move {
+        let result = imported(repository, first_revision).await.0;
+        let _sent = completed.send(result);
+      })
+      .unwrap();
+      slates_rt::futures::detach(task).unwrap();
+    });
+    let deadline = Instant::now() + patience;
+    while crate::daemon::observe_first(&daemon, |_state| {
+      super::svn_commit::staging::KILL_AT_COMMIT_SLICE
+        .with(std::cell::Cell::get)
+        .is_some()
+    }) {
+      if let Ok(early) = outcome.try_recv() {
+        panic!("import ended before the cut: {early:?}");
+      }
+      assert!(
+        Instant::now() < deadline,
+        "import never reached the durable entry"
+      );
+      std::thread::yield_now();
+    }
+    crate::test_store::run_on_first(
+      &daemon,
+      move || async move {
+        let identity = slates_vcs::ContentId::of(expected);
+        let disk = crate::state::with_state(|state| state.vcs_disk.clone())
+          .flatten()
+          .unwrap();
+        let from = u128::from_be_bytes(repository.bytes);
+        assert_eq!(
+          disk.text(from, identity.0, 0).await.unwrap().as_deref(),
+          Some(expected)
+        );
+        crate::state::with_state(|state| {
+          let green = super::svn_commit::green_of(state, repository).unwrap();
+          assert_eq!(state.db.partition().green_head(green), 1);
+          assert_eq!(state.greens.get(&green).unwrap().head(), 0);
+          let record = state.db.partition().green_chain(green).last().unwrap();
+          let increment = crate::merge_service::entry_increment(state, green, record).unwrap();
+          let entry = slates_merge::chain_entry::decode(record, &increment).unwrap();
+          assert!(
+            entry
+              .increment
+              .named
+              .runs
+              .iter()
+              .any(|run| run.identity.hash == identity.0),
+            "the durable entry names this file's text"
+          );
+          crate::vcs_store::within_budget(state, 0, |stores| {
+            let content = stores.content_mut().unwrap();
+            assert!(content.holds_whole(&identity));
+            if release {
+              assert!(content.mark_landed(&identity));
+              assert_eq!(
+                content.let_go(&identity),
+                Ok(u64::try_from(expected.len()).unwrap())
+              );
+            }
+            assert!(content.contains(&identity));
+            assert_eq!(content.holds_whole(&identity), !release);
+          });
+        })
+        .unwrap();
+      },
+      patience,
+    );
+  }
+  daemon.publish_every_shard().unwrap();
+  daemon.stop();
+  store.restart_owner();
+  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  let mut reads = Vec::new();
+  for (repository, (_, expected)) in repositories.into_iter().zip(fixtures) {
+    let identity = slates_vcs::ContentId::of(expected);
+    let disk = store.handle();
+    let durable = crate::test_store::run_on_first(
+      &daemon,
+      move || {
+        let disk = disk.clone();
+        async move {
+          disk
+            .text(u128::from_be_bytes(repository.bytes), identity.0, 0)
+            .await
+            .unwrap()
+        }
+      },
+      patience,
+    );
+    assert_eq!(
+      durable.as_deref(),
+      Some(expected),
+      "the reopened store's own text"
+    );
+    let fence = crate::daemon::observe_first(&daemon, move |state| {
+      let green = state
+        .db
+        .partition()
+        .repositories()
+        .branch(repository, "trunk")
+        .unwrap();
+      state.fenced_greens.get(&green).cloned()
+    });
+    let (session, file) = read_back(&daemon, repository, expected);
+    reads.push((session, file, fence));
+  }
+  let brought = brought_back(&daemon);
+  daemon.stop();
+  let expected = fixtures.map(|(_, bytes)| (Some(bytes.to_vec()), Some(bytes.to_vec()), None));
+  assert_eq!(
+    reads.as_slice(),
+    expected.as_slice(),
+    "first reads after reboot, {brought} named texts fetched"
+  );
+}
+
+/// A-865. With both referenced texts resident in the published image, read both after restarting.
+#[test]
+fn a_subversion_restart_replays_two_named_texts_whose_windows_are_resident() {
+  restart_with_two_named_texts(false);
+}
+
+/// A-865. Only the later green's named window was released. Its first session and green reads must return r1's file.
+#[test]
+fn a_subversion_restart_replays_a_named_text_with_one_released_window() {
+  restart_with_two_named_texts(true);
+}

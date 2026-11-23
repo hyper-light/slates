@@ -1215,7 +1215,8 @@ fn a_push_through_the_driver_lands_in_the_repositorys_store_unless_a_hook_waits(
 
 /// The push driver's steps in one call, for a test on a shard (the daemon's driver, `super::unbundle`, takes them a
 /// slice at a time between yields): `heads` judged and the bundle read, the changegroup taken whole, the push landed on
-/// the shard's store first and then judged and landed (`super::land_stored`'s order, the one landing path).
+/// the shard's store first and then judged and landed ([`super::land_in`], `super::land_stored`'s order, the one landing
+/// path).
 fn drive(
   state: &mut ShardState,
   repository: RepositoryId,
@@ -1229,29 +1230,21 @@ fn drive(
     Ok(unbundle) => unbundle,
     Err(outcome) => return Some(outcome),
   };
-  let mut forked = match unbundle.take_changegroup() {
+  let forked = match unbundle.take_changegroup() {
     None => None,
     Some(changegroup) => match super::take_whole(state, repository, changegroup, room)? {
       Ok(forked) => Some(forked),
       Err(refused) => return Some(Outcome::refused(&refused)),
     },
   };
-  if let Some(taken) = forked.as_mut()
-    && let Err(outcome) = super::store_blocking(state, repository, taken)
-  {
-    return Some(outcome);
-  }
-  match super::landing(
+  super::land_in(
     state,
     repository,
-    (principal, super::push_name(repository, bundle)),
+    (principal, bundle),
     &unbundle,
     forked,
-    (&mut super::Works::Whole, room),
-  ) {
-    super::Landing::Done(outcome) => outcome,
-    super::Landing::Unbuilt(_) => None,
-  }
+    room,
+  )
 }
 
 /// A rule over `names` matching `pattern`, deciding a submit with `effect` for `who`.

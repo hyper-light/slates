@@ -1011,10 +1011,15 @@ impl Import {
     });
     held.give_back(store, outcome)?;
     // A file revision's contents are let go once the segment holding its delta is durable (A-767 C1 step 2b).
-    if let (Log::File(_), Some(emitter), Some((bytes, block))) =
+    if let (Log::File(path), Some(emitter), Some((bytes, block))) =
       (reading.log, self.emitter.as_mut(), kept_as)
     {
-      emitter.note_contents(bytes, block);
+      emitter.note_contents(crate::filerev::FileContents {
+        path: path.to_vec(),
+        node: entry.node,
+        bytes,
+        block,
+      });
     }
     log.cached = Some((rev, text));
     self.cut_when_due(store, false)?;

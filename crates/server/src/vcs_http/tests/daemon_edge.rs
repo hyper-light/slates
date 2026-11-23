@@ -4143,9 +4143,10 @@ fn a_long_push_of_own_texts(
 /// Mercurial's whole history landed, the content store keeping every revision's text). Do: start a two-shard daemon over
 /// loopback TLS; create a Mercurial repository; push a line of [`TEXTS_CHANGESETS`] changesets each adding a file of its
 /// own [`TEXT_BYTES`], cut at [`LONG_SEGMENT_BYTES`]; look at each file's window in its shard's content store; clone it
-/// whole (`getbundle`). Expect the push `200`; every file's window let go of the content store, its entry kept, but
-/// those a home pins on this shard (`vcs_store::landed_pin`, as a landed git pack's); the bytes let go counted; and the
-/// clone carrying the last file's bytes, brought back from the changeset store. Red before: the store held every text.
+/// whole (`getbundle`). Expect the push `200`; every file's window let go of the content store, its entry kept, each
+/// noted with its revision for a home and none pinned (goal 93 item 2b(b): before, the 71 a home held here were
+/// pinned); the bytes let go counted; and the clone carrying the last file's bytes, brought back from the changeset
+/// store. Red before: the store held every text.
 #[test]
 fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
   let (identity, certificate) = identity();
@@ -4168,11 +4169,12 @@ fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
           .map(|text| {
             let window = slates_vcs::ContentId::of(text);
             let pinned = crate::vcs_store::landed_pin(shard, &shards, &window).is_some();
+            let noted = crate::vcs_store::homes::landed(&window).is_some();
             (
               content
                 .object_bytes(&window, u64::try_from(text.len()).unwrap())
                 .is_some(),
-              pinned,
+              (noted, pinned),
               content.len_of(&window).is_some(),
             )
           })
@@ -4190,15 +4192,14 @@ fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
   let cloned = hg_getbundle(edge, &name, &tip);
   daemon.stop();
   let gone = windows.iter().filter(|(here, ..)| !here).count();
-  println!(
-    "let go: {let_go} bytes; {gone} of {TEXTS_CHANGESETS} files' windows gone, the rest pinned by a home"
-  );
+  println!("let go: {let_go} bytes; {gone} of {TEXTS_CHANGESETS} files' windows gone");
   assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
-  for (at, (here, pinned, entry)) in windows.iter().enumerate() {
+  for (at, (here, (noted, pinned), entry)) in windows.iter().enumerate() {
     assert!(entry, "file {at}'s entry kept");
-    assert_eq!(
-      here, pinned,
-      "file {at}'s window at hand only where a home pins it"
+    assert!(!here, "file {at}'s window let go");
+    assert!(
+      *noted && !*pinned,
+      "file {at}'s window noted for a home, not pinned"
     );
   }
   assert!(gone > 0, "some window let go");
@@ -4211,6 +4212,113 @@ fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
   assert!(
     cloned.2.windows(64).any(|window| window == &last[..64]),
     "the clone carries the last file's bytes"
+  );
+}
+
+/// codex-review's region-object pin (2026-11-22, main's order to w-hg) through a real push, and goal 93 item 2b(b). Do:
+/// start a two-shard daemon over loopback TLS; on the repository's shard, keep for the region an object one byte longer
+/// than a window, its first window ranking on the other shard (so no hold here names it); push one changeset whose file
+/// is exactly that first window; once landed, look at the window, then read the object from its home
+/// (`homes::read`). Expect the push `200`; the shared window let go of the content store; the home's read the whole
+/// object, brought back by the file revision noted with it (`vcs.hg.landed_texts_brought_back` 1). Red before: the
+/// window was let go unnoted and the home read none.
+#[test]
+fn a_region_object_sharing_a_landed_files_window_is_read_whole_from_its_home() {
+  let (identity, certificate) = identity();
+  let (daemon, _instance) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  create_empty_hg(&daemon, &name);
+  let (shards, here, window) = crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
+    (
+      state.shards.clone(),
+      state.shard,
+      state.store.content.chunk_bytes(),
+    )
+  });
+  let home_of = |bytes: &[u8]| {
+    crate::vcs_store::homes::home_of(&shards, &slates_vcs::ContentId::of(bytes)).unwrap()
+  };
+  // The file: a window of lines, its last line chosen so the window ranks on the other shard.
+  let mut file = Vec::with_capacity(window);
+  let mut line = 0usize;
+  while file.len() < window {
+    file.extend_from_slice(format!("shared line {line}\n").as_bytes());
+    line += 1;
+  }
+  file.truncate(window);
+  let last = window - 1;
+  file[last] = (b'a'..=b'z')
+    .find(|tail| {
+      file[last] = *tail;
+      home_of(&file) != here
+    })
+    .expect("a window ranking on the other shard");
+  // The object: the window and one byte more, homed on the repository's shard.
+  let mut object = file.clone();
+  object.push(0);
+  object[window] = (u8::MIN..=u8::MAX)
+    .find(|tail| {
+      object[window] = *tail;
+      home_of(&object) == here
+    })
+    .expect("an object homed on the repository's shard");
+  let object_id = slates_vcs::ContentId::of(&object);
+  let held = object.clone();
+  let kept = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    crate::vcs_store::homes::keep_for_region(state, &held).map(|(identity, _)| identity)
+  });
+  assert_eq!(
+    kept.ok(),
+    Some(object_id),
+    "the region's object kept on its home"
+  );
+  let text: &'static [u8] = Box::leak(file.clone().into_boxed_slice());
+  let made = history_of(&[("shared", "shared", text, None, "default")]);
+  let pushed = hg_unbundle((port, &certificate), &name, &history_bundle(&made, &[0]));
+  let window_held = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    crate::vcs_store::lent_state(state, |state| {
+      state.vcs_stores.content().map(|content| {
+        content
+          .object_bytes(
+            &slates_vcs::ContentId::of(text),
+            u64::try_from(text.len()).unwrap(),
+          )
+          .is_some()
+      })
+    })
+  });
+  let reading = shards.clone();
+  let read = crate::test_store::run_at(
+    &daemon,
+    LISTENER,
+    move || async move {
+      let origin = reading.first().copied().unwrap();
+      crate::vcs_store::homes::read(origin, &reading, object_id, u64::MAX).await
+    },
+    Duration::from_secs(60),
+  );
+  let brought = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::repository::hg_push::LANDED_TEXTS_BROUGHT_BACK,
+  );
+  daemon.stop();
+  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
+  assert_eq!(
+    window_held,
+    Some(false),
+    "the shared window let go once landed"
+  );
+  assert_eq!(
+    read.map(|bytes| bytes == object),
+    Some(true),
+    "the home reads its object whole"
+  );
+  assert_eq!(
+    brought, 1,
+    "brought back by the file revision noted with it"
   );
 }
 
@@ -4304,8 +4412,9 @@ fn windows_held(daemon: &Daemon, texts: &'static [Vec<u8>]) -> Vec<bool> {
 /// order of 14:00 (the arena a landed history left held). Do: start a two-shard daemon over loopback TLS; import the
 /// `states` repository into a Mercurial repository and land it; look at each of its file revisions' windows in its
 /// shard's content store; clone it whole (`getbundle`). Expect every file revision's window let go of the content store,
-/// its entry kept, but those a home pins on this shard (`vcs_store::landed_pin`); some let go and counted; and the clone
-/// `200` with a changegroup, its file texts brought back from the changeset store. Red before: the import kept every text.
+/// its entry kept, each window noted with its revision for a home and none pinned (goal 93 item 2b(b): before, those a
+/// home held here were pinned, 1 of 5); counted; and the clone `200` with a changegroup, its file texts brought back
+/// from the changeset store. Red before: the import kept every text.
 #[test]
 fn an_imported_repositorys_file_texts_leave_the_content_store_once_its_segments_land() {
   let (identity, certificate) = identity();
@@ -4329,10 +4438,14 @@ fn an_imported_repositorys_file_texts_leave_the_content_store_once_its_segments_
         let mut seen = Vec::new();
         let mut at = (Vec::new(), 0_u32);
         while let Some((path, rev, row)) = store.index.file_revision_from(content, (&at.0, at.1)) {
+          let noted = content
+            .object_layout(&row.bytes)
+            .iter()
+            .all(|(window, _)| crate::vcs_store::homes::landed(window).is_some());
           let pinned = crate::vcs_store::landed_pin(shard, &shards, &row.bytes).is_some();
           let len = content.len_of(&row.bytes);
           let here = len.is_some_and(|len| content.object_bytes(&row.bytes, len).is_some());
-          seen.push((here, pinned, len.is_some()));
+          seen.push((here, (noted, pinned), len.is_some()));
           at = (path, rev.saturating_add(1));
         }
         Some(seen)
@@ -4359,11 +4472,12 @@ fn an_imported_repositorys_file_texts_leave_the_content_store_once_its_segments_
     looked.len()
   );
   assert!(!looked.is_empty(), "the import keeps file revisions");
-  for (at, (here, pinned, entry)) in looked.iter().enumerate() {
+  for (at, (here, (noted, pinned), entry)) in looked.iter().enumerate() {
     assert!(entry, "file revision {at}'s entry kept");
-    assert_eq!(
-      here, pinned,
-      "file revision {at}'s window at hand only where a home pins it"
+    assert!(!here, "file revision {at}'s window let go");
+    assert!(
+      *noted && !*pinned,
+      "file revision {at}'s windows noted for a home, none pinned"
     );
   }
   assert!(
@@ -4687,4 +4801,103 @@ fn a_create_at_a_commit_let_go_lands() {
     );
   }
   assert!(brought > 0, "the commit's window brought back");
+}
+
+/// A repository name with no `.git` that routes to [`REPOSITORY`]'s partition, as a clone of `/project` names one.
+fn bare_name_on_the_repositorys_partition() -> String {
+  (0u32..)
+    .map(|serial| format!("bare-{serial}"))
+    .find(|name| usize::from(crate::verbs::owner_of_name(name, usize::from(SHARDS))) == REPOSITORY)
+    .expect("a name routes there")
+}
+
+/// The path of an LFS answer's `href` for `action` ("upload", "verify" or "download"): what follows its authority.
+fn href_of(body: &str, action: &str) -> Option<String> {
+  let at = body.find(&format!("\"{action}\""))?;
+  let rest = body.get(at..)?;
+  let href = rest.find("\"href\":\"")? + "\"href\":\"".len();
+  let rest = rest.get(href..)?;
+  let url = rest.get(..rest.find('"')?)?;
+  let path = url.get(url.find("//")? + 2..)?;
+  Some(path.get(path.find('/')?..)?.to_owned())
+}
+
+/// main 01a20182's r95 (stock_git_verbs' lfs row, git-lfs 3.8.1's trace: the batch at `/project.git/info/lfs` answered
+/// with upload and verify hrefs at `/project/info/lfs/objects/<oid>?refspec=refs/heads/master`, and every PUT to them
+/// answered `404` in 0.3 ms, so the object was never kept and the clone's download found nothing). Do: create `bare-N`,
+/// a git repository named with no `.git`; as its owner, ask the batch API at `/bare-N.git/info/lfs/objects/batch` for
+/// an upload of a MiB object on `refs/heads/master`, as git-lfs asks a clone of `/bare-N`; PUT the object to the upload
+/// href the batch handed back, POST its verify href, then batch a download and GET its href. Expect: the batch `200`
+/// with an upload href; the PUT `200`; the verify `200`; the download's GET `200` with the object's bytes. Red before:
+/// the PUT `404`, sent to Subversion's WebDAV site as every method git's smart HTTP never sends was; then the download
+/// `413`, a MiB past the edge's request room.
+#[test]
+fn an_lfs_object_uploaded_to_the_href_its_batch_hands_out_is_kept_and_downloaded() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = bare_name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let object: Vec<u8> = (0..1u32 << 20)
+    .map(|at| u8::try_from(at % 251).unwrap())
+    .collect();
+  let oid: String = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &object)
+    .as_ref()
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect();
+  let lfs_type = "application/vnd.git-lfs+json";
+  let batch = |operation: &str| {
+    let body = format!(
+      "{{\"operation\":\"{operation}\",\"transfers\":[\"basic\"],\"ref\":{{\"name\":\"refs/heads/master\"}},\
+       \"objects\":[{{\"oid\":\"{oid}\",\"size\":{}}}],\"hash_algo\":\"sha256\"}}",
+      object.len()
+    );
+    let request = format!(
+      "POST /{name}.git/info/lfs/objects/batch HTTP/1.1\r\nHost: localhost\r\n{}\r\nAccept: {lfs_type}\r\n\
+       Content-Type: {lfs_type}\r\nContent-Length: {}\r\n\r\n{body}",
+      owner_bearer(),
+      body.len()
+    );
+    let (status, body) = exchange(port, &certificate, request.as_bytes());
+    (status, String::from_utf8_lossy(&body).into_owned())
+  };
+  let send = |method: &str, path: &str, kind: &str, body: &[u8]| {
+    let mut request = format!(
+      "{method} {path} HTTP/1.1\r\nHost: localhost\r\n{}\r\nAccept: {lfs_type}\r\nContent-Type: {kind}\r\n\
+       Content-Length: {}\r\n\r\n",
+      owner_bearer(),
+      body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(body);
+    exchange(port, &certificate, &request)
+  };
+  let uploading = batch("upload");
+  let upload = href_of(&uploading.1, "upload");
+  let verify = href_of(&uploading.1, "verify");
+  let put = upload
+    .as_deref()
+    .map(|path| send("PUT", path, "application/octet-stream", &object).0);
+  let verified = verify.as_deref().map(|path| {
+    let body = format!("{{\"oid\":\"{oid}\",\"size\":{}}}", object.len());
+    send("POST", path, lfs_type, body.as_bytes()).0
+  });
+  let downloading = batch("download");
+  let got = href_of(&downloading.1, "download").map(|path| {
+    let request = format!(
+      "GET {path} HTTP/1.1\r\nHost: localhost\r\n{}\r\nAccept: application/octet-stream\r\n\r\n",
+      owner_bearer()
+    );
+    exchange(port, &certificate, request.as_bytes())
+  });
+  daemon.stop();
+  assert_eq!(uploading.0, 200, "{}", uploading.1);
+  assert!(upload.is_some(), "an upload href: {}", uploading.1);
+  assert_eq!(put, Some(200), "the PUT to {upload:?}");
+  assert_eq!(verified, Some(200), "the verify at {verify:?}");
+  assert_eq!(downloading.0, 200, "{}", downloading.1);
+  let got = got.expect("a download href");
+  assert_eq!((got.0, got.1 == object), (200, true), "the download");
 }
