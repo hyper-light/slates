@@ -200,8 +200,10 @@ missing_docs = "deny"
 unused_must_use = "deny"
 unreachable_pub = "warn"
 # `--cfg loom` selects loom's atomics for the interleaving tests (AC-0.7); `--cfg shuttle` builds
-# the randomized-schedule tests of the pure cores (T-1.6, T-6.7) against the shuttle dev-dependency.
-unexpected_cfgs = { level = "deny", check-cfg = ["cfg(loom)", "cfg(shuttle)"] }
+# the randomized-schedule tests of the pure cores (T-1.6, T-6.7) against the shuttle dev-dependency;
+# `--cfg slates_tsan` is set by the ThreadSanitizer lane (`cargo xtask tsan`), whose allocator replaces
+# the C library's and whose instrumentation slows every access, for the tests that read either.
+unexpected_cfgs = { level = "deny", check-cfg = ["cfg(loom)", "cfg(shuttle)", "cfg(slates_tsan)"] }
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

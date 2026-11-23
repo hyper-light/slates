@@ -672,6 +672,51 @@ fn get<R: Repository + ?Sized>(served: &Served<'_, R>, resource: &Resource) -> A
   }
 }
 
+/// An `update-report`'s answer: HTTPv2's at `me`, DeltaV v1's at the VCC or a node (`update.c`, `session->vcc_url`;
+/// its checked-in hrefs name version resources), streamed; anywhere else `501`.
+fn update_report<R: Repository + ?Sized>(
+  served: &Served<'_, R>,
+  resource: &Resource,
+  update: &super::request::UpdateReport,
+  room: usize,
+) -> Answer {
+  let v2 = match resource {
+    Resource::Me => true,
+    Resource::Node(_) | Resource::Vcc => false,
+    Resource::Baseline(..) | Resource::Unserved => {
+      return Answer::Whole(unserved_method("REPORT"));
+    }
+  };
+  let youngest = served.index.youngest();
+  match UpdateWalk::new(update, served.root, youngest, served.uuid, v2, room) {
+    Ok(walk) => Answer::Report(Report {
+      walk: Walk::Update(Box::new(walk)),
+    }),
+    Err(refused) => Answer::Whole(refused),
+  }
+}
+
+/// A `replay-report`'s answer, streamed (`replay.c`): the 1.8 syntax names its revision by the `!svn/rev/REV` resource
+/// it is sent to, the old one by `S:revision` at the session's URL, whose repository path is the replay's base;
+/// anywhere else `501`.
+fn replay_report(
+  resource: &Resource,
+  replay: &super::request::ReplayReport,
+  room: usize,
+) -> Answer {
+  let (named, base) = match resource {
+    Resource::Baseline(revision, named) if *named == REVISION_STUB => (Some(*revision), "/"),
+    Resource::Node(place) => (None, place.path.as_str()),
+    _ => return Answer::Whole(unserved_method("REPORT")),
+  };
+  match super::report_replay::ReplayWalk::new(replay, named, base, room) {
+    Ok(walk) => Answer::Report(Report {
+      walk: Walk::Replay(Box::new(walk)),
+    }),
+    Err(refused) => Answer::Whole(refused),
+  }
+}
+
 /// The REPORT answer (the module doc): the body read first, then the resource's node; a `log-report` streamed, any
 /// other report `501`.
 fn report<R: Repository + ?Sized>(
@@ -692,37 +737,10 @@ fn report<R: Repository + ?Sized>(
     Err(refused) => return Answer::Whole(refused_body(&refused)),
   };
   if let Asked::Update(update) = &asked {
-    let v2 = match resource {
-      Resource::Me => true,
-      // DeltaV v1's client sends its update-report to the VCC (`update.c`, `session->vcc_url`); its checked-in
-      // hrefs name version resources.
-      Resource::Node(_) | Resource::Vcc => false,
-      Resource::Baseline(..) | Resource::Unserved => {
-        return Answer::Whole(unserved_method("REPORT"));
-      }
-    };
-    let youngest = served.index.youngest();
-    return match UpdateWalk::new(update, served.root, youngest, served.uuid, v2, room) {
-      Ok(walk) => Answer::Report(Report {
-        walk: Walk::Update(Box::new(walk)),
-      }),
-      Err(refused) => Answer::Whole(refused),
-    };
+    return update_report(served, resource, update, room);
   }
   if let Asked::Replay(replay) = &asked {
-    // `replay.c`: the 1.8 syntax names its revision by the `!svn/rev/REV` resource it is sent to, the old one by
-    // `S:revision` at the session's URL, whose repository path is the replay's base.
-    let (named, base) = match resource {
-      Resource::Baseline(revision, named) if *named == REVISION_STUB => (Some(*revision), "/"),
-      Resource::Node(place) => (None, place.path.as_str()),
-      _ => return Answer::Whole(unserved_method("REPORT")),
-    };
-    return match super::report_replay::ReplayWalk::new(replay, named, base, room) {
-      Ok(walk) => Answer::Report(Report {
-        walk: Walk::Replay(Box::new(walk)),
-      }),
-      Err(refused) => Answer::Whole(refused),
-    };
+    return replay_report(resource, replay, room);
   }
   let Resource::Node(place) = resource else {
     return Answer::Whole(unserved_method("REPORT"));
