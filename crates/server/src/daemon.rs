@@ -8212,7 +8212,6 @@ mod tests {
           .map(|at| u8::try_from(at % 239).unwrap())
           .collect();
         let len = u64::try_from(text.len()).unwrap();
-        let here = state.shard;
         let identity = crate::vcs_store::within_budget(state, len, |stores| {
           stores.content_mut().unwrap().put_object(&text).unwrap()
         });
@@ -8253,7 +8252,6 @@ mod tests {
       .observe(shard, move |state| {
         let window = state.store.content.chunk_bytes();
         state.vcs_stores.content_made(window).unwrap();
-        let here = state.shard;
         let restored: Vec<Option<crate::vcs_store::homes::Landed>> = read_windows
           .iter()
           .map(crate::vcs_store::homes::landed)
