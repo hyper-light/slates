@@ -752,10 +752,11 @@
 >   `crates/server/tests/hg_push_heap.rs`, its own binary (`LargeMapped` with a byte sampler on while a row runs), an
 >   in-process daemon with a store and the cleartext HTTP edge, real `hg` subprocesses pushing a 400-changeset
 >   `debugbuilddag` history, then a clone, a stream clone and a verify; each row's top sites printed by bytes a
->   changeset; skips loudly without `hg`. First read (MacBook arm64, debug): push 702,463 B a changeset, its top the HTTP
->   exchange (152,551), the watchdog's lateness p99 (101,097) and its beat (66,992), `push::phase_heads` (61,958) and
->   the arena's window puts (32,419); clone 26,077 and stream clone 26,778, the store's `texts_by_tools`, row scans
->   and copies. OPEN: the cuts by size, then bounds in this test.
+>   changeset; skips loudly without `hg`. Corrected read (MacBook arm64, debug; the sampler's own allocations, a
+>   thread's first backtrace loading the binary's symbols, were once charged to the next allocation, which put a
+>   one-entry `push::phase_heads` and the watchdog among the top): push 362,278 B a changeset, 86% two sites of the
+>   greens' lend (`Green::default`'s `SetHash`, 2 KiB a lend, 167,321; `Greens::lend`'s closure, 145,472); clone 14,632
+>   and stream clone 20,645, the store's `texts_by_tools`, the index's `iter_from` and row scans. OPEN: the cuts by size, then bounds in this test.
 > - Branch heads kept as changesets land BUILT (2026-11-23, w-hg; main's ruling (b) on CI 45127535742: a `lookup` of a
 >   branch name ran one 348 ms step on x86, wrote 43 bytes, `branch_tip` scanning every revision's branch and then
 >   `branch_head_revs` walking the whole history, as `branchmap` whole did, 155-161 ms CPU a call). `HgIndex` keeps

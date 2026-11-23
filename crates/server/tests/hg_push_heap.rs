@@ -60,15 +60,17 @@ const WAITING: usize = 64;
 
 /// Whether the sampler counts: only while a row runs.
 static ON: AtomicBool = AtomicBool::new(false);
-/// The bytes allocated while on, and since the last sample.
+/// The bytes allocated while on.
 static TOTAL: AtomicU64 = AtomicU64::new(0);
-static SINCE: AtomicU64 = AtomicU64::new(0);
 /// The sampled bytes by site.
 static SITES: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 std::thread_local! {
   /// Set while this thread samples: its own allocations are not sampled.
   static GUARD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+  /// This thread's bytes since its last sample: a thread's sample charges its own allocation alone, never bytes another
+  /// thread allocated (a global count charged a one-entry `push::phase_heads` 31 MB of other threads' bytes).
+  static SINCE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// A backtrace's site: its innermost two frames outside the allocator, the standard library and this test.
@@ -113,16 +115,23 @@ fn site(trace: &str) -> String {
 
 /// Notes `size` bytes allocated: sampled every [`SAMPLE`] while on.
 fn note(size: usize) {
-  if !ON.load(Ordering::Relaxed) {
+  // The sampler's own allocations (a backtrace, its symbols: the first on a thread loads the binary's debug info, tens
+  // of MB) are neither counted nor charged: counted, they were charged to the thread's next allocation (31 MB to a
+  // one-entry `push::phase_heads`).
+  if !ON.load(Ordering::Relaxed) || GUARD.with(std::cell::Cell::get) {
     return;
   }
   let size = size as u64;
   TOTAL.fetch_add(size, Ordering::Relaxed);
-  let since = SINCE.fetch_add(size, Ordering::Relaxed) + size;
+  let since = SINCE.with(|since| {
+    let now = since.get().saturating_add(size);
+    since.set(now);
+    now
+  });
   if since < SAMPLE || GUARD.with(|guard| guard.replace(true)) {
     return;
   }
-  SINCE.store(0, Ordering::Relaxed);
+  SINCE.with(|since| since.set(0));
   let key = site(&std::backtrace::Backtrace::force_capture().to_string());
   if let Ok(mut sites) = SITES.lock() {
     *sites
@@ -178,7 +187,6 @@ fn row(name: &'static str, command: &mut Command) -> Row {
     *sites = None;
   }
   TOTAL.store(0, Ordering::Relaxed);
-  SINCE.store(0, Ordering::Relaxed);
   ON.store(true, Ordering::Relaxed);
   let output = command.output().expect("hg ran");
   ON.store(false, Ordering::Relaxed);
