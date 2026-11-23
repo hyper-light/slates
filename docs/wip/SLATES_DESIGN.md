@@ -61609,8 +61609,8 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
   publication no catch-up makes (refused, or its task unspawned, `catch_up_refused`) arms the shard's sweep
   (`idle_sweep::after_borrow`), whose pass begins it again first (`content_holder::image_retry_owed`, counted
   `catch_up_retried`) and does not settle the shard while it is owed. Test
-  `vcs_store::durable::tests::a_tickets_wait_is_answered_after_its_catch_ups_publication_was_refused` (red first: the
-  wait never answered).
+  `vcs_store::durable::tests::a_tickets_wait_is_answered_after_its_catch_ups_publication_was_refused` (red first, the
+  retry cut out: the wait unanswered after six sweep intervals; green: answered, the refusal and the retry counted).
 - **Limit (piece 2, GAPS).** The bound is kept only while the encoder outpaces the changes that never pause (puts,
   bring-backs): each turn encodes at least one page, so the lag past the bound is at most the pages dirty when the
   pause began plus those such changes dirty since, plus two (the oracle's allowance). A shard runs a turn each yield, many
