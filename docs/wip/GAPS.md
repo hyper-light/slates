@@ -985,8 +985,15 @@
 >   2.57 GB freed within a second under `push::held`, 1.24 GB in the band, `object_bytes` 0.62 GB). The index keeps its
 >   own next text and delta (`TextBuffers`), and a whole is read at its length (`object_text`), so a read allocates the
 >   text it hands out alone. `push_heap`'s `a_views_manifest_read_is_one_text`: red 194,487 B a read of a 91,200 B
->   manifest (2.13 copies), now 105,500 B (1.16). Owed: `Taker::file_base`; the 57k push's reading (`hg_push_lifetimes`,
->   w-perf's) after it.
+>   manifest (2.13 copies), now 105,500 B (1.16).
+>   `Taker::file_base`'s cached bases cut BUILT (2026-11-23, w-hg; C1 cut 3): a base the push's cache held was copied
+>   out whole for the step that read it, and the cache kept it to its group's end, though no delta after its last user
+>   asked for it, so no buffer came back and every rebuild allocated. Now the step reads a cached base where it lies
+>   (`Based::Cached`, `Taker::base_text`), and the cache lets a base go once the last delta of its group resting on it
+>   is taken (`Frame::last_on_base`, a second bit a revision told with the first), its buffer a later rebuild's.
+>   `push_heap`'s `a_cached_file_base_is_read_where_it_lies` (one 160 KiB file on two interleaved lines, each delta on
+>   the revision two back): red 176,689 B a revision (1.08 copies), now 12,887 B (0.08). Owed: the 57k push's reading
+>   after the three cuts (`hg_push_lifetimes`, w-perf's).
 >   Its bound from the work BUILT (main's ruling, 2026-11-23): the chain no longer needs its texts held, so the cache holds
 >   the distinct texts its last `waiting` reads lent (one a waiting request, the owner's room) and a chunk's room
 >   (`TextCache::for_reads`), the least lately read out first; a text past it is lent from the buffer it was made into.

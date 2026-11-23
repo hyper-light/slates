@@ -461,3 +461,146 @@ fn a_views_manifest_read_is_one_text() {
     "a manifest read allocated {per_read} B, past one {manifest} B manifest and {SLACK_BYTES} B"
   );
 }
+
+/// A history of `revisions` changesets on two interleaved lines, each rewriting the one file `f` of `size` bytes: the
+/// first a root, the second on it, every later one on the changeset two before it (its first parent `rev - 2`), each
+/// log's revision sent as its delta against its first parent's text (as a client sends a branchy file history), so a
+/// file delta rests on the revision two back, never the one kept last. Its changegroup (version 03) encoded.
+fn interleaved(size: usize, revisions: usize) -> Vec<u8> {
+  let path = b"f".to_vec();
+  let parent = |rev: usize| match rev {
+    0 => None,
+    1 => Some(0),
+    rev => Some(rev - 2),
+  };
+  let mut file_texts: Vec<Vec<u8>> = Vec::new();
+  let mut file_nodes: Vec<Node> = Vec::new();
+  let mut manifest_texts: Vec<Vec<u8>> = Vec::new();
+  let mut manifest_nodes: Vec<Node> = Vec::new();
+  let mut changeset_texts: Vec<Vec<u8>> = Vec::new();
+  let mut changeset_nodes: Vec<Node> = Vec::new();
+  for rev in 0..revisions {
+    let p1 = parent(rev);
+    let text: Vec<u8> = format!("f generation {rev} ")
+      .bytes()
+      .cycle()
+      .take(size)
+      .collect();
+    let file_node = node::compute(
+      &p1.map_or(NULL_NODE, |at| file_nodes[at]),
+      &NULL_NODE,
+      &text,
+    )
+    .unwrap();
+    let mut manifest_text = Vec::new();
+    manifest::encode(
+      &[Entry {
+        path: &path,
+        node: file_node,
+        flag: Flag::Regular,
+      }],
+      &mut manifest_text,
+    )
+    .unwrap();
+    let manifest_node = node::compute(
+      &p1.map_or(NULL_NODE, |at| manifest_nodes[at]),
+      &NULL_NODE,
+      &manifest_text,
+    )
+    .unwrap();
+    let changeset_text =
+      format!("{}\ntest\n0 0\nf\n\nchangeset {rev}", hex(&manifest_node)).into_bytes();
+    let changeset_node = node::compute(
+      &p1.map_or(NULL_NODE, |at| changeset_nodes[at]),
+      &NULL_NODE,
+      &changeset_text,
+    )
+    .unwrap();
+    file_texts.push(text);
+    file_nodes.push(file_node);
+    manifest_texts.push(manifest_text);
+    manifest_nodes.push(manifest_node);
+    changeset_texts.push(changeset_text);
+    changeset_nodes.push(changeset_node);
+  }
+  let data_of = |texts: &[Vec<u8>]| -> Vec<Vec<u8>> {
+    (0..revisions)
+      .map(|rev| match parent(rev) {
+        Some(at) => delta(&texts[at], &texts[rev]),
+        None => whole(&texts[rev]),
+      })
+      .collect()
+  };
+  let (changeset_data, manifest_data, file_data) = (
+    data_of(&changeset_texts),
+    data_of(&manifest_texts),
+    data_of(&file_texts),
+  );
+  let p1_of = |nodes: &[Node], rev: usize| parent(rev).map_or(NULL_NODE, |at| nodes[at]);
+  let mut revisions_sent = Vec::new();
+  for rev in 0..revisions {
+    revisions_sent.push(revision(
+      changeset_nodes[rev],
+      p1_of(&changeset_nodes, rev),
+      changeset_nodes[rev],
+      &changeset_data[rev],
+    ));
+  }
+  for rev in 0..revisions {
+    revisions_sent.push(revision(
+      manifest_nodes[rev],
+      p1_of(&manifest_nodes, rev),
+      changeset_nodes[rev],
+      &manifest_data[rev],
+    ));
+  }
+  for rev in 0..revisions {
+    revisions_sent.push(revision(
+      file_nodes[rev],
+      p1_of(&file_nodes, rev),
+      changeset_nodes[rev],
+      &file_data[rev],
+    ));
+  }
+  let changegroup = Changegroup {
+    version: Version::V03,
+    revisions: revisions_sent,
+    changelog: 0..revisions,
+    manifests: revisions..2 * revisions,
+    trees: Vec::new(),
+    files: vec![Group {
+      name: &path,
+      revisions: 2 * revisions..3 * revisions,
+    }],
+  };
+  let mut out = Vec::new();
+  changegroup.encode(&mut out).unwrap();
+  out
+}
+
+/// Goal 93 (main's order: C1's cuts, `Taker::file_base` third; w-perf's attribution of Mercurial's own push, its copy of
+/// a cached base in the [128 KiB, 256 KiB) band). Do: take a history of one 160 KiB file on two interleaved lines, each
+/// file delta resting on the revision two back (a base the push's cache holds, never the text kept last), then one of
+/// twice as many revisions. Read the churn per revision (the two histories' difference over [`EDITS`]). Expect less
+/// than one copy of the file's text a revision: a base the cache holds is read where it lies. Red before: each base
+/// found in the cache was copied out of it whole for the step that read it.
+#[test]
+fn a_cached_file_base_is_read_where_it_lies() {
+  let _alone = ALONE
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner);
+  let size = 160 << 10;
+  let short = churned(&interleaved(size, EDITS));
+  let long = churned(&interleaved(size, 2 * EDITS));
+  let per_revision = long.saturating_sub(short) / u64::try_from(EDITS).unwrap();
+  let file = u64::try_from(size).unwrap();
+  println!(
+    "push_heap: two lines of a {file} B file, each delta on the revision two back: a revision allocates {per_revision} B \
+     ({:.2} files)",
+    per_revision as f64 / file as f64
+  );
+  assert!(
+    per_revision < file,
+    "a revision allocated {per_revision} B, a copy of its {file} B file's text"
+  );
+}
