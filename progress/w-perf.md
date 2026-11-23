@@ -392,3 +392,11 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   - Siblings: none (every other pair is a stream or Linux seqpacket).
   - For main: clippy and the cross-lint for slates-anchor and slates-server, a Linux run of anchor and held.
   - Queue empty.
+- 2026-11-23 ~00:30 PST:
+  - ead8aee9a: the bug note says the full-table test never passed on macOS (A-462 ran lib tests only, no CI reached it).
+  - G+E's shard regression named for main: naps keep the shard's EEVDF negative lag, because DELAY_ZERO clips only
+    positive lag (kernel v7.0 fair.c).
+  - LANDED 9ff6e401a (merge e4fb444ab), the nightly 45017186325's gates in my crates: heap::system reads no allocator
+    under Miri; TSan skips the heap test; wire_order publishes ResolveConflict (101) and DestroyRepository (102).
+  - Routed: client lone_daemon (a timing bound under TSan) and merge shuttle_green (Outcome::ContentUnread, A-760 p1).
+  - Queue empty.
