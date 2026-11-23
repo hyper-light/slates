@@ -2837,12 +2837,23 @@ pub(crate) const BASE_REBUILDS: &str = "vcs.hg.push_base_rebuilds";
 /// counter name in the status report.
 pub(crate) const BASE_STORE_READS: &str = "vcs.hg.push_base_store_reads";
 
+/// Counter: the most runs only a push's fork held after any of its steps (goal 93, the index seal's reland), the most of
+/// every push's: what a lookup of a new row walked past its parent's runs, within `slates_vcs::Index::tiered_due`'s
+/// bound of ⌊log₃(the fork's own rows ÷ the fewest a seal writes)⌋ + 1. Format: a counter name in the status report.
+pub(crate) const MOST_OWN_RUNS: &str = "vcs.hg.push_most_own_runs";
+
+/// Counter: a push's fork's runs merged by the size-tiered rule as it sealed them (goal 93, the index seal's reland),
+/// so [`MOST_OWN_RUNS`] is not met by sealing nothing. Format: a counter name in the status report.
+pub(crate) const TIERED_MERGES: &str = "vcs.hg.push_tiered_merges";
+
 /// Counts what a push's intake did to find its file delta bases ([`BASE_HITS`], [`BASE_REBUILDS`],
-/// [`BASE_STORE_READS`]).
+/// [`BASE_STORE_READS`]) and how its fork's runs were kept ([`MOST_OWN_RUNS`], [`TIERED_MERGES`]).
 fn count_bases(state: &mut ShardState, intaken: &slates_hg::push::intake::Intaken) {
   state.count(BASE_HITS, intaken.base_hits);
   state.count(BASE_REBUILDS, intaken.base_rebuilds);
   state.count(BASE_STORE_READS, intaken.base_store_reads);
+  state.count_max(MOST_OWN_RUNS, intaken.most_own_runs);
+  state.count(TIERED_MERGES, intaken.tiered_merges);
 }
 
 /// The refusal of a whole changegroup's intake that wanted bytes `range` (`slates_hg::framing`): past its end, a

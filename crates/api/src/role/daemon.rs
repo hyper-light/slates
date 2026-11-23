@@ -153,6 +153,12 @@ pub(crate) struct Started {
 /// Starts the daemon over the anchor's segment from the environment (or its own, run alone) and marks it serving.
 /// `prefix` is the executable's own (see [`run`]).
 pub(crate) fn start(prefix: &[String], options: &ProcessOptions) -> Result<Started, Failure> {
+  // Before anything can start a child: what this process inherited (its anchor's segment and content object, the
+  // listeners and hold table the anchor kept for it) is its own to adopt, never a hook's to inherit. A daemon that
+  // cannot say so does not start (2026-11-23: a hook on Linux held the anchor's segment, which holds the issuer secret).
+  #[cfg(unix)]
+  slates_ipc::confined_spawn::close_inherited_on_exec()
+    .map_err(|error| failed("close-on-exec of the descriptors it inherited", error))?;
   #[cfg(windows)]
   slates_ipc::process_access::confine_current_holder()
     .map_err(|error| failed("process handle authority", error))?;

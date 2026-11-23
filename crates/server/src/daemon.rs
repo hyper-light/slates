@@ -2095,6 +2095,24 @@ impl Daemon {
     })
   }
 
+  /// What the membership plane's detector recorded of condemning `host` by its own probes (A-67 H-2,
+  /// [`slates_cluster::member_plane::Condemnation`]): how many times, how long after `host`'s last answer, and the bound
+  /// the detector stated for it. A one-shot control-shard question ([`Self::observation`]). Exposed so a fleet test
+  /// holds a detection to the bound its detector promised, whichever verdict judged the pair: before a member's pool
+  /// has a verdict, its own retransmission timer's, which took 7.2 s where an estimator's took under one
+  /// (`a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again`, adacachy2, 2026-11-23).
+  pub fn fleet_condemnation(
+    &self,
+    host: slates_db::HostId,
+  ) -> Result<Option<slates_cluster::member_plane::Condemnation>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.plane
+        .plane
+        .as_ref()
+        .and_then(|plane| plane.condemnation(host))
+    })
+  }
+
   /// The bound one record-plane exchange runs under on the control shard now (`fleet::record_exchange_budget_ns`):
   /// derived from the slowest measured path tail, so it grows with load. A test that waits for an exchange to end at
   /// its deadline reads it, rather than assuming its own wait outlasts it (2026-10-10: an interrupted discovery
@@ -5408,6 +5426,9 @@ async fn rebuild_and_report(
 /// keeps serving, until none is left. Whether the pass settled the shard: it reached an idle purge that finished, and no
 /// volume owes another pass; otherwise the sweep arms its next.
 pub(crate) async fn seal_idle_content() -> bool {
+  // An image publication owed is begun again where no catch-up makes it, first of all (A-870 piece 2: a refused catch-up
+  // publication is never dropped), and the shard is not settled while it is owed.
+  let image_owed = state::with_state(crate::content_holder::image_retry_owed).unwrap_or(false);
   let aged = state::with_state(|s| {
     for (_, slot) in s.volumes.iter_mut_all() {
       slot.volume.age_writes();
@@ -5477,7 +5498,7 @@ pub(crate) async fn seal_idle_content() -> bool {
       .any(|(_, slot)| slot.volume.sweep_owes())
   })
   .unwrap_or(false);
-  purged && !owes && directories_idle
+  purged && !owes && !image_owed && directories_idle
 }
 
 /// The idle shard's emptied write log, its pages given back (`crate::write_log::WriteLog::purge`).
