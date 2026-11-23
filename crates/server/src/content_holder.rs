@@ -1427,6 +1427,23 @@ pub(crate) fn paged_entries_of(
   entries
 }
 
+/// Test support (A-870 piece 1): the page pieces among `image`, their count and their bytes.
+#[cfg(test)]
+pub(crate) fn page_pieces_of(image: &[slates_vfs::recover::HeldPiece]) -> (usize, usize) {
+  image
+    .iter()
+    .filter(|piece| split_key(&piece.key).0 == KIND_VCS_PAGE)
+    .fold((0, 0), |(count, bytes), piece| {
+      (count + 1, bytes + piece.bytes.len())
+    })
+}
+
+/// Test support (A-870 piece 1): the page size the shard's encoder plans by now ([`page_bytes`]).
+#[cfg(test)]
+pub(crate) fn image_page_bytes(state: &ShardState) -> usize {
+  page_bytes(state)
+}
+
 /// Test support (A-870 piece 2's oracle): the windows among `entries` and the blocks their chunks lie in.
 #[cfg(test)]
 pub(crate) fn window_blocks(
