@@ -279,6 +279,13 @@ impl Store {
       .saturating_sub(self.budget.hold())
   }
 
+  /// The bytes an admission could take once the work under way on the pool's extents ends, beyond
+  /// [`Store::admittable`]: free extents being made again (A-789, Windows), which no claim takes yet. An admission
+  /// short of room that these would cover waits for them (the server's `room_wait`); zero where every extent is ready.
+  pub fn pending_room(&self) -> u64 {
+    u64::try_from(self.content.arena().pending_claimable()).unwrap_or(u64::MAX)
+  }
+
   /// Reserves `bytes` for a bounded volume against the shard budget, growing the arena from its pool first when the
   /// budget lacks the capacity (A-98). A refusal names what an admission could take now, the pool's free extents
   /// included ([`Store::admittable`]): the arena claims nothing for a commitment the pool cannot cover, so the budget
