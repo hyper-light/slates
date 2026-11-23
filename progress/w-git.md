@@ -618,3 +618,10 @@
   made history 3/3 failed before, every step held after. Post-merge rerun 368 green. OWED: unit red at the SSH edge
   (single-shard tests reach no held answer; two-push shallow test kept as guard); SSH wait for room (A-855). Disk:
   freed 2.3 GiB of rcgu.o from my target. Pushed once after a merge before rerunning (rerun green after).
+
+- 2026-11-23: GUARD BACK 45ff23ab3 + SSH wait for room d2dc3fb84 (merge 150d4e123), on main's order after r18 (lift
+  on: verbs push-tag-of-a-tag declined by receive::works::tree_of reading a let-go tag; verbs shallow refused
+  Pack(Store(Unreadable 2a3c9b98)); HTTP mirror clone stalled 0 bytes, in 4c8b391ec..09797375e, c20133168 cleared).
+  Re-lift reds ignored. SSH room wait: red exit 128 -> 0, answered_again counted. NEXT behind the guard, red first:
+  tree_of brings back; shallow fetch path (main sends the verbs request); sweep stored-object reads in receive/upload;
+  the HTTP stall with the let-go on and a publication owed past its bound.
