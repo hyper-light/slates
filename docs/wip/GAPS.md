@@ -832,8 +832,9 @@
 >   `a_lookup_of_a_branch_name_reads_its_heads_not_the_history` and `branchmap_over_a_long_line_reads_its_heads_not_the_history`
 >   (a 170-changeset line: red 512 and 511 reads, now at most 8; `BranchHeads::answered` the non-vacuity count). A
 >   view that leaves a changeset out (secret, hidden) answers from them too (BUILT 2026-11-23, w-hg, evolution piece
->   2): `BranchHeads` keeps each append's endings in order (`Endings`, sealed 4,096-ending `Arc` chunks a fork shares,
->   8 bytes an ending, about one a changeset), so `BranchHeads::served` reads the heads back to the view's first
+>   2): `BranchHeads` keeps each append's endings in order (`Endings`: each full chunk of 512 sealed into a row of
+>   the index, which a fork shares by the tables' identity as it shares every row, and the open chunk a fork copies; 8
+>   bytes an ending, about one a changeset; once `Arc` chunks, banned by R2, replaced 2026-11-23), so `BranchHeads::served` reads the heads back to the view's first
 >   changeset that is not public (today's below it, and those an append from it on ended) and appends the served tail
 >   alone: the tail's endings and appends, no walk of the history. Held by
 >   `a_views_kept_branch_heads_are_the_walks_whatever_it_leaves_out` (generated histories on three branches, every
