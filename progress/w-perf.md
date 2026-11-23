@@ -407,3 +407,17 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   - Design note to main: the async driver could watch Linux's departure socket.
   - The nightly-gates commit is 9ff6e401a (I first sent main b57a2dbaf by mistake).
   - Queue empty.
+- 2026-11-23 ~03:00 PST:
+  - Arm H's A/B read (run 45108777338). H loses loaded on both legs and is even quiet. My prediction was wrong: the
+    client half alone carries most of G+E's regression.
+  - LANDED 78c5c5b1f (merge c760bfc1e): BENCHMARKS "84a on Linux: naps on a thread's own timer" (G+E and H rejected,
+    runs 45104143760 and 45108777338, main's arms) with the rtkit probe (run 45115263387: no RealtimeKit on either
+    runner); one GAPS line.
+  - LANDED 75a8e7df9 + 3d61fd9b3 (merge a744fc668): a request's ring.request span opens at its own slot read and ends
+    at its reply's publication, before the wake (DaemonEnd::reply returns the reading; send_reply returns Sent).
+    - Red first: a_requests_ring_span_lies_within_its_clients_own_time (server/tests/daemon.rs) failed on the Mac, a
+      span 165 us before its request's publication; green after, and again after main's merge.
+    - Bug record docs/bugs/2026-11-22-a-ring-span-outlasted-its-clients-wait.md.
+  - For main: clippy and the cross-lint for slates-ipc and slates-server (DaemonEnd::reply now returns u64). The
+    attribution's ring/outside split is good only for runs built after a744fc668.
+  - Queue empty.
