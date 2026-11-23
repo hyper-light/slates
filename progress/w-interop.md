@@ -568,3 +568,10 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   revprops are now deleted (svnadmin delrevprop) before its dump, which is compared whole.
   a_mirrors_dump_is_the_same_whatever_url_it_was_synced_from: two stock URLs, one repository. Owed to main: its red
   and green (no svn on the MacBook), then (B).
+- READY (A-875, 2026-11-23; the Node SDK on Windows, moved from the Windows worker's queue): fix d2753797b on the
+  local branch w-interop-a875, unpushed until green. On Windows the bridge signals Node through a named pipe that
+  async.mjs opens by name; Node adopts no Windows socket by descriptor (libuv uv_guess_handle). Diags for main to push:
+  diag-measurer-w-interop-node-win-red 52241bd79 (main + workflow) and diag-measurer-w-interop-node-win-green
+  cde9c1261 (fix + workflow), windows-latest. The Windows code has never been compiled; the green run is its first
+  build. On green: merge main, rerun focused tests, push. Owed: windows-11-arm; a test that a reader from another
+  process is refused.
