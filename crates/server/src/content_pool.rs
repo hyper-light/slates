@@ -496,6 +496,27 @@ impl ContentPool {
       self.refused = self.refused.saturating_add(1);
     }
   }
+
+  /// Gives a released extent's pages back to the system where the extent is a range of the anchor's one content object
+  /// (Linux's memfd), before its mapping is dropped. A memfd's pages belong to the object and outlive every mapping of
+  /// them, so a release that only unmapped left the extent's pages resident: a 64 MiB burst's destroyed volume left the
+  /// object at 69 to 73 MiB and its arena at 4 (adacachy2 and CI, 2026-11-23). The hole is punched through the extent's
+  /// own mapping (`Region::discard`: `MADV_REMOVE`, which on shmem is `fallocate(PUNCH_HOLE | KEEP_SIZE)` of the range,
+  /// madvise(2)), the call the idle purge already gives a free run back with, so the pages leave every mapping of the
+  /// object, the anchor's included, and the range reads zeros for its next claimant: the object fell to 12 MiB, and the
+  /// punch of that 256 MiB extent with 65 MiB resident took 0.17 ms (adacachy2, debug, load 54). A refusal (a mapping
+  /// locked whole) is counted; the extent then keeps its pages. A private mapping (no content object) goes with its unmap.
+  #[cfg(target_os = "linux")]
+  fn punch(&mut self, region: &mut Region) {
+    if self.content.is_some() && !region.discard(0, region.len()) {
+      self.refused = self.refused.saturating_add(1);
+    }
+  }
+
+  /// Where an extent is an object or a section of its own (macOS, and Windows under an anchor), [`ContentPool::give_back`]
+  /// frees it whole after the unmap: nothing to punch first.
+  #[cfg(not(target_os = "linux"))]
+  fn punch(&mut self, _region: &mut Region) {}
 }
 
 impl ExtentSource for ContentPool {
@@ -544,7 +565,8 @@ impl ExtentSource for ContentPool {
     }
   }
 
-  fn release(&mut self, id: u16, region: Region) {
+  fn release(&mut self, id: u16, mut region: Region) {
+    self.punch(&mut region);
     // Unmapped first: the word may be claimed by another shard the moment it is released.
     drop(region);
     self.give_back(id);

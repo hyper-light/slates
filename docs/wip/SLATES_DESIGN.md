@@ -58662,7 +58662,10 @@ GAPS.
 
 Status: built 2026-11-20, macOS; Windows written the same day (main's ruling of 18:40), its build and tests owed to
 w-lint on jupiter (run-requests). Linux keeps one memfd with holes punched (g226: the anchor's punch frees the pages
-with a peer still mapping them; BENCHMARKS "Content give-back per platform").
+with a peer still mapping them; BENCHMARKS "Content give-back per platform"). A release punches its extent's hole
+through the extent's own mapping before the unmap since 2026-11-23 (`ContentPool::punch`, `MADV_REMOVE`). Before, it
+only unmapped, a memfd's pages outlive every mapping, and a 64 MiB burst's destroyed volume left the object at 69 MiB
+on Linux: `docs/bugs/2026-11-23-a-released-pool-extent-kept-its-pages-in-the-linux-content-object.md`.
 - Windows: each extent is a reserved, unnamed section of its own (`slates_mem::make_extent_section`), since only
   closing a section returns its commit (g226: decommitting a view is refused, error 87). The anchor holds a duplicate
   of each under a new hold kind, `WHAT_CONTENT_EXTENT` (one handle, the extent's id as its record), bounded in a class of

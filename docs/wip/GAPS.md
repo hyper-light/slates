@@ -26239,7 +26239,7 @@ A plain debug build on adacachy2 (db3ddff02) sorted the reds:
 - **Plain-Linux reds.** recovery's `a_shard_is_refused_while_another_holds_the_pool_and_admitted_once_it_returns` (the
   test's fixed 1.25-slice volume left room since A-848's best-fit claims; **fixed**, sized by the refusal's own
   `available`), `a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone` (a released extent kept its pages in
-  Linux's memfd),
+  Linux's memfd; **fixed**, `docs/bugs/2026-11-23-a-released-pool-extent-kept-its-pages-in-the-linux-content-object.md`),
   `a_burst_leaves_nothing_resident_behind_it_but_its_data` (no sweep completed within the test's 10 s), and
   `a_shards_start_holds_each_heavy_piece_in_a_slice_of_its_own` (8 heavy pieces in one slice); ipc's
   `a_reply_sent_before_the_client_blocked_teaches_its_wake_nothing` (4 of 5,341 parks that never switched out taught a
