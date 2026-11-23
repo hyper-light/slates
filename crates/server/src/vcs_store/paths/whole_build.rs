@@ -282,7 +282,7 @@ fn head_paths(engine: &slates_merge::engine::Green) -> Vec<String> {
   let mut paths: BTreeMap<Vec<u8>, String> = BTreeMap::new();
   for path in named {
     let name = map_path(&path).to_vec();
-    if !name.is_empty() && super::git_file(engine, &path).is_some() {
+    if !name.is_empty() && super::git_holds(engine, &path) {
       paths.insert(name, path);
     }
   }
@@ -341,7 +341,7 @@ fn slice(state: &mut ShardState, green: DbVolumeId, budget_ns: u64) -> bool {
       false
     }
     Err(refused) => {
-      count(state, Err(refused), BUILT);
+      count(state, (green, Err(refused)), BUILT);
       let parked = retire(state, build);
       crate::verbs::resume_all(state, parked);
       false
@@ -364,7 +364,7 @@ fn moved(state: &mut ShardState, green: DbVolumeId, build: &mut Build, head: u64
     build.entries.remove(map_path(&path));
     build.removed.remove(map_path(&path));
     // A change build puts or removes every path the change names; a whole build puts the head's files alone.
-    let named = build.before.is_some() || super::git_file(&engine, &path).is_some();
+    let named = build.before.is_some() || super::git_holds(&engine, &path);
     if !map_path(&path).is_empty() && named {
       build.paths.push(path);
     }
@@ -420,7 +420,14 @@ fn put_some_over(
   let began = slates_rt::futures::now_ns();
   let mut answer = Ok(());
   while let Some(path) = build.paths.get(build.at) {
-    let Some(file) = super::git_file(engine, path) else {
+    let file = match super::git_file(engine, path) {
+      Ok(file) => file,
+      Err(refused) => {
+        answer = Err(refused);
+        break;
+      }
+    };
+    let Some(file) = file else {
       // A change build notes a path its map before holds a file at as removed.
       if let Some(before) = build.before {
         let name = map_path(path);
@@ -561,7 +568,7 @@ impl PreviewChange {
       state.count(super::super::CHARGE_SHORT, 1);
     }
     let kept = answer.is_ok();
-    count(state, answer, BUILT);
+    count(state, (green, answer), BUILT);
     kept
   }
 
@@ -612,7 +619,11 @@ fn finish(state: &mut ShardState, green: DbVolumeId, build: Build) {
     if !super::super::settle_in(&mut state.store, &mut state.vcs_stores) {
       state.count(super::super::CHARGE_SHORT, 1);
     }
-    count(state, answer, if remade { super::REMADE } else { BUILT });
+    count(
+      state,
+      (green, answer),
+      if remade { super::REMADE } else { BUILT },
+    );
   }
   // The commit a submit owes of this version, made from what it staged, before the submits parked behind it run, so
   // each names it as its parent (A-664's live whole builds, part 2).

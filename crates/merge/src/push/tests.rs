@@ -496,7 +496,7 @@ fn holds_node(green: &Green, path: &str, node: &Node) {
   match node {
     Node::File(bytes, executable) => {
       assert_eq!(
-        green.content(path),
+        green.content_bytes(path),
         Some(bytes.as_slice()),
         "{path}'s bytes"
       );
@@ -518,7 +518,7 @@ fn holds_node(green: &Green, path: &str, node: &Node) {
 
 /// `green` holds no file, link, submodule link or directory but those `files` name or imply.
 fn holds_nothing_else(green: &Green, files: &Files) {
-  let held_files: BTreeSet<String> = green.files().map(|(path, _)| path).collect();
+  let held_files: BTreeSet<String> = green.files_bytes().map(|(path, _)| path).collect();
   let wanted_files: BTreeSet<String> = files
     .iter()
     .filter(|(_, node)| matches!(node, Node::File(..)))
@@ -981,7 +981,7 @@ fn a_removed_file_and_directory_take_their_mode_and_attributes_with_them() {
     },
   ];
   submit(&mut green, &again, b"new", 3);
-  assert_eq!(green.content("tool"), Some(&b"new"[..]));
+  assert_eq!(green.content_bytes("tool"), Some(&b"new"[..]));
   assert_eq!(
     (
       green.mode("tool"),
@@ -1303,8 +1303,8 @@ fn a_push_of_more_paths_than_a_u16_table_held_lands_as_one_work() {
     green.submit(&built.increment),
     Outcome::Accepted { version: 1 }
   );
-  assert_eq!(green.files().count(), 70_000);
-  assert_eq!(green.content("f69999"), Some(&b""[..]));
+  assert_eq!(green.files_bytes().count(), 70_000);
+  assert_eq!(green.content_bytes("f69999"), Some(&b""[..]));
   assert_eq!(green.xattr(ROOT, HEAD_ATTRIBUTE), Some(&head(1)[..]));
 }
 
@@ -1600,7 +1600,7 @@ fn reads_of(green: &mut Green) -> GreenReads {
   let files = (0..=head)
     .map(|version| {
       green
-        .files_at(version)
+        .files_at_bytes(version)
         .into_iter()
         .map(|(path, bytes)| (path, bytes.into_owned()))
         .collect()
@@ -1672,7 +1672,7 @@ fn owing_took_the_record(
   );
   assert_eq!(owing.head(), before.0, "the owing green reads its base");
   assert_eq!(
-    owing.files_at(before.0).len(),
+    owing.files_at_bytes(before.0).len(),
     before.2.last().unwrap().len()
   );
   let (made, _) = built_in_turns(&owing.deferred().unwrap().push(), owing, store, 3);

@@ -303,6 +303,7 @@ mod tests {
         prop_assert_eq!(charged, footprint(&files, &journal), "after {:?}", step);
         let seen: BTreeMap<String, Vec<u8>> = files
           .files(base)
+          .unwrap()
           .into_iter()
           .map(|(path, bytes)| (path, bytes.to_vec()))
           .collect();

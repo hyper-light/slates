@@ -491,7 +491,7 @@ fn file(state: &ShardState, green: DbVolumeId, path: &str) -> Option<Vec<u8>> {
   state
     .greens
     .get(&green)
-    .and_then(|engine| engine.content(path).map(<[u8]>::to_vec))
+    .and_then(|engine| engine.content_bytes(path).map(<[u8]>::to_vec))
 }
 
 /// Rebuilds the fixtures' repository in `hg` as one push to its empty first line: `base` and `second`, the changesets

@@ -1750,7 +1750,7 @@ mod tests {
     state
       .greens
       .get(&to_db_volume(green))
-      .and_then(|engine| engine.content("f").map(<[u8]>::to_vec))
+      .and_then(|engine| engine.content_bytes("f").map(<[u8]>::to_vec))
   }
 
   /// The repository record of `name`.
@@ -2303,7 +2303,7 @@ mod tests {
   fn answers(greens: &mut crate::greens::Greens, green: VolumeId, floor: u64) -> Option<Answers> {
     let mut engine = greens.get_mut(&to_db_volume(green))?;
     let files = (floor..=engine.head())
-      .map(|version| engine.content_at("f", version))
+      .map(|version| engine.content_at_bytes("f", version))
       .collect();
     Some((engine.head(), engine.head_identity(), files))
   }

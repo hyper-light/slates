@@ -105,7 +105,7 @@ impl Green {
 
   /// The head's node at `path`, in a tree's terms: the root always a directory, as the green holds it (A-618).
   fn head_node(&self, path: &str) -> TreeNode<'_> {
-    if let Some(bytes) = self.content(path) {
+    if let Some(bytes) = self.content_bytes(path) {
       return TreeNode::File {
         bytes: Cow::Borrowed(bytes),
         mode: self.mode(path),
@@ -155,7 +155,7 @@ impl Green {
         windows.whole(path, MergeConflictClass::DeleteModify);
         continue;
       };
-      let now = self.content(frame);
+      let now = self.content_bytes(frame);
       if now == Some(base.as_ref()) {
         continue;
       }

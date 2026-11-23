@@ -272,7 +272,7 @@ fn judge(
     2,
     refine,
   ));
-  let content = String::from_utf8(green.content(PATH).unwrap().to_vec()).unwrap();
+  let content = String::from_utf8(green.content_bytes(PATH).unwrap().to_vec()).unwrap();
   (one, two, content)
 }
 
@@ -641,10 +641,10 @@ fn a_rewrite_renamed_over_another_file_is_refined_against_its_source() {
   let two = judge(true, &mut green);
   assert!(matches!(two, Outcome::Accepted { .. }), "{two:?}");
   assert_eq!(
-    String::from_utf8(green.content(PATH).unwrap().to_vec()).unwrap(),
+    String::from_utf8(green.content_bytes(PATH).unwrap().to_vec()).unwrap(),
     first.replacen("a + 190\n", "a - 190\n", 1)
   );
-  assert!(green.content(other).is_none());
+  assert!(green.content_bytes(other).is_none());
 }
 
 /// A-776's refinement replaces only a path's content: do, in one work, rewrite `src/lib.rs` whole with one line changed
@@ -695,7 +695,7 @@ fn a_refined_rewrite_keeps_its_paths_other_operations() {
     named: Default::default(),
   });
   assert!(matches!(outcome, Outcome::Accepted { .. }), "{outcome:?}");
-  assert_eq!(green.content(PATH).unwrap(), post.as_bytes());
+  assert_eq!(green.content_bytes(PATH).unwrap(), post.as_bytes());
   assert_eq!(green.mode(PATH), Some(0o755));
 }
 
