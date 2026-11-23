@@ -1114,7 +1114,7 @@ impl Green {
     }
     let rel = relative(path, source).unwrap_or_default().to_owned();
     let grafted = grafted_in(fix, &rel);
-    let then = self.content_ref_at(path, version);
+    let then = self.content_ref_at_bytes(path, version);
     if then.as_deref() != self.content.get(path).filter(|_| grafted) {
       fix
         .files
@@ -1882,7 +1882,7 @@ impl Green {
   fn entry_at(&self, key: &IdentityKey, from: &str, version: u64) -> Option<Entry> {
     match key {
       IdentityKey::File(path) => self
-        .content_ref_at(from, version)
+        .content_ref_at_bytes(from, version)
         .map(|bytes| file_entry_of(path, &bytes)),
       IdentityKey::Special(path) => self
         .special_at(from, version)

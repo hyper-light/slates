@@ -85,7 +85,7 @@ impl Inodes {
   /// `green`'s head as a volume: each file a node, each hard link a name of its home's node.
   fn of(green: &Green) -> Inodes {
     let mut volume = Inodes::default();
-    for (path, bytes) in green.files() {
+    for (path, bytes) in green.files_bytes() {
       let node = volume.nodes.len();
       volume.names.insert(path, node);
       volume.nodes.push(bytes.to_vec());
@@ -218,7 +218,7 @@ impl Inodes {
 /// naming it there).
 fn seen_in(green: &Green) -> Seen {
   let mut names: BTreeMap<String, BTreeSet<String>> = green
-    .files()
+    .files_bytes()
     .map(|(path, _)| (path.clone(), BTreeSet::from([path])))
     .collect();
   for (link, home) in green.hardlinks.iter() {
@@ -226,7 +226,7 @@ fn seen_in(green: &Green) -> Seen {
   }
   let mut seen = Seen::new();
   for (home, all) in names {
-    let bytes = green.content(&home).map(<[u8]>::to_vec);
+    let bytes = green.content_bytes(&home).map(<[u8]>::to_vec);
     for name in &all {
       seen.insert(name.clone(), (bytes.clone(), all.clone()));
     }

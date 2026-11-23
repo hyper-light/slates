@@ -85,16 +85,16 @@ fn a_text_held_by_path_outlives_its_files_change_and_removal() {
   let made = green.submit(&Work::default().create("a", b"one").at(1, 0));
   assert_eq!(made, Outcome::Accepted { version: 1 });
   green.hold_path(identity(1), "a").unwrap();
-  assert_eq!(green.held(&identity(1)), Some(&b"one"[..]));
+  assert_eq!(green.held_bytes(&identity(1)), Some(&b"one"[..]));
   let changed = green.submit(&Work::default().overwrite("a", b"two").at(2, 1));
   assert_eq!(changed, Outcome::Accepted { version: 2 });
   assert_eq!(
-    (green.content("a"), green.held(&identity(1))),
+    (green.content_bytes("a"), green.held_bytes(&identity(1))),
     (Some(&b"two"[..]), Some(&b"one"[..]))
   );
   let removed = green.submit(&Work::default().unlink("a").at(3, 2));
   assert_eq!(removed, Outcome::Accepted { version: 3 });
-  assert_eq!(green.held(&identity(1)), Some(&b"one"[..]));
+  assert_eq!(green.held_bytes(&identity(1)), Some(&b"one"[..]));
   assert_eq!(green.hold_path(identity(2), "a"), Err(HeldRefused::NoFile));
   assert_eq!(green.held_count(), 1);
 }
@@ -112,16 +112,16 @@ fn a_text_held_by_bytes_is_kept_once_and_let_go_with_its_last_holder() {
   green.hold_bytes(identity(7), b"blob").unwrap();
   green.hold_path(identity(7), "f").unwrap();
   assert_eq!(
-    (green.held(&identity(7)), green.held_count()),
+    (green.held_bytes(&identity(7)), green.held_count()),
     (Some(&b"blob"[..]), 1)
   );
   green.release_held(&identity(7)).unwrap();
   green.release_held(&identity(7)).unwrap();
-  assert_eq!(green.held(&identity(7)), Some(&b"blob"[..]));
+  assert_eq!(green.held_bytes(&identity(7)), Some(&b"blob"[..]));
   green.release_held(&identity(7)).unwrap();
-  assert_eq!(green.held(&identity(7)), None);
+  assert_eq!(green.held_bytes(&identity(7)), None);
   assert_eq!(green.release_held(&identity(7)), Err(HeldRefused::NotHeld));
-  assert_eq!(green.content("f"), Some(&b"other"[..]));
+  assert_eq!(green.content_bytes("f"), Some(&b"other"[..]));
 }
 
 /// A-716 (the table's bound). Do: hold texts by bytes on a green whose room is never set, then on one with room for
@@ -142,7 +142,7 @@ fn a_hold_past_the_tables_room_is_refused_and_holds_nothing() {
     green.hold_bytes(identity(3), b"z"),
     Err(HeldRefused::AtRoom { room: 2 })
   );
-  assert_eq!(green.held(&identity(3)), None);
+  assert_eq!(green.held_bytes(&identity(3)), None);
   green.hold_bytes(identity(1), b"x").unwrap();
   assert_eq!(green.held_count(), 2);
 }
@@ -162,7 +162,7 @@ fn a_text_staged_a_piece_at_a_time_is_held_once_or_given_back() {
   }
   assert_eq!(staged.length(), 3);
   green.seal_staged(staged, identity(1)).unwrap();
-  assert_eq!(green.held(&identity(1)), Some(&b"abc"[..]));
+  assert_eq!(green.held_bytes(&identity(1)), Some(&b"abc"[..]));
   let alive = green.content.blocks().live();
   let mut again = green.stage();
   green.append_staged(&mut again, b"ab");
@@ -178,9 +178,12 @@ fn a_text_staged_a_piece_at_a_time_is_held_once_or_given_back() {
     Err(HeldRefused::AtRoom { room: 1 })
   );
   assert_eq!(
-    (green.content.blocks().live(), green.held(&identity(2))),
+    (
+      green.content.blocks().live(),
+      green.held_bytes(&identity(2))
+    ),
     (alive, None)
   );
   green.release_held(&identity(1)).unwrap();
-  assert_eq!(green.held(&identity(1)), Some(&b"abc"[..]));
+  assert_eq!(green.held_bytes(&identity(1)), Some(&b"abc"[..]));
 }

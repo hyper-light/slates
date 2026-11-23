@@ -3434,7 +3434,7 @@ const REGION_SHARE: u64 = 4;
 /// Stock git's request creating `main` at the last of a line of `commits` commits (three objects each) and an annotated
 /// tag `refs/tags/v<n>` of each, the tags' commands in name order as git sends them: the request, every ref's object, and
 /// the count of objects it brings.
-fn tagged_history(commits: usize) -> (Vec<u8>, Vec<ObjectId>, usize) {
+pub(crate) fn tagged_history(commits: usize) -> (Vec<u8>, Vec<ObjectId>, usize) {
   use slates_git::object_name::Kind;
   let mut objects: Vec<(Kind, Vec<u8>)> = Vec::new();
   let mut parent: Option<ObjectId> = None;
@@ -3486,7 +3486,7 @@ fn tagged_history(commits: usize) -> (Vec<u8>, Vec<ObjectId>, usize) {
 
 /// A v2 `fetch` of every one of `wants` with `done`, `ofs-delta` and no progress, as `git clone` asks for a repository's
 /// refs.
-fn whole_fetch_of(wants: &[ObjectId]) -> Vec<u8> {
+pub(crate) fn whole_fetch_of(wants: &[ObjectId]) -> Vec<u8> {
   let mut request = Vec::new();
   pktline::write(Packet::Data(b"command=fetch\n"), &mut request).expect("the command");
   pktline::write(Packet::Delim, &mut request).expect("the delimiter");
@@ -3639,7 +3639,7 @@ fn a_fetch_past_its_room_waits_for_more_and_is_answered_whole() {
 }
 
 /// Shape: [`a_fetch_past_its_room_waits_for_more_and_is_answered_whole`]'s line: a few commits, each tagged.
-const TAGGED_FEW: usize = 8;
+pub(crate) const TAGGED_FEW: usize = 8;
 
 std::thread_local! {
   /// A repository's landing turn a test holds on the shard's thread ([`a_mercurial_push_parks_for_its_repositorys_landing_turn_and_no_other_waits`]).
@@ -4110,6 +4110,7 @@ fn assert_both_clones_whole(
 /// bytes; and the listing naming `HEAD` at the commit. Red with the guard
 /// (`LANDED_LET_GO` false): nothing let go.
 #[test]
+#[ignore = "the landed let-go is withdrawn (vcs_store::LANDED_LET_GO false, main 01a20182 2026-11-23): a re-lift's red, run with it on"]
 fn a_pushed_pack_is_let_go_by_its_commit_in_slices_and_a_clone_after_is_whole() {
   let (identity, certificate) = identity();
   let daemon = daemon(identity);

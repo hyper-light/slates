@@ -1743,10 +1743,16 @@ fn read_green_range(
     Err(refusal) => return refused(refusal),
   };
   match engine.content_page_at(path, version, range) {
-    Some((bytes, total)) => ReplyBody::ReadPage {
-      bytes,
-      total,
-      stamp: version,
+    Some((page, total)) => match crate::vcs_store::named_objects::bytes_of(path, page) {
+      Ok(bytes) => ReplyBody::ReadPage {
+        bytes: bytes.into_owned(),
+        total,
+        stamp: version,
+      },
+      // A file held by its content-plane object alone (A-760 (b) 4b): never met until piece 4d, which reads it.
+      Err(unread) => refused(Refusal::Unsupported {
+        feature: format!("a read of {unread}"),
+      }),
     },
     None => refused(Refusal::NotFound),
   }
@@ -1956,7 +1962,7 @@ pub(crate) fn status_merge_volume(
   let (bytes, head) = match role {
     MergeRole::Green { .. } => state.greens.get(&id).map_or((0, 0), |engine| {
       (
-        engine.files().map(|(_, bytes)| bytes.len() as u64).sum(),
+        engine.files().map(|(_, bytes)| bytes.len()).sum(),
         engine.head(),
       )
     }),

@@ -66,7 +66,9 @@ test('the addon exposes the async low-level primitives', (t) => {
     'beginSpinRebase', 'pollRebase', 'beginSpinUnlink', 'beginSpinRename', 'beginSpinMkdir',
     'beginSpinRmdir', 'beginSpinChmod', 'beginSpinSymlink', 'beginSpinLink',
     'beginSpinSetXattr', 'beginSpinRemoveXattr', 'pollDeclare',
-    'beginSpinLand', 'pollLand', 'completionFd', 'arm', 'disarm', 'takeReady',
+    // The completion signal: a descriptor on Unix, a pipe opened by name on Windows (A-875); each method is there on
+    // every platform and refuses where its signal is not the platform's.
+    'beginSpinLand', 'pollLand', 'completionFd', 'completionPipe', 'arm', 'disarm', 'takeReady',
   ];
   for (const verb of expected) {
     assert.ok(methods.includes(verb), `Client.prototype has ${verb}`);

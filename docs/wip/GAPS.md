@@ -157,6 +157,16 @@
 > and every clone (stock_git_verbs 1 of 8). Lifted when w-git's fetch-side readers (A-855's held answer, brought back and
 > made again) and the push decision's reads bring a let-go window back, with w-shared's red: annotated tags pushed, the
 > push ended, idle, then ls-remote and a clone byte-identical to stock.
+> **LIFT WITHDRAWN (w-git, 2026-11-23, main 01a20182's order after r18):** `vcs_store::LANDED_LET_GO` false again, every
+> landed let-go held (a commit's, a recovery's and a rebuild's). The lift surfaced a reader on main four times: the fetch
+> stream's choice and object reads (fixed, 0c3f42cea, 7f7793c58), the SSH edge's held answer (fixed, 56fbf0381), the
+> push's tag peel (`receive::works::tree_of` at works.rs:715: a tag of a let-go tag declined "an object it names cannot
+> be read", r18's verbs push-tag-of-a-tag and delete-tags), and a shallow fetch over HTTP refused
+> `Pack(Store(Unreadable { id: sha1:2a3c9b98… }))` (r18's verbs shallow), its path not yet found; and r18's HTTP mirror
+> clone stalled 120 s with 0 pack bytes, between 4c8b391ec and 09797375e (main's bisect cleared c20133168). Owed behind
+> the guard, red first: the tag peel bringing its window back; the shallow fetch's path; a sweep of every read of a
+> stored object in receive and upload for the same refusal; the stall. Re-lifting waits on git/git whole and verbs both
+> passing with it on. The re-lift's reds stay, ignored while it is withdrawn.
 > **r227's SSH regression FIXED (w-git, 2026-11-23):** with the lift, stock git's fetch over SSH ended mid-answer
 > (`unexpected disconnect while reading sideband packet`; on a made history, the shallow clone right after its
 > `packfile` header): an answer whose pack's choice read a let-go window is held for it (`Answer::held_away`) with its
@@ -969,9 +979,14 @@
 >   on (`Frame::based_later`, one bit a revision told when the framing is made), and every text the intake lets go is
 >   a later rebuild's buffer (`Spares`, at most four and the cache's bound). `push_heap`'s
 >   `a_pushs_churn_per_changeset_is_its_file_alone`, red at 28,855 B an edit of a 16 KiB file (1.76 copies), 177,497 B
->   of a 160 KiB one (1.08) with the buffer reused alone; now 12,047 B and 13,674 B (0.74, 0.08), no copy. Owed:
->   `HgIndex::revision_text`'s buffers and `object_bytes`, then `Taker::file_base`; the 57k push's reading
->   (`hg_push_lifetimes`, w-perf's) after them.
+>   of a 160 KiB one (1.08) with the buffer reused alone; now 12,047 B and 13,674 B (0.74, 0.08), no copy.
+>   `HgIndex::revision_text`'s rebuilds cut BUILT (2026-11-23, w-hg; C1 cut 2): each read rebuilt a chain into a text, a
+>   next text and a delta of its own, the whole it began from copied out by `object_bytes` grown from empty (w-perf:
+>   2.57 GB freed within a second under `push::held`, 1.24 GB in the band, `object_bytes` 0.62 GB). The index keeps its
+>   own next text and delta (`TextBuffers`), and a whole is read at its length (`object_text`), so a read allocates the
+>   text it hands out alone. `push_heap`'s `a_views_manifest_read_is_one_text`: red 194,487 B a read of a 91,200 B
+>   manifest (2.13 copies), now 105,500 B (1.16). Owed: `Taker::file_base`; the 57k push's reading (`hg_push_lifetimes`,
+>   w-perf's) after it.
 >   Its bound from the work BUILT (main's ruling, 2026-11-23): the chain no longer needs its texts held, so the cache holds
 >   the distinct texts its last `waiting` reads lent (one a waiting request, the owner's room) and a chunk's room
 >   (`TextCache::for_reads`), the least lately read out first; a text past it is lent from the buffer it was made into.
@@ -995,7 +1010,11 @@
 >   `every_block_has_an_owner_and_the_owners_sum_to_what_is_allocated` (`slates-mem`: 2,000 seeded steps of
 >   allocations, frees, trims and deferred frees against a model) and the memory status's test (the sum after a green's
 >   file is accepted). The greens' content is not in the arena (the merge engine's own heap), so arena-13's named part
->   was 184 MB, not 260. Owed: main's arena-15 to name the rest.
+>   was 184 MB, not 260. arena-15 (CI 45224166925) named it: 556,367,872 bytes held for repository windows of
+>   131,425,429. Since then the chunk store asks the arena for the caller's own length, not its page-rounded block
+>   (`ChunkArena::alloc_asking`), so a window owner's asked bytes against its held name the page rounding; held by
+>   `a_windows_ask_is_its_own_length_and_its_hold_the_page_it_takes` (red: asked 16,384 of 16,384 held for four windows
+>   of 100 bytes; now 400). The rounding's fix is the small-window slab (next piece).
 > - A Mercurial index's tail sealed by every append REVERTED (2026-11-23, w-perf; 0cd8ef36a reverted after main's
 >   arena-14, CI 45208924823: push-all's shard 0 spun past 1 s of CPU in `hg_push::segment` on all three legs and the
 >   watchdog killed the daemon). Each seal writes a run, and a push's fork never merges its runs (only the repository's
@@ -1978,8 +1997,15 @@
 > **A-873 (2026-11-23, w-svn; main 01a20182's ruling (I), A-760 (b) piece 4a):** a green's identity entry for a file
 > hashes its path, length and plain BLAKE3 digest, which each block keeps from when it was made, not its bytes. Golden
 > vectors are regenerated through `--ignored regenerate_the_identity_golden_vectors`, with a determinism gate. Anchor
-> layout 19 refuses a layout-18 segment typed. OWED: 4b (one read seam, `Bytes | Named`; w-git and w-hg told first),
-> 4c (the engine's named-base reads), 4d (a named block holds no bytes).
+> layout 19 refuses a layout-18 segment typed. 4b BUILT (2026-11-23): one read seam, `engine::Content` (a current
+> file's `Bytes | Named`) and `ContentAt` (at a version); the engine's own reads and its tests take the `*_bytes`
+> readers. svn's held texts fall through to the content store, and a rebase holds a named head file's change whole.
+> Every other site refuses typed: git's `StepRefused::Named` (`vcs_paths.named_unread`, logged with path and green),
+> hg's `Unmade::Named` (`vcs.hg.named_unread`), a mount's read `EAGAIN`/`ERROR_RETRY`, a work's base `BaseGone`, a
+> read page `Unsupported`, checkout `Unsupported`. No producer yet, so no red: the suites are its check. OWED: 4c+4d as
+> one piece (main's ruling of 2026-11-23): a named block's hold of the content store with its bytes dropped, history
+> reads through the plane, sync readers refusing typed and their async callers bringing back (never pinned),
+> `history::reanchor` checking a named replace by identity.
 >
 > **A-869 (2026-11-22, w-svn; main 01a20182's order of 19:28, A-760 (b) piece 2):** a green's checkpoint names a file
 > whose block is named for a content-plane object instead of carrying its bytes (`Checkpoint::named`, a section after
@@ -4384,7 +4410,33 @@
 > (`docs/bugs/2026-11-23-the-svnsync-use-row-compared-two-random-mirror-uuids.md`). The rerun (r12, 112e694e7) left
 > one more of the harness's: revision 0's lengths still counted the `svn:sync-*` lines the comparison dropped, and the
 > source URL differs by leg. The mirror's sync properties are now deleted before the dump, which is compared whole
-> (`a_mirrors_dump_is_the_same_whatever_url_it_was_synced_from`). Owed: main's red and green of that test, and (B).
+> (`a_mirrors_dump_is_the_same_whatever_url_it_was_synced_from`).
+> **Done, proven by use (main 01a20182's rounds on the big Studio, stock Subversion 1.15, 2026-11-23):**
+> - (A), DeltaV v1's revision properties over the HTTP edge: `SLATES_SVN_USE_ROUTE=http-v1`,
+>   `SLATES_SVN_USE_VERBS=revprops`, 0 differences from svnserve at 17 revisions (kiln run r254, after 414925522).
+> - (B), `svnsync` over HTTPv2: git-2000's 2,000 revisions mirrored from slates with 0 differences from stock
+>   svnserve's mirror (`SLATES_SVN_USE_VERBS=svnsync` over `http`, 1 passed; kiln run r21 at main 71c2f07a7).
+> - The harness's rule: `a_mirrors_dump_is_the_same_whatever_url_it_was_synced_from` red at 3bb5e53b1
+>   (`svn_interop.rs:3329`, the mirror over stock svnserve against the one over `file://`) and green at 71c2f07a7
+>   (r21).
+> - `an_svnsync_measured` over HTTP (r254): 2,000 revisions in 301.8 s (150.9 ms a revision), mirror at r2000, daemon
+>   RSS 724 MB before and 994 MB at peak. The same round over svn:// took 510.4 s against P7's 270.7 s, sent to w-svn.
+> **svnsync over svn:// measured quiet: 146.1 ms a revision against 135 ms, its time svnsync's own (w-svnperf for
+> main 01a20182, 2026-11-23; goal 93):** a loaded round of `an_svnsync_measured` on the big Studio (main 1d06ab306) had
+> svn:// at 510.4 s, 255.2 ms a revision, and an HTTP import of 111.1 s. The test now prints every counter the daemon
+> reports after the import and what the sync added, and the daemon counts an svn:// conversation's answers against its
+> waits (`vcs_svn.answers`, `answer_ns`, `fetch_wait_ns`, `write_wait_ns`, `read_wait_ns`, `yield_wait_ns`), an
+> import's turns, landing waits and yields (`vcs_store.svn_import.turn_ns`, `land_wait_ns`, `yield_wait_ns`), and the
+> content store's reads, stored, freed, let-go and brought-back figures (`vcs_store.content.*`). Main's quiet r70
+> (load 2.26, main 33b5fe7b1, release, git-2000, stock 1.15.0): svn:// import 3.3 s, svnsync 292.2 s, 146.1 ms a
+> revision; HTTP import 3.5 s, svnsync 268.6 s, 134.3 ms a revision. Over svn:// a revision's 146.1 ms is 125.9 ms of
+> `write_wait` (svnsync not reading while it commits into its mirror), 14.6 of `read_wait`, 3.42 waiting for pieces
+> through the node's store, 1.60 for a poll after a yield and 0.54 answering: the server's share is about 5.6 ms. The
+> 28.4 pieces fetched a revision (28.1 over HTTP) were a reader fetching a piece again each turn, fixed (A-876). The
+> sync's 34.2 GB `content.purged_bytes` is the idle sweep giving back the shard's dead recovery memory a slice a tick
+> (A-117, A-226), which an svn read leaves idle, not memory the sync used. Owed: main's rerun after A-876, expected
+> to show under 10 pieces a revision and about 1 ms of fetch waits; and naming the 94k polls of 65 to 131 µs on the
+> svn:// leg (about 8.5 s of the shard's CPU, more than its answers' 1.08 s).
 > **R4, recovery replays a revision record a turn at a time (2026-11-20, w-svn; Ada's close list; found by w-git's sweep):**
 > a Subversion revision's record was replayed whole in one recovery or rebuild turn (`replay_svn` -> `commit_record`),
 > every text it brought deltified in one step, so one large revision held its shard. Now `RevisionReplay`
@@ -4742,9 +4794,12 @@
 >   routed it to no owner, so the guard passed it and it answered five acknowledged writes `NotFound` (ReadSafety, 2 of
 >   4 replays on adacachy2; a diagnostic build named both sides). Now a node without the record answers only as the
 >   volume's creator that no routing sends elsewhere and that did not lose it to a successor; anywhere else a forwarded
->   read, write or work creation is refused `Overloaded`, recorded nowhere, counted
->   `fleet.forward.refused.not_owner_here`. Test:
->   `a_forwarded_read_at_a_node_neither_holding_nor_owning_its_volume_is_refused_retryably` (red: `NotFound`).
+>   read, write or work creation is refused, recorded nowhere, counted `fleet.forward.refused.not_owner_here`: first
+>   `Overloaded` (6b2952f4d), then, by main's ruling the same day, its own kind, `Refusal::NotOwnerHere { owner }` (wire
+>   tag 84, contract 60), the owner the refusing node's routing names kept as the client's route. A landing's
+>   `Present` and `Land` from a node another host's volume is not on, which answered `NotFound`, meet it too. Test:
+>   `a_node_neither_holding_nor_owning_a_volume_answers_not_owner_here_and_its_creator_not_found` (red on the
+>   `Overloaded` stand-in and the landing's `NotFound`).
 >   Record: `docs/bugs/2026-11-23-a-forwarded-read-at-a-node-that-neither-held-nor-owned-the-volume-answered-not-found.md`.
 
 > **A volume whose owner shard refused its state read as absent: fixed (2026-11-19, A-564, §4.8 "Lookup"; g225; found by
@@ -6170,6 +6225,20 @@
 > Beyond the goal's clauses, owed from this entry: the async form for the remaining verbs, the MCP list tools answering
 > a page at a time, and a merge's versions typed on the wire.
 
+> **The Node SDK's completion on Windows (2026-11-23, w-interop; A-875; found by CI run 45176536354's Windows legs):**
+> `async lifecycle over a live daemon` died with `CompletionLost { reason: "Unsupported fd type: UNKNOWN" }`. Node
+> adopts no Windows socket by descriptor (libuv's `uv_guess_handle`), and the SDK was handed the bridge's loopback
+> socket. **Built:** the Windows bridge signals the Node SDK through a named pipe that `async.mjs` opens by name
+> (`net.connect`), admitting only a reader of this process (`crates/ipc/src/completion_pipe.rs`). Python keeps the
+> socket. **Proven (windows-latest, main's diag runs):**
+> - Red at main (run 45225292920): "Unsupported fd type: UNKNOWN".
+> - With the change (run 45230459274, 20cd9025e): `slates-ipc`'s Windows completion and pipe tests pass, 8 of 8, with
+>   the other-process reader's. The addon builds, and "Unsupported fd type" is gone: the async lifecycle gets past its
+>   completion pipe to the daemon's first create.
+>
+> **Not yet green:** the Node suites on Windows. 4 of 8 pass. The 4 that fail, sync and async alike, are refused
+> `BudgetExceeded { available: 5722144768 }` at their first create. That is the Windows daemon's own sizing (w-win's
+> leftover item 3, now w-win2's), not this change. **Owed:** the SDK lane rerun once that lands, then windows-11-arm.
 > **The Node SDK suites on Windows (2026-11-18, §4.7 status "the Node SDK suites end on Windows"; goal 88).** The three
 > Node suites had never run on Windows: CI's `sdk` job ran on `ubuntu-latest` and `macos-latest` alone. Main's diag run
 > 44384411115 (main da697d886) ran them on both Windows runners, and the step went past 70 minutes until cancelled, with
@@ -8818,7 +8887,10 @@
 >     - **Closed: the doorbell's herd (A-381, 2026-11-18).** On macOS and Windows each client's ring kicked every shard;
 >       now it marks the shard its region names and the doorbell thread kicks only the shards marked. Each shard's
 >       parks fell 59% and the shards' CPU 20 to 34% at 1,000 clients; the latencies moved with the box's load (14 to 52)
->       more than with the change, so no latency is claimed for it (BENCHMARKS, 2026-11-18).
+>       more than with the change, so no latency is claimed for it (BENCHMARKS, 2026-11-18). Since 2026-11-23 (w-win) the
+>       thread also takes the marks rung before its first look, which it had left for good: a claim made as a daemon
+>       started, or while an anchor restarted one, waited with no bound (the Windows Shards CLI step's 20-minute hang,
+>       `docs/bugs/2026-11-23-a-claim-rung-before-the-doorbell-thread-looked-was-never-answered.md`).
 >     - **Closed: an ask waiting out the batch before it (A-388, 2026-11-18).** One batch of asks was out to an owner at
 >       a time, and the wait for it was about half of an ask's way to the owner (p99 1.6 to 2.1 ms for submits and
 >       rebases at 50 ms); a shard now keeps two out.

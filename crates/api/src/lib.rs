@@ -336,9 +336,14 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 59: an import lands a Subversion dump's revisions a batch at a time, a batch atomic (C2 stage C): the re-exported
 /// [`ImportFault`] gains `SubversionLanded` (appended), the refusal naming the last revision that landed, which the
 /// daemon sends in place of `Subversion`; the same dump imported again resumes after it (2026-11-21).
+/// 60: a node that holds no record of a volume and is not its owner says so (§4.8 "Lookup", the rule by authority):
+/// `RetryCause::NotOwnerHere` (appended), the wire's appended `Refusal::NotOwnerHere` with the owner as a hint where
+/// that node's routing names one, from a forwarded read, write or work creation that met a node whose configuration
+/// differs from its sender's, and from a verb that is not forwarded (a landing's) sent to a node another host's volume
+/// is not on; until then such a node answered `NotFound`, a claim that acknowledged writes did not exist (2026-11-23).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 59;
+pub const CONTRACT: u32 = 60;
 
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;

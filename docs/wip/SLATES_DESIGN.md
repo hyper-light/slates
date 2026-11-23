@@ -6881,10 +6881,14 @@ version.
 > current owner and is authoritative", so a node whose catalog holds no record of a volume answers a verb forwarded to
 > it only where it is that owner by the rule a local client's verb is routed by (`verbs::owned_by_another_host`): the
 > volume's creator, which no routing on it sends elsewhere and which did not lose it to a successor. There a volume it
-> never made or destroyed is `NotFound`. Anywhere else the verb is refused `Overloaded`, retryable and recorded nowhere,
-> so the origin, which drops its route at a refusal, locates the owner again on the resend
-> (`verbs::refusal_of_unheld_forward`, counted `fleet.forward.refused.not_owner_here`; a successor before it has made
-> the volume, A-394, `fleet.forward.refused.before_made`). Until then a node whose routing named another owner, or
+> never made or destroyed is `NotFound`. Anywhere else the verb is refused `Refusal::NotOwnerHere { owner }`, retryable
+> and recorded nowhere, `owner` the owner its routing names as a hint (`verbs::refusal_of_unheld_forward`, counted
+> `fleet.forward.refused.not_owner_here`; a successor before it has made the volume stays `Overloaded`, A-394,
+> `fleet.forward.refused.before_made`). The origin keeps the hinted owner as the client's route, or drops its route,
+> and the client's resend goes there (`slates_client` resends a read so, within its reconnect budget). A verb that is
+> not forwarded, a landing's `Present` or `Land`, meets the same refusal from a node another host's volume is not on
+> (`verbs::absent`, judged as an attach form refused by kind is, `remote_attach::elsewhere`). Until then a node whose
+> routing named another owner, or
 > none, served such a verb, found no volume and answered `NotFound`. At seed 8173581894251929445 the chaos nemesis had
 > an origin at configuration 7 forward reads to the successor its routing named, which at configuration 8 routed the
 > volume to no owner, and five acknowledged writes read as missing while the last owner served them all (ReadSafety;
@@ -17466,7 +17470,7 @@ package, examples in three languages.
 1. Python: the extension over the Rust client; `add_reader` completion (socket on Windows);
    buffer-protocol reads; the sync facade; stubs; maturin builds for the wheel matrix; free-
    threaded build with `gil_used = false` and thread-safe `#[pyclass]` state.
-2. TypeScript: the addon; `uv_poll` on the completion fd/socket; external buffers with copy
+2. TypeScript: the addon; `uv_poll` on the completion fd (Unix) or the completion pipe opened by name (Windows, A-875); external buffers with copy
    fallback; async iterators and `AbortSignal`; platform packages over the same typed client.
 3. MCP: the stateless protocol with dual-era support; tool catalog with annotations and
    structured content; resources and prompts for skills; `subscriptions/listen` for volume
@@ -35035,6 +35039,16 @@ shard), `crates/server/src/doorbell.rs` (the thread kicks what the rings marked,
   parks fell by 59% at both loads (4.71 to 1.92 million a level at 50 ms, 2.74 to 1.13 million at 20 ms) and the shards'
   CPU by 34% and 20%. The latencies swung ten- to twentyfold with the box's load (14 to 52) within each arm, so those
   pairs cannot tell the arms' latencies apart; the 1,000-client rung's record run is the supervisor's.
+- **A ring before the thread's first look (w-win for main 01a20182, 2026-11-23).** The doorbell thread took the marks
+  only when a wait returned a word other than the one it read as it started, so a claim rung before that read (in the
+  window between the daemon's publishing its rendezvous, `Listener::open`, and its doorbell thread's start, or into an
+  anchor's object while a killed daemon restarted) was never taken, and its claimant waited for good under the anchor
+  (A-468). The thread now takes the marks once after its first read, before its first wait. Found as the Windows
+  Shards CLI step's 20-minute hang (CI run 45163517212): every thread's stack at a reproduced hang showed the client in
+  its claim's wait, the daemon's shards parked and its doorbell thread waiting for a ring. Held by
+  `doorbell::tests::a_claim_rung_before_the_doorbell_thread_starts_is_taken` (macOS and Windows). Applied in the same
+  change to: `crates/server/src/doorbell.rs`, GAPS (A-381's closure),
+  `docs/bugs/2026-11-23-a-claim-rung-before-the-doorbell-thread-looked-was-never-answered.md`.
 
 ### A-341 — A holder the takeover never asked lets its copy go where the kept retirement shows the object recovered within tolerance (2026-11-18, kiln goal g250; §4.8 "Promotion and takeover"; A-309's owed rule, its safe part; A-335)
 Applied in the same change to: A-309's holder rule (above), GAPS (the unasked holder's entry), `crates/db/src/register.rs`
@@ -35664,13 +35678,30 @@ served the forward and answered `NotFound`. Measured on adacachy2 with a diagnos
 configuration 7 forwarded reads to the successor its routing named, and that node, already at configuration 8, held no
 record of the volume and routed it to no owner, so five acknowledged writes read as missing through the origin while
 the last owner served them all (ReadSafety; 2 of 4 replays of the seed, and 1 of 5 runs of main 05e9bb698 with item 1's
-fix). The guard is now `refusal_of_unheld_forward` (it was `refusal_of_unheld_forward`; its callers `serve_forwarded_read`,
+fix). The guard is now `refusal_of_unheld_forward` (it was `forwarded_before_made`; its callers `serve_forwarded_read`,
 `forwarded_write` and `forward_placement`): a node without the record answers only as the volume's creator that no
 routing on it sends elsewhere and that did not lose the volume to a successor, the rule `owned_by_another_host` routes a
 local client's verb by, and refuses `Overloaded` anywhere else, counted `fleet.forward.refused.not_owner_here`. Applied
 in the same change to: §4.8 "Lookup"'s status, GAPS (A-394's entry), `crates/server/src/verbs.rs`, the test
 `a_forwarded_read_at_a_node_neither_holding_nor_owning_its_volume_is_refused_retryably` (red first: `NotFound`),
 and `docs/bugs/2026-11-23-a-forwarded-read-at-a-node-that-neither-held-nor-owned-the-volume-answered-not-found.md`.
+
+**Amended again 2026-11-23 (main's ruling on the wire): one condition, one refusal.** `Overloaded` says a shard is busy,
+so a refusal of a node that is not the owner filed under it was a refusal of the wrong kind (CLAUDE.md §3: an
+uncategorized refusal is a bug). It is now its own: `Refusal::NotOwnerHere { owner }` (appended, wire tag 84), `owner`
+the owner the refusing node's routing names, where it names one, kept as the client's route by the origin
+(`verbs::route_after`, counted `fleet.owner_location.route_hinted`); the API's `RetryCause::NotOwnerHere` (contract
+60); `slates_client` resends a read so within its reconnect budget (`call_through_transient`) and holds the id for an
+async caller (`note_reply`). The CLI, MCP and both SDKs render refusals by their `Debug` form, so they carry it by
+name. The same refusal closes the gap the sweep named: a verb that is not forwarded, a landing's `Present` or `Land`,
+sent to a node another host's volume is not on, answered `NotFound` from `verbs::absent`; it is now `NotOwnerHere`,
+judged by `remote_attach::elsewhere`, as an attach form refused by kind is, or by a loss to a successor. A creator still
+answers its own destroyed volume `NotFound`. The successor before it made the volume keeps `Overloaded` (A-394's
+case: it owns the volume and will serve it). Test:
+`a_node_neither_holding_nor_owning_a_volume_answers_not_owner_here_and_its_creator_not_found` (`crates/server/src/verbs.rs`,
+which replaces the test above). Applied in the same change to: §4.8 "Lookup"'s status, `crates/ipc/src/protocol.rs`,
+`crates/ipc/tests/wire_order.txt`, `crates/api/src/error.rs` and `lib.rs`, `crates/client/src/client.rs`,
+`crates/server/src/verbs.rs` and `remote_attach.rs`, GAPS, and the bug record.
 
 ### A-399 — A Shards stream's close publishes nothing its write log holds, as a FUSE mount's does (2026-11-18, goal g268; a sibling A-339 recorded in GAPS)
 Applied in the same change to:
@@ -61633,6 +61664,21 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
   so none changes shape; a segment of layout 18 is refused at adoption, typed (`AnchorError::Layout`, the anchor's
   layout 19, `a_segment_from_before_digest_identities_is_refused_at_start`), as A-626's checkpoint version 4 to 5 was.
 - **Not yet.** No byte is dropped in this piece (4b-4d).
+- **4b, the read seam (2026-11-23).** Every reader outside the engine takes a file's content as `engine::Content` (a
+  current file's: `Bytes(&[u8])` or `Named(Identity)`) or `engine::ContentAt` (a file at a version: `Bytes(Cow)` or
+  `Named`) from `Green::content`, `files`, `held`, `content_ref_at`, `content_at`, `files_at` and `content_page_at`.
+  The engine's own reads and its tests take the byte readers (`content_bytes` and its siblings). A probe marking the
+  old readers deprecated found 25 production sites in 13 files. Some need only a path or a length (`Content::len`).
+  svn's held texts fall through to the content store, which reads the same identity. A rebase holds a changed file
+  whole over a named head file (`parts_over_base` with no base: the same bytes, nothing shared). Every other reader
+  refuses a named file typed through the error it has (`vcs_store::named_objects::bytes_of`, `NamedUnread`): git's map
+  `StepRefused::Named` (counted `vcs_paths.named_unread`, logged with the path and the green), hg's made changeset
+  `Unmade::Named` (`vcs.hg.named_unread`), a mount's read the host's try-again (`EAGAIN`, `ERROR_RETRY`), a work's base
+  `BaseGone`, a read page and a checkout `Unsupported`, svn's made view `Unreadable`. Nothing makes a named file yet,
+  so 4b has no failing-first test; the existing suites are its check (main's ruling). 4c+4d land as one piece: a named
+  block's hold of the content store with its bytes dropped, history reads through the plane, sync readers refusing
+  typed with their async callers bringing the object back (never pinned), `history::reanchor` checking a named
+  replace by its identity.
 - **Applied in the same change to** `crates/merge` (`dims`, `engine`, `engine/{copy,branch,copy_checkpoint}`,
   `identity` docs, `tests/origin.rs`, `tests/identity.golden`), `crates/anchor` (`layout`, `tests/anchor.rs`),
   `crates/vcs` (`ContentStore::object_id`'s doc), GAPS, amendments.tsv.
@@ -61658,3 +61704,76 @@ retirement; `landing.rs`: `abandon_presentations` removed, `forget_presentations
   then another client grants and lands; refused `NotFound` before), `a_presentation_goes_with_its_volume` (one
   awaiting after a destroy before, none after), `another_clients_presentation_still_replaces_and_the_bound_still_refuses`,
   and the CLI's session-grant test, red before and green after.
+
+### A-875 — On Windows the Node SDK opens its completion signal by name, a named pipe the bridge nudges (2026-11-23, w-interop; main 01a20182's order, moved from the Windows worker's queue; §4.7, D-19, D-10, A-179)
+Applied in the same change to: Phase 5's TypeScript task, GAPS ("The Node SDK suites on Windows"), `unsafe-budget.toml`
+(`slates-ipc` 169 → 179), `crates/ipc` (`completion_pipe.rs`, new; `completion.rs`, the Windows bridge's `Signal`,
+`start_pipe`, `run_pipe`; `endpoint.rs`, `enable_async_completion_pipe` in place of the Windows
+`enable_async_completion_dup`, and two tests; `stream_pipe.rs`, the name, descriptor and error helpers shared;
+`lib.rs`), `crates/client` (`enable_async_completion_pipe`), `crates/sdk-node` (`src/lib.rs` `completionPipe` beside
+`completionFd`, each on every platform and refusing off its own, since napi-rs registers a `#[napi] impl`'s methods by
+name whatever their `cfg`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sdk_async.test.mjs`), and
+`docs/bugs/2026-11-23-the-node-sdk-could-not-adopt-the-windows-completion-socket.md`.
+- **What failed.** CI run 45176536354, `sdk` job, both Windows legs: `async lifecycle over a live daemon` died at
+  `AsyncClient.create` with `CompletionLost { reason: "Unsupported fd type: UNKNOWN" }`. The Windows bridge's signal
+  is a loopback socket, and `net.Socket({ fd })` was handed a duplicate of it.
+- **Why no descriptor can serve [B: libuv `src/win/handle.c` `uv_guess_handle`; Node `lib/net.js` `createHandle`].**
+  On Windows libuv reads the value as a C runtime file descriptor (`uv__get_osfhandle`) and names it a pipe, a console
+  or a file by `GetFileType`, never a socket; Node accepts a pipe or a TCP handle and throws `ERR_INVALID_FD_TYPE`
+  for anything else. A socket handle is no C runtime descriptor, so it is unknown. A descriptor the addon made with its
+  own C runtime would be no better, since each module's C runtime keeps its own descriptor table.
+- **The rule.** On Windows the Node SDK's signal is a named pipe that `async.mjs` opens with `net.connect(name)`,
+  libuv's own pipe client, as node-pty opens its ConPTY pipes [C: microsoft/node-pty]. The pipe keeps A-179's
+  protections: a fresh 128-bit name, first instance only, one instance, remote clients refused, the owner alone
+  admitted. Since the SDK connects after the pipe is made, the bridge admits a reader only once the kernel names it
+  this process (`GetNamedPipeClientProcessId`); any other is cut off and counted, and the pipe listens again at the
+  bridge's next turn, at most one connect a turn. The reader gets only the eight-byte nudge, never a reply. The pipe
+  buffers one nudge, since an unread nudge is the whole signal. Until a reader is admitted, the bridge's thread waits
+  on the region's Event and on the connect together, so a reply that landed before the SDK connected is signalled as
+  it connects. Python's selector keeps the loopback socket (`enable_async_completion`), and one client signals one
+  of the two (the other is refused `Unsupported`). Unix is unchanged.
+- **Proven (main's diag runs on windows-latest: red 45225292920 at main, "Unsupported fd type: UNKNOWN"; with the
+  change 45230459274 at 20cd9025e, `slates-ipc` 8 of 8, the addon built, the async lifecycle past its pipe):**
+  - `slates-ipc`'s `the_windows_completion_pipe_is_opened_by_name_and_signals_only_an_armed_reply`: a second reader is
+    refused `ERROR_PIPE_BUSY`, the pipe stays quiet for a fast-path reply and holds a nudge for an armed one.
+  - `a_reply_that_landed_before_the_reader_connected_is_signalled_as_it_connects`: within half a second of the
+    connect, under the bridge's one-second timed look.
+  - `a_reader_of_another_process_is_cut_off_and_this_processs_reader_is_admitted`: the test binary run again opens the
+    name first and is cut off with nothing read; this process's open is then admitted and nudged.
+  - The Node suites on windows-latest: the red at main; with this change, 4 of 8 pass, and the other 4 (sync and
+    async alike) are refused `BudgetExceeded { available: 5722144768 }` at their first create. That refusal is the
+    Windows daemon's own sizing (w-win2's), and the suites' full green waits on it.
+
+### A-876 — A reader of a stored text holds the piece it fetched while it reads on in it (2026-11-23, w-svnperf for main 01a20182; goal 93: svnsync over svn:// and HTTP, svn:// update; C2 stage B part 2; A-749, A-751)
+
+- **Why.** Since C2 stage B part 2 (b) no RAM keeps a committed text once its revision stands: a reader reads it back
+  a piece (`slates_store::store::PIECE_BYTES`, 64 KiB) at a time through `svn_texts::fetch_piece`, one round trip to
+  the store's owner thread a piece. Each reader let its piece go after the one call that waited for it. But a call runs
+  the drive for one shard quantum (A-751), and each window step reads at most `STEP_WORK` (1,024) bytes, so a call read
+  a few KiB of the piece, and the next call fetched it again from where the drive stood. Main's r70 (the big Studio,
+  quiet, main 33b5fe7b1, `an_svnsync_measured` over git-2000): svnsync fetched 28.4 pieces a revision over svn:// and
+  28.1 over HTTP, and over svn:// waited 3.42 ms a revision on them, of a 146.1 ms revision that svnsync's own mirror
+  commits bound (`vcs_svn.write_wait_ns`, 125.9 ms).
+- **The rule.** A reader holds the one piece it fetched while it reads on in it. It lets it go when it waits for
+  another piece, when its read's answer ends (`Connection::fetching`), before its conversation moves to another
+  shard, or by its drop. Still one piece a reader, the bound `svn_texts::Pieces` counts.
+- **Where.** `svn_view::FetchedPiece`, beside `SvnHold`: fetched through `fetch_piece`, given back through `let_go` by
+  its drop, on the shard whose pieces hold it, so a reader dropped mid-read (a reaped connection) leaks nothing; it is
+  made only once the fetch succeeds, so a failed fetch gives back no other reader's hold. The two `SvnStores` traits'
+  `fetch` return it, and their `let_go` is gone. The svn:// listener (`vcs_svn`), the SSH tunnel (`vcs_ssh::svn`) and
+  DAV's report (`vcs_http::svn`: its first slices hold the piece in the exchange, so its later slices read on in it)
+  follow the rule. DAV's GET and the export's walk (`TextSource::read_step`) read a fetched piece whole in one call, so
+  they let it go after it, as before.
+- **A leak fixed with it.** DAV's first slices kept their piece in a local: a wait met with output already pending
+  returned the report and dropped the local without letting the piece go, so its hold stayed in `Pieces` for good.
+- **Tests** (debug, this MacBook, load 30 to 65). Each holds the pieces fetched to one a piece of the text read,
+  `len.div_ceil(PIECE_BYTES)`, and that no piece is kept after. Red before, green after:
+  `vcs_svn::tests::a_replay_fetches_each_piece_of_a_stored_text_once` (a 300 KiB text no longer the head's, replayed
+  over svn:// as svnsync asks a revision: 28 fetches, now at most 5);
+  `vcs_ssh::svn::tests::a_checkout_reads_a_text_ram_does_not_hold_through_the_store` and
+  `a_get_file_revs_reads_a_text_ram_does_not_hold_through_the_store` (200 KiB: 12, now at most 4). New after the fix,
+  its before r70's 28.1 a revision: `vcs_http::svn::tests::a_replay_report_fetches_each_piece_of_a_stored_text_once`.
+  Guards that held before and after: DAV's GET, the tunnel's get-file, both hook views, a commit's whole bring, and the
+  export (two exports of two walks each: 15 fetches of a bound of 16).
+- **Applied in the same change to** `crates/server` (`vcs_store/svn_view`, `vcs_store/svn_texts`'s `Pieces` doc,
+  `vcs_svn`, `vcs_ssh/svn`, `vcs_http/svn`, and the tests named above), GAPS, amendments.tsv.

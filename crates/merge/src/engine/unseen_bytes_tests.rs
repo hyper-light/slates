@@ -106,7 +106,7 @@ fn classes(outcome: &Outcome) -> Result<Vec<MergeConflictClass>, String> {
 /// A file's bytes at the head, as text.
 fn text(green: &Green, path: &str) -> Option<String> {
   green
-    .content(path)
+    .content_bytes(path)
     .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
 }
 
