@@ -1,0 +1,73 @@
+name: diag-measurer
+
+# main 01a20182 (2026-11-22): 84a macOS arm M1 (A-868, the doorbell thread in the real-time band). A = main (3241ae61e, the doorbell time-share
+# wake) against B = main now (__B__, with A-867: a client's synchronous park waits on its region's Mach semaphore, the
+# send right carried with the region's fileport). Arms alternating, 8 rounds, each a quiet run and a loaded run (two
+# spinners a CPU, accept and conflict on 10 files). The bar: every loaded p99 and p999 under 1 ms. Diagnostics only:
+# never main.
+
+on:
+  push:
+    branches: ["diag-measurer-main-84a-mac-bell"]
+
+env:
+  CARGO_TERM_COLOR: never
+  ARMS: "3241ae61ed82425caa3bd682397a7b2b9eeca55c 7b3dd6fe67611d64f1b82470061d77d6a2f791d2"
+  ROUNDS: "8"
+
+jobs:
+  mac-confirm:
+    name: mac bell A/B (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: Build both arms
+        run: |
+          W="$RUNNER_TEMP/msr"; mkdir -p "$W/logs"
+          echo "runner cpus $(sysctl -n hw.ncpu)"; sw_vers 2>/dev/null || true
+          for arm in $ARMS; do
+            s="${arm:0:9}"; mkdir -p "$W/src-$s" "$W/bin-$s"
+            git archive --format=tar "$arm" | tar -xmf - -C "$W/src-$s"
+            ( cd "$W/src-$s" && CARGO_TARGET_DIR="$W/target-$s" cargo build --release --locked -p slates-client --example edit_merge_bench ) > "$W/logs/build-$s.log" 2>&1 \
+              || { tail -40 "$W/logs/build-$s.log"; exit 1; }
+            cp "$W/target-$s/release/examples/edit_merge_bench" "$W/bin-$s/"
+            rm -rf "$W/target-$s"
+          done
+      - name: Rounds, arms alternating, each a quiet run and a loaded run
+        run: |
+          W="$RUNNER_TEMP/msr"; set +e
+          for round in $(seq 1 "$ROUNDS"); do
+            if [ $((round % 2)) -eq 1 ]; then ORDER="$ARMS"; else ORDER="$(echo $ARMS | awk '{print $2, $1}')"; fi
+            for arm in $ORDER; do
+              s="${arm:0:9}"
+              Q="$W/logs/quiet-$s-r$round.log"
+              perl -e 'alarm shift; exec @ARGV' 900 "$W/bin-$s/edit_merge_bench" --quiet-only --files 10 --form accept --form conflict </dev/null > "$Q" 2>&1
+              echo "== quiet $s r$round exit $?"; grep -E "^goal" "$Q" | cut -c1-200
+              L="$W/logs/loaded-$s-r$round.log"
+              echo "== loaded $s r$round $(date -u +%FT%TZ) load: $(uptime)" | tee "$L"
+              perl -e 'alarm shift; exec @ARGV' 1500 "$W/bin-$s/edit_merge_bench" --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict </dev/null >> "$L" 2>&1
+              echo "exit $?" >> "$L"
+              grep -E "^goal|^exit|semaphore" "$L" | sort -u | cut -c1-200
+            done
+          done
+          true
+      - name: Keep the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-bell-logs-${{ matrix.os }}
+          path: ${{ runner.temp }}/msr/logs
+          if-no-files-found: warn
