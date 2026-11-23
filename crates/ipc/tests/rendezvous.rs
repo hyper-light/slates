@@ -621,6 +621,125 @@ fn a_client_that_connects_and_leaves_holds_no_descriptor_of_its_region() {
   );
 }
 
+/// Format: the variable that turns this binary into [`capped_claim_role`], naming the instance it serves.
+#[cfg(target_os = "linux")]
+const CHILD_CAPPED_ROLE: &str = "SLATES_RENDEZVOUS_CAPPED_CHILD";
+/// Format: the tag before the line [`capped_claim_role`] writes, since libtest's banner shares its standard output.
+#[cfg(target_os = "linux")]
+const CAPPED_TAG: &str = "slates-capped-claim:";
+/// Format: the name [`capped_claim_role`] makes its regions under.
+#[cfg(target_os = "linux")]
+const CAPPED_REGION_PREFIX: &str = "slates-cr-capped";
+
+/// The process [`a_claim_refused_for_want_of_a_descriptor_leaves_none_of_its_region`] runs: a daemon end and a claim on
+/// it, in this one process, whose descriptors are capped as the claim is prepared at one past the lowest number free.
+/// Its region made, that leaves one descriptor for the hand-off, which needs more, so the claim is refused. It lifts the
+/// cap once the claim has been refused and writes, tagged, how many refusals it met and how many descriptors of its
+/// region remain. Passes trivially when not the child.
+#[cfg(target_os = "linux")]
+#[test]
+fn capped_claim_role() {
+  use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+  use std::os::fd::AsRawFd;
+  toy_seal::install();
+  let Ok(instance) = std::env::var(CHILD_CAPPED_ROLE) else {
+    return;
+  };
+  let limit = getrlimit(Resource::Nofile);
+  let mut listener = Listener::open(&instance, None).unwrap();
+  let mut claim = begin_connect_as(&instance, 0).unwrap();
+  let mut refusals = 0usize;
+  let mut claim_ended = false;
+  let started = Instant::now();
+  while refusals == 0 && !claim_ended && started.elapsed() < Duration::from_nanos(CLAIM_WAIT_NS) {
+    let round = listener.accept_pending(
+      &|_| false,
+      &mut |client_id| {
+        let region = ClientRegion::create(
+          &format!("{CAPPED_REGION_PREFIX}-{}-{client_id}", std::process::id()),
+          client_id,
+          0,
+          geometry(),
+        )?;
+        // Every number below the lowest free one is open, so a cap one past it leaves exactly one to give.
+        let lowest_free = rustix::io::fcntl_dupfd_cloexec(std::io::stdout(), 0).unwrap();
+        let cap = u64::try_from(lowest_free.as_raw_fd()).unwrap() + 1;
+        drop(lowest_free);
+        setrlimit(
+          Resource::Nofile,
+          Rlimit {
+            current: Some(cap),
+            maximum: limit.maximum,
+          },
+        )
+        .unwrap();
+        Ok(Prepared {
+          region,
+          kick_fd: None,
+        })
+      },
+      &mut |_refusal| refusals += 1,
+    );
+    assert!(
+      round.accepted.is_empty(),
+      "a claim one descriptor short of its hand-off is never seated"
+    );
+    claim_ended = claim.poll().is_err();
+  }
+  setrlimit(Resource::Nofile, limit).unwrap();
+  println!(
+    "{CAPPED_TAG}refused={refusals} remaining={}",
+    region_descriptors(CAPPED_REGION_PREFIX)
+  );
+}
+
+/// The sibling of [`a_client_that_connects_and_leaves_holds_no_descriptor_of_its_region`] on the daemon's side
+/// (docs/bugs/2026-11-23-every-linux-client-connect-left-its-regions-descriptor-open.md): a claim refused for want of a
+/// descriptor leaves none of its region behind. Do: re-invoke this binary as [`capped_claim_role`], whose daemon end
+/// prepares a claim with one descriptor left for the hand-off, and read its tagged line. Expect the claim refused, and
+/// no descriptor of its region remaining once the refusal is over. Before, the hand-off duplicated the region's
+/// descriptor first and took ownership of the duplicate only after the shard's kick was made, so the kick's `eventfd`
+/// refused `EMFILE` returned before it and the duplicate stayed open for the daemon's life: exactly under exhaustion,
+/// where a descriptor counts the most.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_claim_refused_for_want_of_a_descriptor_leaves_none_of_its_region() {
+  let instance = format!("test-capped-{}", std::process::id());
+  let exe = std::env::current_exe().unwrap();
+  let output = Command::new(exe)
+    .args(["--exact", "capped_claim_role", "--nocapture"])
+    .env(CHILD_CAPPED_ROLE, &instance)
+    .output()
+    .unwrap();
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  // libtest's `test <name> ... ` comes glued to the role's first line, so the tag is looked for anywhere in a line.
+  let line = stdout
+    .lines()
+    .find_map(|line| line.split_once(CAPPED_TAG).map(|(_, rest)| rest.to_owned()))
+    .unwrap_or_else(|| {
+      panic!(
+        "the role wrote its line: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+      )
+    });
+  assert!(output.status.success(), "the role passed: {output:?}");
+  let value = |key: &str| {
+    line
+      .split_whitespace()
+      .find_map(|pair| pair.strip_prefix(key))
+      .and_then(|number| number.parse::<usize>().ok())
+  };
+  assert!(
+    value("refused=").is_some_and(|refused| refused > 0),
+    "the claim was refused for want of a descriptor: {line}"
+  );
+  assert_eq!(
+    value("remaining="),
+    Some(0),
+    "no descriptor of the refused claim's region left: {line}"
+  );
+}
+
 /// AUD-29-20 (found on CI 2026-10-01: a Node SDK recovery failed every call `OsRefused { call: "recvmsg",
 /// code: Some(104) }`). Do: begin a claim on a daemon end, then close the daemon end before it answers — as a
 /// daemon killed with the claim in its backlog — and poll the claim until it ends. Expect: `DaemonUnavailable`,
