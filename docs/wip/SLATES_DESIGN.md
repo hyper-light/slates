@@ -8972,9 +8972,10 @@ entry is sent on as it lies (A-859 part B).
 
 > **Status (2026-11-22, A-859 part A).** A git fetch priced a byte at memcpy's 0.14 ns, so nothing
 > it encoded deflated or deltified: git/git's clone went 3-4 GiB where stock's pack is ~300 MB. Now a
-> fetched byte is priced at its link as above, cold at deflate's measured break-even. Owed (GAPS):
-> the SSH edge's link (its writes are not yet heard, so SSH fetches price cold), a price per client
-> rather than per shard, and the archive's own question below.
+> fetched byte is priced at its link as above, cold at deflate's measured break-even, learned from
+> the HTTP edge's writes and the SSH edge's alike (each socket write's time and whether it waited,
+> told the git command the connection carries). Owed (GAPS): a price per client rather than per
+> shard, and the archive's own question below.
 
 > **Status (2026-10-20).** The cost model above ran with no inputs in some builds and not
 > others until this date. The boot profile's codec probe was compiled out wherever

@@ -931,18 +931,36 @@ impl<S: SshSite> Link<S> {
     let bytes = self.session.pending_output().to_vec();
     let marker = self.marker(overdue);
     let timer_ns = self.session.next_timer_ns();
-    let outcome = awaited(
-      self.stream.write_some(&bytes),
-      deadline_ns,
-      timer_ns,
-      marker,
-    )
-    .await;
+    // A-859 part A on SSH: the write's time and whether it found the socket full, as the HTTP edge's `Socket::write`
+    // says them, heard by the command it carries (`site::Command::paced`).
+    let started_ns = now_ns();
+    let pended = core::cell::Cell::new(false);
+    let outcome = {
+      let mut write = std::pin::pin!(self.stream.write_some(&bytes));
+      let watched = std::future::poll_fn(|cx| {
+        let polled = write.as_mut().poll(cx);
+        pended.set(pended.get() || polled.is_pending());
+        polled
+      });
+      awaited(watched, deadline_ns, timer_ns, marker).await
+    };
     match self.settle(outcome)? {
       // A socket that takes every write at once never parks the connection, so the loop yields after each: one write
       // and one offer a poll, however fast the client reads (main 01a20182's fixture round, 2026-11-21: one poll of an
       // SSH clone ran 3.5 s in `vcs_ssh::offer`, the daemon killed mid-answer).
       Some(Ok(taken)) => {
+        let sent = crate::vcs_store::upload::Sent {
+          bytes: u64::try_from(taken).unwrap_or(u64::MAX),
+          ns: now_ns().saturating_sub(started_ns),
+          waited: pended.get(),
+        };
+        if let Some(command) = self
+          .running
+          .as_mut()
+          .and_then(|running| running.command.as_mut())
+        {
+          command.paced(sent);
+        }
         let consumed = self.session.consume_output(taken).map_err(|_| Why::Refused);
         yield_now().await;
         consumed
