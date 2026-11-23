@@ -17,14 +17,14 @@ env:
   RED: 064674a8d0a7b9b934a30f54ad4aef10dc7bccbd
 
 jobs:
-  checks:
-    name: checks (${{ matrix.os }})
+  red:
+    name: red arm (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os: [windows-latest, windows-11-arm]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    timeout-minutes: 60
     defaults:
       run:
         shell: bash
@@ -35,48 +35,63 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
-      - name: NASM (x86_64 Windows)
-        if: matrix.os == 'windows-latest'
-        uses: ilammy/setup-nasm@v1.5.2
-      - name: clang-cl (arm64 Windows)
-        if: matrix.os == 'windows-11-arm'
-        shell: pwsh
-        run: |
-          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
-          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
-          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
-          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: "Red: item 3's rendezvous test on the commit before its fix"
         run: |
-          red="$RUNNER_TEMP/red"; mkdir -p "$red"
-          git archive "$RED" | tar -x -C "$red"
+          red="$(cygpath -u "$RUNNER_TEMP")/red"; mkdir -p "$red"
+          git archive --format=tar "$RED" | tar -x -f - -C "$red"
           cd "$red"
           set +e
           CARGO_TARGET_DIR="$RUNNER_TEMP/red-target" cargo test -p slates-ipc --lib an_anchor_that_lets_go 2>&1 | grep -v '^\s*Compiling '
           code=${PIPESTATUS[0]}
           echo "red arm exit $code"
           if [ "$code" -eq 0 ]; then echo "UNEXPECTED: the test passed without its fix"; exit 1; fi
-      - name: "Green, item 3: the rendezvous tests"
-        if: ${{ !cancelled() }}
-        run: cargo test -p slates-ipc --lib rendezvous::platform
-      - name: "Green, item 1: the large path's live figures"
-        if: ${{ !cancelled() }}
-        run: 'cargo test -p slates-mem --lib large::'
-      - name: "Green, item 2: the base host over the disk"
-        if: ${{ !cancelled() }}
-        run: cargo test -p slates-base --test host
-      - name: "Green, item 3: the client driver across restart and death"
-        if: ${{ !cancelled() }}
-        env:
-          AWS_LC_SYS_PREBUILT_NASM: "0"
-        run: cargo test -p slates-client --test driver
-      - name: "Green, item 4: an observation's task label"
-        if: ${{ !cancelled() }}
-        env:
-          AWS_LC_SYS_PREBUILT_NASM: "0"
-        run: cargo test -p slates-server --lib daemon::tests::an_observations_task_is_labelled_where_its_asker_asked -- --test-threads=1
+
+  driver-ab:
+    name: client driver A/B (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: ilammy/setup-nasm@v1.5.2
+      - name: Build both arms (the fix, and the commit before it)
+        run: |
+          root="$(cygpath -u "$RUNNER_TEMP")"
+          mkdir -p "$root/before"
+          git archive --format=tar "$RED" | tar -x -f - -C "$root/before"
+          cargo test -p slates-client --test driver --no-run 2>&1 | grep -v '^\s*Compiling '
+          (cd "$root/before" && CARGO_TARGET_DIR="$RUNNER_TEMP/before-target" cargo test -p slates-client --test driver --no-run 2>&1 | grep -v '^\s*Compiling ')
+      - name: "Run each test alone, each arm, three rounds, each run bounded at 60 s"
+        run: |
+          root="$(cygpath -u "$RUNNER_TEMP")"
+          fixed=$(cargo test -p slates-client --test driver --no-run 2>&1 | sed -n 's/.*Executable .*(\(.*\.exe\)).*/\1/p' | tail -1 | tr '\\' '/')
+          before=$(cd "$root/before" && CARGO_TARGET_DIR="$RUNNER_TEMP/before-target" cargo test -p slates-client --test driver --no-run 2>&1 | sed -n 's/.*Executable .*(\(.*\.exe\)).*/\1/p' | tail -1 | tr '\\' '/')
+          case "$before" in /*|[A-Za-z]:*) ;; *) before="$root/before/$before";; esac
+          echo "fixed=$fixed before=$before"
+          tests="a_call_whose_daemon_is_gone_ends_before_the_old_reply_deadline a_chained_call_is_reported_at_each_step_until_it_ends a_held_daemons_calls_are_waited_for_and_answered_and_a_cancel_releases_at_once a_ready_call_is_reported_once_until_it_is_finished every_call_ends_and_the_loop_is_never_held_across_restart_and_death"
+          for round in 1 2 3; do
+            for arm in fixed before; do
+              exe=$fixed; [ "$arm" = before ] && exe=$before
+              for name in $tests; do
+                log="$root/driver-$arm-$round-$name.log"
+                started=$(date +%s)
+                timeout 60 "$exe" --exact "$name" --test-threads=1 > "$log" 2>&1; code=$?
+                echo "=== round $round $arm $name: exit $code after $(( $(date +%s) - started )) s"
+                if [ "$code" -ne 0 ]; then
+                  grep -E 'panicked at|after the daemon|DaemonGone|answered after|refused at once|non-vacuous|^  left|^ right|has been running' "$log" | head -12
+                fi
+              done
+            done
+          done
 
   shards-hang:
     name: shards hang (windows-latest)
@@ -114,10 +129,10 @@ jobs:
               instance=$(sed -n 's/.*instance \(cr[0-9]*\) up.*/\1/p' "$log" | head -1)
               echo "--- the resync test's instance: $instance"
               "$slates" --instance "$instance" status 2>&1 | grep -i 'shards\|holder\|resync\|pid\|attach' || true
-              echo "--- processes"
-              tasklist //v 2>&1 | grep -i 'slates\|shards' || true
-              echo "--- the run's log, derived values left out"
-              grep -v 'slates daemon: [a-z_0-9]* = \|slates anchor: a \|slates anchor: issuer' "$log"
+              echo "--- processes, with their parents and command lines"
+              pwsh -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { \$_.Name -match 'slates|shards' } | ForEach-Object { '{0} parent {1} started {2}: {3}' -f \$_.ProcessId, \$_.ParentProcessId, \$_.CreationDate, \$_.CommandLine }" || true
+              echo "--- the run's log whole, derived values alone left out"
+              grep -v 'slates daemon: [a-z_0-9]* = ' "$log"
               winpid=$(cat "/proc/$bg/winpid" 2>/dev/null || echo "")
               [ -n "$winpid" ] && taskkill //T //F //PID "$winpid" || true
               exit 1

@@ -763,7 +763,10 @@ fn read_across_a_kill(
   }
   let (code, status, error) = run(instance, &["status"]);
   assert_eq!(code, 0, "status: {error}");
-  kill_hard(value_of(&status, "pid").parse().unwrap());
+  let doomed: u32 = value_of(&status, "pid").parse().unwrap();
+  eprintln!("diag-w-win: harness {instance} kills daemon {doomed}");
+  kill_hard(doomed);
+  eprintln!("diag-w-win: harness {instance} killed daemon {doomed}");
   // Each line is read without a timeout: the probe writes while it lives, and its end closes its output, which ends the
   // read. Until 2026-11-20 each line was also checked against a 120 s `RESYNC_WAIT`, only after it had come.
   let mut read = None;
@@ -811,8 +814,11 @@ fn resyncer() -> ! {
   eprintln!("diag-w-win: resyncer {} read the file", std::process::id());
   println!("{READY_LINE}");
   std::io::stdout().flush().unwrap();
+  eprintln!("diag-w-win: resyncer {} waits for its Resync", std::process::id());
   let read = slates_ipc::stream::read_waiting(channel.as_handle(), &mut message).unwrap();
+  eprintln!("diag-w-win: resyncer {} read {read} bytes on its channel", std::process::id());
   let resync = HandedResync::parse(&message[..read]).unwrap();
+  eprintln!("diag-w-win: resyncer {} parsed its Resync, holder {}", std::process::id(), resync.holder);
   assert!(
     resync.resyncs(&attached),
     "the resync names its attachment and token"
