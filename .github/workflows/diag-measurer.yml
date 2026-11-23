@@ -89,11 +89,11 @@ jobs:
           hits = list(walk(json.load(open(sys.argv[1]))))
           for kind in kinds:
               print(kind, sum(h.get("count", 0) for h in hits if h.get("kind") == kind))' $RUNNER_TEMP/matrix-hg/status.json || true
-          echo "== DIAG what holds memory right after push-all (content_range.*, mem.gauge.*)"; python3 -c 'import json,sys
+          echo "== DIAG what holds memory right after push-all (content_range.*, mem.gauge.*, vcs.hg.push_*)"; python3 -c 'import json,sys
           def walk(o):
               if isinstance(o, dict):
                   k = o.get("kind")
-                  if isinstance(k, str) and (k.startswith("content_range.") or k.startswith("mem.gauge.")): yield o
+                  if isinstance(k, str) and (k.startswith("content_range.") or k.startswith("mem.gauge.") or k.startswith("vcs.hg.push_")): yield o
                   for v in o.values(): yield from walk(v)
               elif isinstance(o, list):
                   for v in o: yield from walk(v)
@@ -101,11 +101,11 @@ jobs:
           for h in walk(json.load(open(sys.argv[1]))):
               totals[h["kind"]] = totals.get(h["kind"], 0) + (h.get("count") or h.get("value") or 0)
           for kind in sorted(totals): print(kind, totals[kind])' $RUNNER_TEMP/matrix-hg/status-after-push.json || true
-          echo "== DIAG what holds memory after idle (content_range.*, mem.gauge.*, content.purge*)"; python3 -c 'import json,sys
+          echo "== DIAG what holds memory after idle (content_range.*, mem.gauge.*, vcs.hg.push_*, content.purge*)"; python3 -c 'import json,sys
           def walk(o):
               if isinstance(o, dict):
                   k = o.get("kind")
-                  if isinstance(k, str) and (k.startswith("content_range.") or k.startswith("mem.gauge.") or k.startswith("content.purge")): yield o
+                  if isinstance(k, str) and (k.startswith("content_range.") or k.startswith("mem.gauge.") or k.startswith("vcs.hg.push_") or k.startswith("content.purge")): yield o
                   for v in o.values(): yield from walk(v)
               elif isinstance(o, list):
                   for v in o: yield from walk(v)
