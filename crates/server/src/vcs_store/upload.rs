@@ -306,7 +306,7 @@ fn note_peak(resident: &crate::vcs_http::git::upload::Resident) {
 /// that end at or before where it reads, and every one of another pack (a pack is read front to back, each in turn);
 /// every one with no `next`. A window a home holds here is kept (`vcs_store::let_go_read`'s `Pinned`); one met again
 /// later is brought back again, its stop and look-ahead as before.
-fn let_go_behind(
+pub(crate) fn let_go_behind(
   state: &mut ShardState,
   resident: &mut crate::vcs_http::git::upload::Resident,
   next: Option<slates_git::store::packed::Waited>,

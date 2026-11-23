@@ -1100,3 +1100,93 @@ fn t_a864_a_fetchs_look_ahead_brings_back_a_turns_windows_never_its_pack() {
   assert_eq!(stopped, Some(vec![false, false, true, false]));
   assert_eq!(counted, Some((Some(2), Some(1))));
 }
+
+/// A-864 piece 3 (main 01a20182's ruling of 2026-11-22: residency at its peak a turn's windows, never a pack's). Do: on a
+/// store-backed daemon, let a four-window pack go as the look-ahead test does; bring back what a fetch's next turn reads
+/// from its first byte; then let go behind a cursor in its third window. Expect: the first two windows held while the
+/// cursor reads them, the answer's resident set two; once the cursor has passed them, both handed to
+/// `vcs_store::let_go_read` and the resident set empty (a one-shard daemon's windows are pinned by their home, there,
+/// so they stay held, as 2b(a) rules, counted let go nowhere); the most held at once (`git_resident.peak_windows`) two.
+#[test]
+fn t_a864_a_fetch_lets_go_again_the_windows_its_cursor_has_passed() {
+  use slates_git::store::packed::Waited;
+  use slates_vcs::ContentId;
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (sent, got) = std::sync::mpsc::channel();
+  crate::daemon::observe_first(&daemon, move |state| {
+    let _ = crate::git_push::tests::git_repository(state, "behind");
+    let window = state
+      .vcs_stores
+      .content()
+      .map_or(1 << 18, slates_vcs::ContentStore::window);
+    let bytes: Vec<u8> = (0..3 * window + 100)
+      .map(|at| u8::try_from(at % 251).unwrap())
+      .collect();
+    let len = u64::try_from(bytes.len()).unwrap();
+    let root = crate::vcs_store::within_budget(state, len, |stores| {
+      stores.content_mut().unwrap().put_object(&bytes).unwrap()
+    });
+    let header = slates_store::log::Header {
+      tool: slates_store::log::Tool::Git,
+      repository: 1,
+      sequence: 0,
+      judged_over: 0,
+      grant: 0,
+      work: 0,
+      time_ns: slates_rt::futures::now_ns(),
+      sections: 0,
+    };
+    let parts = vec![(slates_store::log::SectionKind::Payload, bytes.clone())];
+    assert!(crate::test_store::land_blocking(
+      state.vcs_disk.clone().unwrap(),
+      header,
+      parts
+    ));
+    crate::vcs_store::within_budget(state, 0, |stores| {
+      let content = stores.content_mut().unwrap();
+      for id in bytes.chunks(window).map(ContentId::of) {
+        assert!(content.mark_landed(&id) && content.let_go(&id).is_ok());
+      }
+    });
+    let step = u64::try_from(window).unwrap();
+    let away = move |state: &mut crate::state::ShardState| -> Vec<bool> {
+      let content = state.vcs_stores.content().unwrap();
+      (0..4u64)
+        .map(|index| content.away_window(&root, len, index * step).is_some())
+        .collect()
+    };
+    let task = slates_rt::futures::spawn(async move {
+      let at = |offset| Waited {
+        pack: root,
+        len,
+        offset,
+      };
+      let mut resident = Vec::new();
+      super::read_ahead(
+        crate::vcs_http::git::upload::PackReads {
+          next: Some(at(0)),
+          stopped: None,
+        },
+        &mut resident,
+      )
+      .await;
+      let held = (crate::state::with_state(away), resident.len());
+      let after = crate::state::with_state(|state| {
+        super::let_go_behind(state, &mut resident, Some(at(2 * step + 1)));
+        (
+          away(state),
+          state.refusals.get(super::LET_GO_BEHIND).copied(),
+          state.refusals.get(super::PEAK_WINDOWS).copied(),
+        )
+      });
+      let _ = sent.send((held, after, resident.len()));
+    })
+    .unwrap();
+    slates_rt::futures::detach(task).unwrap();
+  });
+  let (held, after, left) = got.recv().expect("let go behind");
+  daemon.stop();
+  assert_eq!(held, (Some(vec![false, false, true, true]), 2));
+  assert_eq!(after, Some((vec![false, false, true, true], None, Some(2))));
+  assert_eq!(left, 0);
+}
