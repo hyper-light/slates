@@ -8,7 +8,7 @@ use slates_vcs::{ContentId, ContentStore};
 
 use crate::Admission;
 use crate::object_name::{Kind, ObjectFormat, ObjectId};
-use crate::store::packed::{Base, Bases, InPack, PackedRefused, Scratch, read};
+use crate::store::packed::{Base, Bases, InPack, PackedRefused, Scratch, Waited, read};
 use crate::store::{GitNaming, Incoming, Push, Repository, StoredAt};
 use crate::unpack::{self, NoIndex, Outside};
 
@@ -1002,12 +1002,7 @@ fn r165_an_encodings_object_read_past_its_header_reads_stops_at_a_window_let_go_
     let mut stopped_at_the_read = None;
     for _ in 0..100_000 {
       if let_go && stopped_at_the_read.is_none() && encoding.reading_unread_in_pack() {
-        for window in pack.chunks(PIECE2_WINDOW).map(ContentId::of) {
-          if !store.is_away(&window) {
-            assert!(store.mark_landed(&window));
-            store.let_go(&window).unwrap();
-          }
-        }
+        let_go_every_window(&mut store, &pack);
         stopped_at_the_read = Some(false);
       }
       let turn = Turn {
@@ -1025,21 +1020,10 @@ fn r165_an_encodings_object_read_past_its_header_reads_stops_at_a_window_let_go_
         if stopped_at_the_read == Some(false) {
           stopped_at_the_read = Some(true);
         }
-        let (window, start, len) = store
-          .away_window(&waited.pack, waited.len, waited.offset)
-          .expect("the window met is let go");
-        let from = usize::try_from(start).unwrap();
-        let to = from + usize::try_from(len).unwrap();
-        store.bring_back(&window, &pack[from..to]).unwrap();
+        bring_back_the_window_met(&mut store, &pack, &waited);
       }
     }
-    for (at, window) in pack.chunks(PIECE2_WINDOW).enumerate() {
-      let id = ContentId::of(window);
-      if store.is_away(&id) {
-        store.bring_back(&id, window).unwrap();
-      }
-      let _ = at;
-    }
+    bring_back_every_window(&mut store, &pack);
     let clone = super::Answer::objects(&super::reached_now(&repository, &store, 1));
     let (cloned, _) = super::streamed(&repository, &store, clone, u64::MAX);
     (stopped_at_the_read, cloned)
@@ -1052,6 +1036,36 @@ fn r165_an_encodings_object_read_past_its_header_reads_stops_at_a_window_let_go_
     "the read's turn stopped at a let-go window"
   );
   assert!(kept_again == kept, "the same clone of the same fragments");
+}
+
+/// Lets go every `PIECE2_WINDOW` window of `pack` the store still holds, each marked landed first.
+fn let_go_every_window(store: &mut ContentStore, pack: &[u8]) {
+  for window in pack.chunks(PIECE2_WINDOW).map(ContentId::of) {
+    if !store.is_away(&window) {
+      assert!(store.mark_landed(&window));
+      store.let_go(&window).unwrap();
+    }
+  }
+}
+
+/// Brings back the window of `pack` a turn stopped at (`waited`), from the pack's own bytes.
+fn bring_back_the_window_met(store: &mut ContentStore, pack: &[u8], waited: &Waited) {
+  let (window, start, len) = store
+    .away_window(&waited.pack, waited.len, waited.offset)
+    .expect("the window met is let go");
+  let from = usize::try_from(start).unwrap();
+  let to = from + usize::try_from(len).unwrap();
+  store.bring_back(&window, &pack[from..to]).unwrap();
+}
+
+/// Brings back every `PIECE2_WINDOW` window of `pack` still let go.
+fn bring_back_every_window(store: &mut ContentStore, pack: &[u8]) {
+  for window in pack.chunks(PIECE2_WINDOW) {
+    let id = ContentId::of(window);
+    if store.is_away(&id) {
+      store.bring_back(&id, window).unwrap();
+    }
+  }
 }
 
 /// Lets go every window of `windows` the store holds and `brought` does not name: a let-go since a read last met it.

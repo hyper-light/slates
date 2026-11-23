@@ -1364,6 +1364,26 @@ impl<A: Answered> Upload<A> {
     Stage::Loose { from }
   }
 
+  /// The object [`Self::loose`] takes this turn, and the stage after it: the one a delta's base put ahead, else the
+  /// order's object at `from`. `Err` with the stage to go on to when the turn takes none: the order is done (the
+  /// trailer), or its object was placed already, ahead of its turn as a delta's base.
+  fn loose_next(&mut self, from: u64) -> Result<(u64, Stage), Stage> {
+    if let Some(position) = self.ahead.pop() {
+      return Ok((position, Stage::Loose { from }));
+    }
+    let Some(&(_, _, position)) = usize::try_from(from).ok().and_then(|at| self.order.get(at))
+    else {
+      return Err(Stage::Trailer);
+    };
+    let next = Stage::Loose {
+      from: from.saturating_add(1),
+    };
+    if self.loose_at.contains_key(&position) {
+      return Err(next);
+    }
+    Ok((position, next))
+  }
+
   /// One object no part covered (module docs, **What it sends** 3): encoded with the fragments' encoder when it is a
   /// window long at most; past a window, searched against the earlier ones past a window when the request's admission
   /// holds the search, and sent whole otherwise (`loose_large`).
@@ -1373,31 +1393,12 @@ impl<A: Answered> Upload<A> {
     from: u64,
     out: &mut impl Out,
   ) -> Result<Stage, StoreRefused> {
-    let (position, next) = match self.ahead.pop() {
-      Some(position) => (position, Stage::Loose { from }),
-      None => {
-        let Some(&(_, _, position)) = usize::try_from(from).ok().and_then(|at| self.order.get(at))
-        else {
-          return Ok(Stage::Trailer);
-        };
-        let next = Stage::Loose {
-          from: from.saturating_add(1),
-        };
-        // Placed already, ahead of its turn as a delta's base.
-        if self.loose_at.contains_key(&position) {
-          return Ok(next);
-        }
-        (position, next)
-      }
+    let (position, next) = match self.loose_next(from) {
+      Ok(taken) => taken,
+      Err(stage) => return Ok(stage),
     };
     let (id, row, stored) = cx.repository.stored_at(cx.store, position)?;
-    // Its placement is charged once (codex-review, 2026-11-22: a retaken object charged again made the count of a
-    // released pack's stops decide whether a request fit): one charged before a stop or its base's turn keeps its charge.
-    if !self.prepaid.remove(&position) {
-      cx.admission
-        .charge_items::<(u64, u64)>(1)
-        .map_err(|_| StoreRefused::PackTooLarge)?;
-    }
+    self.charge_placement_once(cx, position)?;
     self.loose_at.insert(position, self.at);
     match self.reused(cx, (id, &row, stored, position), out)? {
       Reuse::Sent(pending) => {
@@ -1438,6 +1439,33 @@ impl<A: Answered> Upload<A> {
       bytes,
       named: None,
     };
+    self.encode_loose(cx, object, out)?;
+    Ok(next)
+  }
+
+  /// Charges the placement of the object at `position` to the request's admission once (codex-review, 2026-11-22: a
+  /// retaken object charged again made the count of a released pack's stops decide whether a request fit): one charged
+  /// before a stop or its base's turn keeps its charge.
+  fn charge_placement_once(
+    &mut self,
+    cx: &mut Context<'_>,
+    position: u64,
+  ) -> Result<(), StoreRefused> {
+    if !self.prepaid.remove(&position) {
+      cx.admission
+        .charge_items::<(u64, u64)>(1)
+        .map_err(|_| StoreRefused::PackTooLarge)?;
+    }
+    Ok(())
+  }
+
+  /// `object`, read where it lies, encoded with the fragments' encoder and emitted, counted as sent whole or as a delta.
+  fn encode_loose(
+    &mut self,
+    cx: &Context<'_>,
+    object: ToEncode,
+    out: &mut impl Out,
+  ) -> Result<(), StoreRefused> {
     let mut learning = Learning {
       window: &mut self.window,
       levels: &mut self.levels,
@@ -1454,7 +1482,7 @@ impl<A: Answered> Upload<A> {
       self.counters.loose_deltas = self.counters.loose_deltas.saturating_add(1);
     }
     self.emit(&entry, out);
-    Ok(next)
+    Ok(())
   }
 
   /// `id`'s pushed entry sent on as it lies (A-859, git's pack reuse), once its check holds (a whole entry's data
