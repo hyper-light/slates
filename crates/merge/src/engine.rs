@@ -3010,6 +3010,17 @@ impl Green {
     self.content.name_of(path)
   }
 
+  /// The bytes of every object `wanted` names that a live block of this green is named for (A-866): its current files'
+  /// and its history's alike, copied. What a refused publication's remake reads its checkpoint's and chain's named
+  /// files from when the content store does not hold them whole, before this engine is let go (the server's
+  /// `verbs::remake_green`).
+  pub fn bytes_named(
+    &self,
+    wanted: &std::collections::BTreeSet<crate::named::Identity>,
+  ) -> Vec<(crate::named::Identity, Vec<u8>)> {
+    self.content.blocks().named_bytes(wanted)
+  }
+
   /// Every file the green currently holds, with its bytes — so a new work volume can be seeded with
   /// the base content it inherits and edits splice against it. Each path is assembled by the walk (a persistent map's
   /// keys are its edges, [`crate::dims`]), so it is owned.

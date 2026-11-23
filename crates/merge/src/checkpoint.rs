@@ -51,9 +51,11 @@
 //! **Named files (A-760 (b) piece 2, main 01a20182's order of 2026-11-22 19:28).** A file whose bytes at `F` are the
 //! whole of a content-plane object, its block named for it (`crate::engine::Green::name_of`, A-866), is named rather
 //! than carried ([`Checkpoint::named`]): its path, the version that set it, and the object's identity (BLAKE3 of its
-//! bytes and its length). A Subversion green's files are its repository's stored texts, held by the repository's
+//! bytes and its length). A Subversion green's files are its repository's stored texts, named by the repository's
 //! records and durable in the node's changeset store before any entry names them (A-865), so the checkpoint no longer
-//! holds them a second time. A restore reads them first, a slice a step from the owner's plane
+//! holds them a second time. The content store need not hold them: a recovery brings back what it lacks from the
+//! node's store first (`svn_texts::bring_back_named`), and a refused publication's remake reads what it lacks from the
+//! engine it replaces (`verbs::remake_green`; the bug record of 2026-11-23). A restore reads them first, a slice a step from the owner's plane
 //! ([`Checkpoint::read_step`], as an increment's runs are read), and refuses, typed, a checkpoint whose files are not
 //! all read (`crate::engine::Unrestored`): a missing byte is never a zero. Each restored file takes the buffer it was
 //! read into, with no copy, and is named for its object again.

@@ -15570,8 +15570,10 @@ fn remake_greens_ahead(state: &mut ShardState) {
   }
 }
 
-/// Makes `record`'s green again from its durable checkpoint and chain ([`remake_greens_ahead`]).
+/// Makes `record`'s green again from its durable checkpoint and chain ([`remake_greens_ahead`]), the named texts they name
+/// that the content plane does not hold whole kept from the engine it replaces first ([`kept_for_remake`]).
 fn remake_green(state: &mut ShardState, record: &VolumeRecord) {
+  let kept = kept_for_remake(state, record.id);
   let member = state
     .db
     .partition()
@@ -15602,7 +15604,7 @@ fn remake_green(state: &mut ShardState, record: &VolumeRecord) {
       state.greens.remove(&record.id);
     }
   }
-  let replayed = replay_green(state, record.id);
+  let replayed = replay_green_keeping(state, record.id, kept);
   match &member {
     Some(member) => install_member_root(state, record, member, replayed),
     None => install_green(state, record, replayed),
@@ -20146,9 +20148,63 @@ fn replay_green(
   state: &ShardState,
   id: DbVolumeId,
 ) -> Result<ReplayedGreen, crate::merge_service::GreenFence> {
+  replay_green_keeping(state, id, Vec::new())
+}
+
+/// [`replay_green`], its named texts read from the content plane, then from `kept` (sorted by identity, each an
+/// object's whole bytes: [`remake_green`]'s).
+fn replay_green_keeping(
+  state: &ShardState,
+  id: DbVolumeId,
+  kept: Vec<(slates_merge::named::Identity, Vec<u8>)>,
+) -> Result<ReplayedGreen, crate::merge_service::GreenFence> {
   let mut replay = GreenReplay::begin(state, id)?;
+  replay.kept = kept;
   while !replay.step(state)? {}
   replay.finish(state)
+}
+
+/// Where a replay reads named texts (A-760, A-869): the shard's content plane, read with the shard's chunk store in
+/// place of a lent one (a replay holds the shard read-only), then `kept`.
+fn replay_objects<'a>(
+  state: &'a ShardState,
+  kept: &'a [(slates_merge::named::Identity, Vec<u8>)],
+) -> crate::vcs_store::named_objects::ReplayObjects<'a> {
+  crate::vcs_store::named_objects::ReplayObjects {
+    plane: state
+      .vcs_stores
+      .content()
+      .map(|store| crate::vcs_store::named_objects::PlaneObjects {
+        store,
+        kept_in: &state.store.content,
+      }),
+    kept,
+  }
+}
+
+/// The named texts green `id`'s durable checkpoint and chain name that the content plane does not hold whole, copied from
+/// its engine, which holds each it still names in a block named for it (A-866): what a refused publication's remake
+/// replays with ([`remake_green`]), read before the engine is let go. The checkpoint and the chain name texts that are
+/// durable on the node's store (A-865), but the remake runs inside the refused step and cannot wait on that store, as a
+/// recovery's pre-pass does (`svn_texts::bring_back_named`); a text neither the plane nor the engine holds still fences
+/// the green `ContentMissing`, typed.
+fn kept_for_remake(
+  state: &ShardState,
+  id: DbVolumeId,
+) -> Vec<(slates_merge::named::Identity, Vec<u8>)> {
+  let wanted: std::collections::BTreeSet<slates_merge::named::Identity> =
+    crate::vcs_store::svn_texts::named_lacking(state, id)
+      .into_iter()
+      .map(|(hash, len)| slates_merge::named::Identity { hash, len })
+      .collect();
+  if wanted.is_empty() {
+    return Vec::new();
+  }
+  state
+    .greens
+    .get(&id)
+    .map(|engine| engine.bytes_named(&wanted))
+    .unwrap_or_default()
 }
 
 /// Replays green `id`'s durable origin and chain into a fresh engine in a recovery's slices ([`GreenReplay`]): the slice
@@ -20193,6 +20249,9 @@ pub(crate) struct GreenReplay {
   phase: GreenReplayPhase,
   /// The shares its origin was seeded in: more than one shows the seeding was sliced.
   load_steps: u64,
+  /// Named texts kept for the replay where the content plane does not hold them whole, sorted by identity
+  /// ([`crate::vcs_store::named_objects::ReplayObjects`]): a refused publication's remake's ([`remake_green`]).
+  kept: Vec<(slates_merge::named::Identity, Vec<u8>)>,
 }
 
 /// Where a [`GreenReplay`] is.
@@ -20246,6 +20305,7 @@ impl GreenReplay {
       id,
       phase,
       load_steps: 0,
+      kept: Vec::new(),
     })
   }
 
@@ -20266,6 +20326,7 @@ impl GreenReplay {
       id,
       phase: chain_phase_or_back(state, id, seeded)?,
       load_steps: 0,
+      kept: Vec::new(),
     })
   }
 
@@ -20320,14 +20381,7 @@ impl GreenReplay {
         held,
       } => {
         let held = *held;
-        let store = state
-          .vcs_stores
-          .content()
-          .ok_or(GreenFence::ContentMissing { version: held })?;
-        let objects = crate::vcs_store::named_objects::PlaneObjects {
-          store,
-          kept_in: &state.store.content,
-        };
+        let objects = replay_objects(state, &self.kept);
         let read = checkpoint
           .read_step(&objects, state.config.copy_slice_bytes().max(1))
           .map_err(|_| GreenFence::ContentMissing { version: held })?;
@@ -20359,7 +20413,7 @@ impl GreenReplay {
         reading,
       } => {
         return replay_chain_entry(
-          state,
+          (state, &self.kept),
           (id, green),
           (*held, *head_check),
           (next, reading),
@@ -20432,7 +20486,7 @@ impl GreenReplay {
 /// Applies green `id`'s next chain entry as its own version (A-257), keeping the version's merge record as its owner enqueued
 /// it, with the head identity the green has at that version; true once no entry is left.
 fn replay_chain_entry(
-  state: &ShardState,
+  (state, kept): (&ShardState, &[(slates_merge::named::Identity, Vec<u8>)]),
   (id, green): (DbVolumeId, &mut slates_merge::engine::Green),
   (held, head_check): (u64, Option<(u64, [u8; 32])>),
   (next, reading): (
@@ -20498,14 +20552,7 @@ fn replay_chain_entry(
   // An entry naming its content (A-760) reads it from the content plane first, a copy slice a step, so no step reads
   // a large text whole: the step ends with the entry kept for the next.
   if entry.increment.unread().is_some() {
-    let store = state
-      .vcs_stores
-      .content()
-      .ok_or(GreenFence::ContentMissing { version })?;
-    let objects = crate::vcs_store::named_objects::PlaneObjects {
-      store,
-      kept_in: &state.store.content,
-    };
+    let objects = replay_objects(state, kept);
     let read = entry
       .increment
       .read_step(&objects, state.config.copy_slice_bytes().max(1))
@@ -20791,6 +20838,7 @@ pub(crate) fn begin_readoption(
       id,
       phase,
       load_steps: 0,
+      kept: Vec::new(),
     }));
   }
   true
@@ -21204,14 +21252,22 @@ fn read_journal(
 /// (A-870 piece 1), each delta's pieces folded over its
 /// checkpoint. Read after a publication commits, a missed change mark is a difference here before it is a lost record.
 pub(crate) fn committed_held_agrees(state: &ShardState) -> bool {
-  let committed = match read_journal(state) {
-    Some(Ok((Some(shard), _))) => shard.held,
-    Some(Ok((None, _))) | None => Vec::new(),
-    Some(Err(_)) => return false,
+  let Some(committed) = committed_held(state) else {
+    return false;
   };
   // Compared entry by entry: a paged family's pages differ by the history that made them (A-870 piece 1).
   crate::content_holder::expanded(&committed)
     == crate::content_holder::expanded(&crate::content_holder::held_image(state))
+}
+
+/// The held pieces a restart would read from this shard's committed journal, each delta's folded over its checkpoint
+/// (none committed, none); none where the journal does not read ([`committed_held_agrees`]'s, and A-870's oracle's).
+pub(crate) fn committed_held(state: &ShardState) -> Option<Vec<slates_vfs::recover::HeldPiece>> {
+  match read_journal(state) {
+    Some(Ok((Some(shard), _))) => Some(shard.held),
+    Some(Ok((None, _))) | None => Some(Vec::new()),
+    Some(Err(_)) => None,
+  }
 }
 
 /// The shard's recovery images from its slice of the anchor content object (§4.8), by volume id, and the
@@ -21227,6 +21283,7 @@ fn recover_images(state: &mut ShardState) -> RecoveredImages {
       state.journal = journal;
       state.published_keys = shard.volumes.iter().map(|keyed| keyed.key).collect();
       state.published_held = crate::content_holder::published_from(&shard.held);
+      state.image_encoder = crate::content_holder::image_encoder_of(&shard.held);
       RecoveredImages {
         volumes: shard
           .volumes
@@ -21514,7 +21571,10 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
   }
   // The replicas this shard holds for other owners ride the same image (AUD-29-59): a holder acknowledges a
   // content put only once a publish carrying it commits.
-  let (mut held, pages) = crate::content_holder::held_image_paged(state);
+  // A-870 piece 2: the paged families' changes taken and a turn of their encoding run, at most a slice.
+  crate::content_holder::image_drain(state);
+  let _ = crate::content_holder::image_turn(state);
+  let (mut held, image_carried) = crate::content_holder::held_image_paged(state);
   let whole = crate::content_holder::whole_of(&held);
   let owned = crate::content_holder::owned_of(&held);
   let mut replies = pending_replies(state);
@@ -21588,7 +21648,7 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
     .map(|id| id.bytes)
     .collect();
   crate::content_holder::held_committed(state, whole, true);
-  crate::content_holder::pages_committed(state, pages);
+  crate::content_holder::image_committed(state, image_carried);
   crate::live_ship::owned_committed(state, owned, true);
   call_records_published(state);
   // Every volume captured: this image holds every logged write, so the write log empties, stamped with this
@@ -21917,6 +21977,9 @@ fn publish_delta_into(
     .filter(|key| !present.contains(*key))
     .copied()
     .collect();
+  // A-870 piece 2: the paged families' changes taken and a turn of their encoding run, at most a slice.
+  crate::content_holder::image_drain(state);
+  let _ = crate::content_holder::image_turn(state);
   let mut held = crate::content_holder::held_changes(state);
   let (mut calls, mut calls_removed) = call_records_delta(state);
   let mut nfs_replies = held_nfs_replies_changed(state).then(|| held_nfs_replies(state));
@@ -21981,7 +22044,7 @@ fn publish_delta_into(
     state.count(DELTA_HELD_BYTES, u64::try_from(carried).unwrap_or(u64::MAX));
   }
   crate::content_holder::held_committed(state, held.whole, false);
-  crate::content_holder::pages_committed(state, held.pages);
+  crate::content_holder::image_committed(state, held.image_carried);
   crate::live_ship::owned_committed(state, held.owned, false);
   call_records_published(state);
   settle_write_log(state, &published.skipped, state.journal.generation());
