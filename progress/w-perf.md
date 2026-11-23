@@ -515,3 +515,17 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   - Sent: main the hash for arena-17; w-shared how conditions a-f are met.
   - Disk: deleted ~/.cache/w-perf-land-target.noindex (5.7 GiB) and old ~/.cache/w-perf logs (10.8 MiB) for kiln's reaper.
   - Next: the 57k hg_push_lifetimes rerun for w-hg's cuts (f02fa1a28, 9003d110e, e4cad14ad); then (3) insert_new.
+- 2026-11-23 ~16:00 PST:
+  - arena-17 (CI 45255642995) met A-877's bar: RSS after push-all 826 MB on x86 (arena-16 1,261 MB, -34.5%), arm64
+    797 MB (-34.2%); vcs_windows 154 MB held for 121 MB asked (was 556 MB held).
+  - LANDED faded469a (merge b939c3741): image_pages' checkpoint test judges its pages by the encoder's own page size.
+    The page is the copy slice, which load shrinks (probe: 15,959 B -> 48 pieces, 2,048 B -> 386, a loaded run 2,256 B
+    -> 354), and the old ENTRIES/10 failed under about 2.5 KB.
+  - BUG of mine, FIXED: LANDED 41bf83bf0 (merge 0d9cc659c). A-877's read_piece refused a trimmed own-chunk window
+    (used > its head block), so every window of a granule or more was lost at restart. Windows CI went red (w-win2's run
+    45269168513); the Mac's 16 KiB granule hid it. Red: the restart test with a 2.5-page window refused 2, now 1.
+    docs/bugs/2026-11-23-a-restart-lost-every-repository-window-whose-chunk-the-seal-trimmed.md (sweep inside). Diag
+    for Windows: diag-measurer-w-perf-1 at 9f1ecd1bf, run 45289973863 (main pushed it).
+  - Clippy findings in A-877's tests were fixed by main first (80ef30c1e).
+  - Parked: (3) the window record, patch ~/.cache/w-perf/record-wip.patch + test_heap.rs.saved (371 -> 270 B a window,
+    bound 192; ~600 KB in 4,000 puts still unplaced). Next: finish (3), then system_live's 230 MB by owner.
