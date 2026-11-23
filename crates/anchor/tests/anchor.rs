@@ -1680,6 +1680,7 @@ fn device_child() {
         attachment: DEVICE_ATTACHMENT,
         device: reader.as_fd(),
       },
+      SEND_WAIT_NS,
     )
     .unwrap();
     slates_anchor::held::send(
@@ -1688,6 +1689,7 @@ fn device_child() {
         attachment: DEVICE_ATTACHMENT,
         session: &DEVICE_SESSION,
       },
+      SEND_WAIT_NS,
     )
     .unwrap();
     std::process::exit(SENDER_EXIT);
@@ -1950,6 +1952,10 @@ const FULL_SLACK: u64 = 256;
 /// pair the anchor drains a step at a time, on a loaded runner.
 #[cfg(unix)]
 const FULL_WAIT_MS: u64 = 120_000;
+/// Shape: how long a test daemon's send may wait for room in the hold channel (nanoseconds): the full-table test's own
+/// wait, since the harness drains the anchor's end a poll at a time.
+#[cfg(unix)]
+const SEND_WAIT_NS: u64 = FULL_WAIT_MS * 1_000_000;
 
 /// Derived: the bytes past which the old handoff failed its exec here: Linux's limit on one string, `MAX_ARG_STRLEN`,
 /// `PAGE_SIZE * 32` ("the limit per string is 32 pages": `execve(2)`; `include/uapi/linux/binfmts.h`).
@@ -2014,6 +2020,7 @@ fn full_table_child() {
           attachment: attachment(index),
           device: reader.as_fd(),
         },
+        SEND_WAIT_NS,
       )
       .unwrap();
       held::send(
@@ -2022,6 +2029,7 @@ fn full_table_child() {
           attachment: attachment(index),
           session: &session(index),
         },
+        SEND_WAIT_NS,
       )
       .unwrap();
     }
