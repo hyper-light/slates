@@ -4384,7 +4384,17 @@
 > (`docs/bugs/2026-11-23-the-svnsync-use-row-compared-two-random-mirror-uuids.md`). The rerun (r12, 112e694e7) left
 > one more of the harness's: revision 0's lengths still counted the `svn:sync-*` lines the comparison dropped, and the
 > source URL differs by leg. The mirror's sync properties are now deleted before the dump, which is compared whole
-> (`a_mirrors_dump_is_the_same_whatever_url_it_was_synced_from`). Owed: main's red and green of that test, and (B).
+> (`a_mirrors_dump_is_the_same_whatever_url_it_was_synced_from`).
+> **Done, proven by use (main 01a20182's rounds on the big Studio, stock Subversion 1.15, 2026-11-23):**
+> - (A), DeltaV v1's revision properties over the HTTP edge: `SLATES_SVN_USE_ROUTE=http-v1`,
+>   `SLATES_SVN_USE_VERBS=revprops`, 0 differences from svnserve at 17 revisions (kiln run r254, after 414925522).
+> - (B), `svnsync` over HTTPv2: git-2000's 2,000 revisions mirrored from slates with 0 differences from stock
+>   svnserve's mirror (`SLATES_SVN_USE_VERBS=svnsync` over `http`, 1 passed; kiln run r21 at main 71c2f07a7).
+> - The harness's rule: `a_mirrors_dump_is_the_same_whatever_url_it_was_synced_from` red at 3bb5e53b1
+>   (`svn_interop.rs:3329`, the mirror over stock svnserve against the one over `file://`) and green at 71c2f07a7
+>   (r21).
+> - `an_svnsync_measured` over HTTP (r254): 2,000 revisions in 301.8 s (150.9 ms a revision), mirror at r2000, daemon
+>   RSS 724 MB before and 994 MB at peak. The same round over svn:// took 510.4 s against P7's 270.7 s, sent to w-svn.
 > **R4, recovery replays a revision record a turn at a time (2026-11-20, w-svn; Ada's close list; found by w-git's sweep):**
 > a Subversion revision's record was replayed whole in one recovery or rebuild turn (`replay_svn` -> `commit_record`),
 > every text it brought deltified in one step, so one large revision held its shard. Now `RevisionReplay`
