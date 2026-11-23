@@ -80,10 +80,22 @@ impl Fixture {
     (path, depth): (&str, Option<&str>),
     body: &[u8],
   ) -> Answer {
+    self.ask_labelled(rules, method, (path, depth, None), body)
+  }
+
+  /// [`Fixture::ask`] with a `Label` header's value, if one.
+  fn ask_labelled(
+    &self,
+    rules: Option<&PrincipalRules>,
+    method: &str,
+    (path, depth, label): (&str, Option<&str>, Option<&str>),
+    body: &[u8],
+  ) -> Answer {
     let request = Request {
       method,
       path,
       depth,
+      label,
       body,
     };
     answer(&self.served(rules), &request, &BOUNDS, ROOM)
@@ -550,6 +562,121 @@ fn reported(
   }
 }
 
+/// A `replay-report` in the 1.8 syntax, as ra_serf's `svnsync synchronize` sends it to `!svn/rev/REV`: the root, every
+/// copy's source, deltas.
+const REPLAY_1_8: &[u8] = b"<S:replay-report xmlns:S=\"svn:\"><S:include-path></S:include-path>\
+<S:low-water-mark>0</S:low-water-mark><S:send-deltas>1</S:send-deltas></S:replay-report>";
+
+/// A `replay-report` in the old syntax, sent to the session's URL, naming `revision`.
+fn replay_old(revision: &str) -> Vec<u8> {
+  format!(
+    "<S:replay-report xmlns:S=\"svn:\">{revision}<S:low-water-mark>0</S:low-water-mark>\
+     <S:send-deltas>1</S:send-deltas></S:replay-report>"
+  )
+  .into_bytes()
+}
+
+/// Revision `revision` replayed from the root by the one replay the svn:// site drives
+/// (`crate::report::drive::replay::Replay`), each call written by the DAV drive's replay answer: what the site's
+/// `replay-report` must answer, whole.
+fn replayed_directly(fixture: &Fixture, revision: u64) -> Vec<u8> {
+  let rules = rules_of(None);
+  let mut replay = crate::report::drive::replay::Replay::new(revision, "/", 0, true);
+  let mut drive = super::super::drive::Drive::replay(crate::svndiff::Version::Zero, ROOM);
+  while let Some(call) = replay
+    .next(&fixture.index, &fixture.green, Some(&rules))
+    .unwrap()
+  {
+    drive.call(call).unwrap();
+  }
+  drive.finish().unwrap()
+}
+
+/// Goal 93's svnsync rows over HTTP (w-svn's GAPS entry "svnsync from slates over the HTTP edge": the site advertised
+/// `replay-rev-resource` and served no `replay-report`). Do: for every revision, REPORT a 1.8-syntax replay at
+/// `!svn/rev/REV` taken whole, and again a slice of 64 bytes at a time; and an old-syntax replay of revision 3 at the
+/// session's URL. Expect each answer streamed to its end (`Done`), its bytes exactly the svn:// site's replay of that
+/// revision written as `replay.c` writes it (one drive, no second encoder), the same whatever its slices.
+/// Red before: `REPORT` refused 501, the method not served.
+#[test]
+fn a_replay_report_answers_the_svn_sites_replay_of_its_revision_a_slice_at_a_time() {
+  let fixture = Fixture::new();
+  let rules = rules_of(None);
+  let youngest = fixture.index.youngest();
+  for revision in 1..=youngest {
+    let direct = replayed_directly(&fixture, revision);
+    let path = format!("/!svn/rev/{revision}");
+    let whole = reported(
+      &fixture,
+      Some(&rules),
+      fixture.ask(Some(&rules), "REPORT", (&path, None), REPLAY_1_8),
+      ROOM,
+    );
+    assert_eq!(whole.2, ReportProgress::Done, "revision {revision}");
+    assert_eq!(
+      String::from_utf8_lossy(&whole.1),
+      String::from_utf8_lossy(&direct),
+      "revision {revision}, whole"
+    );
+    let sliced = reported(
+      &fixture,
+      Some(&rules),
+      fixture.ask(Some(&rules), "REPORT", (&path, None), REPLAY_1_8),
+      64,
+    );
+    assert_eq!(
+      (sliced.2, sliced.1),
+      (ReportProgress::Done, direct),
+      "revision {revision}, 64 bytes a slice"
+    );
+  }
+  let old = reported(
+    &fixture,
+    Some(&rules),
+    fixture.ask(
+      Some(&rules),
+      "REPORT",
+      ("/", None),
+      &replay_old("<S:revision>3</S:revision>"),
+    ),
+    ROOM,
+  );
+  assert_eq!(
+    (old.2, old.1),
+    (ReportProgress::Done, replayed_directly(&fixture, 3))
+  );
+}
+
+/// `reports/replay.c`'s refusals. Do: REPORT an old-syntax replay naming no revision at the session's URL, a 1.8-syntax
+/// replay at `!svn/rev/99`, and an old-syntax replay of revision 99. Expect `400` "Request was missing the revision
+/// argument"; and `404` "No such revision 99" for both, the second refused before its first byte.
+#[test]
+fn a_replay_report_is_refused_as_replay_c_refuses_it() {
+  let fixture = Fixture::new();
+  let rules = rules_of(None);
+  let missing = whole(fixture.ask(Some(&rules), "REPORT", ("/", None), &replay_old("")));
+  assert_eq!(missing.status, 400, "{}", text_of(&missing));
+  assert!(text_of(&missing).contains("missing the revision argument"));
+  let past = whole(fixture.ask(Some(&rules), "REPORT", ("/!svn/rev/99", None), REPLAY_1_8));
+  assert_eq!(past.status, 404);
+  let (_, _, ended) = reported(
+    &fixture,
+    Some(&rules),
+    fixture.ask(
+      Some(&rules),
+      "REPORT",
+      ("/", None),
+      &replay_old("<S:revision>99</S:revision>"),
+    ),
+    ROOM,
+  );
+  let ReportProgress::Refused(refused) = ended else {
+    panic!("refused before its first byte: {ended:?}");
+  };
+  assert_eq!(refused.status, 404, "{}", text_of(&refused));
+  assert!(text_of(&refused).contains("No such revision 99"));
+}
+
 /// Each item's revision and its changed paths (each its element's name, its path and its copy source), in order.
 fn log_items(body: &[u8]) -> Vec<(String, Vec<String>)> {
   let report = super::super::xml::parse(body, &BOUNDS).unwrap();
@@ -936,6 +1063,45 @@ fn a_revision_resource_answers_its_revisions_properties_as_its_baseline_does() {
   );
   let past = fixture.anonymous("PROPFIND", "/!svn/rev/99", Some("0"), PROPFIND_ALL);
   assert_eq!(past.status, 404);
+}
+
+/// w-svn's GAPS entry "svnsync from slates over the HTTP edge" (DeltaV v1's revision properties answered the youngest's):
+/// ra_serf's DeltaV v1 `rev_proplist` PROPFINDs the VCC with the revision as its `Label`. Do: PROPFIND `allprop` of
+/// `!svn/vcc/default` at depth 0 labelled 3, unlabelled, labelled 99 and labelled `three`. Expect the labelled answer
+/// revision 3's properties as its baseline `!svn/bln/3` answers them (not revision 6's); the unlabelled answer the VCC's
+/// own (its `checked-in`); 404 past the youngest; and 400 for a label that is no revision. Red before: the labelled
+/// PROPFIND answered the VCC itself, its youngest.
+#[test]
+fn deltav_v1_a_labelled_vcc_answers_the_labelled_revisions_properties() {
+  let fixture = Fixture::new();
+  let vcc = "/!svn/vcc/default";
+  let labelled = |label: &str| {
+    whole(fixture.ask_labelled(
+      Some(&rules_of(None)),
+      "PROPFIND",
+      (vcc, Some("0"), Some(label)),
+      PROPFIND_ALL,
+    ))
+  };
+  let third = labelled("3");
+  let baseline_three =
+    text_of(&fixture.anonymous("PROPFIND", "/!svn/bln/3", Some("0"), PROPFIND_ALL));
+  let baseline_six =
+    text_of(&fixture.anonymous("PROPFIND", "/!svn/bln/6", Some("0"), PROPFIND_ALL));
+  assert_eq!(third.status, 207, "{}", text_of(&third));
+  assert_eq!(
+    text_of(&third),
+    baseline_three,
+    "revision 3's properties, as its baseline answers them"
+  );
+  assert_ne!(text_of(&third), baseline_six, "not the youngest's");
+  let unlabelled = text_of(&fixture.anonymous("PROPFIND", vcc, Some("0"), PROPFIND_ALL));
+  assert!(
+    unlabelled.contains("checked-in"),
+    "the VCC's own: {unlabelled}"
+  );
+  assert_eq!(labelled("99").status, 404);
+  assert_eq!(labelled("three").status, 400);
 }
 
 /// DeltaV v1 (`liveprops.c`: `checked-in` is a version-controlled resource's alone): do PROPFIND a version resource,

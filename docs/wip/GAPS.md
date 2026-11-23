@@ -4246,6 +4246,17 @@
 > at `!svn/rev/REV`, which the site advertises with `replay-rev-resource`), so `svnsync synchronize` from slates over
 > HTTP cannot run; and DeltaV v1's revision properties (a PROPFIND of the VCC with a `Label`) answer the youngest's.
 > svnsync over svn:// mirrors git-2000 in 270.7 s (135 ms a revision; w-interop's 1,068 s before).
+> **Both built (w-interop, 2026-11-23, main 01a20182's order; w-svn told first, its C2 untouched):** (A) a `Label` on
+> the VCC names that revision's baseline (`dav::site` `labelled`; the server passes the header), so DeltaV v1's
+> `rev_proplist` reads the labelled revision's properties (`deltav_v1_a_labelled_vcc_answers_the_labelled_revisions_properties`);
+> (B) `replay-report` is served at the session URL (old syntax) and at `!svn/rev/REV` (1.8 syntax) by
+> `dav::report_replay::ReplayWalk`, the svn:// site's own `Replay` a call at a time into the DAV drive's replay answer,
+> one path, streamed a slice at a time under the step budget
+> (`a_replay_report_answers_the_svn_sites_replay_of_its_revision_a_slice_at_a_time`,
+> `a_replay_report_is_refused_as_replay_c_refuses_it`). Owed, main's runs (no stock Subversion on the MacBook):
+> stock 1.15 over `SLATES_SVN_USE_ROUTE=http-v1` with `SLATES_SVN_USE_VERBS=revprops` against svnserve; and
+> `svnsync synchronize` over HTTP, the mirror against svnserve's byte for byte (`an_svnsync_measured`'s DAV leg,
+> `SLATES_SVN_USE_VERBS=svnsync` over `http`).
 > **R4, recovery replays a revision record a turn at a time (2026-11-20, w-svn; Ada's close list; found by w-git's sweep):**
 > a Subversion revision's record was replayed whole in one recovery or rebuild turn (`replay_svn` -> `commit_record`),
 > every text it brought deltified in one step, so one large revision held its shard. Now `RevisionReplay`
