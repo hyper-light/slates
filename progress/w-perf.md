@@ -363,3 +363,14 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     synchronous request; the region gains the shard's CPU word (layout version 5).
     - F_diag 9ad9d4cc9. The A/B is 45087231374 on diag-measurer-w-perf-84a-f-ab.
   - Worktrees: w-perf-diag and w-perf-armf. w-perf-land was removed (clean) to make room; re-add it to land.
+- 2026-11-22 ~18:30 PST: LANDED A-867 (aba34339c
+76bbf6ca8, merge 156e5ea30): a macOS client's synchronous park waits on its region's
+  Mach semaphore, its send right carried with the region's fileport through mach_claim's keep and fetch.
+  - A/B 45091701553: reply wakes >= 1 ms 3,001 -> 36; loaded p99 median accept 1,766 -> 976 µs, conflict 4,301 -> 1,363 µs.
+  - Bare metal (main's Studio check) has no slow wake: the address-wake spin is the CI VM's.
+  - Red first: the cross-process test failed while the semaphore was named in the header (KERN_INVALID_NAME).
+  - Focused tests on macOS: ipc lib 80/80, rendezvous 16/16, completion_memory, rings, client 39/39.
+  - Main's: clippy (macOS, Linux, Windows cross-lint for slates-ipc), xtask unsafe (slates-ipc 160 -> 167), and the
+    confirming rounds on the landed code.
+  - Arm F rejected and recorded (6bab42576). Arm G handed to main (agents/w-perf-84a-arm-g 674c030f5).
+  - Next mine: init_shard unit 3 (boot's 2-68 ms slice).
