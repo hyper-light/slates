@@ -11,7 +11,7 @@
 //!   so each listener hears each change. kqueue's `EVFILT_VM` (`NOTE_VM_PRESSURE`) was the other candidate: XNU's
 //!   pressure notifier in that file names only the dispatch listeners, so it is not taken. The source's handler runs
 //!   on a dispatch thread and writes one byte to a pipe this owns; the caller awaits the pipe's read end readable and
-//!   empties it ([`Events::acknowledge`]).
+//!   empties it (`Events::acknowledge`, macOS and Linux).
 //! - **Linux**: a pressure-stall trigger on `/proc/pressure/memory` for any stall in the shortest window an
 //!   unprivileged process may ask for ("some 1 2000000": a microsecond, the kernel's unit, in two seconds), which the
 //!   kernel signals with `POLLPRI`, "rate-limited to one per tracking window" [B: kernel
@@ -23,7 +23,7 @@
 //!   report is the stall's end ([`Events::stall_ended_after_ns`]). The shard's runtime awaits readability alone, so the
 //!   trigger sits in an epoll set of its own, which is readable while the trigger has fired (epoll(7): an epoll
 //!   descriptor "is readable if one or more events are available"); the caller awaits that set readable and empties it
-//!   ([`Events::acknowledge`]). A kernel built without PSI, or one before unprivileged triggers (Linux 6.5), refuses:
+//!   (`Events::acknowledge`). A kernel built without PSI, or one before unprivileged triggers (Linux 6.5), refuses:
 //!   [`Refused::Host`].
 //! - **Windows**: the low- and high-memory resource notifications (`CreateMemoryResourceNotification`), each "signaled"
 //!   while its condition holds [B: Microsoft Learn, "CreateMemoryResourceNotification function (memoryapi.h)"]: the

@@ -216,23 +216,21 @@ fn slab_windows_read_back_byte_for_byte_through_let_go_bring_back_and_purge() {
   let mut chunks = shard_chunks(1024);
   let mut store = content();
   assert!(store.lend_in(&mut chunks));
-  let mut oracle = SlabOracle {
-    steps: Steps(0x9e37_79b9_7f4a_7c15),
-    kept: std::collections::BTreeMap::new(),
-    shared_seen: false,
-    freed_kept_seen: false,
-  };
+  let mut steps = Steps(0x9e37_79b9_7f4a_7c15);
+  let mut kept = KeptWindows::new();
+  let (mut shared_seen, mut freed_kept_seen) = (false, false);
   for step in 0..3_000u64 {
-    oracle.step(&mut store, &mut chunks, step);
-    oracle.check(&mut store, &mut chunks, step);
+    take_slab_step(step, &mut steps, (&mut store, &mut chunks), &mut kept);
+    let asked = kept_windows_read_back(step, &store, &kept);
+    let (shared, freed_kept) = windows_row_checked(step, (&mut store, &mut chunks), &kept, asked);
+    shared_seen |= shared;
+    freed_kept_seen |= freed_kept;
   }
   assert!(
-    oracle.shared_seen && oracle.freed_kept_seen,
-    "slabs shared ({}) and kept freed slots ({})",
-    oracle.shared_seen,
-    oracle.freed_kept_seen
+    shared_seen && freed_kept_seen,
+    "slabs shared ({shared_seen}) and kept freed slots ({freed_kept_seen})"
   );
-  for (identity, (_, away)) in std::mem::take(&mut oracle.kept) {
+  for (identity, (_, away)) in std::mem::take(&mut kept) {
     if !away {
       store.release(&identity).unwrap();
     }
@@ -242,133 +240,157 @@ fn slab_windows_read_back_byte_for_byte_through_let_go_bring_back_and_purge() {
   assert_eq!(windows_row(&chunks), (0, 0), "nothing held");
 }
 
-/// The slab oracle's model: each window put by its identity, its bytes and whether it is let go; and whether a step saw
-/// slabs shared and slots let go from slabs still held.
-struct SlabOracle {
-  steps: Steps,
-  kept: std::collections::BTreeMap<slates_vcs::ContentId, (Vec<u8>, bool)>,
-  shared_seen: bool,
-  freed_kept_seen: bool,
+/// The slab test's model: each window put, by its identity, with its bytes and whether it was let go.
+type KeptWindows = std::collections::BTreeMap<slates_vcs::ContentId, (Vec<u8>, bool)>;
+
+/// A window of `kept` drawn by `steps`, among those let go (`away`) or those held; none, and no draw, where there is
+/// none.
+fn pick_window(steps: &mut Steps, kept: &KeptWindows, away: bool) -> Option<slates_vcs::ContentId> {
+  let named: Vec<slates_vcs::ContentId> = kept
+    .iter()
+    .filter(|(_, (_, is_away))| *is_away == away)
+    .map(|(identity, _)| *identity)
+    .collect();
+  (!named.is_empty()).then(|| named[usize::try_from(steps.next()).unwrap() % named.len()])
 }
 
-impl SlabOracle {
-  /// A window of the model, let go (`away`) or kept, picked by the next step; none when there is none.
-  fn pick(&mut self, away: bool) -> Option<slates_vcs::ContentId> {
-    let named: Vec<slates_vcs::ContentId> = self
-      .kept
-      .iter()
-      .filter(|(_, (_, is_away))| *is_away == away)
-      .map(|(identity, _)| *identity)
-      .collect();
-    let at = usize::try_from(self.steps.next()).unwrap();
-    (!named.is_empty()).then(|| named[at % named.len()])
+/// One seeded step of the slab test on `store`, lent `chunks`: put a window, release one, let one go, bring one back, or
+/// purge between lends; `kept` follows each.
+fn take_slab_step(
+  step: u64,
+  steps: &mut Steps,
+  (store, chunks): (&mut ContentStore, &mut ChunkStore),
+  kept: &mut KeptWindows,
+) {
+  match steps.next() % 16 {
+    0..=7 => put_window(step, steps, store, kept),
+    8..=10 => release_window(steps, store, kept),
+    11 | 12 => let_window_go(steps, store, kept),
+    13 | 14 => bring_window_back(steps, store, kept),
+    _ => purge_between_lends(steps, (store, chunks), kept),
   }
+}
 
-  /// One seeded step on the store and the model (the test's docs).
-  fn step(&mut self, store: &mut ContentStore, chunks: &mut ChunkStore, step: u64) {
-    match self.steps.next() % 16 {
-      0..=7 => self.put(store, step),
-      8..=10 => self.release(store),
-      11 | 12 => self.let_go(store),
-      13 | 14 => self.bring_back(store),
-      _ => {
-        assert!(store.hand_back(chunks));
-        self.release(store);
-        while chunks.arena_mut().purge(usize::MAX).more {}
-        assert!(store.lend_in(chunks));
-      }
-    }
+/// Puts window `step`, of one byte to a whole window and most shorter than a granule; `kept` holds it.
+fn put_window(step: u64, steps: &mut Steps, store: &mut ContentStore, kept: &mut KeptWindows) {
+  let len = if steps.next().is_multiple_of(8) {
+    1 + usize::try_from(steps.next()).unwrap() % WINDOW
+  } else {
+    1 + usize::try_from(steps.next()).unwrap() % (2 * MEAN_WINDOW)
+  };
+  let bytes = window_bytes(step, len);
+  let identity = store.put(&bytes).unwrap();
+  kept.insert(identity, (bytes, false));
+}
+
+/// Releases a held window, where there is one; `kept` forgets it.
+fn release_window(steps: &mut Steps, store: &mut ContentStore, kept: &mut KeptWindows) {
+  if let Some(identity) = pick_window(steps, kept, false) {
+    store.release(&identity).unwrap();
+    kept.remove(&identity);
   }
+}
 
-  /// Puts a window of one byte to a whole window, most shorter than a granule.
-  fn put(&mut self, store: &mut ContentStore, step: u64) {
-    let most = if self.steps.next().is_multiple_of(8) {
-      WINDOW
+/// Lets a held window go, landed, where there is one; `kept` marks it let go.
+fn let_window_go(steps: &mut Steps, store: &mut ContentStore, kept: &mut KeptWindows) {
+  if let Some(identity) = pick_window(steps, kept, false) {
+    assert!(store.mark_landed(&identity));
+    store.let_go(&identity).unwrap();
+    kept.get_mut(&identity).unwrap().1 = true;
+  }
+}
+
+/// Brings a window let go back by its bytes, where there is one; `kept` marks it held.
+fn bring_window_back(steps: &mut Steps, store: &mut ContentStore, kept: &mut KeptWindows) {
+  if let Some(identity) = pick_window(steps, kept, true) {
+    let bytes = kept[&identity].0.clone();
+    store.bring_back(&identity, &bytes).unwrap();
+    kept.get_mut(&identity).unwrap().1 = false;
+  }
+}
+
+/// Hands the chunk store back, releases a held window outside the lend, purges the arena's freed bytes (A-105) and
+/// lends the chunk store again.
+fn purge_between_lends(
+  steps: &mut Steps,
+  (store, chunks): (&mut ContentStore, &mut ChunkStore),
+  kept: &mut KeptWindows,
+) {
+  assert!(store.hand_back(chunks));
+  release_window(steps, store, kept);
+  while chunks.arena_mut().purge(usize::MAX).more {}
+  assert!(store.lend_in(chunks));
+}
+
+/// At `step`, every window `kept` holds reads back byte for byte and every window let go reads nothing: the bytes the
+/// held windows ask.
+fn kept_windows_read_back(step: u64, store: &ContentStore, kept: &KeptWindows) -> u64 {
+  let mut asked = 0u64;
+  for (identity, (bytes, away)) in kept {
+    let read = store.bytes_of(identity);
+    if *away {
+      assert_eq!(read, None, "step {step}: a window let go reads nothing");
     } else {
-      2 * MEAN_WINDOW
-    };
-    let len = 1 + usize::try_from(self.steps.next()).unwrap() % most;
-    let bytes = window_bytes(step, len);
-    let identity = store.put(&bytes).unwrap();
-    self.kept.insert(identity, (bytes, false));
-  }
-
-  /// Releases a kept window.
-  fn release(&mut self, store: &mut ContentStore) {
-    if let Some(identity) = self.pick(false) {
-      store.release(&identity).unwrap();
-      self.kept.remove(&identity);
-    }
-  }
-
-  /// Lets a kept window go, landed.
-  fn let_go(&mut self, store: &mut ContentStore) {
-    if let Some(identity) = self.pick(false) {
-      assert!(store.mark_landed(&identity));
-      store.let_go(&identity).unwrap();
-      self.kept.get_mut(&identity).unwrap().1 = true;
-    }
-  }
-
-  /// Brings a window let go back by its bytes.
-  fn bring_back(&mut self, store: &mut ContentStore) {
-    if let Some(identity) = self.pick(true) {
-      let bytes = self.kept[&identity].0.clone();
-      store.bring_back(&identity, &bytes).unwrap();
-      self.kept.get_mut(&identity).unwrap().1 = false;
-    }
-  }
-
-  /// The checks after a step (the test's docs).
-  fn check(&mut self, store: &mut ContentStore, chunks: &mut ChunkStore, step: u64) {
-    let mut asked = 0u64;
-    for (identity, (bytes, away)) in &self.kept {
-      let read = store.bytes_of(identity);
-      let expected = (!*away).then_some(&bytes[..]);
       assert_eq!(
         read.as_deref(),
-        expected,
-        "step {step}: a window reads back as the model has it"
+        Some(&bytes[..]),
+        "step {step}: a window kept reads back"
       );
-      if !*away {
-        asked += u64::try_from(bytes.len()).unwrap();
-      }
+      asked += u64::try_from(bytes.len()).unwrap();
     }
-    assert!(store.hand_back(chunks));
-    let (held, row_asked) = windows_row(chunks);
-    let census = super::chunk_windows_census(store);
-    let windows = self.kept.values().filter(|(_, away)| !away).count();
-    self.shared_seen |= census.slabs < u64::try_from(windows).unwrap();
-    self.freed_kept_seen |= census.freed_kept > 0;
-    assert_eq!(
-      row_asked, asked,
-      "step {step}: asked the kept windows' bytes"
-    );
-    assert!(
-      held >= asked,
-      "step {step}: held {held} under asked {asked}"
-    );
-    assert!(store.lend_in(chunks));
   }
+  asked
+}
+
+/// At `step`, with the chunk store handed back, the arena's repository windows row asked exactly `asked`, the kept
+/// windows' bytes, and held at least that; lent again after. Whether slabs were shared (fewer slabs than windows held)
+/// and whether a slab still held kept a slot let go.
+fn windows_row_checked(
+  step: u64,
+  (store, chunks): (&mut ContentStore, &mut ChunkStore),
+  kept: &KeptWindows,
+  asked: u64,
+) -> (bool, bool) {
+  assert!(store.hand_back(chunks));
+  let (held, row_asked) = windows_row(chunks);
+  let census = super::chunk_windows_census(store);
+  let windows = kept.values().filter(|(_, away)| !away).count();
+  let seen = (
+    census.slabs < u64::try_from(windows).unwrap(),
+    census.freed_kept > 0,
+  );
+  assert_eq!(
+    row_asked, asked,
+    "step {step}: asked the kept windows' bytes"
+  );
+  assert!(
+    held >= asked,
+    "step {step}: held {held} under asked {asked}"
+  );
+  assert!(store.lend_in(chunks));
+  seen
 }
 
 /// Goal 93's slabs across a restart (w-shared's condition (c); and main's Windows red of 2026-11-23, w-win2's run
 /// 45269168513: a window in a chunk of its own whose block the seal trimmed was refused `Malformed` at every restart,
 /// since its record names a head shorter than its bytes, so a Windows shard, whose granule is a 4 KiB page, lost every
 /// window of a page or more). Do: lend a shard chunk store, put 40 windows of arena-15's mean length, one of a whole
-/// window and one of [`TRIMMED_WINDOW`], take the shard image's window pieces, then restore them into a
-/// fresh arena over a region of the same layout, copy the arena's bytes across as the anchor's content object carries
-/// them, and read every window back; restore also a piece of the version before the slabs. Expect: each slab's block
-/// claimed once (as many chunks as the first store held, fewer than the windows), every window read back byte for byte
-/// in its slot, the restored row asking the windows' bytes, and the old piece refused typed (`OldVersion(1)`), counted,
-/// the only piece refused; every window's piece encoded again from the restored windows as it was, the trimmed one's
-/// naming a head shorter than its bytes. Failing first: the trimmed window's piece refused too, two refused.
+/// window and one of [`TRIMMED_WINDOW`], take the shard image's window pieces, then restore them into a fresh arena
+/// over a region of the same layout, copy the arena's bytes across as the anchor's content object carries them, and
+/// read every window back; restore also a piece of the version before the slabs. Expect: each slab's block claimed
+/// once (as many chunks as the first store held, fewer than the windows); the old piece refused typed (`OldVersion(1)`),
+/// counted, the only piece refused; every window's piece encoded again from the restored windows as it was, the
+/// trimmed one's naming a head shorter than its bytes; every window read back byte for byte in its slot (the trimmed
+/// one's tail lies past the head the test can copy, so its piece holds it); and the restored row asking the windows'
+/// bytes. Failing first: the trimmed window's piece refused too, two refused.
 #[test]
 fn a_restart_claims_each_slab_once_and_reads_its_windows_in_their_slots() {
   use slates_vcs::WindowStorage;
   let mut chunks = shard_chunks(64);
   let mut windows = ChunkWindows::new(PAGE);
-  let put = put_named(&mut windows, &mut chunks);
+  assert!(windows.lend_in(&mut chunks));
+  let put = put_restart_windows(&mut windows);
+  assert!(windows.hand_back(&mut chunks));
   let held_chunks = chunks.chunks();
   assert!(
     held_chunks < put.len(),
@@ -388,10 +410,10 @@ fn a_restart_claims_each_slab_once_and_reads_its_windows_in_their_slots() {
     .filter_map(|(_, _, chunk)| chunk)
     .any(|chunk| u64::from(chunk.used) > chunk.block);
   assert!(trimmed, "a piece names a trimmed chunk's head");
-  pieces.pop();
+  let original: Vec<(u64, Vec<u8>)> = pieces[..pieces.len() - 1].to_vec();
   assert_eq!(
     restored.pieces_in(0, u64::MAX),
-    pieces,
+    original,
     "every piece encoded again as it was"
   );
   assert_eq!(
@@ -403,18 +425,8 @@ fn a_restart_claims_each_slab_once_and_reads_its_windows_in_their_slots() {
     held_chunks,
     "each slab's block claimed once"
   );
-  carry_blocks((&windows, &chunks), (&restored, &mut successor), &put);
-  assert!(restored.lend_in(&mut successor));
-  // The trimmed window's tail lies past the head this test can copy across; its placement is held by its piece above.
-  for (window, bytes) in put.iter().filter(|(_, bytes)| bytes.len() <= WINDOW) {
-    let read = restored.read(*window).unwrap();
-    assert_eq!(
-      &read[..],
-      &bytes[..],
-      "window {window:?} read back in its slot"
-    );
-  }
-  assert!(restored.hand_back(&mut successor));
+  carry_slab_blocks(&put, (&windows, &chunks), (&restored, &mut successor));
+  read_back_in_slots(&put, &mut restored, &mut successor);
   let asked: usize = put.iter().map(|(_, bytes)| bytes.len()).sum();
   assert_eq!(
     windows_row(&successor).1,
@@ -427,56 +439,68 @@ fn a_restart_claims_each_slab_once_and_reads_its_windows_in_their_slots() {
 /// head shorter than its bytes.
 const TRIMMED_WINDOW: usize = 2 * PAGE + PAGE / 2;
 
-/// Puts and names 40 windows of arena-15's mean length, one of a whole window and one of [`TRIMMED_WINDOW`] in
-/// `windows`, lent `chunks`: each window's handle and bytes.
-fn put_named(
-  windows: &mut ChunkWindows,
-  chunks: &mut ChunkStore,
-) -> Vec<(slates_vcs::StoredWindow, Vec<u8>)> {
+/// Puts 40 windows of arena-15's mean length, one of a whole window and one of [`TRIMMED_WINDOW`] into `windows`, lent
+/// its chunk store, each named by an identity of its number: each window and its bytes.
+fn put_restart_windows(windows: &mut ChunkWindows) -> Vec<(slates_vcs::StoredWindow, Vec<u8>)> {
   use slates_vcs::WindowStorage;
-  assert!(windows.lend_in(chunks));
-  let put = (0..42u64)
-    .map(|n| {
-      let len = match n {
-        40 => WINDOW,
-        41 => TRIMMED_WINDOW,
-        _ => MEAN_WINDOW,
-      };
-      let bytes = window_bytes(n, len);
-      let window = windows.put(&bytes).unwrap();
-      windows.named(
-        window,
-        &slates_vcs::ContentId([u8::try_from(n).unwrap(); 32]),
-      );
-      (window, bytes)
-    })
-    .collect();
-  assert!(windows.hand_back(chunks));
+  let mut put = Vec::new();
+  for n in 0..42u64 {
+    let len = match n {
+      40 => WINDOW,
+      41 => TRIMMED_WINDOW,
+      _ => MEAN_WINDOW,
+    };
+    let bytes = window_bytes(n, len);
+    let window = windows.put(&bytes).unwrap();
+    let identity = slates_vcs::ContentId([u8::try_from(n).unwrap(); 32]);
+    windows.named(window, &identity);
+    put.push((window, bytes));
+  }
   put
 }
 
-/// Copies each window's block from the first store's arena into the successor's, as the anchor's content object carries
-/// the arena's bytes across a restart.
-fn carry_blocks(
-  (first, first_chunks): (&ChunkWindows, &ChunkStore),
-  (successor, successor_chunks): (&ChunkWindows, &mut ChunkStore),
+/// Copies the block each of `put`'s windows lies in from the first arena into the restored one, as the anchor's content
+/// object carries the arena's bytes across a restart.
+fn carry_slab_blocks(
   put: &[(slates_vcs::StoredWindow, Vec<u8>)],
+  (windows, chunks): (&ChunkWindows, &ChunkStore),
+  (restored, successor): (&ChunkWindows, &mut ChunkStore),
 ) {
-  let block_of = |held: &ChunkWindows, store: &ChunkStore, window| {
-    let (chunk, _) = held.held[window].placed.unwrap().slot().unwrap();
-    store.chunk(chunk).unwrap().block
-  };
   for (window, _) in put {
-    let from = first_chunks
+    let block_of = |held: &ChunkWindows, store: &ChunkStore| {
+      let (chunk, _) = held.held[window].placed.unwrap().slot().unwrap();
+      store.chunk(chunk).unwrap().block
+    };
+    let from = chunks
       .arena()
-      .bytes(block_of(first, first_chunks, window))
+      .bytes(block_of(windows, chunks))
       .unwrap()
       .to_vec();
-    let into = block_of(successor, successor_chunks, window);
-    successor_chunks
+    let into = block_of(restored, successor);
+    successor
       .arena_mut()
       .bytes_mut(into)
       .unwrap()
       .copy_from_slice(&from);
   }
+}
+
+/// Each of `put`'s windows read back from `restored`, lent `successor`, byte for byte in its slot.
+fn read_back_in_slots(
+  put: &[(slates_vcs::StoredWindow, Vec<u8>)],
+  restored: &mut ChunkWindows,
+  successor: &mut ChunkStore,
+) {
+  use slates_vcs::WindowStorage;
+  assert!(restored.lend_in(successor));
+  // A trimmed window's tail lies past the head this test can copy across; its placement is held by its piece.
+  for (window, bytes) in put.iter().filter(|(_, bytes)| bytes.len() <= WINDOW) {
+    let read = restored.read(*window).unwrap();
+    assert_eq!(
+      &read[..],
+      &bytes[..],
+      "window {window:?} read back in its slot"
+    );
+  }
+  assert!(restored.hand_back(successor));
 }

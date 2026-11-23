@@ -513,7 +513,7 @@ pub struct Unrestored {
 struct Making {
   /// The files a run makes whole and their runs, once found.
   wholes: Option<Vec<(usize, usize)>>,
-  /// The files named for the object they are made the whole of, once found ([`Green::named_files`]).
+  /// The files named for the object they are made the whole of, once found ([`named_files`]).
   names: Option<Vec<(usize, crate::named::Identity)>>,
   /// The next effect to look at.
   next: usize,
@@ -5412,7 +5412,7 @@ impl Green {
 
   ///
   /// `names` are the effects' places whose files are named for the object they are the whole of
-  /// ([`Green::named_files`]).
+  /// ([`named_files`]).
   fn commit(
     &mut self,
     mut effects: Vec<Effect>,
@@ -5584,7 +5584,7 @@ impl Green {
   /// Applies one accepted effect at `version`, but a file's removal or new bytes, which are staged for the end of the
   /// commit ([`Staged`]), and a copy, which `commit_copies` applied first.
   ///
-  /// A file's new bytes are named `name` when they are the whole of that object ([`Green::named_files`]).
+  /// A file's new bytes are named `name` when they are the whole of that object ([`named_files`]).
   fn apply_effect(
     &mut self,
     effect: Effect,

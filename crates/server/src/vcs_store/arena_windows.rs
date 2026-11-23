@@ -352,7 +352,7 @@ impl ChunkWindows {
     // fill a 4 KiB granule three at a time and a 16 KiB one fourteen. A window of a granule or more shares nothing.
     let granule = self.chunks.block_bytes(1);
     let shares = bytes.len() < granule;
-    if shares && let Some(placed) = self.fill_next_slot(bytes)? {
+    if shares && let Some(placed) = self.write_into_filling(bytes)? {
       return Ok(Some(placed));
     }
     let want = if shares { granule } else { bytes.len() };
@@ -392,7 +392,7 @@ impl ChunkWindows {
   }
 
   /// `bytes` written into the filling slab's next slot, or none when there is no filling slab or they do not fit.
-  fn fill_next_slot(&mut self, bytes: &[u8]) -> Result<Option<Placed>, ContentRefused> {
+  fn write_into_filling(&mut self, bytes: &[u8]) -> Result<Option<Placed>, ContentRefused> {
     let Some((key, cursor, end)) = self.filling else {
       return Ok(None);
     };

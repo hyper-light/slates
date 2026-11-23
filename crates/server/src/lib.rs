@@ -114,12 +114,14 @@ mod merge_origin;
 pub mod merge_service;
 mod mirror;
 mod mounted_work;
-/// The planned move of a volume to another fleet member (§4.10, A-291).
+// The planned move of a volume to another fleet member (§4.10, A-291).
 mod moves;
 // A host admitted again under its own id yields the volumes it catalogued (A-334, §4.8 "Authority scope").
 mod readmission;
 mod refining;
 mod remote_attach;
+// Creates parked for the room an extent's remake owes them (A-789, Windows).
+mod room_wait;
 mod work_home;
 // The writes acknowledged since the last publication, kept in anchor RAM (A-63): a FUSE mount's (Linux) and a Shards
 // stream's (every platform; A-316, A-339, A-402).

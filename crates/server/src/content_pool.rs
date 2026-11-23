@@ -402,8 +402,7 @@ impl ContentPool {
     for (order, id) in self.candidates().enumerate() {
       // An extent whose section is not made, or not yet held by the anchor, is passed over (A-789, Windows): data never
       // lands where a daemon's death would lose it.
-      #[cfg(windows)]
-      if crate::content_extents::installed() && !crate::content_extents::ready(id) {
+      if !claimable_now(id) {
         continue;
       }
       if !matches!(self.segment.pool_owner(usize::from(id)), Ok(None)) {
@@ -459,6 +458,22 @@ impl ContentPool {
   }
 }
 
+/// Whether extent `id` may be claimed now: on Windows, where each extent is a section of its own (A-789), only once it
+/// is made and held by the anchor; elsewhere always, as is a Windows daemon's with no anchor holding its extents. What
+/// the pool counts as free room ([`ExtentSource::available`]) and what a claim takes agree on this, so a refusal never
+/// names room no claim could take: until 2026-11-23 the count took every free extent, and a create refused while the
+/// holds were under way named the whole pool as available (5,722,144,768 bytes, diag run 45238179939).
+#[cfg(windows)]
+fn claimable_now(id: u16) -> bool {
+  !crate::content_extents::installed() || crate::content_extents::ready(id)
+}
+
+/// [`claimable_now`] off Windows: an extent of the pool is always claimable once free.
+#[cfg(not(windows))]
+fn claimable_now(_id: u16) -> bool {
+  true
+}
+
 impl ContentPool {
   /// Gives a released extent's memory back to the system where it is an object of its own (macOS): its name removed,
   /// so the object and every page in it go with the mapping just dropped, then made again, empty, for its next claim
@@ -469,14 +484,16 @@ impl ContentPool {
     // section and returns its commit, then makes the extent again and has it held. Until then the extent is not ready.
     #[cfg(windows)]
     if crate::content_extents::installed() {
-      drop(crate::content_extents::take(id));
+      drop(crate::content_extents::take_for_remake(id));
       let Some((_, (_, len))) = self.part(id) else {
+        crate::content_extents::end_remake(id);
         return;
       };
       if slates_rt::futures::spawn(crate::content_extents::remake(id, len))
         .and_then(slates_rt::futures::detach)
         .is_err()
       {
+        crate::content_extents::end_remake(id);
         self.refused = self.refused.saturating_add(1);
       }
       return;
@@ -496,6 +513,27 @@ impl ContentPool {
       self.refused = self.refused.saturating_add(1);
     }
   }
+
+  /// Gives a released extent's pages back to the system where the extent is a range of the anchor's one content object
+  /// (Linux's memfd), before its mapping is dropped. A memfd's pages belong to the object and outlive every mapping of
+  /// them, so a release that only unmapped left the extent's pages resident: a 64 MiB burst's destroyed volume left the
+  /// object at 69 to 73 MiB and its arena at 4 (adacachy2 and CI, 2026-11-23). The hole is punched through the extent's
+  /// own mapping (`Region::discard`: `MADV_REMOVE`, which on shmem is `fallocate(PUNCH_HOLE | KEEP_SIZE)` of the range,
+  /// madvise(2)), the call the idle purge already gives a free run back with, so the pages leave every mapping of the
+  /// object, the anchor's included, and the range reads zeros for its next claimant: the object fell to 12 MiB, and the
+  /// punch of that 256 MiB extent with 65 MiB resident took 0.17 ms (adacachy2, debug, load 54). A refusal (a mapping
+  /// locked whole) is counted; the extent then keeps its pages. A private mapping (no content object) goes with its unmap.
+  #[cfg(target_os = "linux")]
+  fn punch(&mut self, region: &mut Region) {
+    if self.content.is_some() && !region.discard(0, region.len()) {
+      self.refused = self.refused.saturating_add(1);
+    }
+  }
+
+  /// Where an extent is an object or a section of its own (macOS, and Windows under an anchor), [`ContentPool::give_back`]
+  /// frees it whole after the unmap: nothing to punch first.
+  #[cfg(not(target_os = "linux"))]
+  fn punch(&mut self, _region: &mut Region) {}
 }
 
 impl ExtentSource for ContentPool {
@@ -544,7 +582,8 @@ impl ExtentSource for ContentPool {
     }
   }
 
-  fn release(&mut self, id: u16, region: Region) {
+  fn release(&mut self, id: u16, mut region: Region) {
+    self.punch(&mut region);
     // Unmapped first: the word may be claimed by another shard the moment it is released.
     drop(region);
     self.give_back(id);
@@ -564,11 +603,22 @@ impl ExtentSource for ContentPool {
     let hold_open = self.hold_open;
     self
       .candidates()
+      .filter(|id| claimable_now(*id))
       .filter(|id| match self.segment.pool_owner(usize::from(*id)) {
         Ok(None) => true,
         Ok(Some(POOL_HOLD_OWNER)) => hold_open,
         _ => false,
       })
+      .filter_map(|id| self.part(id).map(|(_, (_, len))| len))
+      .sum()
+  }
+
+  #[cfg(windows)]
+  fn pending(&self) -> usize {
+    self
+      .candidates()
+      .filter(|id| crate::content_extents::remaking(*id))
+      .filter(|id| matches!(self.segment.pool_owner(usize::from(*id)), Ok(None)))
       .filter_map(|id| self.part(id).map(|(_, (_, len))| len))
       .sum()
   }

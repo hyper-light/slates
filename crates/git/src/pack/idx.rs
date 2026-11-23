@@ -25,8 +25,8 @@
 //!   checksum, every offset inside the pack's objects, the objects back to back from the header to the trailer, and
 //!   each one's CRC32 over its bytes, so compressed bytes can be copied from pack to pack as git copies them, "without
 //!   undetected data corruption" [B: gitformat-pack, idx v2].
-//! - [`write`] writes an index as git 2.50.1 writes it, byte for byte: the entries sorted by id, an offset past
-//!   2^31 - 1 in the 8-byte table, and that table's entries numbered in id order.
+//! - [`write`](fn@write) writes an index as git 2.50.1 writes it, byte for byte: the entries sorted by id, an offset
+//!   past 2^31 - 1 in the 8-byte table, and that table's entries numbered in id order.
 //!
 //! **Stricter than git where git trusts its own files.** A server reads indexes it did not write (an imported
 //! repository's, §4.17.2 piece 15), so each of these is refused by kind:
@@ -47,7 +47,7 @@
 //!
 //! **Bounds (§4.9, §4.2).** Every length is checked against the file before a byte past it is read. [`Idx::decode`]
 //! allocates nothing; [`Idx::check_pack`] orders the objects by offset in a table it charges to the caller's
-//! [`Admission`] before it is built; [`write`] sorts the caller's entries in place and allocates nothing.
+//! [`Admission`] before it is built; [`write`](fn@write) sorts the caller's entries in place and allocates nothing.
 
 use super::{Checksummed, Pack, checksum_of};
 use crate::entry::PACK_HEADER_LEN;
@@ -651,7 +651,7 @@ fn large_count(entries: &[Entry], small_max: u64) -> usize {
     .count()
 }
 
-/// The bytes [`write`] writes for `entries` in `format`'s hash.
+/// The bytes [`write`](fn@write) writes for `entries` in `format`'s hash.
 pub fn written_len(format: ObjectFormat, entries: &[Entry]) -> u64 {
   len_of(
     format,
@@ -660,7 +660,7 @@ pub fn written_len(format: ObjectFormat, entries: &[Entry]) -> u64 {
   )
 }
 
-/// The bytes [`write`] writes for `count` entries, `large` of them past 2^31 - 1, in `format`'s
+/// The bytes [`write`](fn@write) writes for `count` entries, `large` of them past 2^31 - 1, in `format`'s
 /// hash: an index sized before it is written (A-665's view answers a listing with it).
 pub fn len_of(format: ObjectFormat, count: usize, large: usize) -> u64 {
   fixed_len(count, format.raw_len())
@@ -668,7 +668,7 @@ pub fn len_of(format: ObjectFormat, count: usize, large: usize) -> u64 {
     .map_or(u64::MAX, to_u64)
 }
 
-/// Whether [`write`] puts an entry beginning `offset` bytes into its pack in the 8-byte table.
+/// Whether [`write`](fn@write) puts an entry beginning `offset` bytes into its pack in the 8-byte table.
 pub fn is_large(offset: u64) -> bool {
   offset > u64::from(SMALL_MAX)
 }
@@ -683,9 +683,9 @@ pub fn write(
   write_above(entries, pack_checksum, u64::from(SMALL_MAX), out)
 }
 
-/// [`write`], with every offset past `small_max` in the 8-byte table: git's `off32_limit`, which only git's own
-/// `index-pack --index-version=2,<offset>` lowers ("to force 64-bit index entries on objects located above the given
-/// offset"). The golden vector of a table in use is made so, since no small pack has an offset past 2^31 - 1.
+/// [`write`](fn@write), with every offset past `small_max` in the 8-byte table: git's `off32_limit`, which only git's
+/// own `index-pack --index-version=2,<offset>` lowers ("to force 64-bit index entries on objects located above the
+/// given offset"). The golden vector of a table in use is made so, since no small pack has an offset past 2^31 - 1.
 pub(crate) fn write_above(
   entries: &mut [Entry],
   pack_checksum: ObjectId,

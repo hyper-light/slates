@@ -2953,6 +2953,7 @@ pub fn serve(
         || crate::image::join_in_flight(state, origin, id)
         || crate::direct_map::join_in_flight(state, origin, id)
         || crate::lease_wait::join(state, origin, id)
+        || crate::room_wait::join(state, origin, id)
         || crate::work_home::join(state, origin, id)
       {
         return Served::Forwarded;
@@ -3511,6 +3512,7 @@ fn run_forwarded(
         || crate::image::join_in_flight(state, origin, id)
         || crate::direct_map::join_in_flight(state, origin, id)
         || crate::lease_wait::join(state, origin, id)
+        || crate::room_wait::join(state, origin, id)
         || crate::work_home::join(state, origin, id)
       {
         return None;
@@ -5643,7 +5645,16 @@ pub(crate) fn dispatch(
     Ok(fenced) => fenced,
     Err(refusal) => return refused(refusal),
   };
+  // A bounded create refused for room that a remake of the pool's extents owes it waits for the remake (A-789,
+  // `crate::room_wait`): parked with its body, it runs again as each remake ends, and is answered then.
+  let parkable = crate::room_wait::parkable(&body).then(|| body.clone());
+  crate::room_wait::begin(state);
   let reply = dispatch_inner(state, client_id, principal, body);
+  if let Some(body) = parkable
+    && crate::room_wait::park_if_owed(state, client_id, principal, body)
+  {
+    return crate::lease_wait::parked_reply();
+  }
   if let Some(volume) = fenced
     && matches!(reply, ReplyBody::Destroyed)
   {
@@ -7433,7 +7444,11 @@ pub(crate) fn admit_over(
     SizeClass::Bounded { limit } => match state.store.reserve(limit) {
       Ok(r) => Some(r),
       Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
-        report_first_budget_refusal(state, "bytes", limit, available);
+        // Room the remakes of the pool's extents in flight would make is waited for (`crate::room_wait`, A-789), so
+        // only a refusal that waits for nothing is the shard's first to report.
+        if !crate::room_wait::note_refusal(state, limit) {
+          report_first_budget_refusal(state, "bytes", limit, available);
+        }
         return Err(Box::new(refused(Refusal::BudgetExceeded { available })));
       }
       Err(e) => {
@@ -7995,7 +8010,7 @@ pub(crate) fn reconcile_candidate_claims(
 }
 
 /// The bytes this shard's candidate claim on `id` holds for its content ([`CandidateClaim`]), none without one: what a
-/// taken-over volume's restore counts as its own beside what the shard could admit ([`restore_taken_over`]).
+/// taken-over volume's restore counts as its own beside what the shard could admit ([`restore_admitted`]).
 pub(crate) fn claimed_bytes(state: &ShardState, id: DbVolumeId) -> u64 {
   state
     .candidate_claims
@@ -17273,8 +17288,8 @@ pub(crate) fn discard_making(state: &mut ShardState, id: DbVolumeId) {
 /// Finishes making taken-over volume `id` once its tree is laid ([`populate_making`]): a dynamic volume's hold for the
 /// inodes it was restored with (A-342), its record created under the adopted catalog and published, and the tree sealed
 /// as the taken-over head: the snapshot at the adopted sequence, carrying the manifest identity the head names and the
-/// placement the head recorded (`region`), so the successor answers for it as the dead owner did
-/// ([`materialize_taken_over`]'s doc). A volume not being made here is `NotFound`.
+/// placement the head recorded (`region`), so the successor answers for it as the dead owner did (the doc of
+/// `materialize_taken_over`, the tests' making in one call). A volume not being made here is `NotFound`.
 pub(crate) fn finish_making(
   state: &mut ShardState,
   id: DbVolumeId,
@@ -20249,8 +20264,9 @@ fn replay_green(
   replay_green_keeping(state, id, Vec::new())
 }
 
-/// [`replay_green`], its named texts read from the content plane, then from `kept` (sorted by identity, each an
-/// object's whole bytes: [`remake_green`]'s).
+/// Green `id` replayed from its durable chain into a fresh engine, as a recovery replays it (the tests' `replay_green`
+/// keeps nothing), its named texts read from the content plane, then from `kept` (sorted by identity, each an object's
+/// whole bytes: [`remake_green`]'s).
 fn replay_green_keeping(
   state: &ShardState,
   id: DbVolumeId,
