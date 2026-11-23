@@ -428,7 +428,9 @@ struct Making {
   /// The next effect to look at.
   next: usize,
   /// The file under way.
-  current: Option<FileMaking>,
+  /// Boxed: a verdict is held in [`Judgment::Accepted`] beside small variants, and the file under way is the most of
+  /// it (clippy's `large_enum_variant`, 2026-11-22, once A-866 added the names).
+  current: Option<Box<FileMaking>>,
 }
 
 /// One file under way ([`Making`]): its place among the effects, its bytes as pieces of its base and the post-state,
@@ -6122,7 +6124,7 @@ impl Green {
     }
     while copied < budget {
       if judged.making.current.is_none() {
-        judged.making.current = self.next_to_make(judged);
+        judged.making.current = self.next_to_make(judged).map(Box::new);
       }
       let Some(mut file) = judged.making.current.take() else {
         let wholes = judged.making.wholes.clone().unwrap_or_default();
