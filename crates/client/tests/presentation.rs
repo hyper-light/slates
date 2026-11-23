@@ -47,7 +47,7 @@ fn hex(bytes: &[u8]) -> String {
 fn unhex<const N: usize>(text: &str) -> [u8; N] {
   let mut bytes = [0u8; N];
   for (at, byte) in bytes.iter_mut().enumerate() {
-    *byte = u8::from_str_radix(&text[at * 2..at * 2 + 2], 16).unwrap();
+    *byte = u8::from_str_radix(text.get(at * 2..at * 2 + 2).unwrap(), 16).unwrap();
   }
   bytes
 }
