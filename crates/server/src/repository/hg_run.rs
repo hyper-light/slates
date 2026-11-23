@@ -232,9 +232,25 @@ pub(crate) const TEXTS_PINNED: &str = "vcs.hg.push_texts_pinned";
 /// Lets go of `contents`, a landed segment's file revisions' windows (module docs, "Let go"): every window but those a
 /// home holds here (`vcs_store::landed_pin`), counted with its bytes, and the windows kept pinned.
 pub(crate) fn let_go_landed(state: &mut ShardState, contents: &[slates_vcs::ContentId]) {
+  let (freed, pinned) = let_go_windows(state, contents);
+  if freed > 0 {
+    state.count(TEXT_BYTES_LET_GO, freed);
+  }
+  if pinned > 0 {
+    state.count(TEXTS_PINNED, pinned);
+  }
+}
+
+/// Lets go of `contents`' windows, each object's every window marked landed: all but those a home holds here
+/// (`vcs_store::landed_pin`, as a landed git pack's), within the chunk store's lend. The bytes freed and the windows
+/// kept pinned: a push's ([`let_go_landed`]) and an import's (`hg_import::segment_landed`) one path.
+pub(crate) fn let_go_windows(
+  state: &mut ShardState,
+  contents: &[slates_vcs::ContentId],
+) -> (u64, u64) {
   let (shard, shards) = (state.shard, state.shards.clone());
   // The repository's windows are the shard's chunk store's, lent to its content store for the step.
-  let (freed, pinned) = crate::vcs_store::lent_state(state, |state| {
+  crate::vcs_store::lent_state(state, |state| {
     crate::vcs_store::within_budget(state, 0, |stores| {
       stores.content_mut().map_or((0, 0), |content| {
         contents
@@ -247,13 +263,7 @@ pub(crate) fn let_go_landed(state: &mut ShardState, contents: &[slates_vcs::Cont
           })
       })
     })
-  });
-  if freed > 0 {
-    state.count(TEXT_BYTES_LET_GO, freed);
-  }
-  if pinned > 0 {
-    state.count(TEXTS_PINNED, pinned);
-  }
+  })
 }
 
 /// `repository`'s landing turn for a push's entry's commit (module docs, "Apart from the turn"), parking for it where

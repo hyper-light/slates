@@ -637,6 +637,14 @@
 >   `a_long_push_stale_twice_is_re_based_once_holding_the_turn_and_lands`,
 >   `a_dropped_run_is_forgotten_and_the_next_push_lands_past_it`, and the crash oracle killed with an unnamed run's rows
 >   present (`t_b1_a_crash_at_any_segment_boundary_leaves_a_push_whole_or_absent`).
+> - An import's file texts let go BUILT (2026-11-22, w-hg; C1 2b, main 01a20182's ruling of 02:52): each segment carries
+>   its file revisions' contents (`import::emit::Segment::contents`); once the segment is durable its windows are let
+>   go through the push's one path (`hg_run::let_go_windows`, pin-guarded by `vcs_store::landed_pin`), and once more when
+>   the import lands, since its bookmark works (2b (1), 609c1f03c) bring back what they read. A test's one-call landing
+>   builds the works over the same read-through (`built_works_whole`, each want answered on a thread of its own).
+>   Counted `vcs_store.hg_import.file_text_bytes_let_go`, `..._file_texts_pinned`. Held by
+>   `an_imported_repositorys_file_texts_leave_the_content_store_once_its_segments_land` (`states`: 4 of 5 windows let
+>   go, the fifth pinned; the clone served). The pin's open question below holds for it too.
 > - A landed push's file texts let go BUILT (2026-11-22, w-hg; main 01a20182's order of 14:00, CI 45065911852: 4.7 GB
 >   of arena held on the repository's shard after Mercurial's history landed, the content store keeping every text).
 >   Each segment carries its file revisions' content identities (`PushSegment::contents`, counted in the bound); once
@@ -817,9 +825,11 @@
 > `fsck --strict`.
 > A-864's readers BUILT (2026-11-22, w-git; main's r52): every git read before a fetch's pack (the advertisement's
 > and ls-refs' peel, the negotiation, the cuts) holds a refusal that met a let-go window and is made again once it is
-> brought back; a fetch lets the windows it brought back go behind its cursor (piece 3); bring-backs bounded; the landed
-> pack's let-go in `vcs_store::commit` re-enabled (main's guard c9bb36dc5 lifted). Owed: the push decision's reads
-> (receive works), estimated next; the git/git mirror clone's stall at 183,511 bytes (main's sample), before the pack.
+> brought back; a fetch lets the windows it brought back go behind its cursor (piece 3); bring-backs bounded. The landed
+> pack's let-go in `vcs_store::commit` stays guarded (main 01a20182, 2026-11-22: lifted at 01ae9fc26, put back) until
+> the readers still synchronous are covered: (a) the deferred green build through views.rs (w-shared), (b) a push's thin
+> bases through `IndexedObjects::object` and (c) its policy and signature reads (w-git). Owed too: the git/git mirror
+> clone's stall at 183,511 bytes (main's sample), before the pack.
 > A-864 BUILT (2026-11-22, w-git; main's r17): a reused pushed entry was rebuilt to be checked (inflated, its base and
 > itself reconstructed, named), so git/git's clone, every entry reused, ran past 120 s. Now each row keeps its entry's
 > raw length, CRC32 and base (git's pack index, A-864); reuse checks the CRC32 and copies, no object read; a miss is
