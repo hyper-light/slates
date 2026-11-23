@@ -884,6 +884,32 @@ impl ChunkArena {
     Ok(extent)
   }
 
+  /// Sets the bytes the block whose head is `head` is asked for to `asked`, at most the head's length, and its owner's
+  /// asked bytes with it: a block several callers share (a slab of repository windows, goal 93) asks what its live
+  /// callers need, so its owner's asked against its held names the slots let go as well as the rounding. A head no
+  /// owner holds changes nothing.
+  pub fn reask(&mut self, head: Extent, asked: usize) {
+    let granule = self.granule.max(1);
+    let asked = u32::try_from(asked.min(head.len())).unwrap_or(u32::MAX);
+    let Some(slot) = self.slot_mut(head.region) else {
+      return;
+    };
+    let at = head.offset().checked_div(granule).unwrap_or(0);
+    let Some(owner) = slot.heads.get(at).copied().and_then(Owner::of_code) else {
+      return;
+    };
+    let Some(kept) = slot.asked.get_mut(at) else {
+      return;
+    };
+    let was = core::mem::replace(kept, asked);
+    if let Some(total) = self.owned.get_mut(owner.index()) {
+      total.asked = total
+        .asked
+        .saturating_sub(u64::from(was))
+        .saturating_add(u64::from(asked));
+    }
+  }
+
   /// [`ChunkArena::alloc`] before the block is recorded as its owner's.
   fn alloc_block(&mut self, len: usize) -> Result<Extent, MemError> {
     self.allocations = self.allocations.saturating_add(1);

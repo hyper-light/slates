@@ -460,6 +460,7 @@ mod round_trip_tests {
   /// measurement of the handshake, under a second on loopback, at its clock's resolution: milliseconds on macOS,
   /// microseconds on Linux and Windows.
   #[test]
+  #[cfg_attr(miri, ignore = "Miri's isolation has no sockets; plain lanes run it")]
   fn an_accepted_connection_carries_its_handshakes_round_trip() {
     let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), 1).unwrap();
     let address = listener.local_addr().unwrap();
