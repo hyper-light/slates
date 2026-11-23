@@ -336,9 +336,14 @@
 >   rejected. A napping client alone (H) put loaded accept p99 over 1 ms in 5 of 5 arm64 rounds against main's 2, and
 >   CI's runners have no RealtimeKit to grant the real-time class (run 45115263387: no package, unit or bus name;
 >   `RLIMIT_RTPRIO` 0; ubuntu-latest is now Ubuntu 26.04.1 on kernel 7.0.0-1020-azure).
->   **Open (main to Ada):** 84a's 1 ms loaded bar on Linux. In the fair class it is below the kernel's 1 ms tick, and
->   in the real-time class the client's own time-share code waits whole slices. The measured floor is about one tick a
->   hop, 1.3-2.0 ms p99.
+>   On CI's VMs 84a's 1 ms loaded bar on Linux lay below the kernel's 1 ms tick in the fair class, the measured floor
+>   about one tick a hop, 1.3-2.0 ms p99. The bar is bare metal's (Ada, 2026-11-23), so the CI-VM arms stop there.
+>   **Bare metal MET with the shards in `SCHED_RR` (A-872, w-perf for main 01a20182, 2026-11-23; BENCHMARKS "84a on
+>   Linux bare metal").** On adacachy2 (CachyOS 7.3.3, `CONFIG_PREEMPT=y`, `HZ=1000`, `RLIMIT_RTPRIO` 99) the shards'
+>   class held the loaded p99 under 1 ms in 11 of 11 rounds and the p999 in 20 of 22 checks, where main held the p999
+>   in 2 of 8. Its cost: R9's spinning median 12-20 -> 17-27 µs (a real-time shard parks at once), its p99 better.
+>   Grant or skip: an account that grants no real-time priority (CI's) keeps the fair class and its tails. The client's
+>   reply wait in the class (D', D'') was measured and not taken. Owed: main's confirming round on main.
 > - Windows (CI, run 44857045148): no 1 ms band (queued p99 5–49 µs); accept p99 0.13–0.31 ms, conflict 0.11–0.29 ms;
 >   p999 0.2–62 ms. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–7).
 >

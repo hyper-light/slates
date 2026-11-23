@@ -17721,6 +17721,51 @@ held a fixed shard was not separated (DPC time on the busiest CPUs was 7.8-10.9%
 second machine-wide). The runtime's long polls on Windows carry no attribution (`NoClock`): its attribution has no
 per-thread clock there, a gap of its own.
 
+## 84a on Linux bare metal: the shards in the round-robin real-time class where granted, accepted; the client's whole-wait raise not taken (A-872; main 01a20182's A/Bs, w-perf's arms; 2026-11-23)
+
+**Machine.** adacachy2: x86_64, 32 CPUs, CachyOS on kernel 7.3.3 (`CONFIG_PREEMPT=y`, full preemption, `HZ=1000`).
+The account's `RLIMIT_RTPRIO` is 99 (`limits.d/20-audio.conf`, the audio group) and `RLIMIT_RTTIME` unlimited. main's
+bench ran in a user scope at CPUWeight 100, outside kiln's weight-1 agents subtree; other load about 5. Arms interleaved.
+
+**The arms.**
+- **A:** main.
+- **B:** the shards in `SCHED_RR` where granted, parking at once when idle (374ce0e8e, w-perf's 21179849c on main;
+  landed as A-872).
+- **D':** B and the client's reply wait raised to `SCHED_RR` a park at a time (933ec74f8, w-perf's 69c483e8d and
+  7cba67b4a).
+- **D'':** B and the client's reply wait held in `SCHED_RR` from its first park until it returns (71e7945fe on
+  `agents/w-perf-84a-linux-rr`, never main).
+- **E** (an earlier round the same day, scratch 833ca76da, A B B A A B): EEVDF's requested slice, w-perf's arm E ported.
+
+**Results.** Loaded edit and merge (`--spinners-per-core 2 --files 10`, 3 × 1,000 samples a form), µs:
+
+| run | arm | loaded p99 | loaded p999 | other |
+|---|---|---|---|---|
+| E round | A | accept 553-1,150 | accept 960-1,850 | p50 77-94 |
+| E round | E | accept 764-817 | accept 1,080-1,140 | p50 169-325; the kernel holds 100 µs for a 50 µs ask |
+| 02:45-02:50 | A | accept 551-1,110 | accept 980-1,590; conflict 1,040-1,470 | quiet p50 37 |
+| 02:45-02:50 | B | 223-378, 7 of 7 rounds | under 1 ms in 12 of 14 (accept 1,120 and 1,060 over) | quiet p50 37 |
+| 02:45-02:50 | D' | 296-530 | under 1 ms in 13 of 14 (accept 1,060 once) | quiet p50 37 |
+| 03:19-03:22 | A | 736-1,060 | 900-1,440, 2 of 8 under | R9 spinning p99 145 / 57 / 104 |
+| 03:19-03:22 | B | 104-431 | 485-648, 8 of 8 under | R9 spinning p99 71 / 50 / 54 |
+| 03:19-03:22 | D'' | 344-536 | 6 of 8 under (1,010 and 1,030 over) | R9 spinning p99 63 / 50 / 60 |
+
+Quiet p99 was 70-107 µs in every arm of the second run. D'' counted right: `RealTimeWaits` taken 21,408-21,412 a run,
+0 declined, 0 restores refused.
+
+**Ruling (main 01a20182).**
+- **B: accepted, landed as A-872.** Across both runs it held the loaded p99 under 1 ms in 11 of 11 rounds and the p999
+  in 20 of 22 checks, where main held the p999 in 2 of 8 (second run).
+- **D' and D'': measured and not taken.** Holding the client's reply wait in the class added nothing on bare metal: D''
+  ran p99 344-536 µs and missed p999 twice where B missed none that run. It would also put a user's thread in the
+  real-time class. As built, D'' cut the raises to one a wait (red 2 for a wait with one wake and no reply,
+  `a_reply_wait_holds_the_real_time_class_from_its_first_park_until_it_returns`, on its branch).
+- **E: rejected again,** now under full preemption too: the kernel clamps a requested slice to 100 µs at the least
+  (`__setparam_fair`, kernel 7.3.3 `kernel/sched/fair.c`), and E's p50 was 2-4x main's.
+
+**The cost.** B's park at once (a real-time shard never spins idle) raised R9's spinning median, 12-20 µs in A against
+17-27 µs in B, while its p99 improved (145 / 57 / 104 against 71 / 50 / 54 µs). Owed: main's confirming round on main.
+
 ## 84a Linux: the per-thread fair slice on top of A-799, measured, not taken (g222; 2026-11-21)
 
 **The question** (main's 84a ruling, 2026-11-21). A-224's slice was rejected on loaded p50 excursions measured while
