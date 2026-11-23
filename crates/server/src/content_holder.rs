@@ -221,6 +221,11 @@ const KIND_VCS_AWAY: u8 = 15;
 /// then the record's (the pack's identity, its length and the window's offset).
 const KIND_VCS_LANDED_AT: u8 = 16;
 
+/// Format: the piece kind of a home's record of the Mercurial file revision a window it let go once landed holds (goal
+/// 93 item 2b(b), `vcs_store::homes::HgLanded`), keyed by the window identity's first 24 bytes; its bytes the identity,
+/// then the record's (the repository, the node, the path).
+const KIND_VCS_LANDED_HG: u8 = 17;
+
 /// The key of a repository content store's piece of `kind` for `identity`: its first 24 bytes, as a held chunk's is.
 fn vcs_node_key(kind: u8, identity: &slates_vcs::ContentId) -> PieceKey {
   let object: [u8; 16] = identity.0[..16].try_into().unwrap_or_default();
@@ -378,12 +383,27 @@ fn vcs_home_pieces(pieces: &mut Vec<slates_vfs::recover::HeldPiece>) {
       bytes: identity.0.to_vec(),
     });
   }
-  for (identity, at) in crate::vcs_store::homes::landed_here() {
+  for (identity, landed) in crate::vcs_store::homes::landed_here() {
+    let (kind, bytes) = landed_kind(&identity, &landed);
     pieces.push(slates_vfs::recover::HeldPiece {
-      key: vcs_node_key(KIND_VCS_LANDED_AT, &identity),
-      bytes: [identity.0.as_slice(), &at.to_bytes()].concat(),
+      key: vcs_node_key(kind, &identity),
+      bytes,
     });
   }
+}
+
+/// The kind of the piece a landed record of the window `identity` is kept under, and its bytes: the identity, then the
+/// record's (goal 93 item 2b(b)).
+fn landed_kind(
+  identity: &slates_vcs::ContentId,
+  landed: &crate::vcs_store::homes::Landed,
+) -> (u8, Vec<u8>) {
+  use crate::vcs_store::homes::Landed;
+  let (kind, record) = match landed {
+    Landed::Pack(at) => (KIND_VCS_LANDED_AT, at.to_bytes()),
+    Landed::Hg(hg) => (KIND_VCS_LANDED_HG, hg.to_bytes()),
+  };
+  (kind, [identity.0.as_slice(), &record].concat())
 }
 
 /// The repository content store's lists, names and objects let go as held pieces (a3b; A-851's windows let go), for
@@ -729,14 +749,13 @@ fn vcs_node_changes(
 fn vcs_landed_changes(
   (put, removed): (&mut Vec<slates_vfs::recover::HeldPiece>, &mut Vec<PieceKey>),
 ) {
-  for (identity, at) in crate::vcs_store::homes::landed_changes() {
-    let key = vcs_node_key(KIND_VCS_LANDED_AT, &identity);
-    match at {
-      Some(at) => put.push(slates_vfs::recover::HeldPiece {
-        key,
-        bytes: [identity.0.as_slice(), &at.to_bytes()].concat(),
-      }),
-      None => removed.push(key),
+  for (identity, landed, made) in crate::vcs_store::homes::landed_changes() {
+    let (kind, bytes) = landed_kind(&identity, &landed);
+    let key = vcs_node_key(kind, &identity);
+    if made {
+      put.push(slates_vfs::recover::HeldPiece { key, bytes });
+    } else {
+      removed.push(key);
     }
   }
 }
@@ -1004,7 +1023,7 @@ pub(crate) struct RecoveredHeld {
   /// The repository content store's windows let go, each with its length (A-767 C1 step 2b).
   pub(crate) aways: Vec<(slates_vcs::ContentId, u64)>,
   /// Where the windows landed packs carried lie on the node's store, as this shard's homes recorded (goal 93 item 2b(b)).
-  pub(crate) landed: Vec<(slates_vcs::ContentId, crate::vcs_store::homes::LandedAt)>,
+  pub(crate) landed: Vec<(slates_vcs::ContentId, crate::vcs_store::homes::Landed)>,
 }
 
 /// Why a recovered image's held pieces were refused (A-270): never read as less than was held, since a holder that
@@ -1159,7 +1178,22 @@ pub(crate) fn split_held(
           slates_vcs::ContentId::from_slice(identity).ok_or(HeldRefused::UnknownKind(kind))?;
         let at = crate::vcs_store::homes::LandedAt::from_bytes(at)
           .ok_or(HeldRefused::UnknownKind(kind))?;
-        held.landed.push((identity, at));
+        held
+          .landed
+          .push((identity, crate::vcs_store::homes::Landed::Pack(at)));
+      }
+      KIND_VCS_LANDED_HG => {
+        let (identity, hg) = piece
+          .bytes
+          .split_at_checked(slates_vcs::content::IDENTITY_BYTES)
+          .ok_or(HeldRefused::UnknownKind(kind))?;
+        let identity =
+          slates_vcs::ContentId::from_slice(identity).ok_or(HeldRefused::UnknownKind(kind))?;
+        let hg = crate::vcs_store::homes::HgLanded::from_bytes(hg)
+          .ok_or(HeldRefused::UnknownKind(kind))?;
+        held
+          .landed
+          .push((identity, crate::vcs_store::homes::Landed::Hg(hg)));
       }
       KIND_VCS_REGION_HOLD => {
         let identity =
