@@ -451,3 +451,6 @@ Waiting: arena-6 (churn) and arena-7 (lookup/branchmap times) from main.
   a step's worth.
 - The left-out view (secret or hidden) isn't reachable from the hg matrix: no evolution, pushes public, no import.
 Waiting: arena-6 and arena-7.
+- 83f1d4c00: GAPS records changeset evolution as the next completeness item: an evolution-enabled matrix row (amend
+  and rebase pushed with markers), the hidden view served, its branch heads kept. It's next after arena-6 and arena-7,
+  unless they name a memory or time item.
