@@ -17647,6 +17647,80 @@ and every round shown, as main extracted them from the run's log.
     the deferred replies were stamped. The zero-timeout kevent again took at least 1 ms in 7,000-13,000 of
     128,000-150,000 calls loaded, and in 0-8 quiet.
 
+## 84a on Windows bare metal: the OS places every shard, and the client waits one level up (A-871; main 01a20182; 2026-11-23)
+
+**Machine.** jupiter: an AMD Ryzen AI Max+ 395 (16 cores, 32 threads, one NUMA node), 123.6 GiB visible, Windows 11
+Pro build 26200, the Balanced power plan (`CPMINCORES` 0x32: core parking may park half the cores; EPP 25), timer
+resolution 15,625 µs throughout (`NtQueryTimerResolution`, read before and during the runs). The daemon runs in the
+bench's own process: 15 shards, 64 spinning threads (two a logical CPU).
+
+**How it was launched, and why.** kiln's agent job on jupiter fixes its processes' priority class at BelowNormal and
+every thread's level with it (`JOB_OBJECT_LIMIT_PRIORITY_CLASS`; limit flags 0x2020, no breakaway; inside it
+`SetThreadPriority(+1)` and `(+2)` answered success and `GetThreadPriority` stayed 0). There a shard cannot stand above
+its in-process load, and the first round, run inside the job, ran past 1,200 s with shards starved. Every round below
+was started through WMI's `Win32_Process.Create` with a `Win32_ProcessStartup` class (Normal, or BelowNormal where
+named), outside that job (its job allows breakaway and fixes nothing; a thread rose +1 and +2). A sampler confirmed each
+round's class and its threads' levels (Normal: 72 threads at 8, 15 shards at 9).
+
+**Command.** `edit_merge_bench --loaded-only|--quiet-only --spinners-per-core 2 --files 10 --form accept --form
+conflict` (3 × 1,000 samples a form). The diagnostic build is branch `main01a20182/84a-win-diag` (never main) at
+main 8e5ea5489 plus: a slow sample's wait before its shard read it and after its reply on the host clock (4f43ad69f),
+page faults a timed call (ee345e061), a parked shard's wake over 1 ms after its kick and a poll over 1 ms, logged by the
+runtime (54a3e9854), `DIAG_UNPIN` (9c40fdd79), the client's late takes (125e57c9d), `DIAG_NO_CLIENT_RAISE`
+(e8dd4a50b) and `DIAG_SOFT_PIN` (c640203da). Scripts `C:\Users\corph\.cache\main-84a-win\{launch2.ps1,round3.sh,round4.sh,round5.sh}`.
+
+**What held the tail.** Two waits, each a thread that did not run for milliseconds, with 0-3 page faults:
+- A parked shard woken late by its kick. Fixed to its core (main), 399-446 such wakes over 1 ms a quiet round, 27 over
+  16 ms; most on the shards serving the bench (shards 0-6). A quiet p999 of 3.4-6.7 ms in some rounds.
+- A parked client woken late by its reply. 245-492 replies a loaded round were taken over 1 ms after publication, up to
+  70.8 ms, almost all after one park a wake ended (no look, no unanswered wake). A woken client stood at its shards'
+  level (one above normal by the Event's boost), and Windows lets neither of two threads at one level take the other's
+  CPU. The loaded conflict p999 was 2.8-6.5 ms in every round of every placement.
+
+**Placement A/B** (client raise off; quiet then loaded, each P U U P):
+
+| round | shards | parked-shard wakes over 1 ms | accept p999 µs | conflict p999 µs |
+|---|---|---|---|---|
+| quiet 1 | fixed | 446 | 286 | 410 |
+| quiet 2 | OS-placed | 9 | 273 | 281 |
+| quiet 3 | OS-placed | 21 | 681 | 689 |
+| quiet 4 | fixed | 399 | 6,682 | 3,384 |
+| loaded 1 | fixed | 102 | 173 | 4,073 |
+| loaded 2 | OS-placed | 43 | 281 | 4,108 |
+| loaded 3 | OS-placed | 61 | 253 | 2,834 |
+| loaded 4 | fixed | 190 | 238 | 3,060 |
+
+**Client raise A/B** (shards OS-placed; loaded N R R N, then quiet):
+
+| round | client's wait | replies taken over 1 ms late | accept p99 / p999 µs | conflict p99 / p999 µs | max µs |
+|---|---|---|---|---|---|
+| loaded 1 | normal | 492 | 316 / 5,511 | 216 / 6,455 | 7,245 |
+| loaded 2 | one level up | 2 | 132 / 237 | 170 / 192 | 248 |
+| loaded 3 | one level up | 2 | 182 / 293 | 162 / 273 | 537 |
+| loaded 4 | normal | 331 | 128 / 340 | 281 / 5,594 | 6,025 |
+| quiet 5 | one level up | 14 | 148 / 208 | 178 / 329 | 3,487 |
+| quiet 6 | normal | 6 | 158 / 230 | 123 / 261 | 405 |
+
+**Placement with the raise on** (quiet S N N S, loaded S N N S, then one fixed round each; S = each shard's core named
+its ideal processor, N = OS-placed):
+
+| round | parked-shard wakes over 1 ms | accept p999 µs | conflict p999 µs |
+|---|---|---|---|
+| quiet S | 16 · 15 | 359 · 288 | 291 · 135 |
+| quiet N | 9 · 13 | 201 · 220 | 152 · 145 |
+| loaded S | 43 · 15 | 206 · 355 | 231 · 247 |
+| loaded N | 21 · 26 | 337 · 287 | 271 · 261 |
+| loaded fixed | 208 | 216 | 234 |
+| quiet fixed | 344 | 3,380 | 299 |
+
+**Landed** (A-871): the OS places every shard on Windows (`slates_machine::placement::Fixing::Waits`), and a Windows
+client's reply wait raises its thread one level above normal for the wait. With both, every loaded and quiet round's
+p99 and p999 were under 1 ms for both forms (p999 135-359 µs). The ideal processor was even with OS placement, so the
+simpler rule landed. Limits of this record: one machine; which of core parking, deep idle or deferred procedure calls
+held a fixed shard was not separated (DPC time on the busiest CPUs was 7.8-10.9% during a quiet round, ~2,000 DPCs a
+second machine-wide). The runtime's long polls on Windows carry no attribution (`NoClock`): its attribution has no
+per-thread clock there, a gap of its own.
+
 ## 84a Linux: the per-thread fair slice on top of A-799, measured, not taken (g222; 2026-11-21)
 
 **The question** (main's 84a ruling, 2026-11-21). A-224's slice was rejected on loaded p50 excursions measured while

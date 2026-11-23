@@ -3807,7 +3807,7 @@ fn long_push_patience(bundle: &[u8]) -> Duration {
 /// Lets a long push parked by [`a_long_push_parked`] go on.
 fn release_long_push(daemon: &Daemon) {
   crate::daemon::observe_at(daemon, REPOSITORY, |_| {
-    crate::repository::hg_run::TEST_RELEASE.with(|release| release.set(true));
+    crate::repository::hg_run::release_parked();
   });
 }
 

@@ -217,6 +217,14 @@
 >   and a runnable shard lost a 31.6 ms quantum to normal-priority load (stamps: 12-22 requests a round queued over
 >   10 ms, 16-22 over 10 ms mid-service). Loaded p999 18-85 ms -> 304-699 µs, p99 174-319 µs, quiet unchanged, on
 >   windows-latest and windows-11-arm, 3 interleaved rounds each (diag run 44948887874; BENCHMARKS).
+>   **Bare metal met too, with A-871 (main 01a20182, 2026-11-23; BENCHMARKS "84a on Windows bare metal").** On jupiter
+>   (Ryzen AI Max+ 395, 32 threads, Windows 11 Balanced, 64 spinners) CI's verdict did not hold: shards fixed to their
+>   cores had 399-446 parked-shard wakes over 1 ms a quiet round, and a woken client queued behind shards at its own
+>   level (245-492 replies a loaded round taken over 1 ms late; loaded conflict p999 2.8-6.5 ms in every round). A-871:
+>   the OS places every Windows shard, and a client's reply wait stands one level above normal. Every round after it,
+>   quiet and loaded: p99 under 1 ms and p999 135-359 µs, both forms. Measured outside kiln's agent job, which fixes
+>   every thread's level (inside it the first round starved past 1,200 s). Open: the runtime's long polls on Windows
+>   carry no attribution (`NoClock`).
 > - **The client's share:** `edit_merge_bench`'s client spins for its reply at default priority beside the load, so
 >   accept's p99/p999 beyond the daemon's part (macOS 0.8–2.6 / 7–9 ms with the nap fixed) is the harness's own
 >   thread waiting for a CPU.
