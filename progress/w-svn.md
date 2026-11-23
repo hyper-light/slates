@@ -706,3 +706,7 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
 - FUSE (linux) and WinFsp (windows) compile unchecked locally (no cross C toolchain): main to run platform checks.
 - Server svn focused: down to 4 failures; reds written: a_work_over_a_subversion_green_reads_and_edits_a_named_text_
   its_windows_let_go, a_mount_read_of_a_named_text_let_go_is_noted_brought_back_and_read_again.
+- OWED after 4c/4d (main, from w-git's push profile): (i) a read-only lend (is_owing, branch_version) takes and restores
+  the whole Lineage by value (~10k memmove samples / 30 s push): borrow instead; (ii) each lend makes and drops one
+  Green::default (Lent::new over the slot, previous Lent's Drop mem::take). Reds: counters of lends taken vs borrowed,
+  and Greens dropped per lend, asserted after the fix.
