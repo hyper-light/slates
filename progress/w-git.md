@@ -574,3 +574,15 @@
   attempted on main's word: 30 server lib tests red (test harness readers read let-go windows directly since 2b(b)
   unpinned audit shards); patch parked ~/.cache/w-git-guard-lift.patch. NEXT (main's order): deepen-by-one bug
   (git_interop.rs:2400), lfs_row test fix (lfs filter config on the clone), then the lift with harness bring-back.
+
+- 2026-11-22: r115 deepen LANDED 80586ec3e (merge 9ca9598c5): the session's repository kept default branch main
+  against git/git's master, so the work clone began unborn and its commit was a root; repository now made with the
+  source's default branch, red "the work clone checks out the source's tip" (left ""), green HTTP+SSH on a small
+  dataset; server deepen guarded at the edge with stock git 2.50's exact request. Clippy checked_div d616218c8;
+  lfs_row filter config 4db1a5e4d (merge 8e5ea5489; no git-lfs here, main's r144 runs it). GUARD LIFTED 76d8804c3
+  (merge 814aa4bd3): red a_pushed_pack_is_let_go_once_its_push_ends_and_a_clone_after_is_whole (0 bytes with the
+  guard); 31 harness reds (sync store calls with no bring-back) fixed by homed_drive bringing back and
+  KEEP_LANDED (cfg(test)) for synchronous audit histories; pre-existing on main: daemon t_c1_windows_let_go_survive_
+  warm_restarts and svn_commit a_revision_refused_at_publication. Lint split packed.rs:628 50dd194b6.
+  NEXT: main's r144 (lfs_row, verbs deepen row, git/git whole) and the lift's round; GAPS owed: SSH edge's link-price
+  writes, a price per client.
