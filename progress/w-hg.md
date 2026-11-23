@@ -541,3 +541,20 @@ Waiting: main's route; arena-7 and arena-8.
 - New rule from main: clippy -p <crate> --lib -D warnings on any new external-bytes parser before landing.
 - Evolution owed: decision 3's rewrite admission, the obsolete pushkey namespace (legacy). Next: the C1 cuts
   (intake::rebuilt, revision_text with object_bytes, file_base), unless main reorders.
+- Landed f02fa1a28 (C1 cut 1: intake file texts, 1.76 -> 0.74 copies at 16 KiB, 1.08 -> 0.08 at 160 KiB). arena-15
+  (main 45de607e7) passes push-all, RSS 1,220 MB (was 1,865 and 2,235), heap live 230 MB (was 399).
+- Cut 2 (9003d110e: revision_text through the index's own buffers; manifest read 2.13 -> 1.16 copies) is landing
+  under main's push-race rule: after green, re-merge, and push at once unless hg paths changed. Merges kept
+  `buffers` against w-perf's seal (reverted in 2662ca69f).
+- Order (main): cut 2, cut 3 (file_base borrows from the cache; red: deltas on the revision two back), then the index
+  seal's reland, which is mine. The design main ruled:
+  - Seal when due in one insert helper after insert_all, as 0cd8ef36a did. Import's settle seal removed. 2662ca69f's
+    revert shows exactly what to put back.
+  - Bound the fork's runs with one merge path, index_upkeep's merge_step, sliced within the step's budget (the loop
+    is TakingIntake::slice in hg_push.rs, around line 2286; the fork lives in Taker.fork).
+  - The rule is size-tiered: merge the newest own runs while the newer holds at least half the older's rows. Runs
+    number at most log2(rows / rows a table) + 1, on a Derived: line, beside the rent-or-buy compaction_due.
+  - Red first on two measures: runs walked per lookup held under the bound across a long push, and one segment step
+    within the quantum. Then measure the 56 MB tail's cut; main lands it with arena-16.
+- w-perf now takes the content arena's page rounding (a small-window slab; the 556 MB is 114,200 windows of about
+  1,151 B, each on its own 4 KiB page).
