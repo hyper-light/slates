@@ -138,13 +138,21 @@ impl Head {
     }
   }
 
-  fn of_green(green: &slates_merge::engine::Green) -> Head {
+  /// The green's head, its files' bytes; refused at a file the green holds by its content-plane object alone, which a
+  /// checkout does not read yet (A-760 (b) 4b).
+  fn of_green(
+    green: &slates_merge::engine::Green,
+  ) -> Result<Head, crate::vcs_store::named_objects::NamedUnread> {
     let base = green.current_base();
-    Head {
-      files: green
-        .files()
-        .map(|(path, bytes)| (path, bytes.to_vec()))
-        .collect(),
+    let files = green
+      .files()
+      .map(|(path, content)| {
+        let bytes = crate::vcs_store::named_objects::bytes_of(&path, content)?.into_owned();
+        Ok((path, bytes))
+      })
+      .collect::<Result<_, _>>()?;
+    Ok(Head {
+      files,
       dirs: base.dirs.iter().cloned().collect(),
       modes: base.modes.iter().cloned().collect(),
       unwritten: unwritten_of(
@@ -153,7 +161,7 @@ impl Head {
         &base.xattrs,
         &base.specials,
       ),
-    }
+    })
   }
 }
 
@@ -357,13 +365,20 @@ pub(crate) fn checkout_verb(
     return refused(Refusal::ConsistentBaseUnavailable);
   }
   // The green is lent for its head and the plan, then given back before the checkout's steps change anything.
-  let Some((version, planned)) = state.greens.get(&record.id).map(|engine| {
-    (
-      engine.head(),
-      plan(&Head::of_origin(&origin), &Head::of_green(&engine)),
-    )
-  }) else {
+  let Some((version, head)) = state
+    .greens
+    .get(&record.id)
+    .map(|engine| (engine.head(), Head::of_green(&engine)))
+  else {
     return refused(Refusal::NotFound);
+  };
+  let planned = match head {
+    Ok(head) => plan(&Head::of_origin(&origin), &head),
+    Err(unread) => {
+      return refused(Refusal::Unsupported {
+        feature: format!("a checkout of {unread}"),
+      });
+    }
   };
   let (steps, report) = match planned {
     Ok(planned) => planned,

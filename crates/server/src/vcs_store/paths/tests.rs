@@ -666,8 +666,8 @@ fn t_a626_p4_a_work_copies_a_tree_and_its_version_holds_it() {
     let green = to_db_volume(at.1);
     let engine = state.greens.get(&green).expect("the green's engine");
     let held = (
-      engine.content("e/a").map(<[u8]>::to_vec),
-      engine.content("d/a").map(<[u8]>::to_vec),
+      engine.content_bytes("e/a").map(<[u8]>::to_vec),
+      engine.content_bytes("d/a").map(<[u8]>::to_vec),
     );
     drop(engine);
     (
@@ -708,7 +708,7 @@ fn t_a626_p4_a_work_copies_a_tree_holding_a_hard_link() {
       .expect("the green's engine");
     let linked = (
       engine.hardlink("e/hard.txt").map(str::to_owned),
-      engine.content("e/g.txt").map(<[u8]>::to_vec),
+      engine.content_bytes("e/g.txt").map(<[u8]>::to_vec),
       engine.hardlink("d/hard.txt").map(str::to_owned),
     );
     drop(engine);

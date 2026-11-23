@@ -676,7 +676,7 @@ fn the_first_push_reads_every_object_once(
     matches!(outcome, Outcome::Accepted { version: 1 }),
     "{outcome:?}"
   );
-  assert_eq!(green.content("docs/guide.md"), Some(guide));
+  assert_eq!(green.content_bytes("docs/guide.md"), Some(guide));
   assert_eq!(green.mode("run.sh"), Some(0o755));
 }
 
@@ -700,8 +700,14 @@ fn the_second_push_reads_only_what_changed(
     matches!(outcome, Outcome::Accepted { version: 2 }),
     "{outcome:?}"
   );
-  assert_eq!(green.content("src/lib.rs"), Some(&b"pub fn two() {}\n"[..]));
-  assert_eq!(green.content("src/main.rs"), Some(&b"fn main() {}\n"[..]));
-  assert_eq!(green.content("docs/guide.md"), Some(guide));
+  assert_eq!(
+    green.content_bytes("src/lib.rs"),
+    Some(&b"pub fn two() {}\n"[..])
+  );
+  assert_eq!(
+    green.content_bytes("src/main.rs"),
+    Some(&b"fn main() {}\n"[..])
+  );
+  assert_eq!(green.content_bytes("docs/guide.md"), Some(guide));
   assert_eq!(green.mode("run.sh"), Some(0o755));
 }

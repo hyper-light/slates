@@ -2421,6 +2421,58 @@ fn footprint_kib(pid: u32) -> Option<u64> {
   Some(kib as u64)
 }
 
+/// Every counter the daemon's shards report (`status --json`, each shard's `refusals`), summed over its shards by name:
+/// what [`an_svnsync_measured`] prints after each leg, so a measurement reads where its time went (the svn://
+/// conversation's phases, the content store's reads, pieces fetched through the node's store, the import's turns and
+/// landings). Every counter, not a family: the import's batches count as `repository.*`.
+#[cfg(unix)]
+fn daemon_counters(instance: &str) -> std::collections::BTreeMap<String, u64> {
+  let (code, out, err) = slates(instance, &["status", "--json"]);
+  assert_eq!(code, 0, "status --json: {out}{err}");
+  let status: serde_json::Value = serde_json::from_str(&out).expect("status --json answers JSON");
+  let mut counters = std::collections::BTreeMap::new();
+  for report in status["shards"].as_array().into_iter().flatten() {
+    for counter in report["refusals"].as_array().into_iter().flatten() {
+      let (Some(kind), Some(count)) = (counter["kind"].as_str(), counter["count"].as_u64()) else {
+        continue;
+      };
+      *counters.entry(kind.to_owned()).or_insert(0) += count;
+    }
+  }
+  counters
+}
+
+/// Each counter `after` holds, as `kind=count`, one a line: a leg's counters whole.
+#[cfg(unix)]
+fn counters_listed(after: &std::collections::BTreeMap<String, u64>) -> String {
+  after
+    .iter()
+    .map(|(kind, count)| format!("\n    {kind}={count}"))
+    .collect()
+}
+
+/// What each counter of `after` gained over `before`, those that moved alone, one a line: the gain and the gain divided
+/// by `revisions`, a leg's counters a revision.
+#[cfg(unix)]
+fn counters_added(
+  before: &std::collections::BTreeMap<String, u64>,
+  after: &std::collections::BTreeMap<String, u64>,
+  revisions: f64,
+) -> String {
+  after
+    .iter()
+    .filter_map(|(kind, count)| {
+      let added = count.saturating_sub(before.get(kind).copied().unwrap_or(0));
+      (added > 0).then(|| {
+        format!(
+          "\n    {kind}=+{added} ({:.3} a revision)",
+          added as f64 / revisions
+        )
+      })
+    })
+    .collect()
+}
+
 /// The pid of instance `instance`'s daemon (not its anchor), as `ps` lists it.
 fn daemon_pid(instance: &str) -> Option<u32> {
   let listed = Command::new("ps")
@@ -2438,8 +2490,11 @@ fn daemon_pid(instance: &str) -> Option<u32> {
 /// Subversion repository and import the dump `SLATES_SVN_SYNC_DUMP` names through the CLI; then mirror it with stock
 /// `svnsync` 1.15 into a local FSFS repository (`svnadmin create`, a pre-revprop-change hook allowing every change,
 /// `svnsync init`, then `svnsync sync` timed), sampling the daemon's resident bytes. Expect nothing: print each scheme's
-/// import seconds, the sync's answer, seconds and seconds a revision, the mirror's youngest revision, and the daemon's
-/// resident bytes before and at its peak. Skips loudly without stock Subversion 1.15 or the dump.
+/// import seconds, the sync's answer, seconds and seconds a revision, the mirror's youngest revision, the daemon's
+/// resident bytes before and at its peak, and its counters: every one after the import, and what the sync added to each,
+/// whole and a revision (the svn:// conversation's phases in `vcs_svn.*_ns`, the content store's reads, pieces fetched
+/// through the node's store), so a slower round names where its time went. Skips loudly without stock Subversion 1.15
+/// or the dump.
 #[test]
 #[cfg(unix)]
 #[allow(clippy::disallowed_methods)] // test code: the mirror's hook, in the test's own scratch directory
@@ -2468,6 +2523,7 @@ fn an_svnsync_measured() {
     let (code, out, err) = slates(&instance, &["repository", "import", REPOSITORY, &dump]);
     assert_eq!(code, 0, "repository import: {out}{err}");
     let imported = importing.elapsed().as_secs_f64();
+    let after_import = daemon_counters(&instance);
     let (id, token) = minted_token(&instance, &issuer);
     let (user, url) = match scheme {
       "svn" => (
@@ -2534,11 +2590,15 @@ fn an_svnsync_measured() {
       .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
       .unwrap_or_default();
     let revisions = youngest.parse::<f64>().unwrap_or(0.0).max(1.0);
+    let after_sync = daemon_counters(&instance);
     println!(
       "an_svnsync_measured {scheme}: import {imported:.1} s; svnsync exit {code} in {seconds:.1} s, {:.1} ms a revision; \
-       mirror at r{youngest}; daemon RSS {before} KiB before, peak {peak} KiB\n  svnsync: {}",
+       mirror at r{youngest}; daemon RSS {before} KiB before, peak {peak} KiB\n  svnsync: {}\n  counters after the \
+       import:{}\n  counters the sync added:{}",
       seconds * 1e3 / revisions,
-      err.join().unwrap().trim()
+      err.join().unwrap().trim(),
+      counters_listed(&after_import),
+      counters_added(&after_import, &after_sync, revisions)
     );
   }
 }

@@ -78,7 +78,7 @@ fn overwrite(
 fn reads_back(green: &Green, versions: &[(u64, &[u8])]) {
   for (version, bytes) in versions {
     assert_eq!(
-      green.content_ref_at("f", *version).as_deref(),
+      green.content_ref_at_bytes("f", *version).as_deref(),
       Some(*bytes),
       "version {version}"
     );
@@ -159,7 +159,7 @@ fn removed_then_folded(green: &mut Green, fourth: &[u8]) {
   let mut unlink = increment(5, 4, "f", &[(OpKind::Unlink, 0, 0)], b"");
   unlink.doc.ops[0].src = u64::MAX;
   assert_eq!(green.submit(&unlink), Outcome::Accepted { version: 5 });
-  assert_eq!(green.content("f"), None);
+  assert_eq!(green.content_bytes("f"), None);
   assert_eq!(
     (green.history_reanchored(), green.history_owned_bytes()),
     ((2, 2, 12), 12),
@@ -167,7 +167,7 @@ fn removed_then_folded(green: &mut Green, fourth: &[u8]) {
   );
   reads_back(green, &[(4, fourth)]);
   green.fold_history_before(5);
-  assert_eq!(green.content_ref_at("f", 5).as_deref(), None);
+  assert_eq!(green.content_ref_at_bytes("f", 5).as_deref(), None);
   balanced(green);
 }
 
@@ -208,7 +208,7 @@ fn a_length_preserving_change_walks_one_value_however_long_its_history() {
   for (index, bytes) in versions.iter().enumerate() {
     let version = u64::try_from(index).unwrap() + 1;
     assert_eq!(
-      green.content_ref_at("f", version).as_deref(),
+      green.content_ref_at_bytes("f", version).as_deref(),
       Some(bytes.as_slice()),
       "version {version}"
     );
@@ -377,8 +377,8 @@ proptest::proptest! {
       for version in floor..=head {
         let expected = &model[usize::try_from(version).unwrap()];
         for (which, path) in paths.iter().enumerate() {
-          let layered = twins[0].green.content_ref_at(path, version).map(|bytes| bytes.into_owned());
-          let full = twins[1].green.content_ref_at(path, version).map(|bytes| bytes.into_owned());
+          let layered = twins[0].green.content_ref_at_bytes(path, version).map(|bytes| bytes.into_owned());
+          let full = twins[1].green.content_ref_at_bytes(path, version).map(|bytes| bytes.into_owned());
           proptest::prop_assert_eq!(&layered, &full, "{} at {}", path, version);
           let want = (!expected[which].is_empty() || version > u64::try_from(which).unwrap())
             .then(|| expected[which].clone());
@@ -458,7 +458,7 @@ fn a_same_length_replacement_walks_one_value_however_long_its_history() {
   for (index, bytes) in versions.iter().enumerate() {
     let version = u64::try_from(index).unwrap() + 1;
     assert_eq!(
-      green.content_ref_at("f", version).as_deref(),
+      green.content_ref_at_bytes("f", version).as_deref(),
       Some(bytes.as_slice()),
       "version {version}"
     );
@@ -503,7 +503,7 @@ fn a_read_of_an_early_version_examines_one_layer_a_range_however_often_it_was_ov
   }
   let before = green.history_layers_examined();
   assert_eq!(
-    green.content_ref_at("f", 1).as_deref(),
+    green.content_ref_at_bytes("f", 1).as_deref(),
     Some(first.as_slice())
   );
   let examined = green.history_layers_examined() - before;
@@ -514,7 +514,7 @@ fn a_read_of_an_early_version_examines_one_layer_a_range_however_often_it_was_ov
   for version in (1..=VERSIONS + 1).step_by(100) {
     let index = usize::try_from(version - 1).unwrap();
     assert_eq!(
-      green.content_ref_at("f", version).as_deref(),
+      green.content_ref_at_bytes("f", version).as_deref(),
       Some(versions[index].as_slice()),
       "version {version}"
     );

@@ -292,7 +292,9 @@ fn copy_step(
     }),
     Side::Base => {
       if let Some(engine) = state.greens.get(&green) {
-        let bytes = engine.content_ref_at(&copy.base_path, base_version)?;
+        let content = engine.content_ref_at(&copy.base_path, base_version)?;
+        // A base held by its content-plane object alone (A-760 (b) 4b, never met until piece 4d): not copied.
+        let bytes = crate::vcs_store::named_objects::bytes_of(&copy.base_path, content).ok()?;
         return copy_from(bytes, &mut copy.base, slice);
       }
       if let Some(replica) = state
@@ -300,7 +302,8 @@ fn copy_step(
         .replicas
         .get(&slates_db::register::ObjectId(green.bytes))
       {
-        let bytes = replica.content_ref_at(&copy.base_path, base_version)?;
+        let content = replica.content_ref_at(&copy.base_path, base_version)?;
+        let bytes = crate::vcs_store::named_objects::bytes_of(&copy.base_path, content).ok()?;
         return copy_from(bytes, &mut copy.base, slice);
       }
       let bytes = crate::work_home::parked_fetch(state, work, &copy.base_path)?;

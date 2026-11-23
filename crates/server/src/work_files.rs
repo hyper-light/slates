@@ -658,10 +658,14 @@ pub struct Base<'a> {
 
 impl<'a> Base<'a> {
   /// The base's bytes of `path`: `Ok(None)` when the base has no such file, `Err(BaseGone)` when the green is gone
-  /// and the base cannot be read.
+  /// and the base cannot be read, or the file is held by its content-plane object alone, which a work's base does not
+  /// read yet (A-760 (b) 4b; never met until piece 4d brings it back).
   pub(crate) fn file(self, path: &str) -> Result<Option<Cow<'a, [u8]>>, BaseGone> {
     if let Some(green) = self.green {
-      return Ok(green.content_ref_at(path, self.version));
+      return green
+        .content_ref_at(path, self.version)
+        .map(|content| unread_gone(path, content))
+        .transpose();
     }
     match self.fetched {
       Some(fetched) if !fetched.gone => match fetched.files.get(path) {
@@ -719,10 +723,10 @@ impl<'a> Base<'a> {
       bytes.get(lo..hi).map(Cow::Borrowed)
     };
     if let Some(green) = self.green {
-      return green
+      let (page, _) = green
         .content_page_at(path, self.version, (at, len))
-        .map(|(bytes, _)| Cow::Owned(bytes))
-        .ok_or(BaseGone);
+        .ok_or(BaseGone)?;
+      return unread_gone(path, page).map(|page| Cow::Owned(page.into_owned()));
     }
     let fetched = self
       .fetched
@@ -758,9 +762,19 @@ impl<'a> Base<'a> {
   }
 }
 
-/// The base of a work cannot be read: its green is gone.
+/// The base of a work cannot be read: its green is gone, or (A-760 (b) 4b) a file of it is held by its content-plane
+/// object alone, which a work's base does not read yet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BaseGone;
+
+/// A base file's content as its bytes, refused [`BaseGone`] for one held by its content-plane object alone (A-760 (b)
+/// 4b; never met until piece 4d brings it back).
+fn unread_gone<'a>(
+  path: &str,
+  content: slates_merge::engine::ContentAt<'a>,
+) -> Result<Cow<'a, [u8]>, BaseGone> {
+  crate::vcs_store::named_objects::bytes_of(path, content).map_err(|_| BaseGone)
+}
 
 /// The footprint a work's delta holds at one key: the path and what it holds of the file, the path alone for a removal.
 fn held(path: &str, entry: Option<&Option<Held>>) -> u64 {
@@ -773,6 +787,9 @@ fn held(path: &str, entry: Option<&Option<Held>>) -> u64 {
 
 /// A path the work holds of its own, and its bytes put together from its pieces (none: removed).
 pub type ChangedEntry<'a> = (&'a str, Option<Cow<'a, [u8]>>);
+
+/// A file the work sees, by its path, and its bytes ([`WorkFiles::files`]).
+pub type SeenFile<'a> = (String, Cow<'a, [u8]>);
 
 impl WorkFiles {
   /// The file at `path` as the work sees it: its own bytes, nothing where it removed one, else the base's. A file the
@@ -839,11 +856,16 @@ impl WorkFiles {
   /// Every file the work sees, sorted by path: the base's files it did not change and the files it holds. Without
   /// the base (its green gone) only the files the work holds whole are known. The paths are owned, as the green's walk
   /// gives them (its maps are persistent radix trees, A-534).
-  pub fn files<'a>(&'a self, base: Base<'a>) -> Vec<(String, Cow<'a, [u8]>)> {
-    let mut files: BTreeMap<String, Cow<'a, [u8]>> = base
-      .green
-      .map(|green| green.files_at(base.version).into_iter().collect())
-      .unwrap_or_default();
+  /// Refused [`BaseGone`] at a base file held by its content-plane object alone (A-760 (b) 4b).
+  pub fn files<'a>(&'a self, base: Base<'a>) -> Result<Vec<SeenFile<'a>>, BaseGone> {
+    let mut files: BTreeMap<String, Cow<'a, [u8]>> = match base.green {
+      Some(green) => green
+        .files_at(base.version)
+        .into_iter()
+        .map(|(path, content)| Ok((path.clone(), unread_gone(&path, content)?)))
+        .collect::<Result<_, BaseGone>>()?,
+      None => BTreeMap::new(),
+    };
     for path in self.changed.keys() {
       match self.get(base, path) {
         Ok(Some(bytes)) => {
@@ -854,7 +876,7 @@ impl WorkFiles {
         }
       }
     }
-    files.into_iter().collect()
+    Ok(files.into_iter().collect())
   }
 
   /// A page of the file at `path` as the work sees it: its bytes in `[offset, offset + want)` and its length, from its
@@ -874,7 +896,10 @@ impl WorkFiles {
       }
       Some(None) => Ok(None),
       None => match base.green {
-        Some(green) => Ok(green.content_page_at(path, base.version, (offset, want))),
+        Some(green) => green
+          .content_page_at(path, base.version, (offset, want))
+          .map(|(page, total)| Ok((unread_gone(path, page)?.into_owned(), total)))
+          .transpose(),
         None => base.fetched_page(path, (offset, want)).ok_or(BaseGone),
       },
     }

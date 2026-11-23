@@ -42,7 +42,7 @@ fn a_submit_accepts_and_updates_the_green() {
   let mut green = Green::new();
   let outcome = green.submit(&Build::new().create("a", b"hello").at(1, 0));
   assert_eq!(outcome, Outcome::Accepted { version: 1 });
-  assert_eq!(green.content("a"), Some(b"hello".as_slice()));
+  assert_eq!(green.content_bytes("a"), Some(b"hello".as_slice()));
   assert_eq!(green.head(), 1);
 }
 
@@ -52,8 +52,8 @@ fn disjoint_files_both_accept() {
   let mut green = Green::new();
   green.submit(&Build::new().create("a", b"aaaa").at(1, 0));
   green.submit(&Build::new().create("b", b"bbbb").at(2, 0));
-  assert_eq!(green.content("a"), Some(b"aaaa".as_slice()));
-  assert_eq!(green.content("b"), Some(b"bbbb".as_slice()));
+  assert_eq!(green.content_bytes("a"), Some(b"aaaa".as_slice()));
+  assert_eq!(green.content_bytes("b"), Some(b"bbbb".as_slice()));
   assert_eq!(green.head(), 2);
 }
 
@@ -71,7 +71,7 @@ fn disjoint_ranges_of_one_file_both_accept() {
     Outcome::Accepted { version: 3 },
     "disjoint span merges"
   );
-  let content = green.content("f").expect("present");
+  let content = green.content_bytes("f").expect("present");
   assert_eq!(&content[0..4], b"AAAA");
   assert_eq!(&content[10..14], b"BBBB");
 }
@@ -87,7 +87,7 @@ fn overlapping_edits_conflict() {
     matches!(second, Outcome::Conflict { .. }),
     "same range conflicts"
   );
-  assert_eq!(&green.content("f").expect("present")[5..9], b"AAAA");
+  assert_eq!(&green.content_bytes("f").expect("present")[5..9], b"AAAA");
   assert_eq!(green.head(), 2);
 }
 
@@ -133,7 +133,7 @@ fn a_disjoint_edit_plus_an_identical_overlap_accepts_per_range() {
     Outcome::Accepted { version: 3 },
     "per-range: a disjoint edit plus an identical overlap accepts"
   );
-  assert_eq!(green.content("f"), Some(b"ABCDWXYZ".as_slice()));
+  assert_eq!(green.content_bytes("f"), Some(b"ABCDWXYZ".as_slice()));
 }
 
 /// Unlinking a symlink removes it (§4.16: the unlink op applies to a symlink path, not only a
@@ -237,7 +237,7 @@ fn create_then_setmode_in_one_increment_accepts() {
   let mut green = Green::new();
   let outcome = green.submit(&Build::new().create("f", b"hi").setmode("f", 0o600).at(1, 0));
   assert_eq!(outcome, Outcome::Accepted { version: 1 });
-  assert_eq!(green.content("f"), Some(b"hi".as_slice()));
+  assert_eq!(green.content_bytes("f"), Some(b"hi".as_slice()));
   assert_eq!(
     green.mode("f"),
     Some(0o600),
@@ -295,7 +295,7 @@ fn renaming_a_hardlink_moves_it() {
   assert_eq!(green.hardlink("h"), None, "the source name is gone");
   assert_eq!(green.hardlink("g"), Some("f"), "the hard link moved");
   assert_eq!(
-    green.content("f"),
+    green.content_bytes("f"),
     Some(b"shared".as_slice()),
     "the shared file is untouched"
   );
@@ -365,7 +365,7 @@ fn an_intervening_insert_shifts_a_later_edit() {
   green.submit(&Build::new().insert("f", 0, b"XX").at(2, 1));
   let outcome = green.submit(&Build::new().overwrite("f", 8, b"YY").at(3, 1));
   assert_eq!(outcome, Outcome::Accepted { version: 3 });
-  assert_eq!(green.content("f"), Some(b"XX01234567YY".as_slice()));
+  assert_eq!(green.content_bytes("f"), Some(b"XX01234567YY".as_slice()));
 }
 
 /// Hostile input, D-27: an increment's ops document is decoded from bytes a peer sent and is not checked
@@ -385,7 +385,7 @@ fn an_increment_whose_ops_run_past_the_base_is_judged_not_panicked() {
   let outcome = green.submit(&hostile);
   assert!(matches!(outcome, Outcome::Conflict { .. }), "{outcome:?}");
   assert_eq!(
-    green.content("f"),
+    green.content_bytes("f"),
     Some(b"XX0123456789".as_slice()),
     "nothing was applied"
   );
@@ -435,7 +435,7 @@ fn a_verdict_consults_only_the_deltas_that_changed_its_paths() {
     green.submit(&lagging),
     Outcome::Accepted { .. } | Outcome::Identical { .. }
   ));
-  assert_eq!(green.content("a"), Some(b"XaaaYaaa".as_slice()));
+  assert_eq!(green.content_bytes("a"), Some(b"XaaaYaaa".as_slice()));
   assert_eq!(
     green.deltas_visited() - before,
     1,
@@ -452,7 +452,7 @@ fn the_fast_path_fires_for_an_unchanged_path() {
   let before = green.fast_path_hits();
   green.submit(&Build::new().overwrite("a", 0, b"AA").at(3, 2));
   assert!(green.fast_path_hits() > before, "the fast path was taken");
-  assert_eq!(green.content("a"), Some(b"AAaa".as_slice()));
+  assert_eq!(green.content_bytes("a"), Some(b"AAaa".as_slice()));
 }
 
 /// A resubmit of the same increment returns the cached result and does not double-apply.
@@ -477,7 +477,7 @@ fn rebase_after_a_conflict_accepts() {
   let head = green.head();
   let rebased = green.submit(&Build::new().overwrite("f", 5, b"BBBB").at(4, head));
   assert_eq!(rebased, Outcome::Accepted { version: 3 });
-  assert_eq!(&green.content("f").expect("present")[5..9], b"BBBB");
+  assert_eq!(&green.content_bytes("f").expect("present")[5..9], b"BBBB");
 }
 
 /// Two agents creating the same path with different bytes: the second conflicts (create/create).
@@ -498,7 +498,7 @@ fn identical_create_accepts() {
   green.submit(&Build::new().create("new", b"same").at(2, 1));
   let b = green.submit(&Build::new().create("new", b"same").at(3, 1));
   assert_eq!(b, Outcome::Identical { version: 3 });
-  assert_eq!(green.content("new"), Some(b"same".as_slice()));
+  assert_eq!(green.content_bytes("new"), Some(b"same".as_slice()));
 }
 
 /// One agent removes a file while another modifies it: delete/modify conflict.
@@ -508,7 +508,7 @@ fn delete_versus_modify_conflicts() {
   green.submit(&Build::new().create("f", b"hello world").at(1, 0));
   let a = green.submit(&Build::new().remove("f").at(2, 1));
   assert_eq!(a, Outcome::Accepted { version: 2 });
-  assert_eq!(green.content("f"), None);
+  assert_eq!(green.content_bytes("f"), None);
   let b = green.submit(&Build::new().overwrite("f", 0, b"HELLO").at(3, 1));
   assert_eq!(conflict_class(&b), Some(MergeConflictClass::DeleteModify));
 }
@@ -522,7 +522,7 @@ fn removes_accept() {
     green.submit(&Build::new().remove("f").at(2, 1)),
     Outcome::Accepted { version: 2 }
   );
-  assert_eq!(green.content("f"), None);
+  assert_eq!(green.content_bytes("f"), None);
   let again = green.submit(&Build::new().remove("f").at(3, 1));
   assert_eq!(
     again,
@@ -570,7 +570,7 @@ fn mode_merges() {
   // A content edit based on version 1 does not conflict with the intervening mode change.
   let edit = green.submit(&Build::new().overwrite("f", 0, b"AB").at(5, 1));
   assert_eq!(edit, Outcome::Accepted { version: 4 });
-  assert_eq!(&green.content("f").expect("present")[0..2], b"AB");
+  assert_eq!(&green.content_bytes("f").expect("present")[0..2], b"AB");
   assert_eq!(green.mode("f"), Some(0o600));
 }
 
@@ -609,8 +609,8 @@ fn rename_merges() {
     green.submit(&Build::new().rename("a", "b").at(2, 1)),
     Outcome::Accepted { version: 2 }
   );
-  assert_eq!(green.content("b"), Some(b"payload".as_slice()));
-  assert_eq!(green.content("a"), None);
+  assert_eq!(green.content_bytes("b"), Some(b"payload".as_slice()));
+  assert_eq!(green.content_bytes("a"), None);
   green.submit(&Build::new().create("c", b"x").at(3, 2));
   green.submit(&Build::new().rename("c", "d").at(4, 3));
   assert_eq!(
@@ -627,8 +627,8 @@ fn rename_carries_an_intervening_edit() {
   green.submit(&Build::new().overwrite("a", 0, b"XX").at(2, 1));
   let outcome = green.submit(&Build::new().rename("a", "b").at(3, 1));
   assert_eq!(outcome, Outcome::Accepted { version: 3 });
-  assert_eq!(green.content("b"), Some(b"XX23456789".as_slice()));
-  assert_eq!(green.content("a"), None);
+  assert_eq!(green.content_bytes("b"), Some(b"XX23456789".as_slice()));
+  assert_eq!(green.content_bytes("a"), None);
 }
 
 /// rmdir removes an empty directory, a directory emptied by this increment, but conflicts on a live
@@ -742,7 +742,7 @@ fn several_dimensions_on_one_path_in_one_increment() {
       .at(2, 1),
   );
   assert_eq!(combined, Outcome::Accepted { version: 2 });
-  assert_eq!(&green.content("f").expect("present")[0..2], b"AB");
+  assert_eq!(&green.content_bytes("f").expect("present")[0..2], b"AB");
   assert_eq!(green.mode("f"), Some(0o640));
   assert_eq!(green.xattr("f", "user.k"), Some(b"v".as_slice()));
 }
@@ -765,8 +765,8 @@ fn a_directory_move_merges_as_child_ops() {
   assert_eq!(moved, Outcome::Accepted { version: 3 });
   assert!(green.is_dir("dir2"));
   assert!(!green.is_dir("dir1"));
-  assert_eq!(green.content("dir2/f"), Some(b"content".as_slice()));
-  assert_eq!(green.content("dir1/f"), None);
+  assert_eq!(green.content_bytes("dir2/f"), Some(b"content".as_slice()));
+  assert_eq!(green.content_bytes("dir1/f"), None);
 }
 
 /// T-6.x §4.16 "Rebase, the only corrective path": a work whose pending operations map cleanly onto
@@ -786,7 +786,7 @@ fn rebase_maps_a_clean_work_forward_and_commits_nothing() {
   // The green did not move: a rebase commits nothing.
   assert_eq!(green.head(), 2, "rebase commits nothing to the green");
   assert_eq!(
-    green.content("f"),
+    green.content_bytes("f"),
     Some(b"AB0123456789".as_slice()),
     "the green's bytes are unchanged by a rebase"
   );
@@ -833,7 +833,7 @@ fn rebase_returns_windows_and_changes_nothing_on_conflict() {
   );
   assert_eq!(green.head(), 2, "a conflicting rebase commits nothing");
   assert_eq!(
-    green.content("f"),
+    green.content_bytes("f"),
     Some(b"01XXX56789".as_slice()),
     "the green's bytes are unchanged by a conflicting rebase"
   );
@@ -993,7 +993,7 @@ proptest! {
       let answered = if identical { Outcome::Identical { version } } else { Outcome::Accepted { version } };
       prop_assert_eq!(&outcome, &answered);
       let expected = reference_merge(&green, &agent);
-      prop_assert_eq!(volume.content("f").unwrap(), expected.as_slice());
+      prop_assert_eq!(volume.content_bytes("f").unwrap(), expected.as_slice());
     }
   }
 }
@@ -1236,29 +1236,31 @@ fn each_version_reads_back(green: &Green, n: u8) {
     (second, twice),
   ] = version_of_pass.try_into().unwrap();
   assert_eq!(
-    green.content_at(&edited_path(n), before_first - 1).unwrap(),
+    green
+      .content_at_bytes(&edited_path(n), before_first - 1)
+      .unwrap(),
     original,
     "file {n} before its edits"
   );
   assert_eq!(
-    green.content_at(&edited_path(n), first).unwrap(),
+    green.content_at_bytes(&edited_path(n), first).unwrap(),
     once,
     "file {n} after its first edit"
   );
   assert_eq!(
     green
-      .content_at(&edited_path(n), before_second - 1)
+      .content_at_bytes(&edited_path(n), before_second - 1)
       .unwrap(),
     once,
     "file {n} between its edits"
   );
   assert_eq!(
-    green.content_at(&edited_path(n), second).unwrap(),
+    green.content_at_bytes(&edited_path(n), second).unwrap(),
     twice,
     "file {n} after its second edit"
   );
   assert_eq!(
-    green.content(&edited_path(n)).unwrap(),
+    green.content_bytes(&edited_path(n)).unwrap(),
     twice.as_slice(),
     "file {n} at the head"
   );
@@ -1285,11 +1287,13 @@ fn assert_fold_bounded_by_the_reachable_floor(green: &mut Green, head: u64) {
     green.history_bytes_recounted(),
     "balanced after the fold"
   );
-  let at_three = green.content_at("big", 3).expect("the floor reconstructs");
+  let at_three = green
+    .content_at_bytes("big", 3)
+    .expect("the floor reconstructs");
   assert_eq!(&at_three[..16], b"EDIT....EDIT....");
   assert_eq!(
-    green.content_at("big", head).as_deref(),
-    green.content("big")
+    green.content_at_bytes("big", head).as_deref(),
+    green.content_bytes("big")
   );
 }
 
@@ -1329,7 +1333,7 @@ fn assert_shared(green: &Green) {
   );
   for version in 1..=green.head() {
     let bytes = green
-      .content_at("big", version)
+      .content_at_bytes("big", version)
       .expect("every version reconstructs");
     let edits = usize::try_from(version - 1).unwrap();
     for edit in 0..usize::try_from(SMALL_EDITS).unwrap() {
@@ -1354,7 +1358,7 @@ fn assert_fold_to_head(green: &mut Green, head: u64) {
   assert_eq!(
     (
       green.history_bytes_recounted(),
-      green.content("big").map(|bytes| bytes.len())
+      green.content_bytes("big").map(|bytes| bytes.len())
     ),
     (retained, Some(LARGE_FILE_BYTES)),
     "balanced, and the current file is untouched"
@@ -1512,7 +1516,7 @@ fn a_conflicting_verdict_makes_no_file_and_an_accept_makes_each_once() {
       .at(4, 2),
   );
   assert!(matches!(outcome, Outcome::Conflict { .. }), "{outcome:?}");
-  assert_eq!(green.content("a"), Some(b"aaaa".as_slice()));
+  assert_eq!(green.content_bytes("a"), Some(b"aaaa".as_slice()));
   assert_eq!(
     green.mapped_files_made(),
     before,
@@ -1526,7 +1530,7 @@ fn a_conflicting_verdict_makes_no_file_and_an_accept_makes_each_once() {
     ),
     "{outcome:?}"
   );
-  assert_eq!(green.content("a"), Some(b"aAaa".as_slice()));
+  assert_eq!(green.content_bytes("a"), Some(b"aAaa".as_slice()));
   assert_eq!(
     green.mapped_files_made(),
     before + 1,
