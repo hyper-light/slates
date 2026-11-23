@@ -788,6 +788,9 @@ fn held(path: &str, entry: Option<&Option<Held>>) -> u64 {
 /// A path the work holds of its own, and its bytes put together from its pieces (none: removed).
 pub type ChangedEntry<'a> = (&'a str, Option<Cow<'a, [u8]>>);
 
+/// A file the work sees, by its path, and its bytes ([`WorkFiles::files`]).
+pub type SeenFile<'a> = (String, Cow<'a, [u8]>);
+
 impl WorkFiles {
   /// The file at `path` as the work sees it: its own bytes, nothing where it removed one, else the base's. A file the
   /// work changed is lent where it wrote it all, else put together from its pieces (the base's ranges and its own).
@@ -854,7 +857,7 @@ impl WorkFiles {
   /// the base (its green gone) only the files the work holds whole are known. The paths are owned, as the green's walk
   /// gives them (its maps are persistent radix trees, A-534).
   /// Refused [`BaseGone`] at a base file held by its content-plane object alone (A-760 (b) 4b).
-  pub fn files<'a>(&'a self, base: Base<'a>) -> Result<Vec<(String, Cow<'a, [u8]>)>, BaseGone> {
+  pub fn files<'a>(&'a self, base: Base<'a>) -> Result<Vec<SeenFile<'a>>, BaseGone> {
     let mut files: BTreeMap<String, Cow<'a, [u8]>> = match base.green {
       Some(green) => green
         .files_at(base.version)

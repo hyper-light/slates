@@ -1017,7 +1017,11 @@
 >   `every_block_has_an_owner_and_the_owners_sum_to_what_is_allocated` (`slates-mem`: 2,000 seeded steps of
 >   allocations, frees, trims and deferred frees against a model) and the memory status's test (the sum after a green's
 >   file is accepted). The greens' content is not in the arena (the merge engine's own heap), so arena-13's named part
->   was 184 MB, not 260. Owed: main's arena-15 to name the rest.
+>   was 184 MB, not 260. arena-15 (CI 45224166925) named it: 556,367,872 bytes held for repository windows of
+>   131,425,429. Since then the chunk store asks the arena for the caller's own length, not its page-rounded block
+>   (`ChunkArena::alloc_asking`), so a window owner's asked bytes against its held name the page rounding; held by
+>   `a_windows_ask_is_its_own_length_and_its_hold_the_page_it_takes` (red: asked 16,384 of 16,384 held for four windows
+>   of 100 bytes; now 400). The rounding's fix is the small-window slab (next piece).
 > - A Mercurial index's tail sealed by every append REVERTED (2026-11-23, w-perf; 0cd8ef36a reverted after main's
 >   arena-14, CI 45208924823: push-all's shard 0 spun past 1 s of CPU in `hg_push::segment` on all three legs and the
 >   watchdog killed the daemon). Each seal writes a run, and a push's fork never merges its runs (only the repository's
