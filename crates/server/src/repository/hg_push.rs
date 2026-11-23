@@ -94,7 +94,7 @@ use crate::state::ShardState;
 #[cfg(unix)]
 use crate::vcs_hooks::{self, CommittedView, ExitStatus, HookInput, Lesson, Outcome, PendingView};
 use crate::vcs_policy::{self, Asked, Name, Namespace, PushRefusal, Right};
-use crate::vcs_store::hg_view::{self, PUBLISHING};
+use crate::vcs_store::hg_view;
 use crate::vcs_store::{self, VcsStores};
 use crate::verbs::hex_of;
 
@@ -1479,8 +1479,14 @@ async fn unbundled(
       Some(outcome)
     }
   };
-  // Committed, its file revisions are noted for a home and let go a turn at a time (`hg_run::let_go_committed`): a
-  // whole history's are hundreds of thousands, never one poll's work. Else its run is forgotten.
+  settle_run(run, outcome.as_ref()).await;
+  outcome
+}
+
+/// A push's run once its outcome stands. Committed, its file revisions are noted for a home and let go a turn at a time
+/// (`hg_run::let_go_committed`): a whole history's are hundreds of thousands, never one poll's work. Else its run is
+/// forgotten.
+async fn settle_run(run: super::hg_run::Run, outcome: Option<&PushOutcome>) {
   if matches!(outcome, Some(PushOutcome::Accepted(_))) {
     let (repository, contents) = run.committed();
     super::hg_run::let_go_committed(
@@ -1495,7 +1501,6 @@ async fn unbundled(
   } else {
     let _ = crate::state::with_state(move |state| run.abandon(state));
   }
-  outcome
 }
 
 /// [`unbundle`]'s landing: its works built and held ahead, then `forked` recorded and landed in one step against the
@@ -1516,8 +1521,7 @@ async fn landed_after_builds(
       give_back(forked);
       return Some(outcome);
     }
-    // The works first, a unit a turn (main's ruling (1)): the landing's one step takes them, never builds them.
-    let (plan, mut built) = match built_works(
+    let (plan, mut built, ahead) = match works_held_ahead(
       repository,
       (principal, name),
       unbundle,
@@ -1526,17 +1530,11 @@ async fn landed_after_builds(
     )
     .await?
     {
-      Ok(planned) => planned,
+      Ok(prepared) => prepared,
       Err(outcome) => {
         give_back(forked);
         return Some(outcome);
       }
-    };
-    // Their increments held in the content store next, a unit a turn: the landing's step names them, never hashes or
-    // copies them (`crate::held_ahead`).
-    let Ok(ahead) = held_ahead_waiting(repository, &built).await? else {
-      give_back(forked);
-      return Some(PushOutcome::refused(&abort(UNHELD.to_vec())));
     };
     match committing.ready(repository, &mut forked).await? {
       Ok(true) => {}
@@ -1699,6 +1697,37 @@ fn give_back(forked: Option<Forked>) {
 pub(crate) const WORKS_BUILT: &str = "vcs.hg.push_works_built";
 /// Counter: the turns a push's works took to build. Format: a counter name in the status report.
 pub(crate) const WORK_TURNS: &str = "vcs.hg.push_work_turns";
+
+/// A landing try's works and their increments, held ahead of its step. The works first, a unit a turn (main's ruling
+/// (1)): the landing's one step takes them, never builds them. Their increments held in the content store next, a unit
+/// a turn: the landing's step names them, never hashes or copies them (`crate::held_ahead`). The push's refusal where
+/// either was refused; `None` where the store went away.
+async fn works_held_ahead(
+  repository: RepositoryId,
+  (principal, name): (&Principal, [u8; 32]),
+  unbundle: &Unbundle,
+  forked: Option<&Forked>,
+  room: &Admission,
+) -> Option<
+  Result<
+    (
+      Vec<WorkKey>,
+      BTreeMap<WorkKey, Increment>,
+      Vec<crate::held_ahead::HeldAhead>,
+    ),
+    PushOutcome,
+  >,
+> {
+  let (plan, built) =
+    match built_works(repository, (principal, name), unbundle, forked, room).await? {
+      Ok(planned) => planned,
+      Err(outcome) => return Some(Err(outcome)),
+    };
+  let Ok(ahead) = held_ahead_waiting(repository, &built).await? else {
+    return Some(Err(PushOutcome::refused(&abort(UNHELD.to_vec()))));
+  };
+  Some(Ok((plan, built, ahead)))
+}
 
 /// The works `forked`'s push makes, built before its landing a unit a turn (A-767 C1, the push spin; main's ruling (1)
 /// of 2026-11-21 13:26): its moves planned as the landing will judge them ([`Works::Planning`], within a copy of
@@ -2469,6 +2498,15 @@ async fn taking_begun(
   Some(sized.map(|()| taking))
 }
 
+/// A slice's wants of the node's changeset store answered (a file delta's base landed before the push, A-767 C1);
+/// `None` where the intake or the store went away.
+async fn store_wants_answered(taking: &mut Taking, repository: RepositoryId) -> Option<()> {
+  let intake = taking.intake.as_mut()?;
+  vcs_store::hg_view::answer_store_wants(intake, repository)
+    .await
+    .then_some(())
+}
+
 /// `take_sliced`'s steps: a slice at a time, a yield between slices, until the intake is done, the segments each slice
 /// cut landed after it ([`segments_landed`]). A file delta's base landed before the push is read from the node's
 /// changeset store between slices (A-767 C1); a step past its admission waits and is taken again (`retaken`). The
@@ -2493,12 +2531,7 @@ async fn stepped_to_end(
     match stepped {
       Ok(Stepped::More) => slates_rt::futures::yield_now().await,
       Ok(Stepped::Done) => return Some(Ok(())),
-      Ok(Stepped::Store) => {
-        let intake = taking.intake.as_mut()?;
-        if !vcs_store::hg_view::answer_store_wants(intake, repository).await {
-          return None;
-        }
-      }
+      Ok(Stepped::Store) => store_wants_answered(taking, repository).await?,
       // The slice answers a whole changegroup's want as its truncation; none reaches here.
       Ok(Stepped::Wanted(range)) => return Some(Err(intake_outcome(&whole_wanted(&[], range)))),
       Err(refused) => {
@@ -3364,7 +3397,7 @@ fn judged_over(
   hg_view::with_view_over(state, repository, over, room, |view, _, content, room| {
     let (brought, held_changesets) =
       brought_of(forked, content, room).map_err(|refused| PushOutcome::refused(&refused))?;
-    let terms = (PUBLISHING, name, room.left());
+    let terms = (view.publishing(), name, room.left());
     let prepared = prepare(
       state,
       repository,

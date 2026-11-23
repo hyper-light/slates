@@ -5945,11 +5945,12 @@ fn dispatch_inner(
       hooks,
       hooks_env,
       signers,
+      hg_publishing,
     } => crate::repository::set_policy(
       state,
       principal,
       (&repository, read),
-      (&rules, &hooks, &hooks_env, &signers),
+      (&rules, &hooks, &hooks_env, &signers, hg_publishing),
     ),
     // A Mercurial repository's directory, or a Subversion dump, imported into its store, answered when the import ends
     // (A-678, A-652 part 3).
@@ -20144,6 +20145,7 @@ pub(crate) fn replayed_green_for_test(
   replay_green(state, id).ok().map(|replayed| replayed.0)
 }
 
+#[cfg(test)]
 fn replay_green(
   state: &ShardState,
   id: DbVolumeId,

@@ -60,9 +60,7 @@ const CASES: [Case; 7] = [
 
 /// The bytes the hexadecimal `hex` names.
 fn bytes(hex: &str) -> Vec<u8> {
-  (0..hex.len() / 2)
-    .map(|at| u8::from_str_radix(&hex[2 * at..2 * at + 2], 16).unwrap())
-    .collect()
+  crate::tags::unhexlify(hex.as_bytes()).unwrap()
 }
 
 /// Goal 93 (changeset evolution: a marker in either format exchanged as 7.2 exchanges it). Do: read each case's
@@ -107,7 +105,8 @@ fn a_float_is_written_as_python_writes_its_repr() {
     (1e-4, "0.0001"),
     (1e-5, "1e-05"),
     (1.5e-5, "1.5e-05"),
-    (1_059_438_285_926_254.25, "1059438285926254.2"),
+    // A tie: the value lies halfway between ...254.2 and ...254.3, and repr rounds to the even digit.
+    (1_059_438_285_926_254.0 + 0.25, "1059438285926254.2"),
     (5e-324, "5e-324"),
     (f64::MAX, "1.7976931348623157e+308"),
     (0.1 + 0.2, "0.30000000000000004"),

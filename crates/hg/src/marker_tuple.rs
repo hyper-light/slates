@@ -38,6 +38,14 @@ const DATE_KEY: &[u8] = b"date";
 const NO_DATE: &[u8] = b"0 0";
 /// Format: the metadata keys format 0 keeps the parents under (`p0` marks none recorded).
 const PARENT_KEYS: [&[u8]; 3] = [b"p0", b"p1", b"p2"];
+/// Format: hexadecimal, radix 16 (`node.hex`).
+const HEX_RADIX: u32 = 16;
+/// Format: decimal's base, `int()`'s when none is named.
+const RADIX: i64 = 10;
+/// Format: the date `_fm0readmarkers` gives a format 0 date it cannot read, `(0.0, 0)`: the float's bits and the
+/// timezone.
+const UNREAD_DATE: (u64, i64) = (0.0_f64.to_bits(), 0);
+
 /// Format: format 0's separators: between entries, and between an entry's key and value.
 const ENTRY_SEPARATOR: u8 = 0;
 /// Format: see [`ENTRY_SEPARATOR`].
@@ -81,10 +89,7 @@ impl<'a> Tuple<'a> {
       Metadata::Sized { sizes, bytes } => {
         let mut metadata = Vec::with_capacity(sizes.len() / 2);
         let mut at = 0_usize;
-        for pair in sizes.chunks_exact(2) {
-          let &[key, value] = pair else {
-            continue;
-          };
+        for &[key, value] in sizes.as_chunks::<2>().0 {
           let (key, value) = (usize::from(key), usize::from(value));
           let key_end = at.saturating_add(key);
           let value_end = key_end.saturating_add(value);
@@ -103,7 +108,10 @@ impl<'a> Tuple<'a> {
           successors: marker.successors,
           flags: marker.flags,
           metadata,
-          date: (date.seconds_bits, i64::from(date.offset_minutes) * MINUTE),
+          date: (
+            date.seconds_bits,
+            i64::from(date.offset_minutes).saturating_mul(MINUTE),
+          ),
           parents: marker.parents.map(Cow::Borrowed),
         })
       }
@@ -116,7 +124,10 @@ impl<'a> Tuple<'a> {
           let Some(at) = entry.iter().position(|byte| *byte == KEY_SEPARATOR) else {
             continue;
           };
-          let (key, value) = (&entry[..at], &entry[at.saturating_add(1)..]);
+          let (key, value) = (
+            entry.get(..at).unwrap_or_default(),
+            entry.get(at.saturating_add(1)..).unwrap_or_default(),
+          );
           match metadata.iter_mut().find(|(held, _)| *held == key) {
             Some(slot) => slot.1 = value,
             None => metadata.push((key, value)),
@@ -137,7 +148,7 @@ impl<'a> Tuple<'a> {
         let parents = parents.and_then(|hexes| {
           let mut nodes = Vec::with_capacity(hexes.len().saturating_mul(SHA1_LEN));
           for hex in hexes {
-            let node = unhex(hex?)?;
+            let node = crate::tags::unhexlify(hex?)?;
             if node.len() != SHA1_LEN {
               return None;
             }
@@ -353,18 +364,18 @@ fn put<'e>(entries: &mut Vec<(&'e [u8], Cow<'e, [u8]>)>, key: &'e [u8], value: C
 fn read_date(date: &[u8]) -> Result<(u64, i64), Unread> {
   let mut halves = date.split(|byte| *byte == b' ');
   let (Some(when), Some(offset), None) = (halves.next(), halves.next(), halves.next()) else {
-    return Ok((0.0_f64.to_bits(), 0));
+    return Ok(UNREAD_DATE);
   };
   match (python_float(when), python_int(offset)) {
     (Some(seconds), Some(Ok(offset))) => Ok((seconds.to_bits(), offset)),
     (Some(_), Some(Err(Unread))) => Err(Unread),
-    _ => Ok((0.0_f64.to_bits(), 0)),
+    _ => Ok(UNREAD_DATE),
   }
 }
 
 /// Whether `byte` is whitespace to CPython's `float()` and `int()` of bytes (`Py_ISSPACE`).
 fn python_space(byte: u8) -> bool {
-  matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+  matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c')
 }
 
 /// `text` without the whitespace around it.
@@ -430,14 +441,18 @@ fn python_int(text: &[u8]) -> Option<Result<i64, Unread>> {
   let mut value: i64 = 0;
   for digit in plain {
     let next = value
-      .checked_mul(10)
-      .and_then(|value| value.checked_add(i64::from(digit - b'0')));
+      .checked_mul(RADIX)
+      .and_then(|value| value.checked_add(i64::from(digit.saturating_sub(b'0'))));
     match next {
       Some(next) => value = next,
       None => return Some(Err(Unread)),
     }
   }
-  Some(Ok(if negative { -value } else { value }))
+  Some(Ok(if negative {
+    value.saturating_neg()
+  } else {
+    value
+  }))
 }
 
 /// Python's `repr` of `value` (module docs, "Writing"): the shortest digits that read back to it, rounded to the even
@@ -496,32 +511,14 @@ pub fn python_repr(value: f64) -> String {
   format!("{sign}{body}")
 }
 
-/// Appends `bytes` in lower-case hexadecimal (`node.hex`).
+/// Appends `bytes` in lower-case hexadecimal (`node.hex`), as [`crate::node::write_hex`] writes a node.
 fn lower_hex(bytes: &[u8], out: &mut Vec<u8>) {
-  const DIGITS: &[u8; 16] = b"0123456789abcdef";
   for byte in bytes {
-    out.extend_from_slice(&[
-      DIGITS[usize::from(byte >> 4)],
-      DIGITS[usize::from(byte & 0xf)],
-    ]);
+    for digit in [u32::from(*byte) / HEX_RADIX, u32::from(*byte) % HEX_RADIX] {
+      let character = char::from_digit(digit, HEX_RADIX).unwrap_or('0');
+      out.push(u8::try_from(character).unwrap_or(b'0'));
+    }
   }
-}
-
-/// The bytes the hexadecimal `hex` names (`binascii.unhexlify`: either case, an even count); none otherwise.
-fn unhex(hex: &[u8]) -> Option<Vec<u8>> {
-  if !hex.len().is_multiple_of(2) {
-    return None;
-  }
-  hex
-    .chunks_exact(2)
-    .map(|pair| {
-      let &[high, low] = pair else {
-        return None;
-      };
-      let digit = |byte: u8| u8::try_from(char::from(byte).to_digit(16)?).ok();
-      Some(digit(high)? << 4 | digit(low)?)
-    })
-    .collect()
 }
 
 #[cfg(test)]

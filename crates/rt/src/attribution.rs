@@ -362,8 +362,10 @@ mod tests {
     let read_ns = u64::try_from((began.elapsed() / TIMED_READS).as_nanos()).unwrap();
     println!("attribution: slept {slept:?}, spun {spun:?}; an account read {read_ns} ns");
     assert_eq!((slept, spun), (Attribution::Blocked, Attribution::Long));
+    // ThreadSanitizer's checks slow every access (3,003 ns a read there, run 45176536354): the cost bound is the
+    // shipped build's, and the instrumented one still judges the attribution above.
     assert!(
-      read_ns < PLATFORM_QUANTUM_NS / 100,
+      cfg!(slates_tsan) || read_ns < PLATFORM_QUANTUM_NS / 100,
       "an account read took {read_ns} ns against a {PLATFORM_QUANTUM_NS} ns quantum"
     );
   }

@@ -2576,6 +2576,7 @@ mod tests {
       hooks: Vec::new(),
       hooks_env: Vec::new(),
       signers: Vec::new(),
+      hg_publishing: true,
     }
   }
 
@@ -2621,6 +2622,7 @@ mod tests {
         section("pre-lock", "TOKENS", b"made by the hook"),
       ],
       signers: Vec::new(),
+      hg_publishing: true,
     };
     let set = Op::RepositoryPolicySet {
       repository: repo,

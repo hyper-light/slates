@@ -232,7 +232,7 @@ pub(crate) async fn read_ahead(
   let away = crate::state::with_state(|state| {
     let content = state.vcs_stores.content()?;
     let window = to_u64(content.window()).max(1);
-    let first = next.offset / window;
+    let first = next.offset.checked_div(window).unwrap_or(0);
     Some(
       (first..first.saturating_add(LOOK_AHEAD_WINDOWS))
         .map(|index| index.saturating_mul(window).max(next.offset))

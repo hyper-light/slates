@@ -1149,6 +1149,7 @@ fn set_policy(
       hooks: Vec::new(),
       hooks_env: Vec::new(),
       signers: Vec::new(),
+      hg_publishing: true,
     },
   );
   assert_eq!(reply, ReplyBody::Acknowledged);
@@ -1171,6 +1172,7 @@ fn set_hook(state: &mut ShardState, name: &str, hook: &str) {
       }],
       hooks_env: Vec::new(),
       signers: Vec::new(),
+      hg_publishing: true,
     },
   );
   assert_eq!(reply, ReplyBody::Acknowledged);
@@ -1504,6 +1506,7 @@ mod hooks {
         })
         .collect(),
       hooks_env: Vec::new(),
+      hg_publishing: true,
     }
   }
 

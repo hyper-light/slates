@@ -212,3 +212,110 @@ fn an_evolution_clients_amend_and_rebase_land_with_their_markers() {
     "its words name the public changeset: {words}"
   );
 }
+
+/// Goal 93 (§4.17.3 decision 3: a non-publishing repository keeps a push's changesets draft; decision 4: an obsolete
+/// draft leaves the served view). Do: make the repository non-publishing (its policy's `hg_publishing`); with an
+/// evolution-enabled client, commit and push `base` and then `b` on it; amend `b` and push the amend; clone the
+/// repository and list its changesets with their phases, the hidden ones too, and its markers. Expect `base` and the
+/// amended `b` served as drafts, the pushed `b` the amend rewrote never served (its marker hides it), and the clone
+/// holding the amend's one marker. Red before: every repository published, so `b` landed public and its amend was
+/// refused by the client ("cannot amend public changesets").
+#[test]
+fn a_non_publishing_repository_keeps_drafts_and_hides_a_rewritten_one() {
+  if !common::hg::has_hg() {
+    eprintln!(
+      "SKIPPED a_non_publishing_repository_keeps_drafts_and_hides_a_rewritten_one: no `hg` on PATH"
+    );
+    return;
+  }
+  let served = common::hg::serve("hg-drafts", EVOLUTION);
+  served.set_publishing(false);
+  let url = served.url.clone();
+  ran(
+    "init",
+    served.hg(".").args(["init", "source"]).output().unwrap(),
+  );
+  let commit = |file: &str, message: &str| {
+    std::fs::write(format!("{}/source/{file}", served.base()), message).unwrap();
+    ran(
+      message,
+      served
+        .hg("source")
+        .args(["commit", "-qA", "-m", message])
+        .output()
+        .unwrap(),
+    );
+  };
+  let node = |revset: &str| {
+    stdout(&ran(
+      revset,
+      served
+        .hg("source")
+        .args(["log", "-r", revset, "-T", "{node}"])
+        .output()
+        .unwrap(),
+    ))
+  };
+  let push = || {
+    served
+      .hg("source")
+      .args(["push", "-q", "--new-branch", &url])
+      .output()
+      .unwrap()
+  };
+  commit("base.txt", "base");
+  let base = node(".");
+  commit("b.txt", "b");
+  let old_b = node(".");
+  ran("push b", push());
+  ran(
+    "amend b",
+    served
+      .hg("source")
+      .args(["commit", "-q", "--amend", "-m", "b amended"])
+      .output()
+      .unwrap(),
+  );
+  let new_b = node(".");
+  ran("push the amend", push());
+  ran(
+    "clone",
+    served
+      .hg(".")
+      .args(["clone", "-q", &url, "cloned"])
+      .output()
+      .unwrap(),
+  );
+  let listed = stdout(&ran(
+    "log",
+    served
+      .hg("cloned")
+      .args(["log", "--hidden", "-T", "{node} {phase}\n"])
+      .output()
+      .unwrap(),
+  ));
+  let markers = stdout(&ran(
+    "markers",
+    served
+      .hg("cloned")
+      .args(["debugobsolete"])
+      .output()
+      .unwrap(),
+  ));
+  served.stop();
+  for (name, kept) in [("base", &base), ("b amended", &new_b)] {
+    assert!(
+      listed.contains(&format!("{kept} draft")),
+      "{name} served as a draft: {listed}"
+    );
+  }
+  assert!(
+    !listed.contains(old_b.as_str()),
+    "the rewritten b never served: {listed}"
+  );
+  let lines: Vec<&str> = markers.lines().collect();
+  assert!(
+    lines.len() == 1 && lines[0].starts_with(&old_b) && lines[0].contains(&new_b),
+    "the amend's marker: {markers}"
+  );
+}

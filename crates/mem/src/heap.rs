@@ -165,6 +165,7 @@ mod tests {
   /// present (the main arena's top at least), the mapped bytes up by the block while it is held and down by it once freed.
   #[cfg(all(target_os = "linux", target_env = "gnu", not(miri)))]
   #[test]
+  #[cfg_attr(slates_tsan, ignore)] // ThreadSanitizer's allocator replaces glibc's: glibc's figures hold no block of ours
   fn glibcs_mapped_bytes_follow_a_block_it_maps_until_it_is_freed() {
     /// Derived: twice glibc's largest mmap threshold on 64-bit (`DEFAULT_MMAP_THRESHOLD_MAX`, 4 MiB times
     /// `sizeof (long)`, 32 MiB), so glibc maps the block on its own however far the threshold has risen.

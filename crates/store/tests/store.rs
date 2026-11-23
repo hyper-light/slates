@@ -341,6 +341,33 @@ fn a_store_lent_more_memory_than_a_memtable_addresses_lands_and_reads() {
   );
 }
 
+/// What a restart keeps after one of two repositories sharing a payload is forgotten (A-767 C3): the `survivor`
+/// still lists its changeset and reads the payload's bytes, `expected`, from its `whole`, by piece and by place;
+/// the `forgotten` repository lists none.
+fn assert_the_survivor_reads_the_shared_payload(
+  store: &mut Store,
+  staging: &slates_store::staging::Staging,
+  whole: slates_store::texts::Place,
+  expected: &[u8],
+  survivor: u128,
+  forgotten: u128,
+) {
+  assert_eq!(store.changesets(survivor, 1, 1).unwrap().len(), 1);
+  assert!(store.changesets(forgotten, 1, 1).unwrap().is_empty());
+  assert_eq!(
+    store
+      .piece(staging, &whole.payload, whole.len, 0)
+      .unwrap()
+      .as_deref(),
+    Some(expected),
+    "the surviving repository still names this payload"
+  );
+  assert_eq!(
+    store.places_bytes(staging, &[whole]).unwrap(),
+    vec![expected.to_vec()]
+  );
+}
+
 /// A-767 C3. Land identical payloads in two repositories, including two occurrences in one
 /// changeset. Forget either repository first. The other still serves the bytes after a restart.
 #[test]
@@ -382,21 +409,13 @@ fn forgetting_a_duplicate_payload_keeps_the_surviving_changesets_bytes() {
     assert!(store.forget(forgotten, 1).unwrap() > 0);
     drop(store);
     let mut store = open(&dir);
-    assert_eq!(store.changesets(survivor, 1, 1).unwrap().len(), 1);
-    assert!(store.changesets(forgotten, 1, 1).unwrap().is_empty());
-    assert_eq!(
-      store.piece(&staging, &identity, len, 0).unwrap().as_deref(),
-      Some(payload.as_slice()),
-      "the surviving repository still names this payload"
-    );
-    let place = slates_store::texts::Place {
+    let whole = slates_store::texts::Place {
       payload: identity,
       offset: 0,
       len,
     };
-    assert_eq!(
-      store.places_bytes(&staging, &[place]).unwrap(),
-      vec![payload.to_vec()]
+    assert_the_survivor_reads_the_shared_payload(
+      &mut store, &staging, whole, payload, survivor, forgotten,
     );
     assert_eq!(store.forget(forgotten, 1).unwrap(), 0);
     assert!(store.forget(survivor, 1).unwrap() > 0);
