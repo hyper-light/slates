@@ -3278,6 +3278,61 @@ fn an_xml_tags_attribute_order_is_no_part_of_an_answer() {
   );
 }
 
+/// The comparison's rule for an `svnsync` mirror ([`mirror_dump_of`]). Do: mirror one stock repository (the reads
+/// fixtures' `crates/svn/fixtures/dump/full.dump`, loaded) from two stock servers on two URLs, `svnserve` through the
+/// control's tunnel and `file://`, as the use test mirrors stock `svnserve` and slates. Expect the two mirrors' dumps
+/// equal, length headers and all: the URL each mirror records of its source (`svn:sync-from-url`, revision 0's) is no
+/// part of what it mirrors. Found by main's round (B) at 112e694e7 (2026-11-23): revision 0's `Prop-content-length`
+/// 221 against 220, a source URL a byte longer. Skips loudly without stock Subversion 1.15.
+#[test]
+fn a_mirrors_dump_is_the_same_whatever_url_it_was_synced_from() {
+  if !use_tools_here() {
+    eprintln!(
+      "skipping the mirror comparison's rule: no stock Subversion 1.15 here (svn, svnadmin, svnserve, svnrdump, svnsync)"
+    );
+    return;
+  }
+  let scratch = Scratch::new("svn-mirror-rule");
+  let root = format!("{}/repositories", scratch.path);
+  made_directory(&root);
+  let dump = format!(
+    "{}/../svn/fixtures/dump/full.dump",
+    env!("CARGO_MANIFEST_DIR")
+  );
+  use_control_loaded(&scratch.path, &root, &dump);
+  let tunnel = UseLeg {
+    name: "stock svnserve",
+    svn: Svn::new(
+      &scratch,
+      "tunnel",
+      vec![
+        "--config-option".to_owned(),
+        format!(
+          "config:tunnels:{CONTROL_TUNNEL}=sh -c 'exec svnserve -t -r {root} --tunnel-user={TUNNEL_USER}'"
+        ),
+      ],
+    ),
+    url: format!("svn+{CONTROL_TUNNEL}://localhost/{REPOSITORY}"),
+  };
+  let local = UseLeg {
+    name: "stock file://",
+    svn: Svn::new(&scratch, "local", Vec::new()),
+    url: format!("file://{root}/{REPOSITORY}"),
+  };
+  let [over_tunnel, over_file] =
+    [&tunnel, &local].map(|leg| mirror_dump_of(leg, (&scratch.path, &root)));
+  assert!(
+    over_tunnel.contains("Revision-number: 13"),
+    "the mirror over {} reached the fixture's youngest: {over_tunnel}",
+    tunnel.name
+  );
+  assert_eq!(
+    over_tunnel, over_file,
+    "the mirror over {} (left) and over {} (right)",
+    tunnel.name, local.name
+  );
+}
+
 /// The comparison's rule for a diff ([`canonical_diff`]). Do: put stock `svnserve`'s and slates' answers to `svn diff
 /// -c 4` over the golden repository (main's round of 2026-11-21), the same three deleted paths in two orders, through
 /// it, and an answer whose blocks differ. Expect the first two one text, and the third still different from them.
