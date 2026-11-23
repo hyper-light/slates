@@ -504,3 +504,14 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   - Next (main's order): (2) small-window slab in arena_windows.rs (w-shared's conditions a-f; main's: vcs only, a
     Derived: class line, red on N small windows' held bytes, read-back oracle through let-go/bring-back/purge); then
     (3) ContentStore::insert_new's 24 MB. Main runs arena-16 after (2).
+- 2026-11-23 ~12:15 PST:
+  - LANDED A-877, c1da780ec (merge 6bc368806): repository windows under a granule share one-granule slabs. Slots are
+    never rewritten, a slab is freed with its last window via A-64's deferred free, and the block asks its live bytes
+    (ChunkArena::reask). Piece v2 carries the slot, v1 refused OldVersion; gauges vcs_content.slabs/slab_freed_kept(_bytes).
+    Red 3,276,800 -> <=245,760 bytes for 200 x 1,151 B windows at 16 KiB. Plus an oracle (let-go, bring-back, purge),
+    a slab restart test, and the vfs volume-block test.
+  - Possible flake for main: image_pages a_checkpoint_carries_many_entries... failed once at its pieces assert under
+    load 70-80, then passed 4/4 on the same merge.
+  - Sent: main the hash for arena-17; w-shared how conditions a-f are met.
+  - Disk: deleted ~/.cache/w-perf-land-target.noindex (5.7 GiB) and old ~/.cache/w-perf logs (10.8 MiB) for kiln's reaper.
+  - Next: the 57k hg_push_lifetimes rerun for w-hg's cuts (f02fa1a28, 9003d110e, e4cad14ad); then (3) insert_new.
