@@ -7600,3 +7600,8 @@ After w-svn's fix run `cargo test --release --locked -p slates-server --lib a_re
 ## 2026-11-22 codex-review, home-repeat
 
 After w-shared's fix, run `cargo test --release --locked -p slates-server --lib a_homes_first_read_of_a_landed_object_with_a_repeated_window_is_whole` with the attached test. On both Linux and the Studio the first read must equal the warm read, including every repeated window.
+
+## 2026-11-22 codex-review, allocator extent claims, main 0ac91d301
+
+- On the bare-metal Studio, run `cargo test --release --locked -p slates-server --test recovery a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone -- --exact --nocapture` with the existing A-789 burst fixture. Record the pool's before, peak and after values if the test prints them. Red is failure to observe the burst or an after-minus-before of at least one quarter of its bytes.
+- In the Linux and Windows memory lanes, run `cargo test --release --locked -p slates-mem --lib a_pool_claim_for_`. All four mixed-size cases must pass using each host's page size. macOS arm64 passed locally.

@@ -14,3 +14,7 @@ Main acknowledged and routed all four findings at 19:25 PST. The single-serve in
 A refused Subversion whole-text read kept 262,144 bytes. Reproduced on e7269dae4 and reported to w-svn through main in inbox/main-from-codex-review-svn-bring-room.md.
 
 The home read-through returned None once for a 524,288-byte object with a repeated window. The immediate retry served the entire object. Reproduced at e7269dae4 and reported to main for w-shared in inbox/main-from-codex-review-home-repeat.md.
+
+2026-11-22. Allocator extent sizing fixed in `70710fafa`, published via `0ac91d301`. Four focused failures on mixed-size pools turned green. With three pages of headroom, the idle arena returned 12 of 16 pages. Growth left the other mapping available and preserved offers it could not use. Four existing focused tests passed, including the capacity integration and partial-claim rollback. See `inbox/main-from-codex-review-extent-claims.md` and `run-requests.md`.
+
+Completed the requested review through overlay recovery `951be1217`, lint fixes `74d48a98e` and `dcf34cbbe`, plus Git `0fefc86e2`/`469237825`, shared `9e74250b3`/`e7269dae4`, SVN `f974b5b13`/`d386763ba`, Hg `3419263ac`/`609c1f03c`, IPC `76bbf6ca8` and leases `ad5cd3250`. The three owner reports above have reproducing tests. Full histories, memory profiles and loaded latency remain main's measurements. Next proposed piece is a restart test for a held Subversion named text whose window is away.
