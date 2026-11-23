@@ -561,3 +561,10 @@ Waiting: main's route; arena-7 and arena-8.
   - w-perf's two points: the Option<Merge> lives in the Intake beside Taker.fork, as a step kind run within
     TakingIntake::slice's pacing (a refused or abandoned push drops it with the fork). I add the tiered rule in
     crates/vcs/src/index.rs myself; w-perf stays in vfs/content.rs and arena_windows.rs.
+- Landed 9003d110e (C1 cut 2), e4cad14ad (C1 cut 3: a cached base read where it lies, let go after its last user;
+  1.08 -> 0.08 copies), 0396009b9 (Windows server tests compile: the hg harness's principal is channel_account), and
+  c6fab004e (the seal's reland: HgIndex::insert seals when due, Index::tiered_due merges a push fork's runs a table a
+  step; counters vcs.hg.push_most_own_runs and vcs.hg.push_tiered_merges for arena-18).
+- arena-17 (cuts 2 and 3 plus w-perf's slab): RSS after push-all about 797-826 MB, down a third. The goal is about
+  410 MiB.
+- Next: decision 3's rewrite admission (evolution's last item), unless main reorders.
