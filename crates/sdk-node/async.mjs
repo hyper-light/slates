@@ -2,7 +2,8 @@
 // low-level primitives and settles each verb's Promise from the client's driver (AUD-29-19, AUD-29-20). A
 // call is submitted and gets a ticket at once — sent when the client admits it, queued otherwise, never
 // waiting — and the driver hands back events: a reply landed (decoded here by the verb's poll), or the call
-// failed, typed. Two inputs feed it: the completion fd's readiness (wrapped in a net.Socket that libuv polls)
+// failed, typed. Two inputs feed it: the completion signal's readiness (a net.Socket that libuv polls: the
+// completion fd it adopts on Unix, the completion pipe it opens by name on Windows, whose libuv adopts no handle)
 // and one timer at the driver's next wake (reply deadlines, reconnect attempts). The timer is referenced
 // while a call waits, so the process lives until every call has ended; a reader error, the fd closing or a
 // pump exception fails every call. No tokio and no extra thread — the loop is Node's.
@@ -232,8 +233,11 @@ export class AsyncClient {
       old.destroy();
     }
     this._channel = channel;
-    const fd = this._c.completionFd();
-    const sock = new net.Socket({ fd, readable: true, writable: false });
+    // Windows' libuv adopts no handle (`net.Socket({ fd })` reads a C runtime descriptor of Node's own), so there the
+    // reader opens the channel's completion pipe by its name.
+    const sock = process.platform === 'win32'
+      ? net.connect({ path: this._c.completionPipe() })
+      : new net.Socket({ fd: this._c.completionFd(), readable: true, writable: false });
     let ended = false;
     sock.on('data', () => this._guard(() => this._settle(this._c.pump())));
     sock.on('error', (err) => this._lose(err));

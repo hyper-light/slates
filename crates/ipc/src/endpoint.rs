@@ -388,7 +388,7 @@ impl ClientEnd {
     self
       .bridge
       .as_ref()
-      .map(crate::completion::CompletionBridge::completion_socket)
+      .and_then(crate::completion::CompletionBridge::completion_socket)
   }
 
   /// Clears the completion socket's readiness after the event loop reports it readable, so the next
@@ -410,28 +410,38 @@ impl ClientEnd {
   /// the socket with [`Self::drain_completion`] when the loop reports it readable.
   #[cfg(windows)]
   pub fn enable_async_completion(&mut self) -> Result<RawSocket, IpcError> {
-    if let Some(bridge) = &self.bridge {
-      return Ok(bridge.completion_socket());
+    if self.bridge.is_none() {
+      self.bridge = Some(crate::completion::CompletionBridge::start(&self.region)?);
     }
-    let bridge = crate::completion::CompletionBridge::start(&self.region)?;
-    let socket = bridge.completion_socket();
-    self.bridge = Some(bridge);
-    Ok(socket)
+    self
+      .bridge
+      .as_ref()
+      .and_then(crate::completion::CompletionBridge::completion_socket)
+      .ok_or(IpcError::Unsupported {
+        feature: "a completion socket on a channel whose completion is a pipe",
+      })
   }
 
-  /// Like [`Self::enable_async_completion`] but returns a **dup** the caller owns and must close — for
-  /// an SDK whose event loop closes the socket it polls (Node's `net.Socket` adopts and closes it;
-  /// asyncio only polls it, so it uses `enable_async_completion`). The dup and the client's own socket
-  /// refer to the same loopback endpoint, so closing the dup leaves the client's intact.
+  /// Enables the async completion channel as a pipe the caller's event loop opens by its name, and returns the name
+  /// (§4.7, D-19): for a loop that adopts no handle and opens a pipe by name (Node's libuv on Windows, `net.connect({
+  /// path })`), where [`Self::enable_async_completion`]'s socket serves a loop that polls a socket (a Python
+  /// selector). Idempotent: the same name each call. The bridge's thread holds the pipe once this process opens it
+  /// (`crate::stream::accept_own`); refused typed on a channel whose completion is a socket.
   #[cfg(windows)]
-  pub fn enable_async_completion_dup(&mut self) -> Result<RawSocket, IpcError> {
-    self.enable_async_completion()?;
-    match &self.bridge {
-      Some(bridge) => bridge.dup_socket(),
-      None => Err(IpcError::Unsupported {
-        feature: "async completion socket (the bridge did not start)",
-      }),
+  pub fn enable_async_completion_pipe(&mut self) -> Result<String, IpcError> {
+    if self.bridge.is_none() {
+      self.bridge = Some(crate::completion::CompletionBridge::start_piped(
+        &self.region,
+      )?);
     }
+    self
+      .bridge
+      .as_ref()
+      .and_then(crate::completion::CompletionBridge::completion_pipe)
+      .map(str::to_owned)
+      .ok_or(IpcError::Unsupported {
+        feature: "a completion pipe on a channel whose completion is a socket",
+      })
   }
 
   /// Arms the completion signal before the SDK yields to its event loop: the daemon wakes a parked

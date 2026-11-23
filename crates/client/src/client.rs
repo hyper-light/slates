@@ -2945,13 +2945,14 @@ impl Client {
     self.end.enable_async_completion().map_err(ClientError::Ipc)
   }
 
-  /// The Windows analogue of [`Self::enable_async_completion_dup`]: a dup of the completion socket the
-  /// caller owns and closes (Node's `net.Socket` adopts and closes it), leaving the client's intact.
+  /// The completion channel as a pipe the caller's event loop opens by its name, and that name (Windows; §4.7, D-19):
+  /// for Node's libuv, which adopts no handle there (`net.Socket({ fd })` reads a C runtime descriptor of Node's own)
+  /// and opens a pipe by its name. [`Self::enable_async_completion`]'s socket serves a loop that polls one.
   #[cfg(windows)]
-  pub fn enable_async_completion_dup(&mut self) -> Result<RawSocket, ClientError> {
+  pub fn enable_async_completion_pipe(&mut self) -> Result<String, ClientError> {
     self
       .end
-      .enable_async_completion_dup()
+      .enable_async_completion_pipe()
       .map_err(ClientError::Ipc)
   }
 

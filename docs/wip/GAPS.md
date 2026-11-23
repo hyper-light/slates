@@ -6145,7 +6145,11 @@
 > runs 20 s after its kill. CI's `sdk` job gains `windows-latest` and `windows-11-arm` legs that run the Node suites
 > and the packaged smoke test, each Node step bounded at 30 minutes; the packaged test's helper is copied beside it in
 > `ci.yml`, `.kiln/ci.yaml` and `.kiln/nightly.yaml`. **Owed:**
-> - the first Windows run of the three suites (filed for main; red would be a suite failing, not hanging);
+> - the first Windows run of the three suites (filed for main; red would be a suite failing, not hanging). Run
+>   45176536354 ran them on both Windows runners: none hung. The async suite failed `Unsupported fd type: UNKNOWN`,
+>   since Node's libuv adopts no handle on Windows; since 2026-11-23 (w-win) Node opens a completion pipe by its name
+>   there (`docs/bugs/2026-11-23-the-node-async-sdk-could-not-adopt-its-windows-completion-socket.md`). Three sync
+>   tests failed `Refused(BudgetExceeded { available: 5722144768 })` at their first create, which is owed;
 > - the Python suites on Windows: the `sdk` job's Python steps assume a Unix venv (`venv/bin/pip`), and the suites
 >   themselves start the anchor with `start_new_session` and end it with `os.killpg(os.getpgid(..), SIGKILL)`
 >   (`test_sdk.py`, `test_sdk_async.py`), neither of which Windows has, and the async suite's freeze uses `pgrep` and

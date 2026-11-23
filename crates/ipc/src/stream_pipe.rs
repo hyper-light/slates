@@ -46,13 +46,14 @@ use windows_sys::Win32::Security::Cryptography::{
 };
 use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows_sys::Win32::Storage::FileSystem::{
-  CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FileNameInfo,
-  GetFileInformationByHandleEx, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, SECURITY_ANONYMOUS,
-  SECURITY_SQOS_PRESENT, WriteFile,
+  CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_FLAGS_AND_ATTRIBUTES,
+  FileNameInfo, GetFileInformationByHandleEx, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+  PIPE_ACCESS_OUTBOUND, ReadFile, SECURITY_ANONYMOUS, SECURITY_SQOS_PRESENT, WriteFile,
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{
-  ConnectNamedPipe, CreateNamedPipeW, NAMED_PIPE_MODE, PIPE_READMODE_BYTE, PIPE_READMODE_MESSAGE,
+  ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
+  NAMED_PIPE_MODE, PIPE_NOWAIT, PIPE_READMODE_BYTE, PIPE_READMODE_MESSAGE,
   PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_TYPE_MESSAGE, PIPE_WAIT,
   SetNamedPipeHandleState,
 };
@@ -63,6 +64,10 @@ use crate::error::IpcError;
 /// Format: the prefix of every Shards stream's pipe name, in the local pipe namespace. What follows is the name's
 /// random part in hex.
 const NAME_PREFIX: &str = r"\\.\pipe\slates-shards-";
+
+/// Format: the prefix of a [`listener`]'s pipe name in the local pipe namespace, the random part following in hex: the
+/// pipe an async SDK's event loop opens by its name to read its client's completion (§4.7, D-19).
+const LISTENER_PREFIX: &str = r"\\.\pipe\slates-completion-";
 
 /// Format: the bytes of a pipe name's random part: 128 bits, as the plan for the Shards route on Windows asks (A-179).
 /// At 2^-64 odds of a collision after 2^32 names, a guess is hopeless and a collision is refused anyway
@@ -118,20 +123,8 @@ pub fn pair(frame_bytes: usize) -> Result<(OwnedHandle, OwnedHandle), IpcError> 
 /// A-198). A write a reader is not taking can be cancelled without leaving part of a message behind.
 pub fn message_pair(frame_bytes: usize) -> Result<(OwnedHandle, OwnedHandle), IpcError> {
   let (server, client) = pair_in(frame_bytes, PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE)?;
-  let mode: NAMED_PIPE_MODE = PIPE_READMODE_MESSAGE;
-  // SAFETY: the client end just opened, owned here; the mode is a live local; the two collection settings stay as they
-  // are (null). A client end opens in byte read mode whatever the pipe's type, so it is set to read messages too.
-  if unsafe {
-    SetNamedPipeHandleState(
-      client.as_raw_handle(),
-      &mode,
-      std::ptr::null(),
-      std::ptr::null(),
-    )
-  } == 0
-  {
-    return Err(os("SetNamedPipeHandleState"));
-  }
+  // A client end opens in byte read mode whatever the pipe's type, so it is set to read messages too.
+  set_mode(&client, PIPE_READMODE_MESSAGE)?;
   Ok((server, client))
 }
 
@@ -143,8 +136,36 @@ fn pair_in(
   let buffer = u32::try_from(frame_bytes).map_err(|_| IpcError::Layout {
     reason: "a pipe buffer past what CreateNamedPipeW takes",
   })?;
-  let name = fresh_name()?;
-  let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+  let wide = wide_name(&fresh_name(NAME_PREFIX)?);
+  let server = server_end(
+    &wide,
+    PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+    pipe_mode | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+    (buffer, buffer),
+  )?;
+  let client = client_end(
+    &wide,
+    GENERIC_READ | GENERIC_WRITE,
+    FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS,
+  )
+  .map_err(|()| os("CreateFileW of the pipe's client end"))?;
+  connected(&server)?;
+  Ok((server, client))
+}
+
+/// `name` in UTF-16, NUL-terminated, as the pipe calls take it.
+fn wide_name(name: &str) -> Vec<u16> {
+  name.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// A pipe's one server end under the NUL-terminated `wide` name: opened `access`, in `pipe_mode`, buffering
+/// `(out, in)` bytes, under the owner-only descriptor, and not inheritable (the module doc says why each).
+fn server_end(
+  wide: &[u16],
+  access: FILE_FLAGS_AND_ATTRIBUTES,
+  pipe_mode: NAMED_PIPE_MODE,
+  (out_bytes, in_bytes): (u32, u32),
+) -> Result<OwnedHandle, IpcError> {
   let descriptor = OwnerOnly::new()?;
   let attributes = SECURITY_ATTRIBUTES {
     nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(u32::MAX),
@@ -156,11 +177,11 @@ fn pair_in(
   let server = unsafe {
     CreateNamedPipeW(
       wide.as_ptr(),
-      PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
-      pipe_mode | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+      access,
+      pipe_mode,
       ONE_INSTANCE,
-      buffer,
-      buffer,
+      out_bytes,
+      in_bytes,
       NO_WAIT_TIMEOUT,
       &attributes,
     )
@@ -169,31 +190,133 @@ fn pair_in(
     return Err(os("CreateNamedPipeW"));
   }
   // SAFETY: the server end just made, owned here alone and closed on drop.
-  let server = unsafe { OwnedHandle::from_raw_handle(server) };
-  // SAFETY: the same NUL-terminated name; no attributes, so the handle is not inheritable; the handle returned is
-  // checked and owned below.
+  Ok(unsafe { OwnedHandle::from_raw_handle(server) })
+}
+
+/// A client end of the pipe under the NUL-terminated `wide` name, opened `access` with `flags`, not inheritable; `Err`
+/// when the open is refused, this thread's last error left for the caller to read.
+fn client_end(
+  wide: &[u16],
+  access: u32,
+  flags: FILE_FLAGS_AND_ATTRIBUTES,
+) -> Result<OwnedHandle, ()> {
+  // SAFETY: a NUL-terminated name; no attributes, so the handle is not inheritable; the handle returned is checked and
+  // owned below.
   let client = unsafe {
     CreateFileW(
       wide.as_ptr(),
-      GENERIC_READ | GENERIC_WRITE,
+      access,
       0,
       std::ptr::null(),
       OPEN_EXISTING,
-      FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS,
+      flags,
       std::ptr::null_mut(),
     )
   };
   if client == INVALID_HANDLE_VALUE || client.is_null() {
-    return Err(os("CreateFileW of the pipe's client end"));
+    return Err(());
   }
   // SAFETY: the client end just opened, owned here alone and closed on drop.
-  let client = unsafe { OwnedHandle::from_raw_handle(client) };
-  connected(&server)?;
-  Ok((server, client))
+  Ok(unsafe { OwnedHandle::from_raw_handle(client) })
 }
 
-/// A fresh pipe name: [`NAME_PREFIX`] and [`NAME_RANDOM_BYTES`] from the OS's random source, in hex.
-fn fresh_name() -> Result<String, IpcError> {
+/// A pipe this process's own reader opens by its name (§4.7, D-19): its server end, outbound alone and not yet
+/// connected, and its name. It is made as a pair is (a fresh name, `FILE_FLAG_FIRST_PIPE_INSTANCE`, one instance, no
+/// remote client, the owner alone), for a reader that can open a pipe only by its name: Node's `net.connect`, since
+/// Node's libuv adopts no handle on Windows (`net.Socket({ fd })` reads a C runtime descriptor of Node's own). The
+/// server end is synchronous; [`accept_own`] waits on it for the reader, and [`write_nowait`] then never waits.
+pub fn listener(out_bytes: usize) -> Result<(OwnedHandle, String), IpcError> {
+  let out_bytes = u32::try_from(out_bytes).map_err(|_| IpcError::Layout {
+    reason: "a pipe buffer past what CreateNamedPipeW takes",
+  })?;
+  let name = fresh_name(LISTENER_PREFIX)?;
+  let server = server_end(
+    &wide_name(&name),
+    PIPE_ACCESS_OUTBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
+    PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+    (out_bytes, 0),
+  )?;
+  Ok((server, name))
+}
+
+/// Waits on a [`listener`]'s server end for its reader, and keeps the reader only when it is this process
+/// (`GetNamedPipeClientProcessId`): an open by another process of the owner's (the descriptor admits no one else) is let
+/// go, and the wait goes on. `Ok(true)` with the reader held and the end set never to wait (`PIPE_NOWAIT`); `Ok(false)`
+/// when `ended` says so once an open returns the wait ([`knock`] is how an owner returns it).
+pub fn accept_own(server: &OwnedHandle, ended: &dyn Fn() -> bool) -> Result<bool, IpcError> {
+  loop {
+    // SAFETY: the live server end, synchronous, so the call returns once a reader has opened the name (or had already).
+    let opened = unsafe { ConnectNamedPipe(server.as_raw_handle(), std::ptr::null_mut()) };
+    if opened == 0 && last_error() != ERROR_PIPE_CONNECTED {
+      return Err(os("ConnectNamedPipe"));
+    }
+    if ended() {
+      return Ok(false);
+    }
+    let mut reader = 0u32;
+    // SAFETY: the live, connected server end and a local the call writes.
+    if unsafe { GetNamedPipeClientProcessId(server.as_raw_handle(), &mut reader) } == 0 {
+      return Err(os("GetNamedPipeClientProcessId"));
+    }
+    if reader == std::process::id() {
+      set_mode(server, PIPE_READMODE_BYTE | PIPE_NOWAIT)?;
+      return Ok(true);
+    }
+    // SAFETY: the live server end; the stranger's open is let go, and its handle reads the pipe's end.
+    if unsafe { DisconnectNamedPipe(server.as_raw_handle()) } == 0 {
+      return Err(os("DisconnectNamedPipe"));
+    }
+  }
+}
+
+/// Opens the pipe `name` and closes it at once, so an [`accept_own`] waiting on its server end returns to read its
+/// `ended`. A pipe whose reader is held refuses the open (`ERROR_PIPE_BUSY`), and one gone has no name: nothing waits
+/// on it then, so the refusal is no error.
+pub fn knock(name: &str) {
+  let _opened_and_closed = client_end(
+    &wide_name(name),
+    GENERIC_READ,
+    SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS,
+  );
+}
+
+/// Writes `bytes` to a [`listener`]'s server end that [`accept_own`] set never to wait: a full pipe takes none, which
+/// is a reader already woken, and a reader gone refuses the write; neither is an error to the writer of a wake.
+pub fn write_nowait(server: &OwnedHandle, bytes: &[u8]) {
+  let length = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+  let mut written = 0u32;
+  // SAFETY: the live server end in non-waiting mode, `length` bytes at `bytes`, and a local the call writes; no
+  // OVERLAPPED, since the end is synchronous.
+  let _taken_or_refused = unsafe {
+    WriteFile(
+      server.as_raw_handle(),
+      bytes.as_ptr(),
+      length,
+      &mut written,
+      std::ptr::null_mut(),
+    )
+  };
+}
+
+/// Sets `end`'s pipe mode.
+fn set_mode(end: &OwnedHandle, mode: NAMED_PIPE_MODE) -> Result<(), IpcError> {
+  // SAFETY: the live end; the mode is a live local; the two collection settings stay as they are (null).
+  if unsafe {
+    SetNamedPipeHandleState(
+      end.as_raw_handle(),
+      &mode,
+      std::ptr::null(),
+      std::ptr::null(),
+    )
+  } == 0
+  {
+    return Err(os("SetNamedPipeHandleState"));
+  }
+  Ok(())
+}
+
+/// A fresh pipe name: `prefix` and [`NAME_RANDOM_BYTES`] from the OS's random source, in hex.
+fn fresh_name(prefix: &str) -> Result<String, IpcError> {
   let mut bytes = [0u8; NAME_RANDOM_BYTES];
   let length = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
   // SAFETY: no algorithm handle with the system's preferred generator, and a buffer of `length` bytes.
@@ -211,8 +334,8 @@ fn fresh_name() -> Result<String, IpcError> {
       code: Some(status),
     });
   }
-  let mut name = String::with_capacity(NAME_PREFIX.len().saturating_add(2 * NAME_RANDOM_BYTES));
-  name.push_str(NAME_PREFIX);
+  let mut name = String::with_capacity(prefix.len().saturating_add(2 * NAME_RANDOM_BYTES));
+  name.push_str(prefix);
   for byte in bytes {
     use std::fmt::Write as _;
     let _infallible = write!(name, "{byte:02x}");
@@ -632,6 +755,49 @@ mod tests {
   /// The full name of the pipe `end` belongs to, as a client opens it.
   fn full_name(end: &OwnedHandle) -> String {
     format!(r"\\.\pipe{}", name_of(end.as_handle()).unwrap())
+  }
+
+  /// §4.7, D-19 (a completion pipe a loop opens by its name). Do: make a listener, open its name from this process
+  /// for reading as Node's libuv does, accept the reader, write a byte without waiting and read it at the reader's end;
+  /// then open the name again. Expect: the reader held as this process's own, the byte read, and the second open
+  /// refused `ERROR_PIPE_BUSY` (one instance, its reader held), so no other open of the name can take the signal.
+  #[test]
+  fn a_listeners_own_reader_is_held_and_reads_its_nudge_and_the_name_admits_no_second() {
+    use std::io::Read as _;
+    let (server, name) = listener(TEST_FRAME).unwrap();
+    assert!(name.starts_with(LISTENER_PREFIX), "{name}");
+    let reader = client_end(
+      &wide_name(&name),
+      GENERIC_READ,
+      SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS,
+    )
+    .unwrap();
+    assert!(
+      accept_own(&server, &|| false).unwrap(),
+      "this process's reader is held"
+    );
+    write_nowait(&server, b"x");
+    let mut read = [0u8; 1];
+    let mut reader = std::fs::File::from(reader);
+    assert_eq!(reader.read(&mut read).unwrap(), 1);
+    assert_eq!(&read, b"x");
+    assert_eq!(open_by_name(&name).err(), Some(ERROR_PIPE_BUSY));
+  }
+
+  /// §4.7, D-19 (a bridge stopped before its loop opened the pipe). Do: wait on a listener for its reader on another
+  /// thread, say the wait is ended, and knock on the name. Expect: the wait returns `false`, its reader never come.
+  #[test]
+  fn a_knock_returns_a_wait_for_a_reader_once_it_is_ended() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (server, name) = listener(TEST_FRAME).unwrap();
+    let ended = AtomicBool::new(false);
+    let accepted = std::thread::scope(|scope| {
+      let waiting = scope.spawn(|| accept_own(&server, &|| ended.load(Ordering::Acquire)));
+      ended.store(true, Ordering::Release);
+      knock(&name);
+      waiting.join().unwrap()
+    });
+    assert!(!accepted.unwrap(), "the wait returned unaccepted");
   }
 
   /// A-179: do make a pair and write each way with the waiting helpers (the daemon's end is overlapped too, so they

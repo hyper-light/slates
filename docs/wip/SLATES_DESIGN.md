@@ -5408,7 +5408,10 @@ return from its wait while the client is armed and a reply waits in its ring: a 
 waiter: a synchronous park raises a mark before its flag, and a bridge woken while the mark stands wakes once
 more, so the parked call is never left to its deadline (2026-11-18: before, 16 to 19 of 20 parked calls beside
 a running bridge slept to it). A bridge whose thread the OS refuses is refused typed, never started without
-it. The client folds a
+it. On Windows the bridge serves the shape the SDK's loop can wait on: the read end of a loopback socket pair, which
+a selector polls (Python's `add_reader`), or a pipe the loop opens by its name (Node's `net.connect({ path })`, since
+Node's libuv adopts no handle there and read the socket's as `Unsupported fd type: UNKNOWN`), which the bridge holds
+only once this process has opened it (2026-11-23). The client folds a
 confirmed stamp inside its wait into its estimate (stamp to return). Shards poll rings while any
 client has activity within the
 measured idle window, then park in the driver; a parked shard is woken by the driver kick the
@@ -61605,3 +61608,27 @@ retirement; `landing.rs`: `abandon_presentations` removed, `forget_presentations
   then another client grants and lands; refused `NotFound` before), `a_presentation_goes_with_its_volume` (one
   awaiting after a destroy before, none after), `another_clients_presentation_still_replaces_and_the_bound_still_refuses`,
   and the CLI's session-grant test, red before and green after.
+
+### A-875 — On Windows the Node SDK reads its completion through a pipe it opens by name (2026-11-23, w-win for main 01a20182; §4.7, D-10, D-19; corrects the 2026-09-09 claim that Node adopts a `SOCKET`)
+
+- **Why.** Both Windows legs of CI's SDK lane (run 45176536354, Node v24.22.3) failed the async suite at its first
+  parked verb with `CompletionLost { reason: "Unsupported fd type: UNKNOWN" }`. `async.mjs` wrapped the completion
+  signal in `net.Socket({ fd })`, and on Windows the addon handed it the bridge's loopback `SOCKET`. Node asks libuv's
+  `uv_guess_handle`, which on Windows takes the number for a C runtime descriptor of `node.exe`'s own table
+  (`_get_osfhandle`), so no handle an addon makes can be adopted that way (read from libuv's and Node's sources, not
+  measured). The 2026-09-09 note that "Node and libuv accept a `SOCKET` there" was never run on Windows.
+- **The change.** The Windows bridge serves the shape the SDK's loop can wait on (`completion.rs`, `Polled`): the read
+  end of the loopback pair, which a selector polls (Python's `add_reader`), unchanged; or a pipe the loop opens by its
+  name (`stream_pipe::listener`: a fresh name, first instance, one instance, no remote client, the owner alone,
+  outbound only), whose server end the bridge's thread holds only once this process has opened it
+  (`accept_own`, `GetNamedPipeClientProcessId`) and then writes without waiting. `knock` returns that wait at a stop.
+  The same loop nudges either (`nudge_while_armed`). The addon's Windows `completionPipe()` names the pipe and
+  `async.mjs` opens it with `net.connect({ path })`; `enable_async_completion_pipe` replaces the Windows
+  `enable_async_completion_dup`, whose only caller was the addon.
+- **Not changed.** Unix keeps the completion fd Node adopts; Python on Windows keeps the socket.
+- **Tests.** `stream_pipe` (Windows): `a_listeners_own_reader_is_held_and_reads_its_nudge_and_the_name_admits_no_second`,
+  `a_knock_returns_a_wait_for_a_reader_once_it_is_ended`; the SDK lane's async suite on both Windows runners.
+- **Applied in the same change to:** `crates/ipc/src/stream_pipe.rs`, `crates/ipc/src/completion.rs`,
+  `crates/ipc/src/endpoint.rs`, `crates/client/src/client.rs`, `crates/sdk-node/src/lib.rs`, `crates/sdk-node/async.mjs`,
+  the Node suites, `unsafe-budget.toml` (slates-ipc 169 -> 171), §4.7, GAPS (the Node SDK suites on Windows),
+  `docs/bugs/2026-11-23-the-node-async-sdk-could-not-adopt-its-windows-completion-socket.md`.

@@ -538,7 +538,14 @@ slates-db = 0
 # SYNCHRONIZE and PROCESS_QUERY_LIMITED_INFORMATION (OpenProcess, the handle adopted), reads its creation time
 # (GetProcessTimes, also of the daemon's own pseudo-handle, GetCurrentProcess) to tell it from a process given its pid
 # after it, and waits on the claim's Event and the process at once (WaitForMultipleObjects); compiled only for Windows.
-slates-ipc = 169
+slates-ipc = 171
+# 2026-11-23 (+2 over the ceiling, 4 sites from a count of 167, w-win for main 01a20182; compiled only for Windows; a
+#   `// SAFETY:` line directly above each): the completion pipe Node's event loop opens by its name (`stream_pipe.rs`,
+#   §4.7, D-19), since Node's libuv adopts no handle on Windows. `accept_own` waits for the reader with a synchronous
+#   `ConnectNamedPipe`, reads its process with `GetNamedPipeClientProcessId` and lets a stranger go with
+#   `DisconnectNamedPipe`; `write_nowait` is a synchronous `WriteFile` on the end set never to wait. windows-sys has no
+#   safe wrapper for any. The pipe's creation, its client open and its mode are the pair's own sites, moved into
+#   `server_end`, `client_end` and `set_mode`, so they add none.
 # 2026-11-23 (+2, A-871, main 01a20182, compiled only for Windows): a client's reply wait raises its own thread one level
 #   above normal and puts it back (`endpoint.rs`, `RaisedForTheWait`): `GetThreadPriority` and `SetThreadPriority` on
 #   the thread's pseudo-handle as the wait begins, `SetThreadPriority` as it ends; windows-sys exposes no safe wrapper.
