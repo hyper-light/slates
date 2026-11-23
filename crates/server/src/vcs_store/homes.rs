@@ -590,6 +590,12 @@ std::thread_local! {
   /// windows its content store holds.
   static REGION_HELD: std::cell::RefCell<std::collections::BTreeSet<ContentId>> =
     const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+  /// The windows of the objects this shard holds for the region, each with how many of them it lies in: what pins a
+  /// window once landed (`vcs_store::landed_pin`), since a region hold names its object and an object longer than a
+  /// window is a list whose windows have identities of their own (codex-review, 2026-11-22: a Mercurial file sharing a
+  /// region object's first window let it go, and the home read the object as none). Bounded by those objects' windows.
+  static REGION_WINDOWS: std::cell::RefCell<std::collections::BTreeMap<ContentId, u32>> =
+    const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
   /// The region holds kept (true) or let go (false) since the shard's last committed publication: what a delta of the
   /// shard image carries ([`region_changes`]), so a home's holds survive its restart (A-724 piece 8c). Bounded by them.
   static REGION_CHANGES: std::cell::RefCell<std::collections::BTreeMap<ContentId, bool>> =
@@ -989,6 +995,7 @@ pub(crate) fn restore_region_holds(
     });
     if kept {
       held = held.saturating_add(1);
+      region_windows_changed(content, identity, true);
     } else {
       // Held in the store, but not named as the region's: given back, so the store's count and the set agree.
       let _ = content.release(identity);
@@ -1016,13 +1023,48 @@ pub(crate) fn keep_for_region(
     return Ok((identity, ticket_here(state.shard)));
   }
   let kept = keep_here(state, bytes)?;
-  REGION_HELD.with(|held| {
-    if let Ok(mut held) = held.try_borrow_mut() {
-      held.insert(kept.0);
-    }
+  let inserted = REGION_HELD.with(|held| {
+    held
+      .try_borrow_mut()
+      .is_ok_and(|mut held| held.insert(kept.0))
   });
+  if inserted && let Some(content) = state.vcs_stores.content() {
+    region_windows_changed(content, &kept.0, true);
+  }
   region_changed(kept.0, true);
   Ok(kept)
+}
+
+/// Counts the windows of the object `identity` in `content` into ([`REGION_WINDOWS`]), as its region hold is taken
+/// (`held`), or out of it, as it is given back.
+fn region_windows_changed(content: &slates_vcs::ContentStore, identity: &ContentId, held: bool) {
+  let windows = content.object_layout(identity);
+  REGION_WINDOWS.with(|counted| {
+    let Ok(mut counted) = counted.try_borrow_mut() else {
+      return;
+    };
+    for (window, _) in windows {
+      if held {
+        let count = counted.entry(window).or_insert(0);
+        *count = count.saturating_add(1);
+      } else if let Some(count) = counted.get_mut(&window) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+          counted.remove(&window);
+        }
+      }
+    }
+  });
+}
+
+/// Whether the window `identity` lies in an object this shard holds for the region ([`REGION_WINDOWS`]): a landed
+/// window's pin (`vcs_store::landed_pin`).
+pub(crate) fn region_holds_window(identity: &ContentId) -> bool {
+  REGION_WINDOWS.with(|counted| {
+    counted
+      .try_borrow()
+      .is_ok_and(|counted| counted.contains_key(identity))
+  })
 }
 
 /// Lets go this shard's region hold of the window `identity` (module docs, "From the region"): `NotHeld` where the region
@@ -1038,6 +1080,9 @@ pub(crate) fn let_go_for_region(
   });
   if !held {
     return Err(HomeRefused::NotHeld);
+  }
+  if let Some(content) = state.vcs_stores.content() {
+    region_windows_changed(content, identity, false);
   }
   region_changed(*identity, false);
   let_go_here(state, identity)
