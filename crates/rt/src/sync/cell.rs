@@ -7,7 +7,11 @@
 //! **Bounded.** At most [`MAX_CELLS`] cells live at once, and fewer when the consumer sets a lower [`set_limit`];
 //! past it a claim is refused [`RtError::Capacity`].
 //! Cells are allocated a segment of [`SEGMENT`] at a time, when first needed, and a segment is never freed (its
-//! cells are reused), so the table's memory is the most cells ever live at once, rounded up to a segment.
+//! cells are reused), so the table's memory is the most cells ever live at once, rounded up to a segment, and a
+//! directory of 512 segments' slots for each such span. The table is two levels, directories of segments,
+//! so a look-up borrows two arrays of 512 slots and never the whole table: Miri retags every slot of an array a
+//! reference borrows, and the one-level table's 262,144 slots made each claim and each handle's look-up cost seconds
+//! under it.
 //!
 //! **Claiming.** A two-level bitmap of free cells: a word per segment (a bit per cell) and a word per 64 segments
 //! (a bit per segment that may have a free cell). A claim finds a marked segment and clears one free bit with a
@@ -47,6 +51,22 @@ const SEGMENTS: usize = MAX_CELLS >> SEGMENT_SHIFT;
 
 /// Derived: the summary words, one bit per segment.
 const SUMMARY_WORDS: usize = SEGMENTS >> SEGMENT_SHIFT;
+
+/// Derived: `log2` of the segments one directory holds, half of `log2(`[`SEGMENTS`]`)`, so the table's two levels are
+/// arrays of one length (2^9 entries each): a look-up borrows two arrays of 512 slots, never the whole table. Under
+/// Miri a borrow of a one-level table of all 262,144 slots retagged the whole 4 MiB array at every claim and every
+/// handle's look-up (w-wall, 2026-11-23: `retirement::tests::a_group_is_adopted_retired_and_its_owner_joined` ran 37
+/// minutes without finishing, every progress report inside `claim`'s look-up).
+const DIRECTORY_SHIFT: u32 = SEGMENTS.trailing_zeros() / 2;
+
+/// Derived: the segments one directory holds.
+const DIRECTORY: usize = 1 << DIRECTORY_SHIFT;
+
+/// Format: the mask that turns a segment's index into its slot within its directory.
+const DIRECTORY_MASK: usize = DIRECTORY - 1;
+
+/// Derived: the directories [`SEGMENTS`] needs.
+const DIRECTORIES: usize = SEGMENTS >> DIRECTORY_SHIFT;
 
 /// Format: "no task waits" in a cell's waiter word. No task word is all ones: its shard field would be `u16::MAX`,
 /// which the registry never issues (a runtime's shards are numbered from zero, far below it).
@@ -113,8 +133,14 @@ struct Segment {
   free: AtomicU64,
 }
 
-/// The segments, each allocated when first needed and kept for the process.
-static TABLE: [OnceLock<Box<Segment>>; SEGMENTS] = [const { OnceLock::new() }; SEGMENTS];
+/// A directory of segments, allocated when its first segment is needed and kept for the process.
+#[derive(Debug)]
+struct Directory {
+  segments: [OnceLock<Box<Segment>>; DIRECTORY],
+}
+
+/// The directories of segments, each allocated when first needed and kept for the process.
+static TABLE: [OnceLock<Box<Directory>>; DIRECTORIES] = [const { OnceLock::new() }; DIRECTORIES];
 
 /// A bit per segment that may have a free cell: every segment starts free.
 static NONFULL: [AtomicU64; SUMMARY_WORDS] = [const { AtomicU64::new(u64::MAX) }; SUMMARY_WORDS];
@@ -144,9 +170,14 @@ pub(crate) struct CellRef {
   generation: u32,
 }
 
-/// Segment `index`, allocated on first use.
+/// Segment `index`, allocated on first use, with its directory.
 fn segment(index: usize) -> Option<&'static Segment> {
-  TABLE.get(index).map(|slot| {
+  let directory = TABLE.get(index >> DIRECTORY_SHIFT)?.get_or_init(|| {
+    Box::new(Directory {
+      segments: [const { OnceLock::new() }; DIRECTORY],
+    })
+  });
+  directory.segments.get(index & DIRECTORY_MASK).map(|slot| {
     &**slot.get_or_init(|| {
       Box::new(Segment {
         cells: [const { Cell::new() }; SEGMENT],
@@ -154,6 +185,16 @@ fn segment(index: usize) -> Option<&'static Segment> {
       })
     })
   })
+}
+
+/// Segment `index` if it has been allocated.
+fn allocated_segment(index: usize) -> Option<&'static Segment> {
+  let directory = TABLE.get(index >> DIRECTORY_SHIFT)?.get()?;
+  directory
+    .segments
+    .get(index & DIRECTORY_MASK)?
+    .get()
+    .map(|segment| &**segment)
 }
 
 /// The bit of `low` in a `u64` word (`low` below 64 by construction; any other reads as no bit).
@@ -239,7 +280,7 @@ impl CellRef {
   /// The cell, while this handle's generation is its own.
   pub(crate) fn cell(self) -> Option<&'static Cell> {
     let index = usize::try_from(self.index).ok()?;
-    let segment = TABLE.get(index >> SEGMENT_SHIFT)?.get()?;
+    let segment = allocated_segment(index >> SEGMENT_SHIFT)?;
     let cell = segment.cells.get(index & SEGMENT_MASK)?;
     (cell.generation.load(Ordering::Acquire) == self.generation).then_some(cell)
   }
@@ -263,7 +304,7 @@ impl CellRef {
     cell.waiter.store(NO_WAITER, Ordering::Release);
     let index = usize::try_from(self.index).unwrap_or(usize::MAX);
     let (segment_index, cell_bit) = (index >> SEGMENT_SHIFT, index & SEGMENT_MASK);
-    if let Some(segment) = TABLE.get(segment_index).and_then(OnceLock::get) {
+    if let Some(segment) = allocated_segment(segment_index) {
       segment.free.fetch_or(bit(cell_bit), Ordering::AcqRel);
     }
     if let Some(summary) = NONFULL.get(segment_index >> SEGMENT_SHIFT) {
@@ -330,5 +371,30 @@ mod tests {
     for cell in claimed {
       cell.release();
     }
+  }
+  /// Shape: the rounds the measurement below times each figure over.
+  const MEASURE_ROUNDS: u32 = 1_000_000;
+
+  /// A measurement tool, run alone and in release: a claim with its handle's look-up and release, and a look-up alone,
+  /// each the mean of [`MEASURE_ROUNDS`]. `cargo test --release -p slates-rt --lib -- --ignored --exact
+  /// sync::cell::tests::measure_claim_and_look_up --nocapture`.
+  #[test]
+  #[ignore = "a measurement tool, run alone"]
+  fn measure_claim_and_look_up() {
+    let started = std::time::Instant::now();
+    for _ in 0..MEASURE_ROUNDS {
+      let cell = claim(1).unwrap();
+      std::hint::black_box(cell.cell());
+      cell.release();
+    }
+    let claimed_ns = started.elapsed().as_nanos() / u128::from(MEASURE_ROUNDS);
+    let held = claim(1).unwrap();
+    let started = std::time::Instant::now();
+    for _ in 0..MEASURE_ROUNDS {
+      std::hint::black_box(std::hint::black_box(held).cell());
+    }
+    let looked_ns = started.elapsed().as_nanos() / u128::from(MEASURE_ROUNDS);
+    held.release();
+    println!("MEASURE claim, look-up and release {claimed_ns} ns; look-up {looked_ns} ns");
   }
 }

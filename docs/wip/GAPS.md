@@ -26397,16 +26397,48 @@ A plain debug build on adacachy2 (db3ddff02) sorted the reds:
   test's fixed 1.25-slice volume left room since A-848's best-fit claims; **fixed**, sized by the refusal's own
   `available`), `a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone` (a released extent kept its pages in
   Linux's memfd; **fixed**, `docs/bugs/2026-11-23-a-released-pool-extent-kept-its-pages-in-the-linux-content-object.md`),
-  `a_burst_leaves_nothing_resident_behind_it_but_its_data` (no sweep completed within the test's 10 s), and
-  `a_shards_start_holds_each_heavy_piece_in_a_slice_of_its_own` (8 heavy pieces in one slice); ipc's
+  `a_burst_leaves_nothing_resident_behind_it_but_its_data` (no sweep completed within the test's 10 s: a fresh
+  daemon's sweep walks its write log and journal whole, 47.5 million pages in 104 s on adacachy2; **fixed**, the test
+  reads the arena's held runs from the memory report's kinds, which a sweep passed 5.2 ms after the first memory
+  request), and
+  `a_shards_start_holds_each_heavy_piece_in_a_slice_of_its_own` (8 heavy pieces in one slice; **fixed**, a heavy
+  piece ends its slice whatever the yields have cost,
+  `docs/bugs/2026-11-23-a-starts-heavy-pieces-ran-in-one-slice-where-yields-cost-more.md`); ipc's
   `a_reply_sent_before_the_client_blocked_teaches_its_wake_nothing` (4 of 5,341 parks that never switched out taught a
-  wake: Linux trusts `futex_wake`'s count, which counts a waiter woken before it blocked).
+  wake: Linux trusted `futex_wake`'s count, which counts a waiter woken before it blocked; **fixed**, a Linux park
+  teaches only if its thread switched out, the test judged by the client's held wakes,
+  `docs/bugs/2026-11-23-a-linux-client-learned-a-wake-from-a-park-that-never-slept.md`).
 - **Timing-dependent on Linux.** daemon's `a_metadata_class_bounds_the_volume_records_a_shard_admits` judged the bytes
   left against the claimed capacity, which a publication's give-back trims to the demand (A-853): 6 of 10.5 MiB failed on
   CI, 6 of 12.5 passed here. **Fixed:** judged against the shard's slice, read after a publication.
 - **One poll past the budget.** `git_push::tests::t_a850_r16_a_history_and_its_tags_pushed_whole_into_an_empty_repository_bring_each_object_once`
   held the control shard 1,540 ms in one poll here (the daemon's near-miss line); under TSan the watchdog ended the
-  library's test process at it (exit 4), so about 1,000 of its 1,247 tests never ran.
+  library's test process at it (exit 4), so about 1,000 of its 1,247 tests never ran. **Fixed:** the test drove the
+  whole push in one observation, where the edges take a step a poll (`vcs_ssh::receive`); it drives it so now
+  (`pushed_a_step_a_poll`).
+- **Measured, open: a push's steps against the quantum.** r16's push driven a step a poll, release, adacachy2 (load
+  12-21, 3 runs): the longest answer step 1.41, 1.20 and 1.11 ms, and the longest carry 3.91, 3.55 and 3.48 ms (an
+  await's wall time, which can span steps), against the shard's live quantum of 2.96, 4.26 and 2.75 µs and its step
+  ceiling of 100 ms. `rt.long_steps` rose 3,403 to 4,747 over each push of about 6,300 to 6,900 steps, and the push
+  took 166 to 186 ms. In debug: 16.7 and 7.5 ms against 8.9 µs. Tied to the push hot path w-git is rebuilding: once
+  w-git's index fix lands, main measures an edit's p99 on a shard during a concurrent git/git push, and the step
+  granularity is decided from that (84a's under-1 ms p99).
+- **A flaky bench assertion.** `crates/ipc/examples/ipc_bench.rs`'s parked row asserts "every trip woke the client"; it
+  aborted 1 run in 12 under load on adacachy2 (2026-11-23, BENCHMARKS' A/B of the switch-count reads). Its spinning row
+  had failed every run since A-799 (85b88770e): **fixed**, it names its spin.
 - **TSan only (green here).** `content_ranges::tests::a_sweep_on_its_step_clock_settles_at_steps_its_fixed_cost_amortizes`
   (1 of 3 TSan runs) and `git_push::tests::t_a614a_a_long_historys_derivation_takes_turns_by_the_shards_pace_not_its_objects`
   (2 of 3; 1 turn in 21 ms here).
+
+### 2026-11-23: the Miri lane stalled in the runtime's cell table — fixed (w-tsan, main 01a20182's order; w-wall's finding)
+CI's Miri lane ("miri + loom (mem, rt, wire)") would next stall in slates-rt's
+`retirement::tests::a_group_is_adopted_retired_and_its_owner_joined`: w-wall's run went 37 minutes without finishing,
+every progress report inside `sync::cell::claim`'s look-up of the cell table, and a native sample of Miri put its time
+in the borrow tracker. The table was one static array of 262,144 `OnceLock<Box<Segment>>` slots (A-767 C2), and every
+claim and every handle's look-up borrowed all 4 MiB of it, which Stacked Borrows retags slot by slot. On this MacBook the
+cell test `a_cell_is_freed_by_its_last_handle_and_a_stale_handle_finds_it_closed` took 43.0 s of CPU under Stacked
+Borrows and 3.19 s with them off. **Fixed:** two levels, 512 directories of 512 segments' slots, so a look-up borrows
+two arrays of 512. The cell test then took 2.74 s of CPU, and the retirement test passed in 3.98 s; with CI's flags,
+`retirement::` and `sync::cell::` passed 4 of 4 in 158 s of CPU. The plain build pays about 2 ns a claim (12 to 14 ns,
+least against least, 8 interleaved rounds at load 79-103), which main accepted (BENCHMARKS). CI's Miri lane is the check
+of the whole crate.

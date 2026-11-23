@@ -5452,6 +5452,12 @@ drops.
 > (`diag-liveness-client-4`). So the mean on main stayed a sleeper's: the parked bench form's client estimate read
 > 17–33 µs on both Windows runners before and after (`Client::wake_estimate`, provision_bench's `client wake` line),
 > against a published window of 8.8–9.9 µs (`diag-liveness-client-1`, `-2`).
+> **Linux too (2026-11-23).** The daemon's confirmation was not enough there: `futex_wake` counts a waiter that queued
+> itself and was set running again before it blocked, so the same test on adacachy2 found 5,341 of 16,384 racing parks
+> that never switched out, and 4 of them taught 560 to 9,286 ns. A Linux park now teaches only if the client's own
+> voluntary switch count rose across it and the daemon confirmed. The client already read the count around every
+> wait, so no call is added. macOS, which gives no per-thread count, keeps the confirmation alone. Record:
+> `docs/bugs/2026-11-23-a-linux-client-learned-a-wake-from-a-park-that-never-slept.md`.
 
 > **Status (2026-09-29, A-42: the idle spin is opened by client activity and ends with its window).** The
 > daemon set a shard "active" at its first client's handoff and nothing cleared it, so from then on every

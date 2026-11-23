@@ -3883,23 +3883,34 @@ fn a_file_deleted_after_its_burst_went_idle_takes_its_reserve_with_it() {
   );
 }
 
-/// The content arena's allocated and resident bytes for the status report (A-744), read from a sweep that completed
-/// after this call began, so the figures are of now.
+/// The content arena's allocated and resident bytes for the status report (A-744): resident as the memory report's
+/// `arenas` row says it, from a sweep that began after this call did and passed the arenas' held runs, which a sweep walks
+/// first (main's ruling of 2026-11-21 on w-sizing's option (a)), so the figures are of now. Until 2026-11-23 this waited
+/// for a whole sweep of the shard's slice, which on a fresh daemon walks its write log and journal whole: on adacachy2,
+/// one shard of a 125 GiB host, 47.5 million pages in 104 s, while the held runs were passed 5.2 ms after the first
+/// memory request, so the wait's 10 s failed there and on CI's TSan lane. The bound is now the report's own for what it
+/// walks first: ten liveness budgets of a second.
 #[cfg(target_os = "linux")]
 fn arena_figures(client: &mut Client) -> (u64, u64) {
-  let completed = memory_counter(client, "content_range.sweep.completed");
+  // A plain status arms no sweep: the count is read before the first memory request arms one at the held runs.
+  let passed = counter(client, "content_range.sweep.kinds_swept");
   let started = Instant::now();
-  while memory_counter(client, "content_range.sweep.completed") <= completed {
+  while memory_counter(client, "content_range.sweep.kinds_swept") <= passed {
     assert!(
       started.elapsed() < Duration::from_secs(10),
-      "a sweep of the shard's slice completed"
+      "a sweep passed the arenas' held runs"
     );
     std::thread::yield_now();
   }
-  (
-    counter(client, "content_range.arena.allocated"),
-    counter(client, "content_range.arena.resident"),
-  )
+  let resident = client
+    .daemon_status()
+    .unwrap()
+    .memory
+    .iter()
+    .filter(|row| row.kind == "arenas")
+    .map(|row| row.resident_bytes)
+    .sum();
+  (counter(client, "content_range.arena.allocated"), resident)
 }
 
 /// [`counter`] read from a status that asks for the memory report, which alone advances and arms the residency sweep
