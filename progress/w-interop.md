@@ -528,3 +528,9 @@ Waiting: w-git's fix; then main reruns git/git and the git matrix, and the part 
   docs/bugs/2026-11-22-the-heap-row-counted-large-blocks-spans-as-resident.md.
 - NEXT (main's assignment): (b2) name the live large blocks by size from the tracked table, match them to their
   with_capacity sites, size each from the work (Windows charges commit for them).
+- LANDED ad5cd3250 (2026-11-22 ~17:45 PST, main 1ce8a383a), (b2): the partition's lease-expiry wheel grows with its
+  leases (rt Wheel::growing); two 595 MiB per-shard reservations gone; an idle two-shard daemon's `large` row 12 /
+  1,298,595,840 B reserved -> 7 / 12,353,536. Red: slates-db --test lease_wheel (201,326,592 B mapped before, 0 after).
+  Note docs/bugs/2026-11-22-each-partition-reserved-a-lease-timer-for-every-volume-it-could-hold.md.
+- Open for main: r74's ~120 MB footprint past live (heap reserved 612 MB vs 111.7 MB in use); I sent the
+  top/vmmap/lldb malloc_zone_pressure_relief check; a give-back is a piece only if it releases ~100 MB.
