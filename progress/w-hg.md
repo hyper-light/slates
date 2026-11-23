@@ -512,3 +512,9 @@ Waiting: main's route; arena-7 and arena-8.
   hex walk. Oracle against the walk; at most 8 reads.
 - Queue clear. Next: changeset evolution (an evolution row, the hidden view, its kept heads), unless arena-10 names a
   memory item.
+- Landed 8dd4adbb5 (evolution piece 1, be9ffd98f): pushed obsolescence markers are kept and served. The new
+  hg_evolution test runs real hg with evolution = all, pushes an amend and a rebase, and clones: the clone holds the
+  2 markers and the successors. A marker on public a is refused in 7.2's createmarkers words. The real-hg harness is
+  tests/common/hg.rs. Flaky under a parallel run: t_goal93 landed-pack let-go (git; passed 3/3 alone).
+- Next: kept branch heads for a view that leaves changesets out. Still owed: non-publishing repos and the hidden
+  view, rewrite admission, the obsolete pushkey namespace, the "N new" output.
