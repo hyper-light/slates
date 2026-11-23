@@ -157,6 +157,14 @@
 > and every clone (stock_git_verbs 1 of 8). Lifted when w-git's fetch-side readers (A-855's held answer, brought back and
 > made again) and the push decision's reads bring a let-go window back, with w-shared's red: annotated tags pushed, the
 > push ended, idle, then ls-remote and a clone byte-identical to stock.
+> **r227's SSH regression FIXED (w-git, 2026-11-23):** with the lift, stock git's fetch over SSH ended mid-answer
+> (`unexpected disconnect while reading sideband packet`; on a made history, the shallow clone right after its
+> `packfile` header): an answer whose pack's choice read a let-go window is held for it (`Answer::held_away`) with its
+> sections written, and the SSH edge's `write_answer` dropped it as written, where the HTTP edge brings the window back
+> and makes it again past what it wrote. Now the SSH edge keeps it and its next step does the same (`read_through_held`).
+> Red at the session: git_interop's whole session over SSH on a made history failed 3 of 3, every step held after.
+> Owed: a unit red at the edge (the single-shard edge tests reach no held answer); the SSH edge's wait for room
+> (A-855: an answer held for room is dropped the same way; the HTTP edge's `wait_for_room` has no SSH twin).
 > **LIFTED AGAIN (w-git, 2026-11-23, main 01a20182's order after r165):** `vcs_store::LANDED_LET_GO` on, one switch for
 > a commit's let-go and a recovery's or rebuild's (w-shared's `put_changeset`): the commit owes its pack and the push's
 > end or the repository's idle give-back lets it go a slice a turn (3e1588a54, the quantum alone ending a slice), every
