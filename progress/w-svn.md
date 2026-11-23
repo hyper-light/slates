@@ -590,3 +590,15 @@ Next: finding (2) re-measured on the merged tree; main runs git-2000.
   (`finding_2_probe_what_an_import_leaves_held` spawns `ps` blocking on the shard), not load. It's #[ignore]d locally.
 - Left per text in-process: the two `read_step`s (~11 MB each); the batch's re-read goes with w-engine's paused
   fast-forward.
+- Main's 17:00 rulings:
+  1. The DAV flake is mine; neither sighting ran my probe.
+  2. Then A-760's items 3-7: the green's block names the plane's object. One item a piece, each with an oracle
+     against `apply_recorded`. The engine work is mine while w-engine is paused; tell w-perf when I start.
+- The DAV flake, diagnosed. w-git's line: `daemon_edge.rs:408:16` at ~27cae9bf7, the test reader `line_of`: the
+  client's read gave up waiting for the PROPPATCH answer.
+  - Cause: the hook's pipes are `std::io::pipe()` (`hook_driver.rs` 224-227); on macOS close-on-exec lands a call late.
+  - The in-process test binaries spawn stock clients with `std::process::Command`, not `confined_spawn`. One lands in
+    that window and inherits the hook's words write end.
+  - A first-run hook has no deadline, so its drain waits until the client leaves.
+- Proposed to main: (b) end the drain when the hook's process group is empty, red first with a plain std child
+  holding the pipe; or (d) confine the tests' spawns. Awaiting the ruling.
