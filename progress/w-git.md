@@ -559,3 +559,7 @@
   let go behind a fetch's cursor; vcs_store::commit lets the landed pack go again. w-shared's annotated-tags red green
   (1,115,127 B let go). Focused: server 361, git 202. OPEN: git/git mirror stall at 183,511 B (before the pack, with
   the guard in; main's sample pending); push decision reads; LFS object 404; mirror pack 554 vs 218 KB (made_whole).
+- 2026-11-22 ~19:10 PST: guard put back LANDED 6692d6f24 (main's ruling): commit lets no landed pack go until the
+  synchronous readers read through: (a) green_ready via views (w-shared), (b) push thin bases via IndexedObjects and
+  (c) policy/signature reads (mine, ~3 h). Fetch-side readers stay. NEXT: (b)+(c); LFS on main's trace; stall on
+  main's sample.
