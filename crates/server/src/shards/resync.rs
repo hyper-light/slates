@@ -24,7 +24,7 @@
 //! flush a handed end, A-161's record); the copy is kept there too, so the two platforms run one rule.
 //!
 //! **While the stream lives**: the owner view the guest's root names (A-281) is told to the anchor as the hold's new
-//! session ([`tell_owners`]); a stream whose guest maps a file with DAX keeps its resync while the anchor holds each
+//! session ([`tell_session`]); a stream whose guest maps a file with DAX keeps its resync while the anchor holds each
 //! object it hands the device and the shard's range table records the ranges answered (A-365, `crate::shards::dax_hold`),
 //! since the guest's stores through a map live in an object only the device maps once this daemon is gone, and gives it
 //! up ([`give_up`]) where either is refused; and the attachment's end releases the hold ([`give_up`] again), so the
@@ -42,8 +42,8 @@
 //! taken back and their guest's unsynced stores ingested before it serves anything (A-365).
 //!
 //! **Windows** (A-427) keeps the same token, owner view and form, and one thing more: the process that holds the
-//! stream ([`Holder`]), since a successor there duplicates the fresh end into a process rather than sending it on the
-//! channel (A-418's wire). The session's bytes there are [`handle_session_bytes`], and the channel's I/O is the child
+//! stream (`Holder`), since a successor there duplicates the fresh end into a process rather than sending it on the
+//! channel (A-418's wire). The session's bytes there are `handle_session_bytes`'s, and the channel's I/O is the child
 //! module `resync_handle` of `crate::shards`. A successor's half on Windows is not here yet (GAPS).
 
 #[cfg(unix)]

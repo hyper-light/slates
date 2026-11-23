@@ -458,7 +458,7 @@ pub(crate) async fn commit_turn(repository: RepositoryId) -> Option<Result<Turn,
   }
 }
 
-/// [`PATIENCE_NS`], or a test's on this shard's thread ([`TEST_TURN_PATIENCE_NS`]).
+/// [`PATIENCE_NS`], or a test's on this shard's thread (`TEST_TURN_PATIENCE_NS`, set by the tests alone).
 fn patience_ns() -> u64 {
   #[cfg(test)]
   {

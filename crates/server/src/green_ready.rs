@@ -10,8 +10,9 @@
 //! - [`green_ready`] answers [`Ready`](GreenReady::Ready) for a green that holds its content, and for one that owes a
 //!   push starts (or joins) its materialization and answers [`Materializing`](GreenReady::Materializing).
 //! - The materialization is a task of the shard: the owed push's `Building` advanced a turn at a time over the objects
-//!   the green's tool gives ([`ObjectsOf`], which the tool registers; git's over its store), then `Green::materialize`
-//!   commits the built work as the owed version. It is today's eager create, deferred: one builder over one input.
+//!   the green's tool gives ([`PushObjects`], lent from the tool's store by [`with_objects`]; git's over its store), then
+//!   `Green::materialize` commits the built work as the owed version. It is today's eager create, deferred: one builder
+//!   over one input.
 //! - A recorded request on an owing green, or on a work over one, parks (`verbs::run_recorded` through
 //!   [`park_request`]); an owner's step of a submit parks too (`verbs::owner_judge`). Each runs again, in the order they
 //!   came, once the green is materialized. A request no answer can wait on (no route, a bare dispatch) is answered
