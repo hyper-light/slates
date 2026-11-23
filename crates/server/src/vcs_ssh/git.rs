@@ -124,6 +124,8 @@ pub(crate) struct UploadCommand<L: StoreLender> {
   admitted: u64,
   /// The let-go window its answer was last held for, until it writes again (A-864's readers' progress).
   last_away: Option<slates_git::store::packed::Waited>,
+  /// What its answers have learned of the link (A-859 part A): nothing until a write of an answer waits for the client.
+  pacing: crate::vcs_store::upload::Pacing,
 }
 
 impl<L: StoreLender> UploadCommand<L> {
@@ -155,6 +157,7 @@ impl<L: StoreLender> UploadCommand<L> {
       request: Vec::new(),
       admitted: 0,
       last_away: None,
+      pacing: crate::vcs_store::upload::Pacing::default(),
     }
   }
 
@@ -445,6 +448,18 @@ impl<L: StoreLender> Command for UploadCommand<L> {
 
   fn sent(&mut self, _stderr: usize, stdout: usize) {
     self.out.drain(..stdout.min(self.out.len()));
+  }
+
+  /// A write of the connection while an answer is written (A-859 part A on SSH, as the HTTP edge's `Upload::sent`):
+  /// learned into the shard's link price once a write of an answer has waited for the client; the advertisement's and a
+  /// negotiation's teach nothing, their bytes too few to fill a socket.
+  fn paced(&mut self, sent: crate::vcs_store::upload::Sent) {
+    if self.answer.is_none() {
+      return;
+    }
+    if let Some(taught) = self.pacing.sent(sent) {
+      self.lender.paced(taught);
+    }
   }
 }
 

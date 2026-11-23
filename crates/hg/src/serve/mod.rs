@@ -100,6 +100,9 @@ pub trait Repository {
   /// head, `crate::tags`); none where its manifest names no `.hgtags`. What it reads is charged to `admission` first.
   /// Its text is read from the node's changeset store (`lookup::TagsRead`).
   fn tags_file(&self, rev: Rev, admission: &mut Admission) -> Result<Option<Node>, Refusal>;
+
+  /// The repository's obsolescence markers, in any order: a fetch sends them, and a push's are judged against them.
+  fn markers(&self) -> impl Iterator<Item = crate::obsmarkers::Marker<'_>>;
 }
 
 /// Why a request was refused.

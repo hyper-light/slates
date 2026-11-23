@@ -38,6 +38,16 @@
 //! else a line of its node's branch. Stricter than 7.2, on purpose: a node the repository does not hold, named by the
 //! `bookmarks` part or a `phase-heads` part, is refused by kind, where 7.2 sets the bookmark or fails on the lookup.
 //!
+//! **Markers** (§4.17.3 decision 4; 7.2's `handleobsmarker`, `obsstore.mergemarkers`). An `obsmarkers` part's
+//! markers are kept, each alone in the part's format, in the order they arrived, less every one the repository holds
+//! already or the push carried before (7.2 compares markers whole: a marker and the same marker in the other format
+//! are two); its `reply:obsmarkers` counts the new ones, and where there are any an `output` part in reply to it says
+//! so in 7.2's words (`%i new obsolescence markers`, which 7.2's handler prints and its part processing captures,
+//! after the handler's reply). Stricter than 7.2, on purpose: a marker whose predecessor is
+//! a changeset public as the part is taken (held public, or made public by this push's earlier parts) refuses the
+//! push in the words 7.2's `createmarkers` refuses making one with, where 7.2's server keeps it; a predecessor the
+//! repository does not hold (a draft rewritten before it was pushed) is kept, as 7.2 keeps it.
+//!
 //! **The change in heads** (`reply:changegroup`'s `return`): the new changesets with no new child added, the old heads
 //! a new changeset is a child of removed (the null node of an empty repository among them, as 7.2's `headrevsdiff`
 //! counts it), the added heads that close their branch counted down ([`heads_changed`]).
@@ -53,6 +63,7 @@ use super::reply::{Refused, Replied, heads_changed};
 use super::verify::Arrived;
 use super::{Asks, BookmarkAt, PushkeyAsk, Unbundle};
 use crate::bookmarks::divergent;
+use crate::obsmarkers::{self, Marker};
 use crate::phases::{Phase, PhaseHead};
 use crate::read::to_u64;
 use crate::serve::{Repository, Rev};
@@ -73,10 +84,19 @@ const UNKNOWN_BEFORE: &[u8] = b"unknown revision '";
 /// Format: see [`UNKNOWN_BEFORE`].
 const UNKNOWN_AFTER: &[u8] = b"'";
 
-/// Format: slates' words for a part a push may not carry yet (markers are piece 7's) and for a repository with no
+/// Format: 7.2's words refusing a marker that obsoletes a public changeset (`createmarkers`), before its short hex,
+/// and their hint.
+const PUBLIC_OBSOLETED: &[u8] = b"cannot obsolete public changeset: ";
+/// Format: see [`PUBLIC_OBSOLETED`].
+const PUBLIC_OBSOLETED_HINT: &[u8] = b"see 'hg help phases' for details";
+/// Format: 7.2's words after the count of an `obsmarkers` part's new markers (`handleobsmarker`).
+const NEW_MARKERS: &[u8] = b" new obsolescence markers\n";
+/// Format: the hexadecimal digits of a short node (7.2's `short`).
+const SHORT_DIGITS: usize = 12;
+/// Format: slates' words for an `obsmarkers` part whose payload 7.2's reader refuses, and for a repository with no
 /// line to make one from (never met for a repository its verb made).
-const MARKERS_NOT_SERVED: &[u8] = b"obsolescence markers are not accepted by this server";
-/// Format: see [`MARKERS_NOT_SERVED`].
+const UNREADABLE_MARKERS: &[u8] = b"obsolescence markers this server cannot read";
+/// Format: see [`UNREADABLE_MARKERS`].
 const NO_LINE: &[u8] = b"the repository has no line to make a branch from";
 /// Format: slates' words for a push past the request's admission.
 const PAST_ADMISSION: &[u8] = b"push larger than this server admits";
@@ -191,8 +211,11 @@ pub struct Plan {
   pub bookmarks: Vec<BookmarkMove>,
   /// The draft roots' changes: every removal, then every addition, each in node order.
   pub roots: Vec<RootChange>,
-  /// The reply's parts for the parts it handled, in stream order: `reply:changegroup` and `reply:pushkey`.
+  /// The reply's parts for the parts it handled, in stream order: `reply:changegroup`, `reply:pushkey`, and
+  /// `reply:obsmarkers` with the `output` saying how many markers were new.
   pub replied: Vec<Replied>,
+  /// The obsolescence markers it keeps (module docs, "Markers"), each alone in its part's format, in arrival order.
+  pub markers: Vec<Vec<u8>>,
   /// The first and the last changeset it added (`HG_NODE`, `HG_NODE_LAST`), if it added any.
   pub added: Option<(Node, Node)>,
   /// The branches whose lines it moves, makes or retires, sorted.
@@ -223,10 +246,12 @@ pub enum Unclassified {
     /// What it asked.
     ask: PushkeyAsk,
   },
-  /// An `obsmarkers` part: markers are piece 7's.
-  Markers {
-    /// The part's id.
-    id: u32,
+  /// An `obsmarkers` part whose payload 7.2's reader refuses.
+  UnreadableMarkers,
+  /// A marker whose predecessor is public (module docs, "Markers").
+  PublicObsoleted {
+    /// The predecessor.
+    node: Node,
   },
   /// A line was needed to make another from, and the repository holds none.
   NoLine,
@@ -272,7 +297,17 @@ impl Unclassified {
         old: Some(ask.old.clone()),
         ret: None,
       },
-      Self::Markers { .. } => abort(MARKERS_NOT_SERVED.to_vec()),
+      Self::UnreadableMarkers => abort(UNREADABLE_MARKERS.to_vec()),
+      Self::PublicObsoleted { node } => {
+        let mut message = PUBLIC_OBSOLETED.to_vec();
+        let at = message.len();
+        node::write_hex(node, &mut message);
+        message.truncate(at.saturating_add(SHORT_DIGITS));
+        Refused::Abort {
+          message,
+          hint: Some(PUBLIC_OBSOLETED_HINT.to_vec()),
+        }
+      }
       Self::NoLine => abort(NO_LINE.to_vec()),
       Self::Changeset { .. } => abort(UNREADABLE.to_vec()),
       Self::PastAdmission(_) => abort(PAST_ADMISSION.to_vec()),
@@ -633,6 +668,7 @@ pub fn classify(
   let mut graph = Graph::new(view, brought, admission)?;
   let mut plan = Plan::default();
   let mut bookmarks = Marks::new(marks);
+  let mut markers = Vec::new();
   for taken in &unbundle.parts {
     match &taken.asks {
       Asks::Changegroup(_) => {
@@ -661,10 +697,17 @@ pub fn classify(
           moved,
         });
       }
-      Asks::Obsmarkers(_) => return Err(Unclassified::Markers { id: taken.id }),
+      Asks::Obsmarkers(payload) => {
+        take_markers(&graph, (taken.id, payload), &mut markers, admission)?;
+        plan.replied.push(Replied::Obsmarkers {
+          in_reply_to: taken.id,
+          new: 0,
+        });
+      }
       _ => {}
     }
   }
+  kept_markers(view, markers, &mut plan, admission)?;
   let (moves, created, touched) = place_lines(&graph, lines, admission)?;
   plan.lines = moves;
   plan.created = created;
@@ -692,6 +735,137 @@ pub fn classify(
     }
   }
   Ok(plan)
+}
+
+/// A marker an `obsmarkers` part carries: the part's id, the marker, and its encoding alone in the part's format.
+type Carried<'u> = (u32, Marker<'u>, Vec<u8>);
+
+/// Takes an `obsmarkers` part's markers (`id`, `payload`) into `carried` (module docs, "Markers"): refused where the
+/// payload is unreadable or a marker's predecessor is public now.
+fn take_markers<'u, V: Repository>(
+  graph: &Graph<'_, V>,
+  (id, payload): (u32, &'u [u8]),
+  carried: &mut Vec<Carried<'u>>,
+  admission: &mut Admission,
+) -> Result<(), Unclassified> {
+  let decoded = obsmarkers::decode(payload).map_err(|_| Unclassified::UnreadableMarkers)?;
+  let format = decoded.format();
+  admission.charge_items::<Carried<'_>>(decoded.len())?;
+  for marker in decoded.iter() {
+    if let Ok(node) = Node::try_from(marker.predecessor)
+      && graph
+        .known(&node)
+        .is_some_and(|at| graph.phase(Some(at)) == Phase::Public)
+    {
+      return Err(Unclassified::PublicObsoleted { node });
+    }
+    let len =
+      obsmarkers::encoded_len(format, &[marker]).map_err(|_| Unclassified::UnreadableMarkers)?;
+    admission.charge(len)?;
+    let mut alone = Vec::with_capacity(usize::try_from(len).unwrap_or_default());
+    obsmarkers::encode(format, &[marker], &mut alone)
+      .map_err(|_| Unclassified::UnreadableMarkers)?;
+    carried.push((id, marker, alone));
+  }
+  Ok(())
+}
+
+/// Keeps the `carried` markers neither `view` holds nor an earlier one of the push carried, in their order, into
+/// `plan`, each part's `reply:obsmarkers` counting its own (module docs, "Markers"): one pass over the held markers,
+/// each looked up by its predecessor among the carried.
+fn kept_markers<V: Repository>(
+  view: &V,
+  carried: Vec<Carried<'_>>,
+  plan: &mut Plan,
+  admission: &mut Admission,
+) -> Result<(), PastAdmission> {
+  if carried.is_empty() {
+    return Ok(());
+  }
+  admission.charge_items::<(&[u8], usize)>(carried.len())?;
+  let mut by_predecessor: BTreeMap<&[u8], Vec<usize>> = BTreeMap::new();
+  for (index, (_, marker, _)) in carried.iter().enumerate() {
+    by_predecessor
+      .entry(marker.predecessor)
+      .or_default()
+      .push(index);
+  }
+  admission.charge_items::<bool>(carried.len())?;
+  let mut dropped = vec![false; carried.len()];
+  for held in view.markers() {
+    for index in by_predecessor.get(held.predecessor).into_iter().flatten() {
+      if carried
+        .get(*index)
+        .is_some_and(|(_, marker, _)| *marker == held)
+        && let Some(slot) = dropped.get_mut(*index)
+      {
+        *slot = true;
+      }
+    }
+  }
+  let mut seen: BTreeSet<&[u8]> = BTreeSet::new();
+  let mut kept = 0_usize;
+  for (index, (id, _, alone)) in carried.iter().enumerate() {
+    let Some(slot) = dropped.get_mut(index) else {
+      continue;
+    };
+    if *slot || !seen.insert(alone.as_slice()) {
+      *slot = true;
+      continue;
+    }
+    kept = kept.saturating_add(1);
+    for replied in &mut plan.replied {
+      if let Replied::Obsmarkers { in_reply_to, new } = replied
+        && in_reply_to == id
+      {
+        *new = new.saturating_add(1);
+      }
+    }
+  }
+  drop(seen);
+  said(&mut plan.replied, admission)?;
+  admission.charge_items::<Vec<u8>>(kept)?;
+  plan.markers.extend(
+    carried
+      .into_iter()
+      .zip(dropped)
+      .filter_map(|((_, _, alone), dropped)| (!dropped).then_some(alone)),
+  );
+  Ok(())
+}
+
+/// Puts an `output` part saying how many markers were new after each `reply:obsmarkers` that counts any (module docs,
+/// "Markers").
+fn said(replied: &mut Vec<Replied>, admission: &mut Admission) -> Result<(), PastAdmission> {
+  let counted = replied
+    .iter()
+    .filter(|replied| matches!(replied, Replied::Obsmarkers { new, .. } if *new > 0))
+    .count();
+  if counted == 0 {
+    return Ok(());
+  }
+  admission.charge_items::<Replied>(replied.len().saturating_add(counted))?;
+  let mut with = Vec::with_capacity(replied.len().saturating_add(counted));
+  for part in replied.drain(..) {
+    let words = match &part {
+      Replied::Obsmarkers { in_reply_to, new } if *new > 0 => {
+        let mut words = new.to_string().into_bytes();
+        words.extend_from_slice(NEW_MARKERS);
+        admission.charge(to_u64(words.len()))?;
+        Some((*in_reply_to, words))
+      }
+      _ => None,
+    };
+    with.push(part);
+    if let Some((in_reply_to, words)) = words {
+      with.push(Replied::Output {
+        in_reply_to: Some(in_reply_to),
+        words,
+      });
+    }
+  }
+  *replied = with;
+  Ok(())
 }
 
 /// `reply:changegroup`'s `return` for what the push brought (module docs).

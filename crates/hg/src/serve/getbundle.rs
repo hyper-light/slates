@@ -92,9 +92,6 @@ pub trait Store: Repository {
     room: &mut Admission,
   ) -> Result<Option<Logged<'_>>, PastAdmission>;
 
-  /// The repository's obsolescence markers, in any order.
-  fn markers(&self) -> impl Iterator<Item = Marker<'_>>;
-
   /// The file revision at `path` whose node is `node` as its log's row holds it, with no text read ([`FileEntry`];
   /// A-767 C1: a fetch sends each file revision as the changeset store keeps it, so the served view reads no file's
   /// whole text); none where the log lacks it.

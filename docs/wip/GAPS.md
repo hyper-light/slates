@@ -343,9 +343,42 @@
 >   rejected. A napping client alone (H) put loaded accept p99 over 1 ms in 5 of 5 arm64 rounds against main's 2, and
 >   CI's runners have no RealtimeKit to grant the real-time class (run 45115263387: no package, unit or bus name;
 >   `RLIMIT_RTPRIO` 0; ubuntu-latest is now Ubuntu 26.04.1 on kernel 7.0.0-1020-azure).
->   **Open (main to Ada):** 84a's 1 ms loaded bar on Linux. In the fair class it is below the kernel's 1 ms tick, and
->   in the real-time class the client's own time-share code waits whole slices. The measured floor is about one tick a
->   hop, 1.3-2.0 ms p99.
+>   On CI's VMs 84a's 1 ms loaded bar on Linux lay below the kernel's 1 ms tick in the fair class, the measured floor
+>   about one tick a hop, 1.3-2.0 ms p99. The bar is bare metal's (Ada, 2026-11-23), so the CI-VM arms stop there.
+>   **Bare metal MET with the shards in `SCHED_RR` (A-872, w-perf for main 01a20182, 2026-11-23; BENCHMARKS "84a on
+>   Linux bare metal").** On adacachy2 (CachyOS 7.3.3, `CONFIG_PREEMPT=y`, `HZ=1000`, `RLIMIT_RTPRIO` 99) the shards'
+>   class held the loaded p99 under 1 ms in 11 of 11 rounds and the p999 in 20 of 22 checks, where main held the p999
+>   in 2 of 8. Its cost: R9's spinning median 12-20 -> 17-27 µs (a real-time shard parks at once), its p99 better.
+>   Grant or skip: an account that grants no real-time priority (CI's) keeps the fair class and its tails. The client's
+>   reply wait in the class (D', D'') was measured and not taken. **Confirmed on main** (ca98b72c4, main 01a20182,
+>   2026-11-23 03:42, adacachy2 in a user scope at CPUWeight 100): 6 loaded rounds, p99 241-440 µs and p999 325-697 µs,
+>   12 of 12 under 1 ms; quiet p99 76-103 µs; R9 spinning p99 45.6 / 54.6 / 56.2 µs (main before: 57-145).
+>   **The desktop route, PARKED (main 01a20182's ruling, 2026-11-23; w-perf's readings).** Most desktop Linux grants no
+>   `RLIMIT_RTPRIO` but ships RealtimeKit (`org.freedesktop.RealtimeKit1` on the system bus, which PipeWire uses), an
+>   OS-shipped broker R10 allows. An account with `RLIMIT_RTPRIO` 0 would ask it per shard thread
+>   (`MakeThreadRealtimeWithPID` at the class's lowest priority, under its `MaxRealtimePriority`). Readings:
+>   - No host here runs it. adacachy (7.2.9) and adacachy2 (7.3.3): not on the bus and not activatable, no
+>     `rtkit-daemon` unit, no polkit action (`busctl`, `systemctl`, `pkaction`); CI's runners neither (run
+>     45115263387). Both adacachy hosts grant `RLIMIT_RTPRIO` 99, so A-872's limit path covers them.
+>   - No D-Bus without C or an executor: the lockfile has no D-Bus crate; zbus runs on an async executor (D-9 bans it)
+>     and the `dbus` crate binds libdbus. A hand-rolled client over the system bus socket would be a new parser of
+>     external bytes that no host can run against the real daemon.
+>   - RealtimeKit refuses a process whose `RLIMIT_RTTIME` hard limit exceeds its `RTTimeUSecMax` (200,000 µs by
+>     default, from memory; read the property). The kernel counts a real-time task's CPU a tick at a time and resets
+>     the count only when a wakeup enqueues it (7.3.3 `kernel/sched/rt.c`: `watchdog`, `enqueue_task_rt` with
+>     `ENQUEUE_WAKEUP`), so a shard with work, which never parks, is signalled `SIGXCPU` past the soft limit and
+>     killed past the hard one. A-872's limit path needs `RLIMIT_RTTIME` unlimited for that reason.
+>   Rulings for whoever builds it:
+>   - A shard holding the class by RealtimeKit sleeps at least once every half of the soft limit it set: a real
+>     block that a timer ends, since only a wakeup's enqueue resets the count (an `epoll_wait` that finds events
+>     ready does not, nor a yield). Not self-demotion: at `RLIMIT_RTPRIO` 0 a demoted thread cannot climb back by
+>     itself, and every return is another RealtimeKit call against its burst limit and a threads-per-user cap it
+>     shares with PipeWire.
+>   - A partial grant is kept, counted per thread by source (limit, rtkit, none), the first refusal of each source
+>     logged with its typed reason: the limit path's grant or skip, a thread at a time. All-or-none would take one
+>     thread's grant away for another's refusal.
+>   Unparked by: a host running `rtkit-daemon`, which is Ada's to install. Arm E stays settled on bare metal too
+>   (main's adacachy2 round, 2026-11-23 02:51: p99 705-817 µs, p999 0.88-1.14 ms, p50 2-4x worse).
 > - Windows (CI, run 44857045148): no 1 ms band (queued p99 5–49 µs); accept p99 0.13–0.31 ms, conflict 0.11–0.29 ms;
 >   p999 0.2–62 ms. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–7).
 >
@@ -783,6 +816,19 @@
 >   markers obsolete left out), and the branch heads of such a view kept rather than walked
 >   (`discovery::walked_branch_head_revs`, the one view the kept heads do not answer for, below). After arena-6's and
 >   arena-7's reads, unless they name a memory or time item first.
+>   Piece 1 BUILT (2026-11-23, w-hg): pushed markers kept and served. `crates/server/tests/hg_evolution.rs` (real `hg`
+>   with `experimental.evolution = all` against an in-process daemon, `tests/common/hg.rs`): an amend and a rebase
+>   pushed, a clone holding their 2 markers and the successors, none of the rewritten drafts; a marker pruning public
+>   `a` refused in 7.2's `createmarkers` words (red before: "obsolescence markers are not accepted by this server").
+>   `classify` keeps an `obsmarkers` part's markers each alone in its format, less those the view holds or the push
+>   carried before (compared whole, one pass over the held ones keyed by predecessor), `reply:obsmarkers` counting
+>   them; a public predecessor refuses (decision 4). The entry appends `StateChange::MarkerAdded` and checks the phases
+>   and markers logs; the served view reads the register's markers after the index's rows (`State::markers`), so a
+>   clone takes them and the filter hides what they obsolete. `markers` moved from `getbundle::Store` to `Repository`.
+>   Still owed: the hidden view under a non-publishing repository (`PUBLISHING` is const true, so a pushed draft lands
+>   public and a rewrite of a pushed changeset is refused by the client), decision 3's rewrite admission, the
+>   `obsolete` pushkey namespace, and the reply's `N new obsolescence markers` output. The kept heads for a view with
+>   left-out changesets: BUILT (piece 2, below).
 > - A daemon's allocation by site under stock Mercurial measured BUILT (2026-11-23, w-hg; main's order (A)):
 >   `crates/server/tests/hg_push_heap.rs`, its own binary (`LargeMapped` with a byte sampler on while a row runs), an
 >   in-process daemon with a store and the cleartext HTTP edge, real `hg` subprocesses pushing a 400-changeset
@@ -818,7 +864,16 @@
 >   taken again, appended in groups as segments land, equal to the walk and the rule after every group),
 >   `a_lookup_of_a_branch_name_reads_its_heads_not_the_history` and `branchmap_over_a_long_line_reads_its_heads_not_the_history`
 >   (a 170-changeset line: red 512 and 511 reads, now at most 8; `BranchHeads::answered` the non-vacuity count). A
->   view that leaves a changeset out (secret, hidden) still walks: OPEN, rare in a publishing repository.
+>   view that leaves a changeset out (secret, hidden) answers from them too (BUILT 2026-11-23, w-hg, evolution piece
+>   2): `BranchHeads` keeps each append's endings in order (`Endings`: each full chunk of 512 sealed into a row of
+>   the index, which a fork shares by the tables' identity as it shares every row, and the open chunk a fork copies; 8
+>   bytes an ending, about one a changeset; once `Arc` chunks, banned by R2, replaced 2026-11-23), so `BranchHeads::served` reads the heads back to the view's first
+>   changeset that is not public (today's below it, and those an append from it on ended) and appends the served tail
+>   alone: the tail's endings and appends, no walk of the history. Held by
+>   `a_views_kept_branch_heads_are_the_walks_whatever_it_leaves_out` (generated histories on three branches, every
+>   phase, prunes and rewrites, publishing or not: red, the kept heads answered none) and
+>   `a_long_views_kept_heads_read_back_past_sealed_endings` (9,000 changesets, the first not public inside the second
+>   sealed chunk). The cost: about 8 bytes a changeset held, measured nowhere yet (main's).
 >   An append's walk through other branches is one append's work: counted (`BranchHeads::longest_walk`, the status
 >   counter `vcs.hg.branch_heads_longest_walk`, read from each index a landing puts in place) and held by
 >   `a_branch_taken_again_after_a_long_line_counts_its_walk` (a `stable` revision on a 400-revision `default` line:
@@ -1039,9 +1094,11 @@
 > lies there, checked against its name first, its delta reused where its base precedes it (`t_a859_…`: 20,916 bytes
 > against the pushed 17,299, where 89,439 went before); a stored entry reused whenever one exists, a delta's wanted
 > base placed first (3fa634049). Part A BUILT: a fetched byte priced at its link, learned per shard from the HTTP
-> edge's writes that waited for the peer, cold at deflate's measured break-even at git's level 6 (§4.11). Owed: the
-> SSH edge's writes heard (SSH fetches price cold), a price per client, not per shard; main's git/git whole round and
-> `fsck --strict`.
+> edge's writes that waited for the peer, cold at deflate's measured break-even at git's level 6 (§4.11). The SSH
+> edge's writes heard too (2026-11-23, w-git; the forward through svn.rs's `EitherCommand` agreed with w-svn): each socket write of a connection, its time and whether it found the
+> socket full, told the command it carries (`site::Command::paced`), and a git fetch's answer learns from them as the
+> HTTP edge's does (`a859_an_ssh_commands_writes_to_a_client_that_reads_late_are_heard_with_their_waits`: none heard
+> before). Owed: a price per client, not per shard; main's git/git whole round and `fsck --strict`.
 > A-864's readers BUILT (2026-11-22, w-git; main's r52): every git read before a fetch's pack (the advertisement's
 > and ls-refs' peel, the negotiation, the cuts) holds a refusal that met a let-go window and is made again once it is
 > brought back; a fetch lets the windows it brought back go behind its cursor (piece 3); bring-backs bounded. The landed

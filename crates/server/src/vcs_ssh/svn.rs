@@ -287,6 +287,13 @@ impl<C: Command, T: Command> Command for EitherCommand<C, T> {
       Self::Tunnel(command) => command.sent(stderr, stdout),
     }
   }
+
+  fn paced(&mut self, sent: crate::vcs_store::upload::Sent) {
+    match self {
+      Self::Other(command) => command.paced(sent),
+      Self::Tunnel(command) => command.paced(sent),
+    }
+  }
 }
 
 impl<S, R, V> Services for SvnServices<S, R, V>

@@ -4,10 +4,12 @@
 
 pub(crate) mod anchor;
 pub(crate) mod client;
+// An in-process daemon serving one Mercurial repository to stock `hg` (the hg integration tests).
 #[cfg(unix)]
 pub(crate) mod fuse_map;
 #[cfg(unix)]
 pub(crate) mod guest;
+pub(crate) mod hg;
 // The landing plane's fixtures, on every platform since the Windows writer (A-185).
 pub(crate) mod landing;
 pub(crate) mod lease;

@@ -104,6 +104,7 @@ fn state_of(imported: &Imported) -> State<'_> {
     roots: &imported.phase_roots,
     bookmarks: &imported.bookmarks,
     publishing: false,
+    markers: &[],
   }
 }
 
@@ -456,6 +457,7 @@ fn texts_longer_than_a_window_are_copied_within_the_room() {
     roots: &[],
     bookmarks: &[],
     publishing: true,
+    markers: &[],
   };
   let view = Indexed::new(&index, &store, no_state, &mut room()).unwrap();
   let short = view.changeset_text(0, &mut Admission::new(9_999));
@@ -559,6 +561,11 @@ const STRANGER: Node = [0x11; 20];
 /// The repository of `made`, its markers in revision order; with `strangers`, also a phase root, a prune and a
 /// bookmark of a node it never held.
 fn build(made: &[Made], strangers: bool) -> Built {
+  build_on(made, strangers, &vec![&b"default"[..]; made.len()])
+}
+
+/// [`build`], each changeset on its branch of `branches`.
+fn build_on(made: &[Made], strangers: bool, branches: &[&[u8]]) -> Built {
   let mut store = store();
   let mut index = HgIndex::new();
   let nodes: Vec<Node> = (0..made.len())
@@ -581,7 +588,7 @@ fn build(made: &[Made], strangers: bool) -> Built {
       text: store.put(text).unwrap(),
       manifest: NULL_NODE,
       closed: false,
-      branch: b"default",
+      branch: branches[rev],
     })
     .collect();
   index.append_changesets(&mut store, &group).unwrap();
@@ -765,6 +772,7 @@ fn view_of(built: &Built, publishing: bool) -> Indexed<'_> {
     roots: &built.roots,
     bookmarks: &built.bookmarks,
     publishing,
+    markers: &[],
   };
   Indexed::new(&built.index, &built.store, state, &mut room()).unwrap()
 }
@@ -814,6 +822,30 @@ fn choices() -> impl Strategy<Value = Vec<Choice>> {
 
 proptest! {
   #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
+
+  /// Goal 93 (changeset evolution; main's ruling of 2026-11-23: the branch heads of a view that leaves changesets out
+  /// kept, not walked). Do: view generated histories on three branches (merges across them, phase roots of every
+  /// phase, prunes and rewrites, bookmarks), publishing or not. Expect the view's kept heads always to answer, equal to
+  /// the walk of the served view (`walked_branch_head_revs`, the rule's own reading), each answer counted. Red before:
+  /// a view that left any changeset out kept none (`maintained_branch_heads` none), so `branchmap`, `heads` and a
+  /// branch's `lookup` walked the whole served view.
+  #[test]
+  fn a_views_kept_branch_heads_are_the_walks_whatever_it_leaves_out(
+    choices in choices(),
+    branches in proptest::collection::vec(0_u8..3, 20),
+    publishing in any::<bool>(),
+  ) {
+    const NAMES: [&[u8]; 3] = [b"default", b"stable", b"b2"];
+    let made = made_from(&choices);
+    let on: Vec<&[u8]> = branches.iter().take(made.len()).map(|at| NAMES[usize::from(*at)]).collect();
+    let built = build_on(&made, false, &on);
+    let view = view_of(&built, publishing);
+    let answered = built.index.branch_heads().answered();
+    let kept = view.maintained_branch_heads();
+    let walked = discovery::walked_branch_head_revs(&view, &mut room()).unwrap();
+    prop_assert_eq!(kept, Some(walked));
+    prop_assert_eq!(built.index.branch_heads().answered(), answered + 1);
+  }
 
   /// A-680 part 1 (model): do view generated histories (merges, phase roots of every phase, prunes and rewrites,
   /// bookmarks, and now and then a root, a prune and a bookmark of a node the history never held). Expect each
@@ -1021,6 +1053,7 @@ fn a_marker_the_store_cannot_read_refuses_the_view() {
     roots: &built.roots,
     bookmarks: &built.bookmarks,
     publishing: false,
+    markers: &[],
   };
   let refused = Indexed::new(&built.index, &built.store, state, &mut room()).err();
   assert_eq!(
@@ -1870,6 +1903,9 @@ impl Repository for ReadCounted<'_> {
   fn count(&self) -> Rev {
     self.view.count()
   }
+  fn markers(&self) -> impl Iterator<Item = crate::obsmarkers::Marker<'_>> {
+    self.view.markers()
+  }
   fn node(&self, rev: Rev) -> Option<Node> {
     self.read();
     self.view.node(rev)
@@ -1995,6 +2031,50 @@ fn branchmap_over_a_long_line_reads_its_heads_not_the_history() {
     built.index.branch_heads().answered() > answered,
     "the kept heads answered"
   );
+}
+
+/// Goal 93 (changeset evolution: the kept heads of a view that leaves changesets out, read back past sealed chunks of
+/// the index's endings). Do: build 9,000 changesets on three branches, merges and side heads among them, a draft root
+/// at 5,000 (inside the second sealed chunk), a prune at 6,000 with draft descendants, and a secret root at 7,000;
+/// view it, publishing and not. Expect the kept heads to answer, equal to the walk of the served view, and changesets
+/// left out (the secret ones). Red before: no kept heads for such a view.
+#[test]
+fn a_long_views_kept_heads_read_back_past_sealed_endings() {
+  const NAMES: [&[u8]; 3] = [b"default", b"stable", b"b2"];
+  let count = 9_000_usize;
+  let made: Vec<Made> = (0..count)
+    .map(|rev| Made {
+      parents: [
+        (rev > 0).then(|| {
+          if rev % 13 == 0 && rev > 1 {
+            rev - 2
+          } else {
+            rev - 1
+          }
+        }),
+        (rev % 7 == 0 && rev > 5).then(|| rev - 5),
+      ],
+      root: match rev {
+        5_000 => Some(Phase::Draft),
+        7_000 => Some(Phase::Secret),
+        _ => None,
+      },
+      marker: (rev == 6_000).then_some(Obsoleted::Pruned),
+      bookmark: false,
+    })
+    .collect();
+  let branches: Vec<&[u8]> = (0..count).map(|rev| NAMES[rev / 50 % 3]).collect();
+  let built = build_on(&made, false, &branches);
+  for publishing in [false, true] {
+    let view = view_of(&built, publishing);
+    assert!(
+      view.count() < u32::try_from(count).unwrap(),
+      "the secret ones left out"
+    );
+    let walked = discovery::walked_branch_head_revs(&view, &mut room()).unwrap();
+    assert!(!walked.is_empty());
+    assert_eq!(view.maintained_branch_heads(), Some(walked));
+  }
 }
 
 /// `key`'s `lookup` answer over `view`, its node prefixes read by node (`by_node`) or walked, and the reads it made.

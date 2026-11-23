@@ -71,6 +71,10 @@ impl History {
 }
 
 impl Repository for History {
+  fn markers(&self) -> impl Iterator<Item = crate::obsmarkers::Marker<'_>> {
+    core::iter::empty()
+  }
+
   fn count(&self) -> Rev {
     Rev::try_from(self.revs.len()).unwrap()
   }
