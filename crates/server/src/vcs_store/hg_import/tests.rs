@@ -612,3 +612,49 @@ fn t_a732_a_rebuild_replays_a_mercurial_store_a_step_a_turn() {
   assert!(held);
   assert_eq!(rows, landed);
 }
+
+/// Format: the step budget of [`t_c1_2b_an_imports_bookmark_works_are_built_over_turns_before_its_landing`]'s daemon: a
+/// few microseconds, so a bookmark's work takes many of its turns.
+const SHORT_STEP_NS: u64 = 5_000;
+
+/// Main 01a20182's ruling of 2026-11-22 02:52 (C1 2b (1): an import's bookmark works built a unit a turn before its
+/// landing, never in the landing's one step; its non-vacuity owed). Do: on a running daemon whose step budget is
+/// [`SHORT_STEP_NS`], start an import of the `states` repository, hand it to a task of the shard ([`run`]), and land it
+/// once done ([`land`], which builds no work); wait for it. Expect the landing's entry the one-call import's (its phase
+/// roots and three bookmarks bound to their changesets), and more work turns than works (`WORK_TURNS` past 3): each
+/// bookmark's work built over turns of its own, none in the landing.
+#[test]
+fn t_c1_2b_an_imports_bookmark_works_are_built_over_turns_before_its_landing() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored_configured(|config| {
+    config.runtime.step_budget_ns = SHORT_STEP_NS;
+  });
+  let id = crate::daemon::observe_first(&daemon, |state| {
+    let id = created(state, "hg", VcsTool::Mercurial);
+    assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
+    let task = slates_rt::futures::spawn(async move {
+      if run(id).await.is_some_and(|ended| ended.is_ok()) {
+        drop(crate::state::with_state(|state| land(state, id)));
+      }
+    });
+    task
+      .and_then(slates_rt::futures::detach)
+      .expect("the import's task");
+    id
+  });
+  let began = Instant::now();
+  let importing = loop {
+    let importing =
+      crate::daemon::observe_first(&daemon, move |state| state.vcs_stores.importing(id));
+    if !importing || began.elapsed() > TASK_WAIT {
+      break importing;
+    }
+  };
+  let turns = crate::daemon::observe_first(&daemon, |state| count(state, super::WORK_TURNS));
+  crate::daemon::observe_first(&daemon, move |state| {
+    let (_, expected) = in_one_call(state, STATES);
+    assert_landed_as_imported(state, id, &expected);
+  });
+  daemon.stop();
+  assert!(!importing, "still importing after {TASK_WAIT:?}");
+  assert!(turns > 3, "{turns} work turns for three bookmarks' works");
+}
