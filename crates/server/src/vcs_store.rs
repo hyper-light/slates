@@ -3723,11 +3723,12 @@ async fn payload_bytes(
   (bytes.len() == whole).then_some(bytes)
 }
 
-/// Whether a landed push's pack may be let go once landed (goal 93 item 2b): on again (main 01a20182's order of
-/// 2026-11-23, after r165's `Pack(Store(Unreadable))` put the guard back in 5d9e81984; every read of a let-go window
-/// now stops and is brought back, and the let-go is sliced). One switch for every path that lets a landed pack go: a
-/// commit's ([`commit`]) and a recovery's or a rebuild's of the pack it read whole ([`put_changeset`]).
-pub(crate) const LANDED_LET_GO: bool = true;
+/// Whether a landed push's pack may be let go once landed (goal 93 item 2b): held again (main 01a20182's order of
+/// 2026-11-23 after r18: with it on, a push of a tag of a let-go tag was declined by its peel's read, a shallow fetch
+/// over HTTP refused `Pack(Store(Unreadable))`, and git/git's HTTP mirror clone stalled; GAPS). One switch for every
+/// path that lets a landed pack go: a commit's ([`commit`]) and a recovery's or a rebuild's of the pack it read whole
+/// ([`put_changeset`]).
+pub(crate) const LANDED_LET_GO: bool = false;
 
 /// Puts what [`read_changeset`] read into the shard's content store, each checked against the record's identity and
 /// held by its put as one fetched from the region is, and notes the changeset's sequence as landed, so the next push

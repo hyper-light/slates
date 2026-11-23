@@ -157,6 +157,16 @@
 > and every clone (stock_git_verbs 1 of 8). Lifted when w-git's fetch-side readers (A-855's held answer, brought back and
 > made again) and the push decision's reads bring a let-go window back, with w-shared's red: annotated tags pushed, the
 > push ended, idle, then ls-remote and a clone byte-identical to stock.
+> **LIFT WITHDRAWN (w-git, 2026-11-23, main 01a20182's order after r18):** `vcs_store::LANDED_LET_GO` false again, every
+> landed let-go held (a commit's, a recovery's and a rebuild's). The lift surfaced a reader on main four times: the fetch
+> stream's choice and object reads (fixed, 0c3f42cea, 7f7793c58), the SSH edge's held answer (fixed, 56fbf0381), the
+> push's tag peel (`receive::works::tree_of` at works.rs:715: a tag of a let-go tag declined "an object it names cannot
+> be read", r18's verbs push-tag-of-a-tag and delete-tags), and a shallow fetch over HTTP refused
+> `Pack(Store(Unreadable { id: sha1:2a3c9b98… }))` (r18's verbs shallow), its path not yet found; and r18's HTTP mirror
+> clone stalled 120 s with 0 pack bytes, between 4c8b391ec and 09797375e (main's bisect cleared c20133168). Owed behind
+> the guard, red first: the tag peel bringing its window back; the shallow fetch's path; a sweep of every read of a
+> stored object in receive and upload for the same refusal; the stall. Re-lifting waits on git/git whole and verbs both
+> passing with it on. The re-lift's reds stay, ignored while it is withdrawn.
 > **r227's SSH regression FIXED (w-git, 2026-11-23):** with the lift, stock git's fetch over SSH ended mid-answer
 > (`unexpected disconnect while reading sideband packet`; on a made history, the shallow clone right after its
 > `packfile` header): an answer whose pack's choice read a let-go window is held for it (`Answer::held_away`) with its

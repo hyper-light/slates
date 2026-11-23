@@ -434,6 +434,7 @@ fn a_long_fetchs_answer_over_ssh_is_kept_alive_with_gits_keepalive_while_its_pac
 /// push exits 0; bytes let go; both clones exit 0, each pack the push's three objects, each the pushed bytes. Red with the
 /// guard (`vcs_store::LANDED_LET_GO` false): nothing let go.
 #[test]
+#[ignore = "the landed let-go is withdrawn (vcs_store::LANDED_LET_GO false, main 01a20182 2026-11-23): a re-lift's red, run with it on"]
 fn a_pushed_pack_let_go_by_its_commit_is_cloned_whole_and_shallow_over_ssh() {
   use crate::vcs_http::daemon_edge_tests::{
     LET_GO_FILE, fetch_of, fetched_pack, fetched_pack_after, large_create, objects_of,
@@ -504,6 +505,7 @@ fn a_pushed_pack_let_go_by_its_commit_is_cloned_whole_and_shallow_over_ssh() {
 /// over SSH on a made history, red 3 of 3 before the fix: the shallow clone's answer held for a window of the work
 /// clone's 284-byte pack); the unit red at the edge is owed.
 #[test]
+#[ignore = "the landed let-go is withdrawn (vcs_store::LANDED_LET_GO false, main 01a20182 2026-11-23): a re-lift's red, run with it on"]
 fn a_shallow_clone_of_a_later_push_let_go_is_answered_whole_over_ssh() {
   use crate::vcs_http::daemon_edge_tests::{
     fetched_pack_after, git_name, large_create, objects_of, packets_from, stored_pack,

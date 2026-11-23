@@ -4110,6 +4110,7 @@ fn assert_both_clones_whole(
 /// bytes; and the listing naming `HEAD` at the commit. Red with the guard
 /// (`LANDED_LET_GO` false): nothing let go.
 #[test]
+#[ignore = "the landed let-go is withdrawn (vcs_store::LANDED_LET_GO false, main 01a20182 2026-11-23): a re-lift's red, run with it on"]
 fn a_pushed_pack_is_let_go_by_its_commit_in_slices_and_a_clone_after_is_whole() {
   let (identity, certificate) = identity();
   let daemon = daemon(identity);
