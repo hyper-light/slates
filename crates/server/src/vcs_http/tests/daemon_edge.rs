@@ -890,6 +890,88 @@ fn a_push_of_a_long_history_and_many_branches_lands_every_ref_through_the_daemon
   assert_eq!((created.0, landed), (200, MANY_BRANCHES + 1), "{report}");
 }
 
+/// Shape: how long [`a_fetch_whose_let_go_window_the_store_never_answers_fails_cleanly_within_its_bound`]'s node store
+/// is waited for on each read: its stand-in for `read_through::PATIENCE_NS`, short so the test is.
+const UNANSWERED_PATIENCE_NS: u64 = 200_000_000;
+
+/// Goal 93's read-through bound (main 01a20182's ruling of 2026-11-22 17:00: an await without a bound is a defect on
+/// its own, banned items 8 and 9). Do: on a two-shard daemon with its edge, push a commit whose one file spans several
+/// of the content store's windows; on the repository's shard, let every window of its staged pack go as landed (those
+/// the push's own let-go has not), and
+/// make the node's store never answer a bring-back's read (`read_through::TEST_UNANSWERED`), each waited for
+/// [`UNANSWERED_PATIENCE_NS`]; then fetch the commit as `git clone` asks, from a thread the test waits on. Expect: the
+/// fetch answered, not hung (well inside a minute); its answer no whole pack of every object pushed, so the client fails
+/// cleanly; the refusals counted `vcs_store.read_through.unanswered`. Failing first: the bring-back awaited the store
+/// without end and the fetch never answered.
+#[test]
+fn a_fetch_whose_let_go_window_the_store_never_answers_fails_cleanly_within_its_bound() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let (request, commit) = large_create(1 << 20);
+  let created = pushed((port, &certificate), &name, &request);
+  assert_eq!(created.0, 200, "{}", String::from_utf8_lossy(&created.1));
+  let (_, commands_end) = packets_from(&request, 0);
+  let pack = request
+    .get(commands_end..)
+    .expect("the push's pack")
+    .to_vec();
+  let let_go = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    crate::vcs_store::read_through::TEST_UNANSWERED.with(|unanswered| unanswered.set(true));
+    crate::vcs_store::read_through::TEST_PATIENCE_NS
+      .with(|patience| patience.set(UNANSWERED_PATIENCE_NS));
+    crate::vcs_store::within_budget(state, 0, |stores| {
+      let Some(content) = stores.content_mut() else {
+        return 0;
+      };
+      let window = content.window();
+      pack
+        .chunks(window)
+        .map(slates_vcs::ContentId::of)
+        // Let go here, or by the push's own landed let-go already (its windows no home pins).
+        .filter(|id| {
+          if content.mark_landed(id) {
+            let _ = content.let_go_landed(id, None);
+          }
+          content.is_away(id)
+        })
+        .count()
+    })
+  });
+  assert!(let_go > 1, "the pack's windows let go: {let_go}");
+  let (sent, got) = std::sync::mpsc::channel();
+  let fetch = fetch_of(commit);
+  let asked = std::thread::spawn(move || {
+    let _ = sent.send(uploaded((port, &certificate), &name, &fetch));
+  });
+  let answered = got.recv_timeout(Duration::from_secs(60));
+  let unanswered = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::vcs_store::read_through::UNANSWERED,
+  );
+  let answered = answered.expect("the fetch answered within its bound, never hung");
+  let _ = asked.join();
+  daemon.stop();
+  let (status, body) = answered;
+  // A pack read whole holding every object pushed, or not: an answer cut short or ended on git's error band is not.
+  let pushed_objects = ids_in(&request[commands_end..]).len();
+  let whole = status == 200
+    && body.starts_with(b"000dpackfile\n")
+    && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      ids_in(&fetched_pack(&body)).len()
+    }))
+    .is_ok_and(|fetched| fetched == pushed_objects);
+  assert!(
+    !whole,
+    "no whole pack answered from windows the store never gave back"
+  );
+  assert!(unanswered > 0, "each refusal counted");
+}
+
 /// Shape: the annotated tags [`a_push_of_annotated_tags_is_listed_and_fetched_whole_once_its_pack_is_landed`] pushes,
 /// each after a file of [`TAGGED_FILE_BYTES`] in its pack, so each lies in a window of its own.
 const TAGS: usize = 4;

@@ -458,12 +458,7 @@ impl<F: BlockFile> ChangesetLog<F> {
 
   /// The header of the committed record at `offset` (a row's offset): read and its CRC checked.
   pub fn header_at(&self, offset: u64) -> Result<Header, LogError> {
-    if offset_after(offset, HEADER_BYTES)? > self.end {
-      return Err(LogError::Corrupt("a header past the committed records"));
-    }
-    let mut head = [0u8; HEADER_BYTES];
-    self.file.read_exact_at(&mut head, offset)?;
-    decode_header(&head).ok_or(LogError::Corrupt("a header"))
+    header_in(&self.file, offset, self.end)
   }
 
   /// Reads `buf.len()` bytes of the log from `offset` (inside a committed record's section, by its [`Section`]).
@@ -514,6 +509,16 @@ impl<F: BlockFile> Drop for Appending<'_, F> {
   fn drop(&mut self) {
     self.log.abandon_open();
   }
+}
+
+/// Reads the checked header at a row's offset within the committed prefix ending at `end`.
+pub(crate) fn header_in<F: BlockFile>(file: &F, offset: u64, end: u64) -> Result<Header, LogError> {
+  if offset_after(offset, HEADER_BYTES)? > end {
+    return Err(LogError::Corrupt("a header past the committed records"));
+  }
+  let mut head = [0u8; HEADER_BYTES];
+  file.read_exact_at(&mut head, offset)?;
+  decode_header(&head).ok_or(LogError::Corrupt("a header"))
 }
 
 /// The sections of the committed record `located` in `file`, in order: each head read for its kind and length.

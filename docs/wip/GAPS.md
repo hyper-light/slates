@@ -830,9 +830,11 @@
 > `fsck --strict`.
 > A-864's readers BUILT (2026-11-22, w-git; main's r52): every git read before a fetch's pack (the advertisement's
 > and ls-refs' peel, the negotiation, the cuts) holds a refusal that met a let-go window and is made again once it is
-> brought back; a fetch lets the windows it brought back go behind its cursor (piece 3); bring-backs bounded; the landed
-> pack's let-go in `vcs_store::commit` re-enabled (main's guard c9bb36dc5 lifted). Owed: the push decision's reads
-> (receive works), estimated next; the git/git mirror clone's stall at 183,511 bytes (main's sample), before the pack.
+> brought back; a fetch lets the windows it brought back go behind its cursor (piece 3); bring-backs bounded. The landed
+> pack's let-go in `vcs_store::commit` stays guarded (main 01a20182, 2026-11-22: lifted at 01ae9fc26, put back) until
+> the readers still synchronous are covered: (a) the deferred green build through views.rs (w-shared), (b) a push's thin
+> bases through `IndexedObjects::object` and (c) its policy and signature reads (w-git). Owed too: the git/git mirror
+> clone's stall at 183,511 bytes (main's sample), before the pack.
 > A-864 BUILT (2026-11-22, w-git; main's r17): a reused pushed entry was rebuilt to be checked (inflated, its base and
 > itself reconstructed, named), so git/git's clone, every entry reused, ran past 120 s. Now each row keeps its entry's
 > raw length, CRC32 and base (git's pack index, A-864); reuse checks the CRC32 and copies, no object read; a miss is
@@ -906,7 +908,9 @@
 > sequence)` row is the newest landing at it, the only one the register can name). The orphan's log bytes stay until
 > the cleaner of unnamed log space (owed). Its rows can be forgotten now (2026-11-22, w-hg; main 01a20182's ruling of
 > 12:00, for an abandoned push's run): `Store::forget` / `StoreHandle::forget` drops an unnamed changeset's `C`, `H`
-> and `K` rows and its `P` rows where they name its bytes, and moves each `T` and `I` row it owned to the next
+> and `K` rows. Forgetting or replacing a changeset removes its payload places. The `P` lookup moves to a surviving
+> copy even across repositories (2026-11-22, `forgetting_a_duplicate_payload_keeps_the_surviving_changesets_bytes`).
+> Checkpoints written before this fix rebuild payload places once from their live changesets. Each `T` and `I` row moves to the next
 > changeset that kept the same text (the new `K` keeper rows, by text), the engine checkpointed after so a replay
 > never puts them back (`a_forgotten_changesets_rows_go_and_a_text_another_kept_moves_to_it`,
 > `a_changeset_forgotten_through_the_owner_stays_forgotten_across_a_restart`); its log bytes stay this cleaner's.
