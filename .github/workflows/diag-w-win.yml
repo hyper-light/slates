@@ -63,7 +63,7 @@ jobs:
         run: cargo test -p slates-ipc --lib rendezvous::platform
       - name: "Green, item 1: the large path's live figures"
         if: ${{ !cancelled() }}
-        run: cargo test -p slates-mem --lib large::
+        run: 'cargo test -p slates-mem --lib large::'
       - name: "Green, item 2: the base host over the disk"
         if: ${{ !cancelled() }}
         run: cargo test -p slates-base --test host
