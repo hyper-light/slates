@@ -18,7 +18,12 @@
 //! - `process.*` (the control shard alone, the process's figures once): the system allocator's live bytes and the bytes
 //!   it ever allocated (its churn), and the
 //!   mapped blocks live and their resident bytes (`slates_mem::large::heap`). A resident set past the live bytes and
-//!   the mapped blocks' resident pages is what the system allocator kept of freed blocks.
+//!   the mapped blocks' resident pages is what the system allocator kept of freed blocks. On Linux with glibc (absent
+//!   elsewhere), glibc's own figures beside them (`slates_mem::heap::malloc`, summed over every arena, as glibc 2.39's
+//!   `malloc.c` reads them): `malloc_free_bytes`, the free bytes it keeps in its arenas (`fordblks`, its fastbins'
+//!   `fsmblks` already among them, so not added again), measuring that kept memory where elsewhere it is the remainder;
+//!   `malloc_mapped_bytes`, its blocks mapped each on its own (`hblkhd`); `malloc_arena_bytes`, what its arenas hold from
+//!   the OS (`arena`).
 
 use crate::state::ShardState;
 use slates_ipc::protocol::RefusalCount;
@@ -46,6 +51,15 @@ pub(crate) fn rows(state: &ShardState, memory: bool) -> Vec<RefusalCount> {
       ),
       ("mem.gauge.process.mapped_untracked", heap.untracked),
     ]);
+    #[cfg(all(target_os = "linux", target_env = "gnu", not(miri)))]
+    {
+      let malloc = slates_mem::heap::malloc();
+      rows.extend([
+        ("mem.gauge.process.malloc_free_bytes", malloc.free),
+        ("mem.gauge.process.malloc_mapped_bytes", malloc.mapped),
+        ("mem.gauge.process.malloc_arena_bytes", malloc.arena),
+      ]);
+    }
   }
   rows
     .into_iter()
@@ -251,5 +265,30 @@ mod tests {
       Some(&(32 + 16 + 20 + 6)),
       "{rows:?}"
     );
+  }
+
+  /// The memory status's `process.malloc_*` gauges (main 01a20182, 2026-11-23). Do: read the control shard's gauges.
+  /// Expect, on Linux with glibc, glibc's arena and free bytes among them (the main arena and its top exist once anything
+  /// allocated); elsewhere no `malloc_*` row at all (they are glibc's figures alone).
+  #[test]
+  fn the_control_shards_memory_status_names_glibcs_bytes_where_glibc_runs() {
+    let rows = crate::daemon::audit_on_shard(|state| super::rows(state, true));
+    let malloc: std::collections::BTreeMap<&str, u64> = rows
+      .iter()
+      .filter(|row| row.kind.starts_with("mem.gauge.process.malloc_"))
+      .map(|row| (row.kind.as_str(), row.count))
+      .collect();
+    if cfg!(all(target_os = "linux", target_env = "gnu", not(miri))) {
+      assert!(
+        malloc.contains_key("mem.gauge.process.malloc_arena_bytes"),
+        "{malloc:?}"
+      );
+      assert!(
+        malloc.contains_key("mem.gauge.process.malloc_free_bytes"),
+        "{malloc:?}"
+      );
+    } else {
+      assert!(malloc.is_empty(), "{malloc:?}");
+    }
   }
 }
