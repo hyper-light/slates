@@ -551,12 +551,36 @@ fn the_store_makes_a_pushed_mercurial_text_whole() {
   });
 }
 
-/// Every revision of repository `id`'s served view: its log's path as the store's rows name it, its node and its text,
-/// changesets first, then the manifest log's, then each file log's, in order.
+/// What a revision's text must be, as its writer kept it: a changeset's or a manifest's text whole; a file revision's
+/// by the identities its row names (its bytes' BLAKE3 and its metadata block's), since a landed file's text leaves the
+/// content store once its writer lands it (goal 93 item 2b(b)) and its row's names are what the writer kept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Kept {
+  /// The text.
+  Text(Vec<u8>),
+  /// A file revision's names.
+  File(slates_hg::push::verify::FileNames),
+}
+
+impl Kept {
+  /// Whether `text`, as the store made it, is the text kept.
+  fn is(&self, text: &[u8]) -> bool {
+    match self {
+      Kept::Text(kept) => kept.as_slice() == text,
+      Kept::File(names) => slates_hg::filerev::split(text).is_ok_and(|split| {
+        slates_vcs::ContentId::of(split.bytes) == names.bytes
+          && split.metadata.map(slates_vcs::ContentId::of) == names.block
+      }),
+    }
+  }
+}
+
+/// Every revision of repository `id`'s served view: its log's path as the store's rows name it, its node and what its
+/// text must be ([`Kept`]), changesets first, then the manifest log's, then each file log's, in order.
 fn every_revision(
   state: &mut ShardState,
   id: RepositoryId,
-) -> Vec<(Vec<u8>, slates_hg::Node, Vec<u8>)> {
+) -> Vec<(Vec<u8>, slates_hg::Node, Kept)> {
   use slates_hg::push::intake::{CHANGELOG_PATH, MANIFEST_PATH};
   use slates_hg::push::verify::Held;
   let mut room = Admission::new(ROOM);
@@ -570,7 +594,7 @@ fn every_revision(
           .unwrap()
           .unwrap()
           .into_owned();
-        revisions.push((CHANGELOG_PATH.to_vec(), node, text));
+        revisions.push((CHANGELOG_PATH.to_vec(), node, Kept::Text(text)));
       }
       let mut position = 0;
       while let Some(linked) = view.manifest_linked(position) {
@@ -578,15 +602,15 @@ fn every_revision(
         revisions.push((
           MANIFEST_PATH.to_vec(),
           linked.node,
-          logged.text.into_owned(),
+          Kept::Text(logged.text.into_owned()),
         ));
         position += 1;
       }
       let mut at = (Vec::new(), 0);
       while let Some((path, position, linked)) = view.file_linked_from((&at.0, at.1)) {
-        // The served view reads no file's text (A-767 C1); the index's own, through its content store, is the oracle.
-        let text = held.file_text(&path, &linked.node).unwrap().into_owned();
-        revisions.push((path.clone(), linked.node, text));
+        // The served view reads no file's text (A-767 C1); the index's own names, as its writer kept them, are the oracle.
+        let names = held.file_names(&path, &linked.node).unwrap();
+        revisions.push((path.clone(), linked.node, Kept::File(names)));
         at = (path, position + 1);
       }
       revisions
@@ -600,7 +624,7 @@ fn every_revision(
 fn kept_by_the_store(
   state: &mut ShardState,
   id: RepositoryId,
-  revisions: &[(Vec<u8>, slates_hg::Node, Vec<u8>)],
+  revisions: &[(Vec<u8>, slates_hg::Node, Kept)],
 ) -> (usize, Vec<Vec<u8>>) {
   struct Rows {
     want: Option<slates_hg::render::Want>,
@@ -747,7 +771,8 @@ fn cloned_changegroup(
 /// file index), import the history into one repository (the import's writer); clone it through the store and push the
 /// clone's changegroup into another (the push intake's writer); ask the node's store for every revision of each
 /// whole (`StoreHandle::text`). Expect every text the store makes equal the text the view derives, revision for
-/// revision, under both writers, and edits among what each writer kept, so both a whole and a delta are made.
+/// revision (a file's, the bytes and block its row names, its text let go once landed), under both writers, and edits
+/// among what each writer kept, so both a whole and a delta are made.
 #[test]
 fn every_text_both_writers_keep_is_made_whole_by_the_store_in_every_format() {
   use crate::hg_base::tests::{DOT, FILE_INDEX, HYBRID, LEGACY, V2};
@@ -768,9 +793,15 @@ fn every_text_both_writers_keep_is_made_whole_by_the_store_in_every_format() {
       );
       imported(state, imported_id);
       let revisions = every_revision(state, imported_id);
-      let texts: Vec<Vec<u8>> = revisions.iter().map(|(_, _, text)| text.clone()).collect();
+      let made_as_kept = |made: &[Vec<u8>]| {
+        made.len() == revisions.len()
+          && made
+            .iter()
+            .zip(&revisions)
+            .all(|(made, (_, _, kept))| kept.is(made))
+      };
       let (imported_edits, made) = kept_by_the_store(state, imported_id, &revisions);
-      assert_eq!(made, texts, "{name}: the import's texts made whole");
+      assert!(made_as_kept(&made), "{name}: the import's texts made whole");
       let changegroup = cloned_changegroup(state, imported_id);
       let pushed_id = created(state, &format!("{name}-pushed"), VcsTool::Mercurial);
       push_part(state, pushed_id, changegroup);
@@ -780,7 +811,7 @@ fn every_text_both_writers_keep_is_made_whole_by_the_store_in_every_format() {
         "{name}: the push holds the import's history"
       );
       let (pushed_edits, made) = kept_by_the_store(state, pushed_id, &revisions);
-      assert_eq!(made, texts, "{name}: the push's texts made whole");
+      assert!(made_as_kept(&made), "{name}: the push's texts made whole");
       assert!(
         imported_edits > 0 && pushed_edits > 0,
         "{name}: edits kept, {imported_edits} imported and {pushed_edits} pushed"

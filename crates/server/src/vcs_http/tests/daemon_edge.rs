@@ -4143,9 +4143,10 @@ fn a_long_push_of_own_texts(
 /// Mercurial's whole history landed, the content store keeping every revision's text). Do: start a two-shard daemon over
 /// loopback TLS; create a Mercurial repository; push a line of [`TEXTS_CHANGESETS`] changesets each adding a file of its
 /// own [`TEXT_BYTES`], cut at [`LONG_SEGMENT_BYTES`]; look at each file's window in its shard's content store; clone it
-/// whole (`getbundle`). Expect the push `200`; every file's window let go of the content store, its entry kept, but
-/// those a home pins on this shard (`vcs_store::landed_pin`, as a landed git pack's); the bytes let go counted; and the
-/// clone carrying the last file's bytes, brought back from the changeset store. Red before: the store held every text.
+/// whole (`getbundle`). Expect the push `200`; every file's window let go of the content store, its entry kept, each
+/// noted with its revision for a home and none pinned (goal 93 item 2b(b): before, the 71 a home held here were
+/// pinned); the bytes let go counted; and the clone carrying the last file's bytes, brought back from the changeset
+/// store. Red before: the store held every text.
 #[test]
 fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
   let (identity, certificate) = identity();
@@ -4168,11 +4169,12 @@ fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
           .map(|text| {
             let window = slates_vcs::ContentId::of(text);
             let pinned = crate::vcs_store::landed_pin(shard, &shards, &window).is_some();
+            let noted = crate::vcs_store::homes::landed(&window).is_some();
             (
               content
                 .object_bytes(&window, u64::try_from(text.len()).unwrap())
                 .is_some(),
-              pinned,
+              (noted, pinned),
               content.len_of(&window).is_some(),
             )
           })
@@ -4190,15 +4192,14 @@ fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
   let cloned = hg_getbundle(edge, &name, &tip);
   daemon.stop();
   let gone = windows.iter().filter(|(here, ..)| !here).count();
-  println!(
-    "let go: {let_go} bytes; {gone} of {TEXTS_CHANGESETS} files' windows gone, the rest pinned by a home"
-  );
+  println!("let go: {let_go} bytes; {gone} of {TEXTS_CHANGESETS} files' windows gone");
   assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
-  for (at, (here, pinned, entry)) in windows.iter().enumerate() {
+  for (at, (here, (noted, pinned), entry)) in windows.iter().enumerate() {
     assert!(entry, "file {at}'s entry kept");
-    assert_eq!(
-      here, pinned,
-      "file {at}'s window at hand only where a home pins it"
+    assert!(!here, "file {at}'s window let go");
+    assert!(
+      *noted && !*pinned,
+      "file {at}'s window noted for a home, not pinned"
     );
   }
   assert!(gone > 0, "some window let go");
@@ -4211,6 +4212,113 @@ fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
   assert!(
     cloned.2.windows(64).any(|window| window == &last[..64]),
     "the clone carries the last file's bytes"
+  );
+}
+
+/// codex-review's region-object pin (2026-11-22, main's order to w-hg) through a real push, and goal 93 item 2b(b). Do:
+/// start a two-shard daemon over loopback TLS; on the repository's shard, keep for the region an object one byte longer
+/// than a window, its first window ranking on the other shard (so no hold here names it); push one changeset whose file
+/// is exactly that first window; once landed, look at the window, then read the object from its home
+/// (`homes::read`). Expect the push `200`; the shared window let go of the content store; the home's read the whole
+/// object, brought back by the file revision noted with it (`vcs.hg.landed_texts_brought_back` 1). Red before: the
+/// window was let go unnoted and the home read none.
+#[test]
+fn a_region_object_sharing_a_landed_files_window_is_read_whole_from_its_home() {
+  let (identity, certificate) = identity();
+  let (daemon, _instance) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  create_empty_hg(&daemon, &name);
+  let (shards, here, window) = crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
+    (
+      state.shards.clone(),
+      state.shard,
+      state.store.content.chunk_bytes(),
+    )
+  });
+  let home_of = |bytes: &[u8]| {
+    crate::vcs_store::homes::home_of(&shards, &slates_vcs::ContentId::of(bytes)).unwrap()
+  };
+  // The file: a window of lines, its last line chosen so the window ranks on the other shard.
+  let mut file = Vec::with_capacity(window);
+  let mut line = 0usize;
+  while file.len() < window {
+    file.extend_from_slice(format!("shared line {line}\n").as_bytes());
+    line += 1;
+  }
+  file.truncate(window);
+  let last = window - 1;
+  file[last] = (b'a'..=b'z')
+    .find(|tail| {
+      file[last] = *tail;
+      home_of(&file) != here
+    })
+    .expect("a window ranking on the other shard");
+  // The object: the window and one byte more, homed on the repository's shard.
+  let mut object = file.clone();
+  object.push(0);
+  object[window] = (u8::MIN..=u8::MAX)
+    .find(|tail| {
+      object[window] = *tail;
+      home_of(&object) == here
+    })
+    .expect("an object homed on the repository's shard");
+  let object_id = slates_vcs::ContentId::of(&object);
+  let held = object.clone();
+  let kept = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    crate::vcs_store::homes::keep_for_region(state, &held).map(|(identity, _)| identity)
+  });
+  assert_eq!(
+    kept.ok(),
+    Some(object_id),
+    "the region's object kept on its home"
+  );
+  let text: &'static [u8] = Box::leak(file.clone().into_boxed_slice());
+  let made = history_of(&[("shared", "shared", text, None, "default")]);
+  let pushed = hg_unbundle((port, &certificate), &name, &history_bundle(&made, &[0]));
+  let window_held = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    crate::vcs_store::lent_state(state, |state| {
+      state.vcs_stores.content().map(|content| {
+        content
+          .object_bytes(
+            &slates_vcs::ContentId::of(text),
+            u64::try_from(text.len()).unwrap(),
+          )
+          .is_some()
+      })
+    })
+  });
+  let reading = shards.clone();
+  let read = crate::test_store::run_at(
+    &daemon,
+    LISTENER,
+    move || async move {
+      let origin = reading.first().copied().unwrap();
+      crate::vcs_store::homes::read(origin, &reading, object_id, u64::MAX).await
+    },
+    Duration::from_secs(60),
+  );
+  let brought = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::repository::hg_push::LANDED_TEXTS_BROUGHT_BACK,
+  );
+  daemon.stop();
+  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
+  assert_eq!(
+    window_held,
+    Some(false),
+    "the shared window let go once landed"
+  );
+  assert_eq!(
+    read.map(|bytes| bytes == object),
+    Some(true),
+    "the home reads its object whole"
+  );
+  assert_eq!(
+    brought, 1,
+    "brought back by the file revision noted with it"
   );
 }
 
@@ -4304,8 +4412,9 @@ fn windows_held(daemon: &Daemon, texts: &'static [Vec<u8>]) -> Vec<bool> {
 /// order of 14:00 (the arena a landed history left held). Do: start a two-shard daemon over loopback TLS; import the
 /// `states` repository into a Mercurial repository and land it; look at each of its file revisions' windows in its
 /// shard's content store; clone it whole (`getbundle`). Expect every file revision's window let go of the content store,
-/// its entry kept, but those a home pins on this shard (`vcs_store::landed_pin`); some let go and counted; and the clone
-/// `200` with a changegroup, its file texts brought back from the changeset store. Red before: the import kept every text.
+/// its entry kept, each window noted with its revision for a home and none pinned (goal 93 item 2b(b): before, those a
+/// home held here were pinned, 1 of 5); counted; and the clone `200` with a changegroup, its file texts brought back
+/// from the changeset store. Red before: the import kept every text.
 #[test]
 fn an_imported_repositorys_file_texts_leave_the_content_store_once_its_segments_land() {
   let (identity, certificate) = identity();
@@ -4329,10 +4438,14 @@ fn an_imported_repositorys_file_texts_leave_the_content_store_once_its_segments_
         let mut seen = Vec::new();
         let mut at = (Vec::new(), 0_u32);
         while let Some((path, rev, row)) = store.index.file_revision_from(content, (&at.0, at.1)) {
+          let noted = content
+            .object_layout(&row.bytes)
+            .iter()
+            .all(|(window, _)| crate::vcs_store::homes::landed(window).is_some());
           let pinned = crate::vcs_store::landed_pin(shard, &shards, &row.bytes).is_some();
           let len = content.len_of(&row.bytes);
           let here = len.is_some_and(|len| content.object_bytes(&row.bytes, len).is_some());
-          seen.push((here, pinned, len.is_some()));
+          seen.push((here, (noted, pinned), len.is_some()));
           at = (path, rev.saturating_add(1));
         }
         Some(seen)
@@ -4359,11 +4472,12 @@ fn an_imported_repositorys_file_texts_leave_the_content_store_once_its_segments_
     looked.len()
   );
   assert!(!looked.is_empty(), "the import keeps file revisions");
-  for (at, (here, pinned, entry)) in looked.iter().enumerate() {
+  for (at, (here, (noted, pinned), entry)) in looked.iter().enumerate() {
     assert!(entry, "file revision {at}'s entry kept");
-    assert_eq!(
-      here, pinned,
-      "file revision {at}'s window at hand only where a home pins it"
+    assert!(!here, "file revision {at}'s window let go");
+    assert!(
+      *noted && !*pinned,
+      "file revision {at}'s windows noted for a home, none pinned"
     );
   }
   assert!(

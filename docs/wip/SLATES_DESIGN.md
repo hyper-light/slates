@@ -60992,6 +60992,12 @@ owed.
   whole text off the shard's step (`slates_hg::push::held::TextAsk`, the one ask a push's work uses for a text an
   import let go), and its block and bytes are put back by the identities the row names within the room they take; true
   where both are held whole after. Evidence: `a_landed_file_revisions_let_go_windows_are_brought_back_whole_by_its_path_and_node`.
+  Each window is noted with its revision (`homes::note_landed`, `Landed::Hg`) by the let-go that follows its push's
+  entry commit or its import's landing, and so pinned by nothing; the let-go as each segment lands notes nothing,
+  since the revision is not yet in the index the bring-back reads, and leaves a window a home holds pinned
+  (`vcs_store::landed_pin`, every window of an object held for the region since 7663054bb). A home's read of an object
+  with an away window noted for hg brings it back through the repository's reader, once a revision
+  (`homes::bring_back_landed`). Evidence: `a_region_object_sharing_a_landed_files_window_is_read_whole_from_its_home`.
 
 
 ### A-864 — A pushed entry is checked by the CRC32 its row keeps, and sent on with no object read (2026-11-22, w-git; main 01a20182's r17 of 07:08 and ruling of 07:31 PST, goal 93; A-859, A-722 record v4)

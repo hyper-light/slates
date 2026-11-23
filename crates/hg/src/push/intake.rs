@@ -38,6 +38,7 @@ use super::commit::{Unindexed, keep_one};
 use super::held::IndexHeld;
 use super::verify::{Arrived, Held, LogOf, Unverified, audit};
 use crate::changegroup::{Revision, Version};
+use crate::filerev::FileContents;
 use crate::framing::{Collect, Framed, Framing, Halt, Source, Wanted};
 use crate::index::{HgIndex, Log, NONE};
 use crate::read::to_u64;
@@ -302,14 +303,16 @@ impl Intake {
       .saturating_mul(to_u64(size_of::<(LogOf, u32)>()));
     // Each file revision once more for the new manifests awaiting it ([`Taker::awaited`]): its path and node, however
     // many snapshots name it.
-    // And, cut into segments, its bytes' and block's content identities until its segment lands ([`PushSegment`]).
-    let awaited = to_u64(size_of::<(Vec<u8>, Node)>())
-      .saturating_add(to_u64(size_of::<ContentId>()).saturating_mul(2));
+    // And, cut into segments, its contents with its path until its segment lands ([`PushSegment::contents`]).
+    let awaited =
+      to_u64(size_of::<(Vec<u8>, Node)>()).saturating_add(to_u64(size_of::<FileContents>()));
     let files = framed.files.iter().fold(0u64, |total, (name, revisions)| {
       let path = name.end.saturating_sub(name.start);
       total
         .saturating_add(kept(revisions.len(), path))
-        .saturating_add(to_u64(revisions.len()).saturating_mul(awaited.saturating_add(path)))
+        .saturating_add(
+          to_u64(revisions.len()).saturating_mul(awaited.saturating_add(path.saturating_mul(2))),
+        )
         // Its path twice: as its group opens (`Taker::files`) and as its log is noted (`logged_of`).
         .saturating_add(path.saturating_mul(2))
     });
@@ -403,7 +406,7 @@ impl Cutting {
     &mut self,
     (log, rev): (LogOf, u32),
     kept: KeptText,
-    (charged, contents): (u64, Vec<ContentId>),
+    (charged, contents): (u64, Option<FileContents>),
   ) {
     let open = self.open.get_or_insert_with(|| Open {
       slice: kept.place.start..kept.place.end,
@@ -459,8 +462,8 @@ struct Open {
   texts: Vec<KeptText>,
   /// What their texts charged the push's admission.
   charged: u64,
-  /// The content store's identities its file revisions are kept as.
-  contents: Vec<ContentId>,
+  /// Its file revisions as the content store keeps them.
+  contents: Vec<FileContents>,
 }
 
 /// A segment of a push's kept revisions, cut ([`Intake::take_segment`]): its slice of the changegroup (its changeset's
@@ -477,10 +480,11 @@ pub struct PushSegment {
   pub texts: Vec<KeptText>,
   /// What their texts charged the push's admission.
   pub charged: u64,
-  /// The content store's identities its file revisions' bytes and metadata blocks are kept as: what its driver lets go
-  /// of the content store once the segment is durable on the node's changeset store, which then serves them (main
-  /// 01a20182's order of 2026-11-22 14:00, the arena a whole-history push left held).
-  pub contents: Vec<ContentId>,
+  /// Its file revisions as the content store keeps them, each by its path and node: what its driver lets go of the
+  /// content store once the segment is durable on the node's changeset store, which then serves them (main 01a20182's
+  /// order of 2026-11-22 14:00, the arena a whole-history push left held), and notes for a home's read once its entry
+  /// commits (goal 93 item 2b(b)).
+  pub contents: Vec<FileContents>,
 }
 
 /// The `Record` of `segment` (main's ruling (b1)): record v8 of a push's source, each log's kept revisions in it read by
@@ -1265,17 +1269,30 @@ impl Taker {
       ..
     } = *pending;
     let log = log.log();
-    checking.finish().map_err(|fault| Unverified::Node {
-      log: log_of(log),
-      node,
-      fault,
-    })?;
+    // Taken out of the intake, the writer's windows are this step's to give back on any refusal: the intake's own give
+    // back (`Intake::abandon`) no longer reaches them.
+    if let Err(fault) = checking.finish() {
+      if let Some(writing) = writing {
+        store.abandon_object(writing);
+      }
+      return Err(
+        Unverified::Node {
+          log: log_of(log),
+          node,
+          fault,
+        }
+        .into(),
+      );
+    }
     let kept = match writing {
-      Some(mut writing) => Some(
-        store
-          .finish_object(&mut writing)
-          .map_err(|refused| Refused::Unindexed(Unindexed::from(refused)))?,
-      ),
+      Some(mut writing) => match store.finish_object(&mut writing) {
+        Ok(kept) => Some(kept),
+        // A refused finish leaves the windows it acquired with the writer for its caller to give back.
+        Err(refused) => {
+          store.abandon_object(writing);
+          return Err(Refused::Unindexed(Unindexed::from(refused)));
+        }
+      },
       None => None,
     };
     let revision = Revision {
@@ -1371,17 +1388,20 @@ impl Taker {
     match self.cutting.as_mut() {
       Some(cutting) => {
         let rev = self.fork.len(store, log).saturating_sub(1);
-        let contents: Vec<ContentId> = match log {
-          Log::File(_) => self
-            .fork
-            .revision(store, log, rev)
-            .map(|row| core::iter::once(row.bytes).chain(row.block).collect())
-            .unwrap_or_default(),
-          Log::Changelog | Log::Manifest => Vec::new(),
+        let contents = match log {
+          Log::File(_) => self.fork.revision(store, log, rev).map(|row| FileContents {
+            path: path.to_vec(),
+            node: revision.node,
+            bytes: row.bytes,
+            block: row.block,
+          }),
+          Log::Changelog | Log::Manifest => None,
         };
         let charged = to_u64(size_of::<KeptText>())
           .saturating_add(to_u64(path.len()))
-          .saturating_add(to_u64(size_of::<ContentId>()).saturating_mul(to_u64(contents.len())));
+          .saturating_add(contents.as_ref().map_or(0, |contents| {
+            to_u64(size_of::<FileContents>()).saturating_add(to_u64(contents.path.len()))
+          }));
         cutting.kept((log_of(log), rev), kept, (charged, contents));
       }
       None => self.intaken.texts.push(kept),
