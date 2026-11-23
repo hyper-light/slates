@@ -1540,7 +1540,9 @@ that bought showed a 13% p50 win confined to the parked wake path against a loss
 kept behind a flag: the rule is replace, do not layer. macOS: kqueue with `EVFILT_USER` kicks and non-blocking socket I/O for the NFS
 server. Windows: IOCP with `PostQueuedCompletionStatus` kicks, a blocked wait raised one priority level for as long as it
 blocks (A-361: a completion port's waiter gets none of the wake boost an event's waiter gets, so a kicked shard waited
-out its neighbours' turns); WinFsp requests arrive on WinFsp's threads and are routed to the owning shard by handle. Simulation: a driver that replaces time,
+out its neighbours' turns), and a client's reply wait one level above normal for the wait (A-871: woken by its Event at
+the shards' own level, a client queued behind them); WinFsp requests arrive on WinFsp's threads and are routed to the
+owning shard by handle. Simulation: a driver that replaces time,
 randomness, sockets, rings, and the bridge with seeded in-process simulations for the whole
 cluster.
 
@@ -1776,9 +1778,18 @@ static CPU manager gives a Guaranteed pod with integer CPUs [B: Kubernetes, "Con
 Policies on the Node"]. A quota below the cpuset is a share of time on a pool other tenants share. There
 the OS places the shards, because fixed cores would stack every such daemon on the same CPUs. Seastar draws
 the same line with an operator's `overprovisioned` flag [C: seastar reactor_config.hh]; slates derives it
-from the facts. A refused pin is counted per shard and logged once where the OS pins. Two daemons given one
-cpuset with no quota between them still share its cores, which the facts cannot show: give each daemon its
+from the facts. A refused pin is counted per shard and logged once where the OS pins. On Windows the OS places every
+shard (A-871): a thread fixed to one CPU is readied onto that CPU alone, and Windows parks, deep-idles and interrupts
+its CPUs by a power and interrupt policy the process does not own (`slates_machine::placement::Fixing`). Two daemons
+given one cpuset with no quota between them still share its cores, which the facts cannot show: give each daemon its
 own machine, cpuset or quota.
+
+> **Status (2026-11-23, A-871: on Windows the OS places every shard).** On jupiter (Ryzen AI Max+ 395, 32 threads,
+> Windows 11 Balanced with core parking, 64 spinners in the bench's process) shards fixed to the even logical CPUs had
+> 399-446 parked-shard wakes over a millisecond after their kick a quiet round, 27 over 16 ms, and quiet p999s up to
+> 6.7 ms; placed by the OS, 9-21 such wakes and p999 145-337 µs quiet and loaded (with the client's raise, §4.7).
+> Naming each shard's core as its ideal processor was even with that, so the simpler rule landed. The wake probe
+> follows the same rule, so it measures the placement production runs. BENCHMARKS "84a on Windows bare metal".
 
 > **Status (2026-09-29, A-41: shards are fixed only to cores the process owns).** The facts listed a Linux
 > process's cores as `0..available_parallelism()`, a count a CPU quota lowers and that names no core. Every
@@ -61310,4 +61321,50 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
   image equals the shard's entry by entry. `pages_cover_their_coordinates_and_hold_at_most_the_page_size` (200
   generated plans) and `a_page_piece_reads_back_its_entries_and_refuses_what_no_page_wrote` (every cut, a count past the
   bytes, another version). The pieces' encode is still one call per publication: piece 2 bounds it.
+
+### A-871 — On Windows the OS places every shard, and a client waits for its reply one level above normal (2026-11-23, main 01a20182; goal 84a; A-361, A-834, A-831, A-41, A-208)
+
+- **Why.** CI's Windows VMs had met 84a (A-828, A-834), but bare metal did not. On jupiter (an AMD Ryzen AI Max+ 395,
+  16 cores and 32 threads, Windows 11 build 26200, the Balanced plan with core parking's floor at half the cores, 64
+  spinning threads in the bench's own process) the loaded edit-and-merge p999 was 2.8-6.5 ms in every conflict round,
+  and the quiet p999 reached 3.4-6.7 ms. A diagnostic (branch `main01a20182/84a-win-diag`, never main) stamped each slow
+  sample's wait before its shard read it and after its reply, page faults (0-3 in every slow sample), each parked shard's
+  wake against its kick and each client's take against the reply's publication. Two waits held the tail:
+  - A shard fixed to its core (A-41's placement, unchanged since) was readied onto that one CPU, which Windows parks,
+    deep-idles and interrupts by its own policy: 399-446 parked-shard wakes over a millisecond a quiet round, 27 over
+    16 ms.
+  - A parked client woken by its reply's Event stood one level above normal, the shards' level since A-361 and A-834,
+    and Windows lets neither of two threads at one level take the other's CPU: 245-492 replies a loaded round were
+    taken over a millisecond late, up to 70.8 ms.
+- **The change.**
+  - `slates_machine::placement::Fixing` names whether a thread fixed to one CPU keeps its wake on the platform:
+    `Keeps` on Linux and macOS, `Waits` on Windows (`Fixing::HERE`). `Placement::of` applies this platform's;
+    `Placement::of_with` takes either, so the rule is one cfg-free rule tested on every host. Where a fixed thread
+    waits, nothing is fixed: the OS places every shard, and the wake probe pairs its threads the same way, so it
+    measures the placement production runs.
+  - A Windows client's reply wait (`ClientEnd::wait_ending`, both the deadline's and the departure's forms) raises the
+    waiting thread from normal to one level above for the wait and puts it back as the wait returns
+    (`RaisedForTheWait`). The woken client then stands one level above the shards. A thread at another level is left
+    as it is, and so is one whose job fixes its level (kiln's agent job: `SetThreadPriority` answers success there and
+    the level stays). No privilege is asked (R10).
+- **Evidence** (BENCHMARKS "84a on Windows bare metal"; every round started through WMI outside kiln's agent job, whose
+  `JOB_OBJECT_LIMIT_PRIORITY_CLASS` fixes every thread's level, so no raise takes effect inside it):
+  - Fixed against OS-placed shards, quiet P U U P: parked-shard wakes over 1 ms 446 / 9 / 21 / 399.
+  - The client's wait, loaded N R R N with OS-placed shards: replies taken over 1 ms late 492 / 2 / 2 / 331; conflict
+    p999 6,455 / 192 / 273 / 5,594 µs; accept p999 5,511 / 237 / 293 / 340 µs.
+  - With the raise on, every round's p99 and p999 were under 1 ms for both forms, quiet and loaded (p999 135-359 µs).
+    Naming each shard's core as its ideal processor was even with OS placement (135-359 against 145-337 µs), so the
+    simpler rule landed.
+  - Tests: `placement::tests::where_a_fixed_thread_waits_for_its_cpu_the_os_places_every_shard` (both kinds on every
+    host), `wake::tests::the_pairs_follow_the_runtimes_shard_placement` (no pairs where a fixed thread waits), and on
+    Windows `endpoint::tests::a_windows_clients_reply_wait_stands_one_level_above_normal_and_then_returns_to_normal`
+    (another thread reads the waiting thread's level through its handle: normal before, one above while waiting,
+    normal after).
+- **Not changed.** Linux keeps its fixing; macOS keeps affinity as a hint and its time-constraint policy (A-831).
+  Which of core parking, deep idle or a deferred procedure call held a fixed shard was not separated. One machine.
+  The runtime's long polls on Windows carry no attribution (`NoClock`), a gap of its own (GAPS, 84a).
+- **Applied in the same change to:** `crates/machine/src/placement.rs` (module doc, `Fixing`, `of_with`, tests),
+  `crates/machine/src/wake.rs` (the pairing test), `crates/ipc/src/endpoint.rs` (module doc, `RaisedForTheWait`, the
+  Windows test), `unsafe-budget.toml` (slates-ipc 167 -> 169), §4.3 (the placement paragraph and its status, the
+  Windows driver sentence), GAPS (84a, Windows), BENCHMARKS ("84a on Windows bare metal").
 

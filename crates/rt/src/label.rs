@@ -115,6 +115,12 @@ pub(crate) fn caller() -> u32 {
   intern(TaskLabel::Site(Location::caller()))
 }
 
+/// The label of the site `site`: a task spawned on another's behalf, labelled where that work was asked for (an
+/// observation's question, labelled where the asker asked; `crate::runtime::submit_to_holder_at`).
+pub(crate) fn at(site: &'static Location<'static>) -> u32 {
+  intern(TaskLabel::Site(site))
+}
+
 /// The label interned at `index`; none for 0 (unlabelled) or an index no label holds.
 pub fn label_of(index: u32) -> Option<TaskLabel> {
   let at = usize::try_from(index).ok()?.checked_sub(1)?;

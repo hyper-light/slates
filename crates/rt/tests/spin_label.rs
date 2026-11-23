@@ -98,3 +98,36 @@ struct AtomicBoolPair {
   /// The test has read it: go on to the next phase.
   go_on: AtomicBool,
 }
+
+/// Main 01a20182's order of 2026-11-23: every task submitted from another thread read `runtime.rs:38`, the submit's own
+/// line, so a wedged shard named no culprit. Do: from this thread submit a task (`submit_to_holder`) that spins until
+/// told, and read the shard's pulse while it spins. Expect: its label this file at the submitting line.
+#[test]
+fn a_task_submitted_from_another_thread_is_labelled_with_its_submitters_line() {
+  let runtime = Runtime::start(&config()).unwrap();
+  let shard = *runtime.shard_ids().first().unwrap();
+  let holder = runtime.holder_of(shard).unwrap();
+  let phase: &'static AtomicBoolPair = Box::leak(Box::new(AtomicBoolPair::default()));
+  let line = line!() + 1;
+  let receipt = slates_rt::runtime::submit_to_holder(holder, async move {
+    phase.spinning.store(true, Ordering::Release);
+    while !phase.go_on.swap(false, Ordering::AcqRel) {
+      std::hint::spin_loop();
+    }
+  })
+  .unwrap();
+  let started = Instant::now();
+  while !phase.spinning.swap(false, Ordering::AcqRel) {
+    assert!(started.elapsed() < WAIT, "the task never ran");
+    std::hint::spin_loop();
+  }
+  let seen = polling(shard.0);
+  phase.go_on.store(true, Ordering::Release);
+  let _ = receipt.wait(WAIT);
+  runtime.shutdown().unwrap();
+  assert!(
+    matches!(seen.label, Some(TaskLabel::Site(site))
+      if site.file().ends_with("tests/spin_label.rs") && site.line() == line),
+    "{seen}"
+  );
+}
