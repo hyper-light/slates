@@ -15,7 +15,7 @@
 //! **A revision** (`get_oid_1`, but for its suffixes `~`, `^`, `^{...}` and a reflog's `@{...}`, which a name ending
 //! in one is refused by kind for until a later slice reads them):
 //! - an object's full name in the repository's format, either case, held or not (`get_oid_basic`); when a ref has that
-//!   name too, git warns "refname '<name>' is ambiguous." and prints its advice of refs named like an object;
+//!   name too, git warns "refname '\<name>' is ambiguous." and prints its advice of refs named like an object;
 //! - a ref by git's patterns, `@` naming `HEAD` (`refs::dwim`): the first pattern's, git warning the same way when
 //!   another pattern finds a ref too, or when the name also abbreviates exactly one object's name;
 //! - `git describe`'s name, `<ref>-<count>-g<abbreviation>`: the last `-g` whose part before it is a ref name git
@@ -26,7 +26,7 @@
 //!   otherwise it is ambiguous and names nothing.
 //!
 //! **What git writes** of an ambiguous abbreviation, but in a quiet lookup (`git describe`'s; the check behind the
-//! warning above): "error: short object ID <digits> is ambiguous", then its advice, "hint: The candidates are:" and a
+//! warning above): "error: short object ID \<digits> is ambiguous", then its advice, "hint: The candidates are:" and a
 //! line for each candidate: those the hint takes when two or more do, every one otherwise; tags first, then commits,
 //! trees and blobs, each kind in name order; each by its shortest unique abbreviation (`StoreGraph::unique_digits`)
 //! and what it is: a commit's author date in the author's own zone and its subject (its first paragraph's lines,

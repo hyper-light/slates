@@ -1064,6 +1064,20 @@
 >   `push_heap`'s `a_cached_file_base_is_read_where_it_lies` (one 160 KiB file on two interleaved lines, each delta on
 >   the revision two back): red 176,689 B a revision (1.08 copies), now 12,887 B (0.08). Owed: the 57k push's reading
 >   after the three cuts (`hg_push_lifetimes`, w-perf's).
+>   The index tail sealed as a push appends, its runs size-tiered BUILT (2026-11-23, w-hg; main's ruling, the reland of
+>   w-perf's 0cd8ef36a, reverted in 2662ca69f): a push held its tail's rows to its end (56 MB of Mercurial's push: each
+>   row two buffers), since only an import sealed; sealed at every append alone (0cd8ef36a), each seal a run its fork
+>   never merged, so each new row's lookup walked them all and a segment step grew with the push (arena-14: shard 0 past
+>   1 s in `hg_push::segment`, the daemon killed). Now every append seals when due through one insert
+>   (`HgIndex::insert`, import's own seal gone), and the fork's runs are merged by a size-tiered rule as it goes
+>   (`slates_vcs::Index::tiered_due`: the newest merged while their rows together are at least half the next older's;
+>   Derived: at most ⌊log₃(own rows ÷ the fewest a seal writes)⌋ + 1 own runs), a table a step between revisions
+>   (`Taker::merge_step`, `Intaken::tiered_merges`, `most_own_runs`). Held by
+>   `a_tiered_merge_keeps_an_indexs_runs_within_a_logarithm_of_its_rows` (slates-vcs, 2,000 rows: red 2 runs past the
+>   bound after 2 seals) and push_heap's
+>   `a_long_pushs_fork_keeps_its_runs_within_a_logarithm_of_its_rows` (1,500 edits under a 4 KiB window, 186 seals: red
+>   186 own runs against a bound of 9, the push 210 s in debug; now at most 4, 102 merges, 43 s). Owed: the 56 MB tail's
+>   reading at full scale (arena-17).
 >   Its bound from the work BUILT (main's ruling, 2026-11-23): the chain no longer needs its texts held, so the cache holds
 >   the distinct texts its last `waiting` reads lent (one a waiting request, the owner's room) and a chunk's room
 >   (`TextCache::for_reads`), the least lately read out first; a text past it is lent from the buffer it was made into.
@@ -5538,11 +5552,26 @@
 >   contention, 40 of 40 with the fix where main failed 4 of 40: the first held write given up at 3.8 to 4.7 s, the
 >   bound its owner judged by never past 5.6 s. Record:
 >   `docs/bugs/2026-11-23-a-cut-off-owners-failover-delay-grew-with-its-detectors-backed-off-probes.md`.
->   - **Open (a sibling, measured 2026-11-23):** A-351's
+>   - **FIXED 2026-11-23 (w-fleet; the sibling of the entry above, a defect of the test's wait):** A-351's
 >     `a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again` timed out its wait for the
->     successor's give-up in 2 of 6 runs on main under four-CPU contention, and once in 10 with this fix, in a loaded
->     run of eight fleet tests. Its budget reads the largest failover delay across the nodes, and the round it waits on
->     restarted 4 times in the failed run.
+>     successor's give-up in 7 of 40 runs on adacachy2, the test alone on two or four CPUs (`taskset`). Logged once a
+>     second from the cut: each failure came where both survivors judged the cut-off leader by their pair's own
+>     retransmission timer at the cut, which comes 0.9 s into the test, before either survivor's pool had a verdict. The
+>     leader was condemned 7.2 s after its last answer, where an estimator took under one second. No failover estimate
+>     counts that timer, and the wait's one budget was three failover delays from the cut. The wait is now judged in two
+>     parts by the fleet's own measures. The detection is held to the bound each survivor's detector stated
+>     (`Daemon::fleet_condemnation`). The give-up, from the death held, is held to the departure's confirmation and the
+>     round's promise wait. With it, 40 of 40 passed under the same contention. Sixteen of those runs met a detection
+>     of 7.2 to 15.3 s, and the give-up then came 53 to 89 periods after the death was held, against a budget of about
+>     144 to 177. Record:
+>     `docs/bugs/2026-11-23-the-readmission-tests-wait-missed-a-detection-judged-by-the-timer.md`.
+>   - **Open (found with it, measured 2026-11-23):** the failover delay's detection term (A-363) leaves out a detection
+>     the timer judges. While a member's pool has no verdict, its timer-judged pairs take about 7 s to condemn in a
+>     three-node fleet, where its delay said 2.2 to 5.1 s, so every wait that reads the delay reads the smaller figure
+>     for those seconds. A fix would count a crashed peer's two unanswered probes at the run the detector bounds them by
+>     now (hyper-swim's `longest_unanswered`), which falls back once the pool has a verdict. That is an amendment of A-363
+>     and of each consumer. In the same regime `lease::horizon_ns`'s doc ("the longest a peer can go unanswered before
+>     this node's detector declares it dead", 0.9 s) is untrue, though the lease's safety rests on answers, not on it.
 > - **Owed (the integrator's):** live_chaos and live_fleet flows that keep a writer waiting past the failover SLO (10 s)
 >   now meet `DurabilityPending` where they waited; each flow's stops are a few liveness budgets, under it, but a flow
 >   that stops every candidate longer must treat the refusal as its write's outcome (not acknowledged, so never owed to
@@ -13125,6 +13154,42 @@ finding against the sweep's thirty candidates is the measure of how far a grep w
 **Owed:** five references were deleted rather than repointed, because nothing of that name exists and the
 right pointer needs someone who owns §4.8's SWIM wiring: `accept_probes`, `probe_peer`, `serve_peer_probes`,
 `fold_peer_state`, `ProbeTiming::budget`, all in `crates/server/src/fleet.rs`.
+
+**Red again, cleared 2026-11-23** (w-wall for main, at main b21dd5d5f). Fleet agents land without building docs
+(CLAUDE.md §8), so the gate went red unseen. CI run 45251228315 showed 51 errors in three crates, but cargo stops
+starting crates after the first failure, so that was a subset: `cargo doc --keep-going` with the gate's flags found
+**131 errors in 17 crates** on macOS and 131 on adacachy2's Linux, 132 distinct (the same set but for one each:
+`ProcessMark` is macOS and Windows only, `crates/server/src/held_copy.rs` Linux only). Each was repointed at what it
+means now, never deleted:
+
+| Kind | Count | Examples |
+|---|---|---|
+| A name renamed or removed | 19 | `Store::text_by_tool` (`Store::texts_by_tools`), `changeset_of` (folded into `changeset_landing`), `tell_owners` (`tell_session`), `Landing::chmod` (`Landing::set_meta`), `PendingMount` (`PendingHandshake`), `keylife::key_time_limit_ns` (RFC 4253 §9's hour, `RECOMMENDED_KEY_TIME_NS`) |
+| A `#[cfg(test)]` item named from a production doc | 22 | the takeover oracles `resolve_held_objects` and `reconcile_held_authority` (production walks `install_on_copy` a copy a turn), `Dim::copy_tree` (production holds with `hold_tree` and grafts with `graft_tree`), `Connection::poll_transmit` (`poll_transmit_into`) |
+| A module's own docs resolved in its parent's scope | 27 | `crates/server/src/moves.rs` (13), five `crates/git/src/store` children (10), `crates/vfs/src/host/tree.rs` (4) |
+| Prose read as a link | 21 | evidence tiers `[B]` and `[C]` (14), protocol grammar with `<placeholders>` in brackets (4), C source `name[entrylen]` |
+| Ambiguous between a function and a macro, module or primitive | 19 | `write` (12), `answer` (2), `ready`, `tuple`, `pointer`, `reference`, `slice` |
+| A real item by a path that does not reach it | 17 | `hg_run` from `hg_push.rs` (10), `HomeMessage` imported inside a function only |
+| A placeholder read as an unclosed HTML tag | 4 | git's messages quoting `<name>`, `<digits>`, `<blob-ish>`, `<id>` |
+| An item behind a platform cfg the build cannot see | 3 | `Holder` and `handle_session_bytes` (`cfg(any(windows, test))`), `ProcessMark` |
+
+**The trap behind the 27.** A module with an outer `///` doc on its `mod` line and its own `//!` docs gets one
+merged doc, which rustdoc 1.98.1 resolves in the *parent's* scope, so every inner link to the module's own items
+fails with "no item named ... in scope" beside the very item. Proved on a two-file crate: the inner link fails with
+the outer doc and resolves once the outer doc is a `//` comment. The outer lines became `//` comments, as
+`crates/server/src/lib.rs` already writes its other module notes; each module's own docs already opened with the
+same summary. Eleven more modules still carry both kinds and do not fail today: `crates/ipc/src/lib.rs`'s
+`completion`, `mach_claim` and `peer` (their outer docs say more than their first lines, so turning them into
+comments needs their text moved in), `xtask/src/kind.rs`'s three `kind_*`, and five test-only modules no docs build
+renders.
+
+**The Windows docs lane, run from the Mac** (`cargo xwin doc` over `windows-lint`'s crate list; every one of its 13
+crates builds here, aws-lc-sys and zstd-sys through clang-cl), found 11 more, each a link from docs every platform
+builds to an item Windows does not have: `crates/server/src/shards/resync.rs`'s seven (`establish`, `Resync::end`,
+`give_up` three times, `tell_session`, `send_resync`, all `cfg(unix)`), `Events::acknowledge` twice (macOS and Linux
+alone), `svn_presenter::repos_for_hook` and `Answering::Hook`. Plain code now, the rule for a cfg-gated item. CI's
+Windows lane had stopped at an earlier step (run 45251228315, `svn_interop`'s `UPDATE_SPAN`), so its docs step never
+ran on them.
 
 ### 8a-fdscan. A descriptor probe counted every parallel test's objects as its own (2026-10-20, closed)
 

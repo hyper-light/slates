@@ -807,17 +807,21 @@ fn retirement_learned_periods(daemons: &[&Daemon]) -> u64 {
 }
 
 /// Derived: the coordinator periods the survivors take to learn a voter's departure: a membership horizon for the
-/// detector to hold it dead, the death window, the election the departure leaves owed when the voter led the council
-/// (its timeout's base and span, [`election_periods`], and its two rounds, the pre-vote's and the vote's), the
-/// retirement's commit, the two commits of the joint change that refills its seat, the period a learner sees its
-/// divergence in, and its fetch round. The voter these tests stop is the bootstrapper, which leads the council it created
-/// unless a priority transfer moved its leadership, and only a leader proposes the retirement: without the election the
-/// budget ran out with the retirement still owed at one CPU beside two busy loops (diag-g225-forming-fleet-reaches-2,
-/// 2026-11-18: 9 of 48 runs of the two tests waiting on it, every survivor still at the version of the stop or the
-/// leader still naming the stopped voter, 94 periods spent).
+/// detector to hold it dead, then the departure confirmed ([`departure_confirmed_periods`]). The voter these tests stop is
+/// the bootstrapper, which leads the council it created unless a priority transfer moved its leadership, and only a
+/// leader proposes the retirement: without the election the budget ran out with the retirement still owed at one CPU
+/// beside two busy loops (diag-g225-forming-fleet-reaches-2, 2026-11-18: 9 of 48 runs of the two tests waiting on it,
+/// every survivor still at the version of the stop or the leader still naming the stopped voter, 94 periods spent).
 fn departure_learned_periods(daemons: &[&Daemon]) -> u64 {
-  horizon_periods()
-    .saturating_add(death_window_periods(daemons))
+  horizon_periods().saturating_add(departure_confirmed_periods(daemons))
+}
+
+/// Derived: the coordinator periods from the survivors holding a voter dead to their learning its departure: the death
+/// window, the election the departure leaves owed when the voter led the council (its timeout's base and span,
+/// [`election_periods`], and its two rounds, the pre-vote's and the vote's), the retirement's commit, the two commits of
+/// the joint change that refills its seat, the period a learner sees its divergence in, and its fetch round.
+fn departure_confirmed_periods(daemons: &[&Daemon]) -> u64 {
+  death_window_periods(daemons)
     .saturating_add(election_periods(daemons))
     .saturating_add(commit_periods().saturating_mul(6))
     .saturating_add(1)
@@ -15619,6 +15623,51 @@ fn promise_wait_periods(daemons: &[&Daemon]) -> u64 {
     .max(1)
 }
 
+/// Derived: the coordinator periods a successor takes to give a cut-off voter's objects up once the survivors hold the
+/// voter dead: the departure confirmed ([`departure_confirmed_periods`]), whose commits are the configuration changes
+/// that restart the successor's takeover round, each one starting its promise wait afresh; then that wait whole from
+/// the last of them ([`promise_wait_periods`]); and the period the give-up is recorded in. Not the detection: that is
+/// the survivors' detectors', held to the bound each states ([`Daemon::fleet_condemnation`]).
+fn given_up_once_held_dead_periods(daemons: &[&Daemon]) -> u64 {
+  departure_confirmed_periods(daemons)
+    .saturating_add(promise_wait_periods(daemons))
+    .saturating_add(1)
+}
+
+/// Whether `survivor` holds `host` dead: its fleet's belief, which the council's death watch reads, or `host` already
+/// retired from its council's configuration.
+fn holds_dead(survivor: &Daemon, host: HostId) -> Result<bool, ObserveError> {
+  let dead = survivor
+    .fleet_member_state(host)?
+    .is_some_and(|state| state.liveness == slates_cluster::membership::Liveness::Dead);
+  Ok(dead || !survivor.council_members()?.contains(&host))
+}
+
+/// The survivors' records of condemning a cut-off member ([`Daemon::fleet_condemnation`]), as each answered.
+type Condemnations = [Result<Option<slates_cluster::member_plane::Condemnation>, ObserveError>];
+
+/// Asserts a cut-off member's detection kept what the survivors' detectors promised: a survivor's own probes condemned it
+/// (non-vacuity; another may hold it dead by that survivor's gossip alone), and each that did so condemned it within the
+/// bound its detector stated when it did.
+fn assert_condemned_within_stated_bounds(condemnations: &Condemnations) {
+  let own: Vec<slates_cluster::member_plane::Condemnation> = condemnations
+    .iter()
+    .filter_map(|condemnation| condemnation.as_ref().ok().copied().flatten())
+    .filter(|condemnation| condemnation.count > 0)
+    .collect();
+  assert!(
+    !own.is_empty(),
+    "a survivor's own probes condemned the cut-off member: {condemnations:?}"
+  );
+  assert!(
+    own.iter().all(|condemnation| matches!(
+      (condemnation.after, condemnation.within),
+      (Some(after), Some(within)) if after <= within
+    )),
+    "each survivor that condemned the cut-off member did so within the bound its detector stated: {condemnations:?}"
+  );
+}
+
 /// Derived: the coordinator periods a fleet takes to settle on one configuration again once a member it retired on a
 /// false death hears it again: the member's refutation (a membership horizon), a round of its takeover run whole (the
 /// promise wait, the round's own bound), the commits that complete its retirement and re-admit it, the seat changes
@@ -17776,12 +17825,22 @@ fn summed_count(daemon: &Daemon, name: &str) -> u64 {
 /// one configuration once its faults stop. Do: three nodes at `f = 1`; a volume on a, sealed and its head held by b and
 /// c; the survivor that is not the volume's successor leaves the successor's takeover questions unanswered, while its
 /// own are answered, so its share confirms and nothing else changes the configuration; cut a off on the probe plane until
-/// b and c have retired it and the successor has given the volume up; let the other survivor answer; heal a. Expect every
-/// node to hold one configuration that names all three as members and voters, installed, and the probe mesh whole,
-/// within the periods a re-admission takes, and the successor to have judged its round afresh. Before, nothing but a
-/// configuration change started a round that gave objects up over, the retirement it owed stayed kept, a kept retirement
-/// refuses its host's re-admission, and the fleet stayed split for good (the chaos nemesis's split, the survivors at two
-/// members and a at three: there the other survivor's share had confirmed early, as here).
+/// b and c hold it dead, each survivor whose own probes condemned it within the bound its detector stated, and the
+/// successor has given the volume up within the departure's confirmation and its round's promise wait
+/// ([`given_up_once_held_dead_periods`]); let the other survivor answer; heal a. Expect every node to hold one
+/// configuration that names all three as members and voters, installed, and the probe mesh whole, within the periods a
+/// re-admission takes, and the successor to have judged its round afresh. Before, nothing but a configuration change
+/// started a round that gave objects up over, the retirement it owed stayed kept, a kept retirement refuses its host's
+/// re-admission, and the fleet stayed split for good (the chaos nemesis's split, the survivors at two members and a at
+/// three: there the other survivor's share had confirmed early, as here).
+///
+/// The give-up was once waited for in one budget from the cut, three failover delays as the nodes read them. The cut
+/// comes about 0.9 s into the test, and where neither survivor's pool had a verdict by then, each judged a by its pair's
+/// own retransmission timer, floored at a second and doubling, and a was condemned about 7.2 s after its last answer,
+/// where an estimator condemned it in under one. No failover estimate counts that timer, so the wait ran out at 145 to
+/// 147 periods with the successor's promise wait still running: 3 of 20 runs under two- and four-CPU contention, each one
+/// where both survivors judged a by its timer at the cut, and none of the other 17 (adacachy2, 2026-11-23,
+/// `docs/bugs/2026-11-23-the-readmission-tests-wait-missed-a-detection-judged-by-the-timer.md`).
 #[test]
 fn a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again() {
   let _serial = serialize_fleet_tests();
@@ -17796,13 +17855,28 @@ fn a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again()
   let silenced = daemons[other].inject_takeover_silence(&[hosts[at]]);
   let observed: Vec<&Daemon> = daemons.iter().collect();
   let cut = silenced.is_ok() && probe_plane_cut(&daemons, &hosts, true);
-  // The successor's bound is its own failover estimate's worth of periods, which load raises while it waits: the
-  // budget follows it.
-  let given_up = cut
+  // Two waits, each judged by the fleet's own measure. The detection is the survivors' detectors', held afterwards to
+  // the bound each stated for it: no failover estimate describes it while a survivor's pool has no verdict, when the
+  // pair's own retransmission timer judges a's probes. Then, from the death held, the departure is confirmed and the
+  // successor's round waits its promises whole from its last restart, at the failover delay the nodes read now.
+  let survivors = [&daemons[1], &daemons[2]];
+  let held_dead = cut
+    && poll_until(&observed, RETIREMENT_DEADLINE, || {
+      all_hold(
+        survivors
+          .iter()
+          .map(|survivor| holds_dead(survivor, hosts[0])),
+      )
+    });
+  let condemnations: Vec<_> = survivors
+    .iter()
+    .map(|survivor| survivor.fleet_condemnation(hosts[0]))
+    .collect();
+  let given_up = held_dead
     && poll_for_live_periods(
       &observed,
       RETIREMENT_DEADLINE,
-      || promise_wait_periods(&observed).saturating_mul(3),
+      || given_up_once_held_dead_periods(&observed),
       || Ok(summed_count(&daemons[at], "fleet.takeover.given_up") > 0),
     );
   let at_give_up: Vec<String> = daemons.iter().map(configuration_view).collect();
@@ -17822,11 +17896,18 @@ fn a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again()
     daemon.stop();
   }
   eprintln!(
-    "given up, then heard: cut {cut}, given up {given_up}, answering again {answering}, healed {healed}, settled \
-     {settled}, judged afresh {judged_afresh}\nat the give-up:\n{}\nat the end:\n{}",
+    "given up, then heard: cut {cut}, held dead {held_dead}, condemned by the survivors {condemnations:?}, given up \
+     {given_up}, answering again {answering}, healed {healed}, settled {settled}, judged afresh {judged_afresh}\nat the \
+     give-up:\n{}\nat the end:\n{}",
     at_give_up.join("\n"),
     at_end.join("\n")
   );
+  assert!(
+    cut && held_dead,
+    "a was cut off and both survivors hold it dead: {}",
+    at_give_up.join("; ")
+  );
+  assert_condemned_within_stated_bounds(&condemnations);
   assert!(
     cut && given_up,
     "a was cut off and the volume's successor gave it up: {}",

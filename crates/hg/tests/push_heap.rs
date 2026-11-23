@@ -607,3 +607,56 @@ fn a_cached_file_base_is_read_where_it_lies() {
     "a revision allocated {per_revision} B, a copy of its {file} B file's text"
   );
 }
+
+/// Shape: the edits of the runs test's history: enough appends under its window for hundreds of seals.
+const LONG_EDITS: usize = 1_500;
+
+/// Goal 93 (the index seal's reland, main's ruling of 2026-11-23): every append seals the fork's tail when due, each
+/// seal a run, and a lookup of a new row walks every run; arena-14's push of Mercurial's history spun past the watchdog
+/// in a segment step as the fork's unmerged runs grew. Do: take a history of [`LONG_EDITS`] edits through the intake
+/// under a 4 KiB window, so the fork seals hundreds of times. Expect the most runs only the fork held after any step
+/// within ⌊log₃(its rows)⌋ + 1 (the size-tiered rule's bound, a seal writing a row at least), and merges made (the
+/// counter, so the bound is not met by sealing nothing). Red before: no merge, the fork's own runs one a seal.
+#[test]
+fn a_long_pushs_fork_keeps_its_runs_within_a_logarithm_of_its_rows() {
+  let (payload, _) = history(50, 64, LONG_EDITS);
+  let mut store = ContentStore::new(u64::MAX, 4 << 10).unwrap();
+  let mut index = HgIndex::new();
+  let mut admission = Admission::new(u64::MAX);
+  let mut intake = Intake::begin(
+    (Version::V03, &payload),
+    &mut index,
+    &mut store,
+    &mut admission,
+  )
+  .unwrap();
+  loop {
+    match intake.step(&payload, &mut store, &mut admission).unwrap() {
+      Stepped::More => {}
+      Stepped::Done => break,
+      other => panic!("a whole changegroup in memory stepped {other:?}"),
+    }
+  }
+  let Ok((mut fork, intaken)) = intake.finish() else {
+    panic!("a whole changegroup taken");
+  };
+  let rows = fork.rows().rows();
+  // In integers: f64's log₃ of a power of three can fall just short of it (243 gives 4.999999999999999).
+  let bound = u64::from(rows.checked_ilog(3).unwrap_or(0)) + 1;
+  println!(
+    "push_heap: {rows} rows, {} seals, {} tiered merges, the most own runs {} (bound {bound})",
+    fork.rows().counters().seals,
+    intaken.tiered_merges,
+    intaken.most_own_runs
+  );
+  assert!(
+    fork.rows().counters().seals > 100,
+    "the fork sealed as it appended"
+  );
+  assert!(intaken.tiered_merges > 0, "the tiered rule merged");
+  assert!(
+    intaken.most_own_runs <= bound,
+    "the fork held {} runs of its own, past the bound {bound} at {rows} rows",
+    intaken.most_own_runs
+  );
+}
