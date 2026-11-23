@@ -46,6 +46,8 @@
 //! is written a part a turn before it since A-732, `Stage::Writing`), and the snapshot carrying the store's tables, so a
 //! recovery replays only the log's suffix.
 
+use std::collections::BTreeMap;
+
 use slates_db::catalog::{
   MemberOrigin, Principal, RepositoryId, StateChange, VolumeId as DbVolumeId,
 };
@@ -122,6 +124,9 @@ enum Stage {
     imported: Box<Imported>,
     /// The room it ran within.
     room: u64,
+    /// Each bookmark's work, built a unit a turn once the import was done ([`built_works`]): what its landing's entry
+    /// moves each bookmark's green by, never built in the landing's one step.
+    works: BTreeMap<Vec<u8>, slates_merge::engine::Increment>,
   },
 }
 
@@ -461,6 +466,7 @@ pub(crate) fn segment_landed(
 #[cfg(test)]
 pub(crate) fn land_imported(state: &mut ShardState, id: RepositoryId) -> Result<(), ImportFailed> {
   land_segments_blocking(state, id)?;
+  built_works_whole(state, id)?;
   land(state, id)
 }
 
@@ -624,6 +630,7 @@ fn finish(state: &mut ShardState, id: RepositoryId) -> Result<Turned, ImportFail
       stage: Stage::Done {
         imported: Box::new(imported),
         room,
+        works: BTreeMap::new(),
       },
       reserved: 0,
       segments,
@@ -753,26 +760,31 @@ fn give_back(state: &mut ShardState, index: HgIndex) {
 /// the entry's apply. Refused, nothing is recorded, and the index and everything it held are given back. `Busy` while
 /// the import is still under way, `NoStore` when none is held for `id`.
 pub(crate) fn land(state: &mut ShardState, id: RepositoryId) -> Result<(), ImportFailed> {
-  let (mut imported, room, (run, named, name)) = match state.vcs_stores.imports.remove(&id) {
-    Some(Importing {
-      stage: Stage::Done { imported, room },
-      segments,
-      run: Some(run),
-      named,
-      name,
-      ..
-    }) if segments.is_empty() => (imported, room, (run, named, name)),
-    Some(running) => {
-      state.vcs_stores.imports.insert(id, running);
-      return Err(ImportFailed::Busy);
-    }
-    None => return Err(ImportFailed::NoStore),
-  };
+  let (mut imported, room, mut works, (run, named, name)) =
+    match state.vcs_stores.imports.remove(&id) {
+      Some(Importing {
+        stage: Stage::Done {
+          imported,
+          room,
+          works,
+        },
+        segments,
+        run: Some(run),
+        named,
+        name,
+        ..
+      }) if segments.is_empty() => (imported, room, works, (run, named, name)),
+      Some(running) => {
+        state.vcs_stores.imports.insert(id, running);
+        return Err(ImportFailed::Busy);
+      }
+      None => return Err(ImportFailed::NoStore),
+    };
   // The register names the run (A-767 C1 step 3): its segments' records and payloads are the changeset store's.
   let record = slates_hg::import::record::write_run_reference(room, run);
   let name = *name.finalize().as_bytes();
   let entry = super::lent_state(state, |state| {
-    landing_entry(state, id, (&*imported, room), (record, name))
+    landing_entry(state, id, (&*imported, &mut works), (record, name))
   });
   let mut index = Some(core::mem::take(&mut imported.index));
   let appended = entry.and_then(|(owner, changes, parts, record)| {
@@ -810,14 +822,13 @@ type Landing = (Principal, Vec<BranchChange>, EntryParts, Vec<u8>);
 fn landing_entry(
   state: &ShardState,
   id: RepositoryId,
-  (imported, room): (&Imported, u64),
+  (imported, works): (
+    &Imported,
+    &mut BTreeMap<Vec<u8>, slates_merge::engine::Increment>,
+  ),
   (record, name): (Vec<u8>, [u8; 32]),
 ) -> Result<Landing, Refusal> {
-  let content = state
-    .vcs_stores
-    .content
-    .as_ref()
-    .ok_or(Refusal::ContentUnavailable)?;
+  let _ = name;
   let repositories = state.db.partition().repositories();
   let owner = repositories
     .repository(id)
@@ -828,8 +839,7 @@ fn landing_entry(
     .find(|member| matches!(member.origin, MemberOrigin::Root))
     .map(|member| member.green)
     .ok_or(Refusal::NotFound)?;
-  let held = IndexHeld::new(&imported.index, content);
-  let changes = bookmark_greens(state, (root, &imported.bookmarks), (&held, name, room))?;
+  let changes = bookmark_greens(state, (root, &imported.bookmarks), works)?;
   // The record rides as the import's stored objects (`push_imported`), never as the parts' own.
   let parts = EntryParts {
     checks: Vec::new(),
@@ -861,45 +871,24 @@ fn phase_roots_added(roots: &[PhaseHead]) -> Vec<StateChange> {
 
 /// What a bookmark's work is built from: the imported index as a push's `Held`, the import's name, and the room the
 /// works may take between them.
-type Works<'h> = (&'h IndexHeld<'h>, [u8; 32], u64);
 
 /// Each bookmark a green (§4.17.3 decision 2): made from `root` at its head, as a push makes a bookmark from a line's
-/// version, and moved to the bookmark's changeset by a work built from the imported index (none where the root's head is
-/// that changeset already); the works within the room between them.
+/// version, and moved to the bookmark's changeset by its work, built before the landing ([`built_works`]); none where
+/// the root's head is that changeset already. A work its bookmark wants that was not built refuses the landing
+/// `ContentUnavailable`, never built here: the landing is one step, and a work is a tree's walk.
 fn bookmark_greens(
   state: &ShardState,
   (root, bookmarks): (DbVolumeId, &[(Vec<u8>, Node)]),
-  (held, name, room): Works<'_>,
+  works: &mut BTreeMap<Vec<u8>, slates_merge::engine::Increment>,
 ) -> Result<Vec<BranchChange>, Refusal> {
-  let engine = state.greens.get(&root).ok_or(Refusal::ContentUnavailable)?;
   let version = state.db.partition().green_head(root);
-  let head = engine
-    .xattr(ROOT, HEAD_ATTRIBUTE)
-    .and_then(|bytes| Node::try_from(bytes).ok());
-  let mut admission = Admission::new(room);
+  let head = root_head(state, root)?;
   let mut changes = Vec::with_capacity(bookmarks.len());
   for (mark, node) in bookmarks {
     let work = if head == Some(*node) {
       None
     } else {
-      let moved = Move {
-        name,
-        base_version: version,
-        base: head.as_ref(),
-        head: node,
-      };
-      let built = tree::work(
-        &moved,
-        &engine,
-        (&Verified::default(), held),
-        admission.left(),
-        &mut admission,
-      )
-      .map_err(|refused| work_refused(&refused, room))?;
-      admission
-        .charge(u64::try_from(built.increment.post_state.len()).unwrap_or(u64::MAX))
-        .map_err(|_| past_room(room))?;
-      Some(built.increment)
+      Some(works.remove(mark).ok_or(Refusal::ContentUnavailable)?)
     };
     changes.push(BranchChange::Create {
       name: crate::repository::hg_push::bookmark_name(mark),
@@ -909,6 +898,260 @@ fn bookmark_greens(
     });
   }
   Ok(changes)
+}
+
+/// The changeset `root`'s green holds as its head (`HEAD_ATTRIBUTE`), none for an empty green; refused where the green
+/// is not held here.
+fn root_head(state: &ShardState, root: DbVolumeId) -> Result<Option<Node>, Refusal> {
+  let engine = state.greens.get(&root).ok_or(Refusal::ContentUnavailable)?;
+  Ok(
+    engine
+      .xattr(ROOT, HEAD_ATTRIBUTE)
+      .and_then(|bytes| Node::try_from(bytes).ok()),
+  )
+}
+
+/// What repository `id`'s done import's bookmarks need built: the root green, its version and head, the import's room and
+/// name, and each bookmark whose changeset is not the head; none where no import is done or the repository holds no
+/// root.
+fn wanted_works(state: &ShardState, id: RepositoryId) -> Option<WantedWorks> {
+  let Some(Importing {
+    stage: Stage::Done { imported, room, .. },
+    name,
+    ..
+  }) = state.vcs_stores.imports.get(&id)
+  else {
+    return None;
+  };
+  let root = state
+    .db
+    .partition()
+    .repositories()
+    .members_of(id)
+    .find(|member| matches!(member.origin, MemberOrigin::Root))
+    .map(|member| member.green)?;
+  let head = root_head(state, root).ok()?;
+  let marks = imported
+    .bookmarks
+    .iter()
+    .filter(|(_, node)| head != Some(*node))
+    .cloned()
+    .collect();
+  Some(WantedWorks {
+    root,
+    version: state.db.partition().green_head(root),
+    head,
+    room: *room,
+    name: *name.clone().finalize().as_bytes(),
+    marks,
+  })
+}
+
+/// The bookmarks' works an import's landing moves its greens by ([`wanted_works`]).
+struct WantedWorks {
+  /// The repository's root green, which each bookmark's green is made from.
+  root: DbVolumeId,
+  /// Its version.
+  version: u64,
+  /// Its head changeset.
+  head: Option<Node>,
+  /// The import's room.
+  room: u64,
+  /// The import's name, each work's name.
+  name: [u8; 32],
+  /// Each bookmark and the changeset it moves to.
+  marks: Vec<(Vec<u8>, Node)>,
+}
+
+/// Counter: a unit-a-turn turn of an import's bookmark works (2b, main 01a20182's ruling of 2026-11-22 02:52: the landing
+/// builds none in its one step). Format: a counter name in the status report.
+pub(crate) const WORK_TURNS: &str = "vcs_store.hg_import.work_turns";
+
+/// Repository `id`'s done import's bookmark works, each built a unit a turn under half the shard's quantum as a push's are
+/// (`hg_push::built_works`), over the import's own index; a turn waiting for a text not at hand (one a landed segment
+/// let go) reads it from the node's changeset store between turns and brings it back. Kept in the done import for its
+/// landing. None where the shard's state is gone; refused as the work's refusal names it.
+async fn built_works(id: RepositoryId) -> Option<Result<(), ImportFailed>> {
+  let Some(wanted) = crate::state::with_state(|state| wanted_works(state, id)).flatten() else {
+    return Some(Ok(()));
+  };
+  let verified = Verified::default();
+  let mut admission = Admission::new(wanted.room);
+  for (mark, node) in &wanted.marks {
+    let moved = Move {
+      name: wanted.name,
+      base_version: wanted.version,
+      base: wanted.head.as_ref(),
+      head: node,
+    };
+    let begun = crate::state::with_state(|state| {
+      let pace = slates_merge::pace::Pace::new(slates_rt::futures::now_ns);
+      super::lent_state(state, |state| {
+        done_held(state, id, |held| {
+          tree::begin_work(
+            &moved,
+            (&verified, held),
+            (admission.left(), pace),
+            &mut admission,
+          )
+        })
+      })
+    })
+    .flatten()?;
+    let mut building = match begun {
+      Ok(building) => building,
+      Err(refused) => {
+        return Some(Err(ImportFailed::Landing(work_refused(
+          &refused,
+          wanted.room,
+        ))));
+      }
+    };
+    loop {
+      let advanced = crate::state::with_state(|state| {
+        let quantum = state.config.step_quantum_ns() / 2;
+        building
+          .pace()
+          .turn(slates_rt::futures::now_ns().saturating_add(quantum.max(1)));
+        state.count(WORK_TURNS, 1);
+        // The windows lent for the turn, as the landing's own step lends them (`super::lent_state`).
+        super::lent_state(state, |state| {
+          let engine = state.greens.get(&wanted.root)?;
+          done_held(state, id, |held| {
+            building.advance(&engine, (&verified, held))
+          })
+        })
+      })
+      .flatten()?;
+      match advanced {
+        None if building.ask_waited(admission.left()) => {
+          if !super::hg_view::answer_store_wants(&mut building, id).await {
+            return None;
+          }
+          let brought = crate::state::with_state(|state| {
+            super::lent_state(state, |state| brought_back(state, id, &mut building))
+          })
+          .flatten();
+          if brought.is_none() {
+            return Some(Err(ImportFailed::Landing(Refusal::ContentUnavailable)));
+          }
+        }
+        None => slates_rt::futures::yield_now().await,
+        Some(Ok(built)) => {
+          if admission
+            .charge(u64::try_from(built.increment.post_state.len()).unwrap_or(u64::MAX))
+            .is_err()
+          {
+            return Some(Err(ImportFailed::Landing(past_room(wanted.room))));
+          }
+          crate::state::with_state(|state| keep_work(state, id, mark.clone(), built.increment))?;
+          break;
+        }
+        Some(Err(refused)) => {
+          return Some(Err(ImportFailed::Landing(work_refused(
+            &refused,
+            wanted.room,
+          ))));
+        }
+      }
+    }
+  }
+  Some(Ok(()))
+}
+
+/// Runs `step` over repository `id`'s done import's index, its contents in the shard's content store, within a step its
+/// caller has lent the windows (`super::lent_state`); none where no import is done or no content store is held.
+fn done_held<T>(
+  state: &ShardState,
+  id: RepositoryId,
+  step: impl FnOnce(&IndexHeld<'_>) -> T,
+) -> Option<T> {
+  let Some(Importing {
+    stage: Stage::Done { imported, .. },
+    ..
+  }) = state.vcs_stores.imports.get(&id)
+  else {
+    return None;
+  };
+  let content = state.vcs_stores.content.as_ref()?;
+  Some(step(&IndexHeld::new(&imported.index, content)))
+}
+
+/// The text `building` was given for the file revision it waited for, brought back into the content store by the
+/// identities repository `id`'s done import's index names; none where nothing was given or the store refused it.
+fn brought_back(
+  state: &mut ShardState,
+  id: RepositoryId,
+  building: &mut tree::WorkBuild,
+) -> Option<()> {
+  let (path, node, text) = building.take_given()?;
+  // Brought back within the room its bytes take, lent to the content store for the step (a put outside it is refused
+  // `OverBudget`, as a push's works found).
+  let lend = u64::try_from(text.len()).unwrap_or(u64::MAX);
+  super::within_budget(state, lend, |stores| {
+    let VcsStores {
+      imports, content, ..
+    } = stores;
+    let Some(Importing {
+      stage: Stage::Done { imported, .. },
+      ..
+    }) = imports.get(&id)
+    else {
+      return None;
+    };
+    let content = content.as_mut()?;
+    slates_hg::push::held::bring_back_file((&imported.index, content), (&path, &node), &text).ok()
+  })
+}
+
+/// Keeps `work`, bookmark `mark`'s, in repository `id`'s done import for its landing.
+fn keep_work(
+  state: &mut ShardState,
+  id: RepositoryId,
+  mark: Vec<u8>,
+  work: slates_merge::engine::Increment,
+) {
+  if let Some(Importing {
+    stage: Stage::Done { works, .. },
+    ..
+  }) = state.vcs_stores.imports.get_mut(&id)
+  {
+    works.insert(mark, work);
+  }
+}
+
+/// Repository `id`'s done import's bookmark works built whole, for a test that holds the shard's state and lands it in
+/// one call ([`land_imported`]); [`built_works`] builds them a unit a turn.
+#[cfg(test)]
+fn built_works_whole(state: &mut ShardState, id: RepositoryId) -> Result<(), ImportFailed> {
+  let Some(wanted) = wanted_works(state, id) else {
+    return Ok(());
+  };
+  let mut admission = Admission::new(wanted.room);
+  for (mark, node) in &wanted.marks {
+    let moved = Move {
+      name: wanted.name,
+      base_version: wanted.version,
+      base: wanted.head.as_ref(),
+      head: node,
+    };
+    let built = super::lent_state(state, |state| {
+      let engine = state.greens.get(&wanted.root)?;
+      done_held(state, id, |held| {
+        tree::work(
+          &moved,
+          &engine,
+          (&Verified::default(), held),
+          admission.left(),
+          &mut admission,
+        )
+      })
+    })
+    .ok_or(ImportFailed::Landing(Refusal::ContentUnavailable))?
+    .map_err(|refused| ImportFailed::Landing(work_refused(&refused, wanted.room)))?;
+    keep_work(state, id, mark.clone(), built.increment);
+  }
+  Ok(())
 }
 
 /// `ImportRefused { PastRoom }` naming the import's room.
@@ -989,6 +1232,11 @@ pub(crate) async fn run(id: RepositoryId) -> Option<Result<Box<Finished>, Import
     match turned {
       Ok(Turned::More) => {}
       Ok(Turned::Done(finished)) => {
+        // Its bookmarks' works, a unit a turn (2b, main's ruling of 2026-11-22 02:52): the landing builds none.
+        if let Err(failed) = built_works(id).await? {
+          crate::state::with_state(|state| abandon(state, id))?;
+          return Some(Err(failed));
+        }
         // Its record names its contents by identity (A-729 part 2), so its landing commits only once the shard's image
         // holding them is published (durable before named, A-727 slice b's barrier); one not published gives the import
         // back.
