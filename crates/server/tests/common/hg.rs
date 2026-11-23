@@ -15,7 +15,7 @@ use slates_store::owner::StoreOwner;
 use slates_store::store::Sizing;
 
 use super::anchor::{Anchor, held_anchor, source_of};
-use super::client::connect;
+use super::client::{channel_account, connect};
 use super::target::{TargetDir, target_dir};
 
 /// Shape: the daemon's shards.
@@ -141,9 +141,12 @@ pub(crate) fn serve(name: &str, extra: &str) -> Served {
     })
     .unwrap();
   let token = format!("{name}-token-{}", std::process::id());
+  // The account the daemon authenticated this client's channel as, on every platform: a Unix channel's peer uid, a
+  // Windows channel's the daemon's mapping of its token (never `getuid`, which Windows has none of), as the test that
+  // enrolls the token will be served as.
   let principal = Principal::Uid {
     host: client.daemon_status().unwrap().anchor,
-    uid: rustix::process::getuid().as_raw(),
+    uid: channel_account(&daemon, client.client_id()),
   };
   let material = CredentialMaterial::HttpToken {
     id: slates_server::credentials::token_id(token.as_bytes()),

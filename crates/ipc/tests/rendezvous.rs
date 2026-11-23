@@ -506,7 +506,17 @@ fn poll_while_serving(listener: &mut Listener, instance: &str) -> (slates_ipc::C
 /// closes with it.
 fn serve_until_connected(
   listener: &mut Listener,
+  claim: slates_ipc::Claim,
+) -> (slates_ipc::Connected, Longest, Vec<slates_ipc::Accepted>) {
+  serve_until_connected_named(listener, claim, "slates-claim")
+}
+
+/// [`serve_until_connected`], naming each region it makes `{prefix}-{pid}-{n}`, so a test can tell its own regions from
+/// its siblings' in the descriptor table they share (the tests run on parallel threads of one process).
+fn serve_until_connected_named(
+  listener: &mut Listener,
   mut claim: slates_ipc::Claim,
+  prefix: &str,
 ) -> (slates_ipc::Connected, Longest, Vec<slates_ipc::Accepted>) {
   let pid = std::process::id();
   let started = Instant::now();
@@ -523,7 +533,7 @@ fn serve_until_connected(
         let region = REGIONS_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Prepared {
           region: ClientRegion::create(
-            &format!("slates-claim-{pid}-{region}"),
+            &format!("{prefix}-{pid}-{region}"),
             client_id,
             0,
             geometry(),
@@ -549,6 +559,66 @@ fn serve_until_connected(
       "the answered claim connects within the claim wait"
     );
   }
+}
+
+/// Format: the name the descriptor test makes its regions under, which no other test here uses, so its count of this
+/// process's region descriptors sees its own alone.
+#[cfg(target_os = "linux")]
+const LEAK_REGION_PREFIX: &str = "slates-cr-leak";
+/// Shape: the connections the descriptor test makes and lets go: more than one, so a descriptor left by every
+/// connection is told from a fixed cost.
+#[cfg(target_os = "linux")]
+const LEAK_CONNECTS: usize = 8;
+
+/// How many of this process's descriptors name a memory object made under `prefix`: the region a connection holds on
+/// either end (the daemon end's own, the client's).
+#[cfg(target_os = "linux")]
+fn region_descriptors(prefix: &str) -> usize {
+  let named = format!("memfd:{prefix}-");
+  let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+    return 0;
+  };
+  entries
+    .flatten()
+    .filter(|entry| {
+      std::fs::read_link(entry.path()).is_ok_and(|target| target.to_string_lossy().contains(&named))
+    })
+    .count()
+}
+
+/// §4.7 "Rendezvous" (docs/bugs/2026-11-23-every-linux-client-connect-left-its-regions-descriptor-open.md): a client
+/// that connects and leaves holds nothing of its region afterwards. Do: in this process, connect [`LEAK_CONNECTS`]
+/// times through the rendezvous, each claim served by the daemon end here under a region name of this test's own;
+/// count this process's descriptors naming those regions while each connection lives, then let it and the daemon's
+/// side of it go; count again after the last. Expect: a live connection's region is counted (so the count is not
+/// vacuous), and after the last none is left. Before 2026-11-23 the client passed the descriptor it received to an open
+/// that duplicates a handed-off number and closes only the duplicate, so every connection left one, holding its
+/// region's memory: a nemesis run's test process held 18,950 and its next spawn met `EMFILE`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_client_that_connects_and_leaves_holds_no_descriptor_of_its_region() {
+  toy_seal::install();
+  let instance = format!("test-leak-{}", std::process::id());
+  let mut listener = Listener::open(&instance, None).unwrap();
+  let mut while_connected = Vec::with_capacity(LEAK_CONNECTS);
+  for _ in 0..LEAK_CONNECTS {
+    let claim = begin_connect_as(&instance, 0).unwrap();
+    let (connected, _, accepted) =
+      serve_until_connected_named(&mut listener, claim, LEAK_REGION_PREFIX);
+    while_connected.push(region_descriptors(LEAK_REGION_PREFIX));
+    drop(connected);
+    drop(accepted);
+  }
+  let after = region_descriptors(LEAK_REGION_PREFIX);
+  assert!(
+    while_connected.iter().all(|count| *count > 0),
+    "a live connection's region is counted: {while_connected:?}"
+  );
+  assert_eq!(
+    after, 0,
+    "no descriptor of a region outlives its connection ({LEAK_CONNECTS} connections; counted while each lived: \
+     {while_connected:?})"
+  );
 }
 
 /// AUD-29-20 (found on CI 2026-10-01: a Node SDK recovery failed every call `OsRefused { call: "recvmsg",
