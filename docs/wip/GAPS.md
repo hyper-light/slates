@@ -4371,7 +4371,10 @@
 > alone. Stock `svnsync` never sets a mirror's UUID (`svnsync.c` `do_initialize`), so each `svnadmin create` mirror
 > held a random one. The HTTP edge reports the imported dump's UUID (OPTIONS and PROPFIND, checked). `mirror_dump_of`
 > now gives each mirror `MIRROR_UUID`, as `svn-matrix.sh` does
-> (`docs/bugs/2026-11-23-the-svnsync-use-row-compared-two-random-mirror-uuids.md`). Owed: main's rerun of (B).
+> (`docs/bugs/2026-11-23-the-svnsync-use-row-compared-two-random-mirror-uuids.md`). The rerun (r12, 112e694e7) left
+> one more of the harness's: revision 0's lengths still counted the `svn:sync-*` lines the comparison dropped, and the
+> source URL differs by leg. The mirror's sync properties are now deleted before the dump, which is compared whole
+> (`a_mirrors_dump_is_the_same_whatever_url_it_was_synced_from`). Owed: main's red and green of that test, and (B).
 > **R4, recovery replays a revision record a turn at a time (2026-11-20, w-svn; Ada's close list; found by w-git's sweep):**
 > a Subversion revision's record was replayed whole in one recovery or rebuild turn (`replay_svn` -> `commit_record`),
 > every text it brought deltified in one step, so one large revision held its shard. Now `RevisionReplay`

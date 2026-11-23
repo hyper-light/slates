@@ -70,6 +70,16 @@ const FILE: &str = "file";
 /// dumps would otherwise differ by on every run whatever the server.
 const MIRROR_UUID: &str = "00000000-0000-4000-8000-00000000a703";
 
+/// Format: the revision properties `svnsync` keeps on a mirror's revision 0 once a sync has ended (Subversion 1.15.1
+/// `svn_props.h`: `SVNSYNC_PROP_FROM_URL`, `SVNSYNC_PROP_FROM_UUID`, `SVNSYNC_PROP_LAST_MERGED_REV`; its lock and
+/// `currently-copying` are gone by then). Each names the mirror's source, a URL every leg has its own of, so the
+/// comparison deletes them before the dump.
+const MIRROR_SYNC_PROPERTIES: [&str; 3] = [
+  "svn:sync-from-url",
+  "svn:sync-from-uuid",
+  "svn:sync-last-merged-rev",
+];
+
 /// Shape: the shards of each test's daemon, as `tests/cli.rs` starts one.
 const SHARDS: &str = "2";
 
@@ -2993,8 +3003,8 @@ fn rdump_of(leg: &UseLeg, scratch: &str) -> String {
   }
 }
 
-/// An `svnsync` mirror of `leg`'s repository made under `root`, given [`MIRROR_UUID`], as `svnadmin dump` reads it (its
-/// own sync properties left out), or the step that failed.
+/// An `svnsync` mirror of `leg`'s repository made under `root`, given [`MIRROR_UUID`], as `svnadmin dump` reads it once
+/// its own sync properties ([`MIRROR_SYNC_PROPERTIES`]) are deleted, or the step that failed.
 fn mirror_dump_of(leg: &UseLeg, (scratch, root): (&str, &str)) -> String {
   let mirror = format!("{root}/mirror-of-{}", leg.svn.session);
   tool("svnadmin", scratch, &["create", &mirror]);
@@ -3025,13 +3035,23 @@ fn mirror_dump_of(leg: &UseLeg, (scratch, root): (&str, &str)) -> String {
   if code != 0 {
     return format!("sync exit {code}: {}", leg.plain(&err));
   }
-  // The mirror's own sync properties name its source: left out, as each names its own server.
-  let (_, out, _) = tool("svnadmin", scratch, &["dump", "-q", &mirror]);
+  // The mirror's own sync properties name its source, each leg its own server: deleted from the mirror, so its dump
+  // is what it mirrors, its length headers too (a line filter left revision 0's lengths counting them).
+  for name in MIRROR_SYNC_PROPERTIES {
+    let (code, out, err) = tool(
+      "svnadmin",
+      scratch,
+      &["delrevprop", &mirror, "-r", "0", name],
+    );
+    if code != 0 {
+      return format!("delrevprop {name} exit {code}: {out}{err}");
+    }
+  }
+  let (code, out, err) = tool("svnadmin", scratch, &["dump", "-q", &mirror]);
+  if code != 0 {
+    return format!("dump exit {code}: {out}{err}");
+  }
   out
-    .lines()
-    .filter(|line| !line.contains("svn:sync-"))
-    .collect::<Vec<_>>()
-    .join("\n")
 }
 
 /// The writing verbs `writes` as one session of edits on `leg`, then its last four revisions' log with the server's own
