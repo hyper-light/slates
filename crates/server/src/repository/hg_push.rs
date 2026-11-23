@@ -1465,8 +1465,22 @@ async fn unbundled(
       Some(outcome)
     }
   };
-  let committed = matches!(outcome, Some(PushOutcome::Accepted(_)));
-  let _ = crate::state::with_state(move |state| run.settle(state, committed));
+  // Committed, its file revisions are noted for a home and let go a turn at a time (`hg_run::let_go_committed`): a
+  // whole history's are hundreds of thousands, never one poll's work. Else its run is forgotten.
+  if matches!(outcome, Some(PushOutcome::Accepted(_))) {
+    let (repository, contents) = run.committed();
+    super::hg_run::let_go_committed(
+      repository,
+      contents,
+      (
+        super::hg_run::TEXT_BYTES_LET_GO,
+        super::hg_run::TEXTS_PINNED,
+      ),
+    )
+    .await;
+  } else {
+    let _ = crate::state::with_state(move |state| run.abandon(state));
+  }
   outcome
 }
 
@@ -2066,15 +2080,15 @@ pub(crate) fn changeset_landing(
 /// [`hg_run::segment_changeset`] and the store's own `land`, waited for on a thread of its own
 /// (`crate::test_store::land_blocking`); its record the run's reference (v11). A fork that brought no revision, or
 /// already names its run, lands nothing. A refused segment is the landing's refusal. The run is kept whatever the
-/// landing then answers: a test's pushes land one at a time.
+/// landing then answers: its caller settles it once its landing answers ([`settled_whole`]), as the driver does.
 #[cfg(test)]
 pub(crate) fn store_blocking(
   state: &mut ShardState,
   repository: RepositoryId,
   forked: &mut Forked,
-) -> Result<(), PushOutcome> {
+) -> Result<Option<super::hg_run::Run>, PushOutcome> {
   if forked.record.is_some() || forked.intaken.logs.is_empty() {
-    return Ok(());
+    return Ok(None);
   }
   let unlanded = || PushOutcome::refused(&abort(UNLANDED.to_vec()));
   let mut run = super::hg_run::Run::new(repository);
@@ -2094,10 +2108,31 @@ pub(crate) fn store_blocking(
     landed_segment(state, (&mut run, &segment), sequence, ok)
   });
   let reference = run.reference(forked.room);
-  run.settle(state, true);
-  landed?;
-  forked.record = Some(reference.ok_or_else(unlanded)?);
-  Ok(())
+  if let Err(outcome) = landed {
+    run.abandon(state);
+    return Err(outcome);
+  }
+  let Some(reference) = reference else {
+    run.abandon(state);
+    return Err(unlanded());
+  };
+  forked.record = Some(reference);
+  Ok(Some(run))
+}
+
+/// A test's run settled once its push's landing answered (`accepted`), as the driver settles one, every revision at once:
+/// a test holds the shard's state through its push. Committed, its file revisions noted and let go; else forgotten.
+#[cfg(test)]
+fn settled_whole(state: &mut ShardState, run: Option<super::hg_run::Run>, accepted: bool) {
+  let Some(run) = run else {
+    return;
+  };
+  if accepted {
+    let (repository, contents) = run.committed();
+    super::hg_run::let_go_landed(state, Some(repository), &contents);
+  } else {
+    run.abandon(state);
+  }
 }
 
 /// [`land`] for a test on a shard (main's ruling of 2026-11-20: the one landing path, the store first): `prepared`'s
@@ -2109,10 +2144,13 @@ pub(crate) fn land_stored(
   (principal, repository): (&Principal, RepositoryId),
   mut prepared: Prepared,
 ) -> Landed {
-  if let Some(forked) = prepared.forked.as_mut() {
-    let _ = store_blocking(state, repository, forked);
-  }
-  land(state, (principal, repository), prepared)
+  let run = match prepared.forked.as_mut() {
+    Some(forked) => store_blocking(state, repository, forked).ok().flatten(),
+    None => None,
+  };
+  let landed = land(state, (principal, repository), prepared);
+  settled_whole(state, run, landed.answer.is_ok());
+  landed
 }
 
 /// A push's segment changeset `sequence` landed (`ok`) or refused by the store ([`hg_run`]): counted; landed, the run
@@ -2878,10 +2916,12 @@ pub(crate) fn land_in(
     fresh => fresh,
   };
   let mut forked = forked;
-  if let Some(fork) = forked.as_mut()
-    && let Err(outcome) = store_blocking(state, repository, fork)
-  {
-    return Some(outcome);
+  let mut run = None;
+  if let Some(fork) = forked.as_mut() {
+    match store_blocking(state, repository, fork) {
+      Ok(stored) => run = stored,
+      Err(outcome) => return Some(outcome),
+    }
   }
   // Its works planned as the landing judges them and built whole, as the driver plans and builds them a unit a turn.
   let name = push_name(repository, bundle);
@@ -2911,6 +2951,7 @@ pub(crate) fn land_in(
       {
         state.count(vcs_store::RELEASE_REFUSED, 1);
       }
+      settled_whole(state, run, false);
       return Some(outcome);
     }
   };
@@ -2929,9 +2970,16 @@ pub(crate) fn land_in(
     forked,
     (&mut works, room),
   ) {
-    Landing::Done(outcome) => outcome,
+    Landing::Done(outcome) => {
+      let accepted = matches!(outcome, Some(PushOutcome::Accepted(_)));
+      settled_whole(state, run, accepted);
+      outcome
+    }
     // Built from the plan its landing judges, it misses no work.
-    Landing::Unbuilt(_) => None,
+    Landing::Unbuilt(_) => {
+      settled_whole(state, run, false);
+      None
+    }
   }
 }
 
