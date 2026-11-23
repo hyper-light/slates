@@ -791,6 +791,51 @@ pub(crate) fn landed_changes_committed() {
   });
 }
 
+/// What this shard's homes hold beside the content store (the memory status's `mem.gauge.homes.*`): its region holds,
+/// the windows of the objects they name, its landed records and their bytes as the shard image keeps them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HomesHeld {
+  /// The objects held for the region ([`REGION_HELD`]).
+  pub(crate) region_holds: u64,
+  /// The windows of those objects counted for their pin ([`REGION_WINDOWS`]).
+  pub(crate) region_windows: u64,
+  /// The landed records ([`LANDED`]).
+  pub(crate) landed_records: u64,
+  /// Their bytes in the image's form: each window's identity and its record.
+  pub(crate) landed_record_bytes: u64,
+}
+
+/// What this shard's homes hold now ([`HomesHeld`]).
+pub(crate) fn held() -> HomesHeld {
+  let count = |len: usize| u64::try_from(len).unwrap_or(u64::MAX);
+  let region_holds = REGION_HELD.with(|held| held.try_borrow().map_or(0, |held| count(held.len())));
+  let region_windows = REGION_WINDOWS.with(|windows| {
+    windows
+      .try_borrow()
+      .map_or(0, |windows| count(windows.len()))
+  });
+  let (landed_records, landed_record_bytes) = LANDED.with(|landed| {
+    landed.try_borrow().map_or((0, 0), |landed| {
+      let bytes = landed.values().fold(0u64, |sum, record| {
+        let record = match record {
+          Landed::Pack(_) => LANDED_AT_BYTES,
+          Landed::Hg(hg) => HG_LANDED_HEAD.saturating_add(hg.path.len()),
+        };
+        sum.saturating_add(count(
+          slates_vcs::content::IDENTITY_BYTES.saturating_add(record),
+        ))
+      });
+      (count(landed.len()), bytes)
+    })
+  });
+  HomesHeld {
+    region_holds,
+    region_windows,
+    landed_records,
+    landed_record_bytes,
+  }
+}
+
 /// The landed records a recovered shard image carried, taken back as they were: no store is read for them.
 pub(crate) fn restore_landed(records: &[(ContentId, Landed)]) {
   LANDED.with(|landed| {
@@ -847,11 +892,14 @@ pub(crate) const LANDED_BROUGHT_BACK: &str = "vcs_store.homes.landed_brought_bac
 /// it holds. True where it is held here whole after (brought back, or never let go).
 pub(crate) async fn bring_back_landed(identity: ContentId) -> bool {
   let (disk, (away, revisions)) = crate::state::with_state(|state| {
+    // Each physical window once: an object may hold the same window at several offsets (two identical windows are one
+    // entry), and the first bring-back puts it back for all of them (codex-review, 2026-11-22).
+    let mut seen = std::collections::BTreeSet::new();
     let mut away: Vec<(ContentId, LandedAt, u64)> = Vec::new();
     let mut revisions: Vec<HgLanded> = Vec::new();
     if let Some(content) = state.vcs_stores.content() {
       for (window, _) in content.object_layout(&identity) {
-        if !content.is_away(&window) {
+        if !content.is_away(&window) || !seen.insert(window) {
           continue;
         }
         match landed(&window) {
@@ -884,19 +932,32 @@ pub(crate) async fn bring_back_landed(identity: ContentId) -> bool {
   }
   if let Some(disk) = disk {
     for (window, at, len) in away {
+      // One another read brought back meanwhile is back: nothing to read.
+      let still_away = crate::state::with_state(|state| {
+        state
+          .vcs_stores
+          .content()
+          .is_some_and(|content| content.is_away(&window))
+      })
+      .unwrap_or(false);
+      if !still_away {
+        continue;
+      }
       let Some(bytes) = landed_bytes(&disk, at, len).await else {
         return false;
       };
       let back = crate::state::with_state(|state| {
-        let back = super::within_budget(state, len, |stores| {
-          stores
-            .content_mut()
-            .is_some_and(|content| content.bring_back(&window, &bytes).is_ok())
+        // Put back, or back already (another read put it back while this one read the store): either way it is held.
+        let (put, held) = super::within_budget(state, len, |stores| {
+          stores.content_mut().map_or((false, false), |content| {
+            let put = content.bring_back(&window, &bytes).is_ok();
+            (put, put || !content.is_away(&window))
+          })
         });
-        if back {
+        if put {
           state.count(LANDED_BROUGHT_BACK, 1);
         }
-        back
+        held
       })
       .unwrap_or(false);
       if !back {

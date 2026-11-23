@@ -492,7 +492,26 @@ pub(crate) const FILE_TEXTS_PINNED: &str = "vcs_store.hg_import.file_texts_pinne
 pub(crate) fn land_imported(state: &mut ShardState, id: RepositoryId) -> Result<(), ImportFailed> {
   land_segments_blocking(state, id)?;
   built_works_whole(state, id)?;
-  land(state, id)
+  // A test holds the shard's state through its landing: its revisions let go at once.
+  let contents = land(state, id)?;
+  let (freed, pinned) = crate::repository::hg_run::let_go_windows(state, Some(id), &contents);
+  state.count(FILE_TEXT_BYTES_LET_GO, freed);
+  state.count(FILE_TEXTS_PINNED, pinned);
+  Ok(())
+}
+
+/// Notes a landed import's file revisions `contents` for a home and lets them go, a turn at a time, once its landing is
+/// durable (`repository::import`'s answer): its counters.
+pub(crate) async fn let_go_landed_import(
+  id: RepositoryId,
+  contents: Vec<slates_hg::filerev::FileContents>,
+) {
+  crate::repository::hg_run::let_go_committed(
+    id,
+    contents,
+    (FILE_TEXT_BYTES_LET_GO, FILE_TEXTS_PINNED),
+  )
+  .await;
 }
 
 /// Every segment repository `id`'s import has cut, landed on the changeset store, waiting on a thread of its own for
@@ -790,7 +809,10 @@ fn give_back(state: &mut ShardState, index: HgIndex) {
 /// in the caller's transaction when one is open, its index put in its store's place between the register's guard and
 /// the entry's apply. Refused, nothing is recorded, and the index and everything it held are given back. `Busy` while
 /// the import is still under way, `NoStore` when none is held for `id`.
-pub(crate) fn land(state: &mut ShardState, id: RepositoryId) -> Result<(), ImportFailed> {
+pub(crate) fn land(
+  state: &mut ShardState,
+  id: RepositoryId,
+) -> Result<Vec<slates_hg::filerev::FileContents>, ImportFailed> {
   let (mut imported, room, mut works, (run, named, name), landed_contents) =
     match state.vcs_stores.imports.remove(&id) {
       Some(Importing {
@@ -835,13 +857,10 @@ pub(crate) fn land(state: &mut ShardState, id: RepositoryId) -> Result<(), Impor
   match appended {
     Ok(_) => {
       state.count(LANDED, 1);
-      // Landed, its texts noted for a home and let go once more: its works brought back what they read (A-767 C1 step
-      // 2b), and its index now holds them, by which a home's read brings one back (goal 93 item 2b(b)).
-      let (freed, pinned) =
-        crate::repository::hg_run::let_go_windows(state, Some(id), &landed_contents);
-      state.count(FILE_TEXT_BYTES_LET_GO, freed);
-      state.count(FILE_TEXTS_PINNED, pinned);
-      Ok(())
+      // Landed, its file revisions are its caller's to note for a home and let go once more, a turn at a time once its
+      // landing is durable (`hg_run::let_go_committed`, `let_go_landed_import`): its works brought back what they read
+      // (A-767 C1 step 2b), and its index now holds them, by which a home's read brings one back (goal 93 item 2b(b)).
+      Ok(landed_contents)
     }
     Err(refusal) => {
       // The run landed unnamed: the next landing takes the last the register names, plus one (decision 2).

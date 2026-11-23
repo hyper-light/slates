@@ -45,7 +45,15 @@ const SERVER_TARGETS: [&str; 4] = [
 
 /// Shape: the tests the lane leaves out, each with why. A skipped test still runs in every other lane;
 /// only its assertion is one the instrumentation itself falsifies.
-const SKIPPED: [(&str, &str); 7] = [
+const SKIPPED: [(&str, &str); 8] = [
+  (
+    "heap::tests::a_live_allocation_shows_in_the_heaps_bytes_in_use_and_reserved",
+    "ThreadSanitizer's runtime replaces malloc with its own allocator, so glibc's `mallinfo2` reports arenas \
+     the program never allocated from: the nightly's run 45017186325 read reserved 0 and in use 0 before and after \
+     a live megabyte, the system allocator marked read. The heap's own figures are the system allocator's, which \
+     the instrumentation stands in for; the test passes uninstrumented and under Miri, which reads no system \
+     allocator",
+  ),
   (
     "region::tests::locking_a_small_region_is_reported_by_the_os_within_one_page",
     "ThreadSanitizer ignores mlock (its runtime prints `ThreadSanitizer ignores mlock/mlockall/munlock/\

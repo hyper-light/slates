@@ -3151,13 +3151,7 @@ mod tests {
     let mut store = ContentStore::new(1 << 22, window).unwrap();
     let bytes = patterned(window * 3 + 100);
     let object = store.put_object(&bytes).unwrap();
-    let windows: Vec<ContentId> = bytes.chunks(window).map(ContentId::of).collect();
-    for id in &windows {
-      store.hold(id).unwrap();
-      store.hold(id).unwrap();
-      assert!(store.mark_landed(id));
-      assert_eq!(store.let_go(id), Err(LetGoRefused::Shared));
-    }
+    let windows = landed_with_two_more_holders(&mut store, &bytes, window);
     let pinned = windows[1];
     assert_eq!(
       store.let_go_landed(&pinned, Some("homes")),
@@ -3169,10 +3163,8 @@ mod tests {
     assert_eq!(freed, u64::try_from(bytes.len() - window).unwrap());
     assert!(!store.is_away(&pinned));
     assert!(
-      windows
-        .iter()
-        .filter(|id| **id != pinned)
-        .all(|id| store.is_away(id))
+      all_away_but(&store, &windows, &pinned),
+      "every other window freed"
     );
     let (freed, kept) = store.let_go_object_landed(&object, &|_| None);
     assert_eq!((freed, kept), (u64::try_from(window).unwrap(), 0));
@@ -3181,6 +3173,31 @@ mod tests {
       store.object_bytes(&object, u64::try_from(bytes.len()).unwrap()),
       Some(bytes)
     );
+  }
+
+  /// The windows of `bytes`, put in `store` a window of `window` bytes each, each held twice more and marked landed (a
+  /// landed push's holders: its staged pack, its repository's), each refused a plain `let_go` as shared.
+  fn landed_with_two_more_holders(
+    store: &mut ContentStore,
+    bytes: &[u8],
+    window: usize,
+  ) -> Vec<ContentId> {
+    let windows: Vec<ContentId> = bytes.chunks(window).map(ContentId::of).collect();
+    for id in &windows {
+      store.hold(id).unwrap();
+      store.hold(id).unwrap();
+      assert!(store.mark_landed(id));
+      assert_eq!(store.let_go(id), Err(LetGoRefused::Shared));
+    }
+    windows
+  }
+
+  /// Whether every one of `windows` but `kept` is let go from `store`.
+  fn all_away_but(store: &ContentStore, windows: &[ContentId], kept: &ContentId) -> bool {
+    windows
+      .iter()
+      .filter(|id| *id != kept)
+      .all(|id| store.is_away(id))
   }
 
   /// A-767 C1 step 2b (main's ruling (a) of 2026-11-22 02:52: the image records the windows let go). Do: put an object

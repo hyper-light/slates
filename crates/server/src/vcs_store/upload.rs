@@ -772,6 +772,29 @@ pub(crate) const STREAM_COUNTED: [StreamCount; 18] = [
   ("vcs_store.git_upload.stops", |c| c.stops),
 ];
 
+/// Counter: deflate states the shard's thread made, none kept to take (A-868, `slates_git::store::deflaters`): O(the
+/// deflates under way at once on the shard), never O(objects × trials). Format: a counter name.
+pub(crate) const DEFLATE_STATES_MADE: &str = "vcs_store.git_deflate.states_made";
+/// Counter: deflate states taken again from those the shard's thread keeps (A-868). Format: a counter name.
+pub(crate) const DEFLATE_STATES_REUSED: &str = "vcs_store.git_deflate.states_reused";
+/// Counter: deflate states dropped, given back past what a thread keeps or let go idle (A-868). Format: a counter name.
+pub(crate) const DEFLATE_STATES_DROPPED: &str = "vcs_store.git_deflate.states_dropped";
+
+/// Counts on `state` the deflate states its thread made, took again and dropped since this was last called (A-868):
+/// the git crate counts them on the thread, a shard's.
+pub(crate) fn count_deflaters(state: &mut ShardState) {
+  let counts = slates_git::store::deflaters::take_counts();
+  for (name, by) in [
+    (DEFLATE_STATES_MADE, counts.made),
+    (DEFLATE_STATES_REUSED, counts.reused),
+    (DEFLATE_STATES_DROPPED, counts.dropped),
+  ] {
+    if by > 0 {
+      state.count(name, by);
+    }
+  }
+}
+
 /// A-639's stream as upload-pack's pack source on the owner shard (the module doc): each turn on the shard's clock, at
 /// the owner's exchange, within the step quantum the shard keeps when the step was lent.
 #[derive(Clone, Copy, Debug)]
@@ -795,8 +818,10 @@ impl ShardPacks {
     }
   }
 
-  /// Counts on `state` what the stream's writes counted in this step ([`STREAM_COUNTED`]).
+  /// Counts on `state` what the stream's writes counted in this step ([`STREAM_COUNTED`]), and the deflate states its
+  /// shard thread made and took again ([`count_deflaters`]).
   fn count_on(&self, state: &mut ShardState) {
+    count_deflaters(state);
     let Some((before, after)) = self.counted else {
       return;
     };

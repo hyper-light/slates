@@ -4188,6 +4188,14 @@ fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
     REPOSITORY,
     crate::repository::hg_run::TEXT_BYTES_LET_GO,
   );
+  let (turns, longest, quantum) = crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
+    let counted = |kind| state.refusals.get(kind).copied().unwrap_or(0);
+    (
+      counted(crate::repository::hg_run::LET_GO_TURNS),
+      counted(crate::repository::hg_run::LET_GO_LONGEST_TURN_NS),
+      state.config.step_quantum_ns(),
+    )
+  });
   let tip = crate::verbs::hex_of(&made[TEXTS_CHANGESETS - 1].node);
   let cloned = hg_getbundle(edge, &name, &tip);
   daemon.stop();
@@ -4203,6 +4211,11 @@ fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
     );
   }
   assert!(gone > 0, "some window let go");
+  // At the derived budget (half the shard's step quantum) the commit's let-go is spread over turns too.
+  println!(
+    "the commit's let-go: {turns} turns, the longest {longest} ns of a {quantum} ns quantum"
+  );
+  assert!(turns > 1, "the commit's let-go spread over turns: {turns}");
   assert!(
     let_go >= u64::try_from(gone * TEXT_BYTES).unwrap(),
     "{let_go} bytes let go"
@@ -4213,6 +4226,45 @@ fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
     cloned.2.windows(64).any(|window| window == &last[..64]),
     "the clone carries the last file's bytes"
   );
+}
+
+/// Main's order of 2026-11-22 (CI 45110563116: on x86, shard 0 spun 1,045 ms of CPU in one poll of `hg_push::unbundle`
+/// as a whole-history push's committed file revisions were noted and let go in one step, and the daemon was killed).
+/// Do: start a two-shard daemon over loopback TLS; push [`a_long_push_of_own_texts`]'s line with the let-go's turn
+/// budget at a nanosecond (`hg_run::TEST_LET_GO_TURN_NS`); read the let-go's counters. Expect the push `200`; its file
+/// revisions let go over a turn each, one at a time ([`TEXTS_CHANGESETS`] turns: a turn ends at the first revision past
+/// its budget, a revision being the let-go's unit), the longest counted; every file's window let go. Red before: one
+/// turn took them all (1 turn, 642,500 ns in debug).
+#[test]
+fn a_committed_pushs_file_revisions_are_let_go_a_turn_at_a_time() {
+  let (identity, certificate) = identity();
+  let (daemon, _instance) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  create_empty_hg(&daemon, &name);
+  let quantum = crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
+    crate::repository::hg_run::TEST_LET_GO_TURN_NS.with(|budget| budget.set(1));
+    state.config.step_quantum_ns()
+  });
+  let (_, texts, pushed) = a_long_push_of_own_texts(&daemon, (port, &certificate), &name);
+  let turns = counted_on(&daemon, REPOSITORY, crate::repository::hg_run::LET_GO_TURNS);
+  let longest = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::repository::hg_run::LET_GO_LONGEST_TURN_NS,
+  );
+  let held = windows_held(&daemon, texts);
+  daemon.stop();
+  println!("let go over {turns} turns, the longest {longest} ns of a {quantum} ns quantum");
+  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
+  assert_eq!(
+    turns,
+    u64::try_from(TEXTS_CHANGESETS).unwrap(),
+    "a file revision a turn"
+  );
+  assert!(longest > 0, "the longest turn counted");
+  assert!(held.iter().all(|here| !here), "every file's window let go");
 }
 
 /// codex-review's region-object pin (2026-11-22, main's order to w-hg) through a real push, and goal 93 item 2b(b). Do:
@@ -4801,4 +4853,103 @@ fn a_create_at_a_commit_let_go_lands() {
     );
   }
   assert!(brought > 0, "the commit's window brought back");
+}
+
+/// A repository name with no `.git` that routes to [`REPOSITORY`]'s partition, as a clone of `/project` names one.
+fn bare_name_on_the_repositorys_partition() -> String {
+  (0u32..)
+    .map(|serial| format!("bare-{serial}"))
+    .find(|name| usize::from(crate::verbs::owner_of_name(name, usize::from(SHARDS))) == REPOSITORY)
+    .expect("a name routes there")
+}
+
+/// The path of an LFS answer's `href` for `action` ("upload", "verify" or "download"): what follows its authority.
+fn href_of(body: &str, action: &str) -> Option<String> {
+  let at = body.find(&format!("\"{action}\""))?;
+  let rest = body.get(at..)?;
+  let href = rest.find("\"href\":\"")? + "\"href\":\"".len();
+  let rest = rest.get(href..)?;
+  let url = rest.get(..rest.find('"')?)?;
+  let path = url.get(url.find("//")? + 2..)?;
+  Some(path.get(path.find('/')?..)?.to_owned())
+}
+
+/// main 01a20182's r95 (stock_git_verbs' lfs row, git-lfs 3.8.1's trace: the batch at `/project.git/info/lfs` answered
+/// with upload and verify hrefs at `/project/info/lfs/objects/<oid>?refspec=refs/heads/master`, and every PUT to them
+/// answered `404` in 0.3 ms, so the object was never kept and the clone's download found nothing). Do: create `bare-N`,
+/// a git repository named with no `.git`; as its owner, ask the batch API at `/bare-N.git/info/lfs/objects/batch` for
+/// an upload of a MiB object on `refs/heads/master`, as git-lfs asks a clone of `/bare-N`; PUT the object to the upload
+/// href the batch handed back, POST its verify href, then batch a download and GET its href. Expect: the batch `200`
+/// with an upload href; the PUT `200`; the verify `200`; the download's GET `200` with the object's bytes. Red before:
+/// the PUT `404`, sent to Subversion's WebDAV site as every method git's smart HTTP never sends was; then the download
+/// `413`, a MiB past the edge's request room.
+#[test]
+fn an_lfs_object_uploaded_to_the_href_its_batch_hands_out_is_kept_and_downloaded() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = bare_name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let object: Vec<u8> = (0..1u32 << 20)
+    .map(|at| u8::try_from(at % 251).unwrap())
+    .collect();
+  let oid: String = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &object)
+    .as_ref()
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect();
+  let lfs_type = "application/vnd.git-lfs+json";
+  let batch = |operation: &str| {
+    let body = format!(
+      "{{\"operation\":\"{operation}\",\"transfers\":[\"basic\"],\"ref\":{{\"name\":\"refs/heads/master\"}},\
+       \"objects\":[{{\"oid\":\"{oid}\",\"size\":{}}}],\"hash_algo\":\"sha256\"}}",
+      object.len()
+    );
+    let request = format!(
+      "POST /{name}.git/info/lfs/objects/batch HTTP/1.1\r\nHost: localhost\r\n{}\r\nAccept: {lfs_type}\r\n\
+       Content-Type: {lfs_type}\r\nContent-Length: {}\r\n\r\n{body}",
+      owner_bearer(),
+      body.len()
+    );
+    let (status, body) = exchange(port, &certificate, request.as_bytes());
+    (status, String::from_utf8_lossy(&body).into_owned())
+  };
+  let send = |method: &str, path: &str, kind: &str, body: &[u8]| {
+    let mut request = format!(
+      "{method} {path} HTTP/1.1\r\nHost: localhost\r\n{}\r\nAccept: {lfs_type}\r\nContent-Type: {kind}\r\n\
+       Content-Length: {}\r\n\r\n",
+      owner_bearer(),
+      body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(body);
+    exchange(port, &certificate, &request)
+  };
+  let uploading = batch("upload");
+  let upload = href_of(&uploading.1, "upload");
+  let verify = href_of(&uploading.1, "verify");
+  let put = upload
+    .as_deref()
+    .map(|path| send("PUT", path, "application/octet-stream", &object).0);
+  let verified = verify.as_deref().map(|path| {
+    let body = format!("{{\"oid\":\"{oid}\",\"size\":{}}}", object.len());
+    send("POST", path, lfs_type, body.as_bytes()).0
+  });
+  let downloading = batch("download");
+  let got = href_of(&downloading.1, "download").map(|path| {
+    let request = format!(
+      "GET {path} HTTP/1.1\r\nHost: localhost\r\n{}\r\nAccept: application/octet-stream\r\n\r\n",
+      owner_bearer()
+    );
+    exchange(port, &certificate, request.as_bytes())
+  });
+  daemon.stop();
+  assert_eq!(uploading.0, 200, "{}", uploading.1);
+  assert!(upload.is_some(), "an upload href: {}", uploading.1);
+  assert_eq!(put, Some(200), "the PUT to {upload:?}");
+  assert_eq!(verified, Some(200), "the verify at {verify:?}");
+  assert_eq!(downloading.0, 200, "{}", downloading.1);
+  let got = got.expect("a download href");
+  assert_eq!((got.0, got.1 == object), (200, true), "the download");
 }

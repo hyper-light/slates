@@ -258,6 +258,10 @@
 >   tail with the neighbours' share level (x86 p999 3.2-6.1 -> ~1.9 ms). But a wakeup's p99 pins at one tick (kick ->
 >   run 998-999 µs, the client's wake 983-989 µs under `PREEMPT_LAZY` at `HZ=1000`), so a loaded edit and merge floors
 >   at about 1.3-2.0 ms p99. It also cost x86's quiet p50 30-40%, so it is rejected too.
+>   Naps on a thread's own timer (arms G+E and H, main's; BENCHMARKS "84a on Linux: naps on a thread's own timer"):
+>   rejected. A napping client alone (H) put loaded accept p99 over 1 ms in 5 of 5 arm64 rounds against main's 2, and
+>   CI's runners have no RealtimeKit to grant the real-time class (run 45115263387: no package, unit or bus name;
+>   `RLIMIT_RTPRIO` 0; ubuntu-latest is now Ubuntu 26.04.1 on kernel 7.0.0-1020-azure).
 >   **Open (main to Ada):** 84a's 1 ms loaded bar on Linux. In the fair class it is below the kernel's 1 ms tick, and
 >   in the real-time class the client's own time-share code waits whole slices. The measured floor is about one tick a
 >   hop, 1.3-2.0 ms p99.
@@ -689,6 +693,17 @@
 >   The test-only one-call landing builds a push's works as the driver does, planned and then built over the
 >   store's read-through (`works_whole`); `Works::Whole` and the one-call `tree::work` arm are gone, and `prepare` takes
 >   the view alone. The store-made-texts oracle compares a file by the identities its row names.
+> - The committed let-go bounded a turn at a time BUILT (2026-11-22, w-hg; main's order on CI 45110563116: on x86, push-all
+>   refused 503 after shard 0 spun 1,045 ms of CPU in one poll of `hg_push::unbundle`, the commit noting and letting go
+>   the whole push's file revisions in one step): `hg_run::let_go_committed` takes them a turn at a time within half
+>   the shard's step quantum, a revision its unit, yielding between, from the push's task once its entry commits and
+>   from the import's answer once its landing is durable (`hg_import::land` hands them back; none after a refused
+>   commit). Counted `vcs.hg.landed_let_go_turns`, `..._longest_turn_ns`. Held by
+>   `a_committed_pushs_file_revisions_are_let_go_a_turn_at_a_time` (a nanosecond's budget: red 1 turn of 642,500 ns,
+>   now 120, a revision each) and the long push's let-go over more than one turn at the derived budget. A revision is
+>   40-63 us in debug against a 6 us wake-estimate quantum, so a turn is half the quantum plus one revision. OPEN
+>   (main's): the restart spin (`serve_loop`'s second poll, 1,040 ms) is not yet attributed; the image carries a piece
+>   a noted window.
 > - A refused finish's windows given back BUILT (2026-11-22, w-hg; main's routing of w-svn's sibling sweep): the
 >   intake's last step of a file text took its writer out of the intake, so a refused node check or `finish_object`
 >   dropped it with its whole windows held and nothing to read them; both now abandon it
@@ -866,6 +881,9 @@
 > the readers still synchronous are covered: (a) the deferred green build through views.rs (w-shared), (b) a push's thin
 > bases through `IndexedObjects::object` and (c) its policy and signature reads (w-git). Owed too: the git/git mirror
 > clone's stall at 183,511 bytes (main's sample), before the pack.
+> A-868 BUILT (2026-11-22, w-git; main's queue item 4): every deflate made its own zlib state, an object or a level
+> sampled (72 for a 42-object clone); now it takes its shard thread's kept state, reset and set to its level, given back
+> on drop (1 made, 71 taken again), counted `vcs_store.git_deflate.states_*`, let go idle. Owed: nothing in git's crate.
 > A-864 BUILT (2026-11-22, w-git; main's r17): a reused pushed entry was rebuilt to be checked (inflated, its base and
 > itself reconstructed, named), so git/git's clone, every entry reused, ran past 120 s. Now each row keeps its entry's
 > raw length, CRC32 and base (git's pack index, A-864); reuse checks the CRC32 and copies, no object read; a miss is
@@ -9307,7 +9325,10 @@
 >   asks nothing (`a_call_looks_at_the_daemons_life_at_twice_its_wait_not_at_the_old_reply_deadline`; the driver
 >   suite's `a_call_whose_daemon_is_gone_ends_before_the_old_reply_deadline`, main's to run). Still owed for the async
 >   loops: the departure as an event (Linux's control socket, macOS's exit-watch kqueue and, on Windows, the bridge
->   thread waiting beside the process handle could each tell the loop at once). macOS's `MOUNT_CALL_DEADLINE` since A-517 (2026-11-18, g251b; C-b's third
+>   thread waiting beside the process handle could each tell the loop at once). What that costs now, measured (w-perf, 2026-11-23): a call outstanding at its daemon's exit ends at the doubling's next
+>   look, up to the time already waited after the exit: a look due at 35.0 s against an exit at 26.3 s under
+>   ThreadSanitizer (nightly 45017186325, window 25.2 s), 14.1 s against 7.2 s on plain macOS (`lone_daemon`, ea3240fd8).
+>   Not built (main's close order, 2026-11-23). macOS's `MOUNT_CALL_DEADLINE` since A-517 (2026-11-18, g251b; C-b's third
 >   part): the mount's MOUNT call for the root handle (`slates_bridge_nfs::client::exchange`) bounded each of its
 >   connect, send and receive by one liveness budget, so a live daemon that answered later failed the mount; it now
 >   waits while its connection lives, as the hard NFS mount it makes does (Apple's `mount_nfs(8)`), a daemon gone

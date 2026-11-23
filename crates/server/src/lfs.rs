@@ -456,7 +456,14 @@ pub(crate) fn answer(state: &mut ShardState, call: &LfsCall<'_>) -> Answer {
     query: call.query,
     body: call.body,
   };
-  let mut admission = slates_git::Admission::new(call.room);
+  // A download's answer is the object's bytes: admitted the room its repository's shard admits now, never one request's
+  // region (A-855's rule for an answer; main 01a20182's r95: a 1 MiB object's download answered `413` within the edge's
+  // request room once its upload was kept). Every other endpoint answers within the request's room.
+  let room = match call.routed.endpoint {
+    slates_git::lfs::serve::Endpoint::Download(_) => call.room.max(state.store.admittable()),
+    _ => call.room,
+  };
+  let mut admission = slates_git::Admission::new(room);
   if asks_locks(&call.routed.endpoint) {
     let mut locks = LogLocks {
       state,
