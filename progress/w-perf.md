@@ -461,3 +461,15 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
     D', D'', E; R9 median cost 12-20 -> 17-27 us).
   - Not run by me: clippy (Ada's §8; main's wall). Owed: main's confirming round on main.
   - Queue empty.
+- 2026-11-23 ~15:00 PST (goal 93 memory term):
+  - LANDED a472a4ca4: GAPS, A-872's RealtimeKit route parked (main's rulings recorded).
+  - LANDED 5cc3f261b: crates/server/tests/hg_push_lifetimes.rs (#[ignore]d; sampled by site, x86_64 size class, life;
+    SLATES_HG_PUSH_SOURCE=~/.cache/w-perf/hg-src, CARGO_PROFILE_DEV_OPT_LEVEL=2).
+  - LANDED cf7c67662 (merge c9e130878): the store's TextCache in chunks of the mapped floor, the oldest given back
+    whole; Store::make through two reused buffers; text_at still lends. Red/green tests/text_cache_heap.rs: 6,606,904
+    live bytes grown -> 90,424. Push of Mercurial's history after: sub-floor >=1 s/live 4.18 GB -> 0.68 GB; live at end
+    under floor 366 -> 189 MB; [128K, floor) churn 3.52 -> 2.72 GB.
+  - Finding for main: the cache's bound still grows to the longest chain's bytes (no longer needed with the buffers):
+    360 MB of mapped chunks held at the push's end.
+  - Split with w-hg: intake::rebuilt, HgIndex::revision_text, Taker::file_base are w-hg's (C1).
+  - Pushed once before rerunning after a merge that brought crates/mem/src/arena.rs; reran the store tests after: green.
