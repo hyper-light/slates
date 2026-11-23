@@ -296,7 +296,11 @@
 > daemon held 6,193 MiB: arenas 5,166 MiB (the stored content, w-hg's holdings; to w-store's disk store under
 > STORAGE), segment 229, content object 2, the rest ~796 (~90 of it an idle daemon's). **Found:** `slates status`'s
 > heap row counts allocated, not resident, bytes: ~920-960 MiB on an idle daemon whose RSS is 35-87 MiB (1, 4 and 23
-> shards), about 900 MB allocated and never touched, constant across shard counts (not yet traced). > **The status memory report's residency FIXED (g226, 2026-11-21, w-sizing's option (a)):** on macOS a memory status
+> shards), about 900 MB allocated and never touched, constant across shard counts (not yet traced). **The row FIXED
+> (w-interop, 2026-11-22, main's (b1); `docs/bugs/2026-11-22-the-heap-row-counted-large-blocks-spans-as-resident.md`):**
+> the row's resident added the large path's live mappings' whole spans; `heap` is now the system allocator alone and
+> `large` the mapped blocks, resident by their pages in RAM. The ~900 MB never touched is those spans (main's r41: 12
+> blocks, 1.27 GB mapped, 13.7 MB written); naming and sizing them from the work is (b2), open. > **The status memory report's residency FIXED (g226, 2026-11-21, w-sizing's option (a)):** on macOS a memory status
 > read the arenas 0 MiB after a 256 MiB burst, so R3's split came back empty: the sweep walked every range of each
 > shard's slice whole (4 GiB arena region, ~28 GiB of content object and segment a shard on the test daemon) and the
 > arenas' figure waited for it to complete. Now the sweep walks only what can hold pages (the arena's held runs, the

@@ -790,8 +790,8 @@ fn stock_git_pushes_and_clones_tags_of_a_blob_a_tree_and_a_tag() {
 
 /// Format: the kinds of mapped memory `slates status --json` reports under `memory` (§4.14, A-232's gotcha): the anchor
 /// segment, the anchor content object (the shards' arenas among its bytes), the shards' arenas, the clients' ring
-/// regions, and the heap.
-const MEMORY_KINDS: [&str; 5] = ["segment", "content", "arenas", "regions", "heap"];
+/// regions, the heap (the system allocator), and the large blocks mapped on their own.
+const MEMORY_KINDS: [&str; 6] = ["segment", "content", "arenas", "regions", "heap", "large"];
 
 /// §4.14 and A-232's gotcha (the bug record of 2026-11-20, the anchor's kills of w-hg's daemon): the daemon reports its
 /// own memory by kind, read in process with nothing suspended, so no inspector need suspend it (`vmmap`, `heap`), which
