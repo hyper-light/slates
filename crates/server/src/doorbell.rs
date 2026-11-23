@@ -5,6 +5,9 @@
 //! Shutdown wakes and joins it. Linux clients write eventfds directly, and the control shard
 //! awaits rendezvous readiness through its driver, so Linux starts no watcher thread.
 //!
+//! **Whether it runs in macOS's real-time band (A-868).** The thread reports, once at its start, whether it holds Mach's
+//! time-constraint policy ([`DoorbellThread::real_time`]), which the daemon exposes.
+//!
 //! **Only the shard rung is kicked (A-381).** Until 2026-11-18 each ring kicked every shard: at 1,000 clients over 23
 //! shards on a Mac Studio each shard parked and woke about 7,500 times a second whatever its own clients asked (a
 //! shard's parks were alike on shards serving one connection and two), so each request a client sent to a parked shard
@@ -25,12 +28,16 @@ pub struct DoorbellThread {
   handle: Option<JoinHandle<()>>,
   /// The daemon's own handle on the doorbell, rung to wake the thread for its stop.
   waker: DoorbellWaiter,
+  /// Whether the thread holds macOS's time-constraint policy, as it read its own at its start: `None` where the policy is
+  /// not macOS's, or the thread could not say.
+  real_time: Option<bool>,
 }
 
 impl std::fmt::Debug for DoorbellThread {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("DoorbellThread")
       .field("running", &self.handle.is_some())
+      .field("real_time", &self.real_time)
       .finish()
   }
 }
@@ -46,18 +53,35 @@ impl DoorbellThread {
     rang: &'static AtomicBool,
   ) -> Result<DoorbellThread, slates_ipc::IpcError> {
     let (stop, stop_signal) = channel();
+    let (held, held_signal) = std::sync::mpsc::sync_channel(1);
     let handle = std::thread::Builder::new()
       .name("slates-doorbell".to_owned())
-      .spawn(move || run(&waiter, &kicks, &stop_signal, rang))
+      .spawn(move || {
+        if held.send(slates_machine::time_constraint::holds()).is_err() {
+          slates_machine::log_line!(
+            "slates-server: the doorbell thread's policy went unreported: its starter was gone"
+          );
+        }
+        run(&waiter, &kicks, &stop_signal, rang);
+      })
       .map_err(|error| slates_ipc::IpcError::OsRefused {
         call: "spawn the doorbell thread",
         code: error.raw_os_error(),
       })?;
+    // The thread's first act is its report, so this waits for no work of its own.
+    let real_time = held_signal.recv().ok().flatten();
     Ok(DoorbellThread {
       stop: Some(stop),
       handle: Some(handle),
       waker,
+      real_time,
     })
+  }
+
+  /// Whether the thread holds macOS's time-constraint policy, as it read its own at its start: `None` off macOS, or where
+  /// the thread could not say.
+  pub fn real_time(&self) -> Option<bool> {
+    self.real_time
   }
 
   /// Stops the thread and joins it.

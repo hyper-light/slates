@@ -1972,6 +1972,12 @@ impl Daemon {
       .collect()
   }
 
+  /// Whether the daemon's doorbell thread holds macOS's time-constraint policy (A-868): `None` where the daemon runs no
+  /// doorbell thread (Linux) or the policy is not the platform's.
+  pub fn doorbell_real_time(&self) -> Option<bool> {
+    self.doorbell.as_ref().and_then(DoorbellThread::real_time)
+  }
+
   /// What each shard's start did, in shard order (`crate::StartReport`): how it was sliced and its heaviest piece. A
   /// shard whose start has not ended answers `None`; an observation the daemon could not make is its typed refusal.
   pub fn shard_start_reports(&self) -> Result<Vec<Option<crate::StartReport>>, ObserveError> {
