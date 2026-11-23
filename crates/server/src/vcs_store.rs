@@ -1727,18 +1727,39 @@ pub(crate) struct SealedPush {
 /// Puts a push's names' rows `bytes` into the shard's content store as one content, held for its record (A-724 piece
 /// 8c), lent the room the shard can admit for the step and settled after: its identity; none where refused.
 pub(crate) fn put_names(state: &mut ShardState, bytes: &[u8]) -> Option<slates_vcs::ContentId> {
+  put_rows(state, bytes, slates_vcs::rows::put)
+}
+
+/// [`put_names`], each window of it the store holds let go brought back from `bytes` (`rows::put_whole`): what a
+/// recovery that read the content from the node's store or the region puts, so it reads whole by its identity
+/// (codex-review, 2026-11-22: a pack read from disk was put, answered its identity, and read as none). A record's replay
+/// over content the image restored puts it with [`put_names`], which keeps the windows the image let go out of RAM
+/// (A-767 C1 step 2b).
+pub(crate) fn put_names_whole(
+  state: &mut ShardState,
+  bytes: &[u8],
+) -> Option<slates_vcs::ContentId> {
+  put_rows(state, bytes, slates_vcs::rows::put_whole)
+}
+
+/// [`put_names`]' body, its put `put`.
+fn put_rows(
+  state: &mut ShardState,
+  bytes: &[u8],
+  put: fn(&mut ContentStore, &[u8]) -> Result<slates_vcs::ContentId, slates_vcs::rows::RowsRefused>,
+) -> Option<slates_vcs::ContentId> {
   let need = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
   lend(&mut state.store, &mut state.vcs_stores, need);
-  let put = {
+  let kept = {
     let lent = Lent::new(&mut state.store, &mut state.vcs_stores);
     lent
       .stores
       .content
       .as_mut()
-      .map(|content| slates_vcs::rows::put(content, bytes))
+      .map(|content| put(content, bytes))
   };
   settle(state);
-  put.and_then(Result::ok)
+  kept.and_then(Result::ok)
 }
 
 /// Takes a hold of the content `identity` for the record that will name it (A-722's record v4: the push's pack, held by
@@ -2377,6 +2398,10 @@ fn based_moves(
 /// hold its moves alone. Refused, nothing of the store changed and the push still holds its objects.
 pub(crate) fn commit(state: &mut ShardState, sealed: &mut SealedPush) -> Result<(), GitRefused> {
   let repository = sealed.repository;
+  // The pack the staging put in the content store, where its changeset landed on the node's store (A-767 C5).
+  let landed_pack = (sealed.landed > 0)
+    .then(|| sealed.push.stored_pack())
+    .flatten();
   let unkept = within_budget(state, 0, |stores| {
     let (content, store) = stores.git(repository).ok_or(GitRefused::NoStore)?;
     commit_moves(
@@ -2388,14 +2413,39 @@ pub(crate) fn commit(state: &mut ShardState, sealed: &mut SealedPush) -> Result<
   })?;
   sealed.objects = RecordWriter::default();
   state.count(VALUE_UNKEPT, unkept);
-  // A landed push's pack stays resident: its let-go (goal 93 item 2b) is safe only once every git read of the
-  // repository brings a let-go window back, and some do not yet. Run r52 (2026-11-22, the big Studio, main 6f6e87d82):
-  // once git/git's push ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's
-  // tag peel among the reads), so stock git read "possible repository corruption" on ls-remote and every clone. So no
-  // landed pack is let go or owed here until w-git's read-through covers every reader; the let-go itself
-  // (`let_go_landed_pack`, `let_go_owed`) is unchanged and tested directly (read_through's tests), and nothing reaches it
-  // from a push. GAPS: goal 93 item 2b.
+  // A synchronous audit shard's history can bring nothing back (a bring-back awaits the node's store), so its landed
+  // packs stay resident ([`KEEP_LANDED`]); a daemon's edges and tasks, and every let-go test, let them go.
+  #[cfg(test)]
+  let landed_pack = landed_pack.filter(|_| !KEEP_LANDED.with(core::cell::Cell::get));
+  if let Some((pack, _)) = landed_pack {
+    // Never under a fetch's answer or an encoding, nor under a push still deciding its refs (a non-atomic push's later
+    // refs, each an entry of its own, read its objects): owed until the push ends or the repository goes idle. Every git
+    // read brings a let-go window back, so its pack may go once landed: the fetch side's (A-864: the stream's stops and
+    // look-ahead, the encoding's stops, an answer held before its pack and made again once the window is back), a
+    // push's thin bases and its policy and signature reads (w-git), the deferred green build (w-shared), w-shared's
+    // codex-review gates and w-hg's half of 2b(b). The guard r52 put here (c9bb36dc5) lifted on main 01a20182's word of
+    // 2026-11-22 (GAPS, goal 93 item 2b).
+    if landed_let_go_may(state, repository, 0) {
+      let_go_landed_pack(state, &pack);
+    } else {
+      state
+        .vcs_stores
+        .landed_owed
+        .entry(repository)
+        .or_default()
+        .push(pack);
+    }
+  }
   Ok(())
+}
+
+// The tests' switch, kept on the shard that serves the history, so a test's daemon alone meets it.
+#[cfg(test)]
+thread_local! {
+  /// Whether a push's commit keeps its landed pack resident on this shard (true: the guard's old behaviour): set by
+  /// `test_store::audit_on_stored_shard` for a synchronous history, whose reads are the store's own calls with no driver
+  /// to bring a let-go window back, as the edges', the green build's and the rebuild's do.
+  pub(crate) static KEEP_LANDED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
 /// Lets go again the window `window` a read brought back ([`read_through::bring_back`]) once the read has passed it (w-git's
@@ -3418,12 +3468,26 @@ fn put_changeset(
   wanted: &ChangesetWanted,
   read: ChangesetRead,
 ) -> Result<(), ReplayRefused> {
+  let pack_read = read.pack.is_some();
   for (bytes, identity) in [(read.names, wanted.named.0), (read.pack, wanted.packed.0)] {
     if let Some(bytes) = bytes
-      && put_names(state, &bytes) != Some(identity)
+      && put_names_whole(state, &bytes) != Some(identity)
     {
       return Err(ReplayRefused::Unlanded);
     }
+  }
+  // The pack read whole for the replay is a landed push's, as its commit let it go (goal 93 item 2b): owed its let-go
+  // again, run once a recovery ends (`recover_repository`), so a warm restart leaves out of RAM what its predecessor let
+  // go; a live rebuild's owes it to the repository's idle give-back, as a live commit under a push does.
+  #[cfg(test)]
+  let pack_read = pack_read && !KEEP_LANDED.with(core::cell::Cell::get);
+  if pack_read {
+    state
+      .vcs_stores
+      .landed_owed
+      .entry(id)
+      .or_default()
+      .push(wanted.packed.0);
   }
   state.vcs_stores.landed_changeset(id, wanted.sequence);
   state.count(CHANGESET_READ, 1);
@@ -4173,6 +4237,10 @@ async fn recover_repository(
     slices.unit_done().await;
   }
   remake_greens(state, record, slices).await;
+  // The landed packs its replay read whole from the node's store, let go again as their commits let them go
+  // ([`put_changeset`]), once its greens' maps are made again: a warm restart leaves out of RAM what its predecessor
+  // let go.
+  let_go_owed(state, record.id);
 }
 
 /// Each of `record`'s greens' map of its head made again as the live store holds it (A-664 part 3), and a Subversion
@@ -4288,7 +4356,7 @@ async fn rebuild_turns(id: RepositoryId, generation: u64) {
       let fetched =
         homes::read_in_region(origin, &shards, identity, crate::fleet::live_budget()).await;
       let put = crate::state::with_state(|state| match fetched {
-        Some(bytes) if put_names(state, &bytes) == Some(identity) => {
+        Some(bytes) if put_names_whole(state, &bytes) == Some(identity) => {
           state.count(NAMES_FETCHED, 1);
           true
         }
@@ -4615,8 +4683,9 @@ fn abandon_git_replay(state: &mut ShardState, id: RepositoryId) {
   }
 }
 
-/// A git or Subversion rebuild's end: the store lent again, then each git green's map made again in slices by its build
-/// (`paths::whole_build`), whose end makes any commit a submit owed of it.
+/// A git or Subversion rebuild's end: the store lent again (the landed packs its replay read whole owed their let-go,
+/// [`put_changeset`], as a live commit owes one, to the repository's idle give-back), then each git green's map made
+/// again in slices by its build (`paths::whole_build`), whose end makes any commit a submit owed of it.
 fn rebuild_ended(state: &mut ShardState, id: RepositoryId) {
   state.vcs_stores.rebuild_turns.remove(&id);
   state.vcs_stores.rebuilding.remove(&id);

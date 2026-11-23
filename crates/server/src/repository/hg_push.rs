@@ -2168,10 +2168,28 @@ fn landed_segment(
   state.count(super::hg_run::SEGMENTS_LANDED, 1);
   run.landed(sequence, &segment.contents);
   // Durable on the node's changeset store, which serves them from here: its file texts leave the content store, their
-  // entries kept, each brought back by the read that meets it (`hg_run`, "Let go").
-  super::hg_run::let_go_landed(state, None, &segment.contents);
+  // entries kept, each brought back by the read that meets it (`hg_run`, "Let go"). What the push held just before,
+  // its admission and its texts resident, is its high-water's sample.
+  let kept = super::hg_run::contents_bytes(state, &segment.contents);
+  let freed = super::hg_run::let_go_landed(state, None, &segment.contents);
+  let (held, texts) = run.texts_landed((kept, freed));
+  state.count_max(PUSH_HELD_HIGH_BYTES, held);
+  state.count_max(PUSH_TEXTS_HIGH_BYTES, texts);
   Ok(())
 }
+
+/// Counter: the most a push held at once, bytes (goal 93, the 410 MiB bar; main's ruling of 2026-11-23): its admission
+/// held (its bookkeeping and the texts its open segment charged) and its file texts still in the content store, sampled
+/// as each segment lands, before that segment's let-go. Bounded by the work, it is about one segment's whatever the
+/// history. Format: a counter name in the status report.
+pub(crate) const PUSH_HELD_HIGH_BYTES: &str = "vcs.hg.push_held_high_bytes";
+/// Counter: the file texts' share of [`PUSH_HELD_HIGH_BYTES`] at its most, bytes: those still in the content store with
+/// the landing segment's; the rest is the push's admission held. Format: a counter name in the status report.
+pub(crate) const PUSH_TEXTS_HIGH_BYTES: &str = "vcs.hg.push_texts_high_bytes";
+/// Counter: the most bytes a push's fork's index held once its intake ended (`HgIndex::held_bytes`): a row a revision of
+/// every log, which grows with the history and becomes the repository's index. Format: a counter name in the status
+/// report.
+pub(crate) const PUSH_ROWS_BYTES: &str = "vcs.hg.push_rows_bytes";
 
 /// Whether `forked` was made from an index another push has replaced since (A-720 part 2b).
 fn is_stale(state: &ShardState, repository: RepositoryId, forked: &Forked) -> bool {
@@ -2378,7 +2396,18 @@ async fn take_sliced(
   {
     return Some(Err(outcome));
   }
-  Some(Ok((settled(taking)?, run)))
+  let forked = settled(taking)?;
+  // The fork's rows as its intake ended: they grow with the history (`PUSH_ROWS_BYTES`).
+  let _ = crate::state::with_state(|state| {
+    let rows = vcs_store::lent_state(state, |state| {
+      state
+        .vcs_stores
+        .content()
+        .map_or(0, |content| forked.fork.held_bytes(content))
+    });
+    state.count_max(PUSH_ROWS_BYTES, rows);
+  });
+  Some(Ok((forked, run)))
 }
 
 /// `take_sliced`'s begin: the intake begun after any waits, cutting its kept texts into segments ([`hg_run`]), then
@@ -2438,7 +2467,7 @@ async fn stepped_to_end(
     if last {
       taking.cut_rest();
     }
-    if let Err(outcome) = segments_landed(repository, taking, room, run).await? {
+    if let Err(outcome) = segments_landed(repository, taking, (room, *admitted), run).await? {
       return Some(Err(outcome));
     }
     match stepped {
@@ -2473,10 +2502,11 @@ async fn stepped_to_end(
 async fn segments_landed(
   repository: RepositoryId,
   taking: &mut Taking,
-  room: &mut Admission,
+  (room, admitted): (&mut Admission, u64),
   run: &mut super::hg_run::Run,
 ) -> Option<Result<(), PushOutcome>> {
   while let Some(segment) = taking.take_segment() {
+    run.admission_held(admitted.saturating_sub(room.left()));
     if let Err(outcome) = segment_landed(repository, taking, &segment, run).await? {
       return Some(Err(outcome));
     }

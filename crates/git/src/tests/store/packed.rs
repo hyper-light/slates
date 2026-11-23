@@ -618,6 +618,56 @@ fn a864_an_entry_whose_crc_misses_is_rebuilt_and_the_clone_is_whole() {
   assert_eq!(objects_of(&pack), expected);
 }
 
+/// `clone` streamed from `repository` within `room` bytes of admission, a turn at a time, bringing back before the next
+/// turn the window of `pack` (its bytes, and its identity and length `root`) each turn stopped at (`Upload::waiting`,
+/// cut from the pack as the node's store gives it), each stop checked to name a window of `pack` and to read next in
+/// it (`Upload::reading_next`): the pack streamed, and the stops made.
+fn streamed_bringing_back(
+  repository: &Repository,
+  store: &mut ContentStore,
+  (clone, room): (super::Answer, u64),
+  (pack, root): (&[u8], (ContentId, u64)),
+) -> (Vec<u8>, usize) {
+  use crate::store::{Progress, Turn, Upload};
+  let mut upload = Upload::new(clone, repository);
+  let mut clock = super::Ticks(0);
+  let mut admission = Admission::new(room);
+  let mut out = Vec::new();
+  let mut stops = 0;
+  for _ in 0..10_000 {
+    let turn = Turn {
+      clock: &mut clock,
+      exchange: super::EXCHANGE,
+      quantum_ns: u64::MAX,
+    };
+    let progress = upload
+      .advance(repository, store, turn, &mut admission, &mut out)
+      .unwrap_or_else(|refused| {
+        panic!("the same clone within {room} bytes after {stops} window stops: {refused:?}")
+      });
+    if progress == Progress::Done {
+      break;
+    }
+    let Some(waited) = upload.waiting() else {
+      continue;
+    };
+    stops += 1;
+    assert_eq!((waited.pack, waited.len), root);
+    assert!(
+      upload
+        .reading_next()
+        .is_some_and(|next| next.pack == root.0)
+    );
+    let (window, start, len) = store
+      .away_window(&waited.pack, waited.len, waited.offset)
+      .expect("the window met is let go");
+    let from = usize::try_from(start).unwrap();
+    let to = from + usize::try_from(len).unwrap();
+    store.bring_back(&window, &pack[from..to]).unwrap();
+  }
+  (out, stops)
+}
+
 /// A-864 piece 2's invariant (main 01a20182's ruling of 2026-11-22: a turn stops cleanly at a unit boundary, nothing of
 /// the unit written, where it meets a let-go window). Do: land the `create` push in a store of 64-byte windows and
 /// stream its clone; then let every window of its pack go and stream the clone again, a turn at a time, bringing back
@@ -626,7 +676,6 @@ fn a864_an_entry_whose_crc_misses_is_rebuilt_and_the_clone_is_whole() {
 /// pack, and where the next turn reads (`Upload::reading_next`) lies in that pack.
 #[test]
 fn a864_a_turn_that_meets_a_let_go_window_stops_cleanly_and_the_clone_is_byte_identical() {
-  use crate::store::{Progress, Turn, Upload};
   let (repository, mut store, _, pack) = landed_create_in(PIECE2_WINDOW);
   let clone = super::Answer::objects(&super::reached_now(&repository, &store, 1));
   let mut measured = Admission::new(u64::MAX);
@@ -649,42 +698,7 @@ fn a864_a_turn_that_meets_a_let_go_window_stops_cleanly_and_the_clone_is_byte_id
     assert!(store.mark_landed(&window));
     store.let_go(&window).unwrap();
   }
-  let mut upload = Upload::new(clone, &repository);
-  let mut clock = super::Ticks(0);
-  let mut admission = Admission::new(room);
-  let mut out = Vec::new();
-  let mut stops = 0;
-  for _ in 0..10_000 {
-    let turn = Turn {
-      clock: &mut clock,
-      exchange: super::EXCHANGE,
-      quantum_ns: u64::MAX,
-    };
-    if upload
-      .advance(&repository, &store, turn, &mut admission, &mut out)
-      .unwrap_or_else(|refused| {
-        panic!("the same clone within {room} bytes after {stops} window stops: {refused:?}")
-      })
-      == Progress::Done
-    {
-      break;
-    }
-    if let Some(waited) = upload.waiting() {
-      stops += 1;
-      assert_eq!((waited.pack, waited.len), root);
-      assert!(
-        upload
-          .reading_next()
-          .is_some_and(|next| next.pack == root.0)
-      );
-      let (window, start, len) = store
-        .away_window(&waited.pack, waited.len, waited.offset)
-        .expect("the window met is let go");
-      let from = usize::try_from(start).unwrap();
-      let to = from + usize::try_from(len).unwrap();
-      store.bring_back(&window, &pack[from..to]).unwrap();
-    }
-  }
+  let (out, stops) = streamed_bringing_back(&repository, &mut store, (clone, room), (&pack, root));
   assert!(stops > 0, "a let-go window met");
   assert!(
     out == whole,
