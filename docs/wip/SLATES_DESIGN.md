@@ -61633,11 +61633,14 @@ name whatever their `cfg`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sdk_async.t
   on the region's Event and on the connect together, so a reply that landed before the SDK connected is signalled as
   it connects. Python's selector keeps the loopback socket (`enable_async_completion`), and one client signals one
   of the two (the other is refused `Unsupported`). Unix is unchanged.
-- **Proven (owed to main's diag run on windows-latest, no Windows build on the MacBook):**
+- **Proven (main's diag runs on windows-latest: red 45225292920 at main, "Unsupported fd type: UNKNOWN"; with the
+  change 45230459274 at 20cd9025e, `slates-ipc` 8 of 8, the addon built, the async lifecycle past its pipe):**
   - `slates-ipc`'s `the_windows_completion_pipe_is_opened_by_name_and_signals_only_an_armed_reply`: a second reader is
     refused `ERROR_PIPE_BUSY`, the pipe stays quiet for a fast-path reply and holds a nudge for an armed one.
   - `a_reply_that_landed_before_the_reader_connected_is_signalled_as_it_connects`: within half a second of the
     connect, under the bridge's one-second timed look.
   - `a_reader_of_another_process_is_cut_off_and_this_processs_reader_is_admitted`: the test binary run again opens the
     name first and is cut off with nothing read; this process's open is then admitted and nudged.
-  - The Node suites on windows-latest, the red at main and the green with this change.
+  - The Node suites on windows-latest: the red at main; with this change, 4 of 8 pass, and the other 4 (sync and
+    async alike) are refused `BudgetExceeded { available: 5722144768 }` at their first create. That refusal is the
+    Windows daemon's own sizing (w-win2's), and the suites' full green waits on it.

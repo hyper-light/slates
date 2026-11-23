@@ -6155,8 +6155,15 @@
 > adopts no Windows socket by descriptor (libuv's `uv_guess_handle`), and the SDK was handed the bridge's loopback
 > socket. **Built:** the Windows bridge signals the Node SDK through a named pipe that `async.mjs` opens by name
 > (`net.connect`), admitting only a reader of this process (`crates/ipc/src/completion_pipe.rs`). Python keeps the
-> socket. **Owed:** main's diag run on windows-latest (red at main, green with the change, with `slates-ipc`'s new
-> Windows tests and the other-process reader's), then windows-11-arm.
+> socket. **Proven (windows-latest, main's diag runs):**
+> - Red at main (run 45225292920): "Unsupported fd type: UNKNOWN".
+> - With the change (run 45230459274, 20cd9025e): `slates-ipc`'s Windows completion and pipe tests pass, 8 of 8, with
+>   the other-process reader's. The addon builds, and "Unsupported fd type" is gone: the async lifecycle gets past its
+>   completion pipe to the daemon's first create.
+>
+> **Not yet green:** the Node suites on Windows. 4 of 8 pass. The 4 that fail, sync and async alike, are refused
+> `BudgetExceeded { available: 5722144768 }` at their first create. That is the Windows daemon's own sizing (w-win's
+> leftover item 3, now w-win2's), not this change. **Owed:** the SDK lane rerun once that lands, then windows-11-arm.
 > **The Node SDK suites on Windows (2026-11-18, §4.7 status "the Node SDK suites end on Windows"; goal 88).** The three
 > Node suites had never run on Windows: CI's `sdk` job ran on `ubuntu-latest` and `macos-latest` alone. Main's diag run
 > 44384411115 (main da697d886) ran them on both Windows runners, and the step went past 70 minutes until cancelled, with

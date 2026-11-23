@@ -48,11 +48,18 @@ a selector) were not affected, and nothing was written wrongly.
 - `unsafe-budget.toml` (`slates-ipc` 169 → 179), `docs/wip/SLATES_DESIGN.md` (A-875), GAPS.
 
 ## Evidence
-- Before: CI run 45176536354, as quoted, on both Windows legs; the red reproduced by main's diag run on windows-latest
-  at main (the Node suites alone).
-- After: owed to main's diag run on windows-latest with this change: the Node suites, and `slates-ipc`'s
-  `the_windows_completion_pipe_is_opened_by_name_and_signals_only_an_armed_reply` and
-  `a_reply_that_landed_before_the_reader_connected_is_signalled_as_it_connects` and
-  `a_reader_of_another_process_is_cut_off_and_this_processs_reader_is_admitted`. The MacBook builds no Windows code;
-  main cross-linted `slates-ipc`'s library for both Windows targets (one complexity finding in `run_pipe`, split).
-  On macOS, unchanged: `slates-ipc --lib completion` 3 of 3 and `--test completion_memory` 1 of 1.
+- Before: CI run 45176536354, as quoted, on both Windows legs. Reproduced by main's diag run 45225292920 on
+  windows-latest at main.
+- After (diag run 45230459274, windows-latest, 20cd9025e):
+  - `slates-ipc`'s Windows completion and pipe tests pass, 8 of 8:
+    `the_windows_completion_pipe_is_opened_by_name_and_signals_only_an_armed_reply`,
+    `a_reply_that_landed_before_the_reader_connected_is_signalled_as_it_connects`,
+    `a_reader_of_another_process_is_cut_off_and_this_processs_reader_is_admitted`, and the stream tests.
+  - The addon builds, and "Unsupported fd type" is gone: the async lifecycle reaches the daemon's first create.
+  - 4 of the 8 Node tests pass, among them "the addon exposes the async low-level primitives".
+- Not yet: the other 4 Node tests, sync and async alike, are refused `BudgetExceeded { available: 5722144768 }` at
+  their first create. That is the Windows daemon's own sizing (w-win2's), not this change, and the suites' full green
+  on Windows waits on its fix.
+- Main cross-linted `slates-ipc` for both Windows targets; the one finding, `run_pipe`'s complexity, is split.
+- On macOS, unchanged: `slates-ipc --lib completion` 3 of 3, `--test completion_memory` 1 of 1, and the addon's
+  method-list test against a built addon.
