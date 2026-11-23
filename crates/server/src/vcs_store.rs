@@ -684,6 +684,18 @@ impl VcsStores {
         ("mem.gauge.vcs_content.charged_bytes", census.charged),
       ]);
     }
+    // The chunks the windows lie in and the windows let go from slabs still held (goal 93; `arena_windows`, "Slabs").
+    if let Some(windows) = chunk_windows(self) {
+      let slabs = windows.slab_census();
+      rows.extend([
+        ("mem.gauge.vcs_content.slabs", slabs.slabs),
+        ("mem.gauge.vcs_content.slab_freed_kept", slabs.freed_kept),
+        (
+          "mem.gauge.vcs_content.slab_freed_kept_bytes",
+          slabs.freed_kept_bytes,
+        ),
+      ]);
+    }
     let mut git = slates_git::store::RepositoryHeld::default();
     let (mut repositories, mut heads) = (0u64, 0u64);
     for store in self.entries.values() {

@@ -1014,7 +1014,9 @@
 >   131,425,429. Since then the chunk store asks the arena for the caller's own length, not its page-rounded block
 >   (`ChunkArena::alloc_asking`), so a window owner's asked bytes against its held name the page rounding; held by
 >   `a_windows_ask_is_its_own_length_and_its_hold_the_page_it_takes` (red: asked 16,384 of 16,384 held for four windows
->   of 100 bytes; now 400). The rounding's fix is the small-window slab (next piece).
+>   of 100 bytes; now 400). The rounding's fix, A-877, is BUILT: windows shorter than a granule share slabs of one granule,
+>   slots never written twice, a slab freed with its last window through A-64's deferred free (red: 3,276,800 bytes held
+>   for 200 windows of 1,151 bytes at a 16 KiB granule; now at most 245,760). Owed: main's arena-17.
 > - A Mercurial index's tail sealed by every append REVERTED (2026-11-23, w-perf; 0cd8ef36a reverted after main's
 >   arena-14, CI 45208924823: push-all's shard 0 spun past 1 s of CPU in `hg_push::segment` on all three legs and the
 >   watchdog killed the daemon). Each seal writes a run, and a push's fork never merges its runs (only the repository's
