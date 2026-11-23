@@ -275,6 +275,26 @@ impl Hook {
       stdout,
       stderr: ChildStream::Fd(words_write.as_fd()),
     });
+    // A test's foreign holder of the words stream (`HOLD_WORDS_ABROAD`): a plain `std::process::Command` child given the
+    // write end, as a spawn by anyone else in the process lands in the window between a macOS pipe and its close-on-exec.
+    #[cfg(test)]
+    if launch
+      .input
+      .env
+      .iter()
+      .any(|(name, _)| name == HOLD_WORDS_ABROAD)
+    {
+      let held = words_write
+        .try_clone()
+        .map_err(|error| start_refused(&error))?;
+      let _holder = std::process::Command::new("/bin/sleep")
+        .arg(HOLDER_SECONDS.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(held))
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|error| start_refused(&error))?;
+    }
     // This side's copies of the child's ends: dropped, so the words stream ends when the hook and what it started close
     // theirs, and its input when this side closes its own.
     drop((words_write, input_read));
@@ -473,7 +493,12 @@ impl Hook {
     }
   }
 
-  /// Bytes the words stream holds now, or its end (or a read error, which ends it too); none when it would wait.
+  /// Bytes the words stream holds now, or its end (or a read error, which ends it too); none when it would wait. Its end
+  /// is also when nothing of the hook's can write it any more (main 01a20182's ruling of 2026-11-22 ~17:30): the hook has
+  /// exited and its group holds nothing but it (`SpawnedChild::group_has_others`), so whatever still holds the stream is
+  /// a process the hook never started (another spawner's child that inherited it on macOS, or a child of the hook's that
+  /// left its group with `setsid`, which the group's kill never reached either). Every word written before is read
+  /// first; asked only when a read would wait after the exit, so a stream that ends at its hook's exit never asks.
   fn read_words(&mut self) -> Option<Happened> {
     let fd = self.words.as_ref()?;
     loop {
@@ -481,7 +506,14 @@ impl Hook {
         Ok(0) => break,
         Ok(read) => return Some(Happened::Output(self.buffer.get(..read)?.to_vec())),
         Err(rustix::io::Errno::INTR) => {}
-        Err(rustix::io::Errno::AGAIN) => return None,
+        Err(rustix::io::Errno::AGAIN) => {
+          let held_by_the_hook =
+            !self.exited || self.child.as_ref().is_none_or(Child::group_has_others);
+          if held_by_the_hook {
+            return None;
+          }
+          break;
+        }
         Err(_) => break,
       }
     }
@@ -660,6 +692,16 @@ fn start_refused(error: &std::io::Error) -> StartRefused {
     },
   }
 }
+
+/// Format: the environment variable that has a test's hook spawned with a foreign holder of its words stream
+/// ([`Hook::spawn`]): a plain `std::process::Command` child given the stream's write end.
+#[cfg(test)]
+pub(crate) const HOLD_WORDS_ABROAD: &str = "SLATES_TEST_HOLD_WORDS_ABROAD";
+
+/// Shape: how long a test's foreign holder holds the words stream, in seconds for `sleep`: four liveness windows, far
+/// past a run that ends at its hook's exit.
+#[cfg(test)]
+const HOLDER_SECONDS: u64 = 4 * crate::daemon::LIVENESS_BUDGET_NS / 1_000_000_000;
 
 #[cfg(test)]
 mod tests {
@@ -1133,6 +1175,29 @@ mod tests {
         );
       }
     }
+  }
+
+  /// Main 01a20182's ruling of 2026-11-22 ~17:30 (the DAV revprop flake: a stock client a test spawned with
+  /// `std::process::Command`, not confined, inherited a hook's words stream in the macOS window between its pipe and its
+  /// close-on-exec, and the hook's first run, with no deadline, waited until its client gave up). Do: run a refusing
+  /// hook, with no learned bound and a client that never leaves, its words stream also held by a plain
+  /// `std::process::Command` child that outlives it ([`super::HOLD_WORDS_ABROAD`], four liveness windows). Expect: the run
+  /// ended at the hook's own exit (within [`QUICK_RUN_NS`]), refused with every word the hook wrote. Failing first: the
+  /// run waited for the holder's end, four liveness windows. Only on macOS, where a pipe is made in two calls: elsewhere
+  /// no foreign spawn inherits one, and a holder past the exit is the hook's own, waited for.
+  #[cfg(target_os = "macos")]
+  #[test]
+  fn a_hooks_run_ends_at_its_exit_whatever_another_spawner_holds() {
+    let mut hook = input(HookPoint::SvnPreCommit, "refuse", &[], Vec::new());
+    hook.env.push((
+      super::HOLD_WORDS_ABROAD.to_owned(),
+      EnvValue::Bytes(b"1".to_vec()),
+    ));
+    let (outcome, _, took) = drive(None, hook, None, None).expect("the run ended");
+    assert!(
+      text(&outcome).contains("refused by the hook") && took < QUICK_RUN_NS,
+      "the run took {took} ns, its words held for {HOLDER_NS} ns by another spawner's child: {outcome:?}"
+    );
   }
 
   /// A-622 part 3 (the learned deadline, the group's kill, the reap). Do: with a learned bound, run a hook that sleeps.

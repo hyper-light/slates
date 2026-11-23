@@ -312,6 +312,13 @@ pub fn spawn(spawn: &Spawn<'_>) -> io::Result<SpawnedChild> {
 }
 
 impl SpawnedChild {
+  /// Whether a process other than this child is still in its group, the child being its group's leader (a spawn with
+  /// `own_group`): what tells a hook's run that nothing of the hook's can still write its words once the hook has
+  /// exited (`crate::group_holders`).
+  pub fn group_has_others(&self) -> bool {
+    crate::group_holders::group_has_others(self.pid)
+  }
+
   /// Its pid.
   pub fn id(&self) -> u32 {
     self.pid
@@ -379,7 +386,7 @@ mod tests {
   use std::io::Read;
   use std::os::fd::AsFd;
 
-  use super::{ChildStream, Environment, Spawn, spawn};
+  use super::{ChildStream, Environment, Spawn, SpawnedChild, spawn};
 
   /// main 01a20182's ruling of 2026-11-22 02:06 (the hook pipe race, (a)): a descriptor another thread made and had not
   /// marked close-on-exec yet leaked into a child spawned meanwhile. Do: hold a pipe whose write end's close-on-exec is
@@ -423,5 +430,58 @@ mod tests {
       !numbers.contains(&held),
       "the child held {numbers:?}; the held pipe's write end is {held}"
     );
+  }
+
+  /// A spawn of `/bin/sh -c script` as its own group's leader, its streams the null device.
+  fn leader_of(script: &str) -> SpawnedChild {
+    let script = std::ffi::OsString::from(script);
+    spawn(&Spawn {
+      program: std::path::Path::new("/bin/sh"),
+      args: &[std::ffi::OsStr::new("-c"), &script],
+      environment: Environment::Inherited,
+      overrides: &[],
+      directory: std::path::Path::new("/"),
+      own_group: true,
+      stdin: ChildStream::Null,
+      stdout: ChildStream::Null,
+      stderr: ChildStream::Null,
+    })
+    .unwrap()
+  }
+
+  /// Waits for `child`'s exit without reaping it, as a hook's run reads it: its leader stays a zombie.
+  fn exited_unreaped(child: &SpawnedChild) {
+    let pid = rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+    let options = rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOWAIT;
+    rustix::process::waitid(rustix::process::WaitId::Pid(pid), options).unwrap();
+  }
+
+  /// Main 01a20182's ruling of 2026-11-22 ~17:30 (the hook drain; `crate::group_holders`). Do: spawn a group leader that
+  /// exits at once, and one that starts a long sleep in its group and exits; read each exit without reaping. Expect: the
+  /// lone leader's group holds no one else (its zombie alone); the other's holds its sleep, until the group is killed.
+  /// On Linux and Windows the answer is that others may hold it, whatever the group holds (module docs).
+  #[test]
+  fn a_groups_others_are_told_apart_from_its_exited_leader() {
+    let lone = leader_of("exit 0");
+    exited_unreaped(&lone);
+    let with_sleep = leader_of("sleep 30 & exit 0");
+    exited_unreaped(&with_sleep);
+    let answers = (lone.group_has_others(), with_sleep.group_has_others());
+    with_sleep.kill_group();
+    let (mut lone, mut with_sleep) = (lone, with_sleep);
+    let _ = (lone.wait(), with_sleep.wait());
+    if cfg!(target_os = "macos") {
+      assert_eq!(
+        answers,
+        (false, true),
+        "(the lone leader's group, the one with a sleep)"
+      );
+    } else {
+      assert_eq!(
+        answers,
+        (true, true),
+        "others may hold it wherever a pipe is made atomically"
+      );
+    }
   }
 }

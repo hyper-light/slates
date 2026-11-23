@@ -3040,6 +3040,30 @@
 > session passes 1 of 1 in 33.54 s, byte for byte against `svnserve`, and the guard leaves 0 views mounted. Owed:
 > w-lint's Linux and Windows cross-target round. Windows spawns no hooks yet (A-622's Windows
 > part), so it has no seam to change.
+> **The hook drain held by a foreign holder (2026-11-22, w-svn; main 01a20182's rulings of ~17:20 and ~17:30): FIXED.**
+> `daemon_edge`'s `a_dav_proppatch_of_a_revision_changes_its_property_through_its_revprop_hooks` failed once in w-git's
+> batch at load ~40 (its reader, "the answer ended inside a line"): a stock client the test binary spawned with
+> `std::process::Command`, not confined, inherited a hook's words pipe in the macOS window between `pipe()` and its
+> close-on-exec (std makes a pipe so on macOS, `library/std/src/sys/pipe/unix.rs`), and the hook's first run, with no
+> deadline, waited until its client gave up. Now a run's words end once nothing of the hook's can write them: the hook
+> has exited and its group holds nothing but it (`slates_ipc::group_holders`, `proc_listpgrppids` on macOS; Linux's
+> `pipe2(O_CLOEXEC)` and Windows' non-inheritable `CreatePipe` handles leave nothing foreign to hold one), whatever
+> still holds the stream; a child that left the group with `setsid` is told the same, as the group's kill never reached
+> it. Red: `a_hooks_run_ends_at_its_exit_whatever_another_spawner_holds` took 4,151,291,875 ns, held by a plain std
+> child; now it ends at the hook's exit with its words.
+> **OPEN (w-svn, noted for main 2026-11-22): a hook's first run has no deadline but its client's connection.** Before
+> any run of a hook has finished, `HookTimes::bound_ns` answers none (the module docs: "a run has no deadline but its
+> client's connection"), so a hook that never exits on its first run holds that run, and the client's request, for the
+> client's lifetime. The learned bound starts only from a finished run; a bound the design may owe.
+> **OPEN (w-svn, the sibling sweep for main, 2026-11-22): every descriptor the daemon makes on macOS is marked
+> close-on-exec a call after it is made,** since Apple has no `pipe2`, `accept4` or `SOCK_CLOEXEC`: a foreign spawner in
+> the same process (a test binary's stock client, an embedder) inherits it in that window. Pipes: `hook_driver.rs`
+> 224-227 (std), `ipc` `completion.rs` 293 (std), `delivery.rs` 392 (its doc says so). Socket pairs: `ipc` `stream.rs`
+> 32 and 62, `endpoint.rs` 1528 and 2024, `rendezvous.rs` 2377, server `reap.rs` 575, `hangup.rs` 437 and 590,
+> `fuse.rs` 1908. Sockets and accepts: `rt` `netsys.rs` (the listeners every edge binds through `slates_rt::tcp`, and
+> its `accept`, 568), `ipc` `route.rs` 473, `completion.rs` 577-580 (std). A connection inherited so stays half open
+> after the daemon closes it, its peer seeing no end while the holder lives. `kqueue` descriptors are not inherited by
+> a child. Not fixed here.
 > **svn replay by stock clients (w-interop, 2026-11-20; A-703):** `svn-matrix.sh` gains `svnrdump dump` and
 > `svnsync initialize/synchronize` over svn://, each compared with the dump stock svnserve 1.15.0 made of the same history
 > (`crates/svn/fixtures/replay`, `EXPECT_RDUMP`, `EXPECT_SYNC`): over the reads fixtures' repository both are
