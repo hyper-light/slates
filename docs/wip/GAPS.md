@@ -100,7 +100,9 @@
 > since a pack's answer cannot be taken again mid-pack byte for byte. (2b)(a) LANDED (w-shared): a landed push's staged
 > pack let go once no fetch is answered and no encoding runs (else owed to the idle give-back), whatever its windows'
 > holders (`ContentStore::let_go_landed`), every window a home holds here kept (`vcs_store::landed_pin`; a one-shard
-> daemon lets nothing go until (2b)(b), homes' own read-through, next).
+> daemon lets nothing go until (2b)(b), homes' own read-through, next). (2b)(b) BUILT (w-shared, A-724 piece 8c): the
+> pack's home records where each of its windows lies on the node's store (`homes::LandedAt`), lets it go and brings it
+> back on a read; the records ride the shard image, so a window with one is not pinned.
 > **HELD (main 01a20182, 2026-11-22 15:40):** no landed pack is let go or owed from a push's commit (`vcs_store::commit`),
 > since r52 (the big Studio, main 6f6e87d82) found readers that do not bring a let-go window back: once git/git's push
 > ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's tag peel through

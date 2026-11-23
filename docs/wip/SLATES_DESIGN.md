@@ -55496,6 +55496,29 @@ Applied in the same change to:
   `vcs_store::homes::tests` 6 of 6 (region offers idempotent; a lone node's healer moves nothing; the region put
   acknowledged only after its image) and `fleet::` 33 of 33. A region home answers `Kept` only once A-727 a3 drives its
   image barrier, so until then the healer offers and keeps its own copy (no release without every home's `Kept`).
+- **Piece 8c, a home's landed windows read through (2026-11-22, w-shared; goal 93 item 2b(b), main 01a20182's ruling:
+  homes keep window → (payload identity, offset) for the windows homed as part of a landed pack, and a home's read of a
+  window let go brings it back through that record).** A push's pack is homed whole in the region before it lands
+  (`home_in_region`): on this node the shard `home_of(shards, pack)` holds it for the region, cut at the store's
+  windows. Once the pack's changeset lands and its record commits, the pack's owner tells that home
+  (`vcs_store::let_go_landed_pack_among`: on its own shard before its own let-go, else by a task of its own whose answer
+  nothing waits on). The home, where it holds the pack for the region (`homes::landed_pack_here`), records each window
+  where it lies on the node's store (`homes::LandedAt`: the pack's identity, the plain BLAKE3 the store's `Payload` is
+  keyed by, its length, the window's offset in it, from `ContentStore::object_layout`), marks it landed and lets it go
+  (`homes::record_landed_here`, counted `vcs_store.homes.landed_let_go_bytes`). A home's read that finds an object or
+  window not whole (`homes::read`, and so `read_part`, `serve_remote`'s `Read` and `read_many`'s misses) brings each of
+  its let-go windows back by its record (`homes::bring_back_landed`: read a piece at a time from the node's store off
+  the shard's step, then put back by its identity within the step's lent room, counted
+  `vcs_store.homes.landed_brought_back`), then reads again. A window with a record needs no pin (`landed_pin` answers
+  none for it), so the owner lets its own copy go too. A record is dropped when its window is freed (`let_go_here`), and
+  the records ride the shard image as their own piece kind (`KIND_VCS_LANDED_AT`, whole at a checkpoint, made and
+  dropped in each delta), taken back at recovery (`homes::restore_landed`) beside the windows let go
+  (`KIND_VCS_AWAY`). Evidence: `vcs_store::read_through::tests::a_landed_pack_its_home_holds_is_let_go_and_read_back_through_its_record`
+  (each window recorded at its offset, all let go, none pinned, the pack read whole through `homes::read`, each window
+  brought back by its record) and `daemon::tests::t_goal93_a_homes_landed_records_survive_a_restart_and_bring_its_windows_back`
+  (the records taken back as they were across a stop and start over the same segment and store, and the pack read
+  whole). A pack's home on another node keeps its copy as before: its records would need that node's store to hold the
+  pack, which only its own landing gives it.
 - **Piece 9b, the cut in the record and look-ups routed by it (2026-11-20).** `RepositoryRecord::index_bits` (appended,
   zero at creation, the whole index on the owner) moves one bit at a time by `Op::RepositoryIndexCut` (appended, `Op`
   102), its guard refusing any other step or a cut past 32 bits `DbError::IndexCutStep { current }` (the wire's
@@ -60955,7 +60978,9 @@ owed.
   taken at the first settle after the content store is made, which may be any step after the recovery. Evidence:
   `t_goal93_a_region_held_window_stays_pinned_across_a_restart` (a region hold, a stop and start over the same segment,
   the let-go refused `Pinned { by: "homes" }`).
-- Open: 2b(b), homes' read-through (window -> payload identity and offset), which lifts the homes' pin.
+- 2b(b) BUILT (A-724 piece 8c, "a home's landed windows read through"): a home records where each window of a landed
+  pack it holds for the region lies on the node's store and lets it go; its reads bring it back by that record, so a
+  window with a record is not pinned.
 
 
 ### A-864 — A pushed entry is checked by the CRC32 its row keeps, and sent on with no object read (2026-11-22, w-git; main 01a20182's r17 of 07:08 and ruling of 07:31 PST, goal 93; A-859, A-722 record v4)
