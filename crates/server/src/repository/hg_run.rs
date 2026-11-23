@@ -20,6 +20,13 @@
 //! its repository's landing turn only for its entry's commit (`hg_push`'s landing), so a small push waits for another's
 //! commit, never for its segments.
 //!
+//! **Let go.** Once a segment is durable on the node's changeset store, which serves its texts from then on, its file
+//! revisions' windows leave the shard's content store ([`let_go_landed`]), their entries kept, so the push's fork and
+//! the index it becomes still name them by identity, and a read that meets one brings it back from the store (the
+//! intake's base reads, the works' read-through, the served view's). A window a home holds stays, as a landed git
+//! pack's does (`vcs_store::landed_pin`). So a whole-history push leaves its rows held, never its history's texts (main
+//! 01a20182's order of 2026-11-22 14:00: 4.7 GB of arena held after Mercurial's history landed).
+//!
 //! **Abandoned.** A run no entry names (the push refused, its connection ended, its task cancelled) is forgotten as it
 //! ends: each of its sequences' rows dropped from the store (`StoreHandle::forget`, counted), its log bytes the owed
 //! cleaner of unnamed log space's. So a client that keeps starting and dropping long pushes grows no rows. After a
@@ -127,6 +134,9 @@ pub(crate) struct Run {
   repository: RepositoryId,
   /// The sequences landed, ascending and apart.
   ranges: Vec<(u64, u64)>,
+  /// The content identities of its landed segments' file revisions, let go again once its entry is committed (module
+  /// docs, "Let go": a push's works bring back the texts they read between its segments and its entry).
+  contents: Vec<slates_vcs::ContentId>,
   /// Whether it is settled.
   settled: bool,
 }
@@ -137,12 +147,14 @@ impl Run {
     Run {
       repository,
       ranges: Vec::new(),
+      contents: Vec::new(),
       settled: false,
     }
   }
 
-  /// Notes segment changeset `sequence` landed, after every one before.
-  pub(crate) fn landed(&mut self, sequence: u64) {
+  /// Notes segment changeset `sequence` landed, after every one before, its file revisions kept as `contents`.
+  pub(crate) fn landed(&mut self, sequence: u64, contents: &[slates_vcs::ContentId]) {
+    self.contents.extend_from_slice(contents);
     match self.ranges.last_mut() {
       Some((_, last)) if last.checked_add(1) == Some(sequence) => *last = sequence,
       _ => self.ranges.push((sequence, sequence)),
@@ -163,10 +175,13 @@ impl Run {
     record::write_push_runs_reference(room, &self.ranges)
   }
 
-  /// Ends the run (module docs, "Abandoned"): kept where an entry named it (`committed`), else forgotten.
+  /// Ends the run (module docs, "Abandoned", "Let go"): where an entry named it (`committed`), its file texts let go
+  /// once more, whatever its works brought back; else forgotten.
   pub(crate) fn settle(mut self, state: &mut ShardState, committed: bool) {
     self.settled = true;
-    if !committed {
+    if committed {
+      let_go_landed(state, &core::mem::take(&mut self.contents));
+    } else {
       abandoned(state, self.repository, core::mem::take(&mut self.ranges));
     }
   }
@@ -204,6 +219,40 @@ fn abandoned(state: &mut ShardState, repository: RepositoryId, ranges: Vec<(u64,
   };
   if slates_rt::futures::spawn_detached(forgetting).is_err() {
     state.count(RUN_ROWS_UNFORGOTTEN, 1);
+  }
+}
+
+/// Counter: the bytes of pushes' file texts let go of the content store once the segment carrying them was durable
+/// (module docs, "Let go"). Format: a counter name in the status report.
+pub(crate) const TEXT_BYTES_LET_GO: &str = "vcs.hg.push_text_bytes_let_go";
+/// Counter: a landed segment's window kept because a home holds it here (`vcs_store::landed_pin`: one whose home by
+/// identity is this shard, which a home reads by identity alone and cannot bring back). Format: a counter name.
+pub(crate) const TEXTS_PINNED: &str = "vcs.hg.push_texts_pinned";
+
+/// Lets go of `contents`, a landed segment's file revisions' windows (module docs, "Let go"): every window but those a
+/// home holds here (`vcs_store::landed_pin`), counted with its bytes, and the windows kept pinned.
+pub(crate) fn let_go_landed(state: &mut ShardState, contents: &[slates_vcs::ContentId]) {
+  let (shard, shards) = (state.shard, state.shards.clone());
+  // The repository's windows are the shard's chunk store's, lent to its content store for the step.
+  let (freed, pinned) = crate::vcs_store::lent_state(state, |state| {
+    crate::vcs_store::within_budget(state, 0, |stores| {
+      stores.content_mut().map_or((0, 0), |content| {
+        contents
+          .iter()
+          .fold((0_u64, 0_u64), |(freed, pinned), identity| {
+            let (more, kept) = content.let_go_object_landed(identity, &|window| {
+              crate::vcs_store::landed_pin(shard, &shards, window)
+            });
+            (freed.saturating_add(more), pinned.saturating_add(kept))
+          })
+      })
+    })
+  });
+  if freed > 0 {
+    state.count(TEXT_BYTES_LET_GO, freed);
+  }
+  if pinned > 0 {
+    state.count(TEXTS_PINNED, pinned);
   }
 }
 

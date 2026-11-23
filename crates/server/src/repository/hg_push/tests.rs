@@ -1738,7 +1738,7 @@ async fn run_held_until_dropped(repository: RepositoryId) {
   let sequence = header.sequence;
   if disk.land(header, parts).await.is_ok() {
     STAND_IN_LANDED.with(|landed| landed.set(true));
-    run.landed(sequence);
+    run.landed(sequence, &[]);
   }
   std::future::pending::<()>().await;
   drop(run);
