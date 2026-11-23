@@ -840,6 +840,14 @@
 >   public and a rewrite of a pushed changeset is refused by the client), decision 3's rewrite admission, the
 >   `obsolete` pushkey namespace, and the reply's `N new obsolescence markers` output. The kept heads for a view with
 >   left-out changesets: BUILT (piece 2, below).
+>   Markers as 7.2 holds them BUILT (2026-11-23, w-hg): a repository holding a format 0 marker (an old obsstore's
+>   import, an old client's push) refused every clone that asked for markers, the format 1 encoder unable to write it
+>   (`markers_held_in_format_0_are_sent_in_format_1`, red: `Unencodable`). `marker_tuple` makes 7.2's in-memory tuple of
+>   either format and writes either from it, as `_fm0encodeonemarker` and `_fm1encodeonemarker` do: seven golden
+>   vectors from 7.2's own writers byte for byte; Python's `repr` of a float held to CPython over 400,014 floats, ties
+>   included, and its `float()` and `int()` over 525,750 strings. `getbundle` reads the tuples for relevance (a format 0
+>   marker's parents are in its metadata) and order; a push's markers are compared as tuples, so the same marker in the
+>   other format is not kept twice (`a_held_marker_in_the_other_format_is_not_kept_again`, red).
 > - A daemon's allocation by site under stock Mercurial measured BUILT (2026-11-23, w-hg; main's order (A)):
 >   `crates/server/tests/hg_push_heap.rs`, its own binary (`LargeMapped` with a byte sampler on while a row runs), an
 >   in-process daemon with a store and the cleartext HTTP edge, real `hg` subprocesses pushing a 400-changeset
@@ -902,6 +910,23 @@
 >   or a manifest into the buffer of the one kept before the last (`Taker::spare`; `delta::apply_into` keeps its
 >   capacity), which no later delta rests on, so a manifest's rebuild allocates nothing past the first. The test now
 >   `a_pushs_churn_per_changeset_is_its_file_alone`: red 102,045 B an edit, now 10,766 B (0.12 manifests).
+> - The store's texts made from their chains off the system heap BUILT (2026-11-23, w-perf; main's order on arena-11/12,
+>   the split agreed with w-hg). A daemon's push of Mercurial's own history, sampled by site, size and life
+>   (`crates/server/tests/hg_push_lifetimes.rs`, `#[ignore]`d, `SLATES_HG_PUSH_SOURCE`; MacBook, 57,036 changesets,
+>   17.5 GB allocated in 152 s), put 83% of its bytes under x86_64's 256 KiB floor that lived a second or more in the
+>   store owner's `TextCache` (3.47 GB sampled, 195 MB still held at the push's end), each text its own buffer.
+>   `TextCache` now lays its texts in chunks of the mapped floor and gives the oldest back whole (A-861's rule), and
+>   `Store::make` makes a chain through two buffers it reuses; `text_at` still lends a slice. Held by
+>   `the_store_keeps_the_texts_it_made_off_the_system_heap` (`crates/store/tests/text_cache_heap.rs`: red 6,606,904 live
+>   bytes grown holding 6,553,600, now 90,424 holding 6,029,312). The hg intake's whole texts (`intake::rebuilt`,
+>   `HgIndex::revision_text`, `Taker::file_base`; 3.52 GB of the [128 KiB, 256 KiB) band's churn with the cache's
+>   share) are w-hg's, in C1. Owed: main's arena round for RSS.
+>   Its bound from the work BUILT (main's ruling, 2026-11-23): the chain no longer needs its texts held, so the cache holds
+>   the distinct texts its last `waiting` reads lent (one a waiting request, the owner's room) and a chunk's room
+>   (`TextCache::for_reads`), the least lately read out first; a text past it is lent from the buffer it was made into.
+>   Grown to the longest chain before, it held 360 MB of chunks at the end of Mercurial's push. Held by
+>   `the_store_holds_the_texts_its_last_reads_lent_and_no_more` (red: bound 6,553,600 after a 400-version chain's read;
+>   now 1,064,960 for 4 reads, 384 texts let go, the latest found again unmade).
 > - The watchdog's beat allocates nothing BUILT (2026-11-23, w-perf; main's order). A beat made 4 allocations, about
 >   1 KB by their types (estimated, not measured). `hg_push_heap`'s first read had charged the watchdog 24% of a push's
 >   sampled bytes, about 10-15 MB a second; that was its sampler's artifact (a thread's first symbol load charged to its

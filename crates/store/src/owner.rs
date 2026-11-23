@@ -370,8 +370,9 @@ fn serve(
   // The owner lands bytes the request carries; nothing is staged on its side.
   let staging = Staging::new(0);
   // The texts the owner made from their chains (A-645's derived per-path read form), kept across requests, so a clone
-  // streaming a path's versions in order makes each from the one before; its bound learned from the chains it made.
-  let mut texts = TextCache::new(0);
+  // streaming a path's versions in order makes each from the one before: those the last `waiting` reads lent, one a
+  // waiting request (`TextCache::for_reads`).
+  let mut texts = TextCache::for_reads(waiting);
   let mut landings = Landings {
     open: None,
     held: VecDeque::new(),

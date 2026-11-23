@@ -1559,6 +1559,51 @@ fn a_bundle1_and_parts_the_client_cannot_read_are_refused_by_kind() {
   }
 }
 
+/// Goal 93 (changeset evolution; 7.2's `encodemarkers` writes each marker from its tuple, whatever format it was
+/// read in). Do: hold the clone's markers each as 7.2 writes it in format 0, and answer a clone asking for markers of a
+/// client that reads both formats; then the same of the store holding them in format 1. Expect the two `OBSMARKERS`
+/// parts the same, in format 1, byte for byte. Red before: the format 0 store's clone was refused (a format 0 marker
+/// cannot be written in format 1 as it is), so a repository holding one could not be cloned.
+#[test]
+fn markers_held_in_format_0_are_sent_in_format_1() {
+  let served = cloned();
+  assert!(!served.markers.is_empty(), "the clone holds markers");
+  let mut old = served.clone();
+  old.markers = served
+    .markers
+    .iter()
+    .map(|payload| {
+      let decoded = obsmarkers::decode(payload).unwrap();
+      let marker = decoded.iter().next().unwrap();
+      let mut as_v0 = Vec::new();
+      crate::marker_tuple::Tuple::of(&marker)
+        .unwrap()
+        .encode(obsmarkers::Format::V0, &mut as_v0)
+        .unwrap();
+      assert_eq!(as_v0.first(), Some(&0), "held in format 0");
+      as_v0
+    })
+    .collect();
+  let tips = head_revs(&served, &mut room()).unwrap();
+  let heads = joined(tips.iter().map(|rev| served.history.revs[at(*rev)].node));
+  let bundlecaps = caps(CLIENT_BLOB);
+  let asked = Asked {
+    bundlecaps: &bundlecaps,
+    heads: &heads,
+    obsmarkers: Some(&b"1"[..]),
+    ..Asked::default()
+  };
+  let markers_of = |served: &Served| {
+    parts(served, &asked)
+      .into_iter()
+      .find(|(kind, _, _)| kind == b"OBSMARKERS")
+      .map(|(_, _, payload)| payload)
+  };
+  let sent = markers_of(&served).unwrap();
+  assert_eq!(sent.first(), Some(&1), "sent in format 1");
+  assert_eq!(markers_of(&old), Some(sent));
+}
+
 /// AC-HG.9, A-619: do ask a client that names `HG20` and no bundle2 capability for the default parts, then with the
 /// bookmarks' keys; and ask for nothing missing, with every head common, of a client that lists only version 01.
 /// Expect an empty stream, then the one `LISTKEYS` part (7.2 sends no changegroup to such a client); and the version
