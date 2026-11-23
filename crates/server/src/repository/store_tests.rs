@@ -9,7 +9,9 @@ use slates_land::store_root::StoreRoot;
 use slates_store::log::{ChangesetLog, SectionKind, Tool};
 use slates_store::store::{LOG_FILE, Store};
 
-use crate::test_store::{SIZING, TestStore, root, routed_create};
+use crate::test_store::{
+  SIZING, TestStore, created_subversion, file_work, landed_work, root, routed_create,
+};
 
 use crate::{Daemon, SegmentSource};
 
@@ -556,87 +558,6 @@ fn anchor_of(instance: &str) -> (slates_anchor::AnchorSegment, slates_ipc::HeldR
   .with_content(&format!("{instance}-con"), config.content_bytes())
   .unwrap();
   (segment, slates_ipc::HeldRendezvous::hold(instance).unwrap())
-}
-
-/// Creates Subversion repository `name` on `daemon`'s one shard through a client's request, waiting for its creation to
-/// land on the store and be recorded (A-767 item 7's one order).
-fn created_subversion(daemon: &Daemon, name: &str) -> RepositoryId {
-  let asked = (name, VcsTool::Subversion, ObjectFormat::Revisions, "trunk");
-  crate::test_store::create_on(daemon, 0, &owner(), asked).0
-}
-
-/// A client's work on revision `head` setting `/trunk/a.txt` to `bytes` (`action`: add or modify), `/trunk` added with
-/// it at revision 0, with its text held as a commit's sink holds it.
-fn file_work(
-  head: u64,
-  action: slates_svn::index::Action,
-  bytes: &[u8],
-) -> (
-  slates_svn::commit::drive::Work,
-  slates_svn::commit::drive::HeldTexts,
-) {
-  use slates_svn::commit::drive::TextSink;
-  use slates_svn::index::{Action, ChangedPath, NodeKind};
-  let text = slates_svn::commit::drive::text_of(bytes).unwrap();
-  let texts = slates_svn::commit::drive::HeldTexts::new();
-  let staged = texts.stage(None).unwrap();
-  texts.append(staged, bytes).unwrap();
-  texts.seal(staged, text.identity).unwrap();
-  let mut changes = Vec::new();
-  if head == 0 {
-    changes.push(ChangedPath {
-      path: "/trunk".to_owned(),
-      action: Action::Add,
-      kind: NodeKind::Directory,
-      copy_from: None,
-      text: None,
-      properties: None,
-      mergeinfo_modified: false,
-    });
-  }
-  changes.push(ChangedPath {
-    path: "/trunk/a.txt".to_owned(),
-    action,
-    kind: NodeKind::File,
-    copy_from: None,
-    text: Some(text),
-    properties: None,
-    mergeinfo_modified: false,
-  });
-  let work = slates_svn::commit::drive::Work {
-    head,
-    record: slates_svn::index::RevisionRecord {
-      transaction: format!("{head}-1"),
-      changes,
-    },
-    lock_entries: Vec::new(),
-    revision_properties: vec![(b"svn:log".to_vec(), format!("r{}", head + 1).into_bytes())],
-    texts: std::iter::once(text.identity).collect(),
-    property_lists: std::collections::BTreeMap::new(),
-    locks: slates_svn::lock::CommitLocks::default(),
-  };
-  (work, texts)
-}
-
-/// Lands `work` on `repository` through the client's commit landing (`svn_commit::land_work`), as a task on `daemon`'s
-/// shard: the revision it committed, or why not.
-fn landed_work(
-  daemon: &Daemon,
-  repository: RepositoryId,
-  head: u64,
-  (action, bytes): (slates_svn::index::Action, Vec<u8>),
-) -> Result<u64, super::svn_commit::Uncommitted> {
-  crate::test_store::run_on_first(
-    daemon,
-    move || async move {
-      let (work, texts) = file_work(head, action, &bytes);
-      super::svn_commit::land_work((&owner(), repository), work, &texts)
-        .await
-        .unwrap()
-        .map(|committed| committed.revision)
-    },
-    std::time::Duration::from_secs(60),
-  )
 }
 
 /// Everything recovery must make again of `repository`: its records whole as they print, their youngest revision, its
@@ -1490,4 +1411,82 @@ fn a_subversion_restart_replays_two_named_texts_whose_windows_are_resident() {
 #[test]
 fn a_subversion_restart_replays_a_named_text_with_one_released_window() {
   restart_with_two_named_texts(true);
+}
+
+/// The re-adoption's bring-back (main 01a20182's ruling of 2026-11-23, the sibling of the remake fix cf1529f1d): a
+/// takeover's re-adoption replays the green's own checkpoint and chain onto the engine it is handed, and since A-869 the
+/// checkpoint names its texts. Do: on a daemon holding a store, land revision 1 adding `/trunk/a.txt`, whose checkpoint
+/// names its text; leave the text the node's store's alone (the content store holds none of it) and the green as a
+/// restart leaves an adopted one (its engine gone, awaiting its re-adoption through version 0); re-adopt it over a
+/// seeded engine (`green_adopt::readopt_with`, as the existing readoption test hands `Green::new()`); then commit
+/// revision 2. Expect: re-adopted, the file the text's bytes, the next commit revision 2. Failing first: the replay
+/// fenced the green `ContentMissing` (no pre-pass), so it was not re-adopted. End to end this stays unreachable until
+/// A-727 (d): an svn takeover fails today at the holder's replica build (`merge.replica.checkpoint_unread`).
+#[test]
+fn a_readopted_green_brings_back_the_texts_its_checkpoint_names_first() {
+  use slates_svn::index::Action;
+  let (_store, daemon) = crate::test_store::audit_daemon_stored_configured(|_| {});
+  let repository = created_subversion(&daemon, "readopted");
+  let text = b"alpha, read again\n";
+  assert_eq!(
+    landed_work(&daemon, repository, 0, (Action::Add, text.to_vec())),
+    Ok(1)
+  );
+  assert!(
+    checkpoint_named(&daemon, repository, 1) > 0,
+    "the checkpoint names its text"
+  );
+  let identity = slates_vcs::ContentId(*blake3::hash(text).as_bytes());
+  let green = crate::daemon::observe_first(&daemon, move |state| {
+    let green = super::svn_commit::green_of(state, repository).unwrap();
+    crate::vcs_store::within_budget(state, 0, |stores| {
+      if let Some(content) = stores.content_mut() {
+        while content.contains(&identity) {
+          if content.release(&identity).is_err() {
+            break;
+          }
+        }
+      }
+    });
+    if let Some((lineage, Ok(mut release))) = state.greens.retire(&green) {
+      while state
+        .greens
+        .release_step(lineage, &mut release)
+        .is_ok_and(|more| more)
+      {}
+    }
+    state.greens.remove(&green);
+    state.merge.awaiting_adoption.insert(
+      green,
+      crate::green_adopt::AwaitingAdoption {
+        through: 0,
+        identity: None,
+        replay: None,
+      },
+    );
+    green
+  });
+  let (readopted, served) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let shard = crate::state::with_state(|state| state.shard).unwrap();
+      let readopted =
+        crate::green_adopt::readopt_with(shard, shard, green, slates_merge::engine::Green::new())
+          .await;
+      let served = crate::state::with_state(|state| {
+        state
+          .greens
+          .get(&green)
+          .and_then(|engine| engine.content("trunk/a.txt").map(<[u8]>::to_vec))
+      })
+      .flatten();
+      (readopted, served)
+    },
+    std::time::Duration::from_secs(60),
+  );
+  let next = landed_work(&daemon, repository, 1, (Action::Modify, b"two\n".to_vec()));
+  daemon.stop();
+  assert_eq!(readopted, Some(true), "re-adopted");
+  assert_eq!(served.as_deref(), Some(text.as_slice()), "its file");
+  assert_eq!(next, Ok(2), "the next commit");
 }

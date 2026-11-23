@@ -237,8 +237,10 @@ fn apply_blocks(model: &mut FileModel, entry: &Logged, version: u64) -> (bool, b
 
 /// Decides the log by the block oracle, in the owner's order: a conflicting submission is refused;
 /// any other is accepted at the next version, its non-identical blocks applied, and it took the
-/// fast path iff the file was last changed at or before its base. Returns the oracle's fast-path
-/// count, the per-file bytes, and the head.
+/// fast path iff the file was last changed at or before its base. An accept that applied no block
+/// (every block it writes an identical overlap) is `Identical`, the accept whose verdict left no
+/// effect (A-782); any other is `Accepted`. Returns the oracle's fast-path count, the per-file
+/// bytes, and the head.
 fn decide_by_the_oracle(log: &[Logged], head_after_setup: u64) -> (u64, Vec<Vec<u8>>, u64) {
   let mut files = vec![
     FileModel {
@@ -265,20 +267,22 @@ fn decide_by_the_oracle(log: &[Logged], head_after_setup: u64) -> (u64, Vec<Vec<
       continue;
     }
     head += 1;
-    assert_eq!(
-      entry.outcome,
-      Outcome::Accepted { version: head },
-      "agent {} based on {} on file {}: the oracle accepts at {head}",
-      entry.agent,
-      entry.base,
-      entry.file
-    );
-    ACCEPTS.fetch_add(1, Ordering::Relaxed);
     if model.last_changed <= entry.base {
       fast_paths += 1;
       FAST_PATHS.fetch_add(1, Ordering::Relaxed);
     }
     let (applied, identical) = apply_blocks(model, entry, head);
+    let expected = if applied {
+      Outcome::Accepted { version: head }
+    } else {
+      Outcome::Identical { version: head }
+    };
+    assert_eq!(
+      entry.outcome, expected,
+      "agent {} based on {} on file {}: the oracle accepts at {head}, applying a block: {applied}",
+      entry.agent, entry.base, entry.file
+    );
+    ACCEPTS.fetch_add(1, Ordering::Relaxed);
     if identical {
       IDENTICAL.fetch_add(1, Ordering::Relaxed);
     }

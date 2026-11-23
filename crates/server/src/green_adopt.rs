@@ -500,20 +500,54 @@ async fn readopt_one(control: u16, owner: u16, id: DbVolumeId, through: u64) -> 
     let Some(engine) = rebuilt_engine(object, through).await else {
       return false;
     };
-    let began = crate::xshard::call_in_shard_time(
-      control,
-      owner,
-      move |s| crate::verbs::begin_readoption(s, id, engine),
-      crate::daemon::LIVENESS_BUDGET_NS,
-    )
-    .await;
-    match began {
-      Some(true) => return stepped_through(control, owner, id).await,
-      Some(false) => return false,
-      None => {}
+    if let Some(readopted) = readopt_with(control, owner, id, engine).await {
+      return readopted;
     }
   }
   false
+}
+
+/// Re-adopts green `id` on `owner` over `engine`, the engine its ledger rebuilt: whether it now serves there, or `None`
+/// when the owner shard did not answer the hand-off (the engine gone with it, so the caller rebuilds and asks again).
+/// First, as a task of the owner shard, the named texts the green's own checkpoint and chain name that the content
+/// store does not hold whole are brought back from the node's changeset store, as a recovery's pre-pass brings them
+/// (`svn_texts::bring_back_named_live`; A-869), so the replay reads every name through the plane; their holds are given
+/// back once the green is installed or fenced. End to end this stays unreachable for a Subversion green until A-727
+/// (d): the engine handed is the holder's replica, which reads no named content, so an svn takeover fails today at
+/// the replica's build (`merge.replica.checkpoint_unread`).
+pub(crate) async fn readopt_with(
+  control: u16,
+  owner: u16,
+  id: DbVolumeId,
+  engine: Green,
+) -> Option<bool> {
+  let brought = crate::xshard::task_to_its_end(control, owner, move || {
+    crate::vcs_store::svn_texts::bring_back_named_live(id)
+  })
+  .await
+  .unwrap_or_default();
+  let began = crate::xshard::call_in_shard_time(
+    control,
+    owner,
+    move |s| crate::verbs::begin_readoption(s, id, engine),
+    crate::daemon::LIVENESS_BUDGET_NS,
+  )
+  .await;
+  let readopted = match began {
+    Some(true) => Some(stepped_through(control, owner, id).await),
+    Some(false) => Some(false),
+    None => None,
+  };
+  if !brought.is_empty() {
+    let _ = crate::xshard::call_in_shard_time(
+      control,
+      owner,
+      move |s| crate::repository::svn_commit::release_texts(s, None, &brought),
+      crate::daemon::LIVENESS_BUDGET_NS,
+    )
+    .await;
+  }
+  readopted
 }
 
 /// The engine of `object` rebuilt from this node's ledger through `through`, a slice at a time on this shard: version 0
