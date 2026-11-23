@@ -911,7 +911,10 @@ fn first_log(index: &HgIndex, store: &ContentStore) -> Option<Walked> {
 /// Derived: the rows a stream's step reads to gather an ask ([`Streaming::rows_held`]): a content window's worth of
 /// their stored form, the store's own unit of a step (as a long revision is taken a window a step), one at least.
 pub(crate) fn rows_a_step(store: &ContentStore) -> u64 {
-  (to_u64(store.window()) / to_u64(core::mem::size_of::<StoredRevision>()).max(1)).max(1)
+  to_u64(store.window())
+    .checked_div(to_u64(core::mem::size_of::<StoredRevision>()).max(1))
+    .unwrap_or(0)
+    .max(1)
 }
 
 /// The log after `log` in the walk's order that holds a revision.

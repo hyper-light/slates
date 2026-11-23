@@ -34,19 +34,30 @@ fn append(log: &mut ChangesetLog<SimFile>, sequence: u64, bytes: &[u8]) -> Locat
   record.commit().unwrap()
 }
 
+/// The bytes `identity`'s payload lookup names in `log`, or `None` where `rows` holds no lookup for it. A refused read
+/// fails the test ([`lookup`], [`bytes_at`]), never reads as no lookup.
 fn read(
   rows: &mut ShardDb<SimFile>,
   log: &ChangesetLog<SimFile>,
   identity: &Identity,
 ) -> Option<Vec<u8>> {
+  let (found, value) = lookup(rows, identity);
+  found.then(|| bytes_at(log, &value))
+}
+
+/// Whether `rows` holds `identity`'s payload lookup, and its value.
+fn lookup(rows: &mut ShardDb<SimFile>, identity: &Identity) -> (bool, Vec<u8>) {
   let mut value = Vec::new();
-  if !rows.get(&content_key(identity), &mut value).unwrap() {
-    return None;
-  }
-  let (offset, len) = decode_content(&value).unwrap();
+  let found = rows.get(&content_key(identity), &mut value).unwrap();
+  (found, value)
+}
+
+/// The bytes a payload lookup's `value` names in `log`.
+fn bytes_at(log: &ChangesetLog<SimFile>, value: &[u8]) -> Vec<u8> {
+  let (offset, len) = decode_content(value).unwrap();
   let mut bytes = vec![0; usize::try_from(len).unwrap()];
   log.read_at(&mut bytes, offset).unwrap();
-  Some(bytes)
+  bytes
 }
 
 /// A-767 C3. Rebuild a checkpoint missing a shared payload's lookup and holding a replaced

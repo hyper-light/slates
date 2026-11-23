@@ -925,7 +925,8 @@ fn stock_svn_copies_a_directory_from_an_older_revision_over_svn_protocol() {
   put(&within, "one\n");
   svn.ok(&within, &["add", FILE]);
   expect_line(
-    &svn.ok(&copy, &["commit", "--message", "d"]),
+    // Not "d": stock svn refuses a log message naming a path of the working copy (E205005, "use '--force-log'").
+    &svn.ok(&copy, &["commit", "--message", "add d"]),
     "Committed revision 1.",
   );
   put(&within, "two\n");

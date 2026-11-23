@@ -337,7 +337,9 @@ impl ChunkArena {
     }
     let mut added = 0usize;
     while added < bytes {
-      let want = self.block_len(bytes - added).unwrap_or(usize::MAX);
+      let want = self
+        .block_len(bytes.saturating_sub(added))
+        .unwrap_or(usize::MAX);
       let Some(source) = self.source.as_mut() else {
         break;
       };
