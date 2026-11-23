@@ -57,9 +57,201 @@ const EXIT_FAILED: u8 = slates_server::watchdog::FAILED_EXIT_CODE;
 /// a freed large buffer returns to the OS at once (`slates_mem::large`, A-742); the rest the system's. An
 /// embedding host that serves the roles from its own executable installs it the same way.
 #[global_allocator]
-static ALLOCATOR: slates_mem::large::LargeMapped = slates_mem::large::LargeMapped;
+static ALLOCATOR: sites::Sited = sites::Sited;
+
+/// DIAG ONLY (w-hg's alloc-sites branch, never main; main 01a20182's order of 2026-11-23): `LargeMapped` with a byte
+/// sampler behind `SLATES_ALLOC_SITES`. Every [`sites::SAMPLE`] bytes allocated, a backtrace names the allocation's
+/// innermost frames outside the allocator and the standard library; the sampled bytes are charged to it. The cumulative
+/// top sites are dumped to stderr (the anchor's log), stamped with the wall clock: first once the run has allocated what
+/// its first second allocated again, then each time its allocation grows by a [`sites::FRACTION`]th, so the arena's
+/// rows (`ROW-START` stamps) split them.
+#[allow(
+  clippy::disallowed_types,
+  clippy::print_stderr,
+  clippy::unwrap_used,
+  clippy::arithmetic_side_effects,
+  clippy::indexing_slicing
+)]
+mod sites {
+  use std::alloc::{GlobalAlloc, Layout};
+  use std::collections::HashMap;
+  use std::sync::Mutex;
+  use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+  use slates_mem::large::LargeMapped;
+
+  /// Diag shape: the bytes between samples.
+  pub const SAMPLE: u64 = 4 << 20;
+  /// Diag shape: a dump each time the run's allocation grows by this fraction of itself.
+  pub const FRACTION: u64 = 16;
+  /// Diag shape: the sites a dump lists.
+  const LISTED: usize = 25;
+
+  /// Whether sampling is on (`SLATES_ALLOC_SITES` at start).
+  static ENABLED: AtomicBool = AtomicBool::new(false);
+  /// Bytes allocated since sampling began, and since the last sample.
+  static TOTAL: AtomicU64 = AtomicU64::new(0);
+  static SINCE: AtomicU64 = AtomicU64::new(0);
+  /// The run's first second's allocation, once known, and the allocation the next dump waits for.
+  static FIRST: AtomicU64 = AtomicU64::new(0);
+  static NEXT: AtomicU64 = AtomicU64::new(u64::MAX);
+  /// When sampling began, milliseconds of the wall clock.
+  static START_MS: AtomicU64 = AtomicU64::new(0);
+  /// The sampled bytes by site.
+  static TABLE: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+
+  std::thread_local! {
+    /// Set while this thread samples or dumps: its own allocations are not sampled.
+    static GUARD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+  }
+
+  /// The wall clock, milliseconds.
+  fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .map_or(0, |since| {
+        u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+      })
+  }
+
+  /// Turns sampling on where `SLATES_ALLOC_SITES` is set.
+  pub fn enable_from_env() {
+    if std::env::var_os("SLATES_ALLOC_SITES").is_some() {
+      START_MS.store(now_ms(), Ordering::Relaxed);
+      ENABLED.store(true, Ordering::Relaxed);
+      eprintln!(
+        "slates: DIAG alloc-sites on: a sample every {SAMPLE} B, a dump each 1/{FRACTION} of the run's allocation"
+      );
+    }
+  }
+
+  /// A backtrace's site: its innermost two frames outside the allocator, the standard library and this module.
+  fn site(trace: &str) -> String {
+    let skip = |name: &str| {
+      name.starts_with("std::")
+        || name.starts_with("core::")
+        || name.starts_with("alloc::")
+        || name.starts_with("<alloc::")
+        || name.starts_with("<core::")
+        || name.starts_with("<std::")
+        || name.starts_with("__rust")
+        || name.starts_with("__rdl")
+        || name.contains("slates_mem::large")
+        || name.contains("slates::sites")
+        || name.contains("sites::")
+        || name.contains("backtrace")
+        || name.contains("GlobalAlloc")
+    };
+    let frames: Vec<&str> = trace
+      .lines()
+      .map(str::trim)
+      .filter_map(|line| {
+        let (number, name) = line.split_once(": ")?;
+        number.chars().all(|c| c.is_ascii_digit()).then_some(name)
+      })
+      .filter(|name| !skip(name))
+      .take(2)
+      .collect();
+    let short = |name: &str| {
+      name
+        .rsplit_once("::h")
+        .map_or(name, |(head, _)| head)
+        .to_owned()
+    };
+    match frames.as_slice() {
+      [inner, caller, ..] => format!("{} <- {}", short(inner), short(caller)),
+      [inner] => short(inner),
+      [] => "(no frame)".to_owned(),
+    }
+  }
+
+  /// Dumps the cumulative top sites, stamped.
+  fn dump(total: u64) {
+    let Ok(table) = TABLE.lock() else {
+      return;
+    };
+    let Some(table) = table.as_ref() else {
+      return;
+    };
+    let mut sites: Vec<(&String, &u64)> = table.iter().collect();
+    sites.sort_by(|left, right| right.1.cmp(left.1));
+    eprintln!(
+      "slates-server: DIAG alloc-sites at_ms={} since_ms={} total={total} sites={}",
+      now_ms(),
+      now_ms().saturating_sub(START_MS.load(Ordering::Relaxed)),
+      table.len()
+    );
+    for (name, bytes) in sites.into_iter().take(LISTED) {
+      eprintln!("slates-server: DIAG alloc-site {bytes} {name}");
+    }
+  }
+
+  /// Notes `size` bytes allocated: sampled every [`SAMPLE`], dumped as the run's allocation grows.
+  fn note(size: usize) {
+    if !ENABLED.load(Ordering::Relaxed) {
+      return;
+    }
+    let size = size as u64;
+    let total = TOTAL.fetch_add(size, Ordering::Relaxed) + size;
+    let since = SINCE.fetch_add(size, Ordering::Relaxed) + size;
+    if since < SAMPLE {
+      return;
+    }
+    if GUARD.with(|guard| guard.replace(true)) {
+      return;
+    }
+    SINCE.store(0, Ordering::Relaxed);
+    let key = site(&std::backtrace::Backtrace::force_capture().to_string());
+    if let Ok(mut table) = TABLE.lock() {
+      *table
+        .get_or_insert_with(HashMap::new)
+        .entry(key)
+        .or_insert(0) += since;
+    }
+    // The first interval: what the run's first second allocated.
+    if FIRST.load(Ordering::Relaxed) == 0
+      && now_ms().saturating_sub(START_MS.load(Ordering::Relaxed)) >= 1_000
+    {
+      FIRST.store(total.max(1), Ordering::Relaxed);
+      NEXT.store(total.saturating_mul(2), Ordering::Relaxed);
+    }
+    if total >= NEXT.load(Ordering::Relaxed) {
+      let step = FIRST.load(Ordering::Relaxed).max(total / FRACTION);
+      NEXT.store(total.saturating_add(step), Ordering::Relaxed);
+      dump(total);
+    }
+    GUARD.with(|guard| guard.set(false));
+  }
+
+  /// `LargeMapped`, sampled.
+  pub struct Sited;
+
+  // SAFETY: every call is `LargeMapped`'s, unchanged; the sampler only reads the layout's size before it.
+  unsafe impl GlobalAlloc for Sited {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+      note(layout.size());
+      // SAFETY: as the caller's contract with `alloc`.
+      unsafe { LargeMapped.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+      // SAFETY: as the caller's contract with `dealloc`.
+      unsafe { LargeMapped.dealloc(ptr, layout) }
+    }
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+      note(layout.size());
+      // SAFETY: as the caller's contract with `alloc_zeroed`.
+      unsafe { LargeMapped.alloc_zeroed(layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+      note(new_size.saturating_sub(layout.size()));
+      // SAFETY: as the caller's contract with `realloc`.
+      unsafe { LargeMapped.realloc(ptr, layout, new_size) }
+    }
+  }
+}
 
 fn main() -> ExitCode {
+  sites::enable_from_env();
   let arguments: Vec<String> = std::env::args().skip(1).collect();
   // The daemon's WinFsp purge client, a role only a daemon starts (no daemon thread opens its own volume, §4.6), served
   // by the library's role entry as a host's executable serves it.

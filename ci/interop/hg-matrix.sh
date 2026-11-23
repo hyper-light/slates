@@ -39,6 +39,8 @@ row() {
   local log="$WORK/logs/$name.log" peak="$WORK/logs/$name.rss" start end code sampler kib
   mkdir -p "$WORK/logs"
   start=$(date +%s)
+  # w-hg's alloc-sites diag: each row's start in milliseconds, so the daemon's stamped DIAG alloc-sites dumps split by row.
+  echo "ROW-START $name $(date +%s%3N)"
   daemon_rss >"$peak"
   ( top=0; while :; do now=$(daemon_rss); [ "$now" -gt "$top" ] && { top=$now; echo "$top" >"$peak"; }
     sleep "$RSS_PERIOD"; done ) &

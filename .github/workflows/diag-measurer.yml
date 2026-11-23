@@ -42,6 +42,9 @@ jobs:
           "$RUNNER_TEMP/hgvenv/bin/pip" install --disable-pip-version-check --no-input "mercurial==7.2"
           echo "$RUNNER_TEMP/hgvenv/bin" >> "$GITHUB_PATH"
       - name: Build
+        # w-hg's alloc-sites diag: line tables, so a sampled backtrace names inlined frames in the release binary.
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
         run: cargo build --release --locked -p slates-cli --bin slates
       - name: Mercurial's own history (a tag at a time, so a cut transfer is retried small)
         run: |
@@ -57,6 +60,8 @@ jobs:
           # main 01a20182 (arena-8): is the RSS floor glibc's retention? One leg runs the daemon with a single arena.
           if [ "${{ matrix.malloc }}" = arena1 ]; then export MALLOC_ARENA_MAX=1; fi
           echo "MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX:-unset}"
+          # w-hg's alloc-sites diag: the daemon samples its allocation by site and dumps the cumulative top sites.
+          export SLATES_ALLOC_SITES=1
           echo "nproc $(nproc); load before $(cat /proc/loadavg)"
           for i in $(seq $(( $(nproc) * 2 ))); do (while :; do :; done) & done
           sleep 20; echo "load with burners $(cat /proc/loadavg)"
@@ -72,6 +77,9 @@ jobs:
           echo "== w-hg's give-up line"; grep "a push's intake waited for room and gave up" $A | cut -c1-400 | sort | uniq -c | head -20 || true
           echo "== the typed refusal"; grep -h "needs more room than its repository could ever be lent on its shard" $A $RUNNER_TEMP/matrix-hg/logs/*.log | cut -c1-400 | sort | uniq -c | head -20 || true
           echo "== push-all's log"; tail -c 3000 $RUNNER_TEMP/matrix-hg/logs/push-all.log || true
+          echo "== w-hg alloc-sites: each row's start (ms), then every stamped dump of the daemon's top sites"
+          grep -h "^ROW-START" $RUNNER_TEMP/matrix-hg.out || true
+          grep -E "DIAG alloc-site" $A | cut -c1-400 || true
           echo "== the push's outcome"; grep -E "^(PASS|FAIL) push-all" $RUNNER_TEMP/matrix-hg.out | head -1 | cut -c1-400 || true
           echo "== past-ceiling log line (typed, at the wait)"; grep "a push's intake needs more than its repository could ever be lent" $A | cut -c1-400 | sort | uniq -c | head -20 || true
           echo "== the counters (vcs.hg.push_segments_landed, vcs.hg.push_runs_abandoned, vcs.hg.push_need_admitted, the room waits)"; python3 -c 'import json,sys
