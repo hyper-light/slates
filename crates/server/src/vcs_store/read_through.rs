@@ -380,4 +380,74 @@ mod tests {
       Err(slates_vcs::LetGoRefused::Pinned { by: "homes" })
     );
   }
+
+  /// Goal 93 item 2b(a)'s window (main 01a20182, 2026-11-22: a fetch that starts while a push of the same repository is
+  /// still deciding its refs reads every object). Do: on a store-backed daemon, put a landed pack of several windows in a
+  /// git repository's content store and owe its let-go (the commit of a push's first entry deferred it), with a push of
+  /// the repository under way (`vcs_share::Live::begin`, as `ReceivePack` holds one); let a fetch end, as its going idle
+  /// runs (`git_encode::give_back_idle`); then end the push and go idle again. Expect: while the push is under way the
+  /// pack held whole and still owed, nothing of it let go or pinned, so its later refs read every object; once the push
+  /// has ended its let-go run (each window let go, or kept where a home holds it here: on this one-shard daemon every
+  /// window's home is here) and owed no more. Failing first: the fetch's going idle ran the let-go under the push.
+  #[test]
+  fn a_landed_pack_owed_its_let_go_stays_whole_while_a_push_of_it_is_under_way() {
+    let (_store, daemon) = crate::test_store::audit_daemon_stored();
+    let answered = crate::daemon::observe_first(&daemon, |state| {
+      let id = crate::git_push::tests::git_repository(state, "owed-under-push");
+      let window = state
+        .vcs_stores
+        .content()
+        .map_or(1 << 18, slates_vcs::ContentStore::window);
+      let bytes: Vec<u8> = (0..3 * window + 11)
+        .map(|at| u8::try_from(at % 247).unwrap())
+        .collect();
+      let len = u64::try_from(bytes.len()).unwrap();
+      let pack = crate::vcs_store::within_budget(state, len, |stores| {
+        stores.content_mut().unwrap().put_object(&bytes).unwrap()
+      });
+      state
+        .vcs_stores
+        .landed_owed
+        .entry(id)
+        .or_default()
+        .push(pack);
+      let whole = |state: &crate::state::ShardState| {
+        state
+          .vcs_stores
+          .content()
+          .is_some_and(|content| content.holds_whole(&pack))
+      };
+      let counted = |state: &crate::state::ShardState| {
+        let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+        count(crate::vcs_store::LANDED_LET_GO_BYTES) + count(crate::vcs_store::LANDED_PINNED)
+      };
+      let owed = |state: &crate::state::ShardState| {
+        state
+          .vcs_stores
+          .landed_owed
+          .get(&id)
+          .is_some_and(|owed| owed.contains(&pack))
+      };
+      let pushing = crate::vcs_share::Live::begin(id);
+      crate::vcs_store::git_encode::give_back_idle(state, id);
+      let under_push = (whole(state), counted(state), owed(state));
+      drop(pushing);
+      crate::vcs_store::git_encode::give_back_idle(state, id);
+      (under_push, (counted(state), owed(state)))
+    });
+    daemon.stop();
+    let ((whole_under_push, let_go_under_push, owed_under_push), (let_go_after, owed_after)) =
+      answered;
+    assert!(
+      whole_under_push,
+      "the pack held whole while a push of it is under way"
+    );
+    assert_eq!(
+      let_go_under_push, 0,
+      "nothing let go or pinned under the push"
+    );
+    assert!(owed_under_push, "its let-go still owed under the push");
+    assert!(let_go_after > 0, "its let-go run once the push ended");
+    assert!(!owed_after, "owed no more");
+  }
 }
