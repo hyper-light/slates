@@ -591,51 +591,66 @@ fn run_pipe(
   stop: Receiver<()>,
   ready: std::sync::mpsc::SyncSender<Result<(), IpcError>>,
 ) {
-  use crate::completion_pipe::{Listener, Nudged};
-  use crate::wake::EventOrExit;
-  let mut listener = match Listener::new(server) {
-    Ok(listener) => listener,
-    Err(refused) => {
-      let _ = ready.send(Err(refused));
-      return;
-    }
-  };
-  if ready.send(Ok(())).is_err() {
+  let Some(mut listener) = listening(server, &ready) else {
     return;
-  }
+  };
   while !stopped(&stop) {
-    let signaled = if listener.admitted() {
-      region.wake_wait(Some(POLL_NS)).unwrap_or(false)
-    } else {
-      matches!(
-        region.wake_wait_or_exit(listener.event(), Some(POLL_NS)),
-        Ok(EventOrExit::Signaled)
-      )
-    };
+    let signaled = pipe_wait(&region, &listener);
     if stopped(&stop) {
       break;
     }
     if signaled && synchronous_park_waiting(&region) {
       let _ = region.wake_signal();
     }
-    match listener.settle() {
-      Ok(true) => {}
-      Ok(false) => continue,
-      Err(_) => break,
-    }
-    if armed_with_reply_waiting(&region) {
-      match listener.nudge(&NUDGE) {
-        Ok(Nudged::Readable) => {}
-        // The reader went (its stream destroyed): listen for the next at once.
-        Ok(Nudged::ReaderGone) => {
-          if listener.settle().is_err() {
-            break;
-          }
-        }
-        Err(_) => break,
-      }
+    if pipe_turn(&region, &mut listener).is_err() {
+      break;
     }
   }
+}
+
+/// The pipe bridge's listener, made on its thread, and the start told whether it was: `None` when it could not be
+/// made, or the start no longer waits.
+#[cfg(windows)]
+fn listening(
+  server: std::os::windows::io::OwnedHandle,
+  ready: &std::sync::mpsc::SyncSender<Result<(), IpcError>>,
+) -> Option<crate::completion_pipe::Listener> {
+  match crate::completion_pipe::Listener::new(server) {
+    Ok(listener) => ready.send(Ok(())).is_ok().then_some(listener),
+    Err(refused) => {
+      let _ = ready.send(Err(refused));
+      None
+    }
+  }
+}
+
+/// The pipe bridge's wait: on the region's Event alone once a reader is admitted, else beside the listener's connect.
+/// Whether the Event ended it.
+#[cfg(windows)]
+fn pipe_wait(region: &ClientRegion, listener: &crate::completion_pipe::Listener) -> bool {
+  if listener.admitted() {
+    return region.wake_wait(Some(POLL_NS)).unwrap_or(false);
+  }
+  matches!(
+    region.wake_wait_or_exit(listener.event(), Some(POLL_NS)),
+    Ok(crate::wake::EventOrExit::Signaled)
+  )
+}
+
+/// One turn of the pipe bridge after its wait: a step toward an admitted reader, then, with one admitted, a nudge while
+/// the client is armed and a reply waits; a reader gone is listened past at once. A refusal ends the thread.
+#[cfg(windows)]
+fn pipe_turn(
+  region: &ClientRegion,
+  listener: &mut crate::completion_pipe::Listener,
+) -> Result<(), IpcError> {
+  if !listener.settle()? || !armed_with_reply_waiting(region) {
+    return Ok(());
+  }
+  if listener.nudge(&NUDGE)? == crate::completion_pipe::Nudged::ReaderGone {
+    listener.settle()?;
+  }
+  Ok(())
 }
 
 /// The Windows bridge thread: park on the region's named Event; after every return, whether signalled or

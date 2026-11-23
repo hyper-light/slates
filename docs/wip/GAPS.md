@@ -6155,8 +6155,8 @@
 > adopts no Windows socket by descriptor (libuv's `uv_guess_handle`), and the SDK was handed the bridge's loopback
 > socket. **Built:** the Windows bridge signals the Node SDK through a named pipe that `async.mjs` opens by name
 > (`net.connect`), admitting only a reader of this process (`crates/ipc/src/completion_pipe.rs`). Python keeps the
-> socket. **Owed:** main's diag run on windows-latest (red at main, green with the change, with `slates-ipc`'s two new
-> Windows tests), then windows-11-arm; a test of a reader from another process being refused.
+> socket. **Owed:** main's diag run on windows-latest (red at main, green with the change, with `slates-ipc`'s new
+> Windows tests and the other-process reader's), then windows-11-arm.
 > **The Node SDK suites on Windows (2026-11-18, §4.7 status "the Node SDK suites end on Windows"; goal 88).** The three
 > Node suites had never run on Windows: CI's `sdk` job ran on `ubuntu-latest` and `macos-latest` alone. Main's diag run
 > 44384411115 (main da697d886) ran them on both Windows runners, and the step went past 70 minutes until cancelled, with

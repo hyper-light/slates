@@ -2570,6 +2570,22 @@ mod windows_tests {
   /// look would take longer than this.
   const SOONER_THAN_THE_TIMED_LOOK: Duration = Duration::from_millis(500);
 
+  /// Format: the variable that makes a run of this test binary the intruder of
+  /// [`a_reader_of_another_process_is_cut_off_and_this_processs_reader_is_admitted`]: the pipe name it opens.
+  const INTRUDER_ENV: &str = "SLATES_TEST_COMPLETION_PIPE_INTRUDER";
+
+  /// Format: the tag before what the intruder saw, looked for anywhere in a line, since libtest's `test <name> ... `
+  /// comes glued to the role's first line.
+  const INTRUDER_TAG: &str = "COMPLETION-PIPE-INTRUDER";
+
+  /// Shape: how long the intruder may take to start, open the name and be cut off: far above a test binary's start
+  /// on a loaded runner, a guard against a bridge that never cuts it, never a measure.
+  const INTRUDER_ENDS_WITHIN: Duration = Duration::from_secs(60);
+
+  /// Shape: how long the test retries its own open while the bridge, having cut the intruder off, has yet to listen
+  /// again: two of the bridge's timed looks (a second each).
+  const RELISTENS_WITHIN: Duration = Duration::from_secs(2);
+
   fn geometry() -> RegionGeometry {
     RegionGeometry {
       slots: 8,
@@ -2695,6 +2711,108 @@ mod windows_tests {
     client.disarm_async().unwrap();
     assert_eq!(client.try_take().unwrap().unwrap().payload, b"two");
 
+    drop(reader);
+    drop(client);
+  }
+
+  /// The intruder's role for [`a_reader_of_another_process_is_cut_off_and_this_processs_reader_is_admitted`]: nothing
+  /// unless [`INTRUDER_ENV`] names a pipe; then open it as Node does and read until the bridge cuts it off, printing
+  /// what the read answered (zero bytes, the pipe gone) or the open's refusal.
+  #[test]
+  fn completion_pipe_intruder_role() {
+    let Ok(pipe) = std::env::var(INTRUDER_ENV) else {
+      return;
+    };
+    match open_as_node_does(&pipe) {
+      Ok(reader) => {
+        let mut bytes = [0u8; 8];
+        let read = crate::stream::read_waiting(reader.as_handle(), &mut bytes);
+        println!("{INTRUDER_TAG} CUT {read:?}");
+      }
+      Err(code) => println!("{INTRUDER_TAG} REFUSED {code}"),
+    }
+  }
+
+  /// A-875 (the completion pipe's reader is this process's alone). Do: enable the client's completion pipe, and before
+  /// this process opens it, open its name from another process (this test binary run again as the intruder, which
+  /// reads until it is cut off); then open it here and reply to an armed client. Expect the intruder's open to succeed
+  /// at the kernel and its read to end with nothing (zero bytes: the bridge judged it another process and cut it off),
+  /// this process's open then admitted within two timed looks, and the armed reply's nudge waiting for it.
+  #[test]
+  fn a_reader_of_another_process_is_cut_off_and_this_processs_reader_is_admitted() {
+    use std::io::Read as _;
+    let name = format!(
+      "slates-endpoint-windows-pipe-intruder-{}",
+      std::process::id()
+    );
+    let region = ClientRegion::create(&name, 7, 0, geometry()).unwrap();
+    let (handoff, len) = region.handoff().unwrap();
+    let mut client = ClientEnd::new(ClientRegion::open(&handoff, len).unwrap());
+    let mut daemon = DaemonEnd::new(region);
+    let pipe = client.enable_async_completion_pipe().unwrap();
+
+    let mut intruder = std::process::Command::new(std::env::current_exe().unwrap())
+      .args([
+        "--exact",
+        "endpoint::windows_tests::completion_pipe_intruder_role",
+        "--nocapture",
+        "--test-threads=1",
+      ])
+      .env(INTRUDER_ENV, &pipe)
+      .stdout(std::process::Stdio::piped())
+      .spawn()
+      .unwrap();
+    let started = Instant::now();
+    while intruder.try_wait().unwrap().is_none() {
+      if started.elapsed() > INTRUDER_ENDS_WITHIN {
+        let _ = intruder.kill();
+        let _ = intruder.wait();
+        panic!(
+          "the intruder still held the pipe after {INTRUDER_ENDS_WITHIN:?}: it was never cut off"
+        );
+      }
+      // Test pacing while the intruder runs; shipped code waits on its driver (D-9).
+      #[allow(clippy::disallowed_methods)]
+      std::thread::sleep(LOOK_EVERY);
+    }
+    let mut said = String::new();
+    intruder
+      .stdout
+      .take()
+      .unwrap()
+      .read_to_string(&mut said)
+      .unwrap();
+    assert!(
+      said.contains(&format!("{INTRUDER_TAG} CUT Ok(0)")),
+      "the intruder was cut off with nothing read: {said}"
+    );
+
+    let opening = Instant::now();
+    let reader = loop {
+      match open_as_node_does(&pipe) {
+        Ok(reader) => break reader,
+        Err(_) if opening.elapsed() < RELISTENS_WITHIN => {
+          // Test pacing while the bridge comes to listen again; shipped code waits on its driver (D-9).
+          #[allow(clippy::disallowed_methods)]
+          std::thread::sleep(LOOK_EVERY);
+        }
+        Err(code) => {
+          panic!("this process's open refused {code} for {RELISTENS_WITHIN:?} after the intruder")
+        }
+      }
+    };
+    client.arm_async().unwrap();
+    client.send(&Slot::inline(1, b"hi").unwrap()).unwrap();
+    let request = daemon.try_take().unwrap().unwrap();
+    daemon
+      .reply(&Slot::inline(request.request, b"mine").unwrap())
+      .unwrap();
+    assert!(
+      readable_within(&reader, ARRIVES_WITHIN),
+      "this process's reader, admitted after the intruder, is nudged for an armed reply"
+    );
+    client.disarm_async().unwrap();
+    assert_eq!(client.try_take().unwrap().unwrap().payload, b"mine");
     drop(reader);
     drop(client);
   }

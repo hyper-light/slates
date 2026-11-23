@@ -37,7 +37,7 @@ a selector) were not affected, and nothing was written wrongly.
 - `crates/ipc/src/completion.rs`: the Windows bridge signals a socket or a pipe (`Signal`); `start_pipe` and
   `run_pipe`, which waits beside the connect until a reader is admitted.
 - `crates/ipc/src/endpoint.rs`: `enable_async_completion_pipe` replaces the Windows `enable_async_completion_dup`;
-  two Windows tests.
+  three Windows tests, one with a reader from another process (the test binary run again).
 - `crates/ipc/src/stream_pipe.rs`: `fresh_name(prefix)`, `OwnerOnly`, `last_error` and `os` shared with the crate.
 - `crates/client/src/client.rs`: `enable_async_completion_pipe` on Windows.
 - `crates/sdk-node/src/lib.rs`: `completionPipe()` on Windows in place of `completionFd()`. `async.mjs` opens the
@@ -49,5 +49,7 @@ a selector) were not affected, and nothing was written wrongly.
   at main (the Node suites alone).
 - After: owed to main's diag run on windows-latest with this change: the Node suites, and `slates-ipc`'s
   `the_windows_completion_pipe_is_opened_by_name_and_signals_only_an_armed_reply` and
-  `a_reply_that_landed_before_the_reader_connected_is_signalled_as_it_connects`. The MacBook builds no Windows code.
+  `a_reply_that_landed_before_the_reader_connected_is_signalled_as_it_connects` and
+  `a_reader_of_another_process_is_cut_off_and_this_processs_reader_is_admitted`. The MacBook builds no Windows code;
+  main cross-linted `slates-ipc`'s library for both Windows targets (one complexity finding in `run_pipe`, split).
   On macOS, unchanged: `slates-ipc --lib completion` 3 of 3 and `--test completion_memory` 1 of 1.

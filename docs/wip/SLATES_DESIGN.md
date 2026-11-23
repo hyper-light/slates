@@ -61637,6 +61637,6 @@ Windows in place of `completionFd`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sd
     refused `ERROR_PIPE_BUSY`, the pipe stays quiet for a fast-path reply and holds a nudge for an armed one.
   - `a_reply_that_landed_before_the_reader_connected_is_signalled_as_it_connects`: within half a second of the
     connect, under the bridge's one-second timed look.
+  - `a_reader_of_another_process_is_cut_off_and_this_processs_reader_is_admitted`: the test binary run again opens the
+    name first and is cut off with nothing read; this process's open is then admitted and nudged.
   - The Node suites on windows-latest, the red at main and the green with this change.
-- **Not proven here:** a reader of another process refused. That needs a second process to race the SDK to the name,
-  and the refusal's count is there for such a test (`Listener::refused`).
