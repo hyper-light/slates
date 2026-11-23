@@ -792,8 +792,8 @@
 >   clone takes them and the filter hides what they obsolete. `markers` moved from `getbundle::Store` to `Repository`.
 >   Still owed: the hidden view under a non-publishing repository (`PUBLISHING` is const true, so a pushed draft lands
 >   public and a rewrite of a pushed changeset is refused by the client), decision 3's rewrite admission, the
->   `obsolete` pushkey namespace, the reply's `N new obsolescence markers` output, and the kept heads for a view with
->   left-out changesets.
+>   `obsolete` pushkey namespace, and the reply's `N new obsolescence markers` output. The kept heads for a view with
+>   left-out changesets: BUILT (piece 2, below).
 > - A daemon's allocation by site under stock Mercurial measured BUILT (2026-11-23, w-hg; main's order (A)):
 >   `crates/server/tests/hg_push_heap.rs`, its own binary (`LargeMapped` with a byte sampler on while a row runs), an
 >   in-process daemon with a store and the cleartext HTTP edge, real `hg` subprocesses pushing a 400-changeset
@@ -829,7 +829,15 @@
 >   taken again, appended in groups as segments land, equal to the walk and the rule after every group),
 >   `a_lookup_of_a_branch_name_reads_its_heads_not_the_history` and `branchmap_over_a_long_line_reads_its_heads_not_the_history`
 >   (a 170-changeset line: red 512 and 511 reads, now at most 8; `BranchHeads::answered` the non-vacuity count). A
->   view that leaves a changeset out (secret, hidden) still walks: OPEN, rare in a publishing repository.
+>   view that leaves a changeset out (secret, hidden) answers from them too (BUILT 2026-11-23, w-hg, evolution piece
+>   2): `BranchHeads` keeps each append's endings in order (`Endings`, sealed 4,096-ending `Arc` chunks a fork shares,
+>   8 bytes an ending, about one a changeset), so `BranchHeads::served` reads the heads back to the view's first
+>   changeset that is not public (today's below it, and those an append from it on ended) and appends the served tail
+>   alone: the tail's endings and appends, no walk of the history. Held by
+>   `a_views_kept_branch_heads_are_the_walks_whatever_it_leaves_out` (generated histories on three branches, every
+>   phase, prunes and rewrites, publishing or not: red, the kept heads answered none) and
+>   `a_long_views_kept_heads_read_back_past_sealed_endings` (9,000 changesets, the first not public inside the second
+>   sealed chunk). The cost: about 8 bytes a changeset held, measured nowhere yet (main's).
 >   An append's walk through other branches is one append's work: counted (`BranchHeads::longest_walk`, the status
 >   counter `vcs.hg.branch_heads_longest_walk`, read from each index a landing puts in place) and held by
 >   `a_branch_taken_again_after_a_long_line_counts_its_walk` (a `stable` revision on a 400-revision `default` line:

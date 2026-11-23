@@ -427,9 +427,22 @@ impl Repository for Indexed<'_> {
     )
   }
 
+  /// Every head the index keeps where the view serves the whole changelog; else the kept heads read back to the view's
+  /// first changeset that is not public and its served tail appended (`BranchHeads::served`), each numbered as the
+  /// view numbers it. None where the index cannot read a row the tail names.
   fn maintained_branch_heads(&self) -> Option<Vec<Rev>> {
-    (self.left_out.is_empty() && self.count() == self.index.len(self.store, Log::Changelog))
-      .then(|| self.index.branch_heads().answer())
+    let heads = self.index.branch_heads();
+    if self.left_out.is_empty() && self.count() == self.index.len(self.store, Log::Changelog) {
+      return Some(heads.answer());
+    }
+    let served = heads
+      .served(
+        (self.index, self.store),
+        self.first,
+        self.tail.iter().map(|kept| kept.rev),
+      )
+      .ok()?;
+    served.into_iter().map(|rev| self.served_rev(rev)).collect()
   }
 
   fn node(&self, rev: Rev) -> Option<Node> {
