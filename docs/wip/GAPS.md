@@ -4364,6 +4364,11 @@
 > stock 1.15 over `SLATES_SVN_USE_ROUTE=http-v1` with `SLATES_SVN_USE_VERBS=revprops` against svnserve; and
 > `svnsync synchronize` over HTTP, the mirror against svnserve's byte for byte (`an_svnsync_measured`'s DAV leg,
 > `SLATES_SVN_USE_VERBS=svnsync` over `http`).
+> **(B)'s one difference was the harness's (w-interop, 2026-11-23):** main's round failed on the mirrors' `UUID:` line
+> alone. Stock `svnsync` never sets a mirror's UUID (`svnsync.c` `do_initialize`), so each `svnadmin create` mirror
+> held a random one. The HTTP edge reports the imported dump's UUID (OPTIONS and PROPFIND, checked). `mirror_dump_of`
+> now gives each mirror `MIRROR_UUID`, as `svn-matrix.sh` does
+> (`docs/bugs/2026-11-23-the-svnsync-use-row-compared-two-random-mirror-uuids.md`). Owed: main's rerun of (B).
 > **R4, recovery replays a revision record a turn at a time (2026-11-20, w-svn; Ada's close list; found by w-git's sweep):**
 > a Subversion revision's record was replayed whole in one recovery or rebuild turn (`replay_svn` -> `commit_record`),
 > every text it brought deltified in one step, so one large revision held its shard. Now `RevisionReplay`
@@ -9726,8 +9731,11 @@
 >   (`a_claim_under_a_live_anchor_waits_out_a_restart_slower_than_the_old_reconnect_budget`,
 >   `a_claim_under_an_anchor_ends_at_the_anchors_going`,
 >   `a_rendezvous_has_a_holder_while_its_anchor_or_its_own_daemon_lives`;
->   `a_call_to_a_killed_unanchored_daemon_ends_daemon_gone_at_once`). `reconnect_ns` still bounds the waits on a fleet
->   owner's takeover (a request refused for now held for its resend, the pause between resends,
+>   `a_call_to_a_killed_unanchored_daemon_ends_daemon_gone_at_once`). Since 2026-11-23 (w-win) an anchor's going clears
+>   its mark from the header: a client's doorbell keeps a Windows object past the hold, so an anchor that let go inside a
+>   live process had read as the holder for good (`an_anchor_that_lets_go_is_no_holder_though_a_client_maps_the_object`;
+>   `docs/bugs/2026-11-23-a-windows-anchor-that-let-go-still-read-as-the-rendezvous-holder.md`). `reconnect_ns` still
+>   bounds the waits on a fleet owner's takeover (a request refused for now held for its resend, the pause between resends,
 >   `Client::call_through_transient`), owed to the failover delay the daemon reports. The server's reclaim of a
 >   taken-back map no holder claims (`held_copy::reconnect_budget_ns`, "The holder claims it") mirrored the old
 >   reconnect budget, a fixed two seconds R3 forbids; since A-552 its claim is owed for the failover delay its shard
