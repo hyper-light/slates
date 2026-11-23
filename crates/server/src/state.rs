@@ -699,6 +699,8 @@ pub struct ShardState {
   pub deferred: Vec<Deferred>,
   /// The shard's server task, woken when a client is added while it idles.
   pub server_task: Option<slates_rt::TaskId>,
+  /// What the shard's start did (`crate::recovery_slices::StartReport`), kept once its start ends.
+  pub(crate) start_report: Option<crate::StartReport>,
   /// The clients whose watches reported them gone and whose retirement is owed, each with its id (A-475): a seat joins
   /// once, at its report, so the queue is bounded by the shard's seats (`clients_per_shard`). The reaper takes them a
   /// batch at a time (`crate::reap::reaper`).
