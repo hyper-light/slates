@@ -162,18 +162,30 @@ pub struct Purged {
   pub bytes: usize,
   /// Whether free blocks remain to visit: the next call resumes where this one stopped.
   pub more: bool,
+  /// Bytes of free runs this call left resident for being shorter than the discard size
+  /// ([`ChunkArena::discarding_from`]): taken out of [`ChunkArena::resident_free_bytes`], yet in RAM until reused (the
+  /// memory status's `content.purge_kept_short_bytes`, main 01a20182's ruling of 2026-11-23 on arena-12's 753 MiB).
+  pub kept_short: usize,
 }
 
 /// One resident free run `(first, reach)` of `slot` through the idle purge (A-105): taken out of the resident set and,
-/// when it is at least `discard_from` bytes, given back to the OS. The bytes given back.
-fn purge_run(slot: &mut Slot, (first, reach): (usize, usize), discard_from: usize) -> usize {
+/// when it is at least `discard_from` bytes, given back to the OS. The bytes given back, and the bytes kept resident for
+/// being shorter than that.
+fn purge_run(
+  slot: &mut Slot,
+  (first, reach): (usize, usize),
+  discard_from: usize,
+) -> (usize, usize) {
   slot.dirty.take(first, reach);
   let len = reach.saturating_sub(first);
   // A range shorter than the discard size stays resident: keeping it costs less than faulting it back.
-  if len >= discard_from && slot.region.discard(first, len) {
-    len
+  if len < discard_from {
+    return (0, len);
+  }
+  if slot.region.discard(first, len) {
+    (len, 0)
   } else {
-    0
+    (0, 0)
   }
 }
 
@@ -304,9 +316,10 @@ impl ChunkArena {
           return done;
         }
         visited = visited.saturating_add(1);
-        let discarded = purge_run(slot, (first, reach), discard_from);
+        let (discarded, kept_short) = purge_run(slot, (first, reach), discard_from);
         drained = drained.saturating_add(reach.saturating_sub(first));
         done.bytes = done.bytes.saturating_add(discarded);
+        done.kept_short = done.kept_short.saturating_add(kept_short);
         at = reach;
       }
       self.resident_free = self.resident_free.saturating_sub(drained);
@@ -1148,6 +1161,23 @@ impl ChunkArena {
     self.resident_free = self.resident_free.saturating_add(released_total);
   }
 
+  /// What of the arena's regions is in RAM, each read from the kernel's page table ([`crate::resident::of_range`], the
+  /// reader the large path's `mapped_resident` uses), no byte touched: the memory status's
+  /// `mem.gauge.content.object_resident_bytes` (main 01a20182's ruling of 2026-11-23). A walk of every region's pages, so
+  /// only a memory status asks; a region the OS refuses to read is left out.
+  pub fn residency(&self) -> crate::resident::Residency {
+    let mut found = crate::resident::Residency::default();
+    for slot in self.held() {
+      let bytes = slot.region.bytes();
+      if let Ok(residency) =
+        crate::resident::of_range(bytes.as_ptr(), bytes.len(), slot.region.page())
+      {
+        found = found.plus(residency);
+      }
+    }
+    found
+  }
+
   /// The bytes the arena's regions map — the address space taken, which the buddy's usable
   /// [`ChunkArena::capacity`] is at most (§4.2 "segment, slab and buddy geometry report usable
   /// capacity, not mapping length": both are reported, so the difference is visible).
@@ -1349,6 +1379,44 @@ mod tests {
       "the written block counts again: {purged} -> {written}"
     );
     assert!(arena.bytes(again).unwrap().iter().all(|byte| *byte == 0xCD));
+  }
+
+  /// The memory status's short-run path (main 01a20182's ruling of 2026-11-23: arena-12's content object held 753 MiB
+  /// resident against 183 MB used). Do: in an arena discarding from four pages, write three one-page blocks, free the
+  /// middle one (a run shorter than the discard size between two live blocks), and purge to the end. Expect: the purge
+  /// counts the page kept short and gives nothing back, the arena's resident-free count drops to none, and the
+  /// region's pages in RAM do not fall: the freed page stays resident, which only the kept-short count tells.
+  #[test]
+  #[cfg_attr(miri, ignore)] // Miri models no mincore
+  fn a_free_run_under_the_discard_size_stays_resident_and_is_counted_kept_short() {
+    let p = page();
+    let mut arena = ChunkArena::new(p).discarding_from(4 * p);
+    arena
+      .add_region(Region::map(p * 4, p, false).unwrap())
+      .unwrap();
+    let blocks: Vec<Extent> = (0..3).map(|_| arena.alloc(p).unwrap()).collect();
+    for block in &blocks {
+      arena.bytes_mut(*block).unwrap().fill(0xAB);
+    }
+    arena.free(blocks[1]).unwrap();
+    let resident_before = arena.residency().resident;
+    let mut done = Purged::default();
+    loop {
+      let purged = arena.purge(1);
+      done.bytes += purged.bytes;
+      done.kept_short += purged.kept_short;
+      if !purged.more {
+        break;
+      }
+    }
+    assert_eq!(done.kept_short, p, "the short run counted kept: {done:?}");
+    assert_eq!(done.bytes, 0, "nothing given back: {done:?}");
+    assert_eq!(arena.resident_free_bytes(), 0);
+    let resident_after = arena.residency().resident;
+    assert!(
+      resident_after >= resident_before && resident_after >= 3 * p as u64,
+      "the freed page stays in RAM: {resident_before} then {resident_after}"
+    );
   }
 
   #[test]
