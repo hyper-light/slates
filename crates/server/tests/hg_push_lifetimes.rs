@@ -101,7 +101,8 @@ fn now_ns() -> u64 {
   u64::try_from(origin.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// A backtrace's site: its innermost four frames outside the allocator, the standard library and this test.
+/// A backtrace's site: its innermost four frames outside the allocator, the standard library and this test, tagged with
+/// the innermost standard container it allocated through.
 fn site(trace: &str) -> String {
   let skip = |name: &str| {
     [
@@ -126,21 +127,42 @@ fn site(trace: &str) -> String {
     };
     name.chars().take(160).collect::<String>()
   };
-  let frames: Vec<String> = trace
+  let names: Vec<&str> = trace
     .lines()
     .map(str::trim)
     .filter_map(|line| {
       let (number, name) = line.split_once(": ")?;
       number.chars().all(|c| c.is_ascii_digit()).then_some(name)
     })
+    .collect();
+  // What the site allocated, by the innermost standard-library container above the allocator: a site's B-tree nodes,
+  // hash table, boxes and vectors told apart (one site's 24 MB held at a push's end was any of them).
+  let kind = names.iter().take_while(|name| skip(name)).find_map(|name| {
+    [
+      ("btree", "btree"),
+      ("hashbrown", "hash table"),
+      ("raw_vec", "vec"),
+      ("alloc::boxed", "box"),
+      ("alloc::vec", "vec"),
+    ]
+    .iter()
+    .find(|(part, _)| name.contains(part))
+    .map(|(_, kind)| *kind)
+  });
+  let frames: Vec<String> = names
+    .into_iter()
     .filter(|name| !skip(name))
     .take(4)
     .map(short)
     .collect();
-  if frames.is_empty() {
+  let sited = if frames.is_empty() {
     "(no frame)".to_owned()
   } else {
     frames.join(" <- ")
+  };
+  match kind {
+    Some(kind) => format!("[{kind}] {sited}"),
+    None => sited,
   }
 }
 

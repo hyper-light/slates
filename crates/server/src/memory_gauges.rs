@@ -81,10 +81,29 @@ pub(crate) fn rows(state: &ShardState, memory: bool) -> Vec<RefusalCount> {
 /// object 753 MiB resident against 183 MB the content store used): the regions it maps, their free bytes, the freed
 /// bytes zeroed in place that an idle purge would give back, the frees held for a committed image (A-64), and the
 /// regions' pages in RAM, read from the page table as the large path's `mapped_resident` is.
-fn content_rows(state: &ShardState) -> [(&'static str, u64); 5] {
+///
+/// And what each owner holds there (goal 93, main 01a20182's order on arena-13's 373 MB no gauge named;
+/// `slates_mem::Owner`): its blocks' bytes, and the bytes it asked for, whose difference is the buddy's rounding. The
+/// owners' held bytes and the deferred bytes sum to the arena's allocated bytes, mapped less free, by construction.
+fn content_rows(state: &ShardState) -> [(&'static str, u64); 11] {
   let arena = state.store.content.arena();
   let bytes = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+  let volume = arena.owned(slates_mem::Owner::Volume);
+  let windows = arena.owned(slates_mem::Owner::VcsWindows);
+  let hold = arena.owned(slates_mem::Owner::ContentHold);
   [
+    ("mem.gauge.content.arena_volume_bytes", volume.held),
+    ("mem.gauge.content.arena_volume_asked_bytes", volume.asked),
+    ("mem.gauge.content.arena_vcs_windows_bytes", windows.held),
+    (
+      "mem.gauge.content.arena_vcs_windows_asked_bytes",
+      windows.asked,
+    ),
+    ("mem.gauge.content.arena_content_hold_bytes", hold.held),
+    (
+      "mem.gauge.content.arena_content_hold_asked_bytes",
+      hold.asked,
+    ),
     (
       "mem.gauge.content.arena_mapped_bytes",
       bytes(arena.mapped_bytes()),
@@ -162,7 +181,8 @@ mod tests {
   /// The memory status's gauges (main 01a20182, 2026-11-22 03:46). Do: on one shard, make a green with one file written
   /// and accepted, then read the shard's report with and without memory. Expect: with memory, the greens' rows (one green,
   /// its current file bytes), the content hold's (its checkpoint, the version folded) and the content arena's (its
-  /// regions mapped and in RAM past the file's bytes); without, no gauge row at all (a plain status does no residency work).
+  /// regions mapped and in RAM past the file's bytes, and its owners' bytes summing to what it allocated, the content
+  /// hold among them); without, no gauge row at all (a plain status does no residency work).
   #[test]
   fn a_memory_status_names_its_holders_and_a_plain_one_none() {
     let (with, without) = crate::daemon::audit_on_shard(|state| {
@@ -256,6 +276,29 @@ mod tests {
         .is_some_and(|bytes| *bytes >= 4096),
       "{with:?}"
     );
+    // Goal 93 (main 01a20182's order on arena-13's unnamed 373 MB): the arena's owners and its deferred frees sum to
+    // what it has allocated, its mapped bytes less its free ones; a missing owner would be a gap. The content hold's
+    // checkpoint is one owner here, so the sum is not empty.
+    let row = |name: &str| with.get(name).copied().unwrap_or(0);
+    let owners = row("mem.gauge.content.arena_volume_bytes")
+      + row("mem.gauge.content.arena_vcs_windows_bytes")
+      + row("mem.gauge.content.arena_content_hold_bytes");
+    assert_eq!(
+      owners + row("mem.gauge.content.arena_deferred_bytes"),
+      row("mem.gauge.content.arena_mapped_bytes") - row("mem.gauge.content.arena_free_bytes"),
+      "the arena's owners against its allocated bytes: {with:?}"
+    );
+    assert!(
+      row("mem.gauge.content.arena_content_hold_bytes") > 0,
+      "the content hold owns its checkpoint's blocks: {with:?}"
+    );
+    for owner in ["volume", "vcs_windows", "content_hold"] {
+      assert!(
+        row(&format!("mem.gauge.content.arena_{owner}_asked_bytes"))
+          <= row(&format!("mem.gauge.content.arena_{owner}_bytes")),
+        "{owner} asked past what it holds: {with:?}"
+      );
+    }
     assert!(without.is_empty(), "{without:?}");
   }
 
@@ -271,7 +314,12 @@ mod tests {
       let bytes: Vec<u8> = (0..window + 5)
         .map(|at| u8::try_from(at % 233).unwrap())
         .collect();
-      let (object, _) = crate::vcs_store::homes::keep_for_region(state, &bytes).unwrap();
+      let (object, _) = crate::vcs_store::homes::keep_for_region(
+        state,
+        &bytes,
+        &[crate::vcs_store::homes::TEST_OWNER],
+      )
+      .unwrap();
       let first = state
         .vcs_stores
         .content()

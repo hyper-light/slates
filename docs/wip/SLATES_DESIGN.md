@@ -5553,8 +5553,10 @@ drops.
 > holds its own. On Linux the holder is the listening socket, which the anchor keeps across a restart and whose queued
 > claims the kernel resets when its last holder closes it; on macOS the owner's bootstrap name, which the anchor holds
 > while it holds the rendezvous; on Windows the anchor's process, named in the bootstrap header by its process id and
-> creation time (the layout `SLB4`), else the daemon's (A-447) with its start stamp. A claim refused for now (no claim
-> slot free, the restarted daemon not yet published, the daemon gone mid-answer) asks `slates_ipc::holder_lives`: with a
+> creation time (the layout `SLB4`) while it holds the rendezvous and cleared when it lets go (since 2026-11-23: the
+> header outlives the hold while a client's doorbell maps the object), else the daemon's (A-447) with its start stamp.
+> A claim refused for now (no claim slot free, the restarted daemon not yet published, the daemon gone mid-answer) asks
+> `slates_ipc::holder_lives`: with a
 > holder the client claims again, paced as an async connect polls (doubling, at most a tenth of the claim wait); with
 > none it fails `DaemonGone` at once. The synchronous reconnect and the async driver's recovery keep that one rule.
 > `Deadlines::reconnect_ns` remains only for the waits on a fleet owner's takeover (a request refused for now held for
@@ -6874,6 +6876,20 @@ version.
 >
 > (`a_verb_for_a_volume_whose_owner_is_fenced_is_refused_by_the_fence_never_not_found`;
 > `docs/bugs/2026-11-19-a-volume-on-a-fenced-owner-read-as-absent.md`).
+
+> **Status (2026-11-23, A-394's amendment: only the owner says a volume does not exist).** "The answer comes from the
+> current owner and is authoritative", so a node whose catalog holds no record of a volume answers a verb forwarded to
+> it only where it is that owner by the rule a local client's verb is routed by (`verbs::owned_by_another_host`): the
+> volume's creator, which no routing on it sends elsewhere and which did not lose it to a successor. There a volume it
+> never made or destroyed is `NotFound`. Anywhere else the verb is refused `Overloaded`, retryable and recorded nowhere,
+> so the origin, which drops its route at a refusal, locates the owner again on the resend
+> (`verbs::refusal_of_unheld_forward`, counted `fleet.forward.refused.not_owner_here`; a successor before it has made
+> the volume, A-394, `fleet.forward.refused.before_made`). Until then a node whose routing named another owner, or
+> none, served such a verb, found no volume and answered `NotFound`. At seed 8173581894251929445 the chaos nemesis had
+> an origin at configuration 7 forward reads to the successor its routing named, which at configuration 8 routed the
+> volume to no owner, and five acknowledged writes read as missing while the last owner served them all (ReadSafety;
+> `a_forwarded_read_at_a_node_neither_holding_nor_owning_its_volume_is_refused_retryably`;
+> `docs/bugs/2026-11-23-a-forwarded-read-at-a-node-that-neither-held-nor-owned-the-volume-answered-not-found.md`).
 
 > **Status (2026-11-18, A-317: the location budget is the membership horizon, ended by a look begun after it).** A
 > forward that does not know its volume's owner repeats the read-only location round (the direct route first, and
@@ -35597,7 +35613,7 @@ owner's measurements), and `docs/bugs/2026-11-18-a-held-macos-shard-napped-inste
 
 ### A-394 — A verb forwarded to a takeover's successor before it has made the volume is refused retryably, never answered `NotFound` (2026-11-18, kiln goal g250; §4.8 "Lookup"; ReadSafety; the chaos nemesis, seed 6876545201569229162)
 Applied in the same change to: GAPS (the entry at its head) and `crates/server/src/verbs.rs` (`serve_forward`,
-`serve_forwarded_read`, `forwarded_before_made`, `fleet.forward.refused.before_made`).
+`serve_forwarded_read`, `refusal_of_unheld_forward`, `fleet.forward.refused.before_made`).
 - **What was there.** A node serves a verb another node forwarded to it as the volume's owner without asking whether it
   holds the volume: the sender found it the owner, and a forward is one hop. A takeover's install moves the volume's
   route to its successor on every holder before the successor has made it, so in that window a holder forwards a
@@ -35616,6 +35632,20 @@ Applied in the same change to: GAPS (the entry at its head) and `crates/server/s
   counted, a volume made here answered; without the guard the read answered `NotFound`). The chaos nemesis at seed
   6876545201569229162 on the Mac Studio (kiln r264, 2026-11-18, debug build): 2 of 2 runs passed with every invariant
   held, 91.9 s and 63.5 s, where main bf58691 failed ReadSafety in 3 of 3 (r212).
+
+**Amended 2026-11-23 (w-chaos, the nemesis at seed 8173581894251929445): the rule by authority.** The guard refused only
+where the receiver's own routing named itself the owner, so a node whose routing named another member, or none, still
+served the forward and answered `NotFound`. Measured on adacachy2 with a diagnostic build (2026-11-23): an origin at
+configuration 7 forwarded reads to the successor its routing named, and that node, already at configuration 8, held no
+record of the volume and routed it to no owner, so five acknowledged writes read as missing through the origin while
+the last owner served them all (ReadSafety; 2 of 4 replays of the seed, and 1 of 5 runs of main 05e9bb698 with item 1's
+fix). The guard is now `refusal_of_unheld_forward` (it was `refusal_of_unheld_forward`; its callers `serve_forwarded_read`,
+`forwarded_write` and `forward_placement`): a node without the record answers only as the volume's creator that no
+routing on it sends elsewhere and that did not lose the volume to a successor, the rule `owned_by_another_host` routes a
+local client's verb by, and refuses `Overloaded` anywhere else, counted `fleet.forward.refused.not_owner_here`. Applied
+in the same change to: §4.8 "Lookup"'s status, GAPS (A-394's entry), `crates/server/src/verbs.rs`, the test
+`a_forwarded_read_at_a_node_neither_holding_nor_owning_its_volume_is_refused_retryably` (red first: `NotFound`),
+and `docs/bugs/2026-11-23-a-forwarded-read-at-a-node-that-neither-held-nor-owned-the-volume-answered-not-found.md`.
 
 ### A-399 — A Shards stream's close publishes nothing its write log holds, as a FUSE mount's does (2026-11-18, goal g268; a sibling A-339 recorded in GAPS)
 Applied in the same change to:
@@ -38643,6 +38673,16 @@ and `crates/server/src/direct_map.rs` (the offers' callers), `crates/server/test
   `crates/client/tests/waits.rs` gone case is now `a_call_to_a_killed_unanchored_daemon_ends_daemon_gone_at_once`: a
   killed daemon that held its own rendezvous ends both calls `DaemonGone` before the old budget, where it asserted they
   took at least it.
+- **An anchor's going, written (w-win for main 01a20182, 2026-11-23).** `Held`'s drop clears the anchor's mark from
+  the bootstrap header (its pid, and on Windows its creation time), while its owner's token is still held. The header
+  outlives the hold while a client maps the object, as a connected client's doorbell does, and Windows keeps a named
+  object while any handle holds it (A-176). So an anchor that let go inside a live process read as the holder for good
+  there: `holder_lives` named that process, alive, and its daemon's clients claimed again for good. The client
+  driver's `every_call_ends_and_the_loop_is_never_held_across_restart_and_death` failed so on both Windows lanes (CI run
+  45176536354: `call 64 after the daemon's death ended DaemonGone: None`). Held by
+  `an_anchor_that_lets_go_is_no_holder_though_a_client_maps_the_object` (macOS and Windows). Applied in the same change
+  to: `crates/ipc/src/rendezvous.rs`, §4.7's A-468 status, GAPS (A-468),
+  `docs/bugs/2026-11-23-a-windows-anchor-that-let-go-still-read-as-the-rendezvous-holder.md`.
 
 ### A-497 — Version-control servers over greens and works: the shared mapping (2026-11-18, g261 for UI goal 91; new §4.17 and D-28; §4.8, §4.16)
 - **What it adds.** §4.17's frame and its shared part, §4.17.1: how a stock git, Mercurial or Subversion client's
@@ -55770,6 +55810,41 @@ Applied in the same change to: GAPS (§4.17). Status: designed; slices (a1) to (
   same bytes by its identity).
 
 
+- **Slice (d), a holder's replica reads named content (2026-11-23, w-shared; main 01a20182's rulings of 2026-11-23).**
+  A Subversion green could not be taken over: its checkpoint (A-869) and chain (A-760) name their texts, and a holder's
+  replica read none (`merge.replica.checkpoint_unread`). A holder's texts come from **the region's homes**, the one path
+  for version-control content (rejected: shipping changesets to the holders' node stores, a second replication path;
+  the checkpoint carrying the texts again, what A-869 took out). Built as (d1a) the homes' owners, (d1b) Subversion's
+  homing on them, (d2) one read stage before every replica apply, (d3) the live recompute and the takeover.
+  - **(d1a) A region hold names its owners** (`slates_cluster::homes::HomeOwner`, main's rulings (b) and (ii)): the
+    attempt in flight that homed it (its repository, the member and process running it: since SWIM's
+    incarnation starts over at each start and a warm restart keeps the boot nonce, the process's nonce; and its number
+    there, `homes::attempt_owner`), then its repository's
+    records once the attempt's entry commits. `homes::REGION_HELD` keeps each object's owners: one content-store hold
+    however many, a keep idempotent per (object, owner) so a retry stays flat, the bytes given back with the last owner.
+    An attempt's end is settled by one task a shard off the step (`homes::settle_later`): its record committed moves
+    each of its holds to the records at every home (`HomeMessage::Moved`); refused, it lets them go (`LetGo` naming the
+    owner), so another repository's hold of the same object is untouched. git's push and the server's made commits
+    take an attempt at their homing's first ask (`SealedPush::home_owner`), move at `vcs_store::commit`, release at every
+    refusal after homing (`release_homed`, `release_unhomed`); the healer re-offers an object for every owner its hold
+    has. Derived bound: an object's owners are at most the attempts in flight on the repositories that home it (one each,
+    a repository's landing turn admitting one) and those repositories' records. **No old form is read:** the image
+    carries a region hold as kind 20, its owners after its identity; the ownerless kind 14 is refused at a restore,
+    typed (`HeldRefused::Retired`); the home wire leads every message with a version byte (`homes::VERSION`, version 2),
+    and a message of another version, version 1 included, is refused at once and typed: a home answers it
+    `HomeRefusal::Version` (counted `vcs_store.homes.version_refused`), and a sender drops a reply refusing its version
+    or one it cannot read (counted `reply_other_version`), so its homing fails at once, never at its deadline (every
+    request on a record session is answered, `fleet`'s stream dispatch; a version-1 peer's answer to a version-2 message
+    is empty, read as failed at once too). **So a region whose nodes run different home-wire versions homes nothing, and its commits are refused typed
+    until its nodes match: there is no mixed-version homing.** Owed in (d1a-3): an attempt a crash left between the
+    two is resolved from the homes' side once its process has ended (its member dead, or announcing another process nonce),
+    asking the repository's current owner whether a record names the object (`HomeMessage::Resolve`), never on a timer;
+    until then its hold stays, the safe side. Tests: `homes::tests::a_region_hold_is_kept_once_per_owner_and_goes_with_its_last_owner`,
+    `a_region_holds_owners_ride_the_image_and_the_ownerless_kind_is_refused`, `a_home_message_of_another_version_is_refused_at_once_and_typed`,
+    `git_push::tests::t_a727_d1a_a_push_refused_after_its_names_were_homed_leaves_no_hold_in_the_region` (red first: the
+    names' hold stayed for the home's life), `t_a727_d1a_a_refused_push_leaves_another_repositorys_hold_of_the_same_object`,
+    and slates-cluster `homes::tests::a_home_message_of_another_version_or_without_an_owner_is_refused_typed`.
+
 ### A-664 Subversion objects — A version a work submits to a Subversion repository's green becomes the revision the server makes of it (bug, 2026-11-20, w-shared for UI goal 93)
 - **What was there.** A submitted version moved a Subversion repository's one green and made no revision, so the
   green passed its records' youngest revision: every later `svn commit` was refused (its step lands only while the
@@ -59112,7 +59187,7 @@ Applied in the same change to: §4.16 "Commit" (inputs past a shipment's bound),
   answered `Overloaded` otherwise, so the origin's resend under the id met the completion.
 - **Change.** `crates/server/src/verbs.rs` `serve_forward`: a forwarded `CreateWork` runs on the shard its name hashes
   to, as a create is placed; whether the green is made yet is still asked of the green's shard first
-  (`forwarded_before_made`, so a forward racing the green's creation answers retryable, nothing recorded);
+  (`refusal_of_unheld_forward`, so a forward racing the green's creation answers retryable, nothing recorded);
   `forwarded_write` takes the volume to check as an option. `crates/server/src/work_home.rs`: `attach_forwarded` keeps
   a forward's waiter beside its parked verb, and the resume answers it from the verb's completion, or attaches it to
   the verb's next wait (parked again, or its acceptance deferred to a fleet commit), else `Overloaded`

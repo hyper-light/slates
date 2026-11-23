@@ -589,6 +589,45 @@ mod tests {
     (coordinate, key, vec![7u8; len])
   }
 
+  /// The plan's own half of `pages_cover_their_coordinates_and_hold_at_most_the_page_size`, in round `round`: the
+  /// `planned` pages apart and in order from coordinate 0, the one ending the space the last; each page's bytes of
+  /// `entries` within `limit`, or the page the deepest or of one coordinate; every entry it holds inside it.
+  fn assert_the_plan_covers_in_order(
+    round: u64,
+    entries: &[Entry],
+    planned: &[(Page, core::ops::Range<usize>)],
+    limit: usize,
+  ) {
+    let mut expect_start = 0u64;
+    for (at, (page, range)) in planned.iter().enumerate() {
+      assert_eq!(
+        page.start, expect_start,
+        "round {round}: pages apart and in order"
+      );
+      let held = &entries[range.clone()];
+      assert!(
+        bytes_of(held) <= limit
+          || page.depth == DEEPEST
+          || held.len() <= 1
+          || held.iter().all(|(c, _, _)| *c == held[0].0),
+        "round {round}: page {at} past the page size"
+      );
+      assert!(
+        held
+          .iter()
+          .all(|(coordinate, _, _)| page.contains(*coordinate))
+      );
+      expect_start = page.last().wrapping_add(1);
+      if page.last() == u64::MAX {
+        assert_eq!(
+          at,
+          planned.len() - 1,
+          "round {round}: the last page ends the space"
+        );
+      }
+    }
+  }
+
   /// A-870 piece 1. Do: plan pages over generated entries (counts, coordinates spread or crowded, entry sizes), at a
   /// page size; then find each entry's page in the directory of the plan. Expect: the pages a cover of every coordinate,
   /// apart, in order; each page's bytes within the page size or a page of one coordinate; every entry in exactly the
@@ -614,34 +653,7 @@ mod tests {
       entries.sort_by_key(|(coordinate, _, _)| *coordinate);
       let limit = 200 + usize::try_from(next() % 2000).unwrap();
       let planned = plan(&entries, Page::WHOLE, limit);
-      let mut expect_start = 0u64;
-      for (at, (page, range)) in planned.iter().enumerate() {
-        assert_eq!(
-          page.start, expect_start,
-          "round {round}: pages apart and in order"
-        );
-        let held = &entries[range.clone()];
-        assert!(
-          bytes_of(held) <= limit
-            || page.depth == DEEPEST
-            || held.len() <= 1
-            || held.iter().all(|(c, _, _)| *c == held[0].0),
-          "round {round}: page {at} past the page size"
-        );
-        assert!(
-          held
-            .iter()
-            .all(|(coordinate, _, _)| page.contains(*coordinate))
-        );
-        expect_start = page.last().wrapping_add(1);
-        if page.last() == u64::MAX {
-          assert_eq!(
-            at,
-            planned.len() - 1,
-            "round {round}: the last page ends the space"
-          );
-        }
-      }
+      assert_the_plan_covers_in_order(round, &entries, &planned, limit);
       let directory = Directory::of(planned.iter().map(|(page, _)| *page));
       for (page, range) in &planned {
         for (coordinate, _, _) in &entries[range.clone()] {
@@ -912,11 +924,16 @@ mod tests {
   #[test]
   fn a_paused_encoder_wakes_its_waiting_tasks_at_the_publication_that_carries_its_cut() {
     struct Count(std::sync::atomic::AtomicUsize);
+    // D-8 test harness: `std::task::Wake` takes `Arc<Self>` by signature; its two owners are this test, which reads
+    // the count, and the `Waker` the encoder keeps while it waits.
+    #[allow(clippy::disallowed_types)]
     impl std::task::Wake for Count {
       fn wake(self: std::sync::Arc<Self>) {
         self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
       }
     }
+    // D-8 test harness, as above: the `Waker` is made from an `Arc` of the count.
+    #[allow(clippy::disallowed_types)]
     let count = std::sync::Arc::new(Count(std::sync::atomic::AtomicUsize::new(0)));
     let waker = std::task::Waker::from(count.clone());
     let woken = || count.0.load(std::sync::atomic::Ordering::Relaxed);
@@ -1090,7 +1107,7 @@ mod tests {
     /// One change drawn from `kind`: puts, let-gos (elective: none while paused, as the shard's let-go sites hold them),
     /// a bring-back.
     fn change(&mut self, state: &mut crate::state::ShardState, kind: u64) {
-      let count = 1 + draw(&mut self.draws, 16) as usize;
+      let count = 1 + usize::try_from(draw(&mut self.draws, 16)).unwrap();
       let elective = matches!(kind, 1 | 2);
       if elective && crate::content_holder::image_paused(state) {
         return;

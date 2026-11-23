@@ -53,7 +53,7 @@ pub mod shared;
 pub mod slab;
 pub mod words;
 
-pub use arena::{ChunkArena, Extent};
+pub use arena::{ChunkArena, Extent, Owned, Owner};
 pub use dax_object::{
   DAX_OBJECT_BYTES, DAX_RANGE_BYTES, DaxLayout, DaxObject, DaxPiece, DaxPieces, PeerAccess,
   PeerObject, PeerView, PeerWriteView, Placement, dax_object_bytes,

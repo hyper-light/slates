@@ -191,7 +191,6 @@ fn enroll(daemon: &Daemon, token: &str, uid: u32, expires_ns: Option<u64>) {
 }
 
 /// A rustls client's connection to the edge on `port`, trusting `certificate`.
-#[allow(clippy::disallowed_types)] // rustls takes its configuration and provider as `Arc` by signature (D-8's test-harness exception).
 fn tls_client(
   port: u16,
   certificate: &CertificateDer<'static>,
@@ -200,6 +199,7 @@ fn tls_client(
 }
 
 /// [`tls_client`], its reads waiting at most `patience` for an answer.
+#[allow(clippy::disallowed_types)] // rustls takes its configuration and provider as `Arc` by signature (D-8's test-harness exception).
 fn tls_client_within(
   port: u16,
   certificate: &CertificateDer<'static>,
@@ -708,7 +708,7 @@ fn stored_zlib(data: &[u8]) -> Vec<u8> {
 }
 
 /// A pack of `objects`, each stored whole in stored blocks.
-fn stored_pack(objects: &[(slates_git::object_name::Kind, &[u8])]) -> Vec<u8> {
+pub(crate) fn stored_pack(objects: &[(slates_git::object_name::Kind, &[u8])]) -> Vec<u8> {
   use slates_git::entry::{self, Header, Representation};
   let mut out = Vec::new();
   let count = u32::try_from(objects.len()).expect("a count");
@@ -730,7 +730,7 @@ fn stored_pack(objects: &[(slates_git::object_name::Kind, &[u8])]) -> Vec<u8> {
 }
 
 /// The name git gives an object of `kind` holding `content`.
-fn git_name(kind: slates_git::object_name::Kind, content: &[u8]) -> ObjectId {
+pub(crate) fn git_name(kind: slates_git::object_name::Kind, content: &[u8]) -> ObjectId {
   slates_git::object_name::name_of(GitFormat::Sha1, kind, content).expect("named")
 }
 
@@ -1059,6 +1059,8 @@ fn a_push_of_annotated_tags_is_listed_and_fetched_whole_once_its_pack_is_landed(
   while counted_on(&daemon, REPOSITORY, crate::vcs_store::LANDED_LET_GO_BYTES) == 0
     && waited.elapsed() < Duration::from_secs(3)
   {
+    // The harness paces its looks; the daemon under test waits on its wheel.
+    #[allow(clippy::disallowed_methods)]
     std::thread::sleep(Duration::from_millis(20));
   }
   // Then the repository goes idle, as it does once no fetch of it is answered: what its reads keep of the objects read
@@ -1075,9 +1077,7 @@ fn a_push_of_annotated_tags_is_listed_and_fetched_whole_once_its_pack_is_landed(
     )
   });
   let mut ls_refs = Vec::new();
-  for line in [b"command=ls-refs\n".as_slice()] {
-    pktline::write(Packet::Data(line), &mut ls_refs).expect("the command");
-  }
+  pktline::write(Packet::Data(b"command=ls-refs\n"), &mut ls_refs).expect("the command");
   pktline::write(Packet::Delim, &mut ls_refs).expect("the delimiter");
   for argument in [b"peel\n".as_slice(), b"ref-prefix refs/\n"] {
     pktline::write(Packet::Data(argument), &mut ls_refs).expect("an argument");
@@ -3779,6 +3779,18 @@ fn a_mercurial_push_parks_for_its_repositorys_landing_turn_and_no_other_waits() 
     u128::from(waited_ns) >= held_after_park.as_nanos(),
     "waited {waited_ns} ns, parked {held_after_park:?} before the release at least"
   );
+  assert_refused_past_its_patience(&refused, given_up, &unmoved, &heads);
+}
+
+/// The last push of [`a_mercurial_push_parks_for_its_repositorys_landing_turn_and_no_other_waits`]: `refused` in
+/// slates' words for a turn held past its patience, counted once given up (`given_up`), and the repository's heads
+/// after it (`unmoved`) still `heads`.
+fn assert_refused_past_its_patience(
+  refused: &(u16, String, Vec<u8>),
+  given_up: u64,
+  unmoved: &(u16, Vec<u8>),
+  heads: &(u16, Vec<u8>),
+) {
   let words = crate::repository::hg_run::TURN_PAST_PATIENCE;
   assert!(
     refused.2.windows(words.len()).any(|at| at == words),
@@ -3826,6 +3838,8 @@ fn a_long_push_parked(
       !long.is_finished(),
       "the long push answered before it parked"
     );
+    // The harness paces its looks; the daemon under test waits on its wheel.
+    #[allow(clippy::disallowed_methods)]
     std::thread::sleep(Duration::from_millis(5));
   }
   (made[FRESH_CHANGESETS - 1].node, long)
@@ -4065,6 +4079,27 @@ fn a_clone_of_a_pushed_pack_let_go_is_whole_holding_at_most_a_turns_windows() {
   );
 }
 
+/// The two clones of [`a_pushed_pack_is_let_go_by_its_commit_in_slices_and_a_clone_after_is_whole`]: the one commit
+/// deep one (`shallow`) and the whole one (`fetched`) each `200`, each pack's objects the `pushed` bytes.
+fn assert_both_clones_whole(
+  shallow: &(u16, Vec<u8>),
+  fetched: &(u16, Vec<u8>),
+  pushed: &std::collections::BTreeMap<String, Vec<u8>>,
+) {
+  assert_eq!(shallow.0, 200);
+  assert_eq!(
+    objects_of(&fetched_pack_after(&shallow.1)),
+    *pushed,
+    "the shallow clone whole, its one commit's objects the pushed bytes"
+  );
+  assert_eq!(fetched.0, 200);
+  assert_eq!(
+    objects_of(&fetched_pack(&fetched.1)),
+    *pushed,
+    "the clone whole, each object the pushed bytes"
+  );
+}
+
 /// Goal 93 item 2b, lifted again (main 01a20182's order of 2026-11-23, after r165's `Pack(Store(Unreadable))`): a landed
 /// push's pack let go by its own commit, sliced off the owing step, and a whole clone after it. Do: start a two-shard
 /// store-backed daemon with its edge; push a create of `main` at a commit whose one file is [`LET_GO_FILE`] bytes, a
@@ -4097,6 +4132,8 @@ fn a_pushed_pack_is_let_go_by_its_commit_in_slices_and_a_clone_after_is_whole() 
   };
   let waited = std::time::Instant::now();
   while let_go_bytes() == 0 && waited.elapsed() < Duration::from_secs(10) {
+    // The harness paces its looks; the daemon under test waits on its wheel.
+    #[allow(clippy::disallowed_methods)]
     std::thread::sleep(Duration::from_millis(20));
   }
   let let_go = let_go_bytes();
@@ -4111,20 +4148,9 @@ fn a_pushed_pack_is_let_go_by_its_commit_in_slices_and_a_clone_after_is_whole() 
     "the push's commit let its landed pack go: {let_go} bytes"
   );
   assert!(slices > 1, "let go in slices: {slices}");
-  assert_eq!(shallow.0, 200);
   let (_, commands_end) = packets_from(&request, 0);
   let pushed_objects = objects_of(request.get(commands_end..).expect("the push's pack"));
-  assert_eq!(
-    objects_of(&fetched_pack_after(&shallow.1)),
-    pushed_objects,
-    "the shallow clone whole, its one commit's objects the pushed bytes"
-  );
-  assert_eq!(fetched.0, 200);
-  assert_eq!(
-    objects_of(&fetched_pack(&fetched.1)),
-    pushed_objects,
-    "the clone whole, each object the pushed bytes"
-  );
+  assert_both_clones_whole(&shallow, &fetched, &pushed_objects);
   assert_eq!(listed.0, 200);
   assert!(
     String::from_utf8_lossy(&listed.1)
@@ -4299,6 +4325,9 @@ const TEXTS_CHANGESETS: usize = 120;
 /// Format: the bytes of each file of that history.
 const TEXT_BYTES: usize = 8 * 1024;
 
+/// A push of own-text files ([`a_push_of_own_texts`]): the changesets, the files' texts, and the push's answer.
+type OwnTextsPush = (Vec<Made>, &'static [Vec<u8>], (u16, String, Vec<u8>));
+
 /// Pushes into `name`, through `edge`, a line of [`TEXTS_CHANGESETS`] changesets each adding a file of its own
 /// [`TEXT_BYTES`] (each text its own, so the store keeps every one), cut at [`LONG_SEGMENT_BYTES`]: the changesets, the
 /// files' texts, and the push's answer.
@@ -4306,7 +4335,7 @@ fn a_long_push_of_own_texts(
   daemon: &Daemon,
   edge: (u16, &CertificateDer<'static>),
   name: &str,
-) -> (Vec<Made>, &'static [Vec<u8>], (u16, String, Vec<u8>)) {
+) -> OwnTextsPush {
   a_push_of_own_texts(daemon, edge, (name, TEXTS_CHANGESETS))
 }
 
@@ -4315,7 +4344,7 @@ fn a_push_of_own_texts(
   daemon: &Daemon,
   edge: (u16, &CertificateDer<'static>),
   (name, changesets): (&str, usize),
-) -> (Vec<Made>, &'static [Vec<u8>], (u16, String, Vec<u8>)) {
+) -> OwnTextsPush {
   crate::daemon::observe_at(daemon, REPOSITORY, |_| {
     crate::repository::hg_run::TEST_SEGMENT_BYTES.with(|bound| bound.set(LONG_SEGMENT_BYTES));
   });
@@ -4420,6 +4449,20 @@ fn a_pushs_texts_high_water_is_a_segments_whatever_its_history() {
   assert!(long_rows > short_rows, "the rows grow with the history");
 }
 
+/// Each file's window as [`a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land`] looks at it,
+/// `(here, (noted, pinned), entry)` a file: every entry kept, every window let go, and none noted or pinned, since no
+/// home holds any.
+fn assert_every_files_window_let_go(windows: &[(bool, (bool, bool), bool)]) {
+  for (at, (here, (noted, pinned), entry)) in windows.iter().enumerate() {
+    assert!(entry, "file {at}'s entry kept");
+    assert!(!here, "file {at}'s window let go");
+    assert!(
+      !*noted && !*pinned,
+      "file {at}'s window neither noted nor pinned: no home holds it"
+    );
+  }
+}
+
 /// Main 01a20182's order of 2026-11-22 14:00 (CI 45065911852: 4.7 GB of arena held on the repository's shard after
 /// Mercurial's whole history landed, the content store keeping every revision's text). Do: start a two-shard daemon over
 /// loopback TLS; create a Mercurial repository; push a line of [`TEXTS_CHANGESETS`] changesets each adding a file of its
@@ -4483,14 +4526,7 @@ fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
   let gone = windows.iter().filter(|(here, ..)| !here).count();
   println!("let go: {let_go} bytes; {gone} of {TEXTS_CHANGESETS} files' windows gone");
   assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
-  for (at, (here, (noted, pinned), entry)) in windows.iter().enumerate() {
-    assert!(entry, "file {at}'s entry kept");
-    assert!(!here, "file {at}'s window let go");
-    assert!(
-      !*noted && !*pinned,
-      "file {at}'s window neither noted nor pinned: no home holds it"
-    );
-  }
+  assert_every_files_window_let_go(&windows);
   assert!(gone > 0, "some window let go");
   // At the derived budget (half the shard's step quantum) the commit's let-go is spread over turns too.
   println!(
@@ -4600,7 +4636,8 @@ fn a_region_object_sharing_a_landed_files_window_is_read_whole_from_its_home() {
   let object_id = slates_vcs::ContentId::of(&object);
   let held = object.clone();
   let kept = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
-    crate::vcs_store::homes::keep_for_region(state, &held).map(|(identity, _)| identity)
+    crate::vcs_store::homes::keep_for_region(state, &held, &[crate::vcs_store::homes::TEST_OWNER])
+      .map(|(identity, _)| identity)
   });
   assert_eq!(
     kept.ok(),

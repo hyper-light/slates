@@ -977,15 +977,17 @@ type Ask = (crate::git_push::Carry, Homing);
 
 /// The made commit's first ask: its names put as one content and asked homed. None where it brings no object or its
 /// names were not put.
-fn first_ask(state: &mut ShardState, sealed: &SealedPush) -> Option<Ask> {
+fn first_ask(state: &mut ShardState, sealed: &mut SealedPush) -> Option<Ask> {
   let names = {
     let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
     sealed.names_now(lent.stores).ok()
   };
   let (bytes, count) = names.filter(|(_, count)| *count > 0)?;
   let identity = super::put_names(state, &bytes)?;
+  // The attempt its holds in the region are for until its record commits (A-727 (d1a)).
+  let owner = sealed.home_owner(state);
   Some((
-    crate::git_push::Carry::Home(bytes),
+    crate::git_push::Carry::Home(bytes, owner),
     Homing::Names((identity, count)),
   ))
 }
@@ -1002,7 +1004,7 @@ fn next_ask(
   match (homing, carried) {
     (Homing::Names((identity, count)), Carried::Homed(homed)) => {
       if homed.outcome.as_ref().ok() != Some(&identity) {
-        super::release_names(state, &identity);
+        sealed.release_unhomed(state, &identity);
         return None;
       }
       sealed.homed_as((identity, count));
@@ -1010,14 +1012,15 @@ fn next_ask(
       if !super::hold_for_record(state, &packed.0) {
         return None;
       }
+      let owner = sealed.home_owner(state);
       Some(Some((
-        Carry::Home(bytes),
+        Carry::Home(bytes, owner),
         Homing::Pack(homed.bytes, packed),
       )))
     }
     (Homing::Pack(names, packed), Carried::Homed(homed)) => {
       if homed.outcome.as_ref().ok() != Some(&packed.0) {
-        super::release_names(state, &packed.0);
+        sealed.release_unhomed(state, &packed.0);
         return None;
       }
       sealed.pack_homed_as(packed);

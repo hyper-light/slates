@@ -16,7 +16,10 @@
 > its overlay borrow ends, and an open's descriptor closes at its last close. A later read reopens through the home and
 > proves the file the inode was made from (A-151). Witnessed large copies keep theirs (their witness reads through it).
 > Red on main: 500 reads left 506 handles open against 6; green: 6 (`reading_base_files_keeps_no_descriptor_after_the_reads`,
-> `an_open_base_file_keeps_its_descriptor_until_its_last_close`).
+> `an_open_base_file_keeps_its_descriptor_until_its_last_close`). The real-disk counterpart
+> (`crates/base/tests/host.rs`, `an_overlay_over_the_workspace_tree_costs_one_open_and_reads_the_disk`) kept the old
+> count, the read's descriptor held after its borrow (3 != 4 on Windows in CI run 45176536354 and on macOS); since
+> 2026-11-23 (w-win) it holds the rule on the disk: root, `vfs` and `src` alone.
 > **Closed (main, 2026-11-21, A-833): a recovery reopened every base directory the image recorded, in one step.** kiln's
 > daemon on adacachy recorded about 192,000, overran the 1 s liveness window and was killed a second into every restart.
 > Now a recovery reopens the root alone; each other directory is reacquired at its first use (`Overlay::reacquire`:
@@ -123,6 +126,16 @@
 > `content.purge_kept_short_bytes` (red-first by use: `slates-mem`
 > `arena::tests::a_free_run_under_the_discard_size_stays_resident_and_is_counted_kept_short`). OWED: arena-13's reading
 > after push-all and again after an idle pass, and the cut it names.
+> **OPEN (A-727 (d1a), w-shared; main 01a20182's rulings of 2026-11-23): region holds name their owners; what is owed.**
+> BUILT: an attempt's holds move to its records at its commit and are let go at its refusal (`homes::settle_later`), so
+> a refused push holds nothing and another repository's hold of the same object stays; the image and the home wire carry
+> owners, version 2, refusing the old forms typed. OWED (d1a-3): an attempt a crash left between homing and its end
+> (or whose settle a home did not answer, counted `vcs_store.homes.settle_unanswered`) keeps its holds until it is
+> resolved from the homes' side once its process ended, by `HomeMessage::Resolve` to its repository's current owner;
+> bounded meanwhile by the attempts a crash or a lost answer left, each one's homed objects. OWED (fleet memory, one item
+> for all three tools): a remote home keeps what it homes in RAM for the history's life, and assembles an object sent
+> in parts whole before keeping it (`homes::stage_part`: a git pack, and Subversion texts once homed): a remote home
+> should land what it keeps on its own node's store, streamed, and let it go, as this node's home does by its record.
 > **A-870 (w-shared; main 01a20182's rulings of 2026-11-22 ~22:10 and ~22:30): a shard image's content-store families
 > published and restored over turns.** Piece 1 BUILT: the families paged (`crate::image_pages`): 3,000 windows let go
 > and 3,000 landed records rode 6,000 pieces, now 17 (534,085 bytes at a 43,912-byte page), restored whole. Piece 2
@@ -144,6 +157,14 @@
 > and every clone (stock_git_verbs 1 of 8). Lifted when w-git's fetch-side readers (A-855's held answer, brought back and
 > made again) and the push decision's reads bring a let-go window back, with w-shared's red: annotated tags pushed, the
 > push ended, idle, then ls-remote and a clone byte-identical to stock.
+> **r227's SSH regression FIXED (w-git, 2026-11-23):** with the lift, stock git's fetch over SSH ended mid-answer
+> (`unexpected disconnect while reading sideband packet`; on a made history, the shallow clone right after its
+> `packfile` header): an answer whose pack's choice read a let-go window is held for it (`Answer::held_away`) with its
+> sections written, and the SSH edge's `write_answer` dropped it as written, where the HTTP edge brings the window back
+> and makes it again past what it wrote. Now the SSH edge keeps it and its next step does the same (`read_through_held`).
+> Red at the session: git_interop's whole session over SSH on a made history failed 3 of 3, every step held after.
+> Owed: a unit red at the edge (the single-shard edge tests reach no held answer); the SSH edge's wait for room
+> (A-855: an answer held for room is dropped the same way; the HTTP edge's `wait_for_room` has no SSH twin).
 > **LIFTED AGAIN (w-git, 2026-11-23, main 01a20182's order after r165):** `vcs_store::LANDED_LET_GO` on, one switch for
 > a commit's let-go and a recovery's or rebuild's (w-shared's `put_changeset`): the commit owes its pack and the push's
 > end or the repository's idle give-back lets it go a slice a turn (3e1588a54, the quantum alone ending a slice), every
@@ -965,13 +986,23 @@
 >   laid again in the newest. Held by `the_store_holds_the_walks_in_flight_not_the_reads_that_could_be_waiting` (red
 >   7,340,032 bytes reserved with room for 1,000 reads and no walk in flight; now 1,048,576) and
 >   `a_walk_in_flight_keeps_its_text_through_other_reads`. Owed: main's arena-14 on CI's runner.
-> - A Mercurial index's tail sealed by every append BUILT (2026-11-23, w-perf; w-hg's three conditions). Only an import
->   sealed (`import::settle`), so a push's, a replay's and a made changeset's tail grew for the whole push: 56 MB of tail
->   rows, two buffers each, still held at the end of Mercurial's push (`Index::admit` 34 MB, `table::encode_body` 22 MB).
->   Every append's rows now go in through `HgIndex::insert`, which seals when due; import's own seal is gone. A seal the
->   store refuses leaves the append standing and is counted (`HgIndex::seals_refused`). Held by
->   `every_append_seals_the_tail_when_due_and_a_released_fork_gives_its_seals_back` (`crates/hg/src/tests/index.rs`: red
->   due after group 26 of 200; now never due, the fork sealed, and its release gives its seals back).
+> - The content arena's allocations by owner BUILT (2026-11-23, w-perf; main 01a20182's order on arena-13, CI
+>   45193998198: 634 MB allocated, 373 MB of it named by no gauge). Every `ChunkArena` allocation and claim names its
+>   owner (`slates_mem::Owner`: a volume's file content, a repository's windows, the content hold), recorded at the
+>   block's head in a table each region makes when it is added, so the arena's hot path still allocates nothing.
+>   `mem.gauge.content.arena_<owner>_bytes` and `..._asked_bytes` (the asked bytes short of the held being the buddy's
+>   rounding) sum, with the deferred bytes, to mapped less free. Held by
+>   `every_block_has_an_owner_and_the_owners_sum_to_what_is_allocated` (`slates-mem`: 2,000 seeded steps of
+>   allocations, frees, trims and deferred frees against a model) and the memory status's test (the sum after a green's
+>   file is accepted). The greens' content is not in the arena (the merge engine's own heap), so arena-13's named part
+>   was 184 MB, not 260. Owed: main's arena-15 to name the rest.
+> - A Mercurial index's tail sealed by every append REVERTED (2026-11-23, w-perf; 0cd8ef36a reverted after main's
+>   arena-14, CI 45208924823: push-all's shard 0 spun past 1 s of CPU in `hg_push::segment` on all three legs and the
+>   watchdog killed the daemon). Each seal writes a run, and a push's fork never merges its runs (only the repository's
+>   own index is merged, `vcs_store::index_upkeep`), so a push sealing at every append piled up runs, and every new row's
+>   plan looks its key up through all of them, a table opened a run. The 56 MB of tail rows a push of Mercurial's history
+>   held at its end stay owed: reland the seal with the push's runs merged a step at a time (or the tail kept in an arena
+>   of its own), red first that a segment step over a long history stays within the step quantum.
 > - The watchdog's beat allocates nothing BUILT (2026-11-23, w-perf; main's order). A beat made 4 allocations, about
 >   1 KB by their types (estimated, not measured). `hg_push_heap`'s first read had charged the watchdog 24% of a push's
 >   sampled bytes, about 10-15 MB a second; that was its sampler's artifact (a thread's first symbol load charged to its
@@ -4346,6 +4377,14 @@
 > stock 1.15 over `SLATES_SVN_USE_ROUTE=http-v1` with `SLATES_SVN_USE_VERBS=revprops` against svnserve; and
 > `svnsync synchronize` over HTTP, the mirror against svnserve's byte for byte (`an_svnsync_measured`'s DAV leg,
 > `SLATES_SVN_USE_VERBS=svnsync` over `http`).
+> **(B)'s one difference was the harness's (w-interop, 2026-11-23):** main's round failed on the mirrors' `UUID:` line
+> alone. Stock `svnsync` never sets a mirror's UUID (`svnsync.c` `do_initialize`), so each `svnadmin create` mirror
+> held a random one. The HTTP edge reports the imported dump's UUID (OPTIONS and PROPFIND, checked). `mirror_dump_of`
+> now gives each mirror `MIRROR_UUID`, as `svn-matrix.sh` does
+> (`docs/bugs/2026-11-23-the-svnsync-use-row-compared-two-random-mirror-uuids.md`). The rerun (r12, 112e694e7) left
+> one more of the harness's: revision 0's lengths still counted the `svn:sync-*` lines the comparison dropped, and the
+> source URL differs by leg. The mirror's sync properties are now deleted before the dump, which is compared whole
+> (`a_mirrors_dump_is_the_same_whatever_url_it_was_synced_from`). Owed: main's red and green of that test, and (B).
 > **R4, recovery replays a revision record a turn at a time (2026-11-20, w-svn; Ada's close list; found by w-git's sweep):**
 > a Subversion revision's record was replayed whole in one recovery or rebuild turn (`replay_svn` -> `commit_record`),
 > every text it brought deltified in one step, so one large revision held its shard. Now `RevisionReplay`
@@ -4692,11 +4731,21 @@
 > catalog, served each as any forwarded verb is served, found no volume and answered `NotFound`: a claim that the file
 > did not exist. A forwarded write met the same `NotFound` and had it recorded as its completion. A local client's verb
 > there already met `owned_unmaterialized`'s retryable `Overloaded`; a forwarded one now meets the same
-> (`verbs::forwarded_before_made`, counted `fleet.forward.refused.before_made`), before any completion is recorded.
+> (`verbs::refusal_of_unheld_forward`, counted `fleet.forward.refused.before_made`), before any completion is recorded.
 > Test: `a_forwarded_read_of_a_volume_owned_here_but_not_made_is_refused_retryably` (`crates/server/src/verbs.rs`), red
 > without the guard (`NotFound`). The seed on the fix (kiln r264, Mac Studio, debug build): 2 of 2 runs pass, every
 > invariant held, 91.9 s and 63.5 s; on main bf58691 without it (r212), 3 of 3 failed ReadSafety alone, five reads each.
 > **Owed (the supervisor's):** the seed on both Linux arches on the fix.
+> - **FIXED 2026-11-23 (w-chaos; A-394's amendment, the rule by authority): the guard covered only a receiver whose own
+>   routing named itself.** At seed 8173581894251929445 (the owner deafened from 203 ms) an origin at configuration 7
+>   forwarded reads to the successor its routing named; that node, at configuration 8, held no record of the volume and
+>   routed it to no owner, so the guard passed it and it answered five acknowledged writes `NotFound` (ReadSafety, 2 of
+>   4 replays on adacachy2; a diagnostic build named both sides). Now a node without the record answers only as the
+>   volume's creator that no routing sends elsewhere and that did not lose it to a successor; anywhere else a forwarded
+>   read, write or work creation is refused `Overloaded`, recorded nowhere, counted
+>   `fleet.forward.refused.not_owner_here`. Test:
+>   `a_forwarded_read_at_a_node_neither_holding_nor_owning_its_volume_is_refused_retryably` (red: `NotFound`).
+>   Record: `docs/bugs/2026-11-23-a-forwarded-read-at-a-node-that-neither-held-nor-owned-the-volume-answered-not-found.md`.
 
 > **A volume whose owner shard refused its state read as absent: fixed (2026-11-19, A-564, §4.8 "Lookup"; g225; found by
 > A-557).** A verb forwarded to its volume's owner shard was answered `NotFound` whenever the owner did not run it:
@@ -9708,8 +9757,11 @@
 >   (`a_claim_under_a_live_anchor_waits_out_a_restart_slower_than_the_old_reconnect_budget`,
 >   `a_claim_under_an_anchor_ends_at_the_anchors_going`,
 >   `a_rendezvous_has_a_holder_while_its_anchor_or_its_own_daemon_lives`;
->   `a_call_to_a_killed_unanchored_daemon_ends_daemon_gone_at_once`). `reconnect_ns` still bounds the waits on a fleet
->   owner's takeover (a request refused for now held for its resend, the pause between resends,
+>   `a_call_to_a_killed_unanchored_daemon_ends_daemon_gone_at_once`). Since 2026-11-23 (w-win) an anchor's going clears
+>   its mark from the header: a client's doorbell keeps a Windows object past the hold, so an anchor that let go inside a
+>   live process had read as the holder for good (`an_anchor_that_lets_go_is_no_holder_though_a_client_maps_the_object`;
+>   `docs/bugs/2026-11-23-a-windows-anchor-that-let-go-still-read-as-the-rendezvous-holder.md`). `reconnect_ns` still
+>   bounds the waits on a fleet owner's takeover (a request refused for now held for its resend, the pause between resends,
 >   `Client::call_through_transient`), owed to the failover delay the daemon reports. The server's reclaim of a
 >   taken-back map no holder claims (`held_copy::reconnect_budget_ns`, "The holder claims it") mirrored the old
 >   reconnect budget, a fixed two seconds R3 forbids; since A-552 its claim is owed for the failover delay its shard

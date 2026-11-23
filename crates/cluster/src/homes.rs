@@ -16,10 +16,18 @@
 //! the window's homes (`slates_db::identity_homes::homes`), and only bytes that hash to the identity they were sent
 //! under: authority is the configuration alone, so no owner event can make a member hold or drop one.
 //!
-//! **The wire.** A kind byte, then the fields little-endian, byte strings length-prefixed by a `u32`: a window's bytes
+//! **Owners (A-727 (d1a), main 01a20182's rulings of 2026-11-23).** A hold is for its owners ([`HomeOwner`]): the attempt
+//! in flight that homed it (its repository, the node and process that run it, its number there), then the records that name
+//! it once the attempt's entry commits ([`HomeMessage::Moved`]). A keep is idempotent per (identity, owner); a let-go
+//! releases one owner ([`HomeMessage::LetGo`]), or every one where a holder is no home; the bytes go once none is left.
+//! An attempt a crash left unresolved is asked of the repository's current owner ([`HomeMessage::Resolve`]).
+//!
+//! **The wire.** A version byte ([`VERSION`]), then a kind byte, then the fields little-endian, byte strings length-prefixed by a `u32`: a window's bytes
 //! are at most the archive format's chunk cap (`slates_archive::format::MAX_CHUNK_BYTES`), checked before they are
 //! copied; truncation, an unknown kind or refusal, a length past the bytes and trailing bytes are each refused typed
-//! ([`HomeWireError`]), never a panic.
+//! ([`HomeWireError`]), never a panic. A message of another version (version 1 had none: its first byte was its kind) is
+//! refused typed ([`HomeWireError::Version`]): a region whose members speak different versions homes nothing, so its
+//! commits are refused until they match; there is no mixed-version homing.
 
 use slates_archive::format::MAX_CHUNK_BYTES;
 use slates_db::identity_homes::homes;
@@ -30,6 +38,9 @@ use slates_db::register::HostId;
 /// stream id a kind of exchange on a connection; a fixed label, not a tunable.
 pub const HOME_STREAM: u64 = 30;
 
+/// Format: the version byte every message begins with (A-727 (d1a): owners on the wire). Version 1 had none, its first
+/// byte a kind of 1 to 6, so neither version reads the other's messages as its own.
+pub const VERSION: u8 = 0x82;
 /// Format: the kind byte of a put.
 const KIND_PUT: u8 = 1;
 /// Format: the kind byte of a read.
@@ -42,6 +53,23 @@ const KIND_ANSWER: u8 = 4;
 const KIND_PUT_PART: u8 = 5;
 /// Format: the kind byte of a read of a part (appended).
 const KIND_READ_PART: u8 = 6;
+/// Format: the kind byte of an owner's move (A-727 (d1a)).
+const KIND_MOVED: u8 = 7;
+/// Format: the kind byte of an attempt's resolution asked of its repository's owner (A-727 (d1a)).
+const KIND_RESOLVE: u8 = 8;
+/// Format: an owner's tag byte: an attempt in flight.
+const OWNER_ATTEMPT: u8 = 1;
+/// Format: an owner's tag byte: the records naming it.
+const OWNER_RECORD: u8 = 2;
+/// Format: a let-go's owner byte: one owner follows.
+const LET_GO_ONE: u8 = 1;
+/// Format: a let-go's owner byte: every owner.
+const LET_GO_ALL: u8 = 0;
+/// Format: the width of a repository id.
+const REPOSITORY_BYTES: usize = 16;
+/// Format: the fewest bytes an owner takes on the wire (a record's: its tag and repository), by which a count of owners
+/// is checked against the bytes left before anything is reserved.
+const OWNER_MIN_BYTES: usize = 1 + REPOSITORY_BYTES;
 /// Format: the outcome byte of an answer that kept the window.
 const OUTCOME_KEPT: u8 = 1;
 /// Format: the outcome byte of an answer carrying the window's bytes.
@@ -54,6 +82,10 @@ const OUTCOME_REFUSED: u8 = 4;
 const OUTCOME_TAKEN: u8 = 5;
 /// Format: the outcome byte of a read's part: the object's length, then the part's bytes (appended).
 const OUTCOME_PART: u8 = 6;
+/// Format: the outcome byte of an owner moved (A-727 (d1a)).
+const OUTCOME_MOVED: u8 = 7;
+/// Format: the outcome byte of a resolution: whether a record names the identity, a byte 0 or 1 (A-727 (d1a)).
+const OUTCOME_NAMED: u8 = 8;
 
 /// The most bytes one part carries ([`HomeMessage::PutPart`], [`HomeOutcome::Part`]): the chunk cap a message's byte
 /// string is held to. Derived: `slates_archive::format::MAX_CHUNK_BYTES`.
@@ -74,6 +106,9 @@ pub enum HomeRefusal {
   Room,
   /// The member's home shard did not answer in time, or its image was not published within the wait.
   Unanswered,
+  /// The message was of another version (module docs, "The wire"): answered at once, so its sender refuses its homing
+  /// at once rather than waiting out its deadline (A-727 (d1a)).
+  Version,
 }
 
 impl HomeRefusal {
@@ -85,6 +120,7 @@ impl HomeRefusal {
       HomeRefusal::NotHeld => 3,
       HomeRefusal::Room => 4,
       HomeRefusal::Unanswered => 5,
+      HomeRefusal::Version => 6,
     }
   }
 
@@ -96,8 +132,70 @@ impl HomeRefusal {
       3 => Some(HomeRefusal::NotHeld),
       4 => Some(HomeRefusal::Room),
       5 => Some(HomeRefusal::Unanswered),
+      6 => Some(HomeRefusal::Version),
       _ => None,
     }
+  }
+}
+
+/// Who a hold is for (module docs, "Owners").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HomeOwner {
+  /// An attempt in flight: its repository, the member and process running it (the process's nonce, fresh at every start
+  /// of its daemon, since a member's SWIM incarnation starts over at each start and a warm restart keeps its process nonce),
+  /// and its number in that process.
+  Attempt {
+    /// The repository's id.
+    repository: [u8; 16],
+    /// The member running it.
+    node: HostId,
+    /// That member's process.
+    process: u64,
+    /// Its number in that process.
+    attempt: u64,
+  },
+  /// The records of a repository, which name it.
+  Record {
+    /// The repository's id.
+    repository: [u8; 16],
+  },
+}
+
+impl HomeOwner {
+  /// The owner's repository.
+  pub fn repository(&self) -> [u8; 16] {
+    match self {
+      HomeOwner::Attempt { repository, .. } | HomeOwner::Record { repository } => *repository,
+    }
+  }
+
+  /// Its bytes on the wire and in a home's image.
+  pub fn encode_into(&self, out: &mut Vec<u8>) {
+    match self {
+      HomeOwner::Attempt {
+        repository,
+        node,
+        process,
+        attempt,
+      } => {
+        out.push(OWNER_ATTEMPT);
+        out.extend_from_slice(repository);
+        out.extend_from_slice(&node.0.to_le_bytes());
+        out.extend_from_slice(&process.to_le_bytes());
+        out.extend_from_slice(&attempt.to_le_bytes());
+      }
+      HomeOwner::Record { repository } => {
+        out.push(OWNER_RECORD);
+        out.extend_from_slice(repository);
+      }
+    }
+  }
+
+  /// One read from the front of `bytes`, with what is left; refused typed where they are short or name no owner.
+  pub fn decode_from(bytes: &[u8]) -> Result<(HomeOwner, &[u8]), HomeWireError> {
+    let mut reader = Reader { rest: bytes };
+    let owner = reader.owner()?;
+    Ok((owner, reader.rest))
   }
 }
 
@@ -128,15 +226,24 @@ pub enum HomeOutcome {
     /// The part's bytes.
     bytes: Vec<u8>,
   },
+  /// The owner was moved (A-727 (d1a)).
+  Moved,
+  /// A resolution's answer: whether a record of the attempt's repository names the identity (A-727 (d1a)).
+  Named {
+    /// Whether one does.
+    named: bool,
+  },
 }
 
 /// A home exchange's message (module docs).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HomeMessage {
-  /// Keep the window `bytes`, named `identity`.
+  /// Keep the window `bytes`, named `identity`, for `owners`.
   Put {
     /// The window's identity: the BLAKE3 of its bytes.
     identity: [u8; 32],
+    /// Who it is kept for (at least one).
+    owners: Vec<HomeOwner>,
     /// Its bytes.
     bytes: Vec<u8>,
   },
@@ -145,16 +252,20 @@ pub enum HomeMessage {
     /// Its identity.
     identity: [u8; 32],
   },
-  /// Let one holder of the window named `identity` go.
+  /// Let `owner`'s hold of the window named `identity` go, or every owner's (`None`: a holder that is no home).
   LetGo {
     /// Its identity.
     identity: [u8; 32],
+    /// The owner whose hold goes, or none for every one.
+    owner: Option<HomeOwner>,
   },
   /// Keep part of the object named `identity`, `total` bytes long, its bytes from `offset` (appended, A-724 piece 8c: an
   /// object past one message, sent in order a part at a time, each at most [`PART_BYTES`]).
   PutPart {
     /// The object's identity: the BLAKE3 of its whole bytes.
     identity: [u8; 32],
+    /// Who it is kept for, once whole (at least one).
+    owners: Vec<HomeOwner>,
     /// The object's length.
     total: u64,
     /// Where this part begins.
@@ -168,6 +279,24 @@ pub enum HomeMessage {
     identity: [u8; 32],
     /// Where the part begins.
     offset: u64,
+  },
+  /// Move the hold of the object named `identity` from owner `from` to owner `to` (A-727 (d1a): an attempt's entry
+  /// committed, so its records now name it).
+  Moved {
+    /// Its identity.
+    identity: [u8; 32],
+    /// The owner it was held for.
+    from: HomeOwner,
+    /// The owner it is held for now.
+    to: HomeOwner,
+  },
+  /// Whether a record of `attempt`'s repository names the object `identity` (A-727 (d1a)): asked of the repository's
+  /// current owner by a home holding it for an attempt whose process has ended.
+  Resolve {
+    /// Its identity.
+    identity: [u8; 32],
+    /// The attempt it is held for.
+    attempt: HomeOwner,
   },
   /// A member's answer about the window named `identity`.
   Answer {
@@ -190,6 +319,11 @@ pub enum HomeWireError {
   },
   /// A length is past the bytes or the chunk cap, or bytes trail the message.
   BadLength,
+  /// The message is of another version (module docs, "The wire").
+  Version {
+    /// The first byte found.
+    byte: u8,
+  },
 }
 
 /// Whether member `me` keeps a window named `identity` whose bytes are `bytes`, among `members` with `f` (module docs,
@@ -211,29 +345,43 @@ pub fn admits(
 impl HomeMessage {
   /// The message's canonical bytes (module docs, "The wire").
   pub fn encode(&self) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut out = vec![VERSION];
     match self {
-      HomeMessage::Put { identity, bytes } => {
+      HomeMessage::Put {
+        identity,
+        owners,
+        bytes,
+      } => {
         out.push(KIND_PUT);
         out.extend_from_slice(identity);
+        put_owners(&mut out, owners);
         put_blob(&mut out, bytes);
       }
       HomeMessage::Read { identity } => {
         out.push(KIND_READ);
         out.extend_from_slice(identity);
       }
-      HomeMessage::LetGo { identity } => {
+      HomeMessage::LetGo { identity, owner } => {
         out.push(KIND_LET_GO);
         out.extend_from_slice(identity);
+        match owner {
+          Some(owner) => {
+            out.push(LET_GO_ONE);
+            owner.encode_into(&mut out);
+          }
+          None => out.push(LET_GO_ALL),
+        }
       }
       HomeMessage::PutPart {
         identity,
+        owners,
         total,
         offset,
         bytes,
       } => {
         out.push(KIND_PUT_PART);
         out.extend_from_slice(identity);
+        put_owners(&mut out, owners);
         out.extend_from_slice(&total.to_le_bytes());
         out.extend_from_slice(&offset.to_le_bytes());
         put_blob(&mut out, bytes);
@@ -242,6 +390,17 @@ impl HomeMessage {
         out.push(KIND_READ_PART);
         out.extend_from_slice(identity);
         out.extend_from_slice(&offset.to_le_bytes());
+      }
+      HomeMessage::Moved { identity, from, to } => {
+        out.push(KIND_MOVED);
+        out.extend_from_slice(identity);
+        from.encode_into(&mut out);
+        to.encode_into(&mut out);
+      }
+      HomeMessage::Resolve { identity, attempt } => {
+        out.push(KIND_RESOLVE);
+        out.extend_from_slice(identity);
+        attempt.encode_into(&mut out);
       }
       HomeMessage::Answer { identity, outcome } => {
         out.push(KIND_ANSWER);
@@ -269,26 +428,44 @@ impl HomeMessage {
             out.extend_from_slice(&total.to_le_bytes());
             put_blob(&mut out, bytes);
           }
+          HomeOutcome::Moved => out.push(OUTCOME_MOVED),
+          HomeOutcome::Named { named } => {
+            out.push(OUTCOME_NAMED);
+            out.push(u8::from(*named));
+          }
         }
       }
     }
     out
   }
 
-  /// Parses a message (module docs, "The wire").
+  /// Parses a message (module docs, "The wire"): refused [`HomeWireError::Version`] for one of another version.
   pub fn decode(bytes: &[u8]) -> Result<HomeMessage, HomeWireError> {
     let mut reader = Reader { rest: bytes };
+    let version = reader.byte()?;
+    if version != VERSION {
+      return Err(HomeWireError::Version { byte: version });
+    }
     let kind = reader.byte()?;
     let identity = reader.identity()?;
     let message = match kind {
       KIND_PUT => HomeMessage::Put {
         identity,
+        owners: reader.owners()?,
         bytes: reader.blob()?,
       },
       KIND_READ => HomeMessage::Read { identity },
-      KIND_LET_GO => HomeMessage::LetGo { identity },
+      KIND_LET_GO => HomeMessage::LetGo {
+        identity,
+        owner: match reader.byte()? {
+          LET_GO_ONE => Some(reader.owner()?),
+          LET_GO_ALL => None,
+          byte => return Err(HomeWireError::Unknown { byte }),
+        },
+      },
       KIND_PUT_PART => HomeMessage::PutPart {
         identity,
+        owners: reader.owners()?,
         total: reader.long()?,
         offset: reader.long()?,
         bytes: reader.blob()?,
@@ -296,6 +473,15 @@ impl HomeMessage {
       KIND_READ_PART => HomeMessage::ReadPart {
         identity,
         offset: reader.long()?,
+      },
+      KIND_MOVED => HomeMessage::Moved {
+        identity,
+        from: reader.owner()?,
+        to: reader.owner()?,
+      },
+      KIND_RESOLVE => HomeMessage::Resolve {
+        identity,
+        attempt: reader.owner()?,
       },
       KIND_ANSWER => {
         let outcome = match reader.byte()? {
@@ -315,6 +501,14 @@ impl HomeMessage {
             total: reader.long()?,
             bytes: reader.blob()?,
           },
+          OUTCOME_MOVED => HomeOutcome::Moved,
+          OUTCOME_NAMED => HomeOutcome::Named {
+            named: match reader.byte()? {
+              0 => false,
+              1 => true,
+              byte => return Err(HomeWireError::Unknown { byte }),
+            },
+          },
           byte => return Err(HomeWireError::Unknown { byte }),
         };
         HomeMessage::Answer { identity, outcome }
@@ -325,6 +519,18 @@ impl HomeMessage {
       return Err(HomeWireError::BadLength);
     }
     Ok(message)
+  }
+}
+
+/// A count of owners, then each.
+fn put_owners(out: &mut Vec<u8>, owners: &[HomeOwner]) {
+  out.extend_from_slice(
+    &u32::try_from(owners.len())
+      .unwrap_or(u32::MAX)
+      .to_le_bytes(),
+  );
+  for owner in owners {
+    owner.encode_into(out);
   }
 }
 
@@ -368,6 +574,38 @@ impl<'a> Reader<'a> {
       .map_err(|_| HomeWireError::Truncated)
   }
 
+  /// An owner ([`HomeOwner::encode_into`]).
+  fn owner(&mut self) -> Result<HomeOwner, HomeWireError> {
+    let tag = self.byte()?;
+    let repository = <[u8; REPOSITORY_BYTES]>::try_from(self.take(REPOSITORY_BYTES)?)
+      .map_err(|_| HomeWireError::Truncated)?;
+    match tag {
+      OWNER_ATTEMPT => Ok(HomeOwner::Attempt {
+        repository,
+        node: HostId(self.long()?),
+        process: self.long()?,
+        attempt: self.long()?,
+      }),
+      OWNER_RECORD => Ok(HomeOwner::Record { repository }),
+      byte => Err(HomeWireError::Unknown { byte }),
+    }
+  }
+
+  /// A count of owners, then each ([`put_owners`]): the count checked against the bytes left before anything is reserved,
+  /// and at least one.
+  fn owners(&mut self) -> Result<Vec<HomeOwner>, HomeWireError> {
+    let bytes = <[u8; 4]>::try_from(self.take(4)?).map_err(|_| HomeWireError::Truncated)?;
+    let count = usize::try_from(u32::from_le_bytes(bytes)).map_err(|_| HomeWireError::BadLength)?;
+    if count == 0 || count > self.rest.len() / OWNER_MIN_BYTES {
+      return Err(HomeWireError::BadLength);
+    }
+    let mut owners = Vec::with_capacity(count);
+    for _ in 0..count {
+      owners.push(self.owner()?);
+    }
+    Ok(owners)
+  }
+
   /// A length-prefixed byte string, its length checked against the chunk cap and the bytes left before it is copied.
   fn blob(&mut self) -> Result<Vec<u8>, HomeWireError> {
     let bytes = <[u8; 4]>::try_from(self.take(4)?).map_err(|_| HomeWireError::Truncated)?;
@@ -382,32 +620,82 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
-  use super::{HomeMessage, HomeOutcome, HomeRefusal, HomeWireError, admits};
+  use super::{HomeMessage, HomeOutcome, HomeOwner, HomeRefusal, HomeWireError, VERSION, admits};
   use proptest::prelude::*;
   use slates_db::identity_homes::homes;
   use slates_db::register::HostId;
+
+  /// Any owner (A-727 (d1a)), each kind alike, its union built from boxed strategies as [`message`]'s is.
+  fn owner() -> impl Strategy<Value = HomeOwner> {
+    let repository = proptest::array::uniform16(any::<u8>());
+    proptest::strategy::Union::new([
+      (repository, any::<u64>(), any::<u64>(), any::<u64>())
+        .prop_map(|(repository, node, process, attempt)| HomeOwner::Attempt {
+          repository,
+          node: HostId(node),
+          process,
+          attempt,
+        })
+        .boxed(),
+      repository
+        .prop_map(|repository| HomeOwner::Record { repository })
+        .boxed(),
+    ])
+  }
 
   /// Any message, each kind alike. The union is built as `prop_oneof!` builds one of more than ten arms, from boxed
   /// strategies: its shorter forms hold their arms in `Arc`s (R2).
   fn message() -> impl Strategy<Value = HomeMessage> {
     let identity = proptest::array::uniform32(any::<u8>());
     let bytes = proptest::collection::vec(any::<u8>(), 0..2048);
+    let owners = || proptest::collection::vec(owner(), 1..4);
     proptest::strategy::Union::new([
-      (identity, bytes.clone())
-        .prop_map(|(identity, bytes)| HomeMessage::Put { identity, bytes })
+      (identity, owners(), bytes.clone())
+        .prop_map(|(identity, owners, bytes)| HomeMessage::Put {
+          identity,
+          owners,
+          bytes,
+        })
         .boxed(),
       identity
         .prop_map(|identity| HomeMessage::Read { identity })
         .boxed(),
-      identity
-        .prop_map(|identity| HomeMessage::LetGo { identity })
+      (identity, proptest::option::of(owner()))
+        .prop_map(|(identity, owner)| HomeMessage::LetGo { identity, owner })
         .boxed(),
-      (identity, any::<u64>(), any::<u64>(), bytes.clone())
-        .prop_map(|(identity, total, offset, bytes)| HomeMessage::PutPart {
+      (
+        identity,
+        owners(),
+        any::<u64>(),
+        any::<u64>(),
+        bytes.clone(),
+      )
+        .prop_map(
+          |(identity, owners, total, offset, bytes)| HomeMessage::PutPart {
+            identity,
+            owners,
+            total,
+            offset,
+            bytes,
+          },
+        )
+        .boxed(),
+      (identity, owner(), owner())
+        .prop_map(|(identity, from, to)| HomeMessage::Moved { identity, from, to })
+        .boxed(),
+      (identity, owner())
+        .prop_map(|(identity, attempt)| HomeMessage::Resolve { identity, attempt })
+        .boxed(),
+      (identity, any::<bool>())
+        .prop_map(|(identity, named)| HomeMessage::Answer {
           identity,
-          total,
-          offset,
-          bytes,
+          outcome: HomeOutcome::Named { named },
+        })
+        .boxed(),
+      identity
+        .prop_map(|identity| HomeMessage::Answer {
+          identity,
+          outcome: HomeOutcome::Moved,
         })
         .boxed(),
       (identity, any::<u64>())
@@ -511,17 +799,17 @@ mod tests {
   /// kind, an unknown refusal and trailing bytes. Expect: each refused by its kind.
   #[test]
   fn hostile_home_messages_are_refused_by_kind() {
-    let mut long = vec![1u8];
+    let mut long = vec![VERSION, 1u8];
     long.extend_from_slice(&[0; 32]);
     long.extend_from_slice(&u32::MAX.to_le_bytes());
     assert_eq!(HomeMessage::decode(&long), Err(HomeWireError::BadLength));
-    let mut unknown = vec![9u8];
+    let mut unknown = vec![VERSION, 9u8];
     unknown.extend_from_slice(&[0; 32]);
     assert_eq!(
       HomeMessage::decode(&unknown),
       Err(HomeWireError::Unknown { byte: 9 })
     );
-    let mut refusal = vec![4u8];
+    let mut refusal = vec![VERSION, 4u8];
     refusal.extend_from_slice(&[0; 32]);
     refusal.extend_from_slice(&[4, 77]);
     assert_eq!(
@@ -534,5 +822,41 @@ mod tests {
       HomeMessage::decode(&trailing),
       Err(HomeWireError::BadLength)
     );
+  }
+
+  /// A-727 (d1a), no mixed-version homing (main 01a20182's ruling of 2026-11-23). Do: decode a version-1 put (its kind
+  /// byte first, no owner) and a put of the version after this one; decode a put with no owner and one whose owner
+  /// count passes its bytes. Expect: both versions refused `Version` with the byte found, never read as an ownerless
+  /// put; the owners refused `BadLength`.
+  #[test]
+  fn a_home_message_of_another_version_or_without_an_owner_is_refused_typed() {
+    let mut first = vec![1u8];
+    first.extend_from_slice(&[5; 32]);
+    first.extend_from_slice(&3u32.to_le_bytes());
+    first.extend_from_slice(b"abc");
+    assert_eq!(
+      HomeMessage::decode(&first),
+      Err(HomeWireError::Version { byte: 1 })
+    );
+    let mut next = HomeMessage::Read { identity: [5; 32] }.encode();
+    next[0] = VERSION.wrapping_add(1);
+    assert_eq!(
+      HomeMessage::decode(&next),
+      Err(HomeWireError::Version {
+        byte: VERSION.wrapping_add(1)
+      })
+    );
+    let mut ownerless = vec![VERSION, 1u8];
+    ownerless.extend_from_slice(&[5; 32]);
+    ownerless.extend_from_slice(&0u32.to_le_bytes());
+    ownerless.extend_from_slice(&0u32.to_le_bytes());
+    assert_eq!(
+      HomeMessage::decode(&ownerless),
+      Err(HomeWireError::BadLength)
+    );
+    let mut counted = vec![VERSION, 1u8];
+    counted.extend_from_slice(&[5; 32]);
+    counted.extend_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(HomeMessage::decode(&counted), Err(HomeWireError::BadLength));
   }
 }
