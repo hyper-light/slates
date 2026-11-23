@@ -401,3 +401,9 @@ sent to main and w-svn.
   restore_landed are O(notes) in one call.
 - Next: the memory plan when arena-4 lands (w-shared's terms: the push peak is the rendezvous pin until commit, and
   ~1.3 GB stored after the push is unexplained).
+
+## 2026-11-23 ~00:10 PST (w-hg)
+Landed 6b7a4982f: a landed hg window is noted only where landed_pin would pin it (held for the region), per w-shared's
+1ecb57cf4 (rendezvous pin gone) and main's ruling. Red: the let-go tests assert no notes (every window was noted).
+9f42d8942: unused test bindings dropped. w-shared told of its 3 warnings (daemon.rs:8215/8256, homes.rs:75).
+Waiting: arena-4 (1baba966b) rows from main, then the 410 MiB plan.
