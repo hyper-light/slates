@@ -632,8 +632,10 @@ fn t_c1_2b_an_imports_bookmark_works_are_built_over_turns_before_its_landing() {
     let id = created(state, "hg", VcsTool::Mercurial);
     assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
     let task = slates_rt::futures::spawn(async move {
-      if run(id).await.is_some_and(|ended| ended.is_ok()) {
-        drop(crate::state::with_state(|state| land(state, id)));
+      if run(id).await.is_some_and(|ended| ended.is_ok())
+        && let Some(Ok(contents)) = crate::state::with_state(|state| land(state, id))
+      {
+        super::let_go_landed_import(id, contents).await;
       }
     });
     task
