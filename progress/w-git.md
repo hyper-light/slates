@@ -632,3 +632,19 @@
   and two refs rows; all pass after (118 s). Guard stays in. Unit red owed. Shallow fetch: request for main in
   inbox/main-from-w-git-shallow-lift.md (verbs over git/git with the lift on in a round worktree). HTTP stall: held
   until main's r108 bisect or w-shared's r8 names the commit.
+
+- 2026-11-23: READ SWEEP sent (inbox/main-from-w-git-read-sweep.md); main accepted the order B1, B2, B3-B7, B8. B1 PARKED
+  (~/.cache/w-git-b1-wip.patch: Repository::fresh_waiting, readers peek and only bring-back drivers take; red still
+  flaky, 2 of 3) behind main's two later orders.
+- 2026-11-23: PUSH HOT PATH (main's order, before B2-B8): ShardGreens::holding asks only the greens holding the
+  commit, via Repository::holders (git store, head position -> green -> newest version, charged with the chains) and
+  Repositories::member_keyed (db, key -> member and join rank; VolumeId::serial = green_key). Red
+  t_goal93_a_pushs_search_..._is_flat_in_the_repositorys_greens: examined 60 (4 held) vs 156 (16 held) before, equal
+  after. Focused: push 37/37, vcs_store 25/25, db repository 35/35, git store:: (reach skipped) 116/116. Owed (GAPS):
+  the lend that only reads (is_owing, branch_version) and Lent::new's empty engine made and dropped each lend (w-svn's
+  lend; w-svn's session not listed to tell); the commit's O(greens) head-map clone and footprint walk. Main runs
+  git/git's push before and after on the Studio.
+- 2026-11-23: UPLOAD STREAMING investigated (inbox/main-from-w-git-upload-streaming.md): the pack streams after
+  derive_for_read (waited whole, unbounded), encode_for_fetch (one liveness window) and the wanted set (header count);
+  all of it on the owner shard. Proposal P1-P3 to spread across shards (P1 needs a rule on the encoding's learned
+  rules). NEXT: git_interop's per-step PATIENCE from the work (needs main's ratio over stock, asked), then B1.
