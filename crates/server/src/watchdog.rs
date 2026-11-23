@@ -413,40 +413,94 @@ const PERCENT: usize = 100;
 /// how much longer than its pause it took, and their p99. A machine busy enough to delay a watcher delays what it
 /// watches too, so the watchdog and the anchor each hold their judgments to their own measured lateness, never to a
 /// fixed second. Bounded: the oldest reading leaves as the newest comes.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// It allocates nothing after it is made (goal 93's "no allocation by design"): the readings are a ring of fixed size,
+/// written in place, and the p99 sorts a copy on the stack. Until 2026-11-23 the readings were a growable queue and each
+/// p99 collected and sorted a fresh vector, every watchdog beat and every anchor wait: 14.4% of the bytes a Mercurial
+/// push's daemon sampled (`tests/hg_push_heap.rs`, main 9c8e4a95e), and with the beat's own vectors about 10-15 MB a
+/// second on a two-shard daemon (`tests/watchdog_allocations.rs` holds it at none).
+#[derive(Clone, Debug)]
 pub struct LatenessTail {
-  readings: std::collections::VecDeque<u64>,
+  /// The kept readings: the first `kept` slots, in no order the p99 needs; `next` is where the newest goes, over the
+  /// oldest once all are kept.
+  readings: [u64; LATENESS_SAMPLES],
+  /// Where the next reading is written.
+  next: usize,
+  /// How many readings are kept, at most [`LATENESS_SAMPLES`].
+  kept: usize,
 }
+
+impl Default for LatenessTail {
+  fn default() -> Self {
+    LatenessTail {
+      readings: [0; LATENESS_SAMPLES],
+      next: 0,
+      kept: 0,
+    }
+  }
+}
+
+impl PartialEq for LatenessTail {
+  /// Two tails are equal when they keep the same readings in the same order, wherever their rings stand.
+  fn eq(&self, other: &Self) -> bool {
+    self.in_order().eq(other.in_order())
+  }
+}
+
+impl Eq for LatenessTail {}
 
 impl LatenessTail {
   /// Keeps one wait's lateness, nanoseconds past its pause.
   pub fn record(&mut self, late_ns: u64) {
-    if self.readings.len() >= LATENESS_SAMPLES {
-      self.readings.pop_front();
+    if let Some(slot) = self.readings.get_mut(self.next) {
+      *slot = late_ns;
     }
-    self.readings.push_back(late_ns);
+    self.next = self
+      .next
+      .saturating_add(1)
+      .checked_rem(LATENESS_SAMPLES)
+      .unwrap_or(0);
+    self.kept = self.kept.saturating_add(1).min(LATENESS_SAMPLES);
   }
 
   /// The p99 of the kept readings (nearest rank), zero before any.
   pub fn p99_ns(&self) -> u64 {
-    let mut sorted: Vec<u64> = self.readings.iter().copied().collect();
-    sorted.sort_unstable();
-    let last = sorted.len().saturating_sub(1);
+    let mut sorted = self.readings;
+    let Some(kept) = sorted.get_mut(..self.kept) else {
+      return 0;
+    };
+    kept.sort_unstable();
+    let last = kept.len().saturating_sub(1);
     let rank = last
       .saturating_mul(LATENESS_PERCENTILE)
       .checked_div(PERCENT)
       .unwrap_or(0);
-    sorted.get(rank).copied().unwrap_or(0)
+    kept.get(rank).copied().unwrap_or(0)
   }
 
   /// How many readings are kept.
   pub fn len(&self) -> usize {
-    self.readings.len()
+    self.kept
   }
 
   /// Whether none is kept yet.
   pub fn is_empty(&self) -> bool {
-    self.readings.is_empty()
+    self.kept == 0
+  }
+
+  /// The kept readings, oldest first: from slot 0 until the ring is full, then from where the next one goes.
+  fn in_order(&self) -> impl Iterator<Item = u64> + '_ {
+    let oldest = if self.kept < LATENESS_SAMPLES {
+      0
+    } else {
+      self.next
+    };
+    (0..self.kept).filter_map(move |offset| {
+      let at = oldest
+        .saturating_add(offset)
+        .checked_rem(LATENESS_SAMPLES)?;
+      self.readings.get(at).copied()
+    })
   }
 }
 
@@ -837,6 +891,11 @@ fn run(
   let mut stopping = false;
   let mut lateness = Lateness::default();
   let mut last_beat_ns = 0_u64;
+  // Each beat's looks, windows and verdicts, one slot a shard, made once and refilled in place: a beat allocates nothing
+  // (`tests/watchdog_allocations.rs`). Until 2026-11-23 each beat collected three fresh vectors.
+  let mut looks: Vec<Option<Look>> = Vec::with_capacity(holders.len());
+  let mut windows: Vec<u64> = Vec::with_capacity(holders.len());
+  let mut verdicts: Vec<Option<(u16, Verdict)>> = Vec::with_capacity(holders.len());
   loop {
     match stop.recv_timeout(std::time::Duration::from_nanos(HEARTBEAT_NS)) {
       Err(RecvTimeoutError::Timeout) => {}
@@ -851,28 +910,34 @@ fn run(
     let late_ns = lateness.look(now);
     // How late this thread's own looks come, at their p99 (A-474): a gap they explain is no span it did not watch.
     let watcher_late_ns = lateness.p99_ns();
-    let mut looks: Vec<Option<Look>> = holders
-      .iter()
-      .map(|holder| look_at(*holder, now, watcher_late_ns))
-      .collect();
+    looks.clear();
+    looks.extend(
+      holders
+        .iter()
+        .map(|holder| look_at(*holder, now, watcher_late_ns)),
+    );
     // Each shard's window at this look, from the overrun it measured (A-455), aligned with `holders`.
-    let windows: Vec<u64> = holders
-      .iter()
-      .map(|holder| watch_window_ns(overrun_of(*holder)))
-      .collect();
+    windows.clear();
+    windows.extend(
+      holders
+        .iter()
+        .map(|holder| watch_window_ns(overrun_of(*holder))),
+    );
     read_runs(holders, &watches, &mut looks, memory);
     // In shard order, aligned with `reported`: `None` for a slot that now holds another registration.
-    let verdicts: Vec<Option<(u16, Verdict)>> = holders
-      .iter()
-      .zip(looks)
-      .zip(watches.iter_mut())
-      .zip(&windows)
-      .map(|(((holder, look), watch), window_ns)| {
-        let (verdict, next) = watch.judge(look?, *window_ns, spin_window_ns(cost, *window_ns));
-        *watch = next;
-        Some((holder.shard(), verdict))
-      })
-      .collect();
+    verdicts.clear();
+    verdicts.extend(
+      holders
+        .iter()
+        .zip(looks.drain(..))
+        .zip(watches.iter_mut())
+        .zip(&windows)
+        .map(|(((holder, look), watch), window_ns)| {
+          let (verdict, next) = watch.judge(look?, *window_ns, spin_window_ns(cost, *window_ns));
+          *watch = next;
+          Some((holder.shard(), verdict))
+        }),
+    );
     let stuck_at = verdicts
       .iter()
       .position(|found| found.is_some_and(|(_, verdict)| !verdict.beats()));
@@ -1411,6 +1476,49 @@ fn log_verdict(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// The tail as it was kept until 2026-11-23, a growable queue sorted afresh at each p99: the reference the fixed ring
+  /// must equal.
+  fn reference_p99(readings: &std::collections::VecDeque<u64>) -> u64 {
+    let mut sorted: Vec<u64> = readings.iter().copied().collect();
+    sorted.sort_unstable();
+    let rank = sorted.len().saturating_sub(1) * LATENESS_PERCENTILE / PERCENT;
+    sorted.get(rank).copied().unwrap_or(0)
+  }
+
+  /// A-474's lateness tail, kept in a fixed ring since goal 93's cut. Do: record two and a half times the kept count of
+  /// scattered readings into the ring and into the reference queue, which drops its oldest past the kept count. Expect:
+  /// after every reading the same count and the same p99 (zero before any); and two rings holding the same readings
+  /// from different starting points compare equal, while a different reading does not.
+  #[test]
+  fn the_lateness_ring_keeps_the_last_hundred_and_their_p99_as_the_queue_did() {
+    let mut ring = LatenessTail::default();
+    let mut reference = std::collections::VecDeque::new();
+    assert_eq!((ring.p99_ns(), ring.len(), ring.is_empty()), (0, 0, true));
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    for _ in 0..LATENESS_SAMPLES * 5 / 2 {
+      state = state
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+      let late_ns = state >> 40;
+      ring.record(late_ns);
+      if reference.len() >= LATENESS_SAMPLES {
+        reference.pop_front();
+      }
+      reference.push_back(late_ns);
+      assert_eq!(ring.len(), reference.len());
+      assert_eq!(ring.p99_ns(), reference_p99(&reference));
+    }
+    // The same last hundred, recorded from a fresh ring, which starts at slot zero.
+    let mut fresh = LatenessTail::default();
+    for late_ns in &reference {
+      fresh.record(*late_ns);
+    }
+    assert_eq!(ring, fresh);
+    fresh.record(1);
+    ring.record(2);
+    assert_ne!(ring, fresh);
+  }
 
   /// Shape: the window the rule is tested at (a second, the liveness budget).
   const WINDOW: u64 = 1_000_000_000;
