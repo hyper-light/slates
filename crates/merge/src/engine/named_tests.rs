@@ -540,6 +540,9 @@ struct Version {
   changes: Vec<Change>,
   share: bool,
   stepped: bool,
+  /// After the version, the replaying green is replaced by one restored from the judging green's checkpoint at an
+  /// earlier version (this picks which, among those committed), then caught up by the recorded versions after it.
+  restore: Option<u8>,
 }
 
 /// A version's bytes added to a path: carried, or a run of object `k` (offset, length).
@@ -560,12 +563,41 @@ struct NameCensus {
   changed_away: u64,
   kept: u64,
   stepped: u64,
+  /// Restores, those below the head (caught up by recorded versions), and the files their checkpoints named.
+  restored: u64,
+  restored_below: u64,
+  named_restored: u64,
 }
 
 impl NameCensus {
   fn met(&self) -> bool {
-    self.moved > 0 && self.shared > 0 && self.changed_away > 0 && self.kept > 0 && self.stepped > 0
+    self.moved > 0
+      && self.shared > 0
+      && self.changed_away > 0
+      && self.kept > 0
+      && self.stepped > 0
+      && self.restored > 0
+      && self.restored_below > 0
+      && self.named_restored > 0
   }
+}
+
+/// A version committed in a generated history, kept to apply it again as its entry records it: its index, the version,
+/// the model before it, its number and what its entry recorded.
+struct Committed {
+  index: usize,
+  version: Version,
+  before: Model,
+  number: u64,
+  applied: Vec<crate::chain_entry::Applied>,
+}
+
+/// What a version does, planned over the model: its journal, the bytes it adds to each path, and the model after it.
+#[derive(Default)]
+struct Planned {
+  journal: Vec<VolumeOp>,
+  adds: Vec<(String, Adding)>,
+  after: Model,
 }
 
 /// The work `version` makes over `model` as increment `index`, judged at `base`, and the model after it; none when it
@@ -577,76 +609,130 @@ fn version_work(
   version: &Version,
   identities: &[Identity],
 ) -> Option<(Increment, Model)> {
-  let mut journal = Vec::new();
-  let mut adds: Vec<(String, Adding)> = Vec::new();
-  let mut after = model.clone();
-  for (path, change) in PATHS.iter().zip(&version.changes) {
-    let path = (*path).to_owned();
-    let standing = model.get(&path).map(|(bytes, _)| bytes.clone());
-    let (made, name, adding) = match (change, &standing) {
-      (Change::Keep, _) | (Change::Remove, None) => continue,
-      (Change::Remove, Some(_)) => {
-        journal.push(VolumeOp::Unlink { path: path.clone() });
-        after.remove(&path);
-        continue;
-      }
-      (Change::Splice(at, bytes), Some(old)) if !old.is_empty() => {
-        let at = usize::from(*at) % old.len();
-        let len = bytes.len().min(old.len() - at);
-        let mut made = old.clone();
-        made[at..at + len].copy_from_slice(&bytes[..len]);
-        journal.push(VolumeOp::Overwrite {
-          path: path.clone(),
-          at: at as u64,
-          len: len as u64,
-        });
-        adds.push((path.clone(), Adding::Inline(bytes[..len].to_vec())));
-        after.insert(path, (made, None));
-        continue;
-      }
-      (Change::Whole(k), _) => {
-        let bytes = object_bytes(*k);
-        let len = bytes.len() as u64;
-        (bytes, Some(identities[*k]), Adding::Run(*k, 0, len))
-      }
-      (Change::Part(k, from, take), _) => {
-        let bytes = object_bytes(*k);
-        let offset = usize::from(*from) % bytes.len();
-        let mut len = 1 + usize::from(*take) % (bytes.len() - offset);
-        if offset == 0 && len == bytes.len() {
-          len -= 1;
-        }
-        let part = bytes[offset..offset + len].to_vec();
-        (part, None, Adding::Run(*k, offset as u64, len as u64))
-      }
-      (Change::Inline(bytes), _) | (Change::Splice(_, bytes), _) => {
-        (bytes.clone(), None, Adding::Inline(bytes.clone()))
-      }
-    };
-    match &standing {
-      None => journal.push(VolumeOp::Create { path: path.clone() }),
-      Some(old) if !old.is_empty() => journal.push(VolumeOp::Truncate {
-        path: path.clone(),
-        len: 0,
-      }),
-      Some(_) => {}
-    }
-    journal.push(VolumeOp::Extend {
-      path: path.clone(),
-      at: 0,
-      len: made.len() as u64,
-    });
-    adds.push((path.clone(), adding));
-    after.insert(path, (made, name));
-  }
-  if journal.is_empty() {
+  let planned = planned(model, version, identities);
+  if planned.journal.is_empty() {
     return None;
   }
+  Some(work_of(
+    (index, base),
+    model,
+    version.share,
+    identities,
+    planned,
+  ))
+}
+
+/// `version`'s changes over `model`, a path at a time ([`plan_path`]).
+fn planned(model: &Model, version: &Version, identities: &[Identity]) -> Planned {
+  let mut planned = Planned {
+    after: model.clone(),
+    ..Planned::default()
+  };
+  for (path, change) in PATHS.iter().zip(&version.changes) {
+    plan_path(path, change, (model, identities), &mut planned);
+  }
+  planned
+}
+
+/// One path's change, planned: a removal, a splice into the file standing, or the file made new ([`made_of`]).
+fn plan_path(
+  path: &str,
+  change: &Change,
+  (model, identities): (&Model, &[Identity]),
+  planned: &mut Planned,
+) {
+  let path = path.to_owned();
+  let standing = model.get(&path).map(|(bytes, _)| bytes.clone());
+  match (change, &standing) {
+    (Change::Keep, _) | (Change::Remove, None) => {}
+    (Change::Remove, Some(_)) => {
+      planned
+        .journal
+        .push(VolumeOp::Unlink { path: path.clone() });
+      planned.after.remove(&path);
+    }
+    (Change::Splice(at, bytes), Some(old)) if !old.is_empty() => {
+      plan_splice(path, old, (*at, bytes), planned);
+    }
+    _ => {
+      let (made, name, adding) = made_of(change, identities);
+      match &standing {
+        None => planned
+          .journal
+          .push(VolumeOp::Create { path: path.clone() }),
+        Some(old) if !old.is_empty() => planned.journal.push(VolumeOp::Truncate {
+          path: path.clone(),
+          len: 0,
+        }),
+        Some(_) => {}
+      }
+      planned.journal.push(VolumeOp::Extend {
+        path: path.clone(),
+        at: 0,
+        len: made.len() as u64,
+      });
+      planned.adds.push((path.clone(), adding));
+      planned.after.insert(path, (made, name));
+    }
+  }
+}
+
+/// `bytes` overwritten into `old`, the file at `path`, at a fraction `at` of its length, carried.
+fn plan_splice(path: String, old: &[u8], (at, bytes): (u8, &[u8]), planned: &mut Planned) {
+  let at = usize::from(at) % old.len();
+  let len = bytes.len().min(old.len() - at);
+  let mut made = old.to_vec();
+  made[at..at + len].copy_from_slice(&bytes[..len]);
+  planned.journal.push(VolumeOp::Overwrite {
+    path: path.clone(),
+    at: at as u64,
+    len: len as u64,
+  });
+  planned
+    .adds
+    .push((path.clone(), Adding::Inline(bytes[..len].to_vec())));
+  planned.after.insert(path, (made, None));
+}
+
+/// A file `change` makes new: its bytes, the object they are the whole of by the design's rule, and how they are added.
+fn made_of(change: &Change, identities: &[Identity]) -> (Vec<u8>, Option<Identity>, Adding) {
+  match change {
+    Change::Whole(k) => {
+      let bytes = object_bytes(*k);
+      let len = bytes.len() as u64;
+      (bytes, Some(identities[*k]), Adding::Run(*k, 0, len))
+    }
+    Change::Part(k, from, take) => {
+      let bytes = object_bytes(*k);
+      let offset = usize::from(*from) % bytes.len();
+      let mut len = 1 + usize::from(*take) % (bytes.len() - offset);
+      if offset == 0 && len == bytes.len() {
+        len -= 1;
+      }
+      let part = bytes[offset..offset + len].to_vec();
+      (part, None, Adding::Run(*k, offset as u64, len as u64))
+    }
+    Change::Inline(bytes) | Change::Splice(_, bytes) => {
+      (bytes.clone(), None, Adding::Inline(bytes.clone()))
+    }
+    Change::Keep | Change::Remove => (Vec::new(), None, Adding::Inline(Vec::new())),
+  }
+}
+
+/// The increment `planned` composes over `model` as increment `index` at `base`, its post-state laid out
+/// ([`lay_out`]) and each adding op pointed at its bytes ([`point_ops`]); and the model after it.
+fn work_of(
+  (index, base): (usize, u64),
+  model: &Model,
+  share: bool,
+  identities: &[Identity],
+  planned: Planned,
+) -> (Increment, Model) {
   let files: Vec<(String, u64)> = model
     .iter()
     .map(|(path, (bytes, _))| (path.clone(), bytes.len() as u64))
     .collect();
-  let (doc, _) = compose_volume_planned(&Base::of_files(files), &journal).unwrap();
+  let (doc, _) = compose_volume_planned(&Base::of_files(files), &planned.journal).unwrap();
   let mut work = Increment {
     id: *blake3::hash(&index.to_le_bytes()).as_bytes(),
     base,
@@ -655,31 +741,42 @@ fn version_work(
     evidence: Vec::new(),
     named: Default::default(),
   };
-  // The post-state's one address space: the carried bytes first, then each run in order.
+  let srcs = lay_out(&mut work, &planned.adds, share, identities);
+  point_ops(&mut work, &srcs);
+  (work, planned.after)
+}
+
+/// The post-state's one address space: the carried bytes first, then each run in order, two files whole of one object
+/// sharing its run where `share`. Each path's bytes' offset there.
+fn lay_out(
+  work: &mut Increment,
+  adds: &[(String, Adding)],
+  share: bool,
+  identities: &[Identity],
+) -> BTreeMap<String, u64> {
   let mut srcs: BTreeMap<String, u64> = BTreeMap::new();
-  for (path, adding) in &adds {
+  for (path, adding) in adds {
     if let Adding::Inline(bytes) = adding {
       srcs.insert(path.clone(), work.post_state.len() as u64);
       work.post_state.extend_from_slice(bytes);
     }
   }
   let mut shared: BTreeMap<usize, u64> = BTreeMap::new();
-  for (path, adding) in &adds {
+  for (path, adding) in adds {
     let Adding::Run(k, offset, len) = adding else {
       continue;
     };
     let whole = *offset == 0 && *len == identities[*k].len;
     let src = match shared.get(k) {
-      Some(src) if version.share && whole => *src,
+      Some(src) if share && whole => *src,
       _ => {
-        let src = work
-          .push_named(NamedRun {
-            identity: identities[*k],
-            offset: *offset,
-            len: *len,
-          })
-          .unwrap();
-        if version.share && whole {
+        let run = NamedRun {
+          identity: identities[*k],
+          offset: *offset,
+          len: *len,
+        };
+        let src = work.push_named(run).unwrap();
+        if share && whole {
           shared.insert(*k, src);
         }
         src
@@ -687,6 +784,11 @@ fn version_work(
     };
     srcs.insert(path.clone(), src);
   }
+  srcs
+}
+
+/// Points each adding op of `work` at its path's bytes in `srcs`: one adding op a path.
+fn point_ops(work: &mut Increment, srcs: &BTreeMap<String, u64>) {
   let mut seen: BTreeMap<String, u32> = BTreeMap::new();
   for op in &mut work.doc.ops {
     if matches!(
@@ -704,7 +806,6 @@ fn version_work(
     seen.values().all(|count| *count == 1),
     "a path took two adding ops: {seen:?}"
   );
-  Some((work, after))
 }
 
 /// `green`'s files and their names are `model`'s, for every one of [`PATHS`].
@@ -734,36 +835,149 @@ fn read_all(work: &mut Increment, plane: &Plane) {
   while !work.read_step(plane, 7).unwrap() {}
 }
 
-/// Runs `versions` through a judging green and a green applying each as its entry records it, both against the model.
-fn run_names(versions: &[Version], census: &mut NameCensus) -> Result<(), TestCaseError> {
-  let mut plane = Plane::default();
-  let identities: Vec<Identity> = (0..OBJECTS).map(|k| plane.put(object_bytes(k))).collect();
-  let mut judging = Green::new();
-  let mut replaying = Green::new();
-  let mut model = Model::new();
-  for (index, version) in versions.iter().enumerate() {
-    let Some((mut work, after)) = version_work(index, judging.head(), &model, version, &identities)
-    else {
-      continue;
+/// A generated history as it runs: the plane and its objects, the judging green, the green applying each version as its
+/// entry records it, the model, and the versions committed so far.
+struct History {
+  plane: Plane,
+  identities: Vec<Identity>,
+  judging: Green,
+  replaying: Green,
+  model: Model,
+  committed: Vec<Committed>,
+}
+
+impl History {
+  /// A history at version 0 over a plane holding the [`OBJECTS`].
+  fn new() -> History {
+    let mut plane = Plane::default();
+    let identities = (0..OBJECTS).map(|k| plane.put(object_bytes(k))).collect();
+    History {
+      plane,
+      identities,
+      judging: Green::new(),
+      replaying: Green::new(),
+      model: Model::new(),
+      committed: Vec::new(),
+    }
+  }
+
+  /// `version`, increment `index`: judged and committed on the judging green (made a slice a step first where it says),
+  /// applied as its entry records it on the replaying green, both then held to the model; nothing for a version that
+  /// changes nothing.
+  fn run(
+    &mut self,
+    index: usize,
+    version: &Version,
+    census: &mut NameCensus,
+  ) -> Result<(), TestCaseError> {
+    let Some((mut work, after)) = version_work(
+      index,
+      self.judging.head(),
+      &self.model,
+      version,
+      &self.identities,
+    ) else {
+      return Ok(());
     };
-    read_all(&mut work, &plane);
-    let super::Judgment::Accepted(mut judged) = judging.judge_named(&mut work) else {
+    read_all(&mut work, &self.plane);
+    let super::Judgment::Accepted(mut judged) = self.judging.judge_named(&mut work) else {
       return Err(TestCaseError::fail(format!("version {index} not accepted")));
     };
+    let moved =
+      |moved: super::HeadMoved| TestCaseError::fail(format!("version {index}: {moved:?}"));
     if version.stepped {
-      while !judging.make_step(&mut judged, 5).unwrap().done {}
+      while !self.judging.make_step(&mut judged, 5).map_err(moved)?.done {}
       census.stepped += 1;
     }
-    let (number, applied) = judging.commit_judged(judged).unwrap();
-    let (mut recorded, _) =
-      version_work(index, replaying.head(), &model, version, &identities).unwrap();
-    read_all(&mut recorded, &plane);
-    prop_assert_eq!(replaying.apply_recorded(&mut recorded, &applied), number);
-    count_names(&model, &after, version, census);
-    model = after;
-    holds_model(&judging, &model, "the judging green")?;
-    holds_model(&replaying, &model, "the replaying green")?;
-    prop_assert_eq!(replaying.head_identity(), judging.head_identity());
+    let (number, applied) = self.judging.commit_judged(judged).map_err(moved)?;
+    let (mut recorded, _) = version_work(
+      index,
+      self.replaying.head(),
+      &self.model,
+      version,
+      &self.identities,
+    )
+    .ok_or_else(|| TestCaseError::fail(format!("version {index} changed nothing again")))?;
+    read_all(&mut recorded, &self.plane);
+    prop_assert_eq!(
+      self.replaying.apply_recorded(&mut recorded, &applied),
+      number
+    );
+    count_names(&self.model, &after, version, census);
+    let before = std::mem::replace(&mut self.model, after);
+    self.committed.push(Committed {
+      index,
+      version: version.clone(),
+      before,
+      number,
+      applied,
+    });
+    holds_model(&self.judging, &self.model, "the judging green")?;
+    holds_model(&self.replaying, &self.model, "the replaying green")?;
+    prop_assert_eq!(self.replaying.head_identity(), self.judging.head_identity());
+    Ok(())
+  }
+
+  /// The replaying green replaced by one restored from the judging green's checkpoint at the committed version `pick`
+  /// chooses ([`decoded_and_read`]), caught up by every later committed version applied as its entry records it, then
+  /// held to the model (A-869).
+  fn restore(&mut self, pick: u8, census: &mut NameCensus) -> Result<(), TestCaseError> {
+    if self.committed.is_empty() {
+      return Ok(());
+    }
+    let from = usize::from(pick) % self.committed.len();
+    let at = self.committed[from].number;
+    let taken = self
+      .judging
+      .checkpoint(at)
+      .ok_or_else(|| TestCaseError::fail(format!("no checkpoint at {at}")))?;
+    let mut checkpoint = decoded_and_read(&taken, &self.plane);
+    census.named_restored += checkpoint.named.len() as u64;
+    let mut green = Green::restore(crate::origin::Origin::default(), &mut checkpoint)
+      .map_err(|unrestored| TestCaseError::fail(format!("unread: {:?}", unrestored.identity)))?;
+    census.restored += 1;
+    for later in &self.committed[from + 1..] {
+      census.restored_below += 1;
+      let (mut work, _) = version_work(
+        later.index,
+        green.head(),
+        &later.before,
+        &later.version,
+        &self.identities,
+      )
+      .ok_or_else(|| TestCaseError::fail(format!("version {} changed nothing", later.index)))?;
+      read_all(&mut work, &self.plane);
+      prop_assert_eq!(
+        green.apply_recorded(&mut work, &later.applied),
+        later.number
+      );
+    }
+    self.replaying = green;
+    holds_model(&self.replaying, &self.model, "the restored green")?;
+    prop_assert_eq!(self.replaying.head_identity(), self.judging.head_identity());
+    Ok(())
+  }
+}
+
+/// `taken`'s encoding decoded, equal to it, and its named files read from `plane` a few bytes a step.
+fn decoded_and_read(
+  taken: &crate::checkpoint::Checkpoint,
+  plane: &Plane,
+) -> crate::checkpoint::Checkpoint {
+  let mut checkpoint = crate::checkpoint::Checkpoint::decode(&taken.encode()).unwrap();
+  assert_eq!(&checkpoint, taken, "the checkpoint's encoding round trip");
+  while !checkpoint.read_step(plane, 5).unwrap() {}
+  checkpoint
+}
+
+/// Runs `versions` through a [`History`], restoring where a version says, against the model.
+fn run_names(versions: &[Version], census: &mut NameCensus) -> Result<(), TestCaseError> {
+  let mut history = History::new();
+  for (index, version) in versions.iter().enumerate() {
+    history.run(index, version, census)?;
+    if let Some(pick) = version.restore {
+      history.restore(pick, census)?;
+    }
   }
   Ok(())
 }
@@ -793,26 +1007,39 @@ fn count_names(before: &Model, after: &Model, version: &Version, census: &mut Na
   }
 }
 
+/// A generated change ([`Change`]), by a selector's weights (no `prop_oneof!`, whose arms are held in an `Arc`, CLAUDE.md
+/// R2): leave alone 2 in 9, whole 3, part 1, carried 1, splice 1, remove 1.
+fn generated_change() -> impl Strategy<Value = Change> {
+  (
+    0u8..9,
+    0..OBJECTS,
+    (any::<u8>(), any::<u8>()),
+    prop::collection::vec(any::<u8>(), 1..8),
+  )
+    .prop_map(|(selector, k, (from, take), bytes)| match selector {
+      0..2 => Change::Keep,
+      2..5 => Change::Whole(k),
+      5 => Change::Part(k, from, take),
+      6 => Change::Inline(bytes),
+      7 => Change::Splice(from, bytes),
+      _ => Change::Remove,
+    })
+}
+
 /// A generated version ([`Version`]).
 fn generated_version() -> impl Strategy<Value = Version> {
-  let change = prop_oneof![
-    2 => Just(Change::Keep),
-    3 => (0..OBJECTS).prop_map(Change::Whole),
-    1 => (0..OBJECTS, any::<u8>(), any::<u8>()).prop_map(|(k, from, take)| Change::Part(k, from, take)),
-    1 => prop::collection::vec(any::<u8>(), 1..8).prop_map(Change::Inline),
-    1 => (any::<u8>(), prop::collection::vec(any::<u8>(), 1..8))
-      .prop_map(|(at, bytes)| Change::Splice(at, bytes)),
-    1 => Just(Change::Remove),
-  ];
+  let change = generated_change();
   (
     prop::collection::vec(change, PATHS.len()),
     any::<bool>(),
     any::<bool>(),
+    prop::option::weighted(0.3, any::<u8>()),
   )
-    .prop_map(|(changes, share, stepped)| Version {
+    .prop_map(|(changes, share, stepped, restore)| Version {
       changes,
       share,
       stepped,
+      restore,
     })
 }
 
@@ -824,6 +1051,12 @@ fn generated_version() -> impl Strategy<Value = Version> {
 /// version both greens hold the model's bytes and names: a file is named for the object exactly when the version that
 /// last changed it made it the whole of that object's run, and the two greens' heads are one. Failing first: no file was
 /// named (the commit made every block unnamed).
+///
+/// A-869, piece 2 (main 01a20182's order of 2026-11-22 19:28: restores included). Some versions are followed by a
+/// restore: the judging green's checkpoint at an earlier committed version (or the head), encoded and decoded, its named
+/// files read from the plane a few bytes a step, restored, and caught up by every later version as its entry records it,
+/// in place of the replaying green. Expect it the model's bytes and names, and the judging green's head identity.
+/// Failing first: a restored green named no file (`left: None`, the checkpoint carried every file's bytes).
 #[test]
 fn a_file_made_whole_of_a_named_object_is_named_for_it_until_changed() {
   let fixed = vec![
@@ -831,6 +1064,7 @@ fn a_file_made_whole_of_a_named_object_is_named_for_it_until_changed() {
       changes: vec![Change::Whole(0), Change::Whole(1), Change::Whole(1)],
       share: true,
       stepped: false,
+      restore: None,
     },
     Version {
       changes: vec![
@@ -840,6 +1074,8 @@ fn a_file_made_whole_of_a_named_object_is_named_for_it_until_changed() {
       ],
       share: false,
       stepped: true,
+      // Restored at version 1, then caught up by version 2's entry.
+      restore: Some(0),
     },
     Version {
       changes: vec![
@@ -849,6 +1085,8 @@ fn a_file_made_whole_of_a_named_object_is_named_for_it_until_changed() {
       ],
       share: false,
       stepped: false,
+      // Restored at its head.
+      restore: Some(2),
     },
   ];
   let mut census = NameCensus::default();

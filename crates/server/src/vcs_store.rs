@@ -662,6 +662,17 @@ impl VcsStores {
         heads = heads.saturating_add(u64::try_from(store.heads.len()).unwrap_or(u64::MAX));
       }
     }
+    // What homes hold beside the content store: region holds, their windows' pins, landed records (goal 93 item 2b(b)).
+    let homes = homes::held();
+    rows.extend([
+      ("mem.gauge.homes.region_holds", homes.region_holds),
+      ("mem.gauge.homes.region_windows", homes.region_windows),
+      ("mem.gauge.homes.landed_records", homes.landed_records),
+      (
+        "mem.gauge.homes.landed_record_bytes",
+        homes.landed_record_bytes,
+      ),
+    ]);
     rows.extend([
       ("mem.gauge.git.repositories", repositories),
       ("mem.gauge.git.scratch_bytes", git.scratch),

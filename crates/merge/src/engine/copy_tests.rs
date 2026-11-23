@@ -714,7 +714,7 @@ fn a_green_holding_a_copy_is_checkpointed_and_restored() {
       copied_files,
       "the copied files at {at}"
     );
-    let mut restored = Green::restore(Origin::default(), &checkpoint);
+    let mut restored = Green::restore(Origin::default(), &mut checkpoint.clone()).unwrap();
     if at == 2 {
       let work = Work::default().overwrite("b/a", 0, b"A").at(3, 2);
       assert_eq!(restored.submit(&work), Outcome::Accepted { version: 3 });
@@ -1404,7 +1404,7 @@ fn a_replica_restored_after_a_copys_source_version_hashes_as_its_owner() {
   edit.overwrite("b/a", 0, b"Z");
   let edit = edit.at(5, 4);
   let edited = accepted_effects(&mut green, &edit);
-  let mut replica = Green::restore(Origin::default(), &checkpoint);
+  let mut replica = Green::restore(Origin::default(), &mut checkpoint.clone()).unwrap();
   assert_eq!(replay_entry(&mut replica, &copy, &copied), 4);
   assert_eq!(replay_entry(&mut replica, &edit, &edited), 5);
   assert_eq!(
@@ -1444,7 +1444,7 @@ fn a_replica_replaying_a_copy_edited_in_its_own_version_hashes_as_its_owner() {
   work.copy("trunk", "b", 1).overwrite("b/a", 3, b"HA");
   let increment = work.at(4, 3);
   let applied = accepted_effects(&mut green, &increment);
-  let mut replica = Green::restore(Origin::default(), &checkpoint);
+  let mut replica = Green::restore(Origin::default(), &mut checkpoint.clone()).unwrap();
   assert_eq!(replay_entry(&mut replica, &increment, &applied), 4);
   assert_eq!(
     replica.head_identity(),
@@ -2294,7 +2294,7 @@ impl Oracle {
     checkpoint: &Checkpoint,
     identities: &[[u8; 32]],
   ) -> Result<Green, TestCaseError> {
-    let mut restored = Green::restore(Origin::default(), checkpoint);
+    let mut restored = Green::restore(Origin::default(), &mut checkpoint.clone()).unwrap();
     let at = usize::try_from(checkpoint.version).unwrap_or(usize::MAX);
     let expected = |version: usize| identities.get(version).copied();
     prop_assert_eq!(
@@ -2649,7 +2649,7 @@ fn a_copied_trees_links_share_the_copys_nodes_and_one_naming_a_node_outside_owns
   assert_eq!(linked_reads(&replica), expected);
   assert_eq!(replica.head_identity(), green.head_identity());
   let checkpoint = green.checkpoint(4).expect("a checkpoint");
-  let mut restored = Green::restore(Origin::default(), &checkpoint);
+  let mut restored = Green::restore(Origin::default(), &mut checkpoint.clone()).unwrap();
   assert_eq!(linked_reads(&restored), expected);
   assert_eq!(restored.head_identity(), green.head_identity());
 }

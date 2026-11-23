@@ -1100,11 +1100,47 @@ fn a_batch_killed_between_its_changeset_and_its_entry_lands_again_whole() {
   assert!(exported == Some((FULL_LAST, FULL.to_vec())), "full.dump");
 }
 
-/// A-760's pre-pass on the cold path alone (main 01a20182's ruling of 2026-11-22 ~11:35). Do: import `full.dump` whole on
-/// a daemon holding a store; stop it and the store's owner, start both again, read the history. Expect: nothing brought
-/// back (the batch's checkpoint covers every entry), the history `full.dump` byte for byte.
+/// How many distinct objects repository `repository`'s green's checkpoint names its files by (A-869), once the
+/// checkpoint covers the green's head `head`, waited for within a minute: the import answers before its batch's
+/// checkpoint commits, so a test that stops the daemon at once races it (w-hg's and w-shared's finding of 2026-11-22: 1
+/// run in 6 on the big Studio recovered from the entries, all 13 texts brought back). Zero for no such checkpoint.
+fn checkpoint_named(daemon: &Daemon, repository: RepositoryId, head: u64) -> u64 {
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+  loop {
+    let named = checkpoint_named_now(daemon, repository, head);
+    if named.is_some() || std::time::Instant::now() >= deadline {
+      return named.unwrap_or(0);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(10));
+  }
+}
+
+/// [`checkpoint_named`] as the shard holds it now: none until a checkpoint at `head` stands.
+fn checkpoint_named_now(daemon: &Daemon, repository: RepositoryId, head: u64) -> Option<u64> {
+  crate::daemon::observe_first(daemon, move |state| {
+    let green = super::svn_commit::green_of(state, repository).ok()?;
+    let (held, named) = state.db.partition().green_checkpoint(green)?;
+    if held < head {
+      return None;
+    }
+    let bytes = crate::merge_service::checkpoint_bytes(state, green, &named)?;
+    let checkpoint = slates_merge::checkpoint::Checkpoint::decode(&bytes).ok()?;
+    let distinct: std::collections::BTreeSet<[u8; 32]> = checkpoint
+      .named
+      .iter()
+      .map(|file| file.identity.hash)
+      .collect();
+    u64::try_from(distinct.len()).ok()
+  })
+}
+
+/// A-760's pre-pass on the cold path alone (main 01a20182's ruling of 2026-11-22 ~11:35), with A-869's checkpoint naming
+/// its files. Do: import `full.dump` whole on a daemon holding a store; wait for the batch's checkpoint at its head and
+/// count the objects it names; stop the daemon and the store's owner, start both again, read the history. Expect: the batch's checkpoint covers
+/// every entry, so what is brought back is the texts the checkpoint names and nothing for an entry (before A-869 the
+/// checkpoint carried their bytes, and nothing was brought); some named; the history `full.dump` byte for byte.
 #[test]
-fn a_cleanly_restarted_import_brings_back_no_named_text() {
+fn a_cleanly_restarted_import_brings_back_only_its_checkpoints_named_texts() {
   use crate::vcs_store::svn_import::tests::{FULL, FULL_LAST, history, imported};
   let instance = format!("vcs-store-svn-clean-{}", std::process::id());
   let mut store = TestStore::start("svn-clean-restart");
@@ -1123,6 +1159,7 @@ fn a_cleanly_restarted_import_brings_back_no_named_text() {
     std::time::Duration::from_secs(60),
   );
   assert_eq!(loaded, Ok(FULL_LAST));
+  let named = checkpoint_named(&daemon, repository, FULL_LAST);
   daemon.stop();
   store.restart_owner();
   let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
@@ -1133,7 +1170,11 @@ fn a_cleanly_restarted_import_brings_back_no_named_text() {
     std::time::Duration::from_secs(60),
   );
   daemon.stop();
-  assert_eq!(brought, 0, "the cold path ran without a crash");
+  assert!(named > 0, "the checkpoint names no file");
+  assert_eq!(
+    brought, named,
+    "what was brought back is what the checkpoint names"
+  );
   assert!(exported == Some((FULL_LAST, FULL.to_vec())), "full.dump");
 }
 

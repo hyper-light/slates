@@ -791,6 +791,51 @@ pub(crate) fn landed_changes_committed() {
   });
 }
 
+/// What this shard's homes hold beside the content store (the memory status's `mem.gauge.homes.*`): its region holds,
+/// the windows of the objects they name, its landed records and their bytes as the shard image keeps them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HomesHeld {
+  /// The objects held for the region ([`REGION_HELD`]).
+  pub(crate) region_holds: u64,
+  /// The windows of those objects counted for their pin ([`REGION_WINDOWS`]).
+  pub(crate) region_windows: u64,
+  /// The landed records ([`LANDED`]).
+  pub(crate) landed_records: u64,
+  /// Their bytes in the image's form: each window's identity and its record.
+  pub(crate) landed_record_bytes: u64,
+}
+
+/// What this shard's homes hold now ([`HomesHeld`]).
+pub(crate) fn held() -> HomesHeld {
+  let count = |len: usize| u64::try_from(len).unwrap_or(u64::MAX);
+  let region_holds = REGION_HELD.with(|held| held.try_borrow().map_or(0, |held| count(held.len())));
+  let region_windows = REGION_WINDOWS.with(|windows| {
+    windows
+      .try_borrow()
+      .map_or(0, |windows| count(windows.len()))
+  });
+  let (landed_records, landed_record_bytes) = LANDED.with(|landed| {
+    landed.try_borrow().map_or((0, 0), |landed| {
+      let bytes = landed.values().fold(0u64, |sum, record| {
+        let record = match record {
+          Landed::Pack(_) => LANDED_AT_BYTES,
+          Landed::Hg(hg) => HG_LANDED_HEAD.saturating_add(hg.path.len()),
+        };
+        sum.saturating_add(count(
+          slates_vcs::content::IDENTITY_BYTES.saturating_add(record),
+        ))
+      });
+      (count(landed.len()), bytes)
+    })
+  });
+  HomesHeld {
+    region_holds,
+    region_windows,
+    landed_records,
+    landed_record_bytes,
+  }
+}
+
 /// The landed records a recovered shard image carried, taken back as they were: no store is read for them.
 pub(crate) fn restore_landed(records: &[(ContentId, Landed)]) {
   LANDED.with(|landed| {
