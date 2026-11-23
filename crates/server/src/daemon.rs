@@ -5542,7 +5542,15 @@ fn spent_since(started: Option<u64>, ended: Option<u64>) -> Option<u64> {
 /// read, teaches nothing.
 fn learn_give_back_rate(s: &mut ShardState, walked: usize, spent: Option<u64>) {
   let quantum = futures::step_budget_ns().unwrap_or(s.config.runtime.step_budget_ns);
+  let before = s.give_back_rate.slice_bytes;
   s.give_back_rate.fold(walked, spent, quantum);
+  // DIAG ONLY (diag-measurer-w-win2, never merged): the first folds, and every one that changes the slice tenfold.
+  static FOLDS: AtomicU64 = AtomicU64::new(0);
+  let folds = FOLDS.fetch_add(1, Ordering::Relaxed);
+  let after = s.give_back_rate.slice_bytes;
+  if folds < 24 || after > before.saturating_mul(10) || after.saturating_mul(10) < before {
+    slates_machine::log_line!("DIAG fold {folds}: walked {walked} spent {spent:?} quantum {quantum} slice {before} -> {after}");
+  }
 }
 
 /// The rate the idle give-back has learned of its own steps (A-226, A-491): the bytes one step may walk, and what the
@@ -5715,7 +5723,26 @@ fn return_dead_recovery_timed(
 /// burst resident behind it (w-hg's release run after hg's history push: 4,931.4 MiB, and 3.5 GB more faulted at idle).
 /// Measured against none: BENCHMARKS, "The idle prefault reserve, measured against none".
 async fn purge_if_idle() -> bool {
+  // DIAG ONLY (diag-measurer-w-win2, never merged): one line a pass, its steps and how it ended.
+  let began = std::time::Instant::now();
+  let mut steps = 0u64;
+  let ended = purge_if_idle_steps(&mut steps).await;
+  slates_machine::log_line!("DIAG pass: {steps} steps in {:?}, ended {ended:?}", began.elapsed());
+  ended == PassEnd::Settled
+}
+
+/// DIAG ONLY: how a pass ended.
+#[derive(Debug, PartialEq, Eq)]
+enum PassEnd {
+  Settled,
+  Busy,
+  OthersRan,
+}
+
+/// DIAG ONLY: [`purge_if_idle`]'s steps, counted.
+async fn purge_if_idle_steps(steps: &mut u64) -> PassEnd {
   loop {
+    *steps = steps.saturating_add(1);
     let step = state::with_state(|s| {
       let allocations = s.store.content.arena().allocations();
       let idle = allocations == s.purge_seen_allocations;
@@ -5750,7 +5777,7 @@ async fn purge_if_idle() -> bool {
     .flatten();
     if step != Some(true) {
       // Settled once a step found the shard idle and left nothing; a busy shard owes the next pass.
-      return step == Some(false);
+      return if step == Some(false) { PassEnd::Settled } else { PassEnd::Busy };
     }
     // Whatever ran across this yield is work of the shard's, and this is only keeping RAM tidy: the rest waits for the
     // next tick (one step a tick, at the worst). The arena's idle test cannot see such work when it allocates nothing,
@@ -5763,7 +5790,7 @@ async fn purge_if_idle() -> bool {
       .is_some_and(|(before, after)| after.saturating_sub(before) > 1);
     if others_ran {
       let _ = state::with_state_counted(|s| s.count(GIVE_BACK_LEFT, 1));
-      return false;
+      return PassEnd::OthersRan;
     }
   }
 }

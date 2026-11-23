@@ -204,7 +204,11 @@ mod tests {
     let pause = Duration::from_nanos(super::interval_ns());
     let begun = Instant::now();
     loop {
-      if crate::daemon::observe_first(daemon, look.clone()) {
+      let asked = look.clone();
+      let (done, seen) =
+        crate::daemon::observe_first(daemon, move |state| (asked(state), diag_state(state)));
+      println!("DIAG look at {:?}: {done} | {seen}", begun.elapsed());
+      if done {
         return true;
       }
       if begun.elapsed() > bound {
@@ -402,6 +406,59 @@ mod tests {
     println!(
       "{LISTED_DIRECTORIES} idle directories closed {took:?} after their last use (a sweep's interval is {interval:?})"
     );
+  }
+
+  /// DIAG ONLY (diag-measurer-w-win2, never merged): the sweep's whole state, one line.
+  fn diag_state(state: &mut crate::state::ShardState) -> String {
+    let count = |state: &crate::state::ShardState, kind: &str| {
+      state.refusals.get(kind).copied().unwrap_or(0)
+    };
+    let counts = [
+      crate::daemon::TICKS_SEALING,
+      crate::daemon::TICKS_DEFERRED,
+      crate::daemon::TICKS_BUSY,
+      crate::daemon::TICKS_IDLE,
+      crate::daemon::GIVE_BACK_LEFT,
+      crate::daemon::CONTENT_PURGED,
+      crate::daemon::RECOVERY_RETURNED,
+    ]
+    .map(|kind| format!("{}={}", kind.rsplit('.').next().unwrap_or(kind), count(state, kind)))
+    .join(" ");
+    let (slots_start, slots_end) = state.content_range;
+    let (log_start, log_end) = state.delta_range;
+    let recovery_left = state
+      .journal
+      .dead_ranges(
+        slots_end.saturating_sub(slots_start),
+        log_end.saturating_sub(log_start),
+      )
+      .map_or(0, |dead| {
+        dead.stale_slot.1.saturating_add(dead.log_past_tail.1)
+      });
+    let now = state.clock.monotonic_ns();
+    let at = state.idle_sweep_at.map(|at| at.saturating_sub(now));
+    let running = state.idle_sweep_running;
+    let slice = state.give_back_rate.slice_bytes;
+    let log_left = state.write_log.as_ref().map(crate::write_log::WriteLog::written_bytes);
+    let arena = state.store.content.arena();
+    let (resident_free, deferred) = (arena.resident_free_bytes(), arena.deferred_bytes());
+    format!(
+      "{counts} | armed_in {at:?} running {running} | slice {slice} log_left {log_left:?} recovery_left {recovery_left} resident_free {resident_free} deferred {deferred} | quantum {:?} rate {:?}",
+      slates_rt::futures::step_budget_ns(),
+      diag_rate(),
+    )
+  }
+
+  /// DIAG ONLY: the cycle rate the Windows clock reads at.
+  #[cfg(windows)]
+  fn diag_rate() -> Option<u64> {
+    slates_machine::own_cpu::cycle_rate_hz()
+  }
+
+  /// DIAG ONLY: no cycle rate off Windows.
+  #[cfg(not(windows))]
+  fn diag_rate() -> Option<u64> {
+    None
   }
 
   /// What the shard's sweep has done and owes, for a failure's message.
