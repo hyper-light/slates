@@ -53,6 +53,13 @@ pub(crate) const MATERIALIZE_OVER_ROOM: &str = "merge.green.materialize_over_roo
 /// Counter: a materialization whose build ran past its room and waited for room (A-857), made again once room came or
 /// refused past the wait's patience (`crate::vcs_share::wait`). Format: a counter name.
 pub(crate) const MATERIALIZE_WAITED: &str = "merge.green.materialize_waited";
+/// Counter: a window of a git repository's pack let go that a materialization's build read, brought back from the
+/// node's store before the build took its unit again (goal 93 item 2b). Format: a counter name.
+pub(crate) const MATERIALIZE_BROUGHT_BACK: &str = "merge.green.materialize_brought_back";
+/// Counter: a materialization refused because a window its build read could not be brought back from the node's store
+/// (`vcs_store::read_through::ReadThroughRefused`), its parked requests answered `ContentUnavailable`. Format: a
+/// counter name.
+pub(crate) const MATERIALIZE_UNREAD: &str = "merge.green.materialize_unread";
 /// Counter: a request parked on a green's materialization. Format: a counter name.
 pub(crate) const PARKED: &str = "merge.green.materialize_parked";
 /// Counter: a request refused `Overloaded` at the parked bound, or with no route to park on. Format: a counter name.
@@ -286,6 +293,15 @@ pub(crate) fn make_building_now(state: &mut ShardState) {
       // synchronous test holding the shard so that no room could come.
       let step = match turned {
         Turned::More => continue,
+        // A test holding the shard cannot bring a window back from the node's store: the build is refused with it.
+        Turned::Waiting(met) => {
+          unread(
+            state,
+            green,
+            &crate::vcs_store::read_through::ReadThroughRefused::Missing { at: met.offset },
+          );
+          break;
+        }
         Turned::Done => break,
         Turned::PastRoom { asked, room } => waited(state, green, &mut wait, (asked, room)),
       };
@@ -295,7 +311,7 @@ pub(crate) fn make_building_now(state: &mut ShardState) {
           give_up(state, green);
           break;
         }
-        Step::End => break,
+        Step::End | Step::BringBack(_) => break,
       }
     }
   }
@@ -334,6 +350,27 @@ enum Turned {
   Done,
   /// Run past its room (A-857): what it asked and the room it had; it waits for room, its parked requests held.
   PastRoom { asked: u64, room: u64 },
+  /// Stopped at a window of its repository's pack let go (goal 93 item 2b; `slates_merge::push::Unavailable::NotYet`
+  /// from git's views): the window to bring back from the node's store before the build takes the unit again.
+  Waiting(slates_git::store::packed::Waited),
+}
+
+/// Refuses `green`'s build, a window it read not brought back (`refused`): logged and counted
+/// [`MATERIALIZE_UNREAD`], its parked requests answered `ContentUnavailable`, the green still owing, so a retry starts
+/// it again.
+fn unread(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  refused: &crate::vcs_store::read_through::ReadThroughRefused,
+) {
+  state.materializations.building.remove(&green);
+  state.count(MATERIALIZE_UNREAD, 1);
+  slates_machine::log_line!(
+    "slates-server: partition {}: a green's owed push was refused building: a window it read could not be brought \
+     back: {refused:?}",
+    state.partition
+  );
+  refuse_parked(state, green, Refusal::ContentUnavailable);
 }
 
 /// What the materialization's task does next.
@@ -342,6 +379,8 @@ enum Step {
   Yield,
   /// Waits this many nanoseconds for room, then asks again.
   Wait(u64),
+  /// Brings back the window of its repository's pack the build stopped at, then turns again.
+  BringBack(slates_git::store::packed::Waited),
   /// Is done.
   End,
 }
@@ -358,6 +397,7 @@ async fn materialize(green: DbVolumeId) {
       }
       match turn(state, green) {
         Turned::More => Step::Yield,
+        Turned::Waiting(waited) => Step::BringBack(waited),
         Turned::Done => Step::End,
         Turned::PastRoom { asked, room } => {
           past = Some((asked, room));
@@ -375,6 +415,19 @@ async fn materialize(green: DbVolumeId) {
       Some(Step::Wait(ns)) => {
         // A sleep the runtime refuses ends the wait early: the next turn asks again.
         let _ = slates_rt::futures::sleep(ns).await;
+      }
+      // The window the build stopped at brought back (bounded by its patience, `read_through::PATIENCE_NS`), then the
+      // unit taken again; refused, the build is: a window that cannot come back is never read again in a loop.
+      Some(Step::BringBack(waited)) => {
+        match crate::vcs_store::read_through::bring_back(waited).await {
+          Ok(_) => {
+            let _ = crate::state::with_state(|state| state.count(MATERIALIZE_BROUGHT_BACK, 1));
+          }
+          Err(refused) => {
+            let _ = crate::state::with_state(|state| unread(state, green, &refused));
+            return;
+          }
+        }
       }
       Some(Step::End) | None => return,
     }
@@ -467,8 +520,14 @@ fn turn(state: &mut ShardState, green: DbVolumeId) -> Turned {
     });
   match advanced {
     None => {
+      // A unit that met a window let go: the window its read noted on the repository, brought back before the next turn.
+      let waited = building
+        .waiting()
+        .and_then(|_| repository)
+        .and_then(|repository| state.vcs_stores.git(repository))
+        .and_then(|(_, store)| store.repository.waiting());
       state.materializations.building.insert(green, building);
-      Turned::More
+      waited.map_or(Turned::More, Turned::Waiting)
     }
     Some(Ok(built)) => {
       // Secured before it commits, as a submit's admission secures a work's history and change index
