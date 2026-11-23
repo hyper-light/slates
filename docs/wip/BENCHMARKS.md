@@ -18460,3 +18460,45 @@ Every run: oracle failures 0, refusals 0, lost 0.
 - Beside it, the quiet reference: on the big Studio (M3 Ultra, 32 cores, 2026-11-21 23:03) A's SubmitAccepted p50 was
   0.38 to 0.45 ms. On the same hardware B at a3e673efc (format 6 with d44f0166a, before A-854) was 356 to 429 ms.
 - A-825 is closed by A-854 (GAPS).
+
+## An idle heap give-back for the import's freed small blocks: measured and rejected (w-interop; main 01a20182's ruling; 2026-11-22)
+
+- **Why asked.** main's r80 (the big Studio, an svn import of git-2000.dump at b79b54350, idle 30 s, another run on the
+  box): RSS 1.14 GB, footprint 670 MB. `vmmap -summary`: `MALLOC_SMALL` 452 MB virtual, 415 MB resident, 334.5 MB
+  dirty; `MALLOC_SMALL (empty)` 512 MB virtual, 507.7 MB resident, 235.0 MB dirty in 128 regions; `MALLOC_TINY`
+  128 KiB; `VM_ALLOCATE` 23.3 MB dirty. No mapped file. The 235 MB of empty small regions is freed blocks libmalloc
+  keeps dirty for reuse. (vmmap's suspend lost that daemon: the anchor's beat lapsed.)
+- **Machine and probe.** This MacBook (Adas-MacBook-Pro-2.local, macOS 26, Darwin 25.4), 2026-11-22 ~17:40 PST, load
+  average 43 to 65 (shared; not quiesced). A standalone C program (clang -O1) allocates 512 MiB in blocks of one
+  size, writes every byte, frees every block, sleeps 5 s, calls `malloc_zone_pressure_relief(NULL, 0)`, and reads its
+  own physical footprint (`proc_pid_rusage` `ri_phys_footprint`) at each step. No daemon was suspended.
+
+| block | held (MiB) | after free | 5 s idle | relief released | after relief |
+|---|---|---|---|---|---|
+| 512 B | 523 | 28 | 28 | 0 | 28 |
+| 2 KiB | 517 | 22 | 22 | 0 | 22 |
+| 8 KiB | 515 | 133 | 133 | 0 | 133 |
+| 64 KiB | 515 | 515 | 515 | 0 | 515 |
+| 8 KiB, `MallocAggressiveMadvise=1` | 515 | 133 | 133 | 0 | 133 |
+| 64 KiB, `MallocAggressiveMadvise=1` | 515 | 515 | 515 | 0 | 515 |
+| 8 KiB, `MallocSpaceEfficient=1` | 515 | 3 | 3 | 0 | 3 |
+| 64 KiB, `MallocSpaceEfficient=1` | 515 | 3 | 3 | 0 | 3 |
+
+- **Churn cost of `MallocSpaceEfficient=1`.** A second probe (clang -O2) keeps 4,096 live blocks and makes 4,000,000
+  random alloc-and-free pairs; three runs each, default first:
+
+| sizes | default (ns a pair) | `MallocSpaceEfficient=1` |
+|---|---|---|
+| 64 B to 64 KiB | 1,656 / 1,681 / 1,526 | 13,884 / 10,349 / 8,447 |
+| 16 B to 1 KiB | 155 / 236 / 246 | 273 / 206 / 180 |
+
+- **Rejected, each:**
+  - An idle `malloc_zone_pressure_relief`: it released 0 bytes at every size (as A-742 found for large blocks on
+    2026-11-20).
+  - `MallocSpaceEfficient=1`, set by the anchor for the daemon: it takes the freed 515 MB down to 3 MB, but makes
+    every 64 B to 64 KiB alloc-and-free pair 5 to 8 times slower. That is a hot-path cost paid to tidy an idle figure,
+    and a process-wide mode switch.
+  - A lower large-path floor (medium blocks mapped and unmapped on their own): a syscall and a zero-fill a block.
+    Not measured.
+- **Kept:** the pages are libmalloc's own cache, which the next work reuses; not a leak. The cause is upstream: the
+  import churns about 500 MB of small blocks it frees again (GAPS, w-svn's import, P7's finding (2)).

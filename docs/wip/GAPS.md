@@ -3880,6 +3880,14 @@
 > Still to measure: the A-742 floor's A/B only if the
 > footprint still stays (main's ruling). A local 64 KiB floor gave 47 MB of footprint at 2 s idle, against 363 MB, at
 > 19.4 s against 12.0 s (debug).
+> **An idle heap give-back measured and rejected (w-interop, 2026-11-22; main's ruling; BENCHMARKS "An idle heap
+> give-back for the import's freed small blocks"):** `malloc_zone_pressure_relief` releases 0 bytes at every block size;
+> `MallocSpaceEfficient=1` takes 515 MB of freed blocks down to 3 MB but makes 64 B to 64 KiB alloc-and-free pairs 5 to
+> 8 times slower. The pages are libmalloc's cache, reused by the next work.
+> **OPEN, upstream (main's ruling of 2026-11-22): the import churns about 500 MB of small blocks it frees again**, a
+> working set that grows with the dump (owed: a bounded working set per push). main's r80 (big Studio, git-2000.dump at
+> b79b54350, idle 30 s, a shared box): RSS 1.14 GB, footprint 670 MB; `MALLOC_SMALL (empty)` 512 MB virtual, 507.7 MB
+> resident, 235.0 MB dirty in 128 regions; `MALLOC_SMALL` 452 MB virtual, 415 MB resident, 334.5 MB dirty.
 > **A-822's commit held the shard past its watchdog; A-835 slices it (2026-11-21, w-svn; main's ruling of 12:43).**
 > Main's git-2000 run over A-822 had the watchdog kill the anchor twice: the batch's 2,000 versions applied in one step.
 > A-835 applies a recorded batch a slice a turn and folds a recovered Subversion green to its readers (the 434 MB under
