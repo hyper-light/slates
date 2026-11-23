@@ -61,7 +61,11 @@ fn the_hot_path_makes_zero_system_allocations() {
       slab.remove(h).unwrap();
     }
     for i in 0..12usize {
-      extents.push(arena.alloc(page * (1 + (i + round) % 3)).unwrap());
+      extents.push(
+        arena
+          .alloc(page * (1 + (i + round) % 3), slates_mem::Owner::Volume)
+          .unwrap(),
+      );
     }
     for e in extents.drain(..) {
       arena.free(e).unwrap();

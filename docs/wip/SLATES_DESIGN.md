@@ -6877,6 +6877,20 @@ version.
 > (`a_verb_for_a_volume_whose_owner_is_fenced_is_refused_by_the_fence_never_not_found`;
 > `docs/bugs/2026-11-19-a-volume-on-a-fenced-owner-read-as-absent.md`).
 
+> **Status (2026-11-23, A-394's amendment: only the owner says a volume does not exist).** "The answer comes from the
+> current owner and is authoritative", so a node whose catalog holds no record of a volume answers a verb forwarded to
+> it only where it is that owner by the rule a local client's verb is routed by (`verbs::owned_by_another_host`): the
+> volume's creator, which no routing on it sends elsewhere and which did not lose it to a successor. There a volume it
+> never made or destroyed is `NotFound`. Anywhere else the verb is refused `Overloaded`, retryable and recorded nowhere,
+> so the origin, which drops its route at a refusal, locates the owner again on the resend
+> (`verbs::refusal_of_unheld_forward`, counted `fleet.forward.refused.not_owner_here`; a successor before it has made
+> the volume, A-394, `fleet.forward.refused.before_made`). Until then a node whose routing named another owner, or
+> none, served such a verb, found no volume and answered `NotFound`. At seed 8173581894251929445 the chaos nemesis had
+> an origin at configuration 7 forward reads to the successor its routing named, which at configuration 8 routed the
+> volume to no owner, and five acknowledged writes read as missing while the last owner served them all (ReadSafety;
+> `a_forwarded_read_at_a_node_neither_holding_nor_owning_its_volume_is_refused_retryably`;
+> `docs/bugs/2026-11-23-a-forwarded-read-at-a-node-that-neither-held-nor-owned-the-volume-answered-not-found.md`).
+
 > **Status (2026-11-18, A-317: the location budget is the membership horizon, ended by a look begun after it).** A
 > forward that does not know its volume's owner repeats the read-only location round (the direct route first, and
 > again after the round) every poll interval for the membership horizon (`lease::horizon_ns`, the window in which a
@@ -35599,7 +35613,7 @@ owner's measurements), and `docs/bugs/2026-11-18-a-held-macos-shard-napped-inste
 
 ### A-394 — A verb forwarded to a takeover's successor before it has made the volume is refused retryably, never answered `NotFound` (2026-11-18, kiln goal g250; §4.8 "Lookup"; ReadSafety; the chaos nemesis, seed 6876545201569229162)
 Applied in the same change to: GAPS (the entry at its head) and `crates/server/src/verbs.rs` (`serve_forward`,
-`serve_forwarded_read`, `forwarded_before_made`, `fleet.forward.refused.before_made`).
+`serve_forwarded_read`, `refusal_of_unheld_forward`, `fleet.forward.refused.before_made`).
 - **What was there.** A node serves a verb another node forwarded to it as the volume's owner without asking whether it
   holds the volume: the sender found it the owner, and a forward is one hop. A takeover's install moves the volume's
   route to its successor on every holder before the successor has made it, so in that window a holder forwards a
@@ -35618,6 +35632,20 @@ Applied in the same change to: GAPS (the entry at its head) and `crates/server/s
   counted, a volume made here answered; without the guard the read answered `NotFound`). The chaos nemesis at seed
   6876545201569229162 on the Mac Studio (kiln r264, 2026-11-18, debug build): 2 of 2 runs passed with every invariant
   held, 91.9 s and 63.5 s, where main bf58691 failed ReadSafety in 3 of 3 (r212).
+
+**Amended 2026-11-23 (w-chaos, the nemesis at seed 8173581894251929445): the rule by authority.** The guard refused only
+where the receiver's own routing named itself the owner, so a node whose routing named another member, or none, still
+served the forward and answered `NotFound`. Measured on adacachy2 with a diagnostic build (2026-11-23): an origin at
+configuration 7 forwarded reads to the successor its routing named, and that node, already at configuration 8, held no
+record of the volume and routed it to no owner, so five acknowledged writes read as missing through the origin while
+the last owner served them all (ReadSafety; 2 of 4 replays of the seed, and 1 of 5 runs of main 05e9bb698 with item 1's
+fix). The guard is now `refusal_of_unheld_forward` (it was `refusal_of_unheld_forward`; its callers `serve_forwarded_read`,
+`forwarded_write` and `forward_placement`): a node without the record answers only as the volume's creator that no
+routing on it sends elsewhere and that did not lose the volume to a successor, the rule `owned_by_another_host` routes a
+local client's verb by, and refuses `Overloaded` anywhere else, counted `fleet.forward.refused.not_owner_here`. Applied
+in the same change to: §4.8 "Lookup"'s status, GAPS (A-394's entry), `crates/server/src/verbs.rs`, the test
+`a_forwarded_read_at_a_node_neither_holding_nor_owning_its_volume_is_refused_retryably` (red first: `NotFound`),
+and `docs/bugs/2026-11-23-a-forwarded-read-at-a-node-that-neither-held-nor-owned-the-volume-answered-not-found.md`.
 
 ### A-399 — A Shards stream's close publishes nothing its write log holds, as a FUSE mount's does (2026-11-18, goal g268; a sibling A-339 recorded in GAPS)
 Applied in the same change to:
@@ -59159,7 +59187,7 @@ Applied in the same change to: §4.16 "Commit" (inputs past a shipment's bound),
   answered `Overloaded` otherwise, so the origin's resend under the id met the completion.
 - **Change.** `crates/server/src/verbs.rs` `serve_forward`: a forwarded `CreateWork` runs on the shard its name hashes
   to, as a create is placed; whether the green is made yet is still asked of the green's shard first
-  (`forwarded_before_made`, so a forward racing the green's creation answers retryable, nothing recorded);
+  (`refusal_of_unheld_forward`, so a forward racing the green's creation answers retryable, nothing recorded);
   `forwarded_write` takes the volume to check as an option. `crates/server/src/work_home.rs`: `attach_forwarded` keeps
   a forward's waiter beside its parked verb, and the resume answers it from the verb's completion, or attaches it to
   the verb's next wait (parked again, or its acceptance deferred to a fleet commit), else `Overloaded`
