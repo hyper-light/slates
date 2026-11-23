@@ -52,7 +52,7 @@ pub fn stats() -> HeapStats {
 }
 
 /// The system allocator's (allocated, in use) bytes over every zone (macOS).
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(miri)))]
 fn system() -> Option<(u64, u64)> {
   // SAFETY: an all-zero `malloc_statistics_t` is a valid value of the C struct (integers only).
   let mut statistics: libc::malloc_statistics_t = unsafe { std::mem::zeroed() };
@@ -67,7 +67,7 @@ fn system() -> Option<(u64, u64)> {
 
 /// The system allocator's (allocated, in use) bytes (glibc): its main and other arenas' bytes from the OS (`arena`) and
 /// its own large mappings (`hblkhd`), against the bytes in use in the arenas (`uordblks`) and those mappings.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(all(target_os = "linux", target_env = "gnu", not(miri)))]
 fn system() -> Option<(u64, u64)> {
   // SAFETY: `mallinfo2` takes nothing and returns its record by value [B: man 3 mallinfo2].
   let info = unsafe { libc::mallinfo2() };
@@ -78,8 +78,13 @@ fn system() -> Option<(u64, u64)> {
   ))
 }
 
-/// No system allocator read here (module docs).
-#[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
+/// No system allocator read here (module docs): none is, or Miri runs the program, which models its own allocations and
+/// calls no foreign allocator's statistics (`mallinfo2`, `malloc_zone_statistics`: "unsupported operation", the nightly's
+/// Miri lane, run 45017186325).
+#[cfg(any(
+  miri,
+  not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))
+))]
 fn system() -> Option<(u64, u64)> {
   None
 }
