@@ -1814,8 +1814,11 @@ async fn built_works(
           if !vcs_store::hg_view::answer_store_wants(&mut building, repository).await {
             return None;
           }
+          // Its window goes back into the shard's chunk store, lent to the content store for the step.
           let brought = crate::state::with_state(|state| {
-            brought_back(state, repository, forked, &mut building)
+            vcs_store::lent_state(state, |state| {
+              brought_back(state, repository, forked, &mut building)
+            })
           })
           .flatten();
           if brought.is_none() {
@@ -1931,9 +1934,13 @@ fn brought_back(
   building: &mut tree::WorkBuild,
 ) -> Option<()> {
   let (path, node, text) = building.take_given()?;
-  let (content, store) = state.vcs_stores.mercurial(id)?;
-  let index = forked.map_or(&store.index, |forked| &forked.fork);
-  slates_hg::push::held::bring_back_file((index, content), (&path, &node), &text).ok()?;
+  // Brought back within the room its bytes take, lent to the content store for the step.
+  let lend = u64::try_from(text.len()).unwrap_or(u64::MAX);
+  vcs_store::within_budget(state, lend, |stores| {
+    let (content, store) = stores.mercurial(id)?;
+    let index = forked.map_or(&store.index, |forked| &forked.fork);
+    slates_hg::push::held::bring_back_file((index, content), (&path, &node), &text).ok()
+  })?;
   state.count(WORK_TEXTS_READ, 1);
   Some(())
 }
@@ -2080,7 +2087,7 @@ pub(crate) fn store_blocking(
     };
     let sequence = header.sequence;
     let ok = crate::test_store::land_blocking(disk, header, parts);
-    landed_segment(state, &mut run, sequence, ok)
+    landed_segment(state, (&mut run, &segment), sequence, ok)
   });
   let reference = run.reference(forked.room);
   run.settle(state, true);
@@ -2108,7 +2115,7 @@ pub(crate) fn land_stored(
 /// grows; refused, the push is answered `UNLANDED`, and its run, never named, is abandoned with it.
 fn landed_segment(
   state: &mut ShardState,
-  run: &mut super::hg_run::Run,
+  (run, segment): (&mut super::hg_run::Run, &PushSegment),
   sequence: u64,
   ok: bool,
 ) -> Result<(), PushOutcome> {
@@ -2117,7 +2124,10 @@ fn landed_segment(
     return Err(PushOutcome::refused(&abort(UNLANDED.to_vec())));
   }
   state.count(super::hg_run::SEGMENTS_LANDED, 1);
-  run.landed(sequence);
+  run.landed(sequence, &segment.contents);
+  // Durable on the node's changeset store, which serves them from here: its file texts leave the content store, their
+  // entries kept, each brought back by the read that meets it (`hg_run`, "Let go").
+  super::hg_run::let_go_landed(state, &segment.contents);
   Ok(())
 }
 
@@ -2458,7 +2468,7 @@ async fn segment_landed(
   };
   let sequence = header.sequence;
   let ok = disk.land(header, parts).await.is_ok();
-  crate::state::with_state(|state| landed_segment(state, run, sequence, ok))
+  crate::state::with_state(|state| landed_segment(state, (run, segment), sequence, ok))
 }
 
 /// `take_sliced`'s settle: the intake finished into its fork, its delta bases counted. None where the store went away.
