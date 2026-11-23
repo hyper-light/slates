@@ -109,11 +109,18 @@
 > Linux RSS round reading them.
 > **A-870 (w-shared; main 01a20182's rulings of 2026-11-22 ~22:10 and ~22:30): a shard image's content-store families
 > published and restored over turns.** Piece 1 BUILT: the families paged (`crate::image_pages`): 3,000 windows let go
-> and 3,000 landed records rode 6,000 pieces, now 17 (534,085 bytes at a 43,912-byte page), restored whole. OWED: piece 2
-> (pages encoded ahead a slice a turn, a chunk freed under an unpublished page released at that page's commit, an
-> oracle of let-go, publish and crash; first, whether windows let go and records code as a range per object), piece 3
-> (pages restored a page a turn, reads waiting), and a 100k-file volume's longest image step measured against the step
-> budget (the volumes' images paged too only if past it).
+> and 3,000 landed records rode 6,000 pieces, now 17 (534,085 bytes at a 43,912-byte page), restored whole. Piece 2
+> BUILT (main's ruling of 2026-11-23, options (a)-(d)): the pages encoded a slice a turn (`image_pages::Encoder`), a
+> publication carrying them only when none is dirty, else the committed cut again with every deferred block kept
+> (`capture_deferred` whole) and the publication owed; past its bound elective let-gos pause, woken by the publication
+> that carries the cut; red 1,068,980 bytes encoded in one publication's step at a 4,096-byte page, now at most three
+> pages; held by an oracle of generated let-go, put, publish and crash histories, one continuous (A-870 "Evidence (piece
+> 2)"). OPEN: the lag bound holds only while the encoder outpaces the changes that never pause (puts, bring-backs);
+> a put stream that outpaces a turn a yield is unmeasured until arena-12 reads it: `vcs_store.image.paused_encoded_bytes`
+> against `paused_imposed_bytes` over `paused_turns`, and `longest_lag_turns` (main's addition of 2026-11-23). Counters
+> for main's rounds: `vcs_store.image.*` (skipped, longest lag, pauses, the longest turn's bytes). Ranges per object rejected on arena-5's numbers (main agreed). OWED:
+> piece 3 (pages restored a page a turn, reads waiting), and a 100k-file volume's longest image step measured against
+> the step budget (the volumes' images paged too only if past it).
 > **HELD (main 01a20182, 2026-11-22 15:40):** no landed pack is let go or owed from a push's commit (`vcs_store::commit`),
 > since r52 (the big Studio, main 6f6e87d82) found readers that do not bring a let-go window back: once git/git's push
 > ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's tag peel through
@@ -4239,6 +4246,17 @@
 > at `!svn/rev/REV`, which the site advertises with `replay-rev-resource`), so `svnsync synchronize` from slates over
 > HTTP cannot run; and DeltaV v1's revision properties (a PROPFIND of the VCC with a `Label`) answer the youngest's.
 > svnsync over svn:// mirrors git-2000 in 270.7 s (135 ms a revision; w-interop's 1,068 s before).
+> **Both built (w-interop, 2026-11-23, main 01a20182's order; w-svn told first, its C2 untouched):** (A) a `Label` on
+> the VCC names that revision's baseline (`dav::site` `labelled`; the server passes the header), so DeltaV v1's
+> `rev_proplist` reads the labelled revision's properties (`deltav_v1_a_labelled_vcc_answers_the_labelled_revisions_properties`);
+> (B) `replay-report` is served at the session URL (old syntax) and at `!svn/rev/REV` (1.8 syntax) by
+> `dav::report_replay::ReplayWalk`, the svn:// site's own `Replay` a call at a time into the DAV drive's replay answer,
+> one path, streamed a slice at a time under the step budget
+> (`a_replay_report_answers_the_svn_sites_replay_of_its_revision_a_slice_at_a_time`,
+> `a_replay_report_is_refused_as_replay_c_refuses_it`). Owed, main's runs (no stock Subversion on the MacBook):
+> stock 1.15 over `SLATES_SVN_USE_ROUTE=http-v1` with `SLATES_SVN_USE_VERBS=revprops` against svnserve; and
+> `svnsync synchronize` over HTTP, the mirror against svnserve's byte for byte (`an_svnsync_measured`'s DAV leg,
+> `SLATES_SVN_USE_VERBS=svnsync` over `http`).
 > **R4, recovery replays a revision record a turn at a time (2026-11-20, w-svn; Ada's close list; found by w-git's sweep):**
 > a Subversion revision's record was replayed whole in one recovery or rebuild turn (`replay_svn` -> `commit_record`),
 > every text it brought deltified in one step, so one large revision held its shard. Now `RevisionReplay`

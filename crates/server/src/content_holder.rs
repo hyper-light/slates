@@ -381,14 +381,9 @@ pub(crate) fn held_image(state: &ShardState) -> Vec<slates_vfs::recover::HeldPie
   held_image_paged(state).0
 }
 
-/// [`held_image`], and the paged families' directories its pages make (A-870 piece 1), adopted once the checkpoint
-/// carrying it commits ([`pages_committed`]).
-pub(crate) fn held_image_paged(
-  state: &ShardState,
-) -> (
-  Vec<slates_vfs::recover::HeldPiece>,
-  crate::image_pages::Directories,
-) {
+/// [`held_image`], and whether its paged families are the shard's now (A-870 piece 2: where a change is not yet encoded
+/// they are the last committed cut, [`image_committed`]).
+pub(crate) fn held_image_paged(state: &ShardState) -> (Vec<slates_vfs::recover::HeldPiece>, bool) {
   let mut pieces: Vec<slates_vfs::recover::HeldPiece> = whole_pieces(state)
     .into_iter()
     .map(|(key, bytes)| slates_vfs::recover::HeldPiece { key, bytes })
@@ -427,9 +422,17 @@ pub(crate) fn held_image_paged(
   // The repository content store's and homes' entries, a page a range of each family (A-870 piece 1): its windows
   // kept as chunks (A-727 slice a3), lists, names and windows let go (a3b), region holds (A-724 piece 8c) and landed
   // records (goal 93 item 2b(b)).
-  let (paged, directories) = paged_image(state);
-  pieces.extend(paged);
-  (pieces, directories)
+  // A-870 piece 2: copied from the encoder, the shard's now where every change is encoded, else the last committed cut.
+  let (pages, carried) = state.image_encoder.whole();
+  pieces.extend(
+    pages
+      .into_iter()
+      .map(|((family, page), bytes)| slates_vfs::recover::HeldPiece {
+        key: page_key(family, page),
+        bytes: bytes.to_vec(),
+      }),
+  );
+  (pieces, carried)
 }
 
 /// The kind of the piece a landed record of the window `identity` is kept under, and its bytes: the identity, then the
@@ -584,79 +587,6 @@ fn changed_coordinates(state: &ShardState, family: crate::image_pages::Family) -
   }
 }
 
-/// `family`'s page `page` holding `entries`, as a held piece.
-fn page_piece(
-  family: crate::image_pages::Family,
-  page: crate::image_pages::Page,
-  entries: &[crate::image_pages::Entry],
-) -> slates_vfs::recover::HeldPiece {
-  slates_vfs::recover::HeldPiece {
-    key: page_key(family, page),
-    bytes: crate::image_pages::encode_page(entries),
-  }
-}
-
-/// Every paged family planned afresh into pages (A-870 piece 1), as a checkpoint carries them: the page pieces, and
-/// the directories they make, adopted once the checkpoint commits.
-pub(crate) fn paged_image(
-  state: &ShardState,
-) -> (
-  Vec<slates_vfs::recover::HeldPiece>,
-  crate::image_pages::Directories,
-) {
-  let limit = page_bytes(state);
-  let mut pieces = Vec::new();
-  let mut directories = crate::image_pages::Directories::default();
-  for family in crate::image_pages::Family::ALL {
-    let entries = family_entries(state, family, (0, u64::MAX));
-    let planned = crate::image_pages::plan(&entries, crate::image_pages::Page::WHOLE, limit);
-    for (page, range) in &planned {
-      if let Some(held) = entries.get(range.clone()).filter(|held| !held.is_empty()) {
-        pieces.push(page_piece(family, *page, held));
-      }
-    }
-    directories.families.insert(
-      family,
-      crate::image_pages::Directory::of(planned.into_iter().map(|(page, _)| page)),
-    );
-  }
-  (pieces, directories)
-}
-
-/// What a delta carries of the paged families (A-870 piece 1): each page a change since the last committed publication
-/// lies in, re-encoded whole from what the shard holds now (put, or removed once empty), one past twice the page size
-/// split into the pages it now fills (its own key removed); and the pieces an image before A-870 kept one an entry,
-/// removed once. The directories as they now are, adopted once the delta commits.
-fn paged_changes(
-  state: &ShardState,
-  (put, removed): (&mut Vec<slates_vfs::recover::HeldPiece>, &mut Vec<PieceKey>),
-) -> crate::image_pages::Directories {
-  let limit = page_bytes(state);
-  let mut directories = state.published_held.pages.clone();
-  for family in crate::image_pages::Family::ALL {
-    let mut directory = directories.of(family);
-    for page in directory.plan_dirty(changed_coordinates(state, family)) {
-      let entries = family_entries(state, family, (page.start, page.last()));
-      let planned = if crate::image_pages::entries_bytes(&entries) > limit.saturating_mul(2) {
-        removed.push(page_key(family, page));
-        crate::image_pages::plan(&entries, page, limit)
-      } else {
-        vec![(page, 0..entries.len())]
-      };
-      for (into, range) in &planned {
-        match entries.get(range.clone()).filter(|held| !held.is_empty()) {
-          Some(held) => put.push(page_piece(family, *into, held)),
-          None => removed.push(page_key(family, *into)),
-        }
-      }
-      directory.replace(page, planned.into_iter().map(|(page, _)| page));
-    }
-    directories.families.insert(family, directory);
-  }
-  removed.extend(state.published_held.legacy.iter().copied());
-  directories
-}
-
 /// A held checkpoint's piece (A-404), keyed by its green.
 fn checkpoint_piece(
   object: ObjectId,
@@ -755,8 +685,6 @@ pub(crate) struct PublishedHeld {
   whole: BTreeMap<PieceKey, Vec<u8>>,
   live: BTreeMap<ObjectId, (u64, u64)>,
   registers: BTreeMap<ObjectId, std::collections::BTreeSet<(ObjectId, u64)>>,
-  /// The paged families' pages as published (A-870 piece 1).
-  pages: crate::image_pages::Directories,
   /// The entries an image before A-870 kept a piece each: removed by the next delta, which carries them in pages.
   legacy: Vec<PieceKey>,
 }
@@ -772,8 +700,9 @@ pub(crate) struct HeldChanges {
   pub(crate) whole: BTreeMap<PieceKey, Vec<u8>>,
   /// The kept pieces of owned live logs it changes (A-344), kept once it commits (`live_ship::owned_committed`).
   pub(crate) owned: Vec<([u8; 16], Option<crate::live_ship::OwnedLive>)>,
-  /// The paged families' directories as they now are, adopted once the delta commits (A-870 piece 1).
-  pub(crate) pages: crate::image_pages::Directories,
+  /// Whether it carries the paged families' cut (A-870 piece 2): none while a change is not yet encoded
+  /// ([`image_committed`]).
+  pub(crate) image_carried: bool,
 }
 
 /// What a delta carries of held register `object` (A-367): its head, and the positions its acceptor names written (put
@@ -959,7 +888,7 @@ pub(crate) fn held_changes(state: &ShardState) -> HeldChanges {
   // The repository content store's and homes' entries kept or let go since then, a page each change lies in (A-870
   // piece 1): windows (A-727 slice a3), lists, names and windows let go (a3b), region holds (A-724 piece 8c) and landed
   // records (goal 93 item 2b(b)).
-  let pages = paged_changes(state, (&mut put, &mut removed));
+  let image_carried = image_cut(state, (&mut put, &mut removed));
   // The live logs this shard ships whose kept piece this publication changes (A-344): each captured one at the position
   // its coming entry takes, and each marked; a log let go has its piece removed.
   let owned = crate::live_ship::owned_changes(state);
@@ -974,7 +903,7 @@ pub(crate) fn held_changes(state: &ShardState) -> HeldChanges {
     removed,
     whole,
     owned,
-    pages,
+    image_carried,
   }
 }
 
@@ -994,12 +923,179 @@ pub(crate) fn owned_of(
     .collect()
 }
 
-/// Adopts the paged families' directories a committed publication carried (A-870 piece 1): a checkpoint's planned afresh
-/// ([`held_image_paged`]), a delta's as its re-encoded pages left them ([`HeldChanges`]'s `pages`); the pieces an image
-/// before A-870 kept one an entry are gone once either commits.
-pub(crate) fn pages_committed(state: &mut ShardState, pages: crate::image_pages::Directories) {
-  state.published_held.pages = pages;
-  state.published_held.legacy.clear();
+/// Adopts what a committed publication carried of the paged families (A-870 piece 2): where it carried the encoder's
+/// cut (`carried`), that cut is the committed one, the pieces an image before A-870 kept one an entry are gone, and the
+/// windows it carried are durable, so every homes ticket kept before it answers so (A-724 with A-727 a3). Where a change
+/// was not yet encoded it carried the committed cut again: every block the arena would free at this commit is kept (the
+/// cut may name it, A-64's rule), the publication is counted skipped and owed, and a task encodes on and publishes once
+/// caught up ([`image_catch_up`]).
+pub(crate) fn image_committed(state: &mut ShardState, carried: bool) {
+  state.image_encoder.committed(carried);
+  if carried {
+    state.published_held.legacy.clear();
+    crate::vcs_store::homes::publication_committed();
+    return;
+  }
+  state.store.content.arena_mut().capture_deferred();
+  state.count(IMAGE_SKIPPED, 1);
+  let lag = state.image_encoder.skipped();
+  state.count_max(IMAGE_LONGEST_LAG, lag);
+  if state.image_encoder.start_catching_up() {
+    let started = slates_rt::futures::spawn(image_catch_up()).and_then(slates_rt::futures::detach);
+    if started.is_err() {
+      state.image_encoder.stop_catching_up();
+      state.count(IMAGE_CATCH_UP_REFUSED, 1);
+    }
+  }
+}
+
+/// Encodes a turn at a time, yielding between, until every change is encoded, then publishes the shard (A-870 piece 2):
+/// what a publication that found a change not yet encoded leaves owed. Ends where the shard's state is gone.
+async fn image_catch_up() {
+  loop {
+    let done = crate::state::with_state(|state| {
+      image_drain(state);
+      if !image_turn(state).caught_up {
+        return false;
+      }
+      state.image_encoder.stop_catching_up();
+      if state.image_encoder.owed() {
+        let _ = crate::verbs::publish_shard(state);
+      }
+      true
+    });
+    if done != Some(false) {
+      return;
+    }
+    slates_rt::futures::yield_now().await;
+  }
+}
+
+/// Format: the status counter of publications that carried no paged page, a change not yet encoded (A-870 piece 2).
+pub(crate) const IMAGE_SKIPPED: &str = "vcs_store.image.publications_skipped";
+/// Format: the status counter of the longest a publication of the paged families was owed, in encoder turns.
+pub(crate) const IMAGE_LONGEST_LAG: &str = "vcs_store.image.longest_lag_turns";
+/// Format: the status counter of elective changes paused while a publication was owed past its bound.
+pub(crate) const IMAGE_PAUSES: &str = "vcs_store.image.pauses";
+/// Format: the status counter of the encoder's turns.
+pub(crate) const IMAGE_TURNS: &str = "vcs_store.image.encode_turns";
+/// Format: the status counter of the bytes the encoder's turns encoded.
+pub(crate) const IMAGE_ENCODED_BYTES: &str = "vcs_store.image.encoded_bytes";
+/// Format: the status counter of the most bytes one encoder turn encoded.
+pub(crate) const IMAGE_LONGEST_TURN_BYTES: &str = "vcs_store.image.longest_turn_bytes";
+/// Format: the status counter of the encoder's turns while paused.
+pub(crate) const IMAGE_PAUSED_TURNS: &str = "vcs_store.image.paused_turns";
+/// Format: the status counter of the bytes the encoder's turns encoded while paused.
+pub(crate) const IMAGE_PAUSED_ENCODED_BYTES: &str = "vcs_store.image.paused_encoded_bytes";
+/// Format: the status counter of the bytes, of those, of pages the never-paused changes first dirtied in the pause
+/// (puts, bring-backs): under [`IMAGE_PAUSED_ENCODED_BYTES`] by a margin while the encoder outpaces them.
+pub(crate) const IMAGE_PAUSED_IMPOSED_BYTES: &str = "vcs_store.image.paused_imposed_bytes";
+/// Format: the status counter of catch-up tasks the runtime refused to start (the next publication tries again).
+pub(crate) const IMAGE_CATCH_UP_REFUSED: &str = "vcs_store.image.catch_up_refused";
+
+/// Takes every change since the encoder last looked into its dirty pages, and forgets them where they were kept (A-870
+/// piece 2): the encoder is their one reader. Their coordinates: windows' handles, the content store's lists, names
+/// and windows let go, homes' region holds and landed records.
+pub(crate) fn image_drain(state: &mut ShardState) {
+  for family in crate::image_pages::Family::ALL {
+    let coordinates = changed_coordinates(state, family);
+    state.image_encoder.mark(family, coordinates);
+  }
+  if let Some(windows) = crate::vcs_store::chunk_windows_mut(&mut state.vcs_stores) {
+    windows.clear_changes();
+  }
+  if let Some(content) = state.vcs_stores.content_mut() {
+    content.clear_changes();
+  }
+  crate::vcs_store::homes::region_changes_committed();
+  crate::vcs_store::homes::landed_changes_committed();
+}
+
+/// One turn of the encoder (A-870 piece 2): dirty pages re-encoded from what the shard holds, at most the page size
+/// spent (and the one page crossing it), counted.
+pub(crate) fn image_turn(state: &mut ShardState) -> crate::image_pages::Turned {
+  let limit = page_bytes(state);
+  let mut encoder = core::mem::take(&mut state.image_encoder);
+  let turned = encoder.turn((limit, limit), &|family, range| {
+    family_entries(state, family, range)
+  });
+  state.image_encoder = encoder;
+  state.count(IMAGE_TURNS, 1);
+  state.count(IMAGE_ENCODED_BYTES, turned.bytes);
+  state.count_max(IMAGE_LONGEST_TURN_BYTES, turned.bytes);
+  if turned.paused {
+    // The progress rule's assumption, measured (main 01a20182, 2026-11-23): while paused, the encoder's bytes a turn
+    // against the never-paused changes' bytes it encoded (the pages they first dirtied in the pause).
+    state.count(IMAGE_PAUSED_TURNS, 1);
+    state.count(IMAGE_PAUSED_ENCODED_BYTES, turned.bytes);
+    state.count(IMAGE_PAUSED_IMPOSED_BYTES, turned.imposed);
+  }
+  turned
+}
+
+/// Whether the content store's elective changes (a let-go) wait now (A-870 piece 2, main's progress rule): a
+/// publication of the paged families owed past its bound of turns. Counted each time one waits.
+pub(crate) fn image_paused(state: &mut ShardState) -> bool {
+  let paused = state.image_encoder.paused();
+  if paused {
+    state.count(IMAGE_PAUSES, 1);
+  }
+  paused
+}
+
+/// Waits while the content store's elective changes pause ([`image_paused`]), ready at once where they do not: woken by
+/// the publication that carries the encoder's cut (`Encoder::committed`), never by a timer. Ready where the shard's state
+/// is gone, so a task waiting ends with it.
+pub(crate) fn image_resumed() -> impl core::future::Future<Output = ()> {
+  core::future::poll_fn(|cx| {
+    let waits = crate::state::with_state_counted(|state| {
+      let paused = image_paused(state);
+      if paused {
+        state.image_encoder.wait(cx.waker());
+      }
+      paused
+    });
+    if waits == Some(true) {
+      core::task::Poll::Pending
+    } else {
+      core::task::Poll::Ready(())
+    }
+  })
+}
+
+/// What a delta carries of the paged families (A-870 piece 2): the encoder's cut, each page re-encoded since the last
+/// committed one put or removed, and the pieces an image before A-870 kept one an entry removed; nothing where a change
+/// is not yet encoded. Whether it carried the cut.
+fn image_cut(
+  state: &ShardState,
+  (put, removed): (&mut Vec<slates_vfs::recover::HeldPiece>, &mut Vec<PieceKey>),
+) -> bool {
+  let Some(cut) = state.image_encoder.cut() else {
+    return false;
+  };
+  for ((family, page), bytes) in cut {
+    match bytes {
+      Some(bytes) => put.push(slates_vfs::recover::HeldPiece {
+        key: page_key(family, page),
+        bytes: bytes.to_vec(),
+      }),
+      None => removed.push(page_key(family, page)),
+    }
+  }
+  removed.extend(state.published_held.legacy.iter().copied());
+  true
+}
+
+/// The encoder of a recovered image's held `pieces` (A-870 piece 2): its pages, the committed cut.
+pub(crate) fn image_encoder_of(
+  pieces: &[slates_vfs::recover::HeldPiece],
+) -> crate::image_pages::Encoder {
+  crate::image_pages::Encoder::restored(
+    pieces
+      .iter()
+      .filter_map(|piece| Some((page_of_key(&piece.key)?, piece.bytes.clone())))
+      .collect(),
+  )
 }
 
 /// Adopts what a committed publication carried of the held pieces (A-270): `whole` as the published whole pieces, each
@@ -1049,16 +1145,8 @@ pub(crate) fn held_committed(
   state.holder_records.clear_changed();
   state.live.held.clear_changed();
   state.merge.checkpoints_changed.clear();
-  if let Some(windows) = crate::vcs_store::chunk_windows_mut(&mut state.vcs_stores) {
-    windows.clear_changes();
-  }
-  crate::vcs_store::homes::region_changes_committed();
-  crate::vcs_store::homes::landed_changes_committed();
-  if let Some(content) = state.vcs_stores.content_mut() {
-    content.clear_changes();
-  }
-  // The windows this publication carried are durable: every homes ticket kept before it answers so (A-724 with A-727 a3).
-  crate::vcs_store::homes::publication_committed();
+  // The content store's and homes' changes are the encoder's (`image_drain`), and their tickets durable with its cut
+  // (`image_committed`, A-870 piece 2).
 }
 
 /// Adopts what a committed publication carried of the held registers (A-367): each register's published positions as
@@ -1141,21 +1229,10 @@ pub(crate) fn published_from(pieces: &[slates_vfs::recover::HeldPiece]) -> Publi
         .insert((ObjectId(object), slot));
     }
   }
-  let mut pages: BTreeMap<crate::image_pages::Family, Vec<crate::image_pages::Page>> =
-    BTreeMap::new();
-  for (family, page) in pieces.iter().filter_map(|piece| page_of_key(&piece.key)) {
-    pages.entry(family).or_default().push(page);
-  }
   PublishedHeld {
     whole: whole_of(pieces),
     live,
     registers,
-    pages: crate::image_pages::Directories {
-      families: pages
-        .into_iter()
-        .map(|(family, pages)| (family, crate::image_pages::Directory::of(pages)))
-        .collect(),
-    },
     legacy: pieces
       .iter()
       .filter(|piece| is_paged_entry_kind(split_key(&piece.key).0))
@@ -1243,6 +1320,47 @@ impl From<slates_wire::WireError> for HeldRefused {
   fn from(error: slates_wire::WireError) -> Self {
     HeldRefused::Wire(error)
   }
+}
+
+/// Test support (A-870 piece 2's oracle): every paged family's entries the shard holds now, read from its maps (never
+/// the encoder), each as (key, bytes), in key order.
+#[cfg(test)]
+pub(crate) fn paged_entries_now(state: &ShardState) -> Vec<(PieceKey, Vec<u8>)> {
+  let mut entries: Vec<(PieceKey, Vec<u8>)> = crate::image_pages::Family::ALL
+    .into_iter()
+    .flat_map(|family| family_entries(state, family, (0, u64::MAX)))
+    .map(|(_, key, bytes)| (key, bytes))
+    .collect();
+  entries.sort();
+  entries
+}
+
+/// Test support (A-870 piece 2's oracle): the paged families' entries an image's `pieces` carry, each as (key, bytes),
+/// in key order; none from a page that does not decode, which a comparison then sees missing.
+#[cfg(test)]
+pub(crate) fn paged_entries_of(
+  pieces: &[slates_vfs::recover::HeldPiece],
+) -> Vec<(PieceKey, Vec<u8>)> {
+  let mut entries: Vec<(PieceKey, Vec<u8>)> = pieces
+    .iter()
+    .filter(|piece| split_key(&piece.key).0 == KIND_VCS_PAGE)
+    .filter_map(|piece| crate::image_pages::decode_page(&piece.bytes))
+    .flatten()
+    .collect();
+  entries.sort();
+  entries
+}
+
+/// Test support (A-870 piece 2's oracle): the windows among `entries` and the blocks their chunks lie in.
+#[cfg(test)]
+pub(crate) fn window_blocks(
+  entries: &[(PieceKey, Vec<u8>)],
+) -> Vec<(slates_vcs::ContentId, u16, u64, u64)> {
+  entries
+    .iter()
+    .filter(|(key, _)| split_key(key).0 == KIND_VCS_WINDOW)
+    .filter_map(|(_, bytes)| crate::vcs_store::arena_windows::piece_block(bytes))
+    .collect()
 }
 
 /// A content hold's pieces by kind (A-376): its chunks', its manifests' and its stages' bytes.

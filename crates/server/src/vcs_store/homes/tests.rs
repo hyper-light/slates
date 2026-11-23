@@ -460,9 +460,10 @@ fn the_healer_on_a_lone_node_moves_nothing_and_region_offers_are_idempotent() {
 }
 
 /// A-724 with A-727 a3, the barrier driven by the daemon's own publications. Do: keep a window on this shard (its
-/// ticket), then commit a publication of the shard's held pieces as `verbs::publish_shard` does (`held_committed`),
-/// then keep a second. Expect: the first ticket not published before the publication and published after it; the
-/// second's generation past it, so a window kept after a publication waits for the next.
+/// ticket), then commit a publication that carried an older cut of the paged families, then one that carried the
+/// encoder's cut, as `verbs::publish_shard` does (`content_holder::image_committed`, A-870 piece 2), then keep a second.
+/// Expect: the first ticket not published before the publications nor after the older cut's, published after the
+/// encoder's cut; the second's generation past it, so a window kept after a publication waits for the next.
 #[test]
 fn a_committed_publication_publishes_the_tickets_of_windows_kept_before_it() {
   use super::{keep_here, published_here};
@@ -472,7 +473,14 @@ fn a_committed_publication_publishes_the_tickets_of_windows_kept_before_it() {
       !published_here(first.generation),
       "durable before any publication"
     );
-    crate::content_holder::held_committed(state, std::collections::BTreeMap::new(), false);
+    // A-870 piece 2: a publication that carried the committed cut again (a change not yet encoded) carried no window
+    // kept since, so its ticket waits; one that carried the encoder's cut publishes it.
+    crate::content_holder::image_committed(state, false);
+    assert!(
+      !published_here(first.generation),
+      "a publication that carried an older cut published the ticket"
+    );
+    crate::content_holder::image_committed(state, true);
     assert!(
       published_here(first.generation),
       "a committed publication left its ticket unpublished"
