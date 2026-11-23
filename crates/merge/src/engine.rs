@@ -417,6 +417,17 @@ pub struct Judged {
   making: Making,
 }
 
+/// A checkpoint refused by a restore while a file it names is unread (A-869, [`Green::with_checkpoint`]): the object
+/// not read yet, and the green as it was before the restore, which its caller takes back (a lineage member's engine
+/// holds its lineage's arenas).
+#[derive(Debug)]
+pub struct Unrestored {
+  /// The first named file's object not read yet.
+  pub identity: crate::named::Identity,
+  /// The green, as it was seeded.
+  pub green: Box<Green>,
+}
+
 /// A held verdict's files made a copy slice a step before its commit ([`Green::make_step`], A-760): the files a run
 /// makes whole, found at the first step; the next effect to look at; the file under way.
 #[derive(Default)]
@@ -2189,6 +2200,7 @@ impl Green {
     // The sum stands for what the copies' entries hold beyond the restored state's own, so it travels beside a copy's
     // record alone: without one, a restore's own entries are the identity (A-626 part 3, continued (1)).
     let sum = (!copies.is_empty()).then(|| self.sum_at(at));
+    let (files, named) = self.changed_content_at(at);
     let mut checkpoint = crate::checkpoint::Checkpoint {
       version: at,
       accepted: self
@@ -2202,7 +2214,9 @@ impl Green {
         .range(..=at)
         .map(|(version, signature)| (*version, *signature))
         .collect(),
-      files: self.changed_content_at(at),
+      files,
+      named,
+      read: crate::checkpoint::NamedRead::default(),
       dirs: self
         .dir_history
         .iter()
@@ -2234,21 +2248,38 @@ impl Green {
   /// key the checkpoint names set to its value there (its history one entry, its last change the checkpoint's), the
   /// accepted identities restored, and the head at the checkpoint's version with no delta before it, so every later
   /// increment replays onto it as onto the green the checkpoint was taken from, and a base below it is refused
-  /// ([`Outcome::BaseUnavailable`]). Deterministic: the same origin and checkpoint restore the same green.
+  /// ([`Outcome::BaseUnavailable`]). Deterministic: the same origin and checkpoint restore the same green. A checkpoint
+  /// naming a file it has not read (A-869, [`crate::checkpoint::Checkpoint::read_step`]) is refused, typed: a missing
+  /// byte is never a zero.
   pub fn restore(
     origin: crate::origin::Origin,
-    checkpoint: &crate::checkpoint::Checkpoint,
-  ) -> Green {
+    checkpoint: &mut crate::checkpoint::Checkpoint,
+  ) -> Result<Green, Unrestored> {
     Green::with_origin(origin).with_checkpoint(checkpoint)
   }
 
   /// This green, seeded from its origin and at version 0 with no increment yet, with `checkpoint` applied: what
   /// [`Green::restore`] does after its seeding, so a recovery that seeds the origin a share at a time ([`OriginLoad`])
-  /// restores the same green as the one call does.
-  pub fn with_checkpoint(mut self, checkpoint: &crate::checkpoint::Checkpoint) -> Green {
+  /// restores the same green as the one call does. Each named file takes the buffer its bytes were read into, with no
+  /// copy, and its block is named for its object, as the version that made it named it (A-869). Refused [`Unrestored`],
+  /// the green handed back as it was seeded and the checkpoint as it was, while a named file is unread.
+  pub fn with_checkpoint(
+    mut self,
+    checkpoint: &mut crate::checkpoint::Checkpoint,
+  ) -> Result<Green, Unrestored> {
+    if let Some(file) = checkpoint.unread() {
+      return Err(Unrestored {
+        identity: file.identity,
+        green: Box::new(self),
+      });
+    }
+    let named = checkpoint.take_named().unwrap_or_default();
     let green = &mut self;
     for changed in &checkpoint.files {
       green.restore_file(changed);
+    }
+    for (file, bytes) in named {
+      green.restore_named_file(file, bytes);
     }
     for changed in &checkpoint.dirs {
       green.restore_dir(changed);
@@ -2282,7 +2313,17 @@ impl Green {
     if let Some(sum) = &checkpoint.sum {
       green.take_sum(sum);
     }
-    self
+    Ok(self)
+  }
+
+  /// A named file of a checkpoint (A-869): placed of `bytes`, its object's whole, and named for it; then recorded as
+  /// [`Green::restore_file`] records a carried one.
+  fn restore_named_file(&mut self, file: crate::checkpoint::NamedFile, bytes: Vec<u8>) {
+    self.place_named_file(&file.key, bytes, file.identity);
+    self.last_changed.insert(file.key.clone(), file.at);
+    self.clear_content_history(&file.key);
+    let value = self.named_value(&file.key);
+    self.push_content(file.key, file.at, Some(value));
   }
 
   fn restore_file(&mut self, changed: &crate::checkpoint::Changed<String, Vec<u8>>) {
@@ -3529,21 +3570,47 @@ impl Green {
 
   /// Every file whose value in effect at `at` was set after the origin, with that version and its bytes: the
   /// checkpoint's files ([`Green::checkpoint`]).
-  fn changed_content_at(&self, at: u64) -> Vec<crate::checkpoint::Changed<String, Vec<u8>>> {
-    self
-      .content_history
-      .iter()
-      .filter_map(|(path, entries)| {
-        let (version, value) = entries.iter().rev().find(|(v, _)| *v <= at)?;
-        (*version > 0).then(|| crate::checkpoint::Changed {
+  fn changed_content_at(
+    &self,
+    at: u64,
+  ) -> (
+    Vec<crate::checkpoint::Changed<String, Vec<u8>>>,
+    Vec<crate::checkpoint::NamedFile>,
+  ) {
+    let mut carried = Vec::new();
+    let mut named = Vec::new();
+    for (path, entries) in &self.content_history {
+      let Some((version, value)) = entries.iter().rev().find(|(v, _)| *v <= at) else {
+        continue;
+      };
+      if *version == 0 {
+        continue;
+      }
+      // A value that is a block named for its object whole is named, not carried (A-869): the checkpoint costs the
+      // name, and a restore reads the bytes from the plane.
+      let name = value.as_ref().and_then(|value| {
+        let name = self
+          .content
+          .blocks()
+          .name(value.whole_block(&self.chunks)?)?;
+        (u64::try_from(value.len()).ok() == Some(name.len)).then_some(name)
+      });
+      match name {
+        Some(identity) => named.push(crate::checkpoint::NamedFile {
+          key: path.clone(),
+          at: *version,
+          identity,
+        }),
+        None => carried.push(crate::checkpoint::Changed {
           key: path.clone(),
           at: *version,
           value: value
             .as_ref()
             .map(|value| value.materialize(&self.chunks, self.content.blocks())),
-        })
-      })
-      .collect()
+        }),
+      }
+    }
+    (carried, named)
   }
 
   /// Records `value` as `path`'s content at `version`, the running totals with it: the new latest value replaces the

@@ -652,7 +652,7 @@ fn a_copy_behind_the_works_base_refuses_it_typed() {
 fn a_green_restored_past_the_works_base_refuses_it_typed() {
   let (owner, _) = owner_and_copy();
   let checkpoint = owner.checkpoint(2).expect("a checkpoint at the head");
-  let restored = Green::restore(origin(), &checkpoint);
+  let restored = Green::restore(origin(), &mut checkpoint.clone()).unwrap();
   let behind = work(&owner, 1, &[Edit::Write(2, b"four".to_vec())], 4);
   let unavailable = ComputeRefused::BaseUnavailable { base: 1, floor: 2 };
   assert_eq!(

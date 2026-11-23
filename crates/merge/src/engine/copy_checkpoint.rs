@@ -220,6 +220,10 @@ impl Green {
     checkpoint.files = unlisted(std::mem::take(&mut checkpoint.files), listed, |key| {
       IdentityKey::File(path(key))
     });
+    // A named file (A-869) is a changed file too.
+    checkpoint
+      .named
+      .retain(|file| !listed.contains(&IdentityKey::File(file.key.clone())));
     checkpoint.dirs = unlisted(std::mem::take(&mut checkpoint.dirs), listed, |key| {
       IdentityKey::Dir(path(key))
     });
@@ -346,6 +350,21 @@ impl Green {
       self.identity.add(&file_entry(path, bytes));
       self.content.insert(path, bytes.to_vec());
     }
+  }
+
+  /// A named file of a checkpoint set (A-869): its bytes, the whole of `identity`'s object, taken without a copy and
+  /// its block named for it, the identity's entry moved with it; no history.
+  pub(super) fn place_named_file(
+    &mut self,
+    path: &str,
+    bytes: Vec<u8>,
+    identity: crate::named::Identity,
+  ) {
+    if let Some(old) = self.content.remove(path) {
+      self.identity.remove(&file_entry(path, &old));
+    }
+    self.identity.add(&file_entry(path, &bytes));
+    self.content.insert_named(path, bytes, Some(identity));
   }
 
   /// A directory set or taken away, the identity's entry moved with it; no history.

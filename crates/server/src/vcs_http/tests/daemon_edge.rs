@@ -4188,6 +4188,14 @@ fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
     REPOSITORY,
     crate::repository::hg_run::TEXT_BYTES_LET_GO,
   );
+  let (turns, longest, quantum) = crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
+    let counted = |kind| state.refusals.get(kind).copied().unwrap_or(0);
+    (
+      counted(crate::repository::hg_run::LET_GO_TURNS),
+      counted(crate::repository::hg_run::LET_GO_LONGEST_TURN_NS),
+      state.config.step_quantum_ns(),
+    )
+  });
   let tip = crate::verbs::hex_of(&made[TEXTS_CHANGESETS - 1].node);
   let cloned = hg_getbundle(edge, &name, &tip);
   daemon.stop();
@@ -4203,6 +4211,11 @@ fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
     );
   }
   assert!(gone > 0, "some window let go");
+  // At the derived budget (half the shard's step quantum) the commit's let-go is spread over turns too.
+  println!(
+    "the commit's let-go: {turns} turns, the longest {longest} ns of a {quantum} ns quantum"
+  );
+  assert!(turns > 1, "the commit's let-go spread over turns: {turns}");
   assert!(
     let_go >= u64::try_from(gone * TEXT_BYTES).unwrap(),
     "{let_go} bytes let go"
@@ -4213,6 +4226,45 @@ fn a_long_pushs_file_texts_leave_the_content_store_once_their_segments_land() {
     cloned.2.windows(64).any(|window| window == &last[..64]),
     "the clone carries the last file's bytes"
   );
+}
+
+/// Main's order of 2026-11-22 (CI 45110563116: on x86, shard 0 spun 1,045 ms of CPU in one poll of `hg_push::unbundle`
+/// as a whole-history push's committed file revisions were noted and let go in one step, and the daemon was killed).
+/// Do: start a two-shard daemon over loopback TLS; push [`a_long_push_of_own_texts`]'s line with the let-go's turn
+/// budget at a nanosecond (`hg_run::TEST_LET_GO_TURN_NS`); read the let-go's counters. Expect the push `200`; its file
+/// revisions let go over a turn each, one at a time ([`TEXTS_CHANGESETS`] turns: a turn ends at the first revision past
+/// its budget, a revision being the let-go's unit), the longest counted; every file's window let go. Red before: one
+/// turn took them all (1 turn, 642,500 ns in debug).
+#[test]
+fn a_committed_pushs_file_revisions_are_let_go_a_turn_at_a_time() {
+  let (identity, certificate) = identity();
+  let (daemon, _instance) = daemon_named(Some(identity));
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  create_empty_hg(&daemon, &name);
+  let quantum = crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
+    crate::repository::hg_run::TEST_LET_GO_TURN_NS.with(|budget| budget.set(1));
+    state.config.step_quantum_ns()
+  });
+  let (_, texts, pushed) = a_long_push_of_own_texts(&daemon, (port, &certificate), &name);
+  let turns = counted_on(&daemon, REPOSITORY, crate::repository::hg_run::LET_GO_TURNS);
+  let longest = counted_on(
+    &daemon,
+    REPOSITORY,
+    crate::repository::hg_run::LET_GO_LONGEST_TURN_NS,
+  );
+  let held = windows_held(&daemon, texts);
+  daemon.stop();
+  println!("let go over {turns} turns, the longest {longest} ns of a {quantum} ns quantum");
+  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
+  assert_eq!(
+    turns,
+    u64::try_from(TEXTS_CHANGESETS).unwrap(),
+    "a file revision a turn"
+  );
+  assert!(longest > 0, "the longest turn counted");
+  assert!(held.iter().all(|here| !here), "every file's window let go");
 }
 
 /// codex-review's region-object pin (2026-11-22, main's order to w-hg) through a real push, and goal 93 item 2b(b). Do:

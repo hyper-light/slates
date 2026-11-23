@@ -2,7 +2,7 @@
 //! outside the crate, for a checkpoint holding a copy and for one of a green that never copied, the determinism gate
 //! over every table version 4 added, and hostile input refused typed.
 
-use super::{Changed, Checkpoint, CopyRecord, SUM_BYTES, Sum, Tables};
+use super::{Changed, Checkpoint, CopyRecord, NamedFile, SUM_BYTES, Sum, Tables};
 use crate::chain_entry::Signature;
 use crate::ops_doc::DocDecodeError;
 
@@ -83,6 +83,7 @@ fn golden() -> Checkpoint {
     copied: golden_copied(),
     sum: Some(patterned_sum()),
     head_check: Some((9, [4; 32])),
+    ..Checkpoint::default()
   }
 }
 
@@ -317,7 +318,8 @@ fn doubled() -> (Vec<u8>, Vec<u8>) {
 /// Hostile input (A-626 part 3 and its continuation (1)). Do: decode every proper prefix of the golden checkpoint (the
 /// sum cut short among them), a version 4 header (the sum in every checkpoint), a copied key written twice, a copy's
 /// record written twice, and the encoding with a byte appended. Expect each refused typed: `Truncated` or another
-/// refusal for a prefix, never a checkpoint; `BadVersion`; `DuplicatePath` twice; `TrailingBytes`.
+/// refusal for a prefix, never a checkpoint; `BadVersion`; `DuplicatePath` twice; `Truncated` for the appended byte,
+/// which begins a named files' section (A-869) cut short.
 #[test]
 fn a_hostile_checkpoint_is_refused_typed() {
   let bytes = golden_bytes();
@@ -340,10 +342,201 @@ fn a_hostile_checkpoint_is_refused_typed() {
       Err(DocDecodeError::DuplicatePath)
     )
   );
+  // A byte past the head check begins the named files' section (A-869), cut short here; a byte past a whole section is
+  // `TrailingBytes` (`a_named_files_section_is_refused_typed_when_hostile`).
   let mut trailing = bytes;
+  trailing.push(0);
+  assert_eq!(
+    Checkpoint::decode(&trailing),
+    Err(DocDecodeError::Truncated)
+  );
+}
+
+/// A named file of the named-section tests: `key` at version 1, its object `bytes`.
+fn named(key: &str, bytes: &[u8]) -> NamedFile {
+  NamedFile {
+    key: key.to_owned(),
+    at: 1,
+    identity: crate::named::Identity {
+      hash: *blake3::hash(bytes).as_bytes(),
+      len: bytes.len() as u64,
+    },
+  }
+}
+
+/// [`never_copied`] naming `n`, its object `named text` (A-869).
+fn never_copied_naming() -> Checkpoint {
+  Checkpoint {
+    named: vec![named("n", b"named text")],
+    ..never_copied()
+  }
+}
+
+/// [`never_copied_naming`]'s bytes, laid out apart from the encoder: version 5's layout, then the named files' section
+/// (the count, then the path, the version, the object's hash and its length).
+fn never_copied_naming_bytes() -> Vec<u8> {
+  let mut out = never_copied_bytes();
+  out.extend_from_slice(&1u32.to_le_bytes());
+  blob(&mut out, b"n");
+  out.extend_from_slice(&1u64.to_le_bytes());
+  out.extend_from_slice(blake3::hash(b"named text").as_bytes());
+  out.extend_from_slice(&10u64.to_le_bytes());
+  out
+}
+
+/// A-869 (main 01a20182's order of 2026-11-22 19:28: a checkpoint names a named file, and old checkpoints still read).
+/// Do: encode a checkpoint naming one file beside the one it carries, decode the layout's bytes, and decode version 5's
+/// layout with no named section. Expect: the encoding the layout's, byte for byte: the bytes version 5 always wrote, then
+/// the section; its decode the checkpoint, the file named and not carried; and a checkpoint with no named file the bytes
+/// of before, naming none.
+#[test]
+fn a_named_file_is_written_after_the_layout_of_before_and_read_back() {
+  let naming = never_copied_naming();
+  let bytes = naming.encode();
+  assert_eq!(
+    bytes,
+    never_copied_naming_bytes(),
+    "the named section's layout"
+  );
+  assert_eq!(Checkpoint::decode(&bytes), Ok(naming));
+  assert_eq!(
+    never_copied().encode(),
+    never_copied_bytes(),
+    "the layout of before"
+  );
+  let before = Checkpoint::decode(&never_copied_bytes()).unwrap();
+  assert!(
+    before.named.is_empty(),
+    "a checkpoint of before names nothing"
+  );
+}
+
+/// A-869's hostile input. Do: decode the named section with its path also carried, with a path named twice, with a count
+/// of none, with a count past the bytes left, cut at every byte, and whole with a byte appended. Expect each refused
+/// typed: `DuplicatePath` twice, `BadKind`, `Truncated`, never a checkpoint for a cut, `TrailingBytes`.
+#[test]
+fn a_named_files_section_is_refused_typed_when_hostile() {
+  let carried_too = Checkpoint {
+    named: vec![named("f", b"also carried")],
+    ..never_copied()
+  }
+  .encode();
+  assert_eq!(
+    Checkpoint::decode(&carried_too),
+    Err(DocDecodeError::DuplicatePath)
+  );
+  let mut twice = never_copied_bytes();
+  twice.extend_from_slice(&2u32.to_le_bytes());
+  for _ in 0..2 {
+    blob(&mut twice, b"n");
+    twice.extend_from_slice(&1u64.to_le_bytes());
+    twice.extend_from_slice(&[3; 32]);
+    twice.extend_from_slice(&4u64.to_le_bytes());
+  }
+  assert_eq!(
+    Checkpoint::decode(&twice),
+    Err(DocDecodeError::DuplicatePath)
+  );
+  let mut none = never_copied_bytes();
+  none.extend_from_slice(&0u32.to_le_bytes());
+  assert_eq!(Checkpoint::decode(&none), Err(DocDecodeError::BadKind));
+  let mut wild = never_copied_bytes();
+  wild.extend_from_slice(&u32::MAX.to_le_bytes());
+  assert_eq!(Checkpoint::decode(&wild), Err(DocDecodeError::Truncated));
+  let whole = never_copied_naming_bytes();
+  let from = never_copied_bytes().len() + 1;
+  let cut = (from..whole.len()).find(|&cut| Checkpoint::decode(&whole[..cut]).is_ok());
+  assert_eq!(cut, None, "a cut section decoded");
+  let mut trailing = whole;
   trailing.push(0);
   assert_eq!(
     Checkpoint::decode(&trailing),
     Err(DocDecodeError::TrailingBytes)
   );
+}
+
+/// A plane of objects by identity for the read tests, counting the largest read.
+#[derive(Default)]
+struct Plane {
+  objects: std::collections::BTreeMap<[u8; 32], Vec<u8>>,
+  largest: std::cell::Cell<usize>,
+}
+
+impl crate::named::Objects for Plane {
+  fn read(
+    &self,
+    identity: &crate::named::Identity,
+    at: u64,
+    into: &mut [u8],
+  ) -> Result<(), crate::named::ObjectMissing> {
+    self.largest.set(self.largest.get().max(into.len()));
+    let missing = crate::named::ObjectMissing {
+      identity: *identity,
+    };
+    let bytes = self.objects.get(&identity.hash).ok_or(missing)?;
+    let at = usize::try_from(at).map_err(|_| missing)?;
+    into.copy_from_slice(bytes.get(at..at + into.len()).ok_or(missing)?);
+    Ok(())
+  }
+}
+
+/// A-869, a restore's read (Ada's sizing rule: no step reads more than its slice). Do: read a checkpoint naming three
+/// files, of 0, 10 and 100 bytes, 7 bytes a step from a plane holding them, after a first try at a plane holding none.
+/// Expect: the try refused `ObjectMissing`, keeping nothing; then every file read in order, no read past 7 bytes, the
+/// steps those the bytes take (a file a step at least); and the files taken with their bytes, once, then unread again.
+#[test]
+fn a_checkpoints_named_files_are_read_a_slice_a_step() {
+  let texts: [&[u8]; 3] = [b"", b"ten bytes!", &[7; 100]];
+  let mut checkpoint = Checkpoint {
+    named: texts
+      .iter()
+      .enumerate()
+      .map(|(at, bytes)| named(&format!("f{at}"), bytes))
+      .collect(),
+    ..Checkpoint::default()
+  };
+  let empty = Plane::default();
+  assert!(
+    checkpoint.read_step(&empty, 7).is_ok(),
+    "an empty object reads from any plane"
+  );
+  assert_eq!(
+    checkpoint
+      .read_step(&empty, 7)
+      .map_err(|missing| missing.identity),
+    Err(checkpoint.named[1].identity)
+  );
+  assert_eq!(
+    checkpoint.unread().map(|file| file.key.as_str()),
+    Some("f1")
+  );
+  let mut plane = Plane::default();
+  for bytes in texts {
+    plane
+      .objects
+      .insert(*blake3::hash(bytes).as_bytes(), bytes.to_vec());
+  }
+  let mut steps = 0;
+  while !checkpoint.read_step(&plane, 7).unwrap() {
+    steps += 1;
+  }
+  assert_eq!(
+    steps + 1,
+    2 + 15,
+    "f1's 10 bytes in 2 steps, f2's 100 in 15"
+  );
+  assert!(
+    plane.largest.get() <= 7,
+    "{} bytes in one read",
+    plane.largest.get()
+  );
+  let taken = checkpoint.take_named().unwrap();
+  let bytes: Vec<&[u8]> = taken.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+  assert_eq!(bytes, texts.to_vec());
+  // Taken, the files are unread again: a second restore reads them again rather than take nothing.
+  assert_eq!(
+    checkpoint.unread().map(|file| file.key.as_str()),
+    Some("f0")
+  );
+  assert!(checkpoint.take_named().is_none(), "taken once");
 }

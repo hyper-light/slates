@@ -693,6 +693,17 @@
 >   The test-only one-call landing builds a push's works as the driver does, planned and then built over the
 >   store's read-through (`works_whole`); `Works::Whole` and the one-call `tree::work` arm are gone, and `prepare` takes
 >   the view alone. The store-made-texts oracle compares a file by the identities its row names.
+> - The committed let-go bounded a turn at a time BUILT (2026-11-22, w-hg; main's order on CI 45110563116: on x86, push-all
+>   refused 503 after shard 0 spun 1,045 ms of CPU in one poll of `hg_push::unbundle`, the commit noting and letting go
+>   the whole push's file revisions in one step): `hg_run::let_go_committed` takes them a turn at a time within half
+>   the shard's step quantum, a revision its unit, yielding between, from the push's task once its entry commits and
+>   from the import's answer once its landing is durable (`hg_import::land` hands them back; none after a refused
+>   commit). Counted `vcs.hg.landed_let_go_turns`, `..._longest_turn_ns`. Held by
+>   `a_committed_pushs_file_revisions_are_let_go_a_turn_at_a_time` (a nanosecond's budget: red 1 turn of 642,500 ns,
+>   now 120, a revision each) and the long push's let-go over more than one turn at the derived budget. A revision is
+>   40-63 us in debug against a 6 us wake-estimate quantum, so a turn is half the quantum plus one revision. OPEN
+>   (main's): the restart spin (`serve_loop`'s second poll, 1,040 ms) is not yet attributed; the image carries a piece
+>   a noted window.
 > - A refused finish's windows given back BUILT (2026-11-22, w-hg; main's routing of w-svn's sibling sweep): the
 >   intake's last step of a file text took its writer out of the intake, so a refused node check or `finish_object`
 >   dropped it with its whole windows held and nothing to read them; both now abandon it
@@ -1621,9 +1632,18 @@
 > four pieces (`inbox/main-from-w-svn-a760b-plan.md` on the fan-out ledger). Piece 1 BUILT: a block made of the whole of
 > one named run spanning its object keeps that object's identity (`Green::name_of`), through a judged commit, `make_step`
 > and `apply_recorded` alike; any other making leaves the block unnamed. No memory change yet. Oracle:
-> `a_file_made_whole_of_a_named_object_is_named_for_it_until_changed`. OWED: piece 2, a checkpoint naming a named file
-> instead of carrying its bytes (a restored green names nothing until then); piece 3, the history keeping a named
-> version by its name; piece 4, the current block holding no bytes, read through the plane.
+> `a_file_made_whole_of_a_named_object_is_named_for_it_until_changed`. Piece 2 BUILT as A-869 (below). OWED: piece 3,
+> the history keeping a named version by its name; piece 4, the current block holding no bytes, read through the plane.
+>
+> **A-869 (2026-11-22, w-svn; main 01a20182's order of 19:28, A-760 (b) piece 2):** a green's checkpoint names a file
+> whose block is named for a content-plane object instead of carrying its bytes (`Checkpoint::named`, a section after
+> the head check written only when a file is named; version 5 kept, so every checkpoint before decodes as it did). A
+> restore reads them a slice a step (`Checkpoint::read_step`) and refuses an unread one typed (`engine::Unrestored`). The
+> daemon's recovery reads them in its own phase (`verbs::GreenReplayPhase::Restoring`), and A-760's pre-pass brings back
+> the checkpoint's names its store does not hold whole. A holder's replica refuses a held checkpoint that names files
+> (`merge.replica.checkpoint_unread`, A-727 (d) owes its reads). Oracle: the A-866 oracle with restores, at earlier
+> versions too, caught up by recorded entries. Red first: a restored green named nothing. Not yet measured: the
+> register's checkpoint bytes before and after (main's). OWED: a copied tree's keys are carried still.
 >
 > **Finding, 2026-11-20 (w-engine, not chased under the close order):** `cargo test -p slates-merge --test checkpoint`
 > failed once in 10 runs (`a_green_restored_from_its_checkpoint_answers_as_the_green_it_was`, a proptest, unseeded) on

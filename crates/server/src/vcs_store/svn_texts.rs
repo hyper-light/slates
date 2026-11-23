@@ -232,18 +232,24 @@ fn finish_brought(
 }
 
 /// Counter: a text a Subversion green's recovery brought back from the node's changeset store before its replay
-/// ([`bring_back_named`]): the cold path alone, 0 in a run with no crash. Format: a counter name in the status report.
+/// ([`bring_back_named`]): a text its checkpoint (A-869) or a chain entry names that the restored content store does
+/// not hold whole. That is the head's texts once a checkpoint names them, and any entry's texts past the checkpoint,
+/// which a stop before a deferred checkpoint commits (`merge_service`'s `checkpoint_in_turns`) leaves in the chain.
+/// Format: a counter name in the status report.
 pub(crate) const NAMED_BROUGHT_BACK: &str = "vcs_store.svn_texts.named_brought_back";
 
-/// A-760's recovery pre-pass (main 01a20182's rulings of 2026-11-22 ~11:35 and ~11:50, (i)): the texts that the entries of
-/// green `green`'s chain name (A-760) and the content store does not hold whole, brought back whole from the node's
-/// changeset store before the green's replay, a text a recovery unit, so the replay finds every name and its
-/// `ContentMissing` stays a true fence. What it brought, each holding one count of the content store, for the caller to give back once the green
-/// is replayed. Nothing but for a Subversion repository's member.
+/// A-760's recovery pre-pass (main 01a20182's rulings of 2026-11-22 ~11:35 and ~11:50, (i)): the texts that green
+/// `green`'s checkpoint (A-869) and the entries of its chain name (A-760) and the content store does not hold whole,
+/// brought back whole from the node's changeset store before the green's replay, a text a recovery unit, so the restore
+/// and the replay find every name and their `ContentMissing` stays a true fence. What it brought, each holding one count
+/// of the content store, for the caller to give back once the green is replayed. Nothing but for a Subversion
+/// repository's member.
 ///
 /// **Bound.** The chain holds the entries past the green's checkpoint alone, and an import's batch checkpoints its green
-/// as it lands, so what is brought is at most one batch's texts, bounded by the batch's admission
-/// (`svn_commit::staging`).
+/// as it lands, so what the entries bring is at most one batch's texts, bounded by the batch's admission
+/// (`svn_commit::staging`). The checkpoint names the head's texts it no longer carries (A-869): what was its bytes, in
+/// the checkpoint's own object before, is brought into the content store instead, each a text a recovery unit within
+/// the room each is lent, and given back once the green is replayed.
 ///
 /// **Why it can be found.** An entry naming a text commits only once the changeset holding that text is durable on the
 /// node's store: `staging::Staging::land` awaits `landing::land_changeset` before `ImportBatch::commit` appends the
@@ -289,14 +295,34 @@ fn subversion_of(
   (record.tool == slates_db::catalog::VcsTool::Subversion).then_some(member.repository)
 }
 
-/// The texts green `green`'s chain entries name that the content store does not hold whole (lacks, or holds with a
-/// window let go), each once, with its length.
+/// The texts green `green`'s checkpoint (A-869) and chain entries name that the content store does not hold whole
+/// (lacks, or holds with a window let go), each once, with its length.
 fn named_lacking(
   state: &ShardState,
   green: slates_db::catalog::VolumeId,
 ) -> Vec<(ContentIdentity, u64)> {
   let mut wanted: Vec<(ContentIdentity, u64)> = Vec::new();
-  for bytes in state.db.partition().green_chain(green).iter() {
+  // Held whole, or brought: a restored store keeps the name of a text whose window was let go, and the restore and the
+  // replay read every byte (codex-review's restart of 2026-11-22: r1 fenced `ContentMissing` for one six-byte window).
+  let mut want = |identity: slates_merge::named::Identity| {
+    let held = state
+      .vcs_stores
+      .content()
+      .is_some_and(|content| content.holds_whole(&slates_vcs::ContentId(identity.hash)));
+    if !held && !wanted.iter().any(|(wanted, _)| *wanted == identity.hash) {
+      wanted.push((identity.hash, identity.len));
+    }
+  };
+  let partition = state.db.partition();
+  if let Some((_, named)) = partition.green_checkpoint(green)
+    && let Some(bytes) = crate::merge_service::checkpoint_bytes(state, green, &named)
+    && let Ok(checkpoint) = slates_merge::checkpoint::Checkpoint::decode(&bytes)
+  {
+    for file in &checkpoint.named {
+      want(file.identity);
+    }
+  }
+  for bytes in partition.green_chain(green).iter() {
     if slates_merge::push::DeferredPush::is_record(bytes) {
       continue;
     }
@@ -314,19 +340,7 @@ fn named_lacking(
       continue;
     };
     for run in &entry.increment.named.runs {
-      // Held whole, or brought: a restored store keeps the name of a text whose window was let go, and the replay
-      // reads every byte (codex-review's restart of 2026-11-22: r1 fenced `ContentMissing` for one six-byte window).
-      let held = state
-        .vcs_stores
-        .content()
-        .is_some_and(|content| content.holds_whole(&slates_vcs::ContentId(run.identity.hash)));
-      if !held
-        && !wanted
-          .iter()
-          .any(|(identity, _)| *identity == run.identity.hash)
-      {
-        wanted.push((run.identity.hash, run.identity.len));
-      }
+      want(run.identity);
     }
   }
   wanted

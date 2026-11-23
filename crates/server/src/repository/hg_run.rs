@@ -27,7 +27,10 @@
 //! as a landed git pack's does (`vcs_store::landed_pin`): a home reads by identity alone, and the revision is not yet in
 //! the index its read-through reads. Once it commits, each window is noted with its revision for the home
 //! (`homes::note_landed`, `Landed::Hg`; goal 93 item 2b(b), w-shared's seam 1) and let go, pinned by nothing: a home's
-//! read brings it back by its path and node (`hg_push::bring_back`). So a whole-history push leaves its rows held, never
+//! read brings it back by its path and node (`hg_push::bring_back`). That noting is a whole push's file revisions, so the
+//! push's task takes it a turn at a time within half the shard's step quantum, a revision its unit ([`let_go_committed`];
+//! in one poll it spun CI's x86 shard 0 for 1,045 ms, run 45110563116), as the import's answer does once its landing is
+//! durable. So a whole-history push leaves its rows held, never
 //! its history's texts (main 01a20182's order of 2026-11-22 14:00: 4.7 GB of arena held after Mercurial's history
 //! landed; 150,880 texts pinned on shard 0 after the first let-go, CI 45101827617).
 //!
@@ -90,6 +93,9 @@ std::thread_local! {
   /// A test's segment bound on this shard's thread, in place of [`segment_bytes`]'s derivation where more than none: a
   /// test's push of a few hundred kilobytes cut into several segments.
   pub(crate) static TEST_SEGMENT_BYTES: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+  /// A test's budget for a turn of a committed run's let-go on this shard's thread, in place of [`let_go_turn_ns`]'s
+  /// derivation where more than none: a test's push of a hundred files let go over a turn each.
+  pub(crate) static TEST_LET_GO_TURN_NS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
   /// A test's patience for a landing turn on this shard's thread, in place of [`PATIENCE_NS`] where more than none: a
   /// test's push refused past it in milliseconds.
   pub(crate) static TEST_TURN_PATIENCE_NS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
@@ -180,19 +186,17 @@ impl Run {
     record::write_push_runs_reference(room, &self.ranges)
   }
 
-  /// Ends the run (module docs, "Abandoned", "Let go"): where an entry named it (`committed`), its file texts noted for a
-  /// home and let go once more, whatever its works brought back; else forgotten.
-  pub(crate) fn settle(mut self, state: &mut ShardState, committed: bool) {
+  /// Ends a run no entry named (module docs, "Abandoned"): forgotten.
+  pub(crate) fn abandon(mut self, state: &mut ShardState) {
     self.settled = true;
-    if committed {
-      let_go_landed(
-        state,
-        Some(self.repository),
-        &core::mem::take(&mut self.contents),
-      );
-    } else {
-      abandoned(state, self.repository, core::mem::take(&mut self.ranges));
-    }
+    abandoned(state, self.repository, core::mem::take(&mut self.ranges));
+  }
+
+  /// Ends a run its entry named (module docs, "Let go"): its repository and its file revisions, for their noting for a
+  /// home and their let-go once more, whatever its works brought back, a turn at a time ([`let_go_committed`]).
+  pub(crate) fn committed(mut self) -> (RepositoryId, Vec<FileContents>) {
+    self.settled = true;
+    (self.repository, core::mem::take(&mut self.contents))
   }
 }
 
@@ -234,9 +238,8 @@ fn abandoned(state: &mut ShardState, repository: RepositoryId, ranges: Vec<(u64,
 /// Counter: the bytes of pushes' file texts let go of the content store once the segment carrying them was durable
 /// (module docs, "Let go"). Format: a counter name in the status report.
 pub(crate) const TEXT_BYTES_LET_GO: &str = "vcs.hg.push_text_bytes_let_go";
-/// Counter: a landed segment's window kept because a home holds it here (`vcs_store::landed_pin`: one whose home by
-/// identity is this shard, which a home reads by identity alone), until its entry commits and notes it. Format: a
-/// counter name.
+/// Counter: a landed segment's window kept because a home holds it here (`vcs_store::landed_pin`: one this shard holds
+/// for the region, which a home reads by identity alone), until its entry commits and notes it. Format: a counter name.
 pub(crate) const TEXTS_PINNED: &str = "vcs.hg.push_texts_pinned";
 
 /// Lets go of `contents`, a landed segment's file revisions' windows (module docs, "Let go"), each noted for a home as
@@ -268,28 +271,96 @@ pub(crate) fn let_go_windows(
   noting: Option<RepositoryId>,
   contents: &[FileContents],
 ) -> (u64, u64) {
+  let (freed, pinned, _) = let_go_windows_until(state, noting, contents, u64::MAX);
+  (freed, pinned)
+}
+
+/// [`let_go_windows`] over `contents` a revision at a time until the clock passes `deadline_ns`, one revision at least:
+/// the bytes freed, the windows kept pinned, and how many revisions were taken.
+fn let_go_windows_until(
+  state: &mut ShardState,
+  noting: Option<RepositoryId>,
+  contents: &[FileContents],
+  deadline_ns: u64,
+) -> (u64, u64, usize) {
   // The repository's windows are the shard's chunk store's, lent to its content store for the step.
   crate::vcs_store::lent_state(state, |state| {
     crate::vcs_store::within_budget(state, 0, |stores| {
-      stores.content_mut().map_or((0, 0), |content| {
-        contents
-          .iter()
-          .flat_map(|revision| {
-            revision
-              .identities()
-              .map(move |identity| (revision, identity))
-          })
-          .fold((0_u64, 0_u64), |(freed, pinned), (revision, identity)| {
-            if let Some(repository) = noting {
-              note_windows(content, repository, revision, identity);
-            }
-            let (more, kept) =
-              content.let_go_object_landed(identity, &crate::vcs_store::landed_pin);
-            (freed.saturating_add(more), pinned.saturating_add(kept))
-          })
-      })
+      let Some(content) = stores.content_mut() else {
+        return (0, 0, contents.len());
+      };
+      let (mut freed, mut pinned, mut taken) = (0_u64, 0_u64, 0_usize);
+      for revision in contents {
+        for identity in revision.identities() {
+          if let Some(repository) = noting {
+            note_windows(content, repository, revision, identity);
+          }
+          let (more, kept) = content.let_go_object_landed(identity, &crate::vcs_store::landed_pin);
+          freed = freed.saturating_add(more);
+          pinned = pinned.saturating_add(kept);
+        }
+        taken = taken.saturating_add(1);
+        if slates_rt::futures::now_ns() >= deadline_ns {
+          break;
+        }
+      }
+      (freed, pinned, taken)
     })
   })
+}
+
+/// Counter: the turns a committed run's or a landed import's file revisions were noted and let go over
+/// ([`let_go_committed`]). Format: a counter name in the status report.
+pub(crate) const LET_GO_TURNS: &str = "vcs.hg.landed_let_go_turns";
+/// Counter: the longest of those turns, nanoseconds: held under the shard's step quantum (goal 93: a whole-history
+/// push's let-go in one poll spun shard 0 for 1,045 ms of CPU on CI's x86 runner, run 45110563116). Format: a counter
+/// name in the status report.
+pub(crate) const LET_GO_LONGEST_TURN_NS: &str = "vcs.hg.landed_let_go_longest_turn_ns";
+
+/// The budget of one turn of [`let_go_committed`]: half the shard's step quantum, as a push's work builds a turn
+/// (`hg_push::built_works`), so the turn leaves the step room for what else the shard serves.
+fn let_go_turn_ns(state: &ShardState) -> u64 {
+  #[cfg(test)]
+  {
+    let set = TEST_LET_GO_TURN_NS.with(core::cell::Cell::get);
+    if set > 0 {
+      return set;
+    }
+  }
+  (state.config.step_quantum_ns() / 2).max(1)
+}
+
+/// Notes `contents`, the file revisions of `repository` its index now holds (a push's entry committed, an import
+/// landed), for a home and lets their windows go ([`let_go_windows`]), a turn at a time within [`let_go_turn_ns`],
+/// yielding between: a whole history's revisions are hundreds of thousands, never one poll's work. Counted into
+/// `freed_pinned` (the push's or the import's counters), with the turns and the longest. Ends where the shard's state
+/// is gone; what was not let go then stays held, read as before.
+pub(crate) async fn let_go_committed(
+  repository: RepositoryId,
+  contents: Vec<FileContents>,
+  freed_pinned: (&'static str, &'static str),
+) {
+  let mut at = 0_usize;
+  while let Some(rest) = contents.get(at..).filter(|rest| !rest.is_empty()) {
+    let taken = crate::state::with_state(|state| {
+      let began = slates_rt::futures::now_ns();
+      let deadline = began.saturating_add(let_go_turn_ns(state));
+      let (freed, pinned, taken) = let_go_windows_until(state, Some(repository), rest, deadline);
+      state.count(freed_pinned.0, freed);
+      state.count(freed_pinned.1, pinned);
+      state.count(LET_GO_TURNS, 1);
+      state.count_max(
+        LET_GO_LONGEST_TURN_NS,
+        slates_rt::futures::now_ns().saturating_sub(began),
+      );
+      taken
+    });
+    let Some(taken) = taken else {
+      return;
+    };
+    at = at.saturating_add(taken.max(1));
+    slates_rt::futures::yield_now().await;
+  }
 }
 
 /// Notes each window of `identity`, one of `revision`'s objects in `repository`, with the revision for a home on this
