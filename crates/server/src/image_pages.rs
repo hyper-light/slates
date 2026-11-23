@@ -86,6 +86,7 @@ pub(crate) struct Page {
 
 impl Page {
   /// The page of every coordinate.
+  #[cfg(test)]
   pub(crate) const WHOLE: Page = Page { depth: 0, start: 0 };
 
   /// Its last coordinate.
@@ -127,6 +128,9 @@ impl Page {
 }
 
 /// One entry of a family, as the piece it would be alone: its coordinate, its piece key and its bytes.
+/// A page of one family: the key a publication's and a checkpoint's pieces are named by.
+pub(crate) type FamilyPage = (Family, Page);
+
 pub(crate) type Entry = (
   u64,
   [u8; slates_vfs::recover::HELD_PIECE_KEY_BYTES],
@@ -188,6 +192,7 @@ std::thread_local! {
 }
 
 /// The bytes this shard's thread has encoded into page pieces, ever ([`ENCODED`]).
+#[cfg(test)]
 pub(crate) fn encoded_bytes() -> u64 {
   ENCODED.with(core::cell::Cell::get)
 }
@@ -266,6 +271,7 @@ impl Directory {
   }
 
   /// Its pages, in coordinate order.
+  #[cfg(test)]
   pub(crate) fn pages(&self) -> impl Iterator<Item = Page> + '_ {
     self.pages.iter().map(|(start, depth)| Page {
       depth: *depth,
@@ -463,7 +469,7 @@ impl Encoder {
 
   /// The pages a publication carries, where no change is left to encode: each page re-encoded since the last committed
   /// cut, its bytes or none to remove its piece. None while a page is dirty: the publication carries no page then.
-  pub(crate) fn cut(&self) -> Option<impl Iterator<Item = ((Family, Page), Option<&[u8]>)> + '_> {
+  pub(crate) fn cut(&self) -> Option<impl Iterator<Item = (FamilyPage, Option<&[u8]>)> + '_> {
     (!self.is_dirty()).then(|| {
       self
         .pending
@@ -474,7 +480,7 @@ impl Encoder {
 
   /// Every page a checkpoint carries with its bytes: the shard's now, where no change is left to encode (the committed
   /// cut with the re-encoded pages over it), else the committed cut alone; and whether it is the shard's now.
-  pub(crate) fn whole(&self) -> (Vec<((Family, Page), &[u8])>, bool) {
+  pub(crate) fn whole(&self) -> (Vec<(FamilyPage, &[u8])>, bool) {
     if self.is_dirty() {
       let pages = self
         .committed

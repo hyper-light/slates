@@ -927,9 +927,6 @@ fn phase_roots_added(roots: &[PhaseHead]) -> Vec<StateChange> {
     .collect()
 }
 
-/// What a bookmark's work is built from: the imported index as a push's `Held`, the import's name, and the room the
-/// works may take between them.
-
 /// Each bookmark a green (§4.17.3 decision 2): made from `root` at its head, as a push makes a bookmark from a line's
 /// version, and moved to the bookmark's changeset by its work, built before the landing ([`built_works`]); none where
 /// the root's head is that changeset already. A work its bookmark wants that was not built refuses the landing
@@ -1327,30 +1324,32 @@ pub(crate) async fn run(id: RepositoryId) -> Option<Result<Box<Finished>, Import
     }
     match turned {
       Ok(Turned::More) => {}
-      Ok(Turned::Done(finished)) => {
-        // Its bookmarks' works, a unit a turn (2b, main's ruling of 2026-11-22 02:52): the landing builds none.
-        if let Err(failed) = built_works(id).await? {
-          crate::state::with_state(|state| abandon(state, id))?;
-          return Some(Err(failed));
-        }
-        // Its record names its contents by identity (A-729 part 2), so its landing commits only once the shard's image
-        // holding them is published (durable before named, A-727 slice b's barrier); one not published gives the import
-        // back.
-        let (shard, ticket) =
-          crate::state::with_state(|state| (state.shard, super::durable::content_ticket(state)))?;
-        let durable = super::durable::content_durable(
-          shard,
-          ticket,
-          crate::fleet::live_budget().max_deadline_ns(),
-        )
-        .await;
-        if durable.is_ok() {
-          return Some(Ok(finished));
-        }
-        crate::state::with_state(|state| abandon(state, id))?;
-        return Some(Err(ImportFailed::Landing(Refusal::ContentUnavailable)));
-      }
+      Ok(Turned::Done(finished)) => return finished_import(id, finished).await,
       Err(failed) => return Some(Err(failed)),
     }
   }
+}
+
+/// A finished import's last steps. Its bookmarks' works first, a unit a turn (2b, main's ruling of 2026-11-22 02:52):
+/// the landing builds none. Its record names its contents by identity (A-729 part 2), so its landing commits only once
+/// the shard's image holding them is published (durable before named, A-727 slice b's barrier). One whose works or
+/// image fail gives the import back.
+async fn finished_import(
+  id: RepositoryId,
+  finished: Box<Finished>,
+) -> Option<Result<Box<Finished>, ImportFailed>> {
+  if let Err(failed) = built_works(id).await? {
+    crate::state::with_state(|state| abandon(state, id))?;
+    return Some(Err(failed));
+  }
+  let (shard, ticket) =
+    crate::state::with_state(|state| (state.shard, super::durable::content_ticket(state)))?;
+  let durable =
+    super::durable::content_durable(shard, ticket, crate::fleet::live_budget().max_deadline_ns())
+      .await;
+  if durable.is_ok() {
+    return Some(Ok(finished));
+  }
+  crate::state::with_state(|state| abandon(state, id))?;
+  Some(Err(ImportFailed::Landing(Refusal::ContentUnavailable)))
 }

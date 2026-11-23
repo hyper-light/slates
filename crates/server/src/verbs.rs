@@ -20144,6 +20144,7 @@ pub(crate) fn replayed_green_for_test(
   replay_green(state, id).ok().map(|replayed| replayed.0)
 }
 
+#[cfg(test)]
 fn replay_green(
   state: &ShardState,
   id: DbVolumeId,
