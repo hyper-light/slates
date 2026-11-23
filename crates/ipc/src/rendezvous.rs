@@ -4625,6 +4625,26 @@ pub mod platform {
       SharedObject::open(&handoff, OBJECT_BYTES, bootstrap_words()).unwrap()
     }
 
+    /// A-468 (the holder's going ends a reconnect at once). Do: hold the instance's rendezvous as an anchor does, map its
+    /// bootstrap object as a connected client's doorbell does, ask `holder_lives`, then let the anchor go inside its own
+    /// live process and ask again. Expect: a holder while the anchor holds the rendezvous, and none once it has let go,
+    /// though the client's mapping keeps the object (Windows keeps a named object while any handle holds it, A-176).
+    #[test]
+    fn an_anchor_that_lets_go_is_no_holder_though_a_client_maps_the_object() {
+      let name = instance("let-go");
+      let anchor = crate::rendezvous::HeldRendezvous::hold(&name).unwrap();
+      let client = client_mapping(&name);
+      let held = holder_lives(&name).unwrap();
+      drop(anchor);
+      let after = holder_lives(&name).unwrap();
+      drop(client);
+      assert!(held, "the anchor holds the rendezvous");
+      assert!(
+        !after,
+        "no holder once the anchor has let go, though a client still maps the object"
+      );
+    }
+
     /// A-381 (§4.7, D-10). Do: clients ring for shards 3, 64, 3 again and 65,535, the last id a region can name, then a
     /// claim rings; the daemon's thread takes what the rings marked, then takes again. Expect: the word moved once a
     /// ring, so the thread is woken for each; the first take holds the claim and exactly shards 3, 64 and 65,535, each
