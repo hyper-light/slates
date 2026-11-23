@@ -1,0 +1,84 @@
+name: diag-w-perf
+
+# w-perf for main 01a20182 (2026-11-23): A-877's restart data loss, red on Windows CI (w-win2's run 45269168513). A
+# diagnostics lane run only from `diag-measurer-w-perf-*` branches, never main. On both Windows runners: the two store
+# tests that found it and the window storage's restart test, first with the bug put back (`bug.patch`: version 2's
+# piece reader refusing a trimmed chunk's head), then with the fix, each step's output in a file printed after it and
+# in an always() step; then the server's Windows clippy.
+
+on:
+  push:
+    branches: ["diag-measurer-w-perf-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  restart:
+    name: A-877's restart (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+      TESTS: >-
+        repository::store_tests::a_batch_killed_between_its_commits_slices_recovers_and_resumes_to_the_same_history
+        repository::store_tests::a_region_held_window_is_restored_beside_the_named_texts_brought_back
+        vcs_store::arena_windows::tests::a_restart_claims_each_slab_once_and_reads_its_windows_in_their_slots
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - name: NASM (x86_64 Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64 Windows)
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: "Red: the three tests with the bug put back"
+        timeout-minutes: 60
+        run: |
+          git apply .github/diag-w-perf/bug.patch
+          set +e
+          cargo test -p slates-server --lib -- --test-threads=1 $TESTS > "$RUNNER_TEMP/restart-red.log" 2>&1
+          code=$?
+          set -e
+          git apply -R .github/diag-w-perf/bug.patch
+          grep -a 'test result\|^failures:\|^    [a-z_:]*$\|panicked at\|left:\|right:' "$RUNNER_TEMP/restart-red.log" | tail -40
+          echo "red arm exit $code"
+          if [ "$code" -eq 0 ]; then echo "UNEXPECTED: the tests passed with the bug put back"; exit 1; fi
+      - name: "Green: the three tests with the fix, three times"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 60
+        run: |
+          set +e
+          failed=0
+          for round in 1 2 3; do
+            cargo test -p slates-server --lib -- --test-threads=1 $TESTS > "$RUNNER_TEMP/restart-green-$round.log" 2>&1
+            code=$?
+            echo "round $round: exit $code, $(grep -a 'test result' "$RUNNER_TEMP/restart-green-$round.log" | tail -1)"
+            if [ "$code" -ne 0 ]; then failed=1; grep -a 'panicked at\|left:\|right:\|^failures:' "$RUNNER_TEMP/restart-green-$round.log" | tail -30; fi
+          done
+          exit $failed
+      - name: Clippy the server on Windows, alone
+        if: ${{ !cancelled() }}
+        run: cargo clippy -p slates-server --no-deps --lib --tests -- -D warnings 2>&1 | grep -v '^\s*Checking \|^\s*Compiling '
+      - name: "The test logs, whatever happened"
+        if: always()
+        run: |
+          for f in "$RUNNER_TEMP"/restart-*.log; do echo "=== $f"; grep -av '^\s*Compiling \|^slates daemon: \|^slates-server: ' "$f" | tail -60; done

@@ -1,0 +1,13 @@
+diff --git a/crates/server/src/vcs_store/arena_windows.rs b/crates/server/src/vcs_store/arena_windows.rs
+index 2f7ee75e8..a5a797ddf 100644
+--- a/crates/server/src/vcs_store/arena_windows.rs
++++ b/crates/server/src/vcs_store/arena_windows.rs
+@@ -282,7 +282,7 @@ fn read_piece(bytes: &[u8]) -> Result<PieceRead, PieceRefused> {
+       // window's slot is held to the chunk's bytes. Until 2026-11-23 a used length past the head was refused here, and
+       // every window of a granule or more was lost at a restart
+       // (docs/bugs/2026-11-23-a-restart-lost-every-repository-window-whose-chunk-the-seal-trimmed.md).
+-      if len == 0 || end > u64::from(used) {
++      if len == 0 || end > u64::from(used) || u64::from(used) > block {
+         return Err(PieceRefused::Malformed);
+       }
+       Some(PieceChunk {
