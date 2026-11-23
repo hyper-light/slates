@@ -8032,6 +8032,110 @@ mod tests {
     );
   }
 
+  /// Goal 93 item 2b(b) (main 01a20182's ruling: homes keep window → (payload identity, offset) for the windows a landed
+  /// pack carried, and a home's read of a window let go brings it back through that record; the record must survive the
+  /// home's restart, or its windows let go are lost to the region's readers). Do: on a store-backed daemon, hold a pack
+  /// of several windows for the region on its shard (`homes::keep_for_region`), land its bytes as a changeset's
+  /// `Payload`, let the landed pack go among this shard alone, its home, and publish the shard's image; stop the daemon
+  /// and start its successor over the same segment and store; on the shard, read the pack through `homes::read`.
+  /// Expect: before the restart every window let go and recorded; after it, each record taken back as it was, and the
+  /// read answering the pack whole, each window brought back by its record. Failing first: a restore that skipped the
+  /// records left the windows let go with nothing to bring them back by, the read answering none.
+  #[test]
+  fn t_goal93_a_homes_landed_records_survive_a_restart_and_bring_its_windows_back() {
+    use slates_anchor::AnchorSegment;
+    let store = crate::test_store::TestStore::start("landed-records");
+    let profile = test_profile();
+    let instance = format!("landed-records-{}", std::process::id());
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    config.vcs_disk = Some(store.handle());
+    let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
+      .unwrap()
+      .with_content(&super::content_name_of(&instance), config.content_bytes())
+      .unwrap();
+    let rendezvous = slates_ipc::HeldRendezvous::hold(&instance).unwrap();
+    let source = || {
+      let (handoff, len) = segment.handoff().unwrap();
+      super::SegmentSource::Handoff {
+        handoff,
+        len,
+        content: segment.content_handoff().unwrap(),
+        rendezvous: rendezvous.adoption(),
+      }
+    };
+    let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
+    first.bootstrap(true).unwrap();
+    let shard = first.shards.first().copied();
+    let (pack, bytes, before) = first
+      .observe(shard, |state| {
+        let window = state.store.content.chunk_bytes();
+        state.vcs_stores.content_made(window).unwrap();
+        let window = state
+          .vcs_stores
+          .content()
+          .map_or(1 << 18, slates_vcs::ContentStore::window);
+        let bytes: Vec<u8> = (0..3 * window + 41)
+          .map(|at| u8::try_from(at % 241).unwrap())
+          .collect();
+        let (pack, _) = crate::vcs_store::homes::keep_for_region(state, &bytes).unwrap();
+        let header = slates_store::log::Header {
+          tool: slates_store::log::Tool::Git,
+          repository: 4,
+          sequence: 0,
+          judged_over: 0,
+          grant: 0,
+          work: 0,
+          time_ns: slates_rt::futures::now_ns(),
+          sections: 0,
+        };
+        let parts = vec![(slates_store::log::SectionKind::Payload, bytes.clone())];
+        assert!(crate::test_store::land_blocking(
+          state.vcs_disk.clone().unwrap(),
+          header,
+          parts
+        ));
+        let here = state.shard;
+        crate::vcs_store::let_go_landed_pack_among(state, &pack, &[here]);
+        crate::verbs::publish_shard(state).unwrap();
+        let records = crate::vcs_store::homes::landed_here();
+        let gone = state.vcs_stores.content().map_or(0, |content| {
+          records
+            .iter()
+            .filter(|(window, _)| content.is_away(window))
+            .count()
+        });
+        (pack, bytes, (records, gone))
+      })
+      .unwrap();
+    first.stop();
+    let second = super::Daemon::start(&profile, config, source()).unwrap();
+    let shard = second.shards.first().copied();
+    let (sent, got) = std::sync::mpsc::channel();
+    second
+      .observe(shard, move |state| {
+        // The content store made by its first use, as a home's read makes it (`homes::read_here`).
+        let window = state.store.content.chunk_bytes();
+        state.vcs_stores.content_made(window).unwrap();
+        let restored = crate::vcs_store::homes::landed_here();
+        let here = state.shard;
+        let budget_ns = crate::fleet::live_budget().max_deadline_ns();
+        let task = slates_rt::futures::spawn(async move {
+          let read = crate::vcs_store::homes::read(here, &[here], pack, budget_ns).await;
+          let _ = sent.send((restored, read));
+        })
+        .unwrap();
+        slates_rt::futures::detach(task).unwrap();
+      })
+      .unwrap();
+    let (restored, read) = got.recv().expect("the read answered");
+    second.stop();
+    let (records, gone) = before;
+    assert!(records.len() > 1, "a record for each window: {records:?}");
+    assert_eq!(gone, records.len(), "every recorded window let go");
+    assert_eq!(restored, records, "each record taken back as it was");
+    assert!(read == Some(bytes), "the pack read whole after the restart");
+  }
+
   /// A-767 C5 (git onto the changeset store; main's order of 2026-11-20 ~21:20: "red first: a stock git push lands as
   /// one changeset, and a daemon restarted with kill -9 replays it"). Do: on a daemon over a retained anchor segment
   /// holding a store (the one shared test store), create a git repository and push the fixtures' `create` as stock git
