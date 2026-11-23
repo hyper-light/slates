@@ -8,7 +8,10 @@
 > its overlay borrow ends, and an open's descriptor closes at its last close. A later read reopens through the home and
 > proves the file the inode was made from (A-151). Witnessed large copies keep theirs (their witness reads through it).
 > Red on main: 500 reads left 506 handles open against 6; green: 6 (`reading_base_files_keeps_no_descriptor_after_the_reads`,
-> `an_open_base_file_keeps_its_descriptor_until_its_last_close`).
+> `an_open_base_file_keeps_its_descriptor_until_its_last_close`). The real-disk counterpart
+> (`crates/base/tests/host.rs`, `an_overlay_over_the_workspace_tree_costs_one_open_and_reads_the_disk`) kept the old
+> count, the read's descriptor held after its borrow (3 != 4 on Windows in CI run 45176536354 and on macOS); since
+> 2026-11-23 (w-win) it holds the rule on the disk: root, `vfs` and `src` alone.
 > **Closed (main, 2026-11-21, A-833): a recovery reopened every base directory the image recorded, in one step.** kiln's
 > daemon on adacachy recorded about 192,000, overran the 1 s liveness window and was killed a second into every restart.
 > Now a recovery reopens the root alone; each other directory is reacquired at its first use (`Overlay::reacquire`:
