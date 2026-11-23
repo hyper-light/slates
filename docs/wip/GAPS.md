@@ -5433,13 +5433,28 @@
 >   restart has had this gap since A-200). And `live_ship::join` (and its destroy half) copies the first waiter at the
 >   key's position, which may be another request's when two wait on one position, so a retry can be answered with that
 >   request's reply; found by reading, not yet by a test.
-> - **Open (w-chaos, 2026-11-23): a write held past the held-write bound, one cut-off run in ten on adacachy2.** In
->   `an_owner_cut_off_while_running_is_superseded_and_serves_nothing_stale` at load 69, a write sent 0.18 ms before the
->   relay isolated its owner was held 20.86 s, until the heal, and refused `StaleEpoch { current: 2 }` (the flow's bound
->   5.71 s), and no give-up was logged in the run: the write never waited where `live_ship::judge_held` judges it, so it
->   was held before its verb ran, or its owner's failover estimate rose past the partition. Every invariant held in that
->   run; the other nine passed, and CI's 19 judgements of the bound held. Owed: what held it, from a run that catches it
->   with the owner's status read throughout.
+> - **FIXED 2026-11-23 (w-fleet; found by w-chaos): a write held past the held-write bound, one cut-off run in ten on
+>   adacachy2.** In `an_owner_cut_off_while_running_is_superseded_and_serves_nothing_stale` at load 69, a write sent
+>   0.18 ms before the relay isolated its owner was held 20.86 s, until the heal, and refused `StaleEpoch { current: 2 }`
+>   (the flow's bound 5.71 s), and no give-up was logged in the run. Reproduced in 4 of 40 runs with the flow confined to
+>   two or four CPUs (`taskset`), the owner's status and its `judge_held` read throughout. The write did wait where
+>   `judge_held` judges it, and no coordinator step stalled. The bound it was judged by, the owner's own failover delay,
+>   grew faster than the hold: 14.2 s at 3 s held, 23.1 s at 5 s, 52.8 s at 10 s, 97.8 s at 20 s. Its detection term
+>   counted each period of the cut-off owner's detector, and with every probe unanswered each period lasted the probe's
+>   retransmission timer, which doubles at each expiry. The term rose from 2.4 s to 95.6 s in 19 s, in steps 1.2, 2.5,
+>   4.5 and 9.5 s apart. Now a period is timed only when its probe was answered, so a cut-off node keeps the term it
+>   measured before the cut (A-363's amendment of 2026-11-23). No invariant was at risk: every invariant held in each
+>   failing run, and the write was refused, never acknowledged. Tests:
+>   `a_member_cut_off_keeps_the_detection_term_it_measured_before_the_cut` (`crates/cluster/tests/member_plane.rs`: on
+>   main 14.7 ms before the cut, 124.2 s after 40 s of it; unchanged with the fix) and the cut-off flow under the same
+>   contention, 40 of 40 with the fix where main failed 4 of 40: the first held write given up at 3.8 to 4.7 s, the
+>   bound its owner judged by never past 5.6 s. Record:
+>   `docs/bugs/2026-11-23-a-cut-off-owners-failover-delay-grew-with-its-detectors-backed-off-probes.md`.
+>   - **Open (a sibling, measured 2026-11-23):** A-351's
+>     `a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again` timed out its wait for the
+>     successor's give-up in 2 of 6 runs on main under four-CPU contention, and once in 10 with this fix, in a loaded
+>     run of eight fleet tests. Its budget reads the largest failover delay across the nodes, and the round it waits on
+>     restarted 4 times in the failed run.
 > - **Owed (the integrator's):** live_chaos and live_fleet flows that keep a writer waiting past the failover SLO (10 s)
 >   now meet `DurabilityPending` where they waited; each flow's stops are a few liveness budgets, under it, but a flow
 >   that stops every candidate longer must treat the refusal as its write's outcome (not acknowledged, so never owed to

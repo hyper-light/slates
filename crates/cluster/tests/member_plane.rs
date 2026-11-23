@@ -108,6 +108,10 @@ struct Network {
   events: BTreeMap<u64, Vec<PlaneEvent>>,
   /// Members whose datagrams are dropped both ways: killed.
   killed: Vec<u64>,
+  /// Members whose datagrams are dropped both ways while they still run: cut off.
+  cut_off: Vec<u64>,
+  /// The datagrams the members cut off sent, every one dropped.
+  sent_while_cut_off: u64,
   now_ns: u64,
   /// The jitter generator's state (xorshift64), deterministic.
   jitter: u64,
@@ -164,6 +168,8 @@ impl Network {
       in_flight: Vec::new(),
       events: BTreeMap::new(),
       killed: Vec::new(),
+      cut_off: Vec::new(),
+      sent_while_cut_off: 0,
       now_ns: 1,
       jitter: 0x9E37_79B9_7F4A_7C15,
       condemned: Vec::new(),
@@ -183,12 +189,17 @@ impl Network {
   fn flush(&mut self, me: u64) {
     let now = self.now_ns;
     let killed = self.killed.contains(&me);
+    let cut_off = self.cut_off.contains(&me);
     let mut sealed = Vec::new();
+    let mut dropped = 0u64;
     self.members.get_mut(&me).unwrap().flush(|to, bytes| {
-      if !killed {
+      if cut_off {
+        dropped += 1;
+      } else if !killed {
         sealed.push((to.0, bytes.to_vec()));
       }
     });
+    self.sent_while_cut_off += dropped;
     for (to, bytes) in sealed {
       let crossing = if self.far.contains(&me) != self.far.contains(&to) {
         FAR_LATENCY_NS
@@ -231,7 +242,7 @@ impl Network {
         }
       });
       for (to, mut bytes) in landed {
-        if self.killed.contains(&to) {
+        if self.killed.contains(&to) || self.cut_off.contains(&to) {
           continue;
         }
         let events = self.events.entry(to).or_default();
@@ -485,6 +496,69 @@ fn a_killed_member_is_condemned_by_every_survivor_and_no_live_one_is() {
   assert!(
     own > 0,
     "a survivor's own probes condemned the killed member"
+  );
+}
+
+/// Shape: the periods member 1's detector times before it is cut off: a measured detection term, past its first
+/// samples.
+const MEASURED_PERIODS: u64 = 32;
+/// Shape: the simulated time member 1 stays cut off, nanoseconds: long enough for its probes' timer, doubled at each
+/// expiry (RFC 6298 §5.5), to pass 16 s.
+const CUT_OFF_OBSERVED_NS: u64 = 40_000_000_000;
+
+/// A-363 (the failover estimate's detection term; found by `crates/cli/tests/live_chaos.rs`'s cut-off owner on
+/// adacachy2, 2026-11-23). Do: three members; run until member 1's detector has timed its periods; read its detection
+/// term; cut member 1 off both ways while it runs (nothing it sends or is sent arrives), for 40 s. Expect: member 1 sent
+/// probes throughout and its own probes suspected both peers, whose last answers came before the cut (non-vacuous);
+/// and its detection term is the one it measured before the cut. A period whose probe went unanswered ends at the
+/// probe's timer, which doubles at each expiry, so its length is the timer's setting, not the detector's pace. Folded
+/// as a period, it made the term grow with every doubling: on adacachy2 a cut-off owner's term rose from 2.4 s before the
+/// cut to 95.6 s 19 s into it, and the bound of its held write with it, so the write was held until the heal.
+#[test]
+fn a_member_cut_off_keeps_the_detection_term_it_measured_before_the_cut() {
+  let mut fleet = Network::new();
+  let measured = fleet.run_until(HORIZON_NS, |fleet| {
+    fleet.members[&1]
+      .detection()
+      .is_some_and(|term| term.samples >= MEASURED_PERIODS)
+  });
+  assert!(measured, "member 1's detector timed its periods");
+  let before = fleet.members[&1].detection().unwrap();
+  let cut_at = fleet.now_ns;
+  fleet.cut_off.push(1);
+  fleet.run_until(cut_at + CUT_OFF_OBSERVED_NS, |_| false);
+  let after = fleet.members[&1].detection().unwrap();
+  let reports: Vec<_> = [2, 3]
+    .iter()
+    .map(|peer| {
+      fleet.members[&1]
+        .detector()
+        .report(hyper_swim::HostId(*peer))
+        .unwrap()
+    })
+    .collect();
+  println!(
+    "cut off: detection before {before:?}, after {after:?}; {} datagrams sent while cut off; suspicions {:?}",
+    fleet.sent_while_cut_off,
+    reports
+      .iter()
+      .map(|report| report.suspicions)
+      .collect::<Vec<_>>()
+  );
+  assert!(
+    fleet.sent_while_cut_off > 0,
+    "member 1 probed while cut off"
+  );
+  assert!(
+    reports.iter().all(|report| report.suspicions > 0
+      && report
+        .last_answer_ns
+        .is_some_and(|answered| answered <= cut_at)),
+    "member 1's own probes suspected both peers, last answered before the cut: {reports:?}"
+  );
+  assert_eq!(
+    after, before,
+    "the detection term member 1 measured before the cut, kept while no probe of its is answered"
   );
 }
 
