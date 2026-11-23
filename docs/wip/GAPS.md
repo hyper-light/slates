@@ -109,11 +109,18 @@
 > Linux RSS round reading them.
 > **A-870 (w-shared; main 01a20182's rulings of 2026-11-22 ~22:10 and ~22:30): a shard image's content-store families
 > published and restored over turns.** Piece 1 BUILT: the families paged (`crate::image_pages`): 3,000 windows let go
-> and 3,000 landed records rode 6,000 pieces, now 17 (534,085 bytes at a 43,912-byte page), restored whole. OWED: piece 2
-> (pages encoded ahead a slice a turn, a chunk freed under an unpublished page released at that page's commit, an
-> oracle of let-go, publish and crash; first, whether windows let go and records code as a range per object), piece 3
-> (pages restored a page a turn, reads waiting), and a 100k-file volume's longest image step measured against the step
-> budget (the volumes' images paged too only if past it).
+> and 3,000 landed records rode 6,000 pieces, now 17 (534,085 bytes at a 43,912-byte page), restored whole. Piece 2
+> BUILT (main's ruling of 2026-11-23, options (a)-(d)): the pages encoded a slice a turn (`image_pages::Encoder`), a
+> publication carrying them only when none is dirty, else the committed cut again with every deferred block kept
+> (`capture_deferred` whole) and the publication owed; past its bound elective let-gos pause, woken by the publication
+> that carries the cut; red 1,068,980 bytes encoded in one publication's step at a 4,096-byte page, now at most three
+> pages; held by an oracle of generated let-go, put, publish and crash histories, one continuous (A-870 "Evidence (piece
+> 2)"). OPEN: the lag bound holds only while the encoder outpaces the changes that never pause (puts, bring-backs);
+> a put stream that outpaces a turn a yield is unmeasured until arena-12 reads it: `vcs_store.image.paused_encoded_bytes`
+> against `paused_imposed_bytes` over `paused_turns`, and `longest_lag_turns` (main's addition of 2026-11-23). Counters
+> for main's rounds: `vcs_store.image.*` (skipped, longest lag, pauses, the longest turn's bytes). Ranges per object rejected on arena-5's numbers (main agreed). OWED:
+> piece 3 (pages restored a page a turn, reads waiting), and a 100k-file volume's longest image step measured against
+> the step budget (the volumes' images paged too only if past it).
 > **HELD (main 01a20182, 2026-11-22 15:40):** no landed pack is let go or owed from a push's commit (`vcs_store::commit`),
 > since r52 (the big Studio, main 6f6e87d82) found readers that do not bring a let-go window back: once git/git's push
 > ended and its pack was let go, every fetch was refused `Store(Unreadable)` (the advertisement's tag peel through
@@ -858,8 +865,9 @@
 >   `a_lookup_of_a_branch_name_reads_its_heads_not_the_history` and `branchmap_over_a_long_line_reads_its_heads_not_the_history`
 >   (a 170-changeset line: red 512 and 511 reads, now at most 8; `BranchHeads::answered` the non-vacuity count). A
 >   view that leaves a changeset out (secret, hidden) answers from them too (BUILT 2026-11-23, w-hg, evolution piece
->   2): `BranchHeads` keeps each append's endings in order (`Endings`, sealed 4,096-ending `Arc` chunks a fork shares,
->   8 bytes an ending, about one a changeset), so `BranchHeads::served` reads the heads back to the view's first
+>   2): `BranchHeads` keeps each append's endings in order (`Endings`: each full chunk of 512 sealed into a row of
+>   the index, which a fork shares by the tables' identity as it shares every row, and the open chunk a fork copies; 8
+>   bytes an ending, about one a changeset; once `Arc` chunks, banned by R2, replaced 2026-11-23), so `BranchHeads::served` reads the heads back to the view's first
 >   changeset that is not public (today's below it, and those an append from it on ended) and appends the served tail
 >   alone: the tail's endings and appends, no walk of the history. Held by
 >   `a_views_kept_branch_heads_are_the_walks_whatever_it_leaves_out` (generated histories on three branches, every
@@ -1086,9 +1094,11 @@
 > lies there, checked against its name first, its delta reused where its base precedes it (`t_a859_…`: 20,916 bytes
 > against the pushed 17,299, where 89,439 went before); a stored entry reused whenever one exists, a delta's wanted
 > base placed first (3fa634049). Part A BUILT: a fetched byte priced at its link, learned per shard from the HTTP
-> edge's writes that waited for the peer, cold at deflate's measured break-even at git's level 6 (§4.11). Owed: the
-> SSH edge's writes heard (SSH fetches price cold), a price per client, not per shard; main's git/git whole round and
-> `fsck --strict`.
+> edge's writes that waited for the peer, cold at deflate's measured break-even at git's level 6 (§4.11). The SSH
+> edge's writes heard too (2026-11-23, w-git; the forward through svn.rs's `EitherCommand` agreed with w-svn): each socket write of a connection, its time and whether it found the
+> socket full, told the command it carries (`site::Command::paced`), and a git fetch's answer learns from them as the
+> HTTP edge's does (`a859_an_ssh_commands_writes_to_a_client_that_reads_late_are_heard_with_their_waits`: none heard
+> before). Owed: a price per client, not per shard; main's git/git whole round and `fsck --strict`.
 > A-864's readers BUILT (2026-11-22, w-git; main's r52): every git read before a fetch's pack (the advertisement's
 > and ls-refs' peel, the negotiation, the cuts) holds a refusal that met a let-go window and is made again once it is
 > brought back; a fetch lets the windows it brought back go behind its cursor (piece 3); bring-backs bounded. The landed

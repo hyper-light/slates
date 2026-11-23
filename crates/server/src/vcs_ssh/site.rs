@@ -224,6 +224,10 @@ pub(crate) trait Command {
   fn output(&self) -> (&[u8], &[u8]);
   /// The channel took `stderr` bytes of its standard error and `stdout` of its standard output.
   fn sent(&mut self, stderr: usize, stdout: usize);
+  /// One write of the connection to its client's socket while this command runs (A-859 part A on SSH): its bytes, its
+  /// time to the client taking its last byte, and whether it found the socket full and waited. A git fetch's answer
+  /// learns its link's price from it (`crate::vcs_store::upload::Pacing`); every other command hears nothing.
+  fn paced(&mut self, _sent: crate::vcs_store::upload::Sent) {}
 }
 
 /// How a site answers an `exec`.
@@ -532,6 +536,14 @@ impl<L: StoreLender, H: HgStores, S: ShardLender> Command for ToolCommand<L, H, 
       ToolCommand::Upload(command) => command.sent(stderr, stdout),
       ToolCommand::Receive(command) => command.sent(stderr, stdout),
       ToolCommand::Mercurial(command) => command.sent(stderr, stdout),
+    }
+  }
+
+  fn paced(&mut self, sent: crate::vcs_store::upload::Sent) {
+    match self {
+      ToolCommand::Upload(command) => command.paced(sent),
+      ToolCommand::Receive(command) => command.paced(sent),
+      ToolCommand::Mercurial(command) => command.paced(sent),
     }
   }
 }

@@ -949,6 +949,147 @@ impl Command for SaysWhere {
   }
 }
 
+/// Shape: what [`Streams`] writes, within the test client's channel window ([`CLIENT_WINDOW`], never adjusted) and past
+/// what a loopback socket's buffers take at once, so a client that reads late leaves the edge's writes waiting.
+const STREAMED: usize = (1 << 20) - (64 << 10);
+
+/// Each write [`Streams`] heard of, as the connection reported it (`Command::paced`).
+static PACED: std::sync::Mutex<Vec<crate::vcs_store::upload::Sent>> =
+  std::sync::Mutex::new(Vec::new());
+
+/// A command that writes [`STREAMED`] bytes and exits 0, keeping every write of the connection it hears of in [`PACED`].
+#[derive(Default)]
+struct Streams {
+  /// What it wrote and the channel has not taken.
+  out: Vec<u8>,
+  /// Whether it wrote.
+  wrote: bool,
+}
+
+impl Command for Streams {
+  fn input(&mut self, _run: &[u8]) -> Result<(), Refused> {
+    Ok(())
+  }
+
+  fn input_end(&mut self) {}
+
+  async fn step(&mut self, _gone: ClientGone<'_>) -> Result<Stepped, Refused> {
+    if !self.wrote {
+      self.wrote = true;
+      self.out = (0..STREAMED).map(|at| (at % 251) as u8).collect();
+    }
+    Ok(Stepped {
+      consumed: 0,
+      next: Next::Exited(0),
+    })
+  }
+
+  fn output(&self) -> (&[u8], &[u8]) {
+    (&[], &self.out)
+  }
+
+  fn sent(&mut self, _stderr: usize, stdout: usize) {
+    self.out.drain(..stdout.min(self.out.len()));
+  }
+
+  fn paced(&mut self, sent: crate::vcs_store::upload::Sent) {
+    PACED.lock().expect("the log").push(sent);
+  }
+}
+
+/// [`Site`] running git's upload service as [`Streams`].
+struct StreamsSite;
+
+impl SshSite for StreamsSite {
+  type Keys = Keys;
+  type Command = Streams;
+
+  fn keys(&mut self) -> Keys {
+    Keys
+  }
+
+  async fn lookup(&mut self, user: &[u8], key: &UserKey, key_blob: &[u8]) -> Holding<Principal> {
+    Keys.holding(user, key, key_blob)
+  }
+
+  fn locate(&self, _command: &Asked) -> Located {
+    Located::Here
+  }
+
+  fn dispatch(
+    &mut self,
+    _principal: &Principal,
+    _command: &Asked,
+    _git_protocol: Option<&[u8]>,
+  ) -> Dispatched<Streams> {
+    Dispatched::Run(Streams::default())
+  }
+}
+
+/// A-859 part A on SSH (GAPS: "the SSH edge's writes heard (SSH fetches price cold)"; main 01a20182's ruling of
+/// 2026-11-22 06:32: a link's price learned from the time the edge's writes waited for the peer, from the first that
+/// found the socket full). Do: run a command writing [`STREAMED`] bytes for a client that reads a tenth of a liveness
+/// window late, then reads it all. Expect: the client reads every byte; the command hears the connection's writes while
+/// it runs (`Command::paced`), their bytes at least what it wrote; some found the socket full and waited; and what a
+/// fetch's pacing learns from them, the bytes from that first wait on, past 256 KiB. Red before: nothing heard.
+#[test]
+fn a859_an_ssh_commands_writes_to_a_client_that_reads_late_are_heard_with_their_waits() {
+  PACED.lock().expect("the log").clear();
+  let (transcript, _) = served_by(
+    ONE_SEAT,
+    || StreamsSite,
+    |address| {
+      let mut peer = Peer::connect(address)?;
+      (query(&mut peer, &HELD_SEED)? == 60).then_some(())?;
+      (sign(&mut peer, &HELD_SEED)? == 52).then_some(())?;
+      exec(&mut peer, b"git-upload-pack '/r.git'").then_some(())?;
+      // The client reads late on purpose, so the edge's writes meet a full socket.
+      pause(MOMENT_NS);
+      Some(transcript(&mut peer))
+    },
+  );
+  let transcript = transcript.expect("the session");
+  let paced = PACED.lock().expect("the log").clone();
+  let written: u64 = paced.iter().map(|sent| sent.bytes).sum();
+  let mut pacing = crate::vcs_store::upload::Pacing::default();
+  let learned: u64 = paced
+    .iter()
+    .filter_map(|sent| pacing.sent(*sent))
+    .map(|(_, bytes)| bytes)
+    .sum();
+  assert_eq!(transcript.out.len(), STREAMED, "the output read whole");
+  assert!(
+    written >= STREAMED as u64,
+    "{written} bytes heard written of {STREAMED}"
+  );
+  assert!(
+    paced.iter().any(|sent| sent.waited),
+    "a write waited for the client: {} writes heard",
+    paced.len()
+  );
+  assert!(learned > 256 << 10, "learned {learned} bytes");
+}
+
+/// A-859 part A on SSH, through the daemon's own command (w-svn's agreement of 2026-11-23): the daemon's SSH services wrap
+/// git's commands in the Subversion tunnel's `svn::EitherCommand`. Do: wrap a [`Streams`] as another service's command
+/// and tell the wrapper of a write (`Command::paced`). Expect: the command inside hears that write. Red before: the
+/// wrapper kept the trait's no-op default and the write was lost, so the daemon's git fetches over SSH priced cold.
+#[test]
+fn a859_a_write_heard_by_the_svn_sites_command_reaches_the_git_command_it_wraps() {
+  let sent = crate::vcs_store::upload::Sent {
+    bytes: 7_771,
+    ns: 31_337,
+    waited: true,
+  };
+  let mut wrapped: super::svn::EitherCommand<Streams, Streams> =
+    super::svn::EitherCommand::Other(Streams::default());
+  wrapped.paced(sent);
+  assert!(
+    PACED.lock().expect("the log").contains(&sent),
+    "the write reached the command the wrapper carries"
+  );
+}
+
 /// The production site over the record's keys and the repositories' partitions, its services [`StartsEvery`].
 fn production_site() -> ToolSite<RecordKeys, ShardRepositories, StartsEvery> {
   ToolSite::new(RecordKeys, ShardRepositories, StartsEvery)
