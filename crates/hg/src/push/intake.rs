@@ -349,6 +349,10 @@ impl Intake {
 struct Taker {
   /// The fork: the repository's revisions, and the push's as they are kept.
   fork: HgIndex,
+  /// The buffer the next revision's text is rebuilt into (goal 93, no allocation by design): a changeset's or a
+  /// manifest's text kept before the last, which no later delta rests on once another is kept, so a manifest's rebuild
+  /// reuses it and allocates nothing past the first.
+  spare: Vec<u8>,
   /// The unit next.
   stage: Stage,
   /// The nodes the push brought in the log being taken, to tell a revision brought earlier from one held.
@@ -815,6 +819,7 @@ impl Intake {
         awaited: BTreeSet::new(),
         bringing,
         last: None,
+        spare: Vec::new(),
         last_identity: None,
         logged: false,
         path: None,
@@ -1127,6 +1132,7 @@ impl Taker {
     }
     self.check_known(log, revision, store)?;
     let mut room = *admission;
+    let into = core::mem::take(&mut self.spare);
     let base_rebuilt = given.is_none() && revision.base != NULL_NODE;
     let base_text = match given {
       Some(text) => Some(Cow::Owned(text)),
@@ -1139,7 +1145,7 @@ impl Taker {
       (Some(text), _) => Some(*blake3::hash(text).as_bytes()),
       (None, _) => None,
     };
-    let text = rebuilt(base_text, revision, log, &mut room)?;
+    let text = rebuilt(base_text, revision, log, (&mut room, into))?;
     if base_rebuilt {
       self.intaken.rebuilt = self.intaken.rebuilt.saturating_add(1);
     }
@@ -1407,9 +1413,13 @@ impl Taker {
       None => self.intaken.texts.push(kept),
     }
     self.last_identity = Some((revision.node, identity));
-    // The text kept before this one may be a later delta's base: the push's cache keeps it ((b2)).
-    if let (Log::File(_), Some((node, text))) = (log, self.last.take()) {
-      self.cache.put(node, text);
+    // The text kept before this one may be a later delta's base: the push's cache keeps a file's ((b2)). A changeset's or
+    // a manifest's is no later delta's base once this one is kept (each rests on the one before), so its buffer is the
+    // next rebuild's.
+    match (log, self.last.take()) {
+      (Log::File(_), Some((node, text))) => self.cache.put(node, text),
+      (_, Some((_, text))) => self.spare = text,
+      (_, None) => {}
     }
     self.last = Some((revision.node, arrived.text));
     Ok(())
@@ -1928,7 +1938,7 @@ fn rebuilt(
   base: Option<Cow<'_, [u8]>>,
   revision: &Revision<'_>,
   log: Log<'_>,
-  room: &mut Admission,
+  (room, mut into): (&mut Admission, Vec<u8>),
 ) -> Result<Vec<u8>, Unverified> {
   let base = base.ok_or_else(|| Unverified::UnknownDeltaBase {
     log: log_of(log),
@@ -1936,11 +1946,13 @@ fn rebuilt(
     base: revision.base,
   })?;
   room.charge(to_u64(base.len()))?;
-  delta::apply(&base, revision.data, room).map_err(|fault| Unverified::Delta {
+  // Into `into`'s buffer, its capacity kept: `apply_into` clears it and reserves only what it lacks.
+  delta::apply_into(&base, revision.data, &mut into, room).map_err(|fault| Unverified::Delta {
     log: log_of(log),
     node: revision.node,
     fault,
-  })
+  })?;
+  Ok(into)
 }
 
 /// The entries of manifest `text` its delta wrote (main's ruling of 2026-11-21 05:12 (a)): the whole lines each hunk's
