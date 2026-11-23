@@ -128,14 +128,22 @@
 > a delta's check, a search's read) turned a let-go window into `Unreadable` mid-pack. Each now stops the turn at the
 > window and retakes its unit (`Upload::read_or_stop`). Reds over stock git's offset-delta pack, every window let go:
 > `r165_an_entry_made_whole_from_a_let_go_window_stops_and_the_answer_is_byte_identical` (`Unreadable` at 0 stops
-> before) and `r165_an_object_encoded_afresh_…` (after 5). Owed: the encoding's object read (`Reading::read_window`)
-> refuses the same way where its header reads have not brought the window back first (no red yet); main's round, the
-> guard still in, before a re-lift. The let-go a push's end or an idle repository owes is no longer one walk over the
-> whole pack within that step (main 01a20182, 2026-11-23: git/git's ~600 MB in `ReceivePack`'s drop): it is queued
-> (`vcs_store::LettingGo`) and let go by a task of the shard's a slice a turn, `LET_GO_WINDOWS` windows at most within
-> the step quantum, a home's share on its own shard alike, counted `vcs_store.landed.let_go_slices`
-> (`t_goal93_a_large_landed_packs_let_go_is_sliced_a_window_set_a_turn_never_one_walk`: 131 windows in 132 slices,
-> none within the owing step; before, all 34 MB in it).
+> before) and `r165_an_object_encoded_afresh_…` (after 5). Item 2 (2026-11-23, main's order, reds built directly by
+> test switches: `upload::REUSE_OFF`, `upload::KEPT_OFF`, `encoding::NO_REUSE`, and every window not brought back let go
+> before each one-unit turn): the stream's delta check (`DeltaReuse::Stopped`), its raw-entry and base reads before it
+> (were `reuse_unread`, the object then encoded afresh), and a search's reads stop too; the encoding's object read
+> (`Reading::read_window`) and its reuse check's reads stop and keep their unit. Reds: `r165_a_streams_entry_check_…`
+> and `r165_a_streams_encode_and_search_…` (`Unreadable` at 0 stops before), `r165_an_encodings_object_read_…`
+> (`Unreadable` before; with the reuse check falling back, its fragments 1,274 bytes against 1,302 resident, now the
+> same). Owed: main's round, the guard still in, before a re-lift. The let-go a push's end or an idle repository owes is
+> no longer one walk over the whole pack within that step (main 01a20182, 2026-11-23: git/git's ~600 MB in
+> `ReceivePack`'s drop): it is queued (`vcs_store::LettingGo`) and let go by a task of the shard's a slice a turn, the
+> step quantum alone ending a slice (a window taken only where it would end within it, at least one), a home's share on
+> its own shard alike, counted `vcs_store.landed.let_go_slices` and `let_go_past_quantum`
+> (`t_goal93_a_large_landed_packs_let_go_is_sliced_within_the_step_quantum_never_one_walk`: 131 windows in 132 slices,
+> none within the owing step, each slice past the quantum one window, counted; before, all 34 MB in the step). On a
+> debug audit shard one window's let-go (about 25 µs) outlasts the 8 µs quantum, so every slice there is one window
+> past it.
 > **LIFTED (w-git, 2026-11-22, on main 01a20182's word; put back above):** `vcs_store::commit` lets a landed push's pack go again, or
 > owes it to the push's end or the repository's idle give-back, with each gate on main: w-git's fetch-side readers
 > (A-864) and a push's readers, (b) its thin bases through `IndexedObjects::away` and (c) its policy and signature reads;
