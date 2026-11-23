@@ -258,6 +258,10 @@
 >   tail with the neighbours' share level (x86 p999 3.2-6.1 -> ~1.9 ms). But a wakeup's p99 pins at one tick (kick ->
 >   run 998-999 µs, the client's wake 983-989 µs under `PREEMPT_LAZY` at `HZ=1000`), so a loaded edit and merge floors
 >   at about 1.3-2.0 ms p99. It also cost x86's quiet p50 30-40%, so it is rejected too.
+>   Naps on a thread's own timer (arms G+E and H, main's; BENCHMARKS "84a on Linux: naps on a thread's own timer"):
+>   rejected. A napping client alone (H) put loaded accept p99 over 1 ms in 5 of 5 arm64 rounds against main's 2, and
+>   CI's runners have no RealtimeKit to grant the real-time class (run 45115263387: no package, unit or bus name;
+>   `RLIMIT_RTPRIO` 0; ubuntu-latest is now Ubuntu 26.04.1 on kernel 7.0.0-1020-azure).
 >   **Open (main to Ada):** 84a's 1 ms loaded bar on Linux. In the fair class it is below the kernel's 1 ms tick, and
 >   in the real-time class the client's own time-share code waits whole slices. The measured floor is about one tick a
 >   hop, 1.3-2.0 ms p99.
