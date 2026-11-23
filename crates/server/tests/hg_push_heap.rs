@@ -191,7 +191,7 @@ fn row(name: &'static str, command: &mut Command) -> Row {
     })
     .map(|(_, bytes)| *bytes)
     .sum();
-  sites.sort_by(|left, right| right.1.cmp(&left.1));
+  sites.sort_by_key(|(_, bytes)| std::cmp::Reverse(*bytes));
   sites.truncate(LISTED);
   Row {
     name,
