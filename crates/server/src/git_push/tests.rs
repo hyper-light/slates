@@ -1017,9 +1017,13 @@ const PACED_TURNS: u64 = 8;
 /// versions 3,024,021 turns, each paying the shard's lend, its settle and a yield). Do: push a line of [`PACED_HISTORY`]
 /// commits as one create, then turn the repository's derivation until it is idle, nobody else waiting on the shard.
 /// Expect: the one version derived, in at most [`PACED_TURNS`] turns besides one per step's ceiling of the derivation's
-/// wall time: a derivation runs while nobody waits to the step's ceiling (A-783), never a few units a turn, so its turns
-/// follow its time, whatever the machine's load (a loaded host's ceiling-long turns do less each; main's ruling of
-/// 2026-11-21 08:20, the rule stated rather than the machine's speed). Red before the change: hundreds of turns.
+/// wall time and one per wait of another task's the shard found meanwhile (`waiting_found`, the shard's own count of
+/// what a paced step asks): a derivation runs while nobody waits to the step's ceiling (A-783), never a few units a
+/// turn, so its turns follow its time and the shard's other work, whatever the machine's load (a loaded host's
+/// ceiling-long turns do less each; main's ruling of 2026-11-21 08:20, the rule stated rather than the machine's speed).
+/// Red before the change: hundreds of turns. Until 2026-11-23 the shard's own waits were left to a slack of eight: a
+/// derivation slowed past a second (ThreadSanitizer's lane) met its shard's timers and beat more often than that, and
+/// failed two runs of three there.
 #[test]
 fn t_a614a_a_long_historys_derivation_takes_turns_by_the_shards_pace_not_its_objects() {
   use crate::vcs_store::git_derive::{DERIVED, TURNS, derive_for_read};
@@ -1047,6 +1051,9 @@ fn t_a614a_a_long_historys_derivation_takes_turns_by_the_shards_pace_not_its_obj
   let ceiling_ns = crate::daemon::observe_first(&daemon, |state| {
     slates_rt::futures::step_ceiling_ns().unwrap_or_else(|| state.config.step_quantum_ns())
   });
+  let waits_found =
+    || slates_rt::registry::with_current(|context| context.counters().waiting_found).unwrap_or(0);
+  let found_before = crate::daemon::observe_first(&daemon, move |_| waits_found());
   let began = std::time::Instant::now();
   crate::daemon::observe_first(&daemon, move |_| {
     let task = slates_rt::futures::spawn(async move {
@@ -1058,6 +1065,7 @@ fn t_a614a_a_long_historys_derivation_takes_turns_by_the_shards_pace_not_its_obj
   });
   finished.recv().unwrap();
   let took_ns = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+  let found = crate::daemon::observe_first(&daemon, move |_| waits_found()) - found_before;
   let after = crate::daemon::observe_first(&daemon, move |state| {
     (count(state, TURNS), count(state, DERIVED))
   });
@@ -1066,8 +1074,8 @@ fn t_a614a_a_long_historys_derivation_takes_turns_by_the_shards_pace_not_its_obj
   assert_eq!(derived, 1);
   let filled = took_ns.div_ceil(ceiling_ns.max(1));
   assert!(
-    turns <= PACED_TURNS + filled,
-    "{turns} turns over {took_ns} ns at a {ceiling_ns} ns ceiling"
+    turns <= PACED_TURNS + filled + found,
+    "{turns} turns over {took_ns} ns at a {ceiling_ns} ns ceiling, the shard finding others waiting {found} times"
   );
 }
 
