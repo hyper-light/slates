@@ -63,6 +63,15 @@ pub(crate) const DONE: &str = "vcs_store.svn_import.done";
 pub(crate) const REFUSED: &str = "vcs_store.svn_import.refused";
 /// Counter: an import given back before its end: its repository freed. Format: a counter name.
 pub(crate) const ABANDONED: &str = "vcs_store.svn_import.abandoned";
+/// Counter: the nanoseconds an import spent in its turns ([`turn`]), the shard's clock: its own work, against the waits
+/// below (goal 93: which side a slower import's time went to). Format: a counter name.
+pub(crate) const TURN_NS: &str = "vcs_store.svn_import.turn_ns";
+/// Counter: the nanoseconds an import waited for what its turns handed over to land ([`land_owed`]), the node's
+/// changeset store's flush among it. Format: a counter name.
+pub(crate) const LAND_WAIT_NS: &str = "vcs_store.svn_import.land_wait_ns";
+/// Counter: the nanoseconds an import waited to be polled again after yielding between its turns ([`run`]): the shard's
+/// other work. Format: a counter name.
+pub(crate) const YIELD_WAIT_NS: &str = "vcs_store.svn_import.yield_wait_ns";
 
 /// A repository's import under way, kept in the shard's map between its turns (the module doc).
 pub(crate) struct Importing {
@@ -780,14 +789,30 @@ pub(crate) fn abandon(state: &mut ShardState, id: RepositoryId) {
 /// ended otherwise, or `None` when no import of `id` is under way or the shard's state is gone.
 pub(crate) async fn run(id: RepositoryId) -> Option<Result<Loaded, LoadFailed>> {
   loop {
+    let yielded = slates_rt::futures::now_ns();
     slates_rt::futures::yield_now().await;
-    if let Err(failed) = land_owed(id).await? {
+    let landing = slates_rt::futures::now_ns();
+    let landed = land_owed(id).await?;
+    let ended = slates_rt::futures::now_ns();
+    crate::state::with_state(|state| {
+      state.count(YIELD_WAIT_NS, landing.saturating_sub(yielded));
+      state.count(LAND_WAIT_NS, ended.saturating_sub(landing));
+    })?;
+    if let Err(failed) = landed {
       return Some(Err(failed));
     }
     if let Err(failed) = supply_owed_base(id).await? {
       return Some(Err(failed));
     }
-    let turned = crate::state::with_state(|state| turn(state, id))??;
+    let turned = crate::state::with_state(|state| {
+      let turning = slates_rt::futures::now_ns();
+      let turned = turn(state, id);
+      state.count(
+        TURN_NS,
+        slates_rt::futures::now_ns().saturating_sub(turning),
+      );
+      turned
+    })??;
     match turned {
       Ok(Turned::More) => {}
       Ok(Turned::Done(loaded)) => return Some(Ok(loaded)),

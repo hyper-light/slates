@@ -157,6 +157,16 @@
 > and every clone (stock_git_verbs 1 of 8). Lifted when w-git's fetch-side readers (A-855's held answer, brought back and
 > made again) and the push decision's reads bring a let-go window back, with w-shared's red: annotated tags pushed, the
 > push ended, idle, then ls-remote and a clone byte-identical to stock.
+> **LIFT WITHDRAWN (w-git, 2026-11-23, main 01a20182's order after r18):** `vcs_store::LANDED_LET_GO` false again, every
+> landed let-go held (a commit's, a recovery's and a rebuild's). The lift surfaced a reader on main four times: the fetch
+> stream's choice and object reads (fixed, 0c3f42cea, 7f7793c58), the SSH edge's held answer (fixed, 56fbf0381), the
+> push's tag peel (`receive::works::tree_of` at works.rs:715: a tag of a let-go tag declined "an object it names cannot
+> be read", r18's verbs push-tag-of-a-tag and delete-tags), and a shallow fetch over HTTP refused
+> `Pack(Store(Unreadable { id: sha1:2a3c9b98… }))` (r18's verbs shallow), its path not yet found; and r18's HTTP mirror
+> clone stalled 120 s with 0 pack bytes, between 4c8b391ec and 09797375e (main's bisect cleared c20133168). Owed behind
+> the guard, red first: the tag peel bringing its window back; the shallow fetch's path; a sweep of every read of a
+> stored object in receive and upload for the same refusal; the stall. Re-lifting waits on git/git whole and verbs both
+> passing with it on. The re-lift's reds stay, ignored while it is withdrawn.
 > **r227's SSH regression FIXED (w-git, 2026-11-23):** with the lift, stock git's fetch over SSH ended mid-answer
 > (`unexpected disconnect while reading sideband packet`; on a made history, the shallow clone right after its
 > `packfile` header): an answer whose pack's choice read a let-go window is held for it (`Answer::held_away`) with its
@@ -969,9 +979,14 @@
 >   on (`Frame::based_later`, one bit a revision told when the framing is made), and every text the intake lets go is
 >   a later rebuild's buffer (`Spares`, at most four and the cache's bound). `push_heap`'s
 >   `a_pushs_churn_per_changeset_is_its_file_alone`, red at 28,855 B an edit of a 16 KiB file (1.76 copies), 177,497 B
->   of a 160 KiB one (1.08) with the buffer reused alone; now 12,047 B and 13,674 B (0.74, 0.08), no copy. Owed:
->   `HgIndex::revision_text`'s buffers and `object_bytes`, then `Taker::file_base`; the 57k push's reading
->   (`hg_push_lifetimes`, w-perf's) after them.
+>   of a 160 KiB one (1.08) with the buffer reused alone; now 12,047 B and 13,674 B (0.74, 0.08), no copy.
+>   `HgIndex::revision_text`'s rebuilds cut BUILT (2026-11-23, w-hg; C1 cut 2): each read rebuilt a chain into a text, a
+>   next text and a delta of its own, the whole it began from copied out by `object_bytes` grown from empty (w-perf:
+>   2.57 GB freed within a second under `push::held`, 1.24 GB in the band, `object_bytes` 0.62 GB). The index keeps its
+>   own next text and delta (`TextBuffers`), and a whole is read at its length (`object_text`), so a read allocates the
+>   text it hands out alone. `push_heap`'s `a_views_manifest_read_is_one_text`: red 194,487 B a read of a 91,200 B
+>   manifest (2.13 copies), now 105,500 B (1.16). Owed: `Taker::file_base`; the 57k push's reading (`hg_push_lifetimes`,
+>   w-perf's) after it.
 >   Its bound from the work BUILT (main's ruling, 2026-11-23): the chain no longer needs its texts held, so the cache holds
 >   the distinct texts its last `waiting` reads lent (one a waiting request, the owner's room) and a chunk's room
 >   (`TextCache::for_reads`), the least lately read out first; a text past it is lent from the buffer it was made into.
@@ -4402,6 +4417,17 @@
 >   (r21).
 > - `an_svnsync_measured` over HTTP (r254): 2,000 revisions in 301.8 s (150.9 ms a revision), mirror at r2000, daemon
 >   RSS 724 MB before and 994 MB at peak. The same round over svn:// took 510.4 s against P7's 270.7 s, sent to w-svn.
+> **OPEN, svnsync over svn:// at 255.2 ms a revision against 135 ms (w-svnperf for main 01a20182, 2026-11-23; goal
+> 93):** main's round of `an_svnsync_measured` on the big Studio (main 1d06ab306, release, git-2000, stock 1.15.0):
+> svn:// import 5.9 s, then svnsync 510.4 s, daemon RSS 854 MB before and 1,032 MB at peak; HTTP import 111.1 s, then
+> svnsync 301.8 s (150.9 ms a revision). The 2026-11-21 figure above was 270.7 s. To find where the time went, the
+> test now prints every counter the daemon's shards report after the import, and what the sync added to each, whole and
+> a revision. The daemon counts an svn:// conversation's answers and their nanoseconds (`vcs_svn.answers`,
+> `vcs_svn.answer_ns`) against its waits: for a piece through the node's store, for a write, for the client's bytes,
+> and for a poll after a yield (`vcs_svn.fetch_wait_ns`, `write_wait_ns`, `read_wait_ns`, `yield_wait_ns`). It counts
+> an import's turns, landing waits and yields (`vcs_store.svn_import.turn_ns`, `land_wait_ns`, `yield_wait_ns`), and
+> the content store's reads, stored, freed, let-go and brought-back figures (`vcs_store.content.*`). Owed: main's quiet
+> rerun with them.
 > **R4, recovery replays a revision record a turn at a time (2026-11-20, w-svn; Ada's close list; found by w-git's sweep):**
 > a Subversion revision's record was replayed whole in one recovery or rebuild turn (`replay_svn` -> `commit_record`),
 > every text it brought deltified in one step, so one large revision held its shard. Now `RevisionReplay`
@@ -6190,6 +6216,20 @@
 > Beyond the goal's clauses, owed from this entry: the async form for the remaining verbs, the MCP list tools answering
 > a page at a time, and a merge's versions typed on the wire.
 
+> **The Node SDK's completion on Windows (2026-11-23, w-interop; A-875; found by CI run 45176536354's Windows legs):**
+> `async lifecycle over a live daemon` died with `CompletionLost { reason: "Unsupported fd type: UNKNOWN" }`. Node
+> adopts no Windows socket by descriptor (libuv's `uv_guess_handle`), and the SDK was handed the bridge's loopback
+> socket. **Built:** the Windows bridge signals the Node SDK through a named pipe that `async.mjs` opens by name
+> (`net.connect`), admitting only a reader of this process (`crates/ipc/src/completion_pipe.rs`). Python keeps the
+> socket. **Proven (windows-latest, main's diag runs):**
+> - Red at main (run 45225292920): "Unsupported fd type: UNKNOWN".
+> - With the change (run 45230459274, 20cd9025e): `slates-ipc`'s Windows completion and pipe tests pass, 8 of 8, with
+>   the other-process reader's. The addon builds, and "Unsupported fd type" is gone: the async lifecycle gets past its
+>   completion pipe to the daemon's first create.
+>
+> **Not yet green:** the Node suites on Windows. 4 of 8 pass. The 4 that fail, sync and async alike, are refused
+> `BudgetExceeded { available: 5722144768 }` at their first create. That is the Windows daemon's own sizing (w-win's
+> leftover item 3, now w-win2's), not this change. **Owed:** the SDK lane rerun once that lands, then windows-11-arm.
 > **The Node SDK suites on Windows (2026-11-18, §4.7 status "the Node SDK suites end on Windows"; goal 88).** The three
 > Node suites had never run on Windows: CI's `sdk` job ran on `ubuntu-latest` and `macos-latest` alone. Main's diag run
 > 44384411115 (main da697d886) ran them on both Windows runners, and the step went past 70 minutes until cancelled, with
