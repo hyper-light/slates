@@ -576,7 +576,7 @@ impl HgIndex {
     log: Log<'_>,
     group: &[NewRevision],
   ) -> Result<Vec<u32>, Refused> {
-    self.append_revisions_after(store, log, group, None)
+    self.append_revisions_after(store, log, group, (None, &[]))
   }
 
   /// [`HgIndex::append_revisions`], `previous` the caller's node and whole text of the revision before the group where
@@ -585,12 +585,16 @@ impl HgIndex {
   /// rebuilding it applied each in turn over a copy of the whole text: hg's own history spent 130 s of a restart's
   /// replay, its longest step 277 ms, rebuilding each manifest's predecessor. A text the caller does not hold, or
   /// holds for another node, is rebuilt from the log as before.
-  pub fn append_revisions_after(
+  ///
+  /// `given` are the group's own whole texts the caller holds, by node (a push's intake holds the one it keeps): a
+  /// manifest's delta is made from it, never from its text read back from the store it was just put in (goal 93: that
+  /// read was a whole copy of every manifest a push kept). A row whose text is not given is read from the store.
+  pub fn append_revisions_after<'t>(
     &mut self,
     store: &mut ContentStore,
     log: Log<'_>,
     group: &[NewRevision],
-    previous: Option<(&Node, &[u8])>,
+    (previous, given): (Option<(&Node, &'t [u8])>, &[(Node, &'t [u8])]),
   ) -> Result<Vec<u32>, Refused> {
     let (revs, mut planned) = self.planned(store, log, group.iter())?;
     let previous = match (log, planned.first()) {
@@ -615,7 +619,7 @@ impl HgIndex {
       }
       _ => None,
     };
-    let puts = kept_as(store, log, &mut planned, previous)?;
+    let puts = kept_as(store, log, &mut planned, (previous, given))?;
     let written = self.write(store, log, &planned);
     for put in &puts {
       drop(store.release(put));
@@ -907,11 +911,11 @@ const WHOLE: Stored = (NONE, 0, 0);
 /// within the text's own length, so a text is rebuilt from at most its own length of deltas over the whole text it rests
 /// on (7.2's `deltas.py` refuses a delta longer than its text by the same bound). The puts' holds, for the caller to
 /// give back once the rows hold their contents.
-fn kept_as(
+fn kept_as<'t>(
   store: &mut ContentStore,
   log: Log<'_>,
   planned: &mut [Planned],
-  mut previous: Option<(u32, Cow<'_, [u8]>, u64)>,
+  (mut previous, given): (Option<(u32, Cow<'t, [u8]>, u64)>, &[(Node, &'t [u8])]),
 ) -> Result<Vec<ContentId>, Refused> {
   let mut puts = Vec::new();
   for row in planned.iter_mut() {
@@ -921,12 +925,21 @@ fn kept_as(
         .payload
         .get(COMMON_BYTES - LEN_BYTES..COMMON_BYTES)
         .and_then(|len| len.try_into().ok().map(u64::from_le_bytes));
-      let text = row
-        .contents
-        .first()
-        .zip(len)
-        .and_then(|(id, len)| store.object_bytes(id, len))
-        .ok_or(Refused::Unread { rev: row.rev })?;
+      // The caller's own copy of the text where it gave one for this node, of the length the row names; else read back.
+      let held = given
+        .iter()
+        .find(|(node, text)| *node == row.node && len == Some(crate::read::to_u64(text.len())))
+        .map(|(_, text)| Cow::Borrowed(*text));
+      let text = match held {
+        Some(text) => text,
+        None => row
+          .contents
+          .first()
+          .zip(len)
+          .and_then(|(id, len)| store.object_bytes(id, len))
+          .map(Cow::Owned)
+          .ok_or(Refused::Unread { rev: row.rev })?,
+      };
       if let Some((rev, prior, chain)) = &previous
         && rev.checked_add(1) == Some(row.rev)
       {
@@ -945,7 +958,7 @@ fn kept_as(
           fields = (*rev, crate::read::to_u64(delta.len()), grown);
         }
       }
-      previous = Some((row.rev, Cow::Owned(text), fields.2));
+      previous = Some((row.rev, text, fields.2));
     }
     row.payload.extend_from_slice(&fields.0.to_le_bytes());
     row.payload.extend_from_slice(&fields.1.to_le_bytes());

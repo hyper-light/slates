@@ -1,0 +1,357 @@
+//! A push's allocation churn on the system allocator's path (goal 93, the 410 MiB bar; main's order of 2026-11-23 on CI
+//! 45127535742: 57.3 GB allocated over the hg matrix's run, which breeds the 1.26 GB the allocator keeps after push-all):
+//! its own binary, so the slates binary's allocator ([`LargeMapped`]) is the global one and its figures read what a
+//! push's intake allocates per changeset, as `crates/svn/tests/import_heap.rs` reads an import's.
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::print_stdout,
+  clippy::indexing_slicing,
+  clippy::arithmetic_side_effects,
+  clippy::cast_precision_loss
+)]
+
+use slates_hg::changegroup::{Changegroup, Group, Revision, Version};
+use slates_hg::index::HgIndex;
+use slates_hg::manifest::{self, Entry, Flag};
+use slates_hg::push::intake::{Intake, Stepped};
+use slates_hg::{Admission, NULL_NODE, Node, node};
+use slates_mem::large::{LargeMapped, heap};
+use std::borrow::Cow;
+
+use slates_vcs::{ContentRefused, ContentStore, StoredWindow, WindowStorage};
+
+#[global_allocator]
+static ALLOCATOR: LargeMapped = LargeMapped;
+
+/// Shape: the changesets after the first, each rewriting one file, in the shorter history; the longer has twice as many,
+/// so their difference is what [`EDITS`] edit changesets allocate alone.
+const EDITS: usize = 40;
+/// Shape: the content store's window, a daemon's chunk.
+const WINDOW: usize = 256 << 10;
+/// Shape: the segment bound the intake cuts at, a test's: several segments over the history.
+const SEGMENT: u64 = 64 << 10;
+
+/// Shape: what the test's arena reserves up front, past every history's windows: one reservation, on the mapped path.
+const ARENA_BYTES: usize = 16 << 20;
+/// Shape: the windows its table reserves room for up front.
+const ARENA_WINDOWS: usize = 1 << 16;
+
+/// Windows kept as a daemon's store keeps them, in an arena reserved once (the shard's repository arena,
+/// `ContentStore::with_storage`), never on the system heap a window at a time: so what the test reads is the push's own
+/// churn, not a tool's window storage (`HeapWindows`). Released windows are not reused; nothing here outlives the test.
+#[derive(Debug)]
+struct Arena {
+  /// The windows' bytes, end to end.
+  bytes: Vec<u8>,
+  /// Each window's place in them, by handle.
+  places: Vec<(usize, usize)>,
+}
+
+impl Arena {
+  /// An arena reserved up front.
+  fn new() -> Arena {
+    Arena {
+      bytes: Vec::with_capacity(ARENA_BYTES),
+      places: Vec::with_capacity(ARENA_WINDOWS),
+    }
+  }
+}
+
+impl WindowStorage for Arena {
+  fn put(&mut self, bytes: &[u8]) -> Result<StoredWindow, ContentRefused> {
+    assert!(
+      self.bytes.len() + bytes.len() <= self.bytes.capacity()
+        && self.places.len() < self.places.capacity(),
+      "the test's arena holds every window"
+    );
+    let at = self.bytes.len();
+    self.bytes.extend_from_slice(bytes);
+    self.places.push((at, bytes.len()));
+    Ok(StoredWindow(u64::try_from(self.places.len() - 1).unwrap()))
+  }
+
+  fn read(&self, window: StoredWindow) -> Option<Cow<'_, [u8]>> {
+    let (at, len) = *self.places.get(usize::try_from(window.0).ok()?)?;
+    self.bytes.get(at..at + len).map(Cow::Borrowed)
+  }
+
+  fn release(&mut self, _window: StoredWindow) {}
+}
+
+/// A revision's text as a changegroup carries it whole: one hunk replacing nothing.
+fn whole(text: &[u8]) -> Vec<u8> {
+  let mut data = Vec::with_capacity(12 + text.len());
+  data.extend_from_slice(&0u32.to_be_bytes());
+  data.extend_from_slice(&0u32.to_be_bytes());
+  data.extend_from_slice(&u32::try_from(text.len()).unwrap().to_be_bytes());
+  data.extend_from_slice(text);
+  data
+}
+
+/// `text` as a client sends it against `base`: the one hunk replacing the bytes between their common prefix and
+/// suffix, as a revision that rewrote one line arrives.
+fn delta(base: &[u8], text: &[u8]) -> Vec<u8> {
+  let prefix = base.iter().zip(text).take_while(|(a, b)| a == b).count();
+  let suffix = base[prefix..]
+    .iter()
+    .rev()
+    .zip(text[prefix..].iter().rev())
+    .take_while(|(a, b)| a == b)
+    .count();
+  let inserted = &text[prefix..text.len() - suffix];
+  let mut data = Vec::with_capacity(12 + inserted.len());
+  data.extend_from_slice(&u32::try_from(prefix).unwrap().to_be_bytes());
+  data.extend_from_slice(&u32::try_from(base.len() - suffix).unwrap().to_be_bytes());
+  data.extend_from_slice(&u32::try_from(inserted.len()).unwrap().to_be_bytes());
+  data.extend_from_slice(inserted);
+  data
+}
+
+/// Each of `texts` as a changegroup sends it: the first whole, each later one its delta against the one before.
+fn sent(texts: &[&[u8]]) -> Vec<Vec<u8>> {
+  texts
+    .iter()
+    .enumerate()
+    .map(
+      |(at, text)| match at.checked_sub(1).and_then(|before| texts.get(before)) {
+        Some(base) => delta(base, text),
+        None => whole(text),
+      },
+    )
+    .collect()
+}
+
+/// The forty hexadecimal digits of `node`.
+fn hex(node: &Node) -> String {
+  node.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// A history of a first changeset adding `files` files of `size` bytes, then `edits` changesets each rewriting one,
+/// its changegroup (version 03, each log's first revision whole and each later one its delta against the one before, as
+/// a client sends them) encoded, and its manifest text's length.
+fn history(files: usize, size: usize, edits: usize) -> (Vec<u8>, usize) {
+  let paths: Vec<Vec<u8>> = (0..files)
+    .map(|at| format!("dir/file-{at:06}").into_bytes())
+    .collect();
+  let text_of = |file: usize, generation: usize| -> Vec<u8> {
+    let line = format!("file {file} generation {generation} ");
+    line.bytes().cycle().take(size).collect()
+  };
+  // Each file's revisions: (node, p1, text, link changeset).
+  let mut file_revisions: Vec<Vec<(Node, Node, Vec<u8>, usize)>> = vec![Vec::new(); files];
+  let mut current: Vec<Node> = vec![NULL_NODE; files];
+  let mut changesets: Vec<(Node, Node, Vec<u8>)> = Vec::new();
+  let mut manifests: Vec<(Node, Node, Vec<u8>)> = Vec::new();
+  for rev in 0..=edits {
+    let touched: Vec<usize> = if rev == 0 {
+      (0..files).collect()
+    } else {
+      vec![rev % files]
+    };
+    for &file in &touched {
+      let text = text_of(file, rev);
+      let p1 = current[file];
+      let file_node = node::compute(&p1, &NULL_NODE, &text).unwrap();
+      file_revisions[file].push((file_node, p1, text, rev));
+      current[file] = file_node;
+    }
+    let entries: Vec<Entry<'_>> = paths
+      .iter()
+      .zip(&current)
+      .map(|(path, node)| Entry {
+        path,
+        node: *node,
+        flag: Flag::Regular,
+      })
+      .collect();
+    let mut manifest_text = Vec::new();
+    manifest::encode(&entries, &mut manifest_text).unwrap();
+    let manifest_p1 = manifests.last().map_or(NULL_NODE, |(node, ..)| *node);
+    let manifest_node = node::compute(&manifest_p1, &NULL_NODE, &manifest_text).unwrap();
+    manifests.push((manifest_node, manifest_p1, manifest_text));
+    let touched_paths: Vec<String> = touched
+      .iter()
+      .map(|file| String::from_utf8(paths[*file].clone()).unwrap())
+      .collect();
+    let changeset_text = format!(
+      "{}\ntest\n0 0\n{}\n\nchangeset {rev}",
+      hex(&manifest_node),
+      touched_paths.join("\n")
+    )
+    .into_bytes();
+    let changeset_p1 = changesets.last().map_or(NULL_NODE, |(node, ..)| *node);
+    let changeset_node = node::compute(&changeset_p1, &NULL_NODE, &changeset_text).unwrap();
+    changesets.push((changeset_node, changeset_p1, changeset_text));
+  }
+  let changeset_texts: Vec<&[u8]> = changesets
+    .iter()
+    .map(|(.., text)| text.as_slice())
+    .collect();
+  let manifest_texts: Vec<&[u8]> = manifests.iter().map(|(.., text)| text.as_slice()).collect();
+  let datas: Vec<Vec<u8>> = sent(&changeset_texts)
+    .into_iter()
+    .chain(sent(&manifest_texts))
+    .chain(file_revisions.iter().flat_map(|revisions| {
+      let texts: Vec<&[u8]> = revisions
+        .iter()
+        .map(|(_, _, text, _)| text.as_slice())
+        .collect();
+      sent(&texts)
+    }))
+    .collect();
+  let mut revisions = Vec::new();
+  let mut data = datas.iter();
+  for (rev, (node, p1, _)) in changesets.iter().enumerate() {
+    revisions.push(revision(
+      *node,
+      *p1,
+      changesets[rev].0,
+      data.next().unwrap(),
+    ));
+  }
+  for (rev, (node, p1, _)) in manifests.iter().enumerate() {
+    revisions.push(revision(
+      *node,
+      *p1,
+      changesets[rev].0,
+      data.next().unwrap(),
+    ));
+  }
+  let mut groups = Vec::new();
+  for (file, revisions_of) in file_revisions.iter().enumerate() {
+    let start = revisions.len();
+    for (node, p1, _, link) in revisions_of {
+      revisions.push(revision(
+        *node,
+        *p1,
+        changesets[*link].0,
+        data.next().unwrap(),
+      ));
+    }
+    groups.push((file, start..revisions.len()));
+  }
+  let changegroup = Changegroup {
+    version: Version::V03,
+    revisions,
+    changelog: 0..changesets.len(),
+    manifests: changesets.len()..changesets.len() + manifests.len(),
+    trees: Vec::new(),
+    files: groups
+      .into_iter()
+      .map(|(file, range)| Group {
+        name: &paths[file],
+        revisions: range,
+      })
+      .collect(),
+  };
+  let mut out = Vec::new();
+  changegroup.encode(&mut out).unwrap();
+  (out, manifests.last().map_or(0, |(.., text)| text.len()))
+}
+
+/// A revision as sent: its node, first parent and link, its `data` against its first parent (the revision before it in
+/// its log, or none).
+fn revision(node: Node, p1: Node, link: Node, data: &[u8]) -> Revision<'_> {
+  Revision {
+    node,
+    p1,
+    p2: NULL_NODE,
+    base: p1,
+    link,
+    flags: 0,
+    info: None,
+    protocol_flags: 0,
+    data,
+    sidedata: None,
+  }
+}
+
+/// What one reading of the heap's figures allocates itself ([`heap`] reads every mapped block's residency into a
+/// buffer), taken off the figure it reads.
+fn reading_cost() -> u64 {
+  let before = heap().system_allocated;
+  heap().system_allocated.saturating_sub(before)
+}
+
+/// What taking `payload` into an empty index allocated on the system path, the readings' own allocations taken off: its
+/// steps', each segment's record written as it is cut.
+fn churned(payload: &[u8]) -> u64 {
+  let mut store = ContentStore::with_storage(u64::MAX, WINDOW, Box::new(Arena::new())).unwrap();
+  // Read once the arena is made: a reading reads every mapped block's residency, the arena's among them.
+  let reading = reading_cost();
+  let mut index = HgIndex::new();
+  let mut admission = Admission::new(u64::MAX);
+  let before = heap().system_allocated;
+  let mut intake = Intake::begin(
+    (Version::V03, payload),
+    &mut index,
+    &mut store,
+    &mut admission,
+  )
+  .unwrap()
+  .cutting(SEGMENT);
+  loop {
+    let stepped = intake.step(payload, &mut store, &mut admission).unwrap();
+    if matches!(stepped, Stepped::Done) {
+      intake.cut_rest();
+    }
+    while let Some(segment) = intake.take_segment() {
+      let _record = intake.segment_record(&segment, u64::MAX, &store).unwrap();
+    }
+    match stepped {
+      Stepped::More => {}
+      Stepped::Done => break,
+      other => panic!("a whole changegroup in memory stepped {other:?}"),
+    }
+  }
+  heap()
+    .system_allocated
+    .saturating_sub(before)
+    .saturating_sub(reading)
+}
+
+/// Shape: what an edit changeset may allocate past one copy of its manifest text and one of its file's: its rows, its
+/// bookkeeping and its share of its segment's record (measured at 10,751 B to 12,514 B over the four histories, debug).
+const SLACK_BYTES: u64 = 16 << 10;
+
+/// Goal 93 (main's orders on CI 45127535742: name the top allocators per changeset, then cut by reuse; one manifest copy
+/// a changeset, not two). Do: take a history of a first changeset adding a number of files, then [`EDITS`] changesets
+/// each rewriting one, sent as a client sends them (each revision a delta against the one before), into an empty index
+/// through the intake, its windows in an arena as a daemon's store keeps them, cut at [`SEGMENT`], each segment's record
+/// written; again with twice the edits; at three manifest sizes and two file sizes. Read the system path's churn per edit
+/// changeset (the two histories' difference over [`EDITS`]). Expect at least one manifest's bytes an edit (the counter
+/// counts), and within one copy of its manifest text and one of its file's, with [`SLACK_BYTES`], at the largest
+/// manifest and the largest file. Red before (2026-11-23, MacBook arm64, debug): 291,519 B an edit at a 91,200 B
+/// manifest, 3.20 copies, `kept_as` reading the text it was handed back from the store and `encode_lines` listing both
+/// texts' lines; now 102,015 B, 1.12.
+#[test]
+fn a_pushs_churn_per_changeset_is_one_manifest_and_one_file() {
+  for (files, size) in [(100, 64), (400, 64), (1_600, 64), (100, 16 << 10)] {
+    let (short_payload, manifest) = history(files, size, EDITS);
+    let short = churned(&short_payload);
+    let long = churned(&history(files, size, 2 * EDITS).0);
+    let per_edit = long.saturating_sub(short) / u64::try_from(EDITS).unwrap();
+    let (manifest, file) = (
+      u64::try_from(manifest).unwrap(),
+      u64::try_from(size).unwrap(),
+    );
+    let bound = manifest + file + SLACK_BYTES;
+    println!(
+      "push_heap: {files} files of {size} B, a {manifest} B manifest: an edit changeset allocates {per_edit} B \
+       ({:.2} manifests), its bound {bound} B",
+      per_edit as f64 / manifest as f64
+    );
+    assert!(
+      per_edit >= manifest,
+      "the allocator counted an edit's manifest: {per_edit} B"
+    );
+    if files == 1_600 || size == 16 << 10 {
+      assert!(
+        per_edit <= bound,
+        "an edit changeset allocated {per_edit} B, past one {manifest} B manifest, one {file} B file and {SLACK_BYTES} B"
+      );
+    }
+  }
+}

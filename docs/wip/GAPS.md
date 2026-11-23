@@ -706,6 +706,14 @@
 >   The test-only one-call landing builds a push's works as the driver does, planned and then built over the
 >   store's read-through (`works_whole`); `Works::Whole` and the one-call `tree::work` arm are gone, and `prepare` takes
 >   the view alone. The store-made-texts oracle compares a file by the identities its row names.
+> - A push's churn a manifest copy a changeset BUILT (2026-11-23, w-hg; main's orders on CI 45127535742: 57.3 GB through
+>   the allocator over the hg matrix, which breeds the 1.26 GB it keeps after push-all). Named by a counting allocator
+>   (`crates/hg/tests/push_heap.rs`, its store's windows in an arena as a daemon's are): an edit changeset allocated
+>   3.20 copies of its manifest. `delta::apply` is the one needed; `index::kept_as` read the text it was just handed
+>   back from the store, now given it by `keep_one` (`HgIndex::append_revisions_after`'s `given`); `delta::encode_lines`
+>   listed both texts' lines, now walks them by cursors. Held by
+>   `a_pushs_churn_per_changeset_is_one_manifest_and_one_file` (1,600 files: red 291,519 B an edit at a 91,200 B
+>   manifest, now 102,015 B, 1.12 copies; 16 KiB files within one manifest and one file copy and 16 KiB of slack).
 > - A push's held high-water gauged BUILT (2026-11-23, w-hg; main's ruling: the 410 MiB bar's push-all peak first):
 >   `vcs.hg.push_held_high_bytes`, the push's admission held plus its file texts still in the content store, sampled as
 >   each segment lands before its let-go; `..._texts_high_bytes` its texts' share; `vcs.hg.push_rows_bytes` its fork's

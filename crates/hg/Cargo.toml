@@ -29,6 +29,8 @@ blake3 = { workspace = true }
 
 [dev-dependencies]
 slates-test-seeds = { workspace = true }
+# The push's heap test (tests/push_heap.rs): the slates binary's allocator as its global one, read for its churn.
+slates-mem = { workspace = true }
 proptest = { workspace = true }
 # The changeset A/B example (examples/changeset_ab.rs): a landed log's segments in LZ4.
 lz4_flex = { workspace = true }
