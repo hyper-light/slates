@@ -4343,8 +4343,9 @@ fn whole_record(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> Opt
   Some(VolumeRecord::Full { image }.to_bytes())
 }
 
-/// The plain body of a publication of `record` (A-377 split it from [`payload`]): the record and its content runs, read
-/// from the volume now, so it is captured in the publication's own turn whenever it is sealed.
+/// The plain body of a publication of `record` (A-377 split this capture from the seal, [`sealed_payload`]): the record
+/// and its content runs, read from the volume now, so it is captured in the publication's own turn whenever it is
+/// sealed.
 fn plain_body(
   state: &ShardState,
   id: slates_db::catalog::VolumeId,

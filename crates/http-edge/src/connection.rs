@@ -50,7 +50,7 @@ pub type Fields = Vec<(Vec<u8>, Vec<u8>)>;
 /// What a connection needs next.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Next<'a> {
-  /// Write the bytes [`Connection::take_output`] gives to the socket.
+  /// Write the bytes [`Connection::output`] lends to the socket, then say so ([`Connection::written`]).
   Write,
   /// Read from the socket and pass what came to [`Connection::receive`], or [`Connection::peer_closed`] at its end.
   Read,

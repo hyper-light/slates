@@ -82,3 +82,7 @@ false success. Where the unanswered periods were short, the same waits shrank in
   delay across the nodes, and its own wait's doc records that "a successor whose estimate rose tenfold during the wait
   failed it every time". A survivor's probes of the cut-off owner expire too, so this fault is the likely cause of that
   rise. That is an inference, not traced. Not changed.
+  Traced since, and the inference was wrong for the failures measured with this fix. The survivors' failover delay
+  stayed at 2.2 to 5.1 s through the detection, and the wait ran out because both survivors judged the owner by their
+  pair's timer at the cut and took 7.2 s to condemn it, which no failover estimate counts. Fixed in the test's wait:
+  `docs/bugs/2026-11-23-the-readmission-tests-wait-missed-a-detection-judged-by-the-timer.md`.

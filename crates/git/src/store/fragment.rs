@@ -222,9 +222,10 @@ impl Putting {
 
   /// The bytes its next step is given (A-718, main's ruling of 2026-11-21 07:30: a unit sized from its measured cost
   /// within the step budget, never a fixed count): a search step or a deflate step the bytes the machine's measured
-  /// rate for that work does in `quantum_ns` ([`Rates`]), one at least and `window` at most (the most a step holds);
-  /// a level's sample its whole window, the bytes a level is chosen on. A search or deflate step a window's work at a
-  /// quantum of a few microseconds ran past it nearly every time: 844,380 of 992,574 turns on git/git (w-git's r52).
+  /// rate for that work does in `quantum_ns` ([`Rates`](super::learn::Rates)), one at least and `window` at most (the
+  /// most a step holds); a level's sample its whole window, the bytes a level is chosen on. A search or deflate step a
+  /// window's work at a quantum of a few microseconds ran past it nearly every time: 844,380 of 992,574 turns on git/git
+  /// (w-git's r52).
   pub(crate) fn unit_bytes(
     &self,
     rates: &crate::store::learn::Rates,

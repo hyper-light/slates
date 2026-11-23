@@ -447,7 +447,7 @@ pub(crate) fn await_exit_of(pid: u32) -> bool {
   rustix::event::poll(&mut fds, Some(&timeout)).is_ok_and(|ready| ready > 0)
 }
 
-/// [`Judged::look`]'s rule, apart from the clocks it reads: the tree's CPU at the last progress (`then`) and now, how
+/// [`Judged::judge`]'s rule, apart from the clocks it reads: the tree's CPU at the last progress (`then`) and now, how
 /// long since that progress, and the CPU it spent since the wait began.
 pub(crate) fn verdict(
   then: Option<Duration>,
@@ -617,5 +617,5 @@ fn a_mount_table_wait_reads_the_table_at_the_kernels_word_not_on_a_poll() {
 /// Shape: the most readings a never-holding mount-table wait may take ([`a_mount_table_wait_reads_the_table_at_the_kernels_word_not_on_a_poll`]):
 /// the first and the last, and room for the mounts and unmounts other processes on a busy development machine make in
 /// the wait (each one word), far under a poll's hundreds.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 const MOUNT_TABLE_READINGS: u32 = 20;

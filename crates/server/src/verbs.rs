@@ -8089,7 +8089,7 @@ pub(crate) fn reconcile_candidate_claims(
 }
 
 /// The bytes this shard's candidate claim on `id` holds for its content ([`CandidateClaim`]), none without one: what a
-/// taken-over volume's restore counts as its own beside what the shard could admit ([`restore_taken_over`]).
+/// taken-over volume's restore counts as its own beside what the shard could admit ([`restore_admitted`]).
 pub(crate) fn claimed_bytes(state: &ShardState, id: DbVolumeId) -> u64 {
   state
     .candidate_claims
@@ -17367,8 +17367,8 @@ pub(crate) fn discard_making(state: &mut ShardState, id: DbVolumeId) {
 /// Finishes making taken-over volume `id` once its tree is laid ([`populate_making`]): a dynamic volume's hold for the
 /// inodes it was restored with (A-342), its record created under the adopted catalog and published, and the tree sealed
 /// as the taken-over head: the snapshot at the adopted sequence, carrying the manifest identity the head names and the
-/// placement the head recorded (`region`), so the successor answers for it as the dead owner did
-/// ([`materialize_taken_over`]'s doc). A volume not being made here is `NotFound`.
+/// placement the head recorded (`region`), so the successor answers for it as the dead owner did (the doc of
+/// `materialize_taken_over`, the tests' making in one call). A volume not being made here is `NotFound`.
 pub(crate) fn finish_making(
   state: &mut ShardState,
   id: DbVolumeId,
@@ -20343,8 +20343,9 @@ fn replay_green(
   replay_green_keeping(state, id, Vec::new())
 }
 
-/// [`replay_green`], its named texts read from the content plane, then from `kept` (sorted by identity, each an
-/// object's whole bytes: [`remake_green`]'s).
+/// Green `id` replayed from its durable chain into a fresh engine, as a recovery replays it (the tests' `replay_green`
+/// keeps nothing), its named texts read from the content plane, then from `kept` (sorted by identity, each an object's
+/// whole bytes: [`remake_green`]'s).
 fn replay_green_keeping(
   state: &ShardState,
   id: DbVolumeId,

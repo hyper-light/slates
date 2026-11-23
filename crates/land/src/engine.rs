@@ -587,7 +587,7 @@ struct Landing<'a, 'b, H: LandFs> {
 /// A captured clone's replacement as its validation judged its metadata (A-466): the mode and Windows bits the file lands
 /// with (`crate::verdict::landed_meta`: the volume's where it changed a field and the disk still held the capture's, the
 /// disk's otherwise), and whether its bytes are written. They are not where the disk already held the clone's bytes:
-/// then only the metadata the file lacks is set, through its own handle ([`Landing::chmod`]).
+/// then only the metadata the file lacks is set, through its own handle ([`Landing::set_meta`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ReplacedMeta {
   /// What the file lands with.

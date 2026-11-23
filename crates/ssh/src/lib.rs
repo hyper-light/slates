@@ -36,7 +36,7 @@
 //! time: input stops while it does, and while the output holds a packet cap of bytes the caller has not written, so a
 //! peer that stops reading cannot grow the server's memory. A name is at most RFC 4251 §6's 64 bytes, an identification
 //! line RFC 4253 §4.2's 255. A key is retired by the bounds its cipher's analysis gives (RFC 4344 §3) and by the key time
-//! the caller passes ([`keylife::key_time_limit_ns`]).
+//! the caller passes (the daemon's is RFC 4253 §9's hour, [`keylife::RECOMMENDED_KEY_TIME_NS`]).
 //!
 //! **Hostile input (§4.9).** Every byte from the client is untrusted: every length is checked against what is left and
 //! against its cap before anything past it is read or allocated; every refusal is a typed variant of [`refusal::Refusal`]

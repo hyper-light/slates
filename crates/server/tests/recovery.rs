@@ -2915,10 +2915,15 @@ fn a_volume_larger_than_its_shards_slice_fills_from_the_pool_and_survives_a_rest
   second.stop();
 }
 
-/// A-98 (§4.2): shards meet in the pool. Do: on two shards of [`SLICE`] each, create a volume on shard 0 that takes
-/// the other slice's extent too, try a volume on shard 1, then destroy the first and try again. Expect shard 1's
-/// create refused `BudgetExceeded` while the pool is taken (typed, nothing created), and admitted once the destroy
-/// completes and its shard's next publication returns the wholly free extents to the pool.
+/// A-98 (§4.2): shards meet in the pool. Do: on two shards of [`SLICE`] each, ask shard 0 for a volume larger than the
+/// pool and read what its refusal names as available, create a volume of exactly that on shard 0, so it holds the whole
+/// pool, try a volume on shard 1, then destroy the first and try again. Expect what shard 0 could take to be more than
+/// its own slice, shard 1's create refused `BudgetExceeded` while the pool is taken (typed, nothing created), and
+/// admitted once the destroy completes and its shard's next publication returns the wholly free extents to the pool.
+/// Until 2026-11-23 shard 0's volume was a fixed 1.25 slices: since A-848 a claim takes parts by need, so it left the
+/// other shard room wherever the operation headroom is small against the slice (red on Linux, whose 4 KiB page makes
+/// the headroom 2.5 MiB against this 32 MiB slice: shard 0 held 44 of the 64 MiB and shard 1 was admitted), and passed
+/// only on macOS, whose 10 MiB headroom took 56.
 #[test]
 fn a_shard_is_refused_while_another_holds_the_pool_and_admitted_once_it_returns() {
   let profile = common::machine_profile();
@@ -2935,9 +2940,24 @@ fn a_shard_is_refused_while_another_holds_the_pool_and_admitted_once_it_returns(
     size: SizeClass::Bounded { limit },
     ..scratch(&name)
   };
+  let oversized = client.create(&bounded(
+    name_on(0, "oversized"),
+    SLICE * u64::from(POOL_SHARDS) + SLICE,
+  ));
+  let Err(ClientError::Refused(slates_ipc::protocol::Refusal::BudgetExceeded { available })) =
+    oversized
+  else {
+    panic!(
+      "a volume larger than the pool is refused, naming what shard 0 could take: {oversized:?}"
+    );
+  };
+  assert!(
+    available > SLICE,
+    "shard 0 could take more than its own slice, the other's room with it: {available} bytes"
+  );
   let large = client
-    .create(&bounded(name_on(0, "large"), SLICE + SLICE / 4))
-    .expect("the pool covers it");
+    .create(&bounded(name_on(0, "large"), available))
+    .expect("the pool covers what the refusal named");
   let other = bounded(name_on(1, "other"), SLICE / 4);
   match client.create(&other) {
     Err(ClientError::Refused(slates_ipc::protocol::Refusal::BudgetExceeded { .. })) => {}
@@ -3863,23 +3883,34 @@ fn a_file_deleted_after_its_burst_went_idle_takes_its_reserve_with_it() {
   );
 }
 
-/// The content arena's allocated and resident bytes for the status report (A-744), read from a sweep that completed
-/// after this call began, so the figures are of now.
+/// The content arena's allocated and resident bytes for the status report (A-744): resident as the memory report's
+/// `arenas` row says it, from a sweep that began after this call did and passed the arenas' held runs, which a sweep walks
+/// first (main's ruling of 2026-11-21 on w-sizing's option (a)), so the figures are of now. Until 2026-11-23 this waited
+/// for a whole sweep of the shard's slice, which on a fresh daemon walks its write log and journal whole: on adacachy2,
+/// one shard of a 125 GiB host, 47.5 million pages in 104 s, while the held runs were passed 5.2 ms after the first
+/// memory request, so the wait's 10 s failed there and on CI's TSan lane. The bound is now the report's own for what it
+/// walks first: ten liveness budgets of a second.
 #[cfg(target_os = "linux")]
 fn arena_figures(client: &mut Client) -> (u64, u64) {
-  let completed = memory_counter(client, "content_range.sweep.completed");
+  // A plain status arms no sweep: the count is read before the first memory request arms one at the held runs.
+  let passed = counter(client, "content_range.sweep.kinds_swept");
   let started = Instant::now();
-  while memory_counter(client, "content_range.sweep.completed") <= completed {
+  while memory_counter(client, "content_range.sweep.kinds_swept") <= passed {
     assert!(
       started.elapsed() < Duration::from_secs(10),
-      "a sweep of the shard's slice completed"
+      "a sweep passed the arenas' held runs"
     );
     std::thread::yield_now();
   }
-  (
-    counter(client, "content_range.arena.allocated"),
-    counter(client, "content_range.arena.resident"),
-  )
+  let resident = client
+    .daemon_status()
+    .unwrap()
+    .memory
+    .iter()
+    .filter(|row| row.kind == "arenas")
+    .map(|row| row.resident_bytes)
+    .sum();
+  (counter(client, "content_range.arena.allocated"), resident)
 }
 
 /// [`counter`] read from a status that asks for the memory report, which alone advances and arms the residency sweep

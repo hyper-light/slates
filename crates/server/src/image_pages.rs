@@ -576,6 +576,12 @@ impl Encoder {
   pub(crate) fn stop_catching_up(&mut self) {
     self.catching_up = false;
   }
+
+  /// Whether a publication is owed and no task is encoding on to make it: a catch-up whose publication was refused, or
+  /// whose task could not be spawned, which the shard's sweep begins again (`content_holder::image_retry_owed`).
+  pub(crate) fn owed_unattended(&self) -> bool {
+    self.owed.is_some() && !self.catching_up
+  }
 }
 
 #[cfg(test)]

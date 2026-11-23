@@ -5452,6 +5452,12 @@ drops.
 > (`diag-liveness-client-4`). So the mean on main stayed a sleeper's: the parked bench form's client estimate read
 > 17–33 µs on both Windows runners before and after (`Client::wake_estimate`, provision_bench's `client wake` line),
 > against a published window of 8.8–9.9 µs (`diag-liveness-client-1`, `-2`).
+> **Linux too (2026-11-23).** The daemon's confirmation was not enough there: `futex_wake` counts a waiter that queued
+> itself and was set running again before it blocked, so the same test on adacachy2 found 5,341 of 16,384 racing parks
+> that never switched out, and 4 of them taught 560 to 9,286 ns. A Linux park now teaches only if the client's own
+> voluntary switch count rose across it and the daemon confirmed. The client already read the count around every
+> wait, so no call is added. macOS, which gives no per-thread count, keeps the confirmation alone. Record:
+> `docs/bugs/2026-11-23-a-linux-client-learned-a-wake-from-a-park-that-never-slept.md`.
 
 > **Status (2026-09-29, A-42: the idle spin is opened by client activity and ends with its window).** The
 > daemon set a shard "active" at its first client's handoff and nothing cleared it, so from then on every
@@ -58679,7 +58685,10 @@ GAPS.
 
 Status: built 2026-11-20, macOS; Windows written the same day (main's ruling of 18:40), its build and tests owed to
 w-lint on jupiter (run-requests). Linux keeps one memfd with holes punched (g226: the anchor's punch frees the pages
-with a peer still mapping them; BENCHMARKS "Content give-back per platform").
+with a peer still mapping them; BENCHMARKS "Content give-back per platform"). A release punches its extent's hole
+through the extent's own mapping before the unmap since 2026-11-23 (`ContentPool::punch`, `MADV_REMOVE`). Before, it
+only unmapped, a memfd's pages outlive every mapping, and a 64 MiB burst's destroyed volume left the object at 69 MiB
+on Linux: `docs/bugs/2026-11-23-a-released-pool-extent-kept-its-pages-in-the-linux-content-object.md`.
 - Windows: each extent is a reserved, unnamed section of its own (`slates_mem::make_extent_section`), since only
   closing a section returns its commit (g226: decommitting a view is refused, error 87). The anchor holds a duplicate
   of each under a new hold kind, `WHAT_CONTENT_EXTENT` (one handle, the extent's id as its record), bounded in a class of
@@ -61626,6 +61635,16 @@ Status: built 2026-11-22, macOS arm64 (focused tests); main's daemon A/B (`an_im
   encoder's (w-git's catch: a let-go task that ended while packs were queued stranded them). Ported: piece 1's delta test runs the
   encoder's turns before each publication; `homes::tests::a_committed_publication_publishes_the_tickets_of_windows_kept_before_it`
   shows a publication of an older cut leaving the ticket unpublished.
+- **A refused catch-up publication is never dropped (2026-11-23; main 01a20182's ruling, banned item 9).** The
+  catch-up's publication (`content_holder::image_catch_up`) dropped `publish_shard`'s error, so a refused one left the
+  publication owed with no task to make it, and a homing waiting on its ticket (`homes::published_within`, bounded by
+  the home shard's own CPU time) waited on an idle shard without end: the HTTP push stall's strongest candidate. Now a
+  refused catch-up publication is counted (`vcs_store.image.catch_up_publish_refused`) and stays owed; an owed
+  publication no catch-up makes (refused, or its task unspawned, `catch_up_refused`) arms the shard's sweep
+  (`idle_sweep::after_borrow`), whose pass begins it again first (`content_holder::image_retry_owed`, counted
+  `catch_up_retried`) and does not settle the shard while it is owed. Test
+  `vcs_store::durable::tests::a_tickets_wait_is_answered_after_its_catch_ups_publication_was_refused` (red first, the
+  retry cut out: the wait unanswered after six sweep intervals; green: answered, the refusal and the retry counted).
 - **Limit (piece 2, GAPS).** The bound is kept only while the encoder outpaces the changes that never pause (puts,
   bring-backs): each turn encodes at least one page, so the lag past the bound is at most the pages dirty when the
   pause began plus those such changes dirty since, plus two (the oracle's allowance). A shard runs a turn each yield, many
@@ -61880,6 +61899,10 @@ name whatever their `cfg`; `async.mjs`; `tests/sdk.test.mjs`, `tests/sdk_async.t
   groups the pieces by block and claims each block once, refusing as `Malformed` a group whose pieces disagree on the
   chunk or whose slots overlap. Version 1 is refused typed (`PieceRefused::OldVersion(1)`) and counted unrestored. Its
   window is put again by the record replay that holds its bytes.
+  **Corrected 2026-11-23.** A chunk of its own whose block the seal trimmed (A-118) names a head shorter than its bytes,
+  and version 2's reader first refused it, so every window of a granule or more was lost at a restart. Windows' 4 KiB
+  granule showed it, and a 16 KiB granule hid it (`docs/bugs/2026-11-23-a-restart-lost-every-repository-window-whose-
+  chunk-the-seal-trimmed.md`). Only a window's slot is held to its chunk's bytes, and only a shared slab asks again.
 - **Gauges.** `mem.gauge.vcs_content.slabs`, `slab_freed_kept` and `slab_freed_kept_bytes`.
 - **Proven** (`slates-server` lib, `vcs_store::arena_windows::tests`):
   - `small_windows_share_slabs_and_hold_at_most_their_bytes_rounded_a_slab`: red 3,276,800 bytes held for 200 windows
